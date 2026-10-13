@@ -10355,6 +10355,22 @@ class Interpreter {
     return ok;
   }
 
+  // The same for a .local access: every lane of `m` aligned and inside the current function's frame (and below the alloca
+  // stack), as check_local and load_routed's local case want, and the offset in the lane's frame, by lane.
+  bool local_lanes_inside(const Lanes& base, int64_t offset, Mask m, uint32_t va, bool va_pow2, uint64_t total,
+                          uint64_t* offs) {
+    const uint64_t top = local_top();
+    bool ok = true;
+    for_active(m, W_, [&](uint32_t lane) {
+      const uint64_t addr = kLocalVaBase + base[lane] + static_cast<uint64_t>(offset);
+      const uint64_t off = addr - kLocalVaBase;
+      const bool aligned = va_pow2 ? (addr & (va - 1)) == 0 : addr % va == 0;
+      ok &= aligned && is_local(addr) && off < kStackOffset && off + total <= top && off + total <= kStackOffset;
+      offs[lane] = off;
+    });
+    return ok;
+  }
+
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
     uint32_t size = op.ty.bytes();
     size_t n = op.dsts.size();
@@ -10431,6 +10447,19 @@ class Interpreter {
         LaneSet got(n);
         for_active(m, W_, [&](uint32_t lane) {
           for (size_t e = 0; e < n; ++e) got[e][lane] = load_bytes(sh + offs[lane] + e * size, size);
+        });
+        for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, got[e], op.ty);
+        return;
+      }
+    }
+    // A .local access inside the frame is a read of the lane's own buffer.
+    if (op.space == Space::Local && fast_enabled_ && !(op.ordered && n > 1)) {
+      uint64_t offs[kMaxWarpSize];
+      if (local_lanes_inside(base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
+        LaneSet got(n);
+        for_active(m, W_, [&](uint32_t lane) {
+          const uint8_t* buf = lane_local(w, lane).data();
+          for (size_t e = 0; e < n; ++e) got[e][lane] = load_bytes(buf + offs[lane] + e * size, size);
         });
         for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, got[e], op.ty);
         return;
@@ -10540,6 +10569,17 @@ class Interpreter {
         for_active(m, W_, [&](uint32_t lane) {
           for (size_t e = 0; e < n; ++e)
             store_bytes(sh + offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
+        });
+        return;
+      }
+    }
+    if (op.space == Space::Local && fast_enabled_ && !(op.ordered && n > 1)) {
+      uint64_t offs[kMaxWarpSize];
+      if (local_lanes_inside(base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
+        for_active(m, W_, [&](uint32_t lane) {
+          uint8_t* buf = lane_local(w, lane).data();
+          for (size_t e = 0; e < n; ++e)
+            store_bytes(buf + offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
         });
         return;
       }

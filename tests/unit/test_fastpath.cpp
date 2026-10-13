@@ -429,7 +429,7 @@ struct MemRun {
 // every lane or only the even ones. Loads fold what they read into out[t];
 // the buffer is dumped to out afterwards either way, so stores are seen.
 MemRun run_access(const Access& a, int stride, int shift, bool even_only, bool store,
-                  bool is_shared) {
+                  bool is_shared, bool is_local = false) {
   const int width = a.bytes * a.vec;                // bytes one lane moves
   const int nelem = 16384 / width;                  // elements in the region
   std::string regs;
@@ -442,14 +442,18 @@ MemRun run_access(const Access& a, int stride, int shift, bool even_only, bool s
   ptx += "    .reg .pred %p<4>;\n    .reg .b32 %r<24>;\n    .reg .b64 %rd<16>;\n";
   ptx += "    .reg .b32 %v0, %v1, %v2, %v3;\n    .reg .b64 %w0, %w1, %w2, %w3;\n";
   if (is_shared) ptx += "    .shared .align 16 .b8 sm[16384];\n";
+  if (is_local) ptx += "    .local .align 16 .b8 loc[16384];\n";
   ptx += "    ld.param.u64 %rd1, [pbuf];\n    ld.param.u64 %rd2, [pout];\n    mov.u32 %r1, %tid.x;\n";
   // Fill: thread t writes words t + 64 j, j < 64, with a value that names the word.
   if (is_shared) ptx += "    mov.u32 %r10, sm;\n";
+  if (is_local) ptx += "    mov.u64 %rd9, loc;\n";
   for (int j = 0; j < 64; ++j) {
     ptx += "    add.u32 %r5, %r1, " + std::to_string(64 * j) + ";\n";
     ptx += "    mul.lo.u32 %r6, %r5, 2654435761;\n    xor.b32 %r6, %r6, 305419896;\n";
     if (is_shared) {
       ptx += "    shl.b32 %r7, %r5, 2;\n    add.u32 %r7, %r7, %r10;\n    st.shared.u32 [%r7], %r6;\n";
+    } else if (is_local) {
+      ptx += "    mul.wide.u32 %rd3, %r5, 4;\n    add.u64 %rd3, %rd9, %rd3;\n    st.local.u32 [%rd3], %r6;\n";
     } else {
       ptx += "    mul.wide.u32 %rd3, %r5, 4;\n    add.u64 %rd3, %rd1, %rd3;\n    st.global.u32 [%rd3], %r6;\n";
     }
@@ -461,11 +465,11 @@ MemRun run_access(const Access& a, int stride, int shift, bool even_only, bool s
   ptx += "    and.b32 %r11, %r11, " + std::to_string(nelem - 1) + ";\n";
   ptx += "    mul.lo.u32 %r12, %r11, " + std::to_string(width) + ";\n";
   if (is_shared) ptx += "    add.u32 %r12, %r12, %r10;\n";
-  else ptx += "    cvt.u64.u32 %rd4, %r12;\n    add.u64 %rd4, %rd1, %rd4;\n";
+  else ptx += std::string("    cvt.u64.u32 %rd4, %r12;\n    add.u64 %rd4, ") + (is_local ? "%rd9" : "%rd1") + ", %rd4;\n";
   ptx += "    and.b32 %r13, %r1, 1;\n    setp.eq.u32 %p1, %r13, 0;\n";
   const std::string guard = even_only ? "@%p1 " : "";
   const std::string addr = is_shared ? "[%r12]" : "[%rd4]";
-  const std::string sp = is_shared ? "shared" : "global";
+  const std::string sp = is_shared ? "shared" : is_local ? "local" : "global";
   // Each element is a 32- or 64-bit register; narrower types load into 32-bit ones.
   std::string list;
   for (int i = 0; i < a.vec; ++i)
@@ -501,6 +505,8 @@ MemRun run_access(const Access& a, int stride, int shift, bool even_only, bool s
     ptx += "    add.u32 %r5, %r1, " + std::to_string(64 * j) + ";\n";
     if (is_shared) {
       ptx += "    shl.b32 %r7, %r5, 2;\n    add.u32 %r7, %r7, %r10;\n    ld.shared.u32 %r8, [%r7];\n";
+    } else if (is_local) {
+      ptx += "    mul.wide.u32 %rd3, %r5, 4;\n    add.u64 %rd3, %rd9, %rd3;\n    ld.local.u32 %r8, [%rd3];\n";
     } else {
       ptx += "    mul.wide.u32 %rd3, %r5, 4;\n    add.u64 %rd3, %rd1, %rd3;\n    ld.global.u32 %r8, [%rd3];\n";
     }
@@ -540,18 +546,19 @@ VTEST(memory_access_counters_and_data_match_the_general_path) {
                              {"v2.u64", "u64", 8, 2}};
   const int strides[] = {0, 1, 2, 3, 4, 5, 8, 16, 17, 32, 33, 64};
   int runs = 0;
-  for (bool is_shared : {true, false})
+  for (int space : {1, 0, 2})   // shared, global, local
     for (const Access& a : accesses)
       for (int stride : strides)
         for (bool even : {false, true})
           for (bool store : {false, true}) {
+            const bool is_shared = space == 1, is_local = space == 2;
             const int shift = stride == 3 ? 5 : 0;
             setenv("VGPU_FASTPATH", "1", 1);
-            const MemRun fast = run_access(a, stride, shift, even, store, is_shared);
+            const MemRun fast = run_access(a, stride, shift, even, store, is_shared, is_local);
             setenv("VGPU_FASTPATH", "0", 1);
-            const MemRun slow = run_access(a, stride, shift, even, store, is_shared);
+            const MemRun slow = run_access(a, stride, shift, even, store, is_shared, is_local);
             unsetenv("VGPU_FASTPATH");
-            const std::string what = std::string(is_shared ? "shared " : "global ") + (store ? "st." : "ld.") +
+            const std::string what = std::string(is_shared ? "shared " : is_local ? "local " : "global ") + (store ? "st." : "ld.") +
                                      a.space + " stride " + std::to_string(stride) + (even ? " even lanes" : " all lanes");
             if (fast.error != slow.error)
               throw vtest::Failure(what + ": fast error '" + fast.error + "', general '" + slow.error + "'");
@@ -559,7 +566,7 @@ VTEST(memory_access_counters_and_data_match_the_general_path) {
             if (!same_stats(fast.stats, slow.stats)) throw vtest::Failure(what + ": counters differ");
             ++runs;
           }
-  VCHECK(runs > 300);
+  VCHECK(runs > 450);
 }
 
 // The counters are not just equal to each other: shared bank passes and global
@@ -638,7 +645,7 @@ VTEST(refused_accesses_give_the_same_error) {
     setenv("VGPU_FASTPATH", fp, 1);
     const std::string ptx = ".version 8.3\n.target sm_86\n.address_size 64\n"
         ".visible .entry k(.param .u64 pout)\n{\n    .reg .b32 %r<8>;\n    .reg .b64 %rd<8>;\n"
-        "    .shared .align 16 .b8 sm[256];\n    mov.u32 %r1, %tid.x;\n    mov.u32 %r2, sm;\n" + body + "    ret;\n}\n";
+        "    .shared .align 16 .b8 sm[256];\n    .local .align 16 .b8 loc[256];\n    mov.u32 %r1, %tid.x;\n    mov.u32 %r2, sm;\n" + body + "    ret;\n}\n";
     MemoryManager mem{1 << 20};
     DeviceProfile prof = load_gpu("nvidia/a10");
     auto m = ptx::parse(ptx);
@@ -663,6 +670,10 @@ VTEST(refused_accesses_give_the_same_error) {
       "    shl.b32 %r3, %r1, 4;\n    add.u32 %r3, %r3, %r2;\n    st.shared.v2.u32 [%r3+4], {%r1, %r1};\n",
       // a store through an address in no allocation
       "    mov.u64 %rd2, 16;\n    st.global.u32 [%rd2], %r1;\n",
+      // .local accesses past the frame, in the last lane only, and a misaligned vector
+      "    mov.u64 %rd2, loc;\n    mul.wide.u32 %rd3, %r1, 8;\n    add.u64 %rd3, %rd3, %rd2;\n    ld.local.u32 %r4, [%rd3+8];\n",
+      "    mov.u64 %rd2, loc;\n    mul.wide.u32 %rd3, %r1, 8;\n    add.u64 %rd3, %rd3, %rd2;\n    st.local.u32 [%rd3+8], %r1;\n",
+      "    mov.u64 %rd2, loc;\n    mul.wide.u32 %rd3, %r1, 16;\n    add.u64 %rd3, %rd3, %rd2;\n    ld.local.v4.u32 {%r4, %r5, %r6, %r7}, [%rd3+4];\n",
   };
   for (const char* body : bodies) {
     const std::string fast = run_bad(body, "1"), slow = run_bad(body, "0");
