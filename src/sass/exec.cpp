@@ -298,6 +298,7 @@ class Runner {
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
   bool fast_alu(Warp& w, const Instr& ins, Mask ex);   // exec_ops.inc
   bool fast_wide(Warp& w, const Instr& ins, Mask ex);   // exec_ops.inc: the wider forms fast_alu hands over
+  bool fast_float(Warp& w, const Instr& ins, Mask ex);  // exec_ops.inc: the float forms fast_alu hands over
 
   // ---- state access ----
   const Instr& fetch(uint64_t addr, const Code** code_out = nullptr);

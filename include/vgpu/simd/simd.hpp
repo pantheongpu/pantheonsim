@@ -132,6 +132,30 @@ struct Kernels {
   //    (sh ? 2 : 0) SASS's FLO: the index of the highest set bit (of the complement for a negative value if `sgn`; all
   //    ones if there is none), or if `sh` that index counted from bit 31 (31 - index; all ones stays).
   void (*lane_unary)(unsigned kind, uint32_t* r, const uint32_t* a);
+
+  // The f32 forms of the SASS executor that carry a flush or a saturation (32 lanes, r may not alias the sources).
+  //  ffma_x, fadd_x, fmul_x: ffma/fadd/fmul with `flags` bit 0: a subnormal input, and then a subnormal result, becomes the
+  //    zero of its sign; bit 1: the result is clamped to [0, 1] (a NaN gives 0, -0 stays -0) after the flush. A NaN result is
+  //    the canonical 0x7fffffff.
+  //  fcmp_mask: bit l is SASS's float comparison `cmp` (0 F, 1 LT, 2 EQ, 3 LE, 4 GT, 5 NE, 6 GE, 7 NUM, 8 NAN, 9 LTU, 10 EQU,
+  //    11 LEU, 12 GTU, 13 NEU, 14 GEU, 15 T; the ordered ones false when either side is NaN, the U ones true) of a[l] and b[l], the
+  //    inputs flushed first if `ftz`.
+  //  mufu: MUFU.RCP (kind 4: 1/x), .RSQ (5: 1/sqrt x), .SQRT (8): in double, rounded once to float, the input flushed
+  //    first and the result after; a NaN is whatever the host's division or root gives (the executor's own scalar code).
+  //  i2f: a 32-bit integer (signed if `sgn`) to f32, to nearest even.
+  //  f2i: f32 (flushed first if `ftz`) rounded to an integer (`rnd` 0 to nearest even, 1 down, 2 up, else towards zero) and
+  //    clamped to the 32-bit signed or unsigned range; a NaN gives 0.
+  //  fmnmx: lane l is min(a, b) if bit l of `min_mask` is set, else max(a, b), the operands flushed first if `ftz`; a NaN
+  //    loses (the other operand is the answer, b if both are NaN), of two zeros the minimum is the one with a sign (a's, else b)
+  //    and the maximum the other; with `nan`, a NaN operand gives the canonical NaN.
+  void (*ffma_x)(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, unsigned flags);
+  void (*fadd_x)(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned flags);
+  void (*fmul_x)(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned flags);
+  uint32_t (*fcmp_mask)(unsigned cmp, bool ftz, const uint32_t* a, const uint32_t* b);
+  void (*mufu)(unsigned kind, uint32_t* r, const uint32_t* a);
+  void (*i2f)(bool sgn, uint32_t* r, const uint32_t* a);
+  void (*f2i)(bool sgn, unsigned rnd, bool ftz, uint32_t* r, const uint32_t* a);
+  void (*fmnmx)(uint32_t* r, const uint32_t* a, const uint32_t* b, uint32_t min_mask, bool ftz, bool nan);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the

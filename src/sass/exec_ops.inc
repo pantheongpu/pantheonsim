@@ -998,6 +998,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     case Op::FSEL: case Op::FFMA: case Op::FADD: case Op::FMUL: case Op::LEA: case Op::SHF:
     case Op::DADD: case Op::DMUL: case Op::DFMA: break;
     case Op::PLOP3: case Op::SEL: case Op::POPC: case Op::BREV: case Op::FLO: return fast_wide(w, ins, ex);
+    case Op::FMNMX: case Op::MUFU: case Op::I2FP: case Op::I2F: case Op::F2I: return fast_float(w, ins, ex);
     default: return false;
   }
   if (ins.dst.empty()) return false;
@@ -1053,6 +1054,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     return true;
   }
   if (ins.op == Op::FSETP) {
+    if (fast_float(w, ins, ex)) return true;   // the SIMD compare, if the form is one it takes
     const unsigned cmp = ins.f[0], bop = ins.f[1];
     const bool fz = ins.f[2];
     if (ins.dst.size() < 2 || !pdst_ok(ins.dst[0]) || !pdst_ok(ins.dst[1]) || ins.src.size() < 3) return false;
@@ -1362,6 +1364,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     }
     case Op::FFMA: case Op::FADD: case Op::FMUL: {
       const unsigned nsrc = ins.op == Op::FFMA ? 3 : 2;
+      if ((ins.f[1] || ins.f[2]) && !ins.f[0]) return fast_float(w, ins, ex);   // .FTZ, .SAT
       if (ins.f[0] || ins.f[1] || ins.f[2] || (ins.op == Op::FMUL && ins.f[4] != 4) || ins.src.size() < nsrc)
         return false;
       const uint32_t* s[3];
@@ -1596,6 +1599,138 @@ bool Runner::fast_wide(Warp& w, const Instr& ins, Mask ex) {
         if (d.reg + 1 != kRZ) store_row(d.reg + 1, rhi);   // (R254's partner is RZ)
       }
       if (ins.dst.size() == 2) setp(ins.dst[1], carry);
+      return true;
+    }
+    default: return false;
+  }
+}
+
+// The float forms of the 32-lane path that fast_alu does not take itself: FFMA, FADD and FMUL with .FTZ or .SAT, FSETP,
+// FMNMX, MUFU, I2F/I2FP to f32, F2I from f32 to 32 bits. The same rules as exec_float's, over the 32 lanes at once with the
+// kernels of vgpu/simd/simd.hpp (ffma_x, fadd_x, fmul_x, fcmp_mask, fmnmx, mufu, i2f, f2i); a form not handled here returns false
+// and takes the general path. A source's |x| and -x are applied to the bits before the kernel flushes: a flush keeps the sign of
+// a subnormal, so flush-then-modify and modify-then-flush give the same bits.
+bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
+  const simd::Kernels* const sk = simd::enabled() ? &simd::kernels() : nullptr;
+  if (!sk || ins.dst.empty() || ins.guard_uniform) return false;
+  const auto pmask = [&](const Operand& o) -> Mask {
+    Mask v;
+    if (o.kind == Kind::UPred) v = (o.reg == kPT || w.up[o.reg]) ? kAll : 0;
+    else v = o.reg == kPT ? kAll : w.p[o.reg];
+    return o.neg ? ~v : v;
+  };
+  const auto is_pred = [](const Operand& o) { return o.kind == Kind::Pred || o.kind == Kind::UPred; };
+  const auto setp = [&](const Operand& o, Mask v) {
+    if (o.reg != kPT) w.p[o.reg] = (w.p[o.reg] & ~ex) | (v & ex);
+  };
+  const auto plain = [](const Operand& o) {
+    return o.kind == Kind::Reg || o.kind == Kind::Imm || o.kind == Kind::FImm || o.kind == Kind::CBank || o.kind == Kind::UReg;
+  };
+  const auto store_row = [&](unsigned reg, const uint32_t* v) {
+    uint32_t* d = &w.reg(reg, 0);
+    if (ex == kAll) std::memcpy(d, v, 32 * sizeof(uint32_t));
+    else sk->blend_m(d, v, ex);
+  };
+  // A source as 32 lanes of float bits: the register's own, or its value for every lane, with |x| and -x applied if `mods`.
+  alignas(32) uint32_t buf[3][32];
+  const auto lanes = [&](unsigned i, const Operand& o, bool mods) -> const uint32_t* {
+    const bool reg = o.kind == Kind::Reg && o.reg != kRZ;
+    const bool ab = mods && o.abs, ng = mods && o.neg;
+    if (reg && !ab && !ng) return &w.reg(o.reg, 0);
+    const uint32_t* row = reg ? &w.reg(o.reg, 0) : nullptr;
+    const uint32_t one = reg || o.kind == Kind::Reg ? 0u : read32(w, o, 0);
+    const uint32_t absm = ab ? 0x7fffffffu : ~0u, negm = ng ? 0x80000000u : 0u;
+    uint32_t* const out = buf[i];
+    for (unsigned l = 0; l < 32; ++l) out[l] = ((row ? row[l] : one) & absm) ^ negm;
+    return out;
+  };
+  alignas(32) uint32_t r[32];
+  switch (ins.op) {
+    case Op::FFMA: case Op::FADD: case Op::FMUL: {
+      const unsigned nsrc = ins.op == Op::FFMA ? 3 : 2;
+      if (ins.f[0] || (ins.op == Op::FMUL && ins.f[4] != 4) || ins.src.size() < nsrc || ins.dst[0].kind != Kind::Reg) return false;
+      const unsigned flags = (ins.f[1] ? 1u : 0u) | (ins.f[2] ? 2u : 0u);
+      const uint32_t* s[3];
+      for (unsigned i = 0; i < nsrc; ++i) {
+        if (!plain(ins.src[i]) || ins.src[i].bnot) return false;
+        s[i] = lanes(i, ins.src[i], true);
+      }
+      if (ins.op == Op::FFMA) sk->ffma_x(r, s[0], s[1], s[2], flags);
+      else if (ins.op == Op::FADD) sk->fadd_x(r, s[0], s[1], flags);
+      else sk->fmul_x(r, s[0], s[1], flags);
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::FSETP: {
+      const unsigned cmp = ins.f[0], bop = ins.f[1];
+      if (ins.dst.size() < 2 || ins.dst[0].kind != Kind::Pred || ins.dst[1].kind != Kind::Pred || ins.src.size() < 3 ||
+          !is_pred(ins.src[2]))
+        return false;
+      for (int i = 0; i < 2; ++i)
+        if (!plain(ins.src[i]) || ins.src[i].bnot) return false;
+      const Mask res = sk->fcmp_mask(cmp, ins.f[2] != 0, lanes(0, ins.src[0], true), lanes(1, ins.src[1], true)) & ex;
+      const Mask acc = pmask(ins.src[2]);
+      const auto combine = [](unsigned b, Mask x, Mask a) -> Mask { return b == 0 ? (x & a) : b == 1 ? (x | a) : (x ^ a); };
+      setp(ins.dst[0], combine(bop, res, acc));
+      setp(ins.dst[1], combine(bop, ~res, acc));
+      return true;
+    }
+    case Op::FMNMX: {
+      if (ins.src.size() < 3 || !plain(ins.src[0]) || !plain(ins.src[1]) || ins.src[0].bnot || ins.src[1].bnot ||
+          !is_pred(ins.src[2]) || ins.dst[0].kind != Kind::Reg)
+        return false;
+      sk->fmnmx(r, lanes(0, ins.src[0], true), lanes(1, ins.src[1], true), static_cast<uint32_t>(pmask(ins.src[2])), ins.f[0] != 0,
+                ins.f[1] != 0);
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::MUFU: {
+      const unsigned op = ins.f[0];
+      if (op == 6 || op == 7 || op > 9 || ins.src.empty() || !plain(ins.src[0]) || ins.src[0].bnot || ins.dst[0].kind != Kind::Reg)
+        return false;
+      if (op == 4 || op == 5 || op == 8) {
+        sk->mufu(op, r, lanes(0, ins.src[0], true));
+      } else {
+        // The functions the host's libm gives (no SIMD form has the same bits): the input flushed, then |x| and -x, as f32src(.., true)
+        // does; the answer in double, rounded once to float and flushed.
+        const Operand& o = ins.src[0];
+        const uint32_t* raw = lanes(0, o, false);
+        for (unsigned l = 0; l < 32; ++l) {
+          float f = as_f32(raw[l]);
+          f = ftz(f);
+          if (o.abs) f = std::fabs(f);
+          if (o.neg) f = -f;
+          const double x = ftz(f);
+          float v;
+          switch (op) {
+            case 0: v = static_cast<float>(std::cos(x * 6.28318530717958647692)); break;   // the argument is in turns
+            case 1: v = static_cast<float>(std::sin(x * 6.28318530717958647692)); break;
+            case 2: v = static_cast<float>(std::exp2(x)); break;
+            case 3: v = static_cast<float>(std::log2(x)); break;
+            default: v = static_cast<float>(std::tanh(x)); break;
+          }
+          r[l] = f32_bits(ftz(v));
+        }
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::I2F: case Op::I2FP: {
+      // To f32 from a 32-bit integer, to nearest even. (The source's modifiers do not apply: read32 is all the general rule reads.)
+      const unsigned dsize = ins.op == Op::I2FP ? 2 : ins.f[0], ssize = ins.op == Op::I2FP ? 2 : ins.f[1];
+      const bool sgn = ins.op == Op::I2FP ? ins.f[0] != 0 : ins.f[2] != 0;
+      const unsigned rnd = ins.op == Op::I2FP ? ins.f[1] : ins.f[3];
+      if (dsize != 2 || ssize != 2 || rnd != 0 || ins.src.empty() || !plain(ins.src[0]) || ins.dst[0].kind != Kind::Reg) return false;
+      sk->i2f(sgn, r, lanes(0, ins.src[0], false));
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::F2I: {
+      // f32 to a 32-bit integer.
+      if (ins.f[0] != 2 || ins.f[1] != 2 || ins.src.empty() || !plain(ins.src[0]) || ins.src[0].bnot || ins.dst[0].kind != Kind::Reg)
+        return false;
+      sk->f2i(ins.f[2] != 0, ins.f[3], ins.f[4] != 0, r, lanes(0, ins.src[0], true));
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
       return true;
     }
     default: return false;

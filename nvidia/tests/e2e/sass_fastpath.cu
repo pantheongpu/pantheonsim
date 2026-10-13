@@ -286,6 +286,63 @@ static int run_fault(const char* name) {
   return e == cudaSuccess ? 1 : 0;   // it must fault
 }
 
+
+// The f32 forms with a flush or a saturation, compares, MUFU, conversions and min/max, written as PTX so that ptxas gives each
+// its own SASS (FFMA.FTZ, FADD.SAT, FMNMX.FTZ, MUFU.RCP, F2I.TRUNC, I2FP, FSETP...). The special values come from the host: zeros,
+// subnormals, infinities, NaNs of both signs, the extremes. Only the two runs' agreement is checked for these (the kernels have
+// their own host references in tests/unit/test_simd.cpp).
+constexpr int kFloatForms = 28;
+__device__ __forceinline__ uint32_t fbits_(float f) { return __float_as_uint(f); }
+__global__ void float_forms(const float* in, uint32_t* out, int n, int shape) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float a = in[i], b = in[(i + 1) % n], c = in[(i + 5) % n];
+  uint32_t o[kFloatForms] = {};
+  const bool take = shape == 0 ? true : shape == 1 ? (__float_as_uint(b) & 3) != 0 : (i & 4) == 0;
+  if (take) {
+    float r;
+    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c)); o[0] = fbits_(r);
+    asm("fma.rn.ftz.sat.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c)); o[1] = fbits_(r);
+    asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[2] = fbits_(r);
+    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[3] = fbits_(r);
+    asm("mul.rn.ftz.sat.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[4] = fbits_(r);
+    asm("add.rn.sat.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[5] = fbits_(r);
+    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(-a), "f"(fabsf(b)), "f"(-fabsf(c))); o[6] = fbits_(r);
+    asm("min.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[7] = fbits_(r);
+    asm("max.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[8] = fbits_(r);
+    asm("min.ftz.NaN.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[9] = fbits_(r);
+    asm("max.NaN.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(-b)); o[10] = fbits_(r);
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); o[11] = fbits_(r);
+    asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); o[12] = fbits_(r);
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); o[13] = fbits_(r);
+    asm("sin.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); o[14] = fbits_(r);
+    asm("cos.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(fabsf(a))); o[15] = fbits_(r);
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); o[16] = fbits_(r);
+    asm("lg2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); o[17] = fbits_(r);
+    asm("tanh.approx.f32 %0, %1;" : "=f"(r) : "f"(a)); o[18] = fbits_(r);
+    int si; unsigned ui;
+    asm("cvt.rni.s32.f32 %0, %1;" : "=r"(si) : "f"(a)); o[19] = static_cast<uint32_t>(si);
+    asm("cvt.rzi.u32.f32 %0, %1;" : "=r"(ui) : "f"(a)); o[20] = ui;
+    asm("cvt.rmi.ftz.s32.f32 %0, %1;" : "=r"(si) : "f"(a)); o[21] = static_cast<uint32_t>(si);
+    asm("cvt.rpi.u32.f32 %0, %1;" : "=r"(ui) : "f"(-b)); o[22] = ui;
+    const int ia = static_cast<int>(__float_as_uint(a)), ib = static_cast<int>(__float_as_uint(b));
+    asm("cvt.rn.f32.s32 %0, %1;" : "=f"(r) : "r"(ia)); o[23] = fbits_(r);
+    asm("cvt.rn.f32.u32 %0, %1;" : "=f"(r) : "r"(ib)); o[24] = fbits_(r);
+    // The compares, each a predicate turned into a bit.
+    uint32_t m = 0, q;
+#define CMP(OP, BIT, FTZ) \
+    asm("{ .reg .pred p; setp." OP FTZ ".f32 p, %1, %2; selp.u32 %0, 1, 0, p; }" : "=r"(q) : "f"(a), "f"(b)); m |= q << BIT;
+    CMP("lt", 0, "") CMP("le", 1, ".ftz") CMP("eq", 2, "") CMP("ne", 3, ".ftz") CMP("gt", 4, "") CMP("ge", 5, ".ftz")
+    CMP("num", 6, "") CMP("nan", 7, ".ftz") CMP("ltu", 8, "") CMP("leu", 9, ".ftz") CMP("equ", 10, "") CMP("neu", 11, ".ftz")
+    CMP("gtu", 12, "") CMP("geu", 13, ".ftz")
+#undef CMP
+    o[25] = m;
+    o[26] = static_cast<uint32_t>(a > b ? 1 : 0) | (static_cast<uint32_t>(fabsf(a) < fabsf(b) ? 2 : 0));
+    o[27] = fbits_(fminf(a, b)) ^ fbits_(fmaxf(b, c));
+  }
+  for (int k = 0; k < kFloatForms; ++k) out[static_cast<size_t>(i) * kFloatForms + k] = o[k];
+}
+
 template <class T>
 static bool same(const std::vector<T>& a, const std::vector<T>& b, const char* what) {
   if (a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0) return true;
@@ -675,6 +732,38 @@ int main(int argc, char** argv) {
       std::printf("atomic_forms pattern=%d bits %016llx\n", pattern, static_cast<unsigned long long>(hh));
     }
     CK(cudaFree(dm)); CK(cudaFree(dout));
+  }
+
+  {
+    // float_forms over the special values and random bits (the NaNs include both signs and payloads).
+    const uint32_t sp[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u,
+                           0x3f800000u, 0xbf800000u, 0x3f000000u, 0x40000000u, 0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
+                           0x7fc00000u, 0xffc00000u, 0x7fc12345u, 0x7f800001u, 0xffbfffffu, 0x3effffffu, 0x4b000000u, 0x4b800001u,
+                           0x33800000u, 0x3f800001u, 0x4f000000u, 0xcf000000u, 0x4f800000u, 0x4effffffu, 0x3f7fffffu, 0x40490fdbu};
+    const int ns = sizeof sp / sizeof sp[0];
+    const int n = 32 * 11 + 7;
+    std::vector<float> h(n);
+    uint64_t s = 0x4F1BBCDCBFA53E0Aull;
+    for (int i = 0; i < n; ++i) {
+      s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+      const uint32_t bits = i % 3 == 0 ? static_cast<uint32_t>(s) : sp[s % ns];
+      std::memcpy(&h[i], &bits, 4);
+    }
+    float* din; uint32_t* dout;
+    CK(cudaMalloc(&din, n * 4));
+    CK(cudaMalloc(&dout, static_cast<size_t>(n) * kFloatForms * 4));
+    CK(cudaMemcpy(din, h.data(), n * 4, cudaMemcpyHostToDevice));
+    for (int shape = 0; shape < 3; ++shape) {
+      CK(cudaMemset(dout, 0, static_cast<size_t>(n) * kFloatForms * 4));
+      float_forms<<<(n + 63) / 64, 64>>>(din, dout, n, shape);
+      CK(cudaDeviceSynchronize());
+      std::vector<uint32_t> got(static_cast<size_t>(n) * kFloatForms);
+      CK(cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost));
+      uint64_t hh = 1469598103934665603ull;
+      for (uint32_t v : got) hh = (hh ^ v) * 1099511628211ull;
+      std::printf("float_forms shape=%d bits %016llx\n", shape, static_cast<unsigned long long>(hh));
+    }
+    CK(cudaFree(din)); CK(cudaFree(dout));
   }
   std::printf("wrong: %d\n", wrong);
   return wrong != 0;

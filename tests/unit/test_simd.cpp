@@ -1005,6 +1005,170 @@ VTEST(wide_integer_kernels_at_every_level) {
   }
 }
 
+// The float kernels the SASS executor's fast path calls for flush and saturation, compares, MUFU, conversions and min/max,
+// against the executor's own scalar rules written out here (the general rule of exec_float, on doubles and libm), over special
+// values (zeros of both signs, subnormals, the extremes, infinities, NaNs of both signs and payloads) and random bits.
+namespace {
+float ftz_ref(float f) { return std::fpclassify(f) == FP_SUBNORMAL ? std::copysign(0.0f, f) : f; }
+float sat_ref(float f) { return f != f ? 0.0f : f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
+bool fcmp_ref(unsigned cmp, double a, double b) {
+  const bool un = a != a || b != b;
+  switch (cmp) {
+    case 0: return false;
+    case 1: return !un && a < b;
+    case 2: return !un && a == b;
+    case 3: return !un && a <= b;
+    case 4: return !un && a > b;
+    case 5: return !un && a != b;
+    case 6: return !un && a >= b;
+    case 7: return !un;
+    case 8: return un;
+    case 9: return un || a < b;
+    case 10: return un || a == b;
+    case 11: return un || a <= b;
+    case 12: return un || a > b;
+    case 13: return un || a != b;
+    case 14: return un || a >= b;
+    default: return true;
+  }
+}
+const uint32_t kFloatBits[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u,
+                               0x3f800000u, 0xbf800000u, 0x3f000000u, 0x40000000u, 0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
+                               0x7fc00000u, 0xffc00000u, 0x7fc12345u, 0x7f800001u, 0xffbfffffu, 0x3effffffu, 0x4b000000u, 0x4b800001u,
+                               0x33800000u, 0x3f800001u, 0x2f800000u, 0x4f000000u, 0xcf000000u, 0x4f800000u, 0x4effffffu, 0xbf000000u,
+                               0x3f7fffffu, 0x40490fdbu, 0x0f800000u, 0x7e800000u, 0xc0000000u};
+constexpr size_t kNFB = sizeof kFloatBits / sizeof kFloatBits[0];
+}  // namespace
+
+VTEST(float_forms_at_every_level) {
+  std::mt19937 rng(9090);
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    const auto fail = [&](const char* what, unsigned lane, uint32_t a, uint32_t b, uint32_t c, uint32_t got, uint32_t want, int info) {
+      throw vtest::Failure(lv + " " + what + " info " + std::to_string(info) + " lane " + std::to_string(lane) + ": a=0x" + hex(a) +
+                           " b=0x" + hex(b) + " c=0x" + hex(c) + " got 0x" + hex(got) + " want 0x" + hex(want));
+    };
+    for (int round = 0; round < 20000; ++round) {
+      uint32_t a[32], b[32], c[32], r[32];
+      const int style = round % 3;
+      for (int i = 0; i < 32; ++i) {
+        a[i] = style == 0 ? static_cast<uint32_t>(rng()) : kFloatBits[rng() % kNFB];
+        b[i] = style == 1 ? static_cast<uint32_t>(rng()) : kFloatBits[rng() % kNFB];
+        c[i] = round % 5 == 0 ? static_cast<uint32_t>(rng()) : kFloatBits[rng() % kNFB];
+      }
+      // ffma_x, fadd_x, fmul_x
+      for (unsigned flags = 0; flags < 4; ++flags) {
+        const auto in = [&](uint32_t v) { return (flags & 1) ? ftz_ref(std::bit_cast<float>(v)) : std::bit_cast<float>(v); };
+        const auto fin = [&](float f) {
+          if (flags & 1) f = ftz_ref(f);
+          if (flags & 2) f = sat_ref(f);
+          return f != f ? 0x7fffffffu : std::bit_cast<uint32_t>(f);
+        };
+        k.ffma_x(r, a, b, c, flags);
+        for (int i = 0; i < 32; ++i) {
+          volatile float v = std::fma(in(a[i]), in(b[i]), in(c[i]));
+          if (r[i] != fin(v)) fail("ffma_x", i, a[i], b[i], c[i], r[i], fin(v), flags);
+        }
+        k.fadd_x(r, a, b, flags);
+        for (int i = 0; i < 32; ++i) {
+          volatile float v = in(a[i]) + in(b[i]);
+          if (r[i] != fin(v)) fail("fadd_x", i, a[i], b[i], 0, r[i], fin(v), flags);
+        }
+        k.fmul_x(r, a, b, flags);
+        for (int i = 0; i < 32; ++i) {
+          volatile float v = in(a[i]) * in(b[i]);
+          if (r[i] != fin(v)) fail("fmul_x", i, a[i], b[i], 0, r[i], fin(v), flags);
+        }
+      }
+      // fcmp_mask
+      for (unsigned cmp = 0; cmp < 16; ++cmp)
+        for (bool ftz : {false, true}) {
+          const uint32_t got = k.fcmp_mask(cmp, ftz, a, b);
+          uint32_t want = 0;
+          for (int i = 0; i < 32; ++i) {
+            const float x = ftz ? ftz_ref(std::bit_cast<float>(a[i])) : std::bit_cast<float>(a[i]);
+            const float y = ftz ? ftz_ref(std::bit_cast<float>(b[i])) : std::bit_cast<float>(b[i]);
+            want |= static_cast<uint32_t>(fcmp_ref(cmp, x, y)) << i;
+          }
+          if (got != want)
+            throw vtest::Failure(lv + " fcmp_mask cmp " + std::to_string(cmp) + (ftz ? " ftz" : "") + ": got 0x" + hex(got) + " want 0x" + hex(want));
+        }
+      // mufu: RCP, RSQ, SQRT
+      for (unsigned kind : {4u, 5u, 8u}) {
+        k.mufu(kind, r, a);
+        for (int i = 0; i < 32; ++i) {
+          volatile double x = ftz_ref(std::bit_cast<float>(a[i]));
+          volatile double q = kind == 4 ? 1.0 / x : kind == 5 ? 1.0 / std::sqrt(x) : std::sqrt(x);
+          const float f = ftz_ref(static_cast<float>(q));
+          const uint32_t want = std::bit_cast<uint32_t>(f);
+          if (r[i] != want) fail("mufu", i, a[i], 0, 0, r[i], want, static_cast<int>(kind));
+        }
+      }
+      // i2f
+      for (bool sgn : {false, true}) {
+        k.i2f(sgn, r, a);
+        for (int i = 0; i < 32; ++i) {
+          const int64_t sv = sgn ? static_cast<int64_t>(static_cast<int32_t>(a[i])) : static_cast<int64_t>(a[i]);
+          const uint32_t want = std::bit_cast<uint32_t>(static_cast<float>(sv));
+          if (r[i] != want) fail("i2f", i, a[i], 0, 0, r[i], want, sgn);
+        }
+      }
+      // f2i
+      for (bool sgn : {false, true})
+        for (unsigned rnd = 0; rnd < 4; ++rnd)
+          for (bool ftz : {false, true}) {
+            k.f2i(sgn, rnd, ftz, r, a);
+            for (int i = 0; i < 32; ++i) {
+              double x = ftz ? ftz_ref(std::bit_cast<float>(a[i])) : std::bit_cast<float>(a[i]);
+              switch (rnd) {
+                case 0: x = std::nearbyint(x); break;
+                case 1: x = std::floor(x); break;
+                case 2: x = std::ceil(x); break;
+                default: x = std::trunc(x); break;
+              }
+              uint64_t want64;
+              if (x != x) want64 = 0;
+              else if (sgn) {
+                const double lo = -std::ldexp(1.0, 31), hi = std::ldexp(1.0, 31) - 1;
+                want64 = static_cast<uint64_t>(static_cast<int64_t>(x < lo ? lo : x > hi ? hi : x));
+              } else {
+                const double hi = std::ldexp(1.0, 32) - 1;
+                want64 = static_cast<uint64_t>(x < 0 ? 0 : x > hi ? hi : x);
+              }
+              const uint32_t want = static_cast<uint32_t>(want64);
+              if (r[i] != want) fail("f2i", i, a[i], 0, 0, r[i], want, static_cast<int>(sgn) * 100 + static_cast<int>(rnd) * 10 + ftz);
+            }
+          }
+      // fmnmx
+      {
+        const uint32_t mn = round % 7 == 0 ? ~0u : round % 11 == 0 ? 0u : static_cast<uint32_t>(rng());
+        for (bool ftz : {false, true})
+          for (bool nan : {false, true}) {
+            k.fmnmx(r, a, b, mn, ftz, nan);
+            for (int i = 0; i < 32; ++i) {
+              const float x = ftz ? ftz_ref(std::bit_cast<float>(a[i])) : std::bit_cast<float>(a[i]);
+              const float y = ftz ? ftz_ref(std::bit_cast<float>(b[i])) : std::bit_cast<float>(b[i]);
+              const bool m = (mn >> i) & 1;
+              uint32_t want;
+              if (nan && (x != x || y != y)) {
+                want = 0x7fffffffu;
+              } else {
+                float v;
+                if (x != x) v = y;
+                else if (y != y) v = x;
+                else if (x == 0 && y == 0) v = m ? (std::signbit(x) ? x : y) : (std::signbit(x) ? y : x);
+                else v = m ? std::min(x, y) : std::max(x, y);
+                want = std::bit_cast<uint32_t>(v);
+              }
+              if (r[i] != want) fail("fmnmx", i, a[i], b[i], 0, r[i], want, (m ? 4 : 0) + (ftz ? 2 : 0) + (nan ? 1 : 0));
+            }
+          }
+      }
+    }
+  }
+}
+
 // lane_unary: the population count and the bit reversal against bit-by-bit loops, and FLO against a scan, for every word
 // with one or two bits set, every byte pattern in each byte, the edge words and random ones.
 VTEST(lane_unary_at_every_level) {

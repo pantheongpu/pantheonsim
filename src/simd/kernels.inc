@@ -837,6 +837,288 @@ void lane_unary_k(unsigned kind, uint32_t* r, const uint32_t* a) {
   }
 }
 
+// ---- float forms of the SASS executor's fast path: flush and saturation, compares, MUFU, conversions, min and max ---------
+
+// (Scalar helpers: the base level's loops, and the lanes of the AVX2 ones that the instructions cannot do.)
+inline uint32_t sc_ftz(uint32_t x) { return (x & 0x7f800000u) == 0 ? (x & 0x80000000u) : x; }
+inline float sc_sat(float f) { return f != f ? 0.0f : f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
+// A float result as the register holds it: flushed if flags bit 0, saturated if bit 1, a NaN the canonical one.
+inline uint32_t sc_finish(float f, unsigned flags) {
+  uint32_t u = std::bit_cast<uint32_t>(f);
+  if (flags & 1) u = sc_ftz(u);
+  float g = std::bit_cast<float>(u);
+  if (flags & 2) g = sc_sat(g);
+  return g != g ? 0x7fffffffu : std::bit_cast<uint32_t>(g);
+}
+inline float sc_in(uint32_t x, unsigned flags) { return std::bit_cast<float>((flags & 1) ? sc_ftz(x) : x); }
+
+#if VGPU_SIMD_AVX2
+inline __m256i fx_flush(__m256i x) {
+  const __m256i m = _mm256_cmpeq_epi32(_mm256_and_si256(x, _mm256_set1_epi32(0x7f800000)), _mm256_setzero_si256());
+  return _mm256_blendv_epi8(x, _mm256_and_si256(x, _mm256_set1_epi32(static_cast<int>(0x80000000u))), m);
+}
+inline __m256i fx_finish(__m256 v, unsigned flags) {
+  __m256i u = _mm256_castps_si256(v);
+  if (flags & 1) u = fx_flush(u);
+  if (flags & 2) {
+    const __m256 f = _mm256_castsi256_ps(u), zero = _mm256_setzero_ps(), one = _mm256_set1_ps(1.0f);
+    const __m256 low = _mm256_or_ps(_mm256_cmp_ps(f, zero, _CMP_LT_OQ), _mm256_cmp_ps(f, f, _CMP_UNORD_Q));
+    const __m256 g = _mm256_blendv_ps(_mm256_blendv_ps(f, zero, low), one, _mm256_cmp_ps(f, one, _CMP_GT_OQ));
+    u = _mm256_castps_si256(g);
+  }
+  const __m256 f = _mm256_castsi256_ps(u);
+  return _mm256_blendv_epi8(u, _mm256_set1_epi32(0x7fffffff), _mm256_castps_si256(_mm256_cmp_ps(f, f, _CMP_UNORD_Q)));
+}
+inline __m256i fx_load(const uint32_t* p, unsigned flags) {
+  const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+  return (flags & 1) ? fx_flush(x) : x;
+}
+#endif
+
+void ffma_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, unsigned flags) {
+#if VGPU_SIMD_AVX2
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256 v = _mm256_fmadd_ps(_mm256_castsi256_ps(fx_load(a + i, flags)), _mm256_castsi256_ps(fx_load(b + i, flags)),
+                                     _mm256_castsi256_ps(fx_load(c + i, flags)));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), fx_finish(v, flags));
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) r[l] = sc_finish(__builtin_fmaf(sc_in(a[l], flags), sc_in(b[l], flags), sc_in(c[l], flags)), flags);
+#endif
+}
+
+void fadd_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned flags) {
+#if VGPU_SIMD_AVX2
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256 v = _mm256_add_ps(_mm256_castsi256_ps(fx_load(a + i, flags)), _mm256_castsi256_ps(fx_load(b + i, flags)));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), fx_finish(v, flags));
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) r[l] = sc_finish(sc_in(a[l], flags) + sc_in(b[l], flags), flags);
+#endif
+}
+
+void fmul_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned flags) {
+#if VGPU_SIMD_AVX2
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256 v = _mm256_mul_ps(_mm256_castsi256_ps(fx_load(a + i, flags)), _mm256_castsi256_ps(fx_load(b + i, flags)));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), fx_finish(v, flags));
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) r[l] = sc_finish(sc_in(a[l], flags) * sc_in(b[l], flags), flags);
+#endif
+}
+
+// SASS's 4-bit float comparison code, on two floats (as the executor's float_cmp does it on their doubles).
+inline bool sc_fcmp(unsigned cmp, float a, float b) {
+  const bool un = a != a || b != b;
+  switch (cmp) {
+    case 0: return false;
+    case 1: return !un && a < b;
+    case 2: return !un && a == b;
+    case 3: return !un && a <= b;
+    case 4: return !un && a > b;
+    case 5: return !un && a != b;
+    case 6: return !un && a >= b;
+    case 7: return !un;
+    case 8: return un;
+    case 9: return un || a < b;
+    case 10: return un || a == b;
+    case 11: return un || a <= b;
+    case 12: return un || a > b;
+    case 13: return un || a != b;
+    case 14: return un || a >= b;
+    default: return true;
+  }
+}
+
+#if VGPU_SIMD_AVX2
+template <int Pred>
+inline uint32_t fcmp_avx2(const uint32_t* a, const uint32_t* b, unsigned flags) {
+  uint32_t out = 0;
+  for (unsigned i = 0; i < 32; i += 8)
+    out |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(_mm256_castsi256_ps(fx_load(a + i, flags)),
+                                                                  _mm256_castsi256_ps(fx_load(b + i, flags)), Pred)))
+           << i;
+  return out;
+}
+#endif
+
+uint32_t fcmp_mask_k(unsigned cmp, bool ftz, const uint32_t* a, const uint32_t* b) {
+#if VGPU_SIMD_AVX2
+  const unsigned fl = ftz ? 1u : 0u;
+  switch (cmp) {
+    case 0: return 0;
+    case 1: return fcmp_avx2<_CMP_LT_OQ>(a, b, fl);
+    case 2: return fcmp_avx2<_CMP_EQ_OQ>(a, b, fl);
+    case 3: return fcmp_avx2<_CMP_LE_OQ>(a, b, fl);
+    case 4: return fcmp_avx2<_CMP_GT_OQ>(a, b, fl);
+    case 5: return fcmp_avx2<_CMP_NEQ_OQ>(a, b, fl);
+    case 6: return fcmp_avx2<_CMP_GE_OQ>(a, b, fl);
+    case 7: return fcmp_avx2<_CMP_ORD_Q>(a, b, fl);
+    case 8: return fcmp_avx2<_CMP_UNORD_Q>(a, b, fl);
+    case 9: return fcmp_avx2<_CMP_NGE_UQ>(a, b, fl);
+    case 10: return fcmp_avx2<_CMP_EQ_UQ>(a, b, fl);
+    case 11: return fcmp_avx2<_CMP_NGT_UQ>(a, b, fl);
+    case 12: return fcmp_avx2<_CMP_NLE_UQ>(a, b, fl);
+    case 13: return fcmp_avx2<_CMP_NEQ_UQ>(a, b, fl);
+    case 14: return fcmp_avx2<_CMP_NLT_UQ>(a, b, fl);
+    default: return ~0u;
+  }
+#else
+  uint32_t out = 0;
+  for (unsigned l = 0; l < 32; ++l) out |= static_cast<uint32_t>(sc_fcmp(cmp, sc_in(a[l], ftz), sc_in(b[l], ftz))) << l;
+  return out;
+#endif
+}
+
+// MUFU.RCP (kind 4), .RSQ (5), .SQRT (8): in double, rounded once to float; the input flushed first, the result after.
+void mufu_k(unsigned kind, uint32_t* r, const uint32_t* a) {
+#if VGPU_SIMD_AVX2
+  const __m256d one = _mm256_set1_pd(1.0);
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256 x = _mm256_castsi256_ps(fx_load(a + i, 1));
+    const auto op = [&](__m128 h) {
+      const __m256d d = _mm256_cvtps_pd(h);
+      const __m256d v = kind == 4 ? _mm256_div_pd(one, d) : kind == 5 ? _mm256_div_pd(one, _mm256_sqrt_pd(d)) : _mm256_sqrt_pd(d);
+      return _mm256_cvtpd_ps(v);
+    };
+    const __m256 v = _mm256_set_m128(op(_mm256_extractf128_ps(x, 1)), op(_mm256_castps256_ps128(x)));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), fx_flush(_mm256_castps_si256(v)));
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) {
+    const double x = sc_in(a[l], 1);
+    const float f = static_cast<float>(kind == 4 ? 1.0 / x : kind == 5 ? 1.0 / __builtin_sqrt(x) : __builtin_sqrt(x));
+    r[l] = sc_ftz(std::bit_cast<uint32_t>(f));
+  }
+#endif
+}
+
+// I2F: an s32 or u32 to f32, to nearest even.
+void i2f_k(bool sgn, uint32_t* r, const uint32_t* a) {
+#if VGPU_SIMD_AVX2
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+    __m256 v;
+    if (sgn) {
+      v = _mm256_cvtepi32_ps(x);
+    } else {   // (as doubles, which hold a u32 exactly: the sign bit flipped to use the signed conversion, 2^31 added back)
+      const __m256i f = _mm256_xor_si256(x, _mm256_set1_epi32(static_cast<int>(0x80000000u)));
+      const __m256d two31 = _mm256_set1_pd(2147483648.0);
+      const __m256d lo = _mm256_add_pd(_mm256_cvtepi32_pd(_mm256_castsi256_si128(f)), two31);
+      const __m256d hi = _mm256_add_pd(_mm256_cvtepi32_pd(_mm256_extracti128_si256(f, 1)), two31);
+      v = _mm256_set_m128(_mm256_cvtpd_ps(hi), _mm256_cvtpd_ps(lo));
+    }
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), _mm256_castps_si256(v));
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l)
+    r[l] = std::bit_cast<uint32_t>(sgn ? static_cast<float>(static_cast<int64_t>(static_cast<int32_t>(a[l])))
+                                       : static_cast<float>(static_cast<int64_t>(a[l])));
+#endif
+}
+
+// F2I to 32 bits: f32 (flushed first if ftz) rounded by rnd (0 to nearest even, 1 down, 2 up, 3 towards zero), a NaN giving 0, an
+// out-of-range value the nearest end of the signed or unsigned range.
+inline uint32_t sc_f2i(bool sgn, unsigned rnd, float f) {
+  double x = f;
+  switch (rnd) {
+    case 0: x = __builtin_nearbyint(x); break;
+    case 1: x = __builtin_floor(x); break;
+    case 2: x = __builtin_ceil(x); break;
+    default: x = __builtin_trunc(x); break;
+  }
+  uint64_t v;
+  if (x != x) v = 0;
+  else if (sgn) v = static_cast<uint64_t>(static_cast<int64_t>(x < -2147483648.0 ? -2147483648.0 : x > 2147483647.0 ? 2147483647.0 : x));
+  else v = static_cast<uint64_t>(x < 0 ? 0.0 : x > 4294967295.0 ? 4294967295.0 : x);
+  return static_cast<uint32_t>(v);
+}
+
+#if VGPU_SIMD_AVX2
+// The four 64-bit lane masks of a __m256d compare as four 32-bit lane masks.
+inline __m128i narrow_mask_pd(__m256d m) {
+  return _mm_castps_si128(_mm_shuffle_ps(_mm256_castps256_ps128(_mm256_castpd_ps(m)), _mm256_extractf128_ps(_mm256_castpd_ps(m), 1), 0x88));
+}
+
+template <int Mode>
+inline void f2i_avx2(bool sgn, bool ftz, uint32_t* r, const uint32_t* a) {
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256 x = _mm256_castsi256_ps(fx_load(a + i, ftz ? 1u : 0u));
+    const auto half = [&](__m128 h) -> __m128i {
+      const __m256d d = _mm256_round_pd(_mm256_cvtps_pd(h), Mode | _MM_FROUND_NO_EXC);
+      __m128i v;
+      if (sgn) {
+        const __m256d c = _mm256_min_pd(_mm256_max_pd(d, _mm256_set1_pd(-2147483648.0)), _mm256_set1_pd(2147483647.0));
+        v = _mm256_cvttpd_epi32(c);
+      } else {
+        // Below 2^31 as it is; from there, 2^31 less (which the signed conversion takes) and the top bit put back.
+        const __m256d c = _mm256_min_pd(_mm256_max_pd(d, _mm256_setzero_pd()), _mm256_set1_pd(4294967295.0));
+        const __m256d big = _mm256_cmp_pd(c, _mm256_set1_pd(2147483648.0), _CMP_GE_OQ);
+        const __m256d adj = _mm256_sub_pd(c, _mm256_and_pd(big, _mm256_set1_pd(2147483648.0)));
+        v = _mm_or_si128(_mm256_cvttpd_epi32(adj), _mm_and_si128(narrow_mask_pd(big), _mm_set1_epi32(static_cast<int>(0x80000000u))));
+      }
+      // (max and min give their second operand for a NaN: the NaN lanes are cleared here)
+      return _mm_andnot_si128(narrow_mask_pd(_mm256_cmp_pd(d, d, _CMP_UNORD_Q)), v);
+    };
+    const __m128i lo = half(_mm256_castps256_ps128(x)), hi = half(_mm256_extractf128_ps(x, 1));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), _mm256_set_m128i(hi, lo));
+  }
+}
+#endif
+
+void f2i_k(bool sgn, unsigned rnd, bool ftz, uint32_t* r, const uint32_t* a) {
+#if VGPU_SIMD_AVX2
+  switch (rnd) {
+    case 0: f2i_avx2<_MM_FROUND_TO_NEAREST_INT>(sgn, ftz, r, a); break;
+    case 1: f2i_avx2<_MM_FROUND_TO_NEG_INF>(sgn, ftz, r, a); break;
+    case 2: f2i_avx2<_MM_FROUND_TO_POS_INF>(sgn, ftz, r, a); break;
+    default: f2i_avx2<_MM_FROUND_TO_ZERO>(sgn, ftz, r, a); break;
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) r[l] = sc_f2i(sgn, rnd, sc_in(a[l], ftz ? 1u : 0u));
+#endif
+}
+
+// FMNMX: lane l is the minimum of a and b if bit l of `min_mask` is set, else the maximum; a NaN loses (the other operand
+// is the answer; two NaNs give b), of two zeros the minimum is the negative one, the maximum the positive one; with `nan` a
+// NaN operand gives the canonical NaN. The operands are flushed first if ftz.
+inline uint32_t sc_fmnmx(float a, float b, bool mn, bool nan) {
+  if (nan && (a != a || b != b)) return 0x7fffffffu;
+  float r;
+  if (a != a) r = b;
+  else if (b != b) r = a;
+  else if (a == 0 && b == 0) r = mn ? (__builtin_signbit(a) ? a : b) : (__builtin_signbit(a) ? b : a);
+  else r = mn ? (b < a ? b : a) : (a < b ? b : a);
+  return std::bit_cast<uint32_t>(r);
+}
+
+void fmnmx_k(uint32_t* r, const uint32_t* a, const uint32_t* b, uint32_t min_mask, bool ftz, bool nan) {
+#if VGPU_SIMD_AVX2
+  const unsigned fl = ftz ? 1u : 0u;
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256 x = _mm256_castsi256_ps(fx_load(a + i, fl)), y = _mm256_castsi256_ps(fx_load(b + i, fl));
+    const __m256 mn = _mm256_castsi256_ps(lane_mask_dwords(min_mask >> i));
+    const __m256 xnan = _mm256_cmp_ps(x, x, _CMP_UNORD_Q), ynan = _mm256_cmp_ps(y, y, _CMP_UNORD_Q);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 both_zero = _mm256_and_ps(_mm256_cmp_ps(x, zero, _CMP_EQ_OQ), _mm256_cmp_ps(y, zero, _CMP_EQ_OQ));
+    const __m256 xneg = _mm256_castsi256_ps(_mm256_srai_epi32(_mm256_castps_si256(x), 31));   // all ones where a's sign bit is set
+    // min: b < a ? b : a; max: a < b ? b : a (no NaN, no two zeros here)
+    const __m256 vmin = _mm256_min_ps(y, x), vmax = _mm256_max_ps(y, x);
+    __m256 v = _mm256_blendv_ps(vmax, vmin, mn);
+    const __m256 zmin = _mm256_blendv_ps(y, x, xneg), zmax = _mm256_blendv_ps(x, y, xneg);
+    v = _mm256_blendv_ps(v, _mm256_blendv_ps(zmax, zmin, mn), both_zero);
+    v = _mm256_blendv_ps(v, x, ynan);
+    v = _mm256_blendv_ps(v, y, xnan);
+    if (nan) v = _mm256_blendv_ps(v, _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)), _mm256_or_ps(xnan, ynan));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), _mm256_castps_si256(v));
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) r[l] = sc_fmnmx(sc_in(a[l], ftz ? 1u : 0u), sc_in(b[l], ftz ? 1u : 0u), (min_mask >> l) & 1, nan);
+#endif
+}
+
 #if VGPU_SIMD_AVX2
 // Four doubles to four binary16 (in the low 64 bits): to nearest even in one rounding, a NaN the canonical 0x7fff.
 // The integer form of f64_to_f16_bits (simd/fp16.hpp), whose comments say why each constant is what it is.
