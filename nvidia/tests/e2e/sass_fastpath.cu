@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -236,6 +237,55 @@ __global__ void atomic_forms(AtomMem* m, uint32_t* out, int count, int pattern) 
   for (int k = 0; k < 12; ++k) out[static_cast<size_t>(i) * 12 + k] = o[k];
 }
 
+
+// Accesses that fault, one lane of the warp outside what it may reach. A fast path takes an access only when every active lane is
+// inside; with one outside it must hand the instruction to the general path, which reports the fault as it always did. Each
+// runs in a process of its own (a fault ends the context): `sass_fastpath <name>`.
+__global__ void oob_local(uint32_t* out, int far) {
+  uint32_t arr[256];
+  const int t = threadIdx.x;
+  for (int i = 0; i < 256; ++i) arr[i] = i * t;
+  volatile int idx = (t == 7) ? far : t;
+  out[t] = arr[idx];
+}
+__global__ void oob_gather(const uint32_t* in, uint32_t* out, long far) {
+  const int t = threadIdx.x;
+  out[t] = in[(t == 5) ? far : t];
+}
+__global__ void oob_scatter(uint32_t* out, long far) {
+  const int t = threadIdx.x;
+  out[(t == 9) ? far : t] = t;
+}
+__global__ void oob_atomic(uint32_t* out, long far) {
+  const int t = threadIdx.x;
+  atomicAdd(&out[(t == 3) ? far : t % 4], 1u);
+}
+__global__ void oob_shared(uint32_t* out, int far) {
+  __shared__ uint32_t s[64];
+  const int t = threadIdx.x;
+  s[t] = t;
+  __syncthreads();
+  volatile int idx = (t == 11) ? far : t;
+  out[t] = s[idx];
+}
+static int run_fault(const char* name) {
+  uint32_t *a, *b;
+  CK(cudaMalloc(&a, 4096));
+  CK(cudaMalloc(&b, 4096));
+  CK(cudaMemset(a, 0, 4096));
+  CK(cudaMemset(b, 0, 4096));
+  const std::string n = name;
+  if (n == "local") oob_local<<<1, 32>>>(a, 1 << 22);
+  else if (n == "gather") oob_gather<<<1, 32>>>(a, b, 1l << 34);
+  else if (n == "scatter") oob_scatter<<<1, 32>>>(a, 1l << 34);
+  else if (n == "atomic") oob_atomic<<<1, 32>>>(a, 1l << 34);
+  else if (n == "shared") oob_shared<<<1, 32>>>(a, 1 << 20);
+  else return 2;
+  const cudaError_t e = cudaDeviceSynchronize();
+  std::printf("fault %s: %s\n", name, cudaGetErrorString(e));
+  return e == cudaSuccess ? 1 : 0;   // it must fault
+}
+
 template <class T>
 static bool same(const std::vector<T>& a, const std::vector<T>& b, const char* what) {
   if (a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0) return true;
@@ -304,7 +354,8 @@ static int run_shared(const char* name) {
   return 0;
 }
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc > 1) return run_fault(argv[1]);
   for (int n : {1, 31, 32, 33, 1000, 4096 + 5}) {
     if (run_copy<uint8_t>("u8", n) || run_copy<uint16_t>("u16", n) || run_copy<uint32_t>("u32", n) ||
         run_copy<uint64_t>("u64", n) || run_copy<float>("f32", n))
