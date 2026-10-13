@@ -80,8 +80,14 @@ __global__ void k_wide(const u32* A, const u32* Bv, const u32* C, const u64* P, 
   u64 idx = P[i];
   const u32* base = A + (idx & 0xffff);
   const char* cp = (const char*)base + (i64)(idx >> 3) * 8 - (i64)(idx >> 41);
-  u32 r[24];
+  const u32* rp = (const u32*)P[(i + 1) % n];   // a pointer value that is anything: only the arithmetic on it is looked at
+  const u32* rq = (const u32*)P[(i + 2) % n];
+  u32 r[32];
   int k = 0;
+  r[k++] = (u32)(u64)(rp + (i32)A[i]);        r[k++] = (u32)((u64)(rp + (i32)A[i]) >> 32);
+  r[k++] = (u32)(u64)(rq + (A[i] >> 3));      r[k++] = (u32)((u64)(rq + (A[i] >> 3)) >> 32);
+  r[k++] = (u32)(u64)((const double*)rq + (i32)Bv[i]); r[k++] = (u32)((u64)((const double*)rq + (i32)Bv[i]) >> 32);
+  r[k++] = (u32)(u64)((const char*)rp - (i32)C[i]);    r[k++] = (u32)((u64)((const char*)rp - (i32)C[i]) >> 32);
   r[k++] = (u32)s; r[k++] = (u32)(s >> 32); r[k++] = (u32)(s >> 64); r[k++] = (u32)(s >> 96);
   r[k++] = (u32)d; r[k++] = (u32)(d >> 32); r[k++] = (u32)(d >> 64); r[k++] = (u32)(d >> 96);
   r[k++] = (u32)m; r[k++] = (u32)(m >> 32); r[k++] = (u32)(m >> 64); r[k++] = (u32)(m >> 96);
@@ -89,7 +95,7 @@ __global__ void k_wide(const u32* A, const u32* Bv, const u32* C, const u64* P, 
   r[k++] = (u32)(x == y); r[k++] = (u32)(x >= y);
   r[k++] = (u32)(u64)cp; r[k++] = (u32)((u64)cp >> 32); r[k++] = (u32)(u64)(cp + (idx >> 20)); r[k++] = (u32)((u64)(cp - (idx << 3)) >> 32);
   r[k++] = (u32)(idx * (u64)A[i]); r[k++] = (u32)((idx * (u64)A[i]) >> 32);
-  for (int j = 0; j < 24; ++j) out[(size_t)i * 24 + j] = r[j];
+  for (int j = 0; j < 32; ++j) out[(size_t)i * 32 + j] = j < k ? r[j] : 0;
 }
 
 // Branches on data, so that lanes diverge and the handlers see partial masks of every shape.
@@ -388,12 +394,12 @@ int main() {
     fill64(pv, 3);
     u64* dp = dev_copy(pv);
     u32* out;
-    CK(cudaMalloc(&out, (size_t)n * 24 * 4));
+    CK(cudaMalloc(&out, (size_t)n * 32 * 4));
     for (int threads : {128, 36}) {
       k_wide<<<(n + threads - 1) / threads, threads>>>(da, db, dc, dp, out, n);
       char label[64];
       std::snprintf(label, sizeof label, "wide threads=%d", threads);
-      if (report(label, out, (size_t)n * 24)) return 1;
+      if (report(label, out, (size_t)n * 32)) return 1;
     }
     CK(cudaFree(out)); CK(cudaFree(dp));
   }
