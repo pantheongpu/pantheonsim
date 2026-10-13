@@ -2510,14 +2510,13 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
 void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned size = ins.f[0];
   const uint32_t bytes = size <= 1 ? 1 : size <= 3 ? 2 : size == 4 ? 4 : size == 5 ? 8 : size == 8 ? 32 : 16;
-  const auto extend = [&](uint32_t v) -> uint32_t {
-    switch (size) {
-      case 0: return v & 0xff;
-      case 1: return static_cast<uint32_t>(static_cast<int8_t>(v));
-      case 2: return v & 0xffff;
-      case 3: return static_cast<uint32_t>(static_cast<int16_t>(v));
-      default: return v;
-    }
+  // A loaded byte or half to 32 bits: zero- or sign-extended (sizes 0 to 3: u8, s8, u16, s16), or the word as it is. (As shifts, not
+  // a switch: it is made for every lane.)
+  const unsigned ext_shift = size <= 1 ? 24u : size <= 3 ? 16u : 0u;
+  const bool ext_signed = size == 1 || size == 3;
+  const auto extend = [=](uint32_t v) -> uint32_t {
+    const uint32_t t = v << ext_shift;
+    return ext_signed ? static_cast<uint32_t>(static_cast<int32_t>(t) >> ext_shift) : t >> ext_shift;
   };
   // The address of a memory operand for one lane: the register (64-bit for
   // .E and the .64 forms), the uniform register when there is one, and the
@@ -2590,11 +2589,23 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       if (fast_ && !generic && (bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8) && ex && ((ex + (ex & -ex)) & ex) == 0) {
         const unsigned first = static_cast<unsigned>(std::countr_zero(ex));
         const unsigned count = popc(ex);
-        const uint64_t g0 = address(a, first, wide, ur, store ? 64 : 32, 0);
-        bool run = !(g0 >= kConstWindow && g0 < kConstWindow + (uint64_t{1} << 32));
-        for (unsigned i = 0; run && i < count; ++i) {
-          const uint64_t g = address(a, first + i, wide, ur, store ? 64 : 32, 0);
-          run = g == g0 + uint64_t{i} * bytes;
+        uint64_t g0;
+        bool run;
+        if (m_.sm >= 80) {
+          // (the addresses of all the lanes, then compared with a run of consecutive elements)
+          uint64_t ra[32];
+          row_addresses(a, wide, ur, store ? 64 : 32, ex, ra);
+          g0 = ra[first];
+          uint64_t diff = 0;
+          for (unsigned i = 0; i < count; ++i) diff |= ra[first + i] ^ (g0 + uint64_t{i} * bytes);
+          run = diff == 0 && !(g0 >= kConstWindow && g0 < kConstWindow + (uint64_t{1} << 32));
+        } else {
+          g0 = address(a, first, wide, ur, store ? 64 : 32, 0);
+          run = !(g0 >= kConstWindow && g0 < kConstWindow + (uint64_t{1} << 32));
+          for (unsigned i = 0; run && i < count; ++i) {
+            const uint64_t g = address(a, first + i, wide, ur, store ? 64 : 32, 0);
+            run = g == g0 + uint64_t{i} * bytes;
+          }
         }
         if (run && (g0 + uint64_t{count} * bytes - 1 < kConstWindow || g0 >= kConstWindow + (uint64_t{1} << 32))) {
           uint8_t buf[32 * 16];
@@ -2602,14 +2613,19 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           bool done = false;
           if (store) {
             const Operand& d = ins.src[1];
-            for (unsigned i = 0; i < count; ++i) {
-              if (bytes <= 4) {
-                const uint32_t v = read32(w, d, first + i);
-                std::memcpy(buf + i * bytes, &v, bytes);
-              } else {
-                uint32_t v[4];
-                for (unsigned k = 0; k < bytes / 4; ++k) v[k] = d.reg == kRZ ? 0 : w.reg(d.reg + k, first + i);
-                std::memcpy(buf + i * bytes, v, bytes);
+            if (bytes == 4 && d.kind == Kind::Reg) {   // (a word a lane: the register's lanes as they are)
+              if (d.reg == kRZ) std::memset(buf, 0, count * 4);
+              else std::memcpy(buf, &w.reg(d.reg, first), count * 4);
+            } else {
+              for (unsigned i = 0; i < count; ++i) {
+                if (bytes <= 4) {
+                  const uint32_t v = read32(w, d, first + i);
+                  std::memcpy(buf + i * bytes, &v, bytes);
+                } else {
+                  uint32_t v[4];
+                  for (unsigned k = 0; k < bytes / 4; ++k) v[k] = d.reg == kRZ ? 0 : w.reg(d.reg + k, first + i);
+                  std::memcpy(buf + i * bytes, v, bytes);
+                }
               }
             }
             done = mem_.store_run(g0, buf, uint64_t{count} * bytes, unit);
@@ -2617,16 +2633,20 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             done = mem_.load_run(g0, buf, uint64_t{count} * bytes, unit);
             if (done) {
               const Operand& d = ins.dst[0];
-              for (unsigned i = 0; i < count; ++i) {
-                if (bytes <= 4) {
-                  uint32_t v = 0;
-                  std::memcpy(&v, buf + i * bytes, bytes);
-                  write32(w, d, first + i, extend(v));
-                } else {
-                  uint32_t v[4];
-                  std::memcpy(v, buf + i * bytes, bytes);
-                  if (d.reg != kRZ)
-                    for (unsigned k = 0; k < bytes / 4; ++k) w.reg(d.reg + k, first + i) = v[k];
+              if (bytes == 4 && d.kind == Kind::Reg) {
+                if (d.reg != kRZ) std::memcpy(&w.reg(d.reg, first), buf, count * 4);
+              } else {
+                for (unsigned i = 0; i < count; ++i) {
+                  if (bytes <= 4) {
+                    uint32_t v = 0;
+                    std::memcpy(&v, buf + i * bytes, bytes);
+                    write32(w, d, first + i, extend(v));
+                  } else {
+                    uint32_t v[4];
+                    std::memcpy(v, buf + i * bytes, bytes);
+                    if (d.reg != kRZ)
+                      for (unsigned k = 0; k < bytes / 4; ++k) w.reg(d.reg + k, first + i) = v[k];
+                  }
                 }
               }
             }
