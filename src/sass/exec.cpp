@@ -210,9 +210,8 @@ std::mutex& atomic_lock(uint64_t addr) {
 
 void tier_add_total(uint64_t n);   // tier_ops.inc
 
-// Whether every lane of `run` has the program counter `p` (the lowest runnable lane's): then that is the lowest address
-// and `run` the group. The addresses are compared two to a vector register where SSE2 is there.
-inline bool tier_all_at(const Warp& w, uint64_t p, Mask run) {
+// The lanes whose program counter is `p`, compared two to a vector register where SSE2 is there.
+inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
   Mask eq = 0;
 #if defined(__SSE2__)
   const __m128i want = _mm_set1_epi64x(static_cast<long long>(p));
@@ -225,7 +224,7 @@ inline bool tier_all_at(const Warp& w, uint64_t p, Mask run) {
 #else
   for (unsigned i = 0; i < 32; ++i) eq |= static_cast<Mask>(w.pc[i] == p) << i;
 #endif
-  return (run & ~eq) == 0;
+  return eq;
 }
 
 class Runner {
@@ -307,6 +306,7 @@ class Runner {
   // For the tier's handlers (tier_ops.inc): the memory the launch runs on, and the interpreter's memory
   // instructions for the cases a handler leaves to it.
   MemoryManager& memory() { return mem_; }
+  uint32_t tier_sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const { return sreg(blk, w, idx, lane); }
   void tier_exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mem(blk, w, ins, ex); }
   ~Runner() {
     if (coop_ws_) {
@@ -1294,8 +1294,13 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   Mask group = 0;
   // With the tier on, a warp whose runnable lanes all stand at one address (the usual case) is found by comparing
   // the 32 addresses at once: the same lo and group the pass below finds.
-  if (tier_ && tier_all_at(w, lo, run)) {
-    group = run;
+  if (tier_) {
+    if (const Mask at = tier_lanes_at(w, lo); (run & ~at) == 0) {
+      group = run;
+    } else {   // diverged: the lowest address among the runnable lanes, and the lanes there
+      for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
+      group = tier_lanes_at(w, lo) & run;
+    }
   } else
   for (Mask m = run; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));

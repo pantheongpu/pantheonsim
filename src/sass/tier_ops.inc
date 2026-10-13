@@ -675,6 +675,30 @@ static void h_local(void* vc, const tier::MOp& op, Mask ex) {
   count_access(blk.st, 2, Store, addrs, ex, bytes);
 }
 
+// PLOP3: for each lane, the table bit that the three predicates select, into two predicates (exec_int).
+TIER_HANDLER(h_plop3) {
+  TIER_PRELUDE
+  const Mask a = tier_pmask(c, op.s[0]), b = tier_pmask(c, op.s[1]), d = tier_pmask(c, op.s[2]);
+  Mask r0 = 0, r1 = 0;
+  for (unsigned idx = 0; idx < 8; ++idx) {
+    const Mask term = ((idx & 4) ? a : ~a) & ((idx & 2) ? b : ~b) & ((idx & 1) ? d : ~d);
+    if ((op.a >> idx) & 1) r0 |= term;
+    if ((op.b >> idx) & 1) r1 |= term;
+  }
+  tier_setp(c, op.dst, ex, r0);
+  tier_setp(c, op.dst2, ex, r1);
+}
+
+TIER_HANDLER(h_s2r) {
+  TIER_PRELUDE
+  if (op.dst == tier::kNoReg) return;
+  uint32_t* d = c.R + op.dst * 32u;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    d[l] = c.r->tier_sreg(*c.blk, *c.w, op.a, l);
+  }
+}
+
 tier::MOp::Fn tier_handler_for(tier::Form f) {
   using F = tier::Form;
   switch (f) {
@@ -691,6 +715,8 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Fadd: return &h_fadd;
     case F::Fmul: return &h_fmul;
     case F::Dop: return &h_dop;
+    case F::Plop3: return &h_plop3;
+    case F::S2r: return &h_s2r;
     case F::Iadd3x: return &h_iadd3x;
     case F::Imad32: return &h_imad32;
     case F::ImadWide: return &h_imad_wide;
@@ -719,6 +745,7 @@ struct TierStats {
   std::atomic<uint64_t> native[kOps]{};
   std::mutex fb_mu;
   std::map<std::string, uint64_t> fallback;   // by mnemonic and modifiers, which tell the forms apart
+  std::map<std::string, uint64_t> ended;      // the instructions that end a run (control flow, waits, warp-wide ops), run by execute
   std::atomic<uint64_t> total{0};   // every warp instruction of the launches (LaunchStats::instructions)
   ~TierStats() {
     uint64_t nat = 0, fb = 0;
@@ -739,14 +766,16 @@ struct TierStats {
         line += std::string(" ") + op_name(static_cast<Op>(v[i].second)) + "=" + std::to_string(v[i].first);
       std::fprintf(stderr, "%s\n", line.c_str());
     }
-    {
+    const auto list = [&](const char* what, const std::map<std::string, uint64_t>& m) {
       std::vector<std::pair<uint64_t, std::string>> v;
-      for (const auto& [k, n] : fallback) v.emplace_back(n, k);
+      for (const auto& [k, n] : m) v.emplace_back(n, k);
       std::sort(v.rbegin(), v.rend());
-      std::string line = "tier interpreter (straight):";
+      std::string line = std::string("tier ") + what + ":";
       for (size_t i = 0; i < v.size() && i < 24; ++i) line += " " + v[i].second + "=" + std::to_string(v[i].first);
       std::fprintf(stderr, "%s\n", line.c_str());
-    }
+    };
+    list("interpreter (straight)", fallback);
+    list("interpreter (ends a run)", ended);
   }
 };
 
@@ -755,12 +784,12 @@ TierStats& tier_stats() {
   return s;
 }
 
-void tier_note_fallback(const Instr& ins) {
+void tier_note_fallback(const Instr& ins, bool ends_run = false) {
   std::string key = ins.mnemonic;
   for (const std::string& m : ins.mods) key += "." + m;
   TierStats& s = tier_stats();
   std::lock_guard<std::mutex> g(s.fb_mu);
-  ++s.fallback[key];
+  ++(ends_run ? s.ended : s.fallback)[key];
 }
 
 void tier_add_total(uint64_t n) { tier_stats().total.fetch_add(n, std::memory_order_relaxed); }
@@ -839,6 +868,37 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
     if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::BRA)].fetch_add(1, std::memory_order_relaxed);
     return true;
   }
+  if (last.fn && !last.straight && (regs_ok || last.maxreg <= w.nregs)) {
+    // PLOP3 and S2R: a handler, and the next address (execute() advances the group when nothing set the counters).
+    const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+    const unsigned lanes = ex == group ? glanes : popc(ex);
+    ++st.instructions;
+    st.thread_instructions += lanes;
+    st.inst_by_class[last.cls] += lanes;
+    if (ex) last.fn(&c, last, ex);
+    const uint64_t next = code.base + 16 * static_cast<uint64_t>(idx) + 16;
+    for (Mask m = group; m; m &= m - 1) w.pc[std::countr_zero(m)] = next;
+    if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(last.ins->op)].fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  if (last.form == tier::Form::Bssy || last.form == tier::Form::Nop) {
+    // These leave the program counters to execute()'s advance: every lane of the group goes on to the next address.
+    const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+    const unsigned lanes = ex == group ? glanes : popc(ex);
+    ++st.instructions;
+    st.thread_instructions += lanes;
+    st.inst_by_class[last.cls] += lanes;
+    if (last.form == tier::Form::Bssy) {
+      // The lanes join the barrier, in nesting order (see exec_control's BSSY).
+      w.b[last.dst] |= ex;
+      w.bssy_stamp[last.dst & 15] = ++blk.bssy_clock;
+    }
+    const uint64_t next = code.base + 16 * static_cast<uint64_t>(idx) + 16;
+    for (Mask m = group; m; m &= m - 1) w.pc[std::countr_zero(m)] = next;
+    if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(last.ins->op)].fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  if (tier_stats_) [[unlikely]] tier_note_fallback(*last.ins, true);
   if (idx != first) {
     const uint64_t pc = code.base + 16 * static_cast<uint64_t>(idx);
     for (Mask m = group; m; m &= m - 1) w.pc[std::countr_zero(m)] = pc;

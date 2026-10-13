@@ -87,6 +87,10 @@ enum class Form : uint8_t {
   Fmul,
   Dop,       // DADD, DMUL, DFMA
   Bra,       // a plain relative BRA: run by tier_run itself when it ends a straight-line run
+  Bssy,      // BSSY and NOP, which end a run without moving any lane's program counter: run by tier_run too
+  Nop,
+  Plop3,     // PLOP3 and S2R end a run (they are not straight-line ones) but need nothing of the interpreter
+  S2r,
   Count_,
 };
 const char* form_name(Form f);

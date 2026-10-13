@@ -262,7 +262,7 @@ const char* form_name(Form f) {
   static const char* const names[] = {"none",  "mov",   "iadd3", "iadd3x", "imad",  "imad32", "imadwide", "imadhi",
                                       "isetpex", "popc", "i2fp",  "ldg",    "stg",   "lds",    "sts",      "ldl",
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
-                                      "fadd",  "fmul",  "dop",    "bra"};
+                                      "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -352,6 +352,36 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
         if (o.kind == Kind::Pred || o.kind == Kind::UPred) return;
       m.imm = ins.src.back().imm;
       accept(Form::Bra);
+      return;
+    }
+    case Op::BSSY:   // the lanes join convergence barrier Bx (exec_control)
+      if (ins.dst.empty() || ins.dst[0].reg >= 16) return;
+      m.dst = static_cast<uint16_t>(ins.dst[0].reg);
+      accept(Form::Bssy);
+      return;
+    case Op::NOP:
+      accept(Form::Nop);
+      return;
+    case Op::PLOP3: {   // a three-input logic function of three predicates, into two
+      if (ins.guard_uniform || ins.f[2] || ins.dst.size() < 2 || !pred_dst(ins.dst[0]) || !pred_dst(ins.dst[1]) || ins.src.size() < 3)
+        return;
+      for (int i = 0; i < 3; ++i)
+        if (ins.src[i].kind != Kind::Pred && ins.src[i].kind != Kind::UPred) return;
+      m.s[0] = pred_src(ins.src[0]);
+      m.s[1] = pred_src(ins.src[1]);
+      m.s[2] = pred_src(ins.src[2]);
+      m.a = ins.f[0];
+      m.b = ins.f[1];
+      m.dst = static_cast<uint16_t>(ins.dst[0].reg);
+      m.dst2 = static_cast<uint16_t>(ins.dst[1].reg);
+      accept(Form::Plop3);
+      return;
+    }
+    case Op::S2R: {   // a special register of each lane (not a performance-monitor counter: those are refused)
+      if (ins.guard_uniform || ins.dst.empty() || ins.dst[0].kind != Kind::Reg || (ins.f[0] >= 0x64 && ins.f[0] <= 0x73)) return;
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.a = ins.f[0];
+      accept(Form::S2r);
       return;
     }
     default: break;
