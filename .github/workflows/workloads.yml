@@ -92,6 +92,27 @@ jobs:
           - { key: h200-x4-cuda13.0,  gpu: nvidia/h200,        count: 4, cuda: '13.0' }  # Hopper 9.0
           - { key: rtx5090-x1-cuda13.0, gpu: nvidia/rtx5090,   count: 1, cuda: '13.0' }  # Blackwell 12.0, consumer; CUDA 12.8+
           - { key: b300-x1-cuda13.0,  gpu: nvidia/b300,        count: 1, cuda: '13.0' }  # Blackwell Ultra 10.3; CUDA 12.9+
+          - { key: a100-80gb-pcie-x1-cuda13.0, gpu: nvidia/a100-80gb-pcie, count: 1, cuda: '13.0' }  # Ampere 8.0, PCIe
+          - { key: a30-x1-cuda12.0, gpu: nvidia/a30, count: 1, cuda: '12.0' }  # Ampere 8.0
+          - { key: a40-x1-cuda13.0, gpu: nvidia/a40, count: 1, cuda: '13.0' }  # Ampere 8.6
+          - { key: rtx-a5000-x1-cuda12.0, gpu: nvidia/rtx-a5000, count: 1, cuda: '12.0' }  # Ampere 8.6, workstation
+          - { key: rtx-a6000-x1-cuda13.0, gpu: nvidia/rtx-a6000, count: 1, cuda: '13.0' }  # Ampere 8.6, workstation
+          - { key: rtx3070-x1-cuda12.0, gpu: nvidia/rtx3070, count: 1, cuda: '12.0' }  # Ampere 8.6, consumer
+          - { key: rtx3090-x1-cuda13.0, gpu: nvidia/rtx3090, count: 1, cuda: '13.0' }  # Ampere 8.6, consumer
+          - { key: rtx2080ti-x1-cuda13.0, gpu: nvidia/rtx2080ti, count: 1, cuda: '13.0' }  # Turing 7.5, consumer
+          - { key: l40-x1-cuda13.0, gpu: nvidia/l40, count: 1, cuda: '13.0' }  # Ada 8.9
+          - { key: rtx4080-x1-cuda12.0, gpu: nvidia/rtx4080, count: 1, cuda: '12.0' }  # Ada 8.9, consumer
+          - { key: rtx4090-x1-cuda13.0, gpu: nvidia/rtx4090, count: 1, cuda: '13.0' }  # Ada 8.9, consumer
+          - { key: rtx6000-ada-x1-cuda12.0, gpu: nvidia/rtx6000-ada, count: 1, cuda: '12.0' }  # Ada 8.9, workstation
+          - { key: h100-nvl-x2-cuda12.0, gpu: nvidia/h100-nvl, count: 2, cuda: '12.0' }  # Hopper 9.0, two NVLink-bridged cards
+          - { key: h200-nvl-x1-cuda13.0, gpu: nvidia/h200-nvl, count: 1, cuda: '13.0' }  # Hopper 9.0
+          - { key: gb10-x1-cuda13.0, gpu: nvidia/gb10, count: 1, cuda: '13.0' }  # Blackwell 12.1, unified memory; CUDA 12.9+
+          - { key: gb200-x2-cuda13.0, gpu: nvidia/gb200, count: 2, cuda: '13.0' }  # Blackwell 10.0, Grace Blackwell
+          - { key: thor-x1-cuda13.0, gpu: nvidia/thor, count: 1, cuda: '13.0' }  # Blackwell 11.0, Jetson Thor; CUDA 13.0+
+          - { key: rtx-pro-6000-x1-cuda13.0, gpu: nvidia/rtx-pro-6000, count: 1, cuda: '13.0' }  # Blackwell 12.0, workstation
+          - { key: rtx-pro-6000-max-q-x1-cuda13.0, gpu: nvidia/rtx-pro-6000-max-q, count: 1, cuda: '13.0' }  # Blackwell 12.0, Max-Q
+          - { key: rtx-pro-6000-server-x1-cuda13.0, gpu: nvidia/rtx-pro-6000-server, count: 1, cuda: '13.0' }  # Blackwell 12.0, server
+          - { key: vr200-x1-cuda13.0, gpu: nvidia/vr200, count: 1, cuda: '13.0' }  # Rubin 10.7
     env:
       # CUDA 13 packages from NVIDIA's repository: the compiler and the headers
       # of every library the simulator stands in for.
@@ -151,6 +172,9 @@ jobs:
           VGPU_WORKLOAD_SECONDS: '5'
           VGPU_WORKLOAD_ARGS: --kernel_loops 2 --warmup_iters 1 --grid_size 4
           VGPU_WORKLOAD_TIMEOUT: '300'
+          # mma_virus and omni_virus run a cuBLASLt GEMM, which the simulator computes
+          # on the host; the default 4096 cubed does not finish in the timeout.
+          VGPU_WORKLOAD_GEMM_SIZE: '256'
           KEY: ${{ matrix.key }}
         # Paths from $GITHUB_WORKSPACE: the github.workspace and runner.temp
         # expressions name the runner's paths even inside a container.
