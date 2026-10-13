@@ -291,7 +291,7 @@ static int run_fault(const char* name) {
 // its own SASS (FFMA.FTZ, FADD.SAT, FMNMX.FTZ, MUFU.RCP, F2I.TRUNC, I2FP, FSETP...). The special values come from the host: zeros,
 // subnormals, infinities, NaNs of both signs, the extremes. Only the two runs' agreement is checked for these (the kernels have
 // their own host references in tests/unit/test_simd.cpp).
-constexpr int kFloatForms = 28;
+constexpr int kFloatForms = 36;
 __device__ __forceinline__ uint32_t fbits_(float f) { return __float_as_uint(f); }
 __global__ void float_forms(const float* in, uint32_t* out, int n, int shape) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -339,6 +339,15 @@ __global__ void float_forms(const float* in, uint32_t* out, int n, int shape) {
     o[25] = m;
     o[26] = static_cast<uint32_t>(a > b ? 1 : 0) | (static_cast<uint32_t>(fabsf(a) < fabsf(b) ? 2 : 0));
     o[27] = fbits_(fminf(a, b)) ^ fbits_(fmaxf(b, c));
+    // Directed rounding, with a flush and a saturation, and the narrow integers to f32 (I2F.U8, .S8, .U16, .S16 with a byte selected).
+    asm("fma.rz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c)); o[28] = fbits_(r);
+    asm("mul.rm.ftz.sat.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[29] = fbits_(r);
+    asm("add.rp.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); o[30] = fbits_(r);
+    asm("fma.rm.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(-a), "f"(b), "f"(c)); o[31] = fbits_(r);
+    o[32] = fbits_(static_cast<float>(static_cast<unsigned char>(ia >> 8)));
+    o[33] = fbits_(static_cast<float>(static_cast<signed char>(ia >> 16)));
+    o[34] = fbits_(static_cast<float>(static_cast<unsigned short>(ib >> 16)));
+    o[35] = fbits_(static_cast<float>(static_cast<short>(ib)));
   }
   for (int k = 0; k < kFloatForms; ++k) out[static_cast<size_t>(i) * kFloatForms + k] = o[k];
 }

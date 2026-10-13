@@ -1364,7 +1364,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     }
     case Op::FFMA: case Op::FADD: case Op::FMUL: {
       const unsigned nsrc = ins.op == Op::FFMA ? 3 : 2;
-      if ((ins.f[1] || ins.f[2]) && !ins.f[0]) return fast_float(w, ins, ex);   // .FTZ, .SAT
+      if (ins.f[0] || ins.f[1] || ins.f[2]) return fast_float(w, ins, ex);   // a rounding mode, .FTZ, .SAT
       if (ins.f[0] || ins.f[1] || ins.f[2] || (ins.op == Op::FMUL && ins.f[4] != 4) || ins.src.size() < nsrc)
         return false;
       const uint32_t* s[3];
@@ -1648,16 +1648,39 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
   switch (ins.op) {
     case Op::FFMA: case Op::FADD: case Op::FMUL: {
       const unsigned nsrc = ins.op == Op::FFMA ? 3 : 2;
-      if (ins.f[0] || (ins.op == Op::FMUL && ins.f[4] != 4) || ins.src.size() < nsrc || ins.dst[0].kind != Kind::Reg) return false;
+      if ((ins.op == Op::FMUL && ins.f[4] != 4) || ins.src.size() < nsrc || ins.dst[0].kind != Kind::Reg) return false;
       const unsigned flags = (ins.f[1] ? 1u : 0u) | (ins.f[2] ? 2u : 0u);
+      // A directed rounding mode (RM, RP, RZ) is the host's own for the kernel's arithmetic: set around the call, once for the 32
+      // lanes (the kernel is called through a pointer, so the compiler keeps its arithmetic between the two).
+      struct RoundingScope {
+        int saved;
+        explicit RoundingScope(unsigned rnd) : saved(std::fegetround()) {
+          static const int modes[] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
+          std::fesetround(modes[rnd & 3]);
+          asm volatile("" ::: "memory");
+        }
+        ~RoundingScope() {
+          asm volatile("" ::: "memory");
+          std::fesetround(saved);
+        }
+      };
       const uint32_t* s[3];
       for (unsigned i = 0; i < nsrc; ++i) {
         if (!plain(ins.src[i]) || ins.src[i].bnot) return false;
         s[i] = lanes(i, ins.src[i], true);
       }
-      if (ins.op == Op::FFMA) sk->ffma_x(r, s[0], s[1], s[2], flags);
-      else if (ins.op == Op::FADD) sk->fadd_x(r, s[0], s[1], flags);
-      else sk->fmul_x(r, s[0], s[1], flags);
+      if (ins.f[0]) {
+        RoundingScope scope(ins.f[0]);
+        if (ins.op == Op::FFMA) sk->ffma_x(r, s[0], s[1], s[2], flags);
+        else if (ins.op == Op::FADD) sk->fadd_x(r, s[0], s[1], flags);
+        else sk->fmul_x(r, s[0], s[1], flags);
+      } else if (ins.op == Op::FFMA) {
+        sk->ffma_x(r, s[0], s[1], s[2], flags);
+      } else if (ins.op == Op::FADD) {
+        sk->fadd_x(r, s[0], s[1], flags);
+      } else {
+        sk->fmul_x(r, s[0], s[1], flags);
+      }
       if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
       return true;
     }
@@ -1720,8 +1743,22 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       const unsigned dsize = ins.op == Op::I2FP ? 2 : ins.f[0], ssize = ins.op == Op::I2FP ? 2 : ins.f[1];
       const bool sgn = ins.op == Op::I2FP ? ins.f[0] != 0 : ins.f[2] != 0;
       const unsigned rnd = ins.op == Op::I2FP ? ins.f[1] : ins.f[3];
-      if (dsize != 2 || ssize != 2 || rnd != 0 || ins.src.empty() || !plain(ins.src[0]) || ins.dst[0].kind != Kind::Reg) return false;
-      sk->i2f(sgn, r, lanes(0, ins.src[0], false));
+      if (dsize != 2 || ssize > 2 || rnd != 0 || ins.src.empty() || !plain(ins.src[0]) || ins.dst[0].kind != Kind::Reg) return false;
+      const uint32_t* src = lanes(0, ins.src[0], false);
+      if (ssize < 2) {
+        // A byte or a half of the register (I2F's .B1-.B3, .H1 move it down), sign- or zero-extended to 32 bits: it converts as
+        // a signed 32-bit integer.
+        alignas(32) uint32_t ext[32];
+        const unsigned shift = ins.op == Op::I2F ? (ssize == 1 ? 16u : 8u) * ins.f[4] : 0u;
+        for (unsigned l = 0; l < 32; ++l) {
+          const uint32_t v = shift >= 32 ? 0u : src[l] >> shift;
+          ext[l] = ssize == 0 ? (sgn ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v))) : (v & 0xffu))
+                              : (sgn ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v))) : (v & 0xffffu));
+        }
+        sk->i2f(true, r, ext);
+      } else {
+        sk->i2f(sgn, r, src);
+      }
       if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
       return true;
     }
