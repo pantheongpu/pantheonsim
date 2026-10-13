@@ -283,6 +283,10 @@ class Runner {
 
   exec::LaunchStats run();
   void set_launches(Launches* dl) { dl_ = dl; }
+  // For the tier's handlers (tier_ops.inc): the memory the launch runs on, and the interpreter's memory
+  // instructions for the cases a handler leaves to it.
+  MemoryManager& memory() { return mem_; }
+  void tier_exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mem(blk, w, ins, ex); }
   ~Runner() {
     if (coop_ws_) {
       try {

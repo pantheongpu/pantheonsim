@@ -62,7 +62,20 @@ enum class Form : uint8_t {
   None,
   Mov,       // MOV Rd, src
   Iadd3,
+  Iadd3x,    // IADD3 with carry-outs and/or carry-ins
   Imad,
+  Imad32,    // IMAD with a carry-in or a carry-out
+  ImadWide,  // IMAD.WIDE: a 64-bit result
+  ImadHi,    // IMAD.HI
+  IsetpEx,   // ISETP.EX
+  Popc,
+  I2fp,      // I2FP.F32 from a 32-bit integer
+  Ldg,       // global loads and stores of 1, 2, 4 or 8 bytes
+  Stg,
+  Lds,       // shared memory
+  Sts,
+  Ldl,       // local memory
+  Stl,
   Lop3,
   Lea,
   Shf,
@@ -84,6 +97,8 @@ struct MOp {
   const Instr* ins = nullptr;    // for the interpreter, faults and statistics
   Src s[3];                      // sources, in the order the handler takes them
   Src p;                         // a predicate source (Dyn::Reg: a per-lane P<n>; Dyn::UReg: a uniform UP<n>), if any
+  Src p2;                        // a second one
+  int64_t imm = 0;               // a memory operand's offset
   uint32_t a = 0, b = 0;         // form-specific immediates (a LOP3's table, an IADD3's +1 count, a shift, ...)
   uint32_t c = 0;
   uint16_t dst = 0;              // destination register row, or kNoReg for RZ
@@ -95,6 +110,7 @@ struct MOp {
   bool guard_not = false;
   bool guard_uniform = false;
   bool unguarded = true;
+  bool never = false;            // @!PT: the guard is false for every lane, so it does nothing but count
   bool straight = false;         // Instr::straight
   uint8_t aux = 0;               // form-specific flags
 };

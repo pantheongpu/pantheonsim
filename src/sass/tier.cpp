@@ -211,11 +211,58 @@ bool src64(Builder& b, const Operand& o, unsigned i, Src& out, uint32_t& mods, u
   return true;
 }
 
+// A 64-bit integer source (IMAD.WIDE's addend): a register pair, or one value for every lane. -x and ~x on the 64 bits
+// are folded into a constant, and left in `mod` for a pair or a value read when the instruction runs.
+bool src64i(Builder& b, const Operand& o, uint8_t mod, Src& out, uint16_t& maxreg) {
+  const auto fold = [&](uint64_t v) {
+    if (mod & kNeg) v = 0 - v;
+    if (mod & kNot) v = ~v;
+    return b.constant64(v);
+  };
+  switch (o.kind) {
+    case Kind::Reg:
+      if (o.reg == kRZ) { out = fold(0); return true; }
+      out = Src{};
+      out.kind = SrcKind::Row;
+      out.mod = mod;
+      out.off = o.reg * 32u;
+      maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(o.reg + 2));
+      return true;
+    case Kind::Imm: out = fold(static_cast<uint64_t>(o.imm)); return true;
+    case Kind::FImm: out = fold(o.fbits); return true;
+    case Kind::UReg:
+      if (o.reg >= b.urz()) { out = fold(0); return true; }
+      out = Src{};
+      out.kind = SrcKind::Dyn;
+      out.dyn = Dyn::UReg;
+      out.mod = mod;
+      out.off = o.reg;
+      return true;
+    case Kind::CBank: {
+      if (o.reg != 0) return false;
+      const uint64_t off = static_cast<uint64_t>(o.imm);
+      if (off > 0xffffffffull - 16) { out = fold(0); return true; }
+      out = Src{};
+      out.kind = SrcKind::Dyn;
+      out.dyn = Dyn::Bank0;
+      out.mod = mod;
+      out.off = static_cast<uint32_t>(off);
+      return true;
+    }
+    default: return false;
+  }
+}
+
+// How many bytes a memory instruction moves (exec_mem's table), and how a sub-word load widens (extend).
+unsigned mem_bytes(unsigned size) { return size <= 1 ? 1 : size <= 3 ? 2 : size == 4 ? 4 : size == 5 ? 8 : size == 8 ? 32 : 16; }
+
 }  // namespace
 
 const char* form_name(Form f) {
-  static const char* const names[] = {"none", "mov",   "iadd3", "imad",  "lop3", "lea", "shf",
-                                      "isetp", "fsetp", "fsel",  "ffma",  "fadd", "fmul", "dop"};
+  static const char* const names[] = {"none",  "mov",   "iadd3", "iadd3x", "imad",  "imad32", "imadwide", "imadhi",
+                                      "isetpex", "popc", "i2fp",  "ldg",    "stg",   "lds",    "sts",      "ldl",
+                                      "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
+                                      "fadd",  "fmul",  "dop"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -229,7 +276,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
   op.guard_not = ins.guard_not;
   op.guard_uniform = ins.guard_uniform;
   op.unguarded = ins.guard == kPT && !ins.guard_not;
-  if (ins.dst.empty()) return;
+  op.never = ins.guard == kPT && ins.guard_not;   // Runner::guard_mask: ~(all lanes) is none
   Builder b{prog, sm};
   if (prog.pool.empty()) b.const_row(0);   // pool[0] is the zero row
   uint16_t maxreg = 0;
@@ -241,13 +288,75 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
     op = m;
   };
 
+  // Memory instructions: stores have no destination, so these come before the check below.
+  switch (ins.op) {
+    case Op::LDG: case Op::STG: {
+      // Global loads and stores of 1, 2, 4 or 8 bytes on Ampere and later (Turing's address form is the interpreter's).
+      const bool store = ins.op == Op::STG;
+      const unsigned bytes = mem_bytes(ins.f[0]);
+      if (sm < 80 || !(bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8) || ins.src.size() < (store ? 2u : 1u)) return;
+      const Operand& d = store ? ins.src[1] : ins.dst.empty() ? ins.src[0] : ins.dst[0];
+      if (!store && ins.dst.empty()) return;
+      if (d.kind != Kind::Reg) return;
+      const bool e = ins.w.bit(72), wide = e || ins.w.bit(90), ur = ins.w.bit(91) && !e;
+      const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
+      unsigned u = ~0u;
+      if (ur) {
+        u = static_cast<unsigned>(ins.w.field(store ? 64 : 32, sm >= 100 ? 8 : 6));
+        if (u == (sm >= 100 ? 255u : 63u)) u = ~0u;
+      }
+      if (ra != kRZ) maxreg = static_cast<uint16_t>(ra + (wide ? 2 : 1));
+      if (d.reg != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(d.reg + (bytes == 8 ? 2 : 1)));
+      m.a = bytes;
+      m.b = ins.f[0];
+      m.s[0].off = ra;
+      m.s[1].off = u;
+      m.imm = ins.src[0].imm;
+      m.aux = wide ? 1 : 0;
+      m.dst = d.reg == kRZ ? kNoReg : static_cast<uint16_t>(d.reg);
+      accept(store ? Form::Stg : Form::Ldg);
+      return;
+    }
+    case Op::LDS: case Op::STS: case Op::LDL: case Op::STL: {
+      const bool store = ins.op == Op::STS || ins.op == Op::STL, shared = ins.op == Op::LDS || ins.op == Op::STS;
+      const unsigned bytes = mem_bytes(ins.f[0]);
+      if (!(bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16) || ins.src.size() < (store ? 2u : 1u)) return;
+      if (shared && ins.f[3] > 3) return;
+      const Operand* d = store ? &ins.src[1] : ins.dst.empty() ? nullptr : &ins.dst[0];
+      if (!d || d->kind != Kind::Reg) return;
+      const bool ur = ins.w.bit(91);
+      const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
+      unsigned u = ~0u;
+      if (ur) {
+        u = static_cast<unsigned>(ins.w.field(store ? 64 : 32, sm >= 100 ? 8 : 6));
+        if (u == (sm >= 100 ? 255u : 63u)) u = ~0u;
+      }
+      static const unsigned kStrides[] = {0, 4, 8, 16};
+      if (ra != kRZ) maxreg = static_cast<uint16_t>(ra + 1);
+      if (d->reg != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(d->reg + std::max(1u, bytes / 4)));
+      m.a = bytes;
+      m.b = ins.f[0];
+      m.c = shared ? kStrides[ins.f[3]] : 0;
+      m.s[0].off = ra;
+      m.s[1].off = u;
+      m.imm = ins.src[0].imm;
+      m.dst = d->reg == kRZ ? kNoReg : static_cast<uint16_t>(d->reg);
+      accept(shared ? (store ? Form::Sts : Form::Lds) : (store ? Form::Stl : Form::Ldl));
+      return;
+    }
+    default: break;
+  }
+  if (ins.dst.empty()) return;
+
   switch (ins.op) {
     case Op::ISETP: {
       const unsigned cmp = ins.f[0];
-      if (ins.f[3] || ins.f[4] || ins.dst.size() < 2 || !pred_dst(ins.dst[0]) || !pred_dst(ins.dst[1]) ||
-          ins.src.size() < 3)
+      if (ins.f[4] || ins.dst.size() < 2 || !pred_dst(ins.dst[0]) || !pred_dst(ins.dst[1]) || ins.src.size() < 3)
         return;
       if (cmp < 1 || cmp > 6) return;   // false and true: the interpreter's loop
+      // .EX: the high words of a 64-bit compare, the low words' answer coming in as a predicate (exec_int).
+      const bool ex_form = ins.f[3] != 0;
+      if (ex_form && (ins.guard_uniform || ins.src.size() < 4)) return;
       for (int i = 0; i < 2; ++i) {
         const Operand& o = ins.src[i];
         if (!(o.kind == Kind::Reg || o.kind == Kind::Imm || o.kind == Kind::CBank || o.kind == Kind::UReg)) return;
@@ -259,7 +368,8 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.c = ins.f[1] ? 1 : 0;            // signed
       m.dst = static_cast<uint16_t>(ins.dst[0].reg);
       m.dst2 = static_cast<uint16_t>(ins.dst[1].reg);
-      accept(Form::Isetp);
+      if (ex_form) m.p2 = pred_src(ins.src[3]);
+      accept(ex_form ? Form::IsetpEx : Form::Isetp);
       return;
     }
     case Op::FSETP: {
@@ -318,36 +428,97 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       return;
     }
     case Op::IADD3: {
-      if (ins.f[0] || ins.f[1] || ins.src.size() < 3) return;
+      if (ins.f[1] || ins.src.size() < 3) return;
+      const bool x = ins.f[0];
+      bool simple = !x;
       for (size_t i = 1; i < ins.dst.size(); ++i)   // carry-outs other than PT
-        if (!(ins.dst[i].kind == Kind::Pred && ins.dst[i].reg == kPT)) return;
+        if (!(ins.dst[i].kind == Kind::Pred && ins.dst[i].reg == kPT)) simple = false;
+      if (simple) {
+        for (unsigned i = 0; i < 3; ++i) {
+          if (!plain_kind(ins.src[i])) return;
+          if (!src32(b, ins.src[i], Dom::IntCompl, m.s[i], maxreg)) return;
+        }
+        if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+        m.a = (ins.src[0].neg ? 1u : 0u) + (ins.src[1].neg ? 1u : 0u) + (ins.src[2].neg ? 1u : 0u);
+        accept(Form::Iadd3);
+        return;
+      }
+      // The general form (exec_int): carries out to dst[1] and dst[2], carries in from src[3] and src[4].
+      if (ins.guard_uniform || ins.dst.size() > 3 || (x && ins.src.size() < 5)) return;
+      for (size_t i = 1; i < ins.dst.size(); ++i)
+        if (!pred_dst(ins.dst[i])) return;
       for (unsigned i = 0; i < 3; ++i) {
         if (!plain_kind(ins.src[i])) return;
         if (!src32(b, ins.src[i], Dom::IntCompl, m.s[i], maxreg)) return;
       }
       if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
       m.a = (ins.src[0].neg ? 1u : 0u) + (ins.src[1].neg ? 1u : 0u) + (ins.src[2].neg ? 1u : 0u);
-      accept(Form::Iadd3);
+      if (x) {
+        m.p = pred_src(ins.src[3]);
+        m.p2 = pred_src(ins.src[4]);
+      }
+      m.aux = x ? 1 : 0;
+      m.dst2 = ins.dst.size() > 1 ? static_cast<uint16_t>(ins.dst[1].reg) : kNoReg;
+      m.c = ins.dst.size() > 2 ? ins.dst[2].reg : kNoReg;
+      accept(Form::Iadd3x);
       return;
     }
     case Op::IMAD: {
       const unsigned kind = ins.f[0];
-      if (kind == 0x25 || kind == 0x27 || ins.f[2] || ins.dst.size() > 1 || ins.src.size() < 3) return;
-      const auto zero = [](const Operand& o) {
-        return !o.bnot && ((o.kind == Kind::Reg && o.reg == kRZ) || (o.kind == Kind::Imm && o.imm == 0));
-      };
-      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
-      if ((zero(ins.src[0]) || zero(ins.src[1])) && plain_kind(ins.src[2])) {
-        // IMAD.MOV (RZ * RZ + c) and the like: the addend with its modifiers, through s[0].
-        if (!src32(b, ins.src[2], Dom::Int, m.s[0], maxreg)) return;
-        accept(Form::Mov);
+      const bool simple = !(kind == 0x25 || kind == 0x27 || ins.f[2] || ins.dst.size() > 1 || ins.src.size() < 3);
+      if (simple) {
+        const auto zero = [](const Operand& o) {
+          return !o.bnot && ((o.kind == Kind::Reg && o.reg == kRZ) || (o.kind == Kind::Imm && o.imm == 0));
+        };
+        if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+        if ((zero(ins.src[0]) || zero(ins.src[1])) && plain_kind(ins.src[2])) {
+          // IMAD.MOV (RZ * RZ + c) and the like: the addend with its modifiers, through s[0].
+          if (!src32(b, ins.src[2], Dom::Int, m.s[0], maxreg)) return;
+          accept(Form::Mov);
+          return;
+        }
+        for (unsigned i = 0; i < 3; ++i) {
+          if (!plain_kind(ins.src[i])) return;
+          if (!src32(b, ins.src[i], Dom::Int, m.s[i], maxreg)) return;
+        }
+        accept(Form::Imad);
         return;
       }
-      for (unsigned i = 0; i < 3; ++i) {
+      // The general forms (exec_int): a carry in (.X) and out, the 64-bit product (.WIDE) and its high half (.HI).
+      const bool x = ins.f[2], sgn = ins.f[1];
+      if (ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.dst.size() > 2 || ins.src.size() < (x ? 4u : 3u)) return;
+      if (ins.dst.size() == 2 && !pred_dst(ins.dst[1])) return;
+      if (x && ins.src[3].kind != Kind::Pred && ins.src[3].kind != Kind::UPred) return;
+      for (unsigned i = 0; i < 2; ++i) {
         if (!plain_kind(ins.src[i])) return;
         if (!src32(b, ins.src[i], Dom::Int, m.s[i], maxreg)) return;
       }
-      accept(Form::Imad);
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      if (x) m.p = pred_src(ins.src[3]);
+      m.dst2 = ins.dst.size() == 2 ? static_cast<uint16_t>(ins.dst[1].reg) : kNoReg;
+      m.aux = static_cast<uint8_t>((x ? 1 : 0) | (sgn ? 2 : 0));
+      const Operand& c2 = ins.src[2];
+      if (kind == 0x25) {   // WIDE: a 64-bit product plus a 64-bit addend, into a register pair
+        if (ins.dst[0].reg != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(ins.dst[0].reg + (ins.dst[0].reg + 1 == kRZ ? 1 : 2)));
+        const uint8_t mod = static_cast<uint8_t>((c2.neg ? kNeg : 0) | (c2.bnot ? kNot : 0));
+        if (!src64i(b, c2, mod, m.s[2], maxreg)) return;
+        accept(Form::ImadWide);
+        return;
+      }
+      if (kind == 0x27) {   // HI: the high word of the product plus a 64-bit addend
+        if (c2.kind == Kind::Reg || c2.kind == Kind::UReg) {
+          if (!src64i(b, c2, static_cast<uint8_t>(c2.neg ? kNeg : 0), m.s[2], maxreg)) return;
+          m.aux |= 4;   // the addend is a pair
+        } else {
+          if (!plain_kind(c2)) return;
+          if (!src32(b, c2, Dom::Int, m.s[2], maxreg)) return;
+        }
+        accept(Form::ImadHi);
+        return;
+      }
+      if (!plain_kind(c2)) return;
+      if (!src32(b, c2, Dom::Int, m.s[2], maxreg)) return;
+      accept(Form::Imad32);
       return;
     }
     case Op::LOP3: {
@@ -408,6 +579,19 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.p = pred_src(ins.src[2]);
       if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
       accept(Form::Fsel);
+      return;
+    }
+    case Op::POPC: {
+      if (ins.guard_uniform || ins.src.empty() || !plain_kind(ins.src[0])) return;
+      if (!src32(b, ins.src[0], Dom::Int, m.s[0], maxreg) || !reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      accept(Form::Popc);
+      return;
+    }
+    case Op::I2FP: {   // I2FP.F32.{U32,S32}, to nearest (exec_float: the other roundings set the host mode)
+      if (ins.guard_uniform || ins.f[1] != 0 || ins.src.empty() || !plain_kind(ins.src[0])) return;
+      if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg) || !reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.c = ins.f[0] != 0 ? 1 : 0;   // signed
+      accept(Form::I2fp);
       return;
     }
     case Op::FFMA: case Op::FADD: case Op::FMUL: {
