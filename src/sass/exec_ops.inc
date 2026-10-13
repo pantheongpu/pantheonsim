@@ -1235,7 +1235,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     case Op::LOP3: {
       const bool has_p = ins.dst.size() > 1;
       if (has_p && (ins.dst.size() != 2 || !pdst_ok(ins.dst[0]) || ins.dst[1].kind != Kind::Reg)) return false;
-      if (ins.src.size() < 3) return false;
+      if (ins.src.size() < (has_p ? 5u : 3u)) return false;
       const uint32_t* s[3];
       for (unsigned i = 0; i < 3; ++i) {
         if (!plain(ins.src[i])) return false;
@@ -1253,7 +1253,6 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
         }
       }
       if (has_p) {
-        if (ins.src.size() < 5) return false;
         Mask pm = 0;
         if (sk) {   // the lanes whose result is not zero, or is all ones (.PAND)
           pm = static_cast<Mask>(sk->icmp_mask(ins.f[1] ? 0 : 1, false, r, ins.f[1] ? kOnes32.data() : kZeros32.data(), 32));
@@ -1281,6 +1280,31 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
       const uint32_t* b = lanes(1, ins.src[1], IntMod{ins.src[1].neg, ins.src[1].bnot, ins.src[1].neg || ins.src[1].bnot});
       const uint32_t* top = three ? lanes(2, ins.src[2], Same{}) : nullptr;
       Mask carry = 0;
+      if (sk) {
+        // The shift by the funnel-shift kernel (a left shift of the word, or of the 64-bit (top:a) with the high word kept),
+        // then the sum and its carry out by the three-way add.
+        alignas(32) uint32_t nsh[32], shifted[32], sign[32];
+        for (unsigned l = 0; l < 32; ++l) nsh[l] = sh;
+        if (!hi) {
+          sk->shf(shifted, a, nsh, kZeros32.data(), 3, false, false, false);
+        } else {
+          if (!three)
+            for (unsigned l = 0; l < 32; ++l) sign[l] = static_cast<uint32_t>(static_cast<int32_t>(a[l]) >> 31);
+          sk->shf(shifted, a, nsh, three ? top : sign, 1, false, false, true);
+        }
+        if (!x && ins.dst.size() == 1) {
+          sk->iadd3(r, shifted, b, kZeros32.data(), 0);
+        } else {
+          uint32_t g1, g2;
+          sk->iadd3x(r, shifted, b, kZeros32.data(), 0, static_cast<uint32_t>(cin), 0, &g1, &g2);
+          carry = g1;
+          // -0 is ~0 + 1: it carries out (see the general rule).
+          if (ins.src[1].neg) carry |= static_cast<Mask>(sk->icmp_mask(0, false, b, kZeros32.data(), 32));
+        }
+        store(ins.dst[0]);
+        if (ins.dst.size() == 2) setp(ins.dst[1], carry);
+        return true;
+      }
       for (unsigned l = 0; l < 32; ++l) {
         uint32_t shifted;
         if (!hi) {
@@ -2629,38 +2653,8 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const bool cas = ins.f[5] || (shared && ins.mods[0].rfind("CAS", 0) == 0);
       const bool popc_inc = shared && ins.f[2] == 1;
       const Operand& a = red ? ins.src[0] : ins.src[shared ? 0 : 0];
-      // Warp-aggregated increment: one add of the active lane count.
-      each_lane(ex, [&](unsigned l) {
-        uint64_t addr;
-        Space sp;
-        if (shared) {
-          const unsigned strides[] = {0, 4, 8, 16};
-          addr = static_cast<uint32_t>(address(a, l, false, ins.w.bit(91) || popc_inc, 64, strides[ins.w.field(78, 2)]));
-          sp = Space::Shared;
-        } else {
-          const bool e = ins.w.bit(72);
-          const uint64_t g = address(a, l, e || ins.w.bit(90), ins.w.bit(91) && !e, 64, 0);
-          sp = ins.op == Op::ATOM ? classify(g, &addr) : (addr = g, Space::Global);
-        }
-        // The vector forms (sm_90's F32x2/x4, F16x4/x8, BF16x4/x8): f[7] words
-        // in consecutive registers, aligned to all of them, each its own atomic.
-        const unsigned nwords = ins.f[7] ? ins.f[7] : 1;
-        if (nwords > 1 && addr % (4ull * nwords))
-          fault(w, ins, l, "a vector atomic of " + std::to_string(4 * nwords) + " bytes at an address not aligned to them",
-                Err::MisalignedAccess);
-        const uint64_t addr0 = addr;
-        for (unsigned word = 0; word < nwords; ++word) {
-        addr = addr0 + 4ull * word;
-        std::unique_lock<std::mutex> lock;
-        if (sp == Space::Global) lock = std::unique_lock<std::mutex>(atomic_lock(addr));
-        Operand vtmp;
-        const Operand* vp = &ins.src[1];
-        if (word) { vtmp = *vp; if (vtmp.reg != kRZ) vtmp.reg += word; vp = &vtmp; }
-        const Operand& vop = *vp;
-        const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
-        const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
-        // The value the atomic stores, given the one it finds.
-        const auto compute = [&](const uint64_t old) -> uint64_t {
+      // The value the atomic stores, given the one it finds (old), the operand (v) and the exchange value (swap) of lane l.
+      const auto apply = [&](unsigned l, const uint64_t old, const uint64_t v, const uint64_t swap) -> uint64_t {
         uint64_t nw = old;
         if (cas) {
           if (old == v) nw = swap;
@@ -2708,7 +2702,137 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         }
         if (!is64) nw &= 0xffffffff;
         return nw;
-        };
+      };
+      // What a lane's atomic gives back: the old value in the destination (the vector forms' word `word` in the register `word`
+      // on), the predicate ATOM and ATOMG set, and CAST.SPIN's flag.
+      const auto emit = [&](unsigned l, unsigned word, uint64_t old, uint64_t v) {
+        Operand dtmp;
+        const Operand* dp = ins.op == Op::ATOMS ? &ins.dst[0] : &ins.dst[1];
+        if (word) { dtmp = *dp; if (dtmp.reg != kRZ) dtmp.reg += word; dp = &dtmp; }
+        const Operand& d = *dp;
+        // ATOM/ATOMG's predicate: done in hardware (a generic CAS of a
+        // shared address included, so no software path is needed).
+        if (ins.op != Op::ATOMS) set_pred(w, ins.dst[0], l, true);
+        if (is64) write64(w, d, l, old);
+        else write32(w, d, l, static_cast<uint32_t>(old));
+        // CAST.SPIN: whether it stored (ATOMS keeps the mode in f[1], ATOM in f[6]).
+        // The .64 form's flag is the whole register pair: ptxas's loop
+        // after it (sm_86's atomicAdd of a double in shared memory, as
+        // CUDA Samples' jacobiCudaGraphs does) tests Rd == 1 and Rd+1 == 0,
+        // so leaving the old value's high word in Rd+1 spun forever.
+        if (cas && (ins.op == Op::ATOMS ? ins.f[1] == 3 : ins.f[6] != 0)) {
+          if (d.kind == Kind::Pred) set_pred(w, d, l, old == v);   // sm_100's ATOMS.CAST.SPIN P
+          else if (is64) write64(w, d, l, old == v ? 1 : 0);
+          else write32(w, d, l, old == v ? 1 : 0);
+        }
+      };
+      // A warp's atomics on plain global memory taken together. Each lane's is a read-modify-write under the lock of its
+      // address' stripe; here the lanes' addresses are grouped (a lane that shares an address with an earlier one finds
+      // what that one left, as in the loop below), the stripes involved locked in order, each distinct address loaded
+      // and stored once (MemoryManager::load_batch / store_batch, which decline, having done nothing, whenever the plain
+      // accesses could differ) and the lanes applied one after another in lane order. What every lane gets back and what
+      // memory holds are what the loop below gives; another host thread sees the warp's atomics as one step. Anything
+      // else -- shared or local memory, host-mapped memory, misaligned addresses, vector forms -- takes the loop.
+      if (fast_ && !shared && !popc_inc && ins.f[7] <= 1 && m_.sm >= 80 && ex && (red || ins.dst.back().kind == Kind::Reg)) {
+        uint64_t ga[32];
+        row_addresses(a, ins.w.bit(72) || ins.w.bit(90), ins.w.bit(91) && !ins.w.bit(72), 64, ex, ga);
+        bool ok = true;
+        uint64_t uaddr[32], v[32], swp[32];
+        unsigned nu = 0, slot[32];
+        uint64_t stripes = 0;
+        for (Mask m = ex; m && ok; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+          uint64_t addr = ga[l];
+          if (ins.op == Op::ATOM && classify(ga[l], &addr) != Space::Global) ok = false;
+          if (addr % n) ok = false;
+          if (!ok) break;
+          // The slot of this address among the distinct ones (the last one first: lanes of a warp mostly repeat or step on).
+          unsigned k = nu;
+          if (nu && uaddr[nu - 1] == addr) k = nu - 1;
+          else
+            for (unsigned i = 0; i < nu; ++i)
+              if (uaddr[i] == addr) {
+                k = i;
+                break;
+              }
+          if (k == nu) {
+            uaddr[nu++] = addr;
+            stripes |= uint64_t{1} << ((addr >> 3) % 64);
+          }
+          slot[l] = k;
+          v[l] = is64 ? read64(w, ins.src[1], l) : read32(w, ins.src[1], l);
+          swp[l] = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
+        }
+        // Memory the host maps (managed, pinned, shared through CUDA IPC) takes the CPU's atomic in the loop; asking also
+        // finds read-only host memory, which the loop's first lane to reach it reports.
+        for (unsigned i = 0; ok && i < nu; ++i) {
+          try {
+            if (mem_.host_address(uaddr[i], n)) ok = false;
+          } catch (const Error&) {
+            ok = false;
+          }
+        }
+        if (ok) {
+          uint64_t old_of[32];
+          bool done = false;
+          {   // (the locks are let go before the loop below might take them again)
+            std::unique_lock<std::mutex> locks[32];
+            unsigned held = 0;
+            for (uint64_t sm = stripes; sm; sm &= sm - 1)
+              locks[held++] = std::unique_lock<std::mutex>(atomic_lock(uint64_t{static_cast<unsigned>(std::countr_zero(sm))} << 3));
+            uint64_t cur[32];
+            if (mem_.load_batch(uaddr, nu, n, cur)) {
+              for (Mask m = ex; m; m &= m - 1) {
+                const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                old_of[l] = cur[slot[l]];
+                cur[slot[l]] = apply(l, old_of[l], v[l], swp[l]);
+              }
+              // (a store the memory declines leaves it as it was, and the loop does the lot: nothing above has an effect)
+              done = mem_.store_batch(uaddr, nu, n, cur);
+            }
+          }
+          if (done) {
+            for (Mask m = ex; m; m &= m - 1) {
+              const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+              ++blk.st.atomics;
+              blk.st.atomic_bytes += n;
+              if (!red) emit(l, 0, old_of[l], v[l]);
+            }
+            return;
+          }
+        }
+      }
+      // Warp-aggregated increment: one add of the active lane count.
+      each_lane(ex, [&](unsigned l) {
+        uint64_t addr;
+        Space sp;
+        if (shared) {
+          const unsigned strides[] = {0, 4, 8, 16};
+          addr = static_cast<uint32_t>(address(a, l, false, ins.w.bit(91) || popc_inc, 64, strides[ins.w.field(78, 2)]));
+          sp = Space::Shared;
+        } else {
+          const bool e = ins.w.bit(72);
+          const uint64_t g = address(a, l, e || ins.w.bit(90), ins.w.bit(91) && !e, 64, 0);
+          sp = ins.op == Op::ATOM ? classify(g, &addr) : (addr = g, Space::Global);
+        }
+        // The vector forms (sm_90's F32x2/x4, F16x4/x8, BF16x4/x8): f[7] words
+        // in consecutive registers, aligned to all of them, each its own atomic.
+        const unsigned nwords = ins.f[7] ? ins.f[7] : 1;
+        if (nwords > 1 && addr % (4ull * nwords))
+          fault(w, ins, l, "a vector atomic of " + std::to_string(4 * nwords) + " bytes at an address not aligned to them",
+                Err::MisalignedAccess);
+        const uint64_t addr0 = addr;
+        for (unsigned word = 0; word < nwords; ++word) {
+        addr = addr0 + 4ull * word;
+        std::unique_lock<std::mutex> lock;
+        if (sp == Space::Global) lock = std::unique_lock<std::mutex>(atomic_lock(addr));
+        Operand vtmp;
+        const Operand* vp = &ins.src[1];
+        if (word) { vtmp = *vp; if (vtmp.reg != kRZ) vtmp.reg += word; vp = &vtmp; }
+        const Operand& vop = *vp;
+        const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
+        const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
+        const auto compute = [&](const uint64_t old) -> uint64_t { return apply(l, old, v, swap); };
         // Memory the host maps -- managed, pinned, or shared with another
         // process through CUDA IPC -- takes the CPU's own atomic, which host
         // code and other processes' kernels respect; the stripe lock is this
@@ -2724,27 +2848,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         }
         ++blk.st.atomics;
         blk.st.atomic_bytes += n;
-        if (!red) {
-          Operand dtmp;
-          const Operand* dp = ins.op == Op::ATOMS ? &ins.dst[0] : &ins.dst[1];
-          if (word) { dtmp = *dp; if (dtmp.reg != kRZ) dtmp.reg += word; dp = &dtmp; }
-          const Operand& d = *dp;
-          // ATOM/ATOMG's predicate: done in hardware (a generic CAS of a
-          // shared address included, so no software path is needed).
-          if (ins.op != Op::ATOMS) set_pred(w, ins.dst[0], l, true);
-          if (is64) write64(w, d, l, old);
-          else write32(w, d, l, static_cast<uint32_t>(old));
-          // CAST.SPIN: whether it stored (ATOMS keeps the mode in f[1], ATOM in f[6]).
-          // The .64 form's flag is the whole register pair: ptxas's loop
-          // after it (sm_86's atomicAdd of a double in shared memory, as
-          // CUDA Samples' jacobiCudaGraphs does) tests Rd == 1 and Rd+1 == 0,
-          // so leaving the old value's high word in Rd+1 spun forever.
-          if (cas && (ins.op == Op::ATOMS ? ins.f[1] == 3 : ins.f[6] != 0)) {
-            if (d.kind == Kind::Pred) set_pred(w, d, l, old == v);   // sm_100's ATOMS.CAST.SPIN P
-            else if (is64) write64(w, d, l, old == v ? 1 : 0);
-            else write32(w, d, l, old == v ? 1 : 0);
-          }
-        }
+        if (!red) emit(l, word, old, v);
         }   // for each word of a vector atomic
       });
       return;
@@ -3837,11 +3941,22 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         else take = agreed ? group : 0;
       }
       const int64_t target = ins.src.back().imm;
-      each_lane(group, [&](unsigned l) {
-        const uint64_t base = base_of(l);
-        const uint64_t next = w.pc[l] + 16;
-        w.pc[l] = ((take >> l) & 1) ? base + static_cast<uint64_t>(target) : next;
-      });
+      if (take == group || !take) {
+        // Every lane of the group goes the same way: a lane's new pc is its own plus the distance to the target
+        // (base_of(l) + target = pc - ins.pc + target) or plus 16. (A whole warp is a straight loop over its 32 counters.)
+        const uint64_t delta = take ? static_cast<uint64_t>(target) - ins.pc : 16;
+        if (group == kAll) {
+          for (unsigned l = 0; l < 32; ++l) w.pc[l] += delta;
+        } else {
+          each_lane(group, [&](unsigned l) { w.pc[l] += delta; });
+        }
+      } else {
+        each_lane(group, [&](unsigned l) {
+          const uint64_t base = base_of(l);
+          const uint64_t next = w.pc[l] + 16;
+          w.pc[l] = ((take >> l) & 1) ? base + static_cast<uint64_t>(target) : next;
+        });
+      }
       // A group that branches backwards while other lanes wait gives way now
       // and then.
       if (take && target <= static_cast<int64_t>(ins.pc) && (w.runnable() & ~group)) {

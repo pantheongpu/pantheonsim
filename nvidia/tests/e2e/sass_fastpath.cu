@@ -173,6 +173,69 @@ __global__ void lane_ops(const uint32_t* in, uint32_t* out, int count, int shape
   for (int k = 0; k < kLaneOps; ++k) out[static_cast<size_t>(i) * kLaneOps + k] = o[k];
 }
 
+
+// LEA in its forms: a shift and add (with a negated or zero second operand, whose carry out the 64-bit index arithmetic
+// uses), the .HI forms that add the high word of a 64-bit index (.SX32 from a 32-bit signed one), and 64-bit negation.
+__global__ void lea_forms(const uint32_t* in, uint64_t* out, uint64_t base, int pad, int count) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const uint32_t x = in[i], y = in[(i + 3) % count];
+  const int32_t sx = static_cast<int32_t>(x);
+  uint64_t o[10];
+  o[0] = base + (static_cast<uint64_t>(x) << 3);
+  o[1] = base + static_cast<uint64_t>(static_cast<int64_t>(sx) * 16);
+  o[2] = (x << 5) + y;
+  o[3] = static_cast<uint32_t>((x << 2) - y);
+  o[4] = static_cast<uint64_t>(static_cast<int64_t>(sx) * 4 - pad);   // pad: zero or not, from the host
+  o[5] = static_cast<uint64_t>(-static_cast<int64_t>(static_cast<uint64_t>(x) << 32 | y));
+  o[6] = base - (static_cast<uint64_t>(y) << 4) + static_cast<uint64_t>(pad);
+  o[7] = static_cast<uint64_t>(static_cast<int64_t>(sx) * 3 + static_cast<int64_t>(base));
+  o[8] = (static_cast<uint64_t>(y) << 32 | x) * 8 + (base >> 3);
+  o[9] = static_cast<uint64_t>(sx >> 3) + (static_cast<uint64_t>(x) << 33);
+  const bool take = (i % 3) != 0;
+  for (int k = 0; k < 10; ++k) if (take || k < 5) out[static_cast<size_t>(i) * 10 + k] = o[k];
+}
+
+
+// Atomics on global memory: one address for every lane, a few addresses, distinct ones, scattered ones; with the old value
+// returned (ATOMG) and without (RED); add, min, max, exchange, compare-and-swap, increment, decrement, and, or, xor, in 32 and 64
+// bits and in float and double. The sums, extremes and bit operations also have a host reference (any order gives the same).
+constexpr int kAtomSlots = 64;
+struct AtomMem {
+  uint32_t add[kAtomSlots], umax[kAtomSlots], exch[kAtomSlots], cas[kAtomSlots], inc[kAtomSlots], dec[kAtomSlots];
+  uint32_t band[kAtomSlots], bor[kAtomSlots], bxor[kAtomSlots], red[kAtomSlots];
+  int32_t smin[kAtomSlots];
+  unsigned long long add64[kAtomSlots], max64[kAtomSlots];
+  float fadd[kAtomSlots];
+  double dadd[kAtomSlots];
+};
+__global__ void atomic_forms(AtomMem* m, uint32_t* out, int count, int pattern) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const unsigned idx = pattern == 0 ? 0u : pattern == 1 ? i % 4u : pattern == 2 ? static_cast<unsigned>(i) % kAtomSlots : (i * 7u) % 33u;
+  const bool take = pattern == 1 ? (i % 5) != 0 : pattern == 3 ? (i & 8) == 0 : true;
+  uint32_t o[12] = {};
+  if (take) {
+    o[0] = atomicAdd(&m->add[idx], i + 1u);
+    o[1] = atomicMax(&m->umax[idx], i * 2654435761u);
+    o[2] = static_cast<uint32_t>(atomicMin(&m->smin[idx], static_cast<int>(i * 31) - 500));
+    o[3] = atomicExch(&m->exch[idx], i);
+    o[4] = atomicCAS(&m->cas[idx], static_cast<uint32_t>(i & 3), static_cast<uint32_t>(i + 100));
+    o[5] = atomicInc(&m->inc[idx], 7u);
+    o[6] = atomicDec(&m->dec[idx], 5u);
+    o[7] = atomicAnd(&m->band[idx], ~(1u << (i & 31)));
+    o[8] = atomicOr(&m->bor[idx], 1u << (i & 31));
+    o[9] = atomicXor(&m->bxor[idx], i * 40503u);
+    o[10] = static_cast<uint32_t>(atomicAdd(&m->add64[idx], static_cast<unsigned long long>(i) << 33));
+    atomicMax(&m->max64[idx], static_cast<unsigned long long>(i) * 0x9E3779B97F4A7C15ull);
+    atomicAdd(&m->fadd[idx], 0.5f * i);
+    atomicAdd(&m->dadd[idx], 0.25 * i);
+    atomicAdd(&m->red[idx], 3u);                 // a reduction, no old value
+    o[11] = static_cast<uint32_t>(__float_as_uint(atomicAdd(&m->fadd[(idx + 1) % kAtomSlots], 1.0f)));
+  }
+  for (int k = 0; k < 12; ++k) out[static_cast<size_t>(i) * 12 + k] = o[k];
+}
+
 template <class T>
 static bool same(const std::vector<T>& a, const std::vector<T>& b, const char* what) {
   if (a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0) return true;
@@ -455,6 +518,112 @@ int main() {
       std::printf("lane_ops shape=%d bits %016llx\n", shape, static_cast<unsigned long long>(hh));
     }
     CK(cudaFree(din)); CK(cudaFree(dout));
+  }
+
+  {
+    const int n = 32 * 7 + 9;
+    std::vector<uint32_t> h(n);
+    uint64_t s = 0x9E3779B97F4A7C15ull;
+    const uint32_t edge[] = {0u, 1u, 0x7fffffffu, 0x80000000u, 0xffffffffu, 0x80000001u, 0x40000000u, 0xfffffffeu, 0x00010000u, 3u};
+    for (int i = 0; i < n; ++i) {
+      s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+      h[i] = i % 2 == 0 ? edge[s % 10] : static_cast<uint32_t>(s);
+    }
+    uint32_t* din; uint64_t* dout;
+    CK(cudaMalloc(&din, n * 4));
+    CK(cudaMalloc(&dout, static_cast<size_t>(n) * 10 * 8));
+    CK(cudaMemcpy(din, h.data(), n * 4, cudaMemcpyHostToDevice));
+    for (uint64_t base : {0x7f0000001000ull, 0xffffffff00000008ull, 0ull})
+      for (int pad : {0, 5, -7}) {
+        CK(cudaMemset(dout, 0, static_cast<size_t>(n) * 10 * 8));
+        lea_forms<<<(n + 63) / 64, 64>>>(din, dout, base, pad, n);
+        CK(cudaDeviceSynchronize());
+        std::vector<uint64_t> got(static_cast<size_t>(n) * 10);
+        CK(cudaMemcpy(got.data(), dout, got.size() * 8, cudaMemcpyDeviceToHost));
+        int bad = 0;
+        uint64_t hh = 1469598103934665603ull;
+        for (int i = 0; i < n; ++i) {
+          const uint32_t x = h[i], y = h[(i + 3) % n];
+          const int32_t sx = static_cast<int32_t>(x);
+          uint64_t w[10] = {};
+          w[0] = base + (static_cast<uint64_t>(x) << 3);
+          w[1] = base + static_cast<uint64_t>(static_cast<int64_t>(sx) * 16);
+          w[2] = static_cast<uint32_t>((x << 5) + y);
+          w[3] = static_cast<uint32_t>((x << 2) - y);
+          w[4] = static_cast<uint64_t>(static_cast<int64_t>(sx) * 4 - pad);
+          w[5] = static_cast<uint64_t>(-static_cast<int64_t>(static_cast<uint64_t>(x) << 32 | y));
+          w[6] = base - (static_cast<uint64_t>(y) << 4) + static_cast<uint64_t>(pad);
+          w[7] = static_cast<uint64_t>(static_cast<int64_t>(sx) * 3 + static_cast<int64_t>(base));
+          w[8] = (static_cast<uint64_t>(y) << 32 | x) * 8 + (base >> 3);
+          w[9] = static_cast<uint64_t>(sx >> 3) + (static_cast<uint64_t>(x) << 33);
+          const bool take = (i % 3) != 0;
+          for (int k = 0; k < 10; ++k) {
+            const uint64_t want = (take || k < 5) ? w[k] : 0;
+            if (got[static_cast<size_t>(i) * 10 + k] != want) ++bad;
+            hh = (hh ^ got[static_cast<size_t>(i) * 10 + k]) * 1099511628211ull;
+          }
+        }
+        if (bad) { std::printf("WRONG lea_forms base=%llx pad=%d: %d\n", static_cast<unsigned long long>(base), pad, bad); ++wrong; }
+        std::printf("lea_forms base=%llx pad=%d bits %016llx\n", static_cast<unsigned long long>(base), pad, static_cast<unsigned long long>(hh));
+      }
+    CK(cudaFree(din)); CK(cudaFree(dout));
+  }
+
+  {
+    const int n = 32 * 5 + 11;
+    AtomMem* dm; uint32_t* dout;
+    CK(cudaMalloc(&dm, sizeof(AtomMem)));
+    CK(cudaMalloc(&dout, static_cast<size_t>(n) * 12 * 4));
+    for (int pattern = 0; pattern < 4; ++pattern) {
+      AtomMem init = {};
+      for (int k = 0; k < kAtomSlots; ++k) {
+        init.smin[k] = 1000;
+        init.band[k] = 0xffffffffu;
+        init.dec[k] = 3;
+        init.inc[k] = 2;
+        init.cas[k] = k & 1;
+      }
+      CK(cudaMemcpy(dm, &init, sizeof init, cudaMemcpyHostToDevice));
+      CK(cudaMemset(dout, 0, static_cast<size_t>(n) * 12 * 4));
+      atomic_forms<<<(n + 63) / 64, 64>>>(dm, dout, n, pattern);
+      CK(cudaDeviceSynchronize());
+      AtomMem got;
+      std::vector<uint32_t> gout(static_cast<size_t>(n) * 12);
+      CK(cudaMemcpy(&got, dm, sizeof got, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(gout.data(), dout, gout.size() * 4, cudaMemcpyDeviceToHost));
+      AtomMem want = init;   // the order-independent ones
+      for (int i = 0; i < n; ++i) {
+        const unsigned idx = pattern == 0 ? 0u : pattern == 1 ? i % 4u : pattern == 2 ? static_cast<unsigned>(i) % kAtomSlots : (i * 7u) % 33u;
+        const bool take = pattern == 1 ? (i % 5) != 0 : pattern == 3 ? (i & 8) == 0 : true;
+        if (!take) continue;
+        want.add[idx] += i + 1u;
+        want.umax[idx] = std::max(want.umax[idx], static_cast<uint32_t>(i * 2654435761u));
+        want.smin[idx] = std::min(want.smin[idx], static_cast<int>(i * 31) - 500);
+        want.band[idx] &= ~(1u << (i & 31));
+        want.bor[idx] |= 1u << (i & 31);
+        want.bxor[idx] ^= i * 40503u;
+        want.add64[idx] += static_cast<unsigned long long>(i) << 33;
+        want.max64[idx] = std::max(want.max64[idx], static_cast<unsigned long long>(i) * 0x9E3779B97F4A7C15ull);
+        want.fadd[idx] += 0.5f * i;
+        want.dadd[idx] += 0.25 * i;
+        want.red[idx] += 3u;
+        want.fadd[(idx + 1) % kAtomSlots] += 1.0f;
+      }
+      int bad = 0;
+      for (int k = 0; k < kAtomSlots; ++k) {
+        bad += got.add[k] != want.add[k] || got.umax[k] != want.umax[k] || got.smin[k] != want.smin[k] || got.band[k] != want.band[k] ||
+               got.bor[k] != want.bor[k] || got.bxor[k] != want.bxor[k] || got.add64[k] != want.add64[k] ||
+               got.max64[k] != want.max64[k] || got.fadd[k] != want.fadd[k] || got.dadd[k] != want.dadd[k] || got.red[k] != want.red[k];
+      }
+      if (bad) { std::printf("WRONG atomic_forms pattern=%d: %d slots\n", pattern, bad); ++wrong; }
+      // Printed so that the two runs are compared on every returned value and on the order-dependent memory too.
+      uint64_t hh = 1469598103934665603ull;
+      for (uint32_t v : gout) hh = (hh ^ v) * 1099511628211ull;
+      const uint32_t* mw = reinterpret_cast<const uint32_t*>(&got);
+      for (size_t k = 0; k < sizeof got / 4; ++k) hh = (hh ^ mw[k]) * 1099511628211ull;
+      std::printf("atomic_forms pattern=%d bits %016llx\n", pattern, static_cast<unsigned long long>(hh));
+    }
+    CK(cudaFree(dm)); CK(cudaFree(dout));
   }
   std::printf("wrong: %d\n", wrong);
   return wrong != 0;
