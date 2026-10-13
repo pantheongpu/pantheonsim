@@ -1016,17 +1016,17 @@ the CPU's subnormal assist, `wmma`/`mma_ptx` by the scalar tensor-core loop (hal
 `VGPU_TIER` unset against r7-final (6 workloads, 9 runs, load 3 to 11): all within the noise, B/A best 0.98 to 1.03.
 
 **How it is held to the interpreter** (all wired in CMake):
-* `e2e_sass_tier` (nvidia/tests/e2e/run_sass_tier.sh): `sass_tier.cu`, a program of ~400 expressions over random inputs mixed with
+* `e2e_sass_tier` (nvidia/tests/e2e/run_sass_tier.sh): `sass_tier.cu`, a program of 185 expressions (launched with block sizes that are not whole warps) over random inputs mixed with
   zeros, extremes, NaN payloads, infinities, subnormals and shift counts past the width (integer, 128-bit and pointer
   arithmetic, f32, f64, branches, global/shared/local memory of every width, signed sub-word loads, generic accesses,
-  atomics, shuffles), built for sm_75 to sm_120 and run on each generation's profile; plus the 36 other SASS test
-  programs of the architecture sweep. Each runs with `VGPU_TIER=0` and `1` with `VGPU_COUNTERS=1`: every result and every
+  atomics, shuffles), built for sm_75 to sm_120 and run on each generation's profile; plus the other SASS test
+  programs of the architecture sweep (41 listed; CUDA 12.0 skips two). Each runs with `VGPU_TIER=0` and `1` with `VGPU_COUNTERS=1`: every result and every
   counter of every launch must print identically; `sass_tier` also under four host threads, and the tier must have run
   at least 30% of its warp instructions (it cannot pass by doing nothing). `VGPU_TIER_OTHER_ARCHS=1` runs the others on
   every architecture (a soak; 144 runs passed).
 * `bench_counters_tier`: `run_bench_check.sh` with `VGPU_TIER=1` (the 16 workloads, counts against tools/bench/expected).
-* `test_tier` (tests/unit): the analysis over every instruction of the disassembler corpora (sm_80 to sm_120: 3,500 to 4,700
-  handlers per corpus): operand rows inside the program, register bounds, the guard flags, Turing left to the interpreter.
+* `test_tier` (tests/unit): the analysis over every instruction of the disassembler corpora (sm_80 to sm_120: 780 to 4,700
+  instructions with a handler per corpus): operand rows inside the program, register bounds, the guard flags, Turing left to the interpreter.
 * Mutation checks (a handler broken on purpose, `e2e_sass_tier` run on sm_86): FFMA rounded twice, the ISETP comparison table with
   LE and GT swapped, one counter left out of the run loop, the BRA target off by 16, PLOP3's first input inverted,
   IMAD.WIDE's signedness swapped, IADD3's carry-in dropped, the signed byte load not sign-extended: all fail the test.
