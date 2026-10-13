@@ -1198,17 +1198,19 @@ using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt
 // them stays in cache and runs without any of that. It exists only for the
 // forms the interpreter's fast paths already take (32-bit integer arithmetic
 // and mad.lo, mov, setp, selp, not, shf, f32 arithmetic and fma, all on the narrow register
-// file, no carry, no saturation, no rounding mode; and the 64-bit forms of the address arithmetic around
-// memory accesses: integer arithmetic and setp on 64-bit registers, integer conversions, mul.wide);
+// file, no carry, no saturation, no rounding mode; the 64-bit forms of the address arithmetic around
+// memory accesses: integer arithmetic and setp on 64-bit registers, integer conversions, mul.wide; and
+// mul.hi, neg/abs, and the conversion of a narrow integer to f32 or f64);
 // anything else has kind None and runs as it always did. build_micro() decides, and mirrors the
 // conditions of Interpreter::fast_path exactly.
 struct MicroOp {
   enum Kind : uint8_t { None = 0, Int32, MadLo32, Mov32, Setp32, Fma32, Float32, Selp32, Not32, Shf32, Bra,
-                        Int64, Cvt, MulWide32, Setp64 };
+                        Int64, Cvt, MulWide32, Setp64, MulHi32, Sign32, CvtI2F };
   enum Flags : uint8_t { kSigned = 1, kFloat = 2, kHasPred = 4, kPredNeg = 8, kLeft = 16, kWrap = 32,
-                         kDstWide = 64 };
+                         kDstWide = 64, kFtz = 128 };
   Kind kind = None;
-  uint8_t sub = 0;        // IntBinOp, FloatBinOp or CmpOp, by kind; Cvt: the source's width in bits
+  uint8_t sub = 0;        // IntBinOp, FloatBinOp or CmpOp, by kind; Cvt, CvtI2F: the source's width in bits;
+                          // Sign32: 1 for neg, 0 for abs
   uint8_t flags = 0;
   // Bit i set (0-2): source i is an immediate in src[i], else a register id. Bit 3 + i set: that register is in the
   // 64-bit file (Int64, Cvt, Setp64; an immediate there is the 32-bit value in src[i] sign-extended).

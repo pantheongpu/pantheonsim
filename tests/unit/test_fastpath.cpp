@@ -54,7 +54,8 @@ uint64_t dbits(double d) {
 std::vector<uint64_t> int_values() {
   const uint32_t v[] = {0, 1, 2, 3, 7, 31, 32, 33, 40, 0xFFFFFFFFu, 0xFFFFFFFEu, 0x7FFFFFFFu,
                         0x80000000u, 0x80000001u, 0xFFFFu, 0x10000u, 0xDEADBEEFu, 1103515245u,
-                        12345u, 0xAAAAAAAAu, 0x55555555u, 100, 0xFFFFFF9Cu /* -100 */};
+                        12345u, 0xAAAAAAAAu, 0x55555555u, 100, 0xFFFFFF9Cu /* -100 */, 16777217u /* 2^24 + 1 */,
+                        0x7FFFFF81u, 0xFEFFFFFFu, 0x01000003u, 0x80000100u};
   std::vector<uint64_t> out;
   for (int i = 0; i < kThreads; ++i) out.push_back(v[(i * 7 + i / 23) % (sizeof v / sizeof v[0])]);
   return out;
@@ -856,6 +857,44 @@ LOOP:
       VCHECK_EQ(got[t], acc);
     }
     unsetenv("VGPU_FASTPATH");
+  }
+}
+
+// mul.hi, neg, abs and the conversion of a narrow integer to f32 or f64, unguarded and under both guards, against the
+// general path: the magic-number multiplies of division by a constant, INT_MIN, NaN payloads and subnormals under
+// .ftz, and integers whose float rounds (above 2^24).
+VTEST(pre_decoded_mul_hi_neg_abs_and_int_to_float_match_the_general_path) {
+  const auto a = int_values(), b = rotate(a, 5), c = rotate(a, 11);
+  const auto f = f32_values();
+  for (int guard : {1, 2, 0}) {
+    g_guard = guard;
+    for (const char* ty : {"u32", "s32"}) {
+      same(std::string("mul.hi.") + ty + " %d, %a, %b;", false, a, b, c);
+      same(std::string("mul.hi.") + ty + " %d, %a, 2863311531;", false, a, b, c);
+      same(std::string("mul.hi.") + ty + " %d, 1431655766, %b;", false, a, b, c);
+      same(std::string("mul.hi.") + ty + " %a, %a, %a; mov.b32 %d, %a;", false, a, b, c);
+    }
+    same("neg.s32 %d, %a;", false, a, b, c);
+    same("abs.s32 %d, %a;", false, a, b, c);
+    same("neg.s32 %d, -2147483648;", false, a, b, c);
+    same("abs.s32 %d, -7;", false, a, b, c);
+    for (const char* op : {"neg.f32", "abs.f32", "neg.ftz.f32", "abs.ftz.f32"}) {
+      same(std::string(op) + " %d, %a;", false, f, b, c);
+      same(std::string(op) + " %d, 0f80000001;", false, f, b, c);
+    }
+    for (const char* cvt : {"cvt.rn.f32.s32 %d, %a;", "cvt.rn.f32.u32 %d, %a;", "cvt.rz.f32.s32 %d, %a;",
+                            "cvt.rm.f32.u32 %d, %a;", "cvt.rn.f32.s64 %d, %A;", "cvt.rn.f32.u64 %d, %A;",
+                            "cvt.rn.f32.s32 %a, %a; mov.b32 %d, %a;",
+                            "cvt.u16.u32 %rs1, %a; cvt.rn.f32.u16 %d, %rs1;",
+                            "cvt.u16.u32 %rs1, %a; cvt.rn.f32.s16 %d, %rs1;",
+                            "cvt.u8.u32 %rs1, %a; cvt.rn.f32.s8 %d, %rs1;",
+                            "cvt.u8.u32 %rs1, %a; cvt.rn.f32.u8 %d, %rs1;",
+                            "cvt.rn.f32.s32 %d, %r15;"})
+      same(cvt, false, a, b, c);
+    for (const char* cvt : {"cvt.rn.f64.s32 %D, %a;", "cvt.rn.f64.u32 %D, %a;", "cvt.rn.f64.s64 %D, %A;",
+                            "cvt.rn.f64.u64 %D, %A;", "cvt.u16.u32 %rs1, %a; cvt.rn.f64.s16 %D, %rs1;"})
+      same(cvt, true, a, b, c);
+    g_guard = 0;
   }
 }
 

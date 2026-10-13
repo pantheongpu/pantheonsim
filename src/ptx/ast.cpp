@@ -141,6 +141,26 @@ void build_micro(EntryFn& fn) {
           if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
         }
       }
+    } else if (const auto* op = std::get_if<OpCvt>(&ins.op); op && op->dst_ty.is_float() && !op->dst_ty.is_bfloat() &&
+                                                             !op->src_ty.is_real() &&
+                                                             op->src_ty.kind != Type::Kind::Pred) {
+      // An integer of at most 32 bits to f32 or f64, rounded to nearest: exact in a double, so the general path's
+      // double-then-float conversion is one rounding. Anything else (a 64-bit source, a directed rounding mode, f16)
+      // stays on the general path.
+      const Type& st = op->src_ty;
+      const Type& dt = op->dst_ty;
+      const auto* src = std::get_if<RegOperand>(&op->src);
+      ok = src && src->reg.id != kNoReg && !src->reg.wide && op->dst.id != kNoReg && st.bits >= 1 && st.bits <= 32 &&
+           (op->round == Round::None || op->round == Round::Rn) &&
+           ((dt.bits == 32 && !op->dst.wide) || (dt.bits == 64 && op->dst.wide));
+      if (ok) {
+        u.kind = MicroOp::CvtI2F;
+        u.sub = static_cast<uint8_t>(st.bits);
+        u.src[0] = src->reg.id;
+        u.dst = op->dst.id;
+        if (st.is_signed()) u.flags |= MicroOp::kSigned;
+        if (dt.bits == 64) u.flags |= MicroOp::kDstWide;
+      }
     } else if (const auto* op = std::get_if<OpCvt>(&ins.op)) {
       // fast_cvt_int's conditions: an integer to an integer, no rounding, no saturation.
       const Type& st = op->src_ty;
@@ -157,6 +177,26 @@ void build_micro(EntryFn& fn) {
         source64(0, op->src);
         u.dst = op->dst.id;
         if (op->dst.wide) u.flags |= MicroOp::kDstWide;
+      }
+    } else if (const auto* op = std::get_if<OpMulHi>(&ins.op)) {
+      ok = op->ty.bits == 32 && !op->ty.is_real() && narrow_dst(op->dst) && source(0, op->a) && source(1, op->b);
+      if (ok) {
+        u.kind = MicroOp::MulHi32;
+        if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
+      }
+    } else if (const auto* op = std::get_if<OpNeg>(&ins.op)) {
+      ok = op->ty.bits == 32 && !op->ty.is_bfloat() && narrow_dst(op->dst) && source(0, op->src);
+      if (ok) {
+        u.kind = MicroOp::Sign32;
+        u.sub = 1;
+        if (op->ty.is_float()) u.flags |= MicroOp::kFloat | (op->ftz ? MicroOp::kFtz : 0);
+      }
+    } else if (const auto* op = std::get_if<OpAbs>(&ins.op)) {
+      ok = op->ty.bits == 32 && !op->ty.is_bfloat() && narrow_dst(op->dst) && source(0, op->src);
+      if (ok) {
+        u.kind = MicroOp::Sign32;
+        u.sub = 0;
+        if (op->ty.is_float()) u.flags |= MicroOp::kFloat | (op->ftz ? MicroOp::kFtz : 0);
       }
     } else if (const auto* op = std::get_if<OpMulWide>(&ins.op)) {
       ok = op->src_bits == 32 && wide_dst(op->dst) && source(0, op->a) && source(1, op->b);

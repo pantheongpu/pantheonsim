@@ -3144,6 +3144,9 @@ class Interpreter {
       case MicroOp::Cvt: return micro_cvt(w, u, fm);
       case MicroOp::MulWide32: return micro_mul_wide32(w, u, fm);
       case MicroOp::Setp64: return micro_setp64(w, u, fm);
+      case MicroOp::MulHi32: return micro_mul_hi32(w, u, fm);
+      case MicroOp::Sign32: return micro_sign32(w, u, fm);
+      case MicroOp::CvtI2F: return micro_cvt_i2f(w, u, fm);
       case MicroOp::Bra: return false;   // moves the pc: run_micro_batch's, or step()'s
       case MicroOp::None: break;
     }
@@ -3329,6 +3332,73 @@ class Interpreter {
     else
       for_active(fm, W_, [&](uint32_t l) { d[l] = uint64_t{a[l]} * uint64_t{b[l]}; });
     w.written64[u.dst] = 1;
+    return true;
+  }
+  // mul.hi: the high 32 bits of the 64-bit product, signed or not (mul_hi at 32 bits).
+  [[gnu::noinline]] bool micro_mul_hi32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    uint32_t* d = dst32(w, u.dst, fm);
+    if (u.flags & MicroOp::kSigned)
+      for_active(fm, W_, [&](uint32_t l) {
+        d[l] = static_cast<uint32_t>(static_cast<uint64_t>(int64_t{static_cast<int32_t>(a[l])} *
+                                                           int64_t{static_cast<int32_t>(b[l])}) >> 32);
+      });
+    else
+      for_active(fm, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>((uint64_t{a[l]} * uint64_t{b[l]}) >> 32); });
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // neg and abs of a 32-bit integer or f32 (float_sign_op's rules: a NaN is the canonical one, .ftz flushes a
+  // subnormal first).
+  [[gnu::noinline]] bool micro_sign32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* v = micro_src(w, u, 0);
+    uint32_t* d = dst32(w, u.dst, fm);
+    const bool negate = u.sub != 0;
+    if (u.flags & MicroOp::kFloat) {
+      const bool ftz = u.flags & MicroOp::kFtz;
+      for_active(fm, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>(float_sign_op(32, v[l], ftz, negate)); });
+    } else if (negate) {
+      for_active(fm, W_, [&](uint32_t l) { d[l] = 0u - v[l]; });
+    } else {
+      for_active(fm, W_, [&](uint32_t l) {
+        const int32_t x = static_cast<int32_t>(v[l]);
+        d[l] = static_cast<uint32_t>(x < 0 ? -int64_t{x} : int64_t{x});
+      });
+    }
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // cvt of an integer of at most 32 bits to f32 or f64 (see build_micro).
+  [[gnu::noinline]] bool micro_cvt_i2f(Warp& w, const MicroOp& u, Mask fm) {
+    const unsigned sb = u.sub;
+    const uint32_t id = u.src[0];
+    const uint32_t* v = (id >= w.regs32.size() || !w.written32[id]) ? zero_lanes_.data() : w.regs32[id].data();
+    const uint64_t src_mask = (uint64_t{1} << sb) - 1;
+    const uint64_t sign = uint64_t{1} << (sb - 1);
+    const bool sig = u.flags & MicroOp::kSigned;
+    // The source cut to its width and, when signed, sign-extended: convert()'s sv.
+    auto value = [&](uint32_t in) {
+      const uint64_t x = in & src_mask;
+      return sig ? (x ^ sign) - sign : x;
+    };
+    if (u.flags & MicroOp::kDstWide) {
+      uint64_t* d = dst64(w, u.dst, fm);
+      if (sig) for_active(fm, W_, [&](uint32_t l) { d[l] = f64bits(static_cast<double>(static_cast<int64_t>(value(v[l])))); });
+      else for_active(fm, W_, [&](uint32_t l) { d[l] = f64bits(static_cast<double>(value(v[l]))); });
+      w.written64[u.dst] = 1;
+    } else {
+      uint32_t* d = dst32(w, u.dst, fm);
+      if (sig)
+        for_active(fm, W_, [&](uint32_t l) {
+          d[l] = static_cast<uint32_t>(f32bits(static_cast<float>(static_cast<double>(static_cast<int64_t>(value(v[l]))))));
+        });
+      else
+        for_active(fm, W_, [&](uint32_t l) {
+          d[l] = static_cast<uint32_t>(f32bits(static_cast<float>(static_cast<double>(value(v[l])))));
+        });
+      w.written32[u.dst] = 1;
+    }
     return true;
   }
   [[gnu::noinline]] bool micro_setp64(Warp& w, const MicroOp& u, Mask fm) {
