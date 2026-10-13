@@ -381,7 +381,7 @@ false` throughout. gfx1251 (MI430X) is not covered.
   mixed 8-, 6- and 4-bit `f8f6f4` forms, and the block-scaled forms with E8M0, E5M3 and E4M3 scales), and the sparse
   `v_swmmac_*`. The lane layouts, the sparse index words and the scale selection come from the document's tables and
   pseudocode. Each product is summed exactly and rounded once, so the last bit can differ from hardware that sums in a
-  fixed order; `FP16_OVFL` is not modelled (an overflow gives infinity). EXEC must be all ones. No card has run them:
+  fixed order; `FP16_OVFL` (MODE bit 23) is not modelled (an overflow gives infinity). EXEC must be all ones. No card has run them:
   `tests/hipcc/wmma1250.cpp` checks them against the host, and the dense checks hold for any order of K, while the
   sparse, mixed-width and scaled ones depend on the layout read from the document.
 - **Arithmetic the compiler seldom emits** (`tests/hipcc/alu1250.cpp`, each against the ISA's pseudocode written out for
@@ -411,8 +411,8 @@ false` throughout. gfx1251 (MI430X) is not covered.
   document's figure; `tests/hipcc/trload1250.cpp` feeds them to a WMMA). EXEC must be all ones.
 - **Vector registers past v255:** a wave's register file grows to what a kernel names, up to the 1024 a gfx1250 wave may
   have, and `s_set_vgpr_msb` puts the two high bits on the numbers each following instruction's destination and sources
-  name (VALU, FLAT/GLOBAL and DS instructions; the buffer and image forms and `v_movrel*` are not covered, nor is writing
-  the bits through the MODE register). `tests/hipcc/vgprs1250.cpp` keeps 600 values live at once.
+  name (VALU, FLAT/GLOBAL and DS instructions; the buffer and image forms and `v_movrel*` are not covered), or a write to
+  MODE's bits 19:12 does (see below). `tests/hipcc/vgprs1250.cpp` keeps 600 values live at once.
 - **DPP8** (all eight selects, with and without `fi`, on the VALU and compare instructions) and DPP on the compares, which
   were refused.
 - **LDS atomics and exchanges** (`tests/hipcc/ds1250.cpp`): `ds_cond_sub_*`, `ds_sub_clamp_*`, `ds_pk_add_{f16,bf16}` (with and
@@ -461,9 +461,18 @@ false` throughout. gfx1251 (MI430X) is not covered.
 - **Block loads and stores** (`global_load_block`, `global_store_block`: up to 32 dwords to or from consecutive registers, by the
   mask in M0; a scaled offset is refused) and the **cluster loads** (`cluster_load_b{32,64,128}` and `cluster_load_async_to_lds_*`,
   run as the global loads they downgrade to outside a cluster; `tests/hipcc/block1250.cpp`).
-- **Decoded and printed, but refused when executed:** the 6- and 4-bit transposed loads
-  (`*_load_tr6_*`, `*_load_tr4_*`); the `v_cvt_scale*` and `v_cvt_scalef32*` families (the ISA's pseudocode calls scaling
-  helpers it does not define); the LDS barrier arrives (`ds_atomic_*barrier_arrive*`: the barrier's width is not fixed by the ISA's text). Each says so by name
+- **The 6- and 4-bit transposed loads** (`global_load_tr6_b96`, `global_load_tr4_b64`, and the `ds_` ones; `tests/hipcc/forms1250.cpp`):
+  the document's figure labels each of the 32 K columns of the 16x32 tile with the lane whose address supplies it (16 elements along M, 96 or
+  64 bits) and the code follows it. The figure draws no destination for these two kinds, so that half is assumed from the 16- and 8-bit
+  kinds': lane = M + 16 * (K / 16), the 16 elements of a lane along K in order from bit 0.
+- **MODE and the VGPR MSB bits:** `s_setreg_b32` / `s_setreg_imm32_b32` on MODE bits 19:12 now set the registers the next instructions name,
+  as `s_set_vgpr_msb` does, and `s_getreg_b32` of MODE shows what `s_set_vgpr_msb` set. The scalar prefetches (`s_prefetch_inst`,
+  `s_prefetch_data`, their PC-relative forms and `s_buffer_prefetch_data`) do nothing (no cache to warm). `v_cvt_pk_i16_f32` and
+  `v_cvt_pk_u16_f32` convert toward zero with saturation and a NaN as zero (assumed: the document's helper functions are not defined).
+- **Decoded and printed, but refused when executed:** the `v_cvt_scale*` and `v_cvt_scalef32*` families (the document gives their
+  pseudocode in terms of helpers it does not define (`fp8_to_f16_scale` and the like: overflow and rounding), and its two accounts of which
+  scale byte a lane uses, the pseudocode's `S1[OPSEL * 8 +: 8]` and the lane-by-lane Table 36, differ); the LDS barrier arrives
+  (`ds_atomic_*barrier_arrive*`: the document's pseudocode leaves the barrier's `WIDTH` (21 to 32 bits) as a name that nothing sets). Each says so by name
   when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.
 - **A disagreement worth knowing:** AMD's XML gives the scaled matrix instructions' two-word prefix the opcodes

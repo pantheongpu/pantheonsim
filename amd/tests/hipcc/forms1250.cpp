@@ -84,6 +84,57 @@ __global__ void k_scratch_svs(const uint32_t* a, const uint32_t*, uint32_t* o) {
   asm volatile("scratch_load_b32 %0, %1, %2\n s_wait_loadcnt 0x0" : "=v"(r) : "v"(voff), "s"(soff) : "memory");
   o[i] = r;
 }
+// MODE holds s_set_vgpr_msb's eight bits (DST 13:12, SRC0 15:14, SRC1 17:16, SRC2 19:18), so writing MODE moves the registers the
+// next instructions name: written to v773 with MODE's DST bits set to 3, then read back with s_set_vgpr_msb's SRC0 = 3. v5 must not
+// have been touched, and reading MODE after s_set_vgpr_msb shows the same bits. The scalar prefetches do nothing.
+__global__ void k_mode_msb(const uint32_t* a, const uint32_t*, uint32_t* o) {
+  const int i = threadIdx.x;
+  uint32_t r = 0, plain = 0, mode = 0;
+  const uint32_t x = a[i];
+  asm volatile(
+      "s_prefetch_inst_pc_rel 0x0, null, 0\n"
+      "v_mov_b32 v5, 0xAAAA\n"
+      "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 12, 2), 3\n"
+      "v_mov_b32 v5, %2\n"
+      "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 12, 2), 0\n"
+      "s_set_vgpr_msb 0x03\n"
+      "v_mov_b32 %0, v5\n"
+      "s_set_vgpr_msb 0x1B\n"
+      "s_getreg_b32 %3, hwreg(HW_REG_MODE, 12, 8)\n"
+      "s_set_vgpr_msb 0\n"
+      "v_mov_b32 %1, v5\n"
+      : "=&v"(r), "=&v"(plain), "+v"(const_cast<uint32_t&>(x)), "=&s"(mode)
+      :
+      : "v5");
+  o[i] = r;
+  o[32 + i] = plain;
+  o[64 + i] = mode;
+}
+__global__ void k_scalar_prefetch(const uint32_t* a, const uint32_t*, uint32_t* o) {
+  const uint64_t addr = reinterpret_cast<uint64_t>(a);
+  const uint64_t base = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(addr)) | static_cast<uint64_t>(__builtin_amdgcn_readfirstlane(static_cast<uint32_t>(addr >> 32))) << 32;
+  asm volatile("s_wait_xcnt 0x0\n s_prefetch_data %0, 0x0, null, 0\n s_wait_xcnt 0x0\n s_prefetch_inst %0, 0x40, null, 1" ::"s"(base));
+  o[threadIdx.x] = a[threadIdx.x] + 1;
+}
+// global_load_tr6_b96 and global_load_tr4_b64: lane s supplies the address of its column of the tile (16 elements along M).
+typedef unsigned v3u __attribute__((ext_vector_type(3)));
+typedef unsigned v2u __attribute__((ext_vector_type(2)));
+__global__ void k_tr6(const uint8_t* mem, uint32_t* o) {
+  const int i = threadIdx.x;
+  v3u r = {0, 0, 0};
+  const uint8_t* p = mem + 12 * i;
+  asm volatile("global_load_tr6_b96 %0, %1, off\n s_wait_loadcnt 0x0" : "=&v"(r) : "v"(p) : "memory");
+  o[3 * i + 0] = r[0], o[3 * i + 1] = r[1], o[3 * i + 2] = r[2];
+}
+__global__ void k_tr4(const uint8_t* mem, uint32_t* o) {
+  const int i = threadIdx.x;
+  v2u r = {0, 0};
+  const uint8_t* p = mem + 8 * i;
+  asm volatile("global_load_tr4_b64 %0, %1, off\n s_wait_loadcnt 0x0" : "=&v"(r) : "v"(p) : "memory");
+  o[2 * i + 0] = r[0], o[2 * i + 1] = r[1];
+}
+V1(k_cvt_pk_i16, "v_cvt_pk_i16_f32 %0, %1, 4.0")
+V2(k_cvt_pk_u16, "v_cvt_pk_u16_f32 %0, %1, %2")
 V2(k_min_num_f32, "v_min_num_f32 %0, %1, %2")
 V2(k_max_num_f32, "v_max_num_f32 %0, %1, %2")
 V2(k_fmamk_f16, "v_fmamk_f16 %0, %1, 0x4100, %2")
@@ -614,6 +665,69 @@ int main() {
   }
   // Scratch with signed VGPR + SGPR offsets: each lane gets back what it stored.
   check("scratch_store_b32 / scratch_load_b32 with a VGPR and an SGPR offset", k_scratch_svs, ia, ib, [&](int l) { return ia[l]; });
+  // MODE and the VGPR MSB bits, and the scalar prefetches.
+  {
+    std::vector<uint32_t> a(32);
+    for (int l = 0; l < 32; ++l) a[l] = 0x1000u + l;
+    const auto out = launch(k_mode_msb, a, a, 96);
+    int wrong = 0;
+    for (int l = 0; l < 32; ++l) wrong += out[l] != a[l] || out[32 + l] != 0xAAAAu || out[64 + l] != 0x6Cu;
+    std::printf("s_setreg of MODE's VGPR MSB bits and s_getreg: %d of 32 wrong (mode field %02x, want 6c)\n", wrong, out[64]);
+    failed += wrong != 0;
+    const auto out2 = launch(k_scalar_prefetch, a, a, 32);
+    wrong = 0;
+    for (int l = 0; l < 32; ++l) wrong += out2[l] != a[l] + 1;
+    std::printf("s_prefetch_data, s_prefetch_inst, s_prefetch_inst_pc_rel: %d of 32 wrong\n", wrong);
+    failed += wrong != 0;
+  }
+  // v_cvt_pk_i16_f32 / v_cvt_pk_u16_f32: toward zero, saturating, a NaN is zero (assumed: the document's helpers are undefined).
+  {
+    static const float fv[16] = {0.0f, 1.9f, -1.9f, 40000.0f, -40000.0f, 70000.0f, -0.5f, 32767.5f, __builtin_nanf(""), __builtin_inff(), -__builtin_inff(), 65535.9f, -32768.9f, 123.0f, 2.5f, -2.5f};
+    std::vector<uint32_t> a(32), b(32);
+    for (int l = 0; l < 32; ++l) a[l] = fbits(fv[l % 16]), b[l] = fbits(fv[(l * 5 + 3) % 16]);
+    const auto si = [](float f) -> uint32_t { return f != f ? 0u : static_cast<uint16_t>(static_cast<int16_t>(f >= 32767.0f ? 32767.0 : f <= -32768.0f ? -32768.0 : __builtin_trunc(f))); };
+    const auto su = [](float f) -> uint32_t { return f != f ? 0u : static_cast<uint16_t>(f >= 65535.0f ? 65535.0 : f <= 0.0f ? 0.0 : __builtin_trunc(f)); };
+    check("v_cvt_pk_i16_f32 (second source the constant 4.0)", k_cvt_pk_i16, a, a, [&](int l) { return si(bitsf(a[l])) | si(4.0f) << 16; });
+    check("v_cvt_pk_u16_f32", k_cvt_pk_u16, a, b, [&](int l) { return su(bitsf(a[l])) | su(bitsf(b[l])) << 16; });
+  }
+  // The 6- and 4-bit transposed loads, from the figure's source lanes (see the executor): lane o ends with M = o % 16 and the
+  // 16 elements K = 16 * (o / 16) + j, each taken from the lane the figure gives for that K.
+  {
+    uint8_t* dmem = nullptr;
+    uint32_t* dout = nullptr;
+    CHECK(hipMalloc(&dmem, 512));
+    CHECK(hipMalloc(&dout, 512));
+    for (int bits : {6, 4}) {
+      const int bytes = bits == 6 ? 12 : 8;
+      std::vector<uint8_t> mem(32 * bytes);
+      uint32_t seed = 7 + bits;
+      for (auto& b : mem) seed = seed * 1664525u + 1013904223u, b = static_cast<uint8_t>(seed >> 24);
+      std::vector<uint32_t> out(32 * (bits == 6 ? 3 : 2), 0xDEADBEEFu);
+      CHECK(hipMemcpy(dmem, mem.data(), mem.size(), hipMemcpyHostToDevice));
+      if (bits == 6) hipLaunchKernelGGL(k_tr6, dim3(1), dim3(32), 0, 0, dmem, dout);
+      else hipLaunchKernelGGL(k_tr4, dim3(1), dim3(32), 0, 0, dmem, dout);
+      CHECK(hipDeviceSynchronize());
+      CHECK(hipMemcpy(out.data(), dout, out.size() * 4, hipMemcpyDeviceToHost));
+      static const int base6[8] = {0, 8, 4, 12, 16, 24, 20, 28}, base4[4] = {0, 16, 8, 24};
+      const auto elem = [&](int lane, int m) -> uint32_t {   // element m of a source lane's bytes
+        const int at = m * bits;
+        uint32_t v = mem[lane * bytes + at / 8] >> (at % 8);
+        if (at % 8 + bits > 8) v |= static_cast<uint32_t>(mem[lane * bytes + at / 8 + 1]) << (8 - at % 8);
+        return v & ((1u << bits) - 1);
+      };
+      int wrong = 0;
+      for (int o = 0; o < 32; ++o)
+        for (int j = 0; j < 16; ++j) {
+          const int k = 16 * (o / 16) + j, src = bits == 6 ? base6[k / 4] + k % 4 : base4[k / 8] + k % 8;
+          const int at = j * bits, w0 = o * (bits == 6 ? 3 : 2);
+          uint32_t v = out[w0 + at / 32] >> (at % 32);
+          if (at % 32 + bits > 32) v |= out[w0 + at / 32 + 1] << (32 - at % 32);
+          wrong += (v & ((1u << bits) - 1)) != elem(src, o % 16);
+        }
+      std::printf("global_load_tr%d_b%d: %d of 512 wrong\n", bits, bits == 6 ? 96 : 64, wrong);
+      failed += wrong != 0;
+    }
+  }
   // The byte byte_sel picks of v_cvt_f16_fp8, against the plain conversion of that byte.
   {
     const auto check_f16_byte = [&](const char* what, auto kernel) {
