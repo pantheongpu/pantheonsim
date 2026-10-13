@@ -206,6 +206,16 @@ SCALE_F8_F16(8) SCALE_F8_F16(9) SCALE_F8_F16(10) SCALE_F8_F16(11)
     asm volatile("v_cvt_scale_pk16_f32_fp6 %0, %1, %2 scale_sel:" #N : "=&v"(r) : "v"(in), "v"(s1[i])); \
     *reinterpret_cast<v16f*>(o + 16 * i) = r; }
 SCALE_F6_F32(0) SCALE_F6_F32(1) SCALE_F6_F32(2) SCALE_F6_F32(4) SCALE_F6_F32(5) SCALE_F6_F32(7)
+// A BFloat16 instruction's inline float constant is the 32-bit float, and the source reads its upper 16 bits (the BF16): v_pk_add_bf16 of
+// a pair and 1.0 adds 1.0 to both halves. IB_STS2 reads zero outside a cluster, and the cluster messages answer with zeroes.
+V2(k_pk_add_bf16_one, "v_pk_add_bf16 %0, %1, 1.0 op_sel:[0,1] op_sel_hi:[1,1]")
+__global__ void k_ids(const uint32_t*, const uint32_t*, uint32_t* o) {
+  uint32_t sts2 = 0xFFFFFFFFu, se = 0xFFFFFFFFu, cb = 0xFFFFFFFFu;
+  asm volatile("s_getreg_b32 %0, hwreg(HW_REG_IB_STS2)\n s_sendmsg_rtn_b32 %1, 0x87\n s_wait_kmcnt 0x0" : "=&s"(sts2), "=&s"(se));
+  asm volatile("s_sendmsg_rtn_b32 %0, 0x88\n s_wait_kmcnt 0x0" : "=&s"(cb));
+  const int i = threadIdx.x;
+  o[i] = sts2, o[32 + i] = se, o[64 + i] = cb;
+}
 V2(k_min_num_f32, "v_min_num_f32 %0, %1, %2")
 V2(k_max_num_f32, "v_max_num_f32 %0, %1, %2")
 V2(k_fmamk_f16, "v_fmamk_f16 %0, %1, 0x4100, %2")
@@ -964,6 +974,21 @@ int main() {
       std::printf("v_cvt_scale_pk16_f32_fp6, scale_sel 0, 1, 2, 4, 5, 7: %d of 3072 wrong\n", wrong);
       failed += wrong != 0;
     }
+  }
+  // BF16 constants, and the cluster state outside a cluster.
+  {
+    std::vector<uint32_t> a(32), none(32);
+    for (int l = 0; l < 32; ++l) a[l] = 0x4000u + l * 0x10 | (0x4040u + l * 0x10) << 16;   // bf16 pairs: 2.0.. and 3.0..
+    const auto bf = [](uint32_t v) { return bf2f(static_cast<uint16_t>(v)); };
+    const auto tobf = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return (u + 0x7FFF + ((u >> 16) & 1)) >> 16; };
+    check("v_pk_add_bf16 with the inline constant 1.0 (upper 16 bits of the float)", k_pk_add_bf16_one, a, none, [&](int l) {
+      return tobf(bf(a[l]) + 1.0f) | tobf(bf(a[l] >> 16) + 1.0f) << 16;
+    });
+    const auto out = launch(k_ids, a, none, 96);
+    int wrong = 0;
+    for (int l = 0; l < 32; ++l) wrong += out[l] != 0 || out[32 + l] != 0 || out[64 + l] != 0;
+    std::printf("IB_STS2 and the cluster messages outside a cluster: %d of 32 wrong\n", wrong);
+    failed += wrong != 0;
   }
   // The byte byte_sel picks of v_cvt_f16_fp8, against the plain conversion of that byte.
   {

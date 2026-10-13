@@ -219,6 +219,10 @@ struct Wave {
   // waiting on it, and whether the wave is waiting on it now.
   uint8_t nb_joined = 0;
   bool nb_complete = false, nb_wait = false;
+  // gfx1250 clusters: the wave's cluster (IB_STS2.CLUSTER_ID, 0 outside one) and its work-group's number in it, and the state of the
+  // cluster barrier for it: waiting at it, or it completed before the wave waited.
+  uint8_t cluster_id = 0, wg_in_cluster = 0;
+  bool cl_wait = false, cl_complete = false;
   // How many global loads the wave has issued that no s_waitcnt has waited for yet (capped), and
   // whether it gave up its turn at such a wait (run_round). A load takes a card hundreds of cycles
   // and a barrier, an LDS read or a wave next to this one a few: the waves of a group that wait for
@@ -823,7 +827,12 @@ struct Machine {
   // instructions take none) is the whole pair: its top 16 bits are the high
   // half, as LLVM encodes a packed constant (3.0 in both halves is
   // 0x42004200).
-  static uint16_t constant_half(const Inst&, const Operand& o, uint32_t top) {
+  // A BFloat16 instruction's float constant is the 32-bit float, and the source's half is that float's: OPSEL (or, with none, the high
+  // half) picks the upper 16 bits, the BF16 (CDNA5 ISA 7.7: "BF16 uses 32-bit float constants and then the BF16 operand selects the
+  // upper 16 bits of the FP32 constant"), and the lower 16 bits are what a program that asked for them gets.
+  static uint16_t constant_half(const Inst& in, const Operand& o, uint32_t top) {
+    if (o.kind == OperandKind::InlineFloat && in.arch == gcn::Target::Gfx1250 && in.name.find("bf16") != std::string::npos)
+      return static_cast<uint16_t>(as_bits(static_cast<float>(o.fvalue)) >> (16 * top));
     if (o.kind == OperandKind::InlineFloat) return top ? 0 : as_bits(static_cast<_Float16>(o.fvalue));
     return static_cast<uint16_t>(static_cast<uint32_t>(o.value) >> (16 * top));
   }
@@ -1257,9 +1266,9 @@ struct Machine {
           reg = gcn::is_gfx12(in.arch) ? static_cast<uint32_t>(stats.instructions)
                                                 : static_cast<uint32_t>(stats.instructions) & 0xFFFFF;
         else if (id == 30 && gcn::is_gfx12(in.arch)) reg = static_cast<uint32_t>(stats.instructions >> 32);
-        // gfx1250's IB_STS2, whose bits 9:6 are the wave's number in its work-group (llvm.amdgcn.wave.id reads
-        // them, where gfx12 read TTMP8).
-        else if (id == 28 && in.arch == gcn::Target::Gfx1250) reg = (static_cast<uint32_t>(w.first_lane / w.lanes) & 0xF) << 6;
+        // gfx1250's IB_STS2: CLUSTER_ID in bits 9:6 (0 where the wave is not in a cluster) and WG_IN_CLUSTER in 24:21 (CDNA5 ISA, IB_STS2).
+        // 0 where the dispatch has no cluster. (The wave's number in its work-group is TTMP8[29:25], where llvm.amdgcn.wave.id reads it.)
+        else if (id == 28 && in.arch == gcn::Target::Gfx1250) reg = (w.cluster_id & 0xFu) << 6 | (w.wg_in_cluster & 0xFu) << 21;
         else throw Error::make(Err::Unsupported, "s_getreg_b32 of hardware register ", id, ", which this does not model");
         write_scalar(w, in.dst[0], (reg & mask) >> at);
       }
@@ -1506,9 +1515,16 @@ struct Machine {
     } else if (op == "s_sendmsg_rtn_b32"_op || op == "s_sendmsg_rtn_b64"_op) {
       // A message that answers. The one compute code asks is the time
       // (realtime_ticks).
-      if (in.simm != 131)
-        throw Error::make(Err::Unsupported, "s_sendmsg_rtn of message ", in.simm, ", which this does not answer");
-      write_scalar(w, in.dst[0], realtime_ticks());
+      // gfx1250 also answers 0x87, RTN_GET_SE_HW_ID ({XCC[19:16], SE_ID[3:0]}: shader engine 0 of XCC 0 here), and 0x88,
+      // RTN_GET_CLUSTER_BARRIER_STATE ({0, signalCnt, 5'b0, memberCnt, 3'b0, valid}: all zero, for no cluster barrier exists outside a
+      // cluster).
+      if (in.arch == gcn::Target::Gfx1250 && (in.simm == 0x87 || in.simm == 0x88)) {
+        write_scalar(w, in.dst[0], 0);
+      } else {
+        if (in.simm != 131)
+          throw Error::make(Err::Unsupported, "s_sendmsg_rtn of message ", in.simm, ", which this does not answer");
+        write_scalar(w, in.dst[0], realtime_ticks());
+      }
     } else if (scalar_float(w, in, op, a, b)) {
     } else if (op == "s_quadmask_b32"_op || op == "s_quadmask_b64"_op) {
       // One bit for each group of four: set where any of the four is.
@@ -7248,6 +7264,19 @@ struct Machine {
     uint64_t arrived = 0, generation = 0;
   };
   std::map<uint32_t, GwsBarrier> gws;
+  // gfx1250 clusters (CDNA5 ISA 2.3 and 5.6): the work-groups of the cluster this machine is running, which run side by side in one thread,
+  // and the cluster barrier (-3): one signal per work-group (the compiler has a wave signal after the work-group barrier), complete
+  // when every work-group still running has signalled; every wave then goes past its s_barrier_wait -3.
+  std::vector<Group*> cluster_groups;
+  uint32_t cluster_members = 0, cluster_signaled = 0;
+  void cluster_barrier_complete() {
+    cluster_signaled = 0;
+    for (Group* g : cluster_groups)
+      for (Wave& wv : g->waves) {
+        if (wv.cl_wait) wv.cl_wait = false, wv.cl_complete = false;
+        else if (!wv.done) wv.cl_complete = true;
+      }
+  }
   bool gws_barrier(Wave& w, const Inst& in) {
     const OpName op(in.name);
     if (op == "ds_gws_init"_op) return true;   // the count comes with each barrier
@@ -7308,6 +7337,12 @@ struct Machine {
       if (b.id == -1) {
         if (isfirst) w.scc = g.wg_signaled == 0;
         ++g.wg_signaled;
+      } else if (b.id == -3) {
+        if (!cluster_groups.empty()) {   // (outside a cluster the cluster barrier is a no-op)
+          if (isfirst) w.scc = cluster_signaled == 0;
+          ++cluster_signaled;
+          if (cluster_members && cluster_signaled >= cluster_members) cluster_barrier_complete();
+        }
       } else if (named) {
         if (b.members) g.nb_members[b.id] = b.members;
         if (isfirst) w.scc = g.nb_signaled[b.id] == 0;
@@ -7569,6 +7604,14 @@ struct Machine {
     }
     if (OpName(in.name) == "s_barrier_wait"_op) {
       // gfx1250: only the work-group barrier (-1) is the scheduler's; a named one has a count of its own.
+      if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) == -3 && !cluster_groups.empty()) {
+        if (w.cl_complete) {
+          w.cl_complete = false;
+          return true;
+        }
+        w.cl_wait = true;
+        return false;
+      }
       if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) != -1)
         return gfx1250_named_wait(w, static_cast<int16_t>(in.simm));
       w.at_barrier = true;
@@ -7909,7 +7952,7 @@ bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
   do {
     again = false;
     for (Wave& w : group.waves) {
-      if (w.done || w.at_barrier || w.nb_wait || w.round_stopped) continue;
+      if (w.done || w.at_barrier || w.nb_wait || w.cl_wait || w.round_stopped) continue;
       runnable = true;
       uint64_t pc = w.pc;
       try {
@@ -7940,6 +7983,9 @@ bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
       any = true;
     }
   group.wg_signaled = 0;
+  if (!any)
+    for (const Wave& w : group.waves)
+      if (w.cl_wait) return false;   // waiting at the cluster barrier for the other work-groups of the cluster
   if (!any)
     for (const Wave& w : group.waves)
       if (w.nb_wait)
@@ -8007,6 +8053,77 @@ void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_s
       ++it;
     }
     if (all_waiting && next < end && resident_waves < kMaxResidentWaves) admit();
+  }
+}
+
+// gfx1250's clusters (CDNA5 ISA 2.3): a kernel built for a cluster (.cluster_dims) has its work-groups launched in clusters of that
+// shape, up to 16 of them, which run at the same time -- here side by side on one host thread, each taking a turn in order, so
+// that a cluster barrier (s_barrier_signal -3 and s_barrier_wait -3) can be passed. A work-group finds its place in its cluster in
+// TTMP6 (its x, y and z in 3:0, 7:4 and 11:8; the cluster's shape, less one, in 15:12, 19:16 and 23:20, and the number of work-groups in it, less
+// one, in 27:24), the cluster's own place in TTMP9 (x) and TTMP7 (y in 15:0, z in 31:16), and in IB_STS2 (CLUSTER_ID in 9:6, the
+// work-group's flat number in the cluster in 24:21). Assumed, not stated: work-groups are numbered across a cluster with x
+// fastest, clusters across the grid likewise, and CLUSTER_ID is the cluster's number, modulo 15, plus 1.
+void run_clusters(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_segment, uint64_t begin, uint64_t end,
+                  const std::atomic<bool>* failed) {
+  const uint32_t* cd = d.kernel->cluster_dims;
+  const uint32_t csize = cd[0] * cd[1] * cd[2];
+  const uint32_t nx = d.groups[0] / cd[0], ny = d.groups[1] / cd[1];
+  for (uint64_t ci = begin; ci < end; ++ci) {
+    if (failed && failed->load(std::memory_order_relaxed)) return;
+    const uint32_t cx = static_cast<uint32_t>(ci % nx), cy = static_cast<uint32_t>(ci / nx % ny), cz = static_cast<uint32_t>(ci / nx / ny);
+    std::vector<Group> members(csize);
+    for (uint32_t i = 0; i < csize; ++i) {
+      const uint32_t wx = i % cd[0], wy = i / cd[0] % cd[1], wz = i / cd[0] / cd[1];
+      set_up_group(members[i], m, d, packet, group_segment, cx * cd[0] + wx, cy * cd[1] + wy, cz * cd[2] + wz);
+      for (Wave& w : members[i].waves) {
+        w.ttmp[6] = wx | wy << 4 | wz << 8 | (cd[0] - 1) << 12 | (cd[1] - 1) << 16 | (cd[2] - 1) << 20 | (csize - 1) << 24;
+        w.ttmp[9] = cx;
+        w.ttmp[7] = (cy & 0xFFFF) | cz << 16;
+        w.cluster_id = static_cast<uint8_t>(ci % 15 + 1);
+        w.wg_in_cluster = static_cast<uint8_t>(i);
+      }
+    }
+    m.cluster_groups.clear();
+    for (Group& g : members) m.cluster_groups.push_back(&g);
+    m.cluster_members = csize;
+    m.cluster_signaled = 0;
+    std::vector<bool> finished(csize, false);
+    for (uint32_t left = csize; left;) {
+      if (failed && failed->load(std::memory_order_relaxed)) return;
+      bool moved = false;
+      for (uint32_t i = 0; i < csize; ++i) {
+        if (finished[i]) continue;
+        if (run_round(m, members[i])) {
+          finished[i] = true;
+          --left;
+          --m.cluster_members;   // a work-group that ends leaves the barrier's members
+          if (m.cluster_members && m.cluster_signaled >= m.cluster_members) m.cluster_barrier_complete();
+        }
+        moved = true;
+      }
+      // Every wave of every work-group left is at the cluster barrier, and not enough have signalled (a group whose waves have all just
+      // ended is not stuck: its next turn says it is finished).
+      bool pending_finish = false, other_runnable = false, at_cluster_barrier = false;
+      for (uint32_t i = 0; i < csize; ++i) {
+        if (finished[i]) continue;
+        bool all_done = true;
+        for (const Wave& w : members[i].waves) {
+          all_done = all_done && w.done;
+          other_runnable = other_runnable || (!w.done && !w.cl_wait);
+          at_cluster_barrier = at_cluster_barrier || w.cl_wait;
+        }
+        pending_finish = pending_finish || all_done;
+      }
+      if (left && moved && !pending_finish && !other_runnable && at_cluster_barrier) {
+        uint32_t waiting_at_barrier = 0;
+        for (uint32_t i = 0; i < csize; ++i)
+          if (!finished[i])
+            for (const Wave& w : members[i].waves) waiting_at_barrier += w.cl_wait;
+        throw Error::make(Err::ExecLimit, "every wave of the cluster is waiting at the cluster barrier (", waiting_at_barrier, " waves in ", left,
+                          " work-groups; ", m.cluster_signaled, " of ", m.cluster_members, " work-groups have signalled), and no work-group is left to complete it");
+      }
+    }
+    m.cluster_groups.clear();
   }
 }
 
@@ -8082,6 +8199,50 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
       if (packet) mem.free(packet);
       return total;
     }
+  }
+  const uint32_t* cdims = k.cluster_dims;
+  const uint32_t csize = cdims[0] * cdims[1] * cdims[2];
+  if (csize > 1 && gcn::target_of_mach(d.object->mach) == gcn::Target::Gfx1250) {
+    if (csize > 16) throw Error::make(Err::InvalidValue, "a cluster of ", csize, " work-groups is past the 16 a cluster has");
+    for (int i = 0; i < 3; ++i)
+      if (d.groups[i] % cdims[i])
+        throw Error::make(Err::InvalidValue, "a grid of ", d.groups[i], " work-groups is not whole clusters of ", cdims[i], " (dimension ", i, ")");
+    const uint64_t clusters = groups / csize;
+    const unsigned nthreads_c = worker_count(clusters);
+    if (nthreads_c <= 1) {
+      Machine m(d, mem, *cache);
+      run_clusters(m, d, packet, group_segment, 0, clusters, nullptr);
+      total = m.stats;
+    } else {
+      std::vector<DispatchStats> per_thread(nthreads_c);
+      std::vector<std::thread> pool;
+      std::mutex err_mu;
+      std::exception_ptr first_error;
+      std::atomic<bool> failed{false};
+      for (unsigned t = 0; t < nthreads_c; ++t) {
+        const uint64_t begin = clusters * t / nthreads_c, end = clusters * (t + 1) / nthreads_c;
+        pool.emplace_back([&, t, begin, end] {
+          try {
+            Machine m(d, mem, *cache);
+            m.concurrent = true;
+            run_clusters(m, d, packet, group_segment, begin, end, &failed);
+            per_thread[t] = m.stats;
+          } catch (...) {
+            failed = true;
+            std::lock_guard<std::mutex> lock(err_mu);
+            if (!first_error) first_error = std::current_exception();
+          }
+        });
+      }
+      for (std::thread& th : pool) th.join();
+      if (first_error) {
+        if (packet) mem.free(packet);
+        std::rethrow_exception(first_error);
+      }
+      for (const DispatchStats& p : per_thread) total.add(p);
+    }
+    if (packet) mem.free(packet);
+    return total;
   }
   const unsigned nthreads = d.cooperative ? 1 : worker_count(groups);
   if (d.cooperative) {

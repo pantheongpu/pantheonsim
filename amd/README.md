@@ -485,10 +485,19 @@ false` throughout. gfx1251 (MI430X) is not covered.
   at 32; this takes 31, the largest width with a phase (a program reading the phase as `state >> W` for any smaller W sees it change), and each
   active lane arrives in lane order. The TDM's arrive is made once after the move, to the word at `atomic_barrier_address[18:3]` from the start of
   the LDS. Nothing wakes a sleeping wave. `src_shared_limit` reads as the document defines it.
+- **Clusters** (`tests/hipcc/cluster1250.cpp`, its kernel `cluster1250_kernel.cpp` built by `build.sh` into a code object that the program loads as a
+  module): a kernel whose code object carries `.cluster_dims` (ROCm 7.2's clang has no source attribute; `build.sh` adds the `amdgpu-cluster-dims`
+  function attribute to the kernel's IR) has its work-groups launched in clusters of that shape, up to 16, which run side by side. A
+  work-group finds its place in TTMP6, TTMP7, TTMP9 and IB_STS2 as the document says (2.3), the compiler's own `blockIdx` and the
+  `__builtin_amdgcn_cluster_*` builtins read them, and the cluster barrier (`s_barrier_signal -3`, `s_barrier_wait -3`) completes when every work-group
+  still running has signalled. No ROCm 7.2 runtime consumes `.cluster_dims`, so no public launch interface exists; the simulator takes the cluster
+  from the code object, whichever call launches it, and refuses a grid that is not whole clusters. Assumed, not stated: work-groups and clusters are numbered x
+  fastest, and CLUSTER_ID is the cluster's number modulo 15, plus 1. The multicast of cluster loads is ignored (it moves the same data to the same
+  places).
 - **Decoded and printed, but refused when executed:** the narrowing `v_cvt_scalef32*` and `v_cvt_scalef32_sr*` families (the document does not say whether the
   scale divides or multiplies, how an overflow before or after scaling is judged, or where the stochastic rounding's 16 random bits sit in the
   dropped bits), `v_permlane64_b32` (assembled by LLVM, absent from the document, and gfx1250 is wave32 only), E5M3 (`CLAMP` on the fp8
-  conversions: its largest value and infinity are not stated), and clusters (no public interface launches one: HIP 7.2 has no cluster attribute). Each says so by name
+  conversions: its largest value and infinity are not stated). Each says so by name
   when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.
 - **A disagreement worth knowing:** AMD's XML gives the scaled matrix instructions' two-word prefix the opcodes

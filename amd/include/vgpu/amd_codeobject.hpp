@@ -45,6 +45,8 @@ struct Kernel {
   uint32_t private_segment = 0;           // scratch per work-item, bytes
   uint32_t sgpr_count = 0, vgpr_count = 0, agpr_count = 0;
   uint32_t max_flat_workgroup_size = 0;
+  // gfx1250: the cluster the kernel was built for, in work-groups per dimension (.cluster_dims; 1, 1, 1: none).
+  uint32_t cluster_dims[3] = {1, 1, 1};
   uint32_t wavefront_size = 64;
   // The kernel was built for work-groups that all have the same size
   // (.uniform_work_group_size, clang's uniform-work-group-size attribute):
