@@ -1311,6 +1311,8 @@ vgpu_unit_test(test_host_fft nvidia/tests/unit/test_host_fft.cpp)
 # The dense factorizations behind cuSOLVER and the JPEG transform and colour conversion behind nvJPEG, likewise.
 vgpu_unit_test(test_host_dense nvidia/tests/unit/test_host_dense.cpp)
 vgpu_unit_test(test_host_jpeg nvidia/tests/unit/test_host_jpeg.cpp)
+# The AVX2 kernels of the video codecs, against the scalar loops they stand in for.
+vgpu_unit_test(test_video_simd nvidia/tests/unit/test_video_simd.cpp)
 # The HEVC decoder and parser behind NVDEC, against the CRC-32 of every frame an RTX 3060 displayed.
 vgpu_unit_test(test_hevc_decode nvidia/tests/unit/test_hevc_decode.cpp)
 target_sources(test_hevc_decode PRIVATE nvidia/src/hevc_decode.cpp nvidia/src/hevc_parser.cpp nvidia/src/hevc_syntax.cpp nvidia/src/hevc_stream.cpp)
