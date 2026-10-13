@@ -10476,7 +10476,7 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_ && ok; ++lane)
         if (m & (Mask{1} << lane)) {
           const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-          if (addr % va != 0) ok = false;
+          if (va_pow2 ? (addr & (va - 1)) != 0 : addr % va != 0) ok = false;   // (a mask: % by a variable is a divide)
           for (size_t e = 0; e < n; ++e) fa[cnt++] = addr + e * size;
         }
       if (ok && mem_.load_batch(fa, cnt, size, fv)) {
@@ -10595,7 +10595,7 @@ class Interpreter {
       for (uint32_t lane = 0; lane < W_ && ok; ++lane)
         if (m & (Mask{1} << lane)) {
           const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-          if (addr % va != 0) ok = false;
+          if (va_pow2 ? (addr & (va - 1)) != 0 : addr % va != 0) ok = false;
           for (size_t e = 0; e < n; ++e) {
             fa[cnt] = addr + e * size;
             fv[cnt] = mask_to_bits(vals[e][lane], op.ty.bits);
