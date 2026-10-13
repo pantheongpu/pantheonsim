@@ -4,6 +4,7 @@
 // on both instruction sets, for any thread count, over inputs that break arithmetic (signed zeros, subnormals,
 // infinities, NaN, the extremes) and over shapes that cut the work into blocks and chunks of k.
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -214,6 +215,122 @@ VTEST(host_gemm_int8_matches_the_loops) {
         }
   }
   std::printf("  int8: %d cases\n", cases);
+}
+
+// ---- the complex kernel (cgemm) ----
+//
+// Reference: the loops cublas_complex.inc had, in std::complex<double>:  s = 0; for p: s += x(p) * y(p).
+// The kernel computes the same sums without the complex multiply's repair of a NaN product, so the comparison is made
+// where the operands are finite and the sums come out finite (the callers check exactly that and run their own
+// loops otherwise); operands with an infinity or a NaN are not compared here.
+namespace {
+
+using cdbl = std::complex<double>;
+
+struct CCase {
+  int m, n, k;
+};
+
+std::vector<double> cfill(size_t n, Mix mix, std::mt19937_64& rng) {
+  std::vector<double> v(n);
+  std::uniform_real_distribution<double> u(-2.0, 2.0);
+  // Finite specials only: zeros of both signs, subnormals, the smallest normal, large and tiny magnitudes.
+  const double sp[] = {0.0, -0.0, 1.0, -1.0, std::numeric_limits<double>::denorm_min(), -std::numeric_limits<double>::denorm_min(),
+                       std::numeric_limits<double>::min(), -std::numeric_limits<double>::min(), 1e-200, -1e-200, 1e150, -1e150,
+                       0.1, 3.0, 9007199254740993.0, 0.5};
+  for (auto& x : v) {
+    switch (mix) {
+      case Mix::Plain: x = u(rng); break;
+      case Mix::Zeros: x = rng() % 3 == 0 ? (rng() % 2 ? 0.0 : -0.0) : u(rng); break;
+      case Mix::Special: x = rng() % 2 ? sp[rng() % (sizeof sp / sizeof sp[0])] : u(rng); break;
+      case Mix::SpecialSparse: x = rng() % 40 == 0 ? sp[rng() % (sizeof sp / sizeof sp[0])] : u(rng); break;
+    }
+  }
+  return v;
+}
+
+}  // namespace
+
+VTEST(host_cgemm_matches_the_complex_loops) {
+  std::mt19937_64 rng(4242);
+  const CCase shapes[] = {{1, 1, 1},   {3, 5, 7},    {8, 2, 9},    {9, 3, 17},    {16, 6, 17},   {33, 13, 40},  {64, 64, 64},
+                          {65, 67, 63}, {100, 90, 255}, {100, 90, 257}, {129, 131, 300}, {1, 300, 70}, {300, 1, 70}, {7, 5, 600}};
+  int cases = 0, compared = 0, skipped = 0;
+  size_t bad = 0;
+  for (const CCase& s : shapes)
+    for (const Mix mix : {Mix::Plain, Mix::Zeros, Mix::Special, Mix::SpecialSparse})
+      for (const int pad : {0, 3}) {
+        const int ldx = s.m + pad, ldy = s.k + pad, lds = s.m + pad;
+        const auto xr = cfill(static_cast<size_t>(ldx) * s.k, mix, rng), xi = cfill(xr.size(), mix, rng);
+        const auto yr = cfill(static_cast<size_t>(ldy) * s.n, mix, rng), yi = cfill(yr.size(), mix, rng);
+        std::vector<cdbl> ref(static_cast<size_t>(s.m) * s.n);
+        bool finite = true;
+        for (int j = 0; j < s.n; ++j)
+          for (int i = 0; i < s.m; ++i) {
+            cdbl acc = 0;
+            for (int p = 0; p < s.k; ++p)
+              acc += cdbl(xr[idx(i, p, ldx)], xi[idx(i, p, ldx)]) * cdbl(yr[idx(p, j, ldy)], yi[idx(p, j, ldy)]);
+            ref[static_cast<size_t>(i) + static_cast<size_t>(j) * s.m] = acc;
+            finite &= std::isfinite(acc.real()) && std::isfinite(acc.imag());
+          }
+        ++cases;
+        if (!finite) { ++skipped; continue; }   // an overflow somewhere: the callers' loops decide, not this kernel
+        for (const int tri : {0, 1, 2})
+          for (const Isa isa : {Isa::Generic, Isa::Avx2}) {
+            if (isa == Isa::Avx2 && !vgpu::hostgemm::avx2_available()) continue;
+            for (const unsigned threads : {1u, 3u}) {
+              std::vector<double> sr(static_cast<size_t>(lds) * s.n, 0.0), si(sr.size(), 0.0);
+              vgpu::hostgemm::cgemm(s.m, s.n, s.k, xr.data(), xi.data(), ldx, yr.data(), yi.data(), ldy, sr.data(), si.data(), lds,
+                                    tri, isa, threads);
+              ++compared;
+              for (int j = 0; j < s.n; ++j)
+                for (int i = 0; i < s.m; ++i) {
+                  if (tri == 1 && i < j) continue;
+                  if (tri == 2 && i > j) continue;
+                  const cdbl r = ref[static_cast<size_t>(i) + static_cast<size_t>(j) * s.m];
+                  const double gr = sr[idx(i, j, lds)], gi = si[idx(i, j, lds)];
+                  if (std::memcmp(&gr, &r, 8) != 0 || std::memcmp(&gi, reinterpret_cast<const char*>(&r) + 8, 8) != 0) ++bad;
+                }
+            }
+          }
+      }
+  std::printf("  complex: %d cases (%d with an overflowing sum not compared) x triangle, instruction set and thread count (%d runs), %zu elements differ\n",
+              cases, skipped, compared, bad);
+  VCHECK_EQ(bad, static_cast<size_t>(0));
+  VCHECK(compared > 100);
+}
+
+// The same chain through the real kernel with a triangle asked for: the blocks wholly outside are not computed and the
+// rest are the loops' bits.
+VTEST(host_gemm_triangle_blocks_match_the_loops) {
+  std::mt19937_64 rng(99);
+  size_t bad = 0;
+  int runs = 0;
+  for (const Shape& s : {Shape{200, 200, 90}, Shape{257, 257, 40}, Shape{64, 64, 300}, Shape{130, 130, 3}})
+    for (const int tri : {1, 2}) {
+      const auto A = fill<double>(static_cast<size_t>(s.m) * s.k, Mix::Zeros, rng), B = fill<double>(static_cast<size_t>(s.k) * s.n, Mix::Zeros, rng);
+      std::vector<double> ref(static_cast<size_t>(s.m) * s.n, 0.0), got = ref;
+      for (int j = 0; j < s.n; ++j)
+        for (int i = 0; i < s.m; ++i) {
+          double acc = 0;
+          for (int p = 0; p < s.k; ++p) acc += A[idx(i, p, s.m)] * B[idx(p, j, s.k)];
+          ref[idx(i, j, s.m)] = acc;
+        }
+      for (const unsigned threads : {1u, 3u}) {
+        std::fill(got.begin(), got.end(), 0.0);
+        vgpu::hostgemm::gemm<double, double>(false, false, s.m, s.n, s.k, A.data(), s.m, B.data(), s.k,
+                                             [&](int64_t i, int64_t j, double acc) { got[idx(i, j, s.m)] = acc; }, Isa::Auto, threads, tri);
+        ++runs;
+        for (int j = 0; j < s.n; ++j)
+          for (int i = 0; i < s.m; ++i) {
+            if (tri == 1 && i < j) continue;
+            if (tri == 2 && i > j) continue;
+            if (std::memcmp(&got[idx(i, j, s.m)], &ref[idx(i, j, s.m)], 8) != 0) ++bad;
+          }
+      }
+    }
+  std::printf("  triangle: %d runs, %zu elements differ\n", runs, bad);
+  VCHECK_EQ(bad, static_cast<size_t>(0));
 }
 
 VTEST_MAIN

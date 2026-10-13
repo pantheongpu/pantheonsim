@@ -1304,6 +1304,7 @@ target_sources(test_h264_decode PRIVATE nvidia/src/h264_decode.cpp nvidia/src/h2
 target_compile_definitions(test_h264_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The host matrix product behind cuBLAS and cuBLASLt, bit for bit against the plain loops it replaced.
 vgpu_unit_test(test_host_gemm nvidia/tests/unit/test_host_gemm.cpp)
+vgpu_unit_test(test_host_trsm nvidia/tests/unit/test_host_trsm.cpp)
 # The host convolution behind cuDNN and the host FFT behind cuFFT, likewise.
 vgpu_unit_test(test_host_conv nvidia/tests/unit/test_host_conv.cpp)
 vgpu_unit_test(test_host_fft nvidia/tests/unit/test_host_fft.cpp)
@@ -2083,7 +2084,7 @@ if(TARGET vgpucublas)
                           "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
                           "lt_paths:cublasLt" "lt_epilogue_paths:cublasLt" "lt_blockscaled_paths:cublasLt"
                           "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
-                          "blas_level23_paths:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
+                          "blas_level23_paths:cublas" "blas_host_sums:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
                           "blas_batched_paths:cublas" "blas_64_paths:cublas" "blas_legacy_paths:cublas"
                           "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"

@@ -19,6 +19,8 @@
 #include <numeric>
 #include <vector>
 
+#include "host_trsm.hpp"
+
 namespace vgpu_la {
 
 using cd = std::complex<double>;
@@ -119,10 +121,51 @@ inline void tri_solve(const CMat& a, int k, bool lower, Op op, bool unit, cd* x,
     for (int i = k - 1; i >= 0; --i) row(i, i + 1, k);  // M is upper: back
 }
 
+// The solve of trsm() on host_trsm.hpp's lanes, for operands that make it certain to give the loops' bits: every entry
+// of op(A) that the solve reads and every entry of B finite, and (checked by the solver) every x finite. On false,
+// B is as it was and the loops below run. b has been scaled by alpha already.
+inline bool trsm_fast(bool left, bool lower, Op op, bool unit, int m, int n, const CMat& a, CMat& b) {
+  const int k = left ? m : n;
+  if (k <= 0 || m <= 0 || n <= 0 || static_cast<uint64_t>(m) * n * k < 4096) return false;
+  // M(i, j) as the loops' tri_solve reads it (for the right side: against the transpose, a row of B being a column
+  // vector; the conjugate-transpose is handled by solving for the conjugate row, as the loops do).
+  const bool conj_io = !left && op == Op::C;
+  const Op mop = left ? op : (op == Op::C ? Op::N : (op == Op::N ? Op::T : Op::N));
+  const bool forward = lower == (mop == Op::N);
+  std::vector<double> mr(static_cast<size_t>(k) * k, 0.0), mi(mr.size(), 0.0);
+  for (int i = 0; i < k; ++i) {
+    const int j0 = forward ? 0 : i + 1, j1 = forward ? i : k;
+    auto put = [&](int j) {
+      const cd v = mop == Op::N ? a(i, j) : apply_op(a(j, i), mop);
+      if (!std::isfinite(v.real()) || !std::isfinite(v.imag())) return false;
+      mr[static_cast<size_t>(i) * k + j] = v.real();
+      mi[static_cast<size_t>(i) * k + j] = v.imag();
+      return true;
+    };
+    for (int j = j0; j < j1; ++j)
+      if (!put(j)) return false;
+    if (!unit && !put(i)) return false;
+  }
+  std::vector<cd> w(static_cast<size_t>(m) * n);
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      const cd v = b(i, j);
+      if (!std::isfinite(v.real()) || !std::isfinite(v.imag())) return false;
+      w[static_cast<size_t>(j) * m + i] = v;
+    }
+  const bool ok = left ? vgpu::hosttrsm::cplx(k, n, forward, unit, mr.data(), mi.data(), w.data(), 1, m, false)
+                       : vgpu::hosttrsm::cplx(k, m, forward, unit, mr.data(), mi.data(), w.data(), m, 1, conj_io);
+  if (!ok) return false;
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) b(i, j) = w[static_cast<size_t>(j) * m + i];
+  return true;
+}
+
 // op(A) X = alpha B (left) or X op(A) = alpha B (right); X over the m x n B.
 inline void trsm(bool left, bool lower, Op op, bool unit, int m, int n, cd alpha, const CMat& a, CMat& b) {
   for (int j = 0; j < n; ++j)
     for (int i = 0; i < m; ++i) b(i, j) *= alpha;
+  if (trsm_fast(left, lower, op, unit, m, n, a, b)) return;
   if (left) {
     for (int j = 0; j < n; ++j) tri_solve(a, m, lower, op, unit, &b(0, j), 1);
   } else {

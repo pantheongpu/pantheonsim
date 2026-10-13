@@ -88,9 +88,13 @@ inline T chain_one(bool ta, bool tb, int64_t i, int64_t j, int64_t k, const S* A
 // Computes every output's chain and hands it to epi(i, j, acc). T is the
 // accumulator type: float, double, or uint32_t (wrapping integer sums of
 // int8 operands). Epi must be safe to call concurrently on distinct (i, j).
+//
+// tri selects the outputs wanted: 0 all of them, 1 those with i >= j, 2 those with i <= j. A block of outputs that
+// lies wholly outside is not computed and epi is not called for it; one that straddles the diagonal is computed whole
+// and epi is called for all of it, so a caller that wants a triangle has to leave the rest alone.
 template <class T, class S, class Epi>
 void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t lda, const S* B, int64_t ldb,
-          Epi&& epi, Isa isa = Isa::Auto, unsigned threads = 0) {
+          Epi&& epi, Isa isa = Isa::Auto, unsigned threads = 0, int tri = 0) {
   if (m <= 0 || n <= 0) return;
 #ifdef VGPU_HOSTGEMM_AVX2
   const bool wide = isa == Isa::Avx2 || (isa == Isa::Auto && avx2_available());
@@ -138,6 +142,8 @@ void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t
     T* const bp = ap + mcp_max * kcmax;
     const int64_t ic = (it % mb) * mcb, jc = (it / mb) * ncb;
     const int64_t mc = std::min(mcb, m - ic), nc = std::min(ncb, n - jc);
+    if (tri == 1 && ic + mc - 1 < jc) return;   // every output of the block is above the diagonal
+    if (tri == 2 && ic > jc + nc - 1) return;   // ... below it
     if (wide) {
 #ifdef VGPU_HOSTGEMM_AVX2
       W::block(ta, tb, m, n, k, A, lda, B, ldb, ic, mc, jc, nc, acc, ap, bp);
@@ -148,6 +154,70 @@ void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t
     const int64_t mcp = (mc + MR - 1) / MR * MR;
     for (int64_t j = 0; j < nc; ++j)
       for (int64_t i = 0; i < mc; ++i) epi(ic + i, jc + j, acc[static_cast<size_t>(i + j * mcp)]);
+  });
+}
+
+// The complex counterpart (see COps in host_gemm_impl.inc): for the m x n outputs, in double,
+//
+//     s(i, j) = chain over p of ( xr*yr - xi*yi , xr*yi + xi*yr ),   X(i, p) = (xr, xi), Y(p, j) = (yr, yi)
+//
+// X is m x k and Y is k x n, column-major, each part (real, imaginary) in an array of its own with the leading
+// dimension given; the sums go to the planes sr and si (leading dimension lds). tri as in gemm().
+inline void cgemm(int64_t m, int64_t n, int64_t k, const double* xr, const double* xi, int64_t ldx, const double* yr,
+                  const double* yi, int64_t ldy, double* sr, double* si, int64_t lds, int tri = 0, Isa isa = Isa::Auto,
+                  unsigned threads = 0) {
+  if (m <= 0 || n <= 0) return;
+#ifdef VGPU_HOSTGEMM_AVX2
+  const bool wide = isa == Isa::Avx2 || (isa == Isa::Auto && avx2_available());
+#else
+  const bool wide = false;
+#endif
+  using G = generic::COps;
+#ifdef VGPU_HOSTGEMM_AVX2
+  using W = avx2::COps;
+#else
+  using W = G;
+#endif
+  const int MR = wide ? W::MR : G::MR, NR = wide ? W::NR : G::NR;
+  const uint64_t madds = static_cast<uint64_t>(m) * static_cast<uint64_t>(n) * static_cast<uint64_t>(k);
+  const unsigned want = threads ? threads : vgpu::hostpar::plan(madds, std::numeric_limits<int64_t>::max(), 1u << 22);
+  int64_t mcb = wide ? W::MC : G::MC, ncb = wide ? W::NC : G::NC;
+  auto nblocks = [&] { return ((m + mcb - 1) / mcb) * ((n + ncb - 1) / ncb); };
+  while (want > 1 && nblocks() < static_cast<int64_t>(2 * want)) {
+    if (mcb >= ncb && mcb / 2 >= 2 * MR) mcb = (mcb / 2 + MR - 1) / MR * MR;
+    else if (ncb / 2 >= 2 * NR) ncb = (ncb / 2 + NR - 1) / NR * NR;
+    else if (mcb / 2 >= 2 * MR) mcb = (mcb / 2 + MR - 1) / MR * MR;
+    else break;
+  }
+  const int64_t mb = (m + mcb - 1) / mcb, nb = (n + ncb - 1) / ncb, items = mb * nb;
+  const unsigned nthreads = static_cast<unsigned>(std::min<int64_t>(want, items));
+  const int64_t mcp_max = (mcb + MR - 1) / MR * MR, ncp_max = (ncb + NR - 1) / NR * NR;
+  const int64_t kcmax = std::max<int64_t>(1, std::min<int64_t>(k, wide ? W::KC : G::KC));
+
+  vgpu::hostpar::parallel_for(nthreads, items, [&](int64_t it) {
+    thread_local std::vector<double> scratch;
+    scratch.resize(static_cast<size_t>(2 * mcp_max * ncp_max + 2 * mcp_max * kcmax + 2 * ncp_max * kcmax));
+    double* const accr = scratch.data();
+    double* const acci = accr + mcp_max * ncp_max;
+    double* const ap = acci + mcp_max * ncp_max;
+    double* const bp = ap + 2 * mcp_max * kcmax;
+    const int64_t ic = (it % mb) * mcb, jc = (it / mb) * ncb;
+    const int64_t mc = std::min(mcb, m - ic), nc = std::min(ncb, n - jc);
+    if (tri == 1 && ic + mc - 1 < jc) return;
+    if (tri == 2 && ic > jc + nc - 1) return;
+    if (wide) {
+#ifdef VGPU_HOSTGEMM_AVX2
+      W::block(m, n, k, xr, xi, ldx, yr, yi, ldy, ic, mc, jc, nc, accr, acci, ap, bp);
+#endif
+    } else {
+      G::block(m, n, k, xr, xi, ldx, yr, yi, ldy, ic, mc, jc, nc, accr, acci, ap, bp);
+    }
+    const int64_t mcp = (mc + MR - 1) / MR * MR;
+    for (int64_t j = 0; j < nc; ++j)
+      for (int64_t i = 0; i < mc; ++i) {
+        sr[(ic + i) + (jc + j) * lds] = accr[static_cast<size_t>(i + j * mcp)];
+        si[(ic + i) + (jc + j) * lds] = acci[static_cast<size_t>(i + j * mcp)];
+      }
   });
 }
 

@@ -45,6 +45,7 @@
 #include "enum_value.hpp"
 #include "fixed_point_gemm.hpp"
 #include "host_gemm.hpp"
+#include "host_trsm.hpp"
 
 // Operands are read from and written to the same virtual device memory the
 // kernels see, through the runtime shim's own copy path (declared by the CUDA
@@ -1029,19 +1030,6 @@ VGPU_EXPORT cublasStatus_t cublasDgetrsBatched(cublasHandle_t h, cublasOperation
 
 namespace {
 
-// Solves M x = x in place, M = A or A^T (`trans`) of the k x k triangle `lower`.
-void tri_solve(const std::vector<double>& a, int k, int lda, bool lower, bool trans, bool unit, double* x,
-               size_t step) {
-  auto M = [&](int i, int j) { return trans ? a[(size_t)i * lda + j] : a[(size_t)j * lda + i]; };
-  auto row = [&](int i, int from, int to) {
-    double s = x[(size_t)i * step];
-    for (int j = from; j < to; ++j) s -= M(i, j) * x[(size_t)j * step];
-    x[(size_t)i * step] = unit ? s : s / M(i, i);
-  };
-  if (lower != trans) for (int i = 0; i < k; ++i) row(i, 0, i);   // M is lower: forward
-  else for (int i = k - 1; i >= 0; --i) row(i, i + 1, k);          // M is upper: back
-}
-
 template <class T>
 cublasStatus_t trsm_one(cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans, cublasDiagType_t diag,
                         int m, int n, T alpha, const T* A, int lda, T* B, int ldb) {
@@ -1053,10 +1041,16 @@ cublasStatus_t trsm_one(cublasSideMode_t side, cublasFillMode_t uplo, cublasOper
   const bool lower = uplo == CUBLAS_FILL_MODE_LOWER, t = trans != CUBLAS_OP_N, unit = diag == CUBLAS_DIAG_UNIT;
   for (int j = 0; j < n; ++j)
     for (int i = 0; i < m; ++i) b[(size_t)j * ldb + i] *= (double)alpha;
-  if (side == CUBLAS_SIDE_LEFT)  // each column of B: op(A) x = b
-    for (int j = 0; j < n; ++j) tri_solve(a, k, lda, lower, t, unit, &b[(size_t)j * ldb], 1);
-  else  // each row of B: x op(A) = b, which is op(A)^T x^T = b^T
-    for (int i = 0; i < m; ++i) tri_solve(a, k, lda, lower, !t, unit, &b[(size_t)i], (size_t)ldb);
+  // Each column of B (left): op(A) x = b; each row (right): x op(A) = b, which is op(A)^T x^T = b^T. A vector is solved
+  // by  s = x[i]; for j in the span of row i of M, ascending: s -= M(i,j) * x[j]; x[i] = unit ? s : s / M(i,i),  with M = A
+  // or A^T (`tm`) of the k x k triangle `lower`; host_trsm.hpp runs many vectors side by side, each with those steps.
+  const bool tm = side == CUBLAS_SIDE_LEFT ? t : !t;
+  const bool forward = lower != tm;
+  const int64_t sti = tm ? lda : 1, stj = tm ? 1 : lda;
+  if (m > 0 && n > 0) {
+    if (side == CUBLAS_SIDE_LEFT) vgpu::hosttrsm::real(k, n, forward, unit, a.data(), sti, stj, b.data(), 1, ldb);
+    else vgpu::hosttrsm::real(k, m, forward, unit, a.data(), sti, stj, b.data(), ldb, 1);
+  }
   store(B, std::vector<T>(b.begin(), b.end()));
   return CUBLAS_STATUS_SUCCESS;
 }
