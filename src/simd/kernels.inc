@@ -1159,6 +1159,99 @@ void prmt0_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* 
 #endif
 }
 
+// DSETP's comparison of two doubles held as register pairs (the low words of 32 lanes and the high words), after |x| and -x as
+// dop_m's `mods` say (bit 2i |source i|, bit 2i + 1 -source i; sources a, b are 0, 1). For the codes of float compares (1 to 14 --
+// as fcmp_mask) bit l of *r is the comparison. Code 0 is MIN and 15 MAX: bit l of *r is whether a is the answer (a NaN loses; of two
+// equal values MIN takes a if its sign is set and MAX if not), and bit l of *both_nan whether both are NaN. *both_nan is
+// set to 0 for the other codes.
+void dcmp_k(unsigned cmp, unsigned mods, const uint32_t* alo, const uint32_t* ahi, const uint32_t* blo, const uint32_t* bhi,
+            uint32_t* r, uint32_t* both_nan) {
+  const uint32_t absm[2] = {(mods & 1) ? 0x7fffffffu : ~0u, (mods & 4) ? 0x7fffffffu : ~0u};
+  const uint32_t negm[2] = {(mods & 2) ? 0x80000000u : 0u, (mods & 8) ? 0x80000000u : 0u};
+  uint32_t out = 0, bn = 0;
+#if VGPU_SIMD_AVX2
+  const __m256i absv0 = _mm256_set1_epi32(static_cast<int>(absm[0])), absv1 = _mm256_set1_epi32(static_cast<int>(absm[1]));
+  const __m256i negv0 = _mm256_set1_epi32(static_cast<int>(negm[0])), negv1 = _mm256_set1_epi32(static_cast<int>(negm[1]));
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256i al = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(alo + i));
+    const __m256i ah = _mm256_xor_si256(_mm256_and_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ahi + i)), absv0), negv0);
+    const __m256i bl = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blo + i));
+    const __m256i bh = _mm256_xor_si256(_mm256_and_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(bhi + i)), absv1), negv1);
+    // (lanes 0 1 4 5, then 2 3 6 7)
+    const __m256d xa = _mm256_castsi256_pd(_mm256_unpacklo_epi32(al, ah)), xb = _mm256_castsi256_pd(_mm256_unpackhi_epi32(al, ah));
+    const __m256d ya = _mm256_castsi256_pd(_mm256_unpacklo_epi32(bl, bh)), yb = _mm256_castsi256_pd(_mm256_unpackhi_epi32(bl, bh));
+    const auto bits_of = [](__m256d p, __m256d q) {   // 64-bit lane masks -> 8 bits in lane order
+      return static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(pair_pack_lo(_mm256_castpd_si256(p), _mm256_castpd_si256(q)))));
+    };
+    uint32_t res;
+    if (cmp == 0 || cmp == 15) {
+      const __m256d an_a = _mm256_cmp_pd(xa, xa, _CMP_UNORD_Q), an_b = _mm256_cmp_pd(xb, xb, _CMP_UNORD_Q);
+      const __m256d bn_a = _mm256_cmp_pd(ya, ya, _CMP_UNORD_Q), bn_b = _mm256_cmp_pd(yb, yb, _CMP_UNORD_Q);
+      const auto pick = [&](__m256d x, __m256d y, __m256d anan, __m256d bnan) {
+        const __m256d eq = _mm256_cmp_pd(x, y, _CMP_EQ_OQ);
+        const __m256d cmpv = cmp == 0 ? _mm256_cmp_pd(x, y, _CMP_LT_OQ) : _mm256_cmp_pd(x, y, _CMP_GT_OQ);
+        const __m256d neg = _mm256_castsi256_pd(_mm256_srai_epi32(_mm256_shuffle_epi32(_mm256_castpd_si256(x), 0xF5), 31));   // a's sign bit, through the lane
+        const __m256d same = cmp == 0 ? neg : _mm256_xor_pd(neg, _mm256_castsi256_pd(_mm256_set1_epi64x(-1)));
+        __m256d v = _mm256_blendv_pd(cmpv, same, eq);                                              // equal: by sign; else by order
+        v = _mm256_blendv_pd(v, _mm256_xor_pd(anan, _mm256_castsi256_pd(_mm256_set1_epi64x(-1))), _mm256_or_pd(anan, bnan));   // a NaN loses
+        return v;
+      };
+      res = bits_of(pick(xa, ya, an_a, bn_a), pick(xb, yb, an_b, bn_b));
+      bn |= bits_of(_mm256_and_pd(an_a, bn_a), _mm256_and_pd(an_b, bn_b)) << i;
+    } else {
+      // (the same predicates as the float compares)
+      __m256d ra, rb;
+      switch (cmp) {
+#define VGPU_DCMP_CASE(N, P) case N: ra = _mm256_cmp_pd(xa, ya, P); rb = _mm256_cmp_pd(xb, yb, P); break;
+        VGPU_DCMP_CASE(1, _CMP_LT_OQ) VGPU_DCMP_CASE(2, _CMP_EQ_OQ) VGPU_DCMP_CASE(3, _CMP_LE_OQ) VGPU_DCMP_CASE(4, _CMP_GT_OQ)
+        VGPU_DCMP_CASE(5, _CMP_NEQ_OQ) VGPU_DCMP_CASE(6, _CMP_GE_OQ) VGPU_DCMP_CASE(7, _CMP_ORD_Q) VGPU_DCMP_CASE(8, _CMP_UNORD_Q)
+        VGPU_DCMP_CASE(9, _CMP_NGE_UQ) VGPU_DCMP_CASE(10, _CMP_EQ_UQ) VGPU_DCMP_CASE(11, _CMP_NGT_UQ) VGPU_DCMP_CASE(12, _CMP_NLE_UQ)
+        VGPU_DCMP_CASE(13, _CMP_NEQ_UQ) VGPU_DCMP_CASE(14, _CMP_NLT_UQ)
+#undef VGPU_DCMP_CASE
+        default: ra = rb = _mm256_castsi256_pd(_mm256_set1_epi64x(-1)); break;
+      }
+      res = bits_of(ra, rb);
+    }
+    out |= res << i;
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) {
+    const double a = std::bit_cast<double>(uint64_t{alo[l]} | (uint64_t{(ahi[l] & absm[0]) ^ negm[0]} << 32));
+    const double b = std::bit_cast<double>(uint64_t{blo[l]} | (uint64_t{(bhi[l] & absm[1]) ^ negm[1]} << 32));
+    const bool an = a != a, bnn = b != b;
+    bool v;
+    if (cmp == 0 || cmp == 15) {
+      if (an || bnn) v = !an;
+      else if (a == b) v = cmp == 0 ? __builtin_signbit(a) : !__builtin_signbit(a);
+      else v = cmp == 0 ? a < b : a > b;
+      bn |= static_cast<uint32_t>(an && bnn) << l;
+    } else {
+      const bool un = an || bnn;
+      switch (cmp) {
+        case 1: v = !un && a < b; break;
+        case 2: v = !un && a == b; break;
+        case 3: v = !un && a <= b; break;
+        case 4: v = !un && a > b; break;
+        case 5: v = !un && a != b; break;
+        case 6: v = !un && a >= b; break;
+        case 7: v = !un; break;
+        case 8: v = un; break;
+        case 9: v = un || a < b; break;
+        case 10: v = un || a == b; break;
+        case 11: v = un || a <= b; break;
+        case 12: v = un || a > b; break;
+        case 13: v = un || a != b; break;
+        case 14: v = un || a >= b; break;
+        default: v = true; break;
+      }
+    }
+    out |= static_cast<uint32_t>(v) << l;
+  }
+#endif
+  *r = out;
+  *both_nan = bn;
+}
+
 #if VGPU_SIMD_AVX2
 // Four doubles to four binary16 (in the low 64 bits): to nearest even in one rounding, a NaN the canonical 0x7fff.
 // The integer form of f64_to_f16_bits (simd/fp16.hpp), whose comments say why each constant is what it is.

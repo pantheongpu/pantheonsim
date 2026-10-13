@@ -1199,6 +1199,57 @@ VTEST(prmt0_at_every_level) {
   }
 }
 
+// dcmp: DSETP's compares and its MIN/MAX against the executor's rule on doubles, over special values and random bit patterns,
+// with |x| and -x on either source.
+VTEST(dcmp_at_every_level) {
+  std::mt19937_64 rng(135);
+  static const uint64_t special[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x3ff0000000000000ull, 0xbff0000000000000ull,
+                                     0x7ff0000000000000ull, 0xfff0000000000000ull, 0x7ff8000000000000ull, 0xfff8000000000001ull,
+                                     0x7ff0000000000001ull, 0x0000000000000001ull, 0x800fffffffffffffull, 0x7fefffffffffffffull,
+                                     0x4000000000000000ull, 0xc000000000000000ull};
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 20000; ++round) {
+      uint32_t lo[2][32], hi[2][32];
+      double v[2][32];
+      const unsigned mods = round % 4 == 0 ? static_cast<unsigned>(rng() & 15) : 0;
+      for (int s = 0; s < 2; ++s)
+        for (int i = 0; i < 32; ++i) {
+          uint64_t u = round % 3 == 0 ? rng() : special[rng() % 14];
+          if (s == 1 && round % 5 == 0 && i % 2 == 0) u = std::bit_cast<uint64_t>(v[0][i]);   // equal operands
+          lo[s][i] = static_cast<uint32_t>(u);
+          hi[s][i] = static_cast<uint32_t>(u >> 32);
+          double d = std::bit_cast<double>(u);
+          if (mods & (1u << (2 * s))) d = std::fabs(d);
+          if (mods & (2u << (2 * s))) d = -d;
+          v[s][i] = d;
+        }
+      for (unsigned cmp = 0; cmp < 16; ++cmp) {
+        uint32_t got = 0, got_nan = 0xdeadbeef, want = 0, want_nan = 0;
+        k.dcmp(cmp, mods, lo[0], hi[0], lo[1], hi[1], &got, &got_nan);
+        for (int i = 0; i < 32; ++i) {
+          const double a = v[0][i], b = v[1][i];
+          bool r;
+          if (cmp == 0 || cmp == 15) {
+            const bool an = a != a, bn = b != b;
+            if (an || bn) r = !an;
+            else if (a == b) r = cmp == 0 ? std::signbit(a) : !std::signbit(a);
+            else r = cmp == 0 ? a < b : a > b;
+            want_nan |= static_cast<uint32_t>(an && bn) << i;
+          } else {
+            r = fcmp_ref(cmp, a, b);
+          }
+          want |= static_cast<uint32_t>(r) << i;
+        }
+        if (got != want || got_nan != want_nan)
+          throw vtest::Failure(lv + " dcmp cmp " + std::to_string(cmp) + " mods " + std::to_string(mods) + ": got 0x" + hex(got) + "/0x" +
+                               hex(got_nan) + " want 0x" + hex(want) + "/0x" + hex(want_nan));
+      }
+    }
+  }
+}
+
 // lane_unary: the population count and the bit reversal against bit-by-bit loops, and FLO against a scan, for every word
 // with one or two bits set, every byte pattern in each byte, the edge words and random ones.
 VTEST(lane_unary_at_every_level) {

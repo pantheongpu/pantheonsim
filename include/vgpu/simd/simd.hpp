@@ -161,6 +161,13 @@ struct Kernels {
   //    (a's four, then b's four) for the i-th nibble n of sel[l], or, if bit 3 of n is set, the sign bit of that byte copied through
   //    all its bits.
   void (*prmt0)(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* sel);
+
+  //  dcmp: DSETP's comparison of binary64 lanes held as register pairs (alo/ahi, blo/bhi: the low and high words of 32 lanes), the
+  //    sources' |x| and -x by `mods` as dop_m's. For cmp 1 to 14 (the codes of fcmp_mask) bit l of *r is the comparison and
+  //    *both_nan is 0. cmp 0 is MIN and 15 MAX: bit l of *r says a is the answer (a NaN loses, b if a is one; of equal values MIN
+  //    takes a if its sign is set, MAX if not), bit l of *both_nan that both are NaN.
+  void (*dcmp)(unsigned cmp, unsigned mods, const uint32_t* alo, const uint32_t* ahi, const uint32_t* blo, const uint32_t* bhi,
+               uint32_t* r, uint32_t* both_nan);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the

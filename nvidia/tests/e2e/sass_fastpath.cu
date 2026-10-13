@@ -409,6 +409,17 @@ __global__ void half_forms(const uint32_t* in, uint32_t* out, const uint64_t* di
     d[5] = static_cast<uint64_t>(__double_as_longlong(__fma_ru(p, q, -r)));
     d[6] = static_cast<uint64_t>(__double_as_longlong(__fma_rd(p, q, r)));
     d[7] = static_cast<uint64_t>(__double_as_longlong(__fma_rn(p, q, r)));
+    // DSETP: every comparison, and fmin / fmax (its MIN and MAX forms), with |x| and -x.
+    o[22] = static_cast<uint32_t>(p < q) | static_cast<uint32_t>(p <= q) << 1 | static_cast<uint32_t>(p == q) << 2 | static_cast<uint32_t>(p != q) << 3 |
+            static_cast<uint32_t>(p > q) << 4 | static_cast<uint32_t>(p >= q) << 5 | static_cast<uint32_t>(!(p < q)) << 6 |
+            static_cast<uint32_t>(!(p <= q)) << 7 | static_cast<uint32_t>(!(p == q)) << 8 | static_cast<uint32_t>(!(p > q)) << 9 |
+            static_cast<uint32_t>(!(p >= q)) << 10 | static_cast<uint32_t>(isnan(p)) << 11 | static_cast<uint32_t>(!isnan(q)) << 12 |
+            static_cast<uint32_t>(fabs(p) < -q) << 13 | static_cast<uint32_t>(-p >= fabs(q)) << 14 | static_cast<uint32_t>(isnan(p) && isnan(q)) << 15 |
+            static_cast<uint32_t>(isnan(p + q)) << 16 | static_cast<uint32_t>((p < q) != (r > q)) << 17;
+    {
+      const long long mn = __double_as_longlong(fmin(p, q)), mx = __double_as_longlong(fmax(-p, fabs(q)));
+      o[23] = static_cast<uint32_t>(mn) ^ static_cast<uint32_t>(mn >> 32) ^ (static_cast<uint32_t>(mx) * 3u) ^ static_cast<uint32_t>(mx >> 32);
+    }
   }
   for (int k = 0; k < kHalfForms; ++k) out[static_cast<size_t>(i) * kHalfForms + k] = o[k];
   for (int k = 0; k < 8; ++k) dout[static_cast<size_t>(i) * 8 + k] = d[k];

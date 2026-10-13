@@ -1019,6 +1019,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     case Op::FMNMX: case Op::MUFU: case Op::I2FP: case Op::I2F: case Op::F2I: case Op::HADD2: case Op::HMUL2: case Op::HFMA2:
       return fast_float(w, ins, ex);
     case Op::PRMT: return fast_wide(w, ins, ex);
+    case Op::DSETP: return fast_float(w, ins, ex);
     default: return false;
   }
   if (ins.dst.empty()) return false;
@@ -1783,6 +1784,51 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
         }
       }
       if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::DSETP: {
+      // A double comparison (or MIN/MAX: whether a is the answer, and whether both are NaN) of two register pairs or values the same for
+      // every lane, as the DFMA path reads its sources.
+      const unsigned cmp = ins.f[0], bop = ins.f[1];
+      if (ins.dst.size() < 2 || ins.dst[0].kind != Kind::Pred || ins.dst[1].kind != Kind::Pred || ins.src.size() < 3 ||
+          !is_pred(ins.src[2]))
+        return false;
+      for (int i = 0; i < 2; ++i) {
+        const Kind k = ins.src[i].kind;
+        if (!(k == Kind::Reg || k == Kind::UReg || k == Kind::CBank || k == Kind::Imm || k == Kind::FImm)) return false;
+      }
+      alignas(32) uint32_t tlo[2][32], thi[2][32];
+      const uint32_t *lo[2], *hi[2];
+      unsigned mods = 0;
+      for (unsigned i = 0; i < 2; ++i) {
+        const Operand& o = ins.src[i];
+        if (o.kind == Kind::Reg && o.reg != kRZ) {
+          lo[i] = &w.reg(o.reg, 0);
+          hi[i] = &w.reg(o.reg + 1, 0);
+          mods |= (o.abs ? 1u : 0u) << (2 * i) | (o.neg ? 1u : 0u) << (2 * i + 1);
+        } else {
+          uint64_t bits = o.kind == Kind::FImm && o.fwidth == 64 ? static_cast<uint64_t>(o.fbits) << 32 : read64(w, o, 0);
+          if (o.abs) bits &= 0x7fffffffffffffffull;
+          if (o.neg) bits ^= 0x8000000000000000ull;
+          for (unsigned l = 0; l < 32; ++l) {
+            tlo[i][l] = static_cast<uint32_t>(bits);
+            thi[i][l] = static_cast<uint32_t>(bits >> 32);
+          }
+          lo[i] = tlo[i];
+          hi[i] = thi[i];
+        }
+      }
+      uint32_t res, both_nan;
+      sk->dcmp(cmp, mods, lo[0], hi[0], lo[1], hi[1], &res, &both_nan);
+      const Mask acc = pmask(ins.src[2]);
+      const auto combine = [](unsigned b, Mask x, Mask a) -> Mask { return b == 0 ? (x & a) : b == 1 ? (x | a) : (x ^ a); };
+      if (cmp == 0 || cmp == 15) {
+        setp(ins.dst[0], combine(bop, res, acc));
+        setp(ins.dst[1], both_nan);
+      } else {
+        setp(ins.dst[0], combine(bop, res, acc));
+        setp(ins.dst[1], combine(bop, ~res, acc));
+      }
       return true;
     }
     case Op::HADD2: case Op::HMUL2: case Op::HFMA2: {
