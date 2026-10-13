@@ -3945,7 +3945,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         else take = agreed ? group : 0;
       }
       const int64_t target = ins.src.back().imm;
-      if (take == group || !take) {
+      if (fast_ && (take == group || !take)) {
         // Every lane of the group goes the same way: a lane's new pc is its own plus the distance to the target
         // (base_of(l) + target = pc - ins.pc + target) or plus 16. (A whole warp is a straight loop over its 32 counters.)
         const uint64_t delta = take ? static_cast<uint64_t>(target) - ins.pc : 16;
