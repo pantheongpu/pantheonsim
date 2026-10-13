@@ -111,7 +111,7 @@ cd "$VGPU_WL_PANTHEON"
 # would otherwise rebuild everything each time the matrix changes card.
 bdir="build-vgpu-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d .)"
 targets=""; for w in $VGPU_WL_NAMES; do case " $VGPU_WL_SKIP " in *" $w "*) ;; *) targets="$targets $bdir/$w" ;; esac; done
-make -k PLATFORM=CUDA BUILD_DIR="$bdir" -j"$(nproc)" $targets >"$VGPU_WL_LOGS/build.log" 2>&1 || true
+make -k PLATFORM=CUDA BUILD_DIR="$bdir" -j"${VGPU_WL_JOBS:-1}" $targets >"$VGPU_WL_LOGS/build.log" 2>&1 || true
 rc=0
 : >"$VGPU_WL_LOGS/results.tsv"
 record() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$VGPU_WL_LOGS/results.tsv"; printf '%-26s %-8s %5ss  %s\n' "$1" "$2" "$3" "$4"; }
@@ -169,7 +169,7 @@ fi
 
 VGPU_WL_PANTHEON="$pantheon" VGPU_WL_NAMES="$WORKLOADS" VGPU_WL_SKIP="$OUT_OF_SCOPE" \
 VGPU_WL_LOGS="$logs" VGPU_WL_DURATION="$DURATION" VGPU_WL_MEMPCT="$MEM_PCT" \
-VGPU_WL_ARGS="$ARGS" VGPU_WL_TIMEOUT="$TIMEOUT" VGPU_WL_GEMM="$GEMM_SIZE" \
+VGPU_WL_ARGS="$ARGS" VGPU_WL_TIMEOUT="$TIMEOUT" VGPU_WL_GEMM="$GEMM_SIZE" VGPU_WL_JOBS="$("$root/ci/jobs.sh" -g 2)" \
   "$build/vgpu" shell --gpu "$GPU" --count "$COUNT" --vram-mb "$VRAM_MB" "${isolate[@]}" -y -c "$inner"
 status=$?
 

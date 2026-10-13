@@ -48,12 +48,14 @@ done
 export ROCM_PATH=$rocm HIP_PATH=$rocm HIP_CLANG_PATH=$rocm/lib/llvm/bin HIP_DEVICE_LIB_PATH=$rocm/amdgcn/bitcode
 
 srcs=$(cd "$repo" && find kernels -name '*.cpp' ! -path 'kernels/common/*' | sort)
+# One hipcc per job, sized to the memory there is (ci/jobs.sh), not to the CPUs.
+build_jobs=$("$here/ci/jobs.sh" -g 2)
 echo "Building $(wc -w <<<"$srcs") workloads with $rocm/bin/hipcc (unmodified sources)..."
 for src in $srcs; do
   w=$(basename "$src" .cpp)
   ( cd "$repo" && "$rocm/bin/hipcc" -O3 -std=c++14 -DNDEBUG -Ikernels/common -std=c++17 --offload-arch=gfx942 \
       "$src" -o "$bin/$w" ) >"$logs/build_$w.log" 2>&1 &
-  while [[ $(jobs -r | wc -l) -ge $(nproc) ]]; do wait -n; done
+  while [[ $(jobs -r | wc -l) -ge $build_jobs ]]; do wait -n; done
 done
 wait
 
