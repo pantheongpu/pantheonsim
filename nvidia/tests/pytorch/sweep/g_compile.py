@@ -19,9 +19,9 @@ def comp(f, **kw):
     return lambda d, *a: (fast if d != 'cpu' else f)(*[t.to(d) for t in a])
 
 
-def reg(name, f, args, tol=1e-3, tier='quick', **kw):
+def reg(name, f, args, tol=1e-3, tier='quick', timeout=None, **kw):
     g = comp(f, **kw)
-    check(L, 'torch.compile: ' + name, tol, tier=tier)(lambda d: g(d, *args))
+    check(L, 'torch.compile: ' + name, tol, tier=tier, timeout=timeout)(lambda d: g(d, *args))
 
 
 x2 = rnd(32, 48, seed=1)
@@ -40,7 +40,10 @@ reg('layer norm backward (AOTAutograd)', lambda t: _grad(lambda u: F.layer_norm(
 reg('attention block with a causal mask', lambda q, k, v: _grad_multi(lambda a, b, c: (torch.softmax((a @ b.transpose(-1, -2)) / 5.6 + torch.triu(torch.full((16, 16), float('-inf'), device=a.device), 1), -1) @ c).square().sum(), q, k, v), [x4, x4.flip(-1), x4 * 0.5], 3e-2, tier='full')
 reg('dynamic shapes: the same function at three lengths', lambda t: _dyn(t), [x2], 1e-3, tier='full')
 reg('graph breaks and a data-dependent branch', lambda t: t.sum() if t.sum() > 0 else -t.sum(), [x2], 1e-3, tier='full')
-reg('max-autotune-no-cudagraphs: a matmul template', lambda a, b: a @ b + 1, [rnd(64, 64, seed=1), rnd(64, 64, seed=2)], 5e-3, tier='full', mode='max-autotune-no-cudagraphs')
+reg('max-autotune-no-cudagraphs: a matmul template', lambda a, b: a @ b + 1, [rnd(64, 64, seed=1), rnd(64, 64, seed=2)], 5e-3, tier='full', mode='max-autotune-no-cudagraphs',
+    # Inductor times each of 12 Triton templates on the simulator (480 s of benchmarking alone), then compiles the
+    # winner: 775 s on a quiet runner, over the 900 s default on a busy one, and a hang kills the group's other checks.
+    timeout=3600)
 
 
 def _grad(f, t):

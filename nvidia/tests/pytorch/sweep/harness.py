@@ -56,10 +56,12 @@ def have(mod):
         return False
 
 
-def check(group, name, tol=1e-4, tier='quick', needs=()):
-    """Registers fn(device) -> tensor, or a list/tuple/dict of them, as a check."""
+def check(group, name, tol=1e-4, tier='quick', needs=(), timeout=None):
+    """Registers fn(device) -> tensor, or a list/tuple/dict of them, as a check.
+    timeout: seconds this check may take before it is called a hang, where the
+    default (VGPU_SWEEP_TIMEOUT) is too short for it; never shorter than the default."""
     def deco(fn):
-        REGISTRY.append(dict(group=group, name=name, fn=fn, tol=tol, tier=tier, needs=tuple(needs)))
+        REGISTRY.append(dict(group=group, name=name, fn=fn, tol=tol, tier=tier, needs=tuple(needs), timeout=timeout))
         return fn
     return deco
 
@@ -134,13 +136,18 @@ def compare(g, c, tol):
     gs, cs = flat(g), flat(c)
     if len(gs) != len(cs):
         return f"{len(gs)} tensors against the CPU's {len(cs)}"
-    worst = 0.0
+    worst, at = 0.0, 0
     for i, (a, b) in enumerate(zip(gs, cs)):
         d, why = diff(a, b)
         if why:
             return f"tensor {i}: {why}"
-        worst = max(worst, d)
-    return None if worst <= tol else f"max scaled difference {worst:g}, allowed {tol:g}"
+        if d > worst:
+            worst, at = d, i
+    if worst <= tol:
+        return None
+    # Which tensor it is, so a failure that comes and goes can be traced to one.
+    where = f" (tensor {at} of {len(gs)}, shape {tuple(gs[at].shape)})" if len(gs) > 1 else ""
+    return f"max scaled difference {worst:g}{where}, allowed {tol:g}"
 
 
 def short(e):
@@ -222,7 +229,7 @@ def main(argv, loaders):
     for c, missing in skipped:
         print(f"skip {c['name']}: needs {', '.join(missing)}", flush=True)
     timeout = float(os.environ.get('VGPU_SWEEP_TIMEOUT', '900'))
-    results = [run_one(c, timeout) for c in todo]
+    results = [run_one(c, max(timeout, c.get('timeout') or 0)) for c in todo]
     print(f"# {results.count('ok')} of {len(todo)} checks ok, {results.count('xfail')} known failures", flush=True)
     return 0
 

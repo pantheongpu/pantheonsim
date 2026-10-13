@@ -8,7 +8,9 @@ name: PyTorch sweep nightly
 # backend) and, because the runner's image has no torchvision, torchaudio or
 # transformers, installs them first so those groups run too.
 # Run it by hand with `gh workflow run pytorch-sweep-nightly.yml --ref <branch>`;
-# `tests` narrows it to a ctest regular expression.
+# `tests` narrows it to a ctest regular expression; `groups` and `only` narrow the
+# sweep itself (a comma list of groups such as "compile,nn", and a regular
+# expression on a check's name), for chasing one check without the hour of the rest.
 
 on:
   schedule:
@@ -17,6 +19,14 @@ on:
     inputs:
       tests:
         description: "ctest regular expression (the full sweep and the full distributed set if empty)"
+        required: false
+        default: ''
+      groups:
+        description: "sweep groups to run, comma separated (every group if empty)"
+        required: false
+        default: ''
+      only:
+        description: "regular expression on the sweep's check names (every check if empty)"
         required: false
         default: ''
 
@@ -41,6 +51,8 @@ jobs:
       - name: The full sweep
         env:
           TESTS: ${{ inputs.tests }}
+          VGPU_SWEEP_GROUPS: ${{ inputs.groups }}
+          VGPU_SWEEP_ONLY: ${{ inputs.only }}
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -R "${TESTS:-^e2e_pytorch_(sweep_full|dist_full)$}" 2>&1 | tee sweep.log
