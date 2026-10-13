@@ -718,6 +718,125 @@ VTEST(thread_ids_are_the_linear_index_split_by_the_block_shape) {
   }
 }
 
+// Reading the special registers every thread starts with: tid, ntid, ctaid, nctaid and the lane id, in a grid of
+// several blocks of several shapes, against the values the launch geometry gives.
+VTEST(special_registers_read_what_the_launch_geometry_says) {
+  const std::string ptx = R"(.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 po)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [po];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %tid.y;
+    mov.u32 %r3, %tid.z;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %ntid.y;
+    mov.u32 %r6, %ntid.z;
+    mov.u32 %r7, %ctaid.x;
+    mov.u32 %r8, %ctaid.y;
+    mov.u32 %r9, %ctaid.z;
+    mov.u32 %r10, %nctaid.x;
+    mov.u32 %r11, %nctaid.y;
+    mov.u32 %r12, %nctaid.z;
+    mov.u32 %r13, %laneid;
+    mad.lo.u32 %r14, %r3, %r5, %r2;
+    mad.lo.u32 %r14, %r14, %r4, %r1;
+    mad.lo.u32 %r15, %r9, %r11, %r8;
+    mad.lo.u32 %r15, %r15, %r10, %r7;
+    mul.lo.u32 %r16, %r4, %r5;
+    mul.lo.u32 %r16, %r16, %r6;
+    mad.lo.u32 %r17, %r15, %r16, %r14;
+    mul.wide.u32 %rd2, %r17, 52;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r1;
+    st.global.u32 [%rd3+4], %r2;
+    st.global.u32 [%rd3+8], %r3;
+    st.global.u32 [%rd3+12], %r4;
+    st.global.u32 [%rd3+16], %r5;
+    st.global.u32 [%rd3+20], %r6;
+    st.global.u32 [%rd3+24], %r7;
+    st.global.u32 [%rd3+28], %r8;
+    st.global.u32 [%rd3+32], %r9;
+    st.global.u32 [%rd3+36], %r10;
+    st.global.u32 [%rd3+40], %r11;
+    st.global.u32 [%rd3+44], %r12;
+    st.global.u32 [%rd3+48], %r13;
+    ret;
+}
+)";
+  const uint32_t blocks[][3] = {{5, 3, 7}, {33, 2, 1}, {64, 1, 1}, {7, 1, 9}};
+  const uint32_t grids[][3] = {{3, 2, 2}, {1, 1, 1}, {4, 1, 1}};
+  for (const auto& b : blocks)
+    for (const auto& g : grids) {
+      MemoryManager mem{1 << 22};
+      DeviceProfile prof = load_gpu("nvidia/a10");
+      auto m = ptx::parse(ptx);
+      const uint32_t per = b[0] * b[1] * b[2], n = per * g[0] * g[1] * g[2];
+      const uint64_t out = mem.alloc(uint64_t{n} * 52);
+      LaunchConfig cfg;
+      cfg.block = {b[0], b[1], b[2]};
+      cfg.grid = {g[0], g[1], g[2]};
+      exec::launch(m.entries[0], cfg, {arg_u64(out)}, mem, prof);
+      std::vector<uint32_t> got(n * 13);
+      mem.read(out, got.data(), got.size() * 4);
+      for (uint32_t lin = 0; lin < n; ++lin) {
+        const uint32_t blk = lin / per, t = lin % per;
+        const uint32_t want[13] = {t % b[0], t / b[0] % b[1], t / (b[0] * b[1]), b[0], b[1], b[2],
+                                   blk % g[0], blk / g[0] % g[1], blk / (g[0] * g[1]), g[0], g[1], g[2], t % 32};
+        for (int k = 0; k < 13; ++k) VCHECK_EQ(got[lin * 13 + k], want[k]);
+      }
+    }
+}
+
+// popc and clz at both widths, against a plain host count: values with every run of leading zeros, all ones,
+// and (for the 32-bit form) bits above the type's width, which the type cuts off.
+VTEST(popc_and_clz_count_the_bits_of_the_type) {
+  std::vector<uint64_t> a;
+  for (int i = 0; i < kThreads; ++i) {
+    uint64_t v;
+    switch (i % 8) {
+      case 0: v = 0; break;
+      case 1: v = ~uint64_t{0}; break;
+      case 2: v = uint64_t{1} << (i % 64); break;
+      case 3: v = (uint64_t{1} << (i % 64)) - 1; break;
+      case 4: v = 0x8000000000000000ull | i; break;
+      case 5: v = 0x123456789ABCDEF0ull * (uint64_t(i) + 1); break;
+      case 6: v = 0xFFFFFFFF00000000ull | (uint64_t(i) << 3); break;
+      default: v = (uint64_t(i) * 0x9E3779B97F4A7C15ull) >> (i % 40); break;
+    }
+    a.push_back(v);
+  }
+  g_guard = 1;
+  for (const int bits : {32, 64}) {
+    const uint64_t keep = bits == 64 ? ~uint64_t{0} : (uint64_t{1} << bits) - 1;
+    std::string reg = bits == 64 ? "%A" : "%a";
+    std::string prep;
+    for (const bool popc : {true, false}) {
+      const std::string op = std::string(popc ? "popc.b" : "clz.b") + std::to_string(bits);
+      const auto got = run(prep + op + " %d, " + reg + ";", false, a, a, a);
+      for (int i = 0; i < kThreads; ++i) {
+        const uint64_t x = a[i] & keep;
+        uint64_t want = 0;
+        if (popc) {
+          for (uint64_t y = x; y; y &= y - 1) ++want;
+        } else {
+          for (int k = bits - 1; k >= 0 && !(x >> k & 1); --k) ++want;
+        }
+        if (got[i] != want) {
+          char buf[200];
+          std::snprintf(buf, sizeof buf, "%s of 0x%llx: got %llu, want %llu", op.c_str(), (unsigned long long)x,
+                        (unsigned long long)got[i], (unsigned long long)want);
+          throw vtest::Failure(buf);
+        }
+      }
+    }
+  }
+  g_guard = 0;
+}
+
 // The pre-decoded forms (MicroOp) run the same arithmetic as the handlers they
 // were decoded from, unguarded and under a negated guard as well as under the
 // plain one the other tests use.
@@ -760,6 +879,77 @@ VTEST(pre_decoded_forms_match_the_general_path_under_every_guard) {
   g_guard = 0;
 }
 
+// The 64-bit pre-decoded forms -- integer arithmetic and comparisons on 64-bit registers, integer conversions,
+// mul.wide -- unguarded, under the plain guard and under the negated one: immediates that fit a signed 32 bits
+// (sign-extended) and ones that do not (those stay on the general path), a 32-bit register as a 64-bit source,
+// every width pairing of cvt, and the f64 comparisons including the NaN-aware ones.
+VTEST(pre_decoded_64_bit_forms_match_the_general_path_under_every_guard) {
+  std::vector<uint64_t> a;
+  const uint64_t v[] = {0, 1, 2, 63, 64, 65, 100, ~0ull, 0x8000000000000000ull, 0x7FFFFFFFFFFFFFFFull,
+                        0xFFFFFFFFull, 0x80000000ull, 0x7FFFFFFFull, 0x123456789ABCDEF0ull,
+                        0xFFFFFFFF80000000ull, 0x10000ull, 0xFFFFull, 0x8000ull, 0x80ull, 32,
+                        0xFFFFFFFFFFFFFF9Cull /* -100 */, 0x100000000ull, 0x180000000ull};
+  for (int i = 0; i < kThreads; ++i) a.push_back(v[(i * 7 + i / 19) % (sizeof v / sizeof v[0])]);
+  const auto b = rotate(a, 3), c = rotate(a, 10);
+  const auto x = f64_values(), y = rotate(x, 4), z = rotate(x, 9);
+  for (int guard : {1, 2, 0}) {
+    g_guard = guard;
+    for (const char* op : {"add.u64", "sub.s64", "mul.lo.u64", "and.b64", "or.b64", "xor.b64", "min.s64",
+                           "max.u64", "min.u64", "max.s64", "shl.b64", "shr.u64", "shr.s64"}) {
+      same(std::string(op) + " %D, %A, %B;", true, a, b, c);
+      same(std::string(op) + " %D, %A, 5;", true, a, b, c);
+      same(std::string(op) + " %D, %A, -1;", true, a, b, c);
+      same(std::string(op) + " %D, %A, 2147483647;", true, a, b, c);
+      same(std::string(op) + " %D, %A, 4294967296;", true, a, b, c);   // beyond 32 bits: the general path
+      same(std::string(op) + " %D, 7, %B;", true, a, b, c);
+      same(std::string(op) + " %A, %A, %B; mov.b64 %D, %A;", true, a, b, c);   // destination is a source
+      same(std::string(op) + " %D, %rd20, %A;", true, a, b, c);                // a source nothing has written
+    }
+    same("shl.b64 %D, %A, %b;", true, a, b, c);   // a 32-bit register as the count
+    same("shr.u64 %D, %A, %c;", true, a, b, c);
+    same("shl.b64 %D, %A, %r15;", true, a, b, c);   // ... one nothing has written
+    same("cvt.u64.u32 %D, %r15;", true, a, b, c);
+    same("cvt.u32.u64 %d, %rd21; cvt.u64.u32 %D, %d;", true, a, b, c);
+    same("setp.lt.u64 %p3, %rd20, %B; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+    for (const char* ty : {"u64", "s64", "b64"})
+      for (const char* cmp : {"eq", "ne", "lt", "le", "gt", "ge"}) {
+        if (std::string(ty) == "b64" && std::string(cmp) != "eq" && std::string(cmp) != "ne") continue;
+        const std::string head = std::string("setp.") + cmp + "." + ty;
+        same(head + " %p3, %A, %B; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+        same(head + " %p3, %A, 100; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+        same(head + " %p3, %A, -100; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+        same(head + " %p3, 0, %B; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+        same(head + " %p3, %A, 81985529216486895; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+        same(head + " %p3, %A, %B; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+      }
+    for (const char* cmp : {"eq", "ne", "lt", "le", "gt", "ge", "equ", "neu", "ltu", "leu", "gtu", "geu", "num",
+                            "nan"})
+      same(std::string("setp.") + cmp + ".f64 %p3, %A, %B; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true,
+           x, y, z);
+    // The destination predicate keeps its other lanes: the guard cuts the write.
+    same("setp.lt.u64 %p3, %A, %B; setp.ge.u64 %p3, %B, %A; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+    for (const char* cvt :
+         {"cvt.u64.u32 %D, %a;", "cvt.s64.s32 %D, %a;", "cvt.u64.s32 %D, %a;", "cvt.s64.u32 %D, %a;",
+          "cvt.u32.u64 %d, %A; cvt.u64.u32 %D, %d;", "cvt.s32.s64 %d, %A; cvt.u64.u32 %D, %d;",
+          "cvt.u32.s64 %d, %A; cvt.u64.u32 %D, %d;", "cvt.u64.u64 %D, %A;", "cvt.s64.s64 %D, %A;",
+          "cvt.u32.u32 %d, %a; cvt.u64.u32 %D, %d;", "cvt.s32.u32 %d, %a; cvt.u64.u32 %D, %d;",
+          "cvt.u16.u32 %rs1, %a; cvt.u64.u16 %D, %rs1;", "cvt.u16.u32 %rs1, %a; cvt.s64.s16 %D, %rs1;",
+          "cvt.u16.u64 %rs1, %A; cvt.u64.u16 %D, %rs1;", "cvt.u8.u64 %rs1, %A; cvt.u64.u8 %D, %rs1;",
+          "cvt.u8.u32 %rs1, %a; cvt.s32.s8 %d, %rs1; cvt.u64.u32 %D, %d;",
+          "cvt.u64.u32 %D, %c; cvt.u32.u64 %c, %D; cvt.u64.u32 %D, %c;"})
+      same(cvt, true, a, b, c);
+    same("mul.wide.u32 %D, %a, %b;", true, a, b, c);
+    same("mul.wide.s32 %D, %a, %b;", true, a, b, c);
+    same("mul.wide.s32 %D, %a, -3;", true, a, b, c);
+    same("mul.wide.u32 %D, 4294967295, %b;", true, a, b, c);
+    same("mul.wide.s32 %D, 7, 9;", true, a, b, c);
+    // An address computed the way compiled code does it.
+    same("cvt.u64.u32 %D, %a; shl.b64 %D, %D, 2; add.s64 %D, %D, %B; setp.gt.u64 %p3, %D, %A; "
+         "selp.b64 %D, %D, %A, %p3;", true, a, b, c);
+    g_guard = 0;
+  }
+}
+
 namespace {
 
 // A loop of pre-decoded forms, a divergent branch and a predicated tail, over
@@ -787,6 +977,13 @@ const char* kLoopKernel = R"(.version 8.3
 LOOP:
     add.u32 %r3, %r3, %r1;
     mad.lo.u32 %r3, %r3, 1103515245, 12345;
+    cvt.u64.u32 %rd5, %r3;
+    shl.b64 %rd6, %rd5, 3;
+    sub.s64 %rd6, %rd6, %rd5;
+    setp.gt.u64 %p4, %rd6, 100000000;
+    @%p4 add.u32 %r3, %r3, 9;
+    cvt.u32.u64 %r10, %rd6;
+    xor.b32 %r3, %r3, %r10;
     xor.b32 %r4, %r3, %r2;
     atom.global.add.u32 %r9, [%rd4], 1;
     add.u32 %r4, %r4, %r9;

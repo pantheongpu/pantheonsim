@@ -1,5 +1,6 @@
 #include "vgpu/ptx/ast.hpp"
 
+#include <cstdint>
 #include <mutex>
 #include <unordered_map>
 
@@ -96,15 +97,72 @@ void build_micro(EntryFn& fn) {
       u.dst = r.id;
       return true;
     };
+    auto wide_dst = [&](const Reg& r) {
+      if (!r.wide || r.id == kNoReg) return false;
+      u.dst = r.id;
+      u.flags |= MicroOp::kDstWide;
+      return true;
+    };
+    // A source of a 64-bit form: a register of either file (a narrow one reads zero-extended), or an integer
+    // immediate that is its 32-bit value sign-extended -- the offsets and shift counts of address arithmetic.
+    auto source64 = [&](size_t i, const Operand& o) {
+      if (const auto* r = std::get_if<RegOperand>(&o)) {
+        if (r->reg.id == kNoReg) return false;
+        u.src[i] = r->reg.id;
+        if (r->reg.wide) u.src_imm |= static_cast<uint8_t>(1u << (3 + i));
+        return true;
+      }
+      if (const auto* im = std::get_if<ImmInt>(&o)) {
+        if (im->value < INT32_MIN || im->value > INT32_MAX) return false;
+        u.src[i] = static_cast<uint32_t>(static_cast<int32_t>(im->value));
+        u.src_imm |= static_cast<uint8_t>(1u << i);
+        return true;
+      }
+      return false;
+    };
     bool ok = false;
     if (const auto* op = std::get_if<OpIntBin>(&ins.op)) {
-      ok = !(op->carry_in || op->carry_out || op->sat || op->ty.bits != 32 || op->op == IntBinOp::Div ||
-             op->op == IntBinOp::Rem) &&
-           narrow_dst(op->dst) && source(0, op->a) && source(1, op->b);
+      if (op->ty.bits == 64) {
+        // fast_int_bin64's conditions.
+        ok = !(op->carry_in || op->carry_out || op->sat || op->op == IntBinOp::Div || op->op == IntBinOp::Rem) &&
+             wide_dst(op->dst) && source64(0, op->a) && source64(1, op->b);
+        if (ok) {
+          u.kind = MicroOp::Int64;
+          u.sub = static_cast<uint8_t>(op->op);
+          if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
+        }
+      } else {
+        ok = !(op->carry_in || op->carry_out || op->sat || op->ty.bits != 32 || op->op == IntBinOp::Div ||
+               op->op == IntBinOp::Rem) &&
+             narrow_dst(op->dst) && source(0, op->a) && source(1, op->b);
+        if (ok) {
+          u.kind = MicroOp::Int32;
+          u.sub = static_cast<uint8_t>(op->op);
+          if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
+        }
+      }
+    } else if (const auto* op = std::get_if<OpCvt>(&ins.op)) {
+      // fast_cvt_int's conditions: an integer to an integer, no rounding, no saturation.
+      const Type& st = op->src_ty;
+      const Type& dt = op->dst_ty;
+      const auto* src = std::get_if<RegOperand>(&op->src);
+      ok = src && src->reg.id != kNoReg && op->dst.id != kNoReg && !st.is_real() && !dt.is_real() &&
+           st.kind != Type::Kind::Pred && dt.kind != Type::Kind::Pred && op->round == Round::None && !op->sat &&
+           !(dt.is_signed() && dt.bits < 32) && st.bits >= 1 && st.bits <= 64 && dt.bits >= 1 && dt.bits <= 64;
       if (ok) {
-        u.kind = MicroOp::Int32;
-        u.sub = static_cast<uint8_t>(op->op);
-        if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
+        u.kind = MicroOp::Cvt;
+        u.sub = static_cast<uint8_t>(st.bits);
+        u.src[1] = dt.bits;
+        if (st.is_signed()) u.flags |= MicroOp::kSigned;
+        source64(0, op->src);
+        u.dst = op->dst.id;
+        if (op->dst.wide) u.flags |= MicroOp::kDstWide;
+      }
+    } else if (const auto* op = std::get_if<OpMulWide>(&ins.op)) {
+      ok = op->src_bits == 32 && wide_dst(op->dst) && source(0, op->a) && source(1, op->b);
+      if (ok) {
+        u.kind = MicroOp::MulWide32;
+        if (op->is_signed) u.flags |= MicroOp::kSigned;
       }
     } else if (const auto* op = std::get_if<OpMadLo>(&ins.op)) {
       ok = !(op->carry_in || op->carry_out || op->ty.bits != 32) && narrow_dst(op->dst) && source(0, op->a) &&
@@ -113,6 +171,21 @@ void build_micro(EntryFn& fn) {
     } else if (const auto* op = std::get_if<OpMov>(&ins.op)) {
       ok = op->ty.bits == 32 && narrow_dst(op->dst) && source(0, op->src);
       if (ok) u.kind = MicroOp::Mov32;
+    } else if (const auto* op = std::get_if<OpSetp>(&ins.op); op && op->ty.bits == 64) {
+      // 64-bit integer and f64 comparisons, with registers or small immediates (an f64 literal is 64 bits).
+      ok = !op->ty.is_bfloat() && !op->has_bop && !op->has_q && !op->packed && !op->ftz && narrow_dst(op->dst) &&
+           source64(0, op->a) && source64(1, op->b);
+      if (ok && !op->ty.is_float() &&
+          !(op->cmp == CmpOp::Eq || op->cmp == CmpOp::Ne || op->cmp == CmpOp::Lt || op->cmp == CmpOp::Le ||
+            op->cmp == CmpOp::Gt || op->cmp == CmpOp::Ge))
+        ok = false;
+      if (ok && op->ty.is_float() && (u.src_imm & 7)) ok = false;
+      if (ok) {
+        u.kind = MicroOp::Setp64;
+        u.sub = static_cast<uint8_t>(op->cmp);
+        if (op->ty.is_float()) u.flags |= MicroOp::kFloat;
+        if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
+      }
     } else if (const auto* op = std::get_if<OpSetp>(&ins.op)) {
       ok = op->ty.bits == 32 && !op->ty.is_bfloat() && !op->has_bop && !op->has_q && !op->packed && !op->ftz &&
            narrow_dst(op->dst) && source(0, op->a) && source(1, op->b);
