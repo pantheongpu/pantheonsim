@@ -1838,7 +1838,8 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       // value the same for every lane, a split immediate (one half for both lanes), or a pair of immediates for b or c.
       const bool bf = ins.f[0], f32out = ins.f[1], st = ins.f[3];
       const unsigned need = ins.op == Op::HFMA2 ? 3u : 2u;
-      if (bf || (st && !f32out) || ins.dst[0].kind != Kind::Reg || ins.src.size() < need) return false;
+      // (The f32 result is taken for HADD2, the half-to-float conversion, with no flush or saturation: the forms ptxas emits.)
+      if (bf || st || (f32out && (ins.op != Op::HADD2 || ins.f[2])) || ins.dst[0].kind != Kind::Reg || ins.src.size() < need) return false;
       alignas(32) uint32_t pk[3][32];
       bool ok = true;
       const auto packed = [&](unsigned slot, const Operand& o) -> const uint32_t* {
@@ -1888,36 +1889,24 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       }
       if (!ok) return false;
       if (f32out) {
-        // The result is lane 0 of the pair, as an f32: the sum, product or fused multiply-add of the first halves in double, rounded
-        // once to float (and flushed with .FTZ, clamped to [0, 1] with .SAT). The general rule's arithmetic on the same values; a NaN
-        // among the operands (which of two NaNs the host's arithmetic keeps depends on how the compiler ordered the operands) takes
-        // that general path.
-        alignas(32) uint16_t h16[3][32];
-        alignas(32) float f[3][32];
-        const uint32_t* srcs[3] = {a, b, c};
-        const unsigned nused = ins.op == Op::HFMA2 ? 3 : 2;
+        // The result is lane 0 of the pair, as an f32: the sum of the first halves in double, rounded once to float -- for the usual
+        // a = -RZ (the half to float conversion) exactly the half's value. The general rule's arithmetic on the same values; a NaN among
+        // the operands (which of two NaNs the host's arithmetic keeps depends on how the compiler ordered the operands) takes that
+        // general path.
+        alignas(32) uint16_t h16[2][32];
+        alignas(32) float f[2][32];
         uint32_t nan_seen = 0;
-        for (unsigned k = 0; k < nused; ++k) {
-          for (unsigned l = 0; l < 32; ++l) {
-            h16[k][l] = static_cast<uint16_t>(srcs[k][l]);
-            nan_seen |= (h16[k][l] & 0x7fffu) > 0x7c00u;
-          }
+        for (unsigned l = 0; l < 32; ++l) {
+          h16[0][l] = static_cast<uint16_t>(a[l]);
+          h16[1][l] = static_cast<uint16_t>(b[l]);
+          nan_seen |= ((h16[0][l] & 0x7fffu) > 0x7c00u) | ((h16[1][l] & 0x7fffu) > 0x7c00u);
         }
         if (nan_seen) return false;
         if (ins.dst[0].reg == kRZ) return true;
-        for (unsigned k = 0; k < nused; ++k) sk->f16_to_f32(h16[k], f[k], 32);
+        sk->f16_to_f32(h16[0], f[0], 32);
+        sk->f16_to_f32(h16[1], f[1], 32);
         alignas(32) uint32_t out[32];
-        const bool fz = ins.f[2], satur = st;
-        for (unsigned l = 0; l < 32; ++l) {
-          double v;
-          if (ins.op == Op::HADD2) v = static_cast<double>(f[0][l]) + f[1][l];
-          else if (ins.op == Op::HMUL2) v = static_cast<double>(f[0][l]) * f[1][l];
-          else v = std::fma(static_cast<double>(f[0][l]), static_cast<double>(f[1][l]), static_cast<double>(f[2][l]));
-          if (satur) v = v != v ? 0.0 : std::clamp(v, 0.0, 1.0);
-          float g = static_cast<float>(v);
-          if (fz) g = ftz(g);
-          out[l] = f32_bits(g);
-        }
+        for (unsigned l = 0; l < 32; ++l) out[l] = f32_bits(static_cast<float>(static_cast<double>(f[0][l]) + f[1][l]));
         store_row(ins.dst[0].reg, out);
         return true;
       }
