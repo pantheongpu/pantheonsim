@@ -262,7 +262,7 @@ const char* form_name(Form f) {
   static const char* const names[] = {"none",  "mov",   "iadd3", "iadd3x", "imad",  "imad32", "imadwide", "imadhi",
                                       "isetpex", "popc", "i2fp",  "ldg",    "stg",   "lds",    "sts",      "ldl",
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
-                                      "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r"};
+                                      "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "sel",   "prmt",  "imnmx"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -578,6 +578,34 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
         m.p = pred_src(ins.src[4]);   // the predicate the answer is ORed with (not read with .PAND)
       }
       accept(Form::Lop3);
+      return;
+    }
+    case Op::SEL: {   // p ? a : b
+      if (ins.guard_uniform || ins.f[0] || ins.src.size() < 3 || !plain_kind(ins.src[0]) || !plain_kind(ins.src[1])) return;
+      if (ins.src[2].kind != Kind::Pred && ins.src[2].kind != Kind::UPred) return;
+      if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg) || !src32(b, ins.src[1], Dom::Plain, m.s[1], maxreg)) return;
+      m.p = pred_src(ins.src[2]);
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      accept(Form::Sel);
+      return;
+    }
+    case Op::PRMT: {   // byte permute: sources in the order the interpreter reads them
+      if (ins.guard_uniform || ins.src.size() < 3) return;
+      for (int i = 0; i < 3; ++i)
+        if (!plain_kind(ins.src[i]) || !src32(b, ins.src[i], Dom::Plain, m.s[i], maxreg)) return;
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.a = ins.f[0];
+      accept(Form::Prmt);
+      return;
+    }
+    case Op::IMNMX: {   // 32-bit min or max, by a predicate
+      if (ins.guard_uniform || ins.f[1] || ins.src.size() < 3 || !plain_kind(ins.src[0]) || !plain_kind(ins.src[1])) return;
+      if (ins.src[2].kind != Kind::Pred && ins.src[2].kind != Kind::UPred) return;
+      if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg) || !src32(b, ins.src[1], Dom::Plain, m.s[1], maxreg)) return;
+      m.p = pred_src(ins.src[2]);
+      m.c = ins.f[0] ? 1 : 0;   // signed
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      accept(Form::Imnmx);
       return;
     }
     case Op::LEA: {   // (a << s) + b, with .HI, .SX32, .X and the carry out

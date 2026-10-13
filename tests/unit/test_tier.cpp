@@ -79,7 +79,7 @@ void check_corpus(const std::string& file, int sm) {
     ++accepted;
     // Only instructions step_warp runs as straight-line ones can have a handler (a plain BRA, BSSY or NOP ends a run, and tier_run runs it).
     const bool ends = op.form == sass::tier::Form::Bra || op.form == sass::tier::Form::Bssy || op.form == sass::tier::Form::Nop;
-    const bool terminal = op.form == sass::tier::Form::Plop3 || op.form == sass::tier::Form::S2r;   // end a run, and have handlers
+    const bool terminal = op.form == sass::tier::Form::Plop3 || op.form == sass::tier::Form::S2r || op.form == sass::tier::Form::Sel;   // end a run, and have handlers
     VCHECK(ins.straight != (ends || terminal));
     VCHECK(op.maxreg <= 256);   // 0 is possible: constants into RZ
     const std::string what = std::string(sass::tier::form_name(op.form)) + " " + sass::to_text(ins);

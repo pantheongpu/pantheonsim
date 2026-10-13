@@ -699,6 +699,39 @@ TIER_HANDLER(h_s2r) {
   }
 }
 
+TIER_HANDLER(h_sel) {
+  TIER_PRELUDE
+  alignas(32) uint32_t t[2][32], r[32];
+  const uint32_t* a = tier_src<false>(c, op.s[0], t[0]);
+  const uint32_t* b = tier_src<false>(c, op.s[1], t[1]);
+  const Mask p = tier_pmask(c, op.p);
+  for (unsigned l = 0; l < 32; ++l) r[l] = ((p >> l) & 1) ? a[l] : b[l];
+  tier_store(c, op.dst, ex, r);
+}
+
+TIER_HANDLER(h_prmt) {
+  TIER_PRELUDE
+  alignas(32) uint32_t t[3][32], r[32];
+  const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *sel = tier_src<false>(c, op.s[1], t[1]),
+                 *bb = tier_src<false>(c, op.s[2], t[2]);
+  for (unsigned l = 0; l < 32; ++l) r[l] = prmt(a[l], bb[l], sel[l], op.a);
+  tier_store(c, op.dst, ex, r);
+}
+
+TIER_HANDLER(h_imnmx) {
+  TIER_PRELUDE
+  alignas(32) uint32_t t[2][32], r[32];
+  const uint32_t* a = tier_src<false>(c, op.s[0], t[0]);
+  const uint32_t* b = tier_src<false>(c, op.s[1], t[1]);
+  const Mask mn = tier_pmask(c, op.p);
+  for (unsigned l = 0; l < 32; ++l) {
+    const bool m = (mn >> l) & 1;
+    if (op.c) r[l] = m ? static_cast<uint32_t>(std::min<int32_t>(a[l], b[l])) : static_cast<uint32_t>(std::max<int32_t>(a[l], b[l]));
+    else r[l] = m ? std::min(a[l], b[l]) : std::max(a[l], b[l]);
+  }
+  tier_store(c, op.dst, ex, r);
+}
+
 tier::MOp::Fn tier_handler_for(tier::Form f) {
   using F = tier::Form;
   switch (f) {
@@ -717,6 +750,9 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Dop: return &h_dop;
     case F::Plop3: return &h_plop3;
     case F::S2r: return &h_s2r;
+    case F::Sel: return &h_sel;
+    case F::Prmt: return &h_prmt;
+    case F::Imnmx: return &h_imnmx;
     case F::Iadd3x: return &h_iadd3x;
     case F::Imad32: return &h_imad32;
     case F::ImadWide: return &h_imad_wide;

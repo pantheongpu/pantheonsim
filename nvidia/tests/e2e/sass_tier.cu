@@ -70,6 +70,28 @@ __global__ void k_int(const u32* A, const u32* Bv, const u32* C, u32* out, int n
   for (int j = k; j < kInt; ++j) out[(size_t)i * kInt + j] = 0;
 }
 
+// 128-bit and 64-bit-index arithmetic: carries and borrows that cross words (IADD3.X, IMAD.X, LEA.HI.X, ISETP.EX).
+__global__ void k_wide(const u32* A, const u32* Bv, const u32* C, const u64* P, u32* out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  unsigned __int128 x = ((unsigned __int128)(((u64)A[i] << 32) | Bv[i]) << 64) | (((u64)C[i] << 32) | A[(i + 1) % n]);
+  unsigned __int128 y = ((unsigned __int128)(((u64)Bv[(i + 2) % n] << 32) | C[(i + 3) % n]) << 64) | ((u64)A[(i + 5) % n] << 17);
+  unsigned __int128 s = x + y, d = x - y, m = x * y, nx = -x;
+  u64 idx = P[i];
+  const u32* base = A + (idx & 0xffff);
+  const char* cp = (const char*)base + (i64)(idx >> 3) * 8 - (i64)(idx >> 41);
+  u32 r[24];
+  int k = 0;
+  r[k++] = (u32)s; r[k++] = (u32)(s >> 32); r[k++] = (u32)(s >> 64); r[k++] = (u32)(s >> 96);
+  r[k++] = (u32)d; r[k++] = (u32)(d >> 32); r[k++] = (u32)(d >> 64); r[k++] = (u32)(d >> 96);
+  r[k++] = (u32)m; r[k++] = (u32)(m >> 32); r[k++] = (u32)(m >> 64); r[k++] = (u32)(m >> 96);
+  r[k++] = (u32)nx; r[k++] = (u32)(nx >> 64); r[k++] = (u32)(x < y); r[k++] = (u32)((__int128)x < (__int128)y);
+  r[k++] = (u32)(x == y); r[k++] = (u32)(x >= y);
+  r[k++] = (u32)(u64)cp; r[k++] = (u32)((u64)cp >> 32); r[k++] = (u32)(u64)(cp + (idx >> 20)); r[k++] = (u32)((u64)(cp - (idx << 3)) >> 32);
+  r[k++] = (u32)(idx * (u64)A[i]); r[k++] = (u32)((idx * (u64)A[i]) >> 32);
+  for (int j = 0; j < 24; ++j) out[(size_t)i * 24 + j] = r[j];
+}
+
 // Branches on data, so that lanes diverge and the handlers see partial masks of every shape.
 __global__ void k_branch(const u32* A, const u32* Bv, const u32* C, u32* out, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -360,6 +382,20 @@ int main() {
       if (report(label, out, (size_t)n * kInt)) return 1;
     }
     CK(cudaFree(out));
+  }
+  {
+    std::vector<u64> pv(n);
+    fill64(pv, 3);
+    u64* dp = dev_copy(pv);
+    u32* out;
+    CK(cudaMalloc(&out, (size_t)n * 24 * 4));
+    for (int threads : {128, 36}) {
+      k_wide<<<(n + threads - 1) / threads, threads>>>(da, db, dc, dp, out, n);
+      char label[64];
+      std::snprintf(label, sizeof label, "wide threads=%d", threads);
+      if (report(label, out, (size_t)n * 24)) return 1;
+    }
+    CK(cudaFree(out)); CK(cudaFree(dp));
   }
   {
     u32* out;
