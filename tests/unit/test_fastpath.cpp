@@ -983,6 +983,41 @@ VTEST(ld_param_of_every_scalar_type_gives_the_same_value) {
   }
 }
 
+// 16-bit integer arithmetic, setp and mov: the operands are 16-bit registers loaded from 32-bit values whose upper half is
+// garbage as often as zero (the upper half takes no part), against the general path, unguarded and under both guards.
+VTEST(pre_decoded_16_bit_forms_match_the_general_path) {
+  const auto a = int_values(), b = rotate(a, 5), c = rotate(a, 11);
+  for (int guard : {1, 2, 0}) {
+    g_guard = guard;
+    for (const char* ty : {"u16", "s16"}) {
+      for (const char* op : {"add", "sub", "mul.lo", "min", "max", "and", "or", "xor", "shl", "shr"}) {
+        const std::string o = std::string(op) + "." + (std::string(op) == "and" || std::string(op) == "or" || std::string(op) == "xor" ||
+                                                      std::string(op) == "shl" ? "b16" : ty);
+        // %rs1 and %rs2 take the low halves with the upper halves left as they are (mov.b32 into a 16-bit register).
+        const std::string load = "mov.b32 %rs1, %a; mov.b32 %rs2, %b; ";
+        same(load + o + " %rs3, %rs1, %rs2; cvt.u32.u16 %d, %rs3;", false, a, b, c);
+        same(load + o + " %rs3, %rs1, 3; cvt.u32.u16 %d, %rs3;", false, a, b, c);
+        same(load + o + " %rs3, %rs1, 17; cvt.u32.u16 %d, %rs3;", false, a, b, c);
+        same(load + o + " %rs3, %rs1, -5; cvt.u32.u16 %d, %rs3;", false, a, b, c);
+        same(load + o + " %rs1, %rs1, %rs2; mov.b32 %d, %rs1;", false, a, b, c);   // destination is a source; upper bits as written
+        same(load + o + " %rs3, %rs1, %b; cvt.u32.u16 %d, %rs3;", false, a, b, c);   // a 32-bit register as the count or operand
+      }
+      for (const char* cmp : {"eq", "ne", "lt", "le", "gt", "ge"}) {
+        const std::string load = "mov.b32 %rs1, %a; mov.b32 %rs2, %b; ";
+        const std::string t = std::string(cmp) == "eq" || std::string(cmp) == "ne" ? "b16" : ty;
+        same(load + "setp." + cmp + "." + t + " %p3, %rs1, %rs2; selp.u32 %d, 1, 2, %p3;", false, a, b, c);
+        same(load + "setp." + cmp + "." + t + " %p3, %rs1, 100; selp.u32 %d, 1, 2, %p3;", false, a, b, c);
+        same(load + "setp." + cmp + "." + t + " %p3, %rs1, -100; selp.u32 %d, 1, 2, %p3;", false, a, b, c);
+      }
+    }
+    same("mov.b32 %rs1, %a; mov.u16 %rs2, %rs1; cvt.u32.u16 %d, %rs2;", false, a, b, c);
+    same("mov.u16 %rs2, 65535; mov.b32 %d, %rs2;", false, a, b, c);
+    same("mov.u16 %rs2, -3; mov.b32 %d, %rs2;", false, a, b, c);
+    same("mov.b32 %rs1, %a; mov.u16 %rs1, %rs1; mov.b32 %d, %rs1;", false, a, b, c);
+    g_guard = 0;
+  }
+}
+
 // f32 arithmetic with .ftz, the contracted subtract (an fma that negates its product or its addend) with and without
 // .ftz, and setp.ftz, unguarded and under both guards: the operands are subnormals, NaNs of every payload, infinities
 // and signed zeros, and the results land in the subnormal range.

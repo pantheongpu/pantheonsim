@@ -1200,14 +1200,14 @@ using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt
 // and mad.lo, mov, setp, selp, not, shf, f32 arithmetic and fma, all on the narrow register
 // file, no carry, no saturation, no rounding mode (f32 arithmetic may be .ftz, and an fma a contracted sub or .ftz); the 64-bit forms of the address arithmetic around
 // memory accesses: integer arithmetic and setp on 64-bit registers, integer conversions, mul.wide; and
-// mul.hi, neg/abs, the conversion of a narrow integer to f32 or f64, 32-bit division, the 64-bit mov and the
+// 16-bit integer arithmetic, setp and mov (the result cut to 16 bits, as write_reg does), mul.hi, neg/abs, the conversion of a narrow integer to f32 or f64, 32-bit division, the 64-bit mov and the
 // identity cvta; and the kernel's start: the thread and block ids, the warp size, ld.param of a scalar, predicate logic);
 // anything else has kind None and runs as it always did. build_micro() decides, and mirrors the
 // conditions of Interpreter::fast_path exactly.
 struct MicroOp {
   enum Kind : uint8_t { None = 0, Int32, MadLo32, Mov32, Setp32, Fma32, Float32, Selp32, Not32, Shf32, Bra,
                         Int64, Cvt, MulWide32, Setp64, MulHi32, Sign32, CvtI2F, Mov64, MovSreg, LdParam, PredBin,
-                        NotPred };
+                        NotPred, Int16, Setp16, Mov16 };
   enum Flags : uint8_t { kSigned = 1, kFloat = 2, kHasPred = 4, kPredNeg = 8, kLeft = 16, kWrap = 32,
                          kDstWide = 64, kFtz = 128 };
   Kind kind = None;

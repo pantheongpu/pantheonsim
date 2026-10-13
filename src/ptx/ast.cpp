@@ -131,6 +131,15 @@ void build_micro(EntryFn& fn) {
           u.sub = static_cast<uint8_t>(op->op);
           if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
         }
+      } else if (op->ty.bits == 16) {
+        // int_bin's 16-bit cases, the result cut to 16 bits (division is left to the general path).
+        ok = !(op->carry_in || op->carry_out || op->sat || op->op == IntBinOp::Div || op->op == IntBinOp::Rem) &&
+             !op->ty.is_float() && narrow_dst(op->dst) && source(0, op->a) && source(1, op->b);
+        if (ok) {
+          u.kind = MicroOp::Int16;
+          u.sub = static_cast<uint8_t>(op->op);
+          if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
+        }
       } else {
         ok = !(op->carry_in || op->carry_out || op->sat || op->ty.bits != 32) && narrow_dst(op->dst) &&
              source(0, op->a) && source(1, op->b);
@@ -232,6 +241,9 @@ void build_micro(EntryFn& fn) {
           u.kind = MicroOp::MovSreg;
           u.sub = 255;
         }
+      } else if (op->ty.bits == 16) {
+        ok = narrow_dst(op->dst) && source(0, op->src);
+        if (ok) u.kind = MicroOp::Mov16;
       } else {
         ok = op->ty.bits == 32 && narrow_dst(op->dst) && source(0, op->src);
         if (ok) u.kind = MicroOp::Mov32;
@@ -270,6 +282,16 @@ void build_micro(EntryFn& fn) {
       if (ok) {
         u.kind = MicroOp::NotPred;
         u.src[0] = op->src.id;
+      }
+    } else if (const auto* op = std::get_if<OpSetp>(&ins.op); op && op->ty.bits == 16 && !op->ty.is_real()) {
+      // 16-bit integer comparisons (compare's narrow_s/narrow_u at 16 bits): the six ordered ones.
+      ok = !op->has_bop && !op->has_q && !op->packed && narrow_dst(op->dst) && source(0, op->a) && source(1, op->b) &&
+           (op->cmp == CmpOp::Eq || op->cmp == CmpOp::Ne || op->cmp == CmpOp::Lt || op->cmp == CmpOp::Le ||
+            op->cmp == CmpOp::Gt || op->cmp == CmpOp::Ge);
+      if (ok) {
+        u.kind = MicroOp::Setp16;
+        u.sub = static_cast<uint8_t>(op->cmp);
+        if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
       }
     } else if (const auto* op = std::get_if<OpSetp>(&ins.op); op && op->ty.bits == 64) {
       // 64-bit integer and f64 comparisons, with registers or small immediates (an f64 literal is 64 bits).

@@ -3214,6 +3214,9 @@ class Interpreter {
       case MicroOp::LdParam: return micro_ld_param(w, u, fm);
       case MicroOp::PredBin: return micro_pred_bin(w, u, fm);
       case MicroOp::NotPred: return micro_not_pred(w, u, fm);
+      case MicroOp::Int16: return micro_int16(w, u, fm);
+      case MicroOp::Setp16: return micro_setp16(w, u, fm);
+      case MicroOp::Mov16: return micro_mov16(w, u, fm);
       case MicroOp::Bra: return false;   // moves the pc: run_micro_batch's, or step()'s
       case MicroOp::None: break;
     }
@@ -3449,6 +3452,79 @@ class Interpreter {
     else
       for_active(fm, W_, [&](uint32_t l) { d[l] = uint64_t{a[l]} * uint64_t{b[l]}; });
     w.written64[u.dst] = 1;
+    return true;
+  }
+  // 16-bit integer arithmetic: int_bin's cases, computed from the low 16 bits of the registers (whatever is above them
+  // takes no part, as narrow_u and narrow_s see to) and the result cut to 16 bits, as write_reg does.
+  [[gnu::noinline]] bool micro_int16(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    uint32_t* d = dst32(w, u.dst, fm);
+    const bool sig = u.flags & MicroOp::kSigned;
+    auto run = [&](auto f) { for_active(fm, W_, [&](uint32_t l) { d[l] = f(a[l], b[l]) & 0xFFFFu; }); };
+    auto s16 = [](uint32_t v) { return static_cast<int32_t>(static_cast<int16_t>(static_cast<uint16_t>(v))); };
+    switch (static_cast<IntBinOp>(u.sub)) {
+      case IntBinOp::Add: run([](uint32_t x, uint32_t y) { return x + y; }); break;
+      case IntBinOp::Sub: run([](uint32_t x, uint32_t y) { return x - y; }); break;
+      case IntBinOp::Mul: run([](uint32_t x, uint32_t y) { return x * y; }); break;
+      case IntBinOp::And: run([](uint32_t x, uint32_t y) { return x & y; }); break;
+      case IntBinOp::Or: run([](uint32_t x, uint32_t y) { return x | y; }); break;
+      case IntBinOp::Xor: run([](uint32_t x, uint32_t y) { return x ^ y; }); break;
+      case IntBinOp::Min:
+        if (sig) run([&](uint32_t x, uint32_t y) { return static_cast<uint32_t>(std::min(s16(x), s16(y))); });
+        else run([](uint32_t x, uint32_t y) { return std::min(x & 0xFFFFu, y & 0xFFFFu); });
+        break;
+      case IntBinOp::Max:
+        if (sig) run([&](uint32_t x, uint32_t y) { return static_cast<uint32_t>(std::max(s16(x), s16(y))); });
+        else run([](uint32_t x, uint32_t y) { return std::max(x & 0xFFFFu, y & 0xFFFFu); });
+        break;
+      // The count is a .u32 whatever the type; past the width all bits are shifted out (or the sign fills).
+      case IntBinOp::Shl: run([](uint32_t x, uint32_t y) { return y >= 16 ? 0u : x << y; }); break;
+      case IntBinOp::Shr:
+        if (sig) run([&](uint32_t x, uint32_t y) {
+            const int32_t v = s16(x);
+            return static_cast<uint32_t>(y >= 16 ? (v < 0 ? -1 : 0) : v >> y);
+          });
+        else run([](uint32_t x, uint32_t y) { return y >= 16 ? 0u : (x & 0xFFFFu) >> y; });
+        break;
+      default: return false;
+    }
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  [[gnu::noinline]] bool micro_setp16(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    Mask res = 0;
+    auto cmp = [&](auto cast) {
+      auto run = [&](auto f) {
+        for_active(fm, W_, [&](uint32_t l) { res |= Mask{f(cast(a[l]), cast(b[l])) ? 1u : 0u} << l; });
+      };
+      switch (static_cast<CmpOp>(u.sub)) {
+        case CmpOp::Eq: run([](auto x, auto y) { return x == y; }); break;
+        case CmpOp::Ne: run([](auto x, auto y) { return x != y; }); break;
+        case CmpOp::Lt: run([](auto x, auto y) { return x < y; }); break;
+        case CmpOp::Le: run([](auto x, auto y) { return x <= y; }); break;
+        case CmpOp::Gt: run([](auto x, auto y) { return x > y; }); break;
+        case CmpOp::Ge: run([](auto x, auto y) { return x >= y; }); break;
+        default: return false;
+      }
+      return true;
+    };
+    const bool ok = (u.flags & MicroOp::kSigned)
+                        ? cmp([](uint32_t v) { return static_cast<int32_t>(static_cast<int16_t>(static_cast<uint16_t>(v))); })
+                        : cmp([](uint32_t v) { return v & 0xFFFFu; });
+    if (!ok) return false;
+    w.written32[u.dst] = 1;
+    Mask& p = w.preds[u.dst];
+    p = (p & ~fm) | (res & fm);
+    return true;
+  }
+  [[gnu::noinline]] bool micro_mov16(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* v = micro_src(w, u, 0);
+    uint32_t* d = dst32(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = v[l] & 0xFFFFu; });
+    w.written32[u.dst] = 1;
     return true;
   }
   // mov of 64 bits (and cvta to or from the generic space, which adds nothing to a global address).
