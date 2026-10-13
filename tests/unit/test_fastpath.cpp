@@ -718,6 +718,136 @@ VTEST(thread_ids_are_the_linear_index_split_by_the_block_shape) {
   }
 }
 
+// Device-function calls: a recursive function whose depth differs by lane (so paths split inside it and the warp's
+// frames go as deep as 12), a struct argument passed as bytes, and calls in a loop, which reuse the frames a return
+// leaves behind. The values are computed on the host.
+VTEST(device_function_calls_return_what_the_host_computes) {
+  const std::string ptx = R"(.version 8.3
+.target sm_86
+.address_size 64
+.func (.param .b32 func_retval0) fibf(.param .b32 fibf_param_0)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<9>;
+    ld.param.u32 %r8, [fibf_param_0];
+    setp.lt.s32 %p1, %r8, 2;
+    @%p1 bra DONE;
+    add.s32 %r4, %r8, -1;
+    {
+    .reg .b32 temp_param_reg;
+    .param .b32 param0;
+    st.param.b32 [param0+0], %r4;
+    .param .b32 retval0;
+    call.uni (retval0), fibf, (param0);
+    ld.param.b32 %r5, [retval0+0];
+    }
+    add.s32 %r6, %r8, -2;
+    {
+    .reg .b32 temp_param_reg;
+    .param .b32 param0;
+    st.param.b32 [param0+0], %r6;
+    .param .b32 retval0;
+    call.uni (retval0), fibf, (param0);
+    ld.param.b32 %r7, [retval0+0];
+    }
+    add.s32 %r8, %r7, %r5;
+DONE:
+    st.param.b32 [func_retval0+0], %r8;
+    ret;
+}
+.func (.param .b32 func_retval0) f3(.param .b32 f3_param_0, .param .b32 f3_param_1)
+{
+    .reg .b32 %r<4>;
+    ld.param.u32 %r1, [f3_param_0];
+    ld.param.u32 %r2, [f3_param_1];
+    mad.lo.s32 %r3, %r1, 3, %r2;
+    st.param.b32 [func_retval0+0], %r3;
+    ret;
+}
+.func (.param .b32 func_retval0) hs(.param .align 4 .b8 hs_param_0[8], .param .b32 hs_param_1)
+{
+    .reg .b32 %r<6>;
+    ld.param.u32 %r1, [hs_param_1];
+    ld.param.u32 %r2, [hs_param_0];
+    ld.param.u32 %r4, [hs_param_0+4];
+    mad.lo.s32 %r3, %r2, %r1, %r4;
+    st.param.b32 [func_retval0+0], %r3;
+    ret;
+}
+.visible .entry k(.param .u64 po)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [po];
+    mov.u32 %r1, %tid.x;
+    rem.u32 %r2, %r1, 12;
+    {
+    .reg .b32 temp_param_reg;
+    .param .b32 param0;
+    st.param.b32 [param0+0], %r2;
+    .param .b32 retval0;
+    call.uni (retval0), fibf, (param0);
+    ld.param.b32 %r3, [retval0+0];
+    }
+    mov.u32 %r4, 0;
+LOOP:
+    {
+    .reg .b32 temp_param_reg;
+    .param .b32 param0;
+    st.param.b32 [param0+0], %r3;
+    .param .b32 param1;
+    st.param.b32 [param1+0], %r4;
+    .param .b32 retval0;
+    call.uni (retval0), f3, (param0, param1);
+    ld.param.b32 %r5, [retval0+0];
+    }
+    and.b32 %r6, %r5, 3;
+    {
+    .reg .b32 temp_param_reg;
+    .param .align 4 .b8 param0[8];
+    st.param.b32 [param0+0], %r4;
+    st.param.b32 [param0+4], 7;
+    .param .b32 param1;
+    st.param.b32 [param1+0], %r6;
+    .param .b32 retval0;
+    call.uni (retval0), hs, (param0, param1);
+    ld.param.b32 %r7, [retval0+0];
+    }
+    add.s32 %r3, %r5, %r7;
+    add.s32 %r4, %r4, 1;
+    setp.lt.s32 %p1, %r4, 5;
+    @%p1 bra LOOP;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r3;
+    ret;
+}
+)";
+  auto fib = [](int n) { int a = 0, b = 1; for (int i = 0; i < n; ++i) { const int t = a + b; a = b; b = t; } return a; };
+  for (const char* fp : {"1", "0"}) {
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(ptx);
+    const uint64_t po = mem.alloc(100 * 4);
+    LaunchConfig cfg;
+    cfg.block = {100, 1, 1};
+    exec::launch(m.entries[0], cfg, {arg_u64(po)}, mem, prof);
+    std::vector<int32_t> got(100);
+    mem.read(po, got.data(), 400);
+    for (int t = 0; t < 100; ++t) {
+      int32_t acc = fib(t % 12);
+      for (int i = 0; i < 5; ++i) {
+        const int32_t r = acc * 3 + i;
+        acc = r + ((i * (r & 3)) + 7);
+      }
+      VCHECK_EQ(got[t], acc);
+    }
+    unsetenv("VGPU_FASTPATH");
+  }
+}
+
 // Reading the special registers every thread starts with: tid, ntid, ctaid, nctaid and the lane id, in a grid of
 // several blocks of several shapes, against the values the launch geometry gives.
 VTEST(special_registers_read_what_the_launch_geometry_says) {

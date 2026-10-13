@@ -482,17 +482,32 @@ struct Warp {
                     bytes.data() + static_cast<size_t>(lane) * size, size);
       *this = std::move(grown);
     }
+    // The sizes arguments come in are constants to the compiler this way, so each is one move, not a call to memcpy
+    // with a length (this runs once per lane for every st.param and ld.param of a call).
     uint64_t read(uint32_t lane, uint32_t off, uint32_t nbytes) const {
       uint64_t v = 0;
       const size_t base = static_cast<size_t>(lane) * size + off;
       if (base + nbytes > bytes.size()) return 0;
-      std::memcpy(&v, bytes.data() + base, nbytes);
-      return v;
+      const uint8_t* p = bytes.data() + base;
+      switch (nbytes) {
+        case 1: { uint8_t x; std::memcpy(&x, p, 1); return x; }
+        case 2: { uint16_t x; std::memcpy(&x, p, 2); return x; }
+        case 4: { uint32_t x; std::memcpy(&x, p, 4); return x; }
+        case 8: { uint64_t x; std::memcpy(&x, p, 8); return x; }
+        default: std::memcpy(&v, p, nbytes); return v;
+      }
     }
     void write(uint32_t lane, uint32_t off, uint32_t nbytes, uint64_t v) {
       const size_t base = static_cast<size_t>(lane) * size + off;
       if (base + nbytes > bytes.size()) return;
-      std::memcpy(bytes.data() + base, &v, nbytes);
+      uint8_t* p = bytes.data() + base;
+      switch (nbytes) {
+        case 1: { const uint8_t x = static_cast<uint8_t>(v); std::memcpy(p, &x, 1); return; }
+        case 2: { const uint16_t x = static_cast<uint16_t>(v); std::memcpy(p, &x, 2); return; }
+        case 4: { const uint32_t x = static_cast<uint32_t>(v); std::memcpy(p, &x, 4); return; }
+        case 8: std::memcpy(p, &v, 8); return;
+        default: std::memcpy(p, &v, nbytes); return;
+      }
     }
   };
   std::unordered_map<std::string, Slot> slots;
@@ -520,6 +535,9 @@ struct Warp {
     bool sp_valid = false;
   };
   std::vector<Frame> frames;
+  // Frames a return has finished with, emptied but keeping the capacity of their vectors, for the next call to take:
+  // a call otherwise allocates and frees a register file, a path list and a slot map each time.
+  std::vector<Frame> spare_frames;
   // The function this warp is executing (null: the kernel) and where its
   // .local frame starts; the interpreter's cur_ and local_base_ follow the
   // warp it is running.
@@ -7095,6 +7113,10 @@ class Interpreter {
     if (const auto* op = std::get_if<OpDeclSlot>(&ins.op)) {
       Warp::Slot& slot = w.slots[op->name];
       slot.fit(op->size ? op->size : 8u, W_);
+      if (m == all_ && slot.bytes.size() == static_cast<size_t>(slot.size) * W_) {
+        std::memset(slot.bytes.data(), 0, slot.bytes.size());   // every lane's bytes: one run
+        return;
+      }
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane))
           std::memset(slot.bytes.data() + static_cast<size_t>(lane) * slot.size, 0, slot.size);
@@ -11907,15 +11929,21 @@ class Interpreter {
     // The caller resumes after the call, so its path is saved already past it.
     ++w.paths[step_idx_].pc;
     Warp::Frame f;
+    if (!w.spare_frames.empty()) {
+      f = std::move(w.spare_frames.back());
+      w.spare_frames.pop_back();
+    }
     f.fn = w.fn;
     f.local_base = w.local_base;
-    f.paths = std::move(w.paths);
-    f.regs32 = std::move(w.regs32);
-    f.regs64 = std::move(w.regs64);
-    f.preds = std::move(w.preds);
-    f.written32 = std::move(w.written32);
-    f.written64 = std::move(w.written64);
-    f.slots = std::move(w.slots);
+    // The caller's state goes into the frame and the frame's spare vectors (empty, with their capacity) come out to
+    // the callee, which clears and sizes them below.
+    f.paths.swap(w.paths);
+    f.regs32.swap(w.regs32);
+    f.regs64.swap(w.regs64);
+    f.preds.swap(w.preds);
+    f.written32.swap(w.written32);
+    f.written64.swap(w.written64);
+    f.slots.swap(w.slots);
     f.retval_from = callee.retval_slot_name;
     f.retval_to = op.retval_slot;
     f.lanes = m;
@@ -11947,8 +11975,7 @@ class Interpreter {
   // The callee's last path has returned: the caller's world comes back, with
   // the return value, if the callee set one, in the caller's slot.
   void return_to_caller(Warp& w) {
-    Warp::Frame f = std::move(w.frames.back());
-    w.frames.pop_back();
+    Warp::Frame& f = w.frames.back();
     Warp::Slot retval;
     bool have_ret = false;
     if (!f.retval_from.empty()) {
@@ -11962,13 +11989,14 @@ class Interpreter {
     w.local_base = f.local_base;
     cur_ = w.fn ? w.fn : &fn_;
     local_base_ = w.local_base;
-    w.paths = std::move(f.paths);
-    w.regs32 = std::move(f.regs32);
-    w.regs64 = std::move(f.regs64);
-    w.preds = std::move(f.preds);
-    w.written32 = std::move(f.written32);
-    w.written64 = std::move(f.written64);
-    w.slots = std::move(f.slots);
+    // The caller's state comes back; the callee's (now in the frame) is emptied and the frame kept for the next call.
+    w.paths.swap(f.paths);
+    w.regs32.swap(f.regs32);
+    w.regs64.swap(f.regs64);
+    w.preds.swap(f.preds);
+    w.written32.swap(f.written32);
+    w.written64.swap(f.written64);
+    w.slots.swap(f.slots);
     w.sp = f.sp;
     w.sp_valid = f.sp_valid;
     // Only the calling lanes' return values: another path's lanes may have a
@@ -11981,6 +12009,10 @@ class Interpreter {
           std::memcpy(out.bytes.data() + static_cast<size_t>(lane) * out.size,
                       retval.bytes.data() + static_cast<size_t>(lane) * retval.size, retval.size);
     }
+    f.paths.clear();
+    f.slots.clear();
+    if (w.spare_frames.size() < 8) w.spare_frames.push_back(std::move(f));
+    w.frames.pop_back();
   }
 
   // Lanes of the warp that are live but outside the function it is running:
