@@ -680,6 +680,50 @@ does not depend on the thread count. The one thing that is not fixed is the sign
 NaNs meeting in one operation (an input NaN and the default NaN of an inf*0): the hardware returns the first operand's, and
 which operand the compiler makes first differs between two copies of the same source line, so it never was fixed.
 
+### What round 8 added, and what it measured
+
+The same rule, applied to more of the host code. Each row is one call on this machine, one host thread (`VGPU_THREADS=1`), the
+fastest of three alternating runs against the previous build, results compared bit for bit (the digest of the output equal in every
+row). The threaded numbers are in the notes; both builds were measured with other jobs running on the machine, so read a ratio of 1.0x
+to 1.1x as noise.
+
+| call | before | after | how |
+| --- | --- | --- | --- |
+| `cublasCgemm` / `Zgemm` 384x384x384 | 70-90 ms | 17-18 ms (6.8-9 ms on 20 threads) | `host_gemm.hpp`'s `cgemm`: complex products in double, the real and imaginary parts in separate arrays, the same four products and two sums per term, no fusion |
+| `Cherk`, `Csyrk`, `Cher2k`, `Csyr2k`, `Chemm`, `Csymm`, `Ctrmm` (and `Z`) | 24-140 ms | 6.6-22 ms | the same kernel, with the triangle of the output asked for (blocks wholly outside it are not computed) |
+| `Ssyrk`, `Ssyr2k`, `Ssymm`, `Strmm` (and `D`) | 24-125 ms | 2.9-7 ms | these routines shared the complex code with a zero imaginary part; they now take the real product |
+| `Ctrsm` / `Strsm` 384x384 | 35 / 12.5 ms | 6.6 / 2.0 ms | `host_trsm.hpp`: the right-hand sides along the vector lanes |
+| `Sgemv` 2048x2048 | 11 ms | 5.6 ms | the host product with one column |
+| `cusolverDnDgetrf` / `Sgetrf` n = 1000 | 96 ms | 30 ms (22 ms threaded) | a panel at a time: the panel's own columns as before, the rows of U by `host_trsm.hpp`, the rest of the matrix by a product whose sums start from the old values (`c + (-a)*b` is `c - a*b` to the bit) |
+| `Dgeqrf` / `Sgeqrf` n = 1000 | 175 / 174 ms | 82 / 80 ms (26 / 22 ms threaded) | the reflectors of a panel applied to the columns to its right with the columns as lanes (`host_trsm.hpp`, `reflect`) |
+| `Dorgqr` n = 1000 | 228 ms | 106 ms (15 ms threaded) | the same |
+| cuDNN activation, softmax, pooling, batch normalization, add and op tensor, 800k elements | 2-12 ms | up to 4x faster on 20 threads (2.6x for relu, 4.1x for tanh, 2.9x for softmax) | the mode chosen once and the elements spread over threads; the graph runner's pointwise, band-mask, offset and broadcast walks in pieces |
+| cuDNN SDPA backward (composite graph, b 2, h 8, s 256, d 64) | 350 ms | 115-135 ms (20 threads) | broadcast index without a division per element, batched products over threads, pointwise and band-mask loops in pieces |
+| cuDNN filter gradient of a depthwise convolution (3x3, 5x5, 7x7) | 36 / 34 / 7.7 ms | 30 / 21 / 5.1 ms | the taps of a filter row as lanes (`host_conv_impl.inc`, `filt_taps`); the rest of the call is the transfer of the tensors |
+| cuSPARSE SpMV, CSR, 50000 x 50000, 2M entries | 35 ms | 19 ms | row by row, each row's sum in a register; typed conversions |
+| cuSPARSE SpMM, same matrix, 32 columns, row-major / column-major B | 129 / 154 ms (53 / 59 on threads) | 55 / 121 ms (23 / 31 on threads) | the same, with a block of columns together where B is contiguous across them |
+| cuRAND quasirandom (Sobol') uniforms, 8M | 367 ms | 11 ms | a point is the previous one XOR one direction vector; pieces over threads |
+| cuRAND log-normal, 8M | 94 ms (33 threaded) | 90 ms (14 threaded) | the exp in the pass that makes the normals |
+| NPP 8-bit add with a scale factor (1280x720x3) | 27 ms | 4.6 ms | the factor taken once, rounding without a library call |
+| NPP `FilterBox` 5x5 (1280x720) | 11 ms | 3.8 ms (1.7 ms threaded) | running sums along rows then columns (the sums are integers) |
+| HEVC encoder, 640x360, six pictures with two reference pictures and B pictures | 2.1 s | 1.2 s | AVX2 butterflies for the 8, 16 and 32 point transforms (eight lines at a time, zero column groups skipped in the inverse), AVX2 interpolation (16-bit sums where they cannot overflow), SAD with `psadbw`, prediction read in place |
+| HEVC decoder, same stream | 12.5 ms per picture | 4.9 ms per picture | the same inverse transform |
+| H.264 encoder, same size, High / Baseline | 552 / 268 ms | 403 / 197 ms | the sample positions of a block chosen once, not per sample; AVX2 SAD |
+
+`video_simd.hpp` holds the AVX2 codec kernels (compiled under a target pragma and called after a CPU check, like the matrix product), and
+`tests/unit/test_video_simd.cpp` compares each with the scalar loops over random and extreme inputs. In the cuBLAS routines a result is
+computed by the new kernels only when it is certain to be the loops' answer: with an infinity or a NaN among the operands, or a sum that
+overflows to one, the std::complex<double> multiply's repair of a NaN product comes into play, which the kernels do not have, and the routine
+runs its old loops (`blas_host_sums.cu` checks this with operands that hold infinities, NaNs and values that overflow). The NaN sign and
+payload when two NaNs meet is the one thing not fixed, as before.
+
+What stayed as it was, measured on this machine and not worth the change: the Jacobi eigen- and singular value solvers of cuSOLVER (`syevd`,
+`gesvd`, `gesvdj`, 42-46 ms at n = 200; each rotation depends on the last in the two-sided method, so neither the rotations nor the order of
+their updates can change, and the complex ones, 126-137 ms at n = 128, are the same shape), `potrf` (3 ms at n = 512 already, 0.09 ns per
+multiply-add at n = 1500), the level-2 routines of cuBLAS apart from `gemv` (their time is the transfer and conversion of the matrix), cuDNN's
+tensor transfers (a copy out of device memory, a conversion to double and back make up 50% of a depthwise convolution), the H.264 and MPEG-2
+decoders (entropy decoding is 24% of the first and cannot be split), NPP's resize, warp, threshold and morphology, and nvJPEG's encoder.
+
 ## Verified against real hardware
 
 `nvidia/tests/conformance/run_conformance.sh` compiles each test once, runs it against
