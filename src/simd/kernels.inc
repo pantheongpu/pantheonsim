@@ -220,7 +220,46 @@ void imad_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c
   }
 }
 
+// (A macro, not a function taking the vector type: a 32-byte vector parameter changes the ABI on a baseline x86-64 build.)
+#define VGPU_LOP3_LOOP(EXPR)                          \
+  do {                                                \
+    for (unsigned i = 0; i < 32; i += 8) {            \
+      V8u x, y, z;                                    \
+      std::memcpy(&x, a + i, sizeof x);               \
+      std::memcpy(&y, b + i, sizeof y);               \
+      std::memcpy(&z, c + i, sizeof z);               \
+      const V8u v = (EXPR);                           \
+      std::memcpy(r + i, &v, sizeof v);               \
+    }                                                 \
+    return;                                           \
+  } while (0)
+
 void lop3_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t lut) {
+  // The tables compilers use most -- and, xor, or of two or three, a pass-through, a complement, and the few two-level ones --
+  // by the expression itself (bit 4a + 2b + c of the table is the answer for those a, b, c); tests/unit/test_simd.cpp checks
+  // every table.
+  switch (lut) {
+    case 0xc0: VGPU_LOP3_LOOP(x & y);
+    case 0x3c: VGPU_LOP3_LOOP(x ^ y);
+    case 0xfc: VGPU_LOP3_LOOP(x | y);
+    case 0xf0: VGPU_LOP3_LOOP(x);
+    case 0xcc: VGPU_LOP3_LOOP(y);
+    case 0xaa: VGPU_LOP3_LOOP(z);
+    case 0x0f: VGPU_LOP3_LOOP(~x);
+    case 0x33: VGPU_LOP3_LOOP(~y);
+    case 0x55: VGPU_LOP3_LOOP(~z);
+    case 0x96: VGPU_LOP3_LOOP(x ^ y ^ z);
+    case 0x80: VGPU_LOP3_LOOP(x & y & z);
+    case 0xfe: VGPU_LOP3_LOOP(x | y | z);
+    case 0xf8: VGPU_LOP3_LOOP(x | (y & z));
+    case 0xe0: VGPU_LOP3_LOOP(x & (y | z));
+    case 0xea: VGPU_LOP3_LOOP((x & y) | z);
+    case 0xe8: VGPU_LOP3_LOOP((x & y) | (z & (x | y)));
+    case 0x30: VGPU_LOP3_LOOP(x & ~y);
+    case 0x0c: VGPU_LOP3_LOOP(~x & y);
+    case 0xc3: VGPU_LOP3_LOOP(~(x ^ y));
+    default: break;
+  }
   // Each set bit t of the table is one minterm of (a, b, c): the lanes where a, b, c equal t's bits.
   uint32_t ma[8], mb[8], mc[8];
   unsigned n = 0;

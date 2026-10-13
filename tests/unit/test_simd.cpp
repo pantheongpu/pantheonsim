@@ -1095,9 +1095,9 @@ VTEST(double_lanes_in_place_at_every_level) {
       // The same, in place in the file. (When the destination pair is a register apart from an operand pair, the
       // halves overlap: rd == ra + 1 and so on.)
       k.dop_m(kind, mods, file[rd], file[rd + 1], file[ra], file[ra + 1], file[rb], file[rb + 1], file[rc], file[rc + 1], mask);
-      for (int r = 0; r < 8; ++r)
+      for (unsigned r = 0; r < 8; ++r)
         for (int i = 0; i < 32; ++i)
-          if (file[r][i] != ref[r][i] && !(rd == r || rd + 1 == r) )
+          if (file[r][i] != ref[r][i] && !(rd == r || rd + 1 == r))
             throw vtest::Failure(lv + " dop_m in place changed register " + std::to_string(r));
       for (int i = 0; i < 32; ++i)
         if (file[rd][i] != ref[rd][i] || file[rd + 1][i] != ref[rd + 1][i]) {

@@ -2212,7 +2212,8 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   };
   // The same addresses for all the lanes of `lanes` at once, the instruction's fields decoded once: base + each lane's register
   // (a pair if `wide`). For the forms of sm_80 and later; Turing's global forms (above) take `address`.
-  const auto row_addresses = [&](const Operand& a, bool wide, bool with_ur, unsigned ur_pos, Mask lanes, uint64_t* out) {
+  const auto row_addresses = [&](const Operand& a, bool wide, bool with_ur, unsigned ur_pos, Mask lanes, uint64_t* out,
+                                 unsigned stride = 0) {
     const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
     uint64_t base = static_cast<uint64_t>(a.imm);
     if (with_ur) {
@@ -2228,12 +2229,12 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const uint32_t* hi = &w.reg(ra + 1, 0);
       for (Mask m = lanes; m; m &= m - 1) {
         const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-        out[l] = (lo[l] | (static_cast<uint64_t>(hi[l]) << 32)) + base;
+        out[l] = (lo[l] | (static_cast<uint64_t>(hi[l]) << 32)) * (stride ? stride : 1) + base;
       }
     } else {
       for (Mask m = lanes; m; m &= m - 1) {
         const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-        out[l] = lo[l] + base;
+        out[l] = uint64_t{lo[l]} * (stride ? stride : 1) + base;
       }
     }
   };
@@ -2412,11 +2413,14 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // below runs instead and finds the lane that faults, exactly as it always did.
         const uint64_t ssize = blk.shared.size();
         bool inside = true;
-        each_lane(ex, [&](unsigned l) {
-          const uint64_t off = static_cast<uint32_t>(address(a, l, false, ur, store ? 64 : 32, stride));
+        uint64_t sa[32];
+        row_addresses(a, false, ur, store ? 64 : 32, ex, sa, stride);
+        for (Mask m = ex; m; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+          const uint64_t off = static_cast<uint32_t>(sa[l]);
           addrs[l] = off;
           inside = inside && (off >> 24) == blk.rank && (off & 0xffffff) + bytes <= ssize;
-        });
+        }
         if (inside) {
           uint8_t* sh = blk.shared.data();
           if (store) {
@@ -2442,7 +2446,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           return;
         }
       }
-      if (!shared && fast_ && m_.sm >= 80 && ex && bytes <= 16) {
+      if (!shared && fast_ && ex && bytes <= 16) {
         // Local memory, when every active lane's access is inside its own window: the bytes move between the register file and
         // the window directly. (The window is made on first use, as mem_read / mem_write make it. If any lane is outside it
         // the loop below runs and finds the one that faults, as it always did.)
