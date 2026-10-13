@@ -74,7 +74,10 @@ jobs:
         # architecture still differ in memory, device identity and what
         # nvidia-smi and NVML report. CUDA 12.0 and 13.0 alternate across each
         # architecture, and counts above one take all_reduce and p2p_thrasher
-        # down their real multi-GPU paths.
+        # down their real multi-GPU paths. A profile no toolchain here can build
+        # for is listed in a "# not-run nvidia/<name>: reason" line instead;
+        # the coverage job accepts exactly those and the summary expects one
+        # machine fewer for each.
         include:
           - { key: t4-x1-cuda12.0,    gpu: nvidia/t4,          count: 1, cuda: '12.0' }  # Turing 7.5
           - { key: a100-x1-cuda12.0,  gpu: nvidia/a100,        count: 1, cuda: '12.0' }  # Ampere 8.0
@@ -112,7 +115,10 @@ jobs:
           - { key: rtx-pro-6000-x1-cuda13.0, gpu: nvidia/rtx-pro-6000, count: 1, cuda: '13.0' }  # Blackwell 12.0, workstation
           - { key: rtx-pro-6000-max-q-x1-cuda13.0, gpu: nvidia/rtx-pro-6000-max-q, count: 1, cuda: '13.0' }  # Blackwell 12.0, Max-Q
           - { key: rtx-pro-6000-server-x1-cuda13.0, gpu: nvidia/rtx-pro-6000-server, count: 1, cuda: '13.0' }  # Blackwell 12.0, server
-          - { key: vr200-x1-cuda13.0, gpu: nvidia/vr200, count: 1, cuda: '13.0' }  # Rubin 10.7
+          # not-run nvidia/vr200: Rubin is compute capability 10.7, which needs CUDA 13.4 (the
+          # profile cites its release notes); the CUDA 13.0 toolchain image cannot compile
+          # for sm_107, so every workload fails to build. Give it a row, on a 13.4 image,
+          # and delete this line when the toolchain image moves to 13.4 or later.
     env:
       # CUDA 13 packages from NVIDIA's repository: the compiler and the headers
       # of every library the simulator stands in for.
@@ -210,12 +216,17 @@ jobs:
       - name: Compare the matrix with nvidia/profiles
         run: |
           have=$(grep -oE 'gpu: nvidia/[a-z0-9-]+' .github/workflows/workloads.yml | sed 's#gpu: nvidia/##' | sort -u)
+          skip=$(grep -oE '^ *# not-run nvidia/[a-z0-9-]+:' .github/workflows/workloads.yml | sed -E 's#^ *\# not-run nvidia/##; s#:$##' | sort -u)
           want=$(find nvidia/profiles -name '*.yaml' -printf '%f\n' | sed 's/[.]yaml$//' | sort -u)
-          missing=$(comm -13 <(printf '%s\n' "$have") <(printf '%s\n' "$want") | tr '\n' ' ')
-          stale=$(comm -23 <(printf '%s\n' "$have") <(printf '%s\n' "$want") | tr '\n' ' ')
-          echo "matrix: $(printf '%s\n' "$have" | wc -l) profiles; nvidia/profiles: $(printf '%s\n' "$want" | wc -l)"
+          # A profile is either in the matrix or explicitly not run, never both,
+          # and a not-run line must name a real profile.
+          both=$(comm -12 <(printf '%s\n' "$have") <(printf '%s\n' "$skip") | tr '\n' ' ')
+          missing=$(comm -13 <(printf '%s\n' "$have" "$skip" | sort -u) <(printf '%s\n' "$want") | tr '\n' ' ')
+          stale=$(comm -23 <(printf '%s\n' "$have" "$skip" | sort -u) <(printf '%s\n' "$want") | tr '\n' ' ')
+          echo "matrix: $(printf '%s\n' "$have" | wc -l) profiles; not run: $(printf '%s\n' "$skip" | grep -c .); nvidia/profiles: $(printf '%s\n' "$want" | wc -l)"
           [ -z "${missing// }" ] || { echo "::error::not in the workloads matrix: $missing"; exit 1; }
           [ -z "${stale// }" ] || { echo "::error::in the matrix but not a profile: $stale"; exit 1; }
+          [ -z "${both// }" ] || { echo "::error::both in the matrix and marked not-run: $both"; exit 1; }
 
   summary:
     name: every machine
@@ -229,6 +240,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: |
+            .github/workflows
             tests/workloads
             nvidia/profiles
 
@@ -241,7 +253,9 @@ jobs:
         run: |
           # One machine per NVIDIA profile (the coverage job holds the matrix to
           # that), so a machine that wrote nothing is reported as missing.
-          python3 tests/workloads/workload_matrix.py results "$(find nvidia/profiles -name '*.yaml' | wc -l)" > matrix.md
+          profiles=$(find nvidia/profiles -name '*.yaml' | wc -l)
+          notrun=$(grep -cE '^ *# not-run nvidia/[a-z0-9-]+:' .github/workflows/workloads.yml || true)
+          python3 tests/workloads/workload_matrix.py results "$((profiles - notrun))" > matrix.md
           cat matrix.md >> "$GITHUB_STEP_SUMMARY"
 
       # While main is broken there is one open issue saying where, updated by
