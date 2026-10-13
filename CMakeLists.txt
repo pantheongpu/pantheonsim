@@ -2094,7 +2094,7 @@ if(TARGET vgpucublas)
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
                           "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_fp8_attention:cudnn" "dnn_fp8_attention_probe:cudnn" "dnn_fp8_attention_frontend:cudnn"
-                          "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "dnn_dropout:cudnn" "dnn_rnn_dropout:cudnn"
+                          "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "dnn_dropout:cudnn" "dnn_host_ops:cudnn" "dnn_rnn_dropout:cudnn"
                           "dnn_attn_dropout:cudnn" "dnn_sdpa_mask:cudnn" "cutensor_paths:cutensor"
                           "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet" "cutensornet_state_gradient:cutensornet" "cutensornet_decomp_paths:cutensornet"
                           "solver_metis_paths:cusolver:cusparse"

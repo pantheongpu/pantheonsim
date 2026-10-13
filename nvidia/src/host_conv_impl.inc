@@ -171,3 +171,102 @@ void filt_block(const Geom& g, const double* dy, const double* xt, int64_t cs, i
     }
   }
 }
+
+// Filter, for filters with few chains per output channel (a depthwise convolution has one filter per channel): the taps
+// of a filter row (f2 = 0 .. F2-1, F2 at most 2 vectors) are the lanes, and every row of the filter (f1) keeps its own
+// pair of accumulators, so up to 8 x 2 vectors of independent chains advance together. Each chain is still
+// dw[k, ci, f] = sum over (image, o0, o1, o2) of dy * x in that order, and a tap whose input position falls in the
+// padding is left out of its chain (a lane that does not take a step is updated one lane at a time). Lanes are the taps' positions,
+// so the loads from x are contiguous (the dilation of the last dimension must be 1).
+//
+// dyk: filter k's output planes (image n at dyk + n*K*osz); xc: input channel c's planes (image n at xc + n*C*isz);
+// xend: one past the last element of x (a vector load must not reach it); dw: this (k, ci)'s taps, fsz of them.
+constexpr int kTapLanes = 2 * (kVB / 8);
+
+void filt_taps(const Geom& g, const double* dyk, const double* xc, const double* xend, double* dw) {
+  typedef double V __attribute__((vector_size(kVB)));
+  constexpr int L = kVB / 8;
+  const int64_t I0 = g.in[0], I1 = g.in[1], I2 = g.in[2];
+  const int64_t O0 = g.out[0], O1 = g.out[1], O2 = g.out[2];
+  const int64_t F0 = g.flt[0], F1 = g.flt[1], F2 = g.flt[2];
+  const int64_t isz = I0 * I1 * I2, osz = O0 * O1 * O2, fsz = F0 * F1 * F2;
+  // Tap position t2 = lane; the output o2 reaches input o2*str + t2 - pad. The outputs that reach every lane's input are
+  // [vlo, vhi); outside that a lane takes a step only if its own input is in range.
+  int64_t vlo = 0, vhi = O2;
+  for (int64_t t = 0; t < F2; ++t) {
+    int64_t lo, hi;
+    span_of(t - g.pad[2], g.str[2], I2, O2, &lo, &hi);
+    if (lo > vlo) vlo = lo;
+    if (hi < vhi) vhi = hi;
+  }
+  if (vhi < vlo) vhi = vlo;
+  for (int64_t f0 = 0; f0 < F0; ++f0) {
+    const int64_t t0 = g.flip ? F0 - 1 - f0 : f0;
+    V acc[8][2];
+    for (int64_t f1 = 0; f1 < F1; ++f1)
+      for (int v = 0; v < 2; ++v)
+        for (int l = 0; l < L; ++l) acc[f1][v][l] = 0.0;
+    for (int64_t n = 0; n < g.N; ++n) {
+      const double* yn = dyk + n * g.K * osz;
+      const double* xn = xc + n * g.C * isz;
+      for (int64_t o0 = 0; o0 < O0; ++o0) {
+        const int64_t p0 = o0 * g.str[0] - g.pad[0] + t0 * g.dil[0];
+        if (p0 < 0 || p0 >= I0) continue;
+        for (int64_t o1 = 0; o1 < O1; ++o1) {
+          const double* yr = yn + (o0 * O1 + o1) * O2;
+          for (int64_t f1 = 0; f1 < F1; ++f1) {
+            const int64_t t1 = g.flip ? F1 - 1 - f1 : f1;
+            const int64_t p1 = o1 * g.str[1] - g.pad[1] + t1 * g.dil[1];
+            if (p1 < 0 || p1 >= I1) continue;
+            const double* xr = xn + (p0 * I1 + p1) * I2;
+            V a0 = acc[f1][0], a1 = acc[f1][1];
+            // Outputs before the all-lanes span: lane by lane, in order.
+            auto edge = [&](int64_t o2) {
+              double lane[2 * L];
+              __builtin_memcpy(lane, &a0, sizeof(V));
+              __builtin_memcpy(lane + L, &a1, sizeof(V));
+              const double yv = yr[o2];
+              for (int64_t t = 0; t < F2; ++t) {
+                const int64_t px = o2 * g.str[2] + t - g.pad[2];
+                if (px >= 0 && px < I2) lane[t] = lane[t] + yv * xr[px];
+              }
+              __builtin_memcpy(&a0, lane, sizeof(V));
+              __builtin_memcpy(&a1, lane + L, sizeof(V));
+            };
+            for (int64_t o2 = 0; o2 < vlo && o2 < O2; ++o2) edge(o2);
+            for (int64_t o2 = vlo; o2 < vhi; ++o2) {
+              const double* xp = xr + o2 * g.str[2] - g.pad[2];
+              V y;
+              const double yv = yr[o2];
+              for (int l = 0; l < L; ++l) y[l] = yv;
+              V x0, x1;
+              if (xend - xp >= 2 * L) {
+                __builtin_memcpy(&x0, xp, sizeof(V));
+                __builtin_memcpy(&x1, xp + L, sizeof(V));
+              } else {   // the last elements of x: only the F2 taps are read
+                double tmp[2 * L] = {};
+                for (int64_t t = 0; t < F2; ++t) tmp[t] = xp[t];
+                __builtin_memcpy(&x0, tmp, sizeof(V));
+                __builtin_memcpy(&x1, tmp + L, sizeof(V));
+              }
+              a0 = a0 + y * x0;
+              a1 = a1 + y * x1;
+            }
+            for (int64_t o2 = vhi > vlo ? vhi : vlo; o2 < O2; ++o2) edge(o2);
+            acc[f1][0] = a0;
+            acc[f1][1] = a1;
+          }
+        }
+      }
+    }
+    for (int64_t f1 = 0; f1 < F1; ++f1) {
+      double lane[2 * L];
+      __builtin_memcpy(lane, &acc[f1][0], sizeof(V));
+      __builtin_memcpy(lane + L, &acc[f1][1], sizeof(V));
+      for (int64_t f2 = 0; f2 < F2; ++f2) {
+        const int64_t t2 = g.flip ? F2 - 1 - f2 : f2;
+        dw[(f0 * F1 + f1) * F2 + f2] = lane[t2];
+      }
+    }
+  }
+}

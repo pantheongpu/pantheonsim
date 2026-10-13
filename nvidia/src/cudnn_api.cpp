@@ -41,6 +41,8 @@
 #include <memory>
 #include <vector>
 
+#include "host_parallel.hpp"
+
 using namespace vgpu_cudnn;
 
 namespace {
@@ -218,16 +220,28 @@ bool broadcastable(const Layout& a, const Layout& c) {
 // a broadcast onto it.
 std::vector<size_t> broadcast_index(const Layout& a, const Layout& c) {
   std::vector<size_t> idx(c.count());
-  int64_t at[kMaxRank] = {};
-  for (size_t i = 0; i < idx.size(); ++i) {
-    size_t j = 0;
-    for (int d = 0; d < c.rank; ++d) j = j * a.dims[d] + (a.dims[d] == 1 ? 0 : at[d]);
-    idx[i] = j;
-    for (int d = c.rank; d-- > 0;) {
-      if (++at[d] < c.dims[d]) break;
-      at[d] = 0;
-    }
+  if (a.same_dims(c)) {   // nothing to broadcast: element i is element i
+    vgpu::hostpar::for_range(idx.size(), 1, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) idx[i] = i; });
+    return idx;
   }
+  // In pieces over the host's threads: each starts from the multi-index of its first element.
+  vgpu::hostpar::for_range(idx.size(), static_cast<uint64_t>(c.rank) * 3 + 4, [&](size_t b, size_t e) {
+    int64_t at[kMaxRank] = {};
+    size_t rest = b;
+    for (int d = c.rank; d-- > 0;) {
+      at[d] = static_cast<int64_t>(rest % static_cast<size_t>(c.dims[d]));
+      rest /= static_cast<size_t>(c.dims[d]);
+    }
+    for (size_t i = b; i < e; ++i) {
+      size_t j = 0;
+      for (int d = 0; d < c.rank; ++d) j = j * a.dims[d] + (a.dims[d] == 1 ? 0 : at[d]);
+      idx[i] = j;
+      for (int d = c.rank; d-- > 0;) {
+        if (++at[d] < c.dims[d]) break;
+        at[d] = 0;
+      }
+    }
+  });
   return idx;
 }
 
@@ -1329,18 +1343,47 @@ VGPU_EXPORT cudnnStatus_t cudnnGetActivationDescriptorSwishBeta(cudnnActivationD
 namespace {
 double sigmoid(double v) { return 1.0 / (1.0 + std::exp(-v)); }
 
-// The activation itself; false for a mode with no forward function here.
+// The activation itself, one definition per mode (coef is the ELU alpha and the CLIPPED_RELU ceiling; plain RELU ignores it).
+template <cudnnActivationMode_t M>
+inline double act_one(const ActDesc& a, double v) {
+  if constexpr (M == CUDNN_ACTIVATION_SIGMOID) return sigmoid(v);
+  else if constexpr (M == CUDNN_ACTIVATION_RELU) return v > 0.0 ? v : 0.0;
+  else if constexpr (M == CUDNN_ACTIVATION_TANH) return std::tanh(v);
+  else if constexpr (M == CUDNN_ACTIVATION_CLIPPED_RELU) return std::min(std::max(v, 0.0), a.coef);
+  else if constexpr (M == CUDNN_ACTIVATION_ELU) return v > 0.0 ? v : a.coef * (std::exp(v) - 1.0);
+  else if constexpr (M == CUDNN_ACTIVATION_SWISH) return v * sigmoid(a.swish_beta * v);
+  else return v;  // IDENTITY
+}
+
+// The activation; false for a mode with no forward function here.
 bool activate(const ActDesc& a, double v, double* r) {
   switch (a.mode) {
-    case CUDNN_ACTIVATION_SIGMOID: *r = sigmoid(v); return true;
-    // coef is the ELU alpha and the CLIPPED_RELU ceiling; plain RELU ignores it.
-    case CUDNN_ACTIVATION_RELU: *r = v > 0.0 ? v : 0.0; return true;
-    case CUDNN_ACTIVATION_TANH: *r = std::tanh(v); return true;
-    case CUDNN_ACTIVATION_CLIPPED_RELU: *r = std::min(std::max(v, 0.0), a.coef); return true;
-    case CUDNN_ACTIVATION_ELU: *r = v > 0.0 ? v : a.coef * (std::exp(v) - 1.0); return true;
-    case CUDNN_ACTIVATION_SWISH: *r = v * sigmoid(a.swish_beta * v); return true;
-    case CUDNN_ACTIVATION_IDENTITY: *r = v; return true;
+    case CUDNN_ACTIVATION_SIGMOID: *r = act_one<CUDNN_ACTIVATION_SIGMOID>(a, v); return true;
+    case CUDNN_ACTIVATION_RELU: *r = act_one<CUDNN_ACTIVATION_RELU>(a, v); return true;
+    case CUDNN_ACTIVATION_TANH: *r = act_one<CUDNN_ACTIVATION_TANH>(a, v); return true;
+    case CUDNN_ACTIVATION_CLIPPED_RELU: *r = act_one<CUDNN_ACTIVATION_CLIPPED_RELU>(a, v); return true;
+    case CUDNN_ACTIVATION_ELU: *r = act_one<CUDNN_ACTIVATION_ELU>(a, v); return true;
+    case CUDNN_ACTIVATION_SWISH: *r = act_one<CUDNN_ACTIVATION_SWISH>(a, v); return true;
+    case CUDNN_ACTIVATION_IDENTITY: *r = act_one<CUDNN_ACTIVATION_IDENTITY>(a, v); return true;
     default: return false;
+  }
+}
+
+// v[i] = act(v[i]) for all i, the mode chosen once and the elements spread over the host's threads (they are independent).
+void activate_all(const ActDesc& a, std::vector<double>& v) {
+  auto run = [&](auto mode_tag, uint64_t cost) {
+    constexpr cudnnActivationMode_t M = decltype(mode_tag)::value;
+    double* d = v.data();
+    vgpu::hostpar::for_range(v.size(), cost, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) d[i] = act_one<M>(a, d[i]); });
+  };
+  switch (a.mode) {
+    case CUDNN_ACTIVATION_SIGMOID: run(std::integral_constant<cudnnActivationMode_t, CUDNN_ACTIVATION_SIGMOID>{}, 30); break;
+    case CUDNN_ACTIVATION_RELU: run(std::integral_constant<cudnnActivationMode_t, CUDNN_ACTIVATION_RELU>{}, 2); break;
+    case CUDNN_ACTIVATION_TANH: run(std::integral_constant<cudnnActivationMode_t, CUDNN_ACTIVATION_TANH>{}, 40); break;
+    case CUDNN_ACTIVATION_CLIPPED_RELU: run(std::integral_constant<cudnnActivationMode_t, CUDNN_ACTIVATION_CLIPPED_RELU>{}, 3); break;
+    case CUDNN_ACTIVATION_ELU: run(std::integral_constant<cudnnActivationMode_t, CUDNN_ACTIVATION_ELU>{}, 30); break;
+    case CUDNN_ACTIVATION_SWISH: run(std::integral_constant<cudnnActivationMode_t, CUDNN_ACTIVATION_SWISH>{}, 35); break;
+    default: break;
   }
 }
 }  // namespace
@@ -1376,7 +1419,7 @@ VGPU_EXPORT cudnnStatus_t cudnnActivationForward(cudnnHandle_t h, cudnnActivatio
   sync_handle(h);
   std::vector<double> v;
   if (!read(X->l, x, &v)) return CUDNN_STATUS_EXECUTION_FAILED;
-  for (double& e : v) activate(A, e, &e);
+  activate_all(A, v);
   return blend_write(Y->l, y, v, sc(alpha, Y->l), sc(beta, Y->l)) ? CUDNN_STATUS_SUCCESS
                                                                    : CUDNN_STATUS_EXECUTION_FAILED;
 }
@@ -1412,19 +1455,23 @@ VGPU_EXPORT cudnnStatus_t cudnnActivationBackward(cudnnHandle_t h, cudnnActivati
   sync_handle(h);
   std::vector<double> vin, g;
   if (!read(reads_x ? X->l : Y->l, reads_x ? x : y, &vin) || !read(DY->l, dy, &g)) return CUDNN_STATUS_EXECUTION_FAILED;
-  for (size_t i = 0; i < g.size(); ++i) {
-    const double v = vin[i];
+  {
+    // g[i] = dy[i] * f'(v[i]) with the mode chosen once and the elements over the host's threads.
+    auto go = [&](auto body, uint64_t cost) {
+      vgpu::hostpar::for_range(g.size(), cost, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) body(g[i], vin[i]); });
+    };
     switch (A.mode) {
-      case CUDNN_ACTIVATION_RELU: g[i] = v > 0.0 ? g[i] : 0.0; break;
-      case CUDNN_ACTIVATION_CLIPPED_RELU: g[i] = v > 0.0 && v <= A.coef ? g[i] : 0.0; break;
-      case CUDNN_ACTIVATION_SWISH: {
-        const double s = sigmoid(A.swish_beta * v);
-        g[i] *= s + A.swish_beta * v * s * (1.0 - s);
+      case CUDNN_ACTIVATION_RELU: go([](double& gi, double v) { gi = v > 0.0 ? gi : 0.0; }, 2); break;
+      case CUDNN_ACTIVATION_CLIPPED_RELU: go([&](double& gi, double v) { gi = v > 0.0 && v <= A.coef ? gi : 0.0; }, 3); break;
+      case CUDNN_ACTIVATION_SWISH:
+        go([&](double& gi, double v) {
+          const double s = sigmoid(A.swish_beta * v);
+          gi *= s + A.swish_beta * v * s * (1.0 - s);
+        }, 35);
         break;
-      }
-      case CUDNN_ACTIVATION_SIGMOID: g[i] *= v * (1.0 - v); break;
-      case CUDNN_ACTIVATION_TANH: g[i] *= 1.0 - v * v; break;
-      case CUDNN_ACTIVATION_ELU: g[i] = v >= 0.0 ? g[i] : g[i] * (v + A.coef); break;
+      case CUDNN_ACTIVATION_SIGMOID: go([](double& gi, double v) { gi *= v * (1.0 - v); }, 3); break;
+      case CUDNN_ACTIVATION_TANH: go([](double& gi, double v) { gi *= 1.0 - v * v; }, 3); break;
+      case CUDNN_ACTIVATION_ELU: go([&](double& gi, double v) { gi = v >= 0.0 ? gi : gi * (v + A.coef); }, 3); break;
       default: break;
     }
   }
@@ -1650,7 +1697,9 @@ VGPU_EXPORT cudnnStatus_t cudnnPoolingForward(cudnnHandle_t h, const cudnnPoolin
   if (!read_any(X->l, X->vect, x, &vx)) return CUDNN_STATUS_EXECUTION_FAILED;
   std::vector<double> r(static_cast<size_t>(g.NC * g.osz()));
   const bool is_max = P.mode == CUDNN_POOLING_MAX || P.mode == CUDNN_POOLING_MAX_DETERMINISTIC;
-  for (int64_t nc = 0; nc < g.NC; ++nc) {
+  // Each plane (an n, c pair) is independent of the others: they are spread over the host's threads.
+  vgpu::hostpar::for_range(static_cast<size_t>(g.NC), static_cast<uint64_t>(g.osz()) * static_cast<uint64_t>(g.taps()) * 3 + 8, [&](size_t nb, size_t ne) {
+   for (int64_t nc = static_cast<int64_t>(nb); nc < static_cast<int64_t>(ne); ++nc) {
     const double* plane = vx.data() + nc * g.isz();
     for (int64_t o = 0; o < g.osz(); ++o) {
       double best = -INFINITY, sum = 0.0;
@@ -1662,7 +1711,8 @@ VGPU_EXPORT cudnnStatus_t cudnnPoolingForward(cudnnHandle_t h, const cudnnPoolin
       else v = count ? sum / static_cast<double>(count) : 0.0;
       r[static_cast<size_t>(nc * g.osz() + o)] = v;
     }
-  }
+   }
+  });
   return blend_any(Y->l, Y->vect, y, r, sc(alpha, Y->l), sc(beta, Y->l)) ? CUDNN_STATUS_SUCCESS
                                                                    : CUDNN_STATUS_EXECUTION_FAILED;
 }
@@ -1698,7 +1748,8 @@ VGPU_EXPORT cudnnStatus_t cudnnPoolingBackward(cudnnHandle_t h, const cudnnPooli
   if (is_max && !read(X->l, x, &vx)) return CUDNN_STATUS_EXECUTION_FAILED;
   if (P.mode == CUDNN_POOLING_MAX_DETERMINISTIC && !read(Y->l, y, &vy)) return CUDNN_STATUS_EXECUTION_FAILED;
   std::vector<double> r(static_cast<size_t>(g.NC * g.isz()), 0.0);
-  for (int64_t nc = 0; nc < g.NC; ++nc) {
+  vgpu::hostpar::for_range(static_cast<size_t>(g.NC), static_cast<uint64_t>(g.osz()) * static_cast<uint64_t>(g.taps()) * 3 + 8, [&](size_t nb, size_t ne) {
+   for (int64_t nc = static_cast<int64_t>(nb); nc < static_cast<int64_t>(ne); ++nc) {
     double* out = r.data() + nc * g.isz();
     for (int64_t o = 0; o < g.osz(); ++o) {
       const size_t yo = static_cast<size_t>(nc * g.osz() + o);
@@ -1721,7 +1772,8 @@ VGPU_EXPORT cudnnStatus_t cudnnPoolingBackward(cudnnHandle_t h, const cudnnPooli
         if (count) g.window(o, [&](int64_t at) { out[at] += grad / div; });
       }
     }
-  }
+   }
+  });
   return blend_write(DX->l, dx, r, sc(alpha, DX->l), sc(beta, DX->l)) ? CUDNN_STATUS_SUCCESS
                                                                       : CUDNN_STATUS_EXECUTION_FAILED;
 }
@@ -1729,26 +1781,26 @@ VGPU_EXPORT cudnnStatus_t cudnnPoolingBackward(cudnnHandle_t h, const cudnnPooli
 /* ---- softmax ---- */
 
 namespace {
-// The groups softmax normalizes over, as lists of logical indexes: per n
-// (INSTANCE) or per (n, spatial position) over C (CHANNEL).
+// The groups softmax normalizes over: per n (INSTANCE) or per (n, spatial position) over C (CHANNEL). A group is its elements'
+// logical indexes base, base + stride, ... (count of them); f(base, stride, count) handles one group, in the order
+// of the elements, and the groups (independent) are spread over the host's threads.
 template <class F>
 void softmax_groups(const Layout& t, cudnnSoftmaxMode_t mode, F&& f) {
   int64_t N, C, S;
   ncs(t, &N, &C, &S);
-  std::vector<size_t> idx;
   if (mode == CUDNN_SOFTMAX_MODE_INSTANCE) {
-    for (int64_t n = 0; n < N; ++n) {
-      idx.clear();
-      for (int64_t i = 0; i < C * S; ++i) idx.push_back(static_cast<size_t>(n * C * S + i));
-      f(idx);
-    }
+    const size_t count = static_cast<size_t>(C * S);
+    vgpu::hostpar::for_range(static_cast<size_t>(N), static_cast<uint64_t>(count) * 40 + 8, [&](size_t b, size_t e) {
+      for (size_t n = b; n < e; ++n) f(n * count, static_cast<size_t>(1), count);
+    });
   } else {
-    for (int64_t n = 0; n < N; ++n)
-      for (int64_t s = 0; s < S; ++s) {
-        idx.clear();
-        for (int64_t c = 0; c < C; ++c) idx.push_back(static_cast<size_t>((n * C + c) * S + s));
-        f(idx);
+    const size_t groups = static_cast<size_t>(N * S);
+    vgpu::hostpar::for_range(groups, static_cast<uint64_t>(C) * 40 + 8, [&](size_t b, size_t e) {
+      for (size_t g = b; g < e; ++g) {
+        const size_t n = g / static_cast<size_t>(S), sp = g % static_cast<size_t>(S);
+        f(static_cast<size_t>(n * C * S) + sp, static_cast<size_t>(S), static_cast<size_t>(C));
       }
+    });
   }
 }
 }  // namespace
@@ -1768,11 +1820,14 @@ VGPU_EXPORT cudnnStatus_t cudnnSoftmaxForward(cudnnHandle_t h, cudnnSoftmaxAlgor
   std::vector<double> v;
   if (!read(X->l, x, &v)) return CUDNN_STATUS_EXECUTION_FAILED;
   std::vector<double> r(v.size());
-  softmax_groups(X->l, mode, [&](const std::vector<size_t>& idx) {
+  softmax_groups(X->l, mode, [&](size_t base, size_t stride, size_t count) {
     double mx = -INFINITY, sum = 0.0;
-    for (size_t i : idx) mx = std::max(mx, v[i]);
-    for (size_t i : idx) sum += std::exp(v[i] - mx);
-    for (size_t i : idx) r[i] = algo == CUDNN_SOFTMAX_LOG ? v[i] - mx - std::log(sum) : std::exp(v[i] - mx) / sum;
+    for (size_t j = 0; j < count; ++j) mx = std::max(mx, v[base + j * stride]);
+    for (size_t j = 0; j < count; ++j) sum += std::exp(v[base + j * stride] - mx);
+    for (size_t j = 0; j < count; ++j) {
+      const size_t i = base + j * stride;
+      r[i] = algo == CUDNN_SOFTMAX_LOG ? v[i] - mx - std::log(sum) : std::exp(v[i] - mx) / sum;
+    }
   });
   return blend_write(Y->l, y, r, sc(alpha, Y->l), sc(beta, Y->l)) ? CUDNN_STATUS_SUCCESS
                                                                    : CUDNN_STATUS_EXECUTION_FAILED;
@@ -1797,14 +1852,14 @@ VGPU_EXPORT cudnnStatus_t cudnnSoftmaxBackward(cudnnHandle_t h, cudnnSoftmaxAlgo
   std::vector<double> vy, vdy;
   if (!read(Y->l, y, &vy) || !read(DY->l, dy, &vdy)) return CUDNN_STATUS_EXECUTION_FAILED;
   std::vector<double> r(vy.size());
-  softmax_groups(Y->l, mode, [&](const std::vector<size_t>& idx) {
+  softmax_groups(Y->l, mode, [&](size_t base, size_t stride, size_t count) {
     double sum = 0.0;
     if (algo == CUDNN_SOFTMAX_LOG) {
-      for (size_t i : idx) sum += vdy[i];
-      for (size_t i : idx) r[i] = vdy[i] - std::exp(vy[i]) * sum;
+      for (size_t j = 0; j < count; ++j) sum += vdy[base + j * stride];
+      for (size_t j = 0; j < count; ++j) { const size_t i = base + j * stride; r[i] = vdy[i] - std::exp(vy[i]) * sum; }
     } else {
-      for (size_t i : idx) sum += vy[i] * vdy[i];
-      for (size_t i : idx) r[i] = vy[i] * (vdy[i] - sum);
+      for (size_t j = 0; j < count; ++j) { const size_t i = base + j * stride; sum += vy[i] * vdy[i]; }
+      for (size_t j = 0; j < count; ++j) { const size_t i = base + j * stride; r[i] = vy[i] * (vdy[i] - sum); }
     }
   });
   return blend_write(DX->l, dx, r, sc(alpha, DX->l), sc(beta, DX->l)) ? CUDNN_STATUS_SUCCESS
@@ -2108,7 +2163,7 @@ VGPU_EXPORT cudnnStatus_t cudnnAddTensor(cudnnHandle_t h, const void* alpha, con
   if (!read(Ad->l, A, &va)) return CUDNN_STATUS_EXECUTION_FAILED;
   const std::vector<size_t> bi = broadcast_index(Ad->l, Cd->l);
   std::vector<double> r(bi.size());
-  for (size_t i = 0; i < r.size(); ++i) r[i] = va[bi[i]];
+  vgpu::hostpar::for_range(r.size(), 2, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) r[i] = va[bi[i]]; });
   return blend_write(Cd->l, C, r, sc(alpha, Cd->l), sc(beta, Cd->l)) ? CUDNN_STATUS_SUCCESS
                                                                      : CUDNN_STATUS_EXECUTION_FAILED;
 }
@@ -2166,15 +2221,20 @@ VGPU_EXPORT cudnnStatus_t cudnnOpTensor(cudnnHandle_t h, const cudnnOpTensorDesc
   if (!read(Ad->l, A, &va) || !read(Bd->l, Bp, &vb)) return CUDNN_STATUS_EXECUTION_FAILED;
   const std::vector<size_t> bi = broadcast_index(Bd->l, Cd->l);
   std::vector<double> r(va.size());
-  for (size_t i = 0; i < r.size(); ++i) {
-    const double av = a1 * va[i], bv = a2 * vb[bi[i]];
+  {
+    // The operation chosen once; elements are independent and spread over the host's threads.
+    auto go = [&](auto f) {
+      vgpu::hostpar::for_range(r.size(), 4, [&](size_t b, size_t e) {
+        for (size_t i = b; i < e; ++i) r[i] = f(a1 * va[i], a2 * vb[bi[i]]);
+      });
+    };
     switch (O.op) {
-      case CUDNN_OP_TENSOR_ADD: r[i] = av + bv; break;
-      case CUDNN_OP_TENSOR_MUL: r[i] = av * bv; break;
-      case CUDNN_OP_TENSOR_MIN: r[i] = std::min(av, bv); break;
-      case CUDNN_OP_TENSOR_MAX: r[i] = std::max(av, bv); break;
-      case CUDNN_OP_TENSOR_SQRT: r[i] = std::sqrt(av); break;  // unary: B is not read
-      case CUDNN_OP_TENSOR_NOT: r[i] = 1.0 - av; break;
+      case CUDNN_OP_TENSOR_ADD: go([](double av, double bv) { return av + bv; }); break;
+      case CUDNN_OP_TENSOR_MUL: go([](double av, double bv) { return av * bv; }); break;
+      case CUDNN_OP_TENSOR_MIN: go([](double av, double bv) { return std::min(av, bv); }); break;
+      case CUDNN_OP_TENSOR_MAX: go([](double av, double bv) { return std::max(av, bv); }); break;
+      case CUDNN_OP_TENSOR_SQRT: go([](double av, double) { return std::sqrt(av); }); break;  // unary: B is not read
+      case CUDNN_OP_TENSOR_NOT: go([](double av, double) { return 1.0 - av; }); break;
       default: return UNSUPPORTED(fn, "op " + std::to_string(O.op));
     }
   }
@@ -2653,6 +2713,38 @@ struct BnGeom {
   bool spatial = true;
   size_t params() const { return static_cast<size_t>(spatial ? C : C * S); }
   size_t slot(int64_t c, int64_t s) const { return static_cast<size_t>(spatial ? c : c * S + s); }
+  // The elements of slot p, in the order the loops over n, c, i met them (n outermost): visit(at) for each element's
+  // offset in the packed tensor. A slot's chain is the sum over exactly these, so it stays one item for a thread.
+  template <class V>
+  void each_of_slot(size_t p, V&& visit) const {
+    if (spatial) {
+      const int64_t c = static_cast<int64_t>(p);
+      for (int64_t n = 0; n < N; ++n)
+        for (int64_t i = 0; i < S; ++i) visit(static_cast<size_t>((n * C + c) * S + i));
+    } else {
+      const int64_t c = static_cast<int64_t>(p) / S, i = static_cast<int64_t>(p) % S;
+      for (int64_t n = 0; n < N; ++n) visit(static_cast<size_t>((n * C + c) * S + i));
+    }
+  }
+  // Elements per slot, as the loops counted them one by one.
+  double count_of_slot() const { return static_cast<double>(spatial ? N * S : N); }
+  // fn(at, p) for every element, the rows (n, c) of S elements spread over the host's threads.
+  template <class F>
+  void for_elements(F&& fn) const {
+    vgpu::hostpar::for_range(static_cast<size_t>(N * C), static_cast<uint64_t>(S) * 12 + 4, [&](size_t b, size_t e) {
+      for (size_t row = b; row < e; ++row) {
+        const int64_t c = static_cast<int64_t>(row) % C;
+        for (int64_t i = 0; i < S; ++i) fn(row * static_cast<size_t>(S) + static_cast<size_t>(i), slot(c, i));
+      }
+    });
+  }
+  // visit_slot(p) for every slot, spread over the host's threads.
+  template <class F>
+  void for_slots(F&& visit_slot) const {
+    vgpu::hostpar::for_range(params(), static_cast<uint64_t>(spatial ? N * S : N) * 6 + 4, [&](size_t b, size_t e) {
+      for (size_t p = b; p < e; ++p) visit_slot(p);
+    });
+  }
 };
 cudnnStatus_t bn_check(const char* fn, cudnnBatchNormMode_t mode, const TensorDesc* X, const TensorDesc* B,
                        BnGeom* g) {
@@ -2755,13 +2847,14 @@ cudnnStatus_t bn_forward_training(const char* fn, cudnnHandle_t h, cudnnBatchNor
   if (fuse.add && !read(fuse.Z->l, fuse.z, &vz)) return CUDNN_STATUS_EXECUTION_FAILED;
   const size_t np = g.params();
   std::vector<double> sum(np, 0.0), sq(np, 0.0), cnt(np, 0.0);
-  for (int64_t n = 0; n < g.N; ++n)
-    for (int64_t c = 0; c < g.C; ++c)
-      for (int64_t i = 0; i < g.S; ++i) {
-        const size_t p = g.slot(c, i);
-        const double v = vx[static_cast<size_t>((n * g.C + c) * g.S + i)];
-        sum[p] += v, sq[p] += v * v, cnt[p] += 1;
-      }
+  g.for_slots([&](size_t p) {
+    double s0 = 0.0, s1 = 0.0, c0 = 0.0;
+    g.each_of_slot(p, [&](size_t at) {
+      const double v = vx[at];
+      s0 += v, s1 += v * v, c0 += 1;
+    });
+    sum[p] = s0, sq[p] = s1, cnt[p] = c0;
+  });
   std::vector<double> mean(np), var(np), inv(np);
   for (size_t p = 0; p < np; ++p) {
     mean[p] = cnt[p] ? sum[p] / cnt[p] : 0.0;
@@ -2770,15 +2863,12 @@ cudnnStatus_t bn_forward_training(const char* fn, cudnnHandle_t h, cudnnBatchNor
   }
   std::vector<double> r(vx.size());
   std::vector<float> pre(fuse.act ? vx.size() : 0);
-  for (int64_t n = 0; n < g.N; ++n)
-    for (int64_t c = 0; c < g.C; ++c)
-      for (int64_t i = 0; i < g.S; ++i) {
-        const size_t p = g.slot(c, i), at = static_cast<size_t>((n * g.C + c) * g.S + i);
-        double t = hs[p] * (vx[at] - mean[p]) * inv[p] + hb[p];
-        if (fuse.add) t += vz[at];
-        if (fuse.act) pre[at] = static_cast<float>(t), t = fused_act(*fuse.act, t);
-        r[at] = t;
-      }
+  g.for_elements([&](size_t at, size_t p) {
+    double t = hs[p] * (vx[at] - mean[p]) * inv[p] + hb[p];
+    if (fuse.add) t += vz[at];
+    if (fuse.act) pre[at] = static_cast<float>(t), t = fused_act(*fuse.act, t);
+    r[at] = t;
+  });
   if (!blend_write(Y->l, y, r, sc(alpha, Y->l), sc(beta, Y->l))) return CUDNN_STATUS_EXECUTION_FAILED;
   if (fuse.reserve && cudaMemcpy(fuse.reserve, pre.data(), pre.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return CUDNN_STATUS_EXECUTION_FAILED;
@@ -2843,26 +2933,24 @@ cudnnStatus_t bn_backward(const char* fn, cudnnHandle_t h, cudnnBatchNormMode_t 
     } else if (!read(Y->l, y, &t)) {  // RELU: y > 0 exactly where the pre-activation was
       return CUDNN_STATUS_EXECUTION_FAILED;
     }
-    for (size_t i = 0; i < vdy.size(); ++i) vdy[i] *= fused_act_grad(*fuse.act, t[i]);
+    vgpu::hostpar::for_range(vdy.size(), 30, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) vdy[i] *= fused_act_grad(*fuse.act, t[i]); });
     if (fuse.add && !blend_write(DZ->l, dz, vdy, ad, bd)) return CUDNN_STATUS_EXECUTION_FAILED;
   }
   (void)bias;  // the gradient does not depend on it
   const size_t np = g.params();
-  std::vector<double> mean(np, 0.0), inv(np, 0.0), cnt(np, 0.0);
-  for (int64_t n = 0; n < g.N; ++n)
-    for (int64_t c = 0; c < g.C; ++c)
-      for (int64_t i = 0; i < g.S; ++i) cnt[g.slot(c, i)] += 1;
+  std::vector<double> mean(np, 0.0), inv(np, 0.0), cnt(np, g.count_of_slot());   // (a slot's elements, counted one by one, add up to exactly this)
   if (saved_mean && saved_inv) {
     if (!read(B->l, saved_mean, &mean) || !read(B->l, saved_inv, &inv)) return CUDNN_STATUS_EXECUTION_FAILED;
   } else {
     std::vector<double> sum(np, 0.0), sq(np, 0.0);
-    for (int64_t n = 0; n < g.N; ++n)
-      for (int64_t c = 0; c < g.C; ++c)
-        for (int64_t i = 0; i < g.S; ++i) {
-          const size_t p = g.slot(c, i);
-          const double v = vx[static_cast<size_t>((n * g.C + c) * g.S + i)];
-          sum[p] += v, sq[p] += v * v;
-        }
+    g.for_slots([&](size_t p) {
+      double s0 = 0.0, s1 = 0.0;
+      g.each_of_slot(p, [&](size_t at) {
+        const double v = vx[at];
+        s0 += v, s1 += v * v;
+      });
+      sum[p] = s0, sq[p] = s1;
+    });
     for (size_t p = 0; p < np; ++p) {
       mean[p] = cnt[p] ? sum[p] / cnt[p] : 0.0;
       const double var = cnt[p] ? std::max(0.0, sq[p] / cnt[p] - mean[p] * mean[p]) : 0.0;
@@ -2870,21 +2958,19 @@ cudnnStatus_t bn_backward(const char* fn, cudnnHandle_t h, cudnnBatchNormMode_t 
     }
   }
   std::vector<double> dbias(np, 0.0), dscale(np, 0.0);
-  for (int64_t n = 0; n < g.N; ++n)
-    for (int64_t c = 0; c < g.C; ++c)
-      for (int64_t i = 0; i < g.S; ++i) {
-        const size_t p = g.slot(c, i), at = static_cast<size_t>((n * g.C + c) * g.S + i);
-        dbias[p] += vdy[at];
-        dscale[p] += vdy[at] * (vx[at] - mean[p]) * inv[p];
-      }
+  g.for_slots([&](size_t p) {
+    double db = 0.0, ds = 0.0;
+    g.each_of_slot(p, [&](size_t at) {
+      db += vdy[at];
+      ds += vdy[at] * (vx[at] - mean[p]) * inv[p];
+    });
+    dbias[p] = db, dscale[p] = ds;
+  });
   std::vector<double> r(vx.size());
-  for (int64_t n = 0; n < g.N; ++n)
-    for (int64_t c = 0; c < g.C; ++c)
-      for (int64_t i = 0; i < g.S; ++i) {
-        const size_t p = g.slot(c, i), at = static_cast<size_t>((n * g.C + c) * g.S + i);
-        const double xhat = (vx[at] - mean[p]) * inv[p];
-        r[at] = hs[p] * inv[p] / cnt[p] * (cnt[p] * vdy[at] - dbias[p] - xhat * dscale[p]);
-      }
+  g.for_elements([&](size_t at, size_t p) {
+    const double xhat = (vx[at] - mean[p]) * inv[p];
+    r[at] = hs[p] * inv[p] / cnt[p] * (cnt[p] * vdy[at] - dbias[p] - xhat * dscale[p]);
+  });
   if (!blend_write(DX->l, dx, r, ad, bd)) return CUDNN_STATUS_EXECUTION_FAILED;
   if (dscale_out && !blend_write(B->l, dscale_out, dscale, ap, bp)) return CUDNN_STATUS_EXECUTION_FAILED;
   if (dbias_out && !blend_write(B->l, dbias_out, dbias, ap, bp)) return CUDNN_STATUS_EXECUTION_FAILED;
@@ -2912,14 +2998,11 @@ cudnnStatus_t bn_inference(const char* fn, cudnnHandle_t h, cudnnBatchNormMode_t
       !read(M->l, var, &hv))
     return CUDNN_STATUS_EXECUTION_FAILED;
   if (fuse.add && !read(fuse.Z->l, fuse.z, &vz)) return CUDNN_STATUS_EXECUTION_FAILED;
-  for (int64_t n = 0; n < g.N; ++n)
-    for (int64_t c = 0; c < g.C; ++c)
-      for (int64_t i = 0; i < g.S; ++i) {
-        const size_t p = g.slot(c, i), at = static_cast<size_t>((n * g.C + c) * g.S + i);
-        double t = hs[p] * (vx[at] - hm[p]) / std::sqrt(eps + hv[p]) + hb[p];
-        if (fuse.add) t += vz[at];
-        vx[at] = fuse.act ? fused_act(*fuse.act, t) : t;
-      }
+  g.for_elements([&](size_t at, size_t p) {
+    double t = hs[p] * (vx[at] - hm[p]) / std::sqrt(eps + hv[p]) + hb[p];
+    if (fuse.add) t += vz[at];
+    vx[at] = fuse.act ? fused_act(*fuse.act, t) : t;
+  });
   return blend_write(Y->l, y, vx, sc(alpha, Y->l), sc(beta, Y->l)) ? CUDNN_STATUS_SUCCESS
                                                                     : CUDNN_STATUS_EXECUTION_FAILED;
 }

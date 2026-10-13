@@ -189,6 +189,10 @@ inline void apply_pivots(double* b, int64_t ldb, int n, int nrhs, const int* ipi
 
 // Triangular solves. `unit` means an implicit unit diagonal (LU's L).
 inline void trsm_lower(const double* a, int64_t lda, double* b, int64_t ldb, int n, int nrhs, bool unit, bool trans) {
+  if (nrhs >= 4 && n >= 8) {   // many right-hand sides: they go along the vector lanes (host_trsm.hpp), each with the same steps
+    vgpu::hosttrsm::real(n, nrhs, /*forward=*/!trans, unit, a, trans ? lda : 1, trans ? 1 : lda, b, 1, ldb);
+    return;
+  }
   CM A{a, lda};
   M B{b, ldb};
   for (int c = 0; c < nrhs; ++c) {
@@ -211,6 +215,10 @@ inline void trsm_lower(const double* a, int64_t lda, double* b, int64_t ldb, int
 }
 
 inline void trsm_upper(const double* a, int64_t lda, double* b, int64_t ldb, int n, int nrhs, bool unit, bool trans) {
+  if (nrhs >= 4 && n >= 8) {
+    vgpu::hosttrsm::real(n, nrhs, /*forward=*/trans, unit, a, trans ? lda : 1, trans ? 1 : lda, b, 1, ldb);
+    return;
+  }
   CM A{a, lda};
   M B{b, ldb};
   // Not transposed, x_i = (b_i - sum_{k>i} U(i,k) x_k) / U(i,i) takes U along a row, which is strided; with several
