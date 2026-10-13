@@ -363,7 +363,8 @@ __global__ void float_forms(const float* in, uint32_t* out, int n, int shape) {
 // double arithmetic under every rounding mode (DADD, DMUL, DFMA with .RM, .RP, .RZ). Only the two runs' agreement is checked
 // here (the kernels have host references in tests/unit/test_simd.cpp).
 #include <cuda_fp16.h>
-constexpr int kHalfForms = 24;
+#include <cuda_bf16.h>
+constexpr int kHalfForms = 34;
 __global__ void half_forms(const uint32_t* in, uint32_t* out, const uint64_t* din, uint64_t* dout, int n, int shape) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -395,6 +396,18 @@ __global__ void half_forms(const uint32_t* in, uint32_t* out, const uint64_t* di
     asm("prmt.b32.rc16 %0, %1, %2, %3;" : "=r"(o[17]) : "r"(x), "r"(y), "r"(z));
     o[18] = __byte_perm(x, 0x01020304u, 0x7531u);
     o[19] = __byte_perm(x, y, 0x8888u ^ (z & 0x7777u));
+    // Halves to f32 (HADD2.F32 with a swizzle), and f32 pairs packed to f16x2 and bf16x2 (F2FP.PACK_AB), with a negation and .RELU.
+    const float f0 = __half2float(__low2half(a)), f1 = __half2float(__high2half(a));
+    o[24] = __float_as_uint(f0) ^ __float_as_uint(f1 * 2.0f);
+    o[25] = __float_as_uint(__half2float(__high2half(b)) + __half2float(__low2half(c)));
+    o[26] = bits(__float22half2_rn(make_float2(f0 * 1.5f, -f1)));
+    o[27] = bits(__float22half2_rn(make_float2(__uint_as_float(x), __uint_as_float(y))));
+    o[28] = *reinterpret_cast<const uint32_t*>(&(const __nv_bfloat162&)__float22bfloat162_rn(make_float2(__uint_as_float(y), f0)));
+    o[29] = bits(__float22half2_rn(make_float2(fmaxf(__uint_as_float(z), 0.0f), fabsf(__uint_as_float(x)))));
+    o[30] = __float_as_uint(__half2float(__low2half(__hmul2(a, b))) * __half2float(__high2half(c)));
+    o[31] = bits(__hfma2(a, b, c)) ^ bits(__hadd2(__hneg2(a), c));
+    asm("cvt.rn.relu.f16x2.f32 %0, %1, %2;" : "=r"(o[32]) : "f"(__uint_as_float(x)), "f"(-f1));
+    asm("cvt.rn.relu.bf16x2.f32 %0, %1, %2;" : "=r"(o[33]) : "f"(f0), "f"(__uint_as_float(y)));
     // The 32-bit multiply-add with carries.
     const unsigned long long wide = (static_cast<unsigned long long>(x) << 32 | y) * 0x9E3779B1ull + z;
     o[20] = static_cast<uint32_t>(wide >> 32) ^ static_cast<uint32_t>(wide);

@@ -1019,7 +1019,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     case Op::FMNMX: case Op::MUFU: case Op::I2FP: case Op::I2F: case Op::F2I: case Op::HADD2: case Op::HMUL2: case Op::HFMA2:
       return fast_float(w, ins, ex);
     case Op::PRMT: return fast_wide(w, ins, ex);
-    case Op::DSETP: return fast_float(w, ins, ex);
+    case Op::DSETP: case Op::F2FP: return fast_float(w, ins, ex);
     default: return false;
   }
   if (ins.dst.empty()) return false;
@@ -1838,7 +1838,7 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       // value the same for every lane, a split immediate (one half for both lanes), or a pair of immediates for b or c.
       const bool bf = ins.f[0], f32out = ins.f[1], st = ins.f[3];
       const unsigned need = ins.op == Op::HFMA2 ? 3u : 2u;
-      if (bf || f32out || st || ins.dst[0].kind != Kind::Reg || ins.src.size() < need) return false;
+      if (bf || (st && !f32out) || ins.dst[0].kind != Kind::Reg || ins.src.size() < need) return false;
       alignas(32) uint32_t pk[3][32];
       bool ok = true;
       const auto packed = [&](unsigned slot, const Operand& o) -> const uint32_t* {
@@ -1887,6 +1887,40 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
           c = packed(2, ins.src[next]);
       }
       if (!ok) return false;
+      if (f32out) {
+        // The result is lane 0 of the pair, as an f32: the sum, product or fused multiply-add of the first halves in double, rounded
+        // once to float (and flushed with .FTZ, clamped to [0, 1] with .SAT). The general rule's arithmetic on the same values; a NaN
+        // among the operands (which of two NaNs the host's arithmetic keeps depends on how the compiler ordered the operands) takes
+        // that general path.
+        alignas(32) uint16_t h16[3][32];
+        alignas(32) float f[3][32];
+        const uint32_t* srcs[3] = {a, b, c};
+        const unsigned nused = ins.op == Op::HFMA2 ? 3 : 2;
+        uint32_t nan_seen = 0;
+        for (unsigned k = 0; k < nused; ++k) {
+          for (unsigned l = 0; l < 32; ++l) {
+            h16[k][l] = static_cast<uint16_t>(srcs[k][l]);
+            nan_seen |= (h16[k][l] & 0x7fffu) > 0x7c00u;
+          }
+        }
+        if (nan_seen) return false;
+        if (ins.dst[0].reg == kRZ) return true;
+        for (unsigned k = 0; k < nused; ++k) sk->f16_to_f32(h16[k], f[k], 32);
+        alignas(32) uint32_t out[32];
+        const bool fz = ins.f[2], satur = st;
+        for (unsigned l = 0; l < 32; ++l) {
+          double v;
+          if (ins.op == Op::HADD2) v = static_cast<double>(f[0][l]) + f[1][l];
+          else if (ins.op == Op::HMUL2) v = static_cast<double>(f[0][l]) * f[1][l];
+          else v = std::fma(static_cast<double>(f[0][l]), static_cast<double>(f[1][l]), static_cast<double>(f[2][l]));
+          if (satur) v = v != v ? 0.0 : std::clamp(v, 0.0, 1.0);
+          float g = static_cast<float>(v);
+          if (fz) g = ftz(g);
+          out[l] = f32_bits(g);
+        }
+        store_row(ins.dst[0].reg, out);
+        return true;
+      }
       if (ins.dst[0].reg == kRZ) return true;   // (nothing to write)
       uint32_t* const d = &w.reg(ins.dst[0].reg, 0);
       alignas(32) uint32_t fixed[32];
@@ -1899,6 +1933,36 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       } else {
         sk->hfma2_m(d, a, b, c, ex, 32, 2);
       }
+      return true;
+    }
+    case Op::F2FP: {
+      // Two f32 packed into the halves of a register -- f16 or bf16, to nearest even, .RELU first sending a negative value to 0 (not
+      // the narrow formats, TF32 packs or the unpacks, which take the general path).
+      if (ins.src.size() < 2 || ins.dst[0].kind != Kind::Reg || ins.f[5] == 4 || ins.f[3] >= 6 || !plain(ins.src[0]) || !plain(ins.src[1]) ||
+          ins.src[0].bnot || ins.src[1].bnot)
+        return false;
+      alignas(32) float fa[32], fb[32];
+      const uint32_t* ra = lanes(0, ins.src[0], true);
+      const uint32_t* rb = lanes(1, ins.src[1], true);
+      for (unsigned l = 0; l < 32; ++l) {
+        fa[l] = as_f32(ra[l]);
+        fb[l] = as_f32(rb[l]);
+      }
+      if (ins.f[2]) {   // .RELU: a negative value (not -0, not a NaN) becomes +0
+        for (unsigned l = 0; l < 32; ++l) {
+          if (fa[l] < 0) fa[l] = 0;
+          if (fb[l] < 0) fb[l] = 0;
+        }
+      }
+      if (ins.f[0]) {   // bf16
+        for (unsigned l = 0; l < 32; ++l) r[l] = (static_cast<uint32_t>(f32_to_bf16(fa[l])) << 16) | f32_to_bf16(fb[l]);
+      } else {
+        alignas(32) uint16_t ha[32], hb[32];
+        sk->f32_to_f16(fa, ha, 32);
+        sk->f32_to_f16(fb, hb, 32);
+        for (unsigned l = 0; l < 32; ++l) r[l] = (static_cast<uint32_t>(ha[l]) << 16) | hb[l];
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
       return true;
     }
     case Op::I2F: case Op::I2FP: {
