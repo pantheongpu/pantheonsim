@@ -110,6 +110,24 @@ struct Kernels {
   // computes it. `out` may not alias the inputs.
   void (*hmma)(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const uint32_t* b,
                const uint32_t* c, uint32_t* out);
+
+  // The wider integer forms of the SASS executor's plain-form ALU path, 32 lanes each (r, rlo and rhi may not alias the
+  // sources).
+  //  blend_m: d[l] = r[l] for the lanes whose bit of `mask` is set; the others of d keep their value.
+  //  iadd3x: r[l] = a + b + c + add + bit l of cin_a + bit l of cin_b, wrapping; bit l of *ge1 is whether that sum
+  //    (taken in 64 bits) reached 2^32, bit l of *ge2 whether it reached 2 * 2^32 (IADD3's two carry-out predicates).
+  //  imad_wide: the 64-bit register pair (rlo, rhi) = a * b + (clo, chi) + bit l of cin, the product of the 32-bit
+  //    operands signed (`sgn`) or unsigned, the sum modulo 2^64; bit l of *carry_out is the carry out of that 64-bit sum.
+  //  shf: SASS's funnel shift of (top:lo) by n: type 0 S64, 1 U64, 2 S32, 3 U32; the count n is taken modulo the width
+  //    (`wrap`, 64 for the 64-bit types, else 32) or limited to it; a left shift (`right` false) shifts in zeros, a right
+  //    shift of a signed type the sign (the count limited to 63); r is the high word of the result if `hi`, else the low.
+  void (*blend_m)(uint32_t* d, const uint32_t* r, uint32_t mask);
+  void (*iadd3x)(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t add, uint32_t cin_a,
+                 uint32_t cin_b, uint32_t* ge1, uint32_t* ge2);
+  void (*imad_wide)(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const uint32_t* b, const uint32_t* clo,
+                    const uint32_t* chi, bool sgn, uint32_t cin, uint32_t* carry_out);
+  void (*shf)(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* top, unsigned type, bool wrap,
+              bool right, bool hi);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the

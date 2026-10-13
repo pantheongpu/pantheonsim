@@ -476,48 +476,105 @@ inline uint64_t dop_nan(unsigned kind, uint64_t a, uint64_t b, uint64_t c) {
   return pick | 0x0008000000000000ull;
 }
 
+#if VGPU_SIMD_AVX2
+// Eight lanes at a time. A register pair's two halves come as the low words and the high words of 8 lanes; unpacking
+// them against each other gives the doubles of lanes 0 1 4 5 (the low unpack) and 2 3 6 7 (the high unpack), and the
+// two shuffles at the end put the result's words back in lane order. A chunk of 8 lanes is read in full before it is
+// written, and a lane's result depends on that lane alone, so d may be a source (a register of the pair as well).
+//
+// A NaN operand gives a NaN result, whatever the operation, so the result is what is looked at: a lane whose result is
+// not a NaN had no NaN operand, and the rest are given the rule of dop_nan (a result that is a NaN with no NaN operand,
+// inf - inf, keeps the host's).
+template <unsigned Kind, bool Mods>
+inline void dop_avx2_t(const uint32_t* absm, const uint32_t* negm, uint32_t* dlo, uint32_t* dhi, const uint32_t* alo,
+                       const uint32_t* ahi, const uint32_t* blo, const uint32_t* bhi, const uint32_t* clo,
+                       const uint32_t* chi, uint32_t mask) {
+  __m256i absv[3], negv[3];
+  for (int k = 0; k < 3; ++k) {
+    absv[k] = _mm256_set1_epi32(static_cast<int>(absm[k]));
+    negv[k] = _mm256_set1_epi32(static_cast<int>(negm[k]));
+  }
+  const auto load = [&](const uint32_t* lo, const uint32_t* hi, unsigned k, unsigned i, __m256d& p, __m256d& q) {
+    const __m256i l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lo + i));
+    __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hi + i));
+    if constexpr (Mods) h = _mm256_xor_si256(_mm256_and_si256(h, absv[k]), negv[k]);
+    p = _mm256_castsi256_pd(_mm256_unpacklo_epi32(l, h));
+    q = _mm256_castsi256_pd(_mm256_unpackhi_epi32(l, h));
+  };
+  const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
+  const __m256i pick = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+  for (unsigned i = 0; i < 32; i += 8) {
+    const uint32_t bits = (mask >> i) & 0xffu;
+    __m256d xa, xb, ya, yb, za = _mm256_setzero_pd(), zb = _mm256_setzero_pd();
+    load(alo, ahi, 0, i, xa, xb);
+    load(blo, bhi, 1, i, ya, yb);
+    __m256d va, vb;
+    if constexpr (Kind == 0) {
+      va = _mm256_add_pd(xa, ya);
+      vb = _mm256_add_pd(xb, yb);
+    } else if constexpr (Kind == 1) {
+      va = _mm256_mul_pd(xa, ya);
+      vb = _mm256_mul_pd(xb, yb);
+    } else {
+      load(clo, chi, 2, i, za, zb);
+      va = _mm256_fmadd_pd(xa, ya, za);
+      vb = _mm256_fmadd_pd(xb, yb, zb);
+    }
+    if (_mm256_movemask_pd(_mm256_or_pd(_mm256_cmp_pd(va, va, _CMP_UNORD_Q), _mm256_cmp_pd(vb, vb, _CMP_UNORD_Q)))) {
+      // Rare: a NaN result. The operands and results of the 8 lanes, in lane order, and the rule applied to each.
+      alignas(32) double X[8], Y[8], Z[8], R[8];
+      const auto spill = [](double* o, __m256d p, __m256d q) {
+        _mm_storeu_pd(o, _mm256_castpd256_pd128(p));
+        _mm_storeu_pd(o + 4, _mm256_extractf128_pd(p, 1));
+        _mm_storeu_pd(o + 2, _mm256_castpd256_pd128(q));
+        _mm_storeu_pd(o + 6, _mm256_extractf128_pd(q, 1));
+      };
+      spill(X, xa, xb);
+      spill(Y, ya, yb);
+      spill(Z, za, zb);
+      spill(R, va, vb);
+      for (unsigned k = 0; k < 8; ++k) {
+        const uint64_t ua = std::bit_cast<uint64_t>(X[k]), ub = std::bit_cast<uint64_t>(Y[k]),
+                       uc = Kind == 2 ? std::bit_cast<uint64_t>(Z[k]) : 0;
+        if (is_nan(ua) || is_nan(ub) || (Kind == 2 && is_nan(uc))) R[k] = std::bit_cast<double>(dop_nan(Kind, ua, ub, uc));
+      }
+      va = _mm256_insertf128_pd(_mm256_castpd128_pd256(_mm_loadu_pd(R)), _mm_loadu_pd(R + 4), 1);
+      vb = _mm256_insertf128_pd(_mm256_castpd128_pd256(_mm_loadu_pd(R + 2)), _mm_loadu_pd(R + 6), 1);
+    }
+    const __m256i rlo = _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castpd_ps(va), _mm256_castpd_ps(vb), 0x88));
+    const __m256i rhi = _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castpd_ps(va), _mm256_castpd_ps(vb), 0xDD));
+    if (bits == 0xffu) {
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(dlo + i), rlo);
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(dhi + i), rhi);
+    } else if (bits) {
+      const __m256i m = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(static_cast<int>(bits)), pick), pick);
+      _mm256_maskstore_epi32(reinterpret_cast<int*>(dlo + i), m, rlo);
+      _mm256_maskstore_epi32(reinterpret_cast<int*>(dhi + i), m, rhi);
+    }
+  }
+}
+#endif
+
 void dop_m_k(unsigned kind, unsigned mods, uint32_t* dlo, uint32_t* dhi, const uint32_t* alo, const uint32_t* ahi,
              const uint32_t* blo, const uint32_t* bhi, const uint32_t* clo, const uint32_t* chi, uint32_t mask) {
-  uint32_t rlo[32], rhi[32];
   const uint32_t absm[3] = {(mods & 1) ? 0x7fffffffu : ~0u, (mods & 4) ? 0x7fffffffu : ~0u, (mods & 16) ? 0x7fffffffu : ~0u};
   const uint32_t negm[3] = {(mods & 2) ? 0x80000000u : 0u, (mods & 8) ? 0x80000000u : 0u, (mods & 32) ? 0x80000000u : 0u};
+#if VGPU_SIMD_AVX2
+  if ((mods & 63u) == 0) {
+    if (kind == 0) dop_avx2_t<0, false>(absm, negm, dlo, dhi, alo, ahi, blo, bhi, clo, chi, mask);
+    else if (kind == 1) dop_avx2_t<1, false>(absm, negm, dlo, dhi, alo, ahi, blo, bhi, clo, chi, mask);
+    else dop_avx2_t<2, false>(absm, negm, dlo, dhi, alo, ahi, blo, bhi, clo, chi, mask);
+  } else {
+    if (kind == 0) dop_avx2_t<0, true>(absm, negm, dlo, dhi, alo, ahi, blo, bhi, clo, chi, mask);
+    else if (kind == 1) dop_avx2_t<1, true>(absm, negm, dlo, dhi, alo, ahi, blo, bhi, clo, chi, mask);
+    else dop_avx2_t<2, true>(absm, negm, dlo, dhi, alo, ahi, blo, bhi, clo, chi, mask);
+  }
+#else
+  uint32_t rlo[32], rhi[32];
   const auto bits = [&](const uint32_t* lo, const uint32_t* hi, unsigned i, unsigned k) {
     return uint64_t{lo[i]} | (uint64_t{(hi[i] & absm[k]) ^ negm[k]} << 32);
   };
   const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
-#if VGPU_SIMD_AVX2
-  for (unsigned i = 0; i < 32; i += 4) {
-    const auto load = [&](const uint32_t* lo, const uint32_t* hi, unsigned k) {
-      __m128i l = _mm_loadu_si128(reinterpret_cast<const __m128i*>(lo + i));
-      __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hi + i));
-      h = _mm_xor_si128(_mm_and_si128(h, _mm_set1_epi32(static_cast<int>(absm[k]))), _mm_set1_epi32(static_cast<int>(negm[k])));
-      return _mm256_castsi256_pd(_mm256_or_si256(_mm256_cvtepu32_epi64(l), _mm256_slli_epi64(_mm256_cvtepu32_epi64(h), 32)));
-    };
-    const __m256d x = load(alo, ahi, 0), y = load(blo, bhi, 1);
-    __m256d v, nanv = _mm256_cmp_pd(x, y, _CMP_UNORD_Q);
-    if (kind == 0) v = _mm256_add_pd(x, y);
-    else if (kind == 1) v = _mm256_mul_pd(x, y);
-    else {
-      const __m256d z = load(clo, chi, 2);
-      v = _mm256_fmadd_pd(x, y, z);
-      nanv = _mm256_or_pd(nanv, _mm256_cmp_pd(z, z, _CMP_UNORD_Q));
-    }
-    const __m256i u = _mm256_castpd_si256(v);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(rlo + i),
-                     _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(u, _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0))));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(rhi + i),
-                     _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(u, _mm256_setr_epi32(1, 3, 5, 7, 0, 0, 0, 0))));
-    if (const int nm = _mm256_movemask_pd(nanv)) {   // rare: a NaN among the operands
-      for (unsigned k = 0; k < 4; ++k)
-        if ((nm >> k) & 1) {
-          const uint64_t r = dop_nan(kind, bits(alo, ahi, i + k, 0), bits(blo, bhi, i + k, 1),
-                                     kind == 2 ? bits(clo, chi, i + k, 2) : 0);
-          rlo[i + k] = static_cast<uint32_t>(r);
-          rhi[i + k] = static_cast<uint32_t>(r >> 32);
-        }
-    }
-  }
-#else
   for (unsigned i = 0; i < 32; ++i) {
     const uint64_t ua = bits(alo, ahi, i, 0), ub = bits(blo, bhi, i, 1), uc = kind == 2 ? bits(clo, chi, i, 2) : 0;
     uint64_t u;
@@ -531,10 +588,177 @@ void dop_m_k(unsigned kind, unsigned mods, uint32_t* dlo, uint32_t* dhi, const u
     rlo[i] = static_cast<uint32_t>(u);
     rhi[i] = static_cast<uint32_t>(u >> 32);
   }
-#endif
-  (void)is_nan;
   store_masked(dlo, rlo, mask, 32);
   store_masked(dhi, rhi, mask, 32);
+#endif
+}
+
+// ---- wider integer forms of the SASS executor's fast_alu (32 lanes) ---------------------------------------------------
+
+void blend_m_k(uint32_t* d, const uint32_t* r, uint32_t mask) { store_masked(d, r, mask, 32); }
+
+#if VGPU_SIMD_AVX2
+// Eight lanes of a 32-bit vector widened to 64-bit lanes, in the order the AVX2 unpacks give: `p` holds lanes 0 1 4 5
+// and `q` lanes 2 3 6 7 (the high dword of each is `hi`, or zero). pair_pack_lo/hi put 64-bit results back in lane order.
+inline __m256i pair_pack_lo(__m256i p, __m256i q) {
+  return _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castsi256_ps(p), _mm256_castsi256_ps(q), 0x88));
+}
+inline __m256i pair_pack_hi(__m256i p, __m256i q) {
+  return _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castsi256_ps(p), _mm256_castsi256_ps(q), 0xDD));
+}
+// Bit k of the low 8 bits of `bits` as an all-ones dword in lane k.
+inline __m256i lane_mask_dwords(uint32_t bits) {
+  const __m256i pick = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+  return _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(static_cast<int>(bits & 0xffu)), pick), pick);
+}
+#endif
+
+void iadd3x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t add, uint32_t cin_a,
+              uint32_t cin_b, uint32_t* ge1, uint32_t* ge2) {
+  uint32_t o1 = 0, o2 = 0;
+#if VGPU_SIMD_AVX2
+  const __m256i zero = _mm256_setzero_si256();
+  for (unsigned i = 0; i < 32; i += 8) {
+    // The addend and the two carries in (each 0 or 1 a lane), one number a lane.
+    const __m256i k = _mm256_sub_epi32(_mm256_sub_epi32(_mm256_set1_epi32(static_cast<int>(add)), lane_mask_dwords(cin_a >> i)),
+                                       lane_mask_dwords(cin_b >> i));
+    const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+    const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+    const __m256i z = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + i));
+    const __m256i p = _mm256_add_epi64(_mm256_add_epi64(_mm256_unpacklo_epi32(x, zero), _mm256_unpacklo_epi32(y, zero)),
+                                       _mm256_add_epi64(_mm256_unpacklo_epi32(z, zero), _mm256_unpacklo_epi32(k, zero)));
+    const __m256i q = _mm256_add_epi64(_mm256_add_epi64(_mm256_unpackhi_epi32(x, zero), _mm256_unpackhi_epi32(y, zero)),
+                                       _mm256_add_epi64(_mm256_unpackhi_epi32(z, zero), _mm256_unpackhi_epi32(k, zero)));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), pair_pack_lo(p, q));
+    const __m256i over = pair_pack_hi(p, q);   // the carries out of 32 bits: 0 to 3
+    o1 |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(over, zero)))) << i;
+    o2 |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(over, _mm256_set1_epi32(1))))) << i;
+  }
+#else
+  for (unsigned i = 0; i < 32; ++i) {
+    const uint64_t sum = uint64_t{a[i]} + b[i] + c[i] + add + ((cin_a >> i) & 1u) + ((cin_b >> i) & 1u);
+    r[i] = static_cast<uint32_t>(sum);
+    o1 |= static_cast<uint32_t>((sum >> 32) >= 1) << i;
+    o2 |= static_cast<uint32_t>((sum >> 32) >= 2) << i;
+  }
+#endif
+  *ge1 = o1;
+  *ge2 = o2;
+}
+
+#if VGPU_SIMD_AVX2
+template <bool Sgn>
+inline void imad_wide_avx2(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const uint32_t* b, const uint32_t* clo,
+                           const uint32_t* chi, uint32_t cin, uint32_t* carry_out) {
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i sign = _mm256_set1_epi64x(static_cast<long long>(0x8000000000000000ull));
+  uint32_t out = 0;
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+    const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+    const __m256i cl = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(clo + i));
+    const __m256i ch = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(chi + i));
+    const __m256i cm = lane_mask_dwords(cin >> i);
+    const auto half = [&](bool high, __m256i& res, __m256i& carry) {
+      const __m256i xa = high ? _mm256_unpackhi_epi32(x, zero) : _mm256_unpacklo_epi32(x, zero);
+      const __m256i ya = high ? _mm256_unpackhi_epi32(y, zero) : _mm256_unpacklo_epi32(y, zero);
+      const __m256i prod = Sgn ? _mm256_mul_epi32(xa, ya) : _mm256_mul_epu32(xa, ya);
+      const __m256i cc = high ? _mm256_unpackhi_epi32(cl, ch) : _mm256_unpacklo_epi32(cl, ch);
+      const __m256i ci = _mm256_srli_epi64(high ? _mm256_unpackhi_epi32(cm, cm) : _mm256_unpacklo_epi32(cm, cm), 63);
+      const __m256i s1 = _mm256_add_epi64(prod, cc);
+      const __m256i s2 = _mm256_add_epi64(s1, ci);
+      // Unsigned: a sum below an addend wrapped. (cmpgt is signed; the sign bit flipped on both makes it unsigned.)
+      const __m256i c1 = _mm256_cmpgt_epi64(_mm256_xor_si256(prod, sign), _mm256_xor_si256(s1, sign));
+      const __m256i c2 = _mm256_cmpgt_epi64(_mm256_xor_si256(s1, sign), _mm256_xor_si256(s2, sign));
+      res = s2;
+      carry = _mm256_or_si256(c1, c2);
+    };
+    __m256i p, q, cp, cq;
+    half(false, p, cp);
+    half(true, q, cq);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(rlo + i), pair_pack_lo(p, q));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(rhi + i), pair_pack_hi(p, q));
+    out |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(pair_pack_lo(cp, cq)))) << i;
+  }
+  *carry_out = out;
+}
+#endif
+
+void imad_wide_k(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const uint32_t* b, const uint32_t* clo,
+                 const uint32_t* chi, bool sgn, uint32_t cin, uint32_t* carry_out) {
+#if VGPU_SIMD_AVX2
+  if (sgn) imad_wide_avx2<true>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+  else imad_wide_avx2<false>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+#else
+  uint32_t out = 0;
+  for (unsigned i = 0; i < 32; ++i) {
+    const uint64_t prod = sgn ? static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(a[i])) * static_cast<int32_t>(b[i]))
+                              : static_cast<uint64_t>(a[i]) * b[i];
+    const uint64_t c = uint64_t{clo[i]} | (uint64_t{chi[i]} << 32);
+    const unsigned __int128 full = static_cast<unsigned __int128>(prod) + c + ((cin >> i) & 1u);
+    rlo[i] = static_cast<uint32_t>(full);
+    rhi[i] = static_cast<uint32_t>(static_cast<uint64_t>(full) >> 32);
+    out |= static_cast<uint32_t>((full >> 64) != 0) << i;
+  }
+  *carry_out = out;
+#endif
+}
+
+#if VGPU_SIMD_AVX2
+template <bool Right, bool Sgn, bool Hi>
+inline void shf_avx2(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* top, bool wrap, unsigned width) {
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i wmask = _mm256_set1_epi32(static_cast<int>(width - 1)), wmax = _mm256_set1_epi32(static_cast<int>(width));
+  const __m256i k63 = _mm256_set1_epi64x(63);
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256i l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lo + i));
+    const __m256i t = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(top + i));
+    __m256i k = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(n + i));
+    k = wrap ? _mm256_and_si256(k, wmask) : _mm256_min_epu32(k, wmax);   // (a power of two: n % width is n & (width - 1))
+    const auto half = [&](bool high) {
+      const __m256i v = high ? _mm256_unpackhi_epi32(l, t) : _mm256_unpacklo_epi32(l, t);
+      const __m256i kk = high ? _mm256_unpackhi_epi32(k, zero) : _mm256_unpacklo_epi32(k, zero);
+      if constexpr (!Right) {
+        return _mm256_sllv_epi64(v, kk);   // (a count of 64 or more gives zero)
+      } else if constexpr (Sgn) {
+        const __m256i s = _mm256_cmpgt_epi64(zero, v);
+        return _mm256_xor_si256(_mm256_srlv_epi64(_mm256_xor_si256(v, s), _mm256_min_epu32(kk, k63)), s);
+      } else {
+        return _mm256_srlv_epi64(v, kk);
+      }
+    };
+    const __m256i p = half(false), q = half(true);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), Hi ? pair_pack_hi(p, q) : pair_pack_lo(p, q));
+  }
+}
+#endif
+
+void shf_k(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* top, unsigned type, bool wrap,
+           bool right, bool hi) {
+  const bool is64 = type < 2, sgn = type == 0 || type == 2;
+  const unsigned width = is64 ? 64 : 32;
+#if VGPU_SIMD_AVX2
+  if (!right) {
+    if (hi) shf_avx2<false, false, true>(r, lo, n, top, wrap, width);
+    else shf_avx2<false, false, false>(r, lo, n, top, wrap, width);
+  } else if (sgn) {
+    if (hi) shf_avx2<true, true, true>(r, lo, n, top, wrap, width);
+    else shf_avx2<true, true, false>(r, lo, n, top, wrap, width);
+  } else {
+    if (hi) shf_avx2<true, false, true>(r, lo, n, top, wrap, width);
+    else shf_avx2<true, false, false>(r, lo, n, top, wrap, width);
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) {
+    const uint64_t v = lo[l] | (static_cast<uint64_t>(top[l]) << 32);
+    const uint32_t k = wrap ? n[l] % width : std::min(n[l], width);
+    uint64_t x;
+    if (!right) x = k >= 64 ? 0 : v << k;
+    else if (sgn) x = static_cast<uint64_t>(static_cast<int64_t>(v) >> std::min(k, 63u));
+    else x = k >= 64 ? 0 : v >> k;
+    r[l] = static_cast<uint32_t>(hi ? x >> 32 : x);
+  }
+#endif
 }
 
 #if VGPU_SIMD_AVX2

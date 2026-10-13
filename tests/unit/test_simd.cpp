@@ -908,6 +908,157 @@ VTEST(fma_kernels_special_triples_and_cancellation) {
   }
 }
 
+// The wider integer kernels the SASS executor's plain-form ALU path uses (blend_m, iadd3x, imad_wide, shf), and the
+// double kernel with its destination in the same registers as its sources. The references are written out here
+// independently: 64-bit and 128-bit integer arithmetic, and the funnel-shift rule as the general path states it.
+VTEST(wide_integer_kernels_at_every_level) {
+  std::mt19937_64 rng(2026);
+  static const uint32_t edge[] = {0u, 1u, 2u, 3u, 31u, 32u, 33u, 63u, 64u, 65u, 0x7fffffffu, 0x80000000u, 0x80000001u,
+                                  0xffffffffu, 0xfffffffeu, 0xffffu, 0x10000u, 0x55555555u, 0xaaaaaaaau, 0xdeadbeefu};
+  constexpr unsigned kE = sizeof edge / sizeof edge[0];
+  const auto word = [&](int style) -> uint32_t {
+    return style == 0 ? static_cast<uint32_t>(rng()) : style == 1 ? edge[rng() % kE] : static_cast<uint32_t>(rng() % 80);
+  };
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 30000; ++round) {
+      const int style = round % 3;
+      uint32_t a[32], b[32], c[32], c2[32], d0[32], d[32];
+      for (int i = 0; i < 32; ++i) {
+        a[i] = word(style);
+        b[i] = word((style + round / 3) % 3);
+        c[i] = word(style == 2 ? 1 : style);
+        c2[i] = word((style + 1) % 3);
+        d0[i] = static_cast<uint32_t>(rng());
+      }
+      uint32_t m1 = static_cast<uint32_t>(rng()), m2 = static_cast<uint32_t>(rng());
+      if (round % 7 == 0) m1 = ~0u;
+      if (round % 11 == 0) m2 = 0;
+      if (round % 13 == 0) m1 = 0;
+      if (round % 17 == 0) m2 = ~0u;
+
+      // blend_m: the lanes of the mask from r, the others untouched; d may be what r was copied from.
+      std::memcpy(d, d0, sizeof d);
+      k.blend_m(d, a, m1);
+      for (int i = 0; i < 32; ++i)
+        if (d[i] != ((m1 >> i) & 1 ? a[i] : d0[i])) throw vtest::Failure(lv + " blend_m lane " + std::to_string(i));
+
+      // iadd3x
+      {
+        const uint32_t add = static_cast<uint32_t>(rng() % 4);
+        uint32_t r[32], g1 = 0xdeadbeef, g2 = 0xdeadbeef, w1 = 0, w2 = 0;
+        k.iadd3x(r, a, b, c, add, m1, m2, &g1, &g2);
+        for (int i = 0; i < 32; ++i) {
+          const uint64_t sum = uint64_t{a[i]} + b[i] + c[i] + add + ((m1 >> i) & 1) + ((m2 >> i) & 1);
+          w1 |= static_cast<uint32_t>(sum >> 32 >= 1) << i;
+          w2 |= static_cast<uint32_t>(sum >> 32 >= 2) << i;
+          if (r[i] != static_cast<uint32_t>(sum))
+            throw vtest::Failure(lv + " iadd3x lane " + std::to_string(i) + ": got 0x" + hex(r[i]) + " want 0x" + hex(static_cast<uint32_t>(sum)));
+        }
+        if (g1 != w1 || g2 != w2)
+          throw vtest::Failure(lv + " iadd3x carries: got 0x" + hex(g1) + "/0x" + hex(g2) + " want 0x" + hex(w1) + "/0x" + hex(w2));
+      }
+
+      // imad_wide, signed and unsigned
+      for (bool sgn : {false, true}) {
+        uint32_t rlo[32], rhi[32], carry = 0xdeadbeef, want_carry = 0;
+        k.imad_wide(rlo, rhi, a, b, c, c2, sgn, m1, &carry);
+        for (int i = 0; i < 32; ++i) {
+          const unsigned __int128 prod = sgn ? static_cast<unsigned __int128>(static_cast<__int128>(static_cast<int64_t>(static_cast<int32_t>(a[i])) * static_cast<int32_t>(b[i])) & ((static_cast<__int128>(1) << 64) - 1))
+                                             : static_cast<unsigned __int128>(uint64_t{a[i]} * b[i]);
+          const unsigned __int128 full = prod + (uint64_t{c[i]} | (uint64_t{c2[i]} << 32)) + ((m1 >> i) & 1);
+          want_carry |= static_cast<uint32_t>((full >> 64) != 0) << i;
+          const uint64_t lo64 = static_cast<uint64_t>(full);
+          if (rlo[i] != static_cast<uint32_t>(lo64) || rhi[i] != static_cast<uint32_t>(lo64 >> 32))
+            throw vtest::Failure(lv + (sgn ? " imad_wide signed" : " imad_wide unsigned") + " lane " + std::to_string(i) + ": a=0x" +
+                                 hex(a[i]) + " b=0x" + hex(b[i]) + " c=0x" + hex(c[i] | (uint64_t{c2[i]} << 32)) + " got 0x" +
+                                 hex(uint64_t{rlo[i]} | (uint64_t{rhi[i]} << 32)) + " want 0x" + hex(lo64));
+        }
+        if (carry != want_carry)
+          throw vtest::Failure(lv + " imad_wide carry out: got 0x" + hex(carry) + " want 0x" + hex(want_carry));
+      }
+
+      // shf, every form
+      for (unsigned type = 0; type < 4; ++type)
+        for (int form = 0; form < 8; ++form) {
+          const bool wrap = form & 1, right = form & 2, hi = form & 4;
+          uint32_t r[32];
+          k.shf(r, a, b, c, type, wrap, right, hi);
+          const bool is64 = type < 2, sgn = type == 0 || type == 2;
+          const uint32_t width = is64 ? 64 : 32;
+          for (int i = 0; i < 32; ++i) {
+            const uint64_t v = a[i] | (uint64_t{c[i]} << 32);
+            const uint32_t n = wrap ? b[i] % width : std::min(b[i], width);
+            uint64_t x;
+            if (!right) x = n >= 64 ? 0 : v << n;
+            else if (sgn) x = static_cast<uint64_t>(static_cast<int64_t>(v) >> std::min(n, 63u));
+            else x = n >= 64 ? 0 : v >> n;
+            const uint32_t want = static_cast<uint32_t>(hi ? x >> 32 : x);
+            if (r[i] != want)
+              throw vtest::Failure(lv + " shf type " + std::to_string(type) + (wrap ? " wrap" : " clamp") + (right ? " right" : " left") +
+                                   (hi ? " hi" : " lo") + " lane " + std::to_string(i) + ": lo=0x" + hex(a[i]) + " top=0x" + hex(c[i]) +
+                                   " n=" + std::to_string(b[i]) + " got 0x" + hex(r[i]) + " want 0x" + hex(want));
+          }
+        }
+    }
+  }
+}
+
+// dop_m with the destination registers being the sources' (the SASS executor writes a result over an operand), and a
+// register of the destination pair being the other half of an operand pair: the result of a lane depends on that
+// lane's operands alone, all read before the lane is written.
+VTEST(double_lanes_in_place_at_every_level) {
+  std::mt19937_64 rng(88);
+  static const uint64_t special[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x3ff0000000000000ull, 0xbff0000000000000ull,
+                                     0x7ff0000000000000ull, 0xfff0000000000000ull, 0x7ff8000000000000ull, 0x7ff0000000000001ull,
+                                     0x0000000000000001ull, 0x000fffffffffffffull, 0x4000000000000000ull, 0x7fefffffffffffffull};
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 20000; ++round) {
+      // A file of 8 registers of 32 lanes; operands are register pairs (r, r + 1) at start registers 0..6.
+      uint32_t file[8][32], ref[8][32];
+      for (auto& row : file)
+        for (uint32_t& v : row) v = round % 2 ? static_cast<uint32_t>(rng()) : static_cast<uint32_t>(special[rng() % 12] >> (rng() % 2 ? 32 : 0));
+      std::memcpy(ref, file, sizeof file);
+      const unsigned ra = rng() % 7, rb = rng() % 7, rc = rng() % 7, rd = rng() % 7;
+      const unsigned kind = round % 3, mods = static_cast<unsigned>(rng() & 63);
+      const uint32_t mask = round % 5 == 0 ? ~0u : static_cast<uint32_t>(rng());
+      // The reference: operands copied out first, then the kernel on separate arrays, then the pair written.
+      uint32_t lo[3][32], hi[3][32], olo[32], ohi[32];
+      for (int i = 0; i < 32; ++i) {
+        lo[0][i] = ref[ra][i]; hi[0][i] = ref[ra + 1][i];
+        lo[1][i] = ref[rb][i]; hi[1][i] = ref[rb + 1][i];
+        lo[2][i] = ref[rc][i]; hi[2][i] = ref[rc + 1][i];
+        olo[i] = ref[rd][i];
+        ohi[i] = ref[rd + 1][i];
+      }
+      // (the destination's own words are what is not overwritten; a lane of the destination pair that overlaps an
+      // operand reads the old value because the operands were copied above)
+      k.dop_m(kind, mods, olo, ohi, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], mask);
+      for (int i = 0; i < 32; ++i) {
+        ref[rd][i] = olo[i];
+        ref[rd + 1][i] = ohi[i];
+      }
+      // The same, in place in the file. (When the destination pair is a register apart from an operand pair, the
+      // halves overlap: rd == ra + 1 and so on.)
+      k.dop_m(kind, mods, file[rd], file[rd + 1], file[ra], file[ra + 1], file[rb], file[rb + 1], file[rc], file[rc + 1], mask);
+      for (int r = 0; r < 8; ++r)
+        for (int i = 0; i < 32; ++i)
+          if (file[r][i] != ref[r][i] && !(rd == r || rd + 1 == r) )
+            throw vtest::Failure(lv + " dop_m in place changed register " + std::to_string(r));
+      for (int i = 0; i < 32; ++i)
+        if (file[rd][i] != ref[rd][i] || file[rd + 1][i] != ref[rd + 1][i]) {
+          // A destination that overlaps an operand is read before it is written only when the registers are the same
+          // or the lanes independent, which they are: any difference is a fault of the kernel.
+          throw vtest::Failure(lv + " dop_m in place kind " + std::to_string(kind) + " regs a" + std::to_string(ra) + " b" +
+                               std::to_string(rb) + " c" + std::to_string(rc) + " d" + std::to_string(rd) + " lane " + std::to_string(i));
+        }
+    }
+  }
+}
+
 VTEST(level_choice) {
   VCHECK(simd::supported(simd::Level::Base));
   VCHECK(simd::supported(simd::level()));
