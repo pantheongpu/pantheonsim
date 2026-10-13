@@ -3113,6 +3113,7 @@ class Interpreter {
     const uint64_t max_steps = cfg_.max_steps;
     uint64_t n = 0;
     uint64_t by_class[static_cast<size_t>(InstClass::Count)] = {};
+    uint32_t seen = 0;   // the classes in by_class that are not zero (a batch is often a few instructions of one or two)
     while (pc < end) {
       const MicroOp& u = micro_[pc];
       if (u.kind == MicroOp::None) break;
@@ -3142,6 +3143,7 @@ class Interpreter {
       ++n;
       ++steps;
       ++by_class[static_cast<size_t>(cls)];
+      seen |= 1u << static_cast<unsigned>(cls);
       if (u.opcode_id) {
         if (u.opcode_id >= stats_.inst_by_opcode.size()) stats_.inst_by_opcode.resize(u.opcode_id + 1u, 0);
         ++stats_.inst_by_opcode[u.opcode_id];
@@ -3156,8 +3158,10 @@ class Interpreter {
       const uint64_t lanes = mask == all_ ? W_ : static_cast<uint64_t>(popcount_mask(mask));
       stats_.instructions += n;
       stats_.thread_instructions += n * lanes;
-      for (size_t c = 0; c < static_cast<size_t>(InstClass::Count); ++c)
+      for (uint32_t bits = seen; bits; bits &= bits - 1) {
+        const size_t c = static_cast<size_t>(__builtin_ctz(bits));
         stats_.inst_by_class[c] += by_class[c] * lanes;
+      }
       if (ctx.clock) *ctx.clock += n;
       w.steps = steps;
       path.pc = pc;
@@ -3262,17 +3266,27 @@ class Interpreter {
     return true;
   }
   bool micro_setp32(Warp& w, const MicroOp& u, Mask fm) {
+    if (u.flags & MicroOp::kFtz) return micro_setp32_ftz(w, u, fm);
     const uint32_t* a = micro_src(w, u, 0);
     const uint32_t* b = micro_src(w, u, 1);
-    if (u.flags & MicroOp::kFtz) {   // setp.ftz.f32: subnormal operands compare as signed zero
-      flush_lanes(ftz_a_.data(), a, 0, fm, W_);
-      flush_lanes(ftz_b_.data(), b, 0, fm, W_);
-      a = ftz_a_.data();
-      b = ftz_b_.data();
-    }
     Mask res = 0;
     if (!setp32_lanes(static_cast<CmpOp>(u.sub), u.flags & MicroOp::kFloat, u.flags & MicroOp::kSigned, a, b, fm, W_,
                       res))
+      return false;
+    w.written32[u.dst] = 1;
+    Mask& p = w.preds[u.dst];
+    p = (p & ~fm) | (res & fm);
+    return true;
+  }
+  // setp.ftz.f32: subnormal operands compare as signed zero.
+  [[gnu::noinline]] bool micro_setp32_ftz(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    flush_lanes(ftz_a_.data(), a, 0, fm, W_);
+    flush_lanes(ftz_b_.data(), b, 0, fm, W_);
+    Mask res = 0;
+    if (!setp32_lanes(static_cast<CmpOp>(u.sub), u.flags & MicroOp::kFloat, u.flags & MicroOp::kSigned, ftz_a_.data(),
+                      ftz_b_.data(), fm, W_, res))
       return false;
     w.written32[u.dst] = 1;
     Mask& p = w.preds[u.dst];
@@ -3289,26 +3303,33 @@ class Interpreter {
   }
   bool micro_fma32(Warp& w, const MicroOp& u, Mask fm) {
     if (alu_armed()) return false;
+    if ((u.flags & MicroOp::kFtz) || u.sub) return micro_fma32_ftz(w, u, fm);
     const uint32_t* a = micro_src(w, u, 0);
     const uint32_t* b = micro_src(w, u, 1);
     const uint32_t* c = micro_src(w, u, 2);
-    // A contracted sub negates the product or the addend before the .ftz flush of the operands.
-    const bool ftz = u.flags & MicroOp::kFtz;
-    if (ftz || u.sub) {
-      const uint32_t flip_a = u.sub & 1 ? 0x80000000u : 0u, flip_c = u.sub & 2 ? 0x80000000u : 0u;
-      if (ftz) {
-        flush_lanes(ftz_a_.data(), a, flip_a, fm, W_);
-        flush_lanes(ftz_b_.data(), b, 0, fm, W_);
-        flush_lanes(ftz_c_.data(), c, flip_c, fm, W_);
-      } else {
-        for_active(fm, W_, [&](uint32_t l) { ftz_a_[l] = a[l] ^ flip_a; ftz_c_[l] = c[l] ^ flip_c; });
-      }
-      a = ftz_a_.data();
-      if (ftz) b = ftz_b_.data();
-      c = ftz_c_.data();
-    }
     uint32_t* d = dst32(w, u.dst, fm);
     fma32_lanes(d, a, b, c, fm, W_);
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // The .ftz fma and the contracted sub (an fma that negates its product or its addend): the operands negated and
+  // flushed first, in that order, as the general path does, and the result flushed after.
+  [[gnu::noinline]] bool micro_fma32_ftz(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    const uint32_t* c = micro_src(w, u, 2);
+    const bool ftz = u.flags & MicroOp::kFtz;
+    const uint32_t flip_a = u.sub & 1 ? 0x80000000u : 0u, flip_c = u.sub & 2 ? 0x80000000u : 0u;
+    if (ftz) {
+      flush_lanes(ftz_a_.data(), a, flip_a, fm, W_);
+      flush_lanes(ftz_b_.data(), b, 0, fm, W_);
+      flush_lanes(ftz_c_.data(), c, flip_c, fm, W_);
+      b = ftz_b_.data();
+    } else {
+      for_active(fm, W_, [&](uint32_t l) { ftz_a_[l] = a[l] ^ flip_a; ftz_c_[l] = c[l] ^ flip_c; });
+    }
+    uint32_t* d = dst32(w, u.dst, fm);
+    fma32_lanes(d, ftz_a_.data(), b, ftz_c_.data(), fm, W_);
     if (ftz) flush_lanes(d, d, 0, fm, W_);   // (a NaN is the canonical one already, and is not touched)
     w.written32[u.dst] = 1;
     return true;
@@ -3603,18 +3624,23 @@ class Interpreter {
   }
   bool micro_float32(Warp& w, const MicroOp& u, Mask fm) {
     if (alu_armed()) return false;
+    if (u.flags & MicroOp::kFtz) return micro_float32_ftz(w, u, fm);
     const uint32_t* a = micro_src(w, u, 0);
     const uint32_t* b = micro_src(w, u, 1);
-    const bool ftz = u.flags & MicroOp::kFtz;
-    if (ftz) {   // .ftz: subnormal inputs and results to signed zero
-      flush_lanes(ftz_a_.data(), a, 0, fm, W_);
-      flush_lanes(ftz_b_.data(), b, 0, fm, W_);
-      a = ftz_a_.data();
-      b = ftz_b_.data();
-    }
     uint32_t* d = dst32(w, u.dst, fm);
     float_bin32_lanes(static_cast<FloatBinOp>(u.sub), d, a, b, fm, W_);
-    if (ftz) flush_lanes(d, d, 0, fm, W_);
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // The .ftz forms: subnormal inputs and results to signed zero.
+  [[gnu::noinline]] bool micro_float32_ftz(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    flush_lanes(ftz_a_.data(), a, 0, fm, W_);
+    flush_lanes(ftz_b_.data(), b, 0, fm, W_);
+    uint32_t* d = dst32(w, u.dst, fm);
+    float_bin32_lanes(static_cast<FloatBinOp>(u.sub), d, ftz_a_.data(), ftz_b_.data(), fm, W_);
+    flush_lanes(d, d, 0, fm, W_);
     w.written32[u.dst] = 1;
     return true;
   }
