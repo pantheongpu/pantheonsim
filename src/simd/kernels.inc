@@ -761,6 +761,43 @@ void shf_k(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* t
 #endif
 }
 
+// One-operand lane ops of the SASS executor, 32 lanes: kind 0 POPC, 1 BREV (the bits reversed), 2 + (sgn ? 1 : 0) + (sh ? 2 : 0)
+// FLO (the index of the highest set bit, of the complement of a negative value if `sgn`; all ones for none; counted
+// from the other end, 31 - index, if `sh`).
+void lane_unary_k(unsigned kind, uint32_t* r, const uint32_t* a) {
+  if (kind == 0) {
+    for (unsigned i = 0; i < 32; i += 8) {
+      V8u x;
+      std::memcpy(&x, a + i, sizeof x);
+      x = x - ((x >> 1) & 0x55555555u);
+      x = (x & 0x33333333u) + ((x >> 2) & 0x33333333u);
+      x = (x + (x >> 4)) & 0x0f0f0f0fu;
+      x = (x * 0x01010101u) >> 24;
+      std::memcpy(r + i, &x, sizeof x);
+    }
+  } else if (kind == 1) {
+    for (unsigned i = 0; i < 32; i += 8) {
+      V8u x;
+      std::memcpy(&x, a + i, sizeof x);
+      x = ((x >> 1) & 0x55555555u) | ((x & 0x55555555u) << 1);
+      x = ((x >> 2) & 0x33333333u) | ((x & 0x33333333u) << 2);
+      x = ((x >> 4) & 0x0f0f0f0fu) | ((x & 0x0f0f0f0fu) << 4);
+      x = ((x >> 8) & 0x00ff00ffu) | ((x & 0x00ff00ffu) << 8);
+      x = (x >> 16) | (x << 16);
+      std::memcpy(r + i, &x, sizeof x);
+    }
+  } else {
+    const bool sgn = ((kind - 2) & 1) != 0, sh = ((kind - 2) & 2) != 0;
+    for (unsigned l = 0; l < 32; ++l) {
+      uint32_t v = a[l];
+      if (sgn && (v >> 31)) v = ~v;
+      uint32_t res = v ? 31u - static_cast<uint32_t>(__builtin_clz(v)) : ~0u;
+      if (sh && res != ~0u) res = 31u - res;
+      r[l] = res;
+    }
+  }
+}
+
 #if VGPU_SIMD_AVX2
 // Four doubles to four binary16 (in the low 64 bits): to nearest even in one rounding, a NaN the canonical 0x7fff.
 // The integer form of f64_to_f16_bits (simd/fp16.hpp), whose comments say why each constant is what it is.

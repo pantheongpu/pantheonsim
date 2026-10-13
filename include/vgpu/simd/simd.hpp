@@ -128,6 +128,10 @@ struct Kernels {
                     const uint32_t* chi, bool sgn, uint32_t cin, uint32_t* carry_out);
   void (*shf)(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* top, unsigned type, bool wrap,
               bool right, bool hi);
+  //  lane_unary: r[l] from a[l], by `kind`: 0 the number of set bits, 1 the bits in reverse order, 2 + (sgn ? 1 : 0) +
+  //    (sh ? 2 : 0) SASS's FLO: the index of the highest set bit (of the complement for a negative value if `sgn`; all
+  //    ones if there is none), or if `sh` that index counted from bit 31 (31 - index; all ones stays).
+  void (*lane_unary)(unsigned kind, uint32_t* r, const uint32_t* a);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the

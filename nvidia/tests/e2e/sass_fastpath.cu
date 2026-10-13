@@ -9,6 +9,7 @@
 // off a sector boundary), shared-memory loads and stores of 1 to 16 bytes with
 // conflicts and broadcasts, FFMA over special values (zeros, subnormals,
 // infinities, NaNs), 64-bit arithmetic and POPC.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -79,6 +80,97 @@ __global__ void wide_math(const uint64_t* in, uint64_t* out, double* dout, int n
   double d = __longlong_as_double((long long)(x & 0x7fefffffffffffffull));
   // DFMA with a constant and a negated operand, DMUL by a constant, DADD with |x| and a constant.
   dout[i] = fma(d, 1.0000001, -d * 0.5) + fabs(d) * 0.25 - (d + 1.5) + __longlong_as_double((long long)(x >> 3));
+}
+
+
+// The wider forms of the 32-lane integer path: 64-bit adds with carries (IADD3.X), 64-bit compares (ISETP.EX), widening
+// multiplies (IMAD.WIDE), funnel and 64-bit shifts (SHF), and boolean expressions of predicates (PLOP3). Lanes take
+// different paths on `sel`, so the forms run with part of the warp active as well as with all of it.
+struct WideIn { uint64_t a, b, c; uint32_t x, y, n; int32_t sx, sy; };
+struct WideOut {
+  uint64_t add3, sub, mulw, mulws, madw, mulc, fl, fr, flc, frc, shl, shr, sar;
+  uint32_t flags;
+};
+__global__ void wide_forms(const WideIn* in, WideOut* out, int count, const uint64_t* base, uint32_t mod) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const WideIn v = in[i];
+  WideOut o = {};
+  o.add3 = v.a + v.b + v.c;
+  o.sub = v.a - v.b;
+  // IMAD.WIDE with an addend in a register pair, with a constant one, and the product alone.
+  o.mulw = static_cast<uint64_t>(v.x) * v.y + v.c;
+  o.mulws = static_cast<uint64_t>(static_cast<int64_t>(v.sx) * v.sy) + v.a;
+  o.madw = static_cast<uint64_t>(v.x) * 0x9E3779B1u + 0x123456789abcdefull;
+  o.mulc = base[i % 4] + static_cast<uint64_t>(v.y % mod) * 8;
+  o.fl = __funnelshift_l(v.x, v.y, v.n);
+  o.fr = __funnelshift_r(v.x, v.y, v.n);
+  o.flc = __funnelshift_lc(v.x, v.y, v.n);
+  o.frc = __funnelshift_rc(v.x, v.y, v.n);
+  // PTX's own shifts: a count of 64 or more gives zero (shl, shr.u64) or the sign (shr.s64).
+  asm("shl.b64 %0, %1, %2;" : "=l"(o.shl) : "l"(v.a), "r"(v.n));
+  asm("shr.u64 %0, %1, %2;" : "=l"(o.shr) : "l"(v.a), "r"(v.n));
+  asm("shr.s64 %0, %1, %2;" : "=l"(o.sar) : "l"(v.a), "r"(v.n));
+  uint32_t f = 0;
+  f |= (v.a < v.b) << 0;
+  f |= (v.a <= v.b) << 1;
+  f |= (v.a == v.b) << 2;
+  f |= (v.a != v.b) << 3;
+  f |= (static_cast<int64_t>(v.a) < static_cast<int64_t>(v.b)) << 4;
+  f |= (static_cast<int64_t>(v.a) >= static_cast<int64_t>(v.b)) << 5;
+  f |= (v.a > v.b) << 6;
+  f |= (static_cast<int64_t>(v.a) > static_cast<int64_t>(v.c)) << 7;
+  // Predicates combined: ptxas turns these into PLOP3 with different tables.
+  const bool p = v.x < v.y, q = v.sx > v.sy, r = (v.n & 1) != 0, t = v.c > v.a;
+  f |= ((p && q) || (r && !t)) << 8;
+  f |= ((p ^ q) && (r || t)) << 9;
+  f |= (!(p || q) && (r ^ t)) << 10;
+  f |= ((p || q || r) && !(t && p)) << 11;
+  o.flags = f;
+  out[i] = o;
+}
+
+
+// POPC, BREV, FLO, SEL, IMAD.HI, and the warp-wide SHFL and VOTE, with lanes on different paths of a guard (the shuffles and
+// votes name the lanes that are active). The first nine results are checked against the host; the others are compared
+// between the two paths (and with the general path's counters) by the script.
+constexpr int kLaneOps = 24;
+__global__ void lane_ops(const uint32_t* in, uint32_t* out, int count, int shape) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const uint32_t x = in[i], y = in[(i + 1) % count];
+  const int32_t sx = static_cast<int32_t>(x), sy = static_cast<int32_t>(y);
+  uint32_t o[kLaneOps] = {};
+  o[0] = __popc(x);
+  o[1] = __popc(~x);
+  o[2] = __brev(x);
+  o[3] = __clz(x);
+  o[4] = __clz(sx);                       // FLO.SH on a signed value
+  o[5] = (x & 8) ? y : x;                 // SEL
+  o[6] = __umulhi(x, y);                  // IMAD.HI.U32
+  o[7] = static_cast<uint32_t>(__mulhi(sx, sy));
+  o[8] = x / 1000003u + static_cast<uint32_t>(sy / 7);
+  // The lanes that get here are some of the warp's: a guard on the data.
+  const bool take = shape == 0 ? true : shape == 1 ? (x & 3) != 0 : shape == 2 ? (i & 1) == 0 : (x >> 7 & 7) != 5;
+  if (take) {
+    const unsigned m = __activemask();
+    o[9] = __shfl_sync(m, x, (y >> 3) & 31);
+    o[10] = __shfl_down_sync(m, x, y & 7);
+    o[11] = __shfl_up_sync(m, x, (y >> 5) & 7);
+    o[12] = __shfl_xor_sync(m, x, (y >> 9) & 31);
+    o[13] = __shfl_sync(m, x, (y >> 3) & 31, 8);
+    o[14] = __shfl_down_sync(m, x, y & 3, 16);
+    o[15] = __shfl_xor_sync(m, x, 5, 4);
+    o[16] = __ballot_sync(m, x & 1);
+    o[17] = __any_sync(m, (x & 6) == 6);
+    o[18] = __all_sync(m, (x & 1) != 0 || (y & 1) != 0);
+    o[19] = m;
+    o[20] = __match_any_sync(m, x & 7);
+    o[21] = __popc(__ballot_sync(m, sx < 0));
+    o[22] = __shfl_sync(m, y, 3);              // a constant lane
+    o[23] = __shfl_sync(m, x, i & 31, 32);
+  }
+  for (int k = 0; k < kLaneOps; ++k) out[static_cast<size_t>(i) * kLaneOps + k] = o[k];
 }
 
 template <class T>
@@ -239,6 +331,130 @@ int main() {
     for (int i = 0; i < n; ++i) { uint64_t g; std::memcpy(&g, &gd[i], 8); hh = (hh ^ g) * 1099511628211ull; }
     std::printf("wide_math double bits %016llx\n", static_cast<unsigned long long>(hh));
     CK(cudaFree(d)); CK(cudaFree(o)); CK(cudaFree(od));
+  }
+
+  {
+    // wide_forms over edge and random values, with lanes taking different paths of a guard (the count is not a
+    // multiple of 32, and the grid has partial warps).
+    const uint64_t edge[] = {0ull, 1ull, 0x7fffffffull, 0x80000000ull, 0xffffffffull, 0x100000000ull, 0x7fffffffffffffffull,
+                             0x8000000000000000ull, 0xffffffffffffffffull, 0xfffffffffffffffeull, 0x00000000ffff0000ull,
+                             0xffff000000000000ull, 0x0000ffffffff0000ull, 0x5555555555555555ull, 0xaaaaaaaaaaaaaaaaull};
+    const int ne = sizeof edge / sizeof edge[0];
+    const int n = 1000 + 7;
+    std::vector<WideIn> h(n);
+    uint64_t s = 0x9E3779B97F4A7C15ull;
+    const auto next = [&] { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+    for (int i = 0; i < n; ++i) {
+      WideIn w;
+      const int style = i % 3;
+      w.a = style == 0 ? next() : edge[next() % ne];
+      w.b = style == 1 ? next() : edge[next() % ne];
+      w.c = i % 4 == 0 ? w.a : style == 2 ? next() : edge[next() % ne];
+      if (i % 5 == 0) w.b = w.a;               // equal operands: the low words decide
+      if (i % 7 == 0) w.b = w.a ^ 0xffffffffull;   // equal high words
+      if (i % 11 == 0) w.b = w.a + (1ull << 32);
+      w.x = static_cast<uint32_t>(style == 0 ? next() : edge[next() % ne]);
+      w.y = static_cast<uint32_t>(style == 1 ? next() : edge[next() % ne]);
+      w.n = static_cast<uint32_t>(i % 6 == 0 ? next() : next() % 140);
+      w.sx = static_cast<int32_t>(w.x);
+      w.sy = static_cast<int32_t>(w.y);
+      h[i] = w;
+    }
+    WideIn* din; WideOut* dout; uint64_t* dbase;
+    CK(cudaMalloc(&din, n * sizeof(WideIn)));
+    CK(cudaMalloc(&dout, n * sizeof(WideOut)));
+    CK(cudaMalloc(&dbase, 4 * 8));
+    const uint64_t base[4] = {0x1000ull, 0xffffffffffff0000ull, 0x7fffffff00000000ull, 0xfffffffffffffff8ull};
+    CK(cudaMemcpy(din, h.data(), n * sizeof(WideIn), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dbase, base, sizeof base, cudaMemcpyHostToDevice));
+    for (int mod : {1000, 3}) {
+      CK(cudaMemset(dout, 0, n * sizeof(WideOut)));
+      wide_forms<<<(n + 63) / 64, 64>>>(din, dout, n, dbase, mod);
+      CK(cudaDeviceSynchronize());
+      std::vector<WideOut> got(n);
+      CK(cudaMemcpy(got.data(), dout, n * sizeof(WideOut), cudaMemcpyDeviceToHost));
+      int bad = 0;
+      uint64_t hh = 1469598103934665603ull;
+      for (int i = 0; i < n; ++i) {
+        const WideIn& v = h[i];
+        WideOut w = {};
+        w.add3 = v.a + v.b + v.c;
+        w.sub = v.a - v.b;
+        w.mulw = static_cast<uint64_t>(v.x) * v.y + v.c;
+        w.mulws = static_cast<uint64_t>(static_cast<int64_t>(v.sx) * v.sy) + v.a;
+        w.madw = static_cast<uint64_t>(v.x) * 0x9E3779B1u + 0x123456789abcdefull;
+        w.mulc = base[i % 4] + static_cast<uint64_t>(v.y % mod) * 8;
+        const uint64_t cat = (static_cast<uint64_t>(v.y) << 32) | v.x;   // __funnelshift_*(lo = x, hi = y, n) work on hi:lo
+        const uint32_t nl = v.n & 31, nlc = std::min<uint32_t>(v.n, 32);
+        w.fl = static_cast<uint32_t>((cat << nl) >> 32);
+        w.fr = static_cast<uint32_t>(cat >> nl);
+        w.flc = static_cast<uint32_t>((cat << nlc) >> 32);
+        w.frc = static_cast<uint32_t>(cat >> nlc);
+        w.shl = v.n >= 64 ? 0 : v.a << v.n;
+        w.shr = v.n >= 64 ? 0 : v.a >> v.n;
+        w.sar = static_cast<uint64_t>(static_cast<int64_t>(v.a) >> std::min<uint32_t>(v.n, 63));
+        uint32_t f = 0;
+        const int64_t sa = static_cast<int64_t>(v.a), sb = static_cast<int64_t>(v.b), sc = static_cast<int64_t>(v.c);
+        f |= (v.a < v.b) << 0; f |= (v.a <= v.b) << 1; f |= (v.a == v.b) << 2; f |= (v.a != v.b) << 3;
+        f |= (sa < sb) << 4; f |= (sa >= sb) << 5; f |= (v.a > v.b) << 6; f |= (sa > sc) << 7;
+        const bool p = v.x < v.y, q = v.sx > v.sy, r = (v.n & 1) != 0, t = v.c > v.a;
+        f |= ((p && q) || (r && !t)) << 8; f |= ((p ^ q) && (r || t)) << 9;
+        f |= (!(p || q) && (r ^ t)) << 10; f |= ((p || q || r) && !(t && p)) << 11;
+        w.flags = f;
+        if (std::memcmp(&w, &got[i], sizeof w) != 0) ++bad;
+        const uint64_t* words = reinterpret_cast<const uint64_t*>(&got[i]);
+        for (size_t k = 0; k < 13; ++k) hh = (hh ^ words[k]) * 1099511628211ull;
+        hh = (hh ^ got[i].flags) * 1099511628211ull;
+      }
+      if (bad) { std::printf("WRONG wide_forms mod=%d %d of %d\n", mod, bad, n); ++wrong; }
+      std::printf("wide_forms mod=%d bits %016llx\n", mod, static_cast<unsigned long long>(hh));
+    }
+    CK(cudaFree(din)); CK(cudaFree(dout)); CK(cudaFree(dbase));
+  }
+
+  {
+    const int n = 32 * 9 + 5;
+    std::vector<uint32_t> h(n);
+    uint64_t s = 0x2545F4914F6CDD1Dull;
+    const uint32_t edge[] = {0u, 1u, 0x7fffffffu, 0x80000000u, 0xffffffffu, 0x80000001u, 0x40000000u, 0xfffffffeu, 0x00010000u, 0xaaaaaaaau};
+    for (int i = 0; i < n; ++i) {
+      s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+      h[i] = i % 3 == 0 ? edge[s % 10] : i % 3 == 1 ? static_cast<uint32_t>(s) : static_cast<uint32_t>(s) >> (s >> 40 & 31);
+    }
+    uint32_t *din, *dout;
+    CK(cudaMalloc(&din, n * 4));
+    CK(cudaMalloc(&dout, static_cast<size_t>(n) * kLaneOps * 4));
+    CK(cudaMemcpy(din, h.data(), n * 4, cudaMemcpyHostToDevice));
+    for (int shape = 0; shape < 4; ++shape) {
+      CK(cudaMemset(dout, 0, static_cast<size_t>(n) * kLaneOps * 4));
+      lane_ops<<<(n + 63) / 64, 64>>>(din, dout, n, shape);
+      CK(cudaDeviceSynchronize());
+      std::vector<uint32_t> got(static_cast<size_t>(n) * kLaneOps);
+      CK(cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost));
+      int bad = 0;
+      uint64_t hh = 1469598103934665603ull;
+      for (int i = 0; i < n; ++i) {
+        const uint32_t x = h[i], y = h[(i + 1) % n];
+        const int32_t sx = static_cast<int32_t>(x), sy = static_cast<int32_t>(y);
+        uint32_t want[9];
+        want[0] = __builtin_popcount(x);
+        want[1] = __builtin_popcount(~x);
+        want[2] = 0;
+        for (int b = 0; b < 32; ++b) want[2] |= ((x >> b) & 1u) << (31 - b);
+        want[3] = x ? __builtin_clz(x) : 32;
+        want[4] = x ? __builtin_clz(x) : 32;
+        want[5] = (x & 8) ? y : x;
+        want[6] = static_cast<uint32_t>((static_cast<uint64_t>(x) * y) >> 32);
+        want[7] = static_cast<uint32_t>((static_cast<int64_t>(sx) * sy) >> 32);
+        want[8] = x / 1000003u + static_cast<uint32_t>(sy / 7);
+        for (int k = 0; k < 9; ++k)
+          if (got[static_cast<size_t>(i) * kLaneOps + k] != want[k]) ++bad;
+        for (int k = 0; k < kLaneOps; ++k) hh = (hh ^ got[static_cast<size_t>(i) * kLaneOps + k]) * 1099511628211ull;
+      }
+      if (bad) { std::printf("WRONG lane_ops shape=%d %d\n", shape, bad); ++wrong; }
+      std::printf("lane_ops shape=%d bits %016llx\n", shape, static_cast<unsigned long long>(hh));
+    }
+    CK(cudaFree(din)); CK(cudaFree(dout));
   }
   std::printf("wrong: %d\n", wrong);
   return wrong != 0;

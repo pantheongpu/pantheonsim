@@ -997,7 +997,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     case Op::IADD3: case Op::IMAD: case Op::LOP3: case Op::MOV: case Op::ISETP: case Op::FSETP:
     case Op::FSEL: case Op::FFMA: case Op::FADD: case Op::FMUL: case Op::LEA: case Op::SHF:
     case Op::DADD: case Op::DMUL: case Op::DFMA: break;
-    case Op::PLOP3: return fast_wide(w, ins, ex);
+    case Op::PLOP3: case Op::SEL: case Op::POPC: case Op::BREV: case Op::FLO: return fast_wide(w, ins, ex);
     default: return false;
   }
   if (ins.dst.empty()) return false;
@@ -1208,8 +1208,8 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     }
     case Op::IMAD: {
       const unsigned kind = ins.f[0];
-      if (kind == 0x25) return fast_wide(w, ins, ex);   // IMAD.WIDE
-      if (kind == 0x27 || ins.f[2] || ins.dst.size() > 1 || ins.src.size() < 3) return false;
+      if (kind == 0x25 || kind == 0x27) return fast_wide(w, ins, ex);   // IMAD.WIDE, IMAD.HI
+      if (ins.f[2] || ins.dst.size() > 1 || ins.src.size() < 3) return false;
       // IMAD.MOV (RZ * RZ + c) and the like: a zero factor leaves the addend.
       const auto zero = [](const Operand& o) {
         return !o.bnot && ((o.kind == Kind::Reg && o.reg == kRZ) || (o.kind == Kind::Imm && o.imm == 0));
@@ -1392,19 +1392,49 @@ bool Runner::fast_wide(Warp& w, const Instr& ins, Mask ex) {
     if (ex == kAll) std::memcpy(d, v, 32 * sizeof(uint32_t));
     else sk->blend_m(d, v, ex);
   };
-  // A source as 32 lanes: the register's own, or its value -- the modifiers applied as ival applies them -- for every lane.
+  // A source as 32 lanes: the register's own, or its value for every lane -- with the modifiers applied as ival applies them
+  // (negated, then complemented) if `mods`, else as read32 gives it.
   alignas(32) uint32_t buf[3][32];
-  const auto lanes = [&](unsigned i, const Operand& o) -> const uint32_t* {
-    if (o.kind == Kind::Reg && o.reg != kRZ && !o.neg && !o.bnot) return &w.reg(o.reg, 0);
+  const auto lanes = [&](unsigned i, const Operand& o, bool mods = true) -> const uint32_t* {
+    const bool reg = o.kind == Kind::Reg && o.reg != kRZ;
+    const bool neg = mods && o.neg, bnot = mods && o.bnot;
+    if (reg && !neg && !bnot) return &w.reg(o.reg, 0);
+    const uint32_t* row = reg ? &w.reg(o.reg, 0) : nullptr;
+    const uint32_t one = reg || o.kind == Kind::Reg ? 0u : read32(w, o, 0);   // (RZ is zero, the rest the same for every lane)
+    const uint32_t negm = neg ? ~0u : 0u, notm = bnot ? ~0u : 0u;
+    uint32_t* const out = buf[i];
     for (unsigned l = 0; l < 32; ++l) {
-      uint32_t v = o.kind == Kind::Reg ? (o.reg == kRZ ? 0u : w.reg(o.reg, l)) : read32(w, o, 0);
-      if (o.neg) v = 0u - v;
-      if (o.bnot) v = ~v;
-      buf[i][l] = v;
+      const uint32_t v = row ? row[l] : one;
+      out[l] = (((0u - v) & negm) | (v & ~negm)) ^ notm;   // -v where negated
     }
-    return buf[i];
+    return out;
   };
   switch (ins.op) {
+    case Op::SEL: {   // a where the predicate holds, else b (the 32-bit form)
+      if (!sk || ins.f[0] || ins.dst[0].kind != Kind::Reg || ins.src.size() < 3 || !plain(ins.src[0]) || !plain(ins.src[1]) ||
+          !is_pred(ins.src[2]))
+        return false;
+      const uint32_t* a = lanes(0, ins.src[0], false);
+      const uint32_t* b = lanes(1, ins.src[1], false);
+      alignas(32) uint32_t r[32];
+      std::memcpy(r, b, sizeof r);
+      sk->blend_m(r, a, pmask(ins.src[2]));
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::POPC: case Op::BREV: case Op::FLO: {
+      // The population count, the bit reversal, the index of the highest set bit: POPC and FLO take their operand as ival
+      // gives it (negated or complemented), BREV as it is.
+      const Operand& d = ins.dst.back();
+      if (!sk || ins.src.empty() || !plain(ins.src[0]) || d.kind != Kind::Reg || (ins.op != Op::FLO && ins.dst.size() != 1))
+        return false;
+      const unsigned kind = ins.op == Op::POPC ? 0 : ins.op == Op::BREV ? 1 : 2 + (ins.f[0] ? 1u : 0u) + (ins.f[1] ? 2u : 0u);
+      const uint32_t* a = lanes(0, ins.src[0], ins.op != Op::BREV);
+      alignas(32) uint32_t r[32];
+      sk->lane_unary(kind, r, a);
+      if (d.reg != kRZ) store_row(d.reg, r);
+      return true;
+    }
     case Op::PLOP3: {
       // Two predicates from a truth table over three: the lanes as bit masks, one minterm of the table at a time. Both
       // answers are worked out before either is written (a destination may be a source).
@@ -1489,17 +1519,20 @@ bool Runner::fast_wide(Warp& w, const Instr& ins, Mask ex) {
       return true;
     }
     case Op::IMAD: {
-      // IMAD.WIDE[.X]: a 64-bit register pair = a * b + a 64-bit addend (+ a carry in), the carry out of the 64-bit sum in
-      // dst[1]. Taken here for an addend that is a register pair as it is, or the same for every lane.
+      // IMAD.WIDE[.X] (0x25): a 64-bit register pair = a * b + a 64-bit addend (+ a carry in), the carry out of the 64-bit sum
+      // in dst[1]. IMAD.HI[.X] (0x27): the same sum, only its high word is written. Taken here for an addend that is a
+      // register pair as it is, or the same for every lane.
+      const unsigned kind = ins.f[0];
       const bool sgn = ins.f[1], x = ins.f[2];
-      if (!sk || ins.f[0] != 0x25 || ins.dst.size() > 2 || ins.dst[0].kind != Kind::Reg || ins.src.size() < (x ? 4u : 3u))
+      if (!sk || (kind != 0x25 && kind != 0x27) || ins.dst.size() > 2 || ins.dst[0].kind != Kind::Reg ||
+          ins.src.size() < (x ? 4u : 3u))
         return false;
       if (ins.dst.size() == 2 && ins.dst[1].kind != Kind::Pred) return false;
       if (x && !is_pred(ins.src[3])) return false;
       for (int i = 0; i < 3; ++i)
         if (!plain(ins.src[i])) return false;
       const Operand& co = ins.src[2];
-      if (co.kind == Kind::Reg && co.reg != kRZ && (co.neg || co.bnot)) return false;
+      if (co.kind == Kind::Reg && co.reg != kRZ && (co.neg || (kind == 0x25 && co.bnot))) return false;
       const uint32_t* s[2] = {lanes(0, ins.src[0]), lanes(1, ins.src[1])};
       alignas(32) uint32_t clo_b[32], chi_b[32];
       const uint32_t *clo, *chi;
@@ -1507,9 +1540,20 @@ bool Runner::fast_wide(Warp& w, const Instr& ins, Mask ex) {
         clo = &w.reg(co.reg, 0);
         chi = &w.reg(co.reg + 1, 0);
       } else {
-        uint64_t c = read64(w, co, 0);   // the same for every lane
-        if (co.neg) c = 0 - c;
-        if (co.bnot) c = ~c;
+        uint64_t c;   // the same for every lane
+        if (kind == 0x25) {
+          c = read64(w, co, 0);
+          if (co.neg) c = 0 - c;
+          if (co.bnot) c = ~c;
+        } else if (co.kind == Kind::Reg || co.kind == Kind::UReg) {
+          c = read64(w, co, 0);
+          if (co.neg) c = 0 - c;
+        } else {   // a 32-bit addend, extended to 64 bits as the product is
+          uint32_t v = read32(w, co, 0);
+          if (co.neg) v = 0u - v;
+          if (co.bnot) v = ~v;
+          c = sgn ? static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(v))) : v;
+        }
         for (unsigned l = 0; l < 32; ++l) {
           clo_b[l] = static_cast<uint32_t>(c);
           chi_b[l] = static_cast<uint32_t>(c >> 32);
@@ -1521,7 +1565,9 @@ bool Runner::fast_wide(Warp& w, const Instr& ins, Mask ex) {
       uint32_t carry;
       sk->imad_wide(rlo, rhi, s[0], s[1], clo, chi, sgn, x ? static_cast<uint32_t>(pmask(ins.src[3])) : 0u, &carry);
       const Operand& d = ins.dst[0];
-      if (d.reg != kRZ) {
+      if (kind == 0x27) {
+        if (d.reg != kRZ) store_row(d.reg, rhi);
+      } else if (d.reg != kRZ) {
         store_row(d.reg, rlo);
         if (d.reg + 1 != kRZ) store_row(d.reg + 1, rhi);   // (R254's partner is RZ)
       }
@@ -2140,6 +2186,33 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     }
     return v + static_cast<uint64_t>(a.imm);
   };
+  // The same addresses for all the lanes of `lanes` at once, the instruction's fields decoded once: base + each lane's register
+  // (a pair if `wide`). For the forms of sm_80 and later; Turing's global forms (above) take `address`.
+  const auto row_addresses = [&](const Operand& a, bool wide, bool with_ur, unsigned ur_pos, Mask lanes, uint64_t* out) {
+    const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
+    uint64_t base = static_cast<uint64_t>(a.imm);
+    if (with_ur) {
+      const unsigned u = static_cast<unsigned>(ins.w.field(ur_pos, m_.sm >= 100 ? 8 : 6));
+      if (u != (m_.sm >= 100 ? 255u : 63u)) base += w.ur[u];
+    }
+    if (ra == kRZ) {
+      for (Mask m = lanes; m; m &= m - 1) out[std::countr_zero(m)] = base;
+      return;
+    }
+    const uint32_t* lo = &w.reg(ra, 0);
+    if (wide) {
+      const uint32_t* hi = &w.reg(ra + 1, 0);
+      for (Mask m = lanes; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+        out[l] = (lo[l] | (static_cast<uint64_t>(hi[l]) << 32)) + base;
+      }
+    } else {
+      for (Mask m = lanes; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+        out[l] = lo[l] + base;
+      }
+    }
+  };
   switch (ins.op) {
     case Op::LDG: case Op::LD: case Op::STG: case Op::ST: {
       const bool store = ins.op == Op::STG || ins.op == Op::ST;
@@ -2199,6 +2272,58 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           }
           if (done) {
             for (unsigned i = 0; i < count; ++i) addrs[first + i] = g0 + uint64_t{i} * bytes;
+            count_access(blk.st, 0, store, addrs, ex, bytes);
+            return;
+          }
+        }
+      }
+      // A scattered access (a gather, a scatter) of 1 to 8 bytes in plain global memory: the lanes' accesses are made
+      // together by MemoryManager::load_batch / store_batch, which do what load_scalar / store_scalar would lane by lane,
+      // in this order, or decline (return false, having done nothing) whenever the two could differ -- a fault armed, a
+      // host mapping in range, a misaligned access, an address outside the allocation the first is in; the loop below
+      // then makes them one at a time and meets any error where it always did.
+      if (fast_ && !generic && m_.sm >= 80 && (bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8) && ex) {
+        uint64_t ga[32], dense[32], vals[32];
+        row_addresses(a, wide, ur, store ? 64 : 32, ex, ga);
+        unsigned count = 0;
+        bool plain_global = true;   // (no lane in the constant window, which the loop below reads through its bank)
+        for (Mask m = ex; m; m &= m - 1) {
+          const uint64_t g = ga[std::countr_zero(m)];
+          plain_global = plain_global && !(g >= kConstWindow && g < kConstWindow + (uint64_t{1} << 32));
+          dense[count++] = g;
+        }
+        if (plain_global) {
+          bool done;
+          if (store) {
+            const Operand& d = ins.src[1];
+            unsigned i = 0;
+            for (Mask m = ex; m; m &= m - 1, ++i) {
+              const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+              if (bytes <= 4) {
+                vals[i] = read32(w, d, l) & (bytes == 4 ? 0xffffffffu : (1u << (8 * bytes)) - 1);
+              } else {
+                vals[i] = d.reg == kRZ ? 0 : (w.reg(d.reg, l) | (static_cast<uint64_t>(w.reg(d.reg + 1, l)) << 32));
+              }
+            }
+            done = mem_.store_batch(dense, count, bytes, vals);
+          } else {
+            done = mem_.load_batch(dense, count, bytes, vals);
+            if (done) {
+              const Operand& d = ins.dst[0];
+              unsigned i = 0;
+              for (Mask m = ex; m; m &= m - 1, ++i) {
+                const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                if (bytes <= 4) {
+                  write32(w, d, l, extend(static_cast<uint32_t>(vals[i])));
+                } else if (d.reg != kRZ) {
+                  w.reg(d.reg, l) = static_cast<uint32_t>(vals[i]);
+                  w.reg(d.reg + 1, l) = static_cast<uint32_t>(vals[i] >> 32);
+                }
+              }
+            }
+          }
+          if (done) {
+            for (Mask m = ex; m; m &= m - 1) addrs[std::countr_zero(m)] = ga[std::countr_zero(m)];
             count_access(blk.st, 0, store, addrs, ex, bytes);
             return;
           }
@@ -2290,6 +2415,40 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             });
           }
           count_access(blk.st, 1, store, addrs, ex, bytes);
+          return;
+        }
+      }
+      if (!shared && fast_ && m_.sm >= 80 && ex && bytes <= 16) {
+        // Local memory, when every active lane's access is inside its own window: the bytes move between the register file and
+        // the window directly. (The window is made on first use, as mem_read / mem_write make it. If any lane is outside it
+        // the loop below runs and finds the one that faults, as it always did.)
+        uint64_t la[32];
+        row_addresses(a, false, ur, store ? 64 : 32, ex, la);
+        bool inside = true;
+        for (Mask m = ex; m; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+          const uint64_t off = static_cast<uint32_t>(la[l]);
+          addrs[l] = off;
+          inside = inside && off + bytes <= w.local_size;
+        }
+        if (inside) {
+          if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
+          const Operand& d = store ? ins.src[1] : ins.dst[0];
+          for (Mask m = ex; m; m &= m - 1) {
+            const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+            uint8_t* const at = &w.local[size_t{l} * w.local_size + addrs[l]];
+            uint32_t v[4] = {};
+            if (store) {
+              for (unsigned i = 0; i < std::max(1u, bytes / 4); ++i) v[i] = d.reg == kRZ ? 0 : w.reg(d.reg + i, l);
+              std::memcpy(at, v, bytes);
+            } else {
+              std::memcpy(v, at, bytes);
+              if (bytes <= 4) write32(w, d, l, extend(v[0]));
+              else if (d.reg != kRZ)
+                for (unsigned i = 0; i < bytes / 4; ++i) w.reg(d.reg + i, l) = v[i];
+            }
+          }
+          count_access(blk.st, 2, store, addrs, ex, bytes);
           return;
         }
       }
@@ -2603,6 +2762,51 @@ void Runner::exec_warp(Block&, Warp& w, const Instr& ins, Mask ex, Mask) {
       // dst[0] the in-range predicate, dst[1] the value; src: value, lane, c
       // (c = clamp in bits 0-4, segment mask in 8-12), as PTX's shfl.
       uint32_t vals[32];
+      if (fast_ && ins.dst.size() == 2 && ins.dst[0].kind == Kind::Pred && ins.dst[1].kind == Kind::Reg && ins.src.size() >= 3) {
+        // The three sources as 32 lanes each (a register's own, or the one value every lane has), and the answers worked
+        // out for all 32 lanes, then written for the active ones: no operand is read through read32 per lane.
+        bool simple = true;
+        for (int i = 0; i < 3; ++i) {
+          const Kind k = ins.src[i].kind;
+          simple = simple && (k == Kind::Reg || k == Kind::Imm || k == Kind::FImm || k == Kind::UReg || k == Kind::CBank);
+        }
+        if (simple) {
+          uint32_t tmp[3][32];
+          const auto row = [&](unsigned i) -> const uint32_t* {
+            const Operand& o = ins.src[i];
+            if (o.kind == Kind::Reg && o.reg != kRZ) return &w.reg(o.reg, 0);
+            const uint32_t v = o.kind == Kind::Reg ? 0u : read32(w, o, 0);
+            for (unsigned l = 0; l < 32; ++l) tmp[i][l] = v;
+            return tmp[i];
+          };
+          const uint32_t *vp = row(0), *bp = row(1), *cp = row(2);
+          const unsigned mode = ins.f[0];
+          uint32_t out[32];
+          Mask in_range = 0;
+          for (unsigned l = 0; l < 32; ++l) {
+            const uint32_t b = bp[l], c = cp[l];
+            const uint32_t clamp = c & 0x1f, segmask = (c >> 8) & 0x1f;
+            const uint32_t maxl = (l & segmask) | (clamp & ~segmask), minl = l & segmask;
+            uint32_t j;
+            bool in;
+            switch (mode) {
+              case 0: j = minl | (b & ~segmask & 0x1f); in = j <= maxl; break;
+              case 1: j = l - b; in = static_cast<int32_t>(j) >= static_cast<int32_t>(maxl); break;
+              case 2: j = l + b; in = j <= maxl; break;
+              default: j = l ^ b; in = j <= maxl; break;
+            }
+            if (!in) j = l;
+            out[l] = ((ex >> (j & 31)) & 1) ? vp[j & 31] : 0;   // (a source lane that is not running this shuffle gives 0)
+            in_range |= static_cast<Mask>(in) << l;
+          }
+          if (ins.dst[1].reg != kRZ) {
+            uint32_t* d = &w.reg(ins.dst[1].reg, 0);
+            for (Mask m = ex; m; m &= m - 1) d[std::countr_zero(m)] = out[std::countr_zero(m)];
+          }
+          if (ins.dst[0].reg != kPT) w.p[ins.dst[0].reg] = (w.p[ins.dst[0].reg] & ~ex) | (in_range & ex);
+          return;
+        }
+      }
       for (unsigned l = 0; l < 32; ++l) vals[l] = read32(w, ins.src[0], l);
       each_lane(ex, [&](unsigned l) {
         const uint32_t b = read32(w, ins.src[1], l), c = read32(w, ins.src[2], l);
@@ -2627,6 +2831,25 @@ void Runner::exec_warp(Block&, Warp& w, const Instr& ins, Mask ex, Mask) {
     }
     case Op::VOTE: case Op::VOTEU: {
       Mask ballot = 0;
+      if (fast_ && ins.op == Op::VOTE && !ins.dst.empty() && ins.dst.back().kind == Kind::Pred &&
+          (ins.dst.size() == 1 || ins.dst[0].kind == Kind::Reg) &&
+          (ins.src[0].kind == Kind::Pred || ins.src[0].kind == Kind::UPred)) {
+        // The predicate as the warp holds it (a bit a lane), the answers written for the active lanes as masks.
+        const Operand& so = ins.src[0];
+        Mask v;
+        if (so.kind == Kind::UPred) v = (so.reg == kPT || w.up[so.reg]) ? kAll : 0;
+        else v = so.reg == kPT ? kAll : w.p[so.reg];
+        ballot = (so.neg ? ~v : v) & ex;
+        const bool all = (ballot & ex) == ex, any = ballot != 0, eq = all || !any;
+        const bool r = ins.f[0] == 0 ? all : ins.f[0] == 1 ? any : eq;
+        const Operand& pd = ins.dst.back();
+        if (ins.dst.size() > 1 && ins.dst[0].reg != kRZ) {
+          uint32_t* d = &w.reg(ins.dst[0].reg, 0);
+          for (Mask m = ex; m; m &= m - 1) d[std::countr_zero(m)] = ballot;
+        }
+        if (pd.reg != kPT) w.p[pd.reg] = (w.p[pd.reg] & ~ex) | (r ? ex : 0);
+        return;
+      }
       each_lane(ex, [&](unsigned l) {
         if (pred(w, ins.src[0], l)) ballot |= Mask{1} << l;
       });

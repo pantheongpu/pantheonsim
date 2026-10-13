@@ -1005,6 +1005,57 @@ VTEST(wide_integer_kernels_at_every_level) {
   }
 }
 
+// lane_unary: the population count and the bit reversal against bit-by-bit loops, and FLO against a scan, for every word
+// with one or two bits set, every byte pattern in each byte, the edge words and random ones.
+VTEST(lane_unary_at_every_level) {
+  std::mt19937 rng(515);
+  std::vector<uint32_t> words;
+  for (int i = 0; i < 32; ++i)
+    for (int j = 0; j < 32; ++j) words.push_back((1u << i) | (1u << j));
+  for (uint32_t b = 0; b < 256; ++b)
+    for (int pos = 0; pos < 4; ++pos) words.push_back(b << (8 * pos));
+  for (uint32_t v : {0u, ~0u, 0x80000000u, 0x7fffffffu, 0x80000001u, 0xdeadbeefu, 0x55555555u, 0xaaaaaaaau, 0xffffu, 0xffff0000u})
+    words.push_back(v);
+  for (int i = 0; i < 200000; ++i) words.push_back(static_cast<uint32_t>(rng()));
+  for (int i = 0; i < 100000; ++i) words.push_back(static_cast<uint32_t>(rng()) >> (rng() % 32));   // (high bits clear)
+  while (words.size() % 32) words.push_back(0);
+  const auto flo = [](uint32_t v, bool sgn, bool sh) {
+    if (sgn && (v >> 31)) v = ~v;
+    uint32_t r = ~0u;
+    for (int b = 31; b >= 0; --b)
+      if ((v >> b) & 1) {
+        r = static_cast<uint32_t>(b);
+        break;
+      }
+    if (sh && r != ~0u) r = 31 - r;
+    return r;
+  };
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (size_t at = 0; at < words.size(); at += 32) {
+      uint32_t r[32];
+      for (unsigned kind = 0; kind < 6; ++kind) {
+        k.lane_unary(kind, r, &words[at]);
+        for (int i = 0; i < 32; ++i) {
+          const uint32_t v = words[at + i];
+          uint32_t want = 0;
+          if (kind == 0) {
+            for (int b = 0; b < 32; ++b) want += (v >> b) & 1;
+          } else if (kind == 1) {
+            for (int b = 0; b < 32; ++b) want |= ((v >> b) & 1u) << (31 - b);
+          } else {
+            want = flo(v, (kind - 2) & 1, ((kind - 2) & 2) != 0);
+          }
+          if (r[i] != want)
+            throw vtest::Failure(lv + " lane_unary kind " + std::to_string(kind) + " of 0x" + hex(v) + ": got 0x" + hex(r[i]) +
+                                 " want 0x" + hex(want));
+        }
+      }
+    }
+  }
+}
+
 // dop_m with the destination registers being the sources' (the SASS executor writes a result over an operand), and a
 // register of the destination pair being the other half of an operand pair: the result of a lane depends on that
 // lane's operands alone, all read before the lane is written.

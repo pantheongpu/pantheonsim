@@ -49,7 +49,8 @@ const Kernels kBase = {Level::Base,       base_impl::f16_to_f32_k, base_impl::f3
                        base_impl::imad_k, base_impl::lop3_k,       base_impl::ffma_k,       base_impl::fadd_k,
                        base_impl::fmul_k, base_impl::ffma_m_k,   base_impl::hfma2_m_k,     base_impl::icmp_mask_k, base_impl::ibin_m_k, base_impl::imad_m_k, base_impl::dop_m_k,
                        base_impl::f64_to_f16_canon_k, base_impl::hmma_k,
-                       base_impl::blend_m_k, base_impl::iadd3x_k, base_impl::imad_wide_k, base_impl::shf_k};
+                       base_impl::blend_m_k, base_impl::iadd3x_k, base_impl::imad_wide_k, base_impl::shf_k,
+                       base_impl::lane_unary_k};
 #ifdef VGPU_SIMD_X86
 // The AVX2 table with every entry that does not use F16C. The four that do (the two conversions, the tensor kernel and
 // the f16 fma) are the baseline's here; kAvx2 below has them too.
@@ -58,12 +59,14 @@ const Kernels kAvx2NoF16c = {Level::Avx2,       base_impl::f16_to_f32_k, base_im
                              avx2_impl::fmul_k, avx2_impl::ffma_m_k,   base_impl::hfma2_m_k,     avx2_impl::icmp_mask_k,
                              avx2_impl::ibin_m_k, avx2_impl::imad_m_k, avx2_impl::dop_m_k,
                              avx2_impl::f64_to_f16_canon_k, base_impl::hmma_k,
-                             avx2_impl::blend_m_k, avx2_impl::iadd3x_k, avx2_impl::imad_wide_k, avx2_impl::shf_k};
+                             avx2_impl::blend_m_k, avx2_impl::iadd3x_k, avx2_impl::imad_wide_k, avx2_impl::shf_k,
+                       avx2_impl::lane_unary_k};
 const Kernels kAvx2 = {Level::Avx2,       avx2_impl::f16_to_f32_k, avx2_impl::f32_to_f16_k, avx2_impl::iadd3_k,
                        avx2_impl::imad_k, avx2_impl::lop3_k,       avx2_impl::ffma_k,       avx2_impl::fadd_k,
                        avx2_impl::fmul_k, avx2_impl::ffma_m_k,   avx2_impl::hfma2_m_k,     avx2_impl::icmp_mask_k, avx2_impl::ibin_m_k, avx2_impl::imad_m_k, avx2_impl::dop_m_k,
                        avx2_impl::f64_to_f16_canon_k, avx2_impl::hmma_k,
-                       avx2_impl::blend_m_k, avx2_impl::iadd3x_k, avx2_impl::imad_wide_k, avx2_impl::shf_k};
+                       avx2_impl::blend_m_k, avx2_impl::iadd3x_k, avx2_impl::imad_wide_k, avx2_impl::shf_k,
+                       avx2_impl::lane_unary_k};
 
 // The F16C conversions against the scalar ones: every half, and a spread of
 // floats. A host whose conversion differs (a stray MXCSR, an emulator) does
@@ -174,7 +177,8 @@ const Kernels kAvx2Lazy = {Level::Avx2,       lazy_f16_to_f32,   lazy_f32_to_f16
                            avx2_impl::fmul_k, avx2_impl::ffma_m_k, lazy_hfma2_m,    avx2_impl::icmp_mask_k,
                            avx2_impl::ibin_m_k, avx2_impl::imad_m_k, avx2_impl::dop_m_k,
                            avx2_impl::f64_to_f16_canon_k, lazy_hmma,
-                           avx2_impl::blend_m_k, avx2_impl::iadd3x_k, avx2_impl::imad_wide_k, avx2_impl::shf_k};
+                           avx2_impl::blend_m_k, avx2_impl::iadd3x_k, avx2_impl::imad_wide_k, avx2_impl::shf_k,
+                       avx2_impl::lane_unary_k};
 #endif
 
 }  // namespace
