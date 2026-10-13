@@ -227,7 +227,10 @@ const Shape kShapes[] = {{1, 1}, {2, 3}, {3, 2}, {5, 5}, {8, 8}, {13, 9}, {9, 13
 VTEST(host_dense_getrf_matches) {
   size_t bad = 0;
   int cases = 0;
-  for (const Shape& s : kShapes)
+  std::vector<Shape> shapes(std::begin(kShapes), std::end(kShapes));
+  for (const Shape& extra : {Shape{300, 300}, Shape{400, 150}, Shape{150, 400}, Shape{257, 129}, Shape{129, 257}})   // across the panels of the blocked form
+    shapes.push_back(extra);
+  for (const Shape& s : shapes)
     for (int kind = 0; kind < 3; ++kind)
       for (const bool pivot : {true, false}) {
         Mat A = random_mat(s.m, s.n, 3, kind), R = A;
@@ -235,6 +238,22 @@ VTEST(host_dense_getrf_matches) {
         const int info_ref = ref_getrf(R, s.m, s.n, pivot ? &ipiv_ref : nullptr);
         const int info_new = vgpu::hostdense::getrf(A.v.data(), A.ld, s.m, s.n, pivot ? ipiv_new.data() : nullptr);
         VCHECK_EQ(info_ref, info_new);
+        if (pivot) VCHECK(ipiv_ref == ipiv_new);
+        bad += differing(R.v, A.v);
+        ++cases;
+      }
+  // A zero pivot in a later panel (a zero column, no earlier trouble): the blocked form hands the rest over to the plain loops.
+  for (const Shape& s : {Shape{300, 300}, Shape{200, 200}, Shape{257, 200}, Shape{200, 257}})
+    for (const bool pivot : {true, false})
+      for (const int zero_col : {s.n / 2, 130, 190}) {
+        Mat A = random_mat(s.m, s.n, 2, 0);
+        for (int r = 0; r < s.m; ++r) A(r, zero_col) = 0.0;
+        Mat R = A;
+        std::vector<int> ipiv_ref, ipiv_new(std::min(s.m, s.n));
+        const int info_ref = ref_getrf(R, s.m, s.n, pivot ? &ipiv_ref : nullptr);
+        const int info_new = vgpu::hostdense::getrf(A.v.data(), A.ld, s.m, s.n, pivot ? ipiv_new.data() : nullptr);
+        VCHECK_EQ(info_ref, info_new);
+        VCHECK(info_ref > 0);
         if (pivot) VCHECK(ipiv_ref == ipiv_new);
         bad += differing(R.v, A.v);
         ++cases;
@@ -305,7 +324,7 @@ VTEST(host_dense_qr_matches) {
       bad += differing(QR.v, Q.v);
       for (const bool left : {true, false})
         for (const bool trans : {false, true}) {
-          const int cr = left ? s.m : 7, cc = left ? 6 : s.m;   // C: m x 6 for left, 7 x m for right
+          const int cr = left ? s.m : 7, cc = left ? (s.m > 60 ? 45 : 6) : s.m;   // C: m x 6 for left, 7 x m for right
           const int cn = left ? cc : s.m;                          // (ormqr's n is C's column count)
           Mat C = random_mat(cr, cc, 1, 0), CR = C;
           (void)cn;
@@ -321,6 +340,54 @@ VTEST(host_dense_qr_matches) {
       ++cases;
     }
   std::printf("  qr: %d cases, %zu elements differ\n", cases, bad);
+  VCHECK_EQ(bad, static_cast<size_t>(0));
+}
+
+// The reflector kernel on its own (host_trsm.hpp, reflect): arbitrary reflector storage and scales (zero, negative zero, NaN,
+// infinity among them), both directions, with and without skipping zero scales, both instruction sets, several thread
+// counts, columns across the width of a group; against the loops (dot, scale, update per column, reflector by reflector).
+VTEST(host_dense_reflect_kernel_matches) {
+  using vgpu::hostgemm::Isa;
+  size_t bad = 0;
+  int runs = 0;
+  struct Case { int m, ncols, k; };
+  for (const Case& s : {Case{40, 5, 7}, Case{64, 33, 20}, Case{100, 70, 30}, Case{7, 40, 7}, Case{130, 17, 64}, Case{20, 100, 3}})
+    for (int kind = 0; kind < 3; ++kind)
+      for (const bool down : {false, true})
+        for (const bool skip : {false, true}) {
+          Mat A = random_mat(s.m, s.k, 2, kind);
+          Mat C = random_mat(s.m, s.ncols, 1, kind);
+          std::vector<double> tau(s.k);
+          for (int j = 0; j < s.k; ++j) {
+            const uint64_t r = g_rng() % 12;
+            tau[j] = r == 0 ? 0.0 : r == 1 ? -0.0 : (kind == 1 && r == 2) ? std::numeric_limits<double>::quiet_NaN() : 1.0 + double(g_rng() % 100) / 50.0;
+          }
+          const int j0 = down ? s.k - 1 : 0, j1 = down ? 0 : s.k - 1, step = down ? -1 : 1;
+          Mat R = C;
+          for (int j = j0; down ? j >= j1 : j <= j1; j += step) {
+            if (skip && tau[j] == 0.0) continue;
+            if (j >= s.m) continue;
+            std::vector<double> v(s.m);
+            v[j] = 1.0;
+            for (int i = j + 1; i < s.m; ++i) v[i] = A(i, j);
+            for (int c = 0; c < s.ncols; ++c) {
+              double dot = 0.0;
+              for (int i = j; i < s.m; ++i) dot += v[i] * R(i, c);
+              dot *= tau[j];
+              for (int i = j; i < s.m; ++i) R(i, c) -= dot * v[i];
+            }
+          }
+          for (const Isa isa : {Isa::Generic, Isa::Avx2}) {
+            if (isa == Isa::Avx2 && !vgpu::hostgemm::avx2_available()) continue;
+            for (const unsigned threads : {1u, 3u}) {
+              Mat G = C;
+              vgpu::hosttrsm::reflect(A.v.data(), A.ld, tau.data(), s.m, j0, j1, step, G.v.data(), G.ld, 0, s.ncols, skip, isa, threads);
+              ++runs;
+              bad += differing(R.v, G.v);
+            }
+          }
+        }
+  std::printf("  reflect: %d runs, %zu elements differ\n", runs, bad);
   VCHECK_EQ(bad, static_cast<size_t>(0));
 }
 

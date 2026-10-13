@@ -13,6 +13,7 @@
 // operand a product can be repaired by the complex multiply's rule, which these kernels do not have; the caller
 // passes only finite operands, and the solve says whether every x it made is finite (an infinity or a NaN that arises
 // in a step stays one in every x that follows, so if none is, none arose). Otherwise the caller runs the loops.
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <complex>
@@ -140,6 +141,57 @@ inline bool cplx(int k, int64_t nv, bool forward, bool unit, const double* mr, c
     if (!ok) finite.store(false, std::memory_order_relaxed);
   });
   return finite.load(std::memory_order_relaxed);
+}
+
+// Householder reflectors H_j = I - t_j v_j v_j^T applied to the columns [c0, c1) of the m-row matrix c, for j = jfirst, then
+// jfirst + step, ..., jlast: reflector j is v with v[j] = 1 and v[i] = a[i + j*lda] for i > j (rows above j are not touched),
+// scaled by tau[j]. Each column gets the steps of the old loops (dot product, scale, update; see ReflOps) in the order
+// of the reflectors; groups of columns are independent and go to the host's threads, each held as lanes while all the
+// reflectors pass over it (the panel stays in the cache).
+// skip_zero_tau: a reflector whose tau is exactly 0 is left out (geqrf's loops never made one).
+inline void reflect(const double* a, int64_t lda, const double* tau, int64_t m, int jfirst, int jlast, int step,
+                    double* c, int64_t ldc, int64_t c0, int64_t c1, bool skip_zero_tau, Isa isa = Isa::Auto,
+                    unsigned threads = 0) {
+  if (m <= 0 || c1 <= c0) return;
+#ifdef VGPU_HOSTGEMM_AVX2
+  const bool wide = isa == Isa::Avx2 || (isa == Isa::Auto && vgpu::hostgemm::avx2_available());
+  const int W = wide ? vgpu::hostgemm::avx2::ReflOps::W : vgpu::hostgemm::generic::ReflOps::W;
+#else
+  const bool wide = false;
+  const int W = vgpu::hostgemm::generic::ReflOps::W;
+#endif
+  const int64_t rmin = std::min(jfirst, jlast);
+  if (rmin >= m) return;
+  const int64_t groups = (c1 - c0 + W - 1) / W, rows = m - rmin;
+  const int64_t nref = (static_cast<int64_t>(jlast) - jfirst) * step + 1;
+  const unsigned want = threads ? threads : vgpu::hostpar::plan(static_cast<uint64_t>(rows) * static_cast<uint64_t>(c1 - c0) * static_cast<uint64_t>(nref > 0 ? nref : 1), groups, 1u << 21);
+  vgpu::hostpar::parallel_for(want, groups, [&](int64_t g) {
+    thread_local std::vector<double> xt;
+    xt.resize(static_cast<size_t>(m) * W);   // row i at xt + i*W (rows above rmin unused)
+    const int64_t k0 = c0 + g * W;
+    const int lanes = static_cast<int>(c1 - k0 < W ? c1 - k0 : W);
+    for (int l = 0; l < lanes; ++l) {
+      const double* col = c + (k0 + l) * ldc;
+      for (int64_t i = rmin; i < m; ++i) xt[static_cast<size_t>(i) * W + l] = col[i];
+    }
+    for (int l = lanes; l < W; ++l)
+      for (int64_t i = rmin; i < m; ++i) xt[static_cast<size_t>(i) * W + l] = 0.0;
+    for (int j = jfirst; step > 0 ? j <= jlast : j >= jlast; j += step) {
+      if (skip_zero_tau && tau[j] == 0.0) continue;
+      if (j >= m) continue;
+      if (wide) {
+#ifdef VGPU_HOSTGEMM_AVX2
+        vgpu::hostgemm::avx2::ReflOps::apply(a + static_cast<int64_t>(j) * lda, m, j, tau[j], xt.data());
+#endif
+      } else {
+        vgpu::hostgemm::generic::ReflOps::apply(a + static_cast<int64_t>(j) * lda, m, j, tau[j], xt.data());
+      }
+    }
+    for (int l = 0; l < lanes; ++l) {
+      double* col = c + (k0 + l) * ldc;
+      for (int64_t i = rmin; i < m; ++i) col[i] = xt[static_cast<size_t>(i) * W + l];
+    }
+  });
 }
 
 }  // namespace vgpu::hosttrsm

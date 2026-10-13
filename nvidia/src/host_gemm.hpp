@@ -75,12 +75,13 @@ inline bool avx2_available() {
 // and payload of a NaN that is the result of two NaNs meeting were never fixed, here or in the loops this replaces; every
 // other bit of every result is, and a result is NaN exactly when it was.
 template <class T, class S>
-inline T chain_one(bool ta, bool tb, int64_t i, int64_t j, int64_t k, const S* A, int64_t lda, const S* B, int64_t ldb) {
-  T acc = T(0);
+inline T chain_one(bool ta, bool tb, int64_t i, int64_t j, int64_t k, const S* A, int64_t lda, const S* B, int64_t ldb,
+                   T init = T(0), bool neg = false) {
+  T acc = init;
   for (int64_t p = 0; p < k; ++p) {
     T a = static_cast<T>(ta ? A[p + i * lda] : A[i + p * lda]);
     T b = static_cast<T>(tb ? B[j + p * ldb] : B[p + j * ldb]);
-    acc += a * b;
+    acc += (neg ? -a : a) * b;
   }
   return acc;
 }
@@ -89,12 +90,17 @@ inline T chain_one(bool ta, bool tb, int64_t i, int64_t j, int64_t k, const S* A
 // accumulator type: float, double, or uint32_t (wrapping integer sums of
 // int8 operands). Epi must be safe to call concurrently on distinct (i, j).
 //
+// cin (leading dimension ldcin) makes every chain start from C's value instead of zero, and neg_a negates A: with both,
+// the chains are  ((c - a0*b0) - a1*b1) - ...  as a blocked factorization's update takes them (c + (-a)*b is c - a*b to the
+// bit, and -(a*b) is (-a)*b). epi still receives the result.
+//
 // tri selects the outputs wanted: 0 all of them, 1 those with i >= j, 2 those with i <= j. A block of outputs that
 // lies wholly outside is not computed and epi is not called for it; one that straddles the diagonal is computed whole
 // and epi is called for all of it, so a caller that wants a triangle has to leave the rest alone.
 template <class T, class S, class Epi>
 void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t lda, const S* B, int64_t ldb,
-          Epi&& epi, Isa isa = Isa::Auto, unsigned threads = 0, int tri = 0) {
+          Epi&& epi, Isa isa = Isa::Auto, unsigned threads = 0, int tri = 0, const T* cin = nullptr,
+          int64_t ldcin = 0, bool neg_a = false) {
   if (m <= 0 || n <= 0) return;
 #ifdef VGPU_HOSTGEMM_AVX2
   const bool wide = isa == Isa::Avx2 || (isa == Isa::Auto && avx2_available());
@@ -104,7 +110,8 @@ void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t
   const uint64_t madds = static_cast<uint64_t>(m) * static_cast<uint64_t>(n) * static_cast<uint64_t>(k);
   if (madds < 4096 || k == 0) {   // too small to be worth blocking: the chains, one at a time
     for (int64_t j = 0; j < n; ++j)
-      for (int64_t i = 0; i < m; ++i) epi(i, j, chain_one<T, S>(ta, tb, i, j, k, A, lda, B, ldb));
+      for (int64_t i = 0; i < m; ++i)
+        epi(i, j, chain_one<T, S>(ta, tb, i, j, k, A, lda, B, ldb, cin ? cin[i + j * ldcin] : T(0), neg_a));
     return;
   }
 
@@ -146,10 +153,10 @@ void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t
     if (tri == 2 && ic > jc + nc - 1) return;   // ... below it
     if (wide) {
 #ifdef VGPU_HOSTGEMM_AVX2
-      W::block(ta, tb, m, n, k, A, lda, B, ldb, ic, mc, jc, nc, acc, ap, bp);
+      W::block(ta, tb, m, n, k, A, lda, B, ldb, ic, mc, jc, nc, acc, ap, bp, cin, ldcin, neg_a);
 #endif
     } else {
-      G::block(ta, tb, m, n, k, A, lda, B, ldb, ic, mc, jc, nc, acc, ap, bp);
+      G::block(ta, tb, m, n, k, A, lda, B, ldb, ic, mc, jc, nc, acc, ap, bp, cin, ldcin, neg_a);
     }
     const int64_t mcp = (mc + MR - 1) / MR * MR;
     for (int64_t j = 0; j < nc; ++j)

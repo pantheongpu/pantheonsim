@@ -69,3 +69,45 @@ struct TrsmOps {
     }
   }
 };
+
+// A Householder reflector applied to a panel of columns held as lanes (see host_dense.hpp): for every lane (one column)
+//     d = 0;  for i = j .. m-1:  d = d + v[i] * x[i];     d = d * t;     for i = j .. m-1:  x[i] = x[i] - d * v[i]
+// with v[j] = 1 and v[i] = vcol[i] below. Row i of the panel is at xt + i*W.
+struct ReflOps {
+  using V = typename Lanes<double>::type;
+  static constexpr int L = Lanes<double>::n;
+  static constexpr int WV = 8;   // eight independent chains of the dot product keep the adder busy
+  static constexpr int W = WV * L;
+
+  static void apply(const double* vcol, int64_t m, int64_t j, double t, double* xt) {
+    V d[WV];
+    for (int v = 0; v < WV; ++v)
+      for (int l = 0; l < L; ++l) d[v][l] = 0.0;
+    for (int64_t i = j; i < m; ++i) {
+      const double vi = i == j ? 1.0 : vcol[i];
+      V vv;
+      for (int l = 0; l < L; ++l) vv[l] = vi;
+      const double* xi = xt + i * W;
+      for (int v = 0; v < WV; ++v) {
+        V x;
+        __builtin_memcpy(&x, xi + v * L, sizeof(V));
+        d[v] = d[v] + vv * x;
+      }
+    }
+    V tv;
+    for (int l = 0; l < L; ++l) tv[l] = t;
+    for (int v = 0; v < WV; ++v) d[v] = d[v] * tv;
+    for (int64_t i = j; i < m; ++i) {
+      const double vi = i == j ? 1.0 : vcol[i];
+      V vv;
+      for (int l = 0; l < L; ++l) vv[l] = vi;
+      double* xi = xt + i * W;
+      for (int v = 0; v < WV; ++v) {
+        V x;
+        __builtin_memcpy(&x, xi + v * L, sizeof(V));
+        x = x - d[v] * vv;
+        __builtin_memcpy(xi + v * L, &x, sizeof(V));
+      }
+    }
+  }
+};

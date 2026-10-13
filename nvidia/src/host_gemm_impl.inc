@@ -119,7 +119,26 @@ struct Ops {
   }
 
   // op(A)(i0 .. i0+mr, p0 .. p0+kc) as panels of MR rows, p-major, zero beyond m.
-  static void pack_a(bool ta, const S* A, int64_t lda, int64_t i0, int64_t mc, int64_t m, int64_t p0, int kc, T* out) {
+  static void pack_a(bool ta, const S* A, int64_t lda, int64_t i0, int64_t mc, int64_t m, int64_t p0, int kc, T* out,
+                     bool neg = false) {
+    if (neg) {   // -a, exactly: used for  c - a*b  as  c + (-a)*b  (the same bits as the subtraction of the product)
+      for (int64_t ir = 0; ir < mc; ir += MR) {
+        T* dst = out + static_cast<size_t>(ir / MR) * MR * kc;
+        for (int r = 0; r < MR; ++r) {
+          const int64_t i = i0 + ir + r;
+          if (ir + r >= mc || i >= m) {
+            for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * MR + r] = T(0);
+          } else if (ta) {
+            const S* src = A + p0 + i * lda;
+            for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * MR + r] = -conv(src[p]);
+          } else {
+            const S* src = A + i + p0 * lda;
+            for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * MR + r] = -conv(src[static_cast<size_t>(p) * lda]);
+          }
+        }
+      }
+      return;
+    }
     for (int64_t ir = 0; ir < mc; ir += MR) {
       T* dst = out + static_cast<size_t>(ir / MR) * MR * kc;
       for (int r = 0; r < MR; ++r) {
@@ -159,13 +178,20 @@ struct Ops {
   // The sums of the block C(ic .. ic+mc, jc .. jc+nc) over all k, into acc
   // (leading dimension mcp = mc rounded up to MR, ncp likewise to NR).
   // apack holds mcp*KC, bpack ncp*KC elements.
+  //
+  // With cin (leading dimension ldcin) the sums start from the values of C(ic .., jc ..) instead of zero, and neg
+  // negates A as it is packed: acc = ((c + (-a0)*b0) + (-a1)*b1) + ...  which is  ((c - a0*b0) - a1*b1) - ...  to the bit.
   static void block(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t lda, const S* B,
-                    int64_t ldb, int64_t ic, int64_t mc, int64_t jc, int64_t nc, T* acc, T* apack, T* bpack) {
+                    int64_t ldb, int64_t ic, int64_t mc, int64_t jc, int64_t nc, T* acc, T* apack, T* bpack,
+                    const T* cin = nullptr, int64_t ldcin = 0, bool neg = false) {
     const int64_t mcp = (mc + MR - 1) / MR * MR, ncp = (nc + NR - 1) / NR * NR;
     for (int64_t i = 0; i < mcp * ncp; ++i) acc[i] = T(0);
+    if (cin)
+      for (int64_t j = 0; j < nc; ++j)
+        for (int64_t i = 0; i < mc; ++i) acc[static_cast<size_t>(i + j * mcp)] = cin[(ic + i) + (jc + j) * ldcin];
     for (int64_t pc = 0; pc < k; pc += KC) {
       const int kc = static_cast<int>(k - pc < KC ? k - pc : KC);
-      pack_a(ta, A, lda, ic, mc, m, pc, kc, apack);
+      pack_a(ta, A, lda, ic, mc, m, pc, kc, apack, neg);
       pack_b(tb, B, ldb, jc, nc, n, pc, kc, bpack);
       for (int64_t jr = 0; jr < ncp; jr += NR)
         for (int64_t ir = 0; ir < mcp; ir += MR)
