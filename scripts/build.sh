@@ -3,4 +3,4 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cmake -S . -B build -DCMAKE_BUILD_TYPE="${VGPU_BUILD_TYPE:-Release}" >/dev/null
-cmake --build build -j"$(nproc)"
+cmake --build build -j"$(ci/jobs.sh -p release)"

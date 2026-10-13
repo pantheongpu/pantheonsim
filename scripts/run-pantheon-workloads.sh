@@ -54,13 +54,15 @@ fi
 [[ -e "$shim/libcudart.so.13" ]] || { echo "error: build VirtualGPU first (./scripts/build.sh)" >&2; exit 1; }
 
 names=$(ls "$repo/kernels" | grep -v '^common$')
+# One nvcc per job, sized to the memory there is (ci/jobs.sh), not to the CPUs.
+build_jobs=$("$here/ci/jobs.sh" -g 2)
 echo "Building $(wc -w <<<"$names") workloads (unmodified sources)..."
 for w in $names; do
   ( cd "$repo" && nvcc -O3 -std=c++14 -DNDEBUG -Ikernels/common -x cu \
       --gpu-architecture=sm_86 -Wno-deprecated-gpu-targets \
       -I kernels/common/optix -I kernels/common/nvenc -cudart shared \
       "kernels/$w/$w.cpp" -o "$bin/$w" -L"$shim" -lcuda -ldl ) >"$logs/build_$w.log" 2>&1 &
-  while [[ $(jobs -r | wc -l) -ge $(nproc) ]]; do wait -n; done
+  while [[ $(jobs -r | wc -l) -ge $build_jobs ]]; do wait -n; done
 done
 wait
 

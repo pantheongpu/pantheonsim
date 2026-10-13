@@ -72,7 +72,7 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build -j"$(nproc)"
+        run: cmake --build build -j"$(ci/jobs.sh -p release)"
 
       - name: Report which CUDA ABI was detected
         # The shim's soname major follows the installed toolkit, and getting it
@@ -131,7 +131,7 @@ jobs:
         working-directory: pantheonsim
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
+          cmake --build build -j"$(ci/jobs.sh -p release)"
 
       - name: Run pantheon workloads
         working-directory: pantheonsim
@@ -172,6 +172,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This job needs a lot of memory, and on a shared runner another job may
+      # hold most of it. Fail here, alone, if this one cannot fit, rather than
+      # take the machine down part-way (the minimums are in ci/jobs.sh).
+      - name: Check the memory
+        run: ci/jobs.sh --check sass
+
       - name: Install CUDA 13
         if: ${{ !job.container.id }}
         run: |
@@ -190,7 +196,7 @@ jobs:
       - name: Build VirtualGPU
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
+          cmake --build build -j"$(ci/jobs.sh -p sass)"
           ls build/shim/libcudart.so.*
 
       - name: The SASS tests
@@ -248,6 +254,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This job needs a lot of memory, and on a shared runner another job may
+      # hold most of it. Fail here, alone, if this one cannot fit, rather than
+      # take the machine down part-way (the minimums are in ci/jobs.sh).
+      - name: Check the memory
+        run: ci/jobs.sh --check ollama
+
       - name: Install CUDA 13
         if: ${{ !job.container.id }}
         run: |
@@ -276,7 +288,7 @@ jobs:
       - name: Build VirtualGPU
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
+          cmake --build build -j"$(ci/jobs.sh -p ollama)"
           ls build/shim/libcudart.so.*
 
       - name: The model, from the cache
@@ -332,6 +344,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This job needs a lot of memory, and on a shared runner another job may
+      # hold most of it. Fail here, alone, if this one cannot fit, rather than
+      # take the machine down part-way (the minimums are in ci/jobs.sh).
+      - name: Check the memory
+        run: ci/jobs.sh --check ollama-amd
+
       - name: Install ollama and its ROCm backend
         run: |
           sudo flock /tmp/pool-apt.lock apt-get update -qq
@@ -348,7 +366,7 @@ jobs:
       - name: Build VirtualGPU's HIP runtime
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target vgpuhip vgpu_cli
+          cmake --build build -j"$(ci/jobs.sh -p ollama-amd)" --target vgpuhip vgpu_cli
 
       - name: The model, from the cache
         id: model
@@ -426,7 +444,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           # Every AMD test binary the next step runs, found by name rather than
           # listed, so a test added later is built without anyone remembering to.
-          cmake --build build -j"$(nproc)" --target vgpuhip \
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpuhip \
             $(ninja -C build -t targets all | grep -oE '^test_amd[a-z0-9_]*' | sort -u)
 
       - name: Read code objects, decode CDNA, run it, and check it against the assembler
@@ -465,7 +483,7 @@ jobs:
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(nproc)"
+          cmake --build build -j"$(ci/jobs.sh -p release)"
 
       - name: PyTorch, rocBLAS and hipSPARSELt
         # A test that skips fails the job: here each has what it needs, so a
@@ -527,7 +545,7 @@ jobs:
           RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms|e2e_runtime_132)$'
         run: |
           set -o pipefail
-          ctest --test-dir build --output-on-failure -j2 \
+          ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 4 -m 2)" \
             -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm|e2e_pytorch_sweep_full|e2e_pytorch_dist_full)$' \
             2>&1 | tee rest.log
           skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
@@ -565,6 +583,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This job needs a lot of memory, and on a shared runner another job may
+      # hold most of it. Fail here, alone, if this one cannot fit, rather than
+      # take the machine down part-way (the minimums are in ci/jobs.sh).
+      - name: Check the memory
+        run: ci/jobs.sh --check asan
+
       # The checkout belongs to the runner's user and the job runs as root in
       # the container: trust this one repository, or git refuses it (tests ask
       # git which files are tracked). actions/checkout's own exception lasts
@@ -585,7 +609,7 @@ jobs:
           cmake -S . -B build-san -G Ninja -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
-          cmake --build build-san -j"$(nproc)"
+          cmake --build build-san -j"$(ci/jobs.sh -p asan)"
 
       - name: Run under sanitizers
         env:
@@ -622,6 +646,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This job needs a lot of memory, and on a shared runner another job may
+      # hold most of it. Fail here, alone, if this one cannot fit, rather than
+      # take the machine down part-way (the minimums are in ci/jobs.sh).
+      - name: Check the memory
+        run: ci/jobs.sh --check tsan
+
       # The checkout belongs to the runner's user and the job runs as root in
       # the container: trust this one repository, or git refuses it (tests ask
       # git which files are tracked). actions/checkout's own exception lasts
@@ -642,7 +672,7 @@ jobs:
           cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
-          cmake --build build-tsan -j"$(nproc)"
+          cmake --build build-tsan -j"$(ci/jobs.sh -p tsan)"
 
       - name: Run under TSan
         # TSan cannot map its shadow memory under this kernel's ASLR entropy, so

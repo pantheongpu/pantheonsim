@@ -120,6 +120,14 @@ if 'CDNA 5' in arch and not images:
     rows.setdefault(('Vop2', 0, 35, False), ('v_fmamk_f64', f64 + [('SRC0', 'Src', 64, False), ('LITERAL', 'Simm64', 64, False), ('VSRC1', 'Vgpr', 64, False)], 0))
     rows.setdefault(('Vop2', 0, 36, False), ('v_fmaak_f64', f64 + [('SRC0', 'Src', 64, False), ('VSRC1', 'Vgpr', 64, False), ('LITERAL', 'Simm64', 64, False)], 0))
 
+# The VOPD dot products (opcodes 12 and 13, in both the 64-bit and the 96-bit forms, as X or as Y) are in ROCm's LLVM (llvm-mc
+# -mcpu=gfx1250 assembles them) but not in the XML. They are the VOP2 dot-product-accumulates, v_dot2acc_f32_f16 and
+# v_dot2acc_f32_bf16, issued as half of a pair: the destination is also the addend.
+if 'CDNA 5' in arch and not images:
+    for seg in (0, 1):
+        for opcode, name in ((12, 'v_dual_dot2acc_f32_f16'), (13, 'v_dual_dot2acc_f32_bf16')):
+            rows.setdefault(('Vopd', seg, opcode, False), (name, [('VDSTX', 'Vgpr', 32, True), ('SRCX0', 'Src', 32, False), ('VSRCX1', 'Vgpr', 32, False)], 0))
+
 with open(out_path, 'w') as f:
     what = 'every image instruction' if images else 'every instruction the RDNA decoder handles'
     f.write(f'// {arch}: {what}, from AMD\'s machine-readable\n'

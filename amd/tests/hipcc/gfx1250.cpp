@@ -3,7 +3,7 @@
 // whether the hardware agrees.
 //
 //   - 64-bit integer arithmetic in the vector unit (add, sub, mul, min, max, multiply-add of a 32-bit pair);
-//   - v_add_max / v_add_min: a clamped add, then the other operand;
+//   - v_add_max / v_add_min: an add (saturating for the signed forms, wrapping for the unsigned), then the other operand;
 //   - v_ashr_pk_i8_i32 and v_ashr_pk_u8_i32, v_sat_pk4_i4_i8 and v_sat_pk4_u4_u8 (16-bit results);
 //   - v_tanh_f32, the bfloat16 transcendentals, and the 8-bit float to half conversions;
 //   - an f64 atomic add, and the prefetch the compiler writes for __builtin_prefetch.
@@ -181,7 +181,7 @@ int main() {
     int wrong = 0;
     for (int l = 0; l < kLanes; ++l) {
       const int64_t s = std::min<int64_t>(std::max<int64_t>(int64_t{ai[l]} + bi[l], INT32_MIN), INT32_MAX);
-      const uint64_t u = std::min<uint64_t>(uint64_t{static_cast<uint32_t>(ai[l])} + static_cast<uint32_t>(bi[l]), 0xFFFFFFFFu);
+      const uint64_t u = static_cast<uint32_t>(static_cast<uint32_t>(ai[l]) + static_cast<uint32_t>(bi[l]));   // (the unsigned sum wraps: see the executor)
       const uint32_t cu = static_cast<uint32_t>(ci[l]);
       const int want[4] = {static_cast<int>(std::max<int64_t>(s, ci[l])), static_cast<int>(std::min<int64_t>(s, ci[l])),
                            static_cast<int>(std::max<uint64_t>(u, cu)), static_cast<int>(std::min<uint64_t>(u, cu))};
