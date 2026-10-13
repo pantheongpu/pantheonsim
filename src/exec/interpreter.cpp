@@ -3001,6 +3001,7 @@ class Interpreter {
   // Runs one warp until it yields: a barrier, a return, or -- when `slice` is
   // non-zero -- that many instructions. Zero means no bound.
   void run_warp_until_yield(Warp& w, const BlockCtx& ctx, uint64_t slice = 0) {
+    ctx_ = &ctx;
     cur_ = w.fn ? w.fn : &fn_;
     local_base_ = w.local_base;
     uint64_t issued = 0;
@@ -3204,6 +3205,11 @@ class Interpreter {
       case MicroOp::MulHi32: return micro_mul_hi32(w, u, fm);
       case MicroOp::Sign32: return micro_sign32(w, u, fm);
       case MicroOp::CvtI2F: return micro_cvt_i2f(w, u, fm);
+      case MicroOp::Mov64: return micro_mov64(w, u, fm);
+      case MicroOp::MovSreg: return micro_mov_sreg(w, u, fm);
+      case MicroOp::LdParam: return micro_ld_param(w, u, fm);
+      case MicroOp::PredBin: return micro_pred_bin(w, u, fm);
+      case MicroOp::NotPred: return micro_not_pred(w, u, fm);
       case MicroOp::Bra: return false;   // moves the pc: run_micro_batch's, or step()'s
       case MicroOp::None: break;
     }
@@ -3229,6 +3235,9 @@ class Interpreter {
   }
 
   bool micro_int32(Warp& w, const MicroOp& u, Mask fm) {
+    // A division by zero is an error in strict mode, which the general path reports.
+    if ((u.sub == static_cast<uint8_t>(IntBinOp::Div) || u.sub == static_cast<uint8_t>(IntBinOp::Rem)) && strict())
+      return false;
     const uint32_t* a = micro_src(w, u, 0);
     const uint32_t* b = micro_src(w, u, 1);
     uint32_t* d = dst32(w, u.dst, fm);
@@ -3419,6 +3428,98 @@ class Interpreter {
     else
       for_active(fm, W_, [&](uint32_t l) { d[l] = uint64_t{a[l]} * uint64_t{b[l]}; });
     w.written64[u.dst] = 1;
+    return true;
+  }
+  // mov of 64 bits (and cvta to or from the generic space, which adds nothing to a global address).
+  [[gnu::noinline]] bool micro_mov64(Warp& w, const MicroOp& u, Mask fm) {
+    const uint64_t* v = micro_src64(w, u, 0);
+    uint64_t* d = dst64(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = v[l]; });
+    w.written64[u.dst] = 1;
+    return true;
+  }
+  // mov of the thread and block ids, the lane id, or the warp size (sreg_value's values).
+  [[gnu::noinline]] bool micro_mov_sreg(Warp& w, const MicroOp& u, Mask fm) {
+    const BlockCtx& ctx = *ctx_;
+    uint32_t* d = dst32(w, u.dst, fm);
+    auto fill = [&](uint32_t v) { for_active(fm, W_, [&](uint32_t l) { d[l] = v; }); };
+    switch (u.sub) {
+      case static_cast<uint8_t>(Sreg::TidX): for_active(fm, W_, [&](uint32_t l) { d[l] = w.tid_x[l]; }); break;
+      case static_cast<uint8_t>(Sreg::TidY): for_active(fm, W_, [&](uint32_t l) { d[l] = w.tid_y[l]; }); break;
+      case static_cast<uint8_t>(Sreg::TidZ): for_active(fm, W_, [&](uint32_t l) { d[l] = w.tid_z[l]; }); break;
+      case static_cast<uint8_t>(Sreg::LaneId): for_active(fm, W_, [&](uint32_t l) { d[l] = l; }); break;
+      case static_cast<uint8_t>(Sreg::NtidX): fill(ctx.ntid[0]); break;
+      case static_cast<uint8_t>(Sreg::NtidY): fill(ctx.ntid[1]); break;
+      case static_cast<uint8_t>(Sreg::NtidZ): fill(ctx.ntid[2]); break;
+      case static_cast<uint8_t>(Sreg::CtaidX): fill(ctx.ctaid[0]); break;
+      case static_cast<uint8_t>(Sreg::CtaidY): fill(ctx.ctaid[1]); break;
+      case static_cast<uint8_t>(Sreg::CtaidZ): fill(ctx.ctaid[2]); break;
+      case static_cast<uint8_t>(Sreg::NctaidX): fill(ctx.nctaid[0]); break;
+      case static_cast<uint8_t>(Sreg::NctaidY): fill(ctx.nctaid[1]); break;
+      case static_cast<uint8_t>(Sreg::NctaidZ): fill(ctx.nctaid[2]); break;
+      default: fill(W_); break;   // 255: WARP_SZ
+    }
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // ld.param of a scalar by the parameter's position, as exec_ld does it for the kernel's own body (a device function
+  // or an access the general path would refuse is left to it).
+  [[gnu::noinline]] bool micro_ld_param(Warp& w, const MicroOp& u, Mask fm) {
+    if (cur_ != &fn_ || u.src[0] >= params_.by_index.size()) return false;
+    const auto [off, psize] = params_.by_index[u.src[0]];
+    const int64_t at = int64_t{off} + static_cast<int32_t>(u.src[1]);
+    const uint32_t size = u.sub;
+    if (at < 0 || static_cast<uint64_t>(at) + size > uint64_t{off} + psize) return false;
+    uint64_t v = 0;
+    std::memcpy(&v, params_.bytes.data() + at, size);
+    const uint32_t bits = size * 8;
+    const bool wide = u.flags & MicroOp::kDstWide;
+    const uint32_t dst_bits = wide ? 64u : 32u;
+    if ((u.flags & MicroOp::kSigned) && bits < dst_bits) {   // write_loaded: a signed value is sign-extended
+      const uint64_t sign = uint64_t{1} << (bits - 1);
+      v = (v ^ sign) - sign;
+    } else if (bits < dst_bits) {
+      v &= (uint64_t{1} << bits) - 1;
+    }
+    if (wide) {
+      uint64_t* d = dst64(w, u.dst, fm);
+      for_active(fm, W_, [&](uint32_t l) { d[l] = v; });
+      w.written64[u.dst] = 1;
+    } else {
+      uint32_t* d = dst32(w, u.dst, fm);
+      const uint32_t v32 = static_cast<uint32_t>(v);
+      for_active(fm, W_, [&](uint32_t l) { d[l] = v32; });
+      w.written32[u.dst] = 1;
+    }
+    return true;
+  }
+  // The predicate a PredBin/NotPred source names; false for one nothing has written (the general path reports it).
+  bool micro_pred(const Warp& w, const MicroOp& u, unsigned i, Mask& out) const {
+    if (u.src_imm >> i & 1) {
+      out = u.src[i] ? ~Mask{0} : Mask{0};
+      return true;
+    }
+    const uint32_t id = u.src[i];
+    if (id >= w.written32.size() || !w.written32[id] || id >= w.preds.size()) return false;
+    out = w.preds[id];
+    return true;
+  }
+  [[gnu::noinline]] bool micro_pred_bin(Warp& w, const MicroOp& u, Mask fm) {
+    Mask a, b;
+    if (!micro_pred(w, u, 0, a) || !micro_pred(w, u, 1, b)) return false;
+    const PredBinOp o = static_cast<PredBinOp>(u.sub);
+    const Mask r = o == PredBinOp::And ? (a & b) : o == PredBinOp::Or ? (a | b) : (a ^ b);
+    w.written32[u.dst] = 1;
+    Mask& p = w.preds[u.dst];
+    p = (p & ~fm) | (r & fm);
+    return true;
+  }
+  [[gnu::noinline]] bool micro_not_pred(Warp& w, const MicroOp& u, Mask fm) {
+    Mask s;
+    if (!micro_pred(w, u, 0, s)) return false;
+    w.written32[u.dst] = 1;
+    Mask& p = w.preds[u.dst];
+    p = (p & ~fm) | (~s & fm);
     return true;
   }
   // mul.hi: the high 32 bits of the 64-bit product, signed or not (mul_hi at 32 bits).
@@ -5104,6 +5205,22 @@ class Interpreter {
           });
         else run([](uint32_t x, uint32_t y) { return std::max(x, y); });
         break;
+      // As int_bin does them (a zero divisor gives all ones, quotient and remainder alike -- the strict-mode error is
+      // the caller's to take first; the one signed quotient that does not fit wraps and its remainder is zero).
+      case IntBinOp::Div:
+        run([sig](uint32_t x, uint32_t y) -> uint32_t {
+          if (y == 0) return ~0u;
+          if (sig) return y == 0xFFFFFFFFu ? 0u - x : static_cast<uint32_t>(static_cast<int32_t>(x) / static_cast<int32_t>(y));
+          return x / y;
+        });
+        break;
+      case IntBinOp::Rem:
+        run([sig](uint32_t x, uint32_t y) -> uint32_t {
+          if (y == 0) return ~0u;
+          if (sig) return y == 0xFFFFFFFFu ? 0u : static_cast<uint32_t>(static_cast<int32_t>(x) % static_cast<int32_t>(y));
+          return x % y;
+        });
+        break;
       // PTX clamps shift amounts: past the width, all bits shift out (or,
       // for a signed right shift, the sign fills).
       case IntBinOp::Shl: run([](uint32_t x, uint32_t y) { return y >= 32 ? 0u : x << y; }); break;
@@ -5114,7 +5231,7 @@ class Interpreter {
           });
         else run([](uint32_t x, uint32_t y) { return y >= 32 ? 0u : x >> y; });
         break;
-      default: return false;   // Div and Rem
+      default: return false;
     }
     return true;
   }
@@ -13173,6 +13290,7 @@ class Interpreter {
     return alu_flag_ && __atomic_load_n(alu_flag_, __ATOMIC_RELAXED);
   }
   std::vector<size_t> runnable_;   // step_block's scratch: the warps ready to run
+  const BlockCtx* ctx_ = nullptr;          // the block of the warp being run (for the pre-decoded forms)
   const EntryFn* micro_owner_ = nullptr;   // the function micro_ was taken from
   const MicroOp* micro_ = nullptr;         // its pre-decoded instructions, or null
   // Immediates spread across the lanes for micro_src, with the value each holds,

@@ -867,6 +867,122 @@ LOOP:
   }
 }
 
+// 32-bit division and remainder (zero divisors, -1, INT_MIN), the 64-bit mov and cvta, warpSize, and predicate logic, as
+// pre-decoded forms against the general path, unguarded and under both guards; and a division by zero is the same
+// error in strict mode.
+VTEST(pre_decoded_div_mov64_cvta_and_predicate_forms_match_the_general_path) {
+  const auto a = int_values(), b = rotate(a, 5), c = rotate(a, 11);
+  std::vector<uint64_t> w;
+  const uint64_t wv[] = {0, 1, 5, ~0ull, 0x8000000000000000ull, 0x123456789ABCDEF0ull, 0xFFFFFFFF80000000ull, 4294967296ull};
+  for (int i = 0; i < kThreads; ++i) w.push_back(wv[(i * 3 + i / 8) % 8]);
+  const auto w2 = rotate(w, 3), w3 = rotate(w, 5);
+  for (int guard : {1, 2, 0}) {
+    g_guard = guard;
+    for (const char* ty : {"u32", "s32"})
+      for (const char* op : {"div", "rem"}) {
+        const std::string o = std::string(op) + "." + ty;
+        same(o + " %d, %a, %b;", false, a, b, c);
+        same(o + " %d, %a, 7;", false, a, b, c);
+        same(o + " %d, %a, -1;", false, a, b, c);
+        same(o + " %d, %a, 0;", false, a, b, c);
+        same(o + " %d, -2147483648, %b;", false, a, b, c);
+        same(o + " %a, %a, %b; mov.b32 %d, %a;", false, a, b, c);
+      }
+    same("mov.u64 %D, %A;", true, w, w2, w3);
+    same("mov.b64 %D, 5;", true, w, w2, w3);
+    same("mov.u64 %D, -5;", true, w, w2, w3);
+    same("mov.b64 %D, 4294967296;", true, w, w2, w3);   // beyond 32 bits: the general path
+    same("mov.u64 %D, %rd20;", true, w, w2, w3);         // a register nothing has written
+    same("cvta.to.global.u64 %D, %A;", true, w, w2, w3);
+    same("cvta.global.u64 %D, %A;", true, w, w2, w3);
+    same("cvta.shared.u64 %D, %A;", true, w, w2, w3);   // a window to add: the general path
+    same("cvta.to.shared.u64 %D, %A;", true, w, w2, w3);
+    same("mov.u32 %d, WARP_SZ;", false, a, b, c);
+    same("setp.lt.u32 %p3, %a, %b; setp.ge.u32 %p4, %a, %c; and.pred %p5, %p3, %p4; or.pred %p6, %p3, %p4; "
+         "xor.pred %p7, %p3, %p5; not.pred %p2, %p6; selp.u32 %r3, 1, 0, %p5; selp.u32 %r4, 2, 0, %p6; "
+         "selp.u32 %r5, 4, 0, %p7; selp.u32 %r6, 8, 0, %p2; or.b32 %d, %r3, %r4; or.b32 %d, %d, %r5; "
+         "or.b32 %d, %d, %r6;", false, a, b, c);
+    same("setp.lt.u32 %p3, %a, %b; not.pred %p3, %p3; selp.u32 %d, 3, 4, %p3;", false, a, b, c);   // destination is a source
+    g_guard = 0;
+  }
+  // Strict mode turns a zero divisor into an error; the pre-decoded form leaves it to the general path.
+  auto run_strict = [&](const char* fp) {
+    setenv("VGPU_STRICT", "1", 1);
+    setenv("VGPU_FASTPATH", fp, 1);
+    std::string err;
+    try {
+      run("div.u32 %d, %a, %b;", false, a, b, c);
+    } catch (const std::exception& e) {
+      err = e.what();
+    }
+    unsetenv("VGPU_STRICT");
+    unsetenv("VGPU_FASTPATH");
+    return err;
+  };
+  const std::string fast_err = run_strict("1"), slow_err = run_strict("0");
+  VCHECK(!slow_err.empty());
+  VCHECK_EQ(fast_err, slow_err);
+}
+
+// ld.param of each scalar type into 32- and 64-bit registers: signed values extend, unsigned ones do not, in the pre-decoded
+// form and in the general path alike.
+VTEST(ld_param_of_every_scalar_type_gives_the_same_value) {
+  const std::string ptx = R"(.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 out, .param .s8 a, .param .s16 b, .param .s32 c, .param .u8 d, .param .u16 e,
+                  .param .f32 f, .param .u64 g, .param .s32 h)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    ld.param.s8 %r1, [a];
+    ld.param.s16 %r2, [b];
+    ld.param.s32 %r3, [c];
+    ld.param.u8 %r4, [d];
+    ld.param.u16 %r5, [e];
+    ld.param.f32 %r6, [f];
+    ld.param.u64 %rd2, [g];
+    ld.param.s32 %rd3, [h];
+    st.global.u32 [%rd1], %r1;
+    st.global.u32 [%rd1+4], %r2;
+    st.global.u32 [%rd1+8], %r3;
+    st.global.u32 [%rd1+12], %r4;
+    st.global.u32 [%rd1+16], %r5;
+    st.global.u32 [%rd1+20], %r6;
+    st.global.u64 [%rd1+24], %rd2;
+    st.global.u64 [%rd1+32], %rd3;
+    ret;
+}
+)";
+  for (const char* fp : {"1", "0"}) {
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(ptx);
+    const uint64_t out = mem.alloc(48);
+    LaunchConfig cfg;
+    cfg.block = {40, 1, 1};   // two warps, the second partial
+    const std::vector<std::vector<uint8_t>> args = {arg_u64(out), {0x85}, {0x34, 0x92}, {0x78, 0x56, 0x34, 0x82}, {0xF1},
+                                                    {0xCD, 0xAB}, {0x00, 0x00, 0x80, 0x3F}, arg_u64(0x1122334455667788ull),
+                                                    {0x01, 0x00, 0x00, 0x80}};
+    exec::launch(m.entries[0], cfg, args, mem, prof);
+    uint32_t w[6];
+    uint64_t q[2];
+    mem.read(out, w, 24);
+    mem.read(out + 24, q, 16);
+    unsetenv("VGPU_FASTPATH");
+    VCHECK_EQ(w[0], 0xFFFFFF85u);   // s8 -> 32 bits, sign-extended
+    VCHECK_EQ(w[1], 0xFFFF9234u);
+    VCHECK_EQ(w[2], 0x82345678u);
+    VCHECK_EQ(w[3], 0xF1u);
+    VCHECK_EQ(w[4], 0xABCDu);
+    VCHECK_EQ(w[5], 0x3F800000u);
+    VCHECK_EQ(q[0], 0x1122334455667788ull);
+    VCHECK_EQ(q[1], 0xFFFFFFFF80000001ull);   // s32 into a 64-bit register: sign-extended
+  }
+}
+
 // f32 arithmetic with .ftz, the contracted subtract (an fma that negates its product or its addend) with and without
 // .ftz, and setp.ftz, unguarded and under both guards: the operands are subnormals, NaNs of every payload, infinities
 // and signed zeros, and the results land in the subnormal range.
