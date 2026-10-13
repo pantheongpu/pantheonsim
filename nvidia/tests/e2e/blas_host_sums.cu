@@ -459,6 +459,47 @@ static void check_trsm(cublasHandle_t h) {
   each_type(cuDoubleComplex{});
 }
 
+// ---- gemv (real): y = alpha op(A) x + beta y, each y[i] one chain in the type's own arithmetic ----
+template <class T> static cublasStatus_t gemv_call(cublasHandle_t h, cublasOperation_t t, int m, int n, const T* al, const T* A, int lda, const T* x, int incx, const T* be, T* y, int incy);
+template <> cublasStatus_t gemv_call<float>(cublasHandle_t h, cublasOperation_t t, int m, int n, const float* al, const float* A, int lda, const float* x, int incx, const float* be, float* y, int incy) { return cublasSgemv(h, t, m, n, al, A, lda, x, incx, be, y, incy); }
+template <> cublasStatus_t gemv_call<double>(cublasHandle_t h, cublasOperation_t t, int m, int n, const double* al, const double* A, int lda, const double* x, int incx, const double* be, double* y, int incy) { return cublasDgemv(h, t, m, n, al, A, lda, x, incx, be, y, incy); }
+
+static size_t velem(int i, int n, int inc) { return inc > 0 ? (size_t)i * inc : (size_t)(n - 1 - i) * -inc; }
+
+template <class T> static void check_gemv_type(cublasHandle_t h, const char* tn) {
+  std::mt19937_64 rng(88);
+  char what[200];
+  for (const Mix mix : {Mix::Plain, Mix::Zeros, Mix::Subnormal, Mix::InfNan, Mix::Overflow})
+    for (const cublasOperation_t t : {CUBLAS_OP_N, CUBLAS_OP_T})
+      for (const int incx : {1, -2, 3})
+        for (const int incy : {1, -1, 2}) {
+          const int m = 70 + (int)(rng() % 9), n = 53 + (int)(rng() % 7), lda = m + (int)(rng() % 3);
+          const int xlen = t == CUBLAS_OP_N ? n : m, ylen = t == CUBLAS_OP_N ? m : n;
+          const auto A = gen<T>((size_t)lda * n, mix, rng);
+          const auto x = gen<T>((size_t)(xlen - 1) * std::abs(incx) + 1, mix, rng), y0 = gen<T>((size_t)(ylen - 1) * std::abs(incy) + 1, Mix::Plain, rng);
+          for (const int q : {0, 1, 2}) {
+            const T al = q == 0 ? T(1) : T(0.75), be = q == 2 ? T(-0.5) : (q == 1 ? T(1) : T(0));
+            std::vector<T> want = y0;
+            for (int i = 0; i < ylen; ++i) {
+              T acc = 0;
+              for (int j = 0; j < xlen; ++j) acc += A[t == CUBLAS_OP_N ? (size_t)i + (size_t)j * lda : (size_t)j + (size_t)i * lda] * x[velem(j, xlen, incx)];
+              T& yi = want[velem(i, ylen, incy)];
+              yi = be == T(0) ? al * acc : al * acc + be * yi;
+            }
+            T *dA = dev(A), *dx = dev(x), *dy = dev(y0);
+            const cublasStatus_t st = gemv_call<T>(h, t, m, n, &al, dA, lda, dx, incx, &be, dy, incy);
+            std::snprintf(what, sizeof what, "%sgemv op %d %dx%d incx %d incy %d beta %g mix %s", tn, (int)t, m, n, incx, incy, (double)be, mix_name(mix));
+            report(st == CUBLAS_STATUS_SUCCESS && same_all(host(dy, y0.size()), want), what);
+            cudaFree(dA); cudaFree(dx); cudaFree(dy);
+          }
+        }
+}
+
+static void check_gemv(cublasHandle_t h) {
+  check_gemv_type<float>(h, "S");
+  check_gemv_type<double>(h, "D");
+}
+
 int main() {
   cublasHandle_t h;
   if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) {
@@ -467,6 +508,7 @@ int main() {
   }
   check_level3(h);
   check_trsm(h);
+  check_gemv(h);
   cublasDestroy(h);
   std::printf("%d checks, %d failed\n", checks, failures);
   std::printf(failures ? "FAIL\n" : "PASS\n");

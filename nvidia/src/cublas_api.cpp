@@ -1153,11 +1153,15 @@ cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t trans, int m, int n, con
   auto hA = fetch<T>(A, extent(lda, n, m));
   auto hx = fetch<T>(x, span(xlen, incx));
   auto hy = fetch<T>(y, span(ylen, incy));
+  // Each y[i] is one chain  acc = 0; acc += A(i,j) * x[j]  over j in order, which the host product runs for many i at once (x as a
+  // dense column; op(A) = A or A^T, whichever makes the chain contiguous).
+  std::vector<T> xd(static_cast<size_t>(xlen)), accv(static_cast<size_t>(ylen));
+  for (int j = 0; j < xlen; ++j) xd[static_cast<size_t>(j)] = hx[elem(j, xlen, incx)];
+  vgpu::hostgemm::gemm<T, T>(trans != CUBLAS_OP_N, false, ylen, 1, xlen, hA.data(), lda, xd.data(), xlen,
+                             [&](int64_t i, int64_t, T acc) { accv[static_cast<size_t>(i)] = acc; });
   for (int i = 0; i < ylen; ++i) {
-    T acc = 0;
-    for (int j = 0; j < xlen; ++j)
-      acc += hA[trans == CUBLAS_OP_N ? idx(i, j, lda) : idx(j, i, lda)] * hx[elem(j, xlen, incx)];
     T& yi = hy[elem(i, ylen, incy)];
+    const T acc = accv[static_cast<size_t>(i)];
     yi = b == T(0) ? a * acc : a * acc + b * yi;
   }
   store(y, hy);
