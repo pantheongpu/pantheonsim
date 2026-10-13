@@ -227,8 +227,8 @@ void build_micro(EntryFn& fn) {
         if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
       }
     } else if (const auto* op = std::get_if<OpSetp>(&ins.op)) {
-      ok = op->ty.bits == 32 && !op->ty.is_bfloat() && !op->has_bop && !op->has_q && !op->packed && !op->ftz &&
-           narrow_dst(op->dst) && source(0, op->a) && source(1, op->b);
+      ok = op->ty.bits == 32 && !op->ty.is_bfloat() && !op->has_bop && !op->has_q && !op->packed &&
+           (!op->ftz || op->ty.is_float()) && narrow_dst(op->dst) && source(0, op->a) && source(1, op->b);
       // The integer comparisons the fast path knows: the six ordered ones.
       if (ok && !op->ty.is_float() &&
           !(op->cmp == CmpOp::Eq || op->cmp == CmpOp::Ne || op->cmp == CmpOp::Lt || op->cmp == CmpOp::Le ||
@@ -237,6 +237,7 @@ void build_micro(EntryFn& fn) {
       if (ok) {
         u.kind = MicroOp::Setp32;
         u.sub = static_cast<uint8_t>(op->cmp);
+        if (op->ftz) u.flags |= MicroOp::kFtz;
         if (op->ty.is_float()) u.flags |= MicroOp::kFloat;
         if (op->ty.is_signed()) u.flags |= MicroOp::kSigned;
       }
@@ -264,16 +265,21 @@ void build_micro(EntryFn& fn) {
         u.src[0] = static_cast<uint32_t>(op->target);
       }
     } else if (const auto* op = std::get_if<OpFma>(&ins.op)) {
-      ok = !(op->round != FRound::Nearest || op->sat || op->ftz || op->neg_ab || op->neg_c) && op->ty.bits == 32 &&
-           narrow_dst(op->dst) && source(0, op->a) && source(1, op->b) && source(2, op->c);
-      if (ok) u.kind = MicroOp::Fma32;
+      ok = !(op->round != FRound::Nearest || op->sat) && op->ty.bits == 32 && narrow_dst(op->dst) &&
+           source(0, op->a) && source(1, op->b) && source(2, op->c);
+      if (ok) {
+        u.kind = MicroOp::Fma32;
+        u.sub = static_cast<uint8_t>((op->neg_ab ? 1 : 0) | (op->neg_c ? 2 : 0));   // a contracted sub
+        if (op->ftz) u.flags |= MicroOp::kFtz;
+      }
     } else if (const auto* op = std::get_if<OpFloatBin>(&ins.op)) {
-      ok = !(op->round != FRound::Nearest || op->nan_propagate || op->sat || op->xorsign_abs || op->ftz ||
+      ok = !(op->round != FRound::Nearest || op->nan_propagate || op->sat || op->xorsign_abs ||
              op->approx || op->ty.bits != 32 || !op->ty.is_float()) &&
            narrow_dst(op->dst) && source(0, op->a) && source(1, op->b);
       if (ok) {
         u.kind = MicroOp::Float32;
         u.sub = static_cast<uint8_t>(op->op);
+        if (op->ftz) u.flags |= MicroOp::kFtz;
       }
     }
     if (ok) fn.micro[pc] = u;

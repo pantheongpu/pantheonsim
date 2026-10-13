@@ -1198,7 +1198,7 @@ using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt
 // them stays in cache and runs without any of that. It exists only for the
 // forms the interpreter's fast paths already take (32-bit integer arithmetic
 // and mad.lo, mov, setp, selp, not, shf, f32 arithmetic and fma, all on the narrow register
-// file, no carry, no saturation, no rounding mode; the 64-bit forms of the address arithmetic around
+// file, no carry, no saturation, no rounding mode (f32 arithmetic may be .ftz, and an fma a contracted sub or .ftz); the 64-bit forms of the address arithmetic around
 // memory accesses: integer arithmetic and setp on 64-bit registers, integer conversions, mul.wide; and
 // mul.hi, neg/abs, and the conversion of a narrow integer to f32 or f64);
 // anything else has kind None and runs as it always did. build_micro() decides, and mirrors the
@@ -1210,7 +1210,7 @@ struct MicroOp {
                          kDstWide = 64, kFtz = 128 };
   Kind kind = None;
   uint8_t sub = 0;        // IntBinOp, FloatBinOp or CmpOp, by kind; Cvt, CvtI2F: the source's width in bits;
-                          // Sign32: 1 for neg, 0 for abs
+                          // Sign32: 1 for neg, 0 for abs; Fma32: bit 0 negates the product, bit 1 the addend
   uint8_t flags = 0;
   // Bit i set (0-2): source i is an immediate in src[i], else a register id. Bit 3 + i set: that register is in the
   // 64-bit file (Int64, Cvt, Setp64; an immediate there is the 32-bit value in src[i] sign-extended).

@@ -867,6 +867,40 @@ LOOP:
   }
 }
 
+// f32 arithmetic with .ftz, the contracted subtract (an fma that negates its product or its addend) with and without
+// .ftz, and setp.ftz, unguarded and under both guards: the operands are subnormals, NaNs of every payload, infinities
+// and signed zeros, and the results land in the subnormal range.
+VTEST(pre_decoded_ftz_and_contracted_forms_match_the_general_path) {
+  std::vector<uint64_t> f = f32_values();
+  // More operands that make a product or a sum subnormal.
+  const uint32_t extra[] = {0x00800000u, 0x00800001u, 0x007FFFFFu, 0x80800000u, 0x3F000000u, 0x34000000u, 0x00000010u,
+                            0x80000010u, 0x7F7FFFFFu, 0x33800000u, 0x1A000000u, 0x0A000000u};
+  for (int i = 0; i < kThreads; ++i) f[i] = (i % 3 == 0) ? extra[(i / 3) % 12] : f[i];
+  const auto g = rotate(f, 3), h = rotate(f, 8);
+  for (int guard : {1, 2, 0}) {
+    g_guard = guard;
+    for (const char* op : {"add.ftz.f32", "sub.ftz.f32", "mul.ftz.f32", "min.ftz.f32", "max.ftz.f32", "div.rn.ftz.f32",
+                           "add.rn.ftz.f32", "mul.rn.ftz.f32"})
+      same(std::string(op) + " %d, %a, %b;", false, f, g, h);
+    same("add.ftz.f32 %d, %a, 0f00000001;", false, f, g, h);
+    same("fma.rn.ftz.f32 %d, %a, %b, %c;", false, f, g, h);
+    same("fma.rn.ftz.f32 %d, %a, 0f3F000000, %c;", false, f, g, h);
+    same("fma.rn.ftz.f32 %a, %a, %b, %a; mov.b32 %d, %a;", false, f, g, h);
+    for (const char* cmp : {"eq", "ne", "lt", "le", "gt", "ge", "equ", "neu", "ltu", "num", "nan"})
+      same(std::string("setp.") + cmp + ".ftz.f32 %p3, %a, %b; selp.u32 %d, 1, 2, %p3;", false, f, g, h);
+    // Contraction turns these pairs into one fma with a negated product or addend.
+    for (const char* pair : {"mul.f32 %r3, %a, %b; sub.f32 %d, %r3, %c;", "mul.f32 %r3, %a, %b; sub.f32 %d, %c, %r3;",
+                             "mul.f32 %r3, %a, %b; add.f32 %d, %r3, %c;", "mul.f32 %r3, %a, %b; add.f32 %d, %c, %r3;",
+                             "mul.ftz.f32 %r3, %a, %b; sub.ftz.f32 %d, %r3, %c;",
+                             "mul.ftz.f32 %r3, %a, %b; sub.ftz.f32 %d, %c, %r3;",
+                             "mul.ftz.f32 %r3, %a, %b; add.ftz.f32 %d, %r3, %c;",
+                             "mul.ftz.f32 %r3, %a, %b; add.ftz.f32 %d, %c, %r3;",
+                             "mul.f32 %r3, %a, %b; sub.ftz.f32 %d, %r3, %c;"})   // (mixed: not contracted)
+      same(pair, false, f, g, h);
+    g_guard = 0;
+  }
+}
+
 // mul.hi, neg, abs and the conversion of a narrow integer to f32 or f64, unguarded and under both guards, against the
 // general path: the magic-number multiplies of division by a constant, INT_MIN, NaN payloads and subnormals under
 // .ftz, and integers whose float rounds (above 2^24).

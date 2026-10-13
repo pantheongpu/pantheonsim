@@ -3255,6 +3255,12 @@ class Interpreter {
   bool micro_setp32(Warp& w, const MicroOp& u, Mask fm) {
     const uint32_t* a = micro_src(w, u, 0);
     const uint32_t* b = micro_src(w, u, 1);
+    if (u.flags & MicroOp::kFtz) {   // setp.ftz.f32: subnormal operands compare as signed zero
+      flush_lanes(ftz_a_.data(), a, 0, fm, W_);
+      flush_lanes(ftz_b_.data(), b, 0, fm, W_);
+      a = ftz_a_.data();
+      b = ftz_b_.data();
+    }
     Mask res = 0;
     if (!setp32_lanes(static_cast<CmpOp>(u.sub), u.flags & MicroOp::kFloat, u.flags & MicroOp::kSigned, a, b, fm, W_,
                       res))
@@ -3264,13 +3270,37 @@ class Interpreter {
     p = (p & ~fm) | (res & fm);
     return true;
   }
+  // x with its sign flipped by `flip` (0x80000000 or 0), and -- the .ftz forms -- a subnormal flushed to the zero of its
+  // sign (the general path negates and then flushes, in that order). Over the active lanes.
+  static void flush_lanes(uint32_t* out, const uint32_t* in, uint32_t flip, Mask m, uint32_t width) {
+    for_active(m, width, [&](uint32_t l) {
+      const uint32_t x = in[l] ^ flip;
+      out[l] = (x & 0x7F800000u) == 0 ? (x & 0x80000000u) : x;
+    });
+  }
   bool micro_fma32(Warp& w, const MicroOp& u, Mask fm) {
     if (alu_armed()) return false;
     const uint32_t* a = micro_src(w, u, 0);
     const uint32_t* b = micro_src(w, u, 1);
     const uint32_t* c = micro_src(w, u, 2);
+    // A contracted sub negates the product or the addend before the .ftz flush of the operands.
+    const bool ftz = u.flags & MicroOp::kFtz;
+    if (ftz || u.sub) {
+      const uint32_t flip_a = u.sub & 1 ? 0x80000000u : 0u, flip_c = u.sub & 2 ? 0x80000000u : 0u;
+      if (ftz) {
+        flush_lanes(ftz_a_.data(), a, flip_a, fm, W_);
+        flush_lanes(ftz_b_.data(), b, 0, fm, W_);
+        flush_lanes(ftz_c_.data(), c, flip_c, fm, W_);
+      } else {
+        for_active(fm, W_, [&](uint32_t l) { ftz_a_[l] = a[l] ^ flip_a; ftz_c_[l] = c[l] ^ flip_c; });
+      }
+      a = ftz_a_.data();
+      if (ftz) b = ftz_b_.data();
+      c = ftz_c_.data();
+    }
     uint32_t* d = dst32(w, u.dst, fm);
     fma32_lanes(d, a, b, c, fm, W_);
+    if (ftz) flush_lanes(d, d, 0, fm, W_);   // (a NaN is the canonical one already, and is not touched)
     w.written32[u.dst] = 1;
     return true;
   }
@@ -3474,8 +3504,16 @@ class Interpreter {
     if (alu_armed()) return false;
     const uint32_t* a = micro_src(w, u, 0);
     const uint32_t* b = micro_src(w, u, 1);
+    const bool ftz = u.flags & MicroOp::kFtz;
+    if (ftz) {   // .ftz: subnormal inputs and results to signed zero
+      flush_lanes(ftz_a_.data(), a, 0, fm, W_);
+      flush_lanes(ftz_b_.data(), b, 0, fm, W_);
+      a = ftz_a_.data();
+      b = ftz_b_.data();
+    }
     uint32_t* d = dst32(w, u.dst, fm);
     float_bin32_lanes(static_cast<FloatBinOp>(u.sub), d, a, b, fm, W_);
+    if (ftz) flush_lanes(d, d, 0, fm, W_);
     w.written32[u.dst] = 1;
     return true;
   }
@@ -13143,6 +13181,7 @@ class Interpreter {
   std::array<uint32_t, 3> imm_value_{};
   std::array<bool, 3> imm_valid_{};
   Lanes32 zero_lanes_{};
+  Lanes32 ftz_a_{}, ftz_b_{}, ftz_c_{};   // operands flushed (or negated) by a micro form that needs it
   // The same for the 64-bit forms (micro_src64): immediates, a narrow register widened, and zeros.
   std::array<Lanes, 3> imm64_lanes_{};
   std::array<uint32_t, 3> imm64_value_{};
