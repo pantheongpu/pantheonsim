@@ -117,8 +117,13 @@ struct Kernels {
 namespace detail {
 // Set when the library is loaded (src/simd/simd.cpp): the baseline kernels and "on" until then, so a call from another
 // translation unit's static initialisation still works.
-extern std::atomic<const Kernels*> g_kernels;
-extern bool g_enabled;
+//
+// Hidden: libvgpu.a is linked into every shim (libcuda, libcudart, ...), each of which has its own copy of these and
+// is meant to -- each is set when its library loads, from the same CPU and the same environment. A default-visibility
+// definition in two libraries one process loads is an ODR violation to AddressSanitizer, which aborts the process
+// when the second loads.
+extern std::atomic<const Kernels*> g_kernels __attribute__((visibility("hidden")));
+extern bool g_enabled __attribute__((visibility("hidden")));
 }  // namespace detail
 
 // The kernels at the level in use. Inline: it is called once or twice per simulated instruction.

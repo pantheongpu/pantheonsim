@@ -14177,7 +14177,9 @@ float mma_narrow_sum(const double* terms, size_t n, float c) {
   const int top = hi ? 127 - std::countl_zero(hi) : 63 - std::countl_zero(lo);
   // fp32 keeps 24 bits and nothing below 2^-149
   const int shift = std::max(top - 23, -149 - lsb);
-  const uint64_t mm = shift >= 0 ? static_cast<uint64_t>(mag >> shift) : static_cast<uint64_t>(mag << -shift);
+  // (A shift of 128 or more is undefined for a 128-bit type, and what x86 does with the count is not zero:
+  // everything below 2^-149 is zero.)
+  const uint64_t mm = shift >= 128 ? 0 : shift >= 0 ? static_cast<uint64_t>(mag >> shift) : static_cast<uint64_t>(mag << -shift);
   if (mm == 0) return 0.0f;
   // The float mm * 2^(lsb + shift): mm has at most 24 bits and the scale is at least 2^-149, so it is exact
   // unless it reaches 2^128, which is infinity. Built from the bits rather than with ldexp.
@@ -14221,7 +14223,7 @@ float mma_narrow_sum_libm(const double* terms, size_t n, float c) {
   const int top = hi ? 127 - std::countl_zero(hi) : 63 - std::countl_zero(lo);
   // fp32 keeps 24 bits and nothing below 2^-149
   const int shift = std::max(top - 23, -149 - lsb);
-  const uint64_t m = shift >= 0 ? static_cast<uint64_t>(mag >> shift) : static_cast<uint64_t>(mag << -shift);
+  const uint64_t m = shift >= 128 ? 0 : shift >= 0 ? static_cast<uint64_t>(mag >> shift) : static_cast<uint64_t>(mag << -shift);
   if (m == 0) return 0.0f;
   const double v = std::ldexp(static_cast<double>(m), lsb + shift);
   if (v >= 0x1p128) return neg ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();

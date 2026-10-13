@@ -592,7 +592,7 @@ float ref_narrow_sum(const double* terms, size_t n, float c) {
   const uint64_t hi = static_cast<uint64_t>(mag >> 64), lo = static_cast<uint64_t>(mag);
   const int top = hi ? 127 - std::countl_zero(hi) : 63 - std::countl_zero(lo);
   const int shift = std::max(top - 23, -149 - lsb);
-  const uint64_t m = shift >= 0 ? static_cast<uint64_t>(mag >> shift) : static_cast<uint64_t>(mag << -shift);
+  const uint64_t m = shift >= 128 ? 0 : shift >= 0 ? static_cast<uint64_t>(mag >> shift) : static_cast<uint64_t>(mag << -shift);
   if (m == 0) return 0.0f;
   const double v = std::ldexp(static_cast<double>(m), lsb + shift);
   if (v >= 0x1p128) return neg ? -std::numeric_limits<float>::infinity() : std::numeric_limits<float>::infinity();

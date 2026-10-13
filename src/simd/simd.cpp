@@ -211,8 +211,8 @@ int f16c_checks_run() { return g_f16c_checks.load(std::memory_order_relaxed); }
 }  // namespace testing
 
 namespace detail {
-std::atomic<const Kernels*> g_kernels{&kBase};
-bool g_enabled = true;
+std::atomic<const Kernels*> g_kernels __attribute__((visibility("hidden"))){&kBase};
+bool g_enabled __attribute__((visibility("hidden"))) = true;
 }  // namespace detail
 
 namespace {

@@ -100,11 +100,22 @@ int main(int argc, char** argv) {
   }
   nvjpegHandle_t h;
   if (nvjpegCreateSimple(&h)) return 1;
-  nvjpegJpegState_t st;
+  nvjpegJpegState_t st = nullptr;
   nvjpegJpegStateCreate(h, &st);
   const size_t cap = 1 << 20;
-  unsigned char* dev;
+  unsigned char* dev = nullptr;
   cudaMalloc(&dev, cap * 4);
+  // Released on every way out of main (a leak check, ASan's among them, covers the test too).
+  struct Release {
+    nvjpegHandle_t h;
+    nvjpegJpegState_t st;
+    unsigned char* dev;
+    ~Release() {
+      if (dev) cudaFree(dev);
+      if (st) nvjpegJpegStateDestroy(st);
+      nvjpegDestroy(h);
+    }
+  } release{h, st, dev};
   std::vector<unsigned char> host(cap * 4);
   std::vector<uint64_t> digests;
   Rng rng{20261012};
