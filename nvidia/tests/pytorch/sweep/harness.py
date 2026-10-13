@@ -132,6 +132,18 @@ def diff(g, c):
     return float((g - c).abs().max()) / max(1.0, float(c.abs().max())), ''
 
 
+def worst_element(g, c):
+    """Where the two tensors differ most, with both values: for a failure that has to be chased from the log."""
+    try:
+        g, c = g.detach().cpu().double(), c.detach().double()
+        d = torch.nan_to_num((g - c).abs(), nan=-1.0, posinf=-1.0)
+        k = int(d.argmax())
+        at = tuple(int(i) for i in torch.unravel_index(torch.tensor(k), g.shape))
+        return f", worst at {at}: {float(g.flatten()[k]):.8g} against the CPU's {float(c.flatten()[k]):.8g}"
+    except Exception:
+        return ""
+
+
 def compare(g, c, tol):
     gs, cs = flat(g), flat(c)
     if len(gs) != len(cs):
@@ -147,7 +159,7 @@ def compare(g, c, tol):
         return None
     # Which tensor it is, so a failure that comes and goes can be traced to one.
     where = f" (tensor {at} of {len(gs)}, shape {tuple(gs[at].shape)})" if len(gs) > 1 else ""
-    return f"max scaled difference {worst:g}{where}, allowed {tol:g}"
+    return f"max scaled difference {worst:g}{where}, allowed {tol:g}{worst_element(gs[at], cs[at])}"
 
 
 def short(e):

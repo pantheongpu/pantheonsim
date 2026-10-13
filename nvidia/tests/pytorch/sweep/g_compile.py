@@ -82,20 +82,23 @@ def _train(d):
 check(L, 'torch.compile: a model trained three AdamW steps (forward and backward kernels)', 3e-3, tier='full')(_train)
 
 
-def _compiled_opt(d):
+def _adam_steps(d, compiled):
     torch.manual_seed(0)
     net = nn.Linear(16, 4).to(d)
     opt = torch.optim.Adam(net.parameters(), 1e-2, capturable=d != 'cpu')
-    step = torch.compile(opt.step) if d != 'cpu' else opt.step
+    step = torch.compile(opt.step) if compiled and d != 'cpu' else opt.step
     xs = rnd(12, 16, seed=1).to(d)
+    after = []
     for _ in range(2):
         opt.zero_grad()
         net(xs).square().mean().backward()
         step()
-    return list(net.parameters())
+        after.append([p.detach().clone() for p in net.parameters()])   # each step's, so a failure names the step
+    return after
 
 
-check(L, 'torch.compile: the optimizer step (fused foreach kernels)', 3e-3, tier='full')(_compiled_opt)
+check(L, 'Adam (capturable) steps, not compiled: the compiled step\'s reference', 3e-3, tier='full')(lambda d: _adam_steps(d, False))
+check(L, 'torch.compile: the optimizer step (fused foreach kernels)', 3e-3, tier='full')(lambda d: _adam_steps(d, True))
 
 
 def _reduce_overhead(d):
