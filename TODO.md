@@ -1582,7 +1582,7 @@ number below is against a fresh build of the same source; against the stale one
   `ldexp`, `ilogb` and the divides by powers of two (each checked against libm
   on 3e8 values, and `tests/unit/test_fastpath.cpp` compares whole fetches with
   `VGPU_FASTPATH=0`). The texel reads (`MemoryManager::load_scalar`, a quarter
-  of what is left) are the memory layer's.
+  of what is left, about a seventh) are the memory layer's.
 - `popc` is the POPCNT instruction (it was libgcc's table walk: 10% of
   `int_alu`), `clz` one instruction, the arithmetic-fault flag one inline load
   (it was an out-of-line call, 3.7% of compute_virus), `%tid`/`%ntid`/`%ctaid`
@@ -1593,21 +1593,25 @@ Measured (alternating A/B, 9-21 runs, medians; the machine was shared, load
 
 | workload (PTX engine) | warp-instr/s before | after |
 | --- | ---: | ---: |
-| bench int_alu | 53 M | 66 M |
-| bench mem | 10.7 M | 13.3 M |
-| bench shared | 8.9 M | 10.3 M |
-| bench local | 13.6 M | 18.6 M |
-| bench divergent | 16.5 M | 36 M |
-| bench warp | 32.7 M | 34.6 M |
+| bench int_alu | 52 M | 63 M |
+| bench mem | 9.0 M | 11.7 M |
+| bench shared | 8.1 M | 9.4 M |
+| bench local | 12.9 M | 17.8 M |
+| bench texture | 1.85 M | 2.20 M |
+| bench divergent | 17.3 M | 38.2 M |
+| bench warp | 36.2 M | 38.3 M |
 | pantheon int_virus | 56 M | 70 M |
 | pantheon compute_virus | 30 M | 40 M |
 | pantheon memory_bank_thrash | 17 M | 24 M |
+| pantheon cache_latency | 16.5 M | 20.9 M |
 
-HeCBench programs (user CPU, whole process): 1.1x to 1.5x (aobench 2.6x);
-a call-heavy kernel (device functions and recursion) 1.26x; a linear float
-texture fetch loop 1.3x. SASS rows are within noise except wmma/mma_ptx at -3%
-that reproduces in both orders with no SASS code changed (the SASS stepper's
-placement moved; the build is layout-sensitive to a few percent either way).
+HeCBench programs (user CPU, whole process, 21 programs): 1.01x to 1.5x, most
+1.1x-1.3x (aobench 2.6x, which uses `.ftz` arithmetic throughout); a call-heavy
+kernel (device functions and recursion) 1.26x; a linear float texture fetch
+loop 1.3x. Rodinia (backprop, gaussian, lud, needle, pathfinder, srad_v2,
+streamcluster): output identical but for timing lines. SASS rows are within
+noise (wmma/mma_ptx read -3% in some runs and +3% in others with no SASS code
+changed: the build is layout-sensitive to a few percent either way).
 
 One limit found and left alone: on Intel cores a subnormal operand or result
 costs every FP operation a microcode assist, and fp64_virus's FMA chains
