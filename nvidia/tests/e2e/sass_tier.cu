@@ -284,6 +284,42 @@ static int run_copy(const char* name, int n) {
   return 0;
 }
 
+// Signed sub-word elements widen on load (LDG.S8, LDS.S16, ...): the sign extension is the handlers' to get right.
+template <class T>
+__global__ void k_widen(const T* in, i32* out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  __shared__ T s[256];
+  if (i < n) {
+    s[threadIdx.x & 255] = in[i];
+    out[i] = (i32)in[(i * 3) % n] + (i32)s[threadIdx.x & 255] * 2;
+  }
+  __syncthreads();
+  if (i < n) out[n + i] = (i32)s[(threadIdx.x * 5) & 255];
+}
+
+static int run_signed(const char* name, int n) {
+  std::vector<signed char> h8(n);
+  std::vector<short> h16(n);
+  for (int i = 0; i < n; ++i) {
+    const u64 x = next_rand();
+    h8[i] = (signed char)x;
+    h16[i] = (short)(x >> 20);
+  }
+  signed char* d8 = dev_copy(h8);
+  short* d16 = dev_copy(h16);
+  i32* out;
+  CK(cudaMalloc(&out, 2 * (size_t)n * 4 + 64));
+  k_widen<signed char><<<(n + 127) / 128, 128>>>(d8, out, n);
+  char label[64];
+  std::snprintf(label, sizeof label, "widen %s s8 n=%d", name, n);
+  if (report(label, out, 2 * (size_t)n)) return 1;
+  k_widen<short><<<(n + 127) / 128, 128>>>(d16, out, n);
+  std::snprintf(label, sizeof label, "widen %s s16 n=%d", name, n);
+  if (report(label, out, 2 * (size_t)n)) return 1;
+  CK(cudaFree(d8)); CK(cudaFree(d16)); CK(cudaFree(out));
+  return 0;
+}
+
 template <class T>
 static int run_shared(const char* name) {
   const int blocks = 3, threads = 192;
@@ -364,7 +400,7 @@ int main() {
   }
   for (int m : {1, 31, 32, 33, 1000, 4096 + 5}) {
     if (run_copy<unsigned char>("u8", m) || run_copy<unsigned short>("u16", m) || run_copy<u32>("u32", m) ||
-        run_copy<u64>("u64", m) || run_copy<Q>("q16", m))
+        run_copy<u64>("u64", m) || run_copy<Q>("q16", m) || run_signed("s8/s16", m))
       return 1;
   }
   if (run_shared<unsigned char>("u8") || run_shared<unsigned short>("u16") || run_shared<u32>("u32") ||

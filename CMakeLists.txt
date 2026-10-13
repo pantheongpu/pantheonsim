@@ -1321,6 +1321,10 @@ target_sources(test_mpeg2_decode PRIVATE nvidia/src/mpeg2_decode.cpp nvidia/src/
 target_compile_definitions(test_mpeg2_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_sass_decode nvidia/tests/unit/test_sass_decode.cpp)
 target_compile_definitions(test_sass_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The tier's analysis (src/sass/tier.cpp) over the same corpora.
+vgpu_unit_test(test_tier)
+target_include_directories(test_tier PRIVATE src)
+target_compile_definitions(test_tier PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
 target_compile_definitions(test_amd_gcn PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # And run: a wavefront over that machine code, against device memory.

@@ -814,6 +814,31 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
     if (e.message().rfind("SASS kernel ", 0) == 0) throw;
     fault(w, *cur->ins, static_cast<unsigned>(std::countr_zero(group ? group : 1u)), e.message(), e.code());
   }
+  const tier::MOp& last = ops[idx];
+  if (last.form == tier::Form::Bra) {
+    // exec_control's BRA for a fixed target: the lanes that take it go there, the others on to the next instruction;
+    // a group that branches backwards while other lanes wait gives way now and then. Counted as execute() counts it.
+    const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+    const unsigned lanes = ex == group ? glanes : popc(ex);
+    ++st.instructions;
+    st.thread_instructions += lanes;
+    st.inst_by_class[last.cls] += lanes;
+    if (ex && ex != group) ++st.divergent_branches;
+    const uint64_t here = code.base + 16 * static_cast<uint64_t>(idx);
+    const uint64_t target = code.base + static_cast<uint64_t>(last.imm);
+    for (Mask m = group; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      w.pc[l] = ((ex >> l) & 1) ? target : here + 16;
+    }
+    if (ex && last.imm <= static_cast<int64_t>(last.ins->pc) && (w.runnable() & ~group)) {
+      if (++w.spins >= 64) {
+        w.spins = 0;
+        w.give_way = true;
+      }
+    }
+    if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::BRA)].fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
   if (idx != first) {
     const uint64_t pc = code.base + 16 * static_cast<uint64_t>(idx);
     for (Mask m = group; m; m &= m - 1) w.pc[std::countr_zero(m)] = pc;

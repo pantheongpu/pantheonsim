@@ -262,7 +262,7 @@ const char* form_name(Form f) {
   static const char* const names[] = {"none",  "mov",   "iadd3", "iadd3x", "imad",  "imad32", "imadwide", "imadhi",
                                       "isetpex", "popc", "i2fp",  "ldg",    "stg",   "lds",    "sts",      "ldl",
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
-                                      "fadd",  "fmul",  "dop"};
+                                      "fadd",  "fmul",  "dop",    "bra"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -342,6 +342,16 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.imm = ins.src[0].imm;
       m.dst = d->reg == kRZ ? kNoReg : static_cast<uint16_t>(d->reg);
       accept(shared ? (store ? Form::Sts : Form::Lds) : (store ? Form::Stl : Form::Ldl));
+      return;
+    }
+    case Op::BRA: {
+      // A branch to a fixed address, taken by the lanes the guard leaves (exec_control): no .DIV/.CONV, no .U.ANY, no
+      // condition predicate beside the guard.
+      if (ins.f[0] >= 2 || ins.f[1] || ins.src.empty() || ins.src.back().kind != Kind::Label) return;
+      for (const Operand& o : ins.src)
+        if (o.kind == Kind::Pred || o.kind == Kind::UPred) return;
+      m.imm = ins.src.back().imm;
+      accept(Form::Bra);
       return;
     }
     default: break;

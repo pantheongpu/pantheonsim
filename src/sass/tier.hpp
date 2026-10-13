@@ -86,6 +86,7 @@ enum class Form : uint8_t {
   Fadd,
   Fmul,
   Dop,       // DADD, DMUL, DFMA
+  Bra,       // a plain relative BRA: run by tier_run itself when it ends a straight-line run
   Count_,
 };
 const char* form_name(Form f);

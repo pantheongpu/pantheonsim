@@ -17,6 +17,9 @@
 #include "vgpu/sass/exec.hpp"
 #include "tier.hpp"
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -206,6 +209,24 @@ std::mutex& atomic_lock(uint64_t addr) {
 }
 
 void tier_add_total(uint64_t n);   // tier_ops.inc
+
+// Whether every lane of `run` has the program counter `p` (the lowest runnable lane's): then that is the lowest address
+// and `run` the group. The addresses are compared two to a vector register where SSE2 is there.
+inline bool tier_all_at(const Warp& w, uint64_t p, Mask run) {
+  Mask eq = 0;
+#if defined(__SSE2__)
+  const __m128i want = _mm_set1_epi64x(static_cast<long long>(p));
+  for (unsigned i = 0; i < 32; i += 2) {
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i]));
+    const __m128i e = _mm_cmpeq_epi32(v, want);
+    const __m128i both = _mm_and_si128(e, _mm_shuffle_epi32(e, 0xB1));   // a 64-bit lane is equal when both halves are
+    eq |= static_cast<Mask>(_mm_movemask_pd(_mm_castsi128_pd(both))) << i;
+  }
+#else
+  for (unsigned i = 0; i < 32; ++i) eq |= static_cast<Mask>(w.pc[i] == p) << i;
+#endif
+  return (run & ~eq) == 0;
+}
 
 class Runner {
  public:
@@ -1271,6 +1292,11 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   // unpredictably, and a mispredicted branch per lane was the largest cost of this loop.
   uint64_t lo = w.pc[std::countr_zero(run)];
   Mask group = 0;
+  // With the tier on, a warp whose runnable lanes all stand at one address (the usual case) is found by comparing
+  // the 32 addresses at once: the same lo and group the pass below finds.
+  if (tier_ && tier_all_at(w, lo, run)) {
+    group = run;
+  } else
   for (Mask m = run; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     const uint64_t p = w.pc[l];
