@@ -19,6 +19,11 @@
 //
 // Blocks of the output are independent, so they go to as many threads as the
 // work warrants and the host has to spare (the same result for any count).
+//
+// Operands are read through a loader, ld(index, i, p) -> value, which turns the stored element (bf16, fp16, an
+// int8 with a scale, ...) into the accumulator type T when a panel of it is packed: no converted copy of a whole
+// matrix is ever made, and the scratch is a few panels per thread whatever the sizes. The pointer form of gemm
+// below is the loader that just casts.
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -74,23 +79,32 @@ inline bool avx2_available() {
 // the reference loop and this one disagree on the sign of such a NaN depending on how the operand is indexed). So the sign
 // and payload of a NaN that is the result of two NaNs meeting were never fixed, here or in the loops this replaces; every
 // other bit of every result is, and a result is NaN exactly when it was.
-template <class T, class S>
-inline T chain_one(bool ta, bool tb, int64_t i, int64_t j, int64_t k, const S* A, int64_t lda, const S* B, int64_t ldb) {
+template <class T, class LA, class LB>
+inline T chain_one(bool ta, bool tb, int64_t i, int64_t j, int64_t k, const LA& A, int64_t lda, const LB& B, int64_t ldb) {
   T acc = T(0);
   for (int64_t p = 0; p < k; ++p) {
-    T a = static_cast<T>(ta ? A[p + i * lda] : A[i + p * lda]);
-    T b = static_cast<T>(tb ? B[j + p * ldb] : B[p + j * ldb]);
+    T a = static_cast<T>(ta ? A(p + i * lda, i, p) : A(i + p * lda, i, p));
+    T b = static_cast<T>(tb ? B(j + p * ldb, j, p) : B(p + j * ldb, j, p));
     acc += a * b;
   }
   return acc;
 }
 
+// The loader of a plain array: the element, cast to T.
+template <class T, class S>
+struct PtrLoader {
+  const S* p;
+  T operator()(int64_t idx, int64_t, int64_t) const { return static_cast<T>(p[idx]); }
+};
+
 // Computes every output's chain and hands it to epi(i, j, acc). T is the
 // accumulator type: float, double, or uint32_t (wrapping integer sums of
-// int8 operands). Epi must be safe to call concurrently on distinct (i, j).
-template <class T, class S, class Epi>
-void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t lda, const S* B, int64_t ldb,
-          Epi&& epi, Isa isa = Isa::Auto, unsigned threads = 0) {
+// int8 operands). A and B are loaders (see the top of this file): A(idx, i, p)
+// is op(A)(i, p) stored at idx, B(idx, j, p) is op(B)(p, j). Epi must be safe to
+// call concurrently on distinct (i, j).
+template <class T, class LA, class LB, class Epi>
+void gemm_with(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const LA& A, int64_t lda, const LB& B, int64_t ldb,
+               Epi&& epi, Isa isa = Isa::Auto, unsigned threads = 0) {
   if (m <= 0 || n <= 0) return;
 #ifdef VGPU_HOSTGEMM_AVX2
   const bool wide = isa == Isa::Avx2 || (isa == Isa::Auto && avx2_available());
@@ -100,13 +114,13 @@ void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t
   const uint64_t madds = static_cast<uint64_t>(m) * static_cast<uint64_t>(n) * static_cast<uint64_t>(k);
   if (madds < 4096 || k == 0) {   // too small to be worth blocking: the chains, one at a time
     for (int64_t j = 0; j < n; ++j)
-      for (int64_t i = 0; i < m; ++i) epi(i, j, chain_one<T, S>(ta, tb, i, j, k, A, lda, B, ldb));
+      for (int64_t i = 0; i < m; ++i) epi(i, j, chain_one<T>(ta, tb, i, j, k, A, lda, B, ldb));
     return;
   }
 
-  using G = generic::Ops<T, S>;
+  using G = generic::Ops<T>;
 #ifdef VGPU_HOSTGEMM_AVX2
-  using W = avx2::Ops<T, S>;
+  using W = avx2::Ops<T>;
 #else
   using W = G;
 #endif
@@ -149,6 +163,13 @@ void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t
     for (int64_t j = 0; j < nc; ++j)
       for (int64_t i = 0; i < mc; ++i) epi(ic + i, jc + j, acc[static_cast<size_t>(i + j * mcp)]);
   });
+}
+
+// The same over plain arrays of S.
+template <class T, class S, class Epi>
+void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t lda, const S* B, int64_t ldb, Epi&& epi,
+          Isa isa = Isa::Auto, unsigned threads = 0) {
+  gemm_with<T>(ta, tb, m, n, k, PtrLoader<T, S>{A}, lda, PtrLoader<T, S>{B}, ldb, static_cast<Epi&&>(epi), isa, threads);
 }
 
 }  // namespace vgpu::hostgemm
