@@ -13,11 +13,48 @@ add_compile_options(-Wall -Wextra)
 # The interpreter is the hot path and benefits measurably from cross-TU
 # inlining. Enabled only for Release builds, and only if the toolchain
 # supports it, so debug builds and odd toolchains are unaffected.
+# -DVGPU_LTO=OFF builds without it: an order of magnitude less link time for
+# a development loop that does not measure speed.
+option(VGPU_LTO "Link-time optimization in Release builds" ON)
 include(CheckIPOSupported)
 check_ipo_supported(RESULT VGPU_HAVE_LTO OUTPUT _lto_msg)
-if(VGPU_HAVE_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
+if(VGPU_LTO AND VGPU_HAVE_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
   message(STATUS "Link-time optimization enabled for Release")
+endif()
+
+# Profile-guided optimization with GCC, opt in and never the default. The
+# profile belongs to one compiler version and one revision of the sources, so
+# nothing is committed: train and build in the same build directory.
+#   cmake -B build-pgo -DVGPU_PGO=generate && cmake --build build-pgo
+#   scripts/pgo-train.sh build-pgo         (runs the training programs)
+#   cmake -B build-pgo -DVGPU_PGO=use && cmake --build build-pgo
+# The "use" step must keep the build directory's path, which names the profile
+# files. It changes code generation only; a test result must not differ.
+# Code the training run does not reach is compiled for size, which can be slower
+# than without a profile (the PTX engine's fma lane loops lost their FMA
+# inlining when only SASS programs trained): train on what you will run.
+set(VGPU_PGO "" CACHE STRING "Profile-guided optimization: generate, use, or empty for off")
+set_property(CACHE VGPU_PGO PROPERTY STRINGS "" generate use)
+set(VGPU_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "Where the PGO profile (.gcda files) is written and read")
+if(VGPU_PGO)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR "VGPU_PGO is written for GCC (-fprofile-generate=DIR); this is ${CMAKE_CXX_COMPILER_ID}")
+  endif()
+  if(VGPU_PGO STREQUAL "generate")
+    # prefer-atomic: a training run may use several host threads.
+    set(_pgo_flags -fprofile-generate=${VGPU_PGO_DIR} -fprofile-update=prefer-atomic)
+  elseif(VGPU_PGO STREQUAL "use")
+    # A function whose source changed since the profile was taken is compiled
+    # without it (-Wno-coverage-mismatch), not rejected.
+    set(_pgo_flags -fprofile-use=${VGPU_PGO_DIR} -fprofile-correction -Wno-missing-profile
+                   -Wno-coverage-mismatch)
+  else()
+    message(FATAL_ERROR "VGPU_PGO must be generate, use or empty, not '${VGPU_PGO}'")
+  endif()
+  add_compile_options(${_pgo_flags})
+  add_link_options(${_pgo_flags})
+  message(STATUS "Profile-guided optimization: ${VGPU_PGO} (${VGPU_PGO_DIR})")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -182,15 +219,29 @@ add_library(vgpu STATIC
   src/ptx/regalloc.cpp
   src/ptx/contract.cpp
   src/ptx/sync_masks.cpp
+  src/simd/simd.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/exec/devrt.cpp
+  src/exec/worker_pool.cpp
   src/runtime/runtime.cpp
   src/runtime/shared_runtime.cpp
   src/runtime/visible_devices.cpp
   nvidia/src/device_attributes.cpp
 )
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
+
+# With LTO on, every executable that links this archive re-optimises all of it
+# at link time. The ~90 unit tests did that on CI: 11 of the 16 minutes of a
+# build were their links. So the archive keeps machine code next to the LTO
+# bytecode (-ffat-lto-objects): the shims still link it with LTO and get the
+# same code as before, while a test (marked at the end of this file) links the
+# machine code and takes seconds.
+option(VGPU_TEST_FAST_LINK "Link unit tests without LTO (the vgpu archive carries machine code for them)" ON)
+if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set_target_properties(vgpu PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
+  target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
+endif()
 
 # libvgpucuda: the CUDA Driver API shim external programs link against.
 add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/driver_graph.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
@@ -1184,12 +1235,25 @@ vgpu_unit_test(test_blackwell)
 vgpu_unit_test(test_rubin)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
+# The host threads that run a grid's blocks, kept between launches: reuse,
+# nesting, several callers, fork; and the same kernels at 1, 2 and N threads.
+vgpu_unit_test(test_worker_pool)
+vgpu_unit_test(test_sched)
+# The SASS executor's memory-access counting, against the straightforward version it replaced
+# (vgpu/exec/mem_counters.hpp, which both engines count with).
+vgpu_unit_test(test_sass_access_count)
+# The memory manager's per-thread lookup cache, against its general path.
+vgpu_unit_test(test_memfast)
+# The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
+vgpu_unit_test(test_simd)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
 vgpu_unit_test(test_barriers)
 # Dynamic parallelism at the PTX level.
 vgpu_unit_test(test_dynpar)
+# What a device remembers between launches gives the answers a device that remembers nothing gives.
+vgpu_unit_test(test_launch_cache)
 vgpu_unit_test(test_devrt)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
@@ -1228,6 +1292,9 @@ vgpu_unit_test(test_nvenc_hevc nvidia/tests/unit/test_nvenc_hevc.cpp)
 vgpu_unit_test(test_nvenc_h264_enc nvidia/tests/unit/test_nvenc_h264_enc.cpp)
 target_sources(test_nvenc_h264_enc PRIVATE nvidia/src/nvenc_h264_enc.cpp nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp nvidia/src/h264_stream.cpp)
 target_compile_definitions(test_nvenc_h264_enc PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The bytes both compressing encoders write, as digests taken before their inner loops were reworked for speed.
+vgpu_unit_test(test_nvenc_golden nvidia/tests/unit/test_nvenc_golden.cpp)
+target_sources(test_nvenc_golden PRIVATE nvidia/src/nvenc_h264_enc.cpp nvidia/src/nvenc_hevc_enc.cpp nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp nvidia/src/h264_stream.cpp)
 # The compressing HEVC encoder behind NVENC, against ffmpeg's decoder where it is installed.
 vgpu_unit_test(test_nvenc_hevc_enc nvidia/tests/unit/test_nvenc_hevc_enc.cpp)
 target_sources(test_nvenc_hevc_enc PRIVATE nvidia/src/nvenc_hevc_enc.cpp)
@@ -1235,6 +1302,14 @@ target_sources(test_nvenc_hevc_enc PRIVATE nvidia/src/nvenc_hevc_enc.cpp)
 vgpu_unit_test(test_h264_decode nvidia/tests/unit/test_h264_decode.cpp)
 target_sources(test_h264_decode PRIVATE nvidia/src/h264_decode.cpp nvidia/src/h264_parser.cpp nvidia/src/h264_stream.cpp)
 target_compile_definitions(test_h264_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The host matrix product behind cuBLAS and cuBLASLt, bit for bit against the plain loops it replaced.
+vgpu_unit_test(test_host_gemm nvidia/tests/unit/test_host_gemm.cpp)
+# The host convolution behind cuDNN and the host FFT behind cuFFT, likewise.
+vgpu_unit_test(test_host_conv nvidia/tests/unit/test_host_conv.cpp)
+vgpu_unit_test(test_host_fft nvidia/tests/unit/test_host_fft.cpp)
+# The dense factorizations behind cuSOLVER and the JPEG transform and colour conversion behind nvJPEG, likewise.
+vgpu_unit_test(test_host_dense nvidia/tests/unit/test_host_dense.cpp)
+vgpu_unit_test(test_host_jpeg nvidia/tests/unit/test_host_jpeg.cpp)
 # The HEVC decoder and parser behind NVDEC, against the CRC-32 of every frame an RTX 3060 displayed.
 vgpu_unit_test(test_hevc_decode nvidia/tests/unit/test_hevc_decode.cpp)
 target_sources(test_hevc_decode PRIVATE nvidia/src/hevc_decode.cpp nvidia/src/hevc_parser.cpp nvidia/src/hevc_syntax.cpp nvidia/src/hevc_stream.cpp)
@@ -1939,6 +2014,15 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 
+  # The plain ALU and tensor-core forms the SIMD kernels run (include/vgpu/simd), pinned to the bits the
+  # simulator gave before the kernels, on both engines at every SIMD level.
+  add_test(NAME e2e_simd_lane_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_simd_lane_forms.sh)
+  set_tests_properties(e2e_simd_lane_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
   # bf16 arithmetic, half2 atomics and labeled_partition, through nvcc. The
   # unit tests feed hand-written PTX; a compiler emits forms a hand-written
   # test never thinks to write, and this is what catches the difference. It
@@ -2005,7 +2089,7 @@ if(TARGET vgpucublas)
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
                           "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvcomp_streaming:nvcomp" "nvcomp_cpu:nvcomp_cpu:nvcomp"
                           "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
-                          "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg"
+                          "solver_sparse_ll_paths:cusolver:cusparse" "nvjpeg_paths:nvjpeg" "nvjpeg_damaged:nvjpeg"
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
                           "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_fp8_attention:cudnn" "dnn_fp8_attention_probe:cudnn" "dnn_fp8_attention_frontend:cudnn"
@@ -2282,6 +2366,27 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  # The benchmark workloads' instruction counters (tools/bench): counts, never times, on SASS and PTX,
+  # against tools/bench/expected. A simulator change that alters a counter fails here.
+  add_test(NAME bench_counters
+           COMMAND ${CMAKE_SOURCE_DIR}/tools/bench/run_bench_check.sh)
+  set_tests_properties(bench_counters PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "SKIP:"
+    TIMEOUT 300)
+
+  # Thousands of launches on the pool of host threads, on several streams and from
+  # several host threads, at VGPU_THREADS=1, 2, 7 and the default, on SASS and PTX:
+  # every run prints the same lines.
+  add_test(NAME e2e_sched_pool
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sched_pool.sh)
+  set_tests_properties(e2e_sched_pool PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 900)
 
   add_test(NAME e2e_lop3_pred_chain
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lop3_pred_chain.sh)
@@ -2717,6 +2822,15 @@ add_test(NAME e2e_sass_path
 set_tests_properties(e2e_sass_path PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 600)
+
+# The SASS executor's fast paths against its general path (VGPU_FASTPATH=0): answers and counters.
+add_test(NAME e2e_sass_fastpath
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_fastpath.sh)
+set_tests_properties(e2e_sass_fastpath PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 600)
 
 # SASS on every architecture: programs built for each generation's SASS, sm_75
@@ -3272,6 +3386,14 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # What the runtime and driver remember between launches never shows: the same
+  # results and errors with and without it, across loads, unloads and resets.
+  add_test(NAME e2e_launch_cache COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_cache.sh)
+  set_tests_properties(e2e_launch_cache PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # A kernel's fault reported by the calls after its launch, not by the
   # launch, from the runtime and the driver, as an RTX 3060 reports it.
   add_test(NAME e2e_deferred_errors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_deferred_errors.sh)
@@ -3369,3 +3491,33 @@ get_property(_vgpu_all_tests DIRECTORY PROPERTY TESTS)
 if(_vgpu_all_tests)
   set_tests_properties(${_vgpu_all_tests} PROPERTIES SKIP_REGULAR_EXPRESSION "(^|\n)SKIP:")
 endif()
+
+# Unit tests link the archive's machine code, not LTO (see the comment on the
+# vgpu library). Only the tests: the shims and the vgpu tool keep LTO.
+if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  get_property(_vgpu_all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_t IN LISTS _vgpu_all_targets)
+    get_target_property(_type ${_t} TYPE)
+    if(_type STREQUAL "EXECUTABLE" AND _t MATCHES "^test_")
+      set_target_properties(${_t} PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
+      # The archive's objects carry LTO bytecode too, and the compiler driver
+      # runs LTO on them at link time unless told not to: 70 s of CPU, against
+      # 0.1 s for the plain link, for a test that gains nothing from it.
+      target_link_options(${_t} PRIVATE -fno-lto)
+    endif()
+  endforeach()
+endif()
+
+# The CUTLASS and CuTe tests each size their nvcc compiles from the memory
+# free when they start (cutlass_compile_jobs in nvidia/tests/e2e/cutlass_fetch.sh),
+# ten gigabytes a compile. Two of them at once under `ctest -j` would each count
+# the same free memory, so they take a lock and run one at a time; everything
+# else may overlap them. A serial ctest ignores the lock.
+foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopper e2e_cutlass_sm103
+           e2e_cutlass_sm100_conv e2e_cutlass_fmha e2e_tma_gemm_cute e2e_wgmma_cute
+           e2e_tma_reduce_cute e2e_tensormap_replace_cute e2e_sass_archs e2e_device_runtime
+           e2e_sync_masks)
+  if(TEST ${_t})
+    set_property(TEST ${_t} APPEND PROPERTY RESOURCE_LOCK nvcc_memory)
+  endif()
+endforeach()

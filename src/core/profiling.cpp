@@ -241,7 +241,9 @@ void notify_init_finished() {
 
 SyncScope::SyncScope(SyncKind kind, uint64_t stream, uint64_t event, uint32_t device)
     : kind_(kind), stream_(stream), event_(event), device_(device), outermost_(t_sync_depth++ == 0) {
-  if (outermost_) t0_ = host_ns();
+  // The start is only a record's; nobody recording means nobody reads it (the destructor reads it only when
+  // recording is on at the end, and a record that was switched on during the wait has no start to give).
+  if (outermost_ && enabled()) t0_ = host_ns();
 }
 SyncScope::~SyncScope() {
   --t_sync_depth;
@@ -250,8 +252,8 @@ SyncScope::~SyncScope() {
     Event ev;
     ev.kind = EventKind::Sync;
     ev.sync_kind = static_cast<uint8_t>(kind_);
-    ev.start_ns = t0_;
     ev.end_ns = host_ns();
+    ev.start_ns = t0_ ? t0_ : ev.end_ns;   // recording came on during the wait: no start was taken
     ev.device = device_;
     ev.correlation = work_correlation();
     ev.stream = stream_;

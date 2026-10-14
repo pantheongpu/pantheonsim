@@ -1413,6 +1413,15 @@ should say both. Done, not missing: the per-opcode histogram `inst_by_opcode`
 
 ## Performance
 
+**2026-10-12: the host threads that run a grid are a pool.** A launch used to
+create and join `VGPU_THREADS` threads each time; for 10,000 launches of 8 small
+blocks that was 246 us per launch against 40 us with parked threads (SASS; PTX
+222 vs 30 us; grid 64: 742 vs 236 us; grid 1 runs inline and is unchanged), on a
+host at load 9-15, medians of 7 alternating runs. `include/vgpu/exec/worker_pool.hpp`,
+`docs/perf-design/host-parallelism.md` (also: what was measured and rejected for
+block hand-out, per-block reuse, warps of a block on several threads, and
+cooperative launches) and `docs/perf-design/streams.md`.
+
 **2026-09-25: fast paths, measured on the pantheon workloads that hit their
 watchdog at full size.** perf (extracted from Ubuntu's linux-tools package;
 no install needed) put int_virus's time in int_bin, dispatch, read_operand
@@ -1465,6 +1474,22 @@ finish:
 fp64_virus is held back by the subnormal assists below; mma_virus by the
 matrix work itself, which is still about 1 M warp instructions a second.
 
+**2026-10-12: SIMD lane kernels (include/vgpu/simd, src/simd).** The build is baseline x86-64, so the
+numeric kernels are compiled twice (baseline, and AVX2+FMA+F16C under a target pragma) and chosen once at load;
+`VGPU_SIMD=base|avx2` caps the level and `VGPU_SIMD=off` sends the engines back to their old code.
+Profiled with perf first: the SASS HMMA path was 76% element-at-a-time decode with libgcc half-to-double calls
+(now one kernel: F16C, 8x8 transposes, the same sequential f32 sums, never fused); FFMA was a libm call per lane
+(now vfmadd); the SASS fast ALU forms stalled on a partial-store/wide-load of an operand-modifier struct (inlined);
+HFMA2 / fma.f16x2 now use F16C, a double FMA and an integer round to binary16 four lanes at a time; DADD/DMUL/DFMA
+work on the register pairs in place; fp8/fp6/fp4 decodes are tables; the exact narrow-float tensor sum takes the
+double apart with integer operations instead of ilogb/ldexp/floor. The PTX wmma path's F16C conversion had never
+run (its self-check compared against a table whose NaNs have no payload); it does now. Single thread, a10
+profile, one launch, median of 9 alternating runs on a loaded VM:
+SASS mma_virus 11.5x, omni_virus 8.7x, fp64_virus 4.6x, pulse_virus 2.8x, compute_virus 2.0x, int_virus 1.7x;
+PTX pulse_virus 2.0x, omni_virus 1.5x, mma_virus 1.4x, int_virus and fp64_virus unchanged. Not done: AVX-512
+(this host has none to test on). tests/unit/test_simd.cpp checks every kernel at every level against scalar
+references, e2e_simd_lane_forms pins the engines' bits for the forms (and keeps an RTX 3060's hashes).
+
 Since then (2026-09-27), profiled with perf again:
 
 - mma_virus's time was the WMMA fast path's bookkeeping, not the multiply.
@@ -1488,6 +1513,37 @@ Since then (2026-09-27), profiled with perf again:
   dominate. Doing the FMAs four lanes at a time with AVX was measured and
   was no faster (the assist is not cheaper for a vector), so it was not
   kept.
+
+**2026-10-12, round 7 (the PTX interpreter, VGPU_SASS=0; one host thread, user CPU
+time, A/B alternating against the previous main, counters and program output
+identical in every pair).** Profiled with perf (cpu-clock) first:
+
+- Shared-memory kernels spent 45-60% of their time counting bank conflicts:
+  `count_addresses` zero-filled 2 KB for each of the 32 banks (and 4 KB for the
+  sectors) on every load and store. It now files each lane's words once and
+  searches sectors newest first; the old counting stays behind VGPU_FASTPATH=0.
+  lud 4.4x, pathfinder 3.2x, needle 4.0x, HeCBench matern 3.4x, merge 3.4x.
+- A shared access in the block's own memory no longer builds a `SharedRef` and
+  divides three times for the cluster rank; `ld.param` finds its slot by the
+  position the parser recorded, not by hashing its name; thread ids are counted
+  up, not divided (three 64-bit divisions a lane); `step_block` reuses its
+  runnable list.
+- The commonest forms (32-bit integer arithmetic, mad.lo, mov, setp, selp, not,
+  shf, f32 arithmetic and fma, and `bra`) are decoded once, after parsing and
+  contraction, into a 24-byte `MicroOp` (include/vgpu/ptx/ast.hpp,
+  `build_micro`). A warp on one path runs a run of them in `run_micro_batch`,
+  adding its counters once per batch instead of per instruction; it stops
+  before anything that is not one of them, at the scheduler's slice, at the step
+  budget, at a divergent branch and before the instruction at which progress is
+  reported. The f32 fma applies the canonical-NaN rule in its own pass (a
+  branch on data had mispredicted: 35% of pulse_virus). Measured on the pantheon
+  workloads, grid 4: int_virus 74 -> 96 M warp instructions/s, compute_virus
+  52 -> 75, pulse_virus 29 -> 59, omni_virus 13.5 -> 15.3; fp64_virus and
+  mma_virus unchanged (subnormal assists, and the matrix work itself).
+- Not done: 64-bit integer, cvt and mul.wide as MicroOps; computed goto (the
+  `dispatch` chain shows no hot spot of its own in the profiles); the
+  per-lane `MemoryManager::resolve` + reader lock, which is 20% of the memory-
+  bound programs and is the memory layer's.
 
 One limit found and left alone: on Intel cores a subnormal operand or result
 costs every FP operation a microcode assist, and fp64_virus's FMA chains

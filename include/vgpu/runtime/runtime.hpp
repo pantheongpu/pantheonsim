@@ -17,6 +17,7 @@
 #include <string>
 #include <list>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 #include "vgpu/exec/launch.hpp"
@@ -54,8 +55,9 @@ class Device {
   }
 
   // Reports host<->device traffic to telemetry (bytes and the time it took).
-  void note_transfer(uint64_t bytes, double seconds) {
-    if (telemetry_) telemetry_->note_transfer(static_cast<uint32_t>(physical_), bytes, seconds);
+  // `now_ns`: the steady clock in nanoseconds, if the caller has just read it (telemetry::Publisher::note_transfer).
+  void note_transfer(uint64_t bytes, double seconds, int64_t now_ns = -1) {
+    if (telemetry_) telemetry_->note_transfer(static_cast<uint32_t>(physical_), bytes, seconds, now_ns);
   }
 
   // Destroys everything this device holds -- loaded modules and their globals,
@@ -89,6 +91,23 @@ class Device {
 
   // The module's global-variable addresses (valid while the module is loaded).
   const exec::SymbolTable* symbols(uint64_t module_id) const;
+
+  // Whether this device remembers what it works out for a launch (the table of every loaded kernel, and, in the
+  // API shims, which function a kernel handle names) instead of working it out again at every launch. On unless
+  // VGPU_LAUNCH_CACHE=0; the answer must not depend on it, which is what turning it off is for (A/B timing, and
+  // tests/unit/test_launch_cache.cpp, which runs one sequence both ways and requires the same results).
+  bool launch_cache() const { return launch_cache_; }
+  void set_launch_cache(bool on) {
+    launch_cache_ = on;
+    forget_kernel_table();
+  }
+
+  // Counts the modules this device has unloaded. A caller that keeps what
+  // get_function returned for a module id may keep it for as long as this has
+  // not changed: module ids are never reused, so a function of a module that is
+  // still loaded stays where it is, and an unload anywhere on the device is
+  // the one thing that can take one away.
+  uint64_t unload_epoch() const { return unload_epoch_.load(std::memory_order_acquire); }
   // A module's global variable by name: its address and its declared size.
   // False when the module declares no global of that name.
   bool global(uint64_t module_id, const std::string& name, uint64_t* addr, uint64_t* size) const;
@@ -148,6 +167,9 @@ class Device {
     std::vector<std::pair<uint64_t, const ptx::EntryFn*>> kernels;
     std::shared_ptr<LazyModule> lazy;
     std::shared_ptr<sass::Module> sass;   // a cubin's: its code, banks and variables
+    // A cubin's kernels by name, to the first entry of that name (ptx::Module::find_entry's answer).
+    // A cubin can carry thousands, and looking one up by name was a search of all of them.
+    std::unordered_map<std::string, size_t> entry_index;
   };
   // A list, not a vector: a function handle keeps a pointer to its module's
   // symbol table, and a vector moved every module whenever another loaded, so
@@ -155,6 +177,27 @@ class Device {
   // loads a module per kernel and launches earlier ones again).
   // mutable: a lazy module parses kernels on lookup.
   mutable std::list<LoadedModule> modules_;
+  // modules_ by module id (list elements do not move), so the per-launch lookups are not a walk of every
+  // module the program has loaded. Kept with modules_: load_module, load_cubin and unload_module.
+  std::unordered_map<uint64_t, std::list<LoadedModule>::iterator> module_index_;
+  LoadedModule* find_module(uint64_t module_id) const {
+    const auto it = module_index_.find(module_id);
+    return it == module_index_.end() ? nullptr : &*it->second;
+  }
+  // Every kernel loaded on the device, by address, which a launch hands the
+  // kernel for the child grids it launches (LaunchConfig::kernels). It was
+  // rebuilt, a node per kernel, at every launch, so a launch cost as much as
+  // the number of kernels the program had loaded. Now it is built when
+  // something has changed what it holds -- a module loaded or unloaded, or a
+  // lazy module's kernel parsed -- and a launch takes a reference to the
+  // current one (a snapshot: a launch running while another thread loads a
+  // module keeps the table it started with).
+  std::shared_ptr<const exec::KernelTable> kernel_table() const;
+  void forget_kernel_table() const;
+  std::atomic<uint64_t> unload_epoch_{0};
+  bool launch_cache_ = true;
+  mutable std::mutex kernel_table_mu_;
+  mutable std::shared_ptr<const exec::KernelTable> kernel_table_;
 };
 
 // A range of host memory CUDA knows about, and the device that was current

@@ -43,6 +43,7 @@
 
 #include <cuda_runtime.h>
 
+#include "host_gemm.hpp"
 #include "vgpu/profiling.hpp"
 #include "enum_value.hpp"
 #include "vgpu/runtime/capture.hpp"
@@ -1377,13 +1378,38 @@ cublasStatus_t matmul_run(const MatmulDesc& md, const MatrixLayout& la, const Ma
                              (size_t)m, bias_type);
     std::vector<double> bgrad((size_t)(ep.bgradb ? n : m), 0.0);
 
+    // Every output is the chain  acc = acc + (((a*sa) * b) * sb)  over p in order, in double. When B's scale is 1 the
+    // last factor is exact, so the chain is acc + (a' * b) with a' = a*sa taken once per element of A: the same
+    // chain host_gemm.hpp runs for many outputs at once, without changing a bit of it. (A scale on B that is not 1
+    // keeps the loop below: its rounding cannot be moved out of the chain.)
+    std::vector<double> sums;
+    const bool unit_sb = (sb.mode == kScaleScalar || sb.mode == kScalePerBatch) && (sb.values.empty() || sb.values[0] == 1.0);
+    const bool unit_sa = (sa.mode == kScaleScalar || sa.mode == kScalePerBatch) && (sa.values.empty() || sa.values[0] == 1.0);
+    if (unit_sb && m > 0 && n > 0 && k > 0) {
+      std::vector<double> ap((size_t)m * (size_t)k), bp((size_t)k * (size_t)n);
+      for (int64_t p = 0; p < k; ++p)
+        for (int64_t i = 0; i < m; ++i) {
+          const double a = ea.get(ta ? at(la, p, i) : at(la, i, p));
+          ap[(size_t)(i + p * m)] = unit_sa ? a : a * sa.at((size_t)i, (size_t)p);
+        }
+      for (int64_t j = 0; j < n; ++j)
+        for (int64_t p = 0; p < k; ++p) bp[(size_t)(p + j * k)] = eb.get(tb ? at(lb, j, p) : at(lb, p, j));
+      sums.resize((size_t)m * (size_t)n);
+      double* const out = sums.data();
+      vgpu::hostgemm::gemm<double, double>(false, false, m, n, k, ap.data(), m, bp.data(), k,
+                                           [=](int64_t i, int64_t j, double acc) { out[(size_t)(i + j * m)] = acc; });
+    }
     std::vector<double> col((size_t)m);
     for (int64_t j = 0; j < n; ++j) {
       for (int64_t i = 0; i < m; ++i) {
         double acc = 0.0;
-        for (int64_t p = 0; p < k; ++p)
-          acc += ea.get(ta ? at(la, p, i) : at(la, i, p)) * sa.at((size_t)i, (size_t)p) *
-                 eb.get(tb ? at(lb, j, p) : at(lb, p, j)) * sb.at((size_t)j, (size_t)p);
+        if (!sums.empty()) {
+          acc = sums[(size_t)(i + j * m)];
+        } else {
+          for (int64_t p = 0; p < k; ++p)
+            acc += ea.get(ta ? at(la, p, i) : at(la, i, p)) * sa.at((size_t)i, (size_t)p) *
+                   eb.get(tb ? at(lb, j, p) : at(lb, p, j)) * sb.at((size_t)j, (size_t)p);
+        }
         const double al = alphas[alpha_vec ? (size_t)i : 0], be = betas[beta_vec ? (size_t)i : 0];
         // The epilogue runs in fp32 as the card's does: the product, the C term and the bias are each rounded to
         // fp32 (measured on an L4: a bias that is not exact in fp32 moves FP8 rounding ties).

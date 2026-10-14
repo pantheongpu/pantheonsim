@@ -1,0 +1,123 @@
+name: bench
+
+# Simulator speed, measured: tools/bench/bench.sh runs the benchmark workloads
+# on the SASS engine and on the PTX interpreter and reports warp-instructions
+# per CPU second, wall time and peak RSS. The JSON is uploaded as an artifact
+# and the table is printed to the job summary.
+#
+# This workflow does NOT gate anything and never runs on pull requests: a
+# hosted runner is a shared VM, so its timings move by tens of percent between
+# runs and between days, and a speed gate on them would fail for no reason or
+# hide a real regression. Read the numbers as a trend, and compare two builds
+# with the alternating A/B mode (tools/bench/bench.sh --ab) on one machine.
+#
+# What does gate pull requests is the counter check, a ctest test
+# (bench_counters): instruction COUNTS, not times, against
+# tools/bench/expected. It is deterministic on any host, and it is run here
+# too, nightly, as a cross-check.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "timed runs per workload and engine"
+        default: "3"
+      size:
+        description: "workload size: full (timing) or quick"
+        default: "full"
+      workloads:
+        description: "comma list of workloads or groups (empty: all)"
+        default: ""
+  schedule:
+    - cron: '41 4 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bench:
+    name: simulator speed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      # Ubuntu's CUDA 12.0 nvcc rejects the image's GCC 13 headers (see ci.yml).
+      NVCC_PREPEND_FLAGS: -ccbin g++-12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit python3
+          nvcc --version | tail -2
+
+      - name: Build (Release, shims only)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)" --target vgpucudart vgpucuda
+          ls build/shim/
+
+      - name: What this host lets us count
+        # Hardware performance counters are not promised on a hosted runner (it
+        # is a VM). Record what it offers rather than assume; the harness also
+        # writes this into the JSON meta block.
+        run: |
+          {
+            echo "### Host"
+            echo '```'
+            echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs), $(nproc) logical CPUs"
+            echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo n/a)"
+            echo "perf binary: $(command -v perf || echo none)"
+            echo "load: $(cat /proc/loadavg)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Benchmark
+        env:
+          RUNS: ${{ inputs.runs || '3' }}
+          SIZE: ${{ inputs.size || 'full' }}
+          WORKLOADS: ${{ inputs.workloads }}
+        run: |
+          args=(--build build --runs "$RUNS" --size "$SIZE" --json bench.json --markdown bench.md)
+          [[ -n "$WORKLOADS" ]] && args+=(--workloads "$WORKLOADS")
+          tools/bench/bench.sh "${args[@]}" 2>&1 | tee bench.txt
+          {
+            echo "### Simulator speed (warp-instructions per CPU second, median of $RUNS runs)"
+            echo
+            echo "Hosted runner: shared VM, expect tens of percent of noise. Not a gate."
+            echo
+            cat bench.md
+            echo
+            echo '```'
+            tail -n 2 bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Counter check (instruction counts against tools/bench/expected)
+        if: always()
+        run: |
+          set +e
+          out="$(tools/bench/bench.sh --check-counters --build build 2>&1)"
+          rc=$?
+          echo "$out"
+          { echo "### Counter check"; echo '```'; echo "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.run_id }}
+          path: |
+            bench.json
+            bench.md
+            bench.txt
+          if-no-files-found: ignore

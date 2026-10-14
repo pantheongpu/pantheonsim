@@ -11,6 +11,8 @@
 
 namespace vgpu::sass {
 
+void annotate_instr(Instr& ins);   // exec.cpp: the facts Instr::cls, ::tensor and ::straight hold
+
 bool runs_on(int cubin_sm, bool arch_specific, int device_sm) {
   if (arch_specific) return cubin_sm == device_sm;
   return cubin_sm / 10 == device_sm / 10 && cubin_sm <= device_sm;
@@ -36,7 +38,9 @@ const Instr& Code::instr(size_t i) const {
       std::memcpy(&w.lo, &(*bytes)[16 * k], 8);
       std::memcpy(&w.hi, &(*bytes)[16 * k + 8], 8);
       try {
-        out.push_back(decode(w, 16 * k, sm));
+        Instr ins = decode(w, 16 * k, sm);
+        annotate_instr(ins);
+        out.push_back(std::move(ins));
       } catch (const Error& e) {
         Instr bad;
         bad.w = w;
@@ -44,6 +48,7 @@ const Instr& Code::instr(size_t i) const {
         bad.sm = sm;
         bad.op = Op::Unknown;
         bad.mnemonic = e.what();
+        annotate_instr(bad);
         out.push_back(std::move(bad));
       }
     }

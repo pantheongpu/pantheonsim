@@ -381,7 +381,7 @@ false` throughout. gfx1251 (MI430X) is not covered.
   mixed 8-, 6- and 4-bit `f8f6f4` forms, and the block-scaled forms with E8M0, E5M3 and E4M3 scales), and the sparse
   `v_swmmac_*`. The lane layouts, the sparse index words and the scale selection come from the document's tables and
   pseudocode. Each product is summed exactly and rounded once, so the last bit can differ from hardware that sums in a
-  fixed order; `FP16_OVFL` is not modelled (an overflow gives infinity). EXEC must be all ones. No card has run them:
+  fixed order; `FP16_OVFL` (MODE bit 23) saturates a 16-bit float result (see below). EXEC must be all ones. No card has run them:
   `tests/hipcc/wmma1250.cpp` checks them against the host, and the dense checks hold for any order of K, while the
   sparse, mixed-width and scaled ones depend on the layout read from the document.
 - **Arithmetic the compiler seldom emits** (`tests/hipcc/alu1250.cpp`, each against the ISA's pseudocode written out for
@@ -411,8 +411,8 @@ false` throughout. gfx1251 (MI430X) is not covered.
   document's figure; `tests/hipcc/trload1250.cpp` feeds them to a WMMA). EXEC must be all ones.
 - **Vector registers past v255:** a wave's register file grows to what a kernel names, up to the 1024 a gfx1250 wave may
   have, and `s_set_vgpr_msb` puts the two high bits on the numbers each following instruction's destination and sources
-  name (VALU, FLAT/GLOBAL and DS instructions; the buffer and image forms and `v_movrel*` are not covered, nor is writing
-  the bits through the MODE register). `tests/hipcc/vgprs1250.cpp` keeps 600 values live at once.
+  name (VALU, FLAT/GLOBAL and DS instructions; the buffer and image forms and `v_movrel*` are not covered), or a write to
+  MODE's bits 19:12 does (see below). `tests/hipcc/vgprs1250.cpp` keeps 600 values live at once.
 - **DPP8** (all eight selects, with and without `fi`, on the VALU and compare instructions) and DPP on the compares, which
   were refused.
 - **LDS atomics and exchanges** (`tests/hipcc/ds1250.cpp`): `ds_cond_sub_*`, `ds_sub_clamp_*`, `ds_pk_add_{f16,bf16}` (with and
@@ -461,9 +461,34 @@ false` throughout. gfx1251 (MI430X) is not covered.
 - **Block loads and stores** (`global_load_block`, `global_store_block`: up to 32 dwords to or from consecutive registers, by the
   mask in M0; a scaled offset is refused) and the **cluster loads** (`cluster_load_b{32,64,128}` and `cluster_load_async_to_lds_*`,
   run as the global loads they downgrade to outside a cluster; `tests/hipcc/block1250.cpp`).
-- **Decoded and printed, but refused when executed:** the 6- and 4-bit transposed loads
-  (`*_load_tr6_*`, `*_load_tr4_*`); the `v_cvt_scale*` and `v_cvt_scalef32*` families (the ISA's pseudocode calls scaling
-  helpers it does not define); the LDS barrier arrives (`ds_atomic_*barrier_arrive*`: the barrier's width is not fixed by the ISA's text). Each says so by name
+- **The 6- and 4-bit transposed loads** (`global_load_tr6_b96`, `global_load_tr4_b64`, and the `ds_` ones; `tests/hipcc/forms1250.cpp`):
+  the document's figure labels each of the 32 K columns of the 16x32 tile with the lane whose address supplies it (16 elements along M, 96 or
+  64 bits) and the code follows it. The figure draws no destination for these two kinds, so that half is assumed from the 16- and 8-bit
+  kinds': lane = M + 16 * (K / 16), the 16 elements of a lane along K in order from bit 0.
+- **MODE and the VGPR MSB bits:** `s_setreg_b32` / `s_setreg_imm32_b32` on MODE bits 19:12 now set the registers the next instructions name,
+  as `s_set_vgpr_msb` does, and `s_getreg_b32` of MODE shows what `s_set_vgpr_msb` set. The scalar prefetches (`s_prefetch_inst`,
+  `s_prefetch_data`, their PC-relative forms and `s_buffer_prefetch_data`) do nothing (no cache to warm). `v_cvt_pk_i16_f32` and
+  `v_cvt_pk_u16_f32` convert toward zero with saturation and a NaN as zero (assumed: the document's helper functions are not defined).
+- **The scaled widening conversions** (`v_cvt_scale_pk{8,16}_{f16,bf16,f32}_{fp4,fp6,bf6,fp8,bf8}`; `tests/hipcc/forms1250.cpp`): the value times
+  2^(scale - 127), the scale an E8M0 byte of S1. Which byte, of which lane's S1, a lane takes is the document's Table 36 (4- and 6-bit) or
+  Table 37 (8-bit): the code follows the tables (the pseudocode's `S1[OPSEL * 8 +: 8]` reads only the lane's own register and agrees with them
+  only where S1 is alike in every lane); Table 37's reserved rows (block16 with OPSEL[2] set) are refused. Assumed, not stated: a scale of
+  0xFF gives NaN, and the result is exact but for an overflow, then rounded to nearest even (denormals kept).
+- **`MODE.FP16_OVFL`** (bit 23, gfx1250): set, an overflow of half-precision `add`, `sub`, `mul`, `fma`, `mad`, `fmac`, `ldexp` and `cvt_f16_f32` (and the packed
+  ones) gives the largest finite half, not infinity, and so do WMMA results of 16-bit float type, the scaled widenings to f16 or bf16, and f32 to
+  fp8/bf8 conversions (where an infinity too becomes the largest value, as the document's table says). An infinite operand stays infinite. The
+  operations whose infinite result may be a divide by zero (`rcp`, `log`) are left alone.
+- **The LDS barrier arrives** (`ds_atomic_barrier_arrive_rtn_b64`, `ds_atomic_async_barrier_arrive_b64`, and the Tensor Data Mover's
+  `atomic_barrier_enable`; `tests/hipcc/forms1250.cpp`, `tensor1250.cpp`): a 64-bit LDS word, state (pending count below, phase above) with the initial
+  count in bits 47:32; an arrive subtracts 1 (or the _RTN form's DATA0), and below zero the pending count reloads and the phase has dropped by the
+  borrow. The document leaves the pending count's width (`WIDTH`, 21 to 32 bits) set by nothing, and its two accounts of the roll-under test disagree
+  at 32; this takes 31, the largest width with a phase (a program reading the phase as `state >> W` for any smaller W sees it change), and each
+  active lane arrives in lane order. The TDM's arrive is made once after the move, to the word at `atomic_barrier_address[18:3]` from the start of
+  the LDS. Nothing wakes a sleeping wave. `src_shared_limit` reads as the document defines it.
+- **Decoded and printed, but refused when executed:** the narrowing `v_cvt_scalef32*` and `v_cvt_scalef32_sr*` families (the document does not say whether the
+  scale divides or multiplies, how an overflow before or after scaling is judged, or where the stochastic rounding's 16 random bits sit in the
+  dropped bits), `v_permlane64_b32` (assembled by LLVM, absent from the document, and gfx1250 is wave32 only), E5M3 (`CLAMP` on the fp8
+  conversions: its largest value and infinity are not stated), and clusters (no public interface launches one: HIP 7.2 has no cluster attribute). Each says so by name
   when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.
 - **A disagreement worth knowing:** AMD's XML gives the scaled matrix instructions' two-word prefix the opcodes

@@ -658,6 +658,28 @@ Operands live in, and results return to, the same virtual device memory that
 kernels see, so mixing library calls with simulated kernels works normally, and
 allocation still fails with `cudaErrorMemoryAllocation` when the device is full.
 
+### How fast the host code is, and what it may not change
+
+The host math is only as quick as the host code. The rule for making it quicker is that no result bit changes: a result
+may be compared byte for byte with the card's, so the order of the floating-point operations of each output element is
+part of what the library does. The routines that matter were therefore rewritten to keep each element's chain of
+operations exactly -- the product rounded, then the sum rounded, in the same order of the inner index, no fused
+multiply-add, no reassociation -- and to run **many chains side by side**: one per vector lane, blocked for the caches,
+and spread over the host's threads. `host_gemm.hpp` (cuBLAS and cuBLASLt matrix products, cuDNN forward and backward-data
+convolution through an unrolled copy of the input), `host_conv.hpp` (cuDNN convolution rows and the filter gradient),
+`host_fft.hpp` (cuFFT's mixed radix, twiddle factors looked up in tables that are filled once per size), `host_dense.hpp`
+(cuSOLVER's LU, Cholesky, QR and triangular solves, with the loops run down columns), `host_jpeg.hpp` (nvJPEG's
+inverse and forward DCT and colour conversion) are the kernels; `tests/unit/test_host_*.cpp` keep the loops they replaced
+as the reference and compare bits over shapes and values that break arithmetic (zeros, signed zeros, subnormals, infinities,
+NaNs, extremes).
+
+Conventions: the wide path is compiled for AVX2 *without* FMA (so a compiler cannot contract a product and a sum), chosen at
+run time, with a generic path beside it; the host threads follow `VGPU_THREADS` (1 gives one thread) and otherwise the
+CPUs the process may use, less the threads other host-library calls hold at that moment (`host_parallel.hpp`); a result
+does not depend on the thread count. The one thing that is not fixed is the sign and payload of a NaN that comes out of two
+NaNs meeting in one operation (an input NaN and the default NaN of an inf*0): the hardware returns the first operand's, and
+which operand the compiler makes first differs between two copies of the same source line, so it never was fixed.
+
 ## Verified against real hardware
 
 `nvidia/tests/conformance/run_conformance.sh` compiles each test once, runs it against

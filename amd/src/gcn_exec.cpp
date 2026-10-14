@@ -574,7 +574,11 @@ struct Machine {
       case OperandKind::Ttmp:
         if (o.index + o.width > 16) break;
         return o.width >= 2 ? w.ttmp[o.index] | static_cast<uint64_t>(w.ttmp[o.index + 1]) << 32 : w.ttmp[o.index];
+      // gfx1250: SHARED_LIMIT = {shared_base[15:0], 48'h0000FFFFFFFF}, the top of the shared aperture (CDNA5 ISA); read as the base is, its
+      // high dword or the 64 bits. (There is no private limit on this part.)
       case OperandKind::SharedLimit:
+        if (target() == gcn::Target::Gfx1250) return o.width >= 2 ? (kSharedBase | 0xFFFFFFFFull) : kSharedBase >> 32;
+        [[fallthrough]];
       case OperandKind::PrivateLimit:
         throw Error::make(Err::Unsupported, "reading ", operand_text(o), ", which this does not model");
       case OperandKind::Vgpr:
@@ -721,17 +725,18 @@ struct Machine {
   // past FNUZ fp8's 240), becomes the NaN (FNUZ, E4M3) or infinity (E5M2),
   // or with saturate the largest value. An infinity becomes the NaN, but
   // stays one in E5M2.
-  static uint32_t float_to_f8(float x, const F8& t, bool saturate, const uint32_t* random) {
+  // With `ovfl` (gfx1250's MODE.FP16_OVFL), the largest value stands in for every overflow and for an infinity, in both formats.
+  static uint32_t float_to_f8(float x, const F8& t, bool saturate, const uint32_t* random, bool ovfl = false) {
     const uint32_t sign_bit = 1u << (t.bits - 1), sign = std::signbit(x) ? sign_bit : 0;
     const uint32_t top = sign_bit - 1;                                // the largest magnitude's code
     const uint32_t nan = t.style == F8::Fnuz ? sign_bit : sign | 0x7F;
     const uint32_t largest = t.style == F8::OcpE4M3 ? 0x7E : t.style == F8::OcpE5M2 ? 0x7B : top;
     if (t.style == F8::Finite && (std::isnan(x) || std::isinf(x))) return sign | largest;
     if (std::isnan(x)) return nan;
-    if (std::isinf(x)) return t.style == F8::OcpE5M2 ? sign | 0x7C : nan;
+    if (std::isinf(x)) return ovfl ? sign | largest : t.style == F8::OcpE5M2 ? sign | 0x7C : nan;
     const double a = std::fabs(static_cast<double>(x));
     if (a > t.max) {
-      if (saturate || t.style == F8::Finite) return sign | largest;
+      if (saturate || ovfl || t.style == F8::Finite) return sign | largest;
       return t.style == F8::OcpE5M2 ? sign | 0x7C : nan;
     }
     const uint32_t zero = t.style == F8::Fnuz ? 0 : sign;   // OCP keeps a negative zero
@@ -758,6 +763,18 @@ struct Machine {
   // A half result, which fills the low half of the register and zeroes the
   // high half, as every 16-bit instruction here does.
   void write_half(Wave& w, const Inst& in, uint32_t lane, _Float16 v) {
+    // FP16_OVFL: an infinity that no infinite operand explains is an overflow, and becomes the largest finite half.
+    if (std::isinf(static_cast<float>(v)) && fp16_ovfl(w, in) && overflow_only_op(in.name)) {
+      bool finite_in = true;
+      const bool wide_src = in.name.find("cvt_f16_f32") != std::string::npos;
+      for (size_t k = 0; k < in.src.size() && k < 3; ++k) {
+        const Operand& o = in.src[k];
+        if (o.kind == OperandKind::None) continue;
+        const float f = wide_src ? lane_float(w, o, lane) : static_cast<float>(lane_half(w, o, lane));
+        finite_in = finite_in && std::isfinite(f);
+      }
+      if (finite_in) v = std::signbit(static_cast<float>(v)) ? static_cast<_Float16>(-65504.0f) : static_cast<_Float16>(65504.0f);
+    }
     // The output multiplier and the clamp apply to a half result as to a single one.
     if (in.omod || in.clamp) {
       float f = static_cast<float>(v);
@@ -1191,6 +1208,7 @@ struct Machine {
                                                              : static_cast<uint32_t>(scalar(w, in.dst[0]));
         uint32_t& reg = sched ? w.sched_mode : flat_scr ? w.flat_scratch[id - 20] : w.mode;
         reg = (reg & ~mask) | ((value << at) & mask);
+        if (id == 1 && in.arch == gcn::Target::Gfx1250) take_msb_from_mode(w);
       } else {
         uint32_t reg;
         if (id == 1) reg = w.mode;
@@ -1581,6 +1599,10 @@ struct Machine {
   }
 
   void scalar_load(Wave& w, const Inst& in) {
+    // gfx1250's scalar prefetches (s_prefetch_inst, s_prefetch_data, their PC-relative forms, s_buffer_prefetch_data) warm
+    // the constant or instruction cache: "1 = enable ... 0 = ignore them (S_NOP)" (CDNA5 ISA, MODE, and 8.5). There is
+    // no cache here to warm, and a prefetch changes no register, so it does nothing (the buffer form checks no bounds).
+    if (in.name.find("prefetch") != std::string::npos) return;
     // Counters, rather than loads. s_memtime is the shader clock, which on a
     // card runs with the core clock; here it is the instructions retired so
     // far by the host thread running the wave, which is this model's cycle
@@ -2228,7 +2250,7 @@ struct Machine {
           if (in.src[0].abs) f = std::fabs(f);
           return in.src[0].neg ? -f : f;
         };
-        const uint32_t two = float_to_f8(half_at(0), t, in.clamp, nullptr) | float_to_f8(half_at(16), t, in.clamp, nullptr) << 8;
+        const uint32_t two = float_to_f8(half_at(0), t, in.clamp, nullptr, fp16_ovfl(w, in)) | float_to_f8(half_at(16), t, in.clamp, nullptr, fp16_ovfl(w, in)) << 8;
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         write_lane(w, in.dst[0], lane, in.op_sel & 8 ? (was & 0xFFFFu) | two << 16 : (was & 0xFFFF0000u) | two);
       });
@@ -2245,7 +2267,7 @@ struct Machine {
         const uint32_t seed = lane_src(w, in.src[1], lane) >> (is_fp8 ? 25 : 24);
         const uint32_t m = ((h & 0x3FFu) + seed) & 0x3FFu;
         const float f = static_cast<float>(as_half(static_cast<uint16_t>((h & 0xFC00u) | m)));
-        const uint32_t b = float_to_f8(f, t, in.clamp, nullptr);
+        const uint32_t b = float_to_f8(f, t, in.clamp, nullptr, fp16_ovfl(w, in));
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         write_lane(w, in.dst[0], lane, (was & ~(0xFFu << at)) | b << at);
       });
@@ -2888,13 +2910,16 @@ struct Machine {
           if (out == "f32") {
             slot = as_bits(static_cast<float>(total));
           } else if (out == "f16") {
-            const _Float16 h = static_cast<_Float16>(total);
+            _Float16 h = static_cast<_Float16>(total);
+            // FP16_OVFL: an overflowing result saturates to the largest finite value instead of an infinity (CDNA5 ISA 7.12).
+            if (std::isinf(static_cast<float>(h)) && std::isfinite(total) && fp16_ovfl(w, in)) h = static_cast<_Float16>(total < 0 ? -65504.0f : 65504.0f);
             uint16_t b16;
             std::memcpy(&b16, &h, 2);
             slot = half ? (slot & 0xFFFF) | uint32_t{b16} << 16 : (slot & 0xFFFF0000u) | b16;
           } else {   // bf16 and bf16f32: a bfloat16 result, to nearest even
             const uint32_t f = as_bits(static_cast<float>(total));
-            const uint32_t bits = std::isnan(as_float(f)) ? 0x7FC0 : (f + 0x7FFF + ((f >> 16) & 1)) >> 16;
+            uint32_t bits = std::isnan(as_float(f)) ? 0x7FC0 : (f + 0x7FFF + ((f >> 16) & 1)) >> 16;
+            if ((bits & 0x7FFF) == 0x7F80 && std::isfinite(total) && fp16_ovfl(w, in)) bits = (total < 0 ? 0x8000u : 0u) | 0x7F7Fu;
             slot = half ? (slot & 0xFFFF) | bits << 16 : (slot & 0xFFFF0000u) | bits;
           }
         }
@@ -3121,6 +3146,82 @@ struct Machine {
         const uint32_t v = op == "v_mad_u16"_op ? static_cast<uint32_t>(u16(0, lane)) * u16(1, lane) + u16(2, lane)
                                                 : static_cast<uint32_t>(i16(0, lane) * i16(1, lane) + i16(2, lane));
         write_lane(w, in.dst[0], lane, v & 0xFFFF);
+      });
+    } else if (op == "v_cvt_pk_i16_f32"_op || op == "v_cvt_pk_u16_f32"_op) {
+      // Each float to a 16-bit integer, packed (CDNA5 ISA: v_cvt_i16_f32 and v_cvt_u16_f32 of S0 into the low half and S1 into
+      // the high one). The document does not define those two helpers; assumed here, as the 32-bit conversions are: toward
+      // zero, out-of-range values saturate, a NaN is zero.
+      const bool is_signed = op == "v_cvt_pk_i16_f32"_op;
+      const auto conv = [&](float f) -> uint32_t {
+        if (std::isnan(f)) return 0;
+        const double t = std::trunc(static_cast<double>(f));
+        return static_cast<uint16_t>(is_signed ? static_cast<int16_t>(std::clamp(t, -32768.0, 32767.0)) : static_cast<uint16_t>(std::clamp(t, 0.0, 65535.0)));
+      };
+      each([&](uint32_t lane) {
+        write_lane(w, in.dst[0], lane, conv(lane_float(w, in.src[0], lane)) | conv(lane_float(w, in.src[1], lane)) << 16);
+      });
+    } else if (std::string_view(in.name).substr(0, 14) == "v_cvt_scale_pk") {
+      const std::string& name = in.name;
+      // 4-, 6- and 8-bit floats widened to 16- or 32-bit ones and scaled by an E8M0 block scale, 2^(scale - 127) (CDNA5 ISA, 7.6.3):
+      // v_cvt_scale_pk{8,16}_{f16,bf16,f32}_{fp4,fp6,bf6,fp8,bf8}, scale_sel in OPSEL. Which scale byte, of which lane's S1, a data lane
+      // takes is Table 36 (4- and 6-bit) or Table 37 (8-bit) of the document: lane L (row L & 15, half L / 16) reads S1 of lane
+      // (L & 15) + 16 * A, byte `byte`, with, for 4 and 6 bits, A = OPSEL[0] and byte = OPSEL[2] ? 2 * half + OPSEL[1] : 2 * OPSEL[1] + half;
+      // for 8 bits with OPSEL[3] = 0, A = OPSEL[0] and byte = 2 * OPSEL[1] + OPSEL[2] (the same for both halves); with OPSEL[3] = 1,
+      // A = OPSEL[1] and byte = 2 * OPSEL[1] + half, OPSEL[2] reserved (refused). (The pseudocode's `S1[OPSEL * 8 +: 8]` reads only
+      // the lane's own register, which agrees where S1 is the same in every lane.) Assumed, not stated: a scale of 0xFF (E8M0's NaN)
+      // gives NaN; results are exact but for overflow, then rounded to nearest even to the 16-bit type (denormals kept).
+      const bool pk16 = name.rfind("v_cvt_scale_pk16_", 0) == 0;
+      const std::string rest = name.substr(pk16 ? 17 : 16);
+      const size_t us = rest.find('_');
+      const std::string to = rest.substr(0, us), from = rest.substr(us + 1);
+      const F8* t = from == "fp4" ? &kFp4 : from == "fp6" ? &kFp6 : from == "bf6" ? &kBf6 : from == "fp8" ? &kOcpFp8 : &kOcpBf8;
+      const uint32_t sbits = t->bits, n = pk16 ? 16 : 8, opsel = in.op_sel & 15;
+      const bool narrow = sbits < 8;
+      if (!narrow && (opsel & 8) && (opsel & 4))
+        throw Error::make(Err::Unsupported, name, " with scale_sel ", opsel, ": Table 37 of the CDNA5 ISA marks it reserved");
+      each([&](uint32_t lane) {
+        const uint32_t row = lane & 15, half = lane >> 4;
+        uint32_t src_lane, byte;
+        if (narrow) {
+          src_lane = row + 16 * (opsel & 1);
+          byte = (opsel & 4) ? 2 * half + ((opsel >> 1) & 1) : 2 * ((opsel >> 1) & 1) + half;
+        } else if (!(opsel & 8)) {
+          src_lane = row + 16 * (opsel & 1);
+          byte = 2 * ((opsel >> 1) & 1) + ((opsel >> 2) & 1);
+        } else {
+          src_lane = row + 16 * ((opsel >> 1) & 1);
+          byte = 2 * ((opsel >> 1) & 1) + half;
+        }
+        const Operand& s1 = in.src[1];
+        const uint32_t sreg = s1.kind == OperandKind::Vgpr ? w.vgpr[s1.index][src_lane] : lane_src(w, s1, lane);
+        const uint32_t e = (sreg >> (8 * byte)) & 0xFF;
+        const uint32_t out_bits = to == "f32" ? 32 : 16;
+        for (uint32_t i = 0; i < n; ++i) {
+          const uint32_t at = i * sbits;
+          uint32_t code = word(w, in.src[0], at / 32, lane) >> (at % 32);
+          if (at % 32 + sbits > 32) code |= word(w, in.src[0], at / 32 + 1, lane) << (32 - at % 32);
+          const float v = f8_to_float(code & ((1u << sbits) - 1), *t);
+          const double scaled = e == 0xFF || std::isnan(v) ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(static_cast<double>(v), static_cast<int>(e) - 127);
+          const float f = static_cast<float>(scaled);
+          uint32_t bits;
+          if (to == "f32") {
+            bits = as_bits(f);
+          } else if (to == "f16") {
+            _Float16 h = static_cast<_Float16>(f);
+            if (std::isinf(static_cast<float>(h)) && std::isfinite(v) && e != 0xFF && fp16_ovfl(w, in)) h = static_cast<_Float16>(f < 0 ? -65504.0f : 65504.0f);
+            bits = as_bits(h);
+          } else {
+            bits = to_bf16(f);
+            if ((bits & 0x7FFF) == 0x7F80 && std::isfinite(v) && e != 0xFF && fp16_ovfl(w, in)) bits = (f < 0 ? 0x8000u : 0u) | 0x7F7Fu;
+          }
+          const uint32_t reg = i * out_bits / 32;
+          if (out_bits == 32) set_word(w, in.dst[0], reg, lane, bits);
+          else {
+            uint32_t cur = i % 2 ? word(w, in.dst[0], reg, lane) : 0;
+            cur = (cur & ~(0xFFFFu << (16 * (i % 2)))) | (bits & 0xFFFFu) << (16 * (i % 2));
+            set_word(w, in.dst[0], reg, lane, cur);
+          }
+        }
       });
     } else if (op == "v_cvt_pk_i16_i32"_op) {
       each([&](uint32_t lane) {
@@ -3352,7 +3453,7 @@ struct Machine {
     // row maximum across a wave32, in vLLM's attention -- moved each lane's
     // high half, and -inf arrived as a tiny positive number.)
     if (in.enc == gcn::Enc::Vop3 && (in.op_sel & 7) && in.name.find("fp8") == std::string::npos &&
-        in.name.find("bf8") == std::string::npos && in.name.rfind("v_permlane", 0) != 0) {
+        in.name.find("bf8") == std::string::npos && in.name.rfind("v_permlane", 0) != 0 && in.name.rfind("v_cvt_scale", 0) != 0) {
       const bool wide_third = in.name.find("u32_u16") != std::string::npos;   // v_mad_u32_u16's addend is 32 bits
       Inst x = in;
       for (uint32_t k = 0; k < x.src.size() && k < 3; ++k)
@@ -3661,8 +3762,8 @@ struct Machine {
       // bit 3 says the high one), the other half kept.
       const F8& t = op == "v_cvt_pk_fp8_f32"_op ? fp8() : bf8();
       each([&](uint32_t lane) {
-        const uint32_t two = float_to_f8(lane_float(w, in.src[0], lane), t, in.clamp, nullptr) |
-                             float_to_f8(lane_float(w, in.src[1], lane), t, in.clamp, nullptr) << 8;
+        const uint32_t two = float_to_f8(lane_float(w, in.src[0], lane), t, in.clamp, nullptr, fp16_ovfl(w, in)) |
+                             float_to_f8(lane_float(w, in.src[1], lane), t, in.clamp, nullptr, fp16_ovfl(w, in)) << 8;
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         write_lane(w, in.dst[0], lane, in.op_sel & 8 ? (was & 0xFFFFu) | two << 16 : (was & 0xFFFF0000u) | two);
       });
@@ -3673,7 +3774,7 @@ struct Machine {
       const uint32_t at = 8 * ((in.op_sel >> 2) & 3);
       each([&](uint32_t lane) {
         const uint32_t random = lane_src(w, in.src[1], lane);
-        const uint32_t b = float_to_f8(lane_float(w, in.src[0], lane), t, in.clamp, &random);
+        const uint32_t b = float_to_f8(lane_float(w, in.src[0], lane), t, in.clamp, &random, fp16_ovfl(w, in));
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         write_lane(w, in.dst[0], lane, (was & ~(0xFFu << at)) | b << at);
       });
@@ -4348,7 +4449,11 @@ struct Machine {
                           : op == "v_pk_min_f16"_op ? hw_min(in, x, y)
                           : op == "v_pk_max_f16"_op ? hw_max(in, x, y)
                                                  : std::fma(x, y, packed_half(w, in, 2, half, lane));
-          r |= static_cast<uint32_t>(as_bits(static_cast<_Float16>(in.clamp ? clamp01(v) : v))) << (16 * half);
+          _Float16 h = static_cast<_Float16>(in.clamp ? clamp01(v) : v);
+          if (std::isinf(static_cast<float>(h)) && fp16_ovfl(w, in) && std::isfinite(x) && std::isfinite(y) &&
+              (op != "v_pk_fma_f16"_op || std::isfinite(packed_half(w, in, 2, half, lane))) && op != "v_pk_min_f16"_op && op != "v_pk_max_f16"_op)
+            h = static_cast<_Float16>(std::signbit(static_cast<float>(h)) ? -65504.0f : 65504.0f);
+          r |= static_cast<uint32_t>(as_bits(h)) << (16 * half);
         }
         write_lane(w, in.dst[0], lane, r);
       });
@@ -4509,6 +4614,34 @@ struct Machine {
     return (lane & ~31u) | ((((lane & 31u) & and_mask) | or_mask) ^ xor_mask);
   }
 
+  // The pending-count width of gfx1250's LDS barrier (see ds_atomic_barrier_arrive): assumed, not stated by the document.
+  static constexpr uint32_t kLdsBarrierWidth = 31;
+  // gfx1250's MODE.FP16_OVFL (bit 23): "if set, an overflowed FP16 VALU result is clamped to +/- MAX_FP16 regardless of round mode"; infinite
+  // inputs stay infinite (CDNA5 ISA, MODE register). It applies where the destination is FP16 or BF16 (7.6), to WMMA results of those
+  // types, and to f32 to fp8/bf8 conversions (the table in 7.6). Only the operations whose infinite result from finite operands can only
+  // be an overflow (not a divide by zero or a logarithm of zero) are given it here: add, subtract, multiply, the multiply-adds, ldexp and the
+  // conversions from wider floats.
+  static bool fp16_ovfl(const Wave& w, const Inst& in) { return in.arch == gcn::Target::Gfx1250 && ((w.mode >> 23) & 1); }
+  static bool overflow_only_op(const std::string& name) {
+    static const char* const kTokens[] = {"add_f16", "sub_f16", "subrev_f16", "mul_f16", "fma_f16", "mad_f16", "fmac_f16", "fmamk_f16",
+                                          "fmaak_f16", "ldexp_f16", "cvt_f16_f32", "cvt_pk_f16_f32"};
+    for (const char* t : kTokens)
+      if (name.find(t) != std::string::npos) return true;
+    return false;
+  }
+  // One arrive at the 64-bit LDS barrier at `addr` (subtract `update`; where the pending count went below zero, reload it from the
+  // initial count): the state change of ds_atomic_barrier_arrive, which the Tensor Data Mover also sends when a descriptor asks.
+  uint64_t lds_barrier_arrive(Group& g, uint64_t addr, uint32_t update) {
+    if (addr + 8 > g.lds.size())
+      throw Error::make(Err::InvalidValue, "an LDS barrier at ", addr, ", past the ", g.lds.size(), " bytes the work-group has");
+    uint64_t old = 0;
+    std::memcpy(&old, &g.lds[addr], 8);
+    const uint32_t mask = (1u << kLdsBarrierWidth) - 1, init = static_cast<uint32_t>(old >> 32) & 0xFFFFu;
+    uint32_t next = static_cast<uint32_t>(old) - update;
+    if (((next & mask) >> (kLdsBarrierWidth - 1)) & 1) next = (next >> kLdsBarrierWidth << kLdsBarrierWidth) | (init & mask);
+    std::memcpy(&g.lds[addr], &next, 4);
+    return old;
+  }
   // gfx1250's transposing loads (ds_load_tr*, global_load_tr*), after the CDNA 5 ISA document's section on them: each
   // lane reads 8 contiguous 16-bit (or 8-bit) elements from an address of its own, one column of a matrix held in
   // memory column by column, and the hardware deals them out so that each lane holds, in the registers of a WMMA
@@ -4516,8 +4649,43 @@ struct Machine {
   // row M = 8 * (half of the lane) + 0..7 and column K = L mod 8 + 8 * (L / 16) (16-bit) or 4 * (L / 8) + L mod 4
   // (8-bit), where the half is bit 3 of L (16-bit) or bit 2 (8-bit); the registers hold K along the lane's
   // elements, M along the lanes (lane = M + 16 * (K / 8)), in order. Only the 16-bit and 8-bit kinds are done:
-  // the 6- and 4-bit kinds have 16x32 tiles whose figures this code does not rely on. EXEC must be all ones.
+  // EXEC must be all ones.
+  // The 6- and 4-bit kinds (global_load_tr6_b96, global_load_tr4_b64, and the ds_ ones) load a 16x32 tile: the figure
+  // labels each of the 32 K columns with one lane, whose 96 (or 64) bits are that column's 16 elements along M, in order from
+  // bit 0. The lanes' order over K is the figure's: for 4 bits, K 0-7 from lanes 0-7, K 8-15 from lanes 16-23, K 16-23 from
+  // lanes 8-15, K 24-31 from lanes 24-31; for 6 bits, the same in groups of four (K 0-3 from lanes 0-3, 4-7 from 8-11, 8-11 from
+  // 4-7, 12-15 from 12-15, 16-19 from 16-19, 20-23 from 24-27, 24-27 from 20-23, 28-31 from 28-31). The registers are laid
+  // out as the 16-bit and 8-bit kinds' are ("VGPR layout: row major"): lane = M + 16 * (K / 16), the 16 elements of a lane
+  // along K in order from bit 0. (Assumed, not written: the document draws no destination for these two kinds, so that
+  // half follows from the other two; the figure's source lanes are what it shows.)
+  void transpose_regs_narrow(Wave& w, const Inst& in, uint32_t elem_bits, const uint8_t (&raw)[32][16]) {
+    static const uint32_t kBase6[8] = {0, 8, 4, 12, 16, 24, 20, 28}, kBase4[4] = {0, 16, 8, 24};
+    const uint32_t words = elem_bits == 6 ? 3 : 2, mask = (1u << elem_bits) - 1;
+    const auto field = [&](uint32_t lane, uint32_t m) {   // element m of a lane's loaded bits
+      const uint32_t at = m * elem_bits;
+      uint32_t v = raw[lane][at / 8] >> (at % 8);
+      if (at % 8 + elem_bits > 8) v |= static_cast<uint32_t>(raw[lane][at / 8 + 1]) << (8 - at % 8);
+      return v & mask;
+    };
+    for (uint32_t o = 0; o < 32; ++o) {
+      uint8_t out[12] = {};
+      const uint32_t m = o % 16;
+      for (uint32_t j = 0; j < 16; ++j) {
+        const uint32_t k = 16 * (o / 16) + j;
+        const uint32_t src = elem_bits == 6 ? kBase6[k / 4] + k % 4 : kBase4[k / 8] + k % 8;
+        const uint32_t v = field(src, m), at = j * elem_bits;
+        out[at / 8] |= static_cast<uint8_t>(v << (at % 8));
+        if (at % 8 + elem_bits > 8) out[at / 8 + 1] |= static_cast<uint8_t>(v >> (8 - at % 8));
+      }
+      for (uint32_t k = 0; k < words; ++k) {
+        uint32_t v;
+        std::memcpy(&v, out + 4 * k, 4);
+        set_word(w, in.dst[0], k, o, v);
+      }
+    }
+  }
   void transpose_regs(Wave& w, const Inst& in, uint32_t elem_bits, const uint8_t (&raw)[32][16]) {
+    if (elem_bits < 8) return transpose_regs_narrow(w, in, elem_bits, raw);
     const uint32_t words = elem_bits == 16 ? 4 : 2;
     for (uint32_t o = 0; o < 32; ++o) {
       uint8_t out[16] = {};
@@ -4542,8 +4710,12 @@ struct Machine {
   static bool transpose_kind(std::string_view body, uint32_t* elem_bits) {
     if (body == "load_tr16_b128") return *elem_bits = 16, true;
     if (body == "load_tr8_b64") return *elem_bits = 8, true;
+    if (body == "load_tr6_b96") return *elem_bits = 6, true;
+    if (body == "load_tr4_b64") return *elem_bits = 4, true;
     return false;
   }
+  // Bytes each lane loads.
+  static uint32_t transpose_bytes(uint32_t elem_bits) { return elem_bits == 16 ? 16 : elem_bits == 6 ? 12 : 8; }
   // Whether the wave can do one at all: a wave of 32 with every lane on (an EXEC of zero is a no-op).
   bool transpose_ready(const Wave& w, const Inst& in) {
     if (!w.exec) return false;
@@ -4558,9 +4730,8 @@ struct Machine {
   // tensor's extent in some dimension, a store drops what falls outside, and a load can pad the LDS rows. Gather mode
   // takes the rows from a list, and iteration repeats the move with the addresses stepped. Done when issued, so
   // s_wait_tensorcnt has nothing to wait for. Not modelled: multicast to other work-groups of a cluster (a mask in group
-  // 1, which the ISA says must be zero outside a cluster, and is ignored), and the LDS barrier a descriptor can ask to
-  // be signalled when the move is done -- the ISA gives that barrier's layout a width its text does not fix, so a
-  // descriptor that asks for it is refused.
+  // 1, which the ISA says must be zero outside a cluster, and is ignored). The LDS barrier a descriptor can ask to be
+  // signalled when the move is done is arrived at once, after the move (see lds_barrier_arrive for its assumptions).
   void tensor_move(Wave& w, const Inst& in, Group& g) {
     const bool store = in.name == "tensor_store_from_lds";
     uint32_t d[4][8] = {};
@@ -4579,8 +4750,6 @@ struct Machine {
     const uint64_t global_base = uint64_t{g0[2]} | (uint64_t{g0[3]} & 0x1FFFFFF) << 32;
     const uint32_t data_log2 = (g1[0] >> 16) & 3, elem = 1u << data_log2;
     const bool barrier = (g1[0] >> 18) & 1, iterate = (g1[0] >> 19) & 1 && !gather, pad = (g1[0] >> 20) & 1;
-    if (barrier)
-      throw Error::make(Err::Unsupported, in.name, " with atomic_barrier_enable: the LDS barrier's layout is not fixed by the ISA's text");
     const uint32_t pad_interval_bytes = 8u << ((g1[0] >> 22) & 7), pad_bytes = 4 * (((g1[0] >> 25) & 0x7F) + 1);
     const uint64_t tensor_dim[5] = {(g1[1] >> 16) | (uint64_t{g1[2]} & 0xFFFF) << 16, (g1[2] >> 16) | (uint64_t{g1[3]} & 0xFFFF) << 16,
                                     g2[0], iterate ? 0 : g2[1], uint64_t{g3[1] >> 16} | (uint64_t{g3[2]} & 0xFFFF) << 16};
@@ -4632,6 +4801,10 @@ struct Machine {
               }
             }
     }
+    // atomic_barrier_enable: when the move is done the TDM sends one DS_ATOMIC_ASYNC_BARRIER_ARRIVE to the 64-bit LDS word at
+    // atomic_barrier_address[18:3] (group 1, bits 47:32; the word is 8-byte aligned). Assumed: the address is from the start
+    // of the work-group's LDS, as the descriptor's LDS address is.
+    if (barrier) lds_barrier_arrive(g, uint64_t{g1[1] & 0xFFFFu} << 3, 1);
   }
 
   void lds_access(Wave& w, const Inst& in, Group& g) {
@@ -4641,7 +4814,7 @@ struct Machine {
       uint8_t raw[32][16] = {};
       for (uint32_t lane = 0; lane < 32; ++lane) {
         const uint64_t a = static_cast<uint32_t>(lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset));
-        const uint32_t n = bits == 16 ? 16 : 8;
+        const uint32_t n = transpose_bytes(bits);
         if (a + n <= g.lds.size()) std::memcpy(raw[lane], &g.lds[a], n);
         else if (g.lds.empty())
           throw Error::make(Err::InvalidValue, "an LDS access at ", a, " in a work-group given no LDS: the launch ",
@@ -4759,6 +4932,19 @@ struct Machine {
         // gfx1250's backward permute that fetches from lanes that are off too (EXEC says only which lanes are written).
         const uint32_t from = ((lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset)) >> 2) & (w.lanes - 1);
         write_lane(w, in.dst[0], lane, before[from]);
+      } else if (op == "ds_atomic_async_barrier_arrive_b64"_op || op == "ds_atomic_barrier_arrive_rtn_b64"_op) {
+        // gfx1250's LDS barrier (CDNA5 ISA 11.2.2 and the instruction pseudocode in 15.15): a 64-bit word, the 32-bit state
+        // (pending count in the low WIDTH bits, phase above) with the initial count in bits 47:32. An arrive subtracts 1 (the
+        // async form) or DATA0's low dword (the _RTN form, which returns the whole word as it was) from the state; where
+        // the pending count went below zero (its top bit is set) the barrier is met: the pending count is reloaded from the
+        // initial count and the phase, which the borrow already decremented, stays as it is. Assumed: each active lane
+        // arrives, in lane order (the document's pseudocode is scalar, and says a barrier "is typically initialized with the
+        // thread count"); and WIDTH, which the document leaves unset and whose two accounts disagree at 32, is 31, so that
+        // a program reading the phase as `state >> W` for any W up to 31 sees it change. Waves are woken by nothing here: a
+        // wave polling with s_sleep is never put to sleep.
+        const bool rtn = op == "ds_atomic_barrier_arrive_rtn_b64"_op;
+        const uint64_t old = lds_barrier_arrive(g, static_cast<uint32_t>(addr + off), rtn ? lane_src(w, in.src[1], lane) : 1u);
+        if (rtn) write_lane64(w, in.dst[0], lane, old);
       } else if (op == "ds_cond_sub_u32"_op || op == "ds_cond_sub_rtn_u32"_op || op == "ds_sub_clamp_u32"_op ||
                  op == "ds_sub_clamp_rtn_u32"_op) {
         // gfx1250's conditional subtract (only where memory is at least the operand) and subtract clamped at zero.
@@ -6408,7 +6594,7 @@ struct Machine {
     }
     if (uint32_t bits; transpose_kind(body, &bits)) {
       if (!transpose_ready(w, in)) return;
-      const uint32_t n = bits == 16 ? 16 : 8;
+      const uint32_t n = transpose_bytes(bits);
       uint8_t raw[32][16] = {};
       for (uint32_t lane = 0; lane < 32; ++lane) {
         uint32_t words[kMaxWords];
@@ -6938,6 +7124,17 @@ struct Machine {
 
   // What s_set_gpr_idx_on does to an instruction: each vector register
   // operand it enabled is moved on by M0's low byte.
+  // gfx1250: MODE holds the same eight bits s_set_vgpr_msb sets: DST in 13:12, SRC0 in 15:14, SRC1 in 17:16, SRC2 in 19:18
+  // (CDNA5 ISA, MODE register); s_set_vgpr_msb's immediate is {dst, src2, src1, src0}, two bits each. So a write to MODE
+  // (s_setreg_b32) changes the registers the following instructions name, and a read of MODE shows what s_set_vgpr_msb set.
+  static void set_mode_msb_bits(Wave& w) {
+    const uint32_t m = w.vgpr_msb;
+    w.mode = (w.mode & ~(0xFFu << 12)) | (m >> 6 & 3) << 12 | (m & 3) << 14 | (m >> 2 & 3) << 16 | (m >> 4 & 3) << 18;
+  }
+  static void take_msb_from_mode(Wave& w) {
+    const uint32_t d = w.mode >> 12 & 3, s0 = w.mode >> 14 & 3, s1 = w.mode >> 16 & 3, s2 = w.mode >> 18 & 3;
+    w.vgpr_msb = static_cast<uint8_t>(d << 6 | s2 << 4 | s1 << 2 | s0);
+  }
   // gfx1250: the two top bits of each vector register's number come from the wave's s_set_vgpr_msb setting, by the
   // operand's place in the instruction (the destination, then sources 0 to 2); a scalar, a constant or any other operand is
   // as it was. The wave's register file grows to hold what is named.
@@ -7388,6 +7585,7 @@ struct Machine {
       // The two high bits of the vector register numbers the following instructions name, until the next one (the same
       // bits are in the MODE register, which s_setreg_b32 can write, and that is not modelled).
       w.vgpr_msb = static_cast<uint8_t>(in.simm & 0xFF);
+      set_mode_msb_bits(w);
       return true;
     }
     if (OpName(in.name) == "s_monitor_sleep"_op) return false;

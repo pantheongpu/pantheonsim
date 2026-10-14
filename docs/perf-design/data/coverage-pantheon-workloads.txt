@@ -1,0 +1,119 @@
+cubins 46 kernels 144 instructions 27512; prototype subset compiles 3 kernels (2.1%)
+loop-body instructions 19712 (71.6% of all); in kernels the subset compiles: 240
+instruction-level: 15349 of 25792 non-NOP instructions (59.5%) are inside the subset; in loop bodies 11376 of 19712 (57.7%)
+-- unsupported instructions by reason (top 25)
+  1970  HFMA2: op HFMA2
+   736  IMAD: IMAD form
+   712  UIADD3: uniform guard at @!UPT UIADD3 URZ, URZ, URZ, URZ
+   698  IADD3: IADD3 carry out
+   539  ISETP: ISETP form
+   480  HMMA: op HMMA
+   349  IADD3: IADD3 form
+   290  STL: op STL
+   286  SEL: op SEL
+   271  LDG: memory form
+   252  STG: memory form
+   252  BSYNC: op BSYNC
+   252  BSSY: op BSSY
+   232  LOP3: LOP3 form
+   204  POPC: op POPC
+   180  FSEL: op FSEL
+   164  IMAD: IMAD modifier
+   160  VOTEU: op VOTEU
+   154  MUFU: op MUFU
+   143  F2I: op F2I
+   140  FSETP: op FSETP
+   139  I2F: op I2F
+   137  CALL: op CALL
+   128  DFMA: op DFMA
+   124  RED: op RED
+-- first unsupported reason per kernel
+   75  ISETP form
+   15  LOP3 form
+   11  BRA form
+    7  op UISETP
+    5  op FSEL
+    5  op CS2R
+    4  IADD3 carry out
+    3  op SEL
+    2  op UMOV
+    2  op UIMAD
+    2  op UIADD3
+    2  op STS
+    2  op I2F
+    2  op BSSY
+    1  op PLOP3
+    1  op FSETP
+    1  op DFMA
+    1  memory form
+-- op histogram (all code | loop bodies)
+IMAD         5065  18.4% cum  18.4% | loops   3304  16.8%
+ISETP        2289   8.3% cum  26.7% | loops   1563   7.9%
+LOP3         2085   7.6% cum  34.3% | loops   1838   9.3%
+HFMA2        1970   7.2% cum  41.5% | loops   1970  10.0%
+IADD3        1901   6.9% cum  48.4% | loops   1317   6.7%
+NOP          1720   6.3% cum  54.6% | loops      0   0.0%
+FFMA         1500   5.5% cum  60.1% | loops   1340   6.8%
+BRA          1262   4.6% cum  64.7% | loops   1054   5.3%
+SHF          1035   3.8% cum  68.4% | loops    958   4.9%
+UIADD3        797   2.9% cum  71.3% | loops    748   3.8%
+LEA           619   2.2% cum  73.6% | loops    513   2.6%
+MOV           603   2.2% cum  75.8% | loops    350   1.8%
+S2R           488   1.8% cum  77.5% | loops    183   0.9%
+HMMA          480   1.7% cum  79.3% | loops    480   2.4%
+LDG           446   1.6% cum  80.9% | loops    343   1.7%
+FMUL          409   1.5% cum  82.4% | loops    394   2.0%
+STG           358   1.3% cum  83.7% | loops    286   1.5%
+EXIT          303   1.1% cum  84.8% | loops      0   0.0%
+STL           290   1.1% cum  85.9% | loops    219   1.1%
+SEL           286   1.0% cum  86.9% | loops    127   0.6%
+ULDC          262   1.0% cum  87.8% | loops     10   0.1%
+BSYNC         252   0.9% cum  88.8% | loops    229   1.2%
+BSSY          252   0.9% cum  89.7% | loops    229   1.2%
+POPC          204   0.7% cum  90.4% | loops    184   0.9%
+FSEL          180   0.7% cum  91.1% | loops    163   0.8%
+VOTEU         160   0.6% cum  91.7% | loops    139   0.7%
+MUFU          154   0.6% cum  92.2% | loops    126   0.6%
+F2I           143   0.5% cum  92.7% | loops    117   0.6%
+FSETP         140   0.5% cum  93.2% | loops    119   0.6%
+I2F           139   0.5% cum  93.7% | loops    115   0.6%
+CALL          137   0.5% cum  94.2% | loops    112   0.6%
+I2FP          131   0.5% cum  94.7% | loops    113   0.6%
+DFMA          128   0.5% cum  95.2% | loops    128   0.6%
+RED           124   0.5% cum  95.6% | loops    103   0.5%
+UFLO          117   0.4% cum  96.1% | loops     96   0.5%
+FADD          109   0.4% cum  96.5% | loops    100   0.5%
+LDL           108   0.4% cum  96.9% | loops    108   0.5%
+UMOV           96   0.3% cum  97.2% | loops     72   0.4%
+CS2R           72   0.3% cum  97.5% | loops     59   0.3%
+LDC            69   0.3% cum  97.7% | loops     47   0.2%
+YIELD          65   0.2% cum  97.9% | loops     65   0.3%
+F2F            60   0.2% cum  98.2% | loops     36   0.2%
+SHFL           49   0.2% cum  98.3% | loops     49   0.2%
+PRMT           48   0.2% cum  98.5% | loops     10   0.1%
+FLO            44   0.2% cum  98.7% | loops     44   0.2%
+ATOMG          44   0.2% cum  98.8% | loops     44   0.2%
+DMUL           36   0.1% cum  99.0% | loops     36   0.2%
+UIMAD          30   0.1% cum  99.1% | loops      0   0.0%
+USEL           29   0.1% cum  99.2% | loops      2   0.0%
+UISETP         26   0.1% cum  99.3% | loops      2   0.0%
+HADD2          22   0.1% cum  99.4% | loops     15   0.1%
+RET            21   0.1% cum  99.4% | loops      0   0.0%
+PLOP3          19   0.1% cum  99.5% | loops      0   0.0%
+STS            17   0.1% cum  99.6% | loops      7   0.0%
+USHF           14   0.1% cum  99.6% | loops      4   0.0%
+ULOP3          13   0.0% cum  99.7% | loops      0   0.0%
+F2FP           13   0.0% cum  99.7% | loops      0   0.0%
+ULEA           11   0.0% cum  99.8% | loops      0   0.0%
+S2UR           11   0.0% cum  99.8% | loops      0   0.0%
+BRX            11   0.0% cum  99.8% | loops     11   0.1%
+IMNMX           9   0.0% cum  99.9% | loops      9   0.0%
+LDS             8   0.0% cum  99.9% | loops      5   0.0%
+P2R             6   0.0% cum  99.9% | loops      2   0.0%
+DADD            6   0.0% cum  99.9% | loops      3   0.0%
+DSETP           4   0.0% cum 100.0% | loops      4   0.0%
+BAR             4   0.0% cum 100.0% | loops      0   0.0%
+FMNMX           3   0.0% cum 100.0% | loops      3   0.0%
+ATOMS           3   0.0% cum 100.0% | loops      3   0.0%
+FCHK            2   0.0% cum 100.0% | loops      2   0.0%
+REDUX           1   0.0% cum 100.0% | loops      0   0.0%

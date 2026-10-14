@@ -84,6 +84,128 @@ __global__ void k_scratch_svs(const uint32_t* a, const uint32_t*, uint32_t* o) {
   asm volatile("scratch_load_b32 %0, %1, %2\n s_wait_loadcnt 0x0" : "=v"(r) : "v"(voff), "s"(soff) : "memory");
   o[i] = r;
 }
+// MODE holds s_set_vgpr_msb's eight bits (DST 13:12, SRC0 15:14, SRC1 17:16, SRC2 19:18), so writing MODE moves the registers the
+// next instructions name: written to v773 with MODE's DST bits set to 3, then read back with s_set_vgpr_msb's SRC0 = 3. v5 must not
+// have been touched, and reading MODE after s_set_vgpr_msb shows the same bits. The scalar prefetches do nothing.
+__global__ void k_mode_msb(const uint32_t* a, const uint32_t*, uint32_t* o) {
+  const int i = threadIdx.x;
+  uint32_t r = 0, plain = 0, mode = 0;
+  const uint32_t x = a[i];
+  asm volatile(
+      "s_prefetch_inst_pc_rel 0x0, null, 0\n"
+      "v_mov_b32 v5, 0xAAAA\n"
+      "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 12, 2), 3\n"
+      "v_mov_b32 v5, %2\n"
+      "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 12, 2), 0\n"
+      "s_set_vgpr_msb 0x03\n"
+      "v_mov_b32 %0, v5\n"
+      "s_set_vgpr_msb 0x1B\n"
+      "s_getreg_b32 %3, hwreg(HW_REG_MODE, 12, 8)\n"
+      "s_set_vgpr_msb 0\n"
+      "v_mov_b32 %1, v5\n"
+      : "=&v"(r), "=&v"(plain), "+v"(const_cast<uint32_t&>(x)), "=&s"(mode)
+      :
+      : "v5");
+  o[i] = r;
+  o[32 + i] = plain;
+  o[64 + i] = mode;
+}
+__global__ void k_scalar_prefetch(const uint32_t* a, const uint32_t*, uint32_t* o) {
+  const uint64_t addr = reinterpret_cast<uint64_t>(a);
+  const uint64_t base = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(addr)) | static_cast<uint64_t>(__builtin_amdgcn_readfirstlane(static_cast<uint32_t>(addr >> 32))) << 32;
+  asm volatile("s_wait_xcnt 0x0\n s_prefetch_data %0, 0x0, null, 0\n s_wait_xcnt 0x0\n s_prefetch_inst %0, 0x40, null, 1" ::"s"(base));
+  o[threadIdx.x] = a[threadIdx.x] + 1;
+}
+// global_load_tr6_b96 and global_load_tr4_b64: lane s supplies the address of its column of the tile (16 elements along M).
+typedef unsigned v3u __attribute__((ext_vector_type(3)));
+typedef unsigned v2u __attribute__((ext_vector_type(2)));
+__global__ void k_tr6(const uint8_t* mem, uint32_t* o) {
+  const int i = threadIdx.x;
+  v3u r = {0, 0, 0};
+  const uint8_t* p = mem + 12 * i;
+  asm volatile("global_load_tr6_b96 %0, %1, off\n s_wait_loadcnt 0x0" : "=&v"(r) : "v"(p) : "memory");
+  o[3 * i + 0] = r[0], o[3 * i + 1] = r[1], o[3 * i + 2] = r[2];
+}
+__global__ void k_tr4(const uint8_t* mem, uint32_t* o) {
+  const int i = threadIdx.x;
+  v2u r = {0, 0};
+  const uint8_t* p = mem + 8 * i;
+  asm volatile("global_load_tr4_b64 %0, %1, off\n s_wait_loadcnt 0x0" : "=&v"(r) : "v"(p) : "memory");
+  o[2 * i + 0] = r[0], o[2 * i + 1] = r[1];
+}
+V1(k_cvt_pk_i16, "v_cvt_pk_i16_f32 %0, %1, 4.0")
+V2(k_cvt_pk_u16, "v_cvt_pk_u16_f32 %0, %1, %2")
+// gfx1250's LDS barrier atomics: a 64-bit word whose state is a pending count (low bits) and a phase (above), the initial count in bits
+// 47:32. All 32 lanes arrive at one barrier initialised to 31 (so the last arrival is the 32nd, which goes below zero) with the _RTN form,
+// which returns the word as it was, and at another with the async form (an update of 1). Each lane's returned pending count is 31 - lane;
+// afterwards both words are met: the pending count reloaded from the initial count, the phase (the borrow) one lower (assumes WIDTH = 31).
+__global__ void k_lds_barrier(const uint32_t*, const uint32_t*, uint32_t* o) {
+  __shared__ uint64_t bar[2];
+  const int i = threadIdx.x;
+  if (i == 0) bar[0] = bar[1] = (31ull << 32) | 31ull;
+  __syncthreads();
+  const uint32_t a0 = static_cast<uint32_t>(reinterpret_cast<uintptr_t>((__attribute__((address_space(3))) uint64_t*)&bar[0]));
+  const uint32_t a1 = a0 + 8;
+  uint64_t ret = 0;
+  asm volatile("ds_atomic_barrier_arrive_rtn_b64 %0, %1, %2\n s_wait_dscnt 0x0" : "=v"(ret) : "v"(a0), "v"(static_cast<uint64_t>(1)) : "memory");
+  asm volatile("ds_atomic_async_barrier_arrive_b64 %0\n s_wait_asynccnt 0x0" ::"v"(a1) : "memory");
+  __syncthreads();
+  o[2 * i] = static_cast<uint32_t>(ret);
+  o[2 * i + 1] = static_cast<uint32_t>(ret >> 32);
+  if (i == 0) {
+    o[64] = static_cast<uint32_t>(bar[0]), o[65] = static_cast<uint32_t>(bar[0] >> 32);
+    o[66] = static_cast<uint32_t>(bar[1]), o[67] = static_cast<uint32_t>(bar[1] >> 32);
+  }
+}
+
+// MODE.FP16_OVFL (bit 23): with it set an overflow to infinity from finite operands is the largest finite value; infinite operands stay
+// infinite. Each lane adds a[l] + b[l] in half precision, and converts two floats to fp8, with the bit set and then clear.
+__global__ void k_fp16_ovfl(const uint32_t* a, const uint32_t* b, uint32_t* o) {
+  const int i = threadIdx.x;
+  uint32_t on = 0, off = 0, c_on = 0, c_off = 0, f_on = 0, f_off = 0;
+  asm volatile(
+      "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 1\n"
+      "v_add_f16 %0, %6, %7\n"
+      "v_cvt_pk_fp8_f32 %2, %8, %9\n"
+      "v_cvt_f16_f32 %4, %8\n"
+      "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 0\n"
+      "v_add_f16 %1, %6, %7\n"
+      "v_cvt_pk_fp8_f32 %3, %8, %9\n"
+      "v_cvt_f16_f32 %5, %8\n"
+      : "=&v"(on), "=&v"(off), "=&v"(c_on), "=&v"(c_off), "=&v"(f_on), "=&v"(f_off)
+      : "v"(a[i]), "v"(b[i]), "v"(0x447A0000u), "v"(0x7F800000u));   // 1000.0f and +infinity
+  o[i] = on & 0xFFFF;
+  o[32 + i] = off & 0xFFFF;
+  o[64 + i] = c_on & 0xFFFF;
+  o[96 + i] = c_off & 0xFFFF;
+  o[128 + i] = f_on & 0xFFFF;
+  o[160 + i] = f_off & 0xFFFF;
+}
+// v_cvt_scale_*: 4-, 6- and 8-bit floats widened and scaled by a block scale; the kernels differ in scale_sel.
+typedef unsigned v2u __attribute__((ext_vector_type(2)));
+typedef unsigned v4u __attribute__((ext_vector_type(4)));
+typedef unsigned v3u __attribute__((ext_vector_type(3)));
+typedef float v8f __attribute__((ext_vector_type(8)));
+typedef float v16f __attribute__((ext_vector_type(16)));
+#define SCALE_F4_F32(N) \
+  __global__ void k_sc_f4_f32_##N(const uint32_t* s0, const uint32_t* s1, uint32_t* o) { \
+    const int i = threadIdx.x; v8f r; \
+    asm volatile("v_cvt_scale_pk8_f32_fp4 %0, %1, %2 scale_sel:" #N : "=&v"(r) : "v"(s0[i]), "v"(s1[i])); \
+    *reinterpret_cast<v8f*>(o + 8 * i) = r; }
+SCALE_F4_F32(0) SCALE_F4_F32(1) SCALE_F4_F32(2) SCALE_F4_F32(3) SCALE_F4_F32(4) SCALE_F4_F32(5) SCALE_F4_F32(6) SCALE_F4_F32(7)
+#define SCALE_F8_F16(N) \
+  __global__ void k_sc_f8_f16_##N(const uint32_t* s0, const uint32_t* s1, uint32_t* o) { \
+    const int i = threadIdx.x; v4u r; v2u in = {s0[2 * i], s0[2 * i + 1]}; \
+    asm volatile("v_cvt_scale_pk8_f16_fp8 %0, %1, %2 scale_sel:" #N : "=&v"(r) : "v"(in), "v"(s1[i])); \
+    for (int k = 0; k < 4; ++k) o[4 * i + k] = r[k]; }
+SCALE_F8_F16(0) SCALE_F8_F16(1) SCALE_F8_F16(2) SCALE_F8_F16(3) SCALE_F8_F16(4) SCALE_F8_F16(5) SCALE_F8_F16(6) SCALE_F8_F16(7)
+SCALE_F8_F16(8) SCALE_F8_F16(9) SCALE_F8_F16(10) SCALE_F8_F16(11)
+#define SCALE_F6_F32(N) \
+  __global__ void k_sc_f6_f32_##N(const uint32_t* s0, const uint32_t* s1, uint32_t* o) { \
+    const int i = threadIdx.x; v16f r; v3u in = {s0[3 * i], s0[3 * i + 1], s0[3 * i + 2]}; \
+    asm volatile("v_cvt_scale_pk16_f32_fp6 %0, %1, %2 scale_sel:" #N : "=&v"(r) : "v"(in), "v"(s1[i])); \
+    *reinterpret_cast<v16f*>(o + 16 * i) = r; }
+SCALE_F6_F32(0) SCALE_F6_F32(1) SCALE_F6_F32(2) SCALE_F6_F32(4) SCALE_F6_F32(5) SCALE_F6_F32(7)
 V2(k_min_num_f32, "v_min_num_f32 %0, %1, %2")
 V2(k_max_num_f32, "v_max_num_f32 %0, %1, %2")
 V2(k_fmamk_f16, "v_fmamk_f16 %0, %1, 0x4100, %2")
@@ -614,6 +736,235 @@ int main() {
   }
   // Scratch with signed VGPR + SGPR offsets: each lane gets back what it stored.
   check("scratch_store_b32 / scratch_load_b32 with a VGPR and an SGPR offset", k_scratch_svs, ia, ib, [&](int l) { return ia[l]; });
+  // MODE and the VGPR MSB bits, and the scalar prefetches.
+  {
+    std::vector<uint32_t> a(32);
+    for (int l = 0; l < 32; ++l) a[l] = 0x1000u + l;
+    const auto out = launch(k_mode_msb, a, a, 96);
+    int wrong = 0;
+    for (int l = 0; l < 32; ++l) wrong += out[l] != a[l] || out[32 + l] != 0xAAAAu || out[64 + l] != 0x6Cu;
+    std::printf("s_setreg of MODE's VGPR MSB bits and s_getreg: %d of 32 wrong (mode field %02x, want 6c)\n", wrong, out[64]);
+    failed += wrong != 0;
+    const auto out2 = launch(k_scalar_prefetch, a, a, 32);
+    wrong = 0;
+    for (int l = 0; l < 32; ++l) wrong += out2[l] != a[l] + 1;
+    std::printf("s_prefetch_data, s_prefetch_inst, s_prefetch_inst_pc_rel: %d of 32 wrong\n", wrong);
+    failed += wrong != 0;
+  }
+  // v_cvt_pk_i16_f32 / v_cvt_pk_u16_f32: toward zero, saturating, a NaN is zero (assumed: the document's helpers are undefined).
+  {
+    static const float fv[16] = {0.0f, 1.9f, -1.9f, 40000.0f, -40000.0f, 70000.0f, -0.5f, 32767.5f, __builtin_nanf(""), __builtin_inff(), -__builtin_inff(), 65535.9f, -32768.9f, 123.0f, 2.5f, -2.5f};
+    std::vector<uint32_t> a(32), b(32);
+    for (int l = 0; l < 32; ++l) a[l] = fbits(fv[l % 16]), b[l] = fbits(fv[(l * 5 + 3) % 16]);
+    const auto si = [](float f) -> uint32_t { return f != f ? 0u : static_cast<uint16_t>(static_cast<int16_t>(f >= 32767.0f ? 32767.0 : f <= -32768.0f ? -32768.0 : __builtin_trunc(f))); };
+    const auto su = [](float f) -> uint32_t { return f != f ? 0u : static_cast<uint16_t>(f >= 65535.0f ? 65535.0 : f <= 0.0f ? 0.0 : __builtin_trunc(f)); };
+    check("v_cvt_pk_i16_f32 (second source the constant 4.0)", k_cvt_pk_i16, a, a, [&](int l) { return si(bitsf(a[l])) | si(4.0f) << 16; });
+    check("v_cvt_pk_u16_f32", k_cvt_pk_u16, a, b, [&](int l) { return su(bitsf(a[l])) | su(bitsf(b[l])) << 16; });
+  }
+  // The 6- and 4-bit transposed loads, from the figure's source lanes (see the executor): lane o ends with M = o % 16 and the
+  // 16 elements K = 16 * (o / 16) + j, each taken from the lane the figure gives for that K.
+  {
+    uint8_t* dmem = nullptr;
+    uint32_t* dout = nullptr;
+    CHECK(hipMalloc(&dmem, 512));
+    CHECK(hipMalloc(&dout, 512));
+    for (int bits : {6, 4}) {
+      const int bytes = bits == 6 ? 12 : 8;
+      std::vector<uint8_t> mem(32 * bytes);
+      uint32_t seed = 7 + bits;
+      for (auto& b : mem) seed = seed * 1664525u + 1013904223u, b = static_cast<uint8_t>(seed >> 24);
+      std::vector<uint32_t> out(32 * (bits == 6 ? 3 : 2), 0xDEADBEEFu);
+      CHECK(hipMemcpy(dmem, mem.data(), mem.size(), hipMemcpyHostToDevice));
+      if (bits == 6) hipLaunchKernelGGL(k_tr6, dim3(1), dim3(32), 0, 0, dmem, dout);
+      else hipLaunchKernelGGL(k_tr4, dim3(1), dim3(32), 0, 0, dmem, dout);
+      CHECK(hipDeviceSynchronize());
+      CHECK(hipMemcpy(out.data(), dout, out.size() * 4, hipMemcpyDeviceToHost));
+      static const int base6[8] = {0, 8, 4, 12, 16, 24, 20, 28}, base4[4] = {0, 16, 8, 24};
+      const auto elem = [&](int lane, int m) -> uint32_t {   // element m of a source lane's bytes
+        const int at = m * bits;
+        uint32_t v = mem[lane * bytes + at / 8] >> (at % 8);
+        if (at % 8 + bits > 8) v |= static_cast<uint32_t>(mem[lane * bytes + at / 8 + 1]) << (8 - at % 8);
+        return v & ((1u << bits) - 1);
+      };
+      int wrong = 0;
+      for (int o = 0; o < 32; ++o)
+        for (int j = 0; j < 16; ++j) {
+          const int k = 16 * (o / 16) + j, src = bits == 6 ? base6[k / 4] + k % 4 : base4[k / 8] + k % 8;
+          const int at = j * bits, w0 = o * (bits == 6 ? 3 : 2);
+          uint32_t v = out[w0 + at / 32] >> (at % 32);
+          if (at % 32 + bits > 32) v |= out[w0 + at / 32 + 1] << (32 - at % 32);
+          wrong += (v & ((1u << bits) - 1)) != elem(src, o % 16);
+        }
+      std::printf("global_load_tr%d_b%d: %d of 512 wrong\n", bits, bits == 6 ? 96 : 64, wrong);
+      failed += wrong != 0;
+    }
+  }
+  // The LDS barrier atomics (see the kernel).
+  {
+    const auto out = launch(k_lds_barrier, ia, ib, 68);
+    int wrong = 0;
+    for (int l = 0; l < 32; ++l) wrong += out[2 * l] != static_cast<uint32_t>(31 - l) || out[2 * l + 1] != 31u;
+    for (int w = 0; w < 2; ++w) wrong += out[64 + 2 * w] != 0x8000001Fu || out[65 + 2 * w] != 31u;
+    std::printf("ds_atomic_barrier_arrive_rtn_b64 and ds_atomic_async_barrier_arrive_b64: %d of 68 wrong\n", wrong);
+    failed += wrong != 0;
+  }
+  // MODE.FP16_OVFL.
+  {
+    static const float av[8] = {60000.0f, -60000.0f, __builtin_inff(), 1.0f, 65504.0f, 30000.0f, -__builtin_inff(), 3.0f};
+    static const float bv[8] = {60000.0f, -60000.0f, 1.0f, 2.0f, 1.0f, 30000.0f, -5.0f, __builtin_inff()};
+    std::vector<uint32_t> a(32), b(32);
+    for (int l = 0; l < 32; ++l) a[l] = f2h(av[l & 7]), b[l] = f2h(bv[l & 7]);
+    const auto out = launch(k_fp16_ovfl, a, b, 192);
+    int wrong = 0;
+    for (int l = 0; l < 32; ++l) {
+      const float sum = h2f(a[l]) + h2f(b[l]);
+      const bool overflow = std::isfinite(h2f(a[l])) && std::isfinite(h2f(b[l])) && !std::isfinite(static_cast<float>(static_cast<_Float16>(sum)));
+      const uint32_t plain = f2h(sum), clamped = overflow ? (sum < 0 ? 0xFBFFu : 0x7BFFu) : plain;
+      wrong += out[l] != clamped || out[32 + l] != plain;
+      // 1000.0f and +inf into fp8 (E4M3: largest 448, NaN 0x7F): the bit set gives the largest for both, clear gives NaN for both;
+      // 1000.0f to half is an ordinary 1000 either way.
+      wrong += out[64 + l] != 0x7E7Eu || out[96 + l] != 0x7F7Fu || out[128 + l] != f2h(1000.0f) || out[160 + l] != f2h(1000.0f);
+    }
+    std::printf("MODE.FP16_OVFL on v_add_f16, v_cvt_pk_fp8_f32 and v_cvt_f16_f32: %d of 32 wrong\n", wrong);
+    failed += wrong != 0;
+  }
+  // v_cvt_scale_pk*: Tables 36 and 37 of the document, transcribed here as arrays (scale byte, and whether it is from lanes 0-15 or 16-31
+  // of S1), against the executor's formulas for them.
+  {
+    struct Sel { int lanes16, byte; };   // lanes16: 0 reads lanes 0-15 of S1, 1 reads lanes 16-31
+    // Table 36 (4- and 6-bit), [OPSEL[2:0]][half of the data lanes]
+    static const Sel t36[8][2] = {{{0, 0}, {0, 1}}, {{1, 0}, {1, 1}}, {{0, 2}, {0, 3}}, {{1, 2}, {1, 3}},
+                                  {{0, 0}, {0, 2}}, {{1, 0}, {1, 2}}, {{0, 1}, {0, 3}}, {{1, 1}, {1, 3}}};
+    // Table 37 (8-bit), [OPSEL[3:0]] for OPSEL[3] = 0: both halves alike; for 1: OPSEL[2] = 0 only (rows 000 and 001 alike, 010 and 011 alike)
+    static const Sel t37_32[8] = {{0, 0}, {1, 0}, {0, 2}, {1, 2}, {0, 1}, {1, 1}, {0, 3}, {1, 3}};
+    static const Sel t37_16[4][2] = {{{0, 0}, {0, 1}}, {{0, 0}, {0, 1}}, {{1, 2}, {1, 3}}, {{1, 2}, {1, 3}}};
+    const auto fp_val = [](uint32_t code, int ebits, int mbits, int bias) {   // a small float, no infinity or NaN used
+      const int sign = (code >> (ebits + mbits)) & 1, e = (code >> mbits) & ((1 << ebits) - 1), m = code & ((1 << mbits) - 1);
+      const double mag = e == 0 ? std::ldexp(static_cast<double>(m), 1 - bias - mbits) : std::ldexp(static_cast<double>((1 << mbits) | m), e - bias - mbits);
+      return sign ? -mag : mag;
+    };
+    uint32_t seed = 31337;
+    const auto rnd32 = [&] { seed = seed * 1664525u + 1013904223u; return seed; };
+    const auto reg_of = [](std::vector<uint32_t>& v, int words) { (void)words; (void)v; };
+    (void)reg_of;
+    // Inputs: S1 differs across lanes, so the lane and the byte both show.
+    std::vector<uint32_t> s1(32);
+    for (int l = 0; l < 32; ++l) s1[l] = (118u + l % 7) | (121u + l % 5) << 8 | (124u + l % 3) << 16 | (127u + l % 4) << 24;
+    const auto scale_of = [&](const Sel& sel, int lane) { return std::ldexp(1.0, static_cast<int>((s1[(lane & 15) + 16 * sel.lanes16] >> (8 * sel.byte)) & 0xFF) - 127); };
+    // 4-bit to f32, PK8
+    {
+      std::vector<uint32_t> s0(32);
+      for (auto& v : s0) v = rnd32();
+      int wrong = 0;
+      std::vector<uint32_t> none(32);
+      for (int N : {0, 1, 2, 3, 4, 5, 6, 7}) {
+        std::vector<uint32_t> out;
+        switch (N) {
+          case 0: out = launch(k_sc_f4_f32_0, s0, s1, 256); break;
+          case 1: out = launch(k_sc_f4_f32_1, s0, s1, 256); break;
+          case 2: out = launch(k_sc_f4_f32_2, s0, s1, 256); break;
+          case 3: out = launch(k_sc_f4_f32_3, s0, s1, 256); break;
+          case 4: out = launch(k_sc_f4_f32_4, s0, s1, 256); break;
+          case 5: out = launch(k_sc_f4_f32_5, s0, s1, 256); break;
+          case 6: out = launch(k_sc_f4_f32_6, s0, s1, 256); break;
+          default: out = launch(k_sc_f4_f32_7, s0, s1, 256); break;
+        }
+        for (int l = 0; l < 32; ++l)
+          for (int k = 0; k < 8; ++k) {
+            const double want = fp_val((s0[l] >> (4 * k)) & 15, 2, 1, 1) * scale_of(t36[N][l / 16], l);
+            wrong += out[8 * l + k] != fbits(static_cast<float>(want));
+          }
+      }
+      std::printf("v_cvt_scale_pk8_f32_fp4, every scale_sel 0-7: %d of 2048 wrong\n", wrong);
+      failed += wrong != 0;
+    }
+    // 8-bit (E4M3) to f16, PK8: 64-bit source, f16 pairs in four registers
+    {
+      std::vector<uint32_t> s0(64);
+      for (auto& v : s0) {
+        v = rnd32();
+        for (int k = 0; k < 4; ++k)
+          if (((v >> (8 * k)) & 0x7F) == 0x7F) v &= ~(1u << (8 * k));   // no NaN
+      }
+      int wrong = 0;
+      for (int N : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}) {
+        const uint32_t* s0p = s0.data();
+        (void)s0p;
+        uint32_t *d0 = nullptr, *d1 = nullptr, *dout = nullptr;
+        std::vector<uint32_t> out(128, 0xDEADBEEFu);
+        CHECK(hipMalloc(&d0, 256));
+        CHECK(hipMalloc(&d1, 128));
+        CHECK(hipMalloc(&dout, 512));
+        CHECK(hipMemcpy(d0, s0.data(), 256, hipMemcpyHostToDevice));
+        CHECK(hipMemcpy(d1, s1.data(), 128, hipMemcpyHostToDevice));
+        switch (N) {
+          case 0: hipLaunchKernelGGL(k_sc_f8_f16_0, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 1: hipLaunchKernelGGL(k_sc_f8_f16_1, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 2: hipLaunchKernelGGL(k_sc_f8_f16_2, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 3: hipLaunchKernelGGL(k_sc_f8_f16_3, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 4: hipLaunchKernelGGL(k_sc_f8_f16_4, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 5: hipLaunchKernelGGL(k_sc_f8_f16_5, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 6: hipLaunchKernelGGL(k_sc_f8_f16_6, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 7: hipLaunchKernelGGL(k_sc_f8_f16_7, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 8: hipLaunchKernelGGL(k_sc_f8_f16_8, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 9: hipLaunchKernelGGL(k_sc_f8_f16_9, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 10: hipLaunchKernelGGL(k_sc_f8_f16_10, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          default: hipLaunchKernelGGL(k_sc_f8_f16_11, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+        }
+        CHECK(hipDeviceSynchronize());
+        CHECK(hipMemcpy(out.data(), dout, 512, hipMemcpyDeviceToHost));
+        hipFree(d0), hipFree(d1), hipFree(dout);
+        for (int l = 0; l < 32; ++l) {
+          const Sel sel = (N & 8) ? t37_16[(N & 7) < 4 ? N & 3 : 0][l / 16] : t37_32[N & 7];
+          if ((N & 8) && (N & 4)) continue;   // reserved rows are refused (not run here)
+          for (int k = 0; k < 8; ++k) {
+            const uint32_t code = (s0[2 * l + k / 4] >> (8 * (k % 4))) & 0xFF;
+            const double want = fp_val(code, 4, 3, 7) * scale_of(sel, l);
+            const uint32_t got = (out[4 * l + k / 2] >> (16 * (k % 2))) & 0xFFFF;
+            wrong += got != f2h(static_cast<float>(want));
+          }
+        }
+      }
+      std::printf("v_cvt_scale_pk8_f16_fp8, scale_sel 0-7 and 8-11 (the 8-bit block16 rows): %d of 3072 wrong\n", wrong);
+      failed += wrong != 0;
+    }
+    // 6-bit (E2M3) to f32, PK16: 96-bit source, sixteen f32 results
+    {
+      std::vector<uint32_t> s0(96);
+      for (auto& v : s0) v = rnd32();
+      int wrong = 0;
+      for (int N : {0, 1, 2, 4, 5, 7}) {
+        uint32_t *d0 = nullptr, *d1 = nullptr, *dout = nullptr;
+        std::vector<uint32_t> out(512, 0xDEADBEEFu);
+        CHECK(hipMalloc(&d0, 384));
+        CHECK(hipMalloc(&d1, 128));
+        CHECK(hipMalloc(&dout, 2048));
+        CHECK(hipMemcpy(d0, s0.data(), 384, hipMemcpyHostToDevice));
+        CHECK(hipMemcpy(d1, s1.data(), 128, hipMemcpyHostToDevice));
+        switch (N) {
+          case 0: hipLaunchKernelGGL(k_sc_f6_f32_0, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 1: hipLaunchKernelGGL(k_sc_f6_f32_1, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 2: hipLaunchKernelGGL(k_sc_f6_f32_2, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 4: hipLaunchKernelGGL(k_sc_f6_f32_4, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          case 5: hipLaunchKernelGGL(k_sc_f6_f32_5, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+          default: hipLaunchKernelGGL(k_sc_f6_f32_7, dim3(1), dim3(32), 0, 0, d0, d1, dout); break;
+        }
+        CHECK(hipDeviceSynchronize());
+        CHECK(hipMemcpy(out.data(), dout, 2048, hipMemcpyDeviceToHost));
+        hipFree(d0), hipFree(d1), hipFree(dout);
+        for (int l = 0; l < 32; ++l)
+          for (int k = 0; k < 16; ++k) {
+            const int at = 6 * k;
+            uint32_t code = s0[3 * l + at / 32] >> (at % 32);
+            if (at % 32 + 6 > 32) code |= s0[3 * l + at / 32 + 1] << (32 - at % 32);
+            const double want = fp_val(code & 63, 2, 3, 1) * scale_of(t36[N][l / 16], l);
+            wrong += out[16 * l + k] != fbits(static_cast<float>(want));
+          }
+      }
+      std::printf("v_cvt_scale_pk16_f32_fp6, scale_sel 0, 1, 2, 4, 5, 7: %d of 3072 wrong\n", wrong);
+      failed += wrong != 0;
+    }
+  }
   // The byte byte_sel picks of v_cvt_f16_fp8, against the plain conversion of that byte.
   {
     const auto check_f16_byte = [&](const char* what, auto kernel) {
