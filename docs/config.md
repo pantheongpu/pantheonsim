@@ -81,7 +81,7 @@ vgpu: pantheonsim.yaml:3: unknown key 'tread'; did you mean 'threads'?
 $ vgpu info
 vgpu: pantheonsim.yaml:2: count: expected a whole number from 1 to 16, got 'lots'
 $ vgpu info
-vgpu: pantheonsim.yaml:1: gpu: 'nvidia/h10' is not a GPU profile; did you mean 'nvidia/h100'? (`vgpu list-gpus` prints them)
+vgpu: pantheonsim.yaml:1: gpu: 'nvidia/h1000' is not a GPU profile; did you mean 'nvidia/h100'? (`vgpu list-gpus` prints them)
 ```
 
 ## Keys

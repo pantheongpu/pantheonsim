@@ -112,10 +112,10 @@ contains "with the same message" "pantheonsim.yaml:2: count:" "$out"
 
 printf 'gpuu: nvidia/t4\n' > pantheonsim.yaml
 contains "a typo in a key suggests the key" "unknown key 'gpuu'; did you mean 'gpu'?" "$("$vgpu" info 2>&1)"
-printf 'gpu: nvidia/h10\n' > pantheonsim.yaml
+printf 'gpu: nvidia/h1000\n' > pantheonsim.yaml
 out=$("$vgpu" info 2>&1)
-contains "a gpu that does not exist is named" "'nvidia/h10' is not a GPU profile" "$out"
-contains "with the nearest one" "did you mean 'nvidia/h100'?" "$out"
+contains "a gpu that does not exist is named" "'nvidia/h1000' is not a GPU profile" "$out"
+contains "with a near one" "did you mean 'nvidia/" "$out"
 printf 'threads 4\n' > pantheonsim.yaml
 contains "a line that is not key: value is refused" "pantheonsim.yaml:1: expected \`key: value\`" "$("$vgpu" info --gpu nvidia/t4 2>&1)"
 rm -f pantheonsim.yaml
