@@ -29,10 +29,6 @@ on:
         description: "regular expression on the sweep's check names (every check if empty)"
         required: false
         default: ''
-      script:
-        description: "debug: a python file in the repo to run under vgpu instead of the sweep"
-        required: false
-        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -52,23 +48,7 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(ci/jobs.sh -p release)"
-      - name: Debug script
-        if: inputs.script != ''
-        env:
-          SCRIPT: ${{ inputs.script }}
-        run: |
-          py=""
-          for c in "${VGPU_TORCH_CUDA_PYTHON:-}" $(ls -d "$HOME"/.local/share/torch-cu13*/bin/python 2>/dev/null) python3 python; do
-            [ -n "$c" ] && "$c" -c 'import torch, sys; sys.exit(0 if (torch.version.cuda or "").startswith("13") else 1)' 2>/dev/null && { py=$c; break; }
-          done
-          echo "python: $py"; env | grep -i -E 'torch|vgpu' | sed 's/=.*token.*//' || true
-          [ -n "$py" ] || { echo "no python with torch for CUDA 13"; exit 1; }
-          cd "$(mktemp -d)"
-          TORCH_LOGS=output_code TRITON_CACHE_DIR="$PWD/triton" TORCHINDUCTOR_CACHE_DIR="$PWD/inductor" \
-            timeout 3000 "$GITHUB_WORKSPACE/build/vgpu" run --gpu nvidia/rtx5090 --count 1 --preload "$py" "$GITHUB_WORKSPACE/$SCRIPT" > out.log 2>&1 || echo "exit $?"
-          cat out.log
       - name: The full sweep
-        if: inputs.script == ''
         env:
           TESTS: ${{ inputs.tests }}
           VGPU_SWEEP_GROUPS: ${{ inputs.groups }}
