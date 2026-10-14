@@ -19,6 +19,8 @@
 #include <utility>
 #include <vector>
 
+#include "host_parallel.hpp"
+
 namespace vgpu_npp {
 
 // An interleaved host image: `stride` elements per row, `ch` per pixel. A
@@ -188,22 +190,33 @@ struct Bounds {
 template <class T, class Map>
 inline void warp(const Image<T>& src, const Rect& sroi, Image<T>& dst, const Rect& droi, int interp,
                  Map map, const Bounds& bounds = Bounds()) {
-  double v[4];
   const float x_lo = sroi.x - bounds.lo_slack, x_hi = sroi.x + sroi.w - 1 + bounds.hi_slack;
   const float y_lo = sroi.y - bounds.lo_slack, y_hi = sroi.y + sroi.h - 1 + bounds.hi_slack;
-  for (int y = droi.y; y < droi.y + droi.h; ++y)
-    for (int x = droi.x; x < droi.x + droi.w; ++x) {
+  // Every destination pixel is its own: rows go to as many threads as the work warrants.
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(droi.w) * static_cast<uint64_t>(droi.h) * 60u, droi.h);
+  vgpu::hostpar::parallel_for(threads, droi.h, [&](int64_t row) {
+    // (The images, the map and the bounds are copied to locals: stores to pixels may alias anything the lambda captured by
+    // reference, which would keep the loops from holding them in registers.)
+    const Image<T> s = src;
+    Image<T> d = dst;
+    Map m = map;
+    const bool hi_open = bounds.hi_open, clamp_low = bounds.clamp_low;
+    const int sroi_x = sroi.x, sroi_y = sroi.y, dx0 = droi.x, dx1 = droi.x + droi.w;
+    const int y = droi.y + static_cast<int>(row);
+    double v[4];
+    for (int x = dx0; x < dx1; ++x) {
       float sx, sy;
-      if (!map(x, y, &sx, &sy)) continue;
+      if (!m(x, y, &sx, &sy)) continue;
       if (!(sx >= x_lo && sy >= y_lo)) continue;
-      if (bounds.hi_open ? !(sx < x_hi && sy < y_hi) : !(sx <= x_hi && sy <= y_hi)) continue;
-      if (bounds.clamp_low && interp != kNN) {
-        sx = std::max(sx, static_cast<float>(sroi.x));
-        sy = std::max(sy, static_cast<float>(sroi.y));
+      if (hi_open ? !(sx < x_hi && sy < y_hi) : !(sx <= x_hi && sy <= y_hi)) continue;
+      if (clamp_low && interp != kNN) {
+        sx = std::max(sx, static_cast<float>(sroi_x));
+        sy = std::max(sy, static_cast<float>(sroi_y));
       }
-      sample(src, sx, sy, interp, v);
-      for (int c = 0; c < dst.ch; ++c) dst.at(x, y, c) = to_pixel<T>(v[c]);
+      sample(s, sx, sy, interp, v);
+      for (int c = 0; c < d.ch; ++c) d.at(x, y, c) = to_pixel<T>(v[c]);
     }
+  });
 }
 
 // The inverse of a 2x3 affine matrix (forward warps map destination pixels

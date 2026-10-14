@@ -29,6 +29,7 @@
 #include <cufftXt.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -48,6 +49,8 @@
 
 #include "capture_defer.hpp"
 #include "fatbin.hpp"
+#include "host_fft.hpp"
+#include "host_parallel.hpp"
 #include "ptx_link.hpp"
 #include "toolkit_nvjitlink.hpp"
 
@@ -112,63 +115,50 @@ size_t complex_elems(const std::vector<int>& n) {
   return p * (size_t)(n.back() / 2 + 1);
 }
 
-int smallest_factor(int n) {
-  for (int p = 2; (long long)p * p <= n; ++p)
-    if (n % p == 0) return p;
-  return n;  // prime
-}
-
-// Generic Cooley-Tukey. `in` is read with `stride`, `out` is packed. The
-// scratch buffer is sized once by the caller and never grown here: a resize
-// mid-recursion would invalidate the `tmp` pointers held by every level above.
-void fft_rec(const cd* in, cd* out, int n, int stride, int sign, cd* scratch) {
-  if (n == 1) { out[0] = in[0]; return; }
-  const int p = smallest_factor(n);
-  const int m = n / p;
-  cd* tmp = scratch;
-  // Children run one after another and hand their results up into `tmp` before
-  // the next starts, so they can all share the region past this level's.
-  for (int j = 0; j < p; ++j)
-    fft_rec(in + (size_t)j * stride, tmp + (size_t)j * m, m, stride * p, sign, scratch + n);
-  const double base = sign * 2.0 * M_PI / n;
-  for (int q = 0; q < p; ++q)
-    for (int k = 0; k < m; ++k) {
-      cd acc = tmp[k];  // j = 0 has a unit twiddle
-      for (int j = 1; j < p; ++j) {
-        const double ang = base * (double)j * (double)(k + q * m);
-        acc += tmp[(size_t)j * m + k] * cd(std::cos(ang), std::sin(ang));
-      }
-      out[(size_t)q * m + k] = acc;
-    }
+// The transform of a line is host_fft.hpp's: the same mixed-radix Cooley-Tukey (split on the smallest prime factor
+// at each level, so every size works and only a large prime factor degrades to the O(n*p) direct sum), with the
+// same complex arithmetic in the same order, but bottom-up over arrays and with the twiddle factors looked up in
+// tables kept per size.
+void fft_1d_plan(const vgpu::hostfft::Plan& pl, cd* data) {
+  thread_local std::vector<cd> scratch;
+  if (scratch.size() < (size_t)pl.n * 2) scratch.resize((size_t)pl.n * 2);
+  vgpu::hostfft::run(pl, data, scratch.data());
 }
 
 void fft_1d(cd* data, int n, int sign) {
   if (n <= 1) return;
-  // Each recursion level needs n slots and every level at least halves n, so
-  // 2n bounds the whole tree.
-  std::vector<cd> out((size_t)n), scratch((size_t)n * 2 + 8);
-  fft_rec(data, out.data(), n, 1, sign, scratch.data());
-  std::memcpy(data, out.data(), sizeof(cd) * (size_t)n);
+  fft_1d_plan(*vgpu::hostfft::plan_1d(n, sign), data);
 }
 
 // Multi-dimensional transform of a packed array: 1-D transforms along each
 // axis. With `skip_last` the fastest axis is left alone, which is what the
-// complex-to-real inverse needs before its last, Hermitian, step.
-void fft_nd(std::vector<cd>& a, const std::vector<int>& n, int sign, bool skip_last = false) {
+// complex-to-real inverse needs before its last, Hermitian, step. The lines of
+// an axis are independent, so `threads` (0: as many as the work warrants and
+// the host has to spare) take them in turn.
+void fft_nd(std::vector<cd>& a, const std::vector<int>& n, int sign, bool skip_last = false, unsigned threads = 0) {
   const size_t total = a.size();
   size_t inner = 1;
   for (size_t d = n.size(); d-- > 0;) {
     const int len = n[d];
     if (skip_last && d + 1 == n.size()) { inner *= (size_t)len; continue; }
     const size_t outer = total / (inner * (size_t)len);
-    std::vector<cd> line((size_t)len);
-    for (size_t o = 0; o < outer; ++o)
-      for (size_t i = 0; i < inner; ++i) {
-        const size_t base = o * inner * (size_t)len + i;
-        for (int k = 0; k < len; ++k) line[k] = a[base + (size_t)k * inner];
-        fft_1d(line.data(), len, sign);
-        for (int k = 0; k < len; ++k) a[base + (size_t)k * inner] = line[k];
-      }
+    if (len > 1) {
+      const auto pl = vgpu::hostfft::plan_1d(len, sign);
+      const int64_t lines = (int64_t)(outer * inner);
+      const uint64_t work = (uint64_t)total * (uint64_t)(1 + std::bit_width((unsigned)len)) * 4;
+      cd* const base_ptr = a.data();
+      const size_t in = inner;
+      vgpu::hostpar::parallel_for(threads ? std::min<unsigned>(threads, (unsigned)lines) : vgpu::hostpar::plan(work, lines),
+                                  lines, [&, in](int64_t it) {
+        thread_local std::vector<cd> line;
+        line.resize((size_t)len);
+        const size_t o = (size_t)it / in, i = (size_t)it % in;
+        const size_t base = o * in * (size_t)len + i;
+        for (int k = 0; k < len; ++k) line[k] = base_ptr[base + (size_t)k * in];
+        fft_1d_plan(*pl, line.data());
+        for (int k = 0; k < len; ++k) base_ptr[base + (size_t)k * in] = line[k];
+      });
+    }
     inner *= (size_t)len;
   }
 }
@@ -373,16 +363,16 @@ void transform(const Plan& p, const Geometry& g, const std::vector<char>& hin,
   const int sign = c2r ? CUFFT_INVERSE : r2c ? CUFFT_FORWARD : direction;
   const int last = p.n.back();
   const std::vector<int>& half = g.half;
-  std::vector<cd> work;
-  for (long long b = 0; b < p.batch; ++b) {
+  // One batch: load, transform, store. `threads` is what its axes may spread over (0: as the work warrants).
+  auto one_batch = [&](long long b, unsigned threads) {
     const size_t ib = (size_t)b * g.idist, ob = (size_t)b * g.odist;
-    work.resize(g.ioff.size());
+    std::vector<cd> work(g.ioff.size());
     for (size_t k = 0; k < g.ioff.size(); ++k) work[k] = g.ie.load(hin, ib + g.ioff[k]);
 
     if (c2r) {
       // Invert every axis but the fastest on the stored half, then each
       // fastest-axis line is the half spectrum of a real signal.
-      fft_nd(work, half, CUFFT_INVERSE, /*skip_last=*/true);
+      fft_nd(work, half, CUFFT_INVERSE, /*skip_last=*/true, threads);
       const size_t lines = work.size() / (size_t)half.back();
       std::vector<cd> full((size_t)lines * (size_t)last);
       for (size_t l = 0; l < lines; ++l) {
@@ -392,7 +382,7 @@ void transform(const Plan& p, const Geometry& g, const std::vector<char>& hin,
       }
       work.swap(full);
     } else {
-      fft_nd(work, p.n, sign);
+      fft_nd(work, p.n, sign, false, threads);
       if (r2c) {  // keep the non-redundant half of the fastest dimension
         const size_t lines = work.size() / (size_t)last, h = (size_t)half.back();
         for (size_t l = 0; l < lines; ++l)
@@ -401,7 +391,19 @@ void transform(const Plan& p, const Geometry& g, const std::vector<char>& hin,
       }
     }
     for (size_t k = 0; k < g.ooff.size(); ++k) g.oe.store(hout, ob + g.ooff[k], work[k]);
+  };
+  // Batches write disjoint parts of the output when the distance between them clears one batch's furthest element
+  // (an overlapping layout keeps the batches in order, as before); then they go to threads, each batch on one.
+  const bool disjoint = p.batch > 1 && g.odist > g.ooff.back();
+  if (disjoint) {
+    const uint64_t work = (uint64_t)p.batch * g.ioff.size() * (uint64_t)(1 + std::bit_width((unsigned)last)) * 4;
+    const unsigned n = vgpu::hostpar::plan(work, p.batch);
+    if (n > 1) {
+      vgpu::hostpar::parallel_for(n, p.batch, [&](int64_t b) { one_batch(b, 1); });
+      return;
+    }
   }
+  for (long long b = 0; b < p.batch; ++b) one_batch(b, 0);
 }
 
 // The single implementation behind every single-GPU Exec entry point. Reads

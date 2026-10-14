@@ -1,0 +1,9 @@
+workload launches kernels distinct_post_states launches_whose_post_state_equals_previous_launch_of_same_kernel
+cache_latency 2030 2 2 2028
+compute_virus 14143 1 1 14142
+fp64_virus 653 1 1 652
+int_virus 6260 1 6259 1
+memory_bank_thrash 1497 1 1 1496
+memory_retention_bake 7401 2 2 7399
+omni_virus 1140 4 4 1136
+pulse_virus 60 1 59 1

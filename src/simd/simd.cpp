@@ -1,0 +1,231 @@
+// Dispatch for the SIMD kernels (include/vgpu/simd/simd.hpp). The kernels are
+// in kernels.inc, compiled once for the baseline and once under a target
+// pragma.
+#include "vgpu/simd/simd.hpp"
+
+#include <atomic>
+#include <bit>
+#include <cstring>
+#include <cstdlib>
+#include <mutex>
+
+#include "vgpu/simd/fp16.hpp"
+
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(__clang__)
+#include <immintrin.h>
+#define VGPU_SIMD_X86 1
+#endif
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+// A product the card rounds before the sum must not become an FMA in a build
+// that has one (the AVX2 level has FMA): no contraction anywhere in this file.
+#pragma GCC optimize("fp-contract=off")
+
+namespace vgpu::simd {
+
+#define VGPU_SIMD_NS base_impl
+#define VGPU_SIMD_AVX2 0
+#include "kernels.inc"
+#undef VGPU_SIMD_NS
+#undef VGPU_SIMD_AVX2
+
+#ifdef VGPU_SIMD_X86
+#pragma GCC push_options
+#pragma GCC target("avx2,fma,f16c")
+#define VGPU_SIMD_NS avx2_impl
+#define VGPU_SIMD_AVX2 1
+#include "kernels.inc"
+#undef VGPU_SIMD_NS
+#undef VGPU_SIMD_AVX2
+#pragma GCC pop_options
+#endif
+
+namespace {
+
+const Kernels kBase = {Level::Base,       base_impl::f16_to_f32_k, base_impl::f32_to_f16_k, base_impl::iadd3_k,
+                       base_impl::imad_k, base_impl::lop3_k,       base_impl::ffma_k,       base_impl::fadd_k,
+                       base_impl::fmul_k, base_impl::ffma_m_k,   base_impl::hfma2_m_k,     base_impl::icmp_mask_k, base_impl::ibin_m_k, base_impl::imad_m_k, base_impl::dop_m_k,
+                       base_impl::f64_to_f16_canon_k, base_impl::hmma_k};
+#ifdef VGPU_SIMD_X86
+// The AVX2 table with every entry that does not use F16C. The four that do (the two conversions, the tensor kernel and
+// the f16 fma) are the baseline's here; kAvx2 below has them too.
+const Kernels kAvx2NoF16c = {Level::Avx2,       base_impl::f16_to_f32_k, base_impl::f32_to_f16_k, avx2_impl::iadd3_k,
+                             avx2_impl::imad_k, avx2_impl::lop3_k,       avx2_impl::ffma_k,       avx2_impl::fadd_k,
+                             avx2_impl::fmul_k, avx2_impl::ffma_m_k,   base_impl::hfma2_m_k,     avx2_impl::icmp_mask_k,
+                             avx2_impl::ibin_m_k, avx2_impl::imad_m_k, avx2_impl::dop_m_k,
+                             avx2_impl::f64_to_f16_canon_k, base_impl::hmma_k};
+const Kernels kAvx2 = {Level::Avx2,       avx2_impl::f16_to_f32_k, avx2_impl::f32_to_f16_k, avx2_impl::iadd3_k,
+                       avx2_impl::imad_k, avx2_impl::lop3_k,       avx2_impl::ffma_k,       avx2_impl::fadd_k,
+                       avx2_impl::fmul_k, avx2_impl::ffma_m_k,   avx2_impl::hfma2_m_k,     avx2_impl::icmp_mask_k, avx2_impl::ibin_m_k, avx2_impl::imad_m_k, avx2_impl::dop_m_k,
+                       avx2_impl::f64_to_f16_canon_k, avx2_impl::hmma_k};
+
+// The F16C conversions against the scalar ones: every half, and a spread of
+// floats. A host whose conversion differs (a stray MXCSR, an emulator) does
+// not get the F16C kernels -- the same check the PTX engine makes of its F16C
+// path. About 0.4 ms, so it runs on the first use of an F16C kernel and not
+// when the library loads.
+bool avx2_conversions_agree() {
+  for (uint32_t h = 0; h < 65536; h += 8) {
+    uint16_t in[8];
+    float got[8];
+    for (uint32_t i = 0; i < 8; ++i) in[i] = static_cast<uint16_t>(h + i);
+    kAvx2.f16_to_f32(in, got, 8);
+    for (uint32_t i = 0; i < 8; ++i)
+      if (std::bit_cast<uint32_t>(got[i]) != f16_to_f32_bits(in[i])) return false;
+  }
+  uint32_t x = 0x9E3779B9u;
+  for (int blk = 0; blk < 4096; ++blk) {
+    float in[8];
+    uint16_t got[8];
+    for (int i = 0; i < 8; ++i) {
+      x = x * 1664525u + 1013904223u;
+      in[i] = std::bit_cast<float>(blk < 2048 ? x : (x & 0x80000000u) | (0x30000000u + (x & 0x0FFFFFFFu)));
+    }
+    kAvx2.f32_to_f16(in, got, 8);
+    for (int i = 0; i < 8; ++i)
+      if (in[i] == in[i] && got[i] != f32_to_f16_bits(in[i])) return false;
+  }
+  return true;
+}
+#endif
+
+bool cpu_has_avx2() {
+#ifdef VGPU_SIMD_X86
+  static const bool has = [] {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
+  }();
+  return has;
+#else
+  return false;
+#endif
+}
+
+Level choose() {
+  Level best = cpu_has_avx2() ? Level::Avx2 : Level::Base;
+  if (const char* v = std::getenv("VGPU_SIMD")) {
+    if (std::strcmp(v, "base") == 0) best = Level::Base;
+    else if (std::strcmp(v, "avx2") == 0 && best != Level::Avx2) best = Level::Base;   // asked for more than the host has
+  }
+  return best;
+}
+
+// 0: not checked yet, 2: F16C agrees with the scalar conversions, 3: it does not (1 is unused).
+std::atomic<int> g_f16c_state{0};
+std::atomic<int> g_f16c_checks{0};
+std::mutex g_f16c_mutex;
+
+#ifdef VGPU_SIMD_X86
+// The table of an AVX2 host once the F16C check has been made.
+const Kernels& avx2_final() { return g_f16c_state.load(std::memory_order_acquire) == 2 ? kAvx2 : kAvx2NoF16c; }
+
+// Makes the F16C check if no thread has (exactly once, whatever the number of threads asking), and returns the state.
+int resolve_f16c() {
+  int s = g_f16c_state.load(std::memory_order_acquire);
+  if (s >= 2) return s;
+  std::lock_guard<std::mutex> lock(g_f16c_mutex);
+  s = g_f16c_state.load(std::memory_order_relaxed);
+  if (s < 2) {
+    g_f16c_checks.fetch_add(1, std::memory_order_relaxed);
+    s = avx2_conversions_agree() ? 2 : 3;
+    g_f16c_state.store(s, std::memory_order_release);
+  }
+  return s;
+}
+
+// What the engines get on an AVX2 host until the check has been made: the same table except for the four F16C entries,
+// which check first (once) and then run what the table of the checked state has. The first call replaces the table
+// the engines read, so later calls go straight to the kernel.
+extern const Kernels kAvx2Lazy;
+void publish(const Kernels* from) {
+  const Kernels* expect = from;
+  detail::g_kernels.compare_exchange_strong(expect, &avx2_final(), std::memory_order_acq_rel);
+}
+void lazy_f16_to_f32(const uint16_t* in, float* out, size_t n) {
+  resolve_f16c();
+  publish(&kAvx2Lazy);
+  avx2_final().f16_to_f32(in, out, n);
+}
+void lazy_f32_to_f16(const float* in, uint16_t* out, size_t n) {
+  resolve_f16c();
+  publish(&kAvx2Lazy);
+  avx2_final().f32_to_f16(in, out, n);
+}
+void lazy_hfma2_m(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n,
+                  unsigned halves) {
+  resolve_f16c();
+  publish(&kAvx2Lazy);
+  avx2_final().hfma2_m(d, a, b, c, mask, n, halves);
+}
+void lazy_hmma(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const uint32_t* b, const uint32_t* c,
+               uint32_t* out) {
+  resolve_f16c();
+  publish(&kAvx2Lazy);
+  avx2_final().hmma(kind, K, acc_f16, a, b, c, out);
+}
+const Kernels kAvx2Lazy = {Level::Avx2,       lazy_f16_to_f32,   lazy_f32_to_f16,   avx2_impl::iadd3_k,
+                           avx2_impl::imad_k, avx2_impl::lop3_k, avx2_impl::ffma_k, avx2_impl::fadd_k,
+                           avx2_impl::fmul_k, avx2_impl::ffma_m_k, lazy_hfma2_m,    avx2_impl::icmp_mask_k,
+                           avx2_impl::ibin_m_k, avx2_impl::imad_m_k, avx2_impl::dop_m_k,
+                           avx2_impl::f64_to_f16_canon_k, lazy_hmma};
+#endif
+
+}  // namespace
+
+const char* level_name(Level l) { return l == Level::Avx2 ? "avx2" : "base"; }
+
+bool supported(Level l) { return l == Level::Base || (l == Level::Avx2 && cpu_has_avx2()); }
+
+Level level() {
+  static const Level l = choose();
+  return l;
+}
+
+const Kernels& kernels_for(Level l) {
+#ifdef VGPU_SIMD_X86
+  if (l == Level::Avx2 && cpu_has_avx2()) {
+    resolve_f16c();
+    return avx2_final();
+  }
+#endif
+  return kBase;
+}
+
+F16cState f16c_state() {
+  const int s = g_f16c_state.load(std::memory_order_acquire);
+  return s == 0 ? F16cState::Unchecked : s == 2 ? F16cState::Agrees : F16cState::Disagrees;
+}
+
+namespace testing {
+void reset_f16c_check() {
+#ifdef VGPU_SIMD_X86
+  std::lock_guard<std::mutex> lock(g_f16c_mutex);
+  g_f16c_state.store(0, std::memory_order_release);
+  g_f16c_checks.store(0, std::memory_order_relaxed);
+  if (level() == Level::Avx2) detail::g_kernels.store(&kAvx2Lazy, std::memory_order_release);
+#endif
+}
+int f16c_checks_run() { return g_f16c_checks.load(std::memory_order_relaxed); }
+}  // namespace testing
+
+namespace detail {
+std::atomic<const Kernels*> g_kernels __attribute__((visibility("hidden"))){&kBase};
+bool g_enabled __attribute__((visibility("hidden"))) = true;
+}  // namespace detail
+
+namespace {
+// Runs when the library is loaded: from here on the engines get the level this host has (an AVX2 host starts on the
+// table whose F16C entries make the one-time check; see kAvx2Lazy).
+const bool g_init = [] {
+#ifdef VGPU_SIMD_X86
+  if (level() == Level::Avx2) detail::g_kernels.store(&kAvx2Lazy, std::memory_order_release);
+#endif
+  const char* v = std::getenv("VGPU_SIMD");
+  detail::g_enabled = !(v && std::strcmp(v, "off") == 0);
+  return true;
+}();
+}  // namespace
+
+}  // namespace vgpu::simd

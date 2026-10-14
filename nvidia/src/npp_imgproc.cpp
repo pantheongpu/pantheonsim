@@ -30,6 +30,7 @@
 #include <cuda_runtime.h>
 
 #include "capture_defer.hpp"
+#include "host_parallel.hpp"
 
 // Every read and write of device memory below is the commit point of a call made on a capturing stream
 // (capture_defer.hpp).
@@ -596,7 +597,6 @@ NppStatus resize_sqr(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* p
                 sizeof(T) * sr.w * ch);
   Image<T> si{win.data(), sr.w, sr.h, sr.w * ch, ch};
   Window<T> dst(pDst, dstep, droi.x, droi.y, droi.width, droi.height, ch);
-  double v[4];
   // The sample point of destination column x is fma(1/f, x, c) in single
   // precision, with 1/f rounded to float and c = 0.5/f - 0.5 - shift/f formed
   // from it in double and rounded: the only grouping that reproduces NPP's
@@ -604,7 +604,14 @@ NppStatus resize_sqr(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* p
   const float invx = static_cast<float>(1.0 / fx), invy = static_cast<float>(1.0 / fy);
   const float cx = static_cast<float>(0.5 * invx - 0.5 - shx * invx);
   const float cy = static_cast<float>(0.5 * invy - 0.5 - shy * invy);
-  for (int y = droi.y; y < droi.y + droi.height; ++y)
+  // Every destination pixel is its own: rows go to as many threads as the work warrants.
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(droi.width) * static_cast<uint64_t>(droi.height) * 80u * (interp == NPPI_INTER_LANCZOS ? 8u : 1u), droi.height);
+  vgpu::hostpar::parallel_for(threads, droi.height, [&](int64_t row) {
+    // (The images are copied to locals: stores to pixels may alias anything the lambda captured by reference.)
+    const Image<T> sic = si;
+    Image<T> dimg = dst.img;
+    const int y = droi.y + static_cast<int>(row);
+    double v[4];
     for (int x = droi.x; x < droi.x + droi.width; ++x) {
       if (interp == NPPI_INTER_SUPER) {
         // Each destination pixel is the mean of the source over the interval
@@ -627,12 +634,12 @@ NppStatus resize_sqr(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* p
             for (int sx = xa; sx < xb; ++sx) {
               const double ox = std::min<double>(sx + 1, x1) - std::max<double>(sx, x0);
               if (ox <= 0) continue;
-              acc += static_cast<double>(si.at(sx, sy, c)) * ox * oy;
+              acc += static_cast<double>(sic.at(sx, sy, c)) * ox * oy;
             }
           }
           v[c] = acc * fx * fy;
         }
-        for (int c = 0; c < ch; ++c) dst.img.at(x, y, c) = to_pixel<T>(v[c]);
+        for (int c = 0; c < ch; ++c) dimg.at(x, y, c) = to_pixel<T>(v[c]);
         continue;
       }
       const double ux = (x + 0.5 - shx) / fx, uy = (y + 0.5 - shy) / fy;
@@ -660,18 +667,19 @@ NppStatus resize_sqr(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* p
             for (int i = 0; i < 6; ++i) {
               if (wx[i] == 0) continue;
               const int xx = std::min(std::max(xa + i, 0), sr.w - 1);
-              row += wx[i] * static_cast<double>(si.at(xx, yy, c));
+              row += wx[i] * static_cast<double>(sic.at(xx, yy, c));
             }
             acc += wy[j] * row;
           }
           v[c] = acc / (sxs * sys);
         }
-        for (int c = 0; c < ch; ++c) dst.img.at(x, y, c) = to_pixel<T>(v[c]);
+        for (int c = 0; c < ch; ++c) dimg.at(x, y, c) = to_pixel<T>(v[c]);
         continue;
       }
-      sample(si, sx, sy, interp, v);
-      for (int c = 0; c < ch; ++c) dst.img.at(x, y, c) = to_pixel<T>(v[c]);
+      sample(sic, sx, sy, interp, v);
+      for (int c = 0; c < ch; ++c) dimg.at(x, y, c) = to_pixel<T>(v[c]);
     }
+  });
   dst.put_back(pDst, dstep);
   return NPP_SUCCESS;
 }
@@ -1509,17 +1517,25 @@ NppStatus neighbourhood(const T* s, int ss, T* d, int ds, NppiSize roi, NppiSize
   int w = 0;
   auto src = fetch_halo(s, ss, roi, msz, anchor, ch, &w);
   std::vector<T> dst(static_cast<size_t>(roi.width) * roi.height * ch);
-  for (int y = 0; y < roi.height; ++y)
-    for (int x = 0; x < roi.width; ++x)
+  // Every output is its own sum over the mask: rows go to as many threads as the work warrants.
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(roi.width) * static_cast<uint64_t>(roi.height) * static_cast<uint64_t>(ch) *
+                                                   static_cast<uint64_t>(msz.width) * static_cast<uint64_t>(msz.height) * 2u,
+                                               roi.height);
+  vgpu::hostpar::parallel_for(threads, roi.height, [&, mw = msz.width, mh = msz.height, rw = roi.width, sw = w, srcp = src.data(),
+                                                    dstp = dst.data(), mp = m.data(), has_mask = mask != nullptr](int64_t row) {
+    // (The sizes and pointers are copied into the lambda so the loops keep them in registers across the stores.)
+    const int y = static_cast<int>(row);
+    for (int x = 0; x < rw; ++x)
       for (int c = 0; c < ch; ++c) {
         auto acc = init();
-        for (int j = 0; j < msz.height; ++j)
-          for (int i = 0; i < msz.width; ++i) {
-            if (mask && !m[static_cast<size_t>(j) * msz.width + i]) continue;
-            acc = step(acc, src[(static_cast<size_t>(y + j) * w + x + i) * ch + c]);
+        for (int j = 0; j < mh; ++j)
+          for (int i = 0; i < mw; ++i) {
+            if (has_mask && !mp[static_cast<size_t>(j) * mw + i]) continue;
+            acc = step(acc, srcp[(static_cast<size_t>(y + j) * sw + x + i) * ch + c]);
           }
-        dst[(static_cast<size_t>(y) * roi.width + x) * ch + c] = done(acc);
+        dstp[(static_cast<size_t>(y) * rw + x) * ch + c] = done(acc);
       }
+  });
   store<T>(d, ds, roi.width * ch, roi.height, dst);
   return NPP_SUCCESS;
 }

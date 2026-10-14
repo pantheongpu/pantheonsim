@@ -143,10 +143,12 @@ class Publisher {
   // Called by the runtime as work happens.
   void note_memory(uint32_t ordinal, uint64_t used_bytes);
   void note_kernel(uint32_t ordinal, double seconds_busy);
-  void note_transfer(uint32_t ordinal, uint64_t bytes, double seconds_busy);
+  // `now_ns`, when the caller has just read the steady clock (the one now_ns() in telemetry.cpp reads, in
+  // nanoseconds since its epoch), saves reading it again here.
+  void note_transfer(uint32_t ordinal, uint64_t bytes, double seconds_busy, int64_t now_ns = -1);
   // Recomputes the derived (synthetic) columns from real activity. Cheap;
-  // called on every update and by observers' liveness checks.
-  void refresh(uint32_t ordinal);
+  // called on every update and by observers' liveness checks. `now_ns` as above.
+  void refresh(uint32_t ordinal, int64_t now_ns = -1);
 
  private:
   // Per-device integration state. Owned by the Publisher rather than kept in a
@@ -163,7 +165,8 @@ class Publisher {
   };
 
   void begin_update();
-  void end_update();
+  // Stamps the segment with `now_ns` (or the clock, if -1) and returns the stamp.
+  int64_t end_update(int64_t now_ns = -1);
   // One writer at a time: kernels and copies on different streams finish on
   // different threads, and each updates the segment's counters and the seqlock
   // around them. Recursive, since the writers refresh as they go.

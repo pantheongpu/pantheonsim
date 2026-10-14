@@ -67,8 +67,8 @@ micro test framework) so a bare CI container can build it.
 
 ### Why C++ (vs Rust)
 
-The deliverable is a C-ABI `libcuda`-compatible `.so`, future JIT work is
-LLVM (a C++ library), and the audience (CUDA shops, CI images) always has a
+The deliverable is a C-ABI `libcuda`-compatible `.so`, any future faster
+execution tier is written in the same dependency-free C++, and the audience (CUDA shops, CI images) always has a
 C++ toolchain. Rust's safety was the counter-argument; we compensate with
 bounds-checked accessors everywhere and dense tests. Decided 2026-09-01;
 revisit only with a concrete failure mode in hand.
@@ -89,10 +89,13 @@ Consequence: `bar.sync` under divergence is rejected with a precise error
 (IPDOM reconvergence is the planned fix, not a redesign — the stack becomes
 reconvergence-point-keyed).
 
-The interpreter is deliberately naive (hash-map register files, per-lane
-loops). Correctness, determinism, and diagnosability outrank speed; the
-upgrade path is `PTX -> internal IR -> LLVM JIT` behind the same
-`exec::launch()` boundary, so the runtime above never changes.
+The interpreter favours plain, checkable code over speed. Correctness,
+determinism, and diagnosability outrank speed, and the project keeps zero
+external dependencies, so faster execution comes from inside the tree: decoded
+forms, lane kernels and fast paths that give the same bits as the general path.
+Translating whole kernels to a faster tier, still behind the same
+`exec::launch()` boundary and still dependency-free, is studied in
+`docs/perf-design/`; nothing there is built.
 
 ### D2. Scheduling is an abstraction, and always will be
 
@@ -108,7 +111,11 @@ provides.
 Blocks are spread over host threads, one block per thread at a time, and each
 block keeps its own scheduler. `VGPU_THREADS` sets the count (default: every
 core); `VGPU_THREADS=1` runs them sequentially in fixed order, a legal schedule
-and the one the determinism contract below is stated for. Blocks on different
+and the one the determinism contract below is stated for. The threads are a
+pool made on the first launch that needs them and parked between launches
+(`include/vgpu/exec/worker_pool.hpp`), not created per launch; a launch still
+gets exactly as many as before, all alive together, and a one-thread launch
+runs on the calling thread without touching the pool. Blocks on different
 threads can share global memory, and kernels rely on it (CUB's decoupled
 look-back spins on flags other blocks publish), so the engine follows the GPU
 memory model rather than assuming one thread:

@@ -39,6 +39,7 @@
 
 #include "nvcomp_codecs.hpp"
 #include "nvcomp_gdeflate.hpp"
+#include "host_parallel.hpp"
 #include "nvcomp_internal.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/runtime/capture.hpp"
@@ -224,15 +225,20 @@ void run_compress(const CompressArgs& a) {
     return;
   }
   const Facts& fx = facts(a.fmt);
-  for (size_t i = 0; i < a.num; ++i) {
+  // Chunks are independent (each its own bitstream, its own output buffer and slots in the status arrays), so they go to
+  // threads: as many as the work warrants.
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < a.num; ++i) bytes += sizes[i];
+  vgpu::hostpar::parallel_for(vgpu::hostpar::plan(bytes * 40, static_cast<int64_t>(a.num)), static_cast<int64_t>(a.num), [&](int64_t ci) {
+    const size_t i = static_cast<size_t>(ci);
     if (sizes[i] > fx.max_compress_chunk) {
       st[i] = nvcompErrorChunkSizeTooLarge;
-      continue;
+      return;
     }
     std::vector<uint8_t> buf(sizes[i]);
     if (!get(buf.data(), in[i], sizes[i])) {
       st[i] = nvcompErrorCudaError;
-      continue;
+      return;
     }
     if (a.shuffle) {
       std::vector<uint8_t> shuffled(buf.size());
@@ -242,10 +248,10 @@ void run_compress(const CompressArgs& a) {
     const Bytes c = compress(a.fmt, buf.data(), buf.size(), a.level);
     if (!put(out[i], c.data(), c.size())) {
       st[i] = nvcompErrorCudaError;
-      continue;
+      return;
     }
     out_sizes[i] = c.size();
-  }
+  });
   put(a.out_sizes, out_sizes.data(), a.num * sizeof(size_t));
   if (a.statuses) put(a.statuses, st.data(), a.num * sizeof(nvcompStatus_t));
 }
@@ -285,17 +291,20 @@ void run_decompress(const DecompressArgs& a) {
     say_once("nvcomp-args", "nvCOMP: a chunk pointer or size array is not readable memory");
     return;
   }
-  for (size_t i = 0; i < a.num; ++i) {
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < a.num; ++i) bytes += caps[i];
+  vgpu::hostpar::parallel_for(vgpu::hostpar::plan(bytes * 10, static_cast<int64_t>(a.num)), static_cast<int64_t>(a.num), [&](int64_t ci) {
+    const size_t i = static_cast<size_t>(ci);
     std::vector<uint8_t> src(sizes[i]);
     if (!get(src.data(), in[i], sizes[i])) {
       st[i] = nvcompErrorCudaError;
-      continue;
+      return;
     }
     std::vector<uint8_t> dst(caps[i]);
     size_t produced = 0;
     const Result r = decompress(a.fmt, src.data(), src.size(), dst.data(), dst.size(), &produced);
     st[i] = chunk_status(r);
-    if (r != Result::Ok) continue;
+    if (r != Result::Ok) return;
     if (a.unshuffle_mode) {
       if (produced) {
         std::vector<uint8_t> plain(produced);
@@ -305,10 +314,10 @@ void run_decompress(const DecompressArgs& a) {
     }
     if (!put(out[i], dst.data(), produced)) {
       st[i] = nvcompErrorCudaError;
-      continue;
+      return;
     }
     actual[i] = produced;
-  }
+  });
   if (a.actual_sizes) put(a.actual_sizes, actual.data(), a.num * sizeof(size_t));
   if (a.statuses) put(a.statuses, st.data(), a.num * sizeof(nvcompStatus_t));
 }
@@ -322,9 +331,12 @@ void run_sizes(Fmt fmt, const void* const* ptrs, const size_t* sizes_p, size_t* 
     return;
   }
   std::vector<size_t> out(num, 0);
-  for (size_t i = 0; i < num; ++i) {
+  uint64_t bytes = 0;
+  for (size_t i = 0; i < num; ++i) bytes += sizes[i];
+  vgpu::hostpar::parallel_for(vgpu::hostpar::plan(bytes * 10, static_cast<int64_t>(num)), static_cast<int64_t>(num), [&](int64_t ci) {
+    const size_t i = static_cast<size_t>(ci);
     std::vector<uint8_t> src(sizes[i]);
-    if (!get(src.data(), in[i], sizes[i])) continue;
+    if (!get(src.data(), in[i], sizes[i])) return;
     size_t n = 0;
     // Measured by decoding without writing: every format's own length fields
     // are checked against its data, and a stream that does not parse is 0.
@@ -334,7 +346,7 @@ void run_sizes(Fmt fmt, const void* const* ptrs, const size_t* sizes_p, size_t* 
       n = 0;
     }
     out[i] = n;
-  }
+  });
   put(out_sizes, out.data(), num * sizeof(size_t));
 }
 
