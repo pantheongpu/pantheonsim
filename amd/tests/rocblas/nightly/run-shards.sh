@@ -7,8 +7,8 @@
 # GPU is a profile (amd/mi300x); FILTER "fp" for the float and double tests,
 # "mixed" for half, bfloat16 and int8. The environment names the pieces:
 # VGPU_BUILD_DIR (its shim/), ROCM_RUN (fetch-rocm.sh's "run" packages) and
-# CLIENT (build-client.sh's output). Exits non-zero if any test fails or a
-# shard does not finish.
+# CLIENT (build-client.sh's output). Exits non-zero if any test fails, a
+# shard exits non-zero or a shard does not finish.
 set -uo pipefail
 gpu=$1 filter=$2 first=$3 last=$4 total=$5
 # Absolute: the shards run from the client's directory.
@@ -26,7 +26,9 @@ export VGPU_GPU=$gpu VGPU_QUIET=1 GTEST_TOTAL_SHARDS=$total
 cd "$CLIENT"
 run() {
   GTEST_SHARD_INDEX=$1 timeout 3600 ./rocblas-test --gtest_filter="$f" --gtest_brief=1 > "$logs/$1.log" 2>&1
-  echo "shard $1: exit $? $(grep -h ' ran\. (' "$logs/$1.log" | sed 's/^\[=*\] //')"
+  local rc=$?
+  echo "$rc" > "$logs/$1.exit"
+  echo "shard $1: exit $rc $(grep -h ' ran\. (' "$logs/$1.log" | sed 's/^\[=*\] //')"
 }
 for ((i = first; i <= last; i += 2)); do
   run "$i" &
@@ -36,6 +38,10 @@ done
 passed=$(grep -h '^\[  PASSED  \]' "$logs"/*.log | awk '{s += $4} END {print s + 0}')
 failed=$(grep -h '^\[  FAILED  \] [0-9]* test' "$logs"/*.log | awk '{s += $4} END {print s + 0}')
 unfinished=$(grep -L ' ran\. (' "$logs"/*.log | wc -l)
-echo "$gpu $filter shards $first-$last of $total: $passed passed, $failed failed, $unfinished unfinished"
+# --gtest_brief=1 prints a failure where it happens and no "N tests, listed
+# below" summary, so the count above stays 0 for a shard that failed a test:
+# its exit status is what says so.
+nonzero=$(grep -L '^0$' "$logs"/*.exit | wc -l)
+echo "$gpu $filter shards $first-$last of $total: $passed passed, $failed failed, $unfinished unfinished, $nonzero with a non-zero exit"
 grep -h '^\[  FAILED  \] .*\.' "$logs"/*.log | sort -u | head -50
-[[ $failed == 0 && $unfinished == 0 && $passed -gt 0 ]]
+[[ $failed == 0 && $unfinished == 0 && $nonzero == 0 && $passed -gt 0 ]]

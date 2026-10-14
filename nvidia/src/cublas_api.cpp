@@ -44,6 +44,7 @@
 #include "vgpu/runtime/capture.hpp"
 #include "enum_value.hpp"
 #include "fixed_point_gemm.hpp"
+#include "host_gemm.hpp"
 
 // Operands are read from and written to the same virtual device memory the
 // kernels see, through the runtime shim's own copy path (declared by the CUDA
@@ -183,11 +184,27 @@ inline bool host_result_under_capture(cublasHandle_t h) {
 inline size_t idx(int row, int col, int ld) { return static_cast<size_t>(col) * ld + row; }
 
 // C = alpha * op(A) * op(B) + beta * C, computed in Acc and stored as T.
+//
+// Float and double take host_gemm.hpp's kernels: each output is still the one
+// chain  acc = acc + a(i,p)*b(p,j)  over p in order (product and sum rounded
+// separately), only many outputs advance side by side. Other types keep the
+// plain loop.
 template <class T, class Acc>
 void gemm_host(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k, Acc alpha,
                const std::vector<T>& A, int lda, const std::vector<T>& B, int ldb, Acc beta,
                std::vector<T>& C, int ldc) {
   const bool ta = transa != CUBLAS_OP_N, tb = transb != CUBLAS_OP_N;
+  if constexpr (std::is_same_v<T, Acc> && (std::is_same_v<T, float> || std::is_same_v<T, double>)) {
+    T* const c0 = C.data();
+    vgpu::hostgemm::gemm<T, T>(ta, tb, m, n, k, A.data(), lda, B.data(), ldb, [=](int64_t i, int64_t j, T acc) {
+      T& c = c0[idx(static_cast<int>(i), static_cast<int>(j), ldc)];
+      // beta == 0 means C is write-only, so its prior contents (which may be
+      // uninitialized) must not be read -- multiplying by zero would poison
+      // the result with NaN.
+      c = beta == T(0) ? alpha * acc : alpha * acc + beta * c;
+    });
+    return;
+  }
   for (int j = 0; j < n; ++j) {
     for (int i = 0; i < m; ++i) {
       Acc acc = Acc(0);
@@ -197,9 +214,6 @@ void gemm_host(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
         acc += a * b;
       }
       T& c = C[idx(i, j, ldc)];
-      // beta == 0 means C is write-only, so its prior contents (which may be
-      // uninitialized) must not be read -- multiplying by zero would poison
-      // the result with NaN.
       c = static_cast<T>(beta == Acc(0) ? alpha * acc
                                         : alpha * acc + beta * static_cast<Acc>(c));
     }
@@ -289,15 +303,7 @@ size_t type_bytes(cudaDataType t) {
 void gemm_float(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
                 float alpha, const std::vector<float>& A, int lda, const std::vector<float>& B,
                 int ldb, float beta, std::vector<float>& C, int ldc) {
-  const bool ta = transa != CUBLAS_OP_N, tb = transb != CUBLAS_OP_N;
-  for (int j = 0; j < n; ++j)
-    for (int i = 0; i < m; ++i) {
-      float acc = 0.0f;
-      for (int p = 0; p < k; ++p)
-        acc += A[ta ? idx(p, i, lda) : idx(i, p, lda)] * B[tb ? idx(j, p, ldb) : idx(p, j, ldb)];
-      float& c = C[idx(i, j, ldc)];
-      c = beta == 0.0f ? alpha * acc : alpha * acc + beta * c;
-    }
+  gemm_host<float, float>(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
 // The int8 path: operands are int8, the product accumulates in int32, and C is
@@ -306,15 +312,16 @@ void gemm_int8(cublasOperation_t transa, cublasOperation_t transb, int m, int n,
                int32_t alpha, const std::vector<int8_t>& A, int lda, const std::vector<int8_t>& B,
                int ldb, int32_t beta, std::vector<int32_t>& C, int ldc) {
   const bool ta = transa != CUBLAS_OP_N, tb = transb != CUBLAS_OP_N;
-  for (int j = 0; j < n; ++j)
-    for (int i = 0; i < m; ++i) {
-      int32_t acc = 0;
-      for (int p = 0; p < k; ++p)
-        acc += static_cast<int32_t>(A[ta ? idx(p, i, lda) : idx(i, p, lda)]) *
-               static_cast<int32_t>(B[tb ? idx(j, p, ldb) : idx(p, j, ldb)]);
-      int32_t& c = C[idx(i, j, ldc)];
-      c = beta == 0 ? alpha * acc : alpha * acc + beta * c;
-    }
+  int32_t* const c0 = C.data();
+  // Sums wrap in unsigned arithmetic, which is what the signed loop did on the
+  // machines this runs on and is defined here.
+  vgpu::hostgemm::gemm<uint32_t, int8_t>(ta, tb, m, n, k, A.data(), lda, B.data(), ldb,
+                                         [=](int64_t i, int64_t j, uint32_t acc) {
+    int32_t& c = c0[idx(static_cast<int>(i), static_cast<int>(j), ldc)];
+    c = static_cast<int32_t>(beta == 0 ? static_cast<uint32_t>(alpha) * acc
+                                       : static_cast<uint32_t>(alpha) * acc +
+                                             static_cast<uint32_t>(beta) * static_cast<uint32_t>(c));
+  });
 }
 
 // The arguments a GEMM refuses, as an RTX 3060's cuBLAS does: an unknown

@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "../include/vgpu_nvcomp.hpp"
+#include "host_parallel.hpp"
 #include "nvcomp_internal.hpp"
 
 namespace impl = vgpu::nvcomp_impl;
@@ -198,9 +199,14 @@ struct nvcompManagerInternalBase {
     std::vector<Bytes> pieces(nc);
     std::vector<uint64_t> offsets(nc), sizes(nc);
     size_t at = 0;
-    for (size_t i = 0; i < nc; ++i) {
+    // The chunks are independent bitstreams: they are coded on as many threads as the work warrants, then laid out in order.
+    vgpu::hostpar::parallel_for(vgpu::hostpar::plan(static_cast<uint64_t>(n) * 40, static_cast<int64_t>(nc)), static_cast<int64_t>(nc),
+                                [&](int64_t ci) {
+      const size_t i = static_cast<size_t>(ci);
       const size_t begin = i * chunk, len = std::min(chunk, n - begin);
       pieces[i] = impl::compress(fmt, src.data() + begin, len, level);
+    });
+    for (size_t i = 0; i < nc; ++i) {
       at = align8(at);
       offsets[i] = at;
       sizes[i] = pieces[i].size();

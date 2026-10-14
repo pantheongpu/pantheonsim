@@ -103,6 +103,15 @@ struct Instr {
   // Op-specific decoded fields the executor reads (what each means is set by
   // the op's decoder, and documented there).
   uint32_t f[8] = {};
+  // Facts about the instruction the executor used to work out again on every
+  // execution, set once when the code section is decoded (Code::instr,
+  // annotate in exec.cpp): its profiler class (exec::InstClass), whether it is
+  // a tensor-core instruction, and whether it leaves every lane's program
+  // counter to its caller (straight-line arithmetic, conversions and plain
+  // memory access; Runner::step_warp).
+  uint8_t cls = 0;
+  bool tensor = false;
+  bool straight = false;
 };
 
 // Decodes one instruction. `pc` is its address (branch targets are relative to

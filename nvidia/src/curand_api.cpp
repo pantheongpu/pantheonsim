@@ -31,6 +31,7 @@
 #include <cuda_runtime.h>
 
 #include "capture_defer.hpp"
+#include "host_parallel.hpp"
 
 namespace {
 
@@ -110,6 +111,20 @@ inline uint64_t mix(uint64_t x) {
 
 inline uint32_t draw32(uint64_t seed, uint64_t index) {
   return static_cast<uint32_t>(mix(seed ^ mix(index)) >> 32);
+}
+
+// Calls fn(begin, end) over [0, n) in pieces on as many threads as the work warrants. Value i of every generator below depends
+// only on (seed, offset + counter + i), so the pieces are independent and the numbers are the same whatever the split.
+// `cost` is a rough number of nanoseconds per element.
+template <class Fn>
+void for_pieces(size_t n, unsigned cost, Fn&& fn) {
+  constexpr size_t kPiece = 1 << 14;
+  const int64_t pieces = static_cast<int64_t>((n + kPiece - 1) / kPiece);
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(n) * cost, pieces, 2000000);
+  vgpu::hostpar::parallel_for(threads, pieces, [&](int64_t p) {
+    const size_t b = static_cast<size_t>(p) * kPiece;
+    fn(b, std::min(n, b + kPiece));
+  });
 }
 
 // (0, 1] like cuRAND: never returns 0, may return 1.
@@ -457,7 +472,9 @@ VGPU_EXPORT curandStatus_t curandGenerate(curandGenerator_t gen, unsigned int* o
   VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerate(gen, out, n));
   if (g->quasi()) return quasi_fill(g, out, n, [](auto x) { return static_cast<unsigned int>(x); });
   std::vector<unsigned int> h(n);
-  for (size_t i = 0; i < n; ++i) h[i] = draw32(g->seed, g->offset + g->counter + i);
+  for_pieces(n, 4, [&](size_t b, size_t e) {
+    for (size_t i = b; i < e; ++i) h[i] = draw32(g->seed, g->offset + g->counter + i);
+  });
   g->counter += n;
   store(out, h);
   return CURAND_STATUS_SUCCESS;
@@ -478,7 +495,9 @@ VGPU_EXPORT curandStatus_t curandGenerateUniform(curandGenerator_t gen, float* o
   VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateUniform(gen, out, n));
   if (g->quasi()) return quasi_fill(g, out, n, [](auto x) { return quasi_float(x); });
   std::vector<float> h(n);
-  for (size_t i = 0; i < n; ++i) h[i] = uniform_float(draw32(g->seed, g->offset + g->counter + i));
+  for_pieces(n, 4, [&](size_t b, size_t e) {
+    for (size_t i = b; i < e; ++i) h[i] = uniform_float(draw32(g->seed, g->offset + g->counter + i));
+  });
   g->counter += n;
   store(out, h);
   return CURAND_STATUS_SUCCESS;
@@ -491,8 +510,9 @@ VGPU_EXPORT curandStatus_t curandGenerateUniformDouble(curandGenerator_t gen, do
   VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateUniformDouble(gen, out, n));
   if (g->quasi()) return quasi_fill(g, out, n, [](auto x) { return quasi_double(x); });
   std::vector<double> h(n);
-  for (size_t i = 0; i < n; ++i)
-    h[i] = uniform_double(mix(g->seed ^ mix(g->offset + g->counter + i)));
+  for_pieces(n, 4, [&](size_t b, size_t e) {
+    for (size_t i = b; i < e; ++i) h[i] = uniform_double(mix(g->seed ^ mix(g->offset + g->counter + i)));
+  });
   g->counter += n;
   store(out, h);
   return CURAND_STATUS_SUCCESS;
@@ -513,13 +533,16 @@ VGPU_EXPORT curandStatus_t curandGenerateNormal(curandGenerator_t gen, float* ou
   if (n % 2) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
   auto* g = reinterpret_cast<Generator*>(gen);
   std::vector<float> h(n);
-  for (size_t i = 0; i < n; i += 2) {
-    float u1 = uniform_float(draw32(g->seed, g->offset + g->counter + i));
-    float u2 = uniform_float(draw32(g->seed, g->offset + g->counter + i + 1));
-    float r = std::sqrt(-2.0f * std::log(u1)), theta = 6.2831853f * u2;
-    h[i] = mean + stddev * r * std::cos(theta);
-    h[i + 1] = mean + stddev * r * std::sin(theta);
-  }
+  // (Pieces are even in length, so a pair of normals is never split.)
+  for_pieces(n, 30, [&](size_t b, size_t e) {
+    for (size_t i = b; i < e; i += 2) {
+      float u1 = uniform_float(draw32(g->seed, g->offset + g->counter + i));
+      float u2 = uniform_float(draw32(g->seed, g->offset + g->counter + i + 1));
+      float r = std::sqrt(-2.0f * std::log(u1)), theta = 6.2831853f * u2;
+      h[i] = mean + stddev * r * std::cos(theta);
+      h[i + 1] = mean + stddev * r * std::sin(theta);
+    }
+  });
   g->counter += n;
   store(out, h);
   return CURAND_STATUS_SUCCESS;
@@ -535,13 +558,15 @@ VGPU_EXPORT curandStatus_t curandGenerateNormalDouble(curandGenerator_t gen, dou
   if (n % 2) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
   auto* g = reinterpret_cast<Generator*>(gen);
   std::vector<double> h(n);
-  for (size_t i = 0; i < n; i += 2) {
-    double u1 = uniform_double(mix(g->seed ^ mix(g->offset + g->counter + i)));
-    double u2 = uniform_double(mix(g->seed ^ mix(g->offset + g->counter + i + 1)));
-    double r = std::sqrt(-2.0 * std::log(u1)), theta = 6.283185307179586 * u2;
-    h[i] = mean + stddev * r * std::cos(theta);
-    h[i + 1] = mean + stddev * r * std::sin(theta);
-  }
+  for_pieces(n, 40, [&](size_t b, size_t e) {
+    for (size_t i = b; i < e; i += 2) {
+      double u1 = uniform_double(mix(g->seed ^ mix(g->offset + g->counter + i)));
+      double u2 = uniform_double(mix(g->seed ^ mix(g->offset + g->counter + i + 1)));
+      double r = std::sqrt(-2.0 * std::log(u1)), theta = 6.283185307179586 * u2;
+      h[i] = mean + stddev * r * std::cos(theta);
+      h[i + 1] = mean + stddev * r * std::sin(theta);
+    }
+  });
   g->counter += n;
   store(out, h);
   return CURAND_STATUS_SUCCESS;
@@ -556,7 +581,9 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormal(curandGenerator_t gen, float*
   if (s != CURAND_STATUS_SUCCESS) return s;
   std::vector<float> h(n);
   cudaMemcpy(h.data(), out, n * sizeof(float), cudaMemcpyDeviceToHost);
-  for (auto& v : h) v = std::exp(v);
+  for_pieces(n, 15, [&](size_t b, size_t e) {
+    for (size_t i = b; i < e; ++i) h[i] = std::exp(h[i]);
+  });
   store(out, h);
   return CURAND_STATUS_SUCCESS;
 }
@@ -570,7 +597,9 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormalDouble(curandGenerator_t gen, 
   if (s != CURAND_STATUS_SUCCESS) return s;
   std::vector<double> h(n);
   cudaMemcpy(h.data(), out, n * sizeof(double), cudaMemcpyDeviceToHost);
-  for (auto& v : h) v = std::exp(v);
+  for_pieces(n, 20, [&](size_t b, size_t e) {
+    for (size_t i = b; i < e; ++i) h[i] = std::exp(h[i]);
+  });
   store(out, h);
   return CURAND_STATUS_SUCCESS;
 }

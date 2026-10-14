@@ -101,11 +101,12 @@ Publisher::~Publisher() {
 void Publisher::begin_update() {
   if (shared_) __atomic_add_fetch(&shared_->update_seq, 1, __ATOMIC_ACQ_REL);
 }
-void Publisher::end_update() {
-  if (shared_) {
-    shared_->update_ns = now_ns();
-    __atomic_add_fetch(&shared_->update_seq, 1, __ATOMIC_ACQ_REL);
-  }
+int64_t Publisher::end_update(int64_t now) {
+  if (!shared_) return now;
+  const int64_t t = now >= 0 ? now : now_ns();
+  shared_->update_ns = t;
+  __atomic_add_fetch(&shared_->update_seq, 1, __ATOMIC_ACQ_REL);
+  return t;
 }
 
 void Publisher::set_device_count(uint32_t n) {
@@ -134,8 +135,7 @@ void Publisher::note_memory(uint32_t ordinal, uint64_t used_bytes) {
   if (!d) return;
   begin_update();
   d->vram_used_bytes = used_bytes;
-  end_update();
-  refresh(ordinal);
+  refresh(ordinal, end_update());
 }
 
 void Publisher::note_kernel(uint32_t ordinal, double seconds_busy) {
@@ -146,11 +146,10 @@ void Publisher::note_kernel(uint32_t ordinal, double seconds_busy) {
   a.busy_seconds += seconds_busy;
   begin_update();
   ++d->kernels_launched;
-  end_update();
-  refresh(ordinal);
+  refresh(ordinal, end_update());
 }
 
-void Publisher::note_transfer(uint32_t ordinal, uint64_t bytes, double seconds_busy) {
+void Publisher::note_transfer(uint32_t ordinal, uint64_t bytes, double seconds_busy, int64_t now) {
   std::lock_guard<std::recursive_mutex> lock(writers_);
   DeviceSample* d = device(ordinal);
   if (!d) return;
@@ -159,16 +158,15 @@ void Publisher::note_transfer(uint32_t ordinal, uint64_t bytes, double seconds_b
   a.mem_busy_seconds += seconds_busy;
   begin_update();
   d->bytes_moved += bytes;
-  end_update();
-  refresh(ordinal);
+  refresh(ordinal, end_update(now));
 }
 
-void Publisher::refresh(uint32_t ordinal) {
+void Publisher::refresh(uint32_t ordinal, int64_t now) {
   std::lock_guard<std::recursive_mutex> lock(writers_);
   DeviceSample* d = device(ordinal);
   if (!d) return;
   Accum& a = accum_[ordinal];
-  int64_t t = now_ns();
+  int64_t t = now >= 0 ? now : now_ns();
   if (!a.primed) {
     a.window_start_ns = t;
     a.power_w = d->power_limit_mw / 1000.0 * 0.08;  // idle draw

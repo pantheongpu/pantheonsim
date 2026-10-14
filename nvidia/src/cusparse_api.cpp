@@ -39,6 +39,7 @@
 #include <cuda_runtime.h>
 
 #include "capture_defer.hpp"
+#include "host_parallel.hpp"
 
 // The reads and writes of device memory below are the commit points of a call made on a capturing stream
 // (capture_defer.hpp); the calls that record themselves (SpMV, SpMM, ...) do not need them.
@@ -1021,16 +1022,37 @@ cusparseStatus_t spmm_one(cusparseOperation_t opA, cusparseOperation_t opB, V al
   } else {
     c.assign(dn_elems(C), V(0.0));
   }
-  for (size_t e = 0; e < t.val.size(); ++e) {
+  const size_t ne = t.val.size();
+  for (size_t e = 0; e < ne; ++e) {
     const int64_t r = transposed(opA) ? t.col[e] : t.row[e];
     const int64_t cc = transposed(opA) ? t.row[e] : t.col[e];
     if (r < 0 || r >= m || cc < 0 || cc >= k) return CUSPARSE_STATUS_INVALID_VALUE;
-    const V av = al * conj_op(t.val[e], opA);
-    for (int64_t j = 0; j < n; ++j) {
-      const size_t bi = transposed(opB) ? dn_index(B, j, cc) : dn_index(B, cc, j);
-      c[dn_index(C, r, j)] += av * conj_op(b[bi], opB);
-    }
   }
+  // C(r, j) is the sum over A's entries, in their order, of al*A(r,cc) * B(cc, j) added to what it held. Columns j of C do not
+  // meet, so they go to threads in ranges, and each range takes the entries in order (down one column of a column-major C at
+  // a time, where that is the contiguous way, and across a row of a row-major one).
+  std::vector<V> av(ne);
+  for (size_t e = 0; e < ne; ++e) av[e] = al * conj_op(t.val[e], opA);
+  const bool cmajor = C.order == CUSPARSE_ORDER_COL;
+  const int64_t range = 8;
+  const int64_t nrange = (n + range - 1) / range;
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(ne) * static_cast<uint64_t>(n) * 4u, nrange);
+  vgpu::hostpar::parallel_for(threads, nrange, [&](int64_t rg) {
+    const int64_t j0 = rg * range, j1 = std::min<int64_t>(n, j0 + range);
+    auto entry = [&](size_t e, int64_t j) {
+      const int64_t r = transposed(opA) ? t.col[e] : t.row[e];
+      const int64_t cc = transposed(opA) ? t.row[e] : t.col[e];
+      const size_t bi = transposed(opB) ? dn_index(B, j, cc) : dn_index(B, cc, j);
+      c[dn_index(C, r, j)] += av[e] * conj_op(b[bi], opB);
+    };
+    if (cmajor) {
+      for (int64_t j = j0; j < j1; ++j)
+        for (size_t e = 0; e < ne; ++e) entry(e, j);
+    } else {
+      for (size_t e = 0; e < ne; ++e)
+        for (int64_t j = j0; j < j1; ++j) entry(e, j);
+    }
+  });
   return store_values(C.values, c, C.type) ? CUSPARSE_STATUS_SUCCESS
                                            : CUSPARSE_STATUS_INTERNAL_ERROR;
 }

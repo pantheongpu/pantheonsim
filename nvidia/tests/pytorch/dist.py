@@ -227,19 +227,35 @@ def ddp_train():
     return None if diff <= 1e-4 else f"max parameter difference {diff:g}"
 
 
+class TwoBranches(nn.Module):
+    """Only `a` takes part in forward; `unused` has parameters that never get a gradient."""
+
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Linear(16, 8)
+        self.unused = nn.Linear(16, 8)
+
+    def forward(self, x):
+        return self.a(x)
+
+
 def ddp_no_sync_and_unused():
+    # The forward has to go through the DDP wrapper: it is DDP.forward that arms the reducer's hooks for the
+    # backward, and a call of the inner module would never synchronise anything (the ranks' gradients differ).
     batch, _ = whole_batch_grads()
-    net = nn.ModuleDict({'a': nn.Linear(16, 8), 'unused': nn.Linear(16, 8)})
     torch.manual_seed(0)
-    m = nn.parallel.DistributedDataParallel(net.cuda(), device_ids=[rank], find_unused_parameters=True)
+    m = nn.parallel.DistributedDataParallel(TwoBranches().cuda(), device_ids=[rank], find_unused_parameters=True)
     x = batch[8 * rank:8 * (rank + 1)].cuda()
     with m.no_sync():
-        m.module['a'](x).sum().backward()
-    m.module['a'](x).sum().backward()
-    g = m.module['a'].weight.grad.clone()
+        m(x).sum().backward()          # kept on the rank
+    m(x).sum().backward()              # added to it, then averaged over the ranks
+    g = m.module.a.weight.grad.clone()
     gs = [torch.empty_like(g) for _ in range(world)]
     dist.all_gather(gs, g)
-    return same(gs[0], gs[1].cpu())
+    # The weight gradient of sum(x @ W.T) is the sum of the batch rows; two backward passes accumulate it twice
+    # and the average over two ranks of twice a half-batch's sum is the whole batch's sum.
+    want = batch.sum(0).expand(8, 16)
+    return same(gs[0], gs[1].cpu()) or same(gs[0], want, 1e-4)
 
 
 def ddp_half_hook():
@@ -265,7 +281,8 @@ def ddp_bn():
 def fsdp():
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     batch, want = whole_batch_grads()
-    m = FSDP(make_model().cuda(), device_id=rank)
+    # with_grads=True needs the original parameters (use_orig_params=True): FSDP refuses it otherwise.
+    m = FSDP(make_model().cuda(), device_id=rank, use_orig_params=True)
     out = m(batch[8 * rank:8 * (rank + 1)].cuda())
     out.pow(2).mean().backward()
     with FSDP.summon_full_params(m, with_grads=True):

@@ -1,0 +1,140 @@
+### r7proto isa=base :: elf/int_virus.2.sm_86.cubin int_virus grid=64 block=256 iters=200
+load before: 10.20 9.75 10.69
+proto 136 SASS -> 128 micro-ops, compile 164.2 us
+genr 136 SASS -> 4 regions (118 ops fused), 25818 bytes of C++, generate 0.3 ms, g++ -O2 0.50 s wall / 0.41 s cpu
+genf 136 SASS -> 4 regions (118 ops fused), 13905 bytes of C++, generate 0.1 ms, g++ -O2 0.24 s wall / 0.16 s cpu
+base wall s/launch median 0.4281 base cpu s/launch median 0.4280 (min 0.3734 max 0.7043) 24.4 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0854 proto cpu s/launch median 0.0854 (min 0.0612 max 0.1170) 122.4 M warp-inst/s vs base 5.01x same bits YES same counters YES 
+genr wall s/launch median 0.1251 genr cpu s/launch median 0.1251 (min 0.1165 max 0.2453) 83.6 M warp-inst/s vs base 3.42x same bits YES same counters YES 
+genf wall s/launch median 0.0857 genf cpu s/launch median 0.0857 (min 0.0829 max 0.1344) 122.0 M warp-inst/s vs base 4.99x same bits YES same counters YES 
+load after: 11.32 10.02 10.76
+### r7proto isa=base :: k.cubin ffma_loop grid=16 block=256 iters=1000
+load before: 11.32 10.02 10.76
+proto 48 SASS -> 41 micro-ops, compile 49.7 us
+genr 48 SASS -> 4 regions (33 ops fused), 8816 bytes of C++, generate 0.1 ms, g++ -O2 0.12 s wall / 0.08 s cpu
+genf 48 SASS -> 4 regions (33 ops fused), 8673 bytes of C++, generate 0.0 ms, g++ -O2 0.26 s wall / 0.10 s cpu
+base wall s/launch median 0.1627 base cpu s/launch median 0.1627 (min 0.1379 max 0.1929) 8.7 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.1034 proto cpu s/launch median 0.1034 (min 0.0839 max 0.1383) 13.6 M warp-inst/s vs base 1.57x same bits YES same counters YES 
+genr wall s/launch median 0.0697 genr cpu s/launch median 0.0697 (min 0.0576 max 0.1019) 20.2 M warp-inst/s vs base 2.33x same bits YES same counters YES 
+genf wall s/launch median 0.0664 genf cpu s/launch median 0.0664 (min 0.0514 max 0.0950) 21.3 M warp-inst/s vs base 2.45x same bits YES same counters YES 
+load after: 11.32 10.02 10.76
+### r7proto isa=base :: k.cubin int_loop grid=16 block=256 iters=1000
+load before: 11.32 10.02 10.76
+proto 40 SASS -> 35 micro-ops, compile 104.3 us
+genr 40 SASS -> 2 regions (25 ops fused), 6895 bytes of C++, generate 0.1 ms, g++ -O2 0.20 s wall / 0.13 s cpu
+genf 40 SASS -> 2 regions (25 ops fused), 6119 bytes of C++, generate 0.1 ms, g++ -O2 0.21 s wall / 0.12 s cpu
+base wall s/launch median 0.1551 base cpu s/launch median 0.1488 (min 0.0901 max 0.1694) 12.1 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0445 proto cpu s/launch median 0.0445 (min 0.0300 max 0.0552) 40.3 M warp-inst/s vs base 3.34x same bits YES same counters YES 
+genr wall s/launch median 0.0335 genr cpu s/launch median 0.0335 (min 0.0189 max 0.0385) 53.6 M warp-inst/s vs base 4.44x same bits YES same counters YES 
+genf wall s/launch median 0.0104 genf cpu s/launch median 0.0103 (min 0.0065 max 0.0131) 173.5 M warp-inst/s vs base 14.39x same bits YES same counters YES 
+load after: 12.41 10.27 10.84
+### r7proto isa=base :: k.cubin vecadd grid=2048 block=256 bulk=0
+load before: 12.41 10.27 10.84
+proto 32 SASS -> 19 micro-ops, compile 58.4 us
+genr 32 SASS -> 3 regions (12 ops fused), 4975 bytes of C++, generate 0.0 ms, g++ -O2 0.15 s wall / 0.05 s cpu
+genf 32 SASS -> 3 regions (12 ops fused), 6023 bytes of C++, generate 0.0 ms, g++ -O2 0.12 s wall / 0.05 s cpu
+base wall s/launch median 0.0953 base cpu s/launch median 0.0953 (min 0.0939 max 0.0960) 2.8 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0323 proto cpu s/launch median 0.0323 (min 0.0313 max 0.0329) 8.1 M warp-inst/s vs base 2.95x same bits YES same counters YES 
+genr wall s/launch median 0.0331 genr cpu s/launch median 0.0330 (min 0.0319 max 0.0336) 7.9 M warp-inst/s vs base 2.88x same bits YES same counters YES 
+genf wall s/launch median 0.0320 genf cpu s/launch median 0.0320 (min 0.0305 max 0.0329) 8.2 M warp-inst/s vs base 2.98x same bits YES same counters YES 
+load after: 12.41 10.27 10.84
+### r7proto isa=base :: k.cubin vecadd grid=2048 block=256 bulk=1
+load before: 12.41 10.27 10.84
+proto 32 SASS -> 19 micro-ops, compile 44.2 us
+genr 32 SASS -> 3 regions (12 ops fused), 4975 bytes of C++, generate 0.0 ms, g++ -O2 0.11 s wall / 0.05 s cpu
+genf 32 SASS -> 3 regions (12 ops fused), 6023 bytes of C++, generate 0.0 ms, g++ -O2 0.10 s wall / 0.05 s cpu
+base wall s/launch median 0.0988 base cpu s/launch median 0.0988 (min 0.0949 max 0.1080) 2.7 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0080 proto cpu s/launch median 0.0080 (min 0.0076 max 0.0130) 32.9 M warp-inst/s vs base 12.39x same bits YES same counters YES 
+genr wall s/launch median 0.0082 genr cpu s/launch median 0.0082 (min 0.0080 max 0.0108) 31.9 M warp-inst/s vs base 12.01x same bits YES same counters YES 
+genf wall s/launch median 0.0069 genf cpu s/launch median 0.0069 (min 0.0068 max 0.0105) 37.9 M warp-inst/s vs base 14.29x same bits YES same counters YES 
+load after: 11.98 10.21 10.82
+### r7proto isa=base :: k.cubin saxpy grid=64 block=256 stride_iters=16 bulk=0
+load before: 11.98 10.21 10.82
+proto 32 SASS -> 24 micro-ops, compile 53.9 us
+genr 32 SASS -> 4 regions (14 ops fused), 5301 bytes of C++, generate 0.0 ms, g++ -O2 0.10 s wall / 0.06 s cpu
+genf 32 SASS -> 4 regions (14 ops fused), 6265 bytes of C++, generate 0.0 ms, g++ -O2 0.10 s wall / 0.06 s cpu
+base wall s/launch median 0.0361 base cpu s/launch median 0.0361 (min 0.0354 max 0.0371) 2.6 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0154 proto cpu s/launch median 0.0154 (min 0.0151 max 0.0225) 6.1 M warp-inst/s vs base 2.35x same bits YES same counters YES 
+genr wall s/launch median 0.0153 genr cpu s/launch median 0.0153 (min 0.0149 max 0.0162) 6.1 M warp-inst/s vs base 2.35x same bits YES same counters YES 
+genf wall s/launch median 0.0147 genf cpu s/launch median 0.0147 (min 0.0144 max 0.0157) 6.4 M warp-inst/s vs base 2.46x same bits YES same counters YES 
+load after: 11.98 10.21 10.82
+### r7proto isa=base :: k.cubin saxpy grid=64 block=256 stride_iters=16 bulk=1
+load before: 11.98 10.21 10.82
+proto 32 SASS -> 24 micro-ops, compile 40.3 us
+genr 32 SASS -> 4 regions (14 ops fused), 5301 bytes of C++, generate 0.0 ms, g++ -O2 0.11 s wall / 0.06 s cpu
+genf 32 SASS -> 4 regions (14 ops fused), 6265 bytes of C++, generate 0.0 ms, g++ -O2 0.11 s wall / 0.06 s cpu
+base wall s/launch median 0.0366 base cpu s/launch median 0.0366 (min 0.0354 max 0.0406) 2.6 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0030 proto cpu s/launch median 0.0030 (min 0.0029 max 0.0031) 31.4 M warp-inst/s vs base 12.21x same bits YES same counters YES 
+genr wall s/launch median 0.0027 genr cpu s/launch median 0.0027 (min 0.0026 max 0.0028) 35.1 M warp-inst/s vs base 13.66x same bits YES same counters YES 
+genf wall s/launch median 0.0023 genf cpu s/launch median 0.0023 (min 0.0023 max 0.0029) 40.5 M warp-inst/s vs base 15.75x same bits YES same counters YES 
+load after: 11.98 10.21 10.82
+### r7proto_avx2 isa=avx2 :: elf/int_virus.2.sm_86.cubin int_virus grid=64 block=256 iters=200
+load before: 11.98 10.21 10.82
+proto 136 SASS -> 128 micro-ops, compile 74.7 us
+genr 136 SASS -> 4 regions (118 ops fused), 25818 bytes of C++, generate 0.1 ms, g++ -O2 -mavx2 -mfma 0.32 s wall / 0.27 s cpu
+genf 136 SASS -> 4 regions (118 ops fused), 13905 bytes of C++, generate 0.1 ms, g++ -O2 -mavx2 -mfma 0.14 s wall / 0.08 s cpu
+base wall s/launch median 0.4335 base cpu s/launch median 0.4335 (min 0.3887 max 0.6078) 24.1 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0428 proto cpu s/launch median 0.0428 (min 0.0415 max 0.0666) 244.1 M warp-inst/s vs base 10.12x same bits YES same counters YES 
+genr wall s/launch median 0.0590 genr cpu s/launch median 0.0590 (min 0.0548 max 0.0914) 177.3 M warp-inst/s vs base 7.35x same bits YES same counters YES 
+genf wall s/launch median 0.0232 genf cpu s/launch median 0.0232 (min 0.0226 max 0.0336) 450.0 M warp-inst/s vs base 18.66x same bits YES same counters YES 
+load after: 11.74 10.19 10.81
+### r7proto_avx2 isa=avx2 :: k.cubin ffma_loop grid=16 block=256 iters=1000
+load before: 11.74 10.19 10.81
+proto 48 SASS -> 41 micro-ops, compile 55.3 us
+genr 48 SASS -> 4 regions (33 ops fused), 8816 bytes of C++, generate 0.1 ms, g++ -O2 -mavx2 -mfma 0.19 s wall / 0.11 s cpu
+genf 48 SASS -> 4 regions (33 ops fused), 8673 bytes of C++, generate 0.1 ms, g++ -O2 -mavx2 -mfma 0.16 s wall / 0.10 s cpu
+base wall s/launch median 0.1032 base cpu s/launch median 0.1032 (min 0.0922 max 0.1293) 13.7 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0122 proto cpu s/launch median 0.0122 (min 0.0102 max 0.0181) 115.5 M warp-inst/s vs base 8.44x same bits YES same counters YES 
+genr wall s/launch median 0.0067 genr cpu s/launch median 0.0067 (min 0.0066 max 0.0122) 210.0 M warp-inst/s vs base 15.36x same bits YES same counters YES 
+genf wall s/launch median 0.0029 genf cpu s/launch median 0.0029 (min 0.0029 max 0.0045) 483.6 M warp-inst/s vs base 35.36x same bits YES same counters YES 
+load after: 11.74 10.19 10.81
+### r7proto_avx2 isa=avx2 :: k.cubin int_loop grid=16 block=256 iters=1000
+load before: 11.74 10.19 10.81
+proto 40 SASS -> 35 micro-ops, compile 56.9 us
+genr 40 SASS -> 2 regions (25 ops fused), 6895 bytes of C++, generate 0.0 ms, g++ -O2 -mavx2 -mfma 0.16 s wall / 0.08 s cpu
+genf 40 SASS -> 2 regions (25 ops fused), 6119 bytes of C++, generate 0.1 ms, g++ -O2 -mavx2 -mfma 0.14 s wall / 0.07 s cpu
+base wall s/launch median 0.1141 base cpu s/launch median 0.1140 (min 0.0913 max 0.1478) 15.7 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0194 proto cpu s/launch median 0.0194 (min 0.0187 max 0.0313) 92.6 M warp-inst/s vs base 5.89x same bits YES same counters YES 
+genr wall s/launch median 0.0091 genr cpu s/launch median 0.0091 (min 0.0081 max 0.0141) 196.6 M warp-inst/s vs base 12.49x same bits YES same counters YES 
+genf wall s/launch median 0.0035 genf cpu s/launch median 0.0035 (min 0.0028 max 0.0043) 507.9 M warp-inst/s vs base 32.27x same bits YES same counters YES 
+load after: 11.76 10.22 10.82
+### r7proto_avx2 isa=avx2 :: k.cubin vecadd grid=2048 block=256 bulk=0
+load before: 11.76 10.22 10.82
+proto 32 SASS -> 19 micro-ops, compile 49.9 us
+genr 32 SASS -> 3 regions (12 ops fused), 4975 bytes of C++, generate 0.1 ms, g++ -O2 -mavx2 -mfma 0.12 s wall / 0.07 s cpu
+genf 32 SASS -> 3 regions (12 ops fused), 6023 bytes of C++, generate 0.0 ms, g++ -O2 -mavx2 -mfma 0.12 s wall / 0.06 s cpu
+base wall s/launch median 0.1022 base cpu s/launch median 0.1022 (min 0.1006 max 0.1060) 2.6 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0317 proto cpu s/launch median 0.0317 (min 0.0311 max 0.0327) 8.3 M warp-inst/s vs base 3.23x same bits YES same counters YES 
+genr wall s/launch median 0.0315 genr cpu s/launch median 0.0315 (min 0.0310 max 0.0326) 8.3 M warp-inst/s vs base 3.24x same bits YES same counters YES 
+genf wall s/launch median 0.0310 genf cpu s/launch median 0.0310 (min 0.0307 max 0.0343) 8.4 M warp-inst/s vs base 3.29x same bits YES same counters YES 
+load after: 11.76 10.22 10.82
+### r7proto_avx2 isa=avx2 :: k.cubin vecadd grid=2048 block=256 bulk=1
+load before: 11.76 10.22 10.82
+proto 32 SASS -> 19 micro-ops, compile 56.3 us
+genr 32 SASS -> 3 regions (12 ops fused), 4975 bytes of C++, generate 0.0 ms, g++ -O2 -mavx2 -mfma 0.11 s wall / 0.06 s cpu
+genf 32 SASS -> 3 regions (12 ops fused), 6023 bytes of C++, generate 0.0 ms, g++ -O2 -mavx2 -mfma 0.11 s wall / 0.06 s cpu
+base wall s/launch median 0.1013 base cpu s/launch median 0.1013 (min 0.1009 max 0.1088) 2.6 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0067 proto cpu s/launch median 0.0067 (min 0.0065 max 0.0070) 39.0 M warp-inst/s vs base 15.07x same bits YES same counters YES 
+genr wall s/launch median 0.0064 genr cpu s/launch median 0.0064 (min 0.0062 max 0.0072) 40.7 M warp-inst/s vs base 15.75x same bits YES same counters YES 
+genf wall s/launch median 0.0059 genf cpu s/launch median 0.0059 (min 0.0057 max 0.0060) 44.8 M warp-inst/s vs base 17.30x same bits YES same counters YES 
+load after: 11.76 10.22 10.82
+### r7proto_avx2 isa=avx2 :: k.cubin saxpy grid=64 block=256 stride_iters=16 bulk=0
+load before: 11.76 10.22 10.82
+proto 32 SASS -> 24 micro-ops, compile 49.8 us
+genr 32 SASS -> 4 regions (14 ops fused), 5301 bytes of C++, generate 0.0 ms, g++ -O2 -mavx2 -mfma 0.11 s wall / 0.06 s cpu
+genf 32 SASS -> 4 regions (14 ops fused), 6265 bytes of C++, generate 0.0 ms, g++ -O2 -mavx2 -mfma 0.11 s wall / 0.06 s cpu
+base wall s/launch median 0.0373 base cpu s/launch median 0.0373 (min 0.0361 max 0.0402) 2.5 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0148 proto cpu s/launch median 0.0148 (min 0.0146 max 0.0172) 6.3 M warp-inst/s vs base 2.51x same bits YES same counters YES 
+genr wall s/launch median 0.0145 genr cpu s/launch median 0.0145 (min 0.0142 max 0.0154) 6.5 M warp-inst/s vs base 2.57x same bits YES same counters YES 
+genf wall s/launch median 0.0144 genf cpu s/launch median 0.0144 (min 0.0139 max 0.0151) 6.5 M warp-inst/s vs base 2.59x same bits YES same counters YES 
+load after: 11.38 10.17 10.80
+### r7proto_avx2 isa=avx2 :: k.cubin saxpy grid=64 block=256 stride_iters=16 bulk=1
+load before: 11.38 10.17 10.80
+proto 32 SASS -> 24 micro-ops, compile 59.3 us
+genr 32 SASS -> 4 regions (14 ops fused), 5301 bytes of C++, generate 0.1 ms, g++ -O2 -mavx2 -mfma 0.12 s wall / 0.07 s cpu
+genf 32 SASS -> 4 regions (14 ops fused), 6265 bytes of C++, generate 0.0 ms, g++ -O2 -mavx2 -mfma 0.12 s wall / 0.07 s cpu
+base wall s/launch median 0.0374 base cpu s/launch median 0.0374 (min 0.0366 max 0.0397) 2.5 M warp-inst/s vs base 1.00x same bits YES same counters YES 
+proto wall s/launch median 0.0022 proto cpu s/launch median 0.0022 (min 0.0021 max 0.0023) 42.9 M warp-inst/s vs base 17.03x same bits YES same counters YES 
+genr wall s/launch median 0.0020 genr cpu s/launch median 0.0020 (min 0.0020 max 0.0022) 47.1 M warp-inst/s vs base 18.71x same bits YES same counters YES 
+genf wall s/launch median 0.0018 genf cpu s/launch median 0.0018 (min 0.0017 max 0.0018) 53.3 M warp-inst/s vs base 21.19x same bits YES same counters YES 
+load after: 11.38 10.17 10.80

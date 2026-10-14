@@ -57,17 +57,29 @@ jobs:
     name: rocblas-test ${{ matrix.gpu }} ${{ matrix.filter }} (${{ matrix.first }}-${{ matrix.last }} of 100)
     needs: client
     runs-on: ubuntu-24.04
+    # A shard of the float and double tests takes 3 to 7 minutes on this runner and
+    # two run at a time, so twenty of them fit well inside the limit (fifty did not:
+    # every run since 2026-09-30 was cancelled at the limit).
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         include:
-          - {gpu: amd/mi300x, filter: fp, first: 0, last: 49}
-          - {gpu: amd/mi300x, filter: fp, first: 50, last: 99}
-          - {gpu: amd/mi350x, filter: fp, first: 0, last: 49}
-          - {gpu: amd/mi350x, filter: fp, first: 50, last: 99}
-          - {gpu: amd/mi250x, filter: fp, first: 0, last: 49}
-          - {gpu: amd/mi250x, filter: fp, first: 50, last: 99}
+          - {gpu: amd/mi300x, filter: fp, first: 0, last: 19}
+          - {gpu: amd/mi300x, filter: fp, first: 20, last: 39}
+          - {gpu: amd/mi300x, filter: fp, first: 40, last: 59}
+          - {gpu: amd/mi300x, filter: fp, first: 60, last: 79}
+          - {gpu: amd/mi300x, filter: fp, first: 80, last: 99}
+          - {gpu: amd/mi350x, filter: fp, first: 0, last: 19}
+          - {gpu: amd/mi350x, filter: fp, first: 20, last: 39}
+          - {gpu: amd/mi350x, filter: fp, first: 40, last: 59}
+          - {gpu: amd/mi350x, filter: fp, first: 60, last: 79}
+          - {gpu: amd/mi350x, filter: fp, first: 80, last: 99}
+          - {gpu: amd/mi250x, filter: fp, first: 0, last: 19}
+          - {gpu: amd/mi250x, filter: fp, first: 20, last: 39}
+          - {gpu: amd/mi250x, filter: fp, first: 40, last: 59}
+          - {gpu: amd/mi250x, filter: fp, first: 60, last: 79}
+          - {gpu: amd/mi250x, filter: fp, first: 80, last: 99}
           - {gpu: amd/mi300x, filter: mixed, first: 0, last: 99}
     steps:
       - uses: actions/checkout@v4
