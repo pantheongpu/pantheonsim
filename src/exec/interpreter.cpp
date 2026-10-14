@@ -417,6 +417,9 @@ struct Warp {
   // the deterministic scheduler a turn otherwise lasts until the warp blocks,
   // and a spin never blocks, so the first waiter would hold the block forever.
   bool yield_now = false;
+  // Armed until the warp reaches its first store to global memory, where its turn ends once
+  // (see run_warp_until_yield).
+  bool store_gate = true;
   // Set by an instruction that must run again rather than advance: a
   // tcgen05.alloc that found too few columns free waits by retrying, giving
   // up its turn each time so the warp that will free them can run.
@@ -2915,6 +2918,20 @@ class Interpreter {
       if (w.paths[idx].pc >= cur_->body.size()) {
         exec_ret(w, ctx, implicit_ret(), idx, w.paths[idx].mask);
         continue;
+      }
+      // A warp's first store to global memory ends its turn, once, so that the block's other warps issue
+      // the loads their prologues make before it lands. On a card the warps of a block start within a few
+      // cycles of each other and a store posts only after a load's round trip, so a warp never sees a
+      // warp-mate's store from the same start: Triton's `step += 1` on a one-element tensor has every warp
+      // load, add and store the same word, and is right only because of that. Run to the end one warp at
+      // a time, warp k would load what warps 0..k-1 stored and add one more each. Any order is legal for
+      // code with no synchronization; this is the one the hardware gives. (The SASS executor does the same.)
+      if (w.store_gate) {
+        if (const auto* st = std::get_if<OpSt>(&cur_->body[w.paths[idx].pc].op);
+            st && (st->space == Space::Global || st->space == Space::Generic)) {
+          w.store_gate = false;
+          if (ctx.warps && ctx.warps->size() > 1) return;
+        }
       }
       // The pre-decoded forms of the function's instructions, when it has them
       // (see MicroOp).
