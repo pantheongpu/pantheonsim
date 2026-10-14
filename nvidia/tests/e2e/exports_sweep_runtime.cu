@@ -32,6 +32,44 @@ __global__ void kern(int* p) {
 __global__ void other(float* p) { p[threadIdx.x] = 2.f; }
 void hostfn() {}
 
+// Kernels for the attribute cases (cudaFuncGetAttributes / cudaFuncSetAttribute): static shared memory of several
+// sizes, dynamic shared memory, launch bounds, enough registers to limit the block, and module constants.
+template <int N> __global__ void kstat(int* p) {
+  __shared__ char s[N];
+  s[threadIdx.x % N] = static_cast<char>(threadIdx.x);
+  __syncthreads();
+  p[0] = s[1 % N];
+}
+__global__ void kdyn(int* p) {
+  extern __shared__ char dsm[];
+  dsm[threadIdx.x] = 1;
+  __syncthreads();
+  p[0] = dsm[0];
+}
+__global__ void kdyn2(int* p) {
+  extern __shared__ char dsm[];
+  dsm[threadIdx.x] = 1;
+  __syncthreads();
+  p[0] = dsm[0];
+}
+__global__ __launch_bounds__(128) void klb128(int* p) { p[0] = 1; }
+__global__ __launch_bounds__(512, 2) void klb512(int* p) { p[0] = 1; }
+__global__ __launch_bounds__(96) void klb96(int* p) { p[0] = 1; }
+template <int N> __global__ void kheavy(float* o) {
+  float a[N];
+#pragma unroll
+  for (int i = 0; i < N; i++) a[i] = o[i * 32 + threadIdx.x];
+  float s = 0;
+#pragma unroll
+  for (int i = 0; i < N; i++) s += a[i] * a[(i * 7 + 1) % N];
+#pragma unroll
+  for (int i = 0; i < N; i++) o[i * 32 + threadIdx.x] = a[i] * s + a[(i + 1) % N];
+}
+__constant__ int ctab[100];
+__constant__ char cflag[5];
+__constant__ double cwide[3];
+__global__ void kconst(int* p) { p[0] = ctab[threadIdx.x] + cflag[1] + static_cast<int>(cwide[1]); }
+
 static std::string g_notes;
 static void note(const char* fmt, ...) {
   char buf[256];
@@ -47,6 +85,45 @@ static cudaStream_t stream_made() {
   cudaStream_t s = nullptr;
   cudaStreamCreate(&s);
   return s;
+}
+
+// What cudaFuncGetAttributes says of a kernel (not the registers and local memory: they are the compiler's).
+static void note_attrs(const void* f) {
+  cudaFuncAttributes a;
+  const cudaError_t e = cudaFuncGetAttributes(&a, f);
+  if (e != cudaSuccess) {
+    note("get %s", cudaGetErrorName(e));
+    return;
+  }
+  note("static %zu, const %zu, maxThreads %d, ptx %d, binary %d, cacheCA %d, maxDynamic %d, carveout %d, clusterMustBeSet %d, "
+       "cluster %d %d %d, policy %d, nonPortable %d",
+       a.sharedSizeBytes, a.constSizeBytes, a.maxThreadsPerBlock, a.ptxVersion, a.binaryVersion, a.cacheModeCA,
+       a.maxDynamicSharedSizeBytes, a.preferredShmemCarveout, a.clusterDimMustBeSet, a.requiredClusterWidth,
+       a.requiredClusterHeight, a.requiredClusterDepth, a.clusterSchedulingPolicyPreference,
+       a.nonPortableClusterSizeAllowed);
+}
+static int max_dynamic(const void* f) {
+  cudaFuncAttributes a;
+  return cudaFuncGetAttributes(&a, f) == cudaSuccess ? a.maxDynamicSharedSizeBytes : -99;
+}
+// A launch of one warp with `dyn` bytes of dynamic shared memory: whether it was refused. The code is not printed:
+// an RTX 3060 under CUDA 13.0 says cudaErrorInvalidValue and this library, like the CUDA 12 runtime, says
+// cudaErrorInvalidConfiguration for every launch configuration it refuses.
+static bool launch_refused(const void* f, size_t dyn) {
+  int* d = nullptr;
+  cudaMalloc(&d, 4096);
+  void* args[1] = {&d};
+  const cudaError_t e = cudaLaunchKernel(f, dim3(1), dim3(32), args, dyn, 0);
+  cudaGetLastError();
+  cudaDeviceSynchronize();
+  cudaGetLastError();
+  cudaFree(d);
+  return e != cudaSuccess;
+}
+static cudaError_t set_dynamic(const void* f, int v) {
+  const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, v);
+  note("now %d", max_dynamic(f));
+  return e;
 }
 
 struct Case {
@@ -106,6 +183,83 @@ int main() {
   }
   C("cudaOccupancyAvailableDynamicSMemPerBlock null", { return cudaOccupancyAvailableDynamicSMemPerBlock(nullptr, (const void*)kern, 1, 128); });
   C("cudaOccupancyAvailableDynamicSMemPerBlock null function", { size_t s; return cudaOccupancyAvailableDynamicSMemPerBlock(&s, nullptr, 1, 128); });
+  // ---- kernel attributes: what cudaFuncGetAttributes says before anything is set, and what cudaFuncSetAttribute
+  // accepts (nvidia/src/func_attrs.hpp has the rules; every line is an RTX 3060 under CUDA 13.0)
+  C("cudaFuncGetAttributes, no static shared memory", { note_attrs((const void*)kdyn); return cudaSuccess; });
+  C("cudaFuncGetAttributes, 256 bytes static", { note_attrs((const void*)kstat<256>); return cudaSuccess; });
+  C("cudaFuncGetAttributes, 40000 bytes static", { note_attrs((const void*)kstat<40000>); return cudaSuccess; });
+  C("cudaFuncGetAttributes, 48 KiB static", { note_attrs((const void*)kstat<49152>); return cudaSuccess; });
+  C("cudaFuncGetAttributes, __launch_bounds__(128)", { note_attrs((const void*)klb128); return cudaSuccess; });
+  C("cudaFuncGetAttributes, __launch_bounds__(512, 2)", { note_attrs((const void*)klb512); return cudaSuccess; });
+  C("cudaFuncGetAttributes, __launch_bounds__(96)", { note_attrs((const void*)klb96); return cudaSuccess; });
+  C("cudaFuncGetAttributes, registers limit the block", { note_attrs((const void*)kheavy<400>); return cudaSuccess; });
+  C("cudaFuncGetAttributes, module constants", { note_attrs((const void*)kconst); return cudaSuccess; });
+  C("cudaFuncGetAttributes null attributes", { return cudaFuncGetAttributes(nullptr, (const void*)kdyn); });
+  C("cudaFuncGetAttributes null function", { cudaFuncAttributes a; return cudaFuncGetAttributes(&a, nullptr); });
+  C("cudaFuncGetAttributes stack address", { cudaFuncAttributes a; int x; return cudaFuncGetAttributes(&a, (const void*)&x); });
+  C("cudaFuncGetAttributes null both", { return cudaFuncGetAttributes(nullptr, nullptr); });
+  static const int dyn_values[] = {-1, 0, 1, 1024, 49152, 49153, 65536, 101376, 101377, 102400};
+  for (const int v : dyn_values) {
+    static char labels[16][96];
+    static int n = 0;
+    std::snprintf(labels[n], sizeof labels[n], "cudaFuncSetAttribute MaxDynamicSharedMemorySize %d, no static", v);
+    const char* label = labels[n++];
+    cases.push_back({label, "", [v]() -> cudaError_t { return set_dynamic((const void*)kdyn, v); }});
+  }
+  C("cudaFuncSetAttribute MaxDynamicSharedMemorySize 101120, 256 static", { return set_dynamic((const void*)kstat<256>, 101120); });
+  C("cudaFuncSetAttribute MaxDynamicSharedMemorySize 101121, 256 static", { return set_dynamic((const void*)kstat<256>, 101121); });
+  C("cudaFuncSetAttribute MaxDynamicSharedMemorySize 48896, 256 static", { return set_dynamic((const void*)kstat<256>, 48896); });
+  C("cudaFuncSetAttribute MaxDynamicSharedMemorySize 61376, 40000 static", { return set_dynamic((const void*)kstat<40000>, 61376); });
+  C("cudaFuncSetAttribute MaxDynamicSharedMemorySize 61377, 40000 static", { return set_dynamic((const void*)kstat<40000>, 61377); });
+  C("cudaFuncSetAttribute MaxDynamicSharedMemorySize 52224, 48 KiB static", { return set_dynamic((const void*)kstat<49152>, 52224); });
+  C("cudaFuncSetAttribute MaxDynamicSharedMemorySize 52225, 48 KiB static", { return set_dynamic((const void*)kstat<49152>, 52225); });
+  C("cudaFuncSetAttribute MaxDynamicSharedMemorySize 100000, 48 KiB static", { return set_dynamic((const void*)kstat<49152>, 100000); });
+  C("cudaFuncSetAttribute MaxDynamicSharedMemorySize twice", { cudaError_t e = set_dynamic((const void*)kdyn, 70000); set_dynamic((const void*)kdyn, 3000); return e; });
+  C("cudaFuncSetAttribute attribute 99", { return cudaFuncSetAttribute((const void*)kdyn, (cudaFuncAttribute)99, 1); });
+  C("cudaFuncSetAttribute attribute -1", { return cudaFuncSetAttribute((const void*)kdyn, (cudaFuncAttribute)-1, 1); });
+  C("cudaFuncSetAttribute attribute 16", { return cudaFuncSetAttribute((const void*)kdyn, (cudaFuncAttribute)16, 1); });
+  C("cudaFuncSetAttribute attribute 0", { return cudaFuncSetAttribute((const void*)kdyn, (cudaFuncAttribute)0, 1); });
+  C("cudaFuncSetAttribute attribute 1", { return cudaFuncSetAttribute((const void*)kdyn, (cudaFuncAttribute)1, 1); });
+  C("cudaFuncSetAttribute attribute 7", { return cudaFuncSetAttribute((const void*)kdyn, (cudaFuncAttribute)7, 1); });
+  C("cudaFuncSetAttribute ClusterDimMustBeSet", { return cudaFuncSetAttribute((const void*)kdyn, cudaFuncAttributeClusterDimMustBeSet, 1); });
+  C("cudaFuncSetAttribute null function", { return cudaFuncSetAttribute(nullptr, cudaFuncAttributeMaxDynamicSharedMemorySize, 100); });
+  C("cudaFuncSetAttribute stack address", { int x; return cudaFuncSetAttribute((const void*)&x, cudaFuncAttributeMaxDynamicSharedMemorySize, 100); });
+  C("cudaFuncSetAttribute stack address, carveout", { int x; return cudaFuncSetAttribute((const void*)&x, cudaFuncAttributePreferredSharedMemoryCarveout, 1); });
+  C("cudaFuncSetAttribute stack address, attribute 99", { int x; return cudaFuncSetAttribute((const void*)&x, (cudaFuncAttribute)99, 1); });
+  C("cudaFuncSetAttribute stack address, size -1", { int x; return cudaFuncSetAttribute((const void*)&x, cudaFuncAttributeMaxDynamicSharedMemorySize, -1); });
+  static const int carve_values[] = {-2, -1, 0, 1, 50, 100, 101};
+  for (const int v : carve_values) {
+    static char labels[16][96];
+    static int n = 0;
+    std::snprintf(labels[n], sizeof labels[n], "cudaFuncSetAttribute PreferredSharedMemoryCarveout %d", v);
+    const char* label = labels[n++];
+    cases.push_back({label, "", [v]() -> cudaError_t { cudaError_t e = cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributePreferredSharedMemoryCarveout, v); cudaFuncAttributes a; cudaFuncGetAttributes(&a, (const void*)klb128); note("now %d", a.preferredShmemCarveout); return e; }});
+  }
+  C("cudaFuncSetAttribute required cluster dimensions", { cudaError_t e = cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeRequiredClusterWidth, 3); cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeRequiredClusterHeight, 2); cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeRequiredClusterDepth, 5); note_attrs((const void*)klb128); return e; });
+  C("cudaFuncSetAttribute required cluster width -1", { return cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeRequiredClusterWidth, -1); });
+  C("cudaFuncSetAttribute required cluster height -1", { return cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeRequiredClusterHeight, -1); });
+  C("cudaFuncSetAttribute required cluster depth 0", { cudaError_t e = cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeRequiredClusterDepth, 0); note_attrs((const void*)klb128); return e; });
+  C("cudaFuncSetAttribute ClusterSchedulingPolicyPreference 2", { cudaError_t e = cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeClusterSchedulingPolicyPreference, 2); note_attrs((const void*)klb128); return e; });
+  C("cudaFuncSetAttribute ClusterSchedulingPolicyPreference 3", { return cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeClusterSchedulingPolicyPreference, 3); });
+  C("cudaFuncSetAttribute ClusterSchedulingPolicyPreference -1", { return cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeClusterSchedulingPolicyPreference, -1); });
+  C("cudaFuncSetAttribute NonPortableClusterSizeAllowed 7", { cudaError_t e = cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeNonPortableClusterSizeAllowed, 7); note_attrs((const void*)klb128); return e; });
+  C("cudaFuncSetAttribute NonPortableClusterSizeAllowed -1", { cudaError_t e = cudaFuncSetAttribute((const void*)klb128, cudaFuncAttributeNonPortableClusterSizeAllowed, -1); note_attrs((const void*)klb128); return e; });
+  C("cudaFuncSetAttribute everything on one kernel, then the other", { cudaFuncSetAttribute((const void*)kdyn, cudaFuncAttributeMaxDynamicSharedMemorySize, 70000); cudaFuncSetAttribute((const void*)kdyn, cudaFuncAttributePreferredSharedMemoryCarveout, 40); note("other kernel %d", max_dynamic((const void*)kdyn2)); note_attrs((const void*)kdyn); return cudaSuccess; });
+  C("cudaFuncSetAttribute on device 0, read on device 1", { cudaSetDevice(0); cudaFuncSetAttribute((const void*)kdyn, cudaFuncAttributeMaxDynamicSharedMemorySize, 70000); cudaFuncSetAttribute((const void*)kdyn, cudaFuncAttributePreferredSharedMemoryCarveout, 40); int on0 = max_dynamic((const void*)kdyn); cudaSetDevice(1); int on1 = max_dynamic((const void*)kdyn); cudaFuncSetAttribute((const void*)kdyn, cudaFuncAttributeMaxDynamicSharedMemorySize, 3000); int after = max_dynamic((const void*)kdyn); cudaSetDevice(0); note("device 0 %d, device 1 %d, after setting 3000 on 1: %d, device 0 again %d", on0, on1, after, max_dynamic((const void*)kdyn)); return cudaSuccess; });
+  // A launch may ask for what the kernel's limit allows, no more.
+  C("launch dynamic shared memory, not opted in", { note("49152 refused %d, 49153 refused %d, 65536 refused %d", launch_refused((const void*)kdyn, 49152), launch_refused((const void*)kdyn, 49153), launch_refused((const void*)kdyn, 65536)); return cudaSuccess; });
+  C("launch dynamic shared memory, 40000 bytes static", { note("9152 refused %d, 9153 refused %d", launch_refused((const void*)kstat<40000>, 9152), launch_refused((const void*)kstat<40000>, 9153)); return cudaSuccess; });
+  C("launch dynamic shared memory, 48 KiB static", { note("0 refused %d, 1 refused %d", launch_refused((const void*)kstat<49152>, 0), launch_refused((const void*)kstat<49152>, 1)); return cudaSuccess; });
+  C("launch dynamic shared memory, opted in to 60000", { cudaFuncSetAttribute((const void*)kdyn, cudaFuncAttributeMaxDynamicSharedMemorySize, 60000); note("49153 refused %d, 60000 refused %d, 60001 refused %d", launch_refused((const void*)kdyn, 49153), launch_refused((const void*)kdyn, 60000), launch_refused((const void*)kdyn, 60001)); return cudaSuccess; });
+  C("launch dynamic shared memory, opted in to 100", { cudaFuncSetAttribute((const void*)kdyn, cudaFuncAttributeMaxDynamicSharedMemorySize, 100); note("100 refused %d, 101 refused %d, 49152 refused %d", launch_refused((const void*)kdyn, 100), launch_refused((const void*)kdyn, 101), launch_refused((const void*)kdyn, 49152)); return cudaSuccess; });
+  C("launch dynamic shared memory, opted in to the most", { cudaFuncSetAttribute((const void*)kdyn, cudaFuncAttributeMaxDynamicSharedMemorySize, 101376); note("101376 refused %d, 101377 refused %d", launch_refused((const void*)kdyn, 101376), launch_refused((const void*)kdyn, 101377)); return cudaSuccess; });
+  C("launch with more threads than __launch_bounds__", { int* d; cudaMalloc(&d, 4096); void* args[1] = {&d}; cudaError_t e1 = cudaLaunchKernel((const void*)klb128, dim3(1), dim3(128), args, 0, 0); cudaError_t e2 = cudaLaunchKernel((const void*)klb128, dim3(1), dim3(129), args, 0, 0); cudaError_t e3 = cudaLaunchKernel((const void*)klb128, dim3(1), dim3(64, 2), args, 0, 0); cudaError_t e4 = cudaLaunchKernel((const void*)klb128, dim3(1), dim3(64, 3), args, 0, 0); cudaGetLastError(); note("128 refused %d, 129 refused %d, 64x2 refused %d, 64x3 refused %d", e1 != cudaSuccess, e2 != cudaSuccess, e3 != cudaSuccess, e4 != cudaSuccess); return cudaSuccess; });
+  // The occupancy calls follow the limit.
+  C("cudaOccupancyMaxActiveBlocksPerMultiprocessor, dynamic shared memory past the limit", { int n[5] = {-9, -9, -9, -9, -9}; const size_t dyn[5] = {0, 49152, 49153, 65536, 101376}; cudaError_t e = cudaSuccess; for (int i = 0; i < 5; ++i) { cudaError_t x = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n[i], (const void*)kdyn2, 128, dyn[i]); if (x != cudaSuccess) e = x; } note("blocks at 0, 49152, 49153, 65536, 101376: %d %d %d %d %d", n[0], n[1], n[2], n[3], n[4]); return e; });
+  C("cudaOccupancyMaxActiveBlocksPerMultiprocessor, opted in to 60000", { cudaFuncSetAttribute((const void*)kdyn2, cudaFuncAttributeMaxDynamicSharedMemorySize, 60000); int n[5] = {-9, -9, -9, -9, -9}; const size_t dyn[5] = {0, 49152, 49153, 65536, 101376}; cudaError_t e = cudaSuccess; for (int i = 0; i < 5; ++i) { cudaError_t x = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n[i], (const void*)kdyn2, 128, dyn[i]); if (x != cudaSuccess) e = x; } note("blocks at 0, 49152, 49153, 65536, 101376: %d %d %d %d %d", n[0], n[1], n[2], n[3], n[4]); return e; });
+  C("cudaOccupancyAvailableDynamicSMemPerBlock, opted in to 60000", { cudaFuncSetAttribute((const void*)kdyn2, cudaFuncAttributeMaxDynamicSharedMemorySize, 60000); size_t a[3] = {77, 77, 77}; cudaError_t e = cudaSuccess; const int blocks[3] = {1, 2, 4}; for (int i = 0; i < 3; ++i) { cudaError_t x = cudaOccupancyAvailableDynamicSMemPerBlock(&a[i], (const void*)kdyn2, blocks[i], 128); if (x != cudaSuccess) e = x; } note("1, 2, 4 blocks: %zu %zu %zu", a[0], a[1], a[2]); return e; });
+  C("cudaOccupancyAvailableDynamicSMemPerBlock, not opted in", { size_t a[3] = {77, 77, 77}; cudaError_t e = cudaSuccess; const int blocks[3] = {1, 2, 4}; for (int i = 0; i < 3; ++i) { cudaError_t x = cudaOccupancyAvailableDynamicSMemPerBlock(&a[i], (const void*)kdyn2, blocks[i], 128); if (x != cudaSuccess) e = x; } note("1, 2, 4 blocks: %zu %zu %zu", a[0], a[1], a[2]); return e; });
+  C("cudaOccupancyAvailableDynamicSMemPerBlock, opted in to the most", { cudaFuncSetAttribute((const void*)kdyn2, cudaFuncAttributeMaxDynamicSharedMemorySize, 101376); size_t a[3] = {77, 77, 77}; cudaError_t e = cudaSuccess; const int blocks[3] = {1, 2, 4}; for (int i = 0; i < 3; ++i) { cudaError_t x = cudaOccupancyAvailableDynamicSMemPerBlock(&a[i], (const void*)kdyn2, blocks[i], 128); if (x != cudaSuccess) e = x; } note("1, 2, 4 blocks: %zu %zu %zu", a[0], a[1], a[2]); return e; });
   // ---- NvSci, the export table
   C("cudaDeviceGetNvSciSyncAttributes", { char b[64] = {}; return cudaDeviceGetNvSciSyncAttributes(b, 0, 0); });
   C("cudaDeviceGetNvSciSyncAttributes null", { return cudaDeviceGetNvSciSyncAttributes(nullptr, 0, 0); });

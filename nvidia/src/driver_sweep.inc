@@ -59,7 +59,7 @@ VGPU_EXPORT int vgpu_driver_function_for_v1(int dev, uint64_t mid, const char* n
     uintptr_t& fh = s.runtime_functions[{mh, std::string(name)}];
     if (!fh) {
       fh = make_handle(s, kTagFunc);
-      s.functions[fh] = {dev, mh, s.rt->device(dev).get_function(mid, name), s.rt->device(dev).symbols(mid)};
+      s.functions[fh] = {dev, mh, s.rt->device(dev).get_function(mid, name), s.rt->device(dev).symbols(mid), mid};
     }
     *func_out = reinterpret_cast<void*>(fh);
     if (module_out) *module_out = reinterpret_cast<void*>(mh);
@@ -264,7 +264,7 @@ static CUresult cuModuleEnumerateFunctions_impl(CUfunction* functions, unsigned 
       uintptr_t& fh = s.runtime_functions[{mh, names[i]}];
       if (!fh || !s.functions.count(fh)) {
         fh = make_handle(s, kTagFunc);
-        s.functions[fh] = {dev, mh, s.rt->device(dev).get_function(mid, names[i]), s.rt->device(dev).symbols(mid)};
+        s.functions[fh] = {dev, mh, s.rt->device(dev).get_function(mid, names[i]), s.rt->device(dev).symbols(mid), mid};
       }
       functions[i] = reinterpret_cast<CUfunction>(fh);
     }
