@@ -28,6 +28,7 @@
 // falls back rather than receiving a plausible wrong answer.
 #include <cublasLt.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -39,6 +40,7 @@
 #include <mutex>
 #include <new>
 #include <set>
+#include <type_traits>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -1272,6 +1274,91 @@ cublasStatus_t validate(const MatmulDesc& md, const MatrixLayout& la, const Matr
 
 namespace {
 
+// ---- Operand loaders for host_gemm.hpp ----
+//
+// The product reads its operands through these, converting each element to double as a panel of it is packed
+// (host_gemm.hpp), so no double-precision copy of A or B is ever made: all that is held is the raw bytes of the
+// device matrix (Elems) and, per thread, a few panels. Each returns exactly the double that Elems::get returned
+// (times the operand's scale for A, where it has one), so the sums are those of the loops that built whole copies.
+// The arguments are the element's index in the stored matrix and its (row, k) position, which a scale needs.
+struct Bf16Loader {
+  const uint8_t* raw;
+  double operator()(int64_t idx, int64_t, int64_t) const {
+    uint16_t h;
+    std::memcpy(&h, raw + (size_t)idx * 2, 2);
+    return from_bf16(h);
+  }
+};
+// fp16 -> double by table: from_half (with its ldexp) is the reference, the table is built from it, and it is the
+// same 65536 values; a lookup is far cheaper than a library call per element, which packing makes many times.
+const double* half_table() {
+  struct Table {
+    double v[65536];
+    Table() {
+      for (uint32_t h = 0; h < 65536; ++h) v[h] = from_half((uint16_t)h);
+    }
+  };
+  static const Table t;
+  return t.v;
+}
+struct HalfLoader {
+  const uint8_t* raw;
+  const double* table;
+  double operator()(int64_t idx, int64_t, int64_t) const {
+    uint16_t h;
+    std::memcpy(&h, raw + (size_t)idx * 2, 2);
+    return table[h];
+  }
+};
+struct F32Loader {
+  const uint8_t* raw;
+  double operator()(int64_t idx, int64_t, int64_t) const {
+    float f;
+    std::memcpy(&f, raw + (size_t)idx * 4, 4);
+    return f;
+  }
+};
+struct F64Loader {
+  const uint8_t* raw;
+  double operator()(int64_t idx, int64_t, int64_t) const {
+    double d;
+    std::memcpy(&d, raw + (size_t)idx * 8, 8);
+    return d;
+  }
+};
+// Every other type (FP8, FP4, the integers), and an operand with a scale: Elems::get, then the scale.
+struct GenericLoader {
+  const Elems* e;
+  const Scales* scale;   // null: the operand's scale is 1 and not applied (as when it is exactly 1)
+  double operator()(int64_t idx, int64_t outer, int64_t k) const {
+    const double a = e->get((size_t)idx);
+    return scale ? a * scale->at((size_t)outer, (size_t)k) : a;
+  }
+};
+// A loader seen from a column offset: a strip of B's columns starts `off` elements into the stored matrix.
+template <class L>
+struct Shifted {
+  L inner;
+  int64_t off;
+  double operator()(int64_t idx, int64_t outer, int64_t k) const { return inner(idx + off, outer, k); }
+};
+
+// Whether the sums of columns [j0, j0 + w) of op(A) * op(B) can be had: calls go(loaderA, loaderB) with the loaders
+// that fit the operands' types, the plain ones when both are the same common type and A has no scale.
+template <class F>
+void with_loaders(const Elems& ea, const Scales* sa_or_null, const Elems& eb, F&& go) {
+  if (!sa_or_null && ea.t == eb.t) {
+    switch (ea.t) {
+      case CUDA_R_16BF: go(Bf16Loader{ea.raw.data()}, Bf16Loader{eb.raw.data()}); return;
+      case CUDA_R_16F: go(HalfLoader{ea.raw.data(), half_table()}, HalfLoader{eb.raw.data(), half_table()}); return;
+      case CUDA_R_32F: go(F32Loader{ea.raw.data()}, F32Loader{eb.raw.data()}); return;
+      case CUDA_R_64F: go(F64Loader{ea.raw.data()}, F64Loader{eb.raw.data()}); return;
+      default: break;
+    }
+  }
+  go(GenericLoader{&ea, sa_or_null}, GenericLoader{&eb, nullptr});
+}
+
 // The matrix product itself, on the host (see cublasLtMatmul).
 cublasStatus_t matmul_run(const MatmulDesc& md, const MatrixLayout& la, const MatrixLayout& lb, const MatrixLayout& lc,
                           const MatrixLayout& ld, const void* alpha, const void* A, const void* B, const void* beta,
@@ -1340,6 +1427,7 @@ cublasStatus_t matmul_run(const MatmulDesc& md, const MatrixLayout& la, const Ma
   double aux_amax = 0.0;
   double aux_scale = 1.0;
   if (md.aux_scale && narrow(auxt)) aux_scale = read_as_double(md.aux_scale, 1, CUDA_R_32F)[0];
+  std::vector<double> strip;   // the sums of a strip of columns (see below)
   for (int bi = 0; bi < batch; ++bi) {
     auto base = [&](const void* p, const MatrixLayout& l) { return static_cast<const uint8_t*>(p) + batch_offset_bytes(l, bi); };
     // A's, B's and C's scales and D's, for this batch (an unset scale is 1).
@@ -1379,32 +1467,48 @@ cublasStatus_t matmul_run(const MatmulDesc& md, const MatrixLayout& la, const Ma
     std::vector<double> bgrad((size_t)(ep.bgradb ? n : m), 0.0);
 
     // Every output is the chain  acc = acc + (((a*sa) * b) * sb)  over p in order, in double. When B's scale is 1 the
-    // last factor is exact, so the chain is acc + (a' * b) with a' = a*sa taken once per element of A: the same
-    // chain host_gemm.hpp runs for many outputs at once, without changing a bit of it. (A scale on B that is not 1
-    // keeps the loop below: its rounding cannot be moved out of the chain.)
-    std::vector<double> sums;
+    // last factor is exact, so the chain is acc + (a' * b) with a' = a*sa: the same chain host_gemm.hpp runs for many
+    // outputs at once, without changing a bit of it. (A scale on B that is not 1 keeps the loop below: its rounding
+    // cannot be moved out of the chain.)
+    //
+    // host_gemm.hpp converts the operands to double as it packs a panel at a time (see the loaders above), so nothing
+    // the size of A or B is made; its sums come a strip of columns at a time, into `strip`, and the epilogue below
+    // takes each column from it in order, as it took them from the whole product: the strip's size does not depend on
+    // n or k, so what is held beside the device matrices' own bytes is a few MiB at any size.
     const bool unit_sb = (sb.mode == kScaleScalar || sb.mode == kScalePerBatch) && (sb.values.empty() || sb.values[0] == 1.0);
     const bool unit_sa = (sa.mode == kScaleScalar || sa.mode == kScalePerBatch) && (sa.values.empty() || sa.values[0] == 1.0);
-    if (unit_sb && m > 0 && n > 0 && k > 0) {
-      std::vector<double> ap((size_t)m * (size_t)k), bp((size_t)k * (size_t)n);
-      for (int64_t p = 0; p < k; ++p)
-        for (int64_t i = 0; i < m; ++i) {
-          const double a = ea.get(ta ? at(la, p, i) : at(la, i, p));
-          ap[(size_t)(i + p * m)] = unit_sa ? a : a * sa.at((size_t)i, (size_t)p);
-        }
-      for (int64_t j = 0; j < n; ++j)
-        for (int64_t p = 0; p < k; ++p) bp[(size_t)(p + j * k)] = eb.get(tb ? at(lb, j, p) : at(lb, p, j));
-      sums.resize((size_t)m * (size_t)n);
-      double* const out = sums.data();
-      vgpu::hostgemm::gemm<double, double>(false, false, m, n, k, ap.data(), m, bp.data(), k,
-                                           [=](int64_t i, int64_t j, double acc) { out[(size_t)(i + j * m)] = acc; });
+    const bool fast = unit_sb && m > 0 && n > 0 && k > 0;
+    // A stored matrix's element (r, c) is at r + c*ld, or at r*ld + c in a row-major layout, which reads as the
+    // transposed operand of the column-major form host_gemm.hpp takes.
+    const bool gta = ta != (la.order == CUBLASLT_ORDER_ROW), gtb = tb != (lb.order == CUBLASLT_ORDER_ROW);
+    // Fills strip with the sums of columns [j0, j0 + w) of op(A) * op(B), column-major with leading dimension m.
+    auto strip_sums = [&](int64_t j0, int64_t w) {
+      double* const out = strip.data();
+      const int64_t boff = gtb ? j0 : j0 * (int64_t)lb.ld;
+      with_loaders(ea, unit_sa ? nullptr : &sa, eb, [&](const auto& LA, const auto& LB) {
+        vgpu::hostgemm::gemm_with<double>(gta, gtb, m, w, k, LA, (int64_t)la.ld, Shifted<std::decay_t<decltype(LB)>>{LB, boff},
+                                          (int64_t)lb.ld, [=](int64_t i, int64_t j, double acc) { out[(size_t)(i + j * m)] = acc; });
+      });
+    };
+    int64_t strip_width = 0, strip_j0 = 0, strip_end = 0;
+    if (fast) {
+      constexpr int64_t kStripBytes = int64_t(8) << 20;
+      strip_width = std::max<int64_t>(1, kStripBytes / (int64_t)(sizeof(double) * (size_t)m));
+      strip_width = strip_width >= 128 ? strip_width - strip_width % 128 : strip_width >= 32 ? strip_width - strip_width % 32 : 32;
+      strip_width = std::min<int64_t>(strip_width, n);
+      if (strip.size() < (size_t)m * (size_t)strip_width) strip.resize((size_t)m * (size_t)strip_width);
     }
     std::vector<double> col((size_t)m);
     for (int64_t j = 0; j < n; ++j) {
+      if (fast && j >= strip_end) {   // the next strip of columns
+        strip_j0 = j;
+        strip_end = std::min<int64_t>(n, j + strip_width);
+        strip_sums(j, strip_end - j);
+      }
       for (int64_t i = 0; i < m; ++i) {
         double acc = 0.0;
-        if (!sums.empty()) {
-          acc = sums[(size_t)(i + j * m)];
+        if (fast) {
+          acc = strip[(size_t)(i + (j - strip_j0) * m)];
         } else {
           for (int64_t p = 0; p < k; ++p)
             acc += ea.get(ta ? at(la, p, i) : at(la, i, p)) * sa.at((size_t)i, (size_t)p) *

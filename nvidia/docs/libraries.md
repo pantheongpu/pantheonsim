@@ -680,6 +680,14 @@ does not depend on the thread count. The one thing that is not fixed is the sign
 NaNs meeting in one operation (an input NaN and the default NaN of an inf*0): the hardware returns the first operand's, and
 which operand the compiler makes first differs between two copies of the same source line, so it never was fixed.
 
+The host products also hold no matrix-sized temporaries beyond the bytes the device matrices themselves are read as. An
+operand is converted to the accumulator type (bf16, fp16, fp8 or a scaled value to double or float) a panel at a time,
+as `host_gemm.hpp` packs it, through a *loader* (`gemm_with`), and cuBLASLt's sums come a strip of columns at a time
+(about 8 MiB) into the epilogue, so a 8192-cubed bf16 matmul that once held 1.9 GiB beside its operands holds 0.4 GiB
+(the raw bytes of A, B and D, 128 MiB each) plus a few MiB. The chain of each output is the same, so no bit moves;
+`tests/unit/test_cublaslt_matmul.cpp` and `test_cublas_gemmex_mixed.cpp` check the bits against the plain loops and
+count the heap a 2048-cubed call holds at its peak.
+
 ## Verified against real hardware
 
 `nvidia/tests/conformance/run_conformance.sh` compiles each test once, runs it against

@@ -1963,6 +1963,21 @@ if(TARGET vgpucublaslt)
   target_include_directories(test_cublaslt_algo PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_cublaslt_algo COMMAND test_cublaslt_algo)
   set_tests_properties(test_cublaslt_algo PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1")
+  # cublasLtMatmul's host product against the plain loops, bit for bit (bf16, fp16, fp32, FP8, scales, layouts), and the
+  # heap it holds at its peak. An H100 profile: the FP8 cases need a device that has FP8.
+  add_executable(test_cublaslt_matmul nvidia/tests/unit/test_cublaslt_matmul.cpp)
+  target_link_libraries(test_cublaslt_matmul PRIVATE vgpucublaslt vgpucudart)
+  target_include_directories(test_cublaslt_matmul PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cublaslt_matmul COMMAND test_cublaslt_matmul)
+  set_tests_properties(test_cublaslt_matmul PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1;VGPU_THREADS=2" TIMEOUT 600)
+endif()
+# cublasGemmEx with half, bfloat16 and int8 operands, likewise.
+if(TARGET vgpucublas)
+  add_executable(test_cublas_gemmex_mixed nvidia/tests/unit/test_cublas_gemmex_mixed.cpp)
+  target_link_libraries(test_cublas_gemmex_mixed PRIVATE vgpucublas vgpucudart)
+  target_include_directories(test_cublas_gemmex_mixed PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cublas_gemmex_mixed COMMAND test_cublas_gemmex_mixed)
+  set_tests_properties(test_cublas_gemmex_mixed PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;VGPU_THREADS=2" TIMEOUT 600)
 endif()
 
 # A cuBLAS call captured into a CUDA graph. The library computes on the host,
