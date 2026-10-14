@@ -420,6 +420,10 @@ struct Warp {
   // Armed until the warp reaches its first store to global memory, where its turn ends once
   // (see run_warp_until_yield).
   bool store_gate = true;
+  // Where the turn the gate cut short began, so that the rest of it counts toward kLongTurn as if it had
+  // not been cut: the warp then runs the same instructions in the same order whatever the gate does.
+  bool resumed_turn = false;
+  uint64_t resumed_turn_start = 0;
   // Set by an instruction that must run again rather than advance: a
   // tcgen05.alloc that found too few columns free waits by retrying, giving
   // up its turn each time so the warp that will free them can run.
@@ -2901,7 +2905,8 @@ class Interpreter {
     cur_ = w.fn ? w.fn : &fn_;
     local_base_ = w.local_base;
     uint64_t issued = 0;
-    turn_start_ = w.steps;
+    turn_start_ = w.resumed_turn ? w.resumed_turn_start : w.steps;
+    w.resumed_turn = false;
     for (Path& p : w.paths)
       if (p.parked == Path::kThisTurn) p.parked = Path::kRunnable;
     while (w.state == Warp::State::Ready) {
@@ -2926,11 +2931,17 @@ class Interpreter {
       // load, add and store the same word, and is right only because of that. Run to the end one warp at
       // a time, warp k would load what warps 0..k-1 stored and add one more each. Any order is legal for
       // code with no synchronization; this is the one the hardware gives. (The SASS executor does the same.)
-      if (w.store_gate) {
+      // Only a converged warp: a diverged one keeps the gate armed for a later store, so that the order its
+      // paths run in (and the counters that depend on it) is the one it always had.
+      if (w.store_gate && w.paths.size() == 1) {
         if (const auto* st = std::get_if<OpSt>(&cur_->body[w.paths[idx].pc].op);
             st && (st->space == Space::Global || st->space == Space::Generic)) {
           w.store_gate = false;
-          if (ctx.warps && ctx.warps->size() > 1) return;
+          if (ctx.warps && ctx.warps->size() > 1) {
+            w.resumed_turn = true;
+            w.resumed_turn_start = turn_start_;
+            return;
+          }
         }
       }
       // The pre-decoded forms of the function's instructions, when it has them
