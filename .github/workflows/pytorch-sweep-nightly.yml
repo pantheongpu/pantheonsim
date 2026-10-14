@@ -57,7 +57,12 @@ jobs:
         env:
           SCRIPT: ${{ inputs.script }}
         run: |
-          py=$(ls -d "$HOME"/.local/share/torch-cu13*/bin/python | head -1)
+          py=""
+          for c in "${VGPU_TORCH_CUDA_PYTHON:-}" $(ls -d "$HOME"/.local/share/torch-cu13*/bin/python 2>/dev/null) python3 python; do
+            [ -n "$c" ] && "$c" -c 'import torch, sys; sys.exit(0 if (torch.version.cuda or "").startswith("13") else 1)' 2>/dev/null && { py=$c; break; }
+          done
+          echo "python: $py"; env | grep -i -E 'torch|vgpu' | sed 's/=.*token.*//' || true
+          [ -n "$py" ] || { echo "no python with torch for CUDA 13"; exit 1; }
           cd "$(mktemp -d)"
           TORCH_LOGS=output_code TRITON_CACHE_DIR="$PWD/triton" TORCHINDUCTOR_CACHE_DIR="$PWD/inductor" \
             timeout 3000 "$GITHUB_WORKSPACE/build/vgpu" run --gpu nvidia/rtx5090 --count 1 --preload "$py" "$GITHUB_WORKSPACE/$SCRIPT" > out.log 2>&1 || echo "exit $?"
