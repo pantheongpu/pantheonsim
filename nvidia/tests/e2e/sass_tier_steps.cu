@@ -36,11 +36,13 @@ typedef uint64_t u64;
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_) { std::printf("error %s at line %d\n", cudaGetErrorString(e_), __LINE__); return 1; } } while (0)
 
-// n dependent additions the compiler cannot fold (each asm is volatile), SASS: n IADD3s in a straight run.
-#define ADD1(v) asm volatile("add.u32 %0, %0, 1;" : "+r"(v));
+// n steps of a xorshift generator the compilers cannot fold (an asm of constant additions was folded by ptxas into one): each step is
+// three dependent shifts and xors, SASS a few straight instructions. USE keeps the result alive without touching any value.
+#define ADD1(v) asm volatile("{ .reg .b32 t; shl.b32 t, %0, 13; xor.b32 %0, %0, t; shr.b32 t, %0, 17; xor.b32 %0, %0, t; shl.b32 t, %0, 5; xor.b32 %0, %0, t; }" : "+r"(v));
 #define ADD8(v) ADD1(v) ADD1(v) ADD1(v) ADD1(v) ADD1(v) ADD1(v) ADD1(v) ADD1(v)
 #define ADD64(v) ADD8(v) ADD8(v) ADD8(v) ADD8(v) ADD8(v) ADD8(v) ADD8(v) ADD8(v)
 #define ADD256(v) ADD64(v) ADD64(v) ADD64(v) ADD64(v)
+#define USE(v) asm volatile("" ::"r"(v));
 
 // ---- 1. the store gate -------------------------------------------------------------------------------------------
 // Each warp's first lane loads the word, adds one and stores it. With the gate every warp loads before any stores: all end
@@ -58,8 +60,9 @@ __global__ void gate_long(u32* word, u32* seen) {
     const u32 v = *word;
     u32 pad = threadIdx.x;
     ADD256(pad) ADD64(pad) ADD8(pad)
-    seen[threadIdx.x >> 5] = v + (pad & 0x80000000u);
-    *word = v + 1 + (pad >> 31);
+    USE(pad)
+    seen[threadIdx.x >> 5] = v;
+    *word = v + 1;
   }
 }
 // A generic store (ST): the pointer is global at run time but the compiler cannot know.
@@ -81,7 +84,8 @@ __global__ void gate_diverged(u32* word, u32* seen) {
     if (lane == 0) {
       u32 pad = v;
       ADD64(pad)
-      *word = v + 1 + (pad >> 31);
+      USE(pad)
+      *word = v + 1;
     } else {
       *word = v + 2;
     }
@@ -99,7 +103,7 @@ __device__ __forceinline__ u32 spin_body(volatile u32* flag, u32 acc) {
   if (Kind == 4) __threadfence();                                                   // MEMBAR
   if (Kind == 5) { if (acc & 2) acc += 3; else acc ^= 5; }                          // a branch lanes may split on
   if (Kind == 6) { ADD256(acc) ADD256(acc) ADD64(acc) ADD8(acc) }                   // a body longer than two chunks
-  return acc + 1;
+  return (acc ^ (acc << 7)) + 1;
 }
 template <int Kind>
 __global__ void spin(u32* flag, u32* out) {
@@ -115,9 +119,10 @@ __global__ void spin(u32* flag, u32* out) {
     out[lane] = acc;
     out[32 + lane] = n;
   } else if (warp == 1 && lane == 0) {
-    u32 pad = 0;
+    u32 pad = 1;
     ADD64(pad) ADD64(pad)
-    *vf = 1 + (pad >> 31);
+    USE(pad)
+    *vf = 1;
   }
 }
 
@@ -186,10 +191,10 @@ __global__ void reconverge(const u32* in, u32* out, int n) {
   } else if (v & 4) {
     for (int k = 0; k < (int)(v & 7); ++k) v += sh[(threadIdx.x + k) & 255];
   }
-  __syncthreads();
+  const u32 cnt = (u32)__syncthreads_count(v & 1);   // BAR.RED.POPC and its result
   sh[threadIdx.x & 255] = v;
-  __syncthreads();
-  if (i < n) out[i] = v + sh[(threadIdx.x + 17) & 255] + (u32)__popc(__activemask());
+  const int all = __syncthreads_and(v != 7), any = __syncthreads_or(v == 3);
+  if (i < n) out[i] = v + sh[(threadIdx.x + 17) & 255] + (u32)__popc(__activemask()) + cnt * 3u + (u32)all + (u32)any * 5u;
 }
 
 // ---- shuffles and votes in every mode, with constant and with data-dependent lanes and widths, under partial masks -------------
@@ -291,13 +296,15 @@ __global__ void f_gather(const u32* in, u32* out, long far) {
   const int t = threadIdx.x;
   u32 pad = t;
   ADD256(pad) ADD64(pad)
-  out[t] = in[(t == 5) ? far : t] + (pad >> 31);
+  USE(pad)
+  out[t] = in[(t == 5) ? far : t];
 }
 __global__ void f_scatter(u32* out, long far) {
   const int t = threadIdx.x;
   u32 pad = t;
   ADD256(pad) ADD8(pad)
-  out[(t == 9) ? far : t] = t + (pad >> 31);
+  USE(pad)
+  out[(t == 9) ? far : t] = t;
 }
 __global__ void f_local(u32* out, int far) {
   u32 arr[256];
@@ -306,7 +313,8 @@ __global__ void f_local(u32* out, int far) {
   volatile int idx = (t == 7) ? far : t;
   u32 pad = t;
   ADD64(pad)
-  out[t] = arr[idx] + (pad >> 31);
+  USE(pad)
+  out[t] = arr[idx];
 }
 __global__ void f_shared(u32* out, int far) {
   __shared__ u32 s[64];
@@ -316,7 +324,8 @@ __global__ void f_shared(u32* out, int far) {
   volatile int idx = (t == 11) ? far : t;
   u32 pad = t;
   ADD64(pad) ADD8(pad)
-  out[t] = s[idx] + (pad >> 31);
+  USE(pad)
+  out[t] = s[idx];
 }
 __global__ void f_atomic(u32* out, long far) {
   const int t = threadIdx.x;
@@ -648,20 +657,20 @@ int main(int argc, char** argv) {
   {
     int rc = 0;
     long lo = 1, hi = 100000;   // lo fails, hi passes
-    std::string ok = child(argv[0], "steps", "env VGPU_MAX_STEPS=100000", &rc);
+    std::string ok = child(argv[0], "steps", "env VGPU_TIER_STATS=0 VGPU_MAX_STEPS=100000", &rc);
     if (rc != 0) {
       std::printf("steps: even a limit of %ld fails: %s", hi, ok.c_str());
       return 1;
     }
     while (hi - lo > 1) {
       const long mid = (lo + hi) / 2;
-      std::string r = child(argv[0], "steps", "env VGPU_MAX_STEPS=" + std::to_string(mid), &rc);
+      std::string r = child(argv[0], "steps", "env VGPU_TIER_STATS=0 VGPU_MAX_STEPS=" + std::to_string(mid), &rc);
       if (rc == 0) hi = mid; else lo = mid;
     }
     std::printf("steps: the kernel finishes under VGPU_MAX_STEPS=%ld\n", hi);
-    std::string below = child(argv[0], "steps", "env VGPU_MAX_STEPS=" + std::to_string(hi - 1), &rc);
+    std::string below = child(argv[0], "steps", "env VGPU_TIER_STATS=0 VGPU_MAX_STEPS=" + std::to_string(hi - 1), &rc);
     std::printf("steps: one below: rc=%d %s", rc != 0, below.c_str());
-    std::printf("steps: at the limit: %s", child(argv[0], "steps", "env VGPU_MAX_STEPS=" + std::to_string(hi), &rc).c_str());
+    std::printf("steps: at the limit: %s", child(argv[0], "steps", "env VGPU_TIER_STATS=0 VGPU_MAX_STEPS=" + std::to_string(hi), &rc).c_str());
   }
   std::printf("done\n");
   return 0;
