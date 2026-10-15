@@ -109,7 +109,7 @@ bool src32(Builder& b, const Operand& o, Dom d, Src& out, uint16_t& maxreg) {
     case Kind::Imm: out = b.constant(apply(d, mod, static_cast<uint32_t>(o.imm))); return true;
     case Kind::FImm: out = b.constant(apply(d, mod, o.fbits)); return true;
     case Kind::CBank: {
-      if (o.reg != 0) return false;
+      if (o.reg > 255) return false;
       const uint64_t off = static_cast<uint64_t>(o.imm);
       if (off > 0xffffffffull - 4) {   // cbank32 reads zero past the bank
         out = b.constant(apply(d, mod, 0));
@@ -117,7 +117,8 @@ bool src32(Builder& b, const Operand& o, Dom d, Src& out, uint16_t& maxreg) {
       }
       out = Src{};
       out.kind = SrcKind::Dyn;
-      out.dyn = Dyn::Bank0;
+      out.dyn = o.reg == 0 ? Dyn::Bank0 : Dyn::BankN;
+      out.pad = static_cast<uint8_t>(o.reg);
       out.mod = mod;
       out.off = static_cast<uint32_t>(off);
       return true;
@@ -200,12 +201,13 @@ bool src64(Builder& b, const Operand& o, unsigned i, Src& out, uint32_t& mods, u
     return true;
   }
   // CBank
-  if (o.reg != 0) return false;
+  if (o.reg > 255) return false;
   const uint64_t off = static_cast<uint64_t>(o.imm);
   if (off > 0xffffffffull - 16) { out = fold(0); return true; }
   out = Src{};
   out.kind = SrcKind::Dyn;
-  out.dyn = Dyn::Bank0;
+  out.dyn = o.reg == 0 ? Dyn::Bank0 : Dyn::BankN;
+  out.pad = static_cast<uint8_t>(o.reg);
   out.mod = m;
   out.off = static_cast<uint32_t>(off);
   return true;
@@ -239,12 +241,13 @@ bool src64i(Builder& b, const Operand& o, uint8_t mod, Src& out, uint16_t& maxre
       out.off = o.reg;
       return true;
     case Kind::CBank: {
-      if (o.reg != 0) return false;
+      if (o.reg > 255) return false;
       const uint64_t off = static_cast<uint64_t>(o.imm);
       if (off > 0xffffffffull - 16) { out = fold(0); return true; }
       out = Src{};
       out.kind = SrcKind::Dyn;
-      out.dyn = Dyn::Bank0;
+      out.dyn = o.reg == 0 ? Dyn::Bank0 : Dyn::BankN;
+      out.pad = static_cast<uint8_t>(o.reg);
       out.mod = mod;
       out.off = static_cast<uint32_t>(off);
       return true;

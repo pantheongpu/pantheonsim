@@ -58,6 +58,11 @@ template <bool Flt>
       for (unsigned l = 0; l < 32; ++l) tmp[l] = v;
       return tmp;
     }
+    case tier::Dyn::BankN: {
+      const uint32_t v = tier_mod(Flt, s.mod, c.r->tier_cbank32(s.pad, s.off));
+      for (unsigned l = 0; l < 32; ++l) tmp[l] = v;
+      return tmp;
+    }
   }
   return tmp;
 }
@@ -76,6 +81,8 @@ inline const uint32_t* tier_src(const TCtx& c, const tier::Src& s, uint32_t* tmp
 [[gnu::noinline]] void tier_dyn64(const TCtx& c, const tier::Src& s, uint32_t* lo, uint32_t* hi, bool fold_float) {
   uint64_t bits;
   if (s.dyn == tier::Dyn::Bank0) bits = tier_b0(c, s.off) | (static_cast<uint64_t>(tier_b0(c, uint64_t{s.off} + 4)) << 32);
+  else if (s.dyn == tier::Dyn::BankN)
+    bits = c.r->tier_cbank32(s.pad, s.off) | (static_cast<uint64_t>(c.r->tier_cbank32(s.pad, uint64_t{s.off} + 4)) << 32);
   else bits = c.w->ur[s.off] | (static_cast<uint64_t>(c.w->ur[s.off + 1]) << 32);
   if (fold_float) {
     if (s.mod & tier::kAbs) bits &= 0x7fffffffffffffffull;
@@ -668,6 +675,7 @@ inline uint32_t tier_sc(const TCtx& c, const tier::Src& s, unsigned l) {   // a 
   switch (s.dyn) {
     case tier::Dyn::Reg: return c.R[s.off * 32u + l];
     case tier::Dyn::Bank0: return tier_b0(c, s.off);
+    case tier::Dyn::BankN: return c.r->tier_cbank32(s.pad, s.off);
     default: return c.w->ur[s.off];
   }
 }

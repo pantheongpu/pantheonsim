@@ -44,6 +44,7 @@ enum class SrcKind : uint8_t {
 enum class Dyn : uint8_t {
   Reg,     // a register with a modifier: off = register
   Bank0,   // a word of constant bank 0 (kernel parameters, launch shape): off = byte offset
+  BankN,   // a word of another constant bank (the module's __constant__ data lives in memory): pad = the bank, off = byte offset
   UReg,    // a uniform register: off = its number
 };
 // The modifiers a Dyn source carries, applied to its value as the form's domain says (apply()).
@@ -53,7 +54,7 @@ struct Src {
   SrcKind kind = SrcKind::Pool;
   Dyn dyn = Dyn::Reg;
   uint8_t mod = 0;
-  uint8_t pad = 0;
+  uint8_t pad = 0;     // the constant bank of a Dyn::BankN source
   uint32_t off = 0;
 };
 

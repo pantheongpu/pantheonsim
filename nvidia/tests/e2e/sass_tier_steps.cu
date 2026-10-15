@@ -221,6 +221,34 @@ __global__ void shuffles(const u32* in, u32* out, int n, int shape) {
   for (int k = 0; k < 32; ++k) out[(size_t)i * 32 + k] = o[k];
 }
 
+// ---- constant memory used as an operand: __constant__ data of the module (a bank other than 0) in every kind of instruction --------
+__constant__ float kfl[16];
+__constant__ double kdb[8];
+__constant__ u32 kin[32];
+__constant__ u64 kq[8];
+__global__ void cbanks(const u32* in, u32* out, int n, u32 sel) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const u32 v = in[i];
+  const float x = __uint_as_float(v & 0x3fffffffu);
+  const double y = (double)(v >> 3);
+  u32 o[12];
+  o[0] = (u32)__float_as_uint(x * kfl[3] + kfl[5]);
+  o[1] = (u32)__float_as_uint(fmaxf(x, kfl[7]) - kfl[0]);
+  o[2] = v + kin[7] + (v ^ kin[11]) + (v & kin[2]);
+  o[3] = (v < kin[9]) ? kin[1] : kin[14];
+  const u64 q = y * kdb[2] > kdb[1] ? 1 : 0;
+  o[4] = (u32)__double_as_longlong(y * kdb[2] + kdb[1]) ^ (u32)q;
+  o[5] = (u32)((u64)v * kq[3] >> 17);
+  o[6] = (u32)(((u64)v + kq[5]) >> 32);
+  o[7] = kin[v & 31] + kin[(v >> 5) & 31];
+  o[8] = (u32)(kin[sel & 31] * v);
+  o[9] = (u32)__float_as_uint(kfl[sel & 15] * x);
+  o[10] = (u32)(const_cast<u32*>(&kin[0]) == nullptr) + __popc(kin[3]) + __clz(kin[5] | 1u);
+  o[11] = (u32)(((long long)(int)v * (long long)kin[6]) >> 3);
+  for (int k = 0; k < 12; ++k) out[(size_t)i * 12 + k] = o[k];
+}
+
 // ---- the uniform datapath: values every lane of a warp has in common (kernel arguments, blockIdx) and loops on them -----------
 __global__ void uniforms(u32* out, u32 a, u32 b, u32 c, u32 n, u64 w64, int sgn) {
   const unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -558,6 +586,30 @@ int main(int argc, char** argv) {
         std::snprintf(nm, sizeof nm, "shuffles shape=%d threads=%d", shape, threads);
         if (report(nm, dout, (size_t)n * 32)) return 1;
       }
+    CK(cudaFree(din)); CK(cudaFree(dout));
+  }
+  {
+    const int n = 700;
+    std::vector<u32> h(n);
+    for (int i = 0; i < n; ++i) h[i] = (u32)(i * 2246822519u + 3266489917u) ^ (u32)(i << 5);
+    float fl[16]; double db[8]; u32 ki[32]; u64 qq[8];
+    for (int i = 0; i < 16; ++i) fl[i] = 0.5f * (float)(i + 1) - 3.25f * (float)(i & 3);
+    for (int i = 0; i < 8; ++i) db[i] = 1.25 * (double)(i + 1) + 0.0009765625 * i, qq[i] = 0x9e3779b97f4a7c15ull * (u64)(i + 1);
+    for (int i = 0; i < 32; ++i) ki[i] = (u32)(i * 2654435761u + 77u);
+    CK(cudaMemcpyToSymbol(kfl, fl, sizeof fl));
+    CK(cudaMemcpyToSymbol(kdb, db, sizeof db));
+    CK(cudaMemcpyToSymbol(kin, ki, sizeof ki));
+    CK(cudaMemcpyToSymbol(kq, qq, sizeof qq));
+    u32 *din, *dout;
+    CK(cudaMalloc(&din, n * 4));
+    CK(cudaMalloc(&dout, (size_t)n * 12 * 4));
+    CK(cudaMemcpy(din, h.data(), n * 4, cudaMemcpyHostToDevice));
+    for (int threads : {128, 50}) {
+      cbanks<<<(n + threads - 1) / threads, threads>>>(din, dout, n, 0x5a5a1234u);
+      char nm[64];
+      std::snprintf(nm, sizeof nm, "cbanks threads=%d", threads);
+      if (report(nm, dout, (size_t)n * 12)) return 1;
+    }
     CK(cudaFree(din)); CK(cudaFree(dout));
   }
   {
