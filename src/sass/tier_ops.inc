@@ -874,6 +874,20 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
   const tier::MOp* cur = &ops[idx];
   try {
     for (unsigned n = 0;; ++n) {
+      // step_warp's store gate: a warp's first store to global memory ends its turn, once, so that the block's other warps
+      // issue the loads their prologues make before it lands (the comment there says why). The tier must stop where
+      // the interpreter does, or a block's warps see each other's stores in another order.
+      if (w.store_gate && (ops[idx].ins->op == Op::STG || ops[idx].ins->op == Op::ST)) {
+        w.store_gate = false;
+        if (blk.warps.size() > 1) {
+          if (idx != first) {
+            const uint64_t pc = code.base + 16 * static_cast<uint64_t>(idx);
+            for (Mask m = group; m; m &= m - 1) w.pc[std::countr_zero(m)] = pc;
+          }
+          w.yield = true;
+          return true;
+        }
+      }
       if (++w.steps > cfg_.max_steps)
         throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(cfg_.max_steps) +
                                       " instructions (an infinite loop?)");

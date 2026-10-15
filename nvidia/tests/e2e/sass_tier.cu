@@ -226,6 +226,17 @@ __global__ void k_generic(u32* g, u32* cnt, const u32* A, int n) {
   g[blockIdx.x * blockDim.x + t] ^= __shfl_xor_sync(0xffffffffu, v, 3) + __popc(__ballot_sync(0xffffffffu, v & 4));
 }
 
+// The store gate (Runner::step_warp): a warp's first store to global memory ends its turn, once, so every warp of the block
+// loads the word before any warp stores. Four warps each doing `*w += 1` end with 1, not 4, as on a card. The tier must
+// stop at the store as the interpreter does.
+__global__ void k_gate(u32* word, u32* seen) {
+  if ((threadIdx.x & 31) == 0) {
+    u32 v = *word;
+    seen[threadIdx.x >> 5] = v;
+    *word = v + 1;
+  }
+}
+
 // ---- driver -------------------------------------------------------------------------------------
 static u64 rng = 88172645463325252ull;
 static u64 next_rand() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; }
@@ -473,6 +484,21 @@ int main() {
     k_generic<<<4, 256>>>(g, cnt, da, n);
     if (report("generic", g, 1024) || report("generic atomics", cnt, 64)) return 1;
     CK(cudaFree(g)); CK(cudaFree(cnt));
+  }
+  {
+    u32 *word, *seen;
+    CK(cudaMalloc(&word, 4));
+    CK(cudaMalloc(&seen, 16 * 4));
+    CK(cudaMemset(word, 0, 4));
+    CK(cudaMemset(seen, 0xff, 16 * 4));
+    k_gate<<<1, 128>>>(word, seen);
+    if (report("store gate word", word, 1) || report("store gate seen", seen, 4)) return 1;
+    u32 w = 0, s[4];
+    CK(cudaMemcpy(&w, word, 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(s, seen, 16, cudaMemcpyDeviceToHost));
+    std::printf("store gate: word=%u seen=%u,%u,%u,%u %s\n", w, s[0], s[1], s[2], s[3],
+                w == 1 && !s[0] && !s[1] && !s[2] && !s[3] ? "ok" : "WRONG");
+    CK(cudaFree(word)); CK(cudaFree(seen));
   }
   CK(cudaFree(da)); CK(cudaFree(db)); CK(cudaFree(dc));
   std::printf("done\n");

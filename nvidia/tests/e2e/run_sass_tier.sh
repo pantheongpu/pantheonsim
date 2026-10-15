@@ -89,6 +89,9 @@ check() {
   [[ $ra == 0 ]] || why="${why:+$why; }the run failed (exit $ra)"
   [[ "$a" == "$bq" ]] || why="${why:+$why; }the interpreter and the tier print differently"
   if [[ $p == sass_tier ]]; then
+    # The store gate (step_warp) is what this line checks, in both runs: four warps loading and storing one word end with 1.
+    grep -q '^store gate: .* ok$' <<< "$a" || why="${why:+$why; }the interpreter's store gate line is not ok"
+    grep -q '^store gate: .* ok$' <<< "$bq" || why="${why:+$why; }the tier's store gate line is not ok"
     # The tier is shared by the host threads of a launch: four of them must give what one thread of the interpreter does.
     local c4
     c4="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_THREADS=4 timeout 900 "$bin" 2>&1 | grep -v '^tier')"
