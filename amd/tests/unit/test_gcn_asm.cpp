@@ -1278,6 +1278,246 @@ VTEST(rdna_images_load_store_sample_gather_and_query_what_their_resources_descri
   VCHECK_EQ(bad, 0);
 }
 
+// gfx90a's (MI200) image instructions (asm_images90a.s) on resources written
+// here in the layout of the MI200 guide's Table 41: each result against the
+// texel arithmetic done on the host, from the guide's rules (DMASK, DA, a
+// store that zeroes the channels it leaves out).
+VTEST(gfx90a_images_load_store_sample_and_query_what_their_resources_describe) {
+  namespace im = amd::image;
+  const amd::CodeObject o = object("asm_images90a", "gfx90a");
+  constexpr im::Gen G = im::Gen::Gfx9;
+  MemoryManager mem(16ull << 20);
+  const auto t0 = [](int64_t x, int64_t y) {
+    x = std::clamp<int64_t>(x, 0, 7), y = std::clamp<int64_t>(y, 0, 3);
+    return static_cast<float>(x + 10 * y) + 0.25f;
+  };
+  std::vector<float> f0(32);
+  for (uint32_t i = 0; i < 32; ++i) f0[i] = t0(i % 8, i / 8);
+  std::vector<uint8_t> rgba(4 * 8);
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint8_t b[4] = {static_cast<uint8_t>((i % 4) * 40), static_cast<uint8_t>((i / 4) * 100), 7, 255};
+    std::memcpy(&rgba[4 * i], b, 4);
+  }
+  // T3: level 0 is 4x4 ones, level 1 is 2x2 of 100 + i. T4 and T5: 4x4x2.
+  std::vector<float> mips(16 + 4);
+  for (uint32_t i = 0; i < 20; ++i) mips[i] = i < 16 ? 1.0f : 100.0f + static_cast<float>(i - 16);
+  std::vector<float> a4(32), a5(32);
+  for (uint32_t i = 0; i < 32; ++i) {
+    const float x = static_cast<float>(i % 4), y = static_cast<float>(i / 4 % 4), z = static_cast<float>(i / 16);
+    a4[i] = x + 10 * y + 100 * z + 0.25f;
+    a5[i] = x + 10 * y + 100 * z + 0.5f;
+  }
+  const uint64_t d0 = mem.alloc(32 * 4), d1 = mem.alloc(rgba.size()), d2 = mem.alloc(32 * 4),
+                 d3 = mem.alloc(mips.size() * 4), d4 = mem.alloc(32 * 4), d5 = mem.alloc(32 * 4), d6 = mem.alloc(32 * 4),
+                 d7 = mem.alloc(32 * 8);
+  std::vector<uint64_t> wide(32);
+  for (uint32_t i = 0; i < 32; ++i) wide[i] = (uint64_t{7} + i) << 32 | static_cast<uint32_t>(0xfffffff0u + i);
+  mem.write(d7, wide.data(), 32 * 8);
+  mem.write(d0, f0.data(), 32 * 4);
+  mem.write(d1, rgba.data(), rgba.size());
+  const std::vector<uint32_t> zero(32, 0), ones(32, 0xFFFFFFFFu);
+  mem.write(d2, zero.data(), 32 * 4);
+  mem.write(d3, mips.data(), mips.size() * 4);
+  mem.write(d4, a4.data(), 32 * 4);
+  mem.write(d5, a5.data(), 32 * 4);
+  mem.write(d6, ones.data(), 32 * 4);
+
+  uint32_t desc[72] = {};
+  im::Image i0;
+  i0.base = d0, i0.width = 8, i0.height = 4, i0.format = {im::Data::D32, im::Num::Float};
+  im::encode(i0, G, &desc[0]);
+  im::Image i1;
+  i1.base = d1, i1.width = 4, i1.height = 2, i1.format = {im::Data::D8_8_8_8, im::Num::Unorm};
+  im::encode(i1, G, &desc[8]);
+  im::Image i2 = i0;
+  i2.base = d2, i2.format = {im::Data::D32, im::Num::Uint};
+  im::encode(i2, G, &desc[16]);
+  im::Sampler point, linear;
+  im::encode(point, G, &desc[24]);
+  linear.mag_linear = linear.min_linear = true;
+  im::encode(linear, G, &desc[28]);
+  im::Image i3;
+  i3.base = d3, i3.width = 4, i3.height = 4, i3.last_level = 1, i3.format = {im::Data::D32, im::Num::Float};
+  im::encode(i3, G, &desc[32]);
+  im::Image i4;
+  i4.base = d4, i4.width = 4, i4.height = 4, i4.depth = 2, i4.type = im::Type::Img2DArray;
+  i4.format = {im::Data::D32, im::Num::Float};
+  im::encode(i4, G, &desc[40]);
+  im::Image i5 = i4;
+  i5.base = d5, i5.type = im::Type::Img3D;
+  im::encode(i5, G, &desc[48]);
+  im::Image i6 = i0;
+  i6.base = d6, i6.format = {im::Data::D8_8_8_8, im::Num::Uint};
+  im::encode(i6, G, &desc[56]);
+  im::Image i7 = i0;
+  i7.base = d7, i7.format = {im::Data::D32_32, im::Num::Uint};
+  im::encode(i7, G, &desc[64]);
+  // The resources round-trip, in the guide's layout: the data and number
+  // formats in word 1, the width and height less one in word 2, the shape in
+  // the top of word 3, the pitch less one above the depth in word 4.
+  VCHECK_EQ(im::decode_image(&desc[8], G).width, 4u);
+  VCHECK(im::decode_image(&desc[8], G).format.data == im::Data::D8_8_8_8);
+  VCHECK_EQ(desc[1] >> 20 & 0x3F, 4u);                   // T0: IMG_DATA_FORMAT_32
+  VCHECK_EQ(desc[9] >> 20 & 0x3F, 10u);                  // T1: IMG_DATA_FORMAT_8_8_8_8
+  VCHECK_EQ(desc[9] >> 26 & 0xF, 0u);                    // unorm
+  VCHECK_EQ(desc[2] & 0x3FFF, 7u);                       // T0: 8 wide less one
+  VCHECK_EQ(desc[2] >> 14 & 0x3FFF, 3u);                 // 4 high less one
+  VCHECK_EQ(desc[3] >> 28, 9u);                          // T0: a 2D image
+  VCHECK_EQ(desc[43] >> 28, 13u);                        // T4's word 3: a 2D array
+  VCHECK_EQ(desc[44] & 0x1FFF, 1u);                      // its two layers less one
+  VCHECK_EQ(desc[44] >> 13 & 0xFFFF, 3u);                // and a pitch of 4 less one
+  VCHECK_EQ(im::texel_offset(i3, 1, 0, 0, 0), uint64_t{64});
+  VCHECK(im::decode_sampler(&desc[28], G).mag_linear);
+  const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(960 * 4);
+  mem.write(ddesc, desc, sizeof(desc));
+
+  const amd::Kernel* k = amd::find_kernel(o, "images");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  std::memcpy(&args[0], &out, 8);
+  std::memcpy(&args[8], &ddesc, 8);
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.group_size[0] = 32;
+  amd::execute(d, mem);
+  std::vector<uint32_t> r(960);
+  mem.read(out, r.data(), r.size() * 4);
+  const auto f = [&](uint32_t at) {
+    float v;
+    std::memcpy(&v, &r[at], 4);
+    return v;
+  };
+  const auto half = [](float v) {
+    const _Float16 h = static_cast<_Float16>(v);
+    uint16_t b;
+    std::memcpy(&b, &h, 2);
+    return uint32_t{b};
+  };
+  const auto pair = [&](uint32_t at) { return uint64_t{r[at + 1]} << 32 | r[at]; };
+  int wrong[14] = {};
+  for (uint32_t l = 0; l < 32; ++l) {
+    const int64_t x = l % 8, y = l / 8;
+    wrong[0] += f(l) != t0(x, y);
+    wrong[1] += f(32 + l) != t0(x, y);
+    wrong[2] += f(64 + l) != (x == 0 ? t0(0, y) : t0(x, y) - 0.5f);
+    const uint32_t t = (l % 4) + 4 * ((l / 4) % 2);
+    for (uint32_t c = 0; c < 4; ++c) wrong[3] += std::fabs(f(96 + 4 * l + c) - rgba[4 * t + c] / 255.0f) > 1e-6f;
+    const uint32_t level = l % 2;
+    wrong[4] += r[224 + 4 * l] != (4u >> level) || r[225 + 4 * l] != (4u >> level) || r[226 + 4 * l] != 1 ||
+                r[227 + 4 * l] != 2;
+    wrong[5] += f(352 + l) != 100.0f + static_cast<float>(l % 2 + 2 * (l / 2 % 2));
+    wrong[6] += f(384 + l) != a4[l];
+    wrong[7] += f(416 + l) != a4[l];
+    wrong[8] += f(448 + l) != a5[l];
+    wrong[9] += r[480 + l] != 3 * l;
+    wrong[10] += f(512 + l) != t0(x, y);
+    wrong[11] += r[544 + l] != (half(rgba[4 * t] / 255.0f) | half(rgba[4 * t + 1] / 255.0f) << 16);
+    // Red and alpha as stored; green and blue zero, not what was there.
+    wrong[12] += r[576 + 4 * l] != l + 1 || r[577 + 4 * l] != 0 || r[578 + 4 * l] != 0 || r[579 + 4 * l] != 200 - l;
+    // A 64-bit add finds the old texel and leaves the old plus 0x100000020 -- a carry out of the low half
+    // included -- for the 64-bit compare-and-swap to find, which returns it and stores its own.
+    wrong[13] += pair(704 + 2 * l) != wide[l] || pair(832 + 2 * l) != wide[l] + 0x100000020ull ||
+                 pair(896 + 2 * l) != (uint64_t{0xcafe} << 32 | static_cast<uint32_t>(0xbeef0000u + l)) ||
+                 r[768 + l] != 3 * l + 5 || r[800 + l] != 1000 + l;   // and the 32-bit compare-and-swap
+  }
+  for (int c = 0; c < 14; ++c) VCHECK_EQ(wrong[c], 0);
+  std::vector<uint32_t> stored(32);
+  mem.read(d2, stored.data(), 32 * 4);
+  int bad = 0;
+  for (uint32_t l = 0; l < 32; ++l) bad += stored[l] != 1000 + l;
+  VCHECK_EQ(bad, 0);
+}
+
+// gfx90a's formatted buffer accesses (asm_images90a.s, the "formats" kernel): MUBUF's load_format
+// and store_format forms, whose element format is in the resource (a V# with DATA_FORMAT [18:15] and
+// NUM_FORMAT [14:12]), each result against the same conversion done on the host.
+VTEST(gfx90a_formatted_buffer_loads_and_stores_convert_between_the_resources_format_and_registers) {
+  namespace im = amd::image;
+  const amd::CodeObject o = object("asm_images90a", "gfx90a");
+  constexpr im::Gen G = im::Gen::Gfx9;
+  MemoryManager mem(16ull << 20);
+  const auto half = [](float v) {
+    const _Float16 h = static_cast<_Float16>(v);
+    uint16_t b;
+    std::memcpy(&b, &h, 2);
+    return uint32_t{b};
+  };
+  std::vector<uint8_t> px(32 * 4);
+  std::vector<uint32_t> halves(32);
+  for (uint32_t i = 0; i < 32; ++i) {
+    const uint8_t b[4] = {static_cast<uint8_t>(i * 3), static_cast<uint8_t>(i * 5 + 1), static_cast<uint8_t>(255 - i),
+                          static_cast<uint8_t>(i * 7)};
+    std::memcpy(&px[4 * i], b, 4);
+    halves[i] = half(static_cast<float>(i) * 0.5f) | half(-static_cast<float>(i) * 0.25f) << 16;
+  }
+  const uint64_t d0 = mem.alloc(128), d1 = mem.alloc(128), d2 = mem.alloc(128), d3 = mem.alloc(128);
+  mem.write(d0, px.data(), 128);
+  mem.write(d1, halves.data(), 128);
+  const std::vector<uint32_t> zero(32, 0);
+  mem.write(d2, zero.data(), 128);
+  mem.write(d3, zero.data(), 128);
+  uint32_t desc[16] = {};
+  im::encode_buffer(d0, 4, 32, {im::Data::D8_8_8_8, im::Num::Unorm}, G, &desc[0]);
+  im::encode_buffer(d1, 4, 32, {im::Data::D16_16, im::Num::Float}, G, &desc[4]);
+  im::encode_buffer(d2, 4, 32, {im::Data::D8_8_8_8, im::Num::Uint}, G, &desc[8]);
+  im::encode_buffer(d3, 4, 32, {im::Data::D32, im::Num::Float}, G, &desc[12]);
+  // gfx9's V#: NUM_FORMAT in bits 14:12 and DATA_FORMAT in 18:15 of word 3.
+  VCHECK_EQ(desc[3] >> 12 & 7, 0u);
+  VCHECK_EQ(desc[3] >> 15 & 0xF, 10u);
+  VCHECK_EQ(desc[7] >> 12 & 7, 7u);
+  VCHECK_EQ(desc[7] >> 15 & 0xF, 5u);
+  const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(736 * 4);
+  mem.write(ddesc, desc, sizeof(desc));
+  const amd::Kernel* k = amd::find_kernel(o, "formats");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  std::memcpy(&args[0], &out, 8);
+  std::memcpy(&args[8], &ddesc, 8);
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.group_size[0] = 32;
+  amd::execute(d, mem);
+  std::vector<uint32_t> r(736);
+  mem.read(out, r.data(), r.size() * 4);
+  const auto f = [&](uint32_t at) {
+    float v;
+    std::memcpy(&v, &r[at], 4);
+    return v;
+  };
+  int wrong[8] = {};
+  for (uint32_t l = 0; l < 32; ++l) {
+    for (uint32_t c = 0; c < 4; ++c) {
+      wrong[0] += f(4 * l + c) != px[4 * l + c] / 255.0f;
+      wrong[3] += r[224 + 4 * l + c] != l * (c + 1);
+    }
+    wrong[1] += f(128 + 2 * l) != static_cast<float>(l) * 0.5f || f(129 + 2 * l) != -static_cast<float>(l) * 0.25f;
+    wrong[2] += r[192 + l] != (half(px[4 * l] / 255.0f) | half(px[4 * l + 1] / 255.0f) << 16);
+    const float v = static_cast<float>(l) + 0.5f;
+    uint32_t bits;
+    std::memcpy(&bits, &v, 4);
+    wrong[4] += r[352 + l] != bits;
+    wrong[5] += r[384 + l] != (0x1234u | half(px[4 * l] / 255.0f) << 16);
+    wrong[6] += r[416 + l] != (half(v) | half(v + 1.0f) << 16);
+    // A typed load takes its format from the instruction, whatever the resource says: V1's dword as four
+    // bytes, then as two halves and two zeroes (the identity DST_SEL, X, Y, and 0 for the channels the
+    // format lacks), and the pair stored as halves reads back as the dword it makes.
+    for (uint32_t c = 0; c < 4; ++c) {
+      wrong[7] += r[448 + 4 * l + c] != (halves[l] >> (8 * c) & 0xFF);
+      wrong[7] += r[576 + 4 * l + c] != (c < 2 ? halves[l] >> (16 * c) & 0xFFFF : 0u);
+    }
+    wrong[7] += r[704 + l] != (l | 2 * l << 16);
+  }
+  for (int c = 0; c < 8; ++c) VCHECK_EQ(wrong[c], 0);
+}
+
 VTEST(the_24_bit_multiplies_take_the_low_24_bits_signed_or_not_and_give_the_low_or_the_high_half) {
   // v_mul_hi_i32_i24 (VOP2 0x07) was not decoded: llama.cpp's mul_mat_vec_q for Q6_K stopped on it.
   const amd::CodeObject o = object("asm_mulhi");

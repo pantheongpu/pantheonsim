@@ -200,6 +200,12 @@ VTEST(every_rdna_image_instruction_shape_decodes_as_llvm_prints_it) {
   check_corpus("isa_corpus_images_gfx1201.txt", amd::gcn::Target::Gfx1200, 40);
 }
 
+// gfx90a's (MI200) image instructions: every opcode of the guide's Table 91
+// with the operand and modifier forms the assembler takes.
+VTEST(every_gfx90a_image_instruction_shape_decodes_as_llvm_prints_it) {
+  check_corpus("isa_corpus_images_gfx90a.txt", amd::gcn::Target::Gfx90a, 1000);
+}
+
 // And gfx1030 (RDNA2): gfx9's names, gfx10's memory bits, M0 and null the
 // other way round from gfx11, and SDWA.
 VTEST(every_gfx1030_instruction_shape_decodes_as_llvm_prints_it) {

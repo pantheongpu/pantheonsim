@@ -28,6 +28,13 @@ echo "wrote $(pwd)/chevron.O0.gfx942, chevron.O0.gfx942.o and its listing ($(wc 
 "$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 printf.gfx942.o |
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > printf.gfx942.dis
 echo "wrote $(pwd)/printf.gfx942, printf.gfx942.o and its listing ($(wc -l < printf.gfx942.dis) instructions)"
+# What a kernel asks of the host while it runs: a host function, malloc and
+# free, printf's conversions and the library's fprintf. Wave64 (CDNA and CDNA2)
+# and wave32 (RDNA3).
+for arch in gfx942 gfx90a gfx1100; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch hostcall.cpp -o hostcall.$arch
+done
+echo "wrote $(pwd)/hostcall.gfx942, hostcall.gfx90a and hostcall.gfx1100"
 # Occupancy, device attributes, and a kernel reaching another device's memory.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 runtime.cpp -o runtime.gfx942
 echo "wrote $(pwd)/runtime.gfx942"
@@ -147,10 +154,11 @@ echo "wrote $(pwd)/prim.all"
   --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1100 --offload-arch=gfx1201 smid.cpp -o smid.all
 echo "wrote $(pwd)/smid.all"
 # Arrays, textures and surfaces, for each RDNA generation's image resources.
-for arch in gfx1030 gfx1031 gfx1100 gfx1201; do
+# and for the MI200's (gfx90a), which has MIMG too.
+for arch in gfx1030 gfx1031 gfx1100 gfx1201 gfx90a; do
   "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch images.cpp -o images.$arch
 done
-echo "wrote $(pwd)/images.gfx1030, images.gfx1031, images.gfx1100 and images.gfx1201"
+echo "wrote $(pwd)/images.gfx1030, images.gfx1031, images.gfx1100, images.gfx1201 and images.gfx90a"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.

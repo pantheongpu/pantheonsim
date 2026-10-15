@@ -1,7 +1,8 @@
 // AMD's rocBLAS, unmodified, on a simulated MI300X: a level-1 call, a
 // reduction, single- and double-precision GEMMs, gemm_ex on halves,
-// bfloat16s and bytes, and complex GEMMs, each checked against the same
-// arithmetic done on the host. rocBLAS brings its own kernels -- some built
+// bfloat16s and bytes, complex GEMMs, and double-precision triangular
+// solves (trsv and trsm), each checked against the same arithmetic done on
+// the host. rocBLAS brings its own kernels -- some built
 // into the library, the GEMMs from the Tensile code objects it loads at run
 // time -- so what runs is AMD's code, not ours.
 #include <hip/hip_runtime.h>
@@ -233,6 +234,40 @@ int complex_gemm(rocblas_handle handle, Blas gemm, double tolerance, int ta, int
   return 1;
 }
 
+
+// Solves op(A) x = b in place for a triangular n x n A (column-major), the unused triangle ignored.
+// Conjugation is nothing for reals. The reference for rocblas_dtrsv and rocblas_dtrsm.
+void trsv_on_host(bool lower, bool transpose, bool unit, int n, const std::vector<double>& a, int lda, double* x) {
+  const auto op = [&](int i, int j) { return transpose ? a[size_t(i) * lda + j] : a[size_t(j) * lda + i]; };
+  if (lower != transpose) {   // op(A) is lower triangular
+    for (int i = 0; i < n; ++i) {
+      double s = x[i];
+      for (int j = 0; j < i; ++j) s -= op(i, j) * x[j];
+      x[i] = unit ? s : s / op(i, i);
+    }
+  } else {
+    for (int i = n - 1; i >= 0; --i) {
+      double s = x[i];
+      for (int j = i + 1; j < n; ++j) s -= op(i, j) * x[j];
+      x[i] = unit ? s : s / op(i, i);
+    }
+  }
+}
+
+// A well-conditioned triangle: a diagonal of 2 to 3 in size, either sign, small entries off it (and
+// junk in the triangle that is not used, which a solve must leave alone).
+std::vector<double> triangle(int n, int lda, bool lower, int seed) {
+  std::vector<double> a = filled<double>(size_t(lda) * n, seed);
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < n; ++i) {
+      double& v = a[size_t(j) * lda + i];
+      if (i == j) v = (v < 0 ? -1.0 : 1.0) * (2.0 + std::fabs(v));
+      else if (lower ? i > j : i < j) v = v * 0.5 / std::sqrt(double(n));
+      else v = 4242.0;
+    }
+  return a;
+}
+
 int main() {
   rocblas_handle handle;
   BLAS(rocblas_create_handle(&handle));
@@ -374,6 +409,82 @@ int main() {
         complexes += 2;
       }
   std::printf("complex GEMMs, every transpose and conjugate: %d of %d right\n", complex_right, complexes);
+  // Double-precision triangular solves: rocBLAS's trsv (a blocked substitution, with a stride on x that
+  // may run backwards) and trsm (the solve for a matrix of right-hand sides, from either side), every
+  // fill, every transpose (the conjugate is the transpose for reals) and both diagonals.
+  int solves = 0, solved = 0;
+  const auto fill_of = [](bool lower) { return lower ? rocblas_fill_lower : rocblas_fill_upper; };
+  const auto trans_of = [](int t) {
+    return t == 0 ? rocblas_operation_none : t == 1 ? rocblas_operation_transpose : rocblas_operation_conjugate_transpose;
+  };
+  const auto diag_of = [](bool unit) { return unit ? rocblas_diagonal_unit : rocblas_diagonal_non_unit; };
+  for (int nt : {1, 7, 33, 64, 65, 130})
+    for (int lower = 0; lower < 2; ++lower)
+      for (int t = 0; t < 3; ++t)
+        for (int unit = 0; unit < 2; ++unit)
+          for (int incx : {1, -2}) {
+            const int lda = nt + 1, step = std::abs(incx);
+            const std::vector<double> a = triangle(nt, lda, lower, 60 + nt);
+            std::vector<double> b = filled<double>(nt, 70 + nt), spread(size_t(nt) * step, 9999.0);
+            const auto position = [&](int i) { return incx > 0 ? i * step : (nt - 1 - i) * step; };
+            for (int i = 0; i < nt; ++i) spread[position(i)] = b[i];
+            trsv_on_host(lower, t != 0, unit, nt, a, lda, b.data());
+            double *da = to_device(a), *dx = to_device(spread);
+            if (!da || !dx) return 1;
+            BLAS(rocblas_dtrsv(handle, fill_of(lower), trans_of(t), diag_of(unit), nt, da, lda, dx, incx));
+            const std::vector<double> got = to_host(dx, spread.size());
+            std::vector<double> mine(nt), between_ok(1, 1.0);
+            bool untouched = true;
+            for (int i = 0; i < nt; ++i) mine[i] = got[position(i)];
+            for (size_t i = 0; i < spread.size(); ++i)
+              if (spread[i] == 9999.0 && got[i] != 9999.0) untouched = false;   // the gaps between elements stay
+            solved += untouched && close(mine, b, 1e-9) == nt;
+            ++solves;
+            for (void* q : {static_cast<void*>(da), static_cast<void*>(dx)}) HIP(hipFree(q));
+          }
+  const int rhs[][2] = {{1, 5}, {7, 3}, {33, 17}, {64, 65}, {130, 40}};
+  for (const auto& mn : rhs)
+    for (int right = 0; right < 2; ++right)
+      for (int lower = 0; lower < 2; ++lower)
+        for (int t = 0; t < 3; ++t)
+          for (int unit = 0; unit < 2; ++unit) {
+            const int m3 = mn[0], n3 = mn[1], k3 = right ? n3 : m3, lda = k3 + 1, ldb = m3 + 2;
+            const std::vector<double> a = triangle(k3, lda, lower, 80 + m3 + n3);
+            const std::vector<double> b0 = filled<double>(size_t(ldb) * n3, 90 + m3);
+            const double alpha3 = 1.5;
+            std::vector<double> want = b0;
+            if (!right) {   // op(A) X = alpha B, a column at a time
+              for (int j = 0; j < n3; ++j) {
+                double* col = &want[size_t(j) * ldb];
+                for (int i = 0; i < m3; ++i) col[i] *= alpha3;
+                trsv_on_host(lower, t != 0, unit, m3, a, lda, col);
+              }
+            } else {        // X op(A) = alpha B, a row at a time: op(A)^T x = alpha b
+              for (int i = 0; i < m3; ++i) {
+                std::vector<double> row(n3);
+                for (int j = 0; j < n3; ++j) row[j] = alpha3 * b0[size_t(j) * ldb + i];
+                trsv_on_host(lower, t == 0, unit, n3, a, lda, row.data());
+                for (int j = 0; j < n3; ++j) want[size_t(j) * ldb + i] = row[j];
+              }
+            }
+            double *da = to_device(a), *db = to_device(b0);
+            if (!da || !db) return 1;
+            BLAS(rocblas_dtrsm(handle, right ? rocblas_side_right : rocblas_side_left, fill_of(lower), trans_of(t),
+                               diag_of(unit), m3, n3, &alpha3, da, lda, db, ldb));
+            const std::vector<double> got = to_host(db, want.size());
+            // The two rows of padding below each column are not B's: they come back as they were.
+            int ok = 1;
+            for (int j = 0; j < n3 && ok; ++j)
+              for (int i = 0; i < ldb && ok; ++i) {
+                const size_t at = size_t(j) * ldb + i;
+                ok = i < m3 ? std::fabs(got[at] - want[at]) <= 1e-9 * (1 + std::fabs(want[at])) : got[at] == b0[at];
+              }
+            solved += ok;
+            ++solves;
+            for (void* q : {static_cast<void*>(da), static_cast<void*>(db)}) HIP(hipFree(q));
+          }
+  std::printf("triangular solves, trsv and trsm in double, every fill, transpose and diagonal: %d of %d right\n", solved,
+              solves);
   BLAS(rocblas_destroy_handle(handle));
   return 0;
 }

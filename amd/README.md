@@ -137,10 +137,11 @@ library loads (zlib and zstd are the two methods clang defines; any other method
 were linked into, each keeping its own metadata. The stream-ordered
 allocations, pitched copies, pointer attributes and work-item-sized launches
 (`hipExtModuleLaunchKernel`) it calls are there. `tests/e2e/run_rocblas.sh`
-builds a program against rocBLAS and checks its level-1 routines and its
-float and double GEMMs -- ragged sizes, every transpose -- against the same
-arithmetic on the host; both need ROCm with rocBLAS installed and skip
-elsewhere. AMD's own rocBLAS test suite, built from ROCm 7.1's source, runs
+builds a program against rocBLAS and checks its level-1 routines, its
+float and double GEMMs -- ragged sizes, every transpose -- and its double
+triangular solves (`trsv` with a backwards stride, `trsm` from either side;
+every fill, transpose and diagonal) against the same arithmetic on the host;
+both need ROCm with rocBLAS installed and skip elsewhere. AMD's own rocBLAS test suite, built from ROCm 7.1's source, runs
 on it as well: all 162,807 of its quick float and double tests pass, each
 checked against OpenBLAS, and its half, bfloat16, int8 and FP8 GEMMs run too.
 
@@ -248,12 +249,29 @@ Device-side `malloc` and `free` are the second (service 3, ockl's
 `__ockl_devmem_request`): the device library's allocator asks the host for
 its 2 MiB slabs and for large blocks, and gives them back; the host answers
 with device memory placed on the alignment the library finds slabs by, and a
-null pointer when the device is full (`tests/data/devmalloc.cpp`, run by
-`test_amd_runtime_gaps`). The address sanitizer's report (service 4) ends the
+null pointer when the device is full. A kernel built for code object version
+5 or later (every current hipcc) keeps the allocator's state in a block the
+runtime provides (`hidden_heap_v1`); the runtime makes it, 128 KiB with the
+counts of recordable slabs the allocator expects to find, when the first
+kernel that has the argument launches (`Hostcall::heap`, the layout is
+dm.cl's; ROCm's CLR does the same with the device library's own
+initialization kernel); earlier code objects keep it in their own data
+(`tests/data/devmalloc.cpp`, run by `test_amd_runtime_gaps`). The address
+sanitizer's report (service 4) ends the
 kernel with the report as the error (ROCm's runtime prints it and aborts); no
 sanitizer-instrumented code was available to run it, so it is checked against
-the device library's argument order only. A hostcall for any other service
-(a device function call) is refused by name. Vector loads and stores may be unaligned, as ROCm runs the
+the device library's argument order only. The device function call (service 1,
+`__ockl_call_host_function`) calls a host function the kernel names, once for
+each lane that makes the call: word 0 of a lane's slot is the function's
+address (`void f(uint64_t* output, const uint64_t* input)` -- seven words in,
+two out, the signature ROCm's CLR documents), and its two output words come
+back. Those are all the services the device library has; the fprintf
+interface (`__ockl_fprintf_*`, the stderr stream included, which `assert`
+uses) and printf are service 2. `tests/hipcc/hostcall.cpp` runs a host
+function, malloc and free, printf's conversions and fprintf from a kernel
+on the shim (wave64 and wave32), and the same program's host function,
+malloc and fprintf parts run on ROCm's own HIP over the HSA runtime.
+Vector loads and stores may be unaligned, as ROCm runs the
 hardware; the compiler counts on that when it packs a string.
 
 A program hipcc built carries linked code objects, whose code reaches its
@@ -610,9 +628,30 @@ texture units, and the simulator models them from the kernel up:
 - **HSA:** the images extension (`src/hsa_images.inc`): images and samplers,
   import, export, copy and clear, and each agent's image limits.
 - **Checks:** `tests/data/asm_images.s` checks each instruction against the
-  host; `tests/hipcc/images.cpp` (20 checks) runs on all three generations, on
+  host; `tests/hipcc/images.cpp` (21 checks) runs on all three generations, on
   the shim and on ROCm's own HIP over the HSA runtime; `tests/hsa/hsa_images.c`
   checks the extension.
+
+The MI200 family (gfx90a, MI250X) has texture units too, and its instructions are MIMG in gfx9's own
+encoding, which has no DIM field (the resource's TYPE and the DA bit say the shape) and, per the MI200
+guide (12.15), exactly one sample, `image_sample` (implicit level of detail, no `_l`, `_lz`, `_b`, `_c`,
+`_d`, `_o` or `_cl` forms, no `image_gather4`): hipcc drops `tex2DLod` and `tex2Dgather` from the code it
+builds for gfx90a, so a program that calls them gets nothing there (that is the compiler's doing, not the
+simulator's). The executor runs loads (`_mip` included), stores, atomics (on 32- and 64-bit texels, with the
+DMASK values the guide lists), `get_resinfo` and `image_sample` on gfx90a through the same code as RDNA's, with the guide's rules where they differ (a store writes the
+whole texel, the channels DMASK leaves out as zero; with d16 DMASK is only a count), and MUBUF's
+`buffer_load_format_*` and `buffer_store_format_*` (opcodes 0-15, 38 and 39) that `tex1Dfetch` compiles to, and
+MTBUF's `tbuffer_*_format_*`, whose data and number formats are the instruction's own and whose DST_SEL is the
+identity (a channel the format lacks reads 0). A store of fewer components than the format has is refused:
+the guide does not say what becomes of the rest.
+The T# (Table 41 of the guide, ROCR-Runtime's `resource_ai.h`) names the format as GCN does, a data
+format and a number format. Left refused, with the guide's words in the error: the `_pck` forms (the
+guide says the resource's format is ignored and 8- and 16-bit components are zero- or sign-extended,
+and nothing about which channels a DMASK past the texel's returns), LWE (where `LOD_CLAMPED` goes is not
+said), 2D MSAA images and buffers behind a T#. `tests/data/asm_images90a.s`
+(`test_amd_gcn_asm`), `tests/data/isa_corpus_images_gfx90a.txt` (`test_amd_gcn`, the decoder against
+llvm-objdump), `tests/hipcc/images.gfx90a` (19 checks, on the shim and on ROCm's HIP over the HSA runtime)
+and OpenCL's images (`tests/opencl/cl.c`) cover it.
 
 The MI300 family (gfx942 and gfx950) has no texture units. hipcc refuses the
 texture API in their device code (`__HIP_NO_IMAGE_SUPPORT`), and ROCm's HIP on
@@ -676,7 +715,7 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 Two more ways to program an AMD GPU run on the simulated ones with ROCm's own runtimes, and neither goes through HIP.
 
 - **OpenMP target offloading.** LLVM's `libomptarget` has an AMD plugin that drives the HSA runtime directly: queues, signals, memory pools, executables, kernel dispatch packets. `tests/openmp/omp.cpp` is built by ROCm's `amdclang++ -fopenmp --offload-arch=gfx...` for each GPU's ISA and run on two simulated devices of each model (ctest `amd_openmp`, `tests/e2e/run_openmp.sh`): `target teams distribute parallel for` with map clauses, reductions (built-in and `declare reduction`), `declare mapper`, `target data` with `enter`/`exit`/`update`, `map(present)` and `map(always)`, `declare target` functions and variables, `omp_target_alloc`/`memcpy`/`associate_ptr`, atomics (update and capture), `collapse`, `teams loop`, `num_teams`/`thread_limit`/`num_threads`, `nowait` with `depend`, `device(n)` for every device, the device math library, and `printf` from a target region. All of them pass on the six GPUs.
-- **OpenCL.** ROCm's OpenCL runtime (`libamdocl64`, on the same CLR as HIP) builds each kernel with the compiler library and runs it through the HSA runtime. `tests/opencl/cl.c` is an ordinary OpenCL program (built by the system's compiler against the ICD loader) that runs on two devices of each model (ctest `amd_opencl`, `tests/e2e/run_opencl.sh`): vector add, a reduction through local memory and barriers, atomics, doubles, a 2D range, barriers over global memory, buffer fill, copy and map, a global offset with a range that is not a multiple of the work-group, coarse-grained shared virtual memory, and, on the Radeon GPUs, images and samplers. The MI300 family has no texture units, and says so (`CL_DEVICE_IMAGE_SUPPORT` is false). MI250X does have them and says so too; its image instructions (gfx9 MIMG) are not implemented yet, so the test leaves its images out.
+- **OpenCL.** ROCm's OpenCL runtime (`libamdocl64`, on the same CLR as HIP) builds each kernel with the compiler library and runs it through the HSA runtime. `tests/opencl/cl.c` is an ordinary OpenCL program (built by the system's compiler against the ICD loader) that runs on two devices of each model (ctest `amd_opencl`, `tests/e2e/run_opencl.sh`): vector add, a reduction through local memory and barriers, atomics, doubles, a 2D range, barriers over global memory, buffer fill, copy and map, a global offset with a range that is not a multiple of the work-group, coarse-grained shared virtual memory, and, on the Radeon GPUs and the MI250X, images and samplers. The MI300 family has no texture units, and says so (`CL_DEVICE_IMAGE_SUPPORT` is false).
 - **Which GPUs, and where.** Both need only ROCm's LLVM or OpenCL runtime beside the simulator's HSA runtime; the CI job `models` unpacks them from AMD's apt repository (`tests/openmp/fetch-rocm-llvm.sh`, `tests/opencl/fetch-rocm-opencl.sh`) with nothing installed, and the tests skip where neither is found. `offload-arch` (`amdgpu-arch`), which they and CMake's HIP language use to find the GPUs, reads the kernel driver's own directory `/sys/devices/virtual/kfd/kfd`: an isolated session has it, with `/sys/class/kfd/kfd` a link to it as on a machine with the driver.
 
 ## System tools
