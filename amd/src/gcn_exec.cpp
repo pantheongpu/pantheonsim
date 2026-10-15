@@ -3099,6 +3099,63 @@ struct Machine {
       vector_alu(w, renamed);
       return true;
     }
+    if (name.rfind("v_cvt_scalef32_", 0) == 0) {
+      // gfx950's widening conversions of 4-, 6- and 8-bit floats (CDNA4 guide, V_CVT_SCALEF32_PK_F32_FP8 and the rest): each small float
+      // is widened exactly and scaled by 2^(scale - 127), scale = "exponent(S1.f32)", the E8M0 exponent -- the float's exponent field
+      // (bits 30:23), so an inline 1.0 is 127 -- "Convert instructions with SCALE add an 8-bit exponent bias (E8M0, bias of 127) to each
+      // F4/F6/F8 value" (6.7); "Conversion from F4/F6/F8 do not support input modifiers ... F4/F6/F8 allows denorms regardless of MODE"
+      // (7.3). Which source bits are read: pk_*_fp8/bf8 the two bytes of the half OPSEL[0] names, f32_fp8/bf8 the byte OPSEL[1:0] names, pk_*_fp4
+      // the byte OPSEL[1:0] names (low nibble first), pk32_* all 32 six-bit values of S0. Assumed, not stated: a scale of 255 (E8M0's NaN,
+      // 7.2) gives NaN; the result is rounded once to nearest even to a 16-bit type (a value past its range is infinity, FP16_OVFL not
+      // applied).
+      const size_t from_at = name.rfind('_', name.size() - 1);
+      const std::string from = name.substr(from_at + 1);
+      const std::string head = name.substr(15, from_at - 15);   // "pk_f32", "f32", "pk32_f16" ...
+      const bool pk32 = head.rfind("pk32_", 0) == 0, pk = head.rfind("pk_", 0) == 0;
+      const std::string to = head.substr(pk32 ? 5 : pk ? 3 : 0);
+      const F8& t = from == "fp8" ? kOcpFp8 : from == "bf8" ? kOcpBf8 : from == "fp4" ? kFp4 : from == "fp6" ? kFp6 : kBf6;
+      const uint32_t n = pk32 ? 32 : pk ? 2 : 1, bits = static_cast<uint32_t>(t.bits), out_bits = to == "f32" ? 32 : 16;
+      const uint32_t op_sel = in.op_sel;
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        if (!(w.exec >> lane & 1)) continue;
+        const uint32_t e = (lane_src(w, in.src[1], lane) >> 23) & 0xFF;
+        uint32_t result[32] = {};
+        uint32_t src_word = 0;   // the register-pair read for the 8-bit packed forms, or the byte for the others
+        if (pk32) {
+          // (read below, a code at a time)
+        } else if (bits == 8 && pk) {
+          src_word = (lane_src(w, in.src[0], lane) >> (16 * (op_sel & 1))) & 0xFFFF;
+        } else {
+          src_word = (lane_src(w, in.src[0], lane) >> (8 * (op_sel & 3))) & 0xFF;
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+          uint32_t code;
+          if (pk32) {
+            const uint32_t at = i * 6;
+            code = word(w, in.src[0], at / 32, lane) >> (at % 32);
+            if (at % 32 + 6 > 32) code |= word(w, in.src[0], at / 32 + 1, lane) << (32 - at % 32);
+          } else {
+            code = src_word >> (i * bits);
+          }
+          const float v = f8_to_float(code & ((1u << bits) - 1), t);
+          const double scaled = e == 0xFF || std::isnan(v) ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(static_cast<double>(v), static_cast<int>(e) - 127);
+          const float f = static_cast<float>(scaled);
+          uint32_t out;
+          if (to == "f32") {
+            out = as_bits(f);
+          } else if (to == "f16") {
+            out = as_bits(static_cast<_Float16>(f));
+          } else {
+            out = to_bf16(f) & 0xFFFFu;
+          }
+          if (out_bits == 32) result[i] = out;
+          else result[i / 2] |= (out & 0xFFFFu) << (16 * (i % 2));
+        }
+        const uint32_t regs = (n * out_bits + 31) / 32;
+        for (uint32_t r = 0; r < regs; ++r) set_word(w, in.dst[0], r, lane, result[r]);
+      }
+      return true;
+    }
     if (name == "v_cvt_pkaccum_u8_f32") {
       // "byte = S1.u32[1:0]; D0.u32[byte * 8 + 7 : byte * 8] = f32_to_u8(S0.f32)": the byte S1 names, the rest of the destination kept (the
       // opcode "uses src_c to pass destination in as a source"). The guide does not define f32_to_u8; this is v_cvt_pk_u8_f32's conversion
@@ -3975,8 +4032,8 @@ struct Machine {
       // bit 3 says the high one), the other half kept.
       const F8& t = op == "v_cvt_pk_fp8_f32"_op ? fp8() : bf8();
       each([&](uint32_t lane) {
-        const uint32_t two = float_to_f8(lane_float(w, in.src[0], lane), t, in.clamp, nullptr, fp16_ovfl(w, in)) |
-                             float_to_f8(lane_float(w, in.src[1], lane), t, in.clamp, nullptr, fp16_ovfl(w, in)) << 8;
+        const uint32_t two = float_to_f8(lane_float(w, in.src[0], lane), t, f8_saturate(in), nullptr, fp16_ovfl(w, in)) |
+                             float_to_f8(lane_float(w, in.src[1], lane), t, f8_saturate(in), nullptr, fp16_ovfl(w, in)) << 8;
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         write_lane(w, in.dst[0], lane, in.op_sel & 8 ? (was & 0xFFFFu) | two << 16 : (was & 0xFFFF0000u) | two);
       });
@@ -3987,7 +4044,7 @@ struct Machine {
       const uint32_t at = 8 * ((in.op_sel >> 2) & 3);
       each([&](uint32_t lane) {
         const uint32_t random = lane_src(w, in.src[1], lane);
-        const uint32_t b = float_to_f8(lane_float(w, in.src[0], lane), t, in.clamp, &random, fp16_ovfl(w, in));
+        const uint32_t b = float_to_f8(lane_float(w, in.src[0], lane), t, f8_saturate(in), &random, fp16_ovfl(w, in));
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         write_lane(w, in.dst[0], lane, (was & ~(0xFFu << at)) | b << at);
       });
@@ -4850,7 +4907,15 @@ struct Machine {
   // types, and to f32 to fp8/bf8 conversions (the table in 7.6). Only the operations whose infinite result from finite operands can only
   // be an overflow (not a divide by zero or a logarithm of zero) are given it here: add, subtract, multiply, the multiply-adds, ldexp and the
   // conversions from wider floats.
-  static bool fp16_ovfl(const Wave& w, const Inst& in) { return in.arch == gcn::Target::Gfx1250 && ((w.mode >> 23) & 1); }
+  // MODE.FP16_OVFL: "If set, an overflowed FP16 result is clamped to +/- MAX_FP16, regardless of round mode, while still preserving true
+  // INF values" (the MODE register table of the CDNA3, CDNA4 and CDNA5 guides), and the F32 to FP8/BF8 conversions' overflow rule (CDNA3 and
+  // CDNA4 guides, 7.3, "CVT_*FP8_F32 and CVT*_BF8_F32 FP16_OVFL rule").
+  static bool fp16_ovfl(const Wave& w, const Inst& in) {
+    return (in.arch == gcn::Target::Gfx1250 || is_guide_arch(in)) && ((w.mode >> 23) & 1);
+  }
+  // (The CDNA3 and CDNA4 guides' V_CVT_PK_FP8_F32 and V_CVT_SR_FP8_F32 say "Ignores OMOD and clamp", and the assembler refuses `clamp` on
+  // them for gfx942 and gfx950, so a compiled program never sets the bit; its saturating meaning on RDNA and gfx1250 is left as it was.)
+  static bool f8_saturate(const Inst& in) { return in.clamp; }
   static bool overflow_only_op(const std::string& name) {
     static const char* const kTokens[] = {"add_f16", "sub_f16", "subrev_f16", "mul_f16", "fma_f16", "mad_f16", "fmac_f16", "fmamk_f16",
                                           "fmaak_f16", "ldexp_f16", "cvt_f16_f32", "cvt_pk_f16_f32"};

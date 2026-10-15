@@ -606,6 +606,26 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x13b}, {"v_fmac_f32_e64", 1, 2}},
       {{Enc::Vop3, 0x1c2}, {"v_mad_i32_i24", 1, 3}},
       {{Enc::Vop3, 0x1f0}, {"v_cvt_pkaccum_u8_f32", 1, 2}},   // (the destination is the third source)
+      // gfx950's conversions of 4-, 6- and 8-bit floats to wider ones, scaled by the exponent field of the second source (a float, or an inline
+      // constant) -- CDNA4 guide, V_CVT_SCALEF32_*. (The narrowing forms, and the single-half forms 586 and 587 whose destination half the
+      // guide does not settle, are not decoded.)
+      {{Enc::Vop3, 0x239}, {"v_cvt_scalef32_pk_f32_fp8", 2, 2}},
+      {{Enc::Vop3, 0x23a}, {"v_cvt_scalef32_pk_f32_bf8", 2, 2}},
+      {{Enc::Vop3, 0x23b}, {"v_cvt_scalef32_f32_fp8", 1, 2}},
+      {{Enc::Vop3, 0x23c}, {"v_cvt_scalef32_f32_bf8", 1, 2}},
+      {{Enc::Vop3, 0x23f}, {"v_cvt_scalef32_pk_f32_fp4", 2, 2}},
+      {{Enc::Vop3, 0x248}, {"v_cvt_scalef32_pk_f16_fp8", 1, 2}},
+      {{Enc::Vop3, 0x249}, {"v_cvt_scalef32_pk_f16_bf8", 1, 2}},
+      {{Enc::Vop3, 0x250}, {"v_cvt_scalef32_pk_f16_fp4", 1, 2}},
+      {{Enc::Vop3, 0x251}, {"v_cvt_scalef32_pk_bf16_fp4", 1, 2}},
+      {{Enc::Vop3, 0x256}, {"v_cvt_scalef32_pk32_f32_fp6", 32, 2, 6}},
+      {{Enc::Vop3, 0x257}, {"v_cvt_scalef32_pk32_f32_bf6", 32, 2, 6}},
+      {{Enc::Vop3, 0x260}, {"v_cvt_scalef32_pk32_f16_fp6", 16, 2, 6}},
+      {{Enc::Vop3, 0x261}, {"v_cvt_scalef32_pk32_bf16_fp6", 16, 2, 6}},
+      {{Enc::Vop3, 0x262}, {"v_cvt_scalef32_pk32_f16_bf6", 16, 2, 6}},
+      {{Enc::Vop3, 0x263}, {"v_cvt_scalef32_pk32_bf16_bf6", 16, 2, 6}},
+      {{Enc::Vop3, 0x269}, {"v_cvt_scalef32_pk_bf16_fp8", 1, 2}},
+      {{Enc::Vop3, 0x26a}, {"v_cvt_scalef32_pk_bf16_bf8", 1, 2}},
       {{Enc::Vop3, 0x265}, {"v_ashr_pk_i8_i32", 1, 3}},
       {{Enc::Vop3, 0x266}, {"v_ashr_pk_u8_i32", 1, 3}},
       {{Enc::Vop3, 0x2a8}, {"v_minimum3_f32", 1, 3}},

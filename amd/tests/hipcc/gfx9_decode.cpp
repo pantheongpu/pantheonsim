@@ -53,12 +53,73 @@ KERNEL(k_mad_legacy_u16, 0xA5A5A5A5u, "v_mad_legacy_u16 %0, %1, %2, %3", A3)
 KERNEL(k_mad_legacy_i16, 0xA5A5A5A5u, "v_mad_legacy_i16 %0, %1, %2, %3", A3)
 KERNEL(k_div_fixup_legacy_f16, 0xA5A5A5A5u, "v_div_fixup_legacy_f16 %0, %1, %2, %3", A3)
 
+
+#ifdef VGPU_GFX950
+// gfx950's scaled conversions of small floats to wider ones: each value widened exactly and scaled by 2^(e - 127), e the exponent field of the second
+// source. The 2-element forms write a register pair (f32) or one register (f16, bf16); pk32 reads 32 six-bit values from six registers.
+typedef uint32_t v6u __attribute__((ext_vector_type(6)));
+typedef uint32_t v16u __attribute__((ext_vector_type(16)));
+typedef uint32_t v32u __attribute__((ext_vector_type(32)));
+#define WIDEN2(NAME, INSTR) \
+  __global__ void NAME(const uint32_t* a, const uint32_t* b, uint32_t* o) { \
+    const int i = threadIdx.x; uint64_t r; asm volatile(INSTR : "=v"(r) : "v"(a[i]), "v"(b[i])); o[2 * i] = static_cast<uint32_t>(r); o[2 * i + 1] = static_cast<uint32_t>(r >> 32); }
+#define WIDEN1(NAME, INSTR) \
+  __global__ void NAME(const uint32_t* a, const uint32_t* b, uint32_t* o) { \
+    const int i = threadIdx.x; uint32_t r; asm volatile(INSTR : "=v"(r) : "v"(a[i]), "v"(b[i])); o[i] = r; }
+WIDEN2(k_sc_pk_f32_fp8_0, "v_cvt_scalef32_pk_f32_fp8 %0, %1, %2")
+WIDEN2(k_sc_pk_f32_fp8_1, "v_cvt_scalef32_pk_f32_fp8 %0, %1, %2 op_sel:[1,0,0]")
+WIDEN2(k_sc_pk_f32_bf8_0, "v_cvt_scalef32_pk_f32_bf8 %0, %1, %2")
+WIDEN2(k_sc_pk_f32_bf8_1, "v_cvt_scalef32_pk_f32_bf8 %0, %1, %2 op_sel:[1,0,0]")
+WIDEN1(k_sc_f32_fp8_0, "v_cvt_scalef32_f32_fp8 %0, %1, %2")
+WIDEN1(k_sc_f32_fp8_1, "v_cvt_scalef32_f32_fp8 %0, %1, %2 op_sel:[1,0,0]")
+WIDEN1(k_sc_f32_fp8_2, "v_cvt_scalef32_f32_fp8 %0, %1, %2 op_sel:[0,1,0]")
+WIDEN1(k_sc_f32_fp8_3, "v_cvt_scalef32_f32_fp8 %0, %1, %2 op_sel:[1,1,0]")
+WIDEN1(k_sc_f32_bf8_2, "v_cvt_scalef32_f32_bf8 %0, %1, %2 op_sel:[0,1,0]")
+WIDEN1(k_sc_pk_f16_fp8_1, "v_cvt_scalef32_pk_f16_fp8 %0, %1, %2 op_sel:[1,0,0]")
+WIDEN1(k_sc_pk_f16_bf8_0, "v_cvt_scalef32_pk_f16_bf8 %0, %1, %2")
+WIDEN1(k_sc_pk_bf16_fp8_0, "v_cvt_scalef32_pk_bf16_fp8 %0, %1, %2")
+WIDEN1(k_sc_pk_bf16_bf8_1, "v_cvt_scalef32_pk_bf16_bf8 %0, %1, %2 op_sel:[1,0,0]")
+WIDEN2(k_sc_pk_f32_fp4_0, "v_cvt_scalef32_pk_f32_fp4 %0, %1, %2")
+WIDEN2(k_sc_pk_f32_fp4_2, "v_cvt_scalef32_pk_f32_fp4 %0, %1, %2 op_sel:[0,1,0]")
+WIDEN1(k_sc_pk_f16_fp4_3, "v_cvt_scalef32_pk_f16_fp4 %0, %1, %2 op_sel:[1,1,0]")
+WIDEN1(k_sc_pk_bf16_fp4_1, "v_cvt_scalef32_pk_bf16_fp4 %0, %1, %2 op_sel:[1,0,0]")
+// An inline constant as the scale: 2.0's exponent field is 128, so the values are doubled.
+WIDEN2(k_sc_pk_f32_fp8_two, "v_cvt_scalef32_pk_f32_fp8 %0, %1, 2.0")
+#define WIDEN32(NAME, INSTR, OUT, N) \
+  __global__ void NAME(const uint32_t* a, const uint32_t* b, uint32_t* o) { \
+    const int i = threadIdx.x; v6u in; for (int k = 0; k < 6; ++k) in[k] = a[6 * i + k]; \
+    OUT r; asm volatile(INSTR : "=v"(r) : "v"(in), "v"(b[i])); for (int k = 0; k < N; ++k) o[N * i + k] = r[k]; }
+WIDEN32(k_sc_pk32_f32_fp6, "v_cvt_scalef32_pk32_f32_fp6 %0, %1, %2", v32u, 32)
+WIDEN32(k_sc_pk32_f32_bf6, "v_cvt_scalef32_pk32_f32_bf6 %0, %1, %2", v32u, 32)
+WIDEN32(k_sc_pk32_f16_fp6, "v_cvt_scalef32_pk32_f16_fp6 %0, %1, %2", v16u, 16)
+WIDEN32(k_sc_pk32_bf16_fp6, "v_cvt_scalef32_pk32_bf16_fp6 %0, %1, %2", v16u, 16)
+WIDEN32(k_sc_pk32_f16_bf6, "v_cvt_scalef32_pk32_f16_bf6 %0, %1, %2", v16u, 16)
+WIDEN32(k_sc_pk32_bf16_bf6, "v_cvt_scalef32_pk32_bf16_bf6 %0, %1, %2", v16u, 16)
+#endif
+
 // v_mfma_f64_4x4x4_4b_f64: four 4x4x4 products at once, in the guide's layout (7.1.4): A[b,i,k] in lane i + 4 * (b + 4 * k), B[b,k,j] in lane
 // j + 4 * (b + 4 * k), and C and D[b,i,j] in lane j + 4 * (i + 4 * b).
 __global__ void k_mfma_f64_4b(const double* a, const double* b, const double* c, double* d) {
   const int l = threadIdx.x;
   d[l] = __builtin_amdgcn_mfma_f64_4x4x4f64(a[l], b[l], c[l], 0, 0, 0);
 }
+
+
+// MODE.FP16_OVFL (bit 23) set around an instruction: "an overflowed FP16 result is clamped to +/- MAX_FP16, regardless of round mode, while still
+// preserving true INF values", and the F32 to FP8/BF8 conversions' overflow rule (guides, 7.3). The destination starts as zero.
+#define OVFL(NAME, SET, INSTR) \
+  __global__ void NAME(const uint32_t* a, const uint32_t* b, const uint32_t*, uint32_t* o) { \
+    const int i = threadIdx.x; uint32_t r = 0; \
+    asm volatile("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), " #SET "\n " INSTR "\n s_setreg_imm32_b32 hwreg(HW_REG_MODE, 23, 1), 0" : "+v"(r) : "v"(a[i]), "v"(b[i])); \
+    o[i] = r; }
+OVFL(k_add_f16_ovfl1, 1, "v_add_f16 %0, %1, %2")
+OVFL(k_add_f16_ovfl0, 0, "v_add_f16 %0, %1, %2")
+OVFL(k_pk_fp8_ovfl1, 1, "v_cvt_pk_fp8_f32 %0, %1, %2")
+OVFL(k_pk_fp8_ovfl0, 0, "v_cvt_pk_fp8_f32 %0, %1, %2")
+OVFL(k_pk_bf8_ovfl1, 1, "v_cvt_pk_bf8_f32 %0, %1, %2")
+OVFL(k_pk_bf8_ovfl0, 0, "v_cvt_pk_bf8_f32 %0, %1, %2")
+OVFL(k_sr_fp8_ovfl1, 1, "v_cvt_sr_fp8_f32 %0, %1, %2")
+OVFL(k_sr_fp8_ovfl0, 0, "v_cvt_sr_fp8_f32 %0, %1, %2")
 
 // The relative moves: the register number in the instruction plus M0. Lane 0 only; o[0..7] hold the results.
 __global__ void k_movrel(uint32_t* o) {
@@ -112,6 +173,72 @@ static void cases(const char* what, K kernel, const std::vector<Case>& cs, uint3
 }
 static bool is_nan_half(uint32_t v) { return (v & 0x7C00u) == 0x7C00u && (v & 0x3FFu) != 0; }
 
+
+#ifdef VGPU_GFX950
+// The small floats of the CDNA4 guide's Table 30, decoded on the host: sign, exponent (bias), mantissa; the least exponent is the denormal one.
+static double small_value(uint32_t code, int ebits, int mbits, int bias, int kind) {   // kind: 0 plain (no NaN, no infinity), 1 E4M3, 2 E5M2
+  const int sign = (code >> (ebits + mbits)) & 1, e = (code >> mbits) & ((1 << ebits) - 1), m = code & ((1 << mbits) - 1);
+  if (kind == 1 && e == 15 && m == 7) return std::nan("");
+  if (kind == 2 && e == 31) return m ? std::nan("") : (sign ? -INFINITY : INFINITY);
+  const double mag = e == 0 ? std::ldexp(static_cast<double>(m), 1 - bias - mbits) : std::ldexp(static_cast<double>((1 << mbits) | m), e - bias - mbits);
+  return sign ? -mag : mag;
+}
+static double fp8_value(uint32_t c) { return small_value(c & 0xFF, 4, 3, 7, 1); }
+static double bf8_value(uint32_t c) { return small_value(c & 0xFF, 5, 2, 15, 2); }
+static double fp6_value(uint32_t c) { return small_value(c & 0x3F, 2, 3, 1, 0); }
+static double bf6_value(uint32_t c) { return small_value(c & 0x3F, 3, 2, 3, 0); }
+static double fp4_value(uint32_t c) { return small_value(c & 0xF, 2, 1, 1, 0); }
+static uint32_t f32_bits(double scaled) { const float f = static_cast<float>(scaled); uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static uint32_t f16_bits(double scaled) { return h16(static_cast<float>(scaled)); }
+static uint32_t bf16_bits(double scaled) {   // round to nearest even from the float
+  const uint32_t u = f32_bits(scaled);
+  if (std::isnan(scaled)) return 0x7FC0;
+  return (u + 0x7FFF + ((u >> 16) & 1)) >> 16;
+}
+static bool nan_bits(uint32_t bits, int width) { return width == 32 ? (bits & 0x7F800000u) == 0x7F800000u && (bits & 0x7FFFFFu) : width == 16 ? is_nan_half(bits) : (bits & 0x7F80u) == 0x7F80u && (bits & 0x7Fu); }
+static uint32_t next_random() { static uint32_t x = 0x2545F491u; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return x; }
+// One scale per lane (the float whose exponent field it is): 1.0, 8, 2^-7, 2^-100 and a field of 255, repeating.
+static uint32_t scale_for(int lane) { static const uint32_t e[5] = {127, 130, 120, 27, 255}; return e[lane % 5] << 23 | (lane % 3 ? 0x155555u : 0); }
+static int scale_exp(int lane) { return static_cast<int>(scale_for(lane) >> 23) - 127; }
+
+template <typename K>
+static std::vector<uint32_t> run_words(K kernel, const std::vector<uint32_t>& a, const std::vector<uint32_t>& b, size_t out_words) {
+  uint32_t *da, *db, *dout;
+  std::vector<uint32_t> out(out_words, 0xDEADBEEFu);
+  hipMalloc(&da, a.size() * 4), hipMalloc(&db, b.size() * 4), hipMalloc(&dout, out_words * 4);
+  hipMemcpy(da, a.data(), a.size() * 4, hipMemcpyHostToDevice), hipMemcpy(db, b.data(), b.size() * 4, hipMemcpyHostToDevice);
+  hipLaunchKernelGGL(kernel, dim3(1), dim3(64), 0, 0, da, db, dout);
+  if (hipDeviceSynchronize() != hipSuccess) return out;
+  hipMemcpy(out.data(), dout, out_words * 4, hipMemcpyDeviceToHost);
+  hipFree(da), hipFree(db), hipFree(dout);
+  return out;
+}
+// n values a lane, each from `code(lane, i, words)` through `value`, scaled and encoded by `encode` (width bits); the kernel's output is compared lane by lane.
+template <typename K, typename Code, typename Value, typename Encode>
+static void widen_check(const char* what, K kernel, int src_words, int n, int width, Code code, Value value, Encode encode) {
+  std::vector<uint32_t> a(64 * src_words), b(64);
+  for (auto& x : a) x = next_random();
+  for (int l = 0; l < 64; ++l) b[l] = scale_for(l);
+  const int out_words = n * width / 32;
+  const auto out = run_words(kernel, a, b, 64 * out_words);
+  int wrong = 0;
+  for (int l = 0; l < 64; ++l)
+    for (int i = 0; i < n; ++i) {
+      const double v = value(code(&a[l * src_words], i));
+      const bool nan = std::isnan(v) || scale_exp(l) == 128;   // (the field 255: E8M0's NaN)
+      const double scaled = nan ? std::nan("") : std::ldexp(v, scale_exp(l));
+      const uint32_t want = encode(scaled);
+      const size_t at = static_cast<size_t>(l) * n + i;
+      const uint32_t got = width == 32 ? out[at] : (out[at / 2] >> (16 * (at % 2))) & 0xFFFFu;
+      if (nan ? !nan_bits(got, width) : got != want) {
+        if (wrong < 2) std::printf("  %s lane %d value %d: got %08x want %08x\n", what, l, i, got, want);
+        ++wrong;
+      }
+    }
+  report(what, wrong, 64 * n);
+}
+#endif
+
 int main() {
   // v_cvt_pkaccum_u8_f32: the byte S1[1:0] names takes the float (whole numbers here, so the conversion's rounding does not matter); the
   // other bytes of the destination (0x11223344 to begin with) are kept, and S1's other bits are ignored.
@@ -154,6 +281,92 @@ int main() {
     int wrong = 0;
     for (int l = 0; l < 64; ++l) wrong += out[l] != want[l];
     report("v_mfma_f64_4x4x4_4b_f64 (four 4x4x4 products, the guide's layout)", wrong, 64);
+  }
+
+
+#ifdef VGPU_GFX950
+  {
+    // 8-bit sources: the two bytes of the half OPSEL[0] names, or the byte OPSEL[1:0] names.
+    const auto byte_of = [](int which) { return [which](const uint32_t* w, int) { return (w[0] >> (8 * which)) & 0xFF; }; };
+    const auto pair_of = [](int half) { return [half](const uint32_t* w, int i) { return (w[0] >> (16 * half + 8 * i)) & 0xFF; }; };
+    widen_check("v_cvt_scalef32_pk_f32_fp8 (low half)", k_sc_pk_f32_fp8_0, 1, 2, 32, pair_of(0), fp8_value, f32_bits);
+    widen_check("v_cvt_scalef32_pk_f32_fp8 (high half, op_sel[0])", k_sc_pk_f32_fp8_1, 1, 2, 32, pair_of(1), fp8_value, f32_bits);
+    widen_check("v_cvt_scalef32_pk_f32_bf8 (low half)", k_sc_pk_f32_bf8_0, 1, 2, 32, pair_of(0), bf8_value, f32_bits);
+    widen_check("v_cvt_scalef32_pk_f32_bf8 (high half)", k_sc_pk_f32_bf8_1, 1, 2, 32, pair_of(1), bf8_value, f32_bits);
+    widen_check("v_cvt_scalef32_f32_fp8 (byte 0)", k_sc_f32_fp8_0, 1, 1, 32, byte_of(0), fp8_value, f32_bits);
+    widen_check("v_cvt_scalef32_f32_fp8 (byte 1)", k_sc_f32_fp8_1, 1, 1, 32, byte_of(1), fp8_value, f32_bits);
+    widen_check("v_cvt_scalef32_f32_fp8 (byte 2)", k_sc_f32_fp8_2, 1, 1, 32, byte_of(2), fp8_value, f32_bits);
+    widen_check("v_cvt_scalef32_f32_fp8 (byte 3)", k_sc_f32_fp8_3, 1, 1, 32, byte_of(3), fp8_value, f32_bits);
+    widen_check("v_cvt_scalef32_f32_bf8 (byte 2)", k_sc_f32_bf8_2, 1, 1, 32, byte_of(2), bf8_value, f32_bits);
+    widen_check("v_cvt_scalef32_pk_f16_fp8 (high half)", k_sc_pk_f16_fp8_1, 1, 2, 16, pair_of(1), fp8_value, f16_bits);
+    widen_check("v_cvt_scalef32_pk_f16_bf8 (low half)", k_sc_pk_f16_bf8_0, 1, 2, 16, pair_of(0), bf8_value, f16_bits);
+    widen_check("v_cvt_scalef32_pk_bf16_fp8 (low half)", k_sc_pk_bf16_fp8_0, 1, 2, 16, pair_of(0), fp8_value, bf16_bits);
+    widen_check("v_cvt_scalef32_pk_bf16_bf8 (high half)", k_sc_pk_bf16_bf8_1, 1, 2, 16, pair_of(1), bf8_value, bf16_bits);
+    // 4-bit sources: the byte OPSEL[1:0] names, low nibble first.
+    const auto nib_of = [](int byte) { return [byte](const uint32_t* w, int i) { return (w[0] >> (8 * byte + 4 * i)) & 0xF; }; };
+    widen_check("v_cvt_scalef32_pk_f32_fp4 (byte 0)", k_sc_pk_f32_fp4_0, 1, 2, 32, nib_of(0), fp4_value, f32_bits);
+    widen_check("v_cvt_scalef32_pk_f32_fp4 (byte 2)", k_sc_pk_f32_fp4_2, 1, 2, 32, nib_of(2), fp4_value, f32_bits);
+    widen_check("v_cvt_scalef32_pk_f16_fp4 (byte 3)", k_sc_pk_f16_fp4_3, 1, 2, 16, nib_of(3), fp4_value, f16_bits);
+    widen_check("v_cvt_scalef32_pk_bf16_fp4 (byte 1)", k_sc_pk_bf16_fp4_1, 1, 2, 16, nib_of(1), fp4_value, bf16_bits);
+    // 6-bit sources: 32 values of six bits, the first in the lowest bits of the first register.
+    const auto six_of = [](const uint32_t* w, int i) {
+      const int at = 6 * i;
+      uint64_t v = w[at / 32];
+      if (at % 32 + 6 > 32) v |= static_cast<uint64_t>(w[at / 32 + 1]) << 32;
+      return static_cast<uint32_t>(v >> (at % 32)) & 0x3F;
+    };
+    widen_check("v_cvt_scalef32_pk32_f32_fp6", k_sc_pk32_f32_fp6, 6, 32, 32, six_of, fp6_value, f32_bits);
+    widen_check("v_cvt_scalef32_pk32_f32_bf6", k_sc_pk32_f32_bf6, 6, 32, 32, six_of, bf6_value, f32_bits);
+    widen_check("v_cvt_scalef32_pk32_f16_fp6", k_sc_pk32_f16_fp6, 6, 32, 16, six_of, fp6_value, f16_bits);
+    widen_check("v_cvt_scalef32_pk32_bf16_fp6", k_sc_pk32_bf16_fp6, 6, 32, 16, six_of, fp6_value, bf16_bits);
+    widen_check("v_cvt_scalef32_pk32_f16_bf6", k_sc_pk32_f16_bf6, 6, 32, 16, six_of, bf6_value, f16_bits);
+    widen_check("v_cvt_scalef32_pk32_bf16_bf6", k_sc_pk32_bf16_bf6, 6, 32, 16, six_of, bf6_value, bf16_bits);
+    // The scale as an inline constant (2.0: exponent field 128, scale 2^1); lane l's scale operand is ignored.
+    {
+      std::vector<uint32_t> a(64), b(64, 0);
+      for (auto& x : a) x = next_random();
+      const auto out = run_words(k_sc_pk_f32_fp8_two, a, b, 128);
+      int wrong = 0;
+      for (int l = 0; l < 64; ++l)
+        for (int i = 0; i < 2; ++i) {
+          const double v = fp8_value((a[l] >> (8 * i)) & 0xFF);
+          if (std::isnan(v) ? !nan_bits(out[2 * l + i], 32) : out[2 * l + i] != f32_bits(2.0 * v)) ++wrong;
+        }
+      report("v_cvt_scalef32_pk_f32_fp8 with the inline constant 2.0 as the scale", wrong, 128);
+    }
+  }
+#endif
+
+
+  {
+    // Two finite halves that overflow, and a true infinity.
+    const uint32_t inf16 = 0x7C00u;
+    cases("v_add_f16 overflowing, MODE.FP16_OVFL set: clamped to the largest half", k_add_f16_ovfl1,
+          {{h(60000.0f), h(60000.0f), 0, 0x7BFFu}, {h(-60000.0f), h(-60000.0f), 0, 0xFBFFu}, {inf16, h(1.0f), 0, inf16}, {h(1.0f), h(2.0f), 0, h(3.0f)}}, 0xFFFF);
+    cases("v_add_f16 overflowing, MODE.FP16_OVFL clear: an infinity", k_add_f16_ovfl0, {{h(60000.0f), h(60000.0f), 0, inf16}, {h(-60000.0f), h(-60000.0f), 0, 0xFC00u}}, 0xFFFF);
+    // F32 to FP8/BF8 (the low byte of the pair; S1 is the same value). Table 7.3: Inf and a value past the format's largest are NaN (fp8) or Inf (bf8)
+    // with FP16_OVFL clear, and +-max with it set; a NaN stays a NaN. gfx942's 8-bit floats are the FNUZ ones: largest 240
+    // (0x7F) and 57344 (0x7F), their NaN 0x80, and no infinity.
+    const uint32_t inf = fb(INFINITY), ninf = fb(-INFINITY), big = fb(1.0e9f), nbig = fb(-1.0e9f), nan = 0x7FC00000u;
+#ifdef VGPU_GFX950
+    cases("v_cvt_pk_fp8_f32 with FP16_OVFL set: +-max (448)", k_pk_fp8_ovfl1, {{inf, inf, 0, 0x7E}, {ninf, ninf, 0, 0xFE}, {big, big, 0, 0x7E}, {nbig, nbig, 0, 0xFE}, {fb(448.0f), fb(448.0f), 0, 0x7E}}, 0xFF);
+    cases("v_cvt_pk_fp8_f32 with FP16_OVFL clear: NaN", k_pk_fp8_ovfl0, {{inf, inf, 0, 0x7F}, {ninf, ninf, 0, 0xFF}, {big, big, 0, 0x7F}, {nbig, nbig, 0, 0xFF}, {fb(448.0f), fb(448.0f), 0, 0x7E}}, 0xFF);
+    cases("v_cvt_pk_bf8_f32 with FP16_OVFL set: +-max (57344)", k_pk_bf8_ovfl1, {{inf, inf, 0, 0x7B}, {ninf, ninf, 0, 0xFB}, {big, big, 0, 0x7B}, {fb(57344.0f), fb(57344.0f), 0, 0x7B}}, 0xFF);
+    cases("v_cvt_pk_bf8_f32 with FP16_OVFL clear: +-Inf", k_pk_bf8_ovfl0, {{inf, inf, 0, 0x7C}, {ninf, ninf, 0, 0xFC}, {big, big, 0, 0x7C}, {fb(57344.0f), fb(57344.0f), 0, 0x7B}}, 0xFF);
+    cases("v_cvt_sr_fp8_f32 with FP16_OVFL set: +-max", k_sr_fp8_ovfl1, {{inf, 0x12345678u, 0, 0x7E}, {nbig, 0x9abcdef0u, 0, 0xFE}}, 0xFF);
+    cases("v_cvt_sr_fp8_f32 with FP16_OVFL clear: NaN", k_sr_fp8_ovfl0, {{inf, 0x12345678u, 0, 0x7F}, {nbig, 0x9abcdef0u, 0, 0xFF}}, 0xFF);
+#else
+    cases("v_cvt_pk_fp8_f32 with FP16_OVFL set: +-max (240)", k_pk_fp8_ovfl1, {{inf, inf, 0, 0x7F}, {ninf, ninf, 0, 0xFF}, {big, big, 0, 0x7F}, {nbig, nbig, 0, 0xFF}, {fb(240.0f), fb(240.0f), 0, 0x7F}}, 0xFF);
+    cases("v_cvt_pk_fp8_f32 with FP16_OVFL clear: NaN", k_pk_fp8_ovfl0, {{inf, inf, 0, 0x80}, {ninf, ninf, 0, 0x80}, {big, big, 0, 0x80}, {nbig, nbig, 0, 0x80}, {fb(240.0f), fb(240.0f), 0, 0x7F}}, 0xFF);
+    cases("v_cvt_pk_bf8_f32 with FP16_OVFL set: +-max (57344)", k_pk_bf8_ovfl1, {{inf, inf, 0, 0x7F}, {ninf, ninf, 0, 0xFF}, {big, big, 0, 0x7F}, {fb(57344.0f), fb(57344.0f), 0, 0x7F}}, 0xFF);
+    cases("v_cvt_sr_fp8_f32 with FP16_OVFL set: +-max", k_sr_fp8_ovfl1, {{inf, 0x12345678u, 0, 0x7F}, {nbig, 0x9abcdef0u, 0, 0xFF}}, 0xFF);
+    cases("v_cvt_sr_fp8_f32 with FP16_OVFL clear: NaN", k_sr_fp8_ovfl0, {{inf, 0x12345678u, 0, 0x80}, {nbig, 0x9abcdef0u, 0, 0x80}}, 0xFF);
+#endif
+#ifdef VGPU_GFX950
+    cases("v_cvt_pk_fp8_f32 of a NaN is a NaN", k_pk_fp8_ovfl1, {{nan, nan, 0, 0x7F}}, 0x7F);
+#else
+    cases("v_cvt_pk_fp8_f32 of a NaN is a NaN", k_pk_fp8_ovfl1, {{nan, nan, 0, 0x80}}, 0xFF);
+#endif
   }
 
   // Relative scalar moves.
