@@ -243,19 +243,46 @@ template <class V> bool decode(const uint8_t* raw, size_t n, cudaDataType t, std
   const bool cplx = is_complex(t);
   if (cplx && std::is_same_v<V, double>) return false;  // a complex value has no real-only form
   out->resize(n);
-  for (size_t i = 0; i < n; ++i) {
-    const uint8_t* p = raw + i * eb;
-    (*out)[i] = make_value<V>(get_part(p, t), cplx ? get_part(p + eb / 2, t) : 0.0);
-  }
+  V* o = out->data();
+  // The usual types with the type chosen once, the elements over the host's threads (they are independent); the rest one at a time.
+  vgpu::hostpar::for_range(n, 3, [&](size_t b, size_t e) {
+    if (t == CUDA_R_32F) {
+      for (size_t i = b; i < e; ++i) { float f; std::memcpy(&f, raw + i * 4, 4); o[i] = make_value<V>(f, 0.0); }
+    } else if (t == CUDA_R_64F) {
+      for (size_t i = b; i < e; ++i) { double d; std::memcpy(&d, raw + i * 8, 8); o[i] = make_value<V>(d, 0.0); }
+    } else if (t == CUDA_C_32F) {
+      for (size_t i = b; i < e; ++i) { float f[2]; std::memcpy(f, raw + i * 8, 8); o[i] = make_value<V>(f[0], f[1]); }
+    } else if (t == CUDA_C_64F) {
+      for (size_t i = b; i < e; ++i) { double d[2]; std::memcpy(d, raw + i * 16, 16); o[i] = make_value<V>(d[0], d[1]); }
+    } else {
+      for (size_t i = b; i < e; ++i) {
+        const uint8_t* p = raw + i * eb;
+        o[i] = make_value<V>(get_part(p, t), cplx ? get_part(p + eb / 2, t) : 0.0);
+      }
+    }
+  });
   return true;
 }
 template <class V> void encode(const std::vector<V>& in, cudaDataType t, uint8_t* raw) {
   const size_t eb = type_bytes(t);
   const bool cplx = is_complex(t);
-  for (size_t i = 0; i < in.size(); ++i) {
-    put_part(raw + i * eb, re(in[i]), t);
-    if (cplx) put_part(raw + i * eb + eb / 2, im(in[i]), t);
-  }
+  const V* v = in.data();
+  vgpu::hostpar::for_range(in.size(), 3, [&](size_t b, size_t e) {
+    if (t == CUDA_R_32F) {
+      for (size_t i = b; i < e; ++i) { const float f = (float)re(v[i]); std::memcpy(raw + i * 4, &f, 4); }
+    } else if (t == CUDA_R_64F) {
+      for (size_t i = b; i < e; ++i) { const double d = re(v[i]); std::memcpy(raw + i * 8, &d, 8); }
+    } else if (t == CUDA_C_32F) {
+      for (size_t i = b; i < e; ++i) { const float f[2] = {(float)re(v[i]), (float)im(v[i])}; std::memcpy(raw + i * 8, f, 8); }
+    } else if (t == CUDA_C_64F) {
+      for (size_t i = b; i < e; ++i) { const double d[2] = {re(v[i]), im(v[i])}; std::memcpy(raw + i * 16, d, 16); }
+    } else {
+      for (size_t i = b; i < e; ++i) {
+        put_part(raw + i * eb, re(v[i]), t);
+        if (cplx) put_part(raw + i * eb + eb / 2, im(v[i]), t);
+      }
+    }
+  });
 }
 
 template <class V> bool fetch_values(const void* dev, size_t n, cudaDataType t, std::vector<V>* out) {
@@ -283,7 +310,9 @@ bool fetch_indices(const void* dev, size_t n, cusparseIndexType_t t, std::vector
   if (t == CUSPARSE_INDEX_32I) {
     std::vector<int32_t> tmp(n);
     if (cudaMemcpy(tmp.data(), dev, n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-    for (size_t i = 0; i < n; ++i) (*out)[i] = tmp[i];
+    int64_t* o = out->data();
+    const int32_t* in = tmp.data();
+    vgpu::hostpar::for_range(n, 1, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) o[i] = in[i]; });
     return true;
   }
   if (t == CUSPARSE_INDEX_64I)
@@ -373,6 +402,29 @@ template <class V> bool expand_ell(const SpMat& a, Triplets<V>* t) {
       }
   }
   return true;
+}
+
+// A compressed-row matrix whose structure is sound: row offsets that start at the base, never decrease and end at nnz,
+// and column indices inside the matrix. The row-parallel products below take it as it is; anything else (a matrix the
+// triplet path would refuse, or read in a way of its own) goes the triplet way.
+template <class V> struct CsrData {
+  std::vector<int64_t> offs, cols;
+  std::vector<V> val;
+};
+template <class V> bool csr_load(const SpMat& a, CsrData<V>* c) {
+  if (a.format != CUSPARSE_FORMAT_CSR || a.nnz < 0 || a.rows < 0) return false;
+  const int64_t off = a.base == CUSPARSE_INDEX_BASE_ONE ? 1 : 0;
+  if (!fetch_indices(a.rows_ptr, (size_t)a.rows + 1, a.row_type, &c->offs)) return false;
+  if (c->offs[0] - off != 0 || c->offs[(size_t)a.rows] - off != a.nnz) return false;
+  for (size_t r = 0; r < (size_t)a.rows; ++r)
+    if (c->offs[r + 1] < c->offs[r]) return false;
+  if (!fetch_indices(a.cols_ptr, (size_t)a.nnz, a.col_type, &c->cols)) return false;
+  for (auto& v : c->offs) v -= off;
+  for (auto& v : c->cols) {
+    v -= off;
+    if (v < 0 || v >= a.cols) return false;
+  }
+  return fetch_values(a.values, (size_t)a.nnz, a.value_type, &c->val);
 }
 
 template <class V> bool expand(const SpMat& a, Triplets<V>* t) {
@@ -889,6 +941,32 @@ cusparseStatus_t spmv(cusparseHandle_t h, cusparseOperation_t op, const void* al
   const int64_t n = transposed(op) ? A.rows : A.cols;
   if (X.size != n || Y.size != m) return CUSPARSE_STATUS_INVALID_VALUE;
 
+  // A sound CSR matrix, not transposed: every row is its own chain  y[r] = ((y[r] + a*v0*x0) + a*v1*x1) + ...  in storage
+  // order, so the rows (independent) go to the host's threads and each keeps its sum in a register.
+  if (op == CUSPARSE_OPERATION_NON_TRANSPOSE) {
+    CsrData<V> csr;
+    if (csr_load(A, &csr)) {
+      std::vector<V> x, y;
+      if (!fetch_values(X.values, (size_t)n, X.type, &x)) return CUSPARSE_STATUS_INTERNAL_ERROR;
+      const V a = scalar<V>(h, alpha, ct), b = scalar<V>(h, beta, ct);
+      if (b != V(0.0)) {
+        if (!fetch_values(Y.values, (size_t)m, Y.type, &y)) return CUSPARSE_STATUS_INTERNAL_ERROR;
+        for (auto& v : y) v *= b;
+      } else {
+        y.assign((size_t)m, V(0.0));
+      }
+      const uint64_t per_row = csr.val.size() / (size_t)(A.rows ? A.rows : 1) + 2;
+      vgpu::hostpar::for_range((size_t)A.rows, per_row * 3, [&](size_t r0, size_t r1) {
+        for (size_t r = r0; r < r1; ++r) {
+          V acc = y[r];
+          for (int64_t k = csr.offs[r]; k < csr.offs[r + 1]; ++k) acc += a * conj_op(csr.val[(size_t)k], op) * x[(size_t)csr.cols[(size_t)k]];
+          y[r] = acc;
+        }
+      });
+      return store_values(Y.values, y, Y.type) ? CUSPARSE_STATUS_SUCCESS : CUSPARSE_STATUS_INTERNAL_ERROR;
+    }
+  }
+
   Triplets<V> t;
   if (!expand(A, &t)) return CUSPARSE_STATUS_INTERNAL_ERROR;
   std::vector<V> x, y;
@@ -1011,6 +1089,54 @@ cusparseStatus_t spmm_one(cusparseOperation_t opA, cusparseOperation_t opB, V al
   const int64_t bk = transposed(opB) ? B.cols : B.rows;
   const int64_t n = transposed(opB) ? B.rows : B.cols;
   if (bk != k || C.rows != m || C.cols != n) return CUSPARSE_STATUS_INVALID_VALUE;
+
+  // A sound CSR matrix, not transposed: row r of C is  c[r][j] = ((c + av0*b0) + av1*b1) + ...  over r's entries in storage order, for
+  // each column j. The rows (independent) go to the host's threads; a block of columns keeps its sums in registers.
+  if (opA == CUSPARSE_OPERATION_NON_TRANSPOSE) {
+    CsrData<V> csr;
+    if (csr_load(A, &csr)) {
+      std::vector<V> b, c;
+      if (!fetch_values(B.values, dn_elems(B), B.type, &b)) return CUSPARSE_STATUS_INTERNAL_ERROR;
+      if (be != V(0.0)) {
+        if (!fetch_values(C.values, dn_elems(C), C.type, &c)) return CUSPARSE_STATUS_INTERNAL_ERROR;
+        for (auto& v : c) v *= be;
+      } else {
+        c.assign(dn_elems(C), V(0.0));
+      }
+      const size_t nnz = csr.val.size();
+      std::vector<V> av(nnz);
+      vgpu::hostpar::for_range(nnz, 4, [&](size_t e0, size_t e1) { for (size_t e = e0; e < e1; ++e) av[e] = al * conj_op(csr.val[e], opA); });
+      // Columns j are taken in blocks: 8 together where B(., j) is contiguous in j, else one at a time (its column of B stays in
+      // the cache while the rows' entries go by). A block's sums are constants in size, so they stay in registers.
+      const bool contiguous_j = (B.order == CUSPARSE_ORDER_ROW) != transposed(opB);
+      const bool tb = transposed(opB);
+      const uint64_t per_row = (nnz / (size_t)(A.rows ? A.rows : 1) + 2) * static_cast<uint64_t>(n) * 2;
+      auto block = [&](auto jb_tag, size_t r0, size_t r1, int64_t j0) {
+        constexpr int JB = decltype(jb_tag)::value;
+        for (size_t r = r0; r < r1; ++r) {
+          V acc[JB];
+          for (int q = 0; q < JB; ++q) acc[q] = c[dn_index(C, (int64_t)r, j0 + q)];
+          for (int64_t k = csr.offs[r]; k < csr.offs[r + 1]; ++k) {
+            const int64_t cc = csr.cols[(size_t)k];
+            const V a_ = av[(size_t)k];
+            for (int q = 0; q < JB; ++q) {
+              const int64_t j = j0 + q;
+              const size_t bi = tb ? dn_index(B, j, cc) : dn_index(B, cc, j);
+              acc[q] += a_ * conj_op(b[bi], opB);
+            }
+          }
+          for (int q = 0; q < JB; ++q) c[dn_index(C, (int64_t)r, j0 + q)] = acc[q];
+        }
+      };
+      vgpu::hostpar::for_range((size_t)A.rows, per_row, [&](size_t r0, size_t r1) {
+        int64_t j0 = 0;
+        if (contiguous_j)
+          for (; j0 + 8 <= n; j0 += 8) block(std::integral_constant<int, 8>{}, r0, r1, j0);
+        for (; j0 < n; ++j0) block(std::integral_constant<int, 1>{}, r0, r1, j0);
+      });
+      return store_values(C.values, c, C.type) ? CUSPARSE_STATUS_SUCCESS : CUSPARSE_STATUS_INTERNAL_ERROR;
+    }
+  }
 
   Triplets<V> t;
   if (!expand(A, &t)) return CUSPARSE_STATUS_INTERNAL_ERROR;

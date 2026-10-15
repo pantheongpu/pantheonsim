@@ -31,6 +31,7 @@ template <> inline cuDoubleComplex from_cd<cuDoubleComplex>(cd v) { return make_
 template <> inline float from_cd<float>(cd v) { return static_cast<float>(v.real()); }
 template <> inline double from_cd<double>(cd v) { return v.real(); }
 template <class T> using Real = std::conditional_t<std::is_same_v<T, cuComplex>, float, double>;
+template <class T> constexpr bool kRealType = std::is_same_v<T, float> || std::is_same_v<T, double>;
 
 template <class T> std::vector<cd> load_c(const T* dev, size_t n) {
   const auto raw = fetch<T>(dev, n);
@@ -60,6 +61,81 @@ vgpu_la::Op to_op(cublasOperation_t t) {
 // element (i, j) of op(A)
 inline cd opel(const CMat& a, vgpu_la::Op op, int i, int j) {
   return op == vgpu_la::Op::N ? a(i, j) : vgpu_la::apply_op(a(j, i), op);
+}
+
+// ---- the sums of products, on the host's vector kernels ----
+//
+// Most of the work of the matrix routines below is one loop shape: for every output (i, j), in std::complex<double>,
+//     s = 0;  for p in 0 .. k-1:  s += x(i, p) * y(p, j);
+// dot_sums() computes all those s with host_gemm.hpp's kernels, each output's chain of products and sums the same
+// (see COps in host_gemm_impl.inc). It does so only when it can be sure the answer is the loops' bit for bit:
+//  * every x and y that goes in is finite. A complex product with an infinity in it can come out NaN in both parts,
+//    which the complex multiply then repairs by __muldc3's rule; the kernels do not have that rule.
+//  * every sum that comes out is finite. With finite operands no product can be NaN unless an earlier one overflowed
+//    to an infinity, and an infinity (or NaN) in a running sum stays one: so if no sum is infinite or NaN, none
+//    of the products or partial sums was, and no repair could have happened.
+// Otherwise it returns false and the caller runs its own loops, which are the reference. For the real routines
+// (Real = true), where the loops carry an imaginary part that is always zero, only the real part is summed: it is
+// the same chain, since a product's real part is x*y - 0*0 and subtracting a zero changes nothing that a sum
+// that starts at +0 can show.
+// tri (as in hostgemm::gemm): 1 asks for the outputs with i >= j only, 2 for i <= j; the others come back zero.
+constexpr uint64_t kDotSumsMin = 8192;   // m*n*k below this: the loops are cheaper than the blocked kernels
+
+// The operands x(i, p) and y(p, j) are read by the kernels a panel at a time through the accessors given (no copy of either
+// is made, as in host_gemm.hpp's loaders); each one that is read is checked for finiteness as it goes. The sums land in s
+// (only those of the outputs wanted; the rest are zero).
+template <bool Real, class FX, class FY>
+bool dot_sums(int m, int n, int k, FX&& x, FY&& y, int tri, std::vector<cd>& s) {
+  if (m <= 0 || n <= 0 || k <= 0) return false;
+  if (static_cast<uint64_t>(m) * static_cast<uint64_t>(n) * static_cast<uint64_t>(k) < kDotSumsMin) return false;
+  const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
+  std::atomic<bool> bad{false};
+  auto wanted = [&](int64_t i, int64_t j) { return tri == 0 || (tri == 1 ? i >= j : i <= j); };
+  s.assign(mn, cd(0));
+  cd* const out = s.data();
+  if constexpr (Real) {
+    auto ldx = [&](int64_t, int64_t i, int64_t p) -> double {
+      const double v = x(static_cast<int>(i), static_cast<int>(p)).real();
+      if (!std::isfinite(v)) bad.store(true, std::memory_order_relaxed);
+      return v;
+    };
+    auto ldy = [&](int64_t, int64_t j, int64_t p) -> double {
+      const double v = y(static_cast<int>(p), static_cast<int>(j)).real();
+      if (!std::isfinite(v)) bad.store(true, std::memory_order_relaxed);
+      return v;
+    };
+    vgpu::hostgemm::gemm_with<double>(
+        false, false, m, n, k, ldx, m, ldy, k,
+        [&](int64_t i, int64_t j, double acc) {
+          if (wanted(i, j)) out[static_cast<size_t>(i) + static_cast<size_t>(j) * m] = cd(acc, 0.0);
+        },
+        vgpu::hostgemm::Isa::Auto, 0, tri);
+  } else {
+    auto ldx = [&](int64_t i, int64_t p) -> vgpu::hostgemm::CPair {
+      const cd v = x(static_cast<int>(i), static_cast<int>(p));
+      if (!std::isfinite(v.real()) || !std::isfinite(v.imag())) bad.store(true, std::memory_order_relaxed);
+      return {v.real(), v.imag()};
+    };
+    auto ldy = [&](int64_t j, int64_t p) -> vgpu::hostgemm::CPair {
+      const cd v = y(static_cast<int>(p), static_cast<int>(j));
+      if (!std::isfinite(v.real()) || !std::isfinite(v.imag())) bad.store(true, std::memory_order_relaxed);
+      return {v.real(), v.imag()};
+    };
+    vgpu::hostgemm::cgemm_with(
+        m, n, k, ldx, ldy,
+        [&](int64_t i, int64_t j, double re, double im) {
+          if (wanted(i, j)) out[static_cast<size_t>(i) + static_cast<size_t>(j) * m] = cd(re, im);
+        },
+        tri);
+  }
+  if (bad.load()) return false;
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      if (!wanted(i, j)) continue;
+      const cd v = out[static_cast<size_t>(i) + static_cast<size_t>(j) * m];
+      if (!std::isfinite(v.real()) || !std::isfinite(v.imag())) return false;
+    }
+  return true;
 }
 
 // Runs `body` now, or records it when the handle's stream is capturing. The
@@ -97,10 +173,14 @@ template <class T> void store_vec(T* x, int n, int inc, const std::vector<cd>& v
 // back as it was; its old values are then never used.
 void cgemm_mat(vgpu_la::Op oa, vgpu_la::Op ob, int m, int n, int k, cd alpha, const CMat& a, const CMat& b, cd beta,
                CMat& c) {
+  std::vector<cd> sums;
+  const bool fast = dot_sums<false>(
+      m, n, k, [&](int i, int p) { return opel(a, oa, i, p); }, [&](int p, int j) { return opel(b, ob, p, j); }, 0, sums);
   for (int j = 0; j < n; ++j)
     for (int i = 0; i < m; ++i) {
       cd s = 0;
-      for (int p = 0; p < k; ++p) s += opel(a, oa, i, p) * opel(b, ob, p, j);
+      if (fast) s = sums[static_cast<size_t>(i) + static_cast<size_t>(j) * m];
+      else for (int p = 0; p < k; ++p) s += opel(a, oa, i, p) * opel(b, ob, p, j);
       c(i, j) = beta == cd(0) ? alpha * s : alpha * s + beta * c(i, j);
     }
 }
@@ -236,10 +316,16 @@ cublasStatus_t chemm(cublasHandle_t h, bool hermitian, cublasSideMode_t side, cu
     // C is read even when beta is 0, so the padding between its columns is
     // written back as it was; its old values are then never used.
     CMat c = load_mat(C, ldc, n, m);
+    std::vector<cd> sums;
+    const bool fast = left ? dot_sums<kRealType<T>>(
+                                 m, n, m, [&](int i, int p) { return a(i, p); }, [&](int p, int j) { return b(p, j); }, 0, sums)
+                           : dot_sums<kRealType<T>>(
+                                 m, n, n, [&](int i, int p) { return b(i, p); }, [&](int p, int j) { return a(p, j); }, 0, sums);
     for (int j = 0; j < n; ++j)
       for (int i = 0; i < m; ++i) {
         cd s = 0;
-        if (left) for (int p = 0; p < m; ++p) s += a(i, p) * b(p, j);
+        if (fast) s = sums[static_cast<size_t>(i) + static_cast<size_t>(j) * m];
+        else if (left) for (int p = 0; p < m; ++p) s += a(i, p) * b(p, j);
         else for (int p = 0; p < n; ++p) s += b(i, p) * a(p, j);
         c(i, j) = b_ == cd(0) ? a_ * s : a_ * s + b_ * c(i, j);
       }
@@ -275,15 +361,18 @@ cublasStatus_t chemv(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, in
 // alpha op(A) op(A)^T + beta C (syrk). Only C's `uplo` triangle is written.
 // Any operation but N reads A transposed: herk takes T as C, syrk C as T, as
 // the card does.
-void cherk_mat(bool hermitian, bool lower, bool trans, int n, int k, cd alpha, const CMat& a, cd beta, CMat& c) {
+void cherk_mat(bool hermitian, bool lower, bool trans, int n, int k, cd alpha, const CMat& a, cd beta, CMat& c,
+               bool real = false) {
+  auto xf = [&](int i, int p) -> cd { return trans ? (hermitian ? std::conj(a(p, i)) : a(p, i)) : a(i, p); };
+  auto yf = [&](int p, int j) -> cd { return trans ? a(p, j) : (hermitian ? std::conj(a(j, p)) : a(j, p)); };
+  std::vector<cd> sums;
+  const bool fast = real ? dot_sums<true>(n, n, k, xf, yf, lower ? 1 : 2, sums)
+                         : dot_sums<false>(n, n, k, xf, yf, lower ? 1 : 2, sums);
   for (int j = 0; j < n; ++j)
     for (int i = lower ? j : 0; i < (lower ? n : j + 1); ++i) {
       cd s = 0;
-      for (int p = 0; p < k; ++p) {
-        const cd x = trans ? (hermitian ? std::conj(a(p, i)) : a(p, i)) : a(i, p);
-        const cd y = trans ? a(p, j) : (hermitian ? std::conj(a(j, p)) : a(j, p));
-        s += x * y;
-      }
+      if (fast) s = sums[static_cast<size_t>(i) + static_cast<size_t>(j) * n];
+      else for (int p = 0; p < k; ++p) s += xf(i, p) * yf(p, j);
       c(i, j) = beta == cd(0) ? alpha * s : alpha * s + beta * c(i, j);
       if (hermitian && i == j) c(i, j) = c(i, j).real();
     }
@@ -309,7 +398,7 @@ cublasStatus_t cherk(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, cu
     const bool trans = t != CUBLAS_OP_N;
     const CMat a = load_mat(A, lda, trans ? n : k, trans ? k : n);
     CMat c = load_mat(C, ldc, n, n);
-    cherk_mat(hermitian, uplo == CUBLAS_FILL_MODE_LOWER, trans, n, k, sc(al), a, sc(be), c);
+    cherk_mat(hermitian, uplo == CUBLAS_FILL_MODE_LOWER, trans, n, k, sc(al), a, sc(be), c, kRealType<T>);
     store_mat(C, c, n, n);
     return CUBLAS_STATUS_SUCCESS;
   });
@@ -366,17 +455,26 @@ cublasStatus_t csyr2k(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, c
     auto op = [&](cd v) { return hermitian ? std::conj(v) : v; };
     auto el = [&](const CMat& m, int i, int p) { return trans ? m(p, i) : m(i, p); };   // op(M)(i, p)
     CMat c = load_mat(C, ldc, n, n);
+    // With OP_C (her2k) the first factor is the conjugated one.
+    const bool cfirst = trans && hermitian;
+    auto x1 = [&](int i, int p) -> cd { return cfirst ? std::conj(el(a, i, p)) : el(a, i, p); };
+    auto y1 = [&](int p, int j) -> cd { return cfirst ? el(b, j, p) : op(el(b, j, p)); };
+    auto x2 = [&](int i, int p) -> cd { return cfirst ? std::conj(el(b, i, p)) : el(b, i, p); };
+    auto y2 = [&](int p, int j) -> cd { return cfirst ? el(a, j, p) : op(el(a, j, p)); };
+    std::vector<cd> sums1, sums2;
+    const int tri = lower ? 1 : 2;
+    const bool fast = kRealType<T> ? (dot_sums<true>(n, n, k, x1, y1, tri, sums1) && dot_sums<true>(n, n, k, x2, y2, tri, sums2))
+                                   : (dot_sums<false>(n, n, k, x1, y1, tri, sums1) && dot_sums<false>(n, n, k, x2, y2, tri, sums2));
     for (int j = 0; j < n; ++j)
       for (int i = lower ? j : 0; i < (lower ? n : j + 1); ++i) {
         cd s1 = 0, s2 = 0;
-        for (int p = 0; p < k; ++p) {
-          // With OP_C (her2k) the first factor is the conjugated one.
-          if (trans && hermitian) {
-            s1 += std::conj(el(a, i, p)) * el(b, j, p);
-            s2 += std::conj(el(b, i, p)) * el(a, j, p);
-          } else {
-            s1 += el(a, i, p) * op(el(b, j, p));
-            s2 += el(b, i, p) * op(el(a, j, p));
+        if (fast) {
+          s1 = sums1[static_cast<size_t>(i) + static_cast<size_t>(j) * n];
+          s2 = sums2[static_cast<size_t>(i) + static_cast<size_t>(j) * n];
+        } else {
+          for (int p = 0; p < k; ++p) {
+            s1 += x1(i, p) * y1(p, j);
+            s2 += x2(i, p) * y2(p, j);
           }
         }
         const cd v = a_ * s1 + op(a_) * s2;
@@ -449,10 +547,16 @@ cublasStatus_t ctrmm(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t u
       return vgpu_la::apply_op(a(r, c), op);
     };
     CMat c = load_mat(C, ldc, n, m);  // for the padding between columns
+    std::vector<cd> sums;
+    const bool fast = left ? dot_sums<kRealType<T>>(
+                                 m, n, m, [&](int i, int p) { return tri(i, p); }, [&](int p, int j) { return b(p, j); }, 0, sums)
+                           : dot_sums<kRealType<T>>(
+                                 m, n, n, [&](int i, int p) { return b(i, p); }, [&](int p, int j) { return tri(p, j); }, 0, sums);
     for (int j = 0; j < n; ++j)
       for (int i = 0; i < m; ++i) {
         cd s = 0;
-        if (left) for (int p = 0; p < m; ++p) s += tri(i, p) * b(p, j);
+        if (fast) s = sums[static_cast<size_t>(i) + static_cast<size_t>(j) * m];
+        else if (left) for (int p = 0; p < m; ++p) s += tri(i, p) * b(p, j);
         else for (int p = 0; p < n; ++p) s += b(i, p) * tri(p, j);
         c(i, j) = a_ * s;
       }

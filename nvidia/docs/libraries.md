@@ -688,6 +688,56 @@ as `host_gemm.hpp` packs it, through a *loader* (`gemm_with`), and cuBLASLt's su
 `tests/unit/test_cublaslt_matmul.cpp` and `test_cublas_gemmex_mixed.cpp` check the bits against the plain loops and
 count the heap a 2048-cubed call holds at its peak.
 
+### What round 8 added, and what it measured
+
+The same rule, applied to more of the host code. Each row is one call on this machine, one host thread (`VGPU_THREADS=1`) unless the
+row says threads, the fastest of three alternating runs against a build of `main` without these changes (13.0, Release, no LTO), results
+compared bit for bit (the digest of the output equal in every row). Both builds were measured with other jobs running on the machine
+(load average 6 to 15 on 20 CPUs), so read a ratio of 1.0x to 1.1x as noise, and the codec rows below were measured earlier, on a
+quieter machine, against the same sources (the files they involve are not touched by anything that landed since).
+
+The cuBLAS routines read their operands as the loaders of `host_gemm.hpp` do: the complex kernels take a loader per operand
+(`cgemm_with`, which hands each element as a `CPair`), a panel at a time, so the real and imaginary planes of a whole operand are never
+made; `tests/unit/test_cublas_complex_heap.cpp` bounds the heap a 512-cubed `Zgemm` and a 768 x 512 `Dsyrk` hold.
+
+| call | before | after | how |
+| --- | --- | --- | --- |
+| `cublasCgemm` / `Zgemm` 384x384x384 | 78-106 ms | 18-19.5 ms | `cgemm_with`: complex products in double, the real and imaginary parts in separate panels, the same four products and two sums per term, no fusion |
+| `Cherk`, `Csyrk`, `Cher2k`, `Csyr2k`, `Chemm`, `Csymm`, `Ctrmm` (and `Z`) | 26-155 ms | 10-23 ms | the same kernel, with the triangle of the output asked for (blocks wholly outside it are not computed) |
+| `Ssyrk`, `Ssyr2k`, `Ssymm`, `Strmm` (and `D`) | 28-157 ms | 3.9-9.5 ms | these routines shared the complex code with a zero imaginary part; they now take the real product |
+| `Ctrsm` / `Strsm` 384x384 | 39.5 / 14.2 ms | 9.0 / 2.4 ms | `host_trsm.hpp`: the right-hand sides along the vector lanes |
+| `Sgemv` 2048x2048 | 21 ms | 7.0 ms | the host product with one column |
+| `cusolverDnDgetrf` / `Sgetrf` n = 1000 | 87 / 82 ms | 34 / 28 ms (26 / 23 ms on 20 threads) | a panel at a time: the panel's own columns as before, the rows of U by `host_trsm.hpp`, the rest of the matrix by a product whose sums start from the old values (`c + (-a)*b` is `c - a*b` to the bit) |
+| `Dgeqrf` / `Sgeqrf` n = 1000 | 120 / 117 ms | 86 / 82 ms (30 / 27 ms on 20 threads) | the reflectors of a panel applied to the columns to its right with the columns as lanes (`host_trsm.hpp`, `reflect`) |
+| `Dorgqr` n = 1000 | 181 ms | 114 ms (20 ms on 20 threads) | the same |
+| cuSOLVER `potrf`, n = 1000, lower / upper (double; float through it) | 31 / 41 ms (float 31 / 38) | 20 / 21 ms (float 18 / 20); on 20 threads 34 / 42 against 18 / 17.5 ms | a panel of 64 columns at a time, the rest of the matrix updated by the product with the sums starting from the old values (only the triangle that is kept); from n = 256 (lower) and n = 512 (upper); a matrix that is not positive definite starts over from a copy through the plain loops, so the columns it leaves are the loops' |
+| `cusolverDnZgesvd` / `Zheevd`, n = 128 | 130 / 48 ms (and 126 / 135 ms in other builds of the same source) | 57-60 / 58-60 ms | the plane rotation of the Jacobi sweeps written on the parts of the numbers (`rotate_pair` in `complex_linalg.hpp`): with the operators the compiler stored the two halves of each element and loaded both as one 16-byte vector, a store-forwarding stall, in some copies of the loop and not others (hence the different timings for the same source); the products and sums are the same ones, in the same order |
+| cuDNN activation, softmax, pooling, batch normalization, add and op tensor, 800k elements, 20 threads | 3-15 ms | forward activation 1.8-3.2x, backward 1.1-2.0x, softmax 1.4-2.0x, pooling 1.1-1.7x, batch norm 1.2-1.4x, op tensor 1.0-1.6x (one thread: unchanged) | the mode chosen once and the elements spread over threads; the graph runner's pointwise, band-mask, offset and broadcast walks in pieces |
+| cuDNN SDPA backward (composite graph, b 2, h 8, s 256, d 64), 20 threads | 350 ms | 115-135 ms | broadcast index without a division per element, batched products over threads, pointwise and band-mask loops in pieces (measured before the rebase, as the codecs) |
+| cuDNN filter gradient of a depthwise convolution (3x3 / 5x5 / 7x7) | 43 / 39 / 8.3 ms | 34 / 24 / 5.5 ms | the taps of a filter row as lanes (`host_conv_impl.inc`, `filt_taps`); the rest of the call is the transfer of the tensors |
+| cuSPARSE SpMV, CSR, 50000 x 50000, 2M entries | 43 ms | 26 ms | row by row, each row's sum in a register; typed conversions |
+| cuSPARSE SpMM, same matrix, 32 columns, row-major / column-major B | 183 / 171 ms | 75 / 153 ms | the same, with a block of columns together where B is contiguous across them |
+| cuRAND quasirandom (Sobol') uniforms, 8M | 392 ms (412 on 20 threads) | 15.7 ms (11.7 on 20 threads) | a point is the previous one XOR one direction vector; pieces over threads |
+| cuRAND log-normal, 8M | 102 ms (51 on 20 threads) | 97 ms (21 on 20 threads) | the exp in the pass that makes the normals |
+| NPP 8-bit add with a scale factor (1280x720x3) | 28.5 ms | 6.3 ms | the factor taken once, rounding without a library call |
+| NPP `FilterBox` 5x5 (1280x720) | 11.6 ms | 4.2 ms | running sums along rows then columns (the sums are integers) |
+| HEVC encoder, 640x360, six pictures with two reference pictures and B pictures | 2.1 s | 1.2 s | AVX2 butterflies for the 8, 16 and 32 point transforms (eight lines at a time, zero column groups skipped in the inverse), AVX2 interpolation (16-bit sums where they cannot overflow), SAD with `psadbw`, prediction read in place |
+| HEVC decoder, same stream | 12.5 ms per picture | 4.9 ms per picture | the same inverse transform |
+| H.264 encoder, same size, High / Baseline | 552 / 268 ms | 403 / 197 ms | the sample positions of a block chosen once, not per sample; AVX2 SAD |
+
+`video_simd.hpp` holds the AVX2 codec kernels (compiled under a target pragma and called after a CPU check, like the matrix product), and
+`tests/unit/test_video_simd.cpp` compares each with the scalar loops over random and extreme inputs. In the cuBLAS routines a result is
+computed by the new kernels only when it is certain to be the loops' answer: with an infinity or a NaN among the operands, or a sum that
+overflows to one, the std::complex<double> multiply's repair of a NaN product comes into play, which the kernels do not have, and the routine
+runs its old loops (`blas_host_sums.cu` checks this with operands that hold infinities, NaNs and values that overflow). The NaN sign and
+payload when two NaNs meet is the one thing not fixed, as before.
+
+What stayed as it was, measured on this machine and not worth the change: the Jacobi eigen- and singular value solvers of cuSOLVER (`syevd`,
+`gesvd`, `gesvdj`, 42-46 ms at n = 200; each rotation depends on the last in the two-sided method, so neither the rotations nor the order of
+their updates can change; for the complex ones only the plane rotation was rewritten, see the table), the level-2 routines of cuBLAS apart from `gemv` (their time is the transfer and conversion of the matrix), cuDNN's
+tensor transfers (a copy out of device memory, a conversion to double and back make up 50% of a depthwise convolution), the H.264 and MPEG-2
+decoders (entropy decoding is 24% of the first and cannot be split), NPP's resize, warp, threshold and morphology, and nvJPEG's encoder.
+
 ## Verified against real hardware
 
 `nvidia/tests/conformance/run_conformance.sh` compiles each test once, runs it against

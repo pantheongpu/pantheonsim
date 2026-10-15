@@ -1309,12 +1309,15 @@ target_sources(test_h264_decode PRIVATE nvidia/src/h264_decode.cpp nvidia/src/h2
 target_compile_definitions(test_h264_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The host matrix product behind cuBLAS and cuBLASLt, bit for bit against the plain loops it replaced.
 vgpu_unit_test(test_host_gemm nvidia/tests/unit/test_host_gemm.cpp)
+vgpu_unit_test(test_host_trsm nvidia/tests/unit/test_host_trsm.cpp)
 # The host convolution behind cuDNN and the host FFT behind cuFFT, likewise.
 vgpu_unit_test(test_host_conv nvidia/tests/unit/test_host_conv.cpp)
 vgpu_unit_test(test_host_fft nvidia/tests/unit/test_host_fft.cpp)
 # The dense factorizations behind cuSOLVER and the JPEG transform and colour conversion behind nvJPEG, likewise.
 vgpu_unit_test(test_host_dense nvidia/tests/unit/test_host_dense.cpp)
 vgpu_unit_test(test_host_jpeg nvidia/tests/unit/test_host_jpeg.cpp)
+# The AVX2 kernels of the video codecs, against the scalar loops they stand in for.
+vgpu_unit_test(test_video_simd nvidia/tests/unit/test_video_simd.cpp)
 # The HEVC decoder and parser behind NVDEC, against the CRC-32 of every frame an RTX 3060 displayed.
 vgpu_unit_test(test_hevc_decode nvidia/tests/unit/test_hevc_decode.cpp)
 target_sources(test_hevc_decode PRIVATE nvidia/src/hevc_decode.cpp nvidia/src/hevc_parser.cpp nvidia/src/hevc_syntax.cpp nvidia/src/hevc_stream.cpp)
@@ -1983,6 +1986,14 @@ if(TARGET vgpucublaslt)
   add_test(NAME test_cublaslt_matmul COMMAND test_cublaslt_matmul)
   set_tests_properties(test_cublaslt_matmul PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1;VGPU_THREADS=2" TIMEOUT 600)
 endif()
+# The complex and symmetric cuBLAS routines on the blocked kernels: the heap they hold (no planar copies of the operands).
+if(TARGET vgpucublas)
+  add_executable(test_cublas_complex_heap nvidia/tests/unit/test_cublas_complex_heap.cpp)
+  target_link_libraries(test_cublas_complex_heap PRIVATE vgpucublas vgpucudart)
+  target_include_directories(test_cublas_complex_heap PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cublas_complex_heap COMMAND test_cublas_complex_heap)
+  set_tests_properties(test_cublas_complex_heap PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;VGPU_THREADS=2" TIMEOUT 600)
+endif()
 # cublasGemmEx with half, bfloat16 and int8 operands, likewise.
 if(TARGET vgpucublas)
   add_executable(test_cublas_gemmex_mixed nvidia/tests/unit/test_cublas_gemmex_mixed.cpp)
@@ -2107,12 +2118,12 @@ if(TARGET vgpucublas)
   # cuBLAS's factorizations and batched solves (torch.linalg).
   foreach(_check IN ITEMS "fft_layouts:cufft" "fft_callbacks:cufft" "solver_paths:cusolver:cublas"
                           "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse"
-                          "sparse_paths:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
+                          "sparse_paths:cusparse" "sparse_host_products:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
                           "lt_paths:cublasLt" "lt_epilogue_paths:cublasLt" "lt_blockscaled_paths:cublasLt"
                           "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
-                          "blas_level23_paths:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
+                          "blas_level23_paths:cublas" "blas_host_sums:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
                           "blas_batched_paths:cublas" "blas_64_paths:cublas" "blas_legacy_paths:cublas"
-                          "rand_paths:curand" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
+                          "rand_paths:curand" "rand_host_fill:curand" "npp_host_ops:nppc:nppial:nppif" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
                           "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvcomp_streaming:nvcomp" "nvcomp_cpu:nvcomp_cpu:nvcomp"
                           "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
@@ -2120,7 +2131,7 @@ if(TARGET vgpucublas)
                           "sparse_tridiag_paths:cusparse" "sparse_vector_paths:cusparse"
                           "sparse_helper_paths:cusparse" "sparselt_paths:cusparseLt" "dnn_backward:cudnn"
                           "dnn_graph:cudnn" "dnn_int8x32:cudnn" "dnn_fp8_attention:cudnn" "dnn_fp8_attention_probe:cudnn" "dnn_fp8_attention_frontend:cudnn"
-                          "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "dnn_dropout:cudnn" "dnn_rnn_dropout:cudnn"
+                          "dnn_attention:cudnn" "dnn_frontend_ops:cudnn" "dnn_dropout:cudnn" "dnn_host_ops:cudnn" "dnn_rnn_dropout:cudnn"
                           "dnn_attn_dropout:cudnn" "dnn_sdpa_mask:cudnn" "cutensor_paths:cutensor"
                           "cutensornet_paths:cutensornet" "cutensornet_state_paths:cutensornet" "cutensornet_state_gradient:cutensornet" "cutensornet_decomp_paths:cutensornet"
                           "solver_metis_paths:cusolver:cusparse"
