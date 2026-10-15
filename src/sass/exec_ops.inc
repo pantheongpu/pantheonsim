@@ -2295,7 +2295,7 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
     }
     case Op::HSETP2: case Op::HSET2: {
       // A comparison of two f16 (or bf16) lanes at once: two predicates, or a word of 16-bit masks (or 1.0s), with the operands'
-      // swizzles, |.| and - as the general rule applies them (after the conversion, and the flush if .FTZ).
+      // swizzles, |.| and - as the general rule applies them (after the conversion).
       const bool is_setp = ins.op == Op::HSETP2;
       const unsigned cmp = ins.f[0], bop = ins.f[1];
       const bool bf_result = ins.f[2] != 0, bf16 = ins.f[3] != 0, fz = ins.f[4] != 0;
