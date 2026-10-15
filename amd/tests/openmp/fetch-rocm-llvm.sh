@@ -15,7 +15,7 @@ pkgs=(r/rocm-llvm/rocm-llvm_20.0.0.25425.$v r/rocm-device-libs/rocm-device-libs_
 mkdir -p "$dir" "$dir.debs"
 for p in "${pkgs[@]}"; do
   f="$dir.debs/$(basename "$p")"
-  [[ -s $f ]] || curl -fsSL --retry 3 -o "$f" "$repo/$p"
+  [[ -s $f ]] || curl -fsSL --http1.1 --retry 5 --retry-all-errors --retry-delay 3 -o "$f" "$repo/$p"
   dpkg-deb -x "$f" "$dir"
 done
 rm -rf "$dir.debs"
