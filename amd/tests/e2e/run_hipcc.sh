@@ -185,9 +185,9 @@ expect "each gfx950 sparse product is what the ISA says" "22 of 22" \
   "$(grep -c '^[fi]32_.* cbsz:.*: 0 of [0-9]* wrong$' <<< "$out") of 22"
 
 # What the CDNA3 and CDNA4 guides say beyond the core matrix instructions
-# (hipcc/mfma_modes.cpp, gfx9_added.cpp, gfx9_semantics.cpp): the matrix modes,
+# (hipcc/mfma_modes.cpp, gfx9_added.cpp, gfx9_semantics.cpp, gfx9_decode.cpp): the matrix modes,
 # instructions the two chips added, and ALU rules that differ from older chips.
-for t in mfma_modes gfx9_added gfx9_semantics; do
+for t in mfma_modes gfx9_added gfx9_semantics gfx9_decode; do
   for chip in gfx942:mi300x gfx950:mi350x; do
     out=$(VGPU_QUIET=1 VGPU_GPU=amd/${chip#*:} LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/$t.${chip%%:*}" 2>&1)
     status=$?

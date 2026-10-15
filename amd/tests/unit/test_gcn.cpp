@@ -291,8 +291,8 @@ VTEST(a_branch_says_where_it_goes) {
 VTEST(an_instruction_this_does_not_know_is_refused_by_name) {
   std::string what;
   try {
-    // VOP3 with an opcode nothing uses.
-    const std::vector<uint8_t> code = {0x00, 0x00, 0x9b, 0xd3, 0x00, 0x00, 0x00, 0x00};
+    // VOP3P with an opcode nothing uses (0x1e: gfx950's 0x1b and 0x1c are v_pk_minimum3_f16 and v_pk_maximum3_f16).
+    const std::vector<uint8_t> code = {0x00, 0x00, 0x9e, 0xd3, 0x00, 0x00, 0x00, 0x00};
     amd::gcn::decode(code, 0, 0);
   } catch (const std::exception& e) {
     what = e.what();
