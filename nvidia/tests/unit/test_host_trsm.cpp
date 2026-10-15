@@ -216,4 +216,38 @@ VTEST(host_trsm_complex_kernel_matches_the_loops) {
   VCHECK(runs > 40);
 }
 
+// The plane rotation of the Jacobi solvers (heev, svd in complex_linalg.hpp) against the expressions it replaced:
+//     p' = c*xp - (s*conj(phase))*xq     q' = (s*phase)*xp + c*xq        (std::complex<double>)
+// over numbers that break arithmetic, columns (stride 1) and rows (stride ld), counts from 0 to 40.
+VTEST(complex_jacobi_rotation_matches_the_operators) {
+  std::mt19937_64 rng(777);
+  size_t bad = 0;
+  int runs = 0;
+  for (const Mix mix : {Mix::Plain, Mix::Zeros, Mix::Subnormal, Mix::Special, Mix::Overflow})
+    for (int count = 0; count <= 40; count += (count < 8 ? 1 : 7))
+      for (const int stride : {1, 5}) {
+        const size_t len = static_cast<size_t>(count) * stride + 1;
+        std::vector<cdbl> p(len), q(len);
+        for (auto& x : p) x = cdbl(draw(mix, rng), draw(mix, rng));
+        for (auto& x : q) x = cdbl(draw(mix, rng), draw(mix, rng));
+        const double c = draw(mix, rng), s = draw(mix, rng);
+        const cdbl phase(draw(mix, rng), draw(mix, rng));
+        for (const bool rowform : {false, true}) {
+          const cdbl m1 = rowform ? s * phase : s * std::conj(phase), m2 = rowform ? s * std::conj(phase) : s * phase;
+          auto wp = p, wq = q;
+          for (int k = 0; k < count; ++k) {
+            const cdbl xp = wp[static_cast<size_t>(k) * stride], xq = wq[static_cast<size_t>(k) * stride];
+            wp[static_cast<size_t>(k) * stride] = c * xp - m1 * xq;
+            wq[static_cast<size_t>(k) * stride] = m2 * xp + c * xq;
+          }
+          auto gp = p, gq = q;
+          vgpu_la::rotate_pair(gp.data(), gq.data(), stride, count, c, m1, m2);
+          ++runs;
+          for (size_t i = 0; i < len; ++i) bad += !same_c(gp[i], wp[i]) + !same_c(gq[i], wq[i]);
+        }
+      }
+  std::printf("  rotation: %d runs, %zu elements differ\n", runs, bad);
+  VCHECK_EQ(bad, static_cast<size_t>(0));
+}
+
 VTEST_MAIN
