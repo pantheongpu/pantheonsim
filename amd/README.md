@@ -137,10 +137,11 @@ library loads (zlib and zstd are the two methods clang defines; any other method
 were linked into, each keeping its own metadata. The stream-ordered
 allocations, pitched copies, pointer attributes and work-item-sized launches
 (`hipExtModuleLaunchKernel`) it calls are there. `tests/e2e/run_rocblas.sh`
-builds a program against rocBLAS and checks its level-1 routines and its
-float and double GEMMs -- ragged sizes, every transpose -- against the same
-arithmetic on the host; both need ROCm with rocBLAS installed and skip
-elsewhere. AMD's own rocBLAS test suite, built from ROCm 7.1's source, runs
+builds a program against rocBLAS and checks its level-1 routines, its
+float and double GEMMs -- ragged sizes, every transpose -- and its double
+triangular solves (`trsv` with a backwards stride, `trsm` from either side;
+every fill, transpose and diagonal) against the same arithmetic on the host;
+both need ROCm with rocBLAS installed and skip elsewhere. AMD's own rocBLAS test suite, built from ROCm 7.1's source, runs
 on it as well: all 162,807 of its quick float and double tests pass, each
 checked against OpenBLAS, and its half, bfloat16, int8 and FP8 GEMMs run too.
 
