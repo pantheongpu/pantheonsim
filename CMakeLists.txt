@@ -3595,3 +3595,16 @@ foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopp
     set_property(TEST ${_t} APPEND PROPERTY RESOURCE_LOCK nvcc_memory)
   endif()
 endforeach()
+# Under `ctest -j` the tests holding that lock form a chain, and the two CUTLASS
+# tests are most of it (about 1200 s and 1000 s in the build job; every other
+# test is under 120 s). ctest starts tests in cost order (by number when it has
+# no history, which a fresh CI checkout has not), so with these two last in the
+# order they would start only after everything else had finished and the
+# chain could overlap nothing. A cost starts them first: the lock chain then
+# runs beside the other tests from the first second, and the wall time is the
+# chain's rather than the sum.
+foreach(_t e2e_cutlass_hopper e2e_cutlass_gemm)
+  if(TEST ${_t})
+    set_property(TEST ${_t} PROPERTY COST 1000)
+  endif()
+endforeach()
