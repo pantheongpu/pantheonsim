@@ -1580,8 +1580,12 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
   exec::LaunchStats& st = blk.st;
   const tier::MOp* ops = tp.ops.data();
   const size_t count = code.count;
-  const bool regs_ok = tp.max_reg <= w.nregs;
+  bool regs_ok = true;
   for (bool again = false;; again = true) {   // one pass is one call of step_warp
+  // The warp's register file may have been resized since the last pass (USETMAXREG.TRY_ALLOC grows it, and a vector that grows moves):
+  // the row pointer and the check that a program's registers are inside the file are worked out again for every pass.
+  c.R = w.r.data();
+  regs_ok = tp.max_reg <= w.nregs;
   if (tier_stats_) [[unlikely]] {
     tier_stats().passes.fetch_add(1, std::memory_order_relaxed);
     if (again) tier_stats().chained.fetch_add(1, std::memory_order_relaxed);
