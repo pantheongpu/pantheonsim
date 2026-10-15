@@ -26,6 +26,8 @@ const Code* Module::code_at_linear(uint64_t addr) const {
 
 void Module::index_code() {
   code_bases.clear();
+  code_pages.clear();
+  code_page_base = 0;
   for (size_t i = 0; i < code.size(); ++i) {
     // Each section must end at or before the next one starts (an empty one ends where it starts). Then at most one
     // section holds an address, and it is the last whose base is at or below it: the scan's first match.
@@ -36,9 +38,31 @@ void Module::index_code() {
     }
     code_bases.push_back(code[i].base);
   }
+  if (code.empty()) return;
+  // The page table: every section starts on a 256-byte boundary (load() pads each to one), so a page belongs to at most
+  // one section, and an empty section owns none.
+  constexpr uint64_t kMaxPages = (uint64_t{64} << 20) / 256;
+  const uint64_t first = code.front().base, end = code.back().base + 16 * code.back().count;
+  if (end < first || (end - first + 255) / 256 > kMaxPages) return;
+  for (const Code& c : code)
+    if ((c.base - first) % 256 != 0) return;
+  code_pages.assign(static_cast<size_t>((end - first + 255) / 256), 0);
+  for (size_t i = 0; i < code.size(); ++i) {
+    const uint64_t pages = (16 * code[i].count + 255) / 256;
+    for (uint64_t k = 0; k < pages; ++k) code_pages[static_cast<size_t>((code[i].base - first) / 256 + k)] = static_cast<uint32_t>(i + 1);
+  }
+  code_page_base = first;
 }
 
 const Code* Module::code_at(uint64_t addr) const {
+  if (!code_pages.empty()) {
+    const uint64_t page = (addr - code_page_base) >> 8;
+    if (addr < code_page_base || page >= code_pages.size()) return nullptr;
+    const uint32_t idx = code_pages[static_cast<size_t>(page)];
+    if (!idx) return nullptr;
+    const Code& c = code[idx - 1];
+    return addr >= c.base && addr < c.base + 16 * c.count ? &c : nullptr;
+  }
   if (code_bases.size() != code.size() || code.empty()) return code_at_linear(addr);
   const auto it = std::upper_bound(code_bases.begin(), code_bases.end(), addr);
   if (it == code_bases.begin()) return nullptr;

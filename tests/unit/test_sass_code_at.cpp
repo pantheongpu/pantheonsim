@@ -1,8 +1,10 @@
-// Module::code_at (vgpu/sass/exec.hpp): the binary search over the code sections' start addresses against the
-// scan over the sections it replaced (code_at_linear), for every address that matters -- below the first section,
-// on and around each section's first and last byte, in the padding between sections, past the last, and at the
-// ends of the address space -- on modules shaped like the ones load() makes (consecutive 256-aligned placements,
-// empty sections included) and on ones it never makes (out of order, overlapping), which keep no index and scan.
+// Module::code_at (vgpu/sass/exec.hpp): the page table, the binary search over the sections' start addresses, and the
+// scan, against the first-match scan over the sections that code_at replaced (code_at_linear), for every address that
+// matters -- below the first section, on and around each section's first and last byte, in the padding between
+// sections, past the last, and at the ends of the address space -- on modules shaped like the ones load() makes
+// (consecutive 256-aligned placements, empty sections included, which use the page table), on ones that are in order
+// but not on 256-byte boundaries or are spread too wide (the binary search), and on ones it never makes (out of order,
+// overlapping), which keep no index and scan.
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -35,8 +37,9 @@ void add(Module& m, uint64_t base, size_t count) {
 }
 
 // Every address of interest against the scan; `indexed` is whether the module is one that keeps an index.
-void compare(const Module& m, bool indexed) {
+void compare(const Module& m, bool indexed, bool paged = false) {
   VCHECK_EQ(m.code_bases.empty(), !indexed);
+  VCHECK_EQ(m.code_pages.empty(), !paged);
   std::vector<uint64_t> probes = {0, 1, 15, 16, 0xff, 0x100, ~uint64_t{0}, ~uint64_t{0} - 1, uint64_t{1} << 63};
   for (const Code& c : m.code) {
     const uint64_t end = c.base + 16 * c.count;
@@ -76,7 +79,9 @@ VTEST(code_at_matches_the_scan_on_modules_load_places) {
       va += (16 * count + 0xff) & ~uint64_t{0xff};   // exactly load()'s placement
     }
     m.index_code();
-    compare(m, !m.code.empty());
+    // (A module with no byte of code has no page to name.)
+    const bool paged = !m.code.empty() && m.code.back().base + 16 * m.code.back().count > m.code.front().base;
+    compare(m, !m.code.empty(), paged);
   }
 }
 
@@ -85,6 +90,26 @@ VTEST(code_at_empty_module) {
   m.index_code();
   VCHECK(m.code_at(0) == nullptr);
   VCHECK(m.code_at(kBase) == nullptr);
+}
+
+// In order but off the 256-byte boundaries or spread over more than 64 MB: the binary search.
+VTEST(code_at_binary_search_for_modules_off_the_grid) {
+  Rng rng;
+  for (int iter = 0; iter < 100; ++iter) {
+    Module m;
+    uint64_t va = kBase;
+    const bool wide = iter % 2 == 1;
+    const unsigned n = 2 + static_cast<unsigned>(rng.below(30));
+    for (unsigned i = 0; i < n; ++i) {
+      const size_t count = i == 0 ? 20 : (rng.below(4) == 0 ? 0 : 1 + rng.below(300));
+      add(m, va, count);
+      va += ((16 * count + 0xff) & ~uint64_t{0xff}) + 256 * rng.below(3);   // (on the grid so far)
+      if (wide && i == 0) va += uint64_t{80} << 20;                           // (a gap that makes the window over 64 MB)
+    }
+    if (!wide) m.code.back().base += 16;   // one section off the grid
+    m.index_code();
+    compare(m, true, false);
+  }
 }
 
 // A module whose sections are out of order, overlapping, or wrapping the address space keeps no index and the

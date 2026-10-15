@@ -587,15 +587,17 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
   const uint64_t imm = static_cast<uint64_t>(op.imm);
   uint64_t addrs[32] = {};
   const uint64_t ssize = blk.shared.size();
-  bool inside = true;
+  uint64_t other = 0, highest = 0;   // (as exec_mem: the other-block bits ORed, and the highest offset)
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     uint64_t v = base ? base[l] : 0;
     if (stride) v *= stride;
     const uint64_t off = static_cast<uint32_t>(v + urv + imm);
     addrs[l] = off;
-    inside = inside && (off >> 24) == blk.rank && (off & 0xffffff) + bytes <= ssize;
+    other |= (off >> 24) ^ blk.rank;
+    highest = std::max<uint64_t>(highest, off & 0xffffff);
   }
+  const bool inside = ex == 0 || (other == 0 && highest + bytes <= ssize);
   if (!inside) {
     c.r->tier_exec_mem(blk, w, *op.ins, ex);
     return;
@@ -652,13 +654,14 @@ static void h_local(void* vc, const tier::MOp& op, Mask ex) {
   const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
   const uint64_t imm = static_cast<uint64_t>(op.imm);
   uint64_t addrs[32] = {};
-  bool inside = true;
+  uint64_t highest = 0;
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     const uint64_t off = static_cast<uint32_t>((base ? base[l] : 0) + urv + imm);
     addrs[l] = off;
-    inside = inside && off + bytes <= w.local_size;
+    highest = std::max(highest, off);
   }
+  const bool inside = ex == 0 || highest + bytes <= w.local_size;
   if (!inside) {
     c.r->tier_exec_mem(blk, w, *op.ins, ex);   // the lane that faults, and the words of the fault, are its
     return;

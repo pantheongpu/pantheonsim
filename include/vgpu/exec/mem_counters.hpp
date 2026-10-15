@@ -185,11 +185,12 @@ inline bool lane_progression(const uint64_t* addrs, uint64_t m, uint64_t margin,
 // 32 bytes: adding the width wraps, which the general loop counts as no sectors at all.
 constexpr uint64_t kSectorTop = ~uint64_t{0} - 31;
 
-// The sectors of lanes on a fixed stride (lane_progression), each lane covering `span` bytes. Four cases have a closed
+// The sectors of lanes on a fixed stride (lane_progression), each lane covering `span` bytes. Two cases have a closed
 // form:
-//  - one lane, or every lane on the same bytes (stride 0): the sectors one access touches.
-//  - the lanes' bytes end to end (stride = +-span): they cover [low, low + n * span) with no gap, whose sectors run
-//    from the first byte's to the last's.
+//  - a stride (either way) of at most the width plus 31 bytes, so that the gap between one access and the next is
+//    under a sector: the lanes' accesses cover every sector from the lowest address's to the highest access's last
+//    byte, because a sector that none of them touched would have to lie wholly inside a gap. (One lane, and every lane
+//    on the same bytes, are this with a stride of zero.)
 //  - a stride that is a multiple of 32 and at least as many sectors as one access touches: every lane touches the same
 //    number c of sectors (the same offset into the sector) and no two lanes share one, so n * c.
 // Anything else (false) goes to the counts that walk the lanes.
@@ -198,21 +199,19 @@ inline bool sectors_progression(const uint64_t* addrs, uint64_t m, uint64_t span
   int64_t s;
   unsigned lo, n;
   if (!lane_progression(addrs, m, span, s, lo, n)) return false;
-  const uint64_t a0 = addrs[lo];
-  const uint64_t one = ((a0 + span - 1) >> 5) - (a0 >> 5) + 1;   // (the sectors of the first lane's access)
-  if (s == 0) {
-    out = one;
-    return true;
-  }
+  const uint64_t a0 = addrs[lo], last = addrs[lo + n - 1];
   const uint64_t us = s < 0 ? 0 - static_cast<uint64_t>(s) : static_cast<uint64_t>(s);
-  if (us == span) {
-    const uint64_t low = s > 0 ? a0 : addrs[lo + n - 1];
-    out = ((low + uint64_t{n} * span - 1) >> 5) - (low >> 5) + 1;
+  if (us <= span + 31) {
+    const uint64_t low = s >= 0 ? a0 : last, high = s >= 0 ? last : a0;
+    out = ((high + span - 1) >> 5) - (low >> 5) + 1;
     return true;
   }
-  if ((us & 31) == 0 && us / 32 >= one) {
-    out = uint64_t{n} * one;
-    return true;
+  if ((us & 31) == 0) {
+    const uint64_t one = ((a0 + span - 1) >> 5) - (a0 >> 5) + 1;   // (the sectors of the first lane's access)
+    if (us / 32 >= one) {
+      out = uint64_t{n} * one;
+      return true;
+    }
   }
   return false;
 }

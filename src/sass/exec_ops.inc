@@ -2670,6 +2670,16 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     }
     const uint32_t* lo = &w.reg(ra, 0);
+    if (lanes == kAll) {   // a full warp (the usual case): all 32 in a counted loop, which needs no lane-by-lane bit search
+      const uint32_t mul = stride ? stride : 1;
+      if (wide) {
+        const uint32_t* hi = &w.reg(ra + 1, 0);
+        for (unsigned l = 0; l < 32; ++l) out[l] = (lo[l] | (static_cast<uint64_t>(hi[l]) << 32)) * mul + base;
+      } else {
+        for (unsigned l = 0; l < 32; ++l) out[l] = uint64_t{lo[l]} * mul + base;
+      }
+      return;
+    }
     if (wide) {
       const uint32_t* hi = &w.reg(ra + 1, 0);
       for (Mask m = lanes; m; m &= m - 1) {
@@ -2898,15 +2908,19 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // out first (they only read registers); if any lane's is another block's or out of range, the loop
         // below runs instead and finds the lane that faults, exactly as it always did.
         const uint64_t ssize = blk.shared.size();
-        bool inside = true;
         uint64_t sa[32];
         row_addresses(a, false, ur, store ? 64 : 32, ex, sa, stride);
+        // (Every lane in this block's window and its last byte inside the array: the other block's bits ORed together
+        // and the highest offset, with no branch per lane. The same test as checking each lane in turn.)
+        uint64_t other = 0, highest = 0;
         for (Mask m = ex; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint64_t off = static_cast<uint32_t>(sa[l]);
           addrs[l] = off;
-          inside = inside && (off >> 24) == blk.rank && (off & 0xffffff) + bytes <= ssize;
+          other |= (off >> 24) ^ blk.rank;
+          highest = std::max<uint64_t>(highest, off & 0xffffff);
         }
+        const bool inside = ex == 0 || (other == 0 && highest + bytes <= ssize);
         if (inside) {
           uint8_t* sh = blk.shared.data();
           const bool moved = with_lane_width(bytes, [&](auto width) {
@@ -2958,13 +2972,14 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // the loop below runs and finds the one that faults, as it always did.)
         uint64_t la[32];
         row_addresses(a, false, ur, store ? 64 : 32, ex, la);
-        bool inside = true;
+        uint64_t highest = 0;
         for (Mask m = ex; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint64_t off = static_cast<uint32_t>(la[l]);
           addrs[l] = off;
-          inside = inside && off + bytes <= w.local_size;
+          highest = std::max(highest, off);
         }
+        const bool inside = highest + bytes <= w.local_size;   // (ex is not zero in this branch)
         if (inside) {
           if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
           const Operand& d = store ? ins.src[1] : ins.dst[0];
