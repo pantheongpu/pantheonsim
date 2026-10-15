@@ -87,13 +87,27 @@ enum class Form : uint8_t {
   Fmul,
   Dop,       // DADD, DMUL, DFMA
   Bra,       // a plain relative BRA: run by tier_run itself when it ends a straight-line run
-  Bssy,      // BSSY and NOP, which end a run without moving any lane's program counter: run by tier_run too
+  Bssy,      // BSSY and NOP (and the barriers and fences that do nothing here), which end a run without moving any lane's program counter: run by tier_run too
   Nop,
   Plop3,     // PLOP3, S2R and SEL end a run (they are not straight-line ones) but need nothing of the interpreter
   S2r,
   Sel,
   Prmt,
   Imnmx,
+  Fmnmx,     // FMNMX
+  Mufu,      // MUFU: every function the interpreter's fast path takes
+  F2i,       // F2I from f32 to 32 bits
+  I2f,       // I2F from 8, 16 or 32 bits to f32 (I2FP.F32 is I2fp)
+  F2fp,      // F2FP.PACK_AB to f16 or bf16
+  Dsetp,     // DSETP
+  Hop2,      // HADD2, HMUL2, HFMA2 (packed f16; the f32-result HADD2.F32 is the interpreter's)
+  Unary,     // BREV and FLO
+  Ldc,       // LDC from a constant bank
+  Bsync,     // BSYNC: ends a run, run by tier_run itself
+  Yield,     // YIELD: ends a run, run by tier_run itself
+  Shfl,      // SHFL: ends a run, has a handler
+  Vote,      // VOTE.{ALL,ANY,EQ}: ends a run, has a handler
+  Hmma,      // HMMA (dense f16, bf16, tf32 with an f32 or f16 accumulator): the SIMD kernel; ends a run, has a handler
   Count_,
 };
 const char* form_name(Form f);
@@ -105,7 +119,7 @@ struct MOp {
   const Instr* ins = nullptr;    // for the interpreter, faults and statistics
   Src s[3];                      // sources, in the order the handler takes them
   Src p;                         // a predicate source (Dyn::Reg: a per-lane P<n>; Dyn::UReg: a uniform UP<n>), if any
-  Src p2;                        // a second one
+  Src p2;                        // a second one (a BRA's condition predicates are p and p2: aux says how many)
   int64_t imm = 0;               // a memory operand's offset
   uint32_t a = 0, b = 0;         // form-specific immediates (a LOP3's table, an IADD3's +1 count, a shift, ...)
   uint32_t c = 0;

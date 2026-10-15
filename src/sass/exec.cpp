@@ -99,6 +99,9 @@ struct Warp {
   uint64_t rpc[32] = {};              // the return-address register (RPCMOV)
   uint64_t gmma_issued = 0;           // warpgroup MMAs this warp has issued
   const Code* code_hint = nullptr;    // the code section the tier last found this warp in
+  // The tier's chain (tier_ops.inc): how many more calls of step_warp the caller's turn has after this one, and how many the
+  // tier has taken over. Set by the caller before each call; the caller adds `extra` to its count and clears it.
+  uint32_t budget = 0, extra = 0;
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
   uint32_t local_size = 0;
   uint64_t steps = 0;
@@ -233,6 +236,25 @@ inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
   return eq;
 }
 
+// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds, as four
+// independent chains of compare-and-select over all 32 lanes when many lanes run (a chain of dependent min()s over 16 lanes was a
+// tenth of the divergent workload), else that loop.
+inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) {
+  if (simd::popcount32(run) <= 5) {
+    uint64_t lo = first;
+    for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
+    return lo;
+  }
+  uint64_t a = ~uint64_t{0}, b = a, c = a, d = a;
+  for (unsigned l = 0; l < 32; l += 4) {
+    a = std::min(a, ((run >> l) & 1) ? w.pc[l] : ~uint64_t{0});
+    b = std::min(b, ((run >> (l + 1)) & 1) ? w.pc[l + 1] : ~uint64_t{0});
+    c = std::min(c, ((run >> (l + 2)) & 1) ? w.pc[l + 2] : ~uint64_t{0});
+    d = std::min(d, ((run >> (l + 3)) & 1) ? w.pc[l + 3] : ~uint64_t{0});
+  }
+  return std::min(std::min(a, b), std::min(c, d));
+}
+
 class Runner {
  public:
   Runner(const Module& m, const CubinKernel& k, const exec::LaunchConfig& cfg,
@@ -292,7 +314,9 @@ class Runner {
       const char* tr = std::getenv("VGPU_SASS_TRACE");
       tier_ = fast_ && simd::enabled() && !(tr && *tr);
       const char* ts = std::getenv("VGPU_TIER_STATS");
-      tier_stats_ = tier_ && ts && ts[0] == '1';
+      tier_stats_ = tier_ && ts && (ts[0] == '1' || ts[0] == '2');
+      const char* tc = std::getenv("VGPU_TIER_CHAIN");
+      tier_chain_ = !(tc && tc[0] == '0');
     }
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
@@ -314,6 +338,7 @@ class Runner {
   MemoryManager& memory() { return mem_; }
   uint32_t tier_sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const { return sreg(blk, w, idx, lane); }
   void tier_exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mem(blk, w, ins, ex); }
+  uint32_t tier_cbank32(unsigned bank, uint64_t offset) const { return cbank32(bank, offset); }
   ~Runner() {
     if (coop_ws_) {
       try {
@@ -426,6 +451,7 @@ class Runner {
   // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
   bool tier_ = false;
   bool tier_stats_ = false;
+  bool tier_chain_ = true;   // VGPU_TIER_CHAIN=0: one run per call of step_warp, as the interpreter's (tier_ops.inc)
   std::vector<uint8_t> bank0_;
   std::map<unsigned, uint64_t> bank_va_, bank_size_;
   uint64_t entry_ = 0;
@@ -992,13 +1018,17 @@ exec::LaunchStats Runner::run() {
         for (Warp& w : blk.warps) {
           if (!(w.alive & ~w.exited)) continue;
           live = true;
-          for (int n = 0; n < 256 && (w.alive & ~w.exited); ++n)
+          for (int n = 0; n < 256 && (w.alive & ~w.exited); ++n) {
+            w.budget = 255 - n;   // (the tier's chain: the calls this turn has left after this one)
             if (step_warp(blk, w)) {
               progress = true;
+              n += static_cast<int>(w.extra);
+              w.extra = 0;
               if (w.yield) break;
             } else {
               break;
             }
+          }
           w.yield = false;
         }
       if (live && !progress) {
@@ -1152,8 +1182,11 @@ void Runner::run_block(Block& blk) {
       live = true;
       for (int n = 0; n < 4096; ++n) {
         if (!(w.alive & ~w.exited)) break;
+        w.budget = 4095 - n;   // (the tier's chain: the calls this turn has left after this one)
         if (!step_warp(blk, w)) break;
         progress = true;
+        n += static_cast<int>(w.extra);
+        w.extra = 0;
         if (w.yield) break;
       }
       if (!w.yield) w.spin_yields = 0;
@@ -1201,8 +1234,11 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
         live = true;
         for (int n = 0; n < 4096; ++n) {
           if (!(w.alive & ~w.exited)) break;
+          w.budget = 4095 - n;
           if (!step_warp(blk, w)) break;
           progress = true;
+          n += static_cast<int>(w.extra);
+          w.extra = 0;
           if (w.yield) break;
         }
         if (!w.yield) w.spin_yields = 0;
@@ -1306,7 +1342,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     if (const Mask at = tier_lanes_at(w, lo); (run & ~at) == 0) {
       group = run;
     } else {   // diverged: the lowest address among the runnable lanes, and the lanes there
-      for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
+      lo = tier_lowest_pc(w, run, lo);
       group = tier_lanes_at(w, lo) & run;
     }
   } else
@@ -1452,7 +1488,7 @@ bool compute_straight(const Instr& ins) {
 }
 
 // Mask of the group's lanes whose guard predicate holds.
-Mask guard_mask(const Warp& w, const Instr& ins, Mask group) {
+[[gnu::always_inline]] inline Mask guard_mask(const Warp& w, const Instr& ins, Mask group) {
   if (ins.guard == kPT && !ins.guard_not) return group;
   Mask g;
   if (ins.guard_uniform) g = (ins.guard == kPT || w.up[ins.guard]) ? kAll : 0;

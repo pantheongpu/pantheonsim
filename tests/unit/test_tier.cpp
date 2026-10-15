@@ -78,21 +78,23 @@ void check_corpus(const std::string& file, int sm) {
     ++t.accepted;
     ++accepted;
     // Only instructions step_warp runs as straight-line ones can have a handler (a plain BRA, BSSY or NOP ends a run, and tier_run runs it).
-    const bool ends = op.form == sass::tier::Form::Bra || op.form == sass::tier::Form::Bssy || op.form == sass::tier::Form::Nop;
-    const bool terminal = op.form == sass::tier::Form::Plop3 || op.form == sass::tier::Form::S2r || op.form == sass::tier::Form::Sel;   // end a run, and have handlers
+    const bool ends = op.form == sass::tier::Form::Bra || op.form == sass::tier::Form::Bssy || op.form == sass::tier::Form::Nop ||
+                      op.form == sass::tier::Form::Bsync || op.form == sass::tier::Form::Yield;
+    const bool terminal = op.form == sass::tier::Form::Plop3 || op.form == sass::tier::Form::S2r || op.form == sass::tier::Form::Sel ||
+                          op.form == sass::tier::Form::Shfl || op.form == sass::tier::Form::Vote || op.form == sass::tier::Form::Hmma;   // end a run, and have handlers
     VCHECK(ins.straight != (ends || terminal));
     VCHECK(op.maxreg <= 256);   // 0 is possible: constants into RZ
     const std::string what = std::string(sass::tier::form_name(op.form)) + " " + sass::to_text(ins);
-    const bool mem = op.form >= sass::tier::Form::Ldg && op.form <= sass::tier::Form::Stl;   // s[] holds raw register numbers there
+    const bool mem = (op.form >= sass::tier::Form::Ldg && op.form <= sass::tier::Form::Stl) || op.form == sass::tier::Form::Hmma;   // s[] holds raw register numbers there
     // A double operand, and IMAD.WIDE's and IMAD.HI's addend, are pairs of rows.
     for (int i = 0; i < 3 && !mem; ++i) {
-      const bool pair = op.form == sass::tier::Form::Dop || (i == 2 && (op.form == sass::tier::Form::ImadWide ||
+      const bool pair = op.form == sass::tier::Form::Dop || op.form == sass::tier::Form::Dsetp || (i == 2 && (op.form == sass::tier::Form::ImadWide ||
                                                                        (op.form == sass::tier::Form::ImadHi && (op.aux & 4))));
       check_src(op.s[i], prog, pair ? 1 : 0, what.c_str());
     }
     // A destination register the handler writes lies inside the file the op claims to need.
     if (op.dst != sass::tier::kNoReg && op.form != sass::tier::Form::Isetp && op.form != sass::tier::Form::Fsetp &&
-        op.form != sass::tier::Form::IsetpEx && op.form != sass::tier::Form::Plop3 && !ends)
+        op.form != sass::tier::Form::IsetpEx && op.form != sass::tier::Form::Plop3 && op.form != sass::tier::Form::Dsetp && op.form != sass::tier::Form::Vote && !ends)
       VCHECK(op.dst < op.maxreg);
     if (ends) VCHECK(op.fn == nullptr);
   }

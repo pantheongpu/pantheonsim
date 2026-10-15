@@ -262,7 +262,9 @@ const char* form_name(Form f) {
   static const char* const names[] = {"none",  "mov",   "iadd3", "iadd3x", "imad",  "imad32", "imadwide", "imadhi",
                                       "isetpex", "popc", "i2fp",  "ldg",    "stg",   "lds",    "sts",      "ldl",
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
-                                      "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "sel",   "prmt",  "imnmx"};
+                                      "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "sel",   "prmt",  "imnmx",
+                                      "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "ldc",
+                                      "bsync", "yield", "shfl",  "vote",  "hmma"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -344,12 +346,34 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       accept(shared ? (store ? Form::Sts : Form::Lds) : (store ? Form::Stl : Form::Ldl));
       return;
     }
+    case Op::LDC: {   // a word (or two) of a constant bank, at a register + offset, wrapping in the 64 KiB bank
+      if (ins.dst.empty() || ins.dst[0].kind != Kind::Reg) return;
+      const unsigned bytes = mem_bytes(ins.f[0]);
+      const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
+      if (ra != kRZ) maxreg = static_cast<uint16_t>(ra + 1);
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      if (bytes == 8 && ins.dst[0].reg != kRZ)
+        maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(ins.dst[0].reg + (ins.dst[0].reg + 1 == kRZ ? 1 : 2)));
+      m.a = ins.f[4];                 // the bank
+      m.b = ins.f[0];                 // the size field
+      m.c = ra;
+      m.imm = ins.w.sfield(38, 16);
+      accept(Form::Ldc);
+      return;
+    }
     case Op::BRA: {
       // A branch to a fixed address, taken by the lanes the guard leaves (exec_control): no .DIV/.CONV, no .U.ANY, no
       // condition predicate beside the guard.
+      // A condition predicate beside the guard (sm_90's BRA Pn, and the loop branches of sm_86: `@P0 BRA P1, label`) narrows the lanes
+      // that take it (with_condition); two at most.
       if (ins.f[0] >= 2 || ins.f[1] || ins.src.empty() || ins.src.back().kind != Kind::Label) return;
-      for (const Operand& o : ins.src)
-        if (o.kind == Kind::Pred || o.kind == Kind::UPred) return;
+      unsigned conds = 0;
+      for (const Operand& o : ins.src) {
+        if (o.kind != Kind::Pred && o.kind != Kind::UPred) continue;
+        if (conds == 2) return;
+        (conds++ == 0 ? m.p : m.p2) = pred_src(o);
+      }
+      m.aux = static_cast<uint8_t>(conds);
       m.imm = ins.src.back().imm;
       accept(Form::Bra);
       return;
@@ -359,9 +383,71 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.dst = static_cast<uint16_t>(ins.dst[0].reg);
       accept(Form::Bssy);
       return;
-    case Op::NOP:
-      accept(Form::Nop);
+    case Op::NOP: case Op::DEPBAR: case Op::MEMBAR: case Op::ERRBAR: case Op::NANOSLEEP: case Op::ENDCOLLECTIVE:
+      accept(Form::Nop);   // exec_control does nothing for these but let the group go on
       return;
+    case Op::YIELD:       // the other lanes, and the other warps, go first
+      accept(Form::Yield);
+      return;
+    case Op::BSYNC:   // the lanes wait at convergence barrier Bx (exec_control); tier_run does the rest
+      if (ins.src.empty() || ins.src[0].reg >= 16) return;
+      m.c = ins.src[0].reg;
+      accept(Form::Bsync);
+      return;
+    case Op::SHFL: {   // a shuffle: value, lane and clamp as 32 lanes each; the value to dst[1], the in-range predicate to dst[0]
+      if (ins.dst.size() != 2 || ins.dst[0].kind != Kind::Pred || ins.dst[1].kind != Kind::Reg || ins.src.size() < 3) return;
+      for (int i = 0; i < 3; ++i) {
+        const Kind k = ins.src[i].kind;
+        if (!(k == Kind::Reg || k == Kind::Imm || k == Kind::FImm || k == Kind::UReg || k == Kind::CBank)) return;
+        if (!src32(b, ins.src[i], Dom::Plain, m.s[i], maxreg)) return;
+      }
+      if (!reg_dst(ins.dst[1], m.dst, maxreg)) return;
+      m.dst2 = static_cast<uint16_t>(ins.dst[0].reg);
+      m.a = ins.f[0];   // idx, up, down, bfly
+      accept(Form::Shfl);
+      return;
+    }
+    case Op::HMMA: {
+      // The dense forms exec_mma gives to the SIMD kernel: f16, bf16 or tf32 operands, a float or half accumulator, K up to 16.
+      // The rest (sparse, the other types) is exec_mma's general form.
+      static const unsigned ks[] = {8, 16, 4, 0};
+      if (ins.guard_uniform || ins.f[3] || ins.f[0] > 3 || ins.dst.empty() || ins.dst[0].kind != Kind::Reg || ins.src.size() < 3 ||
+          ins.src[0].kind != Kind::Reg || ins.src[1].kind != Kind::Reg || ins.src[2].kind != Kind::Reg)
+        return;
+      const unsigned kind = ins.f[2] == 1 ? 1 : ins.f[2] == 2 ? 2 : 0;   // f16, bf16, tf32
+      unsigned K = ks[ins.f[0]];
+      if (kind == 2 && ins.f[0] == 0) K = 8;
+      const unsigned per_reg = kind == 2 ? 1 : 2;
+      if (!(K > 0 && K <= 16 && K % (4 * per_reg) == 0)) return;
+      const bool acc16 = ins.f[1] == 0;
+      const unsigned a_regs = 16 * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = acc16 ? 2 : 4;
+      const unsigned ra = ins.src[0].reg, rb = ins.src[1].reg, rc = ins.src[2].reg, rd = ins.dst[0].reg;
+      if (ra != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(ra + a_regs));
+      if (rb != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(rb + b_regs));
+      if (rc != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(rc + c_regs));
+      if (rd != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(rd + c_regs));
+      m.s[0].off = ra;   // raw register numbers, as in the memory forms
+      m.s[1].off = rb;
+      m.s[2].off = rc;
+      m.dst = rd == kRZ ? kNoReg : static_cast<uint16_t>(rd);
+      m.a = kind;
+      m.b = K;
+      m.c = acc16 ? 1 : 0;
+      accept(Form::Hmma);
+      return;
+    }
+    case Op::VOTE: {   // the lanes' predicate as a ballot and as ALL/ANY/EQ (VOTEU is the interpreter's)
+      if (ins.dst.empty() || ins.dst.back().kind != Kind::Pred || (ins.dst.size() != 1 && ins.dst[0].kind != Kind::Reg) ||
+          ins.src.empty() || (ins.src[0].kind != Kind::Pred && ins.src[0].kind != Kind::UPred))
+        return;
+      m.dst = kNoReg;
+      if (ins.dst.size() > 1 && !reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.p = pred_src(ins.src[0]);
+      m.dst2 = static_cast<uint16_t>(ins.dst.back().reg);
+      m.a = ins.f[0];
+      accept(Form::Vote);
+      return;
+    }
     case Op::PLOP3: {   // a three-input logic function of three predicates, into two
       if (ins.guard_uniform || ins.f[2] || ins.dst.size() < 2 || !pred_dst(ins.dst[0]) || !pred_dst(ins.dst[1]) || ins.src.size() < 3)
         return;
@@ -452,6 +538,23 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
         maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(d.reg + 1 == kRZ ? d.reg + 1 : d.reg + 2));
       }
       accept(Form::Dop);
+      return;
+    }
+    case Op::DSETP: {   // a double comparison, or MIN/MAX's two answers (fast_float)
+      if (ins.guard_uniform || ins.dst.size() < 2 || !pred_dst(ins.dst[0]) || !pred_dst(ins.dst[1]) || ins.src.size() < 3 ||
+          (ins.src[2].kind != Kind::Pred && ins.src[2].kind != Kind::UPred))
+        return;
+      uint32_t mods = 0;
+      for (unsigned i = 0; i < 2; ++i)
+        if (!src64(b, ins.src[i], i, m.s[i], mods, maxreg)) return;
+      m.s[2] = b.constant64(0);
+      m.p = pred_src(ins.src[2]);
+      m.a = ins.f[0];
+      m.b = mods;
+      m.c = ins.f[1];
+      m.dst = static_cast<uint16_t>(ins.dst[0].reg);
+      m.dst2 = static_cast<uint16_t>(ins.dst[1].reg);
+      accept(Form::Dsetp);
       return;
     }
     default: break;
@@ -664,14 +767,133 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
     }
     case Op::FFMA: case Op::FADD: case Op::FMUL: {
       const unsigned nsrc = ins.op == Op::FFMA ? 3 : 2;
-      if (ins.f[0] || ins.f[1] || ins.f[2] || (ins.op == Op::FMUL && ins.f[4] != 4) || ins.src.size() < nsrc) return;
+      // A rounding mode, .FTZ or .SAT is fast_float's ffma_x (which declines a uniform guard); none is fast_alu's plain kernel.
+      const bool x = ins.f[0] || ins.f[1] || ins.f[2];
+      if ((x && ins.guard_uniform) || (ins.op == Op::FMUL && ins.f[4] != 4) || ins.src.size() < nsrc) return;
       for (unsigned i = 0; i < nsrc; ++i) {
         const Operand& o = ins.src[i];
         if (!plain_kind(o) || o.bnot) return;
         if (!src32(b, o, Dom::Flt, m.s[i], maxreg)) return;
       }
       if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.a = (ins.f[1] ? 1u : 0u) | (ins.f[2] ? 2u : 0u);   // ffma_x's flags: flush, saturate
+      m.b = ins.f[0];                                     // the rounding mode
       accept(ins.op == Op::FFMA ? Form::Ffma : ins.op == Op::FADD ? Form::Fadd : Form::Fmul);
+      return;
+    }
+    case Op::FMNMX: {   // min or max by a predicate (fast_float)
+      if (ins.guard_uniform || ins.src.size() < 3 || !plain_kind(ins.src[0]) || !plain_kind(ins.src[1]) || ins.src[0].bnot ||
+          ins.src[1].bnot || (ins.src[2].kind != Kind::Pred && ins.src[2].kind != Kind::UPred))
+        return;
+      if (!src32(b, ins.src[0], Dom::Flt, m.s[0], maxreg) || !src32(b, ins.src[1], Dom::Flt, m.s[1], maxreg)) return;
+      m.p = pred_src(ins.src[2]);
+      m.a = ins.f[0] != 0;   // flush to zero
+      m.b = ins.f[1] != 0;   // .NAN
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      accept(Form::Fmnmx);
+      return;
+    }
+    case Op::MUFU: {   // RCP, RSQ, SQRT as SIMD kernels; the others in libm, as fast_float does them
+      const unsigned fn = ins.f[0];
+      if (ins.guard_uniform || fn == 6 || fn == 7 || fn > 9 || ins.src.empty() || !plain_kind(ins.src[0]) || ins.src[0].bnot) return;
+      const Operand& o = ins.src[0];
+      const bool simd_fn = fn == 4 || fn == 5 || fn == 8;
+      // The SIMD kernels take |x| and -x applied; the libm ones flush first, so the source keeps its raw bits.
+      if (!src32(b, o, simd_fn ? Dom::Flt : Dom::Plain, m.s[0], maxreg)) return;
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.a = fn;
+      m.aux = static_cast<uint8_t>((o.abs ? 1 : 0) | (o.neg ? 2 : 0));
+      accept(Form::Mufu);
+      return;
+    }
+    case Op::F2I: {   // f32 to a 32-bit integer
+      if (ins.guard_uniform || ins.f[0] != 2 || ins.f[1] != 2 || ins.src.empty() || !plain_kind(ins.src[0]) || ins.src[0].bnot) return;
+      if (!src32(b, ins.src[0], Dom::Flt, m.s[0], maxreg) || !reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.a = ins.f[2] != 0;   // signed
+      m.b = ins.f[3];        // the rounding
+      m.c = ins.f[4] != 0;   // flush to zero
+      accept(Form::F2i);
+      return;
+    }
+    case Op::I2F: {   // 8, 16 or 32 bits to f32, to nearest even
+      const unsigned dsize = ins.f[0], ssize = ins.f[1];
+      if (ins.guard_uniform || dsize != 2 || ssize > 2 || ins.f[3] != 0 || ins.src.empty() || !plain_kind(ins.src[0])) return;
+      if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg) || !reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.a = ssize;
+      m.c = ins.f[2] != 0;   // signed
+      m.b = ssize == 2 ? 0u : (ssize == 1 ? 16u : 8u) * ins.f[4];   // the byte or half moved down
+      accept(Form::I2f);
+      return;
+    }
+    case Op::F2FP: {   // two f32 into f16 or bf16 halves
+      if (ins.guard_uniform || ins.src.size() < 2 || ins.f[5] == 4 || ins.f[3] >= 6 || !plain_kind(ins.src[0]) ||
+          !plain_kind(ins.src[1]) || ins.src[0].bnot || ins.src[1].bnot)
+        return;
+      if (!src32(b, ins.src[0], Dom::Flt, m.s[0], maxreg) || !src32(b, ins.src[1], Dom::Flt, m.s[1], maxreg)) return;
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.a = ins.f[0] != 0;   // bf16
+      m.b = ins.f[2] != 0;   // .RELU
+      accept(Form::F2fp);
+      return;
+    }
+    case Op::BREV: case Op::FLO: {
+      if (ins.dst.size() != 1 || ins.src.empty() || !plain_kind(ins.src[0])) return;
+      const bool flo = ins.op == Op::FLO;
+      if (!src32(b, ins.src[0], flo ? Dom::Int : Dom::Plain, m.s[0], maxreg) || !reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.a = flo ? 2 + (ins.f[0] ? 1u : 0u) + (ins.f[1] ? 2u : 0u) : 1u;   // simd lane_unary's kind
+      accept(Form::Unary);
+      return;
+    }
+    case Op::HADD2: case Op::HMUL2: case Op::HFMA2: {
+      // Packed f16 (fast_float): each half the double-precision fma of its inputs rounded once. The f32 result, bf16 and
+      // saturation forms are the interpreter's.
+      const unsigned need = ins.op == Op::HFMA2 ? 3u : 2u;
+      if (ins.guard_uniform || ins.f[0] || ins.f[1] || ins.f[3] || ins.src.size() < need) return;
+      // packed(): an immediate pair/single, or a register, uniform register, bank-0 word, with a half swizzle and |.|, -.
+      const auto packed = [&](const Operand& o, Src& out, uint32_t& opbits) -> bool {
+        opbits = 0;
+        if (o.kind == Kind::FImm) {
+          out = b.constant((o.fbits & 0xffffu) * 0x10001u);
+          return true;
+        }
+        if (!plain_kind(o) || o.kind == Kind::Imm || o.suffix == ".F32") return false;
+        const unsigned mode = o.suffix == ".H0_H0" ? 1 : o.suffix == ".H1_H1" ? 2 : 0;
+        if (!src32(b, o, Dom::Plain, out, maxreg)) return false;
+        if (out.kind == SrcKind::Pool) {   // RZ: the same arithmetic on a zero
+          uint32_t v = b.prog.pool[out.off].v[0];
+          if (mode == 1) v = (v & 0xffffu) * 0x10001u;
+          else if (mode == 2) v = (v >> 16) * 0x10001u;
+          v = (v & (o.abs ? 0x7fff7fffu : ~0u)) ^ (o.neg ? 0x80008000u : 0u);
+          out = b.constant(v);
+          return true;
+        }
+        opbits = mode | (o.abs ? 4u : 0u) | (o.neg ? 8u : 0u);
+        return true;
+      };
+      uint32_t ob[3] = {0, 0, 0};
+      if (!packed(ins.src[0], m.s[0], ob[0])) return;
+      size_t next = 1;
+      if (ins.src.size() > next + 1 && ins.src[next].kind == Kind::FImm && ins.src[next + 1].kind == Kind::FImm) {
+        m.s[1] = b.constant((ins.src[next].fbits & 0xffffu) << 16 | (ins.src[next + 1].fbits & 0xffffu));
+        next += 2;
+      } else {
+        if (!packed(ins.src[next], m.s[1], ob[1])) return;
+        next += 1;
+      }
+      if (ins.op == Op::HFMA2) {
+        if (ins.src.size() > next + 1 && ins.src[next].kind == Kind::FImm && ins.src[next + 1].kind == Kind::FImm) {
+          m.s[2] = b.constant((ins.src[next].fbits & 0xffffu) << 16 | (ins.src[next + 1].fbits & 0xffffu));
+        } else {
+          if (next >= ins.src.size() || !packed(ins.src[next], m.s[2], ob[2])) return;
+        }
+      } else {
+        // HADD2 is a * 1 + b and HMUL2 a * b + (-0), both exactly the same in double.
+        m.s[2] = b.constant(ins.op == Op::HADD2 ? 0x3c003c00u : 0x80008000u);
+      }
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      m.a = ins.op == Op::HADD2 ? 0 : ins.op == Op::HMUL2 ? 1 : 2;
+      m.b = ob[0] | ob[1] << 4 | ob[2] << 8;
+      accept(Form::Hop2);
       return;
     }
     default: break;
