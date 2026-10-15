@@ -236,7 +236,7 @@ variable is unset by default.
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `VGPU_THREADS` | Host threads used to run blocks. | one per core |
-| `VGPU_MAX_STEPS` | Raises the runaway-kernel step budget; `0` removes it. | built-in |
+| `VGPU_MAX_STEPS` | Raises (or lowers) the runaway-kernel step budget; `0` removes it. Both engines read it at the start of each launch (the SASS engine used not to: its budget was the built-in one whatever this said). | built-in |
 | `VGPU_SASS` | `0` forces the PTX engine; `1` insists on SASS and does not fall back. | SASS when the binary carries it, else PTX |
 | `VGPU_SASS_LOG` | `1` says when a fatbin falls back from SASS to PTX. | off |
 | `VGPU_SCHEDULER` | Warp scheduling order: `deterministic`, `random` or `adversarial`. Random and adversarial orders find bugs that depend on which warp runs first, and they run blocks one at a time so an order can be replayed. **PTX engine only:** kernels that run from SASS (the default whenever the binary carries it) use one fixed warp order, so set `VGPU_SASS=0` to use this. | deterministic |
