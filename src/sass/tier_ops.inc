@@ -281,7 +281,8 @@ TIER_HANDLER(h_fsel) {
   const uint32_t* a = tier_src<true>(c, op.s[0], t[0]);
   const uint32_t* b = tier_src<true>(c, op.s[1], t[1]);
   const Mask p = tier_pmask(c, op.p);
-  for (unsigned l = 0; l < 32; ++l) r[l] = ((p >> l) & 1) ? a[l] : b[l];
+  tier_copy_row(r, b);               // b where the predicate is clear, a where it holds: the blend kernel (fast_wide's SEL)
+  c.sk->blend_m(r, a, p);
   tier_store(c, op.dst, ex, r);
 }
 
@@ -738,7 +739,7 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
       bool done = false;
       if (Store) {
         for (unsigned i = 0; i < count; ++i) {
-          uint32_t v[2];
+          uint32_t v[4] = {};
           data(first + i, v);
           tier_put(buf + i * bytes, v, bytes);
         }
@@ -749,7 +750,7 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
           uint32_t* d = c.R + op.dst * 32u;
           for (unsigned i = 0; i < count; ++i) {
             if (bytes <= 4) {
-              uint32_t v[2] = {};
+              uint32_t v[4] = {};
               tier_get(v, buf + i * bytes, bytes);
               d[first + i] = tier_extend(op.b, v[0]);
             } else {
@@ -934,7 +935,8 @@ TIER_HANDLER(h_sel) {
   const uint32_t* a = tier_src<false>(c, op.s[0], t[0]);
   const uint32_t* b = tier_src<false>(c, op.s[1], t[1]);
   const Mask p = tier_pmask(c, op.p);
-  for (unsigned l = 0; l < 32; ++l) r[l] = ((p >> l) & 1) ? a[l] : b[l];
+  tier_copy_row(r, b);               // b where the predicate is clear, a where it holds: the blend kernel (fast_wide's SEL)
+  c.sk->blend_m(r, a, p);
   tier_store(c, op.dst, ex, r);
 }
 
@@ -1092,6 +1094,7 @@ struct TierStats {
   std::map<std::string, uint64_t> ended;      // the instructions that end a run (control flow, waits, warp-wide ops), run by execute
   std::map<std::string, std::vector<std::string>> samples;   // VGPU_TIER_STATS=2: up to three disassembled examples of each
   std::atomic<uint64_t> total{0};   // every warp instruction of the launches (LaunchStats::instructions)
+  std::atomic<uint64_t> passes{0}, chained{0};   // runs of straight instructions the tier made, and how many of them it chained on to
   ~TierStats() {
     uint64_t nat = 0, fb = 0;
     for (size_t i = 0; i < kOps; ++i) nat += native[i].load();
@@ -1119,6 +1122,8 @@ struct TierStats {
       for (size_t i = 0; i < v.size() && i < 24; ++i) line += " " + v[i].second + "=" + std::to_string(v[i].first);
       std::fprintf(stderr, "%s\n", line.c_str());
     };
+    std::fprintf(stderr, "tier runs: %llu runs of straight instructions, %llu of them started by the tier's chain instead of a call of the scheduler\n",
+                 (unsigned long long)passes.load(), (unsigned long long)chained.load());
     list("interpreter (straight)", fallback);
     list("interpreter (ends a run)", ended);
     for (const auto& [k, v] : samples) {
@@ -1213,7 +1218,11 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
   const tier::MOp* ops = tp.ops.data();
   const size_t count = code.count;
   const bool regs_ok = tp.max_reg <= w.nregs;
-  for (;;) {   // one pass is one call of step_warp
+  for (bool again = false;; again = true) {   // one pass is one call of step_warp
+  if (tier_stats_) [[unlikely]] {
+    tier_stats().passes.fetch_add(1, std::memory_order_relaxed);
+    if (again) tier_stats().chained.fetch_add(1, std::memory_order_relaxed);
+  }
   const size_t first = static_cast<size_t>((pick - code.base) / 16);
   size_t idx = first;
   const unsigned glanes = popc(group);

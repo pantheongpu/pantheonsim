@@ -30,8 +30,14 @@ shopt -u nullglob
 nvcc_bin="$(pick_nvcc_for_shim "$shim")"
 [[ -n "$nvcc_bin" ]] || { echo "SKIP: no nvcc matching this shim's toolkit"; exit 0; }
 nvcc_host_compiler_fix
-work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-sass-tier.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
+# VGPU_TIER_WORK=<dir> keeps the built programs there between runs (a program is rebuilt only when its source is newer), for
+# working on the tier without compiling fifty programs each time; VGPU_TIER_BUILD_ONLY=1 stops after the builds.
+if [[ -n ${VGPU_TIER_WORK:-} ]]; then
+  work="$VGPU_TIER_WORK"; mkdir -p "$work"
+else
+  work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-sass-tier.XXXXXX")"
+  trap 'rm -rf "$work"' EXIT
+fi
 
 declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm_89]=nvidia/l4 [sm_90]=nvidia/h100
                 [sm_100]=nvidia/b200 [sm_120]=nvidia/rtx5090)
@@ -71,9 +77,13 @@ read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
 export nvcc_bin root work
 export san="${san_flags[*]}"
 printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_TIER_JOBS:-$("$root/ci/jobs.sh" -p sass)}" -L 1 bash -c '
+  [[ -x "$work/$0.$1" && "$work/$0.$1" -nt "$root/nvidia/tests/e2e/$0.cu" && ! -s "$work/$0.$1.build" ]] && exit 0
+  rm -f "$work/$0.$1" "$work/$0.$1.build"
   "$nvcc_bin" -std=c++17 -arch="$1" -cudart shared -w -Wno-deprecated-gpu-targets -Xlinker --as-needed $san \
     -I"$root/nvidia/tests/e2e" "$root/nvidia/tests/e2e/$0.cu" -o "$work/$0.$1" -lcuda 2> "$work/$0.$1.build" ||
     echo "build failed" >> "$work/$0.$1.build"'
+
+[[ -n ${VGPU_TIER_BUILD_ONLY:-} ]] && { echo "built in $work"; exit 0; }
 
 fails=0
 check() {
@@ -112,6 +122,13 @@ check() {
     if [[ -z $ran || -z $total ]] || (( total == 0 || ran * 100 < total * min_percent )); then
       why="${why:+$why; }the tier ran ${ran:-?} of ${total:-?} warp instructions (wanted at least $min_percent%)"
     fi
+  fi
+  if [[ ( $p == sass_tier_steps || $p == sass_tier ) && -z $why ]]; then
+    # The tier without its chain (one run of straight instructions per call of the scheduler, as the interpreter has it): the
+    # same again, so that a difference of the chain's is told from one of the handlers'.
+    local nc
+    nc="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_CHAIN=0 timeout 900 "$bin" 2>&1)"
+    [[ "$a" == "$nc" ]] || why="${why:+$why; }the tier without its chain prints differently from the interpreter"
   fi
   if [[ $p == sass_tier_steps && -z $why ]]; then
     # Faults deep into a run of straight instructions, and the step limit: the text names the instruction, the lane and the
