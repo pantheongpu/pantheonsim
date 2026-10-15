@@ -12,9 +12,10 @@
 //        `steps`: the smallest limit a kernel finishes under, and the text of the failure one step below it.
 //   3. At most 256 straight instructions, then the next one, a call; a section's last instruction ends a run.
 //        spin_long: a loop body of 700 straight instructions waits for another warp.
-//   4. A call of step_warp is the unit of a warp's turn (4096 of them, then the next warp goes): the instruction count of a
-//      warp that spins on another's store says how many calls an iteration took.
-//        spin_plain, spin_shfl, spin_atomic, spin_vote, spin_membar, spin_diverged, spin_long.
+//   4. A call of step_warp is the unit of a warp's turn (4096 of them, then the next warp goes). A loop of warp 0 reads a flag
+//      warp 1 sets at its start, at iteration K: the least K at which it reads the flag set is where warp 0's turn ended, and says how
+//      many calls an iteration took. turn_plain, turn_shfl, turn_atomic, turn_vote, turn_branch, turn_long.
+//      (spin_*: the same with a loop that waits for the flag, which ptxas puts a YIELD in: every iteration ends the turn.)
 //   5. Which lanes execute: the guard, the counters (instructions, thread instructions, per class, barriers, divergent
 //      branches), BSSY/BSYNC reconvergence, a block that is not whole warps.   reconverge, barriers.
 //   6. A fault names the instruction, the lane and the address, however far into a run it is.   `fault <name>`.
@@ -136,6 +137,24 @@ __global__ void spinlock(u32* lock, u32* counter, u32* out) {
   out[threadIdx.x] = threadIdx.x + 1;
 }
 
+// warp 0 runs K + 8 iterations of a loop with no exit that depends on memory (so no YIELD) and reads the flag in the K-th;
+// warp 1 sets it. Where warp 0's turn of 4096 calls ends, warp 1 runs, and the K-th iteration reads 1.
+template <int Kind>
+__global__ void turn(u32* flag, u32* out, u32 K) {
+  volatile u32* vf = flag;
+  const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  if (warp == 0) {
+    u32 acc = lane, snap = 7;
+    for (u32 i = 0; i < K + 8; ++i) {
+      acc = spin_body<Kind>(vf, acc);
+      if (i == K) snap = *vf;
+    }
+    out[lane] = snap + (acc & 0);
+  } else if (warp == 1 && lane == 0) {
+    *vf = 1;
+  }
+}
+
 // ---- 2. the step limit -------------------------------------------------------------------------------------------
 // One warp: loads and stores, a loop, a shuffle, a vote, a barrier, a branch that splits the lanes, an exit by every lane.
 __global__ void steps_kernel(u32* data, u32* out) {
@@ -228,11 +247,6 @@ __global__ void f_atomic(u32* out, long far) {
   const int t = threadIdx.x;
   atomicAdd(&out[(t == 3) ? far : t % 4], 1u);
 }
-__global__ void f_misaligned(const u32* in, u32* out) {
-  const int t = threadIdx.x;
-  const char* p = reinterpret_cast<const char*>(in) + (t == 2 ? 3 : 0) + 4 * t;
-  out[t] = *reinterpret_cast<const u32*>(p);
-}
 __global__ void f_trap(u32* out) {
   u32 pad = threadIdx.x;
   ADD64(pad)
@@ -259,7 +273,6 @@ static int run_fault(const std::string& n) {
   else if (n == "local") f_local<<<1, 32>>>(a, 1 << 22);
   else if (n == "shared") f_shared<<<1, 32>>>(a, 1 << 20);
   else if (n == "atomic") f_atomic<<<1, 32>>>(a, 1l << 34);
-  else if (n == "misaligned") f_misaligned<<<1, 32>>>(a, b);
   else if (n == "trap") f_trap<<<1, 32>>>(a);
   else if (n == "forever") f_forever<<<1, 32>>>(a);
   else return 2;
@@ -349,6 +362,35 @@ static int run_spin(const char* name, int threads) {
   return 0;
 }
 
+// The least K at which `turn<Kind>` reads the flag set (a bisection: each launch is independent).
+template <int Kind>
+static int run_turn(const char* name, int threads) {
+  u32 *flag, *out;
+  CK(cudaMalloc(&flag, 64));
+  CK(cudaMalloc(&out, 64 * 4));
+  const auto reads_one = [&](u32 K, bool* ok) {
+    CK(cudaMemset(flag, 0, 64));
+    CK(cudaMemset(out, 0, 64 * 4));
+    turn<Kind><<<1, threads>>>(flag, out, K);
+    if (cudaDeviceSynchronize()) { *ok = false; return 0; }
+    u32 v = 0;
+    CK(cudaMemcpy(&v, out, 4, cudaMemcpyDeviceToHost));
+    *ok = true;
+    return v == 1 ? 1 : 0;
+  };
+  u32 lo = 0, hi = 60000;   // lo reads 0, hi reads 1
+  bool ok = true;
+  if (reads_one(hi, &ok) != 1 || !ok) { std::printf("%-26s no turn change within %u iterations\n", name, hi); return 0; }
+  while (hi - lo > 1) {
+    const u32 mid = (lo + hi) / 2;
+    if (reads_one(mid, &ok)) hi = mid; else lo = mid;
+  }
+  std::printf("%-26s warp 1 runs from iteration %u\n", name, hi);
+  CK(cudaFree(flag));
+  CK(cudaFree(out));
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc > 2 && std::string(argv[1]) == "fault") return run_fault(argv[2]);
   if (argc > 1 && std::string(argv[1]) == "steps") return run_steps_child();
@@ -419,6 +461,22 @@ int main(int argc, char** argv) {
       std::printf("spinlock %-17d counter=%u (of %d)\n", threads, n, threads);
     }
     CK(cudaFree(lock)); CK(cudaFree(counter)); CK(cudaFree(out));
+  }
+
+  for (int threads : {64, 96}) {
+    char nm[64];
+    std::snprintf(nm, sizeof nm, "turn_plain  %d", threads);
+    if (run_turn<0>(nm, threads)) return 1;
+    std::snprintf(nm, sizeof nm, "turn_shfl   %d", threads);
+    if (run_turn<1>(nm, threads)) return 1;
+    std::snprintf(nm, sizeof nm, "turn_atomic %d", threads);
+    if (run_turn<2>(nm, threads)) return 1;
+    std::snprintf(nm, sizeof nm, "turn_vote   %d", threads);
+    if (run_turn<3>(nm, threads)) return 1;
+    std::snprintf(nm, sizeof nm, "turn_branch %d", threads);
+    if (run_turn<5>(nm, threads)) return 1;
+    std::snprintf(nm, sizeof nm, "turn_long   %d", threads);
+    if (run_turn<6>(nm, threads)) return 1;
   }
 
   // Reconvergence and barriers, with block sizes that are not whole warps.

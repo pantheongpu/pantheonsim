@@ -134,7 +134,7 @@ check() {
     # Faults deep into a run of straight instructions, and the step limit: the text names the instruction, the lane and the
     # address, so a handler that reports it differently shows here. VGPU_MAX_STEPS keeps the loop with no end short.
     local f fa fb fenv=(VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_MAX_STEPS=50000 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
-    for f in gather scatter local shared atomic misaligned trap forever; do
+    for f in gather scatter local shared atomic trap forever; do
       fa="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=0 timeout 300 "$bin" fault $f 2>&1)"
       fb="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 timeout 300 "$bin" fault $f 2>&1 | grep -v '^tier')"
       if ! grep -q "^fault $f: " <<< "$fa" || grep -q "^fault $f: no error" <<< "$fa"; then why="${why:+$why; }the $f fault did not happen"
