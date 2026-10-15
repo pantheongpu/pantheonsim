@@ -6194,14 +6194,46 @@ struct Machine {
 
   void buffer_access(Wave& w, const Inst& in, Group& g) {
     if (!w.exec) return;
-    const bool reads_data = in.dst.empty();   // a store, or an atomic
-    const Operand& data = reads_data ? in.src[0] : in.dst[0];
+    // A load with the LDS bit has no data register: its sources are the
+    // address, the resource and the scalar offset, and the data goes to LDS.
+    const bool lds_dma = in.lds_dma;
+    const bool reads_data = !lds_dma && in.dst.empty();   // a store, or an atomic
+    const Operand& data = lds_dma ? in.src[0] : reads_data ? in.src[0] : in.dst[0];   // (unused, with the LDS bit)
     const Operand& vaddr = in.src[reads_data ? 1 : 0];
     const Operand& rsrc = in.src[reads_data ? 2 : 1];
     const Operand& soff = in.src[reads_data ? 3 : 2];
+    // The words each lane brings, and where in LDS they go. CDNA3 ISA 9.1.9 lists the
+    // loads that may have the LDS bit: ubyte, sbyte, ushort, sshort, dword and
+    // format_x; CDNA4 ISA 9.1.9 adds dwordx3 and dwordx4. Its figure gives
+    //   LDS_ADDR = LDSbase + M0[15:0] + inst_offset + TIDinWave * 4
+    // (TIDinWave * 16 for three or four dwords, which "writes 3 dwords and skips
+    // the 4th"), and MEM_ADDR as any buffer access's. The dword forms are run;
+    // the sub-dword and format_x forms are not: the guides give the LDS stride
+    // (4 bytes a lane) but not whether a byte load writes one byte or a
+    // zero-extended dword. gfx90a's guide was not consulted.
+    uint32_t lds_words = 0;
+    uint64_t lds_at = 0;
+    if (lds_dma) {
+      const std::string_view op = in.name;
+      lds_words = op == "buffer_load_dword" ? 1 : op == "buffer_load_dwordx3" ? 3 : op == "buffer_load_dwordx4" ? 4 : 0;
+      const bool wide = lds_words > 1;
+      if (!lds_words || in.arch == gcn::Target::Gfx90a || gcn::is_rdna(in.arch) || (wide && in.arch != gcn::Target::Gfx950))
+        throw Error::make(Err::Unsupported, in.name, " loads straight into LDS, which this does not model for this form");
+      // M0's LDS offset: bits 15:0 in CDNA3's text and in both figures; CDNA4's
+      // text says "18-bit unsigned byte offset from M0[17:0]", which differs
+      // only where M0 reaches 64 KiB. The documents contradict each other, so
+      // an M0 that high is refused, not guessed at.
+      if (w.m0 >> 16)
+        throw Error::make(Err::Unsupported, in.name, " with M0 = ", w.m0,
+                          ": CDNA4 ISA 9.1.9 gives the LDS offset as M0[17:0] in its text and M0[15:0] in its figure");
+      lds_at = uint64_t{w.m0} + static_cast<uint32_t>(in.offset);
+    }
     const uint32_t d1 = w.sgpr[rsrc.index + 1], records = w.sgpr[rsrc.index + 2], d3 = w.sgpr[rsrc.index + 3];
     const uint64_t base = w.sgpr[rsrc.index] | static_cast<uint64_t>(d1 & 0xFFFF) << 32;
-    if (base == kScratchResourceBase) return scratch_buffer_access(w, in, g, data, vaddr, soff);
+    if (base == kScratchResourceBase) {
+      if (lds_dma) throw Error::make(Err::Unsupported, in.name, " loads straight into LDS from scratch, which this does not model");
+      return scratch_buffer_access(w, in, g, data, vaddr, soff);
+    }
     const uint32_t stride = (d1 >> 16) & 0x3FFF;
     // RDNA's resource (V#) keeps the same base, stride and record count, but
     // a 2-bit swizzle, a 7-bit format at bits 18:12 in place of gfx9's data
@@ -6258,7 +6290,17 @@ struct Machine {
           }
         return stride ? index < records : soffset + at + bytes <= records;
       };
-      if (formatted) {
+      if (lds_dma) {
+        // Out of range reads zero, as for any buffer load.
+        const uint64_t to = lds_at + uint64_t{lane} * 4 * lds_words;
+        if (to + 4 * lds_words > g.lds.size())
+          throw Error::make(Err::InvalidValue, in.name, " writes LDS at ", to, ", past the ", g.lds.size(),
+                            " bytes the work-group has");
+        uint32_t v[4] = {0, 0, 0, 0};
+        for (uint32_t k = 0; k < lds_words; ++k)
+          if (fits(offset + 4 * k, 4)) v[k] = static_cast<uint32_t>(load(addr + 4 * k, 4));
+        std::memcpy(&g.lds[to], v, 4 * lds_words);
+      } else if (formatted) {
         formatted_access(w, in, body, format, d3, data, lane, addr, fits(offset, image::texel_bytes(format)));
       } else if (Half h; half_access(body, &h)) {
         if (h.store) {
@@ -7559,6 +7601,7 @@ struct Machine {
         if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
         else ++n.vmem_rd, issued_load(w);
         buffer_access(w, in, g);
+        if (in.lds_dma) ++n.lds;
         return true;
       case gcn::Enc::Mtbuf:
         ++n.vmem;

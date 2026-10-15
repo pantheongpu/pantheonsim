@@ -7,7 +7,7 @@ name: vLLM nightly
 # (amd/tests/e2e/run_vllm_amd.sh). ROCm's libraries are AMD's 7.2.3 release;
 # the HIP and HSA runtimes and the ROCm SMI and AMD SMI libraries are the
 # simulator's. Nightly, as it takes ROCm's libraries and vLLM's wheels, some
-# 30 GB, on every run.
+# 30 GB, on every run. Each GPU runs vLLM twice: eager, and as it runs by default (torch.compile and CUDA graphs).
 
 on:
   schedule:
@@ -24,7 +24,7 @@ jobs:
   vllm:
     name: vLLM on ${{ matrix.gpu }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -50,3 +50,11 @@ jobs:
           VGPU_BUILD_DIR=build amd/tests/e2e/run_vllm_amd.sh "${{ matrix.gpu }}" | tee vllm.log
           # A skip means the job lost what it installed: here that is a failure.
           if grep -q '^SKIP' vllm.log; then echo "::error::the vLLM test skipped"; exit 1; fi
+      - name: vLLM as it runs by default, with torch.compile and CUDA graphs
+        run: |
+          set -o pipefail
+          export VGPU_VLLM_PYTHON="$HOME/vllm-venv/bin/python"
+          # Compiled by Inductor and Triton, the decode step captured into HIP graphs
+          # (piecewise and full) for batch sizes 1 and 2, two prompts together.
+          VGPU_VLLM_MODE=graphs VGPU_BUILD_DIR=build amd/tests/e2e/run_vllm_amd.sh "${{ matrix.gpu }}" | tee vllm-graphs.log
+          if grep -q '^SKIP' vllm-graphs.log; then echo "::error::the vLLM test skipped"; exit 1; fi

@@ -2,10 +2,14 @@
 
 torch.compile turns a function into Triton kernels that Triton compiles for
 the device and loads through HIP at run time; a Triton kernel written by
-hand goes the same way. Each is checked against the CPU. One line each:
+hand goes the same way. Each is checked against the CPU: reductions, scans,
+sorts, random numbers, dynamic shapes, a training step's forward and
+backward, and the "reduce-overhead" mode that records the compiled kernels
+into a HIP graph and replays it (what vLLM does to its model). One line each:
 "ok <name>", or "FAIL <name>: <why>".
 """
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -60,3 +64,77 @@ try:
     check('a Triton kernel written by hand', c, a + b, 0.0)
 except Exception as e:
     print(f"FAIL a Triton kernel written by hand: {type(e).__name__}: {str(e).splitlines()[0][:200]}", flush=True)
+
+
+def run(name, f):
+    try:
+        why = f()
+        print(f"ok {name}" if why is None else f"FAIL {name}: {why}", flush=True)
+    except Exception as e:
+        print(f"FAIL {name}: {type(e).__name__}: {str(e).splitlines()[0][:200]}", flush=True)
+
+
+def diff(got, want, tol):
+    d = float((got.detach().float().cpu() - want.detach().float()).abs().max())
+    return None if d <= tol else f"max difference {d:g}, allowed {tol:g}"
+
+
+def reduce_overhead():
+    # Dynamo, Inductor and cudagraph trees: warm-up runs, then the kernels
+    # recorded into a graph, which later calls replay with the inputs copied
+    # in. The inputs change between calls, so a stale replay would be seen.
+    def f(x, w):
+        return torch.relu(x @ w).sum(1)
+    g = torch.compile(f, mode="reduce-overhead")
+    for i in range(4):
+        x, w = torch.randn(32, 32), torch.randn(32, 16)
+        if (why := diff(g(x.cuda(), w.cuda()), f(x, w), 1e-3)):
+            return f"call {i}: {why}"
+
+
+def scan_and_sort():
+    def f(t):
+        return torch.cumsum(t, -1) + torch.cumprod(torch.sigmoid(t), -1) + torch.sort(t, -1)[0]
+    t = torch.randn(16, 300)
+    return diff(torch.compile(f)(t.cuda()), f(t), 1e-3)
+
+
+def dynamic_shapes():
+    f = torch.compile(lambda t: torch.softmax(t, -1) * t.shape[0], dynamic=True)
+    for n in (5, 9, 33):
+        t = torch.randn(n, 70)
+        if (why := diff(f(t.cuda()), torch.softmax(t, -1) * n, 1e-5)):
+            return f"{n} rows: {why}"
+
+
+def random_numbers():
+    f = torch.compile(lambda t: F.dropout(t, 0.5, True) + torch.rand_like(t))
+    t = torch.ones(4096, device='cuda')
+    a, b = f(t), f(t)
+    if torch.equal(a, b):
+        return "two calls drew the same numbers"
+    return None if float(a.min()) >= 0 and float(a.max()) <= 3 else "values outside [0, 3]"
+
+
+def training_step():
+    torch.manual_seed(0)
+    m = torch.nn.Sequential(torch.nn.Linear(32, 64), torch.nn.GELU(), torch.nn.LayerNorm(64), torch.nn.Linear(64, 8))
+    x, y = torch.randn(16, 32), torch.randint(0, 8, (16,))
+    want = m(x)
+    F.cross_entropy(want, y).backward()
+    grads = [p.grad.clone() for p in m.parameters()]
+    for p in m.parameters():
+        p.grad = None
+    out = torch.compile(m.cuda())(x.cuda())
+    F.cross_entropy(out, y.cuda()).backward()
+    for p, g in zip(m.parameters(), grads):
+        if (why := diff(p.grad, g, 2e-3)):
+            return f"gradient: {why}"
+    return diff(out, want, 1e-3)
+
+
+run('torch.compile with mode="reduce-overhead" (compiled kernels in a HIP graph)', reduce_overhead)
+run('torch.compile of a cumulative sum, product and sort', scan_and_sort)
+run('torch.compile with dynamic shapes', dynamic_shapes)
+run('torch.compile of dropout and rand_like draws new numbers per call', random_numbers)
+run('torch.compile of a training step, forward and backward', training_step)

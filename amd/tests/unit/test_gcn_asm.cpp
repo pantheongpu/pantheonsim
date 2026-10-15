@@ -363,6 +363,56 @@ VTEST(global_loads_into_lds_land_where_m0_the_offset_and_the_lane_say) {
   VCHECK_EQ(wrong, 0);
 }
 
+// The buffer loads with the LDS bit (CDNA3 and CDNA4 ISA 9.1.9): lane L's data is read from
+//   mem_offset + inst_offset + off_vgpr  (off_vgpr = 16 L here)
+// of a 640-byte resource (zero where that lies past its end) and written to
+//   M0 + inst_offset + 4 L bytes of LDS, or 16 L for three or four dwords.
+// src[i] = 7 i + 1, so a wrong word shows.
+VTEST(buffer_loads_into_lds_land_where_m0_the_offset_and_the_lane_say_gfx950) {
+  const amd::CodeObject o = object("asm_buffer_lds", "gfx950");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> src(256);
+  for (uint32_t i = 0; i < src.size(); ++i) src[i] = i * 7 + 1;
+  const uint64_t in = mem.alloc(256 * 4), out = mem.alloc(768 * 4);
+  mem.write(in, src.data(), 256 * 4);
+  const std::vector<uint32_t> r = run(o, "buf_lds", mem, out, 768, {in, out});
+  std::vector<uint32_t> want(768, 0);
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    // dwordx4: M0 0, no offset, scalar offset 0: bytes 16 L .. 16 L + 15 of the resource.
+    for (uint32_t k = 0; k < 4; ++k)
+      if (16 * lane + 4 * k + 4 <= 640) want[lane * 4 + k] = src[lane * 4 + k];
+    // dwordx3: M0 0x400, offset 4, scalar offset 16: bytes 20 + 16 L ..; LDS at 0x404 + 16 L, the fourth dword skipped.
+    for (uint32_t k = 0; k < 3; ++k)
+      if (20 + 16 * lane + 4 * k + 4 <= 640) want[257 + lane * 4 + k] = src[5 + lane * 4 + k];
+    // dword: M0 0x800, offset 8: byte 8 + 16 L; LDS at 0x808 + 4 L.
+    if (8 + 16 * lane + 4 <= 640) want[514 + lane] = src[lane * 4 + 2];
+  }
+  int wrong = 0;
+  for (size_t i = 0; i < want.size(); ++i) wrong += r[i] != want[i];
+  VCHECK_EQ(wrong, 0);
+  VCHECK_EQ(r[4 * 40], 0u);   // lane 40 of the dwordx4: past the end of the resource
+}
+
+VTEST(buffer_loads_into_lds_land_where_m0_the_offset_and_the_lane_say_gfx942) {
+  const amd::CodeObject o = object("asm_buffer_lds_cdna3", "gfx942");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> src(256);
+  for (uint32_t i = 0; i < src.size(); ++i) src[i] = i * 7 + 1;
+  const uint64_t in = mem.alloc(256 * 4), out = mem.alloc(768 * 4);
+  mem.write(in, src.data(), 256 * 4);
+  const std::vector<uint32_t> r = run(o, "buf_lds942", mem, out, 768, {in, out});
+  std::vector<uint32_t> want(768, 0);
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    // dword: M0 0x400, offset 4, scalar offset 16: byte 20 + 16 L; LDS at 0x404 + 4 L.
+    if (20 + 16 * lane + 4 <= 640) want[257 + lane] = src[5 + lane * 4];
+    // dword: M0 0x800, offset 8: byte 8 + 16 L; LDS at 0x808 + 4 L.
+    if (8 + 16 * lane + 4 <= 640) want[514 + lane] = src[lane * 4 + 2];
+  }
+  int wrong = 0;
+  for (size_t i = 0; i < want.size(); ++i) wrong += r[i] != want[i];
+  VCHECK_EQ(wrong, 0);
+}
+
 VTEST(transposing_lds_reads_hand_each_lane_its_column) {
   // Destination lane l's element r is element l mod tile of lane A's read,
   // A = lane bits t..t+b-1, then r, then lane bits t+b and up (t = log2 tile;

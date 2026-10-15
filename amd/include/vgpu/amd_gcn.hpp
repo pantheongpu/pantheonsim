@@ -107,6 +107,10 @@ struct Inst {
   uint32_t saddr = 0;            // a global_* instruction's scalar base, when it has one
   bool has_saddr = false;
   bool has_vaddr = true;         // a scratch_* instruction may address by offset alone
+  // CDNA's MUBUF load with the LDS bit set: its data goes to LDS, at M0 and the
+  // offset, not to a register, so it has no data operand (the sources are the
+  // address register, the resource and the scalar offset).
+  bool lds_dma = false;
   // Which of the one address space a memory instruction reaches: flat (the
   // address decides), global, or a work-item's private memory.
   enum class Segment { Flat, Scratch, Global } segment = Segment::Global;

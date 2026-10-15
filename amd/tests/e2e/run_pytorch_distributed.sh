@@ -4,7 +4,12 @@
 # RCCL's collectives and DistributedDataParallel, device memory reaching
 # across the processes through HIP's IPC handles. Set up as run_pytorch.sh
 # sets up PyTorch; each process is held to its own memory cap.
+#
+# run_pytorch_distributed.sh [script expected]: another script under
+# amd/tests/pytorch, and how many "ok" lines the two ranks print in all
+# (distributed_graphs.py 4: RCCL collectives recorded into HIP graphs).
 set -uo pipefail
+script="${1:-distributed.py}" expected="${2:-8}"
 build="${VGPU_BUILD_DIR:-build}"
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 shim="$build/shim/libamdhip64.so.7"
@@ -36,7 +41,7 @@ port=$((29500 + RANDOM % 1000))
 for r in 0 1; do
   (cd "$tmp" && VGPU_GPU=amd/mi300x VGPU_DEVICE_COUNT=2 VGPU_MEMORY_RAM_MB="${VGPU_MEMORY_RAM_MB:-2048}" \
      PYTHONPATH="$tmp" MASTER_ADDR=127.0.0.1 MASTER_PORT=$port RANK=$r WORLD_SIZE=2 NCCL_DEBUG=ERROR \
-     timeout 900 "${cap[@]}" "$python" "$root/amd/tests/pytorch/distributed.py" > "$tmp/rank$r.log" 2>&1
+     timeout 900 "${cap[@]}" "$python" "$root/amd/tests/pytorch/$script" > "$tmp/rank$r.log" 2>&1
    echo "exit $?" >> "$tmp/rank$r.log") &
 done
 wait
@@ -55,9 +60,9 @@ for r in 0 1; do
   [[ "$st" == "exit 0" ]] || { echo "FAIL  rank $r ran to the end ($st)"; tail -5 "$tmp/rank$r.log" | sed 's/^/      /'; fail=1; }
 done
 passed=$(grep -c '^ok ' <<< "$out")
-if grep -q '^FAIL ' <<< "$out" || [[ $passed != 8 ]]; then
-  echo "FAIL  torch.distributed across two processes: $passed of 8"; fail=1
+if grep -q '^FAIL ' <<< "$out" || [[ $passed != "$expected" ]]; then
+  echo "FAIL  torch.distributed ($script) across two processes: $passed of $expected"; fail=1
 else
-  echo "ok    torch.distributed across two processes: 8 of 8"
+  echo "ok    torch.distributed ($script) across two processes: $expected of $expected"
 fi
 exit $fail

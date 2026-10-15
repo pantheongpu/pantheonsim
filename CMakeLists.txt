@@ -1468,6 +1468,11 @@ endforeach()
 add_test(NAME amd_vllm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vllm_amd.sh amd/mi300x)
 set_tests_properties(amd_vllm PROPERTIES DEPENDS "vgpuhip;vgpuamdsmi;vgpursmi" RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 5400)
+# And as vLLM runs by default: torch.compile and CUDA graphs (piecewise and full,
+# batch sizes 1 and 2), two prompts generated together.
+add_test(NAME amd_vllm_graphs COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vllm_amd.sh amd/mi300x)
+set_tests_properties(amd_vllm_graphs PROPERTIES DEPENDS "vgpuhip;vgpuamdsmi;vgpursmi" RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_VLLM_MODE=graphs" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 5400)
 add_test(NAME amd_amdsmi_python COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_amdsmi_python.sh)
 set_tests_properties(amd_amdsmi_python PROPERTIES DEPENDS vgpuamdsmi
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
@@ -1673,9 +1678,38 @@ set_tests_properties(amd_pytorch_rx6700xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL 
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};HSA_OVERRIDE_GFX_VERSION=10.3.0" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # torch.compile's Triton kernels, and one written by hand, compiled and loaded
 # at run time.
-add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 3 1)
+add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 8 1)
 set_tests_properties(amd_pytorch_compile PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+# CUDA graphs (HIP graphs): a model's launches, copies and events recorded by
+# stream capture and replayed, as vLLM's decode step and torch.compile's
+# "reduce-overhead" mode do; on every generation the simulator has.
+foreach(_g mi300x mi350x mi250x rx7900xtx rx9070xt)
+  set(_name amd_pytorch_graphs)
+  if(NOT _g STREQUAL "mi300x")
+    set(_name amd_pytorch_graphs_${_g})
+  endif()
+  add_test(NAME ${_name} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh graphs.py 17 1 amd/${_g})
+  set_tests_properties(${_name} PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+endforeach()
+# Triton's AMD backend on hand-written kernels (amd/tests/pytorch/triton.py):
+# MFMA or WMMA in each input type, attention, reductions, atomics. The number
+# of checks depends on the device: fp8 products on gfx942 (two more) and gfx950
+# (two more, and the MX-scaled product).
+foreach(_g mi300x:18 mi350x:19 mi250x:16 rx7900xtx:16 rx9070xt:16)
+  string(REPLACE ":" ";" _p ${_g})
+  list(GET _p 0 _gpu)
+  list(GET _p 1 _count)
+  add_test(NAME amd_pytorch_triton_${_gpu} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh triton.py ${_count} 1 amd/${_gpu})
+  set_tests_properties(amd_pytorch_triton_${_gpu} PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+endforeach()
+# Triton's asynchronous copies on gfx950 (global memory to LDS without
+# registers: buffer_load_* with the LDS bit), which it uses when asked to.
+add_test(NAME amd_pytorch_triton_async_copy_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh triton.py 19 1 amd/mi350x)
+set_tests_properties(amd_pytorch_triton_async_copy_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};TRITON_HIP_USE_ASYNC_COPY=1" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # Whole models (amd/tests/pytorch/models.py): a GPT trained with a schedule and
 # generating with a KV cache, a ResNet, an LSTM, a U-Net, a vision transformer,
 # mixture of experts, a recommender, mixed precision, activation checkpointing
@@ -1710,6 +1744,11 @@ set_tests_properties(amd_pytorch_xf32 PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
 # DistributedDataParallel.
 add_test(NAME amd_pytorch_distributed COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch_distributed.sh)
 set_tests_properties(amd_pytorch_distributed PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# RCCL's collectives recorded into HIP graphs across two processes: the all-reduces
+# of a tensor-parallel decode step, which vLLM captures and replays.
+add_test(NAME amd_pytorch_graphs_distributed COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch_distributed.sh distributed_graphs.py 6)
+set_tests_properties(amd_pytorch_graphs_distributed PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # And on two devices: RCCL's collectives and DataParallel between them.
 add_test(NAME amd_pytorch_multi_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh multi_gpu.py 9 2)
