@@ -2993,6 +2993,9 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
   add_test(NAME lint_capture_coverage
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_capture_coverage.py)
+  # A curl that downloads a file retries on any error (a dropped HTTP/2 stream is not retried by --retry alone).
+  add_test(NAME lint_curl_retries
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_curl_retries.py)
   # A key repeated in a workflow file makes GitHub refuse the whole file (it then runs on every push as a
   # failure with no jobs, and its schedule stops): the check reads every workflow for one.
   add_test(NAME lint_workflow_yaml
