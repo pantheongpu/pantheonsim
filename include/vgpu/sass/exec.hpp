@@ -90,7 +90,17 @@ struct Module {
   std::map<uint64_t, std::string> builtins;   // magic address -> vprintf, malloc, ...
   bool device_launches = false;               // it can launch kernels (dynamic parallelism)
 
-  const Code* code_at(uint64_t addr) const;   // the section holding a code address
+  // The section holding a code address, or null for an address in no section (before the first, past the last, or
+  // in the padding between two). Sections are placed in ascending order and never overlap (load() places them), so
+  // this is a binary search over their start addresses, which index_code() records; the answer is the one
+  // code_at_linear gives, which is the original first-match scan and is kept as the reference the unit test
+  // (tests/unit/test_sass_code_at.cpp) compares with.
+  const Code* code_at(uint64_t addr) const;
+  const Code* code_at_linear(uint64_t addr) const;
+  // Records code[i].base for code_at. Called by load() once the sections are placed; a module whose sections are not
+  // in ascending, non-overlapping order (none that load() makes) keeps no index and code_at scans.
+  void index_code();
+  std::vector<uint64_t> code_bases;           // code[i].base, when index_code() found the sections in order
 };
 
 // Loads a cubin (checked against the device: it must be one the profile's

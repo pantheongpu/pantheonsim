@@ -527,7 +527,7 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
         }
       }
       if (done) {
-        count_access(blk.st, 0, Store, addrs, ex, bytes);
+        count_run(blk.st, Store, g0, first, count, ex, bytes);
         return;
       }
     }
@@ -603,20 +603,37 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
   uint8_t* sh = blk.shared.data();
   uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
   const unsigned words = std::max(1u, bytes / 4);
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    uint8_t* at = sh + (addrs[l] & 0xffffff);
-    if (Store) {
-      uint32_t v[4] = {};
-      for (unsigned i = 0; i < words; ++i) v[i] = d ? d[32 * i + l] : 0;
-      std::memcpy(at, v, bytes);
-    } else {
-      uint32_t v[4] = {};
-      std::memcpy(v, at, bytes);
-      if (d) {
-        if (bytes <= 4) d[l] = tier_extend(op.b, v[0]);
+  // (The widths the instruction can have move with copies of a size known at compile time: see store_lane_bytes.)
+  const bool moved = with_lane_width(bytes, [&](auto width) {
+    constexpr unsigned B = decltype(width)::value;
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      uint8_t* at = sh + (addrs[l] & 0xffffff);
+      if (Store) {
+        store_lane_bytes<B>(at, [&](unsigned i) -> uint32_t { return d ? d[32 * i + l] : 0u; });
+      } else if (d) {
+        if constexpr (B <= 4) d[l] = tier_extend(op.b, load_lane_word<B>(at));
         else
-          for (unsigned i = 0; i < words; ++i) d[32 * i + l] = v[i];
+          for (unsigned i = 0; i < B / 4; ++i) d[32 * i + l] = load_lane_word<B>(at, i);
+      }
+    }
+  });
+  if (!moved) {
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      uint8_t* at = sh + (addrs[l] & 0xffffff);
+      if (Store) {
+        uint32_t v[4] = {};
+        for (unsigned i = 0; i < words; ++i) v[i] = d ? d[32 * i + l] : 0;
+        std::memcpy(at, v, bytes);
+      } else {
+        uint32_t v[4] = {};
+        std::memcpy(v, at, bytes);
+        if (d) {
+          if (bytes <= 4) d[l] = tier_extend(op.b, v[0]);
+          else
+            for (unsigned i = 0; i < words; ++i) d[32 * i + l] = v[i];
+        }
       }
     }
   }
@@ -649,20 +666,36 @@ static void h_local(void* vc, const tier::MOp& op, Mask ex) {
   if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
   uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
   const unsigned words = std::max(1u, bytes / 4);
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    uint8_t* at = &w.local[size_t{l} * w.local_size + addrs[l]];
-    if (Store) {
-      uint32_t v[4] = {};
-      for (unsigned i = 0; i < words; ++i) v[i] = d ? d[32 * i + l] : 0;
-      std::memcpy(at, v, bytes);
-    } else {
-      uint32_t v[4] = {};
-      std::memcpy(v, at, bytes);
-      if (d) {
-        if (bytes <= 4) d[l] = tier_extend(op.b, v[0]);
+  const bool moved = with_lane_width(bytes, [&](auto width) {
+    constexpr unsigned B = decltype(width)::value;
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      uint8_t* at = &w.local[size_t{l} * w.local_size + addrs[l]];
+      if (Store) {
+        store_lane_bytes<B>(at, [&](unsigned i) -> uint32_t { return d ? d[32 * i + l] : 0u; });
+      } else if (d) {
+        if constexpr (B <= 4) d[l] = tier_extend(op.b, load_lane_word<B>(at));
         else
-          for (unsigned i = 0; i < words; ++i) d[32 * i + l] = v[i];
+          for (unsigned i = 0; i < B / 4; ++i) d[32 * i + l] = load_lane_word<B>(at, i);
+      }
+    }
+  });
+  if (!moved) {
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      uint8_t* at = &w.local[size_t{l} * w.local_size + addrs[l]];
+      if (Store) {
+        uint32_t v[4] = {};
+        for (unsigned i = 0; i < words; ++i) v[i] = d ? d[32 * i + l] : 0;
+        std::memcpy(at, v, bytes);
+      } else {
+        uint32_t v[4] = {};
+        std::memcpy(v, at, bytes);
+        if (d) {
+          if (bytes <= 4) d[l] = tier_extend(op.b, v[0]);
+          else
+            for (unsigned i = 0; i < words; ++i) d[32 * i + l] = v[i];
+        }
       }
     }
   }

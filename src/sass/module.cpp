@@ -18,10 +18,32 @@ bool runs_on(int cubin_sm, bool arch_specific, int device_sm) {
   return cubin_sm / 10 == device_sm / 10 && cubin_sm <= device_sm;
 }
 
-const Code* Module::code_at(uint64_t addr) const {
+const Code* Module::code_at_linear(uint64_t addr) const {
   for (const Code& c : code)
     if (addr >= c.base && addr < c.base + 16 * c.count) return &c;
   return nullptr;
+}
+
+void Module::index_code() {
+  code_bases.clear();
+  for (size_t i = 0; i < code.size(); ++i) {
+    // Each section must end at or before the next one starts (an empty one ends where it starts). Then at most one
+    // section holds an address, and it is the last whose base is at or below it: the scan's first match.
+    if (i + 1 < code.size() && (code[i].base + 16 * code[i].count < code[i].base ||
+                                code[i].base + 16 * code[i].count > code[i + 1].base)) {
+      code_bases.clear();
+      return;
+    }
+    code_bases.push_back(code[i].base);
+  }
+}
+
+const Code* Module::code_at(uint64_t addr) const {
+  if (code_bases.size() != code.size() || code.empty()) return code_at_linear(addr);
+  const auto it = std::upper_bound(code_bases.begin(), code_bases.end(), addr);
+  if (it == code_bases.begin()) return nullptr;
+  const Code& c = code[static_cast<size_t>(it - code_bases.begin()) - 1];
+  return addr >= c.base && addr < c.base + 16 * c.count ? &c : nullptr;
 }
 
 // An instruction the decoder does not know is kept as an unknown one and
@@ -165,6 +187,7 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
     m->code_index[s.name] = m->code.size();
     m->code.push_back(std::move(code));
   }
+  m->index_code();
   for (size_t i = 0; i < c.kernels.size(); ++i) {
     if (!m->code_index.count(c.kernels[i].text_section))
       throw Error(Err::InvalidValue, "cubin: kernel " + c.kernels[i].name + " has no code");
