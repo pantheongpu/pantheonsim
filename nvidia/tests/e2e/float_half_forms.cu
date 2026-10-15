@@ -184,7 +184,7 @@ __global__ void k_wmma_tf32(const float* a, const float* b, const float* c, floa
   wmma::mma_sync(fc, fa, fb, fc);
   wmma::store_matrix_sync(d + t * 256, fc, 16, wmma::mem_row_major);
 }
-static uint32_t mix32(uint32_t x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
+static __host__ __device__ __forceinline__ uint32_t mix32(uint32_t x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
 
 // Double arithmetic on NaNs with distinct signs and payloads (the answer is a NaN that is one of the operands', quieted: b's if b is
 // a NaN, else a's, and for an fma b's, else c's, else a's -- an RTX 3060; the instruction's |x| and -x change the arithmetic, not a
@@ -249,6 +249,78 @@ __global__ void k_sad(const uint32_t* in, uint32_t* out, int n) {
   out[6 * i + 4] = static_cast<uint32_t>(__sad(static_cast<int>(a), static_cast<int>(b), 0x80000000u));
   out[6 * i + 5] = __usad(a, 0xffffffffu, c);
 }
+
+// mma.sync of f16, bf16 and tf32 operands with random registers, summed by the tensor core (include/vgpu/exec/tc_ampere.hpp in the
+// simulator): style 0 finite values over wide exponent ranges (a sequential f32 sum differs from the card's chunked, truncating one in
+// the low bits of most results), style 1 uniformly random bits (infinities, NaNs, subnormals, products past the f32 range). Each
+// form's hash is over every lane's result registers.
+__device__ __forceinline__ uint32_t rw(int style, char kind, uint32_t seed, uint32_t lane, uint32_t idx) {
+  uint32_t h = mix32(seed * 0x9E3779B9u ^ mix32(lane * 131u + idx * 7919u + 17u));
+  if (style == 1) return h;
+  if (kind == 'h') {
+    uint32_t g = mix32(h + 1), w = 0;
+    for (int e = 0; e < 2; ++e) {
+      const uint32_t x = e ? g : h;
+      w |= (((x & 0x8000u) | (((x >> 16) % 30 + 1) << 10) | ((x >> 1) & 0x3ffu))) << (16 * e);
+    }
+    return w;
+  }
+  if (kind == 'b') {
+    uint32_t g = mix32(h + 1), w = 0;
+    for (int e = 0; e < 2; ++e) {
+      const uint32_t x = e ? g : h;
+      w |= (((x & 0x8000u) | (((x >> 16) % 250 + 3) << 7) | ((x >> 1) & 0x7fu))) << (16 * e);
+    }
+    return w;
+  }
+  return (h & 0x807fffffu) | (((h >> 8) % 240 + 8) << 23);   // 't': any float, 8-bit exponent, low mantissa bits as they are
+}
+__device__ __forceinline__ uint32_t rc(int style, uint32_t seed, uint32_t lane, uint32_t idx) {
+  uint32_t h = mix32(seed * 0x85EBCA6Bu ^ mix32(lane * 977u + idx * 31u + 5u));
+  if (style == 1) return h;
+  return (h & 0x807fffffu) | (((h >> 8) % 120 + 60) << 23);
+}
+#define MMA_FORM(NAME, SHAPE, ATYPE, KIND, NA, NB, NC, ACC16)                                                                              \
+  __global__ void NAME(int style, uint32_t seed, uint32_t* out) {                                                                          \
+    const uint32_t lane = threadIdx.x;                                                                                                     \
+    uint32_t a[NA], b[NB], c[NC], d[NC];                                                                                                   \
+    for (int i = 0; i < NA; ++i) a[i] = rw(style, KIND, seed, lane, i);                                                                    \
+    for (int i = 0; i < NB; ++i) b[i] = rw(style, KIND, seed + 7, lane, i);                                                                \
+    for (int i = 0; i < NC; ++i) c[i] = ACC16 ? rw(style, 'h', seed + 13, lane, i) : rc(style, seed + 13, lane, i);                        \
+    MMA_ASM_##NAME;                                                                                                                        \
+    for (int i = 0; i < NC; ++i) out[lane * NC + i] = d[i];                                                                                \
+  }
+#define MMA_ASM_k_mma_f16_k16 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]))
+#define MMA_ASM_k_mma_f16_k8 asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(b[0]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]))
+#define MMA_ASM_k_mma_f16acc_k16 asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%9};" : "=r"(d[0]), "=r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(c[0]), "r"(c[1]))
+#define MMA_ASM_k_mma_bf16_k16 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]))
+#define MMA_ASM_k_mma_bf16_k8 asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(b[0]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]))
+#define MMA_ASM_k_mma_tf32_k8 asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]))
+#define MMA_ASM_k_mma_tf32_k4 asm volatile("mma.sync.aligned.m16n8k4.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};" : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(b[0]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]))
+MMA_FORM(k_mma_f16_k16, 0, 0, 'h', 4, 2, 4, false)
+MMA_FORM(k_mma_f16_k8, 0, 0, 'h', 2, 1, 4, false)
+MMA_FORM(k_mma_f16acc_k16, 0, 0, 'h', 4, 2, 2, true)
+MMA_FORM(k_mma_bf16_k16, 0, 0, 'b', 4, 2, 4, false)
+MMA_FORM(k_mma_bf16_k8, 0, 0, 'b', 2, 1, 4, false)
+MMA_FORM(k_mma_tf32_k8, 0, 0, 't', 4, 2, 4, false)
+MMA_FORM(k_mma_tf32_k4, 0, 0, 't', 2, 1, 4, false)
+
+// Hand-picked cases of the tensor core's rule (signs of zero, cancellation, subnormal and overflowing terms, infinities, NaNs, terms
+// below the alignment grid), one m16n8k8 f16 mma each: only element (0,0) is read. A row 0 = a[0..7], B column 0 = b[0..7], C(0,0) = c.
+__global__ void k_case(const uint16_t* a, const uint16_t* b, const float* c, float* d, int n) {
+  const int lane = threadIdx.x, g = lane >> 2, t4 = lane & 3;
+  const int cs = blockIdx.x;
+  uint32_t ra0 = 0, ra1 = 0, rb0 = 0;
+  const uint16_t* ca = a + cs * 8; const uint16_t* cb = b + cs * 8;
+  if (g == 0) { ra0 = ca[2 * t4] | (uint32_t)ca[2 * t4 + 1] << 16; }
+  if (g == 0) { rb0 = cb[2 * t4] | (uint32_t)cb[2 * t4 + 1] << 16; }   // B col 0 -> lane group g = 0 holds column 0
+  float c0 = (g == 0 && t4 == 0) ? c[cs] : 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+  float d0, d1, d2, d3;
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};"
+               : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3) : "r"(ra0), "r"(ra1), "r"(rb0), "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+  if (g == 0 && t4 == 0) d[cs] = d0;
+}
+struct EdgeCase { const char* name; uint16_t a[8], b[8]; uint32_t c; };
 
 static uint64_t fnv_step(uint64_t h, uint64_t v, int bytes) {
   for (int i = 0; i < bytes; ++i) h = (h ^ ((v >> (8 * i)) & 0xff)) * 1099511628211ull;
@@ -429,6 +501,83 @@ int main() {
       std::printf("%s %016llx\n", sn[f], static_cast<unsigned long long>(hh));
     }
     CK(cudaFree(din)); CK(cudaFree(dout));
+  }
+  {
+    uint32_t* d;
+    CK(cudaMalloc(&d, 32 * 4 * 4));
+    uint32_t h[128];
+    struct Form { const char* name; void (*fn)(int, uint32_t, uint32_t*); int words; };
+    const Form forms[] = {{"mma_f16_k16", k_mma_f16_k16, 128}, {"mma_f16_k8", k_mma_f16_k8, 128}, {"mma_f16acc_k16", k_mma_f16acc_k16, 64},
+                          {"mma_bf16_k16", k_mma_bf16_k16, 128}, {"mma_bf16_k8", k_mma_bf16_k8, 128}, {"mma_tf32_k8", k_mma_tf32_k8, 128},
+                          {"mma_tf32_k4", k_mma_tf32_k4, 128}};
+    for (const Form& f : forms)
+      for (int style = 0; style < 2; ++style) {
+        uint64_t hh = 1469598103934665603ull;
+        for (uint32_t seed = 1; seed <= 24; ++seed) {
+          f.fn<<<1, 32>>>(style, seed, d);
+          CK(cudaGetLastError());
+          CK(cudaDeviceSynchronize());
+          CK(cudaMemcpy(h, d, f.words * 4, cudaMemcpyDeviceToHost));
+          for (int i = 0; i < f.words; ++i) hh = fnv_step(hh, h[i], 4);
+        }
+        std::printf("%s style%d %016llx\n", f.name, style, static_cast<unsigned long long>(hh));
+      }
+    CK(cudaFree(d));
+  }
+  {
+    std::vector<EdgeCase> cs;
+    auto add = [&](const char* nm, std::initializer_list<uint16_t> a, std::initializer_list<uint16_t> b, uint32_t c) {
+      EdgeCase k{}; k.name = nm; int i = 0; for (auto x : a) k.a[i++] = x; i = 0; for (auto x : b) k.b[i++] = x; k.c = c; cs.push_back(k); };
+    const uint16_t one = 0x3c00, mone = 0xbc00, z = 0, mz = 0x8000, big = 0x7bff, sub = 0x0001, inf = 0x7c00, minf = 0xfc00, nan = 0x7e00;
+    const uint32_t F0 = 0, FM0 = 0x80000000u, F1 = 0x3f800000u, FM1 = 0xbf800000u, FMAX = 0x7f7fffffu, FNMAX = 0xff7fffffu, FSUB = 1u, FINF = 0x7f800000u, FNINF = 0xff800000u;
+    add("zeros +0", {z,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, F0);
+    add("zeros c=-0", {z,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, FM0);
+    add("neg zero products c=-0", {mz,mz,mz,mz,mz,mz,mz,mz}, {one,one,one,one,one,one,one,one}, FM0);
+    add("neg zero products c=+0", {mz,mz,mz,mz,mz,mz,mz,mz}, {one,one,one,one,one,one,one,one}, F0);
+    add("neg zero products one pos c=-0", {mz,mz,mz,mz,mz,mz,mz,z}, {one,one,one,one,one,one,one,one}, FM0);
+    add("cancel +1-1 c=0", {one,mone,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, F0);
+    add("cancel +1-1 c=-0", {one,mone,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, FM0);
+    add("cancel c=1, -1", {mone,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, F1);
+    add("cancel c=-1, +1", {one,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, FM1);
+    add("overflow c=max + big*big", {big,z,z,z,z,z,z,z}, {big,one,one,one,one,one,one,one}, FMAX);
+    add("overflow c=max + 1*1", {one,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, FMAX);
+    add("overflow c=-max - big*big", {mone,z,z,z,z,z,z,z}, {big,one,one,one,one,one,one,one}, FNMAX);
+    add("overflow c=max + 2e30-ish", {big,big,big,big,big,big,big,big}, {big,big,big,big,big,big,big,big}, FMAX);
+    add("tiny c=2^-149 + 0", {z,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, FSUB);
+    add("tiny c=2^-149 + sub*sub", {sub,z,z,z,z,z,z,z}, {sub,one,one,one,one,one,one,one}, FSUB);
+    add("sub*sub only", {sub,z,z,z,z,z,z,z}, {sub,one,one,one,one,one,one,one}, F0);
+    add("sub*one + c=sub f32", {sub,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, 0x00000400u);
+    add("c subnormal f32 neg + products", {sub,sub,sub,sub,sub,sub,sub,sub}, {sub,sub,sub,sub,sub,sub,sub,sub}, 0x80000003u);
+    add("f32 min normal - tiny", {mone,z,z,z,z,z,z,z}, {sub,one,one,one,one,one,one,one}, 0x00800000u);
+    add("inf*1", {inf,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, F0);
+    add("inf*0", {inf,z,z,z,z,z,z,z}, {z,one,one,one,one,one,one,one}, F0);
+    add("inf + -inf", {inf,minf,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, F0);
+    add("inf + c=-inf", {inf,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, FNINF);
+    add("c=inf + finite", {one,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, FINF);
+    add("nan in a", {nan,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, F0);
+    add("nan c payload", {one,z,z,z,z,z,z,z}, {one,one,one,one,one,one,one,one}, 0xffc12345u);
+    add("sum 1+2^-24", {one,sub,z,z,z,z,z,z}, {one,0x0400,one,one,one,one,one,one}, F1);
+    // random-ish exact edges: alignment depth checks
+    add("1 + 2^-23*0.5 (below grid)", {one,0x0001,z,z,z,z,z,z}, {one,0x0001,one,one,one,one,one,one}, F1);
+    add("c=1; product 2^-25", {0x1400,z,z,z,z,z,z,z}, {0x1400,one,one,one,one,one,one,one}, F1);
+    add("c=1; product 2^-26", {0x1000,z,z,z,z,z,z,z}, {0x1800,one,one,one,one,one,one,one}, F1);
+
+    const int n = static_cast<int>(cs.size());
+    std::vector<uint16_t> a(8 * n), b(8 * n); std::vector<float> c(n), d(n);
+    for (int i = 0; i < n; ++i) { std::memcpy(&a[8 * i], cs[i].a, 16); std::memcpy(&b[8 * i], cs[i].b, 16); std::memcpy(&c[i], &cs[i].c, 4); }
+    uint16_t *da, *db; float *dc, *dd;
+    CK(cudaMalloc(&da, a.size() * 2)); CK(cudaMalloc(&db, b.size() * 2)); CK(cudaMalloc(&dc, n * 4)); CK(cudaMalloc(&dd, n * 4));
+    CK(cudaMemcpy(da, a.data(), a.size() * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(db, b.data(), b.size() * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dc, c.data(), n * 4, cudaMemcpyHostToDevice)); CK(cudaMemset(dd, 0xAB, n * 4));
+    k_case<<<n, 32>>>(da, db, dc, dd, n);
+    CK(cudaGetLastError());
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(d.data(), dd, n * 4, cudaMemcpyDeviceToHost));
+    for (int i = 0; i < n; ++i) {
+      uint32_t u; std::memcpy(&u, &d[i], 4);
+      std::printf("mma_edge_%02d %08x\n", i, u);   // (one line per case: the names are in float_half_forms.cu)
+    }
+    CK(cudaFree(da)); CK(cudaFree(db)); CK(cudaFree(dc)); CK(cudaFree(dd));
   }
   return 0;
 }

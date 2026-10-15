@@ -1,6 +1,7 @@
 // Dispatch for the SIMD kernels (include/vgpu/simd/simd.hpp). The kernels are
 // in kernels.inc, compiled once for the baseline and once under a target
 // pragma.
+#include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/simd/simd.hpp"
 
 #include <algorithm>

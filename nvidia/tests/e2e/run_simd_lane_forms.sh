@@ -5,12 +5,13 @@
 #
 #   nvidia/tests/data/simd_lane_forms.sass.txt, .ptx.txt   the simulator's own hashes, pinned (a kernel that changes
 #                                                           a bit anywhere fails here)
-#   nvidia/tests/data/simd_lane_forms.rtx3060.txt          an RTX 3060's hashes. The simulator agrees with it on
-#                                                           every integer, float, half and double form; the
-#                                                           tensor-core forms over full-range random data differ (the
-#                                                           card orders its sums differently, and the pinned files
-#                                                           keep what the simulator does). The card-checked tensor
-#                                                           forms are mma_forms and wmma_types.
+#   nvidia/tests/data/simd_lane_forms.rtx3060.txt          an RTX 3060's hashes. The simulator agrees with it on every line, on both
+#                                                           engines: the integer, float, half and double forms, and the f16, bf16 and
+#                                                           tf32 tensor core over full-range random data and over the special values
+#                                                           (the tensor core sums in chunks with truncation, include/vgpu/exec/
+#                                                           tc_ampere.hpp; the sequential f32 sum this simulator used before differed
+#                                                           from the card on the random lines). So the pinned files ARE the card's
+#                                                           lines, and this script requires it.
 #
 #   run_simd_lane_forms.sh                  simulator vs the pinned files
 #   run_simd_lane_forms.sh --card [--update]   NVIDIA's runtime on a real GPU vs the card file (or rewrite it)
@@ -56,5 +57,10 @@ for engine in sass ptx; do
     fi
   done
 done
-echo "(informational) lines where the simulator differs from the RTX 3060: sass $(diff "$data/simd_lane_forms.rtx3060.txt" "$data/simd_lane_forms.sass.txt" | grep -c '^>') ptx $(diff "$data/simd_lane_forms.rtx3060.txt" "$data/simd_lane_forms.ptx.txt" | grep -c '^>')"
+# The pinned files are the card's lines: SASS == PTX == card.
+for engine in sass ptx; do
+  if ! diff "$data/simd_lane_forms.rtx3060.txt" "$data/simd_lane_forms.$engine.txt" > "$out/d.txt"; then
+    echo "FAIL: simd_lane_forms.$engine.txt differs from the RTX 3060's lines:"; head -10 "$out/d.txt"; fails=1
+  fi
+done
 (( fails == 0 )) && echo PASS || { echo FAIL; exit 1; }

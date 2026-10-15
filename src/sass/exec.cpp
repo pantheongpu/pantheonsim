@@ -43,6 +43,7 @@
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/numerics.hpp"
+#include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/texture_grad.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"

@@ -109,3 +109,47 @@ usad_imm_b_c c46f6b98da62636f
 sad_imm_b 746f7bd7570212b0
 sad_imm_c dc1f1bd7d0eb1d63
 usad_imm_b 55cd7d76235bae0d
+mma_f16_k16 style0 590154e34c7adabb
+mma_f16_k16 style1 d08efa4a4139f6b5
+mma_f16_k8 style0 1752a23c2fdfa213
+mma_f16_k8 style1 c085c1ba65d6aaee
+mma_f16acc_k16 style0 ee8ee3131005ebce
+mma_f16acc_k16 style1 4e5d026ae784ce7a
+mma_bf16_k16 style0 e4b3d4d74ddb89f2
+mma_bf16_k16 style1 bb986fa346cb239b
+mma_bf16_k8 style0 79d5e3f217c750f1
+mma_bf16_k8 style1 ea0609a471500fb9
+mma_tf32_k8 style0 bbcf3abdea540752
+mma_tf32_k8 style1 90cde3f70041e303
+mma_tf32_k4 style0 412db646c860c37d
+mma_tf32_k4 style1 d3255168fceecbbc
+mma_edge_00 00000000
+mma_edge_01 00000000
+mma_edge_02 00000000
+mma_edge_03 00000000
+mma_edge_04 00000000
+mma_edge_05 00000000
+mma_edge_06 00000000
+mma_edge_07 00000000
+mma_edge_08 00000000
+mma_edge_09 7f7fffff
+mma_edge_10 7f7fffff
+mma_edge_11 ff7fffff
+mma_edge_12 7f7fffff
+mma_edge_13 00000001
+mma_edge_14 27800000
+mma_edge_15 27800000
+mma_edge_16 33800000
+mma_edge_17 29000000
+mma_edge_18 b3800000
+mma_edge_19 7f800000
+mma_edge_20 7fffffff
+mma_edge_21 7fffffff
+mma_edge_22 7fffffff
+mma_edge_23 7f800000
+mma_edge_24 7fffffff
+mma_edge_25 7fffffff
+mma_edge_26 40000000
+mma_edge_27 40000000
+mma_edge_28 3f800008
+mma_edge_29 3f800008

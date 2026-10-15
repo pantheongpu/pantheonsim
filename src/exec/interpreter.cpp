@@ -50,6 +50,7 @@
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/numerics.hpp"
+#include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
 #include "vgpu/exec/tma.hpp"
@@ -8701,6 +8702,22 @@ class Interpreter {
     };
     const bool narrow_tensor_core = profile_.cc_major == 12 && narrow_elem(op.ab_type) && narrow_elem(op.b_type) &&
                                     !op.acc_int && !op.acc_f64 && !op.acc_f16;
+    // An RTX 3060's tensor core (sm_86) sums f16, bf16 and tf32 products in chunks (include/vgpu/exec/tc_ampere.hpp), not one at a time
+    // in f32: D for the whole tile first, then taken instead of the sequential sum below. Not the sparse, block-scaled or narrow forms.
+    const bool tc86_sum = vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && !op.sparse && !op.block_scale &&
+                          (op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16 || op.ab_type == MmaElem::TF32) &&
+                          op.b_type == op.ab_type && !op.acc_int && !op.acc_f64 && K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0;
+    std::array<float, 16 * kN> Dtc{};
+    if (tc86_sum) {
+      std::array<float, 16 * 16> Af{};
+      std::array<float, 16 * kN> Bf{}, Cf{};
+      for (uint32_t x = 0; x < M * K; ++x) Af[x] = static_cast<float>(A[x]);
+      for (uint32_t x = 0; x < K * kN; ++x) Bf[x] = static_cast<float>(B[x]);
+      for (uint32_t x = 0; x < M * kN; ++x) Cf[x] = static_cast<float>(C[x]);
+      vgpu::exec::tc86::mma(M, kN, K, op.ab_type == MmaElem::TF32 ? 4 : 8,
+                            op.ab_type == MmaElem::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, op.acc_f16, Af.data(), K,
+                            Bf.data(), kN, Cf.data(), kN, Dtc.data(), kN);
+    }
     const int prev_round = std::fegetround();
     if (op.acc_f64) {
       switch (op.rnd) {
@@ -8745,6 +8762,8 @@ class Interpreter {
             terms[k] = op.block_scale ? (A[i * K + k] * SA[i][k / sblock]) * (B[k * kN + j] * SB[j][k / sblock])
                                       : A[i * K + k] * B[k * kN + j];
           D[i * kN + j] = static_cast<double>(vgpu::exec::mma_narrow_sum(terms, K, static_cast<float>(C[i * kN + j])));
+        } else if (tc86_sum) {
+          D[i * kN + j] = static_cast<double>(Dtc[i * kN + j]);
         } else {
           float acc = static_cast<float>(C[i * kN + j]);
           if (op.block_scale)
@@ -9696,7 +9715,11 @@ class Interpreter {
       }
     }
     alignas(32) float D[kMmaDim][kMmaDim];
-    wmma_tile(D, A, B, C, kMmaDim);
+    if (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor))   // (include/vgpu/exec/tc_ampere.hpp)
+      vgpu::exec::tc86::mma(kMmaDim, kMmaDim, kMmaDim, 8, bf ? vgpu::exec::tc86::kEminWide : vgpu::exec::tc86::kEminF16, false, af, kMmaDim,
+                            bff, kMmaDim, cf, kMmaDim, &D[0][0], kMmaDim);
+    else
+      wmma_tile(D, A, B, C, kMmaDim);
     const float* const df = &D[0][0];
     // Every register of D, written after all of A, B and C have been read:
     // D may name the same registers as C.
@@ -9872,14 +9895,29 @@ class Interpreter {
     std::vector<uint64_t> D(size_t{M} * N);
     const WmmaType at = op.atype;
     if (at == WmmaType::F16 || at == WmmaType::BF16 || at == WmmaType::TF32) {
-      // Products and sums in f32, k in order, as the f32-accumulator path does;
-      // an f16 result is that rounded once.
+      // On an RTX 3060 (sm_86) the tensor core's chunked truncating sum (include/vgpu/exec/tc_ampere.hpp); elsewhere products and sums in
+      // f32, k in order, as the f32-accumulator path does. An f16 result is that rounded once.
+      const bool tc = vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && M <= 32 && N <= 32 && K <= 16 &&
+                      K % (at == WmmaType::TF32 ? 4 : 8) == 0;
+      std::vector<float> Dtc;
+      if (tc) {
+        std::vector<float> Af(A.begin(), A.end()), Bf(B.begin(), B.end()), Cf(C.begin(), C.end());
+        Dtc.resize(size_t{M} * N);
+        // A tensor core with an f16 accumulator when both the accumulator and the result are f16; otherwise the f32 sum, then converted.
+        const bool acc16 = op.ctype == WmmaType::F16 && op.dtype == WmmaType::F16;
+        vgpu::exec::tc86::mma(M, N, K, at == WmmaType::TF32 ? 4 : 8, at == WmmaType::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
+                              acc16, Af.data(), K, Bf.data(), N, Cf.data(), N, Dtc.data(), N);
+      }
       for (uint32_t i = 0; i < M; ++i)
         for (uint32_t j = 0; j < N; ++j) {
           float acc = static_cast<float>(C[size_t{i} * N + j]);
-          for (uint32_t k = 0; k < K; ++k) {
-            const float prod = static_cast<float>(A[size_t{i} * K + k]) * static_cast<float>(B[size_t{k} * N + j]);
-            acc = acc + prod;
+          if (tc) {
+            acc = Dtc[size_t{i} * N + j];
+          } else {
+            for (uint32_t k = 0; k < K; ++k) {
+              const float prod = static_cast<float>(A[size_t{i} * K + k]) * static_cast<float>(B[size_t{k} * N + j]);
+              acc = acc + prod;
+            }
           }
           // (f16: double_to_f16 answers a NaN with the canonical 0x7fff; f32: the canonical 0x7fffffff, as the tile does.)
           D[size_t{i} * N + j] = op.dtype == WmmaType::F16 ? double_to_f16(acc) : canon32(acc);
@@ -10010,7 +10048,11 @@ class Interpreter {
     // Each element still accumulates its products in k order, exactly as the
     // element-by-element form did; running j innermost lets it vectorize.
     float D[kMmaDim][kMmaDim];
-    wmma_tile(D, A, B, C, K);
+    if (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor))   // (include/vgpu/exec/tc_ampere.hpp)
+      vgpu::exec::tc86::mma(kMmaDim, kMmaDim, K, tf ? 4 : 8, bf || tf ? vgpu::exec::tc86::kEminWide : vgpu::exec::tc86::kEminF16, false,
+                            &A[0][0], kMmaDim, &B[0][0], kMmaDim, &C[0][0], kMmaDim, &D[0][0], kMmaDim);
+    else
+      wmma_tile(D, A, B, C, K);
     // Scatter D back into the destination fragment.
     for (int reg = 0; reg < 8; ++reg) {
       Lanes r;  // written for every active lane below

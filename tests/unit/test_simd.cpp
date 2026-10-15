@@ -792,20 +792,16 @@ VTEST(double_lanes_and_popcount) {
         const uint64_t u = (mask >> i) & 1 ? std::bit_cast<uint64_t>(r) : uint64_t{olo[i]} | (uint64_t{ohi[i]} << 32);
         const uint64_t g = uint64_t{dlo[i]} | (uint64_t{dhi[i]} << 32);
         // A NaN operand decides the result by the kernel's rule, not by the host instruction the compiler picked: the
-        // first NaN of (b, a) for a sum or product (as the scalar code and an RTX 3060 do) and of (b, a, c) for an fma,
-        // with its quiet bit set.
+        // first NaN of (b, a) for a sum or product and of (b, c, a) for an fma, with its quiet bit set, taken as the register
+        // holds it -- the |x| and -x modifiers change the arithmetic and not the NaN that is the answer (an RTX 3060, probed
+        // with distinct payloads in every position: float_half_forms.cu).
         uint64_t u2 = u;
         {
-          const auto raw = [&](int s) {
-            uint64_t v = uint64_t{lo[s][i]} | (uint64_t{hi[s][i]} << 32);
-            if (mods & (1u << (2 * s))) v &= 0x7fffffffffffffffull;
-            if (mods & (2u << (2 * s))) v ^= 0x8000000000000000ull;
-            return v;
-          };
+          const auto raw = [&](int s) { return uint64_t{lo[s][i]} | (uint64_t{hi[s][i]} << 32); };
           const auto nan = [](uint64_t v) { return (v & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
           const uint64_t ra = raw(0), rb = raw(1), rc = kind == 2 ? raw(2) : 0;
           if (nan(ra) || nan(rb) || nan(rc)) {
-            const uint64_t pick = kind == 2 ? (nan(rb) ? rb : nan(ra) ? ra : rc) : (nan(rb) ? rb : ra);
+            const uint64_t pick = kind == 2 ? (nan(rb) ? rb : nan(rc) ? rc : ra) : (nan(rb) ? rb : ra);
             if ((mask >> i) & 1) u2 = pick | 0x0008000000000000ull;
           }
         }

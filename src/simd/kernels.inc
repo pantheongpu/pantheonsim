@@ -107,6 +107,9 @@ inline void transpose8x8(float* dst, const float* src) {
 
 void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const uint32_t* b, const uint32_t* c,
             uint32_t* out) {
+  // Bit 4 of `kind` asks for an RTX 3060's tensor-core sum (vgpu/exec/tc_ampere.hpp) in place of the sequential f32 one.
+  const bool ampere = (kind & 16) != 0;
+  kind &= 3;
   const unsigned per_reg = kind == 2 ? 1 : 2, L = 4 * per_reg;
   const unsigned a_regs = K / (2 * per_reg), b_regs = K / (4 * per_reg);
   alignas(32) float FA[256], FB[128];
@@ -146,6 +149,10 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
         std::memcpy(&Cm[(g + 8 * h) * 8 + 4], &hi, sizeof hi);
       }
   }
+  if (ampere) {
+    vgpu::exec::tc86::mma(16, 8, K, kind == 2 ? 4 : 8, kind == 0 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, acc_f16, A, K, Bm, 8, Cm, 8,
+                          Dm, 8);
+  } else
   for (unsigned i0 = 0; i0 < 16; i0 += 4) {
     V8f acc0, acc1, acc2, acc3;
     std::memcpy(&acc0, &Cm[(i0 + 0) * 8], sizeof acc0);

@@ -4059,7 +4059,8 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
       const uint32_t* pa = ra == kRZ ? kZero : &w.reg(ra, 0);
       const uint32_t* pb = rb == kRZ ? kZero : &w.reg(rb, 0);
       uint32_t out[4 * 32];
-      simd::kernels().hmma(at == MmaT::F16 ? 0u : at == MmaT::BF16 ? 1u : 2u, K, acc == AccF16, pa, pb,
+      // (An sm_86 cubin sums as an RTX 3060's tensor core does: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
+      simd::kernels().hmma((at == MmaT::F16 ? 0u : at == MmaT::BF16 ? 1u : 2u) | (m_.sm == 86 ? 16u : 0u), K, acc == AccF16, pa, pb,
                            rc == kRZ ? nullptr : &w.reg(rc, 0), out);
       if (rd != kRZ)
         each_lane(ex, [&](unsigned l) {
@@ -4147,6 +4148,18 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
       C[cd(l, s)] = v;
     }
   double D[16 * kN] = {};
+  // An sm_86 cubin's f16, bf16 and tf32 products sum as an RTX 3060's tensor core does (vgpu/exec/tc_ampere.hpp): the whole tile first.
+  const bool tc86_sum = m_.sm == 86 && ins.op == Op::HMMA && !sparse && (at == MmaT::F16 || at == MmaT::BF16 || at == MmaT::TF32) && bt == at &&
+                        (acc == AccF32 || acc == AccF16) && K <= 16 && K % (at == MmaT::TF32 ? 4 : 8) == 0;
+  float Dtc[16 * kN] = {};
+  if (tc86_sum) {
+    float Af[16 * 16], Bf[16 * kN], Cf[16 * kN];
+    for (unsigned x = 0; x < M * K; ++x) Af[x] = static_cast<float>(A[x]);
+    for (unsigned x = 0; x < K * kN; ++x) Bf[x] = static_cast<float>(B[x]);
+    for (unsigned x = 0; x < M * kN; ++x) Cf[x] = static_cast<float>(C[x]);
+    vgpu::exec::tc86::mma(M, kN, K, at == MmaT::TF32 ? 4 : 8, at == MmaT::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
+                          acc == AccF16, Af, K, Bf, kN, Cf, kN, Dtc, kN);
+  }
   const auto narrow_elem = [](MmaT t) {
     return t == MmaT::E4M3 || t == MmaT::E5M2 || t == MmaT::E3M2 || t == MmaT::E2M3 || t == MmaT::E2M1 || t == MmaT::E2M1P;
   };
@@ -4183,6 +4196,8 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
           terms[k] = block_scaled ? (A[i * K + k] * SA[i][k / sblock]) * (B[k * kN + j] * SB[j][k / sblock])
                                   : A[i * K + k] * B[k * kN + j];
         D[i * kN + j] = exec::mma_narrow_sum(terms, K, static_cast<float>(C[i * kN + j]));
+      } else if (tc86_sum) {
+        D[i * kN + j] = Dtc[i * kN + j];
       } else {
         float a = static_cast<float>(C[i * kN + j]);
         const unsigned sblock = K / scale_vec;

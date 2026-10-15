@@ -1629,8 +1629,11 @@ sums its rows as it writes them and goes over a tile again only when that sum is
 a NaN, so a tile without one pays one add per vector. The sanitizer skip and the
 `_nonan` twin lines in simd_lane_forms are gone: its pinned hashes are the same in
 Release 13.0 and 12.0 and in the CI ThreadSanitizer Debug configuration.
-`wgmma`, `tcgen05` and the `m8n8k4` form of `mma` still add f32 products in scalar
-code and are not covered by this.
+`wgmma`, `tcgen05` and the `m8n8k4` form of `mma` added f32 products in scalar
+code and were not covered by this: **round 9 (2026-10-15)** found the same compiler-order
+dependence there with a Debug TSan `-O1` / Release pair (wgmma's D[0][0] was 0x7fc02000 in Release and
+0xffc00000 under TSan, tcgen05's the other way round) and made all three write 0x7fffffff;
+see nvidia/docs/sass.md, "Numerics checked against an RTX 3060".
 **2026-10-13/15, round 8 (the SASS engine's operations, r8-sass).** The forms the general path still took -- 64-bit address arithmetic with
 carries, float forms with .FTZ/.SAT/a rounding mode, half-precision forms, MUFU, conversions, FMNMX, DSETP, PRMT, SHFL/VOTE, scattered, broadcast
 and 16-byte global accesses, atomics -- run over 32 lanes with SIMD kernels or batch memory calls; main vs this branch (SASS, 9 alternating runs):
@@ -2283,3 +2286,18 @@ its roadmap (:278-285); docs/telemetry.md:454-456 and `src/cli/serve.cpp:8` ("AM
 implemented"); README.md:60 on Nsight; the header comment of `src/exec/interpreter.cpp` (barriers in
 divergent code, IPDOM); `vgpu counters`' spill note (`src/cli/main.cpp:103-114`, left as a comment in this
 file's "Registers and counters" because it is output text, not documentation).
+
+
+**2026-10-15 (round 9, r9-correct): SASS == PTX == card.** The new e2e `float_half_forms` hashes the
+single-instruction f32/f16/f64 forms and mma.sync/wmma/__sad per form against an RTX 3060, and both
+engines now print exactly the card's lines. Found: SASS `.SAT` of -0, `FMNMX` of two NaNs, `MUFU` NaNs
+and TANH subnormals, `PRMT` modes, `HADD2.F32`/`F2FP`/`F2F` NaNs and `.RELU` of -0, double NaN operand
+rules, `VABSDIFF` undecoded (silent PTX fallback); PTX `cvt.rmi.ftz`, f64 min/max/add/mul/fma NaNs,
+wmma tf32 (rounded at load, the card truncates). The tensor core's f32 sum is the chunked truncating
+one described in include/vgpu/exec/tc_ampere.hpp (measured, all 106496 results), for sm_86 only;
+cost: a SASS HMMA is about 3.4x slower than the sequential sum (0.047 s to 0.160 s for 96000 mma.sync/
+wmma in tools measured as A/B alternation below), the PTX engine 1.15x. Launch refusals report the
+card's 13.0 codes (cudaErrorInvalidValue, 701, 912). Still different from the card: the SFU
+approximations (rcp/sqrt/rsqrt/ex2 within 1 ulp, lg2/sin/cos/tanh more), the sign and NaN payload of a
+NaN that passes through a folded `neg`/`abs` on the PTX engine, the m8n8k4/sparse tensor forms and
+other architectures' tensor cores, device-side launch errors (cudaErrorInvalidConfiguration kept).

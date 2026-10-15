@@ -59,7 +59,7 @@ for engine in sass ptx; do
     if diff "$out/want.txt" "$out/sim.txt" > "$out/d.txt"; then
       echo "ok   $engine VGPU_SIMD=$level"
     else
-      echo "FAIL $engine VGPU_SIMD=$level: differs from the card's hashes"; head -20 "$out/d.txt"; fails=1
+      echo "FAIL $engine VGPU_SIMD=$level: differs from the card's hashes"; cat "$out/d.txt"; fails=1
     fi
   done
 done
