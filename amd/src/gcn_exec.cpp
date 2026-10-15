@@ -4497,29 +4497,6 @@ struct Machine {
         };
         write_lane(w, in.dst[0], lane, narrow(a) | narrow(b) << 16);
       });
-    } else if (op == "v_cvt_scalef32_pk_bf16_fp4"_op || op == "v_cvt_scalef32_pk_bf16_fp8"_op ||
-               op == "v_cvt_scalef32_pk_bf16_bf8"_op) {
-      // CDNA4 ISA, V_CVT_SCALEF32_PK_BF16_{FP4,FP8,BF8}: scale = exponent(S1.f32) (S1's biased exponent field, E8M0);
-      // FP4: byte OPSEL[1:0] of SRC0, its low nibble to the low bfloat16 and its high nibble to the high one; FP8 and
-      // BF8: 16-bit half OPSEL[0] of SRC0, its low byte to the low bfloat16. Each value is scaled by 2^(scale - 127).
-      // Assumed, not stated (the pseudocode's fp4_to_bf16_scale and its 8-bit kin are not defined): the product is exact
-      // and rounded to nearest even to bfloat16, and a scale of 0xFF (E8M0's NaN) or a NaN input gives NaN.
-      const bool is4 = op == "v_cvt_scalef32_pk_bf16_fp4"_op;
-      const F8& t = is4 ? kFp4 : op == "v_cvt_scalef32_pk_bf16_fp8"_op ? kOcpFp8 : kOcpBf8;
-      const uint32_t opsel = in.op_sel;
-      each([&](uint32_t lane) {
-        const uint32_t scale = (as_bits(lane_float(w, in.src[1], lane)) >> 23) & 0xFF;
-        const uint32_t src = lane_src(w, in.src[0], lane);
-        uint32_t r = 0;
-        for (uint32_t i = 0; i < 2; ++i) {
-          const uint32_t code = is4 ? (src >> (8 * (opsel & 3)) >> (4 * i)) & 0xF : (src >> (16 * (opsel & 1)) >> (8 * i)) & 0xFF;
-          const float v = f8_to_float(code, t);
-          const float scaled = scale == 0xFF || std::isnan(v) ? std::numeric_limits<float>::quiet_NaN()
-                                                              : static_cast<float>(std::ldexp(static_cast<double>(v), static_cast<int>(scale) - 127));
-          r |= (to_bf16(scaled) & 0xFFFFu) << (16 * i);
-        }
-        write_lane(w, in.dst[0], lane, r);
-      });
     } else if (op == "v_cvt_pkrtz_f16_f32"_op) {
       each([&](uint32_t lane) {
         // Two floats narrowed to halves and packed, each rounded toward zero.

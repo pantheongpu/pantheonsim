@@ -756,15 +756,6 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x2a3}, {"v_cvt_pk_bf8_f32", 1, 2}},
       {{Enc::Vop3, 0x2a4}, {"v_cvt_sr_fp8_f32", 1, 2}},
       {{Enc::Vop3, 0x2a5}, {"v_cvt_sr_bf8_f32", 1, 2}},
-      // gfx950's IEEE three-way minimum and maximum (CDNA4 ISA: V_MINIMUM3_F32 680, V_MAXIMUM3_F32 681),
-      // and their packed half forms (VOP3P 27 and 28, below).
-      // gfx950's scaled conversions of two 4- or 8-bit floats to bfloat16 (CDNA4 ISA, V_CVT_SCALEF32_PK_BF16_FP4 593,
-      // _FP8 617, _BF8 618), which Triton's MX-scaled dot uses for operands it widens first.
-      {{Enc::Vop3, 0x251}, {"v_cvt_scalef32_pk_bf16_fp4", 1, 2}},
-      {{Enc::Vop3, 0x269}, {"v_cvt_scalef32_pk_bf16_fp8", 1, 2}},
-      {{Enc::Vop3, 0x26a}, {"v_cvt_scalef32_pk_bf16_bf8", 1, 2}},
-      {{Enc::Vop3, 0x2a8}, {"v_minimum3_f32", 1, 3}},
-      {{Enc::Vop3, 0x2a9}, {"v_maximum3_f32", 1, 3}},
       // DS: LDS reads and writes. A read takes the address; a write takes the
       // address and the data.
       {{Enc::Ds, 0x00}, {"ds_add_u32", 0, 2}},
@@ -1088,9 +1079,6 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x2e}, {"v_mfma_f32_32x32x64_f8f6f4", 16, 3, 8, 8, 16}},
       // Two pairs of bfloat16s multiplied and added into a float (gfx950).
       {{Enc::Vop3p, 0x1a}, {"v_dot2_f32_bf16", 1, 3}},
-      // gfx950's component-wise IEEE minimum and maximum of three halves.
-      {{Enc::Vop3p, 0x1b}, {"v_pk_minimum3_f16", 1, 3}},
-      {{Enc::Vop3p, 0x1c}, {"v_pk_maximum3_f16", 1, 3}},
       {{Enc::Vop3p, 0x55}, {"v_mfma_f32_32x32x16_f16", 16, 3, 4, 4, 16}},
       {{Enc::Vop3p, 0x35}, {"v_mfma_f32_16x16x32_bf16", 4, 3, 4, 4, 4}},
       {{Enc::Vop3p, 0x37}, {"v_mfma_f32_32x32x16_bf16", 16, 3, 4, 4, 16}},
