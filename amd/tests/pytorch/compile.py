@@ -134,9 +134,9 @@ def training_step():
 
 
 def nan_propagation():
-    # Inductor lowers relu, maximum and clamp to Triton's tl.maximum / tl.minimum, which on
-    # gfx950 are v_maximum3_f32 and v_pk_maximum3_f16 (IEEE: a NaN in gives a NaN out). The
-    # CPU's answers, with NaNs and signed zeros in the inputs, are the reference.
+    # Inductor's relu, maximum, minimum and clamp keep a NaN (what torch's CPU does), each way
+    # its Triton lowers them (compare and select, or an IEEE minimum or maximum instruction).
+    # The CPU's answers, with NaNs and signed zeros in the inputs, are the reference.
     def f(x, y):
         return torch.relu(x), torch.maximum(x, y), torch.minimum(x, y), torch.clamp(y, -0.5, 0.5)
     x = torch.randn(257)

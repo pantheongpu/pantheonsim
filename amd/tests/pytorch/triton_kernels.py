@@ -12,7 +12,7 @@ each: "ok <name>", or "FAIL <name>: <why>".
 
 fp8 matrix products (gfx942's fnuz formats and gfx950's OCP ones) and MX-scaled
 products (gfx950) run on the devices that have them, so the number of lines
-depends on the device: 16, and 2 more on gfx942, 3 more on gfx950.
+depends on the device: 18, and 2 more on gfx942, 3 more on gfx950.
 """
 import torch
 import triton
@@ -160,6 +160,35 @@ def maths():
 
 
 @triton.jit
+def nan_kernel(a, b, c, o, n, BLOCK: tl.constexpr):
+    i = tl.arange(0, BLOCK)
+    m = i < n
+    x, y, z = tl.load(a + i, mask=m), tl.load(b + i, mask=m), tl.load(c + i, mask=m)
+    nan = tl.PropagateNan.ALL
+    tl.store(o + i, tl.maximum(tl.maximum(x, y, propagate_nan=nan), z, propagate_nan=nan))
+    tl.store(o + n + i, tl.minimum(tl.minimum(x, y, propagate_nan=nan), z, propagate_nan=nan))
+
+
+def nan_propagation(dtype):
+    # Three-way maximum and minimum that pass a NaN through: gfx950's v_maximum3_f32 and
+    # v_pk_maximum3_f16 (and the minimum forms). The CPU's torch.maximum and minimum also pass a
+    # NaN through, and treat -0 and +0 as equal.
+    def run():
+        n = 128
+        a, b, c = (torch.randn(n).to(dtype) for _ in range(3))
+        a[::5] = b[1::7] = float('nan')
+        a[2::11], b[2::11], c[2::11] = 0.0, -0.0, -0.0
+        o = torch.empty(2 * n, device=dev, dtype=dtype)
+        nan_kernel[(1,)](a.to(dev), b.to(dev), c.to(dev), o, n, BLOCK=128)
+        want = torch.cat([torch.maximum(torch.maximum(a, b), c), torch.minimum(torch.minimum(a, b), c)])
+        got = o.cpu()
+        if not torch.equal(torch.isnan(got), torch.isnan(want)):
+            return "NaNs in different places"
+        return close(torch.nan_to_num(got, nan=7.0), torch.nan_to_num(want, nan=7.0), 0)
+    return run
+
+
+@triton.jit
 def asm_kernel(x, o, BLOCK: tl.constexpr):
     i = tl.arange(0, BLOCK)
     tl.store(o + i, tl.inline_asm_elementwise("v_add_u32 $0, $1, 7", "=v,v", [tl.load(x + i)], dtype=tl.int32,
@@ -256,6 +285,8 @@ if arch == "gfx950":
 check("sum, max, argmax, cumsum, sort and histogram", reductions)
 check("atomic add (fp32, fp16, int32) and max", atomics)
 check("exp, log, sqrt, trigonometry, erf, tanh and libdevice pow", maths)
+check("three-way maximum and minimum passing NaNs, fp32", nan_propagation(torch.float32))
+check("three-way maximum and minimum passing NaNs, fp16", nan_propagation(torch.float16))
 check("inline assembly", inline_asm)
 check("block pointers with a boundary check, and a transpose", block_pointers)
 check("tl.device_print", device_print)
