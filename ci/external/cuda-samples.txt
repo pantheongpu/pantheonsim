@@ -95,7 +95,7 @@ Samples/3_CUDA_Features/cudaCompressibleMemory/cudaCompressibleMemory|||
 Samples/3_CUDA_Features/dmmaTensorCoreGemm/dmmaTensorCoreGemm|||
 Samples/3_CUDA_Features/globalToShmemAsyncCopy/globalToShmemAsyncCopy|Checking computed result for correctness: Result = PASS|-wA=128 -hA=128 -wB=128 -hB=128|
 Samples/3_CUDA_Features/graphConditionalNodes/graphConditionalNodes|||
-Samples/3_CUDA_Features/graphMemoryFootprint/graphMemoryFootprint||||3000
+Samples/3_CUDA_Features/graphMemoryFootprint/graphMemoryFootprint|||
 Samples/3_CUDA_Features/graphMemoryNodes/graphMemoryNodes|Validation PASSED!||
 Samples/3_CUDA_Features/warpAggregatedAtomicsCG/warpAggregatedAtomicsCG|Warp Aggregated Atomics PASSED ||
 Samples/4_CUDA_Libraries/MersenneTwisterGP11213/MersenneTwisterGP11213|L1 norm: 0.000000E+00||

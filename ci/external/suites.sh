@@ -26,6 +26,12 @@
 # the device memory the two leave after any kernel holds different bytes, as
 # nvidia/tools/sass_ptx_digest.sh does for the e2e programs.
 #
+# cuda-samples-known.txt lists the programs whose result differs from the card's
+# today (sample | class | reason | what fixes it): a listed one that differs is
+# reported, not failed, one that starts matching fails (take it off the list),
+# and every other difference fails. The list is a ratchet: it can only shrink.
+# A class of `skipped` marks a program too slow to run at all; it is not run.
+#
 # The builds use nvcc from PATH (CUDA 13.0, as the card's did) and do not
 # depend on the simulator, so CI caches them. `run` exits non-zero when any
 # program's result differs from the card's; report-dir gets one line per
@@ -228,26 +234,39 @@ run() {
   if [[ $mode == digest ]] && cc -shared -fPIC -O2 -o "$report/fixed_time.so" "$here/fixed_time.c" 2>/dev/null; then
     fixed_time="$report/fixed_time.so"
   fi
-  local fails=0 total=0
+  local fails=0 total=0 known_n=0
   result() {  # result <name> <ok|FAIL> <secs> <detail>
     printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$report/results.tsv"
     printf '%-4s %-36s %5ss  %s\n' "$2" "$1" "$3" "$4"
-    total=$((total + 1)); [[ $2 == ok ]] || fails=$((fails + 1))
+    total=$((total + 1))
+    case $2 in ok) ;; known) known_n=$((known_n + 1)) ;; *) fails=$((fails + 1)) ;; esac
   }
   case $suite in
     cuda-samples)
+      # The known differences, only on the default engine: another may differ where it does not.
+      ratchet=1; [[ ${VGPU_SASS:-1} == 0 ]] && ratchet=0
       while IFS='|' read -r path marker args extra run_timeout; do
         name=$(basename "$path"); exe="build/$path"; log="$report/logs/$name.log"
         marker=${marker//%7C/|}
-        [[ -x $exe ]] || { result "$name" FAIL 0 "did not build"; continue; }
-        # args: the sample's arguments; extra: environment (VGPU_DEVICE_COUNT=2 for
-        # the samples that want the card's two GPUs).
-        # shellcheck disable=SC2086
-        run_one "$name" "$(dirname "$exe")" "$log" ${extra:+env $extra} "./$name" $args
-        [[ $mode == digest ]] && { digest_result "$name"; continue; }
-        if [[ $rc != 0 ]]; then result "$name" FAIL "$secs" "exit $rc (the card's: 0)"
-        elif [[ -n $marker ]] && ! grep -qF -- "$marker" "$log"; then result "$name" FAIL "$secs" "no \"$marker\""
-        else result "$name" ok "$secs" ""; fi
+        IFS='|' read -r _ kclass kreason kfix < <(awk -F'|' -v n="$name" '$1 == n {print; exit}' "$here/cuda-samples-known.txt" 2>/dev/null)
+        kclass=${kclass:-}; kreason=${kreason:-}; kfix=${kfix:-}
+        if [[ $kclass == skipped ]]; then result "$name" known 0 "not run: $kreason ($kfix)"; continue; fi
+        outcome=ok; detail=""
+        if [[ ! -x $exe ]]; then outcome=FAIL; detail="did not build"; secs=0
+        else
+          # args: the sample's arguments; extra: environment (VGPU_DEVICE_COUNT=2 for
+          # the samples that want the card's two GPUs).
+          # shellcheck disable=SC2086
+          run_one "$name" "$(dirname "$exe")" "$log" ${extra:+env $extra} "./$name" $args
+          [[ $mode == digest ]] && { digest_result "$name"; continue; }
+          if [[ $rc != 0 ]]; then outcome=FAIL; detail="exit $rc (the card's: 0)"
+          elif [[ -n $marker ]] && ! grep -qF -- "$marker" "$log"; then outcome=FAIL; detail="no \"$marker\""; fi
+        fi
+        if [[ $mode == digest || -z $kclass ]]; then result "$name" "$outcome" "$secs" "$detail"
+        elif [[ $outcome == ok ]]; then
+          if (( ratchet )); then result "$name" FAIL "$secs" "matches the card now: take it off cuda-samples-known.txt (it was: $kclass, $kreason)"
+          else result "$name" ok "$secs" ""; fi
+        else result "$name" known "$secs" "$detail; known, $kclass: $kreason ($kfix)"; fi
       done < <(entries) ;;
     hecbench)
       while IFS='|' read -r d args card; do
@@ -332,19 +351,26 @@ run() {
         else result "$name" ok "$secs" ""; fi
       done < <(entries) ;;
   esac
+  known_msg=""; (( known_n )) && known_msg=", $known_n known differences"
   {
     if [[ $mode == digest ]]; then echo "### $suite on $gpu, SASS against PTX: $((total - fails)) of $total leave the same memory"
-    else echo "### $suite on $gpu: $((total - fails)) of $total ${verdict:-as on the RTX 3060}"; fi
+    else echo "### $suite on $gpu: $((total - fails - known_n)) of $total ${verdict:-as on the RTX 3060}$known_msg"; fi
     echo
     if (( fails )); then
       echo "| program | seconds | result |"; echo "|---|---|---|"
-      awk -F'\t' '$2 != "ok" {printf "| %s | %s | %s |\n", $1, $3, $4}' "$report/results.tsv"
+      awk -F'\t' '$2 == "FAIL" {printf "| %s | %s | %s |\n", $1, $3, $4}' "$report/results.tsv"
+      echo
+    fi
+    if (( known_n )); then
+      echo "Known differences (ci/external/$suite-known.txt; a program that starts matching fails the job until it is taken off):"; echo
+      echo "| program | seconds | what differs, why, and what fixes it |"; echo "|---|---|---|"
+      awk -F'\t' '$2 == "known" {printf "| %s | %s | %s |\n", $1, $3, $4}' "$report/results.tsv"
       echo
     fi
     echo "Slowest: $(sort -t$'\t' -k3,3nr "$report/results.tsv" | head -5 | awk -F'\t' '{printf "%s %ss, ", $1, $3}' | sed 's/, $//')"
   } > "$report/summary.md"
   if [[ $mode == digest ]]; then echo "$suite: $((total - fails)) of $total leave the same memory on SASS and PTX"
-  else echo "$suite: $((total - fails)) of $total ${verdict:-match the card}"; fi
+  else echo "$suite: $((total - fails - known_n)) of $total ${verdict:-match the card}$known_msg"; fi
   (( total > 0 && fails == 0 ))
 }
 
