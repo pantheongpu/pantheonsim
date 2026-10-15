@@ -1369,12 +1369,29 @@ bool activate(const ActDesc& a, double v, double* r) {
   }
 }
 
+template <cudnnActivationMode_t M>
+void act_span(const ActDesc& a, double* d, size_t n) {
+  for (size_t i = 0; i < n; ++i) d[i] = act_one<M>(a, d[i]);
+}
+// d[i] = act(d[i]) for i < n, the mode chosen once.
+void activate_span(const ActDesc& a, double* d, size_t n) {
+  switch (a.mode) {
+    case CUDNN_ACTIVATION_SIGMOID: act_span<CUDNN_ACTIVATION_SIGMOID>(a, d, n); break;
+    case CUDNN_ACTIVATION_RELU: act_span<CUDNN_ACTIVATION_RELU>(a, d, n); break;
+    case CUDNN_ACTIVATION_TANH: act_span<CUDNN_ACTIVATION_TANH>(a, d, n); break;
+    case CUDNN_ACTIVATION_CLIPPED_RELU: act_span<CUDNN_ACTIVATION_CLIPPED_RELU>(a, d, n); break;
+    case CUDNN_ACTIVATION_ELU: act_span<CUDNN_ACTIVATION_ELU>(a, d, n); break;
+    case CUDNN_ACTIVATION_SWISH: act_span<CUDNN_ACTIVATION_SWISH>(a, d, n); break;
+    default: break;
+  }
+}
+
 // v[i] = act(v[i]) for all i, the mode chosen once and the elements spread over the host's threads (they are independent).
 void activate_all(const ActDesc& a, std::vector<double>& v) {
   auto run = [&](auto mode_tag, uint64_t cost) {
     constexpr cudnnActivationMode_t M = decltype(mode_tag)::value;
     double* d = v.data();
-    vgpu::hostpar::for_range(v.size(), cost, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) d[i] = act_one<M>(a, d[i]); });
+    vgpu::hostpar::for_range(v.size(), cost, [&](size_t b, size_t e) { act_span<M>(a, d + b, e - b); });
   };
   switch (a.mode) {
     case CUDNN_ACTIVATION_SIGMOID: run(std::integral_constant<cudnnActivationMode_t, CUDNN_ACTIVATION_SIGMOID>{}, 30); break;
@@ -1417,11 +1434,39 @@ VGPU_EXPORT cudnnStatus_t cudnnActivationForward(cudnnHandle_t h, cudnnActivatio
   double r;
   if (!activate(A, 0.0, &r)) return UNSUPPORTED(fn, "activation mode " + std::to_string(A.mode));
   sync_handle(h);
+  if (floating(X->l.type) && floating(Y->l.type)) {
+    // Blocks that stay in cache, decoded, activated, blended and encoded one after another (cudnn_common.hpp's map_packed).
+    const Layout* ins[1] = {&X->l};
+    const void* devs[1] = {x};
+    const MapResult mr = map_packed(ins, devs, 1, Y->l, y, sc(alpha, Y->l), sc(beta, Y->l),
+                                    [&](double* const* v, size_t n) { activate_span(A, v[0], n); });
+    if (mr == MapResult::Done) return CUDNN_STATUS_SUCCESS;
+    if (mr == MapResult::Failed) return CUDNN_STATUS_EXECUTION_FAILED;
+  }
   std::vector<double> v;
   if (!read(X->l, x, &v)) return CUDNN_STATUS_EXECUTION_FAILED;
   activate_all(A, v);
   return blend_write(Y->l, y, v, sc(alpha, Y->l), sc(beta, Y->l)) ? CUDNN_STATUS_SUCCESS
                                                                    : CUDNN_STATUS_EXECUTION_FAILED;
+}
+
+// g[i] = g[i] * f'(v[i]) for i < n (g is dy on the way in), the mode chosen once. Which of x and y the gradient reads is the
+// caller's choice (below); each mode's expression is the one the loops in cudnnActivationBackward made.
+void activation_grad_span(const ActDesc& A, double* g, const double* v, size_t n) {
+  switch (A.mode) {
+    case CUDNN_ACTIVATION_RELU: for (size_t i = 0; i < n; ++i) g[i] = v[i] > 0.0 ? g[i] : 0.0; break;
+    case CUDNN_ACTIVATION_CLIPPED_RELU: for (size_t i = 0; i < n; ++i) g[i] = v[i] > 0.0 && v[i] <= A.coef ? g[i] : 0.0; break;
+    case CUDNN_ACTIVATION_SWISH:
+      for (size_t i = 0; i < n; ++i) {
+        const double s = sigmoid(A.swish_beta * v[i]);
+        g[i] *= s + A.swish_beta * v[i] * s * (1.0 - s);
+      }
+      break;
+    case CUDNN_ACTIVATION_SIGMOID: for (size_t i = 0; i < n; ++i) g[i] *= v[i] * (1.0 - v[i]); break;
+    case CUDNN_ACTIVATION_TANH: for (size_t i = 0; i < n; ++i) g[i] *= 1.0 - v[i] * v[i]; break;
+    case CUDNN_ACTIVATION_ELU: for (size_t i = 0; i < n; ++i) g[i] = v[i] >= 0.0 ? g[i] : g[i] * (v[i] + A.coef); break;
+    default: break;
+  }
 }
 
 // dx = alpha * f'(x) dy + beta * dx. Which of x and y each mode's gradient
@@ -1453,27 +1498,21 @@ VGPU_EXPORT cudnnStatus_t cudnnActivationBackward(cudnnHandle_t h, cudnnActivati
   if (!reads_x && !reads_y) return UNSUPPORTED(fn, "activation mode " + std::to_string(A.mode));
   if ((reads_x && !x) || (reads_y && !y)) return BAD(fn, "the operand this mode's gradient reads is null");
   sync_handle(h);
+  {
+    // Blocks that stay in cache (cudnn_common.hpp's map_packed): g = dy * f'(v) with v read from x or y.
+    const Layout* ins[2] = {&DY->l, reads_x ? &X->l : &Y->l};
+    const void* devs[2] = {dy, reads_x ? x : y};
+    const MapResult mr = map_packed(ins, devs, 2, DX->l, dx, sc(alpha, DX->l), sc(beta, DX->l),
+                                    [&](double* const* v, size_t n) { activation_grad_span(A, v[0], v[1], n); });
+    if (mr == MapResult::Done) return CUDNN_STATUS_SUCCESS;
+    if (mr == MapResult::Failed) return CUDNN_STATUS_EXECUTION_FAILED;
+  }
   std::vector<double> vin, g;
   if (!read(reads_x ? X->l : Y->l, reads_x ? x : y, &vin) || !read(DY->l, dy, &g)) return CUDNN_STATUS_EXECUTION_FAILED;
   {
     // g[i] = dy[i] * f'(v[i]) with the mode chosen once and the elements over the host's threads.
-    auto go = [&](auto body, uint64_t cost) {
-      vgpu::hostpar::for_range(g.size(), cost, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) body(g[i], vin[i]); });
-    };
-    switch (A.mode) {
-      case CUDNN_ACTIVATION_RELU: go([](double& gi, double v) { gi = v > 0.0 ? gi : 0.0; }, 2); break;
-      case CUDNN_ACTIVATION_CLIPPED_RELU: go([&](double& gi, double v) { gi = v > 0.0 && v <= A.coef ? gi : 0.0; }, 3); break;
-      case CUDNN_ACTIVATION_SWISH:
-        go([&](double& gi, double v) {
-          const double s = sigmoid(A.swish_beta * v);
-          gi *= s + A.swish_beta * v * s * (1.0 - s);
-        }, 35);
-        break;
-      case CUDNN_ACTIVATION_SIGMOID: go([](double& gi, double v) { gi *= v * (1.0 - v); }, 3); break;
-      case CUDNN_ACTIVATION_TANH: go([](double& gi, double v) { gi *= 1.0 - v * v; }, 3); break;
-      case CUDNN_ACTIVATION_ELU: go([&](double& gi, double v) { gi = v >= 0.0 ? gi : gi * (v + A.coef); }, 3); break;
-      default: break;
-    }
+    const uint64_t cost = A.mode == CUDNN_ACTIVATION_SWISH ? 35 : (A.mode == CUDNN_ACTIVATION_RELU ? 2 : 3);
+    vgpu::hostpar::for_range(g.size(), cost, [&](size_t b, size_t e) { activation_grad_span(A, g.data() + b, vin.data() + b, e - b); });
   }
   return blend_write(DX->l, dx, g, sc(alpha, DX->l), sc(beta, DX->l)) ? CUDNN_STATUS_SUCCESS
                                                                       : CUDNN_STATUS_EXECUTION_FAILED;
