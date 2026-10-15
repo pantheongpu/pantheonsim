@@ -77,6 +77,21 @@ for src in asm_ttmp asm_cycles asm_fminmax12 asm_salu_f16 asm_hwid12; do
   echo "wrote $(pwd)/$src.gfx1201.o"
 done
 
+# What the CDNA ISA guides define and the executor used to refuse (test_amd_gcn_cdna_gaps): one source a target, run through the C
+# preprocessor for the spelling of the sc0/glc bit and for what only some parts have (GFX90A, GFX942 or GFX950 is defined).
+for src in asm_cdna_mem64 asm_cdna_ldsdma asm_cdna_ds asm_cdna_scalar asm_cdna_valu asm_cdna_formats asm_cdna_pk asm_cdna_refused; do
+  for t in gfx90a gfx942 gfx950; do
+    "$clang" -x assembler-with-cpp -D"$(echo "$t" | tr a-z A-Z)" -target amdgcn-amd-amdhsa -mcpu=$t -c "$src.s" -o "$src.$t.o"
+    echo "wrote $(pwd)/$src.$t.o"
+  done
+done
+
+# gfx1250's: the same for what the CDNA 5 document defines and the executor refused (test_amd_gcn_cdna_gaps).
+for src in asm_cdna5_gaps; do
+  "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -c "$src.s" -o "$src.gfx1250.o"
+  echo "wrote $(pwd)/$src.gfx1250.o"
+done
+
 # The same code as the assembler writes it, which the decoder's test compares
 # against instruction by instruction. llvm-objdump ships with clang; without
 # it the listing already checked in stays as it is.

@@ -268,6 +268,11 @@ struct Wave {
   // VGPR indexing (s_set_gpr_idx_on): which operands are offset -- source
   // 0, 1, 2 and the destination, a bit each -- by M0's low byte. 0 is off.
   uint8_t gpr_idx = 0;
+  // Whether indexing is on (MODE.gpr_idx_en: s_set_gpr_idx_on sets it, s_set_gpr_idx_off clears it), so that s_set_gpr_idx_mode,
+  // which changes only the mask in M0[15:12], takes effect only while it is.
+  bool gpr_idx_en = false;
+  // VSKIP (s_setvskip): while set, vector instructions are not issued.
+  bool vskip = false;
 };
 
 // The MODE register's round and denormal modes, applied to the host's own
@@ -1135,7 +1140,9 @@ struct Machine {
     const OpName op(in.name);
     const uint64_t a = in.src.empty() ? 0 : scalar(w, in.src[0]);
     const uint64_t b = in.src.size() > 1 ? scalar(w, in.src[1]) : 0;
-    if (op == "s_getpc_b64"_op) {
+    if (op == "s_set_gpr_idx_idx"_op) {
+      w.m0 = (w.m0 & ~0xFFu) | (static_cast<uint32_t>(a) & 0xFF);   // "M0[7:0] = S0.u32[7:0]" (CDNA3 and CDNA4 ISA, S_SET_GPR_IDX_IDX)
+    } else if (op == "s_getpc_b64"_op) {
       // The address of the instruction after this one, which is what the
       // hardware gives: the program counter has already moved on.
       write_scalar(w, in.dst[0], w.pc);
@@ -1163,6 +1170,16 @@ struct Machine {
         if (wide) set_sgpr64(w, at, a);
         else set_sgpr(w, at, static_cast<uint32_t>(a));
       }
+    } else if (op == "s_movrelsd_2_b32"_op) {
+      // gfx1250 (CDNA5 ISA, S_MOVRELSD_2_B32): "addrs = SRC0.u32; addrd = DST.u32; addrs += M0.u32[9:0]; addrd += M0.u32[25:16]; SGPR[addrd].b32 =
+      // SGPR[addrs].b32": each raw register number moves on by its own field of M0. As for the other relative moves, an operand that is not a
+      // scalar register, or a number past s101, is refused: the document does not say what either means.
+      if (in.src[0].kind != OperandKind::Sgpr || in.dst[0].kind != OperandKind::Sgpr)
+        throw Error::make(Err::Unsupported, in.name, " with an operand that is not a scalar register, whose raw value the document makes the base");
+      const uint64_t from = uint64_t{in.src[0].index} + (w.m0 & 0x3FFu), to = uint64_t{in.dst[0].index} + ((w.m0 >> 16) & 0x3FFu);
+      if (from >= 102 || to >= 102)
+        throw Error::make(Err::Unsupported, in.name, " reaching scalar register ", std::max(from, to), ", past s101, which the document does not define");
+      set_sgpr(w, static_cast<uint32_t>(to), sgpr(w, static_cast<uint32_t>(from)));
     } else if (op == "s_movk_i32"_op) {
       write_scalar(w, in.dst[0], static_cast<uint64_t>(static_cast<int64_t>(in.simm)));
     } else if (op == "s_addk_i32"_op) {
@@ -1693,6 +1710,12 @@ struct Machine {
       w.m0 = (w.m0 & ~0xF0FFu) | (static_cast<uint32_t>(scalar(w, in.src[0])) & 0xFF) |
              (static_cast<uint32_t>(in.simm) & 0xF) << 12;
       w.gpr_idx = static_cast<uint8_t>(in.simm & 0xF);
+      w.gpr_idx_en = true;
+      return;
+    }
+    if (in.name == "s_setvskip") {
+      // "VSKIP = S0.u32[S1.u32[4:0]]" (CDNA2, CDNA3 and CDNA4 ISA, S_SETVSKIP).
+      w.vskip = (scalar(w, in.src[0]) >> (scalar(w, in.src[1]) & 31)) & 1;
       return;
     }
     const uint64_t a = scalar(w, in.src[0]), b = scalar(w, in.src[1]);
@@ -1757,6 +1780,12 @@ struct Machine {
     }
     // The scalar cache holds nothing here to write back or drop.
     if (OpName(in.name) == "s_dcache_wb"_op || OpName(in.name) == "s_dcache_inv"_op) return;
+    // Its volatile-line forms, the discard of dirty lines (the data is not written back, and there is no cache to hold any) and a probe
+    // or prefetch of an address (CDNA2 ISA, S_ATC_PROBE) change nothing a program can read.
+    if (OpName(in.name) == "s_dcache_wb_vol"_op || OpName(in.name) == "s_dcache_inv_vol"_op ||
+        OpName(in.name) == "s_dcache_discard"_op || OpName(in.name) == "s_dcache_discard_x2"_op ||
+        OpName(in.name) == "s_atc_probe"_op || OpName(in.name) == "s_atc_probe_buffer"_op)
+      return;
     // The base, the instruction's own offset, and a scalar register's where
     // it names one.
     // (RDNA's decoder keeps the register as the second source: null, reading
@@ -1772,16 +1801,41 @@ struct Machine {
         at(base + 4 * i).store_scalar(base + 4 * i, 4, sgpr(w, in.dst[0].index + i));
       return;
     }
-    if (in.name.rfind("s_atomic_", 0) == 0) {
+    // Through a buffer resource (s_buffer_load's): the resource's base (48 bits) and its size in bytes (num_records), the offset
+    // counted against it. (CalcScalarBufferAddr is not defined in the guides; this is s_buffer_load's rule: a dword past the end reads
+    // zero, and here a store or an atomic past it is dropped.)
+    const bool through_buffer = in.name.rfind("s_buffer_", 0) == 0;
+    if (through_buffer && in.name.rfind("s_buffer_store_dword", 0) == 0) {
+      const uint32_t r = in.src[0].index;
+      const uint64_t buffer = sgpr(w, r) | uint64_t{sgpr(w, r + 1) & 0xFFFF} << 32;
+      const uint64_t records = sgpr(w, r + 2);
+      const uint64_t offset = static_cast<uint64_t>(in.offset) + (in.has_saddr ? scalar_field(w, in.saddr, false) : 0);
+      for (uint32_t i = 0; i < in.dst[0].width; ++i) {
+        const uint64_t off = offset + 4 * i, addr = buffer + off;
+        if (off + 4 <= records) at(addr).store_scalar(addr, 4, sgpr(w, in.dst[0].index + i));
+      }
+      return;
+    }
+    if (in.name.rfind("s_atomic_", 0) == 0 || in.name.rfind("s_buffer_atomic_", 0) == 0) {
       // One value for the whole wave, read and replaced at once; with glc
       // the data register gets back what memory held.
       const bool wide = in.name.size() > 3 && in.name.compare(in.name.size() - 3, 3, "_x2") == 0;
       const uint32_t bytes = wide ? 8 : 4, r = in.dst[0].index;
-      const std::string what = in.name.substr(9, in.name.size() - 9 - (wide ? 3 : 0));
+      const size_t prefix = through_buffer ? 16 : 9;   // "s_buffer_atomic_" or "s_atomic_"
+      const std::string what = in.name.substr(prefix, in.name.size() - prefix - (wide ? 3 : 0));
       const uint64_t mask = wide ? ~uint64_t{0} : 0xFFFFFFFFull;
       const uint64_t data = wide ? sgpr64(w, r) : sgpr(w, r);
-      const auto guard = atomic_guard(base);
-      const uint64_t old = at(base).load_scalar(base, bytes);
+      uint64_t base_at = base;
+      bool inside = true;
+      if (through_buffer) {
+        const uint32_t rs = in.src[0].index;
+        const uint64_t buffer = sgpr(w, rs) | uint64_t{sgpr(w, rs + 1) & 0xFFFF} << 32;
+        const uint64_t off = static_cast<uint64_t>(in.offset) + (in.has_saddr ? scalar_field(w, in.saddr, false) : 0);
+        base_at = buffer + off;
+        inside = off + bytes <= sgpr(w, rs + 2);
+      }
+      const auto guard = atomic_guard(base_at);
+      const uint64_t old = inside ? at(base_at).load_scalar(base_at, bytes) : 0;
       const auto sx = [&](uint64_t v) { return wide ? static_cast<int64_t>(v) : static_cast<int64_t>(static_cast<int32_t>(v)); };
       uint64_t now;
       if (what == "swap") now = data;
@@ -1798,7 +1852,7 @@ struct Machine {
       else if (what == "inc") now = old >= data ? 0 : old + 1;
       else if (what == "dec") now = old == 0 || old > data ? data : old - 1;
       else throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
-      at(base).store_scalar(base, bytes, now & mask);
+      if (inside) at(base_at).store_scalar(base_at, bytes, now & mask);
       if (in.cache & 1) {
         if (wide) set_sgpr64(w, r, old);
         else set_sgpr(w, r, static_cast<uint32_t>(old));
@@ -2255,7 +2309,13 @@ struct Machine {
         // exactly 0, as the ISA's examples have it (sin of the most negative half is +0, not a rounding error's).
         const double x = static_cast<double>(lane_half(w, in.src[0], lane));
         double r;
-        if (!std::isfinite(x)) r = std::numeric_limits<double>::quiet_NaN();
+        if (!std::isfinite(x)) {
+          // The CDNA guides' own examples give the half NaN of an infinity's sine and cosine as 0xfe00 ("V_SIN_F16(0x7c00) => 0xfe00
+          // // sin(+INF) = NAN"), the sign bit set; RDNA's is the positive one.
+          write_half(w, in, lane, gcn::is_rdna(in.arch) ? static_cast<_Float16>(std::numeric_limits<double>::quiet_NaN())
+                                                         : std::bit_cast<_Float16>(uint16_t{0xFE00}));
+          return;
+        }
         else if (x == 0 && op == "v_sin_f16"_op) r = x;
         else {
           const double frac = x - std::floor(x);
@@ -3085,6 +3145,25 @@ struct Machine {
 
   // The integer, 16-bit, half-precision and double instructions PyTorch's
   // libraries use beside the ones above. Returns whether `op` was one.
+  // The instructions of gfx90a that gfx9_added_alu runs, which the CDNA2 guide defines (12.8, 12.9, 12.11: "D.f16 = sin(S0.f16 * 2 * PI)",
+  // the cube-map pseudocode, "4-bit signed int to 32-bit float", "D.i = (int)floor(S0.f + 0.5)", "Fused half precision multiply add",
+  // the frexp pseudocode, "D.f16 = S0.f16 * (2 ** S1.i16)", V_MAD_LEGACY_I16, the packed fused multiply-add, "D.u32 = {16'b0, sat8(...)}").
+  // Left out, as the guide only lists them in its opcode table or leaves open what the CDNA3 text settles: V_MAC_F16 ("D.f16 = S0.f16 *
+  // S1.f16 + D.f16": whether the product is rounded before the add is not said), V_CVT_NORM_{I,U}16_F16, V_CVT_PKACCUM_U8_F32 and
+  // V_MAD_LEGACY_F16.
+  static bool cdna2_defines(const std::string& full) {
+    std::string name = full;
+    for (const char* suffix : {"_e32", "_e64", "_dpp", "_sdwa"})
+      if (name.size() > std::strlen(suffix) && name.compare(name.size() - std::strlen(suffix), std::strlen(suffix), suffix) == 0) {
+        name.resize(name.size() - std::strlen(suffix));
+        break;
+      }
+    static const std::set<std::string_view> kDefined = {
+        "v_sin_f16", "v_cos_f16", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32", "v_cvt_off_f32_i4",
+        "v_cvt_rpi_i32_f32", "v_fma_legacy_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16", "v_ldexp_f16", "v_mad_legacy_i16",
+        "v_pk_fmac_f16", "v_sat_pk_u8_i16"};
+    return kDefined.count(name) != 0;
+  }
   // The VALU instructions of the CDNA3 and CDNA4 guides that gfx942 and gfx950 have and that the gfx1250 and RDNA code already does by another
   // name or under the same one: run under the name that code knows (the half-precision "legacy" multiply-adds are the fused ones; a
   // half's product is exact in a float, so one rounding is the same either way).
@@ -3218,7 +3297,7 @@ struct Machine {
     const auto u16 = [&](uint32_t k, uint32_t lane) { return static_cast<uint16_t>(lane_src(w, in.src[k], lane)); };
     const auto i16 = [&](uint32_t k, uint32_t lane) { return static_cast<int16_t>(lane_src(w, in.src[k], lane)); };
     const auto half = [&](uint32_t k, uint32_t lane) { return static_cast<float>(lane_half(w, in.src[k], lane)); };
-    if (op == "v_nop"_op) {
+    if (op == "v_nop"_op || op == "v_clrexcp"_op) {
     } else if (op == "v_cvt_f32_ubyte1_e32"_op || op == "v_cvt_f32_ubyte2_e32"_op || op == "v_cvt_f32_ubyte3_e32"_op) {
       const uint32_t at = 8 * static_cast<uint32_t>(op.substr(15, 1)[0] - '0');   // "v_cvt_f32_ubyte1_e32"[15]
       each([&](uint32_t lane) {
@@ -3778,7 +3857,9 @@ struct Machine {
     if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) return;
     if (carry_alu(w, in)) return;
     if (more_alu(w, in, op)) return;
-    if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && gfx9_added_alu(w, in)) return;
+    if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950 || (in.arch == gcn::Target::Gfx90a && cdna2_defines(in.name))) &&
+        gfx9_added_alu(w, in))
+      return;
     if (op == "v_mov_b16_e32"_op || op == "v_mov_b16_e64"_op || op == "v_mov_b16"_op) {
       // RDNA: a half register, or the low half of a constant, into a half.
       for (uint32_t lane = 0; lane < kLanes; ++lane)
@@ -5151,6 +5232,24 @@ struct Machine {
       transpose_regs(w, in, bits, raw);
       return;
     }
+    if (op == "ds_nop"_op) return;   // "Do nothing" (CDNA2, CDNA3 and CDNA4 ISA, DS_NOP)
+    if (op == "ds_append"_op || op == "ds_consume"_op) {
+      // "Add (count_bits(exec_mask)) to the value stored in DS memory at (M0.base + instr_offset) if GDS, or at instr_offset if LDS.
+      // Return the pre-operation value to VGPRs." (DS_CONSUME subtracts.) GDS is not modelled; the value every active lane gets back
+      // is the one the instruction found.
+      if (in.gds) throw Error::make(Err::Unsupported, in.name, " on GDS, which this does not model");
+      const uint64_t where = static_cast<uint32_t>(in.offset);
+      if (where + 4 > g.lds.size())
+        throw Error::make(Err::InvalidValue, in.name, " at LDS offset ", where, ", past the ", g.lds.size(), " bytes the work-group has");
+      uint32_t was = 0;
+      std::memcpy(&was, &g.lds[where], 4);
+      const uint32_t count = static_cast<uint32_t>(__builtin_popcountll(w.exec));
+      const uint32_t now = op == "ds_append"_op ? was + count : was - count;
+      std::memcpy(&g.lds[where], &now, 4);
+      for (uint32_t lane = 0; lane < kLanes; ++lane)
+        if (w.exec >> lane & 1) write_lane(w, in.dst[0], lane, was);
+      return;
+    }
     // The two that move values between lanes read every lane's value before
     // any lane's result is written: the destination may be the very register
     // they read, and a lane further on must still see what was there.
@@ -5311,6 +5410,25 @@ struct Machine {
         const uint64_t now = (was & ~lane_src64(w, in.src[1], lane)) | lane_src64(w, in.src[2], lane);
         std::memcpy(at(off, 8), &now, 8);
         if (op == "ds_mskor_rtn_b64"_op) write_lane64(w, in.dst[0], lane, was);
+      } else if (op == "ds_wrap_rtn_b32"_op) {
+        // "tmp = MEM[ADDR].u32; MEM[ADDR].u32 = tmp >= DATA.u32 ? tmp - DATA.u32 : tmp + DATA2.u32; RETURN_DATA = tmp" (the
+        // subtract that wraps, for ring buffers).
+        uint32_t was = 0;
+        std::memcpy(&was, at(off), 4);
+        const uint32_t sub = lane_src(w, in.src[1], lane), add = lane_src(w, in.src[2], lane);
+        const uint32_t now = was >= sub ? was - sub : was + add;
+        std::memcpy(at(off), &now, 4);
+        write_lane(w, in.dst[0], lane, was);
+      } else if (op == "ds_cmpst_f64"_op || op == "ds_cmpst_rtn_f64"_op) {
+        // "tmp = MEM[addr].f64; src = DATA2.f64; cmp = DATA.f64; MEM[addr].f64 = tmp == cmp ? src : tmp; RETURN_DATA.f64 = tmp": the
+        // comparison is the float one, so a NaN is never equal and -0 equals +0.
+        uint64_t was = 0;
+        std::memcpy(&was, at(off, 8), 8);
+        if (as_double(was) == as_double(lane_src64(w, in.src[1], lane))) {
+          const uint64_t v = lane_src64(w, in.src[2], lane);
+          std::memcpy(at(off, 8), &v, 8);
+        }
+        if (op == "ds_cmpst_rtn_f64"_op) write_lane64(w, in.dst[0], lane, was);
       } else if (op == "ds_cmpstore_b64"_op || op == "ds_cmpst_b64"_op) {
         // As the _rtn form, with nothing handed back.
         uint64_t was = 0;
@@ -5320,10 +5438,16 @@ struct Machine {
           std::memcpy(at(off, 8), &v, 8);
         }
       } else if (op == "ds_storexchg_2addr_rtn_b32"_op || op == "ds_storexchg_2addr_stride64_rtn_b32"_op ||
-                 op == "ds_storexchg_2addr_rtn_b64"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op) {
-        // Two stores that each hand back what they replaced, to two addresses a count of elements (or of 64 elements) on.
-        const bool wide = op == "ds_storexchg_2addr_rtn_b64"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op;
-        const bool stride = op == "ds_storexchg_2addr_stride64_rtn_b32"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op;
+                 op == "ds_storexchg_2addr_rtn_b64"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op ||
+                 op == "ds_wrxchg2_rtn_b32"_op || op == "ds_wrxchg2st64_rtn_b32"_op || op == "ds_wrxchg2_rtn_b64"_op ||
+                 op == "ds_wrxchg2st64_rtn_b64"_op) {
+        // Two stores that each hand back what they replaced, to two addresses a count of elements (or of 64 elements) on (gfx9's
+        // spelling: ds_wrxchg2_rtn and ds_wrxchg2st64_rtn; CDNA3 ISA, DS_WRXCHG2_RTN_B32: "addr1 = ADDR_BASE.u32 + OFFSET0.u32 * 4U", ST64
+        // "* 256U"; "RETURN_DATA[31:0] = tmp1; RETURN_DATA[63:32] = tmp2").
+        const bool wide = op == "ds_storexchg_2addr_rtn_b64"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op ||
+                          op == "ds_wrxchg2_rtn_b64"_op || op == "ds_wrxchg2st64_rtn_b64"_op;
+        const bool stride = op == "ds_storexchg_2addr_stride64_rtn_b32"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op ||
+                            op == "ds_wrxchg2st64_rtn_b32"_op || op == "ds_wrxchg2st64_rtn_b64"_op;
         const uint64_t unit = (wide ? 8 : 4) * (stride ? 64 : 1), n = wide ? 8 : 4;
         uint8_t* const a0 = at(uint64_t{static_cast<uint32_t>(in.offset)} * unit, n);
         uint8_t* const a1 = at(uint64_t{static_cast<uint32_t>(in.offset1)} * unit, n);
@@ -5363,8 +5487,9 @@ struct Machine {
         set_word(w, in.dst[0], 0, lane, t0);
         set_word(w, in.dst[0], 1, lane, t1);
       } else if (by_lane) {
-        // The address is the instruction's offset, M0's low 20 bits and four bytes a lane.
-        const uint64_t where = uint64_t{static_cast<uint32_t>(in.offset)} + (w.m0 & 0xFFFFF) + 4 * lane;
+        // The address is the instruction's offset, M0's low 20 bits (gfx1250's) or low 16 ("{OFFSET1, OFFSET0} + M0[15:0]", CDNA2,
+        // CDNA3 and CDNA4 ISA, DS_READ_ADDTID_B32) and four bytes a lane.
+        const uint64_t where = uint64_t{static_cast<uint32_t>(in.offset)} + (w.m0 & (in.arch == gcn::Target::Gfx1250 ? 0xFFFFFu : 0xFFFFu)) + 4 * lane;
         if (op == "ds_store_addtid_b32"_op || op == "ds_write_addtid_b32"_op) {
           const uint32_t v = lane_src(w, in.src[0], lane);
           std::memcpy(at(where, 4), &v, 4);
@@ -5965,9 +6090,32 @@ struct Machine {
     return lds;
   }
 
+  // scratch_load_lds_{dword,ubyte,sbyte,ushort,sshort}: a load from the work-item's private memory into LDS, laid out as the global
+  // forms' (see global_load_lds; CDNA3 and CDNA4 ISA 10.3 give the LDS address for "instructions which return data to LDS").
+  void scratch_load_lds(Wave& w, const Inst& in, Group& g) {
+    Narrow part;
+    const bool narrow_load = narrow(in.name, &part);
+    const uint64_t m0 = w.m0 & 0x3FFFCu;   // M0[17:2] * 4
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (!(w.exec >> lane & 1)) continue;
+      const uint64_t offset = (in.has_vaddr ? lane_src(w, in.src[0], lane) : 0) +
+                              (in.has_saddr ? scalar_field(w, in.saddr, false) : 0) + static_cast<uint64_t>(in.offset);
+      const uint32_t nbytes = narrow_load ? part.bytes : 4;
+      uint64_t raw = 0;
+      std::memcpy(&raw, scratch_at(g, w, lane, offset, nbytes), nbytes);
+      const uint64_t at = m0 + static_cast<uint64_t>(in.offset) + uint64_t{lane} * 4;
+      if (at + 4 > g.lds.size())
+        throw Error::make(Err::InvalidValue, in.name, " writes LDS at ", at, ", past the ", g.lds.size(),
+                          " bytes the work-group has");
+      const uint32_t v = narrow_load ? widen(raw, part) : static_cast<uint32_t>(raw);
+      std::memcpy(&g.lds[at], &v, 4);
+    }
+  }
+
   // A work-item's private memory, which a kernel spills into.
   void scratch_access(Wave& w, const Inst& in, Group& g) {
     const OpName op(in.name);
+    if (in.name.rfind("scratch_load_lds_", 0) == 0) return scratch_load_lds(w, in, g);
     const uint32_t words = op.rfind("scratch_store", 0) == 0 ? in.src[1].width : in.dst[0].width;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
@@ -6554,17 +6702,18 @@ struct Machine {
   // XYZ0 or XYZW" by the number of components in the data format (MI200 guide, Table 31).
   static constexpr uint32_t kIdentitySel = 4 | 5 << 3 | 6 << 6 | 7 << 9;
 
+  // (`lds_word`, where given, takes the first channel instead of a register: a load with the LDS bit.)
   void formatted_access(Wave& w, const Inst& in, std::string_view body, image::Format format, uint32_t d3,
-                        const Operand& data, uint32_t lane, uint64_t addr, bool inside) {
+                        const Operand& data, uint32_t lane, uint64_t addr, bool inside, uint32_t* lds_word = nullptr) {
     const bool storing = body.rfind("store", 0) == 0, d16 = body.find("_d16") != std::string_view::npos;
     const bool hi = body.ends_with("_hi_x");
     const std::string_view xyzw = body.substr(body.rfind('_') + 1);
     const uint32_t count = static_cast<uint32_t>(xyzw.size());
     // gfx9 stores a whole element or refuses: the guide says what the store of fewer components than the format has
     // does to the others nowhere.
-    if (storing && in.arch == gcn::Target::Gfx90a && count < image::channels(format))
+    if (storing && !gcn::is_rdna(in.arch) && count < image::channels(format))
       throw Error::make(Err::Unsupported, in.name, " of ", count, " components into a format of ", image::channels(format),
-                        " is decoded but not implemented: the MI200 guide does not say what becomes of the others");
+                        " is decoded but not implemented: the CDNA guides do not say what becomes of the others");
     const bool ints = image::integer(format);
     const uint32_t nbytes = image::texel_bytes(format);
     const auto to_half = [&](uint32_t v) -> uint32_t {
@@ -6586,7 +6735,7 @@ struct Machine {
     if (inside) {
       at(addr).read(addr, bytes, nbytes);
       image::read_texel(format, bytes, raw);
-      if (in.enc == gcn::Enc::Mtbuf && in.arch == gcn::Target::Gfx90a)   // X000, XY00, XYZ0: no alpha of 1 for a missing one
+      if (in.enc == gcn::Enc::Mtbuf && !gcn::is_rdna(in.arch))   // X000, XY00, XYZ0: no alpha of 1 for a missing one (CDNA2, CDNA3, CDNA4)
         for (uint32_t k = image::channels(format); k < 4; ++k) raw[k] = 0;
     }
     if (storing) {
@@ -6612,6 +6761,10 @@ struct Machine {
       }
       if (!inside) out[k] = 0;
     }
+    if (lds_word) {
+      *lds_word = out[0];
+      return;
+    }
     if (!d16) {
       for (uint32_t k = 0; k < count; ++k) set_word(w, data, k, lane, out[k]);
     } else if (hi) {
@@ -6632,31 +6785,34 @@ struct Machine {
     const Operand& vaddr = in.src[reads_data ? 1 : 0];
     const Operand& rsrc = in.src[reads_data ? 2 : 1];
     const Operand& soff = in.src[reads_data ? 3 : 2];
-    // The words each lane brings, and where in LDS they go. CDNA3 ISA 9.1.9 lists the
-    // loads that may have the LDS bit: ubyte, sbyte, ushort, sshort, dword and
-    // format_x; CDNA4 ISA 9.1.9 adds dwordx3 and dwordx4. Its figure gives
-    //   LDS_ADDR = LDSbase + M0[15:0] + inst_offset + TIDinWave * 4
-    // (TIDinWave * 16 for three or four dwords, which "writes 3 dwords and skips
-    // the 4th"), and MEM_ADDR as any buffer access's. The dword forms are run;
-    // the sub-dword and format_x forms are not: the guides give the LDS stride
-    // (4 bytes a lane) but not whether a byte load writes one byte or a
-    // zero-extended dword. gfx90a's guide was not consulted.
+    // The words each lane brings, and where in LDS they go. The CDNA2, CDNA3 and CDNA4 ISA guides (9.1.9) list the
+    // loads that may have the LDS bit: ubyte, sbyte, ushort, sshort, dword and format_x (CDNA4 adds dwordx3 and dwordx4).
+    // Their figure gives
+    //   LDS_ADDR = LDSbase + M0[15:0] + inst_offset + TIDinWave * 4     ("bytes-per-dword")
+    // (TIDinWave * 16 for three or four dwords, which "writes 3 dwords and skips the 4th"), and MEM_ADDR as any buffer
+    // access's. A byte or a half is a lane's whole dword of LDS: the instructions are "load unsigned byte ... zero extend
+    // to 32 bits" (and sign extend for sbyte and sshort), and the figure's stride is a dword's; format_x stores the one
+    // converted channel, the 32-bit value the instruction would put in a register. (Assumed, not stated: the guide's
+    // sentences are about the register forms, and the figure is what says the lane's slot is a dword.)
     uint32_t lds_words = 0;
     uint64_t lds_at = 0;
+    Narrow lds_narrow;
+    bool lds_part = false;
     if (lds_dma) {
       const std::string_view op = in.name;
       lds_words = op == "buffer_load_dword" ? 1 : op == "buffer_load_dwordx3" ? 3 : op == "buffer_load_dwordx4" ? 4 : 0;
+      lds_part = narrow(in.name, &lds_narrow) && op.rfind("buffer_load_", 0) == 0;
+      if (lds_part || op == "buffer_load_format_x") lds_words = 1;
       const bool wide = lds_words > 1;
-      if (!lds_words || in.arch == gcn::Target::Gfx90a || gcn::is_rdna(in.arch) || (wide && in.arch != gcn::Target::Gfx950))
+      if (!lds_words || gcn::is_rdna(in.arch) || (wide && in.arch != gcn::Target::Gfx950))
         throw Error::make(Err::Unsupported, in.name, " loads straight into LDS, which this does not model for this form");
-      // M0's LDS offset: bits 15:0 in CDNA3's text and in both figures; CDNA4's
-      // text says "18-bit unsigned byte offset from M0[17:0]", which differs
-      // only where M0 reaches 64 KiB. The documents contradict each other, so
-      // an M0 that high is refused, not guessed at.
-      if (w.m0 >> 16)
+      // M0's LDS offset: bits 15:0 in the CDNA2 and CDNA3 text ("16-bit unsigned byte offset from M0[15:0]") and in every
+      // figure; CDNA4's text says "18-bit unsigned byte offset from M0[17:0]", which differs only where M0 reaches 64 KiB.
+      // CDNA4's two accounts contradict each other, so an M0 that high is refused there, not guessed at.
+      if (in.arch == gcn::Target::Gfx950 && (w.m0 >> 16))
         throw Error::make(Err::Unsupported, in.name, " with M0 = ", w.m0,
                           ": CDNA4 ISA 9.1.9 gives the LDS offset as M0[17:0] in its text and M0[15:0] in its figure");
-      lds_at = uint64_t{w.m0} + static_cast<uint32_t>(in.offset);
+      lds_at = uint64_t{w.m0 & 0xFFFFu} + static_cast<uint32_t>(in.offset);
     }
     const uint32_t d1 = w.sgpr[rsrc.index + 1], records = w.sgpr[rsrc.index + 2], d3 = w.sgpr[rsrc.index + 3];
     const uint64_t base = w.sgpr[rsrc.index] | static_cast<uint64_t>(d1 & 0xFFFF) << 32;
@@ -6730,8 +6886,14 @@ struct Machine {
           throw Error::make(Err::InvalidValue, in.name, " writes LDS at ", to, ", past the ", g.lds.size(),
                             " bytes the work-group has");
         uint32_t v[4] = {0, 0, 0, 0};
-        for (uint32_t k = 0; k < lds_words; ++k)
-          if (fits(offset + 4 * k, 4)) v[k] = static_cast<uint32_t>(load(addr + 4 * k, 4));
+        if (lds_part) {
+          if (fits(offset, lds_narrow.bytes)) v[0] = static_cast<uint32_t>(widen(load(addr, lds_narrow.bytes), lds_narrow));
+        } else if (formatted) {
+          formatted_access(w, in, body, format, d3, data, lane, addr, fits(offset, image::texel_bytes(format)), &v[0]);
+        } else {
+          for (uint32_t k = 0; k < lds_words; ++k)
+            if (fits(offset + 4 * k, 4)) v[k] = static_cast<uint32_t>(load(addr + 4 * k, 4));
+        }
         std::memcpy(&g.lds[to], v, 4 * lds_words);
       } else if (formatted) {
         formatted_access(w, in, body, format, in.enc == gcn::Enc::Mtbuf && !rdna ? kIdentitySel : d3, data, lane, addr,
@@ -6767,58 +6929,20 @@ struct Machine {
             if (fits(offset + 4 * k, 4)) store(addr + 4 * k, 4, word(w, data, k, lane));
         }
       } else if (atomic) {
-        const bool wide = body == "atomic_cmpswap_x2";
-        const uint32_t bytes = wide ? 8 : 4;
+        // The same read-modify-writes as FLAT and global memory's, on the buffer's address (CDNA2, CDNA3 and CDNA4 ISA,
+        // BUFFER_ATOMIC_*): the data is a register (or a pair, for _x2 and the doubles), a compare-and-swap's value and then what
+        // it must find, and the old value comes back into the first of them where sc0 asks.
+        AtomicOp a;
+        if (!parse_atomic(body, &a)) throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
+        const auto pair = [&](uint32_t k) { return word(w, data, 2 * k, lane) | uint64_t{word(w, data, 2 * k + 1, lane)} << 32; };
+        const bool cmp = a.rmw == Rmw::CmpSwap;
+        const uint64_t v = a.bytes == 8 ? pair(0) : word(w, data, 0, lane);
+        const uint64_t expected = !cmp ? 0 : a.bytes == 8 ? pair(1) : word(w, data, 1, lane);
         uint64_t before = 0;
-        if (fits(offset, bytes)) {
-          const auto guard = atomic_guard(addr);
-          before = at(addr).load_scalar(addr, bytes);
-          uint64_t after;
-          if (body == "atomic_cmpswap_x2") {
-            const uint64_t value = word(w, data, 0, lane) | uint64_t{word(w, data, 1, lane)} << 32;
-            const uint64_t expected = word(w, data, 2, lane) | uint64_t{word(w, data, 3, lane)} << 32;
-            after = before == expected ? value : before;
-          } else if (body == "atomic_cmpswap") {
-            after = before == word(w, data, 1, lane) ? word(w, data, 0, lane) : before;
-          } else if (body == "atomic_add") {
-            after = static_cast<uint32_t>(before + word(w, data, 0, lane));
-          } else if (body == "atomic_swap") {
-            after = word(w, data, 0, lane);
-          } else if (body == "atomic_add_f32") {
-            after = as_bits(as_float(static_cast<uint32_t>(before)) + as_float(word(w, data, 0, lane)));
-          } else if (body == "atomic_pk_add_f16") {
-            after = packed_add(static_cast<uint32_t>(before), word(w, data, 0, lane), false);
-          } else if (const uint32_t old = static_cast<uint32_t>(before), v = word(w, data, 0, lane);
-                     body == "atomic_sub") {
-            after = old - v;
-          } else if (body == "atomic_smin" || body == "atomic_smax") {
-            const int32_t a = static_cast<int32_t>(old), b = static_cast<int32_t>(v);
-            after = static_cast<uint32_t>(body == "atomic_smin" ? std::min(a, b) : std::max(a, b));
-          } else if (body == "atomic_umin") {
-            after = std::min(old, v);
-          } else if (body == "atomic_umax") {
-            after = std::max(old, v);
-          } else if (body == "atomic_and") {
-            after = old & v;
-          } else if (body == "atomic_or") {
-            after = old | v;
-          } else if (body == "atomic_xor") {
-            after = old ^ v;
-          } else if (body == "atomic_inc") {
-            // Counts up to the data, then wraps to zero.
-            after = old >= v ? 0 : old + 1;
-          } else if (body == "atomic_dec") {
-            // Counts down to zero, then wraps to the data (as does anything
-            // above it).
-            after = old == 0 || old > v ? v : old - 1;
-          } else {
-            throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
-          }
-          at(addr).store_scalar(addr, bytes, after);
-        }
+        if (fits(offset, a.bytes)) before = atomic_rmw(addr, a, v, expected);
         if (returns) {
           set_word(w, data, 0, lane, static_cast<uint32_t>(before));
-          if (wide) set_word(w, data, 1, lane, static_cast<uint32_t>(before >> 32));
+          if (a.bytes == 8) set_word(w, data, 1, lane, static_cast<uint32_t>(before >> 32));
         }
       } else {
         throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
@@ -6826,26 +6950,33 @@ struct Machine {
     }
   }
 
-  // Loads straight into LDS (global_load_lds_dword; gfx950's _dwordx3 and
-  // _dwordx4): each lane reads its element from global memory and writes it
-  // into the work-group's LDS at M0, plus the instruction's offset, plus the
-  // lane's number times the element's size -- as LLVM's global_load_lds
-  // intrinsics lay it out. No register is written.
+  // Loads straight into LDS (global_load_lds_dword; gfx950's _dwordx3 and _dwordx4; the narrow _ubyte, _sbyte, _ushort and _sshort):
+  // each lane reads its element from global memory and writes it into the work-group's LDS. CDNA3 and CDNA4 ISA 10.3 give
+  //   DWORDX1:  LDS_ADDR = LDSbase(hw alloc) + LDSoffset(M0[17:2] * 4) + INST.OFFSET + ThreadID*4
+  //   DWORDX4:  LDS_ADDR = LDSbase(hw alloc) + LDSoffset(M0[17:2] * 4) + INST.OFFSET + ThreadID*16
+  // and the narrow ones "load 8 bits of untyped data from the global aperture, zero extend to 32 bits and store the result into a
+  // data share" (16 bits for USHORT and SSHORT, sign extended for the S forms): a whole dword in the lane's four-byte slot.
+  // Not in the guides: the stride of DWORDX3, which is taken as its size, 12 (the buffer form's figure says 16 for 3 or 4
+  // dwords). No register is written.
   void global_load_lds(Wave& w, const Inst& in, Group& g) {
     const std::string& op = in.name;
     const uint32_t words = op.ends_with("_dwordx4") ? 4 : op.ends_with("_dwordx3") ? 3 : 1;
+    Narrow part;
+    const bool narrow_load = narrow(op, &part);
     const uint32_t bytes = 4 * words;
+    const uint64_t m0 = w.m0 & 0x3FFFCu;   // M0[17:2] * 4
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       const uint64_t addr = (in.has_saddr ? scalar_field(w, in.saddr, true) + lane_src(w, in.src[0], lane)
                                           : lane_src64(w, in.src[0], lane)) +
                             static_cast<uint64_t>(static_cast<int64_t>(in.offset));
-      const uint64_t at = uint64_t{w.m0} + static_cast<uint64_t>(static_cast<int64_t>(in.offset)) + uint64_t{lane} * bytes;
+      const uint64_t at = m0 + static_cast<uint64_t>(static_cast<int64_t>(in.offset)) + uint64_t{lane} * bytes;
       if (at + bytes > g.lds.size())
         throw Error::make(Err::InvalidValue, op, " writes LDS at ", at, ", past the ", g.lds.size(),
                           " bytes the work-group has");
       uint32_t v[4];
-      load_words(addr, words, v);
+      if (narrow_load) v[0] = widen(load(addr, part.bytes), part);
+      else load_words(addr, words, v);
       std::memcpy(&g.lds[at], v, bytes);
     }
   }
@@ -6891,7 +7022,7 @@ struct Machine {
   // A read-modify-write of global or flat memory: what it does, and how
   // wide it is.
   enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec,
-                   AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap };
+                   AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap, CondSub, SubClamp };
   struct AtomicOp {
     Rmw rmw = Rmw::Add;
     uint32_t bytes = 4;
@@ -6916,7 +7047,10 @@ struct Machine {
         // RDNA's float min and max, as each generation spells them: gfx10's
         // fmin (fmin_x2 the double), gfx11's min_f32, gfx12's min_num_f32.
         {"fmin", Rmw::MinF32}, {"fmax", Rmw::MaxF32}, {"min_f32", Rmw::MinF32}, {"max_f32", Rmw::MaxF32},
-        {"min_num_f32", Rmw::MinF32}, {"max_num_f32", Rmw::MaxF32}};
+        {"min_num_f32", Rmw::MinF32}, {"max_num_f32", Rmw::MaxF32},
+        // gfx1250's: subtract only where memory is at least the data ("MEM = tmp >= src ? tmp - src : tmp"), and subtract clamped at zero
+        // ("if old_value < DATA.u32 then new_value = 0U else new_value = old_value - DATA.u32").
+        {"cond_sub_u32", Rmw::CondSub}, {"sub_clamp_u32", Rmw::SubClamp}};
     for (auto [name, rmw] : kNames)
       if (what == name) {
         if (a->bytes == 8 && rmw == Rmw::MinF32) rmw = Rmw::MinF64;
@@ -6955,6 +7089,8 @@ struct Machine {
         case Rmw::PkAddF16: return packed_add(b, x, false);
         case Rmw::PkAddBf16: return packed_add(b, x, true);
         case Rmw::CmpSwap: return b == static_cast<uint32_t>(expected) ? x : b;
+        case Rmw::CondSub: return b >= x ? b - x : b;
+        case Rmw::SubClamp: return b < x ? 0u : b - x;
         default: return b;
       }
     }
@@ -7066,6 +7202,18 @@ struct Machine {
     // A flat access that reaches only the device's memory comes here too, so
     // what it does is read from its name past the segment ("load_dwordx4").
     const std::string_view body = std::string_view(op).substr(op.find('_') + 1);
+    if (body == "load_addtid_b32" || body == "store_addtid_b32") {
+      // gfx1250: "RETURN_DATA.u32 = MEM[SGPR_ADDR[63:0] + INST_OFFSET[11:0].b64 + 64'B(laneID.i32 * 4)].u32" (CDNA5 ISA, GLOBAL_LOAD_ADDTID_B32), and the
+      // store's likewise: a scalar base, the 12-bit offset, and four bytes a lane.
+      const uint64_t base = scalar_field(w, in.saddr, true) + (static_cast<uint32_t>(in.offset) & 0xFFFu);
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        if (!(w.exec >> lane & 1)) continue;
+        const uint64_t at = base + 4 * uint64_t{lane};
+        if (body == "load_addtid_b32") write_lane(w, in.dst[0], lane, static_cast<uint32_t>(load(at, 4)));
+        else store(at, 4, lane_src(w, in.src[0], lane));
+      }
+      return;
+    }
     if (body == "load_block" || body == "store_block") {
       // gfx1250: up to 32 consecutive dwords to or from consecutive registers, those M0's bits pick (the ISA lets a block
       // skip "holes" in memory and in the registers alike). A scaled offset is not modelled: the ISA does not say by what.
@@ -7985,6 +8133,17 @@ struct Machine {
     ++stats.instructions;
     if (__builtin_expect(sampler != nullptr, 0)) sample_pc(w, g, pc_here);
     InstructionCounts& n = stats.counts;
+    // "When VSKIP is enabled, no VOP*/M*BUF/MIMG/DS/FLAT instructions are issued" (CDNA2, CDNA3 and CDNA4 ISA, S_SETVSKIP): the wave steps
+    // past them, and (the guide adds) a skipped memory instruction does not touch the wait counters.
+    if (__builtin_expect(w.vskip, 0)) {
+      switch (in.enc) {
+        case gcn::Enc::Vop1: case gcn::Enc::Vop2: case gcn::Enc::Vop3: case gcn::Enc::Vop3p: case gcn::Enc::Vopc:
+        case gcn::Enc::Vopd: case gcn::Enc::Ds: case gcn::Enc::Flat: case gcn::Enc::Mubuf: case gcn::Enc::Mtbuf:
+        case gcn::Enc::Mimg:
+          return true;
+        default: break;
+      }
+    }
     switch (in.enc) {
       case gcn::Enc::Sop1:
       case gcn::Enc::Sop2:
@@ -8190,8 +8349,48 @@ struct Machine {
     if (OpName(in.name) == "s_wakeup"_op || OpName(in.name) == "s_icache_inv"_op) return true;
     if (OpName(in.name) == "s_set_gpr_idx_off"_op) {
       w.gpr_idx = 0;
+      w.gpr_idx_en = false;
       return true;
     }
+    // "M0[15:12] = SIMM16.u16[3:0]": the mask of operands indexing applies to (S_SET_GPR_IDX_MODE); it takes effect where indexing is on.
+    if (OpName(in.name) == "s_set_gpr_idx_mode"_op) {
+      w.m0 = (w.m0 & ~0xF000u) | (static_cast<uint32_t>(in.simm) & 0xF) << 12;
+      if (w.gpr_idx_en) w.gpr_idx = static_cast<uint8_t>(in.simm & 0xF);
+      return true;
+    }
+    // "Kill this wave if the least significant bit of the immediate constant is 1" (S_SETKILL): it ends as s_endpgm does.
+    if (OpName(in.name) == "s_setkill"_op) {
+      if (in.simm & 1) {
+        w.done = true;
+        return false;
+      }
+      return true;
+    }
+    // HALT: "1 = halt, 0 = clear HALT bit" (S_SETHALT; S_SENDMSGHALT sends its message and then halts). A halted wave runs again only when
+    // something resumes it, and nothing here does (there is no trap handler to return from and no debugger-driven resume), so a halt is
+    // refused where it would hang the launch, and clearing a bit that is clear changes nothing.
+    if (OpName(in.name) == "s_sethalt"_op) {
+      if (in.simm & 1)
+        throw Error::make(Err::Unsupported, in.name, " 1 halts the wave, and nothing in this simulator resumes a halted wave");
+      return true;
+    }
+    if (OpName(in.name) == "s_sendmsghalt"_op)
+      throw Error::make(Err::Unsupported, in.name, " halts the wave after its message, and nothing in this simulator resumes a halted wave");
+    // gfx1250: "Set the round mode from an immediate: SIMM16[3:0]" and the denorm mode likewise (CDNA5 ISA, Table 17; MODE's FP_ROUND is bits 3:0
+    // and FP_DENORM 7:4), and the trace stream's immediate (nothing here keeps one).
+    if (in.arch == gcn::Target::Gfx1250 && (OpName(in.name) == "s_round_mode"_op || OpName(in.name) == "s_denorm_mode"_op)) {
+      const uint32_t at = OpName(in.name) == "s_round_mode"_op ? 0 : 4;
+      w.mode = (w.mode & ~(0xFu << at)) | (static_cast<uint32_t>(in.simm) & 0xFu) << at;
+      return true;
+    }
+    if (in.arch == gcn::Target::Gfx1250 && OpName(in.name) == "s_ttracedata_imm"_op) return true;
+    // Performance-counter levels and the thread-trace stream: neither exists here to be changed, and a program cannot read either back.
+    if (OpName(in.name) == "s_incperflevel"_op || OpName(in.name) == "s_decperflevel"_op || OpName(in.name) == "s_ttracedata"_op)
+      return true;
+    // "If WAVE_STATUS.COND_DBG_SYS (or _USER) is set then jump" (S_CBRANCH_CDBGSYS and the others): those status bits are set from outside
+    // the wave, by a debugger, and nothing here sets them (assumed, not stated: they are clear at the wave's start), so the branch falls
+    // through.
+    if (in.name.rfind("s_cbranch_cdbg", 0) == 0) return true;
     if (OpName(in.name) == "s_trap"_op) {
       // A real card's trap handler reports it to the queue and the runtime
       // aborts the launch; the launch fails here, and says why.

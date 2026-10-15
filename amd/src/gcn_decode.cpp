@@ -96,6 +96,58 @@ void add_long_forms(std::map<std::pair<Enc, uint32_t>, Shape>& t) {
   for (const auto& [op, sh] : add) t.emplace(std::make_pair(Enc::Vop3, op), sh);   // a listed entry stays
 }
 
+// The formatted buffer accesses of the CDNA parts (CDNA2, CDNA3 and CDNA4 ISA: MUBUF opcodes 0-15, 38 and 39, MTBUF opcodes 0-15).
+void add_format_accesses(std::map<std::pair<Enc, uint32_t>, Shape>& m) {
+  const auto set = [&](Enc e, uint32_t op, Shape sh) { m[{e, op}] = sh; };
+    // The formatted buffer accesses (MUBUF opcodes 0-15, 38 and 39), which HIP's
+    // tex1Dfetch over linear memory compiles to; the CDNA3 and CDNA4 guides list them
+    // too (BUFFER_LOAD_FORMAT_X ... TBUFFER_STORE_FORMAT_D16_XYZW). The data comes in
+    // 32-bit channels, or with d16 as halves packed two to a register.
+    for (const char* kind : {"load", "store"})
+      for (uint32_t c = 1; c <= 4; ++c) {
+        static const char* kX[5] = {"", "x", "xy", "xyz", "xyzw"};
+        const bool store = kind[0] == 's';
+        const uint32_t base = store ? 4 : 0;
+        const uint32_t dregs = (c + 1) / 2;
+        const std::string plain = std::string("buffer_") + kind + "_format_" + kX[c];
+        const std::string half = std::string("buffer_") + kind + "_format_d16_" + kX[c];
+        static std::deque<std::string> names;   // the table keeps pointers to these
+        names.push_back(plain);
+        names.push_back(half);
+        const char* plain_name = names[names.size() - 2].c_str();
+        const char* half_name = names[names.size() - 1].c_str();
+        if (!store) {
+          set(Enc::Mubuf, base + c - 1, {plain_name, c, 3});
+          set(Enc::Mubuf, 8 + base + c - 1, {half_name, dregs, 3});
+        } else {
+          set(Enc::Mubuf, base + c - 1, {plain_name, 0, 4, c});
+          set(Enc::Mubuf, 8 + base + c - 1, {half_name, 0, 4, dregs});
+        }
+      }
+    // And its typed buffer accesses (MTBUF, Table 87: opcodes 0-15), whose data and number formats are the
+    // instruction's own.
+    for (const char* kind : {"load", "store"})
+      for (uint32_t c = 1; c <= 4; ++c) {
+        static const char* kX[5] = {"", "x", "xy", "xyz", "xyzw"};
+        const bool store = kind[0] == 's';
+        const uint32_t base = store ? 4 : 0, dregs = (c + 1) / 2;
+        static std::deque<std::string> names;
+        names.push_back(std::string("tbuffer_") + kind + "_format_" + kX[c]);
+        names.push_back(std::string("tbuffer_") + kind + "_format_d16_" + kX[c]);
+        const char* plain_name = names[names.size() - 2].c_str();
+        const char* half_name = names[names.size() - 1].c_str();
+        if (!store) {
+          set(Enc::Mtbuf, base + c - 1, {plain_name, c, 3});
+          set(Enc::Mtbuf, 8 + base + c - 1, {half_name, dregs, 3});
+        } else {
+          set(Enc::Mtbuf, base + c - 1, {plain_name, 0, 4, c});
+          set(Enc::Mtbuf, 8 + base + c - 1, {half_name, 0, 4, dregs});
+        }
+      }
+  set(Enc::Mubuf, 0x26, {"buffer_load_format_d16_hi_x", 1, 3});
+  set(Enc::Mubuf, 0x27, {"buffer_store_format_d16_hi_x", 0, 4, 1});
+}
+
 const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
   static const std::map<std::pair<Enc, uint32_t>, Shape> t = [] {
     std::map<std::pair<Enc, uint32_t>, Shape> m = {
@@ -274,6 +326,25 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // abort() compile to, and what unoptimized device library code keeps on
       // the paths optimization proves unreachable.
       {{Enc::Sopp, 0x12}, {"s_trap", 0, 0}},
+      // Debug and control (CDNA2, CDNA3 and CDNA4 ISA, 12.5): kill the wave; set or clear its HALT bit; send a message and halt;
+      // performance-counter and thread-trace controls (no counters or trace here); the conditional branches on the debug flags.
+      {{Enc::Sopp, 0x0b}, {"s_setkill", 0, 0}},
+      {{Enc::Sopp, 0x0d}, {"s_sethalt", 0, 0}},
+      {{Enc::Sopp, 0x11}, {"s_sendmsghalt", 0, 0}},
+      {{Enc::Sopp, 0x14}, {"s_incperflevel", 0, 0}},
+      {{Enc::Sopp, 0x15}, {"s_decperflevel", 0, 0}},
+      {{Enc::Sopp, 0x16}, {"s_ttracedata", 0, 0}},
+      {{Enc::Sopp, 0x17}, {"s_cbranch_cdbgsys", 0, 0}},
+      {{Enc::Sopp, 0x18}, {"s_cbranch_cdbguser", 0, 0}},
+      {{Enc::Sopp, 0x19}, {"s_cbranch_cdbgsys_or_user", 0, 0}},
+      {{Enc::Sopp, 0x1a}, {"s_cbranch_cdbgsys_and_user", 0, 0}},
+      // Vector GPR indexing's mode: M0[15:12] = SIMM16[3:0] (s_set_gpr_idx_mode), and its index: M0[7:0] = S0[7:0] (s_set_gpr_idx_idx).
+      {{Enc::Sopp, 0x1d}, {"s_set_gpr_idx_mode", 0, 0}},
+      {{Enc::Sop1, 0x32}, {"s_set_gpr_idx_idx", 0, 1}},
+      // Writes a hardware register field from a scalar register (see s_getreg_b32).
+      {{Enc::Sopk, 0x12}, {"s_setreg_b32", 1, 0}},
+      // VSKIP = S0[S1[4:0]]: while it is set, vector instructions are not issued.
+      {{Enc::Sopc, 0x10}, {"s_setvskip", 0, 2}},
       // SOPC: a scalar comparison, which sets SCC.
       {{Enc::Sopc, 0x00}, {"s_cmp_eq_i32", 0, 2}},
       {{Enc::Sopc, 0x01}, {"s_cmp_lg_i32", 0, 2}},
@@ -319,6 +390,46 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Smem, 0x12}, {"s_store_dwordx4", 4, 1, 2}},
       {{Enc::Smem, 0x20}, {"s_dcache_inv", 0, 0}},
       {{Enc::Smem, 0x21}, {"s_dcache_wb", 0, 0}},
+      // The same for the lines marked volatile, and the discard of one or two dirty lines (nothing is cached here); a probe or
+      // prefetch of an address into the scalar cache (CDNA2 ISA, S_ATC_PROBE: "Probe or prefetch an address into the SQC data
+      // cache"): none of them changes anything a program can read.
+      {{Enc::Smem, 0x22}, {"s_dcache_inv_vol", 0, 0}},
+      {{Enc::Smem, 0x23}, {"s_dcache_wb_vol", 0, 0}},
+      {{Enc::Smem, 0x26}, {"s_atc_probe", 0, 1, 2}},
+      {{Enc::Smem, 0x27}, {"s_atc_probe_buffer", 0, 1, 4}},
+      {{Enc::Smem, 0x28}, {"s_dcache_discard", 0, 1, 2}},
+      {{Enc::Smem, 0x29}, {"s_dcache_discard_x2", 0, 1, 2}},
+      // Stores through a buffer resource (the scalar buffer's store: CalcScalarBufferAddr as s_buffer_load's), and its atomics, which
+      // are s_atomic_*'s on the buffer's address.
+      {{Enc::Smem, 0x18}, {"s_buffer_store_dword", 1, 1, 4}},
+      {{Enc::Smem, 0x19}, {"s_buffer_store_dwordx2", 2, 1, 4}},
+      {{Enc::Smem, 0x1a}, {"s_buffer_store_dwordx4", 4, 1, 4}},
+      {{Enc::Smem, 0x40}, {"s_buffer_atomic_swap", 1, 1, 4}},
+      {{Enc::Smem, 0x41}, {"s_buffer_atomic_cmpswap", 2, 1, 4}},
+      {{Enc::Smem, 0x42}, {"s_buffer_atomic_add", 1, 1, 4}},
+      {{Enc::Smem, 0x43}, {"s_buffer_atomic_sub", 1, 1, 4}},
+      {{Enc::Smem, 0x44}, {"s_buffer_atomic_smin", 1, 1, 4}},
+      {{Enc::Smem, 0x45}, {"s_buffer_atomic_umin", 1, 1, 4}},
+      {{Enc::Smem, 0x46}, {"s_buffer_atomic_smax", 1, 1, 4}},
+      {{Enc::Smem, 0x47}, {"s_buffer_atomic_umax", 1, 1, 4}},
+      {{Enc::Smem, 0x48}, {"s_buffer_atomic_and", 1, 1, 4}},
+      {{Enc::Smem, 0x49}, {"s_buffer_atomic_or", 1, 1, 4}},
+      {{Enc::Smem, 0x4a}, {"s_buffer_atomic_xor", 1, 1, 4}},
+      {{Enc::Smem, 0x4b}, {"s_buffer_atomic_inc", 1, 1, 4}},
+      {{Enc::Smem, 0x4c}, {"s_buffer_atomic_dec", 1, 1, 4}},
+      {{Enc::Smem, 0x60}, {"s_buffer_atomic_swap_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x61}, {"s_buffer_atomic_cmpswap_x2", 4, 1, 4}},
+      {{Enc::Smem, 0x62}, {"s_buffer_atomic_add_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x63}, {"s_buffer_atomic_sub_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x64}, {"s_buffer_atomic_smin_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x65}, {"s_buffer_atomic_umin_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x66}, {"s_buffer_atomic_smax_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x67}, {"s_buffer_atomic_umax_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x68}, {"s_buffer_atomic_and_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x69}, {"s_buffer_atomic_or_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x6a}, {"s_buffer_atomic_xor_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x6b}, {"s_buffer_atomic_inc_x2", 2, 1, 4}},
+      {{Enc::Smem, 0x6c}, {"s_buffer_atomic_dec_x2", 2, 1, 4}},
       // Scalar atomics: the data register is the value, and with glc gets
       // back what memory held. hipBLASLt's kernels count work-groups with them.
       {{Enc::Smem, 0x80}, {"s_atomic_swap", 1, 1, 2}},
@@ -350,6 +461,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Smem, 0x25}, {"s_memrealtime", 2, 0}},
       // VOP1 and VOP2, the vector ALU's short forms.
       {{Enc::Vop1, 0x00}, {"v_nop", 0, 0}},
+      // "Clear this wave's exception state in the vector ALU" (CDNA2, CDNA3 and CDNA4 ISA, V_CLREXCP): there is none kept here.
+      {{Enc::Vop1, 0x35}, {"v_clrexcp", 0, 0}},
       {{Enc::Vop1, 0x01}, {"v_mov_b32_e32", 1, 1}},
       {{Enc::Vop1, 0x0d}, {"v_cvt_flr_i32_f32_e32", 1, 1}},
       // One byte of the source, widened to a float.
@@ -823,6 +936,34 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Ds, 0x70}, {"ds_cmpst_rtn_b64", 2, 3, 1, 2, 2}},
       {{Enc::Ds, 0xde}, {"ds_write_b96", 0, 2, 1, 3}},
       {{Enc::Ds, 0x0b}, {"ds_xor_b32", 0, 2}},
+      // The rest of LDS's atomics (CDNA2, CDNA3 and CDNA4 ISA, DS_MSKOR_B32 .. DS_CONDXCHG32_RTN_B64): a masked OR (the mask in the
+      // first data register, the bits in the second), two exchanges at once, a compare-and-store of doubles, the conditional exchange
+      // of two dwords, and the subtract that wraps; the 64-bit forms over register pairs.
+      {{Enc::Ds, 0x0c}, {"ds_mskor_b32", 0, 3}},
+      {{Enc::Ds, 0x2c}, {"ds_mskor_rtn_b32", 1, 3}},
+      {{Enc::Ds, 0x4c}, {"ds_mskor_b64", 0, 3, 1, 2, 2}},
+      {{Enc::Ds, 0x6c}, {"ds_mskor_rtn_b64", 2, 3, 1, 2, 2}},
+      {{Enc::Ds, 0x2e}, {"ds_wrxchg2_rtn_b32", 2, 3}},
+      {{Enc::Ds, 0x2f}, {"ds_wrxchg2st64_rtn_b32", 2, 3}},
+      {{Enc::Ds, 0x6e}, {"ds_wrxchg2_rtn_b64", 4, 3, 1, 2, 2}},
+      {{Enc::Ds, 0x6f}, {"ds_wrxchg2st64_rtn_b64", 4, 3, 1, 2, 2}},
+      {{Enc::Ds, 0x34}, {"ds_wrap_rtn_b32", 1, 3}},
+      {{Enc::Ds, 0x50}, {"ds_cmpst_b64", 0, 3, 1, 2, 2}},
+      {{Enc::Ds, 0x51}, {"ds_cmpst_f64", 0, 3, 1, 2, 2}},
+      {{Enc::Ds, 0x71}, {"ds_cmpst_rtn_f64", 2, 3, 1, 2, 2}},
+      {{Enc::Ds, 0x7e}, {"ds_condxchg32_rtn_b64", 2, 2, 1, 2}},
+      // No address register: ds_nop does nothing; ds_append and ds_consume add or subtract the number of active lanes at the
+      // instruction's offset and give back what was there; the ADDTID forms address by the lane's number and M0.
+      {{Enc::Ds, 0x14}, {"ds_nop", 0, 0}},
+      {{Enc::Ds, 0xbe}, {"ds_append", 1, 0}},
+      {{Enc::Ds, 0xbd}, {"ds_consume", 1, 0}},
+      {{Enc::Ds, 0xb6}, {"ds_read_addtid_b32", 1, 0}},
+      {{Enc::Ds, 0x1d}, {"ds_write_addtid_b32", 0, 1}},
+      // Two halves, or two bfloat16s, added in place (gfx940 and later).
+      {{Enc::Ds, 0x17}, {"ds_pk_add_f16", 0, 2}},
+      {{Enc::Ds, 0x18}, {"ds_pk_add_bf16", 0, 2}},
+      {{Enc::Ds, 0xb7}, {"ds_pk_add_rtn_f16", 1, 2}},
+      {{Enc::Ds, 0xb8}, {"ds_pk_add_rtn_bf16", 1, 2}},
       {{Enc::Ds, 0x0d}, {"ds_write_b32", 0, 2}},
       {{Enc::Ds, 0x0e}, {"ds_write2_b32", 0, 3}},
       {{Enc::Ds, 0x0f}, {"ds_write2st64_b32", 0, 3}},
@@ -896,6 +1037,13 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // Loads straight into LDS, no register written: gfx942's dword, and
       // gfx950's three and four dwords a lane (vLLM's skinny GEMMs on MI350X).
       {{Enc::Flat, 0x2a}, {"load_lds_dword", 0, 1}},
+      // And the narrow ones, which store the loaded byte or half extended to 32 bits ("Load 8 bits of untyped data from the global
+      // aperture, zero extend to 32 bits and store the result into a data share", CDNA3 ISA GLOBAL_LOAD_LDS_UBYTE; SBYTE, USHORT and
+      // SSHORT likewise, sign or zero extending).
+      {{Enc::Flat, 0x26}, {"load_lds_ubyte", 0, 1}},
+      {{Enc::Flat, 0x27}, {"load_lds_sbyte", 0, 1}},
+      {{Enc::Flat, 0x28}, {"load_lds_ushort", 0, 1}},
+      {{Enc::Flat, 0x29}, {"load_lds_sshort", 0, 1}},
       {{Enc::Flat, 0x7e}, {"load_lds_dwordx3", 0, 1}},
       {{Enc::Flat, 0x7d}, {"load_lds_dwordx4", 0, 1}},
       {{Enc::Flat, 0x18}, {"store_byte", 0, 2}},
@@ -990,7 +1138,26 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Mubuf, 0x4c}, {"buffer_atomic_dec", 0, 4, 1}},
       {{Enc::Mubuf, 0x4d}, {"buffer_atomic_add_f32", 0, 4, 1}},
       {{Enc::Mubuf, 0x4e}, {"buffer_atomic_pk_add_f16", 0, 4, 1}},
+      // The double-precision adds, minimums and maximums, and the 64-bit forms of the integer atomics (CDNA2, CDNA3 and CDNA4 ISA,
+      // BUFFER_ATOMIC_ADD_F64 .. BUFFER_ATOMIC_DEC_X2): the data is a register pair, and a compare-and-swap's two pairs.
+      {{Enc::Mubuf, 0x4f}, {"buffer_atomic_add_f64", 0, 4, 2}},
+      {{Enc::Mubuf, 0x50}, {"buffer_atomic_min_f64", 0, 4, 2}},
+      {{Enc::Mubuf, 0x51}, {"buffer_atomic_max_f64", 0, 4, 2}},
+      // Two bfloat16s added at once: gfx950's (CDNA4 ISA, BUFFER_ATOMIC_PK_ADD_BF16).
+      {{Enc::Mubuf, 0x52}, {"buffer_atomic_pk_add_bf16", 0, 4, 1}},
+      {{Enc::Mubuf, 0x60}, {"buffer_atomic_swap_x2", 0, 4, 2}},
       {{Enc::Mubuf, 0x61}, {"buffer_atomic_cmpswap_x2", 0, 4, 4}},
+      {{Enc::Mubuf, 0x62}, {"buffer_atomic_add_x2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x63}, {"buffer_atomic_sub_x2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x64}, {"buffer_atomic_smin_x2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x65}, {"buffer_atomic_umin_x2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x66}, {"buffer_atomic_smax_x2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x67}, {"buffer_atomic_umax_x2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x68}, {"buffer_atomic_and_x2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x69}, {"buffer_atomic_or_x2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x6a}, {"buffer_atomic_xor_x2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x6b}, {"buffer_atomic_inc_x2", 0, 4, 2}},
+      {{Enc::Mubuf, 0x6c}, {"buffer_atomic_dec_x2", 0, 4, 2}},
       // VOP3P: a packed pair of halves in one register, both computed at once.
       {{Enc::Vop3p, 0x00}, {"v_pk_mad_i16", 1, 3}},
       {{Enc::Vop3p, 0x01}, {"v_pk_mul_lo_u16", 1, 2}},
@@ -1131,6 +1298,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
     };
     add_comparisons(m);
     add_long_forms(m);
+    add_format_accesses(m);
     return m;
   }();
   return t;
@@ -1229,6 +1397,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table_gfx90a() {
   static const std::map<std::pair<Enc, uint32_t>, Shape> t = [] {
     std::map<std::pair<Enc, uint32_t>, Shape> m = table();
     const auto set = [&](Enc e, uint32_t op, Shape sh) { m[{e, op}] = sh; };
+    // gfx940 added the narrow loads from memory into LDS by FLAT and the packed bfloat16 atomic, which gfx90a does not have.
+    for (uint32_t op : {0x26, 0x27, 0x28, 0x29}) m.erase({Enc::Flat, op});
+    m.erase({Enc::Mubuf, 0x52});
+    for (uint32_t op : {0x17, 0x18, 0xb7, 0xb8}) m.erase({Enc::Ds, op});   // (ds_pk_add_*: gfx940 added them)
     // The matrix instructions gfx940 added or renumbered are not gfx90a's.
     for (uint32_t op : {0x2d, 0x2e, 0x35, 0x36, 0x37, 0x38, 0x3e, 0x3f, 0x56, 0x57, 0x5d, 0x5e, 0x5f, 0x60, 0x61,
                         0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77})
@@ -1274,53 +1446,6 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table_gfx90a() {
              {25, "image_atomic_or"}, {26, "image_atomic_xor"}, {27, "image_atomic_inc"},
              {28, "image_atomic_dec"}, {32, "image_sample"}})
       set(Enc::Mimg, op, {name, 1, 0});
-    // Its formatted buffer accesses (MI200 ISA guide, 12.x MUBUF opcodes 0-15,
-    // 38 and 39), which HIP's tex1Dfetch over linear memory compiles to; gfx940
-    // dropped them. The data comes in 32-bit channels, or with d16 as halves
-    // packed two to a register.
-    for (const char* kind : {"load", "store"})
-      for (uint32_t c = 1; c <= 4; ++c) {
-        static const char* kX[5] = {"", "x", "xy", "xyz", "xyzw"};
-        const bool store = kind[0] == 's';
-        const uint32_t base = store ? 4 : 0;
-        const uint32_t dregs = (c + 1) / 2;
-        const std::string plain = std::string("buffer_") + kind + "_format_" + kX[c];
-        const std::string half = std::string("buffer_") + kind + "_format_d16_" + kX[c];
-        static std::deque<std::string> names;   // the table keeps pointers to these
-        names.push_back(plain);
-        names.push_back(half);
-        const char* plain_name = names[names.size() - 2].c_str();
-        const char* half_name = names[names.size() - 1].c_str();
-        if (!store) {
-          set(Enc::Mubuf, base + c - 1, {plain_name, c, 3});
-          set(Enc::Mubuf, 8 + base + c - 1, {half_name, dregs, 3});
-        } else {
-          set(Enc::Mubuf, base + c - 1, {plain_name, 0, 4, c});
-          set(Enc::Mubuf, 8 + base + c - 1, {half_name, 0, 4, dregs});
-        }
-      }
-    // And its typed buffer accesses (MTBUF, Table 87: opcodes 0-15), whose data and number formats are the
-    // instruction's own.
-    for (const char* kind : {"load", "store"})
-      for (uint32_t c = 1; c <= 4; ++c) {
-        static const char* kX[5] = {"", "x", "xy", "xyz", "xyzw"};
-        const bool store = kind[0] == 's';
-        const uint32_t base = store ? 4 : 0, dregs = (c + 1) / 2;
-        static std::deque<std::string> names;
-        names.push_back(std::string("tbuffer_") + kind + "_format_" + kX[c]);
-        names.push_back(std::string("tbuffer_") + kind + "_format_d16_" + kX[c]);
-        const char* plain_name = names[names.size() - 2].c_str();
-        const char* half_name = names[names.size() - 1].c_str();
-        if (!store) {
-          set(Enc::Mtbuf, base + c - 1, {plain_name, c, 3});
-          set(Enc::Mtbuf, 8 + base + c - 1, {half_name, dregs, 3});
-        } else {
-          set(Enc::Mtbuf, base + c - 1, {plain_name, 0, 4, c});
-          set(Enc::Mtbuf, 8 + base + c - 1, {half_name, 0, 4, dregs});
-        }
-      }
-    set(Enc::Mubuf, 0x26, {"buffer_load_format_d16_hi_x", 1, 3});
-    set(Enc::Mubuf, 0x27, {"buffer_store_format_d16_hi_x", 0, 4, 1});
     // The first-level cache's write-back and invalidate.
     set(Enc::Mubuf, 0x29, {"buffer_invl2", 0, 0});
     set(Enc::Mubuf, 0x3e, {"buffer_wbinvl1", 0, 0});
@@ -1681,6 +1806,7 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.size = 8;
     const uint32_t w1 = word(code, at + 4);
     if (s.dst_width) in.dst.push_back(sgpr((w0 >> 6) & 0x7F, s.dst_width));
+    if (in.name.rfind("s_atc_probe", 0) == 0) in.simm = static_cast<int32_t>((w0 >> 6) & 0x7F);   // (its data field is the probe's own immediate)
     in.cache = (w0 >> 16) & 1;   // glc: an atomic hands back what it found
     if (s.srcs > 0) {
       in.src.push_back(sgpr(((w0 & 0x3F) << 1), s.src_width(0)));   // sbase counts register pairs
@@ -1904,7 +2030,8 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     const uint32_t w1 = word(code, at + 4);
     // A two-address form (ds_read2, ds_write2) has an offset per address;
     // every other DS instruction has one 16-bit offset.
-    if (in.name.find("read2") != std::string::npos || in.name.find("write2") != std::string::npos) {
+    if (in.name.find("read2") != std::string::npos || in.name.find("write2") != std::string::npos ||
+        in.name.find("wrxchg2") != std::string::npos) {
       in.offset = w0 & 0xFF;
       in.offset1 = (w0 >> 8) & 0xFF;
     } else {
@@ -1917,10 +2044,15 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       if (acc) o.kind = OperandKind::Agpr;
       return o;
     };
+    in.gds = (w0 >> 16) & 1;
     if (s.dst_width) in.dst.push_back(data((w1 >> 24) & 0xFF, s.dst_width));
-    in.src.push_back(vgpr(w1 & 0xFF));                              // the address
-    if (s.srcs > 1) in.src.push_back(data((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
-    if (s.srcs > 2) in.src.push_back(data((w1 >> 16) & 0xFF, s.src_width(2)));  // and the second, for a two-address write
+    if (in.name == "ds_write_addtid_b32") {
+      in.src.push_back(data((w1 >> 8) & 0xFF, 1));                   // the data alone: the address is M0, the offset and the lane
+    } else {
+      if (s.srcs) in.src.push_back(vgpr(w1 & 0xFF));                 // the address (ds_nop and the like have none)
+      if (s.srcs > 1) in.src.push_back(data((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
+      if (s.srcs > 2) in.src.push_back(data((w1 >> 16) & 0xFF, s.src_width(2)));  // and the second, for a two-address write
+    }
   } else if ((w0 >> 26) == 0x38) {    // MUBUF: through a buffer resource, and the cache operations
     in.enc = Enc::Mubuf;
     in.opcode = (w0 >> 18) & 0x7F;
@@ -1998,7 +2130,7 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
                                                                    : in.segment == Inst::Segment::Flat ? 2 : 1;
     in.src.push_back(vgpr(w1 & 0xFF, addr_width));
     if (s.srcs > 1) in.src.push_back(data((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
-  } else if ((w0 >> 26) == 0x3a && g_images) {   // MTBUF: gfx90a's typed buffer accesses
+  } else if ((w0 >> 26) == 0x3a) {   // MTBUF: the typed buffer accesses (CDNA2, CDNA3 and CDNA4 ISA: the same fields)
     // MI200 ISA guide, 13.5.1 (Table 86): OFFSET [11:0], OFFEN 12, IDXEN 13, GLC 14, OP [18:15], DFMT [22:19],
     // NFMT [25:23]; second word: VADDR [7:0], VDATA [15:8], SRSRC [20:16], SLC 22, ACC 23, SOFFSET [31:24].
     const uint32_t w1 = word(code, at + 4);
@@ -2010,7 +2142,7 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.offset = static_cast<int32_t>(w0 & 0xFFF);
     in.offen = (w0 >> 12) & 1;
     in.idxen = (w0 >> 13) & 1;
-    in.cache = ((w0 >> 14) & 1) | ((w1 >> 22) & 1) << 1;   // glc, slc
+    in.cache = ((w0 >> 14) & 1) | ((w1 >> 22) & 1) << 1 | (g_images ? 0u : ((w1 >> 21) & 1) << 2);   // glc, slc (sc0, nt, and gfx940's sc1)
     in.format = ((w0 >> 19) & 0xF) | ((w0 >> 23) & 7) << 4;   // the data format, then the number format above it
     Operand data = vgpr((w1 >> 8) & 0xFF, s.dst_width ? s.dst_width : s.src_width(0));
     if ((w1 >> 23) & 1) data.kind = OperandKind::Agpr;
@@ -2266,7 +2398,19 @@ std::string to_text(const Inst& i) {
     if (i.d16) t += " d16";
     return t;
   }
+  if (i.name == "s_atc_probe" || i.name == "s_atc_probe_buffer") {
+    std::string t = s + " " + std::to_string(i.simm) + ", " + operand_text(i.src[0]);
+    char o[32];
+    if (i.has_saddr) {
+      t += ", " + operand_text(operand(i.saddr, 1));
+      if (i.offset || i.smem_both_offsets) t += (std::snprintf(o, sizeof o, " offset:0x%x", i.offset), o);
+    } else {
+      t += (std::snprintf(o, sizeof o, ", 0x%x", i.offset), o);
+    }
+    return t;
+  }
   if (i.name == "s_getreg_b32") return s + " " + operand_text(i.dst[0]) + ", " + hwreg_text(static_cast<uint32_t>(i.simm));
+  if (i.name == "s_setreg_b32") return s + " " + hwreg_text(static_cast<uint32_t>(i.simm)) + ", " + operand_text(i.dst[0]);
   if (i.name == "s_setreg_imm32_b32") {
     const uint32_t v = static_cast<uint32_t>(i.src[0].value);
     char k[32];
@@ -2389,7 +2533,8 @@ std::string to_text(const Inst& i) {
     }
     if (i.cache & 1) s += " glc";
   } else if (i.enc == Enc::Ds) {
-    const bool two = i.name.find("read2") != std::string::npos || i.name.find("write2") != std::string::npos;
+    const bool two = i.name.find("read2") != std::string::npos || i.name.find("write2") != std::string::npos ||
+                     i.name.find("wrxchg2") != std::string::npos;
     if (i.name == "ds_swizzle_b32") {
       if (i.offset) s += " offset:" + swizzle_text(static_cast<uint32_t>(i.offset));
     } else if (i.offset) {
@@ -2400,6 +2545,7 @@ std::string to_text(const Inst& i) {
       std::snprintf(b, sizeof b, " offset1:%d", i.offset1);
       s += b;
     }
+    if (i.gds) s += " gds";
   } else if (i.enc == Enc::Flat) {
     // flat prints only its address and data; global and scratch print the
     // scalar base, or "off" where there is none.
@@ -2447,7 +2593,14 @@ std::string to_text(const Inst& i) {
       throw Error::make(Err::Unsupported, "s_sendmsg with message ", static_cast<uint32_t>(i.simm) & 0xFFFF,
                         " is not decoded yet");
     s += " sendmsg(MSG_INTERRUPT)";
-  } else if (i.name == "s_nop" || i.name == "s_sleep" || i.name == "s_setprio" || i.name == "s_trap") {
+  } else if (i.name == "s_set_gpr_idx_mode") {
+    static const char* kModes[4] = {"SRC0", "SRC1", "SRC2", "DST"};
+    std::string modes;
+    for (int k = 0; k < 4; ++k)
+      if ((i.simm >> k) & 1) modes += (modes.empty() ? "" : ",") + std::string(kModes[k]);
+    s += " gpr_idx(" + modes + ")";
+  } else if (i.name == "s_nop" || i.name == "s_sleep" || i.name == "s_setprio" || i.name == "s_trap" || i.name == "s_setkill" ||
+             i.name == "s_sethalt" || i.name == "s_incperflevel" || i.name == "s_decperflevel") {
     std::snprintf(b, sizeof b, " %d", i.simm);   // how many cycles to wait
     s += b;
   } else if (i.name == "s_waitcnt") {
