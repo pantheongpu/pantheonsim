@@ -1120,7 +1120,42 @@ constexpr size_t op_index() {
 #pragma GCC push_options
 #pragma GCC optimize("fp-contract=off")
 typedef float WmmaRow8 __attribute__((vector_size(32)));
+typedef int32_t WmmaBits8 __attribute__((vector_size(32)));
+// A NaN in the result becomes the canonical one, 0x7fffffff, which is what the SASS executor's HMMA path
+// (simd::hmma, a NaN result the canonical 0x7fffffff) and an RTX 3060 write. Left to the adds and multiplies above,
+// a NaN that meets another NaN is whichever the host instruction returns for two NaN operands -- the first source
+// operand's, in its sign and payload -- and the compiler picks the operand order of every vector add and multiply, so
+// it differed between builds (an optimised one and a ThreadSanitizer -O1 one). A NaN is rare, so the tile sums its
+// result rows as it writes them (one add each; a NaN anywhere makes the sum a NaN, and a sum that is not one holds
+// none) and only a tile whose sum is a NaN -- which an infinity minus an infinity also makes: then nothing changes --
+// is gone over again, a compare and a select on the bits.
+static inline WmmaRow8 wmma_canon_nan(WmmaRow8 v) {
+  WmmaBits8 b;
+  std::memcpy(&b, &v, sizeof b);
+  const WmmaBits8 nan = v != v;   // all ones where the lane is a NaN
+  const WmmaBits8 canon = {0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF};
+  b = nan ? canon : b;
+  std::memcpy(&v, &b, sizeof v);
+  return v;
+}
+static inline void wmma_canon_tile(float (&D)[16][16], WmmaRow8 sum) {
+  alignas(32) float s[8];
+  std::memcpy(s, &sum, sizeof sum);
+  bool any = false;
+  for (int l = 0; l < 8; ++l) any |= s[l] != s[l];
+  if (!any) return;
+  for (uint32_t i = 0; i < 16; ++i) {
+    WmmaRow8 lo, hi;
+    std::memcpy(&lo, &D[i][0], sizeof lo);
+    std::memcpy(&hi, &D[i][8], sizeof hi);
+    lo = wmma_canon_nan(lo);
+    hi = wmma_canon_nan(hi);
+    std::memcpy(&D[i][0], &lo, sizeof lo);
+    std::memcpy(&D[i][8], &hi, sizeof hi);
+  }
+}
 #define VGPU_WMMA_TILE_BODY                                          \
+  WmmaRow8 chk = {0, 0, 0, 0, 0, 0, 0, 0};                           \
   for (uint32_t i = 0; i < 16; ++i) {                                \
     WmmaRow8 lo, hi;                                                 \
     std::memcpy(&lo, &C[i][0], sizeof lo);                           \
@@ -1135,9 +1170,12 @@ typedef float WmmaRow8 __attribute__((vector_size(32)));
       lo = lo + pl;                                                  \
       hi = hi + ph;                                                  \
     }                                                                \
+    chk = chk + lo;                                                  \
+    chk = chk + hi;                                                  \
     std::memcpy(&D[i][0], &lo, sizeof lo);                           \
     std::memcpy(&D[i][8], &hi, sizeof hi);                           \
-  }
+  }                                                                  \
+  wmma_canon_tile(D, chk);
 void wmma_tile_base(float (&D)[16][16], const float (&A)[16][16], const float (&B)[16][16],
                     const float (&C)[16][16], uint32_t K) {
   VGPU_WMMA_TILE_BODY
@@ -9838,7 +9876,8 @@ class Interpreter {
             const float prod = static_cast<float>(A[size_t{i} * K + k]) * static_cast<float>(B[size_t{k} * N + j]);
             acc = acc + prod;
           }
-          D[size_t{i} * N + j] = op.dtype == WmmaType::F16 ? double_to_f16(acc) : f32bits(acc);
+          // (f16: double_to_f16 answers a NaN with the canonical 0x7fff; f32: the canonical 0x7fffffff, as the tile does.)
+          D[size_t{i} * N + j] = op.dtype == WmmaType::F16 ? double_to_f16(acc) : canon32(acc);
         }
     } else if (at == WmmaType::F64) {
       const int prev = op.rnd == FRound::Nearest ? 0 : std::fegetround();

@@ -1613,6 +1613,25 @@ streamcluster): output identical but for timing lines. SASS rows are within
 noise (wmma/mma_ptx read -3% in some runs and +3% in others with no SASS code
 changed: the build is layout-sensitive to a few percent either way).
 
+**2026-10-15: the PTX wmma tile writes a canonical NaN.** The f32-accumulator tile
+(`wmma_tile`, behind `fast_wmma_mma` and `exec_wmma_mma`) used to leave whatever NaN the
+host's vector add or multiply returned for two NaN operands -- the first source
+operand's, sign and payload -- and the compiler picks that order, so the sign
+differed between an optimised build and a ThreadSanitizer `-O1` one (simd_lane_forms
+caught it: `wmma_{f16,bf16,tf32}_f32acc`, random and edges). A NaN result is now
+`0x7fffffff`, as the SASS executor's HMMA path (`simd::hmma`) and an RTX 3060 write
+it (the card file's raw hashes equal their NaN-canonical twins), and so are the
+generic-shape f32 results (`m32n8k16` and the like). The f16 accumulator was
+already canonical (`double_to_f16` answers a NaN with `0x7fff`) and `mma.sync`
+already canonicalised its f32 result (`canon32`); no non-NaN bit moved (the words
+that changed are exactly the NaN words, checked element by element). The tile
+sums its rows as it writes them and goes over a tile again only when that sum is
+a NaN, so a tile without one pays one add per vector. The sanitizer skip and the
+`_nonan` twin lines in simd_lane_forms are gone: its pinned hashes are the same in
+Release 13.0 and 12.0 and in the CI ThreadSanitizer Debug configuration.
+`wgmma`, `tcgen05` and the `m8n8k4` form of `mma` still add f32 products in scalar
+code and are not covered by this.
+
 One limit found and left alone: on Intel cores a subnormal operand or result
 costs every FP operation a microcode assist, and fp64_virus's FMA chains
 decay into that range -- it runs about 3.7x faster with flush-to-zero set.

@@ -401,6 +401,84 @@ VTEST(fast_wmma_matches_the_general_path) {
   }
 }
 
+// A NaN in the f32 accumulator tile is the canonical one, 0x7fffffff (what the SASS executor's HMMA path writes, and an
+// RTX 3060). Which NaN the host's vector adds and multiplies hand on when two NaNs meet is the first source operand's, and
+// the compiler picks that order, so before the tile canonicalised its result the sign came out differently from one build
+// to another. NaNs go in through A, B and C (f16 and bf16 NaN codes, f32 NaNs of both signs and payloads, infinities
+// that make inf * 0), and every NaN word that comes out must be 0x7fffffff (the non-NaN words are compared with the
+// general path by the test above and by simd_lane_forms). Shapes: the m16n16k16 forms (the tile), and m32n8k16 (the
+// generic path); both with the fast paths and with VGPU_FASTPATH=0.
+VTEST(wmma_f32_accumulator_nans_are_the_canonical_one) {
+  const uint16_t h16[] = {0x7E00, 0xFE01, 0x7C00, 0xFC00, 0x3C00, 0x0000, 0x8000, 0x7C01, 0x3555, 0xBC00, 0x7FFF, 0x4248};
+  const uint16_t hbf[] = {0x7FC0, 0xFFC1, 0x7F80, 0xFF80, 0x3F80, 0x0000, 0x8000, 0x7F81, 0x3EAB, 0xBF80, 0x7FFF, 0x4049};
+  const uint32_t cn[] = {0x7FC00000u, 0xFFC00000u, 0x7F800001u, 0xFFFFFFFFu, 0x7FC12345u, 0xFFA00000u, 0x3F800000u, 0x80000000u};
+  int checked = 0;
+  for (bool bf : {false, true})
+    for (const char* shape : {".m16n16k16", ".m32n8k16"}) {
+      const bool wide = std::string(shape) == ".m32n8k16";
+      std::vector<uint32_t> frag;
+      for (int lane = 0; lane < 32; ++lane) {
+        const int na = bf ? 4 : 8, nb = na;   // (f16 fragments A and B are 8 registers in every shape)
+        const uint16_t* t = bf ? hbf : h16;
+        for (int r = 0; r < 8; ++r) {   // the A words, then the B words (the shape's B may need fewer)
+          const uint16_t lo = t[(lane * 3 + r * 5) % 12], hi = t[(lane * 7 + r * 3 + 1) % 12];
+          frag.push_back(r < na ? (uint32_t{lo} | (uint32_t{hi} << 16)) : 0u);
+        }
+        for (int r = 0; r < 8; ++r) {
+          const uint16_t lo = t[(lane * 5 + r * 7 + 2) % 12], hi = t[(lane * 11 + r * 3) % 12];
+          frag.push_back(r < nb ? (uint32_t{lo} | (uint32_t{hi} << 16)) : 0u);
+        }
+        for (int r = 0; r < 8; ++r) frag.push_back((lane + r) % 3 == 0 ? cn[(lane * 5 + r) % 8] : fbits(float(lane % 7) - 3.0f));
+      }
+      for (const char* lay : {"row.row", "col.col"})
+        for (const char* fp : {"1", "0"}) {
+          const std::string sh = std::string(lay) + shape + ".f32" + (bf ? ".bf16.bf16" : ".f32");
+          if (bf && wide) continue;   // (bf16 has only m16n16k16 here)
+          setenv("VGPU_FASTPATH", fp, 1);
+          const auto d = run_wmma(sh, false, frag);
+          unsetenv("VGPU_FASTPATH");
+          int nans = 0;
+          for (size_t i = 0; i < d.size(); ++i)
+            if ((d[i] & 0x7FFFFFFFu) > 0x7F800000u) {
+              ++nans;
+              if (d[i] != 0x7FFFFFFFu) {
+                char buf[160];
+                std::snprintf(buf, sizeof buf, "wmma %s (VGPU_FASTPATH=%s): word %zu is the NaN 0x%08x, not 0x7fffffff", sh.c_str(), fp, i, d[i]);
+                throw vtest::Failure(buf);
+              }
+            }
+          VCHECK(nans > 8);   // the inputs do make NaNs
+          ++checked;
+        }
+    }
+  VCHECK_EQ(checked, 12);
+  // One NaN alone in a clean tile, in the left eight columns of its row and in the right eight (lane 0 and lane 1 of the C
+  // fragment, register 0: elements 0 and 8): it comes out canonical, and nothing else in the tile is a NaN.
+  for (uint32_t lane_with_nan : {0u, 1u, 30u, 31u})
+    for (uint32_t pattern : {0xFFFFFFFFu, 0xFFC12345u, 0x7F800001u}) {
+      std::vector<uint32_t> frag;
+      for (uint32_t lane = 0; lane < 32; ++lane) {
+        for (int r = 0; r < 8; ++r) frag.push_back(0x3C003C00u);   // A: all ones (f16)
+        for (int r = 0; r < 8; ++r) frag.push_back(0x3C003C00u);   // B: all ones
+        for (int r = 0; r < 8; ++r) frag.push_back(lane == lane_with_nan && r == 0 ? pattern : fbits(0.5f));
+      }
+      for (const char* fp : {"1", "0"}) {
+        setenv("VGPU_FASTPATH", fp, 1);
+        const auto d = run_wmma("row.row.m16n16k16.f32.f32", false, frag);
+        unsetenv("VGPU_FASTPATH");
+        for (size_t i = 0; i < d.size(); ++i) {
+          const bool want_nan = i == lane_with_nan * 8;
+          if (want_nan ? d[i] != 0x7FFFFFFFu : (d[i] & 0x7FFFFFFFu) > 0x7F800000u) {
+            char buf[160];
+            std::snprintf(buf, sizeof buf, "a lone NaN 0x%08x in lane %u: word %zu is 0x%08x (VGPU_FASTPATH=%s)", pattern,
+                          lane_with_nan, i, d[i], fp);
+            throw vtest::Failure(buf);
+          }
+        }
+      }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Memory accesses: the counters and the data, fast against general.
 //
