@@ -10,6 +10,7 @@
 // k order). Levels the host cannot run are reported as skipped, not passed.
 #pragma GCC optimize("fp-contract=off")
 
+#include <algorithm>
 #include <bit>
 #include <cfenv>
 #include <cmath>
@@ -1304,6 +1305,84 @@ VTEST(i2f_under_directed_rounding_at_every_level) {
                                    ": a=0x" + hex(a[i]) + " got 0x" + hex(r[i]) + " want 0x" + hex(want[i]));
         }
       }
+    }
+  }
+}
+
+// narrow_from_double / narrow_core (the SASS executor's F2F and I2F to f16 and bf16 in a given rounding mode, one rounding from the
+// exact value) against a brute-force reference: the finite values of the format in a table, the neighbours of the input found by
+// search, and the mode (0 nearest even, 1 toward -inf, 2 toward +inf, 3 toward zero) choosing between them. Inputs: random doubles over
+// the format's whole range and past it, every representable value and its neighbours, every midpoint, and 64-bit integers (what I2F
+// converts: through narrow_core, one rounding from the integer, where f32 first would round twice).
+namespace {
+struct NarrowRef {
+  unsigned mb, eb, inf_bits, sign_bit;
+  std::vector<long double> mag;   // the finite magnitudes by bit pattern; the last entry is 2^(emax+1), where infinity begins
+  explicit NarrowRef(unsigned dsize) : mb(dsize == 1 ? 10 : 7), eb(dsize == 1 ? 5 : 8) {
+    inf_bits = ((1u << eb) - 1) << mb;
+    sign_bit = 1u << (mb + eb);
+    mag.resize(inf_bits + 1);
+    for (uint32_t b = 0; b < inf_bits; ++b)
+      mag[b] = dsize == 1 ? static_cast<long double>(simd::f16_to_f32(static_cast<uint16_t>(b))) : static_cast<long double>(simd::bf16_to_f32(static_cast<uint16_t>(b)));
+    mag[inf_bits] = std::ldexp(1.0L, (1 << (eb - 1)));
+  }
+  uint32_t operator()(long double a, bool sign, unsigned rnd) const {
+    const uint32_t sb = sign ? sign_bit : 0u;
+    if (a == 0) return sb;
+    const bool away = (rnd == 1 && sign) || (rnd == 2 && !sign);
+    if (a >= mag[inf_bits]) return sb | ((rnd == 0 || away) ? inf_bits : inf_bits - 1);
+    const uint32_t lo = static_cast<uint32_t>(std::upper_bound(mag.begin(), mag.end(), a) - mag.begin()) - 1, hi = lo + 1;
+    if (mag[lo] == a) return sb | lo;
+    if (rnd != 0) return sb | (away ? hi : lo);
+    const long double dl = a - mag[lo], dh = mag[hi] - a;
+    return sb | (dl < dh ? lo : dh < dl ? hi : (lo & 1) == 0 ? lo : hi);
+  }
+};
+}  // namespace
+
+VTEST(narrow_in_every_mode_matches_a_table) {
+  for (unsigned dsize : {1u, 4u}) {
+    const NarrowRef ref(dsize);
+    const char* name = dsize == 1 ? "f16" : "bf16";
+    std::mt19937_64 rng(dsize * 1315423911u);
+    std::vector<double> xs;
+    for (int i = 0; i < 60000; ++i) {
+      const int e = static_cast<int>(rng() % (dsize == 1 ? 50 : 300)) - (dsize == 1 ? 30 : 150);
+      xs.push_back(std::ldexp(1.0 + static_cast<double>(rng() >> 11) / 9007199254740992.0, e) * ((rng() & 1) ? -1 : 1));
+    }
+    for (uint32_t b = 0; b + 1 < ref.inf_bits; ++b) {
+      const double v = static_cast<double>(ref.mag[b]), nx = static_cast<double>(ref.mag[b + 1]), mid = (v + nx) / 2;
+      for (double q : {v, std::nextafter(v, 0.0), std::nextafter(v, 1e300), mid, std::nextafter(mid, 0.0), std::nextafter(mid, 1e300)}) {
+        xs.push_back(q);
+        xs.push_back(-q);
+      }
+    }
+    for (double q : {0.0, -0.0, 1e300, -1e300, 65504.0, 65519.99, 65520.0, 65536.0, 3.3895313892515355e38, 3.39e38, 3.4e38})
+      xs.push_back(q);
+    for (double x : xs)
+      for (unsigned rnd = 0; rnd < 4; ++rnd) {
+        const uint32_t got = simd::narrow_from_double(x, dsize, rnd), want = ref(std::fabs(static_cast<long double>(x)), std::signbit(x), rnd);
+        if (got != want) {
+          char buf[200];
+          std::snprintf(buf, sizeof buf, "narrow_from_double(%a, %s, mode %u): got 0x%x want 0x%x", x, name, rnd, got, want);
+          throw vtest::Failure(buf);
+        }
+      }
+    for (int i = 0; i < 60000; ++i) {
+      uint64_t v = rng() >> (rng() % 64);
+      if (i % 5 == 0) v |= (uint64_t{1} << (rng() % 64)) - 1;   // many ones below a leading bit: just under a tie, or on one
+      if (i % 5 == 1) v = (v | 1) << (rng() % 16);
+      if (v == 0) continue;
+      const int z = std::countl_zero(v);
+      for (unsigned rnd = 0; rnd < 4; ++rnd)
+        for (bool neg : {false, true}) {
+          const uint32_t got = simd::narrow_core(neg, v << z, 63 - z, ref.mb, ref.eb, rnd), want = ref(static_cast<long double>(v), neg, rnd);
+          if (got != want) {
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "narrow_core(%s%llu, %s, mode %u): got 0x%x want 0x%x", neg ? "-" : "", static_cast<unsigned long long>(v), name, rnd, got, want);
+            throw vtest::Failure(buf);
+          }
+        }
     }
   }
 }

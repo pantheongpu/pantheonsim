@@ -1242,7 +1242,7 @@ void dec_frnd(Instr& ins, const Word& w) {
   ins.op = Op::FRND;
   ins.mnemonic = "FRND";
   const unsigned dsz = static_cast<unsigned>(w.field(75, 2)), ssz = static_cast<unsigned>(w.field(84, 2));
-  if (dsz == 3 && ssz == 3) ins.mods.push_back("F64");
+  if (dsz == ssz && dsz != 2) ins.mods.push_back(dsz == 3 ? "F64" : "F16");   // (nvdisasm names a same-size pair once)
   else if (dsz != 2 || ssz != 2) {
     ins.mods.push_back(dsz == 3 ? "F64" : dsz == 1 ? "F16" : "F32");
     ins.mods.push_back(ssz == 3 ? "F64" : ssz == 1 ? "F16" : "F32");

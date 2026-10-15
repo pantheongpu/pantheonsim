@@ -1984,17 +1984,17 @@ VTEST(pre_decoded_f64_forms_match_the_general_path) {
       same(std::string(op) + " %D, %A, 0d0000000000000001;", true, x, y, z);
       same(std::string(op) + " %A, %A, %B; mov.b64 %D, %A;", true, x, y, z);   // destination is a source
     }
-    // fma with a NaN in more than one operand returns whichever the host's instruction prefers, which differs between
-    // the general path's libm call and the vector instruction of the fast path (two signalling NaNs, say): the
-    // operands b and c keep their finite values here, and a keeps its NaNs.
-    same("fma.rn.f64 %D, %A, %B, %C;", true, x, yf, zf);
-    same("fma.rn.f64 %D, %A, 0d3FF8000000000000, 0d4000000000000000;", true, x, yf, zf);
-    same("fma.rn.f64 %A, %A, %B, %A; mov.b64 %D, %A;", true, x, yf, zf);
+    // fma with a NaN in more than one operand (two signalling NaNs, say): b's, else c's, else a's, quieted, as an RTX 3060 gives
+    // it and whichever way the host's own fma would have chosen -- the vector instruction, libm and the contracted forms all
+    // follow that rule, so every combination of NaNs in the operands is here.
+    same("fma.rn.f64 %D, %A, %B, %C;", true, x, y, z);
+    same("fma.rn.f64 %D, %A, 0d3FF8000000000000, 0d4000000000000000;", true, x, y, z);
+    same("fma.rn.f64 %A, %A, %B, %A; mov.b64 %D, %A;", true, x, y, z);
     // mul followed by add or sub contracts into an fma (the sub negates the addend or the product).
-    same("mul.f64 %rd10, %A, %B; sub.f64 %D, %rd10, %C;", true, x, yf, zf);
-    same("mul.f64 %rd10, %A, %B; sub.f64 %D, %C, %rd10;", true, x, yf, zf);
-    same("mul.f64 %rd10, %A, %B; add.f64 %D, %rd10, %C;", true, x, yf, zf);
-    same("mul.rn.f64 %rd10, %A, %B; sub.rn.f64 %D, %rd10, %C;", true, x, yf, zf);
+    same("mul.f64 %rd10, %A, %B; sub.f64 %D, %rd10, %C;", true, x, y, z);
+    same("mul.f64 %rd10, %A, %B; sub.f64 %D, %C, %rd10;", true, x, y, z);
+    same("mul.f64 %rd10, %A, %B; add.f64 %D, %rd10, %C;", true, x, y, z);
+    same("mul.rn.f64 %rd10, %A, %B; sub.rn.f64 %D, %rd10, %C;", true, x, y, z);
     // The two halves of a 64-bit register, either of which may be dropped, and the pair put back together.
     same("mov.b64 {%r3, %r4}, %A; add.u32 %d, %r3, %r4;", false, x, y, z);
     same("mov.b64 {%r3, %r4}, %A; xor.b32 %d, %r3, %r4; mov.b64 {%r3, _}, %B;", false, x, y, z);

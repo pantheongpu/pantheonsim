@@ -232,8 +232,35 @@ __global__ void k_nan_cvt(uint32_t* out, int op) {
     case 4: r = __float_as_uint(__half2float(__ushort_as_half(static_cast<unsigned short>(kFV[t])))); break;
     case 5: r = __float_as_uint(__bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(kFV[t])))); break;
     case 6: r = __float_as_uint(sqrtf(a)); break;
+    // The round-to-integral forms that keep the type (cvt.rzi / rmi / rpi / rni.f32.f32, FRND), with a signalling NaN among the inputs:
+    // the card writes the canonical NaN, whatever the form, flush or saturation.
+    case 7: r = __float_as_uint(truncf(a)); break;
+    case 8: r = __float_as_uint(floorf(a)); break;
+    case 9: r = __float_as_uint(ceilf(a)); break;
+    case 10: r = __float_as_uint(rintf(a)); break;
+    case 11: { float q; asm("cvt.rzi.ftz.f32.f32 %0, %1;" : "=f"(q) : "f"(a)); r = __float_as_uint(q); break; }
+    case 12: { float q; asm("cvt.rmi.sat.f32.f32 %0, %1;" : "=f"(q) : "f"(a)); r = __float_as_uint(q); break; }
+    case 13: { float q; asm("cvt.rpi.ftz.sat.f32.f32 %0, %1;" : "=f"(q) : "f"(a)); r = __float_as_uint(q); break; }
+    case 14: { float q; asm("cvt.rni.sat.f32.f32 %0, %1;" : "=f"(q) : "f"(a)); r = __float_as_uint(q); break; }
   }
   out[t] = r;
+}
+// The same for f64 (cvt.rzi / rmi / rpi / rni.f64.f64, FRND.F64): the card sets the quiet bit of a signalling NaN and keeps its sign and
+// payload (0x7ff0000000000001 gives 0x7ff8000000000001).
+__global__ void k_nan_rint(unsigned long long* out, int op) {
+  const int t = threadIdx.x + blockIdx.x * blockDim.x;
+  if (t >= kNV) return;
+  const double a = __longlong_as_double(static_cast<long long>(kDV[t]));
+  double r = 0;
+  switch (op) {
+    case 0: r = trunc(a); break;
+    case 1: r = floor(a); break;
+    case 2: r = ceil(a); break;
+    case 3: r = rint(a); break;
+    case 4: asm("cvt.rzi.sat.f64.f64 %0, %1;" : "=d"(r) : "d"(a)); break;
+    case 5: asm("cvt.rmi.sat.f64.f64 %0, %1;" : "=d"(r) : "d"(a)); break;
+  }
+  out[t] = static_cast<unsigned long long>(__double_as_longlong(r));
 }
 
 // __sad and __usad: |a - b| + c as signed and as unsigned 32-bit numbers (one SASS VABSDIFF each, with a register, an immediate b or
@@ -468,8 +495,9 @@ int main() {
       for (int t = 0; t < kNV * kNV; ++t) hh = fnv_step(hh, h[t], 8);
       std::printf("nan_%s %016llx\n", dn[op], static_cast<unsigned long long>(hh));
     }
-    static const char* cn[] = {"f32_to_f64_hi", "f64_to_f32", "f32_to_f16", "f32_to_bf16", "f16_to_f32", "bf16_to_f32", "sqrtf"};
-    for (int op = 0; op < 7; ++op) {
+    static const char* cn[] = {"f32_to_f64_hi", "f64_to_f32", "f32_to_f16", "f32_to_bf16", "f16_to_f32", "bf16_to_f32", "sqrtf",
+                               "rint_rzi", "rint_rmi", "rint_rpi", "rint_rni", "rint_rzi_ftz", "rint_rmi_sat", "rint_rpi_ftz_sat", "rint_rni_sat"};
+    for (int op = 0; op < 15; ++op) {
       k_nan_cvt<<<1, 32>>>(df, op);
       CK(cudaGetLastError());
       CK(cudaDeviceSynchronize());
@@ -478,6 +506,16 @@ int main() {
       uint64_t hh = 1469598103934665603ull;
       for (int t = 0; t < kNF; ++t) hh = fnv_step(hh, h[t], 4);
       std::printf("nan_cvt_%s %016llx\n", cn[op], static_cast<unsigned long long>(hh));
+    }
+    for (int op = 0; op < 6; ++op) {
+      k_nan_rint<<<1, 32>>>(d, op);
+      CK(cudaGetLastError());
+      CK(cudaDeviceSynchronize());
+      unsigned long long h[kNV];
+      CK(cudaMemcpy(h, d, sizeof h, cudaMemcpyDeviceToHost));
+      uint64_t hh = 1469598103934665603ull;
+      for (int t = 0; t < kNV; ++t) hh = fnv_step(hh, h[t], 8);
+      std::printf("nan_cvt_rint64_%d %016llx\n", op, static_cast<unsigned long long>(hh));
     }
     CK(cudaFree(d)); CK(cudaFree(df));
   }
