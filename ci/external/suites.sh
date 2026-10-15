@@ -31,12 +31,14 @@
 # program's result differs from the card's; report-dir gets one line per
 # program (results.tsv), each one's output, and a summary.md.
 #
-# The cuda-samples list's columns: path | marker | arguments | environment.
+# The cuda-samples list's columns: path | marker | arguments | environment |
+# timeout (seconds; empty: SUITE_TIMEOUT).
 # A '|' inside a marker is written %7C.
 #
 # Environment: SUITE_GPU (nvidia/rtx3060), SUITE_TIMEOUT (seconds per
 # program, 600), SUITE_JOBS (parallel builds, ci/jobs.sh -g 2), SUITE_ONLY (a regex of
-# program names to keep).
+# program names to keep), SUITE_VERBOSE (any value: the programs run without
+# VGPU_QUIET, so their logs hold the simulator's own diagnostics).
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cmd="${1:?fetch|build|run|digest}"; suite="${2:?suite}"; dir="${3:?dir}"
@@ -44,6 +46,7 @@ gpu="${SUITE_GPU:-nvidia/rtx3060}"
 timeout_s="${SUITE_TIMEOUT:-600}"
 jobs="${SUITE_JOBS:-$("$here/../jobs.sh" -g 2)}"
 only="${SUITE_ONLY:-.}"
+quiet=1; [[ -n ${SUITE_VERBOSE:-} ]] && quiet=0
 
 declare -A repo=([cuda-samples]=https://github.com/NVIDIA/cuda-samples
                  [hecbench]=https://github.com/zjin-lcf/HeCBench
@@ -110,8 +113,12 @@ build() {
         -DCMAKE_CUDA_COMPILER="$(command -v nvcc)" \
         -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared > build-configure.log 2>&1 || { tail -30 build-configure.log; exit 1; }
       targets=$(entries | cut -d'|' -f1 | xargs -n1 basename)
-      # -k 0: one sample that fails to build is reported by `run`, not fatal here.
-      cmake --build build -j"$jobs" --target $targets -- -k 0 > build.log 2>&1 || tail -20 build.log
+      # -k 0: one sample that fails to build is reported by `run`, not fatal here;
+      # what failed, and the errors it gave, go in this job's log.
+      cmake --build build -j"$jobs" --target $targets -- -k 0 > build.log 2>&1 ||
+        { tail -5 build.log; echo "--- targets that failed:"; grep -E '^FAILED:' build.log | sed 's/^FAILED: //' | sort -u
+          echo "--- their errors, by how often each came:"
+          grep -E 'error|undefined reference|cannot find|No such file|not found' build.log | sed -E 's#/[^ :]*/suite/##g' | sort | uniq -c | sort -rn | head -40; }
       ;;
     hecbench)
       entries | cut -d'|' -f1 | xargs -P "$jobs" -I{} bash -c '
@@ -164,8 +171,8 @@ run_one() {
        VGPU_KERNEL_DIGEST="$report/digest/$name.ptx" timeout -k 10 "$timeout_s" "$@" > "$log.ptx" 2>&1 < /dev/null)
     rc_ptx=$?
   else
-    (cd "$wd" && env VGPU_QUIET=1 VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" \
-       timeout -k 10 "$timeout_s" "$@" > "$log" 2>&1 < /dev/null)
+    (cd "$wd" && env VGPU_QUIET="$quiet" VGPU_GPU="$gpu" LD_LIBRARY_PATH="$shim" \
+       timeout -k 10 "${run_timeout:-$timeout_s}" "$@" > "$log" 2>&1 < /dev/null)
     rc=$?
   fi
   secs=$(( SECONDS - t0 ))
@@ -223,7 +230,7 @@ run() {
   }
   case $suite in
     cuda-samples)
-      while IFS='|' read -r path marker args extra; do
+      while IFS='|' read -r path marker args extra run_timeout; do
         name=$(basename "$path"); exe="build/$path"; log="$report/logs/$name.log"
         marker=${marker//%7C/|}
         [[ -x $exe ]] || { result "$name" FAIL 0 "did not build"; continue; }
