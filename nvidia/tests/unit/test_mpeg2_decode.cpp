@@ -230,4 +230,46 @@ VTEST(default_quantiser_matrices_are_table_7_6_and_flat) {
   for (int i = 0; i < 64; ++i) VCHECK_EQ(inter[i], 16);
 }
 
+// The frames themselves, bit for bit: nvidia/tests/data/mpeg2/decoded.digests lists, for every stream, the number of frames the
+// decoder gave and the FNV-1a digest of their sizes and samples when the inverse DCT, the half-sample prediction and the bit reader
+// were the plain loops (the vector forms of video_simd.hpp and mpeg2_decode.cpp must give the same samples). The comparison with the
+// card above has a tolerance; this one has none. Rewrite the file (one line per stream: name, frames, digest) if the decoder's output
+// is changed on purpose.
+VTEST(frames_are_the_ones_the_plain_loops_gave) {
+  const std::string src = source_dir();
+  std::ifstream list(src + "/nvidia/tests/data/mpeg2/decoded.digests");
+  VCHECK(list.good());
+  std::string name;
+  size_t frames = 0;
+  unsigned long long want = 0;
+  int checked = 0;
+  while (list >> name >> frames >> std::hex >> want >> std::dec) {
+    const std::vector<uint8_t> data = slurp(src + "/nvidia/tests/data/mpeg2/" + name + ".m2v");
+    VCHECK(!data.empty());
+    std::vector<vgpu_mpeg2::OutFrame> out;
+    std::string err;
+    vgpu_mpeg2::decode_stream(data.data(), data.size(), &out, &err, 0);
+    uint64_t h = 1469598103934665603ull;
+    auto fnv = [&](const void* p, size_t k) {
+      const unsigned char* b = static_cast<const unsigned char*>(p);
+      for (size_t i = 0; i < k; ++i) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+      }
+    };
+    for (const auto& f : out) {
+      const int dim[2] = {f.width, f.height};
+      fnv(dim, sizeof dim);
+      fnv(f.y.data(), f.y.size());
+      fnv(f.u.data(), f.u.size());
+      fnv(f.v.data(), f.v.size());
+    }
+    if (out.size() != frames || h != want) std::fprintf(stderr, "%s: %zu frames digest %016llx, expected %zu and %016llx\n", name.c_str(), out.size(), static_cast<unsigned long long>(h), frames, want);
+    VCHECK_EQ(out.size(), frames);
+    VCHECK(h == want);
+    ++checked;
+  }
+  VCHECK(checked > 90);
+}
+
 VTEST_MAIN
