@@ -6,7 +6,12 @@
 # exercise barriers, divergence, warp ops, atomics, textures, MMA and more). Each runs twice on its generation's
 # simulated GPU, with one host thread and the performance counters on: with the interpreter, and with the tier. The two
 # must pass and print byte for byte the same -- every result and every counter of every launch, and the text of any
-# error -- apart from the tier's own statistics lines (VGPU_TIER_STATS=1, lines starting "tier").
+# error. (The tier's statistics, VGPU_TIER_STATS=1, are written to a file: VGPU_TIER_STATS_FILE.)
+#
+# sass_tier_steps.cu holds what Runner::step_warp does besides executing an instruction -- the store gate, the step count and its
+# limit, the 256-instruction run, the count of calls that a warp's turn is made of (a warp that spins on another's store counts
+# its iterations), faults -- and the tier's chain of runs is held to all of it. Its faults and its step limit run in processes of
+# their own (the text of each error must be the same).
 #
 # The comparison cannot pass by the tier doing nothing: the statistics must show that the tier ran at least
 # VGPU_TIER_MIN_PERCENT (default 30) percent of sass_tier's warp instructions.
@@ -25,14 +30,20 @@ shopt -u nullglob
 nvcc_bin="$(pick_nvcc_for_shim "$shim")"
 [[ -n "$nvcc_bin" ]] || { echo "SKIP: no nvcc matching this shim's toolkit"; exit 0; }
 nvcc_host_compiler_fix
-work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-sass-tier.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
+# VGPU_TIER_WORK=<dir> keeps the built programs there between runs (a program is rebuilt only when its source is newer), for
+# working on the tier without compiling fifty programs each time; VGPU_TIER_BUILD_ONLY=1 stops after the builds.
+if [[ -n ${VGPU_TIER_WORK:-} ]]; then
+  work="$VGPU_TIER_WORK"; mkdir -p "$work"
+else
+  work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-sass-tier.XXXXXX")"
+  trap 'rm -rf "$work"' EXIT
+fi
 
 declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm_89]=nvidia/l4 [sm_90]=nvidia/h100
                 [sm_100]=nvidia/b200 [sm_120]=nvidia/rtx5090)
 archs=(${VGPU_TIER_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_100 sm_120})
 # program:first architecture[:last]; each runs on one architecture except sass_tier, which runs on every one.
-others=(${VGPU_TIER_PROGRAMS:-sass_fastpath:75 sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
+others=(${VGPU_TIER_PROGRAMS:-sass_tier_steps:75 sass_fastpath:75 sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
         symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75 texture_layers:75 texture_forms:75
         surface_formatted:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75
         block_semaphore:75 cooperative_grid:75 alloca_stack:75 shared_max:75 named_barriers:75 smid:75 smem_size_regs:75
@@ -66,9 +77,13 @@ read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
 export nvcc_bin root work
 export san="${san_flags[*]}"
 printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_TIER_JOBS:-$("$root/ci/jobs.sh" -p sass)}" -L 1 bash -c '
+  [[ -x "$work/$0.$1" && "$work/$0.$1" -nt "$root/nvidia/tests/e2e/$0.cu" ]] && ! grep -q "build failed" "$work/$0.$1.build" 2>/dev/null && exit 0
+  rm -f "$work/$0.$1" "$work/$0.$1.build"
   "$nvcc_bin" -std=c++17 -arch="$1" -cudart shared -w -Wno-deprecated-gpu-targets -Xlinker --as-needed $san \
     -I"$root/nvidia/tests/e2e" "$root/nvidia/tests/e2e/$0.cu" -o "$work/$0.$1" -lcuda 2> "$work/$0.$1.build" ||
     echo "build failed" >> "$work/$0.$1.build"'
+
+[[ -n ${VGPU_TIER_BUILD_ONLY:-} ]] && { echo "built in $work"; exit 0; }
 
 fails=0
 check() {
@@ -79,10 +94,12 @@ check() {
   require_shim_libs "$shim" "$bin" >/dev/null || return
   local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_SASS_LOG=1 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
   a="$(cd "$work" && env "${env[@]}" VGPU_TIER=0 timeout 900 "$bin" 2>&1)"; ra=$?
-  b="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 timeout 900 "$bin" 2>&1)"; rb=$?
-  local stats bq
-  stats="$(grep '^tier: ' <<< "$b" | head -1)"
-  bq="$(grep -v '^tier' <<< "$b")"
+  # (The tier's statistics go to a file of their own: printed at exit among the program's buffered output, they tear a line.)
+  local stats bq sf="$work/$p.$arch.stats"
+  rm -f "$sf"
+  b="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 VGPU_TIER_STATS_FILE="$sf" timeout 900 "$bin" 2>&1)"; rb=$?
+  stats="$(grep -h '^tier: ' "$sf" 2>/dev/null | head -1)"
+  bq="$b"
   grep -q "running SASS" <<< "$a" || why="its SASS did not run"
   grep -q "running PTX instead of SASS" <<< "$a" && why="fell back to PTX: $(grep -m1 'running PTX instead' <<< "$a")"
   [[ $ra == "$rb" ]] || why="${why:+$why; }exit status $ra with the interpreter, $rb with the tier"
@@ -99,7 +116,7 @@ check() {
     grep -q '^store gate: .* ok$' <<< "$bq" || why="${why:+$why; }the tier's store gate line is not ok"
     # The tier is shared by the host threads of a launch: four of them must give what one thread of the interpreter does.
     local c4
-    c4="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_THREADS=4 timeout 900 "$bin" 2>&1 | grep -v '^tier')"
+    c4="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_THREADS=4 timeout 900 "$bin" 2>&1)"
     [[ "$a" == "$c4" ]] || why="${why:+$why; }four threads with the tier print differently from the interpreter's one"
     local ran total
     ran="$(sed -n 's/^tier: \([0-9]*\) of \([0-9]*\) warp.*/\1/p' <<< "$stats")"
@@ -107,6 +124,24 @@ check() {
     if [[ -z $ran || -z $total ]] || (( total == 0 || ran * 100 < total * min_percent )); then
       why="${why:+$why; }the tier ran ${ran:-?} of ${total:-?} warp instructions (wanted at least $min_percent%)"
     fi
+  fi
+  if [[ ( $p == sass_tier_steps || $p == sass_tier ) && -z $why ]]; then
+    # The tier without its chain (one run of straight instructions per call of the scheduler, as the interpreter has it): the
+    # same again, so that a difference of the chain's is told from one of the handlers'.
+    local nc
+    nc="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_CHAIN=0 timeout 900 "$bin" 2>&1)"
+    [[ "$a" == "$nc" ]] || why="${why:+$why; }the tier without its chain prints differently from the interpreter"
+  fi
+  if [[ $p == sass_tier_steps && -z $why ]]; then
+    # Faults deep into a run of straight instructions, and the step limit: the text names the instruction, the lane and the
+    # address, so a handler that reports it differently shows here. VGPU_MAX_STEPS keeps the loop with no end short.
+    local f fa fb fenv=(VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_MAX_STEPS=50000 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
+    for f in gather scatter local shared atomic trap forever; do
+      fa="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=0 timeout 300 "$bin" fault $f 2>&1)"
+      fb="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=1 timeout 300 "$bin" fault $f 2>&1)"
+      if ! grep -q "^fault $f: " <<< "$fa" || grep -q "^fault $f: no error" <<< "$fa"; then why="${why:+$why; }the $f fault did not happen"
+      elif [[ "$fa" != "$fb" ]]; then why="${why:+$why; }the $f fault is reported differently by the tier"; fi
+    done
   fi
   if [[ -n $why ]]; then
     echo "FAIL $arch $p: $why"
