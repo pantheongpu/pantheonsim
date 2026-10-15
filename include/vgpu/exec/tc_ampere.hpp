@@ -1,8 +1,9 @@
 // The sum a GA10x (sm_86) tensor core makes of an f16, bf16 or tf32 matrix product with an f32 or f16 accumulator.
 //
-// An RTX 3060 does not add the products one at a time in f32. Measured on the card by black-box probing (mma.sync m16n8k8,
-// wmma 16x16x16 and 16x16x8 in f16, bf16 and tf32, with random finite operands over narrow and wide exponent ranges, element
-// by element: 100% of 8192 f16, 8192 bf16, 8192 tf32 and 4096 m16n8k8 results; the f16 accumulator 100% of 16384):
+// An RTX 3060 does not add the products one at a time in f32. Measured on the card by black-box probing (mma.sync m16n8k8 and
+// wmma 16x16x16 and 16x16x8 in f16, bf16 and tf32, random finite operands over narrow and wide exponent ranges, special values,
+// element by element): 106,496 results of the dense forms, all of them reproduced by the rule below, with the f32 accumulator and
+// (16,384 of the 106,496) the f16 one:
 //
 //   * K is cut into chunks in order: 8 products for f16 and bf16, 4 for tf32 (m16n8k16 is two chunks, m16n8k8 one).
 //   * A chunk is the 8 (4) exact products and the accumulator, summed in one step: every term is aligned to the largest of
