@@ -1806,6 +1806,7 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.size = 8;
     const uint32_t w1 = word(code, at + 4);
     if (s.dst_width) in.dst.push_back(sgpr((w0 >> 6) & 0x7F, s.dst_width));
+    if (in.name.rfind("s_atc_probe", 0) == 0) in.simm = static_cast<int32_t>((w0 >> 6) & 0x7F);   // (its data field is the probe's own immediate)
     in.cache = (w0 >> 16) & 1;   // glc: an atomic hands back what it found
     if (s.srcs > 0) {
       in.src.push_back(sgpr(((w0 & 0x3F) << 1), s.src_width(0)));   // sbase counts register pairs
@@ -2397,6 +2398,17 @@ std::string to_text(const Inst& i) {
     if (i.d16) t += " d16";
     return t;
   }
+  if (i.name == "s_atc_probe" || i.name == "s_atc_probe_buffer") {
+    std::string t = s + " " + std::to_string(i.simm) + ", " + operand_text(i.src[0]);
+    char o[32];
+    if (i.has_saddr) {
+      t += ", " + operand_text(operand(i.saddr, 1));
+      if (i.offset || i.smem_both_offsets) t += (std::snprintf(o, sizeof o, " offset:0x%x", i.offset), o);
+    } else {
+      t += (std::snprintf(o, sizeof o, ", 0x%x", i.offset), o);
+    }
+    return t;
+  }
   if (i.name == "s_getreg_b32") return s + " " + operand_text(i.dst[0]) + ", " + hwreg_text(static_cast<uint32_t>(i.simm));
   if (i.name == "s_setreg_b32") return s + " " + hwreg_text(static_cast<uint32_t>(i.simm)) + ", " + operand_text(i.dst[0]);
   if (i.name == "s_setreg_imm32_b32") {
@@ -2581,7 +2593,14 @@ std::string to_text(const Inst& i) {
       throw Error::make(Err::Unsupported, "s_sendmsg with message ", static_cast<uint32_t>(i.simm) & 0xFFFF,
                         " is not decoded yet");
     s += " sendmsg(MSG_INTERRUPT)";
-  } else if (i.name == "s_nop" || i.name == "s_sleep" || i.name == "s_setprio" || i.name == "s_trap") {
+  } else if (i.name == "s_set_gpr_idx_mode") {
+    static const char* kModes[4] = {"SRC0", "SRC1", "SRC2", "DST"};
+    std::string modes;
+    for (int k = 0; k < 4; ++k)
+      if ((i.simm >> k) & 1) modes += (modes.empty() ? "" : ",") + std::string(kModes[k]);
+    s += " gpr_idx(" + modes + ")";
+  } else if (i.name == "s_nop" || i.name == "s_sleep" || i.name == "s_setprio" || i.name == "s_trap" || i.name == "s_setkill" ||
+             i.name == "s_sethalt" || i.name == "s_incperflevel" || i.name == "s_decperflevel") {
     std::snprintf(b, sizeof b, " %d", i.simm);   // how many cycles to wait
     s += b;
   } else if (i.name == "s_waitcnt") {
