@@ -24,7 +24,7 @@ jobs:
   vllm:
     name: vLLM on ${{ matrix.gpu }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

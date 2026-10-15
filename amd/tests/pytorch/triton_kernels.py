@@ -164,9 +164,8 @@ def nan_kernel(a, b, c, o, n, BLOCK: tl.constexpr):
     i = tl.arange(0, BLOCK)
     m = i < n
     x, y, z = tl.load(a + i, mask=m), tl.load(b + i, mask=m), tl.load(c + i, mask=m)
-    nan = tl.PropagateNan.ALL
-    tl.store(o + i, tl.maximum(tl.maximum(x, y, propagate_nan=nan), z, propagate_nan=nan))
-    tl.store(o + n + i, tl.minimum(tl.minimum(x, y, propagate_nan=nan), z, propagate_nan=nan))
+    tl.store(o + i, tl.maximum(tl.maximum(x, y, propagate_nan=tl.PropagateNan.ALL), z, propagate_nan=tl.PropagateNan.ALL))
+    tl.store(o + n + i, tl.minimum(tl.minimum(x, y, propagate_nan=tl.PropagateNan.ALL), z, propagate_nan=tl.PropagateNan.ALL))
 
 
 def nan_propagation(dtype):
