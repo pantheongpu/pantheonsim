@@ -10,6 +10,9 @@ also puts it at `build/bin/vgpu`, next to drop-in `nvidia-smi`, `rocm-smi` and
 and `smi` take `--help` for their own options; `shell` and `serve` do not, so
 their options are listed below.
 
+Settings you use every time can live in a file (`pantheonsim.yaml`, written by
+`vgpu config init`) instead of flags and variables: see [config.md](config.md).
+
 ## Commands
 
 | Command | What it does |
@@ -204,7 +207,8 @@ GPU's registers behind BAR5. More in [registers.md](registers.md).
 
 ## Environment variables
 
-The `vgpu run` options set most of these for you; set them directly when you run
+Many of these can also be set from the [settings file](config.md), which sets
+the variable for you unless it is already set. The `vgpu run` options set most of these for you; set them directly when you run
 a program without `vgpu run`, such as a driver-API program or a script. Each
 variable is unset by default.
 
