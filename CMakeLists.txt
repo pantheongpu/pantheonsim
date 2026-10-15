@@ -3029,6 +3029,11 @@ set_tests_properties(lint_cudnn_header_fetch PROPERTIES TIMEOUT 300)
 add_test(NAME lint_ci_jobs COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_ci_jobs.sh)
 set_tests_properties(lint_ci_jobs PROPERTIES TIMEOUT 120)
 
+# ci/external/hip-tests.sh's per-case limits against a fake Catch2 suite: a case of a slow suite
+# (HT_SLOW_SUITES) that does not finish is SLOW, not a failure; other suites still fail on a timeout.
+add_test(NAME lint_hip_tests_runner COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_hip_tests_runner.sh)
+set_tests_properties(lint_hip_tests_runner PROPERTIES TIMEOUT 120)
+
 # Copies and fills with a shape in graphs, and the async copies a capture has to
 # record rather than run; two simulated devices, for the peer copy.
 if(TARGET vgpucudart)
