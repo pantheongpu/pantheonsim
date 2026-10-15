@@ -302,9 +302,9 @@ __global__ void divisions(const int* a, const int* b, u32* out, int n) {
 
 // A warp whose lanes diverge into two groups that both loop. The group at the lowest address runs until it has branched backwards 64
 // times while the other waits, then gives way (the scheduler's spin rule), and so on in turn; the lanes of the second group store a
-// flag when they have done 200 iterations, and the first group reads it at iteration K. The least K at which it reads it set says how the
+// flag when they have done M iterations, and the first group reads it at iteration K. The least K at which it reads it set says how the
 // groups alternated, whichever of them is laid out first.
-__global__ void giveway(u32* flag, u32* out, u32 K) {
+__global__ void giveway(u32* flag, u32* out, u32 K, u32 M) {
   volatile u32* vf = flag;
   const unsigned lane = threadIdx.x & 31;
   if (lane < 16) {
@@ -317,7 +317,7 @@ __global__ void giveway(u32* flag, u32* out, u32 K) {
     out[32 + lane] = acc;
   } else {
     u32 acc = lane;
-    for (u32 i = 0; i < 200; ++i) acc = (acc ^ (acc << 5)) + 3;
+    for (u32 i = 0; i < M; ++i) acc = (acc ^ (acc << 5)) + 3;   // (a trip count the compiler does not know: it cannot unroll it away)
     out[32 + lane] = acc;
     if (lane == 16) *vf = 1;
   }
@@ -534,7 +534,7 @@ static int run_turn(const char* name, int threads) {
     *ok = true;
     return v == 1 ? 1 : 0;
   };
-  u32 lo = 0, hi = 60000;   // lo reads 0, hi reads 1
+  u32 lo = 0, hi = 600000;   // lo reads 0, hi reads 1
   bool ok = true;
   if (reads_one(hi, &ok) != 1 || !ok) { std::printf("%-26s no turn change within %u iterations\n", name, hi); return 0; }
   while (hi - lo > 1) {
@@ -679,13 +679,13 @@ int main(int argc, char** argv) {
     const auto reads_one = [&](u32 K) {
       CK(cudaMemset(flag, 0, 64));
       CK(cudaMemset(out, 0, 64 * 4));
-      giveway<<<1, 32>>>(flag, out, K);
+      giveway<<<1, 32>>>(flag, out, K, 5000);
       if (cudaDeviceSynchronize()) return 0;
       u32 v = 0;
       CK(cudaMemcpy(&v, out, 4, cudaMemcpyDeviceToHost));
       return v == 1 ? 1 : 0;
     };
-    u32 lo = 0, hi = 30000;
+    u32 lo = 0, hi = 200000;
     if (!reads_one(hi)) {
       std::printf("giveway: no turn change within %u iterations\n", hi);
     } else {
