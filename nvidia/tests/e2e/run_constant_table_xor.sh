@@ -38,7 +38,7 @@ if (( status )); then
   # the first lane's results), for finding where its answer goes wrong.
   for k in q_row_nostride; do
     echo "== SASS trace of $k, warp 0"
-    VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 VGPU_SASS_TRACE=0 VGPU_SASS_TRACE_KERNEL=$k LD_LIBRARY_PATH="$shim" "$out" 2>&1 \
+    VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 VGPU_SASS_TRACE=0 VGPU_SASS_TRACE_RAW=1 VGPU_SASS_TRACE_KERNEL=$k LD_LIBRARY_PATH="$shim" "$out" 2>&1 \
       | grep -v -E '^(ok  |FAIL|PASS|       \[)' | head -400
   done
 fi
