@@ -183,6 +183,30 @@ bool write(const Layout& t, void* dev, const std::vector<double>& v);
 // rounded to the output's type by write().
 bool blend_write(const Layout& t, void* dev, const std::vector<double>& r, double alpha, double beta);
 
+// out = alpha * r + beta * out, element by element, where r = f(inputs) is formed in blocks that stay in cache instead of whole
+// tensors of doubles: the inputs are copied out of device memory (one copy each), decoded block by block into doubles, f(v, n)
+// turns the n elements of v[0] (and v[1] ... the other inputs') into the result in v[0], which is blended with the old output
+// (read only if beta is not 0, as blend_write does) and encoded; the output goes back in one copy. The same arithmetic as
+// read(), f over the whole tensor and blend_write(), so the same bits: only when every tensor is packed in row-major order and
+// has as many elements as the output's (Declined otherwise: the caller then does it the long way). Blocks go to the host's threads,
+// so f must be a function of its elements alone.
+enum class MapResult { Declined, Failed, Done };
+MapResult map_packed_impl(const Layout* const* in, const void* const* indev, int nin, const Layout& out, void* outdev, double alpha,
+                          double beta, void (*f)(void*, double* const*, size_t, size_t), void* ctx);
+// f(v, n) -- or f(v, n, b), told that the block starts at element b -- may be given no inputs at all (nin = 0): v[0] is then a block to
+// fill.
+template <class F>
+MapResult map_packed(const Layout* const* in, const void* const* indev, int nin, const Layout& out, void* outdev, double alpha,
+                     double beta, F&& f) {
+  using Fn = std::remove_reference_t<F>;
+  return map_packed_impl(in, indev, nin, out, outdev, alpha, beta,
+                         [](void* c, double* const* v, size_t n, size_t b) {
+                           if constexpr (std::is_invocable_v<Fn&, double* const*, size_t, size_t>) (*static_cast<Fn*>(c))(v, n, b);
+                           else (*static_cast<Fn*>(c))(v, n);
+                         },
+                         const_cast<Fn*>(&f));
+}
+
 /* ---- convolution ---- */
 
 // Up to three spatial dimensions, right-aligned into three (fewer are padded

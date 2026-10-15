@@ -17,6 +17,9 @@
 #include <limits>
 #include <type_traits>
 #include <utility>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <vector>
 
 #include "host_parallel.hpp"
@@ -289,6 +292,105 @@ inline void warp_perspective_back(const Image<T>& src, const Rect& sroi, Image<T
   });
 }
 
+
+/* ---- grey-scale morphology ----
+
+   Dilate (a maximum) and Erode (a minimum) over the mask positions that count, for each channel of each output: the output
+   is `init` where no position counts. `src` is the source with its halo, `sw` elements to a row, the output pixel (x, y) reading
+   the element (y + j) * sw + x * ch + i of each tap (j, i * ch). The taps are taken in the order given, and each is applied to a
+   whole row of outputs at a time (which a vector unit does without further ado): per element the sequence of updates is the
+   one a loop over the taps for that output makes, so even the sign of a zero that max and min leave to the order (-0 and +0
+   are neither less than the other) comes out the same. A NaN never replaces a value (acc < v and v < acc are false).
+   std::max(acc, v) is acc < v ? v : acc and std::min(acc, v) is v < acc ? v : acc. */
+// out[k] = the extreme of out[k] and in[k] for k < n, with a NaN in leaving out[k] alone and equal values (the two zeros) leaving out[k] as
+// it is: the scalar form is  MAX ? (acc < v ? v : acc) : (v < acc ? v : acc),  and a vector max or min of (v, acc) in that operand order
+// is the same thing.
+template <class T, bool MAX>
+inline void extreme_row(T* out, const T* in, size_t n) {
+  size_t k = 0;
+#if defined(__SSE2__)
+  if constexpr (std::is_same_v<T, uint8_t>) {
+    for (; k + 16 <= n; k += 16) {
+      const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + k));
+      const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(out + k));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(out + k), MAX ? _mm_max_epu8(v, a) : _mm_min_epu8(v, a));
+    }
+  } else if constexpr (std::is_same_v<T, float>) {
+    for (; k + 4 <= n; k += 4) {
+      const __m128 v = _mm_loadu_ps(in + k);
+      const __m128 a = _mm_loadu_ps(out + k);
+      _mm_storeu_ps(out + k, MAX ? _mm_max_ps(v, a) : _mm_min_ps(v, a));
+    }
+  }
+#endif
+  for (; k < n; ++k) {
+    const T v = in[k], acc = out[k];
+    out[k] = MAX ? (acc < v ? v : acc) : (v < acc ? v : acc);
+  }
+}
+
+template <class T, bool MAX>
+inline void extreme_filter(const T* src, int sw, T* dst, int rw, int rh, int ch, const std::vector<std::pair<int, int>>& taps, T init) {
+  const size_t n = static_cast<size_t>(rw) * static_cast<size_t>(ch);
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(n) * static_cast<uint64_t>(rh) * (taps.size() + 1) * 2u, rh);
+  vgpu::hostpar::parallel_for(threads, rh, [&](int64_t row) {
+    const int y = static_cast<int>(row);
+    T* const out = dst + static_cast<size_t>(y) * n;
+    for (size_t k = 0; k < n; ++k) out[k] = init;
+    for (const auto& t : taps) {
+      const T* const in = src + static_cast<size_t>(y + t.first) * sw + t.second;
+      extreme_row<T, MAX>(out, in, n);
+    }
+  });
+}
+
+/* ---- box filter of 8-bit data ----
+
+   out(x, y, c) = saturate(floor(S / n)) with S the sum of the mw x mh window of channel c at (x, y) of the source with its halo
+   (`src`, `sw` pixels to a row, `ch` channels to a pixel) and n = mw * mh, the division in double as the loops of
+   npp_imgproc.cpp's neighbourhood() made it. The sum of integers is the same whatever order it is taken in, so it is formed
+   by running sums: along each row of the source, then down the columns. Returns false (nothing done) for a window so large
+   that its sum could overflow 32 bits. */
+inline bool box_filter_u8(const uint8_t* src, int sw, int ch, uint8_t* dst, int rw, int rh, int mw, int mh) {
+  if (static_cast<int64_t>(mw) * mh * 255 >= (int64_t(1) << 31)) return false;
+  const size_t n = static_cast<size_t>(rw) * static_cast<size_t>(ch);
+  const int srows = rh + mh - 1;
+  const double area = static_cast<double>(mw) * mh;
+  std::vector<int32_t> hsum(static_cast<size_t>(srows) * n);
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(srows) * n * 3u, srows);
+  vgpu::hostpar::parallel_for(threads, srows, [&](int64_t r) {
+    const uint8_t* in = src + static_cast<size_t>(r) * sw * ch;
+    int32_t* out = hsum.data() + static_cast<size_t>(r) * n;
+    for (int c = 0; c < ch; ++c) {
+      int32_t run = 0;
+      for (int i = 0; i < mw; ++i) run += in[static_cast<size_t>(i) * ch + c];
+      out[c] = run;
+      for (int x = 1; x < rw; ++x) {
+        run += in[static_cast<size_t>(x + mw - 1) * ch + c] - in[static_cast<size_t>(x - 1) * ch + c];
+        out[static_cast<size_t>(x) * ch + c] = run;
+      }
+    }
+  });
+  // Down the columns: the window of rows y .. y + mh - 1, by a running sum kept per output element.
+  std::vector<int32_t> col(n, 0);
+  for (int j = 0; j < mh; ++j) {
+    const int32_t* h = hsum.data() + static_cast<size_t>(j) * n;
+    for (size_t k = 0; k < n; ++k) col[k] += h[k];
+  }
+  for (int y = 0; y < rh; ++y) {
+    if (y > 0) {
+      const int32_t* add = hsum.data() + static_cast<size_t>(y + mh - 1) * n;
+      const int32_t* sub = hsum.data() + static_cast<size_t>(y - 1) * n;
+      for (size_t k = 0; k < n; ++k) col[k] += add[k] - sub[k];
+    }
+    uint8_t* out = dst + static_cast<size_t>(y) * n;
+    for (size_t k = 0; k < n; ++k) {
+      const double v = std::floor(static_cast<double>(col[k]) / area);
+      out[k] = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+    }
+  }
+  return true;
+}
 
 /* ---- watershed segmentation ----
 

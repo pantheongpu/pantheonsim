@@ -732,11 +732,48 @@ overflows to one, the std::complex<double> multiply's repair of a NaN product co
 runs its old loops (`blas_host_sums.cu` checks this with operands that hold infinities, NaNs and values that overflow). The NaN sign and
 payload when two NaNs meet is the one thing not fixed, as before.
 
-What stayed as it was, measured on this machine and not worth the change: the Jacobi eigen- and singular value solvers of cuSOLVER (`syevd`,
-`gesvd`, `gesvdj`, 42-46 ms at n = 200; each rotation depends on the last in the two-sided method, so neither the rotations nor the order of
-their updates can change; for the complex ones only the plane rotation was rewritten, see the table), the level-2 routines of cuBLAS apart from `gemv` (their time is the transfer and conversion of the matrix), cuDNN's
-tensor transfers (a copy out of device memory, a conversion to double and back make up 50% of a depthwise convolution), the H.264 and MPEG-2
-decoders (entropy decoding is 24% of the first and cannot be split), NPP's resize, warp, threshold and morphology, and nvJPEG's encoder.
+What stayed as it was in round 8, and what round 9 did with each, is below.
+
+### What round 9 added, and what it measured
+
+The same rule again (every element of every result the one the plain loops gave; the loops kept as the generic path and as the reference
+of a test), applied to what round 8 left. Each row is one call, one host thread (`VGPU_THREADS=1`), the CPU time of the call (the machine
+ran other jobs, load 13 to 20 on 20 CPUs, so wall-clock times moved by 30% from run to run; CPU time of the process moved by about 10%),
+the least of 3 to 5 alternating runs against a fresh build of round 8's head (13.0, Release, no LTO), and the digest of every output
+equal in every row. The sizes are the ones the rounds before used.
+
+| call | before | after | how |
+| --- | --- | --- | --- |
+| cuSOLVER `syevd`, `syevj`, n = 200 (double; float the same) | 53-63 ms | 29-31 ms | `host_jacobi.hpp`: the four rotations of a row (p, q), (p, q+1) ... together. The 5 x 5 block they all depend on is rotated in scalars, in order; every other element goes through the four rotations alone, so it goes through them in registers: a column of A or V along the vector lanes, the running row p kept contiguous and the four rows q .. q+3 transposed in 4 x 4 tiles. Per element the same products and sums in the same order (no fusion) |
+| cuSOLVER `gesvd`, `gesvdj`, n = 200; 300 x 200 | 51-52 ms; 64 ms | 27 ms; 36 ms | the pairs (p, q) with the same p + q share no column and every pair before one of them in the plain order has a smaller p + q, so they go together: four pairs' three sums to the four lanes of a vector (each lane a chain in row order), the rotations on vectors. The residual's sum is formed in the plain order afterwards |
+| the same, eigenvalues or singular values only (`CUSOLVER_EIG_MODE_NOVECTOR`, `gesvd` with `N`, `N`) | 47-53 ms | 20-22 ms | the vectors are not accumulated (the rotations of A do not depend on them), and the orthonormal bases that would have held them are not completed |
+| cuBLAS `Dger` / `Sger`, 2048 x 2048 | 114 / 90 ms | 27 / 8.3 ms | `host_blas2.hpp`: the matrix is updated where it was fetched (the complex path's helpers no longer make three copies of it, a zero-filled one among them) with the loops' complex arithmetic written on the parts, `alpha * x_i` formed once; only when the scalars and vectors are finite and every element made is (else the old loops run, which is where a complex product could have been repaired by the C99 rule) |
+| `Dsyr`, `Dsyr2`, `Cgeru`, `Zgerc`, `Cher`, `Zher2` | 107, 105, 116, 213, 118, 161 ms | 26, 20, 17.5, 52, 17, 56 ms | the same |
+| NPP `WarpAffine`, `WarpAffineBack`, `WarpPerspective`, `Rotate`, 1280 x 720 x 3 bytes: nearest / linear / cubic | 14-15 / 19-21 / 49-57 ms | 3.2-3.3 / 3.6-3.7 / 5.6-6.4 ms | `npp_simd.hpp`: eight destination pixels at a time, each lane the scalar code's float operations (the fused multiply-adds where `std::fma` is, one rounding) for the source point, the taps (gathers) and the weights; the same for 16-bit and float images and one, three and four channels |
+| NPP `ResizeSqrPixel` down / up by 1.5, 8-bit x 3: nearest / linear / cubic | 4.8 / 6.7 / 18 and 41 / 55 / 161 ms | 1.4 / 1.8 / 2.7 and 10 / 13.6 / 21 ms | the same samplers, the point of a column formed by one fused multiply-add |
+| NPP `Resize_8u` (the legacy entry point), down / up: nearest / linear | 3.1 / 9.2 and 26 / 76 ms | 0.6 / 1.4 and 3.3 / 11 ms | per-column tables and the bilinear row eight pixels at a time (the same float products, summed left to right) |
+| NPP `Threshold_8u_C1R`; `Dilate` with a 3 x 3 mask, `Erode` with a 5 x 5 mask; `FilterMax` 5 x 5, `FilterMin` (4 channels) 3 x 3 | 3.7; 6.5, 15; 11.6, 20.7 ms | 0.36; 0.8, 1.1; 1.1, 2.5 ms | the extreme over a row of outputs per mask position (a maximum or minimum of the same sequence of values per output, so the sign of a zero comes out the same), SSE max/min; thresholding on bytes with the operator chosen once |
+| NPP `FilterBox_8u_C4R` 5 x 5; `HistogramEven_8u_C1R`; `GammaFwd`/`GammaInv_8u_C3R` | 54; 29; 18-20 ms | 13; 0.5; 2.0-2.5 ms | running sums of the integers; the bin of each of the 256 (65536) values found once; the transfer function's 256 values tabulated |
+| nvJPEG encoder, 1280 x 720 RGB, 4:2:0 / 4:4:4 / 4:2:0 optimised tables / 4:2:0 quality 50 | 22 / 35 / 28 / 17 ms | 16 / 21 / 17.6 / 8.2 ms | four divisions at a time and the rounding of a quantised block, whole blocks read without clamping, the nonzero coefficients taken from a bitmask, a Huffman code and its value written together (four bytes at a time unless one needs stuffing), the colour conversion eight pixels at a time; the bitstream is the same byte for byte |
+| MPEG-2 decoder, the 100 sample streams (2.7 Mpixel) | 52 ms | 19-21 ms | the inverse DCT in AVX2 (four outputs of a row to a vector, each lane the scalar chain), half-sample prediction eight samples at a time, the bit reader loading four bytes at once; the frames of every stream are pinned to what the plain loops gave (`decoded.digests`) |
+| cuDNN `ActivationForward` relu / sigmoid (beta 0.5) / tanh; `ActivationBackward` relu / tanh / sigmoid (beta 0.5), 1.6M floats | 13 / 15 / 23 ms; 8.8 / 9.2 / 14.7 ms | 1.9 / 7.5 / 18.6 ms; 3.6 / 3.9 / 4.9 ms | the tensor is decoded, activated, blended and encoded a block at a time in cache (one copy out of device memory and one back, as before), instead of as whole tensors of doubles |
+| cuDNN `AddTensor`, 1.6M floats: same shape / bias `[1,C,1,1]` added (beta 1) / bias with beta 0 | 20.7 / 16.1 / 9.9 ms | 8.8 / 5.6 / 3.2 ms | the broadcast of A is made a block at a time inside the same block loop (an odometer over C's dimensions started at the block's first element), not as a whole-tensor index vector and a whole-tensor copy |
+
+`tests/unit/test_host_jacobi.cpp`, `test_npp_simd.cpp` (also the morphology and box filter), `test_host_blas2.cpp`, `test_host_jpeg.cpp`,
+`test_video_simd.cpp` and `test_mpeg2_decode.cpp` keep the plain loops (or their digests) as the reference and compare every element over
+many sizes and over values that break arithmetic; `nvidia/tests/e2e/solver_jacobi_paths.cu` pins the Jacobi solvers to the digests the loops gave,
+and `npp_host_ops.cu` covers thresholding, comparison, Dilate/Erode and `Resize_8u`. The conformance programs `npp_imgproc`, `npp_ops`, `npp_segment`, `cudnn_ops`, `cudnn_backward` and
+`cudnn_types` print the same lines as before the changes (and match the card's goldens where there are some).
+
+What stayed as it was, measured on this machine: the Jacobi solvers do not use more than one thread (a level of 100 pairs takes about 10 microseconds at n = 200,
+less than starting a thread costs; the pairs of a level are independent, so a pool kept for the call could use them); the complex Jacobi routines (`heev`, complex `gesvd`) keep their
+round-8 form; cuBLAS level-2 routines other than the rank updates and `gemv` (`symv`, `hemv`, `trmv`, `trsv`, `tbmv`, `gbmv`, packed forms; 40-130 ms at n = 2048)
+still convert the matrix to `std::complex<double>`; cuDNN's other tensor operations (op tensor, softmax, pooling, batch normalization) still
+use whole tensors of doubles (the blocks of the activation could serve them where the shapes allow), and its convolutions run at 4-8 GMAC/s on one thread (the
+filter gradient of a 3 x 3 layer, 170 ms, re-reads the input once per tap); the H.264 decoder (a flat profile: CABAC decisions 12%, deblocking 13%,
+interpolation 15%, neighbour derivation 7%, the bit reader 6%; a bit reader that loads 32 bits at a time and a CABAC renormalisation that takes its bits in one read,
+which the frames of 52 streams confirmed to the bit, ran 0 to 7% faster, within what the machine's noise allows one to claim, so they were not kept); the HEVC encoder's
+`write_residual` (12% of the encoder); NPP's Gaussian and general convolution filters on float images, Canny, `AlphaComp` and `CFAToRGB`; nvJPEG's decoder.
 
 ## Verified against real hardware
 

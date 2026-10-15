@@ -430,6 +430,93 @@ bool blend_write(const Layout& t, void* dev, const std::vector<double>& r, doubl
   return write(t, dev, out);
 }
 
+namespace {
+// Decodes elements [b, e) of a packed tensor's bytes into doubles (out[0 .. e - b)), as read() does.
+void decode_block(cudnnDataType_t type, const uint8_t* raw, size_t b, size_t e, double* out) {
+  const size_t eb = type_bytes(type);
+  switch (type) {
+    case CUDNN_DATA_FLOAT:
+      for (size_t i = b; i < e; ++i) { float f; std::memcpy(&f, raw + i * 4, 4); out[i - b] = f; }
+      break;
+    case CUDNN_DATA_DOUBLE: std::memcpy(out, raw + b * 8, (e - b) * 8); break;
+    case CUDNN_DATA_HALF:
+      for (size_t i = b; i < e; ++i) { uint16_t h; std::memcpy(&h, raw + i * 2, 2); out[i - b] = half_to_float(h); }
+      break;
+    case CUDNN_DATA_BFLOAT16:
+      for (size_t i = b; i < e; ++i) { uint16_t h; std::memcpy(&h, raw + i * 2, 2); out[i - b] = bf16_to_float(h); }
+      break;
+    default:
+      for (size_t i = b; i < e; ++i) out[i - b] = decode(type, raw + i * eb);
+      break;
+  }
+}
+// Encodes doubles v[0 .. e - b) as elements [b, e) of a packed tensor's bytes, as write_with() does.
+void encode_block(cudnnDataType_t type, const double* v, size_t b, size_t e, uint8_t* raw) {
+  const size_t eb = type_bytes(type);
+  switch (type) {
+    case CUDNN_DATA_FLOAT:
+      for (size_t i = b; i < e; ++i) { const float f = static_cast<float>(v[i - b]); std::memcpy(raw + i * 4, &f, 4); }
+      break;
+    case CUDNN_DATA_DOUBLE: std::memcpy(raw + b * 8, v, (e - b) * 8); break;
+    case CUDNN_DATA_HALF:
+      for (size_t i = b; i < e; ++i) { const uint16_t h = float_to_half(static_cast<float>(v[i - b])); std::memcpy(raw + i * 2, &h, 2); }
+      break;
+    case CUDNN_DATA_BFLOAT16:
+      for (size_t i = b; i < e; ++i) { const uint16_t h = float_to_bf16(static_cast<float>(v[i - b])); std::memcpy(raw + i * 2, &h, 2); }
+      break;
+    default:
+      for (size_t i = b; i < e; ++i) encode(type, v[i - b], raw + i * eb);
+      break;
+  }
+}
+// Byte buffers for map_packed's copies: one per slot, kept per thread and reused like Staging's.
+std::vector<uint8_t>* slot_buffer(int slot, size_t n) {
+  constexpr size_t kKeep = size_t(64) << 20;
+  static thread_local std::vector<uint8_t> kept[5];
+  static thread_local std::vector<uint8_t> big[5];
+  std::vector<uint8_t>& v = n <= kKeep ? kept[slot] : big[slot];
+  if (v.size() < n) v.resize(n);
+  return &v;
+}
+}  // namespace
+
+MapResult map_packed_impl(const Layout* const* in, const void* const* indev, int nin, const Layout& out, void* outdev, double alpha,
+                          double beta, void (*f)(void*, double* const*, size_t, size_t), void* ctx) {
+  const size_t n = out.count();
+  if (!n || nin < 0 || nin > 3 || !outdev || !packed_row_major(out)) return MapResult::Declined;
+  for (int k = 0; k < nin; ++k)
+    if (!in[k] || in[k]->count() != n || !packed_row_major(*in[k]) || !indev[k]) return MapResult::Declined;
+  // One copy out of device memory per tensor read.
+  const uint8_t* rawin[3];
+  for (int k = 0; k < nin; ++k) {
+    std::vector<uint8_t>& b = *slot_buffer(k, n * type_bytes(in[k]->type));
+    if (cudaMemcpy(b.data(), indev[k], n * type_bytes(in[k]->type), cudaMemcpyDeviceToHost) != cudaSuccess) return MapResult::Failed;
+    rawin[k] = b.data();
+  }
+  const size_t oeb = type_bytes(out.type);
+  std::vector<uint8_t>& ob = *slot_buffer(4, n * oeb);
+  if (beta != 0.0 && cudaMemcpy(ob.data(), outdev, n * oeb, cudaMemcpyDeviceToHost) != cudaSuccess) return MapResult::Failed;
+  uint8_t* rawout = ob.data();
+  constexpr size_t kBlock = 4096;
+  const int64_t blocks = static_cast<int64_t>((n + kBlock - 1) / kBlock);
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(n) * static_cast<uint64_t>(nin + 2) * 6, blocks, 1u << 20);
+  vgpu::hostpar::parallel_for(threads, blocks, [&](int64_t bi) {
+    const size_t b = static_cast<size_t>(bi) * kBlock, e = std::min(n, b + kBlock), m = e - b;
+    double buf[3][kBlock], old[kBlock];
+    double* v[3] = {buf[0], buf[1], buf[2]};
+    for (int k = 0; k < nin; ++k) decode_block(in[k]->type, rawin[k], b, e, v[k]);
+    f(ctx, v, m, b);
+    if (beta == 0.0) {
+      for (size_t i = 0; i < m; ++i) v[0][i] = alpha * v[0][i];
+    } else {
+      decode_block(out.type, rawout, b, e, old);   // (the old output, still in rawout)
+      for (size_t i = 0; i < m; ++i) v[0][i] = alpha * v[0][i] + beta * old[i];
+    }
+    encode_block(out.type, v[0], b, e, rawout);
+  });
+  return cudaMemcpy(outdev, rawout, n * oeb, cudaMemcpyHostToDevice) == cudaSuccess ? MapResult::Done : MapResult::Failed;
+}
+
 /* ---- convolution ---- */
 
 bool conv_geometry(const Layout& x, const Layout& w, const Layout& y, int nsp, const int64_t* pad,

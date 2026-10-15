@@ -1,5 +1,10 @@
 // See mpeg2_decode.hpp. Clause numbers refer to Rec. ITU-T H.262 (02/2000).
 #include "mpeg2_decode.hpp"
+#include "video_simd.hpp"
+
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -86,8 +91,13 @@ class Bits {
   // The next n (<= 24) bits, zeros beyond the end.
   uint32_t peek(int n) const {
     uint32_t v = 0;
-    size_t byte = pos_ >> 3;
-    for (int i = 0; i < 4; ++i) v = (v << 8) | (byte + static_cast<size_t>(i) < n_ ? d_[byte + static_cast<size_t>(i)] : 0u);
+    const size_t byte = pos_ >> 3;
+    if (byte + 4 <= n_) {   // (the four bytes are all there: one load)
+      std::memcpy(&v, d_ + byte, 4);
+      v = __builtin_bswap32(v);
+    } else {
+      for (int i = 0; i < 4; ++i) v = (v << 8) | (byte + static_cast<size_t>(i) < n_ ? d_[byte + static_cast<size_t>(i)] : 0u);
+    }
     return (v << (pos_ & 7)) >> (32 - n);
   }
   uint32_t get(int n) {
@@ -177,9 +187,44 @@ void predict_block(const View& r, int x, int y, int bw, int bh, int mx, int my, 
     }
     return r.p[static_cast<ptrdiff_t>(yy) * r.stride + xx];
   };
+  // A block inside the reference is read straight, eight samples at a time where it can be: the same integers as the loop below
+  // ((a + b + 1) >> 1 is the unsigned byte average, (a + b + c + d + 2) >> 2 a sum in 16 bits).
+  int i0 = 0;
+#if defined(__SSE2__)
+  if (inside && bw >= 8) {
+    const __m128i zero = _mm_setzero_si128(), two = _mm_set1_epi16(2);
+    for (int j = 0; j < bh; ++j) {
+      uint8_t* o = out + static_cast<ptrdiff_t>(j) * ostride;
+      const uint8_t* p0 = r.p + static_cast<ptrdiff_t>(iy + j) * r.stride + ix;
+      const uint8_t* p1 = p0 + r.stride;
+      for (int i = 0; i + 8 <= bw; i += 8) {
+        __m128i v;
+        const __m128i a = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p0 + i));
+        if (!hx && !hy) {
+          v = a;
+        } else if (hx && !hy) {
+          v = _mm_avg_epu8(a, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p0 + i + 1)));
+        } else if (!hx && hy) {
+          v = _mm_avg_epu8(a, _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p1 + i)));
+        } else {
+          const __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p0 + i + 1));
+          const __m128i c = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p1 + i));
+          const __m128i d = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p1 + i + 1));
+          __m128i sum = _mm_add_epi16(_mm_add_epi16(_mm_unpacklo_epi8(a, zero), _mm_unpacklo_epi8(b, zero)),
+                                      _mm_add_epi16(_mm_unpacklo_epi8(c, zero), _mm_unpacklo_epi8(d, zero)));
+          sum = _mm_srli_epi16(_mm_add_epi16(sum, two), 2);
+          v = _mm_packus_epi16(sum, sum);
+        }
+        if (average) v = _mm_avg_epu8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(o + i)), v);
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(o + i), v);
+      }
+    }
+    i0 = bw & ~7;
+  }
+#endif
   for (int j = 0; j < bh; ++j) {
     uint8_t* o = out + static_cast<ptrdiff_t>(j) * ostride;
-    for (int i = 0; i < bw; ++i) {
+    for (int i = i0; i < bw; ++i) {
       int v;
       const int a = at(ix + i, iy + j);
       if (!hx && !hy) v = a;

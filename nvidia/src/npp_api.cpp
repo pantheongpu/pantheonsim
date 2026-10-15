@@ -36,6 +36,7 @@
 
 #include "capture_defer.hpp"
 #include "host_parallel.hpp"
+#include "npp_simd.hpp"
 
 // Every read and write of device memory below is the commit point of a call made on a capturing stream
 // (capture_defer.hpp).
@@ -84,6 +85,18 @@ vgpu_capture::Registry g_reg;
 template <class T>
 std::vector<T> fetch_roi(const void* dev, int step, int elems_per_row, int rows) {
   std::vector<T> host(static_cast<size_t>(elems_per_row) * rows);
+  const auto* base = static_cast<const unsigned char*>(dev);
+  for (int r = 0; r < rows; ++r)
+    cudaMemcpy(host.data() + static_cast<size_t>(r) * elems_per_row,
+               base + static_cast<size_t>(r) * step, elems_per_row * sizeof(T),
+               cudaMemcpyDeviceToHost);
+  return host;
+}
+
+// fetch_roi() with kPad readable elements after the last (npp_simd.hpp's gathers read a little past a pixel).
+template <class T>
+std::vector<T> fetch_roi_padded(const void* dev, int step, int elems_per_row, int rows) {
+  std::vector<T> host(static_cast<size_t>(elems_per_row) * rows + vgpu_npp::simd::kPad);
   const auto* base = static_cast<const unsigned char*>(dev);
   for (int r = 0; r < rows; ++r)
     cudaMemcpy(host.data() + static_cast<size_t>(r) * elems_per_row,
@@ -616,14 +629,42 @@ VGPU_NPP_CTX(NppStatus, nppiRGBToGray_8u_C3C1R,
 
 VGPU_EXPORT NppStatus nppiThreshold_8u_C1R(const Npp8u* s, int ss, Npp8u* d, int ds,
                                            NppiSize roi, const Npp8u threshold, NppCmpOp op) {
-  const double t = threshold;
-  return unop_8u(s, ss, d, ds, roi, 1, 0,
-                 [t, op](double v, int) { return cmp(v, t, op) ? t : v; });
+  if (!s || !d) return NPP_NULL_POINTER_ERROR;
+  if (bad_roi(roi)) return NPP_SIZE_ERROR;
+  // A pixel that compares as asked becomes the threshold, any other stays: on bytes, with the comparison chosen once.
+  auto hs = fetch_roi<Npp8u>(s, ss, roi.width, roi.height);
+  std::vector<Npp8u> hd(hs.size());
+  const Npp8u t = threshold;
+  const size_t n = hs.size();
+  switch (op) {
+    case NPP_CMP_LESS: for (size_t i = 0; i < n; ++i) hd[i] = hs[i] < t ? t : hs[i]; break;
+    case NPP_CMP_LESS_EQ: for (size_t i = 0; i < n; ++i) hd[i] = hs[i] <= t ? t : hs[i]; break;
+    case NPP_CMP_EQ: for (size_t i = 0; i < n; ++i) hd[i] = hs[i] == t ? t : hs[i]; break;
+    case NPP_CMP_GREATER_EQ: for (size_t i = 0; i < n; ++i) hd[i] = hs[i] >= t ? t : hs[i]; break;
+    case NPP_CMP_GREATER: for (size_t i = 0; i < n; ++i) hd[i] = hs[i] > t ? t : hs[i]; break;
+    default: hd = hs; break;
+  }
+  store_roi<Npp8u>(d, ds, roi.width, roi.height, hd);
+  return NPP_SUCCESS;
 }
 VGPU_EXPORT NppStatus nppiCompare_8u_C1R(const Npp8u* s1, int ss1, const Npp8u* s2, int ss2,
                                          Npp8u* d, int ds, NppiSize roi, NppCmpOp op) {
-  return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0,
-                  [op](double a, double b) { return cmp(a, b, op) ? 255.0 : 0.0; });
+  if (!s1 || !s2 || !d) return NPP_NULL_POINTER_ERROR;
+  if (bad_roi(roi)) return NPP_SIZE_ERROR;
+  auto ha = fetch_roi<Npp8u>(s1, ss1, roi.width, roi.height);
+  auto hb = fetch_roi<Npp8u>(s2, ss2, roi.width, roi.height);
+  std::vector<Npp8u> hd(ha.size());
+  const size_t n = ha.size();
+  switch (op) {
+    case NPP_CMP_LESS: for (size_t i = 0; i < n; ++i) hd[i] = ha[i] < hb[i] ? 255 : 0; break;
+    case NPP_CMP_LESS_EQ: for (size_t i = 0; i < n; ++i) hd[i] = ha[i] <= hb[i] ? 255 : 0; break;
+    case NPP_CMP_EQ: for (size_t i = 0; i < n; ++i) hd[i] = ha[i] == hb[i] ? 255 : 0; break;
+    case NPP_CMP_GREATER_EQ: for (size_t i = 0; i < n; ++i) hd[i] = ha[i] >= hb[i] ? 255 : 0; break;
+    case NPP_CMP_GREATER: for (size_t i = 0; i < n; ++i) hd[i] = ha[i] > hb[i] ? 255 : 0; break;
+    default: break;   // (zeros)
+  }
+  store_roi<Npp8u>(d, ds, roi.width, roi.height, hd);
+  return NPP_SUCCESS;
 }
 VGPU_NPP_CTX(NppStatus, nppiThreshold_8u_C1R,
              (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, const Npp8u t, NppCmpOp op,
@@ -901,8 +942,16 @@ NppStatus resize_8u(const Npp8u* s, int ss, NppiSize src_size, NppiRect src_roi,
     return NPP_SIZE_ERROR;
   if (interpolation != NPPI_INTER_NN && interpolation != NPPI_INTER_LINEAR)
     return NPP_INTERPOLATION_ERROR;
-  auto src = fetch_roi<Npp8u>(s, ss, src_size.width * CH, src_size.height);
+  auto src = fetch_roi_padded<Npp8u>(s, ss, src_size.width * CH, src_size.height);
   auto dst = fetch_roi<Npp8u>(d, ds, dst_size.width * CH, dst_size.height);
+  // The vector resizer of npp_simd.hpp gives the pixels of the loops below (which do everything and are the fallback).
+  if ((CH == 1 || CH == 3) && vgpu_npp::simd::resize_legacy_u8(CH, src.data(), src_size.width * CH,
+                                                              vgpu_npp::Rect{src_roi.x, src_roi.y, src_roi.width, src_roi.height}, dst.data(),
+                                                              dst_size.width * CH, vgpu_npp::Rect{dst_roi.x, dst_roi.y, dst_roi.width, dst_roi.height},
+                                                              interpolation == NPPI_INTER_LINEAR)) {
+    store_roi<Npp8u>(d, ds, dst_size.width * CH, dst_size.height, dst);
+    return NPP_SUCCESS;
+  }
   const double fx = static_cast<double>(src_roi.width) / dst_roi.width;
   const double fy = static_cast<double>(src_roi.height) / dst_roi.height;
   auto at = [&](int y, int x, int c) -> double {
