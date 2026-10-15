@@ -186,6 +186,8 @@ formats:
   buffer_load_format_xyzw v[2:5], v0, s[8:11], 0 idxen
   buffer_load_format_xy v[6:7], v0, s[12:15], 0 idxen
   buffer_load_format_d16_xy v8, v0, s[8:11], 0 idxen
+  tbuffer_load_format_xyzw v[26:29], v0, s[12:15], 0 format:[BUF_DATA_FORMAT_8_8_8_8,BUF_NUM_FORMAT_UINT] idxen
+  tbuffer_load_format_xyzw v[30:33], v0, s[12:15], 0 format:[BUF_DATA_FORMAT_16_16,BUF_NUM_FORMAT_UINT] idxen
   v_add_u32_e32 v10, 0, v0
   v_lshlrev_b32_e32 v11, 1, v0
   v_mul_u32_u24_e32 v12, 3, v0
@@ -197,10 +199,14 @@ formats:
   s_waitcnt vmcnt(0)
   buffer_load_format_xyzw v[14:17], v0, s[16:19], 0 idxen
   buffer_load_dword v19, v0, s[20:23], 0 idxen
+  v_mov_b32_e32 v38, v0                         // the pair (l, 2 l)
+  v_lshlrev_b32_e32 v39, 1, v0
   s_waitcnt vmcnt(0)
   global_store_dwordx4 v20, v[2:5], s[4:5]
   global_store_dwordx2 v21, v[6:7], s[4:5] offset:512
   global_store_dword v1, v8, s[4:5] offset:768
+  global_store_dwordx4 v20, v[26:29], s[4:5] offset:1792
+  global_store_dwordx4 v20, v[30:33], s[4:5] offset:2304
   global_store_dwordx4 v20, v[14:17], s[4:5] offset:896
   global_store_dword v1, v19, s[4:5] offset:1408
   // The high half alone, over a register that held 0x1234.
@@ -218,6 +224,12 @@ formats:
   s_waitcnt vmcnt(0)
   global_store_dword v1, v22, s[4:5] offset:1536
   global_store_dword v1, v25, s[4:5] offset:1664
+  // The pair (l, 2 l) stored as 16_16 uint into V3, which holds one 32-bit element a lane, read back raw.
+  tbuffer_store_format_xy v[38:39], v0, s[20:23], 0 format:[BUF_DATA_FORMAT_16_16,BUF_NUM_FORMAT_UINT] idxen
+  s_waitcnt vmcnt(0)
+  buffer_load_dword v37, v0, s[20:23], 0 idxen
+  s_waitcnt vmcnt(0)
+  global_store_dword v1, v37, s[4:5] offset:2816
   s_endpgm
 .Lformats_end:
   .size formats, .Lformats_end-formats
@@ -234,9 +246,9 @@ formats:
   .p2align 6
   .amdhsa_kernel formats
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
-    .amdhsa_next_free_vgpr 28
+    .amdhsa_next_free_vgpr 40
     .amdhsa_next_free_sgpr 24
-    .amdhsa_accum_offset 28
+    .amdhsa_accum_offset 40
   .end_amdhsa_kernel
 
   .amdgpu_metadata
@@ -264,7 +276,7 @@ amdhsa.kernels:
     .private_segment_fixed_size: 0
     .wavefront_size: 64
     .sgpr_count: 24
-    .vgpr_count: 28
+    .vgpr_count: 40
     .max_flat_workgroup_size: 64
     .args:
       - { .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global }

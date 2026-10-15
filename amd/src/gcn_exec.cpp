@@ -6208,12 +6208,21 @@ struct Machine {
   // d16, into a register's high half with d16_hi. A store leaves the
   // channels it does not give as they were; outside the buffer a load reads
   // 0 and a store is dropped.
+  // gfx9's typed buffer loads (MTBUF) select no channels through the resource: DST_SEL is the identity, "X000, XY00,
+  // XYZ0 or XYZW" by the number of components in the data format (MI200 guide, Table 31).
+  static constexpr uint32_t kIdentitySel = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+
   void formatted_access(Wave& w, const Inst& in, std::string_view body, image::Format format, uint32_t d3,
                         const Operand& data, uint32_t lane, uint64_t addr, bool inside) {
     const bool storing = body.rfind("store", 0) == 0, d16 = body.find("_d16") != std::string_view::npos;
     const bool hi = body.ends_with("_hi_x");
     const std::string_view xyzw = body.substr(body.rfind('_') + 1);
     const uint32_t count = static_cast<uint32_t>(xyzw.size());
+    // gfx9 stores a whole element or refuses: the guide says what the store of fewer components than the format has
+    // does to the others nowhere.
+    if (storing && in.arch == gcn::Target::Gfx90a && count < image::channels(format))
+      throw Error::make(Err::Unsupported, in.name, " of ", count, " components into a format of ", image::channels(format),
+                        " is decoded but not implemented: the MI200 guide does not say what becomes of the others");
     const bool ints = image::integer(format);
     const uint32_t nbytes = image::texel_bytes(format);
     const auto to_half = [&](uint32_t v) -> uint32_t {
@@ -6235,6 +6244,8 @@ struct Machine {
     if (inside) {
       at(addr).read(addr, bytes, nbytes);
       image::read_texel(format, bytes, raw);
+      if (in.enc == gcn::Enc::Mtbuf && in.arch == gcn::Target::Gfx90a)   // X000, XY00, XYZ0: no alpha of 1 for a missing one
+        for (uint32_t k = image::channels(format); k < 4; ++k) raw[k] = 0;
     }
     if (storing) {
       if (!inside) return;
@@ -6298,7 +6309,10 @@ struct Machine {
     image::Format format;
     const bool formatted = body.rfind("load_format_", 0) == 0 || body.rfind("store_format_", 0) == 0;
     if (formatted) {
-      if (in.enc == gcn::Enc::Mtbuf) {
+      if (in.enc == gcn::Enc::Mtbuf && !rdna) {   // gfx9: the instruction's DFMT and NFMT (MI200 guide, Table 86)
+        format.data = static_cast<image::Data>(in.format & 0xF);
+        format.num = static_cast<image::Num>((in.format >> 4) & 7);
+      } else if (in.enc == gcn::Enc::Mtbuf) {
         format = image::from_code(in.format, image_gen(in.arch));
       } else if (rdna) {
         const uint32_t words[4] = {w.sgpr[rsrc.index], d1, records, d3};
@@ -6336,7 +6350,8 @@ struct Machine {
         return stride ? index < records : soffset + at + bytes <= records;
       };
       if (formatted) {
-        formatted_access(w, in, body, format, d3, data, lane, addr, fits(offset, image::texel_bytes(format)));
+        formatted_access(w, in, body, format, in.enc == gcn::Enc::Mtbuf && !rdna ? kIdentitySel : d3, data, lane, addr,
+                         fits(offset, image::texel_bytes(format)));
       } else if (Half h; half_access(body, &h)) {
         if (h.store) {
           if (fits(offset, h.bytes)) store(addr, h.bytes, half_store(lane_src(w, data, lane), h));

@@ -1470,7 +1470,7 @@ VTEST(gfx90a_formatted_buffer_loads_and_stores_convert_between_the_resources_for
   VCHECK_EQ(desc[3] >> 15 & 0xF, 10u);
   VCHECK_EQ(desc[7] >> 12 & 7, 7u);
   VCHECK_EQ(desc[7] >> 15 & 0xF, 5u);
-  const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(448 * 4);
+  const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(736 * 4);
   mem.write(ddesc, desc, sizeof(desc));
   const amd::Kernel* k = amd::find_kernel(o, "formats");
   VCHECK(k != nullptr);
@@ -1485,7 +1485,7 @@ VTEST(gfx90a_formatted_buffer_loads_and_stores_convert_between_the_resources_for
   mem.write(d.kernarg, args.data(), args.size());
   d.group_size[0] = 32;
   amd::execute(d, mem);
-  std::vector<uint32_t> r(448);
+  std::vector<uint32_t> r(736);
   mem.read(out, r.data(), r.size() * 4);
   const auto f = [&](uint32_t at) {
     float v;
@@ -1506,8 +1506,16 @@ VTEST(gfx90a_formatted_buffer_loads_and_stores_convert_between_the_resources_for
     wrong[4] += r[352 + l] != bits;
     wrong[5] += r[384 + l] != (0x1234u | half(px[4 * l] / 255.0f) << 16);
     wrong[6] += r[416 + l] != (half(v) | half(v + 1.0f) << 16);
+    // A typed load takes its format from the instruction, whatever the resource says: V1's dword as four
+    // bytes, then as two halves and two zeroes (the identity DST_SEL, X, Y, and 0 for the channels the
+    // format lacks), and the pair stored as halves reads back as the dword it makes.
+    for (uint32_t c = 0; c < 4; ++c) {
+      wrong[7] += r[448 + 4 * l + c] != (halves[l] >> (8 * c) & 0xFF);
+      wrong[7] += r[576 + 4 * l + c] != (c < 2 ? halves[l] >> (16 * c) & 0xFFFF : 0u);
+    }
+    wrong[7] += r[704 + l] != (l | 2 * l << 16);
   }
-  for (int c = 0; c < 7; ++c) VCHECK_EQ(wrong[c], 0);
+  for (int c = 0; c < 8; ++c) VCHECK_EQ(wrong[c], 0);
 }
 
 VTEST(the_24_bit_multiplies_take_the_low_24_bits_signed_or_not_and_give_the_low_or_the_high_half) {

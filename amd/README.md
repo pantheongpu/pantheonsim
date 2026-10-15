@@ -637,7 +637,10 @@ builds for gfx90a, so a program that calls them gets nothing there (that is the 
 simulator's). The executor runs loads (`_mip` included), stores, atomics (on 32- and 64-bit texels, with the
 DMASK values the guide lists), `get_resinfo` and `image_sample` on gfx90a through the same code as RDNA's, with the guide's rules where they differ (a store writes the
 whole texel, the channels DMASK leaves out as zero; with d16 DMASK is only a count), and MUBUF's
-`buffer_load_format_*` and `buffer_store_format_*` (opcodes 0-15, 38 and 39) that `tex1Dfetch` compiles to.
+`buffer_load_format_*` and `buffer_store_format_*` (opcodes 0-15, 38 and 39) that `tex1Dfetch` compiles to, and
+MTBUF's `tbuffer_*_format_*`, whose data and number formats are the instruction's own and whose DST_SEL is the
+identity (a channel the format lacks reads 0). A store of fewer components than the format has is refused:
+the guide does not say what becomes of the rest.
 The T# (Table 41 of the guide, ROCR-Runtime's `resource_ai.h`) names the format as GCN does, a data
 format and a number format. Left refused, with the guide's words in the error: the `_pck` forms (the
 guide says the resource's format is ignored and 8- and 16-bit components are zero- or sign-extended,

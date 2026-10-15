@@ -88,4 +88,7 @@ expect "gemm_ex of halves, bfloat16s and bytes, through their matrix instruction
   "gemm_ex, halves, bfloat16s and bytes, every transpose: 100 of 100 right" "$(grep -o '^gemm_ex, .*' <<< "$out")"
 expect "complex GEMMs, float and double, each operand transposed, conjugated or neither" \
   "complex GEMMs, every transpose and conjugate: 90 of 90 right" "$(grep -o '^complex GEMMs.*' <<< "$out")"
+expect "double triangular solves: trsv (a stride that runs backwards too) and trsm from either side" \
+  "triangular solves, trsv and trsm in double, every fill, transpose and diagonal: 264 of 264 right" \
+  "$(grep -o '^triangular solves.*' <<< "$out")"
 exit $fail
