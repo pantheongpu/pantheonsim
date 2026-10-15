@@ -1016,11 +1016,16 @@ void i2f_k(bool sgn, uint32_t* r, const uint32_t* a) {
     __m256 v;
     if (sgn) {
       v = _mm256_cvtepi32_ps(x);
-    } else {   // (as doubles, which hold a u32 exactly: the sign bit flipped to use the signed conversion, 2^31 added back)
-      const __m256i f = _mm256_xor_si256(x, _mm256_set1_epi32(static_cast<int>(0x80000000u)));
+    } else {
+      // As doubles, which hold a u32 exactly: the low 31 bits, plus 2^31 where the top bit is set. (Both parts are never
+      // negative, so a zero stays +0 in every rounding mode -- the sum of 2^31 and -2^31, which flipping the sign bit and adding
+      // 2^31 back would make, is -0 when the host rounds down.) The narrowing to float uses the host's rounding mode.
+      const __m256i low = _mm256_and_si256(x, _mm256_set1_epi32(0x7fffffff));
+      const __m256i top = _mm256_srli_epi32(x, 31);
       const __m256d two31 = _mm256_set1_pd(2147483648.0);
-      const __m256d lo = _mm256_add_pd(_mm256_cvtepi32_pd(_mm256_castsi256_si128(f)), two31);
-      const __m256d hi = _mm256_add_pd(_mm256_cvtepi32_pd(_mm256_extracti128_si256(f, 1)), two31);
+      const auto wide = [&](__m128i l, __m128i t) { return _mm256_add_pd(_mm256_cvtepi32_pd(l), _mm256_mul_pd(_mm256_cvtepi32_pd(t), two31)); };
+      const __m256d lo = wide(_mm256_castsi256_si128(low), _mm256_castsi256_si128(top));
+      const __m256d hi = wide(_mm256_extracti128_si256(low, 1), _mm256_extracti128_si256(top, 1));
       v = _mm256_set_m128(_mm256_cvtpd_ps(hi), _mm256_cvtpd_ps(lo));
     }
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), _mm256_castps_si256(v));
@@ -1348,6 +1353,40 @@ void hfma2_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t
 #endif
   if (halves == 1)
     for (unsigned l = 0; l < n; ++l) r[l] &= 0xffffu;
+  store_masked(d, r, mask, n);
+}
+
+// The bfloat16 twin of hfma2_m_k: each half of d[l] is the fused multiply-add of the lanes' bf16 halves, rounded to bfloat16 as
+// the SASS executor's general form rounds it -- the exact result in binary64, then to binary32 (to nearest even), then to
+// bfloat16 (to nearest even) -- a NaN the canonical 0x7fff. A bf16 product has 16 significant bits, so it is exact in binary64
+// and the multiply-add is the product plus the addend rounded once, which is what a fused one gives (no FMA unit needed).
+// n a multiple of 4.
+typedef double V4d __attribute__((vector_size(32)));
+void hfma2_bf_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n) {
+  uint32_t r[64];
+  for (unsigned i = 0; i < n; i += 4) {
+    // Four words are eight halves, in memory order: word w's low half then its high half.
+    alignas(32) float f[8];
+    for (int part = 0; part < 2; ++part) {
+      const auto wide = [&](const uint32_t* p) {
+        V8h h;
+        std::memcpy(&h, p + i, sizeof h);
+        const V8u u = __builtin_convertvector(h, V8u) << 16;
+        V4u q;
+        std::memcpy(&q, reinterpret_cast<const char*>(&u) + 16 * part, sizeof q);
+        return __builtin_convertvector(reinterpret_cast<V4f>(q), V4d);
+      };
+      const V4d x = wide(a), y = wide(b), z = wide(c);
+      const V4d v = x * y + z;
+      const V4f s = __builtin_convertvector(v, V4f);
+      std::memcpy(f + 4 * part, &s, sizeof s);
+    }
+    U16A* const out = reinterpret_cast<U16A*>(r + i);
+    for (unsigned k = 0; k < 8; ++k) {
+      const uint32_t u = std::bit_cast<uint32_t>(f[k]);
+      out[k] = f[k] != f[k] ? uint16_t{0x7fff} : static_cast<uint16_t>((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+  }
   store_masked(d, r, mask, n);
 }
 

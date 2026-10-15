@@ -169,6 +169,11 @@ struct Kernels {
   //    takes a if its sign is set, MAX if not), bit l of *both_nan that both are NaN.
   void (*dcmp)(unsigned cmp, unsigned mods, const uint32_t* alo, const uint32_t* ahi, const uint32_t* blo, const uint32_t* bhi,
                uint32_t* r, uint32_t* both_nan);
+
+  //  hfma2_bf_m: hfma2_m's twin for bfloat16 pairs (n a multiple of 4, at most 64; both halves of each word): each half of d[l] is
+  //    the exact a * b + c of the lanes' bf16 halves in binary64, rounded to binary32 and then to bfloat16 (each to nearest even,
+  //    as the SASS executor's general form does), a NaN the canonical 0x7fff. Writes only the lanes of `mask`.
+  void (*hfma2_bf_m)(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the
