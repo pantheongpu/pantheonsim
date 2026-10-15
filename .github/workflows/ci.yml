@@ -623,7 +623,14 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: ctest --test-dir build-san --output-on-failure -E pantheon_workloads
+        # -j2 (fewer when under 12 GiB are free, ci/jobs.sh): 534 tests, 1840 s
+        # one at a time in run 38424481981 (2031 s in 38612576048), the
+        # longest 173 s, on a 24-core machine that otherwise idles through them;
+        # the pool has one runner (server2-1), so each minute here is also a
+        # minute the jobs queued behind this one wait. The ml job runs these
+        # tests at -j2 on every run, and the tests that take the nvcc_memory lock
+        # (CMakeLists.txt) still run one at a time.
+        run: ctest --test-dir build-san --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E pantheon_workloads
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
@@ -686,7 +693,12 @@ jobs:
         # TSan cannot map its shadow memory under this kernel's ASLR entropy, so
         # the run needs randomization off. Without this every test aborts with
         # "unexpected memory mapping" before it starts.
-        run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -E pantheon_workloads
+        #
+        # -j2 (fewer when under 12 GiB are free, ci/jobs.sh): 534 tests, 1436 s
+        # one at a time in run 38424481981 (1586 s in 38612576048), the longest
+        # 150 s, on a 24-core machine that otherwise idles through them. See the
+        # ASan job above for why it is safe.
+        run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E pantheon_workloads
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
