@@ -192,6 +192,35 @@ __global__ void reconverge(const u32* in, u32* out, int n) {
   if (i < n) out[i] = v + sh[(threadIdx.x + 17) & 255] + (u32)__popc(__activemask());
 }
 
+// ---- shuffles and votes in every mode, with constant and with data-dependent lanes and widths, under partial masks -------------
+__global__ void shuffles(const u32* in, u32* out, int n, int shape) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const u32 v = in[i], d = in[(i + 7) % n];
+  u32 o[32] = {};
+  const unsigned lane = threadIdx.x & 31;
+  const bool take = shape == 0 ? true : shape == 1 ? (lane & 3) != 1 : (lane < 21 && lane != 5);
+  if (take) {
+    // (a mask naming only the lanes that run it: the lanes that are not running give 0 to a shuffle that reads them)
+    const unsigned m = shape == 0 ? 0xffffffffu : __activemask();
+    o[0] = __shfl_sync(m, v, 3);          o[1] = __shfl_sync(m, v, 17);          o[2] = __shfl_sync(m, v, 7, 8);
+    o[3] = __shfl_up_sync(m, v, 1);       o[4] = __shfl_up_sync(m, v, 5);        o[5] = __shfl_up_sync(m, v, 2, 16);
+    o[6] = __shfl_down_sync(m, v, 1);     o[7] = __shfl_down_sync(m, v, 9);      o[8] = __shfl_down_sync(m, v, 3, 4);
+    o[9] = __shfl_xor_sync(m, v, 1);      o[10] = __shfl_xor_sync(m, v, 16);     o[11] = __shfl_xor_sync(m, v, 5, 8);
+    o[12] = __shfl_sync(m, v, d & 31);    o[13] = __shfl_up_sync(m, v, d & 15);  o[14] = __shfl_down_sync(m, v, d & 7, 16);
+    o[15] = __shfl_xor_sync(m, v, d & 31);o[16] = __shfl_sync(m, v, d, 2 << (d & 3));
+    o[17] = __shfl_down_sync(m, v, 31);   o[18] = __shfl_up_sync(m, v, 31);      o[19] = __shfl_sync(m, v, 31, 4);
+    // votes: all, any, eq, ballot, of a data-dependent predicate and of a constant one
+    const bool p = (v & 8) != 0;
+    o[20] = __all_sync(m, p);   o[21] = __any_sync(m, p);   o[22] = __ballot_sync(m, p);   o[23] = __all_sync(m, true);
+    o[24] = __any_sync(m, v > d); o[25] = __ballot_sync(m, (v ^ d) & 1); o[26] = __popc(__ballot_sync(m, v < d));
+    o[27] = __match_any_sync(m, v & 3);
+    unsigned pr = 0;
+    o[28] = __match_all_sync(m, v & 1, (int*)&pr) + pr;
+  }
+  for (int k = 0; k < 32; ++k) out[(size_t)i * 32 + k] = o[k];
+}
+
 // ---- 7. special registers and kernel arguments ------------------------------------------------------------------
 __global__ void specials(u32* out, u32 a, u32 b) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -494,6 +523,23 @@ int main(int argc, char** argv) {
       std::snprintf(nm, sizeof nm, "reconverge %d", threads);
       if (report(nm, dout, n)) return 1;
     }
+    CK(cudaFree(din)); CK(cudaFree(dout));
+  }
+  {
+    const int n = 1024;
+    std::vector<u32> h(n);
+    for (int i = 0; i < n; ++i) h[i] = (u32)(i * 2654435761u + 40503u) ^ (u32)(i << 7);
+    u32 *din, *dout;
+    CK(cudaMalloc(&din, n * 4));
+    CK(cudaMalloc(&dout, (size_t)n * 32 * 4));
+    CK(cudaMemcpy(din, h.data(), n * 4, cudaMemcpyHostToDevice));
+    for (int shape = 0; shape < 3; ++shape)
+      for (int threads : {128, 40}) {
+        shuffles<<<(n + threads - 1) / threads, threads>>>(din, dout, n, shape);
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "shuffles shape=%d threads=%d", shape, threads);
+        if (report(nm, dout, (size_t)n * 32)) return 1;
+      }
     CK(cudaFree(din)); CK(cudaFree(dout));
   }
   {
