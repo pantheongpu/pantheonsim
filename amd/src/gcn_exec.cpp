@@ -7100,6 +7100,7 @@ struct Machine {
     static const MatrixShape f16_16x16x16{16, 16, 16, 1, 'h', 'f'}, f32_16x16x4{16, 16, 4, 1, 'f', 'f'},
         f32_32x32x2{32, 32, 2, 1, 'f', 'f'}, f32_16x16x1_4b{16, 16, 1, 4, 'f', 'f'},
         f32_4x4x1_16b{4, 4, 1, 16, 'f', 'f'}, f32_32x32x1_2b{32, 32, 1, 2, 'f', 'f'}, f64_16x16x4{16, 16, 4, 1, 'd', 'd'},
+        f64_4x4x4_4b{4, 4, 4, 4, 'd', 'd'},
         bf16_16x16x16{16, 16, 16, 1, 'b', 'f'}, f16_32x32x8{32, 32, 8, 1, 'h', 'f'},
         bf16_32x32x8{32, 32, 8, 1, 'b', 'f'}, i8_32x32x16{32, 32, 16, 1, 'c', 'i'},
         f16_4x4x4_16b{4, 4, 4, 16, 'h', 'f'}, bf16_4x4x4_16b{4, 4, 4, 16, 'b', 'f'},
@@ -7132,6 +7133,7 @@ struct Machine {
     if (op == "v_mfma_f32_4x4x1_16b_f32"_op) return &f32_4x4x1_16b;
     if (op == "v_mfma_f32_32x32x1_2b_f32"_op) return &f32_32x32x1_2b;
     if (op == "v_mfma_f64_16x16x4_f64"_op) return &f64_16x16x4;
+    if (op == "v_mfma_f64_4x4x4_4b_f64"_op) return &f64_4x4x4_4b;
     if (op == "v_mfma_f32_16x16x16_bf16"_op) return &bf16_16x16x16;
     // gfx950's, with K doubled.
     static const MatrixShape f16_16x16x32{16, 16, 32, 1, 'h', 'f'}, f16_32x32x16{32, 32, 16, 1, 'h', 'f'},
@@ -7232,7 +7234,10 @@ struct Machine {
   // one row a lane group, the next four rows on: the vector width rocWMMA
   // gives a double accumulator on this architecture is 1, a float's 4.
   static void out_place(const MatrixShape& s, uint32_t lane, uint32_t r, uint32_t* block, uint32_t* row) {
-    if (s.out == 'd') {        // one 16x16 block of doubles
+    if (s.out == 'd' && s.m == 4) {   // four 4x4 blocks of doubles, one item a lane (CDNA3 guide, 7.1.4.2, H = 1, B_I = 4, M_I = 4):
+      *block = lane / 16;             // D[b,i,j] is in lane j + 4 * (i + 4 * b)
+      *row = lane / 4 % 4;
+    } else if (s.out == 'd') {        // one 16x16 block of doubles
       *block = 0;
       *row = lane / 16 + 4 * r;
     } else if (s.m == 4) {     // sixteen 4x4 blocks, one to each four lanes
@@ -7341,25 +7346,28 @@ struct Machine {
       return e == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, static_cast<int>(e) - 127);
     };
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      const uint32_t bl = lane / lanes_per_block, within = lane % lanes_per_block, g = within / s.m;
+      // CDNA3 guide, 7.1.4.1: A[b,i,k] sits in lane i + M * (b + B * (k / K_L)) and B[b,k,j] in lane j + N * (b + B * (k / K_L)), K_L the
+      // run of K a lane holds: the row (or column) fastest, then the block, then the group of K. (For one block, or where blocks
+      // fill the wave, that is the block-major order of the other forms; it differs for v_mfma_f64_4x4x4_4b_f64, which has both.)
+      const uint32_t bl = (lane / s.m) % s.blocks, within = lane % lanes_per_block, g = lane / (s.m * s.blocks);
       // With CBSZ, a block takes its A from block ABID of its group of 2^CBSZ:
       // the same place in that block's lanes.
       const uint32_t a_block = in.a_bcast_size ? (bl >> in.a_bcast_size << in.a_bcast_size) + in.a_bcast_id : bl;
-      const uint32_t a_lane = a_block < s.blocks ? a_block * lanes_per_block + within : lane;
+      const uint32_t a_lane = !in.a_bcast_size ? lane : a_block < s.blocks ? a_block * lanes_per_block + within : lane;
       const double sa = in.scaled ? scale_of(in.src[3], in.scale_sel & 3, lane) : 1.0;
       const double sb = in.scaled ? scale_of(in.src[4], in.scale_sel >> 2, lane) : 1.0;
       for (uint32_t e = 0; e < per_lane; ++e) {
         const auto flushed = [&](double v, char type) {
           return type == 'f' && flush_in && v != 0 && std::fabs(v) < 1.17549435e-38 ? std::copysign(0.0, v) : v;
         };
-        if (!sparse) A(bl, within % s.m, g * per_lane + e) = flushed(value(in.src[0], s.in, e, a_lane), s.in) * sa * sign_a;
+        if (!sparse) A(bl, lane % s.m, g * per_lane + e) = flushed(value(in.src[0], s.in, e, a_lane), s.in) * sa * sign_a;
         // gfx950's sparse forms, whose B is eight registers, split it: the
         // first four hold the lane group's run of K in the first half, the
         // last four the same run K/2 on (the CDNA4 guide's layout tables),
         // where A's run is K's in one piece -- as hipSPARSELt lays both out.
         const uint32_t half = per_lane / 2;
         const uint32_t kb = sparse && in.src[1].width == 8 ? e / half * (s.k / 2) + g * half + e % half : g * per_lane + e;
-        B(bl, kb, within % s.n) = flushed(value(in.src[1], s.in_b ? s.in_b : s.in, e, b_lane_of(lane)), s.in_b ? s.in_b : s.in) * sb * sign_b;
+        B(bl, kb, lane % s.n) = flushed(value(in.src[1], s.in_b ? s.in_b : s.in, e, b_lane_of(lane)), s.in_b ? s.in_b : s.in) * sb * sign_b;
       }
       if (sparse) {
         // A lane's A holds two values of each four along K, packed; the
@@ -7369,7 +7377,7 @@ struct Machine {
         const uint32_t sets = 32 / per_lane, set = (in.cbsz == 0 ? in.abid : 0u) % sets;
         const uint32_t idx = reg(in.src[2], 0, lane) >> (set * per_lane);
         for (uint32_t v = 0; v < per_lane / 2; ++v) {
-          const size_t at_k = size_t{bl} * s.m * s.k + (within % s.m) * s.k + g * per_lane + 4 * (v / 2) + ((idx >> (2 * v)) & 3);
+          const size_t at_k = size_t{bl} * s.m * s.k + (lane % s.m) * s.k + g * per_lane + 4 * (v / 2) + ((idx >> (2 * v)) & 3);
           a[at_k] = value(in.src[0], s.in, v, lane);
           kept[at_k] = 1;
         }

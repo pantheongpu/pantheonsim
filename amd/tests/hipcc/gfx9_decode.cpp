@@ -53,6 +53,13 @@ KERNEL(k_mad_legacy_u16, 0xA5A5A5A5u, "v_mad_legacy_u16 %0, %1, %2, %3", A3)
 KERNEL(k_mad_legacy_i16, 0xA5A5A5A5u, "v_mad_legacy_i16 %0, %1, %2, %3", A3)
 KERNEL(k_div_fixup_legacy_f16, 0xA5A5A5A5u, "v_div_fixup_legacy_f16 %0, %1, %2, %3", A3)
 
+// v_mfma_f64_4x4x4_4b_f64: four 4x4x4 products at once, in the guide's layout (7.1.4): A[b,i,k] in lane i + 4 * (b + 4 * k), B[b,k,j] in lane
+// j + 4 * (b + 4 * k), and C and D[b,i,j] in lane j + 4 * (i + 4 * b).
+__global__ void k_mfma_f64_4b(const double* a, const double* b, const double* c, double* d) {
+  const int l = threadIdx.x;
+  d[l] = __builtin_amdgcn_mfma_f64_4x4x4f64(a[l], b[l], c[l], 0, 0, 0);
+}
+
 // The relative moves: the register number in the instruction plus M0. Lane 0 only; o[0..7] hold the results.
 __global__ void k_movrel(uint32_t* o) {
   if (threadIdx.x != 0) return;
@@ -115,6 +122,39 @@ int main() {
   // v_madmk_f16 = S0 * K + S1 and v_madak_f16 = S0 * S1 + K with K = 3.0, "D0 = { 16'0, tmp.f16 }".
   cases("v_madmk_f16 (a * 3 + b; the high half zeroed)", k_madmk, {{h(1.5f), h(2.0f), 0, h(6.5f)}, {h(-2.0f), h(1.0f), 0, h(-5.0f)}, {h(0.0f), h(4.0f), 0, h(4.0f)}});
   cases("v_madak_f16 (a * b + 3; the high half zeroed)", k_madak, {{h(1.5f), h(2.0f), 0, h(6.0f)}, {h(-2.0f), h(1.0f), 0, h(1.0f)}, {h(0.5f), h(0.5f), 0, h(3.25f)}});
+
+  // The four-block double-precision matrix product, worked out on the host from the guide's layout. Every value is a small dyadic number, so any
+  // order of summation is exact.
+  {
+    double A[4][4][4], B[4][4][4], C[4][4][4];
+    std::vector<double> la(64), lb(64), lc(64), out(64, -1.0), want(64);
+    for (int bk = 0; bk < 4; ++bk)
+      for (int x = 0; x < 4; ++x)
+        for (int y = 0; y < 4; ++y) {
+          A[bk][x][y] = (bk + 1) * (x + 1) + 0.5 * y - 1.0;       // A[b][i][k]
+          B[bk][x][y] = (x + 2) - 0.25 * y + bk;                  // B[b][k][j]
+          C[bk][x][y] = 100.0 * bk + 10.0 * x + y;                // C[b][i][j]
+        }
+    for (int bk = 0; bk < 4; ++bk)
+      for (int x = 0; x < 4; ++x)
+        for (int y = 0; y < 4; ++y) {
+          la[x + 4 * (bk + 4 * y)] = A[bk][x][y];   // lane i + 4 * (b + 4 * k)
+          lb[y + 4 * (bk + 4 * x)] = B[bk][x][y];   // lane j + 4 * (b + 4 * k), x the row k and y the column j
+          lc[y + 4 * (x + 4 * bk)] = C[bk][x][y];
+          double sum = C[bk][x][y];
+          for (int k = 0; k < 4; ++k) sum += A[bk][x][k] * B[bk][k][y];
+          want[y + 4 * (x + 4 * bk)] = sum;
+        }
+    double *da, *db, *dc, *dd;
+    hipMalloc(&da, 512), hipMalloc(&db, 512), hipMalloc(&dc, 512), hipMalloc(&dd, 512);
+    hipMemcpy(da, la.data(), 512, hipMemcpyHostToDevice), hipMemcpy(db, lb.data(), 512, hipMemcpyHostToDevice), hipMemcpy(dc, lc.data(), 512, hipMemcpyHostToDevice);
+    hipLaunchKernelGGL(k_mfma_f64_4b, dim3(1), dim3(64), 0, 0, da, db, dc, dd);
+    if (hipDeviceSynchronize() != hipSuccess) { std::printf("FAIL k_mfma_f64_4b\n"); return 1; }
+    hipMemcpy(out.data(), dd, 512, hipMemcpyDeviceToHost);
+    int wrong = 0;
+    for (int l = 0; l < 64; ++l) wrong += out[l] != want[l];
+    report("v_mfma_f64_4x4x4_4b_f64 (four 4x4x4 products, the guide's layout)", wrong, 64);
+  }
 
   // Relative scalar moves.
   {

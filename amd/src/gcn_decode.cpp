@@ -1027,6 +1027,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x44}, {"v_mfma_f32_32x32x2_f32", 16, 3, 1, 1, 16}},
       {{Enc::Vop3p, 0x45}, {"v_mfma_f32_16x16x4_f32", 4, 3, 1, 1, 4}},
       {{Enc::Vop3p, 0x6e}, {"v_mfma_f64_16x16x4_f64", 8, 3, 2, 2, 8}},
+      {{Enc::Vop3p, 0x6f}, {"v_mfma_f64_4x4x4_4b_f64", 2, 3, 2, 2, 2}},   // four 4x4x4 products, a double a lane each
       // Halves, bfloat16s and bytes into floats and ints: the forms the half,
       // bfloat16 and int8 GEMMs use.
       {{Enc::Vop3p, 0x48}, {"v_mfma_f32_32x32x4_2b_f16", 32, 3, 2, 2, 32}},
