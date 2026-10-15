@@ -114,6 +114,11 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop1, 0x28}, {"s_quadmask_b32", 1, 1}},
       {{Enc::Sop1, 0x29}, {"s_quadmask_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x37}, {"s_bitreplicate_b64_b32", 2, 1}},
+      // Relative scalar moves: the source (movrels) or the destination (movreld) register number moves on by M0 (CDNA3 guide, 12.3).
+      {{Enc::Sop1, 0x2a}, {"s_movrels_b32", 1, 1}},
+      {{Enc::Sop1, 0x2b}, {"s_movrels_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x2c}, {"s_movreld_b32", 1, 1}},
+      {{Enc::Sop1, 0x2d}, {"s_movreld_b64", 2, 1, 2}},
       // The rest of the EXEC-saving family (the document's 12.3), and the two that write EXEC and the result.
       {{Enc::Sop1, 0x24}, {"s_orn2_saveexec_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x25}, {"s_nand_saveexec_b64", 2, 1, 2}},
@@ -504,6 +509,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x034}, {"v_add_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x035}, {"v_sub_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x023}, {"v_mac_f16_e32", 1, 2}},
+      // A half multiplied by a constant of the instruction's own (madmk) or added to one (madak); "this opcode cannot use the VOP3 encoding"
+      // (CDNA3 guide, V_MADMK_F16), so no long form is made for them.
+      {{Enc::Vop2, 0x024}, {"v_madmk_f16", 1, 2}},
+      {{Enc::Vop2, 0x025}, {"v_madak_f16", 1, 2}},
       {{Enc::Vop2, 0x033}, {"v_ldexp_f16_e32", 1, 2}},
       {{Enc::Vop2, 0x03c}, {"v_pk_fmac_f16_e32", 1, 2}},
       {{Enc::Vop2, 0x036}, {"v_subrev_u32_e32", 1, 2}},
@@ -596,6 +605,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x135}, {"v_sub_u32_e64", 1, 2}},
       {{Enc::Vop3, 0x13b}, {"v_fmac_f32_e64", 1, 2}},
       {{Enc::Vop3, 0x1c2}, {"v_mad_i32_i24", 1, 3}},
+      {{Enc::Vop3, 0x1f0}, {"v_cvt_pkaccum_u8_f32", 1, 2}},   // (the destination is the third source)
       {{Enc::Vop3, 0x265}, {"v_ashr_pk_i8_i32", 1, 3}},
       {{Enc::Vop3, 0x266}, {"v_ashr_pk_u8_i32", 1, 3}},
       {{Enc::Vop3, 0x2a8}, {"v_minimum3_f32", 1, 3}},
@@ -1045,6 +1055,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x2e}, {"v_mfma_f32_32x32x64_f8f6f4", 16, 3, 8, 8, 16}},
       // Two pairs of bfloat16s multiplied and added into a float (gfx950).
       {{Enc::Vop3p, 0x1a}, {"v_dot2_f32_bf16", 1, 3}},
+      // gfx950's component-wise IEEE minimum and maximum of three halves.
+      {{Enc::Vop3p, 0x1b}, {"v_pk_minimum3_f16", 1, 3}},
+      {{Enc::Vop3p, 0x1c}, {"v_pk_maximum3_f16", 1, 3}},
       {{Enc::Vop3p, 0x55}, {"v_mfma_f32_32x32x16_f16", 16, 3, 4, 4, 16}},
       {{Enc::Vop3p, 0x35}, {"v_mfma_f32_16x16x32_bf16", 4, 3, 4, 4, 4}},
       {{Enc::Vop3p, 0x37}, {"v_mfma_f32_32x32x16_bf16", 16, 3, 4, 4, 16}},
@@ -1937,14 +1950,14 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.src.push_back(take(w0 & 0x1FF, s.src_width(0)));
     // v_fmamk_f32 carries a constant of its own, which sits between the two
     // sources rather than taking one of their places.
-    if (in.name == "v_fmamk_f32" || in.name == "v_madmk_f32") {
+    if (in.name == "v_fmamk_f32" || in.name == "v_madmk_f32" || in.name == "v_madmk_f16") {
       Operand k;
       k.kind = OperandKind::Literal;
       in.src.push_back(k);
       literal = true;
     }
     in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
-    if (in.name == "v_fmaak_f32") {
+    if (in.name == "v_fmaak_f32" || in.name == "v_madak_f16") {
       Operand k;
       k.kind = OperandKind::Literal;
       in.src.push_back(k);

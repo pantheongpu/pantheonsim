@@ -898,6 +898,19 @@ struct Machine {
   // A float held to [0, 1] as the clamp bit does: a NaN and a -0 both become +0.
   static float clamp01(float v) { return std::isnan(v) || v <= 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
   static double clamp01(double v) { return std::isnan(v) || v <= 0.0 ? 0.0 : v > 1.0 ? 1.0 : v; }
+  // The float dot products flush denormal inputs and outputs whatever MODE says: "V_DOT2 instructions operating on floating point data do
+  // not support denormal and rounding modes. They flush input and output denorms" (CDNA3 and CDNA4 guides, 6.4). A flushed value keeps
+  // its sign. (Rounding: the guide only says MODE's is not supported; the sum is rounded once, to nearest even, as before.)
+  static double dot_flush_half(const Inst& in, double x) {
+    return is_guide_arch(in) && x != 0 && std::fabs(x) < 6.103515625e-05 ? std::copysign(0.0, x) : x;   // (a half's least normal is 2^-14)
+  }
+  static double dot_flush_float(const Inst& in, double x) {   // x a float's value
+    return is_guide_arch(in) && std::fpclassify(static_cast<float>(x)) == FP_SUBNORMAL ? std::copysign(0.0, x) : x;
+  }
+  static float dot_flush_out(const Inst& in, double sum) {
+    const float f = static_cast<float>(sum);
+    return is_guide_arch(in) && std::fpclassify(f) == FP_SUBNORMAL ? std::copysign(0.0f, f) : f;
+  }
   // A float result, held to [0, 1] where the instruction asked for it.
   // CDNA3 and CDNA4 (guides, 6.5): "Output modifiers are not compatible with output denormals: if output denormals are enabled, then output
   // modifiers are ignored ... Output modifiers are ignored if the IEEE mode bit is set to 1." Applied, they flush denormals and a -0 to +0.
@@ -1100,6 +1113,28 @@ struct Machine {
       write_scalar(w, in.dst[0], w.pc);
     } else if (op == "s_mov_b32"_op || op == "s_mov_b64"_op) {
       write_scalar(w, in.dst[0], a);
+    } else if (op == "s_movrels_b32"_op || op == "s_movrels_b64"_op || op == "s_movreld_b32"_op || op == "s_movreld_b64"_op) {
+      // CDNA3 guide, 12.3: "addr = SRC0.u32; // Raw value from instruction; addr += M0.u32[31:0]; D0 = SGPR[addr]" (movrels), and
+      // "addr = DST.u32; addr += M0.u32[31:0]; SGPR[addr] = S0" (movreld): the register number moves on by M0. The 64-bit forms need
+      // "the index in M0.u and the operand address ... even". The guide does not say what an address past the file does (or an operand
+      // that is not a plain SGPR, whose raw value is not a register number): refused rather than guessed.
+      const bool load = op == "s_movrels_b32"_op || op == "s_movrels_b64"_op, wide = op == "s_movrels_b64"_op || op == "s_movreld_b64"_op;
+      const Operand& reg = load ? in.src[0] : in.dst[0];
+      if (reg.kind != OperandKind::Sgpr)
+        throw Error::make(Err::Unsupported, in.name, " with an operand that is not a scalar register, whose raw value the guide makes the base");
+      const uint64_t addr = uint64_t{reg.index} + w.m0;
+      if (addr + (wide ? 2 : 1) > 102)
+        throw Error::make(Err::Unsupported, in.name, " reaching scalar register ", addr, ", past s101, which the guide does not define");
+      if (wide && ((w.m0 | reg.index) & 1))
+        throw Error::make(Err::Unsupported, in.name, " with an odd M0 or register number, which the guide says must be even");
+      const uint32_t at = static_cast<uint32_t>(addr);
+      if (load) {
+        if (wide) write_scalar(w, in.dst[0], sgpr64(w, at));
+        else write_scalar(w, in.dst[0], sgpr(w, at));
+      } else {
+        if (wide) set_sgpr64(w, at, a);
+        else set_sgpr(w, at, static_cast<uint32_t>(a));
+      }
     } else if (op == "s_movk_i32"_op) {
       write_scalar(w, in.dst[0], static_cast<uint64_t>(static_cast<int64_t>(in.simm)));
     } else if (op == "s_addk_i32"_op) {
@@ -1949,6 +1984,14 @@ struct Machine {
         // their part of the destination with these bits themselves.)
         m.narrow_dst = &in.dst[0];
         m.narrow_dst_sel = 5;
+        m.narrow_dst_preserve = true;
+      } else if (in.enc == gcn::Enc::Vop3 && !(in.op_sel & 8) && is_guide_arch(in) && in.asm_name.find("legacy") == std::string::npos &&
+                 (in.name == "v_mad_f16" || in.name == "v_mad_u16" || in.name == "v_mad_i16" || in.name == "v_fma_f16" ||
+                  in.name == "v_div_fixup_f16")) {
+        // CDNA3 and CDNA4 guides, V_MAD_F16 and the rest (opcodes 515 to 519): "If OPSEL[3] is 0 Result is written to 16 LSBs of
+        // destination VGPR and hi 16 bits are preserved." (The gfx8-style "legacy" forms zero them: "this is different from V_MAD_F16".)
+        m.narrow_dst = &in.dst[0];
+        m.narrow_dst_sel = 4;
         m.narrow_dst_preserve = true;
       }
     }
@@ -3034,6 +3077,13 @@ struct Machine {
         "v_pk_minimum3_f16", "v_pk_maximum3_f16"};
     std::string canon = name;
     if (const auto it = kAlias.find(name); it != kAlias.end()) canon = it->second;
+    // v_madmk_f16 (S0 * K + S1) and v_madak_f16 (S0 * S1 + K) are RDNA's v_fmamk_f16 and v_fmaak_f16 with the same operand order (the
+    // constant sits where the document puts SIMM16); the result is "{ 16'0, tmp.f16 }" (CDNA3 guide, V_MADMK_F16). Assumed, not stated: one
+    // rounding (a fused multiply-add), as v_mad_f16 here, since a half's product is exact in a float.
+    if (name == "v_madmk_f16" || name == "v_madak_f16") {
+      const OpName shared(name == "v_madmk_f16" ? "v_fmamk_f16" : "v_fmaak_f16");
+      return rdna_alu(w, in, shared);
+    }
     if (canon == "v_fmac_f16") {   // (RDNA's)
       const OpName shared(canon);
       return rdna_alu(w, in, shared);
@@ -3045,7 +3095,21 @@ struct Machine {
     if (canon != name) {
       Inst renamed = in;
       renamed.name = canon;
+      renamed.asm_name = in.name;   // (the "legacy" spelling: those forms zero the high half of the destination, Narrowed)
       vector_alu(w, renamed);
+      return true;
+    }
+    if (name == "v_cvt_pkaccum_u8_f32") {
+      // "byte = S1.u32[1:0]; D0.u32[byte * 8 + 7 : byte * 8] = f32_to_u8(S0.f32)": the byte S1 names, the rest of the destination kept (the
+      // opcode "uses src_c to pass destination in as a source"). The guide does not define f32_to_u8; this is v_cvt_pk_u8_f32's conversion
+      // (toward zero, held to 0..255, a NaN zero), which the guide leaves undefined in the same way.
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        if (!(w.exec >> lane & 1)) continue;
+        const float x = lane_float(w, in.src[0], lane);
+        const uint32_t at = 8 * (lane_src(w, in.src[1], lane) & 3);
+        const uint32_t byte = std::isnan(x) || x <= 0 ? 0 : x >= 255 ? 255 : static_cast<uint32_t>(x);
+        write_lane(w, in.dst[0], lane, (w.vgpr[in.dst[0].index][lane] & ~(0xFFu << at)) | byte << at);
+      }
       return true;
     }
     if (name == "v_cvt_rpi_i32_f32") {
@@ -3508,20 +3572,20 @@ struct Machine {
       // addend is negated by its neg_lo bit.
       each([&](uint32_t lane) {
         const float c = lane_float(w, in.src[2], lane);
-        double sum = (in.neg_lo >> 2) & 1 ? -double(c) : double(c);
+        double sum = dot_flush_float(in, (in.neg_lo >> 2) & 1 ? -double(c) : double(c));
         for (uint32_t h = 0; h < 2; ++h) {
           _Float16 a, b;
           const uint16_t ab = packed_bits(w, in, 0, h, lane), bb = packed_bits(w, in, 1, h, lane);
           std::memcpy(&a, &ab, 2);
           std::memcpy(&b, &bb, 2);
           const uint8_t neg = h ? in.neg_hi : in.neg_lo;
-          sum += (neg & 1 ? -double(a) : double(a)) * (neg & 2 ? -double(b) : double(b));
+          sum += dot_flush_half(in, neg & 1 ? -double(a) : double(a)) * dot_flush_half(in, neg & 2 ? -double(b) : double(b));
         }
         // Its clamp bit does not hold the result to [0, 1], as other float
         // results' does: hip-tests' amd_mixed_dot({1, 3}, {3, 3}, 2, true)
         // is 14 on a card, and the compiler takes the clamped form for the
         // unclamped one.
-        write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
+        write_lane(w, in.dst[0], lane, as_bits(dot_flush_out(in, sum)));
       });
     } else if (op == "v_swap_b32"_op) {
       each([&](uint32_t lane) {
@@ -4274,22 +4338,22 @@ struct Machine {
       // op_sel choosing halves and neg_lo/neg_hi negating, as v_dot2_f32_f16.
       const bool into_dst = op == "v_dot2c_f32_bf16_e32"_op;
       each([&](uint32_t lane) {
-        const auto bf = [](uint32_t bits16) { return static_cast<double>(as_float(bits16 << 16)); };
+        const auto bf = [&](uint32_t bits16) { return dot_flush_float(in, static_cast<double>(as_float(bits16 << 16))); };
         double sum;
         if (into_dst) {
           const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
           sum = bf(a & 0xFFFF) * bf(b & 0xFFFF) + bf(a >> 16) * bf(b >> 16) +
-                static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]));
+                dot_flush_float(in, static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane])));
         } else {
           const float c = lane_float(w, in.src[2], lane);
-          sum = (in.neg_lo >> 2) & 1 ? -double(c) : double(c);
+          sum = dot_flush_float(in, (in.neg_lo >> 2) & 1 ? -double(c) : double(c));
           for (uint32_t h = 0; h < 2; ++h) {
             const double a = bf(packed_bits(w, in, 0, h, lane)), b = bf(packed_bits(w, in, 1, h, lane));
             const uint8_t neg = h ? in.neg_hi : in.neg_lo;
             sum += (neg & 1 ? -a : a) * (neg & 2 ? -b : b);
           }
         }
-        write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
+        write_lane(w, in.dst[0], lane, as_bits(dot_flush_out(in, sum)));
       });
     } else if (op == "v_dot2c_f32_f16_e32"_op) {
       each([&](uint32_t lane) {
@@ -4298,15 +4362,15 @@ struct Machine {
         // once, which is this model's reading of a dot product -- where the
         // sum fits a float exactly, any reading gives the same answer.
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
-        const auto half = [](uint32_t v, uint32_t k) {
+        const auto half = [&](uint32_t v, uint32_t k) {
           _Float16 h;
           const uint16_t bits = static_cast<uint16_t>(v >> (16 * k));
           std::memcpy(&h, &bits, 2);
-          return static_cast<double>(h);
+          return dot_flush_half(in, static_cast<double>(h));
         };
         const double sum = half(a, 0) * half(b, 0) + half(a, 1) * half(b, 1) +
-                           static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]));
-        write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
+                           dot_flush_float(in, static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane])));
+        write_lane(w, in.dst[0], lane, as_bits(dot_flush_out(in, sum)));
       });
     } else if (op == "v_bitop3_b32"_op || op == "v_bitop3_b16"_op) {
       // Each result bit is the truth table's entry for that bit of the three
