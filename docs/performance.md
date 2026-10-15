@@ -1149,6 +1149,68 @@ TSan read the tier's shared `Program` built under `std::call_once`; no external-
 about 100 bytes per instruction, built for a whole code section when it first runs, on top of the 176-byte `Instr`; (4) the
 rest of the run-ending ops (BSYNC, EXIT, BAR, SHFL/VOTE) if `divergent`, `shared` and `warp` are to pass 2x.
 
+## The tier, round 9 (`VGPU_TIER=1`)
+
+Round 8 left the tier opt-in with about half of the instructions of the control-heavy workloads still in the interpreter. This round
+widened what has a handler, made the tier's run loop cheaper, tested every behaviour of `Runner::step_warp`'s straight-line loop
+that the tier copies, and put the tier in the CI jobs that can soak it. It is still **not** the default.
+
+**What has a handler now** (`src/sass/tier.cpp`, `tier_ops.inc`; each is the SIMD kernel or the scalar rule the interpreter's fast
+path or general code uses, with the operands resolved once):
+FFMA/FADD/FMUL with a rounding mode, `.FTZ` or `.SAT`; FMNMX; MUFU (RCP, RSQ, SQRT as kernels; SIN, COS, EX2, LG2, TANH through libm as
+`fast_float` does them); F2I (f32 to 32 bits); I2F from 8, 16 and 32 bits, also under a directed rounding mode; F2FP.PACK_AB; DSETP;
+DADD/DMUL/DFMA also under a directed rounding mode; packed half HADD2/HMUL2/HFMA2 and HADD2.F32; BREV, FLO, IABS; LDC; 16-byte
+global loads and stores; constant-bank operands of banks other than 0 (read when the instruction runs: the module's `__constant__`
+data lives in memory); a lane-constant SHFL as a table worked out once; and, as instructions that end a run, VOTE, SHFL, HMMA (the SIMD
+kernel), CS2R, BSYNC, BAR (SYNC, ARV and the reductions), YIELD, EXIT (when no lane waits at a BSYNC or a WARPSYNC and no block barrier has an
+arrival; otherwise the interpreter's), the conditional `BRA Pn` of loops, and the barriers and fences that do nothing here (DEPBAR, MEMBAR,
+ERRBAR, NANOSLEEP). The uniform datapath is computed once for the warp from the first lane that runs it, as `exec_int` does: UMOV, ULDC,
+UIADD3, UIMAD, UISETP, ULEA, ULOP3, USHF, USEL, UFLO, UPOPC (the forms with a per-lane operand or destination, UIADD3.64 and the 64-bit
+and `.EX` compares stay the interpreter's).
+Still the interpreter's: global atomics and RED, shared atomics, REDUX, MATCH, VOTEU, TEX/TLD, CALL/RET, BRX, BRA.DIV/.CONV, WARPSYNC, 32-byte
+accesses, generic LD/ST, F2F, FRND, FCHK, the double conversions, MUFU.RCP64H/RSQ64H, and Turing's global address form.
+
+**The chain.** In round 8 every run of straight instructions ended in a return to the scheduler. Between two calls of `step_warp` the work
+is: release the lanes a WARPSYNC set keeps waiting (`ws_held`), pick the group at the lowest address, honour a slice a YIELD gave and a
+give-way, find the code section. When there is no `ws_held`, slice, give-way or forced mask and every runnable lane stands at one
+address inside the section just run, that work comes to "group = the runnable lanes, pick = their address", and the next call would
+start exactly where the tier's loop already is. The loop goes on there instead of returning (`tier_run` in `tier_ops.inc`; the
+conditions are checked by the same state the scheduler reads, not derived), and tells its caller how many calls it took over
+(`Warp::extra`), never more than the turn the caller has left (`Warp::budget`): a warp's turn is 4096 calls of `step_warp`
+(`run_block`, `run_cluster`) or 256 (a cooperative launch), so the instruction count of a warp that waits for another one's store, which
+depends on that, is unchanged. `VGPU_TIER_CHAIN=0` turns the chain off. On the benchmark workloads the tier makes 5,000 to 66,000 runs of which
+{{CHAINED}} are chained.
+
+**What `step_warp`'s straight-line loop does besides executing** (the list is at the top of the tier's run loop in `tier_ops.inc`, and each item has a test):
+the store gate (`sass_tier_steps.cu`: gate_plain, gate_long, gate_generic, gate_diverged), the step count and its limit
+(`steps`: the least `VGPU_MAX_STEPS` a kernel finishes under, which must be the same, and the error text one below it), the 256-instruction
+chunk and the end of a section (gate_long, turn_long), the turn of 4096 calls (turn_plain, turn_shfl, turn_atomic, turn_vote, turn_branch,
+turn_long: the first iteration at which the loop of one warp reads the store another warp makes at its start, a measure of calls per
+iteration), YIELD loops and spin locks (spin_*, spinlock), reconvergence and barrier reductions on blocks that are not whole warps, special
+registers, the lanes a guard leaves, and faults named by instruction, lane and address after a long run of straight instructions
+(`fault gather|scatter|local|shared|atomic|trap|forever`). `VGPU_MAX_STEPS` now reaches the SASS engine (before, only the PTX engine read it).
+
+**Small costs the profiles showed** (`perf record` of the benchmark workloads, symbolised with `nm`; `perf report` could not): a 128-byte row copy
+was a call into libc's memmove (15% of the integer workload), the predicate of LOP3 a scalar loop (8% of `divergent`), the 1/2/4/8-byte
+`memcpy` of the shared and local handlers a libc call a lane, the lowest address of a diverged warp a chain of dependent compares
+(a tenth of `divergent`) and then a branch per lane, BSYNC's release a scan of the lanes' wait fields, and the shuffles' arithmetic per
+lane at every execution. All now vector or table work; the benchmarks below are from after them.
+
+{{TABLE}}
+
+**How it is held to the interpreter.** `e2e_sass_tier` (see round 8) now also runs `sass_tier_steps` (above), the tier without its chain
+(`VGPU_TIER_CHAIN=0`) on `sass_tier` and `sass_tier_steps`, and the faults; its statistics go to a file (`VGPU_TIER_STATS_FILE`), because
+printed at exit among a program's buffered output they tore a line. **`e2e_sass_archs` runs every one of its programs on every
+architecture a third time with `VGPU_TIER=1` and requires the output of the interpreter's run** (`VGPU_SASS_TIER=0` skips it): that is the
+tier's soak in the CI job that builds Hopper's and Blackwell's programs (the hosted build-and-test job runs `e2e_sass_tier`, and
+`bench_counters_tier`, as before). `test_tier` checks the new forms' analysis over the disassembler corpora.
+
+{{SOAK}}
+
+{{MEMORY}}
+
+{{MUTATIONS}}
+
 ## Using this to check a change
 
 1. Build baseline and candidate in separate build directories (same flags).
