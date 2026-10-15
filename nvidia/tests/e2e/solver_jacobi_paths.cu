@@ -65,6 +65,7 @@ static const Expect kExpected[] = {
   {"Dsyevj_n8_z0", 0x8205219cdef69336ull},
   {"Dsyevj_n24_z0", 0xb28b4e1e0437f4f4ull},
   {"Dsyevj_n33_z4", 0xe4cf5b0d5d52e9f3ull},
+  {"Dsyevj_n13_z0_novec", 0xa17bc24c22b5db80ull},
   {"Dgesvd_1x1_z0_AA", 0xec21b3bd0b7ab7cdull},
   {"Sgesvd_1x1_z0_SS", 0xb7c15f58edc4daa3ull},
   {"Dgesvd_3x3_z0_AA", 0x919408da9523ee7aull},
@@ -87,6 +88,8 @@ static const Expect kExpected[] = {
   {"Dgesvdj_24x24_e1_z3", 0x4fec293b04258b46ull},
   {"Dgesvdj_8x13_e1_z0", 0x4e83722c323afe35ull},
   {"Dgesvdj_33x33_e0_z0", 0xd17c09e0fda94d16ull},
+  {"Dgesvdj_13x8_e1_z0_novec", 0x0f7ee49df42be46bull},
+  {"Dgesvdj_8x13_e1_z0_novec", 0x0f74a4a5b79ef1a2ull},
 };
 
 static uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
@@ -236,7 +239,7 @@ template <class T> static void run_syevd(int n, int zero_every, bool upper, bool
   cudaFree(dA); cudaFree(dW); cudaFree(dWork); cudaFree(dInfo);
 }
 
-static void run_syevj(int n, int zero_every) {
+static void run_syevj(int n, int zero_every, bool vectors = true) {
   Rng r;
   r.s += static_cast<uint64_t>(n) * 31 + zero_every;
   const std::vector<double> a = sym(n, r, zero_every);
@@ -246,8 +249,8 @@ static void run_syevj(int n, int zero_every) {
   int* dInfo = upload(std::vector<int>(1));
   syevjInfo_t params;
   cusolverDnCreateSyevjInfo(&params);
-  const std::string name = "Dsyevj_n" + std::to_string(n) + "_z" + std::to_string(zero_every);
-  cusolverDnDsyevj(h, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, n, dA, n, dW, dWork, n * 64 + 64, dInfo, params);
+  const std::string name = "Dsyevj_n" + std::to_string(n) + "_z" + std::to_string(zero_every) + (vectors ? "" : "_novec");
+  cusolverDnDsyevj(h, vectors ? CUSOLVER_EIG_MODE_VECTOR : CUSOLVER_EIG_MODE_NOVECTOR, CUBLAS_FILL_MODE_LOWER, n, dA, n, dW, dWork, n * 64 + 64, dInfo, params);
   cudaDeviceSynchronize();
   int sweeps = 0;
   double residual = 0;
@@ -255,7 +258,15 @@ static void run_syevj(int n, int zero_every) {
   cusolverDnXsyevjGetResidual(h, params, &residual);
   const auto w = download(dW, n);
   const auto v = download(dA, static_cast<size_t>(n) * n);
-  eig_checks<double>(name, a, n, w, v);
+  if (vectors) eig_checks<double>(name, a, n, w, v);
+  else {
+    double sum = 0, tr = 0;
+    for (int i = 0; i < n; ++i) {
+      sum += w[i];
+      tr += a[static_cast<size_t>(i) * n + i];
+    }
+    check(std::fabs(sum - tr) <= 1e-10 * std::max(n, 1), name, std::fabs(sum - tr));
+  }
   uint64_t d = fnv(v.data(), v.size() * 8, fnv(w.data(), w.size() * 8));
   d = fnv(&residual, 8, fnv(&sweeps, 4, d));
   digest(name, d);
@@ -313,7 +324,7 @@ template <class T> static void run_gesvd(int m, int n, int zero_every, char jobu
   cudaFree(dA); cudaFree(dS); cudaFree(dU); cudaFree(dVT); cudaFree(dWork); cudaFree(dInfo);
 }
 
-static void run_gesvdj(int m, int n, int econ, int zero_every) {
+static void run_gesvdj(int m, int n, int econ, int zero_every, bool vectors = true) {
   Rng r;
   r.s += static_cast<uint64_t>(m) * 17 + static_cast<uint64_t>(n) * 5 + zero_every;
   std::vector<double> a(static_cast<size_t>(m) * n);
@@ -334,8 +345,8 @@ static void run_gesvdj(int m, int n, int econ, int zero_every) {
   int* dInfo = upload(std::vector<int>(1));
   gesvdjInfo_t params;
   cusolverDnCreateGesvdjInfo(&params);
-  const std::string name = "Dgesvdj_" + std::to_string(m) + "x" + std::to_string(n) + "_e" + std::to_string(econ) + "_z" + std::to_string(zero_every);
-  cusolverDnDgesvdj(h, CUSOLVER_EIG_MODE_VECTOR, econ, m, n, dA, m, dS, dU, m, dV, n, dWork, static_cast<int>(std::max(m, n)) * 64 + 64, dInfo, params);
+  const std::string name = "Dgesvdj_" + std::to_string(m) + "x" + std::to_string(n) + "_e" + std::to_string(econ) + "_z" + std::to_string(zero_every) + (vectors ? "" : "_novec");
+  cusolverDnDgesvdj(h, vectors ? CUSOLVER_EIG_MODE_VECTOR : CUSOLVER_EIG_MODE_NOVECTOR, econ, m, n, dA, m, dS, dU, m, dV, n, dWork, static_cast<int>(std::max(m, n)) * 64 + 64, dInfo, params);
   cudaDeviceSynchronize();
   int sweeps = 0;
   double residual = 0;
@@ -344,7 +355,12 @@ static void run_gesvdj(int m, int n, int econ, int zero_every) {
   const auto s = download(dS, k);
   const auto u = download(dU, static_cast<size_t>(m) * ucols);
   const auto v = download(dV, static_cast<size_t>(n) * vcols);
-  if (m >= n) {
+  if (!vectors) {
+    bool descending = true;
+    for (int q = 0; q < k; ++q)
+      if (s[q] < 0 || (q && !(s[q] <= s[q - 1]))) descending = false;
+    check(descending, name, 0);
+  } else if (m >= n) {
     std::vector<double> sv(s.begin(), s.end());
     svd_checks<double>(name, a, m, n, sv, u, m, v, n, false);
   } else {
@@ -379,6 +395,7 @@ int main(int argc, char** argv) {
   run_syevj(8, 0);
   run_syevj(24, 0);
   run_syevj(33, 4);
+  run_syevj(13, 0, false);
   for (const int n : {1, 3, 5, 8, 13, 24}) {
     run_gesvd<double>(n, n, 0, 'A', 'A');
     run_gesvd<float>(n, n, 0, 'S', 'S');
@@ -393,6 +410,8 @@ int main(int argc, char** argv) {
   run_gesvdj(24, 24, 1, 3);
   run_gesvdj(8, 13, 1, 0);
   run_gesvdj(33, 33, 0, 0);
+  run_gesvdj(13, 8, 1, 0, false);
+  run_gesvdj(8, 13, 1, 0, false);
   std::printf("%s\n", failures ? "FAIL" : "PASS");
   return failures ? 1 : 0;
 }

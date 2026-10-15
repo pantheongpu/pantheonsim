@@ -243,7 +243,7 @@ inline void rowchain(double* rp, double* A, int ld, int n, int q0, int K, const 
 
 // The symmetric eigenproblem: a is n x n column-major and symmetric, v is the identity; returns the sweeps made and the
 // norm of what was left off the diagonal at the start of the last one.
-inline int syev_generic(double* a, double* v, int n, double* residual) {
+inline int syev_generic(double* a, double* v, int n, double* residual, bool want_v = true) {
   auto A = [&](int r, int c) -> double& { return a[static_cast<size_t>(c) * n + r]; };
   auto V = [&](int r, int c) -> double& { return v[static_cast<size_t>(c) * n + r]; };
   int sweeps = 0;
@@ -270,11 +270,12 @@ inline int syev_generic(double* a, double* v, int n, double* residual) {
           A(p, i) = c * api - s * aqi;
           A(q, i) = s * api + c * aqi;
         }
-        for (int i = 0; i < n; ++i) {
-          const double vip = V(i, p), viq = V(i, q);
-          V(i, p) = c * vip - s * viq;
-          V(i, q) = s * vip + c * viq;
-        }
+        if (want_v)
+          for (int i = 0; i < n; ++i) {
+            const double vip = V(i, p), viq = V(i, q);
+            V(i, p) = c * vip - s * viq;
+            V(i, q) = s * vip + c * viq;
+          }
       }
   }
   return sweeps;
@@ -282,7 +283,7 @@ inline int syev_generic(double* a, double* v, int n, double* residual) {
 
 // The singular value problem of the m x n matrix a (column-major, m >= n or not): v is the n x n identity; returns the
 // sweeps made, the residual after the last.
-inline int svd_generic(double* a, double* v, int m, int n, double* residual) {
+inline int svd_generic(double* a, double* v, int m, int n, double* residual, bool want_v = true) {
   auto A = [&](int r, int c) -> double& { return a[static_cast<size_t>(c) * m + r]; };
   auto V = [&](int r, int c) -> double& { return v[static_cast<size_t>(c) * n + r]; };
   int sweeps = 0;
@@ -310,11 +311,12 @@ inline int svd_generic(double* a, double* v, int m, int n, double* residual) {
           A(i, p) = c * aip - sn * aiq;
           A(i, q) = sn * aip + c * aiq;
         }
-        for (int i = 0; i < n; ++i) {
-          const double vip = V(i, p), viq = V(i, q);
-          V(i, p) = c * vip - sn * viq;
-          V(i, q) = sn * vip + c * viq;
-        }
+        if (want_v)
+          for (int i = 0; i < n; ++i) {
+            const double vip = V(i, p), viq = V(i, q);
+            V(i, p) = c * vip - sn * viq;
+            V(i, q) = sn * vip + c * viq;
+          }
       }
     *residual = std::sqrt(2 * off);
     if (worst < 1e-14) break;
@@ -324,7 +326,7 @@ inline int svd_generic(double* a, double* v, int m, int n, double* residual) {
 
 #ifdef VGPU_HOSTGEMM_AVX2
 // One rotation of the two-sided method on the matrix as it lies in memory (the plain loops' body).
-inline void syev_rotate_one(double* a, double* v, int n, int p, int q) {
+inline void syev_rotate_one(double* a, double* v, int n, int p, int q, bool want_v) {
   auto A = [&](int r, int c) -> double& { return a[static_cast<size_t>(c) * n + r]; };
   auto V = [&](int r, int c) -> double& { return v[static_cast<size_t>(c) * n + r]; };
   if (std::fabs(A(p, q)) < 1e-300) return;
@@ -341,14 +343,15 @@ inline void syev_rotate_one(double* a, double* v, int n, int p, int q) {
     A(p, i) = c * api - s * aqi;
     A(q, i) = s * api + c * aqi;
   }
-  for (int i = 0; i < n; ++i) {
-    const double vip = V(i, p), viq = V(i, q);
-    V(i, p) = c * vip - s * viq;
-    V(i, q) = s * vip + c * viq;
-  }
+  if (want_v)
+    for (int i = 0; i < n; ++i) {
+      const double vip = V(i, p), viq = V(i, q);
+      V(i, p) = c * vip - s * viq;
+      V(i, q) = s * vip + c * viq;
+    }
 }
 
-inline int syev_avx2(double* a, double* v, int n, double* residual) {
+inline int syev_avx2(double* a, double* v, int n, double* residual, bool want_v) {
   auto A = [&](int r, int c) -> double& { return a[static_cast<size_t>(c) * n + r]; };
   auto V = [&](int r, int c) -> double& { return v[static_cast<size_t>(c) * n + r]; };
   int sweeps = 0;
@@ -398,24 +401,24 @@ inline int syev_avx2(double* a, double* v, int n, double* residual) {
           double* yv[4];
           for (int k = 0; k < K; ++k) {
             y[k] = &A(0, q + row[k]);
-            yv[k] = &V(0, q + row[k]);
+            if (want_v) yv[k] = &V(0, q + row[k]);
           }
           avx2::colchain(&A(0, p), y, K, n, c, s);
           avx2::rowchain(rp.data(), a, n, n, q, K, row, c, s);
-          avx2::colchain(&V(0, p), yv, K, n, c, s);
+          if (want_v) avx2::colchain(&V(0, p), yv, K, n, c, s);
           for (int r = 1; r < 5; ++r)
             for (int cc = 0; cc < 5; ++cc) A(idx[r], idx[cc]) = M[r][cc];
           for (int cc = 0; cc < 5; ++cc) rp[idx[cc]] = M[0][cc];
         }
         for (int j = 0; j < n; ++j) A(p, j) = rp[j];
       }
-      for (; q < n; ++q) syev_rotate_one(a, v, n, p, q);
+      for (; q < n; ++q) syev_rotate_one(a, v, n, p, q, want_v);
     }
   }
   return sweeps;
 }
 
-inline int svd_avx2(double* a, double* v, int m, int n, double* residual) {
+inline int svd_avx2(double* a, double* v, int m, int n, double* residual, bool want_v) {
   int sweeps = 0;
   *residual = 0;
   const size_t npairs = static_cast<size_t>(n) * (n > 0 ? n - 1 : 0) / 2;
@@ -456,7 +459,7 @@ inline int svd_avx2(double* a, double* v, int m, int n, double* residual) {
           const double tt = (theta >= 0 ? 1.0 : -1.0) / (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
           const double c = 1.0 / std::sqrt(tt * tt + 1.0), sn = tt * c;
           avx2::rotate(a + static_cast<size_t>(p) * m, a + static_cast<size_t>(q) * m, m, c, sn);
-          avx2::rotate(v + static_cast<size_t>(p) * n, v + static_cast<size_t>(q) * n, n, c, sn);
+          if (want_v) avx2::rotate(v + static_cast<size_t>(p) * n, v + static_cast<size_t>(q) * n, n, c, sn);
         }
       }
     }
@@ -470,21 +473,21 @@ inline int svd_avx2(double* a, double* v, int m, int n, double* residual) {
 #endif  // VGPU_HOSTGEMM_AVX2
 
 // The sweeps themselves, on the host's best instruction set (see the top of this file). a, v and the return values as in
-// syev_generic and svd_generic.
-inline int syev_sweeps(double* a, double* v, int n, double* residual, Isa isa = Isa::Auto) {
+// syev_generic and svd_generic. With want_v false v is not touched (it may be null): the rotations do not depend on it.
+inline int syev_sweeps(double* a, double* v, int n, double* residual, Isa isa = Isa::Auto, bool want_v = true) {
 #ifdef VGPU_HOSTGEMM_AVX2
-  if (isa == Isa::Avx2 || (isa == Isa::Auto && vgpu::hostgemm::avx2_available())) return syev_avx2(a, v, n, residual);
+  if (isa == Isa::Avx2 || (isa == Isa::Auto && vgpu::hostgemm::avx2_available())) return syev_avx2(a, v, n, residual, want_v);
 #endif
   (void)isa;
-  return syev_generic(a, v, n, residual);
+  return syev_generic(a, v, n, residual, want_v);
 }
 
-inline int svd_sweeps(double* a, double* v, int m, int n, double* residual, Isa isa = Isa::Auto) {
+inline int svd_sweeps(double* a, double* v, int m, int n, double* residual, Isa isa = Isa::Auto, bool want_v = true) {
 #ifdef VGPU_HOSTGEMM_AVX2
-  if (isa == Isa::Avx2 || (isa == Isa::Auto && vgpu::hostgemm::avx2_available())) return svd_avx2(a, v, m, n, residual);
+  if (isa == Isa::Avx2 || (isa == Isa::Auto && vgpu::hostgemm::avx2_available())) return svd_avx2(a, v, m, n, residual, want_v);
 #endif
   (void)isa;
-  return svd_generic(a, v, m, n, residual);
+  return svd_generic(a, v, m, n, residual, want_v);
 }
 
 }  // namespace vgpu::hostjac

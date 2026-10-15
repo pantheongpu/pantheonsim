@@ -215,6 +215,21 @@ std::vector<Isa> isas() {
   return v;
 }
 
+// The same matrix with the vectors not asked for: A, the sweeps and the residual are what they were (v is a null pointer, which
+// nothing may read or write). Returns the number of differences.
+size_t without_vectors_syev(const std::vector<double>& a0, int n, Isa isa, const std::vector<double>& ra, int rsw, double rres) {
+  std::vector<double> ga = a0;
+  double gres = -3;
+  const int gsw = vgpu::hostjac::syev_sweeps(ga.data(), nullptr, n, &gres, isa, false);
+  return differing(ga, ra) + (gsw != rsw) + !same(gres, rres);
+}
+size_t without_vectors_svd(const std::vector<double>& a0, int m, int n, Isa isa, const std::vector<double>& ra, int rsw, double rres) {
+  std::vector<double> ga = a0;
+  double gres = -3;
+  const int gsw = vgpu::hostjac::svd_sweeps(ga.data(), nullptr, m, n, &gres, isa, false);
+  return differing(ga, ra) + (gsw != rsw) + !same(gres, rres);
+}
+
 }  // namespace
 
 VTEST(host_jacobi_syev_matches_the_loops) {
@@ -239,6 +254,7 @@ VTEST(host_jacobi_syev_matches_the_loops) {
         const int gsw = vgpu::hostjac::syev_sweeps(ga.data(), gv.data(), n, &gres, isa);
         ++runs;
         size_t d = differing(ga, ra) + differing(gv, rv) + (gsw != rsw) + !same(gres, rres);
+        d += without_vectors_syev(a0, n, isa, ra, rsw, rres);
         if (d) std::printf("  syev %s n=%d isa=%d: %zu differ (sweeps %d vs %d)\n", kind_name(Kind(k)), n, static_cast<int>(isa), d, gsw, rsw);
         bad += d;
       }
@@ -265,7 +281,8 @@ VTEST(host_jacobi_syev_larger_matrices_match_the_loops) {
         double gres = -2;
         const int gsw = vgpu::hostjac::syev_sweeps(ga.data(), gv.data(), n, &gres, isa);
         ++runs;
-        const size_t d = differing(ga, ra) + differing(gv, rv) + (gsw != rsw) + !same(gres, rres);
+        size_t d = differing(ga, ra) + differing(gv, rv) + (gsw != rsw) + !same(gres, rres);
+        d += without_vectors_syev(a0, n, isa, ra, rsw, rres);
         if (d) std::printf("  syev %s n=%d isa=%d: %zu differ\n", kind_name(kind), n, static_cast<int>(isa), d);
         bad += d;
       }
@@ -295,7 +312,8 @@ VTEST(host_jacobi_svd_matches_the_loops) {
         double gres = -2;
         const int gsw = vgpu::hostjac::svd_sweeps(ga.data(), gv.data(), s.m, s.n, &gres, isa);
         ++runs;
-        const size_t d = differing(ga, ra) + differing(gv, rv) + (gsw != rsw) + !same(gres, rres);
+        size_t d = differing(ga, ra) + differing(gv, rv) + (gsw != rsw) + !same(gres, rres);
+        d += without_vectors_svd(a0, s.m, s.n, isa, ra, rsw, rres);
         if (d) std::printf("  svd %s %dx%d isa=%d: %zu differ (sweeps %d vs %d)\n", kind_name(Kind(k)), s.m, s.n, static_cast<int>(isa), d, gsw, rsw);
         bad += d;
       }
@@ -323,7 +341,8 @@ VTEST(host_jacobi_svd_larger_matrices_match_the_loops) {
         double gres = -2;
         const int gsw = vgpu::hostjac::svd_sweeps(ga.data(), gv.data(), s.m, s.n, &gres, isa);
         ++runs;
-        const size_t d = differing(ga, ra) + differing(gv, rv) + (gsw != rsw) + !same(gres, rres);
+        size_t d = differing(ga, ra) + differing(gv, rv) + (gsw != rsw) + !same(gres, rres);
+        d += without_vectors_svd(a0, s.m, s.n, isa, ra, rsw, rres);
         if (d) std::printf("  svd %s %dx%d isa=%d: %zu differ\n", kind_name(kind), s.m, s.n, static_cast<int>(isa), d);
         bad += d;
       }
