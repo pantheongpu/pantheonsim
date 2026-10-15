@@ -23,7 +23,7 @@ count: 8             # how many
 strict: true         # refuse undefined behaviour, such as dividing by zero
 ```
 
-In a browser: [pantheonsim.com/play](https://pantheonsim.com/play/). In CI: `pantheongpu/setup-pantheonsim@v0` ([docs/github-action.md](docs/github-action.md)). In a container: `docker run --rm ghcr.io/pantheongpu/pantheonsim:latest vgpu list-gpus` ([docs/docker.md](docs/docker.md)).
+In a browser: [pantheonsim.com/play](https://pantheonsim.com/play/). In CI: `pantheongpu/setup-pantheonsim@v0` ([docs/github-action.md](docs/github-action.md)), or `scripts/ci-setup.sh` on GitLab CI, CircleCI, Forgejo, Jenkins and Buildkite ([docs/ci-other-platforms.md](docs/ci-other-platforms.md)). In a container: `docker run --rm ghcr.io/pantheongpu/pantheonsim:latest vgpu list-gpus` ([docs/docker.md](docs/docker.md)).
 
 ## Docs
 

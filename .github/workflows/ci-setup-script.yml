@@ -1,0 +1,62 @@
+name: CI setup script
+
+# scripts/ci-setup.sh is the portable version of action.yml, for CI systems that
+# are not GitHub Actions. Run it the way they would: in a bare ubuntu:24.04
+# image, as root with no sudo, with nothing from GitHub's tooling on the path.
+# It runs only when the script or this file changes.
+on:
+  push:
+    branches: [main]
+    paths: [scripts/ci-setup.sh, .github/workflows/ci-setup-script.yml]
+  pull_request:
+    paths: [scripts/ci-setup.sh, .github/workflows/ci-setup-script.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci-setup:
+    name: ubuntu:24.04, nvidia/t4, CUDA 12.6
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      PSIM_GPU: nvidia/t4
+      PSIM_COUNT: '1'
+      PSIM_CUDA_TOOLKIT: '12.6'
+      PSIM_BUILD_DIR: /tmp/psim-build
+      PSIM_ENV_FILE: /tmp/psim.env
+      # Empty, so the script writes only its env file and the steps below must
+      # source it, as a job on any other CI system does.
+      GITHUB_PATH: ''
+      GITHUB_ENV: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: First run, builds the simulator
+        run: |
+          start=$SECONDS
+          scripts/ci-setup.sh 2>&1 | tee first.log
+          echo "first run: $((SECONDS - start)) s"
+          if grep -q 'using the cached build' first.log; then echo 'first run used a cache'; exit 1; fi
+
+      - name: nvcc and a vector add through vgpu run
+        run: |
+          . /tmp/psim.env
+          nvcc --version | grep -q 'release 12.6'
+          nvidia-smi -L | grep -q 'Tesla T4'
+          nvcc -arch=compute_75 -code=compute_75 .github/action-tests/cmake-cuda/vectoradd.cu -o vectoradd
+          vgpu run ./vectoradd
+
+      - name: Second run, reuses the build
+        run: |
+          start=$SECONDS
+          scripts/ci-setup.sh 2>&1 | tee second.log
+          echo "second run: $((SECONDS - start)) s"
+          grep -q 'using the cached build' second.log
+          . /tmp/psim.env
+          vgpu run ./vectoradd
