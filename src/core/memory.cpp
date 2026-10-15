@@ -132,7 +132,7 @@ uint64_t MemoryManager::alloc(uint64_t size) {
   if (used_ + size > capacity_ || used_ + size < used_)
     throw Error::make(Err::OutOfMemory, "device out of memory: requested ", size, " bytes, ", used_,
                       " of ", capacity_, " bytes already in use");
-  const uint64_t align = std::max(kAllocAlign, page_);
+  const uint64_t align = std::max(alloc_align_, page_);
   uint64_t base = (next_va_ + align - 1) / align * align;
   uint64_t padded = (size + align - 1) / align * align;
   next_va_ = base + padded;
@@ -320,7 +320,7 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
     // The VA range up to the alignment-padded end belongs to this allocation:
     // an access there is an overrun, which deserves a better diagnosis than
     // "unknown pointer".
-    const uint64_t align = std::max(kAllocAlign, page_);
+    const uint64_t align = std::max(alloc_align_, page_);
     uint64_t padded = (a.size + align - 1) / align * align;
     if (addr < base + padded)
       throw Error::make(Err::OutOfBounds, op, " at ", Hex{addr}, " is ", addr - (base + a.size),

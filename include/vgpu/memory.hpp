@@ -110,6 +110,11 @@ class MemoryManager {
   // every access to the bytes allocated.
   void set_page_size(uint64_t bytes) { page_ = bytes; }
 
+  // The alignment cudaMalloc-style allocations start on, kAllocAlign unless set. NVIDIA's runtime promises a
+  // pointer from cudaMalloc binds to a texture with no offset (cudaDeviceProp::textureAlignment, 512 bytes), and
+  // programs rely on it: convolutionFFT2D makes a texture over each buffer it allocates. `bytes` is a power of two.
+  void set_alloc_alignment(uint64_t bytes) { alloc_align_ = bytes; }
+
   // Frees an allocation. `ptr` must be the exact base returned by alloc().
   void free(uint64_t ptr);
 
@@ -523,6 +528,7 @@ class MemoryManager {
   uint64_t used_ = 0;
   uint64_t next_va_;
   uint64_t page_ = 0;   // set_page_size
+  uint64_t alloc_align_ = kAllocAlign;   // set_alloc_alignment
   void notify_usage() const {
     if (usage_observer_) usage_observer_(used_);
   }
