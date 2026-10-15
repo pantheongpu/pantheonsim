@@ -3,7 +3,7 @@
 # nightly's first runs, spread over each suite. Columns: suite | a regular
 # expression of the names (the list's first column) to run. (cudaGraphsPerfScaling
 # is left out: it needs NVTX's headers, which the CI image does not carry.)
-cuda-samples|/(vectorAdd|simpleAWBarrier|fp16ScalarProduct|simpleOccupancy|scalarProd|dct8x8|streamOrderedAllocation|simpleCudaGraphs|simpleVoteIntrinsics|simpleCooperativeGroups|simpleSurfaceWrite|threadFenceReduction|MC_EstimatePiP|conjugateGradient|conjugateGradientCudaGraphs|conjugateGradientPrecond|conjugateGradientUM|cuSolverDn_LinearSolver|cuSolverRf|cuSolverSp_LinearSolver|cuSolverSp_LowlevelCholesky|cuSolverSp_LowlevelQR|cudaCompressibleMemory|MersenneTwisterGP11213|simpleCUFFT_callback|convolutionFFT2D|quasirandomGenerator|quasirandomGenerator_nvrtc|UnifiedMemoryPerf)$
+cuda-samples|/(vectorAdd|simpleAWBarrier|fp16ScalarProduct|simpleOccupancy|scalarProd|dct8x8|streamOrderedAllocation|simpleCudaGraphs|simpleVoteIntrinsics|simpleCooperativeGroups|simpleSurfaceWrite|threadFenceReduction|MC_EstimatePiP)$
 hecbench|^(adam|attention|backprop|bscan|crc64|floydwarshall|gaussian|hausdorff|jenkins-hash|matrixT|merge|f16atomic)-cuda$
 rodinia|^(pathfinder|needle|lud|streamcluster)$
 polybench|^(2DCONV|3DCONV|BICG|GESUMMV|GEMM|JACOBI2D|ADI)$
