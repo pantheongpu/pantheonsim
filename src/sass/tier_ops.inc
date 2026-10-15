@@ -104,7 +104,7 @@ inline Mask tier_combine(unsigned bop, Mask r, Mask acc) { return bop == 0 ? (r 
 
 // A row of 32 words moved without a call into libc (the 128 bytes were a memmove call: 15% of the integer workload). All eight
 // vectors are read before any is written, so a destination that is the source itself is no problem.
-inline void tier_copy_row(uint32_t* d, const uint32_t* s) {
+[[gnu::always_inline]] inline void tier_copy_row(uint32_t* d, const uint32_t* s) {
 #if defined(__SSE2__)
   __m128i v[8];
   for (unsigned i = 0; i < 8; ++i) v[i] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s) + i);
@@ -125,7 +125,7 @@ inline uint32_t tier_extend(unsigned size, uint32_t v) {   // a sub-word load wi
 }
 
 // A result row to the destination register, for the executing lanes (fast_alu's store).
-inline void tier_store(const TCtx& c, uint16_t dst, Mask ex, const uint32_t* r) {
+[[gnu::always_inline]] inline void tier_store(const TCtx& c, uint16_t dst, Mask ex, const uint32_t* r) {
   if (dst == tier::kNoReg) return;
   uint32_t* d = c.R + dst * 32u;
   if (ex == kAll) tier_copy_row(d, r);
@@ -972,9 +972,20 @@ TIER_HANDLER(h_shfl) {
   TIER_PRELUDE
   alignas(32) uint32_t t[3][32], out[32];
   const uint32_t* vp = tier_src<false>(c, op.s[0], t[0]);
+  Mask in_range = 0;
+  if (op.aux & 1) {   // the lane and the clamp are constants: the source lane of each lane and the in-range lanes were worked out by the analysis
+    const uint32_t* j = c.pool[op.s[1].off].v;
+    if (ex == kAll) {
+      for (unsigned l = 0; l < 32; ++l) out[l] = vp[j[l]];
+    } else {
+      for (unsigned l = 0; l < 32; ++l) out[l] = ((ex >> j[l]) & 1) ? vp[j[l]] : 0;   // (a source lane that is not running gives 0)
+    }
+    tier_store(c, op.dst, ex, out);
+    tier_setp(c, op.dst2, ex, op.b);
+    return;
+  }
   const uint32_t* bp = tier_src<false>(c, op.s[1], t[1]);
   const uint32_t* cp = tier_src<false>(c, op.s[2], t[2]);
-  Mask in_range = 0;
   // (the mode picked once, not per lane)
   const auto lanes = [&](auto pick) {
     for (unsigned l = 0; l < 32; ++l) {
@@ -1195,16 +1206,34 @@ inline void tier_set_pcs(Warp& w, Mask group, uint64_t v) {
 // named by the barrier (a callee that shares Bx with its caller) stay.
 inline void tier_release_bsync(Warp& w, unsigned x) {
   const Mask members = w.b[x] & w.alive & ~w.exited;
-  Mask arrived = 0;
-  for (Mask m = w.waiting; m; m &= m - 1) {   // (the lanes that wait; the others are not at a BSYNC)
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    if (w.wait_kind[l] == Wait::BSync && w.wait_arg[l] == x) arrived |= Mask{1} << l;
+  // The lanes that wait at a BSYNC on Bx: the lanes that wait, whose kind is BSync and whose barrier is x -- the two arrays
+  // compared a vector at a time instead of looked at lane by lane.
+  Mask arrived = w.waiting;
+  if (arrived) {
+#if defined(__SSE2__)
+    const __m128i kind = _mm_set1_epi8(static_cast<char>(Wait::BSync));
+    const uint32_t k = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_kind[0])), kind))) |
+                       static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_kind[16])), kind))) << 16;
+    const __m128i want = _mm_set1_epi32(static_cast<int>(x));
+    uint32_t a = 0;
+    for (unsigned i = 0; i < 8; ++i)
+      a |= static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(
+               _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_arg[4 * i])), want)))) << (4 * i);
+    arrived &= k & a;
+#else
+    Mask match = 0;
+    for (Mask m = arrived; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      if (w.wait_kind[l] == Wait::BSync && w.wait_arg[l] == x) match |= Mask{1} << l;
+    }
+    arrived = match;
+#endif
   }
   if (members) arrived &= members;
   if ((members & ~arrived) == 0 && arrived) {
+    w.waiting &= ~arrived;
     for (Mask m = arrived; m; m &= m - 1) {
       const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-      w.waiting &= ~(Mask{1} << l);
       w.wait_kind[l] = Wait::None;
       w.pc[l] += 16;
     }
@@ -1285,9 +1314,10 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
       if (take == group || !take) {
         tier_set_pcs(w, group, take ? target : here + 16);
       } else {
+        const uint64_t next = here + 16;   // (a select without a branch: the lanes that take it are unpredictable)
         for (Mask m = group; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-          w.pc[l] = ((take >> l) & 1) ? target : here + 16;
+          w.pc[l] = next ^ ((target ^ next) & (uint64_t{0} - ((take >> l) & 1)));
         }
       }
       if (take && last.imm <= static_cast<int64_t>(last.ins->pc) && (w.runnable() & ~group)) {

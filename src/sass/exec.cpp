@@ -236,21 +236,22 @@ inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
   return eq;
 }
 
-// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds, as four
-// independent chains of compare-and-select over all 32 lanes when many lanes run (a chain of dependent min()s over 16 lanes was a
-// tenth of the divergent workload), else that loop.
+// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds. With many lanes
+// running, as four independent chains over all 32 lanes, a lane that does not run counting as the largest address (an all-ones OR,
+// no branch on the lane's bit: those were mispredicted in a diverged warp); with few, the loop over just those lanes.
 inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) {
   if (simd::popcount32(run) <= 5) {
     uint64_t lo = first;
     for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
     return lo;
   }
+  const auto pcv = [&](unsigned l) { return w.pc[l] | ((static_cast<uint64_t>((run >> l) & 1)) - 1); };
   uint64_t a = ~uint64_t{0}, b = a, c = a, d = a;
   for (unsigned l = 0; l < 32; l += 4) {
-    a = std::min(a, ((run >> l) & 1) ? w.pc[l] : ~uint64_t{0});
-    b = std::min(b, ((run >> (l + 1)) & 1) ? w.pc[l + 1] : ~uint64_t{0});
-    c = std::min(c, ((run >> (l + 2)) & 1) ? w.pc[l + 2] : ~uint64_t{0});
-    d = std::min(d, ((run >> (l + 3)) & 1) ? w.pc[l + 3] : ~uint64_t{0});
+    a = std::min(a, pcv(l));
+    b = std::min(b, pcv(l + 1));
+    c = std::min(c, pcv(l + 2));
+    d = std::min(d, pcv(l + 3));
   }
   return std::min(std::min(a, b), std::min(c, d));
 }

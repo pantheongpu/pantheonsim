@@ -404,6 +404,32 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       if (!reg_dst(ins.dst[1], m.dst, maxreg)) return;
       m.dst2 = static_cast<uint16_t>(ins.dst[0].reg);
       m.a = ins.f[0];   // idx, up, down, bfly
+      if (m.s[1].kind == SrcKind::Pool && m.s[2].kind == SrcKind::Pool) {
+        // The lane and the clamp are the same for every lane (an immediate: __shfl_xor_sync(m, v, 16)): which lane each reads, and
+        // which are in range, are worked out here once, the way exec_warp works them out for every lane at every execution.
+        const uint32_t b = prog.pool[m.s[1].off].v[0], cc = prog.pool[m.s[2].off].v[0];
+        Row j;
+        uint32_t in_range = 0;
+        const uint32_t clamp = cc & 0x1f, segmask = (cc >> 8) & 0x1f;
+        for (uint32_t l = 0; l < 32; ++l) {
+          const uint32_t maxl = (l & segmask) | (clamp & ~segmask), minl = l & segmask;
+          uint32_t src;
+          bool in;
+          switch (m.a) {
+            case 0: src = minl | (b & ~segmask & 0x1f); in = src <= maxl; break;
+            case 1: src = l - b; in = static_cast<int32_t>(src) >= static_cast<int32_t>(maxl); break;
+            case 2: src = l + b; in = src <= maxl; break;
+            default: src = l ^ b; in = src <= maxl; break;
+          }
+          if (!in) src = l;
+          j.v[l] = src & 31;
+          in_range |= static_cast<uint32_t>(in) << l;
+        }
+        prog.pool.push_back(j);
+        m.s[1].off = static_cast<uint32_t>(prog.pool.size() - 1);   // the table of source lanes
+        m.b = in_range;
+        m.aux = 1;
+      }
       accept(Form::Shfl);
       return;
     }
