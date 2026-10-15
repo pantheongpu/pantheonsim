@@ -342,7 +342,7 @@ const FormImpl& form_impl(Form f) {
       {Impl::Own, "USHF: uniform datapath, shift"},
       {Impl::Own, "UFLO, UPOPC: uniform datapath, bit counts"},
       {Impl::Own, "USEL: uniform datapath, a select"},
-      {Impl::Interp, "HMMA: exec_mma decides the sum (VGPU_TC_EXACT and the sm_86 tensor-core model) and calls the kernel"},
+      {Impl::Kernel, "hmma, with the kind from Runner::hmma_kernel_kind (VGPU_TC_EXACT and the sm_86 tensor-core model), as exec_mma calls it"},
   };
   static_assert(sizeof table / sizeof table[0] == static_cast<size_t>(Form::Count_), "form_impl: one entry per Form");
   const unsigned i = static_cast<unsigned>(f);

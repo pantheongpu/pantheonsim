@@ -361,12 +361,14 @@ class Runner {
   void tier_exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mem(blk, w, ins, ex); }
   uint32_t tier_cbank32(unsigned bank, uint64_t offset) const { return cbank32(bank, offset); }
   void tier_exec_float(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_float(blk, w, ins, ex); }
-  // A float or tensor instruction as Runner::execute runs it: the 32-lane fast path first, then the general rule. The tier's handlers for the
-  // forms whose result rules are more than a call of a SIMD kernel use these (so that the rules stay in one place, exec_ops.inc).
+  // A float instruction as Runner::execute runs it: the 32-lane fast path first, then the general rule. The tier's handlers for the
+  // forms whose result rules are more than a call of a SIMD kernel use this (so that the rules stay in one place, exec_ops.inc).
   void tier_float_op(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     if (!fast_alu(w, ins, ex)) exec_float(blk, w, ins, ex);
   }
-  void tier_exec_mma(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mma(blk, w, ins, ex); }
+  // The `kind` argument of simd::Kernels::hmma for an f16 (0), bf16 (1) or tf32 (2) HMMA: an sm_86 cubin's sum is the RTX 3060 tensor core's
+  // (bit 4) unless VGPU_TC_EXACT=0. exec_mma (exec_ops.inc) and the tier's HMMA handler both call this, so that the choice is made in one place.
+  unsigned hmma_kernel_kind(unsigned kind) const { return kind | (m_.sm == 86 && vgpu::exec::tc86::exact_enabled() ? 16u : 0u); }
   ~Runner() {
     if (coop_ws_) {
       try {

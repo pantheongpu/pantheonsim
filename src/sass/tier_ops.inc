@@ -1262,9 +1262,16 @@ TIER_HANDLER(h_vote) {
 
 // HMMA (the dense f16, bf16 and tf32 forms): one SIMD kernel over the warp's fragments, as exec_mma gives them to it, the
 // answer written to the executing lanes (RZ as an operand is a row of zeros, as a source accumulator a zero accumulator).
-TIER_HANDLER(h_hmma) {   // the interpreter's own code: which sum an sm_86 cubin gets (VGPU_TC_EXACT) is exec_mma's to decide
+TIER_HANDLER(h_hmma) {   // exec_mma's kernel call: the same kernel, and the same choice of the sum (hmma_kernel_kind: VGPU_TC_EXACT, sm_86)
   TIER_PRELUDE
-  c.r->tier_exec_mma(*c.blk, *c.w, *op.ins, ex);
+  static const uint32_t kZero[4 * 32] = {};
+  const unsigned ra = op.s[0].off, rb = op.s[1].off, rc = op.s[2].off;
+  const unsigned c_regs = op.c ? 2 : 4;
+  alignas(32) uint32_t out[4 * 32];
+  c.sk->hmma(c.r->hmma_kernel_kind(op.a), op.b, op.c != 0, ra == kRZ ? kZero : c.R + ra * 32u, rb == kRZ ? kZero : c.R + rb * 32u,
+             rc == kRZ ? nullptr : c.R + rc * 32u, out);
+  if (op.dst != tier::kNoReg)
+    for (unsigned s = 0; s < c_regs; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, out + s * 32);
 }
 
 tier::MOp::Fn tier_handler_for(tier::Form f) {

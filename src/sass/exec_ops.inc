@@ -4569,7 +4569,7 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
       const uint32_t* pb = rb == kRZ ? kZero : &w.reg(rb, 0);
       uint32_t out[4 * 32];
       // (An sm_86 cubin sums as an RTX 3060's tensor core does: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
-      simd::kernels().hmma((at == MmaT::F16 ? 0u : at == MmaT::BF16 ? 1u : 2u) | (m_.sm == 86 && vgpu::exec::tc86::exact_enabled() ? 16u : 0u), K, acc == AccF16, pa, pb,
+      simd::kernels().hmma(hmma_kernel_kind(at == MmaT::F16 ? 0u : at == MmaT::BF16 ? 1u : 2u), K, acc == AccF16, pa, pb,
                            rc == kRZ ? nullptr : &w.reg(rc, 0), out);
       if (rd != kRZ)
         each_lane(ex, [&](unsigned l) {
