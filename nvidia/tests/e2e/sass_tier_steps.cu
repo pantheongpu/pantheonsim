@@ -258,7 +258,7 @@ __global__ void cbanks(const u32* in, u32* out, int n, u32 sel) {
   o[9] = (u32)__float_as_uint(kfl[sel & 15] * x);
   o[10] = (u32)(const_cast<u32*>(&kin[0]) == nullptr) + __popc(kin[3]) + __clz(kin[5] | 1u);
   o[11] = (u32)(((long long)(int)v * (long long)kin[6]) >> 3);
-  o[12] = kin[(int)(v & 15) - 8 + 16] + __float_as_uint(kfl[(int)((v >> 4) & 7) - 4 + 8]);   // a register offset that is negative
+  o[12] = kin[(int)(v & 15) - 8 + 16] + __float_as_uint(kfl[(int)((v >> 4) & 7) - 4 + 8]);   // (ptxas folds the +16 into the register, so the register offset is never negative here)
   for (int k = 0; k < 13; ++k) out[(size_t)i * 13 + k] = o[k];
 }
 

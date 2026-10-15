@@ -1176,8 +1176,10 @@ start exactly where the tier's loop already is. The loop goes on there instead o
 conditions are checked by the same state the scheduler reads, not derived), and tells its caller how many calls it took over
 (`Warp::extra`), never more than the turn the caller has left (`Warp::budget`): a warp's turn is 4096 calls of `step_warp`
 (`run_block`, `run_cluster`) or 256 (a cooperative launch), so the instruction count of a warp that waits for another one's store, which
-depends on that, is unchanged. `VGPU_TIER_CHAIN=0` turns the chain off. On the benchmark workloads the tier makes 5,000 to 66,000 runs of which
-{{CHAINED}} are chained.
+depends on that, is unchanged. `VGPU_TIER_CHAIN=0` turns the chain off. `VGPU_TIER_STATS=1` prints the count. On the benchmark workloads (full size) the share of runs the chain started is 99% or more for `int_alu`,
+`f32_fma`, `f64_fma`, `wmma`, `mma_ptx`, `texture`, `warp` and `local` (`warp`: 1,281,280 of 1,282,048 runs), 96% for `mem`, 85% for
+`atomics`, 67% for `launch`, 35% for `divergent` (3.6 million runs: a diverged warp usually ends a run at a branch with more than one address
+left) and 25% for `shared` (barriers end its runs).
 
 **What `step_warp`'s straight-line loop does besides executing** (the list is at the top of the tier's run loop in `tier_ops.inc`, and each item has a test):
 the store gate (`sass_tier_steps.cu`: gate_plain, gate_long, gate_generic, gate_diverged), the step count and its limit
@@ -1194,7 +1196,38 @@ was a call into libc's memmove (15% of the integer workload), the predicate of L
 (a tenth of `divergent`) and then a branch per lane, BSYNC's release a scan of the lanes' wait fields, and the shuffles' arithmetic per
 lane at every execution. All now vector or table work; the benchmarks below are from after them.
 
-{{TABLE}}
+**Measured** (`tools/bench/bench.sh`, one host thread, the RTX 3060 profile, CPU 17 of an i9-12900K shared with other jobs, so
+the load average was 6 to 12; the counters of every launch were identical in every comparison). First, the tier on in both builds:
+round 8's (origin/r8-a, 3ef7a6bd) against this round's, 11 alternating runs each:
+
+| workload | r8 tier | r9 tier | r9 / r8 |
+|---|---:|---:|---:|
+| int_alu | 113.7 | 120.8 | 1.06x |
+| f32_fma | 126.6 | 136.1 | 1.08x |
+| f64_fma, f64_subnormal | 60.1, 7.50 | 57.9, 7.48 | same |
+| wmma | 6.43 | 8.80 | 1.37x |
+| mma_ptx | 11.7 | 16.7 | 1.42x |
+| mem | 17.3 | 19.4 | 1.12x |
+| shared | 13.8 | 17.6 | 1.27x |
+| atomics, texture | 9.26, 4.31 | 9.72, 4.51 | 1.05x |
+| local | 21.4 | 25.1 | 1.17x |
+| divergent | 23.7 | 36.4 | 1.54x |
+| warp | 37.2 | 77.6 | 2.09x |
+| launch (k launches/s) | 461 | 519 | 1.13x |
+| api, startup | | | same |
+
+(warp instructions per CPU second, in millions.) Second, one build (this round's) with the tier off and on, three alternating rounds of five
+runs, the median of the rounds: `int_alu` 2.7x, `f32_fma` 2.7x, `f64_fma` 1.6x, `wmma` 1.6x, `mma_ptx` 1.6x, `mem` 1.5x, `shared` 1.4x,
+`atomics` 1.3x, `local` 1.6x, `divergent` 1.8x, `warp` 3.6x, `launch` 1.26x, `texture` 1.06x, `f64_subnormal` 1.08x (the subnormal
+emulation dominates both), `api` and `startup` the same. The tier does not reach 2x on `shared` (barriers), `atomics`
+(a global atomic is still the interpreter's: 71% of its warp instructions run in the tier), `texture` or `f64_subnormal`.
+
+**The tier off costs about 2 to 4% on the two shortest workloads.** With `VGPU_TIER=0` against the r8 build, `launch` (0.1 s) measured 0.95x to 0.97x
+and `warp` (0.26 s) 0.97x to 0.98x in repeated alternating runs (p below 0.001, identical counters); every other workload was the same. The
+interpreter's code did not change except that its loop is now `turn<false>` and `step_warp` reads its step limit from a member. I could not
+find a cause by profile (the shares per function look alike), and the figure moves with the layout of the compiled code: marking one tier-only helper
+`noinline` made `launch` the same as r8 and `warp` 0.95x, another variant the reverse. It is a few percent on a workload of a tenth of a second and
+it is reported rather than chased further.
 
 **How it is held to the interpreter.** `e2e_sass_tier` (see round 8) now also runs `sass_tier_steps` (above), the tier without its chain
 (`VGPU_TIER_CHAIN=0`) on `sass_tier` and `sass_tier_steps`, and the faults; its statistics go to a file (`VGPU_TIER_STATS_FILE`), because
@@ -1203,11 +1236,38 @@ architecture a third time with `VGPU_TIER=1` and requires the output of the inte
 tier's soak in the CI job that builds Hopper's and Blackwell's programs (the hosted build-and-test job runs `e2e_sass_tier`, and
 `bench_counters_tier`, as before). `test_tier` checks the new forms' analysis over the disassembler corpora.
 
-{{SOAK}}
+**Soak** (the programs run twice on the SASS engine of the RTX 3060 profile, `VGPU_TIER=0` then `1`, one host thread, with the stdout, stderr,
+every file the program writes and every launch's counters compared; the scripts are scratch tooling and not in the tree): the HeCBench
+programs (the reduced lists), the CUDA Samples v13.0 programs, the Rodinia apps and PolyBench/GPU, 271 programs in the last pass, of which
+the tier ran 98.6% of the warp instructions. 38 are byte-identical and 140 identical but for timing lines; 82 run longer than their limit
+(30 to 120 s) in both modes and are not compared. 11 were flagged, and every one is a difference between two runs of the same mode: a timing
+line the filter missed (`ccsd-trpdrv`, `ising`, `lebesgue`, `lulesh`, `mallocFree`, `fpdc`), the name of a shared-memory segment or a thread
+launch order (`simpleIPC`, `streamOrderedAllocationIPC`, `threadMigration`), or a program that reads uninitialised or timer-seeded data
+(`fp16ScalarProduct`, `btree`, `particlefilter`, `backprop`; the interpreter differs from itself in `backprop`, as run twice, and in the others as the earlier passes found). No difference in a result
+or a counter was caused by the tier. The nine pantheon workloads (`--verify`, one second each) gave the same exit status in both modes; their outputs and counters differ because they run for a time, and the tier gets further in it, so they are not a bit-for-bit check. The soak runs of this round
+found one bug in the tier before the programs reached it, the stale register-file pointer of a chained pass after `USETMAXREG` (found
+by `e2e_sass_archs`' tier leg on Hopper, fixed in ab7363b5: the register file's address and the registers check are now worked out for every pass).
 
-{{MEMORY}}
+**Memory.** A `MOp` is 96 bytes, and a code section's program is built whole, under `std::call_once`, the first time a warp runs in it:
+the pool rows (128 bytes each; constants, shuffle tables, resolved operands) come to about 25% on top. For the disassembler corpus of
+sm_86 (7,564 instructions) that is 726 KB of MOps and 1,588 rows (203 KB), 0.93 MB or 123 bytes an instruction, against the 184-byte `Instr` the section
+already holds; building it takes 150 to 400 ns an instruction, 2.2 ms for that corpus. In the soak the peak resident size with the tier on was
+within a median of 132 KB of the interpreter's over 257 programs. Building the sections lazily was considered and not done: a section is the unit
+of the `call_once`, a kernel's code is a few hundred instructions at most in everything run here, and a per-instruction build would need a
+published flag on each `MOp` and a second place where the pool grows while other threads read it, to save under a megabyte on a program that
+runs at all. A very large library section (a framework's merged cubin) is where it would pay; none has shown it.
 
-{{MUTATIONS}}
+**Mutation checks.** Fifty one-line breakages of the tier, each switched on by an environment variable in a scratch copy (a different form
+each: the sign of a conversion, the rounding mode of an FFMA, the BSYNC member filter, the chain's checks of the budget, the give-way and
+whether the lanes are together, a shuffle table off by one, the count of barriers, the 16-byte store's last lane, ...). 42 are caught by
+`sass_tier`, `sass_tier_steps`, `sass_fastpath`, `wmma_gemm` or `bsync_recursive_abi`, three (13, 32 and 41) only after tests were added for them.
+Eight survive, and each is a case the compiler's output does not reach or one that cannot change the result: (9) LDC with a negative register
+offset (ptxas folds the constant part into the register, so the register is never negative); (15) a second predicate on a conditional BRA; (35, 37)
+the second carry out of UIADD3 and the carry of ULEA with a negated addend (ptxas passes `!PT` there); (36) UISETP's complement predicate;
+(51) a bank other than 0 as an operand of the uniform datapath (ptxas keeps `LOP3 R, R, c[0x3][...]` in the vector datapath); (26) a BSYNC
+that some lanes of the group skip by a guard (no program here has one); and (19) the chain continuing past `give_way`, which is an equivalent mutant: the
+YIELD that sets `give_way` also sets `yield`, which the chain tests first, and the next call of `step_warp` consumes `give_way` before the
+tier runs. The form analysis of these is still checked over the disassembler corpora by `test_tier`.
 
 ## Using this to check a change
 
