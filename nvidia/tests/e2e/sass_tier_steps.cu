@@ -155,7 +155,8 @@ __global__ void turn(u32* flag, u32* out, u32 K) {
       acc = spin_body<Kind>(vf, acc);
       if (i == K) snap = *vf;
     }
-    out[lane] = snap + (acc & 0);
+    out[lane] = snap;
+    out[32 + lane] = acc;
   } else if (warp == 1 && lane == 0) {
     *vf = 1;
   }
@@ -312,11 +313,13 @@ __global__ void giveway(u32* flag, u32* out, u32 K) {
       acc = (acc ^ (acc << 7)) + 1;
       if (i == K) snap = *vf;
     }
-    out[lane] = snap + (acc & 0);
+    out[lane] = snap;
+    out[32 + lane] = acc;
   } else {
     u32 acc = lane;
     for (u32 i = 0; i < 200; ++i) acc = (acc ^ (acc << 5)) + 3;
-    if (lane == 16) *vf = 1 + (acc & 0);
+    out[32 + lane] = acc;
+    if (lane == 16) *vf = 1;
   }
 }
 
