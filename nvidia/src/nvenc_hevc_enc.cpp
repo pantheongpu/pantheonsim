@@ -11,6 +11,7 @@
 #include "nvenc_cabac.hpp"
 #include "nvenc_h264.hpp"   // BitWriter
 #include "nvenc_hevc.hpp"   // append_hevc_nal
+#include "video_simd.hpp"
 
 namespace vgpu_nvenc {
 namespace {
@@ -91,6 +92,10 @@ void idst4(const int32_t* y, int32_t* x) {
 
 // Forward 2-D transform of an NxN residual block (raster) into coefficients (raster), scaled as the quantiser expects (8-bit video).
 void forward_transform(const int32_t* res, int32_t* coef, int log2, bool dst) {
+  if (!dst && log2 >= 3 && vgpu::videosimd::avx2_available()) {   // eight lines at a time, the same butterflies
+    vgpu::videosimd::forward_dct(res, coef, log2, dct_matrix().t);
+    return;
+  }
   const int N = 1 << log2;
   int32_t tmp[32 * 32], col[32], out[32];
   const int shift1 = log2 - 1, shift2 = log2 + 6;
@@ -109,6 +114,10 @@ void forward_transform(const int32_t* res, int32_t* coef, int log2, bool dst) {
 
 // 8.6.4.2: scaled coefficients d (raster) to the residual (raster).
 void inverse_transform(const int32_t* d, int32_t* res, int log2, bool dst) {
+  if (!dst && log2 >= 3 && vgpu::videosimd::avx2_available()) {
+    vgpu::videosimd::inverse_dct(d, res, log2, dct_matrix().t);
+    return;
+  }
   const int N = 1 << log2;
   int32_t g[32 * 32], col[32], out[32];
   for (int x = 0; x < N; ++x) {   // columns first
@@ -271,9 +280,16 @@ void mc_luma(const RefPlane& r, int x, int y, int bw, int bh, int mvx, int mvy, 
   const int fx = mvx & 3, fy = mvy & 3;
   const int X = x + (mvx >> 2), Y = y + (mvy >> 2);
   Patch p;
-  fill_patch(r, X, Y, bw, bh, 3, 4, &p);
-  const int st = p.stride;
-  const uint8_t* base = p.d + 3 * st + 3;   // the sample under (0, 0)
+  int st;
+  const uint8_t* base;   // the sample under (0, 0)
+  if (X - 3 >= 0 && Y - 3 >= 0 && X + bw + 4 <= r.w && Y + bh + 4 <= r.h) {   // wholly inside the picture: read it in place
+    st = r.stride;
+    base = r.p + static_cast<size_t>(Y) * r.stride + X;
+  } else {
+    fill_patch(r, X, Y, bw, bh, 3, 4, &p);
+    st = p.stride;
+    base = p.d + 3 * st + 3;
+  }
   if (!fx && !fy) {
     for (int j = 0; j < bh; ++j)
       for (int i = 0; i < bw; ++i) out[j * bw + i] = static_cast<int16_t>(base[j * st + i] << 6);
@@ -281,6 +297,12 @@ void mc_luma(const RefPlane& r, int x, int y, int bw, int bh, int mvx, int mvy, 
   }
   const int* cx = kLumaFilter[fx];
   const int* cy = kLumaFilter[fy];
+  if (vgpu::videosimd::avx2_available()) {   // the same sums, eight or sixteen outputs at a time
+    if (!fy) vgpu::videosimd::fir_h(base - 3, st, bw, bh, 8, cx, out);
+    else if (!fx) vgpu::videosimd::fir_v(base - 3 * st, st, bw, bh, 8, cy, out);
+    else vgpu::videosimd::fir_hv(base - 3 * st - 3, st, bw, bh, 8, cx, cy, out);
+    return;
+  }
   if (!fy) {
     for (int j = 0; j < bh; ++j) {
       const uint8_t* row = base + j * st - 3;
@@ -321,9 +343,16 @@ void mc_chroma(const RefPlane& r, int x, int y, int bw, int bh, int mvx, int mvy
   const int fx = mvx & 7, fy = mvy & 7;
   const int X = x + (mvx >> 3), Y = y + (mvy >> 3);
   Patch p;
-  fill_patch(r, X, Y, bw, bh, 1, 2, &p);
-  const int st = p.stride;
-  const uint8_t* base = p.d + st + 1;
+  int st;
+  const uint8_t* base;
+  if (X - 1 >= 0 && Y - 1 >= 0 && X + bw + 2 <= r.w && Y + bh + 2 <= r.h) {
+    st = r.stride;
+    base = r.p + static_cast<size_t>(Y) * r.stride + X;
+  } else {
+    fill_patch(r, X, Y, bw, bh, 1, 2, &p);
+    st = p.stride;
+    base = p.d + st + 1;
+  }
   if (!fx && !fy) {
     for (int j = 0; j < bh; ++j)
       for (int i = 0; i < bw; ++i) out[j * bw + i] = static_cast<int16_t>(base[j * st + i] << 6);
@@ -331,6 +360,12 @@ void mc_chroma(const RefPlane& r, int x, int y, int bw, int bh, int mvx, int mvy
   }
   const int* cx = kChromaFilter[fx];
   const int* cy = kChromaFilter[fy];
+  if (vgpu::videosimd::avx2_available() && bw % 4 == 0) {
+    if (!fy) vgpu::videosimd::fir_h(base - 1, st, bw, bh, 4, cx, out);
+    else if (!fx) vgpu::videosimd::fir_v(base - st, st, bw, bh, 4, cy, out);
+    else vgpu::videosimd::fir_hv(base - st - 1, st, bw, bh, 4, cx, cy, out);
+    return;
+  }
   if (!fy) {
     for (int j = 0; j < bh; ++j)
       for (int i = 0; i < bw; ++i) {
@@ -1014,21 +1049,34 @@ struct HevcEncoder::Impl {
     const int64_t add = static_cast<int64_t>(intra ? 171 : 85) << (qbits - 9);
     const int scale = kQuantScale[qpv % 6];
     int nz = 0;
-    for (int i = 0; i < N * N; ++i) {
-      const int64_t a = std::abs(static_cast<int64_t>(coef[i]));
-      int q = static_cast<int>((a * scale + add) >> qbits);
-      q = std::min(q, 32767);
-      const int v = coef[i] < 0 ? -q : q;
-      lev[(i / N) * lev_stride + (i % N)] = static_cast<int16_t>(v);
-      nz += v != 0;
+    for (int y = 0; y < N; ++y) {
+      const int32_t* cr = coef + y * N;
+      int16_t* lr = lev + y * lev_stride;
+      for (int x = 0; x < N; ++x) {
+        const int64_t a = std::abs(static_cast<int64_t>(cr[x]));
+        int q = static_cast<int>((a * scale + add) >> qbits);
+        q = std::min(q, 32767);
+        const int v = cr[x] < 0 ? -q : q;
+        lr[x] = static_cast<int16_t>(v);
+        nz += v != 0;
+      }
     }
     int64_t err = 0;
     if (nz) {
       const int bd_shift = log2 + 3;
-      for (int i = 0; i < N * N; ++i) {
-        const int v = lev[(i / N) * lev_stride + (i % N)];
-        const int64_t d = ((static_cast<int64_t>(v) * 16 * kLevelScale[qpv % 6]) << (qpv / 6)) + (int64_t{1} << (bd_shift - 1));
-        deq[i] = static_cast<int32_t>(std::max<int64_t>(-32768, std::min<int64_t>(32767, d >> bd_shift)));
+      const int64_t mul = static_cast<int64_t>(16) * kLevelScale[qpv % 6], rnd = int64_t{1} << (bd_shift - 1);
+      for (int y = 0; y < N; ++y) {
+        const int16_t* lr = lev + y * lev_stride;
+        int32_t* dr = deq + y * N;
+        for (int x = 0; x < N; ++x) {
+          const int v = lr[x];
+          if (!v) {   // a zero level dequantises to (rnd >> bd_shift) = 0
+            dr[x] = 0;
+            continue;
+          }
+          const int64_t d = ((static_cast<int64_t>(v) * mul) << (qpv / 6)) + rnd;
+          dr[x] = static_cast<int32_t>(std::max<int64_t>(-32768, std::min<int64_t>(32767, d >> bd_shift)));
+        }
       }
       inverse_transform(deq, res, log2, dst);
       for (int y = 0; y < N; ++y)
@@ -1331,6 +1379,8 @@ struct HevcEncoder::Impl {
     const RefPlane r = ref_plane(l, ri, 0);
     if (!other && !(vx & 3) && !(vy & 3)) {   // whole-sample vector: the SAD against the reference itself
       const int X = px + (vx >> 2), Y = py + (vy >> 2);
+      if (X >= 0 && X + bw <= r.w && Y >= 0 && Y + bh <= r.h && vgpu::videosimd::avx2_available())
+        return vgpu::videosimd::sad_u8(&sy[static_cast<size_t>(py) * W + px], W, r.p + static_cast<size_t>(Y) * r.stride + X, r.stride, bw, bh);
       int sad = 0;
       for (int j = 0; j < bh; ++j) {
         const uint8_t* s = &sy[static_cast<size_t>(py + j) * W + px];
@@ -1345,6 +1395,10 @@ struct HevcEncoder::Impl {
     }
     int16_t p[32 * 32];
     mc_luma(r, px, py, bw, bh, vx, vy, p);
+    if (vgpu::videosimd::avx2_available()) {
+      const uint8_t* src = &sy[static_cast<size_t>(py) * W + px];
+      return other ? vgpu::videosimd::sad_bi(p, other, bw, bh, src, W) : vgpu::videosimd::sad_uni(p, bw, bh, src, W);
+    }
     int sad = 0;
     for (int j = 0; j < bh; ++j)
       for (int i = 0; i < bw; ++i) {
@@ -1822,8 +1876,12 @@ struct HevcEncoder::Impl {
       int16_t p1[32 * 32];
       mc_luma(r1, pu->x, pu->y, pu->w, pu->h, best[1].r.vx, best[1].r.vy, p1);
       int sad = 0;
-      for (int j = 0; j < pu->h; ++j)
-        for (int i = 0; i < pu->w; ++i) sad += std::abs(sy[static_cast<size_t>(pu->y + j) * W + pu->x + i] - weight_bi(p0[j * pu->w + i], p1[j * pu->w + i]));
+      if (vgpu::videosimd::avx2_available()) {
+        sad = vgpu::videosimd::sad_bi(p0, p1, pu->w, pu->h, &sy[static_cast<size_t>(pu->y) * W + pu->x], W);
+      } else {
+        for (int j = 0; j < pu->h; ++j)
+          for (int i = 0; i < pu->w; ++i) sad += std::abs(sy[static_cast<size_t>(pu->y + j) * W + pu->x + i] - weight_bi(p0[j * pu->w + i], p1[j * pu->w + i]));
+      }
       int16_t c0[2][2], c1[2][2];
       amvp_list(0, best[0].ri, cu.x, cu.y, nCbS, pu->x, pu->y, pu->w, pu->h, partIdx, c0);
       amvp_list(1, best[1].ri, cu.x, cu.y, nCbS, pu->x, pu->y, pu->w, pu->h, partIdx, c1);

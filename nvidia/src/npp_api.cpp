@@ -35,6 +35,7 @@
 #include <cuda_runtime.h>
 
 #include "capture_defer.hpp"
+#include "host_parallel.hpp"
 
 // Every read and write of device memory below is the commit point of a call made on a capturing stream
 // (capture_defer.hpp).
@@ -110,11 +111,23 @@ template <class T> void put_scalar(void* dev, T value) {
 inline double scale_by(double v, int scale_factor) {
   return scale_factor == 0 ? v : v * std::pow(2.0, -scale_factor);
 }
+// The factor scale_by multiplies by (1 for no scaling, which leaves every value as it is, a NaN or a negative zero too), taken once for a loop.
+inline double scale_factor_of(int scale_factor) { return scale_factor == 0 ? 1.0 : std::pow(2.0, -scale_factor); }
 // Round to nearest with ties to even, which is what NPP does -- measured, not
 // assumed: half-away-from-zero disagreed with hardware on exactly the values
 // that land on .5, and only on those.
-inline Npp8u sat8u(double v) {
+// The plain form: where the value is a sum or a product of integers the compiler sees that nearbyint changes nothing and drops it.
+inline Npp8u sat8u_nb(double v) {
   const double r = std::nearbyint(v);
+  return static_cast<Npp8u>(r < 0 ? 0 : (r > 255 ? 255 : r));
+}
+inline Npp8u sat8u(double v) {
+  // nearbyint(v) clipped to a byte, as straight-line arithmetic (so that a loop of them can run several to the instruction): v is clamped
+  // to [0, 256] first (everything below 0 clips to 0 and everything from 255.5 up to 255 anyway), and for a value in that range
+  // adding and taking away 1.5 * 2^52 leaves it rounded to the nearest integer, halves to even (the default rounding mode),
+  // which is what nearbyint gives. A NaN passes through, as it did.
+  const double c = v < 0 ? 0 : (v > 256 ? 256 : v);
+  const double r = (c + 6755399441055744.0) - 6755399441055744.0;
   return static_cast<Npp8u>(r < 0 ? 0 : (r > 255 ? 255 : r));
 }
 inline Npp16u sat16u(double v) {
@@ -230,8 +243,12 @@ NppStatus binop_8u(const Npp8u* a, int as, const Npp8u* b, int bs, Npp8u* d, int
   auto ha = fetch_roi<Npp8u>(a, as, n, roi.height);
   auto hb = fetch_roi<Npp8u>(b, bs, n, roi.height);
   std::vector<Npp8u> hd(ha.size());
-  for (size_t i = 0; i < ha.size(); ++i)
-    hd[i] = sat8u(scale_by(op(static_cast<double>(ha[i]), static_cast<double>(hb[i])), sf));
+  const double k = scale_factor_of(sf);
+  if (sf == 0) {
+    for (size_t i = 0; i < ha.size(); ++i) hd[i] = sat8u_nb(op(static_cast<double>(ha[i]), static_cast<double>(hb[i])));
+  } else {
+    for (size_t i = 0; i < ha.size(); ++i) hd[i] = sat8u(op(static_cast<double>(ha[i]), static_cast<double>(hb[i])) * k);
+  }
   store_roi<Npp8u>(d, ds, n, roi.height, hd);
   return NPP_SUCCESS;
 }
@@ -257,8 +274,12 @@ NppStatus unop_8u(const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, int ch
   const int n = roi.width * ch;
   auto hs = fetch_roi<Npp8u>(s, ss, n, roi.height);
   std::vector<Npp8u> hd(hs.size());
-  for (size_t i = 0; i < hs.size(); ++i)
-    hd[i] = sat8u(scale_by(op(static_cast<double>(hs[i]), static_cast<int>(i)), sf));
+  const double k = scale_factor_of(sf);
+  if (sf == 0) {
+    for (size_t i = 0; i < hs.size(); ++i) hd[i] = sat8u_nb(op(static_cast<double>(hs[i]), static_cast<int>(i)));
+  } else {
+    for (size_t i = 0; i < hs.size(); ++i) hd[i] = sat8u(op(static_cast<double>(hs[i]), static_cast<int>(i)) * k);
+  }
   store_roi<Npp8u>(d, ds, n, roi.height, hd);
   return NPP_SUCCESS;
 }
@@ -729,16 +750,39 @@ VGPU_EXPORT NppStatus nppiFilterBox_8u_C1R(const Npp8u* s, Npp32s ss, Npp8u* d, 
   auto src = fetch_haloed_8u(s, ss, roi, mask, anchor, &w, &h, &ox, &oy);
   std::vector<Npp8u> dst(static_cast<size_t>(roi.width) * roi.height);
   const double n = static_cast<double>(mask.width) * mask.height;
-  for (int y = 0; y < roi.height; ++y)
-    for (int x = 0; x < roi.width; ++x) {
-      double acc = 0;
-      for (int my = 0; my < mask.height; ++my)
-        for (int mx = 0; mx < mask.width; ++mx)
-          acc += src[static_cast<size_t>(y + my) * w + (x + mx)];
-      // FilterBox truncates rather than rounds: a window whose mean is exactly
-      // 3.5 comes back as 3 on hardware.
-      dst[static_cast<size_t>(y) * roi.width + x] = sat8u(std::floor(acc / n));
-    }
+  // The sum over a window is an integer (every pixel is a byte), so the order it is added in does not matter: the window sums come
+  // from running sums along the rows and then down the columns, each exact, and the division and rounding are as they were.
+  {
+    const int mw = mask.width, mh = mask.height;
+    std::vector<int32_t> hs(static_cast<size_t>(roi.width) * h);   // hs[r][x] = sum of src[r][x .. x + mw - 1]
+    vgpu::hostpar::for_range(static_cast<size_t>(h), static_cast<uint64_t>(roi.width) * 3 + 8, [&](size_t r0, size_t r1) {
+      for (size_t r = r0; r < r1; ++r) {
+        const Npp8u* row = &src[r * static_cast<size_t>(w)];
+        int32_t* out = &hs[r * static_cast<size_t>(roi.width)];
+        int32_t acc = 0;
+        for (int i = 0; i < mw; ++i) acc += row[i];
+        out[0] = acc;
+        for (int x = 1; x < roi.width; ++x) {
+          acc += row[x + mw - 1] - row[x - 1];
+          out[x] = acc;
+        }
+      }
+    });
+    vgpu::hostpar::for_range(static_cast<size_t>(roi.width), static_cast<uint64_t>(roi.height) * 4 + 8, [&](size_t x0, size_t x1) {
+      std::vector<int32_t> col(x1 - x0, 0);
+      for (int my = 0; my < mh; ++my)
+        for (size_t x = x0; x < x1; ++x) col[x - x0] += hs[static_cast<size_t>(my) * roi.width + x];
+      for (int y = 0; y < roi.height; ++y) {
+        if (y > 0)
+          for (size_t x = x0; x < x1; ++x)
+            col[x - x0] += hs[static_cast<size_t>(y + mh - 1) * roi.width + x] - hs[static_cast<size_t>(y - 1) * roi.width + x];
+        for (size_t x = x0; x < x1; ++x)
+          // FilterBox truncates rather than rounds: a window whose mean is exactly
+          // 3.5 comes back as 3 on hardware.
+          dst[static_cast<size_t>(y) * roi.width + x] = sat8u(std::floor(static_cast<double>(col[x - x0]) / n));
+      }
+    });
+  }
   store_roi<Npp8u>(d, ds, roi.width, roi.height, dst);
   return NPP_SUCCESS;
 }
