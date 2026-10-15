@@ -4,9 +4,27 @@
 # on: as it is, and with VGPU_FASTPATH=0, which sends every instruction down the
 # general path. Both must pass the program's own checks and print byte for byte
 # the same -- the answers and every counter.
+#
+# The conversions (conv_forms: F2I, F2F, FRND, I2F and the half comparisons over special values and random bits) are also checked
+# against an RTX 3060's per-form hashes (nvidia/tests/data/conv_forms.rtx3060.txt) on the fast paths, the general path and every
+# SIMD level: both must print exactly the card's lines.
+#   run_sass_fastpath.sh                    simulator: fast paths vs general path, and the conversions vs the card file
+#   run_sass_fastpath.sh --card [--update]  NVIDIA's runtime on a real GPU vs the card file (or rewrite it)
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
+data="$root/nvidia/tests/data"
+if [[ "${1:-}" == --card ]]; then
+  command -v nvcc >/dev/null 2>&1 || { echo "SKIP: nvcc not found"; exit 0; }
+  cwork="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-conv-card.XXXXXX")"
+  trap 'rm -rf "$cwork"' EXIT
+  nvcc -std=c++17 -arch=sm_86 -cudart shared -w -Wno-deprecated-gpu-targets "$root/nvidia/tests/e2e/sass_fastpath.cu" -o "$cwork/prog" || { echo "FAIL: does not compile"; exit 1; }
+  cuda_root="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
+  LD_LIBRARY_PATH="$cuda_root/lib64" "$cwork/prog" cardforms > "$cwork/card.txt" || { echo "FAIL: the card run failed"; exit 1; }
+  if [[ "${2:-}" == --update ]]; then cp "$cwork/card.txt" "$data/conv_forms.rtx3060.txt"; echo "wrote conv_forms.rtx3060.txt"; exit 0; fi
+  diff "$data/conv_forms.rtx3060.txt" "$cwork/card.txt" > "$cwork/d.txt" && { echo "PASS (card)"; exit 0; }
+  echo "FAIL: the card disagrees with conv_forms.rtx3060.txt"; head -20 "$cwork/d.txt"; exit 1
+fi
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 shopt -s nullglob
 carts=("$shim"/libcudart.so.[0-9]*)
@@ -51,5 +69,16 @@ for fault in local gather scatter atomic shared sharedatomic; do
     echo "FAIL: the $fault fault is reported differently with the fast paths:"; head -20 "$work/fault_diff.txt"; fails=1
   fi
 done
+# The conversions against the card, one line per form, regime and shape (209 forms x 3 regimes x 3 shapes).
+for mode in "fast:" "general:VGPU_FASTPATH=0" "base:VGPU_SIMD=base" "off:VGPU_SIMD=off" "off-general:VGPU_SIMD=off VGPU_FASTPATH=0"; do
+  name=${mode%%:*}; read -r -a menv <<< "${mode#*:}"
+  env VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 VGPU_THREADS=1 LD_LIBRARY_PATH="$shim" "${menv[@]}" "$work/prog" cardforms 2>&1 | grep '^conv_forms ' > "$work/conv_$name.txt"
+  if diff -u "$data/conv_forms.rtx3060.txt" "$work/conv_$name.txt" > "$work/conv_diff.txt"; then
+    :
+  else
+    echo "FAIL: conversions ($name) differ from the card:"; head -20 "$work/conv_diff.txt"; fails=1
+  fi
+done
 (( fails )) && exit 1
+echo "OK: conversions equal the card's on the fast paths, the general path and every SIMD level"
 echo "OK: fast paths and general path agree ($(grep -c 'counters' "$work/fast.txt") launches' counters compared)"

@@ -757,10 +757,119 @@ static int run_bcast(const char* name) {
 
 static int g_dump_form = -1;       // `sass_fastpath dump <form>`: also print the inputs and results of one conv_forms form
 static bool g_list_forms = false;  // `sass_fastpath forms`: one line per conv_forms form (to see which one differs on a card)
+static bool g_card_forms = false;  // `sass_fastpath cardforms`: only the conv_forms lines, one per form, regime and shape (the card file's)
+// conv_forms over special values and random bits; one hash line per form and shape (or, with `cardforms`, only those lines).
+static int run_conv_forms() {
+  {
+    const uint32_t fsp[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u,
+                            0x3f800000u, 0xbf800000u, 0x3f000000u, 0xbf000000u, 0x3fc00000u, 0x40000000u, 0x7f7fffffu, 0xff7fffffu,
+                            0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00000u, 0x7fc12345u, 0x7f800001u, 0x4b000000u, 0x4b800001u,
+                            0x33800000u, 0x3f800001u, 0x4f000000u, 0xcf000000u, 0x4f800000u, 0x5f000000u, 0xdf000000u, 0x5f800000u,
+                            0x477fe000u, 0x477ff000u, 0x38000000u, 0x33000000u, 0x33000001u, 0x3f7fffffu, 0x40490fdbu, 0x4effffffu,
+                            0x47800000u, 0xc7800000u, 0x7bffu, 0x3b800000u};
+    const uint64_t dsp[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x0000000000000001ull, 0x000fffffffffffffull, 0x0010000000000000ull,
+                            0x3ff0000000000000ull, 0xbff0000000000000ull, 0x3ff0000000000001ull, 0x7fefffffffffffffull, 0x7ff0000000000000ull,
+                            0xfff0000000000000ull, 0x7ff8000000000000ull, 0xfff8000000000000ull, 0x7ff0000000000001ull, 0x4000000000000000ull,
+                            0x3fb999999999999aull, 0x3ca0000000000000ull, 0x43e0000000000000ull /* 2^63 */, 0xc3e0000000000000ull /* -2^63 */,
+                            0x43dfffffffffffffull /* just below 2^63 */, 0x43f0000000000000ull /* 2^64 */, 0x43efffffffffffffull,
+                            0x41dfffffffc00000ull /* 2^31 - 1 */, 0x41e0000000000000ull /* 2^31 */, 0xc1e0000000000000ull, 0xc1e0000000200000ull,
+                            0x41efffffffe00000ull /* 2^32 - 1 */, 0x41f0000000000000ull, 0x3fe0000000000000ull, 0xbfe0000000000000ull,
+                            0x3fe0000000000001ull, 0x3ff8000000000000ull, 0x4004000000000000ull, 0x40f0000000000000ull /* 65536 */,
+                            0x380ffffffe000000ull /* near the f32 subnormals */, 0x47efffffe0000000ull /* f32 max */, 0x47effffff0000000ull,
+                            0x3e70000000000000ull /* 2^-24 */, 0x3e60000000000000ull, 0x40effc0000000000ull /* 65504 */, 0x40effe0000000000ull};
+    const uint16_t hsp[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e00, 0xfe00,
+                            0x7c01, 0x4000, 0x3555, 0x5640, 0x3800, 0x4200, 0xc200, 0x6400, 0x5bff, 0x3bff};
+    const uint16_t bsp[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x007f, 0x0080, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x7f80, 0xff80, 0x7fc0, 0x7f81,
+                            0xffc1, 0x4049, 0x4f80, 0x3fc0, 0x3f81, 0x4000, 0xc000, 0x3f00, 0x4300, 0x7f00};
+    const int n = 32 * 11 + 7;
+    std::vector<float> hf(n);
+    std::vector<double> hd(n);
+    std::vector<uint32_t> hw(n);
+    std::vector<uint64_t> hl(n);
+    uint64_t s = 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < n; ++i) {
+      s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+      const uint32_t fb = i % 3 == 0 ? static_cast<uint32_t>(s) : fsp[s % (sizeof fsp / sizeof fsp[0])];
+      std::memcpy(&hf[i], &fb, 4);
+      const uint64_t db = i % 4 == 0 ? s : dsp[(s >> 5) % (sizeof dsp / sizeof dsp[0])];
+      std::memcpy(&hd[i], &db, 8);
+      // Words made of two halves (the low half of the word a half; a pair of bfloat16 comes from the second draw), or random.
+      hw[i] = i % 5 == 0 ? static_cast<uint32_t>(s >> 11)
+                         : static_cast<uint32_t>(hsp[(s >> 9) % (sizeof hsp / sizeof hsp[0])]) | static_cast<uint32_t>(i % 2 ? bsp[(s >> 17) % (sizeof bsp / sizeof bsp[0])] : hsp[(s >> 17) % (sizeof hsp / sizeof hsp[0])]) << 16;
+      // 64-bit integers: random, small, the edges of 2^24, 2^53, 2^63 and 2^64, and sign extensions of 32-bit values.
+      static const uint64_t lsp[] = {0ull, 1ull, ~0ull, 0x8000000000000000ull, 0x7fffffffffffffffull, 0x0000000100000000ull, 0xffffffff00000000ull,
+                                     0x0000000001000001ull, 0x0020000000000001ull, 0x0020000000000003ull, 0x00ffffffffffffffull,
+                                     0x8000000000000400ull, 0x8000008000000001ull, 0xfffffffffffffc01ull, 0x00000000ffffffffull, 0x0000000080000000ull};
+      hl[i] = i % 3 == 0 ? s : lsp[(s >> 7) % (sizeof lsp / sizeof lsp[0])];
+    }
+    float* dfin; double* ddin; uint32_t *dwin, *dout; uint64_t* dlin;
+    CK(cudaMalloc(&dfin, n * 4)); CK(cudaMalloc(&ddin, n * 8)); CK(cudaMalloc(&dwin, n * 4)); CK(cudaMalloc(&dlin, n * 8));
+    CK(cudaMalloc(&dout, static_cast<size_t>(n) * kConvForms * 4));
+    // Two regimes of inputs. The first is the special values above, which put an out-of-range lane in nearly every warp (a 64-bit
+    // conversion with such a lane is left to the general path, and says so by agreeing with it). The second keeps every value
+    // inside the 64-bit ranges -- fractions, ties, zeros of both signs, NaNs -- so that those conversions take the 32-lane path.
+    for (int regime = 0; regime < 3; ++regime) {
+      if (regime == 2) {
+        // The same without a NaN or an infinity anywhere: what an RTX 3060 and the simulator agree on (their NaNs differ in payload and
+        // sign, and in what a conversion to an integer makes of one).
+        for (int i = 0; i < n; ++i) {
+          if (!(hd[i] == hd[i]) || std::fabs(hd[i]) > 1.0e300) hd[i] = 0.75;
+          if (!(hf[i] == hf[i]) || std::fabs(hf[i]) > 1.0e30f) hf[i] = 0.75f;
+          static const uint16_t fin_h[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x4000, 0x3555, 0x5640, 0x3800, 0x4200, 0xc200};
+          static const uint16_t fin_b[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x007f, 0x0080, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x4049, 0x4f80, 0x3fc0, 0x4000, 0xc000, 0x3f00};
+          hw[i] = static_cast<uint32_t>(fin_h[(i * 7 + 3) % 16]) | static_cast<uint32_t>(i % 2 ? fin_b[(i * 5 + 1) % 16] : fin_h[(i * 5 + 1) % 16]) << 16;
+        }
+      }
+      if (regime == 1) {
+        for (int i = 0; i < n; ++i) {
+          s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+          const double m = static_cast<double>(static_cast<int64_t>(s >> 11) % 1000000007ll) * (i % 2 ? 0.25 : 1.0 / 1024.0);
+          const double v = i % 7 == 0 ? static_cast<double>(static_cast<int>(s % 9) - 4) + (i % 2 ? 0.5 : 0.0)
+                         : i % 11 == 0 ? -0.0 : i % 13 == 0 ? std::nan("") : (i % 5 == 0 ? m * 1.0e6 : m);
+          hd[i] = v;
+          hf[i] = static_cast<float>(i % 17 == 0 ? 0.5 + (s % 5) : i % 19 == 0 ? -0.0 : v * 1.0e-3);
+        }
+      }
+      CK(cudaMemcpy(dfin, hf.data(), n * 4, cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(ddin, hd.data(), n * 8, cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dwin, hw.data(), n * 4, cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dlin, hl.data(), n * 8, cudaMemcpyHostToDevice));
+      for (int shape = 0; shape < 3; ++shape) {
+        CK(cudaMemset(dout, 0, static_cast<size_t>(n) * kConvForms * 4));
+        conv_forms<<<(n + 63) / 64, 64>>>(dfin, ddin, dwin, dlin, dout, n, shape);
+        CK(cudaDeviceSynchronize());
+        std::vector<uint32_t> got(static_cast<size_t>(n) * kConvForms);
+        CK(cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost));
+        if (g_dump_form >= 0 && g_dump_form < kConvForms)
+          for (int i = 0; i < n; ++i) {
+            uint32_t fb_; uint64_t db_;
+            std::memcpy(&fb_, &hf[i], 4); std::memcpy(&db_, &hd[i], 8);
+            std::printf("dump regime=%d shape=%d form=%d lane=%d f=%08x d=%016llx w=%08x l=%016llx -> %08x\n", regime, shape, g_dump_form, i, fb_,
+                        static_cast<unsigned long long>(db_), hw[i], static_cast<unsigned long long>(hl[i]), got[static_cast<size_t>(g_dump_form) * n + i]);
+          }
+        // One line for the launch (the lines are compared between runs together with the counters, which the runtime prints on its own
+        // schedule: a short output keeps the two from meeting), or one per form with `forms`.
+        uint64_t all = 1469598103934665603ull;
+        for (int f = 0; f < kConvForms; ++f) {
+          uint64_t hh = 1469598103934665603ull;
+          for (int i = 0; i < n; ++i) hh = (hh ^ got[static_cast<size_t>(f) * n + i]) * 1099511628211ull;
+          all = (all ^ hh) * 1099511628211ull;
+          if (g_list_forms) std::printf("conv_forms regime=%d shape=%d form=%03d bits %016llx\n", regime, shape, f, static_cast<unsigned long long>(hh));
+        }
+        if (!g_list_forms) std::printf("conv_forms regime=%d shape=%d bits %016llx\n", regime, shape, static_cast<unsigned long long>(all));
+      }
+    }
+    CK(cudaFree(dfin)); CK(cudaFree(ddin)); CK(cudaFree(dwin)); CK(cudaFree(dlin)); CK(cudaFree(dout));
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc > 2 && std::string(argv[1]) == "dump") g_dump_form = std::atoi(argv[2]);
   else if (argc > 1 && std::string(argv[1]) == "forms") g_list_forms = true;
+  else if (argc > 1 && std::string(argv[1]) == "cardforms") g_card_forms = g_list_forms = true;
   else if (argc > 1) return run_fault(argv[1]);
+  if (g_card_forms) return run_conv_forms();
   for (int n : {1, 31, 32, 33, 1000, 4096 + 5}) {
     if (run_copy<uint8_t>("u8", n) || run_copy<uint16_t>("u16", n) || run_copy<uint32_t>("u32", n) ||
         run_copy<uint64_t>("u64", n) || run_copy<float>("f32", n) || run_copy<Q>("q16", n))
@@ -1241,108 +1350,7 @@ int main(int argc, char** argv) {
     }
     CK(cudaFree(din)); CK(cudaFree(dout)); CK(cudaFree(ddin)); CK(cudaFree(ddout));
   }
-  {
-    // conv_forms over special values and random bits; one hash line per form and shape.
-    const uint32_t fsp[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u,
-                            0x3f800000u, 0xbf800000u, 0x3f000000u, 0xbf000000u, 0x3fc00000u, 0x40000000u, 0x7f7fffffu, 0xff7fffffu,
-                            0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00000u, 0x7fc12345u, 0x7f800001u, 0x4b000000u, 0x4b800001u,
-                            0x33800000u, 0x3f800001u, 0x4f000000u, 0xcf000000u, 0x4f800000u, 0x5f000000u, 0xdf000000u, 0x5f800000u,
-                            0x477fe000u, 0x477ff000u, 0x38000000u, 0x33000000u, 0x33000001u, 0x3f7fffffu, 0x40490fdbu, 0x4effffffu,
-                            0x47800000u, 0xc7800000u, 0x7bffu, 0x3b800000u};
-    const uint64_t dsp[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x0000000000000001ull, 0x000fffffffffffffull, 0x0010000000000000ull,
-                            0x3ff0000000000000ull, 0xbff0000000000000ull, 0x3ff0000000000001ull, 0x7fefffffffffffffull, 0x7ff0000000000000ull,
-                            0xfff0000000000000ull, 0x7ff8000000000000ull, 0xfff8000000000000ull, 0x7ff0000000000001ull, 0x4000000000000000ull,
-                            0x3fb999999999999aull, 0x3ca0000000000000ull, 0x43e0000000000000ull /* 2^63 */, 0xc3e0000000000000ull /* -2^63 */,
-                            0x43dfffffffffffffull /* just below 2^63 */, 0x43f0000000000000ull /* 2^64 */, 0x43efffffffffffffull,
-                            0x41dfffffffc00000ull /* 2^31 - 1 */, 0x41e0000000000000ull /* 2^31 */, 0xc1e0000000000000ull, 0xc1e0000000200000ull,
-                            0x41efffffffe00000ull /* 2^32 - 1 */, 0x41f0000000000000ull, 0x3fe0000000000000ull, 0xbfe0000000000000ull,
-                            0x3fe0000000000001ull, 0x3ff8000000000000ull, 0x4004000000000000ull, 0x40f0000000000000ull /* 65536 */,
-                            0x380ffffffe000000ull /* near the f32 subnormals */, 0x47efffffe0000000ull /* f32 max */, 0x47effffff0000000ull,
-                            0x3e70000000000000ull /* 2^-24 */, 0x3e60000000000000ull, 0x40effc0000000000ull /* 65504 */, 0x40effe0000000000ull};
-    const uint16_t hsp[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e00, 0xfe00,
-                            0x7c01, 0x4000, 0x3555, 0x5640, 0x3800, 0x4200, 0xc200, 0x6400, 0x5bff, 0x3bff};
-    const uint16_t bsp[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x007f, 0x0080, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x7f80, 0xff80, 0x7fc0, 0x7f81,
-                            0xffc1, 0x4049, 0x4f80, 0x3fc0, 0x3f81, 0x4000, 0xc000, 0x3f00, 0x4300, 0x7f00};
-    const int n = 32 * 11 + 7;
-    std::vector<float> hf(n);
-    std::vector<double> hd(n);
-    std::vector<uint32_t> hw(n);
-    std::vector<uint64_t> hl(n);
-    uint64_t s = 0x9E3779B97F4A7C15ull;
-    for (int i = 0; i < n; ++i) {
-      s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-      const uint32_t fb = i % 3 == 0 ? static_cast<uint32_t>(s) : fsp[s % (sizeof fsp / sizeof fsp[0])];
-      std::memcpy(&hf[i], &fb, 4);
-      const uint64_t db = i % 4 == 0 ? s : dsp[(s >> 5) % (sizeof dsp / sizeof dsp[0])];
-      std::memcpy(&hd[i], &db, 8);
-      // Words made of two halves (the low half of the word a half; a pair of bfloat16 comes from the second draw), or random.
-      hw[i] = i % 5 == 0 ? static_cast<uint32_t>(s >> 11)
-                         : static_cast<uint32_t>(hsp[(s >> 9) % (sizeof hsp / sizeof hsp[0])]) | static_cast<uint32_t>(i % 2 ? bsp[(s >> 17) % (sizeof bsp / sizeof bsp[0])] : hsp[(s >> 17) % (sizeof hsp / sizeof hsp[0])]) << 16;
-      // 64-bit integers: random, small, the edges of 2^24, 2^53, 2^63 and 2^64, and sign extensions of 32-bit values.
-      static const uint64_t lsp[] = {0ull, 1ull, ~0ull, 0x8000000000000000ull, 0x7fffffffffffffffull, 0x0000000100000000ull, 0xffffffff00000000ull,
-                                     0x0000000001000001ull, 0x0020000000000001ull, 0x0020000000000003ull, 0x00ffffffffffffffull,
-                                     0x8000000000000400ull, 0x8000008000000001ull, 0xfffffffffffffc01ull, 0x00000000ffffffffull, 0x0000000080000000ull};
-      hl[i] = i % 3 == 0 ? s : lsp[(s >> 7) % (sizeof lsp / sizeof lsp[0])];
-    }
-    float* dfin; double* ddin; uint32_t *dwin, *dout; uint64_t* dlin;
-    CK(cudaMalloc(&dfin, n * 4)); CK(cudaMalloc(&ddin, n * 8)); CK(cudaMalloc(&dwin, n * 4)); CK(cudaMalloc(&dlin, n * 8));
-    CK(cudaMalloc(&dout, static_cast<size_t>(n) * kConvForms * 4));
-    // Two regimes of inputs. The first is the special values above, which put an out-of-range lane in nearly every warp (a 64-bit
-    // conversion with such a lane is left to the general path, and says so by agreeing with it). The second keeps every value
-    // inside the 64-bit ranges -- fractions, ties, zeros of both signs, NaNs -- so that those conversions take the 32-lane path.
-    for (int regime = 0; regime < 3; ++regime) {
-      if (regime == 2) {
-        // The same without a NaN or an infinity anywhere: what an RTX 3060 and the simulator agree on (their NaNs differ in payload and
-        // sign, and in what a conversion to an integer makes of one).
-        for (int i = 0; i < n; ++i) {
-          if (!(hd[i] == hd[i]) || std::fabs(hd[i]) > 1.0e300) hd[i] = 0.75;
-          if (!(hf[i] == hf[i]) || std::fabs(hf[i]) > 1.0e30f) hf[i] = 0.75f;
-          static const uint16_t fin_h[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x4000, 0x3555, 0x5640, 0x3800, 0x4200, 0xc200};
-          static const uint16_t fin_b[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x007f, 0x0080, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x4049, 0x4f80, 0x3fc0, 0x4000, 0xc000, 0x3f00};
-          hw[i] = static_cast<uint32_t>(fin_h[(i * 7 + 3) % 16]) | static_cast<uint32_t>(i % 2 ? fin_b[(i * 5 + 1) % 16] : fin_h[(i * 5 + 1) % 16]) << 16;
-        }
-      }
-      if (regime == 1) {
-        for (int i = 0; i < n; ++i) {
-          s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-          const double m = static_cast<double>(static_cast<int64_t>(s >> 11) % 1000000007ll) * (i % 2 ? 0.25 : 1.0 / 1024.0);
-          const double v = i % 7 == 0 ? static_cast<double>(static_cast<int>(s % 9) - 4) + (i % 2 ? 0.5 : 0.0)
-                         : i % 11 == 0 ? -0.0 : i % 13 == 0 ? std::nan("") : (i % 5 == 0 ? m * 1.0e6 : m);
-          hd[i] = v;
-          hf[i] = static_cast<float>(i % 17 == 0 ? 0.5 + (s % 5) : i % 19 == 0 ? -0.0 : v * 1.0e-3);
-        }
-      }
-      CK(cudaMemcpy(dfin, hf.data(), n * 4, cudaMemcpyHostToDevice));
-      CK(cudaMemcpy(ddin, hd.data(), n * 8, cudaMemcpyHostToDevice));
-      CK(cudaMemcpy(dwin, hw.data(), n * 4, cudaMemcpyHostToDevice));
-      CK(cudaMemcpy(dlin, hl.data(), n * 8, cudaMemcpyHostToDevice));
-      for (int shape = 0; shape < 3; ++shape) {
-        CK(cudaMemset(dout, 0, static_cast<size_t>(n) * kConvForms * 4));
-        conv_forms<<<(n + 63) / 64, 64>>>(dfin, ddin, dwin, dlin, dout, n, shape);
-        CK(cudaDeviceSynchronize());
-        std::vector<uint32_t> got(static_cast<size_t>(n) * kConvForms);
-        CK(cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost));
-        if (g_dump_form >= 0 && g_dump_form < kConvForms)
-          for (int i = 0; i < n; ++i) {
-            uint32_t fb_; uint64_t db_;
-            std::memcpy(&fb_, &hf[i], 4); std::memcpy(&db_, &hd[i], 8);
-            std::printf("dump regime=%d shape=%d form=%d lane=%d f=%08x d=%016llx w=%08x l=%016llx -> %08x\n", regime, shape, g_dump_form, i, fb_,
-                        static_cast<unsigned long long>(db_), hw[i], static_cast<unsigned long long>(hl[i]), got[static_cast<size_t>(g_dump_form) * n + i]);
-          }
-        // One line for the launch (the lines are compared between runs together with the counters, which the runtime prints on its own
-        // schedule: a short output keeps the two from meeting), or one per form with `forms`.
-        uint64_t all = 1469598103934665603ull;
-        for (int f = 0; f < kConvForms; ++f) {
-          uint64_t hh = 1469598103934665603ull;
-          for (int i = 0; i < n; ++i) hh = (hh ^ got[static_cast<size_t>(f) * n + i]) * 1099511628211ull;
-          all = (all ^ hh) * 1099511628211ull;
-          if (g_list_forms) std::printf("conv_forms regime=%d shape=%d form=%03d bits %016llx\n", regime, shape, f, static_cast<unsigned long long>(hh));
-        }
-        if (!g_list_forms) std::printf("conv_forms regime=%d shape=%d bits %016llx\n", regime, shape, static_cast<unsigned long long>(all));
-      }
-    }
-    CK(cudaFree(dfin)); CK(cudaFree(ddin)); CK(cudaFree(dwin)); CK(cudaFree(dlin)); CK(cudaFree(dout));
-  }
+  if (run_conv_forms()) return 1;
   std::printf("wrong: %d\n", wrong);
   return wrong != 0;
 }

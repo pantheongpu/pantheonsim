@@ -982,13 +982,113 @@ uint16_t f32_to_bf16(float f) {
   return static_cast<uint16_t>(b >> 16);
 }
 uint16_t f64_to_bf16(double d) {
-  // Round once, from double: bf16 has 8 bits of mantissa, and going through
-  // float first could round twice.
-  if (d != d) return 0x7fc0;
-  const float f = static_cast<float>(d);
-  const double back = static_cast<double>(bf16_to_f32(f32_to_bf16(f)));
-  (void)back;
-  return f32_to_bf16(f);
+  // Rounded once, from the double: HFMA2.BF16_V2's fused result is a single rounding of the exact product and sum (an RTX 3060: going through
+  // a float first rounded twice and differed in the last place).
+  if (d != d) return 0x7fff;
+  return static_cast<uint16_t>(simd::narrow_from_double(d, 4, 0));
+}
+
+
+// ---- conversions between the float formats and the integers, as an RTX 3060 does them ----
+// Probed element by element with conv_forms (nvidia/tests/e2e/sass_fastpath.cu) and float_half_forms.cu:
+//   * a NaN source is not touched by the instruction's |x| and -x: its sign and payload are the register's;
+//   * F2I of a NaN is 0, except 1 << (bits - 1) when the source is an f64 or the result is 64 bits wide;
+//   * F2I saturates at both ends of every integer range (a signed 64-bit result at or past 2^63 is 0x7fff...f);
+//   * a NaN to f16 or bf16 is 0x7fff (from an f64 to f16: sign, 0x7e00 and the payload's top ten bits); a NaN to f32 from f16 is
+//     0x7fffffff, from f64 the narrowed payload; a NaN to f64 keeps its sign and payload, quieted; FRND of a NaN is 0x7fffffff /
+//     0x7fff, or for an f64 the NaN quieted;
+//   * F2F to f16 or bf16, and I2F to f16 or bf16, honour the rounding mode, and round once (I2F from the integer itself).
+// `raw` is the source's bits in its own width (an f16's 16, taken from the half the instruction selects), `ssize` 1 f16, 2 f32, 3 f64.
+
+// A half (or bf16) with a subnormal flushed to the zero of its sign, if `fz`.
+inline uint16_t fz_half(uint16_t h, bool bf, bool fz) {
+  return fz && (h & (bf ? 0x7f80u : 0x7c00u)) == 0 ? static_cast<uint16_t>(h & 0x8000u) : h;
+}
+inline double cv_value(uint64_t raw, unsigned ssize, bool ab, bool ng) {
+  double x = ssize == 3 ? as_f64(raw) : ssize == 1 ? static_cast<double>(simd::f16_to_f32(static_cast<uint16_t>(raw))) : static_cast<double>(as_f32(static_cast<uint32_t>(raw)));
+  if (x == x) {
+    if (ab) x = std::fabs(x);
+    if (ng) x = -x;
+  }
+  return x;
+}
+
+using simd::narrow_core;
+using simd::narrow_from_double;
+// A 64-bit integer magnitude to f16 or bf16, once, in mode `rnd`.
+inline uint32_t narrow_from_int(bool neg, uint64_t mag, unsigned dsize, unsigned rnd) {
+  const unsigned mb = dsize == 1 ? 10 : 7, eb = dsize == 1 ? 5 : 8;
+  if (mag == 0) return 0;   // +0 (an integer zero has no sign)
+  const int z = std::countl_zero(mag);
+  return narrow_core(neg, mag << z, 63 - z, mb, eb, rnd);
+}
+
+inline uint64_t cv_f2i(uint64_t raw, unsigned ssize, bool ab, bool ng, bool fz, unsigned dsize, bool sgn, unsigned rnd) {
+  if (fz && ssize == 2) raw = f32_bits(ftz(as_f32(static_cast<uint32_t>(raw))));
+  double x = cv_value(raw, ssize, ab, ng);
+  const unsigned bits = 8u << dsize;
+  if (x != x) return (ssize == 3 || dsize == 3) ? uint64_t{1} << (bits - 1) : 0;
+  switch (rnd) {
+    case 0: x = std::nearbyint(x); break;
+    case 1: x = std::floor(x); break;
+    case 2: x = std::ceil(x); break;
+    default: x = std::trunc(x); break;
+  }
+  if (sgn) {
+    const double lim = std::ldexp(1.0, static_cast<int>(bits) - 1);
+    const int64_t imax = bits == 64 ? INT64_MAX : (int64_t{1} << (bits - 1)) - 1;   // (2^63 - 1 is not a double)
+    if (x <= -lim) return static_cast<uint64_t>(-imax - 1);
+    if (x >= lim) return static_cast<uint64_t>(imax);
+    return static_cast<uint64_t>(static_cast<int64_t>(x));
+  }
+  if (x <= 0) return 0;
+  const double lim = std::ldexp(1.0, static_cast<int>(bits));
+  if (x >= lim) return bits == 64 ? ~uint64_t{0} : (uint64_t{1} << bits) - 1;
+  return static_cast<uint64_t>(x);
+}
+
+// F2F: the result's bits (a 64-bit pair for dsize 3). `dsize` 1 f16, 2 f32, 3 f64, 4 bf16.
+inline uint64_t cv_f2f(uint64_t raw, unsigned ssize, bool ab, bool ng, unsigned dsize, unsigned rnd) {
+  double x = cv_value(raw, ssize, ab, ng);
+  if (x != x) {
+    const uint64_t sign = ssize == 3 ? raw >> 63 : ssize == 2 ? (raw >> 31) & 1 : (raw >> 15) & 1;
+    const uint64_t mant52 = ssize == 3 ? raw & ((uint64_t{1} << 52) - 1) : ssize == 2 ? (raw & 0x7fffff) << 29 : (raw & 0x3ff) << 42;
+    switch (dsize) {
+      case 3: return (sign << 63) | 0x7ff8000000000000ull | mant52;
+      case 2: return ssize == 3 ? f32_bits(static_cast<float>(as_f64(raw))) : 0x7fffffffu;
+      case 1: return ssize == 3 ? static_cast<uint64_t>((sign << 15) | 0x7e00u | (mant52 >> 42)) : 0x7fffu;
+      default: return 0x7fffu;
+    }
+  }
+  switch (dsize) {
+    case 3: return f64_bits(x);
+    case 2: return f32_bits(rounded(ssize == 3 ? rnd : 0u, [&] { return static_cast<float>(x); }));
+    case 1: return rnd ? narrow_from_double(x, 1, rnd) : f64_to_half(x);
+    default: return rnd ? narrow_from_double(x, 4, rnd) : f32_to_bf16(static_cast<float>(x));
+  }
+}
+
+inline uint64_t cv_frnd(uint64_t raw, unsigned ssz, bool ab, bool ng, bool fz, unsigned dsz, unsigned rnd) {
+  if (fz && ssz == 2) raw = f32_bits(ftz(as_f32(static_cast<uint32_t>(raw))));
+  double x = cv_value(raw, ssz, ab, ng);
+  if (x != x) {
+    if (dsz == 3) {
+      const uint64_t sign = ssz == 2 ? (raw >> 31) & 1 : (raw >> 15) & 1;
+      const uint64_t b = ssz == 3 ? raw : (sign << 63) | (ssz == 2 ? (raw & 0x7fffff) << 29 : (raw & 0x3ff) << 42);
+      return b | 0x7ff8000000000000ull;
+    }
+    return dsz == 1 ? 0x7fffu : 0x7fffffffu;
+  }
+  switch (rnd) {
+    case 1: x = std::floor(x); break;
+    case 2: x = std::ceil(x); break;
+    case 3: x = std::trunc(x); break;
+    default: x = std::nearbyint(x); break;
+  }
+  if (dsz == 3) return f64_bits(x);
+  if (dsz == 1) return f64_to_half(x);
+  const float f = static_cast<float>(x);
+  return f32_bits(fz ? ftz(f) : f);
 }
 
 }  // namespace
@@ -1017,7 +1117,7 @@ struct RoundingScope {
 // `part_shift` for .H1/.B1-.B3), taken as a signed or unsigned integer of `ssize` (0 8 bits ... 3 64 bits), and converted to
 // binary64 (dsize 3), binary16 (1), bfloat16 (4) or binary32 in the host's current rounding mode (the narrow formats from the
 // float, as the general rule does).
-[[gnu::noinline]] void i2f_wide_loop(unsigned dsize, unsigned ssize, bool sgn, unsigned part_shift, const uint64_t* v64,
+[[gnu::noinline]] void i2f_wide_loop(unsigned dsize, unsigned ssize, bool sgn, unsigned part_shift, unsigned rnd, const uint64_t* v64,
                                      const uint32_t* row, uint32_t* lo, uint32_t* hi) {
   for (unsigned l = 0; l < 32; ++l) {
     uint64_t v = ssize == 3 ? v64[l] : row[l];
@@ -1035,9 +1135,12 @@ struct RoundingScope {
       const uint64_t b = f64_bits(d);
       lo[l] = static_cast<uint32_t>(b);
       hi[l] = static_cast<uint32_t>(b >> 32);
+    } else if (dsize == 1 || dsize == 4) {   // f16 and bf16: once, from the integer, in the mode (an RTX 3060)
+      const bool neg = !u64 && sv < 0;
+      lo[l] = narrow_from_int(neg, u64 ? v : neg ? 0 - static_cast<uint64_t>(sv) : static_cast<uint64_t>(sv), dsize, rnd);
     } else {
       const float f = u64 ? static_cast<float>(v) : static_cast<float>(sv);
-      lo[l] = dsize == 1 ? f32_to_half(f) : dsize == 4 ? f32_to_bf16(f) : f32_bits(f);
+      lo[l] = f32_bits(f);
     }
   }
 }
@@ -1826,6 +1929,16 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
     store_row(d.reg, lo);
     if (d.reg + 1 != kRZ) store_row(d.reg + 1, hi);
   };
+  // A conversion's source in its own width, 32 lanes (cvt_raw of exec_float, over the rows): an f64's 64 bits, an f32's, or the half an
+  // f16 source selects; no |x| or -x yet (the conversion applies them, except to a NaN).
+  const auto load_cvt_raw = [&](const Operand& o, unsigned ssize, unsigned part, uint64_t* out) {
+    if (ssize == 3) {
+      pair64(o, false, out);
+    } else {
+      const uint32_t* row = lanes(0, o, false);
+      for (unsigned l = 0; l < 32; ++l) out[l] = ssize == 1 ? (row[l] >> (16 * part)) & 0xffffu : row[l];
+    }
+  };
   // `body` with the host's rounding mode set to SASS's `rnd` (the executor's `rounded`, once for the 32 lanes).
   const auto in_mode = [&](unsigned rnd, auto&& body) {
     if (rnd) {
@@ -2110,9 +2223,6 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       const bool sgn = ins.op == Op::I2FP ? ins.f[0] != 0 : ins.f[2] != 0;
       const unsigned rnd = ins.op == Op::I2FP ? ins.f[1] : ins.f[3];
       if (ins.src.empty() || ins.dst[0].kind != Kind::Reg || !(ssize == 3 ? wide_ok(ins.src[0]) : plain(ins.src[0]))) return false;
-      // (An f16 or bf16 result under a rounding mode is rounded twice by the general rule -- to f32 in the mode, then to the narrow format
-      // to nearest -- where an RTX 3060 rounds once: left to the general rule.)
-      if (rnd && (dsize == 1 || dsize == 4)) return false;
       if (dsize == 2 && ssize <= 2) {
         const uint32_t* src = lanes(0, ins.src[0], false);
         in_mode(rnd, [&] {
@@ -2141,7 +2251,7 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       else row = lanes(0, ins.src[0], false);
       alignas(32) uint32_t lo[32], hi[32];
       const unsigned part_shift = ins.op == Op::I2F && ssize < 2 ? (ssize == 1 ? 16u : 8u) * ins.f[4] : 0u;
-      in_mode(rnd, [&] { i2f_wide_loop(dsize, ssize, sgn, part_shift, v64, row, lo, hi); });
+      in_mode(rnd, [&] { i2f_wide_loop(dsize, ssize, sgn, part_shift, rnd, v64, row, lo, hi); });
       if (dsize == 3) store64(ins.dst[0], lo, hi);
       else if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, lo);
       return true;
@@ -2158,59 +2268,14 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
         return true;
       }
       if (!(ssize == 3 ? wide_ok(ins.src[0]) : plain(ins.src[0]))) return false;
-      alignas(32) double x[32];
-      if (ssize == 3) {
-        alignas(32) uint64_t v64[32];
-        pair64(ins.src[0], true, v64);
-        for (unsigned l = 0; l < 32; ++l) x[l] = as_f64(v64[l]);
-      } else if (ssize == 1) {
-        const uint32_t* raw = lanes(0, ins.src[0], false);
-        for (unsigned l = 0; l < 32; ++l) x[l] = half_to_f32(static_cast<uint16_t>(raw[l]));
-      } else {
-        const uint32_t* raw = lanes(0, ins.src[0], true);
-        for (unsigned l = 0; l < 32; ++l) {
-          float f = as_f32(raw[l]);
-          if (fz) f = ftz(f);
-          x[l] = f;
-        }
-      }
-      const unsigned bits = 8u << dsize;
-      const double lo_lim = -std::ldexp(1.0, static_cast<int>(bits) - 1), hi_sgn = std::ldexp(1.0, static_cast<int>(bits) - 1) - 1;
-      const double hi_uns = std::ldexp(1.0, static_cast<int>(bits)) - 1;
+      alignas(32) uint64_t raw64[32];
+      load_cvt_raw(ins.src[0], ssize, ins.f[5], raw64);
       alignas(32) uint32_t lo[32] = {}, hi[32] = {};
-      bool too_big = false;   // a 64-bit result the general rule's own clamp does not reach: left to it
       for (unsigned l = 0; l < 32; ++l) {
-        double v = x[l];
-        switch (rnd) {
-          case 0: v = std::nearbyint(v); break;
-          case 1: v = std::floor(v); break;
-          case 2: v = std::ceil(v); break;
-          default: v = std::trunc(v); break;
-        }
-        uint64_t res;
-        if (v != v) {
-          res = 0;
-        } else if (sgn) {
-          const double c = v < lo_lim ? lo_lim : v > hi_sgn ? hi_sgn : v;
-          if (c >= 9223372036854775808.0) {   // (the clamp's top end, 2^63 - 1, is 2^63 in a double: not an int64)
-            too_big |= ((ex >> l) & 1) != 0;
-            res = 0;
-          } else {
-            res = static_cast<uint64_t>(static_cast<int64_t>(c));
-          }
-        } else {
-          const double c = v < 0 ? 0.0 : v > hi_uns ? hi_uns : v;
-          if (c >= 18446744073709551616.0) {   // (likewise 2^64 - 1)
-            too_big |= ((ex >> l) & 1) != 0;
-            res = 0;
-          } else {
-            res = static_cast<uint64_t>(c);
-          }
-        }
+        const uint64_t res = cv_f2i(raw64[l], ssize, ins.src[0].abs, ins.src[0].neg, fz, dsize, sgn, rnd);
         lo[l] = static_cast<uint32_t>(res);
         hi[l] = static_cast<uint32_t>(res >> 32);
       }
-      if (too_big) return false;
       if (dsize == 3) store64(ins.dst[0], lo, hi);
       else if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, lo);
       return true;
@@ -2222,90 +2287,37 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       return true;
     }
     case Op::F2F: {
-      // Float to float among f16, bf16, f32 and f64 (a binary16 source is the low half of the register; the rounding mode matters
-      // for an f64 narrowed to f32 only; the other narrowings round to nearest even, as the general rule does).
+      // Float to float among f16, bf16, f32 and f64, lane by lane with the general rule's own functions (cv_f2f): the half select, the
+      // rounding mode of a narrowing, a NaN as an RTX 3060 writes it.
       const unsigned dsize = ins.f[0], ssize = ins.f[1], rnd = ins.f[3];
       if (ins.src.empty() || ins.dst[0].kind != Kind::Reg || !(ssize == 3 ? wide_ok(ins.src[0]) : plain(ins.src[0]))) return false;
-      // (A rounding mode on a conversion to f16 or bf16 is ignored by the general rule, which an RTX 3060 does not: left to it.)
-      if (rnd && dsize != 2 && dsize != 3) return false;
-      alignas(32) double x[32];
-      if (ssize == 3) {
-        alignas(32) uint64_t v64[32];
-        pair64(ins.src[0], true, v64);
-        for (unsigned l = 0; l < 32; ++l) x[l] = as_f64(v64[l]);
-      } else if (ssize == 1) {
-        const uint32_t* raw = lanes(0, ins.src[0], false);
-        for (unsigned l = 0; l < 32; ++l) x[l] = half_to_f32(static_cast<uint16_t>(raw[l]));
-      } else {
-        const uint32_t* raw = lanes(0, ins.src[0], true);
-        for (unsigned l = 0; l < 32; ++l) x[l] = as_f32(raw[l]);
-      }
+      alignas(32) uint64_t raw64[32];
+      load_cvt_raw(ins.src[0], ssize, ins.f[5], raw64);
       alignas(32) uint32_t lo[32], hi[32];
-      if (dsize == 3) {
-        for (unsigned l = 0; l < 32; ++l) {
-          const uint64_t b = f64_bits(x[l]);
-          lo[l] = static_cast<uint32_t>(b);
-          hi[l] = static_cast<uint32_t>(b >> 32);
-        }
-        store64(ins.dst[0], lo, hi);
-        return true;
+      for (unsigned l = 0; l < 32; ++l) {
+        const uint64_t res = cv_f2f(raw64[l], ssize, ins.src[0].abs, ins.src[0].neg, dsize, rnd);
+        lo[l] = static_cast<uint32_t>(res);
+        hi[l] = static_cast<uint32_t>(res >> 32);
       }
-      if (dsize == 4) {
-        for (unsigned l = 0; l < 32; ++l) lo[l] = f32_to_bf16(static_cast<float>(x[l]));
-      } else if (dsize == 2) {
-        in_mode(ssize == 3 ? rnd : 0u, [&] { f64_to_f32_loop(x, lo); });
-      } else {
-        for (unsigned l = 0; l < 32; ++l) lo[l] = f64_to_half(x[l]);
-      }
-      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, lo);
+      if (dsize == 3) store64(ins.dst[0], lo, hi);
+      else if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, lo);
       return true;
     }
     case Op::FRND: {
-      // Round to an integral value: f32, f16 or f64 in, f32, f16 or f64 out.
+      // Round to an integral value: f32, f16 or f64 in, f32, f16 or f64 out (cv_frnd, lane by lane).
       const unsigned rnd = ins.f[0], dsz = ins.f[2], ssz = ins.f[3];
       const bool fz = ins.f[1] != 0;
       if (ins.src.empty() || ins.dst[0].kind != Kind::Reg || !(ssz == 3 ? wide_ok(ins.src[0]) : plain(ins.src[0]))) return false;
-      alignas(32) double x[32];
-      if (ssz == 3) {
-        alignas(32) uint64_t v64[32];
-        pair64(ins.src[0], true, v64);
-        for (unsigned l = 0; l < 32; ++l) x[l] = as_f64(v64[l]);
-      } else if (ssz == 1) {
-        const uint32_t* raw = lanes(0, ins.src[0], false);
-        for (unsigned l = 0; l < 32; ++l) x[l] = half_to_f32(static_cast<uint16_t>(raw[l]));
-      } else {
-        const uint32_t* raw = lanes(0, ins.src[0], true);
-        for (unsigned l = 0; l < 32; ++l) {
-          float f = as_f32(raw[l]);
-          if (fz) f = ftz(f);
-          x[l] = f;
-        }
-      }
-      alignas(32) double y[32];
-      switch (rnd) {
-        case 1: for (unsigned l = 0; l < 32; ++l) y[l] = std::floor(x[l]); break;
-        case 2: for (unsigned l = 0; l < 32; ++l) y[l] = std::ceil(x[l]); break;
-        case 3: for (unsigned l = 0; l < 32; ++l) y[l] = std::trunc(x[l]); break;
-        default: for (unsigned l = 0; l < 32; ++l) y[l] = std::nearbyint(x[l]); break;   // (the host mode is to nearest even)
-      }
+      alignas(32) uint64_t raw64[32];
+      load_cvt_raw(ins.src[0], ssz, ins.f[5], raw64);
       alignas(32) uint32_t lo[32], hi[32];
-      if (dsz == 3) {
-        for (unsigned l = 0; l < 32; ++l) {
-          const uint64_t b = f64_bits(y[l]);
-          lo[l] = static_cast<uint32_t>(b);
-          hi[l] = static_cast<uint32_t>(b >> 32);
-        }
-        store64(ins.dst[0], lo, hi);
-        return true;
+      for (unsigned l = 0; l < 32; ++l) {
+        const uint64_t res = cv_frnd(raw64[l], ssz, ins.src[0].abs, ins.src[0].neg, fz, dsz, rnd);
+        lo[l] = static_cast<uint32_t>(res);
+        hi[l] = static_cast<uint32_t>(res >> 32);
       }
-      if (dsz == 1) {
-        for (unsigned l = 0; l < 32; ++l) lo[l] = f64_to_half(y[l]);
-      } else if (fz) {
-        for (unsigned l = 0; l < 32; ++l) lo[l] = f32_bits(ftz(static_cast<float>(y[l])));
-      } else {
-        for (unsigned l = 0; l < 32; ++l) lo[l] = f32_bits(static_cast<float>(y[l]));
-      }
-      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, lo);
+      if (dsz == 3) store64(ins.dst[0], lo, hi);
+      else if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, lo);
       return true;
     }
     case Op::HSETP2: case Op::HSET2: {
@@ -2314,9 +2326,7 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       const bool is_setp = ins.op == Op::HSETP2;
       const unsigned cmp = ins.f[0], bop = ins.f[1];
       const bool bf_result = ins.f[2] != 0, bf16 = ins.f[3] != 0, fz = ins.f[4] != 0;
-      // (.FTZ is left to the general rule. An RTX 3060 flushes the subnormal halves of a setp.ftz.f16x2 operand; the general rule flushes
-      // after converting to float, where a half is never subnormal. Whatever is made of that, it is decided in one place.)
-      if (ins.src.size() < 3 || !plain(ins.src[0]) || fz) return false;
+      if (ins.src.size() < 3 || !plain(ins.src[0])) return false;
       if (is_setp ? (ins.dst.size() < 2 || ins.dst[0].kind != Kind::Pred || ins.dst[1].kind != Kind::Pred)
                : ins.dst[0].kind != Kind::Reg)
         return false;
@@ -2324,7 +2334,8 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       const size_t next = imm_pair ? 3 : 2;
       if (!imm_pair && !plain(ins.src[1])) return false;
       if (ins.src.size() <= next || !is_pred(ins.src[next])) return false;
-      const auto conv = [&](uint16_t h) { return bf16 ? bf16_to_f32(h) : half_to_f32(h); };
+      // (.FTZ flushes the subnormal HALVES of the operands -- an RTX 3060 -- not the float they convert to, which is never subnormal.)
+      const auto conv = [&](uint16_t h) { return bf16 ? bf16_to_f32(fz_half(h, true, fz)) : half_to_f32(fz_half(h, false, fz)); };
       // The swizzle of a source: 0 none, 1 .H0_H0, 2 .H1_H1, 3 .F32.
       const auto mode_of = [](const Operand& o) { return o.suffix == ".H0_H0" ? 1 : o.suffix == ".H1_H1" ? 2 : o.suffix == ".F32" ? 3 : 0; };
       const auto halves = [&](uint32_t v, const Operand& o, int mode, float out[2]) {
@@ -2391,6 +2402,13 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
     if (o.abs) f = std::fabs(f);
     if (o.neg) f = -f;
     return f;
+  };
+  // A conversion's source in its own width: the bits of an f64 (an FImm's are its top 32), an f32, or the half of an f16 the instruction
+  // selects (`part`, .H1). The |x| and -x modifiers are applied by the conversion (cv_value), not to a NaN.
+  const auto cvt_raw = [&](const Operand& o, unsigned l, unsigned ssize, unsigned part) -> uint64_t {
+    if (ssize == 3) return o.kind == Kind::FImm && o.fwidth == 64 ? static_cast<uint64_t>(o.fbits) << 32 : read64(w, o, l);
+    const uint32_t v = read32(w, o, l);
+    return ssize == 1 ? (v >> (16 * part)) & 0xffffu : v;
   };
   const auto f64src = [&](const Operand& o, unsigned l) {
     double d = as_f64(o.kind == Kind::FImm && o.fwidth == 64 ? static_cast<uint64_t>(o.fbits) << 32 : read64(w, o, l));
@@ -2533,7 +2551,11 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
           default: sv = static_cast<int64_t>(v); break;
         }
         const bool u64 = ssize == 3 && !sgn;
-        if (dsize == 3) {
+        if (dsize == 1 || dsize == 4) {   // f16 and bf16: once, from the integer, in the mode
+          const bool neg = !u64 && sv < 0;
+          const uint64_t mag = u64 ? v : neg ? 0 - static_cast<uint64_t>(sv) : static_cast<uint64_t>(sv);
+          write32(w, ins.dst[0], l, narrow_from_int(neg, mag, dsize, rnd));
+        } else if (dsize == 3) {
           const double d = rounded(rnd, [&] { return u64 ? static_cast<double>(v) : static_cast<double>(sv); });
           write64(w, ins.dst[0], l, f64_bits(d));
         } else {
@@ -2549,26 +2571,7 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
       const unsigned dsize = ins.f[0], ssize = ins.f[1], rnd = ins.f[3];
       const bool sgn = ins.f[2];
       each_lane(ex, [&](unsigned l) {
-        double x;
-        if (ssize == 3) x = f64src(ins.src[0], l);
-        else if (ssize == 1) x = half_to_f32(static_cast<uint16_t>(read32(w, ins.src[0], l)));
-        else x = f32src(ins.src[0], l, ins.f[4] != 0);
-        switch (rnd) {
-          case 0: x = std::nearbyint(x); break;
-          case 1: x = std::floor(x); break;
-          case 2: x = std::ceil(x); break;
-          default: x = std::trunc(x); break;
-        }
-        const unsigned bits = 8u << dsize;
-        uint64_t r;
-        if (x != x) r = 0;
-        else if (sgn) {
-          const double lo = -std::ldexp(1.0, static_cast<int>(bits) - 1), hi = std::ldexp(1.0, static_cast<int>(bits) - 1) - 1;
-          r = static_cast<uint64_t>(static_cast<int64_t>(x < lo ? lo : x > hi ? hi : x));
-        } else {
-          const double hi = std::ldexp(1.0, static_cast<int>(bits)) - 1;
-          r = static_cast<uint64_t>(x < 0 ? 0 : x > hi ? hi : x);
-        }
+        const uint64_t r = cv_f2i(cvt_raw(ins.src[0], l, ssize, ins.f[5]), ssize, ins.src[0].abs, ins.src[0].neg, ins.f[4] != 0, dsize, sgn, rnd);
         if (dsize == 3) write64(w, ins.dst[0], l, r);
         else write32(w, ins.dst[0], l, static_cast<uint32_t>(r));
       });
@@ -2577,14 +2580,9 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
     case Op::F2F: {
       const unsigned dsize = ins.f[0], ssize = ins.f[1], rnd = ins.f[3];
       each_lane(ex, [&](unsigned l) {
-        double x;
-        if (ssize == 3) x = f64src(ins.src[0], l);
-        else if (ssize == 1) x = half_to_f32(static_cast<uint16_t>(read32(w, ins.src[0], l)));
-        else x = f32src(ins.src[0], l, false);
-        if (dsize == 3) write64(w, ins.dst[0], l, f64_bits(x));
-        else if (dsize == 4) write32(w, ins.dst[0], l, x != x && ssize != 3 ? 0x7fffu : f32_to_bf16(static_cast<float>(x)));
-        else if (dsize == 2) write32(w, ins.dst[0], l, f32_bits(rounded(rnd, [&] { return static_cast<float>(x); })));
-        else write32(w, ins.dst[0], l, x != x && ssize != 3 ? 0x7fffu : f64_to_half(x));   // (an f32 NaN is 0x7fff in either half format, an RTX 3060)
+        const uint64_t r = cv_f2f(cvt_raw(ins.src[0], l, ssize, ins.f[5]), ssize, ins.src[0].abs, ins.src[0].neg, dsize, rnd);
+        if (dsize == 3) write64(w, ins.dst[0], l, r);
+        else write32(w, ins.dst[0], l, static_cast<uint32_t>(r));
       });
       return;
     }
@@ -2762,7 +2760,8 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
         for (int i = 0; i < 2; ++i) {
           if (ins.op == Op::HADD2) r[i] = static_cast<double>(a[i]) + b[i];
           else if (ins.op == Op::HMUL2) r[i] = static_cast<double>(a[i]) * b[i];
-          else r[i] = std::fma(static_cast<double>(a[i]), static_cast<double>(b[i]), static_cast<double>(c[i]));
+          else r[i] = bf ? simd::fma_round_odd(static_cast<double>(a[i]), static_cast<double>(b[i]), static_cast<double>(c[i]))   // (rounded once to bf16 below)
+                         : std::fma(static_cast<double>(a[i]), static_cast<double>(b[i]), static_cast<double>(c[i]));
           if (st) r[i] = r[i] != r[i] ? 0.0 : std::clamp(r[i], 0.0, 1.0);
         }
         if (f32out) {
@@ -2847,23 +2846,10 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
     case Op::FRND: {
       const unsigned rnd = ins.f[0], dsz = ins.f[2], ssz = ins.f[3];
       const bool fz = ins.f[1];
-      const auto round = [&](double x) {
-        switch (rnd) {
-          case 1: return std::floor(x);
-          case 2: return std::ceil(x);
-          case 3: return std::trunc(x);
-          default: return std::nearbyint(x);   // the host mode is to-nearest-even
-        }
-      };
       each_lane(ex, [&](unsigned l) {
-        double x;
-        if (ssz == 3) x = f64src(ins.src[0], l);
-        else if (ssz == 1) x = half_to_f32(static_cast<uint16_t>(read32(w, ins.src[0], l)));
-        else x = f32src(ins.src[0], l, fz);
-        const double r = round(x);
-        if (dsz == 3) write64(w, ins.dst[0], l, f64_bits(r));
-        else if (dsz == 1) write32(w, ins.dst[0], l, f64_to_half(r));
-        else write32(w, ins.dst[0], l, f32_bits(fz ? ftz(static_cast<float>(r)) : static_cast<float>(r)));
+        const uint64_t r = cv_frnd(cvt_raw(ins.src[0], l, ssz, ins.f[5]), ssz, ins.src[0].abs, ins.src[0].neg, fz, dsz, rnd);
+        if (dsz == 3) write64(w, ins.dst[0], l, r);
+        else write32(w, ins.dst[0], l, static_cast<uint32_t>(r));
       });
       return;
     }
@@ -2876,10 +2862,8 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
     case Op::HSETP2: case Op::HSET2: {
       const unsigned cmp = ins.f[0], bop = ins.f[1];
       const bool bf_result = ins.f[2], bf16 = ins.f[3], fz = ins.f[4];
-      const auto conv = [&](uint16_t h) {
-        const float f = bf16 ? bf16_to_f32(h) : half_to_f32(h);
-        return fz ? ftz(f) : f;
-      };
+      // (.FTZ flushes the subnormal HALVES of the operands -- an RTX 3060 -- not the float they convert to, which is never subnormal.)
+      const auto conv = [&](uint16_t h) { return bf16 ? bf16_to_f32(fz_half(h, true, fz)) : half_to_f32(fz_half(h, false, fz)); };
       const auto halves = [&](const Operand& o, unsigned l, float out[2]) {
         const uint32_t v = read32(w, o, l);
         float lo = conv(static_cast<uint16_t>(v)), hi = conv(static_cast<uint16_t>(v >> 16));

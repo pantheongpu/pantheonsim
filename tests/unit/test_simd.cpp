@@ -533,31 +533,47 @@ VTEST(masked_kernels_at_every_level) {
 
 namespace {
 
-// A double to bfloat16 as the SASS executor's general form does it: to binary32 first (to nearest even), then to the nearest
-// bfloat16 (ties to the even one), a NaN the canonical 0x7fff. Written by choosing between the two neighbours by their distance,
-// not by the add-and-truncate the kernel uses.
+// A double to bfloat16 in one rounding (to nearest, ties to the even one), a NaN the canonical 0x7fff. Written by scaling to an integer
+// significand and rounding there, not by the integer arithmetic on the bits that the kernel uses.
 uint16_t ref_f64_to_bf16(double v) {
   if (v != v) return 0x7fff;
-  const float f = static_cast<float>(v);
-  if (f != f) return 0x7fff;
-  const uint32_t u = fb(f);
-  const uint32_t sign = u & 0x80000000u, mag = u & 0x7fffffffu;
-  if (mag >= 0x7f800000u) return static_cast<uint16_t>(u >> 16);   // an infinity
-  const uint32_t lo = mag & 0xffff0000u, hi = lo + 0x10000u;
-  const double dlo = static_cast<double>(asf(lo));
-  const double dhi = hi >= 0x7f800000u ? std::ldexp(1.0, 128) : static_cast<double>(asf(hi));
-  const double m = std::fabs(static_cast<double>(f));
-  uint32_t pick;
-  if (m - dlo < dhi - m) pick = lo;
-  else if (m - dlo > dhi - m) pick = hi;
-  else pick = ((lo >> 16) & 1) ? hi : lo;
-  return static_cast<uint16_t>((sign | pick) >> 16);
+  const uint16_t sign = std::signbit(v) ? 0x8000 : 0;
+  const double m = std::fabs(v);
+  if (m == 0) return sign;
+  if (std::isinf(m)) return sign | 0x7f80;
+  // Scale to an integer significand of 8 bits at the value's exponent (not below the smallest normal's), round to nearest even there
+  // (exact: the scaling is a power of two), scale back: the nearest bf16 value, whose bits are the top half of the float's.
+  const int e = std::max(std::ilogb(m), -126);
+  const double r = std::ldexp(std::nearbyint(std::ldexp(m, 7 - e)), e - 7);
+  if (r >= std::ldexp(1.0, 128)) return sign | 0x7f80;
+  return sign | static_cast<uint16_t>(fb(static_cast<float>(r)) >> 16);
+}
+
+// a * b + c rounded once to bfloat16: the fma in double rounded down and rounded up (the exact value lies between the two doubles, which
+// are adjacent when they differ), then the bfloat16 rounding of each; when they differ the exact value is on one side of the tie that
+// is one of the two (a double), and which one says which way it goes. (A single rounding to double first can land on the tie.)
+uint16_t ref_fma_bf16(double a, double b, double c) {
+  const int saved = std::fegetround();
+  std::fesetround(FE_DOWNWARD);
+  volatile double x = a, y = b, z = c;
+  const double lo = std::fma(x, y, z);
+  std::fesetround(FE_UPWARD);
+  const double hi = std::fma(x, y, z);
+  std::fesetround(saved);
+  if (lo != lo || hi != hi) return 0x7fff;
+  const uint16_t rl = ref_f64_to_bf16(lo), rh = ref_f64_to_bf16(hi);
+  if (lo == hi) return ref_f64_to_bf16(std::fma(a, b, c));   // exact (and a zero sum has the sign round-to-nearest gives it)
+  if (rl == rh) return rl;
+  // They differ: the tie between two bfloat16 values (a double whose mantissa is 1 followed by 44 zeros past the seventh bit) is lo or hi,
+  // and the exact value is strictly between them, so on the far side of the tie from it: lo a tie means above it (rh), hi a tie below (rl).
+  const auto is_tie = [](double v) { return (std::bit_cast<uint64_t>(v) & ((uint64_t{1} << 45) - 1)) == (uint64_t{1} << 44); };
+  return is_tie(lo) ? rh : rl;
 }
 
 }  // namespace
 
-// hfma2_bf_m: both bfloat16 halves of each word, a * b + c with the exact binary64 result rounded to binary32 and then to
-// bfloat16 (the executor's general form), on zeros, subnormals, the extremes, infinities, NaN payloads, cancellations and
+// hfma2_bf_m: both bfloat16 halves of each word, a * b + c with the exact binary64 result rounded once to
+// bfloat16 (the executor's general form; an RTX 3060 rounds once: through a float it rounded twice and differed in the last place), on zeros, subnormals, the extremes, infinities, NaN payloads, cancellations and
 // random words, with part of the lanes masked off and the destination aliasing a source.
 VTEST(hfma2_bf_m_at_every_level) {
   std::mt19937 rng(23);
@@ -604,7 +620,7 @@ VTEST(hfma2_bf_m_at_every_level) {
         uint32_t out = 0;
         for (unsigned h = 0; h < 2; ++h) {
           const auto cv = [&](uint32_t w) { return static_cast<double>(asf(((w >> (16 * h)) & 0xffffu) << 16)); };
-          out |= uint32_t{ref_f64_to_bf16(std::fma(cv(a[i]), cv(b[i]), cv(c[i])))} << (16 * h);
+          out |= uint32_t{ref_fma_bf16(cv(a[i]), cv(b[i]), cv(c[i]))} << (16 * h);
         }
         const uint32_t want = (mask >> i) & 1 ? out : d0[i];
         if (d[i] != want)

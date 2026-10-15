@@ -10281,6 +10281,9 @@ class Interpreter {
                  : s.bits == 32 ? static_cast<double>(f32(in))
                                 : f64(in);
       if (d.is_real()) {
+        // .ftz flushes an f32 source's subnormal first (an RTX 3060: cvt.rmi.ftz.f32.f32 of -2^-149 is -0, not -1).
+        if (op->ftz && s.bits == 32 && !s.is_bfloat() && x != 0 && std::fabs(x) < static_cast<double>(std::numeric_limits<float>::min()))
+          x = std::copysign(0.0, x);
         // An "i" rounding mode rounds to an integral value and keeps the float
         // type: cvt.rpi.f32.f32 is ceilf. Skipping it here made ceilf, floorf
         // and truncf return their argument, and roundf return x + 0.5.
@@ -10328,7 +10331,8 @@ class Interpreter {
         // 0x7ffd540000000000, 0xffff 0xfffffc0000000000).
         if (d.bits == 64 && s.bits == 16 && !s.is_bfloat() && std::isnan(x))
           return (uint64_t{(in >> 15) & 1} << 63) | 0x7FF8'0000'0000'0000ull | (uint64_t{in & 0x3FFu} << 42);
-        if (d.bits == 64) return f64bits(x);
+        // (A NaN that goes through an f64 rounding cvt, cvt.rmi.f64.f64 and the like, is quieted: an RTX 3060.)
+        if (d.bits == 64) return f64bits(x) | (x != x ? uint64_t{1} << 51 : 0);
         const float f = static_cast<float>(x);
         if (op->ftz && subnormal32(f)) return f32bits(std::copysign(0.0f, f));
         // f32 to f32 goes through the float pipeline, which writes the
@@ -10374,7 +10378,9 @@ class Interpreter {
                                : static_cast<double>(sv);
       if (d.is_bfloat()) return double_to_bf16(x);
       if (d.bits == 16) return double_to_f16(x);
-      return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
+      // (A 64-bit integer to f32 is one rounding, from the integer: through a double first it rounded twice, and an RTX 3060 does not.)
+      if (d.bits == 32) return f32bits(s.is_signed() ? static_cast<float>(static_cast<int64_t>(sv)) : static_cast<float>(sv));
+      return f64bits(x);
     }
     if (op->sat && d.bits < 64) {
       // Clamp to the destination's range, reading the source with its own

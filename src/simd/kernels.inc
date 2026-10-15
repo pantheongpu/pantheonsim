@@ -1366,7 +1366,7 @@ void hfma2_bf_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint3
   uint32_t r[64];
   for (unsigned i = 0; i < n; i += 4) {
     // Four words are eight halves, in memory order: word w's low half then its high half.
-    alignas(32) float f[8];
+    alignas(32) double f[8];
     for (int part = 0; part < 2; ++part) {
       const auto wide = [&](const uint32_t* p) {
         V8h h;
@@ -1377,15 +1377,11 @@ void hfma2_bf_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint3
         return __builtin_convertvector(reinterpret_cast<V4f>(q), V4d);
       };
       const V4d x = wide(a), y = wide(b), z = wide(c);
-      const V4d v = x * y + z;
-      const V4f s = __builtin_convertvector(v, V4f);
-      std::memcpy(f + 4 * part, &s, sizeof s);
+      for (int k = 0; k < 4; ++k) f[4 * part + k] = fma_round_odd(x[k], y[k], z[k]);
     }
+    // Rounded once, from the double (a float in between rounded twice; an RTX 3060 rounds once).
     U16A* const out = reinterpret_cast<U16A*>(r + i);
-    for (unsigned k = 0; k < 8; ++k) {
-      const uint32_t u = std::bit_cast<uint32_t>(f[k]);
-      out[k] = f[k] != f[k] ? uint16_t{0x7fff} : static_cast<uint16_t>((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
-    }
+    for (unsigned k = 0; k < 8; ++k) out[k] = f[k] != f[k] ? uint16_t{0x7fff} : static_cast<uint16_t>(narrow_from_double(f[k], 4, 0));
   }
   store_masked(d, r, mask, n);
 }

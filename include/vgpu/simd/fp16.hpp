@@ -92,4 +92,74 @@ inline uint16_t f32_to_bf16_bits(float f) {
   return static_cast<uint16_t>(b >> 16);
 }
 
+
+// ---- directed and single rounding of an exact value to f16 or bf16 (used by the SASS executor's conversions) ----
+// A finite or infinite value to the nearest representable of a format with `mb` mantissa bits and `eb` exponent bits, in SASS rounding
+// mode `rnd` (0 to nearest even, 1 toward -inf, 2 toward +inf, 3 toward zero); the integer significand `S` has its top bit at bit 63
+// and stands for 1.xxx * 2^E.
+inline uint32_t narrow_core(bool sign, uint64_t S, int E, unsigned mb, unsigned eb, unsigned rnd) {
+  const int bias = (1 << (eb - 1)) - 1, emin = 1 - bias;
+  const uint32_t inf_bits = ((1u << eb) - 1) << mb;
+  const int shift = static_cast<int>(63 - mb) + (E < emin ? emin - E : 0);
+  unsigned __int128 q, rem, half;
+  const unsigned __int128 R = S;
+  if (shift >= 127) { q = 0; rem = 1; half = static_cast<unsigned __int128>(1) << 126; }
+  else { q = R >> shift; rem = R & ((static_cast<unsigned __int128>(1) << shift) - 1); half = static_cast<unsigned __int128>(1) << (shift - 1); }
+  bool up;
+  switch (rnd) {
+    case 0: up = rem > half || (rem == half && (q & 1)); break;
+    case 1: up = sign && rem != 0; break;
+    case 2: up = !sign && rem != 0; break;
+    default: up = false; break;
+  }
+  q += up;
+  uint32_t bits;
+  if (E < emin) bits = static_cast<uint32_t>(q);   // a subnormal (a carry into 1 << mb is the smallest normal)
+  else bits = static_cast<uint32_t>(((E + bias) << mb) + (static_cast<int64_t>(q) - (int64_t{1} << mb)));
+  if (E > bias + 1 || bits >= inf_bits) {   // past the format's range
+    const bool to_inf = rnd == 0 || (rnd == 1 && sign) || (rnd == 2 && !sign);
+    bits = to_inf ? inf_bits : inf_bits - 1;
+  }
+  return (sign ? 1u << (mb + eb) : 0u) | bits;
+}
+inline uint32_t narrow_from_double(double x, unsigned dsize, unsigned rnd) {   // x not a NaN; dsize 1 f16, 4 bf16
+  const unsigned mb = dsize == 1 ? 10 : 7, eb = dsize == 1 ? 5 : 8;
+  const uint64_t b = std::bit_cast<uint64_t>(x);
+  const bool sign = b >> 63;
+  const int e = static_cast<int>((b >> 52) & 0x7ff);
+  uint64_t m = b & ((uint64_t{1} << 52) - 1);
+  if (e == 0x7ff) return (sign ? 1u << (mb + eb) : 0u) | (((1u << eb) - 1) << mb);
+  if (e == 0 && m == 0) return sign ? 1u << (mb + eb) : 0u;
+  int E;
+  uint64_t S;
+  if (e == 0) {
+    const int z = std::countl_zero(m);
+    S = m << z;
+    E = (63 - z) - 1074;   // m * 2^-1074, whose leading bit is bit 63 - z of m
+  } else {
+    S = (m | (uint64_t{1} << 52)) << 11;
+    E = e - 1023;
+  }
+  return narrow_core(sign, S, E, mb, eb, rnd);
+}
+
+// a * b + c for two bfloat16 (or float, or half) values a and b and any double c, rounded to double TO ODD: the exact result when it
+// fits, else whichever of the two neighbouring doubles has an odd last mantissa bit. A later rounding to a narrower format of that is the
+// rounding of the exact value (the double has more than two bits beyond any narrow format's): rounding to nearest in between could land
+// on the narrow format's tie and break it the wrong way (an RTX 3060: -(1.5 * 2^k) + 1.5 for bf16 operands is below the tie by far less than
+// a double's ulp). The product a * b is exact in a double; the sum's rounding error comes from TwoSum.
+inline double fma_round_odd(double a, double b, double c) {
+  const double p = a * b;
+  const double s = p + c;
+  if (!(s == s) || s - s != 0) return s;   // a NaN or an infinity
+  const double bv = s - p;
+  const double err = (p - (s - bv)) + (c - bv);
+  if (err == 0) return s;
+  uint64_t u = std::bit_cast<uint64_t>(s);
+  if (u & 1) return s;
+  // toward the exact value, which is s + err
+  if ((err > 0) == (s > 0)) ++u; else --u;
+  if (u == 0x8000000000000000ull) return std::bit_cast<double>(uint64_t{0x8000000000000001ull});   // (s was -0: not reachable with err != 0)
+  return std::bit_cast<double>(u);
+}
 }  // namespace vgpu::simd

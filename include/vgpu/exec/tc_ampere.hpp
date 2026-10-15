@@ -271,7 +271,7 @@ __attribute__((target("avx2"))) inline void mma_avx2(unsigned M, unsigned N, uns
     row_special[i] = bits;
   }
   const __m256i c255 = _mm256_set1_epi32(255), c7fffff = _mm256_set1_epi32(0x7fffff), cff = _mm256_set1_epi32(0xff), zero = _mm256_setzero_si256(),
-                one = _mm256_set1_epi32(1), cemin = _mm256_set1_epi32(emin);
+                one = _mm256_set1_epi32(1);
   const __m256i imin = _mm256_set1_epi32(INT32_MIN);
   for (unsigned k = 0; k < K; ++k)
     for (unsigned jb = 0; jb < N / 8; ++jb)

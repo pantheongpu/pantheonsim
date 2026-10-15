@@ -1226,6 +1226,15 @@ void dec_fsel(Instr& ins, const Word& w) {
   ins.src.push_back(pred_src(w, 87, 90));
 }
 
+// An f16 source's half of its register, bits 60-61 (the same field as I2F's narrow-source select): `.H1` is the high half. FRND, F2I and
+// F2F with an f16 source read the low half unless it says otherwise (an RTX 3060 converts the high half: probed with conv_forms).
+static void f16_part(Instr& ins, const Word& w, unsigned ssize) {
+  if (ssize != 1) return;
+  const unsigned part = static_cast<unsigned>(w.field(60, 2));
+  ins.f[5] = part;
+  if (part && ins.src[0].kind == Kind::Reg) ins.src[0].suffix = ".H" + std::to_string(part);
+}
+
 // FRND (0x107, 32-bit; 0x113 with a 64-bit side): round to an integral
 // value. 78-79 the rounding (none: to nearest even), 75-76 the result's
 // size and 84-85 the source's (log2 bytes), 80 FTZ.
@@ -1251,6 +1260,7 @@ void dec_frnd(Instr& ins, const Word& w) {
   if (ssz == 3 && ins.src[0].kind == Kind::Reg) ins.src[0].width = 2;
   src_neg_abs(ins.src[0], w, true);
   if (ssz == 3) double_imm(ins);
+  f16_part(ins, w, ssz);
 }
 
 // FCHK: whether a / b needs the division's slow path.
@@ -1322,6 +1332,7 @@ void dec_f2i(Instr& ins, const Word& w) {
   one_src(ins, w, kFloat, false);
   src_neg_abs(ins.src[0], w, true);
   if (ssize == 3) ins.src[0].width = 2;
+  f16_part(ins, w, ssize);
 }
 
 // F2F: float (84-85) to float (75-76).
@@ -1343,6 +1354,7 @@ void dec_f2f(Instr& ins, const Word& w) {
   one_src(ins, w, kFloat, false);
   src_neg_abs(ins.src[0], w, true);
   if (ssize == 3) ins.src[0].width = 2;
+  f16_part(ins, w, ssize);
 }
 
 // I2I: saturating integer narrowing (sm_75+): 32-bit source to U8/S8/U16/S16.
