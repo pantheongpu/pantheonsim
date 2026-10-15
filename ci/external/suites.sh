@@ -32,6 +32,7 @@
 # program (results.tsv), each one's output, and a summary.md.
 #
 # The cuda-samples list's columns: path | marker | arguments | environment.
+# A '|' inside a marker is written %7C.
 #
 # Environment: SUITE_GPU (nvidia/rtx3060), SUITE_TIMEOUT (seconds per
 # program, 600), SUITE_JOBS (parallel builds, ci/jobs.sh -g 2), SUITE_ONLY (a regex of
@@ -224,6 +225,7 @@ run() {
     cuda-samples)
       while IFS='|' read -r path marker args extra; do
         name=$(basename "$path"); exe="build/$path"; log="$report/logs/$name.log"
+        marker=${marker//%7C/|}
         [[ -x $exe ]] || { result "$name" FAIL 0 "did not build"; continue; }
         # args: the sample's arguments; extra: environment (VGPU_DEVICE_COUNT=2 for
         # the samples that want the card's two GPUs).
