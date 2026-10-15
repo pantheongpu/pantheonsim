@@ -1,0 +1,20 @@
+name: PR conflict guard
+description: >-
+  Cancel this workflow run when the pull request it tests has a merge conflict
+  (ci/pr-guard.sh). Does nothing on any other event, and never fails for any
+  reason except a conflict. The job needs `pull-requests: read` and
+  `actions: write`. Use it right after actions/checkout.
+
+inputs:
+  token:
+    description: Token that reads the pull request and cancels the run
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Stop if the pull request has a merge conflict
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: bash "$GITHUB_ACTION_PATH/../../../ci/pr-guard.sh"

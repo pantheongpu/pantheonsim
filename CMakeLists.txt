@@ -3038,6 +3038,10 @@ if(Python3_Interpreter_FOUND)
   # failure with no jobs, and its schedule stops): the check reads every workflow for one.
   add_test(NAME lint_workflow_yaml
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_workflow_yaml.py)
+  # Every heavy job of a workflow that runs on pull requests starts with the
+  # merge-conflict guard, so a new one cannot spend runner time on a PR that conflicts.
+  add_test(NAME lint_pr_guard_coverage
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_pr_guard_coverage.py)
   # Every exported runtime and driver function is a call a profiler is told of,
   # and the driver shim takes the argument sizes the toolkit declares (CUPTI
   # reads them by those sizes).
@@ -3069,6 +3073,11 @@ set_tests_properties(lint_cudnn_header_fetch PROPERTIES TIMEOUT 300)
 # job that cannot fit; synthetic meminfo and cgroup files stand in for the machine.
 add_test(NAME lint_ci_jobs COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_ci_jobs.sh)
 set_tests_properties(lint_ci_jobs PROPERTIES TIMEOUT 120)
+
+# The merge-conflict guards (ci/pr-guard.sh at the start of a heavy job,
+# ci/cancel-conflicting-prs.sh after main moves) against a fake gh and curl.
+add_test(NAME lint_pr_guard COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_pr_guard.sh)
+set_tests_properties(lint_pr_guard PROPERTIES TIMEOUT 120)
 
 # Copies and fills with a shape in graphs, and the async copies a capture has to
 # record rather than run; two simulated devices, for the peer copy.
