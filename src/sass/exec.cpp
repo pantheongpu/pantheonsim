@@ -106,6 +106,9 @@ struct Warp {
   // Set by a wait that came back unsatisfied (an mbarrier phase check): the
   // warp's turn ends there, so the warps it waits on get to run.
   bool yield = false;
+  // Armed until the warp reaches its first store to global memory, where its turn ends once (see
+  // step_warp): by then it has issued every load it makes before storing anything.
+  bool store_gate = true;
   // The cluster barrier (UCGABAR): lanes that have arrived in its current
   // phase, and the phase each lane's wait waits for.
   Mask cga_arrived = 0;
@@ -1321,6 +1324,22 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   const Instr* ins = &fetch(pc, &code);
   const uint64_t end = code->base + 16 * code->count;
   for (unsigned n = 0;; ++n) {
+    // A warp's first store to global memory ends its turn, once, so that the block's other warps issue the loads
+    // their prologues make before it lands. On a card every warp of a block starts within a few cycles of the
+    // others, and a store posts only after a load's round trip, so a warp never sees a store of a warp-mate that
+    // started with it: Triton's `step += 1` on a one-element tensor has every warp load, add and store the same
+    // word, and is right only because of that. Run to the end one warp at a time, warp k would load what warps
+    // 0..k-1 stored and add one more each. Any order is a legal one for code with no synchronization; this is
+    // the one hardware gives. A block of one warp has no warp-mates to wait for.
+    if (w.store_gate && (ins->op == Op::STG || ins->op == Op::ST)) {
+      w.store_gate = false;
+      if (blk.warps.size() > 1) {
+        if (pc != pick)
+          for (Mask m = group; m; m &= m - 1) w.pc[std::countr_zero(m)] = pc;
+        w.yield = true;
+        return true;
+      }
+    }
     if (++w.steps > cfg_.max_steps)
       throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(cfg_.max_steps) +
                                     " instructions (an infinite loop?)");

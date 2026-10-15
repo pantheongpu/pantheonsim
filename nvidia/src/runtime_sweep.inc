@@ -140,10 +140,14 @@ static cudaError_t cudaOccupancyAvailableDynamicSMemPerBlock_traced(size_t* dyna
     const uint64_t reserved = p.reserved_smem_per_block();
     uint64_t share = p.limits.shared_mem_per_sm / static_cast<uint64_t>(numBlocks) / granule * granule;
     share = share > reserved ? share - reserved : 0;
-    const uint64_t cap = p.limits.shared_mem_per_block;   // 48 KiB until a kernel opts in to more
-    share = std::min(share, cap);
     const uint64_t fixed = fn->static_shared_size;
-    *dynamicSmemSize = static_cast<size_t>(share > fixed ? share - fixed : 0);
+    // At most what the kernel may ask for: 48 KiB less its static shared memory until it opts in to more
+    // (cudaFuncSetAttribute), then the figure it set (measured: 60000 for a kernel that asked for 60000 with
+    // one block resident, 101376 after asking for the most the part allows).
+    const auto at = ki.attrs.find(t_current_device);
+    const vgpu_funcattr::State st = at == ki.attrs.end() ? vgpu_funcattr::State{} : at->second;
+    *dynamicSmemSize = static_cast<size_t>(std::min<uint64_t>(share > fixed ? share - fixed : 0,
+                                                              static_cast<uint64_t>(vgpu_funcattr::max_dynamic_shared(st, p, fixed))));
     return cudaSuccess;
   });
 }

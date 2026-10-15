@@ -4,7 +4,7 @@
 // function compiled under the AVX2 pragma would share its mangled name with the
 // generic instantiation, and the linker could keep either one.
 //
-// What is computed, for the operand types T (accumulator) and S (stored):
+// What is computed, for the accumulator type T and operands that a loader turns into T one element at a time:
 //
 //     acc(i, j) = ((0 + a(i,0)*b(0,j)) + a(i,1)*b(1,j)) + ...     (p = 0 .. k-1)
 //
@@ -26,7 +26,7 @@ template <> struct IsFloat<float> { static constexpr bool value = true; };
 template <class T> struct IsDouble { static constexpr bool value = false; };
 template <> struct IsDouble<double> { static constexpr bool value = true; };
 
-template <class T, class S>
+template <class T>
 struct Ops {
   using V = typename Lanes<T>::type;
   static constexpr int L = Lanes<T>::n;
@@ -36,8 +36,6 @@ struct Ops {
   static constexpr int MC = 128;  // a multiple of MR for every L (4, 8) and of the rows of a block
   static constexpr int NC = 128;  // a multiple of NR
   static constexpr int KC = 256;
-
-  static inline T conv(S s) { return static_cast<T>(s); }
 
 
 #ifdef VGPU_HG_INTRIN
@@ -118,39 +116,58 @@ struct Ops {
       for (int v = 0; v < MRV; ++v) __builtin_memcpy(acc + static_cast<size_t>(j) * ld + v * L, &c[j][v], sizeof(V));
   }
 
-  // op(A)(i0 .. i0+mr, p0 .. p0+kc) as panels of MR rows, p-major, zero beyond m.
-  static void pack_a(bool ta, const S* A, int64_t lda, int64_t i0, int64_t mc, int64_t m, int64_t p0, int kc, T* out) {
+  // op(A)(i0 .. i0+mr, p0 .. p0+kc) as panels of MR rows, p-major, zero beyond m. The elements are converted to T
+  // here, a panel at a time, by the loader: ld(index into the stored matrix, i, p) -> value. (This is the only
+  // place an operand is converted, so nothing the size of a matrix is ever made: a panel is at most MC x KC.)
+  template <class LA>
+  static void pack_a(bool ta, const LA& ld, int64_t lda, int64_t i0, int64_t mc, int64_t m, int64_t p0, int kc, T* out) {
     for (int64_t ir = 0; ir < mc; ir += MR) {
       T* dst = out + static_cast<size_t>(ir / MR) * MR * kc;
-      for (int r = 0; r < MR; ++r) {
-        const int64_t i = i0 + ir + r;
-        if (ir + r >= mc || i >= m) {
-          for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * MR + r] = T(0);
-        } else if (ta) {  // op(A)(i, p) = A[p + i*lda]: contiguous in p
-          const S* src = A + p0 + i * lda;
-          for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * MR + r] = conv(src[p]);
-        } else {  // A[i + p*lda]
-          const S* src = A + i + p0 * lda;
-          for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * MR + r] = conv(src[static_cast<size_t>(p) * lda]);
+      // Rows of this panel that exist: the rest are zeros.
+      int64_t rv = mc - ir < m - (i0 + ir) ? mc - ir : m - (i0 + ir);
+      if (rv > MR) rv = MR;
+      if (ta) {  // op(A)(i, p) = A[p + i*lda]: contiguous in p
+        for (int r = 0; r < MR; ++r) {
+          if (r >= rv) {
+            for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * MR + r] = T(0);
+            continue;
+          }
+          const int64_t i = i0 + ir + r, base = p0 + i * lda;
+          for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * MR + r] = static_cast<T>(ld(base + p, i, p0 + p));
+        }
+      } else {  // A[i + p*lda]: contiguous in i, so p runs outside
+        for (int p = 0; p < kc; ++p) {
+          const int64_t base = i0 + ir + (p0 + p) * lda;
+          T* const d = dst + static_cast<size_t>(p) * MR;
+          for (int r = 0; r < rv; ++r) d[r] = static_cast<T>(ld(base + r, i0 + ir + r, p0 + p));
+          for (int r = static_cast<int>(rv); r < MR; ++r) d[r] = T(0);
         }
       }
     }
   }
 
   // op(B)(p0 .. p0+kc, j0 .. j0+nc) as panels of NR columns, p-major, zero beyond n.
-  static void pack_b(bool tb, const S* B, int64_t ldb, int64_t j0, int64_t nc, int64_t n, int64_t p0, int kc, T* out) {
+  template <class LB>
+  static void pack_b(bool tb, const LB& ld, int64_t ldb, int64_t j0, int64_t nc, int64_t n, int64_t p0, int kc, T* out) {
     for (int64_t jr = 0; jr < nc; jr += NR) {
       T* dst = out + static_cast<size_t>(jr / NR) * NR * kc;
-      for (int c = 0; c < NR; ++c) {
-        const int64_t j = j0 + jr + c;
-        if (jr + c >= nc || j >= n) {
-          for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * NR + c] = T(0);
-        } else if (tb) {  // op(B)(p, j) = B[j + p*ldb]
-          const S* src = B + j + p0 * ldb;
-          for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * NR + c] = conv(src[static_cast<size_t>(p) * ldb]);
-        } else {  // B[p + j*ldb]: contiguous in p
-          const S* src = B + p0 + j * ldb;
-          for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * NR + c] = conv(src[p]);
+      int64_t cv = nc - jr < n - (j0 + jr) ? nc - jr : n - (j0 + jr);
+      if (cv > NR) cv = NR;
+      if (tb) {  // op(B)(p, j) = B[j + p*ldb]: contiguous in j, so p runs outside
+        for (int p = 0; p < kc; ++p) {
+          const int64_t base = j0 + jr + (p0 + p) * ldb;
+          T* const d = dst + static_cast<size_t>(p) * NR;
+          for (int c = 0; c < cv; ++c) d[c] = static_cast<T>(ld(base + c, j0 + jr + c, p0 + p));
+          for (int c = static_cast<int>(cv); c < NR; ++c) d[c] = T(0);
+        }
+      } else {  // B[p + j*ldb]: contiguous in p
+        for (int c = 0; c < NR; ++c) {
+          if (c >= cv) {
+            for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * NR + c] = T(0);
+            continue;
+          }
+          const int64_t j = j0 + jr + c, base = p0 + j * ldb;
+          for (int p = 0; p < kc; ++p) dst[static_cast<size_t>(p) * NR + c] = static_cast<T>(ld(base + p, j, p0 + p));
         }
       }
     }
@@ -159,7 +176,8 @@ struct Ops {
   // The sums of the block C(ic .. ic+mc, jc .. jc+nc) over all k, into acc
   // (leading dimension mcp = mc rounded up to MR, ncp likewise to NR).
   // apack holds mcp*KC, bpack ncp*KC elements.
-  static void block(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t lda, const S* B,
+  template <class LA, class LB>
+  static void block(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const LA& A, int64_t lda, const LB& B,
                     int64_t ldb, int64_t ic, int64_t mc, int64_t jc, int64_t nc, T* acc, T* apack, T* bpack) {
     const int64_t mcp = (mc + MR - 1) / MR * MR, ncp = (nc + NR - 1) / NR * NR;
     for (int64_t i = 0; i < mcp * ncp; ++i) acc[i] = T(0);

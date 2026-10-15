@@ -2708,6 +2708,10 @@ static const char* kGlobalRaceKernel = R"(
     // Every thread does a non-atomic increment of the same word, 8 times.
     // With any interleaving at all, updates are lost.
     mov.u32 %r5, 0;
+    // A warp's first global store ends its turn (see run_warp_until_yield),
+    // which would interleave the warps by itself. A store to another word
+    // spends it, so the loop below runs as the deterministic order always ran it.
+    st.global.u32 [%rd2+8], %r5;
 LOOP:
     ld.global.u32 %r1, [%rd2];
     add.s32 %r2, %r1, 1;
@@ -2729,6 +2733,38 @@ static uint64_t run_global_race(Env& e, const ptx::Module& m, vgpu::exec::Schedu
   cfg.scheduler_seed = seed;
   exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
   return e.mem.load_scalar(out, 4);
+}
+
+// Every thread of a block adds one to the same word in place, as Triton's
+// `step += 1` on a one-element tensor does. The warps race by the letter of
+// the memory model, but on a card they all issue their loads before the first
+// store lands, so the word goes up by one. Run to the end one warp at a time,
+// warp k would load what warps 0..k-1 stored and the word would go up by the
+// number of warps; a compiled Adam step then used step 8 for its bias
+// corrections (the PyTorch sweep's torch.compile optimizer-step check).
+VTEST(every_thread_adding_one_to_the_same_word_adds_one_not_one_per_warp) {
+  Env e;
+  auto m = ptx::parse(std::string(kHeader) + R"(
+.visible .entry k(.param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    ld.global.u32 %r1, [%rd2];
+    add.s32 %r2, %r1, 1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}
+)");
+  for (uint32_t threads : {32u, 64u, 256u, 1024u}) {
+    uint64_t out = e.mem.alloc(16);
+    e.mem.store_scalar(out, 4, 5);
+    LaunchConfig cfg;
+    cfg.block = {threads, 1, 1};
+    exec::launch(m.entries[0], cfg, {arg_u64(out)}, e.mem, e.prof);
+    VCHECK_EQ(e.mem.load_scalar(out, 4), uint64_t{6});
+  }
 }
 
 VTEST(the_same_seed_replays_the_same_execution) {

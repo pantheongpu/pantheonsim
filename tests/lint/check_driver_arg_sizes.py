@@ -62,8 +62,8 @@ def main():
     renamed = {v: b for b, v in re.findall(r"#\s*define\s+(cu\w+)\s+(cu\w+_v\d+)\b", header)}
     wanted = []   # (name, params, expression naming the toolkit's function, needs the rename off)
     skipped = []
-    sweep = SOURCE.with_name("driver_sweep.inc")   # the functions the header sweep added
-    for name, params in exports(SOURCE.read_text() + (sweep.read_text() if sweep.exists() else "")):
+    sweeps = [SOURCE.with_name(n) for n in ("driver_sweep.inc", "driver_132.inc")]   # the functions the header sweeps added
+    for name, params in exports(SOURCE.read_text() + "".join(f.read_text() for f in sweeps if f.exists())):
         if name in renamed and renamed[name] in declared:
             wanted.append((name, params, renamed[name], False))
         elif name in declared:

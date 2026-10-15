@@ -1377,6 +1377,14 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
     ordinal = s.current;
     if (const hipError_t e = locate(s, dst, dr, &to); e != hipSuccess) return e;
     if (const hipError_t e = locate(s, src, sr, &from); e != hipSuccess) return e;
+    // An explicit direction names a side that has to be memory the runtime
+    // knows: a host-to-device copy into a stack address, or a device-to-host
+    // copy out of one, is refused, as ROCm's HIP refuses it. (rocBLAS's
+    // bad-device-pointer tests of set/get_vector_async and set/get_matrix_async
+    // pass a host address as the device one and expect the call to fail.)
+    if (((kind == hipMemcpyHostToDevice || kind == hipMemcpyDeviceToDevice) && !to.mem) ||
+        ((kind == hipMemcpyDeviceToHost || kind == hipMemcpyDeviceToDevice) && !from.mem))
+      return fail(hipErrorInvalidValue, "the direction names device memory, but that address is not the runtime's");
     if (sink && sink->mode == RegionSink::kRecord) {
       *sink = RegionSink{RegionSink::kRecord, true, dst, src, dr, sr, kind};
       return hipSuccess;

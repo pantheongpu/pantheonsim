@@ -282,8 +282,11 @@ class Parser {
         continue;
       }
       if (t.text == ".global" || t.text == ".const") {
+        const bool is_const = t.text == ".const";
+        const size_t line = t.line;
         next();
-        m.globals.push_back(parse_global(t.line));
+        m.globals.push_back(parse_global(line));
+        m.globals.back().is_const = is_const;
         continue;
       }
       if (t.text == ".func" || t.text == ".weak" || t.text == ".visible") {

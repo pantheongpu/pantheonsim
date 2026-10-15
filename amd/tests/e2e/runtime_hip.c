@@ -66,6 +66,19 @@ int main(int argc, char** argv) {
   for (int i = 0; i < n; ++i) same = same && back[i] == host[i];
   printf("a copy on a stream lands %d\n", same);
 
+  /* A direction that names device memory, given an address the runtime never
+   * allocated (a stack word): refused, on a stream or not, as ROCm's HIP
+   * refuses it. rocBLAS's bad-device-pointer tests depend on that. */
+  {
+    int word = 0, other = 0;
+    const hipError_t h2d = hipMemcpyAsync(&word, &other, sizeof word, hipMemcpyHostToDevice, stream);
+    const hipError_t d2h = hipMemcpy(&word, &other, sizeof word, hipMemcpyDeviceToHost);
+    const hipError_t ok = hipMemcpy(&word, &other, sizeof word, hipMemcpyHostToHost);
+    (void)hipGetLastError();
+    printf("a host address given as the device side is refused %d\n",
+           h2d != hipSuccess && d2h != hipSuccess && ok == hipSuccess);
+  }
+
   /* LDS the launch sizes: the kernel's shared array has no size of its own,
    * and the launch's shared-memory parameter is what pays for it. */
   hipModule_t module;

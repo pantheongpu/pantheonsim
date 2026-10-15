@@ -5,6 +5,7 @@
 //   vgpu info --gpu <id>        show one device profile (--json for JSON)
 //   vgpu demo vectoradd         (added with the execution engine)
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -48,6 +49,8 @@ int usage(FILE* to) {
                "  vgpu shell                           Interactive machine simulator: pick a GPU,\n"
                "                                       CUDA/driver and OS, then get a shell where\n"
                "                                       nvidia-smi/rocm-smi/lspci/dmesg all work\n"
+               "  vgpu config show|init|keys           The settings file (pantheonsim.yaml) that stands in for\n"
+               "                                       the VGPU_* variables: what is in effect, a starter file\n"
                "  vgpu --version | --help\n",
                kVersion);
   return to == stdout ? 0 : 2;
@@ -229,12 +232,19 @@ int cmd_debug(const std::vector<std::string>& args);
 int cmd_test(const std::vector<std::string>& args);
 // Implemented in ncu.cpp.
 int cmd_ncu(const std::vector<std::string>& args);
+// Implemented in config_cmd.cpp: `vgpu config`, and the settings file (see docs/config.md).
+int cmd_config(const std::vector<std::string>& args);
+int config_prepare(std::vector<std::string>& args);
 
 int main(int argc, char** argv) {
   std::vector<std::string> args(argv + 1, argv + argc);
   if (args.empty()) return usage(stderr);
 
   try {
+    // The settings file: fills in VGPU_* variables nothing has set (flags and the
+    // environment still win). Strips a leading --config PATH.
+    if (int rc = config_prepare(args); rc >= 0) return rc;
+    if (args.empty()) return usage(stderr);
     const std::string& cmd = args[0];
     if (cmd == "--help" || cmd == "-h" || cmd == "help") return usage(stdout);
     if (cmd == "--version") {
@@ -247,6 +257,7 @@ int main(int argc, char** argv) {
     if (cmd == "serve") return cmd_serve({args.begin() + 1, args.end()});
     if (cmd == "fault") return cmd_fault({args.begin() + 1, args.end()});
     if (cmd == "regs") return cmd_regs({args.begin() + 1, args.end()});
+    if (cmd == "config") return cmd_config({args.begin() + 1, args.end()});
     if (cmd == "shell") return cmd_shell({args.begin() + 1, args.end()});
     if (cmd == "run") return cmd_run({args.begin() + 1, args.end()});
     if (cmd == "debug") return cmd_debug({args.begin() + 1, args.end()});
@@ -270,7 +281,11 @@ int main(int argc, char** argv) {
         }
       }
       if (gpu.empty()) {
-        std::fprintf(stderr, "vgpu info: missing --gpu <vendor/model>\n");
+        const char* e = std::getenv("VGPU_GPU");  // also where pantheonsim.yaml's `gpu` lands
+        if (e && e[0]) gpu = e;
+      }
+      if (gpu.empty()) {
+        std::fprintf(stderr, "vgpu info: missing --gpu <vendor/model> (or set VGPU_GPU, or gpu: in pantheonsim.yaml)\n");
         return 2;
       }
       return cmd_info(gpu, json);
@@ -281,7 +296,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "vgpu demo: expected 'vectoradd', got '%s'\n", kernel.c_str());
         return 2;
       }
-      std::string gpu = "nvidia/h100";
+      const char* gpu_env = std::getenv("VGPU_GPU");  // also where pantheonsim.yaml's `gpu` lands
+      std::string gpu = gpu_env && gpu_env[0] ? gpu_env : "nvidia/h100";
       long long n = 65536;
       for (size_t i = 2; i < args.size(); ++i) {
         if ((args[i] == "--gpu" || args[i] == "-n") && i + 1 >= args.size()) {

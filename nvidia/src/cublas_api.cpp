@@ -306,6 +306,99 @@ void gemm_float(cublasOperation_t transa, cublasOperation_t transb, int m, int n
   gemm_host<float, float>(transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
+// ---- the mixed-precision product, without widened copies ----
+//
+// GemmEx with half, bfloat16 or int8 operands accumulates in float. The operands stay as the device holds them
+// (their raw bytes) and host_gemm.hpp widens them to float as it packs a panel at a time, so no float copy of A,
+// B or C is made; C's elements are read and written as they are, one at a time, by the epilogue. Every value is
+// the one load_as_float and store_from_float produced, by the same conversions, and the sums are the same chains.
+// half -> float by table (built from __half2float, so the same 65536 values): packing converts an element many times.
+const float* half_table() {
+  struct Table {
+    float v[65536];
+    Table() {
+      for (uint32_t u = 0; u < 65536; ++u) {
+        const uint16_t b = static_cast<uint16_t>(u);
+        __half h;
+        std::memcpy(static_cast<void*>(&h), static_cast<const void*>(&b), 2);
+        v[u] = __half2float(h);
+      }
+    }
+  };
+  static const Table t;
+  return t.v;
+}
+struct HalfLoader {
+  const uint8_t* raw;
+  const float* table;
+  float operator()(int64_t idx, int64_t, int64_t) const {
+    uint16_t u;
+    std::memcpy(&u, raw + static_cast<size_t>(idx) * 2, 2);
+    return table[u];
+  }
+};
+struct Bf16Loader {
+  const uint8_t* raw;
+  float operator()(int64_t idx, int64_t, int64_t) const {
+    __nv_bfloat16 h;
+    std::memcpy(&h, raw + static_cast<size_t>(idx) * 2, 2);
+    return __bfloat162float(h);
+  }
+};
+struct Int8Loader {
+  const uint8_t* raw;
+  float operator()(int64_t idx, int64_t, int64_t) const { return static_cast<float>(static_cast<int8_t>(raw[idx])); }
+};
+bool mixed_operand(cudaDataType t) { return t == CUDA_R_16F || t == CUDA_R_16BF || t == CUDA_R_8I; }
+bool mixed_output(cudaDataType t) { return t == CUDA_R_32F || t == CUDA_R_16F || t == CUDA_R_16BF; }
+
+float c_get(const uint8_t* raw, size_t i, cudaDataType t) {
+  switch (t) {
+    case CUDA_R_16F: { __half h; std::memcpy(&h, raw + i * 2, 2); return __half2float(h); }
+    case CUDA_R_16BF: { __nv_bfloat16 h; std::memcpy(&h, raw + i * 2, 2); return __bfloat162float(h); }
+    default: { float f; std::memcpy(&f, raw + i * 4, 4); return f; }
+  }
+}
+void c_put(uint8_t* raw, size_t i, cudaDataType t, float v) {
+  switch (t) {
+    case CUDA_R_16F: { const __half h = __float2half(v); std::memcpy(raw + i * 2, &h, 2); break; }
+    case CUDA_R_16BF: { const __nv_bfloat16 h = __float2bfloat16(v); std::memcpy(raw + i * 2, &h, 2); break; }
+    default: std::memcpy(raw + i * 4, &v, 4); break;
+  }
+}
+
+// C = alpha * op(A) * op(B) + beta * C for those types (A and B of one type, as GemmEx takes them); false (nothing
+// read or written) for any others.
+bool gemm_mixed(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k, float alpha, const void* A,
+                cudaDataType Atype, int lda, const void* B, cudaDataType Btype, int ldb, float beta, void* C,
+                cudaDataType Ctype, int ldc) {
+  if (Atype != Btype || !mixed_operand(Atype) || !mixed_output(Ctype)) return false;
+  const bool ta = transa != CUBLAS_OP_N, tb = transb != CUBLAS_OP_N;
+  const auto rawA = fetch<uint8_t>(A, (ta ? extent(lda, m, k) : extent(lda, k, m)) * type_bytes(Atype));
+  const auto rawB = fetch<uint8_t>(B, (tb ? extent(ldb, k, n) : extent(ldb, n, k)) * type_bytes(Btype));
+  const size_t cbytes = type_bytes(Ctype), cn = extent(ldc, n, m);
+  auto rawC = fetch<uint8_t>(C, cn * cbytes);
+  uint8_t* const c0 = rawC.data();
+  auto epi = [=](int64_t i, int64_t j, float acc) {
+    const size_t at = idx(static_cast<int>(i), static_cast<int>(j), ldc);
+    // beta == 0 means C is write-only, so its prior contents (which may be uninitialized) must not be read.
+    c_put(c0, at, Ctype, beta == 0.0f ? alpha * acc : alpha * acc + beta * c_get(c0, at, Ctype));
+  };
+  auto run = [&](const auto& LA, const auto& LB) {
+    vgpu::hostgemm::gemm_with<float>(ta, tb, m, n, k, LA, lda, LB, ldb, epi);
+  };
+  if (Atype == CUDA_R_16F) run(HalfLoader{rawA.data(), half_table()}, HalfLoader{rawB.data(), half_table()});
+  else if (Atype == CUDA_R_16BF) run(Bf16Loader{rawA.data()}, Bf16Loader{rawB.data()});
+  else run(Int8Loader{rawA.data()}, Int8Loader{rawB.data()});
+  // The cells the product does not write (the padding of a leading dimension) went through float and back before,
+  // which is not the identity for a half or bfloat16 NaN: do the same.
+  if (Ctype != CUDA_R_32F)
+    for (int j = 0; j < n; ++j)
+      for (size_t at = idx(m, j, ldc); at < idx(ldc, j, ldc) && at < cn; ++at) c_put(c0, at, Ctype, c_get(c0, at, Ctype));
+  store(C, rawC);
+  return true;
+}
+
 // The int8 path: operands are int8, the product accumulates in int32, and C is
 // int32. Nothing is widened to float, because rounding would change the answer.
 void gemm_int8(cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
@@ -1599,6 +1692,7 @@ VGPU_EXPORT cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta,
     a = scalar(h, static_cast<const float*>(alpha));
     b = scalar(h, static_cast<const float*>(beta));
   }
+  if (gemm_mixed(ta, tb, m, n, k, a, A, Atype, lda, B, Btype, ldb, b, C, Ctype, ldc)) return CUBLAS_STATUS_SUCCESS;
   std::vector<float> hA, hB, hC;
   if (!load_as_float(A, ta == CUBLAS_OP_N ? extent(lda, k, m) : extent(lda, m, k), Atype, &hA) ||
       !load_as_float(B, tb == CUBLAS_OP_N ? extent(ldb, n, k) : extent(ldb, k, n), Btype, &hB) ||
