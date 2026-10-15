@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -46,7 +47,7 @@ extern "C" __device__ unsigned long __ockl_fprintf_stdout_begin();
 
 // ---- The function call service ----
 // The host function a kernel names: seven words in, two out.
-int g_calls = 0;
+std::atomic<int> g_calls{0};
 extern "C" void host_arithmetic(uint64_t* output, const uint64_t* input) {
   ++g_calls;
   uint64_t sum = 0;
@@ -230,7 +231,7 @@ int main(int argc, char** argv) {
       ++calls;
       wrong += r[2 * t] != 7 * t + 22 || r[2 * t + 1] != t * 1000 + 7 + t;
     }
-    wrong += g_calls != calls;   // the host function ran once for each calling lane
+    wrong += g_calls.load() != calls;   // the host function ran once for each calling lane
     report("a host function called by each lane of a diverged wave", wrong, 64 + 1);
     CHECK(hipFree(d));
   }
