@@ -1044,10 +1044,10 @@ only memory instruction is a broadcast `LDG.E.128`).
 **Same bits.** `VGPU_FASTPATH=0` sends every one of these to the old code (the uniform BRA included: it is gated on the same switch).
 `nvidia/tests/e2e/sass_fastpath.cu` runs about 35 kernels over special and random values with lanes on different paths of a guard and
 requires the two runs' output *and counters* to be byte for byte the same (354 launches); the same program prints identical output with
-`VGPU_SIMD=base` and `=off`, and identical output on this branch and on main (0 lines differ, 28 hash lines). Faults: five processes each make
+`VGPU_SIMD=base` and `=off`, and identical output on this branch and on main (0 lines differ in its 28 output lines). Faults: five processes each make
 one lane of a warp reach outside its local window / the allocation (gather, scatter, atomic) / shared memory and require the same error text
 with and without the fast paths. Host references in the program cover 64-bit sums, compares, shifts and multiplies, funnel shifts, popc, brev,
-clz, mulhi, division by constants, atomics' order-independent final values, LEA forms, broadcast loads. The unit test adds 8 tests with
+clz, mulhi, division by constants, atomics' order-independent final values, LEA forms, broadcast loads. The unit test adds 6 tests with
 independent references (`wide_integer_kernels_at_every_level`, `float_forms_at_every_level`, `lane_unary_at_every_level`,
 `prmt0_at_every_level`, `dcmp_at_every_level`, `double_lanes_in_place_at_every_level`, plus the existing LOP3 test now covering the expression
 tables); it passes under `-fsanitize=address,undefined` (kernels compiled sanitized, AVX2 included).
