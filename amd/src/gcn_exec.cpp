@@ -6292,7 +6292,7 @@ struct Machine {
       };
       if (lds_dma) {
         // Out of range reads zero, as for any buffer load.
-        const uint64_t to = lds_at + uint64_t{lane} * 4 * lds_words;
+        const uint64_t to = lds_at + uint64_t{lane} * (lds_words > 1 ? 16 : 4);   // "(TIDinWave * 16)" for three or four dwords
         if (to + 4 * lds_words > g.lds.size())
           throw Error::make(Err::InvalidValue, in.name, " writes LDS at ", to, ", past the ", g.lds.size(),
                             " bytes the work-group has");

@@ -1693,7 +1693,7 @@ foreach(_g mi300x mi350x mi250x rx7900xtx rx9070xt)
   set_tests_properties(${_name} PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 endforeach()
-# Triton's AMD backend on hand-written kernels (amd/tests/pytorch/triton.py):
+# Triton's AMD backend on hand-written kernels (amd/tests/pytorch/triton_kernels.py):
 # MFMA or WMMA in each input type, attention, reductions, atomics. The number
 # of checks depends on the device: fp8 products on gfx942 (two more) and gfx950
 # (two more, and the MX-scaled product).
@@ -1701,13 +1701,13 @@ foreach(_g mi300x:18 mi350x:19 mi250x:16 rx7900xtx:16 rx9070xt:16)
   string(REPLACE ":" ";" _p ${_g})
   list(GET _p 0 _gpu)
   list(GET _p 1 _count)
-  add_test(NAME amd_pytorch_triton_${_gpu} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh triton.py ${_count} 1 amd/${_gpu})
+  add_test(NAME amd_pytorch_triton_${_gpu} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh triton_kernels.py ${_count} 1 amd/${_gpu})
   set_tests_properties(amd_pytorch_triton_${_gpu} PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 endforeach()
 # Triton's asynchronous copies on gfx950 (global memory to LDS without
 # registers: buffer_load_* with the LDS bit), which it uses when asked to.
-add_test(NAME amd_pytorch_triton_async_copy_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh triton.py 19 1 amd/mi350x)
+add_test(NAME amd_pytorch_triton_async_copy_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh triton_kernels.py 19 1 amd/mi350x)
 set_tests_properties(amd_pytorch_triton_async_copy_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};TRITON_HIP_USE_ASYNC_COPY=1" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # Whole models (amd/tests/pytorch/models.py): a GPT trained with a schedule and
