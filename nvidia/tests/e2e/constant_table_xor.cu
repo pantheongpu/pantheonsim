@@ -92,6 +92,73 @@ static void report(const char* what, long bad, long of) {
   if (bad) ++failures;
 }
 
+
+// Narrower probes, all writing the integer, to find which ingredient of the loop above goes wrong: the 2D block,
+// the grid-stride loop, the shift-and-test loop, the table, or the XOR.
+static __global__ void p_index(unsigned* out, unsigned n) {             // the output indexing and the 2D block alone
+  unsigned tid = blockDim.x * blockIdx.x + threadIdx.x;
+  if (tid < n) out[threadIdx.y * n + tid] = threadIdx.y * n + tid;
+}
+static __global__ void p_stride(unsigned* out, unsigned n) {            // plus the grid-stride loop
+  unsigned tid = blockDim.x * blockIdx.x + threadIdx.x, step = blockDim.x * gridDim.x;
+  for (unsigned pos = tid; pos < n; pos += step) out[threadIdx.y * n + pos] = pos ^ 0x5a5a5a5au;
+}
+static __global__ void p_bits(unsigned* out, unsigned n) {              // the shift-and-test loop, no table
+  unsigned tid = blockDim.x * blockIdx.x + threadIdx.x, step = blockDim.x * gridDim.x;
+  for (unsigned pos = tid; pos < n; pos += step) {
+    unsigned result = 0, data = pos;
+    for (int bit = 0; bit < RES; bit++, data >>= 1)
+      if (data & 1) result ^= 0x9E3779B9u * (bit + 1);
+    out[threadIdx.y * n + pos] = result;
+  }
+}
+static __global__ void p_bits_nostride(unsigned* out, unsigned n) {     // the same, one position per thread
+  unsigned pos = blockDim.x * blockIdx.x + threadIdx.x;
+  if (pos >= n) return;
+  unsigned result = 0, data = pos;
+  for (int bit = 0; bit < RES; bit++, data >>= 1)
+    if (data & 1) result ^= 0x9E3779B9u * (bit + 1);
+  out[threadIdx.y * n + pos] = result;
+}
+static __global__ void p_bits_1d(unsigned* out, unsigned n) {           // the same, 1D blocks, y never read
+  unsigned pos = blockDim.x * blockIdx.x + threadIdx.x;
+  if (pos >= n) return;
+  unsigned result = 0, data = pos;
+  for (int bit = 0; bit < RES; bit++, data >>= 1)
+    if (data & 1) result ^= 0x9E3779B9u * (bit + 1);
+  out[pos] = result;
+}
+static __global__ void p_bits_select(unsigned* out, unsigned n) {       // the bits picked without the shifting loop
+  unsigned pos = blockDim.x * blockIdx.x + threadIdx.x;
+  if (pos >= n) return;
+  unsigned result = 0;
+  for (int bit = 0; bit < RES; bit++)
+    if ((pos >> bit) & 1) result ^= 0x9E3779B9u * (bit + 1);
+  out[pos] = result;
+}
+static __global__ void p_table_1d(unsigned* out, unsigned n) {          // the global table, 1D, no stride
+  unsigned pos = blockDim.x * blockIdx.x + threadIdx.x;
+  if (pos >= n) return;
+  unsigned result = 0, data = pos;
+  for (int bit = 0; bit < RES; bit++, data >>= 1)
+    if (data & 1) result ^= g_Table[0][bit];
+  out[pos] = result;
+}
+
+static unsigned* g_probe_out;
+static unsigned g_probe_got[DIMS * (1u << 14)], g_probe_want[DIMS * (1u << 14)];
+static void probe_report(const char* what, unsigned count) {
+  long bad = 0;
+  int shown = 0;
+  for (unsigned i = 0; i < count; ++i)
+    if (g_probe_got[i] != g_probe_want[i]) {
+      if (shown++ < 3) std::printf("       [%u] got %08x want %08x\n", i, g_probe_got[i], g_probe_want[i]);
+      ++bad;
+    }
+  std::printf("%-4s %s: %ld of %u differ\n", bad ? "FAIL" : "ok", what, bad, count);
+  if (bad) ++failures;
+}
+
 int main() {
   const unsigned n = 1u << 14;
   unsigned int table[DIMS][RES];
@@ -158,6 +225,48 @@ int main() {
   plain_mul<<<128, threads>>>(du, 0, n);
   cudaMemcpy(got_u, du, sizeof got_u, cudaMemcpyDeviceToHost);
   bad_u("plain multiplications instead of __umul24");
+
+
+  // Narrower probes (see above).
+  unsigned* po = du;
+  const unsigned total3 = DIMS * n;
+  auto bits_want = [&](unsigned pos) {
+    unsigned r = 0, data = pos;
+    for (int bit = 0; bit < RES; bit++, data >>= 1)
+      if (data & 1) r ^= 0x9E3779B9u * (bit + 1);
+    return r;
+  };
+  auto run = [&](const char* what, unsigned count, auto want_of) {
+    cudaMemcpy(g_probe_got, po, count * sizeof(unsigned), cudaMemcpyDeviceToHost);
+    for (unsigned i = 0; i < count; ++i) g_probe_want[i] = want_of(i);
+    probe_report(what, count);
+  };
+  cudaMemset(po, 0, total3 * 4);
+  p_index<<<(n + 127) / 128, threads>>>(po, n);
+  run("2D block, indexing only", total3, [&](unsigned i) { return i; });
+  cudaMemset(po, 0, total3 * 4);
+  p_stride<<<128, threads>>>(po, n);
+  run("plus the grid-stride loop", total3, [&](unsigned i) { return (i % n) ^ 0x5a5a5a5au; });
+  cudaMemset(po, 0, total3 * 4);
+  p_bits<<<128, threads>>>(po, n);
+  run("shift-and-test loop with no table, 2D block, grid-stride", total3, [&](unsigned i) { return bits_want(i % n); });
+  cudaMemset(po, 0, total3 * 4);
+  p_bits_nostride<<<(n + 127) / 128, threads>>>(po, n);
+  run("the same without the grid-stride loop", total3, [&](unsigned i) { return bits_want(i % n); });
+  cudaMemset(po, 0, total3 * 4);
+  p_bits_1d<<<(n + 127) / 128, 128>>>(po, n);
+  run("the same with 1D blocks", n, [&](unsigned i) { return bits_want(i); });
+  cudaMemset(po, 0, total3 * 4);
+  p_bits_select<<<(n + 127) / 128, 128>>>(po, n);
+  run("bits picked by (pos >> bit) & 1", n, [&](unsigned i) { return bits_want(i); });
+  cudaMemset(po, 0, total3 * 4);
+  p_table_1d<<<(n + 127) / 128, 128>>>(po, n);
+  run("a global table, 1D blocks", n, [&](unsigned i) {
+    unsigned r = 0, data = i;
+    for (int bit = 0; bit < RES; bit++, data >>= 1)
+      if (data & 1) r ^= table[0][bit];
+    return r;
+  });
 
   std::printf("%s\n", failures == 0 ? "PASS" : "FAIL");
   return failures == 0 ? 0 : 1;
