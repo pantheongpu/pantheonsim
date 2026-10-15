@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -1082,10 +1083,14 @@ struct OpBarRed {
 };
 struct OpRet {};
 // Call-sequence machinery (currently only the vprintf builtin is callable).
-struct OpDeclSlot { std::string name; uint32_t size = 0; };            // ".param .b64 param0;" in body
+// A call slot's name as a small integer, one per distinct name in a module (intern_call_slots), so the interpreter
+// finds a warp's slot without hashing a string. The ids are meaningful only inside the module they were made for:
+// a caller and its callee are always in the same one.
+inline constexpr uint32_t kNoSlot = 0xFFFFFFFFu;
+struct OpDeclSlot { std::string name; uint32_t size = 0; uint32_t id = kNoSlot; };            // ".param .b64 param0;" in body
 // A store into a call slot: one value, or a vector (st.param.v2/.v4) whose
 // elements go to consecutive offsets.
-struct OpStSlot { std::string slot; int64_t offset = 0; Type ty; std::vector<Operand> srcs; };
+struct OpStSlot { std::string slot; int64_t offset = 0; Type ty; std::vector<Operand> srcs; uint32_t id = kNoSlot; };
 // cp.async.{ca,cg}.shared.global [dst], [src], cp-size{, src-size};
 //
 // A copy from global to shared that the *thread* does not wait on: it is
@@ -1120,7 +1125,7 @@ struct OpCpAsyncGroup {
 };
 
 // A load from a call slot, one register or a vector of them.
-struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; std::vector<Reg> dsts; };
+struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; std::vector<Reg> dsts; uint32_t id = kNoSlot; };
 // A call. `callee` names either a builtin (vprintf, __assertfail, malloc,
 // free) or a device function defined in the same module, in which case
 // `target` points at it. Not owning: a recursive function calls itself, and a
@@ -1128,16 +1133,34 @@ struct OpLdSlot { std::string slot; int64_t offset = 0; Type ty; std::vector<Reg
 // The functions are owned by Module::funcs and by every kernel's
 // module_funcs, so a callee outlives any kernel that can reach it.
 struct EntryFn;
+// A byte the interpreter fills in the first time it needs it, from several host threads at once (every writer stores
+// the same value, so a relaxed atomic is all it takes); it copies like the plain byte it stands for.
+struct LazyByte {
+  mutable std::atomic<uint8_t> v{0};
+  LazyByte() = default;
+  LazyByte(const LazyByte& o) : v(o.v.load(std::memory_order_relaxed)) {}
+  LazyByte& operator=(const LazyByte& o) {
+    v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    return *this;
+  }
+  uint8_t get() const { return v.load(std::memory_order_relaxed); }
+  void set(uint8_t x) const { v.store(x, std::memory_order_relaxed); }
+};
 struct OpCall {
   std::string callee;
   std::string retval_slot;
   std::vector<std::string> param_slots;
+  // The ids of retval_slot (kNoSlot when there is none) and of param_slots, by intern_call_slots.
+  uint32_t retval_id = kNoSlot;
+  std::vector<uint32_t> param_ids;
   const EntryFn* target = nullptr;  // null for the builtins
   // An indirect call through a function pointer: the callee is whatever
   // address this register holds, so it is resolved per execution rather than
   // at parse time.
   bool indirect = false;
   Reg target_reg;
+  // Which of the interpreter's builtins `callee` names, worked out on the first execution (0: not yet).
+  LazyByte klass;
 };
 
 // The packed integer forms of PTX ISA 8.0 and 9.2-9.4: add, sub, neg, min, max and set on a
@@ -1201,19 +1224,28 @@ using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt
 // file, no carry, no saturation, no rounding mode (f32 arithmetic may be .ftz, and an fma a contracted sub or .ftz); the 64-bit forms of the address arithmetic around
 // memory accesses: integer arithmetic and setp on 64-bit registers, integer conversions, mul.wide; and
 // 16-bit integer arithmetic, setp and mov (the result cut to 16 bits, as write_reg does), mul.hi, neg/abs, the conversion of a narrow integer to f32 or f64, 32-bit division, the 64-bit mov and the
-// identity cvta; and the kernel's start: the thread and block ids, the warp size, ld.param of a scalar, predicate logic);
+// identity cvta; the kernel's start: the thread and block ids, the warp size, ld.param of a scalar, predicate logic;
+// and, from round 9: popc/clz, add/sub/mad.lo with the carry bit (32-bit), shfl.sync and vote.sync, f64 add, sub, mul, div and
+// fma to nearest (constants through EntryFn::micro_consts), mov of a 64-bit constant and of the halves of a 64-bit register,
+// f64 setp, and the conversions of f32/f64 to 32/64-bit integers and between f32 and f64 to nearest);
 // anything else has kind None and runs as it always did. build_micro() decides, and mirrors the
 // conditions of Interpreter::fast_path exactly.
 struct MicroOp {
   enum Kind : uint8_t { None = 0, Int32, MadLo32, Mov32, Setp32, Fma32, Float32, Selp32, Not32, Shf32, Bra,
                         Int64, Cvt, MulWide32, Setp64, MulHi32, Sign32, CvtI2F, Mov64, MovSreg, LdParam, PredBin,
-                        NotPred, Int16, Setp16, Mov16 };
+                        NotPred, Int16, Setp16, Mov16, PopcClz32, Shfl32, Vote, CarryAddSub32, CarryMadLo32,
+                        Float64, Fma64, MovImm64, CvtF2I, CvtF2F, Unpack64, Pack64 };
   enum Flags : uint8_t { kSigned = 1, kFloat = 2, kHasPred = 4, kPredNeg = 8, kLeft = 16, kWrap = 32,
                          kDstWide = 64, kFtz = 128 };
   Kind kind = None;
   uint8_t sub = 0;        // IntBinOp, FloatBinOp or CmpOp, by kind; Cvt, CvtI2F: the source's width in bits;
                           // Sign32: 1 for neg, 0 for abs; Fma32: bit 0 negates the product, bit 1 the addend;
-                          // MovSreg: the Sreg (255: the warp size); LdParam: the bytes read; PredBin: PredBinOp
+                          // MovSreg: the Sreg (255: the warp size); LdParam: the bytes read; PredBin: PredBinOp;
+                          // PopcClz32: 1 for popc, 0 for clz; Shfl32: ShflMode, plus 4 when it writes a predicate
+                          // (its id in `pred`; such a shfl has no guard); Vote: VoteMode, plus 4 for a negated
+                          // source and 8 for ballot; CarryAddSub32, CarryMadLo32: IntBinOp (add, sub) or 0, plus 64 for
+                          // a carry in and 128 for a carry out; Float64: FloatBinOp; Fma64: bit 0 negates the product,
+                          // bit 1 the addend; CvtF2I, CvtF2F: the Round
   uint8_t flags = 0;
   // Bit i set (0-2): source i is an immediate in src[i], else a register id. Bit 3 + i set: that register is in the
   // 64-bit file (Int64, Cvt, Setp64; an immediate there is the 32-bit value in src[i] sign-extended).
@@ -1224,7 +1256,15 @@ struct MicroOp {
   uint32_t src[3] = {0, 0, 0};   // Selp32: src[2] is the selecting predicate's id; Bra: src[0] the target;
                                  // Cvt: src[1] the destination's width in bits; LdParam: src[0] the parameter's
                                  // position, src[1] the offset in it; PredBin, NotPred: predicate ids (an immediate
-                                 // 0 or 1 where src_imm says), NotPred's in src[0]
+                                 // 0 or 1 where src_imm says), NotPred's in src[0];
+                                 // Shfl32: src[0..2] the value, the lane
+                                 // operand and the clamp/segment operand; Vote: src[0] the source predicate's id;
+                                 // Float64, Fma64, MovImm64: a source is a 64-bit register (src_imm bit 3+i) or, where
+                                 // src_imm bit i says, the index of a constant in EntryFn::micro_consts;
+                                 // CvtF2I, CvtF2F: src[0] the source register (src_imm bit 3: in the 64-bit file),
+                                 // src[1] the destination's width in bits (kSigned: a signed integer; kDstWide);
+                                 // Unpack64: src[0] the 64-bit register, dst and src[1] the low and high halves' registers
+                                 // (kNoReg: unused); Pack64: src[0], src[1] the halves, dst the 64-bit register
 };
 static_assert(sizeof(MicroOp) == 24, "keep MicroOp small");
 
@@ -1251,6 +1291,11 @@ const std::vector<std::string>& opcode_names();
 // Decodes fn.body into fn.micro. Pure function of the body.
 struct EntryFn;
 void build_micro(EntryFn& fn);
+
+// Numbers every call slot name of the module (the slots the instructions use and the callees' parameter and return
+// names) and stores the numbers in the instructions and functions. Run once after parsing.
+struct Module;
+void intern_call_slots(Module& m);
 
 struct ParamDecl {
   std::string name;
@@ -1286,6 +1331,8 @@ struct EntryFn {
   std::vector<std::string> param_slot_names;   // in signature order
   std::vector<uint32_t> param_slot_bytes;      // byte size of each, structs included
   std::string retval_slot_name;                // empty when it returns void
+  std::vector<uint32_t> param_slot_ids;        // param_slot_names and retval_slot_name as intern_call_slots numbers
+  uint32_t retval_slot_id = kNoSlot;
   uint32_t retval_bytes = 0;
   // Every device function in the module, in definition order. An indirect call
   // carries an address, and the address is the index -- see kFuncVaBase.
@@ -1299,6 +1346,8 @@ struct EntryFn {
   // body[i] decoded for the fast paths (see MicroOp); empty, or the same length
   // as body. Filled at the end of parsing by build_micro().
   std::vector<MicroOp> micro;
+  // The 64-bit constants the MicroOps of f64 arithmetic and mov name by position.
+  std::vector<uint64_t> micro_consts;
   std::map<std::string, Type> reg_decls;      // declared virtual registers
   // Dense register numbering used by the interpreter's flat register file.
   std::map<std::string, uint32_t> reg_ids;
