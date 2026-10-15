@@ -232,6 +232,9 @@ struct Wave {
   bool soft_yield = false;
   bool round_stopped = false;
   uint64_t round_steps = 0;
+  // Instructions this wave has issued, for PC sampling (Dispatch::sampler);
+  // counted only while a sampler is attached.
+  uint64_t issued = 0;
   // At a GWS barrier (Machine::gws_barrier): counted there, and waiting for
   // the barrier's generation to move past this one.
   bool gws_waiting = false;
@@ -334,7 +337,7 @@ struct Group {
 
 struct Machine {
   Machine(const Dispatch& dispatch, MemoryManager& memory, DecodeCache& cache)
-      : d(dispatch), mem(memory), decoded(&cache) {}
+      : d(dispatch), mem(memory), decoded(&cache), sampler(dispatch.sampler && dispatch.sampler->interval ? dispatch.sampler : nullptr) {}
   const Dispatch& d;
   MemoryManager& mem;
   DispatchStats stats;
@@ -462,6 +465,25 @@ struct Machine {
   // each time cost more than running it. The cache is the module's, or the
   // dispatch's where the runtime keeps none.
   DecodeCache* decoded = nullptr;
+  // The profiler sampling this dispatch's waves' program counters, or null.
+  const PcSampler* sampler = nullptr;
+
+  // PC sampling (Dispatch::sampler): the wave is about to issue the
+  // instruction at `pc`. Sampled when the wave's count of instructions issued
+  // is a multiple of the interval, from its first. Instructions, not time: the
+  // simulator has no timing model (see PcSampler).
+  void sample_pc(Wave& w, const Group& g, uint64_t pc) {
+    const uint64_t n = w.issued++;
+    if (n % sampler->interval) return;
+    PcSample s;
+    s.pc = pc;
+    s.exec = w.lanes >= kLanes ? w.exec : w.exec & 0xFFFFFFFFull;
+    std::copy(std::begin(g.id), std::end(g.id), s.group);
+    s.wave_in_group = static_cast<uint32_t>(w.first_lane / w.lanes);
+    const Place p = place_of(d, w.group);
+    s.die = p.die, s.engine = p.engine, s.array = p.array, s.unit = p.unit;
+    sampler->sample(sampler->user, s);
+  }
 
   gcn::Target target() const { return gcn::target_of_mach(d.object->mach); }
   // An RDNA kernel built for 64-lane waves: its lane masks are register pairs.
@@ -7412,6 +7434,7 @@ struct Machine {
         debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
       debug_stop(w, g);
     const Inst& decoded = fetch(w.pc);
+    const uint64_t pc_here = w.pc;
     // gfx1250's vector register numbers past v255: the instruction as it names them with the wave's MSBs on.
     Inst remapped;
     const bool vector_enc = decoded.enc == gcn::Enc::Vop1 || decoded.enc == gcn::Enc::Vop2 || decoded.enc == gcn::Enc::Vop3 ||
@@ -7432,6 +7455,7 @@ struct Machine {
     if (tracing() && w.first_lane == 0) traced.emplace(*this, w, in, w.pc);
     w.pc += in.size;
     ++stats.instructions;
+    if (__builtin_expect(sampler != nullptr, 0)) sample_pc(w, g, pc_here);
     InstructionCounts& n = stats.counts;
     switch (in.enc) {
       case gcn::Enc::Sop1:
@@ -8190,7 +8214,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   // under the debugger or the wave trace, every group runs.
   bool same_shape = true;
   for (int i = 0; i < 3; ++i) same_shape &= !d.grid_items[i] || d.grid_items[i] % d.group_size[i] == 0;
-  if (groups > 1 && same_shape && !debug::active() && !Machine::tracing()) {
+  if (groups > 1 && same_shape && !debug::active() && !Machine::tracing() && !(d.sampler && d.sampler->interval)) {
     Machine m(d, mem, *cache);
     if (OpName(m.fetch(d.code_base + k.entry).name) == "s_endpgm"_op) {
       run_groups(m, d, packet, group_segment, 0, 1, group_at, nullptr);

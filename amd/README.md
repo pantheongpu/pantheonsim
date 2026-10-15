@@ -776,10 +776,33 @@ well as `SQ_INSTS_FLAT` ("including FLAT").
 Times in the traces are the simulation's own, on the clock
 `/proc/<pid>/stat` uses: a truthful order and truthful durations of the
 simulation, and nothing about how long a card would take. There is no HSA
-runtime, so no HSA trace; no PC sampling or thread trace, which need the
-hardware's sampling and trace units; and no records of the kernels ROCm's
-runtime runs on its own behalf (a device-to-device copy or a memset is not a
-kernel here).
+runtime, so no HSA trace; no thread trace, or the stochastic method of PC
+sampling, which need the hardware's trace and sampling units; and no records of
+the kernels ROCm's runtime runs on its own behalf (a device-to-device copy or a
+memset is not a kernel here).
+
+PC sampling (`rocprofiler_configure_pc_sampling_service`) is offered on the
+Instinct GPUs that have it (gfx90a, gfx942, gfx950) by the host-trap method
+only, and **by instruction count, not time**: the simulator has no timing
+model, so there is no clock to sample on. The one configuration an agent lists
+is the host-trap method with the unit `ROCPROFILER_PC_SAMPLING_UNIT_INSTRUCTIONS`
+and any interval from 1. Each wave is sampled when it is about to issue its
+1st, (1 + interval)th, (1 + 2 * interval)th ... instruction, counting every
+instruction it issues; the program counters are therefore exact and repeatable
+for a kernel, and say nothing of where a card would spend its time. Samples are
+delivered to the buffer as `rocprofiler_pc_sampling_record_host_trap_v0_t`
+records when the dispatch completes: the code object and the offset of the
+instruction, EXEC, the work-group and the wave in it, where the work-group ran
+(compute die, shader engine and array, compute unit; the SIMD, pipe, VM id,
+queue and microengine of the hardware ID are not modelled and read 0), the
+dispatch and correlation ids, and the time the sample was taken on the clock
+the traces use. A tool that asks for the method in time or cycles
+(`rocprofv3 --pc-sampling-unit time`) is refused with
+`ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT` rather than given invented times;
+the stochastic method answers `ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE`, as for a
+GPU without it. `test_amd_rocprofiler_pcsampling_1` and `_5` check the samples
+against llvm-objdump's addresses for a kernel, every instruction and every
+fifth.
 
 `test_amd_rocprofiler` is a profiling tool of its own that runs everywhere;
 `amd_rocprofv3` runs AMD's rocprofv3 in a session wherever rocprofiler-sdk is

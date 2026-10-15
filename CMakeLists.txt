@@ -1429,6 +1429,17 @@ add_test(NAME test_amd_hip_at_exit COMMAND test_amd_hip_at_exit)
 set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "ok HIP from a static destructor" FAIL_REGULAR_EXPRESSION "FAIL|ERROR: AddressSanitizer|malloc|double free|corrupted")
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
+# PC sampling (host-trap method, interval in instructions): the test is the
+# tool; run with every instruction sampled and with every fifth.
+add_executable(test_amd_rocprofiler_pcsampling amd/tests/unit/test_rocprofiler_pcsampling.cpp)
+target_link_libraries(test_amd_rocprofiler_pcsampling PRIVATE vgpurocprof vgpuhip)
+target_include_directories(test_amd_rocprofiler_pcsampling PRIVATE tests/framework amd/include)
+target_compile_definitions(test_amd_rocprofiler_pcsampling PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+foreach(interval 1 5)
+  add_test(NAME test_amd_rocprofiler_pcsampling_${interval} COMMAND test_amd_rocprofiler_pcsampling)
+  set_tests_properties(test_amd_rocprofiler_pcsampling_${interval} PROPERTIES
+    ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1;VGPU_TEST_PCS_INTERVAL=${interval}")
+endforeach()
 # ROCm SMI and AMD SMI each carry the simulator's core, by design; a test that loads both is an ODR violation
 # to a sanitizer build (as in nvidia/tests/e2e/run_lib_check.sh). Leak detection stays on.
 set(VGPU_SAN_ODR_OFF "ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")

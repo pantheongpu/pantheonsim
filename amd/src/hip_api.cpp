@@ -908,6 +908,7 @@ hipError_t run_launch(const LaunchJob& job) {
       mem.write(grid_sync, info.data(), info.size());
     }
     vgpu::amd::Dispatch dispatch;
+    vgpu::amd::PcSampler pc_sampler;   // lives as long as the dispatch runs
     dispatch.object = &object;
     dispatch.kernel = &kernel;
     dispatch.kernarg = kernarg;
@@ -949,6 +950,10 @@ hipError_t run_launch(const LaunchJob& job) {
       launch.group_segment = kernel.group_segment + shared;
       launch.private_segment = kernel.private_segment;
       if (prof->launching) token = prof->launching(launch);
+      if (token && prof->sampling && prof->size >= offsetof(vgpu::amd::hipprof::Hooks, sampling) + sizeof(prof->sampling)) {
+        prof->sampling(token, &pc_sampler);
+        if (pc_sampler.interval && pc_sampler.sample) dispatch.sampler = &pc_sampler;
+      }
       start = vgpu::amd::hipprof::now_ns();
     }
     const vgpu::amd::DispatchStats stats = vgpu::amd::execute(dispatch, mem);

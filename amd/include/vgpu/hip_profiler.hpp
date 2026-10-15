@@ -87,6 +87,11 @@ struct Hooks {
                  uint64_t start_ns, uint64_t end_ns) = nullptr;
   void (*allocated)(int device, uint64_t address, uint64_t bytes, bool freed, uint64_t start_ns,
                     uint64_t end_ns) = nullptr;
+  // Called right after `launching`, with what it returned: a profiler that
+  // samples the program counters of this launch's waves fills in `out` (an
+  // interval of 0 leaves the launch unsampled). The samples are handed to
+  // `out->sample` as the waves run, on the host threads running them.
+  void (*sampling)(void* token, PcSampler* out) = nullptr;
 };
 
 // The clock every time above is on: CLOCK_BOOTTIME in nanoseconds, which is
