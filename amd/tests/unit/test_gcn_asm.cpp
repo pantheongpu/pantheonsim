@@ -363,6 +363,66 @@ VTEST(global_loads_into_lds_land_where_m0_the_offset_and_the_lane_say) {
   VCHECK_EQ(wrong, 0);
 }
 
+// gfx950's three-way IEEE minimum and maximum, one and two halves: IEEE 754-2019's minimum() and
+// maximum() -- a NaN in, a NaN out, and -0 below +0 -- applied twice (CDNA4 ISA, V_MAXIMUM3_F32:
+// D0 = v_maximum_f32(v_maximum_f32(S0, S1), S2)).
+VTEST(three_way_ieee_minimum_and_maximum_on_gfx950) {
+  const amd::CodeObject o = object("asm_minmax3", "gfx950");
+  const auto bits = [](float x) { uint32_t b; std::memcpy(&b, &x, 4); return b; };
+  const auto flt = [](uint32_t b) { float x; std::memcpy(&x, &b, 4); return x; };
+  // IEEE 754-2019 maximum / minimum of two values, on values of either width.
+  const auto ieee = [](double a, double b, bool want_max, bool* nan) {
+    *nan = std::isnan(a) || std::isnan(b);
+    if (*nan) return 0.0;
+    if (a == 0 && b == 0) return want_max ? (std::signbit(a) ? b : a) : (std::signbit(a) ? a : b);
+    return want_max ? std::max(a, b) : std::min(a, b);
+  };
+  const auto three = [&](double a, double b, double c, bool want_max, bool* nan) {
+    bool n1, n2;
+    const double r = ieee(ieee(a, b, want_max, &n1), c, want_max, &n2);
+    *nan = n1 || n2;
+    return r;
+  };
+  std::vector<uint32_t> in(192);
+  const float special[] = {0.0f, -0.0f, 1.0f, -1.0f, INFINITY, -INFINITY, flt(0x7fc00000), flt(0x7f800001), 3.5f, -3.5f};
+  uint32_t seed = 99;
+  const auto next = [&]() { seed = seed * 1103515245u + 12345u; return seed >> 8; };
+  for (uint32_t l = 0; l < 64; ++l) {
+    if (l < 40) {   // the specials, each with each of the others
+      in[l] = bits(special[l % 10]);
+      in[64 + l] = bits(special[(l / 10 + l) % 10]);
+      in[128 + l] = bits(special[(l / 3 + 2 * l) % 10]);
+    } else {        // random bit patterns: floats, and in the halves a NaN, a zero or an infinity now and then
+      for (uint32_t k = 0; k < 3; ++k) in[64 * k + l] = next() << 16 ^ next();
+    }
+  }
+  MemoryManager mem(16ull << 20);
+  const uint64_t in_addr = mem.alloc(192 * 4), out_addr = mem.alloc(256 * 4);
+  mem.write(in_addr, in.data(), 192 * 4);
+  const std::vector<uint32_t> r = run(o, "minmax3", mem, out_addr, 256, {in_addr, out_addr});
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    for (int want_max = 1; want_max >= 0; --want_max) {
+      bool nan;
+      const double want = three(flt(in[l]), flt(in[64 + l]), flt(in[128 + l]), want_max, &nan);
+      const float got = flt(r[(want_max ? 0 : 64) + l]);
+      wrong += nan ? !std::isnan(got) : (std::isnan(got) || got != want || std::signbit(got) != std::signbit(want));
+      // The packed form, a half at a time.
+      uint32_t packed = r[(want_max ? 128 : 192) + l];
+      for (int half = 0; half < 2; ++half) {
+        const auto h = [&](uint32_t w) { uint16_t v = static_cast<uint16_t>(w >> (16 * half)); _Float16 x; std::memcpy(&x, &v, 2); return static_cast<double>(x); };
+        const double hw = three(h(in[l]), h(in[64 + l]), h(in[128 + l]), want_max, &nan);
+        uint16_t gv = static_cast<uint16_t>(packed >> (16 * half));
+        _Float16 gx;
+        std::memcpy(&gx, &gv, 2);
+        const double g = static_cast<double>(gx);
+        wrong += nan ? !std::isnan(g) : (std::isnan(g) || g != hw || std::signbit(g) != std::signbit(hw));
+      }
+    }
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
 // The buffer loads with the LDS bit (CDNA3 and CDNA4 ISA 9.1.9): lane L's data is read from
 //   mem_offset + inst_offset + off_vgpr  (off_vgpr = 16 L here)
 // of a 640-byte resource (zero where that lies past its end) and written to

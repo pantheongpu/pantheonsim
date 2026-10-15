@@ -679,6 +679,10 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x2a3}, {"v_cvt_pk_bf8_f32", 1, 2}},
       {{Enc::Vop3, 0x2a4}, {"v_cvt_sr_fp8_f32", 1, 2}},
       {{Enc::Vop3, 0x2a5}, {"v_cvt_sr_bf8_f32", 1, 2}},
+      // gfx950's IEEE three-way minimum and maximum (CDNA4 ISA: V_MINIMUM3_F32 680, V_MAXIMUM3_F32 681),
+      // and their packed half forms (VOP3P 27 and 28, below).
+      {{Enc::Vop3, 0x2a8}, {"v_minimum3_f32", 1, 3}},
+      {{Enc::Vop3, 0x2a9}, {"v_maximum3_f32", 1, 3}},
       // DS: LDS reads and writes. A read takes the address; a write takes the
       // address and the data.
       {{Enc::Ds, 0x00}, {"ds_add_u32", 0, 2}},
@@ -934,6 +938,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x10}, {"v_pk_mul_f16", 1, 2}},
       {{Enc::Vop3p, 0x11}, {"v_pk_min_f16", 1, 2}},
       {{Enc::Vop3p, 0x12}, {"v_pk_max_f16", 1, 2}},
+      {{Enc::Vop3p, 0x1b}, {"v_pk_minimum3_f16", 1, 3}},
+      {{Enc::Vop3p, 0x1c}, {"v_pk_maximum3_f16", 1, 3}},
       // And the packed float form, where each of the two is a whole register.
       // A multiply-add over sources that may each be a float or a half,
       // rounded to a half and written into one half of the destination.

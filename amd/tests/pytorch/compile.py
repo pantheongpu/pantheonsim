@@ -133,8 +133,30 @@ def training_step():
     return diff(out, want, 1e-3)
 
 
+def nan_propagation():
+    # Inductor lowers relu, maximum and clamp to Triton's tl.maximum / tl.minimum, which on
+    # gfx950 are v_maximum3_f32 and v_pk_maximum3_f16 (IEEE: a NaN in gives a NaN out). The
+    # CPU's answers, with NaNs and signed zeros in the inputs, are the reference.
+    def f(x, y):
+        return torch.relu(x), torch.maximum(x, y), torch.minimum(x, y), torch.clamp(y, -0.5, 0.5)
+    x = torch.randn(257)
+    y = torch.randn(257)
+    x[::7], y[1::7] = float('nan'), float('nan')
+    x[2::11], y[2::11] = 0.0, -0.0
+    for dtype in (torch.float32, torch.float16):
+        a, b = x.to(dtype), y.to(dtype)
+        got = torch.compile(f)(a.cuda(), b.cuda())
+        for g, w in zip(got, f(a, b)):
+            g = g.cpu()
+            if not torch.equal(torch.isnan(g), torch.isnan(w)):
+                return f"{dtype}: NaNs in different places"
+            if not torch.equal(torch.nan_to_num(g, nan=7.0), torch.nan_to_num(w, nan=7.0)):
+                return f"{dtype}: values differ"
+
+
 run('torch.compile with mode="reduce-overhead" (compiled kernels in a HIP graph)', reduce_overhead)
 run('torch.compile of a cumulative sum, product and sort', scan_and_sort)
 run('torch.compile with dynamic shapes', dynamic_shapes)
 run('torch.compile of dropout and rand_like draws new numbers per call', random_numbers)
 run('torch.compile of a training step, forward and backward', training_step)
+run('torch.compile of relu, maximum, minimum and clamp with NaNs in', nan_propagation)

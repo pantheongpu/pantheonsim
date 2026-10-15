@@ -3486,7 +3486,13 @@ struct Machine {
       return;
     }
     Narrowed narrowed(*this, in);
-    if (in.arch == gcn::Target::Gfx1250 && cdna5_alu(w, in, op)) return;
+    // gfx950 has the IEEE three-way minimum and maximum (CDNA4 ISA, V_MINIMUM3_F32, V_MAXIMUM3_F32, V_PK_MINIMUM3_F16,
+    // V_PK_MAXIMUM3_F16), which gfx1250 has the same way ("IEEE minimum()/maximum()", a signaling NaN propagated).
+    if ((in.arch == gcn::Target::Gfx1250 ||
+         (in.arch == gcn::Target::Gfx950 && (op == "v_minimum3_f32"_op || op == "v_maximum3_f32"_op ||
+                                             op == "v_pk_minimum3_f16"_op || op == "v_pk_maximum3_f16"_op))) &&
+        cdna5_alu(w, in, op))
+      return;
     if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) return;
     if (carry_alu(w, in)) return;
     if (more_alu(w, in, op)) return;

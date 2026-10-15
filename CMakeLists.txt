@@ -1678,8 +1678,13 @@ set_tests_properties(amd_pytorch_rx6700xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL 
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};HSA_OVERRIDE_GFX_VERSION=10.3.0" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # torch.compile's Triton kernels, and one written by hand, compiled and loaded
 # at run time.
-add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 8 1)
+add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 9 1)
 set_tests_properties(amd_pytorch_compile PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+# And on gfx950, whose Triton kernels use instructions the others' do not
+# (v_maximum3_f32 for a relu, buffer loads into LDS).
+add_test(NAME amd_pytorch_compile_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 9 1 amd/mi350x)
+set_tests_properties(amd_pytorch_compile_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
 # CUDA graphs (HIP graphs): a model's launches, copies and events recorded by
 # stream capture and replayed, as vLLM's decode step and torch.compile's
