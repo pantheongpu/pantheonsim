@@ -371,4 +371,85 @@ inline uint64_t nonzero_mask(const int* q, bool wide = avx2_available()) {
   return nonzero_mask_scalar(q);
 }
 
+// ---- the encoder's colour conversion ----
+//
+// Y, Cb and Cr of RGB pixels, as float planes, the expressions of nvjpeg_api.cpp's loop (each product rounded to float, the sums
+// from left to right, no fusion: the wide path's target has no FMA):
+//     Y  =         0.299f    * r + 0.587f    * g + 0.114f    * b
+//     Cb = 128.0f - 0.168736f * r - 0.331264f * g + 0.5f      * b
+//     Cr = 128.0f + 0.5f      * r - 0.418688f * g - 0.081312f * b
+inline void ycc_pixel(float r, float g, float b, float* y, float* cb, float* cr) {
+  *y = 0.299f * r + 0.587f * g + 0.114f * b;
+  *cb = 128.0f - 0.168736f * r - 0.331264f * g + 0.5f * b;
+  *cr = 128.0f + 0.5f * r - 0.418688f * g - 0.081312f * b;
+}
+
+// From interleaved bytes, three to a pixel with red at offset ro and blue at offset bo (green is the middle one).
+inline void ycc_from_interleaved_scalar(const uint8_t* px, int ro, int bo, size_t n, float* y, float* cb, float* cr) {
+  for (size_t i = 0; i < n; ++i) ycc_pixel(px[i * 3 + ro], px[i * 3 + 1], px[i * 3 + bo], y + i, cb + i, cr + i);
+}
+// From three planes of bytes.
+inline void ycc_from_planes_scalar(const uint8_t* r, const uint8_t* g, const uint8_t* b, size_t n, float* y, float* cb, float* cr) {
+  for (size_t i = 0; i < n; ++i) ycc_pixel(r[i], g[i], b[i], y + i, cb + i, cr + i);
+}
+
+#ifdef VGPU_HOSTJPEG_AVX2
+__attribute__((target("avx2"))) inline void ycc_eight(__m256 r, __m256 g, __m256 b, float* y, float* cb, float* cr) {
+  const __m256 c128 = _mm256_set1_ps(128.0f);
+  const __m256 vy = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(0.299f), r), _mm256_mul_ps(_mm256_set1_ps(0.587f), g)),
+                                  _mm256_mul_ps(_mm256_set1_ps(0.114f), b));
+  const __m256 vcb = _mm256_add_ps(_mm256_sub_ps(_mm256_sub_ps(c128, _mm256_mul_ps(_mm256_set1_ps(0.168736f), r)), _mm256_mul_ps(_mm256_set1_ps(0.331264f), g)),
+                                   _mm256_mul_ps(_mm256_set1_ps(0.5f), b));
+  const __m256 vcr = _mm256_sub_ps(_mm256_sub_ps(_mm256_add_ps(c128, _mm256_mul_ps(_mm256_set1_ps(0.5f), r)), _mm256_mul_ps(_mm256_set1_ps(0.418688f), g)),
+                                   _mm256_mul_ps(_mm256_set1_ps(0.081312f), b));
+  _mm256_storeu_ps(y, vy);
+  _mm256_storeu_ps(cb, vcb);
+  _mm256_storeu_ps(cr, vcr);
+}
+__attribute__((target("avx2"))) inline void ycc_from_interleaved_avx2(const uint8_t* px, int ro, int bo, size_t n, float* y, float* cb, float* cr) {
+  const __m256i idx = _mm256_setr_epi32(0, 3, 6, 9, 12, 15, 18, 21), mask = _mm256_set1_epi32(0xFF);
+  size_t i = 0;
+  // (each gather reads four bytes at a channel's offset: the last group of pixels is left to the scalar loop so that none reads past the end)
+  for (; i + 9 <= n; i += 8) {
+    const int* base = reinterpret_cast<const int*>(px + 3 * i);
+    const __m256 r = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_i32gather_epi32(reinterpret_cast<const int*>(reinterpret_cast<const uint8_t*>(base) + ro), idx, 1), mask));
+    const __m256 g = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_i32gather_epi32(reinterpret_cast<const int*>(reinterpret_cast<const uint8_t*>(base) + 1), idx, 1), mask));
+    const __m256 b = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_i32gather_epi32(reinterpret_cast<const int*>(reinterpret_cast<const uint8_t*>(base) + bo), idx, 1), mask));
+    ycc_eight(r, g, b, y + i, cb + i, cr + i);
+  }
+  for (; i < n; ++i) ycc_pixel(px[i * 3 + ro], px[i * 3 + 1], px[i * 3 + bo], y + i, cb + i, cr + i);
+}
+__attribute__((target("avx2"))) inline void ycc_from_planes_avx2(const uint8_t* r, const uint8_t* g, const uint8_t* b, size_t n, float* y, float* cb, float* cr) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    const __m256 vr = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(r + i))));
+    const __m256 vg = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(g + i))));
+    const __m256 vb = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + i))));
+    ycc_eight(vr, vg, vb, y + i, cb + i, cr + i);
+  }
+  for (; i < n; ++i) ycc_pixel(r[i], g[i], b[i], y + i, cb + i, cr + i);
+}
+#endif
+
+inline void ycc_from_interleaved(const uint8_t* px, int ro, int bo, size_t n, float* y, float* cb, float* cr, bool wide = avx2_available()) {
+#ifdef VGPU_HOSTJPEG_AVX2
+  if (wide) {
+    ycc_from_interleaved_avx2(px, ro, bo, n, y, cb, cr);
+    return;
+  }
+#endif
+  (void)wide;
+  ycc_from_interleaved_scalar(px, ro, bo, n, y, cb, cr);
+}
+inline void ycc_from_planes(const uint8_t* r, const uint8_t* g, const uint8_t* b, size_t n, float* y, float* cb, float* cr, bool wide = avx2_available()) {
+#ifdef VGPU_HOSTJPEG_AVX2
+  if (wide) {
+    ycc_from_planes_avx2(r, g, b, n, y, cb, cr);
+    return;
+  }
+#endif
+  (void)wide;
+  ycc_from_planes_scalar(r, g, b, n, y, cb, cr);
+}
+
 }  // namespace vgpu::hostjpeg

@@ -263,4 +263,44 @@ VTEST(host_nonzero_mask_matches_the_loop) {
   VCHECK_EQ(bad, 0L);
 }
 
+// The encoder's colour conversion: nvjpeg_api.cpp's loops as they were, against the wide path (interleaved and planar input).
+VTEST(host_ycc_matches_the_original_loops) {
+  std::mt19937_64 rng(2026);
+  long pixels = 0, bad = 0;
+  for (int round = 0; round < 4000; ++round) {
+    const size_t n = round % 40 == 0 ? 0 : 1 + rng() % 200;
+    std::vector<uint8_t> il(n * 3 + 8), r(n + 8), g(n + 8), b(n + 8);
+    for (auto& v : il) v = static_cast<uint8_t>(round % 5 == 0 ? (rng() % 2 ? 255 : 0) : rng());
+    for (size_t i = 0; i < n; ++i) { r[i] = il[i * 3]; g[i] = il[i * 3 + 1]; b[i] = il[i * 3 + 2]; }
+    std::vector<float> wy(n + 8), wcb(n + 8), wcr(n + 8), y(n + 8), cb(n + 8), cr(n + 8);
+    for (size_t i = 0; i < n; ++i) {   // the loops as they were
+      wy[i] = 0.299f * r[i] + 0.587f * g[i] + 0.114f * b[i];
+      wcb[i] = 128.0f - 0.168736f * r[i] - 0.331264f * g[i] + 0.5f * b[i];
+      wcr[i] = 128.0f + 0.5f * r[i] - 0.418688f * g[i] - 0.081312f * b[i];
+    }
+    for (const bool wide : {false, true}) {
+      vgpu::hostjpeg::ycc_from_interleaved(il.data(), 0, 2, n, y.data(), cb.data(), cr.data(), wide);
+      for (size_t i = 0; i < n; ++i) {
+        ++pixels;
+        if (std::memcmp(&y[i], &wy[i], 4) || std::memcmp(&cb[i], &wcb[i], 4) || std::memcmp(&cr[i], &wcr[i], 4)) ++bad;
+      }
+      vgpu::hostjpeg::ycc_from_planes(r.data(), g.data(), b.data(), n, y.data(), cb.data(), cr.data(), wide);
+      for (size_t i = 0; i < n; ++i) {
+        ++pixels;
+        if (std::memcmp(&y[i], &wy[i], 4) || std::memcmp(&cb[i], &wcb[i], 4) || std::memcmp(&cr[i], &wcr[i], 4)) ++bad;
+      }
+      // BGR order: red is the third byte
+      std::vector<uint8_t> bgr(n * 3 + 8);
+      for (size_t i = 0; i < n; ++i) { bgr[i * 3] = b[i]; bgr[i * 3 + 1] = g[i]; bgr[i * 3 + 2] = r[i]; }
+      vgpu::hostjpeg::ycc_from_interleaved(bgr.data(), 2, 0, n, y.data(), cb.data(), cr.data(), wide);
+      for (size_t i = 0; i < n; ++i) {
+        ++pixels;
+        if (std::memcmp(&y[i], &wy[i], 4) || std::memcmp(&cb[i], &wcb[i], 4) || std::memcmp(&cr[i], &wcr[i], 4)) ++bad;
+      }
+    }
+  }
+  std::printf("  %ld pixels, %ld differ\n", pixels, bad);
+  VCHECK_EQ(bad, 0L);
+}
+
 VTEST_MAIN

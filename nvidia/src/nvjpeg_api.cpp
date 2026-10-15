@@ -1125,7 +1125,8 @@ struct BitWriter {
     buf &= (uint64_t(1) << count) - 1;   // (what has not left yet)
   }
   // put(c1, l1) then put(c2, l2), in one go (the two together are at most 32 bits: a Huffman code of up to 16 bits and a value of
-  // up to 15).
+  // up to 15). The bits wait in the 64-bit buffer and go out four bytes at a time unless one of the four is 0xFF (which needs its
+  // stuffed 0x00, as put() writes it); the bytes written, and their order, are the ones a byte-at-a-time writer writes.
   void put2(int c1, int l1, int c2, int l2) {
     if (counting) return;
     const int len = l1 + l2;
@@ -1134,6 +1135,20 @@ struct BitWriter {
     const uint64_t b2 = l2 > 0 ? (static_cast<uint64_t>(static_cast<uint32_t>(c2)) & ((uint64_t(1) << l2) - 1)) : 0;
     buf = (buf << len) | (b1 << (l2 > 0 ? l2 : 0)) | b2;
     count += len;
+    if (count >= 32) {
+      count -= 32;
+      const uint32_t w = static_cast<uint32_t>(buf >> count);
+      if (((~w - 0x01010101u) & w & 0x80808080u) == 0) {
+        const char bytes[4] = {static_cast<char>(w >> 24), static_cast<char>(w >> 16), static_cast<char>(w >> 8), static_cast<char>(w)};
+        out.append(bytes, 4);
+      } else {
+        for (int sh = 24; sh >= 0; sh -= 8) {
+          const uint8_t b = static_cast<uint8_t>(w >> sh);
+          byte(b);
+          if (b == 0xFF) byte(0x00);
+        }
+      }
+    }
     while (count >= 8) {
       count -= 8;
       const uint8_t b = static_cast<uint8_t>((buf >> count) & 0xFF);
@@ -1474,22 +1489,16 @@ std::string encode_planes(const EncoderParams& prm, const std::vector<Plane>& pl
 // converted to YCbCr.
 nvjpegStatus_t read_rgb(const nvjpegImage_t* src, nvjpegInputFormat_t fmt, int width, int height, std::vector<Plane>* ycc) {
   const size_t n = static_cast<size_t>(width) * height;
-  std::vector<uint8_t> r(n), g(n), b(n);
   const auto read = [&](int idx, std::vector<uint8_t>* dst, int w) -> bool {
     if (!src->channel[idx] || src->pitch[idx] < static_cast<size_t>(w)) return false;
     dst->assign(static_cast<size_t>(w) * height, 0);
     return cudaMemcpy2D(dst->data(), w, src->channel[idx], src->pitch[idx], w, height, cudaMemcpyDeviceToHost) ==
            cudaSuccess;
   };
-  if (fmt == NVJPEG_INPUT_RGBI || fmt == NVJPEG_INPUT_BGRI) {
-    std::vector<uint8_t> il;
+  std::vector<uint8_t> il, r, g, b;
+  const bool interleaved = fmt == NVJPEG_INPUT_RGBI || fmt == NVJPEG_INPUT_BGRI;
+  if (interleaved) {
     if (!read(0, &il, width * 3)) return NVJPEG_STATUS_INVALID_PARAMETER;
-    const bool bgr = fmt == NVJPEG_INPUT_BGRI;
-    for (size_t i = 0; i < n; ++i) {
-      r[i] = il[i * 3 + (bgr ? 2 : 0)];
-      g[i] = il[i * 3 + 1];
-      b[i] = il[i * 3 + (bgr ? 0 : 2)];
-    }
   } else if (fmt == NVJPEG_INPUT_RGB || fmt == NVJPEG_INPUT_BGR) {
     const bool bgr = fmt == NVJPEG_INPUT_BGR;
     if (!read(0, bgr ? &b : &r, width) || !read(1, &g, width) || !read(2, bgr ? &r : &b, width))
@@ -1503,11 +1512,16 @@ nvjpegStatus_t read_rgb(const nvjpegImage_t* src, nvjpegInputFormat_t fmt, int w
     p.h = height;
     p.s.resize(n);
   }
-  for (size_t i = 0; i < n; ++i) {
-    (*ycc)[0].s[i] = 0.299f * r[i] + 0.587f * g[i] + 0.114f * b[i];
-    (*ycc)[1].s[i] = 128.0f - 0.168736f * r[i] - 0.331264f * g[i] + 0.5f * b[i];
-    (*ycc)[2].s[i] = 128.0f + 0.5f * r[i] - 0.418688f * g[i] - 0.081312f * b[i];
-  }
+  // (Rows are independent: pieces of the image go to the host's threads.)
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(n) * 12u, height);
+  vgpu::hostpar::parallel_for(threads, height, [&](int64_t row) {
+    const size_t i0 = static_cast<size_t>(row) * width;
+    float* y = (*ycc)[0].s.data() + i0;
+    float* cb = (*ycc)[1].s.data() + i0;
+    float* cr = (*ycc)[2].s.data() + i0;
+    if (interleaved) vgpu::hostjpeg::ycc_from_interleaved(il.data() + i0 * 3, fmt == NVJPEG_INPUT_BGRI ? 2 : 0, fmt == NVJPEG_INPUT_BGRI ? 0 : 2, width, y, cb, cr);
+    else vgpu::hostjpeg::ycc_from_planes(r.data() + i0, g.data() + i0, b.data() + i0, width, y, cb, cr);
+  });
   return NVJPEG_STATUS_SUCCESS;
 }
 
