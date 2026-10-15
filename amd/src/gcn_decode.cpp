@@ -96,6 +96,58 @@ void add_long_forms(std::map<std::pair<Enc, uint32_t>, Shape>& t) {
   for (const auto& [op, sh] : add) t.emplace(std::make_pair(Enc::Vop3, op), sh);   // a listed entry stays
 }
 
+// The formatted buffer accesses of the CDNA parts (CDNA2, CDNA3 and CDNA4 ISA: MUBUF opcodes 0-15, 38 and 39, MTBUF opcodes 0-15).
+void add_format_accesses(std::map<std::pair<Enc, uint32_t>, Shape>& m) {
+  const auto set = [&](Enc e, uint32_t op, Shape sh) { m[{e, op}] = sh; };
+    // The formatted buffer accesses (MUBUF opcodes 0-15, 38 and 39), which HIP's
+    // tex1Dfetch over linear memory compiles to; the CDNA3 and CDNA4 guides list them
+    // too (BUFFER_LOAD_FORMAT_X ... TBUFFER_STORE_FORMAT_D16_XYZW). The data comes in
+    // 32-bit channels, or with d16 as halves packed two to a register.
+    for (const char* kind : {"load", "store"})
+      for (uint32_t c = 1; c <= 4; ++c) {
+        static const char* kX[5] = {"", "x", "xy", "xyz", "xyzw"};
+        const bool store = kind[0] == 's';
+        const uint32_t base = store ? 4 : 0;
+        const uint32_t dregs = (c + 1) / 2;
+        const std::string plain = std::string("buffer_") + kind + "_format_" + kX[c];
+        const std::string half = std::string("buffer_") + kind + "_format_d16_" + kX[c];
+        static std::deque<std::string> names;   // the table keeps pointers to these
+        names.push_back(plain);
+        names.push_back(half);
+        const char* plain_name = names[names.size() - 2].c_str();
+        const char* half_name = names[names.size() - 1].c_str();
+        if (!store) {
+          set(Enc::Mubuf, base + c - 1, {plain_name, c, 3});
+          set(Enc::Mubuf, 8 + base + c - 1, {half_name, dregs, 3});
+        } else {
+          set(Enc::Mubuf, base + c - 1, {plain_name, 0, 4, c});
+          set(Enc::Mubuf, 8 + base + c - 1, {half_name, 0, 4, dregs});
+        }
+      }
+    // And its typed buffer accesses (MTBUF, Table 87: opcodes 0-15), whose data and number formats are the
+    // instruction's own.
+    for (const char* kind : {"load", "store"})
+      for (uint32_t c = 1; c <= 4; ++c) {
+        static const char* kX[5] = {"", "x", "xy", "xyz", "xyzw"};
+        const bool store = kind[0] == 's';
+        const uint32_t base = store ? 4 : 0, dregs = (c + 1) / 2;
+        static std::deque<std::string> names;
+        names.push_back(std::string("tbuffer_") + kind + "_format_" + kX[c]);
+        names.push_back(std::string("tbuffer_") + kind + "_format_d16_" + kX[c]);
+        const char* plain_name = names[names.size() - 2].c_str();
+        const char* half_name = names[names.size() - 1].c_str();
+        if (!store) {
+          set(Enc::Mtbuf, base + c - 1, {plain_name, c, 3});
+          set(Enc::Mtbuf, 8 + base + c - 1, {half_name, dregs, 3});
+        } else {
+          set(Enc::Mtbuf, base + c - 1, {plain_name, 0, 4, c});
+          set(Enc::Mtbuf, 8 + base + c - 1, {half_name, 0, 4, dregs});
+        }
+      }
+  set(Enc::Mubuf, 0x26, {"buffer_load_format_d16_hi_x", 1, 3});
+  set(Enc::Mubuf, 0x27, {"buffer_store_format_d16_hi_x", 0, 4, 1});
+}
+
 const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
   static const std::map<std::pair<Enc, uint32_t>, Shape> t = [] {
     std::map<std::pair<Enc, uint32_t>, Shape> m = {
@@ -1246,6 +1298,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
     };
     add_comparisons(m);
     add_long_forms(m);
+    add_format_accesses(m);
     return m;
   }();
   return t;
@@ -1393,53 +1446,6 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table_gfx90a() {
              {25, "image_atomic_or"}, {26, "image_atomic_xor"}, {27, "image_atomic_inc"},
              {28, "image_atomic_dec"}, {32, "image_sample"}})
       set(Enc::Mimg, op, {name, 1, 0});
-    // Its formatted buffer accesses (MI200 ISA guide, 12.x MUBUF opcodes 0-15,
-    // 38 and 39), which HIP's tex1Dfetch over linear memory compiles to; gfx940
-    // dropped them. The data comes in 32-bit channels, or with d16 as halves
-    // packed two to a register.
-    for (const char* kind : {"load", "store"})
-      for (uint32_t c = 1; c <= 4; ++c) {
-        static const char* kX[5] = {"", "x", "xy", "xyz", "xyzw"};
-        const bool store = kind[0] == 's';
-        const uint32_t base = store ? 4 : 0;
-        const uint32_t dregs = (c + 1) / 2;
-        const std::string plain = std::string("buffer_") + kind + "_format_" + kX[c];
-        const std::string half = std::string("buffer_") + kind + "_format_d16_" + kX[c];
-        static std::deque<std::string> names;   // the table keeps pointers to these
-        names.push_back(plain);
-        names.push_back(half);
-        const char* plain_name = names[names.size() - 2].c_str();
-        const char* half_name = names[names.size() - 1].c_str();
-        if (!store) {
-          set(Enc::Mubuf, base + c - 1, {plain_name, c, 3});
-          set(Enc::Mubuf, 8 + base + c - 1, {half_name, dregs, 3});
-        } else {
-          set(Enc::Mubuf, base + c - 1, {plain_name, 0, 4, c});
-          set(Enc::Mubuf, 8 + base + c - 1, {half_name, 0, 4, dregs});
-        }
-      }
-    // And its typed buffer accesses (MTBUF, Table 87: opcodes 0-15), whose data and number formats are the
-    // instruction's own.
-    for (const char* kind : {"load", "store"})
-      for (uint32_t c = 1; c <= 4; ++c) {
-        static const char* kX[5] = {"", "x", "xy", "xyz", "xyzw"};
-        const bool store = kind[0] == 's';
-        const uint32_t base = store ? 4 : 0, dregs = (c + 1) / 2;
-        static std::deque<std::string> names;
-        names.push_back(std::string("tbuffer_") + kind + "_format_" + kX[c]);
-        names.push_back(std::string("tbuffer_") + kind + "_format_d16_" + kX[c]);
-        const char* plain_name = names[names.size() - 2].c_str();
-        const char* half_name = names[names.size() - 1].c_str();
-        if (!store) {
-          set(Enc::Mtbuf, base + c - 1, {plain_name, c, 3});
-          set(Enc::Mtbuf, 8 + base + c - 1, {half_name, dregs, 3});
-        } else {
-          set(Enc::Mtbuf, base + c - 1, {plain_name, 0, 4, c});
-          set(Enc::Mtbuf, 8 + base + c - 1, {half_name, 0, 4, dregs});
-        }
-      }
-    set(Enc::Mubuf, 0x26, {"buffer_load_format_d16_hi_x", 1, 3});
-    set(Enc::Mubuf, 0x27, {"buffer_store_format_d16_hi_x", 0, 4, 1});
     // The first-level cache's write-back and invalidate.
     set(Enc::Mubuf, 0x29, {"buffer_invl2", 0, 0});
     set(Enc::Mubuf, 0x3e, {"buffer_wbinvl1", 0, 0});
@@ -2123,7 +2129,7 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
                                                                    : in.segment == Inst::Segment::Flat ? 2 : 1;
     in.src.push_back(vgpr(w1 & 0xFF, addr_width));
     if (s.srcs > 1) in.src.push_back(data((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
-  } else if ((w0 >> 26) == 0x3a && g_images) {   // MTBUF: gfx90a's typed buffer accesses
+  } else if ((w0 >> 26) == 0x3a) {   // MTBUF: the typed buffer accesses (CDNA2, CDNA3 and CDNA4 ISA: the same fields)
     // MI200 ISA guide, 13.5.1 (Table 86): OFFSET [11:0], OFFEN 12, IDXEN 13, GLC 14, OP [18:15], DFMT [22:19],
     // NFMT [25:23]; second word: VADDR [7:0], VDATA [15:8], SRSRC [20:16], SLC 22, ACC 23, SOFFSET [31:24].
     const uint32_t w1 = word(code, at + 4);
@@ -2135,7 +2141,7 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.offset = static_cast<int32_t>(w0 & 0xFFF);
     in.offen = (w0 >> 12) & 1;
     in.idxen = (w0 >> 13) & 1;
-    in.cache = ((w0 >> 14) & 1) | ((w1 >> 22) & 1) << 1;   // glc, slc
+    in.cache = ((w0 >> 14) & 1) | ((w1 >> 22) & 1) << 1 | (g_images ? 0u : ((w1 >> 21) & 1) << 2);   // glc, slc (sc0, nt, and gfx940's sc1)
     in.format = ((w0 >> 19) & 0xF) | ((w0 >> 23) & 7) << 4;   // the data format, then the number format above it
     Operand data = vgpr((w1 >> 8) & 0xFF, s.dst_width ? s.dst_width : s.src_width(0));
     if ((w1 >> 23) & 1) data.kind = OperandKind::Agpr;

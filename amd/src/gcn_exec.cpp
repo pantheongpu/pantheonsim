@@ -3132,6 +3132,25 @@ struct Machine {
   // The VALU instructions of the CDNA3 and CDNA4 guides that gfx942 and gfx950 have and that the gfx1250 and RDNA code already does by another
   // name or under the same one: run under the name that code knows (the half-precision "legacy" multiply-adds are the fused ones; a
   // half's product is exact in a float, so one rounding is the same either way).
+  // The instructions of gfx90a that gfx9_added_alu runs, which the CDNA2 guide defines (12.8, 12.9, 12.11: "D.f16 = sin(S0.f16 * 2 * PI)",
+  // the cube-map pseudocode, "4-bit signed int to 32-bit float", "D.i = (int)floor(S0.f + 0.5)", "Fused half precision multiply add",
+  // the frexp pseudocode, "D.f16 = S0.f16 * (2 ** S1.i16)", V_MAD_LEGACY_I16, the packed fused multiply-add, "D.u32 = {16'b0, sat8(...)}").
+  // Left out, as the guide only lists them in its opcode table or leaves open what the CDNA3 text settles: V_MAC_F16 ("D.f16 = S0.f16 *
+  // S1.f16 + D.f16": whether the product is rounded before the add is not said), V_CVT_NORM_{I,U}16_F16, V_CVT_PKACCUM_U8_F32 and
+  // V_MAD_LEGACY_F16.
+  static bool cdna2_defines(const std::string& full) {
+    std::string name = full;
+    for (const char* suffix : {"_e32", "_e64", "_dpp", "_sdwa"})
+      if (name.size() > std::strlen(suffix) && name.compare(name.size() - std::strlen(suffix), std::strlen(suffix), suffix) == 0) {
+        name.resize(name.size() - std::strlen(suffix));
+        break;
+      }
+    static const std::set<std::string_view> kDefined = {
+        "v_sin_f16", "v_cos_f16", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32", "v_cvt_off_f32_i4",
+        "v_cvt_rpi_i32_f32", "v_fma_legacy_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16", "v_ldexp_f16", "v_mad_legacy_i16",
+        "v_pk_fmac_f16", "v_sat_pk_u8_i16"};
+    return kDefined.count(name) != 0;
+  }
   bool gfx9_added_alu(Wave& w, const Inst& in) {
     std::string name = in.name;
     for (const char* suffix : {"_e32", "_e64", "_dpp", "_sdwa"})
@@ -3822,7 +3841,9 @@ struct Machine {
     if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) return;
     if (carry_alu(w, in)) return;
     if (more_alu(w, in, op)) return;
-    if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && gfx9_added_alu(w, in)) return;
+    if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950 || (in.arch == gcn::Target::Gfx90a && cdna2_defines(in.name))) &&
+        gfx9_added_alu(w, in))
+      return;
     if (op == "v_mov_b16_e32"_op || op == "v_mov_b16_e64"_op || op == "v_mov_b16"_op) {
       // RDNA: a half register, or the low half of a constant, into a half.
       for (uint32_t lane = 0; lane < kLanes; ++lane)
@@ -6674,9 +6695,9 @@ struct Machine {
     const uint32_t count = static_cast<uint32_t>(xyzw.size());
     // gfx9 stores a whole element or refuses: the guide says what the store of fewer components than the format has
     // does to the others nowhere.
-    if (storing && in.arch == gcn::Target::Gfx90a && count < image::channels(format))
+    if (storing && !gcn::is_rdna(in.arch) && count < image::channels(format))
       throw Error::make(Err::Unsupported, in.name, " of ", count, " components into a format of ", image::channels(format),
-                        " is decoded but not implemented: the MI200 guide does not say what becomes of the others");
+                        " is decoded but not implemented: the CDNA guides do not say what becomes of the others");
     const bool ints = image::integer(format);
     const uint32_t nbytes = image::texel_bytes(format);
     const auto to_half = [&](uint32_t v) -> uint32_t {
@@ -6698,7 +6719,7 @@ struct Machine {
     if (inside) {
       at(addr).read(addr, bytes, nbytes);
       image::read_texel(format, bytes, raw);
-      if (in.enc == gcn::Enc::Mtbuf && in.arch == gcn::Target::Gfx90a)   // X000, XY00, XYZ0: no alpha of 1 for a missing one
+      if (in.enc == gcn::Enc::Mtbuf && !gcn::is_rdna(in.arch))   // X000, XY00, XYZ0: no alpha of 1 for a missing one (CDNA2, CDNA3, CDNA4)
         for (uint32_t k = image::channels(format); k < 4; ++k) raw[k] = 0;
     }
     if (storing) {
