@@ -369,6 +369,53 @@ modelled:
 - **Scratch:** gfx90a has no flat scratch set up by the hardware. A kernel reaches its private memory through the private segment buffer resource it is handed, with buffer loads and stores the card swizzles across the wave's lanes. The executor hands it that resource and a wave offset, and unswizzles its accesses. This is how rocBLAS's gfx90a kernels spill.
 - **Decoder check:** `tests/data/isa_corpus_gfx90a.txt` holds 1628 instruction shapes from PyTorch's, hipBLASLt's and rocBLAS's gfx90a code. Each decodes, and prints in gfx90a's names (`glc`, `slc`, `v_mfma_f32_32x32x8f16`), as `llvm-objdump` prints it.
 
+## What the CDNA parts still refuse
+
+A coverage probe keeps this list honest: every instruction `llvm-mc` will disassemble for a target (every opcode of each encoding,
+with and without DPP and SDWA, memory forms with and without the LDS bit, and a set of modifier variants of each, 5,000 to
+7,000 forms a target on top of the plain ones) goes into a kernel of its own, and each kernel runs in a process of its own; what stops with
+"decoded but not implemented", "not decoded" or any other unsupported error is the list. gfx90a, gfx942 and gfx950 had 239, 167
+and 211 plain forms in that state before this pass; the CDNA2, CDNA3 and CDNA4 guides settle most of them, and `tests/unit/test_gcn_cdna_gaps.cpp`
+(kernels in `tests/data/asm_cdna_*.s`, one source for the three parts, with the expected values written again from the guides'
+pseudocode) runs what they say:
+
+- 64-bit and double buffer atomics (`buffer_atomic_*_x2`, `_add_f64`, `_min_f64`, `_max_f64`) and gfx950's `buffer_atomic_pk_add_bf16`; the
+  buffer atomics share FLAT's read-modify-write code now.
+- Buffer loads into LDS of a byte, a half and `format_x` (the guides' figure: LDS address `M0[15:0] + offset + 4 * lane`, the data a
+  dword, as `buffer_load_ubyte` and the others say "zero extend to 32 bits"), and on gfx90a the dword form too. `global_load_lds_{ubyte,sbyte,ushort,sshort}`
+  and `scratch_load_lds_*` on gfx942 and gfx950; FLAT's LDS offset is `M0[17:2] * 4`.
+- The rest of LDS's atomics: `ds_mskor_*`, `ds_wrxchg2_*` and `ds_wrxchg2st64_*`, `ds_cmpst_b64`, `ds_cmpst_f64` and `ds_cmpst_rtn_f64`
+  (the float compare), `ds_wrap_rtn_b32`, `ds_condxchg32_rtn_b64`, `ds_nop`, `ds_append` and `ds_consume` (on LDS), the ADDTID pair
+  (`M0[15:0]`), and gfx942's `ds_pk_add_*`.
+- Scalar buffer stores and atomics (`s_buffer_store_*`, `s_buffer_atomic_*`), the cache instructions `s_dcache_*_vol`,
+  `s_dcache_discard*` and gfx90a's `s_atc_probe*` (nothing a program can read changes), `s_setvskip` (vector instructions are skipped),
+  `s_set_gpr_idx_idx` and `_mode`, `s_setreg_b32`, `s_setkill`, `s_cbranch_cdbg*` (not taken: nothing sets the flags), the
+  performance and trace instructions, `v_clrexcp`.
+- Formatted buffer accesses (`buffer_{load,store}_format_*`, `tbuffer_*`) on gfx942 and gfx950: the guides list them, and the
+  executor had only gfx90a's decoder rows for them.
+- gfx90a's `v_sin_f16`, `v_cos_f16`, the cube-map instructions, `v_cvt_rpi_i32_f32`, `v_cvt_off_f32_i4`, `v_frexp_*_f16`, `v_ldexp_f16`,
+  `v_fma_legacy_f16`, `v_mad_legacy_i16`, `v_pk_fmac_f16` and `v_sat_pk_u8_i16`, which its guide defines (gfx942 had them already). The
+  half NaN of a sine or cosine of an infinity is 0xfe00, as the guides' examples have it.
+
+Left refused, with what the guides say (or do not):
+
+- `s_cbranch_g_fork`, `s_cbranch_i_fork`, `s_cbranch_join`: the stack is "six stack entries of 128-bits each, stored in SGPRS" at
+  `SGPR[CSP*4]`, and "requires three SGPRs for each fork/join block"; where it starts and what CSP is at the start are not said.
+- `s_rfe_b64`, `s_rfe_restore_b64`: "may only be used within a trap handler", and `s_trap` ends the launch here. `s_sethalt 1`
+  and `s_sendmsghalt` halt the wave, and nothing resumes a halted wave in this simulator.
+- `s_scratch_load_*` and `s_scratch_store_*`: `CalcScalarScratchAddr` is not defined. `buffer_store_lds_dword` (gfx90a): "Store one DWORD
+  from LDS memory to system memory without utilizing VGPRs", and no LDS address.
+- The image `_pck` forms and LWE (see Textures).
+- `v_exp_legacy_f32`, `v_log_legacy_f32` (the guides give `pow(2.0, S0.f)` and `log2(S0.f)` and not how "legacy" differs),
+  `v_screen_partition_4se_b32` (only in the opcode table), and on gfx90a `v_mac_f16` (not said whether the product is rounded before the add),
+  `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, `v_cvt_pkaccum_u8_f32` and `v_mad_legacy_f16` (only in the table).
+- gfx950: `ds_read_b96_tr_b6` ("Two instruction load a complete matrix. The first loads K values (0..15, 32..47)"), the narrowing and
+  stochastic `v_cvt_scalef32_*` and `v_cvt_sr_*` (their helper functions are not defined), `v_cvt_scalef32_f16_fp8` (the pseudocode stops before
+  the result), `v_mfma_ld_scale_b32` (not in the guide), and an M0 of 64 KiB or more for MUBUF's LDS loads (CDNA4's text says `M0[17:0]`, its
+  figure `M0[15:0]`; gfx90a's and gfx942's text and figure agree on 16 bits, which is what they use).
+- `global_load_lds_dwordx3` writes 12 bytes a lane: the guide gives only DWORDX1 (4 bytes) and DWORDX4 (16) for FLAT, and 16 for the buffer
+  form's "3 or 4 dwords".
+
 ## gfx1250 (Instinct MI455X)
 
 `VGPU_GPU=amd/mi455x` is gfx1250 (CDNA 5): wave32, built on gfx12's instruction set with matrix, tensor, cluster and
@@ -749,7 +796,7 @@ vLLM for ROCm, unmodified, generates on every simulated AMD GPU it supports -- M
 - The default test run is eager (no graphs, no `torch.compile`), with one short sequence and a 3 GB device, so the KV cache fits in RAM. `VGPU_VLLM_MODE=graphs` (ctest `amd_vllm_graphs`, and a second step of the nightly) runs vLLM as it runs by default on a card: Dynamo and Inductor compile the model into Triton kernels, which Triton compiles for the simulated GPU at run time, and the decode step is captured into HIP graphs (piecewise and full) for batch sizes 1 and 2 and replayed per token, two prompts generated together. The test checks the log for the compile and both captures, since vLLM falls back to eager quietly. It took 8 minutes on a simulated MI300X.
 - `VGPU_VLLM_TP=2` (ctest `amd_vllm_graphs_tp2`, the nightly's MI300X job) shards the model over two simulated GPUs, one worker process each: RCCL's all-reduces and vLLM's custom all-reduce, which shares the buffers its graphs capture through HIP's IPC handles, run inside the captured graphs, and the text is the CPU's (12 minutes). That needed two fixes in HIP's IPC: asking twice for the handle of one allocation gave a second handle naming a file that was never made (the first had made it), and `hipMemset` on memory opened from another process wrote through a device address as if it were a host pointer and faulted.
 - What the graph and compiler paths need is checked below vLLM, in PyTorch's own terms (`tests/pytorch/graphs.py`: stream capture of kernels, copies, events, forked streams, allocations, random numbers, attention, a KV-cache decode step replayed per token, `make_graphed_callables`, kept graphs; `compile.py`: `torch.compile` including `mode="reduce-overhead"`, scans, sorts, dynamic shapes, a training step; `triton_kernels.py`: hand-written Triton on MFMA or WMMA in every input type, attention, atomics, reductions; `distributed_graphs.py`: RCCL's all-reduce and all-gather recorded into graphs across two processes, a tensor-parallel block), on every simulated generation.
-- gfx950's Triton kernels needed three things beyond the other generations': `v_minimum3_f32`, `v_maximum3_f32` and the packed half forms (IEEE minimum and maximum of three, a relu in vLLM's compiled model), the scaled conversions of two 4- or 8-bit floats to bfloat16 (`v_cvt_scalef32_pk_bf16_{fp4,fp8,bf8}`, which MX-scaled `tl.dot_scaled` uses with one scale block of K; the other `v_cvt_scalef32_*` forms are still undecoded), and MUBUF loads into LDS (`buffer_load_dword`, `_dwordx3`, `_dwordx4` with the LDS bit, which Triton uses for asynchronous copies, `TRITON_HIP_USE_ASYNC_COPY=1`). The LDS loads are modelled for those three on gfx942 (dword) and gfx950: the sub-dword and `format_x` forms are refused, because the ISA guides do not say whether a byte goes to LDS as one byte or a zero-extended dword; an M0 of 64 KiB or more is refused, because CDNA4's text gives the LDS offset as `M0[17:0]` and its figure as `M0[15:0]`.
+- gfx950's Triton kernels needed three things beyond the other generations': `v_minimum3_f32`, `v_maximum3_f32` and the packed half forms (IEEE minimum and maximum of three, a relu in vLLM's compiled model), the scaled conversions of two 4- or 8-bit floats to bfloat16 (`v_cvt_scalef32_pk_bf16_{fp4,fp8,bf8}`, which MX-scaled `tl.dot_scaled` uses with one scale block of K; the other `v_cvt_scalef32_*` forms are still undecoded), and MUBUF loads into LDS (`buffer_load_dword`, `_dwordx3`, `_dwordx4` with the LDS bit, which Triton uses for asynchronous copies, `TRITON_HIP_USE_ASYNC_COPY=1`). The LDS loads are modelled for those three on gfx942 (dword) and gfx950, and the sub-dword and `format_x` forms too (a byte goes to LDS as a zero- or sign-extended dword, as the guides' instruction text and figure give it); an M0 of 64 KiB or more is refused on gfx950, because CDNA4's text gives the LDS offset as `M0[17:0]` and its figure as `M0[15:0]` (gfx90a and gfx942 take `M0[15:0]`, where the guides agree).
 - vLLM's process ended by aborting, after its output, on a damaged heap: exit() destroys a thread's `thread_local` objects, and then the libraries' static destructors, one of which (hipBLASLt's) still calls HIP. The profiler's per-thread call stack and its table of HIP call names were used after they were destroyed. Both now outlive static destruction (ctest `test_amd_hip_at_exit`: HIP from a static destructor, clean under AddressSanitizer).
 
 ## Debugging

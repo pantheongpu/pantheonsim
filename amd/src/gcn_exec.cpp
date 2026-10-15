@@ -1170,6 +1170,16 @@ struct Machine {
         if (wide) set_sgpr64(w, at, a);
         else set_sgpr(w, at, static_cast<uint32_t>(a));
       }
+    } else if (op == "s_movrelsd_2_b32"_op) {
+      // gfx1250 (CDNA5 ISA, S_MOVRELSD_2_B32): "addrs = SRC0.u32; addrd = DST.u32; addrs += M0.u32[9:0]; addrd += M0.u32[25:16]; SGPR[addrd].b32 =
+      // SGPR[addrs].b32": each raw register number moves on by its own field of M0. As for the other relative moves, an operand that is not a
+      // scalar register, or a number past s101, is refused: the document does not say what either means.
+      if (in.src[0].kind != OperandKind::Sgpr || in.dst[0].kind != OperandKind::Sgpr)
+        throw Error::make(Err::Unsupported, in.name, " with an operand that is not a scalar register, whose raw value the document makes the base");
+      const uint64_t from = uint64_t{in.src[0].index} + (w.m0 & 0x3FFu), to = uint64_t{in.dst[0].index} + ((w.m0 >> 16) & 0x3FFu);
+      if (from >= 102 || to >= 102)
+        throw Error::make(Err::Unsupported, in.name, " reaching scalar register ", std::max(from, to), ", past s101, which the document does not define");
+      set_sgpr(w, static_cast<uint32_t>(to), sgpr(w, static_cast<uint32_t>(from)));
     } else if (op == "s_movk_i32"_op) {
       write_scalar(w, in.dst[0], static_cast<uint64_t>(static_cast<int64_t>(in.simm)));
     } else if (op == "s_addk_i32"_op) {
@@ -7012,7 +7022,7 @@ struct Machine {
   // A read-modify-write of global or flat memory: what it does, and how
   // wide it is.
   enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec,
-                   AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap };
+                   AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap, CondSub, SubClamp };
   struct AtomicOp {
     Rmw rmw = Rmw::Add;
     uint32_t bytes = 4;
@@ -7037,7 +7047,10 @@ struct Machine {
         // RDNA's float min and max, as each generation spells them: gfx10's
         // fmin (fmin_x2 the double), gfx11's min_f32, gfx12's min_num_f32.
         {"fmin", Rmw::MinF32}, {"fmax", Rmw::MaxF32}, {"min_f32", Rmw::MinF32}, {"max_f32", Rmw::MaxF32},
-        {"min_num_f32", Rmw::MinF32}, {"max_num_f32", Rmw::MaxF32}};
+        {"min_num_f32", Rmw::MinF32}, {"max_num_f32", Rmw::MaxF32},
+        // gfx1250's: subtract only where memory is at least the data ("MEM = tmp >= src ? tmp - src : tmp"), and subtract clamped at zero
+        // ("if old_value < DATA.u32 then new_value = 0U else new_value = old_value - DATA.u32").
+        {"cond_sub_u32", Rmw::CondSub}, {"sub_clamp_u32", Rmw::SubClamp}};
     for (auto [name, rmw] : kNames)
       if (what == name) {
         if (a->bytes == 8 && rmw == Rmw::MinF32) rmw = Rmw::MinF64;
@@ -7076,6 +7089,8 @@ struct Machine {
         case Rmw::PkAddF16: return packed_add(b, x, false);
         case Rmw::PkAddBf16: return packed_add(b, x, true);
         case Rmw::CmpSwap: return b == static_cast<uint32_t>(expected) ? x : b;
+        case Rmw::CondSub: return b >= x ? b - x : b;
+        case Rmw::SubClamp: return b < x ? 0u : b - x;
         default: return b;
       }
     }
@@ -7187,6 +7202,18 @@ struct Machine {
     // A flat access that reaches only the device's memory comes here too, so
     // what it does is read from its name past the segment ("load_dwordx4").
     const std::string_view body = std::string_view(op).substr(op.find('_') + 1);
+    if (body == "load_addtid_b32" || body == "store_addtid_b32") {
+      // gfx1250: "RETURN_DATA.u32 = MEM[SGPR_ADDR[63:0] + INST_OFFSET[11:0].b64 + 64'B(laneID.i32 * 4)].u32" (CDNA5 ISA, GLOBAL_LOAD_ADDTID_B32), and the
+      // store's likewise: a scalar base, the 12-bit offset, and four bytes a lane.
+      const uint64_t base = scalar_field(w, in.saddr, true) + (static_cast<uint32_t>(in.offset) & 0xFFFu);
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        if (!(w.exec >> lane & 1)) continue;
+        const uint64_t at = base + 4 * uint64_t{lane};
+        if (body == "load_addtid_b32") write_lane(w, in.dst[0], lane, static_cast<uint32_t>(load(at, 4)));
+        else store(at, 4, lane_src(w, in.src[0], lane));
+      }
+      return;
+    }
     if (body == "load_block" || body == "store_block") {
       // gfx1250: up to 32 consecutive dwords to or from consecutive registers, those M0's bits pick (the ISA lets a block
       // skip "holes" in memory and in the registers alike). A scaled offset is not modelled: the ISA does not say by what.
@@ -8337,6 +8364,14 @@ struct Machine {
     }
     if (OpName(in.name) == "s_sendmsghalt"_op)
       throw Error::make(Err::Unsupported, in.name, " halts the wave after its message, and nothing in this simulator resumes a halted wave");
+    // gfx1250: "Set the round mode from an immediate: SIMM16[3:0]" and the denorm mode likewise (CDNA5 ISA, Table 17; MODE's FP_ROUND is bits 3:0
+    // and FP_DENORM 7:4), and the trace stream's immediate (nothing here keeps one).
+    if (in.arch == gcn::Target::Gfx1250 && (OpName(in.name) == "s_round_mode"_op || OpName(in.name) == "s_denorm_mode"_op)) {
+      const uint32_t at = OpName(in.name) == "s_round_mode"_op ? 0 : 4;
+      w.mode = (w.mode & ~(0xFu << at)) | (static_cast<uint32_t>(in.simm) & 0xFu) << at;
+      return true;
+    }
+    if (in.arch == gcn::Target::Gfx1250 && OpName(in.name) == "s_ttracedata_imm"_op) return true;
     // Performance-counter levels and the thread-trace stream: neither exists here to be changed, and a program cannot read either back.
     if (OpName(in.name) == "s_incperflevel"_op || OpName(in.name) == "s_decperflevel"_op || OpName(in.name) == "s_ttracedata"_op)
       return true;

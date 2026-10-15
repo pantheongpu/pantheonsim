@@ -618,4 +618,88 @@ VTEST(scratch_loads_into_lds_land_as_dwords) {
   }
 }
 
+// gfx1250 (CDNA 5 ISA): the conditional subtract and the subtract clamped at zero (GLOBAL_ATOMIC_COND_SUB_U32, GLOBAL_ATOMIC_SUB_CLAMP_U32,
+// BUFFER_ATOMIC_COND_SUB_U32), the lane-addressed global load and store, S_MOVRELSD_2_B32 (the document's example: M0 = (20 << 16) | 10,
+// s_movrelsd_2_b32 s5, s7 moves s17 to s25), S_ROUND_MODE and S_DENORM_MODE (SIMM16[3:0] into MODE's FP_ROUND and FP_DENORM) and S_TTRACEDATA_IMM.
+VTEST(gfx1250_conditional_and_clamped_subtracts_addtid_accesses_relative_moves_and_mode_immediates_follow_the_document) {
+  const amd::CodeObject o = object("asm_cdna5_gaps", "gfx1250");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> buf(192);
+  uint32_t seed = 99;
+  for (uint32_t& x : buf) x = (seed = seed * 1664525u + 1013904223u) >> 4;
+  for (uint32_t l = 0; l < 32; ++l) {
+    // About half the lanes have memory below the data and half above, and one lane each at equal.
+    const uint32_t data = buf[32 + l];
+    buf[l] = l % 3 == 0 ? data : l % 3 == 1 ? data + 1000 : data - 1000 + (l == 2);
+    buf[64 + l] = l % 2 ? data - 5 : data + 5;
+    buf[96 + l] = l % 4 == 0 ? data : l % 4 == 1 ? data + 77 : data / 2;
+  }
+  const uint64_t b = put(mem, buf), out = mem.alloc(132 * 4);
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = amd::find_kernel(o, "cdna5_gaps");
+  VCHECK(d.kernel != nullptr);
+  std::vector<uint8_t> args(16);
+  std::memcpy(&args[0], &b, 8);
+  std::memcpy(&args[8], &out, 8);
+  d.kernarg = mem.alloc(16);
+  mem.write(d.kernarg, args.data(), 16);
+  d.group_size[0] = 32;
+  d.wave_size = 32;
+  amd::execute(d, mem);
+  const std::vector<uint32_t> got = get<uint32_t>(mem, b, 192), res = get<uint32_t>(mem, out, 132);
+  int wrong = 0;
+  std::string first;
+  const auto check = [&](uint32_t l, const char* what, uint32_t have, uint32_t want) {
+    if (have == want) return;
+    if (++wrong == 1) {
+      char s[128];
+      std::snprintf(s, sizeof s, "lane %u: %s is %08x, wanted %08x", l, what, have, want);
+      first = s;
+    }
+  };
+  for (uint32_t l = 0; l < 32; ++l) {
+    const uint32_t d0 = buf[32 + l], m0 = buf[l], m2 = buf[64 + l], m3 = buf[96 + l];
+    check(l, "cond_sub's old value", res[l], m0);
+    check(l, "cond_sub's memory", got[l], m0 >= d0 ? m0 - d0 : m0);
+    check(l, "sub_clamp's old value", res[32 + l], m2);
+    check(l, "sub_clamp's memory", got[64 + l], m2 < d0 ? 0u : m2 - d0);
+    check(l, "the buffer cond_sub's old value", res[64 + l], m3);
+    check(l, "the buffer cond_sub's memory", got[96 + l], m3 >= d0 ? m3 - d0 : m3);
+    check(l, "the addtid load", res[96 + l], buf[128 + l]);
+    check(l, "the addtid store", got[160 + l], 3 * l + 7);
+  }
+  check(0, "s_movrelsd_2_b32's s25", res[128], 0xabcd1234u);
+  check(0, "MODE[7:0] after s_round_mode 5 and s_denorm_mode 10", res[129], 0xA5u);
+  check(0, "MODE[7:0] with both put back", res[131], 0xF0u);
+  if (wrong) std::fprintf(stderr, "%d wrong; first: %s\n", wrong, first.c_str());
+  VCHECK_EQ(wrong, 0);
+}
+
+namespace {
+// What launching `name` of the object says, or "" where it ran.
+std::string launch_error(const amd::CodeObject& o, const char* name) {
+  MemoryManager mem(16ull << 20);
+  try {
+    launch(o, name, mem, {mem.alloc(16), mem.alloc(16)});
+  } catch (const std::exception& e) {
+    return e.what();
+  }
+  return "";
+}
+}  // namespace
+
+// Where the guides leave it open the executor still refuses, in words that say why (and clearing HALT, which changes nothing, runs).
+VTEST(what_the_guides_leave_open_is_still_refused_by_name) {
+  for (const char* target : kTargets) {
+    const amd::CodeObject o = object("asm_cdna_refused", target);
+    VCHECK_EQ(launch_error(o, "halt_clear"), std::string());
+    VCHECK_CONTAINS(launch_error(o, "halt_set"), "halts the wave");
+    VCHECK_CONTAINS(launch_error(o, "msg_halt"), "halts the wave");
+  }
+  const amd::CodeObject o = object("asm_cdna_refused", "gfx950");
+  VCHECK_CONTAINS(launch_error(o, "m0_high_buffer_lds"), "M0[17:0]");
+  VCHECK_CONTAINS(launch_error(o, "b6_transpose"), "DS opcode 0xe1 is not decoded yet");   // ds_read_b96_tr_b6
+}
+
 VTEST_MAIN
