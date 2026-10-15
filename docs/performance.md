@@ -1385,6 +1385,210 @@ TSan read the tier's shared `Program` built under `std::call_once`; no external-
 about 100 bytes per instruction, built for a whole code section when it first runs, on top of the 176-byte `Instr`; (4) the
 rest of the run-ending ops (BSYNC, EXIT, BAR, SHFL/VOTE) if `divergent`, `shared` and `warp` are to pass 2x.
 
+## Round 9: counting a memory access (`include/vgpu/exec/mem_counters.hpp`), `Module::code_at`, and the shared/local fast paths
+
+A = a fresh Release build (CUDA 13.0 toolkit, GCC 12, LTO, `-g1`) of origin/r8-a at 3ef7a6bd, B = this branch built the same way.
+Both pinned to CPU 6, `tools/bench/bench.sh --ab A B --engines sass,ptx --runs 21`, one host thread, alternating A B A B,
+`bench_counters` identical in every pair. The machine was quiet (load average 1.7-2.8) for the table below; earlier runs of the same
+comparison at load 12-17 had spreads of 40-70% and are not quoted. HeCBench programs run with the arguments of `~/.cache/HeCBench/reduced*.txt`.
+
+**What the profiles said** (`bench.sh profile`, and `perf record` of 51 HeCBench programs on the SASS engine, run for at most 50 s each):
+across the programs the time in `distinct_sectors` was 4.1% on average (14 programs at 5% or more, `base64e` 18.8%), in the bank-pass
+count 2.3% on average (8 programs at 5% or more, `shmembench` 49.7%), in `Module::code_at` 0.6% (`bh` 4.8%), in `count_access` itself
+0.5%; the texel reads (`load_scalar`, `scalar_location`, `resolve_scalar`) are 15% of the `texture` bench workload and 0.0% of every HeCBench
+program (none samples texture code). `perf`'s per-line view of `shmembench` after the counting had been made cheap showed the other cost of a shared-memory access: 20% of its
+samples were the instruction after a 16-byte load in libc's `memcpy`, which waited for the four 4-byte stores that had just built its source
+(store forwarding does not join them).
+
+**What changed** (everything gives the same numbers as before, lane for lane; `VGPU_FASTCOUNT=0` runs the earlier code):
+
+* *Sectors* (`distinct_sectors`, both engines): lanes on a fixed stride are counted by arithmetic (one lane or a broadcast; a stride up to
+  the access width plus 31 bytes, which covers unit stride, strides 2 to 8, 16-byte vectors and the byte strides of a packed record; a
+  column, a stride that is a multiple of 32 bytes). Lanes whose sectors only go one way are counted by a comparison each; a warp that stays
+  within the 64 sectors around its first lane (768 bytes below, 1.2 KB above), in any order, by the set bits of one word (a thread-private array); the rest, up to 32 lanes, by a
+  128-slot hash set that needs no clearing. A warp none of those fit goes to the earlier loop. Every closed form checks every active
+  lane and gives up the moment one does not fit.
+* *Bank passes* (`sass_bank_passes`, `ptx_bank_passes`): lanes on a fixed stride whose words are one to a lane, end to end, overlapping,
+  or all the same (unit stride of 1 to 16 bytes, a broadcast, a column of a tile, strides of 1 to 3 bytes) by arithmetic (the number of
+  distinct words per bank of a run of consecutive words, and `gcd(stride, 32)` for a stride of whole words); anything else by the earlier
+  table.
+* *A coalesced access* the SASS executors move as a run (`load_run`/`store_run`) is counted from its first and last byte
+  (`count_run`, `memcount::run_sectors`) without building the address array.
+* `Module::code_at` (`src/sass/module.cpp`): a table with an entry for each 256 bytes of the code window, built when the module loads (a
+  binary search if the sections are not on that grid, the original scan if they are not in order); `step_warp` asks it only when a warp
+  moves to another section (`Warp::code_hint`, `src/sass/exec.cpp`), where the tier alone did before.
+* The shared and local fast paths of `exec_mem` and the tier (`h_shared`, `h_local`) copy each register word with a copy whose size is
+  known at compile time (`store_lane_bytes`, `load_lane_word`), test "every lane is inside" without a branch per lane
+  (`include/vgpu/exec/window_check.hpp`), and a full warp's addresses are computed in a counted loop.
+
+
+**Same bits.** `bench_counters` (16 workloads, both engines, and with `VGPU_TIER=1`, and with `VGPU_FASTCOUNT=0` which runs the earlier
+code) matches `tools/bench/expected` unchanged; `VGPU_COUNTERS` of 51 of 58 HeCBench programs on the SASS engine and 23 of 24 on the PTX
+interpreter is byte for byte the same as the r8-a build's (the others: three ran past the 120 s limit and so printed a truncated, timing-dependent
+list, one is `btree`, whose counters differ between two runs of the *same* build -- a race in the program --, one finished in time on this
+branch and not on r8-a, two print no counters at all). `tests/unit/test_memcount_forms.cpp` compares `distinct_sectors`,
+`sass_bank_passes`, `ptx_bank_passes` and `run_sectors` with a definition written from scratch (sorted vectors of the sectors and the words)
+over every stride from -70 to 130 bytes and a spread of larger ones, every width, base alignments, masks of the usual shapes, warps of
+32 and 64 lanes, 120,000 random warps of nine shape families (some with one lane moved by a byte, a word or a sector), 150,000 warps of a few
+lanes in no order, wide accesses of 129 to 5000 bytes, and addresses at the top of the address space; `test_memfast`'s 300,000 random warps
+(against the code of before `mem_counters.hpp`) and `test_sass_access_count` pass unchanged; `test_sass_code_at.cpp` compares `code_at` with
+the original scan for modules `load()` places (page table), ones off its grid (binary search) and ones in no order (scan); the window checks
+are compared with the per-lane tests over 400,000 random accesses. A mutant of each closed form's constants and conditions (about 60 in
+all: an off-by-one in each bound, a dropped lane check, the sign of the stride, the byte in the word of the SASS rule, the gcd, the
+endpoint test, the direction test, the hash probe, ...) is caught by those tests except the ones that only turn a closed form off or move
+the border between two (which the general code then counts correctly). `nvidia/tests/e2e/sass_vector_memory.cu` moves 1, 2, 4, 8 and 16
+bytes through shared and local memory by lane-dependent indices and checks every word on the SASS interpreter, the tier and the PTX interpreter
+(also on the RTX 3060 itself: 0 of 4,608 words differ); a build with one wrong word in each of the four shared/local paths fails it in the
+engine the path belongs to, and a build whose `count_run` counts one sector too many fails `bench_counters` (`global_sectors expected 256, got 320`, ...) on the
+SASS interpreter and on the tier. Builds: CUDA 13.0 and CUDA 12.0 (`/usr/bin/nvcc`, g++-12), unit tests and the e2e pass on both.
+
+### Results
+
+Per-call cost of the counting alone, ns for one warp of 32 lanes (`g++-12 -O3`, minimum of three alternating runs, pinned to one CPU;
+the shapes are in the first column):
+
+| shape (32 lanes) | sectors, SASS | sectors, PTX | bank passes, SASS | bank passes, PTX |
+| --- | ---: | ---: | ---: | ---: |
+| unit4 | 39.9 -> 8.7 | 40.5 -> 8.6 | 45.8 -> 8.4 | 42.9 -> 6.8 |
+| unit8 | 45.7 -> 8.6 | 45.3 -> 8.6 | 84.9 -> 8.2 | 83.5 -> 6.7 |
+| unit16 | 45.5 -> 8.6 | 45.2 -> 8.6 | 205.5 -> 8.0 | 201.8 -> 6.7 |
+| unit1 | 42.8 -> 8.6 | 42.9 -> 8.6 | 49.6 -> 7.7 | 47.4 -> 6.5 |
+| unit4_half | 30.6 -> 6.6 | 31.2 -> 6.7 | 28.9 -> 6.6 | 33.9 -> 5.3 |
+| stride2x4 | 44.4 -> 8.6 | 45.2 -> 8.6 | 51.1 -> 8.8 | 47.3 -> 7.8 |
+| stride4x4 | 45.4 -> 8.6 | 45.8 -> 8.6 | 65.5 -> 8.8 | 65.9 -> 8.0 |
+| bcast4 | 42.8 -> 8.6 | 43.3 -> 8.6 | 48.4 -> 7.5 | 46.7 -> 6.0 |
+| rev4 | 58.4 -> 8.5 | 56.9 -> 8.7 | 45.1 -> 8.2 | 39.6 -> 6.8 |
+| col32 | 44.8 -> 8.8 | 45.7 -> 8.7 | 239.8 -> 8.8 | 240.3 -> 7.8 |
+| pad33 | 44.5 -> 30.3 | 46.0 -> 30.8 | 46.0 -> 8.9 | 42.9 -> 8.0 |
+| rand_wide | 150.8 -> 47.5 | 153.0 -> 47.4 | 47.8 -> 53.5 | 49.7 -> 59.2 |
+| rand_small | 78.2 -> 35.6 | 78.9 -> 34.3 | 43.6 -> 48.2 | 43.8 -> 50.7 |
+| unit4_unal | 45.4 -> 8.7 | 44.9 -> 8.7 | 71.5 -> 8.2 | 42.9 -> 6.7 |
+| sh_unit4 | 41.0 -> 8.6 | 40.6 -> 8.6 | 45.0 -> 8.1 | 42.8 -> 6.7 |
+| sh_str2 | 44.4 -> 8.7 | 44.0 -> 8.6 | 53.4 -> 8.9 | 47.9 -> 7.9 |
+| sh_bcast | 42.7 -> 8.6 | 43.9 -> 8.7 | 47.1 -> 7.4 | 46.9 -> 6.0 |
+| sh_2way_pairs | 71.3 -> 35.1 | 68.8 -> 35.1 | 51.6 -> 52.5 | 49.0 -> 54.7 |
+| sh_unit8 | 44.6 -> 8.7 | 45.1 -> 8.7 | 79.5 -> 8.3 | 82.7 -> 6.8 |
+| sh_unit16 | 44.8 -> 8.7 | 46.1 -> 8.7 | 206.1 -> 8.3 | 203.9 -> 6.8 |
+| sh_red | 15.9 -> 4.5 | 16.0 -> 4.5 | 19.9 -> 20.5 | 20.0 -> 20.1 |
+| sh_tile_col | 45.8 -> 8.6 | 45.7 -> 8.6 | 241.1 -> 8.8 | 237.5 -> 7.8 |
+
+The shapes that did not move are the ones with no regular structure and a conflict (a bank-conflicted warp that is not on a stride,
+`sh_red`'s two lanes); a warp that is none of the shapes pays 3 to 8 ns more than before for the closed forms that gave up
+(random 4-byte words over 400 KB: bank passes 48 -> 54 ns, sectors improved by the hash).
+
+Time in the functions, `perf record` (cpu-clock) of the same programs on r8-a (A) and this branch (B), the SASS engine, shares of the program's
+samples (programs of the 51 with the highest shares; the programs that run past 50 s were cut there, so the totals are not comparable, the
+shares are):
+
+| program | `distinct_sectors` (A -> B) | bank-pass count (A -> B) | `Module::code_at` (A -> B) |
+| --- | ---: | ---: | ---: |
+| atomicReduction | 11.0% -> 0.9% | 0.0% -> 0.0% | 0.5% -> 0.0% |
+| base64e | 18.8% -> 6.6% | 0.0% -> 0.0% | 0.0% -> 0.0% |
+| bh | 4.4% -> 0.4% | 0.0% -> 0.0% | 4.8% -> 2.9% |
+| fpdc | 4.0% -> 2.6% | 10.2% -> 3.4% | 0.2% -> 0.0% |
+| radixsort2 | 1.1% -> 0.4% | 5.1% -> 2.8% | 3.8% -> 0.1% |
+| s3d | 9.9% -> 1.2% | 0.0% -> 0.0% | 1.3% -> 0.0% |
+| shmembench | 0.0% -> 0.0% | 49.7% -> 8.5% | 0.0% -> 0.0% |
+| sortKV | 2.0% -> 0.8% | 8.0% -> 4.2% | 1.4% -> 0.0% |
+| blockScan | 3.2% -> 0.3% | 13.1% -> 4.9% | 2.4% -> 0.3% |
+| bn | 11.8% -> 5.5% | 0.0% -> 0.0% | 0.7% -> 0.0% |
+| bsearch | 13.7% -> 6.9% | 0.0% -> 0.0% | 0.0% -> 0.0% |
+| chemv | 10.1% -> 3.1% | 0.0% -> 0.0% | 0.0% -> 0.0% |
+| contract | 12.6% -> 1.7% | 0.0% -> 0.0% | 0.1% -> 0.0% |
+| **mean of 23 programs** | 7.1% -> 2.5% | 4.5% -> 1.2% | 0.8% -> 0.2% |
+
+`tools/bench/bench.sh --ab`, 21 runs, the 16 bench workloads on both engines, one host thread pinned to CPU 6, load average 2.5:
+
+| workload | engine | metric | r8-a (median) | this branch (median) | median ratio | best ratio | p | verdict |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| int_alu | sass | winst_per_cpu_s | 47.543 | 47.852 | 1.007x | 1.010x | 0.070 | same |
+| int_alu | ptx | winst_per_cpu_s | 66.287 | 64.462 | 0.972x | 0.967x | 0.000 | slower |
+| f32_fma | sass | winst_per_cpu_s | 54.027 | 54.025 | 1.000x | 0.995x | 0.379 | same |
+| f32_fma | ptx | winst_per_cpu_s | 79.216 | 79.146 | 0.999x | 0.996x | 0.900 | same |
+| f64_fma | sass | winst_per_cpu_s | 39.255 | 38.771 | 0.988x | 0.989x | 0.005 | same |
+| f64_fma | ptx | winst_per_cpu_s | 39.709 | 39.569 | 0.996x | 1.003x | 0.880 | same |
+| f64_subnormal | sass | winst_per_cpu_s | 7.509 | 7.419 | 0.988x | 0.985x | 0.000 | same |
+| f64_subnormal | ptx | winst_per_cpu_s | 7.623 | 7.652 | 1.004x | 1.004x | 0.218 | same |
+| wmma | sass | winst_per_cpu_s | 5.947 | 6.044 | 1.016x | 1.015x | 0.000 | same |
+| wmma | ptx | winst_per_cpu_s | 4.560 | 4.583 | 1.005x | 0.986x | 0.651 | same |
+| mma_ptx | sass | winst_per_cpu_s | 10.863 | 10.829 | 0.997x | 1.002x | 0.458 | same |
+| mma_ptx | ptx | winst_per_cpu_s | 0.575 | 0.573 | 0.998x | 0.997x | 0.651 | same |
+| mem | sass | winst_per_cpu_s | 13.754 | 15.528 | 1.129x | 1.139x | 0.000 | faster |
+| mem | ptx | winst_per_cpu_s | 13.500 | 14.509 | 1.075x | 1.070x | 0.000 | faster |
+| shared | sass | winst_per_cpu_s | 13.352 | 16.786 | 1.257x | 1.254x | 0.000 | faster |
+| shared | ptx | winst_per_cpu_s | 10.433 | 12.354 | 1.184x | 1.167x | 0.000 | faster |
+| atomics | sass | winst_per_cpu_s | 8.017 | 8.049 | 1.004x | 1.003x | 0.513 | same |
+| atomics | ptx | winst_per_cpu_s | 2.930 | 2.817 | 0.961x | 0.969x | 0.000 | slower |
+| texture | sass | winst_per_cpu_s | 4.319 | 4.406 | 1.020x | 1.025x | 0.000 | faster |
+| texture | ptx | winst_per_cpu_s | 2.364 | 2.433 | 1.029x | 1.022x | 0.000 | faster |
+| local | sass | winst_per_cpu_s | 16.363 | 25.126 | 1.536x | 1.537x | 0.000 | faster |
+| local | ptx | winst_per_cpu_s | 19.277 | 23.764 | 1.233x | 1.239x | 0.000 | faster |
+| divergent | sass | winst_per_cpu_s | 21.140 | 20.962 | 0.992x | 0.992x | 0.001 | same |
+| divergent | ptx | winst_per_cpu_s | 37.271 | 36.547 | 0.981x | 0.973x | 0.000 | same |
+| warp | sass | winst_per_cpu_s | 23.428 | 22.673 | 0.968x | 0.973x | 0.000 | slower |
+| warp | ptx | winst_per_cpu_s | 35.927 | 36.069 | 1.004x | 1.004x | 0.615 | same |
+| launch | sass | units_per_s | 472.328 | 499.158 | 1.057x | 1.064x | 0.000 | faster |
+| launch | ptx | units_per_s | 380.717 | 391.351 | 1.028x | 1.036x | 0.000 | faster |
+| api | sass | units_per_s | 5574.896 | 5529.988 | 0.992x | 1.007x | 0.056 | same |
+| api | ptx | units_per_s | 5584.200 | 5545.423 | 0.993x | 0.996x | 0.035 | same |
+| startup | sass | wall_s | 0.003 | 0.003 | 1.020x | 0.996x | 0.039 | same |
+| startup | ptx | wall_s | 0.011 | 0.010 | 1.016x | 1.001x | 0.302 | same |
+
+The memory workloads are the changes: `mem` 1.13x / 1.08x (SASS / PTX), `shared` 1.26x / 1.18x, `local` 1.54x / 1.23x, `launch` 1.06x / 1.03x and `texture` 1.02x / 1.03x (not investigated). The rows marked "slower" are PTX `int_alu` (0.972x), PTX `atomics` (0.961x) and SASS `warp`
+(0.968x); none of them runs a function this branch changed (`perf record` of `atomics` on the PTX engine lists the same functions in the
+same order on both builds), and **two builds of the same r8-a source differ by as much**: this A (with `-g1`) against another agent's build
+of the same source without it, `bench.sh --ab`, 21 runs, load 2.7: `int_alu` ptx 1.040x, sass 1.060x; `atomics` ptx 1.037x, sass 1.043x;
+`mem` sass 1.042x, all "faster", p = 0.000. A 3-6% difference between two builds of one source is code placement (LTO partitions, alignment),
+not the source; the same comparison between this A and a copy of itself (PTX `atomics`) reads 1.009x. They are reported, not hidden, and not attributed to a
+change.
+
+HeCBench programs (`perf`-sampled in the profile above; timed here by a small script, not in the repository because it needs this machine's
+HeCBench checkout, that alternates A and B runs pinned to CPU 6 and sums the child's user and system CPU seconds: 9 runs of the shorter programs,
+3 of `shmembench`, `blockScan`, `fpdc`, `aop` and `s3d` on the final build; load 2; the rows other than those five were measured on the build
+before `window_check.hpp` was made a header, which moves no code; `VGPU_COUNTERS` output compared on the first pair of runs):
+
+| program | r8-a CPU s, median [range] | this branch | B / A | counters |
+| --- | ---: | ---: | ---: | --- |
+| shmembench | 67.77 [67.51-67.85] | 21.43 [21.35-21.45] | 0.316 | identical |
+| blockScan | 10.43 [10.42-10.45] | 8.40 [8.39-8.50] | 0.806 | identical |
+| s3d | 0.93 [0.92-0.93] | 0.76 [0.76-0.76] | 0.821 | identical |
+| fpdc | 21.11 [20.96-21.35] | 18.91 [18.87-18.91] | 0.896 | identical |
+| aop | 5.48 [5.47-5.50] | 4.99 [4.99-4.99] | 0.911 | identical |
+| bsearch | 0.37 [0.36-0.38] | 0.33 [0.33-0.34] | 0.901 | identical |
+| sortKV | 0.64 [0.64-0.65] | 0.58 [0.58-0.59] | 0.909 | identical |
+| perplexity | 0.73 [0.73-0.74] | 0.67 [0.66-0.67] | 0.908 | identical |
+| axpby | 1.06 [1.06-1.08] | 0.97 [0.97-0.98] | 0.912 | identical |
+| chacha20 | 0.38 [0.37-0.38] | 0.35 [0.35-0.35] | 0.937 | identical |
+| radixsort2 | 8.59 [8.54-8.67] | 7.86 [7.82-7.89] | 0.915 | identical |
+| bwt | 5.57 [5.56-5.59] | 5.20 [5.16-5.25] | 0.933 | identical |
+| boxfilter | 1.43 [1.42-1.44] | 1.34 [1.33-1.35] | 0.937 | identical |
+| clock | 0.53 [0.52-0.53] | 0.50 [0.50-0.51] | 0.954 | identical |
+| asmooth | 0.59 [0.59-0.60] | 0.57 [0.57-0.57] | 0.968 | identical |
+
+`shmembench` does nothing but shared-memory loads and stores of several widths: 3.2x faster, about two thirds of the saving the count
+(49.7% of the samples before, 8.5% after) and one third the copy that waited on its own stores.
+
+### Not done, and negative results
+
+* *Texel reads.* `texel_channel_bits` makes one `load_scalar` per channel, which on the `texture` workload is 15% of the samples
+  (`resolve_scalar` 3.8, `scalar_location` 3.4, `texel_raw` 4.0, `load_scalar` 2.0, `load_at` 1.9). The obvious change -- one `load_run`
+  for all the channels of a texel -- would not be cheaper: `MemoryManager::run_allocation` takes the allocation table's reader lock on every
+  call and has none of the per-thread lookup memory `load_scalar` uses (`find_ordinary`), so one locked lookup replaces four cached ones.
+  A cached multi-element read in the memory manager would be the right place; not done (the memory layer is not this branch's, and none of
+  the 51 HeCBench programs samples texture code).
+* *PTX atomics.* The interpreter's `exec_atom` does `load_scalar` then `store_scalar` for each lane: two lookups (40% of the PTX `atomics` workload is
+  in `resolve_scalar`, `scalar_location`, `load_scalar`, `store_scalar`). A read-modify-write that looks the address up once would halve it;
+  it belongs to the memory layer and the interpreter, and was not touched.
+* *Local memory layout.* `base64e` spends about a third of its time in the local-memory fast path, where lane `l`'s byte `o` is at
+  `local[l * local_size + o]`, so a warp-wide access touches 32 cache lines; interleaving by words, as the hardware does, would touch one. Every
+  user of `Warp::local` would change; not done.
+* *Bank passes of warps that are not on a stride* (a tile read two rows at a time, a reduction's every-eighth lane) and sector counts
+  for 33 to 64 active lanes that are neither on a stride nor monotone still take the earlier code. `sass_bank_passes` is still 3 to 5% of
+  `blockScan`, `sortKV`, `fpdc`; `shmembench` 8.5%.
+* *Two-section ping-pong.* `bh` still spends about 5% in `fetch` and `Module::code_at`: a divergent warp alternates between a kernel's section
+  and a device function's, so the one-entry `Warp::code_hint` misses; a two-entry hint would catch it.
+
+
 ## Using this to check a change
 
 1. Build baseline and candidate in separate build directories (same flags).

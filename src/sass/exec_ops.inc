@@ -2953,6 +2953,64 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
   }
 }
 
+// count_access for a coalesced run: the lanes of `ex`, which are the `count` consecutive ones from `first`, made their
+// accesses of `bytes` bytes at g0, g0 + bytes, ... in global memory. The lanes' sectors are those from the first
+// byte's to the last's (memcount::run_sectors), so no address array is built; when that closed form does not apply
+// (VGPU_FASTCOUNT=0, or a run that would wrap) the addresses are built and counted as count_access does.
+void count_run(exec::LaunchStats& st, bool store, uint64_t g0, unsigned first, unsigned count, Mask ex, uint32_t bytes) {
+  uint64_t distinct;
+  if (!exec::memcount::run_sectors(g0, uint64_t{count} * bytes, distinct)) {
+    uint64_t addrs[32] = {};
+    for (unsigned i = 0; i < count; ++i) addrs[first + i] = g0 + uint64_t{i} * bytes;
+    count_access(st, 0, store, addrs, ex, bytes);
+    return;
+  }
+  const uint64_t n = count;
+  (store ? st.global_stores : st.global_loads) += n;
+  (store ? st.global_bytes_written : st.global_bytes_read) += n * bytes;
+  st.global_sectors += distinct;
+  ++st.global_requests;
+  (store ? st.global_sectors_st : st.global_sectors_ld) += distinct;
+  ++(store ? st.global_requests_st : st.global_requests_ld);
+  (store ? st.global_bytes_st : st.global_bytes_ld) += n * bytes;
+}
+
+// One lane's access to shared or local memory moves `B` bytes (1, 2, 4, 8 or 16) between the register file and an array.
+// The words are copied one at a time, each with a copy whose size is known at compile time (a move, not a call into
+// libc): the first versions put the words in a four-word temporary and copied it with a copy of `bytes` bytes, which
+// was a library call per lane, and, for 8 and 16 bytes, a load that had to wait for the four narrow stores that made
+// the temporary (store forwarding cannot join them). What lands in memory and in the registers is the same bytes.
+template <unsigned B, class Word>
+inline void store_lane_bytes(uint8_t* dst, Word&& word) {
+  if constexpr (B < 4) {
+    const uint32_t v = word(0u);
+    std::memcpy(dst, &v, B);
+  } else {
+    for (unsigned i = 0; i < B / 4; ++i) {
+      const uint32_t v = word(i);
+      std::memcpy(dst + 4 * i, &v, 4);
+    }
+  }
+}
+template <unsigned B>
+inline uint32_t load_lane_word(const uint8_t* src, unsigned i = 0) {   // (the i-th word; for B < 4, the low B bytes)
+  uint32_t v = 0;
+  std::memcpy(&v, src + 4 * i, B < 4 ? B : 4);
+  return v;
+}
+// Calls f with the width as a std::integral_constant, for the widths above; false for any other (the caller's general code).
+template <class F>
+inline bool with_lane_width(unsigned bytes, F&& f) {
+  switch (bytes) {
+    case 1: f(std::integral_constant<unsigned, 1>{}); return true;
+    case 2: f(std::integral_constant<unsigned, 2>{}); return true;
+    case 4: f(std::integral_constant<unsigned, 4>{}); return true;
+    case 8: f(std::integral_constant<unsigned, 8>{}); return true;
+    case 16: f(std::integral_constant<unsigned, 16>{}); return true;
+    default: return false;
+  }
+}
+
 void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned size = ins.f[0];
   const uint32_t bytes = size <= 1 ? 1 : size <= 3 ? 2 : size == 4 ? 4 : size == 5 ? 8 : size == 8 ? 32 : 16;
@@ -3005,6 +3063,16 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       return;
     }
     const uint32_t* lo = &w.reg(ra, 0);
+    if (lanes == kAll) {   // a full warp (the usual case): all 32 in a counted loop, which needs no lane-by-lane bit search
+      const uint32_t mul = stride ? stride : 1;
+      if (wide) {
+        const uint32_t* hi = &w.reg(ra + 1, 0);
+        for (unsigned l = 0; l < 32; ++l) out[l] = (lo[l] | (static_cast<uint64_t>(hi[l]) << 32)) * mul + base;
+      } else {
+        for (unsigned l = 0; l < 32; ++l) out[l] = uint64_t{lo[l]} * mul + base;
+      }
+      return;
+    }
     if (wide) {
       const uint32_t* hi = &w.reg(ra + 1, 0);
       for (Mask m = lanes; m; m &= m - 1) {
@@ -3098,8 +3166,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             }
           }
           if (done) {
-            for (unsigned i = 0; i < count; ++i) addrs[first + i] = g0 + uint64_t{i} * bytes;
-            count_access(blk.st, 0, store, addrs, ex, bytes);
+            count_run(blk.st, store, g0, first, count, ex, bytes);
             return;
           }
         }
@@ -3234,35 +3301,57 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // out first (they only read registers); if any lane's is another block's or out of range, the loop
         // below runs instead and finds the lane that faults, exactly as it always did.
         const uint64_t ssize = blk.shared.size();
-        bool inside = true;
         uint64_t sa[32];
         row_addresses(a, false, ur, store ? 64 : 32, ex, sa, stride);
+        // (Every lane in this block's window and its last byte inside the array, with no branch per lane: see window_check.hpp.)
+        exec::SharedWindowCheck window;
         for (Mask m = ex; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint64_t off = static_cast<uint32_t>(sa[l]);
           addrs[l] = off;
-          inside = inside && (off >> 24) == blk.rank && (off & 0xffffff) + bytes <= ssize;
+          window.add(off, blk.rank);
         }
+        const bool inside = window.inside(ssize, bytes, ex != 0);
         if (inside) {
           uint8_t* sh = blk.shared.data();
-          if (store) {
-            const Operand& d = ins.src[1];
-            each_lane(ex, [&](unsigned l) {
-              uint32_t v[4] = {};
-              for (unsigned i = 0; i < std::max(1u, bytes / 4); ++i) v[i] = d.reg == kRZ ? 0 : w.reg(d.reg + i, l);
-              if (bytes == 4) std::memcpy(sh + (addrs[l] & 0xffffff), v, 4);
-              else std::memcpy(sh + (addrs[l] & 0xffffff), v, bytes);
-            });
-          } else {
-            const Operand& d = ins.dst[0];
-            each_lane(ex, [&](unsigned l) {
-              uint32_t v[4] = {};
-              if (bytes == 4) std::memcpy(v, sh + (addrs[l] & 0xffffff), 4);
-              else std::memcpy(v, sh + (addrs[l] & 0xffffff), bytes);
-              if (bytes <= 4) write32(w, d, l, extend(v[0]));
-              else if (d.reg != kRZ)
-                for (unsigned i = 0; i < bytes / 4; ++i) w.reg(d.reg + i, l) = v[i];
-            });
+          const bool moved = with_lane_width(bytes, [&](auto width) {
+            constexpr unsigned B = decltype(width)::value;
+            if (store) {
+              const Operand& d = ins.src[1];
+              each_lane(ex, [&](unsigned l) {
+                store_lane_bytes<B>(sh + (addrs[l] & 0xffffff),
+                                    [&](unsigned i) -> uint32_t { return d.reg == kRZ ? 0u : w.reg(d.reg + i, l); });
+              });
+            } else {
+              const Operand& d = ins.dst[0];
+              each_lane(ex, [&](unsigned l) {
+                const uint8_t* at = sh + (addrs[l] & 0xffffff);
+                if constexpr (B <= 4) {
+                  write32(w, d, l, extend(load_lane_word<B>(at)));
+                } else if (d.reg != kRZ) {
+                  for (unsigned i = 0; i < B / 4; ++i) w.reg(d.reg + i, l) = load_lane_word<B>(at, i);
+                }
+              });
+            }
+          });
+          if (!moved) {   // (a width the code above is not made for: the general copy, as it always was)
+            if (store) {
+              const Operand& d = ins.src[1];
+              each_lane(ex, [&](unsigned l) {
+                uint32_t v[4] = {};
+                for (unsigned i = 0; i < std::max(1u, bytes / 4); ++i) v[i] = d.reg == kRZ ? 0 : w.reg(d.reg + i, l);
+                std::memcpy(sh + (addrs[l] & 0xffffff), v, bytes);
+              });
+            } else {
+              const Operand& d = ins.dst[0];
+              each_lane(ex, [&](unsigned l) {
+                uint32_t v[4] = {};
+                std::memcpy(v, sh + (addrs[l] & 0xffffff), bytes);
+                if (bytes <= 4) write32(w, d, l, extend(v[0]));
+                else if (d.reg != kRZ)
+                  for (unsigned i = 0; i < bytes / 4; ++i) w.reg(d.reg + i, l) = v[i];
+              });
+            }
           }
           count_access(blk.st, 1, store, addrs, ex, bytes);
           return;
@@ -3274,28 +3363,45 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // the loop below runs and finds the one that faults, as it always did.)
         uint64_t la[32];
         row_addresses(a, false, ur, store ? 64 : 32, ex, la);
-        bool inside = true;
+        exec::LocalWindowCheck window;
         for (Mask m = ex; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint64_t off = static_cast<uint32_t>(la[l]);
           addrs[l] = off;
-          inside = inside && off + bytes <= w.local_size;
+          window.add(off);
         }
+        const bool inside = window.inside(w.local_size, bytes, ex != 0);
         if (inside) {
           if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
           const Operand& d = store ? ins.src[1] : ins.dst[0];
-          for (Mask m = ex; m; m &= m - 1) {
-            const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-            uint8_t* const at = &w.local[size_t{l} * w.local_size + addrs[l]];
-            uint32_t v[4] = {};
-            if (store) {
-              for (unsigned i = 0; i < std::max(1u, bytes / 4); ++i) v[i] = d.reg == kRZ ? 0 : w.reg(d.reg + i, l);
-              std::memcpy(at, v, bytes);
-            } else {
-              std::memcpy(v, at, bytes);
-              if (bytes <= 4) write32(w, d, l, extend(v[0]));
-              else if (d.reg != kRZ)
-                for (unsigned i = 0; i < bytes / 4; ++i) w.reg(d.reg + i, l) = v[i];
+          const bool moved = with_lane_width(bytes, [&](auto width) {
+            constexpr unsigned B = decltype(width)::value;
+            for (Mask m = ex; m; m &= m - 1) {
+              const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+              uint8_t* const at = &w.local[size_t{l} * w.local_size + addrs[l]];
+              if (store) {
+                store_lane_bytes<B>(at, [&](unsigned i) -> uint32_t { return d.reg == kRZ ? 0u : w.reg(d.reg + i, l); });
+              } else if constexpr (B <= 4) {
+                write32(w, d, l, extend(load_lane_word<B>(at)));
+              } else if (d.reg != kRZ) {
+                for (unsigned i = 0; i < B / 4; ++i) w.reg(d.reg + i, l) = load_lane_word<B>(at, i);
+              }
+            }
+          });
+          if (!moved) {   // (bytes <= 16 here, and 3, 5, 6, 7, 9..15 do not occur: kept as it was)
+            for (Mask m = ex; m; m &= m - 1) {
+              const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+              uint8_t* const at = &w.local[size_t{l} * w.local_size + addrs[l]];
+              uint32_t v[4] = {};
+              if (store) {
+                for (unsigned i = 0; i < std::max(1u, bytes / 4); ++i) v[i] = d.reg == kRZ ? 0 : w.reg(d.reg + i, l);
+                std::memcpy(at, v, bytes);
+              } else {
+                std::memcpy(v, at, bytes);
+                if (bytes <= 4) write32(w, d, l, extend(v[0]));
+                else if (d.reg != kRZ)
+                  for (unsigned i = 0; i < bytes / 4; ++i) w.reg(d.reg + i, l) = v[i];
+              }
             }
           }
           count_access(blk.st, 2, store, addrs, ex, bytes);

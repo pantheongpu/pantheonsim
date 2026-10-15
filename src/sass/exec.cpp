@@ -42,6 +42,7 @@
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/mem_counters.hpp"
+#include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/texture_grad.hpp"
@@ -99,7 +100,7 @@ struct Warp {
   uint64_t bssy_stamp[16] = {};       // when (Block::bssy_clock) each barrier was last set up: higher is more deeply nested
   uint64_t rpc[32] = {};              // the return-address register (RPCMOV)
   uint64_t gmma_issued = 0;           // warpgroup MMAs this warp has issued
-  const Code* code_hint = nullptr;    // the code section the tier last found this warp in
+  const Code* code_hint = nullptr;    // the code section this warp last ran in (step_warp)
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
   uint32_t local_size = 0;
   uint64_t steps = 0;
@@ -1378,17 +1379,18 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   // reads its own pc (LEPC) end the run and take the general path.
   uint64_t pc = pick;
   const Code* code = nullptr;
+  // The section the warp ran in last is most often the one it is in, so Module::code_at is asked only when it moves
+  // to another (a call into a device function, a return). A pc in no section is fetch's fault, as before.
+  if (w.code_hint && pc - w.code_hint->base < 16 * w.code_hint->count) {
+    code = w.code_hint;
+  } else {
+    fetch(pc, &code);
+    w.code_hint = code;
+  }
   if (tier_ && !w.mactive_force) {
-    // The section the warp ran in last is most often the one it is in (Module::code_at searches them all).
-    if (w.code_hint && pc - w.code_hint->base < 16 * w.code_hint->count) {
-      code = w.code_hint;
-    } else {
-      fetch(pc, &code);
-      w.code_hint = code;
-    }
     if (const tier::Program* tp = code->tier_program()) return tier_run(blk, w, group, pick, *code, *tp);
   }
-  const Instr* ins = &fetch(pc, &code);
+  const Instr* ins = &code->instr((pc - code->base) / 16);
   const uint64_t end = code->base + 16 * code->count;
   for (unsigned n = 0;; ++n) {
     // A warp's first store to global memory ends its turn, once, so that the block's other warps issue the loads

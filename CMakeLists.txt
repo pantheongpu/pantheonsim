@@ -1250,6 +1250,10 @@ vgpu_unit_test(test_sched)
 vgpu_unit_test(test_sass_access_count)
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
+# The closed forms of the sector and bank-pass counters, against the definition of what they count.
+vgpu_unit_test(test_memcount_forms)
+# Module::code_at (a binary search over the code sections) against the scan it replaced.
+vgpu_unit_test(test_sass_code_at)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
@@ -2448,6 +2452,14 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_atomic_cas
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_atomic_cas.sh)
   set_tests_properties(e2e_atomic_cas PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # Shared and local memory moved 1 to 16 bytes at a time, on the SASS interpreter, the SASS tier and the PTX interpreter.
+  add_test(NAME e2e_sass_vector_memory
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_vector_memory.sh)
+  set_tests_properties(e2e_sass_vector_memory PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
