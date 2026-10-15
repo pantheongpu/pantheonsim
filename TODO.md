@@ -2165,6 +2165,65 @@ not work for the simulator:
   (`tiny causal transformer ... key biases left out of the update`, a full-tier check, passes). No tolerance was
   loosened. The entry can only go if the check changes what it tests.
 
+### CUDA Samples known differences
+
+The nightly's `cuda-samples` job (ci/external/suites.sh, ci/external/cuda-samples.txt) compares each of
+NVIDIA's CUDA Samples v13.0 with what an RTX 3060 printed. `ci/external/cuda-samples-known.txt` lists the
+programs that still differ, each with a class and a reason. It is a ratchet: a listed program that still
+differs is reported, one that starts matching fails the job until it is taken off, and any other difference
+fails as before. What was found on 2026-10-15 (run 38576253348 listed 18 differences; the others of
+the 133 matched):
+
+Fixed in the simulator, each with a test that fails without the fix:
+
+- `cudaCompressibleMemory`: `CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED` answered 0, where an RTX 3060,
+  L4, L40S and RTX PRO 6000 answer 1 and hand out memory whose properties say it is compressed, so the sample
+  waived itself (exit 2). `e2e_vmm`.
+- `MersenneTwisterGP11213`: `curandCreateGeneratorHost` copied its numbers to the caller's host array as if
+  it were device memory, so the reference was zeros (`L1 norm: INF`). `e2e_rand_paths`.
+- `convolutionFFT2D`: cudaMalloc pointers were 256-byte aligned and a texture over one needs 512
+  (`cudaCreateTextureObject` refused the second test's buffer). `e2e_malloc_alignment`.
+- `quasirandomGenerator` and its NVRTC twin: the SASS decoder read the byte select of `R2P` (`R2P PR, R5.B1`,
+  `.B2`, `.B3`, which ptxas makes of an unrolled shift-and-test loop) from the wrong bits from Ampere on, so
+  every group of tests after the first repeated the first group's. `e2e_constant_table_xor`.
+
+Fixed in the suite: `cuSolverDn_LinearSolver`, `cuSolverSp_LowlevelCholesky` and `cuSolverSp_LowlevelQR`
+had a `|` in their markers, which split the list's line; and the nine cuSPARSE and cuSOLVER C++ samples did
+not link where `libnvJitLink.so.13` is not installed (see `build()` in suites.sh).
+
+Still different, each listed in `cuda-samples-known.txt`:
+
+- `UnifiedMemoryPerf` (simulator gap): every launch runs to completion inside the launch call (ARCHITECTURE: the
+  engine is synchronous), so a kernel that waits for the host to do something after launching it never ends,
+  and the step budget stops it (`a warp ran 1073741824 instructions`, then `cudaErrorLaunchTimeout`).
+  Reproducer:
+  `__global__ void spin(volatile unsigned* f) { while (*f < 1); }  int main() { unsigned* f; cudaMallocHost(&f, 4); *f = 0; cudaStream_t s; cudaStreamCreate(&s); spin<<<1,1,0,s>>>(f); *f = 1; cudaStreamSynchronize(s); }`
+  finishes on a card and hangs here. The fix is kernels that run beside the host thread (a worker per stream, with
+  events and `cudaStreamWaitEvent` ordering them): `nvidia/src/runtime_api.cpp` (the launch entry points) and
+  `src/runtime/runtime.cpp`. Large, and every eager-error and capture path assumes the synchronous engine.
+- `conjugateGradientCudaGraphs` (simulator gap, not yet found): the same loop of cuBLAS and cuSPARSE calls
+  converges when run call by call (`conjugateGradient` and `conjugateGradientUM` match) and diverges when
+  captured into a graph (the residual grows by about 1025 each iteration). `graph_cg_capture` runs both and prints
+  the scalars (alpha, -alpha, beta, the dots) after each iteration; the library calls are recorded in
+  `nvidia/src/capture_defer.hpp`.
+- `simpleCUFFT_callback` (cannot match): the sample links `libcufft_static.a`, which carries NVIDIA's own CUDA
+  runtime; that asks the driver for its internal export table (`cuGetExportTable`), which a simulated driver
+  does not have, and `cufftMakePlan1d` returns `CUFFT_INTERNAL_ERROR`. The simulator's cuFFT shim has legacy
+  callbacks of its own (`e2e_fft_legacy_callbacks`), for programs that link the shared library.
+- `quasirandomGenerator` and `quasirandomGenerator_nvrtc`: with the decoder fixed the simulated GPU's numbers
+  agree with the CPU's to an L1 norm of 7.3e-12, where the card printed 9.439909E-08. The sample's CPU reference
+  is built by the sample's own host code from a table it generates, and the card's norm is that of a table built by
+  another compiler. The first norm printed is a property of the host build as much as of the GPU. Not proven here:
+  nothing but the card could say which build the 9.4e-8 came from.
+- `graphMemoryFootprint` and `simpleAttributes` (too slow): the first launches a 16.7M-thread kernel sixteen times,
+  each thread spinning on `clock()` for 8900 clocks (the simulator's `clock()` is its instruction count); it did not
+  finish in 3000 s. The second launches 65535 x 1024 threads that each loop about 700 times on a shared counter.
+  Neither is run (class `skipped`), where simpleAttributes used to burn the nightly's 600 s timeout every night.
+
+Also found, not in the list: on the hosted toolchain image `convolutionFFT2D` matches the card but its SASS and PTX
+engines leave different bytes after `spPostprocess2D_kernel` (launch 5; the digest in `external-smoke.yml`),
+which has not been looked into.
+
 ### Tooling, CI and process
 
 - Trace record/replay and a conformance database with compatibility scores: not started.
