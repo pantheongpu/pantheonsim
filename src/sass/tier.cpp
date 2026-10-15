@@ -264,7 +264,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "ldc",
-                                      "bsync", "yield", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
+                                      "bsync", "yield", "bar", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -394,6 +394,24 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.c = ins.src[0].reg;
       accept(Form::Bsync);
       return;
+    case Op::BAR: {   // a block barrier (B2R, which reads the last reduction's result, is the interpreter's)
+      if (ins.mnemonic != "BAR" || ins.src.empty() || (ins.f[2] % 32) != 0) return;   // (a count that is no multiple of 32 is an error there)
+      const unsigned mode = ins.f[0];
+      if (mode == 2 && ins.src.back().kind != Kind::Pred && ins.src.back().kind != Kind::UPred) return;
+      if (ins.src[0].kind == Kind::Imm) {
+        if (ins.src[0].imm < 0 || ins.src[0].imm >= 16) return;
+        m.c = static_cast<uint32_t>(ins.src[0].imm);
+        m.aux = 1;   // a fixed barrier; else its number is read from lane 0 at run time
+      } else if (!plain_kind(ins.src[0]) || !src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg)) {
+        return;
+      }
+      m.a = mode;
+      m.b = ins.f[1];
+      m.imm = ins.f[2];   // the thread count, or 0
+      if (mode == 2) m.p = pred_src(ins.src.back());
+      accept(Form::Bar);
+      return;
+    }
     case Op::SHFL: {   // a shuffle: value, lane and clamp as 32 lanes each; the value to dst[1], the in-range predicate to dst[0]
       if (ins.dst.size() != 2 || ins.dst[0].kind != Kind::Pred || ins.dst[1].kind != Kind::Reg || ins.src.size() < 3) return;
       for (int i = 0; i < 3; ++i) {

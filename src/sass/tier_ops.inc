@@ -1404,6 +1404,32 @@ inline void tier_release_bsync(Warp& w, unsigned x) {
   }
 }
 
+// A block barrier's release (exec_control's release_bar): once the barrier has all the threads it waits for -- every live thread of
+// the block, or the count it was named with -- the warps' lanes waiting at it go on, every warp learns the reduction's result, and
+// the barrier is reset.
+inline void tier_release_bar(Block& blk, unsigned id) {
+  Block::Barrier& b = blk.bars[id];
+  uint32_t live = 0;
+  for (const Warp& ww : blk.warps) live += static_cast<uint32_t>(std::popcount(ww.alive & ~ww.exited));
+  const uint32_t expected = b.expected ? b.expected : live;
+  if (b.arrived < expected) return;
+  for (Warp& ww : blk.warps) {
+    for (Mask m = ww.waiting; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      if (ww.wait_kind[l] == Wait::Bar && ww.wait_arg[l] == id) {
+        ww.waiting &= ~(Mask{1} << l);
+        ww.wait_kind[l] = Wait::None;
+        ww.pc[l] += 16;
+      }
+    }
+  }
+  for (Warp& ww : blk.warps) {
+    ww.b2r = b.red == 0 ? b.popc : b.red == 1 ? b.and_ : b.or_;
+    ww.b2r_pred = b.red == 0 ? b.popc != 0 : b.red == 1 ? b.and_ : b.or_;
+  }
+  b = Block::Barrier{};
+}
+
 bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
   TCtx c{&w, &blk, this, w.r.data(), bank0_.data(), bank0_.size(), tp.pool.data(), &simd::kernels()};
   exec::LaunchStats& st = blk.st;
@@ -1527,6 +1553,46 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
       w.yield = true;
       tier_set_pcs(w, group, here + 16);
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::YIELD)].fetch_add(1, std::memory_order_relaxed);
+    } else if (last.form == tier::Form::Bar) {
+      // exec_control's BAR: the threads that run it arrive (counted: per thread, or 32 for a warp when the barrier has a thread count);
+      // BAR.SYNC and BAR.RED make them wait here, BAR.ARV lets them go on; the lanes that do not run it go on. Then the release.
+      const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+      const unsigned lanes = ex == group ? glanes : popc(ex);
+      ++st.instructions;
+      st.thread_instructions += lanes;
+      st.inst_by_class[last.cls] += lanes;
+      if (ex) ++st.barriers;
+      if (idx != first) tier_set_pcs(w, group, here);
+      const unsigned id = (last.aux & 1) ? last.c : (tier_sc(c, last.s[0], 0) & 15);
+      Block::Barrier& b = blk.bars[id];
+      b.mode = last.a;
+      b.red = last.b;
+      const uint32_t count = static_cast<uint32_t>(last.imm);
+      if (count) {
+        b.expected = count;
+        if (ex) b.arrived += 32;
+      } else {
+        b.arrived += popc(ex);
+      }
+      if (last.a == 2 && ex) {
+        const Mask pm = tier_pmask(c, last.p) & ex;
+        b.popc += popc(pm);
+        b.and_ = b.and_ && pm == ex;
+        b.or_ = b.or_ || pm != 0;
+      }
+      if (last.a == 1) {   // ARV: arrive without waiting
+        tier_set_pcs(w, group, here + 16);
+      } else {
+        for (Mask m = ex; m; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+          w.wait_kind[l] = Wait::Bar;
+          w.wait_arg[l] = id;
+        }
+        w.waiting |= ex;
+        for (Mask m = group & ~ex; m; m &= m - 1) w.pc[std::countr_zero(m)] = here + 16;
+      }
+      tier_release_bar(blk, id);
+      if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::BAR)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Bsync) {
       // exec_control's BSYNC: the lanes that run it wait at the barrier (at this address, until released), the others of the group
       // go on; then the barrier is released if all its lanes have arrived.
