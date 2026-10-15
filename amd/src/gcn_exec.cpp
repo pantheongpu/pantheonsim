@@ -6079,15 +6079,37 @@ struct Machine {
           continue;
         }
         if (atomic) {
-          if (image::texel_bytes(img.format) != 4)
-            throw Error::make(Err::Unsupported, name, " of an image whose texels are not 32 bits");
+          const uint32_t texel = image::texel_bytes(img.format);
           const std::string_view body = std::string_view(name).substr(6);   // "atomic_add"
           AtomicOp op;
           if (!parse_atomic(body, &op)) throw Error::make(Err::Unsupported, name, " is decoded but not implemented");
-          const uint64_t v = word(w, in.src[0], 0, lane);
-          const uint64_t expected = op.rmw == Rmw::CmpSwap ? word(w, in.src[0], 1, lane) : 0;
+          // gfx90a: "Image atomic operations are supported only on 32- and 64-bit-per pixel surfaces ... DMASK
+          // legal values: 0x1 32-bit atomics except cmpswap; 0x3 32-bit atomics cmpswap; 0x3 64-bit atomics except
+          // cmpswap; 0xf 64-bit cmpswap" (MI200 guide, Section 9.4.1). The element is one value of 32 or 64 bits.
+          if (g9) {
+            const bool cmp = op.rmw == Rmw::CmpSwap;
+            if (texel != 4 && texel != 8)
+              throw Error::make(Err::Unsupported, name, " of an image whose texels are not 32 or 64 bits");
+            const uint8_t legal = texel == 4 ? (cmp ? 0x3 : 0x1) : (cmp ? 0xf : 0x3);
+            if (in.dmask != legal)
+              throw Error::make(Err::Unsupported, name, " with DMASK 0x", std::hex, static_cast<int>(in.dmask), std::dec,
+                                " on a ", texel * 8, "-bit image: the guide allows 0x", std::hex, static_cast<int>(legal),
+                                std::dec, " only");
+            op.bytes = texel;
+          } else if (texel != 4) {
+            throw Error::make(Err::Unsupported, name, " of an image whose texels are not 32 bits");
+          }
+          const auto data = [&](uint32_t k) {   // the k-th value of the data: a dword, or a pair for 64 bits
+            return op.bytes == 8 ? (uint64_t{word(w, in.src[0], 2 * k + 1, lane)} << 32 | word(w, in.src[0], 2 * k, lane))
+                                 : uint64_t{word(w, in.src[0], k, lane)};
+          };
+          const uint64_t v = data(0);
+          const uint64_t expected = op.rmw == Rmw::CmpSwap ? data(1) : 0;
           const uint64_t before = inside ? atomic_rmw(addr, op, v, expected) : 0;
-          if (!in.dst.empty()) set_word(w, in.dst[0], 0, lane, static_cast<uint32_t>(before));
+          if (!in.dst.empty()) {
+            set_word(w, in.dst[0], 0, lane, static_cast<uint32_t>(before));
+            if (op.bytes == 8) set_word(w, in.dst[0], 1, lane, static_cast<uint32_t>(before >> 32));
+          }
           continue;
         }
         uint32_t v[4] = {0, 0, 0, 0};

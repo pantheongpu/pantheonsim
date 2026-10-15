@@ -1308,7 +1308,11 @@ VTEST(gfx90a_images_load_store_sample_and_query_what_their_resources_describe) {
     a5[i] = x + 10 * y + 100 * z + 0.5f;
   }
   const uint64_t d0 = mem.alloc(32 * 4), d1 = mem.alloc(rgba.size()), d2 = mem.alloc(32 * 4),
-                 d3 = mem.alloc(mips.size() * 4), d4 = mem.alloc(32 * 4), d5 = mem.alloc(32 * 4), d6 = mem.alloc(32 * 4);
+                 d3 = mem.alloc(mips.size() * 4), d4 = mem.alloc(32 * 4), d5 = mem.alloc(32 * 4), d6 = mem.alloc(32 * 4),
+                 d7 = mem.alloc(32 * 8);
+  std::vector<uint64_t> wide(32);
+  for (uint32_t i = 0; i < 32; ++i) wide[i] = (uint64_t{7} + i) << 32 | static_cast<uint32_t>(0xfffffff0u + i);
+  mem.write(d7, wide.data(), 32 * 8);
   mem.write(d0, f0.data(), 32 * 4);
   mem.write(d1, rgba.data(), rgba.size());
   const std::vector<uint32_t> zero(32, 0), ones(32, 0xFFFFFFFFu);
@@ -1318,7 +1322,7 @@ VTEST(gfx90a_images_load_store_sample_and_query_what_their_resources_describe) {
   mem.write(d5, a5.data(), 32 * 4);
   mem.write(d6, ones.data(), 32 * 4);
 
-  uint32_t desc[64] = {};
+  uint32_t desc[72] = {};
   im::Image i0;
   i0.base = d0, i0.width = 8, i0.height = 4, i0.format = {im::Data::D32, im::Num::Float};
   im::encode(i0, G, &desc[0]);
@@ -1345,6 +1349,9 @@ VTEST(gfx90a_images_load_store_sample_and_query_what_their_resources_describe) {
   im::Image i6 = i0;
   i6.base = d6, i6.format = {im::Data::D8_8_8_8, im::Num::Uint};
   im::encode(i6, G, &desc[56]);
+  im::Image i7 = i0;
+  i7.base = d7, i7.format = {im::Data::D32_32, im::Num::Uint};
+  im::encode(i7, G, &desc[64]);
   // The resources round-trip, in the guide's layout: the data and number
   // formats in word 1, the width and height less one in word 2, the shape in
   // the top of word 3, the pitch less one above the depth in word 4.
@@ -1361,7 +1368,7 @@ VTEST(gfx90a_images_load_store_sample_and_query_what_their_resources_describe) {
   VCHECK_EQ(desc[44] >> 13 & 0xFFFF, 3u);                // and a pitch of 4 less one
   VCHECK_EQ(im::texel_offset(i3, 1, 0, 0, 0), uint64_t{64});
   VCHECK(im::decode_sampler(&desc[28], G).mag_linear);
-  const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(704 * 4);
+  const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(960 * 4);
   mem.write(ddesc, desc, sizeof(desc));
 
   const amd::Kernel* k = amd::find_kernel(o, "images");
@@ -1377,7 +1384,7 @@ VTEST(gfx90a_images_load_store_sample_and_query_what_their_resources_describe) {
   mem.write(d.kernarg, args.data(), args.size());
   d.group_size[0] = 32;
   amd::execute(d, mem);
-  std::vector<uint32_t> r(704);
+  std::vector<uint32_t> r(960);
   mem.read(out, r.data(), r.size() * 4);
   const auto f = [&](uint32_t at) {
     float v;
@@ -1390,6 +1397,7 @@ VTEST(gfx90a_images_load_store_sample_and_query_what_their_resources_describe) {
     std::memcpy(&b, &h, 2);
     return uint32_t{b};
   };
+  const auto pair = [&](uint32_t at) { return uint64_t{r[at + 1]} << 32 | r[at]; };
   int wrong[14] = {};
   for (uint32_t l = 0; l < 32; ++l) {
     const int64_t x = l % 8, y = l / 8;
@@ -1410,12 +1418,17 @@ VTEST(gfx90a_images_load_store_sample_and_query_what_their_resources_describe) {
     wrong[11] += r[544 + l] != (half(rgba[4 * t] / 255.0f) | half(rgba[4 * t + 1] / 255.0f) << 16);
     // Red and alpha as stored; green and blue zero, not what was there.
     wrong[12] += r[576 + 4 * l] != l + 1 || r[577 + 4 * l] != 0 || r[578 + 4 * l] != 0 || r[579 + 4 * l] != 200 - l;
+    // A 64-bit add finds the old texel and leaves the old plus 0x100000020 -- a carry out of the low half
+    // included -- for the 64-bit compare-and-swap to find, which returns it and stores its own.
+    wrong[13] += pair(704 + 2 * l) != wide[l] || pair(832 + 2 * l) != wide[l] + 0x100000020ull ||
+                 pair(896 + 2 * l) != (uint64_t{0xcafe} << 32 | static_cast<uint32_t>(0xbeef0000u + l)) ||
+                 r[768 + l] != 3 * l + 5 || r[800 + l] != 1000 + l;   // and the 32-bit compare-and-swap
   }
-  for (int c = 0; c < 13; ++c) VCHECK_EQ(wrong[c], 0);
+  for (int c = 0; c < 14; ++c) VCHECK_EQ(wrong[c], 0);
   std::vector<uint32_t> stored(32);
   mem.read(d2, stored.data(), 32 * 4);
   int bad = 0;
-  for (uint32_t l = 0; l < 32; ++l) bad += stored[l] != 3 * l + 5;
+  for (uint32_t l = 0; l < 32; ++l) bad += stored[l] != 1000 + l;
   VCHECK_EQ(bad, 0);
 }
 

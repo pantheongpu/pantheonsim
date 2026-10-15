@@ -15,6 +15,7 @@
 //   32 T3: a 4x4 float image with two levels
 //   40 T4: a 4x4x2 float 2D array;  48 T5: a 4x4x2 float 3D image
 //   56 T6: an 8x4 8_8_8_8 uint image, all 255 to begin with
+//   64 T7: an 8x4 32_32 uint image (64 bits a texel): (0xfffffff0 + l, 7 + l)
 // One wave of 64 lanes, 32 of them on; lane l is texel (l % 8, l / 8) of T0.
 // out gets, in words: 0 the loads; 32 point samples at texel centers; 64
 // bilinear samples on the left edge of each texel; 96 T1's four channels (4 a
@@ -22,7 +23,10 @@
 // (l % 2, l / 2 % 2); 384 T4 at (l % 4, l / 4 % 4, l / 16) by a load; 416 the same
 // by a sample; 448 T5 there by a load; 480 what the atomic add found; 512 loads
 // with 16-bit coordinates; 544 T1's red and green as halves; 576 T6 read
-// back (4 a lane) after a store of red and alpha only.
+// back (4 a lane) after a store of red and alpha only; 704 what a 64-bit add of
+// 0x100000020 to T7 found (2 a lane); 768 what a compare-and-swap on T2 found,
+// 800 T2 after it; 832 what a 64-bit compare-and-swap on T7 found (2 a lane),
+// 896 T7 after it (2 a lane).
   .amdgcn_target "amdgcn-amd-amdhsa--gfx90a"
   .text
   .globl images
@@ -40,6 +44,7 @@ images:
   s_load_dwordx8 s[48:55], s[6:7], 0xa0
   s_load_dwordx8 s[56:63], s[6:7], 0xc0
   s_load_dwordx8 s[64:71], s[6:7], 0xe0
+  s_load_dwordx8 s[72:79], s[6:7], 0x100
   s_waitcnt lgkmcnt(0)
   v_and_b32_e32 v2, 7, v0                   // x
   v_lshrrev_b32_e32 v3, 3, v0               // y
@@ -123,6 +128,31 @@ images:
   image_load v[52:55], v[2:3], s[64:71] dmask:0xf unorm
   s_waitcnt vmcnt(0)
   global_store_dwordx4 v7, v[52:55], s[4:5] offset:2304
+
+  // A 64-bit add of 0x100000020, then a 64-bit compare-and-swap that finds the sum, and a 32-bit one.
+  v_mov_b32_e32 v56, 0x20
+  v_mov_b32_e32 v57, 1
+  image_atomic_add v[56:57], v[2:3], s[72:79] dmask:0x3 unorm glc
+  s_waitcnt vmcnt(0)
+  v_add_co_u32_e32 v60, vcc, 0x20, v56        // the sum: the old value plus 0x100000020
+  v_addc_co_u32_e32 v61, vcc, 1, v57, vcc
+  v_add_u32_e32 v58, 0xbeef0000, v0
+  v_mov_b32_e32 v59, 0xcafe
+  image_atomic_cmpswap v[58:61], v[2:3], s[72:79] dmask:0xf unorm glc
+  v_add_u32_e32 v64, 1000, v0
+  v_mul_u32_u24_e32 v65, 3, v0
+  v_add_u32_e32 v65, 5, v65                   // what T2 holds: 3 l + 5
+  image_atomic_cmpswap v[64:65], v[2:3], s[24:31] dmask:0x3 unorm glc
+  s_waitcnt vmcnt(0)
+  image_load v[62:63], v[2:3], s[72:79] dmask:0x3 unorm
+  image_load v66, v[2:3], s[24:31] dmask:0x1 unorm
+  v_lshlrev_b32_e32 v68, 3, v0
+  s_waitcnt vmcnt(0)
+  global_store_dwordx2 v68, v[56:57], s[4:5] offset:2816
+  global_store_dword v6, v64, s[4:5] offset:3072
+  global_store_dword v6, v66, s[4:5] offset:3200
+  global_store_dwordx2 v68, v[58:59], s[4:5] offset:3328
+  global_store_dwordx2 v68, v[62:63], s[4:5] offset:3584
   s_endpgm
 .Limages_end:
   .size images, .Limages_end-images
@@ -196,9 +226,9 @@ formats:
   .p2align 6
   .amdhsa_kernel images
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
-    .amdhsa_next_free_vgpr 56
+    .amdhsa_next_free_vgpr 72
     .amdhsa_next_free_sgpr 80
-    .amdhsa_accum_offset 56
+    .amdhsa_accum_offset 72
   .end_amdhsa_kernel
 
   .p2align 6
@@ -221,7 +251,7 @@ amdhsa.kernels:
     .private_segment_fixed_size: 0
     .wavefront_size: 64
     .sgpr_count: 80
-    .vgpr_count: 56
+    .vgpr_count: 72
     .max_flat_workgroup_size: 64
     .args:
       - { .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global }

@@ -634,8 +634,8 @@ encoding, which has no DIM field (the resource's TYPE and the DA bit say the sha
 guide (12.15), exactly one sample, `image_sample` (implicit level of detail, no `_l`, `_lz`, `_b`, `_c`,
 `_d`, `_o` or `_cl` forms, no `image_gather4`): hipcc drops `tex2DLod` and `tex2Dgather` from the code it
 builds for gfx90a, so a program that calls them gets nothing there (that is the compiler's doing, not the
-simulator's). The executor runs loads (`_mip` included), stores, atomics, `get_resinfo` and `image_sample`
-on gfx90a through the same code as RDNA's, with the guide's rules where they differ (a store writes the
+simulator's). The executor runs loads (`_mip` included), stores, atomics (on 32- and 64-bit texels, with the
+DMASK values the guide lists), `get_resinfo` and `image_sample` on gfx90a through the same code as RDNA's, with the guide's rules where they differ (a store writes the
 whole texel, the channels DMASK leaves out as zero; with d16 DMASK is only a count), and MUBUF's
 `buffer_load_format_*` and `buffer_store_format_*` (opcodes 0-15, 38 and 39) that `tex1Dfetch` compiles to.
 The T# (Table 41 of the guide, ROCR-Runtime's `resource_ai.h`) names the format as GCN does, a data
