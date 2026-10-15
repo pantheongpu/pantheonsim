@@ -2,170 +2,144 @@
 
 **Run CUDA and HIP programs, unmodified, on a CPU. No GPU needed.**
 
-PantheonSim simulates NVIDIA and AMD GPUs (a T4, an H100, a B200, an MI300X) on
-an ordinary CPU. Programs built with the real `nvcc` or `hipcc` run against it
-unchanged, and `nvidia-smi`, `rocm-smi` and the vendor libraries report the GPUs
-you asked for. Learn GPU programming without a GPU, and test GPU code in CI on
-standard runners.
+PantheonSim pretends to be an NVIDIA or AMD GPU (a T4, an H100, a B200, an
+MI300X) on an ordinary computer. Programs built with the real `nvcc` or `hipcc`
+run on it unchanged, so you can learn GPU programming, or test GPU code in CI,
+without owning a GPU.
 
 [![The PantheonSim playground: nvcc and nvidia-smi on eight simulated H100s](docs/img/playground.png)](https://pantheonsim.com/play/)
 
-PantheonSim checks what your code does, not how fast it runs: there is no
-performance model, and a run on physical GPUs before a release is still the
-final word. The intended CI model is simulated GPUs on every commit, physical
-ones nightly or before a release. The simulator engine and its command line are
-called VirtualGPU (`vgpu`).
+One honest limit: it checks what your code does, not how fast it runs. There is
+no timing model, so a run on a physical GPU before a release still counts.
 
-## Quick start
+## Try it
 
-Pick one.
-
-- **In your browser.** [pantheonsim.com/play](https://pantheonsim.com/play/) gives
-  you a Linux machine with simulated GPUs, an editor, a terminal, and `nvcc` or
-  `hipcc`. No sign-up.
-- **In GitHub Actions.** One step, on the standard runners:
-
-  ```yaml
-  - uses: pantheongpu/setup-pantheonsim@v0
-    with:
-      gpu: nvidia/h100        # or amd/mi300x
-  - run: cmake -S . -B build && cmake --build build && ctest --test-dir build
-  ```
-
-  More at [pantheonsim.com/ci](https://pantheonsim.com/ci/) and in
-  [docs/github-action.md](docs/github-action.md).
-- **On your own machine.** Follow [Build & test](#build--test) and
-  [Run your first program](#run-your-first-program) below, or
-  [pull the container image](docs/docker.md).
-
-## Build & test
-
-You need Linux, CMake 3.20 or newer, and a C++20 compiler (gcc 13+ or
-clang 17+). No GPU, no CUDA toolkit and no third-party libraries.
+You need a Linux machine with a C++ compiler and CMake, and no GPU. The first
+command checks for them:
 
 ```bash
-./scripts/build.sh              # builds build/vgpu
-./scripts/test.sh               # optional: runs the test suite
-build/vgpu list-gpus            # check it works: lists the GPUs it can simulate
-build/vgpu demo vectoradd       # runs a built-in kernel end to end
+make doctor
 ```
 
-Prefer `make`? `make doctor`, `make build` and `make demo` do the same, `make` lists the rest, and the settings you use every time can live in a file ([docs/config.md](docs/config.md)).
-
-## Run your first program
-
-Build your program with the real compiler, then run it with `vgpu run`:
+`make doctor` installs nothing. It lists what is missing and the command that
+installs it. When it says "Ready", build the simulator (a few minutes), then run
+a built-in test kernel on a simulated H100:
 
 ```bash
-nvcc -cudart shared my_app.cu -o my_app        # NVIDIA: link the shared CUDA runtime
-build/vgpu run --gpu nvidia/h100 ./my_app
-
-hipcc --offload-arch=gfx942 my_app.hip -o my_app   # AMD: build for the GPU you will simulate
-build/vgpu run --gpu amd/mi300x ./my_app
+make build
 ```
 
-`vgpu run` puts the simulator's libraries in front of the real ones and runs the
-program in place, so its output, exit code and signals are the program's own.
-The `-cudart shared` flag matters: it lets the loader swap in the simulator's
-CUDA runtime, and a program that links the runtime statically cannot be
-simulated (see [Status and limitations](docs/status.md)). Python programs work
-too, PyTorch included: `build/vgpu run --preload python train.py` (`--preload` is
-what lets the simulator reach libraries that an interpreter loads later).
-
-Choose the GPU with `--gpu <vendor>/<model>`, such as `nvidia/t4`, `nvidia/h100`
-or `amd/mi300x`. `vgpu list-gpus` lists them all and `vgpu info --gpu nvidia/h100`
-shows one. Add `--count 8` for eight of them.
-
-To explore a whole simulated machine instead, `build/vgpu shell` asks which GPU,
-CUDA or ROCm version and OS you want, then gives you a shell where `nvidia-smi`,
-`rocm-smi`, `lspci` and `dmesg` all describe it. See
-[docs/machine-simulator.md](docs/machine-simulator.md).
-
-## Options
-
-The ones you will use most (the full list is in [docs/cli.md](docs/cli.md)):
-
-| Option | What it does |
-| --- | --- |
-| `--gpu <vendor/model>` | Which GPU to simulate. Default `nvidia/h100`. |
-| `--count <n>` | How many of them. |
-| `--vram-mb <n>` | Memory per GPU, in MiB, instead of the model's. |
-| `--threads <n>` | Host threads that run blocks. Default: one per core. |
-| `--race` | Report shared-memory data races between warps. |
-| `--strict` | Refuse undefined behaviour, such as dividing by zero. |
-| `--counters` | Print exact per-kernel instruction and memory counters. |
-| `--quiet` | Silence the simulator's messages on stderr. |
-
-Each of these sets an environment variable that you can also set yourself, which
-is how you configure a program that does not go through `vgpu run`:
-`VGPU_GPU`, `VGPU_DEVICE_COUNT`, `VGPU_VRAM_MB`, `VGPU_THREADS`, `VGPU_RACE`,
-`VGPU_STRICT`, `VGPU_COUNTERS` and `VGPU_QUIET`. The variables for memory spill,
-the SASS or PTX engine and tracing are in
-[docs/cli.md](docs/cli.md#environment-variables).
-
-## Commands
-
-| Command | What it does |
-| --- | --- |
-| `vgpu list-gpus`, `vgpu info` | List the GPU models and show one. |
-| `vgpu run` | Run a program on a simulated GPU. |
-| `vgpu shell` | An interactive simulated machine. |
-| `vgpu test --matrix` | Run a program on every GPU model and compare the results. |
-| `vgpu ncu`, `vgpu counters` | Exact performance counters, in Nsight Compute's command-line form. |
-| `vgpu debug` | An AMD kernel debugger: breakpoints, stepping, registers. |
-| `vgpu fault` | Inject ECC and PCIe errors, hangs or a lost GPU, to test health tools. |
-| `vgpu regs` | Read, write and dump a device's registers. |
-| `vgpu smi`, `vgpu serve` | Live telemetry for monitoring tools. |
-
-Most take `--help`; `vgpu shell` and `vgpu serve` do not. Every option is in
-[docs/cli.md](docs/cli.md).
-
-## Finding bugs
-
-Errors return the documented CUDA codes and say exactly what went wrong:
-
-```
-[vgpu] cuLaunchKernel: VirtualGPU error [out-of-bounds]: device memory read at
-0x200000003140 is 0 bytes past the end of the 64-byte allocation at 0x200000003100
-  in kernel 'vecAdd', PTX line 30
-  lane 16
-  instruction: ld.global.f32 %f1,[%rd8]
-  GPU profile: nvidia/h100
+```bash
+make demo
 ```
 
-`--race` finds unordered shared-memory access that hardware usually hides, and
-`--strict` catches undefined behaviour real compiler output trips over. Both
-are off by default because each also flags code that is correct, and each costs
-time. See [docs/diagnostics.md](docs/diagnostics.md).
+The demo ends with a line starting `PASS`. That is your first simulation.
+Typing `make` on its own lists everything else you can do.
 
-## What works, and what does not
+### Run your own program
 
-- **NVIDIA:** twelve GPU models verified against physical cards, from Turing to
-  Hopper, plus fifteen built from public documents (including the B200). CUDA
-  runtime and driver APIs, the main vendor libraries (cuBLAS, cuDNN, cuFFT,
-  NCCL and more), PyTorch, Numba and Triton run unmodified.
-- **AMD:** unmodified `hipcc` programs on MI300X and the other CDNA and RDNA
-  models, rocBLAS and PyTorch for ROCm.
-- **Not simulated:** timing. There is no cycle, stall or cache model, so no
-  performance numbers. Statically linked CUDA runtimes (CuPy) and OptiX are not
-  supported.
-- Anything unsupported fails loudly, naming the instruction, kernel and GPU,
-  never silently.
+Build your program with the real compiler. The `-cudart shared` flag lets the
+simulator stand in for the CUDA runtime.
 
-The full status table and the known limitations are in
-[docs/status.md](docs/status.md).
+```bash
+nvcc -cudart shared my_app.cu -o my_app
+```
 
-## More documentation
+```bash
+make run APP=./my_app GPU=nvidia/h100
+```
 
-- [docs/cli.md](docs/cli.md): every command, option and environment variable.
-- [docs/github-action.md](docs/github-action.md) and [docs/docker.md](docs/docker.md): CI and containers.
-- [docs/machine-simulator.md](docs/machine-simulator.md): `vgpu shell`.
-- [docs/diagnostics.md](docs/diagnostics.md): counters, races, strict mode.
-- [docs/driver-api.md](docs/driver-api.md): a program written against the CUDA driver API.
-- [docs/telemetry.md](docs/telemetry.md) and [docs/registers.md](docs/registers.md): `nvidia-smi`, `rocm-smi`, PCI and registers.
-- [docs/pantheon-workloads.md](docs/pantheon-workloads.md): the 44 stress and diagnostics workloads.
+For an AMD GPU, build for the GPU you will simulate (`gfx942` is the MI300X),
+then run it the same way:
+
+```bash
+hipcc --offload-arch=gfx942 my_app.hip -o my_app
+```
+
+```bash
+make run APP=./my_app GPU=amd/mi300x
+```
+
+Python works too, PyTorch included: `make run APP=python ARGS="train.py" PRELOAD=1`.
+`make list-gpus` shows every GPU you can pick.
+
+## Choose your simulated machine
+
+Instead of typing the GPU and the options every time, write them once in a file
+called `pantheonsim.yaml`:
+
+```bash
+make init
+```
+
+That writes a commented starter file in the current directory. Edit it, for example:
+
+```yaml
+gpu: nvidia/h100     # which GPU
+count: 8             # how many of them
+strict: true         # refuse undefined behaviour, such as dividing by zero
+race: on             # report shared-memory data races
+```
+
+```bash
+make config
+```
+
+`make config` prints every setting in effect and where each one came from, and
+`make run` uses them. A setting given on the `make` line (`make run APP=./my_app
+COUNT=2`) wins over the file. Every key, the order of precedence and the
+Makefile variables are in [docs/config.md](docs/config.md).
+
+## Other ways to use it
+
+- **In your browser:** [pantheonsim.com/play](https://pantheonsim.com/play/) is
+  a Linux machine with simulated GPUs, an editor, a terminal and `nvcc`. No
+  sign-up.
+- **In GitHub Actions:** one step with `pantheongpu/setup-pantheonsim@v0` on
+  the standard runners. See [pantheonsim.com/ci](https://pantheonsim.com/ci/)
+  and [docs/github-action.md](docs/github-action.md).
+- **In a container:** `docker run --rm ghcr.io/pantheongpu/pantheonsim:latest vgpu list-gpus`
+  needs no build. See [docs/docker.md](docs/docker.md).
+
+## When something goes wrong
+
+- **`make doctor` says cmake or the compiler is too old.** You need CMake 3.20
+  or newer and g++ 13 or newer (or clang++ 17). `doctor` prints the install
+  command for your system. On Ubuntu 22.04 that means g++ 13 from a PPA; then
+  run `export CXX=g++-13`, `make clean` and `make build`.
+- **Your CUDA program fails with a message about the static runtime.** It was
+  built without `-cudart shared`. Rebuild with it. Programs that link the CUDA
+  runtime statically, such as CuPy, cannot be simulated yet
+  ([docs/status.md](docs/status.md)).
+- **An AMD program says it carries code for the wrong GPU** (`hipErrorNoBinaryForGpu`).
+  Build with the `gfx` name of the simulated GPU. `build/vgpu info --gpu amd/mi300x`
+  shows it on the `gfx target` line.
+- **A run stops with `cudaErrorMemoryAllocation` or `hipErrorOutOfMemory`.**
+  The simulator will not let your computer run out of memory, so it refuses an
+  allocation instead of letting the system kill programs. Ask for less memory
+  (`vram_mb`), let the rest spill to disk (`ram_mb` and `memory_dir`), or lower
+  the memory it keeps free (`host_reserve_mb`, which is the variable
+  `VGPU_MEMORY_HOST_RESERVE_MB`). See
+  [the memory settings](docs/config.md#a-small-machine-that-spills-to-disk).
+- **`nvidia-smi` shows a CUDA, driver or ROCm version you do not want.** The
+  versions are settings: `cuda_version`, `driver_version` and `rocm_version`.
+  They change what the tools report, not your compiler.
+- **A result looks wrong and you want to know why.** Run with `STRICT=1`,
+  `RACE=1` or `COUNTERS=1` ([docs/diagnostics.md](docs/diagnostics.md)).
+
+## Where to read more
+
+- [docs/config.md](docs/config.md): the settings file, every key, the Makefile variables.
+- [docs/cli.md](docs/cli.md): every `vgpu` command, option and environment variable.
+- [docs/diagnostics.md](docs/diagnostics.md): counters, race and strict checks, error messages.
+- [docs/status.md](docs/status.md): what works, what does not, and the supported GPUs.
+- [docs/machine-simulator.md](docs/machine-simulator.md): `make shell`, a whole simulated machine with `nvidia-smi` and `rocm-smi`.
+- [docs/driver-api.md](docs/driver-api.md), [docs/telemetry.md](docs/telemetry.md), [docs/registers.md](docs/registers.md), [docs/pantheon-workloads.md](docs/pantheon-workloads.md): the driver API, monitoring tools, device registers, stress workloads.
 - [nvidia/README.md](nvidia/README.md) and [amd/README.md](amd/README.md): the NVIDIA and AMD sides.
-- [ARCHITECTURE.md](ARCHITECTURE.md): how it is built. [TODO.md](TODO.md): what is open.
+- [ARCHITECTURE.md](ARCHITECTURE.md) is how it is built and [TODO.md](TODO.md) is what is open.
+
+The engine and its command line are called VirtualGPU (`vgpu`). `make` prints
+each `vgpu` command before it runs, so you can copy it.
 
 ## Help, contributing and security
 

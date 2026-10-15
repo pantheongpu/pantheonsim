@@ -10,6 +10,7 @@
 #include "h264_decode.hpp"
 #include "nvenc_cabac.hpp"
 #include "nvenc_h264.hpp"
+#include "video_simd.hpp"
 
 namespace vgpu_nvenc {
 namespace {
@@ -322,35 +323,39 @@ struct H264Encoder::Impl {
       const size_t st = static_cast<size_t>(rp.stride);
       const size_t at0 = static_cast<size_t>(Y0 + kPad) * st + static_cast<size_t>(X0 + kPad);
       const uint8_t *G = rp.g.data() + at0, *Hh = rp.hh.data() + at0, *Vv = rp.vv.data() + at0, *Jj = rp.jj.data() + at0;
-      for (int y = 0; y < bh_; ++y) {
-        const size_t o = static_cast<size_t>(y) * st;
-        for (int x = 0; x < bw_; ++x) {
-          const size_t q = o + static_cast<size_t>(x);
-          auto g = [&](int dx, int dy) { return static_cast<int>(G[q + dy * static_cast<ptrdiff_t>(st) + dx]); };
-          auto b = [&](int dy) { return static_cast<int>(Hh[q + dy * static_cast<ptrdiff_t>(st)]); };
-          auto hv = [&](int dx) { return static_cast<int>(Vv[q + dx]); };
-          const int j = Jj[q];
-          int v;
-          switch (fy * 4 + fx) {
-            case 0: v = g(0, 0); break;
-            case 1: v = (g(0, 0) + b(0) + 1) >> 1; break;
-            case 2: v = b(0); break;
-            case 3: v = (b(0) + g(1, 0) + 1) >> 1; break;
-            case 4: v = (g(0, 0) + hv(0) + 1) >> 1; break;
-            case 5: v = (b(0) + hv(0) + 1) >> 1; break;
-            case 6: v = (b(0) + j + 1) >> 1; break;
-            case 7: v = (b(0) + hv(1) + 1) >> 1; break;
-            case 8: v = hv(0); break;
-            case 9: v = (hv(0) + j + 1) >> 1; break;
-            case 10: v = j; break;
-            case 11: v = (j + hv(1) + 1) >> 1; break;
-            case 12: v = (hv(0) + g(0, 1) + 1) >> 1; break;
-            case 13: v = (hv(0) + b(1) + 1) >> 1; break;
-            case 14: v = (j + b(1) + 1) >> 1; break;
-            default: v = (hv(1) + b(1) + 1) >> 1; break;
-          }
-          out[y * stride + x] = static_cast<uint8_t>(v);
+      // Each of the sixteen positions is one of the planes, or the rounded average of two of them (the samples one step right or down
+      // where the table says so): picked once for the block, not per sample.
+      const ptrdiff_t sp = static_cast<ptrdiff_t>(st);
+      const uint8_t* A = G;
+      const uint8_t* B = nullptr;
+      ptrdiff_t oa = 0, ob = 0;
+      switch (fy * 4 + fx) {
+        case 0: A = G; break;
+        case 1: A = G; B = Hh; break;
+        case 2: A = Hh; break;
+        case 3: A = Hh; B = G; ob = 1; break;
+        case 4: A = G; B = Vv; break;
+        case 5: A = Hh; B = Vv; break;
+        case 6: A = Hh; B = Jj; break;
+        case 7: A = Hh; B = Vv; ob = 1; break;
+        case 8: A = Vv; break;
+        case 9: A = Vv; B = Jj; break;
+        case 10: A = Jj; break;
+        case 11: A = Jj; B = Vv; ob = 1; break;
+        case 12: A = Vv; B = G; ob = sp; break;
+        case 13: A = Vv; B = Hh; ob = sp; break;
+        case 14: A = Jj; B = Hh; ob = sp; break;
+        default: A = Vv; oa = 1; B = Hh; ob = sp; break;
+      }
+      if (B) {
+        for (int y = 0; y < bh_; ++y) {
+          const uint8_t* pa = A + static_cast<size_t>(y) * st + oa;
+          const uint8_t* pb = B + static_cast<size_t>(y) * st + ob;
+          uint8_t* po = out + y * stride;
+          for (int x = 0; x < bw_; ++x) po[x] = static_cast<uint8_t>((pa[x] + pb[x] + 1) >> 1);
         }
+      } else {
+        for (int y = 0; y < bh_; ++y) std::memcpy(out + y * stride, A + static_cast<size_t>(y) * st, static_cast<size_t>(bw_));
       }
       return;
     }
@@ -1684,6 +1689,8 @@ struct H264Encoder::Impl {
     if (((vx | vy) & 3) == 0) {
       const RefPlanes& rp = r.rp;
       const int X0 = px + (vx >> 2), Y0 = py + (vy >> 2);
+      if (vgpu::videosimd::avx2_available() && X0 >= -kPad && X0 + bw_ <= rp.w + kPad && Y0 >= -kPad && Y0 + bh_ <= rp.h + kPad)
+        return vgpu::videosimd::sad_u8(s, ys, rp.at(rp.g, X0, Y0), rp.stride, bw_, bh_);   // (no clamping happens in this range)
       for (int y = 0; y < bh_; ++y) {
         const uint8_t* row = rp.at(rp.g, X0, Y0 + y);   // the padded plane lets a row of in-range samples be read directly
         for (int x = 0; x < bw_; ++x) sad += std::abs(s[y * ys + x] - row[x]);
@@ -1692,6 +1699,7 @@ struct H264Encoder::Impl {
     }
     uint8_t pred[256];
     pred_luma(r, px, py, bw_, bh_, vx, vy, pred, bw_);
+    if (vgpu::videosimd::avx2_available()) return vgpu::videosimd::sad_u8(s, ys, pred, bw_, bw_, bh_);
     for (int y = 0; y < bh_; ++y)
       for (int x = 0; x < bw_; ++x) sad += std::abs(s[y * ys + x] - pred[y * bw_ + x]);
     return sad;

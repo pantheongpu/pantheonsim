@@ -1,6 +1,6 @@
 # Running a driver-API program
 
-A program written against the CUDA driver API links the simulator's `libvgpucuda.so` directly, with no `nvcc` involved. This is the smallest way to use it. Programs built with `nvcc` take the other route, `vgpu run` (see the [README](../README.md#run-your-first-program)).
+A program written against the CUDA driver API links the simulator's `libvgpucuda.so` directly, with no `nvcc` involved. This is the smallest way to use it. Programs built with `nvcc` take the other route, `vgpu run` (see the [README](../README.md#run-your-own-program)).
 
 ```c
 #include <vgpu_cuda.h>   /* clean-room subset header, in include/ */

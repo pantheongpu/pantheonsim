@@ -1198,20 +1198,33 @@ using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt
 // them stays in cache and runs without any of that. It exists only for the
 // forms the interpreter's fast paths already take (32-bit integer arithmetic
 // and mad.lo, mov, setp, selp, not, shf, f32 arithmetic and fma, all on the narrow register
-// file, no carry, no saturation, no rounding mode); anything else has kind
-// None and runs as it always did. build_micro() decides, and mirrors the
+// file, no carry, no saturation, no rounding mode (f32 arithmetic may be .ftz, and an fma a contracted sub or .ftz); the 64-bit forms of the address arithmetic around
+// memory accesses: integer arithmetic and setp on 64-bit registers, integer conversions, mul.wide; and
+// 16-bit integer arithmetic, setp and mov (the result cut to 16 bits, as write_reg does), mul.hi, neg/abs, the conversion of a narrow integer to f32 or f64, 32-bit division, the 64-bit mov and the
+// identity cvta; and the kernel's start: the thread and block ids, the warp size, ld.param of a scalar, predicate logic);
+// anything else has kind None and runs as it always did. build_micro() decides, and mirrors the
 // conditions of Interpreter::fast_path exactly.
 struct MicroOp {
-  enum Kind : uint8_t { None = 0, Int32, MadLo32, Mov32, Setp32, Fma32, Float32, Selp32, Not32, Shf32, Bra };
-  enum Flags : uint8_t { kSigned = 1, kFloat = 2, kHasPred = 4, kPredNeg = 8, kLeft = 16, kWrap = 32 };
+  enum Kind : uint8_t { None = 0, Int32, MadLo32, Mov32, Setp32, Fma32, Float32, Selp32, Not32, Shf32, Bra,
+                        Int64, Cvt, MulWide32, Setp64, MulHi32, Sign32, CvtI2F, Mov64, MovSreg, LdParam, PredBin,
+                        NotPred, Int16, Setp16, Mov16 };
+  enum Flags : uint8_t { kSigned = 1, kFloat = 2, kHasPred = 4, kPredNeg = 8, kLeft = 16, kWrap = 32,
+                         kDstWide = 64, kFtz = 128 };
   Kind kind = None;
-  uint8_t sub = 0;        // IntBinOp, FloatBinOp or CmpOp, by kind
+  uint8_t sub = 0;        // IntBinOp, FloatBinOp or CmpOp, by kind; Cvt, CvtI2F: the source's width in bits;
+                          // Sign32: 1 for neg, 0 for abs; Fma32: bit 0 negates the product, bit 1 the addend;
+                          // MovSreg: the Sreg (255: the warp size); LdParam: the bytes read; PredBin: PredBinOp
   uint8_t flags = 0;
-  uint8_t src_imm = 0;    // bit i set: source i is an immediate in src[i], else a register id
+  // Bit i set (0-2): source i is an immediate in src[i], else a register id. Bit 3 + i set: that register is in the
+  // 64-bit file (Int64, Cvt, Setp64; an immediate there is the 32-bit value in src[i] sign-extended).
+  uint8_t src_imm = 0;
   uint16_t opcode_id = 0;
   uint16_t pred = 0;      // the guard predicate's id, if kHasPred
-  uint32_t dst = 0;       // destination register id (a predicate's, for Setp32)
-  uint32_t src[3] = {0, 0, 0};   // Selp32: src[2] is the selecting predicate's id; Bra: src[0] the target
+  uint32_t dst = 0;       // destination register id (a predicate's, for Setp32 and Setp64)
+  uint32_t src[3] = {0, 0, 0};   // Selp32: src[2] is the selecting predicate's id; Bra: src[0] the target;
+                                 // Cvt: src[1] the destination's width in bits; LdParam: src[0] the parameter's
+                                 // position, src[1] the offset in it; PredBin, NotPred: predicate ids (an immediate
+                                 // 0 or 1 where src_imm says), NotPred's in src[0]
 };
 static_assert(sizeof(MicroOp) == 24, "keep MicroOp small");
 
