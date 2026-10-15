@@ -860,11 +860,38 @@ A profile id is `amd/<name>`, and its file is `profiles/<name>.yaml` here.
 ## ROCm Validation Suite
 
 AMD's open-source [ROCm Validation Suite](https://github.com/ROCm/ROCmValidationSuite)
-(RVS, MIT) is the public counterpart of NVIDIA's DCGM/NVVS. It was not built
-or run here (it needs ROCm's HSA, HIP, rocBLAS and AMD SMI development
-packages, which are not installable on this host); its source was read for the
-calls its modules make, and each was checked against what the simulator
-answers. What RVS asks, module by module:
+(RVS, MIT) is the public counterpart of NVIDIA's DCGM/NVVS. Built from its
+`rocm-7.2.3` source (and run from ROCm's package too), it runs unmodified inside
+`vgpu shell --gpu amd/mi300x`: `rvs -c <conf>` finds the simulated GPUs
+through the KFD topology (`src/kfd.cpp`), ties each to its AMD SMI handle and
+its PCI device, and runs its modules. What each does on the simulator:
+
+| Module | Result | Why |
+| --- | --- | --- |
+| `gpup` | pass | the KFD node properties (`simd_count 1216`, `wave_front_size 64`, `gfx_target_version 90402`, `num_xcc 8`, ids). `caches_count`, `cpu_cores_count`, `local_mem_size`, `fw_version` read 0 (no `caches/` directory) |
+| `peqt` | pass, 17 of 17 | link speed and width, slot, vendor and device ids, driver `amdgpu`, atomics routing and completer bits, from the PCI configuration space and capability chains (`docs/registers.md`) |
+| `pesm` | pass | PCIe link-state monitoring: no change in speed or power |
+| `smqt` | pass with a conf for the MI300X's BARs (256 GB, 2 MB, 512 KB); the shipped `smqt_single.conf` expects an older part's 256 KB register BAR and fails | BARs and the expansion ROM through libpci |
+| `gm` | pass | `amdsmi_get_temp_metric`, `_power_info`, `_clk_freq`, ... (`src/amd_smi.cpp`) |
+| `pebb`, `pbqt` | pass | the link info of `hsa_amd_agent_memory_pool_get_info` (`distance`, `PCIe:20`, `xGMI:15`) and async copies; the GB/s are the interpreter's, not a link's |
+| `babel` | pass | five HIP bandwidth kernels (copy, mul, add, triad, dot) |
+| `gst` | pass with a target any run meets; correctness checks work | with `self_check`, `accuracy_check` and `error_inject`, every rocBLAS SGEMM is compared with the host's result and with the last run, and a wrong element made on purpose is caught by both. The shipped targets (`target_stress` in GFLOPS) are far above what an interpreter does: the module reports GFLOPS 0 and fails |
+| `mem` | pass, all 11 tests, slowly | with `mem_blocks: 1` and `num_passes: 1`: six minutes a GPU (test 7, the 32-bit moving inversions, takes four of them), so it is not in the test |
+| `perf`, `iet`, `tst` | fail, by design | `perf`'s pass mark is a GFLOPS target; `iet`'s is the power a GEMM load draws (60 W, the idle floor, is all it ever sees) and `tst`'s the temperature it reaches (a junction sensor at 32 C, and the edge sensor an Instinct lacks reads 0). The telemetry follows how long the simulated work would have run on the card (the instructions retired over the clock), not the host time the interpreter takes, so a load of seconds of host time is microseconds of device time. There is no timing model to give them anything else |
+| `rcqt` | runs | it asks `dpkg` about ROCm's meta-packages: the host's answer, not the simulator's |
+
+The `rvs` summary header prints "ROCm version N/A" and "amdgpu version N/A": it
+reads `/opt/rocm/.info/version-rocm` and the output of `dkms status`, both of
+the host. Without AMD SMI's library in front of ROCm's, RVS's `gpulist` finds no
+processors and `peqt` and `pesm` crash in `gpu2gpuindex` (an RVS bug: it indexes
+an empty vector); in a session the simulator's library is always first. The
+same set (with `gst` at a target of 0.001 GFLOPS, which the Radeon GPUs need
+where 0.05 is out of reach) runs and passes on MI250X, MI325X, MI350X, RX 7900 XTX,
+RX 9070 XT and RX 6900 XT. `tests/e2e/run_rvs.sh` (ctest `amd_rvs`, which skips without an
+`rvs` binary or an isolated session) runs `gpup`, `peqt`, `pesm`, `smqt`, `babel`
+and `gst` in half a minute.
+
+What RVS asks, module by module:
 
 | Module | What it reads | State |
 | --- | --- | --- |
@@ -872,8 +899,8 @@ answers. What RVS asks, module by module:
 | every module | `amdsmi_get_gpu_kfd_info`, `amdsmi_get_gpu_bdf_id`, `hipDeviceGetPCIBusId` to tie a HIP device to its KFD node and SMI handle | consistent: same bus, same `kfd_id` |
 | `gm`, `tst`, `pulse`, `iet`, `gst` | `amdsmi_get_temp_metric`, `amdsmi_get_power_info`, `amdsmi_get_power_cap_info`, `amdsmi_get_clk_freq`, `amdsmi_set_clk_freq`, `amdsmi_get_energy_count` | added (`src/amd_smi.cpp`); they were NOT_SUPPORTED stubs |
 | `pebb`, `pbqt` | `hsa_amd_agent_memory_pool_get_info` `NUM_LINK_HOPS` and `LINK_INFO`, async copy and its profiling | `LINK_INFO` added: system memory is one PCI Express hop, an Instinct peer one XGMI hop, a Radeon peer two PCI Express hops, as KFD lists them |
-| `mem`, `babel`, `gst` | HIP allocation, copies, kernels; rocBLAS GEMM | already run (`tests/hipcc`, `tests/rocblas`); RVS's own kernels are compiled for the card, so they need a gfx942 code object |
-| `peqt`, `pcie` | PCI configuration space through libpci | the configuration space and its capability chains are modelled (`docs/registers.md`); not exercised through RVS |
+| `mem`, `babel`, `gst` | HIP allocation, copies, kernels; rocBLAS GEMM | RVS's own kernels, compiled for the card, run |
+| `peqt`, `pcie` | PCI configuration space through libpci | the configuration space and its capability chains are modelled (`docs/registers.md`) and RVS reads them |
 
 The AMD SMI calls above are the ones described under "AMD SMI's library" in
 "RCCL, and PyTorch across GPUs"; the sensors follow each profile's class. Temperatures are

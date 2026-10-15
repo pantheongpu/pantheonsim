@@ -1486,6 +1486,10 @@ add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_
 add_test(NAME amd_rocprofiler_pcsampling COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_pcsampling.sh)
 set_tests_properties(amd_rocprofiler_pcsampling PROPERTIES DEPENDS "vgpuhip;vgpurocprof"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# AMD's ROCm Validation Suite, unmodified (skips without an rvs binary or an isolated session).
+add_test(NAME amd_rvs COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rvs.sh)
+set_tests_properties(amd_rvs PROPERTIES DEPENDS "vgpu_cli;vgpuhip;vgpuamdsmi;vgpursmi"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 900)
 add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
 set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
