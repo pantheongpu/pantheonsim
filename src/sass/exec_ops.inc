@@ -999,6 +999,41 @@ struct RoundingScope {
   }
 };
 
+// The conversion loops that depend on the host's rounding mode, out of line so that nothing is hoisted past the RoundingScope
+// of their caller (the callee is opaque to it): the 32 lanes of an I2F, and a double narrowed to a float.
+// I2F as exec_float computes it, lane by lane: the source is `v64[l]` (a 64-bit source) or `row[l]` (shifted down by
+// `part_shift` for .H1/.B1-.B3), taken as a signed or unsigned integer of `ssize` (0 8 bits ... 3 64 bits), and converted to
+// binary64 (dsize 3), binary16 (1), bfloat16 (4) or binary32 in the host's current rounding mode (the narrow formats from the
+// float, as the general rule does).
+[[gnu::noinline]] void i2f_wide_loop(unsigned dsize, unsigned ssize, bool sgn, unsigned part_shift, const uint64_t* v64,
+                                     const uint32_t* row, uint32_t* lo, uint32_t* hi) {
+  for (unsigned l = 0; l < 32; ++l) {
+    uint64_t v = ssize == 3 ? v64[l] : row[l];
+    v >>= part_shift;
+    int64_t sv;
+    switch (ssize) {
+      case 0: sv = sgn ? static_cast<int8_t>(v) : static_cast<int64_t>(v & 0xff); break;
+      case 1: sv = sgn ? static_cast<int16_t>(v) : static_cast<int64_t>(v & 0xffff); break;
+      case 2: sv = sgn ? static_cast<int32_t>(v) : static_cast<int64_t>(v & 0xffffffff); break;
+      default: sv = static_cast<int64_t>(v); break;
+    }
+    const bool u64 = ssize == 3 && !sgn;
+    if (dsize == 3) {
+      const double d = u64 ? static_cast<double>(v) : static_cast<double>(sv);
+      const uint64_t b = f64_bits(d);
+      lo[l] = static_cast<uint32_t>(b);
+      hi[l] = static_cast<uint32_t>(b >> 32);
+    } else {
+      const float f = u64 ? static_cast<float>(v) : static_cast<float>(sv);
+      lo[l] = dsize == 1 ? f32_to_half(f) : dsize == 4 ? f32_to_bf16(f) : f32_bits(f);
+    }
+  }
+}
+// binary64 to binary32 in the host's current rounding mode, 32 lanes.
+[[gnu::noinline]] void f64_to_f32_loop(const double* x, uint32_t* lo) {
+  for (unsigned l = 0; l < 32; ++l) lo[l] = f32_bits(static_cast<float>(x[l]));
+}
+
 }  // namespace
 
 // The instructions compiled kernels spend their time in -- IADD3, IMAD, LOP3,
@@ -1015,11 +1050,12 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     case Op::IADD3: case Op::IMAD: case Op::LOP3: case Op::MOV: case Op::ISETP: case Op::FSETP:
     case Op::FSEL: case Op::FFMA: case Op::FADD: case Op::FMUL: case Op::LEA: case Op::SHF:
     case Op::DADD: case Op::DMUL: case Op::DFMA: break;
-    case Op::PLOP3: case Op::SEL: case Op::POPC: case Op::BREV: case Op::FLO: return fast_wide(w, ins, ex);
+    case Op::PLOP3: case Op::SEL: case Op::POPC: case Op::BREV: case Op::FLO: case Op::IMNMX: case Op::IABS: case Op::P2R: return fast_wide(w, ins, ex);
     case Op::FMNMX: case Op::MUFU: case Op::I2FP: case Op::I2F: case Op::F2I: case Op::HADD2: case Op::HMUL2: case Op::HFMA2:
       return fast_float(w, ins, ex);
     case Op::PRMT: return fast_wide(w, ins, ex);
-    case Op::DSETP: case Op::F2FP: return fast_float(w, ins, ex);
+    case Op::DSETP: case Op::F2FP: case Op::F2F: case Op::FRND: case Op::HSETP2: case Op::HSET2: case Op::FCHK:
+      return fast_float(w, ins, ex);
     default: return false;
   }
   if (ins.dst.empty()) return false;
@@ -1465,6 +1501,52 @@ bool Runner::fast_wide(Warp& w, const Instr& ins, Mask ex) {
     return out;
   };
   switch (ins.op) {
+    case Op::P2R: {
+      // The seven predicates of each lane (P0 in bit 0) merged into a byte of a register under a mask: Rd = (Ra & ~m) | (bits & m),
+      // m = mask << (8 * byte).
+      if (!sk || ins.guard_uniform || ins.dst.size() != 1 || ins.dst[0].kind != Kind::Reg || ins.src.size() < 3 || !plain(ins.src[1]) ||
+          !plain(ins.src[2]))
+        return false;
+      const uint32_t* base = lanes(0, ins.src[1], false);
+      const uint32_t* msk = lanes(1, ins.src[2], false);
+      const unsigned shift = 8 * ins.f[0];
+      alignas(32) uint32_t r[32];
+      for (unsigned l = 0; l < 32; ++l) {
+        uint32_t bits = 0;
+        for (unsigned i = 0; i < 7; ++i) bits |= ((w.p[i] >> l) & 1u) << i;
+        const uint32_t m = msk[l] << shift;
+        r[l] = (base[l] & ~m) | ((bits << shift) & m);
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::IMNMX: {
+      // 32-bit min / max, the predicate choosing the minimum per lane (sm_120's 64-bit form, with three results, is left to the
+      // general rule). The operands as read32 gives them: their modifiers do not apply.
+      if (!sk || ins.guard_uniform || ins.f[1] || ins.dst.size() != 1 || ins.dst[0].kind != Kind::Reg || ins.src.size() < 3 || !plain(ins.src[0]) ||
+          !plain(ins.src[1]) || !is_pred(ins.src[2]))
+        return false;
+      const uint32_t* a = lanes(0, ins.src[0], false);
+      const uint32_t* b = lanes(1, ins.src[1], false);
+      const uint64_t p = pmask(ins.src[2]);
+      alignas(32) uint32_t r[32];
+      sk->ibin_m(static_cast<unsigned>(simd::IntBin::Min), ins.f[0] != 0, r, a, b, p, 32);
+      sk->ibin_m(static_cast<unsigned>(simd::IntBin::Max), ins.f[0] != 0, r, a, b, ~p & 0xffffffffull, 32);
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::IABS: {
+      if (!sk || ins.guard_uniform || ins.dst.size() != 1 || ins.dst[0].kind != Kind::Reg || ins.src.empty() || !plain(ins.src[0]))
+        return false;
+      const uint32_t* a = lanes(0, ins.src[0], false);
+      alignas(32) uint32_t r[32];
+      for (unsigned l = 0; l < 32; ++l) {
+        const int32_t v = static_cast<int32_t>(a[l]);
+        r[l] = static_cast<uint32_t>(v < 0 ? 0u - static_cast<uint32_t>(v) : static_cast<uint32_t>(v));
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
     case Op::SEL: {   // a where the predicate holds, else b (the 32-bit form)
       if (!sk || ins.f[0] || ins.dst[0].kind != Kind::Reg || ins.src.size() < 3 || !plain(ins.src[0]) || !plain(ins.src[1]) ||
           !is_pred(ins.src[2]))
@@ -1668,9 +1750,12 @@ bool Runner::fast_wide(Warp& w, const Instr& ins, Mask ex) {
 }
 
 // The float forms of the 32-lane path that fast_alu does not take itself: FFMA, FADD and FMUL with .FTZ or .SAT, FSETP,
-// FMNMX, MUFU, I2F/I2FP to f32, F2I from f32 to 32 bits. The same rules as exec_float's, over the 32 lanes at once with the
-// kernels of vgpu/simd/simd.hpp (ffma_x, fadd_x, fmul_x, fcmp_mask, fmnmx, mufu, i2f, f2i); a form not handled here returns false
-// and takes the general path. A source's |x| and -x are applied to the bits before the kernel flushes: a flush keeps the sign of
+// FMNMX, MUFU, the conversions (I2F/I2FP from 8 to 64 bits, F2I to 8 to 64 bits, F2F, FRND, in any rounding mode the general rule
+// honours), HSET2/HSETP2 and the bfloat16 HFMA2. The same rules as exec_float's, over the 32 lanes at once with the kernels of
+// vgpu/simd/simd.hpp (ffma_x, fadd_x, fmul_x, fcmp_mask, fmnmx, mufu, i2f, f2i, hfma2_bf_m) or in plain loops over the registers' rows
+// (the wide conversions: the work is the operand decoding the general rule repeats a lane at a time); a form not handled here returns
+// false and takes the general path. Where the general rule departs from an RTX 3060 (see the comments at the returns), the form is
+// left to it, so that a change to the rule is made in one place. A source's |x| and -x are applied to the bits before the kernel flushes: a flush keeps the sign of
 // a subnormal, so flush-then-modify and modify-then-flush give the same bits.
 bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
   const simd::Kernels* const sk = simd::enabled() ? &simd::kernels() : nullptr;
@@ -1705,6 +1790,40 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
     uint32_t* const out = buf[i];
     for (unsigned l = 0; l < 32; ++l) out[l] = ((row ? row[l] : one) & absm) ^ negm;
     return out;
+  };
+  // 64-bit sources and results (binary64 and 64-bit integers as register pairs, for F2F, F2I, I2F and FRND): a source as 32
+  // 64-bit lanes -- a register pair's own two rows, or the one value (read64, or an FImm of 64 bits as exec_float's f64src reads
+  // it) for every lane -- with |x| and -x on the sign bit if `mods`; a result as the two rows of its pair (R254's partner is RZ).
+  const auto wide_ok = [](const Operand& o) {
+    return o.kind == Kind::Reg || o.kind == Kind::UReg || o.kind == Kind::CBank || o.kind == Kind::Imm || o.kind == Kind::FImm;
+  };
+  const auto pair64 = [&](const Operand& o, bool mods, uint64_t* out) {
+    if (o.kind == Kind::Reg && o.reg != kRZ) {
+      const uint32_t* lo = &w.reg(o.reg, 0);
+      const uint32_t* hi = &w.reg(o.reg + 1, 0);
+      for (unsigned l = 0; l < 32; ++l) out[l] = lo[l] | (static_cast<uint64_t>(hi[l]) << 32);
+    } else {
+      const uint64_t bits = o.kind == Kind::FImm && o.fwidth == 64 ? static_cast<uint64_t>(o.fbits) << 32 : read64(w, o, 0);
+      for (unsigned l = 0; l < 32; ++l) out[l] = bits;
+    }
+    if (mods && (o.abs || o.neg)) {
+      const uint64_t absm = o.abs ? 0x7fffffffffffffffull : ~0ull, negm = o.neg ? 0x8000000000000000ull : 0ull;
+      for (unsigned l = 0; l < 32; ++l) out[l] = (out[l] & absm) ^ negm;
+    }
+  };
+  const auto store64 = [&](const Operand& d, const uint32_t* lo, const uint32_t* hi) {
+    if (d.reg == kRZ) return;
+    store_row(d.reg, lo);
+    if (d.reg + 1 != kRZ) store_row(d.reg + 1, hi);
+  };
+  // `body` with the host's rounding mode set to SASS's `rnd` (the executor's `rounded`, once for the 32 lanes).
+  const auto in_mode = [&](unsigned rnd, auto&& body) {
+    if (rnd) {
+      RoundingScope scope(rnd);
+      body();
+    } else {
+      body();
+    }
   };
   alignas(32) uint32_t r[32];
   switch (ins.op) {
@@ -1757,9 +1876,18 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
     }
     case Op::MUFU: {
       const unsigned op = ins.f[0];
-      if (op == 6 || op == 7 || op > 9 || ins.src.empty() || !plain(ins.src[0]) || ins.src[0].bnot || ins.dst[0].kind != Kind::Reg)
+      if (op > 9 || ins.src.empty() || !plain(ins.src[0]) || ins.src[0].bnot || ins.dst[0].kind != Kind::Reg)
         return false;
-      if (op == 4 || op == 5 || op == 8) {
+      if (op == 6 || op == 7) {
+        // RCP64H / RSQ64H: the high word of the reciprocal (root) of the double whose high word is the source (the low word zero);
+        // the source's modifiers, the flush and the result's flush do not apply.
+        const uint32_t* raw = lanes(0, ins.src[0], false);
+        for (unsigned l = 0; l < 32; ++l) {
+          const double d = as_f64(static_cast<uint64_t>(raw[l]) << 32);
+          const double v = op == 6 ? 1.0 / d : 1.0 / std::sqrt(d);
+          r[l] = static_cast<uint32_t>(f64_bits(v) >> 32);
+        }
+      } else if (op == 4 || op == 5 || op == 8) {
         sk->mufu(op, r, lanes(0, ins.src[0], true));
       } else {
         // The functions the host's libm gives (no SIMD form has the same bits): the input flushed, then |x| and -x, as f32src(.., true)
@@ -1839,7 +1967,8 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       const bool bf = ins.f[0], f32out = ins.f[1], st = ins.f[3];
       const unsigned need = ins.op == Op::HFMA2 ? 3u : 2u;
       // (The f32 result is taken for HADD2, the half-to-float conversion, with no flush or saturation: the forms ptxas emits.)
-      if (bf || st || (f32out && (ins.op != Op::HADD2 || ins.f[2])) || ins.dst[0].kind != Kind::Reg || ins.src.size() < need) return false;
+      if (st || (bf && (f32out || ins.op != Op::HFMA2)) || (f32out && (ins.op != Op::HADD2 || ins.f[2])) || ins.dst[0].kind != Kind::Reg || ins.src.size() < need)
+        return false;
       alignas(32) uint32_t pk[3][32];
       bool ok = true;
       const auto packed = [&](unsigned slot, const Operand& o) -> const uint32_t* {
@@ -1913,14 +2042,19 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       if (ins.dst[0].reg == kRZ) return true;   // (nothing to write)
       uint32_t* const d = &w.reg(ins.dst[0].reg, 0);
       alignas(32) uint32_t fixed[32];
+      // (bfloat16 pairs, HFMA2 only -- ptxas lowers a bf16 sum and product to HFMA2.BF16_V2 for sm_80 and sm_86 -- go to hfma2_bf_m.)
+      const auto fma2 = [&](const uint32_t* x, const uint32_t* y, const uint32_t* z) {
+        if (bf) sk->hfma2_bf_m(d, x, y, z, ex, 32);
+        else sk->hfma2_m(d, x, y, z, ex, 32, 2);
+      };
       if (ins.op == Op::HADD2) {   // a * 1 + b
         for (unsigned l = 0; l < 32; ++l) fixed[l] = 0x3c003c00u;
-        sk->hfma2_m(d, a, fixed, b, ex, 32, 2);
+        fma2(a, fixed, b);
       } else if (ins.op == Op::HMUL2) {   // a * b + (-0)
         for (unsigned l = 0; l < 32; ++l) fixed[l] = 0x80008000u;
-        sk->hfma2_m(d, a, b, fixed, ex, 32, 2);
+        fma2(a, b, fixed);
       } else {
-        sk->hfma2_m(d, a, b, c, ex, 32, 2);
+        fma2(a, b, c);
       }
       return true;
     }
@@ -1955,35 +2089,277 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       return true;
     }
     case Op::I2F: case Op::I2FP: {
-      // To f32 from a 32-bit integer, to nearest even. (The source's modifiers do not apply: read32 is all the general rule reads.)
+      // An integer to a float: from 8 to 64 bits, to f16, bf16, f32 or f64, in any of the four rounding modes. (The source's
+      // modifiers do not apply: read32 is all the general rule reads.)
       const unsigned dsize = ins.op == Op::I2FP ? 2 : ins.f[0], ssize = ins.op == Op::I2FP ? 2 : ins.f[1];
       const bool sgn = ins.op == Op::I2FP ? ins.f[0] != 0 : ins.f[2] != 0;
       const unsigned rnd = ins.op == Op::I2FP ? ins.f[1] : ins.f[3];
-      if (dsize != 2 || ssize > 2 || rnd != 0 || ins.src.empty() || !plain(ins.src[0]) || ins.dst[0].kind != Kind::Reg) return false;
-      const uint32_t* src = lanes(0, ins.src[0], false);
-      if (ssize < 2) {
-        // A byte or a half of the register (I2F's .B1-.B3, .H1 move it down), sign- or zero-extended to 32 bits: it converts as
-        // a signed 32-bit integer.
-        alignas(32) uint32_t ext[32];
-        const unsigned shift = ins.op == Op::I2F ? (ssize == 1 ? 16u : 8u) * ins.f[4] : 0u;
-        for (unsigned l = 0; l < 32; ++l) {
-          const uint32_t v = shift >= 32 ? 0u : src[l] >> shift;
-          ext[l] = ssize == 0 ? (sgn ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v))) : (v & 0xffu))
-                              : (sgn ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v))) : (v & 0xffffu));
-        }
-        sk->i2f(true, r, ext);
-      } else {
-        sk->i2f(sgn, r, src);
+      if (ins.src.empty() || ins.dst[0].kind != Kind::Reg || !(ssize == 3 ? wide_ok(ins.src[0]) : plain(ins.src[0]))) return false;
+      // (An f16 or bf16 result under a rounding mode is rounded twice by the general rule -- to f32 in the mode, then to the narrow format
+      // to nearest -- where an RTX 3060 rounds once: left to the general rule.)
+      if (rnd && (dsize == 1 || dsize == 4)) return false;
+      if (dsize == 2 && ssize <= 2) {
+        const uint32_t* src = lanes(0, ins.src[0], false);
+        in_mode(rnd, [&] {
+          if (ssize < 2) {
+            // A byte or a half of the register (I2F's .B1-.B3, .H1 move it down), sign- or zero-extended to 32 bits: it converts as
+            // a signed 32-bit integer.
+            alignas(32) uint32_t ext[32];
+            const unsigned shift = ins.op == Op::I2F ? (ssize == 1 ? 16u : 8u) * ins.f[4] : 0u;
+            for (unsigned l = 0; l < 32; ++l) {
+              const uint32_t v = shift >= 32 ? 0u : src[l] >> shift;
+              ext[l] = ssize == 0 ? (sgn ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v))) : (v & 0xffu))
+                                  : (sgn ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v))) : (v & 0xffffu));
+            }
+            sk->i2f(true, r, ext);
+          } else {
+            sk->i2f(sgn, r, src);
+          }
+        });
+        if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+        return true;
       }
-      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      // The other sizes, lane by lane over the rows: a 64-bit source, or a result that is not an f32.
+      alignas(32) uint64_t v64[32];
+      const uint32_t* row = nullptr;
+      if (ssize == 3) pair64(ins.src[0], false, v64);
+      else row = lanes(0, ins.src[0], false);
+      alignas(32) uint32_t lo[32], hi[32];
+      const unsigned part_shift = ins.op == Op::I2F && ssize < 2 ? (ssize == 1 ? 16u : 8u) * ins.f[4] : 0u;
+      in_mode(rnd, [&] { i2f_wide_loop(dsize, ssize, sgn, part_shift, v64, row, lo, hi); });
+      if (dsize == 3) store64(ins.dst[0], lo, hi);
+      else if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, lo);
       return true;
     }
     case Op::F2I: {
-      // f32 to a 32-bit integer.
-      if (ins.f[0] != 2 || ins.f[1] != 2 || ins.src.empty() || !plain(ins.src[0]) || ins.src[0].bnot || ins.dst[0].kind != Kind::Reg)
+      // A float (f32, or the low half of the register as an f16, or an f64 pair) to an integer of 8 to 64 bits.
+      const unsigned dsize = ins.f[0], ssize = ins.f[1], rnd = ins.f[3];
+      const bool sgn = ins.f[2] != 0, fz = ins.f[4] != 0;
+      if (ins.src.empty() || ins.dst[0].kind != Kind::Reg) return false;
+      if (dsize == 2 && ssize == 2) {
+        if (!plain(ins.src[0]) || ins.src[0].bnot) return false;
+        sk->f2i(sgn, rnd, fz, r, lanes(0, ins.src[0], true));
+        if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+        return true;
+      }
+      if (!(ssize == 3 ? wide_ok(ins.src[0]) : plain(ins.src[0]))) return false;
+      alignas(32) double x[32];
+      if (ssize == 3) {
+        alignas(32) uint64_t v64[32];
+        pair64(ins.src[0], true, v64);
+        for (unsigned l = 0; l < 32; ++l) x[l] = as_f64(v64[l]);
+      } else if (ssize == 1) {
+        const uint32_t* raw = lanes(0, ins.src[0], false);
+        for (unsigned l = 0; l < 32; ++l) x[l] = half_to_f32(static_cast<uint16_t>(raw[l]));
+      } else {
+        const uint32_t* raw = lanes(0, ins.src[0], true);
+        for (unsigned l = 0; l < 32; ++l) {
+          float f = as_f32(raw[l]);
+          if (fz) f = ftz(f);
+          x[l] = f;
+        }
+      }
+      const unsigned bits = 8u << dsize;
+      const double lo_lim = -std::ldexp(1.0, static_cast<int>(bits) - 1), hi_sgn = std::ldexp(1.0, static_cast<int>(bits) - 1) - 1;
+      const double hi_uns = std::ldexp(1.0, static_cast<int>(bits)) - 1;
+      alignas(32) uint32_t lo[32] = {}, hi[32] = {};
+      bool too_big = false;   // a 64-bit result the general rule's own clamp does not reach: left to it
+      for (unsigned l = 0; l < 32; ++l) {
+        double v = x[l];
+        switch (rnd) {
+          case 0: v = std::nearbyint(v); break;
+          case 1: v = std::floor(v); break;
+          case 2: v = std::ceil(v); break;
+          default: v = std::trunc(v); break;
+        }
+        uint64_t res;
+        if (v != v) {
+          res = 0;
+        } else if (sgn) {
+          const double c = v < lo_lim ? lo_lim : v > hi_sgn ? hi_sgn : v;
+          if (c >= 9223372036854775808.0) {   // (the clamp's top end, 2^63 - 1, is 2^63 in a double: not an int64)
+            too_big |= ((ex >> l) & 1) != 0;
+            res = 0;
+          } else {
+            res = static_cast<uint64_t>(static_cast<int64_t>(c));
+          }
+        } else {
+          const double c = v < 0 ? 0.0 : v > hi_uns ? hi_uns : v;
+          if (c >= 18446744073709551616.0) {   // (likewise 2^64 - 1)
+            too_big |= ((ex >> l) & 1) != 0;
+            res = 0;
+          } else {
+            res = static_cast<uint64_t>(c);
+          }
+        }
+        lo[l] = static_cast<uint32_t>(res);
+        hi[l] = static_cast<uint32_t>(res >> 32);
+      }
+      if (too_big) return false;
+      if (dsize == 3) store64(ins.dst[0], lo, hi);
+      else if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, lo);
+      return true;
+    }
+    case Op::FCHK: {
+      // Whether a / b must take the slow path: always (see exec_float), so the predicate is true on every executing lane.
+      if (ins.dst[0].kind != Kind::Pred) return false;
+      setp(ins.dst[0], kAll);
+      return true;
+    }
+    case Op::F2F: {
+      // Float to float among f16, bf16, f32 and f64 (a binary16 source is the low half of the register; the rounding mode matters
+      // for an f64 narrowed to f32 only; the other narrowings round to nearest even, as the general rule does).
+      const unsigned dsize = ins.f[0], ssize = ins.f[1], rnd = ins.f[3];
+      if (ins.src.empty() || ins.dst[0].kind != Kind::Reg || !(ssize == 3 ? wide_ok(ins.src[0]) : plain(ins.src[0]))) return false;
+      // (A rounding mode on a conversion to f16 or bf16 is ignored by the general rule, which an RTX 3060 does not: left to it.)
+      if (rnd && dsize != 2 && dsize != 3) return false;
+      alignas(32) double x[32];
+      if (ssize == 3) {
+        alignas(32) uint64_t v64[32];
+        pair64(ins.src[0], true, v64);
+        for (unsigned l = 0; l < 32; ++l) x[l] = as_f64(v64[l]);
+      } else if (ssize == 1) {
+        const uint32_t* raw = lanes(0, ins.src[0], false);
+        for (unsigned l = 0; l < 32; ++l) x[l] = half_to_f32(static_cast<uint16_t>(raw[l]));
+      } else {
+        const uint32_t* raw = lanes(0, ins.src[0], true);
+        for (unsigned l = 0; l < 32; ++l) x[l] = as_f32(raw[l]);
+      }
+      alignas(32) uint32_t lo[32], hi[32];
+      if (dsize == 3) {
+        for (unsigned l = 0; l < 32; ++l) {
+          const uint64_t b = f64_bits(x[l]);
+          lo[l] = static_cast<uint32_t>(b);
+          hi[l] = static_cast<uint32_t>(b >> 32);
+        }
+        store64(ins.dst[0], lo, hi);
+        return true;
+      }
+      if (dsize == 4) {
+        for (unsigned l = 0; l < 32; ++l) lo[l] = f32_to_bf16(static_cast<float>(x[l]));
+      } else if (dsize == 2) {
+        in_mode(ssize == 3 ? rnd : 0u, [&] { f64_to_f32_loop(x, lo); });
+      } else {
+        for (unsigned l = 0; l < 32; ++l) lo[l] = f64_to_half(x[l]);
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, lo);
+      return true;
+    }
+    case Op::FRND: {
+      // Round to an integral value: f32, f16 or f64 in, f32, f16 or f64 out.
+      const unsigned rnd = ins.f[0], dsz = ins.f[2], ssz = ins.f[3];
+      const bool fz = ins.f[1] != 0;
+      if (ins.src.empty() || ins.dst[0].kind != Kind::Reg || !(ssz == 3 ? wide_ok(ins.src[0]) : plain(ins.src[0]))) return false;
+      alignas(32) double x[32];
+      if (ssz == 3) {
+        alignas(32) uint64_t v64[32];
+        pair64(ins.src[0], true, v64);
+        for (unsigned l = 0; l < 32; ++l) x[l] = as_f64(v64[l]);
+      } else if (ssz == 1) {
+        const uint32_t* raw = lanes(0, ins.src[0], false);
+        for (unsigned l = 0; l < 32; ++l) x[l] = half_to_f32(static_cast<uint16_t>(raw[l]));
+      } else {
+        const uint32_t* raw = lanes(0, ins.src[0], true);
+        for (unsigned l = 0; l < 32; ++l) {
+          float f = as_f32(raw[l]);
+          if (fz) f = ftz(f);
+          x[l] = f;
+        }
+      }
+      alignas(32) double y[32];
+      switch (rnd) {
+        case 1: for (unsigned l = 0; l < 32; ++l) y[l] = std::floor(x[l]); break;
+        case 2: for (unsigned l = 0; l < 32; ++l) y[l] = std::ceil(x[l]); break;
+        case 3: for (unsigned l = 0; l < 32; ++l) y[l] = std::trunc(x[l]); break;
+        default: for (unsigned l = 0; l < 32; ++l) y[l] = std::nearbyint(x[l]); break;   // (the host mode is to nearest even)
+      }
+      alignas(32) uint32_t lo[32], hi[32];
+      if (dsz == 3) {
+        for (unsigned l = 0; l < 32; ++l) {
+          const uint64_t b = f64_bits(y[l]);
+          lo[l] = static_cast<uint32_t>(b);
+          hi[l] = static_cast<uint32_t>(b >> 32);
+        }
+        store64(ins.dst[0], lo, hi);
+        return true;
+      }
+      if (dsz == 1) {
+        for (unsigned l = 0; l < 32; ++l) lo[l] = f64_to_half(y[l]);
+      } else if (fz) {
+        for (unsigned l = 0; l < 32; ++l) lo[l] = f32_bits(ftz(static_cast<float>(y[l])));
+      } else {
+        for (unsigned l = 0; l < 32; ++l) lo[l] = f32_bits(static_cast<float>(y[l]));
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, lo);
+      return true;
+    }
+    case Op::HSETP2: case Op::HSET2: {
+      // A comparison of two f16 (or bf16) lanes at once: two predicates, or a word of 16-bit masks (or 1.0s), with the operands'
+      // swizzles, |.| and - as the general rule applies them (after the conversion, and the flush if .FTZ).
+      const bool is_setp = ins.op == Op::HSETP2;
+      const unsigned cmp = ins.f[0], bop = ins.f[1];
+      const bool bf_result = ins.f[2] != 0, bf16 = ins.f[3] != 0, fz = ins.f[4] != 0;
+      // (.FTZ is left to the general rule. An RTX 3060 flushes the subnormal halves of a setp.ftz.f16x2 operand; the general rule flushes
+      // after converting to float, where a half is never subnormal. Whatever is made of that, it is decided in one place.)
+      if (ins.src.size() < 3 || !plain(ins.src[0]) || fz) return false;
+      if (is_setp ? (ins.dst.size() < 2 || ins.dst[0].kind != Kind::Pred || ins.dst[1].kind != Kind::Pred)
+               : ins.dst[0].kind != Kind::Reg)
         return false;
-      sk->f2i(ins.f[2] != 0, ins.f[3], ins.f[4] != 0, r, lanes(0, ins.src[0], true));
-      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      const bool imm_pair = ins.src.size() > 3 && ins.src[1].kind == Kind::FImm && ins.src[2].kind == Kind::FImm;
+      const size_t next = imm_pair ? 3 : 2;
+      if (!imm_pair && !plain(ins.src[1])) return false;
+      if (ins.src.size() <= next || !is_pred(ins.src[next])) return false;
+      const auto conv = [&](uint16_t h) { return bf16 ? bf16_to_f32(h) : half_to_f32(h); };
+      // The swizzle of a source: 0 none, 1 .H0_H0, 2 .H1_H1, 3 .F32.
+      const auto mode_of = [](const Operand& o) { return o.suffix == ".H0_H0" ? 1 : o.suffix == ".H1_H1" ? 2 : o.suffix == ".F32" ? 3 : 0; };
+      const auto halves = [&](uint32_t v, const Operand& o, int mode, float out[2]) {
+        float lo = conv(static_cast<uint16_t>(v)), hi = conv(static_cast<uint16_t>(v >> 16));
+        if (mode == 1) hi = lo;
+        else if (mode == 2) lo = hi;
+        else if (mode == 3) lo = hi = as_f32(v);
+        out[0] = lo;
+        out[1] = hi;
+        for (int i = 0; i < 2; ++i) {
+          if (o.abs) out[i] = std::fabs(out[i]);
+          if (o.neg) out[i] = -out[i];
+        }
+      };
+      const uint32_t* ra = lanes(0, ins.src[0], false);
+      const uint32_t* rb = imm_pair ? nullptr : lanes(1, ins.src[1], false);
+      const int ma = mode_of(ins.src[0]), mb = imm_pair ? 0 : mode_of(ins.src[1]);
+      float bimm[2] = {0, 0};
+      if (imm_pair) {
+        bimm[1] = conv(static_cast<uint16_t>(ins.src[1].fbits));   // the high half prints first
+        bimm[0] = conv(static_cast<uint16_t>(ins.src[2].fbits));
+      }
+      const Mask acc = pmask(ins.src[next]);
+      Mask m0 = 0, m1 = 0;
+      uint32_t out[32];
+      const uint32_t one = bf16 ? 0x3f80u : 0x3c00u;
+      for (unsigned l = 0; l < 32; ++l) {
+        float a[2], b[2];
+        halves(ra[l], ins.src[0], ma, a);
+        if (imm_pair) {
+          b[0] = bimm[0];
+          b[1] = bimm[1];
+        } else {
+          halves(rb[l], ins.src[1], mb, b);
+        }
+        const bool accl = ((acc >> l) & 1) != 0;
+        const bool r0 = bool_op(bop, float_cmp(cmp, a[0], b[0]), accl), r1 = bool_op(bop, float_cmp(cmp, a[1], b[1]), accl);
+        m0 |= Mask{r0} << l;
+        m1 |= Mask{r1} << l;
+        uint32_t v = 0;
+        if (r0) v |= bf_result ? one : 0xffffu;
+        if (r1) v |= (bf_result ? one : 0xffffu) << 16;
+        out[l] = v;
+      }
+      if (is_setp) {
+        setp(ins.dst[0], m0);
+        setp(ins.dst[1], m1);
+      } else if (ins.dst[0].reg != kRZ) {
+        store_row(ins.dst[0].reg, out);
+      }
       return true;
     }
     default: return false;
@@ -3159,6 +3535,49 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           else write32(w, d, l, old == v ? 1 : 0);
         }
       };
+      // A warp's atomics on the block's own shared memory: the lanes' addresses decoded once, then each lane's read-modify-write in lane
+      // order straight on the block's shared bytes (no stripe lock: the block's warps run one at a time, as in the loop below). Any lane
+      // whose address names another block of a cluster or lies past the shared memory sends the whole instruction to the loop below,
+      // which reports it (nothing has been touched by then). Vector forms take the loop.
+      if (fast_ && shared && ex && ins.f[7] <= 1 && m_.sm >= 80 && (ins.dst[0].kind == Kind::Reg || ins.dst[0].kind == Kind::Pred)) {
+        static const unsigned kStrides[] = {0, 4, 8, 16};
+        uint64_t sa[32];
+        row_addresses(a, false, ins.w.bit(91) || popc_inc, 64, ex, sa, kStrides[ins.w.field(78, 2)]);
+        bool ok = true;
+        uint32_t soff[32];
+        for (Mask m = ex; m && ok; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+          const uint32_t addr = static_cast<uint32_t>(sa[l]);
+          soff[l] = addr & 0xffffff;
+          ok = (addr >> 24) == blk.rank && uint64_t{soff[l]} + n <= blk.shared.size();
+        }
+        if (ok) {
+          const Operand& d = ins.dst[0];
+          const bool spin = cas && ins.f[1] == 3;
+          uint8_t* const sh = blk.shared.data();
+          for (Mask m = ex; m; m &= m - 1) {
+            const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+            const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, ins.src[1], l) : read32(w, ins.src[1], l));
+            const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
+            uint64_t old = 0;
+            std::memcpy(&old, sh + soff[l], n);
+            const uint64_t nw = apply(l, old, v, swap);
+            std::memcpy(sh + soff[l], &nw, n);
+            ++blk.st.atomics;
+            blk.st.atomic_bytes += n;
+            if (!red) {
+              if (is64) write64(w, d, l, old);
+              else write32(w, d, l, static_cast<uint32_t>(old));
+              if (spin) {
+                if (d.kind == Kind::Pred) set_pred(w, d, l, old == v);
+                else if (is64) write64(w, d, l, old == v ? 1 : 0);
+                else write32(w, d, l, old == v ? 1 : 0);
+              }
+            }
+          }
+          return;
+        }
+      }
       // A warp's atomics on plain global memory taken together. Each lane's is a read-modify-write under the lock of its
       // address' stripe; here the lanes' addresses are grouped (a lane that shares an address with an earlier one finds
       // what that one left, as in the loop below), the stripes involved locked in order, each distinct address loaded

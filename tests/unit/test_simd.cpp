@@ -11,6 +11,7 @@
 #pragma GCC optimize("fp-contract=off")
 
 #include <bit>
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -525,6 +526,91 @@ VTEST(masked_kernels_at_every_level) {
         if (d[i] != w)
           throw vtest::Failure(lv + " ffma_m round " + std::to_string(round) + " lane " + std::to_string(i) + ": got 0x" +
                                hex(d[i]) + " want 0x" + hex(w));
+      }
+    }
+  }
+}
+
+namespace {
+
+// A double to bfloat16 as the SASS executor's general form does it: to binary32 first (to nearest even), then to the nearest
+// bfloat16 (ties to the even one), a NaN the canonical 0x7fff. Written by choosing between the two neighbours by their distance,
+// not by the add-and-truncate the kernel uses.
+uint16_t ref_f64_to_bf16(double v) {
+  if (v != v) return 0x7fff;
+  const float f = static_cast<float>(v);
+  if (f != f) return 0x7fff;
+  const uint32_t u = fb(f);
+  const uint32_t sign = u & 0x80000000u, mag = u & 0x7fffffffu;
+  if (mag >= 0x7f800000u) return static_cast<uint16_t>(u >> 16);   // an infinity
+  const uint32_t lo = mag & 0xffff0000u, hi = lo + 0x10000u;
+  const double dlo = static_cast<double>(asf(lo));
+  const double dhi = hi >= 0x7f800000u ? std::ldexp(1.0, 128) : static_cast<double>(asf(hi));
+  const double m = std::fabs(static_cast<double>(f));
+  uint32_t pick;
+  if (m - dlo < dhi - m) pick = lo;
+  else if (m - dlo > dhi - m) pick = hi;
+  else pick = ((lo >> 16) & 1) ? hi : lo;
+  return static_cast<uint16_t>((sign | pick) >> 16);
+}
+
+}  // namespace
+
+// hfma2_bf_m: both bfloat16 halves of each word, a * b + c with the exact binary64 result rounded to binary32 and then to
+// bfloat16 (the executor's general form), on zeros, subnormals, the extremes, infinities, NaN payloads, cancellations and
+// random words, with part of the lanes masked off and the destination aliasing a source.
+VTEST(hfma2_bf_m_at_every_level) {
+  std::mt19937 rng(23);
+  static const uint16_t b16[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x007f, 0x0080, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x7f80, 0xff80,
+                                 0x7fc0, 0x7f81, 0xffc1, 0x4049, 0x0040, 0x4f80, 0x5f00, 0x1f80, 0x3fc0, 0x7f00, 0x0100, 0x3f81,
+                                 0x3f7f, 0x7e80, 0x2000, 0xa000};
+  constexpr size_t N = sizeof b16 / sizeof b16[0];
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 40000; ++round) {
+      const unsigned n = round & 1 ? 64 : 32;
+      uint32_t a[64], b[64], c[64], d[64], d0[64];
+      for (unsigned i = 0; i < n; ++i) {
+        if (round % 3 == 0) {
+          a[i] = rng(), b[i] = rng(), c[i] = rng();
+        } else {
+          a[i] = uint32_t{b16[rng() % N]} | (uint32_t{b16[rng() % N]} << 16);
+          b[i] = uint32_t{b16[rng() % N]} | (uint32_t{b16[rng() % N]} << 16);
+          c[i] = uint32_t{b16[rng() % N]} | (uint32_t{b16[rng() % N]} << 16);
+          if (round % 5 == 0) {   // c cancels the product, or is far below it: the rounding of the sum, not of the product
+            for (int h = 0; h < 2; ++h) {
+              const double p = static_cast<double>(asf(((a[i] >> (16 * h)) & 0xffffu) << 16)) *
+                               static_cast<double>(asf(((b[i] >> (16 * h)) & 0xffffu) << 16));
+              const float pf = static_cast<float>(-p);
+              const uint32_t cb = fb(pf) >> 16;
+              c[i] = (c[i] & ~(0xffffu << (16 * h))) | ((round % 10 == 0 ? cb : cb + 1) << (16 * h));
+            }
+          }
+        }
+        d0[i] = rng();
+      }
+      uint64_t mask = (static_cast<uint64_t>(rng()) << 32) | rng();
+      if (round % 7 == 0) mask = ~uint64_t{0};
+      if (round % 11 == 0) mask = 0;
+      std::memcpy(d, d0, sizeof d);
+      const uint32_t* src_a = a;
+      if (round % 4 == 1) {   // d is also the first source
+        std::memcpy(d, a, sizeof d);
+        std::memcpy(d0, a, sizeof d0);
+      }
+      k.hfma2_bf_m(d, src_a, b, c, mask, n);
+      for (unsigned i = 0; i < n; ++i) {
+        uint32_t out = 0;
+        for (unsigned h = 0; h < 2; ++h) {
+          const auto cv = [&](uint32_t w) { return static_cast<double>(asf(((w >> (16 * h)) & 0xffffu) << 16)); };
+          out |= uint32_t{ref_f64_to_bf16(std::fma(cv(a[i]), cv(b[i]), cv(c[i])))} << (16 * h);
+        }
+        const uint32_t want = (mask >> i) & 1 ? out : d0[i];
+        if (d[i] != want)
+          throw vtest::Failure(lv + " hfma2_bf_m round " + std::to_string(round) + " lane " + std::to_string(i) + ": got 0x" +
+                               hex(d[i]) + " want 0x" + hex(want) + " (a=0x" + hex(a[i]) + " b=0x" + hex(b[i]) + " c=0x" +
+                               hex(c[i]) + ")");
       }
     }
   }
@@ -1171,6 +1257,45 @@ VTEST(float_forms_at_every_level) {
 
 // PRMT's default mode against the byte-by-byte rule: every selector nibble (all 16 values in each of the four positions), over
 // words of special and random bytes.
+namespace {
+// A 32-bit integer to float by the compiler's own conversion, in whatever rounding mode the host is in (out of line, and the
+// result stored through a volatile, so that nothing is evaluated before the mode is set).
+[[gnu::noinline]] uint32_t ref_i2f_in_mode(bool sgn, uint32_t a) {
+  volatile float f = sgn ? static_cast<float>(static_cast<int64_t>(static_cast<int32_t>(a))) : static_cast<float>(static_cast<int64_t>(a));
+  return std::bit_cast<uint32_t>(f);
+}
+}  // namespace
+
+// i2f runs inside a RoundingScope in the SASS executor (I2F.RM / .RP / .RZ): under every host rounding mode it must give the bits the
+// compiler's conversion gives -- including the sign of a zero (the unsigned conversion once made -0 from 0 when rounding down).
+VTEST(i2f_under_directed_rounding_at_every_level) {
+  std::mt19937 rng(77);
+  static const uint32_t edge[] = {0u, 1u, 2u, 0x7fffffffu, 0x80000000u, 0x80000001u, 0xffffffffu, 0xfffffffeu, 0x01000001u, 0x01000003u,
+                                  0x00ffffffu, 0xfeffffffu, 0xff000001u, 0x7f000001u, 0x40000001u, 0x3fffffffu, 0xc0000001u};
+  constexpr size_t N = sizeof edge / sizeof edge[0];
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+      for (int round = 0; round < 2000; ++round) {
+        uint32_t a[32], r[32], want[32];
+        for (int i = 0; i < 32; ++i) a[i] = round % 4 == 0 ? static_cast<uint32_t>(rng()) : edge[rng() % N] + (round % 3 == 0 ? static_cast<uint32_t>(rng() % 5) : 0u);
+        for (bool sgn : {false, true}) {
+          const int saved = std::fegetround();
+          std::fesetround(mode);
+          k.i2f(sgn, r, a);
+          for (int i = 0; i < 32; ++i) want[i] = ref_i2f_in_mode(sgn, a[i]);
+          std::fesetround(saved);
+          for (int i = 0; i < 32; ++i)
+            if (r[i] != want[i])
+              throw vtest::Failure(lv + " i2f mode " + std::to_string(mode) + (sgn ? " signed" : " unsigned") + " lane " + std::to_string(i) +
+                                   ": a=0x" + hex(a[i]) + " got 0x" + hex(r[i]) + " want 0x" + hex(want[i]));
+        }
+      }
+    }
+  }
+}
+
 VTEST(prmt0_at_every_level) {
   std::mt19937 rng(246);
   for (simd::Level l : levels()) {

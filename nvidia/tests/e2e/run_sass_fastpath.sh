@@ -42,7 +42,7 @@ if ! diff -u "$work/general.txt" "$work/fast.txt" > "$work/diff.txt"; then
 fi
 # An access that faults, with one lane of the warp outside: the fast paths decline it and the general path reports it, so the two
 # runs print the same error (the fault message names the lane, the instruction and the address, so a difference would show here).
-for fault in local gather scatter atomic shared; do
+for fault in local gather scatter atomic shared sharedatomic; do
   env VGPU_GPU=nvidia/rtx3060 VGPU_THREADS=1 VGPU_COUNTERS=1 LD_LIBRARY_PATH="$shim" "$work/prog" "$fault" > "$work/fault_fast_$fault.txt" 2>&1; rcf=$?
   env VGPU_GPU=nvidia/rtx3060 VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_FASTPATH=0 LD_LIBRARY_PATH="$shim" "$work/prog" "$fault" > "$work/fault_general_$fault.txt" 2>&1; rcg=$?
   if (( rcf != 0 || rcg != 0 )); then
