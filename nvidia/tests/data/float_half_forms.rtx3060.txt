@@ -37,7 +37,7 @@ float_form_35 359 lanes 00dd4dbc061d92cd
 float_form_36 359 lanes 19ec6f1a01338f81
 float_form_37 359 lanes ba6674f200262a90
 float_form_38 102 lanes bf11f554640b161e
-float_form_39 187 lanes dbb6b743af8601d6
+float_form_39 102 lanes 5d0f5a16f90c199e
 float_form_40 359 lanes e6ff47bff2aa7073
 half_form_00 1053e64c5df21112
 half_form_01 6577ab8947aa41bb
@@ -82,3 +82,30 @@ double_form_5 48e9523b0534aef6
 double_form_6 13b99ea92aa58754
 double_form_7 390fa9bae932f3c3
 wmma_tf32_truncated e8ec07525e4db11e
+nan_dadd b077ad9f1f0a2aed
+nan_dmul d4d4c0ecfcb4d637
+nan_dfma 6f628c9b6aa35254
+nan_dadd_ru da995369b98b0581
+nan_dmul_rd d4d4c0ecfcb4d637
+nan_dfma_rz 6f628c9b6aa35254
+nan_fmin 80f35575d0a23c8c
+nan_fmax feb728002f7b4f94
+nan_sassonly_dadd_neg_a f8e77c903de77929
+nan_sassonly_dmul_neg_b 97bdb2c7259e70b7
+nan_sassonly_dfma_neg_c b6dd6468eddd6b8c
+nan_sassonly_fabs_a_plus_b 3e100f2bf2c21930
+nan_sassonly_neg_fabs_a 733e76c7f7b68da3
+nan_sassonly_abs_a_minus_abs_b 30cb661968fed981
+nan_cvt_f32_to_f64_hi 0b8bcc17aa514dea
+nan_cvt_f64_to_f32 90e59312eca175d7
+nan_cvt_f32_to_f16 b199ba872e27b163
+nan_cvt_f32_to_bf16 003f47a83970de4e
+nan_cvt_f16_to_f32 a8937c864aca20ea
+nan_cvt_bf16_to_f32 1dd0837650a98c04
+nan_cvt_sqrtf c413b284b4c4ccab
+sad_s32 d02ff765200b8b7a
+usad 5780aead7e6c6d17
+usad_imm_b_c c46f6b98da62636f
+sad_imm_b 746f7bd7570212b0
+sad_imm_c dc1f1bd7d0eb1d63
+usad_imm_b 55cd7d76235bae0d

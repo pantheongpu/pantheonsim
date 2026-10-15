@@ -1007,6 +1007,8 @@ __attribute__((target("fma"))) void fma_lanes_f64_hw(uint64_t* d, const uint64_t
     std::memcpy(&z, &c[l], 8);
     const double r = __builtin_fma(x, y, z);
     std::memcpy(&d[l], &r, 8);
+    // A NaN operand: b's, else c's, else a's, quieted, as the general path's fma (an RTX 3060).
+    if (r != r && (x != x || y != y || z != z)) d[l] = (y != y ? b[l] : z != z ? c[l] : a[l]) | 0x0008000000000000ull;
   });
 }
 // fma.f16x2 lanes on the FMA unit, with the decode and the rounding inlined:
@@ -5595,7 +5597,11 @@ class Interpreter {
       return true;
     }
 #endif
-    for_active(m, W_, [&](uint32_t l) { d[l] = f64bits(std::fma(f64(a[l]), f64(b[l]), f64(c[l]))); });
+    for_active(m, W_, [&](uint32_t l) {
+      const double x = f64(a[l]), y = f64(b[l]), z = f64(c[l]);
+      d[l] = x != x || y != y || z != z ? ((y != y ? b[l] : z != z ? c[l] : a[l]) | 0x0008000000000000ull)
+                                        : f64bits(std::fma(x, y, z));
+    });
     w.written64[op.dst.id] = 1;
     return true;
   }
@@ -10561,16 +10567,17 @@ class Interpreter {
     // distinct payload in each position: the sum, product and difference, and the larger or smaller of two NaNs; the host gives the
     // first operand's, which the compiler's operand order picks). A single NaN in min and max loses to the other operand.
     // Division is a software sequence on the card and keeps the host's.
-    if ((std::isnan(x) || std::isnan(y)) && op != FloatBinOp::Div &&
-        !((op == FloatBinOp::Min || op == FloatBinOp::Max) && !(std::isnan(x) && std::isnan(y))))
-      return (std::isnan(y) ? b : a) | 0x0008000000000000ull;
+    if ((op == FloatBinOp::Min || op == FloatBinOp::Max) && (std::isnan(x) != std::isnan(y)))
+      return std::isnan(x) ? b : a;   // (not the host's fmin, which turns a signalling NaN into a NaN result)
+    if ((std::isnan(x) || std::isnan(y)) && op != FloatBinOp::Div) return (std::isnan(y) ? b : a) | 0x0008000000000000ull;
     switch (op) {
       case FloatBinOp::Add: r = x + y; break;
       case FloatBinOp::Sub: r = x - y; break;
       case FloatBinOp::Mul: r = x * y; break;
       case FloatBinOp::Div: r = x / y; break;
-      case FloatBinOp::Min: r = std::fmin(x, y); break;
-      case FloatBinOp::Max: r = std::fmax(x, y); break;
+      // -0 orders below +0 (an RTX 3060: min(-0, +0) is -0 in either order, max(-0, +0) is +0), as for f32.
+      case FloatBinOp::Min: r = x == 0 && y == 0 ? (std::signbit(x) || std::signbit(y) ? -0.0 : 0.0) : std::fmin(x, y); break;
+      case FloatBinOp::Max: r = x == 0 && y == 0 ? (std::signbit(x) && std::signbit(y) ? -0.0 : 0.0) : std::fmax(x, y); break;
     }
     return f64bits(r);
   }

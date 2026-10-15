@@ -66,7 +66,7 @@ bool executes(const Instr& ins) {
     case Op::PLOP3: case Op::POPC: case Op::PRMT: case Op::R2P: case Op::S2R: case Op::S2UR:
     case Op::SEL: case Op::SGXT: case Op::SHF: case Op::UFLO: case Op::UIADD3: case Op::UIMAD: case Op::UISETP:
     case Op::ULDC: case Op::ULEA: case Op::ULOP3: case Op::UMOV: case Op::UPLOP3: case Op::UPOPC: case Op::UPRMT:
-    case Op::USEL: case Op::USHF: case Op::VABSDIFF4: case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX:
+    case Op::USEL: case Op::USHF: case Op::VABSDIFF: case Op::VABSDIFF4: case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX:
     case Op::VIMNMX3: case Op::IADD: case Op::UP2UR: case Op::ELECT: case Op::USETMAXREG: case Op::WARPGROUP:
     case Op::FMNMX3: case Op::STSM: case Op::RPCMOV: case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
       return true;
@@ -122,7 +122,7 @@ exec::InstClass inst_class(Op op) {
       return C::Tensor;
     case Op::IMAD: case Op::IADD3: case Op::LOP3: case Op::SHF: case Op::LEA: case Op::IMNMX: case Op::IABS:
     case Op::VIADD: case Op::VIMNMX: case Op::VIADDMNMX: case Op::VIMNMX3:
-    case Op::POPC: case Op::FLO: case Op::BREV: case Op::BMSK: case Op::SGXT: case Op::IDP: case Op::VABSDIFF4: case Op::ISETP:
+    case Op::POPC: case Op::FLO: case Op::BREV: case Op::BMSK: case Op::SGXT: case Op::IDP: case Op::VABSDIFF: case Op::VABSDIFF4: case Op::ISETP:
     case Op::UIMAD: case Op::UIADD3: case Op::ULOP3: case Op::USHF: case Op::ULEA: case Op::UISETP:
     case Op::UPOPC: case Op::UFLO:
       return C::Integer;
@@ -628,6 +628,16 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           acc += static_cast<uint32_t>(x) * static_cast<uint32_t>(byte(b, i + (two && hi ? 2 : 0), sb));
         }
         write32(w, ins.dst[0], l, acc);
+      });
+      return;
+    }
+    case Op::VABSDIFF: {   // |a - b| + c, the difference at full width and the sum wrapped at 32 bits
+      const bool sgn = ins.f[0];
+      each_lane(ex, [&](unsigned l) {
+        const uint32_t a = ival(w, ins.src[0], l), b = ival(w, ins.src[1], l), c = ival(w, ins.src[2], l);
+        const int64_t x = sgn ? static_cast<int64_t>(static_cast<int32_t>(a)) : static_cast<int64_t>(a);
+        const int64_t y = sgn ? static_cast<int64_t>(static_cast<int32_t>(b)) : static_cast<int64_t>(b);
+        write32(w, ins.dst[0], l, static_cast<uint32_t>((x > y ? x - y : y - x) + c));
       });
       return;
     }
@@ -2196,9 +2206,9 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
         else if (ssize == 1) x = half_to_f32(static_cast<uint16_t>(read32(w, ins.src[0], l)));
         else x = f32src(ins.src[0], l, false);
         if (dsize == 3) write64(w, ins.dst[0], l, f64_bits(x));
-        else if (dsize == 4) write32(w, ins.dst[0], l, f32_to_bf16(static_cast<float>(x)));
+        else if (dsize == 4) write32(w, ins.dst[0], l, x != x && ssize != 3 ? 0x7fffu : f32_to_bf16(static_cast<float>(x)));
         else if (dsize == 2) write32(w, ins.dst[0], l, f32_bits(rounded(rnd, [&] { return static_cast<float>(x); })));
-        else write32(w, ins.dst[0], l, f64_to_half(x));
+        else write32(w, ins.dst[0], l, x != x && ssize != 3 ? 0x7fffu : f64_to_half(x));   // (an f32 NaN is 0x7fff in either half format, an RTX 3060)
       });
       return;
     }

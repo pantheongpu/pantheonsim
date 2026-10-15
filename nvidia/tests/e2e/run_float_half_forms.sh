@@ -43,9 +43,20 @@ fails=0
 for engine in sass ptx; do
   for level in default base off; do
     case "$level" in default) lv=();; *) lv=(VGPU_SIMD="$level");; esac
-    env "${lv[@]}" VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 VGPU_SASS=$([[ $engine == sass ]] && echo 1 || echo 0) \
+    env "${lv[@]}" VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 VGPU_SASS=$([[ $engine == sass ]] && echo 1 || echo 0) VGPU_SASS_LOG=1 \
         LD_LIBRARY_PATH="$shim" "$out/app" > "$out/sim.txt" 2>&1 || true
-    if diff "$data/float_half_forms.rtx3060.txt" "$out/sim.txt" > "$out/d.txt"; then
+    # On the SASS engine every kernel must run as SASS: an instruction the decoder does not know sends a kernel to the PTX engine,
+    # which gives the same answers here and would hide that (VABSDIFF, the instruction __sad and __usad compile to, was one).
+    if [[ $engine == sass ]] && grep -q 'running PTX instead of SASS' "$out/sim.txt"; then
+      echo "FAIL $engine VGPU_SIMD=$level: a kernel fell back to PTX:"; grep 'running PTX instead of SASS' "$out/sim.txt" | head -5; fails=1
+    fi
+    grep -v '^\[vgpu\]' "$out/sim.txt" > "$out/sim1.txt" || true; mv "$out/sim1.txt" "$out/sim.txt"
+    cp "$data/float_half_forms.rtx3060.txt" "$out/want.txt"
+    if [[ $engine == ptx ]]; then   # (the lines that need an operand modifier ptxas folds: see float_half_forms.cu)
+      grep -v 'sassonly_' "$out/want.txt" > "$out/want2.txt"; mv "$out/want2.txt" "$out/want.txt"
+      grep -v 'sassonly_' "$out/sim.txt" > "$out/sim2.txt"; mv "$out/sim2.txt" "$out/sim.txt"
+    fi
+    if diff "$out/want.txt" "$out/sim.txt" > "$out/d.txt"; then
       echo "ok   $engine VGPU_SIMD=$level"
     else
       echo "FAIL $engine VGPU_SIMD=$level: differs from the card's hashes"; head -20 "$out/d.txt"; fails=1

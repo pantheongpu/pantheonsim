@@ -3471,6 +3471,20 @@ void dec_ugetnextworkid(Instr& ins, const Word& w) {
   ins.src.push_back(mem_addr(kRZ, false, "", ur + 1, 0, ins.sm));
 }
 
+// VABSDIFF Rd, Ra, Rb, Rc = |a - b| + c (the 32-bit sum of absolute difference, which is what __sad and __usad compile to): .U32 when bit
+// 73 is clear, otherwise the operands are signed. The difference is taken at full width (a - b of two int32 does not wrap before the
+// absolute value) and the sum with c wraps at 32 bits, as the PTX sad.s32 / sad.u32 the card agrees with (probed with INT_MIN, INT_MAX
+// and -1 operands). Bits 74-80 are not known to mean anything: an encoding that sets one is refused, not guessed at.
+void dec_vabsdiff(Instr& ins, const Word& w) {
+  if (w.field(74, 7) != 0) throw Error(Err::UnsupportedPtx, "SASS: VABSDIFF with modifier bits 74-80 set");
+  ins.op = Op::VABSDIFF;
+  ins.mnemonic = "VABSDIFF";
+  if (!w.bit(73)) ins.mods.push_back("U32");
+  ins.f[0] = w.bit(73);   // signed
+  ins.dst.push_back(dst_reg(w, false, ins.sm));
+  alu3(ins, w, kUnsigned);
+}
+
 void dec_vabsdiff4(Instr& ins, const Word& w) {
   ins.op = Op::VABSDIFF4;
   ins.mnemonic = "VABSDIFF4";
@@ -3633,6 +3647,7 @@ const std::unordered_map<unsigned, Dec>& float_table() {
       {0x104, dec_f2f}, {0x110, dec_f2f},
       {0x38, dec_i2i},
       {0x3e, dec_f2fp},
+      {0x14, dec_vabsdiff},
       {0x15, dec_vabsdiff4},
       {0x26, dec_idp},
       {0x1b, dec_bmsk},

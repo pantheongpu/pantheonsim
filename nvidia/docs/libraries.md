@@ -1669,9 +1669,8 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   (101120 for 256 bytes, 52224 for 48 KiB) and refuses the rest with
   `cudaErrorInvalidValue` / `CUDA_ERROR_INVALID_VALUE`, changing nothing. The
   value is the kernel's limit from then on, below 48 KiB too: a launch asking for
-  more dynamic shared memory is refused (the runtime says
-  `cudaErrorInvalidConfiguration` as for every launch configuration it refuses,
-  the driver `CUDA_ERROR_INVALID_VALUE`), the occupancy calls count 0 blocks
+  more dynamic shared memory is refused (`cudaErrorInvalidValue` /
+  `CUDA_ERROR_INVALID_VALUE`, as for every launch configuration it refuses), the occupancy calls count 0 blocks
   past it and `cudaOccupancyAvailableDynamicSMemPerBlock` stops at it. The
   carveout starts at -1 and takes -1 to 100; the required cluster dimensions
   take 0 and up (kept as given), the scheduling policy 0 to 2, the non-portable
@@ -1687,11 +1686,20 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   `cudaErrorInvalidValue` before the function is looked at. Required cluster
   dimensions and "cluster size must be set" of a kernel the program set nothing
   for come from its `__cluster_dims__`: derived from the documentation, not
-  checked against a card (an RTX 3060 has no clusters). Known differences that
-  remain: the card's CUDA 13.0 runtime answers `cudaErrorInvalidValue` for every
-  refused launch configuration and `cudaErrorLaunchOutOfResources` for a block
-  past the registers (this library answers `cudaErrorInvalidConfiguration`, as a
-  CUDA 12 runtime does), and the device runtime (`cudaGetFuncAttributes` from a
+  checked against a card (an RTX 3060 has no clusters). Refused launches
+  report what an RTX 3060's CUDA 13.0 runtime and driver do (probed for every
+  case, `nvidia/tests/e2e/launch_refusals.cu`, `run_launch_refusals.sh`):
+  `cudaErrorInvalidValue` for a block or grid past the limits, a zero dimension,
+  dynamic shared memory past the limit and a block past `__launch_bounds__`;
+  `cudaErrorLaunchOutOfResources` (701) for a block whose registers do not fit;
+  `cudaErrorInvalidClusterSize` (912) for any cluster launch on a part without
+  clusters, and for a cluster dimension of 0 (on a part with clusters, a cluster
+  that does not divide the grid or is past the size limit also answers 912 here,
+  from the runtime's documentation, not a card). The launch and `cudaGetLastError`
+  report it and `cudaDeviceSynchronize` does not. Known differences that remain:
+  a launch a kernel makes on the device (`cudaLaunchDeviceV2`, see
+  `docs/sass.md`) still answers `cudaErrorInvalidConfiguration` (no card probe of
+  the device runtime), and the device runtime (`cudaGetFuncAttributes` from a
   kernel) still reports the part's limits.
 
 - **cuBLAS**: the exported names the header does not declare (`cublas?bdmm`,

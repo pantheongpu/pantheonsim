@@ -1693,7 +1693,12 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     }
     return cudaSuccess;
   });
-  if (rc != cudaSuccess) g_async_error = rc;  // see g_async_error
+  // (A launch the device refuses for its configuration -- a block or grid past the limits, a zero dimension, too much shared memory, registers that
+  // do not fit, a cluster the part cannot have -- is reported by the launch and by cudaGetLastError and by nothing after: an RTX 3060's
+  // cudaDeviceSynchronize after each of those answers cudaSuccess, so they are not kept for the synchronize to report.)
+  if (rc != cudaSuccess && rc != cudaErrorInvalidValue && rc != cudaErrorLaunchOutOfResources && rc != cudaErrorInvalidConfiguration &&
+      rc != static_cast<cudaError_t>(912))
+    g_async_error = rc;  // see g_async_error
   return rc;
 }
 
@@ -6031,6 +6036,8 @@ static cudaError_t cudaLaunchKernelExC_traced(const cudaLaunchConfig_t* cfg, con
       cluster[0] = a.val.clusterDim.x;
       cluster[1] = a.val.clusterDim.y;
       cluster[2] = a.val.clusterDim.z;
+      // A cluster dimension of 0 is no cluster shape at all: cudaErrorInvalidClusterSize (an RTX 3060, for {0, 1, 1}).
+      if (!cluster[0] || !cluster[1] || !cluster[2]) return static_cast<cudaError_t>(912);
     }
     // A cooperative launch is what cudaLaunchCooperativeKernel does, asked for
     // through the attribute list instead, and it is not inert: its blocks are

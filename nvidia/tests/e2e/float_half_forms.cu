@@ -186,23 +186,87 @@ __global__ void k_wmma_tf32(const float* a, const float* b, const float* c, floa
 }
 static uint32_t mix32(uint32_t x) { x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16; return x; }
 
+// Double arithmetic on NaNs with distinct signs and payloads (the answer is a NaN that is one of the operands', quieted: b's if b is
+// a NaN, else a's, and for an fma b's, else c's, else a's -- an RTX 3060; the instruction's |x| and -x change the arithmetic, not a
+// NaN that is the answer), and the conversions of NaNs. Hashed per operation over every (a, b, c) of a table. The lines named
+// sassonly_ use an operand modifier ptxas folds into the instruction (-a, |a|, -c): the PTX engine runs its negation and absolute
+// value as separate instructions, which flip or clear a NaN's sign, so only the SASS engine can match the card there.
+constexpr int kNV = 14;
+__constant__ unsigned long long kDV[kNV];
+__global__ void k_nan_dbl(unsigned long long* out, int op) {
+  const int t = threadIdx.x + blockIdx.x * blockDim.x;
+  if (t >= kNV * kNV) return;
+  const double a = __longlong_as_double(static_cast<long long>(kDV[t / kNV])), b = __longlong_as_double(static_cast<long long>(kDV[t % kNV])),
+               c = __longlong_as_double(static_cast<long long>(kDV[(t * 5 + 3) % kNV]));
+  double r = 0;
+  switch (op) {
+    case 0: r = __dadd_rn(a, b); break;
+    case 1: r = __dmul_rn(a, b); break;
+    case 2: r = __fma_rn(a, b, c); break;
+    case 3: r = __dadd_ru(a, b); break;
+    case 4: r = __dmul_rd(a, b); break;
+    case 5: r = __fma_rz(a, b, c); break;
+    case 6: r = fmin(a, b); break;
+    case 7: r = fmax(a, b); break;
+    case 8: r = __dadd_rn(-a, b); break;
+    case 9: r = __dmul_rn(a, -b); break;
+    case 10: r = __fma_rn(a, b, -c); break;
+    case 11: r = fabs(a) + b; break;
+    case 12: r = -fabs(a); break;
+    case 13: r = __dadd_rn(fabs(a), -fabs(b)); break;
+  }
+  out[t] = static_cast<unsigned long long>(__double_as_longlong(r));
+}
+constexpr int kNF = 12;
+__constant__ uint32_t kFV[kNF];
+__global__ void k_nan_cvt(uint32_t* out, int op) {
+  const int t = threadIdx.x + blockIdx.x * blockDim.x;
+  if (t >= kNF) return;
+  const float a = __uint_as_float(kFV[t]);
+  uint32_t r = 0;
+  switch (op) {
+    case 0: r = static_cast<uint32_t>(__double_as_longlong(static_cast<double>(a)) >> 32); break;
+    case 1: r = __float_as_uint(static_cast<float>(__longlong_as_double((static_cast<long long>(kFV[t]) << 32) | kFV[(t + 3) % kNF]))); break;
+    case 2: { __half h = __float2half_rn(a); r = *reinterpret_cast<unsigned short*>(&h); break; }
+    case 3: { __nv_bfloat16 h = __float2bfloat16_rn(a); r = *reinterpret_cast<unsigned short*>(&h); break; }
+    case 4: r = __float_as_uint(__half2float(__ushort_as_half(static_cast<unsigned short>(kFV[t])))); break;
+    case 5: r = __float_as_uint(__bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(kFV[t])))); break;
+    case 6: r = __float_as_uint(sqrtf(a)); break;
+  }
+  out[t] = r;
+}
+
+// __sad and __usad: |a - b| + c as signed and as unsigned 32-bit numbers (one SASS VABSDIFF each, with a register, an immediate b or
+// an immediate c), over the extremes and random words. The difference is taken at full width and the sum wraps.
+__global__ void k_sad(const uint32_t* in, uint32_t* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const uint32_t a = in[3 * i], b = in[3 * i + 1], c = in[3 * i + 2];
+  out[6 * i + 0] = static_cast<uint32_t>(__sad(static_cast<int>(a), static_cast<int>(b), c));
+  out[6 * i + 1] = __usad(a, b, c);
+  out[6 * i + 2] = __usad(a, 12345u, 7u);
+  out[6 * i + 3] = static_cast<uint32_t>(__sad(static_cast<int>(a), -77, b));
+  out[6 * i + 4] = static_cast<uint32_t>(__sad(static_cast<int>(a), static_cast<int>(b), 0x80000000u));
+  out[6 * i + 5] = __usad(a, 0xffffffffu, c);
+}
+
 static uint64_t fnv_step(uint64_t h, uint64_t v, int bytes) {
   for (int i = 0; i < bytes; ++i) h = (h ^ ((v >> (8 * i)) & 0xff)) * 1099511628211ull;
   return h;
 }
 
-// Whether the f32 form `k`'s answer for a lane with this source is exact enough to compare: every form but the SFU's, and for those
-// the inputs that are not an ordinary positive number.
-static bool exact_lane(int k, uint32_t src) {
+// Whether the f32 form `k`'s answer for a lane is exact enough to compare: every form but the SFU's, and for those the inputs that are
+// not an ordinary number the function approximates -- the source as the instruction sees it (-a for form 38, |b| for 39, -|c| for 40):
+// a zero, a subnormal, an infinity or a NaN, and a negative number whose root or logarithm is a NaN.
+static bool exact_lane(int k, uint32_t a, uint32_t b, uint32_t c) {
   const bool sfu = (k >= 11 && k <= 18) || k == 38 || k == 39 || k == 40;
   if (!sfu) return true;
+  const uint32_t src = k == 38 ? (a ^ 0x80000000u) : k == 39 ? (b & 0x7fffffffu) : k == 40 ? (c | 0x80000000u) : a;
   const uint32_t e = (src >> 23) & 0xff;
   if (e == 0 || e == 0xff) return true;   // zero, subnormal, infinity, NaN
-  if (k == 40) return true;               // the root of -|c|: a NaN for every nonzero c
-  if (src >> 31) return k == 12 || k == 13 || k == 17 || k == 39;   // negative: sqrt, rsqrt and lg2 give a NaN
+  if (src >> 31) return k == 12 || k == 13 || k == 17 || k == 40;   // negative: sqrt, rsqrt and lg2 give a NaN
   return false;
 }
-static uint32_t src_of(int k, uint32_t a, uint32_t b, uint32_t c) { return k == 39 ? b : k == 40 ? c : a; }
 
 int main() {
   const uint32_t sp[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u,
@@ -235,7 +299,7 @@ int main() {
       uint64_t hh = 1469598103934665603ull;
       int used = 0;
       for (int i = 0; i < n; ++i) {
-        if (!exact_lane(k, src_of(k, in[i], in[(i + 1) % n], in[(i + 5) % n]))) continue;
+        if (!exact_lane(k, in[i], in[(i + 1) % n], in[(i + 5) % n])) continue;
         hh = fnv_step(hh, got[static_cast<size_t>(i) * kFloatForms + k], 4);
         ++used;
       }
@@ -308,6 +372,63 @@ int main() {
     for (float f : d) { uint32_t u; std::memcpy(&u, &f, 4); hh = fnv_step(hh, u, 4); }
     std::printf("wmma_tf32_truncated %016llx\n", static_cast<unsigned long long>(hh));
     CK(cudaFree(da)); CK(cudaFree(db)); CK(cudaFree(dc)); CK(cudaFree(dd));
+  }
+  {
+    const unsigned long long dv[kNV] = {0x7ff8000000000000ull, 0xfff8000000000000ull, 0x7ff8000000000123ull, 0xfff8000000000456ull,
+                                        0x7ff0000000000001ull, 0xfff0000000000002ull, 0x3ff0000000000000ull, 0xc000000000000000ull,
+                                        0x0ull, 0x8000000000000000ull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
+                                        0x7ff80000deadbeefull, 0x3ca0000000000000ull};
+    const uint32_t fv[kNF] = {0x7fc00000u, 0xffc00000u, 0x7fc12345u, 0xffc54321u, 0x7f800001u, 0xff800002u,
+                              0x3f800000u, 0xc0000000u, 0x00000000u, 0x80000000u, 0x7f800000u, 0xff800000u};
+    CK(cudaMemcpyToSymbol(kDV, dv, sizeof dv));
+    CK(cudaMemcpyToSymbol(kFV, fv, sizeof fv));
+    unsigned long long* d; uint32_t* df;
+    CK(cudaMalloc(&d, kNV * kNV * 8)); CK(cudaMalloc(&df, kNF * 4));
+    static const char* dn[] = {"dadd", "dmul", "dfma", "dadd_ru", "dmul_rd", "dfma_rz", "fmin", "fmax", "sassonly_dadd_neg_a", "sassonly_dmul_neg_b",
+                               "sassonly_dfma_neg_c", "sassonly_fabs_a_plus_b", "sassonly_neg_fabs_a", "sassonly_abs_a_minus_abs_b"};
+    for (int op = 0; op < 14; ++op) {
+      k_nan_dbl<<<2, 128>>>(d, op);
+      CK(cudaGetLastError());
+      CK(cudaDeviceSynchronize());
+      unsigned long long h[kNV * kNV];
+      CK(cudaMemcpy(h, d, sizeof h, cudaMemcpyDeviceToHost));
+      uint64_t hh = 1469598103934665603ull;
+      for (int t = 0; t < kNV * kNV; ++t) hh = fnv_step(hh, h[t], 8);
+      std::printf("nan_%s %016llx\n", dn[op], static_cast<unsigned long long>(hh));
+    }
+    static const char* cn[] = {"f32_to_f64_hi", "f64_to_f32", "f32_to_f16", "f32_to_bf16", "f16_to_f32", "bf16_to_f32", "sqrtf"};
+    for (int op = 0; op < 7; ++op) {
+      k_nan_cvt<<<1, 32>>>(df, op);
+      CK(cudaGetLastError());
+      CK(cudaDeviceSynchronize());
+      uint32_t h[kNF];
+      CK(cudaMemcpy(h, df, sizeof h, cudaMemcpyDeviceToHost));
+      uint64_t hh = 1469598103934665603ull;
+      for (int t = 0; t < kNF; ++t) hh = fnv_step(hh, h[t], 4);
+      std::printf("nan_cvt_%s %016llx\n", cn[op], static_cast<unsigned long long>(hh));
+    }
+    CK(cudaFree(d)); CK(cudaFree(df));
+  }
+  {
+    const int n = 4096;
+    std::vector<uint32_t> in(3 * n), out(6 * n);
+    const uint32_t special[] = {0, 1, 0x7fffffffu, 0x80000000u, 0xffffffffu, 0x7ffffffbu, 0x80000005u, 100, 0xffffff00u, 0x0000ffffu, 0x00010000u};
+    uint32_t seed = 12345;
+    for (int i = 0; i < 3 * n; ++i) { seed = seed * 1664525u + 1013904223u; in[i] = (i % 2) ? special[(seed >> 8) % 11] : seed; }
+    uint32_t *din, *dout;
+    CK(cudaMalloc(&din, in.size() * 4)); CK(cudaMalloc(&dout, out.size() * 4));
+    CK(cudaMemcpy(din, in.data(), in.size() * 4, cudaMemcpyHostToDevice));
+    k_sad<<<n / 64, 64>>>(din, dout, n);
+    CK(cudaGetLastError());
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(out.data(), dout, out.size() * 4, cudaMemcpyDeviceToHost));
+    static const char* sn[] = {"sad_s32", "usad", "usad_imm_b_c", "sad_imm_b", "sad_imm_c", "usad_imm_b"};
+    for (int f = 0; f < 6; ++f) {
+      uint64_t hh = 1469598103934665603ull;
+      for (int i = 0; i < n; ++i) hh = fnv_step(hh, out[6 * i + f], 4);
+      std::printf("%s %016llx\n", sn[f], static_cast<unsigned long long>(hh));
+    }
+    CK(cudaFree(din)); CK(cudaFree(dout));
   }
   return 0;
 }
