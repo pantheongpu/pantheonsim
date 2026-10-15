@@ -22,6 +22,7 @@
 //   7. The counter reads of S2R (CTAID, TID, laneid, clock-free ones) and uniform-datapath operands.   specials.
 //
 // The interpreter is the reference; the other tests hold it to the card.
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -193,7 +194,7 @@ __global__ void reconverge(const u32* in, u32* out, int n) {
   }
   const u32 cnt = (u32)__syncthreads_count(v & 1);   // BAR.RED.POPC and its result
   sh[threadIdx.x & 255] = v;
-  const int all = __syncthreads_and(v != 7), any = __syncthreads_or(v == 3);
+  const int all = __syncthreads_and((v & 3) != 0 || threadIdx.x == 0), any = __syncthreads_or(v == 3 && threadIdx.x > 4);
   if (i < n) out[i] = v + sh[(threadIdx.x + 17) & 255] + (u32)__popc(__activemask()) + cnt * 3u + (u32)all + (u32)any * 5u;
 }
 
@@ -222,6 +223,11 @@ __global__ void shuffles(const u32* in, u32* out, int n, int shape) {
     o[27] = __match_any_sync(m, v & 3);
     unsigned pr = 0;
     o[28] = __match_all_sync(m, v & 1, (int*)&pr) + pr;
+    u32 uni;   // VOTE.EQ (vote.uni): whether the predicate is the same for the lanes that run it
+    asm volatile("{ .reg .pred p, q; setp.ne.u32 p, %1, 0; vote.sync.uni.pred q, p, %2; selp.u32 %0, 1, 0, q; }" : "=r"(uni) : "r"(v & 8), "r"(m));
+    o[29] = uni;
+    asm volatile("{ .reg .pred p, q; setp.lt.u32 p, %1, 7; vote.sync.uni.pred q, p, %2; selp.u32 %0, 1, 0, q; }" : "=r"(uni) : "r"(v & 15), "r"(m));
+    o[30] = uni;
   }
   for (int k = 0; k < 32; ++k) out[(size_t)i * 32 + k] = o[k];
 }
@@ -237,7 +243,7 @@ __global__ void cbanks(const u32* in, u32* out, int n, u32 sel) {
   const u32 v = in[i];
   const float x = __uint_as_float(v & 0x3fffffffu);
   const double y = (double)(v >> 3);
-  u32 o[12];
+  u32 o[13];
   o[0] = (u32)__float_as_uint(x * kfl[3] + kfl[5]);
   o[1] = (u32)__float_as_uint(fmaxf(x, kfl[7]) - kfl[0]);
   o[2] = v + kin[7] + (v ^ kin[11]) + (v & kin[2]);
@@ -251,7 +257,63 @@ __global__ void cbanks(const u32* in, u32* out, int n, u32 sel) {
   o[9] = (u32)__float_as_uint(kfl[sel & 15] * x);
   o[10] = (u32)(const_cast<u32*>(&kin[0]) == nullptr) + __popc(kin[3]) + __clz(kin[5] | 1u);
   o[11] = (u32)(((long long)(int)v * (long long)kin[6]) >> 3);
-  for (int k = 0; k < 12; ++k) out[(size_t)i * 12 + k] = o[k];
+  o[12] = kin[(int)(v & 15) - 8 + 16] + __float_as_uint(kfl[(int)((v >> 4) & 7) - 4 + 8]);   // a register offset that is negative
+  for (int k = 0; k < 13; ++k) out[(size_t)i * 13 + k] = o[k];
+}
+
+// ---- MUFU's libm functions with source modifiers, and divisions and conversions under directed rounding ----------------------------
+__global__ void libm_forms(const u32* in, u32* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float a = __uint_as_float(in[i]), b = __uint_as_float(in[(i + 3) % n]);
+  float r;
+  u32 o[16];
+  asm("sin.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(-a)); o[0] = __float_as_uint(r);
+  asm("cos.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(fabsf(a))); o[1] = __float_as_uint(r);
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(-fabsf(a))); o[2] = __float_as_uint(r);
+  asm("lg2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(fabsf(b))); o[3] = __float_as_uint(r);
+  asm("tanh.approx.f32 %0, %1;" : "=f"(r) : "f"(-b)); o[4] = __float_as_uint(r);
+  asm("sin.approx.f32 %0, %1;" : "=f"(r) : "f"(-fabsf(b))); o[5] = __float_as_uint(r);
+  asm("cos.approx.f32 %0, %1;" : "=f"(r) : "f"(-a)); o[6] = __float_as_uint(r);
+  asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(a)); o[7] = __float_as_uint(r);
+  asm("lg2.approx.f32 %0, %1;" : "=f"(r) : "f"(-b)); o[8] = __float_as_uint(r);
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(-fabsf(a))); o[9] = __float_as_uint(r);
+  asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(fabsf(b))); o[10] = __float_as_uint(r);
+  for (int k = 0; k < 11; ++k) out[(size_t)i * 16 + k] = o[k];
+}
+
+__global__ void divisions(const int* a, const int* b, u32* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int x = a[i], y = b[i] | 1;                 // never zero
+  const int ys = (y == -1 && x == INT_MIN) ? 3 : y;   // nor INT_MIN / -1
+  const unsigned ux = (unsigned)x, uy = (unsigned)y | 1u;
+  u32 o[24];
+  o[0] = (u32)(x / ys);    o[1] = (u32)(x % ys);    o[2] = ux / uy;    o[3] = ux % uy;
+  o[4] = (u32)abs(x);      o[5] = (u32)abs(x - y);  o[6] = (u32)((long long)x / (long long)ys);  o[7] = (u32)((long long)x % (long long)ys);
+  o[8] = __float_as_uint(__int2float_rz(x));   o[9] = __float_as_uint(__int2float_ru(x));  o[10] = __float_as_uint(__int2float_rd(x));
+  o[11] = __float_as_uint(__uint2float_rz(ux)); o[12] = __float_as_uint(__uint2float_ru(ux)); o[13] = __float_as_uint(__uint2float_rd(ux));
+  o[14] = __float_as_uint(__int2float_ru((int)(short)x)) ^ __float_as_uint(__int2float_rd((int)(signed char)y));
+  o[15] = (u32)(x / 7) + (u32)(x % 10) + ux / 1000u + ux % 13u;
+  o[16] = (u32)__double2int_rz(__int2double_rn(x) * 0.37) + (u32)(x >> 3);
+  for (int k = 0; k < 17; ++k) out[(size_t)i * 24 + k] = o[k];
+}
+
+// A warp whose lanes diverge: the lanes that loop and the lane that stores a flag take turns as the scheduler's give-way rule says (a
+// group that branches backwards 64 times while other lanes wait gives way). The first iteration at which the loop reads the flag set.
+__global__ void giveway(u32* flag, u32* out, u32 K) {
+  volatile u32* vf = flag;
+  const unsigned lane = threadIdx.x & 31;
+  if (lane < 16) {
+    u32 acc = lane, snap = 7;
+    for (u32 i = 0; i < K + 8; ++i) {
+      acc = (acc ^ (acc << 7)) + 1;
+      if (i == K) snap = *vf;
+    }
+    out[lane] = snap + (acc & 0);
+  } else if (lane == 16) {
+    *vf = 1;
+  }
 }
 
 // ---- the uniform datapath: values every lane of a warp has in common (kernel arguments, blockIdx) and loops on them -----------
@@ -269,6 +331,9 @@ __global__ void uniforms(u32* out, u32 a, u32 b, u32 c, u32 n, u64 w64, int sgn)
   const u32 fl = __funnelshift_l(a, b, c & 31), fr = __funnelshift_r(u1, u2, u3 & 31);
   acc += fl + fr + (sgn ? (u32)(s1 >> 3) : (u32)(s1 / 5));
   acc += (u32)((q + r) >> 32) + (u32)(q < r) + (u32)((long long)q < (long long)r) + __ffs(u1) + __clz(u2) + (u1 > u2 ? 1u : 2u);
+  const u32 z0 = a > b ? c : 5u, z1 = a == c ? n : b, z2 = (int)a < (int)b ? u1 : u3;
+  const u64 w2 = (u64)a * b, w3 = (u64)a + (u64)b + (u64)c;
+  acc += z0 + z1 + z2 + (u32)(w2 >> 32) + (u32)(w3 >> 32) + (u32)(w3 - w2) + (u32)(w64 > w2) + (u32)(a ? n / a : 0u);
   out[t] = acc;
 }
 
@@ -563,6 +628,69 @@ int main(int argc, char** argv) {
     if (run_turn<6>(nm, threads)) return 1;
   }
 
+  {
+    // MUFU's libm functions (with |x| and -x on the source), divisions, and conversions under every rounding mode, on special and random values.
+    const int n = 1500;
+    static const u32 sp[] = {0u, 0x80000000u, 0x3f800000u, 0xbf800000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x00000001u, 0x007fffffu,
+                             0x00800000u, 0x7f7fffffu, 0x3e800000u, 0xc0490fdbu, 0x41200000u, 0x34000000u, 0x4b800000u, 0x3f000000u};
+    std::vector<u32> hf(n);
+    std::vector<int> ha(n), hb(n);
+    u64 st = 0x9e3779b97f4a7c15ull;
+    const auto nx = [&] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+    static const int ispecial[] = {0, 1, -1, 2, -2, 7, -7, 1000, -1000, 65535, -65536, 16777217, -16777217, 0x7fffffff, INT_MIN, 0x40000001, -123456789};
+    for (int i = 0; i < n; ++i) {
+      hf[i] = (i % 3 == 0) ? sp[nx() % (sizeof sp / sizeof sp[0])] : (u32)nx();
+      ha[i] = (i % 4 == 0) ? ispecial[nx() % (sizeof ispecial / sizeof ispecial[0])] : (int)nx();
+      hb[i] = (i % 5 == 0) ? ispecial[nx() % (sizeof ispecial / sizeof ispecial[0])] : (int)(nx() >> (nx() % 28));
+    }
+    u32 *df, *dout;
+    int *da, *db;
+    CK(cudaMalloc(&df, n * 4));
+    CK(cudaMalloc(&da, n * 4));
+    CK(cudaMalloc(&db, n * 4));
+    CK(cudaMalloc(&dout, (size_t)n * 24 * 4));
+    CK(cudaMemcpy(df, hf.data(), n * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(da, ha.data(), n * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(db, hb.data(), n * 4, cudaMemcpyHostToDevice));
+    for (int threads : {128, 45}) {
+      char nm[64];
+      CK(cudaMemset(dout, 0, (size_t)n * 24 * 4));
+      libm_forms<<<(n + threads - 1) / threads, threads>>>(df, dout, n);
+      std::snprintf(nm, sizeof nm, "libm_forms threads=%d", threads);
+      if (report(nm, dout, (size_t)n * 16)) return 1;
+      CK(cudaMemset(dout, 0, (size_t)n * 24 * 4));
+      divisions<<<(n + threads - 1) / threads, threads>>>(da, db, dout, n);
+      std::snprintf(nm, sizeof nm, "divisions threads=%d", threads);
+      if (report(nm, dout, (size_t)n * 24)) return 1;
+    }
+    CK(cudaFree(df)); CK(cudaFree(da)); CK(cudaFree(db)); CK(cudaFree(dout));
+  }
+  {
+    u32 *flag, *out;
+    CK(cudaMalloc(&flag, 64));
+    CK(cudaMalloc(&out, 64 * 4));
+    const auto reads_one = [&](u32 K) {
+      CK(cudaMemset(flag, 0, 64));
+      CK(cudaMemset(out, 0, 64 * 4));
+      giveway<<<1, 32>>>(flag, out, K);
+      if (cudaDeviceSynchronize()) return 0;
+      u32 v = 0;
+      CK(cudaMemcpy(&v, out, 4, cudaMemcpyDeviceToHost));
+      return v == 1 ? 1 : 0;
+    };
+    u32 lo = 0, hi = 30000;
+    if (!reads_one(hi)) {
+      std::printf("giveway: no turn change within %u iterations\n", hi);
+    } else {
+      while (hi - lo > 1) {
+        const u32 mid = (lo + hi) / 2;
+        if (reads_one(mid)) hi = mid; else lo = mid;
+      }
+      std::printf("giveway: the lanes that store run from iteration %u\n", hi);
+    }
+    CK(cudaFree(flag)); CK(cudaFree(out));
+  }
+
   // Reconvergence and barriers, with block sizes that are not whole warps.
   {
     const int n = 3000;
@@ -611,13 +739,13 @@ int main(int argc, char** argv) {
     CK(cudaMemcpyToSymbol(kq, qq, sizeof qq));
     u32 *din, *dout;
     CK(cudaMalloc(&din, n * 4));
-    CK(cudaMalloc(&dout, (size_t)n * 12 * 4));
+    CK(cudaMalloc(&dout, (size_t)n * 13 * 4));
     CK(cudaMemcpy(din, h.data(), n * 4, cudaMemcpyHostToDevice));
     for (int threads : {128, 50}) {
       cbanks<<<(n + threads - 1) / threads, threads>>>(din, dout, n, 0x5a5a1234u);
       char nm[64];
       std::snprintf(nm, sizeof nm, "cbanks threads=%d", threads);
-      if (report(nm, dout, (size_t)n * 12)) return 1;
+      if (report(nm, dout, (size_t)n * 13)) return 1;
     }
     CK(cudaFree(din)); CK(cudaFree(dout));
   }
