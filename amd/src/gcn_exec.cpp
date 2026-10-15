@@ -3145,9 +3145,6 @@ struct Machine {
 
   // The integer, 16-bit, half-precision and double instructions PyTorch's
   // libraries use beside the ones above. Returns whether `op` was one.
-  // The VALU instructions of the CDNA3 and CDNA4 guides that gfx942 and gfx950 have and that the gfx1250 and RDNA code already does by another
-  // name or under the same one: run under the name that code knows (the half-precision "legacy" multiply-adds are the fused ones; a
-  // half's product is exact in a float, so one rounding is the same either way).
   // The instructions of gfx90a that gfx9_added_alu runs, which the CDNA2 guide defines (12.8, 12.9, 12.11: "D.f16 = sin(S0.f16 * 2 * PI)",
   // the cube-map pseudocode, "4-bit signed int to 32-bit float", "D.i = (int)floor(S0.f + 0.5)", "Fused half precision multiply add",
   // the frexp pseudocode, "D.f16 = S0.f16 * (2 ** S1.i16)", V_MAD_LEGACY_I16, the packed fused multiply-add, "D.u32 = {16'b0, sat8(...)}").
@@ -3167,6 +3164,9 @@ struct Machine {
         "v_pk_fmac_f16", "v_sat_pk_u8_i16"};
     return kDefined.count(name) != 0;
   }
+  // The VALU instructions of the CDNA3 and CDNA4 guides that gfx942 and gfx950 have and that the gfx1250 and RDNA code already does by another
+  // name or under the same one: run under the name that code knows (the half-precision "legacy" multiply-adds are the fused ones; a
+  // half's product is exact in a float, so one rounding is the same either way).
   bool gfx9_added_alu(Wave& w, const Inst& in) {
     std::string name = in.name;
     for (const char* suffix : {"_e32", "_e64", "_dpp", "_sdwa"})
