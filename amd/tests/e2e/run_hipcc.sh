@@ -184,6 +184,18 @@ expect "the gfx950 sparse matrix program runs to the end" "0" "$status"
 expect "each gfx950 sparse product is what the ISA says" "22 of 22" \
   "$(grep -c '^[fi]32_.* cbsz:.*: 0 of [0-9]* wrong$' <<< "$out") of 22"
 
+# What the CDNA3 and CDNA4 guides say beyond the core matrix instructions
+# (hipcc/mfma_modes.cpp, gfx9_added.cpp, gfx9_semantics.cpp): the matrix modes,
+# instructions the two chips added, and ALU rules that differ from older chips.
+for t in mfma_modes gfx9_added gfx9_semantics; do
+  for chip in gfx942:mi300x gfx950:mi350x; do
+    out=$(VGPU_QUIET=1 VGPU_GPU=amd/${chip#*:} LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/$t.${chip%%:*}" 2>&1)
+    status=$?
+    expect "the $t program runs to the end on ${chip%%:*}" "0" "$status"
+    expect "every $t check holds on ${chip%%:*}" "$t: 0 failed" "$(grep -E "^$t: [0-9]+ failed" <<< "$out")"
+  done
+done
+
 # MODE's floating-point modes (hipcc/numerics.cpp): what a kernel's
 # descriptor starts it with -- denormals kept by default, single-precision
 # ones flushed when built with -fgpu-flush-denormals-to-zero -- and each

@@ -100,6 +100,14 @@ echo "wrote $(pwd)/gfx950.gfx950"
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 smfmac.cpp -o smfmac.gfx942
 "$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_GFX950 --offload-arch=gfx950 smfmac.cpp -o smfmac.gfx950
 echo "wrote $(pwd)/smfmac.gfx942 and smfmac.gfx950"
+# What the CDNA3 and CDNA4 guides say beyond the matrix instructions' core: the
+# matrix modes (BLGP, EXEC, MODE, sparse pruning), instructions gfx942 and gfx950
+# added, and the vector and scalar ALU rules that differ from older chips.
+for t in mfma_modes gfx9_added gfx9_semantics; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 $t.cpp -o $t.gfx942
+  "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations -DVGPU_GFX950 --offload-arch=gfx950 $t.cpp -o $t.gfx950
+done
+echo "wrote $(pwd)/{mfma_modes,gfx9_added,gfx9_semantics}.{gfx942,gfx950}"
 # MODE's round and denormal modes: as hipcc builds by default, and built to
 # flush single-precision denormals.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 numerics.cpp -o numerics.gfx942

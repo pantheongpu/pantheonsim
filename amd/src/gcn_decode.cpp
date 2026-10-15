@@ -108,6 +108,21 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop1, 0x30}, {"s_abs_i32", 1, 1}},
       // Clear or set one bit of the destination, the rest of it kept.
       {{Enc::Sop1, 0x18}, {"s_bitset0_b32", 1, 1}},
+      {{Enc::Sop1, 0x19}, {"s_bitset0_b64", 2, 1}},
+      {{Enc::Sop1, 0x1b}, {"s_bitset1_b64", 2, 1}},
+      {{Enc::Sop1, 0x15}, {"s_flbit_i32_i64", 1, 1, 2}},
+      {{Enc::Sop1, 0x28}, {"s_quadmask_b32", 1, 1}},
+      {{Enc::Sop1, 0x29}, {"s_quadmask_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x37}, {"s_bitreplicate_b64_b32", 2, 1}},
+      // The rest of the EXEC-saving family (the document's 12.3), and the two that write EXEC and the result.
+      {{Enc::Sop1, 0x24}, {"s_orn2_saveexec_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x25}, {"s_nand_saveexec_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x26}, {"s_nor_saveexec_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x27}, {"s_xnor_saveexec_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x33}, {"s_andn1_saveexec_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x34}, {"s_orn1_saveexec_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x35}, {"s_andn1_wrexec_b64", 2, 1, 2}},
+      {{Enc::Sop1, 0x36}, {"s_andn2_wrexec_b64", 2, 1, 2}},
       {{Enc::Sop1, 0x1a}, {"s_bitset1_b32", 1, 1}},
       {{Enc::Sop1, 0x08}, {"s_brev_b32", 1, 1}},
       {{Enc::Sop1, 0x09}, {"s_brev_b64", 2, 1, 2}},
@@ -199,6 +214,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Sop2, 0x31}, {"s_lshl4_add_u32", 1, 2}},
       // SOPK: a 16-bit immediate.
       {{Enc::Sopk, 0x00}, {"s_movk_i32", 1, 0}},
+      {{Enc::Sopk, 0x01}, {"s_cmovk_i32", 1, 0}},
       {{Enc::Sopk, 0x0e}, {"s_addk_i32", 1, 0}},
       {{Enc::Sopk, 0x0f}, {"s_mulk_i32", 1, 0}},
       // A hardware register read, or written from a constant that follows:
@@ -268,6 +284,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       // Whether one bit of the first source is clear, or set.
       {{Enc::Sopc, 0x0c}, {"s_bitcmp0_b32", 0, 2}},
       {{Enc::Sopc, 0x0d}, {"s_bitcmp1_b32", 0, 2}},
+      {{Enc::Sopc, 0x0e}, {"s_bitcmp0_b64", 0, 2, 2, 1}},
+      {{Enc::Sopc, 0x0f}, {"s_bitcmp1_b64", 0, 2, 2, 1}},
       {{Enc::Sopc, 0x12}, {"s_cmp_eq_u64", 0, 2, 2, 2}},
       // VGPR indexing: from here to s_set_gpr_idx_off, the vector registers
       // the named operands name are offset by the first source.
@@ -417,6 +435,17 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x026}, {"v_rsq_f64_e32", 2, 1, 2}},
       {{Enc::Vop1, 0x024}, {"v_rsq_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x027}, {"v_sqrt_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x028}, {"v_sqrt_f64_e32", 2, 1, 2}},
+      // The half-precision and miscellaneous VOP1 the document lists that no compiler emits for gfx942.
+      {{Enc::Vop1, 0x042}, {"v_frexp_mant_f16_e32", 1, 1}},
+      {{Enc::Vop1, 0x043}, {"v_frexp_exp_i16_f16_e32", 1, 1}},
+      {{Enc::Vop1, 0x049}, {"v_sin_f16_e32", 1, 1}},
+      {{Enc::Vop1, 0x04a}, {"v_cos_f16_e32", 1, 1}},
+      {{Enc::Vop1, 0x04d}, {"v_cvt_norm_i16_f16_e32", 1, 1}},
+      {{Enc::Vop1, 0x04e}, {"v_cvt_norm_u16_f16_e32", 1, 1}},
+      {{Enc::Vop1, 0x04f}, {"v_sat_pk_u8_i16_e32", 1, 1}},
+      {{Enc::Vop1, 0x00c}, {"v_cvt_rpi_i32_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x00e}, {"v_cvt_off_f32_i4_e32", 1, 1}},
       // The sine and the cosine of a turn: the argument is in turns, not
       // radians, which is why the compiler multiplies by 1/2pi first.
       {{Enc::Vop1, 0x029}, {"v_sin_f32_e32", 1, 1}},
@@ -474,6 +503,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop2, 0x02e}, {"v_min_f16_e32", 1, 2}},
       {{Enc::Vop2, 0x034}, {"v_add_u32_e32", 1, 2}},
       {{Enc::Vop2, 0x035}, {"v_sub_u32_e32", 1, 2}},
+      {{Enc::Vop2, 0x023}, {"v_mac_f16_e32", 1, 2}},
+      {{Enc::Vop2, 0x033}, {"v_ldexp_f16_e32", 1, 2}},
+      {{Enc::Vop2, 0x03c}, {"v_pk_fmac_f16_e32", 1, 2}},
       {{Enc::Vop2, 0x036}, {"v_subrev_u32_e32", 1, 2}},
       // The dot products, which add into their destination as fmac does.
       {{Enc::Vop2, 0x037}, {"v_dot2c_f32_f16_e32", 1, 2}},
@@ -564,6 +596,20 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x135}, {"v_sub_u32_e64", 1, 2}},
       {{Enc::Vop3, 0x13b}, {"v_fmac_f32_e64", 1, 2}},
       {{Enc::Vop3, 0x1c2}, {"v_mad_i32_i24", 1, 3}},
+      {{Enc::Vop3, 0x265}, {"v_ashr_pk_i8_i32", 1, 3}},
+      {{Enc::Vop3, 0x266}, {"v_ashr_pk_u8_i32", 1, 3}},
+      {{Enc::Vop3, 0x2a8}, {"v_minimum3_f32", 1, 3}},
+      {{Enc::Vop3, 0x2a9}, {"v_maximum3_f32", 1, 3}},
+      {{Enc::Vop3, 0x1c4}, {"v_cubeid_f32", 1, 3}},
+      {{Enc::Vop3, 0x1c5}, {"v_cubesc_f32", 1, 3}},
+      {{Enc::Vop3, 0x1c6}, {"v_cubetc_f32", 1, 3}},
+      {{Enc::Vop3, 0x1c7}, {"v_cubema_f32", 1, 3}},
+      // gfx9's names for the half-precision multiply-adds (the "legacy" ones keep a separate rounding of the product, which a half's
+      // exact float product makes the same as a fused one).
+      {{Enc::Vop3, 0x1ea}, {"v_mad_legacy_f16", 1, 3}},
+      {{Enc::Vop3, 0x1ec}, {"v_mad_legacy_i16", 1, 3}},
+      {{Enc::Vop3, 0x1ee}, {"v_fma_legacy_f16", 1, 3}},
+      {{Enc::Vop3, 0x1ef}, {"v_div_fixup_legacy_f16", 1, 3}},
       {{Enc::Vop3, 0x1d2}, {"v_min3_u32", 1, 3}},
       {{Enc::Vop3, 0x1e9}, {"v_mad_i64_i32", 2, 3, 1, 1, 2, true}},
       {{Enc::Vop3, 0x1c3}, {"v_mad_u32_u24", 1, 3}},
@@ -1083,6 +1129,9 @@ Operand operand(uint32_t code, uint32_t width) {
     // 32-bit value there.
     o.kind = OperandKind::VccHi;
     o.width = 1;
+  } else if (code >= 108 && code <= 123) {
+    o.kind = OperandKind::Ttmp;   // the trap handler's registers, which a kernel may read
+    o.index = code - 108;
   } else if (code == 124) {
     o.kind = OperandKind::M0;
   } else if (code == 126) {
@@ -1096,6 +1145,12 @@ Operand operand(uint32_t code, uint32_t width) {
     // half as one register.
     o.kind = code == 235 ? OperandKind::SharedBase : OperandKind::PrivateBase;
     o.width = width;
+  } else if (code == 236 || code == 238) {
+    o.kind = code == 236 ? OperandKind::SharedLimit : OperandKind::PrivateLimit;
+    o.width = width;
+  } else if (code >= 251 && code <= 253) {
+    o.kind = code == 251 ? OperandKind::Vccz : code == 252 ? OperandKind::Execz : OperandKind::Scc;   // VCCZ, EXECZ and SCC as sources
+    o.width = 1;
   } else if (code >= 240 && code <= 248) {
     // The inline float constants, in the ISA's order, ending with the one the
     // sine and the cosine need: a turn is 2pi radians, so a kernel that asked
@@ -1645,18 +1700,17 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       if (formats && (cbsz > 4 || blgp > 4 || abid != (g_scaled_product ? 1u : 0u)))
         throw Error::make(Err::Unsupported, in.name, " with source formats ", cbsz, " and ", blgp,
                           ", which are not ones the instruction has");
-      // A's broadcast (CBSZ, ABID) is modelled; B's lane patterns (BLGP)
-      // are not yet, and are refused by name.
-      if (!formats && blgp)
-        throw Error::make(Err::Unsupported, in.name, " rearranges B's lanes (blgp ", blgp, "), which this does not model");
-      if (!formats && abid >= (1u << cbsz))
+      // A's broadcast (CBSZ, ABID) and B's lane permutation (BLGP, Table 29 of the CDNA3 guide) are modelled; the double-precision
+      // forms ignore both and read BLGP as the negation of A, B and C (7.1.5.3).
+      const bool f64 = in.name.find("_f64") != std::string::npos;
+      if (!formats && !f64 && abid >= (1u << cbsz))
         throw Error::make(Err::Unsupported, in.name, " broadcasts block ", abid, " of groups of ", 1u << cbsz,
                           ", which a group does not have");
-      if (!formats) {
+      if (!formats && !f64) {
         in.a_bcast_size = static_cast<uint8_t>(cbsz);
         in.a_bcast_id = static_cast<uint8_t>(abid);
       }
-      if (formats) {
+      if (formats || blgp) {
         in.cbsz = static_cast<uint8_t>(cbsz);
         in.blgp = static_cast<uint8_t>(blgp);
       }
@@ -1871,8 +1925,12 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     if ((w0 & 0x1FF) == 250) {   // the first source comes from another lane
       in.size = 8;
       in.name = in.name.substr(0, in.name.size() - 4) + "_dpp";
-      in.src.push_back(read_dpp(in, word(code, at + 4)));
+      const uint32_t dpp_word = word(code, at + 4);
+      in.src.push_back(read_dpp(in, dpp_word));
       in.src.push_back(vgpr((w0 >> 9) & 0xFF, s.src_width(1)));
+      // The DPP word carries the second source's negation and absolute value too (bits 22 and 23; the first's are 20 and 21).
+      in.src.back().neg = (dpp_word >> 22) & 1;
+      in.src.back().abs = (dpp_word >> 23) & 1;
       if (carry_in || select) in.src.push_back(vcc());
       return in;
     }
@@ -1912,6 +1970,9 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       if (o.kind == OperandKind::Literal) {
         o.value = half ? (value & 0xFFFF) : value;
         o.literal_high = f64 && o.width == 2;   // a double's literal is its high half
+        // A 64-bit signed integer operand sign-extends its literal (CDNA3 ISA 6.2.1.1); an unsigned one zero-extends it.
+        if (!half && !f64 && o.width == 2 && in.name.find("_i64") != std::string::npos && in.name.rfind("s_", 0) != 0)
+          o.value = static_cast<int64_t>(static_cast<int32_t>(value));
       }
     in.size += 4;
   }
@@ -1972,6 +2033,8 @@ std::string operand_text(const Operand& o) {
     case OperandKind::Ttmp: return wrap(range("ttmp"));
     case OperandKind::Null: return wrap("null");
     case OperandKind::Scc: return wrap("src_scc");
+    case OperandKind::Vccz: return wrap("src_vccz");
+    case OperandKind::Execz: return wrap("src_execz");
     case OperandKind::SharedLimit: return wrap("src_shared_limit");
     case OperandKind::PrivateLimit: return wrap("src_private_limit");
     case OperandKind::None: break;

@@ -123,7 +123,7 @@ VTEST(scalar_bit_fields_shifts_and_comparisons_give_what_the_isa_says) {
         u(shifted), u(shifted >> 32),
         u(std::min(x, y)), x < y,
         std::min(ux, uy), ux < uy,
-        u(std::max(x, y)), x > y,
+        u(std::max(x, y)), x >= y,   // the CDNA3 guide: SCC is set on a tie
         (ux | 8u) & ~0x80000000u,
         (ux >> 5) & 1, !((ux >> 5) & 1),
         ux > 0x8000u, x < -32768,
@@ -156,8 +156,8 @@ VTEST(the_rest_of_the_scalar_bitwise_family_gives_what_the_isa_says) {
     const uint64_t bfm = ((uint64_t{1} << (y & 63)) - 1) << (x & 63);
     const uint32_t start = y & 63, width = (y >> 16) & 0x7F;
     const uint64_t bfe = width == 0 ? 0 : width >= 64 ? a >> start : (a >> start) & ((uint64_t{1} << width) - 1);
-    const int64_t d = int64_t{static_cast<int32_t>(x)} - static_cast<int32_t>(y);
-    const uint32_t absdiff = static_cast<uint32_t>(d < 0 ? -d : d);
+    const int32_t d = static_cast<int32_t>(static_cast<uint32_t>(x) - static_cast<uint32_t>(y));   // the guide's pseudocode works in 32 bits: INT_MIN stays negative
+    const uint32_t absdiff = d < 0 ? 0u - static_cast<uint32_t>(d) : static_cast<uint32_t>(d);
     const std::vector<uint32_t> want = {
         x | ~y, (x | ~y) != 0,
         ~(x & y), ~(x & y) != 0,
