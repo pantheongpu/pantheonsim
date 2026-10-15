@@ -27,6 +27,7 @@
 #include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
+#include "gcn_divide.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
 
@@ -1894,92 +1895,33 @@ struct Machine {
     return w.exec ? static_cast<uint32_t>(__builtin_ctzll(w.exec)) : 0;
   }
 
-  // The three instructions a float division is built from. The compiler
-  // emits v_div_scale to bring extreme operands into range, refines a
-  // reciprocal, then v_div_fmas and v_div_fixup put the result back.
-  //
-  // The scaling exists because the hardware's reciprocal is approximate, and
-  // this reciprocal is exact, so the sequence lands on the correctly rounded
-  // quotient either way.
+  // The three instructions a float division is built from: v_div_scale, v_div_fmas and v_div_fixup (gcn_divide.hpp has the pseudocode
+  // they follow, and where it departs from the guides). The compiler scales the operands, refines a reciprocal, and these put the
+  // result back; the sequence lands on the correctly rounded quotient.
   void divide_step(Wave& w, const Inst& in, uint32_t lane) {
     const OpName op(in.name);
-    // The same three steps, in double precision: the ISA gives each a form of
-    // its own, and the scaling is by 2^128 rather than 2^64.
     if (op.size() > 4 && op.compare(op.size() - 4, 4, "_f64") == 0) {
+      const double s0 = lane_double(w, in.src[0], lane), s1 = lane_double(w, in.src[1], lane), s2 = lane_double(w, in.src[2], lane);
       if (op == "v_div_scale_f64"_op) {
-        const double value = lane_double(w, in.src[0], lane), den = lane_double(w, in.src[1], lane),
-                     num = lane_double(w, in.src[2], lane);
-        bool scaled = false;
-        double out = value;
-        // Both have to be ordinary numbers to compare their exponents:
-        // ilogb of a zero is INT_MIN, and subtracting that overflows.
-        if (std::isfinite(den) && std::isfinite(num) && den != 0 && num != 0) {
-          const int64_t de = std::ilogb(den), ne = std::ilogb(num);
-          if (ne - de >= 1022 || ne - de <= -1022) {
-            out = std::ldexp(value, 128);
-            scaled = true;
-          }
-        }
-        write_lane64(w, in.dst[0], lane, as_bits(out));
-        if (scaled) sdst_bits |= uint64_t{1} << lane;
+        const auto r = gcn::divide::div_scale(s0, s1, s2);
+        write_lane64(w, in.dst[0], lane, as_bits(r.value));
+        if (r.vcc) sdst_bits |= uint64_t{1} << lane;
       } else if (op == "v_div_fmas_f64"_op) {
-        const double r = std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane),
-                                  lane_double(w, in.src[2], lane));
-        write_lane64(w, in.dst[0], lane, as_bits((w.vcc >> lane) & 1 ? std::ldexp(r, 128) : r));
+        write_lane64(w, in.dst[0], lane, as_bits(gcn::divide::div_fmas(s0, s1, s2, (w.vcc >> lane) & 1)));
       } else {   // v_div_fixup_f64
-        const double q = lane_double(w, in.src[0], lane), den = lane_double(w, in.src[1], lane),
-                     num = lane_double(w, in.src[2], lane);
-        double out = q;
-        if (std::isnan(num) || std::isnan(den)) out = std::numeric_limits<double>::quiet_NaN();
-        else if (den == 0) out = num == 0 ? std::numeric_limits<double>::quiet_NaN()
-                                          : std::copysign(std::numeric_limits<double>::infinity(), num) *
-                                                std::copysign(1.0, den);
-        else if (std::isinf(den)) out = std::isinf(num) ? std::numeric_limits<double>::quiet_NaN()
-                                                        : std::copysign(0.0, num) * std::copysign(1.0, den);
-        else if (std::isinf(num)) out = std::copysign(std::numeric_limits<double>::infinity(), num) *
-                                        std::copysign(1.0, den);
-        else out = std::signbit(den) != std::signbit(num) ? -std::fabs(q) : std::fabs(q);   // the quotient's sign is the operands' (CDNA3 ISA)
-        write_lane64(w, in.dst[0], lane, as_bits(out));
+        write_lane64(w, in.dst[0], lane, as_bits(gcn::divide::div_fixup(s0, s1, s2)));
       }
       return;
     }
+    const float s0 = lane_float(w, in.src[0], lane), s1 = lane_float(w, in.src[1], lane), s2 = lane_float(w, in.src[2], lane);
     if (op == "v_div_scale_f32"_op) {
-      // src0 is the value to scale, src1 the denominator, src2 the numerator.
-      const float value = lane_float(w, in.src[0], lane), den = lane_float(w, in.src[1], lane),
-                  num = lane_float(w, in.src[2], lane);
-      // Scale only where the quotient would otherwise overflow or flush to
-      // zero: the ISA scales by 2^64, and says so in the condition register.
-      bool scaled = false;
-      float out = value;
-      // As above: a zero has no exponent to compare.
-      if (std::isfinite(den) && std::isfinite(num) && den != 0 && num != 0) {
-        const int64_t de = std::ilogb(den), ne = std::ilogb(num);
-        if (ne - de >= 126 || ne - de <= -126) {
-          out = std::ldexp(value, 64);
-          scaled = true;
-        }
-      }
-      write_lane(w, in.dst[0], lane, as_bits(out));
-      if (scaled) sdst_bits |= uint64_t{1} << lane;
+      const auto r = gcn::divide::div_scale(s0, s1, s2);
+      write_lane(w, in.dst[0], lane, as_bits(r.value));
+      if (r.vcc) sdst_bits |= uint64_t{1} << lane;
     } else if (op == "v_div_fmas_f32"_op) {
-      // A fused multiply-add, times 2^64 where the scaling said so.
-      const float r = std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane),
-                               lane_float(w, in.src[2], lane));
-      write_lane(w, in.dst[0], lane, as_bits((w.vcc >> lane) & 1 ? std::ldexp(r, 64) : r));
-    } else {   // v_div_fixup_f32: the quotient, with the cases the sequence cannot do
-      const float q = lane_float(w, in.src[0], lane), den = lane_float(w, in.src[1], lane),
-                  num = lane_float(w, in.src[2], lane);
-      float out = q;
-      if (std::isnan(num) || std::isnan(den)) out = std::numeric_limits<float>::quiet_NaN();
-      else if (den == 0) out = num == 0 ? std::numeric_limits<float>::quiet_NaN()
-                                        : std::copysign(std::numeric_limits<float>::infinity(), num) *
-                                              std::copysign(1.0f, den);
-      else if (std::isinf(den)) out = std::isinf(num) ? std::numeric_limits<float>::quiet_NaN()
-                                                     : std::copysign(0.0f, num) * std::copysign(1.0f, den);
-      else if (std::isinf(num)) out = std::copysign(std::numeric_limits<float>::infinity(), num) *
-                                      std::copysign(1.0f, den);
-      else out = std::signbit(den) != std::signbit(num) ? -std::fabs(q) : std::fabs(q);   // the quotient's sign is the operands' (CDNA3 ISA)
-      write_lane(w, in.dst[0], lane, as_bits(out));
+      write_lane(w, in.dst[0], lane, as_bits(gcn::divide::div_fmas(s0, s1, s2, (w.vcc >> lane) & 1)));
+    } else {   // v_div_fixup_f32
+      write_lane(w, in.dst[0], lane, as_bits(gcn::divide::div_fixup(s0, s1, s2)));
     }
   }
 

@@ -560,4 +560,18 @@ echo "$out" | sed 's/^/      /'
 expect "the wave-order program runs to the end" "0" "$status"
 expect "every wave reads the word before thread 0 overwrites it, in a kernel's first round and in later ones" \
   "10 of 10 wave-order checks hold" "$(grep -o '^[0-9]* of [0-9]* wave-order checks hold' <<< "$out")"
+# Division as the compiler writes it (v_div_scale, v_rcp, fused multiply-adds, v_div_fmas, v_div_fixup): float and double quotients
+# of edge operands (zeros, denormals, infinities, NaNs, both signs) and of random ones whose exponents differ by up to the whole
+# range, each against the host's own IEEE division, bit for bit (hipcc/divide.cpp). A denominator whose significand is all ones is
+# allowed to be one unit in the last place off.
+for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x" "gfx1100 rx7900xtx" "gfx1201 rx9070xt"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/divide.$1" 2>&1)
+  status=$?
+  expect "$1: the division program runs to the end" "0" "$status"
+  expect "$1: every float and double quotient is the IEEE one" \
+    "divide float: 141681 quotients, 0 differ from IEEE division (0 of the 1681 edge pairs)
+divide double: 141681 quotients, 0 differ from IEEE division (0 of the 1681 edge pairs)" \
+    "$(grep '^divide \(float\|double\):' <<< "$out")"
+done
 exit $fail

@@ -243,3 +243,10 @@ echo "wrote $(pwd)/cluster1250.gfx1250"
 # rocSOLVER's Cholesky kernel): wave_race.cpp.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 wave_race.cpp -o wave_race.gfx942
 echo "wrote $(pwd)/wave_race.gfx942"
+
+# `a / b` on float and double as the compiler writes it (v_div_scale, v_rcp, fused multiply-adds, v_div_fmas, v_div_fixup), over
+# edge and random operands, against the host's own IEEE division: divide.cpp.
+for arch in gfx942 gfx950 gfx90a gfx1100 gfx1201; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch divide.cpp -o divide.$arch
+done
+echo "wrote $(pwd)/divide.gfx942, divide.gfx950, divide.gfx90a, divide.gfx1100 and divide.gfx1201"

@@ -1380,6 +1380,8 @@ target_compile_definitions(test_amd_gcn_crosslane PRIVATE VGPU_SOURCE_DIR="${CMA
 
 vgpu_unit_test(test_amd_gcn_doubles amd/tests/unit/test_gcn_doubles.cpp)
 target_compile_definitions(test_amd_gcn_doubles PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Division: the compiler's v_div_scale / v_div_fmas / v_div_fixup sequence against the host's IEEE quotient.
+vgpu_unit_test(test_amd_gcn_divide amd/tests/unit/test_gcn_divide.cpp)
 
 vgpu_unit_test(test_amd_gcn_narrow amd/tests/unit/test_gcn_narrow.cpp)
 target_compile_definitions(test_amd_gcn_narrow PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
