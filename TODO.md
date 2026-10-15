@@ -1545,6 +1545,13 @@ identical in every pair).** Profiled with perf (cpu-clock) first:
   per-lane `MemoryManager::resolve` + reader lock, which is 20% of the memory-
   bound programs and is the memory layer's.
 
+**2026-10-13/15, round 8 (the SASS engine's operations, r8-sass).** The forms the general path still took -- 64-bit address arithmetic with
+carries, float forms with .FTZ/.SAT/a rounding mode, half-precision forms, MUFU, conversions, FMNMX, DSETP, PRMT, SHFL/VOTE, scattered, broadcast
+and 16-byte global accesses, atomics -- run over 32 lanes with SIMD kernels or batch memory calls; main vs this branch (SASS, 9 alternating runs):
+int_alu 1.88x, f64_fma 1.77x, mem 3.0x, atomics 2.5x, shared 1.30x, local 1.30x, divergent 1.78x, warp 1.83x, launch 1.41x; HeCBench aobench 3.5x,
+lavaMD 1.8x (against the earlier r7-final build). Counters and output unchanged; details, evidence and mutation checks in docs/performance.md
+("Round 8").
+
 One limit found and left alone: on Intel cores a subnormal operand or result
 costs every FP operation a microcode assist, and fp64_virus's FMA chains
 decay into that range -- it runs about 3.7x faster with flush-to-zero set.
