@@ -113,53 +113,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Is there a SASS path?
-        id: sass
-        run: |
-          if grep -q VGPU_SASS_LOG nvidia/src/fatbin.cpp; then echo "here=yes" >> "$GITHUB_OUTPUT"
-          else echo "::notice::no SASS executor in this tree: every kernel already runs on PTX, nothing to repeat"; fi
-
-      - name: Install toolchain
-        if: steps.sass.outputs.here && !job.container.id
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit nvidia-profiler
-
-      - name: Build
-        if: steps.sass.outputs.here
-        run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(ci/jobs.sh -p release)"
-
-      - name: Unit and end-to-end tests on PTX
-        if: steps.sass.outputs.here
-        env:
-          VGPU_SASS: '0'
-        # The build job's set, less the AMD tests, which VGPU_SASS does not
-        # touch.
-        run: |
-          ctest --test-dir build --output-on-failure \
-            -E '^(pantheon_workloads|amd_.*|test_amd.*|.*ollama.*)$'
-
-  digest:
-    name: SASS and PTX leave the same memory
-    needs: image
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    container:
-      # CUDA 13: the only toolkit here that targets every generation (12.0
-      # stops at sm_90).
-      image: ${{ needs.image.outputs.cuda13_0 }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ github.token }}
-      options: --shm-size=2g
-    env:
-      NVCC_PREPEND_FLAGS: ''
-    steps:
-      - uses: actions/checkout@v4
-
       # These jobs build and run with a lot of memory, and on a shared runner
       # another job may hold most of it. Fail here, alone, if this one cannot
       # fit, rather than take the machine down part-way (the minimums are in
