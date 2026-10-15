@@ -23,6 +23,14 @@
 // report, and with no interleaving it also produces no wrong answer. It simply
 // does not show up. Preempting mid-warp is what makes those visible.
 //
+// One exception to "until it yields": under every scheduler a warp's first
+// store to global memory ends its turn once (a block of one warp excepted), so
+// that the block's other warps issue their prologue loads before it lands. A
+// card starts the warps of a block within a few cycles of each other and a
+// store posts only after a load's round trip, so code that has every warp load,
+// add and store the same word in place (Triton's `step += 1` on a one-element
+// tensor) is right on a card, and added one per warp under run-to-the-end.
+//
 // Keeping every legal execution order expressible here is a hard architectural
 // requirement (see ARCHITECTURE.md: race detection roadmap).
 #pragma once
