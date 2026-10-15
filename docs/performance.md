@@ -1088,7 +1088,7 @@ What has a handler (`tier::Form`): MOV; IADD3 (plain, and with carries in and ou
 SEL; PRMT; IMNMX; PLOP3; S2R; global loads and stores of 1, 2, 4 and 8 bytes (Ampere and later), shared and local loads
 and stores of 1 to 16 bytes; and, as the instruction that ends a run, BRA (fixed target, no `.DIV`/`.U.ANY`), BSSY, NOP.
 Where `Runner::fast_alu` has a form, the handler has the same conditions and the same SIMD lane kernel
-(include/vgpu/simd); the other forms are ports of the general code in `exec_int`/`exec_float` row by row. Not covered, and
+(include/vgpu/simd); the other forms are ports of the general code in `exec_int`/`exec_float` row by row. (This is round 8's list; round 9, below, widens it.) Not covered, and
 interpreted as before: uniform-datapath ops (UIADD3, ...), BSYNC, EXIT, BAR, WARPSYNC, SHFL/VOTE, atomics, texture, MMA,
 MUFU, F2I/I2F other than I2FP.F32, half-precision, 16- and 32-byte global accesses, Turing's global address form,
 generic LD/ST, LDC, CALL/RET/BRX.
@@ -1141,13 +1141,11 @@ the CPU's subnormal assist, `wmma`/`mma_ptx` by the scalar tensor-core loop (hal
   **Not caught**: the carry-out of LEA (it needs a pointer whose low word overflows; no kernel here makes one) and the
   second carry-in of IADD3 (ptxas always passes `!PT` there).
 
-**What it would take to make it the default**: (1) a soak over what the tests do not reach: the PyTorch sweep
-(`e2e_pytorch_sass_*`), the pantheon workloads and the CUTLASS/CuTe programs with `VGPU_TIER=1`, comparing results the way
-`run_sass_tier.sh` does; (2) the two CI-only legs this round could not run: the sanitizer jobs (ASan/UBSan leak checks and
-TSan read the tier's shared `Program` built under `std::call_once`; no external-linkage global was added) and the hosted CUDA
-12.0 job (the code builds and `e2e_sass_tier` passes with CUDA 12.0.140's nvcc locally); (3) a decision on memory: a MOp is
-about 100 bytes per instruction, built for a whole code section when it first runs, on top of the 176-byte `Instr`; (4) the
-rest of the run-ending ops (BSYNC, EXIT, BAR, SHFL/VOTE) if `divergent`, `shared` and `warp` are to pass 2x.
+**What it would take to make it the default** (round 8's list; the state after round 9 is at the end of the next section): (1) a soak over what the
+tests do not reach: the PyTorch sweep (`e2e_pytorch_sass_*`) and the CUTLASS/CuTe programs with `VGPU_TIER=1`, comparing results the way
+`run_sass_tier.sh` does; (2) the CI-only legs: the sanitizer jobs (ASan/UBSan leak checks and TSan read the tier's shared `Program` built under
+`std::call_once`; no external-linkage global was added); (3) a decision on memory: a MOp is 96 bytes per instruction, built for a whole code
+section when it first runs, on top of the 184-byte `Instr`.
 
 ## The tier, round 9 (`VGPU_TIER=1`)
 
