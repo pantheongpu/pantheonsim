@@ -2801,6 +2801,14 @@ set_tests_properties(e2e_constant_global_load PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
 
+# CUDA Samples' quasirandomGenerator kernel, a table in __constant__ memory XORed by position bits, on both engines.
+add_test(NAME e2e_constant_table_xor
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_constant_table_xor.sh)
+set_tests_properties(e2e_constant_table_xor PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
+
 # Mipmapped textures: explicit level of detail and plain fetches, every
 # filter combination, biases and clamps, bit for bit with an RTX 3060.
 add_test(NAME e2e_texture_mipmaps COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_texture_mipmaps.sh)
