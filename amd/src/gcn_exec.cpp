@@ -7568,15 +7568,24 @@ struct Machine {
     const auto A = [&](uint32_t bl, uint32_t i, uint32_t k) -> double& { return a[(size_t{bl} * s.m + i) * s.k + k]; };
     const auto B = [&](uint32_t bl, uint32_t k, uint32_t j) -> double& { return b[(size_t{bl} * s.k + k) * s.n + j]; };
     const auto C = [&](uint32_t bl, uint32_t i, uint32_t j) -> double& { return c[(size_t{bl} * s.m + i) * s.n + j]; };
-    // gfx950's scaled forms: each lane's A and B values are its one row (or
-    // column) and one block of 32 along K, and are scaled by 2^(e - 127),
-    // e the E8M0 byte of the lane's scale register its selector names -- or
-    // an inline float constant's exponent. 0xFF is the format's NaN.
-    const auto scale_of = [&](const Operand& o, uint32_t sel, uint32_t lane) -> double {
+    // gfx950's scaled forms: a value at K is scaled by 2^(e - 127) of the scale of its row (A) or column (B) and block K / 32 of K
+    // (CDNA4 guide, 7.2: "one scale value for every 32 K-dimension values"). The scale layout (7.2.1) puts the scales of row i
+    // in lanes i, i + M, ... one block of K a lane group: block q of row i is byte OPSEL of the scale register of lane i + M * q.
+    // e is that E8M0 byte, or an inline float constant's exponent. 0xFF is the format's NaN.
+    const auto scale_of = [&](const Operand& o, uint32_t sel, uint32_t row, uint32_t block) -> double {
       const uint32_t e = o.kind == OperandKind::InlineFloat
                              ? (as_bits(static_cast<float>(o.fvalue)) >> 23) & 0xFF
-                             : (lane_src(w, o, lane) >> (8 * sel)) & 0xFF;
+                             : (lane_src(w, o, row + s.m * block) >> (8 * sel)) & 0xFF;
       return e == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, static_cast<int>(e) - 127);
+    };
+    // Where an f8f6f4 source keeps K (CDNA4 guide, 7.1.5.1, the dense layouts of 8-bit and smaller): lane group g holds 32 values,
+    // element e of its run. 4- and 6-bit ones are 32 in a piece, K = 32 g + e. 8-bit ones are two runs of 16 (registers 0-3, then
+    // 4-7): K = 16 g + e % 16, the second run half the instruction's K on (64 of 128, 32 of 64). That is the layout Triton's dot
+    // operand (kWidth 16, tiled along K) hands real gfx950 hardware. A and B may be of different formats: a product pairs the
+    // values of one K, not of one slot, and the scale of a value is the one of its K block, whichever lane group holds the value.
+    const auto f8f6f4_k = [&](const Operand& o, uint32_t g, uint32_t e) -> uint32_t {
+      const uint32_t f = &o == &in.src[0] ? in.cbsz : in.blgp;
+      return f <= 1 ? 16 * g + e % 16 + e / 16 * (s.k / 2) : 32 * g + e;
     };
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       // CDNA3 guide, 7.1.4.1: A[b,i,k] sits in lane i + M * (b + B * (k / K_L)) and B[b,k,j] in lane j + N * (b + B * (k / K_L)), K_L the
@@ -7587,19 +7596,22 @@ struct Machine {
       // the same place in that block's lanes.
       const uint32_t a_block = in.a_bcast_size ? (bl >> in.a_bcast_size << in.a_bcast_size) + in.a_bcast_id : bl;
       const uint32_t a_lane = !in.a_bcast_size ? lane : a_block < s.blocks ? a_block * lanes_per_block + within : lane;
-      const double sa = in.scaled ? scale_of(in.src[3], in.scale_sel & 3, lane) : 1.0;
-      const double sb = in.scaled ? scale_of(in.src[4], in.scale_sel >> 2, lane) : 1.0;
+      const bool small = s.in == 'x';
       for (uint32_t e = 0; e < per_lane; ++e) {
         const auto flushed = [&](double v, char type) {
           return type == 'f' && flush_in && v != 0 && std::fabs(v) < 1.17549435e-38 ? std::copysign(0.0, v) : v;
         };
-        if (!sparse) A(bl, lane % s.m, g * per_lane + e) = flushed(value(in.src[0], s.in, e, a_lane), s.in) * sa * sign_a;
+        const uint32_t ka = small ? f8f6f4_k(in.src[0], g, e) : g * per_lane + e;
+        const uint32_t kb_small = small ? f8f6f4_k(in.src[1], g, e) : 0;
+        const double sa = in.scaled ? scale_of(in.src[3], in.scale_sel & 3, lane % s.m, ka / 32) : 1.0;
+        const double sb = in.scaled ? scale_of(in.src[4], in.scale_sel >> 2, lane % s.n, kb_small / 32) : 1.0;
+        if (!sparse) A(bl, lane % s.m, ka) = flushed(value(in.src[0], s.in, e, a_lane), s.in) * sa * sign_a;
         // gfx950's sparse forms, whose B is eight registers, split it: the
         // first four hold the lane group's run of K in the first half, the
         // last four the same run K/2 on (the CDNA4 guide's layout tables),
         // where A's run is K's in one piece -- as hipSPARSELt lays both out.
         const uint32_t half = per_lane / 2;
-        const uint32_t kb = sparse && in.src[1].width == 8 ? e / half * (s.k / 2) + g * half + e % half : g * per_lane + e;
+        const uint32_t kb = sparse && in.src[1].width == 8 ? e / half * (s.k / 2) + g * half + e % half : small ? kb_small : g * per_lane + e;
         B(bl, kb, lane % s.n) = flushed(value(in.src[1], s.in_b ? s.in_b : s.in, e, b_lane_of(lane)), s.in_b ? s.in_b : s.in) * sb * sign_b;
       }
       if (sparse) {

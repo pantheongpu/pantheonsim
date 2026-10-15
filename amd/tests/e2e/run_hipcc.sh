@@ -177,8 +177,8 @@ expect "every OCP fp8 and bf8 widens to the float HIP's header gives" "4 of 4 wa
 out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/gfx950.gfx950" 2>&1)
 status=$?
 expect "the gfx950 program runs to the end" "0" "$status"
-expect "each block-scaled product, of every format pairing, is what the ISA says" "6 of 6" \
-  "$(grep -c '^[0-9x]* formats .*: 0 of [0-9]* wrong$' <<< "$out") of 6"
+expect "each block-scaled product, of every format pairing, is what the ISA says" "15 of 15" \
+  "$(grep -c '^[0-9x]* formats .*: 0 of [0-9]* wrong$' <<< "$out") of 15"
 expect "v_prng_b32 steps the ISA's LFSR" "v_prng_b32: 0 of 64 wrong" "$(grep -o '^v_prng_b32:.*' <<< "$out")"
 expect "v_permlane32_swap_b32 trades the halves of two registers" "v_permlane32_swap_b32: 0 of 128 wrong" \
   "$(grep -o '^v_permlane32_swap_b32:.*' <<< "$out")"

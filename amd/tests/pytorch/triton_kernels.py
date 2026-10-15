@@ -12,7 +12,7 @@ each: "ok <name>", or "FAIL <name>: <why>".
 
 fp8 matrix products (gfx942's fnuz formats and gfx950's OCP ones) and MX-scaled
 products (gfx950) run on the devices that have them, so the number of lines
-depends on the device: 18, and 2 more on gfx942, 6 more on gfx950.
+depends on the device: 18, and 2 more on gfx942, 24 more on gfx950.
 """
 import torch
 import triton
@@ -292,12 +292,14 @@ def mx_operand(fmt, rows, k):
     return x, x.float()
 
 
-def mx_dot(fa, fb):
-    # One 32-wide block of K and E8M0 scales (2^-2 .. 2^2) of each row of A and column of B: Triton
-    # widens the operands (v_cvt_scalef32_pk_bf16_*) and multiplies in bfloat16. The reference decodes
-    # the formats here and scales on the CPU.
+def mx_dot(fa, fb, k=32):
+    # E8M0 scales (2^-2 .. 2^2) of each 32-wide block of K of each row of A and column of B. With one block
+    # (K = 32) Triton widens the operands (v_cvt_scalef32_pk_bf16_*) and multiplies in bfloat16; with K = 64 or
+    # 128 it issues v_mfma_scale_f32_32x32x64_f8f6f4 or 16x16x128 -- the 8-bit formats keep K in two runs of 16
+    # a half of K apart, the 4-bit one in a piece of 32 (CDNA4 ISA guide, 7.1.5.1), and a scale belongs to its K
+    # block, not to the lane group holding the value. The reference decodes the formats here and scales on the CPU.
     def run():
-        m = n = k = 32
+        m = n = 32
         (ra, da), (rb, db) = mx_operand(fa, m, k), mx_operand(fb, n, k)
         rb = rb.view(n, -1).t().contiguous()   # K x N
         sa = torch.randint(125, 130, (m, k // 32), dtype=torch.uint8)
@@ -326,6 +328,11 @@ if arch == "gfx950":
     check("tl.dot_scaled of fp8 with E8M0 scales", scaled_dot)
     for fa, fb in [("e2m1", "e2m1"), ("e4m3", "e2m1"), ("e5m2", "e5m2")]:
         check(f"tl.dot_scaled of {fa} by {fb}, one scale block of K", mx_dot(fa, fb))
+    # Several blocks of K: the native scaled matrix instructions, every pairing of the three formats.
+    for k in (64, 128):
+        for fa in ("e2m1", "e4m3", "e5m2"):
+            for fb in ("e2m1", "e4m3", "e5m2"):
+                check(f"tl.dot_scaled of {fa} by {fb}, K = {k}", mx_dot(fa, fb, k))
 check("sum, max, argmax, cumsum, sort and histogram", reductions)
 check("atomic add (fp32, fp16, int32) and max", atomics)
 check("exp, log, sqrt, trigonometry, erf, tanh and libdevice pow", maths)
