@@ -89,7 +89,7 @@ void check_corpus(const std::string& file, int sm) {
     ++accepted;
     // Only instructions step_warp runs as straight-line ones can have a handler (a plain BRA, BSSY or NOP ends a run, and tier_run runs it).
     const bool ends = op.form == sass::tier::Form::Bra || op.form == sass::tier::Form::Bssy || op.form == sass::tier::Form::Nop ||
-                      op.form == sass::tier::Form::Bsync || op.form == sass::tier::Form::Yield || op.form == sass::tier::Form::Bar;
+                      op.form == sass::tier::Form::Bsync || op.form == sass::tier::Form::Yield || op.form == sass::tier::Form::Bar || op.form == sass::tier::Form::Exit;
     const bool terminal = op.form == sass::tier::Form::Plop3 || op.form == sass::tier::Form::S2r || op.form == sass::tier::Form::Sel ||
                           op.form == sass::tier::Form::Shfl || op.form == sass::tier::Form::Vote || op.form == sass::tier::Form::Hmma ||
                           op.form == sass::tier::Form::Umov || op.form == sass::tier::Form::Uldc || op.form == sass::tier::Form::Usel;   // end a run, and have handlers

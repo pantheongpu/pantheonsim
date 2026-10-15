@@ -106,6 +106,7 @@ enum class Form : uint8_t {
   Bsync,     // BSYNC: ends a run, run by tier_run itself
   Yield,     // YIELD: ends a run, run by tier_run itself
   Bar,       // BAR.SYNC / ARV / RED: ends a run, run by tier_run itself
+  Exit,      // EXIT (with up to two condition predicates) when nothing waits at a barrier of any kind: run by tier_run itself
   Shfl,      // SHFL: ends a run, has a handler
   Vote,      // VOTE.{ALL,ANY,EQ}: ends a run, has a handler
   Umov,      // the uniform datapath: computed once for the warp, from the first lane that runs it, into UR/UP

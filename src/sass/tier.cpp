@@ -264,7 +264,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "ldc",
-                                      "bsync", "yield", "bar", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
+                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -394,6 +394,17 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.c = ins.src[0].reg;
       accept(Form::Bsync);
       return;
+    case Op::EXIT: {   // the lanes where the guard and the condition predicates (EXIT Pn) hold leave the kernel
+      unsigned conds = 0;
+      for (const Operand& o : ins.src) {
+        if (o.kind != Kind::Pred && o.kind != Kind::UPred) continue;
+        if (conds == 2) return;
+        (conds++ == 0 ? m.p : m.p2) = pred_src(o);
+      }
+      m.aux = static_cast<uint8_t>(conds);
+      accept(Form::Exit);
+      return;
+    }
     case Op::BAR: {   // a block barrier (B2R, which reads the last reduction's result, is the interpreter's)
       if (ins.mnemonic != "BAR" || ins.src.empty() || (ins.f[2] % 32) != 0) return;   // (a count that is no multiple of 32 is an error there)
       const unsigned mode = ins.f[0];

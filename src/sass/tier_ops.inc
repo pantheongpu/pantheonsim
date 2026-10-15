@@ -1553,6 +1553,28 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
       w.yield = true;
       tier_set_pcs(w, group, here + 16);
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::YIELD)].fetch_add(1, std::memory_order_relaxed);
+    } else if (last.form == tier::Form::Exit && w.waiting == 0 && [&] {
+                 for (const Block::Barrier& b : blk.bars)
+                   if (b.arrived) return false;
+                 return true;
+               }()) {
+      // exec_control's EXIT when nothing waits for it: no lane waits at a BSYNC or a WARPSYNC and no block barrier has an arrival, so
+      // the releases it runs for the lanes that leave (every convergence barrier, the warp-sync sets, every block barrier) have
+      // nothing to release. (With a waiting lane, or a barrier part way, the interpreter runs it.)
+      const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+      const unsigned lanes = ex == group ? glanes : popc(ex);
+      ++st.instructions;
+      st.thread_instructions += lanes;
+      st.inst_by_class[last.cls] += lanes;
+      Mask go = ex;
+      if (last.aux) {
+        go &= tier_pmask(c, last.p);
+        if (last.aux > 1) go &= tier_pmask(c, last.p2);
+      }
+      w.exited |= go;
+      for (Mask m = group & ~go; m; m &= m - 1) w.pc[std::countr_zero(m)] = here + 16;
+      cluster_barrier_check(blk);
+      if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::EXIT)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Bar) {
       // exec_control's BAR: the threads that run it arrive (counted: per thread, or 32 for a warp when the barrier has a thread count);
       // BAR.SYNC and BAR.RED make them wait here, BAR.ARV lets them go on; the lanes that do not run it go on. Then the release.
