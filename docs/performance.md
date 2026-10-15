@@ -959,6 +959,115 @@ Per workload, top 5: **divergent** (2300 samples): 9% `interpreter.cpp:4784`, 7%
 Per workload, top 5: **launch** (606 samples): 6% `atomic_base.h:505`, 4% `interpreter.cpp:2623`, 4% `atomic_base.h:645`, 3% `__vdso_clock_gettime+85`, 3% `getenv+72`; **api** (500 samples): 18% `libc[18984a]`, 7% `__vdso_clock_gettime+85`, 6% `atomic_base.h:895`, 5% `profiling.cpp:264`, 3% `libc[189087]`; **startup** (22 samples): 5% `ast.hpp:114`, 5% `ast.hpp:26`, 5% `basic_string.h:1072`, 5% `char_traits.h:399`, 5% `hashtable.h:1964`
 
 
+## Round 8: the SASS engine's operations
+
+A = a fresh Release build (CUDA 13.0 toolkit, GCC 12, LTO) of origin/main at 61d827c5 (source-identical to 5ea3dc04: the commits
+between touch only a workflow, a lint script and CMakeLists), B = this branch built the same way. Both pinned to CPUs 6-7,
+`tools/bench/bench.sh --ab A B --engines sass,ptx --runs 9`, one host thread, alternating A B A B, `bench_counters` identical in every
+pair. The machine was shared and loaded (load average 12-14 while it ran): a ratio within about 5% of 1 is noise (see "Noise"); the
+SASS rows that moved by 1.1x or more are well outside it. The PTX rows are a control: this branch does not touch the PTX interpreter, only
+`include/vgpu/simd` (a `lop3` kernel the PTX engine does not call, and appended table entries), and they read 0.88x-1.08x, all "same".
+
+| workload | engine | metric | main (median) | this branch (median) | median ratio | best ratio | p | verdict |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| int_alu | sass | winst_per_cpu_s | 22.642 | 42.526 | 1.878x | 1.777x | 0.000 | faster |
+| int_alu | ptx | winst_per_cpu_s | 43.331 | 43.276 | 0.999x | 1.045x | 0.863 | same |
+| f32_fma | sass | winst_per_cpu_s | 43.815 | 42.819 | 0.977x | 1.059x | 0.796 | same |
+| f32_fma | ptx | winst_per_cpu_s | 62.617 | 55.341 | 0.884x | 1.024x | 0.258 | same |
+| f64_fma | sass | winst_per_cpu_s | 19.487 | 34.422 | 1.766x | 1.801x | 0.004 | faster |
+| f64_fma | ptx | winst_per_cpu_s | 32.689 | 31.387 | 0.960x | 0.959x | 0.489 | same |
+| f64_subnormal | sass | winst_per_cpu_s | 5.756 | 6.564 | 1.140x | 1.122x | 0.003 | faster |
+| f64_subnormal | ptx | winst_per_cpu_s | 6.455 | 6.682 | 1.035x | 1.024x | 0.730 | same |
+| wmma | sass | winst_per_cpu_s | 4.790 | 4.922 | 1.027x | 1.012x | 0.666 | same |
+| wmma | ptx | winst_per_cpu_s | 3.753 | 4.051 | 1.079x | 0.941x | 0.387 | same |
+| mma_ptx | sass | winst_per_cpu_s | 8.949 | 9.484 | 1.060x | 1.094x | 0.019 | faster |
+| mma_ptx | ptx | winst_per_cpu_s | 0.490 | 0.476 | 0.972x | 1.032x | 1.000 | same |
+| mem | sass | winst_per_cpu_s | 2.488 | 7.482 | 3.007x | 2.457x | 0.000 | faster |
+| mem | ptx | winst_per_cpu_s | 8.017 | 8.517 | 1.062x | 0.989x | 0.546 | same |
+| shared | sass | winst_per_cpu_s | 8.974 | 11.686 | 1.302x | 1.313x | 0.000 | faster |
+| shared | ptx | winst_per_cpu_s | 8.184 | 8.203 | 1.002x | 0.977x | 0.931 | same |
+| atomics | sass | winst_per_cpu_s | 2.792 | 7.009 | 2.510x | 2.499x | 0.000 | faster |
+| atomics | ptx | winst_per_cpu_s | 2.303 | 2.311 | 1.004x | 0.981x | 0.387 | same |
+| texture | sass | winst_per_cpu_s | 3.045 | 3.376 | 1.109x | 1.144x | 0.014 | faster |
+| texture | ptx | winst_per_cpu_s | 1.643 | 1.780 | 1.084x | 1.021x | 0.190 | same |
+| local | sass | winst_per_cpu_s | 10.985 | 14.285 | 1.300x | 1.263x | 0.000 | faster |
+| local | ptx | winst_per_cpu_s | 10.875 | 10.977 | 1.009x | 1.030x | 0.436 | same |
+| divergent | sass | winst_per_cpu_s | 9.857 | 17.568 | 1.782x | 1.845x | 0.000 | faster |
+| divergent | ptx | winst_per_cpu_s | 14.135 | 13.673 | 0.967x | 0.964x | 0.297 | same |
+| warp | sass | winst_per_cpu_s | 10.852 | 19.842 | 1.828x | 1.592x | 0.000 | faster |
+| warp | ptx | winst_per_cpu_s | 24.791 | 26.714 | 1.078x | 1.021x | 0.297 | same |
+| launch | sass | units_per_s | 285.356 | 401.163 | 1.406x | 1.373x | 0.000 | faster |
+| launch | ptx | units_per_s | 316.935 | 304.565 | 0.961x | 0.985x | 0.489 | same |
+| api | sass | units_per_s | 4735.795 | 4560.842 | 0.963x | 0.983x | 0.258 | same |
+| api | ptx | units_per_s | 4375.708 | 4535.902 | 1.037x | 1.020x | 0.931 | same |
+| startup | sass | wall_s | 0.004 | 0.006 | 0.694x | 0.815x | 0.040 | slower |
+| startup | ptx | wall_s | 0.016 | 0.016 | 0.998x | 0.977x | 0.931 | same |
+
+`startup` read 0.694x once (4 ms against 6 ms of wall time) and 1.035x (p = 0.44) when repeated with 21 runs; `f32_fma` read 0.977x
+once and 1.051x (p = 0.014) with 21. Both are noise at those sizes.
+
+**What the profiles said** (`bench.sh profile --engines sass`, and `perf record` of about 70 HeCBench programs run on the simulator):
+after round 7 the general path was still doing, one lane at a time through `read32`/`write32`/`pred`, every form `fast_alu` declined: a
+64-bit address calculation (IADD3 with a carry out, IADD3.X, IMAD.WIDE, IMAD.X, ISETP.EX, LEA.HI.X: one lambda was 19% of `mem`), every
+float form with .FTZ/.SAT or a rounding mode (`exec_float` was 67% of aobench), half-precision forms with a swizzle or an immediate
+(115,664 of 120,000 sampled instructions of `ert` are `HFMA2 R8, R8, R7, 2, 2`), MUFU, the conversions, FMNMX, DSETP, PRMT, SHFL/VOTE
+(44% of `warp`), and the memory forms that are not a coalesced 1-8 byte access (`resolve` + `unlock_shared` were 20% of `clenergy`, whose
+only memory instruction is a broadcast `LDG.E.128`).
+
+1. **The merged tree's three regressions.** DFMA 0.945x of r7-sass alone: `fast_alu` cleared 768 bytes of scratch before every
+   DFMA/DADD/DMUL (16% of f64_fma's samples on that line) and `dop_m` unpacked each lane with five conversions. Fixed: scratch not cleared,
+   and an AVX2 kernel that unpacks eight lanes with two `unpack` instructions and keeps the rule for a NaN result (look at the result;
+   if it is a NaN, apply `dop_nan` to the lane's operands). f64_fma 1.77x of main. Subnormal 0.946x: 74% of the time is the host's
+   microcode assist inside the vector FMA, so the loss was the gather around it; now 1.14x of main (the assist itself stays). Atomics
+   0.92-0.965x of r7-memory alone: not isolated to one line; the per-lane path does two table lookups and a stripe lock a lane, each through a
+   thread-local; replaced by taking a warp's atomics together (item 4), 2.5x of main.
+2. **Wider forms over 32 lanes**, as kernels in `include/vgpu/simd` (each with an independent scalar reference in
+   `tests/unit/test_simd.cpp` at every level the host has) and as `Runner::fast_wide` / `fast_float` in `src/sass/exec_ops.inc` (kept
+   out of `fast_alu` on purpose: adding them to it made the plain forms 3% slower, measured on `local`). IADD3 with carries in and
+   out (`iadd3x`), IMAD.WIDE / .HI / .X (`imad_wide`), ISETP.EX, PLOP3, SEL, SHF (`shf`), LEA and LEA.HI.X (from `shf` and `iadd3x`),
+   POPC/BREV/FLO (`lane_unary`), PRMT (`prmt0`, pshufb; the other modes in a flat loop), LOP3 by expression for the 19 tables compilers
+   use, masked stores as blends (`blend_m`), FFMA/FADD/FMUL with .FTZ, .SAT and a rounding mode (`ffma_x`...; the mode is set once for the
+   warp with `fesetround` around the call), FSETP and DSETP (`fcmp_mask`, `dcmp`), FMNMX (`fmnmx`), MUFU.RCP/RSQ/SQRT (`mufu`, in double as
+   the executor does; the other functions in a flat libm loop), I2F/I2FP from 8-32 bits (`i2f`), F2I to 32 bits (`f2i`), F2FP.PACK_AB
+   (f16, bf16, .RELU), HADD2/HMUL2/HFMA2 with swizzles, |.|, - and split immediates, HADD2.F32, and DADD/DMUL/DFMA under a directed
+   rounding mode.
+3. **Warp-wide**: SHFL and VOTE read their sources once per instruction and write masks.
+4. **Memory**: scattered, gathered and broadcast 1-16 byte global loads and stores through `MemoryManager::load_batch` / `store_batch` (a
+   16-byte access as two 8-byte pieces, each one relaxed atomic access as `load_scalar` makes it; every case the batch declines -- a fault
+   armed, a host mapping, a misaligned address, a lane outside the allocation -- takes the old loop); coalesced 16-byte runs through
+   `load_run`/`store_run` as 8-byte elements and 4-byte runs copied as rows; a warp's atomics on global memory as one step (lane addresses
+   grouped, the stripe locks taken in ascending order, each distinct address loaded and stored once, the lanes applied in lane order; shared,
+   vector, host-mapped and misaligned atomics take the old loop); local memory moved between the register file and the thread's window;
+   the address fields decoded once per instruction instead of per lane (that lambda was 9-13% of `shared`); byte and half extension by
+   shifts instead of a `switch` per lane (6.7% of the memory-heavy programs); a uniform `BRA` moves the 32 counters in one loop.
+
+**Same bits.** `VGPU_FASTPATH=0` sends every one of these to the old code (the uniform BRA included: it is gated on the same switch).
+`nvidia/tests/e2e/sass_fastpath.cu` runs about 35 kernels over special and random values with lanes on different paths of a guard and
+requires the two runs' output *and counters* to be byte for byte the same (354 launches); the same program prints identical output with
+`VGPU_SIMD=base` and `=off`, and identical output on this branch and on main (0 lines differ in its 28 output lines). Faults: five processes each make
+one lane of a warp reach outside its local window / the allocation (gather, scatter, atomic) / shared memory and require the same error text
+with and without the fast paths. Host references in the program cover 64-bit sums, compares, shifts and multiplies, funnel shifts, popc, brev,
+clz, mulhi, division by constants, atomics' order-independent final values, LEA forms, broadcast loads. The unit test adds 6 tests with
+independent references (`wide_integer_kernels_at_every_level`, `float_forms_at_every_level`, `lane_unary_at_every_level`,
+`prmt0_at_every_level`, `dcmp_at_every_level`, `double_lanes_in_place_at_every_level`, plus the existing LOP3 test now covering the expression
+tables); it passes under `-fsanitize=address,undefined` (kernels compiled sanitized, AVX2 included).
+
+**Mutation checks** (each run against the unit test or the e2e, then reverted): 25 one-line breakages of the kernels (the signed multiply,
+the second carry, a shift's sign fill, a byte permute's sign replication and operand pick, the NaN rule of `dop_m`, each compare's
+predicate, the unsigned conversion's top bit, a flush mask, ...) were all caught by `test_simd`; 30 of the executor's wiring (the ISETP.EX
+formula, PLOP3's outputs, IMAD.HI's register, SEL's order, an atomics' order, a shuffle's range predicate, a vote's negation, LEA's carry,
+a rounding scope, the flags of FFMA.FTZ/SAT, MUFU's source modifiers, ...) by the e2e's hash lines or host checks. Found weak and fixed:
+the local-window bounds check (now the fault tests), MUFU source modifiers and I2F's `.H1`/`.B1` selects (forms added to the e2e), HADD2.F32's
+multiply and flush branches (not reachable from code ptxas emits for sm_86; removed rather than left untested). One mutation of the 16-bit
+store mask in the gather path is equivalent (the memory call truncates).
+
+**Not done, and why.** F2F, FRND, F2I from f64/f16, I2F from 64 bits, HSETP2/HSET2/HMNMX2, bf16 arithmetic, the f32-result forms of
+HMUL2/HFMA2 (ptxas of CUDA 13.0.88 emits only HADD2.F32 for sm_86), MUFU.RCP64H, vector and shared atomics: still the general path. The
+sector and bank counting (`memcount::distinct_sectors`, `sass_bank_passes`) is 10-17% of the memory-bound programs and is r7-memory's
+file. The per-instruction overhead left (`step_warp`, `execute`, operand decoding, `exec_control`'s per-lane BSYNC bookkeeping: 30-45% of an
+ALU-bound program) is a matter for the tier. Subnormal operands stay at the host's assist rate. Having the kernels write the destination
+register in place (no scratch copy) gave no measurable gain and was dropped. AVX-512 was not available, so there is none.
+
 ## Using this to check a change
 
 1. Build baseline and candidate in separate build directories (same flags).

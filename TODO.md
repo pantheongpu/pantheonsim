@@ -1631,6 +1631,12 @@ a NaN, so a tile without one pays one add per vector. The sanitizer skip and the
 Release 13.0 and 12.0 and in the CI ThreadSanitizer Debug configuration.
 `wgmma`, `tcgen05` and the `m8n8k4` form of `mma` still add f32 products in scalar
 code and are not covered by this.
+**2026-10-13/15, round 8 (the SASS engine's operations, r8-sass).** The forms the general path still took -- 64-bit address arithmetic with
+carries, float forms with .FTZ/.SAT/a rounding mode, half-precision forms, MUFU, conversions, FMNMX, DSETP, PRMT, SHFL/VOTE, scattered, broadcast
+and 16-byte global accesses, atomics -- run over 32 lanes with SIMD kernels or batch memory calls; main vs this branch (SASS, 9 alternating runs):
+int_alu 1.88x, f64_fma 1.77x, mem 3.0x, atomics 2.5x, shared 1.30x, local 1.30x, divergent 1.78x, warp 1.83x, launch 1.41x; HeCBench aobench 3.5x,
+lavaMD 1.8x (against the earlier r7-final build). Counters and output unchanged; details, evidence and mutation checks in docs/performance.md
+("Round 8").
 
 One limit found and left alone: on Intel cores a subnormal operand or result
 costs every FP operation a microcode assist, and fp64_virus's FMA chains

@@ -2993,6 +2993,10 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
   add_test(NAME lint_capture_coverage
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_capture_coverage.py)
+  # A key repeated in a workflow file makes GitHub refuse the whole file (it then runs on every push as a
+  # failure with no jobs, and its schedule stops): the check reads every workflow for one.
+  add_test(NAME lint_workflow_yaml
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_workflow_yaml.py)
   # Every exported runtime and driver function is a call a profiler is told of,
   # and the driver shim takes the argument sizes the toolkit declares (CUPTI
   # reads them by those sizes).
