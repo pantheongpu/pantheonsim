@@ -3048,6 +3048,20 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(lint_header_exports PROPERTIES
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  # libcuda and libcudart both contain libvgpu.a, so a data symbol defined with external linkage in
+  # shared code is defined twice in a process that loads both, and AddressSanitizer's ODR check
+  # aborts it (kSysfsFiles, kHwmonFiles, simd's g_kernels all failed CI that way, hours after the
+  # push). This finds one in the plain build; the self-test checks that it does.
+  add_test(NAME lint_odr_globals
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_odr_globals.py)
+  set_tests_properties(lint_odr_globals PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  add_test(NAME lint_odr_globals_selftest
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_odr_globals_selftest.sh)
+  set_tests_properties(lint_odr_globals_selftest PROPERTIES
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 endif()
 add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
 set_tests_properties(lint_shim_symbols PROPERTIES
