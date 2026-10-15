@@ -1773,9 +1773,11 @@ void dec_p2r(Instr& ins, const Word& w) {
 void dec_r2p(Instr& ins, const Word& w) {
   ins.op = Op::R2P;
   ins.mnemonic = "R2P";
-  // Which byte of the register: 72-73, printed as a modifier; Turing keeps
-  // it at 76-77 and prints it on the register.
-  const unsigned byte = static_cast<unsigned>(ins.sm < 80 ? w.field(76, 2) : w.field(72, 2));
+  // Which byte of the register: bits 76-77 on every architecture (ptxas's R2P PR, R5.B1 / .B2 / .B3 for the
+  // second to fourth byte of a loop counter's bits, which a fully unrolled shift-and-test loop makes: 0x...1000,
+  // 0x...2000, 0x...3000 in the high word of an sm_86 cubin). Printed as a modifier from Ampere on; Turing
+  // prints it on the register. It was read at 72-73 from Ampere on, so every R2P took byte 0.
+  const unsigned byte = static_cast<unsigned>(w.field(76, 2));
   if (byte && ins.sm >= 80) ins.mods.push_back("B" + std::to_string(byte));
   ins.f[0] = byte;
   ins.dst.push_back(Txt("PR"));
