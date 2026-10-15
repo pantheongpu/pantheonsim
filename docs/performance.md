@@ -1391,12 +1391,12 @@ that the tier copies, and put the tier in the CI jobs that can soak it. It is st
 
 **What has a handler now** (`src/sass/tier.cpp`, `tier_ops.inc`; each is the SIMD kernel or the scalar rule the interpreter's fast
 path or general code uses, with the operands resolved once):
-FFMA/FADD/FMUL with a rounding mode, `.FTZ` or `.SAT`; FMNMX; MUFU (RCP, RSQ, SQRT as kernels; SIN, COS, EX2, LG2, TANH through libm as
-`fast_float` does them); F2I (f32 to 32 bits); I2F from 8, 16 and 32 bits, also under a directed rounding mode; F2FP.PACK_AB; DSETP;
-DADD/DMUL/DFMA also under a directed rounding mode; packed half HADD2/HMUL2/HFMA2 and HADD2.F32; BREV, FLO, IABS; LDC; 16-byte
+FFMA/FADD/FMUL with a rounding mode, `.FTZ` or `.SAT`; FMNMX; MUFU (RCP, RSQ, SQRT as kernels; SIN, COS, EX2, LG2, TANH by the interpreter's own code); F2I (f32 to 32 bits); I2F from 8, 16 and 32 bits, also under a directed rounding mode; F2FP.PACK_AB (the interpreter's
+code); DSETP;
+DADD/DMUL/DFMA also under a directed rounding mode; packed half HADD2/HMUL2/HFMA2 (HADD2.F32: the interpreter's code); BREV, FLO, IABS; LDC; 16-byte
 global loads and stores; constant-bank operands of banks other than 0 (read when the instruction runs: the module's `__constant__`
 data lives in memory); a lane-constant SHFL as a table worked out once; and, as instructions that end a run, VOTE, SHFL, HMMA (the SIMD
-kernel), CS2R, BSYNC, BAR (SYNC, ARV and the reductions), YIELD, EXIT (when no lane waits at a BSYNC or a WARPSYNC and no block barrier has an
+kernel, with the kind exec_mma chooses), CS2R, BSYNC, BAR (SYNC, ARV and the reductions), YIELD, EXIT (when no lane waits at a BSYNC or a WARPSYNC and no block barrier has an
 arrival; otherwise the interpreter's), the conditional `BRA Pn` of loops, and the barriers and fences that do nothing here (DEPBAR, MEMBAR,
 ERRBAR, NANOSLEEP). The uniform datapath is computed once for the warp from the first lane that runs it, as `exec_int` does: UMOV, ULDC,
 UIADD3, UIMAD, UISETP, ULEA, ULOP3, USHF, USEL, UFLO, UPOPC (the forms with a per-lane operand or destination, UIADD3.64 and the 64-bit
@@ -1425,6 +1425,50 @@ turn_long: the first iteration at which the loop of one warp reads the store ano
 iteration), YIELD loops and spin locks (spin_*, spinlock), reconvergence and barrier reductions on blocks that are not whole warps, special
 registers, the lanes a guard leaves, and faults named by instruction, lane and address after a long run of straight instructions
 (`fault gather|scatter|local|shared|atomic|trap|forever`). `VGPU_MAX_STEPS` now reaches the SASS engine (before, only the PTX engine read it).
+
+**The tier follows the interpreter's rules (second pass, on the merged tree).** The round-9 correctness work (r9-correct2, card-checked) changed
+the interpreter's result rules, and `e2e_sass_tier` then failed on every architecture: the tier's handlers had copied the old rules.
+What differed, form by form: DADD/DMUL/DFMA take the NaN of the registers as they are (`simd::dop_nan`) and leave `|x|` and `-x` to the kernel
+for every kind of source, constants included (the tier folded the modifiers into a constant's bits first); MUFU's libm functions answer a NaN
+with 0x7fffffff and MUFU.TANH does not flush; F2FP.PACK_AB packs every NaN as 0x7fff and `.RELU` turns a `-0` into `+0`; HADD2.F32 of a NaN half is
+0x7fffffff; and an sm_86 cubin's HMMA sums as the RTX 3060's tensor core does (`VGPU_TC_EXACT`, vgpu/exec/tc_ampere.hpp). (The kernels the tier shares with the interpreter -- FFMA/FADD/FMUL's `-0` under `.SAT`, FMNMX's two NaNs, MUFU RCP/RSQ/SQRT, the unsigned
+I2F -- had been fixed in the kernels and needed nothing; PRMT is a shared function too, and `prmt2` agreed on the merged tree.) The new
+`sass_tier` below, run with the tier on and off on the merged tree before this change, disagreed in its `float`, `forms2`, `half2`, `double2` and `mma` programs. The rule since: **a handler computes nothing a number format has rules for; it calls what the interpreter calls.**
+FMNMX, FFMA/FADD/FMUL, FSEL, DADD/DMUL/DFMA, DSETP, the packed-half HFMA2 family, MUFU RCP/RSQ/SQRT, F2I, I2F, I2FP, PRMT, IMNMX, BREV/FLO, POPC
+and HMMA call the same SIMD kernel or shared function as `fast_alu`/`fast_float`/`fast_wide`/`exec_mma`, with the same arguments (HMMA's choice of
+the sum is one function, `Runner::hmma_kernel_kind`, which `exec_mma` calls too). MUFU's libm functions, F2FP.PACK_AB, HADD2.F32 and FSETP with `|x|`
+or `-x` run the interpreter's own code (`Runner::tier_float_op`: `fast_alu`, then `exec_float`). What the tier still computes by itself is
+integer, predicate and control-flow work with no number-format rules (MOV, LEA, SHF, IMAD.WIDE/.HI, IABS, SHFL, VOTE, the uniform datapath, the addresses of the memory forms, ...).
+
+**The guard.** `sass::tier::form_impl` says for every form whether its result is a kernel call (K), the interpreter's code (I) or the tier's own (O),
+with a reason for each O. `test_tier` holds that table to the list checked in at `tests/unit/test_tier.cpp` (adding an O form, or letting a K form stop
+sharing, is a change of that file too), and reads `tier_ops.inc`: a K handler must call a SIMD kernel, an I handler the interpreter, the HMMA handler
+`hmma_kernel_kind`, and no handler may contain scalar float arithmetic (`std::fabs`, `ftz(`, `static_cast<float>`, `f32_bits(`, `std::sin`,
+`float_cmp(`, `dop_nan(`, ...). That is a lint, not a proof (a rule can still be written in integers), but the drift that happened is exactly what it
+catches, and it fails at the unit-test level, with no program to run. Checked by breaking each rule it has: a `fabs` in `h_ffma`, `h_fsetp` with no kernel
+call, `h_hmma` with no `hmma_kernel_kind`, a `static_cast<float>` in `h_mufu` all fail it.
+
+**The programs.** `sass_tier.cu` now also runs the forms the card fixed, on inputs made of NaNs of both signs with distinct payloads in every
+position, zeros of both signs, subnormals and the extremes mixed with random bits: `.SAT`/`.FTZ` of `-0` and directed rounding on FFMA/FADD/FMUL;
+FMNMX with two NaNs and `.NAN`; MUFU's NaNs; F2I of every size and rounding (from f32, f64 and the low and high half of an f16);
+F2F and FRND among f16, bf16, f32 and f64 in each rounding; I2F to every format from every size; the packed halves (HFMA2, HADD2, HMUL2, `.SAT`,
+`.FTZ`, bf16), HSET2/HSETP2 with and without `.FTZ`; F2FP with `.RELU`; DADD/DMUL/DFMA with a NaN in each operand and `|x|`, `-x` on each,
+including operands read from constant banks; DSETP with both predicates; VABSDIFF; PRMT with selector bits past the low two; and mma.sync of f16, bf16 and tf32
+products. `run_sass_tier.sh` also runs `sass_tier`, `wmma_gemm`, `wmma_types`, `mma_fragment_layout` and `modern_dtypes` on sm_86 with `VGPU_TC_EXACT=0`, so
+both sums are held to the interpreter's. Mutation checks (scratch copy, `TMUT=n`): 23 breakages that put the old rules back into the tier (the modifiers applied to the bits,
+the direct HMMA kernel call without the tensor-core sum, TANH flushed, a NaN half as 0x7e00, HADD2.F32's NaN, the multiplier and addend of HFMA2
+exchanged, FSETP ignoring `-x`, IMNMX, I2F without its rounding mode, FMNMX's flags, F2I's rounding, FFMA's `.SAT`, FADD's and DADD's rounding mode, PRMT's mode, a
+bf16 HFMA2 on the f16 kernel, a constant's modifiers folded twice, ...) are all caught by `sass_tier` except one: DSETP's second predicate for a
+comparison (the complement), which ptxas never uses (only MIN/MAX's second predicate, which is covered). HMNMX2 (`min.f16x2`, `max.bf16x2`) is not in the
+SASS decoder (opcode 0x240: "unknown opcode", the program falls back to PTX), so `sass_tier` leaves it out; that is not the tier's.
+
+**Measured on the merged tree** (a quiet machine, the same method as above; counters identical in every comparison). The tier on against off in this build:
+`int_alu` 2.74x, `f32_fma` 2.72x, `f64_fma` 1.58x, `f64_subnormal` 1.08x, `mem` 1.47x, `shared` 1.49x, `atomics` 1.34x, `texture` 1.09x, `local` 1.87x,
+`divergent` 1.82x, `warp` 3.60x, `launch` 1.23x, `api` and `startup` the same; `wmma` 1.12x and `mma_ptx` 1.14x with the sm_86 tensor-core sum (which costs
+the interpreter about 3.6x on these workloads, so the tier's saving is a smaller share), `wmma` 1.59x and `mma_ptx` 1.62x with `VGPU_TC_EXACT=0` (the
+sequential sum). Against the tier as merged before this change (`r9-final` with `VGPU_TIER=1`), 11 alternating runs each: every workload is within 3% (`warp` 1.03x, `mem` 1.03x,
+`texture` 0.98x), which is the cost of handing MUFU's libm functions, F2FP.PACK_AB and HADD2.F32 to the interpreter's code; `wmma` and `mma_ptx` read 0.20x
+because the merged tier summed sequentially where the card (and now the tier) does not.
 
 **Small costs the profiles showed** (`perf record` of the benchmark workloads, symbolised with `nm`; `perf report` could not): a 128-byte row copy
 was a call into libc's memmove (15% of the integer workload), the predicate of LOP3 a scalar loop (8% of `divergent`), the 1/2/4/8-byte
