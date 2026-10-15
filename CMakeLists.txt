@@ -3086,6 +3086,20 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(lint_header_exports PROPERTIES
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  # libcuda and libcudart both contain libvgpu.a, so a data symbol defined with external linkage in
+  # shared code is defined twice in a process that loads both, and AddressSanitizer's ODR check
+  # aborts it (kSysfsFiles, kHwmonFiles, simd's g_kernels all failed CI that way, hours after the
+  # push). This finds one in the plain build; the self-test checks that it does.
+  add_test(NAME lint_odr_globals
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_odr_globals.py)
+  set_tests_properties(lint_odr_globals PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  add_test(NAME lint_odr_globals_selftest
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_odr_globals_selftest.sh)
+  set_tests_properties(lint_odr_globals_selftest PROPERTIES
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 endif()
 add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
 set_tests_properties(lint_shim_symbols PROPERTIES
@@ -3631,5 +3645,18 @@ foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopp
            e2e_sync_masks)
   if(TEST ${_t})
     set_property(TEST ${_t} APPEND PROPERTY RESOURCE_LOCK nvcc_memory)
+  endif()
+endforeach()
+# Under `ctest -j` the tests holding that lock form a chain, and the two CUTLASS
+# tests are most of it (about 1200 s and 1000 s in the build job; every other
+# test is under 120 s). ctest starts tests in cost order (by number when it has
+# no history, which a fresh CI checkout has not), so with these two last in the
+# order they would start only after everything else had finished and the
+# chain could overlap nothing. A cost starts them first: the lock chain then
+# runs beside the other tests from the first second, and the wall time is the
+# chain's rather than the sum.
+foreach(_t e2e_cutlass_hopper e2e_cutlass_gemm)
+  if(TEST ${_t})
+    set_property(TEST ${_t} PROPERTY COST 1000)
   endif()
 endforeach()
