@@ -1067,6 +1067,242 @@ sector and bank counting (`memcount::distinct_sectors`, `sass_bank_passes`) is 1
 file. The per-instruction overhead left (`step_warp`, `execute`, operand decoding, `exec_control`'s per-lane BSYNC bookkeeping: 30-45% of an
 ALU-bound program) is a matter for the tier. Subnormal operands stay at the host's assist rate. Having the kernels write the destination
 register in place (no scratch copy) gave no measurable gain and was dropped. AVX-512 was not available, so there is none.
+## Round 9: the SASS operations round 8 left (r9-sassops)
+
+**What the profile said first.** Round 8's "not done" list was a list of forms, not of hot spots, so the first step was to count. A
+throwaway build (not committed) recorded, for every instruction that reached the general path, how often it did. A static scan of the
+504 HeCBench programs built for sm_86 (`cuobjdump -sass`) picked the 240 whose code holds any of the forms; each ran for up to 25 s on one
+thread (`VGPU_THREADS=1`, `VGPU_COUNTERS=1` for the denominator), and the 130 that completed a launch in that time are the sample. The result is that none of these forms is a large share of any program: the largest are P2R 2.1% of the warp instructions of
+`sort`, I2F.U32.RP 1.0% of `topk`, F2F.F64.F32 0.90% of `myocyte`, IMNMX 0.78% of `segsort`, MUFU.RCP64H 0.47% of `myocyte`, HSET2 0.55% of
+`crossEntropy`, ATOMS.CAST.SPIN.64 0.36% of `aop`; the mean over the 130 programs is below 0.04% for every form. The uniform-datapath ops
+(ULDC.64 is in 124 of the 130, 0.03% on average, at most 0.34%) are one-lane operations: nothing to widen, and left alone. So the gain
+shows in a handful of programs, as below, and nowhere in the bench workloads (which do not use these forms).
+
+**What was done** (`Runner::fast_float` / `fast_wide` and the atomics case of `exec_mem` in `src/sass/exec_ops.inc`; one new kernel in `src/simd`):
+
+| form | how |
+| --- | --- |
+| I2F, I2FP from 8, 16, 32 and 64 bits, to f16, bf16, f32, f64, in each rounding mode | the existing `i2f` kernel inside one `RoundingScope` for 32-bit sources to f32; a loop over the rows for the rest (the scope around an out-of-line loop, so nothing is hoisted past the mode change) |
+| F2I from f16, f32 and f64 to 8, 16, 32 and 64 bits | the `f2i` kernel for f32 to 32 bits as before; a loop over the rows otherwise |
+| F2F among f16, bf16, f32, f64 | loops over the rows |
+| FRND on f16, f32, f64 | loops over the rows |
+| HSET2, HSETP2 (f16 and bf16 pairs, swizzles, \|x\|, -x, immediate pairs) | a loop over the rows with the general rule's element functions |
+| HFMA2 on bf16 pairs | new kernel `hfma2_bf_m` (the exact product and sum in binary64, then to binary32, then to bfloat16, as the general rule rounds; the product of two bf16 values is exact in binary64, so no FMA unit is needed: it is the same at both SIMD levels) |
+| MUFU.RCP64H, MUFU.RSQ64H | a loop over the rows |
+| IMNMX (32 bits), IABS, P2R, FCHK | `ibin_m` (min and max under the two halves of the predicate), loops over the rows, the predicate rows |
+| ATOMS (shared atomics: 32 and 64 bits, every operation, CAS.SPIN, POPC.INC) | the lanes' addresses decoded once, then each lane's read-modify-write in lane order straight on the block's shared bytes |
+
+A form whose result the general rule does not promise as a 32-lane loop goes back to it: a 64-bit conversion with an out-of-range lane
+(the general rule's clamp is `2^63 - 1` in a double, which is `2^63`, and the cast of that is the host's, `0x8000000000000000`), an address
+outside the block's own shared memory or in another block of a cluster, vector atomics, a rounding mode on an f16 or bf16 result of F2F or I2F
+(the general rule ignores it in F2F and rounds twice in I2F, which an RTX 3060 does not: see below), and `.FTZ` on a packed compare. The
+tier (`VGPU_TIER=1`) hands every one of these to `Runner::execute`, so it gets them too.
+
+**A kernel bug the rounding modes found.** `i2f` for an unsigned 32-bit source computed the value as a double by flipping the sign bit and
+adding 2^31 back; under round-down the sum 2^31 + (-2^31) is -0, so `I2F.U32.RM` of 0 gave -0.0. The kernel now adds the low 31 bits and
+2^31 times the top bit (both non-negative). Found by the e2e comparison of the first draft; `i2f_under_directed_rounding_at_every_level`
+(tests/unit/test_simd.cpp) checks every host rounding mode, signed and unsigned, at every level.
+
+**Measured** with the bench harness's approach: A is a fresh Release build (CUDA 13.0, GCC 12, LTO) of `origin/r8-a` (3ef7a6bd), B this
+branch built the same way, `taskset` to CPUs 6-7, one host thread, A B A B ... alternating, 9 runs (user CPU seconds), the machine loaded
+(load average 8 to 17: ratios within about 5% of 1 are noise). Counters and results identical in every pair.
+
+| program | A median (s) | B median (s) | A/B median | A/B best | what it does |
+| --- | ---: | ---: | ---: | ---: | --- |
+| micro `bf16` | 0.93 | 0.14 | 6.6x | 7.4x | HFMA2.BF16_V2 chain |
+| micro `i2frp` | 1.03 | 0.20 | 5.2x | 6.3x | I2F with .RP, .RM, .RZ, from 32 bits |
+| micro `f2f` | 0.11 | 0.04 | 2.8x | 2.7x | F2F.F64.F32 / F2F.F32.F64 chain |
+| micro `f2i64` | 0.55 | 0.26 | 2.1x | 2.0x | F2I.S64.F64 and F2I.U32.F64 |
+| micro `i2f64` | 0.28 | 0.14 | 2.0x | 2.1x | I2F from 64 bits |
+| micro `shatom` | 0.83 | 0.43 | 1.9x | 2.0x | ATOMS.ADD / ATOMS.MAX, 32 bits |
+| micro `frnd` | 0.24 | 0.13 | 1.9x | 1.7x | FRND floor, ceil, trunc, rint |
+| micro `hset2` | 0.50 | 0.29 | 1.7x | 2.1x | HSET2 plus HADD2 |
+| micro `shatom64` | 0.86 | 0.63 | 1.4x | 1.4x | ATOMS.ADD.64 / ATOMS.CAS.64 |
+| micro `imnmx` | 0.27 | 0.24 | 1.13x | 1.20x | IABS, IMNMX |
+| micro `rcp64h` | 0.66 | 0.59 | 1.12x | 1.15x | double division and rsqrt |
+| HeCBench `aop -runs 1` | 6.84 | 4.96 | 1.38x | 1.26x | ATOMS.CAST.SPIN.64 loops (0.36% of the instructions) |
+| HeCBench `heat2d 512 512 20` | 1.60 | 1.35 | 1.19x | 1.23x | IABS (0.29%) |
+| HeCBench `is 256 256 256` | 0.60 | 0.50 | 1.20x | 1.22x | I2F.F64, F2I.F64 (0.35%) |
+| HeCBench `depixel 512 512 1` | 0.43 | 0.39 | 1.10x | 1.06x | IMNMX.U32 (0.43%) |
+| HeCBench `myocyte 100` | 2.34 | 2.35 | 1.00x | 0.97x | F2F.F64.F32 0.9%, RCP64H 0.5%: spread 133%, not resolved |
+
+The micro programs are kernels that loop over the form (written for this round and not committed; the numbers say how much faster one
+form gets, not how much of a real program it is). The bench harness (`tools/bench/bench.sh --ab`, 9 runs, SASS engine, all 16 workloads)
+reads 0.87x to 1.05x with `same` for every row and identical counters; that spread is the loaded machine, as a repeat of the six
+plain-ALU/memory workloads with 21 runs shows (int_alu 1.05x, f32_fma 1.05x, divergent 1.06x, mem 1.04x, local 0.99x, warp 1.07x, p = 0.35 to
+0.78). `bench.sh --check-counters` passes.
+
+**Same bits.** `nvidia/tests/e2e/sass_fastpath.cu` gains `conv_forms` (209 forms in four groups of conversions, packed compares, bf16, MUFU,
+IABS/IMNMX, FCHK; three input regimes -- special values, in-range values with a NaN, and the same with no NaN or infinity -- under three
+lane guards; one hash per launch, one per form with `sass_fastpath forms`, the lanes of one with `sass_fastpath dump <form>`),
+`shared_atomic_forms` (the global atomic program's operations on shared memory, with a host reference for the order-independent results),
+`pred_press` (22 predicates live across a loop, which ptxas packs with P2R; the host computes the same function) and a `sharedatomic` fault
+run (the same error text with and without the fast paths). `run_sass_fastpath.sh` requires fast and general to print identically,
+counters included. It also prints identically with `VGPU_SIMD=base` and `=off`, and the same on three repeats. Two outputs of the program
+vary from run to run and are not claims about the code: with four host threads the old values returned by the global `atomic_forms`
+depend on the order the blocks run in (pre-existing), and the counters are written by the runtime on its own schedule, which is why the
+conv hashes are one line per launch.
+
+**Mutation checks** (each made in the executor or the kernel, `sass_fastpath` or `test_simd` run, then reverted): 20 one-line breakages of
+the new code in the executor -- an unsigned 64-bit source taken as signed, the rounding mode of I2F and of F2F dropped, the nearest-even
+rounding of F2I changed to a floor, the signed clamp off by one, the 64-bit decline removed, F2F to bf16 through the f16 narrowing, FRND
+floor and ceil exchanged, the f16 result of FRND widened, HSET2's bf16 1.0 replaced by the full mask, MUFU.RSQ64H computed as a
+reciprocal, IMNMX's signedness exchanged, IABS not negating, FCHK's predicate cleared, P2R's bit order exchanged, the shared atomics' counter
+left out and their store left out, the f16 source of F2I taken from the high half, |x| and -x dropped from a 64-bit source, HSETP2's two
+predicates exchanged -- were all caught by the e2e (the hashes or the counters). Two kernel breakages (the bf16 rounding constant;
+the old unsigned `i2f`) were caught by `test_simd`. Not caught, and why: `.FTZ` on HSET2 (an equivalent mutant: the form is now left to the
+general rule), HADD2/HMUL2 on bf16 (ptxas lowers a bf16 sum and product to `HFMA2.BF16_V2` for sm_80 and sm_86, so the fast path only
+takes HFMA2).
+
+**Where the general rule differed from an RTX 3060, and what was done.** The first run of `sass_fastpath` on a card with CUDA 13.0 found
+seven differences in the general rule, which the fast paths copied. All seven are fixed in the general rule, the fast paths and the SIMD
+kernel together, and `conv_forms` is now pinned to the card: `nvidia/tests/data/conv_forms.rtx3060.txt` holds the card's hash for each of the
+209 forms, in each of 3 input regimes and 3 shapes, and `run_sass_fastpath.sh` requires the fast paths, the general path and every SIMD
+level to print it (`run_sass_fastpath.sh --card [--update]` runs the program on a real GPU and compares or rewrites it).
+(1) `F2I` of a NaN is 0, except `1 << (bits-1)` when the source is f64 or the destination 64 bits wide (and `0x8000` for f64 to a 16-bit
+integer); the |x| and -x modifiers do not apply to a NaN. (2) A NaN through `F2F` and `FRND` is the canonical `0x7fffffff` (f32) or `0x7fff`
+(f16, bf16), f64 keeps sign and payload with the quiet bit set, and a NaN narrowed from f64 to f16 keeps its sign and top payload
+(`sign | 0x7e00 | payload >> 42`); `0/0` is `0x7fffffff` (the MUFU/FFMA canonical NaN of this round). (3) `F2F` to f16 or bf16 honours
+`.RZ`, `.RM`, `.RP`. (4) `I2F` to f16 or bf16 rounds once, from the integer (`narrow_from_int`); the values an f16 can hold are exact in an f32, so
+this is not visible on f16, and `I2F` to bf16 does not exist on sm_86 (ptxas converts through f32), but the helper is pinned by
+`test_simd` against a table of every f16 and bf16 value in every mode. (5) The decoder now reads the half select (bits 60-61) of an f16 source
+for `FRND`, `F2I` and `F2F` (the corpus gained the two `FRND ... R109.H1` lines, which also showed that nvdisasm names a same-size
+`FRND.F16` once). (6) `.FTZ` on `HSET2`/`HSETP2` flushes the subnormal halves (f16: exponent field 0; bf16 likewise) before the
+comparison. (7) A signed 64-bit conversion at or past 2^63 saturates to `0x7fff...` (and `0x8000...` below -2^63), against the powers of two
+themselves (2^63 - 1 is not a double). Found on the way, with the card as the oracle: a bf16 `HFMA2` rounded twice (the fma to f32, then to
+bf16) and, with exact ties in the f64 intermediate, once more wrongly; it is now the exact result rounded once (`simd::fma_round_odd`, a
+TwoSum-based round-to-odd fma, then `narrow_from_double`), in the kernel and in the general rule.
+The PTX interpreter had the same family: `cvt.rXi.ftz.f32.f32` flushed after the rounding (the card flushes the source first), the
+round-to-integral f64 forms left a signalling NaN signalling (`0x7ff0000000000001` becomes `0x7ff8000000000001`; the f32 forms were already
+canonical, and `.ftz`/`.sat` agree with the card), a 64-bit integer to f32 rounded through a double, and the fused f64 micro-op did not follow the
+NaN rule (b's, else c's, else a's, quieted) in its contracted forms, so `VGPU_FASTPATH=1` and `=0` could return different NaNs for an fma with two
+signalling NaNs. `float_half_forms` now pins the round-to-integral forms of NaNs (`nan_cvt_rint*`, f32 and f64) to the card.
+Remaining PTX-engine differences from the card, none of them a rule the PTX text states: `rsqrt(double)` (the card runs a software sequence from
+`MUFU.RSQ64H`; `rsqrt.approx.f64` here is correctly rounded, 1 ulp from the card in about a third of the lanes, and the SASS executor, which
+runs the card's sequence, matches); `static_cast<double>(-fabsf(b))` of a NaN (ptxas folds `-|x|` into the F2F; the PTX engine runs `abs` and
+`neg` as instructions); and an fma whose multiplicands ptxas swapped (the NaN of the first multiplicand is chosen by the instruction's operand
+order, which the PTX text does not fix). **Atomics order.** The old values a warp's lanes get back from an atomic on one address are in lane order on the card
+and in both engines (probed with 32 threads, `atomicAdd`, `atomicExch`, two interleaved addresses; identical). Between warps of a block and between blocks the card's order
+is its scheduler's: in five of five repeats a global `atomicAdd` / `atomicExch` by 4 blocks of 64 threads gave different old values from the first run in at least one of them, and for shared memory after a
+barrier the card's warp order was the same on every repeat but not a function of the warp number (64 threads: warp 1 first; 128: warps
+2, 3, 0, 1; 256: 4 to 7, then 0 to 3), which neither engine reproduces. Not deterministic on the card across configurations, so not fixed: a program
+that depends on it is racing.
+
+**Not done, and why.** F2F, FRND, F2I from f64/f16, I2F from 64 bits, HSETP2/HSET2/HMNMX2, bf16 arithmetic, the f32-result forms of
+HMUL2/HFMA2 (ptxas of CUDA 13.0.88 emits only HADD2.F32 for sm_86), MUFU.RCP64H, vector and shared atomics: still the general path. The
+sector and bank counting (`memcount::distinct_sectors`, `sass_bank_passes`) is 10-17% of the memory-bound programs and is r7-memory's
+file. The per-instruction overhead left (`step_warp`, `execute`, operand decoding, `exec_control`'s per-lane BSYNC bookkeeping: 30-45% of an
+ALU-bound program) is a matter for the tier. Subnormal operands stay at the host's assist rate. Having the kernels write the destination
+register in place (no scratch copy) gave no measurable gain and was dropped. AVX-512 was not available, so there is none.
+## Round 9: the SASS operations round 8 left (r9-sassops)
+
+**What the profile said first.** Round 8's "not done" list was a list of forms, not of hot spots, so the first step was to count. A
+throwaway build (not committed) recorded, for every instruction that reached the general path, how often it did. A static scan of the
+504 HeCBench programs built for sm_86 (`cuobjdump -sass`) picked the 240 whose code holds any of the forms; each ran for up to 25 s on one
+thread (`VGPU_THREADS=1`, `VGPU_COUNTERS=1` for the denominator), and the 130 that completed a launch in that time are the sample. The result is that none of these forms is a large share of any program: the largest are P2R 2.1% of the warp instructions of
+`sort`, I2F.U32.RP 1.0% of `topk`, F2F.F64.F32 0.90% of `myocyte`, IMNMX 0.78% of `segsort`, MUFU.RCP64H 0.47% of `myocyte`, HSET2 0.55% of
+`crossEntropy`, ATOMS.CAST.SPIN.64 0.36% of `aop`; the mean over the 130 programs is below 0.04% for every form. The uniform-datapath ops
+(ULDC.64 is in 124 of the 130, 0.03% on average, at most 0.34%) are one-lane operations: nothing to widen, and left alone. So the gain
+shows in a handful of programs, as below, and nowhere in the bench workloads (which do not use these forms).
+
+**What was done** (`Runner::fast_float` / `fast_wide` and the atomics case of `exec_mem` in `src/sass/exec_ops.inc`; one new kernel in `src/simd`):
+
+| form | how |
+| --- | --- |
+| I2F, I2FP from 8, 16, 32 and 64 bits, to f16, bf16, f32, f64, in each rounding mode | the existing `i2f` kernel inside one `RoundingScope` for 32-bit sources to f32; a loop over the rows for the rest (the scope around an out-of-line loop, so nothing is hoisted past the mode change) |
+| F2I from f16, f32 and f64 to 8, 16, 32 and 64 bits | the `f2i` kernel for f32 to 32 bits as before; a loop over the rows otherwise |
+| F2F among f16, bf16, f32, f64 | loops over the rows |
+| FRND on f16, f32, f64 | loops over the rows |
+| HSET2, HSETP2 (f16 and bf16 pairs, swizzles, \|x\|, -x, immediate pairs) | a loop over the rows with the general rule's element functions |
+| HFMA2 on bf16 pairs | new kernel `hfma2_bf_m` (the exact product and sum in binary64, then to binary32, then to bfloat16, as the general rule rounds; the product of two bf16 values is exact in binary64, so no FMA unit is needed: it is the same at both SIMD levels) |
+| MUFU.RCP64H, MUFU.RSQ64H | a loop over the rows |
+| IMNMX (32 bits), IABS, P2R, FCHK | `ibin_m` (min and max under the two halves of the predicate), loops over the rows, the predicate rows |
+| ATOMS (shared atomics: 32 and 64 bits, every operation, CAS.SPIN, POPC.INC) | the lanes' addresses decoded once, then each lane's read-modify-write in lane order straight on the block's shared bytes |
+
+A form whose result the general rule does not promise as a 32-lane loop goes back to it: a 64-bit conversion with an out-of-range lane
+(the general rule's clamp is `2^63 - 1` in a double, which is `2^63`, and the cast of that is the host's, `0x8000000000000000`), an address
+outside the block's own shared memory or in another block of a cluster, vector atomics, a rounding mode on an f16 or bf16 result of F2F or I2F
+(the general rule ignores it in F2F and rounds twice in I2F, which an RTX 3060 does not: see below), and `.FTZ` on a packed compare. The
+tier (`VGPU_TIER=1`) hands every one of these to `Runner::execute`, so it gets them too.
+
+**A kernel bug the rounding modes found.** `i2f` for an unsigned 32-bit source computed the value as a double by flipping the sign bit and
+adding 2^31 back; under round-down the sum 2^31 + (-2^31) is -0, so `I2F.U32.RM` of 0 gave -0.0. The kernel now adds the low 31 bits and
+2^31 times the top bit (both non-negative). Found by the e2e comparison of the first draft; `i2f_under_directed_rounding_at_every_level`
+(tests/unit/test_simd.cpp) checks every host rounding mode, signed and unsigned, at every level.
+
+**Measured** with the bench harness's approach: A is a fresh Release build (CUDA 13.0, GCC 12, LTO) of `origin/r8-a` (3ef7a6bd), B this
+branch built the same way, `taskset` to CPUs 6-7, one host thread, A B A B ... alternating, 9 runs (user CPU seconds), the machine loaded
+(load average 8 to 17: ratios within about 5% of 1 are noise). Counters and results identical in every pair.
+
+| program | A median (s) | B median (s) | A/B median | A/B best | what it does |
+| --- | ---: | ---: | ---: | ---: | --- |
+| micro `bf16` | 0.93 | 0.14 | 6.6x | 7.4x | HFMA2.BF16_V2 chain |
+| micro `i2frp` | 1.03 | 0.20 | 5.2x | 6.3x | I2F with .RP, .RM, .RZ, from 32 bits |
+| micro `f2f` | 0.11 | 0.04 | 2.8x | 2.7x | F2F.F64.F32 / F2F.F32.F64 chain |
+| micro `f2i64` | 0.55 | 0.26 | 2.1x | 2.0x | F2I.S64.F64 and F2I.U32.F64 |
+| micro `i2f64` | 0.28 | 0.14 | 2.0x | 2.1x | I2F from 64 bits |
+| micro `shatom` | 0.83 | 0.43 | 1.9x | 2.0x | ATOMS.ADD / ATOMS.MAX, 32 bits |
+| micro `frnd` | 0.24 | 0.13 | 1.9x | 1.7x | FRND floor, ceil, trunc, rint |
+| micro `hset2` | 0.50 | 0.29 | 1.7x | 2.1x | HSET2 plus HADD2 |
+| micro `shatom64` | 0.86 | 0.63 | 1.4x | 1.4x | ATOMS.ADD.64 / ATOMS.CAS.64 |
+| micro `imnmx` | 0.27 | 0.24 | 1.13x | 1.20x | IABS, IMNMX |
+| micro `rcp64h` | 0.66 | 0.59 | 1.12x | 1.15x | double division and rsqrt |
+| HeCBench `aop -runs 1` | 6.84 | 4.96 | 1.38x | 1.26x | ATOMS.CAST.SPIN.64 loops (0.36% of the instructions) |
+| HeCBench `heat2d 512 512 20` | 1.60 | 1.35 | 1.19x | 1.23x | IABS (0.29%) |
+| HeCBench `is 256 256 256` | 0.60 | 0.50 | 1.20x | 1.22x | I2F.F64, F2I.F64 (0.35%) |
+| HeCBench `depixel 512 512 1` | 0.43 | 0.39 | 1.10x | 1.06x | IMNMX.U32 (0.43%) |
+| HeCBench `myocyte 100` | 2.34 | 2.35 | 1.00x | 0.97x | F2F.F64.F32 0.9%, RCP64H 0.5%: spread 133%, not resolved |
+
+The micro programs are kernels that loop over the form (written for this round and not committed; the numbers say how much faster one
+form gets, not how much of a real program it is). The bench harness (`tools/bench/bench.sh --ab`, 9 runs, SASS engine, all 16 workloads)
+reads 0.87x to 1.05x with `same` for every row and identical counters; that spread is the loaded machine, as a repeat of the six
+plain-ALU/memory workloads with 21 runs shows (int_alu 1.05x, f32_fma 1.05x, divergent 1.06x, mem 1.04x, local 0.99x, warp 1.07x, p = 0.35 to
+0.78). `bench.sh --check-counters` passes.
+
+**Same bits.** `nvidia/tests/e2e/sass_fastpath.cu` gains `conv_forms` (209 forms in four groups of conversions, packed compares, bf16, MUFU,
+IABS/IMNMX, FCHK; three input regimes -- special values, in-range values with a NaN, and the same with no NaN or infinity -- under three
+lane guards; one hash per launch, one per form with `sass_fastpath forms`, the lanes of one with `sass_fastpath dump <form>`),
+`shared_atomic_forms` (the global atomic program's operations on shared memory, with a host reference for the order-independent results),
+`pred_press` (22 predicates live across a loop, which ptxas packs with P2R; the host computes the same function) and a `sharedatomic` fault
+run (the same error text with and without the fast paths). `run_sass_fastpath.sh` requires fast and general to print identically,
+counters included. It also prints identically with `VGPU_SIMD=base` and `=off`, and the same on three repeats. Two outputs of the program
+vary from run to run and are not claims about the code: with four host threads the old values returned by the global `atomic_forms`
+depend on the order the blocks run in (pre-existing), and the counters are written by the runtime on its own schedule, which is why the
+conv hashes are one line per launch.
+
+**Mutation checks** (each made in the executor or the kernel, `sass_fastpath` or `test_simd` run, then reverted): 20 one-line breakages of
+the new code in the executor -- an unsigned 64-bit source taken as signed, the rounding mode of I2F and of F2F dropped, the nearest-even
+rounding of F2I changed to a floor, the signed clamp off by one, the 64-bit decline removed, F2F to bf16 through the f16 narrowing, FRND
+floor and ceil exchanged, the f16 result of FRND widened, HSET2's bf16 1.0 replaced by the full mask, MUFU.RSQ64H computed as a
+reciprocal, IMNMX's signedness exchanged, IABS not negating, FCHK's predicate cleared, P2R's bit order exchanged, the shared atomics' counter
+left out and their store left out, the f16 source of F2I taken from the high half, |x| and -x dropped from a 64-bit source, HSETP2's two
+predicates exchanged -- were all caught by the e2e (the hashes or the counters). Two kernel breakages (the bf16 rounding constant;
+the old unsigned `i2f`) were caught by `test_simd`. Not caught, and why: `.FTZ` on HSET2 (an equivalent mutant: the form is now left to the
+general rule), HADD2/HMUL2 on bf16 (ptxas lowers a bf16 sum and product to `HFMA2.BF16_V2` for sm_80 and sm_86, so the fast path only
+takes HFMA2).
+
+**Where the general rule differs from an RTX 3060** (found by running the same `sass_fastpath` on the card with real CUDA 13.0; the fast
+paths copy the general rule bit for bit, so these are the general rule's, and each is a question for the executor, not for this round).
+NaN inputs: `F2I` of a NaN is 0 here and `0x80000000` on the card (for the 32-bit results measured); a NaN through `F2F`, `FRND`
+keeps its payload here and is the canonical `0x7fffffff` (f32) or `0x7fff` (f16) on the card; `a / b` of 0 / 0 is `0xffc00000` here (the host's NaN) and
+`0x7fffffff` on the card. Without NaNs or infinities in the data, the remaining differences are: (1) `F2F` to f16 or bf16 with `.RZ`, `.RM`,
+`.RP` ignores the rounding mode; (2) `I2F` to f16 or bf16 with a rounding mode rounds twice (to f32 in the mode, then to the narrow format
+to nearest); (3) `FRND.F16 Rd, Rs.H1` (and the F2I/F2F forms with an f16 source) with the half select `cuobjdump` prints as `.H1`: the decoder does not
+read the select for these ops (it does for I2F), so the low half is converted; (4) `.FTZ` on `HSETP2`/`HSET2` flushes after the conversion to float, where an
+RTX 3060 flushes the subnormal halves of the operands; (5) a 64-bit signed conversion of a value at or past 2^63 gives the host's `0x8000000000000000` here (low word 0), where the card
+saturates (low word `0xffffffff`; measured for `__double2ll_rn`; the unsigned form was not looked at). The atomics programs differ from the card in the order the lanes' results
+are applied (pre-existing, `atomic_forms` too). The forms with a rule that is the executor's own and not a measurement of the card are
+named in the comments of `fast_float` where it hands them back (1, 2, 4, 5).
+
+**Not done, and why.** HMNMX2 is not implemented by the general rule at all (an `HMNMX2` kernel runs on the PTX engine); vector atomics
+(F32x2/x4, F16x4/x8) are sm_90 forms that ptxas does not emit for sm_86, so they could not be exercised here and stay on the general rule;
+HADD2/HMUL2 on bf16 do not exist before sm_90; R2P has no kernel in the e2e that ptxas lowers to it (it appears around a barrier in
+`sort`), so its fast path was written, found untestable, and removed rather than shipped; HFMA2 `.SAT` and the f32-result HMUL2/HFMA2
+(not emitted for sm_86) are left; the uniform-datapath ops are one-lane work; the generic `ATOM` on a shared window and ATOMS on another
+block of a cluster keep the loop. The tier's analysis is r9-tier's: nothing here needed a change in `src/sass/tier*`. No new
+external-linkage global was added (the kernel is one more function of the two kernel namespaces). The code builds with GCC 12; the
+shim was not rebuilt against CUDA 12.0 (no source here includes a CUDA header), and `sass_fastpath.cu` compiles with CUDA 12.0.140's nvcc.
+
 ## The pre-decoded tier (round 8, `VGPU_TIER=1`)
 
 `src/sass/tier.hpp`, `tier.cpp` and `tier_ops.inc` are route (a) of [docs/perf-design/01-whole-kernel-translation.md](perf-design/01-whole-kernel-translation.md):

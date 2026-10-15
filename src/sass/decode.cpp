@@ -1226,6 +1226,15 @@ void dec_fsel(Instr& ins, const Word& w) {
   ins.src.push_back(pred_src(w, 87, 90));
 }
 
+// An f16 source's half of its register, bits 60-61 (the same field as I2F's narrow-source select): `.H1` is the high half. FRND, F2I and
+// F2F with an f16 source read the low half unless it says otherwise (an RTX 3060 converts the high half: probed with conv_forms).
+static void f16_part(Instr& ins, const Word& w, unsigned ssize) {
+  if (ssize != 1) return;
+  const unsigned part = static_cast<unsigned>(w.field(60, 2));
+  ins.f[5] = part;
+  if (part && ins.src[0].kind == Kind::Reg) ins.src[0].suffix = ".H" + std::to_string(part);
+}
+
 // FRND (0x107, 32-bit; 0x113 with a 64-bit side): round to an integral
 // value. 78-79 the rounding (none: to nearest even), 75-76 the result's
 // size and 84-85 the source's (log2 bytes), 80 FTZ.
@@ -1233,7 +1242,7 @@ void dec_frnd(Instr& ins, const Word& w) {
   ins.op = Op::FRND;
   ins.mnemonic = "FRND";
   const unsigned dsz = static_cast<unsigned>(w.field(75, 2)), ssz = static_cast<unsigned>(w.field(84, 2));
-  if (dsz == 3 && ssz == 3) ins.mods.push_back("F64");
+  if (dsz == ssz && dsz != 2) ins.mods.push_back(dsz == 3 ? "F64" : "F16");   // (nvdisasm names a same-size pair once)
   else if (dsz != 2 || ssz != 2) {
     ins.mods.push_back(dsz == 3 ? "F64" : dsz == 1 ? "F16" : "F32");
     ins.mods.push_back(ssz == 3 ? "F64" : ssz == 1 ? "F16" : "F32");
@@ -1251,6 +1260,7 @@ void dec_frnd(Instr& ins, const Word& w) {
   if (ssz == 3 && ins.src[0].kind == Kind::Reg) ins.src[0].width = 2;
   src_neg_abs(ins.src[0], w, true);
   if (ssz == 3) double_imm(ins);
+  f16_part(ins, w, ssz);
 }
 
 // FCHK: whether a / b needs the division's slow path.
@@ -1322,6 +1332,7 @@ void dec_f2i(Instr& ins, const Word& w) {
   one_src(ins, w, kFloat, false);
   src_neg_abs(ins.src[0], w, true);
   if (ssize == 3) ins.src[0].width = 2;
+  f16_part(ins, w, ssize);
 }
 
 // F2F: float (84-85) to float (75-76).
@@ -1343,6 +1354,7 @@ void dec_f2f(Instr& ins, const Word& w) {
   one_src(ins, w, kFloat, false);
   src_neg_abs(ins.src[0], w, true);
   if (ssize == 3) ins.src[0].width = 2;
+  f16_part(ins, w, ssize);
 }
 
 // I2I: saturating integer narrowing (sm_75+): 32-bit source to U8/S8/U16/S16.
@@ -3471,6 +3483,20 @@ void dec_ugetnextworkid(Instr& ins, const Word& w) {
   ins.src.push_back(mem_addr(kRZ, false, "", ur + 1, 0, ins.sm));
 }
 
+// VABSDIFF Rd, Ra, Rb, Rc = |a - b| + c (the 32-bit sum of absolute difference, which is what __sad and __usad compile to): .U32 when bit
+// 73 is clear, otherwise the operands are signed. The difference is taken at full width (a - b of two int32 does not wrap before the
+// absolute value) and the sum with c wraps at 32 bits, as the PTX sad.s32 / sad.u32 the card agrees with (probed with INT_MIN, INT_MAX
+// and -1 operands). Bits 74-80 are not known to mean anything: an encoding that sets one is refused, not guessed at.
+void dec_vabsdiff(Instr& ins, const Word& w) {
+  if (w.field(74, 7) != 0) throw Error(Err::UnsupportedPtx, "SASS: VABSDIFF with modifier bits 74-80 set");
+  ins.op = Op::VABSDIFF;
+  ins.mnemonic = "VABSDIFF";
+  if (!w.bit(73)) ins.mods.push_back("U32");
+  ins.f[0] = w.bit(73);   // signed
+  ins.dst.push_back(dst_reg(w, false, ins.sm));
+  alu3(ins, w, kUnsigned);
+}
+
 void dec_vabsdiff4(Instr& ins, const Word& w) {
   ins.op = Op::VABSDIFF4;
   ins.mnemonic = "VABSDIFF4";
@@ -3633,6 +3659,7 @@ const std::unordered_map<unsigned, Dec>& float_table() {
       {0x104, dec_f2f}, {0x110, dec_f2f},
       {0x38, dec_i2i},
       {0x3e, dec_f2fp},
+      {0x14, dec_vabsdiff},
       {0x15, dec_vabsdiff4},
       {0x26, dec_idp},
       {0x1b, dec_bmsk},

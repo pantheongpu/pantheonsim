@@ -107,6 +107,9 @@ inline void transpose8x8(float* dst, const float* src) {
 
 void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const uint32_t* b, const uint32_t* c,
             uint32_t* out) {
+  // Bit 4 of `kind` asks for an RTX 3060's tensor-core sum (vgpu/exec/tc_ampere.hpp) in place of the sequential f32 one.
+  const bool ampere = (kind & 16) != 0;
+  kind &= 3;
   const unsigned per_reg = kind == 2 ? 1 : 2, L = 4 * per_reg;
   const unsigned a_regs = K / (2 * per_reg), b_regs = K / (4 * per_reg);
   alignas(32) float FA[256], FB[128];
@@ -146,6 +149,10 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
         std::memcpy(&Cm[(g + 8 * h) * 8 + 4], &hi, sizeof hi);
       }
   }
+  if (ampere) {
+    vgpu::exec::tc86::mma(16, 8, K, kind == 2 ? 4 : 8, kind == 0 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, acc_f16, A, K, Bm, 8, Cm, 8,
+                          Dm, 8);
+  } else
   for (unsigned i0 = 0; i0 < 16; i0 += 4) {
     V8f acc0, acc1, acc2, acc3;
     std::memcpy(&acc0, &Cm[(i0 + 0) * 8], sizeof acc0);
@@ -503,18 +510,8 @@ void imad_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t*
 // kind 0: a + b, 1: a * b, 2: fma(a, b, c); `mods` has bit 2i for |source i| and bit 2i + 1 for -source i (the
 // absolute value first). d, a, b, c are (low, high) pairs of 32-lane arrays; only the lanes of `mask` are written.
 //
-// When an operand is a NaN, which one the result is made from is decided here, not by the instruction the compiler
-// happened to pick: the first NaN of (b, a) for a sum or product -- what the scalar code this replaced gives, and an
-// RTX 3060 -- and of (b, a, c) for an fma (the scalar code this replaced: the compiler had swapped the product's
-// operands for libm's fma). The result is that NaN with its quiet bit set.
-inline uint64_t dop_nan(unsigned kind, uint64_t a, uint64_t b, uint64_t c) {
-  const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
-  uint64_t pick;
-  if (kind == 2) pick = is_nan(b) ? b : is_nan(a) ? a : c;
-  else pick = is_nan(b) ? b : a;
-  return pick | 0x0008000000000000ull;
-}
-
+// When an operand is a NaN, which one the result is made from is decided by simd::dop_nan (simd.hpp), from the operands as the
+// registers hold them: the |x| and -x modifiers apply to the arithmetic, not to a NaN that is the answer.
 #if VGPU_SIMD_AVX2
 // Eight lanes at a time. A register pair's two halves come as the low words and the high words of 8 lanes; unpacking
 // them against each other gives the doubles of lanes 0 1 4 5 (the low unpack) and 2 3 6 7 (the high unpack), and the
@@ -540,6 +537,12 @@ inline void dop_avx2_t(const uint32_t* absm, const uint32_t* negm, uint32_t* dlo
     p = _mm256_castsi256_pd(_mm256_unpacklo_epi32(l, h));
     q = _mm256_castsi256_pd(_mm256_unpackhi_epi32(l, h));
   };
+  const auto load_raw = [&](const uint32_t* lo, const uint32_t* hi, unsigned i, __m256d& p, __m256d& q) {
+    const __m256i l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lo + i));
+    const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hi + i));
+    p = _mm256_castsi256_pd(_mm256_unpacklo_epi32(l, h));
+    q = _mm256_castsi256_pd(_mm256_unpackhi_epi32(l, h));
+  };
   const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
   const __m256i pick = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
   for (unsigned i = 0; i < 32; i += 8) {
@@ -562,6 +565,12 @@ inline void dop_avx2_t(const uint32_t* absm, const uint32_t* negm, uint32_t* dlo
     if (_mm256_movemask_pd(_mm256_or_pd(_mm256_cmp_pd(va, va, _CMP_UNORD_Q), _mm256_cmp_pd(vb, vb, _CMP_UNORD_Q)))) {
       // Rare: a NaN result. The operands and results of the 8 lanes, in lane order, and the rule applied to each.
       alignas(32) double X[8], Y[8], Z[8], R[8];
+      // (The operands as the registers hold them, for the NaN rule: reloaded without the modifiers.)
+      if constexpr (Mods) {
+        load_raw(alo, ahi, i, xa, xb);
+        load_raw(blo, bhi, i, ya, yb);
+        if constexpr (Kind == 2) load_raw(clo, chi, i, za, zb);
+      }
       const auto spill = [](double* o, __m256d p, __m256d q) {
         _mm_storeu_pd(o, _mm256_castpd256_pd128(p));
         _mm_storeu_pd(o + 4, _mm256_extractf128_pd(p, 1));
@@ -613,12 +622,13 @@ void dop_m_k(unsigned kind, unsigned mods, uint32_t* dlo, uint32_t* dhi, const u
   const auto bits = [&](const uint32_t* lo, const uint32_t* hi, unsigned i, unsigned k) {
     return uint64_t{lo[i]} | (uint64_t{(hi[i] & absm[k]) ^ negm[k]} << 32);
   };
+  const auto raw = [&](const uint32_t* lo, const uint32_t* hi, unsigned i) { return uint64_t{lo[i]} | (uint64_t{hi[i]} << 32); };
   const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
   for (unsigned i = 0; i < 32; ++i) {
     const uint64_t ua = bits(alo, ahi, i, 0), ub = bits(blo, bhi, i, 1), uc = kind == 2 ? bits(clo, chi, i, 2) : 0;
     uint64_t u;
     if (is_nan(ua) || is_nan(ub) || (kind == 2 && is_nan(uc))) {
-      u = dop_nan(kind, ua, ub, uc);
+      u = dop_nan(kind, raw(alo, ahi, i), raw(blo, bhi, i), kind == 2 ? raw(clo, chi, i) : 0);
     } else {
       const double x = std::bit_cast<double>(ua), y = std::bit_cast<double>(ub);
       const double v = kind == 0 ? x + y : kind == 1 ? x * y : __builtin_fma(x, y, std::bit_cast<double>(uc));
@@ -841,7 +851,7 @@ void lane_unary_k(unsigned kind, uint32_t* r, const uint32_t* a) {
 
 // (Scalar helpers: the base level's loops, and the lanes of the AVX2 ones that the instructions cannot do.)
 inline uint32_t sc_ftz(uint32_t x) { return (x & 0x7f800000u) == 0 ? (x & 0x80000000u) : x; }
-inline float sc_sat(float f) { return f != f ? 0.0f : f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
+inline float sc_sat(float f) { return f != f ? 0.0f : f <= 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }   // (-0 is +0: see sat() in exec_ops.inc)
 // A float result as the register holds it: flushed if flags bit 0, saturated if bit 1, a NaN the canonical one.
 inline uint32_t sc_finish(float f, unsigned flags) {
   uint32_t u = std::bit_cast<uint32_t>(f);
@@ -862,7 +872,7 @@ inline __m256i fx_finish(__m256 v, unsigned flags) {
   if (flags & 1) u = fx_flush(u);
   if (flags & 2) {
     const __m256 f = _mm256_castsi256_ps(u), zero = _mm256_setzero_ps(), one = _mm256_set1_ps(1.0f);
-    const __m256 low = _mm256_or_ps(_mm256_cmp_ps(f, zero, _CMP_LT_OQ), _mm256_cmp_ps(f, f, _CMP_UNORD_Q));
+    const __m256 low = _mm256_or_ps(_mm256_cmp_ps(f, zero, _CMP_LE_OQ), _mm256_cmp_ps(f, f, _CMP_UNORD_Q));
     const __m256 g = _mm256_blendv_ps(_mm256_blendv_ps(f, zero, low), one, _mm256_cmp_ps(f, one, _CMP_GT_OQ));
     u = _mm256_castps_si256(g);
   }
@@ -984,13 +994,16 @@ void mufu_k(unsigned kind, uint32_t* r, const uint32_t* a) {
       return _mm256_cvtpd_ps(v);
     };
     const __m256 v = _mm256_set_m128(op(_mm256_extractf128_ps(x, 1)), op(_mm256_castps256_ps128(x)));
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), fx_flush(_mm256_castps_si256(v)));
+    // (A NaN result -- the root of a negative number, an operand that was a NaN -- is the canonical one, as on an RTX 3060.)
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i),
+                        _mm256_blendv_epi8(fx_flush(_mm256_castps_si256(v)), _mm256_set1_epi32(0x7fffffff),
+                                           _mm256_castps_si256(_mm256_cmp_ps(v, v, _CMP_UNORD_Q))));
   }
 #else
   for (unsigned l = 0; l < 32; ++l) {
     const double x = sc_in(a[l], 1);
     const float f = static_cast<float>(kind == 4 ? 1.0 / x : kind == 5 ? 1.0 / __builtin_sqrt(x) : __builtin_sqrt(x));
-    r[l] = sc_ftz(std::bit_cast<uint32_t>(f));
+    r[l] = f != f ? 0x7fffffffu : sc_ftz(std::bit_cast<uint32_t>(f));
   }
 #endif
 }
@@ -1003,11 +1016,16 @@ void i2f_k(bool sgn, uint32_t* r, const uint32_t* a) {
     __m256 v;
     if (sgn) {
       v = _mm256_cvtepi32_ps(x);
-    } else {   // (as doubles, which hold a u32 exactly: the sign bit flipped to use the signed conversion, 2^31 added back)
-      const __m256i f = _mm256_xor_si256(x, _mm256_set1_epi32(static_cast<int>(0x80000000u)));
+    } else {
+      // As doubles, which hold a u32 exactly: the low 31 bits, plus 2^31 where the top bit is set. (Both parts are never
+      // negative, so a zero stays +0 in every rounding mode -- the sum of 2^31 and -2^31, which flipping the sign bit and adding
+      // 2^31 back would make, is -0 when the host rounds down.) The narrowing to float uses the host's rounding mode.
+      const __m256i low = _mm256_and_si256(x, _mm256_set1_epi32(0x7fffffff));
+      const __m256i top = _mm256_srli_epi32(x, 31);
       const __m256d two31 = _mm256_set1_pd(2147483648.0);
-      const __m256d lo = _mm256_add_pd(_mm256_cvtepi32_pd(_mm256_castsi256_si128(f)), two31);
-      const __m256d hi = _mm256_add_pd(_mm256_cvtepi32_pd(_mm256_extracti128_si256(f, 1)), two31);
+      const auto wide = [&](__m128i l, __m128i t) { return _mm256_add_pd(_mm256_cvtepi32_pd(l), _mm256_mul_pd(_mm256_cvtepi32_pd(t), two31)); };
+      const __m256d lo = wide(_mm256_castsi256_si128(low), _mm256_castsi256_si128(top));
+      const __m256d hi = wide(_mm256_extracti128_si256(low, 1), _mm256_extracti128_si256(top, 1));
       v = _mm256_set_m128(_mm256_cvtpd_ps(hi), _mm256_cvtpd_ps(lo));
     }
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), _mm256_castps_si256(v));
@@ -1082,10 +1100,10 @@ void f2i_k(bool sgn, unsigned rnd, bool ftz, uint32_t* r, const uint32_t* a) {
 }
 
 // FMNMX: lane l is the minimum of a and b if bit l of `min_mask` is set, else the maximum; a NaN loses (the other operand
-// is the answer; two NaNs give b), of two zeros the minimum is the negative one, the maximum the positive one; with `nan` a
+// is the answer; two NaNs give the canonical NaN, as on an RTX 3060), of two zeros the minimum is the negative one, the maximum the positive one; with `nan` a
 // NaN operand gives the canonical NaN. The operands are flushed first if ftz.
 inline uint32_t sc_fmnmx(float a, float b, bool mn, bool nan) {
-  if (nan && (a != a || b != b)) return 0x7fffffffu;
+  if ((nan && (a != a || b != b)) || (a != a && b != b)) return 0x7fffffffu;
   float r;
   if (a != a) r = b;
   else if (b != b) r = a;
@@ -1111,7 +1129,7 @@ void fmnmx_k(uint32_t* r, const uint32_t* a, const uint32_t* b, uint32_t min_mas
     v = _mm256_blendv_ps(v, _mm256_blendv_ps(zmax, zmin, mn), both_zero);
     v = _mm256_blendv_ps(v, x, ynan);
     v = _mm256_blendv_ps(v, y, xnan);
-    if (nan) v = _mm256_blendv_ps(v, _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)), _mm256_or_ps(xnan, ynan));
+    v = _mm256_blendv_ps(v, _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)), nan ? _mm256_or_ps(xnan, ynan) : _mm256_and_ps(xnan, ynan));
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), _mm256_castps_si256(v));
   }
 #else
@@ -1335,6 +1353,36 @@ void hfma2_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t
 #endif
   if (halves == 1)
     for (unsigned l = 0; l < n; ++l) r[l] &= 0xffffu;
+  store_masked(d, r, mask, n);
+}
+
+// The bfloat16 twin of hfma2_m_k: each half of d[l] is the fused multiply-add of the lanes' bf16 halves, rounded to bfloat16 as
+// the SASS executor's general form rounds it -- the exact result in binary64, then to binary32 (to nearest even), then to
+// bfloat16 (to nearest even) -- a NaN the canonical 0x7fff. A bf16 product has 16 significant bits, so it is exact in binary64
+// and the multiply-add is the product plus the addend rounded once, which is what a fused one gives (no FMA unit needed).
+// n a multiple of 4.
+typedef double V4d __attribute__((vector_size(32)));
+void hfma2_bf_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n) {
+  uint32_t r[64];
+  for (unsigned i = 0; i < n; i += 4) {
+    // Four words are eight halves, in memory order: word w's low half then its high half.
+    alignas(32) double f[8];
+    for (int part = 0; part < 2; ++part) {
+      const auto wide = [&](const uint32_t* p) {
+        V8h h;
+        std::memcpy(&h, p + i, sizeof h);
+        const V8u u = __builtin_convertvector(h, V8u) << 16;
+        V4u q;
+        std::memcpy(&q, reinterpret_cast<const char*>(&u) + 16 * part, sizeof q);
+        return __builtin_convertvector(reinterpret_cast<V4f>(q), V4d);
+      };
+      const V4d x = wide(a), y = wide(b), z = wide(c);
+      for (int k = 0; k < 4; ++k) f[4 * part + k] = fma_round_odd(x[k], y[k], z[k]);
+    }
+    // Rounded once, from the double (a float in between rounded twice; an RTX 3060 rounds once).
+    U16A* const out = reinterpret_cast<U16A*>(r + i);
+    for (unsigned k = 0; k < 8; ++k) out[k] = f[k] != f[k] ? uint16_t{0x7fff} : static_cast<uint16_t>(narrow_from_double(f[k], 4, 0));
+  }
   store_masked(d, r, mask, n);
 }
 

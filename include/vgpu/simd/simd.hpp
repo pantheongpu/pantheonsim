@@ -107,7 +107,8 @@ struct Kernels {
   // summed in k order from C, each product rounded to f32 and each sum
   // rounded to f32 (never fused), a NaN result the canonical 0x7fffffff (f16
   // accumulator: 0x7fff), exactly as the SASS executor's general form
-  // computes it. `out` may not alias the inputs.
+  // computes it. `out` may not alias the inputs. With bit 4 of `kind` set (16 + kind) the sum is an RTX 3060's tensor-core
+  // sum instead (vgpu/exec/tc_ampere.hpp): chunks of 8 products (4 for tf32) with the accumulator, truncated.
   void (*hmma)(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const uint32_t* b,
                const uint32_t* c, uint32_t* out);
 
@@ -168,6 +169,11 @@ struct Kernels {
   //    takes a if its sign is set, MAX if not), bit l of *both_nan that both are NaN.
   void (*dcmp)(unsigned cmp, unsigned mods, const uint32_t* alo, const uint32_t* ahi, const uint32_t* blo, const uint32_t* bhi,
                uint32_t* r, uint32_t* both_nan);
+
+  //  hfma2_bf_m: hfma2_m's twin for bfloat16 pairs (n a multiple of 4, at most 64; both halves of each word): each half of d[l] is
+  //    the exact a * b + c of the lanes' bf16 halves in binary64, rounded to binary32 and then to bfloat16 (each to nearest even,
+  //    as the SASS executor's general form does), a NaN the canonical 0x7fff. Writes only the lanes of `mask`.
+  void (*hfma2_bf_m)(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the
@@ -191,6 +197,19 @@ inline const Kernels& kernels() { return *detail::g_kernels.load(std::memory_ord
 // instruction down the code the kernels replaced, for A/B runs and to rule
 // the kernels out when chasing a difference.
 inline bool enabled() { return detail::g_enabled; }
+
+// Which NaN a binary64 DADD (kind 0), DMUL (1) or DFMA (2) gives when an operand is one: the first NaN of (b, a) for a sum or a
+// product and of (b, c, a) for an fma, with its quiet bit set -- its sign and payload exactly as the register holds them, NOT as the
+// instruction's |x| and -x modifiers would make them (an RTX 3060: DADD of -a with a = 0xfff8...0 and b = 3.0 gives 0xfff8...0, and
+// the same for |a|; probed with distinct payloads in every position, nvidia/tests/e2e/float_half_forms.cu). `a`, `b`, `c` are the raw
+// operand bits. A NaN made from operands that are not (inf - inf, 0 * inf) is the host's, 0xfff8000000000000, as on the card.
+inline uint64_t dop_nan(unsigned kind, uint64_t a, uint64_t b, uint64_t c) {
+  const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
+  uint64_t pick;
+  if (kind == 2) pick = is_nan(b) ? b : is_nan(c) ? c : a;
+  else pick = is_nan(b) ? b : a;
+  return pick | 0x0008000000000000ull;
+}
 
 // Population count of a 32-bit word without a libgcc call (a baseline x86-64 build has no POPCNT instruction, so
 // std::popcount is a call into libgcc: 2% of a warp-instruction's time, at one per instruction).

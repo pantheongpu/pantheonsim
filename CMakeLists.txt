@@ -1252,6 +1252,8 @@ vgpu_unit_test(test_sass_access_count)
 vgpu_unit_test(test_memfast)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
+# An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
+vgpu_unit_test(test_tc_ampere)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
@@ -2064,6 +2066,22 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_simd_lane_forms
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_simd_lane_forms.sh)
   set_tests_properties(e2e_simd_lane_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
+  # The error each refused launch configuration reports, runtime and driver, against an RTX 3060's CUDA 13.0.
+  add_test(NAME e2e_launch_refusals
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_refusals.sh)
+  set_tests_properties(e2e_launch_refusals PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # The f32/f16/f64 forms with a flush, a saturation, a NaN rule or a byte permute: SASS == PTX == an RTX 3060, per form.
+  add_test(NAME e2e_float_half_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_float_half_forms.sh)
+  set_tests_properties(e2e_float_half_forms PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)

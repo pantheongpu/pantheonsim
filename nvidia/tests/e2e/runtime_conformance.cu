@@ -74,17 +74,17 @@ int main() {
   cudaPointerGetAttributes(&a, m);
   CHECK("attributes: managed", a.type == cudaMemoryTypeManaged, "type %d", (int)a.type);
 
-  // Launch configurations the device cannot run. These used to be
-  // cudaErrorInvalidValue.
+  // Launch configurations the device cannot run: cudaErrorInvalidValue, as an RTX 3060's CUDA 13.0 runtime answers every one of them
+  // (probed for each case in launch_refusals.cu; cudaErrorInvalidConfiguration, 9, is what a CUDA 12 runtime said).
   fill<<<1, 2000>>>(d, 64);
   e = cudaGetLastError();
-  CHECK("2000 threads per block", e == cudaErrorInvalidConfiguration, "got %d %s", e, cudaGetErrorName(e));
+  CHECK("2000 threads per block", e == cudaErrorInvalidValue, "got %d %s", e, cudaGetErrorName(e));
   fill<<<dim3(1, 1, 1), dim3(1, 1, 65)>>>(d, 64);
   e = cudaGetLastError();
-  CHECK("blockDim.z 65", e == cudaErrorInvalidConfiguration, "got %d", e);
+  CHECK("blockDim.z 65", e == cudaErrorInvalidValue, "got %d", e);
   fill<<<0, 16>>>(d, 64);
   e = cudaGetLastError();
-  CHECK("an empty grid", e == cudaErrorInvalidConfiguration, "got %d", e);
+  CHECK("an empty grid", e == cudaErrorInvalidValue, "got %d", e);
   fill<<<1, 64>>>(d, 64);
   CHECK("a valid launch still works after them", cudaDeviceSynchronize() == cudaSuccess, "unexpected");
 
