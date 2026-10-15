@@ -628,12 +628,11 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormal(curandGenerator_t gen, float*
       }
     });
     g->counter += n;
-    store(out, h);
+    store(g, out, h);
     return CURAND_STATUS_SUCCESS;
   }
   curandStatus_t s = curandGenerateNormal(gen, out, n, mean, stddev);
   if (s != CURAND_STATUS_SUCCESS) return s;
-  auto* g = reinterpret_cast<Generator*>(gen);
   std::vector<float> h(n);
   load(g, h, out);
   for_pieces(n, 15, [&](size_t b, size_t e) {
@@ -663,12 +662,11 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormalDouble(curandGenerator_t gen, 
       }
     });
     g->counter += n;
-    store(out, h);
+    store(g, out, h);
     return CURAND_STATUS_SUCCESS;
   }
   curandStatus_t s = curandGenerateNormalDouble(gen, out, n, mean, stddev);
   if (s != CURAND_STATUS_SUCCESS) return s;
-  auto* g = reinterpret_cast<Generator*>(gen);
   std::vector<double> h(n);
   load(g, h, out);
   for_pieces(n, 20, [&](size_t b, size_t e) {
