@@ -5577,6 +5577,7 @@ Module parse(const std::string& src) {
   // Last, once nothing edits an instruction any more (mul/add contraction,
   // sync-mask folding and call resolution all do): the pre-decoded forms must
   // describe the body the interpreter will run.
+  intern_call_slots(m);
   for (auto& fn : m.entries) build_micro(fn);
   for (auto& fn : m.funcs) build_micro(*fn);
   return m;
