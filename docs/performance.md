@@ -1067,6 +1067,87 @@ sector and bank counting (`memcount::distinct_sectors`, `sass_bank_passes`) is 1
 file. The per-instruction overhead left (`step_warp`, `execute`, operand decoding, `exec_control`'s per-lane BSYNC bookkeeping: 30-45% of an
 ALU-bound program) is a matter for the tier. Subnormal operands stay at the host's assist rate. Having the kernels write the destination
 register in place (no scratch copy) gave no measurable gain and was dropped. AVX-512 was not available, so there is none.
+## The pre-decoded tier (round 8, `VGPU_TIER=1`)
+
+`src/sass/tier.hpp`, `tier.cpp` and `tier_ops.inc` are route (a) of [docs/perf-design/01-whole-kernel-translation.md](perf-design/01-whole-kernel-translation.md):
+each instruction of a code section is analysed once, the first time the section runs (`Code::tier_program`, exec.cpp),
+into a micro-op: a handler for its form and its operands resolved to register-file rows, constant rows, or the few things
+that can only be read when it runs (a bank-0 word, a uniform register, a register with a modifier). `Runner::tier_run`
+(tier_ops.inc) takes the place of `Runner::execute` for one instruction at a time inside `step_warp`'s straight-line
+loop. It is **not** a second scheduler: the group search, the 256-instruction chunk, the step count, `max_steps`, the
+`slice`/`give_way`/`ws_held` rules and the spin counter are the interpreter's, and every instruction without a handler,
+or whose preconditions the handler cannot prove (a register past the warp's file, a lane mask forced by BMOV.PQUAD MACTIVE,
+a global access that is not the ordinary case), goes to `Runner::execute` / `exec_mem`, which is the existing code.
+Divergent warps work: a handler takes the executing lane mask exactly as the interpreter's code does.
+
+Off unless `VGPU_TIER=1`; `VGPU_FASTPATH=0`, `VGPU_SIMD=off` and `VGPU_SASS_TRACE` switch it off even then.
+With it unset the engine takes the same path as before (the A/B below).
+
+What has a handler (`tier::Form`): MOV; IADD3 (plain, and with carries in and out); IMAD (plain, with carries, `.WIDE`,
+`.HI`); LOP3 (with its predicate); LEA; SHF; ISETP (and `.EX`); FSETP; FSEL; FFMA/FADD/FMUL; DADD/DMUL/DFMA; POPC; I2FP.F32;
+SEL; PRMT; IMNMX; PLOP3; S2R; global loads and stores of 1, 2, 4 and 8 bytes (Ampere and later), shared and local loads
+and stores of 1 to 16 bytes; and, as the instruction that ends a run, BRA (fixed target, no `.DIV`/`.U.ANY`), BSSY, NOP.
+Where `Runner::fast_alu` has a form, the handler has the same conditions and the same SIMD lane kernel
+(include/vgpu/simd); the other forms are ports of the general code in `exec_int`/`exec_float` row by row. Not covered, and
+interpreted as before: uniform-datapath ops (UIADD3, ...), BSYNC, EXIT, BAR, WARPSYNC, SHFL/VOTE, atomics, texture, MMA,
+MUFU, F2I/I2F other than I2FP.F32, half-precision, 16- and 32-byte global accesses, Turing's global address form,
+generic LD/ST, LDC, CALL/RET/BRX.
+
+**Measured** with `tools/bench/bench.sh --ab <r7-final build> <this build> --runs 11 --engines sass --env VGPU_TIER=1`,
+both builds Release CUDA 13.0 `5fea0b07` + this branch, one thread, `nvidia/rtx3060`, quick size, the machine shared (load 8
+falling to 4 over the run). Counters are identical in every row. "Spread" is (max - min) / median of the 11 runs.
+
+| workload | A: r7-final Minst/s (spread) | B: tier Minst/s (spread) | B/A median | B/A best | p | warp instructions in the tier |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| int_alu | 27.3 (42%) | 82.9 (49%) | 3.04x | 3.09x | <0.001 | 100.0% |
+| f32_fma | 49.5 (5%) | 136.9 (29%) | 2.76x | 2.84x | <0.001 | 99.9% |
+| f64_fma | 20.8 (9%) | 44.5 (4%) | 2.14x | 2.14x | <0.001 | 99.6% |
+| f64_subnormal | 6.4 (4%) | 7.5 (3%) | 1.18x | 1.18x | <0.001 | 99.9% |
+| wmma | 5.6 (4%) | 5.9 (5%) | 1.05x | 1.04x | <0.001 | 49.8% |
+| mma_ptx | 10.3 (8%) | 10.9 (4%) | 1.06x | 1.05x | <0.001 | 72.8% |
+| mem | 5.7 (46%) | 10.5 (8%) | 1.86x | 1.88x | <0.001 | 91.9% |
+| shared | 10.1 (4%) | 14.8 (4%) | 1.47x | 1.48x | <0.001 | 86.5% |
+| atomics | 3.2 (2%) | 4.1 (4%) | 1.28x | 1.28x | <0.001 | 64.6% |
+| texture | 3.8 (3%) | 4.5 (3%) | 1.19x | 1.18x | <0.001 | 87.6% |
+| local | 13.2 (4%) | 22.1 (4%) | 1.68x | 1.69x | <0.001 | 100.0% |
+| divergent | 11.6 (2%) | 16.6 (3%) | 1.43x | 1.43x | <0.001 | 90.5% |
+| warp | 15.6 (3%) | 23.7 (3%) | 1.52x | 1.52x | <0.001 | 76.2% |
+| launch (k launches/s) | 371 (4%) | 508 (4%) | 1.37x | 1.37x | <0.001 | 77.8% |
+| api (k calls/s) | 5621 (5%) | 5681 (4%) | 1.01x | 1.00x | 0.40 | no kernel |
+| startup (wall) | 0.003 s (10%) | 0.003 s | 1.01x | 1.00x | 0.52 | 77.8% |
+
+The last column is `VGPU_TIER_STATS=1` ("tier: N of M warp instructions ran in the tier"): warp instructions a handler ran
+(including BRA, BSSY, NOP, PLOP3, S2R, SEL at the end of a run) over all warp instructions of the quick-size run.
+Most of what is left is instructions that end a run on purpose and are rich in state (BSYNC, EXIT, BAR, SHFL/VOTE, HMMA,
+atomics, texture). The two workloads that gain least are bound by something the tier does not touch: `f64_subnormal` by
+the CPU's subnormal assist, `wmma`/`mma_ptx` by the scalar tensor-core loop (half of their instructions are HMMA).
+`VGPU_TIER` unset against r7-final (6 workloads, 9 runs, load 3 to 11): all within the noise, B/A best 0.98 to 1.03.
+
+**How it is held to the interpreter** (all wired in CMake):
+* `e2e_sass_tier` (nvidia/tests/e2e/run_sass_tier.sh): `sass_tier.cu`, a program of 185 expressions (launched with block sizes that are not whole warps) over random inputs mixed with
+  zeros, extremes, NaN payloads, infinities, subnormals and shift counts past the width (integer, 128-bit and pointer
+  arithmetic, f32, f64, branches, global/shared/local memory of every width, signed sub-word loads, generic accesses,
+  atomics, shuffles), built for sm_75 to sm_120 and run on each generation's profile; plus the other SASS test
+  programs of the architecture sweep (41 listed; CUDA 12.0 skips two). Each runs with `VGPU_TIER=0` and `1` with `VGPU_COUNTERS=1`: every result and every
+  counter of every launch must print identically; `sass_tier` also under four host threads, and the tier must have run
+  at least 30% of its warp instructions (it cannot pass by doing nothing). `VGPU_TIER_OTHER_ARCHS=1` runs the others on
+  every architecture (a soak; 144 runs passed).
+* `bench_counters_tier`: `run_bench_check.sh` with `VGPU_TIER=1` (the 16 workloads, counts against tools/bench/expected).
+* `test_tier` (tests/unit): the analysis over every instruction of the disassembler corpora (sm_80 to sm_120: 780 to 4,700
+  instructions with a handler per corpus): operand rows inside the program, register bounds, the guard flags, Turing left to the interpreter.
+* Mutation checks (a handler broken on purpose, `e2e_sass_tier` run on sm_86): FFMA rounded twice, the ISETP comparison table with
+  LE and GT swapped, one counter left out of the run loop, the BRA target off by 16, PLOP3's first input inverted,
+  IMAD.WIDE's signedness swapped, IADD3's carry-in dropped, the signed byte load not sign-extended: all fail the test.
+  **Not caught**: the carry-out of LEA (it needs a pointer whose low word overflows; no kernel here makes one) and the
+  second carry-in of IADD3 (ptxas always passes `!PT` there).
+
+**What it would take to make it the default**: (1) a soak over what the tests do not reach: the PyTorch sweep
+(`e2e_pytorch_sass_*`), the pantheon workloads and the CUTLASS/CuTe programs with `VGPU_TIER=1`, comparing results the way
+`run_sass_tier.sh` does; (2) the two CI-only legs this round could not run: the sanitizer jobs (ASan/UBSan leak checks and
+TSan read the tier's shared `Program` built under `std::call_once`; no external-linkage global was added) and the hosted CUDA
+12.0 job (the code builds and `e2e_sass_tier` passes with CUDA 12.0.140's nvcc locally); (3) a decision on memory: a MOp is
+about 100 bytes per instruction, built for a whole code section when it first runs, on top of the 176-byte `Instr`; (4) the
+rest of the run-ending ops (BSYNC, EXIT, BAR, SHFL/VOTE) if `divergent`, `shared` and `warp` are to pass 2x.
 
 ## Using this to check a change
 
