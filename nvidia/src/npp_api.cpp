@@ -629,27 +629,42 @@ VGPU_NPP_CTX(NppStatus, nppiRGBToGray_8u_C3C1R,
 
 VGPU_EXPORT NppStatus nppiThreshold_8u_C1R(const Npp8u* s, int ss, Npp8u* d, int ds,
                                            NppiSize roi, const Npp8u threshold, NppCmpOp op) {
-  const double t = threshold;
-  // (The comparison is chosen once, not for every pixel.)
+  if (!s || !d) return NPP_NULL_POINTER_ERROR;
+  if (bad_roi(roi)) return NPP_SIZE_ERROR;
+  // A pixel that compares as asked becomes the threshold, any other stays: on bytes, with the comparison chosen once.
+  auto hs = fetch_roi<Npp8u>(s, ss, roi.width, roi.height);
+  std::vector<Npp8u> hd(hs.size());
+  const Npp8u t = threshold;
+  const size_t n = hs.size();
   switch (op) {
-    case NPP_CMP_LESS: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v < t ? t : v; });
-    case NPP_CMP_LESS_EQ: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v <= t ? t : v; });
-    case NPP_CMP_EQ: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v == t ? t : v; });
-    case NPP_CMP_GREATER_EQ: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v >= t ? t : v; });
-    case NPP_CMP_GREATER: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v > t ? t : v; });
-    default: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v; });
+    case NPP_CMP_LESS: for (size_t i = 0; i < n; ++i) hd[i] = hs[i] < t ? t : hs[i]; break;
+    case NPP_CMP_LESS_EQ: for (size_t i = 0; i < n; ++i) hd[i] = hs[i] <= t ? t : hs[i]; break;
+    case NPP_CMP_EQ: for (size_t i = 0; i < n; ++i) hd[i] = hs[i] == t ? t : hs[i]; break;
+    case NPP_CMP_GREATER_EQ: for (size_t i = 0; i < n; ++i) hd[i] = hs[i] >= t ? t : hs[i]; break;
+    case NPP_CMP_GREATER: for (size_t i = 0; i < n; ++i) hd[i] = hs[i] > t ? t : hs[i]; break;
+    default: hd = hs; break;
   }
+  store_roi<Npp8u>(d, ds, roi.width, roi.height, hd);
+  return NPP_SUCCESS;
 }
 VGPU_EXPORT NppStatus nppiCompare_8u_C1R(const Npp8u* s1, int ss1, const Npp8u* s2, int ss2,
                                          Npp8u* d, int ds, NppiSize roi, NppCmpOp op) {
+  if (!s1 || !s2 || !d) return NPP_NULL_POINTER_ERROR;
+  if (bad_roi(roi)) return NPP_SIZE_ERROR;
+  auto ha = fetch_roi<Npp8u>(s1, ss1, roi.width, roi.height);
+  auto hb = fetch_roi<Npp8u>(s2, ss2, roi.width, roi.height);
+  std::vector<Npp8u> hd(ha.size());
+  const size_t n = ha.size();
   switch (op) {
-    case NPP_CMP_LESS: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double a, double b) { return a < b ? 255.0 : 0.0; });
-    case NPP_CMP_LESS_EQ: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double a, double b) { return a <= b ? 255.0 : 0.0; });
-    case NPP_CMP_EQ: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double a, double b) { return a == b ? 255.0 : 0.0; });
-    case NPP_CMP_GREATER_EQ: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double a, double b) { return a >= b ? 255.0 : 0.0; });
-    case NPP_CMP_GREATER: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double a, double b) { return a > b ? 255.0 : 0.0; });
-    default: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double, double) { return 0.0; });
+    case NPP_CMP_LESS: for (size_t i = 0; i < n; ++i) hd[i] = ha[i] < hb[i] ? 255 : 0; break;
+    case NPP_CMP_LESS_EQ: for (size_t i = 0; i < n; ++i) hd[i] = ha[i] <= hb[i] ? 255 : 0; break;
+    case NPP_CMP_EQ: for (size_t i = 0; i < n; ++i) hd[i] = ha[i] == hb[i] ? 255 : 0; break;
+    case NPP_CMP_GREATER_EQ: for (size_t i = 0; i < n; ++i) hd[i] = ha[i] >= hb[i] ? 255 : 0; break;
+    case NPP_CMP_GREATER: for (size_t i = 0; i < n; ++i) hd[i] = ha[i] > hb[i] ? 255 : 0; break;
+    default: break;   // (zeros)
   }
+  store_roi<Npp8u>(d, ds, roi.width, roi.height, hd);
+  return NPP_SUCCESS;
 }
 VGPU_NPP_CTX(NppStatus, nppiThreshold_8u_C1R,
              (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, const Npp8u t, NppCmpOp op,

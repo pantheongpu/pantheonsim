@@ -240,10 +240,16 @@ inline void fdct8x8_scalar(const double* in, double* out) {
 #ifdef VGPU_HOSTJPEG_AVX2
 __attribute__((target("avx2"))) inline void fdct8x8_avx2(const double* in, double* out) {
   const double(*c)[8] = basis_d();
-  // ct[x][u]: the coefficient of input x for output u, so the lanes (u) of one x are adjacent.
-  alignas(32) double ct[8][8];
-  for (int x = 0; x < 8; ++x)
-    for (int u = 0; u < 8; ++u) ct[x][u] = c[u][x];
+  // ct[x][u]: the coefficient of input x for output u, so the lanes (u) of one x are adjacent (formed once).
+  static const struct Transposed {
+    alignas(32) double ct[8][8];
+    Transposed() {
+      const double(*b)[8] = basis_d();
+      for (int x = 0; x < 8; ++x)
+        for (int u = 0; u < 8; ++u) ct[x][u] = b[u][x];
+    }
+  } transposed;
+  const double(*ct)[8] = transposed.ct;
   alignas(32) double tmp[64];
   for (int y = 0; y < 8; ++y) {
     __m256d lo = _mm256_setzero_pd(), hi = _mm256_setzero_pd();   // outputs u = 0..3 and 4..7 of row y
@@ -290,6 +296,79 @@ inline long round_half_away(double x) {
   if (d >= 0.5) ++q;
   else if (d <= -0.5) --q;
   return q;
+}
+
+// ---- the encoder's quantisation of a block ----
+//
+// out[k] = round_half_away(coef[zz[k]] / t[k]) for k = 0 .. 63: a double division by the (integer) table entry, rounded to the
+// nearest integer with halves going away from zero. `tz` is the table as doubles in zig-zag order (tz[k] = t[k]); the wide path
+// divides four at a time (a division is correctly rounded whatever the width) and rounds as round_half_away does, with a
+// block holding a value that is not comfortably an int (or a NaN) left to the scalar function.
+inline void quantize_block_scalar(const double* coef, const int* zz, const double* tz, int* out) {
+  for (int k = 0; k < 64; ++k) out[k] = static_cast<int>(round_half_away(coef[zz[k]] / tz[k]));
+}
+
+#ifdef VGPU_HOSTJPEG_AVX2
+__attribute__((target("avx2"))) inline void quantize_block_avx2(const double* coef, const int* zz, const double* tz, int* out) {
+  alignas(32) double z[64];
+  for (int k = 0; k < 64; ++k) z[k] = coef[zz[k]];
+  const __m256d half = _mm256_set1_pd(0.5), nhalf = _mm256_set1_pd(-0.5), one = _mm256_set1_pd(1.0), lim = _mm256_set1_pd(1.0e9);
+  const __m256d sign = _mm256_set1_pd(-0.0);
+  int bad = 0;
+  alignas(16) int r[64];
+  for (int g = 0; g < 64; g += 4) {
+    const __m256d x = _mm256_div_pd(_mm256_load_pd(z + g), _mm256_load_pd(tz + g));
+    // |x| < 1e9 is false for a NaN and for anything too large
+    bad |= _mm256_movemask_pd(_mm256_cmp_pd(_mm256_andnot_pd(sign, x), lim, _CMP_NLT_UQ));
+    const __m256d q = _mm256_round_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+    const __m256d d = _mm256_sub_pd(x, q);
+    __m256d y = _mm256_add_pd(q, _mm256_and_pd(_mm256_cmp_pd(d, half, _CMP_GE_OQ), one));
+    y = _mm256_sub_pd(y, _mm256_and_pd(_mm256_cmp_pd(d, nhalf, _CMP_LE_OQ), one));
+    _mm_store_si128(reinterpret_cast<__m128i*>(r + g), _mm256_cvttpd_epi32(y));
+  }
+  if (bad) {
+    for (int k = 0; k < 64; ++k) out[k] = static_cast<int>(round_half_away(z[k] / tz[k]));
+    return;
+  }
+  for (int k = 0; k < 64; ++k) out[k] = r[k];
+}
+#endif
+
+inline void quantize_block(const double* coef, const int* zz, const double* tz, int* out, bool wide = avx2_available()) {
+#ifdef VGPU_HOSTJPEG_AVX2
+  if (wide) {
+    quantize_block_avx2(coef, zz, tz, out);
+    return;
+  }
+#endif
+  (void)wide;
+  quantize_block_scalar(coef, zz, tz, out);
+}
+
+// Bit k of the result is set when q[k] != 0, for the 64 quantised coefficients of a block.
+inline uint64_t nonzero_mask_scalar(const int* q) {
+  uint64_t m = 0;
+  for (int k = 0; k < 64; ++k) m |= static_cast<uint64_t>(q[k] != 0) << k;
+  return m;
+}
+#ifdef VGPU_HOSTJPEG_AVX2
+__attribute__((target("avx2"))) inline uint64_t nonzero_mask_avx2(const int* q) {
+  uint64_t m = 0;
+  const __m256i zero = _mm256_setzero_si256();
+  for (int g = 0; g < 8; ++g) {
+    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 8 * g));
+    const unsigned eq = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, zero))));
+    m |= static_cast<uint64_t>(~eq & 0xFFu) << (8 * g);
+  }
+  return m;
+}
+#endif
+inline uint64_t nonzero_mask(const int* q, bool wide = avx2_available()) {
+#ifdef VGPU_HOSTJPEG_AVX2
+  if (wide) return nonzero_mask_avx2(q);
+#endif
+  (void)wide;
+  return nonzero_mask_scalar(q);
 }
 
 }  // namespace vgpu::hostjpeg

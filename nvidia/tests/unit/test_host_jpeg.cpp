@@ -210,4 +210,57 @@ VTEST(host_round_half_away_is_lround) {
   VCHECK_EQ(bad, 0L);
 }
 
+// The encoder's quantisation of a block: the plain loop (nvjpeg_api.cpp's, as it was) against the wide path. Blocks of coefficients
+// of the sizes real images give, halves and their neighbours after the division, values past what an int holds, NaN and infinity.
+VTEST(host_quantize_block_matches_the_plain_loop) {
+  static const int zz[64] = {0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,  12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,  7,  14, 21, 28,
+                              35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
+  std::mt19937_64 rng(404);
+  long blocks = 0, bad = 0;
+  for (int round = 0; round < 200000; ++round) {
+    uint16_t t[64];
+    alignas(32) double tz[64];
+    for (int k = 0; k < 64; ++k) {
+      t[k] = static_cast<uint16_t>(round % 3 == 0 ? 1 + rng() % 255 : (round % 3 == 1 ? 1 : 1 + rng() % 65535));
+      tz[k] = t[k];
+    }
+    double coef[64];
+    for (int k = 0; k < 64; ++k) {
+      switch (round % 7) {
+        case 0: coef[k] = (static_cast<double>(rng() % 40001) - 20000.0) / 8.0; break;
+        case 1: coef[k] = (static_cast<double>(static_cast<int>(rng() % 801) - 400)) * t[zz[k] % 64 ? k : k] + (rng() & 1 ? 0.5 * t[0] : 0.0); break;   // near halves of the quotient
+        case 2: coef[k] = static_cast<double>(static_cast<int>(rng() % 4001) - 2000) / 2.0 * 1.0; break;
+        case 3: { uint64_t bits = rng(); std::memcpy(&coef[k], &bits, 8); break; }   // anything, NaNs and infinities included
+        case 4: coef[k] = (rng() & 1 ? 1 : -1) * 3.0e9 * static_cast<double>(1 + rng() % 5); break;                       // too large for an int
+        case 5: coef[k] = (rng() % 50 == 0) ? 1.0e18 : static_cast<double>(static_cast<int>(rng() % 2001) - 1000); break;
+        default: coef[k] = 0.0; break;
+      }
+    }
+    int a[64], b[64];
+    for (int k = 0; k < 64; ++k) a[k] = static_cast<int>(vgpu::hostjpeg::round_half_away(coef[zz[k]] / t[k]));
+    vgpu::hostjpeg::quantize_block(coef, zz, tz, b);
+    ++blocks;
+    for (int k = 0; k < 64; ++k)
+      if (a[k] != b[k]) ++bad;
+  }
+  std::printf("  %ld blocks, %ld coefficients differ\n", blocks, bad);
+  VCHECK_EQ(bad, 0L);
+}
+
+// The mask of nonzero coefficients of a block.
+VTEST(host_nonzero_mask_matches_the_loop) {
+  std::mt19937_64 rng(808);
+  long bad = 0;
+  for (int round = 0; round < 100000; ++round) {
+    int q[64];
+    const int density = 1 + round % 9;
+    for (int k = 0; k < 64; ++k) q[k] = (rng() % 10 < static_cast<unsigned>(density)) ? static_cast<int>(rng()) : 0;
+    uint64_t want = 0;
+    for (int k = 0; k < 64; ++k)
+      if (q[k] != 0) want |= uint64_t(1) << k;
+    if (vgpu::hostjpeg::nonzero_mask(q) != want || vgpu::hostjpeg::nonzero_mask(q, false) != want) ++bad;
+  }
+  VCHECK_EQ(bad, 0L);
+}
+
 VTEST_MAIN

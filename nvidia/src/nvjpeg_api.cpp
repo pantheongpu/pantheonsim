@@ -1124,6 +1124,24 @@ struct BitWriter {
     }
     buf &= (uint64_t(1) << count) - 1;   // (what has not left yet)
   }
+  // put(c1, l1) then put(c2, l2), in one go (the two together are at most 32 bits: a Huffman code of up to 16 bits and a value of
+  // up to 15).
+  void put2(int c1, int l1, int c2, int l2) {
+    if (counting) return;
+    const int len = l1 + l2;
+    if (len <= 0) return;
+    const uint64_t b1 = l1 > 0 ? (static_cast<uint64_t>(static_cast<uint32_t>(c1)) & ((uint64_t(1) << l1) - 1)) : 0;
+    const uint64_t b2 = l2 > 0 ? (static_cast<uint64_t>(static_cast<uint32_t>(c2)) & ((uint64_t(1) << l2) - 1)) : 0;
+    buf = (buf << len) | (b1 << (l2 > 0 ? l2 : 0)) | b2;
+    count += len;
+    while (count >= 8) {
+      count -= 8;
+      const uint8_t b = static_cast<uint8_t>((buf >> count) & 0xFF);
+      byte(b);
+      if (b == 0xFF) byte(0x00);
+    }
+    buf &= (uint64_t(1) << count) - 1;
+  }
   void flush() {
     if (counting) return;
     if (count) put((1 << (8 - count)) - 1, 8 - count);   // pad with ones, as the standard says
@@ -1257,17 +1275,28 @@ std::string encode_planes(const EncoderParams& prm, const std::vector<Plane>& pl
     b.q.assign(static_cast<size_t>(b.bw) * b.bh * 64, 0);
     const Plane& p = planes[c];
     const uint16_t* t = qt[c == 0 ? 0 : 1];
+    alignas(32) double tz[64];   // the table as doubles, in zig-zag order
+    for (int k = 0; k < 64; ++k) tz[k] = t[k];
     // Rows of blocks are independent.
     const unsigned threads =
         vgpu::hostpar::plan(static_cast<uint64_t>(b.bw) * static_cast<uint64_t>(b.bh) * 700u, b.bh);
     vgpu::hostpar::parallel_for(threads, b.bh, [&](int64_t by) {
       for (int bx = 0; bx < b.bw; ++bx) {
         double blk[64], coef[64];
-        for (int y = 0; y < 8; ++y)
-          for (int x = 0; x < 8; ++x) blk[y * 8 + x] = p.at(bx * 8 + x, static_cast<int>(by) * 8 + y) - 128.0;
+        const int x0 = bx * 8, y0 = static_cast<int>(by) * 8;
+        if (x0 + 8 <= p.w && y0 + 8 <= p.h) {
+          // (A block inside the plane reads it straight: the clamping at the right and bottom edge is for the blocks that overhang.)
+          for (int y = 0; y < 8; ++y) {
+            const float* row = p.s.data() + static_cast<size_t>(y0 + y) * p.w + x0;
+            for (int x = 0; x < 8; ++x) blk[y * 8 + x] = row[x] - 128.0;
+          }
+        } else {
+          for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x) blk[y * 8 + x] = p.at(x0 + x, y0 + y) - 128.0;
+        }
         fdct8x8(blk, coef);
         int* out = b.q.data() + (static_cast<size_t>(by) * b.bw + bx) * 64;
-        for (int k = 0; k < 64; ++k) out[k] = static_cast<int>(vgpu::hostjpeg::round_half_away(coef[kZigZag[k]] / t[k]));
+        vgpu::hostjpeg::quantize_block(coef, kZigZag, tz, out);
       }
     });
   }
@@ -1301,17 +1330,19 @@ std::string encode_planes(const EncoderParams& prm, const std::vector<Plane>& pl
       pred[c] = q[0];
       const int s = magnitude(diff);
       if (counting) ++dc_freq[t][s];
-      e.put(dct[t].code[s], dct[t].len[s]);
-      if (s) e.put(diff > 0 ? diff : diff + (1 << s) - 1, s);
+      e.put2(dct[t].code[s], dct[t].len[s], diff > 0 ? diff : diff + (1 << s) - 1, s);
     };
     const auto ac = [&](int c, const int* q, int ss) {
       const int t = c == 0 ? 0 : 1;
-      int run = 0;
-      for (int k = ss; k < 64; ++k) {
-        if (q[k] == 0) {
-          ++run;
-          continue;
-        }
+      // The nonzero coefficients from ss on, in order: a run of zeros before each, then at the end the end-of-block code if any
+      // zeros are left (the loop this replaces counted the zeros one at a time).
+      uint64_t nz = vgpu::hostjpeg::nonzero_mask(q) & (~uint64_t(0) << ss);
+      int prev = ss - 1;
+      while (nz) {
+        const int k = __builtin_ctzll(nz);
+        nz &= nz - 1;
+        int run = k - prev - 1;
+        prev = k;
         while (run > 15) {
           if (counting) ++ac_freq[t][0xF0];
           e.put(act[t].code[0xF0], act[t].len[0xF0]);
@@ -1320,11 +1351,9 @@ std::string encode_planes(const EncoderParams& prm, const std::vector<Plane>& pl
         const int sz = magnitude(q[k]);
         const int sym = (run << 4) | sz;
         if (counting) ++ac_freq[t][sym];
-        e.put(act[t].code[sym], act[t].len[sym]);
-        e.put(q[k] > 0 ? q[k] : q[k] + (1 << sz) - 1, sz);
-        run = 0;
+        e.put2(act[t].code[sym], act[t].len[sym], q[k] > 0 ? q[k] : q[k] + (1 << sz) - 1, sz);
       }
-      if (run) {
+      if (prev < 63) {
         if (counting) ++ac_freq[t][0x00];
         e.put(act[t].code[0x00], act[t].len[0x00]);
       }

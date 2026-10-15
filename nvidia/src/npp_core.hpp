@@ -17,6 +17,9 @@
 #include <limits>
 #include <type_traits>
 #include <utility>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <vector>
 
 #include "host_parallel.hpp"
@@ -299,6 +302,33 @@ inline void warp_perspective_back(const Image<T>& src, const Rect& sroi, Image<T
    one a loop over the taps for that output makes, so even the sign of a zero that max and min leave to the order (-0 and +0
    are neither less than the other) comes out the same. A NaN never replaces a value (acc < v and v < acc are false).
    std::max(acc, v) is acc < v ? v : acc and std::min(acc, v) is v < acc ? v : acc. */
+// out[k] = the extreme of out[k] and in[k] for k < n, with a NaN in leaving out[k] alone and equal values (the two zeros) leaving out[k] as
+// it is: the scalar form is  MAX ? (acc < v ? v : acc) : (v < acc ? v : acc),  and a vector max or min of (v, acc) in that operand order
+// is the same thing.
+template <class T, bool MAX>
+inline void extreme_row(T* out, const T* in, size_t n) {
+  size_t k = 0;
+#if defined(__SSE2__)
+  if constexpr (std::is_same_v<T, uint8_t>) {
+    for (; k + 16 <= n; k += 16) {
+      const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + k));
+      const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(out + k));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(out + k), MAX ? _mm_max_epu8(v, a) : _mm_min_epu8(v, a));
+    }
+  } else if constexpr (std::is_same_v<T, float>) {
+    for (; k + 4 <= n; k += 4) {
+      const __m128 v = _mm_loadu_ps(in + k);
+      const __m128 a = _mm_loadu_ps(out + k);
+      _mm_storeu_ps(out + k, MAX ? _mm_max_ps(v, a) : _mm_min_ps(v, a));
+    }
+  }
+#endif
+  for (; k < n; ++k) {
+    const T v = in[k], acc = out[k];
+    out[k] = MAX ? (acc < v ? v : acc) : (v < acc ? v : acc);
+  }
+}
+
 template <class T, bool MAX>
 inline void extreme_filter(const T* src, int sw, T* dst, int rw, int rh, int ch, const std::vector<std::pair<int, int>>& taps, T init) {
   const size_t n = static_cast<size_t>(rw) * static_cast<size_t>(ch);
@@ -309,10 +339,7 @@ inline void extreme_filter(const T* src, int sw, T* dst, int rw, int rh, int ch,
     for (size_t k = 0; k < n; ++k) out[k] = init;
     for (const auto& t : taps) {
       const T* const in = src + static_cast<size_t>(y + t.first) * sw + t.second;
-      for (size_t k = 0; k < n; ++k) {
-        const T v = in[k], acc = out[k];
-        out[k] = MAX ? (acc < v ? v : acc) : (v < acc ? v : acc);
-      }
+      extreme_row<T, MAX>(out, in, n);
     }
   });
 }
