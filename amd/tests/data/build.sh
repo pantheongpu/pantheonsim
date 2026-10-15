@@ -87,6 +87,11 @@ if [[ -x "$objdump" ]]; then
       sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > "$src.gfx942.dis"
     echo "wrote $(pwd)/$src.gfx942.dis ($(wc -l < "$src.gfx942.dis") instructions)"
   done
+  # Where each instruction of counters' first kernel sits (hex, no 0x): what
+  # the PC sampling test expects the sampled program counters to be.
+  "$objdump" -d --mcpu=gfx942 counters.gfx942.o | sed -n '/<counted_mix>:/,/s_endpgm/p' |
+    sed -n 's/^\t.*\/\/ \([0-9A-F]*\):.*/\1/p' | sed 's/^0*\(.\)/\1/' > counters.gfx942.pcs
+  echo "wrote $(pwd)/counters.gfx942.pcs ($(wc -l < counters.gfx942.pcs) instructions)"
 else
   echo "no llvm-objdump beside $clang: keeping the listing as it is"
 fi

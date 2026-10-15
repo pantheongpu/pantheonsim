@@ -2162,13 +2162,13 @@ Still open, each with the reason:
   offload bundles need zlib or zstd and refuse other methods (amd/src/bundle.cpp:43-146); graphics interop
   (`hsa_amd_image_create`, `hsa_amd_interop_map_buffer`, `hsa_amd_interop_unmap_buffer`,
   `hsa_executable_agent_global_variable_define`, amd/src/hsa_api.cpp:1984-1991).
-- Profiling: no PC sampling, thread trace or HSA trace, and no records of the runtime's internal kernels
+- Profiling: PC sampling is host-trap only and by instruction count (no clock); no stochastic PC sampling, thread trace or HSA trace, and no records of the runtime's internal kernels
   (amd/README.md:576).
 - Workloads and frameworks: `fused_attention` does not build for AMD (needs a 64-bit mask on wave64); `rt_virus`
   and `media_enc_virus` skip; `mma_virus` needs rocWMMA headers (amd/README.md:609-615); vLLM runs eager only
-  (no graphs, no `torch.compile`), one short sequence, 3 GB device (:513, :515); the ROCm Validation Suite was
-  never built or run, only read (:643).
-- Open on the AMD list: OpenMP offload (`amd_openmp`), OpenCL (`amd_opencl`) and `offload-arch` are done. gfx90a image instructions are done, except the `_pck` forms and LWE (amd/README.md, "Textures").
+  vLLM graphs, `torch.compile` and Triton work (amd_vllm_graphs, amd_pytorch_graphs, amd_pytorch_compile); the ROCm Validation Suite runs
+  (amd/README.md, "ROCm Validation Suite"), except `perf`, `iet` and `tst`, whose pass marks are rates against time, power and heat the simulator does not model, and `mem`, which takes six minutes a GPU.
+- Open on the AMD list: OpenMP offload (`amd_openmp`), OpenCL (`amd_opencl`) and `offload-arch` are done. gfx90a image instructions are done, except the `_pck` forms and LWE (amd/README.md, "Textures"). rocBLAS double `trsv`/`trsm` was checked and nothing was found wrong.
 
 ### Health, RAS and registers (docs/telemetry.md, docs/registers.md, docs/machine-simulator.md)
 

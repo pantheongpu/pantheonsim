@@ -149,6 +149,10 @@ prim=${PRIM_ROCM:-$rocm}
 "$prim/bin/hipcc" -O2 -std=c++17 -isystem "$prim/include" --offload-arch=gfx942 --offload-arch=gfx1100 \
   --offload-compress -s prim.cpp -o prim.all
 echo "wrote $(pwd)/prim.all"
+# A kernel long enough for PC sampling at an interval of ten thousand
+# instructions, which run_rocprofiler_pcsampling.sh runs under AMD's sample tool.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 pcsampling.cpp -o pcsampling.gfx942
+echo "wrote $(pwd)/pcsampling.gfx942"
 # Where a work-group runs (__smid), on every target, in one program.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 --offload-arch=gfx950 --offload-arch=gfx90a \
   --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1100 --offload-arch=gfx1201 smid.cpp -o smid.all
