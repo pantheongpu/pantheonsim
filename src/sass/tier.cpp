@@ -266,7 +266,7 @@ const char* form_name(Form f) {
                                       "isetpex", "popc", "i2fp",  "ldg",    "stg",   "lds",    "sts",      "ldl",
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "sel",   "prmt",  "imnmx",
-                                      "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "ldc",
+                                      "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "iabs", "ldc",
                                       "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
@@ -299,7 +299,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       // Global loads and stores of 1, 2, 4 or 8 bytes on Ampere and later (Turing's address form is the interpreter's).
       const bool store = ins.op == Op::STG;
       const unsigned bytes = mem_bytes(ins.f[0]);
-      if (sm < 80 || !(bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8) || ins.src.size() < (store ? 2u : 1u)) return;
+      if (sm < 80 || !(bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16) || ins.src.size() < (store ? 2u : 1u)) return;
       const Operand& d = store ? ins.src[1] : ins.dst.empty() ? ins.src[0] : ins.dst[0];
       if (!store && ins.dst.empty()) return;
       if (d.kind != Kind::Reg) return;
@@ -311,7 +311,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
         if (u == (sm >= 100 ? 255u : 63u)) u = ~0u;
       }
       if (ra != kRZ) maxreg = static_cast<uint16_t>(ra + (wide ? 2 : 1));
-      if (d.reg != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(d.reg + (bytes == 8 ? 2 : 1)));
+      if (d.reg != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(d.reg + (bytes == 16 ? 4 : bytes == 8 ? 2 : 1)));
       m.a = bytes;
       m.b = ins.f[0];
       m.s[0].off = ra;
@@ -662,10 +662,11 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
     }
     case Op::DADD: case Op::DMUL: case Op::DFMA: {
       const unsigned nsrc = ins.op == Op::DFMA ? 3 : 2;
-      if (ins.f[0] || ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.src.size() < nsrc) return;
+      if (ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.src.size() < nsrc) return;
       uint32_t mods = 0;
       for (unsigned i = 0; i < nsrc; ++i)
         if (!src64(b, ins.src[i], i, m.s[i], mods, maxreg)) return;
+      m.c = ins.f[0];   // a directed rounding mode: the host's, around the kernel
       for (unsigned i = nsrc; i < 3; ++i) m.s[i] = b.constant64(0);   // dop_m ignores c for DADD/DMUL
       const Operand& d = ins.dst[0];
       m.a = ins.op == Op::DADD ? 0 : ins.op == Op::DMUL ? 1 : 2;
@@ -1018,11 +1019,12 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
     }
     case Op::I2F: {   // 8, 16 or 32 bits to f32, to nearest even
       const unsigned dsize = ins.f[0], ssize = ins.f[1];
-      if (ins.guard_uniform || dsize != 2 || ssize > 2 || ins.f[3] != 0 || ins.src.empty() || !plain_kind(ins.src[0])) return;
+      if (ins.guard_uniform || dsize != 2 || ssize > 2 || ins.src.empty() || !plain_kind(ins.src[0])) return;
       if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg) || !reg_dst(ins.dst[0], m.dst, maxreg)) return;
       m.a = ssize;
       m.c = ins.f[2] != 0;   // signed
       m.b = ssize == 2 ? 0u : (ssize == 1 ? 16u : 8u) * ins.f[4];   // the byte or half moved down
+      m.aux = static_cast<uint8_t>(ins.f[3]);   // a directed rounding mode: the general rule's scalar conversion under the host's
       accept(Form::I2f);
       return;
     }
@@ -1035,6 +1037,12 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.a = ins.f[0] != 0;   // bf16
       m.b = ins.f[2] != 0;   // .RELU
       accept(Form::F2fp);
+      return;
+    }
+    case Op::IABS: {
+      if (ins.guard_uniform || ins.src.empty() || !plain_kind(ins.src[0])) return;
+      if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg) || !reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      accept(Form::Iabs);
       return;
     }
     case Op::BREV: case Op::FLO: {

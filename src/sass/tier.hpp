@@ -103,6 +103,7 @@ enum class Form : uint8_t {
   Dsetp,     // DSETP
   Hop2,      // HADD2, HMUL2, HFMA2 (packed f16; the f32-result HADD2.F32 is the interpreter's)
   Unary,     // BREV and FLO
+  Iabs,      // IABS
   Ldc,       // LDC from a constant bank
   Bsync,     // BSYNC: ends a run, run by tier_run itself
   Yield,     // YIELD: ends a run, run by tier_run itself

@@ -350,7 +350,12 @@ TIER_HANDLER(h_dop) {
   uint32_t sink[32];   // R254's partner is RZ: its half of the result goes nowhere
   uint32_t* dlo = c.R + op.dst * 32u;
   uint32_t* dhi = op.dst + 1 == kRZ ? sink : c.R + (op.dst + 1u) * 32u;
-  c.sk->dop_m(op.a, op.b, dlo, dhi, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], ex);
+  if (op.c) {   // a directed rounding mode: the host's, around the kernel (the NaN rule is the same)
+    RoundingScope scope(op.c);
+    c.sk->dop_m(op.a, op.b, dlo, dhi, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], ex);
+  } else {
+    c.sk->dop_m(op.a, op.b, dlo, dhi, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], ex);
+  }
 }
 
 // A double operand as its two rows (low words, high words), |x| and -x applied to the bits.
@@ -546,10 +551,44 @@ TIER_HANDLER(h_f2i) {
   tier_store(c, op.dst, ex, r);
 }
 
+// I2F under a directed rounding mode, as exec_float's general rule converts it lane by lane (the conversion is a host instruction that
+// follows the host's mode; in a function of its own so that the compiler does not fold it across the scope's change of mode).
+[[gnu::noinline]] void tier_i2f_rounded(uint32_t* r, const uint32_t* src, unsigned ssize, unsigned shift, bool sgn) {
+  for (unsigned l = 0; l < 32; ++l) {
+    uint64_t v = src[l];
+    if (ssize < 2) v >>= shift;   // .H1, .B1-.B3
+    int64_t sv;
+    switch (ssize) {
+      case 0: sv = sgn ? static_cast<int8_t>(v) : static_cast<int64_t>(v & 0xff); break;
+      case 1: sv = sgn ? static_cast<int16_t>(v) : static_cast<int64_t>(v & 0xffff); break;
+      default: sv = sgn ? static_cast<int32_t>(v) : static_cast<int64_t>(v & 0xffffffff); break;
+    }
+    const float f = static_cast<float>(sv);
+    r[l] = f32_bits(f);
+  }
+}
+
+TIER_HANDLER(h_iabs) {
+  TIER_PRELUDE
+  alignas(32) uint32_t t[32], r[32];
+  const uint32_t* a = tier_src<false>(c, op.s[0], t);
+  for (unsigned l = 0; l < 32; ++l) {
+    const int32_t v = static_cast<int32_t>(a[l]);
+    r[l] = static_cast<uint32_t>(v < 0 ? 0u - static_cast<uint32_t>(v) : static_cast<uint32_t>(v));
+  }
+  tier_store(c, op.dst, ex, r);
+}
+
 TIER_HANDLER(h_i2f) {
   TIER_PRELUDE
   alignas(32) uint32_t t[32], r[32];
   const uint32_t* src = tier_src<false>(c, op.s[0], t);
+  if (op.aux) {
+    RoundingScope scope(op.aux);
+    tier_i2f_rounded(r, src, op.a, op.b, op.c != 0);
+    tier_store(c, op.dst, ex, r);
+    return;
+  }
   if (op.a < 2) {
     // A byte or a half of the register (.B1-.B3, .H1 move it down), sign- or zero-extended: it converts as a signed 32-bit integer.
     alignas(32) uint32_t ext[32];
@@ -854,11 +893,60 @@ inline void tier_get(uint32_t* v, const uint8_t* at, unsigned bytes) {   // v is
   }
 }
 
+// A 16-byte global access (LDG.E.128, STG.E.128), as exec_mem's lane loop makes it: each active lane, in order, one 16-byte read or
+// write of memory (the memory manager's bulk operation; not the atomic pieces a narrower access is), four registers a lane. The
+// lane loop's decode of the instruction's fields at every execution is what this saves. An address in the constant window is exec_mem's.
+template <bool Store>
+static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
+  const TCtx& c = *static_cast<const TCtx*>(vc);
+  Warp& w = *c.w;
+  Block& blk = *c.blk;
+  const unsigned ra = op.s[0].off;
+  const uint32_t* blo = ra != kRZ ? c.R + ra * 32u : nullptr;
+  const uint32_t* bhi = (ra != kRZ && (op.aux & 1)) ? c.R + (ra + 1u) * 32u : nullptr;
+  const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
+  const uint64_t imm = static_cast<uint64_t>(op.imm);
+  uint64_t addrs[32] = {};
+  constexpr uint64_t kWinEnd = kConstWindow + (uint64_t{1} << 32);
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    uint64_t v = 0;
+    if (blo) {
+      v = blo[l];
+      if (bhi) v |= static_cast<uint64_t>(bhi[l]) << 32;
+    }
+    addrs[l] = v + urv + imm;
+    if (addrs[l] >= kConstWindow && addrs[l] < kWinEnd) {   // nothing is done yet: the interpreter runs the whole instruction
+      c.r->tier_exec_mem(blk, w, *op.ins, ex);
+      return;
+    }
+  }
+  MemoryManager& mem = c.r->memory();
+  uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    uint32_t v[4];
+    if (Store) {
+      for (unsigned k = 0; k < 4; ++k) v[k] = d ? d[32 * k + l] : 0;
+      mem.write(addrs[l], v, 16);
+    } else {
+      mem.read(addrs[l], v, 16);
+      if (d)
+        for (unsigned k = 0; k < 4; ++k) d[32 * k + l] = v[k];
+    }
+  }
+  count_access(blk.st, 0, Store, addrs, ex, 16);
+}
+
 // Global loads and stores of 1, 2, 4 or 8 bytes, as exec_mem does them: a coalesced run in one call, or the lanes'
 // accesses together when the memory manager can make them as one-by-one would; anything else (a constant-window
 // address, a misaligned or faulting access, an armed fault) is exec_mem's own, which has not been started.
 template <bool Store>
 static void h_global(void* vc, const tier::MOp& op, Mask ex) {
+  if (op.a > 8) {
+    tier_global16<Store>(vc, op, ex);
+    return;
+  }
   const TCtx& c = *static_cast<const TCtx*>(vc);
   Warp& w = *c.w;
   Block& blk = *c.blk;
@@ -1238,6 +1326,7 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Dsetp: return &h_dsetp;
     case F::Hop2: return &h_hop2;
     case F::Unary: return &h_unary;
+    case F::Iabs: return &h_iabs;
     case F::Ldc: return &h_ldc;
     case F::Shfl: return &h_shfl;
     case F::Vote: return &h_vote;
