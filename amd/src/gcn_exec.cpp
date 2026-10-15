@@ -2299,7 +2299,13 @@ struct Machine {
         // exactly 0, as the ISA's examples have it (sin of the most negative half is +0, not a rounding error's).
         const double x = static_cast<double>(lane_half(w, in.src[0], lane));
         double r;
-        if (!std::isfinite(x)) r = std::numeric_limits<double>::quiet_NaN();
+        if (!std::isfinite(x)) {
+          // The CDNA guides' own examples give the half NaN of an infinity's sine and cosine as 0xfe00 ("V_SIN_F16(0x7c00) => 0xfe00
+          // // sin(+INF) = NAN"), the sign bit set; RDNA's is the positive one.
+          write_half(w, in, lane, gcn::is_rdna(in.arch) ? static_cast<_Float16>(std::numeric_limits<double>::quiet_NaN())
+                                                         : std::bit_cast<_Float16>(uint16_t{0xFE00}));
+          return;
+        }
         else if (x == 0 && op == "v_sin_f16"_op) r = x;
         else {
           const double frac = x - std::floor(x);
