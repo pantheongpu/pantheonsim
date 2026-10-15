@@ -2279,6 +2279,11 @@ Fixed in the simulator, each with a test that fails without the fix:
 - `quasirandomGenerator` and its NVRTC twin: the SASS decoder read the byte select of `R2P` (`R2P PR, R5.B1`,
   `.B2`, `.B3`, which ptxas makes of an unrolled shift-and-test loop) from the wrong bits from Ampere on, so
   every group of tests after the first repeated the first group's. `e2e_constant_table_xor`.
+- `conjugateGradientCudaGraphs`: a cuBLAS call captured into a graph replayed in the handle's pointer mode at the
+  replay, not the one it was made in; the sample sets host mode for one `cublasSaxpy(&alpha)` and device mode
+  after it, so the host alpha was fetched as a device pointer, read as zero, and the loop diverged (residual up
+  by about 1025 an iteration, 10000 iterations, a timeout). `e2e_graph_cg_capture` compares the captured
+  conjugate-gradient loop with the call-by-call one, scalar by scalar.
 
 Fixed in the suite: `cuSolverDn_LinearSolver`, `cuSolverSp_LowlevelCholesky` and `cuSolverSp_LowlevelQR`
 had a `|` in their markers, which split the list's line; and the nine cuSPARSE and cuSOLVER C++ samples did
@@ -2294,11 +2299,6 @@ Still different, each listed in `cuda-samples-known.txt`:
   finishes on a card and hangs here. The fix is kernels that run beside the host thread (a worker per stream, with
   events and `cudaStreamWaitEvent` ordering them): `nvidia/src/runtime_api.cpp` (the launch entry points) and
   `src/runtime/runtime.cpp`. Large, and every eager-error and capture path assumes the synchronous engine.
-- `conjugateGradientCudaGraphs` (simulator gap, not yet found): the same loop of cuBLAS and cuSPARSE calls
-  converges when run call by call (`conjugateGradient` and `conjugateGradientUM` match) and diverges when
-  captured into a graph (the residual grows by about 1025 each iteration). `graph_cg_capture` runs both and prints
-  the scalars (alpha, -alpha, beta, the dots) after each iteration; the library calls are recorded in
-  `nvidia/src/capture_defer.hpp`.
 - `simpleCUFFT_callback` (cannot match): the sample links `libcufft_static.a`, which carries NVIDIA's own CUDA
   runtime; that asks the driver for its internal export table (`cuGetExportTable`), which a simulated driver
   does not have, and `cufftMakePlan1d` returns `CUFFT_INTERNAL_ERROR`. The simulator's cuFFT shim has legacy
