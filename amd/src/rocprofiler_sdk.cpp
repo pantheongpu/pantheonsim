@@ -651,9 +651,13 @@ void finalize_all() {
   Sdk& s = sdk();
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   if (s.finalized) return;
+  // The contexts are stopped before the tools are told, as rocprofiler-sdk
+  // does (its PC sampling sample asserts that its context is inactive in its
+  // finalize callback). The tools flush their buffers there, which delivers
+  // what was recorded until now.
+  for (Context& c : s.contexts) c.active = false;
   for (Client& c : s.clients) finalize_client(c);
   s.finalized = true;
-  for (Context& c : s.contexts) c.active = false;
 }
 
 void client_finalize(rocprofiler_client_id_t id) {

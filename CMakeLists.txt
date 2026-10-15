@@ -1483,6 +1483,9 @@ add_test(NAME amd_amdsmi_python COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_am
 set_tests_properties(amd_amdsmi_python PROPERTIES DEPENDS vgpuamdsmi
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_abi.sh)
+add_test(NAME amd_rocprofiler_pcsampling COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_pcsampling.sh)
+set_tests_properties(amd_rocprofiler_pcsampling PROPERTIES DEPENDS "vgpuhip;vgpurocprof"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
 set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
