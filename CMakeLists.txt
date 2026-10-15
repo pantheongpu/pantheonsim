@@ -1473,6 +1473,11 @@ set_tests_properties(amd_vllm PROPERTIES DEPENDS "vgpuhip;vgpuamdsmi;vgpursmi" R
 add_test(NAME amd_vllm_graphs COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vllm_amd.sh amd/mi300x)
 set_tests_properties(amd_vllm_graphs PROPERTIES DEPENDS "vgpuhip;vgpuamdsmi;vgpursmi" RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_VLLM_MODE=graphs" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 5400)
+# And sharded over two simulated GPUs (tensor parallelism), the all-reduces
+# inside the captured graphs.
+add_test(NAME amd_vllm_graphs_tp2 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vllm_amd.sh amd/mi300x)
+set_tests_properties(amd_vllm_graphs_tp2 PROPERTIES DEPENDS "vgpuhip;vgpuamdsmi;vgpursmi" RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_VLLM_MODE=graphs;VGPU_VLLM_TP=2" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 5400)
 add_test(NAME amd_amdsmi_python COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_amdsmi_python.sh)
 set_tests_properties(amd_amdsmi_python PROPERTIES DEPENDS vgpuamdsmi
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)

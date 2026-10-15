@@ -19,6 +19,11 @@
 # takes the size-2 graph. The log must show that the model was compiled and the
 # graphs captured: vLLM falls back to eager when it cannot, and the text alone
 # would still be right.
+#
+# VGPU_VLLM_TP=2 (with graphs) shards the model over two simulated GPUs, one
+# worker process each, as vLLM's tensor parallelism runs: RCCL's all-reduces
+# between the two processes, vLLM's custom all-reduce sharing the buffers its
+# graphs capture through HIP's IPC handles, and each graph replayed with them.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 build="$(cd "${VGPU_BUILD_DIR:-$root/build}" && pwd)"
@@ -26,6 +31,9 @@ gpu="${1:-amd/mi300x}"
 model="${2:-facebook/opt-125m}"
 prompt="${3:-The capital of France is}"
 mode="${VGPU_VLLM_MODE:-eager}"
+tp="${VGPU_VLLM_TP:-1}"
+[[ "$tp" =~ ^[12]$ ]] || { echo "FAIL  VGPU_VLLM_TP is 1 or 2, not $tp"; exit 1; }
+[[ "$tp" == 1 || "$mode" == graphs ]] || { echo "FAIL  VGPU_VLLM_TP=2 runs in graphs mode"; exit 1; }
 case "$mode" in eager|graphs) ;; *) echo "FAIL  VGPU_VLLM_MODE is eager or graphs, not $mode"; exit 1 ;; esac
 prompts="$prompt"
 [[ "$mode" == graphs ]] && prompts="$prompt|One plus one equals"
@@ -42,7 +50,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/telemetry"
 cat > "$tmp/run.py" <<'EOF'
 import sys
-model, prompts, where, mode = sys.argv[1], sys.argv[2].split("|"), sys.argv[3], sys.argv[4]
+model, prompts, where, mode, tp = sys.argv[1], sys.argv[2].split("|"), sys.argv[3], sys.argv[4], int(sys.argv[5])
 if where == "cpu":
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -60,7 +68,7 @@ else:
         # The default: torch.compile and CUDA graphs, for batch sizes 1 and 2.
         from vllm.config import CompilationConfig
         llm = LLM(model=model, enforce_eager=False, max_model_len=64, max_num_seqs=2,
-                  max_num_batched_tokens=64, gpu_memory_utilization=0.5, dtype="float16",
+                  max_num_batched_tokens=64, gpu_memory_utilization=0.5, dtype="float16", tensor_parallel_size=tp,
                   compilation_config=CompilationConfig(cudagraph_capture_sizes=[1, 2]))
     else:
         # Eager: no graphs, no torch.compile, one sequence.
@@ -81,10 +89,14 @@ done
 ln -s "$(readlink -f "$build/shim/libamdhip64.so.7")" "$tmp/torch/lib/libamdhip64.so"
 ln -s "$(readlink -f "$build/shim/librocm_smi64.so")" "$tmp/torch/lib/librocm_smi64.so"
 
+# Two workers each keep a device's memory in RAM, so a part of it goes to disk.
+extra_env=()
+[[ "$tp" == 2 ]] && { mkdir -p "$tmp/spill"; extra_env=(VGPU_MEMORY_RAM_MB=768 VGPU_MEMORY_DIR="$tmp/spill"); }
 run() {
   (cd "$tmp" && env -u ROCM_PATH -u ROCM_HOME PYTHONPATH="$tmp" LD_LIBRARY_PATH="$build/shim" \
-     VGPU_GPU="$gpu" VGPU_DEVICE_COUNT=1 VGPU_VRAM_MB="${VGPU_VRAM_MB:-3072}" VGPU_TELEMETRY_PATH="$tmp/telemetry" \
-     VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_CACHE_ROOT="$tmp/vllm-cache" timeout "${VGPU_VLLM_TIMEOUT:-5400}" "$python" "$tmp/run.py" "$model" "$prompts" "$1" "$mode" 2>&1)
+     VGPU_GPU="$gpu" VGPU_DEVICE_COUNT="$tp" VGPU_VRAM_MB="${VGPU_VRAM_MB:-3072}" VGPU_TELEMETRY_PATH="$tmp/telemetry" \
+     ${extra_env[@]+"${extra_env[@]}"} \
+     VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_CACHE_ROOT="$tmp/vllm-cache" timeout "${VGPU_VLLM_TIMEOUT:-5400}" "$python" "$tmp/run.py" "$model" "$prompts" "$1" "$mode" "$tp" 2>&1)
 }
 cpu=$(run cpu)
 gpu_out=$(run gpu)
@@ -98,9 +110,9 @@ if grep -q 'VirtualGPU error \[' <<<"$gpu_out"; then
   echo "FAIL  the simulator ran every kernel vLLM gave it"; grep -m5 'VirtualGPU error \[' <<<"$gpu_out" | sed 's/^/      /'; fail=1
 fi
 if [[ "$got" == "$want" ]]; then
-  echo "ok    vLLM ($mode) on $gpu generates what the CPU does: $(texts "$got")"
+  echo "ok    vLLM ($mode, tensor parallel $tp) on $gpu generates what the CPU does: $(texts "$got")"
 else
-  echo "FAIL  vLLM ($mode) on $gpu generates what the CPU does"; echo "      cpu: $(texts "$want")"; echo "      gpu: $(texts "$got")"
+  echo "FAIL  vLLM ($mode, tensor parallel $tp) on $gpu generates what the CPU does"; echo "      cpu: $(texts "$want")"; echo "      gpu: $(texts "$got")"
   [[ -n "$got" ]] || tail -8 <<<"$gpu_out" | sed 's/^/      /'
   fail=1
 fi
