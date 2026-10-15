@@ -38,12 +38,14 @@ typedef uint64_t u64;
 #define CK(x) do { cudaError_t e_ = (x); if (e_) { std::printf("error %s at line %d\n", cudaGetErrorString(e_), __LINE__); return 1; } } while (0)
 
 // n steps of a xorshift generator the compilers cannot fold (an asm of constant additions was folded by ptxas into one): each step is
-// three dependent shifts and xors, SASS a few straight instructions. USE keeps the result alive without touching any value.
+// three dependent shifts and xors, SASS a few straight instructions. DEP(v) makes a value depend on the chain.
 #define ADD1(v) asm volatile("{ .reg .b32 t; shl.b32 t, %0, 13; xor.b32 %0, %0, t; shr.b32 t, %0, 17; xor.b32 %0, %0, t; shl.b32 t, %0, 5; xor.b32 %0, %0, t; }" : "+r"(v));
 #define ADD8(v) ADD1(v) ADD1(v) ADD1(v) ADD1(v) ADD1(v) ADD1(v) ADD1(v) ADD1(v)
 #define ADD64(v) ADD8(v) ADD8(v) ADD8(v) ADD8(v) ADD8(v) ADD8(v) ADD8(v) ADD8(v)
 #define ADD256(v) ADD64(v) ADD64(v) ADD64(v) ADD64(v)
-#define USE(v) asm volatile("" ::"r"(v));
+// A dependency on the chain that keeps it: ptxas deletes a chain whose result nothing uses (an empty asm using it is not a use). 0 unless
+// the chain ends on one value in 2^32.
+#define DEP(v) ((u32)((v) == 0x9e3779b9u))
 
 // ---- 1. the store gate -------------------------------------------------------------------------------------------
 // Each warp's first lane loads the word, adds one and stores it. With the gate every warp loads before any stores: all end
@@ -61,9 +63,8 @@ __global__ void gate_long(u32* word, u32* seen) {
     const u32 v = *word;
     u32 pad = threadIdx.x;
     ADD256(pad) ADD64(pad) ADD8(pad)
-    USE(pad)
     seen[threadIdx.x >> 5] = v;
-    *word = v + 1;
+    *word = v + 1 + DEP(pad);
   }
 }
 // A generic store (ST): the pointer is global at run time but the compiler cannot know.
@@ -85,8 +86,7 @@ __global__ void gate_diverged(u32* word, u32* seen) {
     if (lane == 0) {
       u32 pad = v;
       ADD64(pad)
-      USE(pad)
-      *word = v + 1;
+      *word = v + 1 + DEP(pad);
     } else {
       *word = v + 2;
     }
@@ -122,8 +122,7 @@ __global__ void spin(u32* flag, u32* out) {
   } else if (warp == 1 && lane == 0) {
     u32 pad = 1;
     ADD64(pad) ADD64(pad)
-    USE(pad)
-    *vf = 1;
+    *vf = 1 + DEP(pad);
   }
 }
 
@@ -151,6 +150,7 @@ __global__ void turn(u32* flag, u32* out, u32 K) {
   const unsigned warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   if (warp == 0) {
     u32 acc = lane, snap = 7;
+    #pragma unroll 1
     for (u32 i = 0; i < K + 8; ++i) {
       acc = spin_body<Kind>(vf, acc);
       if (i == K) snap = *vf;
@@ -309,6 +309,7 @@ __global__ void giveway(u32* flag, u32* out, u32 K, u32 M) {
   const unsigned lane = threadIdx.x & 31;
   if (lane < 16) {
     u32 acc = lane, snap = 7;
+    #pragma unroll 1
     for (u32 i = 0; i < K + 8; ++i) {
       acc = (acc ^ (acc << 7)) + 1;
       if (i == K) snap = *vf;
@@ -317,6 +318,7 @@ __global__ void giveway(u32* flag, u32* out, u32 K, u32 M) {
     out[32 + lane] = acc;
   } else {
     u32 acc = lane;
+    #pragma unroll 1
     for (u32 i = 0; i < M; ++i) acc = (acc ^ (acc << 5)) + 3;   // (a trip count the compiler does not know: it cannot unroll it away)
     out[32 + lane] = acc;
     if (lane == 16) *vf = 1;
@@ -368,15 +370,13 @@ __global__ void f_gather(const u32* in, u32* out, long far) {
   const int t = threadIdx.x;
   u32 pad = t;
   ADD256(pad) ADD64(pad)
-  USE(pad)
-  out[t] = in[(t == 5) ? far : t];
+  out[t] = in[(t == 5) ? far : t] + DEP(pad);
 }
 __global__ void f_scatter(u32* out, long far) {
   const int t = threadIdx.x;
   u32 pad = t;
   ADD256(pad) ADD8(pad)
-  USE(pad)
-  out[(t == 9) ? far : t] = t;
+  out[(t == 9) ? far : t] = t + DEP(pad);
 }
 __global__ void f_local(u32* out, int far) {
   u32 arr[256];
@@ -385,8 +385,7 @@ __global__ void f_local(u32* out, int far) {
   volatile int idx = (t == 7) ? far : t;
   u32 pad = t;
   ADD64(pad)
-  USE(pad)
-  out[t] = arr[idx];
+  out[t] = arr[idx] + DEP(pad);
 }
 __global__ void f_shared(u32* out, int far) {
   __shared__ u32 s[64];
@@ -396,8 +395,7 @@ __global__ void f_shared(u32* out, int far) {
   volatile int idx = (t == 11) ? far : t;
   u32 pad = t;
   ADD64(pad) ADD8(pad)
-  USE(pad)
-  out[t] = s[idx];
+  out[t] = s[idx] + DEP(pad);
 }
 __global__ void f_atomic(u32* out, long far) {
   const int t = threadIdx.x;
@@ -534,7 +532,7 @@ static int run_turn(const char* name, int threads) {
     *ok = true;
     return v == 1 ? 1 : 0;
   };
-  u32 lo = 0, hi = 600000;   // lo reads 0, hi reads 1
+  u32 lo = 0, hi = 60000;   // lo reads 0, hi reads 1
   bool ok = true;
   if (reads_one(hi, &ok) != 1 || !ok) { std::printf("%-26s no turn change within %u iterations\n", name, hi); return 0; }
   while (hi - lo > 1) {
@@ -685,7 +683,7 @@ int main(int argc, char** argv) {
       CK(cudaMemcpy(&v, out, 4, cudaMemcpyDeviceToHost));
       return v == 1 ? 1 : 0;
     };
-    u32 lo = 0, hi = 200000;
+    u32 lo = 0, hi = 30000;
     if (!reads_one(hi)) {
       std::printf("giveway: no turn change within %u iterations\n", hi);
     } else {
