@@ -2303,6 +2303,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         const Operand& vop = *vp;
         const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
         const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
+        // Whether it changed the word: an atomic that finds what it leaves (a CAS that lost, an exchange of the
+        // same value) writes nothing a spinning peer could be waiting for (see Warp::idle_yields).
+        bool changed = false;
+        const uint32_t idle0 = w.idle_yields;
         // The value the atomic stores, given the one it finds.
         const auto compute = [&](const uint64_t old) -> uint64_t {
         uint64_t nw = old;
@@ -2351,6 +2355,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           }
         }
         if (!is64) nw &= 0xffffffff;
+        if (nw != old) changed = true;
         return nw;
         };
         // Memory the host maps -- managed, pinned, or shared with another
@@ -2366,6 +2371,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           const uint64_t nw = compute(old);
           mem_write(blk, w, l, sp, addr, &nw, n);
         }
+        w.idle_yields = changed ? 0 : idle0;
         ++blk.st.atomics;
         blk.st.atomic_bytes += n;
         if (!red) {
@@ -3385,6 +3391,8 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       w.slice = 0;
       w.give_way = true;
       w.yield = true;
+      ++w.idle_yields;
+      w.yield_pc = w.pc[std::countr_zero(group)] + 16;   // where the lanes that yielded stand once the YIELD is done
       return false;
     case Op::BPT:
       if (ex) throw Error(Err::Trap, "SASS kernel " + k_.name + " executed BPT.TRAP (a trap)");
@@ -3428,6 +3436,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         if (++w.spins >= 64) {
           w.spins = 0;
           w.give_way = true;
+          w.yield_pc = w.pc[std::countr_zero(take)];   // the group that branched back, at the top of its loop
         }
       }
       return true;
