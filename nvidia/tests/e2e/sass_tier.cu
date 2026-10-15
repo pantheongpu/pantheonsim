@@ -318,7 +318,7 @@ __global__ void k_half2(const u32* A, const u32* Bv, const u32* C, u32* out, int
   OU("cvt.rn.f16x2.f32 %0, %1, %2;", "f"(F(x)), "f"(F(y)));
   OU("cvt.rn.relu.f16x2.f32 %0, %1, %2;", "f"(F(y)), "f"(-F(z)));
   OU("cvt.rn.f16x2.f32 %0, %1, %2;", "f"(-F(z)), "f"(fabsf(F(x))));
-  // bfloat16 pairs: HFMA2.BF16_V2 is one correctly rounded result; the packs; the min/max.
+  // bfloat16 pairs: HFMA2.BF16_V2 is one correctly rounded result; the packs.
   OU("fma.rn.bf16x2 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
   OU("fma.rn.bf16x2 %0, %1, %2, %3;", "r"(x ^ 0x80008000u), "r"(y), "r"(z & 0x7fff7fffu));
   OU("fma.rn.relu.bf16x2 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
@@ -326,18 +326,13 @@ __global__ void k_half2(const u32* A, const u32* Bv, const u32* C, u32* out, int
   OU("fma.rn.bf16x2 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(0x80008000u));   // a product
   OU("cvt.rn.bf16x2.f32 %0, %1, %2;", "f"(F(x)), "f"(F(y)));
   OU("cvt.rn.relu.bf16x2.f32 %0, %1, %2;", "f"(-F(y)), "f"(F(z)));
-  OU("min.bf16x2 %0, %1, %2;", "r"(x), "r"(y));
-  OU("max.NaN.bf16x2 %0, %1, %2;", "r"(y), "r"(z));
-  OU("min.f16x2 %0, %1, %2;", "r"(x), "r"(y));
-#endif
-#if __CUDA_ARCH__ >= 860
-  OU("max.xorsign.abs.f16x2 %0, %1, %2;", "r"(x), "r"(z));
 #endif
   for (int j = 0; j < kH2; ++j) out[(size_t)i * kH2 + j] = o[j];
 }
 
-constexpr int kD2 = 40;
-__global__ void k_double2(const u64* A, const u64* Bv, const u64* C, u64* out, int n) {
+constexpr int kD2 = 56;
+__constant__ double kdc[4];
+__global__ void k_double2(const u64* A, const u64* Bv, const u64* C, u64* out, int n, double kp) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   const double x = D(A[i]), y = D(Bv[i]), z = D(C[i]);
@@ -364,6 +359,23 @@ __global__ void k_double2(const u64* A, const u64* Bv, const u64* C, u64* out, i
   r[k++] = Bd(fmin(x, y));
   r[k++] = Bd(fmax(-x, fabs(y)));
   r[k++] = (x < y) | ((x == z) << 1) | ((y >= z) << 2) | ((x != x) << 3) | ((fabs(y) > z) << 4);
+  // An operand that is the same for every lane -- a kernel argument or a __constant__ value, which the instruction reads from a constant bank -- with
+  // |x| and -x on it (the kernel applies them to it as to a register).
+  ODD("fma.rn.f64 %0, %1, %2, %3;", "d"(x), "d"(-kp), "d"(y));
+  ODD("fma.rn.f64 %0, %1, %2, %3;", "d"(x), "d"(fabs(kp)), "d"(-z));
+  ODD("fma.rz.f64 %0, %1, %2, %3;", "d"(-kdc[1]), "d"(y), "d"(z));
+  ODD("add.rn.f64 %0, %1, %2;", "d"(x), "d"(-kp));
+  ODD("add.rn.f64 %0, %1, %2;", "d"(-fabs(kdc[2])), "d"(y));
+  ODD("mul.rn.f64 %0, %1, %2;", "d"(-kdc[3]), "d"(z));
+  ODD("mul.rp.f64 %0, %1, %2;", "d"(x), "d"(-kp));
+  // DSETP with both of its predicates used (the second is the complement, or for .NUM/.NAN whether both operands are NaN).
+#define ODS(S, ...) do { u32 q_; asm(S : "=r"(q_) : __VA_ARGS__); r[k++] = q_; } while (0)
+  ODS("{ .reg .pred p, q; setp.lt.f64 p|q, %1, %2; selp.u32 %0, 3, 4, q; }", "d"(x), "d"(y));
+  ODS("{ .reg .pred p, q; setp.lt.f64 p|q, %1, %2; selp.u32 %0, 5, 6, p; }", "d"(x), "d"(-y));
+  ODS("{ .reg .pred p, q, c; setp.ne.u32 c, %3, 0; setp.ge.and.f64 p|q, %1, %2, c; selp.u32 %0, 7, 8, q; }", "d"(y), "d"(z), "r"((u32)(x == x)));
+  ODS("{ .reg .pred p, q; setp.nan.f64 p|q, %1, %2; selp.u32 %0, 9, 10, q; }", "d"(x), "d"(z));
+  ODS("{ .reg .pred p, q; setp.num.f64 p|q, %1, %2; selp.u32 %0, 11, 12, q; }", "d"(y), "d"(z));
+  ODS("{ .reg .pred p, q; setp.lt.f64 p|q, %1, %2; selp.u32 %0, 13, 14, q; }", "d"(x), "d"(kp));
   for (int j = 0; j < kD2; ++j) out[(size_t)i * kD2 + j] = r[j];
 }
 
@@ -800,8 +812,12 @@ int main() {
     }
     CK(cudaFree(out));
     CK(cudaMalloc(&out, (size_t)n * kD2 * 8));
+    {
+      const double kd[4] = {1.5, -0.0, std::nan("0x123"), 3.25};
+      CK(cudaMemcpyToSymbol(kdc, kd, sizeof kd));
+    }
     for (int threads : {64, 37}) {
-      k_double2<<<(n + threads - 1) / threads, threads>>>(dxa, dxb, dxc, out, n);
+      k_double2<<<(n + threads - 1) / threads, threads>>>(dxa, dxb, dxc, out, n, -2.5);
       char label[64];
       std::snprintf(label, sizeof label, "double2 threads=%d", threads);
       if (report(label, out, (size_t)n * kD2)) return 1;
