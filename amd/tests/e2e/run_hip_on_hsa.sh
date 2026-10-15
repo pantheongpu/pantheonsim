@@ -79,10 +79,11 @@ for lib in "${libs[@]}"; do
   # HIP makes the images and samplers there, and the kernels read the
   # resources it writes (hipcc/images.cpp, the same 21 checks as on the
   # simulator's own HIP).
-  for gen in "gfx1030 rx6900xt" "gfx1030 rx6800" "gfx1031 rx6700xt" "gfx1100 rx7900xtx" "gfx1201 rx9070xt"; do
+  # (The MI250X's has 19: it has no image_sample_l or image_gather4, so the two checks that use them do not run.)
+  for gen in "gfx1030 rx6900xt 21" "gfx1030 rx6800 21" "gfx1031 rx6700xt 21" "gfx1100 rx7900xtx 21" "gfx1201 rx9070xt 21" "gfx90a mi250x 19"; do
     set -- $gen
     out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$tmp:$lib" timeout 600 "$bin/images.$1" 2>&1)
-    expect "  arrays, textures and surfaces on $2" "21" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
+    expect "  arrays, textures and surfaces on $2" "$3" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
   done
 done
 exit $fail

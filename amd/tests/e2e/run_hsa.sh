@@ -53,8 +53,8 @@ run() {   # run <label> <extra cflags...>
 }
 
 # The images extension (amd/tests/hsa/hsa_images.c): every check on a
-# Radeon profile, which has texture units, and the refusals on an MI300X,
-# which has none.
+# Radeon profile or an MI250X, which have texture units, and the refusals on
+# an MI300X, which has none.
 run_images() {   # run_images <label> <extra cflags...>
   local label=$1; shift
   if ! "$cc" -std=c11 -O1 -Wall -Werror "${sanitize[@]}" "$@" "$root/amd/tests/hsa/hsa_images.c" -o "$tmp/hsa_images" \
@@ -62,7 +62,7 @@ run_images() {   # run_images <label> <extra cflags...>
     echo "FAIL  hsa_images.c builds against $label"; sed 's/^/      /' "$tmp/cc.log" | head -20; fail=1; return
   fi
   local gpu want out status passed
-  for run in "rx7900xtx 10" "rx9070xt 10" "rx6900xt 10" "rx6800 10" "rx6700xt 10" "mi300x 3"; do
+  for run in "rx7900xtx 10" "rx9070xt 10" "rx6900xt 10" "rx6800 10" "rx6700xt 10" "mi250x 10" "mi300x 3"; do
     set -- $run
     gpu=$1 want=$2
     out=$(VGPU_QUIET=1 VGPU_GPU=amd/$gpu timeout 120 "$tmp/hsa_images" 2>&1)

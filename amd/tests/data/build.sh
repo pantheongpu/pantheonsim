@@ -59,6 +59,12 @@ for src in asm_lds_dma asm_ds_tr; do
   echo "wrote $(pwd)/$src.gfx950.o"
 done
 
+# And for gfx90a (MI200), whose image instructions (MIMG) are its own (test_amd_gcn_asm).
+for src in asm_images90a; do
+  "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx90a -c "$src.s" -o "$src.gfx90a.o"
+  echo "wrote $(pwd)/$src.gfx90a.o"
+done
+
 # And for gfx1100 (RDNA3, wave32), for what only RDNA has (test_amd_gcn_asm).
 for src in asm_permlane asm_images asm_wave asm_literal asm_fminmax11 asm_hwid11; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1100 -c "$src.s" -o "$src.gfx1100.o"

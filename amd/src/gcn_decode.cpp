@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <deque>
 #include <map>
 #include <set>
 #include <vector>
@@ -1173,6 +1174,45 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table_gfx90a() {
     mac_e64.promoted = true;
     set(Enc::Vop3, 0x116, mac_e64);
     set(Enc::Vop2, 0x017, {"v_madmk_f32", 1, 2});
+    // Its image instructions (MI200 ISA guide, Table 91): the only sample is
+    // image_sample, and there is no gather4.
+    for (const auto& [op, name] : std::initializer_list<std::pair<uint32_t, const char*>>{
+             {0, "image_load"}, {1, "image_load_mip"}, {2, "image_load_pck"}, {3, "image_load_pck_sgn"},
+             {4, "image_load_mip_pck"}, {5, "image_load_mip_pck_sgn"}, {8, "image_store"}, {9, "image_store_mip"},
+             {10, "image_store_pck"}, {11, "image_store_mip_pck"}, {14, "image_get_resinfo"},
+             {16, "image_atomic_swap"}, {17, "image_atomic_cmpswap"}, {18, "image_atomic_add"},
+             {19, "image_atomic_sub"}, {20, "image_atomic_smin"}, {21, "image_atomic_umin"},
+             {22, "image_atomic_smax"}, {23, "image_atomic_umax"}, {24, "image_atomic_and"},
+             {25, "image_atomic_or"}, {26, "image_atomic_xor"}, {27, "image_atomic_inc"},
+             {28, "image_atomic_dec"}, {32, "image_sample"}})
+      set(Enc::Mimg, op, {name, 1, 0});
+    // Its formatted buffer accesses (MI200 ISA guide, 12.x MUBUF opcodes 0-15,
+    // 38 and 39), which HIP's tex1Dfetch over linear memory compiles to; gfx940
+    // dropped them. The data comes in 32-bit channels, or with d16 as halves
+    // packed two to a register.
+    for (const char* kind : {"load", "store"})
+      for (uint32_t c = 1; c <= 4; ++c) {
+        static const char* kX[5] = {"", "x", "xy", "xyz", "xyzw"};
+        const bool store = kind[0] == 's';
+        const uint32_t base = store ? 4 : 0;
+        const uint32_t dregs = (c + 1) / 2;
+        const std::string plain = std::string("buffer_") + kind + "_format_" + kX[c];
+        const std::string half = std::string("buffer_") + kind + "_format_d16_" + kX[c];
+        static std::deque<std::string> names;   // the table keeps pointers to these
+        names.push_back(plain);
+        names.push_back(half);
+        const char* plain_name = names[names.size() - 2].c_str();
+        const char* half_name = names[names.size() - 1].c_str();
+        if (!store) {
+          set(Enc::Mubuf, base + c - 1, {plain_name, c, 3});
+          set(Enc::Mubuf, 8 + base + c - 1, {half_name, dregs, 3});
+        } else {
+          set(Enc::Mubuf, base + c - 1, {plain_name, 0, 4, c});
+          set(Enc::Mubuf, 8 + base + c - 1, {half_name, 0, 4, dregs});
+        }
+      }
+    set(Enc::Mubuf, 0x26, {"buffer_load_format_d16_hi_x", 1, 3});
+    set(Enc::Mubuf, 0x27, {"buffer_store_format_d16_hi_x", 0, 4, 1});
     // The first-level cache's write-back and invalidate.
     set(Enc::Mubuf, 0x29, {"buffer_invl2", 0, 0});
     set(Enc::Mubuf, 0x3e, {"buffer_wbinvl1", 0, 0});
@@ -1187,6 +1227,8 @@ thread_local bool g_scaled_product = false;
 
 // The table decode() looks in: the target's, for the instruction being decoded.
 thread_local const std::map<std::pair<Enc, uint32_t>, Shape>* g_table = nullptr;
+// Whether the target has texture units (MIMG): gfx90a among the gfx9 family.
+thread_local bool g_images = false;
 
 const Shape& shape(Enc e, uint32_t opcode) {
   const auto& t = g_table ? *g_table : table();
@@ -1450,8 +1492,11 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
     return in;
   }
   struct Using {
-    explicit Using(Target t) { g_table = t == Target::Gfx90a ? &table_gfx90a() : &table(); }
-    ~Using() { g_table = nullptr; }
+    explicit Using(Target t) {
+      g_table = t == Target::Gfx90a ? &table_gfx90a() : &table();
+      g_images = t == Target::Gfx90a;
+    }
+    ~Using() { g_table = nullptr, g_images = false; }
   } using_table(target);
   Inst in = decode_one(code, at, pc);
   in.arch = target;
@@ -1842,6 +1887,44 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
                                                                    : in.segment == Inst::Segment::Flat ? 2 : 1;
     in.src.push_back(vgpr(w1 & 0xFF, addr_width));
     if (s.srcs > 1) in.src.push_back(data((w1 >> 8) & 0xFF, s.src_width(1)));   // the data written
+  } else if ((w0 >> 26) == 0x3c && g_images) {   // MIMG: gfx90a's image instructions
+    // AMD's MI200 ISA guide, 13.6.1 (Table 90): DMASK [11:8], UNRM 12, GLC 13,
+    // DA 14, A16 15, ACC 16 (VDATA is an accumulation register), LWE 17, OP
+    // [24:18], SLC 25, VADDR [39:32], VDATA [47:40], SRSRC [52:48], SSAMP
+    // [57:53], D16 63. Bit 7 is SCC (the machine-readable specification and
+    // the assembler; the guide's table calls it reserved).
+    const uint32_t w1 = word(code, at + 4);
+    in.enc = Enc::Mimg;
+    in.size = 8;
+    in.opcode = (w0 >> 18) & 0x7F;
+    const Shape& s = shape(in.enc, in.opcode);
+    in.name = s.name;
+    in.dmask = static_cast<uint8_t>((w0 >> 8) & 0xF);
+    in.unorm = (w0 >> 12) & 1;
+    in.da = (w0 >> 14) & 1;
+    in.a16 = (w0 >> 15) & 1;
+    const bool acc = (w0 >> 16) & 1;
+    in.lwe = (w0 >> 17) & 1;
+    in.d16 = (w1 >> 31) & 1;
+    in.cache = ((w0 >> 13) & 1) | ((w0 >> 25) & 1) << 1 | ((w0 >> 7) & 1) << 2;   // glc, slc, scc
+    const bool sample = in.name == "image_sample";
+    const bool store = in.name.rfind("image_store", 0) == 0;
+    const bool atomic = in.name.rfind("image_atomic", 0) == 0;
+    const bool returns = !store && (!atomic || (in.cache & 1));
+    // The data: a register for each channel DMASK names (two 16-bit channels
+    // to one with d16; an atomic's DMASK counts the dwords it sends). LWE
+    // adds no register (the assembler does not count one).
+    uint32_t channels = std::max(1, __builtin_popcount(in.dmask));
+    if (in.d16) channels = (channels + 1) / 2;
+    Operand data = vgpr((w1 >> 8) & 0xFF, channels);
+    if (acc) data.kind = OperandKind::Agpr;
+    in.src.push_back(data);
+    if (returns) in.dst.push_back(data);
+    // The address: its first register only. How many follow depends on the
+    // resource's shape, which the executor reads from the T#.
+    in.src.push_back(vgpr(w1 & 0xFF, 1));
+    in.src.push_back(sgpr(((w1 >> 16) & 0x1F) << 2, 8));
+    if (sample) in.src.push_back(sgpr(((w1 >> 21) & 0x1F) << 2, 4));
   } else if ((w0 >> 31) == 0) {       // VOP2
     in.enc = Enc::Vop2;
     in.opcode = (w0 >> 25) & 0x3F;
@@ -2023,6 +2106,25 @@ std::string to_text(const Inst& i) {
   // they carry.
   if (i.arch == Target::Gfx90a && (i.name == "buffer_wbl2" || i.name == "buffer_invl2")) return s;
   std::string sep = " ";
+  if (i.enc == Enc::Mimg) {
+    // gfx90a's image instruction: the data, the address's first register, the
+    // resource and sampler, then the modifiers in the order the assembler
+    // prints them.
+    std::string t = s + " " + operand_text(i.src[0]) + ", " + operand_text(i.src[1]);
+    for (size_t k = 2; k < i.src.size(); ++k) t += ", " + operand_text(i.src[k]);
+    char m[32];
+    std::snprintf(m, sizeof m, " dmask:0x%x", i.dmask);
+    t += m;
+    if (i.unorm) t += " unorm";
+    if (i.cache & 1) t += " glc";
+    if (i.cache & 2) t += " slc";
+    if (i.cache & 4) t += " scc";
+    if (i.a16) t += " a16";
+    if (i.lwe) t += " lwe";
+    if (i.da) t += " da";
+    if (i.d16) t += " d16";
+    return t;
+  }
   if (i.name == "s_getreg_b32") return s + " " + operand_text(i.dst[0]) + ", " + hwreg_text(static_cast<uint32_t>(i.simm));
   if (i.name == "s_setreg_imm32_b32") {
     const uint32_t v = static_cast<uint32_t>(i.src[0].value);

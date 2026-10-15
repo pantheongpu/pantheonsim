@@ -205,6 +205,10 @@ struct Inst {
   // and where a load's lands), then each address, then the resource and,
   // for a sample, the sampler; dst[0] the data, when the instruction returns
   // any.
+  // gfx90a's MIMG has no DIM: the resource's TYPE says the shape, and DA
+  // (da) says whether the kernel passes an array index (the executor works the
+  // dimension out, and how many address registers there are, from the T#).
+  bool da = false;
   uint8_t dmask = 0, dim = 0;
   bool unorm = false, a16 = false, d16 = false, tfe = false, lwe = false, r128 = false, nsa = false;
   std::vector<Inst> dual;

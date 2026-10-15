@@ -2645,9 +2645,10 @@ void hip_version(const vgpu::DeviceProfile& p, int* major, int* minor) {
 // A Radeon device's texture and surface limits, as ROCm's HIP reports them
 // from its image runtime's (hip_images.inc): no cubemaps, gathers or
 // alternate 3D sizes.
-// Whether a device has texture units: the Radeon targets.
+// Whether a device has texture units: the Radeon targets and the MI200
+// family (gfx90a; the MI300 family has none).
 bool has_images(const vgpu::DeviceProfile& p) {
-  return p.gcn_arch.rfind("gfx10", 0) == 0 || p.gcn_arch.rfind("gfx11", 0) == 0 ||
+  return p.gcn_arch == "gfx90a" || p.gcn_arch.rfind("gfx10", 0) == 0 || p.gcn_arch.rfind("gfx11", 0) == 0 ||
          p.gcn_arch.rfind("gfx12", 0) == 0;
 }
 void fill_texture_limits(vgpu::amd::abi::DevicePropR0600* props) {

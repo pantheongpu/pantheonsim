@@ -5822,7 +5822,9 @@ struct Machine {
   }
 
   static image::Gen image_gen(gcn::Target t) {
-    return t == gcn::Target::Gfx1030 ? image::Gen::Gfx10 : t == gcn::Target::Gfx1100 ? image::Gen::Gfx11 : image::Gen::Gfx12;
+    return t == gcn::Target::Gfx90a ? image::Gen::Gfx9
+           : t == gcn::Target::Gfx1030 ? image::Gen::Gfx10
+           : t == gcn::Target::Gfx1100 ? image::Gen::Gfx11 : image::Gen::Gfx12;
   }
 
   void image_access(Wave& w, const Inst& in) {
@@ -5833,6 +5835,20 @@ struct Machine {
     const bool store = name.rfind("image_store", 0) == 0;
     const bool atomic = name.rfind("image_atomic", 0) == 0;
     const bool resinfo = name == "image_get_resinfo";
+    // gfx90a (MI200): no DIM field -- the T#'s TYPE and the DA bit say the
+    // shape and whether an array index is passed -- and the address
+    // registers are a run from VADDR, as many as that shape needs.
+    const bool g9 = in.arch == gcn::Target::Gfx90a;
+    if (g9) {
+      if (name.find("_pck") != std::string::npos)
+        throw Error::make(Err::Unsupported, name, " is decoded but not implemented: the MI200 guide says the format in the "
+                          "resource is ignored and 8- and 16-bit components are ", name.find("_sgn") != std::string::npos
+                          ? "sign" : "zero", "-extended, but not what a DMASK past the texel's channels returns, or "
+                          "whether DST_SEL applies");
+      if (in.lwe)
+        throw Error::make(Err::Unsupported, name, " with LWE is decoded but not implemented: the MI200 guide says a fetch "
+                          "'may return LOD_CLAMPED=1' and not in which register");
+    }
     const size_t naddr = in.src.size() - (sample ? 3 : 2);
     const Operand& rsrc = in.src[1 + naddr];
     uint32_t t[8] = {};
@@ -5848,9 +5864,29 @@ struct Machine {
     if (!resinfo && image::texel_bytes(img.format) == 0)
       throw Error::make(Err::Unsupported, name, " of an image whose format this does not read (data format ",
                         static_cast<int>(img.format.data), ")");
-    const uint32_t dim = in.dim & 7;
     static const uint32_t kCoords[8] = {1, 2, 3, 3, 2, 3, 3, 4};
     static const uint32_t kSpatial[8] = {1, 2, 3, 2, 1, 2, 2, 2};   // coordinates that are positions, not layers
+    uint32_t dim = in.dim & 7;
+    if (g9) {
+      // The shape is the T#'s TYPE (MI200 guide, Table 41): 8 1D, 9 2D, 10 3D, 11 cube, 12 1D array, 13 2D array.
+      // An array index is in the address only where DA says the kernel passes one: "when DA is zero, the hardware does
+      // not send an array index to the texture cache. If the texture map was indexed, the hardware supplies an
+      // index value of zero. Indices sent for non-indexed texture maps are ignored" (Section 9.4.2) -- so DA on a
+      // resource that is no array still takes a register, which is ignored.
+      const uint32_t type = static_cast<uint32_t>(img.type);
+      if (type < 8 || type > 13)
+        throw Error::make(Err::Unsupported, name, " of a resource of type ", type,
+                          " (a buffer or a multisampled image), which this does not model");
+      const bool array = type == 12 || type == 13;
+      switch (type) {
+        case 8: dim = in.da ? 4 : 0; break;
+        case 9: dim = in.da ? 5 : 1; break;
+        case 10: dim = 2; break;
+        case 11: dim = 3; break;
+        default: dim = in.da ? (type == 12 ? 4u : 5u) : (type == 12 ? 0u : 1u); break;
+      }
+      (void)array;
+    }
     // A load, store or atomic takes a cube's face as a layer (x, y, face), as
     // the hardware addresses it; sampling a cube, which picks the face from
     // a direction, is not modelled (ROCm's HIP makes no cube arrays).
@@ -5875,11 +5911,20 @@ struct Machine {
       uint32_t n = 0;
     };
     std::array<Lane, kLanes> lanes{};
+    // (gfx90a: the registers from VADDR that the shape and the _mip form call for.)
+    Operand g9_addr;
+    if (g9) {
+      g9_addr = in.src[1];
+      const uint32_t n = resinfo ? 1 : kCoords[dim] + (has_mip ? 1 : 0);
+      g9_addr.width = in.a16 ? (n + 1) / 2 : n;
+    }
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      for (size_t k = 1; k <= naddr; ++k)
-        for (uint32_t d = 0; d < in.src[k].width && lanes[lane].n < 16; ++d)
-          lanes[lane].word[lanes[lane].n++] = word(w, in.src[k], d, lane);
+      for (size_t k = 1; k <= naddr; ++k) {
+        const Operand& a = g9 ? g9_addr : in.src[k];
+        for (uint32_t d = 0; d < a.width && lanes[lane].n < 16; ++d)
+          lanes[lane].word[lanes[lane].n++] = word(w, a, d, lane);
+      }
     }
     // Reads a lane's components in the order the ISA gives them: each group
     // (the offsets, the bias, the compare, each derivative vector, and the
@@ -6002,12 +6047,22 @@ struct Machine {
           if (!inside) continue;   // a store past the edge is dropped
           uint8_t bytes[16] = {};
           const uint32_t nbytes = image::texel_bytes(img.format);
-          at(addr).read(addr, bytes, nbytes);
           uint32_t raw[4];
-          image::read_texel(img.format, bytes, raw);
+          // gfx90a writes a whole texel: "it is only possible to write an entire element, not just individual
+          // components. The components come from consecutive VGPRs, and the texture system fills in the value zero for
+          // any missing components" (MI200 guide, Section 9.4.1). With d16, "DMASK is used only as a word count: each
+          // bit represents 16 bits of data ..., bit position is ignored" (Section 9.2.1). The other generations leave the
+          // channels DMASK does not name as they were.
+          const uint8_t dmask = g9 && in.d16 ? static_cast<uint8_t>((1u << __builtin_popcount(in.dmask)) - 1) : in.dmask;
+          if (g9) {
+            raw[0] = raw[1] = raw[2] = raw[3] = 0;
+          } else {
+            at(addr).read(addr, bytes, nbytes);
+            image::read_texel(img.format, bytes, raw);
+          }
           uint32_t k = 0;
           for (int c = 0; c < 4; ++c) {
-            if (!((in.dmask >> c) & 1)) continue;
+            if (!((dmask >> c) & 1)) continue;
             uint32_t v = in.d16 ? (word(w, in.src[0], k / 2, lane) >> (16 * (k & 1))) & 0xFFFF
                                 : word(w, in.src[0], k, lane);
             if (in.d16 && !ints) {

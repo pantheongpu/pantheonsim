@@ -467,10 +467,10 @@ void put_string(void* value, const std::string& s, size_t room) {
 
 std::string isa_name(int device) { return "amdgcn-amd-amdhsa--" + shared::profile(device).gcn_arch_full; }
 
-// Whether a GPU has texture units: the Radeon targets (hsa_images.inc).
+// Whether a GPU has texture units: the Radeon targets and gfx90a (hsa_images.inc).
 bool agent_has_images(int gpu) {
   const std::string& a = shared::profile(gpu).gcn_arch;
-  return a.rfind("gfx10", 0) == 0 || a.rfind("gfx11", 0) == 0 || a.rfind("gfx12", 0) == 0;
+  return a == "gfx90a" || a.rfind("gfx10", 0) == 0 || a.rfind("gfx11", 0) == 0 || a.rfind("gfx12", 0) == 0;
 }
 // The largest image of each HSA geometry (1D, 2D, 3D, 1DA, 2DA, 1DB,
 // 2DDEPTH, 2DADEPTH): width, height, depth, layers -- ROCm's image

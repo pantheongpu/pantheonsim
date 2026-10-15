@@ -215,14 +215,16 @@ expect "every RDNA3 wave64 check holds (DPP, output modifiers, double literals)"
 # (hipcc/images.cpp): samples, filtering, address modes, gathers, linear,
 # pitched, 3D and layered textures, surfaces, the copies to and from arrays
 # and the API's answers -- the same program built for gfx1030, gfx1100 and
-# gfx1201, whose image resources are laid out differently.
-for run in "gfx1030 rx6900xt" "gfx1030 rx6800" "gfx1031 rx6700xt" "gfx1100 rx7900xtx" "gfx1201 rx9070xt"; do
+# gfx1201, whose image resources are laid out differently, and for gfx90a.
+# The MI250X (gfx90a) has one sample instruction, image_sample, so the checks of an explicit level of detail and
+# of gathers do not run there: 19 checks.
+for run in "gfx1030 rx6900xt 21" "gfx1030 rx6800 21" "gfx1031 rx6700xt 21" "gfx1100 rx7900xtx 21" "gfx1201 rx9070xt 21" "gfx90a mi250x 19"; do
   set -- $run
   out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/images.$1" 2>&1)
   status=$?
   expect "the $1 image program runs to the end" "0" "$status"
-  expect "every $1 texture and surface check holds" "21 of 21" \
-    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 21"
+  expect "every $1 texture and surface check holds" "$3 of $3" \
+    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of $3"
 done
 
 # RDNA4 on a simulated Radeon RX 9070 XT (hipcc/rdna4.cpp): WMMA in gfx12's

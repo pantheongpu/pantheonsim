@@ -139,10 +139,11 @@ echo "wrote $(pwd)/prim.all"
   --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1100 --offload-arch=gfx1201 smid.cpp -o smid.all
 echo "wrote $(pwd)/smid.all"
 # Arrays, textures and surfaces, for each RDNA generation's image resources.
-for arch in gfx1030 gfx1031 gfx1100 gfx1201; do
+# and for the MI200's (gfx90a), which has MIMG too.
+for arch in gfx1030 gfx1031 gfx1100 gfx1201 gfx90a; do
   "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch images.cpp -o images.$arch
 done
-echo "wrote $(pwd)/images.gfx1030, images.gfx1031, images.gfx1100 and images.gfx1201"
+echo "wrote $(pwd)/images.gfx1030, images.gfx1031, images.gfx1100, images.gfx1201 and images.gfx90a"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.
