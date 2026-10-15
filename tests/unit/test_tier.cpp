@@ -111,8 +111,17 @@ void check_corpus(const std::string& file, int sm) {
   // pool[0] is the zero row and every constant row is the same value in all 32 lanes except a double's pair halves.
   VCHECK(!prog.pool.empty());
   for (unsigned l = 0; l < 32; ++l) VCHECK(prog.pool[0].v[l] == 0);
-  for (const auto& r : prog.pool)
-    for (unsigned l = 1; l < 32; ++l) VCHECK(r.v[l] == r.v[0]);
+  // (the exception is a shuffle's table of source lanes, one lane per lane: each entry names a lane of the warp)
+  std::vector<bool> table(prog.pool.size(), false);
+  for (const auto& op : prog.ops)
+    if (op.form == sass::tier::Form::Shfl && (op.aux & 1)) {
+      VCHECK(op.s[1].kind == sass::tier::SrcKind::Pool && op.s[1].off < prog.pool.size());
+      table[op.s[1].off] = true;
+      for (unsigned l = 0; l < 32; ++l) VCHECK(prog.pool[op.s[1].off].v[l] < 32);
+    }
+  for (size_t i = 0; i < prog.pool.size(); ++i)
+    if (!table[i])
+      for (unsigned l = 1; l < 32; ++l) VCHECK(prog.pool[i].v[l] == prog.pool[i].v[0]);
   // Not vacuous: a corpus of an architecture with this many integer and float instructions gives the tier many.
   VCHECK(accepted > 200);
   const bool report = std::getenv("VGPU_SASS_REPORT") != nullptr;
