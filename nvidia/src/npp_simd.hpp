@@ -419,6 +419,65 @@ inline ResizeTables resize_tables(const Rect& droi, int src_w, int src_h, double
   return t;
 }
 
+#ifdef VGPU_NPP_AVX2
+#pragma GCC push_options
+#pragma GCC target("avx2")
+// Without FMA in the target, so that nothing here can be contracted: this is for sums of rounded products.
+namespace avx2nf {
+
+// One row of nppiResize_8u's bilinear filter (npp_api.cpp's resize_8u), eight columns at a time. For column x the taps are the
+// pixels at the byte offsets c0[x] and c1[x] (the clamped columns, times CH) of the rows at byte offsets ra and rb, weighted
+//     v = p00 * (1 - ax) * (1 - ay) + p10 * ax * (1 - ay) + p01 * (1 - ax) * ay + p11 * ax * ay        (float, left to right)
+// and the pixel is floor(v) clipped to a byte.
+template <int CH>
+inline void resize_linear_row(const uint8_t* base, int ra, int rb, float ay, const int* c0, const int* c1, const float* ax, int n, uint8_t* drow) {
+  typedef __m256 V;
+  typedef __m256i VI;
+  const V vay = _mm256_set1_ps(ay), vomay = _mm256_set1_ps(1 - ay);
+  const VI vra = _mm256_set1_epi32(ra), vrb = _mm256_set1_epi32(rb);
+  for (int x = 0; x < n; x += 8, drow += 8 * CH) {
+    const int m = n - x < 8 ? n - x : 8;
+    alignas(32) int a0[8], a1[8];
+    alignas(32) float fx[8];
+    for (int l = 0; l < 8; ++l) {
+      const int k = l < m ? x + l : x;   // (lanes past the end repeat the first column: valid offsets, never stored)
+      a0[l] = c0[k];
+      a1[l] = c1[k];
+      fx[l] = ax[k];
+    }
+    const VI vc0 = _mm256_load_si256(reinterpret_cast<const VI*>(a0)), vc1 = _mm256_load_si256(reinterpret_cast<const VI*>(a1));
+    const V vax = _mm256_load_ps(fx);
+    const V vomax = _mm256_sub_ps(_mm256_set1_ps(1.0f), vax);
+    const VI g00 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(base), _mm256_add_epi32(vra, vc0), 1);
+    const VI g10 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(base), _mm256_add_epi32(vra, vc1), 1);
+    const VI g01 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(base), _mm256_add_epi32(vrb, vc0), 1);
+    const VI g11 = _mm256_i32gather_epi32(reinterpret_cast<const int*>(base), _mm256_add_epi32(vrb, vc1), 1);
+    alignas(32) uint8_t res[CH][8];
+    for (int c = 0; c < CH; ++c) {
+      const VI mask = _mm256_set1_epi32(0xFF);
+      const V p00 = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_srli_epi32(g00, 8 * c), mask));
+      const V p10 = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_srli_epi32(g10, 8 * c), mask));
+      const V p01 = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_srli_epi32(g01, 8 * c), mask));
+      const V p11 = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_srli_epi32(g11, 8 * c), mask));
+      const V t0 = _mm256_mul_ps(_mm256_mul_ps(p00, vomax), vomay);
+      const V t1 = _mm256_mul_ps(_mm256_mul_ps(p10, vax), vomay);
+      const V t2 = _mm256_mul_ps(_mm256_mul_ps(p01, vomax), vay);
+      const V t3 = _mm256_mul_ps(_mm256_mul_ps(p11, vax), vay);
+      V v = _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(t0, t1), t2), t3);
+      v = _mm256_min_ps(_mm256_max_ps(_mm256_floor_ps(v), _mm256_setzero_ps()), _mm256_set1_ps(255.0f));
+      const VI ri = _mm256_cvttps_epi32(v);
+      const __m128i p16 = _mm_packus_epi32(_mm256_castsi256_si128(ri), _mm256_extracti128_si256(ri, 1));
+      _mm_storel_epi64(reinterpret_cast<__m128i*>(res[c]), _mm_packus_epi16(p16, p16));
+    }
+    for (int l = 0; l < m; ++l)
+      for (int c = 0; c < CH; ++c) drow[l * CH + c] = res[c][l];
+  }
+}
+
+}  // namespace avx2nf
+#pragma GCC pop_options
+#endif  // VGPU_NPP_AVX2
+
 // ---- the drivers: the same rows as npp_core.hpp's warp() and npp_imgproc.cpp's resize_sqr, on the threads they use ----
 
 #ifdef VGPU_NPP_AVX2
@@ -532,7 +591,63 @@ inline bool resize_sqr(const Image<T>& src, Image<T>& dst, const Rect& droi, flo
     });
   });
 }
+
+// nppiResize_8u_C1R / C3R (npp_api.cpp's resize_8u): the destination rectangle `droi` of `dst` (whole destination image, `dstride`
+// bytes a row) from the source rectangle `sroi` of `src` (the whole source image, `sstride` bytes a row, followed by kPad
+// readable bytes), nearest or bilinear. The sample point of destination column x is (x + 0.5) * fx + sroi.x - 0.5 in double with
+// fx = sroi.w / droi.w, and taps clamp to the source rectangle. Returns false (nothing written) where it does not apply.
+inline bool resize_legacy_u8(int ch, const uint8_t* src, int sstride, const Rect& sroi, uint8_t* dst, int dstride, const Rect& droi, bool linear) {
+  if (ch != 1 && ch != 3) return false;
+  if (linear && !cpu_ok()) return false;
+  if (static_cast<int64_t>(sroi.y + sroi.h) * sstride + 64 >= (int64_t(1) << 30)) return false;
+  const double fx = static_cast<double>(sroi.w) / droi.w, fy = static_cast<double>(sroi.h) / droi.h;
+  const int w = droi.w, h = droi.h;
+  auto clampc = [&](int x) { return x < sroi.x ? sroi.x : (x > sroi.x + sroi.w - 1 ? sroi.x + sroi.w - 1 : x); };
+  auto clampr = [&](int y) { return y < sroi.y ? sroi.y : (y > sroi.y + sroi.h - 1 ? sroi.y + sroi.h - 1 : y); };
+  std::vector<int> c0(static_cast<size_t>(w)), c1(static_cast<size_t>(w));
+  std::vector<float> ax(static_cast<size_t>(w));
+  for (int x = 0; x < w; ++x) {
+    const double sx = (x + 0.5) * fx + sroi.x - 0.5;
+    if (!linear) {
+      c0[x] = clampc(static_cast<int>(std::nearbyint(sx))) * ch;
+    } else {
+      const int x0 = static_cast<int>(std::floor(sx));
+      ax[x] = static_cast<float>(sx - x0);
+      c0[x] = clampc(x0) * ch;
+      c1[x] = clampc(x0 + 1) * ch;
+    }
+  }
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(w) * static_cast<uint64_t>(h) * (linear ? 30u : 6u), h);
+  vgpu::hostpar::parallel_for(threads, h, [&](int64_t row) {
+    const int y = static_cast<int>(row);
+    const double sy = (y + 0.5) * fy + sroi.y - 0.5;
+    uint8_t* drow = dst + static_cast<size_t>(y + droi.y) * dstride + static_cast<size_t>(droi.x) * ch;
+    if (!linear) {
+      const uint8_t* srow = src + static_cast<size_t>(clampr(static_cast<int>(std::nearbyint(sy)))) * sstride;
+      if (ch == 1) {
+        for (int x = 0; x < w; ++x) drow[x] = srow[c0[x]];
+      } else {
+        for (int x = 0; x < w; ++x) {
+          const uint8_t* p = srow + c0[x];
+          drow[3 * x] = p[0];
+          drow[3 * x + 1] = p[1];
+          drow[3 * x + 2] = p[2];
+        }
+      }
+      return;
+    }
+#ifdef VGPU_NPP_AVX2
+    const int y0 = static_cast<int>(std::floor(sy));
+    const float ay = static_cast<float>(sy - y0);
+    const int ra = clampr(y0) * sstride, rb = clampr(y0 + 1) * sstride;
+    if (ch == 1) avx2nf::resize_linear_row<1>(src, ra, rb, ay, c0.data(), c1.data(), ax.data(), w, drow);
+    else avx2nf::resize_linear_row<3>(src, ra, rb, ay, c0.data(), c1.data(), ax.data(), w, drow);
+#endif
+  });
+  return true;
+}
 #else   // no AVX2: the generic path does everything
+inline bool resize_legacy_u8(int, const uint8_t*, int, const Rect&, uint8_t*, int, const Rect&, bool) { return false; }
 template <class T> inline bool warp_affine_back(const Image<T>&, const Rect&, Image<T>&, const Rect&, const double[2][3], int, const Bounds&) { return false; }
 template <class T> inline bool warp_perspective_back(const Image<T>&, const Rect&, Image<T>&, const Rect&, const double[3][3], int) { return false; }
 template <class T> inline bool warp_table(const Image<T>&, const Rect&, Image<T>&, const Rect&, const float*, const float*, int, int, const Bounds&) { return false; }

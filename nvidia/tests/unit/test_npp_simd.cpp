@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -257,6 +258,84 @@ size_t run_all_resizes(Rng& rng, int* cases, int* fast) {
   return bad;
 }
 
+// nppiResize_8u_C1R / C3R's loop of npp_api.cpp, as it was.
+inline uint8_t ref_sat8u(double v) {
+  const double c = v < 0 ? 0 : (v > 256 ? 256 : v);
+  const double r = (c + 6755399441055744.0) - 6755399441055744.0;
+  return static_cast<uint8_t>(r < 0 ? 0 : (r > 255 ? 255 : r));
+}
+template <int CH>
+void ref_resize_legacy(const std::vector<uint8_t>& src, int sw, int sh, const Rect& sroi, std::vector<uint8_t>& dst, int dw, const Rect& droi, bool linear) {
+  (void)sh;
+  const double fx = static_cast<double>(sroi.w) / droi.w;
+  const double fy = static_cast<double>(sroi.h) / droi.h;
+  auto at = [&](int y, int x, int c) -> double {
+    x = std::min(std::max(x, sroi.x), sroi.x + sroi.w - 1);
+    y = std::min(std::max(y, sroi.y), sroi.y + sroi.h - 1);
+    return src[(static_cast<size_t>(y) * sw + x) * CH + c];
+  };
+  for (int y = 0; y < droi.h; ++y)
+    for (int x = 0; x < droi.w; ++x) {
+      const double sx = (x + 0.5) * fx + sroi.x - 0.5;
+      const double sy = (y + 0.5) * fy + sroi.y - 0.5;
+      for (int c = 0; c < CH; ++c) {
+        double v;
+        if (!linear) {
+          v = at(static_cast<int>(std::nearbyint(sy)), static_cast<int>(std::nearbyint(sx)), c);
+        } else {
+          const int x0 = static_cast<int>(std::floor(sx)), y0 = static_cast<int>(std::floor(sy));
+          const float ax = static_cast<float>(sx - x0), ay = static_cast<float>(sy - y0);
+          v = static_cast<float>(at(y0, x0, c)) * (1 - ax) * (1 - ay) +
+              static_cast<float>(at(y0, x0 + 1, c)) * ax * (1 - ay) +
+              static_cast<float>(at(y0 + 1, x0, c)) * (1 - ax) * ay +
+              static_cast<float>(at(y0 + 1, x0 + 1, c)) * ax * ay;
+        }
+        dst[(static_cast<size_t>(y + droi.y) * dw + (x + droi.x)) * CH + c] = ref_sat8u(std::floor(v));
+      }
+    }
+}
+
+template <int CH>
+size_t run_legacy_resizes(Rng& rng, int* cases, int* fast) {
+  size_t bad = 0;
+  for (int rep = 0; rep < 60; ++rep) {
+    const int sw = 1 + rng.below(70), sh = 1 + rng.below(40);
+    std::vector<uint8_t> src(static_cast<size_t>(sw) * CH * sh + simd::kPad, 0);
+    for (size_t i = 0; i < static_cast<size_t>(sw) * CH * sh; ++i) src[i] = random_value<uint8_t>(rng, rep & 1);
+    Rect sroi{rng.below(sw), rng.below(sh), 0, 0};
+    sroi.w = 1 + rng.below(sw - sroi.x);
+    sroi.h = 1 + rng.below(sh - sroi.y);
+    const int dw = 1 + rng.below(90), dh = 1 + rng.below(50);
+    Rect droi{rng.below(dw), rng.below(dh), 0, 0};
+    droi.w = 1 + rng.below(dw - droi.x);
+    droi.h = 1 + rng.below(dh - droi.y);
+    if (rep % 7 == 0) { droi = Rect{0, 0, dw, dh}; sroi = Rect{0, 0, sw, sh}; }
+    std::vector<uint8_t> d0(static_cast<size_t>(dw) * CH * dh);
+    for (auto& v : d0) v = random_value<uint8_t>(rng, false);
+    std::vector<uint8_t> d1 = d0;
+    for (const bool linear : {false, true}) {
+      d1 = d0;
+      std::vector<uint8_t> want = d0;
+      ref_resize_legacy<CH>(src, sw, sh, sroi, want, dw, droi, linear);
+      const bool handled = simd::resize_legacy_u8(CH, src.data(), sw * CH, sroi, d1.data(), dw * CH, droi, linear);
+      ++*cases;
+      if (handled) {
+        ++*fast;
+        const size_t d = differing(want, d1);
+        if (d) std::printf("  legacy resize ch %d linear %d src %dx%d -> %dx%d: %zu differ\n", CH, (int)linear, sw, sh, dw, dh, d);
+        bad += d;
+      }
+    }
+  }
+  return bad;
+}
+
+// Three host threads for the large images below (read once, at the first call that wants more than one): the pixels may not depend
+// on how many there are.
+struct SetThreads {
+  SetThreads() { ::setenv("VGPU_THREADS", "3", 0); }
+} set_threads;
+
 }  // namespace
 
 VTEST(npp_simd_warps_match_the_scalar_code) {
@@ -291,6 +370,48 @@ VTEST(npp_simd_resizes_match_the_scalar_code) {
   bad += run_all_resizes<float, 3>(rng, &cases, &fast);
   bad += run_all_resizes<float, 4>(rng, &cases, &fast);
   std::printf("  resizes: %d cases, %d on the fast path, %zu elements differ\n", cases, fast, bad);
+  VCHECK_EQ(bad, static_cast<size_t>(0));
+  if (simd::cpu_ok()) VCHECK_EQ(fast, cases);
+}
+
+VTEST(npp_simd_large_images_on_several_threads) {
+  Rng rng;
+  rng.s ^= 0x5555;
+  const int W = 330, H = 190;
+  size_t bad = 0;
+  int ran = 0;
+  for (const int interp : {kNN, kLinear, kCubic}) {
+    std::vector<uint8_t> src(static_cast<size_t>(W) * 3 * H + simd::kPad);
+    for (size_t i = 0; i < static_cast<size_t>(W) * 3 * H; ++i) src[i] = static_cast<uint8_t>(rng.below(256));
+    Image<uint8_t> si{src.data(), W, H, W * 3, 3};
+    std::vector<uint8_t> d0(static_cast<size_t>(W) * 3 * H, 7), d1 = d0;
+    Image<uint8_t> a{d0.data(), W, H, W * 3, 3}, b{d1.data(), W, H, W * 3, 3};
+    const double c[2][3] = {{0.93, 0.31, 11.5}, {-0.29, 0.95, 17.25}};
+    const Rect roi{0, 0, W, H};
+    warp(si, roi, a, roi, interp, [&](int x, int y, float* sx, float* sy) { affine_point(c, x, y, sx, sy); return true; }, Bounds());
+    if (simd::warp_affine_back(si, roi, b, roi, c, interp, Bounds())) ++ran;
+    bad += differing(d0, d1);
+    // a resize of the same image
+    std::vector<uint8_t> e0(static_cast<size_t>(W) * 3 * H, 9), e1 = e0;
+    Image<uint8_t> ea{e0.data(), W, H, W * 3, 3}, eb{e1.data(), W, H, W * 3, 3};
+    ref_resize<uint8_t, 3>(si, ea, roi, 1.3, 0.8, 0.1, -0.2, interp, W, H);
+    const auto t = simd::resize_tables(roi, W, H, 1.3, 0.8, 0.1, -0.2);
+    if (simd::resize_sqr(si, eb, roi, t.invx, t.cx, t.invy, t.cy, t.colok.data(), t.rowok.data(), interp)) ++ran;
+    bad += differing(e0, e1);
+  }
+  std::printf("  large images: %d runs on the fast path, %zu elements differ\n", ran, bad);
+  VCHECK_EQ(bad, static_cast<size_t>(0));
+  if (simd::cpu_ok()) VCHECK_EQ(ran, 6);
+}
+
+VTEST(npp_simd_legacy_resize_matches_the_scalar_code) {
+  Rng rng;
+  rng.s ^= 0xABCDEF;
+  int cases = 0, fast = 0;
+  size_t bad = 0;
+  bad += run_legacy_resizes<1>(rng, &cases, &fast);
+  bad += run_legacy_resizes<3>(rng, &cases, &fast);
+  std::printf("  legacy resizes: %d cases, %d on the fast path, %zu elements differ\n", cases, fast, bad);
   VCHECK_EQ(bad, static_cast<size_t>(0));
   if (simd::cpu_ok()) VCHECK_EQ(fast, cases);
 }
