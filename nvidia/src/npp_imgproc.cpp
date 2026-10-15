@@ -38,6 +38,7 @@
 #define cudaMemset ::vgpu_capture::memset_commit
 
 #include "npp_core.hpp"
+#include "npp_simd.hpp"
 
 using namespace vgpu_npp;
 
@@ -64,6 +65,19 @@ struct arg_of<I, R (*)(A...)> {
 template <class T>
 std::vector<T> fetch(const void* dev, int step, int elems_per_row, int rows) {
   std::vector<T> host(static_cast<size_t>(elems_per_row) * rows);
+  const auto* base = static_cast<const unsigned char*>(dev);
+  for (int r = 0; r < rows; ++r)
+    cudaMemcpy(host.data() + static_cast<size_t>(r) * elems_per_row,
+               base + static_cast<size_t>(r) * step, elems_per_row * sizeof(T),
+               cudaMemcpyDeviceToHost);
+  return host;
+}
+
+// fetch() with room after the last pixel for the vector samplers' 32-bit gathers (npp_simd.hpp, kPad bytes); the extra elements are
+// zero and not part of the image.
+template <class T>
+std::vector<T> fetch_padded(const void* dev, int step, int elems_per_row, int rows) {
+  std::vector<T> host(static_cast<size_t>(elems_per_row) * rows + simd::kPad);
   const auto* base = static_cast<const unsigned char*>(dev);
   for (int r = 0; r < rows; ++r)
     cudaMemcpy(host.data() + static_cast<size_t>(r) * elems_per_row,
@@ -227,7 +241,7 @@ NppStatus geometric(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* pD
     perspective_quad(NppiRect{sr.x, sr.y, sr.w, sr.h}, fwd3, q);
   }
   if (!meets(q, droi)) return NPP_WRONG_INTERSECTION_QUAD_WARNING;
-  auto src = fetch<T>(pSrc, sstep, ssz.width * ch, ssz.height);
+  auto src = fetch_padded<T>(pSrc, sstep, ssz.width * ch, ssz.height);
   Image<T> si{src.data(), ssz.width, ssz.height, ssz.width * ch, ch};
   Window<T> dst(pDst, dstep, droi.x, droi.y, droi.width, droi.height, ch);
   const Rect dr{droi.x, droi.y, droi.width, droi.height};
@@ -239,14 +253,17 @@ NppStatus geometric(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* pD
       b.lo_slack = 0.5f;
       b.clamp_low = true;
     }
-    warp(si, sr, dst.img, dr, interp,
-         [&](int x, int y, float* sx, float* sy) {
-           affine_point(back2, x, y, sx, sy);
-           return true;
-         },
-         b);
+    // (The vector sampler of npp_simd.hpp gives the same pixels as the scalar warp() below; it takes the common pixel types.)
+    if (!simd::warp_affine_back(si, sr, dst.img, dr, back2, interp, b))
+      warp(si, sr, dst.img, dr, interp,
+           [&](int x, int y, float* sx, float* sy) {
+             affine_point(back2, x, y, sx, sy);
+             return true;
+           },
+           b);
   } else {
-    warp_perspective_back(si, sr, dst.img, dr, back3, interp);
+    if (!simd::warp_perspective_back(si, sr, dst.img, dr, back3, interp))
+      warp_perspective_back(si, sr, dst.img, dr, back3, interp);
   }
   dst.put_back(pDst, dstep);
   return NPP_SUCCESS;
@@ -425,7 +442,7 @@ NppStatus remap(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, const M* 
   if (!known_interp(interp)) return NPP_INTERPOLATION_ERROR;
   Rect sr{};
   if (!clip_src(ssz, sroi, &sr)) return NPP_WRONG_INTERSECTION_ROI_ERROR;
-  auto src = fetch<T>(pSrc, sstep, ssz.width * ch, ssz.height);
+  auto src = fetch_padded<T>(pSrc, sstep, ssz.width * ch, ssz.height);
   Image<T> si{src.data(), ssz.width, ssz.height, ssz.width * ch, ch};
   auto hx = fetch<M>(xm, xstep, dsz.width, dsz.height);
   auto hy = fetch<M>(ym, ystep, dsz.width, dsz.height);
@@ -435,14 +452,18 @@ NppStatus remap(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, const M* 
   b.hi_slack = 1;
   b.hi_open = true;
   b.clamp_low = true;
-  warp(si, sr, dst.img, Rect{0, 0, dsz.width, dsz.height}, interp,
-       [&](int x, int y, float* sx, float* sy) {
-         const size_t i = static_cast<size_t>(y) * dsz.width + x;
-         *sx = static_cast<float>(hx[i]);
-         *sy = static_cast<float>(hy[i]);
-         return true;
-       },
-       b);
+  bool done = false;
+  if constexpr (std::is_same_v<M, float>)
+    done = simd::warp_table(si, sr, dst.img, Rect{0, 0, dsz.width, dsz.height}, hx.data(), hy.data(), dsz.width, interp, b);
+  if (!done)
+    warp(si, sr, dst.img, Rect{0, 0, dsz.width, dsz.height}, interp,
+         [&](int x, int y, float* sx, float* sy) {
+           const size_t i = static_cast<size_t>(y) * dsz.width + x;
+           *sx = static_cast<float>(hx[i]);
+           *sy = static_cast<float>(hy[i]);
+           return true;
+         },
+         b);
   dst.put_back(pDst, dstep);
   return NPP_SUCCESS;
 }
@@ -591,12 +612,22 @@ NppStatus resize_sqr(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* p
   if (interp == NPPI_INTER_SUPER && !(fx < 1 && fy < 1)) return NPP_RESIZE_FACTOR_ERROR;
   auto src = fetch<T>(pSrc, sstep, ssz.width * ch, ssz.height);
   // Taps clamp to the ROI: a window of the source holding just it.
-  std::vector<T> win(static_cast<size_t>(sr.w) * sr.h * ch);
+  std::vector<T> win(static_cast<size_t>(sr.w) * sr.h * ch + simd::kPad);   // (kPad: room for the vector sampler's gathers)
   for (int y = 0; y < sr.h; ++y)
     std::memcpy(&win[static_cast<size_t>(y) * sr.w * ch], &src[(static_cast<size_t>(y + sr.y) * ssz.width + sr.x) * ch],
                 sizeof(T) * sr.w * ch);
   Image<T> si{win.data(), sr.w, sr.h, sr.w * ch, ch};
   Window<T> dst(pDst, dstep, droi.x, droi.y, droi.width, droi.height, ch);
+  if (interp == NPPI_INTER_NN || interp == NPPI_INTER_LINEAR || interp == NPPI_INTER_CUBIC) {
+    // The vector sampler of npp_simd.hpp (the same pixels as the loop below, which does everything and is the fallback).
+    const int sampler = interp == NPPI_INTER_NN ? kNN : (interp == NPPI_INTER_LINEAR ? kLinear : kCubic);
+    const simd::ResizeTables t = simd::resize_tables(Rect{droi.x, droi.y, droi.width, droi.height}, sr.w, sr.h, fx, fy, shx, shy);
+    if (simd::resize_sqr(si, dst.img, Rect{droi.x, droi.y, droi.width, droi.height}, t.invx, t.cx, t.invy, t.cy, t.colok.data(),
+                         t.rowok.data(), sampler)) {
+      dst.put_back(pDst, dstep);
+      return NPP_SUCCESS;
+    }
+  }
   // The sample point of destination column x is fma(1/f, x, c) in single
   // precision, with 1/f rounded to float and c = 0.5/f - 0.5 - shift/f formed
   // from it in double and rounded: the only grouping that reproduces NPP's
