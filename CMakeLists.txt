@@ -2163,6 +2163,15 @@ if(TARGET vgpucublas)
       TIMEOUT 300)
   endforeach()
 
+  # cuSOLVER's Jacobi solvers (syevd, syevj, gesvd, gesvdj), each result checked by its defining property and, on the
+  # simulator, bit for bit against what the plain loops gave before their sweeps were put on vector lanes.
+  add_test(NAME e2e_solver_jacobi_paths
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh solver_jacobi_paths cusolver)
+  set_tests_properties(e2e_solver_jacobi_paths PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   # Two PEs on two devices that have no peer path (the rtx3060 profile, as the card's pair): NVSHMEM refuses the
   # job, as NVIDIA's does ("Peer GPU 1 is not accessible").
   if(TARGET vgpunvshmem)
