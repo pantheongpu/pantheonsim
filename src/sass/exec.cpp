@@ -1534,6 +1534,13 @@ const tier::Program* Code::tier_program() const {
       tier::MOp& op = prog->ops[i];
       tier::analyze(instr(i), sm, *prog, op);
       op.fn = tier_handler_for(op.form);
+      // VGPU_TIER_OFF=form,form,... (names as VGPU_TIER_STATS shows them in tier::form_name: iadd3, bsync, ...) leaves those forms to the
+      // interpreter, for finding which form a difference comes from.
+      static const std::string off = [] { const char* v = std::getenv("VGPU_TIER_OFF"); return v && *v ? std::string(",") + v + "," : std::string(); }();
+      if (!off.empty() && off.find(std::string(",") + tier::form_name(op.form) + ",") != std::string::npos) {
+        op.form = tier::Form::None;
+        op.fn = nullptr;
+      }
       if (op.fn) {
         ++prog->native;
         prog->max_reg = std::max(prog->max_reg, op.maxreg);
