@@ -1807,6 +1807,8 @@ set_tests_properties(config_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 add_test(NAME lint_makefile COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_makefile.sh)
 set_tests_properties(lint_makefile PROPERTIES TIMEOUT 120)
+add_test(NAME lint_readme_commands COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_readme_commands.sh)
+set_tests_properties(lint_readme_commands PROPERTIES TIMEOUT 120)
 add_test(NAME smi_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_cli.sh)
 set_tests_properties(smi_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)

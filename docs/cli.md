@@ -1,9 +1,9 @@
 # Command-line reference
 
 Everything the `vgpu` command and the environment variables can do. The
-[README](../README.md) has the short path; this page is the full list.
+[README](../README.md) has the short path (`make doctor`, `make build`, `make demo`); this page is the full list.
 
-Build once (`./scripts/build.sh`) and the command is `build/vgpu`. The build
+Build once (`make build`, which runs `./scripts/build.sh`) and the command is `build/vgpu`. The build
 also puts it at `build/bin/vgpu`, next to drop-in `nvidia-smi`, `rocm-smi` and
 `amd-smi`, so `PATH=$PWD/build/bin:$PATH` makes all of them available.
 `vgpu --help` lists the commands. `run`, `test`, `ncu`, `debug`, `fault`, `regs`
@@ -21,6 +21,7 @@ Settings you use every time can live in a file (`pantheonsim.yaml`, written by
 | `vgpu info --gpu <vendor/model> [--json]` | Show one device profile. |
 | `vgpu demo vectoradd [--gpu <id>] [-n <elems>]` | Run a built-in `vectorAdd` kernel end to end, as a smoke test. |
 | `vgpu run [options] <program> [args...]` | Run a program on a simulated GPU. [Options](#vgpu-run). |
+| `vgpu config show\|init\|keys` | The settings file: what is in effect, a commented starter file, the list of keys. See [config.md](config.md). |
 | `vgpu shell` | An interactive simulated machine: `nvidia-smi`, `rocm-smi`, `lspci` and `dmesg` all answer for the GPUs you picked. [Options](#vgpu-shell). |
 | `vgpu test --matrix <program> [args...]` | Run a program on every device profile and compare the results. [Options](#vgpu-test---matrix). |
 | `vgpu ncu [options] <program> [args...]` | Nsight Compute's command line, answered from the simulator's exact counters. [Options](#vgpu-ncu). |
