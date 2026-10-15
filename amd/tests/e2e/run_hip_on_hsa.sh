@@ -68,7 +68,7 @@ for lib in "${libs[@]}"; do
   # initialization kernel), many lanes printing, and the fprintf interface. Not printf's conversions
   # (hostcall.cpp's "printf" part): ROCm 7.1's printf prints "%-10s|%.3s" wrongly, which the shim does not.
   out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$tmp:$lib" timeout 300 "$bin/hostcall.gfx942" call malloc crowd fprintf 2>&1)
-  expect "  a kernel calls a host function, mallocs and frees, and prints" "4" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
+  expect "  a kernel calls a host function, mallocs and frees, and prints" "6" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
   out=$(run "$lib" fp8)
   expect "  the 8-bit float conversions are right, all 16 kinds" "16" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
   out=$(run "$lib" textures)
