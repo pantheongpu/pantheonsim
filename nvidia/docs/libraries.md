@@ -768,7 +768,7 @@ and `npp_host_ops.cu` covers thresholding, comparison, Dilate/Erode and `Resize_
 What stayed as it was, measured on this machine: the Jacobi solvers do not use more than one thread (a level of 100 pairs takes about 10 microseconds at n = 200,
 less than starting a thread costs; the pairs of a level are independent, so a pool kept for the call could use them); the complex Jacobi routines (`heev`, complex `gesvd`) keep their
 round-8 form; cuBLAS level-2 routines other than the rank updates and `gemv` (`symv`, `hemv`, `trmv`, `trsv`, `tbmv`, `gbmv`, packed forms; 40-130 ms at n = 2048)
-still convert the matrix to `std::complex<double>`; cuDNN's other tensor operations (add, op tensor, softmax, pooling, batch normalization) still
+still convert the matrix to `std::complex<double>`; cuDNN's other tensor operations (op tensor, softmax, pooling, batch normalization) still
 use whole tensors of doubles (the blocks of the activation could serve them where the shapes allow), and its convolutions run at 4-8 GMAC/s on one thread (the
 filter gradient of a 3 x 3 layer, 170 ms, re-reads the input once per tap); the H.264 decoder (a flat profile: CABAC decisions 12%, deblocking 13%,
 interpolation 15%, neighbour derivation 7%, the bit reader 6%; a bit reader that loads 32 bits at a time and a CABAC renormalisation that takes its bits in one read,
