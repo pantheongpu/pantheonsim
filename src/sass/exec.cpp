@@ -223,7 +223,7 @@ void tier_add_total(uint64_t n);   // tier_ops.inc
 // The budget of steps a warp may take: the launch's, or VGPU_MAX_STEPS (0: none), by the rule the PTX engine applies
 // (effective_max_steps in src/exec/interpreter.cpp). Read at the start of each launch.
 uint64_t sass_max_steps(uint64_t configured) {
-  const char* e = std::getenv("VGPU_MAX_STEPS");
+  static const char* const e = std::getenv("VGPU_MAX_STEPS");   // (once per process: a launch of a few instructions costs less than a getenv)
   if (!e || !*e) return configured;
   const char* p = e;
   while (*p == ' ' || *p == '\t') ++p;
@@ -376,6 +376,22 @@ class Runner {
   bool break_bsync_standoff(Block& blk);
   void init_block(Block& blk, uint64_t linear);
   bool step_warp(Block& blk, Warp& w);
+  // A warp's turn: up to `limit` calls of step_warp, ending early when it cannot run or yields. With the tier, a call may do the work
+  // of several (the chain, tier_ops.inc): `budget` tells it how many calls the turn has left, `extra` how many it took over.
+  template <bool Tier>
+  void turn(Block& blk, Warp& w, int limit, bool& progress) {
+    for (int n = 0; n < limit; ++n) {
+      if (!(w.alive & ~w.exited)) break;
+      if constexpr (Tier) w.budget = static_cast<uint32_t>(limit - 1 - n);
+      if (!step_warp(blk, w)) break;
+      progress = true;
+      if constexpr (Tier) {
+        n += static_cast<int>(w.extra);
+        w.extra = 0;
+      }
+      if (w.yield) break;
+    }
+  }
   bool tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc
   bool break_spin_wait(const std::vector<Block*>& blocks);
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
@@ -1037,17 +1053,8 @@ exec::LaunchStats Runner::run() {
         for (Warp& w : blk.warps) {
           if (!(w.alive & ~w.exited)) continue;
           live = true;
-          for (int n = 0; n < 256 && (w.alive & ~w.exited); ++n) {
-            w.budget = 255 - n;   // (the tier's chain: the calls this turn has left after this one)
-            if (step_warp(blk, w)) {
-              progress = true;
-              n += static_cast<int>(w.extra);
-              w.extra = 0;
-              if (w.yield) break;
-            } else {
-              break;
-            }
-          }
+          if (tier_) turn<true>(blk, w, 256, progress);
+          else turn<false>(blk, w, 256, progress);
           w.yield = false;
         }
       if (live && !progress) {
@@ -1199,15 +1206,8 @@ void Runner::run_block(Block& blk) {
     for (Warp& w : blk.warps) {
       if (!(w.alive & ~w.exited)) continue;
       live = true;
-      for (int n = 0; n < 4096; ++n) {
-        if (!(w.alive & ~w.exited)) break;
-        w.budget = 4095 - n;   // (the tier's chain: the calls this turn has left after this one)
-        if (!step_warp(blk, w)) break;
-        progress = true;
-        n += static_cast<int>(w.extra);
-        w.extra = 0;
-        if (w.yield) break;
-      }
+      if (tier_) turn<true>(blk, w, 4096, progress);
+      else turn<false>(blk, w, 4096, progress);
       if (!w.yield) w.spin_yields = 0;
       w.yield = false;
     }
@@ -1251,15 +1251,8 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
       for (Warp& w : blk.warps) {
         if (!(w.alive & ~w.exited)) continue;
         live = true;
-        for (int n = 0; n < 4096; ++n) {
-          if (!(w.alive & ~w.exited)) break;
-          w.budget = 4095 - n;
-          if (!step_warp(blk, w)) break;
-          progress = true;
-          n += static_cast<int>(w.extra);
-          w.extra = 0;
-          if (w.yield) break;
-        }
+        if (tier_) turn<true>(blk, w, 4096, progress);
+        else turn<false>(blk, w, 4096, progress);
         if (!w.yield) w.spin_yields = 0;
         w.yield = false;
       }
@@ -1507,7 +1500,7 @@ bool compute_straight(const Instr& ins) {
 }
 
 // Mask of the group's lanes whose guard predicate holds.
-[[gnu::always_inline]] inline Mask guard_mask(const Warp& w, const Instr& ins, Mask group) {
+Mask guard_mask(const Warp& w, const Instr& ins, Mask group) {
   if (ins.guard == kPT && !ins.guard_not) return group;
   Mask g;
   if (ins.guard_uniform) g = (ins.guard == kPT || w.up[ins.guard]) ? kAll : 0;

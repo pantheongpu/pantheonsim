@@ -1500,6 +1500,16 @@ void tier_add_total(uint64_t n) { tier_stats().total.fetch_add(n, std::memory_or
 // applies (no ws_held, no slice, no give-way, no forced mask) and every runnable lane stands at one address inside this section,
 // that work is: group = the runnable lanes, pick = their address, nothing else changed. Then the next call would start exactly
 // where this loop is, and the loop goes on instead of returning, crediting the caller with the call it saved.
+// guard_mask, inlined into the tier's run loop (the interpreter's copy is a call, which its own loop does not mind).
+[[gnu::always_inline]] inline Mask tier_guard(const Warp& w, const Instr& ins, Mask group) {
+  if (ins.guard == kPT && !ins.guard_not) return group;
+  Mask g;
+  if (ins.guard_uniform) g = (ins.guard == kPT || w.up[ins.guard]) ? kAll : 0;
+  else g = ins.guard == kPT ? kAll : w.p[ins.guard];
+  if (ins.guard_not) g = ~g;
+  return group & g;
+}
+
 // The lanes of `group` get program counter `v` (a whole warp: 32 stores the compiler turns into vector ones).
 inline void tier_set_pcs(Warp& w, Mask group, uint64_t v) {
   if (group == kAll) {
@@ -1614,7 +1624,7 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
       cur = &op;
       if (n < 256 && idx + 1 < count && op.straight) {
         if ((op.fn && (regs_ok || op.maxreg <= w.nregs)) || op.never) {
-          const Mask ex = op.unguarded ? group : guard_mask(w, *op.ins, group);
+          const Mask ex = op.unguarded ? group : tier_guard(w, *op.ins, group);
           const unsigned lanes = ex == group ? glanes : popc(ex);
           ++st.instructions;
           st.thread_instructions += lanes;
@@ -1637,7 +1647,7 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
       // exec_control's BRA for a fixed target: the lanes that take it go there, the others on to the next instruction; a condition
       // predicate beside the guard narrows the lanes that take it (with_condition); a group that branches backwards while other
       // lanes wait gives way now and then. Counted as execute() counts it (a branch is divergent when the guard splits the group).
-      const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+      const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
       Mask take = ex;
       if (last.aux) {
         take &= tier_pmask(c, last.p);
@@ -1667,7 +1677,7 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::BRA)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.fn && !last.straight && (regs_ok || last.maxreg <= w.nregs)) {
       // PLOP3, S2R, SEL, SHFL, VOTE: a handler, and the next address (execute() advances the group when nothing set the counters).
-      const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+      const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
       const unsigned lanes = ex == group ? glanes : popc(ex);
       ++st.instructions;
       st.thread_instructions += lanes;
@@ -1678,7 +1688,7 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(last.ins->op)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Bssy || last.form == tier::Form::Nop) {
       // These leave the program counters to execute()'s advance: every lane of the group goes on to the next address.
-      const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+      const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
       const unsigned lanes = ex == group ? glanes : popc(ex);
       ++st.instructions;
       st.thread_instructions += lanes;
@@ -1692,7 +1702,7 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(last.ins->op)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Yield) {
       // exec_control's YIELD: the group that yielded gives way (the lowest address's group is the one that ran), whatever its guard says.
-      const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+      const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
       const unsigned lanes = ex == group ? glanes : popc(ex);
       ++st.instructions;
       st.thread_instructions += lanes;
@@ -1710,7 +1720,7 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
       // exec_control's EXIT when nothing waits for it: no lane waits at a BSYNC or a WARPSYNC and no block barrier has an arrival, so
       // the releases it runs for the lanes that leave (every convergence barrier, the warp-sync sets, every block barrier) have
       // nothing to release. (With a waiting lane, or a barrier part way, the interpreter runs it.)
-      const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+      const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
       const unsigned lanes = ex == group ? glanes : popc(ex);
       ++st.instructions;
       st.thread_instructions += lanes;
@@ -1727,7 +1737,7 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
     } else if (last.form == tier::Form::Bar) {
       // exec_control's BAR: the threads that run it arrive (counted: per thread, or 32 for a warp when the barrier has a thread count);
       // BAR.SYNC and BAR.RED make them wait here, BAR.ARV lets them go on; the lanes that do not run it go on. Then the release.
-      const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+      const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
       const unsigned lanes = ex == group ? glanes : popc(ex);
       ++st.instructions;
       st.thread_instructions += lanes;
@@ -1767,7 +1777,7 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
     } else if (last.form == tier::Form::Bsync) {
       // exec_control's BSYNC: the lanes that run it wait at the barrier (at this address, until released), the others of the group
       // go on; then the barrier is released if all its lanes have arrived.
-      const Mask ex = last.unguarded ? group : guard_mask(w, *last.ins, group);
+      const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
       const unsigned lanes = ex == group ? glanes : popc(ex);
       ++st.instructions;
       st.thread_instructions += lanes;
