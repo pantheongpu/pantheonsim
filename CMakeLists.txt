@@ -1311,6 +1311,8 @@ target_compile_definitions(test_h264_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 # The host matrix product behind cuBLAS and cuBLASLt, bit for bit against the plain loops it replaced.
 vgpu_unit_test(test_host_gemm nvidia/tests/unit/test_host_gemm.cpp)
 vgpu_unit_test(test_host_trsm nvidia/tests/unit/test_host_trsm.cpp)
+# The Jacobi sweeps behind cuSOLVER's real eigen- and singular value solvers, likewise.
+vgpu_unit_test(test_host_jacobi nvidia/tests/unit/test_host_jacobi.cpp)
 # The host convolution behind cuDNN and the host FFT behind cuFFT, likewise.
 vgpu_unit_test(test_host_conv nvidia/tests/unit/test_host_conv.cpp)
 vgpu_unit_test(test_host_fft nvidia/tests/unit/test_host_fft.cpp)

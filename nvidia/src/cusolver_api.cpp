@@ -40,6 +40,7 @@
 #include "capture_defer.hpp"
 #include "complex_linalg.hpp"
 #include "host_dense.hpp"
+#include "host_jacobi.hpp"
 
 // Every read and write of device memory below is the commit point of a call made on a capturing stream
 // (capture_defer.hpp).
@@ -155,44 +156,14 @@ thread_local int tl_sweeps = 0;
 thread_local double tl_residual = 0;
 
 // Cyclic Jacobi for the symmetric eigenproblem. Eigenvalues come back ascending
-// with their vectors, matching LAPACK's syevd.
+// with their vectors, matching LAPACK's syevd. The sweeps are host_jacobi.hpp's
+// (the plain loops, or the same arithmetic in the same order on vector lanes).
 void syev(std::vector<double>& a, int n, std::vector<double>* w, std::vector<double>* vecs) {
   auto A = [&](int r, int c) -> double& { return a[(size_t)c * n + r]; };
   vecs->assign((size_t)n * n, 0.0);
   auto V = [&](int r, int c) -> double& { return (*vecs)[(size_t)c * n + r]; };
   for (int i = 0; i < n; ++i) V(i, i) = 1.0;
-  tl_sweeps = 0;
-  for (int sweep = 0; sweep < 100; ++sweep) {
-    double off = 0.0;
-    for (int p = 0; p < n; ++p)
-      for (int q = p + 1; q < n; ++q) off += A(p, q) * A(p, q);
-    tl_residual = std::sqrt(2 * off);
-    if (off <= 1e-30) break;
-    ++tl_sweeps;
-    for (int p = 0; p < n; ++p)
-      for (int q = p + 1; q < n; ++q) {
-        if (std::fabs(A(p, q)) < 1e-300) continue;
-        const double theta = (A(q, q) - A(p, p)) / (2.0 * A(p, q));
-        const double t = (theta >= 0 ? 1.0 : -1.0) /
-                         (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
-        const double c = 1.0 / std::sqrt(t * t + 1.0), s = t * c;
-        for (int i = 0; i < n; ++i) {
-          const double aip = A(i, p), aiq = A(i, q);
-          A(i, p) = c * aip - s * aiq;
-          A(i, q) = s * aip + c * aiq;
-        }
-        for (int i = 0; i < n; ++i) {
-          const double api = A(p, i), aqi = A(q, i);
-          A(p, i) = c * api - s * aqi;
-          A(q, i) = s * api + c * aqi;
-        }
-        for (int i = 0; i < n; ++i) {
-          const double vip = V(i, p), viq = V(i, q);
-          V(i, p) = c * vip - s * viq;
-          V(i, q) = s * vip + c * viq;
-        }
-      }
-  }
+  tl_sweeps = vgpu::hostjac::syev_sweeps(a.data(), vecs->data(), n, &tl_residual);
   std::vector<int> order(n);
   for (int i = 0; i < n; ++i) order[i] = i;
   std::sort(order.begin(), order.end(), [&](int x, int y) { return A(x, x) < A(y, y); });
@@ -212,41 +183,7 @@ void svd(std::vector<double>& a, int m, int n, std::vector<double>* s, std::vect
   v->assign((size_t)n * n, 0.0);
   auto V = [&](int r, int c) -> double& { return (*v)[(size_t)c * n + r]; };
   for (int i = 0; i < n; ++i) V(i, i) = 1.0;
-  tl_sweeps = 0;
-  tl_residual = 0;
-  for (int sweep = 0; sweep < 60; ++sweep) {
-    double worst = 0.0, off = 0.0;
-    ++tl_sweeps;
-    for (int p = 0; p < n; ++p)
-      for (int q = p + 1; q < n; ++q) {
-        double app = 0, aqq = 0, apq = 0;
-        for (int i = 0; i < m; ++i) {
-          app += A(i, p) * A(i, p);
-          aqq += A(i, q) * A(i, q);
-          apq += A(i, p) * A(i, q);
-        }
-        if (app == 0.0 || aqq == 0.0) continue;
-        worst = std::max(worst, std::fabs(apq) / std::sqrt(app * aqq));
-        off += apq * apq;
-        if (std::fabs(apq) <= 1e-15 * std::sqrt(app * aqq)) continue;
-        const double theta = (aqq - app) / (2.0 * apq);
-        const double t = (theta >= 0 ? 1.0 : -1.0) /
-                         (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
-        const double c = 1.0 / std::sqrt(t * t + 1.0), sn = t * c;
-        for (int i = 0; i < m; ++i) {
-          const double aip = A(i, p), aiq = A(i, q);
-          A(i, p) = c * aip - sn * aiq;
-          A(i, q) = sn * aip + c * aiq;
-        }
-        for (int i = 0; i < n; ++i) {
-          const double vip = V(i, p), viq = V(i, q);
-          V(i, p) = c * vip - sn * viq;
-          V(i, q) = sn * vip + c * viq;
-        }
-      }
-    tl_residual = std::sqrt(2 * off);
-    if (worst < 1e-14) break;
-  }
+  tl_sweeps = vgpu::hostjac::svd_sweeps(a.data(), v->data(), m, n, &tl_residual);
   s->assign(n, 0.0);
   for (int c = 0; c < n; ++c) {
     double norm = 0.0;
