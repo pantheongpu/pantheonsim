@@ -637,11 +637,6 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
       m.a = ins.f[0];   // 0 S64, 1 U64, 2 S32, 3 U32
       m.aux = static_cast<uint8_t>((ins.f[1] ? 1 : 0) | (ins.f[2] ? 2 : 0) | (ins.f[3] ? 4 : 0));   // wrap, right, hi
-      {
-        // The handler's specialisation (tier_ops.inc kShf): right 16, signed 8, hi 4, wrap 2, 64-bit 1.
-        const bool right = ins.f[2], sgn = ins.f[0] == 0 || ins.f[0] == 2, is64 = ins.f[0] < 2;
-        m.b = (right ? 16u : 0u) | (right && sgn ? 8u : 0u) | (ins.f[3] ? 4u : 0u) | (ins.f[1] ? 2u : 0u) | (is64 ? 1u : 0u);
-      }
       accept(Form::Shf);
       return;
     }

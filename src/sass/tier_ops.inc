@@ -106,12 +106,8 @@ inline Mask tier_combine(unsigned bop, Mask r, Mask acc) { return bop == 0 ? (r 
 inline void tier_store(const TCtx& c, uint16_t dst, Mask ex, const uint32_t* r) {
   if (dst == tier::kNoReg) return;
   uint32_t* d = c.R + dst * 32u;
-  if (ex == kAll) {
-    std::memmove(d, r, 32 * sizeof(uint32_t));
-  } else {
-    for (unsigned l = 0; l < 32; ++l)
-      if ((ex >> l) & 1) d[l] = r[l];
-  }
+  if (ex == kAll) std::memmove(d, r, 32 * sizeof(uint32_t));
+  else c.sk->blend_m(d, r, ex);   // the executing lanes only, without a branch per lane
 }
 
 // ---- handlers ---------------------------------------------------------------------------------
@@ -200,39 +196,13 @@ TIER_HANDLER(h_lea) {
   if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
 }
 
-// A funnel shift of (top:lo) by n, as the interpreter computes it, one loop for each way the instruction can be set:
-// right or left, arithmetic or logical, the high or the low word of the result, a count taken modulo the width or clamped
-// to it, over 32 or 64 bits (W). The same operations lane by lane; only what is decided once per instruction is out of the loop.
-template <bool Right, bool Sgn, bool Hi, bool Wrap, unsigned W>
-static void shf_rows(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* top) {
-  for (unsigned l = 0; l < 32; ++l) {
-    const uint64_t v = lo[l] | (static_cast<uint64_t>(top[l]) << 32);
-    const uint32_t k = Wrap ? (n[l] & (W - 1)) : std::min(n[l], W);
-    uint64_t x;
-    if constexpr (!Right) x = k >= 64 ? 0 : v << k;
-    else if constexpr (Sgn) x = static_cast<uint64_t>(static_cast<int64_t>(v) >> std::min(k, 63u));
-    else x = k >= 64 ? 0 : v >> k;
-    r[l] = static_cast<uint32_t>(Hi ? x >> 32 : x);
-  }
-}
-using ShfRows = void (*)(uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*);
-template <unsigned I>
-constexpr ShfRows shf_pick() {
-  return &shf_rows<(I & 16) != 0, (I & 8) != 0, (I & 4) != 0, (I & 2) != 0, (I & 1) ? 64u : 32u>;
-}
-template <unsigned... I>
-constexpr std::array<ShfRows, sizeof...(I)> shf_table(std::integer_sequence<unsigned, I...>) {
-  return {shf_pick<I>()...};
-}
-constexpr std::array<ShfRows, 32> kShf = shf_table(std::make_integer_sequence<unsigned, 32>{});
-
 TIER_HANDLER(h_shf) {
   TIER_PRELUDE
   alignas(32) uint32_t t[3][32], r[32];
   const uint32_t* lo = tier_src<false>(c, op.s[0], t[0]);
   const uint32_t* n = tier_src<false>(c, op.s[1], t[1]);
   const uint32_t* top = tier_src<false>(c, op.s[2], t[2]);
-  kShf[op.b](r, lo, n, top);
+  c.sk->shf(r, lo, n, top, op.a, op.aux & 1, op.aux & 2, op.aux & 4);   // type, wrap, right, hi
   tier_store(c, op.dst, ex, r);
 }
 
@@ -263,9 +233,13 @@ TIER_HANDLER(h_fsetp) {
     return f;
   };
   Mask r = 0;
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    if (float_cmp(cmp, fv(a[l], op.aux & 1, op.aux & 2), fv(b[l], op.aux & 4, op.aux & 8))) r |= Mask{1} << l;
+  if (op.aux == 0) {   // no |x| or -x: the SIMD comparison (the one the interpreter's fast path uses)
+    r = c.sk->fcmp_mask(cmp, fz, a, b) & ex;
+  } else {
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      if (float_cmp(cmp, fv(a[l], op.aux & 1, op.aux & 2), fv(b[l], op.aux & 4, op.aux & 8))) r |= Mask{1} << l;
+    }
   }
   const Mask acc = tier_pmask(c, op.p);
   tier_setp(c, op.dst, ex, tier_combine(bop, r, acc));
@@ -354,16 +328,9 @@ TIER_HANDLER(h_iadd3x) {   // exec_int's IADD3: carries out to two predicates, c
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]),
                  *d = tier_src<false>(c, op.s[2], t[2]);
   const bool x = op.aux & 1;
-  const Mask cin1 = x ? tier_pmask(c, op.p) : 0, cin2 = x ? tier_pmask(c, op.p2) : 0;
-  Mask over1 = 0, over2 = 0;
-  for (unsigned l = 0; l < 32; ++l) {
-    uint64_t sum = static_cast<uint64_t>(a[l]) + b[l] + d[l] + op.a;
-    sum += ((cin1 >> l) & 1) + ((cin2 >> l) & 1);
-    r[l] = static_cast<uint32_t>(sum);
-    const uint64_t over = sum >> 32;
-    over1 |= static_cast<Mask>(over >= 1) << l;
-    over2 |= static_cast<Mask>(over >= 2) << l;
-  }
+  uint32_t over1, over2;
+  c.sk->iadd3x(r, a, b, d, op.a, x ? static_cast<uint32_t>(tier_pmask(c, op.p)) : 0u,
+               x ? static_cast<uint32_t>(tier_pmask(c, op.p2)) : 0u, &over1, &over2);
   tier_store(c, op.dst, ex, r);
   if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, over1);
   if (op.c != tier::kNoReg) tier_setp(c, op.c, ex, over2);
@@ -387,25 +354,24 @@ TIER_HANDLER(h_imad32) {   // IMAD with a carry in and/or out
 
 TIER_HANDLER(h_imad_wide) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[2][32], tlo[32], thi[32], rlo[32], rhi[32];
+  alignas(32) uint32_t t[2][32], tlo[32], thi[32], rlo[32], rhi[32], mlo[32], mhi[32];
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]);
   const uint32_t *clo, *chi;
   tier_src64(c, op.s[2], tlo, thi, clo, chi);
   const uint8_t cmod = op.s[2].mod;
-  const bool sgn = op.aux & 2;
-  const Mask cin = (op.aux & 1) ? tier_pmask(c, op.p) : 0;
-  Mask carry = 0;
-  for (unsigned l = 0; l < 32; ++l) {
-    const uint64_t prod = sgn ? static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(a[l])) * static_cast<int32_t>(b[l]))
-                              : static_cast<uint64_t>(a[l]) * b[l];
-    uint64_t cc = clo[l] | (static_cast<uint64_t>(chi[l]) << 32);
-    if (cmod & tier::kNeg) cc = 0 - cc;
-    if (cmod & tier::kNot) cc = ~cc;
-    const unsigned __int128 full = static_cast<unsigned __int128>(prod) + cc + ((cin >> l) & 1);
-    rlo[l] = static_cast<uint32_t>(full);
-    rhi[l] = static_cast<uint32_t>(static_cast<uint64_t>(full) >> 32);
-    carry |= static_cast<Mask>((full >> 64) != 0) << l;
+  if (cmod) {   // -x and ~x of the 64-bit addend, lane by lane, into rows of their own
+    for (unsigned l = 0; l < 32; ++l) {
+      uint64_t cc = clo[l] | (static_cast<uint64_t>(chi[l]) << 32);
+      if (cmod & tier::kNeg) cc = 0 - cc;
+      if (cmod & tier::kNot) cc = ~cc;
+      mlo[l] = static_cast<uint32_t>(cc);
+      mhi[l] = static_cast<uint32_t>(cc >> 32);
+    }
+    clo = mlo;
+    chi = mhi;
   }
+  uint32_t carry;
+  c.sk->imad_wide(rlo, rhi, a, b, clo, chi, (op.aux & 2) != 0, (op.aux & 1) ? static_cast<uint32_t>(tier_pmask(c, op.p)) : 0u, &carry);
   if (op.dst != tier::kNoReg) {   // write64: R254's partner is RZ
     tier_store(c, op.dst, ex, rlo);
     if (op.dst + 1u != kRZ) tier_store(c, static_cast<uint16_t>(op.dst + 1), ex, rhi);
@@ -460,20 +426,14 @@ TIER_HANDLER(h_isetp_ex) {   // the high words of a 64-bit compare; the low word
 TIER_HANDLER(h_popc) {
   TIER_PRELUDE
   alignas(32) uint32_t t[32], r[32];
-  const uint32_t* a = tier_src<false>(c, op.s[0], t);
-  for (unsigned l = 0; l < 32; ++l) r[l] = popc(a[l]);
+  c.sk->lane_unary(0, r, tier_src<false>(c, op.s[0], t));   // the number of set bits
   tier_store(c, op.dst, ex, r);
 }
 
 TIER_HANDLER(h_i2fp) {
   TIER_PRELUDE
   alignas(32) uint32_t t[32], r[32];
-  const uint32_t* a = tier_src<false>(c, op.s[0], t);
-  const bool sgn = op.c != 0;
-  for (unsigned l = 0; l < 32; ++l) {
-    const int64_t sv = sgn ? static_cast<int64_t>(static_cast<int32_t>(a[l])) : static_cast<int64_t>(uint64_t{a[l]} & 0xffffffff);
-    r[l] = f32_bits(static_cast<float>(sv));
-  }
+  c.sk->i2f(op.c != 0, r, tier_src<false>(c, op.s[0], t));
   tier_store(c, op.dst, ex, r);
 }
 
@@ -740,7 +700,9 @@ TIER_HANDLER(h_prmt) {
   alignas(32) uint32_t t[3][32], r[32];
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *sel = tier_src<false>(c, op.s[1], t[1]),
                  *bb = tier_src<false>(c, op.s[2], t[2]);
-  for (unsigned l = 0; l < 32; ++l) r[l] = prmt(a[l], bb[l], sel[l], op.a);
+  if (op.a == 0) c.sk->prmt0(r, a, bb, sel);
+  else
+    for (unsigned l = 0; l < 32; ++l) r[l] = prmt(a[l], bb[l], sel[l], op.a);
   tier_store(c, op.dst, ex, r);
 }
 
