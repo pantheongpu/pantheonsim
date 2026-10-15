@@ -12,7 +12,7 @@ each: "ok <name>", or "FAIL <name>: <why>".
 
 fp8 matrix products (gfx942's fnuz formats and gfx950's OCP ones) and MX-scaled
 products (gfx950) run on the devices that have them, so the number of lines
-depends on the device: 18, and 2 more on gfx942, 3 more on gfx950.
+depends on the device: 18, and 2 more on gfx942, 6 more on gfx950.
 """
 import torch
 import triton
@@ -268,6 +268,49 @@ def scaled_dot():
     return close(c, a.float() @ b.float(), 0.05)
 
 
+@triton.jit
+def mx_kernel(a, a_scale, b, b_scale, c, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, KA: tl.constexpr,
+              KB: tl.constexpr, FA: tl.constexpr, FB: tl.constexpr):
+    rm, rn, rka, rkb, rs = tl.arange(0, M), tl.arange(0, N), tl.arange(0, KA), tl.arange(0, KB), tl.arange(0, K // 32)
+    A = tl.load(a + rm[:, None] * KA + rka[None, :])
+    B = tl.load(b + rkb[:, None] * N + rn[None, :])
+    As = tl.load(a_scale + rm[:, None] * (K // 32) + rs[None, :])
+    Bs = tl.load(b_scale + rn[:, None] * (K // 32) + rs[None, :])
+    tl.store(c + rm[:, None] * N + rn[None, :], tl.dot_scaled(A, As, FA, B, Bs, FB))
+
+
+E2M1 = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6])
+
+
+def mx_operand(fmt, rows, k):
+    """(what the kernel loads, the values it stands for) for a rows x k operand of an MX format, K packed
+    two to a byte for E2M1 (low nibble first)."""
+    if fmt == "e2m1":
+        raw = torch.randint(0, 256, (rows, k // 2), dtype=torch.uint8)
+        nibbles = torch.stack([raw & 0xF, raw >> 4], -1).flatten(-2).long()
+        return raw, torch.where(nibbles & 8 > 0, -1.0, 1.0) * E2M1[nibbles & 7]
+    x = torch.randn(rows, k).clamp(-3, 3).to({"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}[fmt])
+    return x, x.float()
+
+
+def mx_dot(fa, fb):
+    # One 32-wide block of K and E8M0 scales (2^-2 .. 2^2) of each row of A and column of B: Triton
+    # widens the operands (v_cvt_scalef32_pk_bf16_*) and multiplies in bfloat16. The reference decodes
+    # the formats here and scales on the CPU.
+    def run():
+        m = n = k = 32
+        (ra, da), (rb, db) = mx_operand(fa, m, k), mx_operand(fb, n, k)
+        rb = rb.view(n, -1).t().contiguous()   # K x N
+        sa = torch.randint(125, 130, (m, k // 32), dtype=torch.uint8)
+        sb = torch.randint(125, 130, (n, k // 32), dtype=torch.uint8)
+        c = torch.empty(m, n, device=dev)
+        mx_kernel[(1,)](ra.to(dev), sa.to(dev), rb.to(dev), sb.to(dev), c, m, n, k, ra.shape[1], rb.shape[0], fa, fb)
+        want = (da * torch.pow(2.0, sa.float() - 127).repeat_interleave(32, 1)) @ \
+               (db * torch.pow(2.0, sb.float() - 127).repeat_interleave(32, 1)).t()
+        return close(c, want, 0.1)
+    return run
+
+
 check("a flash-attention loop, 4 warps and 2 stages", attention(4, 2))
 check("a flash-attention loop, 8 warps and 3 stages", attention(8, 3))
 check("a flash-attention loop, one warp", attention(1, 1))
@@ -282,6 +325,8 @@ for name, dtype in {"gfx942": [("e4m3fnuz", torch.float8_e4m3fnuz), ("e5m2fnuz",
     check(f"tl.dot of fp8 {name}", dot(dtype, tl.float32, 32, 32, 32, tol=0.05, gen=small_floats))
 if arch == "gfx950":
     check("tl.dot_scaled of fp8 with E8M0 scales", scaled_dot)
+    for fa, fb in [("e2m1", "e2m1"), ("e4m3", "e2m1"), ("e5m2", "e5m2")]:
+        check(f"tl.dot_scaled of {fa} by {fb}, one scale block of K", mx_dot(fa, fb))
 check("sum, max, argmax, cumsum, sort and histogram", reductions)
 check("atomic add (fp32, fp16, int32) and max", atomics)
 check("exp, log, sqrt, trigonometry, erf, tanh and libdevice pow", maths)

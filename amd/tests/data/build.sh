@@ -54,7 +54,7 @@ for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atom
 done
 
 # And for gfx950, for what only it has (test_amd_gcn_asm).
-for src in asm_lds_dma asm_ds_tr asm_buffer_lds asm_minmax3; do
+for src in asm_lds_dma asm_ds_tr asm_buffer_lds asm_minmax3 asm_scalef32; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -c "$src.s" -o "$src.gfx950.o"
   echo "wrote $(pwd)/$src.gfx950.o"
 done

@@ -423,6 +423,61 @@ VTEST(three_way_ieee_minimum_and_maximum_on_gfx950) {
   VCHECK_EQ(wrong, 0);
 }
 
+// gfx950's V_CVT_SCALEF32_PK_BF16_{FP4,FP8,BF8}: two small floats of SRC0 (FP4: the byte OPSEL[1:0] names, low nibble
+// first; FP8, BF8: the 16-bit half OPSEL[0] names, low byte first), each times 2^(exponent(S1) - 127), as bfloat16.
+// The small floats are decoded here from the formats' tables (CDNA4 ISA, Table 30: E2M1, E4M3 with no infinity and its
+// NaN at S.1111.111, E5M2 with infinity and NaN).
+VTEST(scaled_conversions_of_small_floats_to_bfloat16_on_gfx950) {
+  const amd::CodeObject o = object("asm_scalef32", "gfx950");
+  const auto fp4 = [](uint32_t n) {
+    static const double v[8] = {0, 0.5, 1, 1.5, 2, 3, 4, 6};
+    return (n & 8 ? -1.0 : 1.0) * v[n & 7];
+  };
+  const auto fp8 = [](uint32_t b, int e_bits, int m_bits, int bias, bool e4m3) {
+    const uint32_t m = b & ((1u << m_bits) - 1), e = (b >> m_bits) & ((1u << e_bits) - 1);
+    const double sign = b & 0x80 ? -1.0 : 1.0;
+    if (e4m3 ? (e == 15 && m == 7) : (e == 31 && m != 0)) return std::numeric_limits<double>::quiet_NaN();
+    if (!e4m3 && e == 31) return sign * std::numeric_limits<double>::infinity();
+    if (e == 0) return sign * std::ldexp(static_cast<double>(m), 1 - bias - m_bits);
+    return sign * std::ldexp(1.0 + static_cast<double>(m) / (1 << m_bits), static_cast<int>(e) - bias);
+  };
+  const auto bf16 = [](double d) -> uint32_t {   // to nearest even
+    const float f = static_cast<float>(d);
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    if (std::isnan(f)) return 0x7FC0;
+    return (b + 0x7FFF + ((b >> 16) & 1)) >> 16;
+  };
+  std::vector<uint32_t> in(128);
+  uint32_t seed = 4242;
+  const auto next = [&]() { seed = seed * 1103515245u + 12345u; return seed >> 8; };
+  for (uint32_t l = 0; l < 64; ++l) {
+    in[l] = next() << 16 ^ next();
+    in[64 + l] = (100 + l % 50) << 23 | (next() & 0x7FFFFF);   // the mantissa is not read
+  }
+  MemoryManager mem(16ull << 20);
+  const uint64_t in_addr = mem.alloc(128 * 4), out_addr = mem.alloc(512 * 4);
+  mem.write(in_addr, in.data(), 128 * 4);
+  const std::vector<uint32_t> r = run(o, "scalef32", mem, out_addr, 512, {in_addr, out_addr});
+  int wrong = 0, nans = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const double scale = std::ldexp(1.0, static_cast<int>((in[64 + l] >> 23) & 0xFF) - 127);
+    for (uint32_t k = 0; k < 8; ++k) {   // the eight outputs: fp4 x4, fp8 x2, bf8 x2
+      for (uint32_t half = 0; half < 2; ++half) {
+        double v;
+        if (k < 4) v = fp4((in[l] >> (8 * k + 4 * half)) & 0xF);
+        else v = fp8((in[l] >> (16 * (k & 1) + 8 * half)) & 0xFF, k < 6 ? 4 : 5, k < 6 ? 3 : 2, k < 6 ? 7 : 15, k < 6);
+        const uint32_t want = bf16(v * scale), got = (r[64 * k + l] >> (16 * half)) & 0xFFFF;
+        const bool want_nan = std::isnan(v), got_nan = (got & 0x7F80) == 0x7F80 && (got & 0x7F);
+        nans += want_nan;
+        wrong += want_nan ? !got_nan : got != want;
+      }
+    }
+  }
+  VCHECK_EQ(wrong, 0);
+  VCHECK(nans > 0);   // the random bytes include NaNs of the 8-bit formats
+}
+
 // The buffer loads with the LDS bit (CDNA3 and CDNA4 ISA 9.1.9): lane L's data is read from
 //   mem_offset + inst_offset + off_vgpr  (off_vgpr = 16 L here)
 // of a 640-byte resource (zero where that lies past its end) and written to
