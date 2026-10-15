@@ -179,6 +179,14 @@ TIER_HANDLER(h_lea) {
   const uint32_t* b = tier_src<false>(c, op.s[1], t[1]);
   const uint32_t* top = three ? tier_src<false>(c, op.s[2], t[2]) : nullptr;
   Mask carry = 0;
+  if (!hi && !x && !bneg) {   // the usual one, (a << s) + b: two vector operations, and the carry out is a wrap
+    for (unsigned l = 0; l < 32; ++l) r[l] = (sh >= 32 ? 0 : a[l] << sh) + b[l];
+    if (op.dst2 != tier::kNoReg)
+      for (unsigned l = 0; l < 32; ++l) carry |= static_cast<Mask>(r[l] < (sh >= 32 ? 0 : a[l] << sh)) << l;
+    tier_store(c, op.dst, ex, r);
+    if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
+    return;
+  }
   for (unsigned l = 0; l < 32; ++l) {
     uint32_t shifted;
     if (!hi) {
