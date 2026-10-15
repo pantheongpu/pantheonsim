@@ -107,11 +107,17 @@ build() {
         { sed '/add_subdirectory(Samples)/d' CMakeLists.txt.all
           entries | cut -d'|' -f1 | xargs -n1 dirname | sort -u | sed 's/.*/add_subdirectory(&)/'; } > CMakeLists.txt
       fi
+      # --allow-shlib-undefined: the C++ samples that link cuSPARSE or cuSOLVER (conjugateGradient, cuSolver*)
+      # name the toolkit's libcusparse.so and libcusolver.so by path, and GNU ld then asks that those libraries'
+      # own dependency, libnvJitLink.so.13, can be found; where nvJitLink is not installed (a toolchain image
+      # without libnvjitlink-13-0) the link fails on its symbols. Nothing here runs against NVIDIA's libraries:
+      # the simulator's stand in for them by soname when the samples run.
       # The nvcc on PATH, named: CMake otherwise finds /usr/bin/nvcc first where
       # Ubuntu's CUDA 12.0 is installed too (the pantheonsim.com runner).
       cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 \
         -DCMAKE_CUDA_COMPILER="$(command -v nvcc)" \
-        -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared > build-configure.log 2>&1 || { tail -30 build-configure.log; exit 1; }
+        -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" > build-configure.log 2>&1 || { tail -30 build-configure.log; exit 1; }
       targets=$(entries | cut -d'|' -f1 | xargs -n1 basename)
       # -k 0: one sample that fails to build is reported by `run`, not fatal here;
       # what failed, and the errors it gave, go in this job's log.
