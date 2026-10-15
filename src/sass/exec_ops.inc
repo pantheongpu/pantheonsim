@@ -258,6 +258,14 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
 // ---- integer ------------------------------------------------------------------
 
 namespace {
+// 32 lanes of zero and of all ones, for comparing a result against.
+constexpr std::array<uint32_t, 32> make_ones32() {
+  std::array<uint32_t, 32> a{};
+  for (uint32_t& v : a) v = ~0u;
+  return a;
+}
+constexpr std::array<uint32_t, 32> kZeros32{};
+constexpr std::array<uint32_t, 32> kOnes32 = make_ones32();
 uint32_t lop3(uint32_t a, uint32_t b, uint32_t c, uint32_t lut) {
   uint32_t r = 0;
   for (int i = 0; i < 8; ++i)
@@ -983,6 +991,24 @@ uint16_t f64_to_bf16(double d) {
 
 // ---- fast paths -----------------------------------------------------------------
 //
+namespace {
+// The host's rounding mode set to SASS's (0 RN, 1 RM, 2 RP, 3 RZ) for the life of the object: for a kernel's arithmetic, once for the 32
+// lanes (the kernel is called through a pointer, so the compiler keeps its arithmetic between the constructor and the destructor).
+struct RoundingScope {
+  int saved;
+  explicit RoundingScope(unsigned rnd) : saved(std::fegetround()) {
+    static const int modes[] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
+    std::fesetround(modes[rnd & 3]);
+    asm volatile("" ::: "memory");
+  }
+  ~RoundingScope() {
+    asm volatile("" ::: "memory");
+    std::fesetround(saved);
+  }
+};
+
+}  // namespace
+
 // The instructions compiled kernels spend their time in -- IADD3, IMAD, LOP3,
 // MOV and the f32 FFMA/FADD/FMUL -- in their plain forms: register, RZ,
 // immediate or constant sources, a register destination, no carries, no
@@ -997,6 +1023,11 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     case Op::IADD3: case Op::IMAD: case Op::LOP3: case Op::MOV: case Op::ISETP: case Op::FSETP:
     case Op::FSEL: case Op::FFMA: case Op::FADD: case Op::FMUL: case Op::LEA: case Op::SHF:
     case Op::DADD: case Op::DMUL: case Op::DFMA: break;
+    case Op::PLOP3: case Op::SEL: case Op::POPC: case Op::BREV: case Op::FLO: return fast_wide(w, ins, ex);
+    case Op::FMNMX: case Op::MUFU: case Op::I2FP: case Op::I2F: case Op::F2I: case Op::HADD2: case Op::HMUL2: case Op::HFMA2:
+      return fast_float(w, ins, ex);
+    case Op::PRMT: return fast_wide(w, ins, ex);
+    case Op::DSETP: case Op::F2FP: return fast_float(w, ins, ex);
     default: return false;
   }
   if (ins.dst.empty()) return false;
@@ -1019,7 +1050,8 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
   if (ins.op == Op::ISETP) {
     const unsigned cmp = ins.f[0], bop = ins.f[2];
     const bool sgn = ins.f[1];
-    if (ins.f[3] || ins.f[4] || ins.dst.size() < 2 || !pdst_ok(ins.dst[0]) || !pdst_ok(ins.dst[1]) || ins.src.size() < 3)
+    if (ins.f[3]) return fast_wide(w, ins, ex);   // .EX
+    if (ins.f[4] || ins.dst.size() < 2 || !pdst_ok(ins.dst[0]) || !pdst_ok(ins.dst[1]) || ins.src.size() < 3)
       return false;
     for (int i = 0; i < 2; ++i) {
       const Operand& o = ins.src[i];
@@ -1051,6 +1083,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     return true;
   }
   if (ins.op == Op::FSETP) {
+    if (fast_float(w, ins, ex)) return true;   // the SIMD compare, if the form is one it takes
     const unsigned cmp = ins.f[0], bop = ins.f[1];
     const bool fz = ins.f[2];
     if (ins.dst.size() < 2 || !pdst_ok(ins.dst[0]) || !pdst_ok(ins.dst[1]) || ins.src.size() < 3) return false;
@@ -1084,12 +1117,14 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     // which NaN a NaN operand gives. VGPU_SIMD=off sends them down exec_float's lane loop instead.
     if (!simd::enabled()) return false;
     const unsigned nsrc = ins.op == Op::DFMA ? 3 : 2;
-    if (ins.f[0] || ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.src.size() < nsrc) return false;
+    if (ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.src.size() < nsrc) return false;
     for (unsigned i = 0; i < nsrc; ++i) {
       const Kind k = ins.src[i].kind;
       if (!(k == Kind::Reg || k == Kind::UReg || k == Kind::CBank || k == Kind::Imm || k == Kind::FImm)) return false;
     }
-    uint32_t tlo[3][32] = {}, thi[3][32] = {};   // the sources that are one value for every lane, as 32 lanes
+    // The sources that are one value for every lane, as 32 lanes (not cleared: only the ones filled below are read, and
+    // the third is not read by DADD and DMUL).
+    alignas(32) uint32_t tlo[3][32], thi[3][32];
     const uint32_t* lo[3] = {tlo[0], tlo[1], tlo[2]};
     const uint32_t* hi[3] = {thi[0], thi[1], thi[2]};
     unsigned mods = 0;   // dop_m's: bit 2i is |source i|, bit 2i + 1 is -source i
@@ -1117,8 +1152,14 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     uint32_t sink[32];   // R254's partner is RZ: its half of the result goes nowhere
     uint32_t* dlo = &w.reg(d.reg, 0);
     uint32_t* dhi = d.reg + 1 == kRZ ? sink : &w.reg(d.reg + 1, 0);
-    simd::kernels().dop_m(ins.op == Op::DADD ? 0 : ins.op == Op::DMUL ? 1 : 2, mods, dlo, dhi, lo[0], hi[0], lo[1], hi[1],
-                          lo[2], hi[2], ex);
+    if (ins.f[0]) {   // a directed rounding mode: the host's, around the call (the NaN rule is the same)
+      RoundingScope scope(ins.f[0]);
+      simd::kernels().dop_m(ins.op == Op::DADD ? 0 : ins.op == Op::DMUL ? 1 : 2, mods, dlo, dhi, lo[0], hi[0], lo[1], hi[1],
+                            lo[2], hi[2], ex);
+    } else {
+      simd::kernels().dop_m(ins.op == Op::DADD ? 0 : ins.op == Op::DMUL ? 1 : 2, mods, dlo, dhi, lo[0], hi[0], lo[1], hi[1],
+                            lo[2], hi[2], ex);
+    }
     return true;
   }
   if (ins.dst[0].kind != Kind::Reg && !(ins.op == Op::LOP3 && ins.dst.size() == 2)) return false;
@@ -1159,15 +1200,21 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
   // The lane loops below are SIMD kernels (vgpu/simd/simd.hpp) unless VGPU_SIMD=off; each gives the bits of the loop it
   // replaces, which stays as the other branch (tests/unit/test_simd.cpp).
   const simd::Kernels* const sk = simd::enabled() ? &simd::kernels() : nullptr;
-  const auto store = [&](const Operand& dst) {
-    if (dst.reg == kRZ) return;
-    uint32_t* d = &w.reg(dst.reg, 0);
+  // Register `reg`'s executing lanes from `v`: all 32 as they are, else the others kept (a masked blend).
+  const auto store_row = [&](unsigned reg, const uint32_t* v) {
+    uint32_t* d = &w.reg(reg, 0);
     if (ex == kAll) {
-      std::memcpy(d, r, sizeof r);
+      std::memcpy(d, v, 32 * sizeof(uint32_t));
+    } else if (sk) {
+      sk->blend_m(d, v, ex);
     } else {
       for (unsigned l = 0; l < 32; ++l)
-        if ((ex >> l) & 1) d[l] = r[l];
+        if ((ex >> l) & 1) d[l] = v[l];
     }
+  };
+  const auto store = [&](const Operand& dst) {
+    if (dst.reg == kRZ) return;
+    store_row(dst.reg, r);
   };
   switch (ins.op) {
     case Op::MOV: {
@@ -1178,9 +1225,10 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
       return true;
     }
     case Op::IADD3: {
-      if (ins.f[0] || ins.f[1] || ins.src.size() < 3) return false;
+      if (ins.f[1] || ins.src.size() < 3) return false;
+      if (ins.f[0]) return fast_wide(w, ins, ex);   // .X
       for (size_t i = 1; i < ins.dst.size(); ++i)   // carry-outs other than PT
-        if (!(ins.dst[i].kind == Kind::Pred && ins.dst[i].reg == kPT)) return false;
+        if (!(ins.dst[i].kind == Kind::Pred && ins.dst[i].reg == kPT)) return fast_wide(w, ins, ex);
       const uint32_t* s[3];
       for (unsigned i = 0; i < 3; ++i) {
         const Operand& o = ins.src[i];
@@ -1197,7 +1245,9 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     }
     case Op::IMAD: {
       const unsigned kind = ins.f[0];
-      if (kind == 0x25 || kind == 0x27 || ins.f[2] || ins.dst.size() > 1 || ins.src.size() < 3) return false;
+      if (kind == 0x25 || kind == 0x27) return fast_wide(w, ins, ex);   // IMAD.WIDE, IMAD.HI
+      if (ins.f[2] || ins.dst.size() > 1) return fast_wide(w, ins, ex);   // .X, a carry out
+      if (ins.src.size() < 3) return false;
       // IMAD.MOV (RZ * RZ + c) and the like: a zero factor leaves the addend.
       const auto zero = [](const Operand& o) {
         return !o.bnot && ((o.kind == Kind::Reg && o.reg == kRZ) || (o.kind == Kind::Imm && o.imm == 0));
@@ -1223,7 +1273,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     case Op::LOP3: {
       const bool has_p = ins.dst.size() > 1;
       if (has_p && (ins.dst.size() != 2 || !pdst_ok(ins.dst[0]) || ins.dst[1].kind != Kind::Reg)) return false;
-      if (ins.src.size() < 3) return false;
+      if (ins.src.size() < (has_p ? 5u : 3u)) return false;
       const uint32_t* s[3];
       for (unsigned i = 0; i < 3; ++i) {
         if (!plain(ins.src[i])) return false;
@@ -1241,10 +1291,13 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
         }
       }
       if (has_p) {
-        if (ins.src.size() < 5) return false;
         Mask pm = 0;
-        for (unsigned l = 0; l < 32; ++l)
-          if (ins.f[1] ? r[l] == kAll : r[l] != 0) pm |= Mask{1} << l;
+        if (sk) {   // the lanes whose result is not zero, or is all ones (.PAND)
+          pm = static_cast<Mask>(sk->icmp_mask(ins.f[1] ? 0 : 1, false, r, ins.f[1] ? kOnes32.data() : kZeros32.data(), 32));
+        } else {
+          for (unsigned l = 0; l < 32; ++l)
+            if (ins.f[1] ? r[l] == kAll : r[l] != 0) pm |= Mask{1} << l;
+        }
         if (!ins.f[1]) pm |= pmask(ins.src[4]);   // ORed with the predicate operand, as the general path does
         setp(ins.dst[0], pm);
       }
@@ -1265,6 +1318,31 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
       const uint32_t* b = lanes(1, ins.src[1], IntMod{ins.src[1].neg, ins.src[1].bnot, ins.src[1].neg || ins.src[1].bnot});
       const uint32_t* top = three ? lanes(2, ins.src[2], Same{}) : nullptr;
       Mask carry = 0;
+      if (sk) {
+        // The shift by the funnel-shift kernel (a left shift of the word, or of the 64-bit (top:a) with the high word kept),
+        // then the sum and its carry out by the three-way add.
+        alignas(32) uint32_t nsh[32], shifted[32], sign[32];
+        for (unsigned l = 0; l < 32; ++l) nsh[l] = sh;
+        if (!hi) {
+          sk->shf(shifted, a, nsh, kZeros32.data(), 3, false, false, false);
+        } else {
+          if (!three)
+            for (unsigned l = 0; l < 32; ++l) sign[l] = static_cast<uint32_t>(static_cast<int32_t>(a[l]) >> 31);
+          sk->shf(shifted, a, nsh, three ? top : sign, 1, false, false, true);
+        }
+        if (!x && ins.dst.size() == 1) {
+          sk->iadd3(r, shifted, b, kZeros32.data(), 0);
+        } else {
+          uint32_t g1, g2;
+          sk->iadd3x(r, shifted, b, kZeros32.data(), 0, static_cast<uint32_t>(cin), 0, &g1, &g2);
+          carry = g1;
+          // -0 is ~0 + 1: it carries out (see the general rule).
+          if (ins.src[1].neg) carry |= static_cast<Mask>(sk->icmp_mask(0, false, b, kZeros32.data(), 32));
+        }
+        store(ins.dst[0]);
+        if (ins.dst.size() == 2) setp(ins.dst[1], carry);
+        return true;
+      }
       for (unsigned l = 0; l < 32; ++l) {
         uint32_t shifted;
         if (!hi) {
@@ -1293,6 +1371,11 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
       const uint32_t* lo = lanes(0, ins.src[0], Same{});
       const uint32_t* n = lanes(1, ins.src[1], Same{});
       const uint32_t* top = lanes(2, ins.src[2], Same{});
+      if (sk) {
+        sk->shf(r, lo, n, top, type, wrap, right, hi);
+        store(ins.dst[0]);
+        return true;
+      }
       for (unsigned l = 0; l < 32; ++l) {
         const uint64_t v = lo[l] | (static_cast<uint64_t>(top[l]) << 32);
         const uint32_t k = wrap ? n[l] % width : std::min(n[l], width);
@@ -1317,6 +1400,7 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
     }
     case Op::FFMA: case Op::FADD: case Op::FMUL: {
       const unsigned nsrc = ins.op == Op::FFMA ? 3 : 2;
+      if (ins.f[0] || ins.f[1] || ins.f[2]) return fast_float(w, ins, ex);   // a rounding mode, .FTZ, .SAT
       if (ins.f[0] || ins.f[1] || ins.f[2] || (ins.op == Op::FMUL && ins.f[4] != 4) || ins.src.size() < nsrc)
         return false;
       const uint32_t* s[3];
@@ -1337,6 +1421,577 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
       else
         for (unsigned l = 0; l < 32; ++l) r[l] = out(as_f32(s[0][l]) * as_f32(s[1][l]));
       store(ins.dst[0]);
+      return true;
+    }
+    default: return false;
+  }
+}
+
+// The forms of fast_alu that take more than 32 bits or more than one predicate: IADD3 with carries in or out, IMAD.WIDE,
+// ISETP.EX, PLOP3. (Apart from fast_alu so that the plain forms keep the code they had: it is entered once per
+// instruction.) Each computes what the general rule of exec_int does, over the 32 lanes at once with the kernels of
+// vgpu/simd/simd.hpp (iadd3x, imad_wide, icmp_mask) or on the predicates' bit masks; a form not handled here returns
+// false and takes the general path. VGPU_SIMD=off sends all of them there.
+bool Runner::fast_wide(Warp& w, const Instr& ins, Mask ex) {
+  if (ins.dst.empty()) return false;
+  const auto pmask = [&](const Operand& o) -> Mask {
+    Mask v;
+    if (o.kind == Kind::UPred) v = (o.reg == kPT || w.up[o.reg]) ? kAll : 0;
+    else v = o.reg == kPT ? kAll : w.p[o.reg];
+    return o.neg ? ~v : v;
+  };
+  const auto is_pred = [](const Operand& o) { return o.kind == Kind::Pred || o.kind == Kind::UPred; };
+  const auto setp = [&](const Operand& o, Mask v) {
+    if (o.reg != kPT) w.p[o.reg] = (w.p[o.reg] & ~ex) | (v & ex);
+  };
+  const auto plain = [&](const Operand& o) {
+    return o.kind == Kind::Reg || o.kind == Kind::Imm || o.kind == Kind::FImm || o.kind == Kind::CBank ||
+           o.kind == Kind::UReg;
+  };
+  const simd::Kernels* const sk = simd::enabled() ? &simd::kernels() : nullptr;
+  // Register `reg`'s executing lanes from `v`; the others are kept.
+  const auto store_row = [&](unsigned reg, const uint32_t* v) {
+    uint32_t* d = &w.reg(reg, 0);
+    if (ex == kAll) std::memcpy(d, v, 32 * sizeof(uint32_t));
+    else sk->blend_m(d, v, ex);
+  };
+  // A source as 32 lanes: the register's own, or its value for every lane -- with the modifiers applied as ival applies them
+  // (negated, then complemented) if `mods`, else as read32 gives it.
+  alignas(32) uint32_t buf[3][32];
+  const auto lanes = [&](unsigned i, const Operand& o, bool mods = true) -> const uint32_t* {
+    const bool reg = o.kind == Kind::Reg && o.reg != kRZ;
+    const bool neg = mods && o.neg, bnot = mods && o.bnot;
+    if (reg && !neg && !bnot) return &w.reg(o.reg, 0);
+    const uint32_t* row = reg ? &w.reg(o.reg, 0) : nullptr;
+    const uint32_t one = reg || o.kind == Kind::Reg ? 0u : read32(w, o, 0);   // (RZ is zero, the rest the same for every lane)
+    const uint32_t negm = neg ? ~0u : 0u, notm = bnot ? ~0u : 0u;
+    uint32_t* const out = buf[i];
+    for (unsigned l = 0; l < 32; ++l) {
+      const uint32_t v = row ? row[l] : one;
+      out[l] = (((0u - v) & negm) | (v & ~negm)) ^ notm;   // -v where negated
+    }
+    return out;
+  };
+  switch (ins.op) {
+    case Op::SEL: {   // a where the predicate holds, else b (the 32-bit form)
+      if (!sk || ins.f[0] || ins.dst[0].kind != Kind::Reg || ins.src.size() < 3 || !plain(ins.src[0]) || !plain(ins.src[1]) ||
+          !is_pred(ins.src[2]))
+        return false;
+      const uint32_t* a = lanes(0, ins.src[0], false);
+      const uint32_t* b = lanes(1, ins.src[1], false);
+      alignas(32) uint32_t r[32];
+      std::memcpy(r, b, sizeof r);
+      sk->blend_m(r, a, pmask(ins.src[2]));
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::PRMT: {
+      // Byte permute: Rd = bytes of (Rc : Ra) picked by the nibbles of Rb. The default mode is a SIMD kernel, the other modes the
+      // executor's rule lane by lane (without the operand reads of the general path).
+      if (!sk || ins.src.size() < 3 || ins.dst.size() != 1 || ins.dst[0].kind != Kind::Reg || !plain(ins.src[0]) ||
+          !plain(ins.src[1]) || !plain(ins.src[2]))
+        return false;
+      const uint32_t* a = lanes(0, ins.src[0], false);
+      const uint32_t* sel = lanes(1, ins.src[1], false);
+      const uint32_t* b = lanes(2, ins.src[2], false);
+      alignas(32) uint32_t r[32];
+      if (ins.f[0] == 0) {
+        sk->prmt0(r, a, b, sel);
+      } else {
+        for (unsigned l = 0; l < 32; ++l) r[l] = prmt(a[l], b[l], sel[l], ins.f[0]);
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::POPC: case Op::BREV: case Op::FLO: {
+      // The population count, the bit reversal, the index of the highest set bit: POPC and FLO take their operand as ival
+      // gives it (negated or complemented), BREV as it is.
+      const Operand& d = ins.dst.back();
+      if (!sk || ins.src.empty() || !plain(ins.src[0]) || d.kind != Kind::Reg || (ins.op != Op::FLO && ins.dst.size() != 1))
+        return false;
+      const unsigned kind = ins.op == Op::POPC ? 0 : ins.op == Op::BREV ? 1 : 2 + (ins.f[0] ? 1u : 0u) + (ins.f[1] ? 2u : 0u);
+      const uint32_t* a = lanes(0, ins.src[0], ins.op != Op::BREV);
+      alignas(32) uint32_t r[32];
+      sk->lane_unary(kind, r, a);
+      if (d.reg != kRZ) store_row(d.reg, r);
+      return true;
+    }
+    case Op::PLOP3: {
+      // Two predicates from a truth table over three: the lanes as bit masks, one minterm of the table at a time. Both
+      // answers are worked out before either is written (a destination may be a source).
+      if (ins.f[2] || ins.dst.size() < 2 || ins.src.size() < 3 || ins.dst[0].kind != Kind::Pred || ins.dst[1].kind != Kind::Pred)
+        return false;
+      Mask in[3];
+      for (int i = 0; i < 3; ++i) {
+        if (!is_pred(ins.src[i])) return false;
+        in[i] = pmask(ins.src[i]);
+      }
+      Mask r0 = 0, r1 = 0;
+      for (unsigned t = 0; t < 8; ++t) {
+        const bool b0 = (ins.f[0] >> t) & 1, b1 = (ins.f[1] >> t) & 1;
+        if (!b0 && !b1) continue;
+        const Mask term = ((t & 4) ? in[0] : ~in[0]) & ((t & 2) ? in[1] : ~in[1]) & ((t & 1) ? in[2] : ~in[2]);
+        if (b0) r0 |= term;
+        if (b1) r1 |= term;
+      }
+      setp(ins.dst[0], r0);
+      setp(ins.dst[1], r1);
+      return true;
+    }
+    case Op::ISETP: {
+      // .EX: the high words of a 64-bit compare; the low words' answer is the predicate in src[3]. Where the high words are
+      // equal the answer is the low words'; where they differ it is the high words' own compare (for == that is false,
+      // for != true, so the rule needs no case of its own).
+      const unsigned cmp = ins.f[0], bop = ins.f[2];
+      const bool sgn = ins.f[1];
+      if (!sk || !ins.f[3] || ins.f[4] || cmp < 1 || cmp > 6 || ins.dst.size() < 2 || ins.dst[0].kind != Kind::Pred ||
+          ins.dst[1].kind != Kind::Pred || ins.src.size() < 4 || !is_pred(ins.src[2]) || !is_pred(ins.src[3]))
+        return false;
+      for (int i = 0; i < 2; ++i) {
+        const Operand& o = ins.src[i];
+        if (!(o.kind == Kind::Reg || o.kind == Kind::Imm || o.kind == Kind::CBank || o.kind == Kind::UReg)) return false;
+      }
+      alignas(32) uint32_t tmp[2][32];
+      const auto src32 = [&](const Operand& o, uint32_t* t) -> const uint32_t* {
+        if (o.kind == Kind::Reg && o.reg != kRZ) return &w.reg(o.reg, 0);
+        const uint32_t v = read32(w, o, 0);
+        for (unsigned l = 0; l < 32; ++l) t[l] = v;
+        return t;
+      };
+      static const unsigned kIntCmp[] = {0, 2, 0, 3, 4, 1, 5};   // simd::IntCmp of cmp 1..6: Lt Eq Le Gt Ne Ge
+      const uint32_t* const sa = src32(ins.src[0], tmp[0]);
+      const uint32_t* const sb = src32(ins.src[1], tmp[1]);
+      const Mask hi = static_cast<Mask>(sk->icmp_mask(kIntCmp[cmp], sgn, sa, sb, 32));
+      const Mask eq = static_cast<Mask>(sk->icmp_mask(0, sgn, sa, sb, 32));
+      const Mask r = (eq & pmask(ins.src[3])) | (~eq & hi);
+      const Mask acc = pmask(ins.src[2]);
+      const auto combine = [](unsigned b, Mask x, Mask a) -> Mask { return b == 0 ? (x & a) : b == 1 ? (x | a) : (x ^ a); };
+      setp(ins.dst[0], combine(bop, r, acc));
+      setp(ins.dst[1], combine(bop, ~r, acc));
+      return true;
+    }
+    case Op::IADD3: {
+      // .X adds two carries in (src[3], src[4]); the carry-outs (dst[1], dst[2]) count the overflow, 0 to 3, between them.
+      const bool x = ins.f[0];
+      if (!sk || ins.f[1] || ins.src.size() < (x ? 5u : 3u) || ins.dst.size() > 3 || ins.dst[0].kind != Kind::Reg) return false;
+      if (x && !(is_pred(ins.src[3]) && is_pred(ins.src[4]))) return false;
+      for (size_t i = 1; i < ins.dst.size(); ++i)
+        if (ins.dst[i].kind != Kind::Pred) return false;
+      for (unsigned i = 0; i < 3; ++i)
+        if (!plain(ins.src[i])) return false;
+      // Each operand is added as its bits, a negated one as its complement plus one.
+      const uint32_t* s[3];
+      uint32_t add = 0;
+      for (unsigned i = 0; i < 3; ++i) {
+        const Operand& o = ins.src[i];
+        Operand m = o;   // (complemented for a negated or ~ source, the one added below)
+        m.neg = false;
+        m.bnot = o.neg || o.bnot;
+        s[i] = lanes(i, m);
+        if (o.neg) ++add;
+      }
+      alignas(32) uint32_t r[32];
+      uint32_t ge1, ge2;
+      sk->iadd3x(r, s[0], s[1], s[2], add, x ? static_cast<uint32_t>(pmask(ins.src[3])) : 0u,
+                 x ? static_cast<uint32_t>(pmask(ins.src[4])) : 0u, &ge1, &ge2);
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      if (ins.dst.size() > 1) setp(ins.dst[1], ge1);
+      if (ins.dst.size() > 2) setp(ins.dst[2], ge2);
+      return true;
+    }
+    case Op::IMAD: {
+      // IMAD.WIDE[.X] (0x25): a 64-bit register pair = a * b + a 64-bit addend (+ a carry in), the carry out of the 64-bit sum
+      // in dst[1]. IMAD.HI[.X] (0x27): the same sum, only its high word is written. Taken here for an addend that is a
+      // register pair as it is, or the same for every lane.
+      const unsigned kind = ins.f[0];
+      const bool sgn = ins.f[1], x = ins.f[2];
+      if (!sk || ins.dst.size() > 2 || ins.dst[0].kind != Kind::Reg || ins.src.size() < (x ? 4u : 3u)) return false;
+      if (kind != 0x25 && kind != 0x27) {
+        // IMAD[.X]: a * b + c (+ a carry in) in 32 bits, the carry out of the 33-bit sum in dst[1]: the low product, then the three-way add.
+        if (ins.dst.size() == 2 && ins.dst[1].kind != Kind::Pred) return false;
+        if (x && !is_pred(ins.src[3])) return false;
+        for (int i = 0; i < 3; ++i)
+          if (!plain(ins.src[i])) return false;
+        const uint32_t* ia = lanes(0, ins.src[0]);
+        const uint32_t* ib = lanes(1, ins.src[1]);
+        const uint32_t* ic = lanes(2, ins.src[2]);
+        alignas(32) uint32_t prod[32], r[32];
+        sk->imad(prod, ia, ib, kZeros32.data());
+        uint32_t ge1, ge2;
+        sk->iadd3x(r, prod, ic, kZeros32.data(), 0, x ? static_cast<uint32_t>(pmask(ins.src[3])) : 0u, 0, &ge1, &ge2);
+        if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+        if (ins.dst.size() == 2) setp(ins.dst[1], ge1);
+        return true;
+      }
+      if (kind != 0x25 && kind != 0x27) return false;
+      if (ins.dst.size() == 2 && ins.dst[1].kind != Kind::Pred) return false;
+      if (x && !is_pred(ins.src[3])) return false;
+      for (int i = 0; i < 3; ++i)
+        if (!plain(ins.src[i])) return false;
+      const Operand& co = ins.src[2];
+      if (co.kind == Kind::Reg && co.reg != kRZ && (co.neg || (kind == 0x25 && co.bnot))) return false;
+      const uint32_t* s[2] = {lanes(0, ins.src[0]), lanes(1, ins.src[1])};
+      alignas(32) uint32_t clo_b[32], chi_b[32];
+      const uint32_t *clo, *chi;
+      if (co.kind == Kind::Reg && co.reg != kRZ) {
+        clo = &w.reg(co.reg, 0);
+        chi = &w.reg(co.reg + 1, 0);
+      } else {
+        uint64_t c;   // the same for every lane
+        if (kind == 0x25) {
+          c = read64(w, co, 0);
+          if (co.neg) c = 0 - c;
+          if (co.bnot) c = ~c;
+        } else if (co.kind == Kind::Reg || co.kind == Kind::UReg) {
+          c = read64(w, co, 0);
+          if (co.neg) c = 0 - c;
+        } else {   // a 32-bit addend, extended to 64 bits as the product is
+          uint32_t v = read32(w, co, 0);
+          if (co.neg) v = 0u - v;
+          if (co.bnot) v = ~v;
+          c = sgn ? static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(v))) : v;
+        }
+        for (unsigned l = 0; l < 32; ++l) {
+          clo_b[l] = static_cast<uint32_t>(c);
+          chi_b[l] = static_cast<uint32_t>(c >> 32);
+        }
+        clo = clo_b;
+        chi = chi_b;
+      }
+      alignas(32) uint32_t rlo[32], rhi[32];
+      uint32_t carry;
+      sk->imad_wide(rlo, rhi, s[0], s[1], clo, chi, sgn, x ? static_cast<uint32_t>(pmask(ins.src[3])) : 0u, &carry);
+      const Operand& d = ins.dst[0];
+      if (kind == 0x27) {
+        if (d.reg != kRZ) store_row(d.reg, rhi);
+      } else if (d.reg != kRZ) {
+        store_row(d.reg, rlo);
+        if (d.reg + 1 != kRZ) store_row(d.reg + 1, rhi);   // (R254's partner is RZ)
+      }
+      if (ins.dst.size() == 2) setp(ins.dst[1], carry);
+      return true;
+    }
+    default: return false;
+  }
+}
+
+// The float forms of the 32-lane path that fast_alu does not take itself: FFMA, FADD and FMUL with .FTZ or .SAT, FSETP,
+// FMNMX, MUFU, I2F/I2FP to f32, F2I from f32 to 32 bits. The same rules as exec_float's, over the 32 lanes at once with the
+// kernels of vgpu/simd/simd.hpp (ffma_x, fadd_x, fmul_x, fcmp_mask, fmnmx, mufu, i2f, f2i); a form not handled here returns false
+// and takes the general path. A source's |x| and -x are applied to the bits before the kernel flushes: a flush keeps the sign of
+// a subnormal, so flush-then-modify and modify-then-flush give the same bits.
+bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
+  const simd::Kernels* const sk = simd::enabled() ? &simd::kernels() : nullptr;
+  if (!sk || ins.dst.empty() || ins.guard_uniform) return false;
+  const auto pmask = [&](const Operand& o) -> Mask {
+    Mask v;
+    if (o.kind == Kind::UPred) v = (o.reg == kPT || w.up[o.reg]) ? kAll : 0;
+    else v = o.reg == kPT ? kAll : w.p[o.reg];
+    return o.neg ? ~v : v;
+  };
+  const auto is_pred = [](const Operand& o) { return o.kind == Kind::Pred || o.kind == Kind::UPred; };
+  const auto setp = [&](const Operand& o, Mask v) {
+    if (o.reg != kPT) w.p[o.reg] = (w.p[o.reg] & ~ex) | (v & ex);
+  };
+  const auto plain = [](const Operand& o) {
+    return o.kind == Kind::Reg || o.kind == Kind::Imm || o.kind == Kind::FImm || o.kind == Kind::CBank || o.kind == Kind::UReg;
+  };
+  const auto store_row = [&](unsigned reg, const uint32_t* v) {
+    uint32_t* d = &w.reg(reg, 0);
+    if (ex == kAll) std::memcpy(d, v, 32 * sizeof(uint32_t));
+    else sk->blend_m(d, v, ex);
+  };
+  // A source as 32 lanes of float bits: the register's own, or its value for every lane, with |x| and -x applied if `mods`.
+  alignas(32) uint32_t buf[3][32];
+  const auto lanes = [&](unsigned i, const Operand& o, bool mods) -> const uint32_t* {
+    const bool reg = o.kind == Kind::Reg && o.reg != kRZ;
+    const bool ab = mods && o.abs, ng = mods && o.neg;
+    if (reg && !ab && !ng) return &w.reg(o.reg, 0);
+    const uint32_t* row = reg ? &w.reg(o.reg, 0) : nullptr;
+    const uint32_t one = reg || o.kind == Kind::Reg ? 0u : read32(w, o, 0);
+    const uint32_t absm = ab ? 0x7fffffffu : ~0u, negm = ng ? 0x80000000u : 0u;
+    uint32_t* const out = buf[i];
+    for (unsigned l = 0; l < 32; ++l) out[l] = ((row ? row[l] : one) & absm) ^ negm;
+    return out;
+  };
+  alignas(32) uint32_t r[32];
+  switch (ins.op) {
+    case Op::FFMA: case Op::FADD: case Op::FMUL: {
+      const unsigned nsrc = ins.op == Op::FFMA ? 3 : 2;
+      if ((ins.op == Op::FMUL && ins.f[4] != 4) || ins.src.size() < nsrc || ins.dst[0].kind != Kind::Reg) return false;
+      const unsigned flags = (ins.f[1] ? 1u : 0u) | (ins.f[2] ? 2u : 0u);
+      const uint32_t* s[3];
+      for (unsigned i = 0; i < nsrc; ++i) {
+        if (!plain(ins.src[i]) || ins.src[i].bnot) return false;
+        s[i] = lanes(i, ins.src[i], true);
+      }
+      if (ins.f[0]) {
+        RoundingScope scope(ins.f[0]);
+        if (ins.op == Op::FFMA) sk->ffma_x(r, s[0], s[1], s[2], flags);
+        else if (ins.op == Op::FADD) sk->fadd_x(r, s[0], s[1], flags);
+        else sk->fmul_x(r, s[0], s[1], flags);
+      } else if (ins.op == Op::FFMA) {
+        sk->ffma_x(r, s[0], s[1], s[2], flags);
+      } else if (ins.op == Op::FADD) {
+        sk->fadd_x(r, s[0], s[1], flags);
+      } else {
+        sk->fmul_x(r, s[0], s[1], flags);
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::FSETP: {
+      const unsigned cmp = ins.f[0], bop = ins.f[1];
+      if (ins.dst.size() < 2 || ins.dst[0].kind != Kind::Pred || ins.dst[1].kind != Kind::Pred || ins.src.size() < 3 ||
+          !is_pred(ins.src[2]))
+        return false;
+      for (int i = 0; i < 2; ++i)
+        if (!plain(ins.src[i]) || ins.src[i].bnot) return false;
+      const Mask res = sk->fcmp_mask(cmp, ins.f[2] != 0, lanes(0, ins.src[0], true), lanes(1, ins.src[1], true)) & ex;
+      const Mask acc = pmask(ins.src[2]);
+      const auto combine = [](unsigned b, Mask x, Mask a) -> Mask { return b == 0 ? (x & a) : b == 1 ? (x | a) : (x ^ a); };
+      setp(ins.dst[0], combine(bop, res, acc));
+      setp(ins.dst[1], combine(bop, ~res, acc));
+      return true;
+    }
+    case Op::FMNMX: {
+      if (ins.src.size() < 3 || !plain(ins.src[0]) || !plain(ins.src[1]) || ins.src[0].bnot || ins.src[1].bnot ||
+          !is_pred(ins.src[2]) || ins.dst[0].kind != Kind::Reg)
+        return false;
+      sk->fmnmx(r, lanes(0, ins.src[0], true), lanes(1, ins.src[1], true), static_cast<uint32_t>(pmask(ins.src[2])), ins.f[0] != 0,
+                ins.f[1] != 0);
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::MUFU: {
+      const unsigned op = ins.f[0];
+      if (op == 6 || op == 7 || op > 9 || ins.src.empty() || !plain(ins.src[0]) || ins.src[0].bnot || ins.dst[0].kind != Kind::Reg)
+        return false;
+      if (op == 4 || op == 5 || op == 8) {
+        sk->mufu(op, r, lanes(0, ins.src[0], true));
+      } else {
+        // The functions the host's libm gives (no SIMD form has the same bits): the input flushed, then |x| and -x, as f32src(.., true)
+        // does; the answer in double, rounded once to float and flushed.
+        const Operand& o = ins.src[0];
+        const uint32_t* raw = lanes(0, o, false);
+        for (unsigned l = 0; l < 32; ++l) {
+          float f = as_f32(raw[l]);
+          f = ftz(f);
+          if (o.abs) f = std::fabs(f);
+          if (o.neg) f = -f;
+          const double x = ftz(f);
+          float v;
+          switch (op) {
+            case 0: v = static_cast<float>(std::cos(x * 6.28318530717958647692)); break;   // the argument is in turns
+            case 1: v = static_cast<float>(std::sin(x * 6.28318530717958647692)); break;
+            case 2: v = static_cast<float>(std::exp2(x)); break;
+            case 3: v = static_cast<float>(std::log2(x)); break;
+            default: v = static_cast<float>(std::tanh(x)); break;
+          }
+          r[l] = f32_bits(ftz(v));
+        }
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::DSETP: {
+      // A double comparison (or MIN/MAX: whether a is the answer, and whether both are NaN) of two register pairs or values the same for
+      // every lane, as the DFMA path reads its sources.
+      const unsigned cmp = ins.f[0], bop = ins.f[1];
+      if (ins.dst.size() < 2 || ins.dst[0].kind != Kind::Pred || ins.dst[1].kind != Kind::Pred || ins.src.size() < 3 ||
+          !is_pred(ins.src[2]))
+        return false;
+      for (int i = 0; i < 2; ++i) {
+        const Kind k = ins.src[i].kind;
+        if (!(k == Kind::Reg || k == Kind::UReg || k == Kind::CBank || k == Kind::Imm || k == Kind::FImm)) return false;
+      }
+      alignas(32) uint32_t tlo[2][32], thi[2][32];
+      const uint32_t *lo[2], *hi[2];
+      unsigned mods = 0;
+      for (unsigned i = 0; i < 2; ++i) {
+        const Operand& o = ins.src[i];
+        if (o.kind == Kind::Reg && o.reg != kRZ) {
+          lo[i] = &w.reg(o.reg, 0);
+          hi[i] = &w.reg(o.reg + 1, 0);
+          mods |= (o.abs ? 1u : 0u) << (2 * i) | (o.neg ? 1u : 0u) << (2 * i + 1);
+        } else {
+          uint64_t bits = o.kind == Kind::FImm && o.fwidth == 64 ? static_cast<uint64_t>(o.fbits) << 32 : read64(w, o, 0);
+          if (o.abs) bits &= 0x7fffffffffffffffull;
+          if (o.neg) bits ^= 0x8000000000000000ull;
+          for (unsigned l = 0; l < 32; ++l) {
+            tlo[i][l] = static_cast<uint32_t>(bits);
+            thi[i][l] = static_cast<uint32_t>(bits >> 32);
+          }
+          lo[i] = tlo[i];
+          hi[i] = thi[i];
+        }
+      }
+      uint32_t res, both_nan;
+      sk->dcmp(cmp, mods, lo[0], hi[0], lo[1], hi[1], &res, &both_nan);
+      const Mask acc = pmask(ins.src[2]);
+      const auto combine = [](unsigned b, Mask x, Mask a) -> Mask { return b == 0 ? (x & a) : b == 1 ? (x | a) : (x ^ a); };
+      if (cmp == 0 || cmp == 15) {
+        setp(ins.dst[0], combine(bop, res, acc));
+        setp(ins.dst[1], both_nan);
+      } else {
+        setp(ins.dst[0], combine(bop, res, acc));
+        setp(ins.dst[1], combine(bop, ~res, acc));
+      }
+      return true;
+    }
+    case Op::HADD2: case Op::HMUL2: case Op::HFMA2: {
+      // Packed f16 arithmetic: each half the fused multiply-add of its three inputs in double, rounded once to f16 (the PTX engine's
+      // rule, and the SIMD kernel hfma2_m's). A sum is a * 1 + b and a product a * b + (-0), both exactly the same in double. The
+      // sources as the general rule reads them: a register's halves (swapped or copied by .H0_H0 / .H1_H1, |.| and - on both), a
+      // value the same for every lane, a split immediate (one half for both lanes), or a pair of immediates for b or c.
+      const bool bf = ins.f[0], f32out = ins.f[1], st = ins.f[3];
+      const unsigned need = ins.op == Op::HFMA2 ? 3u : 2u;
+      // (The f32 result is taken for HADD2, the half-to-float conversion, with no flush or saturation: the forms ptxas emits.)
+      if (bf || st || (f32out && (ins.op != Op::HADD2 || ins.f[2])) || ins.dst[0].kind != Kind::Reg || ins.src.size() < need) return false;
+      alignas(32) uint32_t pk[3][32];
+      bool ok = true;
+      const auto packed = [&](unsigned slot, const Operand& o) -> const uint32_t* {
+        uint32_t* out = pk[slot];
+        if (o.kind == Kind::FImm) {   // (the general rule ignores |.| and - on an immediate)
+          const uint32_t v = (o.fbits & 0xffffu) * 0x10001u;
+          for (unsigned l = 0; l < 32; ++l) out[l] = v;
+          return out;
+        }
+        if (!plain(o) || o.kind == Kind::Imm || o.suffix == ".F32") {
+          ok = false;
+          return out;
+        }
+        const bool reg = o.kind == Kind::Reg && o.reg != kRZ;
+        const uint32_t* row = reg ? &w.reg(o.reg, 0) : nullptr;
+        const uint32_t one = reg || o.kind == Kind::Reg ? 0u : read32(w, o, 0);
+        const int mode = o.suffix == ".H0_H0" ? 1 : o.suffix == ".H1_H1" ? 2 : 0;
+        const uint32_t absm = o.abs ? 0x7fff7fffu : ~0u, negm = o.neg ? 0x80008000u : 0u;
+        for (unsigned l = 0; l < 32; ++l) {
+          uint32_t v = row ? row[l] : one;
+          if (mode == 1) v = (v & 0xffffu) * 0x10001u;
+          else if (mode == 2) v = (v >> 16) * 0x10001u;
+          out[l] = (v & absm) ^ negm;
+        }
+        return out;
+      };
+      const auto splat = [&](unsigned slot, uint32_t v) -> const uint32_t* {
+        for (unsigned l = 0; l < 32; ++l) pk[slot][l] = v;
+        return pk[slot];
+      };
+      const uint32_t* a = packed(0, ins.src[0]);
+      size_t next = 1;
+      const uint32_t* b;
+      if (ins.src.size() > next + 1 && ins.src[next].kind == Kind::FImm && ins.src[next + 1].kind == Kind::FImm) {
+        b = splat(1, (ins.src[next].fbits & 0xffffu) << 16 | (ins.src[next + 1].fbits & 0xffffu));   // the second printed half is the low lane
+        next += 2;
+      } else {
+        b = packed(1, ins.src[next]);
+        next += 1;
+      }
+      const uint32_t* c = nullptr;
+      if (ins.op == Op::HFMA2) {
+        if (ins.src.size() > next + 1 && ins.src[next].kind == Kind::FImm && ins.src[next + 1].kind == Kind::FImm)
+          c = splat(2, (ins.src[next].fbits & 0xffffu) << 16 | (ins.src[next + 1].fbits & 0xffffu));
+        else
+          c = packed(2, ins.src[next]);
+      }
+      if (!ok) return false;
+      if (f32out) {
+        // The result is lane 0 of the pair, as an f32: the sum of the first halves in double, rounded once to float -- for the usual
+        // a = -RZ (the half to float conversion) exactly the half's value. The general rule's arithmetic on the same values; a NaN among
+        // the operands (which of two NaNs the host's arithmetic keeps depends on how the compiler ordered the operands) takes that
+        // general path.
+        alignas(32) uint16_t h16[2][32];
+        alignas(32) float f[2][32];
+        uint32_t nan_seen = 0;
+        for (unsigned l = 0; l < 32; ++l) {
+          h16[0][l] = static_cast<uint16_t>(a[l]);
+          h16[1][l] = static_cast<uint16_t>(b[l]);
+          nan_seen |= ((h16[0][l] & 0x7fffu) > 0x7c00u) | ((h16[1][l] & 0x7fffu) > 0x7c00u);
+        }
+        if (nan_seen) return false;
+        if (ins.dst[0].reg == kRZ) return true;
+        sk->f16_to_f32(h16[0], f[0], 32);
+        sk->f16_to_f32(h16[1], f[1], 32);
+        alignas(32) uint32_t out[32];
+        for (unsigned l = 0; l < 32; ++l) out[l] = f32_bits(static_cast<float>(static_cast<double>(f[0][l]) + f[1][l]));
+        store_row(ins.dst[0].reg, out);
+        return true;
+      }
+      if (ins.dst[0].reg == kRZ) return true;   // (nothing to write)
+      uint32_t* const d = &w.reg(ins.dst[0].reg, 0);
+      alignas(32) uint32_t fixed[32];
+      if (ins.op == Op::HADD2) {   // a * 1 + b
+        for (unsigned l = 0; l < 32; ++l) fixed[l] = 0x3c003c00u;
+        sk->hfma2_m(d, a, fixed, b, ex, 32, 2);
+      } else if (ins.op == Op::HMUL2) {   // a * b + (-0)
+        for (unsigned l = 0; l < 32; ++l) fixed[l] = 0x80008000u;
+        sk->hfma2_m(d, a, b, fixed, ex, 32, 2);
+      } else {
+        sk->hfma2_m(d, a, b, c, ex, 32, 2);
+      }
+      return true;
+    }
+    case Op::F2FP: {
+      // Two f32 packed into the halves of a register -- f16 or bf16, to nearest even, .RELU first sending a negative value to 0 (not
+      // the narrow formats, TF32 packs or the unpacks, which take the general path).
+      if (ins.src.size() < 2 || ins.dst[0].kind != Kind::Reg || ins.f[5] == 4 || ins.f[3] >= 6 || !plain(ins.src[0]) || !plain(ins.src[1]) ||
+          ins.src[0].bnot || ins.src[1].bnot)
+        return false;
+      alignas(32) float fa[32], fb[32];
+      const uint32_t* ra = lanes(0, ins.src[0], true);
+      const uint32_t* rb = lanes(1, ins.src[1], true);
+      for (unsigned l = 0; l < 32; ++l) {
+        fa[l] = as_f32(ra[l]);
+        fb[l] = as_f32(rb[l]);
+      }
+      if (ins.f[2]) {   // .RELU: a negative value (not -0, not a NaN) becomes +0
+        for (unsigned l = 0; l < 32; ++l) {
+          if (fa[l] < 0) fa[l] = 0;
+          if (fb[l] < 0) fb[l] = 0;
+        }
+      }
+      if (ins.f[0]) {   // bf16
+        for (unsigned l = 0; l < 32; ++l) r[l] = (static_cast<uint32_t>(f32_to_bf16(fa[l])) << 16) | f32_to_bf16(fb[l]);
+      } else {
+        alignas(32) uint16_t ha[32], hb[32];
+        sk->f32_to_f16(fa, ha, 32);
+        sk->f32_to_f16(fb, hb, 32);
+        for (unsigned l = 0; l < 32; ++l) r[l] = (static_cast<uint32_t>(ha[l]) << 16) | hb[l];
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::I2F: case Op::I2FP: {
+      // To f32 from a 32-bit integer, to nearest even. (The source's modifiers do not apply: read32 is all the general rule reads.)
+      const unsigned dsize = ins.op == Op::I2FP ? 2 : ins.f[0], ssize = ins.op == Op::I2FP ? 2 : ins.f[1];
+      const bool sgn = ins.op == Op::I2FP ? ins.f[0] != 0 : ins.f[2] != 0;
+      const unsigned rnd = ins.op == Op::I2FP ? ins.f[1] : ins.f[3];
+      if (dsize != 2 || ssize > 2 || rnd != 0 || ins.src.empty() || !plain(ins.src[0]) || ins.dst[0].kind != Kind::Reg) return false;
+      const uint32_t* src = lanes(0, ins.src[0], false);
+      if (ssize < 2) {
+        // A byte or a half of the register (I2F's .B1-.B3, .H1 move it down), sign- or zero-extended to 32 bits: it converts as
+        // a signed 32-bit integer.
+        alignas(32) uint32_t ext[32];
+        const unsigned shift = ins.op == Op::I2F ? (ssize == 1 ? 16u : 8u) * ins.f[4] : 0u;
+        for (unsigned l = 0; l < 32; ++l) {
+          const uint32_t v = shift >= 32 ? 0u : src[l] >> shift;
+          ext[l] = ssize == 0 ? (sgn ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v))) : (v & 0xffu))
+                              : (sgn ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v))) : (v & 0xffffu));
+        }
+        sk->i2f(true, r, ext);
+      } else {
+        sk->i2f(sgn, r, src);
+      }
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+      return true;
+    }
+    case Op::F2I: {
+      // f32 to a 32-bit integer.
+      if (ins.f[0] != 2 || ins.f[1] != 2 || ins.src.empty() || !plain(ins.src[0]) || ins.src[0].bnot || ins.dst[0].kind != Kind::Reg)
+        return false;
+      sk->f2i(ins.f[2] != 0, ins.f[3], ins.f[4] != 0, r, lanes(0, ins.src[0], true));
+      if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
       return true;
     }
     default: return false;
@@ -1916,14 +2571,13 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
 void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned size = ins.f[0];
   const uint32_t bytes = size <= 1 ? 1 : size <= 3 ? 2 : size == 4 ? 4 : size == 5 ? 8 : size == 8 ? 32 : 16;
-  const auto extend = [&](uint32_t v) -> uint32_t {
-    switch (size) {
-      case 0: return v & 0xff;
-      case 1: return static_cast<uint32_t>(static_cast<int8_t>(v));
-      case 2: return v & 0xffff;
-      case 3: return static_cast<uint32_t>(static_cast<int16_t>(v));
-      default: return v;
-    }
+  // A loaded byte or half to 32 bits: zero- or sign-extended (sizes 0 to 3: u8, s8, u16, s16), or the word as it is. (As shifts, not
+  // a switch: it is made for every lane.)
+  const unsigned ext_shift = size <= 1 ? 24u : size <= 3 ? 16u : 0u;
+  const bool ext_signed = size == 1 || size == 3;
+  const auto extend = [=](uint32_t v) -> uint32_t {
+    const uint32_t t = v << ext_shift;
+    return ext_signed ? static_cast<uint32_t>(static_cast<int32_t>(t) >> ext_shift) : t >> ext_shift;
   };
   // The address of a memory operand for one lane: the register (64-bit for
   // .E and the .64 forms), the uniform register when there is one, and the
@@ -1951,6 +2605,34 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     }
     return v + static_cast<uint64_t>(a.imm);
   };
+  // The same addresses for all the lanes of `lanes` at once, the instruction's fields decoded once: base + each lane's register
+  // (a pair if `wide`). For the forms of sm_80 and later; Turing's global forms (above) take `address`.
+  const auto row_addresses = [&](const Operand& a, bool wide, bool with_ur, unsigned ur_pos, Mask lanes, uint64_t* out,
+                                 unsigned stride = 0) {
+    const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
+    uint64_t base = static_cast<uint64_t>(a.imm);
+    if (with_ur) {
+      const unsigned u = static_cast<unsigned>(ins.w.field(ur_pos, m_.sm >= 100 ? 8 : 6));
+      if (u != (m_.sm >= 100 ? 255u : 63u)) base += w.ur[u];
+    }
+    if (ra == kRZ) {
+      for (Mask m = lanes; m; m &= m - 1) out[std::countr_zero(m)] = base;
+      return;
+    }
+    const uint32_t* lo = &w.reg(ra, 0);
+    if (wide) {
+      const uint32_t* hi = &w.reg(ra + 1, 0);
+      for (Mask m = lanes; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+        out[l] = (lo[l] | (static_cast<uint64_t>(hi[l]) << 32)) * (stride ? stride : 1) + base;
+      }
+    } else {
+      for (Mask m = lanes; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+        out[l] = uint64_t{lo[l]} * (stride ? stride : 1) + base;
+      }
+    }
+  };
   switch (ins.op) {
     case Op::LDG: case Op::LD: case Op::STG: case Op::ST: {
       const bool store = ins.op == Op::STG || ins.op == Op::ST;
@@ -1968,42 +2650,64 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       if (fast_ && !generic && (bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8) && ex && ((ex + (ex & -ex)) & ex) == 0) {
         const unsigned first = static_cast<unsigned>(std::countr_zero(ex));
         const unsigned count = popc(ex);
-        const uint64_t g0 = address(a, first, wide, ur, store ? 64 : 32, 0);
-        bool run = !(g0 >= kConstWindow && g0 < kConstWindow + (uint64_t{1} << 32));
-        for (unsigned i = 0; run && i < count; ++i) {
-          const uint64_t g = address(a, first + i, wide, ur, store ? 64 : 32, 0);
-          run = g == g0 + uint64_t{i} * bytes;
+        uint64_t g0;
+        bool run;
+        if (m_.sm >= 80) {
+          // (the addresses of all the lanes, then compared with a run of consecutive elements)
+          uint64_t ra[32];
+          row_addresses(a, wide, ur, store ? 64 : 32, ex, ra);
+          g0 = ra[first];
+          uint64_t diff = 0;
+          for (unsigned i = 0; i < count; ++i) diff |= ra[first + i] ^ (g0 + uint64_t{i} * bytes);
+          run = diff == 0 && !(g0 >= kConstWindow && g0 < kConstWindow + (uint64_t{1} << 32));
+        } else {
+          g0 = address(a, first, wide, ur, store ? 64 : 32, 0);
+          run = !(g0 >= kConstWindow && g0 < kConstWindow + (uint64_t{1} << 32));
+          for (unsigned i = 0; run && i < count; ++i) {
+            const uint64_t g = address(a, first + i, wide, ur, store ? 64 : 32, 0);
+            run = g == g0 + uint64_t{i} * bytes;
+          }
         }
         if (run && (g0 + uint64_t{count} * bytes - 1 < kConstWindow || g0 >= kConstWindow + (uint64_t{1} << 32))) {
-          uint8_t buf[32 * 8];
+          uint8_t buf[32 * 16];
+          const uint32_t unit = bytes > 8 ? 8 : bytes;   // (a 16-byte access moves as two 8-byte elements)
           bool done = false;
           if (store) {
             const Operand& d = ins.src[1];
-            for (unsigned i = 0; i < count; ++i) {
-              if (bytes <= 4) {
-                const uint32_t v = read32(w, d, first + i);
-                std::memcpy(buf + i * bytes, &v, bytes);
-              } else {
-                uint32_t v[2];
-                for (unsigned k = 0; k < 2; ++k) v[k] = d.reg == kRZ ? 0 : w.reg(d.reg + k, first + i);
-                std::memcpy(buf + i * 8, v, 8);
-              }
-            }
-            done = mem_.store_run(g0, buf, uint64_t{count} * bytes, bytes);
-          } else {
-            done = mem_.load_run(g0, buf, uint64_t{count} * bytes, bytes);
-            if (done) {
-              const Operand& d = ins.dst[0];
+            if (bytes == 4 && d.kind == Kind::Reg) {   // (a word a lane: the register's lanes as they are)
+              if (d.reg == kRZ) std::memset(buf, 0, count * 4);
+              else std::memcpy(buf, &w.reg(d.reg, first), count * 4);
+            } else {
               for (unsigned i = 0; i < count; ++i) {
                 if (bytes <= 4) {
-                  uint32_t v = 0;
-                  std::memcpy(&v, buf + i * bytes, bytes);
-                  write32(w, d, first + i, extend(v));
+                  const uint32_t v = read32(w, d, first + i);
+                  std::memcpy(buf + i * bytes, &v, bytes);
                 } else {
-                  uint32_t v[2];
-                  std::memcpy(v, buf + i * 8, 8);
-                  if (d.reg != kRZ)
-                    for (unsigned k = 0; k < 2; ++k) w.reg(d.reg + k, first + i) = v[k];
+                  uint32_t v[4];
+                  for (unsigned k = 0; k < bytes / 4; ++k) v[k] = d.reg == kRZ ? 0 : w.reg(d.reg + k, first + i);
+                  std::memcpy(buf + i * bytes, v, bytes);
+                }
+              }
+            }
+            done = mem_.store_run(g0, buf, uint64_t{count} * bytes, unit);
+          } else {
+            done = mem_.load_run(g0, buf, uint64_t{count} * bytes, unit);
+            if (done) {
+              const Operand& d = ins.dst[0];
+              if (bytes == 4 && d.kind == Kind::Reg) {
+                if (d.reg != kRZ) std::memcpy(&w.reg(d.reg, first), buf, count * 4);
+              } else {
+                for (unsigned i = 0; i < count; ++i) {
+                  if (bytes <= 4) {
+                    uint32_t v = 0;
+                    std::memcpy(&v, buf + i * bytes, bytes);
+                    write32(w, d, first + i, extend(v));
+                  } else {
+                    uint32_t v[4];
+                    std::memcpy(v, buf + i * bytes, bytes);
+                    if (d.reg != kRZ)
+                      for (unsigned k = 0; k < bytes / 4; ++k) w.reg(d.reg + k, first + i) = v[k];
+                  }
                 }
               }
             }
@@ -2011,6 +2715,78 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           if (done) {
             for (unsigned i = 0; i < count; ++i) addrs[first + i] = g0 + uint64_t{i} * bytes;
             count_access(blk.st, 0, store, addrs, ex, bytes);
+            return;
+          }
+        }
+      }
+      // A scattered access (a gather, a scatter) of 1 to 8 bytes in plain global memory: the lanes' accesses are made
+      // together by MemoryManager::load_batch / store_batch, which do what load_scalar / store_scalar would lane by lane,
+      // in this order, or decline (return false, having done nothing) whenever the two could differ -- a fault armed, a
+      // host mapping in range, a misaligned access, an address outside the allocation the first is in; the loop below
+      // then makes them one at a time and meets any error where it always did.
+      if (fast_ && !generic && m_.sm >= 80 && (bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8) && ex) {
+        uint64_t ga[32], dense_buf[32], vals[32];
+        row_addresses(a, wide, ur, store ? 64 : 32, ex, ga);
+        const bool all = ex == kAll;
+        // The active lanes in order (all 32 as a counted loop): f(lane, index among the active).
+        const auto each_active = [&](auto&& f) {
+          if (all) {
+            for (unsigned l = 0; l < 32; ++l) f(l, l);
+          } else {
+            unsigned i = 0;
+            for (Mask m = ex; m; m &= m - 1, ++i) f(static_cast<unsigned>(std::countr_zero(m)), i);
+          }
+        };
+        const uint64_t* dense = ga;   // the addresses of the active lanes in order
+        unsigned count = 32;
+        uint64_t in_const = 0, differ = 0;   // (a lane in the constant window, which the loop below reads through its bank; an address unlike the first's)
+        if (all) {
+          for (unsigned l = 0; l < 32; ++l) {
+            in_const |= (ga[l] - kConstWindow) < (uint64_t{1} << 32);
+            differ |= ga[l] ^ ga[0];
+          }
+        } else {
+          count = 0;
+          const uint64_t first = ga[std::countr_zero(ex)];
+          for (Mask m = ex; m; m &= m - 1) {
+            const uint64_t g = ga[std::countr_zero(m)];
+            in_const |= (g - kConstWindow) < (uint64_t{1} << 32);
+            differ |= g ^ first;
+            dense_buf[count++] = g;
+          }
+          dense = dense_buf;
+        }
+        if (!in_const) {
+          bool done;
+          if (store) {
+            const Operand& d = ins.src[1];
+            each_active([&](unsigned l, unsigned i) {
+              if (bytes <= 4) {
+                vals[i] = read32(w, d, l) & (bytes == 4 ? 0xffffffffu : (1u << (8 * bytes)) - 1);
+              } else {
+                vals[i] = d.reg == kRZ ? 0 : (w.reg(d.reg, l) | (static_cast<uint64_t>(w.reg(d.reg + 1, l)) << 32));
+              }
+            });
+            done = mem_.store_batch(dense, count, bytes, vals);
+          } else {
+            // Every active lane loading the same address (a broadcast) is one load.
+            const bool same = differ == 0;
+            done = mem_.load_batch(dense, same ? 1 : count, bytes, vals);
+            if (done) {
+              const Operand& d = ins.dst[0];
+              each_active([&](unsigned l, unsigned i) {
+                const uint64_t v = vals[same ? 0 : i];
+                if (bytes <= 4) {
+                  write32(w, d, l, extend(static_cast<uint32_t>(v)));
+                } else if (d.reg != kRZ) {
+                  w.reg(d.reg, l) = static_cast<uint32_t>(v);
+                  w.reg(d.reg + 1, l) = static_cast<uint32_t>(v >> 32);
+                }
+              });
+            }
+          }
+          if (done) {
+            count_access(blk.st, 0, store, ga, ex, bytes);   // (only the active lanes' addresses are read)
             return;
           }
         }
@@ -2074,11 +2850,14 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // below runs instead and finds the lane that faults, exactly as it always did.
         const uint64_t ssize = blk.shared.size();
         bool inside = true;
-        each_lane(ex, [&](unsigned l) {
-          const uint64_t off = static_cast<uint32_t>(address(a, l, false, ur, store ? 64 : 32, stride));
+        uint64_t sa[32];
+        row_addresses(a, false, ur, store ? 64 : 32, ex, sa, stride);
+        for (Mask m = ex; m; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+          const uint64_t off = static_cast<uint32_t>(sa[l]);
           addrs[l] = off;
           inside = inside && (off >> 24) == blk.rank && (off & 0xffffff) + bytes <= ssize;
-        });
+        }
         if (inside) {
           uint8_t* sh = blk.shared.data();
           if (store) {
@@ -2101,6 +2880,40 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             });
           }
           count_access(blk.st, 1, store, addrs, ex, bytes);
+          return;
+        }
+      }
+      if (!shared && fast_ && ex && bytes <= 16) {
+        // Local memory, when every active lane's access is inside its own window: the bytes move between the register file and
+        // the window directly. (The window is made on first use, as mem_read / mem_write make it. If any lane is outside it
+        // the loop below runs and finds the one that faults, as it always did.)
+        uint64_t la[32];
+        row_addresses(a, false, ur, store ? 64 : 32, ex, la);
+        bool inside = true;
+        for (Mask m = ex; m; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+          const uint64_t off = static_cast<uint32_t>(la[l]);
+          addrs[l] = off;
+          inside = inside && off + bytes <= w.local_size;
+        }
+        if (inside) {
+          if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
+          const Operand& d = store ? ins.src[1] : ins.dst[0];
+          for (Mask m = ex; m; m &= m - 1) {
+            const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+            uint8_t* const at = &w.local[size_t{l} * w.local_size + addrs[l]];
+            uint32_t v[4] = {};
+            if (store) {
+              for (unsigned i = 0; i < std::max(1u, bytes / 4); ++i) v[i] = d.reg == kRZ ? 0 : w.reg(d.reg + i, l);
+              std::memcpy(at, v, bytes);
+            } else {
+              std::memcpy(v, at, bytes);
+              if (bytes <= 4) write32(w, d, l, extend(v[0]));
+              else if (d.reg != kRZ)
+                for (unsigned i = 0; i < bytes / 4; ++i) w.reg(d.reg + i, l) = v[i];
+            }
+          }
+          count_access(blk.st, 2, store, addrs, ex, bytes);
           return;
         }
       }
@@ -2281,38 +3094,8 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const bool cas = ins.f[5] || (shared && ins.mods[0].rfind("CAS", 0) == 0);
       const bool popc_inc = shared && ins.f[2] == 1;
       const Operand& a = red ? ins.src[0] : ins.src[shared ? 0 : 0];
-      // Warp-aggregated increment: one add of the active lane count.
-      each_lane(ex, [&](unsigned l) {
-        uint64_t addr;
-        Space sp;
-        if (shared) {
-          const unsigned strides[] = {0, 4, 8, 16};
-          addr = static_cast<uint32_t>(address(a, l, false, ins.w.bit(91) || popc_inc, 64, strides[ins.w.field(78, 2)]));
-          sp = Space::Shared;
-        } else {
-          const bool e = ins.w.bit(72);
-          const uint64_t g = address(a, l, e || ins.w.bit(90), ins.w.bit(91) && !e, 64, 0);
-          sp = ins.op == Op::ATOM ? classify(g, &addr) : (addr = g, Space::Global);
-        }
-        // The vector forms (sm_90's F32x2/x4, F16x4/x8, BF16x4/x8): f[7] words
-        // in consecutive registers, aligned to all of them, each its own atomic.
-        const unsigned nwords = ins.f[7] ? ins.f[7] : 1;
-        if (nwords > 1 && addr % (4ull * nwords))
-          fault(w, ins, l, "a vector atomic of " + std::to_string(4 * nwords) + " bytes at an address not aligned to them",
-                Err::MisalignedAccess);
-        const uint64_t addr0 = addr;
-        for (unsigned word = 0; word < nwords; ++word) {
-        addr = addr0 + 4ull * word;
-        std::unique_lock<std::mutex> lock;
-        if (sp == Space::Global) lock = std::unique_lock<std::mutex>(atomic_lock(addr));
-        Operand vtmp;
-        const Operand* vp = &ins.src[1];
-        if (word) { vtmp = *vp; if (vtmp.reg != kRZ) vtmp.reg += word; vp = &vtmp; }
-        const Operand& vop = *vp;
-        const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
-        const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
-        // The value the atomic stores, given the one it finds.
-        const auto compute = [&](const uint64_t old) -> uint64_t {
+      // The value the atomic stores, given the one it finds (old), the operand (v) and the exchange value (swap) of lane l.
+      const auto apply = [&](unsigned l, const uint64_t old, const uint64_t v, const uint64_t swap) -> uint64_t {
         uint64_t nw = old;
         if (cas) {
           if (old == v) nw = swap;
@@ -2360,7 +3143,137 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         }
         if (!is64) nw &= 0xffffffff;
         return nw;
-        };
+      };
+      // What a lane's atomic gives back: the old value in the destination (the vector forms' word `word` in the register `word`
+      // on), the predicate ATOM and ATOMG set, and CAST.SPIN's flag.
+      const auto emit = [&](unsigned l, unsigned word, uint64_t old, uint64_t v) {
+        Operand dtmp;
+        const Operand* dp = ins.op == Op::ATOMS ? &ins.dst[0] : &ins.dst[1];
+        if (word) { dtmp = *dp; if (dtmp.reg != kRZ) dtmp.reg += word; dp = &dtmp; }
+        const Operand& d = *dp;
+        // ATOM/ATOMG's predicate: done in hardware (a generic CAS of a
+        // shared address included, so no software path is needed).
+        if (ins.op != Op::ATOMS) set_pred(w, ins.dst[0], l, true);
+        if (is64) write64(w, d, l, old);
+        else write32(w, d, l, static_cast<uint32_t>(old));
+        // CAST.SPIN: whether it stored (ATOMS keeps the mode in f[1], ATOM in f[6]).
+        // The .64 form's flag is the whole register pair: ptxas's loop
+        // after it (sm_86's atomicAdd of a double in shared memory, as
+        // CUDA Samples' jacobiCudaGraphs does) tests Rd == 1 and Rd+1 == 0,
+        // so leaving the old value's high word in Rd+1 spun forever.
+        if (cas && (ins.op == Op::ATOMS ? ins.f[1] == 3 : ins.f[6] != 0)) {
+          if (d.kind == Kind::Pred) set_pred(w, d, l, old == v);   // sm_100's ATOMS.CAST.SPIN P
+          else if (is64) write64(w, d, l, old == v ? 1 : 0);
+          else write32(w, d, l, old == v ? 1 : 0);
+        }
+      };
+      // A warp's atomics on plain global memory taken together. Each lane's is a read-modify-write under the lock of its
+      // address' stripe; here the lanes' addresses are grouped (a lane that shares an address with an earlier one finds
+      // what that one left, as in the loop below), the stripes involved locked in order, each distinct address loaded
+      // and stored once (MemoryManager::load_batch / store_batch, which decline, having done nothing, whenever the plain
+      // accesses could differ) and the lanes applied one after another in lane order. What every lane gets back and what
+      // memory holds are what the loop below gives; another host thread sees the warp's atomics as one step. Anything
+      // else -- shared or local memory, host-mapped memory, misaligned addresses, vector forms -- takes the loop.
+      if (fast_ && !shared && !popc_inc && ins.f[7] <= 1 && m_.sm >= 80 && ex && (red || ins.dst.back().kind == Kind::Reg)) {
+        uint64_t ga[32];
+        row_addresses(a, ins.w.bit(72) || ins.w.bit(90), ins.w.bit(91) && !ins.w.bit(72), 64, ex, ga);
+        bool ok = true;
+        uint64_t uaddr[32], v[32], swp[32];
+        unsigned nu = 0, slot[32];
+        uint64_t stripes = 0;
+        for (Mask m = ex; m && ok; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+          uint64_t addr = ga[l];
+          if (ins.op == Op::ATOM && classify(ga[l], &addr) != Space::Global) ok = false;
+          if (addr % n) ok = false;
+          if (!ok) break;
+          // The slot of this address among the distinct ones (the last one first: lanes of a warp mostly repeat or step on).
+          unsigned k = nu;
+          if (nu && uaddr[nu - 1] == addr) k = nu - 1;
+          else
+            for (unsigned i = 0; i < nu; ++i)
+              if (uaddr[i] == addr) {
+                k = i;
+                break;
+              }
+          if (k == nu) {
+            uaddr[nu++] = addr;
+            stripes |= uint64_t{1} << ((addr >> 3) % 64);
+          }
+          slot[l] = k;
+          v[l] = is64 ? read64(w, ins.src[1], l) : read32(w, ins.src[1], l);
+          swp[l] = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
+        }
+        // Memory the host maps (managed, pinned, shared through CUDA IPC) takes the CPU's atomic in the loop; asking also
+        // finds read-only host memory, which the loop's first lane to reach it reports.
+        for (unsigned i = 0; ok && i < nu; ++i) {
+          try {
+            if (mem_.host_address(uaddr[i], n)) ok = false;
+          } catch (const Error&) {
+            ok = false;
+          }
+        }
+        if (ok) {
+          uint64_t old_of[32];
+          bool done = false;
+          {   // (the locks are let go before the loop below might take them again)
+            std::unique_lock<std::mutex> locks[32];
+            unsigned held = 0;
+            for (uint64_t sm = stripes; sm; sm &= sm - 1)
+              locks[held++] = std::unique_lock<std::mutex>(atomic_lock(uint64_t{static_cast<unsigned>(std::countr_zero(sm))} << 3));
+            uint64_t cur[32];
+            if (mem_.load_batch(uaddr, nu, n, cur)) {
+              for (Mask m = ex; m; m &= m - 1) {
+                const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                old_of[l] = cur[slot[l]];
+                cur[slot[l]] = apply(l, old_of[l], v[l], swp[l]);
+              }
+              // (a store the memory declines leaves it as it was, and the loop does the lot: nothing above has an effect)
+              done = mem_.store_batch(uaddr, nu, n, cur);
+            }
+          }
+          if (done) {
+            for (Mask m = ex; m; m &= m - 1) {
+              const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+              ++blk.st.atomics;
+              blk.st.atomic_bytes += n;
+              if (!red) emit(l, 0, old_of[l], v[l]);
+            }
+            return;
+          }
+        }
+      }
+      // Warp-aggregated increment: one add of the active lane count.
+      each_lane(ex, [&](unsigned l) {
+        uint64_t addr;
+        Space sp;
+        if (shared) {
+          const unsigned strides[] = {0, 4, 8, 16};
+          addr = static_cast<uint32_t>(address(a, l, false, ins.w.bit(91) || popc_inc, 64, strides[ins.w.field(78, 2)]));
+          sp = Space::Shared;
+        } else {
+          const bool e = ins.w.bit(72);
+          const uint64_t g = address(a, l, e || ins.w.bit(90), ins.w.bit(91) && !e, 64, 0);
+          sp = ins.op == Op::ATOM ? classify(g, &addr) : (addr = g, Space::Global);
+        }
+        // The vector forms (sm_90's F32x2/x4, F16x4/x8, BF16x4/x8): f[7] words
+        // in consecutive registers, aligned to all of them, each its own atomic.
+        const unsigned nwords = ins.f[7] ? ins.f[7] : 1;
+        if (nwords > 1 && addr % (4ull * nwords))
+          fault(w, ins, l, "a vector atomic of " + std::to_string(4 * nwords) + " bytes at an address not aligned to them",
+                Err::MisalignedAccess);
+        const uint64_t addr0 = addr;
+        for (unsigned word = 0; word < nwords; ++word) {
+        addr = addr0 + 4ull * word;
+        std::unique_lock<std::mutex> lock;
+        if (sp == Space::Global) lock = std::unique_lock<std::mutex>(atomic_lock(addr));
+        Operand vtmp;
+        const Operand* vp = &ins.src[1];
+        if (word) { vtmp = *vp; if (vtmp.reg != kRZ) vtmp.reg += word; vp = &vtmp; }
+        const Operand& vop = *vp;
+        const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
+        const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
+        const auto compute = [&](const uint64_t old) -> uint64_t { return apply(l, old, v, swap); };
         // Memory the host maps -- managed, pinned, or shared with another
         // process through CUDA IPC -- takes the CPU's own atomic, which host
         // code and other processes' kernels respect; the stripe lock is this
@@ -2376,27 +3289,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         }
         ++blk.st.atomics;
         blk.st.atomic_bytes += n;
-        if (!red) {
-          Operand dtmp;
-          const Operand* dp = ins.op == Op::ATOMS ? &ins.dst[0] : &ins.dst[1];
-          if (word) { dtmp = *dp; if (dtmp.reg != kRZ) dtmp.reg += word; dp = &dtmp; }
-          const Operand& d = *dp;
-          // ATOM/ATOMG's predicate: done in hardware (a generic CAS of a
-          // shared address included, so no software path is needed).
-          if (ins.op != Op::ATOMS) set_pred(w, ins.dst[0], l, true);
-          if (is64) write64(w, d, l, old);
-          else write32(w, d, l, static_cast<uint32_t>(old));
-          // CAST.SPIN: whether it stored (ATOMS keeps the mode in f[1], ATOM in f[6]).
-          // The .64 form's flag is the whole register pair: ptxas's loop
-          // after it (sm_86's atomicAdd of a double in shared memory, as
-          // CUDA Samples' jacobiCudaGraphs does) tests Rd == 1 and Rd+1 == 0,
-          // so leaving the old value's high word in Rd+1 spun forever.
-          if (cas && (ins.op == Op::ATOMS ? ins.f[1] == 3 : ins.f[6] != 0)) {
-            if (d.kind == Kind::Pred) set_pred(w, d, l, old == v);   // sm_100's ATOMS.CAST.SPIN P
-            else if (is64) write64(w, d, l, old == v ? 1 : 0);
-            else write32(w, d, l, old == v ? 1 : 0);
-          }
-        }
+        if (!red) emit(l, word, old, v);
         }   // for each word of a vector atomic
       });
       return;
@@ -2414,6 +3307,51 @@ void Runner::exec_warp(Block&, Warp& w, const Instr& ins, Mask ex, Mask) {
       // dst[0] the in-range predicate, dst[1] the value; src: value, lane, c
       // (c = clamp in bits 0-4, segment mask in 8-12), as PTX's shfl.
       uint32_t vals[32];
+      if (fast_ && ins.dst.size() == 2 && ins.dst[0].kind == Kind::Pred && ins.dst[1].kind == Kind::Reg && ins.src.size() >= 3) {
+        // The three sources as 32 lanes each (a register's own, or the one value every lane has), and the answers worked
+        // out for all 32 lanes, then written for the active ones: no operand is read through read32 per lane.
+        bool simple = true;
+        for (int i = 0; i < 3; ++i) {
+          const Kind k = ins.src[i].kind;
+          simple = simple && (k == Kind::Reg || k == Kind::Imm || k == Kind::FImm || k == Kind::UReg || k == Kind::CBank);
+        }
+        if (simple) {
+          uint32_t tmp[3][32];
+          const auto row = [&](unsigned i) -> const uint32_t* {
+            const Operand& o = ins.src[i];
+            if (o.kind == Kind::Reg && o.reg != kRZ) return &w.reg(o.reg, 0);
+            const uint32_t v = o.kind == Kind::Reg ? 0u : read32(w, o, 0);
+            for (unsigned l = 0; l < 32; ++l) tmp[i][l] = v;
+            return tmp[i];
+          };
+          const uint32_t *vp = row(0), *bp = row(1), *cp = row(2);
+          const unsigned mode = ins.f[0];
+          uint32_t out[32];
+          Mask in_range = 0;
+          for (unsigned l = 0; l < 32; ++l) {
+            const uint32_t b = bp[l], c = cp[l];
+            const uint32_t clamp = c & 0x1f, segmask = (c >> 8) & 0x1f;
+            const uint32_t maxl = (l & segmask) | (clamp & ~segmask), minl = l & segmask;
+            uint32_t j;
+            bool in;
+            switch (mode) {
+              case 0: j = minl | (b & ~segmask & 0x1f); in = j <= maxl; break;
+              case 1: j = l - b; in = static_cast<int32_t>(j) >= static_cast<int32_t>(maxl); break;
+              case 2: j = l + b; in = j <= maxl; break;
+              default: j = l ^ b; in = j <= maxl; break;
+            }
+            if (!in) j = l;
+            out[l] = ((ex >> (j & 31)) & 1) ? vp[j & 31] : 0;   // (a source lane that is not running this shuffle gives 0)
+            in_range |= static_cast<Mask>(in) << l;
+          }
+          if (ins.dst[1].reg != kRZ) {
+            uint32_t* d = &w.reg(ins.dst[1].reg, 0);
+            for (Mask m = ex; m; m &= m - 1) d[std::countr_zero(m)] = out[std::countr_zero(m)];
+          }
+          if (ins.dst[0].reg != kPT) w.p[ins.dst[0].reg] = (w.p[ins.dst[0].reg] & ~ex) | (in_range & ex);
+          return;
+        }
+      }
       for (unsigned l = 0; l < 32; ++l) vals[l] = read32(w, ins.src[0], l);
       each_lane(ex, [&](unsigned l) {
         const uint32_t b = read32(w, ins.src[1], l), c = read32(w, ins.src[2], l);
@@ -2438,6 +3376,25 @@ void Runner::exec_warp(Block&, Warp& w, const Instr& ins, Mask ex, Mask) {
     }
     case Op::VOTE: case Op::VOTEU: {
       Mask ballot = 0;
+      if (fast_ && ins.op == Op::VOTE && !ins.dst.empty() && ins.dst.back().kind == Kind::Pred &&
+          (ins.dst.size() == 1 || ins.dst[0].kind == Kind::Reg) &&
+          (ins.src[0].kind == Kind::Pred || ins.src[0].kind == Kind::UPred)) {
+        // The predicate as the warp holds it (a bit a lane), the answers written for the active lanes as masks.
+        const Operand& so = ins.src[0];
+        Mask v;
+        if (so.kind == Kind::UPred) v = (so.reg == kPT || w.up[so.reg]) ? kAll : 0;
+        else v = so.reg == kPT ? kAll : w.p[so.reg];
+        ballot = (so.neg ? ~v : v) & ex;
+        const bool all = (ballot & ex) == ex, any = ballot != 0, eq = all || !any;
+        const bool r = ins.f[0] == 0 ? all : ins.f[0] == 1 ? any : eq;
+        const Operand& pd = ins.dst.back();
+        if (ins.dst.size() > 1 && ins.dst[0].reg != kRZ) {
+          uint32_t* d = &w.reg(ins.dst[0].reg, 0);
+          for (Mask m = ex; m; m &= m - 1) d[std::countr_zero(m)] = ballot;
+        }
+        if (pd.reg != kPT) w.p[pd.reg] = (w.p[pd.reg] & ~ex) | (r ? ex : 0);
+        return;
+      }
       each_lane(ex, [&](unsigned l) {
         if (pred(w, ins.src[0], l)) ballot |= Mask{1} << l;
       });
@@ -3425,11 +4382,22 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         else take = agreed ? group : 0;
       }
       const int64_t target = ins.src.back().imm;
-      each_lane(group, [&](unsigned l) {
-        const uint64_t base = base_of(l);
-        const uint64_t next = w.pc[l] + 16;
-        w.pc[l] = ((take >> l) & 1) ? base + static_cast<uint64_t>(target) : next;
-      });
+      if (fast_ && (take == group || !take)) {
+        // Every lane of the group goes the same way: a lane's new pc is its own plus the distance to the target
+        // (base_of(l) + target = pc - ins.pc + target) or plus 16. (A whole warp is a straight loop over its 32 counters.)
+        const uint64_t delta = take ? static_cast<uint64_t>(target) - ins.pc : 16;
+        if (group == kAll) {
+          for (unsigned l = 0; l < 32; ++l) w.pc[l] += delta;
+        } else {
+          each_lane(group, [&](unsigned l) { w.pc[l] += delta; });
+        }
+      } else {
+        each_lane(group, [&](unsigned l) {
+          const uint64_t base = base_of(l);
+          const uint64_t next = w.pc[l] + 16;
+          w.pc[l] = ((take >> l) & 1) ? base + static_cast<uint64_t>(target) : next;
+        });
+      }
       // A group that branches backwards while other lanes wait gives way now
       // and then.
       if (take && target <= static_cast<int64_t>(ins.pc) && (w.runnable() & ~group)) {

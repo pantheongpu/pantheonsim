@@ -19,6 +19,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/texture.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
@@ -54,7 +55,8 @@ uint64_t dbits(double d) {
 std::vector<uint64_t> int_values() {
   const uint32_t v[] = {0, 1, 2, 3, 7, 31, 32, 33, 40, 0xFFFFFFFFu, 0xFFFFFFFEu, 0x7FFFFFFFu,
                         0x80000000u, 0x80000001u, 0xFFFFu, 0x10000u, 0xDEADBEEFu, 1103515245u,
-                        12345u, 0xAAAAAAAAu, 0x55555555u, 100, 0xFFFFFF9Cu /* -100 */};
+                        12345u, 0xAAAAAAAAu, 0x55555555u, 100, 0xFFFFFF9Cu /* -100 */, 16777217u /* 2^24 + 1 */,
+                        0x7FFFFF81u, 0xFEFFFFFFu, 0x01000003u, 0x80000100u};
   std::vector<uint64_t> out;
   for (int i = 0; i < kThreads; ++i) out.push_back(v[(i * 7 + i / 23) % (sizeof v / sizeof v[0])]);
   return out;
@@ -399,6 +401,84 @@ VTEST(fast_wmma_matches_the_general_path) {
   }
 }
 
+// A NaN in the f32 accumulator tile is the canonical one, 0x7fffffff (what the SASS executor's HMMA path writes, and an
+// RTX 3060). Which NaN the host's vector adds and multiplies hand on when two NaNs meet is the first source operand's, and
+// the compiler picks that order, so before the tile canonicalised its result the sign came out differently from one build
+// to another. NaNs go in through A, B and C (f16 and bf16 NaN codes, f32 NaNs of both signs and payloads, infinities
+// that make inf * 0), and every NaN word that comes out must be 0x7fffffff (the non-NaN words are compared with the
+// general path by the test above and by simd_lane_forms). Shapes: the m16n16k16 forms (the tile), and m32n8k16 (the
+// generic path); both with the fast paths and with VGPU_FASTPATH=0.
+VTEST(wmma_f32_accumulator_nans_are_the_canonical_one) {
+  const uint16_t h16[] = {0x7E00, 0xFE01, 0x7C00, 0xFC00, 0x3C00, 0x0000, 0x8000, 0x7C01, 0x3555, 0xBC00, 0x7FFF, 0x4248};
+  const uint16_t hbf[] = {0x7FC0, 0xFFC1, 0x7F80, 0xFF80, 0x3F80, 0x0000, 0x8000, 0x7F81, 0x3EAB, 0xBF80, 0x7FFF, 0x4049};
+  const uint32_t cn[] = {0x7FC00000u, 0xFFC00000u, 0x7F800001u, 0xFFFFFFFFu, 0x7FC12345u, 0xFFA00000u, 0x3F800000u, 0x80000000u};
+  int checked = 0;
+  for (bool bf : {false, true})
+    for (const char* shape : {".m16n16k16", ".m32n8k16"}) {
+      const bool wide = std::string(shape) == ".m32n8k16";
+      std::vector<uint32_t> frag;
+      for (int lane = 0; lane < 32; ++lane) {
+        const int na = bf ? 4 : 8, nb = na;   // (f16 fragments A and B are 8 registers in every shape)
+        const uint16_t* t = bf ? hbf : h16;
+        for (int r = 0; r < 8; ++r) {   // the A words, then the B words (the shape's B may need fewer)
+          const uint16_t lo = t[(lane * 3 + r * 5) % 12], hi = t[(lane * 7 + r * 3 + 1) % 12];
+          frag.push_back(r < na ? (uint32_t{lo} | (uint32_t{hi} << 16)) : 0u);
+        }
+        for (int r = 0; r < 8; ++r) {
+          const uint16_t lo = t[(lane * 5 + r * 7 + 2) % 12], hi = t[(lane * 11 + r * 3) % 12];
+          frag.push_back(r < nb ? (uint32_t{lo} | (uint32_t{hi} << 16)) : 0u);
+        }
+        for (int r = 0; r < 8; ++r) frag.push_back((lane + r) % 3 == 0 ? cn[(lane * 5 + r) % 8] : fbits(float(lane % 7) - 3.0f));
+      }
+      for (const char* lay : {"row.row", "col.col"})
+        for (const char* fp : {"1", "0"}) {
+          const std::string sh = std::string(lay) + shape + ".f32" + (bf ? ".bf16.bf16" : ".f32");
+          if (bf && wide) continue;   // (bf16 has only m16n16k16 here)
+          setenv("VGPU_FASTPATH", fp, 1);
+          const auto d = run_wmma(sh, false, frag);
+          unsetenv("VGPU_FASTPATH");
+          int nans = 0;
+          for (size_t i = 0; i < d.size(); ++i)
+            if ((d[i] & 0x7FFFFFFFu) > 0x7F800000u) {
+              ++nans;
+              if (d[i] != 0x7FFFFFFFu) {
+                char buf[160];
+                std::snprintf(buf, sizeof buf, "wmma %s (VGPU_FASTPATH=%s): word %zu is the NaN 0x%08x, not 0x7fffffff", sh.c_str(), fp, i, d[i]);
+                throw vtest::Failure(buf);
+              }
+            }
+          VCHECK(nans > 8);   // the inputs do make NaNs
+          ++checked;
+        }
+    }
+  VCHECK_EQ(checked, 12);
+  // One NaN alone in a clean tile, in the left eight columns of its row and in the right eight (lane 0 and lane 1 of the C
+  // fragment, register 0: elements 0 and 8): it comes out canonical, and nothing else in the tile is a NaN.
+  for (uint32_t lane_with_nan : {0u, 1u, 30u, 31u})
+    for (uint32_t pattern : {0xFFFFFFFFu, 0xFFC12345u, 0x7F800001u}) {
+      std::vector<uint32_t> frag;
+      for (uint32_t lane = 0; lane < 32; ++lane) {
+        for (int r = 0; r < 8; ++r) frag.push_back(0x3C003C00u);   // A: all ones (f16)
+        for (int r = 0; r < 8; ++r) frag.push_back(0x3C003C00u);   // B: all ones
+        for (int r = 0; r < 8; ++r) frag.push_back(lane == lane_with_nan && r == 0 ? pattern : fbits(0.5f));
+      }
+      for (const char* fp : {"1", "0"}) {
+        setenv("VGPU_FASTPATH", fp, 1);
+        const auto d = run_wmma("row.row.m16n16k16.f32.f32", false, frag);
+        unsetenv("VGPU_FASTPATH");
+        for (size_t i = 0; i < d.size(); ++i) {
+          const bool want_nan = i == lane_with_nan * 8;
+          if (want_nan ? d[i] != 0x7FFFFFFFu : (d[i] & 0x7FFFFFFFu) > 0x7F800000u) {
+            char buf[160];
+            std::snprintf(buf, sizeof buf, "a lone NaN 0x%08x in lane %u: word %zu is 0x%08x (VGPU_FASTPATH=%s)", pattern,
+                          lane_with_nan, i, d[i], fp);
+            throw vtest::Failure(buf);
+          }
+        }
+      }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Memory accesses: the counters and the data, fast against general.
 //
@@ -429,7 +509,7 @@ struct MemRun {
 // every lane or only the even ones. Loads fold what they read into out[t];
 // the buffer is dumped to out afterwards either way, so stores are seen.
 MemRun run_access(const Access& a, int stride, int shift, bool even_only, bool store,
-                  bool is_shared) {
+                  bool is_shared, bool is_local = false) {
   const int width = a.bytes * a.vec;                // bytes one lane moves
   const int nelem = 16384 / width;                  // elements in the region
   std::string regs;
@@ -442,14 +522,18 @@ MemRun run_access(const Access& a, int stride, int shift, bool even_only, bool s
   ptx += "    .reg .pred %p<4>;\n    .reg .b32 %r<24>;\n    .reg .b64 %rd<16>;\n";
   ptx += "    .reg .b32 %v0, %v1, %v2, %v3;\n    .reg .b64 %w0, %w1, %w2, %w3;\n";
   if (is_shared) ptx += "    .shared .align 16 .b8 sm[16384];\n";
+  if (is_local) ptx += "    .local .align 16 .b8 loc[16384];\n";
   ptx += "    ld.param.u64 %rd1, [pbuf];\n    ld.param.u64 %rd2, [pout];\n    mov.u32 %r1, %tid.x;\n";
   // Fill: thread t writes words t + 64 j, j < 64, with a value that names the word.
   if (is_shared) ptx += "    mov.u32 %r10, sm;\n";
+  if (is_local) ptx += "    mov.u64 %rd9, loc;\n";
   for (int j = 0; j < 64; ++j) {
     ptx += "    add.u32 %r5, %r1, " + std::to_string(64 * j) + ";\n";
     ptx += "    mul.lo.u32 %r6, %r5, 2654435761;\n    xor.b32 %r6, %r6, 305419896;\n";
     if (is_shared) {
       ptx += "    shl.b32 %r7, %r5, 2;\n    add.u32 %r7, %r7, %r10;\n    st.shared.u32 [%r7], %r6;\n";
+    } else if (is_local) {
+      ptx += "    mul.wide.u32 %rd3, %r5, 4;\n    add.u64 %rd3, %rd9, %rd3;\n    st.local.u32 [%rd3], %r6;\n";
     } else {
       ptx += "    mul.wide.u32 %rd3, %r5, 4;\n    add.u64 %rd3, %rd1, %rd3;\n    st.global.u32 [%rd3], %r6;\n";
     }
@@ -461,11 +545,11 @@ MemRun run_access(const Access& a, int stride, int shift, bool even_only, bool s
   ptx += "    and.b32 %r11, %r11, " + std::to_string(nelem - 1) + ";\n";
   ptx += "    mul.lo.u32 %r12, %r11, " + std::to_string(width) + ";\n";
   if (is_shared) ptx += "    add.u32 %r12, %r12, %r10;\n";
-  else ptx += "    cvt.u64.u32 %rd4, %r12;\n    add.u64 %rd4, %rd1, %rd4;\n";
+  else ptx += std::string("    cvt.u64.u32 %rd4, %r12;\n    add.u64 %rd4, ") + (is_local ? "%rd9" : "%rd1") + ", %rd4;\n";
   ptx += "    and.b32 %r13, %r1, 1;\n    setp.eq.u32 %p1, %r13, 0;\n";
   const std::string guard = even_only ? "@%p1 " : "";
   const std::string addr = is_shared ? "[%r12]" : "[%rd4]";
-  const std::string sp = is_shared ? "shared" : "global";
+  const std::string sp = is_shared ? "shared" : is_local ? "local" : "global";
   // Each element is a 32- or 64-bit register; narrower types load into 32-bit ones.
   std::string list;
   for (int i = 0; i < a.vec; ++i)
@@ -501,6 +585,8 @@ MemRun run_access(const Access& a, int stride, int shift, bool even_only, bool s
     ptx += "    add.u32 %r5, %r1, " + std::to_string(64 * j) + ";\n";
     if (is_shared) {
       ptx += "    shl.b32 %r7, %r5, 2;\n    add.u32 %r7, %r7, %r10;\n    ld.shared.u32 %r8, [%r7];\n";
+    } else if (is_local) {
+      ptx += "    mul.wide.u32 %rd3, %r5, 4;\n    add.u64 %rd3, %rd9, %rd3;\n    ld.local.u32 %r8, [%rd3];\n";
     } else {
       ptx += "    mul.wide.u32 %rd3, %r5, 4;\n    add.u64 %rd3, %rd1, %rd3;\n    ld.global.u32 %r8, [%rd3];\n";
     }
@@ -540,18 +626,19 @@ VTEST(memory_access_counters_and_data_match_the_general_path) {
                              {"v2.u64", "u64", 8, 2}};
   const int strides[] = {0, 1, 2, 3, 4, 5, 8, 16, 17, 32, 33, 64};
   int runs = 0;
-  for (bool is_shared : {true, false})
+  for (int space : {1, 0, 2})   // shared, global, local
     for (const Access& a : accesses)
       for (int stride : strides)
         for (bool even : {false, true})
           for (bool store : {false, true}) {
+            const bool is_shared = space == 1, is_local = space == 2;
             const int shift = stride == 3 ? 5 : 0;
             setenv("VGPU_FASTPATH", "1", 1);
-            const MemRun fast = run_access(a, stride, shift, even, store, is_shared);
+            const MemRun fast = run_access(a, stride, shift, even, store, is_shared, is_local);
             setenv("VGPU_FASTPATH", "0", 1);
-            const MemRun slow = run_access(a, stride, shift, even, store, is_shared);
+            const MemRun slow = run_access(a, stride, shift, even, store, is_shared, is_local);
             unsetenv("VGPU_FASTPATH");
-            const std::string what = std::string(is_shared ? "shared " : "global ") + (store ? "st." : "ld.") +
+            const std::string what = std::string(is_shared ? "shared " : is_local ? "local " : "global ") + (store ? "st." : "ld.") +
                                      a.space + " stride " + std::to_string(stride) + (even ? " even lanes" : " all lanes");
             if (fast.error != slow.error)
               throw vtest::Failure(what + ": fast error '" + fast.error + "', general '" + slow.error + "'");
@@ -559,7 +646,7 @@ VTEST(memory_access_counters_and_data_match_the_general_path) {
             if (!same_stats(fast.stats, slow.stats)) throw vtest::Failure(what + ": counters differ");
             ++runs;
           }
-  VCHECK(runs > 300);
+  VCHECK(runs > 450);
 }
 
 // The counters are not just equal to each other: shared bank passes and global
@@ -638,7 +725,7 @@ VTEST(refused_accesses_give_the_same_error) {
     setenv("VGPU_FASTPATH", fp, 1);
     const std::string ptx = ".version 8.3\n.target sm_86\n.address_size 64\n"
         ".visible .entry k(.param .u64 pout)\n{\n    .reg .b32 %r<8>;\n    .reg .b64 %rd<8>;\n"
-        "    .shared .align 16 .b8 sm[256];\n    mov.u32 %r1, %tid.x;\n    mov.u32 %r2, sm;\n" + body + "    ret;\n}\n";
+        "    .shared .align 16 .b8 sm[256];\n    .local .align 16 .b8 loc[256];\n    mov.u32 %r1, %tid.x;\n    mov.u32 %r2, sm;\n" + body + "    ret;\n}\n";
     MemoryManager mem{1 << 20};
     DeviceProfile prof = load_gpu("nvidia/a10");
     auto m = ptx::parse(ptx);
@@ -661,8 +748,17 @@ VTEST(refused_accesses_give_the_same_error) {
       // a vector access that is not aligned to its width
       "    shl.b32 %r3, %r1, 4;\n    add.u32 %r3, %r3, %r2;\n    ld.shared.v4.u32 {%r4, %r5, %r6, %r7}, [%r3+4];\n",
       "    shl.b32 %r3, %r1, 4;\n    add.u32 %r3, %r3, %r2;\n    st.shared.v2.u32 [%r3+4], {%r1, %r1};\n",
+      // in-bounds but misaligned: a vector at +4, a word at +2 (the whole warp alike, so no lane runs past the end)
+      "    ld.shared.v4.u32 {%r4, %r5, %r6, %r7}, [%r2+4];\n",
+      "    st.shared.v2.u32 [%r2+4], {%r1, %r1};\n",
+      "    ld.shared.u32 %r4, [%r2+2];\n",
+      "    mov.u64 %rd2, loc;\n    ld.local.v2.u32 {%r4, %r5}, [%rd2+4];\n",
       // a store through an address in no allocation
       "    mov.u64 %rd2, 16;\n    st.global.u32 [%rd2], %r1;\n",
+      // .local accesses past the frame, in the last lane only, and a misaligned vector
+      "    mov.u64 %rd2, loc;\n    mul.wide.u32 %rd3, %r1, 8;\n    add.u64 %rd3, %rd3, %rd2;\n    ld.local.u32 %r4, [%rd3+8];\n",
+      "    mov.u64 %rd2, loc;\n    mul.wide.u32 %rd3, %r1, 8;\n    add.u64 %rd3, %rd3, %rd2;\n    st.local.u32 [%rd3+8], %r1;\n",
+      "    mov.u64 %rd2, loc;\n    mul.wide.u32 %rd3, %r1, 16;\n    add.u64 %rd3, %rd3, %rd2;\n    ld.local.v4.u32 {%r4, %r5, %r6, %r7}, [%rd3+4];\n",
   };
   for (const char* body : bodies) {
     const std::string fast = run_bad(body, "1"), slow = run_bad(body, "0");
@@ -718,6 +814,581 @@ VTEST(thread_ids_are_the_linear_index_split_by_the_block_shape) {
   }
 }
 
+// Device-function calls: a recursive function whose depth differs by lane (so paths split inside it and the warp's
+// frames go as deep as 12), a struct argument passed as bytes, and calls in a loop, which reuse the frames a return
+// leaves behind. The values are computed on the host.
+VTEST(device_function_calls_return_what_the_host_computes) {
+  const std::string ptx = R"(.version 8.3
+.target sm_86
+.address_size 64
+.func (.param .b32 func_retval0) fibf(.param .b32 fibf_param_0)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<9>;
+    ld.param.u32 %r8, [fibf_param_0];
+    setp.lt.s32 %p1, %r8, 2;
+    @%p1 bra DONE;
+    add.s32 %r4, %r8, -1;
+    {
+    .reg .b32 temp_param_reg;
+    .param .b32 param0;
+    st.param.b32 [param0+0], %r4;
+    .param .b32 retval0;
+    call.uni (retval0), fibf, (param0);
+    ld.param.b32 %r5, [retval0+0];
+    }
+    add.s32 %r6, %r8, -2;
+    {
+    .reg .b32 temp_param_reg;
+    .param .b32 param0;
+    st.param.b32 [param0+0], %r6;
+    .param .b32 retval0;
+    call.uni (retval0), fibf, (param0);
+    ld.param.b32 %r7, [retval0+0];
+    }
+    add.s32 %r8, %r7, %r5;
+DONE:
+    st.param.b32 [func_retval0+0], %r8;
+    ret;
+}
+.func (.param .b32 func_retval0) f3(.param .b32 f3_param_0, .param .b32 f3_param_1)
+{
+    .reg .b32 %r<4>;
+    ld.param.u32 %r1, [f3_param_0];
+    ld.param.u32 %r2, [f3_param_1];
+    mad.lo.s32 %r3, %r1, 3, %r2;
+    st.param.b32 [func_retval0+0], %r3;
+    ret;
+}
+.func (.param .b32 func_retval0) hs(.param .align 4 .b8 hs_param_0[8], .param .b32 hs_param_1)
+{
+    .reg .b32 %r<6>;
+    ld.param.u32 %r1, [hs_param_1];
+    ld.param.u32 %r2, [hs_param_0];
+    ld.param.u32 %r4, [hs_param_0+4];
+    mad.lo.s32 %r3, %r2, %r1, %r4;
+    st.param.b32 [func_retval0+0], %r3;
+    ret;
+}
+.visible .entry k(.param .u64 po)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [po];
+    mov.u32 %r1, %tid.x;
+    rem.u32 %r2, %r1, 12;
+    {
+    .reg .b32 temp_param_reg;
+    .param .b32 param0;
+    st.param.b32 [param0+0], %r2;
+    .param .b32 retval0;
+    call.uni (retval0), fibf, (param0);
+    ld.param.b32 %r3, [retval0+0];
+    }
+    add.s32 %r3, %r3, 100000;
+    mov.u32 %r4, 0;
+LOOP:
+    {
+    .reg .b32 temp_param_reg;
+    .param .b32 param0;
+    st.param.b32 [param0+0], %r3;
+    .param .b32 param1;
+    st.param.b32 [param1+0], %r4;
+    .param .b32 retval0;
+    call.uni (retval0), f3, (param0, param1);
+    ld.param.b32 %r5, [retval0+0];
+    }
+    and.b32 %r6, %r5, 3;
+    {
+    .reg .b32 temp_param_reg;
+    .param .align 4 .b8 param0[8];
+    st.param.b32 [param0+0], %r4;
+    st.param.b32 [param0+4], 7;
+    .param .b32 param1;
+    st.param.b32 [param1+0], %r6;
+    .param .b32 retval0;
+    call.uni (retval0), hs, (param0, param1);
+    ld.param.b32 %r7, [retval0+0];
+    }
+    add.s32 %r3, %r5, %r7;
+    add.s32 %r4, %r4, 1;
+    setp.lt.s32 %p1, %r4, 5;
+    @%p1 bra LOOP;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r3;
+    ret;
+}
+)";
+  auto fib = [](int n) { int a = 0, b = 1; for (int i = 0; i < n; ++i) { const int t = a + b; a = b; b = t; } return a; };
+  for (const char* fp : {"1", "0"}) {
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(ptx);
+    const uint64_t po = mem.alloc(100 * 4);
+    LaunchConfig cfg;
+    cfg.block = {100, 1, 1};
+    exec::launch(m.entries[0], cfg, {arg_u64(po)}, mem, prof);
+    std::vector<int32_t> got(100);
+    mem.read(po, got.data(), 400);
+    for (int t = 0; t < 100; ++t) {
+      int32_t acc = fib(t % 12) + 100000;
+      for (int i = 0; i < 5; ++i) {
+        const int32_t r = acc * 3 + i;
+        acc = r + ((i * (r & 3)) + 7);
+      }
+      VCHECK_EQ(got[t], acc);
+    }
+    unsetenv("VGPU_FASTPATH");
+  }
+}
+
+// 32-bit division and remainder (zero divisors, -1, INT_MIN), the 64-bit mov and cvta, warpSize, and predicate logic, as
+// pre-decoded forms against the general path, unguarded and under both guards; and a division by zero is the same
+// error in strict mode.
+VTEST(pre_decoded_div_mov64_cvta_and_predicate_forms_match_the_general_path) {
+  const auto a = int_values(), b = rotate(a, 5), c = rotate(a, 11);
+  std::vector<uint64_t> w;
+  const uint64_t wv[] = {0, 1, 5, ~0ull, 0x8000000000000000ull, 0x123456789ABCDEF0ull, 0xFFFFFFFF80000000ull, 4294967296ull};
+  for (int i = 0; i < kThreads; ++i) w.push_back(wv[(i * 3 + i / 8) % 8]);
+  const auto w2 = rotate(w, 3), w3 = rotate(w, 5);
+  for (int guard : {1, 2, 0}) {
+    g_guard = guard;
+    for (const char* ty : {"u32", "s32"})
+      for (const char* op : {"div", "rem"}) {
+        const std::string o = std::string(op) + "." + ty;
+        same(o + " %d, %a, %b;", false, a, b, c);
+        same(o + " %d, %a, 7;", false, a, b, c);
+        same(o + " %d, %a, -1;", false, a, b, c);
+        same(o + " %d, %a, 0;", false, a, b, c);
+        same(o + " %d, -2147483648, %b;", false, a, b, c);
+        same(o + " %a, %a, %b; mov.b32 %d, %a;", false, a, b, c);
+      }
+    same("mov.u64 %D, %A;", true, w, w2, w3);
+    same("mov.b64 %D, 5;", true, w, w2, w3);
+    same("mov.u64 %D, -5;", true, w, w2, w3);
+    same("mov.b64 %D, 4294967296;", true, w, w2, w3);   // beyond 32 bits: the general path
+    same("mov.u64 %D, %rd20;", true, w, w2, w3);         // a register nothing has written
+    same("cvta.to.global.u64 %D, %A;", true, w, w2, w3);
+    same("cvta.global.u64 %D, %A;", true, w, w2, w3);
+    same("cvta.shared.u64 %D, %A;", true, w, w2, w3);   // a window to add: the general path
+    same("cvta.to.shared.u64 %D, %A;", true, w, w2, w3);
+    same("mov.u32 %d, WARP_SZ;", false, a, b, c);
+    same("setp.lt.u32 %p3, %a, %b; setp.ge.u32 %p4, %a, %c; and.pred %p5, %p3, %p4; or.pred %p6, %p3, %p4; "
+         "xor.pred %p7, %p3, %p5; not.pred %p2, %p6; selp.u32 %r3, 1, 0, %p5; selp.u32 %r4, 2, 0, %p6; "
+         "selp.u32 %r5, 4, 0, %p7; selp.u32 %r6, 8, 0, %p2; or.b32 %d, %r3, %r4; or.b32 %d, %d, %r5; "
+         "or.b32 %d, %d, %r6;", false, a, b, c);
+    same("setp.lt.u32 %p3, %a, %b; not.pred %p3, %p3; selp.u32 %d, 3, 4, %p3;", false, a, b, c);   // destination is a source
+    g_guard = 0;
+  }
+  // Strict mode turns a zero divisor into an error; the pre-decoded form leaves it to the general path.
+  auto run_strict = [&](const char* fp) {
+    setenv("VGPU_STRICT", "1", 1);
+    setenv("VGPU_FASTPATH", fp, 1);
+    std::string err;
+    try {
+      run("div.u32 %d, %a, %b;", false, a, b, c);
+    } catch (const std::exception& e) {
+      err = e.what();
+    }
+    unsetenv("VGPU_STRICT");
+    unsetenv("VGPU_FASTPATH");
+    return err;
+  };
+  const std::string fast_err = run_strict("1"), slow_err = run_strict("0");
+  VCHECK(!slow_err.empty());
+  VCHECK_EQ(fast_err, slow_err);
+}
+
+// ld.param of each scalar type into 32- and 64-bit registers: signed values extend, unsigned ones do not, in the pre-decoded
+// form and in the general path alike.
+VTEST(ld_param_of_every_scalar_type_gives_the_same_value) {
+  const std::string ptx = R"(.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 out, .param .s8 a, .param .s16 b, .param .s32 c, .param .u8 d, .param .u16 e,
+                  .param .f32 f, .param .u64 g, .param .s32 h)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    ld.param.s8 %r1, [a];
+    ld.param.s16 %r2, [b];
+    ld.param.s32 %r3, [c];
+    ld.param.u8 %r4, [d];
+    ld.param.u16 %r5, [e];
+    ld.param.f32 %r6, [f];
+    ld.param.u64 %rd2, [g];
+    ld.param.s32 %rd3, [h];
+    st.global.u32 [%rd1], %r1;
+    st.global.u32 [%rd1+4], %r2;
+    st.global.u32 [%rd1+8], %r3;
+    st.global.u32 [%rd1+12], %r4;
+    st.global.u32 [%rd1+16], %r5;
+    st.global.u32 [%rd1+20], %r6;
+    st.global.u64 [%rd1+24], %rd2;
+    st.global.u64 [%rd1+32], %rd3;
+    ret;
+}
+)";
+  for (const char* fp : {"1", "0"}) {
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(ptx);
+    const uint64_t out = mem.alloc(48);
+    LaunchConfig cfg;
+    cfg.block = {40, 1, 1};   // two warps, the second partial
+    const std::vector<std::vector<uint8_t>> args = {arg_u64(out), {0x85}, {0x34, 0x92}, {0x78, 0x56, 0x34, 0x82}, {0xF1},
+                                                    {0xCD, 0xAB}, {0x00, 0x00, 0x80, 0x3F}, arg_u64(0x1122334455667788ull),
+                                                    {0x01, 0x00, 0x00, 0x80}};
+    exec::launch(m.entries[0], cfg, args, mem, prof);
+    uint32_t w[6];
+    uint64_t q[2];
+    mem.read(out, w, 24);
+    mem.read(out + 24, q, 16);
+    unsetenv("VGPU_FASTPATH");
+    VCHECK_EQ(w[0], 0xFFFFFF85u);   // s8 -> 32 bits, sign-extended
+    VCHECK_EQ(w[1], 0xFFFF9234u);
+    VCHECK_EQ(w[2], 0x82345678u);
+    VCHECK_EQ(w[3], 0xF1u);
+    VCHECK_EQ(w[4], 0xABCDu);
+    VCHECK_EQ(w[5], 0x3F800000u);
+    VCHECK_EQ(q[0], 0x1122334455667788ull);
+    VCHECK_EQ(q[1], 0xFFFFFFFF80000001ull);   // s32 into a 64-bit register: sign-extended
+  }
+}
+
+// 16-bit integer arithmetic, setp and mov: the operands are 16-bit registers loaded from 32-bit values whose upper half is
+// garbage as often as zero (the upper half takes no part), against the general path, unguarded and under both guards.
+VTEST(pre_decoded_16_bit_forms_match_the_general_path) {
+  const auto a = int_values(), b = rotate(a, 5), c = rotate(a, 11);
+  for (int guard : {1, 2, 0}) {
+    g_guard = guard;
+    for (const char* ty : {"u16", "s16"}) {
+      for (const char* op : {"add", "sub", "mul.lo", "min", "max", "and", "or", "xor", "shl", "shr"}) {
+        const std::string o = std::string(op) + "." + (std::string(op) == "and" || std::string(op) == "or" || std::string(op) == "xor" ||
+                                                      std::string(op) == "shl" ? "b16" : ty);
+        // %rs1 and %rs2 take the low halves with the upper halves left as they are (mov.b32 into a 16-bit register).
+        const std::string load = "mov.b32 %rs1, %a; mov.b32 %rs2, %b; ";
+        same(load + o + " %rs3, %rs1, %rs2; cvt.u32.u16 %d, %rs3;", false, a, b, c);
+        same(load + o + " %rs3, %rs1, 3; cvt.u32.u16 %d, %rs3;", false, a, b, c);
+        same(load + o + " %rs3, %rs1, 17; cvt.u32.u16 %d, %rs3;", false, a, b, c);
+        same(load + o + " %rs3, %rs1, -5; cvt.u32.u16 %d, %rs3;", false, a, b, c);
+        same(load + o + " %rs1, %rs1, %rs2; mov.b32 %d, %rs1;", false, a, b, c);   // destination is a source; upper bits as written
+        same(load + o + " %rs3, %rs1, %b; cvt.u32.u16 %d, %rs3;", false, a, b, c);   // a 32-bit register as the count or operand
+      }
+      for (const char* cmp : {"eq", "ne", "lt", "le", "gt", "ge"}) {
+        const std::string load = "mov.b32 %rs1, %a; mov.b32 %rs2, %b; ";
+        const std::string t = std::string(cmp) == "eq" || std::string(cmp) == "ne" ? "b16" : ty;
+        same(load + "setp." + cmp + "." + t + " %p3, %rs1, %rs2; selp.u32 %d, 1, 2, %p3;", false, a, b, c);
+        same(load + "setp." + cmp + "." + t + " %p3, %rs1, 100; selp.u32 %d, 1, 2, %p3;", false, a, b, c);
+        same(load + "setp." + cmp + "." + t + " %p3, %rs1, -100; selp.u32 %d, 1, 2, %p3;", false, a, b, c);
+      }
+    }
+    same("mov.b32 %rs1, %a; mov.u16 %rs2, %rs1; cvt.u32.u16 %d, %rs2;", false, a, b, c);
+    same("mov.u16 %rs2, 65535; mov.b32 %d, %rs2;", false, a, b, c);
+    same("mov.u16 %rs2, -3; mov.b32 %d, %rs2;", false, a, b, c);
+    same("mov.b32 %rs1, %a; mov.u16 %rs1, %rs1; mov.b32 %d, %rs1;", false, a, b, c);
+    g_guard = 0;
+  }
+}
+
+// f32 arithmetic with .ftz, the contracted subtract (an fma that negates its product or its addend) with and without
+// .ftz, and setp.ftz, unguarded and under both guards: the operands are subnormals, NaNs of every payload, infinities
+// and signed zeros, and the results land in the subnormal range.
+VTEST(pre_decoded_ftz_and_contracted_forms_match_the_general_path) {
+  std::vector<uint64_t> f = f32_values();
+  // More operands that make a product or a sum subnormal.
+  const uint32_t extra[] = {0x00800000u, 0x00800001u, 0x007FFFFFu, 0x80800000u, 0x3F000000u, 0x34000000u, 0x00000010u,
+                            0x80000010u, 0x7F7FFFFFu, 0x33800000u, 0x1A000000u, 0x0A000000u};
+  for (int i = 0; i < kThreads; ++i) f[i] = (i % 3 == 0) ? extra[(i / 3) % 12] : f[i];
+  const auto g = rotate(f, 3), h = rotate(f, 8);
+  for (int guard : {1, 2, 0}) {
+    g_guard = guard;
+    for (const char* op : {"add.ftz.f32", "sub.ftz.f32", "mul.ftz.f32", "min.ftz.f32", "max.ftz.f32", "div.rn.ftz.f32",
+                           "add.rn.ftz.f32", "mul.rn.ftz.f32"})
+      same(std::string(op) + " %d, %a, %b;", false, f, g, h);
+    same("add.ftz.f32 %d, %a, 0f00000001;", false, f, g, h);
+    same("fma.rn.ftz.f32 %d, %a, %b, %c;", false, f, g, h);
+    same("fma.rn.ftz.f32 %d, %a, 0f3F000000, %c;", false, f, g, h);
+    same("fma.rn.ftz.f32 %a, %a, %b, %a; mov.b32 %d, %a;", false, f, g, h);
+    for (const char* cmp : {"eq", "ne", "lt", "le", "gt", "ge", "equ", "neu", "ltu", "num", "nan"})
+      same(std::string("setp.") + cmp + ".ftz.f32 %p3, %a, %b; selp.u32 %d, 1, 2, %p3;", false, f, g, h);
+    // Contraction turns these pairs into one fma with a negated product or addend.
+    for (const char* pair : {"mul.f32 %r3, %a, %b; sub.f32 %d, %r3, %c;", "mul.f32 %r3, %a, %b; sub.f32 %d, %c, %r3;",
+                             "mul.f32 %r3, %a, %b; add.f32 %d, %r3, %c;", "mul.f32 %r3, %a, %b; add.f32 %d, %c, %r3;",
+                             "mul.ftz.f32 %r3, %a, %b; sub.ftz.f32 %d, %r3, %c;",
+                             "mul.ftz.f32 %r3, %a, %b; sub.ftz.f32 %d, %c, %r3;",
+                             "mul.ftz.f32 %r3, %a, %b; add.ftz.f32 %d, %r3, %c;",
+                             "mul.ftz.f32 %r3, %a, %b; add.ftz.f32 %d, %c, %r3;",
+                             "mul.f32 %r3, %a, %b; sub.ftz.f32 %d, %r3, %c;"})   // (mixed: not contracted)
+      same(pair, false, f, g, h);
+    g_guard = 0;
+  }
+}
+
+// mul.hi, neg, abs and the conversion of a narrow integer to f32 or f64, unguarded and under both guards, against the
+// general path: the magic-number multiplies of division by a constant, INT_MIN, NaN payloads and subnormals under
+// .ftz, and integers whose float rounds (above 2^24).
+VTEST(pre_decoded_mul_hi_neg_abs_and_int_to_float_match_the_general_path) {
+  const auto a = int_values(), b = rotate(a, 5), c = rotate(a, 11);
+  const auto f = f32_values();
+  for (int guard : {1, 2, 0}) {
+    g_guard = guard;
+    for (const char* ty : {"u32", "s32"}) {
+      same(std::string("mul.hi.") + ty + " %d, %a, %b;", false, a, b, c);
+      same(std::string("mul.hi.") + ty + " %d, %a, 2863311531;", false, a, b, c);
+      same(std::string("mul.hi.") + ty + " %d, 1431655766, %b;", false, a, b, c);
+      same(std::string("mul.hi.") + ty + " %a, %a, %a; mov.b32 %d, %a;", false, a, b, c);
+    }
+    same("neg.s32 %d, %a;", false, a, b, c);
+    same("abs.s32 %d, %a;", false, a, b, c);
+    same("neg.s32 %d, -2147483648;", false, a, b, c);
+    same("abs.s32 %d, -7;", false, a, b, c);
+    for (const char* op : {"neg.f32", "abs.f32", "neg.ftz.f32", "abs.ftz.f32"}) {
+      same(std::string(op) + " %d, %a;", false, f, b, c);
+      same(std::string(op) + " %d, 0f80000001;", false, f, b, c);
+    }
+    for (const char* cvt : {"cvt.rn.f32.s32 %d, %a;", "cvt.rn.f32.u32 %d, %a;", "cvt.rz.f32.s32 %d, %a;",
+                            "cvt.rm.f32.u32 %d, %a;", "cvt.rn.f32.s64 %d, %A;", "cvt.rn.f32.u64 %d, %A;",
+                            "cvt.rn.f32.s32 %a, %a; mov.b32 %d, %a;",
+                            "cvt.u16.u32 %rs1, %a; cvt.rn.f32.u16 %d, %rs1;",
+                            "cvt.u16.u32 %rs1, %a; cvt.rn.f32.s16 %d, %rs1;",
+                            "cvt.u8.u32 %rs1, %a; cvt.rn.f32.s8 %d, %rs1;",
+                            "cvt.u8.u32 %rs1, %a; cvt.rn.f32.u8 %d, %rs1;",
+                            "cvt.rn.f32.s32 %d, %r15;"})
+      same(cvt, false, a, b, c);
+    for (const char* cvt : {"cvt.rn.f64.s32 %D, %a;", "cvt.rn.f64.u32 %D, %a;", "cvt.rn.f64.s64 %D, %A;",
+                            "cvt.rn.f64.u64 %D, %A;", "cvt.u16.u32 %rs1, %a; cvt.rn.f64.s16 %D, %rs1;"})
+      same(cvt, true, a, b, c);
+    g_guard = 0;
+  }
+}
+
+// Linear filtering of float textures: the fetch's result bits with the fast paths and with VGPU_FASTPATH=0, over texels
+// that make the rounding of the weighted sum matter -- thirds and tenths, the normal range's edges (2^-126, 2^127),
+// subnormals, zeros of both signs, huge values -- and coordinates inside the texture, on its edges and off it, in
+// clamp and wrap mode, on f32 and f16 texels, one and four channels.
+VTEST(linear_texture_fetches_match_the_general_path) {
+  auto set_mode = [&](const char* fp) {   // the mode is read when a kernel launches
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 16};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(".version 8.3\n.target sm_86\n.address_size 64\n.visible .entry k()\n{\n    ret;\n}\n");
+    LaunchConfig cfg;
+    cfg.block = {1, 1, 1};
+    exec::launch(m.entries[0], cfg, {}, mem, prof);
+  };
+  uint64_t seed = 0x2545F4914F6CDD1Dull;
+  auto rnd = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+  auto texel_f32 = [&]() -> uint32_t {
+    switch (rnd() % 12) {
+      case 0: return 0;
+      case 1: return 0x80000000u;
+      case 2: return 1u + static_cast<uint32_t>(rnd() % 0x7FFFFF);                  // subnormal
+      case 3: return 0x00800000u + static_cast<uint32_t>(rnd() % 4096);             // just above the smallest normal
+      case 4: return 0x7F000000u + static_cast<uint32_t>(rnd() % 0x7FFFFF);         // near 2^127
+      case 5: return 0x7F7FFFFFu - static_cast<uint32_t>(rnd() % 100);              // the largest
+      case 6: return 0x3E2AAAABu;                                                    // a third
+      case 7: return 0xBDCCCCCDu;                                                    // -0.1
+      case 8: return 0x7F800000u;                                                    // infinity
+      default: { const float v = static_cast<float>(static_cast<int64_t>(rnd() % 2000001) - 1000000) / 777.0f * (rnd() % 3 ? 1.0f : 1e-20f); uint32_t u; std::memcpy(&u, &v, 4); return u; }
+    }
+  };
+  struct Case { uint32_t bits, channels, w, h; exec::TexAddress addr; bool normalized; };
+  const Case cases[] = {{32, 1, 8, 8, exec::TexAddress::Clamp, false}, {32, 4, 8, 8, exec::TexAddress::Clamp, false},
+                        {32, 1, 5, 7, exec::TexAddress::Wrap, true},   {16, 1, 8, 8, exec::TexAddress::Clamp, false},
+                        {32, 2, 8, 1, exec::TexAddress::Clamp, false}, {32, 1, 8, 8, exec::TexAddress::Border, false}};
+  for (const Case& c : cases) {
+    MemoryManager mem{1 << 20};
+    const uint32_t texel_bytes = c.bits / 8 * c.channels;
+    const uint64_t base = mem.alloc(uint64_t{c.w} * c.h * texel_bytes);
+    std::vector<uint8_t> bytes(uint64_t{c.w} * c.h * texel_bytes);
+    for (size_t i = 0; i < bytes.size(); i += c.bits / 8) {
+      if (c.bits == 32) { const uint32_t t = texel_f32(); std::memcpy(&bytes[i], &t, 4); }
+      else { const uint16_t t = static_cast<uint16_t>(rnd()); std::memcpy(&bytes[i], &t, 2); }
+    }
+    mem.write(base, bytes.data(), bytes.size());
+    exec::TextureDesc d;
+    d.base = base;
+    d.width = c.w;
+    d.height = c.h > 1 ? c.h : 0;
+    d.channels = c.channels;
+    for (uint32_t i = 0; i < 4; ++i) d.channel_bits[i] = i < c.channels ? c.bits : 0;
+    d.texel_bytes = texel_bytes;
+    d.kind = exec::ChannelKind::Float;
+    d.filter = exec::TexFilter::Linear;
+    d.normalized_coords = c.normalized;
+    for (auto& a : d.address) a = c.addr;
+    std::vector<uint32_t> coords;
+    for (int i = 0; i < 400; ++i) {
+      const float span = static_cast<float>(c.normalized ? 2 : c.w + 3);
+      const float x = (static_cast<float>(rnd() % 100000) / 100000.0f - 0.1f) * span;
+      const float y = (static_cast<float>(rnd() % 100000) / 100000.0f - 0.1f) * (c.normalized ? 2.0f : static_cast<float>(c.h + 3));
+      uint32_t xb, yb;
+      std::memcpy(&xb, &x, 4);
+      std::memcpy(&yb, &y, 4);
+      coords.push_back(xb);
+      coords.push_back(yb);
+    }
+    auto run = [&](const char* fp) {
+      set_mode(fp);
+      uint64_t k = 12345;   // the same offsets in both modes
+      std::vector<uint32_t> out;
+      for (size_t i = 0; i < coords.size(); i += 2) {
+        exec::TexFetch f;
+        f.dims = c.h > 1 ? 2 : 1;
+        f.coord[0] = coords[i];
+        f.coord[1] = coords[i + 1];
+        if ((i / 2) % 3 == 1) {   // every third fetch carries an offset operand
+          k = k * 6364136223846793005ull + 1442695040888963407ull;
+          f.offset[0] = static_cast<int32_t>((k >> 33) % 16) - 8;
+          f.offset[1] = c.h > 1 ? static_cast<int32_t>((k >> 40) % 16) - 8 : 0;
+        }
+        uint32_t r[4] = {0, 0, 0, 0};
+        exec::texture_fetch(mem, d, f, r);
+        out.insert(out.end(), r, r + 4);
+      }
+      return out;
+    };
+    const auto fast = run("1"), slow = run("0");
+    unsetenv("VGPU_FASTPATH");
+    VCHECK_EQ(fast.size(), slow.size());
+    for (size_t i = 0; i < fast.size(); ++i)
+      if (fast[i] != slow[i]) {
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "f%u x%u %ux%u fetch %zu channel %zu: fast 0x%08x, general 0x%08x", c.bits, c.channels,
+                      c.w, c.h, i / 4, i % 4, fast[i], slow[i]);
+        throw vtest::Failure(buf);
+      }
+  }
+}
+
+// Reading the special registers every thread starts with: tid, ntid, ctaid, nctaid and the lane id, in a grid of
+// several blocks of several shapes, against the values the launch geometry gives.
+VTEST(special_registers_read_what_the_launch_geometry_says) {
+  const std::string ptx = R"(.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 po)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [po];
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %tid.y;
+    mov.u32 %r3, %tid.z;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %ntid.y;
+    mov.u32 %r6, %ntid.z;
+    mov.u32 %r7, %ctaid.x;
+    mov.u32 %r8, %ctaid.y;
+    mov.u32 %r9, %ctaid.z;
+    mov.u32 %r10, %nctaid.x;
+    mov.u32 %r11, %nctaid.y;
+    mov.u32 %r12, %nctaid.z;
+    mov.u32 %r13, %laneid;
+    mad.lo.u32 %r14, %r3, %r5, %r2;
+    mad.lo.u32 %r14, %r14, %r4, %r1;
+    mad.lo.u32 %r15, %r9, %r11, %r8;
+    mad.lo.u32 %r15, %r15, %r10, %r7;
+    mul.lo.u32 %r16, %r4, %r5;
+    mul.lo.u32 %r16, %r16, %r6;
+    mad.lo.u32 %r17, %r15, %r16, %r14;
+    mul.wide.u32 %rd2, %r17, 52;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r1;
+    st.global.u32 [%rd3+4], %r2;
+    st.global.u32 [%rd3+8], %r3;
+    st.global.u32 [%rd3+12], %r4;
+    st.global.u32 [%rd3+16], %r5;
+    st.global.u32 [%rd3+20], %r6;
+    st.global.u32 [%rd3+24], %r7;
+    st.global.u32 [%rd3+28], %r8;
+    st.global.u32 [%rd3+32], %r9;
+    st.global.u32 [%rd3+36], %r10;
+    st.global.u32 [%rd3+40], %r11;
+    st.global.u32 [%rd3+44], %r12;
+    st.global.u32 [%rd3+48], %r13;
+    ret;
+}
+)";
+  const uint32_t blocks[][3] = {{5, 3, 7}, {33, 2, 1}, {64, 1, 1}, {7, 1, 9}};
+  const uint32_t grids[][3] = {{3, 2, 2}, {1, 1, 1}, {4, 1, 1}};
+  for (const char* fp : {"1", "0"})   // the pre-decoded form and the general path
+  for (const auto& b : blocks)
+    for (const auto& g : grids) {
+      setenv("VGPU_FASTPATH", fp, 1);
+      MemoryManager mem{1 << 22};
+      DeviceProfile prof = load_gpu("nvidia/a10");
+      auto m = ptx::parse(ptx);
+      const uint32_t per = b[0] * b[1] * b[2], n = per * g[0] * g[1] * g[2];
+      const uint64_t out = mem.alloc(uint64_t{n} * 52);
+      LaunchConfig cfg;
+      cfg.block = {b[0], b[1], b[2]};
+      cfg.grid = {g[0], g[1], g[2]};
+      exec::launch(m.entries[0], cfg, {arg_u64(out)}, mem, prof);
+      std::vector<uint32_t> got(n * 13);
+      mem.read(out, got.data(), got.size() * 4);
+      for (uint32_t lin = 0; lin < n; ++lin) {
+        const uint32_t blk = lin / per, t = lin % per;
+        const uint32_t want[13] = {t % b[0], t / b[0] % b[1], t / (b[0] * b[1]), b[0], b[1], b[2],
+                                   blk % g[0], blk / g[0] % g[1], blk / (g[0] * g[1]), g[0], g[1], g[2], t % 32};
+        for (int k = 0; k < 13; ++k) VCHECK_EQ(got[lin * 13 + k], want[k]);
+      }
+      unsetenv("VGPU_FASTPATH");
+    }
+}
+
+// popc and clz at both widths, against a plain host count: values with every run of leading zeros, all ones,
+// and (for the 32-bit form) bits above the type's width, which the type cuts off.
+VTEST(popc_and_clz_count_the_bits_of_the_type) {
+  std::vector<uint64_t> a;
+  for (int i = 0; i < kThreads; ++i) {
+    uint64_t v;
+    switch (i % 8) {
+      case 0: v = 0; break;
+      case 1: v = ~uint64_t{0}; break;
+      case 2: v = uint64_t{1} << (i % 64); break;
+      case 3: v = (uint64_t{1} << (i % 64)) - 1; break;
+      case 4: v = 0x8000000000000000ull | i; break;
+      case 5: v = 0x123456789ABCDEF0ull * (uint64_t(i) + 1); break;
+      case 6: v = 0xFFFFFFFF00000000ull | (uint64_t(i) << 3); break;
+      default: v = (uint64_t(i) * 0x9E3779B97F4A7C15ull) >> (i % 40); break;
+    }
+    a.push_back(v);
+  }
+  g_guard = 1;
+  for (const int bits : {32, 64}) {
+    const uint64_t keep = bits == 64 ? ~uint64_t{0} : (uint64_t{1} << bits) - 1;
+    std::string reg = bits == 64 ? "%A" : "%a";
+    std::string prep;
+    for (const bool popc : {true, false}) {
+      const std::string op = std::string(popc ? "popc.b" : "clz.b") + std::to_string(bits);
+      const auto got = run(prep + op + " %d, " + reg + ";", false, a, a, a);
+      for (int i = 0; i < kThreads; ++i) {
+        const uint64_t x = a[i] & keep;
+        uint64_t want = 0;
+        if (popc) {
+          for (uint64_t y = x; y; y &= y - 1) ++want;
+        } else {
+          for (int k = bits - 1; k >= 0 && !(x >> k & 1); --k) ++want;
+        }
+        if (got[i] != want) {
+          char buf[200];
+          std::snprintf(buf, sizeof buf, "%s of 0x%llx: got %llu, want %llu", op.c_str(), (unsigned long long)x,
+                        (unsigned long long)got[i], (unsigned long long)want);
+          throw vtest::Failure(buf);
+        }
+      }
+    }
+  }
+  g_guard = 0;
+}
+
 // The pre-decoded forms (MicroOp) run the same arithmetic as the handlers they
 // were decoded from, unguarded and under a negated guard as well as under the
 // plain one the other tests use.
@@ -760,6 +1431,77 @@ VTEST(pre_decoded_forms_match_the_general_path_under_every_guard) {
   g_guard = 0;
 }
 
+// The 64-bit pre-decoded forms -- integer arithmetic and comparisons on 64-bit registers, integer conversions,
+// mul.wide -- unguarded, under the plain guard and under the negated one: immediates that fit a signed 32 bits
+// (sign-extended) and ones that do not (those stay on the general path), a 32-bit register as a 64-bit source,
+// every width pairing of cvt, and the f64 comparisons including the NaN-aware ones.
+VTEST(pre_decoded_64_bit_forms_match_the_general_path_under_every_guard) {
+  std::vector<uint64_t> a;
+  const uint64_t v[] = {0, 1, 2, 63, 64, 65, 100, ~0ull, 0x8000000000000000ull, 0x7FFFFFFFFFFFFFFFull,
+                        0xFFFFFFFFull, 0x80000000ull, 0x7FFFFFFFull, 0x123456789ABCDEF0ull,
+                        0xFFFFFFFF80000000ull, 0x10000ull, 0xFFFFull, 0x8000ull, 0x80ull, 32,
+                        0xFFFFFFFFFFFFFF9Cull /* -100 */, 0x100000000ull, 0x180000000ull};
+  for (int i = 0; i < kThreads; ++i) a.push_back(v[(i * 7 + i / 19) % (sizeof v / sizeof v[0])]);
+  const auto b = rotate(a, 3), c = rotate(a, 10);
+  const auto x = f64_values(), y = rotate(x, 4), z = rotate(x, 9);
+  for (int guard : {1, 2, 0}) {
+    g_guard = guard;
+    for (const char* op : {"add.u64", "sub.s64", "mul.lo.u64", "and.b64", "or.b64", "xor.b64", "min.s64",
+                           "max.u64", "min.u64", "max.s64", "shl.b64", "shr.u64", "shr.s64"}) {
+      same(std::string(op) + " %D, %A, %B;", true, a, b, c);
+      same(std::string(op) + " %D, %A, 5;", true, a, b, c);
+      same(std::string(op) + " %D, %A, -1;", true, a, b, c);
+      same(std::string(op) + " %D, %A, 2147483647;", true, a, b, c);
+      same(std::string(op) + " %D, %A, 4294967296;", true, a, b, c);   // beyond 32 bits: the general path
+      same(std::string(op) + " %D, 7, %B;", true, a, b, c);
+      same(std::string(op) + " %A, %A, %B; mov.b64 %D, %A;", true, a, b, c);   // destination is a source
+      same(std::string(op) + " %D, %rd20, %A;", true, a, b, c);                // a source nothing has written
+    }
+    same("shl.b64 %D, %A, %b;", true, a, b, c);   // a 32-bit register as the count
+    same("shr.u64 %D, %A, %c;", true, a, b, c);
+    same("shl.b64 %D, %A, %r15;", true, a, b, c);   // ... one nothing has written
+    same("cvt.u64.u32 %D, %r15;", true, a, b, c);
+    same("cvt.u32.u64 %d, %rd21; cvt.u64.u32 %D, %d;", true, a, b, c);
+    same("setp.lt.u64 %p3, %rd20, %B; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+    for (const char* ty : {"u64", "s64", "b64"})
+      for (const char* cmp : {"eq", "ne", "lt", "le", "gt", "ge"}) {
+        if (std::string(ty) == "b64" && std::string(cmp) != "eq" && std::string(cmp) != "ne") continue;
+        const std::string head = std::string("setp.") + cmp + "." + ty;
+        same(head + " %p3, %A, %B; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+        same(head + " %p3, %A, 100; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+        same(head + " %p3, %A, -100; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+        same(head + " %p3, 0, %B; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+        same(head + " %p3, %A, 81985529216486895; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+        same(head + " %p3, %A, %B; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+      }
+    for (const char* cmp : {"eq", "ne", "lt", "le", "gt", "ge", "equ", "neu", "ltu", "leu", "gtu", "geu", "num",
+                            "nan"})
+      same(std::string("setp.") + cmp + ".f64 %p3, %A, %B; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true,
+           x, y, z);
+    // The destination predicate keeps its other lanes: the guard cuts the write.
+    same("setp.lt.u64 %p3, %A, %B; setp.ge.u64 %p3, %B, %A; selp.u32 %d, 1, 2, %p3; cvt.u64.u32 %D, %d;", true, a, b, c);
+    for (const char* cvt :
+         {"cvt.u64.u32 %D, %a;", "cvt.s64.s32 %D, %a;", "cvt.u64.s32 %D, %a;", "cvt.s64.u32 %D, %a;",
+          "cvt.u32.u64 %d, %A; cvt.u64.u32 %D, %d;", "cvt.s32.s64 %d, %A; cvt.u64.u32 %D, %d;",
+          "cvt.u32.s64 %d, %A; cvt.u64.u32 %D, %d;", "cvt.u64.u64 %D, %A;", "cvt.s64.s64 %D, %A;",
+          "cvt.u32.u32 %d, %a; cvt.u64.u32 %D, %d;", "cvt.s32.u32 %d, %a; cvt.u64.u32 %D, %d;",
+          "cvt.u16.u32 %rs1, %a; cvt.u64.u16 %D, %rs1;", "cvt.u16.u32 %rs1, %a; cvt.s64.s16 %D, %rs1;",
+          "cvt.u16.u64 %rs1, %A; cvt.u64.u16 %D, %rs1;", "cvt.u8.u64 %rs1, %A; cvt.u64.u8 %D, %rs1;",
+          "cvt.u8.u32 %rs1, %a; cvt.s32.s8 %d, %rs1; cvt.u64.u32 %D, %d;",
+          "cvt.u64.u32 %D, %c; cvt.u32.u64 %c, %D; cvt.u64.u32 %D, %c;"})
+      same(cvt, true, a, b, c);
+    same("mul.wide.u32 %D, %a, %b;", true, a, b, c);
+    same("mul.wide.s32 %D, %a, %b;", true, a, b, c);
+    same("mul.wide.s32 %D, %a, -3;", true, a, b, c);
+    same("mul.wide.u32 %D, 4294967295, %b;", true, a, b, c);
+    same("mul.wide.s32 %D, 7, 9;", true, a, b, c);
+    // An address computed the way compiled code does it.
+    same("cvt.u64.u32 %D, %a; shl.b64 %D, %D, 2; add.s64 %D, %D, %B; setp.gt.u64 %p3, %D, %A; "
+         "selp.b64 %D, %D, %A, %p3;", true, a, b, c);
+    g_guard = 0;
+  }
+}
+
 namespace {
 
 // A loop of pre-decoded forms, a divergent branch and a predicated tail, over
@@ -787,6 +1529,13 @@ const char* kLoopKernel = R"(.version 8.3
 LOOP:
     add.u32 %r3, %r3, %r1;
     mad.lo.u32 %r3, %r3, 1103515245, 12345;
+    cvt.u64.u32 %rd5, %r3;
+    shl.b64 %rd6, %rd5, 3;
+    sub.s64 %rd6, %rd6, %rd5;
+    setp.gt.u64 %p4, %rd6, 100000000;
+    @%p4 add.u32 %r3, %r3, 9;
+    cvt.u32.u64 %r10, %rd6;
+    xor.b32 %r3, %r3, %r10;
     xor.b32 %r4, %r3, %r2;
     atom.global.add.u32 %r9, [%rd4], 1;
     add.u32 %r4, %r4, %r9;

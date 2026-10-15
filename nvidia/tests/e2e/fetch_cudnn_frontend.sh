@@ -18,7 +18,7 @@ if [[ ! -e "$dir/include/cudnn_frontend.h" ]]; then
   mkdir -p "$cache"
   tmp="$(mktemp "$cache/fetch.XXXXXX")"
   trap 'rm -f "$tmp"' EXIT
-  curl -fsSL --retry 3 -o "$tmp" "https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v$version.tar.gz" >&2 || exit 1
+  curl -fsSL --http1.1 --retry 5 --retry-all-errors --retry-delay 3 -o "$tmp" "https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v$version.tar.gz" >&2 || exit 1
   echo "$sha  $tmp" | sha256sum -c --quiet - >&2 || { echo "cudnn-frontend $version: checksum mismatch" >&2; exit 1; }
   tar xzf "$tmp" -C "$cache" "cudnn-frontend-$version/include" "cudnn-frontend-$version/LICENSE.txt" >&2 || exit 1
 fi

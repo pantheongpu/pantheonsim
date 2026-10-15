@@ -1545,6 +1545,99 @@ identical in every pair).** Profiled with perf (cpu-clock) first:
   per-lane `MemoryManager::resolve` + reader lock, which is 20% of the memory-
   bound programs and is the memory layer's.
 
+**2026-10-13, round 8 (the PTX interpreter again, VGPU_SASS=0; one host thread,
+user CPU time, A/B alternating against a fresh build of the same base, counters
+and program output identical in every pair).** Profiled with perf (cpu-clock;
+the `perf` here has no symbol support, so addresses were mapped with `nm` and,
+for lines, `addr2line` on a `-g1` build) over the bench workloads, ~35
+HeCBench programs and the pantheon workloads. The base's benchmark build
+(`pantheonsim-r7-final/build`, 2026-10-12 14:45) predates the last commits of
+its branch (it still reaches `simd::g_enabled` through the GOT), so every
+number below is against a fresh build of the same source; against the stale one
+`int_alu` looks 4% slower than it is.
+
+- **Pre-decoded forms** (`MicroOp`) now cover what the profiles showed ending
+  batches: 64-bit integer arithmetic and setp (and f64 setp), integer `cvt`,
+  `mul.wide`, `mul.hi`, neg/abs, narrow integer to f32/f64, 16-bit integer
+  arithmetic, setp and mov, 32-bit division, f32 `.ftz` arithmetic and setp, the
+  contracted subtract (an fma negating its product or addend), predicate logic,
+  and a kernel's first instructions (thread, block and lane ids, `warpSize`,
+  64-bit `mov` and `cvta`, `ld.param` of a scalar). Not done: carry add/sub,
+  f64 arithmetic (pantheon's fp64_virus is bound by the host's subnormal
+  assists, not by dispatch), float-to-integer and f32/f64 `cvt` (their rounding
+  and NaN rules are the general path's; reimplementing them would need card
+  probes for no measured gain), `vote`/`shfl`/`match`.
+- **Memory instructions:** shared and `.local` loads and stores whose lanes are
+  all aligned and inside the block's own memory (no race detector, no
+  shared-memory fault armed) are done in one pass instead of a `load_routed`
+  call per element; the global batches test alignment with a mask where they
+  can (a `%` by a variable is a 64-bit divide per lane, and was 5% of `mem`).
+- **Calls:** a call slot's read and write were a `memcpy` call per lane, the
+  largest cost of a call-heavy kernel; a return keeps its frame for the next
+  call instead of freeing the register files and slot map. `resolve_symbol` is
+  under 0.4% in every profile and is untouched.
+- **Texture:** a fetch copies the 300-byte descriptor only when it changes it;
+  a linear float fetch rounds its single footprint sum on the bits instead of
+  through the exact expansion, and uses exact stand-ins for `floor`, `trunc`,
+  `ldexp`, `ilogb` and the divides by powers of two (each checked against libm
+  on 3e8 values, and `tests/unit/test_fastpath.cpp` compares whole fetches with
+  `VGPU_FASTPATH=0`). The texel reads (`MemoryManager::load_scalar` and the lookups
+  under it, about a seventh of what is left) are the memory layer's.
+- `popc` is the POPCNT instruction (it was libgcc's table walk: 10% of
+  `int_alu`), `clz` one instruction, the arithmetic-fault flag one inline load
+  (it was an out-of-line call, 3.7% of compute_virus), `%tid`/`%ntid`/`%ctaid`
+  without a switch per lane.
+
+Measured (alternating A/B, 9-21 runs, medians; the machine was shared, load
+5-15, so differences under about 3% are noise):
+
+| workload (PTX engine) | warp-instr/s before | after |
+| --- | ---: | ---: |
+| bench int_alu | 52 M | 63 M |
+| bench mem | 9.0 M | 11.7 M |
+| bench shared | 8.1 M | 9.4 M |
+| bench local | 12.9 M | 17.8 M |
+| bench texture | 1.85 M | 2.20 M |
+| bench divergent | 17.3 M | 38.2 M |
+| bench warp | 36.2 M | 38.3 M |
+| pantheon int_virus | 56 M | 70 M |
+| pantheon compute_virus | 30 M | 40 M |
+| pantheon memory_bank_thrash | 17 M | 24 M |
+| pantheon cache_latency | 16.5 M | 20.9 M |
+
+HeCBench programs (user CPU, whole process, 21 programs): 1.01x to 1.5x, most
+1.1x-1.3x (aobench 2.6x, which uses `.ftz` arithmetic throughout); a call-heavy
+kernel (device functions and recursion) 1.26x; a linear float texture fetch
+loop 1.3x. Rodinia (backprop, gaussian, lud, needle, pathfinder, srad_v2,
+streamcluster): output identical but for timing lines. SASS rows are within
+noise (wmma/mma_ptx read -3% in some runs and +3% in others with no SASS code
+changed: the build is layout-sensitive to a few percent either way).
+
+**2026-10-15: the PTX wmma tile writes a canonical NaN.** The f32-accumulator tile
+(`wmma_tile`, behind `fast_wmma_mma` and `exec_wmma_mma`) used to leave whatever NaN the
+host's vector add or multiply returned for two NaN operands -- the first source
+operand's, sign and payload -- and the compiler picks that order, so the sign
+differed between an optimised build and a ThreadSanitizer `-O1` one (simd_lane_forms
+caught it: `wmma_{f16,bf16,tf32}_f32acc`, random and edges). A NaN result is now
+`0x7fffffff`, as the SASS executor's HMMA path (`simd::hmma`) and an RTX 3060 write
+it (the card file's raw hashes equal their NaN-canonical twins), and so are the
+generic-shape f32 results (`m32n8k16` and the like). The f16 accumulator was
+already canonical (`double_to_f16` answers a NaN with `0x7fff`) and `mma.sync`
+already canonicalised its f32 result (`canon32`); no non-NaN bit moved (the words
+that changed are exactly the NaN words, checked element by element). The tile
+sums its rows as it writes them and goes over a tile again only when that sum is
+a NaN, so a tile without one pays one add per vector. The sanitizer skip and the
+`_nonan` twin lines in simd_lane_forms are gone: its pinned hashes are the same in
+Release 13.0 and 12.0 and in the CI ThreadSanitizer Debug configuration.
+`wgmma`, `tcgen05` and the `m8n8k4` form of `mma` still add f32 products in scalar
+code and are not covered by this.
+**2026-10-13/15, round 8 (the SASS engine's operations, r8-sass).** The forms the general path still took -- 64-bit address arithmetic with
+carries, float forms with .FTZ/.SAT/a rounding mode, half-precision forms, MUFU, conversions, FMNMX, DSETP, PRMT, SHFL/VOTE, scattered, broadcast
+and 16-byte global accesses, atomics -- run over 32 lanes with SIMD kernels or batch memory calls; main vs this branch (SASS, 9 alternating runs):
+int_alu 1.88x, f64_fma 1.77x, mem 3.0x, atomics 2.5x, shared 1.30x, local 1.30x, divergent 1.78x, warp 1.83x, launch 1.41x; HeCBench aobench 3.5x,
+lavaMD 1.8x (against the earlier r7-final build). Counters and output unchanged; details, evidence and mutation checks in docs/performance.md
+("Round 8").
+
 One limit found and left alone: on Intel cores a subnormal operand or result
 costs every FP operation a microcode assist, and fp64_virus's FMA chains
 decay into that range -- it runs about 3.7x faster with flush-to-zero set.

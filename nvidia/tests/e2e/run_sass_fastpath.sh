@@ -40,5 +40,16 @@ fi
 if ! diff -u "$work/general.txt" "$work/fast.txt" > "$work/diff.txt"; then
   echo "FAIL: the fast paths and the general path differ (answers or counters):"; head -40 "$work/diff.txt"; fails=1
 fi
+# An access that faults, with one lane of the warp outside: the fast paths decline it and the general path reports it, so the two
+# runs print the same error (the fault message names the lane, the instruction and the address, so a difference would show here).
+for fault in local gather scatter atomic shared; do
+  env VGPU_GPU=nvidia/rtx3060 VGPU_THREADS=1 VGPU_COUNTERS=1 LD_LIBRARY_PATH="$shim" "$work/prog" "$fault" > "$work/fault_fast_$fault.txt" 2>&1; rcf=$?
+  env VGPU_GPU=nvidia/rtx3060 VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_FASTPATH=0 LD_LIBRARY_PATH="$shim" "$work/prog" "$fault" > "$work/fault_general_$fault.txt" 2>&1; rcg=$?
+  if (( rcf != 0 || rcg != 0 )); then
+    echo "FAIL: the $fault fault did not happen (rc fast $rcf, general $rcg)"; cat "$work/fault_fast_$fault.txt"; fails=1
+  elif ! diff -u "$work/fault_general_$fault.txt" "$work/fault_fast_$fault.txt" > "$work/fault_diff.txt"; then
+    echo "FAIL: the $fault fault is reported differently with the fast paths:"; head -20 "$work/fault_diff.txt"; fails=1
+  fi
+done
 (( fails )) && exit 1
 echo "OK: fast paths and general path agree ($(grep -c 'counters' "$work/fast.txt") launches' counters compared)"

@@ -1,9 +1,9 @@
 # Command-line reference
 
 Everything the `vgpu` command and the environment variables can do. The
-[README](../README.md) has the short path; this page is the full list.
+[README](../README.md) has the short path (`make doctor`, `make build`, `make demo`); this page is the full list.
 
-Build once (`./scripts/build.sh`) and the command is `build/vgpu`. The build
+Build once (`make build`, which runs `./scripts/build.sh`) and the command is `build/vgpu`. The build
 also puts it at `build/bin/vgpu`, next to drop-in `nvidia-smi`, `rocm-smi` and
 `amd-smi`, so `PATH=$PWD/build/bin:$PATH` makes all of them available.
 `vgpu --help` lists the commands. `run`, `test`, `ncu`, `debug`, `fault`, `regs`
@@ -21,6 +21,7 @@ Settings you use every time can live in a file (`pantheonsim.yaml`, written by
 | `vgpu info --gpu <vendor/model> [--json]` | Show one device profile. |
 | `vgpu demo vectoradd [--gpu <id>] [-n <elems>]` | Run a built-in `vectorAdd` kernel end to end, as a smoke test. |
 | `vgpu run [options] <program> [args...]` | Run a program on a simulated GPU. [Options](#vgpu-run). |
+| `vgpu config show\|init\|keys` | The settings file: what is in effect, a commented starter file, the list of keys. See [config.md](config.md). |
 | `vgpu shell` | An interactive simulated machine: `nvidia-smi`, `rocm-smi`, `lspci` and `dmesg` all answer for the GPUs you picked. [Options](#vgpu-shell). |
 | `vgpu test --matrix <program> [args...]` | Run a program on every device profile and compare the results. [Options](#vgpu-test---matrix). |
 | `vgpu ncu [options] <program> [args...]` | Nsight Compute's command line, answered from the simulator's exact counters. [Options](#vgpu-ncu). |
@@ -246,6 +247,7 @@ variable is unset by default.
 | `VGPU_LOOKUP_CACHE` | `0` makes every kernel memory access look its address up in the allocation table, for ruling out the per-thread memory of recent lookups when an access looks wrong (tested to give the same values and errors) | unset (on) |
 | `VGPU_LAUNCH_CACHE` | `0` makes every launch work out again what it can remember (the table of every loaded kernel that a device-side launch looks its child up in, and which function a kernel handle names), for ruling the remembering out when a result looks wrong; the answers are tested to be the same either way | unset (on) |
 | `VGPU_SIMD` | `base` or `avx2` caps the vector instruction set the lane arithmetic, half-precision conversions and tensor-core kernels use (the default is the best the CPU has); `off` sends the engines back to their scalar code, for ruling the vector kernels out when a result looks wrong (they are tested to give the same bits) | best available |
+| `VGPU_TIER` | `1` runs the SASS engine's straight-line instructions through a pre-decoded tier: each instruction's form and operands are worked out once per code section instead of at every execution (about 1.2 to 2.7 times faster on the benchmark workloads, [performance](performance.md)). Results, counters, errors and the warp scheduling are those of the interpreter, which also runs everything the tier has no handler for; `VGPU_FASTPATH=0`, `VGPU_SIMD=off` and `VGPU_SASS_TRACE` turn it off. `VGPU_TIER_STATS=1` prints how many warp instructions it ran and which ones it left to the interpreter when the process exits. | off |
 | `VGPU_FASTCOUNT` | `0` counts memory sectors and bank passes with the earlier reference code instead of the allocation-free version, for ruling the new counting out when a counter looks wrong (tested to give the same numbers) | unset (on) |
 
 **Checks and counters** (see [diagnostics](diagnostics.md))

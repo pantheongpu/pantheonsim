@@ -908,6 +908,453 @@ VTEST(fma_kernels_special_triples_and_cancellation) {
   }
 }
 
+// The wider integer kernels the SASS executor's plain-form ALU path uses (blend_m, iadd3x, imad_wide, shf), and the
+// double kernel with its destination in the same registers as its sources. The references are written out here
+// independently: 64-bit and 128-bit integer arithmetic, and the funnel-shift rule as the general path states it.
+VTEST(wide_integer_kernels_at_every_level) {
+  std::mt19937_64 rng(2026);
+  static const uint32_t edge[] = {0u, 1u, 2u, 3u, 31u, 32u, 33u, 63u, 64u, 65u, 0x7fffffffu, 0x80000000u, 0x80000001u,
+                                  0xffffffffu, 0xfffffffeu, 0xffffu, 0x10000u, 0x55555555u, 0xaaaaaaaau, 0xdeadbeefu};
+  constexpr unsigned kE = sizeof edge / sizeof edge[0];
+  const auto word = [&](int style) -> uint32_t {
+    return style == 0 ? static_cast<uint32_t>(rng()) : style == 1 ? edge[rng() % kE] : static_cast<uint32_t>(rng() % 80);
+  };
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 30000; ++round) {
+      const int style = round % 3;
+      uint32_t a[32], b[32], c[32], c2[32], d0[32], d[32];
+      for (int i = 0; i < 32; ++i) {
+        a[i] = word(style);
+        b[i] = word((style + round / 3) % 3);
+        c[i] = word(style == 2 ? 1 : style);
+        c2[i] = word((style + 1) % 3);
+        d0[i] = static_cast<uint32_t>(rng());
+      }
+      uint32_t m1 = static_cast<uint32_t>(rng()), m2 = static_cast<uint32_t>(rng());
+      if (round % 7 == 0) m1 = ~0u;
+      if (round % 11 == 0) m2 = 0;
+      if (round % 13 == 0) m1 = 0;
+      if (round % 17 == 0) m2 = ~0u;
+
+      // blend_m: the lanes of the mask from r, the others untouched; d may be what r was copied from.
+      std::memcpy(d, d0, sizeof d);
+      k.blend_m(d, a, m1);
+      for (int i = 0; i < 32; ++i)
+        if (d[i] != ((m1 >> i) & 1 ? a[i] : d0[i])) throw vtest::Failure(lv + " blend_m lane " + std::to_string(i));
+
+      // iadd3x
+      {
+        const uint32_t add = static_cast<uint32_t>(rng() % 4);
+        uint32_t r[32], g1 = 0xdeadbeef, g2 = 0xdeadbeef, w1 = 0, w2 = 0;
+        k.iadd3x(r, a, b, c, add, m1, m2, &g1, &g2);
+        for (int i = 0; i < 32; ++i) {
+          const uint64_t sum = uint64_t{a[i]} + b[i] + c[i] + add + ((m1 >> i) & 1) + ((m2 >> i) & 1);
+          w1 |= static_cast<uint32_t>(sum >> 32 >= 1) << i;
+          w2 |= static_cast<uint32_t>(sum >> 32 >= 2) << i;
+          if (r[i] != static_cast<uint32_t>(sum))
+            throw vtest::Failure(lv + " iadd3x lane " + std::to_string(i) + ": got 0x" + hex(r[i]) + " want 0x" + hex(static_cast<uint32_t>(sum)));
+        }
+        if (g1 != w1 || g2 != w2)
+          throw vtest::Failure(lv + " iadd3x carries: got 0x" + hex(g1) + "/0x" + hex(g2) + " want 0x" + hex(w1) + "/0x" + hex(w2));
+      }
+
+      // imad_wide, signed and unsigned
+      for (bool sgn : {false, true}) {
+        uint32_t rlo[32], rhi[32], carry = 0xdeadbeef, want_carry = 0;
+        k.imad_wide(rlo, rhi, a, b, c, c2, sgn, m1, &carry);
+        for (int i = 0; i < 32; ++i) {
+          const unsigned __int128 prod = sgn ? static_cast<unsigned __int128>(static_cast<__int128>(static_cast<int64_t>(static_cast<int32_t>(a[i])) * static_cast<int32_t>(b[i])) & ((static_cast<__int128>(1) << 64) - 1))
+                                             : static_cast<unsigned __int128>(uint64_t{a[i]} * b[i]);
+          const unsigned __int128 full = prod + (uint64_t{c[i]} | (uint64_t{c2[i]} << 32)) + ((m1 >> i) & 1);
+          want_carry |= static_cast<uint32_t>((full >> 64) != 0) << i;
+          const uint64_t lo64 = static_cast<uint64_t>(full);
+          if (rlo[i] != static_cast<uint32_t>(lo64) || rhi[i] != static_cast<uint32_t>(lo64 >> 32))
+            throw vtest::Failure(lv + (sgn ? " imad_wide signed" : " imad_wide unsigned") + " lane " + std::to_string(i) + ": a=0x" +
+                                 hex(a[i]) + " b=0x" + hex(b[i]) + " c=0x" + hex(c[i] | (uint64_t{c2[i]} << 32)) + " got 0x" +
+                                 hex(uint64_t{rlo[i]} | (uint64_t{rhi[i]} << 32)) + " want 0x" + hex(lo64));
+        }
+        if (carry != want_carry)
+          throw vtest::Failure(lv + " imad_wide carry out: got 0x" + hex(carry) + " want 0x" + hex(want_carry));
+      }
+
+      // shf, every form
+      for (unsigned type = 0; type < 4; ++type)
+        for (int form = 0; form < 8; ++form) {
+          const bool wrap = form & 1, right = form & 2, hi = form & 4;
+          uint32_t r[32];
+          k.shf(r, a, b, c, type, wrap, right, hi);
+          const bool is64 = type < 2, sgn = type == 0 || type == 2;
+          const uint32_t width = is64 ? 64 : 32;
+          for (int i = 0; i < 32; ++i) {
+            const uint64_t v = a[i] | (uint64_t{c[i]} << 32);
+            const uint32_t n = wrap ? b[i] % width : std::min(b[i], width);
+            uint64_t x;
+            if (!right) x = n >= 64 ? 0 : v << n;
+            else if (sgn) x = static_cast<uint64_t>(static_cast<int64_t>(v) >> std::min(n, 63u));
+            else x = n >= 64 ? 0 : v >> n;
+            const uint32_t want = static_cast<uint32_t>(hi ? x >> 32 : x);
+            if (r[i] != want)
+              throw vtest::Failure(lv + " shf type " + std::to_string(type) + (wrap ? " wrap" : " clamp") + (right ? " right" : " left") +
+                                   (hi ? " hi" : " lo") + " lane " + std::to_string(i) + ": lo=0x" + hex(a[i]) + " top=0x" + hex(c[i]) +
+                                   " n=" + std::to_string(b[i]) + " got 0x" + hex(r[i]) + " want 0x" + hex(want));
+          }
+        }
+    }
+  }
+}
+
+// The float kernels the SASS executor's fast path calls for flush and saturation, compares, MUFU, conversions and min/max,
+// against the executor's own scalar rules written out here (the general rule of exec_float, on doubles and libm), over special
+// values (zeros of both signs, subnormals, the extremes, infinities, NaNs of both signs and payloads) and random bits.
+namespace {
+float ftz_ref(float f) { return std::fpclassify(f) == FP_SUBNORMAL ? std::copysign(0.0f, f) : f; }
+float sat_ref(float f) { return f != f ? 0.0f : f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
+bool fcmp_ref(unsigned cmp, double a, double b) {
+  const bool un = a != a || b != b;
+  switch (cmp) {
+    case 0: return false;
+    case 1: return !un && a < b;
+    case 2: return !un && a == b;
+    case 3: return !un && a <= b;
+    case 4: return !un && a > b;
+    case 5: return !un && a != b;
+    case 6: return !un && a >= b;
+    case 7: return !un;
+    case 8: return un;
+    case 9: return un || a < b;
+    case 10: return un || a == b;
+    case 11: return un || a <= b;
+    case 12: return un || a > b;
+    case 13: return un || a != b;
+    case 14: return un || a >= b;
+    default: return true;
+  }
+}
+const uint32_t kFloatBits[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u,
+                               0x3f800000u, 0xbf800000u, 0x3f000000u, 0x40000000u, 0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
+                               0x7fc00000u, 0xffc00000u, 0x7fc12345u, 0x7f800001u, 0xffbfffffu, 0x3effffffu, 0x4b000000u, 0x4b800001u,
+                               0x33800000u, 0x3f800001u, 0x2f800000u, 0x4f000000u, 0xcf000000u, 0x4f800000u, 0x4effffffu, 0xbf000000u,
+                               0x3f7fffffu, 0x40490fdbu, 0x0f800000u, 0x7e800000u, 0xc0000000u};
+constexpr size_t kNFB = sizeof kFloatBits / sizeof kFloatBits[0];
+}  // namespace
+
+VTEST(float_forms_at_every_level) {
+  std::mt19937 rng(9090);
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    const auto fail = [&](const char* what, unsigned lane, uint32_t a, uint32_t b, uint32_t c, uint32_t got, uint32_t want, int info) {
+      throw vtest::Failure(lv + " " + what + " info " + std::to_string(info) + " lane " + std::to_string(lane) + ": a=0x" + hex(a) +
+                           " b=0x" + hex(b) + " c=0x" + hex(c) + " got 0x" + hex(got) + " want 0x" + hex(want));
+    };
+    for (int round = 0; round < 20000; ++round) {
+      uint32_t a[32], b[32], c[32], r[32];
+      const int style = round % 3;
+      for (int i = 0; i < 32; ++i) {
+        a[i] = style == 0 ? static_cast<uint32_t>(rng()) : kFloatBits[rng() % kNFB];
+        b[i] = style == 1 ? static_cast<uint32_t>(rng()) : kFloatBits[rng() % kNFB];
+        c[i] = round % 5 == 0 ? static_cast<uint32_t>(rng()) : kFloatBits[rng() % kNFB];
+      }
+      // ffma_x, fadd_x, fmul_x
+      for (unsigned flags = 0; flags < 4; ++flags) {
+        const auto in = [&](uint32_t v) { return (flags & 1) ? ftz_ref(std::bit_cast<float>(v)) : std::bit_cast<float>(v); };
+        const auto fin = [&](float f) {
+          if (flags & 1) f = ftz_ref(f);
+          if (flags & 2) f = sat_ref(f);
+          return f != f ? 0x7fffffffu : std::bit_cast<uint32_t>(f);
+        };
+        k.ffma_x(r, a, b, c, flags);
+        for (int i = 0; i < 32; ++i) {
+          volatile float v = std::fma(in(a[i]), in(b[i]), in(c[i]));
+          if (r[i] != fin(v)) fail("ffma_x", i, a[i], b[i], c[i], r[i], fin(v), flags);
+        }
+        k.fadd_x(r, a, b, flags);
+        for (int i = 0; i < 32; ++i) {
+          volatile float v = in(a[i]) + in(b[i]);
+          if (r[i] != fin(v)) fail("fadd_x", i, a[i], b[i], 0, r[i], fin(v), flags);
+        }
+        k.fmul_x(r, a, b, flags);
+        for (int i = 0; i < 32; ++i) {
+          volatile float v = in(a[i]) * in(b[i]);
+          if (r[i] != fin(v)) fail("fmul_x", i, a[i], b[i], 0, r[i], fin(v), flags);
+        }
+      }
+      // fcmp_mask
+      for (unsigned cmp = 0; cmp < 16; ++cmp)
+        for (bool ftz : {false, true}) {
+          const uint32_t got = k.fcmp_mask(cmp, ftz, a, b);
+          uint32_t want = 0;
+          for (int i = 0; i < 32; ++i) {
+            const float x = ftz ? ftz_ref(std::bit_cast<float>(a[i])) : std::bit_cast<float>(a[i]);
+            const float y = ftz ? ftz_ref(std::bit_cast<float>(b[i])) : std::bit_cast<float>(b[i]);
+            want |= static_cast<uint32_t>(fcmp_ref(cmp, x, y)) << i;
+          }
+          if (got != want)
+            throw vtest::Failure(lv + " fcmp_mask cmp " + std::to_string(cmp) + (ftz ? " ftz" : "") + ": got 0x" + hex(got) + " want 0x" + hex(want));
+        }
+      // mufu: RCP, RSQ, SQRT
+      for (unsigned kind : {4u, 5u, 8u}) {
+        k.mufu(kind, r, a);
+        for (int i = 0; i < 32; ++i) {
+          volatile double x = ftz_ref(std::bit_cast<float>(a[i]));
+          volatile double q = kind == 4 ? 1.0 / x : kind == 5 ? 1.0 / std::sqrt(x) : std::sqrt(x);
+          const float f = ftz_ref(static_cast<float>(q));
+          const uint32_t want = std::bit_cast<uint32_t>(f);
+          if (r[i] != want) fail("mufu", i, a[i], 0, 0, r[i], want, static_cast<int>(kind));
+        }
+      }
+      // i2f
+      for (bool sgn : {false, true}) {
+        k.i2f(sgn, r, a);
+        for (int i = 0; i < 32; ++i) {
+          const int64_t sv = sgn ? static_cast<int64_t>(static_cast<int32_t>(a[i])) : static_cast<int64_t>(a[i]);
+          const uint32_t want = std::bit_cast<uint32_t>(static_cast<float>(sv));
+          if (r[i] != want) fail("i2f", i, a[i], 0, 0, r[i], want, sgn);
+        }
+      }
+      // f2i
+      for (bool sgn : {false, true})
+        for (unsigned rnd = 0; rnd < 4; ++rnd)
+          for (bool ftz : {false, true}) {
+            k.f2i(sgn, rnd, ftz, r, a);
+            for (int i = 0; i < 32; ++i) {
+              double x = ftz ? ftz_ref(std::bit_cast<float>(a[i])) : std::bit_cast<float>(a[i]);
+              switch (rnd) {
+                case 0: x = std::nearbyint(x); break;
+                case 1: x = std::floor(x); break;
+                case 2: x = std::ceil(x); break;
+                default: x = std::trunc(x); break;
+              }
+              uint64_t want64;
+              if (x != x) want64 = 0;
+              else if (sgn) {
+                const double lo = -std::ldexp(1.0, 31), hi = std::ldexp(1.0, 31) - 1;
+                want64 = static_cast<uint64_t>(static_cast<int64_t>(x < lo ? lo : x > hi ? hi : x));
+              } else {
+                const double hi = std::ldexp(1.0, 32) - 1;
+                want64 = static_cast<uint64_t>(x < 0 ? 0 : x > hi ? hi : x);
+              }
+              const uint32_t want = static_cast<uint32_t>(want64);
+              if (r[i] != want) fail("f2i", i, a[i], 0, 0, r[i], want, static_cast<int>(sgn) * 100 + static_cast<int>(rnd) * 10 + ftz);
+            }
+          }
+      // fmnmx
+      {
+        const uint32_t mn = round % 7 == 0 ? ~0u : round % 11 == 0 ? 0u : static_cast<uint32_t>(rng());
+        for (bool ftz : {false, true})
+          for (bool nan : {false, true}) {
+            k.fmnmx(r, a, b, mn, ftz, nan);
+            for (int i = 0; i < 32; ++i) {
+              const float x = ftz ? ftz_ref(std::bit_cast<float>(a[i])) : std::bit_cast<float>(a[i]);
+              const float y = ftz ? ftz_ref(std::bit_cast<float>(b[i])) : std::bit_cast<float>(b[i]);
+              const bool m = (mn >> i) & 1;
+              uint32_t want;
+              if (nan && (x != x || y != y)) {
+                want = 0x7fffffffu;
+              } else {
+                float v;
+                if (x != x) v = y;
+                else if (y != y) v = x;
+                else if (x == 0 && y == 0) v = m ? (std::signbit(x) ? x : y) : (std::signbit(x) ? y : x);
+                else v = m ? std::min(x, y) : std::max(x, y);
+                want = std::bit_cast<uint32_t>(v);
+              }
+              if (r[i] != want) fail("fmnmx", i, a[i], b[i], 0, r[i], want, (m ? 4 : 0) + (ftz ? 2 : 0) + (nan ? 1 : 0));
+            }
+          }
+      }
+    }
+  }
+}
+
+// PRMT's default mode against the byte-by-byte rule: every selector nibble (all 16 values in each of the four positions), over
+// words of special and random bytes.
+VTEST(prmt0_at_every_level) {
+  std::mt19937 rng(246);
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 40000; ++round) {
+      uint32_t a[32], b[32], sel[32], r[32];
+      for (int i = 0; i < 32; ++i) {
+        a[i] = round % 3 == 0 ? static_cast<uint32_t>(rng()) : kWords[rng() % kNW];
+        b[i] = round % 3 == 1 ? static_cast<uint32_t>(rng()) : kWords[rng() % kNW];
+        sel[i] = round < 20 ? (0x1111u * static_cast<uint32_t>(round % 16)) : static_cast<uint32_t>(rng() >> (rng() % 3 == 0 ? 16 : 0));
+      }
+      k.prmt0(r, a, b, sel);
+      for (int i = 0; i < 32; ++i) {
+        uint32_t want = 0;
+        for (unsigned j = 0; j < 4; ++j) {
+          const unsigned n = (sel[i] >> (4 * j)) & 0xf;
+          const uint32_t byte = n & 4 ? (b[i] >> (8 * (n & 3))) & 0xff : (a[i] >> (8 * (n & 3))) & 0xff;
+          want |= (n & 8 ? (byte & 0x80 ? 0xffu : 0u) : byte) << (8 * j);
+        }
+        if (r[i] != want)
+          throw vtest::Failure(lv + " prmt0 lane " + std::to_string(i) + ": a=0x" + hex(a[i]) + " b=0x" + hex(b[i]) + " sel=0x" +
+                               hex(sel[i]) + " got 0x" + hex(r[i]) + " want 0x" + hex(want));
+      }
+    }
+  }
+}
+
+// dcmp: DSETP's compares and its MIN/MAX against the executor's rule on doubles, over special values and random bit patterns,
+// with |x| and -x on either source.
+VTEST(dcmp_at_every_level) {
+  std::mt19937_64 rng(135);
+  static const uint64_t special[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x3ff0000000000000ull, 0xbff0000000000000ull,
+                                     0x7ff0000000000000ull, 0xfff0000000000000ull, 0x7ff8000000000000ull, 0xfff8000000000001ull,
+                                     0x7ff0000000000001ull, 0x0000000000000001ull, 0x800fffffffffffffull, 0x7fefffffffffffffull,
+                                     0x4000000000000000ull, 0xc000000000000000ull};
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 20000; ++round) {
+      uint32_t lo[2][32], hi[2][32];
+      double v[2][32];
+      const unsigned mods = round % 4 == 0 ? static_cast<unsigned>(rng() & 15) : 0;
+      for (int s = 0; s < 2; ++s)
+        for (int i = 0; i < 32; ++i) {
+          uint64_t u = round % 3 == 0 ? rng() : special[rng() % 14];
+          if (s == 1 && round % 5 == 0 && i % 2 == 0) u = std::bit_cast<uint64_t>(v[0][i]);   // equal operands
+          lo[s][i] = static_cast<uint32_t>(u);
+          hi[s][i] = static_cast<uint32_t>(u >> 32);
+          double d = std::bit_cast<double>(u);
+          if (mods & (1u << (2 * s))) d = std::fabs(d);
+          if (mods & (2u << (2 * s))) d = -d;
+          v[s][i] = d;
+        }
+      for (unsigned cmp = 0; cmp < 16; ++cmp) {
+        uint32_t got = 0, got_nan = 0xdeadbeef, want = 0, want_nan = 0;
+        k.dcmp(cmp, mods, lo[0], hi[0], lo[1], hi[1], &got, &got_nan);
+        for (int i = 0; i < 32; ++i) {
+          const double a = v[0][i], b = v[1][i];
+          bool r;
+          if (cmp == 0 || cmp == 15) {
+            const bool an = a != a, bn = b != b;
+            if (an || bn) r = !an;
+            else if (a == b) r = cmp == 0 ? std::signbit(a) : !std::signbit(a);
+            else r = cmp == 0 ? a < b : a > b;
+            want_nan |= static_cast<uint32_t>(an && bn) << i;
+          } else {
+            r = fcmp_ref(cmp, a, b);
+          }
+          want |= static_cast<uint32_t>(r) << i;
+        }
+        if (got != want || got_nan != want_nan)
+          throw vtest::Failure(lv + " dcmp cmp " + std::to_string(cmp) + " mods " + std::to_string(mods) + ": got 0x" + hex(got) + "/0x" +
+                               hex(got_nan) + " want 0x" + hex(want) + "/0x" + hex(want_nan));
+      }
+    }
+  }
+}
+
+// lane_unary: the population count and the bit reversal against bit-by-bit loops, and FLO against a scan, for every word
+// with one or two bits set, every byte pattern in each byte, the edge words and random ones.
+VTEST(lane_unary_at_every_level) {
+  std::mt19937 rng(515);
+  std::vector<uint32_t> words;
+  for (int i = 0; i < 32; ++i)
+    for (int j = 0; j < 32; ++j) words.push_back((1u << i) | (1u << j));
+  for (uint32_t b = 0; b < 256; ++b)
+    for (int pos = 0; pos < 4; ++pos) words.push_back(b << (8 * pos));
+  for (uint32_t v : {0u, ~0u, 0x80000000u, 0x7fffffffu, 0x80000001u, 0xdeadbeefu, 0x55555555u, 0xaaaaaaaau, 0xffffu, 0xffff0000u})
+    words.push_back(v);
+  for (int i = 0; i < 200000; ++i) words.push_back(static_cast<uint32_t>(rng()));
+  for (int i = 0; i < 100000; ++i) words.push_back(static_cast<uint32_t>(rng()) >> (rng() % 32));   // (high bits clear)
+  while (words.size() % 32) words.push_back(0);
+  const auto flo = [](uint32_t v, bool sgn, bool sh) {
+    if (sgn && (v >> 31)) v = ~v;
+    uint32_t r = ~0u;
+    for (int b = 31; b >= 0; --b)
+      if ((v >> b) & 1) {
+        r = static_cast<uint32_t>(b);
+        break;
+      }
+    if (sh && r != ~0u) r = 31 - r;
+    return r;
+  };
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (size_t at = 0; at < words.size(); at += 32) {
+      uint32_t r[32];
+      for (unsigned kind = 0; kind < 6; ++kind) {
+        k.lane_unary(kind, r, &words[at]);
+        for (int i = 0; i < 32; ++i) {
+          const uint32_t v = words[at + i];
+          uint32_t want = 0;
+          if (kind == 0) {
+            for (int b = 0; b < 32; ++b) want += (v >> b) & 1;
+          } else if (kind == 1) {
+            for (int b = 0; b < 32; ++b) want |= ((v >> b) & 1u) << (31 - b);
+          } else {
+            want = flo(v, (kind - 2) & 1, ((kind - 2) & 2) != 0);
+          }
+          if (r[i] != want)
+            throw vtest::Failure(lv + " lane_unary kind " + std::to_string(kind) + " of 0x" + hex(v) + ": got 0x" + hex(r[i]) +
+                                 " want 0x" + hex(want));
+        }
+      }
+    }
+  }
+}
+
+// dop_m with the destination registers being the sources' (the SASS executor writes a result over an operand), and a
+// register of the destination pair being the other half of an operand pair: the result of a lane depends on that
+// lane's operands alone, all read before the lane is written.
+VTEST(double_lanes_in_place_at_every_level) {
+  std::mt19937_64 rng(88);
+  static const uint64_t special[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x3ff0000000000000ull, 0xbff0000000000000ull,
+                                     0x7ff0000000000000ull, 0xfff0000000000000ull, 0x7ff8000000000000ull, 0x7ff0000000000001ull,
+                                     0x0000000000000001ull, 0x000fffffffffffffull, 0x4000000000000000ull, 0x7fefffffffffffffull};
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 20000; ++round) {
+      // A file of 8 registers of 32 lanes; operands are register pairs (r, r + 1) at start registers 0..6.
+      uint32_t file[8][32], ref[8][32];
+      for (auto& row : file)
+        for (uint32_t& v : row) v = round % 2 ? static_cast<uint32_t>(rng()) : static_cast<uint32_t>(special[rng() % 12] >> (rng() % 2 ? 32 : 0));
+      std::memcpy(ref, file, sizeof file);
+      const unsigned ra = rng() % 7, rb = rng() % 7, rc = rng() % 7, rd = rng() % 7;
+      const unsigned kind = round % 3, mods = static_cast<unsigned>(rng() & 63);
+      const uint32_t mask = round % 5 == 0 ? ~0u : static_cast<uint32_t>(rng());
+      // The reference: operands copied out first, then the kernel on separate arrays, then the pair written.
+      uint32_t lo[3][32], hi[3][32], olo[32], ohi[32];
+      for (int i = 0; i < 32; ++i) {
+        lo[0][i] = ref[ra][i]; hi[0][i] = ref[ra + 1][i];
+        lo[1][i] = ref[rb][i]; hi[1][i] = ref[rb + 1][i];
+        lo[2][i] = ref[rc][i]; hi[2][i] = ref[rc + 1][i];
+        olo[i] = ref[rd][i];
+        ohi[i] = ref[rd + 1][i];
+      }
+      // (the destination's own words are what is not overwritten; a lane of the destination pair that overlaps an
+      // operand reads the old value because the operands were copied above)
+      k.dop_m(kind, mods, olo, ohi, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], mask);
+      for (int i = 0; i < 32; ++i) {
+        ref[rd][i] = olo[i];
+        ref[rd + 1][i] = ohi[i];
+      }
+      // The same, in place in the file. (When the destination pair is a register apart from an operand pair, the
+      // halves overlap: rd == ra + 1 and so on.)
+      k.dop_m(kind, mods, file[rd], file[rd + 1], file[ra], file[ra + 1], file[rb], file[rb + 1], file[rc], file[rc + 1], mask);
+      for (unsigned r = 0; r < 8; ++r)
+        for (int i = 0; i < 32; ++i)
+          if (file[r][i] != ref[r][i] && !(rd == r || rd + 1 == r))
+            throw vtest::Failure(lv + " dop_m in place changed register " + std::to_string(r));
+      for (int i = 0; i < 32; ++i)
+        if (file[rd][i] != ref[rd][i] || file[rd + 1][i] != ref[rd + 1][i]) {
+          // A destination that overlaps an operand is read before it is written only when the registers are the same
+          // or the lanes independent, which they are: any difference is a fault of the kernel.
+          throw vtest::Failure(lv + " dop_m in place kind " + std::to_string(kind) + " regs a" + std::to_string(ra) + " b" +
+                               std::to_string(rb) + " c" + std::to_string(rc) + " d" + std::to_string(rd) + " lane " + std::to_string(i));
+        }
+    }
+  }
+}
+
 VTEST(level_choice) {
   VCHECK(simd::supported(simd::Level::Base));
   VCHECK(simd::supported(simd::level()));

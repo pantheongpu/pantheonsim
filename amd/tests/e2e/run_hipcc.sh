@@ -521,4 +521,14 @@ out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe"
 expect "the texture API answers as ROCm's HIP does on a GPU without texture units" "same" \
   "$(diff -q <(echo "$out") "$(dirname "$exe")/rocm/textures.expected" >/dev/null && echo same ||
      diff <(echo "$out") "$(dirname "$exe")/rocm/textures.expected" | head -4 | tr '\n' ' ')"
+# The waves of a work-group read a word right after a barrier before any of them overwrites it, as they do on a card
+# where they leave the barrier within a few cycles of one another (hipcc/wave_race.cpp): rocSOLVER's Cholesky kernel
+# depends on it, and returned a wrong factor for every matrix of order 66 or more when wave 0 ran on to its overwrite
+# before wave 1 read.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/wave_race.gfx942" 2>&1)
+status=$?
+echo "$out" | sed 's/^/      /'
+expect "the wave-order program runs to the end" "0" "$status"
+expect "every wave reads the word before thread 0 overwrites it, in a kernel's first round and in later ones" \
+  "10 of 10 wave-order checks hold" "$(grep -o '^[0-9]* of [0-9]* wave-order checks hold' <<< "$out")"
 exit $fail

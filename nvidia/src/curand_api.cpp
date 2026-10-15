@@ -292,12 +292,33 @@ curandStatus_t quasi_fill(Generator* g, T* out, size_t n, F&& convert) {
   if (n % g->dims) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
   const size_t per = n / g->dims;
   std::vector<T> h(n);
-  for (unsigned d = 0; d < g->dims; ++d)
-    for (size_t k = 0; k < per; ++k) {
-      const uint64_t i = g->offset + g->counter + k;
-      h[d * per + k] = g->quasi64() ? convert(sobol_point<unsigned long long>(*g, d, i))
-                                    : convert(sobol_point<uint32_t>(*g, d, i));
-    }
+  // Point i of a dimension is the XOR of the direction vectors its Gray code picks, so the next point differs from this one by
+  // exactly one vector (that of the lowest set bit of the next index): each piece of a dimension starts with one point worked out
+  // whole and steps from it. Pieces are independent, so they go to the host's threads.
+  auto fill = [&](auto raw_tag) {
+    using Raw = decltype(raw_tag);
+    constexpr unsigned bits = sizeof(Raw) * 8;
+    const std::vector<Raw>& v = direction_table<Raw>(g->scrambled());
+    constexpr size_t kPiece = 1 << 14;
+    const size_t pieces_per_dim = (per + kPiece - 1) / kPiece;
+    const int64_t items = static_cast<int64_t>(pieces_per_dim * g->dims);
+    const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(n) * 12, items, 2000000);
+    vgpu::hostpar::parallel_for(threads, items, [&](int64_t it) {
+      const unsigned d = static_cast<unsigned>(it / static_cast<int64_t>(pieces_per_dim));
+      const size_t k0 = static_cast<size_t>(it % static_cast<int64_t>(pieces_per_dim)) * kPiece, k1 = std::min(per, k0 + kPiece);
+      const Raw* vd = v.data() + static_cast<size_t>(d) * bits;
+      uint64_t i = g->offset + g->counter + k0;
+      Raw x = sobol_point<Raw>(*g, d, i);
+      h[d * per + k0] = convert(x);
+      for (size_t k = k0 + 1; k < k1; ++k) {
+        ++i;
+        x ^= vd[__builtin_ctzll(i)];
+        h[d * per + k] = convert(x);
+      }
+    });
+  };
+  if (g->quasi64()) fill(static_cast<unsigned long long>(0));
+  else fill(static_cast<uint32_t>(0));
   g->counter += per;
   store(g, out, h);
   return CURAND_STATUS_SUCCESS;
@@ -591,6 +612,25 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormal(curandGenerator_t gen, float*
   if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
   if (!reinterpret_cast<Generator*>(gen)->quasi() && n % 2) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
   VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateLogNormal(gen, out, n, mean, stddev));
+  auto* g = reinterpret_cast<Generator*>(gen);
+  if (!g->quasi()) {
+    // Each normal (as the float it is) goes through exp in the same pass, instead of a pass over the stored normals.
+    std::vector<float> h(n);
+    for_pieces(n, 45, [&](size_t b, size_t e) {
+      for (size_t i = b; i < e; i += 2) {
+        float u1 = uniform_float(draw32(g->seed, g->offset + g->counter + i));
+        float u2 = uniform_float(draw32(g->seed, g->offset + g->counter + i + 1));
+        float r = std::sqrt(-2.0f * std::log(u1)), theta = 6.2831853f * u2;
+        const float n0 = mean + stddev * r * std::cos(theta);
+        const float n1 = mean + stddev * r * std::sin(theta);
+        h[i] = std::exp(n0);
+        h[i + 1] = std::exp(n1);
+      }
+    });
+    g->counter += n;
+    store(out, h);
+    return CURAND_STATUS_SUCCESS;
+  }
   curandStatus_t s = curandGenerateNormal(gen, out, n, mean, stddev);
   if (s != CURAND_STATUS_SUCCESS) return s;
   auto* g = reinterpret_cast<Generator*>(gen);
@@ -608,6 +648,24 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormalDouble(curandGenerator_t gen, 
   if (!valid(gen)) return CURAND_STATUS_NOT_INITIALIZED;
   if (!reinterpret_cast<Generator*>(gen)->quasi() && n % 2) return CURAND_STATUS_LENGTH_NOT_MULTIPLE;
   VGPU_RECORD_IF_CAPTURING(gen, n, curandGenerateLogNormalDouble(gen, out, n, mean, stddev));
+  auto* g = reinterpret_cast<Generator*>(gen);
+  if (!g->quasi()) {
+    std::vector<double> h(n);
+    for_pieces(n, 60, [&](size_t b, size_t e) {
+      for (size_t i = b; i < e; i += 2) {
+        double u1 = uniform_double(mix(g->seed ^ mix(g->offset + g->counter + i)));
+        double u2 = uniform_double(mix(g->seed ^ mix(g->offset + g->counter + i + 1)));
+        double r = std::sqrt(-2.0 * std::log(u1)), theta = 6.283185307179586 * u2;
+        const double n0 = mean + stddev * r * std::cos(theta);
+        const double n1 = mean + stddev * r * std::sin(theta);
+        h[i] = std::exp(n0);
+        h[i + 1] = std::exp(n1);
+      }
+    });
+    g->counter += n;
+    store(out, h);
+    return CURAND_STATUS_SUCCESS;
+  }
   curandStatus_t s = curandGenerateNormalDouble(gen, out, n, mean, stddev);
   if (s != CURAND_STATUS_SUCCESS) return s;
   auto* g = reinterpret_cast<Generator*>(gen);
