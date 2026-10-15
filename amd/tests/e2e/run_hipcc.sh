@@ -433,9 +433,10 @@ for prog in block1250 tensor1250 ds1250 forms1250 cluster1250 preload1250.3 prel
   expect "every gfx1250 $prog check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 done
 
-# Events shared between processes (hipcc/ipc.cpp): an interprocess event's
-# handle opened in a process it forks, whose wait waits for the record made
-# here.
+# Events and memory shared between processes (hipcc/ipc.cpp): an interprocess
+# event's handle opened in a process it forks, whose wait waits for the record
+# made here; and two handles asked for one allocation, both opened there, read
+# and written through there.
 out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" timeout 120 "$(dirname "$exe")/ipc.gfx942" 2>&1)
 status=$?
 echo "$out" | sed 's/^/      /'
