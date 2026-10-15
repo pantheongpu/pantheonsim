@@ -264,7 +264,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "ldc",
-                                      "bsync", "yield", "shfl",  "vote",  "hmma"};
+                                      "bsync", "yield", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -547,6 +547,87 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       accept(Form::Fsetp);
       return;
     }
+    // ---- the uniform datapath (exec_int computes these once, for the first lane that runs them) ----
+    // A UR destination (URZ, which the interpreter drops, is kNoReg); sources as plain 32-bit values; -x and ~x kept apart in aux/b
+    // for the forms that apply them as exec_int's ival does (two bits a source: neg, not).
+    case Op::UMOV: {
+      if (ins.mnemonic != "UMOV" || ins.f[1] || ins.dst[0].kind != Kind::UReg || ins.src.empty() || !plain_kind(ins.src[0])) return;
+      if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg)) return;
+      m.dst = ins.dst[0].reg >= b.urz() ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+      accept(Form::Umov);
+      return;
+    }
+    case Op::ULDC: {   // the plain forms: a word, a narrow field of one, or two words, of a constant bank
+      if (ins.f[1] || ins.dst[0].kind != Kind::UReg || ins.src.empty() || ins.src[0].kind != Kind::CBank) return;
+      const unsigned size = ins.f[0];
+      m.dst = ins.dst[0].reg >= b.urz() ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+      m.a = ins.src[0].reg;   // the bank
+      m.imm = ins.src[0].imm;
+      m.b = size;
+      m.c = b.urz();
+      accept(Form::Uldc);
+      return;
+    }
+    case Op::UIADD3: {
+      if (ins.f[1] || ins.src.size() < 3 || ins.dst[0].kind != Kind::UReg) return;   // (UIADD3.64 is the interpreter's)
+      const bool x = ins.f[0];
+      if (x && ins.src.size() < 5) return;
+      if (ins.dst.size() > 3) return;
+      for (size_t i = 1; i < ins.dst.size(); ++i)
+        if (ins.dst[i].kind != Kind::UPred && ins.dst[i].kind != Kind::Pred) return;
+      for (unsigned i = 0; i < 3; ++i) {
+        if (!plain_kind(ins.src[i]) || !src32(b, ins.src[i], Dom::Plain, m.s[i], maxreg)) return;
+        m.b |= (ins.src[i].neg ? 1u : 0u) << (2 * i) | (ins.src[i].bnot ? 1u : 0u) << (2 * i + 1);
+      }
+      if (x) {
+        if ((ins.src[3].kind != Kind::UPred && ins.src[3].kind != Kind::Pred) || (ins.src[4].kind != Kind::UPred && ins.src[4].kind != Kind::Pred)) return;
+        m.p = pred_src(ins.src[3]);
+        m.p2 = pred_src(ins.src[4]);
+      }
+      m.dst = ins.dst[0].reg >= b.urz() ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+      m.dst2 = ins.dst.size() > 1 ? static_cast<uint16_t>(ins.dst[1].reg) : kNoReg;
+      m.a = ins.dst.size() > 2 ? ins.dst[2].reg : kNoReg;
+      m.aux = static_cast<uint8_t>((x ? 1 : 0) | (ins.dst.size() > 1 && ins.dst[1].kind == Kind::UPred ? 2 : 0) |
+                                   (ins.dst.size() > 2 && ins.dst[2].kind == Kind::UPred ? 4 : 0));
+      accept(Form::Uiadd3);
+      return;
+    }
+    case Op::UIMAD: {   // the 32-bit form, with a carry in and out; the WIDE and HI forms are the interpreter's
+      const unsigned kind = ins.f[0];
+      if (kind == 0x25 || kind == 0x27 || ins.src.size() < 3 || ins.dst[0].kind != Kind::UReg || ins.dst.size() > 2) return;
+      if (ins.dst.size() == 2 && ins.dst[1].kind != Kind::UPred && ins.dst[1].kind != Kind::Pred) return;
+      const bool x = ins.f[2];
+      if (x && (ins.src.size() < 4 || (ins.src[3].kind != Kind::UPred && ins.src[3].kind != Kind::Pred))) return;
+      for (unsigned i = 0; i < 3; ++i) {
+        if (!plain_kind(ins.src[i]) || !src32(b, ins.src[i], Dom::Plain, m.s[i], maxreg)) return;
+        m.b |= (ins.src[i].neg ? 1u : 0u) << (2 * i) | (ins.src[i].bnot ? 1u : 0u) << (2 * i + 1);
+      }
+      if (x) m.p = pred_src(ins.src[3]);
+      m.dst = ins.dst[0].reg >= b.urz() ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+      m.dst2 = ins.dst.size() == 2 ? static_cast<uint16_t>(ins.dst[1].reg) : kNoReg;
+      m.aux = static_cast<uint8_t>((x ? 1 : 0) | (ins.dst.size() == 2 && ins.dst[1].kind == Kind::UPred ? 2 : 0));
+      accept(Form::Uimad);
+      return;
+    }
+    case Op::UISETP: {
+      if (ins.f[3] || ins.f[4] || ins.dst.size() < 2 || ins.src.size() < 3) return;   // (.EX and the 64-bit compare are the interpreter's)
+      // With uniform predicates for destinations exec_int does not narrow it to one lane, so what it computes is the last lane's: the
+      // same thing only if no operand is a lane's own. Those (a per-lane register or predicate) are the interpreter's.
+      for (int i = 0; i < 2; ++i) {
+        const Operand& o = ins.src[i];
+        if (!(o.kind == Kind::Imm || o.kind == Kind::CBank || o.kind == Kind::UReg || (o.kind == Kind::Reg && o.reg == kRZ))) return;
+        if (!src32(b, o, Dom::Plain, m.s[i], maxreg)) return;
+      }
+      if (ins.dst[0].kind != Kind::UPred || ins.dst[1].kind != Kind::UPred || ins.src[2].kind != Kind::UPred) return;
+      m.p = pred_src(ins.src[2]);
+      m.a = ins.f[0];
+      m.b = ins.f[2];
+      m.c = ins.f[1] ? 1 : 0;
+      m.dst = static_cast<uint16_t>(ins.dst[0].reg);
+      m.dst2 = static_cast<uint16_t>(ins.dst[1].reg);
+      accept(Form::Uisetp);
+      return;
+    }
     case Op::DADD: case Op::DMUL: case Op::DFMA: {
       const unsigned nsrc = ins.op == Op::DFMA ? 3 : 2;
       if (ins.f[0] || ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.src.size() < nsrc) return;
@@ -581,6 +662,68 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.dst = static_cast<uint16_t>(ins.dst[0].reg);
       m.dst2 = static_cast<uint16_t>(ins.dst[1].reg);
       accept(Form::Dsetp);
+      return;
+    }
+    default: break;
+  }
+
+  // The uniform ones that have a UR destination and are not above.
+  switch (ins.op) {
+    case Op::ULEA: {   // (a << s) + b, with .HI, .SX32, .X and a carry out, as LEA computes it, once
+      const bool hi = ins.f[0], x = ins.f[1], sx32 = ins.f[2];
+      const bool three = hi && !sx32;
+      const size_t pidx = three ? 4 : 3;
+      if (ins.dst[0].kind != Kind::UReg || ins.dst.size() > 2 || ins.src.size() < (x ? pidx + 1 : pidx)) return;
+      if (ins.dst.size() == 2 && ins.dst[1].kind != Kind::UPred && ins.dst[1].kind != Kind::Pred) return;
+      if (!plain_kind(ins.src[0]) || !plain_kind(ins.src[1]) || (three && !plain_kind(ins.src[2]))) return;
+      if (x && ins.src[pidx].kind != Kind::UPred && ins.src[pidx].kind != Kind::Pred) return;
+      if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg) || !src32(b, ins.src[1], Dom::Plain, m.s[1], maxreg)) return;
+      if (three && !src32(b, ins.src[2], Dom::Plain, m.s[2], maxreg)) return;
+      if (x) m.p = pred_src(ins.src[pidx]);
+      m.dst = ins.dst[0].reg >= b.urz() ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+      m.dst2 = ins.dst.size() == 2 ? static_cast<uint16_t>(ins.dst[1].reg) : kNoReg;
+      m.a = ins.f[3];
+      m.b = (ins.src[0].neg ? 1u : 0u) | (ins.src[1].neg ? 2u : 0u) | (ins.src[1].bnot ? 4u : 0u);
+      m.aux = static_cast<uint8_t>((hi ? 1 : 0) | (x ? 2 : 0) | (sx32 ? 4 : 0) | (ins.dst.size() == 2 ? 8 : 0) |
+                                   (ins.dst.size() == 2 && ins.dst[1].kind == Kind::UPred ? 16 : 0));
+      accept(Form::Ulea);
+      return;
+    }
+    case Op::ULOP3: {   // (the form with a predicate runs for every lane: the interpreter's)
+      if (ins.dst.size() != 1 || ins.dst[0].kind != Kind::UReg || ins.src.size() < 3) return;
+      for (unsigned i = 0; i < 3; ++i)
+        if (!plain_kind(ins.src[i]) || !src32(b, ins.src[i], Dom::Plain, m.s[i], maxreg)) return;
+      m.dst = ins.dst[0].reg >= b.urz() ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+      m.a = ins.f[0];   // the truth table
+      accept(Form::Ulop3);
+      return;
+    }
+    case Op::USHF: {
+      if (ins.dst.size() != 1 || ins.dst[0].kind != Kind::UReg || ins.src.size() < 3) return;
+      for (unsigned i = 0; i < 3; ++i)
+        if (!plain_kind(ins.src[i]) || !src32(b, ins.src[i], Dom::Plain, m.s[i], maxreg)) return;
+      m.dst = ins.dst[0].reg >= b.urz() ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+      m.a = ins.f[0];
+      m.aux = static_cast<uint8_t>((ins.f[1] ? 1 : 0) | (ins.f[2] ? 2 : 0) | (ins.f[3] ? 4 : 0));   // wrap, right, hi
+      accept(Form::Ushf);
+      return;
+    }
+    case Op::USEL: {   // p ? a : b
+      if (ins.f[0] || ins.dst.size() != 1 || ins.dst[0].kind != Kind::UReg || ins.src.size() < 3 || !plain_kind(ins.src[0]) || !plain_kind(ins.src[1])) return;
+      if (ins.src[2].kind != Kind::UPred && ins.src[2].kind != Kind::Pred) return;
+      if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg) || !src32(b, ins.src[1], Dom::Plain, m.s[1], maxreg)) return;
+      m.p = pred_src(ins.src[2]);
+      m.dst = ins.dst[0].reg >= b.urz() ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+      accept(Form::Usel);
+      return;
+    }
+    case Op::UFLO: case Op::UPOPC: {
+      if (ins.dst.size() != 1 || ins.dst[0].kind != Kind::UReg || ins.src.empty() || !plain_kind(ins.src[0])) return;
+      if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg)) return;
+      m.b = (ins.src[0].neg ? 1u : 0u) | (ins.src[0].bnot ? 2u : 0u);
+      m.dst = ins.dst[0].reg >= b.urz() ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+      m.a = ins.op == Op::UPOPC ? 0 : 1 + (ins.f[0] ? 1u : 0u) + (ins.f[1] ? 2u : 0u);   // 0 the number of bits; 1.. FLO's variants
+      accept(Form::Uunary);
       return;
     }
     default: break;

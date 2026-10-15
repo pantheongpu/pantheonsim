@@ -91,10 +91,12 @@ void check_corpus(const std::string& file, int sm) {
     const bool ends = op.form == sass::tier::Form::Bra || op.form == sass::tier::Form::Bssy || op.form == sass::tier::Form::Nop ||
                       op.form == sass::tier::Form::Bsync || op.form == sass::tier::Form::Yield;
     const bool terminal = op.form == sass::tier::Form::Plop3 || op.form == sass::tier::Form::S2r || op.form == sass::tier::Form::Sel ||
-                          op.form == sass::tier::Form::Shfl || op.form == sass::tier::Form::Vote || op.form == sass::tier::Form::Hmma;   // end a run, and have handlers
+                          op.form == sass::tier::Form::Shfl || op.form == sass::tier::Form::Vote || op.form == sass::tier::Form::Hmma ||
+                          op.form == sass::tier::Form::Umov || op.form == sass::tier::Form::Uldc || op.form == sass::tier::Form::Usel;   // end a run, and have handlers
     VCHECK(ins.straight != (ends || terminal));
     VCHECK(op.maxreg <= 256);   // 0 is possible: constants into RZ
     const std::string what = std::string(sass::tier::form_name(op.form)) + " " + sass::to_text(ins);
+    const bool uniform = op.form >= sass::tier::Form::Umov && op.form <= sass::tier::Form::Usel;   // dst is a UR, not a row
     const bool mem = (op.form >= sass::tier::Form::Ldg && op.form <= sass::tier::Form::Stl) || op.form == sass::tier::Form::Hmma;   // s[] holds raw register numbers there
     // A double operand, and IMAD.WIDE's and IMAD.HI's addend, are pairs of rows.
     for (int i = 0; i < 3 && !mem; ++i) {
@@ -104,7 +106,7 @@ void check_corpus(const std::string& file, int sm) {
     }
     // A destination register the handler writes lies inside the file the op claims to need.
     if (op.dst != sass::tier::kNoReg && op.form != sass::tier::Form::Isetp && op.form != sass::tier::Form::Fsetp &&
-        op.form != sass::tier::Form::IsetpEx && op.form != sass::tier::Form::Plop3 && op.form != sass::tier::Form::Dsetp && op.form != sass::tier::Form::Vote && !ends)
+        op.form != sass::tier::Form::IsetpEx && op.form != sass::tier::Form::Plop3 && op.form != sass::tier::Form::Dsetp && op.form != sass::tier::Form::Vote && !uniform && !ends)
       VCHECK(op.dst < op.maxreg);
     if (ends) VCHECK(op.fn == nullptr);
   }

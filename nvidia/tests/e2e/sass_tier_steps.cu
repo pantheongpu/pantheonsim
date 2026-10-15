@@ -221,6 +221,24 @@ __global__ void shuffles(const u32* in, u32* out, int n, int shape) {
   for (int k = 0; k < 32; ++k) out[(size_t)i * 32 + k] = o[k];
 }
 
+// ---- the uniform datapath: values every lane of a warp has in common (kernel arguments, blockIdx) and loops on them -----------
+__global__ void uniforms(u32* out, u32 a, u32 b, u32 c, u32 n, u64 w64, int sgn) {
+  const unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+  u32 acc = t;
+  const u32 u1 = a * b + c, u2 = (a ^ c) + blockIdx.x * 7u, u3 = (b << (c & 15)) - a, u4 = __clz(a | 1u) + __popc(b), u5 = __brev(c) ^ u2;
+  const u64 q = w64 * (u64)(blockIdx.x + 3) + ((u64)a << 20), r = q >> (b & 63);
+  const int s1 = (int)a - (int)b;
+  for (u32 i = 0; i < n; i += 3) {
+    acc += (a >> (i & 7)) ^ (b * i) ^ (c < i ? u1 : u2);
+    acc ^= (s1 < (int)i ? u3 : u4) + (i == n / 2 ? u5 : 0u);
+    acc += (u32)(q >> (i & 31)) + (u32)(r + i);
+  }
+  const u32 fl = __funnelshift_l(a, b, c & 31), fr = __funnelshift_r(u1, u2, u3 & 31);
+  acc += fl + fr + (sgn ? (u32)(s1 >> 3) : (u32)(s1 / 5));
+  acc += (u32)((q + r) >> 32) + (u32)(q < r) + (u32)((long long)q < (long long)r) + __ffs(u1) + __clz(u2) + (u1 > u2 ? 1u : 2u);
+  out[t] = acc;
+}
+
 // ---- 7. special registers and kernel arguments ------------------------------------------------------------------
 __global__ void specials(u32* out, u32 a, u32 b) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -541,6 +559,23 @@ int main(int argc, char** argv) {
         if (report(nm, dout, (size_t)n * 32)) return 1;
       }
     CK(cudaFree(din)); CK(cudaFree(dout));
+  }
+  {
+    u32* out;
+    CK(cudaMalloc(&out, 1024 * 4));
+    const u32 args[][4] = {{0x9e3779b9u, 0x85ebca6bu, 0xc2b2ae35u, 40u}, {0u, 0xffffffffu, 0x80000000u, 17u}, {5u, 0x7fffffffu, 1u, 0u},
+                           {0xdeadbeefu, 3u, 0xfedcba98u, 64u}};
+    for (int threads : {96, 33}) {
+      for (int k = 0; k < 4; ++k) {
+        for (int sgn : {0, 1}) {
+          uniforms<<<5, threads>>>(out, args[k][0], args[k][1], args[k][2], args[k][3], 0x0123456789abcdefull * (u64)(k + 1), sgn);
+          char nm[64];
+          std::snprintf(nm, sizeof nm, "uniforms %d args=%d sgn=%d", threads, k, sgn);
+          if (report(nm, out, (size_t)5 * threads)) return 1;
+        }
+      }
+    }
+    CK(cudaFree(out));
   }
   {
     u32* out;

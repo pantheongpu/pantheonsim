@@ -657,6 +657,171 @@ TIER_HANDLER(h_ldc) {
   }
 }
 
+// ---- the uniform datapath ------------------------------------------------------------------------
+//
+// exec_int computes these once for the warp, on the first lane that runs the instruction (the operands of a uniform instruction are
+// the same in every lane), and writes a UR or a UP; a predicate result may also go to a lane's own P, as bit `l`.
+
+inline uint32_t tier_sc(const TCtx& c, const tier::Src& s, unsigned l) {   // a source as lane l reads it
+  if (s.kind == tier::SrcKind::Row) return c.R[s.off + l];
+  if (s.kind == tier::SrcKind::Pool) return c.pool[s.off].v[0];
+  switch (s.dyn) {
+    case tier::Dyn::Reg: return c.R[s.off * 32u + l];
+    case tier::Dyn::Bank0: return tier_b0(c, s.off);
+    default: return c.w->ur[s.off];
+  }
+}
+inline void tier_wur(const TCtx& c, uint16_t reg, uint32_t v) { if (reg != tier::kNoReg) c.w->ur[reg] = v; }
+// A predicate destination (set_pred): a uniform UP, or bit l of a P; PT is not written.
+inline void tier_wp1(const TCtx& c, bool uniform, unsigned reg, unsigned l, bool v) {
+  if (reg == kPT) return;
+  if (uniform) c.w->up[reg] = v;
+  else if (v) c.w->p[reg] |= Mask{1} << l;
+  else c.w->p[reg] &= ~(Mask{1} << l);
+}
+inline bool tier_pb(const TCtx& c, const tier::Src& p, unsigned l) { return ((tier_pmask(c, p) >> l) & 1) != 0; }
+inline uint32_t tier_ival(uint32_t v, bool neg, bool bnot) {   // exec_int's ival: -x, then ~x
+  if (neg) v = 0u - v;
+  if (bnot) v = ~v;
+  return v;
+}
+
+TIER_HANDLER(h_umov) {
+  TIER_PRELUDE
+  tier_wur(c, op.dst, tier_sc(c, op.s[0], static_cast<unsigned>(std::countr_zero(ex))));
+}
+
+// ULDC: a word of a constant bank, or a narrow field of one, or two words (exec_int's non-indexed ULDC).
+TIER_HANDLER(h_uldc) {
+  TIER_PRELUDE
+  const unsigned bank = op.a, size = op.b;
+  const uint64_t off = static_cast<uint64_t>(op.imm);
+  if (size == 5) {
+    const uint32_t lo = c.r->tier_cbank32(bank, off), hi = c.r->tier_cbank32(bank, off + 4);
+    if (op.dst != tier::kNoReg) {
+      c.w->ur[op.dst] = lo;
+      if (op.dst + 1u < op.c) c.w->ur[op.dst + 1] = hi;   // (the partner of the last UR is URZ: dropped)
+    }
+    return;
+  }
+  // A narrow load takes its bytes out of the aligned word: c[0x3][0x59] is a byte of the word at 0x58.
+  const uint32_t v = size < 4 ? c.r->tier_cbank32(bank, off & ~3ull) >> (8 * (off & 3)) : c.r->tier_cbank32(bank, off);
+  tier_wur(c, op.dst, tier_extend(size, v));
+}
+
+TIER_HANDLER(h_uiadd3) {
+  TIER_PRELUDE
+  const unsigned l = static_cast<unsigned>(std::countr_zero(ex));
+  uint64_t sum = 0;
+  for (unsigned i = 0; i < 3; ++i) {
+    uint32_t v = tier_sc(c, op.s[i], l);
+    if ((op.b >> (2 * i)) & 1) {   // a negated source is added as its complement and a one
+      sum += static_cast<uint32_t>(~v);
+      sum += 1;
+    } else {
+      if ((op.b >> (2 * i + 1)) & 1) v = ~v;
+      sum += v;
+    }
+  }
+  if (op.aux & 1) sum += static_cast<uint64_t>(tier_pb(c, op.p, l)) + static_cast<uint64_t>(tier_pb(c, op.p2, l));
+  tier_wur(c, op.dst, static_cast<uint32_t>(sum));
+  const uint64_t over = sum >> 32;
+  if (op.dst2 != tier::kNoReg) tier_wp1(c, op.aux & 2, op.dst2, l, over >= 1);
+  if (op.a != tier::kNoReg) tier_wp1(c, op.aux & 4, op.a, l, over >= 2);
+}
+
+TIER_HANDLER(h_uimad) {
+  TIER_PRELUDE
+  const unsigned l = static_cast<unsigned>(std::countr_zero(ex));
+  const uint32_t a = tier_ival(tier_sc(c, op.s[0], l), op.b & 1, op.b & 2), b = tier_ival(tier_sc(c, op.s[1], l), op.b & 4, op.b & 8),
+                 d = tier_ival(tier_sc(c, op.s[2], l), op.b & 16, op.b & 32);
+  const bool cin = (op.aux & 1) && tier_pb(c, op.p, l);
+  const uint64_t full = static_cast<uint64_t>(a * b) + d + cin;
+  tier_wur(c, op.dst, static_cast<uint32_t>(full));
+  if (op.dst2 != tier::kNoReg) tier_wp1(c, op.aux & 2, op.dst2, l, (full >> 32) != 0);
+}
+
+TIER_HANDLER(h_uisetp) {
+  TIER_PRELUDE
+  const unsigned l = static_cast<unsigned>(std::countr_zero(ex));
+  const uint32_t a = tier_sc(c, op.s[0], l), b = tier_sc(c, op.s[1], l);
+  const bool acc = tier_pb(c, op.p, l);
+  const bool r = op.c ? int_cmp(op.a, static_cast<int32_t>(a), static_cast<int32_t>(b)) : int_cmp(op.a, a, b);
+  tier_wp1(c, true, op.dst, l, bool_op(op.b, r, acc));
+  tier_wp1(c, true, op.dst2, l, bool_op(op.b, !r, acc));
+}
+
+TIER_HANDLER(h_ulea) {
+  TIER_PRELUDE
+  const unsigned l = static_cast<unsigned>(std::countr_zero(ex));
+  const bool hi = op.aux & 1, x = op.aux & 2, sx32 = op.aux & 4, has_p = op.aux & 8;
+  const unsigned s = op.a;
+  const bool a_neg = op.b & 1, b_neg = op.b & 2, b_not = op.b & 4;
+  const uint32_t a = tier_sc(c, op.s[0], l);
+  const uint32_t an = a_neg ? 0u - a : a;
+  const uint32_t b = tier_ival(tier_sc(c, op.s[1], l), b_neg, b_not);
+  uint32_t shifted;
+  if (!hi) {
+    shifted = s >= 32 ? 0 : an << s;
+  } else {
+    const uint32_t top = sx32 ? static_cast<uint32_t>(static_cast<int32_t>(an) >> 31) : tier_sc(c, op.s[2], l);
+    const uint64_t v = an | (static_cast<uint64_t>(top) << 32);
+    shifted = s >= 64 ? 0 : static_cast<uint32_t>((v << s) >> 32);
+  }
+  const bool cin = x && tier_pb(c, op.p, l);
+  uint64_t sum = static_cast<uint64_t>(shifted) + b + cin;
+  // LEA Rd, P, -Ra, Rb: the adder takes ~(Ra << s) + 1, so negating 0 carries out.
+  if (!hi && a_neg) sum = static_cast<uint64_t>(static_cast<uint32_t>(~(s >= 32 ? 0 : a << s))) + 1 + b + cin;
+  // LEA Rd, P, Ra, -Rb: likewise a zero Rb carries out.
+  if (b_neg && b == 0) sum += uint64_t{1} << 32;
+  tier_wur(c, op.dst, static_cast<uint32_t>(sum));
+  if (has_p) tier_wp1(c, op.aux & 16, op.dst2, l, (sum >> 32) != 0);
+}
+
+TIER_HANDLER(h_ulop3) {
+  TIER_PRELUDE
+  const unsigned l = static_cast<unsigned>(std::countr_zero(ex));
+  tier_wur(c, op.dst, lop3(tier_sc(c, op.s[0], l), tier_sc(c, op.s[1], l), tier_sc(c, op.s[2], l), op.a));
+}
+
+TIER_HANDLER(h_ushf) {
+  TIER_PRELUDE
+  const unsigned l = static_cast<unsigned>(std::countr_zero(ex));
+  const unsigned type = op.a;   // 0 S64, 1 U64, 2 S32, 3 U32
+  const bool wrap = op.aux & 1, right = op.aux & 2, hi = op.aux & 4;
+  const bool is64 = type < 2, sgn = type == 0 || type == 2;
+  const uint64_t v = tier_sc(c, op.s[0], l) | (static_cast<uint64_t>(tier_sc(c, op.s[2], l)) << 32);
+  uint32_t n = tier_sc(c, op.s[1], l);
+  const uint32_t width = is64 ? 64 : 32;
+  n = wrap ? n % width : std::min(n, width);
+  uint64_t r;
+  if (!right) r = n >= 64 ? 0 : v << n;
+  else if (sgn) r = static_cast<uint64_t>(static_cast<int64_t>(v) >> std::min(n, 63u));
+  else r = n >= 64 ? 0 : v >> n;
+  tier_wur(c, op.dst, static_cast<uint32_t>(hi ? r >> 32 : r));
+}
+
+TIER_HANDLER(h_usel) {
+  TIER_PRELUDE
+  const unsigned l = static_cast<unsigned>(std::countr_zero(ex));
+  tier_wur(c, op.dst, tier_pb(c, op.p, l) ? tier_sc(c, op.s[0], l) : tier_sc(c, op.s[1], l));
+}
+
+TIER_HANDLER(h_uunary) {
+  TIER_PRELUDE
+  const unsigned l = static_cast<unsigned>(std::countr_zero(ex));
+  uint32_t v = tier_ival(tier_sc(c, op.s[0], l), op.b & 1, op.b & 2);
+  if (op.a == 0) {
+    tier_wur(c, op.dst, popc(v));
+    return;
+  }
+  const bool sgn = (op.a - 1) & 1, sh = (op.a - 1) & 2;   // FLO: the highest set bit (of the complement for a negative value, if signed)
+  if (sgn && (v >> 31)) v = ~v;
+  uint32_t r = v ? 31 - static_cast<uint32_t>(std::countl_zero(v)) : kAll;
+  if (sh && r != kAll) r = 31 - r;
+  tier_wur(c, op.dst, r);
+}
+
 // ---- memory -------------------------------------------------------------------------------------
 
 
@@ -1069,6 +1234,16 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Shfl: return &h_shfl;
     case F::Vote: return &h_vote;
     case F::Hmma: return &h_hmma;
+    case F::Umov: return &h_umov;
+    case F::Uldc: return &h_uldc;
+    case F::Uiadd3: return &h_uiadd3;
+    case F::Uimad: return &h_uimad;
+    case F::Uisetp: return &h_uisetp;
+    case F::Ulea: return &h_ulea;
+    case F::Ulop3: return &h_ulop3;
+    case F::Ushf: return &h_ushf;
+    case F::Uunary: return &h_uunary;
+    case F::Usel: return &h_usel;
     case F::Ldg: return &h_global<false>;
     case F::Stg: return &h_global<true>;
     case F::Lds: return &h_shared<false>;
