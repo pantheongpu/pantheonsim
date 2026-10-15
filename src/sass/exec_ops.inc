@@ -297,29 +297,30 @@ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel, unsigned mode) {
         r |= v << (8 * i);
       }
       return r;
-    case 1: {   // F4E: forward 4 extract
-      const unsigned s = sel & 7;
+    // (The modes take their selector from its low two bits, as the PTX instruction's c[1:0] does: an RTX 3060's PRMT.F4E with
+    // a selector of 5 starts at byte 1, not byte 5.)
+    case 1: {   // F4E: forward 4 extract: bytes s, s+1, s+2, s+3 of the eight
+      const unsigned s = sel & 3;
       for (unsigned i = 0; i < 4; ++i) r |= byte(s + i) << (8 * i);
       return r;
     }
-    case 2: {   // B4E: backward 4 extract
-      const unsigned s = sel & 7;
-      for (unsigned i = 0; i < 4; ++i) r |= byte(s + 8 - i) << (8 * i);
+    case 2: {   // B4E: backward 4 extract: bytes s, s-1, s-2, s-3, wrapping in the eight
+      const unsigned s = sel & 3;
+      for (unsigned i = 0; i < 4; ++i) r |= byte(s - i) << (8 * i);
       return r;
     }
     case 3: {   // RC8: replicate one byte
       const uint32_t v = byte(sel & 3);
       return v * 0x01010101u;
     }
-    case 4: {   // ECL: edge clamp left
+    case 4: {   // ECL: edge clamp left: byte i is byte max(i, s)
       const unsigned s = sel & 3;
-      for (unsigned i = 0; i < 4; ++i) r |= byte(std::max(i, s) == i ? s : i < s ? i : s) << (8 * i);
-      for (unsigned i = 0; i < 4; ++i) r = (r & ~(0xffu << (8 * i))) | (byte(i > s ? s : i) << (8 * i));
+      for (unsigned i = 0; i < 4; ++i) r |= byte(std::max(i, s)) << (8 * i);
       return r;
     }
-    case 5: {   // ECR: edge clamp right
+    case 5: {   // ECR: edge clamp right: byte i is byte min(i, s)
       const unsigned s = sel & 3;
-      for (unsigned i = 0; i < 4; ++i) r |= byte(i < s ? s : i) << (8 * i);
+      for (unsigned i = 0; i < 4; ++i) r |= byte(std::min(i, s)) << (8 * i);
       return r;
     }
     case 6: {   // RC16: replicate one half
@@ -954,7 +955,8 @@ bool float_cmp(unsigned cmp, double a, double b) {
     default: return true;
   }
 }
-float sat(float f) { return f != f ? 0.0f : f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
+// (.SAT clamps to [0, 1] and a NaN is 0; a negative zero is +0 too -- an RTX 3060: FMUL.FTZ.SAT of a product that flushes to -0 writes +0.)
+float sat(float f) { return f != f ? 0.0f : f <= 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
 
 // Half and bfloat16 conversions, round to nearest even.
 // (On the bits, bit for bit what the compiler's _Float16 conversions give -- which on a baseline x86-64 build are
@@ -1126,18 +1128,16 @@ bool Runner::fast_alu(Warp& w, const Instr& ins, Mask ex) {
         // The pair's two halves as 32-lane rows (the bounds are checked once, on both).
         lo[i] = &w.reg(o.reg, 0);
         hi[i] = &w.reg(o.reg + 1, 0);
-        mods |= (o.abs ? 1u : 0u) << (2 * i) | (o.neg ? 1u : 0u) << (2 * i + 1);
       } else {
-        // RZ, or an operand that is the same for every lane: its value with the modifiers applied (|x| clears the
-        // sign bit, -x flips it: the bits fabs and unary minus give), copied to all lanes.
-        uint64_t bits = o.kind == Kind::FImm && o.fwidth == 64 ? static_cast<uint64_t>(o.fbits) << 32 : read64(w, o, 0);
-        if (o.abs) bits &= 0x7fffffffffffffffull;
-        if (o.neg) bits ^= 0x8000000000000000ull;
+        // RZ, or an operand that is the same for every lane: its value, copied to all lanes (the modifiers are applied by the
+        // kernel, as for a register, which keeps a NaN operand as it is).
+        const uint64_t bits = o.kind == Kind::FImm && o.fwidth == 64 ? static_cast<uint64_t>(o.fbits) << 32 : read64(w, o, 0);
         for (unsigned l = 0; l < 32; ++l) {
           tlo[i][l] = static_cast<uint32_t>(bits);
           thi[i][l] = static_cast<uint32_t>(bits >> 32);
         }
       }
+      mods |= (o.abs ? 1u : 0u) << (2 * i) | (o.neg ? 1u : 0u) << (2 * i + 1);
     }
     const Operand& d = ins.dst[0];
     if (d.reg == kRZ) return true;   // nothing is written to RZ
@@ -1766,12 +1766,13 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
         // does; the answer in double, rounded once to float and flushed.
         const Operand& o = ins.src[0];
         const uint32_t* raw = lanes(0, o, false);
+        const bool flush = op != 9;   // (MUFU.TANH reads and writes subnormals as they are: an RTX 3060's tanh of 2^-149 is 2^-149)
         for (unsigned l = 0; l < 32; ++l) {
           float f = as_f32(raw[l]);
-          f = ftz(f);
+          if (flush) f = ftz(f);
           if (o.abs) f = std::fabs(f);
           if (o.neg) f = -f;
-          const double x = ftz(f);
+          const double x = flush ? ftz(f) : f;
           float v;
           switch (op) {
             case 0: v = static_cast<float>(std::cos(x * 6.28318530717958647692)); break;   // the argument is in turns
@@ -1780,7 +1781,7 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
             case 3: v = static_cast<float>(std::log2(x)); break;
             default: v = static_cast<float>(std::tanh(x)); break;
           }
-          r[l] = f32_bits(ftz(v));
+          r[l] = v != v ? 0x7fffffffu : f32_bits(flush ? ftz(v) : v);   // (a NaN is the canonical one, as in exec_float)
         }
       }
       if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
@@ -1937,19 +1938,23 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
         fa[l] = as_f32(ra[l]);
         fb[l] = as_f32(rb[l]);
       }
-      if (ins.f[2]) {   // .RELU: a negative value (not -0, not a NaN) becomes +0
+      if (ins.f[2]) {   // .RELU: a negative value or -0 becomes +0 (an RTX 3060); a NaN stays one
         for (unsigned l = 0; l < 32; ++l) {
-          if (fa[l] < 0) fa[l] = 0;
-          if (fb[l] < 0) fb[l] = 0;
+          if (fa[l] == fa[l] && std::signbit(fa[l])) fa[l] = 0;
+          if (fb[l] == fb[l] && std::signbit(fb[l])) fb[l] = 0;
         }
       }
+      // (A NaN packs to 0x7fff in either format, whatever its sign and payload: an RTX 3060, as the PTX engine's cvt.)
       if (ins.f[0]) {   // bf16
-        for (unsigned l = 0; l < 32; ++l) r[l] = (static_cast<uint32_t>(f32_to_bf16(fa[l])) << 16) | f32_to_bf16(fb[l]);
+        for (unsigned l = 0; l < 32; ++l)
+          r[l] = (static_cast<uint32_t>(fa[l] != fa[l] ? uint16_t{0x7fff} : f32_to_bf16(fa[l])) << 16) |
+                 (fb[l] != fb[l] ? uint16_t{0x7fff} : f32_to_bf16(fb[l]));
       } else {
         alignas(32) uint16_t ha[32], hb[32];
         sk->f32_to_f16(fa, ha, 32);
         sk->f32_to_f16(fb, hb, 32);
-        for (unsigned l = 0; l < 32; ++l) r[l] = (static_cast<uint32_t>(ha[l]) << 16) | hb[l];
+        for (unsigned l = 0; l < 32; ++l)
+          r[l] = (static_cast<uint32_t>(fa[l] != fa[l] ? uint16_t{0x7fff} : ha[l]) << 16) | (fb[l] != fb[l] ? uint16_t{0x7fff} : hb[l]);
       }
       if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
       return true;
@@ -2059,6 +2064,10 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
           write32(w, ins.dst[0], l, 0x7fffffffu);
           return;
         }
+        if (a != a && b != b) {   // two NaNs: the canonical one (an RTX 3060), not either operand
+          write32(w, ins.dst[0], l, 0x7fffffffu);
+          return;
+        }
         if (a != a) r = b;
         else if (b != b) r = a;
         else if (a == 0 && b == 0) r = mn ? (std::signbit(a) ? a : b) : (std::signbit(a) ? b : a);
@@ -2071,7 +2080,7 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
       each_lane(ex, [&](unsigned l) {
         // Computed in double and rounded once, as the PTX engine computes
         // the .approx functions, so the two engines agree to the bit.
-        const double x = ftz(f32src(ins.src[0], l, true));
+        const double x = op == 9 ? f32src(ins.src[0], l, false) : ftz(f32src(ins.src[0], l, true));   // (TANH does not flush)
         float r;
         switch (op) {
           case 0: r = static_cast<float>(std::cos(x * 6.28318530717958647692)); break;   // the argument is in turns
@@ -2091,20 +2100,33 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
           }
           default: fault(w, ins, l, "MUFU op " + std::to_string(op));
         }
-        write32(w, ins.dst[0], l, f32_bits(ftz(r)));
+        // (A NaN result -- a root or log of a negative, an infinity through sin or cos -- is the canonical one, 0x7fffffff,
+        // as on an RTX 3060 and as the PTX engine writes it.)
+        write32(w, ins.dst[0], l, r != r ? 0x7fffffffu : f32_bits(op == 9 ? r : ftz(r)));
       });
       return;
     }
     case Op::DADD: case Op::DMUL: case Op::DFMA: {
       const unsigned rnd = ins.f[0];
+      // (The operands as the registers hold them, for the NaN rule of simd::dop_nan: the |x| and -x modifiers change the arithmetic
+      // and not a NaN that is the answer.)
+      const auto f64raw = [&](const Operand& o, unsigned l) {
+        return o.kind == Kind::FImm && o.fwidth == 64 ? static_cast<uint64_t>(o.fbits) << 32 : read64(w, o, l);
+      };
       each_lane(ex, [&](unsigned l) {
         const double a = f64src(ins.src[0], l), b = f64src(ins.src[1], l);
-        double r;
+        double r, c = 0;
         if (ins.op == Op::DADD) r = rounded(rnd, [&] { return a + b; });
         else if (ins.op == Op::DMUL) r = rounded(rnd, [&] { return a * b; });
         else {
-          const double c = f64src(ins.src[2], l);
+          c = f64src(ins.src[2], l);
           r = rounded(rnd, [&] { return std::fma(a, b, c); });
+        }
+        if (r != r && (a != a || b != b || (ins.op == Op::DFMA && c != c))) {
+          write64(w, ins.dst[0], l,
+                  simd::dop_nan(ins.op == Op::DADD ? 0 : ins.op == Op::DMUL ? 1 : 2, f64raw(ins.src[0], l), f64raw(ins.src[1], l),
+                                ins.op == Op::DFMA ? f64raw(ins.src[2], l) : 0));
+          return;
         }
         write64(w, ins.dst[0], l, f64_bits(r));
       });
@@ -2254,14 +2276,13 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
       }
       each_lane(ex, [&](unsigned l) {
         float a = f32src(ins.src[0], l, false), b = f32src(ins.src[1], l, false);
-        if (ins.f[2]) {   // .RELU
-          if (a < 0) a = 0;
-          if (b < 0) b = 0;
+        if (ins.f[2]) {   // .RELU: a negative value or -0 becomes +0 (an RTX 3060); a NaN stays one
+          if (a == a && std::signbit(a)) a = 0;
+          if (b == b && std::signbit(b)) b = 0;
         }
-        uint32_t r;
-        if (ins.f[0]) r = (static_cast<uint32_t>(f32_to_bf16(a)) << 16) | f32_to_bf16(b);
-        else r = (static_cast<uint32_t>(f32_to_half(a)) << 16) | f32_to_half(b);
-        write32(w, ins.dst[0], l, r);
+        // A NaN packs to 0x7fff in either format, whatever its sign and payload (an RTX 3060, as the PTX engine's cvt).
+        const auto half = [&](float v) -> uint32_t { return v != v ? 0x7fffu : ins.f[0] ? f32_to_bf16(v) : f32_to_half(v); };
+        write32(w, ins.dst[0], l, (half(a) << 16) | half(b));
       });
       return;
     case Op::I2IP:
@@ -2361,7 +2382,9 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
         if (f32out) {
           float f = static_cast<float>(r[0]);
           if (fz) f = ftz(f);
-          write32(w, ins.dst[0], l, f32_bits(f));
+          // (A NaN half widens to the canonical f32 NaN, 0x7fffffff, not to the half's sign and payload: an RTX 3060, as the PTX
+          // engine's cvt.f32.f16.)
+          write32(w, ins.dst[0], l, f != f ? 0x7fffffffu : f32_bits(f));
           return;
         }
         // A NaN result is the canonical 0x7fff, as the PTX engine writes it.
@@ -3901,8 +3924,10 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       if (accumulate) acc = acc32 ? as_f32(slot) : half_to_f32(static_cast<uint16_t>(slot >> shift));
       for (uint32_t k = 0; k < K; ++k)
         acc += static_cast<float>(A[row * K + k]) * static_cast<float>(B[size_t{k} * N + col]);
-      if (acc32) slot = f32_bits(acc);
-      else slot = (slot & ~(0xffffu << shift)) | (static_cast<uint32_t>(f64_to_half(acc)) << shift);
+      // (A NaN is the canonical 0x7fffffff (0x7fff in an f16 accumulator), not whichever the host's add handed on when two met -- the
+      // first source operand's, which the compiler picks; derived from the HMMA path and the PTX documentation, no card has wgmma.)
+      if (acc32) slot = acc != acc ? 0x7fffffffu : f32_bits(acc);
+      else slot = (slot & ~(0xffffu << shift)) | (static_cast<uint32_t>(acc != acc ? uint16_t{0x7fff} : f64_to_half(acc)) << shift);
     }
     for (size_t i = 0; i < out.size(); ++i)
       if (rd != kRZ) w.reg(rd + static_cast<unsigned>(i), l) = out[i];

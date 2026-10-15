@@ -570,13 +570,16 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     // "unspecified launch failure" is the closest real code, and it is at least
     // true that the launch did not produce a result anyone should use.
     case Err::DataRace: code = cudaErrorLaunchFailure; break;
-    // Too many threads per block, a block or grid dimension past the device's
-    // limit, or a zero-sized one. CUDA's name for that is "invalid configuration
-    // argument"; it used to fall through to cudaErrorInvalidValue, which is not
-    // what anyone searching for that message would find. (The driver API's
-    // cuLaunchKernel reports CUDA_ERROR_INVALID_VALUE for the same launch, and
-    // keeps doing so in driver_api.cpp.)
-    case Err::LaunchConfig: code = cudaErrorInvalidConfiguration; break;
+    // A launch the device cannot run. An RTX 3060's CUDA 13.0 runtime answers cudaErrorInvalidValue for a block of too many threads
+    // or a dimension past the limit (1025 x 1, 1 x 1025, z of 65, 2048 as 32x32x2), a zero dimension of the grid or the block, a
+    // grid dimension past the limit (x of 2^31, y or z of 65536), dynamic shared memory past what the kernel may ask for (also
+    // together with its static memory), and a block past __launch_bounds__ -- not cudaErrorInvalidConfiguration (9), which this
+    // used to answer, and which the runtime keeps for a launch with no configuration. A block whose registers do not fit the
+    // multiprocessor is cudaErrorLaunchOutOfResources (701), and any cluster launch on a part without clusters
+    // cudaErrorInvalidClusterSize (912). The driver API's codes are the same (driver_api.cpp).
+    case Err::LaunchConfig: code = cudaErrorInvalidValue; break;
+    case Err::LaunchResources: code = cudaErrorLaunchOutOfResources; break;
+    case Err::LaunchCluster: code = static_cast<cudaError_t>(912); break;   // cudaErrorInvalidClusterSize
     default: code = cudaErrorInvalidValue; break;
   }
   if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, e.what());

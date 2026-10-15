@@ -503,18 +503,8 @@ void imad_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t*
 // kind 0: a + b, 1: a * b, 2: fma(a, b, c); `mods` has bit 2i for |source i| and bit 2i + 1 for -source i (the
 // absolute value first). d, a, b, c are (low, high) pairs of 32-lane arrays; only the lanes of `mask` are written.
 //
-// When an operand is a NaN, which one the result is made from is decided here, not by the instruction the compiler
-// happened to pick: the first NaN of (b, a) for a sum or product -- what the scalar code this replaced gives, and an
-// RTX 3060 -- and of (b, a, c) for an fma (the scalar code this replaced: the compiler had swapped the product's
-// operands for libm's fma). The result is that NaN with its quiet bit set.
-inline uint64_t dop_nan(unsigned kind, uint64_t a, uint64_t b, uint64_t c) {
-  const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
-  uint64_t pick;
-  if (kind == 2) pick = is_nan(b) ? b : is_nan(a) ? a : c;
-  else pick = is_nan(b) ? b : a;
-  return pick | 0x0008000000000000ull;
-}
-
+// When an operand is a NaN, which one the result is made from is decided by simd::dop_nan (simd.hpp), from the operands as the
+// registers hold them: the |x| and -x modifiers apply to the arithmetic, not to a NaN that is the answer.
 #if VGPU_SIMD_AVX2
 // Eight lanes at a time. A register pair's two halves come as the low words and the high words of 8 lanes; unpacking
 // them against each other gives the doubles of lanes 0 1 4 5 (the low unpack) and 2 3 6 7 (the high unpack), and the
@@ -540,6 +530,12 @@ inline void dop_avx2_t(const uint32_t* absm, const uint32_t* negm, uint32_t* dlo
     p = _mm256_castsi256_pd(_mm256_unpacklo_epi32(l, h));
     q = _mm256_castsi256_pd(_mm256_unpackhi_epi32(l, h));
   };
+  const auto load_raw = [&](const uint32_t* lo, const uint32_t* hi, unsigned i, __m256d& p, __m256d& q) {
+    const __m256i l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lo + i));
+    const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hi + i));
+    p = _mm256_castsi256_pd(_mm256_unpacklo_epi32(l, h));
+    q = _mm256_castsi256_pd(_mm256_unpackhi_epi32(l, h));
+  };
   const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
   const __m256i pick = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
   for (unsigned i = 0; i < 32; i += 8) {
@@ -562,6 +558,12 @@ inline void dop_avx2_t(const uint32_t* absm, const uint32_t* negm, uint32_t* dlo
     if (_mm256_movemask_pd(_mm256_or_pd(_mm256_cmp_pd(va, va, _CMP_UNORD_Q), _mm256_cmp_pd(vb, vb, _CMP_UNORD_Q)))) {
       // Rare: a NaN result. The operands and results of the 8 lanes, in lane order, and the rule applied to each.
       alignas(32) double X[8], Y[8], Z[8], R[8];
+      // (The operands as the registers hold them, for the NaN rule: reloaded without the modifiers.)
+      if constexpr (Mods) {
+        load_raw(alo, ahi, i, xa, xb);
+        load_raw(blo, bhi, i, ya, yb);
+        if constexpr (Kind == 2) load_raw(clo, chi, i, za, zb);
+      }
       const auto spill = [](double* o, __m256d p, __m256d q) {
         _mm_storeu_pd(o, _mm256_castpd256_pd128(p));
         _mm_storeu_pd(o + 4, _mm256_extractf128_pd(p, 1));
@@ -613,12 +615,13 @@ void dop_m_k(unsigned kind, unsigned mods, uint32_t* dlo, uint32_t* dhi, const u
   const auto bits = [&](const uint32_t* lo, const uint32_t* hi, unsigned i, unsigned k) {
     return uint64_t{lo[i]} | (uint64_t{(hi[i] & absm[k]) ^ negm[k]} << 32);
   };
+  const auto raw = [&](const uint32_t* lo, const uint32_t* hi, unsigned i) { return uint64_t{lo[i]} | (uint64_t{hi[i]} << 32); };
   const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
   for (unsigned i = 0; i < 32; ++i) {
     const uint64_t ua = bits(alo, ahi, i, 0), ub = bits(blo, bhi, i, 1), uc = kind == 2 ? bits(clo, chi, i, 2) : 0;
     uint64_t u;
     if (is_nan(ua) || is_nan(ub) || (kind == 2 && is_nan(uc))) {
-      u = dop_nan(kind, ua, ub, uc);
+      u = dop_nan(kind, raw(alo, ahi, i), raw(blo, bhi, i), kind == 2 ? raw(clo, chi, i) : 0);
     } else {
       const double x = std::bit_cast<double>(ua), y = std::bit_cast<double>(ub);
       const double v = kind == 0 ? x + y : kind == 1 ? x * y : __builtin_fma(x, y, std::bit_cast<double>(uc));
@@ -841,7 +844,7 @@ void lane_unary_k(unsigned kind, uint32_t* r, const uint32_t* a) {
 
 // (Scalar helpers: the base level's loops, and the lanes of the AVX2 ones that the instructions cannot do.)
 inline uint32_t sc_ftz(uint32_t x) { return (x & 0x7f800000u) == 0 ? (x & 0x80000000u) : x; }
-inline float sc_sat(float f) { return f != f ? 0.0f : f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
+inline float sc_sat(float f) { return f != f ? 0.0f : f <= 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }   // (-0 is +0: see sat() in exec_ops.inc)
 // A float result as the register holds it: flushed if flags bit 0, saturated if bit 1, a NaN the canonical one.
 inline uint32_t sc_finish(float f, unsigned flags) {
   uint32_t u = std::bit_cast<uint32_t>(f);
@@ -862,7 +865,7 @@ inline __m256i fx_finish(__m256 v, unsigned flags) {
   if (flags & 1) u = fx_flush(u);
   if (flags & 2) {
     const __m256 f = _mm256_castsi256_ps(u), zero = _mm256_setzero_ps(), one = _mm256_set1_ps(1.0f);
-    const __m256 low = _mm256_or_ps(_mm256_cmp_ps(f, zero, _CMP_LT_OQ), _mm256_cmp_ps(f, f, _CMP_UNORD_Q));
+    const __m256 low = _mm256_or_ps(_mm256_cmp_ps(f, zero, _CMP_LE_OQ), _mm256_cmp_ps(f, f, _CMP_UNORD_Q));
     const __m256 g = _mm256_blendv_ps(_mm256_blendv_ps(f, zero, low), one, _mm256_cmp_ps(f, one, _CMP_GT_OQ));
     u = _mm256_castps_si256(g);
   }
@@ -984,13 +987,16 @@ void mufu_k(unsigned kind, uint32_t* r, const uint32_t* a) {
       return _mm256_cvtpd_ps(v);
     };
     const __m256 v = _mm256_set_m128(op(_mm256_extractf128_ps(x, 1)), op(_mm256_castps256_ps128(x)));
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), fx_flush(_mm256_castps_si256(v)));
+    // (A NaN result -- the root of a negative number, an operand that was a NaN -- is the canonical one, as on an RTX 3060.)
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i),
+                        _mm256_blendv_epi8(fx_flush(_mm256_castps_si256(v)), _mm256_set1_epi32(0x7fffffff),
+                                           _mm256_castps_si256(_mm256_cmp_ps(v, v, _CMP_UNORD_Q))));
   }
 #else
   for (unsigned l = 0; l < 32; ++l) {
     const double x = sc_in(a[l], 1);
     const float f = static_cast<float>(kind == 4 ? 1.0 / x : kind == 5 ? 1.0 / __builtin_sqrt(x) : __builtin_sqrt(x));
-    r[l] = sc_ftz(std::bit_cast<uint32_t>(f));
+    r[l] = f != f ? 0x7fffffffu : sc_ftz(std::bit_cast<uint32_t>(f));
   }
 #endif
 }
@@ -1082,10 +1088,10 @@ void f2i_k(bool sgn, unsigned rnd, bool ftz, uint32_t* r, const uint32_t* a) {
 }
 
 // FMNMX: lane l is the minimum of a and b if bit l of `min_mask` is set, else the maximum; a NaN loses (the other operand
-// is the answer; two NaNs give b), of two zeros the minimum is the negative one, the maximum the positive one; with `nan` a
+// is the answer; two NaNs give the canonical NaN, as on an RTX 3060), of two zeros the minimum is the negative one, the maximum the positive one; with `nan` a
 // NaN operand gives the canonical NaN. The operands are flushed first if ftz.
 inline uint32_t sc_fmnmx(float a, float b, bool mn, bool nan) {
-  if (nan && (a != a || b != b)) return 0x7fffffffu;
+  if ((nan && (a != a || b != b)) || (a != a && b != b)) return 0x7fffffffu;
   float r;
   if (a != a) r = b;
   else if (b != b) r = a;
@@ -1111,7 +1117,7 @@ void fmnmx_k(uint32_t* r, const uint32_t* a, const uint32_t* b, uint32_t min_mas
     v = _mm256_blendv_ps(v, _mm256_blendv_ps(zmax, zmin, mn), both_zero);
     v = _mm256_blendv_ps(v, x, ynan);
     v = _mm256_blendv_ps(v, y, xnan);
-    if (nan) v = _mm256_blendv_ps(v, _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)), _mm256_or_ps(xnan, ynan));
+    v = _mm256_blendv_ps(v, _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)), nan ? _mm256_or_ps(xnan, ynan) : _mm256_and_ps(xnan, ynan));
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(r + i), _mm256_castps_si256(v));
   }
 #else

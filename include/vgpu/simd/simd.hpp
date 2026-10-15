@@ -192,6 +192,19 @@ inline const Kernels& kernels() { return *detail::g_kernels.load(std::memory_ord
 // the kernels out when chasing a difference.
 inline bool enabled() { return detail::g_enabled; }
 
+// Which NaN a binary64 DADD (kind 0), DMUL (1) or DFMA (2) gives when an operand is one: the first NaN of (b, a) for a sum or a
+// product and of (b, c, a) for an fma, with its quiet bit set -- its sign and payload exactly as the register holds them, NOT as the
+// instruction's |x| and -x modifiers would make them (an RTX 3060: DADD of -a with a = 0xfff8...0 and b = 3.0 gives 0xfff8...0, and
+// the same for |a|; probed with distinct payloads in every position, nvidia/tests/e2e/float_half_forms.cu). `a`, `b`, `c` are the raw
+// operand bits. A NaN made from operands that are not (inf - inf, 0 * inf) is the host's, 0xfff8000000000000, as on the card.
+inline uint64_t dop_nan(unsigned kind, uint64_t a, uint64_t b, uint64_t c) {
+  const auto is_nan = [](uint64_t u) { return (u & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
+  uint64_t pick;
+  if (kind == 2) pick = is_nan(b) ? b : is_nan(c) ? c : a;
+  else pick = is_nan(b) ? b : a;
+  return pick | 0x0008000000000000ull;
+}
+
 // Population count of a 32-bit word without a libgcc call (a baseline x86-64 build has no POPCNT instruction, so
 // std::popcount is a call into libgcc: 2% of a warp-instruction's time, at one per instruction).
 inline unsigned popcount32(uint32_t x) {

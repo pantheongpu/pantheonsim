@@ -339,6 +339,9 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     case Err::InvalidValue:
     case Err::LaunchConfig:
     case Err::ProfileParse: return CUDA_ERROR_INVALID_VALUE;
+    // (An RTX 3060: a block whose registers do not fit is 701, any cluster launch on a part without clusters 912.)
+    case Err::LaunchResources: return CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES;
+    case Err::LaunchCluster: return static_cast<CUresult>(912);   // CUDA_ERROR_INVALID_CLUSTER_SIZE
     case Err::Internal: return CUDA_ERROR_UNKNOWN;
   }
   return CUDA_ERROR_UNKNOWN;

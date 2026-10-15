@@ -479,6 +479,76 @@ VTEST(wmma_f32_accumulator_nans_are_the_canonical_one) {
     }
 }
 
+// mma.m8n8k4 (Volta's form) with an f32 accumulator adds its products in scalar f32 code, and which NaN the host hands on
+// when two meet is the first source operand's, picked by the compiler: it differed between an optimised build and a
+// ThreadSanitizer -O1 one, and a lone NaN kept its sign and payload. Every NaN word is now the canonical 0x7fffffff, as
+// the other mma forms and the wmma tile write it (an RTX 3060). NaNs go in through A, B (f16 NaNs, infinities that make
+// inf * 0) and C (f32 NaNs of both signs and payloads); the non-NaN words are the sums the formula gives and are not
+// compared here (mma_forms checks m8n8k4 against the card).
+VTEST(mma_m8n8k4_f32_accumulator_nans_are_the_canonical_one) {
+  const uint16_t h16[] = {0x7E00, 0xFE01, 0x7C00, 0xFC00, 0x3C00, 0x0000, 0x8000, 0x7C01, 0x3555, 0xBC00, 0x7FFF, 0x4248};
+  const uint32_t cn[] = {0x7FC00000u, 0xFFC00000u, 0x7F800001u, 0xFFFFFFFFu, 0x7FC12345u, 0xFFA00000u, 0x3F800000u, 0x80000000u};
+  int checked = 0;
+  for (const char* layout : {"row.row", "row.col", "col.row", "col.col"}) {
+    std::vector<uint32_t> frag;   // per lane: A (2 words), B (2 words), C (8 words)
+    for (int lane = 0; lane < 32; ++lane) {
+      for (int r = 0; r < 4; ++r) {
+        const uint16_t lo = h16[(lane * 3 + r * 5) % 12], hi = h16[(lane * 7 + r * 3 + 1) % 12];
+        frag.push_back(uint32_t{lo} | (uint32_t{hi} << 16));
+      }
+      for (int r = 0; r < 8; ++r) frag.push_back((lane + r) % 3 == 0 ? cn[(lane * 5 + r) % 8] : fbits(float(lane % 7) - 3.0f));
+    }
+    std::string regs = "%x0, %x1, %x2, %x3, %x4, %x5, %x6, %x7";
+    std::string loads, stores;
+    for (int r = 0; r < 12; ++r)
+      loads += "    ld.global.u32 %" + std::string(r < 2 ? "a" : r < 4 ? "b" : "c") + std::to_string(r < 2 ? r : r < 4 ? r - 2 : r - 4) +
+               ", [%rd3+" + std::to_string(r * 4) + "];\n";
+    for (int r = 0; r < 8; ++r) stores += "    st.global.u32 [%rd4+" + std::to_string(r * 4) + "], %x" + std::to_string(r) + ";\n";
+    const std::string ptx = std::string(".version 8.3\n.target sm_86\n.address_size 64\n") + R"(
+.visible .entry k(.param .u64 in, .param .u64 out)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<8>;
+    .reg .b32 %a<2>, %b<2>, %c<8>, %x<8>;
+    ld.param.u64 %rd1, [in];
+    ld.param.u64 %rd2, [out];
+    mov.u32 %r1, %laneid;
+    mul.wide.u32 %rd5, %r1, 48;
+    add.u64 %rd3, %rd1, %rd5;
+    mul.wide.u32 %rd6, %r1, 32;
+    add.u64 %rd4, %rd2, %rd6;
+)" + loads + "    mma.sync.aligned.m8n8k4." + layout + ".f32.f16.f16.f32 {" + regs +
+                            "}, {%a0, %a1}, {%b0, %b1}, {%c0, %c1, %c2, %c3, %c4, %c5, %c6, %c7};\n" + stores + "    ret;\n}\n";
+    for (const char* fp : {"1", "0"}) {
+      MemoryManager mem{1 << 20};
+      DeviceProfile prof = load_gpu("nvidia/a10");
+      auto m = ptx::parse(ptx);
+      const uint64_t in = mem.alloc(frag.size() * 4), out = mem.alloc(32 * 32);
+      mem.write(in, frag.data(), frag.size() * 4);
+      LaunchConfig cfg;
+      cfg.block = {32, 1, 1};
+      setenv("VGPU_FASTPATH", fp, 1);
+      exec::launch(m.entries[0], cfg, {arg_u64(in), arg_u64(out)}, mem, prof);
+      unsetenv("VGPU_FASTPATH");
+      std::vector<uint32_t> d(32 * 8);
+      mem.read(out, d.data(), d.size() * 4);
+      int nans = 0;
+      for (size_t i = 0; i < d.size(); ++i)
+        if ((d[i] & 0x7FFFFFFFu) > 0x7F800000u) {
+          ++nans;
+          if (d[i] != 0x7FFFFFFFu) {
+            char buf[160];
+            std::snprintf(buf, sizeof buf, "mma.m8n8k4.%s (VGPU_FASTPATH=%s): word %zu is the NaN 0x%08x, not 0x7fffffff", layout, fp, i, d[i]);
+            throw vtest::Failure(buf);
+          }
+        }
+      VCHECK(nans > 8);   // the inputs do make NaNs
+      ++checked;
+    }
+  }
+  VCHECK_EQ(checked, 8);
+}
+
 // ---------------------------------------------------------------------------
 // Memory accesses: the counters and the data, fast against general.
 //

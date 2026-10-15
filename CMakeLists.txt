@@ -2066,6 +2066,22 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 
+  # The error each refused launch configuration reports, runtime and driver, against an RTX 3060's CUDA 13.0.
+  add_test(NAME e2e_launch_refusals
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_refusals.sh)
+  set_tests_properties(e2e_launch_refusals PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # The f32/f16/f64 forms with a flush, a saturation, a NaN rule or a byte permute: SASS == PTX == an RTX 3060, per form.
+  add_test(NAME e2e_float_half_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_float_half_forms.sh)
+  set_tests_properties(e2e_float_half_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
   # bf16 arithmetic, half2 atomics and labeled_partition, through nvcc. The
   # unit tests feed hand-written PTX; a compiler emits forms a hand-written
   # test never thinks to write, and this is what catches the difference. It

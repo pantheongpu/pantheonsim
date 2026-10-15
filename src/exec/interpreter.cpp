@@ -941,18 +941,6 @@ uint32_t double_to_small_float(double v, int eb, int mb, int bias) {
   return sign | std::min(code, max_code);
 }
 
-// tf32 is f32's sign and exponent with the mantissa cut to 10 bits. Round to
-// nearest even rather than truncating: truncation biases every product toward
-// zero, which accumulates over a reduction into a visible error.
-float f32_to_tf32(float x) {
-  uint32_t b = std::bit_cast<uint32_t>(x);
-  if ((b & 0x7F800000u) == 0x7F800000u) return x;  // inf/NaN keep their payload
-  const uint32_t lsb = (b >> 13) & 1u;
-  b += 0x0FFFu + lsb;
-  b &= ~0x1FFFu;
-  return std::bit_cast<float>(b);
-}
-
 float f32(uint64_t bits) { return std::bit_cast<float>(static_cast<uint32_t>(bits)); }
 uint64_t f32bits(float f) { return std::bit_cast<uint32_t>(f); }
 double f64(uint64_t bits) { return std::bit_cast<double>(bits); }
@@ -6004,7 +5992,14 @@ class Interpreter {
           r[l] = canon32(ftz(std::fma(ftz(av), ftz(f32(b[l])), ftz(cv))));
         });
       else
-        for_active(m, W_, [&](uint32_t l) { r[l] = f64bits(std::fma(sa * f64(a[l]), f64(b[l]), sc * f64(c[l]))); });
+        for_active(m, W_, [&](uint32_t l) {
+          const double av = f64(a[l]), bv = f64(b[l]), cv = f64(c[l]);
+          if (std::isnan(av) || std::isnan(bv) || std::isnan(cv)) {   // b's NaN, else c's, else a's, quieted (an RTX 3060)
+            r[l] = (std::isnan(bv) ? b[l] : std::isnan(cv) ? c[l] : a[l]) | 0x0008000000000000ull;
+            return;
+          }
+          r[l] = f64bits(std::fma(sa * av, bv, sc * cv));
+        });
       if (op->round != FRound::Nearest) {
         std::fesetround(prev_round);
         g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
@@ -8844,7 +8839,7 @@ class Interpreter {
             if (op.acc_f16)
               out[i / 2][lane] |= (double_to_f16(acc) & 0xFFFF) << (16 * (i % 2));
             else
-              out[i][lane] = f32bits(acc);
+              out[i][lane] = canon32(acc);   // (a NaN is the canonical one, as in exec_mma)
           }
         }
     }
@@ -9075,7 +9070,10 @@ class Interpreter {
           const uint64_t h = double_to_f16(acc) & 0xFFFF;
           slot = (slot & ~(uint64_t{0xFFFF} << shift) & 0xFFFFFFFFu) | (h << shift);
         } else {
-          slot = f32bits(acc);
+          // A NaN is the canonical 0x7fffffff, not the one the host's add kept when two met (the first source operand's, which
+          // the compiler's operand order picks: a -O2 and a ThreadSanitizer -O1 build differed). Derived from the HMMA/mma
+          // rule (an RTX 3060) and the PTX documentation -- no card has wgmma. An f16 accumulator's NaN is double_to_f16's.
+          slot = canon32(acc);
         }
       }
     }
@@ -9741,7 +9739,9 @@ class Interpreter {
     switch (t) {
       case WmmaType::F16: return f16_to_double(bits & 0xFFFF);
       case WmmaType::BF16: return bf16_to_double(bits & 0xFFFF);
-      case WmmaType::TF32: case WmmaType::F32: return std::bit_cast<float>(static_cast<uint32_t>(bits));
+      // (A tf32 operand is read through its top 19 bits only; the accumulator's f32 is whole.)
+      case WmmaType::TF32: return std::bit_cast<float>(static_cast<uint32_t>(bits) & 0xFFFFE000u);
+      case WmmaType::F32: return std::bit_cast<float>(static_cast<uint32_t>(bits));
       case WmmaType::F64: return std::bit_cast<double>(bits);
       case WmmaType::S8: return static_cast<int8_t>(bits);
       case WmmaType::U8: return static_cast<uint8_t>(bits);
@@ -9772,7 +9772,6 @@ class Interpreter {
           const auto [row, col] = wmma_slot(g, lane, reg, e);
           const uint64_t elem = op.layout == MatLayout::Row ? uint64_t{row} * ld + col : uint64_t{col} * ld + row;
           uint64_t v = wmma_read(w, ctx, ins, lane, addr0, elem, g.bits) & mask;
-          if (op.type == WmmaType::TF32) v = f32bits(f32_to_tf32(f32(v)));
           packed |= v << (e * g.bits);
         }
         r[lane] = packed;
@@ -9957,8 +9956,10 @@ class Interpreter {
           // A is 16x8, B is 8x16: different inner extents, so different maps.
           const uint32_t ar = linear / 8u, ac = linear % 8u;
           const uint32_t br = linear / kMmaDim, bc = linear % kMmaDim;
-          A[ar][ac] = f32(av[lane]);
-          B[br][bc] = f32(bv[lane]);
+          // The tensor core ignores the low 13 bits of a tf32 operand (they are truncated, not rounded, as the SASS
+          // executor's HMMA does and an RTX 3060 shows for fragments loaded without __float_to_tf32).
+          A[ar][ac] = f32(av[lane] & 0xFFFFE000u);
+          B[br][bc] = f32(bv[lane] & 0xFFFFE000u);
         }
       }
     } else
@@ -10072,10 +10073,10 @@ class Interpreter {
           const uint64_t elem = op.layout == MatLayout::Row ? (uint64_t{rr} * ld + cc)
                                                             : (uint64_t{cc} * ld + rr);
           const uint64_t bits = load_routed(w, ctx, ins, lane, addr0 + elem * 4, 4);
-          // tf32 keeps f32's exponent and 10 mantissa bits. Rounding to that
-          // here is what the hardware fragment holds; keeping all 23 would
-          // make the simulator more accurate than the part it stands in for.
-          r[lane] = f32bits(f32_to_tf32(f32(bits)));
+          // wmma.load of a tf32 fragment is a plain 32-bit load: the register holds the
+          // float as it is in memory (an RTX 3060: fa.x[i] reads back every bit), and
+          // the tensor core reads only the top 19 bits of it (see exec_wmma_mma).
+          r[lane] = bits;
         } else {
           uint64_t packed = 0;
           for (int h = 0; h < 2; ++h) {
@@ -10287,7 +10288,10 @@ class Interpreter {
         if (std::isnan(f) && (s.bits == 32 || s.bits == 16)) return 0x7FFF'FFFFu;
         return f32bits(f);
       }
-      // float -> int: round then clamp to the destination range.
+      // float -> int: round then clamp to the destination range. With .ftz an f32 subnormal is the zero of its sign first
+      // (an RTX 3060: cvt.rmi.ftz.s32.f32 of -2^-149 is 0, where the floor of the subnormal itself is -1).
+      if (op->ftz && s.bits == 32 && !s.is_bfloat() && x != 0 && std::fabs(x) < static_cast<double>(std::numeric_limits<float>::min()))
+        x = std::copysign(0.0, x);
       double rounded = round_int(x, op->round == Round::None ? Round::Rzi : op->round);
       // Saturate against the powers of two themselves, which a double holds
       // exactly. Clamping to INT64_MAX as a double rounded it up to 2^63, and
@@ -10553,6 +10557,13 @@ class Interpreter {
       return canon32(r);
     }
     double x = f64(a), y = f64(b), r = 0;
+    // A NaN operand: the NaN of b if b is one, else a's, quieted, with its own sign and payload (an RTX 3060, probed with a
+    // distinct payload in each position: the sum, product and difference, and the larger or smaller of two NaNs; the host gives the
+    // first operand's, which the compiler's operand order picks). A single NaN in min and max loses to the other operand.
+    // Division is a software sequence on the card and keeps the host's.
+    if ((std::isnan(x) || std::isnan(y)) && op != FloatBinOp::Div &&
+        !((op == FloatBinOp::Min || op == FloatBinOp::Max) && !(std::isnan(x) && std::isnan(y))))
+      return (std::isnan(y) ? b : a) | 0x0008000000000000ull;
     switch (op) {
       case FloatBinOp::Add: r = x + y; break;
       case FloatBinOp::Sub: r = x - y; break;
@@ -14239,8 +14250,12 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
             accf[i] = acc;
           }
           tc_rows_f32(accf.data(), Af.data(), Bf.data() + p * w, K, w, N);
+          // (A NaN in an f32 D is the canonical 0x7fffffff, whichever NaN the host's vector add kept when two met -- the compiler's
+          // operand order picks it, and a -O2 and a ThreadSanitizer -O1 build differed. Derived from the HMMA/mma rule of an RTX 3060
+          // and the PTX documentation: no card has tcgen05.)
           for (uint32_t i = 0; i < w; ++i)
-            cells[i] = d_f16 ? static_cast<uint32_t>(double_to_f16(accf[i]) & 0xFFFF) : f32bits(accf[i]);
+            cells[i] = d_f16 ? static_cast<uint32_t>(double_to_f16(accf[i]) & 0xFFFF)
+                             : (accf[i] != accf[i] ? 0x7FFFFFFFu : f32bits(accf[i]));
         }
         continue;
       }
@@ -14271,7 +14286,7 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
           const double b = B[size_t{k} * N + n] * SB[k / blk];
           acc += static_cast<float>(a) * static_cast<float>(b);
         }
-        cell = d_f16 ? static_cast<uint32_t>(double_to_f16(acc) & 0xFFFF) : f32bits(acc);
+        cell = d_f16 ? static_cast<uint32_t>(double_to_f16(acc) & 0xFFFF) : (acc != acc ? 0x7FFFFFFFu : f32bits(acc));
       }
     }
   }
@@ -14452,8 +14467,10 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
     // Clusters arrived with Hopper. Running one on an older profile would
     // report a scheduling level that part does not have, which is the kind of
     // wrong answer this whole engine exists to avoid.
+    // (An RTX 3060, sm_86, refuses every cluster launch -- 2 over 4 blocks, 3 over 4, a cluster of 0, 9 and 16 -- with
+    // cudaErrorInvalidClusterSize / CUDA_ERROR_INVALID_CLUSTER_SIZE (912), in the runtime and the driver alike.)
     if (p.cc_major < 9)
-      throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
+      throw Error::make(Err::LaunchCluster, "kernel '", fn.name,
                         "': thread-block clusters require compute capability 9.0 or later; ",
                         p.id, " is ", p.cc_major, ".", p.cc_minor);
     // A launch that contradicts the kernel's own __cluster_dims__ fails on
@@ -14470,7 +14487,7 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
       // them has blocks belonging to no cluster. Hardware rejects this; so
       // does this, rather than inventing a partial cluster.
       if (cfg.grid[i] % c != 0)
-        throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': grid dimension ", i,
+        throw Error::make(Err::LaunchCluster, "kernel '", fn.name, "': grid dimension ", i,
                           " is ", cfg.grid[i], ", which is not a multiple of the cluster "
                           "dimension ", c);
       ctas *= c;
@@ -14480,7 +14497,7 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
     // Hopper and Blackwell, the most those parts schedule.
     const uint64_t nonportable_max = p.cc_major >= 9 ? 16 : 8;
     if (ctas > 8 && !(cfg.nonportable_cluster && ctas <= nonportable_max))
-      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': cluster of ", ctas,
+      throw Error::make(Err::LaunchCluster, "kernel '", fn.name, "': cluster of ", ctas,
                         " blocks exceeds ",
                         cfg.nonportable_cluster
                             ? "the " + std::to_string(nonportable_max) + " this part can schedule"
@@ -14539,13 +14556,13 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
                                          cfg.shared_bytes);
   uint64_t block_regs = uint64_t{res.usage.regs_per_thread} * threads;
   if (block_regs > p.limits.registers_per_block)
-    throw Error::make(Err::LaunchConfig, "too many resources requested for launch: kernel '",
+    throw Error::make(Err::LaunchResources, "too many resources requested for launch: kernel '",
                       fn.name, "' uses ", res.usage.regs_per_thread, " registers per thread and ",
                       threads, " threads per block (", block_regs,
                       " registers), but profile ", p.id, " allows ", p.limits.registers_per_block,
                       " per block. Use a smaller block or fewer registers.");
   if (res.occupancy.blocks_per_sm == 0)
-    throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
+    throw Error::make(Err::LaunchResources, "kernel '", fn.name,
                       "' cannot place a single block on a multiprocessor of ", p.id,
                       " (limited by ", res.occupancy.limited_by, ")");
 

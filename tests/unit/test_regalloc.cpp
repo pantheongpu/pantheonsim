@@ -264,7 +264,7 @@ VTEST(register_budget_refuses_an_impossible_launch) {
   LaunchConfig cfg;
   cfg.block = {1024, 1, 1};  // 255 x 1024 = 261120, far past the 65536 available
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, mem, prof));
-  VCHECK(err.code() == Err::LaunchConfig);
+  VCHECK(err.code() == Err::LaunchResources);
   VCHECK_CONTAINS(err.what(), "too many resources requested for launch");
 }
 

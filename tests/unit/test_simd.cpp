@@ -1010,7 +1010,7 @@ VTEST(wide_integer_kernels_at_every_level) {
 // values (zeros of both signs, subnormals, the extremes, infinities, NaNs of both signs and payloads) and random bits.
 namespace {
 float ftz_ref(float f) { return std::fpclassify(f) == FP_SUBNORMAL ? std::copysign(0.0f, f) : f; }
-float sat_ref(float f) { return f != f ? 0.0f : f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
+float sat_ref(float f) { return f != f ? 0.0f : f <= 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }   // (-0 is +0: an RTX 3060)
 bool fcmp_ref(unsigned cmp, double a, double b) {
   const bool un = a != a || b != b;
   switch (cmp) {
@@ -1101,7 +1101,7 @@ VTEST(float_forms_at_every_level) {
           volatile double x = ftz_ref(std::bit_cast<float>(a[i]));
           volatile double q = kind == 4 ? 1.0 / x : kind == 5 ? 1.0 / std::sqrt(x) : std::sqrt(x);
           const float f = ftz_ref(static_cast<float>(q));
-          const uint32_t want = std::bit_cast<uint32_t>(f);
+          const uint32_t want = f != f ? 0x7fffffffu : std::bit_cast<uint32_t>(f);   // (a NaN is the canonical one)
           if (r[i] != want) fail("mufu", i, a[i], 0, 0, r[i], want, static_cast<int>(kind));
         }
       }
@@ -1151,7 +1151,7 @@ VTEST(float_forms_at_every_level) {
               const float y = ftz ? ftz_ref(std::bit_cast<float>(b[i])) : std::bit_cast<float>(b[i]);
               const bool m = (mn >> i) & 1;
               uint32_t want;
-              if (nan && (x != x || y != y)) {
+              if ((nan && (x != x || y != y)) || (x != x && y != y)) {   // (two NaNs give the canonical one even without .NAN)
                 want = 0x7fffffffu;
               } else {
                 float v;

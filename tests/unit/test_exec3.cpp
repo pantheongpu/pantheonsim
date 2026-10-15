@@ -4645,7 +4645,7 @@ VTEST(a_cluster_that_does_not_tile_the_grid_is_refused) {
   cfg.block = {1, 1, 1};
   cfg.cluster = {2, 1, 1};
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, e.mem, e.prof));
-  VCHECK(err.code() == Err::LaunchConfig);
+  VCHECK(err.code() == Err::LaunchCluster);
   VCHECK_CONTAINS(err.what(), "not a multiple of the cluster");
 }
 
@@ -4662,7 +4662,7 @@ VTEST(clusters_need_hopper) {
   cfg.block = {1, 1, 1};
   cfg.cluster = {2, 1, 1};
   auto err = VCAPTURE(Error, exec::launch(m.entries[0], cfg, {}, e.mem, e.prof));
-  VCHECK(err.code() == Err::LaunchConfig);
+  VCHECK(err.code() == Err::LaunchCluster);
   VCHECK_CONTAINS(err.what(), "compute capability 9.0");
 }
 
