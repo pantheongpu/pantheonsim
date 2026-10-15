@@ -77,7 +77,7 @@ read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
 export nvcc_bin root work
 export san="${san_flags[*]}"
 printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_TIER_JOBS:-$("$root/ci/jobs.sh" -p sass)}" -L 1 bash -c '
-  [[ -x "$work/$0.$1" && "$work/$0.$1" -nt "$root/nvidia/tests/e2e/$0.cu" && ! -s "$work/$0.$1.build" ]] && exit 0
+  [[ -x "$work/$0.$1" && "$work/$0.$1" -nt "$root/nvidia/tests/e2e/$0.cu" ]] && ! grep -q "build failed" "$work/$0.$1.build" 2>/dev/null && exit 0
   rm -f "$work/$0.$1" "$work/$0.$1.build"
   "$nvcc_bin" -std=c++17 -arch="$1" -cudart shared -w -Wno-deprecated-gpu-targets -Xlinker --as-needed $san \
     -I"$root/nvidia/tests/e2e" "$root/nvidia/tests/e2e/$0.cu" -o "$work/$0.$1" -lcuda 2> "$work/$0.$1.build" ||
