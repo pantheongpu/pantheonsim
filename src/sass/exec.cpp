@@ -25,6 +25,7 @@
 #include <atomic>
 #include <utility>
 #include <bit>
+#include <cerrno>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -219,6 +220,21 @@ std::mutex& atomic_lock(uint64_t addr) {
 
 void tier_add_total(uint64_t n);   // tier_ops.inc
 
+// The budget of steps a warp may take: the launch's, or VGPU_MAX_STEPS (0: none), by the rule the PTX engine applies
+// (effective_max_steps in src/exec/interpreter.cpp). Read at the start of each launch.
+uint64_t sass_max_steps(uint64_t configured) {
+  const char* e = std::getenv("VGPU_MAX_STEPS");
+  if (!e || !*e) return configured;
+  const char* p = e;
+  while (*p == ' ' || *p == '\t') ++p;
+  if (*p == '-' || *p == '+') return configured;   // (strtoull would wrap a negative into a huge budget)
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(e, &end, 10);
+  if (errno != 0 || end == e || *end != '\0') return configured;
+  return v == 0 ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(v);
+}
+
 // The lanes whose program counter is `p`, compared two to a vector register where SSE2 is there.
 inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
   Mask eq = 0;
@@ -260,7 +276,7 @@ class Runner {
  public:
   Runner(const Module& m, const CubinKernel& k, const exec::LaunchConfig& cfg,
          const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem, const DeviceProfile& profile)
-      : m_(m), k_(k), cfg_(cfg), mem_(mem), profile_(profile) {
+      : m_(m), k_(k), cfg_(cfg), mem_(mem), profile_(profile), max_steps_(sass_max_steps(cfg.max_steps)) {
     // A cooperative launch's grid-barrier workspace, as the PTX interpreter
     // makes it: 64 zeroed bytes, freed however the launch ends.
     if (cfg.cooperative) {
@@ -447,6 +463,7 @@ class Runner {
   const exec::LaunchConfig& cfg_;
   MemoryManager& mem_;
   const DeviceProfile& profile_;
+  const uint64_t max_steps_;   // the step budget of a warp (cfg_.max_steps, or VGPU_MAX_STEPS)
   bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
   // The pre-decoded tier (src/sass/tier.hpp): VGPU_TIER=1, with the fast paths and the SIMD kernels it is held to on and
   // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
@@ -1442,8 +1459,8 @@ bool Runner::step_warp(Block& blk, Warp& w) {
         return true;
       }
     }
-    if (++w.steps > cfg_.max_steps)
-      throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(cfg_.max_steps) +
+    if (++w.steps > max_steps_)
+      throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(max_steps_) +
                                     " instructions (an infinite loop?)");
     if (n < 256 && pc + 16 < end && ins->straight) {
       execute(blk, w, *ins, group, /*advance=*/false);
