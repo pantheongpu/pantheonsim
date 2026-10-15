@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 
@@ -178,6 +179,113 @@ VTEST(tier_leaves_turing_global_memory_to_the_interpreter) {
     ++seen;
   }
   VCHECK(seen > 0);
+}
+
+
+// ---- the structural guard: no form's result rules live in the tier alone ------------------------------------------------------------
+//
+// Round 9 changed the interpreter's result rules (NaNs, -0 under .SAT, MUFU, packed halves, conversions, the sm_86 tensor-core sum) and the
+// tier's handlers, which had copied the old rules, drifted from it. The tier must call what the interpreter calls. The table
+// sass::tier::form_impl says, per form, whether its handler (K) calls the SIMD kernel or shared function the interpreter's fast path calls,
+// (I) runs the interpreter's own code, or (O) computes it alone, which is for work with no number-format rules only. This test holds that table
+// to the list checked in here (so that a new own implementation, or a form that stops sharing, is a deliberate change of this file too) and
+// reads tier_ops.inc: a handler of a K form must call a kernel, one of an I form the interpreter, and no handler may contain the scalar
+// float arithmetic a rule would be written in (the interpreter's functions for it are called, not copied).
+const char* const kExpectedImpl =
+    "none:O mov:O iadd3:K iadd3x:O imad:K imad32:O imadwide:O imadhi:O isetpex:O popc:K i2fp:K ldg:O stg:O lds:O sts:O ldl:O stl:O lop3:K lea:O shf:O isetp:K fsetp:K fsel:K ffma:K fadd:K fmul:K dop:K bra:O bssy:O nop:O plop3:O s2r:O cs2r:O sel:O prmt:K imnmx:K fmnmx:K mufu:K f2i:K i2f:K f2fp:I dsetp:K hop2:K unary:K iabs:O ldc:O bsync:O yield:O bar:O exit:O shfl:O vote:O umov:O uldc:O uiadd3:O uimad:O uisetp:O ulea:O ulop3:O ushf:O uunary:O usel:O hmma:I";
+
+std::string read_file(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) throw vtest::Failure("cannot read " + path);
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// The text with // comments and string literals removed.
+std::string strip_comments(const std::string& t) {
+  std::string out;
+  for (size_t i = 0; i < t.size();) {
+    if (t.compare(i, 2, "//") == 0) {
+      while (i < t.size() && t[i] != '\n') ++i;
+    } else if (t.compare(i, 2, "/*") == 0) {
+      const size_t e = t.find("*/", i + 2);
+      i = e == std::string::npos ? t.size() : e + 2;
+    } else {
+      out += t[i++];
+    }
+  }
+  return out;
+}
+
+VTEST(tier_form_table_is_the_checked_in_one) {
+  using sass::tier::Form;
+  std::string got;
+  for (unsigned f = 0; f < static_cast<unsigned>(Form::Count_); ++f) {
+    const auto& fi = sass::tier::form_impl(static_cast<Form>(f));
+    VCHECK(fi.note != nullptr && std::strlen(fi.note) > 3);
+    if (!got.empty()) got += ' ';
+    got += std::string(sass::tier::form_name(static_cast<Form>(f))) + ":" +
+           (fi.impl == sass::tier::Impl::Kernel ? "K" : fi.impl == sass::tier::Impl::Interp ? "I" : "O");
+  }
+  if (got != kExpectedImpl)
+    throw vtest::Failure(std::string("the tier's form table differs from the checked-in list (tests/unit/test_tier.cpp): a form that computes its "
+                                     "result itself (O) must be justified there.\n  table:    ") + got + "\n  expected: " + kExpectedImpl);
+}
+
+VTEST(tier_handlers_call_what_the_interpreter_calls) {
+  using sass::tier::Form;
+  const std::string src = strip_comments(read_file(std::string(VGPU_SOURCE_DIR) + "/src/sass/tier_ops.inc"));
+  // The handler of each form, from tier_handler_for's switch.
+  std::map<std::string, std::string> handler_of;   // form name -> function name
+  for (size_t at = 0; (at = src.find("case F::", at)) != std::string::npos;) {
+    const size_t name_end = src.find(':', at + 8);
+    const std::string en = src.substr(at + 8, name_end - at - 8);
+    const size_t r = src.find("return &h_", name_end);
+    const size_t next_case = src.find("case F::", name_end);
+    if (r != std::string::npos && (next_case == std::string::npos || r < next_case) && src.compare(name_end, 2, ": ") == 0) {
+      const size_t e = src.find(';', r);
+      std::string low = en;
+      for (char& ch : low) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      handler_of[low] = src.substr(r + 8, e - r - 8);
+    }
+    at = name_end;
+  }
+  VCHECK(handler_of.size() > 30);
+  // The text of each handler.
+  const auto body_of = [&](std::string fn) {
+    fn = fn.substr(0, fn.find('<'));   // (a template's arguments)
+    size_t b = src.find("TIER_HANDLER(" + fn + ")");
+    if (b == std::string::npos) b = src.find("void " + fn + "(");
+    if (b == std::string::npos) b = src.find("void " + fn + "(");
+    if (b == std::string::npos) throw vtest::Failure("no handler " + fn);
+    // (a handler ends at the first closing brace in the first column)
+    const size_t close = src.find("\n}", b);
+    const size_t stop = close == std::string::npos ? src.size() : close + 2;
+    return src.substr(b, stop - b);
+  };
+  static const char* const kScalarFloat[] = {"as_f32(",   "f32_bits(", "ftz(",       "std::fabs",   "std::sin",      "std::cos",       "std::exp2",
+                                             "std::log2", "std::tanh", "std::sqrt",  "std::nearbyint", "std::floor", "std::ceil",     "std::trunc",
+                                             "std::fma",  "__builtin_fma", "static_cast<float>", "static_cast<double>", "f32_to_bf16(", "f32_to_half(",
+                                             "half_to_f32(", "bf16_to_f32(", "f64_to_half(", "float_cmp(", "narrow_core(", "narrow_from_",
+                                             "fma_round_odd(", "dop_nan("};
+  for (unsigned f = 1; f < static_cast<unsigned>(Form::Count_); ++f) {
+    const std::string name = sass::tier::form_name(static_cast<Form>(f));
+    const auto& fi = sass::tier::form_impl(static_cast<Form>(f));
+    const auto it = handler_of.find(name);
+    if (it == handler_of.end()) {   // run by tier_run itself: control flow only
+      VCHECK(fi.impl == sass::tier::Impl::Own);
+      continue;
+    }
+    const std::string body = body_of(it->second);
+    VCHECK(body.size() > 20);
+    for (const char* bad : kScalarFloat)
+      if (body.find(bad) != std::string::npos)
+        throw vtest::Failure("handler " + it->second + " (form " + name + ") contains `" + bad + "`: a result rule written in the tier; call the "
+                             "interpreter's kernel or code instead (see tests/unit/test_tier.cpp)");
+    if (fi.impl == sass::tier::Impl::Kernel && body.find("sk->") == std::string::npos && body.find("prmt(") == std::string::npos)
+      throw vtest::Failure("handler " + it->second + " is declared a kernel form but calls no SIMD kernel");
+    if (fi.impl == sass::tier::Impl::Interp && body.find("tier_float_op(") == std::string::npos && body.find("tier_exec_mma(") == std::string::npos)
+      throw vtest::Failure("handler " + it->second + " is declared an interpreter form but does not call it");
+  }
 }
 
 VTEST_MAIN

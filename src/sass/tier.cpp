@@ -171,20 +171,25 @@ Src pred_src(const Operand& o) {
 
 // One 64-bit source of a double op, as fast_alu's DADD/DMUL/DFMA case reads it: a register pair (its two rows), or a
 // value that is the same for every lane.
-bool src64(Builder& b, const Operand& o, unsigned i, Src& out, uint32_t& mods, uint16_t& maxreg) {
+bool src64(Builder& b, const Operand& o, unsigned i, Src& out, uint32_t& mods, uint16_t& maxreg, bool kernel_mods = false) {
   const Kind k = o.kind;
   if (!(k == Kind::Reg || k == Kind::UReg || k == Kind::CBank || k == Kind::Imm || k == Kind::FImm)) return false;
   const uint8_t m = static_cast<uint8_t>((o.abs ? kAbs : 0) | (o.neg ? kNeg : 0));
+  // kernel_mods (DADD, DMUL, DFMA): the value is kept as it is, for every kind of source, and |x| and -x are left to the kernel through
+  // `mods` -- which keeps a NaN operand's sign and payload for the NaN rule (simd::dop_nan), as Runner::fast_alu reads them.
+  if (kernel_mods) mods |= (o.abs ? 1u : 0u) << (2 * i) | (o.neg ? 1u : 0u) << (2 * i + 1);
   const auto fold = [&](uint64_t bits) {
-    if (o.abs) bits &= 0x7fffffffffffffffull;
-    if (o.neg) bits ^= 0x8000000000000000ull;
+    if (!kernel_mods) {
+      if (o.abs) bits &= 0x7fffffffffffffffull;
+      if (o.neg) bits ^= 0x8000000000000000ull;
+    }
     return b.constant64(bits);
   };
   if (k == Kind::Reg && o.reg != kRZ) {
     out = Src{};
     out.kind = SrcKind::Row;
     out.off = o.reg * 32u;
-    mods |= (o.abs ? 1u : 0u) << (2 * i) | (o.neg ? 1u : 0u) << (2 * i + 1);
+    if (!kernel_mods) mods |= (o.abs ? 1u : 0u) << (2 * i) | (o.neg ? 1u : 0u) << (2 * i + 1);
     maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(o.reg + 2));
     return true;
   }
@@ -270,6 +275,78 @@ const char* form_name(Form f) {
                                       "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
+}
+
+const FormImpl& form_impl(Form f) {
+  // In the order of the enum (checked by test_tier against form_name).
+  static const FormImpl table[] = {
+      {Impl::Own, "none: the interpreter's"},
+      {Impl::Own, "MOV: a copy of a row"},
+      {Impl::Kernel, "iadd3"},
+      {Impl::Own, "IADD3 with carries: 32-bit integer carries, no format"},
+      {Impl::Kernel, "imad"},
+      {Impl::Own, "IMAD with a carry: 32-bit integer arithmetic"},
+      {Impl::Own, "IMAD.WIDE: 64-bit integer arithmetic"},
+      {Impl::Own, "IMAD.HI: 64-bit integer arithmetic"},
+      {Impl::Own, "ISETP.EX: integer comparison with a carried predicate"},
+      {Impl::Kernel, "lane_unary popcount"},
+      {Impl::Kernel, "i2f (the kernel's, also in a directed rounding mode)"},
+      {Impl::Own, "LDG: coalesced copies and addresses; faults and the slow cases go to exec_mem; the counters are mem_counters'"},
+      {Impl::Own, "STG: as LDG"},
+      {Impl::Own, "LDS: the width-dispatched lane copies of mem_counters/r9-count; the rest goes to exec_mem"},
+      {Impl::Own, "STS: as LDS"},
+      {Impl::Own, "LDL: as LDS"},
+      {Impl::Own, "STL: as LDS"},
+      {Impl::Kernel, "lop3"},
+      {Impl::Own, "LEA: 32-bit integer shift-add with carries"},
+      {Impl::Own, "SHF: funnel shift of integers"},
+      {Impl::Kernel, "icmp_mask"},
+      {Impl::Kernel, "fcmp_mask; a source with |x| or -x runs the interpreter's FSETP (Interp)"},
+      {Impl::Kernel, "blend_m"},
+      {Impl::Kernel, "ffma / ffma_x"},
+      {Impl::Kernel, "fadd / fadd_x"},
+      {Impl::Kernel, "fmul / fmul_x"},
+      {Impl::Kernel, "dop_m (the NaN rule is simd::dop_nan; the modifiers are the kernel's)"},
+      {Impl::Own, "BRA: control flow"},
+      {Impl::Own, "BSSY: control flow"},
+      {Impl::Own, "NOP and the barriers and fences that do nothing here: control flow"},
+      {Impl::Own, "PLOP3: predicate logic"},
+      {Impl::Own, "S2R: a special register (Runner::tier_sreg)"},
+      {Impl::Own, "CS2R: a special register (Runner::tier_sreg)"},
+      {Impl::Own, "SEL: a blend of two rows by a predicate"},
+      {Impl::Kernel, "prmt0 (mode 0) and prmt() of exec_ops.inc (the other modes)"},
+      {Impl::Kernel, "ibin_m (Min, Max), the calls fast_wide makes"},
+      {Impl::Kernel, "fmnmx"},
+      {Impl::Kernel, "mufu for RCP, RSQ, SQRT; the libm functions (SIN, COS, EX2, LG2, TANH) run the interpreter's code (Interp)"},
+      {Impl::Kernel, "f2i (f32 to 32 bits)"},
+      {Impl::Kernel, "i2f (the kernel's, also in a directed rounding mode)"},
+      {Impl::Interp, "F2FP.PACK_AB: the NaN, .RELU and rounding rules are fast_float's"},
+      {Impl::Kernel, "dcmp"},
+      {Impl::Kernel, "hfma2_m; the F32 result (HADD2.F32) runs the interpreter's code (Interp)"},
+      {Impl::Kernel, "lane_unary (BREV, FLO)"},
+      {Impl::Own, "IABS: 32-bit integer absolute value"},
+      {Impl::Own, "LDC: a word of a constant bank at a register + offset (Runner::cbank32)"},
+      {Impl::Own, "BSYNC: control flow"},
+      {Impl::Own, "YIELD: control flow"},
+      {Impl::Own, "BAR: control flow"},
+      {Impl::Own, "EXIT: control flow"},
+      {Impl::Own, "SHFL: lane permutation of 32-bit words, no format"},
+      {Impl::Own, "VOTE: predicate reductions"},
+      {Impl::Own, "UMOV: uniform datapath, 32-bit integer"},
+      {Impl::Own, "ULDC: uniform datapath, a constant-bank word"},
+      {Impl::Own, "UIADD3: uniform datapath, 32-bit integer"},
+      {Impl::Own, "UIMAD: uniform datapath, 32-bit integer"},
+      {Impl::Own, "UISETP: uniform datapath, integer comparison"},
+      {Impl::Own, "ULEA: uniform datapath, 32-bit integer"},
+      {Impl::Own, "ULOP3: uniform datapath, bitwise"},
+      {Impl::Own, "USHF: uniform datapath, shift"},
+      {Impl::Own, "UFLO, UPOPC: uniform datapath, bit counts"},
+      {Impl::Own, "USEL: uniform datapath, a select"},
+      {Impl::Interp, "HMMA: exec_mma decides the sum (VGPU_TC_EXACT and the sm_86 tensor-core model) and calls the kernel"},
+  };
+  static_assert(sizeof table / sizeof table[0] == static_cast<size_t>(Form::Count_), "form_impl: one entry per Form");
+  const unsigned i = static_cast<unsigned>(f);
+  return table[i < static_cast<unsigned>(Form::Count_) ? i : 0];
 }
 
 void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
@@ -675,7 +752,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       if (ins.guard_uniform || ins.dst[0].kind != Kind::Reg || ins.src.size() < nsrc) return;
       uint32_t mods = 0;
       for (unsigned i = 0; i < nsrc; ++i)
-        if (!src64(b, ins.src[i], i, m.s[i], mods, maxreg)) return;
+        if (!src64(b, ins.src[i], i, m.s[i], mods, maxreg, /*kernel_mods=*/true)) return;
       m.c = ins.f[0];   // a directed rounding mode: the host's, around the kernel
       for (unsigned i = nsrc; i < 3; ++i) m.s[i] = b.constant64(0);   // dop_m ignores c for DADD/DMUL
       const Operand& d = ins.dst[0];

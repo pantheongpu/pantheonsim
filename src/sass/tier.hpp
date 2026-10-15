@@ -127,6 +127,21 @@ enum class Form : uint8_t {
 };
 const char* form_name(Form f);
 
+// How a form's RESULT is computed, so that the rules of the interpreter cannot drift away from the tier's unnoticed (tests/unit/test_tier.cpp holds
+// this table to a checked-in list and reads tier_ops.inc for what a handler may not contain):
+//   Kernel: a call of the SIMD kernel (vgpu/simd/simd.hpp) or the shared function that Runner::fast_alu / fast_float / fast_wide calls for the
+//           same form, with the same arguments. The rules live in the kernel; the handler only resolves the operands.
+//   Interp: the interpreter's own code runs (Runner::fast_alu, then exec_float, exec_mma), for the whole form or for the part of it that has
+//           result rules of its own (named in the note). The tier adds only the dispatch.
+//   Own:    the tier computes it itself. Only for work with no result rules of a number format: integer and predicate arithmetic whose
+//           rules do not depend on a format or a card, scheduling and control, and addresses. Each says why.
+enum class Impl : uint8_t { Kernel, Interp, Own };
+struct FormImpl {
+  Impl impl;
+  const char* note;   // for Own: the reason; for Interp and Kernel: what is shared
+};
+const FormImpl& form_impl(Form f);
+
 struct MOp {
   // `ctx` is exec.cpp's TCtx: what a handler needs of the warp and the launch.
   using Fn = void (*)(void* ctx, const MOp&, uint32_t ex);

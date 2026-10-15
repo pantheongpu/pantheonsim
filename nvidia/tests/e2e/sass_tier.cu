@@ -163,6 +163,289 @@ __global__ void k_double(const u64* A, const u64* Bv, const u64* C, u64* out, in
   for (int j = 0; j < kDbl; ++j) out[(size_t)i * kDbl + j] = j < k ? r[j] : 0;
 }
 
+
+// ---- the forms whose result rules the card fixed (round 9) --------------------------------------------------------------------------
+// The tier must give what the interpreter gives for these, and the interpreter's rules for them are the card's: a -0 under .SAT, two NaNs in FMNMX,
+// the NaN a MUFU makes, the NaN of a packed half or a conversion, F2I/F2F/FRND with a NaN and with the .H1 select, the NaN rule of DADD/DMUL/DFMA
+// (the first NaN of (b, a) or (b, c, a), taken from the register and not from |x| or -x), the bfloat16 HFMA2, VABSDIFF, PRMT's selector bits, and the
+// tensor-core sum (HMMA; an sm_86 cubin's, VGPU_TC_EXACT). The tier's handlers call the interpreter's kernels and code for them; these kernels are
+// what holds that: they run the forms on inputs made of NaNs of both signs with distinct payloads in every position, zeros of both signs,
+// subnormals and the extremes mixed with random bits.
+#define OF(S, ...) do { float r_; asm(S : "=f"(r_) : __VA_ARGS__); o[k++] = B(r_); } while (0)
+#define OU(S, ...) do { u32 r_; asm(S : "=r"(r_) : __VA_ARGS__); o[k++] = r_; } while (0)
+#define OH(S, ...) do { unsigned short h_; asm(S : "=h"(h_) : __VA_ARGS__); o[k++] = h_; } while (0)
+#define OL(S, ...) do { u64 q_; asm(S : "=l"(q_) : __VA_ARGS__); o[k++] = (u32)q_; o[k++] = (u32)(q_ >> 32); } while (0)
+#define OD(S, ...) do { double d_; asm(S : "=d"(d_) : __VA_ARGS__); const u64 q_ = Bd(d_); o[k++] = (u32)q_; o[k++] = (u32)(q_ >> 32); } while (0)
+
+constexpr int kF2 = 160;
+__global__ void k_forms2(const u32* A, const u32* Bv, const u32* C, u32* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const u32 ua = A[i], ub = Bv[i], uc = C[i];
+  const float a = F(ua), b = F(ub), c = F(uc);
+  const double da = D(((u64)ua << 32) | ub), db = D(((u64)uc << 32) | ua);
+  u32 o[kF2] = {};
+  int k = 0;
+  // .SAT and .FTZ of a negative zero, and of values that flush to one; directed rounding.
+  OF("fma.rn.sat.f32 %0, %1, %2, %3;", "f"(a), "f"(b), "f"(c));
+  OF("fma.rn.ftz.sat.f32 %0, %1, %2, %3;", "f"(-a), "f"(b), "f"(c));
+  OF("mul.rn.ftz.sat.f32 %0, %1, %2;", "f"(a), "f"(-b));
+  OF("mul.rn.sat.f32 %0, %1, %2;", "f"(a), "f"(b));
+  OF("add.rn.ftz.sat.f32 %0, %1, %2;", "f"(a), "f"(b));
+  OF("add.rn.sat.f32 %0, %1, %2;", "f"(-a), "f"(-b));
+  OF("fma.rm.sat.f32 %0, %1, %2, %3;", "f"(a), "f"(-b), "f"(c));
+  OF("mul.rp.ftz.f32 %0, %1, %2;", "f"(a), "f"(b));
+  OF("add.rz.ftz.f32 %0, %1, %2;", "f"(-a), "f"(b));
+  // FMNMX with two NaNs, with .NAN, with a flush.
+  OF("min.f32 %0, %1, %2;", "f"(a), "f"(b));
+  OF("max.f32 %0, %1, %2;", "f"(a), "f"(b));
+#if __CUDA_ARCH__ >= 800
+  OF("min.NaN.f32 %0, %1, %2;", "f"(a), "f"(b));
+  OF("max.ftz.NaN.f32 %0, %1, %2;", "f"(a), "f"(b));
+#endif
+  OF("min.ftz.f32 %0, %1, %2;", "f"(-a), "f"(b));
+  OF("max.f32 %0, %1, %2;", "f"(fabsf(a)), "f"(-b));
+  // MUFU: the NaN a negative operand or an infinity makes, with and without a flush, with a source modifier.
+  OF("sin.approx.f32 %0, %1;", "f"(a));
+  OF("cos.approx.ftz.f32 %0, %1;", "f"(a));
+  OF("sin.approx.ftz.f32 %0, %1;", "f"(-a));
+  OF("ex2.approx.f32 %0, %1;", "f"(a));
+  OF("ex2.approx.ftz.f32 %0, %1;", "f"(-fabsf(a)));
+  OF("lg2.approx.f32 %0, %1;", "f"(a));
+  OF("lg2.approx.ftz.f32 %0, %1;", "f"(-a));
+  OF("rsqrt.approx.f32 %0, %1;", "f"(a));
+  OF("rsqrt.approx.ftz.f32 %0, %1;", "f"(-a));
+  OF("sqrt.approx.f32 %0, %1;", "f"(a));
+  OF("sqrt.approx.ftz.f32 %0, %1;", "f"(-fabsf(b)));
+  OF("rcp.approx.ftz.f32 %0, %1;", "f"(a));
+  OF("rcp.approx.ftz.f32 %0, %1;", "f"(-b));
+  OF("tanh.approx.f32 %0, %1;", "f"(a));
+  OF("tanh.approx.f32 %0, %1;", "f"(-b));
+  // F2I of every size and rounding; a NaN, an infinity, the edges; from f16 (the low half and .H1) and from f64.
+  OU("cvt.rzi.s32.f32 %0, %1;", "f"(a));
+  OU("cvt.rni.u32.f32 %0, %1;", "f"(a));
+  OU("cvt.rpi.s32.f32 %0, %1;", "f"(-a));
+  OU("cvt.rmi.ftz.u32.f32 %0, %1;", "f"(b));
+  OH("cvt.rzi.s16.f32 %0, %1;", "f"(a));
+  OH("cvt.rni.u16.f32 %0, %1;", "f"(-b));
+  OL("cvt.rzi.s64.f32 %0, %1;", "f"(a));
+  OL("cvt.rni.u64.f32 %0, %1;", "f"(b));
+  OU("cvt.rzi.s32.f64 %0, %1;", "d"(da));
+  OU("cvt.rpi.u32.f64 %0, %1;", "d"(-db));
+  OL("cvt.rni.s64.f64 %0, %1;", "d"(da));
+  OL("cvt.rzi.u64.f64 %0, %1;", "d"(db));
+  OU("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rzi.s32.f16 %0, lo; }", "r"(ua));
+  OU("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rni.u32.f16 %0, hi; }", "r"(ub));
+  OU("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rpi.s32.f16 %0, hi; }", "r"(uc));
+  // F2F and FRND: f16, bf16, f32 and f64 into each other, in each rounding mode; from the high half.
+  OH("cvt.rn.f16.f32 %0, %1;", "f"(a));
+  OH("cvt.rz.f16.f32 %0, %1;", "f"(b));
+  OH("cvt.rm.f16.f32 %0, %1;", "f"(c));
+  OH("cvt.rp.f16.f32 %0, %1;", "f"(-a));
+  OH("cvt.rn.f16.f64 %0, %1;", "d"(da));
+  OH("cvt.rz.f16.f64 %0, %1;", "d"(db));
+  OF("cvt.f32.f16 %0, %1;", "h"((unsigned short)ua));
+  OF("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.f32.f16 %0, hi; }", "r"(ub));
+  OD("cvt.f64.f32 %0, %1;", "f"(a));
+  OD("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.f64.f16 %0, hi; }", "r"(uc));
+  OF("cvt.rn.f32.f64 %0, %1;", "d"(da));
+  OF("cvt.rz.f32.f64 %0, %1;", "d"(db));
+  OF("cvt.rp.f32.f64 %0, %1;", "d"(-da));
+  OF("cvt.rni.f32.f32 %0, %1;", "f"(a));
+  OF("cvt.rzi.f32.f32 %0, %1;", "f"(b));
+  OF("cvt.rmi.ftz.f32.f32 %0, %1;", "f"(c));
+  OF("cvt.rpi.f32.f32 %0, %1;", "f"(-a));
+  OD("cvt.rni.f64.f64 %0, %1;", "d"(da));
+  OD("cvt.rmi.f64.f64 %0, %1;", "d"(-db));
+  OH("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rni.f16.f16 %0, hi; }", "r"(ua));
+  OH("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rzi.f16.f16 %0, lo; }", "r"(ub));
+  // I2F to every format and rounding, from every integer size (and the high half or byte).
+  OF("cvt.rn.f32.s32 %0, %1;", "r"(ua));
+  OF("cvt.rz.f32.u32 %0, %1;", "r"(ub));
+  OF("cvt.rm.f32.s32 %0, %1;", "r"(uc));
+  OF("cvt.rp.f32.u32 %0, %1;", "r"(ua));
+  OF("cvt.rm.f32.s64 %0, %1;", "l"(((u64)ua << 32) | ub));
+  OF("cvt.rp.f32.u64 %0, %1;", "l"(((u64)uc << 32) | ub));
+  OD("cvt.rn.f64.s64 %0, %1;", "l"(((u64)ub << 32) | uc));
+  OD("cvt.rn.f64.u32 %0, %1;", "r"(ua));
+  OH("cvt.rn.f16.s32 %0, %1;", "r"(ua));
+  OH("cvt.rz.f16.u32 %0, %1;", "r"(ub));
+  OH("cvt.rm.f16.s64 %0, %1;", "l"(((u64)ub << 32) | uc));
+  OH("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rp.f16.u16 %0, hi; }", "r"(uc));
+  OF("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rp.f32.s16 %0, hi; }", "r"(ua));
+  OF("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.rz.f32.u16 %0, lo; }", "r"(ub));
+  // The sum of absolute differences.
+  o[k++] = __usad(ua, ub, uc);
+  o[k++] = (u32)__sad((int)ua, (int)ub, (int)uc);
+  o[k++] = __usad(ub, uc, ua) ^ (u32)__sad((int)uc, (int)ua, (int)ub);
+#if __CUDA_ARCH__ >= 800
+  OH("cvt.rn.bf16.f32 %0, %1;", "f"(a));
+  OH("cvt.rz.bf16.f32 %0, %1;", "f"(b));
+  OH("cvt.rm.bf16.f32 %0, %1;", "f"(-c));
+  OU("cvt.rn.relu.bf16x2.f32 %0, %1, %2;", "f"(a), "f"(b));
+  OU("cvt.rn.relu.f16x2.f32 %0, %1, %2;", "f"(-a), "f"(b));
+  OU("cvt.rn.bf16x2.f32 %0, %1, %2;", "f"(b), "f"(c));
+  OU("cvt.rz.f16x2.f32 %0, %1, %2;", "f"(c), "f"(a));
+#endif
+  for (int j = 0; j < kF2; ++j) out[(size_t)i * kF2 + j] = o[j];
+}
+
+constexpr int kH2 = 64;
+__global__ void k_half2(const u32* A, const u32* Bv, const u32* C, u32* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const u32 x = A[i], y = Bv[i], z = C[i];
+  u32 o[kH2] = {};
+  int k = 0;
+  // packed f16: HFMA2, HADD2, HMUL2 with NaNs of both signs in each half, saturated, flushed; the comparisons (HSET2, HSETP2) with and without .FTZ.
+  OU("fma.rn.f16x2 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("fma.rn.ftz.f16x2 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("fma.rn.sat.f16x2 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("fma.rn.f16x2 %0, %1, %2, %3;", "r"(x ^ 0x80008000u), "r"(y & 0x7fff7fffu), "r"(z));
+  OU("add.rn.f16x2 %0, %1, %2;", "r"(x), "r"(y));
+  OU("mul.rn.f16x2 %0, %1, %2;", "r"(x), "r"(y));
+  OU("set.eq.f16x2.f16x2 %0, %1, %2;", "r"(x), "r"(y));
+  OU("set.lt.ftz.f16x2.f16x2 %0, %1, %2;", "r"(x), "r"(y));
+  OU("set.ge.ftz.f16x2.f16x2 %0, %1, %2;", "r"(y), "r"(z));
+  OU("set.nan.f16x2.f16x2 %0, %1, %2;", "r"(x), "r"(z));
+  OU("set.neu.f16x2.f16x2 %0, %1, %2;", "r"(x), "r"(z));
+  OU("{ .reg .pred p, q; setp.gt.ftz.f16x2 p|q, %1, %2; selp.u32 %0, 3, 0, p; }", "r"(x), "r"(y));
+  OU("{ .reg .pred p, q; setp.le.f16x2 p|q, %1, %2; selp.u32 %0, 5, 6, q; }", "r"(y), "r"(z));
+  // The half to float conversion (HADD2.F32) of each half, the two floats packed to f16x2 (F2FP.PACK_AB), with .RELU, from NaNs and from -0.
+  OF("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.f32.f16 %0, lo; }", "r"(x));
+  OF("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %1; cvt.f32.f16 %0, hi; }", "r"(y));
+#if __CUDA_ARCH__ >= 800
+  OU("cvt.rn.f16x2.f32 %0, %1, %2;", "f"(F(x)), "f"(F(y)));
+  OU("cvt.rn.relu.f16x2.f32 %0, %1, %2;", "f"(F(y)), "f"(-F(z)));
+  OU("cvt.rn.f16x2.f32 %0, %1, %2;", "f"(-F(z)), "f"(fabsf(F(x))));
+  // bfloat16 pairs: HFMA2.BF16_V2 is one correctly rounded result; the packs; the min/max.
+  OU("fma.rn.bf16x2 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("fma.rn.bf16x2 %0, %1, %2, %3;", "r"(x ^ 0x80008000u), "r"(y), "r"(z & 0x7fff7fffu));
+  OU("fma.rn.relu.bf16x2 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("fma.rn.bf16x2 %0, %1, %2, %3;", "r"(x), "r"(0x3f803f80u), "r"(z));   // a sum
+  OU("fma.rn.bf16x2 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(0x80008000u));   // a product
+  OU("cvt.rn.bf16x2.f32 %0, %1, %2;", "f"(F(x)), "f"(F(y)));
+  OU("cvt.rn.relu.bf16x2.f32 %0, %1, %2;", "f"(-F(y)), "f"(F(z)));
+  OU("min.bf16x2 %0, %1, %2;", "r"(x), "r"(y));
+  OU("max.NaN.bf16x2 %0, %1, %2;", "r"(y), "r"(z));
+  OU("min.f16x2 %0, %1, %2;", "r"(x), "r"(y));
+#endif
+#if __CUDA_ARCH__ >= 860
+  OU("max.xorsign.abs.f16x2 %0, %1, %2;", "r"(x), "r"(z));
+#endif
+  for (int j = 0; j < kH2; ++j) out[(size_t)i * kH2 + j] = o[j];
+}
+
+constexpr int kD2 = 40;
+__global__ void k_double2(const u64* A, const u64* Bv, const u64* C, u64* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const double x = D(A[i]), y = D(Bv[i]), z = D(C[i]);
+  u64 r[kD2] = {};
+  int k = 0;
+  // DADD, DMUL and DFMA with a NaN in any operand, with |x| and -x on each (the NaN taken is the register's, not the modified one), in each rounding.
+#define ODD(S, ...) do { double d_; asm(S : "=d"(d_) : __VA_ARGS__); r[k++] = Bd(d_); } while (0)
+  ODD("fma.rn.f64 %0, %1, %2, %3;", "d"(x), "d"(y), "d"(z));
+  ODD("fma.rn.f64 %0, %1, %2, %3;", "d"(-x), "d"(y), "d"(z));
+  ODD("fma.rn.f64 %0, %1, %2, %3;", "d"(fabs(x)), "d"(-y), "d"(-fabs(z)));
+  ODD("fma.rn.f64 %0, %1, %2, %3;", "d"(x), "d"(fabs(y)), "d"(-z));
+  ODD("fma.rz.f64 %0, %1, %2, %3;", "d"(-fabs(x)), "d"(y), "d"(fabs(z)));
+  ODD("fma.rm.f64 %0, %1, %2, %3;", "d"(x), "d"(y), "d"(z));
+  ODD("fma.rp.f64 %0, %1, %2, %3;", "d"(-x), "d"(-y), "d"(z));
+  ODD("add.rn.f64 %0, %1, %2;", "d"(x), "d"(y));
+  ODD("add.rn.f64 %0, %1, %2;", "d"(-x), "d"(y));
+  ODD("add.rn.f64 %0, %1, %2;", "d"(fabs(x)), "d"(fabs(y)));
+  ODD("add.rz.f64 %0, %1, %2;", "d"(x), "d"(-fabs(y)));
+  ODD("add.rm.f64 %0, %1, %2;", "d"(-fabs(x)), "d"(y));
+  ODD("mul.rn.f64 %0, %1, %2;", "d"(x), "d"(y));
+  ODD("mul.rn.f64 %0, %1, %2;", "d"(-x), "d"(fabs(y)));
+  ODD("mul.rp.f64 %0, %1, %2;", "d"(fabs(x)), "d"(y));
+  ODD("mul.rz.f64 %0, %1, %2;", "d"(x), "d"(-y));
+  r[k++] = Bd(fmin(x, y));
+  r[k++] = Bd(fmax(-x, fabs(y)));
+  r[k++] = (x < y) | ((x == z) << 1) | ((y >= z) << 2) | ((x != x) << 3) | ((fabs(y) > z) << 4);
+  for (int j = 0; j < kD2; ++j) out[(size_t)i * kD2 + j] = r[j];
+}
+
+// PRMT with selectors of any bits, in every mode.
+constexpr int kM2 = 16;
+__global__ void k_prmt2(const u32* A, const u32* Bv, const u32* C, u32* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const u32 x = A[i], y = Bv[i], z = C[i];
+  u32 o[kM2] = {};
+  int k = 0;
+  OU("prmt.b32 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("prmt.b32.f4e %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("prmt.b32.f4e %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z >> 7));
+  OU("prmt.b32.b4e %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("prmt.b32.b4e %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z >> 5));
+  OU("prmt.b32.rc8 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("prmt.b32.ecl %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("prmt.b32.ecl %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z >> 9));
+  OU("prmt.b32.ecr %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  OU("prmt.b32.ecr %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z >> 3));
+  OU("prmt.b32.rc16 %0, %1, %2, %3;", "r"(x), "r"(y), "r"(z));
+  for (int j = 0; j < kM2; ++j) out[(size_t)i * kM2 + j] = o[j];
+}
+
+// The tensor cores: mma.sync of f16, bf16 and tf32 products into f32 and f16 accumulators (HMMA). An sm_86 cubin sums as an RTX 3060's tensor core does
+// (chunks, truncated) unless VGPU_TC_EXACT=0; every other one sums sequentially. All 32 lanes of a warp take part.
+constexpr int kMma = 24;
+__global__ void k_mma(const u32* A, const u32* Bv, const u32* C, u32* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  u32 a[4], b[2], c[4], o[kMma] = {};
+  for (int j = 0; j < 4; ++j) { a[j] = A[((size_t)i * 4 + j) % n]; c[j] = C[((size_t)i * 4 + j) % n]; }
+  for (int j = 0; j < 2; ++j) b[j] = Bv[((size_t)i * 2 + j) % n];
+  int k = 0;
+  {   // m16n8k8, f16 (sm_75 has it)
+    float d0, d1, d2, d3;
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};"
+                 : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+                 : "r"(a[0]), "r"(a[1]), "r"(b[0]), "f"(F(c[0])), "f"(F(c[1])), "f"(F(c[2])), "f"(F(c[3])));
+    o[k++] = B(d0); o[k++] = B(d1); o[k++] = B(d2); o[k++] = B(d3);
+  }
+#if __CUDA_ARCH__ >= 800
+  {   // m16n8k16, f16, f32 accumulator
+    float d0, d1, d2, d3;
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+                 : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(F(c[0])), "f"(F(c[1])), "f"(F(c[2])), "f"(F(c[3])));
+    o[k++] = B(d0); o[k++] = B(d1); o[k++] = B(d2); o[k++] = B(d3);
+  }
+  {   // m16n8k16, f16, f16 accumulator
+    u32 d0, d1;
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%9};"
+                 : "=r"(d0), "=r"(d1)
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(c[0]), "r"(c[1]));
+    o[k++] = d0; o[k++] = d1;
+  }
+  {   // m16n8k16, bf16, f32 accumulator
+    float d0, d1, d2, d3;
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+                 : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(F(c[0])), "f"(F(c[1])), "f"(F(c[2])), "f"(F(c[3])));
+    o[k++] = B(d0); o[k++] = B(d1); o[k++] = B(d2); o[k++] = B(d3);
+  }
+  {   // m16n8k8, tf32
+    float d0, d1, d2, d3;
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+                 : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(F(c[0])), "f"(F(c[1])), "f"(F(c[2])), "f"(F(c[3])));
+    o[k++] = B(d0); o[k++] = B(d1); o[k++] = B(d2); o[k++] = B(d3);
+  }
+  {   // m16n8k8, bf16
+    float d0, d1, d2, d3;
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};"
+                 : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+                 : "r"(a[0]), "r"(a[1]), "r"(b[0]), "f"(F(c[0])), "f"(F(c[1])), "f"(F(c[2])), "f"(F(c[3])));
+    o[k++] = B(d0); o[k++] = B(d1); o[k++] = B(d2); o[k++] = B(d3);
+  }
+#endif
+  if (i < n)
+    for (int j = 0; j < kMma; ++j) out[(size_t)i * kMma + j] = o[j];
+}
+
 // ---- memory -------------------------------------------------------------------------------------
 template <class T>
 __global__ void k_copy(const T* in, T* out, int n, int lane_limit, int stride, int shift) {
@@ -246,12 +529,21 @@ static const u32 kSpecial32[] = {0u, 1u, 2u, 3u, 31u, 32u, 33u, 63u, 64u, 0x7fff
                                  // floats
                                  0x3f800000u, 0xbf800000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7f800001u, 0xffc00001u, 0x7fffffffu,
                                  0x00000001u, 0x007fffffu, 0x80000001u, 0x807fffffu, 0x00800000u, 0x7f7fffffu, 0xff7fffffu, 0x4b000000u,
-                                 0x33800000u, 0x3f800001u, 0x2f800000u, 0x5f800000u, 0x42280000u, 0xc2c80000u, 0x3dcccccdu, 0x40490fdbu};
+                                 0x33800000u, 0x3f800001u, 0x2f800000u, 0x5f800000u, 0x42280000u, 0xc2c80000u, 0x3dcccccdu, 0x40490fdbu,
+                                 // NaNs of both signs with distinct payloads, the extremes of the narrow formats, and pairs of halves (f16 and bf16) that are NaN, infinite,
+                                 // subnormal, zero of either sign, or the largest
+                                 0x7fa00000u, 0xffa00001u, 0x7fc12345u, 0xffc54321u, 0x80000000u, 0x00400000u, 0x80400000u, 0x7e00fe01u,
+                                 0x7c017e01u, 0xfe01fc00u, 0x7fff7fffu, 0x00010001u, 0x80018001u, 0x03ff03ffu, 0x80008000u, 0x3c003c00u,
+                                 0x7f807fc0u, 0x7fc17f81u, 0xff80ffc0u, 0x00800080u, 0x7bff7bffu, 0xfbfffbffu, 0x7e007e00u, 0xfc00fc00u,
+                                 0x7f7f7f7fu, 0x007f007fu, 0x807f807fu, 0x7fc0ff80u, 0x3f80bf80u, 0x4000c000u};
 static const u64 kSpecial64[] = {0ull, 1ull, 0x8000000000000000ull, 0x7fffffffffffffffull, 0xffffffffffffffffull, 0x7ff0000000000000ull,
                                  0xfff0000000000000ull, 0x7ff8000000000000ull, 0x7ff0000000000001ull, 0x0000000000000001ull,
                                  0x000fffffffffffffull, 0x0010000000000000ull, 0x3ff0000000000000ull, 0xbff0000000000000ull,
                                  0x7fefffffffffffffull, 0x4330000000000000ull, 0x3cb0000000000000ull, 0x3ff0000000000001ull,
-                                 0x00000000ffffffffull, 0xffffffff00000000ull, 0x4059000000000000ull, 0x3fb999999999999aull};
+                                 0x00000000ffffffffull, 0xffffffff00000000ull, 0x4059000000000000ull, 0x3fb999999999999aull,
+                                 // NaNs of both signs, quiet and signalling, with distinct payloads; subnormals; the edges of the integer conversions
+                                 0xfff8000000000001ull, 0x7ff4000000000000ull, 0xfff0000000000007ull, 0x7ff8dead0000beefull, 0xfff4000000001234ull,
+                                 0x43e0000000000000ull, 0xc3e0000000000000ull, 0x41e0000000000000ull, 0xc1e0000000000000ull, 0x8000000000000001ull};
 
 static void fill32(std::vector<u32>& v, int salt) {
   const int m = sizeof kSpecial32 / sizeof kSpecial32[0];
@@ -274,6 +566,19 @@ static void fill64(std::vector<u64>& v, int salt) {
       case 1: v[i] = r; break;
       default: v[i] = (r & 1) ? kSpecial64[r % m] : (0x3ff0000000000000ull | (r >> 12)); break;   // normal doubles near 1
     }
+  }
+}
+
+// Values for the tensor cores: pairs of halves that are finite and of moderate size as f16 pairs, as bf16 pairs and as floats alike, with an
+// occasional special, so that the sums are mostly numbers.
+static void fill_mma(std::vector<u32>& v, int salt) {
+  const int m = sizeof kSpecial32 / sizeof kSpecial32[0];
+  for (size_t i = 0; i < v.size(); ++i) {
+    const u64 r = next_rand();
+    const auto half = [](u64 q) -> u32 { return (u32)(((q >> 8) & 1) << 15 | (0x38 + (q % 16)) << 10 | ((q >> 16) & 0x3ff)); };
+    u32 w = half(r) << 16 | half(r >> 32);
+    if (((r >> 60) & 15) == (u64)(salt & 15)) w = kSpecial32[(r >> 20) % m];
+    v[i] = w;
   }
 }
 
@@ -436,6 +741,50 @@ int main() {
     }
     CK(cudaFree(out));
   }
+  {   // the forms whose rules the card fixed (see k_forms2)
+    u32* out;
+    CK(cudaMalloc(&out, (size_t)n * kF2 * 4));
+    for (int threads : {128, 50}) {
+      k_forms2<<<(n + threads - 1) / threads, threads>>>(da, db, dc, out, n);
+      char label[64];
+      std::snprintf(label, sizeof label, "forms2 threads=%d", threads);
+      if (report(label, out, (size_t)n * kF2)) return 1;
+    }
+    CK(cudaFree(out));
+    CK(cudaMalloc(&out, (size_t)n * kH2 * 4));
+    for (int threads : {128, 50}) {
+      k_half2<<<(n + threads - 1) / threads, threads>>>(da, db, dc, out, n);
+      char label[64];
+      std::snprintf(label, sizeof label, "half2 threads=%d", threads);
+      if (report(label, out, (size_t)n * kH2)) return 1;
+    }
+    CK(cudaFree(out));
+    CK(cudaMalloc(&out, (size_t)n * kM2 * 4));
+    k_prmt2<<<(n + 127) / 128, 128>>>(da, db, dc, out, n);
+    if (report("prmt2", out, (size_t)n * kM2)) return 1;
+    CK(cudaFree(out));
+  }
+  {   // the tensor cores, on values that sum to numbers (HMMA)
+    const int nm = 2048;
+    std::vector<u32> ma(nm), mb(nm), mc(nm);
+    fill_mma(ma, 1);
+    fill_mma(mb, 2);
+    fill_mma(mc, 3);
+    u32 *dma = dev_copy(ma), *dmb = dev_copy(mb), *dmc = dev_copy(mc), *out;
+    CK(cudaMalloc(&out, (size_t)nm * kMma * 4));
+    for (int threads : {64, 128}) {
+      k_mma<<<nm / threads, threads>>>(dma, dmb, dmc, out, nm);
+      char label[64];
+      std::snprintf(label, sizeof label, "mma threads=%d", threads);
+      if (report(label, out, (size_t)nm * kMma)) return 1;
+    }
+    // (and on the general inputs, whose sums are NaNs and infinities)
+    CK(cudaFree(out));
+    CK(cudaMalloc(&out, (size_t)4096 * kMma * 4));
+    k_mma<<<32, 128>>>(da, db, dc, out, 4096);
+    if (report("mma special", out, (size_t)4096 * kMma)) return 1;
+    CK(cudaFree(out)); CK(cudaFree(dma)); CK(cudaFree(dmb)); CK(cudaFree(dmc));
+  }
   {
     std::vector<u64> xa(n), xb(n), xc(n);
     fill64(xa, 0);
@@ -448,6 +797,14 @@ int main() {
       char label[64];
       std::snprintf(label, sizeof label, "double threads=%d", threads);
       if (report(label, out, (size_t)n * kDbl)) return 1;
+    }
+    CK(cudaFree(out));
+    CK(cudaMalloc(&out, (size_t)n * kD2 * 8));
+    for (int threads : {64, 37}) {
+      k_double2<<<(n + threads - 1) / threads, threads>>>(dxa, dxb, dxc, out, n);
+      char label[64];
+      std::snprintf(label, sizeof label, "double2 threads=%d", threads);
+      if (report(label, out, (size_t)n * kD2)) return 1;
     }
     CK(cudaFree(dxa)); CK(cudaFree(dxb)); CK(cudaFree(dxc)); CK(cudaFree(out));
   }

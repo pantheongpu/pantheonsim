@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <optional>
 #include <utility>
 #include <bit>
 #include <cerrno>
@@ -360,6 +361,12 @@ class Runner {
   void tier_exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mem(blk, w, ins, ex); }
   uint32_t tier_cbank32(unsigned bank, uint64_t offset) const { return cbank32(bank, offset); }
   void tier_exec_float(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_float(blk, w, ins, ex); }
+  // A float or tensor instruction as Runner::execute runs it: the 32-lane fast path first, then the general rule. The tier's handlers for the
+  // forms whose result rules are more than a call of a SIMD kernel use these (so that the rules stay in one place, exec_ops.inc).
+  void tier_float_op(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+    if (!fast_alu(w, ins, ex)) exec_float(blk, w, ins, ex);
+  }
+  void tier_exec_mma(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mma(blk, w, ins, ex); }
   ~Runner() {
     if (coop_ws_) {
       try {

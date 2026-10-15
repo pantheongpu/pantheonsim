@@ -247,24 +247,13 @@ TIER_HANDLER(h_fsetp) {
   alignas(32) uint32_t t[2][32];
   const unsigned cmp = op.a, bop = op.b;
   const bool fz = op.c != 0;
+  if (op.aux != 0) {   // |x| or -x on a source: the interpreter's own code (Runner::fast_alu's FSETP)
+    c.r->tier_float_op(*c.blk, *c.w, *op.ins, ex);
+    return;
+  }
   const uint32_t* a = tier_src<false>(c, op.s[0], t[0]);
   const uint32_t* b = tier_src<false>(c, op.s[1], t[1]);
-  const auto fv = [&](uint32_t bits, bool abs_, bool neg_) {
-    float f = as_f32(bits);
-    if (fz) f = ftz(f);
-    if (abs_) f = std::fabs(f);
-    if (neg_) f = -f;
-    return f;
-  };
-  Mask r = 0;
-  if (op.aux == 0) {   // no |x| or -x: the SIMD comparison (the one the interpreter's fast path uses)
-    r = c.sk->fcmp_mask(cmp, fz, a, b) & ex;
-  } else {
-    for (Mask m = ex; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-      if (float_cmp(cmp, fv(a[l], op.aux & 1, op.aux & 2), fv(b[l], op.aux & 4, op.aux & 8))) r |= Mask{1} << l;
-    }
-  }
+  const Mask r = c.sk->fcmp_mask(cmp, fz, a, b) & ex;   // the SIMD comparison the interpreter's fast path uses
   const Mask acc = tier_pmask(c, op.p);
   tier_setp(c, op.dst, ex, tier_combine(bop, r, acc));
   tier_setp(c, op.dst2, ex, tier_combine(bop, ~r, acc));
@@ -342,7 +331,7 @@ TIER_HANDLER(h_dop) {
       lo[i] = c.pool[s.off].v;
       hi[i] = c.pool[s.off + 1].v;
     } else {
-      tier_dyn64(c, s, tlo[i], thi[i], true);
+      tier_dyn64(c, s, tlo[i], thi[i], false);   // (the modifiers are the kernel's, as for a register: a NaN operand is kept as it is)
       lo[i] = tlo[i];
       hi[i] = thi[i];
     }
@@ -516,31 +505,13 @@ TIER_HANDLER(h_fmnmx) {
 
 TIER_HANDLER(h_mufu) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[32], r[32];
   const unsigned fn = op.a;
-  if (fn == 4 || fn == 5 || fn == 8) {
-    c.sk->mufu(fn, r, tier_src<true>(c, op.s[0], t));
-  } else {
-    // The functions the host's libm gives: the input flushed, then |x| and -x, the answer in double rounded once to float and
-    // flushed (fast_float's MUFU case).
-    const uint32_t* raw = tier_src<false>(c, op.s[0], t);
-    for (unsigned l = 0; l < 32; ++l) {
-      float f = as_f32(raw[l]);
-      f = ftz(f);
-      if (op.aux & 1) f = std::fabs(f);
-      if (op.aux & 2) f = -f;
-      const double x = ftz(f);
-      float v;
-      switch (fn) {
-        case 0: v = static_cast<float>(std::cos(x * 6.28318530717958647692)); break;   // the argument is in turns
-        case 1: v = static_cast<float>(std::sin(x * 6.28318530717958647692)); break;
-        case 2: v = static_cast<float>(std::exp2(x)); break;
-        case 3: v = static_cast<float>(std::log2(x)); break;
-        default: v = static_cast<float>(std::tanh(x)); break;
-      }
-      r[l] = f32_bits(ftz(v));
-    }
+  if (fn != 4 && fn != 5 && fn != 8) {   // the libm functions (SIN, COS, EX2, LG2, TANH): the interpreter's own code
+    c.r->tier_float_op(*c.blk, *c.w, *op.ins, ex);
+    return;
   }
+  alignas(32) uint32_t t[32], r[32];
+  c.sk->mufu(fn, r, tier_src<true>(c, op.s[0], t));   // RCP, RSQ, SQRT: the kernel the interpreter's fast path uses
   tier_store(c, op.dst, ex, r);
 }
 
@@ -549,23 +520,6 @@ TIER_HANDLER(h_f2i) {
   alignas(32) uint32_t t[32], r[32];
   c.sk->f2i(op.a != 0, op.b, op.c != 0, r, tier_src<true>(c, op.s[0], t));
   tier_store(c, op.dst, ex, r);
-}
-
-// I2F under a directed rounding mode, as exec_float's general rule converts it lane by lane (the conversion is a host instruction that
-// follows the host's mode; in a function of its own so that the compiler does not fold it across the scope's change of mode).
-[[gnu::noinline]] void tier_i2f_rounded(uint32_t* r, const uint32_t* src, unsigned ssize, unsigned shift, bool sgn) {
-  for (unsigned l = 0; l < 32; ++l) {
-    uint64_t v = src[l];
-    if (ssize < 2) v >>= shift;   // .H1, .B1-.B3
-    int64_t sv;
-    switch (ssize) {
-      case 0: sv = sgn ? static_cast<int8_t>(v) : static_cast<int64_t>(v & 0xff); break;
-      case 1: sv = sgn ? static_cast<int16_t>(v) : static_cast<int64_t>(v & 0xffff); break;
-      default: sv = sgn ? static_cast<int32_t>(v) : static_cast<int64_t>(v & 0xffffffff); break;
-    }
-    const float f = static_cast<float>(sv);
-    r[l] = f32_bits(f);
-  }
 }
 
 TIER_HANDLER(h_iabs) {
@@ -583,12 +537,9 @@ TIER_HANDLER(h_i2f) {
   TIER_PRELUDE
   alignas(32) uint32_t t[32], r[32];
   const uint32_t* src = tier_src<false>(c, op.s[0], t);
-  if (op.aux) {
-    RoundingScope scope(op.aux);
-    tier_i2f_rounded(r, src, op.a, op.b, op.c != 0);
-    tier_store(c, op.dst, ex, r);
-    return;
-  }
+  // (A directed rounding mode: the host's, around the same kernel, as Runner::fast_float does it.)
+  std::optional<RoundingScope> scope;
+  if (op.aux) scope.emplace(op.aux);
   if (op.a < 2) {
     // A byte or a half of the register (.B1-.B3, .H1 move it down), sign- or zero-extended: it converts as a signed 32-bit integer.
     alignas(32) uint32_t ext[32];
@@ -606,31 +557,9 @@ TIER_HANDLER(h_i2f) {
   tier_store(c, op.dst, ex, r);
 }
 
-TIER_HANDLER(h_f2fp) {
+TIER_HANDLER(h_f2fp) {   // F2FP.PACK_AB: the interpreter's own code (the NaN, .RELU and rounding rules are fast_float's)
   TIER_PRELUDE
-  alignas(32) uint32_t t[2][32], r[32];
-  alignas(32) float fa[32], fb[32];
-  const uint32_t* ra = tier_src<true>(c, op.s[0], t[0]);
-  const uint32_t* rb = tier_src<true>(c, op.s[1], t[1]);
-  for (unsigned l = 0; l < 32; ++l) {
-    fa[l] = as_f32(ra[l]);
-    fb[l] = as_f32(rb[l]);
-  }
-  if (op.b) {   // .RELU: a negative value (not -0, not a NaN) becomes +0
-    for (unsigned l = 0; l < 32; ++l) {
-      if (fa[l] < 0) fa[l] = 0;
-      if (fb[l] < 0) fb[l] = 0;
-    }
-  }
-  if (op.a) {   // bf16
-    for (unsigned l = 0; l < 32; ++l) r[l] = (static_cast<uint32_t>(f32_to_bf16(fa[l])) << 16) | f32_to_bf16(fb[l]);
-  } else {
-    alignas(32) uint16_t ha[32], hb[32];
-    c.sk->f32_to_f16(fa, ha, 32);
-    c.sk->f32_to_f16(fb, hb, 32);
-    for (unsigned l = 0; l < 32; ++l) r[l] = (static_cast<uint32_t>(ha[l]) << 16) | hb[l];
-  }
-  tier_store(c, op.dst, ex, r);
+  c.r->tier_float_op(*c.blk, *c.w, *op.ins, ex);
 }
 
 TIER_HANDLER(h_unary) {
@@ -670,33 +599,13 @@ inline const uint32_t* tier_pk(const TCtx& c, const tier::Src& s, unsigned opbit
 
 TIER_HANDLER(h_hop2) {
   TIER_PRELUDE
+  if (op.aux & 1) {   // HADD2.F32 (the half to float conversion): the interpreter's own code
+    c.r->tier_float_op(*c.blk, *c.w, *op.ins, ex);
+    return;
+  }
   alignas(32) uint32_t t[3][32], u[3][32];
   const uint32_t* a = tier_pk(c, op.s[0], op.b & 15, t[0], u[0]);
   const uint32_t* b = tier_pk(c, op.s[1], (op.b >> 4) & 15, t[1], u[1]);
-  if (op.aux & 1) {
-    // HADD2.F32: the sum of the two low halves in double, rounded once to float -- for the usual a = -RZ (the half to float conversion)
-    // exactly the half's value. A NaN among the operands (which of two NaNs the host keeps depends on how the compiler ordered the
-    // operands) is the general rule's.
-    alignas(32) uint16_t h16[2][32];
-    alignas(32) float f[2][32];
-    uint32_t nan_seen = 0;
-    for (unsigned l = 0; l < 32; ++l) {
-      h16[0][l] = static_cast<uint16_t>(a[l]);
-      h16[1][l] = static_cast<uint16_t>(b[l]);
-      nan_seen |= ((h16[0][l] & 0x7fffu) > 0x7c00u) | ((h16[1][l] & 0x7fffu) > 0x7c00u);
-    }
-    if (nan_seen) {
-      c.r->tier_exec_float(*c.blk, *c.w, *op.ins, ex);
-      return;
-    }
-    if (op.dst == tier::kNoReg) return;
-    c.sk->f16_to_f32(h16[0], f[0], 32);
-    c.sk->f16_to_f32(h16[1], f[1], 32);
-    alignas(32) uint32_t out[32];
-    for (unsigned l = 0; l < 32; ++l) out[l] = f32_bits(static_cast<float>(static_cast<double>(f[0][l]) + f[1][l]));
-    tier_store(c, op.dst, ex, out);
-    return;
-  }
   if (op.dst == tier::kNoReg) return;
   const uint32_t* d3 = tier_pk(c, op.s[2], (op.b >> 8) & 15, t[2], u[2]);
   uint32_t* d = c.R + op.dst * 32u;
@@ -1282,12 +1191,10 @@ TIER_HANDLER(h_imnmx) {
   alignas(32) uint32_t t[2][32], r[32];
   const uint32_t* a = tier_src<false>(c, op.s[0], t[0]);
   const uint32_t* b = tier_src<false>(c, op.s[1], t[1]);
-  const Mask mn = tier_pmask(c, op.p);
-  for (unsigned l = 0; l < 32; ++l) {
-    const bool m = (mn >> l) & 1;
-    if (op.c) r[l] = m ? static_cast<uint32_t>(std::min<int32_t>(a[l], b[l])) : static_cast<uint32_t>(std::max<int32_t>(a[l], b[l]));
-    else r[l] = m ? std::min(a[l], b[l]) : std::max(a[l], b[l]);
-  }
+  const uint64_t p = tier_pmask(c, op.p);
+  // (The predicate chooses the minimum per lane: fast_wide's IMNMX, the same two kernel calls.)
+  c.sk->ibin_m(static_cast<unsigned>(simd::IntBin::Min), op.c != 0, r, a, b, p, 32);
+  c.sk->ibin_m(static_cast<unsigned>(simd::IntBin::Max), op.c != 0, r, a, b, ~p & 0xffffffffull, 32);
   tier_store(c, op.dst, ex, r);
 }
 
@@ -1355,16 +1262,9 @@ TIER_HANDLER(h_vote) {
 
 // HMMA (the dense f16, bf16 and tf32 forms): one SIMD kernel over the warp's fragments, as exec_mma gives them to it, the
 // answer written to the executing lanes (RZ as an operand is a row of zeros, as a source accumulator a zero accumulator).
-TIER_HANDLER(h_hmma) {
+TIER_HANDLER(h_hmma) {   // the interpreter's own code: which sum an sm_86 cubin gets (VGPU_TC_EXACT) is exec_mma's to decide
   TIER_PRELUDE
-  static const uint32_t kZero[4 * 32] = {};
-  const unsigned ra = op.s[0].off, rb = op.s[1].off, rc = op.s[2].off;
-  const unsigned c_regs = op.c ? 2 : 4;
-  alignas(32) uint32_t out[4 * 32];
-  c.sk->hmma(op.a, op.b, op.c != 0, ra == kRZ ? kZero : c.R + ra * 32u, rb == kRZ ? kZero : c.R + rb * 32u,
-             rc == kRZ ? nullptr : c.R + rc * 32u, out);
-  if (op.dst != tier::kNoReg)
-    for (unsigned s = 0; s < c_regs; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, out + s * 32);
+  c.r->tier_exec_mma(*c.blk, *c.w, *op.ins, ex);
 }
 
 tier::MOp::Fn tier_handler_for(tier::Form f) {

@@ -86,13 +86,15 @@ printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_TIER_JOBS:-$("$root/ci/jobs.sh" -p
 [[ -n ${VGPU_TIER_BUILD_ONLY:-} ]] && { echo "built in $work"; exit 0; }
 
 fails=0
+extra_env=()   # (an environment variable for a variant of a run: VGPU_TC_EXACT=0)
+variant=""
 check() {
   local p=$1 arch=$2 bin="$work/$1.$2" a b ra rb why=""
   if [[ ! -x $bin ]]; then
     echo "FAIL $arch $p: does not build"; sed 's/^/    /' "$bin.build" | tail -5; fails=1; return
   fi
   require_shim_libs "$shim" "$bin" >/dev/null || return
-  local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_SASS_LOG=1 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
+  local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_SASS_LOG=1 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim") "${extra_env[@]}")
   a="$(cd "$work" && env "${env[@]}" VGPU_TIER=0 timeout 900 "$bin" 2>&1)"; ra=$?
   # (The tier's statistics go to a file of their own: printed at exit among the program's buffered output, they tear a line.)
   local stats bq sf="$work/$p.$arch.stats"
@@ -144,13 +146,23 @@ check() {
     done
   fi
   if [[ -n $why ]]; then
-    echo "FAIL $arch $p: $why"
+    echo "FAIL $arch $p$variant: $why"
     diff <(echo "$a") <(echo "$bq") | head -12 | sed 's/^/    /'
     fails=1
   else
-    echo "ok   $arch $p${stats:+  ($stats)}"
+    echo "ok   $arch $p$variant${stats:+  ($stats)}"
   fi
 }
 for j in "${jobs[@]}"; do check $j; done
+# The tensor-core sum: an sm_86 cubin sums as an RTX 3060's tensor core does (chunks of products, truncated) unless VGPU_TC_EXACT=0, which
+# gives the sequential sum every other architecture has. The tier hands HMMA to the interpreter's code, which decides; both sums, tier against
+# interpreter (the runs above are the default one).
+for p in sass_tier wmma_gemm wmma_types mma_fragment_layout modern_dtypes; do
+  if [[ -x "$work/$p.sm_86" ]] && grep -qx sm_86 <<< "$supported"; then
+    extra_env=(VGPU_TC_EXACT=0); variant=" (VGPU_TC_EXACT=0)"
+    check "$p" sm_86
+    extra_env=(); variant=""
+  fi
+done
 [[ $fails == 0 ]] && echo "PASS" || echo "FAIL: the tier and the interpreter differ"
 exit $fails
