@@ -1271,6 +1271,7 @@ struct Side {
   int ordinal = -1;   // the device whose memory it is, where it is a device's
 };
 bool vmm_range(uint64_t va, uint64_t* base, uint64_t* size);
+bool ipc_open_range(uint64_t va, uint64_t* base, uint64_t* size);   // memory another process shared, opened here
 hipError_t locate(State& s, const void* p, const Region& r, Side* side) {
   const uint64_t va = reinterpret_cast<uint64_t>(p);
   for (int i = 0; i < s.rt->device_count(); ++i) {
@@ -1294,6 +1295,14 @@ hipError_t locate(State& s, const void* p, const Region& r, Side* side) {
             return fail(hipErrorInvalidValue, "the region runs past the end of the host memory it starts in");
           return hipSuccess;
         }
+      // Not any host memory the runtime knows: memory another process shared and this one opened (hipIpcOpenMemHandle)
+      // is mapped from a file at a device address of its own, and is device memory, filled and copied through the
+      // manager like any other, not a host pointer.
+      if (uint64_t ibase = 0, isize = 0; ipc_open_range(va, &ibase, &isize)) {
+        side->device = true;
+        if (!r.reach(&reach) || reach > isize - (va - ibase))
+          return fail(hipErrorInvalidValue, "the region runs past the end of the shared memory it starts in");
+      }
       return hipSuccess;
     }
     side->device = true;
@@ -4439,6 +4448,20 @@ static_assert(sizeof(IpcPayload) <= sizeof(vgpu::amd::abi::IpcMemHandle), "an IP
 constexpr uint32_t kIpcMagic = 0x48495043;   // "HIPC"
 std::string ipc_path(const char* id) { return vgpu::telemetry::default_path() + "/ipc-hip-" + id; }
 std::map<void*, int> g_ipc_open;   // pointer -> the device it was mapped on
+// The id of the file each shared allocation lives in, by its device pointer: asking for the handle of an
+// allocation that is shared already (vLLM's custom all-reduce asks for each captured buffer's handle more than
+// once) gives a handle to that file, and not to a new path that no file is at.
+std::map<uint64_t, std::string> g_ipc_ids;
+std::map<uint64_t, uint64_t> g_ipc_open_size;   // the pointers of g_ipc_open: how many bytes each maps
+bool ipc_open_range(uint64_t va, uint64_t* base, uint64_t* size) {
+  auto it = g_ipc_open_size.upper_bound(va);
+  if (it == g_ipc_open_size.begin()) return false;
+  --it;
+  if (va - it->first >= it->second) return false;
+  *base = it->first;
+  *size = it->second;
+  return true;
+}
 // This process's exports, numbered: HIP's and HSA's handles share the count.
 uint32_t next_ipc_serial() {
   static std::atomic<uint32_t> counter{0};
@@ -5593,9 +5616,18 @@ hipError_t hipIpcGetMemHandle(vgpu::amd::abi::IpcMemHandle* handle, void* ptr) {
   p.version = 1;
   p.device = static_cast<uint32_t>(d);
   p.pid = static_cast<uint32_t>(::getpid());
-  std::snprintf(p.id, sizeof p.id, "%x-%x", p.pid, next_ipc_serial());
+  const uint64_t base = reinterpret_cast<uint64_t>(ptr);
+  // An allocation already shared is shared as the file it already is. (A freed one's file is gone with it, and its
+  // address may come back as another allocation: that one is shared afresh.)
+  const auto known = g_ipc_ids.find(base);
+  if (known != g_ipc_ids.end() && s.rt->device(d).memory().is_shared(base)) {
+    std::snprintf(p.id, sizeof p.id, "%s", known->second.c_str());
+  } else {
+    std::snprintf(p.id, sizeof p.id, "%x-%x", p.pid, next_ipc_serial());
+    g_ipc_ids[base] = p.id;
+  }
   try {
-    p.size = s.rt->device(d).memory().share(reinterpret_cast<uint64_t>(ptr), ipc_path(p.id));
+    p.size = s.rt->device(d).memory().share(base, ipc_path(p.id));
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
@@ -5623,6 +5655,7 @@ hipError_t hipIpcOpenMemHandle(void** ptr, vgpu::amd::abi::IpcMemHandle handle, 
     return record(s, fail(hipErrorInvalidValue, e.what()));
   }
   g_ipc_open[*ptr] = d;
+  g_ipc_open_size[reinterpret_cast<uint64_t>(*ptr)] = p.size;
   // hipIpcMemLazyEnablePeerAccess, which RCCL passes, and which is what an
   // opened handle behaves as on a card anyway: the memory is mapped where
   // the exporter's device is numbered here, and this process's other devices
@@ -5638,6 +5671,7 @@ hipError_t hipIpcCloseMemHandle(void* ptr) {
   const auto it = g_ipc_open.find(ptr);
   if (it == g_ipc_open.end()) return record(s, hipErrorInvalidValue);
   s.rt->device(it->second).memory().abandon(reinterpret_cast<uint64_t>(ptr));
+  g_ipc_open_size.erase(reinterpret_cast<uint64_t>(ptr));
   g_ipc_open.erase(it);
   return record(s, hipSuccess);
 }
@@ -7668,6 +7702,7 @@ void* ipc_attach(uint32_t pid, uint32_t serial, uint64_t size, int device, std::
     return *why = e.what(), nullptr;
   }
   g_ipc_open[p] = d;
+  g_ipc_open_size[reinterpret_cast<uint64_t>(p)] = size;
   s.ipc_mapped.insert(d);
   return p;
 }
@@ -7677,6 +7712,7 @@ bool ipc_detach(void* ptr) {
   const auto it = g_ipc_open.find(ptr);
   if (it == g_ipc_open.end()) return false;
   s.rt->device(it->second).memory().abandon(reinterpret_cast<uint64_t>(ptr));
+  g_ipc_open_size.erase(reinterpret_cast<uint64_t>(ptr));
   g_ipc_open.erase(it);
   return true;
 }

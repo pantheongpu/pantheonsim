@@ -756,6 +756,15 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x2a3}, {"v_cvt_pk_bf8_f32", 1, 2}},
       {{Enc::Vop3, 0x2a4}, {"v_cvt_sr_fp8_f32", 1, 2}},
       {{Enc::Vop3, 0x2a5}, {"v_cvt_sr_bf8_f32", 1, 2}},
+      // gfx950's IEEE three-way minimum and maximum (CDNA4 ISA: V_MINIMUM3_F32 680, V_MAXIMUM3_F32 681),
+      // and their packed half forms (VOP3P 27 and 28, below).
+      // gfx950's scaled conversions of two 4- or 8-bit floats to bfloat16 (CDNA4 ISA, V_CVT_SCALEF32_PK_BF16_FP4 593,
+      // _FP8 617, _BF8 618), which Triton's MX-scaled dot uses for operands it widens first.
+      {{Enc::Vop3, 0x251}, {"v_cvt_scalef32_pk_bf16_fp4", 1, 2}},
+      {{Enc::Vop3, 0x269}, {"v_cvt_scalef32_pk_bf16_fp8", 1, 2}},
+      {{Enc::Vop3, 0x26a}, {"v_cvt_scalef32_pk_bf16_bf8", 1, 2}},
+      {{Enc::Vop3, 0x2a8}, {"v_minimum3_f32", 1, 3}},
+      {{Enc::Vop3, 0x2a9}, {"v_maximum3_f32", 1, 3}},
       // DS: LDS reads and writes. A read takes the address; a write takes the
       // address and the data.
       {{Enc::Ds, 0x00}, {"ds_add_u32", 0, 2}},
@@ -1011,6 +1020,8 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3p, 0x10}, {"v_pk_mul_f16", 1, 2}},
       {{Enc::Vop3p, 0x11}, {"v_pk_min_f16", 1, 2}},
       {{Enc::Vop3p, 0x12}, {"v_pk_max_f16", 1, 2}},
+      {{Enc::Vop3p, 0x1b}, {"v_pk_minimum3_f16", 1, 3}},
+      {{Enc::Vop3p, 0x1c}, {"v_pk_maximum3_f16", 1, 3}},
       // And the packed float form, where each of the two is a whole register.
       // A multiply-add over sources that may each be a float or a half,
       // rounded to a half and written into one half of the destination.
@@ -1931,8 +1942,10 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
     in.cache = ((w0 >> 14) & 1) | ((w0 >> 17) & 1) << 1 | ((w0 >> 15) & 1) << 2;   // sc0, nt, sc1
     if (s.srcs) {
       const uint32_t w1 = word(code, at + 4);
-      if ((w0 >> 16) & 1)
-        throw Error::make(Err::Unsupported, in.name, " loads straight into LDS, which this does not model");
+      // The LDS bit: the data goes to LDS (CDNA3 ISA 9.1.9, CDNA4 ISA 9.1.9), and the
+      // instruction has no data register. Which forms the hardware has, and what the
+      // simulator runs, is for the executor to say.
+      in.lds_dma = (w0 >> 16) & 1;
       in.offset = static_cast<int32_t>(w0 & 0xFFF);
       in.offen = (w0 >> 12) & 1;
       in.idxen = (w0 >> 13) & 1;
@@ -1940,10 +1953,12 @@ Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
       // an atomic gives back into, where sc0 asks). Then the address register
       // -- an offset, an index, or the two -- the resource's four scalar
       // registers, and the scalar offset.
-      Operand data = vgpr((w1 >> 8) & 0xFF, s.dst_width ? s.dst_width : s.src_width(0));
-      if ((w1 >> 23) & 1) data.kind = OperandKind::Agpr;
-      if (s.dst_width) in.dst.push_back(data);
-      else in.src.push_back(data);
+      if (!in.lds_dma) {
+        Operand data = vgpr((w1 >> 8) & 0xFF, s.dst_width ? s.dst_width : s.src_width(0));
+        if ((w1 >> 23) & 1) data.kind = OperandKind::Agpr;
+        if (s.dst_width) in.dst.push_back(data);
+        else in.src.push_back(data);
+      }
       in.src.push_back(vgpr(w1 & 0xFF, in.offen && in.idxen ? 2 : 1));
       in.src.push_back(sgpr(((w1 >> 16) & 0x1F) << 2, 4));
       in.src.push_back(take((w1 >> 24) & 0xFF, 1));
@@ -2307,7 +2322,7 @@ std::string to_text(const Inst& i) {
   for (size_t k = 0; k < i.src.size(); ++k) {
     // A buffer access that takes neither an offset nor an index from a
     // register prints "off" where the register would be.
-    const bool no_vaddr = (i.enc == Enc::Mubuf || i.enc == Enc::Mtbuf) && !i.offen && !i.idxen && k == (i.dst.empty() ? 1u : 0u);
+    const bool no_vaddr = (i.enc == Enc::Mubuf || i.enc == Enc::Mtbuf) && !i.offen && !i.idxen && k == (i.dst.empty() && !i.lds_dma ? 1u : 0u);
     const char* as_half = f16 && i.src[k].kind == OperandKind::Literal && (i.src[k].value & ~0xFFFFll) == 0
                               ? half_constant(i.src[k].value) : nullptr;
     s += sep + ((scratch_no_addr && k == 0) || no_vaddr ? "off" : as_half ? as_half : operand_text(i.src[k]));
@@ -2437,6 +2452,7 @@ std::string to_text(const Inst& i) {
     if (i.cache & 1) s += i.arch == Target::Gfx90a ? " glc" : " sc0";
     if (i.cache & 2) s += i.arch == Target::Gfx90a ? " slc" : " nt";
     if (i.cache & 4) s += i.arch == Target::Gfx90a ? " scc" : " sc1";
+    if (i.lds_dma) s += " lds";
   } else if (i.name == "s_sendmsg") {
     const uint32_t msg = static_cast<uint32_t>(i.simm) & 0xF;
     if (msg != 1 || (static_cast<uint32_t>(i.simm) & 0xFFF0))

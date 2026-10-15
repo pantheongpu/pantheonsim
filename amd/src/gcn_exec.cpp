@@ -3768,7 +3768,13 @@ struct Machine {
       return;
     }
     Narrowed narrowed(*this, in);
-    if (in.arch == gcn::Target::Gfx1250 && cdna5_alu(w, in, op)) return;
+    // gfx950 has the IEEE three-way minimum and maximum (CDNA4 ISA, V_MINIMUM3_F32, V_MAXIMUM3_F32, V_PK_MINIMUM3_F16,
+    // V_PK_MAXIMUM3_F16), which gfx1250 has the same way ("IEEE minimum()/maximum()", a signaling NaN propagated).
+    if ((in.arch == gcn::Target::Gfx1250 ||
+         (in.arch == gcn::Target::Gfx950 && (op == "v_minimum3_f32"_op || op == "v_maximum3_f32"_op ||
+                                             op == "v_pk_minimum3_f16"_op || op == "v_pk_maximum3_f16"_op))) &&
+        cdna5_alu(w, in, op))
+      return;
     if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) return;
     if (carry_alu(w, in)) return;
     if (more_alu(w, in, op)) return;
@@ -4490,6 +4496,29 @@ struct Machine {
           return bits;
         };
         write_lane(w, in.dst[0], lane, narrow(a) | narrow(b) << 16);
+      });
+    } else if (op == "v_cvt_scalef32_pk_bf16_fp4"_op || op == "v_cvt_scalef32_pk_bf16_fp8"_op ||
+               op == "v_cvt_scalef32_pk_bf16_bf8"_op) {
+      // CDNA4 ISA, V_CVT_SCALEF32_PK_BF16_{FP4,FP8,BF8}: scale = exponent(S1.f32) (S1's biased exponent field, E8M0);
+      // FP4: byte OPSEL[1:0] of SRC0, its low nibble to the low bfloat16 and its high nibble to the high one; FP8 and
+      // BF8: 16-bit half OPSEL[0] of SRC0, its low byte to the low bfloat16. Each value is scaled by 2^(scale - 127).
+      // Assumed, not stated (the pseudocode's fp4_to_bf16_scale and its 8-bit kin are not defined): the product is exact
+      // and rounded to nearest even to bfloat16, and a scale of 0xFF (E8M0's NaN) or a NaN input gives NaN.
+      const bool is4 = op == "v_cvt_scalef32_pk_bf16_fp4"_op;
+      const F8& t = is4 ? kFp4 : op == "v_cvt_scalef32_pk_bf16_fp8"_op ? kOcpFp8 : kOcpBf8;
+      const uint32_t opsel = in.op_sel;
+      each([&](uint32_t lane) {
+        const uint32_t scale = (as_bits(lane_float(w, in.src[1], lane)) >> 23) & 0xFF;
+        const uint32_t src = lane_src(w, in.src[0], lane);
+        uint32_t r = 0;
+        for (uint32_t i = 0; i < 2; ++i) {
+          const uint32_t code = is4 ? (src >> (8 * (opsel & 3)) >> (4 * i)) & 0xF : (src >> (16 * (opsel & 1)) >> (8 * i)) & 0xFF;
+          const float v = f8_to_float(code, t);
+          const float scaled = scale == 0xFF || std::isnan(v) ? std::numeric_limits<float>::quiet_NaN()
+                                                              : static_cast<float>(std::ldexp(static_cast<double>(v), static_cast<int>(scale) - 127));
+          r |= (to_bf16(scaled) & 0xFFFFu) << (16 * i);
+        }
+        write_lane(w, in.dst[0], lane, r);
       });
     } else if (op == "v_cvt_pkrtz_f16_f32"_op) {
       each([&](uint32_t lane) {
@@ -6618,14 +6647,46 @@ struct Machine {
 
   void buffer_access(Wave& w, const Inst& in, Group& g) {
     if (!w.exec) return;
-    const bool reads_data = in.dst.empty();   // a store, or an atomic
-    const Operand& data = reads_data ? in.src[0] : in.dst[0];
+    // A load with the LDS bit has no data register: its sources are the
+    // address, the resource and the scalar offset, and the data goes to LDS.
+    const bool lds_dma = in.lds_dma;
+    const bool reads_data = !lds_dma && in.dst.empty();   // a store, or an atomic
+    const Operand& data = lds_dma ? in.src[0] : reads_data ? in.src[0] : in.dst[0];   // (unused, with the LDS bit)
     const Operand& vaddr = in.src[reads_data ? 1 : 0];
     const Operand& rsrc = in.src[reads_data ? 2 : 1];
     const Operand& soff = in.src[reads_data ? 3 : 2];
+    // The words each lane brings, and where in LDS they go. CDNA3 ISA 9.1.9 lists the
+    // loads that may have the LDS bit: ubyte, sbyte, ushort, sshort, dword and
+    // format_x; CDNA4 ISA 9.1.9 adds dwordx3 and dwordx4. Its figure gives
+    //   LDS_ADDR = LDSbase + M0[15:0] + inst_offset + TIDinWave * 4
+    // (TIDinWave * 16 for three or four dwords, which "writes 3 dwords and skips
+    // the 4th"), and MEM_ADDR as any buffer access's. The dword forms are run;
+    // the sub-dword and format_x forms are not: the guides give the LDS stride
+    // (4 bytes a lane) but not whether a byte load writes one byte or a
+    // zero-extended dword. gfx90a's guide was not consulted.
+    uint32_t lds_words = 0;
+    uint64_t lds_at = 0;
+    if (lds_dma) {
+      const std::string_view op = in.name;
+      lds_words = op == "buffer_load_dword" ? 1 : op == "buffer_load_dwordx3" ? 3 : op == "buffer_load_dwordx4" ? 4 : 0;
+      const bool wide = lds_words > 1;
+      if (!lds_words || in.arch == gcn::Target::Gfx90a || gcn::is_rdna(in.arch) || (wide && in.arch != gcn::Target::Gfx950))
+        throw Error::make(Err::Unsupported, in.name, " loads straight into LDS, which this does not model for this form");
+      // M0's LDS offset: bits 15:0 in CDNA3's text and in both figures; CDNA4's
+      // text says "18-bit unsigned byte offset from M0[17:0]", which differs
+      // only where M0 reaches 64 KiB. The documents contradict each other, so
+      // an M0 that high is refused, not guessed at.
+      if (w.m0 >> 16)
+        throw Error::make(Err::Unsupported, in.name, " with M0 = ", w.m0,
+                          ": CDNA4 ISA 9.1.9 gives the LDS offset as M0[17:0] in its text and M0[15:0] in its figure");
+      lds_at = uint64_t{w.m0} + static_cast<uint32_t>(in.offset);
+    }
     const uint32_t d1 = w.sgpr[rsrc.index + 1], records = w.sgpr[rsrc.index + 2], d3 = w.sgpr[rsrc.index + 3];
     const uint64_t base = w.sgpr[rsrc.index] | static_cast<uint64_t>(d1 & 0xFFFF) << 32;
-    if (base == kScratchResourceBase) return scratch_buffer_access(w, in, g, data, vaddr, soff);
+    if (base == kScratchResourceBase) {
+      if (lds_dma) throw Error::make(Err::Unsupported, in.name, " loads straight into LDS from scratch, which this does not model");
+      return scratch_buffer_access(w, in, g, data, vaddr, soff);
+    }
     const uint32_t stride = (d1 >> 16) & 0x3FFF;
     // RDNA's resource (V#) keeps the same base, stride and record count, but
     // a 2-bit swizzle, a 7-bit format at bits 18:12 in place of gfx9's data
@@ -6685,7 +6746,17 @@ struct Machine {
           }
         return stride ? index < records : soffset + at + bytes <= records;
       };
-      if (formatted) {
+      if (lds_dma) {
+        // Out of range reads zero, as for any buffer load.
+        const uint64_t to = lds_at + uint64_t{lane} * (lds_words > 1 ? 16 : 4);   // "(TIDinWave * 16)" for three or four dwords
+        if (to + 4 * lds_words > g.lds.size())
+          throw Error::make(Err::InvalidValue, in.name, " writes LDS at ", to, ", past the ", g.lds.size(),
+                            " bytes the work-group has");
+        uint32_t v[4] = {0, 0, 0, 0};
+        for (uint32_t k = 0; k < lds_words; ++k)
+          if (fits(offset + 4 * k, 4)) v[k] = static_cast<uint32_t>(load(addr + 4 * k, 4));
+        std::memcpy(&g.lds[to], v, 4 * lds_words);
+      } else if (formatted) {
         formatted_access(w, in, body, format, in.enc == gcn::Enc::Mtbuf && !rdna ? kIdentitySel : d3, data, lane, addr,
                          fits(offset, image::texel_bytes(format)));
       } else if (Half h; half_access(body, &h)) {
@@ -8051,6 +8122,7 @@ struct Machine {
         if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
         else ++n.vmem_rd, issued_load(w);
         buffer_access(w, in, g);
+        if (in.lds_dma) ++n.lds;
         return true;
       case gcn::Enc::Mtbuf:
         ++n.vmem;
