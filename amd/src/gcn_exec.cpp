@@ -232,6 +232,12 @@ struct Wave {
   bool soft_yield = false;
   bool round_stopped = false;
   uint64_t round_steps = 0;
+  // Armed at the start of each round (run_round): the wave's first plain store in it gives the group's other waves
+  // their turn before it lands (see Machine::step). A wave that reads a word, thinks for a hundred instructions and
+  // then overwrites it (rocSOLVER's potf2 does, thread 0 on the diagonal entry every iteration) is read by the
+  // group's other waves a few cycles after the barrier on a card, never after the write; run to its next barrier
+  // one wave at a time, wave 1 read what wave 0 had already overwritten.
+  bool store_gate = true;
   // At a GWS barrier (Machine::gws_barrier): counted there, and waiting for
   // the barrier's generation to move past this one.
   bool gws_waiting = false;
@@ -7499,6 +7505,21 @@ struct Machine {
     return false;
   }
 
+  // A plain write to memory other waves can see: LDS, or global, flat and buffer memory (not scratch, which is the
+  // wave's own, and not atomics, which a card orders where they arrive). Cheap for everything that is not a memory
+  // instruction, since it runs on each instruction until the wave's first store of a round.
+  static bool is_plain_store(const Inst& in) {
+    switch (in.enc) {
+      case gcn::Enc::Ds: return in.name.rfind("ds_write", 0) == 0 || in.name.rfind("ds_store", 0) == 0;
+      case gcn::Enc::Flat:
+        return in.segment != Inst::Segment::Scratch && in.name.find("_store") != std::string::npos &&
+               in.name.find("_atomic") == std::string::npos;
+      case gcn::Enc::Mubuf:
+      case gcn::Enc::Mtbuf: return in.name.find("_store") != std::string::npos && in.name.find("_atomic") == std::string::npos;
+      default: return false;
+    }
+  }
+
   bool step(Wave& w, Group& g) {
     if (debug::active() &&
         debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
@@ -7510,6 +7531,16 @@ struct Machine {
                             decoded.enc == gcn::Enc::Vop3p || decoded.enc == gcn::Enc::Vopc || decoded.enc == gcn::Enc::Vopd ||
                             decoded.enc == gcn::Enc::Flat || decoded.enc == gcn::Enc::Ds;
     const Inst& in = w.vgpr_msb && vector_enc ? (remapped = decoded, apply_vgpr_msb(w, &remapped), remapped) : decoded;
+    // A wave's first store of a round lets the group's other waves run first, once (Wave::store_gate): the loads they
+    // make before their own stores come before this one lands, as the few cycles between the waves of a group make
+    // them on a card. Nothing of the instruction has run: not counted yet, pc not moved, and the wave is back on this
+    // instruction in the round's next pass. A masked-off store waits for no one (and keeps the gate for a real one),
+    // nor does a lone wave, nor a debugger session, which steps in a fixed order.
+    if (w.store_gate && w.exec != 0 && g.waves.size() > 1 && !debug::active() && is_plain_store(in)) {
+      w.store_gate = false;
+      w.soft_yield = true;
+      return false;
+    }
     // The performance counters' instruction mix, worked out when decoded.
     {
       InstructionCounts& c = stats.counts;
@@ -8041,7 +8072,7 @@ bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
   // A wave that waits for a global load gives the others its turn (Wave::soft_yield), as the load's
   // latency does on a card, and has the rest of the round after them; the turn counts across those
   // pauses, so a wave polling memory with loads in its loop still ends its round.
-  for (Wave& w : group.waves) w.round_stopped = false, w.round_steps = 0;
+  for (Wave& w : group.waves) w.round_stopped = false, w.round_steps = 0, w.store_gate = true;
   bool again;
   do {
     again = false;

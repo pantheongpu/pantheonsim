@@ -226,3 +226,8 @@ PY
 rm -rf "$tmp"
 "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx1250 cluster1250.cpp -o cluster1250.gfx1250
 echo "wrote $(pwd)/cluster1250.gfx1250"
+
+# The waves of a work-group read a word right after a barrier before one of them overwrites it (the shape of
+# rocSOLVER's Cholesky kernel): wave_race.cpp.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 wave_race.cpp -o wave_race.gfx942
+echo "wrote $(pwd)/wave_race.gfx942"

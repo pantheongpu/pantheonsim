@@ -1,5 +1,8 @@
 # Simulator speed: design studies (round 7, r7-design)
 
+> **Status (round 8):** route (a) of study 1 is built, opt-in: `VGPU_TIER=1`, `src/sass/tier*`; measurements and the tests that hold it to
+> the interpreter are in [docs/performance.md](../performance.md#the-pre-decoded-tier-round-8-vgpu_tier1). Routes (b) and (c) are not built.
+
 Feasibility studies for the largest possible speed-ups, with a throwaway prototype that measures potential. **No
 file under `src/` was changed.** The prototype is on branch `r7-design-proto` (head `040114fc`,
 `tools/r7proto/`), which is not for merging; the raw measurements are in `data/`.

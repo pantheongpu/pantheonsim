@@ -272,6 +272,28 @@ inline void convolve_exact(const Geom& g, Dir dir, const double* a, const double
       // enough real chains (a depthwise convolution has one per filter): fewer than 8 go the plain way, one chain at
       // a time, with the filters spread over threads.
       const int64_t useful = std::min<int64_t>(g.Kg, 4) * std::min<int64_t>(g.Cg, cb);
+      if (useful < 8 && g.dil[2] == 1 && g.flt[2] >= 2 && g.flt[2] <= (wide ? 8 : 4) && g.flt[1] <= 8) {
+        // The taps of a filter row as the vector lanes (a depthwise convolution is the typical case): up to 8 filter rows' pairs
+        // of accumulators advance together, each chain in its order.
+        const int64_t items = g.K * g.Cg;
+        const uint64_t work = static_cast<uint64_t>(K * g.Cg * fsz) * static_cast<uint64_t>(N * osz);
+        const double* const xend = b + N * C * isz;
+        hostpar::parallel_for(static_cast<unsigned>(pick(work, items)), items, [&](int64_t it) {
+          const int64_t k = it / g.Cg, ci = it % g.Cg;
+          const int64_t c0 = (k / g.Kg) * g.Cg;
+          const double* dyk = a + k * osz;
+          const double* xc = b + (c0 + ci) * isz;
+          double* dw = out + (k * g.Cg + ci) * fsz;
+          if (wide) {
+#ifdef VGPU_HOSTCONV_AVX2
+            avx2::filt_taps(g, dyk, xc, xend, dw);
+#endif
+          } else {
+            generic::filt_taps(g, dyk, xc, xend, dw);
+          }
+        });
+        break;
+      }
       if (useful < 8) {
         const int64_t items = g.K * g.Cg;
         const uint64_t work = static_cast<uint64_t>(K * g.Cg * fsz) * static_cast<uint64_t>(N * osz);

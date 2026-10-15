@@ -15,7 +15,7 @@ fetch_into() {  # fetch_into <dir> <url> <tar members...>
   local dir="$1" url="$2" tmp="$1.tmp.$$"
   shift 2
   mkdir -p "$tmp"
-  if ! curl -fsSL "$url" -o "$tmp.tar.gz"; then
+  if ! curl -fsSL --http1.1 --retry 5 --retry-all-errors --retry-delay 3 "$url" -o "$tmp.tar.gz"; then
     rm -rf "$tmp" "$tmp.tar.gz"
     return 1
   fi

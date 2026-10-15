@@ -12,6 +12,7 @@
 
 #include "hevc_decode.hpp"
 #include "hevc_syntax.hpp"
+#include "video_simd.hpp"
 
 namespace vgpu_hevc {
 namespace {
