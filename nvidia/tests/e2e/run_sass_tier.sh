@@ -6,7 +6,7 @@
 # exercise barriers, divergence, warp ops, atomics, textures, MMA and more). Each runs twice on its generation's
 # simulated GPU, with one host thread and the performance counters on: with the interpreter, and with the tier. The two
 # must pass and print byte for byte the same -- every result and every counter of every launch, and the text of any
-# error -- apart from the tier's own statistics lines (VGPU_TIER_STATS=1, lines starting "tier").
+# error. (The tier's statistics, VGPU_TIER_STATS=1, are written to a file: VGPU_TIER_STATS_FILE.)
 #
 # sass_tier_steps.cu holds what Runner::step_warp does besides executing an instruction -- the store gate, the step count and its
 # limit, the 256-instruction run, the count of calls that a warp's turn is made of (a warp that spins on another's store counts
@@ -94,10 +94,12 @@ check() {
   require_shim_libs "$shim" "$bin" >/dev/null || return
   local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_SASS_LOG=1 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
   a="$(cd "$work" && env "${env[@]}" VGPU_TIER=0 timeout 900 "$bin" 2>&1)"; ra=$?
-  b="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 timeout 900 "$bin" 2>&1)"; rb=$?
-  local stats bq
-  stats="$(grep '^tier: ' <<< "$b" | head -1)"
-  bq="$(grep -v '^tier' <<< "$b")"
+  # (The tier's statistics go to a file of their own: printed at exit among the program's buffered output, they tear a line.)
+  local stats bq sf="$work/$p.$arch.stats"
+  rm -f "$sf"
+  b="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 VGPU_TIER_STATS_FILE="$sf" timeout 900 "$bin" 2>&1)"; rb=$?
+  stats="$(grep -h '^tier: ' "$sf" 2>/dev/null | head -1)"
+  bq="$b"
   grep -q "running SASS" <<< "$a" || why="its SASS did not run"
   grep -q "running PTX instead of SASS" <<< "$a" && why="fell back to PTX: $(grep -m1 'running PTX instead' <<< "$a")"
   [[ $ra == "$rb" ]] || why="${why:+$why; }exit status $ra with the interpreter, $rb with the tier"
@@ -114,7 +116,7 @@ check() {
     grep -q '^store gate: .* ok$' <<< "$bq" || why="${why:+$why; }the tier's store gate line is not ok"
     # The tier is shared by the host threads of a launch: four of them must give what one thread of the interpreter does.
     local c4
-    c4="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_THREADS=4 timeout 900 "$bin" 2>&1 | grep -v '^tier')"
+    c4="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_THREADS=4 timeout 900 "$bin" 2>&1)"
     [[ "$a" == "$c4" ]] || why="${why:+$why; }four threads with the tier print differently from the interpreter's one"
     local ran total
     ran="$(sed -n 's/^tier: \([0-9]*\) of \([0-9]*\) warp.*/\1/p' <<< "$stats")"
@@ -136,7 +138,7 @@ check() {
     local f fa fb fenv=(VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_MAX_STEPS=50000 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
     for f in gather scatter local shared atomic trap forever; do
       fa="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=0 timeout 300 "$bin" fault $f 2>&1)"
-      fb="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 timeout 300 "$bin" fault $f 2>&1 | grep -v '^tier')"
+      fb="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=1 timeout 300 "$bin" fault $f 2>&1)"
       if ! grep -q "^fault $f: " <<< "$fa" || grep -q "^fault $f: no error" <<< "$fa"; then why="${why:+$why; }the $f fault did not happen"
       elif [[ "$fa" != "$fb" ]]; then why="${why:+$why; }the $f fault is reported differently by the tier"; fi
     done

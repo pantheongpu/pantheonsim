@@ -1371,8 +1371,12 @@ struct TierStats {
     for (size_t i = 0; i < kOps; ++i) nat += native[i].load();
     for (const auto& [k, v] : fallback) fb += v;
     if (!nat && !fb) return;
+    // (VGPU_TIER_STATS_FILE: appended to that file, for a test that must not have them among a program's own output)
+    std::FILE* out = stderr;
+    if (const char* f = std::getenv("VGPU_TIER_STATS_FILE"); f && *f)
+      if (std::FILE* g = std::fopen(f, "a")) out = g;
     const uint64_t all = total.load();
-    std::fprintf(stderr, "tier: %llu of %llu warp instructions ran in the tier (%.1f%%); %llu straight-line ones in the interpreter\n",
+    std::fprintf(out, "tier: %llu of %llu warp instructions ran in the tier (%.1f%%); %llu straight-line ones in the interpreter\n",
                  (unsigned long long)nat, (unsigned long long)all, all ? 100.0 * double(nat) / double(all) : 0.0,
                  (unsigned long long)fb);
     {
@@ -1383,7 +1387,7 @@ struct TierStats {
       std::string line = "tier native:";
       for (size_t i = 0; i < v.size() && i < 24; ++i)
         line += std::string(" ") + op_name(static_cast<Op>(v[i].second)) + "=" + std::to_string(v[i].first);
-      std::fprintf(stderr, "%s\n", line.c_str());
+      std::fprintf(out, "%s\n", line.c_str());
     }
     const auto list = [&](const char* what, const std::map<std::string, uint64_t>& m) {
       std::vector<std::pair<uint64_t, std::string>> v;
@@ -1391,17 +1395,18 @@ struct TierStats {
       std::sort(v.rbegin(), v.rend());
       std::string line = std::string("tier ") + what + ":";
       for (size_t i = 0; i < v.size() && i < 24; ++i) line += " " + v[i].second + "=" + std::to_string(v[i].first);
-      std::fprintf(stderr, "%s\n", line.c_str());
+      std::fprintf(out, "%s\n", line.c_str());
     };
-    std::fprintf(stderr, "tier runs: %llu runs of straight instructions, %llu of them started by the tier's chain instead of a call of the scheduler\n",
+    std::fprintf(out, "tier runs: %llu runs of straight instructions, %llu of them started by the tier's chain instead of a call of the scheduler\n",
                  (unsigned long long)passes.load(), (unsigned long long)chained.load());
     list("interpreter (straight)", fallback);
     list("interpreter (ends a run)", ended);
     for (const auto& [k, v] : samples) {
       std::string line = "tier sample " + k + ":";
       for (const std::string& t : v) line += "  [" + t + "]";
-      std::fprintf(stderr, "%s\n", line.c_str());
+      std::fprintf(out, "%s\n", line.c_str());
     }
+    if (out != stderr) std::fclose(out);
   }
 };
 
