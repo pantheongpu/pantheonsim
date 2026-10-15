@@ -33,11 +33,13 @@ for engine in sass ptx; do
   echo "$result"
   [[ "$(tail -1 <<< "$result")" == PASS ]] || status=1
 done
-if (( status )) && command -v cuobjdump >/dev/null 2>&1; then
-  # What ptxas made of the two kernels that differ in one thing only: the row that the table is read at.
-  for k in q_row_nostride q_row0; do
-    echo "== SASS of $k"
-    cuobjdump -sass "$out" | awk -v k="$k" '/Function : / { on = index($0, k) > 0 } on' | sed -E 's#/\*[0-9a-f]{4}\*/##; s#/\* 0x[0-9a-f]+ \*/##' | grep -v '^\s*$' | head -120
+if (( status )); then
+  # What warp 0 of block 0 runs in the kernel that reads the table at row threadIdx.y (the instructions, with
+  # the first lane's results), for finding where its answer goes wrong.
+  for k in q_row_nostride; do
+    echo "== SASS trace of $k, warp 0"
+    VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 VGPU_SASS_TRACE=0 VGPU_SASS_TRACE_KERNEL=$k LD_LIBRARY_PATH="$shim" "$out" 2>&1 \
+      | grep -v -E '^(ok|FAIL|PASS|  )' | head -400
   done
 fi
 exit $status
