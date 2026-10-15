@@ -289,6 +289,7 @@ class Runner {
     // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
     // block. For checking that the fast paths compute what the general one does.
     if (const char* f = std::getenv("VGPU_FASTPATH"); f && f[0] == '0') fast_ = false;
+    vgpu::exec::tc86::refresh_exact();   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
     if (tier::requested()) {
       const char* tr = std::getenv("VGPU_SASS_TRACE");
       tier_ = fast_ && simd::enabled() && !(tr && *tr);

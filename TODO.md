@@ -2345,7 +2345,7 @@ and TANH subnormals, `PRMT` modes, `HADD2.F32`/`F2FP`/`F2F` NaNs and `.RELU` of 
 rules, `VABSDIFF` undecoded (silent PTX fallback); PTX `cvt.rmi.ftz`, f64 min/max/add/mul/fma NaNs,
 wmma tf32 (rounded at load, the card truncates). The tensor core's f32 sum is the chunked truncating
 one described in include/vgpu/exec/tc_ampere.hpp (measured, all 106496 results), for sm_86 only;
-cost: a SASS HMMA is about 3.4x slower than the sequential sum (0.047 s to 0.160 s for 96000 mma.sync/
+`VGPU_TC_EXACT=0` returns both engines to the sequential sum (r9-correct2; docs/cli.md); cost: a SASS HMMA is about 3.4x slower than the sequential sum (0.047 s to 0.160 s for 96000 mma.sync/
 wmma in tools measured as A/B alternation below), the PTX engine 1.15x. Launch refusals report the
 card's 13.0 codes (cudaErrorInvalidValue, 701, 912). Still different from the card: the SFU
 approximations (rcp/sqrt/rsqrt/ex2 within 1 ulp, lg2/sin/cos/tanh more), the sign and NaN payload of a

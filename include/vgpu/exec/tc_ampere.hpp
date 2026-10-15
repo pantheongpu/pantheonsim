@@ -29,10 +29,12 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 #include "vgpu/simd/fp16.hpp"
 #include "vgpu/simd/simd.hpp"
@@ -44,8 +46,24 @@
 
 namespace vgpu::exec::tc86 {
 
-// Whether a device of this compute capability sums as an RTX 3060 does (only the part that was measured).
-inline constexpr bool applies(int cc_major, int cc_minor) { return cc_major == 8 && cc_minor == 6; }
+// VGPU_TC_EXACT=0 turns this model off: the tensor sums are then the sequential f32 ones of the earlier releases, bit for bit, on
+// every device. Read from the environment when the process starts and again at each launch (as VGPU_FASTPATH is), so a test can
+// set it between launches. (Function-local statics of inline functions: no external-linkage global of the shared code.)
+inline std::atomic<bool>& exact_flag() {
+  static std::atomic<bool> f{[] {
+    const char* v = std::getenv("VGPU_TC_EXACT");
+    return !(v && v[0] == '0');
+  }()};
+  return f;
+}
+inline void refresh_exact() {
+  const char* v = std::getenv("VGPU_TC_EXACT");
+  exact_flag().store(!(v && v[0] == '0'), std::memory_order_relaxed);
+}
+inline bool exact_enabled() { return exact_flag().load(std::memory_order_relaxed); }
+
+// Whether a device of this compute capability sums as an RTX 3060 does (only the part that was measured), and the switch is on.
+inline bool applies(int cc_major, int cc_minor) { return cc_major == 8 && cc_minor == 6 && exact_enabled(); }
 
 // The format of the multiplicands: the smallest normal exponent, for the frame positions.
 inline constexpr int kEminF16 = -14;

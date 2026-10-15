@@ -212,6 +212,16 @@ accumulators, and implemented for sm_86 profiles and cubins in `include/vgpu/exe
 against each other and against the card: `test_tc_ampere`, `simd_lane_forms`, `float_half_forms`). Other architectures keep the
 sequential f32 sum (not measured); so do the sparse and `m8n8k4` forms.
 
+`VGPU_TC_EXACT=0` switches the model off, on both engines: the f16, bf16 and tf32 sums of sm_86 are then the sequential f32 ones the
+simulator used before (bit for bit, `simd_lane_forms.{sass,ptx}.tcseq.txt` pin them; the only other difference from the earlier release is
+that PTX `wmma` truncates a tf32 operand as it is read, which is a separate fix and not switched). It is read at each launch, in the
+interpreter's `refresh_modes` and in the SASS executor's constructor, through `tc86::applies` (PTX) and `tc86::exact_enabled`
+(`HMMA`, the kernel's sm_86 bit and the general form). The pre-decoded tier has no `HMMA` handler, so the interpreter, which the tier
+leaves it to, is the only place the switch is read. Measured against a fresh r8-a build (`tools/bench/bench.sh --ab`, 9 runs, SASS and PTX): with the switch off the
+`wmma` and `mma_ptx` workloads run at 0.99x to 1.01x of r8-a (verdict "same", counters identical); with the model on, `wmma` runs at 0.28x
+(SASS) and 0.23x (PTX), `mma_ptx` at 0.28x (SASS) and 1.36x (PTX: its AVX2 form beats the sequential loop). Instruction counters are the
+same in both modes (`bench.sh --check-counters` passes with the switch at 0 and at 1).
+
 What stays different from the card: the SFU. `MUFU.RCP/RSQ/SQRT/EX2/LG2/SIN/COS/TANH` are not correctly rounded on the card (rcp,
 sqrt, rsqrt and ex2 are within 1 ulp of the correctly rounded result, lg2 near 1 has an absolute error, sin and cos and tanh differ
 more, `sin` of a tiny or huge argument is 0), and the simulator computes the correctly rounded function; the special values (zero,

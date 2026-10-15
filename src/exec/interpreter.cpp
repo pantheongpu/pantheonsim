@@ -663,6 +663,7 @@ void refresh_modes() {
   g_race_strict.store(race && race[0] == '2', std::memory_order_relaxed);
   const char* fast = std::getenv("VGPU_FASTPATH");
   g_fast_path.store(!(fast && fast[0] == '0'), std::memory_order_relaxed);
+  vgpu::exec::tc86::refresh_exact();   // VGPU_TC_EXACT=0: the earlier sequential tensor sums (include/vgpu/exec/tc_ampere.hpp)
 }
 
 // IEEE 754 binary16 <-> double, implemented in software so the engine needs no

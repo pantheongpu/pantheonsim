@@ -13,7 +13,14 @@
 #                                                           from the card on the random lines). So the pinned files ARE the card's
 #                                                           lines, and this script requires it.
 #
-#   run_simd_lane_forms.sh                  simulator vs the pinned files
+#   nvidia/tests/data/simd_lane_forms.sass.tcseq.txt, .ptx.tcseq.txt   what VGPU_TC_EXACT=0 prints (the tensor cores' earlier sequential f32
+#                                                           sum, on sm_86 too): the sass file is r8-a's pinned file byte for byte; the ptx
+#                                                           file is r8-a's with its two wmma tf32 lines replaced (random, edges), because
+#                                                           the PTX engine no longer rounds a tf32 operand when wmma.load reads it -- it
+#                                                           truncates, as the SASS executor and the card do -- a fix that is not part of
+#                                                           the sum model and is not switched. Every other line is the same in both modes.
+#
+#   run_simd_lane_forms.sh                  simulator vs the pinned files, with the tensor-core model on (the default) and off
 #   run_simd_lane_forms.sh --card [--update]   NVIDIA's runtime on a real GPU vs the card file (or rewrite it)
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -56,6 +63,24 @@ for engine in sass ptx; do
       echo "FAIL $engine VGPU_SIMD=$level: differs from the pinned hashes"; head -10 "$out/d.txt"; fails=1
     fi
   done
+done
+# VGPU_TC_EXACT=0: the earlier sequential sums, every engine and level; and a mutation guard: the two modes must differ on exactly the
+# tensor-core lines (a switch an engine ignores would print the card's lines here).
+for engine in sass ptx; do
+  for level in default base off; do
+    case "$level" in default) lv=();; *) lv=(VGPU_SIMD="$level");; esac
+    env "${lv[@]}" VGPU_TC_EXACT=0 VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 VGPU_SASS=$([[ $engine == sass ]] && echo 1 || echo 0) \
+        LD_LIBRARY_PATH="$shim" "$out/app" > "$out/sim.txt" 2>&1 || true
+    if diff "$data/simd_lane_forms.$engine.tcseq.txt" "$out/sim.txt" > "$out/d.txt"; then
+      echo "ok   $engine VGPU_SIMD=$level VGPU_TC_EXACT=0"
+    else
+      echo "FAIL $engine VGPU_SIMD=$level VGPU_TC_EXACT=0: differs from the sequential-sum pins"; head -10 "$out/d.txt"; fails=1
+    fi
+  done
+  # (the lines that differ between the two modes are the wmma and mma tensor lines, and only those)
+  if diff "$data/simd_lane_forms.$engine.tcseq.txt" "$data/simd_lane_forms.$engine.txt" | grep '^[<>]' | grep -v -e 'wmma_' -e 'mma_' > "$out/d.txt"; then
+    echo "FAIL: the modes differ on lines that are not tensor-core sums (sass/ptx $engine):"; head -5 "$out/d.txt"; fails=1
+  fi
 done
 # The pinned files are the card's lines: SASS == PTX == card.
 for engine in sass ptx; do

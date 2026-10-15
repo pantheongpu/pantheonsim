@@ -724,6 +724,84 @@ VTEST(wmma_accumulator_is_added) {
     VCHECK_EQ(as_f32(e.mem.load_scalar(out + l * 4, 4)), 106.0f);
 }
 
+// VGPU_TC_EXACT=0 returns the tensor cores' sums to the earlier sequential f32 one, and changes nothing else: the f16 wmma of random
+// operands with spread exponents (so that the chunked, truncating sum of an sm_86 tensor core and the sequential one differ) prints
+// different words on the sm_86 profiles in the two modes, and the same words on every other profile; and an f32 loop is the same in both.
+VTEST(tc_exact_switch_changes_only_sm86_tensor_sums) {
+  const std::string ptx = std::string(kHeader) + R"(
+.visible .entry mma(.param .u64 out)
+{
+    .reg .f32 %f<40>;
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r5, %laneid;
+    mad.lo.u32 %r6, %r5, 0x9E3779B1, 12345;
+    mad.lo.u32 %r7, %r6, 0x85EBCA6B, 777;
+    xor.b32 %r8, %r7, %r6;
+    shr.u32 %r9, %r8, 3;
+    and.b32 %r10, %r8, 0x83FF83FF;
+    and.b32 %r11, %r9, 0x1C001C00;
+    or.b32 %r10, %r10, %r11;
+    or.b32 %r1, %r10, 0x20002000;          // A: random signs and mantissas, exponents 8 to 15
+    mad.lo.u32 %r12, %r7, 0xC2B2AE35, 99;
+    shr.u32 %r13, %r12, 5;
+    and.b32 %r14, %r12, 0x83FF83FF;
+    and.b32 %r15, %r13, 0x1C001C00;
+    or.b32 %r14, %r14, %r15;
+    or.b32 %r2, %r14, 0x20002000;          // B
+    mov.f32 %f3, 0f3F800000;               // C = 1.0
+    wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32
+        {%f10, %f11, %f12, %f13, %f14, %f15, %f16, %f17},
+        {%r1, %r2, %r1, %r2, %r1, %r2, %r1, %r2},
+        {%r2, %r1, %r2, %r1, %r2, %r1, %r2, %r1},
+        {%f3, %f3, %f3, %f3, %f3, %f3, %f3, %f3};
+    // A plain f32 sum in the same kernel, which the switch must not touch.
+    cvt.rn.f32.u32 %f20, %r8;
+    cvt.rn.f32.u32 %f21, %r12;
+    fma.rn.f32 %f22, %f20, %f21, %f10;
+    add.f32 %f23, %f22, %f20;
+    mul.wide.u32 %rd3, %r5, 36;
+    add.s64 %rd4, %rd2, %rd3;
+    st.global.f32 [%rd4], %f10;
+    st.global.f32 [%rd4+4], %f11;
+    st.global.f32 [%rd4+8], %f12;
+    st.global.f32 [%rd4+12], %f13;
+    st.global.f32 [%rd4+16], %f14;
+    st.global.f32 [%rd4+20], %f15;
+    st.global.f32 [%rd4+24], %f16;
+    st.global.f32 [%rd4+28], %f17;
+    st.global.f32 [%rd4+32], %f23;
+    ret;
+}
+)";
+  const auto m = ptx::parse(ptx);
+  const auto run = [&](const char* gpu, bool exact, bool plain_only) {
+    if (exact) unsetenv("VGPU_TC_EXACT"); else setenv("VGPU_TC_EXACT", "0", 1);
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu(gpu);
+    const uint64_t out = mem.alloc(32 * 36);
+    LaunchConfig cfg;
+    cfg.block = {32, 1, 1};
+    exec::launch(m.entries[0], cfg, {arg_u64(out)}, mem, prof);
+    std::vector<uint32_t> words;
+    for (uint32_t l = 0; l < 32; ++l)
+      for (uint32_t k = plain_only ? 8 : 0; k < (plain_only ? 9u : 8u); ++k) words.push_back(static_cast<uint32_t>(mem.load_scalar(out + l * 36 + k * 4, 4)));
+    unsetenv("VGPU_TC_EXACT");
+    return words;
+  };
+  for (const char* gpu : {"nvidia/rtx3060", "nvidia/a10", "nvidia/a100", "nvidia/l4", "nvidia/h100", "nvidia/t4"}) {
+    const bool sm86 = std::string(gpu) == "nvidia/rtx3060" || std::string(gpu) == "nvidia/a10";
+    const auto on = run(gpu, true, false), off = run(gpu, false, false);
+    if (sm86) VCHECK(on != off);   // the model is on by default, and the switch really turns it off
+    else VCHECK(on == off);        // other profiles never used the model
+    VCHECK(run(gpu, true, true) == run(gpu, false, true));   // and no other arithmetic moves
+  }
+  // Off, an sm_86 profile prints what a profile without the model does: the sequential sum (sm_80's words).
+  VCHECK(run("nvidia/rtx3060", false, false) == run("nvidia/a100", true, false));
+}
+
 // Blocks run on several host threads by default, so an atomic that is only
 // atomic within a block silently loses updates. This is the test that says so:
 // 256 blocks of 64 threads each add one to the same counter.
