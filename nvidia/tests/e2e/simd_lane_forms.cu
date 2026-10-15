@@ -216,32 +216,25 @@ int main() {
       uint32_t* pd;
       CK(cudaMalloc(&pd, tiles * 256 * 4));
       std::vector<uint32_t> d(tiles * 256);
-      // f32out: the result is f32 words, and a second line hashes them with every NaN replaced by the canonical one.
-      // Which NaN comes out of an add or multiply of two NaNs is the host instruction's choice, and the compiler
-      // chooses the order of the operands of the simulator's own vector adds, so the raw line can differ between a
-      // sanitizer build and an optimised one while every other element is the same (run_simd_lane_forms.sh).
-      const auto show = [&](const char* name, size_t n, bool f32out) {
+      // (The PTX engine's f32-accumulator tile writes a NaN as the canonical 0x7fffffff, as the SASS executor and the
+      // card do, so the raw hash does not depend on which NaN the host's vector adds happen to hand on.)
+      const auto show = [&](const char* name, size_t n) {
         cudaDeviceSynchronize();
         cudaMemcpy(d.data(), pd, n * 4, cudaMemcpyDeviceToHost);
         std::printf("%-22s %s %016llx\n", name, sn, (unsigned long long)fnv(d.data(), n * 4));
-        if (f32out) {
-          for (size_t i = 0; i < n; ++i)
-            if ((d[i] & 0x7fffffffu) > 0x7f800000u) d[i] = 0x7fffffffu;
-          std::printf("%-22s %s %016llx\n", (std::string(name) + "_nonan").c_str(), sn, (unsigned long long)fnv(d.data(), n * 4));
-        }
       };
       k_wmma<__half, float><<<tiles, 32>>>((const __half*)pa, (const __half*)pb, (const float*)pfc, (float*)pd);
       CK(cudaGetLastError());
-      show("wmma_f16_f32acc", tiles * 256, true);
+      show("wmma_f16_f32acc", tiles * 256);
       k_wmma<__half, __half><<<tiles, 32>>>((const __half*)pa, (const __half*)pb, (const __half*)pc, (__half*)pd);
       CK(cudaGetLastError());
-      show("wmma_f16_f16acc", tiles * 128, false);
+      show("wmma_f16_f16acc", tiles * 128);
       k_wmma<__nv_bfloat16, float><<<tiles, 32>>>((const __nv_bfloat16*)pba, (const __nv_bfloat16*)pbb, (const float*)pfc, (float*)pd);
       CK(cudaGetLastError());
-      show("wmma_bf16_f32acc", tiles * 256, true);
+      show("wmma_bf16_f32acc", tiles * 256);
       k_wmma_tf32<<<tiles, 32>>>((const float*)pfc, (const float*)(pfc + 1024), (const float*)(pfc + 2048), (float*)pd);
       CK(cudaGetLastError());
-      show("wmma_tf32_f32acc", tiles * 256, true);
+      show("wmma_tf32_f32acc", tiles * 256);
     }
   }
   return fails;

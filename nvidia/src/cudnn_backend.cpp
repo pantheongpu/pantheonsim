@@ -303,24 +303,32 @@ std::vector<int64_t> element_offsets(const GTensor& t, const std::vector<double>
   std::vector<int64_t> o(L.count());
   const int64_t end = offs && offs->size() > static_cast<size_t>(L.dims[0])
                           ? static_cast<int64_t>((*offs)[static_cast<size_t>(L.dims[0])]) * t.ragged_mult : -1;
-  int64_t at[vc::kMaxRank] = {};
-  for (size_t i = 0; i < o.size(); ++i) {
-    int64_t off = 0;
-    for (int d = 0; d < L.rank; ++d) {
-      int64_t idx = at[d];
-      if (d == t.vdim) {
-        off += (idx / t.vcount) * t.mem_strides[d] * t.vcount + idx % t.vcount;
-        continue;
-      }
-      if (d == 0 && offs) { off += static_cast<int64_t>((*offs)[static_cast<size_t>(idx)]) * t.ragged_mult; continue; }
-      off += idx * t.mem_strides[d] * (t.vdim >= 0 ? t.vcount : 1);
-    }
-    o[i] = end >= 0 && off >= end ? -1 : off;
+  // In pieces over the host's threads: each starts from its first element's multi-index and walks with counters.
+  vgpu::hostpar::for_range(o.size(), static_cast<uint64_t>(L.rank) * 4 + 4, [&](size_t pb, size_t pe) {
+    int64_t at[vc::kMaxRank] = {};
+    size_t rest = pb;
     for (int d = L.rank; d-- > 0;) {
-      if (++at[d] < L.dims[d]) break;
-      at[d] = 0;
+      at[d] = static_cast<int64_t>(rest % static_cast<size_t>(L.dims[d]));
+      rest /= static_cast<size_t>(L.dims[d]);
     }
-  }
+    for (size_t i = pb; i < pe; ++i) {
+      int64_t off = 0;
+      for (int d = 0; d < L.rank; ++d) {
+        int64_t idx = at[d];
+        if (d == t.vdim) {
+          off += (idx / t.vcount) * t.mem_strides[d] * t.vcount + idx % t.vcount;
+          continue;
+        }
+        if (d == 0 && offs) { off += static_cast<int64_t>((*offs)[static_cast<size_t>(idx)]) * t.ragged_mult; continue; }
+        off += idx * t.mem_strides[d] * (t.vdim >= 0 ? t.vcount : 1);
+      }
+      o[i] = end >= 0 && off >= end ? -1 : off;
+      for (int d = L.rank; d-- > 0;) {
+        if (++at[d] < L.dims[d]) break;
+        at[d] = 0;
+      }
+    }
+  });
   if (t.int8x32_reordered && !o.empty()) {
     // The plain byte at o[i] sits where the reordering moved it (K rows of L bytes, K padded to 8 rows).
     const int64_t K = L.dims[0], cols = static_cast<int64_t>(o.size()) / K;
@@ -1755,16 +1763,45 @@ double pointwise(const Op& op, double x, double b, double t, int64_t index) {
 std::vector<size_t> broadcast_index(const vc::Layout& a0, const vc::Layout& c) {
   const vc::Layout a = at_rank(a0, c.rank);
   std::vector<size_t> idx(c.count());
-  int64_t at[vc::kMaxRank] = {};
-  for (size_t i = 0; i < idx.size(); ++i) {
-    size_t j = 0;
-    for (int d = 0; d < c.rank; ++d) j = j * a.dims[d] + at[d] / (c.dims[d] / a.dims[d]);
-    idx[i] = j;
+  if (a.same_dims(c)) {   // nothing to broadcast: element i is element i
+    vgpu::hostpar::for_range(idx.size(), 1, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) idx[i] = i; });
+    return idx;
+  }
+  // a's logical stride in each dimension, and how many consecutive c elements share one of a's entries along it.
+  size_t sa[vc::kMaxRank] = {};
+  int64_t grp[vc::kMaxRank] = {};
+  {
+    size_t s = 1;
     for (int d = c.rank; d-- > 0;) {
-      if (++at[d] < c.dims[d]) break;
-      at[d] = 0;
+      sa[d] = s;
+      s *= static_cast<size_t>(a.dims[d]);
+      grp[d] = c.dims[d] / a.dims[d];
     }
   }
+  // In pieces over the host's threads; each starts from its first element's multi-index and then walks with counters
+  // (no division per element): j = sum over d of (at[d] / grp[d]) * sa[d].
+  vgpu::hostpar::for_range(idx.size(), static_cast<uint64_t>(c.rank) + 2, [&](size_t b, size_t e) {
+    int64_t at[vc::kMaxRank] = {}, rem[vc::kMaxRank] = {};
+    size_t rest = b, j = 0;
+    for (int d = c.rank; d-- > 0;) {
+      at[d] = static_cast<int64_t>(rest % static_cast<size_t>(c.dims[d]));
+      rest /= static_cast<size_t>(c.dims[d]);
+      rem[d] = at[d] % grp[d];
+      j += static_cast<size_t>(at[d] / grp[d]) * sa[d];
+    }
+    for (size_t i = b; i < e; ++i) {
+      idx[i] = j;
+      for (int d = c.rank; d-- > 0;) {
+        if (++at[d] < c.dims[d]) {
+          if (++rem[d] == grp[d]) rem[d] = 0, j += sa[d];
+          break;
+        }
+        // d wraps to 0: its entry of a goes back to the first
+        j -= static_cast<size_t>((at[d] - 1) / grp[d]) * sa[d];
+        at[d] = 0, rem[d] = 0;
+      }
+    }
+  });
   return idx;
 }
 
@@ -1798,6 +1835,25 @@ void run_matmul(const Op& op, const std::vector<const std::vector<double>*>& in,
   };
   const std::vector<int64_t> Mq = per_batch(kMOverride, M), Nq = per_batch(kNOverride, N), Kq = per_batch(kKOverride, K);
   c->assign(batches * M * N, op.pad_value);
+  // Many products too small to thread inside: the batches (independent) go to the host's threads, one product each.
+  if (op.acc != vc::Accum::Half && batches > 1 && static_cast<uint64_t>(M) * N * K < (1u << 24)) {
+    double* const cdata = c->data();
+    const double* const adata = a.data();
+    const double* const bdata = b.data();
+    const unsigned nt = vgpu::hostpar::plan(static_cast<uint64_t>(batches) * static_cast<uint64_t>(M) * N * static_cast<uint64_t>(K > 0 ? K : 1),
+                                            static_cast<int64_t>(batches), 1u << 22);
+    vgpu::hostpar::parallel_for(nt, static_cast<int64_t>(batches), [&](int64_t qi) {
+      const size_t q = static_cast<size_t>(qi);
+      const double* pa = adata + ai[q] * M * K;
+      const double* pb = bdata + bi[q] * K * N;
+      double* pc = cdata + q * M * N;
+      if (Mq[q] > 0 && Nq[q] > 0)
+        vgpu::hostgemm::gemm<double, double>(true, true, Mq[q], Nq[q], Kq[q], pa, K, pb, N,
+                                             [=](int64_t i, int64_t j, double acc) { pc[i * N + j] = acc; },
+                                             vgpu::hostgemm::Isa::Auto, /*threads=*/1);
+    });
+    return;
+  }
   for (size_t q = 0; q < batches; ++q) {
     const double* pa = a.data() + ai[q] * M * K;
     const double* pb = b.data() + bi[q] * K * N;
@@ -2715,16 +2771,24 @@ void run_bandmask(const Op& op, const std::vector<const std::vector<double>*>& i
   const Bcast fill = bcast_of(op, in, kFill, X, 0.0), sq = bcast_of(op, in, kSeqQ, X, 0.0), skv = bcast_of(op, in, kSeqKV, X, 0.0);
   const Bcast bound = bcast_of(op, in, left_mode ? kLeft : kShift, X, 0.0);
   y->assign(x.size(), 0.0);
-  int64_t at[vc::kMaxRank] = {};
-  for (size_t i = 0; i < x.size(); ++i) {
-    const double row = static_cast<double>(at[X.rank - 2]), col = static_cast<double>(at[X.rank - 1]);
-    const bool keep = in_band(left_mode, op.cmp, row, col, bound[i], sq[i], skv[i], op.role[kSeqQ] >= 0, op.role[kSeqKV] >= 0);
-    (*y)[i] = keep ? x[i] : fill[i];
+  // Elements are independent: pieces of them go to the host's threads (the row and column come from the multi-index).
+  vgpu::hostpar::for_range(x.size(), 20, [&](size_t pb, size_t pe) {
+    int64_t at[vc::kMaxRank] = {};
+    size_t rest = pb;
     for (int d = X.rank; d-- > 0;) {
-      if (++at[d] < X.dims[d]) break;
-      at[d] = 0;
+      at[d] = static_cast<int64_t>(rest % static_cast<size_t>(X.dims[d]));
+      rest /= static_cast<size_t>(X.dims[d]);
     }
-  }
+    for (size_t i = pb; i < pe; ++i) {
+      const double row = static_cast<double>(at[X.rank - 2]), col = static_cast<double>(at[X.rank - 1]);
+      const bool keep = in_band(left_mode, op.cmp, row, col, bound[i], sq[i], skv[i], op.role[kSeqQ] >= 0, op.role[kSeqKV] >= 0);
+      (*y)[i] = keep ? x[i] : fill[i];
+      for (int d = X.rank; d-- > 0;) {
+        if (++at[d] < X.dims[d]) break;
+        at[d] = 0;
+      }
+    }
+  });
 }
 
 // A value as a TF32 operand: float, the low 13 mantissa bits rounded away to
@@ -2824,7 +2888,17 @@ struct Runner {
   // (and read back, rounded to its type, if a later operation reads it).
   cudnnStatus_t store(const GTensor& o, std::vector<double> r, double alpha, double beta) {
     if (o.is_virtual) {
-      for (double& v : r) v = vc::round_to(o.l.type, alpha * v);
+      // v = round_to(type, alpha * v): the type chosen once for the usual floating types, the rest element by element; the
+      // elements spread over the host's threads.
+      double* d = r.data();
+      const cudnnDataType_t ty = o.l.type;
+      vgpu::hostpar::for_range(r.size(), 6, [&](size_t b, size_t e) {
+        switch (ty) {
+          case CUDNN_DATA_FLOAT: for (size_t i = b; i < e; ++i) d[i] = static_cast<double>(static_cast<float>(alpha * d[i])); break;
+          case CUDNN_DATA_DOUBLE: for (size_t i = b; i < e; ++i) d[i] = alpha * d[i]; break;
+          default: for (size_t i = b; i < e; ++i) d[i] = vc::round_to(ty, alpha * d[i]); break;
+        }
+      });
       values[o.uid] = std::move(r);
       return CUDNN_STATUS_SUCCESS;
     }
@@ -3307,18 +3381,27 @@ cudnnStatus_t Runner::run_op(const Op& op) {
       std::vector<std::vector<size_t>> bi;
       for (const GTensor& t : op.in) bi.push_back(broadcast_index(t.l, Y));
       const bool backward = arity(op.pw) == Arity::Backward;
-      int64_t at[vc::kMaxRank] = {};
-      for (size_t i = 0; i < r.size(); ++i) {
-        // Backward modes: in = {dy, x}; the others: {x, b, t}.
-        const double x = backward ? (*in[1])[bi[1][i]] : op.alpha * (*in[0])[bi[0][i]];
-        const double b = backward ? (*in[0])[bi[0][i]] : in.size() > 1 ? op.alpha2 * (*in[1])[bi[1][i]] : 0.0;
-        const double t = in.size() > 2 ? (*in[2])[bi[2][i]] : 0.0;
-        r[i] = pointwise(op, x, b, t, op.axis >= 0 && op.axis < Y.rank ? at[op.axis] : 0);
+      // The elements are independent: pieces of them go to the host's threads, each starting from its first element's
+      // multi-index (the position along op.axis is what some modes read).
+      vgpu::hostpar::for_range(r.size(), 40, [&](size_t pb, size_t pe) {
+        int64_t at[vc::kMaxRank] = {};
+        size_t rest = pb;
         for (int d = Y.rank; d-- > 0;) {
-          if (++at[d] < Y.dims[d]) break;
-          at[d] = 0;
+          at[d] = static_cast<int64_t>(rest % static_cast<size_t>(Y.dims[d]));
+          rest /= static_cast<size_t>(Y.dims[d]);
         }
-      }
+        for (size_t i = pb; i < pe; ++i) {
+          // Backward modes: in = {dy, x}; the others: {x, b, t}.
+          const double x = backward ? (*in[1])[bi[1][i]] : op.alpha * (*in[0])[bi[0][i]];
+          const double b = backward ? (*in[0])[bi[0][i]] : in.size() > 1 ? op.alpha2 * (*in[1])[bi[1][i]] : 0.0;
+          const double t = in.size() > 2 ? (*in[2])[bi[2][i]] : 0.0;
+          r[i] = pointwise(op, x, b, t, op.axis >= 0 && op.axis < Y.rank ? at[op.axis] : 0);
+          for (int d = Y.rank; d-- > 0;) {
+            if (++at[d] < Y.dims[d]) break;
+            at[d] = 0;
+          }
+        }
+      });
       break;
     }
   }

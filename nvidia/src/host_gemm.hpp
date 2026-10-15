@@ -41,6 +41,12 @@ namespace vgpu::hostgemm {
 
 enum class Isa { Auto, Generic, Avx2 };
 
+// One complex element as the complex kernels read it (a plain struct, so that nothing of std::complex is instantiated under
+// the AVX2 target pragma below).
+struct CPair {
+  double re, im;
+};
+
 #if defined(__x86_64__) && defined(__GNUC__)
 #define VGPU_HOSTGEMM_AVX2 1
 #endif
@@ -80,12 +86,13 @@ inline bool avx2_available() {
 // and payload of a NaN that is the result of two NaNs meeting were never fixed, here or in the loops this replaces; every
 // other bit of every result is, and a result is NaN exactly when it was.
 template <class T, class LA, class LB>
-inline T chain_one(bool ta, bool tb, int64_t i, int64_t j, int64_t k, const LA& A, int64_t lda, const LB& B, int64_t ldb) {
-  T acc = T(0);
+inline T chain_one(bool ta, bool tb, int64_t i, int64_t j, int64_t k, const LA& A, int64_t lda, const LB& B, int64_t ldb,
+                   T init = T(0), bool neg = false) {
+  T acc = init;
   for (int64_t p = 0; p < k; ++p) {
     T a = static_cast<T>(ta ? A(p + i * lda, i, p) : A(i + p * lda, i, p));
     T b = static_cast<T>(tb ? B(j + p * ldb, j, p) : B(p + j * ldb, j, p));
-    acc += a * b;
+    acc += (neg ? -a : a) * b;
   }
   return acc;
 }
@@ -102,9 +109,18 @@ struct PtrLoader {
 // int8 operands). A and B are loaders (see the top of this file): A(idx, i, p)
 // is op(A)(i, p) stored at idx, B(idx, j, p) is op(B)(p, j). Epi must be safe to
 // call concurrently on distinct (i, j).
+//
+// cin (leading dimension ldcin) makes every chain start from C's value instead of zero, and neg_a negates A: with both,
+// the chains are  ((c - a0*b0) - a1*b1) - ...  as a blocked factorization's update takes them (c + (-a)*b is c - a*b to the
+// bit, and -(a*b) is (-a)*b). epi still receives the result.
+//
+// tri selects the outputs wanted: 0 all of them, 1 those with i >= j, 2 those with i <= j. A block of outputs that
+// lies wholly outside is not computed and epi is not called for it; one that straddles the diagonal is computed whole
+// and epi is called for all of it, so a caller that wants a triangle has to leave the rest alone.
 template <class T, class LA, class LB, class Epi>
 void gemm_with(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const LA& A, int64_t lda, const LB& B, int64_t ldb,
-               Epi&& epi, Isa isa = Isa::Auto, unsigned threads = 0) {
+               Epi&& epi, Isa isa = Isa::Auto, unsigned threads = 0, int tri = 0, const T* cin = nullptr,
+               int64_t ldcin = 0, bool neg_a = false) {
   if (m <= 0 || n <= 0) return;
 #ifdef VGPU_HOSTGEMM_AVX2
   const bool wide = isa == Isa::Avx2 || (isa == Isa::Auto && avx2_available());
@@ -114,7 +130,8 @@ void gemm_with(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const LA& A, i
   const uint64_t madds = static_cast<uint64_t>(m) * static_cast<uint64_t>(n) * static_cast<uint64_t>(k);
   if (madds < 4096 || k == 0) {   // too small to be worth blocking: the chains, one at a time
     for (int64_t j = 0; j < n; ++j)
-      for (int64_t i = 0; i < m; ++i) epi(i, j, chain_one<T>(ta, tb, i, j, k, A, lda, B, ldb));
+      for (int64_t i = 0; i < m; ++i)
+        epi(i, j, chain_one<T>(ta, tb, i, j, k, A, lda, B, ldb, cin ? cin[i + j * ldcin] : T(0), neg_a));
     return;
   }
 
@@ -152,12 +169,14 @@ void gemm_with(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const LA& A, i
     T* const bp = ap + mcp_max * kcmax;
     const int64_t ic = (it % mb) * mcb, jc = (it / mb) * ncb;
     const int64_t mc = std::min(mcb, m - ic), nc = std::min(ncb, n - jc);
+    if (tri == 1 && ic + mc - 1 < jc) return;   // every output of the block is above the diagonal
+    if (tri == 2 && ic > jc + nc - 1) return;   // ... below it
     if (wide) {
 #ifdef VGPU_HOSTGEMM_AVX2
-      W::block(ta, tb, m, n, k, A, lda, B, ldb, ic, mc, jc, nc, acc, ap, bp);
+      W::block(ta, tb, m, n, k, A, lda, B, ldb, ic, mc, jc, nc, acc, ap, bp, cin, ldcin, neg_a);
 #endif
     } else {
-      G::block(ta, tb, m, n, k, A, lda, B, ldb, ic, mc, jc, nc, acc, ap, bp);
+      G::block(ta, tb, m, n, k, A, lda, B, ldb, ic, mc, jc, nc, acc, ap, bp, cin, ldcin, neg_a);
     }
     const int64_t mcp = (mc + MR - 1) / MR * MR;
     for (int64_t j = 0; j < nc; ++j)
@@ -168,8 +187,73 @@ void gemm_with(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const LA& A, i
 // The same over plain arrays of S.
 template <class T, class S, class Epi>
 void gemm(bool ta, bool tb, int64_t m, int64_t n, int64_t k, const S* A, int64_t lda, const S* B, int64_t ldb, Epi&& epi,
-          Isa isa = Isa::Auto, unsigned threads = 0) {
-  gemm_with<T>(ta, tb, m, n, k, PtrLoader<T, S>{A}, lda, PtrLoader<T, S>{B}, ldb, static_cast<Epi&&>(epi), isa, threads);
+          Isa isa = Isa::Auto, unsigned threads = 0, int tri = 0, const T* cin = nullptr, int64_t ldcin = 0,
+          bool neg_a = false) {
+  gemm_with<T>(ta, tb, m, n, k, PtrLoader<T, S>{A}, lda, PtrLoader<T, S>{B}, ldb, static_cast<Epi&&>(epi), isa, threads, tri,
+               cin, ldcin, neg_a);
+}
+
+// The complex counterpart (see COps in host_gemm_impl.inc): for the m x n outputs, in double,
+//
+//     s(i, j) = chain over p of ( xr*yr - xi*yi , xr*yi + xi*yr ),   X(i, p) = (xr, xi), Y(p, j) = (yr, yi)
+//
+// X(i, p) is ldx(i, p) and Y(p, j) is ldy(j, p), each a CPair, read a panel at a time as the loaders of gemm_with are (a
+// loader sees every element the products read, possibly more than once, from any thread). epi(i, j, re, im) gets the sums,
+// concurrently on distinct (i, j). tri as in gemm_with().
+template <class LX, class LY, class Epi>
+void cgemm_with(int64_t m, int64_t n, int64_t k, const LX& ldx, const LY& ldy, Epi&& epi, int tri = 0, Isa isa = Isa::Auto,
+                unsigned threads = 0) {
+  if (m <= 0 || n <= 0) return;
+#ifdef VGPU_HOSTGEMM_AVX2
+  const bool wide = isa == Isa::Avx2 || (isa == Isa::Auto && avx2_available());
+#else
+  const bool wide = false;
+#endif
+  using G = generic::COps;
+#ifdef VGPU_HOSTGEMM_AVX2
+  using W = avx2::COps;
+#else
+  using W = G;
+#endif
+  const int MR = wide ? W::MR : G::MR, NR = wide ? W::NR : G::NR;
+  const uint64_t madds = static_cast<uint64_t>(m) * static_cast<uint64_t>(n) * static_cast<uint64_t>(k);
+  const unsigned want = threads ? threads : vgpu::hostpar::plan(madds, std::numeric_limits<int64_t>::max(), 1u << 22);
+  int64_t mcb = wide ? W::MC : G::MC, ncb = wide ? W::NC : G::NC;
+  auto nblocks = [&] { return ((m + mcb - 1) / mcb) * ((n + ncb - 1) / ncb); };
+  while (want > 1 && nblocks() < static_cast<int64_t>(2 * want)) {
+    if (mcb >= ncb && mcb / 2 >= 2 * MR) mcb = (mcb / 2 + MR - 1) / MR * MR;
+    else if (ncb / 2 >= 2 * NR) ncb = (ncb / 2 + NR - 1) / NR * NR;
+    else if (mcb / 2 >= 2 * MR) mcb = (mcb / 2 + MR - 1) / MR * MR;
+    else break;
+  }
+  const int64_t mb = (m + mcb - 1) / mcb, nb = (n + ncb - 1) / ncb, items = mb * nb;
+  const unsigned nthreads = static_cast<unsigned>(std::min<int64_t>(want, items));
+  const int64_t mcp_max = (mcb + MR - 1) / MR * MR, ncp_max = (ncb + NR - 1) / NR * NR;
+  const int64_t kcmax = std::max<int64_t>(1, std::min<int64_t>(k, wide ? W::KC : G::KC));
+
+  vgpu::hostpar::parallel_for(nthreads, items, [&](int64_t it) {
+    thread_local std::vector<double> scratch;
+    scratch.resize(static_cast<size_t>(2 * mcp_max * ncp_max + 2 * mcp_max * kcmax + 2 * ncp_max * kcmax));
+    double* const accr = scratch.data();
+    double* const acci = accr + mcp_max * ncp_max;
+    double* const ap = acci + mcp_max * ncp_max;
+    double* const bp = ap + 2 * mcp_max * kcmax;
+    const int64_t ic = (it % mb) * mcb, jc = (it / mb) * ncb;
+    const int64_t mc = std::min(mcb, m - ic), nc = std::min(ncb, n - jc);
+    if (tri == 1 && ic + mc - 1 < jc) return;
+    if (tri == 2 && ic > jc + nc - 1) return;
+    if (wide) {
+#ifdef VGPU_HOSTGEMM_AVX2
+      W::block(m, n, k, ldx, ldy, ic, mc, jc, nc, accr, acci, ap, bp);
+#endif
+    } else {
+      G::block(m, n, k, ldx, ldy, ic, mc, jc, nc, accr, acci, ap, bp);
+    }
+    const int64_t mcp = (mc + MR - 1) / MR * MR;
+    for (int64_t j = 0; j < nc; ++j)
+      for (int64_t i = 0; i < mc; ++i)
+        epi(ic + i, jc + j, accr[static_cast<size_t>(i + j * mcp)], acci[static_cast<size_t>(i + j * mcp)]);
+  });
 }
 
 }  // namespace vgpu::hostgemm

@@ -25,6 +25,10 @@
 
 namespace vgpu::sass {
 
+namespace tier {
+struct Program;   // src/sass/tier.hpp: the pre-decoded execution tier of one code section
+}
+
 // Generic-address windows. The same values the PTX interpreter uses, so a
 // pointer means the same thing to either engine.
 inline constexpr uint64_t kSharedWindow = 0x6ffe'0000'0000ull;
@@ -54,11 +58,17 @@ struct Code {
   int sm = 0;
   const std::vector<uint8_t>* bytes = nullptr;   // the section's, in the module's cubin
   const Instr& instr(size_t i) const;
+  // The section's execution tier (VGPU_TIER=1, src/sass/tier.hpp), built the first time it is asked for; null for
+  // a section with no code. Defined in exec.cpp.
+  const tier::Program* tier_program() const;
  private:
   struct Decoded {
     std::once_flag once;
     std::atomic<bool> ready{false};   // set once decoding is done: the fast check before call_once
     std::vector<Instr> instrs;
+    std::once_flag tier_once;
+    std::atomic<const tier::Program*> tier{nullptr};
+    std::shared_ptr<tier::Program> tier_owner;
   };
   std::unique_ptr<Decoded> decoded_ = std::make_unique<Decoded>();
 };

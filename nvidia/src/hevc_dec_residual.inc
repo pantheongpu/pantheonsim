@@ -317,6 +317,12 @@ static void inverse_transform(int32_t* coeff, int log2_tb, bool dst, int bd, int
     std::memset(res, 0, sizeof(int32_t) * static_cast<size_t>(n) * static_cast<size_t>(n));
     return;
   }
+  if (!dst && n >= 8 && vgpu::videosimd::avx2_available() && bd >= 8 && bd <= 12) {
+    // eight columns, then eight rows at a time with the butterflies of the encoder (tests/unit/test_video_simd.cpp compares them with
+    // the sums below): the same integers, since every input is a 16-bit value and the 32-bit sums cannot overflow.
+    vgpu::videosimd::inverse_dct(coeff, res, log2_tb, kTransMatrix, 20 - bd);
+    return;
+  }
   int32_t tmp[32 * 32];
   int32_t col[32];
   // stage 1: columns (vertical), first shift 7
