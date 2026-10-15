@@ -145,6 +145,59 @@ static __global__ void p_table_1d(unsigned* out, unsigned n) {          // the g
   out[pos] = result;
 }
 
+// Round two: the probes above pass, so what is left of the failing kernels is the seed added to the position
+// and the table row picked by threadIdx.y.
+static __global__ void q_seed(unsigned* out, unsigned seed, unsigned n) {          // no table, seed + pos
+  unsigned tid = blockDim.x * blockIdx.x + threadIdx.x, step = blockDim.x * gridDim.x;
+  for (unsigned pos = tid; pos < n; pos += step) {
+    unsigned result = 0, data = seed + pos;
+    for (int bit = 0; bit < RES; bit++, data >>= 1)
+      if (data & 1) result ^= 0x9E3779B9u * (bit + 1);
+    out[threadIdx.y * n + pos] = result;
+  }
+}
+static __global__ void q_row_nostride(unsigned* out, unsigned n) {                 // row = threadIdx.y, no stride, no seed
+  unsigned pos = blockDim.x * blockIdx.x + threadIdx.x;
+  if (pos >= n) return;
+  unsigned result = 0, data = pos;
+  for (int bit = 0; bit < RES; bit++, data >>= 1)
+    if (data & 1) result ^= g_Table[threadIdx.y][bit];
+  out[threadIdx.y * n + pos] = result;
+}
+static __global__ void q_row_stride(unsigned* out, unsigned n) {                   // row = threadIdx.y, stride, no seed
+  unsigned tid = blockDim.x * blockIdx.x + threadIdx.x, step = blockDim.x * gridDim.x;
+  for (unsigned pos = tid; pos < n; pos += step) {
+    unsigned result = 0, data = pos;
+    for (int bit = 0; bit < RES; bit++, data >>= 1)
+      if (data & 1) result ^= g_Table[threadIdx.y][bit];
+    out[threadIdx.y * n + pos] = result;
+  }
+}
+static __global__ void q_row0(unsigned* out, unsigned n) {                         // 2D block, but row 0 always
+  unsigned tid = blockDim.x * blockIdx.x + threadIdx.x, step = blockDim.x * gridDim.x;
+  for (unsigned pos = tid; pos < n; pos += step) {
+    unsigned result = 0, data = pos;
+    for (int bit = 0; bit < RES; bit++, data >>= 1)
+      if (data & 1) result ^= g_Table[0][bit];
+    out[threadIdx.y * n + pos] = result;
+  }
+}
+static __global__ void q_flat(unsigned* out, unsigned n) {                         // the row as an offset into a flat pointer
+  const unsigned* base = &g_Table[0][0];
+  unsigned tid = blockDim.x * blockIdx.x + threadIdx.x, step = blockDim.x * gridDim.x;
+  for (unsigned pos = tid; pos < n; pos += step) {
+    unsigned result = 0, data = pos;
+    for (int bit = 0; bit < RES; bit++, data >>= 1)
+      if (data & 1) result ^= base[threadIdx.y * RES + bit];
+    out[threadIdx.y * n + pos] = result;
+  }
+}
+static __global__ void q_row_load_only(unsigned* out, unsigned n) {                // just the loads: out = table[y][pos % RES]
+  unsigned pos = blockDim.x * blockIdx.x + threadIdx.x;
+  if (pos >= n) return;
+  out[threadIdx.y * n + pos] = g_Table[threadIdx.y][pos % RES];
+}
+
 static unsigned* g_probe_out;
 static unsigned g_probe_got[DIMS * (1u << 14)], g_probe_want[DIMS * (1u << 14)];
 static void probe_report(const char* what, unsigned count) {
@@ -267,6 +320,36 @@ int main() {
       if (data & 1) r ^= table[0][bit];
     return r;
   });
+
+
+  // Round two.
+  auto table_want = [&](unsigned dim, unsigned pos) {
+    unsigned r = 0, data = pos;
+    for (int bit = 0; bit < RES; bit++, data >>= 1)
+      if (data & 1) r ^= table[dim][bit];
+    return r;
+  };
+  cudaMemset(po, 0, total3 * 4);
+  q_seed<<<128, threads>>>(po, 0, n);
+  run("seed + pos (seed 0), no table", total3, [&](unsigned i) { return bits_want(i % n); });
+  cudaMemset(po, 0, total3 * 4);
+  q_seed<<<128, threads>>>(po, 5, n);
+  run("seed + pos (seed 5), no table", total3, [&](unsigned i) { return bits_want(5 + i % n); });
+  cudaMemset(po, 0, total3 * 4);
+  q_row_load_only<<<(n + 127) / 128, threads>>>(po, n);
+  run("table[threadIdx.y][pos % 31], loads only", total3, [&](unsigned i) { return table[i / n][(i % n) % RES]; });
+  cudaMemset(po, 0, total3 * 4);
+  q_row_nostride<<<(n + 127) / 128, threads>>>(po, n);
+  run("row = threadIdx.y, no stride, no seed", total3, [&](unsigned i) { return table_want(i / n, i % n); });
+  cudaMemset(po, 0, total3 * 4);
+  q_row_stride<<<128, threads>>>(po, n);
+  run("row = threadIdx.y, grid-stride, no seed", total3, [&](unsigned i) { return table_want(i / n, i % n); });
+  cudaMemset(po, 0, total3 * 4);
+  q_row0<<<128, threads>>>(po, n);
+  run("2D block, row 0 always, grid-stride", total3, [&](unsigned i) { return table_want(0, i % n); });
+  cudaMemset(po, 0, total3 * 4);
+  q_flat<<<128, threads>>>(po, n);
+  run("row as an offset into a flat pointer", total3, [&](unsigned i) { return table_want(i / n, i % n); });
 
   std::printf("%s\n", failures == 0 ? "PASS" : "FAIL");
   return failures == 0 ? 0 : 1;
