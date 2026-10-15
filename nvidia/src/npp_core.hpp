@@ -344,6 +344,54 @@ inline void extreme_filter(const T* src, int sw, T* dst, int rw, int rh, int ch,
   });
 }
 
+/* ---- box filter of 8-bit data ----
+
+   out(x, y, c) = saturate(floor(S / n)) with S the sum of the mw x mh window of channel c at (x, y) of the source with its halo
+   (`src`, `sw` pixels to a row, `ch` channels to a pixel) and n = mw * mh, the division in double as the loops of
+   npp_imgproc.cpp's neighbourhood() made it. The sum of integers is the same whatever order it is taken in, so it is formed
+   by running sums: along each row of the source, then down the columns. Returns false (nothing done) for a window so large
+   that its sum could overflow 32 bits. */
+inline bool box_filter_u8(const uint8_t* src, int sw, int ch, uint8_t* dst, int rw, int rh, int mw, int mh) {
+  if (static_cast<int64_t>(mw) * mh * 255 >= (int64_t(1) << 31)) return false;
+  const size_t n = static_cast<size_t>(rw) * static_cast<size_t>(ch);
+  const int srows = rh + mh - 1;
+  const double area = static_cast<double>(mw) * mh;
+  std::vector<int32_t> hsum(static_cast<size_t>(srows) * n);
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(srows) * n * 3u, srows);
+  vgpu::hostpar::parallel_for(threads, srows, [&](int64_t r) {
+    const uint8_t* in = src + static_cast<size_t>(r) * sw * ch;
+    int32_t* out = hsum.data() + static_cast<size_t>(r) * n;
+    for (int c = 0; c < ch; ++c) {
+      int32_t run = 0;
+      for (int i = 0; i < mw; ++i) run += in[static_cast<size_t>(i) * ch + c];
+      out[c] = run;
+      for (int x = 1; x < rw; ++x) {
+        run += in[static_cast<size_t>(x + mw - 1) * ch + c] - in[static_cast<size_t>(x - 1) * ch + c];
+        out[static_cast<size_t>(x) * ch + c] = run;
+      }
+    }
+  });
+  // Down the columns: the window of rows y .. y + mh - 1, by a running sum kept per output element.
+  std::vector<int32_t> col(n, 0);
+  for (int j = 0; j < mh; ++j) {
+    const int32_t* h = hsum.data() + static_cast<size_t>(j) * n;
+    for (size_t k = 0; k < n; ++k) col[k] += h[k];
+  }
+  for (int y = 0; y < rh; ++y) {
+    if (y > 0) {
+      const int32_t* add = hsum.data() + static_cast<size_t>(y + mh - 1) * n;
+      const int32_t* sub = hsum.data() + static_cast<size_t>(y - 1) * n;
+      for (size_t k = 0; k < n; ++k) col[k] += add[k] - sub[k];
+    }
+    uint8_t* out = dst + static_cast<size_t>(y) * n;
+    for (size_t k = 0; k < n; ++k) {
+      const double v = std::floor(static_cast<double>(col[k]) / area);
+      out[k] = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+    }
+  }
+  return true;
+}
+
 /* ---- watershed segmentation ----
 
    nppiSegmentWatershed has no published algorithm, so this is what NPP 13.0

@@ -750,9 +750,11 @@ NppStatus per_channel(const T* s, int ss, T* d, int ds, NppiSize roi, int ch, in
   auto src = fetch<T>(s, ss, roi.width * ch, roi.height);
   // AC4 forms leave the destination's alpha as it was: start from it.
   std::vector<T> dst = touched < ch ? fetch<T>(d, ds, roi.width * ch, roi.height) : src;
-  for (size_t i = 0; i < src.size(); ++i) {
-    const int c = static_cast<int>(i % ch);
-    if (c < touched) dst[i] = op(src[i], c);
+  // (pixel by pixel, the channels in the pixel: no division per element)
+  const size_t pixels = src.size() / static_cast<size_t>(ch);
+  for (size_t p = 0; p < pixels; ++p) {
+    const size_t base = p * static_cast<size_t>(ch);
+    for (int c = 0; c < touched; ++c) dst[base + static_cast<size_t>(c)] = op(src[base + static_cast<size_t>(c)], c);
   }
   store<T>(d, ds, roi.width * ch, roi.height, dst);
   return NPP_SUCCESS;
@@ -1036,33 +1038,42 @@ Npp8u gamma_inv(Npp8u x) {
   const float r = v < 0.081f ? v * 0.222222f : std::pow((v + 0.099f) / 1.099f, 2.22f);
   return static_cast<Npp8u>(std::min(255, std::max(0, static_cast<int>(r * 255.f))));
 }
+// (The transfer functions are functions of the byte alone: tables of their 256 values, made on first use.)
+const Npp8u* gamma_fwd_lut() {
+  static const struct T { Npp8u v[256]; T() { for (int i = 0; i < 256; ++i) v[i] = gamma_fwd(static_cast<Npp8u>(i)); } } t;
+  return t.v;
+}
+const Npp8u* gamma_inv_lut() {
+  static const struct T { Npp8u v[256]; T() { for (int i = 0; i < 256; ++i) v[i] = gamma_inv(static_cast<Npp8u>(i)); } } t;
+  return t.v;
+}
 }  // namespace
 
 #define VGPU_NPP_GAMMA(DIR, FN)                                                                            \
   VGPU_EXPORT NppStatus nppiGamma##DIR##_8u_C3R_Ctx(const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, \
                                                     NppStreamContext unused5) { \
   VGPU_DEFER_CALL(g_reg, unused5.hStream, nppiGamma##DIR##_8u_C3R_Ctx, s, ss, d, ds, roi, unused5); \
-    return per_channel<Npp8u>(s, ss, d, ds, roi, 3, 3, [](Npp8u v, int) { return FN(v); });                \
+    return per_channel<Npp8u>(s, ss, d, ds, roi, 3, 3, [](Npp8u v, int) { return FN##_lut()[v]; });                \
   }                                                                                                        \
   VGPU_PLAIN(nppiGamma##DIR##_8u_C3R, (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi),            \
              (s, ss, d, ds, roi, NppStreamContext{}))                                                      \
   VGPU_EXPORT NppStatus nppiGamma##DIR##_8u_C3IR_Ctx(Npp8u* sd, int ss, NppiSize roi, NppStreamContext unused3) { \
   VGPU_DEFER_CALL(g_reg, unused3.hStream, nppiGamma##DIR##_8u_C3IR_Ctx, sd, ss, roi, unused3); \
-    return per_channel<Npp8u>(sd, ss, sd, ss, roi, 3, 3, [](Npp8u v, int) { return FN(v); });              \
+    return per_channel<Npp8u>(sd, ss, sd, ss, roi, 3, 3, [](Npp8u v, int) { return FN##_lut()[v]; });              \
   }                                                                                                        \
   VGPU_PLAIN(nppiGamma##DIR##_8u_C3IR, (Npp8u * sd, int ss, NppiSize roi), (sd, ss, roi, NppStreamContext{})) \
   VGPU_EXPORT NppStatus nppiGamma##DIR##_8u_AC4R_Ctx(const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, \
                                                      NppStreamContext unused5) { \
   VGPU_DEFER_CALL(g_reg, unused5.hStream, nppiGamma##DIR##_8u_AC4R_Ctx, s, ss, d, ds, roi, unused5); \
     if (ss % 4 || ds % 4) return NPP_NOT_EVEN_STEP_ERROR;                                                  \
-    return per_channel<Npp8u>(s, ss, d, ds, roi, 4, 3, [](Npp8u v, int) { return FN(v); });                \
+    return per_channel<Npp8u>(s, ss, d, ds, roi, 4, 3, [](Npp8u v, int) { return FN##_lut()[v]; });                \
   }                                                                                                        \
   VGPU_PLAIN(nppiGamma##DIR##_8u_AC4R, (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi),           \
              (s, ss, d, ds, roi, NppStreamContext{}))                                                      \
   VGPU_EXPORT NppStatus nppiGamma##DIR##_8u_AC4IR_Ctx(Npp8u* sd, int ss, NppiSize roi, NppStreamContext unused3) { \
   VGPU_DEFER_CALL(g_reg, unused3.hStream, nppiGamma##DIR##_8u_AC4IR_Ctx, sd, ss, roi, unused3); \
     if (ss % 4) return NPP_NOT_EVEN_STEP_ERROR;                                                            \
-    return per_channel<Npp8u>(sd, ss, sd, ss, roi, 4, 3, [](Npp8u v, int) { return FN(v); });              \
+    return per_channel<Npp8u>(sd, ss, sd, ss, roi, 4, 3, [](Npp8u v, int) { return FN##_lut()[v]; });              \
   }                                                                                                        \
   VGPU_PLAIN(nppiGamma##DIR##_8u_AC4IR, (Npp8u * sd, int ss, NppiSize roi), (sd, ss, roi, NppStreamContext{}))
 VGPU_NPP_GAMMA(Fwd, gamma_fwd)
@@ -1279,6 +1290,24 @@ NppStatus histogram(const T* s, int ss, NppiSize roi, int ch, Npp32s* const* his
     if (!hist[c]) return NPP_NULL_POINTER_ERROR;
     if (lv.size() < 2) return NPP_HISTOGRAM_NUMBER_OF_LEVELS_ERROR;
     std::vector<Npp32s> bins(lv.size() - 1, 0);
+    if constexpr (std::is_integral_v<T> && sizeof(T) <= 2 && std::is_integral_v<L>) {
+      // An 8- or 16-bit value has one of 256 or 65536 values: the bin of each, found once by the search below, and the counting
+      // is a table lookup (a count does not depend on the order).
+      const size_t values = size_t(1) << (8 * sizeof(T));
+      if (v.size() / static_cast<size_t>(ch) >= values) {   // (for an image with fewer pixels than values the searches are cheaper)
+        std::vector<int> bin_of(values, -1);
+        for (size_t u = 0; u < values; ++u) {
+          const auto it = std::upper_bound(lv.begin(), lv.end(), static_cast<L>(static_cast<T>(u)));
+          if (it != lv.begin() && it != lv.end()) bin_of[u] = static_cast<int>(it - lv.begin()) - 1;
+        }
+        for (size_t i = c; i < v.size(); i += ch) {
+          const int b = bin_of[static_cast<std::make_unsigned_t<T>>(v[i])];
+          if (b >= 0) ++bins[static_cast<size_t>(b)];
+        }
+        put_n<Npp32s>(hist[c], bins.data(), bins.size());
+        continue;
+      }
+    }
     for (size_t i = c; i < v.size(); i += ch) {
       const auto x = v[i];
       // Binary search for the last level <= x.
@@ -1600,12 +1629,40 @@ NppStatus neighbourhood_extreme(const T* s, int ss, T* d, int ds, NppiSize roi, 
 }
 }  // namespace
 
+namespace {
+// nppiFilterBox on 8-bit data by running sums (box_filter_u8): the same checks, the same halo, as neighbourhood(). Returns false if
+// the window is too large for it (the caller then runs neighbourhood()).
+bool box_8u(const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, NppiSize msz, NppiPoint anchor, int ch, NppStatus* st) {
+  if (!s || !d) { *st = NPP_NULL_POINTER_ERROR; return true; }
+  if (bad(roi)) { *st = NPP_SIZE_ERROR; return true; }
+  if (msz.width <= 0 || msz.height <= 0) { *st = NPP_MASK_SIZE_ERROR; return true; }
+  if (anchor.x < 0 || anchor.y < 0 || anchor.x >= msz.width || anchor.y >= msz.height) { *st = NPP_ANCHOR_ERROR; return true; }
+  int w = 0;
+  auto src = fetch_halo(s, ss, roi, msz, anchor, ch, &w);
+  std::vector<Npp8u> dst(static_cast<size_t>(roi.width) * roi.height * ch);
+  if (!box_filter_u8(src.data(), w, ch, dst.data(), roi.width, roi.height, msz.width, msz.height)) return false;
+  store<Npp8u>(d, ds, roi.width * ch, roi.height, dst);
+  *st = NPP_SUCCESS;
+  return true;
+}
+template <class T>
+bool box_fast(const T* s, int ss, T* d, int ds, NppiSize roi, NppiSize msz, NppiPoint anchor, int ch, NppStatus* st) {
+  if constexpr (std::is_same_v<T, Npp8u>) return box_8u(s, ss, d, ds, roi, msz, anchor, ch, st);
+  else return false;
+}
+}  // namespace
+
 // Box filter: 8-bit truncates the mean, as npp_api.cpp's C1 form measured.
 #define VGPU_NPP_BOX(SFX, T, CH)                                                                           \
   VGPU_EXPORT NppStatus nppiFilterBox_##SFX##_Ctx(const T* s, Npp32s ss, T* d, Npp32s ds, NppiSize roi,      \
                                                   NppiSize m, NppiPoint a, NppStreamContext unused7) { \
   VGPU_DEFER_CALL(g_reg, unused7.hStream, nppiFilterBox_##SFX##_Ctx, s, ss, d, ds, roi, m, a, unused7); \
     const double n = double(m.width) * m.height;                                                           \
+    {                                                                                                      \
+      /* (8-bit data: running sums of the integers, in npp_core.hpp: the same sums, taken in another order) */ \
+      NppStatus st;                                                                                        \
+      if (box_fast<T>(s, ss, d, ds, roi, m, a, CH, &st)) return st;                                        \
+    }                                                                                                      \
     return neighbourhood<T>(                                                                               \
         s, ss, d, ds, roi, m, a, nullptr, CH, [] { return 0.0; }, [](double acc, T v) { return acc + v; },  \
         [n](double acc) {                                                                                  \
@@ -1621,21 +1678,19 @@ NppStatus neighbourhood_extreme(const T* s, int ss, T* d, int ds, NppiSize roi, 
 VGPU_NPP_BOX(8u_C4R, Npp8u, 4)
 VGPU_NPP_BOX(32f_C1R, Npp32f, 1)
 
-#define VGPU_NPP_RANK(NAME, PICK, INIT, SFX, T, CH)                                                        \
+#define VGPU_NPP_RANK(NAME, IS_MAX, INIT, SFX, T, CH)                                                        \
   VGPU_EXPORT NppStatus nppiFilter##NAME##_##SFX##_Ctx(const T* s, Npp32s ss, T* d, Npp32s ds, NppiSize roi, \
                                                        NppiSize m, NppiPoint a, NppStreamContext unused7) { \
   VGPU_DEFER_CALL(g_reg, unused7.hStream, nppiFilter##NAME##_##SFX##_Ctx, s, ss, d, ds, roi, m, a, unused7);        \
-    return neighbourhood<T>(                                                                               \
-        s, ss, d, ds, roi, m, a, nullptr, CH, [] { return INIT; },                                         \
-        [](T acc, T v) { return PICK(acc, v); }, [](T acc) { return acc; });                               \
+    return neighbourhood_extreme<T, IS_MAX>(s, ss, d, ds, roi, m, a, nullptr, CH, INIT);                    \
   }                                                                                                        \
   VGPU_PLAIN(nppiFilter##NAME##_##SFX,                                                                      \
              (const T* s, Npp32s ss, T* d, Npp32s ds, NppiSize roi, NppiSize m, NppiPoint a),              \
              (s, ss, d, ds, roi, m, a, NppStreamContext{}))
-VGPU_NPP_RANK(Max, std::max, Npp8u(0), 8u_C1R, Npp8u, 1)
-VGPU_NPP_RANK(Max, std::max, Npp8u(0), 8u_C4R, Npp8u, 4)
-VGPU_NPP_RANK(Min, std::min, Npp8u(255), 8u_C1R, Npp8u, 1)
-VGPU_NPP_RANK(Min, std::min, Npp8u(255), 8u_C4R, Npp8u, 4)
+VGPU_NPP_RANK(Max, true, Npp8u(0), 8u_C1R, Npp8u, 1)
+VGPU_NPP_RANK(Max, true, Npp8u(0), 8u_C4R, Npp8u, 4)
+VGPU_NPP_RANK(Min, false, Npp8u(255), 8u_C1R, Npp8u, 1)
+VGPU_NPP_RANK(Min, false, Npp8u(255), 8u_C4R, Npp8u, 4)
 
 // Dilate/Erode with an arbitrary mask: the extreme over the positions whose
 // mask byte is nonzero.

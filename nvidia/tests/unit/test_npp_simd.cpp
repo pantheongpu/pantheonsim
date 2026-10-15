@@ -475,5 +475,34 @@ VTEST(npp_morphology_matches_the_loops) {
   std::printf("  morphology: %d cases, %zu elements differ\n", cases, bad);
   VCHECK_EQ(bad, static_cast<size_t>(0));
 }
+VTEST(npp_box_filter_matches_the_window_sums) {
+  Rng rng;
+  rng.s ^= 0xB0C5;
+  size_t bad = 0;
+  int cases = 0;
+  for (int rep = 0; rep < 150; ++rep) {
+    const int ch = rep % 3 == 0 ? 1 : (rep % 3 == 1 ? 3 : 4);
+    const int rw = 1 + rng.below(40), rh = 1 + rng.below(12), mw = 1 + rng.below(9), mh = 1 + rng.below(9);
+    const int sw = rw + mw - 1, sh = rh + mh - 1;
+    std::vector<uint8_t> src(static_cast<size_t>(sw) * sh * ch);
+    for (auto& v : src) v = rep & 1 ? (rng.coin(2) ? 255 : 0) : static_cast<uint8_t>(rng.below(256));
+    std::vector<uint8_t> want(static_cast<size_t>(rw) * rh * ch), got(want.size(), 7);
+    const double n = static_cast<double>(mw) * mh;
+    for (int y = 0; y < rh; ++y)
+      for (int x = 0; x < rw; ++x)
+        for (int c = 0; c < ch; ++c) {   // the loops of neighbourhood(): a sum over the window in double, floor(sum / n), saturated
+          double acc = 0.0;
+          for (int j = 0; j < mh; ++j)
+            for (int i = 0; i < mw; ++i) acc = acc + src[(static_cast<size_t>(y + j) * sw + x + i) * ch + c];
+          want[(static_cast<size_t>(y) * rw + x) * ch + c] = saturate<uint8_t>(std::floor(acc / n));
+        }
+    const bool done = box_filter_u8(src.data(), sw, ch, got.data(), rw, rh, mw, mh);
+    ++cases;
+    if (done) bad += differing(want, got);
+    else ++bad;
+  }
+  std::printf("  box filter: %d cases, %zu elements differ\n", cases, bad);
+  VCHECK_EQ(bad, static_cast<size_t>(0));
+}
 
 VTEST_MAIN
