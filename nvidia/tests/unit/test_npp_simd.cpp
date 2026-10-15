@@ -48,6 +48,7 @@ T random_value(Rng& rng, bool extreme) {
   if constexpr (std::is_same_v<T, float>) {
     if (extreme) {
       switch (rng.below(9)) {
+        case 6: return 0.0f;
         case 0: return std::numeric_limits<float>::infinity();
         case 1: return -std::numeric_limits<float>::infinity();
         case 2: return std::numeric_limits<float>::quiet_NaN();
@@ -336,6 +337,50 @@ struct SetThreads {
   SetThreads() { ::setenv("VGPU_THREADS", "3", 0); }
 } set_threads;
 
+// Dilate/Erode's loop of npp_imgproc.cpp's neighbourhood(), as it was (for a minimum or a maximum).
+template <class T, bool MAX>
+void ref_extreme(const std::vector<T>& src, int sw, std::vector<T>& dst, int rw, int rh, int ch, int mw, int mh, const std::vector<uint8_t>* mask, T init) {
+  for (int y = 0; y < rh; ++y)
+    for (int x = 0; x < rw; ++x)
+      for (int c = 0; c < ch; ++c) {
+        T acc = init;
+        for (int j = 0; j < mh; ++j)
+          for (int i = 0; i < mw; ++i) {
+            if (mask && !(*mask)[static_cast<size_t>(j) * mw + i]) continue;
+            const T v = src[(static_cast<size_t>(y + j) * sw + x + i) * ch + c];
+            acc = MAX ? std::max(acc, v) : std::min(acc, v);
+          }
+        dst[(static_cast<size_t>(y) * rw + x) * ch + c] = acc;
+      }
+}
+
+template <class T, bool MAX>
+size_t run_extreme(Rng& rng, int ch, int* cases) {
+  size_t bad = 0;
+  for (int rep = 0; rep < 40; ++rep) {
+    const int rw = 1 + rng.below(45), rh = 1 + rng.below(9), mw = 1 + rng.below(6), mh = 1 + rng.below(6);
+    const int sw = rw + mw - 1, sh = rh + mh - 1;
+    std::vector<T> src(static_cast<size_t>(sw) * sh * ch);
+    for (auto& v : src) v = random_value<T>(rng, rep & 1);
+    std::vector<uint8_t> mask(static_cast<size_t>(mw) * mh);
+    for (auto& m : mask) m = rng.coin(3) ? 0 : 1 + rng.below(255);
+    const bool use_mask = rep % 5 != 0;
+    const T init = MAX ? (std::is_floating_point_v<T> ? -std::numeric_limits<T>::max() : T(0)) : (std::is_floating_point_v<T> ? std::numeric_limits<T>::max() : std::numeric_limits<T>::max());
+    std::vector<T> want(static_cast<size_t>(rw) * rh * ch), got(want.size());
+    ref_extreme<T, MAX>(src, sw, want, rw, rh, ch, mw, mh, use_mask ? &mask : nullptr, init);
+    std::vector<std::pair<int, int>> taps;
+    for (int j = 0; j < mh; ++j)
+      for (int i = 0; i < mw; ++i)
+        if (!use_mask || mask[static_cast<size_t>(j) * mw + i]) taps.emplace_back(j, i * ch);
+    extreme_filter<T, MAX>(src.data(), sw * ch, got.data(), rw, rh, ch, taps, init);
+    ++*cases;
+    const size_t d = differing(want, got);
+    if (d) std::printf("  extreme type %zu ch %d max %d: %zu differ\n", sizeof(T), ch, (int)MAX, d);
+    bad += d;
+  }
+  return bad;
+}
+
 }  // namespace
 
 VTEST(npp_simd_warps_match_the_scalar_code) {
@@ -414,6 +459,21 @@ VTEST(npp_simd_legacy_resize_matches_the_scalar_code) {
   std::printf("  legacy resizes: %d cases, %d on the fast path, %zu elements differ\n", cases, fast, bad);
   VCHECK_EQ(bad, static_cast<size_t>(0));
   if (simd::cpu_ok()) VCHECK_EQ(fast, cases);
+}
+
+VTEST(npp_morphology_matches_the_loops) {
+  Rng rng;
+  rng.s ^= 0xFEED;
+  int cases = 0;
+  size_t bad = 0;
+  for (const int ch : {1, 3, 4}) {
+    bad += run_extreme<uint8_t, true>(rng, ch, &cases);
+    bad += run_extreme<uint8_t, false>(rng, ch, &cases);
+    bad += run_extreme<float, true>(rng, ch, &cases);
+    bad += run_extreme<float, false>(rng, ch, &cases);
+  }
+  std::printf("  morphology: %d cases, %zu elements differ\n", cases, bad);
+  VCHECK_EQ(bad, static_cast<size_t>(0));
 }
 
 VTEST_MAIN

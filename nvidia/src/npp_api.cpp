@@ -630,13 +630,26 @@ VGPU_NPP_CTX(NppStatus, nppiRGBToGray_8u_C3C1R,
 VGPU_EXPORT NppStatus nppiThreshold_8u_C1R(const Npp8u* s, int ss, Npp8u* d, int ds,
                                            NppiSize roi, const Npp8u threshold, NppCmpOp op) {
   const double t = threshold;
-  return unop_8u(s, ss, d, ds, roi, 1, 0,
-                 [t, op](double v, int) { return cmp(v, t, op) ? t : v; });
+  // (The comparison is chosen once, not for every pixel.)
+  switch (op) {
+    case NPP_CMP_LESS: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v < t ? t : v; });
+    case NPP_CMP_LESS_EQ: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v <= t ? t : v; });
+    case NPP_CMP_EQ: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v == t ? t : v; });
+    case NPP_CMP_GREATER_EQ: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v >= t ? t : v; });
+    case NPP_CMP_GREATER: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v > t ? t : v; });
+    default: return unop_8u(s, ss, d, ds, roi, 1, 0, [t](double v, int) { return v; });
+  }
 }
 VGPU_EXPORT NppStatus nppiCompare_8u_C1R(const Npp8u* s1, int ss1, const Npp8u* s2, int ss2,
                                          Npp8u* d, int ds, NppiSize roi, NppCmpOp op) {
-  return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0,
-                  [op](double a, double b) { return cmp(a, b, op) ? 255.0 : 0.0; });
+  switch (op) {
+    case NPP_CMP_LESS: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double a, double b) { return a < b ? 255.0 : 0.0; });
+    case NPP_CMP_LESS_EQ: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double a, double b) { return a <= b ? 255.0 : 0.0; });
+    case NPP_CMP_EQ: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double a, double b) { return a == b ? 255.0 : 0.0; });
+    case NPP_CMP_GREATER_EQ: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double a, double b) { return a >= b ? 255.0 : 0.0; });
+    case NPP_CMP_GREATER: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double a, double b) { return a > b ? 255.0 : 0.0; });
+    default: return binop_8u(s1, ss1, s2, ss2, d, ds, roi, 1, 0, [](double, double) { return 0.0; });
+  }
 }
 VGPU_NPP_CTX(NppStatus, nppiThreshold_8u_C1R,
              (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, const Npp8u t, NppCmpOp op,

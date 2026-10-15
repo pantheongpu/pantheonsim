@@ -290,6 +290,33 @@ inline void warp_perspective_back(const Image<T>& src, const Rect& sroi, Image<T
 }
 
 
+/* ---- grey-scale morphology ----
+
+   Dilate (a maximum) and Erode (a minimum) over the mask positions that count, for each channel of each output: the output
+   is `init` where no position counts. `src` is the source with its halo, `sw` elements to a row, the output pixel (x, y) reading
+   the element (y + j) * sw + x * ch + i of each tap (j, i * ch). The taps are taken in the order given, and each is applied to a
+   whole row of outputs at a time (which a vector unit does without further ado): per element the sequence of updates is the
+   one a loop over the taps for that output makes, so even the sign of a zero that max and min leave to the order (-0 and +0
+   are neither less than the other) comes out the same. A NaN never replaces a value (acc < v and v < acc are false).
+   std::max(acc, v) is acc < v ? v : acc and std::min(acc, v) is v < acc ? v : acc. */
+template <class T, bool MAX>
+inline void extreme_filter(const T* src, int sw, T* dst, int rw, int rh, int ch, const std::vector<std::pair<int, int>>& taps, T init) {
+  const size_t n = static_cast<size_t>(rw) * static_cast<size_t>(ch);
+  const unsigned threads = vgpu::hostpar::plan(static_cast<uint64_t>(n) * static_cast<uint64_t>(rh) * (taps.size() + 1) * 2u, rh);
+  vgpu::hostpar::parallel_for(threads, rh, [&](int64_t row) {
+    const int y = static_cast<int>(row);
+    T* const out = dst + static_cast<size_t>(y) * n;
+    for (size_t k = 0; k < n; ++k) out[k] = init;
+    for (const auto& t : taps) {
+      const T* const in = src + static_cast<size_t>(y + t.first) * sw + t.second;
+      for (size_t k = 0; k < n; ++k) {
+        const T v = in[k], acc = out[k];
+        out[k] = MAX ? (acc < v ? v : acc) : (v < acc ? v : acc);
+      }
+    }
+  });
+}
+
 /* ---- watershed segmentation ----
 
    nppiSegmentWatershed has no published algorithm, so this is what NPP 13.0

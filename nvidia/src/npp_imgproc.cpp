@@ -1570,6 +1570,34 @@ NppStatus neighbourhood(const T* s, int ss, T* d, int ds, NppiSize roi, NppiSize
   store<T>(d, ds, roi.width * ch, roi.height, dst);
   return NPP_SUCCESS;
 }
+// neighbourhood() for a maximum (Dilate) or a minimum (Erode) with an INIT that no value of the type is beyond: the same value for
+// every output (the extreme is the same whatever order the mask positions are taken in), formed a row of outputs at a time -- for
+// each mask position, the extreme of the output row and the source row shifted by it, which a vector unit does on a whole row.
+// (std::max(acc, v) is acc < v ? v : acc and std::min is v < acc ? v : acc, as written below, so a NaN v leaves acc alone.)
+template <class T, bool MAX>
+NppStatus neighbourhood_extreme(const T* s, int ss, T* d, int ds, NppiSize roi, NppiSize msz, NppiPoint anchor, const Npp8u* mask, int ch,
+                                T init) {
+  if (!s || !d) return NPP_NULL_POINTER_ERROR;
+  if (bad(roi)) return NPP_SIZE_ERROR;
+  if (msz.width <= 0 || msz.height <= 0) return NPP_MASK_SIZE_ERROR;
+  if (anchor.x < 0 || anchor.y < 0 || anchor.x >= msz.width || anchor.y >= msz.height) return NPP_ANCHOR_ERROR;
+  std::vector<Npp8u> m;
+  if (mask) {
+    m.resize(static_cast<size_t>(msz.width) * msz.height);
+    get_n(m.data(), mask, m.size());
+  }
+  int w = 0;
+  auto src = fetch_halo(s, ss, roi, msz, anchor, ch, &w);
+  std::vector<T> dst(static_cast<size_t>(roi.width) * roi.height * ch);
+  // The mask positions that count, as (row j, element offset i * ch) of the source row from the output row's first element.
+  std::vector<std::pair<int, int>> taps;
+  for (int j = 0; j < msz.height; ++j)
+    for (int i = 0; i < msz.width; ++i)
+      if (!mask || m[static_cast<size_t>(j) * msz.width + i]) taps.emplace_back(j, i * ch);
+  extreme_filter<T, MAX>(src.data(), w * ch, dst.data(), roi.width, roi.height, ch, taps, init);
+  store<T>(d, ds, roi.width * ch, roi.height, dst);
+  return NPP_SUCCESS;
+}
 }  // namespace
 
 // Box filter: 8-bit truncates the mean, as npp_api.cpp's C1 form measured.
@@ -1611,27 +1639,25 @@ VGPU_NPP_RANK(Min, std::min, Npp8u(255), 8u_C4R, Npp8u, 4)
 
 // Dilate/Erode with an arbitrary mask: the extreme over the positions whose
 // mask byte is nonzero.
-#define VGPU_NPP_MORPH(NAME, PICK, INIT, SFX, T, CH)                                                       \
+#define VGPU_NPP_MORPH(NAME, IS_MAX, INIT, SFX, T, CH)                                                       \
   VGPU_EXPORT NppStatus nppi##NAME##_##SFX##_Ctx(const T* s, int ss, T* d, int ds, NppiSize roi,             \
                                                  const Npp8u* mask, NppiSize m, NppiPoint a,                \
                                                  NppStreamContext unused8) { \
   VGPU_DEFER_CALL(g_reg, unused8.hStream, nppi##NAME##_##SFX##_Ctx, s, ss, d, ds, roi, mask, m, a, unused8); \
     if (!mask) return NPP_NULL_POINTER_ERROR;                                                              \
-    return neighbourhood<T>(                                                                               \
-        s, ss, d, ds, roi, m, a, mask, CH, [] { return INIT; }, [](T acc, T v) { return PICK(acc, v); },   \
-        [](T acc) { return acc; });                                                                        \
+    return neighbourhood_extreme<T, IS_MAX>(s, ss, d, ds, roi, m, a, mask, CH, INIT);                        \
   }                                                                                                        \
   VGPU_PLAIN(nppi##NAME##_##SFX,                                                                            \
              (const T* s, int ss, T* d, int ds, NppiSize roi, const Npp8u* mask, NppiSize m, NppiPoint a), \
              (s, ss, d, ds, roi, mask, m, a, NppStreamContext{}))
-VGPU_NPP_MORPH(Dilate, std::max, Npp8u(0), 8u_C1R, Npp8u, 1)
-VGPU_NPP_MORPH(Dilate, std::max, Npp8u(0), 8u_C4R, Npp8u, 4)
-VGPU_NPP_MORPH(Dilate, std::max, -std::numeric_limits<Npp32f>::max(), 32f_C1R, Npp32f, 1)
-VGPU_NPP_MORPH(Dilate, std::max, -std::numeric_limits<Npp32f>::max(), 32f_C4R, Npp32f, 4)
-VGPU_NPP_MORPH(Erode, std::min, Npp8u(255), 8u_C1R, Npp8u, 1)
-VGPU_NPP_MORPH(Erode, std::min, Npp8u(255), 8u_C4R, Npp8u, 4)
-VGPU_NPP_MORPH(Erode, std::min, std::numeric_limits<Npp32f>::max(), 32f_C1R, Npp32f, 1)
-VGPU_NPP_MORPH(Erode, std::min, std::numeric_limits<Npp32f>::max(), 32f_C4R, Npp32f, 4)
+VGPU_NPP_MORPH(Dilate, true, Npp8u(0), 8u_C1R, Npp8u, 1)
+VGPU_NPP_MORPH(Dilate, true, Npp8u(0), 8u_C4R, Npp8u, 4)
+VGPU_NPP_MORPH(Dilate, true, -std::numeric_limits<Npp32f>::max(), 32f_C1R, Npp32f, 1)
+VGPU_NPP_MORPH(Dilate, true, -std::numeric_limits<Npp32f>::max(), 32f_C4R, Npp32f, 4)
+VGPU_NPP_MORPH(Erode, false, Npp8u(255), 8u_C1R, Npp8u, 1)
+VGPU_NPP_MORPH(Erode, false, Npp8u(255), 8u_C4R, Npp8u, 4)
+VGPU_NPP_MORPH(Erode, false, std::numeric_limits<Npp32f>::max(), 32f_C1R, Npp32f, 1)
+VGPU_NPP_MORPH(Erode, false, std::numeric_limits<Npp32f>::max(), 32f_C4R, Npp32f, 4)
 
 /* ---- border forms ---- */
 namespace {
