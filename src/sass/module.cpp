@@ -49,7 +49,8 @@ void Module::index_code() {
   code_pages.assign(static_cast<size_t>((end - first + 255) / 256), 0);
   for (size_t i = 0; i < code.size(); ++i) {
     const uint64_t pages = (16 * code[i].count + 255) / 256;
-    for (uint64_t k = 0; k < pages; ++k) code_pages[static_cast<size_t>((code[i].base - first) / 256 + k)] = static_cast<uint32_t>(i + 1);
+    const size_t at = static_cast<size_t>((code[i].base - first) / 256);
+    for (uint64_t k = 0; k < pages; ++k) code_pages[at + static_cast<size_t>(k)] = static_cast<uint32_t>(i + 1);
   }
   code_page_base = first;
 }

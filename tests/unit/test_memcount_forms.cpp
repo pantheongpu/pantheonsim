@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "vgpu/exec/mem_counters.hpp"
+#include "vgpu/exec/window_check.hpp"
 #include "vtest.hpp"
 
 namespace mc = vgpu::exec::memcount;
@@ -341,6 +342,48 @@ VTEST(run_sectors_equal_the_lanes_addresses) {
   VCHECK(!mc::run_sectors(~uint64_t{0} - 3, 8, out));
   VCHECK(mc::run_sectors(~uint64_t{0} - 3, 4, out));
   VCHECK_EQ(out, uint64_t{1});
+}
+
+// The SASS executor's shared- and local-memory fast path takes the window checks of vgpu/exec/window_check.hpp: they must
+// answer exactly what testing each lane in turn answers (the earlier code, copied here), for lanes in this block's window and
+// in others', inside the array and past its end, with one lane off or every lane, and with no lane at all.
+VTEST(window_checks_equal_the_per_lane_tests) {
+  Rng rng(8);
+  uint64_t inside_count = 0, outside_count = 0;
+  for (int iter = 0; iter < 400000; ++iter) {
+    const uint32_t mask = rng.below(8) == 0 ? 0u : (rng.below(2) ? 0xFFFFFFFFu : static_cast<uint32_t>(rng.next()));
+    const uint64_t rank = rng.below(4), size = 1 + rng.below(1 << (4 + rng.below(18))), frame = 1 + rng.below(1 << (4 + rng.below(12)));
+    const uint32_t bytes = 1u << rng.below(6);
+    uint64_t offs[32];
+    for (unsigned l = 0; l < 32; ++l) {
+      const uint64_t in_array = rng.below(size), near_end = size - std::min<uint64_t>(size, rng.below(40));
+      uint64_t off = rng.below(3) == 0 ? near_end : in_array;
+      if (rng.below(25) == 0) off |= (rank ^ (1 + rng.below(3))) << 24;   // another block's window
+      else off |= rank << 24;
+      offs[l] = off & 0xFFFFFFFFull;
+    }
+    // Shared: the earlier loop.
+    bool want = true;
+    for (unsigned l = 0; l < 32; ++l)
+      if (mask >> l & 1) want = want && (offs[l] >> 24) == rank && (offs[l] & 0xffffff) + bytes <= size;
+    vgpu::exec::SharedWindowCheck sc;
+    for (unsigned l = 0; l < 32; ++l)
+      if (mask >> l & 1) sc.add(offs[l], rank);
+    if (sc.inside(size, bytes, mask != 0) != want) throw vtest::Failure("shared window check differs from the per-lane test at iteration " + std::to_string(iter));
+    // Local: the earlier loop, over frame offsets.
+    bool want_local = true;
+    uint64_t loc[32];
+    for (unsigned l = 0; l < 32; ++l) {
+      loc[l] = rng.below(3) == 0 ? frame - std::min<uint64_t>(frame, rng.below(10)) : rng.below(frame);
+      if (mask >> l & 1) want_local = want_local && loc[l] + bytes <= frame;
+    }
+    vgpu::exec::LocalWindowCheck lc;
+    for (unsigned l = 0; l < 32; ++l)
+      if (mask >> l & 1) lc.add(loc[l]);
+    if (lc.inside(frame, bytes, mask != 0) != want_local) throw vtest::Failure("local window check differs from the per-lane test at iteration " + std::to_string(iter));
+    (want ? inside_count : outside_count) += 1;
+  }
+  VCHECK(inside_count > 20000 && outside_count > 20000);   // both answers were exercised
 }
 
 VTEST_MAIN

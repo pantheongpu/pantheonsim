@@ -2910,17 +2910,15 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         const uint64_t ssize = blk.shared.size();
         uint64_t sa[32];
         row_addresses(a, false, ur, store ? 64 : 32, ex, sa, stride);
-        // (Every lane in this block's window and its last byte inside the array: the other block's bits ORed together
-        // and the highest offset, with no branch per lane. The same test as checking each lane in turn.)
-        uint64_t other = 0, highest = 0;
+        // (Every lane in this block's window and its last byte inside the array, with no branch per lane: see window_check.hpp.)
+        exec::SharedWindowCheck window;
         for (Mask m = ex; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint64_t off = static_cast<uint32_t>(sa[l]);
           addrs[l] = off;
-          other |= (off >> 24) ^ blk.rank;
-          highest = std::max<uint64_t>(highest, off & 0xffffff);
+          window.add(off, blk.rank);
         }
-        const bool inside = ex == 0 || (other == 0 && highest + bytes <= ssize);
+        const bool inside = window.inside(ssize, bytes, ex != 0);
         if (inside) {
           uint8_t* sh = blk.shared.data();
           const bool moved = with_lane_width(bytes, [&](auto width) {
@@ -2972,14 +2970,14 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         // the loop below runs and finds the one that faults, as it always did.)
         uint64_t la[32];
         row_addresses(a, false, ur, store ? 64 : 32, ex, la);
-        uint64_t highest = 0;
+        exec::LocalWindowCheck window;
         for (Mask m = ex; m; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           const uint64_t off = static_cast<uint32_t>(la[l]);
           addrs[l] = off;
-          highest = std::max(highest, off);
+          window.add(off);
         }
-        const bool inside = highest + bytes <= w.local_size;   // (ex is not zero in this branch)
+        const bool inside = window.inside(w.local_size, bytes, ex != 0);
         if (inside) {
           if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
           const Operand& d = store ? ins.src[1] : ins.dst[0];
