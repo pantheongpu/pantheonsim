@@ -734,7 +734,7 @@ payload when two NaNs meet is the one thing not fixed, as before.
 
 What stayed as it was, measured on this machine and not worth the change: the Jacobi eigen- and singular value solvers of cuSOLVER (`syevd`,
 `gesvd`, `gesvdj`, 42-46 ms at n = 200; each rotation depends on the last in the two-sided method, so neither the rotations nor the order of
-their updates can change; only the rotation itself, for the complex ones, was rewritten, as the next paragraph says), the level-2 routines of cuBLAS apart from `gemv` (their time is the transfer and conversion of the matrix), cuDNN's
+their updates can change; for the complex ones only the plane rotation was rewritten, see the table), the level-2 routines of cuBLAS apart from `gemv` (their time is the transfer and conversion of the matrix), cuDNN's
 tensor transfers (a copy out of device memory, a conversion to double and back make up 50% of a depthwise convolution), the H.264 and MPEG-2
 decoders (entropy decoding is 24% of the first and cannot be split), NPP's resize, warp, threshold and morphology, and nvJPEG's encoder.
 
