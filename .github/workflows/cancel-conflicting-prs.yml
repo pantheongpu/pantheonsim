@@ -1,0 +1,55 @@
+name: Cancel CI on conflicting PRs
+
+# A pull request with a merge conflict has to be rebased and pushed again, which
+# starts the CI over, so every minute its current run spends is wasted. GitHub
+# starts no pull_request run on a PR that conflicts when the push arrives, but a
+# conflict that appears afterwards (someone merges into main) leaves the PR's
+# queued and running jobs going. This workflow finds those PRs and cancels their
+# runs. It runs after every push to the default branch, which is when new
+# conflicts appear, and every 20 minutes as a backup (a force-push or a changed
+# base can also cause one). ci/pr-guard.sh catches the rest at the start of each
+# heavy job. See docs/ci-merge-conflicts.md.
+#
+# It uses only GITHUB_TOKEN and no pull_request event, so a fork's code never
+# runs here and no secret is exposed.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '7,27,47 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print what would be cancelled and labelled; change nothing"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  actions: write
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: cancel-conflicting-prs
+  cancel-in-progress: false
+
+jobs:
+  cancel:
+    name: cancel runs of PRs that conflict
+    # GitHub's runner, not the shared pool: this job must not wait behind the
+    # runs it exists to cancel.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ci
+
+      - name: Cancel the runs of conflicting pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: ci/cancel-conflicting-prs.sh

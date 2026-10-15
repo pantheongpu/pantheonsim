@@ -29,8 +29,10 @@ jobs:
       fail-fast: false
       matrix:
         gpu: [amd/mi300x, amd/mi325x, amd/mi250x, amd/mi350x, amd/rx7900xtx, amd/rx9070xt]
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
       - name: Make room for ROCm and vLLM
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
