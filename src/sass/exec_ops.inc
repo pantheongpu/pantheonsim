@@ -3086,6 +3086,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       const bool cas = ins.f[5] || (shared && ins.mods[0].rfind("CAS", 0) == 0);
       const bool popc_inc = shared && ins.f[2] == 1;
       const Operand& a = red ? ins.src[0] : ins.src[shared ? 0 : 0];
+      // Whether any lane changed a word: an atomic that finds what it leaves (a CAS that lost, an exchange of the same
+      // value) writes nothing a spinning peer could be waiting for (see Warp::idle_yields).
+      bool changed = false;
+      const uint32_t idle0 = w.idle_yields;
       // The value the atomic stores, given the one it finds (old), the operand (v) and the exchange value (swap) of lane l.
       const auto apply = [&](unsigned l, const uint64_t old, const uint64_t v, const uint64_t swap) -> uint64_t {
         uint64_t nw = old;
@@ -3134,6 +3138,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           }
         }
         if (!is64) nw &= 0xffffffff;
+        if (nw != old) changed = true;
         return nw;
       };
       // What a lane's atomic gives back: the old value in the destination (the vector forms' word `word` in the register `word`
@@ -3225,6 +3230,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             }
           }
           if (done) {
+            w.idle_yields = changed ? 0 : idle0;
             for (Mask m = ex; m; m &= m - 1) {
               const unsigned l = static_cast<unsigned>(std::countr_zero(m));
               ++blk.st.atomics;
@@ -3279,6 +3285,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           const uint64_t nw = compute(old);
           mem_write(blk, w, l, sp, addr, &nw, n);
         }
+        w.idle_yields = changed ? 0 : idle0;
         ++blk.st.atomics;
         blk.st.atomic_bytes += n;
         if (!red) emit(l, word, old, v);
@@ -4342,6 +4349,8 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       w.slice = 0;
       w.give_way = true;
       w.yield = true;
+      ++w.idle_yields;
+      w.yield_pc = w.pc[std::countr_zero(group)] + 16;   // where the lanes that yielded stand once the YIELD is done
       return false;
     case Op::BPT:
       if (ex) throw Error(Err::Trap, "SASS kernel " + k_.name + " executed BPT.TRAP (a trap)");
@@ -4396,6 +4405,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
         if (++w.spins >= 64) {
           w.spins = 0;
           w.give_way = true;
+          w.yield_pc = w.pc[std::countr_zero(take)];   // the group that branched back, at the top of its loop
         }
       }
       return true;

@@ -2491,6 +2491,13 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  add_test(NAME e2e_spin_lock_groups
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_spin_lock_groups.sh)
+  set_tests_properties(e2e_spin_lock_groups PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   add_test(NAME e2e_warp_spin_lock
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_warp_spin_lock.sh)
   set_tests_properties(e2e_warp_spin_lock PROPERTIES
@@ -3078,6 +3085,11 @@ set_tests_properties(lint_ci_jobs PROPERTIES TIMEOUT 120)
 # ci/cancel-conflicting-prs.sh after main moves) against a fake gh and curl.
 add_test(NAME lint_pr_guard COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_pr_guard.sh)
 set_tests_properties(lint_pr_guard PROPERTIES TIMEOUT 120)
+
+# ci/external/hip-tests.sh's per-case limits against a fake Catch2 suite: a case of a slow suite
+# (HT_SLOW_SUITES) that does not finish is SLOW, not a failure; other suites still fail on a timeout.
+add_test(NAME lint_hip_tests_runner COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_hip_tests_runner.sh)
+set_tests_properties(lint_hip_tests_runner PROPERTIES TIMEOUT 120)
 
 # Copies and fills with a shape in graphs, and the async copies a capture has to
 # record rather than run; two simulated devices, for the peer copy.
