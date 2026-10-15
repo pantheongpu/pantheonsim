@@ -168,19 +168,7 @@ TIER_HANDLER(h_lop3) {
   alignas(32) uint32_t t[3][32], r[32];
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]),
                  *d = tier_src<false>(c, op.s[2], t[2]);
-  switch (op.a) {   // the tables compiled code uses most, as the plain expressions they are
-    case 0xc0: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] & b[l]; break;
-    case 0xfc: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] | b[l]; break;
-    case 0x3c: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] ^ b[l]; break;
-    case 0x96: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] ^ b[l] ^ d[l]; break;
-    case 0x80: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] & b[l] & d[l]; break;
-    case 0xfe: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] | b[l] | d[l]; break;
-    case 0x33: for (unsigned l = 0; l < 32; ++l) r[l] = ~b[l]; break;
-    case 0x0f: for (unsigned l = 0; l < 32; ++l) r[l] = ~a[l]; break;
-    case 0x30: for (unsigned l = 0; l < 32; ++l) r[l] = a[l] & ~b[l]; break;
-    case 0x0c: for (unsigned l = 0; l < 32; ++l) r[l] = ~a[l] & b[l]; break;
-    default: c.sk->lop3(r, a, b, d, op.a);
-  }
+  c.sk->lop3(r, a, b, d, op.a);   // (the vector kernel, which has the usual tables as expressions: faster than loops the compiler makes for the baseline x86-64)
   if (op.aux & 1) {
     // The lanes whose result is not zero, or is all ones (.PAND): the compare kernel, as fast_alu does it.
     Mask pm = static_cast<Mask>(c.sk->icmp_mask((op.aux & 2) ? 0 : 1, false, r, (op.aux & 2) ? kOnes32.data() : kZeros32.data(), 32));
