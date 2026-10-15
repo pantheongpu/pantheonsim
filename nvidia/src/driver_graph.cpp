@@ -1251,6 +1251,69 @@ VGPU_EXPORT CUresult cuGraphExecNodeSetParams(CUgraphExec exec, CUgraphNode node
   }
 }
 
+/* ---- ids and parameters of graphs and nodes (CUDA 13.2) ---------------------------------------- */
+// The ids come from the runtime (vgpu_graph_id_v1 and the rest: runtime_api.cpp has the numbering and the card it was
+// measured on); a null graph, executable or node, a null result and a handle that is none are CUDA_ERROR_INVALID_VALUE.
+
+VGPU_EXPORT CUresult cuGraphGetId(CUgraph graph, unsigned int* graphId) {
+  return traced("cuGraphGetId", [](CUgraph g, unsigned int* id) -> CUresult {
+    FORWARD("vgpu_graph_id_v1", int (*)(void*, unsigned int*), g, id);
+  }, graph, graphId);
+}
+VGPU_EXPORT CUresult cuGraphExecGetId(CUgraphExec exec, unsigned int* graphId) {
+  return traced("cuGraphExecGetId", [](CUgraphExec e, unsigned int* id) -> CUresult {
+    FORWARD("vgpu_graph_exec_id_v1", int (*)(void*, unsigned int*), e, id);
+  }, exec, graphId);
+}
+VGPU_EXPORT CUresult cuGraphNodeGetLocalId(CUgraphNode node, unsigned int* nodeId) {
+  return traced("cuGraphNodeGetLocalId", [](CUgraphNode n, unsigned int* id) -> CUresult {
+    if (!id) return kInvalidValue;
+    FORWARD("vgpu_graph_node_ids_v1", int (*)(void*, unsigned int*, unsigned long long*, void**), n, id, nullptr, nullptr);
+  }, node, nodeId);
+}
+VGPU_EXPORT CUresult cuGraphNodeGetToolsId(CUgraphNode node, unsigned long long* toolsNodeId) {
+  return traced("cuGraphNodeGetToolsId", [](CUgraphNode n, unsigned long long* id) -> CUresult {
+    if (!id) return kInvalidValue;
+    FORWARD("vgpu_graph_node_ids_v1", int (*)(void*, unsigned int*, unsigned long long*, void**), n, nullptr, id, nullptr);
+  }, node, toolsNodeId);
+}
+VGPU_EXPORT CUresult cuGraphNodeGetContainingGraph(CUgraphNode node, CUgraph* phGraph) {
+  return traced("cuGraphNodeGetContainingGraph", [](CUgraphNode n, CUgraph* g) -> CUresult {
+    if (!g) return kInvalidValue;
+    FORWARD("vgpu_graph_node_ids_v1", int (*)(void*, unsigned int*, unsigned long long*, void**), n, nullptr, nullptr,
+            reinterpret_cast<void**>(g));
+  }, node, phGraph);
+}
+
+// The parameters of a node of any kind, as the tagged union cuGraphAddNode takes: the answer of the kind's own
+// getter. A node of a kind this graph engine cannot make (memory allocation and free, batch memory operations,
+// external semaphores, conditional nodes) is CUDA_ERROR_NOT_SUPPORTED here; an empty node is the type and nothing else.
+VGPU_EXPORT CUresult cuGraphNodeGetParams(CUgraphNode node, CUgraphNodeParams* nodeParams) {
+  return traced("cuGraphNodeGetParams", [](CUgraphNode n, CUgraphNodeParams* out) -> CUresult {
+    if (!n || !out) return kInvalidValue;
+    CUgraphNodeType type;
+    if (const CUresult r = cuGraphNodeGetType(n, &type)) return r;
+    std::memset(out, 0, sizeof *out);
+    out->type = type;
+    switch (type) {
+      case CU_GRAPH_NODE_TYPE_KERNEL: return cuGraphKernelNodeGetParams_v2(n, &out->kernel);
+      case CU_GRAPH_NODE_TYPE_MEMCPY: return cuGraphMemcpyNodeGetParams(n, &out->memcpy.copyParams);
+      case CU_GRAPH_NODE_TYPE_MEMSET: {
+        CUDA_MEMSET_NODE_PARAMS_v1 v1{};
+        if (const CUresult r = cuGraphMemsetNodeGetParams(n, &v1)) return r;
+        std::memcpy(&out->memset, &v1, sizeof v1);
+        return CUDA_SUCCESS;
+      }
+      case CU_GRAPH_NODE_TYPE_HOST: return cuGraphHostNodeGetParams(n, &out->host);
+      case CU_GRAPH_NODE_TYPE_GRAPH: return cuGraphChildGraphNodeGetGraph(n, &out->graph.graph);
+      case CU_GRAPH_NODE_TYPE_EMPTY: return CUDA_SUCCESS;
+      case CU_GRAPH_NODE_TYPE_WAIT_EVENT: return cuGraphEventWaitNodeGetEvent(n, &out->eventWait.event);
+      case CU_GRAPH_NODE_TYPE_EVENT_RECORD: return cuGraphEventRecordNodeGetEvent(n, &out->eventRecord.event);
+      default: return kNotSupported;
+    }
+  }, node, nodeParams);
+}
+
 /* External semaphores are imported through cuImportExternalSemaphore, which this library does not have;
  * a node that names one has nothing to name. */
 VGPU_EXPORT CUresult cuGraphAddExternalSemaphoresSignalNode(CUgraphNode*, CUgraph, const CUgraphNode*, size_t, const void*) {

@@ -50,6 +50,8 @@ build/vgpu list-gpus            # check it works: lists the GPUs it can simulate
 build/vgpu demo vectoradd       # runs a built-in kernel end to end
 ```
 
+Prefer `make`? `make doctor`, `make build` and `make demo` do the same, `make` lists the rest, and the settings you use every time can live in a file ([docs/config.md](docs/config.md)).
+
 ## Run your first program
 
 Build your program with the real compiler, then run it with `vgpu run`:

@@ -19,9 +19,9 @@ def comp(f, **kw):
     return lambda d, *a: (fast if d != 'cpu' else f)(*[t.to(d) for t in a])
 
 
-def reg(name, f, args, tol=1e-3, tier='quick', **kw):
+def reg(name, f, args, tol=1e-3, tier='quick', timeout=None, **kw):
     g = comp(f, **kw)
-    check(L, 'torch.compile: ' + name, tol, tier=tier)(lambda d: g(d, *args))
+    check(L, 'torch.compile: ' + name, tol, tier=tier, timeout=timeout)(lambda d: g(d, *args))
 
 
 x2 = rnd(32, 48, seed=1)
@@ -40,7 +40,10 @@ reg('layer norm backward (AOTAutograd)', lambda t: _grad(lambda u: F.layer_norm(
 reg('attention block with a causal mask', lambda q, k, v: _grad_multi(lambda a, b, c: (torch.softmax((a @ b.transpose(-1, -2)) / 5.6 + torch.triu(torch.full((16, 16), float('-inf'), device=a.device), 1), -1) @ c).square().sum(), q, k, v), [x4, x4.flip(-1), x4 * 0.5], 3e-2, tier='full')
 reg('dynamic shapes: the same function at three lengths', lambda t: _dyn(t), [x2], 1e-3, tier='full')
 reg('graph breaks and a data-dependent branch', lambda t: t.sum() if t.sum() > 0 else -t.sum(), [x2], 1e-3, tier='full')
-reg('max-autotune-no-cudagraphs: a matmul template', lambda a, b: a @ b + 1, [rnd(64, 64, seed=1), rnd(64, 64, seed=2)], 5e-3, tier='full', mode='max-autotune-no-cudagraphs')
+reg('max-autotune-no-cudagraphs: a matmul template', lambda a, b: a @ b + 1, [rnd(64, 64, seed=1), rnd(64, 64, seed=2)], 5e-3, tier='full', mode='max-autotune-no-cudagraphs',
+    # Inductor times each of 12 Triton templates on the simulator (480 s of benchmarking alone), then compiles the
+    # winner: 775 s on a quiet runner, over the 900 s default on a busy one, and a hang kills the group's other checks.
+    timeout=3600)
 
 
 def _grad(f, t):
@@ -79,20 +82,23 @@ def _train(d):
 check(L, 'torch.compile: a model trained three AdamW steps (forward and backward kernels)', 3e-3, tier='full')(_train)
 
 
-def _compiled_opt(d):
+def _adam_steps(d, compiled):
     torch.manual_seed(0)
     net = nn.Linear(16, 4).to(d)
     opt = torch.optim.Adam(net.parameters(), 1e-2, capturable=d != 'cpu')
-    step = torch.compile(opt.step) if d != 'cpu' else opt.step
+    step = torch.compile(opt.step) if compiled and d != 'cpu' else opt.step
     xs = rnd(12, 16, seed=1).to(d)
+    after = []
     for _ in range(2):
         opt.zero_grad()
         net(xs).square().mean().backward()
         step()
-    return list(net.parameters())
+        after.append([p.detach().clone() for p in net.parameters()])   # each step's, so a failure names the step
+    return after
 
 
-check(L, 'torch.compile: the optimizer step (fused foreach kernels)', 3e-3, tier='full')(_compiled_opt)
+check(L, 'Adam (capturable) steps, not compiled: the compiled step\'s reference', 3e-3, tier='full')(lambda d: _adam_steps(d, False))
+check(L, 'torch.compile: the optimizer step (fused foreach kernels)', 3e-3, tier='full')(lambda d: _adam_steps(d, True))
 
 
 def _reduce_overhead(d):

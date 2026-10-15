@@ -76,6 +76,7 @@ if [[ -x "$tmp/runtime_hip" ]]; then
     "a kernel reading past its arguments runs 1" \
     "and freeing it gives that back 1" \
     "a copy on a stream lands 1" \
+    "a host address given as the device side is refused 1" \
     "a kernel whose LDS the launch paid for 1" \
     "a launch that forgets it is refused 1" \
     "a kernel takes a measurable time 1" \

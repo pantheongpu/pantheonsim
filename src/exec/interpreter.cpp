@@ -417,6 +417,13 @@ struct Warp {
   // the deterministic scheduler a turn otherwise lasts until the warp blocks,
   // and a spin never blocks, so the first waiter would hold the block forever.
   bool yield_now = false;
+  // Armed until the warp reaches its first store to global memory, where its turn ends once
+  // (see run_warp_until_yield).
+  bool store_gate = true;
+  // Where the turn the gate cut short began, so that the rest of it counts toward kLongTurn as if it had
+  // not been cut: the warp then runs the same instructions in the same order whatever the gate does.
+  bool resumed_turn = false;
+  uint64_t resumed_turn_start = 0;
   // Set by an instruction that must run again rather than advance: a
   // tcgen05.alloc that found too few columns free waits by retrying, giving
   // up its turn each time so the warp that will free them can run.
@@ -2898,7 +2905,8 @@ class Interpreter {
     cur_ = w.fn ? w.fn : &fn_;
     local_base_ = w.local_base;
     uint64_t issued = 0;
-    turn_start_ = w.steps;
+    turn_start_ = w.resumed_turn ? w.resumed_turn_start : w.steps;
+    w.resumed_turn = false;
     for (Path& p : w.paths)
       if (p.parked == Path::kThisTurn) p.parked = Path::kRunnable;
     while (w.state == Warp::State::Ready) {
@@ -2915,6 +2923,26 @@ class Interpreter {
       if (w.paths[idx].pc >= cur_->body.size()) {
         exec_ret(w, ctx, implicit_ret(), idx, w.paths[idx].mask);
         continue;
+      }
+      // A warp's first store to global memory ends its turn, once, so that the block's other warps issue
+      // the loads their prologues make before it lands. On a card the warps of a block start within a few
+      // cycles of each other and a store posts only after a load's round trip, so a warp never sees a
+      // warp-mate's store from the same start: Triton's `step += 1` on a one-element tensor has every warp
+      // load, add and store the same word, and is right only because of that. Run to the end one warp at
+      // a time, warp k would load what warps 0..k-1 stored and add one more each. Any order is legal for
+      // code with no synchronization; this is the one the hardware gives. (The SASS executor does the same.)
+      // Only a converged warp: a diverged one keeps the gate armed for a later store, so that the order its
+      // paths run in (and the counters that depend on it) is the one it always had.
+      if (w.store_gate && w.paths.size() == 1) {
+        if (const auto* st = std::get_if<OpSt>(&cur_->body[w.paths[idx].pc].op);
+            st && (st->space == Space::Global || st->space == Space::Generic)) {
+          w.store_gate = false;
+          if (ctx.warps && ctx.warps->size() > 1) {
+            w.resumed_turn = true;
+            w.resumed_turn_start = turn_start_;
+            return;
+          }
+        }
       }
       // The pre-decoded forms of the function's instructions, when it has them
       // (see MicroOp).
@@ -12417,7 +12445,7 @@ class Interpreter {
           }
           const KernelRef& k = kernel_at(lane, slot(1).read(lane, 0, 8));
           uint8_t out[40];
-          devrt::put_func_attrs(devrt::func_attributes(*k.fn, profile_, k.arch), out);
+          devrt::put_func_attrs(devrt::func_attributes(*k.fn, profile_, k.arch, k.constant), out);
           for (uint32_t off = 0; off < 40; off += 8) {
             uint64_t v;
             std::memcpy(&v, out + off, 8);

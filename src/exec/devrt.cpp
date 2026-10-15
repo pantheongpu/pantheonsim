@@ -154,7 +154,18 @@ bool config_ok(const std::array<uint32_t, 3>& grid, const std::array<uint32_t, 3
   return shared_total <= limit;
 }
 
-FuncAttrs func_attributes(const ptx::EntryFn& fn, const DeviceProfile& p, int ptx_arch) {
+uint32_t kernel_thread_limit(const ptx::EntryFn& fn, const DeviceProfile& p, uint32_t regs_per_thread) {
+  uint64_t limit = p.limits.max_threads_per_block;
+  const uint64_t bound = uint64_t{fn.max_ntid[0]} * std::max(1u, fn.max_ntid[1]) * std::max(1u, fn.max_ntid[2]);
+  if (fn.max_ntid[0] && bound) limit = std::min(limit, bound);
+  if (regs_per_thread && p.limits.registers_per_block && p.warp_size) {
+    const uint64_t per_warp = (uint64_t{regs_per_thread} * p.warp_size + 255) / 256 * 256;
+    limit = std::min<uint64_t>(limit, p.limits.registers_per_block / per_warp * p.warp_size);
+  }
+  return static_cast<uint32_t>(limit);
+}
+
+FuncAttrs func_attributes(const ptx::EntryFn& fn, const DeviceProfile& p, int ptx_arch, uint64_t constant) {
   // What the host's cudaFuncGetAttributes reports for the kernel (the device
   // runtime's matched it field for field on an RTX 3060).
   const KernelResources res = kernel_resources(fn, p, p.limits.max_threads_per_block, 0);
@@ -162,7 +173,8 @@ FuncAttrs func_attributes(const ptx::EntryFn& fn, const DeviceProfile& p, int pt
   a.regs = static_cast<int32_t>(res.usage.regs_per_thread);
   a.local = res.usage.local_bytes;
   a.shared = fn.static_shared_size;
-  a.max_threads = static_cast<int32_t>(p.limits.max_threads_per_block);
+  a.constant = constant;
+  a.max_threads = static_cast<int32_t>(kernel_thread_limit(fn, p, res.usage.regs_per_thread));
   a.binary = p.cc_major * 10 + p.cc_minor;
   a.ptx = ptx_arch ? ptx_arch : a.binary;
   return a;

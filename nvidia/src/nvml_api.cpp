@@ -448,6 +448,21 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTemperature(nvmlDevice_t device,
   return NVML_SUCCESS;
 }
 
+#ifdef nvmlTemperature_v1
+// The versioned form CUDA 13 deprecates nvmlDeviceGetTemperature for; tools
+// built against 13 (cuda_memtest) bind to it and fail to load without it.
+VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTemperatureV(nvmlDevice_t device, nvmlTemperature_t* temperature) { REQUIRE_INIT();
+  std::lock_guard<std::recursive_mutex> lock(g_mu);
+  refresh();
+  const auto* d = sample(device);
+  if (!d || !temperature) return bad(device);
+  if (temperature->version != nvmlTemperature_v1) return NVML_ERROR_ARGUMENT_VERSION_MISMATCH;
+  if (temperature->sensorType != NVML_TEMPERATURE_GPU) return NVML_ERROR_NOT_SUPPORTED;
+  temperature->temperature = static_cast<int>(d->temperature_c);
+  return NVML_SUCCESS;
+}
+#endif
+
 VGPU_EXPORT nvmlReturn_t nvmlDeviceGetTemperatureThreshold(nvmlDevice_t device,
                                                            nvmlTemperatureThresholds_t which,
                                                            unsigned int* temp) { REQUIRE_INIT();

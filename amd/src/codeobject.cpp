@@ -408,6 +408,9 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     kern.max_flat_workgroup_size = static_cast<uint32_t>(k.number(".max_flat_workgroup_size", 1024));
     kern.wavefront_size = static_cast<uint32_t>(k.number(".wavefront_size", 64));
     kern.uniform_work_group_size = k.number(".uniform_work_group_size") != 0;
+    if (const Msgpack* cd = k.at(".cluster_dims"); cd && cd->kind == Msgpack::Kind::Array && cd->list.size() == 3)
+      for (size_t i = 0; i < 3; ++i)
+        if (cd->list[i].kind == Msgpack::Kind::Int && cd->list[i].i > 0) kern.cluster_dims[i] = static_cast<uint32_t>(cd->list[i].i);
     if (const Msgpack* args = k.at(".args"); args && args->kind == Msgpack::Kind::Array)
       for (const Msgpack& a : args->list) {
         KernelArg arg;

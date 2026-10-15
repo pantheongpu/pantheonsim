@@ -1182,7 +1182,8 @@ endif()
 
 # CLI
 add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/ncu.cpp
-               src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp)
+               src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp
+               src/cli/config.cpp src/cli/config_cmd.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
@@ -1218,6 +1219,10 @@ endfunction()
 
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_profile)
+# The settings file: its parser and key table (src/cli/config.cpp) need nothing from the simulator.
+vgpu_unit_test(test_config)
+target_sources(test_config PRIVATE src/cli/config.cpp)
+target_include_directories(test_config PRIVATE src/cli)
 vgpu_unit_test(test_driver_version)
 vgpu_unit_test(test_memory)
 vgpu_unit_test(test_ptx)
@@ -1795,6 +1800,13 @@ set_tests_properties(amd_cper PROPERTIES DEPENDS vgpu_cli
 add_test(NAME regs_cli COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_regs_cli.sh)
 set_tests_properties(regs_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+# The settings file end to end (`vgpu config`, and the file's values reaching a command),
+# and the Makefile's targets, checked with `make -n` so nothing runs.
+add_test(NAME config_cli COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_config_cli.sh)
+set_tests_properties(config_cli PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
+add_test(NAME lint_makefile COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_makefile.sh)
+set_tests_properties(lint_makefile PROPERTIES TIMEOUT 120)
 add_test(NAME smi_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_cli.sh)
 set_tests_properties(smi_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
@@ -1963,6 +1975,21 @@ if(TARGET vgpucublaslt)
   target_include_directories(test_cublaslt_algo PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_cublaslt_algo COMMAND test_cublaslt_algo)
   set_tests_properties(test_cublaslt_algo PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1")
+  # cublasLtMatmul's host product against the plain loops, bit for bit (bf16, fp16, fp32, FP8, scales, layouts), and the
+  # heap it holds at its peak. An H100 profile: the FP8 cases need a device that has FP8.
+  add_executable(test_cublaslt_matmul nvidia/tests/unit/test_cublaslt_matmul.cpp)
+  target_link_libraries(test_cublaslt_matmul PRIVATE vgpucublaslt vgpucudart)
+  target_include_directories(test_cublaslt_matmul PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cublaslt_matmul COMMAND test_cublaslt_matmul)
+  set_tests_properties(test_cublaslt_matmul PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100;VGPU_QUIET=1;VGPU_THREADS=2" TIMEOUT 600)
+endif()
+# cublasGemmEx with half, bfloat16 and int8 operands, likewise.
+if(TARGET vgpucublas)
+  add_executable(test_cublas_gemmex_mixed nvidia/tests/unit/test_cublas_gemmex_mixed.cpp)
+  target_link_libraries(test_cublas_gemmex_mixed PRIVATE vgpucublas vgpucudart)
+  target_include_directories(test_cublas_gemmex_mixed PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cublas_gemmex_mixed COMMAND test_cublas_gemmex_mixed)
+  set_tests_properties(test_cublas_gemmex_mixed PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;VGPU_THREADS=2" TIMEOUT 600)
 endif()
 
 # A cuBLAS call captured into a CUDA graph. The library computes on the host,
@@ -2335,6 +2362,15 @@ if(TARGET vgpucublas)
         SKIP_REGULAR_EXPRESSION "^SKIP:"
         TIMEOUT 600)
     endforeach()
+    # The runtime functions only the 13.2 header declares: checked against their driver twins (SKIP unless the runtime shim
+    # was built with 13.2 headers).
+    add_test(NAME e2e_runtime_132
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_runtime_132.sh)
+    set_tests_properties(e2e_runtime_132 PROPERTIES
+      DEPENDS "vgpucudart;vgpucuda"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 300)
     add_test(NAME e2e_p2p_managed
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_p2p_managed.sh)
     set_tests_properties(e2e_p2p_managed PROPERTIES
@@ -2347,6 +2383,13 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_device_functions
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_device_functions.sh)
   set_tests_properties(e2e_device_functions PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_inplace_scalar_update
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_inplace_scalar_update.sh)
+  set_tests_properties(e2e_inplace_scalar_update PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
