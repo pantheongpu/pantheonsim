@@ -146,10 +146,10 @@ VTEST(buffer_loads_of_bytes_and_halves_into_lds_land_as_dwords) {
     const amd::CodeObject o = object("asm_cdna_ldsdma", target);
     MemoryManager mem(16ull << 20);
     const std::vector<uint8_t> src = lds_source();
-    const uint64_t in = put(mem, src), out = mem.alloc(7 * 64 * 4);
+    const uint64_t in = put(mem, src), out = mem.alloc(8 * 64 * 4);
     launch(o, "buf_lds_narrow", mem, {in, out});
-    const std::vector<uint32_t> got = get<uint32_t>(mem, out, 7 * 64);
-    std::vector<uint32_t> want(7 * 64, 0);
+    const std::vector<uint32_t> got = get<uint32_t>(mem, out, 8 * 64);
+    std::vector<uint32_t> want(8 * 64, 0);
     for (uint32_t l = 0; l < 64; ++l) {
       want[0 * 64 + l] = src[4 * l];
       want[1 * 64 + l] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(src[4 * l])));
@@ -158,12 +158,13 @@ VTEST(buffer_loads_of_bytes_and_halves_into_lds_land_as_dwords) {
       want[4 * 64 + l] = src[4 * l + 3] == 0xFF ? 0x3f800000u : 0u;   // an 8-bit unorm 255 is 1.0f
       want[5 * 64 + l] = u16_at(src, 4 * l + 2);
       if (std::string(target) != "gfx950") want[6 * 64 + l] = src[4 * l + 1];   // M0 = 0x10600: LDS offset 0x600
+      want[7 * 64 + l] = u32_at(src, 4 * l);   // the dword form, which gfx90a's guide lists too
     }
     int wrong = 0;
     for (size_t i = 0; i < want.size(); ++i) wrong += got[i] != want[i];
     if (wrong) {
       std::fprintf(stderr, "%s: %d wrong\n", target, wrong);
-      for (uint32_t r = 0; r < 7; ++r)
+      for (uint32_t r = 0; r < 8; ++r)
         std::fprintf(stderr, "  row %u: got %08x %08x %08x %08x want %08x %08x %08x %08x\n", r, got[r * 64], got[r * 64 + 1], got[r * 64 + 2],
                      got[r * 64 + 3], want[r * 64], want[r * 64 + 1], want[r * 64 + 2], want[r * 64 + 3]);
     }
@@ -529,6 +530,88 @@ VTEST(formatted_buffer_loads_and_stores_convert_by_the_resources_or_the_instruct
       for (int k = 0; k < 4; ++k) wrong += st[l * 4 + k] != w[k];
       wrong += st[256 + l * 2] != (w[0] & 0xFFFF);
       wrong += st[256 + l * 2 + 1] != (w[0] >> 16);
+    }
+    if (wrong) std::fprintf(stderr, "%s: %d wrong\n", target, wrong);
+    VCHECK_EQ(wrong, 0);
+  }
+}
+
+namespace {
+uint16_t bf16_bits(float f) { return static_cast<uint16_t>(std::bit_cast<uint32_t>(f) >> 16); }
+float bf16_value(uint16_t b) { return std::bit_cast<float>(uint32_t{b} << 16); }
+}  // namespace
+
+// gfx940's packed atomics (CDNA3 and CDNA4 ISA, DS_PK_ADD_F16 and its bfloat16 and _RTN forms, BUFFER_ATOMIC_PK_ADD_F16, gfx950's
+// BUFFER_ATOMIC_PK_ADD_BF16: "dst[31:16].f16 = tmp[31:16].f16 + src[31:16].f16; dst[15:0].f16 = tmp[15:0].f16 + src[15:0].f16"). The values are
+// multiples of 1/8 below 16, whose sums every one of the formats holds exactly.
+VTEST(packed_half_and_bfloat16_atomics_add_each_half_and_hand_back_the_old_pair) {
+  for (const char* target : {"gfx942", "gfx950"}) {
+    const bool bf_buffer = std::string(target) == "gfx950";
+    const amd::CodeObject o = object("asm_cdna_pk", target);
+    MemoryManager mem(16ull << 20);
+    uint32_t seed = 4242;
+    const auto eighth = [&] { return (static_cast<int>((seed = seed * 1664525u + 1013904223u) >> 16) % 129 - 64) / 8.0; };
+    const auto pk_f16 = [&] { const uint32_t lo = half_bits(eighth()); return lo | uint32_t{half_bits(eighth())} << 16; };
+    const auto pk_bf16 = [&] { const uint32_t lo = bf16_bits(static_cast<float>(eighth())); return lo | uint32_t{bf16_bits(static_cast<float>(eighth()))} << 16; };
+    std::vector<uint32_t> buf(384), vals(128);
+    for (uint32_t l = 0; l < 64; ++l) {
+      buf[4 * l] = pk_f16(), buf[4 * l + 1] = pk_f16(), buf[4 * l + 2] = pk_bf16(), buf[4 * l + 3] = pk_bf16();
+      buf[256 + l] = pk_f16();
+      buf[320 + l] = pk_bf16();
+      vals[2 * l] = pk_f16(), vals[2 * l + 1] = pk_bf16();
+    }
+    const uint64_t b = put(mem, buf), v = put(mem, vals), out = mem.alloc(4096 + 512);
+    launch(o, "pk_atomics", mem, {b, v, out});
+    const std::vector<uint32_t> got = get<uint32_t>(mem, out, (4096 + 512) / 4), after = get<uint32_t>(mem, b, 384);
+    const auto add_f16 = [&](uint32_t a, uint32_t d) {
+      uint32_t r = 0;
+      for (int h = 0; h < 2; ++h)
+        r |= uint32_t{half_bits(half_value(static_cast<uint16_t>(a >> (16 * h))) + half_value(static_cast<uint16_t>(d >> (16 * h))))} << (16 * h);
+      return r;
+    };
+    const auto add_bf16 = [&](uint32_t a, uint32_t d) {
+      uint32_t r = 0;
+      for (int h = 0; h < 2; ++h)
+        r |= uint32_t{bf16_bits(bf16_value(static_cast<uint16_t>(a >> (16 * h))) + bf16_value(static_cast<uint16_t>(d >> (16 * h))))} << (16 * h);
+      return r;
+    };
+    int wrong = 0;
+    for (uint32_t l = 0; l < 64; ++l) {
+      const uint32_t* m = &buf[4 * l];
+      const uint32_t d0 = vals[2 * l], d1 = vals[2 * l + 1];
+      wrong += got[4 * l + 0] != add_f16(m[0], d0);
+      wrong += got[4 * l + 1] != add_f16(m[1], d0);
+      wrong += got[4 * l + 2] != add_bf16(m[2], d1);
+      wrong += got[4 * l + 3] != add_bf16(m[3], d1);
+      wrong += got[512 + 2 * l] != m[1];   // the _RTN forms' old pairs
+      wrong += got[512 + 2 * l + 1] != m[3];
+      wrong += got[1024 + l] != buf[256 + l];   // the buffer atomic's old pair
+      wrong += after[256 + l] != add_f16(buf[256 + l], d0);
+      wrong += got[1024 + 64 + l] != (bf_buffer ? buf[320 + l] : 0u);
+      wrong += after[320 + l] != (bf_buffer ? add_bf16(buf[320 + l], d1) : buf[320 + l]);
+    }
+    if (wrong) std::fprintf(stderr, "%s: %d wrong\n", target, wrong);
+    VCHECK_EQ(wrong, 0);
+  }
+}
+
+// scratch_load_lds_* (CDNA3 and CDNA4 ISA 10.3: the data goes to LDS at M0[17:2] * 4 + INST.OFFSET + ThreadID * 4, a byte or a half extended to a
+// dword as the global forms' are): this segment used to be refused by a crash, from reading a destination register the instruction has not got.
+VTEST(scratch_loads_into_lds_land_as_dwords) {
+  for (const char* target : {"gfx942", "gfx950"}) {
+    const amd::CodeObject o = object("asm_cdna_pk", target);
+    MemoryManager mem(16ull << 20);
+    const uint64_t out = mem.alloc(5 * 256);
+    launch(o, "scratch_lds", mem, {out});
+    const std::vector<uint32_t> got = get<uint32_t>(mem, out, 5 * 64);
+    int wrong = 0;
+    for (uint32_t l = 0; l < 64; ++l) {
+      const uint32_t byte = (l + 0x80) & 0xFF, half = (0x8000 + l) & 0xFFFF;
+      wrong += got[l] != 7 * l + 1;
+      wrong += got[64 + l] != byte;
+      wrong += got[128 + l] != static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(byte)));
+      wrong += got[192 + l] != half;
+      wrong += got[256 + l] != static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(half)));
     }
     if (wrong) std::fprintf(stderr, "%s: %d wrong\n", target, wrong);
     VCHECK_EQ(wrong, 0);

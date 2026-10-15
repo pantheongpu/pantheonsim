@@ -52,6 +52,8 @@ buf_lds_narrow:
   s_mov_b32 m0, 0x10600                        // only M0[15:0] is the offset: the LDS offset is 0x600 (CDNA2 and CDNA3)
   buffer_load_ubyte v1, s[8:11], s12 offen lds
 #endif
+  s_mov_b32 m0, 0x700
+  buffer_load_dword v1, s[8:11], 0 offen lds
   s_waitcnt vmcnt(0)
   ds_read_b32 v2, v3 offset:0
   s_waitcnt lgkmcnt(0)
@@ -74,6 +76,9 @@ buf_lds_narrow:
   ds_read_b32 v2, v3 offset:1536
   s_waitcnt lgkmcnt(0)
   global_store_dword v3, v2, s[6:7] offset:1536
+  ds_read_b32 v2, v3 offset:1792
+  s_waitcnt lgkmcnt(0)
+  global_store_dword v3, v2, s[6:7] offset:1792
   s_waitcnt vmcnt(0)
   s_endpgm
 .Lbuf_lds_narrow_end:

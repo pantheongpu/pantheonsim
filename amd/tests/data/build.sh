@@ -79,7 +79,7 @@ done
 
 # What the CDNA ISA guides define and the executor used to refuse (test_amd_gcn_cdna_gaps): one source a target, run through the C
 # preprocessor for the spelling of the sc0/glc bit and for what only some parts have (GFX90A, GFX942 or GFX950 is defined).
-for src in asm_cdna_mem64 asm_cdna_ldsdma asm_cdna_ds asm_cdna_scalar asm_cdna_valu asm_cdna_formats; do
+for src in asm_cdna_mem64 asm_cdna_ldsdma asm_cdna_ds asm_cdna_scalar asm_cdna_valu asm_cdna_formats asm_cdna_pk; do
   for t in gfx90a gfx942 gfx950; do
     "$clang" -x assembler-with-cpp -D"$(echo "$t" | tr a-z A-Z)" -target amdgcn-amd-amdhsa -mcpu=$t -c "$src.s" -o "$src.$t.o"
     echo "wrote $(pwd)/$src.$t.o"
