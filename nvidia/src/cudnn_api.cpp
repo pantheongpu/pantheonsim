@@ -245,6 +245,32 @@ std::vector<size_t> broadcast_index(const Layout& a, const Layout& c) {
   return idx;
 }
 
+// out[0 .. n) = elements b .. b + n - 1 of C's broadcast of A's data (broadcast_index()'s mapping, one block): A's dimensions are C's or 1.
+void broadcast_block(const Layout& a, const Layout& c, const double* data, double* out, size_t b, size_t n) {
+  int64_t at[kMaxRank] = {}, astride[kMaxRank] = {};
+  size_t rest = b;
+  for (int d = c.rank; d-- > 0;) {
+    at[d] = static_cast<int64_t>(rest % static_cast<size_t>(c.dims[d]));
+    rest /= static_cast<size_t>(c.dims[d]);
+  }
+  int64_t s = 1;   // the stride of A's dimension d in A's packed order; 0 for a dimension A broadcasts
+  for (int d = c.rank; d-- > 0;) {
+    astride[d] = a.dims[d] == 1 ? 0 : s;
+    s *= a.dims[d];
+  }
+  int64_t j = 0;
+  for (int d = 0; d < c.rank; ++d) j += at[d] * astride[d];
+  for (size_t i = 0; i < n; ++i) {
+    out[i] = data[j];
+    for (int d = c.rank; d-- > 0;) {
+      j += astride[d];
+      if (++at[d] < c.dims[d]) break;
+      j -= astride[d] * c.dims[d];
+      at[d] = 0;
+    }
+  }
+}
+
 // The scaling factors' type for an operation writing `out`.
 inline double sc(const void* p, const Layout& out) { return scale_of(p, out.type); }
 
@@ -2200,6 +2226,16 @@ VGPU_EXPORT cudnnStatus_t cudnnAddTensor(cudnnHandle_t h, const void* alpha, con
   sync_handle(h);
   std::vector<double> va;
   if (!read(Ad->l, A, &va)) return CUDNN_STATUS_EXECUTION_FAILED;
+  {
+    // The broadcast A, a block of C at a time in cache (cudnn_common.hpp's map_packed): element i of C is element j of A, j found by
+    // an odometer over C's dimensions that starts from the block's first element.
+    const Layout& a = Ad->l;
+    const Layout& c = Cd->l;
+    const MapResult mr = map_packed(nullptr, nullptr, 0, c, C, sc(alpha, c), sc(beta, c),
+                                    [&](double* const* v, size_t n, size_t b) { broadcast_block(a, c, va.data(), v[0], b, n); });
+    if (mr == MapResult::Done) return CUDNN_STATUS_SUCCESS;
+    if (mr == MapResult::Failed) return CUDNN_STATUS_EXECUTION_FAILED;
+  }
   const std::vector<size_t> bi = broadcast_index(Ad->l, Cd->l);
   std::vector<double> r(bi.size());
   vgpu::hostpar::for_range(r.size(), 2, [&](size_t b, size_t e) { for (size_t i = b; i < e; ++i) r[i] = va[bi[i]]; });

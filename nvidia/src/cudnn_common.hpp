@@ -192,13 +192,19 @@ bool blend_write(const Layout& t, void* dev, const std::vector<double>& r, doubl
 // so f must be a function of its elements alone.
 enum class MapResult { Declined, Failed, Done };
 MapResult map_packed_impl(const Layout* const* in, const void* const* indev, int nin, const Layout& out, void* outdev, double alpha,
-                          double beta, void (*f)(void*, double* const*, size_t), void* ctx);
+                          double beta, void (*f)(void*, double* const*, size_t, size_t), void* ctx);
+// f(v, n) -- or f(v, n, b), told that the block starts at element b -- may be given no inputs at all (nin = 0): v[0] is then a block to
+// fill.
 template <class F>
 MapResult map_packed(const Layout* const* in, const void* const* indev, int nin, const Layout& out, void* outdev, double alpha,
                      double beta, F&& f) {
   using Fn = std::remove_reference_t<F>;
   return map_packed_impl(in, indev, nin, out, outdev, alpha, beta,
-                         [](void* c, double* const* v, size_t n) { (*static_cast<Fn*>(c))(v, n); }, const_cast<Fn*>(&f));
+                         [](void* c, double* const* v, size_t n, size_t b) {
+                           if constexpr (std::is_invocable_v<Fn&, double* const*, size_t, size_t>) (*static_cast<Fn*>(c))(v, n, b);
+                           else (*static_cast<Fn*>(c))(v, n);
+                         },
+                         const_cast<Fn*>(&f));
 }
 
 /* ---- convolution ---- */

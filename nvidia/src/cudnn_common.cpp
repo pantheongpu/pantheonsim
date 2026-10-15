@@ -481,9 +481,9 @@ std::vector<uint8_t>* slot_buffer(int slot, size_t n) {
 }  // namespace
 
 MapResult map_packed_impl(const Layout* const* in, const void* const* indev, int nin, const Layout& out, void* outdev, double alpha,
-                          double beta, void (*f)(void*, double* const*, size_t), void* ctx) {
+                          double beta, void (*f)(void*, double* const*, size_t, size_t), void* ctx) {
   const size_t n = out.count();
-  if (!n || nin < 1 || nin > 3 || !outdev || !packed_row_major(out)) return MapResult::Declined;
+  if (!n || nin < 0 || nin > 3 || !outdev || !packed_row_major(out)) return MapResult::Declined;
   for (int k = 0; k < nin; ++k)
     if (!in[k] || in[k]->count() != n || !packed_row_major(*in[k]) || !indev[k]) return MapResult::Declined;
   // One copy out of device memory per tensor read.
@@ -505,7 +505,7 @@ MapResult map_packed_impl(const Layout* const* in, const void* const* indev, int
     double buf[3][kBlock], old[kBlock];
     double* v[3] = {buf[0], buf[1], buf[2]};
     for (int k = 0; k < nin; ++k) decode_block(in[k]->type, rawin[k], b, e, v[k]);
-    f(ctx, v, m);
+    f(ctx, v, m, b);
     if (beta == 0.0) {
       for (size_t i = 0; i < m; ++i) v[0][i] = alpha * v[0][i];
     } else {
