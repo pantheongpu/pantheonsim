@@ -89,12 +89,12 @@ run_vmem() {   # run_vmem <label> <extra cflags...>
   out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x timeout 120 "$tmp/hsa_vmem" 2>&1)
   status=$?
   passed=$(grep -c '^ok ' <<< "$out")
-  if [[ $status != 0 ]] || grep -q '^FAIL' <<< "$out" || [[ $passed != 10 ]]; then
-    echo "FAIL  virtual memory and IPC, built against $label: $passed of 10 (exit $status)"
+  if [[ $status != 0 ]] || grep -q '^FAIL' <<< "$out" || [[ $passed != 11 ]]; then
+    echo "FAIL  virtual memory and IPC, built against $label: $passed of 11 (exit $status)"
     echo "$out" | grep -v '^ok ' | tail -5 | sed 's/^/      /'
     fail=1
   else
-    echo "ok    virtual memory and IPC, built against $label: 10 of 10"
+    echo "ok    virtual memory and IPC, built against $label: 11 of 11"
   fi
 }
 

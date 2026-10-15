@@ -84,6 +84,20 @@ expect "each lane's printf comes out whole, in lane order" \
 expect "and printf returns what it printed" "printf returned what it printed for 3 of 3 lanes" \
   "$(grep -o 'printf returned .*' <<< "$out")"
 
+# What a kernel asks of the host (hipcc/hostcall.cpp): a host function it names
+# (the device library's function call service), malloc and free (the device
+# memory service, over the heap the runtime provides), printf's conversions and
+# the fprintf interface -- on a wave64 MI300X, an MI250X and a wave32 RX 7900 XTX.
+for run in "gfx942 mi300x" "gfx90a mi250x" "gfx1100 rx7900xtx"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/hostcall.$1" 2>&1)
+  status=$?
+  echo "$out" | sed 's/^/      /'
+  expect "the $1 hostcall program runs to the end" "0" "$status"
+  expect "every $1 hostcall check holds (function call, malloc and free, printf, fprintf)" "7 of 7" \
+    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 7"
+done
+
 # A cooperative launch: sixteen work-groups each publish a value, wait at a
 # grid barrier, and sum what all of them published, then wait again before
 # clearing it -- right only if no group got past a barrier early. A grid one

@@ -7797,6 +7797,8 @@ void fill_hidden_arguments(const Dispatch& d, const Kernel& k, MemoryManager& me
     else if (kind == "hidden_private_base") value = kPrivateBase;
     else if (kind == "hidden_dynamic_lds_size") value = d.dynamic_lds;
     else if (kind == "hidden_hostcall_buffer") value = d.hostcall ? d.hostcall->buffer() : 0;
+    // The state of the device library's malloc, which the runtime sets up (ROCm's CLR does the same).
+    else if (kind == "hidden_heap_v1") value = d.hostcall ? d.hostcall->heap() : 0;
     // The size of the last work-group in each dimension, where the grid is
     // not a whole number of them; zero where it is.
     else if (kind == "hidden_remainder_x") value = threads_x % d.group_size[0];
@@ -7805,9 +7807,9 @@ void fill_hidden_arguments(const Dispatch& d, const Kernel& k, MemoryManager& me
     // What a grid barrier counts on, in a cooperative launch; zero otherwise,
     // which is how a kernel tells that its grid cannot synchronize.
     else if (kind == "hidden_multigrid_sync_arg") value = d.grid_sync;
-    // Everything else -- the global offsets, a heap for device malloc -- is
-    // zero, and a kernel that needs one of those will say so by failing on a
-    // null pointer rather than reading something made up.
+    // Everything else -- the global offsets, the default queue -- is zero,
+    // and a kernel that needs one of those will say so by failing on a null
+    // pointer rather than reading something made up.
     else continue;
     if (a.offset + a.size > k.kernarg_size) continue;
     for (uint32_t b = 0; b < a.size && b < 8; ++b)

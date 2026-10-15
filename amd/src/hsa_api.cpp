@@ -1281,7 +1281,13 @@ hsa_status_t hsa_amd_memory_pool_allocate(hsa_amd_memory_pool_t pool, size_t siz
   if (id.kind == PoolKind::Device) {
     const int gpu = gpu_of(id.agent);
     try {
-      const uint64_t va = shared::memory(gpu).alloc(size);
+      // KFD places a big buffer on the largest power of two up to a 2 MiB huge page that it holds twice or more
+      // (ROCT-Thunk-Interface, fmm.c, "Align big buffers to the next power-of-2 up to huge page"). ROCm's CLR counts
+      // on it: the device library's malloc finds a 2 MiB slab by masking an address down to a multiple of 2 MiB,
+      // and CLR gives it a plain 2 MiB buffer.
+      uint64_t align = 4096;
+      while (align < (uint64_t{2} << 20) && size >= (align << 1)) align <<= 1;
+      const uint64_t va = shared::memory(gpu).alloc(size, align);
       std::lock_guard<std::mutex> lock(g_mutex);
       g_device[va] = {gpu, size};
       *ptr = reinterpret_cast<void*>(va);

@@ -28,6 +28,13 @@ echo "wrote $(pwd)/chevron.O0.gfx942, chevron.O0.gfx942.o and its listing ($(wc 
 "$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 printf.gfx942.o |
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > printf.gfx942.dis
 echo "wrote $(pwd)/printf.gfx942, printf.gfx942.o and its listing ($(wc -l < printf.gfx942.dis) instructions)"
+# What a kernel asks of the host while it runs: a host function, malloc and
+# free, printf's conversions and the library's fprintf. Wave64 (CDNA and CDNA2)
+# and wave32 (RDNA3).
+for arch in gfx942 gfx90a gfx1100; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch hostcall.cpp -o hostcall.$arch
+done
+echo "wrote $(pwd)/hostcall.gfx942, hostcall.gfx90a and hostcall.gfx1100"
 # Occupancy, device attributes, and a kernel reaching another device's memory.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 runtime.cpp -o runtime.gfx942
 echo "wrote $(pwd)/runtime.gfx942"

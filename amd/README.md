@@ -248,12 +248,29 @@ Device-side `malloc` and `free` are the second (service 3, ockl's
 `__ockl_devmem_request`): the device library's allocator asks the host for
 its 2 MiB slabs and for large blocks, and gives them back; the host answers
 with device memory placed on the alignment the library finds slabs by, and a
-null pointer when the device is full (`tests/data/devmalloc.cpp`, run by
-`test_amd_runtime_gaps`). The address sanitizer's report (service 4) ends the
+null pointer when the device is full. A kernel built for code object version
+5 or later (every current hipcc) keeps the allocator's state in a block the
+runtime provides (`hidden_heap_v1`); the runtime makes it, 128 KiB with the
+counts of recordable slabs the allocator expects to find, when the first
+kernel that has the argument launches (`Hostcall::heap`, the layout is
+dm.cl's; ROCm's CLR does the same with the device library's own
+initialization kernel); earlier code objects keep it in their own data
+(`tests/data/devmalloc.cpp`, run by `test_amd_runtime_gaps`). The address
+sanitizer's report (service 4) ends the
 kernel with the report as the error (ROCm's runtime prints it and aborts); no
 sanitizer-instrumented code was available to run it, so it is checked against
-the device library's argument order only. A hostcall for any other service
-(a device function call) is refused by name. Vector loads and stores may be unaligned, as ROCm runs the
+the device library's argument order only. The device function call (service 1,
+`__ockl_call_host_function`) calls a host function the kernel names, once for
+each lane that makes the call: word 0 of a lane's slot is the function's
+address (`void f(uint64_t* output, const uint64_t* input)` -- seven words in,
+two out, the signature ROCm's CLR documents), and its two output words come
+back. Those are all the services the device library has; the fprintf
+interface (`__ockl_fprintf_*`, the stderr stream included, which `assert`
+uses) and printf are service 2. `tests/hipcc/hostcall.cpp` runs a host
+function, malloc and free, printf's conversions and fprintf from a kernel
+on the shim (wave64 and wave32), and the same program's host function,
+malloc and fprintf parts run on ROCm's own HIP over the HSA runtime.
+Vector loads and stores may be unaligned, as ROCm runs the
 hardware; the compiler counts on that when it packs a string.
 
 A program hipcc built carries linked code objects, whose code reaches its

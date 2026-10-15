@@ -2064,8 +2064,8 @@ Still open, each with the reason:
   (amd/include/vgpu/amd_exec.hpp:109); MFMA input rounding not modelled (amd/src/gcn_decode.cpp:982); the 6-bit
   form 0xe1 (:760); undecoded RDNA opcodes, operands and ray-tracing image instructions
   (amd/src/rdna_decode.cpp:148, :279, :335, :563).
-- Runtime: hostcall services other than printf, i.e. device malloc and the address sanitizer
-  (amd/src/hostcall.cpp:121); linking several code objects into one (amd/src/hip_api.cpp:6982); stream-capture
+- Runtime: the address sanitizer's hostcall report is checked against the device library's argument
+  order only, no instrumented code ran it (amd/src/hostcall.cpp); linking several code objects into one (amd/src/hip_api.cpp:6982); stream-capture
   refusals (amd/src/hip_graph.inc:942, :2638); sRGB over linear memory (amd/src/hip_images.inc:742); compressed
   offload bundles need zlib or zstd and refuse other methods (amd/src/bundle.cpp:43-146); graphics interop
   (`hsa_amd_image_create`, `hsa_amd_interop_map_buffer`, `hsa_amd_interop_unmap_buffer`,
