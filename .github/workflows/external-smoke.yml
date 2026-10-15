@@ -80,7 +80,7 @@ jobs:
         # The runtime and the driver, and cuRAND (MC_EstimatePiP).
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j"$(ci/jobs.sh -p release)"
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpucudart vgpucuda vgpucurand
 
       - name: The subsets
         id: subsets
