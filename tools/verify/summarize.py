@@ -33,7 +33,7 @@ import statistics
 import sys
 
 TIMING_WORDS = re.compile(
-    r"(\d\s*s\b|time|elapsed|second|\bsecs?\b|\bms\b|msec|usec|\bus\b|µs|gflop|tflop|gb/s|mb/s|gbps|throughput|bandwidth|"
+    r"(\d\s*s\b|\btook\b|execution|\bback\b|time|elapsed|second|\bsecs?\b|\bms\b|msec|usec|\bus\b|µs|gflop|tflop|gb/s|mb/s|gbps|throughput|bandwidth|"
     r"speedup|latency|\brate\b|/s\b|per second|cycles|clock|duration|runtime|perf|fps|gigaflops|"
     r"kernel execution|total |average|avg|elapsed)", re.I)
 NUM = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?")
@@ -242,7 +242,8 @@ def main():
     stats = {}  # (corpus, pair) -> verdict -> count
     selfdiff = {}
     for (c, p), cfgs in sorted(runs.items()):
-        timed = modes.get((c, p)) == "timed"
+        mode = next((r.meta["mode"] for r in cfgs.values() if "mode" in r.meta), modes.get((c, p)))
+        timed = mode == "timed" or (mode is None and c == "pantheon")
         # which components differ between A and A2: those are not stable even on one build
         unstable = set()
         if "A" in cfgs and "A2" in cfgs and cfgs["A"].status != "missing" and cfgs["A2"].status != "missing" \

@@ -16,6 +16,7 @@ Written for the round 7 + 8 speed work (A = `origin/main` before round 8, B = `o
 | `build_polybench_small.sh` | builds small-size copies of PolyBench/GPU (see below) |
 | `build_pantheon.sh` | builds the pantheon workloads once, for both builds |
 | `nvcc_locked.sh` | nvcc under the machine-wide build lock, niced and memory-capped, with `-cudart shared` |
+| `fixed_time.c` | an `LD_PRELOAD` library that pins `time()` and `clock()`, for programs that seed their input from them (see below) |
 | `compat.h` | maps `cudaThreadSynchronize` (removed in CUDA 12) for the older benchmark sources |
 
 ## Corpora
@@ -87,6 +88,13 @@ counts the samples that waive themselves with exit code 2), `nondeterministic` (
 component), `different`, `timeout-vs-done` (one side hit the timeout, the other did not), `both-timeout`, `n/a`.
 `Bp:Ap` has no PTX self-comparison; a PTX difference in a program that is nondeterministic on the SASS engine is labelled
 `nondeterministic` only by that proxy and should be rerun.
+
+Programs that differ from themselves because they seed their input from the clock (CUDA Samples `fp16ScalarProduct`,
+`radixSortThrust`, `UnifiedMemoryStreams`, Rodinia `particlefilter_float`) can be compared by running them with the
+pinned clock: build `fixed_time.c` (`gcc -shared -fPIC fixed_time.c -o fixed_time.so`) and add
+`+LD_PRELOAD=/path/fixed_time.so` to every configuration spec, for example
+`--configs 'A=A+LD_PRELOAD=...,B=B+LD_PRELOAD=...'`. Programs that print a process id (the IPC samples) or
+uninitialised memory (Rodinia `backprop`'s `output.dat` tail) stay different from themselves.
 
 Not covered: the real card (no GPU runs), more than one host thread (`VGPU_THREADS=1` is what makes the order, and so the output, deterministic),
 programs the corpora do not contain, and anything that needs more than the per-corpus timeout.

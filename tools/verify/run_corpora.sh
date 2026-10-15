@@ -198,7 +198,7 @@ run_one() {   # corpus name mode cwd timeout cmd cfgname cfgspec
   # fresh and timed runs used an empty directory of their own: its outputs are the copies in files/
   [[ "$mode" != inplace ]] && rm -rf "${rdir:?}/work"
   local secs; secs=$(echo "$t1 - $t0" | bc -l)
-  { echo "corpus=$corpus"; echo "program=$name"; echo "config=$cfg"; echo "spec=$spec"; echo "cmd=$cmd"
+  { echo "corpus=$corpus"; echo "program=$name"; echo "mode=$mode"; echo "config=$cfg"; echo "spec=$spec"; echo "cmd=$cmd"
     echo "cwd=$cwd"; echo "timeout=$to"; echo "rc=$rc"; printf 'secs=%.2f\n' "$secs"
     echo "load_at_start=$load"; echo "load_at_end=$(cut -d' ' -f1-3 /proc/loadavg)"
     echo "date=$(date -Is)"; } > "$rdir/meta"
