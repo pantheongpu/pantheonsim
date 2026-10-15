@@ -3,6 +3,7 @@
 // held to the interpreter's by nvidia/tests/e2e/run_sass_tier.sh; this is the part that needs no program to run --
 // operand resolution, constant rows, register bounds, the guard -- and it runs on every instruction shape the
 // corpora hold (41,000 lines over 11 targets), which no kernel of ours reaches.
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -59,6 +60,15 @@ void check_corpus(const std::string& file, int sm) {
   prog.ops.resize(instrs.size());
   std::map<std::string, Tally> by_op;
   size_t accepted = 0;
+  {   // (the cost of the analysis, for VGPU_SASS_REPORT: the whole corpus built again into a scratch program)
+    const auto t0 = std::chrono::steady_clock::now();
+    sass::tier::Program scratch;
+    scratch.ops.resize(instrs.size());
+    for (size_t i = 0; i < instrs.size(); ++i) sass::tier::analyze(instrs[i], sm, scratch, scratch.ops[i]);
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    if (std::getenv("VGPU_SASS_REPORT"))
+      std::fprintf(stderr, "%s: analysis %.0f ns per instruction (%zu instructions, %.0f us)\n", file.c_str(), 1000.0 * us / double(instrs.size()), instrs.size(), us);
+  }
   for (size_t i = 0; i < instrs.size(); ++i) {
     const sass::Instr& ins = instrs[i];
     sass::tier::MOp& op = prog.ops[i];
@@ -110,6 +120,9 @@ void check_corpus(const std::string& file, int sm) {
     for (const auto& [op, t] : by_op)
       if (t.straight) std::fprintf(stderr, "  %-10s %5zu of %5zu straight-line forms taken\n", op.c_str(), t.accepted, t.straight);
     std::fprintf(stderr, "%s: %zu of %zu instructions have a handler\n", file.c_str(), accepted, instrs.size());
+    std::fprintf(stderr, "%s: sizeof(MOp) %zu, sizeof(Instr) %zu; the tier of these %zu instructions: %zu bytes of MOps, %zu pool rows of %zu bytes\n",
+                 file.c_str(), sizeof(sass::tier::MOp), sizeof(sass::Instr), instrs.size(), instrs.size() * sizeof(sass::tier::MOp),
+                 prog.pool.size(), sizeof(sass::tier::Row));
   }
   // The forms the tier exists for must be taken somewhere in every corpus that has them.
   for (const char* must : {"IMAD", "IADD3", "LOP3", "ISETP", "SHF", "FFMA", "LDG", "STG"})

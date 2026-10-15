@@ -8,6 +8,11 @@
 # must pass and print byte for byte the same -- every result and every counter of every launch, and the text of any
 # error -- apart from the tier's own statistics lines (VGPU_TIER_STATS=1, lines starting "tier").
 #
+# sass_tier_steps.cu holds what Runner::step_warp does besides executing an instruction -- the store gate, the step count and its
+# limit, the 256-instruction run, the count of calls that a warp's turn is made of (a warp that spins on another's store counts
+# its iterations), faults -- and the tier's chain of runs is held to all of it. Its faults and its step limit run in processes of
+# their own (the text of each error must be the same).
+#
 # The comparison cannot pass by the tier doing nothing: the statistics must show that the tier ran at least
 # VGPU_TIER_MIN_PERCENT (default 30) percent of sass_tier's warp instructions.
 #

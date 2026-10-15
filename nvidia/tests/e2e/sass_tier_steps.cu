@@ -120,6 +120,22 @@ __global__ void spin(u32* flag, u32* out) {
   }
 }
 
+// Every thread of two warps takes a spin lock (the lanes of a warp compete for it: a YIELD loop, convergence barriers, the lane
+// group that won and the groups that gave way), adds to a counter inside and releases it.
+__global__ void spinlock(u32* lock, u32* counter, u32* out) {
+  bool done = false;
+  while (!done) {
+    if (atomicCAS(lock, 0u, 1u) == 0u) {
+      const u32 v = *reinterpret_cast<volatile u32*>(counter);
+      *reinterpret_cast<volatile u32*>(counter) = v + 1;
+      __threadfence();
+      atomicExch(lock, 0u);
+      done = true;
+    }
+  }
+  out[threadIdx.x] = threadIdx.x + 1;
+}
+
 // ---- 2. the step limit -------------------------------------------------------------------------------------------
 // One warp: loads and stores, a loop, a shuffle, a vote, a barrier, a branch that splits the lanes, an exit by every lane.
 __global__ void steps_kernel(u32* data, u32* out) {
@@ -381,6 +397,28 @@ int main(int argc, char** argv) {
     if (run_spin<5>(nm, threads)) return 1;
     std::snprintf(nm, sizeof nm, "spin_long   %d", threads);
     if (run_spin<6>(nm, threads)) return 1;
+  }
+
+  {
+    u32 *lock, *counter, *out;
+    CK(cudaMalloc(&lock, 4));
+    CK(cudaMalloc(&counter, 4));
+    CK(cudaMalloc(&out, 256 * 4));
+    for (int threads : {32, 64, 96}) {
+      CK(cudaMemset(lock, 0, 4));
+      CK(cudaMemset(counter, 0, 4));
+      CK(cudaMemset(out, 0, 256 * 4));
+      spinlock<<<1, threads>>>(lock, counter, out);
+      u32 n = 0;
+      const cudaError_t e = cudaDeviceSynchronize();
+      if (e) {
+        std::printf("spinlock %d: error %s\n", threads, cudaGetErrorString(e));
+        return 0;
+      }
+      CK(cudaMemcpy(&n, counter, 4, cudaMemcpyDeviceToHost));
+      std::printf("spinlock %-17d counter=%u (of %d)\n", threads, n, threads);
+    }
+    CK(cudaFree(lock)); CK(cudaFree(counter)); CK(cudaFree(out));
   }
 
   // Reconvergence and barriers, with block sizes that are not whole warps.
