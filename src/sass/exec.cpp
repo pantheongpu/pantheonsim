@@ -356,6 +356,7 @@ class Runner {
   uint32_t tier_sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const { return sreg(blk, w, idx, lane); }
   void tier_exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mem(blk, w, ins, ex); }
   uint32_t tier_cbank32(unsigned bank, uint64_t offset) const { return cbank32(bank, offset); }
+  void tier_exec_float(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_float(blk, w, ins, ex); }
   ~Runner() {
     if (coop_ws_) {
       try {

@@ -92,7 +92,8 @@ void check_corpus(const std::string& file, int sm) {
                       op.form == sass::tier::Form::Bsync || op.form == sass::tier::Form::Yield || op.form == sass::tier::Form::Bar || op.form == sass::tier::Form::Exit;
     const bool terminal = op.form == sass::tier::Form::Plop3 || op.form == sass::tier::Form::S2r || op.form == sass::tier::Form::Sel ||
                           op.form == sass::tier::Form::Shfl || op.form == sass::tier::Form::Vote || op.form == sass::tier::Form::Hmma ||
-                          op.form == sass::tier::Form::Umov || op.form == sass::tier::Form::Uldc || op.form == sass::tier::Form::Usel;   // end a run, and have handlers
+                          op.form == sass::tier::Form::Umov || op.form == sass::tier::Form::Uldc || op.form == sass::tier::Form::Usel ||
+                          op.form == sass::tier::Form::Cs2r;   // end a run, and have handlers
     VCHECK(ins.straight != (ends || terminal));
     VCHECK(op.maxreg <= 256);   // 0 is possible: constants into RZ
     const std::string what = std::string(sass::tier::form_name(op.form)) + " " + sass::to_text(ins);

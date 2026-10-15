@@ -265,7 +265,7 @@ const char* form_name(Form f) {
   static const char* const names[] = {"none",  "mov",   "iadd3", "iadd3x", "imad",  "imad32", "imadwide", "imadhi",
                                       "isetpex", "popc", "i2fp",  "ldg",    "stg",   "lds",    "sts",      "ldl",
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
-                                      "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "sel",   "prmt",  "imnmx",
+                                      "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "cs2r", "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "iabs", "ldc",
                                       "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
   const unsigned i = static_cast<unsigned>(f);
@@ -526,6 +526,16 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
       m.a = ins.f[0];
       accept(Form::S2r);
+      return;
+    }
+    case Op::CS2R: {   // a special register (not a performance-monitor counter: refused), or SRZ (0), into a register or a pair
+      if (ins.guard_uniform || ins.dst.empty() || ins.dst[0].kind != Kind::Reg || (ins.f[0] >= 0x64 && ins.f[0] <= 0x73)) return;
+      const bool pair = ins.dst[0].width == 2;
+      if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
+      if (pair && ins.dst[0].reg != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(ins.dst[0].reg + (ins.dst[0].reg + 1 == kRZ ? 1 : 2)));
+      m.a = ins.f[0];
+      m.b = pair ? 1 : 0;
+      accept(Form::Cs2r);
       return;
     }
     default: break;
@@ -1057,7 +1067,9 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       // Packed f16 (fast_float): each half the double-precision fma of its inputs rounded once. The f32 result, bf16 and
       // saturation forms are the interpreter's.
       const unsigned need = ins.op == Op::HFMA2 ? 3u : 2u;
-      if (ins.guard_uniform || ins.f[0] || ins.f[1] || ins.f[3] || ins.src.size() < need) return;
+      // (the f32 result is HADD2 without .FTZ only: the half to float conversion ptxas emits)
+      const bool f32out = ins.f[1];
+      if (ins.guard_uniform || ins.f[0] || ins.f[3] || (f32out && (ins.op != Op::HADD2 || ins.f[2])) || ins.src.size() < need) return;
       // packed(): an immediate pair/single, or a register, uniform register, bank-0 word, with a half swizzle and |.|, -.
       const auto packed = [&](const Operand& o, Src& out, uint32_t& opbits) -> bool {
         opbits = 0;
@@ -1102,6 +1114,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       if (!reg_dst(ins.dst[0], m.dst, maxreg)) return;
       m.a = ins.op == Op::HADD2 ? 0 : ins.op == Op::HMUL2 ? 1 : 2;
       m.b = ob[0] | ob[1] << 4 | ob[2] << 8;
+      m.aux = f32out ? 1 : 0;
       accept(Form::Hop2);
       return;
     }

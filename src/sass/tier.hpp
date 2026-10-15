@@ -92,6 +92,7 @@ enum class Form : uint8_t {
   Nop,
   Plop3,     // PLOP3, S2R and SEL end a run (they are not straight-line ones) but need nothing of the interpreter
   S2r,
+  Cs2r,      // CS2R: a special register, or SRZ, into a register or a pair
   Sel,
   Prmt,
   Imnmx,

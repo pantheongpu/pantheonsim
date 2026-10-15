@@ -670,10 +670,34 @@ inline const uint32_t* tier_pk(const TCtx& c, const tier::Src& s, unsigned opbit
 
 TIER_HANDLER(h_hop2) {
   TIER_PRELUDE
-  if (op.dst == tier::kNoReg) return;
   alignas(32) uint32_t t[3][32], u[3][32];
   const uint32_t* a = tier_pk(c, op.s[0], op.b & 15, t[0], u[0]);
   const uint32_t* b = tier_pk(c, op.s[1], (op.b >> 4) & 15, t[1], u[1]);
+  if (op.aux & 1) {
+    // HADD2.F32: the sum of the two low halves in double, rounded once to float -- for the usual a = -RZ (the half to float conversion)
+    // exactly the half's value. A NaN among the operands (which of two NaNs the host keeps depends on how the compiler ordered the
+    // operands) is the general rule's.
+    alignas(32) uint16_t h16[2][32];
+    alignas(32) float f[2][32];
+    uint32_t nan_seen = 0;
+    for (unsigned l = 0; l < 32; ++l) {
+      h16[0][l] = static_cast<uint16_t>(a[l]);
+      h16[1][l] = static_cast<uint16_t>(b[l]);
+      nan_seen |= ((h16[0][l] & 0x7fffu) > 0x7c00u) | ((h16[1][l] & 0x7fffu) > 0x7c00u);
+    }
+    if (nan_seen) {
+      c.r->tier_exec_float(*c.blk, *c.w, *op.ins, ex);
+      return;
+    }
+    if (op.dst == tier::kNoReg) return;
+    c.sk->f16_to_f32(h16[0], f[0], 32);
+    c.sk->f16_to_f32(h16[1], f[1], 32);
+    alignas(32) uint32_t out[32];
+    for (unsigned l = 0; l < 32; ++l) out[l] = f32_bits(static_cast<float>(static_cast<double>(f[0][l]) + f[1][l]));
+    tier_store(c, op.dst, ex, out);
+    return;
+  }
+  if (op.dst == tier::kNoReg) return;
   const uint32_t* d3 = tier_pk(c, op.s[2], (op.b >> 8) & 15, t[2], u[2]);
   uint32_t* d = c.R + op.dst * 32u;
   if (op.a == 0) c.sk->hfma2_m(d, a, d3, b, ex, 32, 2);        // a * 1 + b (s[2] holds the ones)
@@ -1178,6 +1202,24 @@ TIER_HANDLER(h_s2r) {
   }
 }
 
+TIER_HANDLER(h_cs2r) {
+  TIER_PRELUDE
+  if (op.dst == tier::kNoReg) return;
+  uint32_t* d = c.R + op.dst * 32u;
+  const unsigned idx = op.a;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    const uint32_t lo = idx == 0xff ? 0 : c.r->tier_sreg(*c.blk, *c.w, idx, l);
+    if (op.b) {
+      const uint32_t hi = idx == 0xff ? 0 : c.r->tier_sreg(*c.blk, *c.w, idx + 1, l);
+      d[l] = lo;
+      if (op.dst + 1u != kRZ) d[32 + l] = hi;
+    } else {
+      d[l] = lo;
+    }
+  }
+}
+
 TIER_HANDLER(h_sel) {
   TIER_PRELUDE
   alignas(32) uint32_t t[2][32], r[32];
@@ -1308,6 +1350,7 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Dop: return &h_dop;
     case F::Plop3: return &h_plop3;
     case F::S2r: return &h_s2r;
+    case F::Cs2r: return &h_cs2r;
     case F::Sel: return &h_sel;
     case F::Prmt: return &h_prmt;
     case F::Imnmx: return &h_imnmx;
