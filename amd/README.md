@@ -372,10 +372,11 @@ modelled:
 ## What the CDNA parts still refuse
 
 A coverage probe keeps this list honest: every instruction `llvm-mc` will disassemble for a target (every opcode of each encoding,
-with and without DPP and SDWA, memory forms with and without the LDS bit, and a set of modifier variants of each, 5,000 to
-7,000 forms a target on top of the plain ones) goes into a kernel of its own, and each kernel runs in a process of its own; what stops with
+with and without DPP and SDWA, memory forms with and without the LDS bit: 1,894 forms for gfx90a, 1,922 for gfx942 and 2,031 for gfx950,
+and 4,400 to 5,300 more a target in modifier variants) goes into a kernel of its own, and each kernel runs in a process of its own; what stops with
 "decoded but not implemented", "not decoded" or any other unsupported error is the list. gfx90a, gfx942 and gfx950 had 239, 167
-and 211 plain forms in that state before this pass; the CDNA2, CDNA3 and CDNA4 guides settle most of them, and `tests/unit/test_gcn_cdna_gaps.cpp`
+and 211 plain forms in that state before this pass and 105, 66 and 109 after (the rest are a probe's zero resource descriptors, which no
+format or image instruction can read, jumps to address 0, and what the list below says is left); gfx1250's corpus of 4,549 forms went from 34 to 10; the CDNA2, CDNA3 and CDNA4 guides settle most of them, and `tests/unit/test_gcn_cdna_gaps.cpp`
 (kernels in `tests/data/asm_cdna_*.s`, one source for the three parts, with the expected values written again from the guides'
 pseudocode) runs what they say:
 
