@@ -1,6 +1,7 @@
 // What the CDNA guides leave open and the executor therefore still refuses, so that a change which starts guessing shows up: setting the HALT
 // bit (nothing here resumes a halted wave; clearing it is a no-op), s_sendmsghalt, an M0 of 64 KiB or more for gfx950's MUBUF load into LDS (CDNA4's
-// text says M0[17:0] and its figure M0[15:0]) and gfx950's 6-bit transposing read (the guide gives only "Two instruction load a complete matrix").
+// text says M0[17:0] and its figure M0[15:0]), v_exp_legacy_f32 and v_log_legacy_f32 ("Power with legacy semantics", no definition of the difference from
+// v_exp_f32 and v_log_f32 in any public guide), an MFMA whose CBSZ broadcasts to more blocks than it has (undefined, CDNA3 guide 7.1.5.1) and gfx950's 6-bit transposing read (the guide gives only "Two instruction load a complete matrix").
 //
 // Assembled for gfx90a, gfx942 and gfx950 by build.sh (clang's assembler with the C preprocessor: GFX90A, GFX942 or GFX950 is
 // defined, and RET is how the target spells "return the old value": glc on gfx90a, sc0 after it).
@@ -41,6 +42,22 @@ msg_halt:
   s_endpgm
 .Lmsg_halt_end:
   .size msg_halt, .Lmsg_halt_end-msg_halt
+  .globl exp_legacy
+  .p2align 8
+  .type exp_legacy,@function
+exp_legacy:
+  v_exp_legacy_f32 v1, v0
+  s_endpgm
+.Lexp_legacy_end:
+  .size exp_legacy, .Lexp_legacy_end-exp_legacy
+  .globl log_legacy
+  .p2align 8
+  .type log_legacy,@function
+log_legacy:
+  v_log_legacy_f32 v1, v0
+  s_endpgm
+.Llog_legacy_end:
+  .size log_legacy, .Llog_legacy_end-log_legacy
   .globl cbsz_beyond_blocks
   .p2align 8
   .type cbsz_beyond_blocks,@function
@@ -113,6 +130,24 @@ b6_transpose:
     .amdhsa_accum_offset 64
   .end_amdhsa_kernel
   .p2align 6
+  .amdhsa_kernel exp_legacy
+    .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    .amdhsa_group_segment_fixed_size 0
+    .amdhsa_private_segment_fixed_size 0
+    .amdhsa_next_free_vgpr 64
+    .amdhsa_next_free_sgpr 96
+    .amdhsa_accum_offset 64
+  .end_amdhsa_kernel
+  .p2align 6
+  .amdhsa_kernel log_legacy
+    .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    .amdhsa_group_segment_fixed_size 0
+    .amdhsa_private_segment_fixed_size 0
+    .amdhsa_next_free_vgpr 64
+    .amdhsa_next_free_sgpr 96
+    .amdhsa_accum_offset 64
+  .end_amdhsa_kernel
+  .p2align 6
   .amdhsa_kernel cbsz_beyond_blocks
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_group_segment_fixed_size 0
@@ -158,6 +193,32 @@ amdhsa.version: [ 1, 2 ]
 amdhsa.kernels:
   - .name: halt_set
     .symbol: halt_set.kd
+    .kernarg_segment_size: 16
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: 0
+    .private_segment_fixed_size: 0
+    .wavefront_size: 64
+    .sgpr_count: 96
+    .vgpr_count: 64
+    .max_flat_workgroup_size: 64
+    .args:
+      - { .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global }
+      - { .size: 8, .offset: 8, .value_kind: global_buffer, .address_space: global }
+  - .name: exp_legacy
+    .symbol: exp_legacy.kd
+    .kernarg_segment_size: 16
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: 0
+    .private_segment_fixed_size: 0
+    .wavefront_size: 64
+    .sgpr_count: 96
+    .vgpr_count: 64
+    .max_flat_workgroup_size: 64
+    .args:
+      - { .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global }
+      - { .size: 8, .offset: 8, .value_kind: global_buffer, .address_space: global }
+  - .name: log_legacy
+    .symbol: log_legacy.kd
     .kernarg_segment_size: 16
     .kernarg_segment_align: 8
     .group_segment_fixed_size: 0

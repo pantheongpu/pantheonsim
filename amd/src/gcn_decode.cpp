@@ -560,6 +560,11 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop1, 0x043}, {"v_frexp_exp_i16_f16_e32", 1, 1}},
       {{Enc::Vop1, 0x049}, {"v_sin_f16_e32", 1, 1}},
       {{Enc::Vop1, 0x04a}, {"v_cos_f16_e32", 1, 1}},
+      // Decoded so that the refusal names them: the guides say only "Power with legacy semantics" and "Base 2 logarithm with legacy
+      // semantics" (CDNA2 to CDNA4; the Vega 7nm guide is no more specific), and no public source says how they differ from
+      // v_exp_f32 and v_log_f32.
+      {{Enc::Vop1, 0x04b}, {"v_exp_legacy_f32_e32", 1, 1}},
+      {{Enc::Vop1, 0x04c}, {"v_log_legacy_f32_e32", 1, 1}},
       {{Enc::Vop1, 0x04d}, {"v_cvt_norm_i16_f16_e32", 1, 1}},
       {{Enc::Vop1, 0x04e}, {"v_cvt_norm_u16_f16_e32", 1, 1}},
       {{Enc::Vop1, 0x04f}, {"v_sat_pk_u8_i16_e32", 1, 1}},
