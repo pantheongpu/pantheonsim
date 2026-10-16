@@ -28,6 +28,13 @@ echo "wrote $(pwd)/chevron.O0.gfx942, chevron.O0.gfx942.o and its listing ($(wc 
 "$rocm/lib/llvm/bin/llvm-objdump" -d --mcpu=gfx942 printf.gfx942.o |
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > printf.gfx942.dis
 echo "wrote $(pwd)/printf.gfx942, printf.gfx942.o and its listing ($(wc -l < printf.gfx942.dis) instructions)"
+# What a kernel asks of the host while it runs: a host function, malloc and
+# free, printf's conversions and the library's fprintf. Wave64 (CDNA and CDNA2)
+# and wave32 (RDNA3).
+for arch in gfx942 gfx90a gfx1100; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch hostcall.cpp -o hostcall.$arch
+done
+echo "wrote $(pwd)/hostcall.gfx942, hostcall.gfx90a and hostcall.gfx1100"
 # Occupancy, device attributes, and a kernel reaching another device's memory.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 runtime.cpp -o runtime.gfx942
 echo "wrote $(pwd)/runtime.gfx942"
@@ -100,6 +107,18 @@ echo "wrote $(pwd)/gfx950.gfx950"
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 smfmac.cpp -o smfmac.gfx942
 "$rocm/bin/hipcc" -O2 -std=c++17 -DVGPU_GFX950 --offload-arch=gfx950 smfmac.cpp -o smfmac.gfx950
 echo "wrote $(pwd)/smfmac.gfx942 and smfmac.gfx950"
+# What the CDNA3 and CDNA4 guides say beyond the matrix instructions' core: the
+# matrix modes (BLGP, EXEC, MODE, sparse pruning), instructions gfx942 and gfx950
+# added, and the vector and scalar ALU rules that differ from older chips.
+for t in mfma_modes gfx9_added gfx9_semantics gfx9_decode; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx942 $t.cpp -o $t.gfx942
+  "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations -DVGPU_GFX950 --offload-arch=gfx950 $t.cpp -o $t.gfx950
+done
+echo "wrote $(pwd)/{mfma_modes,gfx9_added,gfx9_semantics,gfx9_decode}.{gfx942,gfx950}"
+# gfx950's scaled narrowing conversions (v_cvt_scalef32_pk_fp8_f32 ... _pk32_bf6_bf16) and the single-half widening ones, called through the
+# builtins Composable Kernel and HIP use, against HIP's host reference (<hip/hip_ext_ocp.h>) and Composable Kernel's own expectations.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx950 scalef32_narrow.cpp -o scalef32_narrow.gfx950
+echo "wrote $(pwd)/scalef32_narrow.gfx950"
 # MODE's round and denormal modes: as hipcc builds by default, and built to
 # flush single-precision denormals.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 numerics.cpp -o numerics.gfx942
@@ -134,15 +153,20 @@ prim=${PRIM_ROCM:-$rocm}
 "$prim/bin/hipcc" -O2 -std=c++17 -isystem "$prim/include" --offload-arch=gfx942 --offload-arch=gfx1100 \
   --offload-compress -s prim.cpp -o prim.all
 echo "wrote $(pwd)/prim.all"
+# A kernel long enough for PC sampling at an interval of ten thousand
+# instructions, which run_rocprofiler_pcsampling.sh runs under AMD's sample tool.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 pcsampling.cpp -o pcsampling.gfx942
+echo "wrote $(pwd)/pcsampling.gfx942"
 # Where a work-group runs (__smid), on every target, in one program.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 --offload-arch=gfx950 --offload-arch=gfx90a \
   --offload-arch=gfx1030 --offload-arch=gfx1031 --offload-arch=gfx1100 --offload-arch=gfx1201 smid.cpp -o smid.all
 echo "wrote $(pwd)/smid.all"
 # Arrays, textures and surfaces, for each RDNA generation's image resources.
-for arch in gfx1030 gfx1031 gfx1100 gfx1201; do
+# and for the MI200's (gfx90a), which has MIMG too.
+for arch in gfx1030 gfx1031 gfx1100 gfx1201 gfx90a; do
   "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch images.cpp -o images.$arch
 done
-echo "wrote $(pwd)/images.gfx1030, images.gfx1031, images.gfx1100 and images.gfx1201"
+echo "wrote $(pwd)/images.gfx1030, images.gfx1031, images.gfx1100, images.gfx1201 and images.gfx90a"
 
 # The device code alone, for the decoder and the executor to be checked
 # against, and the listing of it from the same toolchain's llvm-objdump.
@@ -189,7 +213,7 @@ echo "wrote $(pwd)/workgroup.gfx1031 (ROCm 7.2, like memtest.gfx1031)"
 
 # The same programs for gfx1250 (CDNA 5, MI455X; wave32), which the runner executes on a simulated MI455X. Built
 # by ROCm 7.2's hipcc, which knows gfx1250; no card has run them.
-for src in atomics memory graphs cooperative streams smid errors pointers runtime gfx1250 wmma1250 trload1250 async1250 permlane1250 barrier1250 alu1250 vgprs1250 block1250 tensor1250 ds1250 forms1250; do
+for src in atomics memory graphs cooperative streams smid errors pointers runtime gfx1250 wmma1250 trload1250 async1250 permlane1250 barrier1250 alu1250 vgprs1250 block1250 tensor1250 ds1250 forms1250 scalef32_narrow1250; do
   "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx1250 $src.cpp -o $src.gfx1250
   echo "wrote $(pwd)/$src.gfx1250"
 done
@@ -223,3 +247,25 @@ echo "wrote $(pwd)/cluster1250.gfx1250"
 # rocSOLVER's Cholesky kernel): wave_race.cpp.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 wave_race.cpp -o wave_race.gfx942
 echo "wrote $(pwd)/wave_race.gfx942"
+
+# `a / b` on float and double as the compiler writes it (v_div_scale, v_rcp, fused multiply-adds, v_div_fmas, v_div_fixup), over
+# edge and random operands, against the host's own IEEE division: divide.cpp.
+for arch in gfx942 gfx950 gfx90a gfx1100 gfx1201; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch divide.cpp -o divide.$arch
+done
+echo "wrote $(pwd)/divide.gfx942, divide.gfx950, divide.gfx90a, divide.gfx1100 and divide.gfx1201"
+
+# The half-precision multiply-adds: the MAD forms round the product, the FMA forms are fused: mad_f16.cpp.
+for arch in gfx90a gfx942 gfx950; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch mad_f16.cpp -o mad_f16.$arch
+done
+echo "wrote $(pwd)/mad_f16.gfx90a, mad_f16.gfx942 and mad_f16.gfx950"
+
+# MFMA A-matrix broadcast (CBSZ and ABID) of the multi-block shapes, against AMD's Matrix Instruction Calculator's tables:
+# mfma_broadcast.cpp reads mfma_broadcast_golden.h, which mfma_broadcast_gen.py writes from the calculator
+# (git clone https://github.com/ROCm/amd_matrix_instruction_calculator; mfma_broadcast_gen.py <calc>/matrix_calculator.py >
+# mfma_broadcast_golden.h).
+for arch in gfx90a gfx942 gfx950; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch mfma_broadcast.cpp -o mfma_broadcast.$arch
+done
+echo "wrote $(pwd)/mfma_broadcast.gfx90a, mfma_broadcast.gfx942 and mfma_broadcast.gfx950"

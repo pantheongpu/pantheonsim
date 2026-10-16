@@ -178,10 +178,13 @@ float linear_to_srgb(float c) {
 // The image formats with sRGB color: 8, 8_8 and 8_8_8_8, at these codes
 // (ROCR-Runtime's resource_nv.h, resource_gfx11.h, resource_gfx12.h).
 uint32_t srgb_base(Gen g) { return g == Gen::Gfx10 ? 128 : 64; }
+// gfx9 has no unified code: a T# and a V# hold the data and number formats themselves.
+bool unified(Gen g) { return g != Gen::Gfx9; }
 
 }  // namespace
 
 Format from_code(uint32_t code, Gen g) {
+  if (!unified(g)) return {};
   if (code >= srgb_base(g) && code < srgb_base(g) + 3) {
     static const Data kData[] = {Data::D8, Data::D8_8, Data::D8_8_8_8};
     return {kData[code - srgb_base(g)], Num::Srgb};
@@ -192,6 +195,7 @@ Format from_code(uint32_t code, Gen g) {
   return code < n ? t[code] : Format{};
 }
 uint32_t code(Format f, Gen g) {
+  if (!unified(g)) return 0;
   if (f.num == Num::Srgb)
     return f.data == Data::D8 ? srgb_base(g) : f.data == Data::D8_8 ? srgb_base(g) + 1
            : f.data == Data::D8_8_8_8 ? srgb_base(g) + 2 : 0;
@@ -261,6 +265,14 @@ void write_texel(Format f, const uint32_t in[4], uint8_t* bytes) {
 // the tiling [24:20] (0, linear); TYPE [31:28]. word 4 [13:0]: a 3D image's
 // depth less one, an array's last layer, or else the row pitch less one, in
 // texels.
+//
+// gfx9 (gfx90a), from AMD's MI200 ISA guide (Table 41) and ROCR-Runtime's
+// resource_ai.h: word 0: the base address's bits 39:8; word 1: bits 47:40
+// [7:0], MIN_LOD [19:8], DATA_FORMAT [25:20] and NUM_FORMAT [29:26]; word 2:
+// the width less one [13:0] and the height less one [27:14]; word 3: the four
+// DST_SELs [11:0], BASE_LEVEL [15:12], LAST_LEVEL [19:16], SW_MODE [24:20]
+// (0, linear), TYPE [31:28]; word 4: a 3D image's depth, or an array's
+// layers, less one [12:0] and the row pitch less one [28:13], in texels.
 
 namespace {
 bool array_type(Type t) { return t == Type::Img1DArray || t == Type::Img2DArray || t == Type::Cube; }
@@ -273,6 +285,15 @@ void encode(const Image& i, Gen g, uint32_t w[8]) {
   const uint32_t fmt = code(i.format, g);
   w[0] = static_cast<uint32_t>(i.base >> 8);
   w[1] = static_cast<uint32_t>(i.base >> 40) & 0xFF;
+  if (g == Gen::Gfx9) {
+    w[1] |= (static_cast<uint32_t>(i.format.data) & 0x3F) << 20 | (static_cast<uint32_t>(i.format.num) & 0xF) << 26;
+    w[2] = (wm1 & 0x3FFF) | (hm1 & 0x3FFF) << 14;
+    for (int k = 0; k < 4; ++k) w[3] |= (static_cast<uint32_t>(i.sel[k]) & 7) << (3 * k);
+    w[3] |= (i.base_level & 0xF) << 12 | (i.last_level & 0xF) << 16 | (static_cast<uint32_t>(i.type) & 0xF) << 28;
+    w[4] = ((i.type == Type::Img3D || array_type(i.type)) ? (std::max(1u, i.depth) - 1) & 0x1FFF : 0) |
+           ((pitch - 1) & 0xFFFF) << 13;
+    return;
+  }
   w[1] |= (wm1 & 3) << 30;
   for (int k = 0; k < 4; ++k) w[3] |= (static_cast<uint32_t>(i.sel[k]) & 7) << (3 * k);
   w[3] |= (static_cast<uint32_t>(i.type) & 0xF) << 28;
@@ -294,6 +315,17 @@ Image decode_image(const uint32_t w[8], Gen g) {
   i.base = uint64_t{w[0]} << 8 | uint64_t{w[1] & 0xFF} << 40;
   for (int k = 0; k < 4; ++k) i.sel[k] = static_cast<Sel>(bits(w[3], 3 * k + 2, 3 * k));
   i.type = static_cast<Type>(bits(w[3], 31, 28));
+  if (g == Gen::Gfx9) {
+    i.format.data = static_cast<Data>(bits(w[1], 25, 20) < 15 ? bits(w[1], 25, 20) : 0);   // a data format this does not know reads as invalid
+    i.format.num = static_cast<Num>(bits(w[1], 29, 26));
+    i.width = bits(w[2], 13, 0) + 1;
+    i.height = bits(w[2], 27, 14) + 1;
+    i.base_level = bits(w[3], 15, 12);
+    i.last_level = bits(w[3], 19, 16);
+    i.depth = bits(w[4], 12, 0) + 1;
+    i.pitch = bits(w[4], 28, 13) + 1;
+    return i;
+  }
   if (g == Gen::Gfx12) {
     i.format = from_code(bits(w[1], 24, 17), g);
     i.base_level = bits(w[1], 29, 25);
@@ -393,7 +425,8 @@ Sampler decode_sampler(const uint32_t w[4], Gen g) {
 // word 0: the base address's low bits; word 1: its high 16 [15:0], the
 // stride [29:16]; word 2: the number of records; word 3: the four DST_SELs
 // [11:0], the format's code [18:12] ([17:12] from gfx11), OOB_SELECT
-// [29:28] (0: an index is in range below the record count).
+// [29:28] (0: an index is in range below the record count). On gfx9 the
+// format is NUM_FORMAT [14:12] and DATA_FORMAT [18:15] instead.
 
 void encode_buffer(uint64_t base, uint32_t stride, uint32_t records, Format format, Gen g, uint32_t w[4]) {
   w[0] = static_cast<uint32_t>(base);
@@ -401,10 +434,20 @@ void encode_buffer(uint64_t base, uint32_t stride, uint32_t records, Format form
   w[1] |= (stride & 0x3FFF) << 16;
   w[2] = records;
   w[3] = 4 | 5 << 3 | 6 << 6 | 7 << 9;   // x, y, z, w
+  if (g == Gen::Gfx9) {   // NUM_FORMAT [14:12] (three bits: no sRGB), DATA_FORMAT [18:15]
+    w[3] |= (static_cast<uint32_t>(format.num) & 7) << 12 | (static_cast<uint32_t>(format.data) & 0xF) << 15;
+    return;
+  }
   w[3] |= (code(format, g) & (g == Gen::Gfx10 ? 0x7F : 0x3F)) << 12;
 }
 
 Format buffer_format(const uint32_t w[4], Gen g) {
+  if (g == Gen::Gfx9) {
+    Format f;
+    f.data = static_cast<Data>(bits(w[3], 18, 15) < 15 ? bits(w[3], 18, 15) : 0);
+    f.num = static_cast<Num>(bits(w[3], 14, 12));
+    return f;
+  }
   return from_code(g == Gen::Gfx10 ? bits(w[3], 18, 12) : bits(w[3], 17, 12), g);
 }
 Sel buffer_sel(const uint32_t w[4], int channel) { return static_cast<Sel>(bits(w[3], 3 * channel + 2, 3 * channel)); }

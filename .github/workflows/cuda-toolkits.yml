@@ -109,4 +109,4 @@ jobs:
           SKIP: ${{ matrix.skip }}
         run: |
           ctest --test-dir build --output-on-failure \
-            -E "^(pantheon_workloads|.*ollama.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm|e2e_cutlass.*$SKIP)\$"
+            -E "^(pantheon_workloads|.*ollama.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm.*|e2e_cutlass.*$SKIP)\$"

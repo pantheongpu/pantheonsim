@@ -136,7 +136,7 @@ VTEST(each_lane_has_a_message_of_its_own_and_stderr_is_its_own_stream) {
   VCHECK_EQ(printed[1].stream, 1);
 }
 
-VTEST(a_service_the_host_does_not_provide_is_refused_by_name) {
+VTEST(a_service_the_device_library_does_not_have_is_refused_by_name) {
   MemoryManager mem(64ull << 20);
   amd::Hostcall hc(mem, [](int, const std::string&) {}, 8);
   Device dev(mem, hc);
@@ -144,11 +144,78 @@ VTEST(a_service_the_host_does_not_provide_is_refused_by_name) {
   lanes[0] = {1024, 0};
   bool refused = false;
   try {
-    dev.call(1 /* a device function call */, 1, lanes);
+    dev.call(9 /* no such service */, 1, lanes);
   } catch (const Error& e) {
-    refused = e.code() == Err::Unsupported && std::string(e.what()).find("a device function call") != std::string::npos;
+    refused = e.code() == Err::Unsupported && std::string(e.what()).find("an unknown service") != std::string::npos;
   }
   VCHECK(refused);
+}
+
+// ockl's __ockl_call_host_function: a host function's address and seven words in a lane's slot,
+// two words back in the slot's first two words (ROCm's CLR documents the function as
+// void (uint64_t* output, const uint64_t* input)).
+namespace {
+int g_arguments_seen = 0;
+void sum_and_count(uint64_t* output, const uint64_t* input) {
+  ++g_arguments_seen;
+  output[0] = 0;
+  for (int k = 0; k < 7; ++k) output[0] += input[k];
+  output[1] = input[6] * 2;
+}
+}  // namespace
+
+VTEST(a_lane_that_names_a_host_function_gets_its_two_words_back) {
+  MemoryManager mem(64ull << 20);
+  amd::Hostcall hc(mem, [](int, const std::string&) {}, 8);
+  Device dev(mem, hc);
+  std::vector<std::vector<uint64_t>> lanes(64);
+  const uint64_t fn = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&sum_and_count));
+  lanes[2] = {fn, 1, 2, 3, 4, 5, 6, 70};
+  lanes[40] = {fn, 10, 20, 30, 40, 50, 60, 700};
+  g_arguments_seen = 0;
+  const auto r = dev.call(amd::Hostcall::kServiceFunctionCall, 1ull << 2 | 1ull << 40, lanes);
+  VCHECK_EQ(g_arguments_seen, 2);   // once for each lane that was on
+  VCHECK_EQ(r[2].first, uint64_t{91});
+  VCHECK_EQ(r[2].second, uint64_t{140});
+  VCHECK_EQ(r[40].first, uint64_t{910});
+  VCHECK_EQ(r[40].second, uint64_t{1400});
+}
+
+VTEST(a_call_through_a_null_function_pointer_is_refused) {
+  MemoryManager mem(64ull << 20);
+  amd::Hostcall hc(mem, [](int, const std::string&) {}, 8);
+  Device dev(mem, hc);
+  std::vector<std::vector<uint64_t>> lanes(64);
+  lanes[0] = {0, 1, 2, 3, 4, 5, 6, 7};
+  bool refused = false;
+  try {
+    dev.call(amd::Hostcall::kServiceFunctionCall, 1, lanes);
+  } catch (const Error& e) {
+    refused = e.code() == Err::InvalidValue && std::string(e.what()).find("null pointer") != std::string::npos;
+  }
+  VCHECK(refused);
+}
+
+// A kernel's hidden_heap_v1 argument: the state of the device library's allocator, 128 KiB the runtime
+// makes and sets up -- zeroes, and each of the sixteen block sizes' count of recordable slabs at 256.
+VTEST(the_allocators_state_block_is_made_once_zeroed_and_given_its_slab_counts) {
+  MemoryManager mem(64ull << 20);
+  const uint64_t before = mem.used();
+  {
+    amd::Hostcall hc(mem, [](int, const std::string&) {}, 8);
+    const uint64_t used_without_heap = mem.used();
+    const uint64_t heap = hc.heap();
+    VCHECK(heap != 0);
+    VCHECK_EQ(hc.heap(), heap);                              // made once
+    VCHECK_EQ(mem.used() - used_without_heap, uint64_t{128 << 10});
+    int wrong = 0;
+    for (uint64_t at = 0; at < (128 << 10); at += 4) {
+      const bool recordable = at >= 4096 && at < 4096 + 16 * 128 && (at - 4096) % 128 == 0;
+      wrong += mem.load_scalar(heap + at, 4) != (recordable ? 256u : 0u);
+    }
+    VCHECK_EQ(wrong, 0);
+  }
+  VCHECK_EQ(mem.used(), before);   // and given back with the rest
 }
 
 // ockl's __ockl_devmem_request(addr, size): memory for a size, with no address; a block

@@ -1628,3 +1628,145 @@ D1F3000C 040D8309	v_xad_u32 v12, v9, -1, v3
 2A4604F9 05860632	v_xor_b32_sdwa v35, s50, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:WORD_1
 2A0A14F9 06060105	v_xor_b32_sdwa v5, v5, v10 dst_sel:BYTE_1 dst_unused:UNUSED_PAD src0_sel:DWORD src1_sel:DWORD
 2A0C14F9 06030106	v_xor_b32_sdwa v6, v6, v10 dst_sel:BYTE_1 dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:DWORD
+# And the instructions of the CDNA gaps tests (amd/tests/data/asm_cdna_*.s), as ROCm 7.2.3's llvm-objdump writes them.
+E13C4068 80020200	buffer_atomic_add_f64 v[2:3], off, s[8:11], 0 offset:104 glc
+E1884008 80020200	buffer_atomic_add_x2 v[2:3], off, s[8:11], 0 offset:8 glc
+E18840F8 14020200	buffer_atomic_add_x2 v[2:3], off, s[8:11], s20 offset:248 glc
+E1A04038 80020200	buffer_atomic_and_x2 v[2:3], off, s[8:11], 0 offset:56 glc
+E1844060 80020200	buffer_atomic_cmpswap_x2 v[2:5], off, s[8:11], 0 offset:96 glc
+E1B04058 80020200	buffer_atomic_dec_x2 v[2:3], off, s[8:11], 0 offset:88 glc
+E1AC4050 80020200	buffer_atomic_inc_x2 v[2:3], off, s[8:11], 0 offset:80 glc
+E1444078 80020200	buffer_atomic_max_f64 v[2:3], off, s[8:11], 0 offset:120 glc
+E1404070 80020200	buffer_atomic_min_f64 v[2:3], off, s[8:11], 0 offset:112 glc
+E1A44040 80020200	buffer_atomic_or_x2 v[2:3], off, s[8:11], 0 offset:64 glc
+E1984028 80020200	buffer_atomic_smax_x2 v[2:3], off, s[8:11], 0 offset:40 glc
+E1904018 80020200	buffer_atomic_smin_x2 v[2:3], off, s[8:11], 0 offset:24 glc
+E18C4010 80020200	buffer_atomic_sub_x2 v[2:3], off, s[8:11], 0 offset:16 glc
+E1804000 80020200	buffer_atomic_swap_x2 v[2:3], off, s[8:11], 0 glc
+E19C4030 80020200	buffer_atomic_umax_x2 v[2:3], off, s[8:11], 0 offset:48 glc
+E1944020 80020200	buffer_atomic_umin_x2 v[2:3], off, s[8:11], 0 offset:32 glc
+E1A84048 80020200	buffer_atomic_xor_x2 v[2:3], off, s[8:11], 0 offset:72 glc
+E0511000 80020001	buffer_load_dword v1, s[8:11], 0 offen lds
+E0202000 80020B01	buffer_load_format_d16_x v11, v1, s[8:11], 0 idxen
+E0011000 0C020001	buffer_load_format_x v1, s[8:11], s12 offen lds
+E00C2000 80020401	buffer_load_format_xyzw v[4:7], v1, s[8:11], 0 idxen
+E0451000 80020001	buffer_load_sbyte v1, s[8:11], 0 offen lds
+E04D1000 80020001	buffer_load_sshort v1, s[8:11], 0 offen lds
+E0411000 80020001	buffer_load_ubyte v1, s[8:11], 0 offen lds
+E0411000 0C020001	buffer_load_ubyte v1, s[8:11], s12 offen lds
+E0491000 80020001	buffer_load_ushort v1, s[8:11], 0 offen lds
+E0491000 0C020001	buffer_load_ushort v1, s[8:11], s12 offen lds
+E0142000 80040801	buffer_store_format_xy v[8:9], v1, s[16:19], 0 idxen
+D97C2800 40000000	ds_append v64 offset:10240
+D8A00030 001E1C01	ds_cmpst_b64 v1, v[28:29], v[30:31] offset:48
+D8A20038 00222001	ds_cmpst_f64 v1, v[32:33], v[34:35] offset:56
+D8E20040 36222001	ds_cmpst_rtn_f64 v[54:55], v1, v[32:33], v[34:35] offset:64
+D8FC0058 38001801	ds_condxchg32_rtn_b64 v[56:57], v1, v[24:25] offset:88
+D97A2800 41000000	ds_consume v65 offset:10240
+D8180004 00171601	ds_mskor_b32 v1, v22, v23 offset:4
+D8980010 001E1C01	ds_mskor_b64 v1, v[28:29], v[30:31] offset:16
+D8580000 28151401	ds_mskor_rtn_b32 v40, v1, v20, v21
+D8D80008 2A1A1801	ds_mskor_rtn_b64 v[42:43], v1, v[24:25], v[26:27] offset:8
+D8280000 00000000	ds_nop
+D96C0010 43000000	ds_read_addtid_b32 v67 offset:16
+D86C0000 0A000001	ds_read_b32 v10, v1
+D86C0004 0A000001	ds_read_b32 v10, v1 offset:4
+D8EC0000 0A000008	ds_read_b64 v[10:11], v8
+D8EC0200 0A000008	ds_read_b64 v[10:11], v8 offset:512
+D8680050 34171601	ds_wrap_rtn_b32 v52, v1, v22, v23 offset:80
+D83A0010 00001600	ds_write_addtid_b32 v22 offset:16
+D81A0000 00000A01	ds_write_b32 v1, v10
+D81A0004 00000A01	ds_write_b32 v1, v10 offset:4
+D89A0000 00000A08	ds_write_b64 v8, v[10:11]
+D89A0200 00000A08	ds_write_b64 v8, v[10:11] offset:512
+D85C0706 2C151401	ds_wrxchg2_rtn_b32 v[44:45], v1, v20, v21 offset0:6 offset1:7
+D8DC0504 301A1801	ds_wrxchg2_rtn_b64 v[48:51], v1, v[24:25], v[26:27] offset0:4 offset1:5
+D85E0100 3A151407	ds_wrxchg2st64_rtn_b32 v[58:59], v7, v20, v21 offset1:1
+D8DE0100 3C1A1808	ds_wrxchg2st64_rtn_b64 v[60:63], v8, v[24:25], v[26:27] offset1:1
+DC508000 0A040001	global_load_dword v10, v1, s[4:5]
+DC508004 0A040001	global_load_dword v10, v1, s[4:5] offset:4
+DC548000 0A120003	global_load_dwordx2 v[10:11], v3, s[18:19]
+DC548200 0A120003	global_load_dwordx2 v[10:11], v3, s[18:19] offset:512
+DC5C8000 14060004	global_load_dwordx4 v[20:23], v4, s[6:7]
+DC5C8010 18060004	global_load_dwordx4 v[24:27], v4, s[6:7] offset:16
+DC708000 00082805	global_store_dword v5, v40, s[8:9]
+DC708004 00082A05	global_store_dword v5, v42, s[8:9] offset:4
+DC748000 00180A03	global_store_dwordx2 v3, v[10:11], s[24:25]
+DC748200 00180A03	global_store_dwordx2 v3, v[10:11], s[24:25] offset:512
+DC7C8000 00060402	global_store_dwordx4 v2, v[4:7], s[6:7]
+8010FF04 00002000	s_add_u32 s16, s4, 0x2000
+82118005	s_addc_u32 s17, s5, 0
+8609FF05 0000FFFF	s_and_b32 s9, s5, 0xffff
+C09A0002 00000000	s_atc_probe 0, s[4:5], 0x0
+C09E0004 00000000	s_atc_probe_buffer 0, s[8:11], 0x0
+C10B0F04 00000044	s_buffer_atomic_add s60, s[8:11], 0x44 glc
+C18B0F04 00000088	s_buffer_atomic_add_x2 s[60:61], s[8:11], 0x88 glc
+C1230F04 0000005C	s_buffer_atomic_and s60, s[8:11], 0x5c glc
+C1A30F04 00000090	s_buffer_atomic_and_x2 s[60:61], s[8:11], 0x90 glc
+C1070F04 00000070	s_buffer_atomic_cmpswap s[60:61], s[8:11], 0x70 glc
+C1870F04 00000098	s_buffer_atomic_cmpswap_x2 s[60:63], s[8:11], 0x98 glc
+C1330F04 0000006C	s_buffer_atomic_dec s60, s[8:11], 0x6c glc
+C12F0F04 00000068	s_buffer_atomic_inc s60, s[8:11], 0x68 glc
+C1270F04 00000060	s_buffer_atomic_or s60, s[8:11], 0x60 glc
+C11B0F04 00000054	s_buffer_atomic_smax s60, s[8:11], 0x54 glc
+C1130F04 0000004C	s_buffer_atomic_smin s60, s[8:11], 0x4c glc
+C10F0F04 00000048	s_buffer_atomic_sub s60, s[8:11], 0x48 glc
+C1030F04 00000040	s_buffer_atomic_swap s60, s[8:11], 0x40 glc
+C1830F04 00000080	s_buffer_atomic_swap_x2 s[60:61], s[8:11], 0x80 glc
+C11F0F04 00000058	s_buffer_atomic_umax s60, s[8:11], 0x58 glc
+C1170F04 00000050	s_buffer_atomic_umin s60, s[8:11], 0x50 glc
+C12B0F04 00000064	s_buffer_atomic_xor s60, s[8:11], 0x64 glc
+C0620504 00000000	s_buffer_store_dword s20, s[8:11], 0x0
+C0660584 00000008	s_buffer_store_dwordx2 s[22:23], s[8:11], 0x8
+C06A0604 00000010	s_buffer_store_dwordx4 s[24:27], s[8:11], 0x10
+C0A20002 00000000	s_dcache_discard s[4:5], 0x0
+C0A60002 00000040	s_dcache_discard_x2 s[4:5], 0x40
+C0880000 00000000	s_dcache_inv_vol
+C08C0000 00000000	s_dcache_wb_vol
+BF950003	s_decperflevel 3
+B8B51801	s_getreg_b32 s53, hwreg(HW_REG_MODE, 0, 4)
+BF940003	s_incperflevel 3
+C0120403 00000000	s_load_dwordx16 s[16:31], s[6:7], 0x0
+C0060200 00000010	s_load_dwordx2 s[8:9], s[0:1], 0x10
+C00A0100 00000000	s_load_dwordx4 s[4:7], s[0:1], 0x0
+BEFF00FF 0000FFFF	s_mov_b32 exec_hi, 0xffff
+BEFE00C1	s_mov_b32 exec_lo, -1
+BEFC00FF 00033100	s_mov_b32 m0, 0x33100
+BE8A00C0	s_mov_b32 s10, 64
+BE880004	s_mov_b32 s8, s4
+BEFE01C1	s_mov_b64 exec, -1
+8709FF09 00100000	s_or_b32 s9, s9, 0x100000
+BE803229	s_set_gpr_idx_idx s41
+BF9D0008	s_set_gpr_idx_mode gpr_idx(DST)
+BF9D0001	s_set_gpr_idx_mode gpr_idx(SRC0)
+BF110128	s_set_gpr_idx_on s40, gpr_idx(SRC0)
+BF8D0000	s_sethalt 0
+BF8B0000	s_setkill 0
+B9331801	s_setreg_b32 hwreg(HW_REG_MODE, 0, 4), s51
+BF108081	s_setvskip 1, 0
+BF960000	s_ttracedata
+E808200C 80020A01	tbuffer_load_format_x v10, v1, s[8:11], 0 idxen offset:12
+EA28A000 80020801	tbuffer_load_format_xy v[8:9], v1, s[8:11], 0 format:[BUF_DATA_FORMAT_16_16,BUF_NUM_FORMAT_UINT] idxen
+EBF3A000 80030401	tbuffer_store_format_xyzw v[4:7], v1, s[12:15], 0 format:[BUF_DATA_FORMAT_32_32_32_32,BUF_NUM_FORMAT_FLOAT] idxen
+680E04FF 00002000	v_add_u32_e32 v7, 0x2000, v2
+260000BF	v_and_b32_e32 v0, 63, v0
+7E006A00	v_clrexcp
+7E229504	v_cos_f16_e32 v17, v4
+D1C40012 041E0D05	v_cubeid_f32 v18, v5, v6, v7
+D1C70015 041E0D05	v_cubema_f32 v21, v5, v6, v7
+D1C50013 041E0D05	v_cubesc_f32 v19, v5, v6, v7
+D1C60014 041E0D05	v_cubetc_f32 v20, v5, v6, v7
+7E2E1D04	v_cvt_off_f32_i4_e32 v23, v4
+7E2C1905	v_cvt_rpi_i32_f32_e32 v22, v5
+D1EE001B 042A1308	v_fma_legacy_f16 v27, v8, v9, v10
+7E328704	v_frexp_exp_i16_f16_e32 v25, v4
+7E308504	v_frexp_mant_f16_e32 v24, v4
+66341708	v_ldexp_f16_e32 v26, v8, v11
+24020087	v_lshlrev_b32_e32 v1, 7, v0
+D1EC001C 042A1308	v_mad_legacy_i16 v28, v8, v9, v10
+7E1602FF 00002800	v_mov_b32_e32 v11, 0x2800
+7E120301	v_mov_b32_e32 v9, v1
+100A00FF 00000060	v_mul_u32_u24_e32 v5, 0x60, v0
+783A1308	v_pk_fmac_f16_e32 v29, v8, v9
+7E3C9F0B	v_sat_pk_u8_i16_e32 v30, v11
+7E209304	v_sin_f16_e32 v16, v4

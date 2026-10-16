@@ -200,6 +200,12 @@ VTEST(every_rdna_image_instruction_shape_decodes_as_llvm_prints_it) {
   check_corpus("isa_corpus_images_gfx1201.txt", amd::gcn::Target::Gfx1200, 40);
 }
 
+// gfx90a's (MI200) image instructions: every opcode of the guide's Table 91
+// with the operand and modifier forms the assembler takes.
+VTEST(every_gfx90a_image_instruction_shape_decodes_as_llvm_prints_it) {
+  check_corpus("isa_corpus_images_gfx90a.txt", amd::gcn::Target::Gfx90a, 1000);
+}
+
 // And gfx1030 (RDNA2): gfx9's names, gfx10's memory bits, M0 and null the
 // other way round from gfx11, and SDWA.
 VTEST(every_gfx1030_instruction_shape_decodes_as_llvm_prints_it) {
@@ -291,8 +297,8 @@ VTEST(a_branch_says_where_it_goes) {
 VTEST(an_instruction_this_does_not_know_is_refused_by_name) {
   std::string what;
   try {
-    // VOP3 with an opcode nothing uses.
-    const std::vector<uint8_t> code = {0x00, 0x00, 0x9b, 0xd3, 0x00, 0x00, 0x00, 0x00};
+    // VOP3P with an opcode nothing uses (0x1e: gfx950's 0x1b and 0x1c are v_pk_minimum3_f16 and v_pk_maximum3_f16).
+    const std::vector<uint8_t> code = {0x00, 0x00, 0x9e, 0xd3, 0x00, 0x00, 0x00, 0x00};
     amd::gcn::decode(code, 0, 0);
   } catch (const std::exception& e) {
     what = e.what();

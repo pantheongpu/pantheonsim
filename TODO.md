@@ -1730,9 +1730,7 @@ scripts/run-pantheon-workloads.sh.
    (`amd_hsa`, `amd_hip_on_hsa`, `test_amd_kfd`); textures and images are done
    on RDNA (MI300 has none, correctly); gfx950 (MI350X) is done
    (`amd_pytorch_mi350x`); OpenMP offload and OpenCL run on all six
-   (`amd_openmp`, `amd_opencl`). **Still open on AMD**: gfx9 image
-   instructions (MI250X), a double `trsv` path in rocBLAS
-   (status unconfirmed), the instruction forms the executor refuses by name
+   (`amd_openmp`, `amd_opencl`). **Still open on AMD**: the instruction forms the executor refuses by name
    (gap register), and anything in the gap register's AMD part.
 1. **Interpreter speed**: intern register names to dense indices at parse
    time. **Done** (see Performance above, "Register names are interned to dense
@@ -2158,19 +2156,19 @@ Still open, each with the reason:
   (amd/include/vgpu/amd_exec.hpp:109); MFMA input rounding not modelled (amd/src/gcn_decode.cpp:982); the 6-bit
   form 0xe1 (:760); undecoded RDNA opcodes, operands and ray-tracing image instructions
   (amd/src/rdna_decode.cpp:148, :279, :335, :563).
-- Runtime: hostcall services other than printf, i.e. device malloc and the address sanitizer
-  (amd/src/hostcall.cpp:121); linking several code objects into one (amd/src/hip_api.cpp:6982); stream-capture
+- Runtime: the address sanitizer's hostcall report is checked against the device library's argument
+  order only, no instrumented code ran it (amd/src/hostcall.cpp); linking several code objects into one (amd/src/hip_api.cpp:6982); stream-capture
   refusals (amd/src/hip_graph.inc:942, :2638); sRGB over linear memory (amd/src/hip_images.inc:742); compressed
   offload bundles need zlib or zstd and refuse other methods (amd/src/bundle.cpp:43-146); graphics interop
   (`hsa_amd_image_create`, `hsa_amd_interop_map_buffer`, `hsa_amd_interop_unmap_buffer`,
   `hsa_executable_agent_global_variable_define`, amd/src/hsa_api.cpp:1984-1991).
-- Profiling: no PC sampling, thread trace or HSA trace, and no records of the runtime's internal kernels
+- Profiling: PC sampling is host-trap only and by instruction count (no clock); no stochastic PC sampling, thread trace or HSA trace, and no records of the runtime's internal kernels
   (amd/README.md:576).
 - Workloads and frameworks: `fused_attention` does not build for AMD (needs a 64-bit mask on wave64); `rt_virus`
-  and `media_enc_virus` skip; `mma_virus` needs rocWMMA headers (amd/README.md:609-615); vLLM runs eager only
-  (no graphs, no `torch.compile`), one short sequence, 3 GB device (:513, :515); the ROCm Validation Suite was
-  never built or run, only read (:643).
-- Open on the AMD list: rocBLAS double `trsv` (see "Next milestones" 0). OpenMP offload (`amd_openmp`), OpenCL (`amd_opencl`) and `offload-arch` are done; gfx90a image instructions (MIMG on gfx9) are not, though MI250X reports image support.
+  and `media_enc_virus` skip; `mma_virus` needs rocWMMA headers (amd/README.md:609-615); vLLM with graphs,
+  `torch.compile` and Triton works (amd_vllm_graphs, amd_pytorch_graphs, amd_pytorch_compile); the ROCm Validation Suite runs
+  (amd/README.md, "ROCm Validation Suite"), except `perf`, `iet` and `tst`, whose pass marks are rates against time, power and heat the simulator does not model, and `mem`, which takes six minutes a GPU.
+- Open on the AMD list: OpenMP offload (`amd_openmp`), OpenCL (`amd_opencl`) and `offload-arch` are done. gfx90a image instructions are done, except the `_pck` forms and LWE (amd/README.md, "Textures"). rocBLAS double `trsv`/`trsm` was checked and nothing was found wrong.
 
 ### Health, RAS and registers (docs/telemetry.md, docs/registers.md, docs/machine-simulator.md)
 

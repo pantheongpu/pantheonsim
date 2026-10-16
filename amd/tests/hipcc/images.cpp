@@ -12,7 +12,9 @@
 //     hipTexObjectCreate), pitched memory through tex2D;
 //   - 3D, 2D layered and 1D layered arrays, with hipMemcpy3D into them and
 //     hipMemcpy3DBatchAsync between them;
-//   - gathers, and surfaces written and read;
+//   - gathers, and surfaces written and read (gfx90a, MI200, has one sample
+//     instruction, image_sample: the compiler drops explicit levels of
+//     detail and gathers there, so those two checks do not run on it);
 //   - the copies to and from arrays, and what the API answers about them.
 #include <hip/hip_runtime.h>
 
@@ -152,6 +154,10 @@ int main() {
   report("image support and texture limits", (images != 1) + (p.maxTexture2D[0] != 16384) +
                                                  (p.maxTexture3D[2] != 8192) + (p.textureAlignment != 256),
          4);
+  // The MI200 guide (12.15, IMAGE_SAMPLE): "This is the only sample instruction supported on this ASIC". There is no
+  // image_sample_l or image_gather4, and hipcc drops tex2DLod and tex2Dgather from the kernels it builds for it (they
+  // are empty), so a result left in the output buffer by an earlier check would pass for them.
+  const bool mi200 = std::strncmp(p.gcnArchName, "gfx90a", 6) == 0;
 
   // ---- A 2D float array, sampled every way ----
   std::vector<float> texels(W * H);
@@ -218,13 +224,15 @@ int main() {
     for (int i = 0; i < n; ++i) wrong += r[i] != f2d(i % W, i / W);
     report("point samples at texel centers", wrong, 2 * n);
     // An explicit level of detail with no mipmaps reads the only level.
-    for (int i = 0; i < n; ++i) at[i] = make_float2((i % W + 0.5f) / W, (i / W + 0.5f) / H);
-    (void)hipMemcpy(d_at, at.data(), n * sizeof(float2), hipMemcpyHostToDevice);
-    sample2d_lod<<<1, 64>>>(tn, d_at, d_out, n);
-    r = host_copy(d_out, n);
-    wrong = 0;
-    for (int i = 0; i < n; ++i) wrong += r[i] != f2d(i % W, i / W);
-    report("a level of detail with no mipmaps", wrong, n);
+    if (!mi200) {
+      for (int i = 0; i < n; ++i) at[i] = make_float2((i % W + 0.5f) / W, (i / W + 0.5f) / H);
+      (void)hipMemcpy(d_at, at.data(), n * sizeof(float2), hipMemcpyHostToDevice);
+      sample2d_lod<<<1, 64>>>(tn, d_at, d_out, n);
+      r = host_copy(d_out, n);
+      wrong = 0;
+      for (int i = 0; i < n; ++i) wrong += r[i] != f2d(i % W, i / W);
+      report("a level of detail with no mipmaps", wrong, n);
+    }
     CHECK(hipDestroyTextureObject(tn));
     CHECK(hipDestroyTextureObject(tu));
   }
@@ -277,6 +285,7 @@ int main() {
     }
     report("wrap, clamp, mirror and border", wrong, 4 * W);
   }
+  if (!mi200) {
   // Gathers: at each texel's bottom-right corner, the four texels around it.
   {
     hipTextureObject_t t = 0;
@@ -301,6 +310,7 @@ int main() {
     for (int i = 0; i < n; ++i) wrong += r[i].x != 1 || r[i].y != 1 || r[i].z != 1 || r[i].w != 1;
     report("gathers", wrong, 2 * n);
     CHECK(hipDestroyTextureObject(t));
+  }
   }
 
   // ---- 8-bit texels, as normalized floats and as integers ----

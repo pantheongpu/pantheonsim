@@ -46,10 +46,7 @@ fi
 cases="amd/mi300x amd/mi250x amd/mi350x amd/rx7900xtx amd/rx9070xt amd/rx6900xt amd/rx6800 amd/rx6700xt"
 [[ -n "${VGPU_OPENCL_GPUS:-}" ]] && cases="$VGPU_OPENCL_GPUS"
 for gpu in $cases; do
-  # MI250X's texture units are real, and the gfx9 image instructions are not
-  # modelled yet: its images are the one thing left out.
-  noimg=""; [[ $gpu == amd/mi250x ]] && noimg=1
-  out=$(VGPU_CL_NO_IMAGES=$noimg LD_PRELOAD="$preload" VGPU_QUIET=1 VGPU_GPU="$gpu" VGPU_DEVICE_COUNT=2 OCL_ICD_VENDORS="$tmp/vendors" \
+  out=$(LD_PRELOAD="$preload" VGPU_QUIET=1 VGPU_GPU="$gpu" VGPU_DEVICE_COUNT=2 OCL_ICD_VENDORS="$tmp/vendors" \
         ROCM_PATH="$rocm" LD_LIBRARY_PATH="$shim:$rocm/lib" timeout 900 "$tmp/cl" 2>&1)
   status=$?
   grep -E '^(FAIL|build log)' <<< "$out" | sed 's/^/      /'

@@ -63,6 +63,12 @@ for lib in "${libs[@]}"; do
   out=$(run "$lib" cooperative)
   expect "  a cooperative launch passes its grid barrier" \
     "after the grid barrier, 16 of 16 groups saw every group's value" "$(grep -o '^after the grid barrier.*' <<< "$out")"
+  # What a kernel asks of the host, answered by ROCm's own hostcall listener: a host function, malloc and free
+  # (ROCm's runtime serves the device-memory service and sets up the heap with the device library's own
+  # initialization kernel), many lanes printing, and the fprintf interface. Not printf's conversions
+  # (hostcall.cpp's "printf" part): ROCm 7.1's printf prints "%-10s|%.3s" wrongly, which the shim does not.
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$tmp:$lib" timeout 300 "$bin/hostcall.gfx942" call malloc crowd fprintf 2>&1)
+  expect "  a kernel calls a host function, mallocs and frees, and prints" "6" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
   out=$(run "$lib" fp8)
   expect "  the 8-bit float conversions are right, all 16 kinds" "16" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
   out=$(run "$lib" textures)
@@ -79,10 +85,11 @@ for lib in "${libs[@]}"; do
   # HIP makes the images and samplers there, and the kernels read the
   # resources it writes (hipcc/images.cpp, the same 21 checks as on the
   # simulator's own HIP).
-  for gen in "gfx1030 rx6900xt" "gfx1030 rx6800" "gfx1031 rx6700xt" "gfx1100 rx7900xtx" "gfx1201 rx9070xt"; do
+  # (The MI250X's has 19: it has no image_sample_l or image_gather4, so the two checks that use them do not run.)
+  for gen in "gfx1030 rx6900xt 21" "gfx1030 rx6800 21" "gfx1031 rx6700xt 21" "gfx1100 rx7900xtx 21" "gfx1201 rx9070xt 21" "gfx90a mi250x 19"; do
     set -- $gen
     out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$tmp:$lib" timeout 600 "$bin/images.$1" 2>&1)
-    expect "  arrays, textures and surfaces on $2" "21" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
+    expect "  arrays, textures and surfaces on $2" "$3" "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out")"
   done
 done
 exit $fail

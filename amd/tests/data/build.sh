@@ -48,15 +48,21 @@ echo "wrote $(pwd)/memory.gfx90a.o"
 
 # Kernels written in assembly, for instructions a compiler emits only now and
 # then (test_amd_gcn_asm).
-for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp asm_hwid asm_quad asm_mulhi asm_xf32 asm_permute_exec asm_barrier_order asm_vop3_gaps; do
+for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp asm_hwid asm_quad asm_mulhi asm_xf32 asm_permute_exec asm_barrier_order asm_vop3_gaps asm_buffer_lds_cdna3; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 -c "$src.s" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"
 done
 
 # And for gfx950, for what only it has (test_amd_gcn_asm).
-for src in asm_lds_dma asm_ds_tr; do
+for src in asm_lds_dma asm_ds_tr asm_buffer_lds asm_minmax3 asm_scalef32; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx950 -c "$src.s" -o "$src.gfx950.o"
   echo "wrote $(pwd)/$src.gfx950.o"
+done
+
+# And for gfx90a (MI200), whose image instructions (MIMG) are its own (test_amd_gcn_asm).
+for src in asm_images90a; do
+  "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx90a -c "$src.s" -o "$src.gfx90a.o"
+  echo "wrote $(pwd)/$src.gfx90a.o"
 done
 
 # And for gfx1100 (RDNA3, wave32), for what only RDNA has (test_amd_gcn_asm).
@@ -71,6 +77,21 @@ for src in asm_ttmp asm_cycles asm_fminmax12 asm_salu_f16 asm_hwid12; do
   echo "wrote $(pwd)/$src.gfx1201.o"
 done
 
+# What the CDNA ISA guides define and the executor used to refuse (test_amd_gcn_cdna_gaps): one source a target, run through the C
+# preprocessor for the spelling of the sc0/glc bit and for what only some parts have (GFX90A, GFX942 or GFX950 is defined).
+for src in asm_cdna_mem64 asm_cdna_ldsdma asm_cdna_ds asm_cdna_scalar asm_cdna_valu asm_cdna_formats asm_cdna_pk asm_cdna_refused; do
+  for t in gfx90a gfx942 gfx950; do
+    "$clang" -x assembler-with-cpp -D"$(echo "$t" | tr a-z A-Z)" -target amdgcn-amd-amdhsa -mcpu=$t -c "$src.s" -o "$src.$t.o"
+    echo "wrote $(pwd)/$src.$t.o"
+  done
+done
+
+# gfx1250's: the same for what the CDNA 5 document defines and the executor refused (test_amd_gcn_cdna_gaps).
+for src in asm_cdna5_gaps; do
+  "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 -c "$src.s" -o "$src.gfx1250.o"
+  echo "wrote $(pwd)/$src.gfx1250.o"
+done
+
 # The same code as the assembler writes it, which the decoder's test compares
 # against instruction by instruction. llvm-objdump ships with clang; without
 # it the listing already checked in stays as it is.
@@ -81,6 +102,11 @@ if [[ -x "$objdump" ]]; then
       sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > "$src.gfx942.dis"
     echo "wrote $(pwd)/$src.gfx942.dis ($(wc -l < "$src.gfx942.dis") instructions)"
   done
+  # Where each instruction of counters' first kernel sits (hex, no 0x): what
+  # the PC sampling test expects the sampled program counters to be.
+  "$objdump" -d --mcpu=gfx942 counters.gfx942.o | sed -n '/<counted_mix>:/,/s_endpgm/p' |
+    sed -n 's/^\t.*\/\/ \([0-9A-F]*\):.*/\1/p' | sed 's/^0*\(.\)/\1/' > counters.gfx942.pcs
+  echo "wrote $(pwd)/counters.gfx942.pcs ($(wc -l < counters.gfx942.pcs) instructions)"
 else
   echo "no llvm-objdump beside $clang: keeping the listing as it is"
 fi

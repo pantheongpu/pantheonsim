@@ -84,6 +84,20 @@ expect "each lane's printf comes out whole, in lane order" \
 expect "and printf returns what it printed" "printf returned what it printed for 3 of 3 lanes" \
   "$(grep -o 'printf returned .*' <<< "$out")"
 
+# What a kernel asks of the host (hipcc/hostcall.cpp): a host function it names
+# (the device library's function call service), malloc and free (the device
+# memory service, over the heap the runtime provides), printf's conversions and
+# the fprintf interface -- on a wave64 MI300X, an MI250X and a wave32 RX 7900 XTX.
+for run in "gfx942 mi300x" "gfx90a mi250x" "gfx1100 rx7900xtx"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/hostcall.$1" 2>&1)
+  status=$?
+  echo "$out" | sed 's/^/      /'
+  expect "the $1 hostcall program runs to the end" "0" "$status"
+  expect "every $1 hostcall check holds (function call, malloc and free, printf, fprintf)" "7 of 7" \
+    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 7"
+done
+
 # A cooperative launch: sixteen work-groups each publish a value, wait at a
 # grid barrier, and sum what all of them published, then wait again before
 # clearing it -- right only if no group got past a barrier early. A grid one
@@ -163,8 +177,8 @@ expect "every OCP fp8 and bf8 widens to the float HIP's header gives" "4 of 4 wa
 out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/gfx950.gfx950" 2>&1)
 status=$?
 expect "the gfx950 program runs to the end" "0" "$status"
-expect "each block-scaled product, of every format pairing, is what the ISA says" "6 of 6" \
-  "$(grep -c '^[0-9x]* formats .*: 0 of [0-9]* wrong$' <<< "$out") of 6"
+expect "each block-scaled product, of every format pairing, is what the ISA says" "15 of 15" \
+  "$(grep -c '^[0-9x]* formats .*: 0 of [0-9]* wrong$' <<< "$out") of 15"
 expect "v_prng_b32 steps the ISA's LFSR" "v_prng_b32: 0 of 64 wrong" "$(grep -o '^v_prng_b32:.*' <<< "$out")"
 expect "v_permlane32_swap_b32 trades the halves of two registers" "v_permlane32_swap_b32: 0 of 128 wrong" \
   "$(grep -o '^v_permlane32_swap_b32:.*' <<< "$out")"
@@ -183,6 +197,28 @@ status=$?
 expect "the gfx950 sparse matrix program runs to the end" "0" "$status"
 expect "each gfx950 sparse product is what the ISA says" "22 of 22" \
   "$(grep -c '^[fi]32_.* cbsz:.*: 0 of [0-9]* wrong$' <<< "$out") of 22"
+
+# What the CDNA3 and CDNA4 guides say beyond the core matrix instructions
+# (hipcc/mfma_modes.cpp, gfx9_added.cpp, gfx9_semantics.cpp, gfx9_decode.cpp): the matrix modes,
+# instructions the two chips added, and ALU rules that differ from older chips.
+for t in mfma_modes gfx9_added gfx9_semantics gfx9_decode; do
+  for chip in gfx942:mi300x gfx950:mi350x; do
+    out=$(VGPU_QUIET=1 VGPU_GPU=amd/${chip#*:} LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/$t.${chip%%:*}" 2>&1)
+    status=$?
+    expect "the $t program runs to the end on ${chip%%:*}" "0" "$status"
+    expect "every $t check holds on ${chip%%:*}" "$t: 0 failed" "$(grep -E "^$t: [0-9]+ failed" <<< "$out")"
+  done
+done
+
+# gfx950's scaled narrowing conversions (hipcc/scalef32_narrow.cpp): fp8, bf8, fp4, fp6 and bf6 from f32, f16 and bf16, the pair, byte and
+# 32-value layouts, v_cvt_scalef32_f16_fp8 / _bf8's half choice, each against HIP's host reference (fcbx) over a sweep and against the cases
+# Composable Kernel's tests run on the device (the scale divides; overflow to NaN, infinity or the largest value as the format has it).
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" timeout 600 "$(dirname "$exe")/scalef32_narrow.gfx950" 2>&1)
+status=$?
+echo "$out" | grep -v ': 0 of ' | sed 's/^/      /'
+expect "the gfx950 narrowing conversion program runs to the end" "0" "$status"
+expect "every scaled narrowing conversion is what HIP's host reference and CK's tests say" "scalef32_narrow: 0 failed" "$(grep -E '^scalef32_narrow: [0-9]+ failed' <<< "$out")"
+expect "all 33 of its checks ran" "33" "$(grep -c ' of [0-9]* wrong$' <<< "$out")"
 
 # MODE's floating-point modes (hipcc/numerics.cpp): what a kernel's
 # descriptor starts it with -- denormals kept by default, single-precision
@@ -215,14 +251,16 @@ expect "every RDNA3 wave64 check holds (DPP, output modifiers, double literals)"
 # (hipcc/images.cpp): samples, filtering, address modes, gathers, linear,
 # pitched, 3D and layered textures, surfaces, the copies to and from arrays
 # and the API's answers -- the same program built for gfx1030, gfx1100 and
-# gfx1201, whose image resources are laid out differently.
-for run in "gfx1030 rx6900xt" "gfx1030 rx6800" "gfx1031 rx6700xt" "gfx1100 rx7900xtx" "gfx1201 rx9070xt"; do
+# gfx1201, whose image resources are laid out differently, and for gfx90a.
+# The MI250X (gfx90a) has one sample instruction, image_sample, so the checks of an explicit level of detail and
+# of gathers do not run there: 19 checks.
+for run in "gfx1030 rx6900xt 21" "gfx1030 rx6800 21" "gfx1031 rx6700xt 21" "gfx1100 rx7900xtx 21" "gfx1201 rx9070xt 21" "gfx90a mi250x 19"; do
   set -- $run
   out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/images.$1" 2>&1)
   status=$?
   expect "the $1 image program runs to the end" "0" "$status"
-  expect "every $1 texture and surface check holds" "21 of 21" \
-    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of 21"
+  expect "every $1 texture and surface check holds" "$3 of $3" \
+    "$(grep -c ': 0 of [0-9]* wrong$' <<< "$out") of $3"
 done
 
 # RDNA4 on a simulated Radeon RX 9070 XT (hipcc/rdna4.cpp): WMMA in gfx12's
@@ -417,6 +455,15 @@ status=$?
 expect "the gfx1250 arithmetic program runs to the end" "0" "$status"
 expect "every gfx1250 arithmetic check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# gfx1250's scaled narrowing conversions (hipcc/scalef32_narrow1250.cpp): 8 values to fp8, bf8 or fp4 and 16 to fp6 or bf6, from f32, f16 and
+# bf16, each against HIP's host reference (fcbx) over a sweep.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/scalef32_narrow1250.gfx1250" 2>&1)
+status=$?
+echo "$out" | grep -v ': 0 of ' | sed 's/^/      /'
+expect "the gfx1250 narrowing conversion program runs to the end" "0" "$status"
+expect "every gfx1250 scaled narrowing conversion is what HIP's host reference says" "scalef32_narrow1250: 0 failed" "$(grep -E '^scalef32_narrow1250: [0-9]+ failed' <<< "$out")"
+expect "all 15 of its checks ran" "15" "$(grep -c ' of [0-9]* wrong$' <<< "$out")"
+
 # gfx1250's vector registers past v255 (hipcc/vgprs1250.cpp): s_set_vgpr_msb, and 600 values live at once.
 out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/vgprs1250.gfx1250" 2>&1)
 status=$?
@@ -433,9 +480,10 @@ for prog in block1250 tensor1250 ds1250 forms1250 cluster1250 preload1250.3 prel
   expect "every gfx1250 $prog check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 done
 
-# Events shared between processes (hipcc/ipc.cpp): an interprocess event's
-# handle opened in a process it forks, whose wait waits for the record made
-# here.
+# Events and memory shared between processes (hipcc/ipc.cpp): an interprocess
+# event's handle opened in a process it forks, whose wait waits for the record
+# made here; and two handles asked for one allocation, both opened there, read
+# and written through there.
 out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi300x LD_LIBRARY_PATH="$shim" timeout 120 "$(dirname "$exe")/ipc.gfx942" 2>&1)
 status=$?
 echo "$out" | sed 's/^/      /'
@@ -531,4 +579,39 @@ echo "$out" | sed 's/^/      /'
 expect "the wave-order program runs to the end" "0" "$status"
 expect "every wave reads the word before thread 0 overwrites it, in a kernel's first round and in later ones" \
   "10 of 10 wave-order checks hold" "$(grep -o '^[0-9]* of [0-9]* wave-order checks hold' <<< "$out")"
+# Division as the compiler writes it (v_div_scale, v_rcp, fused multiply-adds, v_div_fmas, v_div_fixup): float and double quotients
+# of edge operands (zeros, denormals, infinities, NaNs, both signs) and of random ones whose exponents differ by up to the whole
+# range, each against the host's own IEEE division, bit for bit (hipcc/divide.cpp). A denominator whose significand is all ones is
+# allowed to be one unit in the last place off.
+for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x" "gfx1100 rx7900xtx" "gfx1201 rx9070xt"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/divide.$1" 2>&1)
+  status=$?
+  expect "$1: the division program runs to the end" "0" "$status"
+  expect "$1: every float and double quotient is the IEEE one" \
+    "divide float: 141681 quotients, 0 differ from IEEE division (0 of the 1681 edge pairs)
+divide double: 141681 quotients, 0 differ from IEEE division (0 of the 1681 edge pairs)" \
+    "$(grep '^divide \(float\|double\):' <<< "$out")"
+done
+# The half-precision multiply-adds of the CDNA chips: v_mad_f16, v_mad_legacy_f16 and v_mac_f16 round the product to a half before the
+# add ("1ULP accuracy"), v_fma_f16 and v_fma_legacy_f16 are fused (CDNA2/3/4 guides, V_MAD_F16 and V_FMA_F16), checked on operands
+# where the two differ against the host's own arithmetic (hipcc/mad_f16.cpp).
+for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/mad_f16.$1" 2>&1)
+  status=$?
+  expect "$1: the half multiply-add program runs to the end" "0" "$status"
+  expect "$1: the MAD forms round the product, the FMA forms are fused" "5 of 5" "$(grep -c ': 0 of 64 wrong$' <<< "$out") of 5"
+done
+# MFMA A-matrix broadcast: for the 2-, 4- and 16-block f32 and f16 shapes, every CBSZ and a spread of ABIDs, each product's A is the element
+# AMD's Matrix Instruction Calculator says the broadcast reads (its tables are in hipcc/mfma_broadcast_golden.h; within each contiguous group of
+# 2^CBSZ blocks, block ABID's A feeds the whole group).
+for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/mfma_broadcast.$1" 2>&1)
+  status=$?
+  expect "$1: the MFMA broadcast program runs to the end" "0" "$status"
+  expect "$1: every CBSZ and ABID reads the A the calculator says" "50 of 50" \
+    "$(grep -c ' cbsz:[0-9]* abid:[0-9]*: 0 of [0-9]* wrong$' <<< "$out") of $(grep -c ' cbsz:[0-9]* abid:[0-9]*:' <<< "$out")"
+done
 exit $fail

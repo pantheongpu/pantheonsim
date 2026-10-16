@@ -29,6 +29,32 @@ namespace vgpu::amd {
 class Hostcall;
 class DecodeCache;
 
+// One PC sample: a wave, and the instruction it was about to issue.
+struct PcSample {
+  uint64_t pc = 0;          // the instruction's address (in device memory for a linked object)
+  uint64_t exec = 0;        // the wave's EXEC mask (a wave32 wave: its low 32 bits)
+  uint32_t group[3] = {};   // the wave's work-group
+  uint32_t wave_in_group = 0;
+  // Where the work-group runs (Dispatch::Layout), the same placement HW_ID
+  // reads back: the compute die, the shader engine, the shader array and the
+  // unit (compute unit, or RDNA's workgroup processor).
+  uint32_t die = 0, engine = 0, array = 0, unit = 0;
+};
+
+// Samples the program counters of the waves of a dispatch, by instruction
+// count. The simulator has no timing model, so there is no clock to sample
+// on: each wave is sampled when it is about to issue its 1st, its
+// (1 + interval)th, its (1 + 2*interval)th ... instruction, counting every
+// instruction it issues, a retried wait included. The samples are therefore
+// exact and repeatable for a given kernel, and say nothing of how long a card
+// would spend where. `sample` runs on the host threads that run the
+// work-groups, concurrently, and must be thread safe.
+struct PcSampler {
+  uint64_t interval = 0;   // instructions a wave issues between samples; 0: not sampling
+  void* user = nullptr;
+  void (*sample)(void* user, const PcSample& s) = nullptr;
+};
+
 // A launch, as the packet a HIP runtime writes describes one.
 struct Dispatch {
   const CodeObject* object = nullptr;
@@ -88,6 +114,8 @@ struct Dispatch {
   struct Layout {
     uint32_t dies = 1, engines = 1, arrays = 1, units = 1;
   } layout;
+  // A profiler sampling the waves' program counters (PcSampler); null for none.
+  const PcSampler* sampler = nullptr;
 };
 
 // What the GPU's performance counters would count for a dispatch: every
