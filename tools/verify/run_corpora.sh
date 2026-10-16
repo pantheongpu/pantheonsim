@@ -161,7 +161,7 @@ build_of() { case "$1" in A) echo "$A_BUILD";; B) echo "$B_BUILD";; C) echo card
 run_one() {   # corpus name mode cwd timeout cmd cfgname cfgspec
   local corpus="$1" name="$2" mode="$3" cwd="$4" to="$5" cmd="$6" cfg="$7" spec="$8"
   local rdir="$OUT/$corpus/$name/$cfg"
-  if [[ -f "$rdir/rc" && $FORCE -eq 0 ]]; then return 0; fi
+  if [[ -s "$rdir/rc" && $FORCE -eq 0 ]]; then return 0; fi
   local build="${spec%%+*}" extra=""; [[ "$spec" == *+* ]] && extra="${spec#*+}"
   local bdir; bdir="$(build_of "$build")" || return 1
   local envs runner=(nice -n 10) limit="ulimit -v 12582912; "
@@ -220,7 +220,11 @@ run_one() {   # corpus name mode cwd timeout cmd cfgname cfgspec
 
 IFS=',' read -r -a CFGS <<< "$CONFIGS"
 echo "# run_corpora: A=$A_BUILD B=$B_BUILD out=$OUT start=$(date -Is) load=$(cut -d' ' -f1-3 /proc/loadavg)"
-all_programs > "$OUT/programs.tsv"
+# the list goes to a private file (several runs may share one results directory, each reading its own list);
+# programs.tsv is a copy for summarize.py, replaced in one step
+PLIST="$(mktemp "$OUT/.programs.XXXXXX")"
+all_programs > "$PLIST"
+cp "$PLIST" "$OUT/.programs.tsv.new" && mv -f "$OUT/.programs.tsv.new" "$OUT/programs.tsv"
 while IFS=$'\t' read -r corpus name mode cwd to cmd; do
   [[ -z "$ONLY" || "$corpus/$name" =~ $ONLY ]] || continue
   for c in "${CFGS[@]}"; do
@@ -228,5 +232,6 @@ while IFS=$'\t' read -r corpus name mode cwd to cmd; do
        && [[ "$(cat "$OUT/$corpus/$name/$SKIPTO/rc")" == 124 ]]; then continue; fi
     run_one "$corpus" "$name" "$mode" "$cwd" "$to" "$cmd" "${c%%=*}" "${c#*=}"
   done
-done < "$OUT/programs.tsv"
+done < "$PLIST"
+rm -f "$PLIST"
 echo "# done $(date -Is)"

@@ -16,6 +16,7 @@ Written for the round 7 + 8 speed work (A = `origin/main` before round 8, B = `o
 | `build_polybench_small.sh` | builds small-size copies of PolyBench/GPU (see below) |
 | `build_pantheon.sh` | builds the pantheon workloads once, for both builds |
 | `nvcc_locked.sh` | nvcc under the machine-wide build lock, niced and memory-capped, with `-cudart shared` |
+| `probes/round9_probe.cu` | a small program that exercises the deliberate round 9 changes (tensor-core sums, NaN selection, conversions, -0 under .sat/.ftz, bf16 HFMA2, 64-bit saturation, VABSDIFF, launch errors) and prints raw bits; `round9_probe full` also dumps every double result. Build with `nvcc -arch=sm_86 -cudart shared`, run it on the card and under every configuration, diff the text |
 | `fixed_time.c` | an `LD_PRELOAD` library that pins `time()` and `clock()`, for programs that seed their input from them (see below) |
 | `compat.h` | maps `cudaThreadSynchronize` (removed in CUDA 12) for the older benchmark sources |
 
@@ -95,6 +96,14 @@ pinned clock: build `fixed_time.c` (`gcc -shared -fPIC fixed_time.c -o fixed_tim
 `+LD_PRELOAD=/path/fixed_time.so` to every configuration spec, for example
 `--configs 'A=A+LD_PRELOAD=...,B=B+LD_PRELOAD=...'`. Programs that print a process id (the IPC samples) or
 uninitialised memory (Rodinia `backprop`'s `output.dat` tail) stay different from themselves.
+
+The real card: a configuration whose build is `C` (for example `--configs C=C`) runs the program against NVIDIA's CUDA 13.0
+libraries on the local RTX 3060 (`/usr/local/cuda-13.0/lib64`; the default 13.2 runtime segfaults on these cards) under
+`flock ~/.cache/pantheonsim-card.lock`, with no memory cap. `summarize.py` compares a pair that contains `C` on exit code, stdout and files
+only (the card has no simulator diagnostics and no counters). Do not run the card over the whole corpora unattended: `simpleMPI` starts an
+`orted` that keeps the lock's file descriptor open after the timeout; kill it, or the next card run waits for the lock forever.
+Do not run two `run_corpora.sh` instances on one results directory at the same time unless their program selections do not overlap (the
+runs would otherwise remove each other's results); each instance reads its own copy of the program list.
 
 Not covered: the real card (no GPU runs), more than one host thread (`VGPU_THREADS=1` is what makes the order, and so the output, deterministic),
 programs the corpora do not contain, and anything that needs more than the per-corpus timeout.
