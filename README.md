@@ -144,16 +144,17 @@ volatile or relaxed load, whose address does not change, and no store) runs the
 blocks the device holds at once together: each host thread keeps a window of
 resident blocks and gives every one a short turn in order, and the next block of the
 grid starts when one finishes, so a grid larger than the device holds still runs its
-first blocks together and the rest later, as a card does. A grid of fewer than 64
+first blocks together and the rest later, as a card does. A grid of fewer than 16
 blocks runs on one thread with all its blocks resident from the start, in a fixed
 order, so a program like the patch locks gives the same answer on every run. A
-larger grid uses every host thread, each starting with one block as before and
-holding more only when every thread's blocks have stood still for a while, so a scan
-with a look-back loop keeps its speed. Waiting blocks sleep rather than spin.
+larger grid uses every host thread it has two blocks for, each starting with one block as
+before and holding one more at a time only after no block on any thread has stored
+or finished for three milliseconds, so a scan with a look-back loop keeps its speed.
+Blocks that stand still sleep rather than spin.
 
 Kernels with no such loop run as before. The variable `VGPU_LOCKSTEP` set to `0` turns
 this off (the old behaviour, for debugging), and set to `all` runs every launch this way
-(to check that nothing depends on the order blocks start in); `VGPU_SASS_LOG` set to `1`
+(to check that nothing depends on the order blocks start in); `VGPU_LOCKSTEP_LOG` set to `1`
 says when a launch used it. It applies to SASS, PTX and AMD kernels; clusters, cooperative
 launches (which always did) and launches under a non-default `VGPU_SCHEDULER` are
 left alone. The code is `exec/lockstep.hpp`; details in

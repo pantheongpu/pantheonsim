@@ -138,25 +138,25 @@ flight together; run one after another every block wins them all).
   divided between the threads) and runs each for one turn of `kLockstepSlice` (64)
   instructions per warp, in the order the blocks started. When a block finishes the
   grid's next block takes its place, so blocks beyond the capacity start as earlier
-  ones end. A grid of fewer than 64 blocks uses one thread and starts them all, so the
-  order is the same on every run. A larger one uses every thread; a thread starts
+  ones end. A grid of fewer than 16 blocks uses one thread and starts them all, so the
+  order is the same on every run. A larger one uses every host thread it has two blocks for; a thread starts
   with one block, as the old path did (the AMD engine takes ranges of consecutive
-  groups, as it did), and doubles the blocks it holds only when no thread's blocks have
-  stored or finished for half a millisecond and its own are standing still. Standing
-  still is a hash of the blocks' registers, program counters and shared memory, equal at
-  two looks a quarter of a millisecond or more apart; a thread whose blocks compute
-  without storing is seen to move by the same look. So a chain of look-back flags
-  (CUB's scan and radix sort) runs as before, a grid barrier or a lock every block
-  contends for has all its blocks resident within a few milliseconds, and the window
-  never grows for blocks that are merely slow. While every block a thread holds
-  stands still it sleeps between passes (5 microseconds, doubling to half a
-  millisecond), so blocks waiting on the host, or on a thread the host has
-  descheduled, do not take a core. The warps of one block keep the turns they had.
+  groups, as it did), and holds one more at a time only after no block on any thread has
+  stored (to shared or global memory) or finished for three milliseconds, then one more
+  every millisecond. So a chain of look-back flags (CUB's scan and radix sort) runs as
+  before, since real blocks store all the time, and a grid barrier, or a lock every
+  block contends for, has all its blocks resident within a few tens of milliseconds. A
+  thread whose blocks all stand still sleeps between passes (5 microseconds, doubling to
+  half a millisecond), so blocks waiting on the host do not take a core. "Standing still"
+  is a hash of the blocks' registers, program counters and shared memory, equal at two
+  looks a quarter of a millisecond or more apart; a wait that counts its polls never
+  stands still, and just gives way to whatever else there is to run. The warps of one
+  block keep the turns they had.
 - **Left alone.** Cooperative launches (they already run this way), clusters, a
   non-default `VGPU_SCHEDULER`, device-side launches and the debugger.
 - **Switches.** `VGPU_LOCKSTEP=0` is the old behaviour. `VGPU_LOCKSTEP=all` makes every
   launch this way, which finds code that depends on the order blocks start in.
-  `VGPU_SASS_LOG=1` prints a line for each launch that used it.
+  `VGPU_LOCKSTEP_LOG=1` prints a line for each launch that used it (a file name there appends the lines to that file).
 
 A kernel that waits on something no resident block will ever do (a grid that does not
 fit the device, a block that never writes the flag) still spins for ever, as it does

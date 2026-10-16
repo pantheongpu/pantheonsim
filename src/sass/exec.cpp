@@ -1140,6 +1140,7 @@ exec::LaunchStats Runner::run() {
     const exec::LockstepShape shape = exec::lockstep_shape(units, capacity, threads);
     exec::lockstep_note(k_.name.c_str(), units, shape);
     std::atomic<uint64_t> beat{0};
+    std::atomic<bool> failed{false};
     const auto resident = [&](unsigned t) {
       try {
         exec::lockstep_worker<Block>(
@@ -1156,11 +1157,9 @@ exec::LaunchStats Runner::run() {
               std::lock_guard<std::mutex> g(stats_mu_);
               stats_.add(b.st);
             },
-            [&] {
-              std::lock_guard<std::mutex> g(fail_mu);
-              return static_cast<bool>(failure);
-            });
+            [&] { return failed.load(std::memory_order_relaxed); });
       } catch (...) {
+        failed.store(true, std::memory_order_relaxed);
         std::lock_guard<std::mutex> g(fail_mu);
         if (!failure) failure = std::current_exception();
       }
