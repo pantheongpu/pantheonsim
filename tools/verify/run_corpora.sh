@@ -27,8 +27,12 @@
 #   A2  = A                      the same build again: finds programs that differ from themselves
 #   B   = B                      build under test, SASS engine
 #   Bt  = B+VGPU_TIER=1+VGPU_TIER_STATS=1   the opt-in pre-decoded tier
+#   Bx  = B+VGPU_TC_EXACT=0      build under test with the earlier sequential tensor-core sums (only builds that have the switch)
 #   Ap  = A+VGPU_SASS=0          baseline, PTX engine
 #   Bp  = B+VGPU_SASS=0          build under test, PTX engine
+# Other configurations by --configs: BUILD may also be C, the real RTX 3060 with NVIDIA's CUDA 13.0 libraries
+# (CARD_LIBS overrides the library path; runs under flock ~/.cache/pantheonsim-card.lock, no memory cap).
+# Never run C for the whole corpora blindly: select the programs with --only.
 #
 # Every run: VGPU_THREADS=1 (strictly ordered blocks), VGPU_COUNTERS=1, VGPU_COUNTERS_FILE, the RTX 3060
 # profile, nice -n 10, ulimit -v 12582912, timeout (per corpus, scaled by TIMEOUT_SCALE).
@@ -38,7 +42,7 @@
 set -uo pipefail
 
 A_BUILD=""; B_BUILD=""; OUT=""; CORPORA="hecbench,rodinia,polybench,samples,pantheon"
-CONFIGS="A=A,A2=A,B=B,Bt=B+VGPU_TIER=1+VGPU_TIER_STATS=1,Ap=A+VGPU_SASS=0,Bp=B+VGPU_SASS=0"
+CONFIGS="A=A,A2=A,B=B,Bt=B+VGPU_TIER=1+VGPU_TIER_STATS=1,Bx=B+VGPU_TC_EXACT=0,Ap=A+VGPU_SASS=0,Bp=B+VGPU_SASS=0"
 ONLY=""; SKIPTO=""; FORCE=0; LIST=0; DRY=0; MAXLOAD=0; PAUSE=60
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -49,7 +53,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY=1; shift;;          --max-load) MAXLOAD="$2"; shift 2;;
     --pause) PAUSE="$2"; shift 2;;
     --skip-timeouts) SKIPTO="$2"; shift 2;;
-    -h|--help) sed -n '2,38p' "$0"; exit 0;;
+    -h|--help) sed -n '2,42p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
@@ -152,7 +156,7 @@ all_programs() {
 if (( LIST )); then all_programs | awk -F'\t' '{printf "%s/%s\t%s\ttimeout=%s\t%s\n", $1, $2, $3, $5, $6}'; exit 0; fi
 
 # --- one run
-build_of() { case "$1" in A) echo "$A_BUILD";; B) echo "$B_BUILD";; *) echo "bad build $1" >&2; return 1;; esac; }
+build_of() { case "$1" in A) echo "$A_BUILD";; B) echo "$B_BUILD";; C) echo card;; *) echo "bad build $1" >&2; return 1;; esac; }
 
 run_one() {   # corpus name mode cwd timeout cmd cfgname cfgspec
   local corpus="$1" name="$2" mode="$3" cwd="$4" to="$5" cmd="$6" cfg="$7" spec="$8"
@@ -160,10 +164,18 @@ run_one() {   # corpus name mode cwd timeout cmd cfgname cfgspec
   if [[ -f "$rdir/rc" && $FORCE -eq 0 ]]; then return 0; fi
   local build="${spec%%+*}" extra=""; [[ "$spec" == *+* ]] && extra="${spec#*+}"
   local bdir; bdir="$(build_of "$build")" || return 1
-  local envs=(PATH="$PATH" HOME="$HOME" LANG=C LC_ALL=C LD_LIBRARY_PATH="$bdir/shim"
-              VGPU_GPU=nvidia/rtx3060 VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_COUNTERS_FILE="$rdir/counters.jsonl")
-  if [[ "$corpus" == pantheon ]]; then
-    envs+=(VGPU_DEVICE_COUNT=2 VGPU_VRAM_MB=1024 VGPU_MAX_STEPS=17179869184)
+  local envs runner=(nice -n 10) limit="ulimit -v 12582912; "
+  if [[ "$build" == C ]]; then
+    # the real card: NVIDIA's libraries, the machine-wide card lock, no memory cap (the real runtime reserves a lot of address space)
+    envs=(PATH="/usr/local/cuda-13.0/bin:$PATH" HOME="$HOME" LANG=C LC_ALL=C
+          LD_LIBRARY_PATH="${CARD_LIBS:-/usr/local/cuda-13.0/lib64:/usr/local/cuda-13.0/targets/x86_64-linux/lib}")
+    runner=(flock "$HOME/.cache/pantheonsim-card.lock" nice -n 10); limit=""
+  else
+    envs=(PATH="$PATH" HOME="$HOME" LANG=C LC_ALL=C LD_LIBRARY_PATH="$bdir/shim"
+          VGPU_GPU=nvidia/rtx3060 VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_COUNTERS_FILE="$rdir/counters.jsonl")
+    if [[ "$corpus" == pantheon ]]; then
+      envs+=(VGPU_DEVICE_COUNT=2 VGPU_VRAM_MB=1024 VGPU_MAX_STEPS=17179869184)
+    fi
   fi
   local kv; for kv in ${extra//+/ }; do envs+=("$kv"); done
   if (( DRY )); then echo "[$corpus/$name/$cfg] (cd $cwd && env ${envs[*]} timeout $to $cmd)"; return 0; fi
@@ -176,8 +188,8 @@ run_one() {   # corpus name mode cwd timeout cmd cfgname cfgspec
   ( cd "$work" && find . -type f -printf '%p\t%s\t%T@\n' | sort > "$pre" )
   local load; load="$(cut -d' ' -f1-3 /proc/loadavg)"
   local t0 t1; t0=$(date +%s.%N)
-  ( cd "$work" && env -i "${envs[@]}" nice -n 10 timeout -k 10 "$to" \
-      bash -c "ulimit -v 12582912; exec $cmd" > "$rdir/stdout" 2> "$rdir/stderr" < /dev/null )
+  ( cd "$work" && env -i "${envs[@]}" "${runner[@]}" timeout -k 10 "$to" \
+      bash -c "${limit}exec $cmd" > "$rdir/stdout" 2> "$rdir/stderr" < /dev/null )
   local rc=$?
   t1=$(date +%s.%N)
   # files the program created or changed: hashed, and kept when small

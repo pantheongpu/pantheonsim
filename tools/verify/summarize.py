@@ -152,7 +152,7 @@ def timed_counters_equal(x, y):
     return (not bad, not bad)
 
 
-def component_diffs(x, y, timed):
+def component_diffs(x, y, timed, card=False):
     """-> dict component -> (raw_equal, norm_equal)"""
     res = {}
     res["rc"] = (x.rc == y.rc, x.rc == y.rc)
@@ -176,6 +176,9 @@ def component_diffs(x, y, timed):
         cb = (x.blocks == y.blocks,) * 2
         cr = (x.records == y.records,) * 2
     res["counters"] = (cb[0] and cr[0], cb[1] and cr[1])
+    if card:   # the real card has no simulator diagnostics and no counters: compare what a user sees
+        for k in ("stderr", "counters"):
+            res[k] = (True, True)
     return res
 
 
@@ -262,7 +265,7 @@ def main():
             elif x.status == "timeout" or y.status == "timeout":
                 verdict, comps, det = "timeout-vs-done", ["rc"], [f"{xn} {x.status} ({x.secs:.0f}s), {yn} {y.status} ({y.secs:.0f}s)"]
             else:
-                cd = component_diffs(x, y, timed)
+                cd = component_diffs(x, y, timed, "C" in (xn, yn))
                 bad = [k for k, (raw, norm) in cd.items() if not norm]
                 masked = [k for k, (raw, norm) in cd.items() if norm and not raw]
                 if not bad:
