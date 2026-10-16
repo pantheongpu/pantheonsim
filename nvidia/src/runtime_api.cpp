@@ -5916,7 +5916,7 @@ VGPU_EXPORT cudaError_t cudaMemAdvise(const void* p, size_t n, cudaMemoryAdvise 
   return traced_call("cudaMemAdvise", cudaMemAdvise_traced, p, n, kind, loc);
 }
 #else
-static cudaError_t cudaMemPrefetchAsync_traced(const void* p, size_t n, int device, cudaStream_t p3) {
+static cudaError_t cudaMemPrefetchAsync_traced(const void* p, size_t n, int device, cudaStream_t /*p3*/) {
   return guard("cudaMemPrefetchAsync", [&](State& s) { return prefetch(s, p, n, device); });
 }
 
@@ -7058,7 +7058,7 @@ std::unordered_map<uint64_t, CondHandle> g_cond_handles;
 // Handles are numbers to a kernel. An RTX 3060 numbers them from 1 in each
 // graph and tells graphs apart by the launch; here they are unique in the
 // process, so the number alone says whose it is. Zero is never one.
-uint64_t g_next_cond_handle = 1;
+[[maybe_unused]] uint64_t g_next_cond_handle = 1;   // used from CUDA 12.3 (cudaGraphConditionalHandleCreate)
 
 // `g` and every graph inside it: child graphs and conditional bodies.
 void graph_tree(const GraphRec& g, std::set<const GraphRec*>* out) {
