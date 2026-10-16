@@ -103,3 +103,54 @@ single-device.
 `trap` is now implemented generally, not just for this: it is what a failed
 device `assert()` and a compiler-inserted unreachable path lower to, and
 reaching one is a fact about the program worth reporting with its line.
+
+## Blocks that wait on one another without a cooperative launch
+
+Nothing in CUDA or HIP promises that the blocks of an ordinary launch are resident
+together, but every card does keep them so when the grid fits, and programs rely on
+it: hand-written grid barriers, a chain of flags run from the last block to the first,
+a producer in one block with its consumers in others, RXMesh's patch locks (the
+block with the lowest id ends up with every lock, but only if all the blocks are in
+flight together; run one after another every block wins them all).
+
+`exec/lockstep.hpp` is the one place that decides how such blocks take turns.
+
+- **Which kernels.** A kernel is searched for a polling loop when it first launches:
+  a backward branch whose loop holds an atomic that returns the old value, or a
+  volatile, relaxed or acquire load (SASS `STRONG` loads, PTX `.volatile` and
+  `.relaxed`, AMD loads with cache bits), whose address and operands are the same on
+  every turn of the loop, and no store to global memory and no call. A register counts
+  as the same when the loop only reads it, or sets it from constants and such registers
+  before it reads it; a counter, or anything built from what a load returned, is not.
+  A compare-and-swap retry loop (`old = atomicCAS(p, assumed, f(assumed))`) is
+  therefore not a poll. The test errs towards "no": a kernel it misses runs as it did,
+  and one it takes for a poller only loses some speed. The search is in
+  `kernel_polls` (SASS, `src/sass/exec.cpp`), `ptx_kernel_polls`
+  (`src/exec/interpreter.cpp`) and `amd_kernel_polls` (`amd/src/gcn_exec.cpp`); for
+  AMD it assumes, and the ISA guides do not say, that a compiler marks the loads of a
+  polling loop with cache-control bits.
+- **How many are resident.** The runtime works out how many blocks of the kernel the
+  device holds at once, as `cudaOccupancyMaxActiveBlocksPerMultiprocessor` does,
+  times the multiprocessors (`LaunchConfig::resident_blocks`, `Dispatch::resident_groups`).
+- **The turns.** Each host thread holds a window of resident blocks (the capacity
+  divided between the threads) and runs each for one turn of `kLockstepSlice` (64)
+  instructions per warp, in the order the blocks started. When a block finishes the
+  grid's next block takes its place, so blocks beyond the capacity start as earlier
+  ones end. A grid of fewer than 64 blocks uses one thread and starts them all, so the
+  order is the same on every run. A larger one uses every thread, taking consecutive
+  blocks a chunk at a time; a thread starts with one block, as the old path did, and
+  admits one more after three passes over its blocks in which no block on any thread
+  finished or stored (a pass of a thread whose blocks all wait, while another thread's
+  blocks get somewhere, does not grow its window). A chain of look-back flags then
+  costs a hand-over between threads per chunk; a grid barrier, or a lock every block
+  contends for, has all its blocks resident after a few passes. The warps of one block
+  keep the turns they had.
+- **Left alone.** Cooperative launches (they already run this way), clusters, a
+  non-default `VGPU_SCHEDULER`, device-side launches and the debugger.
+- **Switches.** `VGPU_LOCKSTEP=0` is the old behaviour. `VGPU_LOCKSTEP=all` makes every
+  launch this way, which finds code that depends on the order blocks start in.
+  `VGPU_SASS_LOG=1` prints a line for each launch that used it.
+
+A kernel that waits on something no resident block will ever do (a grid that does not
+fit the device, a block that never writes the flag) still spins for ever, as it does
+on a card; a kernel waiting for the host spins one core, as it did.

@@ -442,6 +442,7 @@ class Runner {
   // ---- per-block ----
   void run_block(Block& blk);
   bool block_round(Block& blk, int slice);
+  uint64_t fingerprint(const Block& blk) const;
   bool break_warpsync_standoff(Block& blk);
   bool break_bsync_standoff(Block& blk);
   void init_block(Block& blk, uint64_t linear);
@@ -1137,19 +1138,20 @@ exec::LaunchStats Runner::run() {
     for (Block& blk : all) stats_.add(blk.st);
   } else if (lockstep) {
     const exec::LockstepShape shape = exec::lockstep_shape(units, capacity, threads);
-    if (const char* lg = std::getenv("VGPU_SASS_LOG"); lg && lg[0] == '1')
-      std::fprintf(stderr, "[vgpu] lockstep: kernel %s, %llu blocks, %u host thread(s) of %llu resident blocks\n", k_.name.c_str(),
-                   static_cast<unsigned long long>(units), shape.workers, static_cast<unsigned long long>(shape.window));
+    exec::lockstep_note(k_.name.c_str(), units, shape);
+    std::atomic<uint64_t> beat{0};
     const auto resident = [&](unsigned t) {
       try {
         exec::lockstep_worker<Block>(
-            next, units, shape.window,
+            next, beat, units, shape.window, shape.initial, shape.chunk,
             [&](Block& b, uint64_t unit, size_t slot) {
               init_block(b, unit);
               // The SM number a block reads (SR_VIRTUALSMID): distinct among the blocks that are resident together.
               b.worker = static_cast<uint32_t>((uint64_t{t} * shape.window + slot) % std::max<uint32_t>(1, profile_.limits.multiprocessors));
             },
             [&](Block& b) { return !block_round(b, static_cast<int>(exec::kLockstepSlice)); },
+            [](const Block& b) { return b.st.global_stores + b.st.shared_stores; },
+            [this](const Block& b) { return fingerprint(b); },
             [&](Block& b) {
               std::lock_guard<std::mutex> g(stats_mu_);
               stats_.add(b.st);
@@ -1329,6 +1331,23 @@ bool Runner::block_round(Block& blk, int slice) {
                                   ", " + std::to_string(blk.ctaid[1]) + ", " + std::to_string(blk.ctaid[2]) +
                                   ") is waiting (a barrier some threads never reach)" + stall_summary(blk));
   return true;
+}
+
+// A hash of what a block's warps hold: registers, predicates, program counters and the block's shared
+// memory. Equal at two moments a long run of turns apart, the block has been going round a loop that
+// changes nothing (a wait), not computing (see exec/lockstep.hpp).
+uint64_t Runner::fingerprint(const Block& blk) const {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (const Warp& w : blk.warps) {
+    h = exec::lockstep_fold(h, w.r.data(), w.r.size() * sizeof(uint32_t));
+    h = exec::lockstep_fold(h, w.p, sizeof w.p);
+    h = exec::lockstep_fold(h, w.ur, sizeof w.ur);
+    h = exec::lockstep_fold(h, w.pc, sizeof w.pc);
+    const Mask m[2] = {w.waiting, w.exited};
+    h = exec::lockstep_fold(h, m, sizeof m);
+    if (!w.local.empty()) h = exec::lockstep_fold(h, w.local.data(), w.local.size());
+  }
+  return exec::lockstep_fold(h, blk.shared.data(), blk.shared.size());
 }
 
 // Cluster k's blocks, resident together and taking turns as a block's warps

@@ -60,7 +60,7 @@ namespace {
 
 // How many work-groups of `k` the device holds at once (defined with the occupancy arithmetic below);
 // 0 when that cannot be worked out.
-uint64_t resident_groups_of(const vgpu::DeviceProfile& p, const Kernel& k, uint32_t threads, size_t lds);
+uint64_t resident_groups_of(const vgpu::DeviceProfile& p, const vgpu::amd::Kernel& k, uint32_t threads, size_t lds);
 
 
 using vgpu::amd::CodeObject;

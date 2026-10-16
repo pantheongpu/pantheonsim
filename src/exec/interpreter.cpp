@@ -2755,17 +2755,18 @@ class Interpreter {
   // One host thread's part of a lockstep launch (vgpu/exec/lockstep.hpp): up to `window` blocks of the
   // grid resident, each given a short turn in order, the grid's next block taking the place of one
   // that finishes. `worker` and the window number the blocks' SMs.
-  void run_lockstep(std::atomic<uint64_t>& ticket, uint64_t units, uint64_t window, unsigned worker,
+  void run_lockstep(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat, uint64_t units, uint64_t window, uint64_t initial, uint64_t chunk, unsigned worker,
                     const std::atomic<bool>* failed) {
     struct Resident {
       std::unique_ptr<BlockState> b;
       ClusterState solo;   // a block with no explicit cluster is a cluster of one
       std::unique_ptr<Scheduler> sched;
+      uint64_t stores = 0;   // the stores this interpreter made during the block's turns
     };
     lockstep_ = true;
     const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
     lockstep_worker<Resident>(
-        ticket, units, window,
+        ticket, beat, units, window, initial, chunk,
         [&](Resident& r, uint64_t i, size_t slot) {
           r.b = std::make_unique<BlockState>();   // fresh each time: a block starts from nothing
           BlockState& b = *r.b;
@@ -2783,7 +2784,29 @@ class Interpreter {
           b.ctx.cluster_state = &r.solo;
           r.sched = make_scheduler(cfg_.scheduler, cfg_.scheduler_seed + i * 0x9E3779B97F4A7C15ull);
         },
-        [&](Resident& r) { return !step_block(*r.b, *r.sched, kLockstepSlice); },
+        [&](Resident& r) {
+          const uint64_t s0 = stats_.global_stores + stats_.shared_stores;
+          const bool live = step_block(*r.b, *r.sched, kLockstepSlice);
+          r.stores += stats_.global_stores + stats_.shared_stores - s0;
+          return !live;
+        },
+        [](const Resident& r) { return r.stores; },
+        [](const Resident& r) {
+          // What the block's warps hold, to tell a block that waits from one that computes.
+          uint64_t h = 0xcbf29ce484222325ull;
+          for (const Warp& w : r.b->warps) {
+            h = lockstep_fold(h, w.regs32.data(), w.regs32.size() * sizeof(w.regs32[0]));
+            h = lockstep_fold(h, w.regs64.data(), w.regs64.size() * sizeof(w.regs64[0]));
+            h = lockstep_fold(h, w.preds.data(), w.preds.size() * sizeof(w.preds[0]));
+            for (const Path& p : w.paths) {
+              const uint64_t at[3] = {p.pc, p.mask, p.parked};
+              h = lockstep_fold(h, at, sizeof at);
+            }
+            const uint64_t st[2] = {static_cast<uint64_t>(w.state), w.exited};
+            h = lockstep_fold(h, st, sizeof st);
+          }
+          return lockstep_fold(h, r.b->shared.data(), r.b->shared.size());
+        },
         [&](Resident&) { ++stats_.blocks; },
         [&] { return failed && failed->load(std::memory_order_relaxed); });
   }
@@ -14843,12 +14866,9 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
       // A kernel that can allocate while it runs keeps to one host thread (see below).
       const unsigned threads = allocates_while_running(fn, seen) ? 1u : worker_count(blocks);
       const LockstepShape shape = lockstep_shape(blocks, eff.resident_blocks ? eff.resident_blocks : blocks, threads);
-      if (std::getenv("VGPU_SASS_LOG") != nullptr && std::string(std::getenv("VGPU_SASS_LOG")) == "1")
-        std::fprintf(stderr, "[vgpu] lockstep: kernel %s, %llu blocks, %u host thread(s) of %llu resident blocks\n",
-                     fn.name.c_str(), static_cast<unsigned long long>(blocks), shape.workers,
-                     static_cast<unsigned long long>(shape.window));
+      lockstep_note(fn.name.c_str(), blocks, shape);
       std::vector<LaunchStats> per_thread(shape.workers);
-      std::atomic<uint64_t> ticket{0};
+      std::atomic<uint64_t> ticket{0}, beat{0};
       std::atomic<bool> failed{false};
       std::mutex err_mu;
       std::exception_ptr first_error;
@@ -14859,7 +14879,7 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
           interp.set_worker(t);
           interp.set_grid_id(grid_id);
           interp.set_device_launches(dl);
-          interp.run_lockstep(ticket, blocks, shape.window, t, &failed);
+          interp.run_lockstep(ticket, beat, blocks, shape.window, shape.initial, shape.chunk, t, &failed);
         } catch (...) {
           failed.store(true, std::memory_order_relaxed);
           std::lock_guard<std::mutex> lock(err_mu);

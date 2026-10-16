@@ -16,6 +16,7 @@
 // of timed-out waits instead of hanging.
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -220,7 +221,9 @@ static void expect(bool ok, const char* what) {
   }
 }
 
-int main() {
+int main(int argc, char** argv) {
+  // `lockstep_blocks <name>` runs one of barrier, chain, queue, locks, forward; none runs them all.
+  const auto want = [&](const char* name) { return argc < 2 || !std::strcmp(argv[1], name); };
   int dev_count = 0;
   CHECK(cudaGetDeviceCount(&dev_count));
   cudaDeviceProp prop;
@@ -228,7 +231,7 @@ int main() {
   std::printf("device %s, %d SMs\n", prop.name, prop.multiProcessorCount);
 
   // 1. grid barrier: 16 blocks, three phases.
-  {
+  if (want("barrier")) {
     const unsigned n = 16, phases = 3;
     Barrier* bar = dev<Barrier>(1);
     unsigned* data = dev<unsigned>(n * phases);
@@ -251,7 +254,7 @@ int main() {
   }
 
   // 2. a chain from the last block to the first.
-  {
+  if (want("chain")) {
     const unsigned n = 24;
     unsigned* flag = dev<unsigned>(n + 1);
     unsigned* total = dev<unsigned>(n + 1);
@@ -276,7 +279,7 @@ int main() {
   }
 
   // 3. one producer (the last block), consumers in the others.
-  {
+  if (want("queue")) {
     const unsigned n = 10, items = 40;
     unsigned* ready = dev<unsigned>(items);
     unsigned* vals = dev<unsigned>(items);
@@ -297,7 +300,7 @@ int main() {
   }
 
   // 4. patch locks: 12 blocks, many shuffles.
-  {
+  if (want("locks")) {
     const unsigned n = 12, rounds = 60;
     unsigned *lockw = dev<unsigned>(n), *spinw = dev<unsigned>(n);
     std::vector<unsigned> none(n, kNone);
@@ -339,7 +342,7 @@ int main() {
   }
 
   // 5. more blocks than the device holds, each waiting for the one before it.
-  {
+  if (want("forward")) {
     int per_sm = 0;
     CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, forward_chain, 32, 0));
     const unsigned n = per_sm * prop.multiProcessorCount * 2 + 5;

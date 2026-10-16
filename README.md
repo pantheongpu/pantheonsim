@@ -127,6 +127,38 @@ Makefile variables are in [docs/config.md](docs/config.md).
 - **A result looks wrong and you want to know why.** Run with `STRICT=1`,
   `RACE=1` or `COUNTERS=1` ([docs/diagnostics.md](docs/diagnostics.md)).
 
+## Blocks that wait on one another
+
+A real GPU keeps every block of a grid resident at once when the grid fits it (the
+multiprocessors times the blocks each holds, from the kernel's registers, shared
+memory and threads), and starts the rest as those finish. A block may therefore
+spin on a word another block writes: a grid barrier made of atomics, a chain of
+look-back flags, a producer in one block and its consumers in others, a lock that
+blocks take while they all start together (RXMesh's `PatchLock` test).
+
+The simulator used to run each host thread's blocks one after another, so the first
+block of such a kernel spun for ever on a block that had not started, or the answer
+changed from run to run. Now a kernel with a loop that polls global memory (the
+machine code is searched for a loop with an atomic that returns its old value, or a
+volatile or relaxed load, whose address does not change, and no store) runs the
+blocks the device holds at once together: each host thread keeps a window of
+resident blocks and gives every one a short turn in order, and the next block of the
+grid starts when one finishes, so a grid larger than the device holds still runs its
+first blocks together and the rest later, as a card does. A grid of fewer than 64
+blocks runs on one thread with all its blocks resident from the start, in a fixed
+order, so a program like the patch locks gives the same answer on every run. A
+larger grid uses every host thread, each starting with one block as before and
+holding more only while all the ones it holds are waiting, so a scan with a look-back
+loop keeps its speed.
+
+Kernels with no such loop run as before. `VGPU_LOCKSTEP=0` turns this off (the old
+behaviour, for debugging), `VGPU_LOCKSTEP=all` runs every launch this way (to check
+that nothing depends on the order blocks start in), and `VGPU_SASS_LOG=1` says when a
+launch used it. It applies to SASS, PTX and AMD kernels; clusters, cooperative
+launches (which always did) and launches under a non-default `VGPU_SCHEDULER` are
+left alone. The code is `exec/lockstep.hpp`; details in
+[docs/cooperative.md](docs/cooperative.md#blocks-that-wait-on-one-another-without-a-cooperative-launch).
+
 ## Where to read more
 
 - [docs/config.md](docs/config.md): the settings file, every key, the Makefile variables.

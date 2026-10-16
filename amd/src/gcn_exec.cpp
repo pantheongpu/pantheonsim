@@ -8365,20 +8365,22 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     if (mode == exec::LockstepMode::All) {
       lockstep = true;
     } else if (mode == exec::LockstepMode::Auto && d.resident_groups) {
-      Machine probe(d, mem, *cache);
-      lockstep = amd_kernel_polls(probe);
+      const int8_t known = k.polls.v.load(std::memory_order_relaxed);   // (found the first time the kernel launches)
+      if (known >= 0) {
+        lockstep = known != 0;
+      } else {
+        Machine probe(d, mem, *cache);
+        lockstep = amd_kernel_polls(probe);
+      }
     }
     capacity = d.resident_groups ? d.resident_groups : groups;
   }
   const unsigned nthreads = d.cooperative ? 1 : worker_count(groups);
   if (lockstep) {
     const exec::LockstepShape shape = exec::lockstep_shape(groups, capacity, nthreads);
-    if (const char* lg = std::getenv("VGPU_SASS_LOG"); lg && lg[0] == '1')
-      std::fprintf(stderr, "[vgpu] lockstep: kernel %s, %llu work-groups, %u host thread(s) of %llu resident groups\n",
-                   k.name.c_str(), static_cast<unsigned long long>(groups), shape.workers,
-                   static_cast<unsigned long long>(shape.window));
+    exec::lockstep_note(k.name.c_str(), groups, shape);
     std::vector<DispatchStats> per_thread(shape.workers);
-    std::atomic<uint64_t> ticket{0};
+    std::atomic<uint64_t> ticket{0}, beat{0};
     std::atomic<bool> failed{false};
     std::mutex err_mu;
     std::exception_ptr first_error;
@@ -8386,18 +8388,40 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
       try {
         struct Resident {
           std::unique_ptr<Group> g;
+          uint64_t stores = 0;   // the stores the machine made during the group's turns
         };
         Machine m(d, mem, *cache);
         m.concurrent = shape.workers > 1;
         exec::lockstep_worker<Resident>(
-            ticket, groups, shape.window,
+            ticket, beat, groups, shape.window, shape.initial, shape.chunk,
             [&](Resident& r, uint64_t i, size_t) {
               r.g = std::make_unique<Group>();   // fresh each time: a group starts from nothing
               uint32_t gx, gy, gz;
               group_at(i, &gx, &gy, &gz);
               set_up_group(*r.g, m, d, packet, group_segment, gx, gy, gz);
             },
-            [&](Resident& r) { return run_round(m, *r.g, exec::kLockstepSlice); }, [&](Resident&) {},
+            [&](Resident& r) {
+              // (atomics are not counted: a polling loop's compare-and-swap is not progress)
+              const uint64_t s0 = m.stats.counts.vmem_wr - m.stats.counts.flat_atomic;
+              const bool done = run_round(m, *r.g, exec::kLockstepSlice);
+              r.stores += m.stats.counts.vmem_wr - m.stats.counts.flat_atomic - s0;
+              return done;
+            },
+            [](const Resident& r) { return r.stores; },
+            [&](const Resident& r) {
+              // What the group's waves hold, to tell a group that waits from one that computes.
+              uint64_t h = 0xcbf29ce484222325ull;
+              for (const Wave& w : r.g->waves) {
+                h = exec::lockstep_fold(h, w.sgpr, sizeof w.sgpr);
+                const size_t rows = std::min<size_t>(w.vgpr.r.size(), std::max<uint32_t>(d.kernel->vgpr_count, 1));
+                for (size_t i = 0; i < rows; ++i) h = exec::lockstep_fold(h, w.vgpr.r[i].data(), sizeof w.vgpr.r[i]);
+                for (const auto& row : w.agpr) h = exec::lockstep_fold(h, row.data(), sizeof row);
+                const uint64_t st[6] = {w.vcc, w.exec, w.m0, w.scc, w.pc, uint64_t{w.done} | uint64_t{w.at_barrier} << 1};
+                h = exec::lockstep_fold(h, st, sizeof st);
+              }
+              return exec::lockstep_fold(h, r.g->lds.data(), r.g->lds.size());
+            },
+            [&](Resident&) {},
             [&] { return failed.load(std::memory_order_relaxed); });
         per_thread[t] = m.stats;
       } catch (...) {
