@@ -160,6 +160,11 @@ jobs:
     # started while the pull request backlog is long and terminated when it is
     # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
     # the pool, and it runs in the toolchain image there as it does here.
+    # The pool's owner can cap what a job takes with the repository variables
+    # BURST_CONTAINER_OPTIONS (docker options such as `--cpus=12 --memory=16g`),
+    # BURST_MEM_LIMIT_GIB and BURST_JOBS_MAX (for a job outside a container).
+    # All are empty, meaning no cap, until set; tests/lint/check_burst_cap.py
+    # keeps every job on BURST_RUNS_ON passing them on.
     runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: ${{ inputs.cutlass_sass && 330 || 60 }}
     # The cuda13.0 toolchain image (.github/ci-image), or, when there is none,
@@ -170,7 +175,7 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      options: --shm-size=2g
+      options: --shm-size=2g ${{ vars.BURST_CONTAINER_OPTIONS }}
     env:
       NVCC_PREPEND_FLAGS: ''
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
@@ -248,7 +253,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ github.token }}
       # The IPC tests need more than Docker's 64 MB of /dev/shm.
-      options: --shm-size=2g
+      options: --shm-size=2g ${{ vars.BURST_CONTAINER_OPTIONS }}
     env:
       # Shims built against CUDA 13 make Ollama pick its cuda_v13 backend,
       # whose PTX starts at sm_75 and so covers every profile.
@@ -346,6 +351,9 @@ jobs:
         gpu: [amd/mi300x, amd/mi325x, amd/mi350x, amd/mi250x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt]
     env:
       OLLAMA_VERSION: v0.21.0
+      # No container here, so the ceilings go to ci/jobs.sh (empty means none).
+      CI_MEM_LIMIT_GIB: ${{ vars.BURST_MEM_LIMIT_GIB }}
+      CI_JOBS_MAX: ${{ vars.BURST_JOBS_MAX }}
       # Pulled before the test (and cached), so a registry 503 is retried
       # rather than failing the job; the cache key names the model.
       VGPU_OLLAMA_MODEL: smollm2:135m
@@ -594,7 +602,7 @@ jobs:
         password: ${{ github.token }}
       # TSan's setarch -R needs personality() (seccomp), LeakSanitizer
       # ptrace; the IPC tests more than Docker's 64 MB of /dev/shm.
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined ${{ vars.BURST_CONTAINER_OPTIONS }}
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
@@ -659,7 +667,7 @@ jobs:
         password: ${{ github.token }}
       # TSan's setarch -R needs personality() (seccomp), LeakSanitizer
       # ptrace; the IPC tests more than Docker's 64 MB of /dev/shm.
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined ${{ vars.BURST_CONTAINER_OPTIONS }}
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
