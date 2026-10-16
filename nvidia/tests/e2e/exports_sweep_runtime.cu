@@ -107,8 +107,8 @@ static int max_dynamic(const void* f) {
   return cudaFuncGetAttributes(&a, f) == cudaSuccess ? a.maxDynamicSharedSizeBytes : -99;
 }
 // A launch of one warp with `dyn` bytes of dynamic shared memory: whether it was refused. The code is not printed:
-// an RTX 3060 under CUDA 13.0 says cudaErrorInvalidValue and this library, like the CUDA 12 runtime, says
-// cudaErrorInvalidConfiguration for every launch configuration it refuses.
+// an RTX 3060 under CUDA 13.0 says cudaErrorInvalidValue and so does this library; the CUDA 12 runtime said
+// cudaErrorInvalidConfiguration, so the sweep only records whether the launch was refused.
 static bool launch_refused(const void* f, size_t dyn) {
   int* d = nullptr;
   cudaMalloc(&d, 4096);

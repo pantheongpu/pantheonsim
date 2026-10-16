@@ -55,9 +55,24 @@ static std::vector<float> host(const float* d, size_t n) {
   cudaMemcpy(h.data(), d, n * 4, cudaMemcpyDeviceToHost);
   return h;
 }
+// Every descriptor the checks create is destroyed at the end (LeakSanitizer fails the test otherwise).
+static std::vector<cudnnTensorDescriptor_t> g_tensor_descs;
+static std::vector<cudnnActivationDescriptor_t> g_act_descs;
+static std::vector<cudnnOpTensorDescriptor_t> g_op_descs;
+static std::vector<cudnnPoolingDescriptor_t> g_pool_descs;
+static std::vector<cudnnFilterDescriptor_t> g_filter_descs;
+static std::vector<cudnnConvolutionDescriptor_t> g_conv_descs;
+static void destroy_descriptors() {
+  for (auto d : g_tensor_descs) cudnnDestroyTensorDescriptor(d);
+  for (auto d : g_act_descs) cudnnDestroyActivationDescriptor(d);
+  for (auto d : g_op_descs) cudnnDestroyOpTensorDescriptor(d);
+  for (auto d : g_pool_descs) cudnnDestroyPoolingDescriptor(d);
+  for (auto d : g_filter_descs) cudnnDestroyFilterDescriptor(d);
+  for (auto d : g_conv_descs) cudnnDestroyConvolutionDescriptor(d);
+}
 static cudnnTensorDescriptor_t desc(int n, int c, int h, int w) {
   cudnnTensorDescriptor_t d;
-  cudnnCreateTensorDescriptor(&d);
+  cudnnCreateTensorDescriptor(&d); g_tensor_descs.push_back(d);
   cudnnSetTensor4dDescriptor(d, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, n, c, h, w);
   return d;
 }
@@ -75,7 +90,7 @@ static void check_activation(cudnnHandle_t h) {
   const size_t n = (size_t)N * C * H * W;
   auto td = desc(N, C, H, W);
   cudnnActivationDescriptor_t ad;
-  cudnnCreateActivationDescriptor(&ad);
+  cudnnCreateActivationDescriptor(&ad); g_act_descs.push_back(ad);
   for (const Mix mix : {Mix::Plain, Mix::Special})
     for (const cudnnActivationMode_t mode : {CUDNN_ACTIVATION_SIGMOID, CUDNN_ACTIVATION_RELU, CUDNN_ACTIVATION_TANH, CUDNN_ACTIVATION_CLIPPED_RELU,
                                              CUDNN_ACTIVATION_ELU, CUDNN_ACTIVATION_SWISH})
@@ -160,7 +175,7 @@ static void check_tensor_ops(cudnnHandle_t h) {
         cudaFree(db); cudaFree(dc);
       }
       cudnnOpTensorDescriptor_t od;
-      cudnnCreateOpTensorDescriptor(&od);
+      cudnnCreateOpTensorDescriptor(&od); g_op_descs.push_back(od);
       for (const cudnnOpTensorOp_t op : {CUDNN_OP_TENSOR_ADD, CUDNN_OP_TENSOR_MUL, CUDNN_OP_TENSOR_MIN, CUDNN_OP_TENSOR_MAX, CUDNN_OP_TENSOR_SQRT,
                                          CUDNN_OP_TENSOR_NOT}) {
         cudnnSetOpTensorDescriptor(od, op, CUDNN_DATA_FLOAT, CUDNN_NOT_PROPAGATE_NAN);
@@ -249,7 +264,7 @@ static void check_pooling(cudnnHandle_t h) {
       for (const Mix mix : {Mix::Plain, Mix::Special}) {
         const int OH = 1 + (H + 2 * cfg.pad - cfg.win) / cfg.stride, OW = 1 + (W + 2 * cfg.pad - cfg.win) / cfg.stride;
         cudnnPoolingDescriptor_t pd;
-        cudnnCreatePoolingDescriptor(&pd);
+        cudnnCreatePoolingDescriptor(&pd); g_pool_descs.push_back(pd);
         cudnnSetPooling2dDescriptor(pd, mode, CUDNN_NOT_PROPAGATE_NAN, cfg.win, cfg.win, cfg.pad, cfg.pad, cfg.stride, cfg.stride);
         auto xd = desc(N, C, H, W), yd = desc(N, C, OH, OW);
         const size_t nx = (size_t)N * C * H * W, ny = (size_t)N * C * OH * OW;
@@ -416,10 +431,10 @@ static void check_conv_filter(cudnnHandle_t h) {
       const int Cg = c.C / c.groups, Kg = c.K / c.groups;
       const int OH = 1 + (c.H + 2 * c.pad - ((c.R - 1) * c.dil + 1)) / c.stride, OW = 1 + (c.W + 2 * c.pad - ((c.S - 1) * c.dil + 1)) / c.stride;
       cudnnFilterDescriptor_t fd;
-      cudnnCreateFilterDescriptor(&fd);
+      cudnnCreateFilterDescriptor(&fd); g_filter_descs.push_back(fd);
       cudnnSetFilter4dDescriptor(fd, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, c.K, Cg, c.R, c.S);
       cudnnConvolutionDescriptor_t cd;
-      cudnnCreateConvolutionDescriptor(&cd);
+      cudnnCreateConvolutionDescriptor(&cd); g_conv_descs.push_back(cd);
       cudnnSetConvolution2dDescriptor(cd, c.pad, c.pad, c.stride, c.stride, c.dil, c.dil, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
       cudnnSetConvolutionGroupCount(cd, c.groups);
       auto xd = desc(c.N, c.C, c.H, c.W), yd = desc(c.N, c.K, OH, OW);
@@ -470,6 +485,7 @@ int main() {
   check_pooling(h);
   check_batchnorm(h);
   check_conv_filter(h);
+  destroy_descriptors();
   cudnnDestroy(h);
   std::printf("%d checks, %d failed\n", checks, failures);
   std::printf(failures ? "FAIL\n" : "PASS\n");

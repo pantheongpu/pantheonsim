@@ -363,6 +363,50 @@ inline int sad_bi(const int16_t* a, const int16_t* b, int bw, int bh, const uint
   return tail + _mm_cvtsi128_si32(_mm_add_epi32(s2, _mm_shuffle_epi32(s2, 0xb1)));
 }
 
+
+// ---- the inverse DCT of MPEG-2 (mpeg2_idct.inc) ----
+//
+// Two passes of eight-term sums in double, each term rounded and then added (no fused multiply-add: the target has no FMA), the sum
+// starting at 0 and taking its terms in order; the outputs of a row are the four lanes of a vector, so each lane is the chain the
+// scalar loop makes. The sums are rounded to the nearest integer, halves up (floor(s + 0.5)), and saturated to -256 .. 255.
+// c[x][u] is the scalar code's basis. The transposed table is formed on the first call.
+inline void mpeg2_idct(int16_t* blk, const double (*c)[8]) {
+  alignas(32) static double ct[8][8];   // ct[u][x] = c[x][u]: the lanes (x) of one u are adjacent
+  static const bool once = [&] {
+    for (int u = 0; u < 8; ++u)
+      for (int x = 0; x < 8; ++x) ct[u][x] = c[x][u];
+    return true;
+  }();
+  (void)once;
+  alignas(32) double tmp[64];
+  for (int v = 0; v < 8; ++v) {
+    __m256d lo = _mm256_setzero_pd(), hi = _mm256_setzero_pd();   // outputs x = 0..3 and 4..7 of row v
+    for (int u = 0; u < 8; ++u) {
+      const __m256d b = _mm256_set1_pd(static_cast<double>(blk[v * 8 + u]));
+      lo = _mm256_add_pd(lo, _mm256_mul_pd(_mm256_load_pd(&ct[u][0]), b));
+      hi = _mm256_add_pd(hi, _mm256_mul_pd(_mm256_load_pd(&ct[u][4]), b));
+    }
+    _mm256_store_pd(&tmp[v * 8], lo);
+    _mm256_store_pd(&tmp[v * 8 + 4], hi);
+  }
+  const __m256d half = _mm256_set1_pd(0.5);
+  const __m256i lo256 = _mm256_set1_epi32(-256), hi255 = _mm256_set1_epi32(255);
+  for (int y = 0; y < 8; ++y) {
+    __m256d lo = _mm256_setzero_pd(), hi = _mm256_setzero_pd();   // outputs x = 0..3 and 4..7 of row y
+    for (int v = 0; v < 8; ++v) {
+      const __m256d cv = _mm256_set1_pd(c[y][v]);
+      lo = _mm256_add_pd(lo, _mm256_mul_pd(cv, _mm256_load_pd(&tmp[v * 8])));
+      hi = _mm256_add_pd(hi, _mm256_mul_pd(cv, _mm256_load_pd(&tmp[v * 8 + 4])));
+    }
+    const __m128i rl = _mm256_cvttpd_epi32(_mm256_floor_pd(_mm256_add_pd(lo, half)));
+    const __m128i rh = _mm256_cvttpd_epi32(_mm256_floor_pd(_mm256_add_pd(hi, half)));
+    __m256i r = _mm256_inserti128_si256(_mm256_castsi128_si256(rl), rh, 1);
+    r = _mm256_min_epi32(_mm256_max_epi32(r, lo256), hi255);
+    const __m128i p = _mm_packs_epi32(_mm256_castsi256_si128(r), _mm256_extracti128_si256(r, 1));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(blk + y * 8), p);
+  }
+}
+
 }  // namespace avx2
 #pragma GCC pop_options
 #endif
@@ -442,6 +486,16 @@ inline int sad_bi(const int16_t* a, const int16_t* b, int bw, int bh, const uint
 #else
   (void)a; (void)b; (void)bw; (void)bh; (void)src; (void)ss;
   return 0;
+#endif
+}
+
+// The MPEG-2 inverse DCT of a block of 64 coefficients in place (blk[v * 8 + u]), with the scalar code's basis c[x][u]; only when
+// avx2_available().
+inline void mpeg2_idct(int16_t* blk, const double (*c)[8]) {
+#ifdef VGPU_VIDEO_AVX2
+  avx2::mpeg2_idct(blk, c);
+#else
+  (void)blk; (void)c;
 #endif
 }
 

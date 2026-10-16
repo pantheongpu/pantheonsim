@@ -14,6 +14,7 @@
 // with the typed level-1 Ex routines whose type handling it shares.
 
 #include "complex_linalg.hpp"
+#include "host_blas2.hpp"
 
 namespace {
 
@@ -33,25 +34,43 @@ template <> inline double from_cd<double>(cd v) { return v.real(); }
 template <class T> using Real = std::conditional_t<std::is_same_v<T, cuComplex>, float, double>;
 template <class T> constexpr bool kRealType = std::is_same_v<T, float> || std::is_same_v<T, double>;
 
-template <class T> std::vector<cd> load_c(const T* dev, size_t n) {
-  const auto raw = fetch<T>(dev, n);
-  std::vector<cd> out(n);
-  for (size_t i = 0; i < n; ++i) out[i] = to_cd(raw[i]);
+// The elements of a device array as std::complex<double> (a real element has no imaginary part), the first `ext` read from device
+// memory and the rest, up to `total`, zero. (Built element by element into reserved storage: no zero fill of the whole, no copy.)
+template <class T> std::vector<cd> load_c_padded(const T* dev, size_t ext, size_t total) {
+  const auto raw = fetch_raw<T>(dev, ext);
+  std::vector<cd> out;
+  out.reserve(total);
+  for (size_t i = 0; i < ext; ++i) out.emplace_back(to_cd(raw[i]));
+  out.resize(total);
   return out;
 }
-template <class T> void store_c(T* dev, const std::vector<cd>& v) {
-  std::vector<T> raw(v.size());
-  for (size_t i = 0; i < v.size(); ++i) raw[i] = from_cd<T>(v[i]);
-  store(dev, raw);
+template <class T> std::vector<cd> load_c(const T* dev, size_t n) { return load_c_padded(dev, n, n); }
+// Writes v[0 .. count) to device memory, rounded to the type.
+template <class T> void store_c_n(T* dev, const cd* v, size_t count) {
+  RawBuf<T> raw(count);
+  for (size_t i = 0; i < count; ++i) raw[i] = from_cd<T>(v[i]);
+  store_raw(dev, raw.data(), count);
 }
+template <class T> void store_c(T* dev, const std::vector<cd>& v) { store_c_n(dev, v.data(), v.size()); }
 template <class T> CMat load_mat(const T* dev, int ld, int cols, int rows) {
-  CMat m{load_c(dev, extent(ld, cols, rows)), ld};
-  m.v.resize((size_t)ld * std::max(cols, 0));  // room for the padding after the last column
-  return m;
+  // (room for the padding after the last column, zero)
+  return CMat{load_c_padded(dev, extent(ld, cols, rows), static_cast<size_t>(ld) * std::max(cols, 0)), ld};
 }
-template <class T> void store_mat(T* dev, const CMat& m, int cols, int rows) {
-  std::vector<cd> v(m.v.begin(), m.v.begin() + extent(m.ld, cols, rows));
-  store_c(dev, v);
+template <class T> void store_mat(T* dev, const CMat& m, int cols, int rows) { store_c_n(dev, m.v.data(), extent(m.ld, cols, rows)); }
+// The updates of host_blas2.hpp on a fetched matrix of T: the scalar type and the scalars per element.
+template <class T> bool ger_host(bool conj, int m, int n, cd alpha, const std::vector<cd>& x, const std::vector<cd>& y, T* A, int lda) {
+  using vgpu::hostblas2::ger;
+  if constexpr (std::is_same_v<T, float>) return ger<float, 1>(conj, m, n, alpha, x, y, A, lda);
+  else if constexpr (std::is_same_v<T, double>) return ger<double, 1>(conj, m, n, alpha, x, y, A, lda);
+  else if constexpr (std::is_same_v<T, cuComplex>) return ger<float, 2>(conj, m, n, alpha, x, y, reinterpret_cast<float*>(A), lda);
+  else return ger<double, 2>(conj, m, n, alpha, x, y, reinterpret_cast<double*>(A), lda);
+}
+template <class T> bool syr_host(bool hermitian, bool lower, int n, cd alpha, const std::vector<cd>& x, const std::vector<cd>* y, T* A, int lda) {
+  using vgpu::hostblas2::syr;
+  if constexpr (std::is_same_v<T, float>) return syr<float, 1>(hermitian, lower, n, alpha, x, y, A, lda);
+  else if constexpr (std::is_same_v<T, double>) return syr<double, 1>(hermitian, lower, n, alpha, x, y, A, lda);
+  else if constexpr (std::is_same_v<T, cuComplex>) return syr<float, 2>(hermitian, lower, n, alpha, x, y, reinterpret_cast<float*>(A), lda);
+  else return syr<double, 2>(hermitian, lower, n, alpha, x, y, reinterpret_cast<double*>(A), lda);
 }
 template <class T> cd cscalar(cublasHandle_t h, const T* p) { return p ? to_cd(scalar(h, p)) : cd(0); }
 
@@ -278,9 +297,23 @@ cublasStatus_t cger(cublasHandle_t h, bool conj, int m, int n, const T* alpha, c
   return run_c(h, alpha, nullptr, sizeof(T), [=](const void* al, const void*) {
     const cd a_ = cscalar(h, static_cast<const T*>(al));
     const auto xv = load_vec(x, m, incx), yv = load_vec(y, n, incy);
+    if (m > 0 && n > 0) {
+      // On the elements as they are, when the result is certain to be the loops' (host_blas2.hpp); otherwise the loops below.
+      auto raw = fetch_raw<T>(A, extent(lda, n, m));
+      if (ger_host<T>(conj, m, n, a_, xv, yv, raw.data(), lda)) {
+        store_raw(A, raw.data(), raw.size());
+        return CUBLAS_STATUS_SUCCESS;
+      }
+    }
     CMat a = load_mat(A, lda, n, m);
-    for (int j = 0; j < n; ++j)
-      for (int i = 0; i < m; ++i) a(i, j) += a_ * xv[i] * (conj ? std::conj(yv[j]) : yv[j]);
+    // (a_ * xv[i] is the same product for every column: formed once. The expression is  (a_ * x_i) * y_j,  as it was.)
+    std::vector<cd> ax(static_cast<size_t>(m));
+    for (int i = 0; i < m; ++i) ax[i] = a_ * xv[i];
+    for (int j = 0; j < n; ++j) {
+      const cd yj = conj ? std::conj(yv[j]) : yv[j];
+      cd* const col = &a.v[static_cast<size_t>(j) * a.ld];
+      for (int i = 0; i < m; ++i) col[i] += ax[i] * yj;
+    }
     store_mat(A, a, n, m);
     return CUBLAS_STATUS_SUCCESS;
   });
@@ -421,13 +454,29 @@ cublasStatus_t csyr(cublasHandle_t h, bool hermitian, cublasFillMode_t uplo, int
     else a_ = scalar(h, static_cast<const S*>(al));
     const auto xv = load_vec(x, n, incx), yv = y ? load_vec(y, n, incy) : xv;
     auto op = [&](cd v) { return hermitian ? std::conj(v) : v; };
-    CMat a = load_mat(A, lda, n, n);
     const bool lower = uplo == CUBLAS_FILL_MODE_LOWER;
-    for (int j = 0; j < n; ++j)
+    {
+      // On the elements as they are, when the result is certain to be the loops' (host_blas2.hpp); otherwise the loops below.
+      auto raw = fetch_raw<T>(A, extent(lda, n, n));
+      if (syr_host<T>(hermitian, lower, n, a_, xv, y ? &yv : nullptr, raw.data(), lda)) {
+        store_raw(A, raw.data(), raw.size());
+        return CUBLAS_STATUS_SUCCESS;
+      }
+    }
+    CMat a = load_mat(A, lda, n, n);
+    // (The products that depend on i alone, formed once:  a_ * x_i  and  op(a_) * y_i.)
+    std::vector<cd> ax(static_cast<size_t>(n)), oay(y ? static_cast<size_t>(n) : 0);
+    for (int i = 0; i < n; ++i) {
+      ax[i] = a_ * xv[i];
+      if (y) oay[i] = op(a_) * yv[i];
+    }
+    for (int j = 0; j < n; ++j) {
+      const cd oyj = op(yv[j]), oxj = op(xv[j]);
       for (int i = lower ? j : 0; i < (lower ? n : j + 1); ++i) {
-        a(i, j) += y ? a_ * xv[i] * op(yv[j]) + op(a_) * yv[i] * op(xv[j]) : a_ * xv[i] * op(xv[j]);
+        a(i, j) += y ? ax[i] * oyj + oay[i] * oxj : ax[i] * oxj;
         if (hermitian && i == j) a(i, j) = a(i, j).real();
       }
+    }
     store_mat(A, a, n, n);
     return CUBLAS_STATUS_SUCCESS;
   });

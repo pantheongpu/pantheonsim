@@ -24,6 +24,8 @@ const char* err_name(Err e) {
     case Err::EccUncorrectable: return "ecc-uncorrectable";
     case Err::DeviceLost: return "device-lost";
     case Err::LaunchConfig: return "launch-config";
+    case Err::LaunchResources: return "launch-resources";
+    case Err::LaunchCluster: return "launch-cluster";
     case Err::ExecLimit: return "exec-limit";
     case Err::NotFound: return "not-found";
     case Err::Unsupported: return "unsupported";

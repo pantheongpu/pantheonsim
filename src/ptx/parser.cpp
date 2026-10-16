@@ -848,6 +848,7 @@ class Parser {
     expect_punct("{");
     parse_body(fn);
     contract_mul_add(fn);
+    mark_nan_order(fn);
     fold_constant_sync_masks(fn);
     place_dynamic_shared(fn);
     current_kernel_.clear();
@@ -5577,6 +5578,7 @@ Module parse(const std::string& src) {
   // Last, once nothing edits an instruction any more (mul/add contraction,
   // sync-mask folding and call resolution all do): the pre-decoded forms must
   // describe the body the interpreter will run.
+  intern_call_slots(m);
   for (auto& fn : m.entries) build_micro(fn);
   for (auto& fn : m.funcs) build_micro(*fn);
   return m;
