@@ -1307,7 +1307,7 @@ void Runner::run_block(Block& blk) {
 // One round of a block's warps: each runs until it waits, exits, or has had a turn of `slice`
 // instructions, so warps that spin on one another all move. Says whether the block is still going.
 // (A block alone gets a long turn; blocks that share a host thread, which may wait on one another,
-// get a short one, see lockstep_turn.)
+// get a short one, see run().)
 bool Runner::block_round(Block& blk, int slice) {
   bool live = false, progress = false;
   for (Warp& w : blk.warps) {

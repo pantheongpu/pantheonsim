@@ -23,10 +23,12 @@
 // A grid of fewer than 64 blocks runs on one host thread with all its resident blocks taking turns
 // from the start, in a fixed order, as a cooperative launch does: the answer of a program like the
 // patch locks is then the same on every run. A larger grid uses every host thread, each starting with
-// one block, as before, and holding more of them resident only while all the ones it holds are waiting
-// (a pass over them stored nothing and none finished): a chain of look-back flags, where each block
-// waits on the one before it, then costs a few passes over a handful of blocks per link, not a pass
-// over every resident block, and a grid barrier gets all its blocks resident after a few passes.
+// one block, as before, and doubling the blocks it holds only when no thread's blocks have stored or
+// finished for half a millisecond and its own are standing still (their registers and program counters
+// unchanged between two looks): a chain of look-back flags, where each block waits on the one before
+// it, then runs as it did, and a grid barrier gets all its blocks resident within a few milliseconds.
+// While a thread's blocks all stand still it sleeps between passes (to half a millisecond), so blocks
+// waiting on the host, or on a thread the host has descheduled, do not take a core.
 //
 // Kernels with no polling loop run as before. VGPU_LOCKSTEP=0 turns the whole thing off (the old
 // behaviour, for debugging), VGPU_LOCKSTEP=all runs every launch this way (for checking that nothing
@@ -124,9 +126,10 @@ inline uint64_t lockstep_fold(uint64_t h, const void* data, size_t n) {
 
 // One host thread's part of a lockstep launch, and the one place that decides how resident blocks
 // take turns. It keeps blocks resident, taking the grid's next from `ticket` whenever it has room
-// (up to `initial` of them to begin with, then one more at a time, up to `window`, after every
-// kLockstepGrowAfter passes in which no block of the launch, on any thread, finished or stored: the
-// threads tell each other by bumping `beat` whenever a pass of theirs did either), and gives each a
+// (up to `initial` of them to begin with, then doubling, up to `window`, once no block of the launch,
+// on any thread, has finished or stored for kLockstepGrowAfter and this thread's are standing still:
+// the threads tell each other by bumping `beat` whenever a pass of theirs did either, or a look found
+// their blocks changed), and gives each a
 // turn in the order they started; a block whose turn says it is finished leaves, and its storage is
 // used for the next. Blocks are the engine's own type:
 //   admit(Block&, unit, slot)   sets the block up for grid unit `unit`; `slot` numbers it among this

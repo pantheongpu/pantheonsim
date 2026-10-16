@@ -238,6 +238,7 @@ variable is unset by default.
 | --- | --- | --- |
 | `VGPU_THREADS` | Host threads used to run blocks. | one per core |
 | `VGPU_LOCKSTEP` | `0` runs a grid's blocks one after another on each host thread, as before; `all` runs every launch with the blocks the device holds resident together taking turns; the default runs kernels with a loop that polls global memory that way (see the README). | polling kernels |
+| `VGPU_LOCKSTEP_LOG` | A file that gets a line appended for each launch that runs its blocks together (the tests count the kernels that do). `VGPU_SASS_LOG=1` prints the same line. | off |
 | `VGPU_MAX_STEPS` | Raises the runaway-kernel step budget; `0` removes it. | built-in |
 | `VGPU_SASS` | `0` forces the PTX engine; `1` insists on SASS and does not fall back. | SASS when the binary carries it, else PTX |
 | `VGPU_SASS_LOG` | `1` says when a fatbin falls back from SASS to PTX. | off |

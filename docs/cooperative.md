@@ -104,7 +104,9 @@ single-device.
 device `assert()` and a compiler-inserted unreachable path lower to, and
 reaching one is a fact about the program worth reporting with its line.
 
-## Blocks that wait on one another without a cooperative launch
+<a id="lockstep"></a>
+
+## Blocks that wait on one another
 
 Nothing in CUDA or HIP promises that the blocks of an ordinary launch are resident
 together, but every card does keep them so when the grid fits, and programs rely on
@@ -137,14 +139,19 @@ flight together; run one after another every block wins them all).
   instructions per warp, in the order the blocks started. When a block finishes the
   grid's next block takes its place, so blocks beyond the capacity start as earlier
   ones end. A grid of fewer than 64 blocks uses one thread and starts them all, so the
-  order is the same on every run. A larger one uses every thread, taking consecutive
-  blocks a chunk at a time; a thread starts with one block, as the old path did, and
-  admits one more after three passes over its blocks in which no block on any thread
-  finished or stored (a pass of a thread whose blocks all wait, while another thread's
-  blocks get somewhere, does not grow its window). A chain of look-back flags then
-  costs a hand-over between threads per chunk; a grid barrier, or a lock every block
-  contends for, has all its blocks resident after a few passes. The warps of one block
-  keep the turns they had.
+  order is the same on every run. A larger one uses every thread; a thread starts
+  with one block, as the old path did (the AMD engine takes ranges of consecutive
+  groups, as it did), and doubles the blocks it holds only when no thread's blocks have
+  stored or finished for half a millisecond and its own are standing still. Standing
+  still is a hash of the blocks' registers, program counters and shared memory, equal at
+  two looks a quarter of a millisecond or more apart; a thread whose blocks compute
+  without storing is seen to move by the same look. So a chain of look-back flags
+  (CUB's scan and radix sort) runs as before, a grid barrier or a lock every block
+  contends for has all its blocks resident within a few milliseconds, and the window
+  never grows for blocks that are merely slow. While every block a thread holds
+  stands still it sleeps between passes (5 microseconds, doubling to half a
+  millisecond), so blocks waiting on the host, or on a thread the host has
+  descheduled, do not take a core. The warps of one block keep the turns they had.
 - **Left alone.** Cooperative launches (they already run this way), clusters, a
   non-default `VGPU_SCHEDULER`, device-side launches and the debugger.
 - **Switches.** `VGPU_LOCKSTEP=0` is the old behaviour. `VGPU_LOCKSTEP=all` makes every

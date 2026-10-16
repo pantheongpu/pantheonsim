@@ -148,16 +148,16 @@ first blocks together and the rest later, as a card does. A grid of fewer than 6
 blocks runs on one thread with all its blocks resident from the start, in a fixed
 order, so a program like the patch locks gives the same answer on every run. A
 larger grid uses every host thread, each starting with one block as before and
-holding more only while all the ones it holds are waiting, so a scan with a look-back
-loop keeps its speed.
+holding more only when every thread's blocks have stood still for a while, so a scan
+with a look-back loop keeps its speed. Waiting blocks sleep rather than spin.
 
-Kernels with no such loop run as before. `VGPU_LOCKSTEP=0` turns this off (the old
-behaviour, for debugging), `VGPU_LOCKSTEP=all` runs every launch this way (to check
-that nothing depends on the order blocks start in), and `VGPU_SASS_LOG=1` says when a
-launch used it. It applies to SASS, PTX and AMD kernels; clusters, cooperative
+Kernels with no such loop run as before. The variable `VGPU_LOCKSTEP` set to `0` turns
+this off (the old behaviour, for debugging), and set to `all` runs every launch this way
+(to check that nothing depends on the order blocks start in); `VGPU_SASS_LOG` set to `1`
+says when a launch used it. It applies to SASS, PTX and AMD kernels; clusters, cooperative
 launches (which always did) and launches under a non-default `VGPU_SCHEDULER` are
 left alone. The code is `exec/lockstep.hpp`; details in
-[docs/cooperative.md](docs/cooperative.md#blocks-that-wait-on-one-another-without-a-cooperative-launch).
+[docs/cooperative.md](docs/cooperative.md#lockstep).
 
 ## Where to read more
 
