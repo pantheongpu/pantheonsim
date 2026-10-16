@@ -2283,4 +2283,157 @@ VTEST(builtin_calls_and_device_function_classes) {
   VCHECK_EQ(a15.instructions - a5.instructions, uint64_t{10});
 }
 
+// *.sync instructions whose member mask is a register (what ptxas cannot see through): lanes that name different masks
+// run the instruction once per mask, a lane its own mask leaves out traps, and a constant mask is ignored. The
+// pre-decoded shfl and vote must give the general path's answer -- or its error -- for every pattern below, with all
+// lanes running and with half of warp 0 predicated off, and the same warp on two paths must wait for the lanes the
+// mask names (a constant mask, then the instruction is the general path's whenever the warp has diverged).
+namespace {
+// Runs `body` both ways; the output of every thread, or the text of the error it ended in, must be the same.
+// Returns whether the run ended in an error.
+bool same_or_same_error(const std::string& body, const std::vector<uint64_t>& a, const std::vector<uint64_t>& b,
+                        const std::vector<uint64_t>& c) {
+  auto once = [&](const char* fp, std::vector<uint64_t>& out) -> std::string {
+    setenv("VGPU_FASTPATH", fp, 1);
+    std::string err;
+    try {
+      out = run(body, false, a, b, c);
+    } catch (const Error& e) {
+      err = e.what();
+    }
+    unsetenv("VGPU_FASTPATH");
+    return err;
+  };
+  std::vector<uint64_t> fast, slow;
+  const std::string fe = once("1", fast), se = once("0", slow);
+  if (fe != se) throw vtest::Failure("'" + body + "': fast error '" + fe + "', general '" + se + "'");
+  if (fe.empty() && fast != slow) {
+    for (int i = 0; i < kThreads; ++i)
+      if (fast[i] != slow[i]) {
+        char buf[300];
+        std::snprintf(buf, sizeof buf, "'%s' thread %d: fast 0x%llx, general 0x%llx (mask 0x%llx)", body.c_str(), i,
+                      (unsigned long long)fast[i], (unsigned long long)slow[i], (unsigned long long)c[i]);
+        throw vtest::Failure(buf);
+      }
+  }
+  return !fe.empty();
+}
+}  // namespace
+
+VTEST(pre_decoded_shfl_and_vote_follow_register_member_masks_like_the_general_path) {
+  // %c is the member mask. Thread i is lane i % 32 of warp i / 32.
+  auto pattern = [](int kind) {
+    std::vector<uint64_t> m;
+    const uint32_t rnd[] = {0xffffffffu, 0x0000ffffu, 0xffff0000u, 0x80000001u, 0x12345678u, 0u, 0x00000001u, 0xfffffffeu};
+    for (int i = 0; i < kThreads; ++i) {
+      const uint32_t l = i % 32;
+      uint32_t v = 0;
+      switch (kind) {
+        case 0: v = 0xffffffffu; break;                         // all lanes, one mask
+        case 1: v = 0xffffu; break;                             // one mask that leaves half the lanes out
+        case 2: v = 1u << l; break;                             // each lane its own bit
+        case 3: v = (2u << l) - 1; break;                       // inclusive prefix (lane 31: 2u << 31 wraps to 0, minus 1)
+        case 4: v = (1u << l) - 1; break;                       // exclusive prefix: lane 0's mask is empty
+        case 5: v = l < 16 ? 0xffffu : 0xffff0000u; break;      // a mask per half
+        case 6: v = 1u; break;                                  // one lane
+        case 7: v = (l & 1) ? 0xaaaaaaaau : 0x55555555u; break; // two disjoint groups
+        case 8: v = l < 16 ? 0xffffu : 0xfffe0000u; break;      // a lane outside its own group's mask
+        case 9: v = 0u; break;                                  // empty
+        case 10: v = l < 16 ? 0xffff0000u : 0xffffffffu; break; // low lanes name only the others
+        default: v = rnd[(i * 3 + kind) % 8]; break;            // anything
+      }
+      m.push_back(v);
+    }
+    return m;
+  };
+  const auto a = int_values(), b = rotate(a, 5);
+  int traps = 0, runs = 0;
+  for (int guard : {1, 0, 2}) {
+    g_guard = guard;
+    for (int kind = 0; kind <= 12; ++kind) {
+      const auto mk = pattern(kind);
+      auto go = [&](const std::string& body) {
+        traps += same_or_same_error(body, a, b, mk);
+        ++runs;
+      };
+      go("setp.lt.u32 %p3, %a, %b; vote.sync.ballot.b32 %d, %p3, %c;");
+      go("setp.lt.u32 %p3, %a, %b; vote.sync.ballot.b32 %d, !%p3, %c;");
+      for (const char* mode : {"all", "any", "uni"})
+        go(std::string("setp.lt.u32 %p3, %a, %b; vote.sync.") + mode + ".pred %p4, %p3, %c; selp.u32 %d, 1, 2, %p4;");
+      for (const char* mode : {"up", "down", "bfly", "idx"}) {
+        const std::string o = std::string("shfl.sync.") + mode + ".b32 ";
+        go(o + "%d, %a, %b, 0x1f, %c;");
+        go(o + "%d, %a, 1, 0x1f, %c;");
+        go(o + "%d, %a, 3, 0x181f, %c;");
+        go(o + "%d, %a, %b, 0x0, %c;");
+        go(o + "%d, %a, 2, 0x1c1f, %c;");
+        go(o + "%r3|%p3, %a, %b, 0x181f, %c; selp.u32 %d, %r3, 77, %p3;");
+        go(o + "%r3|%p3, %a, 5, 0x1f, %c; selp.u32 %d, %r3, 77, %p3;");
+      }
+    }
+  }
+  g_guard = 0;
+  VCHECK(traps > 40);       // the patterns really do reach the trap...
+  VCHECK(traps < runs - 40);  // ...and the cases that do not
+}
+
+// The same warp on two paths: a shuffle or vote with a constant mask names lanes of the other path, which the general
+// path waits for; and a diverged warp's lanes shuffle among those running them.
+VTEST(pre_decoded_shfl_and_vote_in_a_diverged_warp_match_the_general_path) {
+  const std::string ptx = R"(.version 8.3
+.target sm_86
+.address_size 64
+.visible .entry k(.param .u64 po)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<6>;
+    ld.param.u64 %rd1, [po];
+    mov.u32 %r1, %tid.x;
+    and.b32 %r2, %r1, 31;
+    mad.lo.u32 %r3, %r2, 7, 3;
+    and.b32 %r4, %r2, 3;
+    setp.eq.u32 %p1, %r4, 0;
+    setp.lt.u32 %p2, %r2, 20;
+    mov.u32 %r5, 0;
+    @%p1 bra ARM_A;
+    shfl.sync.bfly.b32 %r5, %r3, 1, 0x1f, 0xffffffff;
+    vote.sync.ballot.b32 %r6, %p2, 0xffffffff;
+    add.u32 %r5, %r5, %r6;
+    bra JOIN;
+ARM_A:
+    shfl.sync.down.b32 %r5|%p3, %r3, 2, 0x1f, 0xffffffff;
+    vote.sync.any.pred %p3, %p2, 0xffffffff;
+    selp.u32 %r6, 100, 200, %p3;
+    add.u32 %r5, %r5, %r6;
+JOIN:
+    shfl.sync.idx.b32 %r7, %r5, 5, 0x1f, 0xffffffff;
+    add.u32 %r5, %r5, %r7;
+    mul.wide.u32 %rd2, %r1, 4;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u32 [%rd3], %r5;
+    ret;
+}
+)";
+  std::vector<uint32_t> outs[2];
+  exec::LaunchStats stats[2];
+  int k = 0;
+  for (const char* fp : {"1", "0"}) {
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(ptx);
+    const uint64_t po = mem.alloc(64 * 4);
+    LaunchConfig cfg;
+    cfg.block = {64, 1, 1};
+    stats[k] = exec::launch(m.entries[0], cfg, {arg_u64(po)}, mem, prof);
+    outs[k].resize(64);
+    mem.read(po, outs[k].data(), 256);
+    unsetenv("VGPU_FASTPATH");
+    ++k;
+  }
+  VCHECK(outs[0] == outs[1]);
+  VCHECK(same_stats(stats[0], stats[1]));
+}
+
 VTEST_MAIN
