@@ -179,6 +179,7 @@ void report_loaded(Module& m, int device, const void* image, size_t image_size) 
     sym.sgprs = k.sgpr_count;
     sym.vgprs = k.vgpr_count;
     sym.agprs = k.agpr_count;
+    sym.wave_size = k.wavefront_size;
     symbols.push_back(sym);
   }
   p->code_object_loaded(o, symbols.data(), symbols.size());
@@ -311,6 +312,7 @@ std::map<void*, int> g_pool_imports;   // imported pool pointer -> the device it
 
 struct State {
   std::mutex mutex;
+  std::string hardware_gfx;   // the device's own target where HSA_OVERRIDE_GFX_VERSION makes it report another
   std::unique_ptr<vgpu::runtime::Runtime> rt;
   std::vector<std::unique_ptr<Module>> modules;
   std::vector<std::unique_ptr<Function>> functions;
@@ -407,6 +409,7 @@ hipError_t ensure_runtime(State& s) {
   // family would not run on the card.
   if (const char* o = std::getenv("HSA_OVERRIDE_GFX_VERSION");
       o && std::strcmp(o, "10.3.0") == 0 && p.gcn_arch.rfind("gfx103", 0) == 0 && p.gcn_arch != "gfx1030") {
+    s.hardware_gfx = p.gcn_arch;   // KFD, and so a profiler, still name the card's own target
     p.gcn_arch_full.replace(0, p.gcn_arch.size(), "gfx1030");
     p.gcn_arch = "gfx1030";
   }
@@ -2509,6 +2512,7 @@ hipError_t hipEventElapsedTime(float* ms, hipEvent_t start, hipEvent_t end) {
 // Before main: the program's device code. The handle it is given back is what
 // it names the binary by when it registers functions and when it exits.
 void** __hipRegisterFatBinary(const void* data) {
+  const ApiCall api("__hipRegisterFatBinary");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   auto fb = std::make_unique<FatBinary>();
@@ -2527,6 +2531,7 @@ void** __hipRegisterFatBinary(const void* data) {
 // kernel in which binary.
 void __hipRegisterFunction(void** modules, const void* host_function, char*, const char* device_name, unsigned int,
                            void*, void*, void*, void*, int*) {
+  const ApiCall api("__hipRegisterFunction");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!modules || !host_function || !device_name) return;
@@ -2536,6 +2541,7 @@ void __hipRegisterFunction(void** modules, const void* host_function, char*, con
 // Before main, once per __device__ or __constant__ variable: which host
 // variable stands for which of the binary's.
 void __hipRegisterVar(void** modules, void* host_var, char*, const char* device_name, int, size_t size, int, int) {
+  const ApiCall api("__hipRegisterVar");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!modules || !host_var || !device_name) return;
@@ -2547,6 +2553,7 @@ void __hipRegisterVar(void** modules, void* host_var, char*, const char* device_
 // modules loaded from the binary point their variable of the same name at it.
 void __hipRegisterManagedVar(void* modules, void** pointer, void* init_value, const char* name, size_t size,
                              unsigned) {
+  const ApiCall api("__hipRegisterManagedVar");
   if (!modules || !pointer || !name || !size) return;
   void* p = nullptr;
   if (host_alloc(&p, size, g_managed) != hipSuccess) return;
@@ -2565,6 +2572,7 @@ void __hipRegisterManagedVar(void* modules, void** pointer, void* init_value, co
 
 // At exit: the binary's modules go, and their variables with them.
 void __hipUnregisterFatBinary(void** modules) {
+  const ApiCall api("__hipUnregisterFatBinary");
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   FatBinary* fb = reinterpret_cast<FatBinary*>(modules);
@@ -3019,7 +3027,12 @@ hipError_t hipHostMalloc(void** ptr, size_t size, unsigned int flags) {
   const ApiCall api("hipHostMalloc");
   // Coherent and non-coherent at once is a contradiction HIP refuses.
   if ((flags & 0x40000000u) && (flags & 0x80000000u)) return record(state(), hipErrorInvalidValue);
-  return host_alloc(ptr, size, g_host_allocations, flags);
+  const uint64_t start = vgpu::amd::hipprof::now_ns();
+  const hipError_t e = host_alloc(ptr, size, g_host_allocations, flags);
+  // A profiler is told of pinned memory as of an allocation on the host (agent -1).
+  if (const auto* p = profiler(); e == hipSuccess && ptr && *ptr && size && p && p->allocated)
+    p->allocated(-1, reinterpret_cast<uint64_t>(*ptr), size, false, start, vgpu::amd::hipprof::now_ns());
+  return e;
 }
 
 hipError_t hipHostFree(void* ptr) {
@@ -3039,9 +3052,15 @@ hipError_t hipHostFree(void* ptr) {
     }
     if (s.rt) drain_device(ordinal);
   }
-  std::lock_guard<std::mutex> lock(s.mutex);
-  if (!ptr) return record(s, hipSuccess);
-  return record(s, host_free(s, ptr, g_host_allocations) ? hipSuccess : hipErrorInvalidValue);
+  const uint64_t start = vgpu::amd::hipprof::now_ns();
+  {
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!ptr) return record(s, hipSuccess);
+    if (!host_free(s, ptr, g_host_allocations)) return record(s, hipErrorInvalidValue);
+  }
+  if (const auto* p = profiler(); p && p->allocated)
+    p->allocated(-1, reinterpret_cast<uint64_t>(ptr), 0, true, start, vgpu::amd::hipprof::now_ns());
+  return record(s, hipSuccess);
 }
 
 // The caller's own memory, made reachable from kernels where it is. Any
@@ -3789,6 +3808,7 @@ int vgpu_hip_profiler_device(int ordinal, vgpu::amd::hipprof::Device* out) {
   vgpu::amd::hipprof::Device d;
   d.ordinal = ordinal;
   d.gfx = p.gcn_arch.c_str();
+  d.hardware_gfx = s.hardware_gfx.empty() ? d.gfx : s.hardware_gfx.c_str();
   d.model = p.model.c_str();
   d.vendor_id = static_cast<uint16_t>(p.telemetry.pci_vendor_id);
   d.device_id = static_cast<uint16_t>(p.telemetry.pci_device_id);

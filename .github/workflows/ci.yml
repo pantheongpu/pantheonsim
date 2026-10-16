@@ -564,7 +564,8 @@ jobs:
             2>&1 | tee rest.log
           skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
                     | sed -E 's/Test +#[0-9]+: ([A-Za-z0-9_]+).*/\1/' || true)
-          unexpected=$(grep -vE "$RUNNER_SKIPS_OK" <<<"$skipped" | grep . || true)
+          # amd_rocprof_*: the image has no rocprofv3 either (the reason amd_rocprofv3 is allowed above).
+          unexpected=$(grep -vE "$RUNNER_SKIPS_OK|^amd_rocprof_" <<<"$skipped" | grep . || true)
           if [[ -n "$skipped" ]]; then
             # ctest hides a skipped test's output; the reason is its SKIP line.
             echo "Skipped tests and why:"
