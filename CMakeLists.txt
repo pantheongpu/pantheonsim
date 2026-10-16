@@ -230,6 +230,13 @@ add_library(vgpu STATIC
   src/runtime/visible_devices.cpp
   nvidia/src/device_attributes.cpp
 )
+# The PTX interpreter's AVX2 tile (wmma_tile_avx2) is a target("avx2") function beside a baseline copy, and a 32-byte vector passed
+# between a function of one target and a function of the other goes in a register on one side and in memory on the other, so the
+# callee reads what happens to be on the stack. Optimised builds inline the helpers and do not notice; an -O0 (sanitizer) build does,
+# and it passed on one CPU and failed on another (round 8's canonical NaN). GCC says so with -Wpsabi: make it an error here.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "-Werror=psabi")
+endif()
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
 # With LTO on, every executable that links this archive re-optimises all of it
@@ -1250,8 +1257,14 @@ vgpu_unit_test(test_sched)
 vgpu_unit_test(test_sass_access_count)
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
+# The closed forms of the sector and bank-pass counters, against the definition of what they count.
+vgpu_unit_test(test_memcount_forms)
+# Module::code_at (a binary search over the code sections) against the scan it replaced.
+vgpu_unit_test(test_sass_code_at)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
+# An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
+vgpu_unit_test(test_tc_ampere)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
@@ -1311,12 +1324,18 @@ target_compile_definitions(test_h264_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 # The host matrix product behind cuBLAS and cuBLASLt, bit for bit against the plain loops it replaced.
 vgpu_unit_test(test_host_gemm nvidia/tests/unit/test_host_gemm.cpp)
 vgpu_unit_test(test_host_trsm nvidia/tests/unit/test_host_trsm.cpp)
+# The rank-one and rank-two updates of cuBLAS (ger, syr, her, syr2, her2) on the device's elements, likewise.
+vgpu_unit_test(test_host_blas2 nvidia/tests/unit/test_host_blas2.cpp)
+# The Jacobi sweeps behind cuSOLVER's real eigen- and singular value solvers, likewise.
+vgpu_unit_test(test_host_jacobi nvidia/tests/unit/test_host_jacobi.cpp)
 # The host convolution behind cuDNN and the host FFT behind cuFFT, likewise.
 vgpu_unit_test(test_host_conv nvidia/tests/unit/test_host_conv.cpp)
 vgpu_unit_test(test_host_fft nvidia/tests/unit/test_host_fft.cpp)
 # The dense factorizations behind cuSOLVER and the JPEG transform and colour conversion behind nvJPEG, likewise.
 vgpu_unit_test(test_host_dense nvidia/tests/unit/test_host_dense.cpp)
 vgpu_unit_test(test_host_jpeg nvidia/tests/unit/test_host_jpeg.cpp)
+# The vector samplers behind NPP's warps, remapping and resizing, and its morphology, against the scalar code they stand in for.
+vgpu_unit_test(test_npp_simd nvidia/tests/unit/test_npp_simd.cpp)
 # The AVX2 kernels of the video codecs, against the scalar loops they stand in for.
 vgpu_unit_test(test_video_simd nvidia/tests/unit/test_video_simd.cpp)
 # The HEVC decoder and parser behind NVDEC, against the CRC-32 of every frame an RTX 3060 displayed.
@@ -2099,6 +2118,31 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 
+  # The error each refused launch configuration reports, runtime and driver, against an RTX 3060's CUDA 13.0.
+  add_test(NAME e2e_launch_refusals
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_refusals.sh)
+  set_tests_properties(e2e_launch_refusals PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # What round 9 changed on purpose (tensor-core sums, NaN selection for floats and doubles, conversions, 64-bit saturation, __sad, launch
+  # error codes), both engines at every SIMD level against an RTX 3060's lines; VGPU_TC_EXACT=0 moves only the wmma lines.
+  add_test(NAME e2e_round9_probe
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_round9_probe.sh)
+  set_tests_properties(e2e_round9_probe PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # The f32/f16/f64 forms with a flush, a saturation, a NaN rule or a byte permute: SASS == PTX == an RTX 3060, per form.
+  add_test(NAME e2e_float_half_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_float_half_forms.sh)
+  set_tests_properties(e2e_float_half_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
   # bf16 arithmetic, half2 atomics and labeled_partition, through nvcc. The
   # unit tests feed hand-written PTX; a compiler emits forms a hand-written
   # test never thinks to write, and this is what catches the difference. It
@@ -2161,7 +2205,7 @@ if(TARGET vgpucublas)
                           "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
                           "blas_level23_paths:cublas" "blas_host_sums:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
                           "blas_batched_paths:cublas" "blas_64_paths:cublas" "blas_legacy_paths:cublas"
-                          "rand_paths:curand" "rand_host_fill:curand" "npp_host_ops:nppc:nppial:nppif" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
+                          "rand_paths:curand" "rand_host_fill:curand" "npp_host_ops:nppc:nppial:nppif:nppig:nppim:nppitc" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
                           "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvcomp_streaming:nvcomp" "nvcomp_cpu:nvcomp_cpu:nvcomp"
                           "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
@@ -2193,6 +2237,15 @@ if(TARGET vgpucublas)
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 300)
   endforeach()
+
+  # cuSOLVER's Jacobi solvers (syevd, syevj, gesvd, gesvdj), each result checked by its defining property and, on the
+  # simulator, bit for bit against what the plain loops gave before their sweeps were put on vector lanes.
+  add_test(NAME e2e_solver_jacobi_paths
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh solver_jacobi_paths cusolver)
+  set_tests_properties(e2e_solver_jacobi_paths PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
 
   # Two PEs on two devices that have no peer path (the rtx3060 profile, as the card's pair): NVSHMEM refuses the
   # job, as NVIDIA's does ("Peer GPU 1 is not accessible").
@@ -2446,6 +2499,14 @@ if(TARGET vgpucublas)
   add_test(NAME e2e_atomic_cas
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_atomic_cas.sh)
   set_tests_properties(e2e_atomic_cas PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # Shared and local memory moved 1 to 16 bytes at a time, on the SASS interpreter, the SASS tier and the PTX interpreter.
+  add_test(NAME e2e_sass_vector_memory
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_vector_memory.sh)
+  set_tests_properties(e2e_sass_vector_memory PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
@@ -2942,7 +3003,7 @@ set_tests_properties(e2e_sass_tier PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
-  TIMEOUT 900)
+  TIMEOUT 1800)
 
 # SASS on every architecture: programs built for each generation's SASS, sm_75
 # to sm_120, run by default and on their PTX, which must agree. sm_100 and
@@ -3095,6 +3156,20 @@ if(Python3_Interpreter_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_header_exports.py ${CUDA_ABI_INCLUDE})
   set_tests_properties(lint_header_exports PROPERTIES
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  # libcuda and libcudart both contain libvgpu.a, so a data symbol defined with external linkage in
+  # shared code is defined twice in a process that loads both, and AddressSanitizer's ODR check
+  # aborts it (kSysfsFiles, kHwmonFiles, simd's g_kernels all failed CI that way, hours after the
+  # push). This finds one in the plain build; the self-test checks that it does.
+  add_test(NAME lint_odr_globals
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_odr_globals.py)
+  set_tests_properties(lint_odr_globals PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  add_test(NAME lint_odr_globals_selftest
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_odr_globals_selftest.sh)
+  set_tests_properties(lint_odr_globals_selftest PROPERTIES
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
     SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 endif()
 add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
@@ -3646,5 +3721,18 @@ foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopp
            e2e_sync_masks)
   if(TEST ${_t})
     set_property(TEST ${_t} APPEND PROPERTY RESOURCE_LOCK nvcc_memory)
+  endif()
+endforeach()
+# Under `ctest -j` the tests holding that lock form a chain, and the two CUTLASS
+# tests are most of it (about 1200 s and 1000 s in the build job; every other
+# test is under 120 s). ctest starts tests in cost order (by number when it has
+# no history, which a fresh CI checkout has not), so with these two last in the
+# order they would start only after everything else had finished and the
+# chain could overlap nothing. A cost starts them first: the lock chain then
+# runs beside the other tests from the first second, and the wall time is the
+# chain's rather than the sum.
+foreach(_t e2e_cutlass_hopper e2e_cutlass_gemm)
+  if(TEST ${_t})
+    set_property(TEST ${_t} PROPERTY COST 1000)
   endif()
 endforeach()

@@ -339,6 +339,9 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     case Err::InvalidValue:
     case Err::LaunchConfig:
     case Err::ProfileParse: return CUDA_ERROR_INVALID_VALUE;
+    // (An RTX 3060: a block whose registers do not fit is 701, any cluster launch on a part without clusters 912.)
+    case Err::LaunchResources: return CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES;
+    case Err::LaunchCluster: return static_cast<CUresult>(912);   // CUDA_ERROR_INVALID_CLUSTER_SIZE
     case Err::Internal: return CUDA_ERROR_UNKNOWN;
   }
   return CUDA_ERROR_UNKNOWN;
@@ -2873,8 +2876,11 @@ static CUresult cuLaunchKernelEx_impl(const void* config, CUfunction f, void** k
   bool cooperative = false;
   for (unsigned i = 0; i < c->num_attrs; ++i) {
     const LaunchAttrABI& a = c->attrs[i];
-    if (a.id == kLaunchAttrClusterDimension)
+    if (a.id == kLaunchAttrClusterDimension) {
       cluster = {a.value.cluster_dim.x, a.value.cluster_dim.y, a.value.cluster_dim.z};
+      // A cluster dimension of 0 is no cluster shape at all: CUDA_ERROR_INVALID_CLUSTER_SIZE (an RTX 3060, for {0, 1, 1}).
+      if (!cluster[0] || !cluster[1] || !cluster[2]) return static_cast<CUresult>(912);
+    }
     else if (a.id == kLaunchAttrCooperative)
       cooperative = a.value.cooperative != 0;
   }

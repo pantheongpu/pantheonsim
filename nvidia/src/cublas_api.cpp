@@ -103,6 +103,32 @@ void store(void* dev, const std::vector<T>& host) {
   if (!host.empty()) cudaMemcpy(dev, host.data(), host.size() * sizeof(T), kH2D);
 }
 
+// A host buffer of `count` elements of T that starts out uninitialised: fetch_raw() overwrites all of it, and a std::vector would
+// zero it first (a whole pass over a matrix). If the copy out of device memory fails the buffer is zeros, as fetch()'s is.
+template <class T>
+struct RawBuf {
+  std::unique_ptr<T[]> p;
+  size_t n = 0;
+  explicit RawBuf(size_t count) : p(count ? new T[count] : nullptr), n(count) {}
+  T* data() { return p.get(); }
+  const T* data() const { return p.get(); }
+  T& operator[](size_t i) { return p[i]; }
+  const T& operator[](size_t i) const { return p[i]; }
+  size_t size() const { return n; }
+};
+template <class T>
+RawBuf<T> fetch_raw(const void* dev, size_t count) {
+  vgpu::profiling::Silence silent;
+  RawBuf<T> host(count);
+  if (count && cudaMemcpy(host.data(), dev, count * sizeof(T), kD2H) != cudaSuccess) std::memset(static_cast<void*>(host.data()), 0, count * sizeof(T));
+  return host;
+}
+template <class T>
+void store_raw(void* dev, const T* host, size_t count) {
+  vgpu::profiling::Silence silent;
+  if (count) cudaMemcpy(dev, host, count * sizeof(T), kH2D);
+}
+
 // A scalar argument is either a host pointer or a device pointer, depending on
 // the handle's pointer mode. Getting this wrong silently corrupts results.
 template <class T>
@@ -1258,7 +1284,7 @@ cublasStatus_t gemv(cublasHandle_t h, cublasOperation_t trans, int m, int n, con
   const int xlen = trans == CUBLAS_OP_N ? n : m;
   const int ylen = trans == CUBLAS_OP_N ? m : n;
   if (!m || !n) return CUBLAS_STATUS_SUCCESS;
-  auto hA = fetch<T>(A, extent(lda, n, m));
+  auto hA = fetch_raw<T>(A, extent(lda, n, m));
   auto hx = fetch<T>(x, span(xlen, incx));
   auto hy = fetch<T>(y, span(ylen, incy));
   // Each y[i] is one chain  acc = 0; acc += A(i,j) * x[j]  over j in order, which the host product runs for many i at once (x as a

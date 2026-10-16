@@ -190,6 +190,44 @@ The tensor map (`cuTensorMapEncodeTiled`) keeps its tile-mode fields where
 NVIDIA's descriptor has them -- found with ptxas, one `tensormap.replace` field
 at a time -- because SASS rewrites a map in place with plain stores.
 
+## Numerics checked against an RTX 3060
+
+`nvidia/tests/e2e/float_half_forms.cu` (`e2e_float_half_forms`) runs the f32, f16, f64 and tensor-core forms that ptxas lowers to
+single SASS instructions with a flush, a saturation, a rounding mode, a NaN rule or a byte permute, over values that break
+arithmetic, and hashes each form; both engines at every SIMD level must print exactly an RTX 3060's lines (SASS == PTX == card).
+Differences it found and fixed: `.SAT` of a negative zero is +0; `FMNMX` of two NaNs is the canonical NaN; `MUFU` writes the
+canonical NaN and `MUFU.TANH` does not flush subnormals; `PRMT.F4E/B4E/ECL/ECR` (selector bits 0-1, and the clamp directions);
+`HADD2.F32`, `F2FP.PACK_AB` and `F2F` write 0x7fffffff / 0x7fff for a NaN and `.RELU` of -0 is +0; `DADD/DMUL/DFMA` give the first
+NaN of (b, a) (fma: b, c, a), quieted, as the register holds it -- the operand modifiers `-x` and `|x|` do not touch a NaN that
+is the answer; the PTX engine's `cvt.rmi.ftz` of a negative subnormal, f64 `min/max` of two NaNs (b's) and of a signed zero, and
+its f64 add/mul/fma NaN choice; `VABSDIFF` (`__sad`, `__usad`) was undecoded, so every kernel with one ran on the PTX engine.
+`wgmma`, `tcgen05.mma` and `mma.m8n8k4` write the canonical NaN (a NaN used to be whichever the host's scalar add handed on, which
+differed between a -O2 and a ThreadSanitizer -O1 build) -- derived from the HMMA rule and the PTX documentation, no card has
+`wgmma` or `tcgen05`.
+
+The tensor core of an RTX 3060 does not sum its products one at a time: chunks of 8 (tf32: 4) exact products plus the accumulator
+are aligned to the largest frame position, truncated at 2^(top - 25), added exactly and truncated to f32 (rounded to nearest to
+f16 for an f16 accumulator). That is measured, 100% of 106496 results of wmma and mma.sync in f16, bf16 and tf32 with f32 and f16
+accumulators, and implemented for sm_86 profiles and cubins in `include/vgpu/exec/tc_ampere.hpp` (scalar and AVX2, checked
+against each other and against the card: `test_tc_ampere`, `simd_lane_forms`, `float_half_forms`). Other architectures keep the
+sequential f32 sum (not measured); so do the sparse and `m8n8k4` forms.
+
+`VGPU_TC_EXACT=0` switches the model off, on both engines: the f16, bf16 and tf32 sums of sm_86 are then the sequential f32 ones the
+simulator used before (bit for bit, `simd_lane_forms.{sass,ptx}.tcseq.txt` pin them; the only other difference from the earlier release is
+that PTX `wmma` truncates a tf32 operand as it is read, which is a separate fix and not switched). It is read at each launch, in the
+interpreter's `refresh_modes` and in the SASS executor's constructor, through `tc86::applies` (PTX) and `tc86::exact_enabled`
+(`HMMA`, the kernel's sm_86 bit and the general form). The pre-decoded tier has no `HMMA` handler, so the interpreter, which the tier
+leaves it to, is the only place the switch is read. Measured against a fresh r8-a build (`tools/bench/bench.sh --ab`, 9 runs, SASS and PTX): with the switch off the
+`wmma` and `mma_ptx` workloads run at 0.99x to 1.01x of r8-a (verdict "same", counters identical); with the model on, `wmma` runs at 0.28x
+(SASS) and 0.23x (PTX), `mma_ptx` at 0.28x (SASS) and 1.36x (PTX: its AVX2 form beats the sequential loop). Instruction counters are the
+same in both modes (`bench.sh --check-counters` passes with the switch at 0 and at 1).
+
+What stays different from the card: the SFU. `MUFU.RCP/RSQ/SQRT/EX2/LG2/SIN/COS/TANH` are not correctly rounded on the card (rcp,
+sqrt, rsqrt and ex2 are within 1 ulp of the correctly rounded result, lg2 near 1 has an absolute error, sin and cos and tanh differ
+more, `sin` of a tiny or huge argument is 0), and the simulator computes the correctly rounded function; the special values (zero,
+subnormal, infinity, NaN, a negative root or logarithm) agree and are what the test hashes. Reproducing the card's tables needs a
+measurement of every mantissa (2^23 per function) and a compact form to keep them: not done.
+
 ## Member masks of the `*.sync` warp instructions
 
 ptxas compiles `__ballot_sync`, `__shfl_sync`, `__match_any_sync`,

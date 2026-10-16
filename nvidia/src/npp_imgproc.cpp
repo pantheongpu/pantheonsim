@@ -38,6 +38,7 @@
 #define cudaMemset ::vgpu_capture::memset_commit
 
 #include "npp_core.hpp"
+#include "npp_simd.hpp"
 
 using namespace vgpu_npp;
 
@@ -64,6 +65,19 @@ struct arg_of<I, R (*)(A...)> {
 template <class T>
 std::vector<T> fetch(const void* dev, int step, int elems_per_row, int rows) {
   std::vector<T> host(static_cast<size_t>(elems_per_row) * rows);
+  const auto* base = static_cast<const unsigned char*>(dev);
+  for (int r = 0; r < rows; ++r)
+    cudaMemcpy(host.data() + static_cast<size_t>(r) * elems_per_row,
+               base + static_cast<size_t>(r) * step, elems_per_row * sizeof(T),
+               cudaMemcpyDeviceToHost);
+  return host;
+}
+
+// fetch() with room after the last pixel for the vector samplers' 32-bit gathers (npp_simd.hpp, kPad bytes); the extra elements are
+// zero and not part of the image.
+template <class T>
+std::vector<T> fetch_padded(const void* dev, int step, int elems_per_row, int rows) {
+  std::vector<T> host(static_cast<size_t>(elems_per_row) * rows + simd::kPad);
   const auto* base = static_cast<const unsigned char*>(dev);
   for (int r = 0; r < rows; ++r)
     cudaMemcpy(host.data() + static_cast<size_t>(r) * elems_per_row,
@@ -227,7 +241,7 @@ NppStatus geometric(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* pD
     perspective_quad(NppiRect{sr.x, sr.y, sr.w, sr.h}, fwd3, q);
   }
   if (!meets(q, droi)) return NPP_WRONG_INTERSECTION_QUAD_WARNING;
-  auto src = fetch<T>(pSrc, sstep, ssz.width * ch, ssz.height);
+  auto src = fetch_padded<T>(pSrc, sstep, ssz.width * ch, ssz.height);
   Image<T> si{src.data(), ssz.width, ssz.height, ssz.width * ch, ch};
   Window<T> dst(pDst, dstep, droi.x, droi.y, droi.width, droi.height, ch);
   const Rect dr{droi.x, droi.y, droi.width, droi.height};
@@ -239,14 +253,17 @@ NppStatus geometric(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* pD
       b.lo_slack = 0.5f;
       b.clamp_low = true;
     }
-    warp(si, sr, dst.img, dr, interp,
-         [&](int x, int y, float* sx, float* sy) {
-           affine_point(back2, x, y, sx, sy);
-           return true;
-         },
-         b);
+    // (The vector sampler of npp_simd.hpp gives the same pixels as the scalar warp() below; it takes the common pixel types.)
+    if (!simd::warp_affine_back(si, sr, dst.img, dr, back2, interp, b))
+      warp(si, sr, dst.img, dr, interp,
+           [&](int x, int y, float* sx, float* sy) {
+             affine_point(back2, x, y, sx, sy);
+             return true;
+           },
+           b);
   } else {
-    warp_perspective_back(si, sr, dst.img, dr, back3, interp);
+    if (!simd::warp_perspective_back(si, sr, dst.img, dr, back3, interp))
+      warp_perspective_back(si, sr, dst.img, dr, back3, interp);
   }
   dst.put_back(pDst, dstep);
   return NPP_SUCCESS;
@@ -425,7 +442,7 @@ NppStatus remap(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, const M* 
   if (!known_interp(interp)) return NPP_INTERPOLATION_ERROR;
   Rect sr{};
   if (!clip_src(ssz, sroi, &sr)) return NPP_WRONG_INTERSECTION_ROI_ERROR;
-  auto src = fetch<T>(pSrc, sstep, ssz.width * ch, ssz.height);
+  auto src = fetch_padded<T>(pSrc, sstep, ssz.width * ch, ssz.height);
   Image<T> si{src.data(), ssz.width, ssz.height, ssz.width * ch, ch};
   auto hx = fetch<M>(xm, xstep, dsz.width, dsz.height);
   auto hy = fetch<M>(ym, ystep, dsz.width, dsz.height);
@@ -435,14 +452,18 @@ NppStatus remap(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, const M* 
   b.hi_slack = 1;
   b.hi_open = true;
   b.clamp_low = true;
-  warp(si, sr, dst.img, Rect{0, 0, dsz.width, dsz.height}, interp,
-       [&](int x, int y, float* sx, float* sy) {
-         const size_t i = static_cast<size_t>(y) * dsz.width + x;
-         *sx = static_cast<float>(hx[i]);
-         *sy = static_cast<float>(hy[i]);
-         return true;
-       },
-       b);
+  bool done = false;
+  if constexpr (std::is_same_v<M, float>)
+    done = simd::warp_table(si, sr, dst.img, Rect{0, 0, dsz.width, dsz.height}, hx.data(), hy.data(), dsz.width, interp, b);
+  if (!done)
+    warp(si, sr, dst.img, Rect{0, 0, dsz.width, dsz.height}, interp,
+         [&](int x, int y, float* sx, float* sy) {
+           const size_t i = static_cast<size_t>(y) * dsz.width + x;
+           *sx = static_cast<float>(hx[i]);
+           *sy = static_cast<float>(hy[i]);
+           return true;
+         },
+         b);
   dst.put_back(pDst, dstep);
   return NPP_SUCCESS;
 }
@@ -591,12 +612,22 @@ NppStatus resize_sqr(const T* pSrc, NppiSize ssz, int sstep, NppiRect sroi, T* p
   if (interp == NPPI_INTER_SUPER && !(fx < 1 && fy < 1)) return NPP_RESIZE_FACTOR_ERROR;
   auto src = fetch<T>(pSrc, sstep, ssz.width * ch, ssz.height);
   // Taps clamp to the ROI: a window of the source holding just it.
-  std::vector<T> win(static_cast<size_t>(sr.w) * sr.h * ch);
+  std::vector<T> win(static_cast<size_t>(sr.w) * sr.h * ch + simd::kPad);   // (kPad: room for the vector sampler's gathers)
   for (int y = 0; y < sr.h; ++y)
     std::memcpy(&win[static_cast<size_t>(y) * sr.w * ch], &src[(static_cast<size_t>(y + sr.y) * ssz.width + sr.x) * ch],
                 sizeof(T) * sr.w * ch);
   Image<T> si{win.data(), sr.w, sr.h, sr.w * ch, ch};
   Window<T> dst(pDst, dstep, droi.x, droi.y, droi.width, droi.height, ch);
+  if (interp == NPPI_INTER_NN || interp == NPPI_INTER_LINEAR || interp == NPPI_INTER_CUBIC) {
+    // The vector sampler of npp_simd.hpp (the same pixels as the loop below, which does everything and is the fallback).
+    const int sampler = interp == NPPI_INTER_NN ? kNN : (interp == NPPI_INTER_LINEAR ? kLinear : kCubic);
+    const simd::ResizeTables t = simd::resize_tables(Rect{droi.x, droi.y, droi.width, droi.height}, sr.w, sr.h, fx, fy, shx, shy);
+    if (simd::resize_sqr(si, dst.img, Rect{droi.x, droi.y, droi.width, droi.height}, t.invx, t.cx, t.invy, t.cy, t.colok.data(),
+                         t.rowok.data(), sampler)) {
+      dst.put_back(pDst, dstep);
+      return NPP_SUCCESS;
+    }
+  }
   // The sample point of destination column x is fma(1/f, x, c) in single
   // precision, with 1/f rounded to float and c = 0.5/f - 0.5 - shift/f formed
   // from it in double and rounded: the only grouping that reproduces NPP's
@@ -719,9 +750,11 @@ NppStatus per_channel(const T* s, int ss, T* d, int ds, NppiSize roi, int ch, in
   auto src = fetch<T>(s, ss, roi.width * ch, roi.height);
   // AC4 forms leave the destination's alpha as it was: start from it.
   std::vector<T> dst = touched < ch ? fetch<T>(d, ds, roi.width * ch, roi.height) : src;
-  for (size_t i = 0; i < src.size(); ++i) {
-    const int c = static_cast<int>(i % ch);
-    if (c < touched) dst[i] = op(src[i], c);
+  // (pixel by pixel, the channels in the pixel: no division per element)
+  const size_t pixels = src.size() / static_cast<size_t>(ch);
+  for (size_t p = 0; p < pixels; ++p) {
+    const size_t base = p * static_cast<size_t>(ch);
+    for (int c = 0; c < touched; ++c) dst[base + static_cast<size_t>(c)] = op(src[base + static_cast<size_t>(c)], c);
   }
   store<T>(d, ds, roi.width * ch, roi.height, dst);
   return NPP_SUCCESS;
@@ -1005,33 +1038,42 @@ Npp8u gamma_inv(Npp8u x) {
   const float r = v < 0.081f ? v * 0.222222f : std::pow((v + 0.099f) / 1.099f, 2.22f);
   return static_cast<Npp8u>(std::min(255, std::max(0, static_cast<int>(r * 255.f))));
 }
+// (The transfer functions are functions of the byte alone: tables of their 256 values, made on first use.)
+const Npp8u* gamma_fwd_lut() {
+  static const struct T { Npp8u v[256]; T() { for (int i = 0; i < 256; ++i) v[i] = gamma_fwd(static_cast<Npp8u>(i)); } } t;
+  return t.v;
+}
+const Npp8u* gamma_inv_lut() {
+  static const struct T { Npp8u v[256]; T() { for (int i = 0; i < 256; ++i) v[i] = gamma_inv(static_cast<Npp8u>(i)); } } t;
+  return t.v;
+}
 }  // namespace
 
 #define VGPU_NPP_GAMMA(DIR, FN)                                                                            \
   VGPU_EXPORT NppStatus nppiGamma##DIR##_8u_C3R_Ctx(const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, \
                                                     NppStreamContext unused5) { \
   VGPU_DEFER_CALL(g_reg, unused5.hStream, nppiGamma##DIR##_8u_C3R_Ctx, s, ss, d, ds, roi, unused5); \
-    return per_channel<Npp8u>(s, ss, d, ds, roi, 3, 3, [](Npp8u v, int) { return FN(v); });                \
+    return per_channel<Npp8u>(s, ss, d, ds, roi, 3, 3, [](Npp8u v, int) { return FN##_lut()[v]; });                \
   }                                                                                                        \
   VGPU_PLAIN(nppiGamma##DIR##_8u_C3R, (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi),            \
              (s, ss, d, ds, roi, NppStreamContext{}))                                                      \
   VGPU_EXPORT NppStatus nppiGamma##DIR##_8u_C3IR_Ctx(Npp8u* sd, int ss, NppiSize roi, NppStreamContext unused3) { \
   VGPU_DEFER_CALL(g_reg, unused3.hStream, nppiGamma##DIR##_8u_C3IR_Ctx, sd, ss, roi, unused3); \
-    return per_channel<Npp8u>(sd, ss, sd, ss, roi, 3, 3, [](Npp8u v, int) { return FN(v); });              \
+    return per_channel<Npp8u>(sd, ss, sd, ss, roi, 3, 3, [](Npp8u v, int) { return FN##_lut()[v]; });              \
   }                                                                                                        \
   VGPU_PLAIN(nppiGamma##DIR##_8u_C3IR, (Npp8u * sd, int ss, NppiSize roi), (sd, ss, roi, NppStreamContext{})) \
   VGPU_EXPORT NppStatus nppiGamma##DIR##_8u_AC4R_Ctx(const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, \
                                                      NppStreamContext unused5) { \
   VGPU_DEFER_CALL(g_reg, unused5.hStream, nppiGamma##DIR##_8u_AC4R_Ctx, s, ss, d, ds, roi, unused5); \
     if (ss % 4 || ds % 4) return NPP_NOT_EVEN_STEP_ERROR;                                                  \
-    return per_channel<Npp8u>(s, ss, d, ds, roi, 4, 3, [](Npp8u v, int) { return FN(v); });                \
+    return per_channel<Npp8u>(s, ss, d, ds, roi, 4, 3, [](Npp8u v, int) { return FN##_lut()[v]; });                \
   }                                                                                                        \
   VGPU_PLAIN(nppiGamma##DIR##_8u_AC4R, (const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi),           \
              (s, ss, d, ds, roi, NppStreamContext{}))                                                      \
   VGPU_EXPORT NppStatus nppiGamma##DIR##_8u_AC4IR_Ctx(Npp8u* sd, int ss, NppiSize roi, NppStreamContext unused3) { \
   VGPU_DEFER_CALL(g_reg, unused3.hStream, nppiGamma##DIR##_8u_AC4IR_Ctx, sd, ss, roi, unused3); \
     if (ss % 4) return NPP_NOT_EVEN_STEP_ERROR;                                                            \
-    return per_channel<Npp8u>(sd, ss, sd, ss, roi, 4, 3, [](Npp8u v, int) { return FN(v); });              \
+    return per_channel<Npp8u>(sd, ss, sd, ss, roi, 4, 3, [](Npp8u v, int) { return FN##_lut()[v]; });              \
   }                                                                                                        \
   VGPU_PLAIN(nppiGamma##DIR##_8u_AC4IR, (Npp8u * sd, int ss, NppiSize roi), (sd, ss, roi, NppStreamContext{}))
 VGPU_NPP_GAMMA(Fwd, gamma_fwd)
@@ -1248,6 +1290,24 @@ NppStatus histogram(const T* s, int ss, NppiSize roi, int ch, Npp32s* const* his
     if (!hist[c]) return NPP_NULL_POINTER_ERROR;
     if (lv.size() < 2) return NPP_HISTOGRAM_NUMBER_OF_LEVELS_ERROR;
     std::vector<Npp32s> bins(lv.size() - 1, 0);
+    if constexpr (std::is_integral_v<T> && sizeof(T) <= 2 && std::is_integral_v<L>) {
+      // An 8- or 16-bit value has one of 256 or 65536 values: the bin of each, found once by the search below, and the counting
+      // is a table lookup (a count does not depend on the order).
+      const size_t values = size_t(1) << (8 * sizeof(T));
+      if (v.size() / static_cast<size_t>(ch) >= values) {   // (for an image with fewer pixels than values the searches are cheaper)
+        std::vector<int> bin_of(values, -1);
+        for (size_t u = 0; u < values; ++u) {
+          const auto it = std::upper_bound(lv.begin(), lv.end(), static_cast<L>(static_cast<T>(u)));
+          if (it != lv.begin() && it != lv.end()) bin_of[u] = static_cast<int>(it - lv.begin()) - 1;
+        }
+        for (size_t i = c; i < v.size(); i += ch) {
+          const int b = bin_of[static_cast<std::make_unsigned_t<T>>(v[i])];
+          if (b >= 0) ++bins[static_cast<size_t>(b)];
+        }
+        put_n<Npp32s>(hist[c], bins.data(), bins.size());
+        continue;
+      }
+    }
     for (size_t i = c; i < v.size(); i += ch) {
       const auto x = v[i];
       // Binary search for the last level <= x.
@@ -1539,6 +1599,57 @@ NppStatus neighbourhood(const T* s, int ss, T* d, int ds, NppiSize roi, NppiSize
   store<T>(d, ds, roi.width * ch, roi.height, dst);
   return NPP_SUCCESS;
 }
+// neighbourhood() for a maximum (Dilate) or a minimum (Erode) with an INIT that no value of the type is beyond: the same value for
+// every output (the extreme is the same whatever order the mask positions are taken in), formed a row of outputs at a time -- for
+// each mask position, the extreme of the output row and the source row shifted by it, which a vector unit does on a whole row.
+// (std::max(acc, v) is acc < v ? v : acc and std::min is v < acc ? v : acc, as written below, so a NaN v leaves acc alone.)
+template <class T, bool MAX>
+NppStatus neighbourhood_extreme(const T* s, int ss, T* d, int ds, NppiSize roi, NppiSize msz, NppiPoint anchor, const Npp8u* mask, int ch,
+                                T init) {
+  if (!s || !d) return NPP_NULL_POINTER_ERROR;
+  if (bad(roi)) return NPP_SIZE_ERROR;
+  if (msz.width <= 0 || msz.height <= 0) return NPP_MASK_SIZE_ERROR;
+  if (anchor.x < 0 || anchor.y < 0 || anchor.x >= msz.width || anchor.y >= msz.height) return NPP_ANCHOR_ERROR;
+  std::vector<Npp8u> m;
+  if (mask) {
+    m.resize(static_cast<size_t>(msz.width) * msz.height);
+    get_n(m.data(), mask, m.size());
+  }
+  int w = 0;
+  auto src = fetch_halo(s, ss, roi, msz, anchor, ch, &w);
+  std::vector<T> dst(static_cast<size_t>(roi.width) * roi.height * ch);
+  // The mask positions that count, as (row j, element offset i * ch) of the source row from the output row's first element.
+  std::vector<std::pair<int, int>> taps;
+  for (int j = 0; j < msz.height; ++j)
+    for (int i = 0; i < msz.width; ++i)
+      if (!mask || m[static_cast<size_t>(j) * msz.width + i]) taps.emplace_back(j, i * ch);
+  extreme_filter<T, MAX>(src.data(), w * ch, dst.data(), roi.width, roi.height, ch, taps, init);
+  store<T>(d, ds, roi.width * ch, roi.height, dst);
+  return NPP_SUCCESS;
+}
+}  // namespace
+
+namespace {
+// nppiFilterBox on 8-bit data by running sums (box_filter_u8): the same checks, the same halo, as neighbourhood(). Returns false if
+// the window is too large for it (the caller then runs neighbourhood()).
+bool box_8u(const Npp8u* s, int ss, Npp8u* d, int ds, NppiSize roi, NppiSize msz, NppiPoint anchor, int ch, NppStatus* st) {
+  if (!s || !d) { *st = NPP_NULL_POINTER_ERROR; return true; }
+  if (bad(roi)) { *st = NPP_SIZE_ERROR; return true; }
+  if (msz.width <= 0 || msz.height <= 0) { *st = NPP_MASK_SIZE_ERROR; return true; }
+  if (anchor.x < 0 || anchor.y < 0 || anchor.x >= msz.width || anchor.y >= msz.height) { *st = NPP_ANCHOR_ERROR; return true; }
+  int w = 0;
+  auto src = fetch_halo(s, ss, roi, msz, anchor, ch, &w);
+  std::vector<Npp8u> dst(static_cast<size_t>(roi.width) * roi.height * ch);
+  if (!box_filter_u8(src.data(), w, ch, dst.data(), roi.width, roi.height, msz.width, msz.height)) return false;
+  store<Npp8u>(d, ds, roi.width * ch, roi.height, dst);
+  *st = NPP_SUCCESS;
+  return true;
+}
+template <class T>
+bool box_fast(const T* s, int ss, T* d, int ds, NppiSize roi, NppiSize msz, NppiPoint anchor, int ch, NppStatus* st) {
+  if constexpr (std::is_same_v<T, Npp8u>) return box_8u(s, ss, d, ds, roi, msz, anchor, ch, st);
+  else return false;
+}
 }  // namespace
 
 // Box filter: 8-bit truncates the mean, as npp_api.cpp's C1 form measured.
@@ -1547,6 +1658,11 @@ NppStatus neighbourhood(const T* s, int ss, T* d, int ds, NppiSize roi, NppiSize
                                                   NppiSize m, NppiPoint a, NppStreamContext unused7) { \
   VGPU_DEFER_CALL(g_reg, unused7.hStream, nppiFilterBox_##SFX##_Ctx, s, ss, d, ds, roi, m, a, unused7); \
     const double n = double(m.width) * m.height;                                                           \
+    {                                                                                                      \
+      /* (8-bit data: running sums of the integers, in npp_core.hpp: the same sums, taken in another order) */ \
+      NppStatus st;                                                                                        \
+      if (box_fast<T>(s, ss, d, ds, roi, m, a, CH, &st)) return st;                                        \
+    }                                                                                                      \
     return neighbourhood<T>(                                                                               \
         s, ss, d, ds, roi, m, a, nullptr, CH, [] { return 0.0; }, [](double acc, T v) { return acc + v; },  \
         [n](double acc) {                                                                                  \
@@ -1562,45 +1678,41 @@ NppStatus neighbourhood(const T* s, int ss, T* d, int ds, NppiSize roi, NppiSize
 VGPU_NPP_BOX(8u_C4R, Npp8u, 4)
 VGPU_NPP_BOX(32f_C1R, Npp32f, 1)
 
-#define VGPU_NPP_RANK(NAME, PICK, INIT, SFX, T, CH)                                                        \
+#define VGPU_NPP_RANK(NAME, IS_MAX, INIT, SFX, T, CH)                                                        \
   VGPU_EXPORT NppStatus nppiFilter##NAME##_##SFX##_Ctx(const T* s, Npp32s ss, T* d, Npp32s ds, NppiSize roi, \
                                                        NppiSize m, NppiPoint a, NppStreamContext unused7) { \
   VGPU_DEFER_CALL(g_reg, unused7.hStream, nppiFilter##NAME##_##SFX##_Ctx, s, ss, d, ds, roi, m, a, unused7);        \
-    return neighbourhood<T>(                                                                               \
-        s, ss, d, ds, roi, m, a, nullptr, CH, [] { return INIT; },                                         \
-        [](T acc, T v) { return PICK(acc, v); }, [](T acc) { return acc; });                               \
+    return neighbourhood_extreme<T, IS_MAX>(s, ss, d, ds, roi, m, a, nullptr, CH, INIT);                    \
   }                                                                                                        \
   VGPU_PLAIN(nppiFilter##NAME##_##SFX,                                                                      \
              (const T* s, Npp32s ss, T* d, Npp32s ds, NppiSize roi, NppiSize m, NppiPoint a),              \
              (s, ss, d, ds, roi, m, a, NppStreamContext{}))
-VGPU_NPP_RANK(Max, std::max, Npp8u(0), 8u_C1R, Npp8u, 1)
-VGPU_NPP_RANK(Max, std::max, Npp8u(0), 8u_C4R, Npp8u, 4)
-VGPU_NPP_RANK(Min, std::min, Npp8u(255), 8u_C1R, Npp8u, 1)
-VGPU_NPP_RANK(Min, std::min, Npp8u(255), 8u_C4R, Npp8u, 4)
+VGPU_NPP_RANK(Max, true, Npp8u(0), 8u_C1R, Npp8u, 1)
+VGPU_NPP_RANK(Max, true, Npp8u(0), 8u_C4R, Npp8u, 4)
+VGPU_NPP_RANK(Min, false, Npp8u(255), 8u_C1R, Npp8u, 1)
+VGPU_NPP_RANK(Min, false, Npp8u(255), 8u_C4R, Npp8u, 4)
 
 // Dilate/Erode with an arbitrary mask: the extreme over the positions whose
 // mask byte is nonzero.
-#define VGPU_NPP_MORPH(NAME, PICK, INIT, SFX, T, CH)                                                       \
+#define VGPU_NPP_MORPH(NAME, IS_MAX, INIT, SFX, T, CH)                                                       \
   VGPU_EXPORT NppStatus nppi##NAME##_##SFX##_Ctx(const T* s, int ss, T* d, int ds, NppiSize roi,             \
                                                  const Npp8u* mask, NppiSize m, NppiPoint a,                \
                                                  NppStreamContext unused8) { \
   VGPU_DEFER_CALL(g_reg, unused8.hStream, nppi##NAME##_##SFX##_Ctx, s, ss, d, ds, roi, mask, m, a, unused8); \
     if (!mask) return NPP_NULL_POINTER_ERROR;                                                              \
-    return neighbourhood<T>(                                                                               \
-        s, ss, d, ds, roi, m, a, mask, CH, [] { return INIT; }, [](T acc, T v) { return PICK(acc, v); },   \
-        [](T acc) { return acc; });                                                                        \
+    return neighbourhood_extreme<T, IS_MAX>(s, ss, d, ds, roi, m, a, mask, CH, INIT);                        \
   }                                                                                                        \
   VGPU_PLAIN(nppi##NAME##_##SFX,                                                                            \
              (const T* s, int ss, T* d, int ds, NppiSize roi, const Npp8u* mask, NppiSize m, NppiPoint a), \
              (s, ss, d, ds, roi, mask, m, a, NppStreamContext{}))
-VGPU_NPP_MORPH(Dilate, std::max, Npp8u(0), 8u_C1R, Npp8u, 1)
-VGPU_NPP_MORPH(Dilate, std::max, Npp8u(0), 8u_C4R, Npp8u, 4)
-VGPU_NPP_MORPH(Dilate, std::max, -std::numeric_limits<Npp32f>::max(), 32f_C1R, Npp32f, 1)
-VGPU_NPP_MORPH(Dilate, std::max, -std::numeric_limits<Npp32f>::max(), 32f_C4R, Npp32f, 4)
-VGPU_NPP_MORPH(Erode, std::min, Npp8u(255), 8u_C1R, Npp8u, 1)
-VGPU_NPP_MORPH(Erode, std::min, Npp8u(255), 8u_C4R, Npp8u, 4)
-VGPU_NPP_MORPH(Erode, std::min, std::numeric_limits<Npp32f>::max(), 32f_C1R, Npp32f, 1)
-VGPU_NPP_MORPH(Erode, std::min, std::numeric_limits<Npp32f>::max(), 32f_C4R, Npp32f, 4)
+VGPU_NPP_MORPH(Dilate, true, Npp8u(0), 8u_C1R, Npp8u, 1)
+VGPU_NPP_MORPH(Dilate, true, Npp8u(0), 8u_C4R, Npp8u, 4)
+VGPU_NPP_MORPH(Dilate, true, -std::numeric_limits<Npp32f>::max(), 32f_C1R, Npp32f, 1)
+VGPU_NPP_MORPH(Dilate, true, -std::numeric_limits<Npp32f>::max(), 32f_C4R, Npp32f, 4)
+VGPU_NPP_MORPH(Erode, false, Npp8u(255), 8u_C1R, Npp8u, 1)
+VGPU_NPP_MORPH(Erode, false, Npp8u(255), 8u_C4R, Npp8u, 4)
+VGPU_NPP_MORPH(Erode, false, std::numeric_limits<Npp32f>::max(), 32f_C1R, Npp32f, 1)
+VGPU_NPP_MORPH(Erode, false, std::numeric_limits<Npp32f>::max(), 32f_C4R, Npp32f, 4)
 
 /* ---- border forms ---- */
 namespace {

@@ -28,6 +28,9 @@
 #include "vgpu/ptx/contract.hpp"
 
 #include <cstdlib>
+#include <map>
+#include <tuple>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -164,6 +167,100 @@ size_t contract_mul_add(EntryFn& fn) {
     ++fused;
   }
   return fused;
+}
+
+}  // namespace vgpu::ptx
+
+namespace vgpu::ptx {
+
+void mark_nan_order(EntryFn& fn) {
+  auto& body = fn.body;
+  std::unordered_map<uint32_t, long> last_def;   // register key -> index of its latest definition so far
+  std::map<std::tuple<int, int, long, long, long, int>, long> cse_rank;   // an expression over defined values -> where it was first computed
+  std::vector<uint32_t> defs, uses;
+  // How late an operand was defined: -1 for a register nothing has written (a parameter, say), a very large number for a constant.
+  const auto rank = [&](const Operand& o) -> long {
+    if (const Reg* r = reg_of(o)) {
+      const auto it = last_def.find(key(*r));
+      return it == last_def.end() ? -1 : it->second;
+    }
+    return 1L << 40;
+  };
+  // Whether register `k`, written by instruction `at`, is read before it is written again (looking ahead a bounded distance).
+  std::vector<uint32_t> fdefs, fuses;
+  const auto read_later = [&](size_t at, uint32_t k) {
+    for (size_t j = at + 1; j < body.size() && j < at + 4096; ++j) {
+      fdefs.clear();
+      fuses.clear();
+      instr_registers(body[j], fdefs, fuses);
+      for (uint32_t u : fuses)
+        if (u == k) return true;
+      if (!body[j].has_pred)
+        for (uint32_t d : fdefs)
+          if (d == k) return false;
+    }
+    return false;
+  };
+  for (size_t i = 0; i < body.size(); ++i) {
+    if (auto* f = std::get_if<OpFloatBin>(&body[i].op); f && f->ty.bits == 64 && f->ty.is_float()) {
+      // a - <constant> is a + <the constant negated> to the code generator, which folds the negation into the constant: a NaN constant
+      // that is the answer comes back with its sign flipped (an RTX 3060: sub.f64 of 0dFFF8000000000008 returns 0x7ff8000000000008).
+      if (f->op == FloatBinOp::Sub && f->round == FRound::Nearest && !f->nan_propagate)
+        if (auto* im = std::get_if<ImmFloatBits>(&f->b); im && im->width == 64) {
+          im->bits ^= uint64_t{1} << 63;
+          f->op = FloatBinOp::Add;
+        }
+      f->nan_a_first = rank(f->a) > rank(f->b);
+    }
+    else if (auto* m = std::get_if<OpFma>(&body[i].op); m && m->ty.bits == 64)
+      m->nan_swap_ab = rank(m->a) > rank(m->b);
+    // ptxas numbers a value once: an expression it has already computed from the same values (a common subexpression), and min or max
+    // of a value with itself, give the earlier result's definition, not a new one.
+    if (!body[i].has_pred) {
+      const auto sorted = [](long x, long y) { return x < y ? std::pair{x, y} : std::pair{y, x}; };
+      const Reg* dst = nullptr;
+      std::tuple<int, int, long, long, long, int> cse{};
+      long same = -2;
+      if (const auto* f = std::get_if<OpFloatBin>(&body[i].op); f && f->ty.bits == 64 && f->ty.is_float() && reg_of(f->a) && reg_of(f->b) &&
+                                                                    f->round == FRound::Nearest && !f->nan_propagate && !f->sat && !f->xorsign_abs) {
+        dst = &f->dst;
+        const long ra = rank(f->a), rb = rank(f->b);
+        const bool commutes = f->op != FloatBinOp::Sub && f->op != FloatBinOp::Div;
+        const auto pr = commutes ? sorted(ra, rb) : std::pair{ra, rb};
+        cse = {1, static_cast<int>(f->op), pr.first, pr.second, 0, f->ftz ? 1 : 0};
+        if ((f->op == FloatBinOp::Min || f->op == FloatBinOp::Max) && ra == rb && ra >= 0) same = ra;
+      } else if (const auto* m = std::get_if<OpFma>(&body[i].op); m && m->ty.bits == 64 && reg_of(m->a) && reg_of(m->b) && reg_of(m->c) &&
+                                                                     m->round == FRound::Nearest && !m->sat) {
+        dst = &m->dst;
+        const auto pr = sorted(rank(m->a), rank(m->b));
+        cse = {2, (m->neg_ab ? 1 : 0) | (m->neg_c ? 2 : 0), pr.first, pr.second, rank(m->c), m->ftz ? 1 : 0};
+      }
+      if (dst && dst->id != kNoReg) {
+        const auto seen = cse_rank.find(cse);
+        const bool known_operands = std::get<2>(cse) >= 0 && std::get<3>(cse) >= 0;
+        if (same >= 0) {
+          last_def[key(*dst)] = same;
+          continue;
+        }
+        if (known_operands && seen != cse_rank.end()) {
+          last_def[key(*dst)] = seen->second;
+          continue;
+        }
+        if (known_operands && read_later(i, key(*dst))) cse_rank[cse] = static_cast<long>(i);   // (a result nothing reads is dead code, which ptxas removes first)
+      }
+    }
+    defs.clear();
+    uses.clear();
+    instr_registers(body[i], defs, uses);
+    // A register-to-register mov is a copy ptxas propagates: the copy has the rank of what it copies (so a mov of a register onto
+    // itself changes nothing, and a copy made late is no later than its source).
+    const auto* mv = std::get_if<OpMov>(&body[i].op);
+    if (mv && !body[i].has_pred && mv->ty.bits == 64 && reg_of(mv->src) && mv->dst.id != kNoReg) {
+      last_def[key(mv->dst)] = rank(mv->src);
+      continue;
+    }
+    for (uint32_t k : defs) last_def[k] = static_cast<long>(i);
+  }
 }
 
 }  // namespace vgpu::ptx

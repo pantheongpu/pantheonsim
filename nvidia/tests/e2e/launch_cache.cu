@@ -208,8 +208,10 @@ int main() {
     CHECK(cudaGetLastError() == first_zero);
     ka<<<1, 4096>>>(d, 1);
     CHECK(cudaGetLastError() == first_big);
-    CHECK(first_zero == cudaErrorInvalidConfiguration);
-    CHECK(first_big == cudaErrorInvalidConfiguration);
+    // An RTX 3060 under CUDA 13.0 answers cudaErrorInvalidValue for both (nvidia/tests/data/launch_refusals.rtx3060.txt;
+    // the chevron forms probed there too), and so does the simulator.
+    CHECK(first_zero == cudaErrorInvalidValue);
+    CHECK(first_big == cudaErrorInvalidValue);
     cudaFuncAttributes attr1{};
     CHECK(cudaFuncGetAttributes(&attr1, ka) == cudaSuccess);
     CHECK(attr0.numRegs == attr1.numRegs && attr0.sharedSizeBytes == attr1.sharedSizeBytes &&
