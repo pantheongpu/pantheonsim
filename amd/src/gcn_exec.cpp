@@ -8377,7 +8377,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   }
   const unsigned nthreads = d.cooperative ? 1 : worker_count(groups);
   if (lockstep) {
-    const exec::LockstepShape shape = exec::lockstep_shape(groups, capacity, nthreads);
+    const exec::LockstepShape shape = exec::lockstep_shape(groups, capacity, nthreads, /*ranges=*/true);
     exec::lockstep_note(k.name.c_str(), groups, shape);
     std::vector<DispatchStats> per_thread(shape.workers);
     std::atomic<uint64_t> ticket{0}, beat{0};

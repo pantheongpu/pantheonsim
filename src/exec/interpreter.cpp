@@ -2484,6 +2484,8 @@ void sp24_pick(const double v[4], uint32_t sel, uint32_t pick[2]) {
 // the loop sets it from what a load, atomic, shuffle, vote or clock returned, from a variable
 // register, or when it is read before the loop sets it and the loop does set it.
 bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
+  // (instr_registers keys a register as id * 2 + wide; an operand with no register has the largest id)
+  const uint32_t kMaxKey = 2 * (f.num_regs32 + f.num_regs64 + 8);
   enum : uint8_t { Undef, Fixed, Variable };
   std::vector<uint8_t> state;
   std::vector<bool> set_in_loop;
@@ -2499,6 +2501,7 @@ bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
     uses.clear();
     instr_registers(f.body[i], defs, uses);
     for (uint32_t d : defs) {
+      if (d >= kMaxKey) continue;
       grow(d);
       set_in_loop[d] = true;
     }
@@ -2511,6 +2514,7 @@ bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
     instr_registers(ins, defs, uses);
     bool var_src = false;
     for (uint32_t u : uses) {
+      if (u >= kMaxKey) continue;
       grow(u);
       var_src = var_src || (state[u] == Undef ? set_in_loop[u] : state[u] == Variable);
     }
@@ -2539,26 +2543,45 @@ bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
     }
     polls = polls || (poll && !var_src);
     const uint8_t now = (generates || var_src) ? Variable : Fixed;
-    for (uint32_t d : defs) state[d] = now;
+    for (uint32_t d : defs)
+      if (d < kMaxKey) state[d] = now;
   }
   return polls;
 }
 
-bool ptx_kernel_polls(const EntryFn& fn) {
-  const int8_t cached = fn.polls.v.load(std::memory_order_relaxed);
+// Whether a function's own body has a polling loop; remembered on the function.
+bool ptx_body_polls(const EntryFn& f) {
+  const int8_t cached = f.polls.v.load(std::memory_order_relaxed);
   if (cached >= 0) return cached != 0;
   bool found = false;
-  const auto scan = [&](const EntryFn& f) {
-    for (size_t i = 0; i < f.body.size() && !found; ++i) {
-      const auto* br = std::get_if<OpBra>(&f.body[i].op);
-      if (!br || br->target > i || i - br->target > 400) continue;
-      found = ptx_loop_polls(f, br->target, i);
+  for (size_t i = 0; i < f.body.size() && !found; ++i) {
+    const auto* br = std::get_if<OpBra>(&f.body[i].op);
+    if (!br || br->target > i || i - br->target > 400) continue;
+    found = ptx_loop_polls(f, br->target, i);
+  }
+  f.polls.v.store(found ? 1 : 0, std::memory_order_relaxed);
+  return found;
+}
+
+// The kernel's body, and the functions it calls directly (an indirect call is not followed).
+bool ptx_kernel_polls(const EntryFn& fn) {
+  const int8_t cached = fn.polls_reach.v.load(std::memory_order_relaxed);
+  if (cached >= 0) return cached != 0;
+  bool found = false;
+  std::set<const EntryFn*> seen;
+  std::vector<const EntryFn*> todo{&fn};
+  while (!todo.empty()) {
+    const EntryFn* f = todo.back();
+    todo.pop_back();
+    if (!seen.insert(f).second) continue;
+    if (ptx_body_polls(*f)) {
+      found = true;
+      break;
     }
-  };
-  scan(fn);
-  for (const auto& g : fn.module_funcs)
-    if (g && !found) scan(*g);
-  fn.polls.v.store(found ? 1 : 0, std::memory_order_relaxed);
+    for (const Instr& ins : f->body)
+      if (const auto* c = std::get_if<OpCall>(&ins.op); c && c->target) todo.push_back(c->target);
+  }
+  fn.polls_reach.v.store(found ? 1 : 0, std::memory_order_relaxed);
   return found;
 }
 

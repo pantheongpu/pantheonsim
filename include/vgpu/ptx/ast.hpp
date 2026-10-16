@@ -1356,7 +1356,7 @@ struct EntryFn {
       v.store(o.v.load());
       return *this;
     }
-  } polls;
+  } polls, polls_reach;   // the body's own loops; and with the functions it calls
 };
 
 // A module-scope .global/.const variable, materialized into device memory at

@@ -75,17 +75,17 @@ struct LockstepShape {
 
 // `units` blocks (or clusters) in the grid, `capacity` of them resident at once on the device, and
 // `threads` host threads available.
-inline LockstepShape lockstep_shape(uint64_t units, uint64_t capacity, unsigned threads) {
+// `chunk`: blocks a thread takes at a time (the NVIDIA engines take them one by one, as they always did;
+// the AMD engine took contiguous ranges, and a chain of work-groups each waiting on the one before it
+// then hands over between threads once a range, not at every link).
+inline LockstepShape lockstep_shape(uint64_t units, uint64_t capacity, unsigned threads, bool ranges = false) {
   LockstepShape s;
   const uint64_t by_size = std::max<uint64_t>(1, units / kLockstepBlocksPerThread);
   s.workers = static_cast<unsigned>(std::max<uint64_t>(1, std::min<uint64_t>(threads, by_size)));
   const uint64_t resident = std::max<uint64_t>(1, std::min(units, capacity ? capacity : units));
   s.window = std::max<uint64_t>(1, (resident + s.workers - 1) / s.workers);
   s.initial = s.workers == 1 ? s.window : 1;
-  // A thread takes consecutive blocks, so that a chain of blocks each waiting on the one before it
-  // (a look-back scan) hands over between threads once a chunk, not at every link: with the host's
-  // cores busy, a hand-over costs a scheduling quantum.
-  s.chunk = std::clamp<uint64_t>(units / (uint64_t{s.workers} * 8), 1, 32);
+  if (ranges) s.chunk = std::clamp<uint64_t>(units / (uint64_t{s.workers} * 8), 1, 32);
   return s;
 }
 
@@ -149,8 +149,7 @@ void lockstep_worker(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat,
   std::vector<std::unique_ptr<Block>> live, spare;
   bool drained = false;
   uint64_t target = std::max<uint64_t>(1, std::min(initial, window)), done_stores = 0;
-  uint64_t next_unit = 0, chunk_end = 0, last_print = 0, dbg_passes = 0, dbg_nap = 0, dbg_admit = 0, dbg_maxlive = 0;
-  const auto dbg_t0 = std::chrono::steady_clock::now(); /*DBG*/
+  uint64_t next_unit = 0, chunk_end = 0, last_print = 0;
   unsigned same = 0, nap_us = 0;
   auto moved_at = std::chrono::steady_clock::now(), last_check = moved_at;
   auto grow_wait = kLockstepGrowAfter;
@@ -194,15 +193,11 @@ void lockstep_worker(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat,
         b = std::make_unique<Block>();
       }
       admit(*b, unit, live.size());
-      ++dbg_admit; /*DBG*/
       live.push_back(std::move(b));
     }
     if (live.empty() || stop()) {
-      if (std::getenv("VGPU_LS_DEBUG")) /*DBG*/
-        std::fprintf(stderr, "worker: %.3fs passes %llu admitted %llu maxlive %llu napped %llu us target %llu\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - dbg_t0).count(), (unsigned long long)dbg_passes, (unsigned long long)dbg_admit, (unsigned long long)dbg_maxlive, (unsigned long long)dbg_nap, (unsigned long long)target);
       return;
     }
-    ++dbg_passes; dbg_maxlive = std::max<uint64_t>(dbg_maxlive, live.size()); /*DBG*/
     const uint64_t before = stores_now();
     bool finished = false;
     size_t keep = 0;
@@ -244,7 +239,6 @@ void lockstep_worker(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat,
     if (same >= 2) {
       nap_us = nap_us ? std::min(nap_us * 2, 500u) : 5u;
       std::this_thread::sleep_for(std::chrono::microseconds(nap_us));
-      dbg_nap += nap_us; /*DBG*/
     }
     // And whether to hold more blocks: not while any thread's blocks get somewhere (they may be the
     // ones these wait for), but when none have for a while and these are standing still, the block
