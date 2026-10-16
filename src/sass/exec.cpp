@@ -299,10 +299,11 @@ class Runner {
                                       static_cast<uint32_t>(std::min<uint64_t>(cfg.stack_bytes, 1u << 24))});
     local_size_ = (local_size_ + 15) & ~15u;
     shared_size_ = static_cast<uint64_t>(k.shared_bytes) + cfg.shared_bytes;
-    if (m.sm >= 100)
+    if (m.sm >= 100) {
       for (const CubinSymbol& sym : m.cubin.symbols)
         if (sym.name == ".nv.reservedSmem.offset0") alloc_handshake_ = static_cast<uint32_t>(sym.value);
         else if (sym.name == "__nv_reservedSMEM_tmem_allocation_pipeline_mbarrier") alloc_mbar_ = static_cast<uint32_t>(sym.value);
+    }
     // From compute capability 8.0 the driver reserves 1 KiB of shared memory
     // behind every block's own, which it rounds to its 128-byte allocation
     // unit (cooperative_groups keeps the scratch of multi-warp tiles there).

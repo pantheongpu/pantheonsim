@@ -1379,7 +1379,7 @@ void dec_i2i(Instr& ins, const Word& w) {
 // nvdisasm names both types.
 // The narrow formats an F2FP packs to or unpacks from, as one code: kept in
 // f[3] (packed to) or f[4] (unpacked from).
-enum : unsigned { kNarrowE4M3 = 10, kNarrowE5M2, kNarrowE3M2, kNarrowE2M3, kNarrowE2M1, kNarrowUE8M0 };
+enum : unsigned { kNarrowNone = 0, kNarrowE4M3 = 10, kNarrowE5M2, kNarrowE3M2, kNarrowE2M3, kNarrowE2M1, kNarrowUE8M0 };
 
 void dec_f2fp(Instr& ins, const Word& w) {
   ins.op = Op::F2FP;
@@ -1397,16 +1397,16 @@ void dec_f2fp(Instr& ins, const Word& w) {
   const char* sname = sts[st];
   unsigned narrow = 0;
   if (mode == 1) {
-    if (fam == 4) narrow = dt == 7 ? kNarrowE4M3 : dt == 6 ? kNarrowE5M2 : 0;
-    else if (fam == 3) narrow = dt == 7 ? kNarrowE3M2 : dt == 6 ? kNarrowE2M3 : 0;
-    else if (fam == 1) narrow = dt == 7 ? kNarrowE2M1 : 0;
-    else if (fam == 6) narrow = dt == 6 ? kNarrowUE8M0 : 0;
+    if (fam == 4) narrow = dt == 7 ? kNarrowE4M3 : dt == 6 ? kNarrowE5M2 : kNarrowNone;
+    else if (fam == 3) narrow = dt == 7 ? kNarrowE3M2 : dt == 6 ? kNarrowE2M3 : kNarrowNone;
+    else if (fam == 1) narrow = dt == 7 ? kNarrowE2M1 : kNarrowNone;
+    else if (fam == 6) narrow = dt == 6 ? kNarrowUE8M0 : kNarrowNone;
     static const char* const nn[] = {"E4M3", "E5M2", "E3M2", "E2M3", "E2M1", "E8"};
     if (narrow) dname = nn[narrow - kNarrowE4M3];
   } else if (mode == 4 && st != 0) {
-    if (ufam == 0) narrow = st == 3 ? kNarrowE4M3 : st == 2 ? kNarrowE5M2 : 0;
+    if (ufam == 0) narrow = st == 3 ? kNarrowE4M3 : st == 2 ? kNarrowE5M2 : kNarrowNone;
     else if (ufam == 1) narrow = st == 3 ? kNarrowE3M2 : st == 2 ? kNarrowE2M3 : kNarrowE2M1;
-    else if (ufam == 2) narrow = st == 3 ? kNarrowUE8M0 : 0;
+    else if (ufam == 2) narrow = st == 3 ? kNarrowUE8M0 : kNarrowNone;
     static const char* const nn[] = {"E4M3", "E5M2", "E3M2", "E2M3", "E2M1", "E8"};
     if (narrow) sname = nn[narrow - kNarrowE4M3];
   }

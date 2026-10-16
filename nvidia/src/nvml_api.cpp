@@ -1127,13 +1127,13 @@ VGPU_EXPORT nvmlReturn_t nvmlDeviceGetFieldValues(nvmlDevice_t device, int count
   // What DCGM's cache manager reads through this call: ECC by location, page
   // retirement and row remapping, the time spent in each clock-event reason, and
   // the energy counter. All from the same state the dedicated entry points read.
-  const vgpu::ras::State ras_state = d ? vgpu::ras::read(d->uuid) : vgpu::ras::State{};
-  auto set_ull = [](nvmlFieldValue_t& v, unsigned long long n) {
+  [[maybe_unused]] const vgpu::ras::State ras_state = d ? vgpu::ras::read(d->uuid) : vgpu::ras::State{};
+  [[maybe_unused]] auto set_ull = [](nvmlFieldValue_t& v, unsigned long long n) {
     v.valueType = NVML_VALUE_TYPE_UNSIGNED_LONG_LONG;
     v.value.ullVal = n;
     v.nvmlReturn = NVML_SUCCESS;
   };
-  auto set_uint = [](nvmlFieldValue_t& v, unsigned int n) {
+  [[maybe_unused]] auto set_uint = [](nvmlFieldValue_t& v, unsigned int n) {
     v.valueType = NVML_VALUE_TYPE_UNSIGNED_INT;
     v.value.uiVal = n;
     v.nvmlReturn = NVML_SUCCESS;

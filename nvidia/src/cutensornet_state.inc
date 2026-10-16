@@ -1826,7 +1826,7 @@ Status apply_block(Mps& m, int64_t lo, int64_t k, const std::vector<cd>& G, cons
     rest_D /= dj;
     const int64_t rows = curL * dj, cols = rest_D * R;
     std::vector<cd> left, right;
-    int64_t kk;
+    int64_t kk = 0;
     const int64_t limit = cfg.maxb.empty() ? INT64_MAX : cfg.maxb[(size_t)(lo + j)];
     if (Status st = split_matrix(cfg, rows, cols, cur, limit, left, right, kk, api)) return st;
     Site& s = m[(size_t)(lo + j)];

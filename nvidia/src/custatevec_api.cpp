@@ -53,7 +53,7 @@ Status refuse(const char* api, const char* why) {
 
 bool complex_type(cudaDataType_t t) { return t == CUDA_C_64F || t == CUDA_C_32F; }
 
-size_t elem_bytes(cudaDataType_t t) { return t == CUDA_C_64F ? 16 : 8; }
+[[maybe_unused]] size_t elem_bytes(cudaDataType_t t) { return t == CUDA_C_64F ? 16 : 8; }
 
 // Work issued on the handle's stream must have finished before its memory is
 // read. A capturing stream has nothing to read yet, so its calls are refused.
