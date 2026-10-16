@@ -45,6 +45,39 @@ compile, download and run programs as on your own computer.
 it shares with your computer; [toolchains.md](toolchains.md) is about `nvcc` and
 `hipcc`. `./run my.yaml -- nvidia-smi -L` runs one command in it and exits.
 
+### What works inside, and what does not
+
+The machine is your own computer with the GPU surfaces replaced, not a separate
+system. What follows was read from `src/cli/shell.cpp` and checked on an Ubuntu 24.04
+host (Python 3.12) with `unshare -r -m -u`, the call `vgpu shell` makes. It was not run
+through `vgpu shell` itself, and no end-to-end test exercises pip.
+
+- **Files are your real files.** Your home and current directory are the host's, so
+  anything you create or download persists after `exit`, owned by you. Only
+  `/proc/driver`, `/sys/class/drm`, `/etc/os-release` and the PCI and hwmon trees differ.
+- **Network is the host's.** `curl`, `wget` and `git clone` work as outside.
+- **No `sudo`, no `apt` inside.** You are `root` only in name: `apt-get install` fails
+  ("are you root?") and `/usr` is not writable. Install system packages on your own
+  machine, outside the session (`make deps` does this for the build tools).
+- **Python packages need a virtual environment.** Verified to work with the
+  user-namespace call above (venv created, `pip install` of a small package, import):
+
+  ```bash
+  python3 -m venv ~/v
+  ~/v/bin/pip install torch      # or any package
+  ~/v/bin/python my_script.py
+  ```
+
+  A plain `pip install x` and `pip install --user x` are refused on Ubuntu 24.04 and
+  similar systems with "externally-managed-environment" (PEP 668). Not tested: installing
+  `torch` itself in the machine through `./run`, and `conda`.
+- **Compilers are the host's** `nvcc` and `hipcc`; see [toolchains.md](toolchains.md).
+  Build CUDA programs with `-cudart shared`.
+- **Where user namespaces are restricted** (`./run` says so), the machine is not
+  isolated and you keep your own user, so `sudo` works as it does outside your session.
+
+To run a Python script in the venv without a terminal: `./run my.yaml -- ~/v/bin/python my_script.py`.
+
 ### Run your own program
 
 Build your program with the real compiler. The `-cudart shared` flag lets the

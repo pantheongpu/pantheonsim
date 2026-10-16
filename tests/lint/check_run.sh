@@ -114,7 +114,7 @@ contains "then the machine starts from it" "--config good.yaml shell -y" "$(cat 
 lacks "isolation is left on" "--no-isolate" "$(cat "$log")"
 contains "the banner names the machine" "8 x nvidia/h100, CUDA 13.0" "$out"
 contains "the banner offers nvidia-smi" "nvidia-smi" "$out"
-contains "the banner offers pip, curl and git" "pip install torch, curl, git clone" "$out"
+contains "the banner offers a venv for pip, and curl and git" "python3 -m venv ~/v && ~/v/bin/pip install torch" "$out"
 contains "the banner says how to leave" "exit" "$out"
 banner=$(sed -n '/PantheonSim:/,/Leave with/p' <<<"$out" | wc -l)
 if (( banner <= 5 )); then ok "the banner is at most 5 lines ($banner)"; else bad "the banner is at most 5 lines" "$banner lines"; fi

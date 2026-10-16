@@ -161,8 +161,10 @@ and checked on a real host:
   namespace's picture, not real privilege: you cannot write to `/usr`, and
   `sudo` and `apt install` do not work in the session. Install packages from
   outside it (`make deps` and your package manager), or use user-level installs
-  in it: `python3 -m venv .venv && . .venv/bin/activate && pip install torch`,
-  `pip install --user`, conda, or a downloaded tarball in your home.
+  in it: `python3 -m venv ~/v && ~/v/bin/pip install torch`,
+  conda, or a downloaded tarball in your home. On Ubuntu 24.04 and other systems
+  that mark Python as externally managed (PEP 668) a plain `pip install` and
+  `pip install --user` are refused; use a virtual environment.
 - **Compilers:** the host's `nvcc` and `hipcc`, if installed. Build CUDA programs
   with `-cudart shared`. See [toolchains.md](toolchains.md).
 - **With `--no-isolate`** (what `./run` uses on a system that restricts user

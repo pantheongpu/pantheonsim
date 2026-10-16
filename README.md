@@ -11,7 +11,7 @@ make     # installs cmake and a C++ compiler if missing (asks first), then build
 ./run    # starts a simulated GPU machine and takes you inside; type exit to leave
 ```
 
-Inside, `nvidia-smi` shows the GPUs, and you can compile, `pip install`, `curl` or `git clone` and run any program as on your own computer.
+Inside, `nvidia-smi` shows the GPUs, and you can compile, download programs with `curl` or `git clone`, and run them; for Python packages use a virtual environment (`python3 -m venv ~/v && ~/v/bin/pip install ...`); system packages (apt) are installed on your own machine, outside.
 
 ## Choose your machine
 

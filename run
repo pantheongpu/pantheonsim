@@ -126,7 +126,7 @@ if command -v nvcc >/dev/null 2>&1 || command -v hipcc >/dev/null 2>&1; then
 else
   echo "        nvcc/hipcc not found; prebuilt programs and Python work, see docs/toolchains.md"
 fi
-echo "        pip install torch, curl, git clone    anything else, as on your own machine"
+echo "        python3 -m venv ~/v && ~/v/bin/pip install torch    Python packages; curl and git clone work too"
 echo "  Leave with: exit"
 echo
 exec "$vgpu" --config "$config" shell -y ${flags[@]+"${flags[@]}"}
