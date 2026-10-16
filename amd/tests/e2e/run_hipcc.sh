@@ -574,4 +574,14 @@ for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x" "gfx1100 rx7900xtx" "
 divide double: 141681 quotients, 0 differ from IEEE division (0 of the 1681 edge pairs)" \
     "$(grep '^divide \(float\|double\):' <<< "$out")"
 done
+# The half-precision multiply-adds of the CDNA chips: v_mad_f16, v_mad_legacy_f16 and v_mac_f16 round the product to a half before the
+# add ("1ULP accuracy"), v_fma_f16 and v_fma_legacy_f16 are fused (CDNA2/3/4 guides, V_MAD_F16 and V_FMA_F16), checked on operands
+# where the two differ against the host's own arithmetic (hipcc/mad_f16.cpp).
+for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/mad_f16.$1" 2>&1)
+  status=$?
+  expect "$1: the half multiply-add program runs to the end" "0" "$status"
+  expect "$1: the MAD forms round the product, the FMA forms are fused" "5 of 5" "$(grep -c ': 0 of 64 wrong$' <<< "$out") of 5"
+done
 exit $fail

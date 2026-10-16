@@ -250,3 +250,9 @@ for arch in gfx942 gfx950 gfx90a gfx1100 gfx1201; do
   "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch divide.cpp -o divide.$arch
 done
 echo "wrote $(pwd)/divide.gfx942, divide.gfx950, divide.gfx90a, divide.gfx1100 and divide.gfx1201"
+
+# The half-precision multiply-adds: the MAD forms round the product, the FMA forms are fused: mad_f16.cpp.
+for arch in gfx90a gfx942 gfx950; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch mad_f16.cpp -o mad_f16.$arch
+done
+echo "wrote $(pwd)/mad_f16.gfx90a, mad_f16.gfx942 and mad_f16.gfx950"
