@@ -247,3 +247,25 @@ echo "wrote $(pwd)/cluster1250.gfx1250"
 # rocSOLVER's Cholesky kernel): wave_race.cpp.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 wave_race.cpp -o wave_race.gfx942
 echo "wrote $(pwd)/wave_race.gfx942"
+
+# `a / b` on float and double as the compiler writes it (v_div_scale, v_rcp, fused multiply-adds, v_div_fmas, v_div_fixup), over
+# edge and random operands, against the host's own IEEE division: divide.cpp.
+for arch in gfx942 gfx950 gfx90a gfx1100 gfx1201; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch divide.cpp -o divide.$arch
+done
+echo "wrote $(pwd)/divide.gfx942, divide.gfx950, divide.gfx90a, divide.gfx1100 and divide.gfx1201"
+
+# The half-precision multiply-adds: the MAD forms round the product, the FMA forms are fused: mad_f16.cpp.
+for arch in gfx90a gfx942 gfx950; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch mad_f16.cpp -o mad_f16.$arch
+done
+echo "wrote $(pwd)/mad_f16.gfx90a, mad_f16.gfx942 and mad_f16.gfx950"
+
+# MFMA A-matrix broadcast (CBSZ and ABID) of the multi-block shapes, against AMD's Matrix Instruction Calculator's tables:
+# mfma_broadcast.cpp reads mfma_broadcast_golden.h, which mfma_broadcast_gen.py writes from the calculator
+# (git clone https://github.com/ROCm/amd_matrix_instruction_calculator; mfma_broadcast_gen.py <calc>/matrix_calculator.py >
+# mfma_broadcast_golden.h).
+for arch in gfx90a gfx942 gfx950; do
+  "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=$arch mfma_broadcast.cpp -o mfma_broadcast.$arch
+done
+echo "wrote $(pwd)/mfma_broadcast.gfx90a, mfma_broadcast.gfx942 and mfma_broadcast.gfx950"

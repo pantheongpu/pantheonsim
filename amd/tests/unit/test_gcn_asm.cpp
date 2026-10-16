@@ -1795,7 +1795,8 @@ VTEST(vop3_instructions_a_compiler_emits_give_what_the_isa_says) {
     check(l, 3, at(3), half_bits(std::min({h0, h1, h2})), "v_min3_f16");
     check(l, 4, at(4), half_bits(std::max({h0, h1, h2})), "v_max3_f16");
     {
-      const uint32_t want = half_bits(h0 * h1 + h2);
+      // The MAD form rounds the product to a half before the add (CDNA2/3/4 guides: "1ULP accuracy", where V_FMA_F16 is fused).
+      const uint32_t want = half_bits(half_val(h0 * h1) + h2);
       if (!both_nan(at(5), want)) check(l, 5, at(5), want, "v_mad_f16");
     }
     check(l, 6, at(6), static_cast<uint16_t>(uint32_t{u0} * u1 + u2), "v_mad_u16");   // unsigned, or two uint16_t promote to a signed int that overflows

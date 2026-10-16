@@ -27,6 +27,7 @@
 #include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
+#include "gcn_divide.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
 
@@ -1894,92 +1895,33 @@ struct Machine {
     return w.exec ? static_cast<uint32_t>(__builtin_ctzll(w.exec)) : 0;
   }
 
-  // The three instructions a float division is built from. The compiler
-  // emits v_div_scale to bring extreme operands into range, refines a
-  // reciprocal, then v_div_fmas and v_div_fixup put the result back.
-  //
-  // The scaling exists because the hardware's reciprocal is approximate, and
-  // this reciprocal is exact, so the sequence lands on the correctly rounded
-  // quotient either way.
+  // The three instructions a float division is built from: v_div_scale, v_div_fmas and v_div_fixup (gcn_divide.hpp has the pseudocode
+  // they follow, and where it departs from the guides). The compiler scales the operands, refines a reciprocal, and these put the
+  // result back; the sequence lands on the correctly rounded quotient.
   void divide_step(Wave& w, const Inst& in, uint32_t lane) {
     const OpName op(in.name);
-    // The same three steps, in double precision: the ISA gives each a form of
-    // its own, and the scaling is by 2^128 rather than 2^64.
     if (op.size() > 4 && op.compare(op.size() - 4, 4, "_f64") == 0) {
+      const double s0 = lane_double(w, in.src[0], lane), s1 = lane_double(w, in.src[1], lane), s2 = lane_double(w, in.src[2], lane);
       if (op == "v_div_scale_f64"_op) {
-        const double value = lane_double(w, in.src[0], lane), den = lane_double(w, in.src[1], lane),
-                     num = lane_double(w, in.src[2], lane);
-        bool scaled = false;
-        double out = value;
-        // Both have to be ordinary numbers to compare their exponents:
-        // ilogb of a zero is INT_MIN, and subtracting that overflows.
-        if (std::isfinite(den) && std::isfinite(num) && den != 0 && num != 0) {
-          const int64_t de = std::ilogb(den), ne = std::ilogb(num);
-          if (ne - de >= 1022 || ne - de <= -1022) {
-            out = std::ldexp(value, 128);
-            scaled = true;
-          }
-        }
-        write_lane64(w, in.dst[0], lane, as_bits(out));
-        if (scaled) sdst_bits |= uint64_t{1} << lane;
+        const auto r = gcn::divide::div_scale(s0, s1, s2);
+        write_lane64(w, in.dst[0], lane, as_bits(r.value));
+        if (r.vcc) sdst_bits |= uint64_t{1} << lane;
       } else if (op == "v_div_fmas_f64"_op) {
-        const double r = std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane),
-                                  lane_double(w, in.src[2], lane));
-        write_lane64(w, in.dst[0], lane, as_bits((w.vcc >> lane) & 1 ? std::ldexp(r, 128) : r));
+        write_lane64(w, in.dst[0], lane, as_bits(gcn::divide::div_fmas(s0, s1, s2, (w.vcc >> lane) & 1)));
       } else {   // v_div_fixup_f64
-        const double q = lane_double(w, in.src[0], lane), den = lane_double(w, in.src[1], lane),
-                     num = lane_double(w, in.src[2], lane);
-        double out = q;
-        if (std::isnan(num) || std::isnan(den)) out = std::numeric_limits<double>::quiet_NaN();
-        else if (den == 0) out = num == 0 ? std::numeric_limits<double>::quiet_NaN()
-                                          : std::copysign(std::numeric_limits<double>::infinity(), num) *
-                                                std::copysign(1.0, den);
-        else if (std::isinf(den)) out = std::isinf(num) ? std::numeric_limits<double>::quiet_NaN()
-                                                        : std::copysign(0.0, num) * std::copysign(1.0, den);
-        else if (std::isinf(num)) out = std::copysign(std::numeric_limits<double>::infinity(), num) *
-                                        std::copysign(1.0, den);
-        else out = std::signbit(den) != std::signbit(num) ? -std::fabs(q) : std::fabs(q);   // the quotient's sign is the operands' (CDNA3 ISA)
-        write_lane64(w, in.dst[0], lane, as_bits(out));
+        write_lane64(w, in.dst[0], lane, as_bits(gcn::divide::div_fixup(s0, s1, s2)));
       }
       return;
     }
+    const float s0 = lane_float(w, in.src[0], lane), s1 = lane_float(w, in.src[1], lane), s2 = lane_float(w, in.src[2], lane);
     if (op == "v_div_scale_f32"_op) {
-      // src0 is the value to scale, src1 the denominator, src2 the numerator.
-      const float value = lane_float(w, in.src[0], lane), den = lane_float(w, in.src[1], lane),
-                  num = lane_float(w, in.src[2], lane);
-      // Scale only where the quotient would otherwise overflow or flush to
-      // zero: the ISA scales by 2^64, and says so in the condition register.
-      bool scaled = false;
-      float out = value;
-      // As above: a zero has no exponent to compare.
-      if (std::isfinite(den) && std::isfinite(num) && den != 0 && num != 0) {
-        const int64_t de = std::ilogb(den), ne = std::ilogb(num);
-        if (ne - de >= 126 || ne - de <= -126) {
-          out = std::ldexp(value, 64);
-          scaled = true;
-        }
-      }
-      write_lane(w, in.dst[0], lane, as_bits(out));
-      if (scaled) sdst_bits |= uint64_t{1} << lane;
+      const auto r = gcn::divide::div_scale(s0, s1, s2);
+      write_lane(w, in.dst[0], lane, as_bits(r.value));
+      if (r.vcc) sdst_bits |= uint64_t{1} << lane;
     } else if (op == "v_div_fmas_f32"_op) {
-      // A fused multiply-add, times 2^64 where the scaling said so.
-      const float r = std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane),
-                               lane_float(w, in.src[2], lane));
-      write_lane(w, in.dst[0], lane, as_bits((w.vcc >> lane) & 1 ? std::ldexp(r, 64) : r));
-    } else {   // v_div_fixup_f32: the quotient, with the cases the sequence cannot do
-      const float q = lane_float(w, in.src[0], lane), den = lane_float(w, in.src[1], lane),
-                  num = lane_float(w, in.src[2], lane);
-      float out = q;
-      if (std::isnan(num) || std::isnan(den)) out = std::numeric_limits<float>::quiet_NaN();
-      else if (den == 0) out = num == 0 ? std::numeric_limits<float>::quiet_NaN()
-                                        : std::copysign(std::numeric_limits<float>::infinity(), num) *
-                                              std::copysign(1.0f, den);
-      else if (std::isinf(den)) out = std::isinf(num) ? std::numeric_limits<float>::quiet_NaN()
-                                                     : std::copysign(0.0f, num) * std::copysign(1.0f, den);
-      else if (std::isinf(num)) out = std::copysign(std::numeric_limits<float>::infinity(), num) *
-                                      std::copysign(1.0f, den);
-      else out = std::signbit(den) != std::signbit(num) ? -std::fabs(q) : std::fabs(q);   // the quotient's sign is the operands' (CDNA3 ISA)
-      write_lane(w, in.dst[0], lane, as_bits(out));
+      write_lane(w, in.dst[0], lane, as_bits(gcn::divide::div_fmas(s0, s1, s2, (w.vcc >> lane) & 1)));
+    } else {   // v_div_fixup_f32
+      write_lane(w, in.dst[0], lane, as_bits(gcn::divide::div_fixup(s0, s1, s2)));
     }
   }
 
@@ -2689,7 +2631,14 @@ struct Machine {
             c = static_cast<float>(lane_half(w, d, lane));
           }
         }
-        write_half(w, in, lane, static_cast<_Float16>(std::fma(a, b, c)));
+        // v_mac_f16 on the CDNA chips is the MAD form (mad_f16_rounds_twice_, see gfx9_added_alu): the product rounded to a half
+        // before the add. A half's product is exact in a float, so rounding it to a half is the one rounding.
+        if (mad_f16_rounds_twice_) {
+          const float p = static_cast<float>(static_cast<_Float16>(a * b));
+          write_half(w, in, lane, static_cast<_Float16>(p + c));
+        } else {
+          write_half(w, in, lane, static_cast<_Float16>(std::fma(a, b, c)));
+        }
       });
     } else if (op == "v_maxmin_f32"_op || op == "v_minmax_f32"_op) {
       // Two steps, each the IEEE-style min or max of two.
@@ -3244,12 +3193,13 @@ struct Machine {
     throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented: it adds a random seed to the bits the narrowing drops, and the guide and AMD's "
                                               "own software disagree on which bits of the seed those are");
   }
+  bool mad_f16_rounds_twice_ = false;   // (set around the one v_fmac_f16 body that v_mac_f16 shares)
   // The instructions of gfx90a that gfx9_added_alu runs, which the CDNA2 guide defines (12.8, 12.9, 12.11: "D.f16 = sin(S0.f16 * 2 * PI)",
   // the cube-map pseudocode, "4-bit signed int to 32-bit float", "D.i = (int)floor(S0.f + 0.5)", "Fused half precision multiply add",
   // the frexp pseudocode, "D.f16 = S0.f16 * (2 ** S1.i16)", V_MAD_LEGACY_I16, the packed fused multiply-add, "D.u32 = {16'b0, sat8(...)}").
-  // Left out, as the guide only lists them in its opcode table or leaves open what the CDNA3 text settles: V_MAC_F16 ("D.f16 = S0.f16 *
-  // S1.f16 + D.f16": whether the product is rounded before the add is not said), V_CVT_NORM_{I,U}16_F16, V_CVT_PKACCUM_U8_F32 and
-  // V_MAD_LEGACY_F16.
+  // V_MAC_F16 ("D.f16 = S0.f16 * S1.f16 + D.f16") and V_MAD_LEGACY_F16 are the MAD forms: not fused (see more_alu, v_mad_f16), the product
+  // rounded to a half first. Left out, as the guide only lists them in its opcode table or leaves open what the CDNA3 text settles:
+  // V_CVT_NORM_{I,U}16_F16 and V_CVT_PKACCUM_U8_F32.
   static bool cdna2_defines(const std::string& full) {
     std::string name = full;
     for (const char* suffix : {"_e32", "_e64", "_dpp", "_sdwa"})
@@ -3260,12 +3210,12 @@ struct Machine {
     static const std::set<std::string_view> kDefined = {
         "v_sin_f16", "v_cos_f16", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32", "v_cubema_f32", "v_cvt_off_f32_i4",
         "v_cvt_rpi_i32_f32", "v_fma_legacy_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16", "v_ldexp_f16", "v_mad_legacy_i16",
-        "v_pk_fmac_f16", "v_sat_pk_u8_i16"};
+        "v_pk_fmac_f16", "v_sat_pk_u8_i16", "v_mac_f16", "v_mad_legacy_f16"};
     return kDefined.count(name) != 0;
   }
   // The VALU instructions of the CDNA3 and CDNA4 guides that gfx942 and gfx950 have and that the gfx1250 and RDNA code already does by another
-  // name or under the same one: run under the name that code knows (the half-precision "legacy" multiply-adds are the fused ones; a
-  // half's product is exact in a float, so one rounding is the same either way).
+  // name or under the same one: run under the name that code knows (v_fma_legacy_f16 is the fused v_fma_f16; v_mac_f16 and v_mad_legacy_f16 are the MAD
+  // forms, whose product is rounded to a half first).
   bool gfx9_added_alu(Wave& w, const Inst& in) {
     std::string name = in.name;
     for (const char* suffix : {"_e32", "_e64", "_dpp", "_sdwa"})
@@ -3274,7 +3224,7 @@ struct Machine {
         break;
       }
     static const std::map<std::string, std::string> kAlias = {
-        {"v_mac_f16", "v_fmac_f16"},           {"v_mad_legacy_f16", "v_fma_f16"},          {"v_fma_legacy_f16", "v_fma_f16"},
+        {"v_mac_f16", "v_fmac_f16"},           {"v_mad_legacy_f16", "v_mad_f16"},          {"v_fma_legacy_f16", "v_fma_f16"},
         {"v_mad_legacy_i16", "v_mad_i16"},     {"v_mad_legacy_u16", "v_mad_u16"},          {"v_div_fixup_legacy_f16", "v_div_fixup_f16"}};
     static const std::set<std::string_view> kShared = {
         "v_sin_f16", "v_cos_f16", "v_frexp_mant_f16", "v_frexp_exp_i16_f16", "v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16",
@@ -3291,6 +3241,12 @@ struct Machine {
       return rdna_alu(w, in, shared);
     }
     if (canon == "v_fmac_f16") {   // (RDNA's)
+      // ... but v_mac_f16 is the two-address MAD, not fused (same evidence as v_mad_f16, in more_alu): the product is rounded first.
+      struct Rounding {
+        bool& flag;
+        explicit Rounding(bool& f, bool on) : flag(f) { flag = on; }
+        ~Rounding() { flag = false; }
+      } rounding(mad_f16_rounds_twice_, name == "v_mac_f16");
       const OpName shared(canon);
       return rdna_alu(w, in, shared);
     }
@@ -3624,7 +3580,14 @@ struct Machine {
         float r;
         if (op == "v_min3_f16"_op) r = std::fmin(std::fmin(x, y), z);
         else if (op == "v_max3_f16"_op) r = std::fmax(std::fmax(x, y), z);
-        else if (op == "v_mad_f16"_op) r = x * y + z;
+        else if (op == "v_mad_f16"_op) {
+          // The MAD forms are not fused: "1ULP accuracy" where V_FMA_F16 is the "Fused half precision multiply add. 0.5ULP accuracy"
+          // (CDNA2 guide 12.9, CDNA3 and CDNA4 guides, V_MAD_F16 and V_FMA_F16), and LLVM defines the node v_mad_f16 is selected for
+          // (ISD::FMAD) as "the same result as the separately rounded operations". So the product is rounded to a half, then added.
+          // (RDNA's v_mad_f16 is left as it was.)
+          const bool cdna = in.arch == gcn::Target::Gfx90a || in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950;
+          r = cdna ? static_cast<float>(static_cast<_Float16>(x * y)) + z : x * y + z;
+        }
         else r = std::isnan(x) || std::isnan(y) || std::isnan(z) ? std::fmin(std::fmin(x, y), z)
                                                                   : std::fmax(std::fmin(x, y), std::fmin(std::fmax(x, y), z));
         write_half(w, in, lane, static_cast<_Float16>(r));
@@ -7837,6 +7800,12 @@ struct Machine {
       if (o.kind == OperandKind::InlineFloat) return o.fvalue;
       return as_double(reg(o, 2 * e, lane) | static_cast<uint64_t>(reg(o, 2 * e + 1, lane)) << 32);
     };
+    // CBSZ broadcasts one block's A to each group of 2^CBSZ blocks: "Setting CBSZ such that (1 << CBSZ) exceeds the number of blocks the MFMA
+    // instruction processes is undefined" (CDNA3 guide, 7.1.5.1; the calculator at github.com/ROCm/amd_matrix_instruction_calculator
+    // refuses it too: "may only contain values between 0 - log2(blocks)"). Refused rather than guessed at.
+    if (in.a_bcast_size && (1u << in.a_bcast_size) > s.blocks)
+      throw Error::make(Err::Unsupported, in.name, " with CBSZ ", static_cast<uint32_t>(in.a_bcast_size), ", which broadcasts to more blocks than the instruction has (",
+                        s.blocks, "): the guide calls that undefined");
     const uint32_t lanes_per_block = kLanes / s.blocks, groups = lanes_per_block / s.m, per_lane = s.k / groups;
     const uint32_t outs = s.m * s.n * s.blocks / kLanes;
     std::vector<double> a(size_t{s.blocks} * s.m * s.k), b(size_t{s.blocks} * s.k * s.n), c(size_t{s.blocks} * s.m * s.n);

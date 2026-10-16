@@ -579,4 +579,39 @@ echo "$out" | sed 's/^/      /'
 expect "the wave-order program runs to the end" "0" "$status"
 expect "every wave reads the word before thread 0 overwrites it, in a kernel's first round and in later ones" \
   "10 of 10 wave-order checks hold" "$(grep -o '^[0-9]* of [0-9]* wave-order checks hold' <<< "$out")"
+# Division as the compiler writes it (v_div_scale, v_rcp, fused multiply-adds, v_div_fmas, v_div_fixup): float and double quotients
+# of edge operands (zeros, denormals, infinities, NaNs, both signs) and of random ones whose exponents differ by up to the whole
+# range, each against the host's own IEEE division, bit for bit (hipcc/divide.cpp). A denominator whose significand is all ones is
+# allowed to be one unit in the last place off.
+for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x" "gfx1100 rx7900xtx" "gfx1201 rx9070xt"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/divide.$1" 2>&1)
+  status=$?
+  expect "$1: the division program runs to the end" "0" "$status"
+  expect "$1: every float and double quotient is the IEEE one" \
+    "divide float: 141681 quotients, 0 differ from IEEE division (0 of the 1681 edge pairs)
+divide double: 141681 quotients, 0 differ from IEEE division (0 of the 1681 edge pairs)" \
+    "$(grep '^divide \(float\|double\):' <<< "$out")"
+done
+# The half-precision multiply-adds of the CDNA chips: v_mad_f16, v_mad_legacy_f16 and v_mac_f16 round the product to a half before the
+# add ("1ULP accuracy"), v_fma_f16 and v_fma_legacy_f16 are fused (CDNA2/3/4 guides, V_MAD_F16 and V_FMA_F16), checked on operands
+# where the two differ against the host's own arithmetic (hipcc/mad_f16.cpp).
+for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/mad_f16.$1" 2>&1)
+  status=$?
+  expect "$1: the half multiply-add program runs to the end" "0" "$status"
+  expect "$1: the MAD forms round the product, the FMA forms are fused" "5 of 5" "$(grep -c ': 0 of 64 wrong$' <<< "$out") of 5"
+done
+# MFMA A-matrix broadcast: for the 2-, 4- and 16-block f32 and f16 shapes, every CBSZ and a spread of ABIDs, each product's A is the element
+# AMD's Matrix Instruction Calculator says the broadcast reads (its tables are in hipcc/mfma_broadcast_golden.h; within each contiguous group of
+# 2^CBSZ blocks, block ABID's A feeds the whole group).
+for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/mfma_broadcast.$1" 2>&1)
+  status=$?
+  expect "$1: the MFMA broadcast program runs to the end" "0" "$status"
+  expect "$1: every CBSZ and ABID reads the A the calculator says" "50 of 50" \
+    "$(grep -c ' cbsz:[0-9]* abid:[0-9]*: 0 of [0-9]* wrong$' <<< "$out") of $(grep -c ' cbsz:[0-9]* abid:[0-9]*:' <<< "$out")"
+done
 exit $fail
