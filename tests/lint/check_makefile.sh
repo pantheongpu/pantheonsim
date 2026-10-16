@@ -28,7 +28,7 @@ lacks() {  # lacks <name> <needle> <haystack>
 fails() { if [[ $2 -ne 0 ]]; then ok "$1"; else bad "$1" "expected a non-zero exit"; fi; }   # make exits 2 when a recipe fails
 expect() { if [[ "$3" == "$2" ]]; then ok "$1"; else bad "$1" "expected: $2" "actual:   $3"; fi; }
 
-targets="doctor build demo list-gpus init config shell run test clean"
+targets="deps doctor build demo list-gpus init config shell run test clean"
 
 # ---- every target exists and make -n shows its command ---------------------------
 for t in help $targets; do
@@ -36,11 +36,28 @@ for t in help $targets; do
   if [[ $rc -eq 0 && -n $out ]]; then ok "make -n $t works"; else bad "make -n $t works" "exit $rc" "$out"; fi
 done
 
-out=$(make -s 2>&1); rc=$?
-expect "plain make prints help and succeeds" "0" "$rc"
+out=$(make -s help 2>&1); rc=$?
+expect "make help prints help and succeeds" "0" "$rc"
 for t in $targets; do contains "help lists 'make $t'" "make $t" "$out"; done
+contains "help lists plain make" "make                 make deps" "$out"
 contains "help documents the variables" "GPU=" "$out"
 contains "help names the settings file" "pantheonsim.yaml" "$out"
+
+# ---- plain `make`: tools, then build, then what to type next ----------------------------------
+out=$(make -n 2>&1); rc=$?
+expect "plain make -n works" "0" "$rc"
+contains "plain make checks the tools first" "./scripts/deps.sh" "$out"
+contains "then builds" "./scripts/build.sh" "$out"
+contains "at low priority" "nice -n 10 ./scripts/build.sh" "$out"
+deps_at=$(grep -n 'scripts/deps.sh$' <<<"$out" | head -1 | cut -d: -f1)
+build_at=$(grep -n 'scripts/build.sh' <<<"$out" | head -1 | cut -d: -f1)
+if [[ -n $deps_at && -n $build_at && $deps_at -lt $build_at ]]; then ok "deps comes before build"; else bad "deps comes before build" "$out"; fi
+contains "and says what to type next" "./run" "$out"
+lacks "plain make does not print the help" "PantheonSim: run CUDA" "$out"
+contains "make deps runs scripts/deps.sh" "./scripts/deps.sh" "$(make -n deps)"
+lacks "make deps does not build" "build.sh" "$(make -n deps)"
+lacks "make build does not install" "deps.sh" "$(make -n build)"
+expect "make build is exactly the build script at low priority" "nice -n 10 ./scripts/build.sh" "$(make -n build)"
 
 # ---- each target runs the command it is documented to run ---------------------------
 dry() { make -n "$@" 2>&1; }
