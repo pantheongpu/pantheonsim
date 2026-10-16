@@ -7671,6 +7671,12 @@ struct Machine {
       if (o.kind == OperandKind::InlineFloat) return o.fvalue;
       return as_double(reg(o, 2 * e, lane) | static_cast<uint64_t>(reg(o, 2 * e + 1, lane)) << 32);
     };
+    // CBSZ broadcasts one block's A to each group of 2^CBSZ blocks: "Setting CBSZ such that (1 << CBSZ) exceeds the number of blocks the MFMA
+    // instruction processes is undefined" (CDNA3 guide, 7.1.5.1; the calculator at github.com/ROCm/amd_matrix_instruction_calculator
+    // refuses it too: "may only contain values between 0 - log2(blocks)"). Refused rather than guessed at.
+    if (in.a_bcast_size && (1u << in.a_bcast_size) > s.blocks)
+      throw Error::make(Err::Unsupported, in.name, " with CBSZ ", static_cast<uint32_t>(in.a_bcast_size), ", which broadcasts to more blocks than the instruction has (",
+                        s.blocks, "): the guide calls that undefined");
     const uint32_t lanes_per_block = kLanes / s.blocks, groups = lanes_per_block / s.m, per_lane = s.k / groups;
     const uint32_t outs = s.m * s.n * s.blocks / kLanes;
     std::vector<double> a(size_t{s.blocks} * s.m * s.k), b(size_t{s.blocks} * s.k * s.n), c(size_t{s.blocks} * s.m * s.n);

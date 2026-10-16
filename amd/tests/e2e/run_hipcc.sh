@@ -584,4 +584,15 @@ for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x"; do
   expect "$1: the half multiply-add program runs to the end" "0" "$status"
   expect "$1: the MAD forms round the product, the FMA forms are fused" "5 of 5" "$(grep -c ': 0 of 64 wrong$' <<< "$out") of 5"
 done
+# MFMA A-matrix broadcast: for the 2-, 4- and 16-block f32 and f16 shapes, every CBSZ and a spread of ABIDs, each product's A is the element
+# AMD's Matrix Instruction Calculator says the broadcast reads (its tables are in hipcc/mfma_broadcast_golden.h; within each contiguous group of
+# 2^CBSZ blocks, block ABID's A feeds the whole group).
+for run in "gfx942 mi300x" "gfx950 mi350x" "gfx90a mi250x"; do
+  set -- $run
+  out=$(VGPU_QUIET=1 VGPU_GPU=amd/$2 LD_LIBRARY_PATH="$shim" "$(dirname "$exe")/mfma_broadcast.$1" 2>&1)
+  status=$?
+  expect "$1: the MFMA broadcast program runs to the end" "0" "$status"
+  expect "$1: every CBSZ and ABID reads the A the calculator says" "50 of 50" \
+    "$(grep -c ' cbsz:[0-9]* abid:[0-9]*: 0 of [0-9]* wrong$' <<< "$out") of $(grep -c ' cbsz:[0-9]* abid:[0-9]*:' <<< "$out")"
+done
 exit $fail

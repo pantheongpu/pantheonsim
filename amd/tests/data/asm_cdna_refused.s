@@ -9,6 +9,13 @@
 #else
 #define RET sc0
 #endif
+#if defined(GFX90A)
+#define MFMA_4_BLOCKS v_mfma_f32_16x16x1f32
+#define MFMA_1_BLOCK v_mfma_f32_16x16x4f32
+#else
+#define MFMA_4_BLOCKS v_mfma_f32_16x16x1_4b_f32
+#define MFMA_1_BLOCK v_mfma_f32_16x16x4_f32
+#endif
   .text
   .globl halt_set
   .p2align 8
@@ -34,6 +41,22 @@ msg_halt:
   s_endpgm
 .Lmsg_halt_end:
   .size msg_halt, .Lmsg_halt_end-msg_halt
+  .globl cbsz_beyond_blocks
+  .p2align 8
+  .type cbsz_beyond_blocks,@function
+cbsz_beyond_blocks:
+  MFMA_4_BLOCKS v[0:15], v16, v17, 0 cbsz:3 abid:0
+  s_endpgm
+.Lcbsz_beyond_blocks_end:
+  .size cbsz_beyond_blocks, .Lcbsz_beyond_blocks_end-cbsz_beyond_blocks
+  .globl cbsz_on_one_block
+  .p2align 8
+  .type cbsz_on_one_block,@function
+cbsz_on_one_block:
+  MFMA_1_BLOCK v[0:3], v4, v5, 0 cbsz:1 abid:0
+  s_endpgm
+.Lcbsz_on_one_block_end:
+  .size cbsz_on_one_block, .Lcbsz_on_one_block_end-cbsz_on_one_block
 #if defined(GFX950)
   .globl m0_high_buffer_lds
   .p2align 8
@@ -89,6 +112,24 @@ b6_transpose:
     .amdhsa_next_free_sgpr 96
     .amdhsa_accum_offset 64
   .end_amdhsa_kernel
+  .p2align 6
+  .amdhsa_kernel cbsz_beyond_blocks
+    .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    .amdhsa_group_segment_fixed_size 0
+    .amdhsa_private_segment_fixed_size 0
+    .amdhsa_next_free_vgpr 64
+    .amdhsa_next_free_sgpr 96
+    .amdhsa_accum_offset 64
+  .end_amdhsa_kernel
+  .p2align 6
+  .amdhsa_kernel cbsz_on_one_block
+    .amdhsa_user_sgpr_kernarg_segment_ptr 1
+    .amdhsa_group_segment_fixed_size 0
+    .amdhsa_private_segment_fixed_size 0
+    .amdhsa_next_free_vgpr 64
+    .amdhsa_next_free_sgpr 96
+    .amdhsa_accum_offset 64
+  .end_amdhsa_kernel
 #if defined(GFX950)
   .p2align 6
   .amdhsa_kernel m0_high_buffer_lds
@@ -117,6 +158,32 @@ amdhsa.version: [ 1, 2 ]
 amdhsa.kernels:
   - .name: halt_set
     .symbol: halt_set.kd
+    .kernarg_segment_size: 16
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: 0
+    .private_segment_fixed_size: 0
+    .wavefront_size: 64
+    .sgpr_count: 96
+    .vgpr_count: 64
+    .max_flat_workgroup_size: 64
+    .args:
+      - { .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global }
+      - { .size: 8, .offset: 8, .value_kind: global_buffer, .address_space: global }
+  - .name: cbsz_beyond_blocks
+    .symbol: cbsz_beyond_blocks.kd
+    .kernarg_segment_size: 16
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: 0
+    .private_segment_fixed_size: 0
+    .wavefront_size: 64
+    .sgpr_count: 96
+    .vgpr_count: 64
+    .max_flat_workgroup_size: 64
+    .args:
+      - { .size: 8, .offset: 0, .value_kind: global_buffer, .address_space: global }
+      - { .size: 8, .offset: 8, .value_kind: global_buffer, .address_space: global }
+  - .name: cbsz_on_one_block
+    .symbol: cbsz_on_one_block.kd
     .kernarg_segment_size: 16
     .kernarg_segment_align: 8
     .group_segment_fixed_size: 0

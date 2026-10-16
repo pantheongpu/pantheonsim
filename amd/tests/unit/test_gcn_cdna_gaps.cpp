@@ -696,6 +696,10 @@ VTEST(what_the_guides_leave_open_is_still_refused_by_name) {
     VCHECK_EQ(launch_error(o, "halt_clear"), std::string());
     VCHECK_CONTAINS(launch_error(o, "halt_set"), "halts the wave");
     VCHECK_CONTAINS(launch_error(o, "msg_halt"), "halts the wave");
+    // CBSZ above log2(blocks): "Setting CBSZ such that (1 << CBSZ) exceeds the number of blocks the MFMA instruction processes is
+    // undefined" (CDNA3 guide, 7.1.5.1), so a broadcast to eight of four blocks, or to two of one, is refused.
+    VCHECK_CONTAINS(launch_error(o, "cbsz_beyond_blocks"), "broadcasts to more blocks than the instruction has (4)");
+    VCHECK_CONTAINS(launch_error(o, "cbsz_on_one_block"), "broadcasts to more blocks than the instruction has (1)");
   }
   const amd::CodeObject o = object("asm_cdna_refused", "gfx950");
   VCHECK_CONTAINS(launch_error(o, "m0_high_buffer_lds"), "M0[17:0]");
