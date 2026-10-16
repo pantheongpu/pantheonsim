@@ -190,11 +190,25 @@ inline size_t compute_scalar_bytes(cublasComputeType_t ct) {
 // Hands the call to the graph when the handle's stream is capturing. Returns
 // true if it was recorded, in which case the caller must return success now
 // without touching device memory.
+//
+// The pointer mode is the call's too: a program switches the handle between host and device scalars while it
+// captures (CUDA Samples' conjugateGradientCudaGraphs sets HOST for one cublasSaxpy and DEVICE after it), and
+// the graph runs after the capture, with the handle in the last mode it was left in. The recorded call reads
+// its scalars as the mode it was made in says, so the replay puts that mode back for the call and then
+// restores the handle's own.
 template <class Fn>
 bool deferred_to_graph(cublasHandle_t h, Fn&& fn) {
   Handle* hh = reinterpret_cast<Handle*>(h);
   if (!hh) return false;
-  return vgpu_record_host_op_if_capturing(hh->stream, std::function<void()>(std::forward<Fn>(fn)));
+  const cublasPointerMode_t mode = hh->pointer_mode;
+  return vgpu_record_host_op_if_capturing(
+      hh->stream, std::function<void()>([h, mode, call = std::forward<Fn>(fn)]() mutable {
+        Handle* live = reinterpret_cast<Handle*>(h);
+        const cublasPointerMode_t current = live->pointer_mode;
+        live->pointer_mode = mode;
+        call();
+        live->pointer_mode = current;
+      }));
 }
 
 // A reduction that writes its answer through a host pointer cannot be recorded:

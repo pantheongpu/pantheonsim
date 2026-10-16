@@ -1833,6 +1833,7 @@ static CUresult cuLinkDestroy_impl(void* state) {
 // ids start at 1, so 0 stays available as "no handle".
 namespace {
 constexpr size_t kVmmGranularity = vgpu::MemoryManager::kVmmGranularity;   // 2 MiB
+constexpr unsigned char kCompGeneric = 1;   // CU_MEM_ALLOCATION_COMP_GENERIC
 
 // The property struct a caller passes. Only a device-local pinned allocation
 // exists here; anything else is refused rather than quietly treated as one.
@@ -1890,7 +1891,13 @@ static CUresult cuMemCreate_impl(CUmemGenericAllocationHandle* handle, size_t si
     if (!handle || size == 0 || flags != 0) return CUDA_ERROR_INVALID_VALUE;
     int device = 0;
     if (const CUresult rc = check_prop(prop, s, &device); rc != CUDA_SUCCESS) return rc;
-    *handle = s.rt->device(device).memory().create_handle(size, prop->requestedHandleTypes & 1);
+    // Generic compression is granted where the device has it (CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED)
+    // and quietly dropped where it does not: the handle then reports no compression, which is how a program
+    // such as CUDA Samples' cudaCompressibleMemory finds out.
+    const bool compressible =
+        prop->allocFlags.compressionType == kCompGeneric &&
+        extra_attribute(s.rt->device(device).profile(), vgpu::cuda::kGenericCompressionSupported) != 0;
+    *handle = s.rt->device(device).memory().create_handle(size, prop->requestedHandleTypes & 1, compressible);
     return CUDA_SUCCESS;
   });
 }
@@ -2031,6 +2038,7 @@ static CUresult cuMemGetAllocationPropertiesFromHandle_impl(CUmemAllocationProp*
       *prop = CUmemAllocationProp{};
       prop->type = CU_MEM_ALLOCATION_TYPE_PINNED;
       prop->requestedHandleTypes = s.rt->device(d).memory().handle_types(handle);
+      prop->allocFlags.compressionType = s.rt->device(d).memory().handle_compressible(handle) ? kCompGeneric : 0;
       prop->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
       prop->location.id = d;
       return CUDA_SUCCESS;
