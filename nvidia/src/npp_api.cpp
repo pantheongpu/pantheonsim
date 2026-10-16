@@ -1037,7 +1037,7 @@ template <class T> void store_signal(T* d, const std::vector<T>& h) {
     auto a = fetch_signal(s1, n);                                                        \
     auto b = fetch_signal(s2, n);                                                        \
     std::vector<Npp32f> o(n);                                                            \
-    for (size_t i = 0; i < n; ++i) {                                                     \
+    for (size_t i = 0; i < static_cast<size_t>(n); ++i) {                                \
       const double x = a[i], y = b[i];                                                   \
       o[i] = static_cast<Npp32f>(EXPR);                                                  \
     }                                                                                    \
@@ -1058,7 +1058,7 @@ VGPU_NPPS_BIN(Div, x == 0.0 ? 0.0 : y / x)
     if (!s || !d) return NPP_NULL_POINTER_ERROR;                                         \
     auto a = fetch_signal(s, n);                                                         \
     std::vector<Npp32f> o(n);                                                            \
-    for (size_t i = 0; i < n; ++i) {                                                     \
+    for (size_t i = 0; i < static_cast<size_t>(n); ++i) {                                \
       const double x = a[i], k = v;                                                      \
       o[i] = static_cast<Npp32f>(EXPR);                                                  \
     }                                                                                    \
@@ -1078,7 +1078,7 @@ VGPU_NPPS_CONST(DivC, k == 0.0 ? 0.0 : x / k)
     if (!s || !d) return NPP_NULL_POINTER_ERROR;                                         \
     auto a = fetch_signal(s, n);                                                         \
     std::vector<Npp32f> o(n);                                                            \
-    for (size_t i = 0; i < n; ++i) {                                                     \
+    for (size_t i = 0; i < static_cast<size_t>(n); ++i) {                                \
       const double x = a[i];                                                             \
       o[i] = static_cast<Npp32f>(EXPR);                                                  \
     }                                                                                    \

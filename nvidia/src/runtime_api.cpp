@@ -1742,7 +1742,7 @@ VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernel(const void* func, dim3 gridD
 // name with different types a conflict, which is exactly the check that caught
 // this.
 #if CUDART_VERSION < 13000
-static cudaError_t cudaLaunchCooperativeKernelMultiDevice_traced(struct cudaLaunchParams* p0, unsigned int p1, unsigned int p2) {
+static cudaError_t cudaLaunchCooperativeKernelMultiDevice_traced(struct cudaLaunchParams* /*p0*/, unsigned int /*p1*/, unsigned int /*p2*/) {
   return cudaErrorNotSupported;
 }
 

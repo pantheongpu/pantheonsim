@@ -372,6 +372,9 @@ VTEST(shared_memory_banks_are_four_bytes_wide) {
   VCHECK_EQ(cudaDeviceGetSharedMemConfig(nullptr), cudaErrorInvalidValue);
 }
 
+// The cudaThread* calls are deprecated; this is the test that they still answer.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 VTEST(the_cudaThread_calls_are_the_cudaDevice_calls) {
   VCHECK_EQ(cudaThreadSetLimit(cudaLimitMallocHeapSize, 32u << 20), cudaSuccess);
   size_t v = 0;
@@ -397,6 +400,7 @@ VTEST(zz_thread_exit_resets_the_device) {
   VCHECK_EQ(cudaThreadExit(), cudaSuccess);
   VCHECK_EQ(cudaFree(p), cudaErrorInvalidValue);   // the allocation went with the reset
 }
+#pragma GCC diagnostic pop
 #endif
 
 }  // namespace
