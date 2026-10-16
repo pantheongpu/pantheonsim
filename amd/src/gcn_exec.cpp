@@ -3149,20 +3149,22 @@ struct Machine {
   // and the rest of 565 to 603; CDNA5 ISA, V_CVT_SCALEF32_PK8_* and _PK16_*). The guides give where each source and result goes and leave the
   // helper functions (f32_to_fp8_scale ...) undefined. What fixes them:
   //  - The scale divides: the value converted is S / 2^(scale - 127), scale the exponent field of the scale operand (a float, or an inline
-  //    constant) -- Composable Kernel include/ck/utility/mxf8_utils.hpp, cvt_float_to_fp8_scaled ("cast_to_f8(f / scale, rng)" where the
-  //    device builtin __builtin_amdgcn_cvt_scalef32_pk_fp8_f32 is not used, and its comment "If fval / scale > max fp8, returns Nan"), and CK's
-  //    test/data_type/test_mx_fp8.cpp, which runs the same expectations on the host and on the device (gfx950): {-8, 4} with scale 2.0 gives
-  //    {-4, 2}; HIP's host reference (amd_hip_ocp_host.hpp, fcbx::from_float: "srcExp -= scale_exp") does the same.
+  //    constant) -- Composable Kernel (ROCm/composable_kernel 77f54d1) include/ck/utility/mxf8_utils.hpp:1049 and :1053, cvt_float_to_fp8_scaled
+  //    ("cast_to_f8(f / scale, rng)" where the device builtin __builtin_amdgcn_cvt_scalef32_pk_fp8_f32 is not used; :200 and :209 comment
+  //    "If fval / scale > max fp8, returns Nan" / "max bf8, returns Inf"), and CK's test/data_type/test_mx_fp8.cpp:109, which runs the same
+  //    expectations on the host and on the device (gfx950): {-8, 4} with scale 2.0 gives {-4, 2}; HIP's host reference (ROCm 7.2.3
+  //    amd_hip_ocp_host.hpp:619, fcbx::from_float: "srcExp -= scale_exp") does the same.
   //  - To 8-bit floats the overflow rule is the guide's table for V_CVT_PK_FP8_F32 (CDNA4 7.3: past the largest value, or an infinity, the
   //    NaN of E4M3 and the infinity of E5M2, or with MODE.FP16_OVFL the largest value; "Conversion to F4/F6 does not support FP16_OVFL, while
-  //    to F8 does"), applied to the scaled value: CK's device test expects NaN for infinity / 2, for 256 / 0.5 and for -256 / 0.5.
+  //    to F8 does"), applied to the scaled value: CK's device test expects NaN for infinity / 2, for 256 / 0.5 and for -256 / 0.5
+  //    (test_mx_fp8.cpp:152, :160, :167).
   //  - To 4- and 6-bit floats a value past the largest saturates, keeping its sign, and one under the least subnormal after rounding
   //    becomes a zero, keeping its sign (CDNA4 7.3: "clamped/saturated to the maximum FP4/FP6 magnitude, preserving the sign"; CK's
-  //    test_mx_fp4.cpp and test_mx_fp6.cpp: infinity, 256 / 0.5 and -256 / 0.5 give the largest and the lowest values).
+  //    test_mx_fp4.cpp:164-178 and test_mx_fp6.cpp:180-185: infinity, 256 / 0.5 and -256 / 0.5 give the largest and the lowest values).
   // Input modifiers, CLAMP and OMOD are refused (the guide says nothing of them for these; CK and HIP never set them), as are a scale of
   // 255 (E8M0's NaN: what the 4- and 6-bit results are is not said) and a NaN going into a 4- or 6-bit float, which has none: CK's tests
-  // give the largest value for it (on the device too), and AMD's own emulator tests (rocm-systems/emulation/rocjitsu hip_cvt_narrow_test.cpp,
-  // run against a gfx950) expect zero. A float denormal is kept (the guide says MODE decides; the other float conversions here keep them).
+  // give the largest value for it (test_mx_fp6.cpp:175 "NaN -> saturate to max"; test_mx_fp4.cpp:158, on the device too), and AMD's own
+  // emulator tests (ROCm/rocm-systems 6e6db17 emulation/rocjitsu/tests/hip_cvt_narrow_test.cpp:625, run against a gfx950) expect zero. A float denormal is kept (the guide says MODE decides; the other float conversions here keep them).
   // Left to the 8-bit rule as the existing V_CVT_PK_FP8_F32 has it: a value between the largest and halfway to the next step is a NaN
   // (the guide's "greater than max"), where HIP's host reference and rocjitsu round first and keep the largest value for it.
   // The stochastic forms are refused: see scalef32_sr_refused.
