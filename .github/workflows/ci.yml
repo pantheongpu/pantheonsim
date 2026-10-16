@@ -173,7 +173,7 @@ jobs:
     # BURST_MEM_LIMIT_GIB and BURST_JOBS_MAX (for a job outside a container).
     # All are empty, meaning no cap, until set; tests/lint/check_burst_cap.py
     # keeps every job on BURST_RUNS_ON passing them on.
-    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON(vars.CONTAINER_RUNS_ON || vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: ${{ inputs.cutlass_sass && 330 || 60 }}
     # The cuda13.0 toolchain image (.github/ci-image), or, when there is none,
     # the runner itself with the install step below.
@@ -599,7 +599,7 @@ jobs:
     # started while the pull request backlog is long and terminated when it is
     # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
     # the pool, and it runs in the toolchain image there as it does here.
-    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON(vars.CONTAINER_RUNS_ON || vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image
@@ -671,7 +671,7 @@ jobs:
     # started while the pull request backlog is long and terminated when it is
     # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
     # the pool, and it runs in the toolchain image there as it does here.
-    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON(vars.CONTAINER_RUNS_ON || vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image

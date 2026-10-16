@@ -49,7 +49,7 @@ workflow).
 
 ## Adding a job
 
-A job that runs on pull requests and is heavy (on `BURST_RUNS_ON`, `ML_RUNS_ON`,
+A job that runs on pull requests and is heavy (on `BURST_RUNS_ON`, `CONTAINER_RUNS_ON`, `ML_RUNS_ON`,
 `SIM_RUNS_ON` or a self-hosted runner, or with a timeout of 20 minutes or more)
 needs the guard as the step after `actions/checkout`, and the permissions it
 uses:
