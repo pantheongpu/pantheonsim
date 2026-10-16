@@ -700,6 +700,15 @@ VTEST(what_the_guides_leave_open_is_still_refused_by_name) {
   const amd::CodeObject o = object("asm_cdna_refused", "gfx950");
   VCHECK_CONTAINS(launch_error(o, "m0_high_buffer_lds"), "M0[17:0]");
   VCHECK_CONTAINS(launch_error(o, "b6_transpose"), "DS opcode 0xe1 is not decoded yet");   // ds_read_b96_tr_b6
+  // The stochastic-rounding conversions add the seed to the bits the narrowing drops; the CDNA4 guide's pseudocode for V_CVT_SR_FP8_F32
+  // takes S1[31:12] and its prose the low bits, and AMD's software (hip_fp8.h, Composable Kernel) and emulator (rocjitsu) differ the same way.
+  for (const char* name : {"sr_fp8_f32", "sr_bf8_f16", "sr_pk_fp4_f32", "sr_pk32_bf6_bf16", "cvt_sr_f16_f32", "cvt_sr_bf16_f32"})
+    VCHECK_CONTAINS(launch_error(o, name), "disagree on which bits of the seed");
+  // And the corners of the scaled narrowing conversions the sources disagree on.
+  VCHECK_CONTAINS(launch_error(o, "nan_into_fp4"), "with a NaN: fp4 has none");
+  VCHECK_CONTAINS(launch_error(o, "nan_into_fp6"), "with a NaN: fp6 has none");
+  VCHECK_CONTAINS(launch_error(o, "scale_255"), "with a scale of 255");
+  VCHECK_CONTAINS(launch_error(o, "narrow_modifier"), "input modifier");
 }
 
 VTEST_MAIN

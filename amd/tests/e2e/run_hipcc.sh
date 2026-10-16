@@ -210,6 +210,16 @@ for t in mfma_modes gfx9_added gfx9_semantics gfx9_decode; do
   done
 done
 
+# gfx950's scaled narrowing conversions (hipcc/scalef32_narrow.cpp): fp8, bf8, fp4, fp6 and bf6 from f32, f16 and bf16, the pair, byte and
+# 32-value layouts, v_cvt_scalef32_f16_fp8 / _bf8's half choice, each against HIP's host reference (fcbx) over a sweep and against the cases
+# Composable Kernel's tests run on the device (the scale divides; overflow to NaN, infinity or the largest value as the format has it).
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi350x LD_LIBRARY_PATH="$shim" timeout 600 "$(dirname "$exe")/scalef32_narrow.gfx950" 2>&1)
+status=$?
+echo "$out" | grep -v ': 0 of ' | sed 's/^/      /'
+expect "the gfx950 narrowing conversion program runs to the end" "0" "$status"
+expect "every scaled narrowing conversion is what HIP's host reference and CK's tests say" "scalef32_narrow: 0 failed" "$(grep -E '^scalef32_narrow: [0-9]+ failed' <<< "$out")"
+expect "all 33 of its checks ran" "33" "$(grep -c ' of [0-9]* wrong$' <<< "$out")"
+
 # MODE's floating-point modes (hipcc/numerics.cpp): what a kernel's
 # descriptor starts it with -- denormals kept by default, single-precision
 # ones flushed when built with -fgpu-flush-denormals-to-zero -- and each
@@ -444,6 +454,15 @@ out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(di
 status=$?
 expect "the gfx1250 arithmetic program runs to the end" "0" "$status"
 expect "every gfx1250 arithmetic check holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
+
+# gfx1250's scaled narrowing conversions (hipcc/scalef32_narrow1250.cpp): 8 values to fp8, bf8 or fp4 and 16 to fp6 or bf6, from f32, f16 and
+# bf16, each against HIP's host reference (fcbx) over a sweep.
+out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/scalef32_narrow1250.gfx1250" 2>&1)
+status=$?
+echo "$out" | grep -v ': 0 of ' | sed 's/^/      /'
+expect "the gfx1250 narrowing conversion program runs to the end" "0" "$status"
+expect "every gfx1250 scaled narrowing conversion is what HIP's host reference says" "scalef32_narrow1250: 0 failed" "$(grep -E '^scalef32_narrow1250: [0-9]+ failed' <<< "$out")"
+expect "all 15 of its checks ran" "15" "$(grep -c ' of [0-9]* wrong$' <<< "$out")"
 
 # gfx1250's vector registers past v255 (hipcc/vgprs1250.cpp): s_set_vgpr_msb, and 600 values live at once.
 out=$(VGPU_QUIET=1 VGPU_GPU=amd/mi455x LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/vgprs1250.gfx1250" 2>&1)

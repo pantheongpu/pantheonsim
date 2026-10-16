@@ -775,7 +775,7 @@ struct Machine {
   // or with saturate the largest value. An infinity becomes the NaN, but
   // stays one in E5M2.
   // With `ovfl` (gfx1250's MODE.FP16_OVFL), the largest value stands in for every overflow and for an infinity, in both formats.
-  static uint32_t float_to_f8(float x, const F8& t, bool saturate, const uint32_t* random, bool ovfl = false) {
+  static uint32_t float_to_f8(double x, const F8& t, bool saturate, const uint32_t* random, bool ovfl = false) {
     const uint32_t sign_bit = 1u << (t.bits - 1), sign = std::signbit(x) ? sign_bit : 0;
     const uint32_t top = sign_bit - 1;                                // the largest magnitude's code
     const uint32_t nan = t.style == F8::Fnuz ? sign_bit : sign | 0x7F;
@@ -3145,6 +3145,103 @@ struct Machine {
 
   // The integer, 16-bit, half-precision and double instructions PyTorch's
   // libraries use beside the ones above. Returns whether `op` was one.
+  // gfx950's and gfx1250's conversions of floats to 4-, 6- and 8-bit ones with a scale, rounded to nearest even (CDNA4 ISA, V_CVT_SCALEF32_PK_FP8_F32
+  // and the rest of 565 to 603; CDNA5 ISA, V_CVT_SCALEF32_PK8_* and _PK16_*). The guides give where each source and result goes and leave the
+  // helper functions (f32_to_fp8_scale ...) undefined. What fixes them:
+  //  - The scale divides: the value converted is S / 2^(scale - 127), scale the exponent field of the scale operand (a float, or an inline
+  //    constant) -- Composable Kernel include/ck/utility/mxf8_utils.hpp, cvt_float_to_fp8_scaled ("cast_to_f8(f / scale, rng)" where the
+  //    device builtin __builtin_amdgcn_cvt_scalef32_pk_fp8_f32 is not used, and its comment "If fval / scale > max fp8, returns Nan"), and CK's
+  //    test/data_type/test_mx_fp8.cpp, which runs the same expectations on the host and on the device (gfx950): {-8, 4} with scale 2.0 gives
+  //    {-4, 2}; HIP's host reference (amd_hip_ocp_host.hpp, fcbx::from_float: "srcExp -= scale_exp") does the same.
+  //  - To 8-bit floats the overflow rule is the guide's table for V_CVT_PK_FP8_F32 (CDNA4 7.3: past the largest value, or an infinity, the
+  //    NaN of E4M3 and the infinity of E5M2, or with MODE.FP16_OVFL the largest value; "Conversion to F4/F6 does not support FP16_OVFL, while
+  //    to F8 does"), applied to the scaled value: CK's device test expects NaN for infinity / 2, for 256 / 0.5 and for -256 / 0.5.
+  //  - To 4- and 6-bit floats a value past the largest saturates, keeping its sign, and one under the least subnormal after rounding
+  //    becomes a zero, keeping its sign (CDNA4 7.3: "clamped/saturated to the maximum FP4/FP6 magnitude, preserving the sign"; CK's
+  //    test_mx_fp4.cpp and test_mx_fp6.cpp: infinity, 256 / 0.5 and -256 / 0.5 give the largest and the lowest values).
+  // Input modifiers, CLAMP and OMOD are refused (the guide says nothing of them for these; CK and HIP never set them), as are a scale of
+  // 255 (E8M0's NaN: what the 4- and 6-bit results are is not said) and a NaN going into a 4- or 6-bit float, which has none: CK's tests
+  // give the largest value for it (on the device too), and AMD's own emulator tests (rocm-systems/emulation/rocjitsu hip_cvt_narrow_test.cpp,
+  // run against a gfx950) expect zero. A float denormal is kept (the guide says MODE decides; the other float conversions here keep them).
+  // Left to the 8-bit rule as the existing V_CVT_PK_FP8_F32 has it: a value between the largest and halfway to the next step is a NaN
+  // (the guide's "greater than max"), where HIP's host reference and rocjitsu round first and keep the largest value for it.
+  // The stochastic forms are refused: see scalef32_sr_refused.
+  bool scalef32_narrow(Wave& w, const Inst& in) {
+    const std::string& name = in.name;
+    std::vector<std::string> tok;
+    for (size_t at = 15; at <= name.size();) {
+      const size_t us = name.find('_', at);
+      tok.push_back(name.substr(at, us == std::string::npos ? std::string::npos : us - at));
+      if (us == std::string::npos) break;
+      at = us + 1;
+    }
+    if (tok.size() < 2) return false;
+    const std::string& from = tok.back();
+    if (from != "f32" && from != "f16" && from != "bf16") return false;
+    const std::string& to = tok[tok.size() - 2];
+    const F8* fmt = to == "fp8" ? &fp8() : to == "bf8" ? &bf8() : to == "fp4" ? &kFp4 : to == "fp6" ? &kFp6 : to == "bf6" ? &kBf6 : nullptr;
+    if (!fmt) return false;
+    const size_t first = tok[0] == "sr" ? 1 : 0;
+    if (first) scalef32_sr_refused(in);
+    const std::string pack = tok.size() - first == 3 ? tok[first] : std::string();
+    const uint32_t n = pack == "" ? 1 : pack == "pk" ? 2 : pack == "pk8" ? 8 : pack == "pk16" ? 16 : 32;   // (pk32, 2xpk16: 32)
+    const uint32_t bits = static_cast<uint32_t>(fmt->bits), from_bits = from == "f32" ? 32 : 16;
+    // Where the sources are: gfx950's pk_*_f32 take two floats in two registers and its 2xpk16 forms two arrays of sixteen (whose
+    // elements the result interleaves); every other form one source holding its n elements, 32 or 16 bits each. The scale follows them.
+    const bool two_ops = pack == "2xpk16" || (pack == "pk" && from == "f32");
+    const size_t scale_at = two_ops ? 2 : 1;
+    if (in.src.size() <= scale_at) return false;
+    for (size_t k = 0; k <= scale_at; ++k)
+      if (in.src[k].neg || in.src[k].abs)
+        throw Error::make(Err::Unsupported, name, " with an input modifier: the guide does not say what they do to the scaled narrowing conversions");
+    if (in.clamp || in.omod)
+      throw Error::make(Err::Unsupported, name, " with clamp or omod: the guide does not say what they do to the scaled narrowing conversions");
+    const bool ovfl = fp16_ovfl(w, in);
+    const uint32_t regs = (n * bits + 31) / 32;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (!(w.exec >> lane & 1)) continue;
+      const uint32_t e = (lane_src(w, in.src[scale_at], lane) >> 23) & 0xFF;
+      if (e == 0xFF)
+        throw Error::make(Err::Unsupported, name, " with a scale of 255, E8M0's NaN: the guide does not say what a narrowing gives");
+      uint32_t out[6] = {};
+      for (uint32_t i = 0; i < n; ++i) {
+        const auto source = [&](const Operand& o, uint32_t reg) { return reg == 0 && o.kind != OperandKind::Vgpr ? lane_src(w, o, lane) : word(w, o, reg, lane); };
+        double x;
+        if (from_bits == 32) {
+          const uint32_t b = pack == "pk" ? source(in.src[i], 0) : pack == "2xpk16" ? source(in.src[i & 1], i >> 1) : source(in.src[0], i);
+          x = static_cast<double>(as_float(b));
+        } else {
+          const uint32_t b = (source(in.src[0], i / 2) >> (16 * (i % 2))) & 0xFFFF;
+          x = from == "f16" ? static_cast<double>(as_half(static_cast<uint16_t>(b))) : static_cast<double>(as_float(b << 16));
+        }
+        if (std::isnan(x) && !(fmt->bits == 8))
+          throw Error::make(Err::Unsupported, name, " with a NaN: ", to, " has none, and the public references disagree on what it becomes");
+        const uint32_t code = float_to_f8(std::isfinite(x) ? std::ldexp(x, 127 - static_cast<int>(e)) : x, *fmt, false, nullptr, ovfl && bits == 8);
+        for (uint32_t b = 0; b < bits; ++b) {
+          const uint32_t at = i * bits + b;
+          out[at / 32] |= (code >> b & 1) << (at % 32);
+        }
+      }
+      if (n == 2 && (bits == 8 || bits == 4)) {   // gfx950's pairs: into the half (OPSEL[3]) or the byte (OPSEL[3:2]) named, the rest kept
+        const uint32_t shift = bits == 8 ? 16 * ((in.op_sel >> 3) & 1) : 8 * ((in.op_sel >> 2) & 3), width = bits == 8 ? 0xFFFFu : 0xFFu;
+        write_lane(w, in.dst[0], lane, (w.vgpr[in.dst[0].index][lane] & ~(width << shift)) | (out[0] & width) << shift);
+      } else {
+        for (uint32_t r = 0; r < regs; ++r) set_word(w, in.dst[0], r, lane, out[r]);
+      }
+    }
+    return true;
+  }
+  // The stochastic-rounding conversions of 4-, 6- and 8-bit floats and of halves (V_CVT_SCALEF32_SR_*, V_CVT_SR_F16_F32, V_CVT_SR_BF16_F32), which add
+  // the random seed to the bits the narrowing drops and cut them off: which bits of the seed those are is what the public sources do not agree
+  // on. CDNA3 and CDNA4's V_CVT_SR_FP8_F32 pseudocode adds S1[31:12] (the seed's top 20 bits; S1[31:11] for BF8) to the mantissa, and its prose
+  // says the MSBs of the second source's mantissa are not used (the low bits); AMD's software for the same instruction (hip_fp8.h cast_to_f8,
+  // Composable Kernel f8_utils.hpp) adds the low bits (rng & drop_mask), where HIP's newer host reference (amd_hip_ocp_host.hpp from_float_sr)
+  // and AMD's emulator (rocjitsu util::f32_to_fp8_e4m3_sr, "seed >> 12") add the top ones; the guide leaves f32_to_f16_sr and the others
+  // undefined. (The existing V_CVT_SR_FP8_F32 keeps the software's low bits, which the hipcc fp8 test compares with HIP's header.)
+  [[noreturn]] static void scalef32_sr_refused(const Inst& in) {
+    throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented: it adds a random seed to the bits the narrowing drops, and the guide and AMD's "
+                                              "own software disagree on which bits of the seed those are");
+  }
   // The instructions of gfx90a that gfx9_added_alu runs, which the CDNA2 guide defines (12.8, 12.9, 12.11: "D.f16 = sin(S0.f16 * 2 * PI)",
   // the cube-map pseudocode, "4-bit signed int to 32-bit float", "D.i = (int)floor(S0.f + 0.5)", "Fused half precision multiply add",
   // the frexp pseudocode, "D.f16 = S0.f16 * (2 ** S1.i16)", V_MAD_LEGACY_I16, the packed fused multiply-add, "D.u32 = {16'b0, sat8(...)}").
@@ -3204,6 +3301,26 @@ struct Machine {
       renamed.name = canon;
       renamed.asm_name = in.name;   // (the "legacy" spelling: those forms zero the high half of the destination, Narrowed)
       vector_alu(w, renamed);
+      return true;
+    }
+    if (name == "v_cvt_scalef32_f16_fp8" || name == "v_cvt_scalef32_f16_bf8") {
+      // One 8-bit float widened to a half and scaled (CDNA4 guide, V_CVT_SCALEF32_F16_FP8: "scale = exponent(S1.f32); srcbyte = OPSEL[1:0] * 8;
+      // tmp = fp8_to_f16_scale(src, scale.u8); // OPSEL[3] controls destination hi/lo; D0 = tmp.b32" -- the pseudocode stops there). The
+      // half goes to the half OPSEL[3] names and the other half is kept: the builtin takes the old destination as its first argument
+      // (clang's BuiltinsAMDGPU.td: `_ExtVector<2, _Float16>(_ExtVector<2, _Float16>, int, float, _Constant int, _Constant bool)`, "byte_sel" and
+      // "dst_lo_hi_sel"; LLVM's VOP3_CVT_SCALE_F1632_FP8BF8_TiedInput_Profile ties vdst_in), and Composable Kernel's cast_to_f16_from_f8_scaled
+      // (mxf8_utils.hpp) reads the low half of its result. The value is the widening of the other forms (exact, times 2^(scale - 127), rounded
+      // once to a half).
+      const F8& t = name == "v_cvt_scalef32_f16_fp8" ? kOcpFp8 : kOcpBf8;
+      const uint32_t src_shift = 8 * (in.op_sel & 3), dst_shift = 16 * ((in.op_sel >> 3) & 1);
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        if (!(w.exec >> lane & 1)) continue;
+        const uint32_t e = (lane_src(w, in.src[1], lane) >> 23) & 0xFF;
+        const float v = f8_to_float((lane_src(w, in.src[0], lane) >> src_shift) & 0xFF, t);
+        const double scaled = e == 0xFF || std::isnan(v) ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(static_cast<double>(v), static_cast<int>(e) - 127);
+        const uint32_t half = as_bits(static_cast<_Float16>(static_cast<float>(scaled))) & 0xFFFFu;
+        write_lane(w, in.dst[0], lane, (w.vgpr[in.dst[0].index][lane] & ~(0xFFFFu << dst_shift)) | half << dst_shift);
+      }
       return true;
     }
     if (name.rfind("v_cvt_scalef32_", 0) == 0) {
@@ -3846,6 +3963,9 @@ struct Machine {
       vector_alu(w, x);
       return;
     }
+    if ((in.arch == gcn::Target::Gfx950 || in.arch == gcn::Target::Gfx1250) && in.name.rfind("v_cvt_scalef32_", 0) == 0 && scalef32_narrow(w, in))
+      return;
+    if (in.arch == gcn::Target::Gfx950 && (in.name == "v_cvt_sr_f16_f32" || in.name == "v_cvt_sr_bf16_f32")) scalef32_sr_refused(in);
     Narrowed narrowed(*this, in);
     // gfx950 has the IEEE three-way minimum and maximum (CDNA4 ISA, V_MINIMUM3_F32, V_MAXIMUM3_F32, V_PK_MINIMUM3_F16,
     // V_PK_MAXIMUM3_F16), which gfx1250 has the same way ("IEEE minimum()/maximum()", a signaling NaN propagated).
@@ -7700,7 +7820,11 @@ struct Machine {
       if (type == 'f') return static_cast<double>(as_float(reg(o, e, lane)));
       if (type == 'F') {
         // XF32: "32-bit floats but the mantissa truncated to 10 bits (not including the leading 1)"
-        // (the MI300 ISA guide, V_MFMA_F32_16X16X8_XF32), denormals kept. Infinities and NaNs stay.
+        // (the MI300 ISA guide, V_MFMA_F32_16X16X8_XF32; its 7.1 says "round the mantissa to 10 bits" once), denormals kept.
+        // Infinities and NaNs stay. Truncation is also what hipBLASLt's golden reference for its xf32 kernels does
+        // (tensilelite/include/Tensile/DataTypes_XFloat32.hpp: "truncate lower 13 bits of IEEE float to convert to XFloat32",
+        // `u.p &= 0xFFFFE000`; client/cpu_gemm_driver.cpp: "XFloat32 ... truncates float operands to a 10-bit mantissa"); the
+        // round-to-nearest-even xfloat32 of rocBLAS and rocWMMA (rocblas_xfloat32.h) is the host type a program converts with.
         uint32_t bits = reg(o, e, lane);
         if ((bits & 0x7F800000u) != 0x7F800000u) bits &= ~0x1FFFu;
         return static_cast<double>(as_float(bits));

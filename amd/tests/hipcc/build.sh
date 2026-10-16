@@ -115,6 +115,10 @@ for t in mfma_modes gfx9_added gfx9_semantics gfx9_decode; do
   "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations -DVGPU_GFX950 --offload-arch=gfx950 $t.cpp -o $t.gfx950
 done
 echo "wrote $(pwd)/{mfma_modes,gfx9_added,gfx9_semantics,gfx9_decode}.{gfx942,gfx950}"
+# gfx950's scaled narrowing conversions (v_cvt_scalef32_pk_fp8_f32 ... _pk32_bf6_bf16) and the single-half widening ones, called through the
+# builtins Composable Kernel and HIP use, against HIP's host reference (<hip/hip_ext_ocp.h>) and Composable Kernel's own expectations.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx950 scalef32_narrow.cpp -o scalef32_narrow.gfx950
+echo "wrote $(pwd)/scalef32_narrow.gfx950"
 # MODE's round and denormal modes: as hipcc builds by default, and built to
 # flush single-precision denormals.
 "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 numerics.cpp -o numerics.gfx942
@@ -209,7 +213,7 @@ echo "wrote $(pwd)/workgroup.gfx1031 (ROCm 7.2, like memtest.gfx1031)"
 
 # The same programs for gfx1250 (CDNA 5, MI455X; wave32), which the runner executes on a simulated MI455X. Built
 # by ROCm 7.2's hipcc, which knows gfx1250; no card has run them.
-for src in atomics memory graphs cooperative streams smid errors pointers runtime gfx1250 wmma1250 trload1250 async1250 permlane1250 barrier1250 alu1250 vgprs1250 block1250 tensor1250 ds1250 forms1250; do
+for src in atomics memory graphs cooperative streams smid errors pointers runtime gfx1250 wmma1250 trload1250 async1250 permlane1250 barrier1250 alu1250 vgprs1250 block1250 tensor1250 ds1250 forms1250 scalef32_narrow1250; do
   "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx1250 $src.cpp -o $src.gfx1250
   echo "wrote $(pwd)/$src.gfx1250"
 done

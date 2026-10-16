@@ -1858,3 +1858,45 @@ D1EC001C 042A1308	v_mad_legacy_i16 v28, v8, v9, v10
 783A1308	v_pk_fmac_f16_e32 v29, v8, v9
 7E3C9F0B	v_sat_pk_u8_i16_e32 v30, v11
 7E209304	v_sin_f16_e32 v16, v4
+# The narrowing conversions of 4-, 6- and 8-bit floats with a scale (V_CVT_SCALEF32_*, rounded to nearest even, and the stochastic forms the executor refuses),
+# V_CVT_SCALEF32_F16_FP8/_BF8 and V_CVT_SR_F16_F32/_BF16_F32, as LLVM's assembler writes them (op_sel in both its spellings).
+D2350001 04120702	v_cvt_scalef32_pk_fp8_f32 v1, v2, v3, v4
+D2354001 04120702	v_cvt_scalef32_pk_fp8_f32 v1, v2, v3, v4 op_sel:[0,0,0,1]
+D2360001 04120702	v_cvt_scalef32_pk_bf8_f32 v1, v2, v3, v4
+D2364001 03D20702	v_cvt_scalef32_pk_bf8_f32 v1, v2, v3, 2.0 op_sel:[0,0,0,1]
+D2370001 04120702	v_cvt_scalef32_sr_fp8_f32 v1, v2, v3, v4
+D2386001 04120702	v_cvt_scalef32_sr_bf8_f32 v1, v2, v3, v4 op_sel:[0,0,1,1]
+D23D0001 04120702	v_cvt_scalef32_pk_fp4_f32 v1, v2, v3, v4
+D23D2001 04120702	v_cvt_scalef32_pk_fp4_f32 v1, v2, v3, v4 op_sel:[0,0,1,0]
+D23E0001 04160902	v_cvt_scalef32_sr_pk_fp4_f32 v1, v[2:3], v4, v5
+D2400001 00020702	v_cvt_scalef32_pk_fp8_f16 v1, v2, v3
+D2404001 00020702	v_cvt_scalef32_pk_fp8_f16 v1, v2, v3 op_sel:[0,0,1]
+D2410001 0001E502	v_cvt_scalef32_pk_bf8_f16 v1, v2, 1.0
+D2420001 04120702	v_cvt_scalef32_sr_fp8_f16 v1, v2, v3, v4
+D2430001 04120702	v_cvt_scalef32_sr_bf8_f16 v1, v2, v3, v4
+D2440001 00020702	v_cvt_scalef32_pk_fp8_bf16 v1, v2, v3
+D2454001 00020702	v_cvt_scalef32_pk_bf8_bf16 v1, v2, v3 op_sel:[0,0,1]
+D2460001 04120702	v_cvt_scalef32_sr_fp8_bf16 v1, v2, v3, v4
+D2470001 04120702	v_cvt_scalef32_sr_bf8_bf16 v1, v2, v3, v4
+D24A0001 00020702	v_cvt_scalef32_f16_fp8 v1, v2, v3
+D24A4801 00020702	v_cvt_scalef32_f16_fp8 v1, v2, v3 op_sel:[1,0,1]
+D24B1001 00020702	v_cvt_scalef32_f16_bf8 v1, v2, v3 op_sel:[0,1,0]
+D24B5801 00020702	v_cvt_scalef32_f16_bf8 v1, v2, v3 op_sel:[1,1,1]
+D24C0001 00020702	v_cvt_scalef32_pk_fp4_f16 v1, v2, v3
+D24D6001 00020702	v_cvt_scalef32_pk_fp4_bf16 v1, v2, v3 op_sel:[0,0,1,1]
+D24E0001 04120702	v_cvt_scalef32_sr_pk_fp4_f16 v1, v2, v3, v4
+D24F0001 04120702	v_cvt_scalef32_sr_pk_fp4_bf16 v1, v2, v3, v4
+D2520000 04A23108	v_cvt_scalef32_2xpk16_fp6_f32 v[0:5], v[8:23], v[24:39], v40
+D2530000 03CA3108	v_cvt_scalef32_2xpk16_bf6_f32 v[0:5], v[8:23], v[24:39], 1.0
+D2540000 04A65108	v_cvt_scalef32_sr_pk32_fp6_f32 v[0:5], v[8:39], v40, v41
+D2550000 04A65108	v_cvt_scalef32_sr_pk32_bf6_f32 v[0:5], v[8:39], v40, v41
+D2580000 00023108	v_cvt_scalef32_pk32_fp6_f16 v[0:5], v[8:23], v24
+D2590000 00023108	v_cvt_scalef32_pk32_fp6_bf16 v[0:5], v[8:23], v24
+D25A0000 00023108	v_cvt_scalef32_pk32_bf6_f16 v[0:5], v[8:23], v24
+D25B0000 00023108	v_cvt_scalef32_pk32_bf6_bf16 v[0:5], v[8:23], v24
+D25C0000 04663108	v_cvt_scalef32_sr_pk32_fp6_f16 v[0:5], v[8:23], v24, v25
+D25D0000 04663108	v_cvt_scalef32_sr_pk32_fp6_bf16 v[0:5], v[8:23], v24, v25
+D25E0000 04663108	v_cvt_scalef32_sr_pk32_bf6_f16 v[0:5], v[8:23], v24, v25
+D25F0000 04663108	v_cvt_scalef32_sr_pk32_bf6_bf16 v[0:5], v[8:23], v24, v25
+D2A60001 00020702	v_cvt_sr_f16_f32 v1, v2, v3
+D2A70001 00020702	v_cvt_sr_bf16_f32 v1, v2, v3

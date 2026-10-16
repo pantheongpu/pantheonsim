@@ -721,8 +721,7 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x1c2}, {"v_mad_i32_i24", 1, 3}},
       {{Enc::Vop3, 0x1f0}, {"v_cvt_pkaccum_u8_f32", 1, 2}},   // (the destination is the third source)
       // gfx950's conversions of 4-, 6- and 8-bit floats to wider ones, scaled by the exponent field of the second source (a float, or an inline
-      // constant) -- CDNA4 guide, V_CVT_SCALEF32_*. (The narrowing forms, and the single-half forms 586 and 587 whose destination half the
-      // guide does not settle, are not decoded.)
+      // constant) -- CDNA4 guide, V_CVT_SCALEF32_*. The narrowing ones follow below, and the single-half ones (586, 587).
       {{Enc::Vop3, 0x239}, {"v_cvt_scalef32_pk_f32_fp8", 2, 2}},
       {{Enc::Vop3, 0x23a}, {"v_cvt_scalef32_pk_f32_bf8", 2, 2}},
       {{Enc::Vop3, 0x23b}, {"v_cvt_scalef32_f32_fp8", 1, 2}},
@@ -740,6 +739,41 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x263}, {"v_cvt_scalef32_pk32_bf16_bf6", 16, 2, 6}},
       {{Enc::Vop3, 0x269}, {"v_cvt_scalef32_pk_bf16_fp8", 1, 2}},
       {{Enc::Vop3, 0x26a}, {"v_cvt_scalef32_pk_bf16_bf8", 1, 2}},
+      // gfx950's narrowing conversions, rounded to nearest even (opcodes 565 to 603 of the CDNA4 guide), and their stochastic forms, which are
+      // decoded and printed and refused when run. The scale operand follows the data: the third source for the float forms of two values
+      // (and the 2xpk16 ones, whose data is two arrays of sixteen floats), the second for the half and bfloat16 ones.
+      {{Enc::Vop3, 0x235}, {"v_cvt_scalef32_pk_fp8_f32", 1, 3}},
+      {{Enc::Vop3, 0x236}, {"v_cvt_scalef32_pk_bf8_f32", 1, 3}},
+      {{Enc::Vop3, 0x237}, {"v_cvt_scalef32_sr_fp8_f32", 1, 3}},
+      {{Enc::Vop3, 0x238}, {"v_cvt_scalef32_sr_bf8_f32", 1, 3}},
+      {{Enc::Vop3, 0x23d}, {"v_cvt_scalef32_pk_fp4_f32", 1, 3}},
+      {{Enc::Vop3, 0x23e}, {"v_cvt_scalef32_sr_pk_fp4_f32", 1, 3, 2}},
+      {{Enc::Vop3, 0x240}, {"v_cvt_scalef32_pk_fp8_f16", 1, 2}},
+      {{Enc::Vop3, 0x241}, {"v_cvt_scalef32_pk_bf8_f16", 1, 2}},
+      {{Enc::Vop3, 0x242}, {"v_cvt_scalef32_sr_fp8_f16", 1, 3}},
+      {{Enc::Vop3, 0x243}, {"v_cvt_scalef32_sr_bf8_f16", 1, 3}},
+      {{Enc::Vop3, 0x244}, {"v_cvt_scalef32_pk_fp8_bf16", 1, 2}},
+      {{Enc::Vop3, 0x245}, {"v_cvt_scalef32_pk_bf8_bf16", 1, 2}},
+      {{Enc::Vop3, 0x246}, {"v_cvt_scalef32_sr_fp8_bf16", 1, 3}},
+      {{Enc::Vop3, 0x247}, {"v_cvt_scalef32_sr_bf8_bf16", 1, 3}},
+      {{Enc::Vop3, 0x24a}, {"v_cvt_scalef32_f16_fp8", 1, 2}},
+      {{Enc::Vop3, 0x24b}, {"v_cvt_scalef32_f16_bf8", 1, 2}},
+      {{Enc::Vop3, 0x24c}, {"v_cvt_scalef32_pk_fp4_f16", 1, 2}},
+      {{Enc::Vop3, 0x24d}, {"v_cvt_scalef32_pk_fp4_bf16", 1, 2}},
+      {{Enc::Vop3, 0x24e}, {"v_cvt_scalef32_sr_pk_fp4_f16", 1, 3}},
+      {{Enc::Vop3, 0x24f}, {"v_cvt_scalef32_sr_pk_fp4_bf16", 1, 3}},
+      {{Enc::Vop3, 0x252}, {"v_cvt_scalef32_2xpk16_fp6_f32", 6, 3, 16, 16, 1}},
+      {{Enc::Vop3, 0x253}, {"v_cvt_scalef32_2xpk16_bf6_f32", 6, 3, 16, 16, 1}},
+      {{Enc::Vop3, 0x254}, {"v_cvt_scalef32_sr_pk32_fp6_f32", 6, 3, 32}},
+      {{Enc::Vop3, 0x255}, {"v_cvt_scalef32_sr_pk32_bf6_f32", 6, 3, 32}},
+      {{Enc::Vop3, 0x258}, {"v_cvt_scalef32_pk32_fp6_f16", 6, 2, 16}},
+      {{Enc::Vop3, 0x259}, {"v_cvt_scalef32_pk32_fp6_bf16", 6, 2, 16}},
+      {{Enc::Vop3, 0x25a}, {"v_cvt_scalef32_pk32_bf6_f16", 6, 2, 16}},
+      {{Enc::Vop3, 0x25b}, {"v_cvt_scalef32_pk32_bf6_bf16", 6, 2, 16}},
+      {{Enc::Vop3, 0x25c}, {"v_cvt_scalef32_sr_pk32_fp6_f16", 6, 3, 16}},
+      {{Enc::Vop3, 0x25d}, {"v_cvt_scalef32_sr_pk32_fp6_bf16", 6, 3, 16}},
+      {{Enc::Vop3, 0x25e}, {"v_cvt_scalef32_sr_pk32_bf6_f16", 6, 3, 16}},
+      {{Enc::Vop3, 0x25f}, {"v_cvt_scalef32_sr_pk32_bf6_bf16", 6, 3, 16}},
       {{Enc::Vop3, 0x265}, {"v_ashr_pk_i8_i32", 1, 3}},
       {{Enc::Vop3, 0x266}, {"v_ashr_pk_u8_i32", 1, 3}},
       {{Enc::Vop3, 0x2a8}, {"v_minimum3_f32", 1, 3}},
@@ -869,6 +903,9 @@ const std::map<std::pair<Enc, uint32_t>, Shape>& table() {
       {{Enc::Vop3, 0x2a3}, {"v_cvt_pk_bf8_f32", 1, 2}},
       {{Enc::Vop3, 0x2a4}, {"v_cvt_sr_fp8_f32", 1, 2}},
       {{Enc::Vop3, 0x2a5}, {"v_cvt_sr_bf8_f32", 1, 2}},
+      // gfx950's float to half and bfloat16 narrowing by stochastic rounding (decoded, refused when run).
+      {{Enc::Vop3, 0x2a6}, {"v_cvt_sr_f16_f32", 1, 2}},
+      {{Enc::Vop3, 0x2a7}, {"v_cvt_sr_bf16_f32", 1, 2}},
       // DS: LDS reads and writes. A read takes the address; a write takes the
       // address and the data.
       {{Enc::Ds, 0x00}, {"ds_add_u32", 0, 2}},
@@ -2482,10 +2519,10 @@ std::string to_text(const Inst& i) {
     s += t;
   }
   if (i.enc == Enc::Vop3 && i.op_sel) {
-    // A source's bit each, then the destination's (bit 3); the stochastic
-    // conversions print bit 2 in a place of its own, though they have two
-    // sources.
-    const bool byte = i.name.find("_sr_") != std::string::npos;
+    // A source's bit each, then the destination's (bit 3); the conversions of two sources that name a byte of the destination (the
+    // stochastic ones, and gfx950's pairs of floats narrowed to fp4) print bit 2 in a place of its own.
+    const bool byte = i.src.size() == 2 &&
+                      (i.name.find("_sr_") != std::string::npos || i.name.rfind("v_cvt_scalef32_pk_fp4_", 0) == 0);
     std::string out = " op_sel:[";
     for (uint32_t k = 0; k < i.src.size() + (byte ? 1 : 0); ++k) out += std::to_string((i.op_sel >> k) & 1) + ",";
     s += out + std::to_string((i.op_sel >> 3) & 1) + "]";
