@@ -488,15 +488,14 @@ Agents build_agents() {
     rocprofiler_agent_v0_t g{};
     g.size = sizeof g;
     g.type = ROCPROFILER_AGENT_TYPE_GPU;
-    // Four SIMDs to a compute unit is CDNA's (the CDNA3 ISA guide). On RDNA
-    // HIP's "compute unit" is a workgroup processor of two compute units with
-    // two SIMDs each, which is what KFD, and so a profiler, counts: an RX 6800
-    // is 30 for HIP and 60 here, with 120 SIMDs either way, and 32 waves to a
-    // compute unit (rocprofv3 on an RX 6800 and an RX 6700 XT, ROCm 7.2).
-    // The agent is the card as KFD describes it: its own target, whatever HSA_OVERRIDE_GFX_VERSION
-    // makes the runtime report (an RX 6700 XT run as gfx1030 is still a gfx1031 agent).
+    // The agent is the card as KFD describes it: its own target, whatever HSA_OVERRIDE_GFX_VERSION makes
+    // the runtime report (an RX 6700 XT run as gfx1030 is still a gfx1031 agent).
     const std::string gfx = d.hardware_gfx && *d.hardware_gfx ? d.hardware_gfx : d.gfx;
     const bool rdna = gfx_target_version(gfx) >= kRdnaFirst;
+    // Four SIMDs to a compute unit is CDNA's (the CDNA3 ISA guide). On RDNA HIP's "compute unit" is a
+    // workgroup processor of two compute units with two SIMDs each, which is what KFD, and so a profiler,
+    // counts: an RX 6800 is 30 for HIP and 60 here, with 120 SIMDs either way, and 32 waves to a compute
+    // unit (rocprofv3 on an RX 6800 and an RX 6700 XT, ROCm 7.2).
     g.cu_count = rdna ? d.compute_units * 2 : d.compute_units;
     g.simd_per_cu = rdna ? 2 : 4;
     g.simd_count = g.cu_count * g.simd_per_cu;
@@ -980,9 +979,12 @@ void on_copied(hp::Copy kind, int src_device, int dst_device, uint64_t bytes, ui
   // report). Measured with rocprofv3 on an RX 6800 and an RX 6700 XT, ROCm 7.2: 16384 bytes is a kernel,
   // 16388 is a DMA copy, in every combination of pageable, pinned, blocking and asynchronous. Nothing is
   // known of the Instinct parts, which keep a record for every copy.
-  if (const rocprofiler_agent_v0_t* dev = agent(s, gpu_agent(s, kind == hp::Copy::HostToDevice ? dst_device : src_device).handle);
+  if (const rocprofiler_agent_v0_t* dev =
+          agent(s, gpu_agent(s, kind == hp::Copy::HostToDevice ? dst_device : src_device).handle);
       dev && dev->gfx_target_version >= kRdnaFirst) {
-    if (bytes <= kBlitCopyBytes || kind == hp::Copy::HostToHost || (kind == hp::Copy::DeviceToDevice && src_device == dst_device))
+    const bool host_and_device = kind == hp::Copy::HostToDevice || kind == hp::Copy::DeviceToHost;
+    if ((host_and_device && bytes <= kBlitCopyBytes) || kind == hp::Copy::HostToHost ||
+        (kind == hp::Copy::DeviceToDevice && src_device == dst_device))
       return;
   }
   const int op = static_cast<int>(kind);
