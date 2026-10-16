@@ -68,14 +68,25 @@ compute_120 only, so its kernels run on `nvidia/rtx5090`
 ([pytorch.md](pytorch.md)); on older profiles they do not.
 
 `torch.profiler` (Kineto) works. `nvidia/tests/pytorch/profiler_check.py` runs
-a small workload (random matrices, a product, a reduction, pinned and pageable
-copies) under the profiler and prints the names of the kernels, copies, fills
-and runtime calls it collected, so a run against NVIDIA's libcupti and a run
-against this one can be compared line by line. It was run both ways on an RTX
-3060 (torch 2.10 with CUDA 13): the kernel, copy and runtime-call name sets are
-the same except for what is listed below, and the result of the workload
-differs in its last float digit (NVIDIA's product sums in another order).
-It needs PyTorch, so it is not part of CI.
+a small workload (random matrices, a product, a reduction, a fill, pinned and
+pageable copies, a copy within the device) under the profiler and compares the
+names of the kernels, copies (with their memory kinds), fills, runtime and
+driver calls and ranges it collected with the lists NVIDIA's libcupti gave on
+an RTX 3060 (torch 2.10 with CUDA 13), committed as
+`nvidia/tests/data/pytorch_profiler.card.txt`. Names only: times are time spent
+simulating, ids and addresses differ by run. It is the ctest
+`e2e_pytorch_profiler` (through `nvidia/tests/e2e/run_pytorch.sh`, so it
+skips where no Python with PyTorch for CUDA 13 is installed), which runs with
+the other PyTorch tests in the ml job. The workload's result must also match
+the CPU's on the same inputs to 1e-4 (PyTorch's random numbers depend on the
+GPU, so not the card's number).
+
+The one difference the check allows is the cuBLAS kernel (below); the script
+lists it, with the reason, in `LIBRARY_ONLY`, and no copy, fill or runtime call
+of the workload came from inside a library on the card. On a real GPU,
+`profiler_check.py --card` runs the same check against NVIDIA's libcupti,
+`--print` prints the collected names, and `--write <file>` regenerates the
+committed lists (do that, on a card, when a PyTorch upgrade renames a kernel).
 
 What Kineto needed, found by tracing the calls it makes:
 

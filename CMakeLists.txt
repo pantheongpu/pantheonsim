@@ -3506,6 +3506,18 @@ if(TARGET vgpucudart)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     RUN_SERIAL TRUE
     TIMEOUT 1800)
+  # torch.profiler (Kineto) over the simulator's CUPTI (nvidia/tests/pytorch/profiler_check.py):
+  # the kernel, copy, fill, runtime-call and range names it collects for a small program equal
+  # NVIDIA's libcupti's on an RTX 3060 (nvidia/tests/data/pytorch_profiler.card.txt), bar the
+  # cuBLAS kernel, which the script lists as an allowed difference. 8 checks.
+  add_test(NAME e2e_pytorch_profiler COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/profiler_check.py 8 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_profiler PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas;vgpucupti"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_E2E_DATA=${CMAKE_SOURCE_DIR}/nvidia/tests/data"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
   # The PyTorch sweep (nvidia/tests/pytorch/sweep.py): nn layers and losses forward
   # and backward, optimizers, torch.linalg / fft / sparse, AMP, CUDA graphs,
   # torch.compile, every SDPA backend forced in turn, two devices in one process,
