@@ -198,8 +198,14 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
 
   // Code: every .text section, placed in the code window; each is decoded
   // when it first runs (Code::instr). The cubin's sections outlive them.
+  // A device function the device link cloned (one copy per kernel that calls it, each with the constants
+  // of its own kernel) has the same section name in every copy, so a symbol is placed by its section's
+  // index, never by the name.
+  constexpr size_t kNone = static_cast<size_t>(-1);
+  std::vector<size_t> code_of(c.sections.size(), kNone);
   uint64_t code_va = kCodeBase;
-  for (const CubinSection& s : c.sections) {
+  for (size_t si = 0; si < c.sections.size(); ++si) {
+    const CubinSection& s = c.sections[si];
     if (s.name.rfind(".text.", 0) != 0) continue;
     Code code;
     code.section = s.name;
@@ -209,7 +215,8 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
     code.bytes = &s.bytes;
     const size_t n = code.count;
     code_va += (16 * n + 0xff) & ~uint64_t{0xff};
-    m->code_index[s.name] = m->code.size();
+    if (!m->code_index.count(s.name)) m->code_index[s.name] = m->code.size();   // the first copy, for the name
+    code_of[si] = m->code.size();
     m->code.push_back(std::move(code));
   }
   m->index_code();
@@ -277,10 +284,10 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
         bool builtin = false;
         for (const auto& [addr, b] : m->builtins) builtin = builtin || (sym.function && b == name);
         if (!builtin && !sym.section.empty()) {
-          if (const auto code = m->code_index.find(sym.section); code != m->code_index.end()) {
+          if (sym.section_idx != kNone && code_of[sym.section_idx] != kNone) {
             *in_code = true;
             *code_off = sym.value;
-            return m->code[code->second].base + sym.value;
+            return m->code[code_of[sym.section_idx]].base + sym.value;
           }
           if (const auto sec = section_va.find(sym.section); sec != section_va.end()) return sec->second + sym.value;
         }
@@ -290,10 +297,10 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
         if (b == name) return addr;
       for (const CubinSymbol& sym : c.symbols) {
         if (sym.name != name || sym.section.empty()) continue;
-        if (const auto code = m->code_index.find(sym.section); code != m->code_index.end()) {
+        if (sym.section_idx != kNone && code_of[sym.section_idx] != kNone) {
           *in_code = true;
           *code_off = sym.value;
-          return m->code[code->second].base + sym.value;
+          return m->code[code_of[sym.section_idx]].base + sym.value;
         }
         if (const auto sec = section_va.find(sym.section); sec != section_va.end()) return sec->second + sym.value;
       }

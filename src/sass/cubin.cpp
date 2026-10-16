@@ -192,7 +192,10 @@ Cubin parse_cubin(const uint8_t* data, size_t size) {
       s.function = (info & 0xf) == 2;
       s.global = (info >> 4) == 1;
       s.managed = (other & 4) != 0;
-      if (shndx != 0 && shndx < shnum) s.section = names[shndx];
+      if (shndx != 0 && shndx < shnum) {
+        s.section = names[shndx];
+        if (as_section[shndx] >= 0) s.section_idx = static_cast<size_t>(as_section[shndx]);
+      }
       sym_names.push_back(s.name);
       c.symbols.push_back(std::move(s));
     }
