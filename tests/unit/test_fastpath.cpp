@@ -326,7 +326,10 @@ VTEST(fast_address_arithmetic_matches_the_general_path) {
 // NaN and infinity -- in f16 and bf16, all four layout pairings, and with the
 // result written over the accumulator it read.
 namespace {
-std::vector<uint32_t> run_wmma(const std::string& shape, bool alias, const std::vector<uint32_t>& frag) {
+// (`gpu`: an sm_86 profile runs wmma through the card-measured tensor-core model (tc_ampere.hpp), the others through the f32 tile
+// -- wmma_tile -- so a test of the tile names another one.)
+std::vector<uint32_t> run_wmma(const std::string& shape, bool alias, const std::vector<uint32_t>& frag,
+                               const char* gpu = "nvidia/a10") {
   std::string dregs = alias ? "%c0, %c1, %c2, %c3, %c4, %c5, %c6, %c7"
                             : "%x0, %x1, %x2, %x3, %x4, %x5, %x6, %x7";
   std::string loads, stores;
@@ -356,7 +359,7 @@ std::vector<uint32_t> run_wmma(const std::string& shape, bool alias, const std::
 )" + loads + "    wmma.mma.sync.aligned." + shape + " {" + dregs + "}, " + areg + ", " + breg +
                           ", {%c0, %c1, %c2, %c3, %c4, %c5, %c6, %c7};\n" + stores + "    ret;\n}\n";
   MemoryManager mem{1 << 20};
-  DeviceProfile prof = load_gpu("nvidia/a10");
+  DeviceProfile prof = load_gpu(gpu);
   auto m = ptx::parse(ptx);
   const uint64_t in = mem.alloc(frag.size() * 4), out = mem.alloc(32 * 32);
   mem.write(in, frag.data(), frag.size() * 4);
@@ -413,6 +416,7 @@ VTEST(wmma_f32_accumulator_nans_are_the_canonical_one) {
   const uint16_t hbf[] = {0x7FC0, 0xFFC1, 0x7F80, 0xFF80, 0x3F80, 0x0000, 0x8000, 0x7F81, 0x3EAB, 0xBF80, 0x7FFF, 0x4049};
   const uint32_t cn[] = {0x7FC00000u, 0xFFC00000u, 0x7F800001u, 0xFFFFFFFFu, 0x7FC12345u, 0xFFA00000u, 0x3F800000u, 0x80000000u};
   int checked = 0;
+  for (const char* gpu : {"nvidia/a10", "nvidia/a100"})   // the tensor-core model, and the tile
   for (bool bf : {false, true})
     for (const char* shape : {".m16n16k16", ".m32n8k16"}) {
       const bool wide = std::string(shape) == ".m32n8k16";
@@ -435,7 +439,7 @@ VTEST(wmma_f32_accumulator_nans_are_the_canonical_one) {
           const std::string sh = std::string(lay) + shape + ".f32" + (bf ? ".bf16.bf16" : ".f32");
           if (bf && wide) continue;   // (bf16 has only m16n16k16 here)
           setenv("VGPU_FASTPATH", fp, 1);
-          const auto d = run_wmma(sh, false, frag);
+          const auto d = run_wmma(sh, false, frag, gpu);
           unsetenv("VGPU_FASTPATH");
           int nans = 0;
           for (size_t i = 0; i < d.size(); ++i)
@@ -443,7 +447,7 @@ VTEST(wmma_f32_accumulator_nans_are_the_canonical_one) {
               ++nans;
               if (d[i] != 0x7FFFFFFFu) {
                 char buf[160];
-                std::snprintf(buf, sizeof buf, "wmma %s (VGPU_FASTPATH=%s): word %zu is the NaN 0x%08x, not 0x7fffffff", sh.c_str(), fp, i, d[i]);
+                std::snprintf(buf, sizeof buf, "wmma %s on %s (VGPU_FASTPATH=%s): word %zu is the NaN 0x%08x, not 0x7fffffff", sh.c_str(), gpu, fp, i, d[i]);
                 throw vtest::Failure(buf);
               }
             }
@@ -451,9 +455,10 @@ VTEST(wmma_f32_accumulator_nans_are_the_canonical_one) {
           ++checked;
         }
     }
-  VCHECK_EQ(checked, 12);
+  VCHECK_EQ(checked, 24);
   // One NaN alone in a clean tile, in the left eight columns of its row and in the right eight (lane 0 and lane 1 of the C
   // fragment, register 0: elements 0 and 8): it comes out canonical, and nothing else in the tile is a NaN.
+  for (const char* gpu : {"nvidia/a10", "nvidia/a100"})
   for (uint32_t lane_with_nan : {0u, 1u, 30u, 31u})
     for (uint32_t pattern : {0xFFFFFFFFu, 0xFFC12345u, 0x7F800001u}) {
       std::vector<uint32_t> frag;
@@ -464,7 +469,7 @@ VTEST(wmma_f32_accumulator_nans_are_the_canonical_one) {
       }
       for (const char* fp : {"1", "0"}) {
         setenv("VGPU_FASTPATH", fp, 1);
-        const auto d = run_wmma("row.row.m16n16k16.f32.f32", false, frag);
+        const auto d = run_wmma("row.row.m16n16k16.f32.f32", false, frag, gpu);
         unsetenv("VGPU_FASTPATH");
         for (size_t i = 0; i < d.size(); ++i) {
           const bool want_nan = i == lane_with_nan * 8;

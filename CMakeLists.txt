@@ -230,6 +230,13 @@ add_library(vgpu STATIC
   src/runtime/visible_devices.cpp
   nvidia/src/device_attributes.cpp
 )
+# The PTX interpreter's AVX2 tile (wmma_tile_avx2) is a target("avx2") function beside a baseline copy, and a 32-byte vector passed
+# between a function of one target and a function of the other goes in a register on one side and in memory on the other, so the
+# callee reads what happens to be on the stack. Optimised builds inline the helpers and do not notice; an -O0 (sanitizer) build does,
+# and it passed on one CPU and failed on another (round 8's canonical NaN). GCC says so with -Wpsabi: make it an error here.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "-Werror=psabi")
+endif()
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
 # With LTO on, every executable that links this archive re-optimises all of it

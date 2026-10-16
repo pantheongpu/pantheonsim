@@ -1170,29 +1170,29 @@ typedef int32_t WmmaBits8 __attribute__((vector_size(32)));
 // result rows as it writes them (one add each; a NaN anywhere makes the sum a NaN, and a sum that is not one holds
 // none) and only a tile whose sum is a NaN -- which an infinity minus an infinity also makes: then nothing changes --
 // is gone over again, a compare and a select on the bits.
-static inline WmmaRow8 wmma_canon_nan(WmmaRow8 v) {
+// (Everything here takes and gives pointers, never a 32-byte vector by value: the tile below is compiled twice, once for the
+// baseline and once with target("avx2"), and a vector passed between a function of one target and a function of the other is
+// passed in different places -- in a ymm register by the AVX function and in memory by the baseline one (GCC's -Wpsabi
+// "changes the ABI"). Optimised, the helpers are inlined and nothing is passed; at -O0, as in the AddressSanitizer Debug build,
+// nothing is inlined and the callee read whatever was on the stack. Round 8's version did that and passed on one CPU and
+// failed on another by luck of the stack.)
+__attribute__((noinline)) static void wmma_canon_row(float* p) {
+  WmmaRow8 v;
   WmmaBits8 b;
-  std::memcpy(&b, &v, sizeof b);
+  std::memcpy(&v, p, sizeof v);
+  std::memcpy(&b, p, sizeof b);
   const WmmaBits8 nan = v != v;   // all ones where the lane is a NaN
   const WmmaBits8 canon = {0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF};
   b = nan ? canon : b;
-  std::memcpy(&v, &b, sizeof v);
-  return v;
+  std::memcpy(p, &b, sizeof b);
 }
-static inline void wmma_canon_tile(float (&D)[16][16], WmmaRow8 sum) {
-  alignas(32) float s[8];
-  std::memcpy(s, &sum, sizeof sum);
+__attribute__((noinline)) static void wmma_canon_tile(float (&D)[16][16], const float* sum8) {
   bool any = false;
-  for (int l = 0; l < 8; ++l) any |= s[l] != s[l];
+  for (int l = 0; l < 8; ++l) any |= sum8[l] != sum8[l];
   if (!any) return;
   for (uint32_t i = 0; i < 16; ++i) {
-    WmmaRow8 lo, hi;
-    std::memcpy(&lo, &D[i][0], sizeof lo);
-    std::memcpy(&hi, &D[i][8], sizeof hi);
-    lo = wmma_canon_nan(lo);
-    hi = wmma_canon_nan(hi);
-    std::memcpy(&D[i][0], &lo, sizeof lo);
-    std::memcpy(&D[i][8], &hi, sizeof hi);
+    wmma_canon_row(&D[i][0]);
+    wmma_canon_row(&D[i][8]);
   }
 }
 #define VGPU_WMMA_TILE_BODY                                          \
@@ -1216,7 +1216,11 @@ static inline void wmma_canon_tile(float (&D)[16][16], WmmaRow8 sum) {
     std::memcpy(&D[i][0], &lo, sizeof lo);                           \
     std::memcpy(&D[i][8], &hi, sizeof hi);                           \
   }                                                                  \
-  wmma_canon_tile(D, chk);
+  {                                                                  \
+    alignas(32) float chk8[8];                                       \
+    std::memcpy(chk8, &chk, sizeof chk);                             \
+    wmma_canon_tile(D, chk8);                                        \
+  }
 void wmma_tile_base(float (&D)[16][16], const float (&A)[16][16], const float (&B)[16][16],
                     const float (&C)[16][16], uint32_t K) {
   VGPU_WMMA_TILE_BODY
