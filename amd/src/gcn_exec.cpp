@@ -26,6 +26,7 @@
 #include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
+#include "vgpu/exec/lockstep.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
 
@@ -8158,6 +8159,86 @@ void run_clusters(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group
   }
 }
 
+// ---- kernels whose work-groups wait on one another (vgpu/exec/lockstep.hpp) ----------------------
+//
+// The test the SASS and PTX engines make (src/sass/exec.cpp, kernel_polls), on the kernel's machine
+// code: a backward branch whose loop has a global, flat or buffer load with cache-control bits set
+// (glc, sc0, sc1, nt, scope: what a volatile or atomic load is compiled to) or an atomic that returns
+// the old value, whose address and operands are the same on every turn of the loop, and no store to
+// global memory and no call. Assumed, not stated by the ISA guides: that a compiler marks the loads of
+// a polling loop with cache bits and returns the atomic's result; a loop it writes otherwise runs
+// as before.
+bool is_mem_name(std::string_view n) {
+  for (const char* p : {"global_", "flat_", "buffer_", "scratch_", "ds_", "s_load", "s_buffer_load", "s_memtime", "s_memrealtime",
+                        "s_getreg", "image_", "tbuffer_"})
+    if (n.rfind(p, 0) == 0) return true;
+  return false;
+}
+
+bool amd_loop_polls(const std::vector<const Inst*>& body) {
+  enum : uint8_t { Undef, Fixed, Variable };
+  constexpr unsigned kRegs = 1024;
+  uint8_t state[2][kRegs] = {};
+  bool set_in_loop[2][kRegs] = {};
+  const auto touch = [](const gcn::Operand& o, const auto& f) {
+    const int file = o.kind == gcn::OperandKind::Sgpr ? 0 : o.kind == gcn::OperandKind::Vgpr ? 1 : -1;
+    if (file < 0) return;
+    for (uint32_t i = 0; i < std::max<uint32_t>(1, o.width) && o.index + i < kRegs; ++i) f(file, o.index + i);
+  };
+  const auto is_variable = [&](int file, uint32_t r) {
+    return state[file][r] == Undef ? set_in_loop[file][r] : state[file][r] == Variable;
+  };
+  for (const Inst* in : body)
+    for (const gcn::Operand& d : in->dst) touch(d, [&](int f, uint32_t r) { set_in_loop[f][r] = true; });
+  bool polls = false;
+  for (const Inst* in : body) {
+    const std::string_view n = in->name;
+    const bool atomic = n.find("atomic") != std::string_view::npos && is_mem_name(n);
+    if (n.rfind("s_swappc", 0) == 0 || n.rfind("s_setpc", 0) == 0 || n.rfind("s_call", 0) == 0) return false;
+    if (n.find("store") != std::string_view::npos && n.rfind("scratch_", 0) != 0 && n.rfind("ds_", 0) != 0 && is_mem_name(n))
+      return false;   // the loop writes global memory
+    if (atomic && in->dst.empty()) return false;   // an atomic with no result is a store
+    bool var_src = in->has_saddr && (is_variable(0, in->saddr) || is_variable(0, in->saddr + 1));
+    for (const gcn::Operand& s : in->src) touch(s, [&](int f, uint32_t r) { var_src = var_src || is_variable(f, r); });
+    const bool load = n.find("load") != std::string_view::npos && is_mem_name(n) && n.rfind("scratch_", 0) != 0 &&
+                      n.rfind("ds_", 0) != 0 && n.rfind("s_", 0) != 0;
+    const bool poll = (load && in->cache != 0) || (atomic && n.rfind("ds_", 0) != 0);
+    polls = polls || (poll && !var_src);
+    const uint8_t now = (is_mem_name(n) || var_src) ? Variable : Fixed;
+    for (const gcn::Operand& d : in->dst) touch(d, [&](int f, uint32_t r) { state[f][r] = now; });
+  }
+  return polls;
+}
+
+bool amd_kernel_polls(Machine& m) {
+  const Kernel& k = *m.d.kernel;
+  const int8_t cached = k.polls.v.load(std::memory_order_relaxed);
+  if (cached >= 0) return cached != 0;
+  bool found = false;
+  try {
+    std::vector<const Inst*> code;   // the kernel's instructions in address order
+    const uint64_t lo = m.d.code_base + k.entry, hi = lo + (k.size ? k.size : 4096);
+    for (uint64_t pc = lo; pc < hi;) {
+      const Inst& in = m.fetch(pc);
+      code.push_back(&in);
+      pc += std::max<uint32_t>(in.size, 4);
+    }
+    for (size_t i = 0; i < code.size() && !found; ++i) {
+      const Inst& br = *code[i];
+      if (br.name.rfind("s_branch", 0) != 0 && br.name.rfind("s_cbranch", 0) != 0) continue;
+      if (br.target > br.pc || br.pc - br.target > 4000) continue;
+      std::vector<const Inst*> body;
+      for (size_t j = 0; j <= i; ++j)
+        if (code[j]->pc >= br.target) body.push_back(code[j]);
+      found = amd_loop_polls(body);
+    }
+  } catch (const Error&) {
+    found = false;   // code this cannot read as a straight run (data among it, an instruction not known): as before
+  }
+  k.polls.v.store(found ? 1 : 0, std::memory_order_relaxed);
+  return found;
+}
+
 }  // namespace
 
 std::mutex& memory_atomic_lock(uint64_t addr) {
@@ -8275,7 +8356,71 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     if (packet) mem.free(packet);
     return total;
   }
+  // Work-groups that may wait on one another (vgpu/exec/lockstep.hpp): a kernel with a loop that polls
+  // global memory runs the groups the device holds at once together, taking turns.
+  bool lockstep = false;
+  uint64_t capacity = 0;
+  if (!d.cooperative && !debug::active() && !Machine::tracing()) {
+    const exec::LockstepMode mode = exec::lockstep_mode();
+    if (mode == exec::LockstepMode::All) {
+      lockstep = true;
+    } else if (mode == exec::LockstepMode::Auto && d.resident_groups) {
+      Machine probe(d, mem, *cache);
+      lockstep = amd_kernel_polls(probe);
+    }
+    capacity = d.resident_groups ? d.resident_groups : groups;
+  }
   const unsigned nthreads = d.cooperative ? 1 : worker_count(groups);
+  if (lockstep) {
+    const exec::LockstepShape shape = exec::lockstep_shape(groups, capacity, nthreads);
+    if (const char* lg = std::getenv("VGPU_SASS_LOG"); lg && lg[0] == '1')
+      std::fprintf(stderr, "[vgpu] lockstep: kernel %s, %llu work-groups, %u host thread(s) of %llu resident groups\n",
+                   k.name.c_str(), static_cast<unsigned long long>(groups), shape.workers,
+                   static_cast<unsigned long long>(shape.window));
+    std::vector<DispatchStats> per_thread(shape.workers);
+    std::atomic<uint64_t> ticket{0};
+    std::atomic<bool> failed{false};
+    std::mutex err_mu;
+    std::exception_ptr first_error;
+    const auto resident = [&](unsigned t) {
+      try {
+        struct Resident {
+          std::unique_ptr<Group> g;
+        };
+        Machine m(d, mem, *cache);
+        m.concurrent = shape.workers > 1;
+        exec::lockstep_worker<Resident>(
+            ticket, groups, shape.window,
+            [&](Resident& r, uint64_t i, size_t) {
+              r.g = std::make_unique<Group>();   // fresh each time: a group starts from nothing
+              uint32_t gx, gy, gz;
+              group_at(i, &gx, &gy, &gz);
+              set_up_group(*r.g, m, d, packet, group_segment, gx, gy, gz);
+            },
+            [&](Resident& r) { return run_round(m, *r.g, exec::kLockstepSlice); }, [&](Resident&) {},
+            [&] { return failed.load(std::memory_order_relaxed); });
+        per_thread[t] = m.stats;
+      } catch (...) {
+        failed = true;
+        std::lock_guard<std::mutex> lock(err_mu);
+        if (!first_error) first_error = std::current_exception();
+      }
+    };
+    if (shape.workers <= 1) {
+      resident(0);
+    } else {
+      std::vector<std::thread> pool;
+      for (unsigned t = 0; t < shape.workers; ++t) pool.emplace_back(resident, t);
+      for (std::thread& th : pool) th.join();
+    }
+    if (first_error) {
+      if (packet) mem.free(packet);
+      std::rethrow_exception(first_error);
+    }
+    for (const DispatchStats& p : per_thread) total.add(p);
+    if (packet) mem.free(packet);
+    return total;
+  }
   if (d.cooperative) {
     // A cooperative launch's work-groups may wait on one another (a grid
     // barrier), so every one is resident at once, as the runtime promised when

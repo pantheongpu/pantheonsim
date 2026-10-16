@@ -11,6 +11,7 @@
 // nothing here is taken from AMD's runtime.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -81,6 +82,18 @@ struct Kernel {
   // RDNA: the kernel runs 32 lanes to a wave (kernel code property bit 10,
   // ENABLE_WAVEFRONT_SIZE32), as HIP builds for those GPUs; CDNA is always 64.
   bool wave32 = false;
+  // Whether the kernel has a loop that polls global memory, so that its work-groups may wait on one
+  // another and a launch runs the resident ones together (vgpu/exec/lockstep.hpp): -1 not looked at yet,
+  // else 0 or 1. Found the first time it launches; copyable so that a Kernel still is.
+  struct PollsFlag {
+    mutable std::atomic<int8_t> v{-1};
+    PollsFlag() = default;
+    PollsFlag(const PollsFlag& o) : v(o.v.load()) {}
+    PollsFlag& operator=(const PollsFlag& o) {
+      v.store(o.v.load());
+      return *this;
+    }
+  } polls;
 };
 
 // A variable the kernels share: a __device__ global. It lives in the module's

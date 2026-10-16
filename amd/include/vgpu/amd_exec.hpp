@@ -78,6 +78,11 @@ struct Dispatch {
   // the kernel finds through its hidden_multigrid_sync_arg argument.
   bool cooperative = false;
   uint64_t grid_sync = 0;
+  // How many work-groups of this kernel the device holds at once (its compute units times what each
+  // holds: the figure hipOccupancyMaxActiveBlocksPerMultiprocessor gives), which the runtime fills in.
+  // A kernel with a loop that polls global memory runs that many of its work-groups together
+  // (vgpu/exec/lockstep.hpp). Zero: not known; the groups run as they did, one after another.
+  uint64_t resident_groups = 0;
   // How the device is laid out, which says where each work-group runs: what
   // the hardware registers a wave reads to learn that (HW_ID, HW_ID1 and
   // XCC_ID, which HIP's __smid reads) hold. Its compute dies, the shader

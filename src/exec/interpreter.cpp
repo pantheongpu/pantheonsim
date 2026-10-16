@@ -61,6 +61,8 @@
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/lockstep.hpp"
+#include "vgpu/ptx/regalloc.hpp"
 #include "vgpu/simd/simd.hpp"
 
 namespace vgpu::exec {
@@ -277,6 +279,7 @@ struct ChildRunner {
     cc.cluster = {0, 0, 0};
     cc.cooperative = false;
     cc.coop_workspace = 0;
+    cc.resident_blocks = 0;   // the parent's figure is for the parent's kernel
     add_stats(launch_grid(*c.kernel.fn, cc, args, mem, profile, c.kernel.symbols, progress, &out));
   }
 };
@@ -339,6 +342,9 @@ struct BlockCtx {
   // per block -- see the note at sreg_value() for why this is a counter and
   // not a time.
   uint64_t* clock = nullptr;
+  // Among the blocks a lockstep launch holds resident at once on this host thread: what makes %smid
+  // distinct for them (vgpu/exec/lockstep.hpp).
+  uint32_t slot = 0;
 };
 
 // One diverged execution path: a set of lanes sharing a program counter.
@@ -2469,6 +2475,93 @@ void sp24_pick(const double v[4], uint32_t sel, uint32_t pick[2]) {
   pick[1] = std::max(order[0], order[1]);
 }
 
+// ---- kernels whose blocks wait on one another (vgpu/exec/lockstep.hpp) ----------------------------
+//
+// The same test the SASS engine makes (src/sass/exec.cpp, kernel_polls), on the PTX: a loop with an
+// atomic that returns its old value, or a volatile, relaxed or acquire load, from global or generic
+// memory, whose address and operands are the same on every turn of the loop, and no store to global
+// memory in it. See there for what "the same on every turn" means; here a register is variable when
+// the loop sets it from what a load, atomic, shuffle, vote or clock returned, from a variable
+// register, or when it is read before the loop sets it and the loop does set it.
+bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
+  enum : uint8_t { Undef, Fixed, Variable };
+  std::vector<uint8_t> state;
+  std::vector<bool> set_in_loop;
+  const auto grow = [&](uint32_t k) {
+    if (k >= state.size()) {
+      state.resize(k + 1, Undef);
+      set_in_loop.resize(k + 1, false);
+    }
+  };
+  std::vector<uint32_t> defs, uses;
+  for (size_t i = first; i <= last; ++i) {
+    defs.clear();
+    uses.clear();
+    instr_registers(f.body[i], defs, uses);
+    for (uint32_t d : defs) {
+      grow(d);
+      set_in_loop[d] = true;
+    }
+  }
+  bool polls = false;
+  for (size_t i = first; i <= last; ++i) {
+    const Instr& ins = f.body[i];
+    defs.clear();
+    uses.clear();
+    instr_registers(ins, defs, uses);
+    bool var_src = false;
+    for (uint32_t u : uses) {
+      grow(u);
+      var_src = var_src || (state[u] == Undef ? set_in_loop[u] : state[u] == Variable);
+    }
+    bool generates = false, poll = false;
+    if (const auto* ld = std::get_if<OpLd>(&ins.op)) {
+      generates = true;
+      poll = ld->ordered && (ld->space == Space::Global || ld->space == Space::Generic);
+    } else if (const auto* at = std::get_if<OpAtom>(&ins.op)) {
+      generates = true;
+      if (at->space == Space::Global || at->space == Space::Generic) {
+        if (at->discards_result) return false;   // red: a store
+        poll = at->vec <= 1;
+      }
+    } else if (const auto* st = std::get_if<OpSt>(&ins.op)) {
+      if (st->space == Space::Global || st->space == Space::Generic) return false;
+    } else if (std::holds_alternative<OpCall>(ins.op) || std::holds_alternative<OpBulkCopy>(ins.op) ||
+               std::holds_alternative<OpStAsync>(ins.op) || std::holds_alternative<OpCpAsync>(ins.op)) {
+      return false;
+    } else if (std::holds_alternative<OpShfl>(ins.op) || std::holds_alternative<OpVote>(ins.op) ||
+               std::holds_alternative<OpMatch>(ins.op) || std::holds_alternative<OpRedux>(ins.op)) {
+      generates = true;
+    } else if (const auto* mv = std::get_if<OpMov>(&ins.op)) {
+      if (const auto* sr = std::get_if<SregOperand>(&mv->src))
+        generates = sr->reg == Sreg::Clock || sr->reg == Sreg::ClockHi || sr->reg == Sreg::Clock64 ||
+                    sr->reg == Sreg::GlobalTimer || sr->reg == Sreg::GlobalTimerLo || sr->reg == Sreg::GlobalTimerHi;
+    }
+    polls = polls || (poll && !var_src);
+    const uint8_t now = (generates || var_src) ? Variable : Fixed;
+    for (uint32_t d : defs) state[d] = now;
+  }
+  return polls;
+}
+
+bool ptx_kernel_polls(const EntryFn& fn) {
+  const int8_t cached = fn.polls.v.load(std::memory_order_relaxed);
+  if (cached >= 0) return cached != 0;
+  bool found = false;
+  const auto scan = [&](const EntryFn& f) {
+    for (size_t i = 0; i < f.body.size() && !found; ++i) {
+      const auto* br = std::get_if<OpBra>(&f.body[i].op);
+      if (!br || br->target > i || i - br->target > 400) continue;
+      found = ptx_loop_polls(f, br->target, i);
+    }
+  };
+  scan(fn);
+  for (const auto& g : fn.module_funcs)
+    if (g && !found) scan(*g);
+  fn.polls.v.store(found ? 1 : 0, std::memory_order_relaxed);
+  return found;
+}
+
 class Interpreter {
  public:
   Interpreter(const EntryFn& fn, const LaunchConfig& cfg, const ParamBuffer& params, MemoryManager& mem,
@@ -2510,6 +2603,7 @@ class Interpreter {
   }
 
   void set_concurrent(bool v) { concurrent_ = v; }
+  void set_lockstep(bool v) { lockstep_ = v; }
   // Which of the launch's host threads this is, for %smid.
   void set_worker(unsigned t) { worker_ = t; }
   void set_device_launches(DeviceLaunches* dl) { dl_ = dl; }
@@ -2658,6 +2752,42 @@ class Interpreter {
     }
   }
 
+  // One host thread's part of a lockstep launch (vgpu/exec/lockstep.hpp): up to `window` blocks of the
+  // grid resident, each given a short turn in order, the grid's next block taking the place of one
+  // that finishes. `worker` and the window number the blocks' SMs.
+  void run_lockstep(std::atomic<uint64_t>& ticket, uint64_t units, uint64_t window, unsigned worker,
+                    const std::atomic<bool>* failed) {
+    struct Resident {
+      std::unique_ptr<BlockState> b;
+      ClusterState solo;   // a block with no explicit cluster is a cluster of one
+      std::unique_ptr<Scheduler> sched;
+    };
+    lockstep_ = true;
+    const uint64_t gx = cfg_.grid[0], gy = cfg_.grid[1];
+    lockstep_worker<Resident>(
+        ticket, units, window,
+        [&](Resident& r, uint64_t i, size_t slot) {
+          r.b = std::make_unique<BlockState>();   // fresh each time: a block starts from nothing
+          BlockState& b = *r.b;
+          b.ctx.ctaid = {static_cast<uint32_t>(i % gx), static_cast<uint32_t>((i / gx) % gy),
+                         static_cast<uint32_t>(i / (gx * gy))};
+          b.ctx.ntid = cfg_.block;
+          b.ctx.nctaid = cfg_.grid;
+          b.ctx.cluster = cluster_shape();
+          b.ctx.explicit_cluster = has_explicit_cluster();
+          b.ctx.slot = static_cast<uint32_t>(uint64_t{worker} * window + slot);
+          setup_block(b);
+          r.solo = ClusterState{};
+          r.solo.blocks.push_back(&b.warps);
+          r.solo.ranks.push_back(&b.ctx);
+          b.ctx.cluster_state = &r.solo;
+          r.sched = make_scheduler(cfg_.scheduler, cfg_.scheduler_seed + i * 0x9E3779B97F4A7C15ull);
+        },
+        [&](Resident& r) { return !step_block(*r.b, *r.sched, kLockstepSlice); },
+        [&](Resident&) { ++stats_.blocks; },
+        [&] { return failed && failed->load(std::memory_order_relaxed); });
+  }
+
   // Runs the blocks with linear indices [first, last). CUDA blocks are
   // independent -- that is the programming model's central promise -- so a
   // range can run on its own thread with nothing shared but device memory.
@@ -2693,6 +2823,7 @@ class Interpreter {
   // cancellation there fails, as it does on a device with nothing pending.
   uint64_t clc_next_ = 0, clc_last_ = 0;
   bool clc_clusters_ = false;
+  bool lockstep_ = false;   // this interpreter holds several resident blocks of a lockstep launch
 
   std::optional<std::array<uint32_t, 3>> clc_take() {
     if (clc_next_ >= clc_last_) return std::nullopt;
@@ -4154,6 +4285,7 @@ class Interpreter {
                                 uint64_t{ctx.ctaid[2]} * ctx.nctaid[0] * ctx.nctaid[1];
         const uint64_t blocks = uint64_t{ctx.nctaid[0]} * ctx.nctaid[1] * ctx.nctaid[2];
         if (cfg_.cooperative || blocks <= sms) return static_cast<uint32_t>(linear % sms);
+        if (lockstep_) return ctx.slot % sms;
         const auto c = cluster_shape();
         const uint64_t size = uint64_t{c[0]} * c[1] * c[2];
         const uint64_t rank = ctx.explicit_cluster ? cluster_rank_of(ctx) : 0;
@@ -14698,6 +14830,50 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
     const unsigned cap = sms ? static_cast<unsigned>(std::max<uint64_t>(1, sms / csize)) : 1u;
     return std::min(worker_count(blocks), cap);
   }();
+
+  // Blocks that may wait on one another (vgpu/exec/lockstep.hpp): a kernel with a loop that polls global
+  // memory runs the blocks the device holds at once together, taking turns. Not under a non-default
+  // scheduler (it is the order the person asked to explore), with clusters (their blocks already take
+  // turns), nor in a cooperative launch (which does).
+  const bool no_clusters = eff.cluster[0] <= 1 && eff.cluster[1] <= 1 && eff.cluster[2] <= 1;
+  if (!eff.cooperative && !ordered && no_clusters) {
+    const LockstepMode mode = lockstep_mode();
+    std::set<const ptx::EntryFn*> seen;
+    if (mode == LockstepMode::All || (mode == LockstepMode::Auto && eff.resident_blocks && ptx_kernel_polls(fn))) {
+      // A kernel that can allocate while it runs keeps to one host thread (see below).
+      const unsigned threads = allocates_while_running(fn, seen) ? 1u : worker_count(blocks);
+      const LockstepShape shape = lockstep_shape(blocks, eff.resident_blocks ? eff.resident_blocks : blocks, threads);
+      if (std::getenv("VGPU_SASS_LOG") != nullptr && std::string(std::getenv("VGPU_SASS_LOG")) == "1")
+        std::fprintf(stderr, "[vgpu] lockstep: kernel %s, %llu blocks, %u host thread(s) of %llu resident blocks\n",
+                     fn.name.c_str(), static_cast<unsigned long long>(blocks), shape.workers,
+                     static_cast<unsigned long long>(shape.window));
+      std::vector<LaunchStats> per_thread(shape.workers);
+      std::atomic<uint64_t> ticket{0};
+      std::atomic<bool> failed{false};
+      std::mutex err_mu;
+      std::exception_ptr first_error;
+      const auto resident = [&](unsigned t) {
+        try {
+          Interpreter interp(fn, eff, pb, mem, profile, symbols, per_thread[t], t == 0 ? progress : ProgressFn{});
+          interp.set_concurrent(shape.workers > 1);
+          interp.set_worker(t);
+          interp.set_grid_id(grid_id);
+          interp.set_device_launches(dl);
+          interp.run_lockstep(ticket, blocks, shape.window, t, &failed);
+        } catch (...) {
+          failed.store(true, std::memory_order_relaxed);
+          std::lock_guard<std::mutex> lock(err_mu);
+          if (!first_error) first_error = std::current_exception();
+        }
+      };
+      if (shape.workers <= 1) resident(0);   // on the calling thread, as the one-thread path runs
+      else run_parallel(shape.workers, resident);
+      if (first_error) std::rethrow_exception(first_error);
+      LaunchStats total;
+      for (const auto& s : per_thread) total.add(s);
+      return total;
+    }
+  }
 
   if (nthreads <= 1) {
     LaunchStats stats;

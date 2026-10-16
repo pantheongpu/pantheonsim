@@ -87,6 +87,11 @@ struct LaunchConfig {
   // cg::this_grid().sync() reads it out of %envreg1/%envreg2 and traps when it
   // is null, so this is what makes the barrier reachable rather than a crash.
   uint64_t coop_workspace = 0;
+  // How many blocks of this kernel the device holds at once (the SMs times the blocks each holds, from
+  // the kernel's registers, shared memory and threads), which the runtime fills in for a launch it
+  // dispatches. A kernel whose blocks wait on one another runs that many of its blocks together
+  // (vgpu/exec/lockstep.hpp). Zero: not known, and blocks run one after another as before.
+  uint64_t resident_blocks = 0;
   // Size of the device heap malloc() and free() in a kernel draw from:
   // cudaLimitMallocHeapSize for the device, 8 MiB unless a program set it.
   uint64_t device_heap_bytes = 8ull << 20;

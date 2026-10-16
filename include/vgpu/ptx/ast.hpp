@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -1344,6 +1345,18 @@ struct EntryFn {
   // A kernel loaded from a cubin rather than PTX: its SASS, which the launch
   // runs instead of `body` (empty then). See nvidia/docs/sass.md.
   std::shared_ptr<const sass::Module> sass;
+  // Whether the kernel has a loop that polls global memory (vgpu/exec/lockstep.hpp): -1 not yet
+  // looked at, else 0 or 1. Memoized here, as the register analysis is, and copyable so that the
+  // function still is.
+  struct PollsFlag {
+    mutable std::atomic<int8_t> v{-1};
+    PollsFlag() = default;
+    PollsFlag(const PollsFlag& o) : v(o.v.load()) {}
+    PollsFlag& operator=(const PollsFlag& o) {
+      v.store(o.v.load());
+      return *this;
+    }
+  } polls;
 };
 
 // A module-scope .global/.const variable, materialized into device memory at
