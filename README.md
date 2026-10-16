@@ -135,6 +135,7 @@ Makefile variables are in [docs/config.md](docs/config.md).
 - [docs/status.md](docs/status.md): what works, what does not, and the supported GPUs.
 - [docs/machine-simulator.md](docs/machine-simulator.md): `make shell`, a whole simulated machine with `nvidia-smi` and `rocm-smi`.
 - [docs/driver-api.md](docs/driver-api.md), [docs/telemetry.md](docs/telemetry.md), [docs/registers.md](docs/registers.md), [docs/pantheon-workloads.md](docs/pantheon-workloads.md): the driver API, monitoring tools, device registers, stress workloads.
+- [docs/ci-merge-conflicts.md](docs/ci-merge-conflicts.md): why CI cancels the runs of a pull request that has a merge conflict, and what to do.
 - [nvidia/README.md](nvidia/README.md) and [amd/README.md](amd/README.md): the NVIDIA and AMD sides.
 - [ARCHITECTURE.md](ARCHITECTURE.md) is how it is built and [TODO.md](TODO.md) is what is open.
 

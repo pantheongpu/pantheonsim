@@ -34,8 +34,10 @@ jobs:
     name: PyTorch, rocBLAS and hipSPARSELt on simulated AMD GPUs
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       - name: Make room for the wheel
         # The runner's image keeps SDKs this job has no use for; the wheel
@@ -86,8 +88,10 @@ jobs:
     # runtime they load is the shim's.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       - name: Install toolchain
         run: |

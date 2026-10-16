@@ -58,8 +58,10 @@ jobs:
       options: --shm-size=2g
     env:
       NVCC_PREPEND_FLAGS: ''
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       - name: Install CUDA 13
         if: ${{ !job.container.id }}

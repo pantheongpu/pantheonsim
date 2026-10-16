@@ -54,8 +54,10 @@ jobs:
     # Not in the toolchain image (.github/ci-image) like the other jobs: its
     # session tests (vgpu shell) need the user namespaces and mounts that an
     # unprivileged container refuses, so it keeps the runner and apt.
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       - name: Install toolchain
         if: runner.environment == 'github-hosted'
@@ -116,10 +118,12 @@ jobs:
         password: ${{ github.token }}
       # The IPC tests need more than Docker's 64 MB of /dev/shm.
       options: --shm-size=2g
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
         with:
           path: pantheonsim
+      - uses: ./pantheonsim/.github/actions/pr-guard
 
       # The workloads are the real coverage: unmodified GPU diagnostics, built
       # by their own Makefile, running end to end against the simulator.
@@ -177,8 +181,10 @@ jobs:
       options: --shm-size=2g
     env:
       NVCC_PREPEND_FLAGS: ''
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       # This job needs a lot of memory, and on a shared runner another job may
       # hold most of it. Fail here, alone, if this one cannot fit, rather than
@@ -259,8 +265,10 @@ jobs:
       # Pulled before the test (and cached), so a registry 503 is retried
       # rather than failing the job; the cache key names the model.
       VGPU_OLLAMA_MODEL: smollm2:135m
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       # This job needs a lot of memory, and on a shared runner another job may
       # hold most of it. Fail here, alone, if this one cannot fit, rather than
@@ -349,8 +357,10 @@ jobs:
       # Pulled before the test (and cached), so a registry 503 is retried
       # rather than failing the job; the cache key names the model.
       VGPU_OLLAMA_MODEL: smollm2:135m
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       # This job needs a lot of memory, and on a shared runner another job may
       # hold most of it. Fail here, alone, if this one cannot fit, rather than
@@ -421,8 +431,10 @@ jobs:
         password: ${{ github.token }}
       # The IPC tests need more than Docker's 64 MB of /dev/shm.
       options: --shm-size=2g
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       # The checkout belongs to the runner's user and the job runs as root in
       # the container: trust this one repository, or git refuses it (tests ask
@@ -485,8 +497,10 @@ jobs:
     if: vars.ML_RUNS_ON != ''
     runs-on: ${{ fromJSON(vars.ML_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: 240
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       - name: Build
         run: |
@@ -588,8 +602,10 @@ jobs:
       # TSan's setarch -R needs personality() (seccomp), LeakSanitizer
       # ptrace; the IPC tests more than Docker's 64 MB of /dev/shm.
       options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       # This job needs a lot of memory, and on a shared runner another job may
       # hold most of it. Fail here, alone, if this one cannot fit, rather than
@@ -658,8 +674,10 @@ jobs:
       # TSan's setarch -R needs personality() (seccomp), LeakSanitizer
       # ptrace; the IPC tests more than Docker's 64 MB of /dev/shm.
       options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       # This job needs a lot of memory, and on a shared runner another job may
       # hold most of it. Fail here, alone, if this one cannot fit, rather than

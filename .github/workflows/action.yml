@@ -16,8 +16,10 @@ jobs:
     name: compile and run CUDA on simulated GPUs
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       - name: PantheonSim
         id: sim
@@ -70,8 +72,10 @@ jobs:
     name: compile and run HIP on simulated AMD GPUs
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       - name: PantheonSim
         uses: ./
@@ -124,8 +128,10 @@ jobs:
     name: compile and run CUDA 12.6 from NVIDIA's repository
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       - name: PantheonSim
         uses: ./
@@ -217,8 +223,10 @@ jobs:
       fail-fast: false
       matrix:
         gpu: [nvidia/t4, amd/mi300x]
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
       - uses: ./
         with:
           gpu: ${{ matrix.gpu }}
@@ -256,8 +264,10 @@ jobs:
         include:
           - { gpu: nvidia/t4, project: cmake-cuda }
           - { gpu: amd/mi300x, project: cmake-hip }
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
       - uses: ./
         with:
           gpu: ${{ matrix.gpu }}
