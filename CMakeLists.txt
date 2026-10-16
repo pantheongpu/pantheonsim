@@ -1842,6 +1842,12 @@ add_test(NAME lint_makefile COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_makefil
 set_tests_properties(lint_makefile PROPERTIES TIMEOUT 120)
 add_test(NAME lint_readme_commands COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_readme_commands.sh)
 set_tests_properties(lint_readme_commands PROPERTIES TIMEOUT 120)
+# ./run against a fake simulator, unshare and package tools.
+add_test(NAME lint_run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_run.sh)
+set_tests_properties(lint_run_launcher PROPERTIES TIMEOUT 120)
+add_test(NAME run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_launcher.sh)
+set_tests_properties(run_launcher PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
 add_test(NAME smi_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_cli.sh)
 set_tests_properties(smi_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)

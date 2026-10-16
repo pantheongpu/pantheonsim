@@ -11,11 +11,19 @@
 #     the key tables of docs/config.md;
 #   - a link to a file in the repository points at a file that exists, and a `#anchor`
 #     on a .md file is a heading (or <a id>) of that file.
-# Usage: tests/lint/check_readme_commands.sh [README.md]   (links resolve from the repository root)
+#   - `./run` is an executable file at the root, and the README, which is the front door,
+#     shows both `make` and `./run` and stays short.
+# Usage: tests/lint/check_readme_commands.sh [FILE.md]   (default: README.md and docs/getting-started.md;
+#   a link resolves from the directory of the file that holds it)
 set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
-readme="${1:-README.md}"
+if [[ $# -eq 0 ]]; then
+  rc=0
+  for f in README.md docs/getting-started.md; do "$0" "$f" || rc=1; done
+  exit $rc
+fi
+readme="$1"
 [[ -f $readme ]] || { echo "FAIL  no such file: $readme"; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -62,6 +70,17 @@ while IFS= read -r line; do
   v=${line%%=*}
   grep -qw -- "$v" Makefile || bad "README shows '$line', but the Makefile does not read $v"
 done < <(grep -E '^[A-Z][A-Z_]*=' "$tmp/code.txt")
+
+# --- ./run, and the front door's shape ------------------------------------------------------
+if grep -qE '(^|[^[:alnum:]_/.-])\./run( |$)' "$tmp/code.txt"; then
+  [[ -f run && -x run ]] || bad "$readme shows './run', but there is no executable file 'run' at the repository root"
+fi
+if [[ $readme == README.md ]]; then
+  grep -qxE 'make( +#.*)?' "$tmp/code.txt" || bad "README.md must show plain 'make' as the way to build"
+  grep -qE '^\./run( |$)' "$tmp/code.txt" || bad "README.md must show './run' as the way to start"
+  lines=$(wc -l < "$readme")
+  (( lines <= 60 )) || bad "README.md has $lines lines; the front door stays under 60 (the rest belongs in docs/getting-started.md)"
+fi
 
 # --- vgpu commands ----------------------------------------------------------------------
 cmds=$(sed -n 's/.*cmd == "\([a-z][a-z-]*\)".*/\1/p' src/cli/main.cpp | sort -u)
@@ -113,7 +132,8 @@ while read -r target; do
   path=${target%%#*}
   anchor=""
   [[ $target == *'#'* ]] && anchor=${target#*#}
-  file=$path
+  file=$(dirname "$readme")/$path
+  [[ $file == ./* ]] && file=${file#./}
   [[ -z $path ]] && file=$readme
   if [[ ! -e $file ]]; then bad "README links to '$target', but $file does not exist"; continue; fi
   if [[ -n $anchor && $file == *.md ]]; then
