@@ -7,7 +7,7 @@ nothing set.
 | Variable | Jobs | Needs on the runner |
 | --- | --- | --- |
 | `BURST_RUNS_ON` | SASS, sanitizers, threads, Ollama on AMD | docker; `sudo apt-get` without a password (the Ollama job installs packages on the host) |
-| `CONTAINER_RUNS_ON` | `sass`, `sanitizers`, `threads` only | docker, and nothing else: these three run inside the CI image |
+| `CONTAINER_RUNS_ON` | `sass`, `sanitizers`, `threads`, and the image finder they wait for | docker, and nothing else: these three run inside the CI image |
 | `ML_RUNS_ON` | ML, external suites, PyTorch sweep | the baked runner image (CUDA 13, PyTorch, ROCm, vLLM) |
 | `SIM_RUNS_ON` | simulator jobs | see the workflow |
 
