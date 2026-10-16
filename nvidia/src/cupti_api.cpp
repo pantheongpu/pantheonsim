@@ -520,6 +520,11 @@ size_t fill_device(uint8_t* out, const vgpu::profiling::Event& e) {
   d->computeCapabilityMinor = static_cast<uint32_t>(prop.minor);
   d->eccEnabled = static_cast<uint32_t>(prop.ECCEnabled);
   d->isCudaVisible = 1;
+  // The same 16 bytes cudaGetDeviceProperties and cuDeviceGetUuid report. A
+  // consumer that identifies a device by this field (Nsight Systems does) finds
+  // an all-zero identifier otherwise.
+  static_assert(sizeof d->uuid.bytes == sizeof prop.uuid.bytes);
+  std::memcpy(d->uuid.bytes, prop.uuid.bytes, sizeof d->uuid.bytes);
   return sizeof *d;
 }
 
@@ -1067,6 +1072,22 @@ VGPU_EXPORT CUptiResult cuptiGetResultString(CUptiResult result, const char** st
 
 VGPU_EXPORT CUptiResult cuptiGetLastError(void) { return CUPTI_SUCCESS; }
 
+// cupti_activity.h: DEFAULT names a thread by pthread_self(), SYSTEM by
+// SYS_gettid; any other value is a type this platform does not have.
+VGPU_EXPORT CUptiResult cuptiSetThreadIdType(CUpti_ActivityThreadIdType type) {
+  if (type == CUPTI_ACTIVITY_THREAD_ID_TYPE_DEFAULT) vgpu::profiling::set_thread_id_system(false);
+  else if (type == CUPTI_ACTIVITY_THREAD_ID_TYPE_SYSTEM) vgpu::profiling::set_thread_id_system(true);
+  else return CUPTI_ERROR_NOT_SUPPORTED;
+  return CUPTI_SUCCESS;
+}
+
+VGPU_EXPORT CUptiResult cuptiGetThreadIdType(CUpti_ActivityThreadIdType* type) {
+  if (!type) return CUPTI_ERROR_INVALID_PARAMETER;
+  *type = vgpu::profiling::thread_id_system() ? CUPTI_ACTIVITY_THREAD_ID_TYPE_SYSTEM
+                                              : CUPTI_ACTIVITY_THREAD_ID_TYPE_DEFAULT;
+  return CUPTI_SUCCESS;
+}
+
 VGPU_EXPORT CUptiResult cuptiGetTimestamp(uint64_t* timestamp) {
   if (!timestamp) return CUPTI_ERROR_INVALID_PARAMETER;
   *timestamp = vgpu::profiling::host_ns();
@@ -1496,7 +1517,7 @@ VGPU_EXPORT CUptiResult cuptiActivityFlushAll(uint32_t flags) {
         vgpu::profiling::Event f, r;
         f.kind = r.kind = vgpu::profiling::EventKind::Overhead;
         f.process_id = r.process_id = static_cast<uint32_t>(::getpid());
-        f.thread_id = r.thread_id = static_cast<uint32_t>(::syscall(SYS_gettid));
+        f.thread_id = r.thread_id = vgpu::profiling::thread_id();
         f.flags = uint32_t{1} << 16;   // CUPTI_ACTIVITY_OVERHEAD_CUPTI_BUFFER_FLUSH
         f.start_ns = flush_start;
         f.end_ns = request_start;
@@ -2187,7 +2208,7 @@ void emit_marker(uint32_t flags, uint32_t id, const std::string& name, const Nvt
   e.name = name;
   if (domain) e.domain = domain->name;
   e.process_id = static_cast<uint32_t>(::getpid());
-  e.thread_id = static_cast<uint32_t>(::syscall(SYS_gettid));
+  e.thread_id = vgpu::profiling::thread_id();
   vgpu::profiling::record(std::move(e));
   // Only a start or an instant made from attributes carries them.
   if (attrib && (flags & (CUPTI_ACTIVITY_FLAG_MARKER_INSTANTANEOUS | CUPTI_ACTIVITY_FLAG_MARKER_START))) {

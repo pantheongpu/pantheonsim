@@ -1522,7 +1522,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       ev.end_ns = vgpu::profiling::host_ns();
       ev.correlation = vgpu::profiling::work_correlation();
       ev.process_id = static_cast<uint32_t>(::getpid());
-      ev.thread_id = static_cast<uint32_t>(::syscall(SYS_gettid));
+      ev.thread_id = vgpu::profiling::thread_id();
       vgpu::profiling::record(std::move(ev));
     }
 

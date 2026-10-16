@@ -6725,8 +6725,8 @@ static CUresult cuGetExportTable_impl(const void** table, const void* uuid) {
                  "       'nvcc -cudart shared', or build inside 'vgpu shell', which supplies an "
                  "nvcc that adds it. Without that the next\n"
                  "       CUDA call fails with error 103, \"integrity checks failed\".\n"
-                 "       If this is a profiler: Nsight Systems collects through its own bundled "
-                 "CUPTI, which needs these tables.\n"
+                 "       If this is a profiler: Nsight Systems loads its own bundled CUPTI and cannot "
+                 "collect CUDA data here.\n"
                  "       nvprof works instead -- see nvidia/docs/cupti.md.\n");
   });
   const unsigned char* u = static_cast<const unsigned char*>(uuid);

@@ -1782,9 +1782,11 @@ scripts/run-pantheon-workloads.sh.
    only from NVIDIA's internal headers or by disassembling their runtime.
    Neither is available to a clean-room project, so this stays where it is.
    Now has two more consumers. Nsight Systems collects through its own bundled
-   CUPTI, loaded by absolute path from its install directory, and that copy
-   reaches the driver the same way -- so `nsys` produces a report with OS
-   runtime traces and no CUDA data. nvprof works, because its path goes through
+   CUPTI, loaded by absolute path from its install directory. Presenting the
+   shim's libcupti at that path (a private mount) loads, and exposes an
+   undocumented CUPTI function the injection library requires, then a host-side
+   failure to recognize the GPU (findings in nvidia/docs/cupti.md) -- so `nsys`
+   produces a report with OS runtime traces and no CUDA data. nvprof works, because its path goes through
    the public CUPTI this does implement. See nvidia/docs/cupti.md. CuPy is the other:
    it links the runtime statically and dies in the same place, at
    `getDeviceCount()`, before it compiles anything.

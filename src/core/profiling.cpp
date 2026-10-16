@@ -9,6 +9,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include <pthread.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -186,6 +187,18 @@ namespace {
 std::atomic<uint64_t (*)()> g_host_clock{nullptr};
 }
 void set_host_clock(uint64_t (*fn)()) { g_host_clock.store(fn, std::memory_order_release); }
+namespace {
+std::atomic<bool> g_thread_id_system{false};
+}
+void set_thread_id_system(bool system) { g_thread_id_system.store(system, std::memory_order_relaxed); }
+bool thread_id_system() { return g_thread_id_system.load(std::memory_order_relaxed); }
+uint32_t thread_id() {
+  // cupti_activity.h, CUpti_ActivityThreadIdType: DEFAULT is pthread_self() on
+  // Linux, SYSTEM is syscall SYS_gettid. The record field is 32 bits wide.
+  if (thread_id_system()) return static_cast<uint32_t>(::syscall(SYS_gettid));
+  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(::pthread_self()));
+}
+
 uint64_t host_ns() {
   const auto fn = g_host_clock.load(std::memory_order_acquire);
   return fn ? fn() : now_ns();
@@ -361,7 +374,7 @@ ApiCall::~ApiCall() {
   e.correlation = correlation_;
   e.name = name_;
   e.process_id = static_cast<uint32_t>(::getpid());
-  e.thread_id = static_cast<uint32_t>(::syscall(SYS_gettid));
+  e.thread_id = thread_id();
   e.result = result_;
   e.domain_driver = domain_ == Domain::Driver;
   record(std::move(e));
