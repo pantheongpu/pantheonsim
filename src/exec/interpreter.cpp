@@ -3656,7 +3656,9 @@ class Interpreter {
   // shfl.sync over the 32 lanes: exec_shfl's arithmetic, on the narrow register file. A warp that is not 32 lanes
   // wide is the general path's error to report.
   [[gnu::noinline]] bool micro_shfl32(Warp& w, const MicroOp& u, Mask fm) {
-    if (W_ != 32u) return false;
+    // A warp on more than one path is step's: a *.sync instruction waits there for the lanes its mask names on the other
+    // paths (wait_for_members).
+    if (W_ != 32u || w.paths.size() != 1) return false;
     const bool has_p = u.sub & 4;
     if (has_p && u.pred >= w.preds.size()) return false;
     const uint32_t* a = micro_src(w, u, 0);
@@ -3706,7 +3708,7 @@ class Interpreter {
   }
   // vote.sync / ballot.sync over the lanes that run it.
   [[gnu::noinline]] bool micro_vote(Warp& w, const MicroOp& u, Mask fm) {
-    if (W_ != 32u) return false;
+    if (W_ != 32u || w.paths.size() != 1) return false;   // (as for shfl)
     const uint32_t sid = u.src[0];
     if (sid >= w.written32.size() || !w.written32[sid] || sid >= w.preds.size()) return false;
     const bool ballot = u.sub & 8;

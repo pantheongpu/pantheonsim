@@ -1653,6 +1653,11 @@ runs were made with `time()` frozen by an `LD_PRELOAD`). The machine was shared 
 | Rodinia backprop / hotspot | 0.49 / 0.57 s | 0.41 / 0.48 s | 1.20x / 1.18x (9, <0.001; which change is not isolated) |
 | Rodinia lud, gaussian, sc_gpu, srad; HeCBench mandelbrot, mask, matern, md, mergeVS, logprob | | | within noise |
 
+Correction after CI (sync_masks, HeCBench bscan): the first version decoded `shfl.sync` and `vote.sync` whatever their member mask, but step() treats
+a *register* mask specially (lanes naming different masks run the instruction once per mask, a lane its own mask leaves out traps, and a
+warp on several paths waits for the lanes the mask names); only a constant mask is ignored by the hardware. They are now decoded only with a
+constant mask and only run from a warp on one path; `pre_decoded_shfl_and_vote_follow_register_member_masks_like_the_general_path` and
+`..._in_a_diverged_warp_...` cover it, with a mutation check for each half.
 Mutation check: 24 deliberate faults in the new handlers (popc/clz, carry and borrow, shuffle modes, vote, f64 operations, the constant table,
 conversion rounding and NaN, pack/unpack, slot lanes, call classes) each fail at least one test (VGPU_MUT in a throwaway build). Two
 disagreements between paths that are older than this round, found by the new tests and not changed here: an f64 `fma` with two signalling

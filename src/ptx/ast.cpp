@@ -270,7 +270,11 @@ void build_micro(EntryFn& fn) {
     } else if (const auto* op = std::get_if<OpShfl>(&ins.op)) {
       // shfl.sync with narrow operands. The predicate output, if any, takes the `pred` field, so such a shfl has no guard.
       const bool has_p = op->pred_dst.id != kNoReg;
-      ok = narrow_dst(op->dst) && source(0, op->a) && source(1, op->b) && source(2, op->c) &&
+      // A member mask in a register is the general path's to read (step's sync_mask_groups: lanes that name different
+      // masks run the instruction once per mask, and a lane its own mask leaves out traps), so only a constant one --
+      // which the instruction ignores -- is decoded; see also micro_shfl32.
+      const bool mask_ok = !op->has_members || std::holds_alternative<ImmInt>(op->member_mask);
+      ok = mask_ok && narrow_dst(op->dst) && source(0, op->a) && source(1, op->b) && source(2, op->c) &&
            (!has_p || (!op->pred_dst.wide && op->pred_dst.id <= 0xFFFF && !ins.has_pred));
       if (ok) {
         u.kind = MicroOp::Shfl32;
@@ -278,7 +282,8 @@ void build_micro(EntryFn& fn) {
         if (has_p) u.pred = static_cast<uint16_t>(op->pred_dst.id);
       }
     } else if (const auto* op = std::get_if<OpVote>(&ins.op)) {
-      ok = !op->src.wide && op->src.id != kNoReg && !op->dst.wide && op->dst.id != kNoReg;
+      const bool mask_ok = !op->has_members || std::holds_alternative<ImmInt>(op->members);   // as for shfl
+      ok = mask_ok && !op->src.wide && op->src.id != kNoReg && !op->dst.wide && op->dst.id != kNoReg;
       if (ok) {
         u.kind = MicroOp::Vote;
         u.sub = static_cast<uint8_t>(static_cast<unsigned>(op->mode) | (op->negate_src ? 4u : 0u) | (op->ballot ? 8u : 0u));
