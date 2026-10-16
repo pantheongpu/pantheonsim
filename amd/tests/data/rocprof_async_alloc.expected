@@ -1,0 +1,27 @@
+# rocprofv3 trace of the async_alloc case, normalised by amd/tests/rocprof_normalize.py
+# recorded on: AMD Radeon RX 6800 (gfx1030), rocm-7.2.0, rocprofv3 1.1.0
+# regenerate: amd/tests/e2e/run_rocprof_case.sh async_alloc --card --update
+[agent]
+gpu name=gfx1030 product_name=AMD Radeon RX 6800 vendor_name=AMD cu_count=60 simd_per_cu=2 wave_front_size=32 lds_size_in_kb=64 max_waves_per_cu=32 workgroup_max_size=1024 gfx_target_version=100300 vendor_id=4098 device_id=29631 workgroup_max_dim=1024,1024,1024
+[kernels]
+_Z4vaddPKfS0_Pfi.kd kernarg=288 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+[hip api, thread 1]
+__hipRegisterFatBinary(data=<ptr>)
+__hipRegisterFunction(modules=<ptr>, hostFunction=<ptr>, deviceFunction=_Z4vaddPKfS0_Pfi, deviceName=_Z4vaddPKfS0_Pfi, threadLimit=4294967295, tid=(null), bid=(null), blockDim=(null), gridDim=(null), wSize=(null))
+hipStreamCreate(stream=<ptr>)
+hipMallocAsync(dev_ptr=<ptr>, size=4096, stream=<ptr>)
+hipMallocAsync(dev_ptr=<ptr>, size=4096, stream=<ptr>)
+hipMemcpyAsync(dst=<ptr>, src=<ptr>, sizeBytes=4096, kind=HostToDevice, stream=<ptr>)
+__hipPushCallConfiguration(gridDim={z=1, y=1, x=4}, blockDim={z=1, y=1, x=256}, sharedMem=0, stream=<ptr>)
+__hipPopCallConfiguration(gridDim=<ptr>, blockDim=<ptr>, sharedMem=<ptr>, stream=<ptr>)
+hipLaunchKernel(function_address=<ptr>, numBlocks={z=1, y=1, x=4}, dimBlocks={z=1, y=1, x=256}, args=<ptr>, sharedMemBytes=0, stream=<ptr>)
+hipMemcpyAsync(dst=<ptr>, src=<ptr>, sizeBytes=4096, kind=DeviceToHost, stream=<ptr>)
+hipFreeAsync(dev_ptr=<ptr>, stream=<ptr>)
+hipFreeAsync(dev_ptr=<ptr>, stream=<ptr>)
+hipStreamSynchronize(stream=<ptr>)
+hipStreamDestroy(stream=<ptr>)
+[dispatches]
+vadd(float const*, float const*, float*, int) [clone .kd] grid=1024,1,1 workgroup=256,1,1 group=0 private=0
+[copies]
+[allocations]
+[markers]
