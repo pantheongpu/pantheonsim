@@ -1,7 +1,7 @@
 # Command-line reference
 
 Everything the `vgpu` command and the environment variables can do. The
-[README](../README.md) has the short path (`make doctor`, `make build`, `make demo`); this page is the full list.
+[README](../README.md) has the short path (`make`, then `./run`) and [getting-started.md](getting-started.md) the step-by-step one (`make doctor`, `make build`, `make demo`); this page is the full list.
 
 Build once (`make build`, which runs `./scripts/build.sh`) and the command is `build/vgpu`. The build
 also puts it at `build/bin/vgpu`, next to drop-in `nvidia-smi`, `rocm-smi` and
@@ -134,6 +134,8 @@ vgpu shell -y --gpu amd/mi300x --count 8 --rocm 6.2.0 --driver 6.3.6 \
 | `-y`, `--no-prompt` | Take the defaults for anything not given, without asking. |
 | `--no-isolate` | Skip the namespaces (session tools only). |
 
+`./run [config.yaml] [-- command]` at the root of the repository starts this shell
+for you (see [machine-simulator.md](machine-simulator.md#start-it-with-run)).
 More in [machine-simulator.md](machine-simulator.md).
 
 ## `vgpu ncu`

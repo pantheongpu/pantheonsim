@@ -158,4 +158,139 @@ contains "doctor: reports nvcc" "nvcc 12.4" "$out"
 contains "doctor: reports hipcc" "hipcc 6.4.43484" "$out"
 contains "doctor: reports memory" "memory:" "$out"
 
+# ---- scripts/deps.sh (make deps), against fake tools and fake package managers -----------------------
+# Nothing is installed: apt-get, sudo and friends are fakes that log what they are asked, and
+# the fake apt-get "installs" by dropping fake tools on the fake PATH.
+bash -n scripts/deps.sh && ok "deps.sh parses" || bad "deps.sh parses"
+depsenv() {  # depsenv <bin-dir> <os-release> [VAR=value ...]; stdin is /dev/null unless the caller redirects
+  local bin=$1 osr=$2; shift 2
+  env -i PATH="$bin" DEPS_OS_RELEASE="$osr" FAKE_BIN="$bin" FAKE_LOG="$tmp/apt.log" "$@" /bin/bash "$root/scripts/deps.sh" 2>&1
+}
+depsbin() {  # depsbin <name> [have-packages]: a PATH dir with the basics and fake apt tools
+  local d="$tmp/deps-$1"; mkdir -p "$d"
+  for t in awk sed cat chmod; do ln -sf "$(command -v $t)" "$d/$t"; done
+  printf '#!/bin/sh\necho "apt-cache $*" >> "$FAKE_LOG"\nfor p in %s; do [ "$2" = "$p" ] && { echo "  Candidate: 9.9"; exit 0; }; done\necho "  Candidate: (none)"\n' "${2:-cmake g++-13}" > "$d/apt-cache"
+  cat > "$d/apt-get" <<'APT'
+#!/bin/sh
+echo "apt-get $*" >> "$FAKE_LOG"
+if [ "$1" = install ]; then
+  for a in "$@"; do case $a in
+    cmake) printf '#!/bin/sh\necho "cmake version 3.28.3"\n' > "$FAKE_BIN/cmake"; chmod +x "$FAKE_BIN/cmake" ;;
+    g++*) printf '#!/bin/sh\necho 13.3.0\n' > "$FAKE_BIN/$a"; chmod +x "$FAKE_BIN/$a" ;;
+  esac; done
+fi
+exit 0
+APT
+  printf '#!/bin/sh\necho "add-apt-repository $*" >> "$FAKE_LOG"\n' > "$d/add-apt-repository"
+  printf '#!/bin/sh\necho "sudo $*" >> "$FAKE_LOG"\nexec "$@"\n' > "$d/sudo"
+  chmod +x "$d"/apt-cache "$d"/apt-get "$d"/add-apt-repository "$d"/sudo
+  echo "$d"
+}
+ubuntu24="$tmp/os-ubuntu24"; printf 'ID=ubuntu\nID_LIKE=debian\nVERSION_ID="24.04"\n' > "$ubuntu24"
+ubuntu22="$tmp/os-ubuntu22"; printf 'ID=ubuntu\nID_LIKE=debian\nVERSION_ID="22.04"\n' > "$ubuntu22"
+fedora="$tmp/os-fedora"; printf 'ID=fedora\nVERSION_ID="41"\n' > "$fedora"
+installed() { grep -c '^apt-get install' "$tmp/apt.log" 2>/dev/null || true; }
+: > "$tmp/apt.log"
+
+p=$(depsbin have); fake "$p" cmake "cmake version 3.28.3"; fake "$p" c++ "13.3.0"
+out=$(depsenv "$p" "$ubuntu24" </dev/null); rc=$?
+expect "deps: nothing missing is fine" "0" "$rc"
+contains "deps: says so" "Build dependencies are installed" "$out"
+expect "deps: and installs nothing" "0" "$(installed)"
+expect "deps --cxx: nothing to say when the default compiler is fine" "" "$(env -i PATH="$p" /bin/bash scripts/deps.sh --cxx)"
+out=$(env -i PATH="$p" /bin/bash scripts/deps.sh --check </dev/null); rc=$?
+expect "deps --check passes when nothing is missing" "0" "$rc"
+
+p=$(depsbin oldcc); fake "$p" cmake "cmake version 3.28.3"; fake "$p" c++ "12.3.0"; fake "$p" g++-13 "13.2.0"
+expect "deps --cxx: names a newer compiler when the default is too old" "g++-13" "$(env -i PATH="$p" /bin/bash scripts/deps.sh --cxx)"
+
+# missing, no terminal, no YES: nothing is installed, the command is printed, and it does not wait
+p=$(depsbin noyes); : > "$tmp/apt.log"
+out=$(depsenv "$p" "$ubuntu24" </dev/null); rc=$?
+expect "deps: missing tools without YES and without a terminal exit 1" "1" "$rc"
+expect "deps: and install nothing" "0" "$(installed)"
+contains "deps: and print the exact command" "apt-get install -y cmake g++-13" "$out"
+contains "deps: and the way to say yes" "make deps YES=1" "$out"
+out=$(env -i PATH="$p" DEPS_OS_RELEASE="$ubuntu24" FAKE_BIN="$p" FAKE_LOG="$tmp/apt.log" /bin/bash scripts/deps.sh --check </dev/null 2>&1); rc=$?
+expect "deps --check reports missing tools as exit 1 and installs nothing" "1" "$rc"
+expect "deps --check installs nothing" "0" "$(installed)"
+
+# YES=1 installs (through sudo unless root) and the result is verified
+p=$(depsbin yes); : > "$tmp/apt.log"
+out=$(depsenv "$p" "$ubuntu24" YES=1 </dev/null); rc=$?
+expect "deps: YES=1 installs and succeeds" "0" "$rc"
+contains "deps: runs apt-get update" "apt-get update" "$(cat "$tmp/apt.log")"
+contains "deps: installs cmake and the compiler" "apt-get install -y cmake g++-13" "$(cat "$tmp/apt.log")"
+if [[ $EUID -ne 0 ]]; then contains "deps: not root: through sudo" "sudo apt-get install" "$(cat "$tmp/apt.log")"; fi
+lacks "deps: no PPA on 24.04" "add-apt-repository" "$(cat "$tmp/apt.log")"
+
+# Ubuntu 22.04: no g++ 13 in the archive, so a PPA is needed, which only YES=1 PPA=1 adds
+p=$(depsbin jammy "cmake"); : > "$tmp/apt.log"
+out=$(depsenv "$p" "$ubuntu22" YES=1 </dev/null); rc=$?
+expect "deps: 22.04 with YES=1 alone does not add a PPA" "1" "$rc"
+contains "deps: it prints the PPA instructions" "ppa:ubuntu-toolchain-r/test" "$out"
+contains "deps: and the export" "export CXX=g++-13" "$out"
+lacks "deps: and ran nothing" "apt-get" "$(cat "$tmp/apt.log")"
+lacks "deps: no PPA was added" "add-apt-repository" "$(cat "$tmp/apt.log")"
+out=$(depsenv "$p" "$ubuntu22" YES=1 PPA=1 </dev/null); rc=$?
+expect "deps: YES=1 PPA=1 does it" "0" "$rc"
+contains "deps: the PPA was added" "add-apt-repository -y ppa:ubuntu-toolchain-r/test" "$(cat "$tmp/apt.log")"
+contains "deps: g++-13 was installed" "apt-get install -y cmake g++-13" "$(cat "$tmp/apt.log")"
+p=$(depsbin jammy2 "cmake"); : > "$tmp/apt.log"
+out=$(depsenv "$p" "$ubuntu22" PPA=1 </dev/null); rc=$?
+expect "deps: PPA=1 without YES=1 still adds nothing" "1" "$rc"
+lacks "deps: and runs nothing" "add-apt-repository" "$(cat "$tmp/apt.log")"
+
+# other package managers: the command is printed, never run
+p="$tmp/deps-dnf"; mkdir -p "$p"; for t in awk sed cat; do ln -sf "$(command -v $t)" "$p/$t"; done
+printf '#!/bin/sh\necho "dnf $*" >> "$FAKE_LOG"\n' > "$p/dnf"; chmod +x "$p/dnf"; : > "$tmp/apt.log"
+out=$(depsenv "$p" "$fedora" YES=1 </dev/null); rc=$?
+expect "deps: dnf systems get the command, exit 1" "1" "$rc"
+contains "deps: the dnf command" "dnf install -y cmake gcc-c++ make" "$out"
+expect "deps: and dnf is never run" "" "$(cat "$tmp/apt.log")"
+
+# the question, on a terminal: no is the default, y installs
+if command -v python3 >/dev/null 2>&1; then
+  ask() {  # ask <answer> <bin-dir>
+    : > "$tmp/apt.log"
+    python3 -I - "$1" "$2" "$ubuntu24" "$root/scripts/deps.sh" "$tmp/apt.log" <<'PY'
+import os, pty, sys, select
+answer, binp, osr, script, log = sys.argv[1:6]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execve("/bin/bash", ["bash", script], {"PATH": binp, "DEPS_OS_RELEASE": osr, "FAKE_BIN": binp, "FAKE_LOG": log})
+out = b""
+sent = False
+while True:
+    r, _, _ = select.select([fd], [], [], 20)
+    if not r:
+        break
+    try:
+        data = os.read(fd, 4096)
+    except OSError:
+        break
+    if not data:
+        break
+    out += data
+    if b"[y/N]" in out and not sent:
+        os.write(fd, answer.encode()); sent = True
+_, status = os.waitpid(pid, 0)
+sys.stdout.write(out.decode(errors="replace"))
+sys.exit(os.waitstatus_to_exitcode(status))
+PY
+  }
+  p=$(depsbin tty1)
+  out=$(ask $'\n' "$p"); rc=$?
+  contains "deps: on a terminal it asks" "[y/N]" "$out"
+  expect "deps: an empty answer is no" "0" "$(installed)"
+  expect "deps: and exits 1" "1" "$rc"
+  p=$(depsbin tty2)
+  out=$(ask $'y\n' "$p"); rc=$?
+  expect "deps: y installs" "1" "$(installed)"
+  expect "deps: and succeeds" "0" "$rc"
+else
+  echo "SKIP  no python3; the on-a-terminal question is not checked"
+fi
+
+
 exit $fail

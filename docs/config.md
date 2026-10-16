@@ -245,13 +245,20 @@ as it is. Without `-y` the shell asks its questions as before, with the file's
 values as the answers it offers. The one exception is the operating system: the
 menu always starts at Ubuntu 22.04, so use `-y` to get `os` from the file.
 
+`./run` at the root of the repository is `build/vgpu --config FILE shell -y` with
+the file checked first, and starts the machine from `./pantheonsim.yaml` when no
+file is named (writing the commented starter if there is none).
+
 ## The Makefile
 
-`make` with no target lists them. They are thin wrappers that print the command
-they run:
+`make help` lists them. They are thin wrappers that print the command they run.
+`make` with no target is `make deps build`, and then `./run` starts the machine
+(`./run my.yaml` for another settings file):
 
 | Target | Runs |
 | --- | --- |
+| `make` | `make deps`, then `make build` (with the compiler `deps` found, if the default is too old), then prints what to type next |
+| `make deps` | `scripts/deps.sh`: installs cmake and a C++20 compiler when missing (Debian and Ubuntu; it asks first, `YES=1` answers yes, no terminal means it only prints the command; `PPA=1` with `YES=1` adds the g++ 13 PPA on Ubuntu 22.04). Never installs CUDA or ROCm |
 | `make doctor` | `scripts/doctor.sh`: checks cmake, a C++20 compiler and memory, and says what to install |
 | `make build` | `scripts/build.sh` at low priority (`NICE=` to change) |
 | `make demo` | `build/vgpu demo vectoradd`, building first if needed |

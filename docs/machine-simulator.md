@@ -3,6 +3,23 @@
 Answer a few questions, get a shell where the machine has the GPUs you asked
 for. The usual tools work; so does any CUDA program you compile and run.
 
+## Start it with `./run`
+
+After `make`, `./run` starts the machine from your settings file, with no
+questions:
+
+```bash
+./run                              # the machine in ./pantheonsim.yaml (a starter is written if missing)
+./run my.yaml                      # the machine in my.yaml
+./run my.yaml -- nvidia-smi -L     # one command in the machine; exits with its status
+```
+
+It is `build/vgpu --config FILE shell -y` with three conveniences: the file is
+checked first and a mistake stops with the line and the reason; a missing build is
+built with `make build` (never installing packages); and where the system forbids
+user namespaces (Ubuntu 24.04 can; see below) it adds `--no-isolate` and says so,
+instead of failing. The rest of this page is `vgpu shell` itself.
+
 ```bash
 ./scripts/build.sh
 build/bin/vgpu shell
@@ -126,6 +143,31 @@ Two layers:
    namespaces are unavailable the session still runs, with the tools working
    (the session's `hostname` and `uname` still print the configured name) and
    the `/proc` paths left alone — and says so.
+
+## Network, files and programs in the session
+
+The session is a view of your own computer with the GPU surfaces replaced, so
+downloading and running programs works as it does outside. Read from
+`src/cli/shell.cpp` (`unshare -r -m -u`, no network, PID or filesystem namespace)
+and checked on a real host:
+
+- **Network:** the host's. `curl`, `git clone`, `pip install` and `wget` reach the
+  internet exactly as they do from your own shell; no flag is needed.
+- **Files:** the host's. Your home, your current directory and every installed
+  program are there; only `/proc/driver`, `/sys/class/drm`, `/etc/os-release` and
+  the PCI and hwmon trees are replaced.
+- **Users:** you are `root` inside (`-r` maps your user to uid 0), and files owned
+  by your user show as owned by root, system files as `nobody`. That is a user
+  namespace's picture, not real privilege: you cannot write to `/usr`, and
+  `sudo` and `apt install` do not work in the session. Install packages from
+  outside it (`make deps` and your package manager), or use user-level installs
+  in it: `python3 -m venv .venv && . .venv/bin/activate && pip install torch`,
+  `pip install --user`, conda, or a downloaded tarball in your home.
+- **Compilers:** the host's `nvcc` and `hipcc`, if installed. Build CUDA programs
+  with `-cudart shared`. See [toolchains.md](toolchains.md).
+- **With `--no-isolate`** (what `./run` uses on a system that restricts user
+  namespaces) everything above holds, except that `/proc` and `/etc` show your
+  real system and you keep your own user, so `sudo` works as it does outside.
 
 ## Processes share the machine
 
