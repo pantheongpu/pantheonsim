@@ -10,6 +10,7 @@
 // gives one thread and the strictly ordered sequence). The result of a call
 // does not depend on the count: callers split their work only into pieces that
 // are independent of each other.
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -74,6 +75,22 @@ void parallel_for(unsigned n, int64_t items, F&& fn) {
   worker();
   for (auto& t : pool) t.join();
   busy_threads().fetch_sub(n, std::memory_order_relaxed);
+}
+
+// Runs fn(begin, end) over the items [0, n) in contiguous pieces on as many threads as the work warrants; `cost` is the number of
+// elementary steps one item takes (a fresh estimate, not a promise). The pieces are independent, so the result does not depend
+// on how many threads there are; for reductions that must keep a fixed order, give each reduction to one item.
+template <class Fn>
+void for_range(size_t n, uint64_t cost, Fn&& fn, uint64_t min_work = (1u << 20)) {
+  if (n == 0) return;
+  if (cost == 0) cost = 1;
+  const size_t piece = std::max<size_t>(1, std::min<size_t>(n, (static_cast<size_t>(1) << 16) / static_cast<size_t>(cost > 65536 ? 65536 : cost)));
+  const int64_t pieces = static_cast<int64_t>((n + piece - 1) / piece);
+  const unsigned threads = plan(static_cast<uint64_t>(n) * cost, pieces, min_work);
+  parallel_for(threads, pieces, [&](int64_t pc) {
+    const size_t b = static_cast<size_t>(pc) * piece;
+    fn(b, std::min(n, b + piece));
+  });
 }
 
 }  // namespace vgpu::hostpar

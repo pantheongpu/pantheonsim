@@ -46,8 +46,10 @@ jobs:
       fail-fast: false
       matrix:
         cuda: ['13.0', '12.8']
+    permissions: { contents: read, packages: write, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       - name: Make room
         run: |

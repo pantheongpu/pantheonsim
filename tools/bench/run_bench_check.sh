@@ -14,6 +14,10 @@
 # toolkit, the shim is sanitizer-built (the Release job runs this), or there is
 # no expected file for the toolkit release in use. To regenerate after an
 # intended change:  tools/bench/bench.sh --update-expected --build <build dir>
+#
+# The harness hands the programs a clean environment (no VGPU_* of the caller's), so VGPU_TIER (the pre-decoded
+# execution tier, src/sass/tier.hpp) is forwarded by name: VGPU_TIER=1 tools/bench/run_bench_check.sh checks that the
+# tier counts exactly what the interpreter does.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -29,4 +33,6 @@ nvcc_bin="$(pick_nvcc_for_shim "$shim")"
 nvcc_host_compiler_fix
 cache="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-bench.XXXXXX")"
 trap 'rm -rf "$cache"' EXIT
-python3 -I "$root/tools/bench/bench.py" --check-counters --build "$build" --nvcc "$nvcc_bin" --cache "$cache" --quiet
+extra=()
+[[ -n "${VGPU_TIER:-}" ]] && extra+=(--env "VGPU_TIER=$VGPU_TIER")
+python3 -I "$root/tools/bench/bench.py" --check-counters --build "$build" --nvcc "$nvcc_bin" --cache "$cache" --quiet "${extra[@]}"

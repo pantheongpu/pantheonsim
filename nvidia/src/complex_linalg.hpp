@@ -19,6 +19,8 @@
 #include <numeric>
 #include <vector>
 
+#include "host_trsm.hpp"
+
 namespace vgpu_la {
 
 using cd = std::complex<double>;
@@ -119,10 +121,51 @@ inline void tri_solve(const CMat& a, int k, bool lower, Op op, bool unit, cd* x,
     for (int i = k - 1; i >= 0; --i) row(i, i + 1, k);  // M is upper: back
 }
 
+// The solve of trsm() on host_trsm.hpp's lanes, for operands that make it certain to give the loops' bits: every entry
+// of op(A) that the solve reads and every entry of B finite, and (checked by the solver) every x finite. On false,
+// B is as it was and the loops below run. b has been scaled by alpha already.
+inline bool trsm_fast(bool left, bool lower, Op op, bool unit, int m, int n, const CMat& a, CMat& b) {
+  const int k = left ? m : n;
+  if (k <= 0 || m <= 0 || n <= 0 || static_cast<uint64_t>(m) * n * k < 4096) return false;
+  // M(i, j) as the loops' tri_solve reads it (for the right side: against the transpose, a row of B being a column
+  // vector; the conjugate-transpose is handled by solving for the conjugate row, as the loops do).
+  const bool conj_io = !left && op == Op::C;
+  const Op mop = left ? op : (op == Op::C ? Op::N : (op == Op::N ? Op::T : Op::N));
+  const bool forward = lower == (mop == Op::N);
+  std::vector<double> mr(static_cast<size_t>(k) * k, 0.0), mi(mr.size(), 0.0);
+  for (int i = 0; i < k; ++i) {
+    const int j0 = forward ? 0 : i + 1, j1 = forward ? i : k;
+    auto put = [&](int j) {
+      const cd v = mop == Op::N ? a(i, j) : apply_op(a(j, i), mop);
+      if (!std::isfinite(v.real()) || !std::isfinite(v.imag())) return false;
+      mr[static_cast<size_t>(i) * k + j] = v.real();
+      mi[static_cast<size_t>(i) * k + j] = v.imag();
+      return true;
+    };
+    for (int j = j0; j < j1; ++j)
+      if (!put(j)) return false;
+    if (!unit && !put(i)) return false;
+  }
+  std::vector<cd> w(static_cast<size_t>(m) * n);
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) {
+      const cd v = b(i, j);
+      if (!std::isfinite(v.real()) || !std::isfinite(v.imag())) return false;
+      w[static_cast<size_t>(j) * m + i] = v;
+    }
+  const bool ok = left ? vgpu::hosttrsm::cplx(k, n, forward, unit, mr.data(), mi.data(), w.data(), 1, m, false)
+                       : vgpu::hosttrsm::cplx(k, m, forward, unit, mr.data(), mi.data(), w.data(), m, 1, conj_io);
+  if (!ok) return false;
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < m; ++i) b(i, j) = w[static_cast<size_t>(j) * m + i];
+  return true;
+}
+
 // op(A) X = alpha B (left) or X op(A) = alpha B (right); X over the m x n B.
 inline void trsm(bool left, bool lower, Op op, bool unit, int m, int n, cd alpha, const CMat& a, CMat& b) {
   for (int j = 0; j < n; ++j)
     for (int i = 0; i < m; ++i) b(i, j) *= alpha;
+  if (trsm_fast(left, lower, op, unit, m, n, a, b)) return;
   if (left) {
     for (int j = 0; j < n; ++j) tri_solve(a, m, lower, op, unit, &b(0, j), 1);
   } else {
@@ -274,6 +317,38 @@ inline void unmqr(bool left, Op op, int m, int n, int k, const CMat& a, const cd
 
 // A (n x n, Hermitian; only the `lower` or upper triangle is read) = V diag(w) V^H.
 // w ascending; V's columns unit and orthogonal.
+// The plane rotation of two vectors, written on the parts of the numbers. For every element
+//     p' = c*xp - m1*xq     q' = m2*xp + c*xq
+// with std::complex<double>'s arithmetic: a double times a complex scales both parts, a complex product is
+// (ar*br - ai*bi, ar*bi + ai*br) and, when both parts of it come out NaN, the repair of __muldc3 (which the library's
+// operator* runs, and this runs by calling it). The loops that were here wrote the same expressions with the operators;
+// the compiler made of those, for some calls and not for others, a store of the two parts of an element followed by a
+// 16-byte load of both (a store-forwarding stall that cost a factor of three). m1 and m2 are formed once by the caller
+// (s * conj(phase), s * phase: the same products the loops formed, one multiplication of each part).
+inline void cmul_parts(double xr, double xi, double yr, double yi, double& r, double& i) {
+  r = xr * yr - xi * yi;
+  i = xr * yi + xi * yr;
+  if (r != r && i != i) {
+    const cd z = cd(xr, xi) * cd(yr, yi);
+    r = z.real();
+    i = z.imag();
+  }
+}
+
+inline void rotate_pair(cd* xp, cd* xq, std::ptrdiff_t stride, int count, double c, cd m1, cd m2) {
+  const double m1r = m1.real(), m1i = m1.imag(), m2r = m2.real(), m2i = m2.imag();
+  for (int k = 0; k < count; ++k) {
+    cd* const P = xp + static_cast<std::ptrdiff_t>(k) * stride;
+    cd* const Q = xq + static_cast<std::ptrdiff_t>(k) * stride;
+    const double pr = P->real(), pi = P->imag(), qr = Q->real(), qi = Q->imag();
+    double t1r, t1i, t2r, t2i;
+    cmul_parts(m1r, m1i, qr, qi, t1r, t1i);
+    cmul_parts(m2r, m2i, pr, pi, t2r, t2i);
+    *P = cd(c * pr - t1r, c * pi - t1i);
+    *Q = cd(t2r + c * qr, t2i + c * qi);
+  }
+}
+
 inline void heev(const CMat& in, int n, bool lower, std::vector<double>* w, CMat* vout) {
   CMat a{std::vector<cd>((size_t)n * n), n};
   for (int j = 0; j < n; ++j)
@@ -303,24 +378,13 @@ inline void heev(const CMat& in, int n, bool lower, std::vector<double>* w, CMat
         const double theta = 0.5 * std::atan2(2 * mag, aqq - app);
         const double c = std::cos(theta), s = std::sin(theta);
         // Column p' = c p - s conj(phase) q ; column q' = s phase p + c q.
-        for (int k = 0; k < n; ++k) {
-          const cd akp = a(k, p), akq = a(k, q);
-          a(k, p) = c * akp - s * std::conj(phase) * akq;
-          a(k, q) = s * phase * akp + c * akq;
-        }
-        for (int k = 0; k < n; ++k) {
-          const cd apk = a(p, k), aqk = a(q, k);
-          a(p, k) = c * apk - s * phase * aqk;
-          a(q, k) = s * std::conj(phase) * apk + c * aqk;
-        }
+        const cd sphase_c = s * std::conj(phase), sphase = s * phase;
+        rotate_pair(&a(0, p), &a(0, q), 1, n, c, sphase_c, sphase);
+        rotate_pair(&a(p, 0), &a(q, 0), n, n, c, sphase, sphase_c);
         a(p, q) = a(q, p) = 0;
         a(p, p) = a(p, p).real();
         a(q, q) = a(q, q).real();
-        for (int k = 0; k < n; ++k) {
-          const cd vkp = v(k, p), vkq = v(k, q);
-          v(k, p) = c * vkp - s * std::conj(phase) * vkq;
-          v(k, q) = s * phase * vkp + c * vkq;
-        }
+        rotate_pair(&v(0, p), &v(0, q), 1, n, c, sphase_c, sphase);
       }
   }
   std::vector<int> order(n);
@@ -393,15 +457,9 @@ inline void svd(const CMat& in, int m, int n, bool full, std::vector<double>* s,
         const double zeta = (beta - alpha) / (2 * g);
         const double t = std::copysign(1.0, zeta) / (std::fabs(zeta) + std::sqrt(1 + zeta * zeta));
         const double c = 1 / std::sqrt(1 + t * t), sn = c * t;
-        auto rot = [&](CMat& x, int nr) {
-          for (int i = 0; i < nr; ++i) {
-            const cd xp = x(i, p), xq = x(i, q);
-            x(i, p) = c * xp - sn * std::conj(phase) * xq;
-            x(i, q) = sn * phase * xp + c * xq;
-          }
-        };
-        rot(a, rows);
-        rot(w, cols);
+        const cd snphase_c = sn * std::conj(phase), snphase = sn * phase;
+        rotate_pair(&a(0, p), &a(0, q), 1, rows, c, snphase_c, snphase);
+        rotate_pair(&w(0, p), &w(0, q), 1, cols, c, snphase_c, snphase);
       }
     tl_residual = std::sqrt(2 * off);
     if (!rotated) break;

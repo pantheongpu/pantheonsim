@@ -15,9 +15,15 @@
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "tier.hpp"
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <utility>
 #include <bit>
 #include <cfenv>
 #include <cmath>
@@ -92,6 +98,7 @@ struct Warp {
   uint64_t bssy_stamp[16] = {};       // when (Block::bssy_clock) each barrier was last set up: higher is more deeply nested
   uint64_t rpc[32] = {};              // the return-address register (RPCMOV)
   uint64_t gmma_issued = 0;           // warpgroup MMAs this warp has issued
+  const Code* code_hint = nullptr;    // the code section the tier last found this warp in
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
   uint32_t local_size = 0;
   uint64_t steps = 0;
@@ -214,6 +221,25 @@ std::mutex& atomic_lock(uint64_t addr) {
   return locks[(addr >> 3) % 64];
 }
 
+void tier_add_total(uint64_t n);   // tier_ops.inc
+
+// The lanes whose program counter is `p`, compared two to a vector register where SSE2 is there.
+inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
+  Mask eq = 0;
+#if defined(__SSE2__)
+  const __m128i want = _mm_set1_epi64x(static_cast<long long>(p));
+  for (unsigned i = 0; i < 32; i += 2) {
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i]));
+    const __m128i e = _mm_cmpeq_epi32(v, want);
+    const __m128i both = _mm_and_si128(e, _mm_shuffle_epi32(e, 0xB1));   // a 64-bit lane is equal when both halves are
+    eq |= static_cast<Mask>(_mm_movemask_pd(_mm_castsi128_pd(both))) << i;
+  }
+#else
+  for (unsigned i = 0; i < 32; ++i) eq |= static_cast<Mask>(w.pc[i] == p) << i;
+#endif
+  return eq;
+}
+
 class Runner {
  public:
   Runner(const Module& m, const CubinKernel& k, const exec::LaunchConfig& cfg,
@@ -269,6 +295,12 @@ class Runner {
     // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
     // block. For checking that the fast paths compute what the general one does.
     if (const char* f = std::getenv("VGPU_FASTPATH"); f && f[0] == '0') fast_ = false;
+    if (tier::requested()) {
+      const char* tr = std::getenv("VGPU_SASS_TRACE");
+      tier_ = fast_ && simd::enabled() && !(tr && *tr);
+      const char* ts = std::getenv("VGPU_TIER_STATS");
+      tier_stats_ = tier_ && ts && ts[0] == '1';
+    }
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
       // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
@@ -284,6 +316,11 @@ class Runner {
 
   exec::LaunchStats run();
   void set_launches(Launches* dl) { dl_ = dl; }
+  // For the tier's handlers (tier_ops.inc): the memory the launch runs on, and the interpreter's memory
+  // instructions for the cases a handler leaves to it.
+  MemoryManager& memory() { return mem_; }
+  uint32_t tier_sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const { return sreg(blk, w, idx, lane); }
+  void tier_exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mem(blk, w, ins, ex); }
   ~Runner() {
     if (coop_ws_) {
       try {
@@ -303,9 +340,12 @@ class Runner {
   bool break_bsync_standoff(Block& blk);
   void init_block(Block& blk, uint64_t linear);
   bool step_warp(Block& blk, Warp& w);
+  bool tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc
   bool break_spin_wait(const std::vector<Block*>& blocks);
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
   bool fast_alu(Warp& w, const Instr& ins, Mask ex);   // exec_ops.inc
+  bool fast_wide(Warp& w, const Instr& ins, Mask ex);   // exec_ops.inc: the wider forms fast_alu hands over
+  bool fast_float(Warp& w, const Instr& ins, Mask ex);  // exec_ops.inc: the float forms fast_alu hands over
 
   // ---- state access ----
   const Instr& fetch(uint64_t addr, const Code** code_out = nullptr);
@@ -389,6 +429,10 @@ class Runner {
   MemoryManager& mem_;
   const DeviceProfile& profile_;
   bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
+  // The pre-decoded tier (src/sass/tier.hpp): VGPU_TIER=1, with the fast paths and the SIMD kernels it is held to on and
+  // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
+  bool tier_ = false;
+  bool tier_stats_ = false;
   std::vector<uint8_t> bank0_;
   std::map<unsigned, uint64_t> bank_va_, bank_size_;
   uint64_t entry_ = 0;
@@ -982,6 +1026,7 @@ exec::LaunchStats Runner::run() {
   }
   if (failure) std::rethrow_exception(failure);
   stats_.blocks = blocks;
+  if (tier_stats_) tier_add_total(stats_.instructions);
   return stats_;
 }
 
@@ -1268,6 +1313,16 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   // unpredictably, and a mispredicted branch per lane was the largest cost of this loop.
   uint64_t lo = w.pc[std::countr_zero(run)];
   Mask group = 0;
+  // With the tier on, a warp whose runnable lanes all stand at one address (the usual case) is found by comparing
+  // the 32 addresses at once: the same lo and group the pass below finds.
+  if (tier_) {
+    if (const Mask at = tier_lanes_at(w, lo); (run & ~at) == 0) {
+      group = run;
+    } else {   // diverged: the lowest address among the runnable lanes, and the lanes there
+      for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
+      group = tier_lanes_at(w, lo) & run;
+    }
+  } else
   for (Mask m = run; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     const uint64_t p = w.pc[l];
@@ -1339,6 +1394,16 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   // reads its own pc (LEPC) end the run and take the general path.
   uint64_t pc = pick;
   const Code* code = nullptr;
+  if (tier_ && !w.mactive_force) {
+    // The section the warp ran in last is most often the one it is in (Module::code_at searches them all).
+    if (w.code_hint && pc - w.code_hint->base < 16 * w.code_hint->count) {
+      code = w.code_hint;
+    } else {
+      fetch(pc, &code);
+      w.code_hint = code;
+    }
+    if (const tier::Program* tp = code->tier_program()) return tier_run(blk, w, group, pick, *code, *tp);
+  }
   const Instr* ins = &fetch(pc, &code);
   const uint64_t end = code->base + 16 * code->count;
   for (unsigned n = 0;; ++n) {
@@ -1415,8 +1480,34 @@ Mask guard_mask(const Warp& w, const Instr& ins, Mask group) {
 }
 
 #include "exec_ops.inc"
+#include "tier_ops.inc"
 
 }  // namespace
+
+// The tier of a code section: its instructions analysed once (tier.cpp), each bound to its handler (tier_ops.inc).
+const tier::Program* Code::tier_program() const {
+  Decoded& d = *decoded_;
+  if (const tier::Program* p = d.tier.load(std::memory_order_acquire)) return p;
+  std::call_once(d.tier_once, [&] {
+    if (count == 0) return;
+    (void)instr(0);   // decode the section if nobody has yet
+    auto prog = std::make_shared<tier::Program>();
+    prog->ops.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+      tier::MOp& op = prog->ops[i];
+      tier::analyze(instr(i), sm, *prog, op);
+      op.fn = tier_handler_for(op.form);
+      if (op.fn) {
+        ++prog->native;
+        prog->max_reg = std::max(prog->max_reg, op.maxreg);
+      }
+    }
+    prog->const_index.clear();
+    d.tier_owner = prog;
+    d.tier.store(prog.get(), std::memory_order_release);
+  });
+  return d.tier.load(std::memory_order_acquire);
+}
 
 // For sass::unsupported (module.cpp).
 bool runs_instr(const Instr& ins) { return executes(ins); }

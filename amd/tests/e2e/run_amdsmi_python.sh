@@ -25,7 +25,7 @@ sha=c711cdf0a23684735b258a9410b177e68b1d249e31aa558813efa3ebce5ebb63
 pkg="$build/amdsmi-26.2.2"
 if [[ ! -d "$pkg/amdsmi" ]]; then
   wheel="${VGPU_AMDSMI_WHEEL:-$build/amdsmi-26.2.2.whl}"
-  [[ -f "$wheel" ]] || curl -sfL --max-time 120 -o "$wheel" "$url" || { rm -f "$wheel"; echo "SKIP: cannot download amdsmi"; exit 0; }
+  [[ -f "$wheel" ]] || curl -sfL --http1.1 --retry 5 --retry-all-errors --retry-delay 3 --max-time 120 -o "$wheel" "$url" || { rm -f "$wheel"; echo "SKIP: cannot download amdsmi"; exit 0; }
   echo "$sha  $wheel" | sha256sum -c --quiet - || { rm -f "$wheel"; echo "FAIL  the amdsmi wheel is not the one expected"; exit 1; }
   rm -rf "$pkg.tmp" && mkdir -p "$pkg.tmp" && python3 -m zipfile -e "$wheel" "$pkg.tmp" && mv "$pkg.tmp" "$pkg"
 fi

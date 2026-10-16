@@ -242,6 +242,9 @@ class MemoryManager {
            __atomic_load_n(access_fault_->alu_pending, __ATOMIC_RELAXED);
   }
   uint64_t alu_result(uint64_t value, uint32_t bits) const { return access_fault_->on_alu(value, bits); }
+  // The word alu_fault_armed reads (null: no fault hook), for a caller that asks per instruction and keeps it
+  // rather than following the hook and its pointer each time. It does not change once the hook is set.
+  const uint64_t* alu_pending_flag() const { return access_fault_ ? access_fault_->alu_pending : nullptr; }
 
   // Whether a shared-memory load could come back changed; while none is,
   // shared_loaded returns its value as it is.
