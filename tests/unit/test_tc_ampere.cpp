@@ -51,7 +51,9 @@ float reference(const float* a, const float* b, unsigned K, unsigned chunk, int 
     int top = INT32_MIN;
     for (unsigned t = 0; t < chunk; ++t)
       if (a[k0 + t] != 0 && b[k0 + t] != 0) top = std::max(top, expo(a[k0 + t]) + expo(b[k0 + t]) + 1);
-    if (acc != 0) top = std::max(top, std::ilogb(acc) + 1);
+    // (An accumulator that overflowed in an earlier chunk is an infinity: ilogb gives INT_MAX and +1 overflows. It has taken part as
+    // INT32_MIN, which is what the wrapped sum was.)
+    if (acc != 0) top = std::max(top, std::isinf(acc) ? INT32_MIN : std::ilogb(acc) + 1);
     if (top == INT32_MIN) {
       acc = 0.0f;
       continue;
