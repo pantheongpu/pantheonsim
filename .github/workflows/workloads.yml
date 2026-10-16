@@ -126,10 +126,12 @@ jobs:
         cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0
         cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0
         libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
         with:
           path: pantheonsim
+      - uses: ./pantheonsim/.github/actions/pr-guard
 
       - uses: actions/checkout@v4
         with:
