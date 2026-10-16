@@ -269,6 +269,7 @@ variable is unset by default.
 | `VGPU_SASS_TRACE=<warp>` | Print every SASS instruction one warp runs, with the lane group and the first lane's results; after a `BSSY`, `BSYNC`, `BREAK` or `BMOV` it adds the barrier masks. | off |
 | `VGPU_SASS_TRACE_KERNEL=<text>` | Restrict the trace to kernels whose name contains the text. | all |
 | `VGPU_SASS_TRACE_BLOCK=<x>` | Trace block `(x,0,0)` instead of block `(0,0,0)`. | `0` |
+| `VGPU_SASS_TRACE_RAW=1` | Add each traced instruction's 128 bits (high word first) to the trace, for finding where a field is encoded. | off |
 
 The code reads further `VGPU_*` variables that plumb the simulator's own parts
 together (NVSHMEM and NCCL rendezvous, the NVRTC and nvJitLink libraries, state

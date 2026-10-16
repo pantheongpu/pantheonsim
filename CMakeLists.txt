@@ -2125,7 +2125,7 @@ if(TARGET vgpucublas)
   # cuBLAS's factorizations and batched solves (torch.linalg).
   foreach(_check IN ITEMS "fft_layouts:cufft" "fft_callbacks:cufft" "solver_paths:cusolver:cublas"
                           "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse"
-                          "sparse_paths:cusparse" "sparse_host_products:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
+                          "sparse_paths:cusparse" "sparse_host_products:cusparse" "graph_cg_capture:cublas:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
                           "lt_paths:cublasLt" "lt_epilogue_paths:cublasLt" "lt_blockscaled_paths:cublasLt"
                           "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
                           "blas_level23_paths:cublas" "blas_host_sums:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
@@ -2183,7 +2183,7 @@ if(TARGET vgpucublas)
   # cuBLASXt (blas_xt_paths.cu) spreads its GEMM tiles, and cuFFT's multi-GPU
   # descriptors (fft_multigpu.cu).
   foreach(_check IN ITEMS "driver_gaps:cuda" "driver_context_gaps:cuda" "driver_texture_gaps:cuda" "runtime_gaps:cudart" "runtime_capture_modes:cudart"
-                          "runtime_memory_gaps:cudart" "runtime_graph_gaps:cudart" "runtime_texture_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas" "fft_multigpu:cufft" "dnn_multigpu_norm:cudnn")
+                          "runtime_memory_gaps:cudart" "malloc_alignment:cudart" "runtime_graph_gaps:cudart" "runtime_texture_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas" "fft_multigpu:cufft" "dnn_multigpu_norm:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -2824,6 +2824,14 @@ set_tests_properties(e2e_texture_layers PROPERTIES
 add_test(NAME e2e_constant_global_load
          COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_constant_global_load.sh)
 set_tests_properties(e2e_constant_global_load PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
+
+# CUDA Samples' quasirandomGenerator kernel, a table in __constant__ memory XORed by position bits, on both engines.
+add_test(NAME e2e_constant_table_xor
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_constant_table_xor.sh)
+set_tests_properties(e2e_constant_table_xor PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)

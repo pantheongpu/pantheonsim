@@ -167,6 +167,34 @@ int main() {
   }
   CK(cuMemRelease(retained));
 
+  // Generic compression, as CUDA Samples' cudaCompressibleMemory finds it: an Ampere or later card answers the
+  // attribute with 1 (an RTX 3060, an L4, an L40S and an RTX PRO 6000 were measured), cuMemCreate with the flag
+  // then hands out memory whose properties say it is compressed, and without the flag they say it is not.
+  int major = 0, compression = -1;
+  CK(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev));
+  CK(cuDeviceGetAttribute(&compression, CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED, dev));
+  if (major >= 8 && compression != 1) {
+    printf("FAIL an Ampere device answers GENERIC_COMPRESSION_SUPPORTED with %d, not 1\n", compression);
+    return 1;
+  }
+  CUmemAllocationProp cprop = prop;
+  cprop.allocFlags.compressionType = CU_MEM_ALLOCATION_COMP_GENERIC;
+  CUmemGenericAllocationHandle comp = 0, plain = 0;
+  CK(cuMemCreate(&comp, granularity, &cprop, 0));
+  CK(cuMemCreate(&plain, granularity, &prop, 0));
+  CUmemAllocationProp comp_got{}, plain_got{};
+  CK(cuMemGetAllocationPropertiesFromHandle(&comp_got, comp));
+  CK(cuMemGetAllocationPropertiesFromHandle(&plain_got, plain));
+  const unsigned char want_comp = compression ? CU_MEM_ALLOCATION_COMP_GENERIC : CU_MEM_ALLOCATION_COMP_NONE;
+  if (comp_got.allocFlags.compressionType != want_comp || plain_got.allocFlags.compressionType != CU_MEM_ALLOCATION_COMP_NONE) {
+    printf("FAIL compression: requested -> %d (want %d), not requested -> %d (want 0)\n",
+           static_cast<int>(comp_got.allocFlags.compressionType), static_cast<int>(want_comp),
+           static_cast<int>(plain_got.allocFlags.compressionType));
+    return 1;
+  }
+  CK(cuMemRelease(comp));
+  CK(cuMemRelease(plain));
+
   // What a device refuses. An unaligned size, a mapping outside the
   // reservation, and freeing address space that is still mapped.
   CUdeviceptr scratch = 0;

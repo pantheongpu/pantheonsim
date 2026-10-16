@@ -105,11 +105,11 @@ Samples/4_CUDA_Libraries/conjugateGradientCudaGraphs/conjugateGradientCudaGraphs
 Samples/4_CUDA_Libraries/conjugateGradientMultiBlockCG/conjugateGradientMultiBlockCG|&&&& conjugateGradientMultiBlockCG PASSED||
 Samples/4_CUDA_Libraries/conjugateGradientPrecond/conjugateGradientPrecond|   Counted total of 0 errors||
 Samples/4_CUDA_Libraries/conjugateGradientUM/conjugateGradientUM|Test Summary:  Error amount = 0.000000, result = SUCCESS||
-Samples/4_CUDA_Libraries/cuSolverDn_LinearSolver/cuSolverDn_LinearSolver||b - A*x|/(|A|*|x|) =||
+Samples/4_CUDA_Libraries/cuSolverDn_LinearSolver/cuSolverDn_LinearSolver|%7Cb - A*x%7C/(%7CA%7C*%7Cx%7C) =||
 Samples/4_CUDA_Libraries/cuSolverRf/cuSolverRf|cusolverRf solve||
 Samples/4_CUDA_Libraries/cuSolverSp_LinearSolver/cuSolverSp_LinearSolver|||
-Samples/4_CUDA_Libraries/cuSolverSp_LowlevelCholesky/cuSolverSp_LowlevelCholesky|(GPU) |b - A*x|/(|A|*|x|) =||
-Samples/4_CUDA_Libraries/cuSolverSp_LowlevelQR/cuSolverSp_LowlevelQR|(GPU) |b - A*x|/(|A|*|x|) =||
+Samples/4_CUDA_Libraries/cuSolverSp_LowlevelCholesky/cuSolverSp_LowlevelCholesky|(GPU) %7Cb - A*x%7C/(%7CA%7C*%7Cx%7C) =||
+Samples/4_CUDA_Libraries/cuSolverSp_LowlevelQR/cuSolverSp_LowlevelQR|(GPU) %7Cb - A*x%7C/(%7CA%7C*%7Cx%7C) =||
 Samples/4_CUDA_Libraries/lineOfSight/lineOfSight|Test passed||
 Samples/4_CUDA_Libraries/matrixMulCUBLAS/matrixMulCUBLAS|Comparing CUBLAS Matrix Multiply with CPU results: PASS||
 Samples/4_CUDA_Libraries/nvJPEG/nvJPEG|||

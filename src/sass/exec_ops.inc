@@ -242,6 +242,14 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
       std::snprintf(b, sizeof b, "  b0..5=%08x %08x %08x %08x %08x %08x", w.b[0], w.b[1], w.b[2], w.b[3], w.b[4], w.b[5]);
       vals += b;
     }
+    // VGPU_SASS_TRACE_RAW=1 adds the instruction's 128 bits (high word first), for finding where a field is encoded.
+    static const bool raw = [] { const char* v = std::getenv("VGPU_SASS_TRACE_RAW"); return v && v[0] == '1'; }();
+    if (raw) {
+      char b[48];
+      std::snprintf(b, sizeof b, "  raw=%016llx%016llx", static_cast<unsigned long long>(ins.w.hi),
+                    static_cast<unsigned long long>(ins.w.lo));
+      vals += b;
+    }
     std::fprintf(stderr, "  [%08x %08x] %04llx  %-50s%s\n", group, ex, static_cast<unsigned long long>(ins.pc),
                  to_text(ins).c_str(), vals.c_str());
   }
