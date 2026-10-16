@@ -466,8 +466,9 @@ void build_micro(EntryFn& fn) {
       }
     } else if (const auto* op = std::get_if<OpFma>(&ins.op); op && op->ty.bits == 64) {
       const size_t consts = fn.micro_consts.size();
-      ok = op->round == FRound::Nearest && !op->sat && !op->ftz && wide_dst(op->dst) && source_f64(0, op->a) &&
-           source_f64(1, op->b) && source_f64(2, op->c);
+      // (The multiplicands in the order ptxas gives them: OpFma::nan_swap_ab.)
+      ok = op->round == FRound::Nearest && !op->sat && !op->ftz && wide_dst(op->dst) &&
+           source_f64(0, op->nan_swap_ab ? op->b : op->a) && source_f64(1, op->nan_swap_ab ? op->a : op->b) && source_f64(2, op->c);
       if (ok) {
         u.kind = MicroOp::Fma64;
         u.sub = static_cast<uint8_t>((op->neg_ab ? 1 : 0) | (op->neg_c ? 2 : 0));

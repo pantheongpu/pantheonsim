@@ -2030,6 +2030,90 @@ VTEST(pre_decoded_f64_forms_match_the_general_path) {
   (void)y2;
 }
 
+// Which of two NaN operands an f64 add, sub, mul, min, max or fma returns follows the order ptxas gives the operands, not the order of
+// the text: the operand whose register was defined later wins (OpFloatBin::nan_a_first, OpFma::nan_swap_ab, mark_nan_order in
+// src/ptx/contract.cpp, which also follows copies, common subexpressions and min or max of a value with itself as ptxas does, and
+// negates a constant subtrahend). The expected words were taken from an RTX 3060 by loading each form's PTX through the driver (A, B, C
+// loaded in that order, A the NaN 0x7ff8...01, B 0xfff8...02, C 0x7ff8...03). Fast and general paths must both give them, and so must
+// the forms (those without a mov or a repeated expression) under a guard, where the micro-ops decline and the other paths run.
+VTEST(f64_nan_pairs_follow_the_operand_order_ptxas_gives) {
+  struct Form { const char* body; uint64_t want; bool guardable; };
+  static const Form forms[] = {
+      {"add.f64 %D, %A, %B;", 0xfff8000000000002ull, true},
+      {"add.f64 %D, %B, %A;", 0xfff8000000000002ull, true},
+      {"sub.f64 %D, %A, %B;", 0xfff8000000000002ull, true},
+      {"sub.f64 %D, %B, %A;", 0xfff8000000000002ull, true},
+      {"mul.f64 %D, %A, %B;", 0xfff8000000000002ull, true},
+      {"mul.f64 %D, %B, %A;", 0xfff8000000000002ull, true},
+      {"min.f64 %D, %A, %B;", 0xfff8000000000002ull, true},
+      {"min.f64 %D, %B, %A;", 0xfff8000000000002ull, true},
+      {"max.f64 %D, %A, %B;", 0xfff8000000000002ull, true},
+      {"max.f64 %D, %B, %A;", 0xfff8000000000002ull, true},
+      {"add.f64 %D, %A, %C;", 0x7ff8000000000003ull, true},
+      {"add.f64 %D, %C, %B;", 0x7ff8000000000003ull, true},
+      {"mul.f64 %D, %C, %A;", 0x7ff8000000000003ull, true},
+      {"fma.rn.f64 %D, %A, %B, %C;", 0xfff8000000000002ull, true},
+      {"fma.rn.f64 %D, %B, %A, %C;", 0xfff8000000000002ull, true},
+      {"fma.rn.f64 %D, %C, %B, %A;", 0x7ff8000000000003ull, true},
+      {"fma.rn.f64 %D, %A, %C, %B;", 0x7ff8000000000003ull, true},
+      {"fma.rn.f64 %D, %A, %A, %B;", 0x7ff8000000000001ull, true},
+      {"fma.rn.f64 %D, %A, %B, %A;", 0xfff8000000000002ull, true},
+      {"fma.rn.f64 %D, %B, %B, %A;", 0xfff8000000000002ull, true},
+      {"mov.f64 %rd10, %A; add.f64 %D, %rd10, %B;", 0xfff8000000000002ull, false},
+      {"mov.f64 %rd10, %B; add.f64 %D, %A, %rd10;", 0xfff8000000000002ull, false},
+      {"mov.f64 %A, %C; add.f64 %D, %A, %B;", 0x7ff8000000000003ull, false},
+      {"mov.f64 %rd10, %C; add.f64 %D, %rd10, %A;", 0x7ff8000000000003ull, false},
+      {"mov.f64 %rd10, %A; fma.rn.f64 %D, %rd10, %B, %C;", 0xfff8000000000002ull, false},
+      {"add.f64 %rd10, %A, %B; add.f64 %D, %rd10, %C;", 0xfff8000000000002ull, true},
+      {"add.f64 %rd10, %A, %B; add.f64 %D, %C, %rd10;", 0xfff8000000000002ull, true},
+      {"add.f64 %rd10, %B, %C; add.f64 %D, %A, %rd10;", 0x7ff8000000000003ull, true},
+      {"add.f64 %rd10, %A, %B; sub.f64 %D, %C, %rd10;", 0xfff8000000000002ull, true},
+      {"mul.f64 %rd10, %A, %B; add.f64 %D, %rd10, %C;", 0xfff8000000000002ull, true},
+      {"mul.f64 %rd10, %A, %B; add.f64 %D, %C, %rd10;", 0xfff8000000000002ull, true},
+      {"mul.f64 %rd10, %A, %B; sub.f64 %D, %rd10, %C;", 0xfff8000000000002ull, true},
+      {"mul.f64 %rd10, %A, %B; sub.f64 %D, %C, %rd10;", 0xfff8000000000002ull, true},
+      {"mul.f64 %rd10, %C, %B; add.f64 %D, %rd10, %A;", 0x7ff8000000000003ull, true},
+      {"add.f64 %D, %A, 0d7FF8000000000009;", 0x7ff8000000000009ull, true},
+      {"add.f64 %D, 0d7FF8000000000009, %A;", 0x7ff8000000000009ull, true},
+      {"mul.f64 %D, %A, 0dFFF8000000000009;", 0xfff8000000000009ull, true},
+      {"sub.f64 %D, %A, 0d7FF8000000000009;", 0xfff8000000000009ull, true},
+      {"sub.f64 %D, 0d7FF8000000000009, %A;", 0x7ff8000000000009ull, true},
+      {"min.f64 %D, %A, 0d7FF8000000000009;", 0x7ff8000000000009ull, true},
+      {"max.f64 %D, 0dFFF8000000000009, %A;", 0xfff8000000000009ull, true},
+      {"fma.rn.f64 %D, %A, 0d7FF8000000000009, %B;", 0x7ff8000000000009ull, true},
+      {"fma.rn.f64 %D, %A, %B, 0d7FF8000000000009;", 0xfff8000000000002ull, true},
+      {"add.f64 %rd10, %A, %B; add.f64 %rd11, %A, %B; add.f64 %D, %rd11, %C;", 0xfff8000000000002ull, false},
+      {"add.f64 %rd10, %A, %B; add.f64 %rd12, %B, %C; add.f64 %rd11, %A, %B; add.f64 %D, %rd11, %rd12;", 0xfff8000000000002ull, false},
+      {"add.f64 %rd10, %A, %B; mul.f64 %rd12, %C, %C; add.f64 %rd11, %B, %A; add.f64 %D, %rd11, %rd12;", 0x7ff8000000000003ull, false},
+      {"add.f64 %rd10, %A, %B; add.f64 %rd12, %B, %C; add.f64 %rd11, %A, %B; add.f64 %rd13, %rd11, %rd12; add.f64 %D, %rd13, %rd10;", 0x7ff8000000000003ull, false},
+      {"min.f64 %rd10, %A, %A; add.f64 %D, %rd10, %B;", 0xfff8000000000002ull, false},
+      {"max.f64 %rd10, %C, %C; add.f64 %D, %A, %rd10;", 0x7ff8000000000003ull, false},
+  };
+  const std::vector<uint64_t> a(kThreads, 0x7FF8000000000001ull), b(kThreads, 0xFFF8000000000002ull), c(kThreads, 0x7FF8000000000003ull);
+  for (const Form& f : forms)
+    for (int guard : {1, 2, 0}) {
+      if (guard != 1 && !f.guardable) continue;
+      g_guard = guard;
+      for (const char* fast : {"1", "0"}) {
+        setenv("VGPU_FASTPATH", fast, 1);
+        const auto out = run(f.body, true, a, b, c);
+        unsetenv("VGPU_FASTPATH");
+        for (int i = 0; i < kThreads; ++i) {
+          // Lanes outside the guard keep the 0x5A5A... the kernel starts the result with.
+          const bool runs = guard == 1 || (guard == 2 ? (i & 1) && i < 32 : !(i & 1) || i >= 32);
+          const uint64_t want = runs ? f.want : 0x5A5A5A5A5A5A5A5Aull;
+          if (out[i] != want) {
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "'%s' guard %d thread %d (fast path %s): got 0x%llx, the card gives 0x%llx", f.body, guard, i, fast,
+                          (unsigned long long)out[i], (unsigned long long)want);
+            throw vtest::Failure(buf);
+          }
+        }
+      }
+    }
+  g_guard = 0;
+}
+
 // Conversions from f32 and f64 to 32- and 64-bit integers in every integer rounding mode, between f32 and f64, and the
 // round-to-integral forms that keep the type, as pre-decoded forms against the general path, unguarded and under both
 // guards: values at and beyond the destination ranges (2^31, 2^32, 2^63, 2^64), halves that round to even, negative

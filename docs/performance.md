@@ -1061,6 +1061,26 @@ the local-window bounds check (now the fault tests), MUFU source modifiers and I
 multiply and flush branches (not reachable from code ptxas emits for sm_86; removed rather than left untested). One mutation of the 16-bit
 store mask in the gather path is equivalent (the memory call truncates).
 
+**Which NaN the PTX engine returns (r9-correct3).** With a NaN in both operands of an f64 add, sub, mul, min, max or fma, an RTX 3060
+returns one of them by the position ptxas gives the operands in the SASS instruction, which it chooses itself: the operand defined later
+in the PTX wins, whatever its name, whatever its position in the instruction (probed with PTX loaded through the driver, so that the
+text is exactly what ptxas saw; the SASS executor, which runs ptxas's choice, was already right). In SASS terms the NaN of Rb is
+returned, else that of Rc, else Ra's (quieted, sign and payload kept), with the commutative operands put in definition order, so for
+`fma(a, b, c)` the later multiplicand, then c, then the earlier multiplicand. `mark_nan_order` (src/ptx/contract.cpp, run when a function
+is parsed) records the choice in `OpFloatBin::nan_a_first` and `OpFma::nan_swap_ab`, and the PTX engine's general path, its fast paths and
+the pre-decoded micro-ops read it. A register's definition order is that of its latest definition before the instruction; a constant
+operand counts as latest; a `mov` of a 64-bit register is a copy that has the rank of what it copies; an expression ptxas has already
+computed from the same values (when the first result is read later: dead code goes first), and `min` or `max` of a value with itself,
+have the earlier result's rank; and `sub.f64 a, <constant>` is `add.f64 a, <the constant negated>`, so a NaN constant that is the answer
+comes back with its sign flipped. All of it was checked on the card with 49 hand-written PTX forms (now `f64_nan_pairs_follow_the_operand_order_ptxas_gives`
+in test_fastpath, fast and general path, unguarded and under both guards) and about 3,000 random straight-line kernels, in which the only
+unmatched kernels were the identities listed above before they were handled. Not reproduced: a loop-carried or branch-dependent
+definition order (ranks follow the text), predicated definitions (counted as definitions), and any program whose registers ptxas renames
+differently from the text's order of definition; none of the programs tried had one. `nvidia/tests/e2e/round9_probe.cu` (from the r9-verify
+agent) prints a hash and the first values of 37 sections, among them every NaN pair of dadd, dmul, dfma, dmin and dmax, and
+`run_round9_probe.sh` requires both engines at every SIMD level to equal `nvidia/tests/data/round9_probe.rtx3060.txt`, apart from the
+hashes of `f32_lg2` and `f32_sin` (the SFU approximations), and requires `VGPU_TC_EXACT=0` to change only the three wmma lines.
+
 **Not done, and why.** F2F, FRND, F2I from f64/f16, I2F from 64 bits, HSETP2/HSET2/HMNMX2, bf16 arithmetic, the f32-result forms of
 HMUL2/HFMA2 (ptxas of CUDA 13.0.88 emits only HADD2.F32 for sm_86), MUFU.RCP64H, vector and shared atomics: still the general path. The
 sector and bank counting (`memcount::distinct_sectors`, `sass_bank_passes`) is 10-17% of the memory-bound programs and is r7-memory's
@@ -1180,8 +1200,8 @@ signalling NaNs. `float_half_forms` now pins the round-to-integral forms of NaNs
 Remaining PTX-engine differences from the card, none of them a rule the PTX text states: `rsqrt(double)` (the card runs a software sequence from
 `MUFU.RSQ64H`; `rsqrt.approx.f64` here is correctly rounded, 1 ulp from the card in about a third of the lanes, and the SASS executor, which
 runs the card's sequence, matches); `static_cast<double>(-fabsf(b))` of a NaN (ptxas folds `-|x|` into the F2F; the PTX engine runs `abs` and
-`neg` as instructions); and an fma whose multiplicands ptxas swapped (the NaN of the first multiplicand is chosen by the instruction's operand
-order, which the PTX text does not fix). **Atomics order.** The old values a warp's lanes get back from an atomic on one address are in lane order on the card
+`neg` as instructions). (The third gap listed earlier, an fma whose multiplicands ptxas swapped, is closed: see "Which NaN the PTX engine returns".)
+**Atomics order.** The old values a warp's lanes get back from an atomic on one address are in lane order on the card
 and in both engines (probed with 32 threads, `atomicAdd`, `atomicExch`, two interleaved addresses; identical). Between warps of a block and between blocks the card's order
 is its scheduler's: in five of five repeats a global `atomicAdd` / `atomicExch` by 4 blocks of 64 threads gave different old values from the first run in at least one of them, and for shared memory after a
 barrier the card's warp order was the same on every repeat but not a function of the warp number (64 threads: warp 1 first; 128: warps

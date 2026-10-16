@@ -848,6 +848,7 @@ class Parser {
     expect_punct("{");
     parse_body(fn);
     contract_mul_add(fn);
+    mark_nan_order(fn);
     fold_constant_sync_masks(fn);
     place_dynamic_shared(fn);
     current_kernel_.clear();

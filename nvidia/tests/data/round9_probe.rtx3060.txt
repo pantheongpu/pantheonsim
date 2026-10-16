@@ -1,0 +1,37 @@
+wmma_f16               27b48a75dbc70352 c6284067 c63d513d 44eb6bd9 c5f81d05
+wmma_bf16              64c5e4923c96988e c627fe6a c63d1539 44eafc64 c5f8ac56
+wmma_tf32              894558ef26cad93f c5551958 460b56f7 4694ce79 c5dab7ae
+f32_fadd               4d8a44e80b0df865 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_fmul               c570bd9ac1c06da1 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_ffma               b2696410339f5db2 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_fmin               b1a21ac305faabee 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7f800000
+f32_fmax               50f525c2f7cba96e 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7f800000
+f32_f2i                80d5601e1fea10f3 00000000 00000000 00000000 00000000 00000000 00000000
+f32_f2h2f              6b41246539d9b35b 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_f2bf2f             dbb3f892d7b441fb 7fff0000 7fff0000 7fff0000 7fff0000 7fff0000 7fff0000
+f32_rcp                95e818808fa0c2db 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_sqrt               f35eaf8dbb0a346b 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_ex2                39bde8d0f36ec35b 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_lg2                269ecc90d0cb9c33 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_sin                09d1d48dcb9773ab 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_rint               3831e6493fdcf54b 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_trunc              3831e6493fdcf54b 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff 7fffffff
+f32_f2u                04f9848667e94793 00000000 00000000 00000000 00000000 00000000 00000000
+f64_dadd               12ff36d3a2f884c3 00000000 7ff80000 00000000 7ff80000 00000000 7ff80000
+f64_dmul               15de294f86bd4c23 00000000 7ff80000 00000000 7ff80000 00000000 7ff80000
+f64_dfma               b819971818f837f5 00000000 7ff80000 00000000 7ff80000 00000000 7ff80000
+f64_dmin               54f7a96330640525 00000000 7ff80000 00000000 7ff80000 00000000 7ff80000
+f64_dmax               2a1e309867885071 00000000 7ff80000 00000000 7ff80000 00000000 7ff80000
+f64_d2f2d              cd6f0cc74a1e0253 00000000 7ff80000 00000000 7ff80000 00000000 7ff80000
+negzero_sat_ftz        23f95bbbc271ee83 00000000 00000000 00000000 80000000 80000000 00000000 80000000 00000000
+bf16_hfma2             beb278ccbc5592fb 5b30f788 caf4fc9d e68f44da 45f8a50b fa07ff80 3dbb871c
+f16_hfma2              6d4b1d2374a3f7c6 5b5bf788 caf47fff e68f48dd 4977a855 fc00fc00 3dbb872c
+int_d2ll               96f392532f12a624 00000000 80000000 ffffffff 7fffffff
+int_d2ull              93f92047ba3b1c02 00000000 80000000 ffffffff ffffffff
+int_f2ll               96f392532f12a624 00000000 80000000 ffffffff 7fffffff
+int_d2ll_rn            5057e08e36d9c36b 00000000 80000000 ffffffff 7fffffff
+int_sad                361121f5c9279572 2fe5c786 00000000 f662b120 00000000
+int_usad               076458c0514e3fde 2fe5c786 00000000 14e4ed0c 00000000
+int_adds32             b45aa99ac9e59955 80000000 ffffffff 23a965e1 00000000
+int_cvt_sat_s64        96f392532f12a624 00000000 80000000 ffffffff 7fffffff
+launch_errors 1 1 0 0 0

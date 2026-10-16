@@ -2095,6 +2095,15 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # What round 9 changed on purpose (tensor-core sums, NaN selection for floats and doubles, conversions, 64-bit saturation, __sad, launch
+  # error codes), both engines at every SIMD level against an RTX 3060's lines; VGPU_TC_EXACT=0 moves only the wmma lines.
+  add_test(NAME e2e_round9_probe
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_round9_probe.sh)
+  set_tests_properties(e2e_round9_probe PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   # The f32/f16/f64 forms with a flush, a saturation, a NaN rule or a byte permute: SASS == PTX == an RTX 3060, per form.
   add_test(NAME e2e_float_half_forms
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_float_half_forms.sh)

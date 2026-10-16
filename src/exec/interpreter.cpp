@@ -5992,8 +5992,9 @@ class Interpreter {
     }
     if (op.ty.bits != 64 || !op.dst.wide) return false;
     Lanes sa, sb, sc;
-    const Lanes& a = read_wide(w, ctx, ins, op.a, sa);
-    const Lanes& b = read_wide(w, ctx, ins, op.b, sb);
+    // (The multiplicands in the order ptxas gives them, which decides a NaN; see OpFma::nan_swap_ab.)
+    const Lanes& a = read_wide(w, ctx, ins, op.nan_swap_ab ? op.b : op.a, sa);
+    const Lanes& b = read_wide(w, ctx, ins, op.nan_swap_ab ? op.a : op.b, sb);
     const Lanes& c = read_wide(w, ctx, ins, op.c, sc);
     uint64_t* d = dst64(w, op.dst.id, m);
 #if defined(__x86_64__) && defined(__GNUC__)
@@ -6411,13 +6412,13 @@ class Interpreter {
           if (op->xorsign_abs) {
             // The smaller/larger magnitude, signed sign(a) ^ sign(b); a NaN
             // operand is ignored as in plain min/max (unless .NaN).
-            uint64_t v = float_bin(op->op, op->ty, av & ~sign, bvv & ~sign, op->nan_propagate);
+            uint64_t v = float_bin(op->op, op->ty, av & ~sign, bvv & ~sign, op->nan_propagate, op->nan_a_first);
             if (!float_is_nan(op->ty, v)) v = (v & ~sign) | ((av ^ bvv) & sign);
             r[lane] = v;
           } else if (op->approx) {
             r[lane] = div_approx32(static_cast<uint32_t>(av), static_cast<uint32_t>(bvv));
           } else {
-            r[lane] = float_bin(op->op, op->ty, av, bvv, op->nan_propagate);
+            r[lane] = float_bin(op->op, op->ty, av, bvv, op->nan_propagate, op->nan_a_first);
           }
           r[lane] = flush(r[lane]);
           if (op->sat) r[lane] = float_sat(op->ty, r[lane]);
@@ -6479,9 +6480,11 @@ class Interpreter {
         });
       else
         for_active(m, W_, [&](uint32_t l) {
-          const double av = f64(a[l]), bv = f64(b[l]), cv = f64(c[l]);
-          if (std::isnan(av) || std::isnan(bv) || std::isnan(cv)) {   // b's NaN, else c's, else a's, quieted (an RTX 3060)
-            r[l] = (std::isnan(bv) ? b[l] : std::isnan(cv) ? c[l] : a[l]) | 0x0008000000000000ull;
+          // The multiplicands in the order ptxas gives them (OpFma::nan_swap_ab): b's NaN, else c's, else a's, quieted (an RTX 3060).
+          const uint64_t am = op->nan_swap_ab ? b[l] : a[l], bm = op->nan_swap_ab ? a[l] : b[l];
+          const double av = f64(am), bv = f64(bm), cv = f64(c[l]);
+          if (std::isnan(av) || std::isnan(bv) || std::isnan(cv)) {
+            r[l] = (std::isnan(bv) ? bm : std::isnan(cv) ? c[l] : am) | 0x0008000000000000ull;
             return;
           }
           r[l] = f64bits(std::fma(sa * av, bv, sc * cv));
@@ -11056,7 +11059,7 @@ class Interpreter {
   static float rcp_approx32(float x) { return static_cast<float>(1.0 / static_cast<double>(x)); }
 
   uint64_t float_bin(FloatBinOp op, Type ty, uint64_t a, uint64_t b,
-                     bool nan_propagate = false) {
+                     bool nan_propagate = false, bool a_first = false) {
     if (nan_propagate && (op == FloatBinOp::Min || op == FloatBinOp::Max)) {
       const double x = ty.bits == 64 ? f64(a) : static_cast<double>(f32(a));
       const double y = ty.bits == 64 ? f64(b) : static_cast<double>(f32(b));
@@ -11068,10 +11071,11 @@ class Interpreter {
         return kCanonicalNaN16;
       }
     }
-    return float_bin_impl(op, ty, a, b);
+    return float_bin_impl(op, ty, a, b, a_first);
   }
 
-  uint64_t float_bin_impl(FloatBinOp op, Type ty, uint64_t a, uint64_t b) {
+  // `a_first` (f64): with a NaN in both operands the card returns a's, not b's (OpFloatBin::nan_a_first: ptxas puts the later-defined operand first).
+  uint64_t float_bin_impl(FloatBinOp op, Type ty, uint64_t a, uint64_t b, bool a_first = false) {
     if (ty.bits == 16) {
       double x = f16_to_double(a), y = f16_to_double(b), r = 0;
       switch (op) {
@@ -11103,7 +11107,8 @@ class Interpreter {
     // Division is a software sequence on the card and keeps the host's.
     if ((op == FloatBinOp::Min || op == FloatBinOp::Max) && (std::isnan(x) != std::isnan(y)))
       return std::isnan(x) ? b : a;   // (not the host's fmin, which turns a signalling NaN into a NaN result)
-    if ((std::isnan(x) || std::isnan(y)) && op != FloatBinOp::Div) return (std::isnan(y) ? b : a) | 0x0008000000000000ull;
+    if ((std::isnan(x) || std::isnan(y)) && op != FloatBinOp::Div)
+      return ((std::isnan(x) && (!std::isnan(y) || a_first)) ? a : b) | 0x0008000000000000ull;
     switch (op) {
       case FloatBinOp::Add: r = x + y; break;
       case FloatBinOp::Sub: r = x - y; break;

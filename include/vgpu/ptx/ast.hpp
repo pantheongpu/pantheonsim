@@ -747,10 +747,16 @@ struct OpShf { bool left = false; bool wrap = false; Reg dst; Operand a, b, c; }
 // approx: div.approx.f32, documented as a * (1/b) -- the reciprocal the
 // approximate one rcp.approx gives -- for |b| in [2^-126, 2^126], and 0 (NaN
 // for an infinite a) for 2^126 < |b| < 2^128.
-struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; bool sat = false; bool xorsign_abs = false; bool ftz = false; bool round_explicit = false; bool approx = false; };
+struct OpFloatBin { FRound round = FRound::Nearest; FloatBinOp op = FloatBinOp::Add; bool nan_propagate = false; Type ty; Reg dst; Operand a, b; bool sat = false; bool xorsign_abs = false; bool ftz = false; bool round_explicit = false; bool approx = false;
+  // f64 only (set by mark_nan_order, src/ptx/contract.cpp): the card's choice among two NaN operands follows ptxas's operand order, not the
+  // text's -- the operand defined LATER wins. True when `a` is the later one (the engines' rule is otherwise b's NaN first, then a's).
+  bool nan_a_first = false; };
 // neg_ab / neg_c negate the product / the addend: what a contracted sub
 // becomes (c - a*b is fma(-a, b, c); a*b - c is fma(a, b, -c)).
-struct OpFma { Type ty; Reg dst; Operand a, b, c; FRound round = FRound::Nearest; bool sat = false; bool ftz = false; bool neg_ab = false, neg_c = false; };
+struct OpFma { Type ty; Reg dst; Operand a, b, c; FRound round = FRound::Nearest; bool sat = false; bool ftz = false; bool neg_ab = false, neg_c = false;
+  // f64 only (mark_nan_order): `a` is the later-defined multiplicand, so it is the one ptxas puts first in the card's NaN order (b, c, a) of
+  // the engines' rule; the engines read the multiplicands exchanged.
+  bool nan_swap_ab = false; };
 // Packed half2 SIMD: one 32-bit register holds two f16 lanes.
 // Half-precision arithmetic. One node covers four shapes, because they differ
 // only in how many 16-bit values a 32-bit register holds and how those bits

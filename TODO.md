@@ -2402,6 +2402,11 @@ divergent code, IPDOM); `vgpu counters`' spill note (`src/cli/main.cpp:103-114`,
 file's "Registers and counters" because it is output text, not documentation).
 
 
+**2026-10-16 (r9-correct3): PTX NaN operand order.** r9-verify's probe found the PTX engine picking the second operand of a two-NaN f64 add/mul
+where the card picks the first, because r9-correct2 applied the SASS rule (Rb's NaN first) to PTX text, whose operands ptxas reorders by
+definition order. `mark_nan_order` (src/ptx/contract.cpp) now records that order per instruction; the probe's 1944 double results and 49
+driver-loaded PTX forms equal the card; see docs/performance.md ("Which NaN the PTX engine returns"). New e2e `round9_probe`.
+
 **2026-10-15 (round 9, r9-correct): SASS == PTX == card.** The new e2e `float_half_forms` hashes the
 single-instruction f32/f16/f64 forms and mma.sync/wmma/__sad per form against an RTX 3060, and both
 engines now print exactly the card's lines. Found: SASS `.SAT` of -0, `FMNMX` of two NaNs, `MUFU` NaNs
