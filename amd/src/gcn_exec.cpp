@@ -3304,6 +3304,7 @@ struct Machine {
       return true;
     }
     if (name == "v_cvt_scalef32_f16_fp8" || name == "v_cvt_scalef32_f16_bf8") {
+      if (in.arch != gcn::Target::Gfx950) throw Error::make(Err::Unsupported, name, " is an instruction of gfx950");
       // One 8-bit float widened to a half and scaled (CDNA4 guide, V_CVT_SCALEF32_F16_FP8: "scale = exponent(S1.f32); srcbyte = OPSEL[1:0] * 8;
       // tmp = fp8_to_f16_scale(src, scale.u8); // OPSEL[3] controls destination hi/lo; D0 = tmp.b32" -- the pseudocode stops there). The
       // half goes to the half OPSEL[3] names and the other half is kept: the builtin takes the old destination as its first argument
@@ -3334,6 +3335,8 @@ struct Machine {
       // applied).
       const size_t from_at = name.rfind('_', name.size() - 1);
       const std::string from = name.substr(from_at + 1);
+      // (A name that narrows -- from a float, half or bfloat16 -- is scalef32_narrow's, and gfx950's and gfx1250's alone.)
+      if (from == "f32" || from == "f16" || from == "bf16") throw Error::make(Err::Unsupported, name, " is not an instruction of this target");
       const std::string head = name.substr(15, from_at - 15);   // "pk_f32", "f32", "pk32_f16" ...
       const bool pk32 = head.rfind("pk32_", 0) == 0, pk = head.rfind("pk_", 0) == 0;
       const std::string to = head.substr(pk32 ? 5 : pk ? 3 : 0);
