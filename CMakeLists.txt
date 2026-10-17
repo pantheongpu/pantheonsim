@@ -2428,6 +2428,17 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # Device functions the device link cloned under one section name: a PDF called through a table of
+  # pointers must run the copy of pow its own call names, not the last one the cubin holds (GooFit's
+  # GenArgusTest returned NaN).
+  add_test(NAME e2e_rdc_clones
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_rdc_clones.sh)
+  set_tests_properties(e2e_rdc_clones PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   add_test(NAME e2e_bsync_across_calls
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_bsync_across_calls.sh)
   set_tests_properties(e2e_bsync_across_calls PROPERTIES
