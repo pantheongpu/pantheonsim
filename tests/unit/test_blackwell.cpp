@@ -8,6 +8,7 @@
 // 9.7.18.10.5 (for M = 128 with a CTA pair, the upper half of N in lanes
 // 64-127). The products are checked against a plain host GEMM.
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -1261,6 +1262,66 @@ VTEST(tcgen05_mma_accumulate_scale_and_negate) {
     for (int n = 0; n < N; ++n) x.d_in[0][size_t(m) * 32 + n] = f32_bits(D0(m, n));
   check_d_f32(x.run(), 1, M, N, K, [&](int m, int k) { return -A(m, k); }, B,
               [&](int m, int n) { return D0(m, n) / 4.0f; }, 0, 32);
+}
+
+// A NaN in an f32 accumulator is the canonical 0x7fffffff, whichever NaNs went in and however the host's adds order
+// them (the same rule as wgmma and mma, test_hopper.cpp: before, tcgen05.mma wrote what the host's scalar add left, the
+// first source operand's NaN, which differs between an optimised build and a ThreadSanitizer -O1 one). Derived from the
+// SASS executor's HMMA, which writes the canonical NaN on an RTX 3060, and the PTX documentation; no card has tcgen05
+// to check it against. Inputs: inf * 0, a NaN in A with a sign and a payload, a NaN in D alone and one meeting a product
+// NaN; every other word must be the host's f32 sum.
+VTEST(tcgen05_mma_f32_nans_are_the_canonical_one) {
+  const int M = 128, N = 32, K = 8;
+  auto A = [](int m, int k) {
+    if (m == 0 && k == 0) return bits_f32(0x7F800000u);
+    if (m == 2 && k == 0) return bits_f32(0xFF800000u);
+    if (m == 4 && k == 1) return bits_f32(0xFFC12000u);
+    return val(m, k, 7);
+  };
+  auto B = [](int k, int n) {
+    if (k == 0 && (n == 0 || n == 3 || n == 8)) return 0.0f;
+    return val(k, n, 8);
+  };
+  auto D0 = [](int m, int n) {
+    if (m == 0 && n == 0) return bits_f32(0x7FC02000u);
+    if (m == 1 && n == 1) return bits_f32(0xFFC12000u);
+    if (m == 5 && n == 2) return bits_f32(0x7FC02000u);
+    return static_cast<float>((m + 3 * n) % 5) - 2.0f;
+  };
+  const Operands o = images(1, M, N, K, 4, Major::K, Major::K, 0, 0, 128, 256, 128, 256,
+                            [&](int m, int k) { return f32_bits(A(m, k)); },
+                            [&](int n, int k) { return f32_bits(B(k, n)); });
+  Mma x;
+  x.kind = "tf32";
+  x.id = idesc(1, 2, 2, M, N);
+  x.desc_a = desc(0, 128, 256, 0);
+  x.desc_b = desc(0, 128, 256, 0);
+  x.smem_a = o.a;
+  x.smem_b = o.b;
+  x.cols = 32;
+  x.enable_d = "1";
+  x.d_in.assign(1, std::vector<uint32_t>(128 * 32));
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) x.d_in[0][size_t(m) * 32 + n] = f32_bits(D0(m, n));
+  const auto out = x.run();
+  int nans = 0;
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      volatile float want = D0(m, n);
+      for (int k = 0; k < K; ++k) want = want + A(m, k) * B(k, n);
+      const float wantf = want;
+      const uint32_t got = out[0][size_t(m) * 32 + n];
+      char buf[160];
+      std::snprintf(buf, sizeof buf, "D[%d][%d] = 0x%08x, expected %s", m, n, got,
+                    std::isnan(wantf) ? "the canonical NaN 0x7fffffff" : "the host's sum");
+      if (std::isnan(wantf)) {
+        ++nans;
+        if (got != 0x7FFFFFFFu) throw vtest::Failure(buf);
+      } else if (got != f32_bits(wantf)) {
+        throw vtest::Failure(buf);
+      }
+    }
+  VCHECK(nans > 20);   // the inputs do make NaNs
 }
 
 // disable-output-lane leaves the lanes it names as they were.

@@ -14,6 +14,7 @@
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -76,14 +77,14 @@ struct FuncRec {
   const vgpu::exec::SymbolTable* syms = nullptr;
   uint64_t module_id = 0;             // the runtime's module on `device`, for what the module says of the kernel
   uintptr_t kernel = 0;               // the CUkernel this function was made from; the two share their attributes
-  vgpu_funcattr::State attrs;         // what cuFuncSetAttribute set, when no CUkernel owns the state
+  vgpu_funcattr::State attrs{};        // what cuFuncSetAttribute set, when no CUkernel owns the state
   // The launch the pre-CUDA 4 API builds up on the function itself
   // (cuFuncSetBlockShape, cuFuncSetSharedSize, cuParamSet*) and cuLaunchGrid
   // runs: a block of one thread, no shared memory and no parameters until
   // told otherwise, as on the card.
   unsigned block[3] = {1, 1, 1};
   unsigned shared_bytes = 0;
-  std::vector<uint8_t> params;   // the parameter buffer, as written
+  std::vector<uint8_t> params{};   // the parameter buffer, as written
   size_t param_size = 0;         // cuParamSetSize
 };
 
@@ -99,7 +100,7 @@ struct LibRec {
 struct KernelRec {
   uintptr_t library = 0;
   std::string name;
-  std::map<int, vgpu_funcattr::State> attrs;   // what cuKernelSetAttribute / cuFuncSetAttribute set, per device
+  std::map<int, vgpu_funcattr::State> attrs{};   // what cuKernelSetAttribute / cuFuncSetAttribute set, per device
 };
 
 struct EventRec {
@@ -339,6 +340,9 @@ CUresult map_error(const vgpu::Error& e, bool kernel_context) {
     case Err::InvalidValue:
     case Err::LaunchConfig:
     case Err::ProfileParse: return CUDA_ERROR_INVALID_VALUE;
+    // (An RTX 3060: a block whose registers do not fit is 701, any cluster launch on a part without clusters 912.)
+    case Err::LaunchResources: return CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES;
+    case Err::LaunchCluster: return static_cast<CUresult>(912);   // CUDA_ERROR_INVALID_CLUSTER_SIZE
     case Err::Internal: return CUDA_ERROR_UNKNOWN;
   }
   return CUDA_ERROR_UNKNOWN;
@@ -1266,7 +1270,7 @@ VGPU_EXPORT CUresult cuCtxSetCurrent(CUcontext ctx) {
 }
 
 static CUresult cuCtxGetCurrent_impl(CUcontext* pctx) {
-  return api("cuCtxGetCurrent", true, false, [&](ShimState& s) {
+  return api("cuCtxGetCurrent", true, false, [&](ShimState&) {
     if (!pctx) return CUDA_ERROR_INVALID_VALUE;
     *pctx = ctx_stack().empty() ? nullptr : reinterpret_cast<CUcontext>(ctx_stack().back());
     return CUDA_SUCCESS;
@@ -1753,6 +1757,52 @@ std::string merge_ptx(const std::vector<std::string>& inputs) {
   return out;
 }
 
+// Whether `data` is libcudadevrt.a: an `ar` archive (the 8-byte "!<arch>\n" magic, then members of a
+// 60-byte header and an even-padded body) whose members are all the toolkit's cuda_device_runtime
+// object. The member names come from the archive's long-name table ("//") or sit in the header
+// itself, so both are read.
+bool is_device_runtime_archive(const void* data, size_t size) {
+  static const char kMagic[] = "!<arch>\n";
+  const char* p = static_cast<const char*>(data);
+  if (size < 8 || std::memcmp(p, kMagic, 8) != 0) return false;
+  std::string longnames;
+  std::vector<std::string> names;
+  size_t at = 8;
+  while (at + 60 <= size) {
+    const char* h = p + at;
+    if (h[58] != '`' || h[59] != '\n') return false;
+    char field[17] = {};
+    std::memcpy(field, h, 16);
+    std::string name(field);
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+    char len[11] = {};
+    std::memcpy(len, h + 48, 10);
+    const size_t body = static_cast<size_t>(std::strtoull(len, nullptr, 10));
+    at += 60;
+    if (body > size - at) return false;
+    if (name == "/") {
+      // The symbol table: not a member.
+    } else if (name == "//") {
+      longnames.assign(p + at, body);
+    } else if (name.size() > 1 && name[0] == '/' && std::isdigit(static_cast<unsigned char>(name[1]))) {
+      const size_t off = static_cast<size_t>(std::strtoull(name.c_str() + 1, nullptr, 10));
+      if (off >= longnames.size()) return false;
+      const size_t end = longnames.find('\n', off);
+      std::string n = longnames.substr(off, end == std::string::npos ? std::string::npos : end - off);
+      if (!n.empty() && n.back() == '/') n.pop_back();
+      names.push_back(n);
+    } else {
+      if (!name.empty() && name.back() == '/') name.pop_back();
+      names.push_back(name);
+    }
+    at += body + (body & 1);
+  }
+  if (names.empty()) return false;
+  for (const std::string& n : names)
+    if (n.rfind("cuda_device_runtime", 0) != 0) return false;
+  return true;
+}
+
 // Accepts one input into a link state. PTX is taken as-is, a fatbin has its PTX
 // pulled out, and a bare cubin is refused with the same message the module
 // loader gives -- there is no SASS decoder behind this.
@@ -1767,6 +1817,19 @@ void link_add(LinkState& st, int type, const void* data, size_t size, const char
     return;
   }
   const char* text = static_cast<const char*>(data);
+  // CU_JIT_INPUT_LIBRARY (4): an `ar` archive of device code. The only one with a meaning here is
+  // libcudadevrt.a, the device runtime a kernel launching kernels (dynamic parallelism) links, and the
+  // simulator implements that runtime itself (vgpu/exec/devrt.hpp: cudaGetParameterBufferV2,
+  // cudaLaunchDeviceV2 and the rest of cuda_device_runtime_api.h resolve by name when a kernel calls
+  // them), so linking it adds nothing to the module. Any other archive holds code that would be linked
+  // in, and there is no SASS to link it into, so it is refused rather than dropped.
+  if (type == 4 /* CU_JIT_INPUT_LIBRARY */) {
+    if (!is_device_runtime_archive(data, size))
+      throw vgpu::Error::make(vgpu::Err::Unsupported, "cuLinkAddData: library '", what,
+                              "' is not the CUDA device runtime (libcudadevrt.a), the only library "
+                              "VirtualGPU links: it implements the device runtime itself and links PTX");
+    return;
+  }
   if (text[0] == 0x7f)
     throw vgpu::Error::make(vgpu::Err::Unsupported, "cuLinkAddData: input '", what,
                             "' is a cubin/ELF image; VirtualGPU links PTX (CU_JIT_INPUT_PTX or a "
@@ -1830,6 +1893,7 @@ static CUresult cuLinkDestroy_impl(void* state) {
 // ids start at 1, so 0 stays available as "no handle".
 namespace {
 constexpr size_t kVmmGranularity = vgpu::MemoryManager::kVmmGranularity;   // 2 MiB
+constexpr unsigned char kCompGeneric = 1;   // CU_MEM_ALLOCATION_COMP_GENERIC
 
 // The property struct a caller passes. Only a device-local pinned allocation
 // exists here; anything else is refused rather than quietly treated as one.
@@ -1887,7 +1951,13 @@ static CUresult cuMemCreate_impl(CUmemGenericAllocationHandle* handle, size_t si
     if (!handle || size == 0 || flags != 0) return CUDA_ERROR_INVALID_VALUE;
     int device = 0;
     if (const CUresult rc = check_prop(prop, s, &device); rc != CUDA_SUCCESS) return rc;
-    *handle = s.rt->device(device).memory().create_handle(size, prop->requestedHandleTypes & 1);
+    // Generic compression is granted where the device has it (CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED)
+    // and quietly dropped where it does not: the handle then reports no compression, which is how a program
+    // such as CUDA Samples' cudaCompressibleMemory finds out.
+    const bool compressible =
+        prop->allocFlags.compressionType == kCompGeneric &&
+        extra_attribute(s.rt->device(device).profile(), vgpu::cuda::kGenericCompressionSupported) != 0;
+    *handle = s.rt->device(device).memory().create_handle(size, prop->requestedHandleTypes & 1, compressible);
     return CUDA_SUCCESS;
   });
 }
@@ -2028,6 +2098,7 @@ static CUresult cuMemGetAllocationPropertiesFromHandle_impl(CUmemAllocationProp*
       *prop = CUmemAllocationProp{};
       prop->type = CU_MEM_ALLOCATION_TYPE_PINNED;
       prop->requestedHandleTypes = s.rt->device(d).memory().handle_types(handle);
+      prop->allocFlags.compressionType = s.rt->device(d).memory().handle_compressible(handle) ? kCompGeneric : 0;
       prop->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
       prop->location.id = d;
       return CUDA_SUCCESS;
@@ -2865,8 +2936,11 @@ static CUresult cuLaunchKernelEx_impl(const void* config, CUfunction f, void** k
   bool cooperative = false;
   for (unsigned i = 0; i < c->num_attrs; ++i) {
     const LaunchAttrABI& a = c->attrs[i];
-    if (a.id == kLaunchAttrClusterDimension)
+    if (a.id == kLaunchAttrClusterDimension) {
       cluster = {a.value.cluster_dim.x, a.value.cluster_dim.y, a.value.cluster_dim.z};
+      // A cluster dimension of 0 is no cluster shape at all: CUDA_ERROR_INVALID_CLUSTER_SIZE (an RTX 3060, for {0, 1, 1}).
+      if (!cluster[0] || !cluster[1] || !cluster[2]) return static_cast<CUresult>(912);
+    }
     else if (a.id == kLaunchAttrCooperative)
       cooperative = a.value.cooperative != 0;
   }
@@ -6717,8 +6791,8 @@ static CUresult cuGetExportTable_impl(const void** table, const void* uuid) {
                  "       'nvcc -cudart shared', or build inside 'vgpu shell', which supplies an "
                  "nvcc that adds it. Without that the next\n"
                  "       CUDA call fails with error 103, \"integrity checks failed\".\n"
-                 "       If this is a profiler: Nsight Systems collects through its own bundled "
-                 "CUPTI, which needs these tables.\n"
+                 "       If this is a profiler: Nsight Systems loads its own bundled CUPTI and cannot "
+                 "collect CUDA data here.\n"
                  "       nvprof works instead -- see nvidia/docs/cupti.md.\n");
   });
   const unsigned char* u = static_cast<const unsigned char*>(uuid);

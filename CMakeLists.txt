@@ -9,6 +9,13 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 add_compile_options(-Wall -Wextra)
+# CI builds with every warning an error (the build is warning-free under GCC 13: a new warning is a
+# failed build, not a line nobody reads in a log). Off by default: a compiler the sources were not
+# checked with may warn about code that is fine.
+option(VGPU_WERROR "Treat compiler warnings as errors" OFF)
+if(VGPU_WERROR)
+  add_compile_options(-Werror)
+endif()
 
 # The interpreter is the hot path and benefits measurably from cross-TU
 # inlining. Enabled only for Release builds, and only if the toolchain
@@ -230,6 +237,13 @@ add_library(vgpu STATIC
   src/runtime/visible_devices.cpp
   nvidia/src/device_attributes.cpp
 )
+# The PTX interpreter's AVX2 tile (wmma_tile_avx2) is a target("avx2") function beside a baseline copy, and a 32-byte vector passed
+# between a function of one target and a function of the other goes in a register on one side and in memory on the other, so the
+# callee reads what happens to be on the stack. Optimised builds inline the helpers and do not notice; an -O0 (sanitizer) build does,
+# and it passed on one CPU and failed on another (round 8's canonical NaN). GCC says so with -Wpsabi: make it an error here.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "-Werror=psabi")
+endif()
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
 # With LTO on, every executable that links this archive re-optimises all of it
@@ -756,7 +770,9 @@ if(CUDA_ABI_INCLUDE)
     message(STATUS "NCCL headers at ${NCCL_INCLUDE}: building libvgpunccl")
     add_library(vgpunccl SHARED nvidia/src/nccl_api.cpp)
     target_link_libraries(vgpunccl PRIVATE vgpu vgpucudart)
-    target_include_directories(vgpunccl PRIVATE ${NCCL_INCLUDE} ${CUDA_ABI_INCLUDE})
+    # NCCL's headers are NVIDIA's and unmodified: SYSTEM, so their warnings are not ours.
+    target_include_directories(vgpunccl SYSTEM PRIVATE ${NCCL_INCLUDE})
+    target_include_directories(vgpunccl PRIVATE ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpunccl PROPERTIES OUTPUT_NAME nccl SOVERSION 2 VERSION 2.0)
     add_custom_command(TARGET vgpunccl POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
@@ -1250,8 +1266,14 @@ vgpu_unit_test(test_sched)
 vgpu_unit_test(test_sass_access_count)
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
+# The closed forms of the sector and bank-pass counters, against the definition of what they count.
+vgpu_unit_test(test_memcount_forms)
+# Module::code_at (a binary search over the code sections) against the scan it replaced.
+vgpu_unit_test(test_sass_code_at)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
+# An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
+vgpu_unit_test(test_tc_ampere)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
@@ -1311,12 +1333,18 @@ target_compile_definitions(test_h264_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 # The host matrix product behind cuBLAS and cuBLASLt, bit for bit against the plain loops it replaced.
 vgpu_unit_test(test_host_gemm nvidia/tests/unit/test_host_gemm.cpp)
 vgpu_unit_test(test_host_trsm nvidia/tests/unit/test_host_trsm.cpp)
+# The rank-one and rank-two updates of cuBLAS (ger, syr, her, syr2, her2) on the device's elements, likewise.
+vgpu_unit_test(test_host_blas2 nvidia/tests/unit/test_host_blas2.cpp)
+# The Jacobi sweeps behind cuSOLVER's real eigen- and singular value solvers, likewise.
+vgpu_unit_test(test_host_jacobi nvidia/tests/unit/test_host_jacobi.cpp)
 # The host convolution behind cuDNN and the host FFT behind cuFFT, likewise.
 vgpu_unit_test(test_host_conv nvidia/tests/unit/test_host_conv.cpp)
 vgpu_unit_test(test_host_fft nvidia/tests/unit/test_host_fft.cpp)
 # The dense factorizations behind cuSOLVER and the JPEG transform and colour conversion behind nvJPEG, likewise.
 vgpu_unit_test(test_host_dense nvidia/tests/unit/test_host_dense.cpp)
 vgpu_unit_test(test_host_jpeg nvidia/tests/unit/test_host_jpeg.cpp)
+# The vector samplers behind NPP's warps, remapping and resizing, and its morphology, against the scalar code they stand in for.
+vgpu_unit_test(test_npp_simd nvidia/tests/unit/test_npp_simd.cpp)
 # The AVX2 kernels of the video codecs, against the scalar loops they stand in for.
 vgpu_unit_test(test_video_simd nvidia/tests/unit/test_video_simd.cpp)
 # The HEVC decoder and parser behind NVDEC, against the CRC-32 of every frame an RTX 3060 displayed.
@@ -1544,6 +1572,31 @@ set_tests_properties(test_amd_runtime_gaps PROPERTIES ENVIRONMENT "VGPU_GPU=amd/
 add_test(NAME test_amd_runtime_gaps_radeon COMMAND test_amd_runtime_gaps)
 set_tests_properties(test_amd_runtime_gaps_radeon PROPERTIES ENVIRONMENT "VGPU_GPU=amd/rx7900xtx;VGPU_QUIET=1")
 
+# rocprofiler-sdk on the Radeon cards rocprofv3 was run on (amd/docs/rocprofiler.md): the agent as KFD counts it,
+# the kernels' register counts, which copies are DMA copies, and the ids of allocation records. One process each
+# (the runtime takes its GPU from VGPU_GPU once); the RX 6700 XT runs gfx1030 code under HSA_OVERRIDE_GFX_VERSION,
+# as on the card.
+add_executable(test_amd_rocprofiler_rdna amd/tests/unit/test_rocprofiler_rdna.cpp)
+target_link_libraries(test_amd_rocprofiler_rdna PRIVATE vgpurocprof vgpuhip)
+target_include_directories(test_amd_rocprofiler_rdna PRIVATE tests/framework amd/include)
+target_compile_definitions(test_amd_rocprofiler_rdna PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_rocprofiler_rx6800 COMMAND test_amd_rocprofiler_rdna)
+set_tests_properties(test_amd_rocprofiler_rx6800 PROPERTIES ENVIRONMENT "VGPU_GPU=amd/rx6800;VGPU_QUIET=1")
+add_test(NAME test_amd_rocprofiler_rx6700xt COMMAND test_amd_rocprofiler_rdna)
+set_tests_properties(test_amd_rocprofiler_rx6700xt PROPERTIES
+  ENVIRONMENT "VGPU_GPU=amd/rx6700xt;HSA_OVERRIDE_GFX_VERSION=10.3.0;VGPU_QUIET=1")
+# What rocprofv3 recorded for small HIP programs on a real RX 6800 (and, for vecadd, an RX 6700 XT), compared with
+# what it records on the simulated card. Skips where there is no ROCm with rocprofv3 and hipcc.
+foreach(_case vecadd memset_d2d copies streams_events graph async_alloc markers geometry)
+  add_test(NAME amd_rocprof_${_case} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh ${_case})
+  set_tests_properties(amd_rocprof_${_case} PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+endforeach()
+add_test(NAME amd_rocprof_vecadd_rx6700xt
+  COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh vecadd --gpu rx6700xt)
+set_tests_properties(amd_rocprof_vecadd_rx6700xt PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+
 # The host-memory guard seen from a HIP program: a reserve no host can meet makes every real chunk
 # of device memory an out-of-memory error (hipErrorOutOfMemory), not a crash.
 add_executable(test_amd_hip_host_guard amd/tests/unit/test_hip_host_guard.cpp)
@@ -1589,6 +1642,13 @@ target_link_libraries(vector_add_driver PRIVATE vgpucuda)
 target_include_directories(vector_add_driver PRIVATE include)
 add_test(NAME c_harness_vector_add COMMAND vector_add_driver)
 set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
+# The JIT linker taking libcudadevrt.a (CU_JIT_INPUT_LIBRARY), as LuisaCompute's CUDA backend links it,
+# and a kernel that launches a kernel running after the link.
+add_executable(link_devrt nvidia/tests/c_harness/link_devrt.c)
+target_include_directories(link_devrt PRIVATE nvidia/include)
+target_link_libraries(link_devrt PRIVATE vgpucuda)
+add_test(NAME c_harness_link_devrt COMMAND link_devrt)
+set_tests_properties(c_harness_link_devrt PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
 
 # The register C API for bring-up software (vgpu_regs.h), and a plain C
 # program against it.
@@ -1888,6 +1948,12 @@ add_test(NAME lint_makefile COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_makefil
 set_tests_properties(lint_makefile PROPERTIES TIMEOUT 120)
 add_test(NAME lint_readme_commands COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_readme_commands.sh)
 set_tests_properties(lint_readme_commands PROPERTIES TIMEOUT 120)
+# ./run against a fake simulator, unshare and package tools.
+add_test(NAME lint_run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_run.sh)
+set_tests_properties(lint_run_launcher PROPERTIES TIMEOUT 120)
+add_test(NAME run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_launcher.sh)
+set_tests_properties(run_launcher PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
 add_test(NAME smi_cli COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_smi_cli.sh)
 set_tests_properties(smi_cli PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
@@ -1953,7 +2019,8 @@ if(TARGET vgpunccl)
   # unsupported when called.
   add_executable(test_nccl_symbols nvidia/tests/unit/test_nccl_symbols.cpp)
   target_link_libraries(test_nccl_symbols PRIVATE vgpunccl)
-  target_include_directories(test_nccl_symbols PRIVATE tests/framework ${NCCL_INCLUDE} ${CUDA_ABI_INCLUDE})
+  target_include_directories(test_nccl_symbols SYSTEM PRIVATE ${NCCL_INCLUDE})
+  target_include_directories(test_nccl_symbols PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_nccl_symbols COMMAND test_nccl_symbols)
   set_tests_properties(test_nccl_symbols PROPERTIES ENVIRONMENT "VGPU_QUIET=1")
   # Two ranks across two processes, the shape the RTX 3060 reference run has.
@@ -2139,6 +2206,31 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 600)
 
+  # The error each refused launch configuration reports, runtime and driver, against an RTX 3060's CUDA 13.0.
+  add_test(NAME e2e_launch_refusals
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_refusals.sh)
+  set_tests_properties(e2e_launch_refusals PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # What round 9 changed on purpose (tensor-core sums, NaN selection for floats and doubles, conversions, 64-bit saturation, __sad, launch
+  # error codes), both engines at every SIMD level against an RTX 3060's lines; VGPU_TC_EXACT=0 moves only the wmma lines.
+  add_test(NAME e2e_round9_probe
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_round9_probe.sh)
+  set_tests_properties(e2e_round9_probe PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  # The f32/f16/f64 forms with a flush, a saturation, a NaN rule or a byte permute: SASS == PTX == an RTX 3060, per form.
+  add_test(NAME e2e_float_half_forms
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_float_half_forms.sh)
+  set_tests_properties(e2e_float_half_forms PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
   # bf16 arithmetic, half2 atomics and labeled_partition, through nvcc. The
   # unit tests feed hand-written PTX; a compiler emits forms a hand-written
   # test never thinks to write, and this is what catches the difference. It
@@ -2196,12 +2288,12 @@ if(TARGET vgpucublas)
   # cuBLAS's factorizations and batched solves (torch.linalg).
   foreach(_check IN ITEMS "fft_layouts:cufft" "fft_callbacks:cufft" "solver_paths:cusolver:cublas"
                           "solver_sytrf_paths:cusolver" "solver_sparse_paths:cusolver:cusparse"
-                          "sparse_paths:cusparse" "sparse_host_products:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
+                          "sparse_paths:cusparse" "sparse_host_products:cusparse" "graph_cg_capture:cublas:cusparse" "sparse_complex_paths:cusparse" "sparse_bsr_paths:cusparse"
                           "lt_paths:cublasLt" "lt_epilogue_paths:cublasLt" "lt_blockscaled_paths:cublasLt"
                           "blas_lt_together:cublas:cublasLt" "blas_ex_paths:cublas" "blas_rot_paths:cublas"
                           "blas_level23_paths:cublas" "blas_host_sums:cublas" "blas_grouped:cublas" "blas_packed_paths:cublas"
                           "blas_batched_paths:cublas" "blas_64_paths:cublas" "blas_legacy_paths:cublas"
-                          "rand_paths:curand" "rand_host_fill:curand" "npp_host_ops:nppc:nppial:nppif" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
+                          "rand_paths:curand" "rand_host_fill:curand" "npp_host_ops:nppc:nppial:nppif:nppig:nppim:nppitc" "managed_paths:cuda" "array_paths:cuda" "complex_paths:cublas:cusolver"
                           "nvrtc_paths:nvrtc:cuda" "statevec_paths:custatevec" "cudss_kkt:cudss" "cudss_paths:cudss"
                           "cufile_paths:cufile" "nvcomp_paths:nvcomp" "nvcomp_manager:nvcomp" "nvcomp_streaming:nvcomp" "nvcomp_cpu:nvcomp_cpu:nvcomp"
                           "nvshmem_host:nvshmem_host" "solver_dense_paths:cusolver" "solver_rf_paths:cusolver"
@@ -2234,6 +2326,15 @@ if(TARGET vgpucublas)
       TIMEOUT 300)
   endforeach()
 
+  # cuSOLVER's Jacobi solvers (syevd, syevj, gesvd, gesvdj), each result checked by its defining property and, on the
+  # simulator, bit for bit against what the plain loops gave before their sweeps were put on vector lanes.
+  add_test(NAME e2e_solver_jacobi_paths
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lib_check.sh solver_jacobi_paths cusolver)
+  set_tests_properties(e2e_solver_jacobi_paths PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   # Two PEs on two devices that have no peer path (the rtx3060 profile, as the card's pair): NVSHMEM refuses the
   # job, as NVIDIA's does ("Peer GPU 1 is not accessible").
   if(TARGET vgpunvshmem)
@@ -2254,7 +2355,7 @@ if(TARGET vgpucublas)
   # cuBLASXt (blas_xt_paths.cu) spreads its GEMM tiles, and cuFFT's multi-GPU
   # descriptors (fft_multigpu.cu).
   foreach(_check IN ITEMS "driver_gaps:cuda" "driver_context_gaps:cuda" "driver_texture_gaps:cuda" "runtime_gaps:cudart" "runtime_capture_modes:cudart"
-                          "runtime_memory_gaps:cudart" "runtime_graph_gaps:cudart" "runtime_texture_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas" "fft_multigpu:cufft" "dnn_multigpu_norm:cudnn")
+                          "runtime_memory_gaps:cudart" "malloc_alignment:cudart" "runtime_graph_gaps:cudart" "runtime_texture_gaps:cudart" "managed_vars:cudart" "solver_mg_paths:cusolverMg:cusolver" "blas_xt_paths:cublas" "fft_multigpu:cufft" "dnn_multigpu_norm:cudnn")
     string(REPLACE ":" ";" _parts "${_check}")
     list(POP_FRONT _parts _name)
     add_test(NAME e2e_${_name}
@@ -2415,6 +2516,17 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # Device functions the device link cloned under one section name: a PDF called through a table of
+  # pointers must run the copy of pow its own call names, not the last one the cubin holds (GooFit's
+  # GenArgusTest returned NaN).
+  add_test(NAME e2e_rdc_clones
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_rdc_clones.sh)
+  set_tests_properties(e2e_rdc_clones PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+
   add_test(NAME e2e_bsync_across_calls
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_bsync_across_calls.sh)
   set_tests_properties(e2e_bsync_across_calls PROPERTIES
@@ -2490,6 +2602,14 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # Shared and local memory moved 1 to 16 bytes at a time, on the SASS interpreter, the SASS tier and the PTX interpreter.
+  add_test(NAME e2e_sass_vector_memory
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_vector_memory.sh)
+  set_tests_properties(e2e_sass_vector_memory PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
   # The benchmark workloads' instruction counters (tools/bench): counts, never times, on SASS and PTX,
   # against tools/bench/expected. A simulator change that alters a counter fails here.
   add_test(NAME bench_counters
@@ -2561,6 +2681,20 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  add_test(NAME e2e_spin_lock_groups
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_spin_lock_groups.sh)
+  set_tests_properties(e2e_spin_lock_groups PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 300)
+
+  add_test(NAME e2e_lockstep_blocks
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_lockstep_blocks.sh)
+  set_tests_properties(e2e_lockstep_blocks PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 
   add_test(NAME e2e_warp_spin_lock
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_warp_spin_lock.sh)
@@ -2823,7 +2957,7 @@ if(TARGET vgpucupti)
   # allocation and pool records, graphs, modules and streams, and the switches
   # (kinds, functions, callbacks, a clock). Each against what NVIDIA's printed on
   # an RTX 3060 (nvidia/docs/cupti.md).
-  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um compat12 driver_params)
+  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um nsys compat12 driver_params)
     add_test(NAME e2e_cupti_${_case}
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh ${_case})
     set_tests_properties(e2e_cupti_${_case} PROPERTIES
@@ -2895,6 +3029,14 @@ set_tests_properties(e2e_texture_layers PROPERTIES
 add_test(NAME e2e_constant_global_load
          COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_constant_global_load.sh)
 set_tests_properties(e2e_constant_global_load PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  TIMEOUT 300)
+
+# CUDA Samples' quasirandomGenerator kernel, a table in __constant__ memory XORed by position bits, on both engines.
+add_test(NAME e2e_constant_table_xor
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_constant_table_xor.sh)
+set_tests_properties(e2e_constant_table_xor PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
@@ -2974,7 +3116,7 @@ set_tests_properties(e2e_sass_tier PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
-  TIMEOUT 900)
+  TIMEOUT 1800)
 
 # SASS on every architecture: programs built for each generation's SASS, sm_75
 # to sm_120, run by default and on their PTX, which must agree. sm_100 and
@@ -3109,6 +3251,14 @@ if(Python3_Interpreter_FOUND)
   # failure with no jobs, and its schedule stops): the check reads every workflow for one.
   add_test(NAME lint_workflow_yaml
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_workflow_yaml.py)
+  # Every heavy job of a workflow that runs on pull requests starts with the
+  # merge-conflict guard, so a new one cannot spend runner time on a PR that conflicts.
+  add_test(NAME lint_pr_guard_coverage
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_pr_guard_coverage.py)
+  # Every job that can land on the shared burst pool carries the pool owner's resource cap
+  # (BURST_CONTAINER_OPTIONS, or BURST_MEM_LIMIT_GIB and BURST_JOBS_MAX for a job outside a container).
+  add_test(NAME lint_burst_cap
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_burst_cap.py)
   # Every exported runtime and driver function is a call a profiler is told of,
   # and the driver shim takes the argument sizes the toolkit declares (CUPTI
   # reads them by those sizes).
@@ -3123,6 +3273,20 @@ if(Python3_Interpreter_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_header_exports.py ${CUDA_ABI_INCLUDE})
   set_tests_properties(lint_header_exports PROPERTIES
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  # libcuda and libcudart both contain libvgpu.a, so a data symbol defined with external linkage in
+  # shared code is defined twice in a process that loads both, and AddressSanitizer's ODR check
+  # aborts it (kSysfsFiles, kHwmonFiles, simd's g_kernels all failed CI that way, hours after the
+  # push). This finds one in the plain build; the self-test checks that it does.
+  add_test(NAME lint_odr_globals
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_odr_globals.py)
+  set_tests_properties(lint_odr_globals PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
+  add_test(NAME lint_odr_globals_selftest
+           COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_odr_globals_selftest.sh)
+  set_tests_properties(lint_odr_globals_selftest PROPERTIES
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
     SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 endif()
 add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_symbols.sh)
@@ -3140,6 +3304,21 @@ set_tests_properties(lint_cudnn_header_fetch PROPERTIES TIMEOUT 300)
 # job that cannot fit; synthetic meminfo and cgroup files stand in for the machine.
 add_test(NAME lint_ci_jobs COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_ci_jobs.sh)
 set_tests_properties(lint_ci_jobs PROPERTIES TIMEOUT 120)
+
+# The merge-conflict guards (ci/pr-guard.sh at the start of a heavy job,
+# ci/cancel-conflicting-prs.sh after main moves) against a fake gh and curl.
+add_test(NAME lint_pr_guard COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_pr_guard.sh)
+set_tests_properties(lint_pr_guard PROPERTIES TIMEOUT 120)
+
+# ci/external/hip-tests.sh's per-case limits against a fake Catch2 suite: a case of a slow suite
+# (HT_SLOW_SUITES) that does not finish is SLOW, not a failure; other suites still fail on a timeout.
+add_test(NAME lint_hip_tests_runner COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_hip_tests_runner.sh)
+set_tests_properties(lint_hip_tests_runner PROPERTIES TIMEOUT 120)
+
+# The "workloads failing on main" issue (ci/track-workloads-issue.sh) against a fake
+# gh: a failure opens or updates it, a pass closes it, a cancelled run touches nothing.
+add_test(NAME lint_workloads_issue COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_workloads_issue.sh)
+set_tests_properties(lint_workloads_issue PROPERTIES TIMEOUT 120)
 
 # Copies and fills with a shape in graphs, and the async copies a capture has to
 # record rather than run; two simulated devices, for the peer copy.
@@ -3412,6 +3591,18 @@ if(TARGET vgpucudart)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     RUN_SERIAL TRUE
     TIMEOUT 1800)
+  # torch.profiler (Kineto) over the simulator's CUPTI (nvidia/tests/pytorch/profiler_check.py):
+  # the kernel, copy, fill, runtime-call and range names it collects for a small program equal
+  # NVIDIA's libcupti's on an RTX 3060 (nvidia/tests/data/pytorch_profiler.card.txt), bar the
+  # cuBLAS kernel, which the script lists as an allowed difference. 8 checks.
+  add_test(NAME e2e_pytorch_profiler COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/profiler_check.py 8 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_profiler PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas;vgpucupti"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_E2E_DATA=${CMAKE_SOURCE_DIR}/nvidia/tests/data"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
   # The PyTorch sweep (nvidia/tests/pytorch/sweep.py): nn layers and losses forward
   # and backward, optimizers, torch.linalg / fft / sparse, AMP, CUDA graphs,
   # torch.compile, every SDPA backend forced in turn, two devices in one process,
@@ -3669,5 +3860,18 @@ foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopp
            e2e_sync_masks)
   if(TEST ${_t})
     set_property(TEST ${_t} APPEND PROPERTY RESOURCE_LOCK nvcc_memory)
+  endif()
+endforeach()
+# Under `ctest -j` the tests holding that lock form a chain, and the two CUTLASS
+# tests are most of it (about 1200 s and 1000 s in the build job; every other
+# test is under 120 s). ctest starts tests in cost order (by number when it has
+# no history, which a fresh CI checkout has not), so with these two last in the
+# order they would start only after everything else had finished and the
+# chain could overlap nothing. A cost starts them first: the lock chain then
+# runs beside the other tests from the first second, and the wall time is the
+# chain's rather than the sum.
+foreach(_t e2e_cutlass_hopper e2e_cutlass_gemm)
+  if(TEST ${_t})
+    set_property(TEST ${_t} PROPERTY COST 1000)
   endif()
 endforeach()

@@ -149,15 +149,28 @@ check() {
   [[ $p == managed_vars ]] && env+=(VGPU_DEVICE_COUNT=2)          # as its own test runs it: two devices
   sass="$(cd "$work" && env "${env[@]}" VGPU_SASS_LOG=1 timeout 600 "$bin" 2>&1)"; rs=$?
   ptx="$(cd "$work" && env "${env[@]}" VGPU_SASS=0 timeout 600 "$bin" 2>&1)"; rp=$?
+  # The pre-decoded tier (VGPU_TIER=1, src/sass/tier.hpp) is opt-in until it has been soaked; this is its soak on every
+  # program and architecture this job builds, Hopper's and Blackwell's own programs among them: it must print what the
+  # interpreter did. (nvidia/tests/e2e/run_sass_tier.sh also holds the counters to the interpreter's.) VGPU_SASS_TIER=0 skips it.
+  local tier="" rt=0
+  if [[ ${VGPU_SASS_TIER:-1} != 0 ]]; then
+    tier="$(cd "$work" && env "${env[@]}" VGPU_SASS_LOG=1 VGPU_TIER=1 timeout 600 "$bin" 2>&1)"; rt=$?
+  fi
   local why=""
   grep -q "running SASS" <<< "$sass" || why="its SASS did not run"
   grep -q "running PTX instead of SASS" <<< "$sass" && why="fell back to PTX: $(grep -m1 'running PTX instead' <<< "$sass")"
   [[ $rs == 0 ]] || why="${why:+$why; }the SASS run failed (exit $rs)"
   [[ $rp == 0 ]] || why="${why:+$why; }the PTX run failed (exit $rp)"
   [[ "$(grep -v '^\[vgpu\] running' <<< "$sass")" == "$ptx" ]] || why="${why:+$why; }the SASS and PTX runs print differently"
+  if [[ ${VGPU_SASS_TIER:-1} != 0 ]]; then
+    [[ $rt == "$rs" ]] || why="${why:+$why; }the tier's run exited $rt, the interpreter's $rs"
+    [[ "$(grep -v '^\[vgpu\] running' <<< "$tier")" == "$(grep -v '^\[vgpu\] running' <<< "$sass")" ]] ||
+      why="${why:+$why; }the tier and the interpreter print differently"
+  fi
   if [[ -n $why ]]; then
     echo "FAIL $arch $p: $why"
     diff <(echo "$ptx") <(grep -v '^\[vgpu\] running' <<< "$sass") | head -8 | sed 's/^/    /'
+    [[ ${VGPU_SASS_TIER:-1} != 0 ]] && diff <(grep -v '^\[vgpu\] running' <<< "$sass") <(grep -v '^\[vgpu\] running' <<< "$tier") | head -8 | sed 's/^/    tier: /'
     fails=1
   else
     echo "ok   $arch $p"

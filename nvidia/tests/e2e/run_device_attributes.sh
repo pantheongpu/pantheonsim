@@ -56,13 +56,12 @@ different = {
   "rt cudaDevAttrGpuPciSubsystemId", "drv CU_DEVICE_ATTRIBUTE_GPU_PCI_SUBSYSTEM_ID", "prop gpuPciSubsystemID",
   # the card's display driver (WSL) has a watchdog, which a headless Linux GPU does not
   "rt cudaDevAttrKernelExecTimeout", "drv CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT",
-  # not implemented: sparse and deferred-mapped arrays, compressible memory,
+  # not implemented: sparse and deferred-mapped arrays,
   # read-only host registration, host memory pools and VMM, the 64-bit and NOR
   # stream memory operations, POSIX file-descriptor handles
   "rt cudaDevAttrSparseCudaArraySupported", "drv CU_DEVICE_ATTRIBUTE_SPARSE_CUDA_ARRAY_SUPPORTED", "prop sparseCudaArraySupported",
   "rt cudaDevAttrDeferredMappingCudaArraySupported", "drv CU_DEVICE_ATTRIBUTE_DEFERRED_MAPPING_CUDA_ARRAY_SUPPORTED",
   "prop deferredMappingCudaArraySupported",
-  "drv CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED",
   "rt cudaDevAttrHostRegisterReadOnlySupported", "drv CU_DEVICE_ATTRIBUTE_READ_ONLY_HOST_REGISTER_SUPPORTED",
   "prop hostRegisterReadOnlySupported",
   "rt cudaDevAttrHostMemoryPoolsSupported", "drv CU_DEVICE_ATTRIBUTE_HOST_MEMORY_POOLS_SUPPORTED",

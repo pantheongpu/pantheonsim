@@ -9,6 +9,9 @@
 // off a sector boundary), shared-memory loads and stores of 1 to 16 bytes with
 // conflicts and broadcasts, FFMA over special values (zeros, subnormals,
 // infinities, NaNs), 64-bit arithmetic and POPC.
+// Round 9 added: the conversions (F2F, FRND, F2I and I2F in every size and rounding mode), packed f16 compares (HSET2, HSETP2), bf16
+// HFMA2, MUFU.RCP64H/RSQ64H, IMNMX, IABS, FCHK, P2R and the atomics on shared memory. `sass_fastpath forms` prints one hash per
+// conv_forms form, `sass_fastpath dump <form>` the lanes of one, for comparing with a card.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -238,6 +241,46 @@ __global__ void atomic_forms(AtomMem* m, uint32_t* out, int count, int pattern) 
 }
 
 
+// The same atomics on the block's shared memory (ATOMS): the lanes of a warp on one address, a few, distinct ones, scattered ones;
+// with the old value returned. The memory starts as the host's `init`, and each block's final memory is copied out for the check.
+__global__ void shared_atomic_forms(const AtomMem* init, AtomMem* fin, uint32_t* out, int count, int pattern) {
+  __shared__ AtomMem sm;
+  const uint32_t* src = reinterpret_cast<const uint32_t*>(init);
+  uint32_t* dst = reinterpret_cast<uint32_t*>(&sm);
+  for (unsigned k = threadIdx.x; k < sizeof(AtomMem) / 4; k += blockDim.x) dst[k] = src[k];
+  __syncthreads();
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t o[12] = {};
+  if (i < count) {
+    const unsigned idx = pattern == 0 ? 0u : pattern == 1 ? i % 4u : pattern == 2 ? static_cast<unsigned>(i) % kAtomSlots : (i * 7u) % 33u;
+    const bool take = pattern == 1 ? (i % 5) != 0 : pattern == 3 ? (i & 8) == 0 : true;
+    if (take) {
+      o[0] = atomicAdd(&sm.add[idx], i + 1u);
+      o[1] = atomicMax(&sm.umax[idx], i * 2654435761u);
+      o[2] = static_cast<uint32_t>(atomicMin(&sm.smin[idx], static_cast<int>(i * 31) - 500));
+      o[3] = atomicExch(&sm.exch[idx], i);
+      o[4] = atomicCAS(&sm.cas[idx], static_cast<uint32_t>(i & 3), static_cast<uint32_t>(i + 100));
+      o[5] = atomicInc(&sm.inc[idx], 7u);
+      o[6] = atomicDec(&sm.dec[idx], 5u);
+      o[7] = atomicAnd(&sm.band[idx], ~(1u << (i & 31)));
+      o[8] = atomicOr(&sm.bor[idx], 1u << (i & 31));
+      o[9] = atomicXor(&sm.bxor[idx], i * 40503u);
+      o[10] = static_cast<uint32_t>(atomicAdd(&sm.add64[idx], static_cast<unsigned long long>(i) << 33));
+      atomicMax(&sm.max64[idx], static_cast<unsigned long long>(i) * 0x9E3779B97F4A7C15ull);
+      atomicAdd(&sm.fadd[idx], 0.5f * i);
+      atomicAdd(&sm.dadd[idx], 0.25 * i);
+      atomicAdd(&sm.red[idx], 3u);
+      o[11] = static_cast<uint32_t>(__float_as_uint(atomicAdd(&sm.fadd[(idx + 1) % kAtomSlots], 1.0f)));
+    }
+    for (int k = 0; k < 12; ++k) out[static_cast<size_t>(i) * 12 + k] = o[k];
+  }
+  __syncthreads();
+  const uint32_t* from = reinterpret_cast<const uint32_t*>(&sm);
+  uint32_t* to = reinterpret_cast<uint32_t*>(&fin[blockIdx.x]);
+  for (unsigned k = threadIdx.x; k < sizeof(AtomMem) / 4; k += blockDim.x) to[k] = from[k];
+}
+
+
 // Accesses that fault, one lane of the warp outside what it may reach. A fast path takes an access only when every active lane is
 // inside; with one outside it must hand the instruction to the general path, which reports the fault as it always did. Each
 // runs in a process of its own (a fault ends the context): `sass_fastpath <name>`.
@@ -260,6 +303,14 @@ __global__ void oob_atomic(uint32_t* out, long far) {
   const int t = threadIdx.x;
   atomicAdd(&out[(t == 3) ? far : t % 4], 1u);
 }
+__global__ void oob_shared_atomic(uint32_t* out, int far) {
+  __shared__ uint32_t s[64];
+  const int t = threadIdx.x;
+  s[t] = t;
+  __syncthreads();
+  volatile int idx = (t == 11) ? far : t % 8;
+  out[t] = atomicAdd(&s[idx], 1u);
+}
 __global__ void oob_shared(uint32_t* out, int far) {
   __shared__ uint32_t s[64];
   const int t = threadIdx.x;
@@ -280,6 +331,7 @@ static int run_fault(const char* name) {
   else if (n == "scatter") oob_scatter<<<1, 32>>>(a, 1l << 34);
   else if (n == "atomic") oob_atomic<<<1, 32>>>(a, 1l << 34);
   else if (n == "shared") oob_shared<<<1, 32>>>(a, 1 << 20);
+  else if (n == "sharedatomic") oob_shared_atomic<<<1, 32>>>(a, 1 << 20);
   else return 2;
   const cudaError_t e = cudaDeviceSynchronize();
   std::printf("fault %s: %s\n", name, cudaGetErrorString(e));
@@ -438,6 +490,164 @@ __global__ void half_forms(const uint32_t* in, uint32_t* out, const uint64_t* di
   for (int k = 0; k < 8; ++k) dout[static_cast<size_t>(i) * 8 + k] = d[k];
 }
 
+// Conversions and packed compares the 32-lane path takes over from the per-lane one (F2F, FRND, F2I from f16 and f64 and to 8, 16
+// and 64 bits, I2F from 64 bits and with a rounding mode, to f16, bf16 and f64, HSET2, bf16 HADD2/HMUL2/HFMA2, MUFU.RCP64H and
+// RSQ64H), each written so that ptxas gives it its own SASS. The inputs are special values from the host (zeros, subnormals, the
+// extremes, infinities, NaNs of both signs, the edges of the 32-, 64-bit and 16-bit integer ranges) mixed with random bits; the
+// lanes take part under three different guards. The results of each form are hashed separately so that a difference between the
+// two runs names the form (and so that a card run names the form it disagrees on).
+constexpr int kConvForms = 209;
+__device__ __forceinline__ uint32_t lo32_(uint64_t v) { return static_cast<uint32_t>(v); }
+__device__ __forceinline__ uint32_t hi32_(uint64_t v) { return static_cast<uint32_t>(v >> 32); }
+__global__ void conv_forms(const float* fin, const double* din, const uint32_t* win, const uint64_t* lin, uint32_t* out, int n, int shape) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float a = fin[i], b = fin[(i + 1) % n];
+  const double p = din[i], q = din[(i + 7) % n];
+  const uint32_t x = win[i], y = win[(i + 3) % n];
+  const uint64_t u = lin[i];
+  const long long sl = static_cast<long long>(u);
+  const unsigned long long ul = u;
+  uint32_t o[kConvForms] = {};
+  int k = 0;
+  const bool take = shape == 0 ? true : shape == 1 ? (__float_as_uint(b) & 3) != 0 : (i & 4) == 0;
+  if (take) {
+#define O32(e) o[k++] = static_cast<uint32_t>(e)
+#define O64(e) { const uint64_t v_ = static_cast<uint64_t>(e); o[k++] = lo32_(v_); o[k++] = hi32_(v_); }
+#define OF(e) o[k++] = __float_as_uint(e)
+#define OD(e) O64(__double_as_longlong(e))
+#define OH(e) o[k++] = __half_as_ushort(e)
+#define OB(e) o[k++] = __bfloat16_as_ushort(e)
+    const __half ha = __ushort_as_half(static_cast<unsigned short>(x)), hb = __ushort_as_half(static_cast<unsigned short>(x >> 16));
+    const __nv_bfloat16 ba = __ushort_as_bfloat16(static_cast<unsigned short>(y)), bb = __ushort_as_bfloat16(static_cast<unsigned short>(y >> 16));
+    // F2F
+    OH(__float2half_rn(a)); OH(__float2half_rz(a)); OH(__float2half_rd(b)); OH(__float2half_ru(b));
+    OF(__half2float(ha)); OF(__half2float(hb));
+    OB(__float2bfloat16_rn(a)); OB(__float2bfloat16_rz(a)); OB(__float2bfloat16_rd(b)); OB(__float2bfloat16_ru(b));
+    OF(__double2float_rn(p)); OF(__double2float_rz(p)); OF(__double2float_rd(q)); OF(__double2float_ru(q));
+    OD(static_cast<double>(a)); OD(static_cast<double>(__half2float(ha)));
+    OH(__double2half(p)); OB(__double2bfloat16(q));
+    OF(__double2float_rz(-fabs(p))); OD(static_cast<double>(-fabsf(b)));
+    // FRND (f32, f16, f64; the four roundings; a flush)
+    OF(floorf(a)); OF(ceilf(a)); OF(truncf(a)); OF(rintf(b)); OF(nearbyintf(-b));
+    { float r; asm("cvt.rzi.ftz.f32.f32 %0, %1;" : "=f"(r) : "f"(a)); OF(r); asm("cvt.rmi.ftz.f32.f32 %0, %1;" : "=f"(r) : "f"(-b)); OF(r); }
+    OD(floor(p)); OD(ceil(p)); OD(trunc(q)); OD(rint(p)); OD(floor(-fabs(q)));
+    OH(hfloor(ha)); OH(hceil(hb)); OH(htrunc(ha)); OH(hrint(hb));
+    // F2I: to 8, 16, 32 and 64 bits, from f32, f16 and f64, signed and unsigned, in each rounding mode
+    O32(__double2int_rn(p)); O32(__double2int_rz(p)); O32(__double2int_rd(q)); O32(__double2int_ru(q));
+    O32(__double2uint_rn(p)); O32(__double2uint_rz(q)); O32(__double2uint_rd(p)); O32(__double2uint_ru(q));
+    O64(__double2ll_rn(p)); O64(__double2ll_rz(p)); O64(__double2ll_rd(q)); O64(__double2ll_ru(q));
+    O64(__double2ull_rn(p)); O64(__double2ull_rz(q)); O64(__double2ull_rd(p)); O64(__double2ull_ru(q));
+    O64(__float2ll_rn(a)); O64(__float2ll_rz(b)); O64(__float2ll_rd(a)); O64(__float2ll_ru(b));
+    O64(__float2ull_rn(a)); O64(__float2ull_rz(b)); O64(__float2ull_rd(b)); O64(__float2ull_ru(a));
+    O32(__half2int_rn(ha)); O32(__half2int_rz(hb)); O32(__half2uint_rd(ha)); O32(__half2uint_ru(hb));
+    O32(__half2short_rn(ha)); O32(__half2ushort_rz(hb)); O32(__half2short_rd(hb));
+    O64(__half2ll_rn(ha)); O64(__half2ull_rz(hb));
+    { unsigned short r;
+      asm("cvt.rzi.s16.f32 %0, %1;" : "=h"(r) : "f"(a)); O32(r);
+      asm("cvt.rni.u16.f32 %0, %1;" : "=h"(r) : "f"(b)); O32(r);
+      asm("cvt.rmi.s16.f64 %0, %1;" : "=h"(r) : "d"(p)); O32(r);
+      asm("cvt.rpi.u16.f64 %0, %1;" : "=h"(r) : "d"(q)); O32(r); }
+    O32(__float2int_rd(a)); O32(__float2uint_ru(b)); O32(__float2int_rn(-b));
+    // I2F: from 64 bits, with each rounding mode, to f32, f64, f16 and bf16; from 8, 16 and 32 bits to f16, bf16 and f64
+    OF(__ll2float_rn(sl)); OF(__ll2float_rz(sl)); OF(__ll2float_rd(sl)); OF(__ll2float_ru(sl));
+    OF(__ull2float_rn(ul)); OF(__ull2float_rz(ul)); OF(__ull2float_rd(ul)); OF(__ull2float_ru(ul));
+    OD(__ll2double_rn(sl)); OD(__ll2double_rz(sl)); OD(__ll2double_rd(sl)); OD(__ll2double_ru(sl));
+    OD(__ull2double_rn(ul)); OD(__ull2double_rz(ul)); OD(__ull2double_rd(ul)); OD(__ull2double_ru(ul));
+    OF(__int2float_rz(static_cast<int>(x))); OF(__int2float_rd(static_cast<int>(y))); OF(__int2float_ru(static_cast<int>(x)));
+    OF(__uint2float_rz(y)); OF(__uint2float_rd(x)); OF(__uint2float_ru(y));
+    OD(__int2double_rn(static_cast<int>(x))); OD(__uint2double_rn(y));
+    OH(__int2half_rn(static_cast<int>(x))); OH(__int2half_rz(static_cast<int>(y))); OH(__uint2half_rd(x)); OH(__uint2half_ru(y));
+    OH(__ll2half_rn(sl)); OH(__ull2half_rz(ul)); OH(__short2half_rn(static_cast<short>(x))); OH(__ushort2half_rd(static_cast<unsigned short>(y)));
+    OB(__int2bfloat16_rn(static_cast<int>(x))); OB(__uint2bfloat16_rz(y)); OB(__ll2bfloat16_rd(sl)); OB(__ull2bfloat16_ru(ul));
+    { float r;
+      asm("cvt.rz.f32.s16 %0, %1;" : "=f"(r) : "h"(static_cast<short>(x))); OF(r);
+      asm("cvt.rp.f32.u8 %0, %1;" : "=f"(r) : "h"(static_cast<unsigned short>(y & 0xff))); OF(r); }
+    // HSET2 / HSETP2: the packed compares for halves and bfloat16 pairs, as 1.0 / 0.0 masks and as one boolean
+    const __half2 h2a = __halves2half2(ha, hb), h2b = __halves2half2(hb, __ushort_as_half(static_cast<unsigned short>(y)));
+    const __nv_bfloat162 b2a = __halves2bfloat162(ba, bb), b2b = __halves2bfloat162(bb, __ushort_as_bfloat16(static_cast<unsigned short>(x)));
+    const auto hb2 = [](__half2 h) { return *reinterpret_cast<const uint32_t*>(&h); };
+    const auto bb2 = [](__nv_bfloat162 h) { return *reinterpret_cast<const uint32_t*>(&h); };
+    O32(hb2(__heq2(h2a, h2b))); O32(hb2(__hne2(h2a, h2b))); O32(hb2(__hlt2(h2a, h2b))); O32(hb2(__hle2(h2a, h2b)));
+    O32(hb2(__hgt2(h2a, h2b))); O32(hb2(__hge2(h2a, h2b))); O32(hb2(__hequ2(h2a, h2b))); O32(hb2(__hneu2(h2a, h2b)));
+    O32(hb2(__hltu2(h2a, h2b))); O32(hb2(__hgeu2(h2a, h2b))); O32(hb2(__hisnan2(h2a)));
+    O32(hb2(__hlt2(__low2half2(h2a), __hneg2(h2b)))); O32(hb2(__hgt2(__habs2(h2a), __high2half2(h2b))));
+    O32(__hbeq2(h2a, h2b)); O32(__hbltu2(h2a, h2b)); O32(__hbge2(h2b, h2a)); O32(__hbne2(h2a, h2b));
+    O32(bb2(__heq2(b2a, b2b))); O32(bb2(__hlt2(b2a, b2b))); O32(bb2(__hgeu2(b2a, b2b))); O32(bb2(__hne2(b2a, b2b)));
+    O32(bb2(__hgt2(__low2bfloat162(b2a), __hneg2(b2b)))); O32(__hbeq2(b2a, b2b)); O32(__hblt2(b2b, b2a));
+    // HSETP2: two predicates from a packed compare (PTX's setp on f16x2), with a boolean combine and a flush
+    {
+      const uint32_t xa = hb2(h2a), xb = hb2(h2b), xc = static_cast<uint32_t>(x ^ y);
+      uint32_t t;
+#define HSETP(OPS) asm("{ .reg .pred p, q, c; .reg .u32 t1, t2; setp.ne.u32 c, %3, 0; setp." OPS " p|q, %1, %2; " \
+                       "selp.u32 t1, 1, 0, p; selp.u32 t2, 2, 0, q; or.b32 %0, t1, t2; }" : "=r"(t) : "r"(xa), "r"(xb), "r"(xc)); O32(t)
+#define HSETPC(OPS) asm("{ .reg .pred p, q, c; .reg .u32 t1, t2; setp.ne.u32 c, %3, 0; setp." OPS " p|q, %1, %2, c; " \
+                        "selp.u32 t1, 1, 0, p; selp.u32 t2, 2, 0, q; or.b32 %0, t1, t2; }" : "=r"(t) : "r"(xa), "r"(xb), "r"(xc)); O32(t)
+      HSETP("lt.f16x2"); HSETP("ge.ftz.f16x2"); HSETP("equ.f16x2"); HSETPC("ne.or.f16x2"); HSETPC("gtu.xor.f16x2");
+#undef HSETP
+#undef HSETPC
+    }
+    // bf16 packed arithmetic
+    O32(bb2(__hfma2(b2a, b2b, __halves2bfloat162(bb, ba)))); O32(bb2(__hadd2(b2a, b2b))); O32(bb2(__hmul2(b2a, b2b)));
+    O32(bb2(__hfma2(__hneg2(b2a), b2b, __habs2(b2b)))); O32(bb2(__hfma2(__low2bfloat162(b2a), b2b, b2a)));
+    O32(bb2(__hfma2(b2a, __high2bfloat162(b2b), __low2bfloat162(b2a)))); O32(bb2(__hfma2(b2a, __float2bfloat162_rn(2.0f), b2b)));
+    O32(bb2(__hfma2(b2a, b2b, __halves2bfloat162(__float2bfloat16(1.5f), __float2bfloat16(-0.25f)))));
+    O32(bb2(__hmul2(b2a, __halves2bfloat162(__float2bfloat16(3.0f), __float2bfloat16(0.125f)))));
+    O32(bb2(__hadd2(__high2bfloat162(b2a), __habs2(b2b)))); O32(bb2(__hsub2(b2a, b2b)));
+    // MUFU.RCP64H / RSQ64H: double division, reciprocal, square root and reciprocal square root
+    OD(__drcp_rn(p)); OD(__ddiv_rn(p, q)); OD(rsqrt(fabs(q))); OD(sqrt(p)); OD(1.0 / q); OD(rsqrt(p));
+    // IABS and IMNMX (signed and unsigned, a predicate choosing the minimum or the maximum per lane)
+    { const int sx = static_cast<int>(x), sy = static_cast<int>(y);
+      O32(abs(sx)); O32(abs(sy - 7)); O32((x & 1) ? min(sx, sy) : max(sx, sy)); O32((y & 2) ? min(x, y) : max(x, y)); O32(max(sx, sy) ^ min(x, y)); }
+    // FCHK (the division's check for the slow path)
+    OF(a / b); OF(b / a);
+#undef O32
+#undef O64
+#undef OF
+#undef OD
+#undef OH
+#undef OB
+  }
+  for (int j = 0; j < kConvForms; ++j) out[static_cast<size_t>(j) * n + i] = o[j];
+}
+
+// Many predicates live across a loop, each used to guard an update: ptxas runs out of predicate registers and packs them into a general
+// register with P2R and unpacks them with R2P. The lanes diverge on the predicates, so both run under partial masks. The host computes
+// the same function.
+__global__ void pred_press(const uint32_t* in, uint32_t* out, int n, int rounds) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  uint32_t v[12];
+  for (int k = 0; k < 12; ++k) v[k] = in[(i + k) % n];
+#define PP(k) const bool p##k = ((v[(k) % 12] ^ (v[(k + 5) % 12] >> ((k) % 7))) & (1u << ((k) % 5))) ? true : (v[(k + 3) % 12] % 7u == (uint32_t)((k) % 5));
+  PP(0) PP(1) PP(2) PP(3) PP(4) PP(5) PP(6) PP(7) PP(8) PP(9) PP(10) PP(11) PP(12) PP(13) PP(14) PP(15) PP(16) PP(17) PP(18) PP(19) PP(20) PP(21)
+  uint32_t acc = i;
+  for (int r = 0; r < rounds; ++r) {
+    for (int k = 0; k < 12; ++k) { v[k] = v[k] * 2654435761u + acc; acc ^= v[(k + 1) % 12] >> 3; }
+#define PU(k) if (p##k) acc += v[(k) % 12] * (k + 3); else acc ^= v[(k + 7) % 12] + (k);
+    PU(0) PU(1) PU(2) PU(3) PU(4) PU(5) PU(6) PU(7) PU(8) PU(9) PU(10) PU(11) PU(12) PU(13) PU(14) PU(15) PU(16) PU(17) PU(18) PU(19) PU(20) PU(21)
+  }
+  out[i] = acc;
+#undef PP
+#undef PU
+}
+static uint32_t pred_press_host(const std::vector<uint32_t>& in, int n, int i, int rounds) {
+  uint32_t v[12];
+  for (int k = 0; k < 12; ++k) v[k] = in[(i + k) % n];
+  bool p[22];
+  for (int k = 0; k < 22; ++k)
+    p[k] = ((v[k % 12] ^ (v[(k + 5) % 12] >> (k % 7))) & (1u << (k % 5))) ? true : (v[(k + 3) % 12] % 7u == static_cast<uint32_t>(k % 5));
+  uint32_t acc = i;
+  for (int r = 0; r < rounds; ++r) {
+    for (int k = 0; k < 12; ++k) { v[k] = v[k] * 2654435761u + acc; acc ^= v[(k + 1) % 12] >> 3; }
+    for (int k = 0; k < 22; ++k) {
+      if (p[k]) acc += v[k % 12] * (k + 3);
+      else acc ^= v[(k + 7) % 12] + k;
+    }
+  }
+  return acc;
+}
+
 template <class T>
 static bool same(const std::vector<T>& a, const std::vector<T>& b, const char* what) {
   if (a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0) return true;
@@ -545,8 +755,121 @@ static int run_bcast(const char* name) {
   return 0;
 }
 
+static int g_dump_form = -1;       // `sass_fastpath dump <form>`: also print the inputs and results of one conv_forms form
+static bool g_list_forms = false;  // `sass_fastpath forms`: one line per conv_forms form (to see which one differs on a card)
+static bool g_card_forms = false;  // `sass_fastpath cardforms`: only the conv_forms lines, one per form, regime and shape (the card file's)
+// conv_forms over special values and random bits; one hash line per form and shape (or, with `cardforms`, only those lines).
+static int run_conv_forms() {
+  {
+    const uint32_t fsp[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u,
+                            0x3f800000u, 0xbf800000u, 0x3f000000u, 0xbf000000u, 0x3fc00000u, 0x40000000u, 0x7f7fffffu, 0xff7fffffu,
+                            0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00000u, 0x7fc12345u, 0x7f800001u, 0x4b000000u, 0x4b800001u,
+                            0x33800000u, 0x3f800001u, 0x4f000000u, 0xcf000000u, 0x4f800000u, 0x5f000000u, 0xdf000000u, 0x5f800000u,
+                            0x477fe000u, 0x477ff000u, 0x38000000u, 0x33000000u, 0x33000001u, 0x3f7fffffu, 0x40490fdbu, 0x4effffffu,
+                            0x47800000u, 0xc7800000u, 0x7bffu, 0x3b800000u};
+    const uint64_t dsp[] = {0x0000000000000000ull, 0x8000000000000000ull, 0x0000000000000001ull, 0x000fffffffffffffull, 0x0010000000000000ull,
+                            0x3ff0000000000000ull, 0xbff0000000000000ull, 0x3ff0000000000001ull, 0x7fefffffffffffffull, 0x7ff0000000000000ull,
+                            0xfff0000000000000ull, 0x7ff8000000000000ull, 0xfff8000000000000ull, 0x7ff0000000000001ull, 0x4000000000000000ull,
+                            0x3fb999999999999aull, 0x3ca0000000000000ull, 0x43e0000000000000ull /* 2^63 */, 0xc3e0000000000000ull /* -2^63 */,
+                            0x43dfffffffffffffull /* just below 2^63 */, 0x43f0000000000000ull /* 2^64 */, 0x43efffffffffffffull,
+                            0x41dfffffffc00000ull /* 2^31 - 1 */, 0x41e0000000000000ull /* 2^31 */, 0xc1e0000000000000ull, 0xc1e0000000200000ull,
+                            0x41efffffffe00000ull /* 2^32 - 1 */, 0x41f0000000000000ull, 0x3fe0000000000000ull, 0xbfe0000000000000ull,
+                            0x3fe0000000000001ull, 0x3ff8000000000000ull, 0x4004000000000000ull, 0x40f0000000000000ull /* 65536 */,
+                            0x380ffffffe000000ull /* near the f32 subnormals */, 0x47efffffe0000000ull /* f32 max */, 0x47effffff0000000ull,
+                            0x3e70000000000000ull /* 2^-24 */, 0x3e60000000000000ull, 0x40effc0000000000ull /* 65504 */, 0x40effe0000000000ull};
+    const uint16_t hsp[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e00, 0xfe00,
+                            0x7c01, 0x4000, 0x3555, 0x5640, 0x3800, 0x4200, 0xc200, 0x6400, 0x5bff, 0x3bff};
+    const uint16_t bsp[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x007f, 0x0080, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x7f80, 0xff80, 0x7fc0, 0x7f81,
+                            0xffc1, 0x4049, 0x4f80, 0x3fc0, 0x3f81, 0x4000, 0xc000, 0x3f00, 0x4300, 0x7f00};
+    const int n = 32 * 11 + 7;
+    std::vector<float> hf(n);
+    std::vector<double> hd(n);
+    std::vector<uint32_t> hw(n);
+    std::vector<uint64_t> hl(n);
+    uint64_t s = 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < n; ++i) {
+      s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+      const uint32_t fb = i % 3 == 0 ? static_cast<uint32_t>(s) : fsp[s % (sizeof fsp / sizeof fsp[0])];
+      std::memcpy(&hf[i], &fb, 4);
+      const uint64_t db = i % 4 == 0 ? s : dsp[(s >> 5) % (sizeof dsp / sizeof dsp[0])];
+      std::memcpy(&hd[i], &db, 8);
+      // Words made of two halves (the low half of the word a half; a pair of bfloat16 comes from the second draw), or random.
+      hw[i] = i % 5 == 0 ? static_cast<uint32_t>(s >> 11)
+                         : static_cast<uint32_t>(hsp[(s >> 9) % (sizeof hsp / sizeof hsp[0])]) | static_cast<uint32_t>(i % 2 ? bsp[(s >> 17) % (sizeof bsp / sizeof bsp[0])] : hsp[(s >> 17) % (sizeof hsp / sizeof hsp[0])]) << 16;
+      // 64-bit integers: random, small, the edges of 2^24, 2^53, 2^63 and 2^64, and sign extensions of 32-bit values.
+      static const uint64_t lsp[] = {0ull, 1ull, ~0ull, 0x8000000000000000ull, 0x7fffffffffffffffull, 0x0000000100000000ull, 0xffffffff00000000ull,
+                                     0x0000000001000001ull, 0x0020000000000001ull, 0x0020000000000003ull, 0x00ffffffffffffffull,
+                                     0x8000000000000400ull, 0x8000008000000001ull, 0xfffffffffffffc01ull, 0x00000000ffffffffull, 0x0000000080000000ull};
+      hl[i] = i % 3 == 0 ? s : lsp[(s >> 7) % (sizeof lsp / sizeof lsp[0])];
+    }
+    float* dfin; double* ddin; uint32_t *dwin, *dout; uint64_t* dlin;
+    CK(cudaMalloc(&dfin, n * 4)); CK(cudaMalloc(&ddin, n * 8)); CK(cudaMalloc(&dwin, n * 4)); CK(cudaMalloc(&dlin, n * 8));
+    CK(cudaMalloc(&dout, static_cast<size_t>(n) * kConvForms * 4));
+    // Two regimes of inputs. The first is the special values above, which put an out-of-range lane in nearly every warp (a 64-bit
+    // conversion with such a lane is left to the general path, and says so by agreeing with it). The second keeps every value
+    // inside the 64-bit ranges -- fractions, ties, zeros of both signs, NaNs -- so that those conversions take the 32-lane path.
+    for (int regime = 0; regime < 3; ++regime) {
+      if (regime == 2) {
+        // The same without a NaN or an infinity anywhere: what an RTX 3060 and the simulator agree on (their NaNs differ in payload and
+        // sign, and in what a conversion to an integer makes of one).
+        for (int i = 0; i < n; ++i) {
+          if (!(hd[i] == hd[i]) || std::fabs(hd[i]) > 1.0e300) hd[i] = 0.75;
+          if (!(hf[i] == hf[i]) || std::fabs(hf[i]) > 1.0e30f) hf[i] = 0.75f;
+          static const uint16_t fin_h[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x4000, 0x3555, 0x5640, 0x3800, 0x4200, 0xc200};
+          static const uint16_t fin_b[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x007f, 0x0080, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x4049, 0x4f80, 0x3fc0, 0x4000, 0xc000, 0x3f00};
+          hw[i] = static_cast<uint32_t>(fin_h[(i * 7 + 3) % 16]) | static_cast<uint32_t>(i % 2 ? fin_b[(i * 5 + 1) % 16] : fin_h[(i * 5 + 1) % 16]) << 16;
+        }
+      }
+      if (regime == 1) {
+        for (int i = 0; i < n; ++i) {
+          s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+          const double m = static_cast<double>(static_cast<int64_t>(s >> 11) % 1000000007ll) * (i % 2 ? 0.25 : 1.0 / 1024.0);
+          const double v = i % 7 == 0 ? static_cast<double>(static_cast<int>(s % 9) - 4) + (i % 2 ? 0.5 : 0.0)
+                         : i % 11 == 0 ? -0.0 : i % 13 == 0 ? std::nan("") : (i % 5 == 0 ? m * 1.0e6 : m);
+          hd[i] = v;
+          hf[i] = static_cast<float>(i % 17 == 0 ? 0.5 + (s % 5) : i % 19 == 0 ? -0.0 : v * 1.0e-3);
+        }
+      }
+      CK(cudaMemcpy(dfin, hf.data(), n * 4, cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(ddin, hd.data(), n * 8, cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dwin, hw.data(), n * 4, cudaMemcpyHostToDevice));
+      CK(cudaMemcpy(dlin, hl.data(), n * 8, cudaMemcpyHostToDevice));
+      for (int shape = 0; shape < 3; ++shape) {
+        CK(cudaMemset(dout, 0, static_cast<size_t>(n) * kConvForms * 4));
+        conv_forms<<<(n + 63) / 64, 64>>>(dfin, ddin, dwin, dlin, dout, n, shape);
+        CK(cudaDeviceSynchronize());
+        std::vector<uint32_t> got(static_cast<size_t>(n) * kConvForms);
+        CK(cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost));
+        if (g_dump_form >= 0 && g_dump_form < kConvForms)
+          for (int i = 0; i < n; ++i) {
+            uint32_t fb_; uint64_t db_;
+            std::memcpy(&fb_, &hf[i], 4); std::memcpy(&db_, &hd[i], 8);
+            std::printf("dump regime=%d shape=%d form=%d lane=%d f=%08x d=%016llx w=%08x l=%016llx -> %08x\n", regime, shape, g_dump_form, i, fb_,
+                        static_cast<unsigned long long>(db_), hw[i], static_cast<unsigned long long>(hl[i]), got[static_cast<size_t>(g_dump_form) * n + i]);
+          }
+        // One line for the launch (the lines are compared between runs together with the counters, which the runtime prints on its own
+        // schedule: a short output keeps the two from meeting), or one per form with `forms`.
+        uint64_t all = 1469598103934665603ull;
+        for (int f = 0; f < kConvForms; ++f) {
+          uint64_t hh = 1469598103934665603ull;
+          for (int i = 0; i < n; ++i) hh = (hh ^ got[static_cast<size_t>(f) * n + i]) * 1099511628211ull;
+          all = (all ^ hh) * 1099511628211ull;
+          if (g_list_forms) std::printf("conv_forms regime=%d shape=%d form=%03d bits %016llx\n", regime, shape, f, static_cast<unsigned long long>(hh));
+        }
+        if (!g_list_forms) std::printf("conv_forms regime=%d shape=%d bits %016llx\n", regime, shape, static_cast<unsigned long long>(all));
+      }
+    }
+    CK(cudaFree(dfin)); CK(cudaFree(ddin)); CK(cudaFree(dwin)); CK(cudaFree(dlin)); CK(cudaFree(dout));
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
-  if (argc > 1) return run_fault(argv[1]);
+  if (argc > 2 && std::string(argv[1]) == "dump") g_dump_form = std::atoi(argv[2]);
+  else if (argc > 1 && std::string(argv[1]) == "forms") g_list_forms = true;
+  else if (argc > 1 && std::string(argv[1]) == "cardforms") g_card_forms = g_list_forms = true;
+  else if (argc > 1) return run_fault(argv[1]);
+  if (g_card_forms) return run_conv_forms();
   for (int n : {1, 31, 32, 33, 1000, 4096 + 5}) {
     if (run_copy<uint8_t>("u8", n) || run_copy<uint16_t>("u16", n) || run_copy<uint32_t>("u32", n) ||
         run_copy<uint64_t>("u64", n) || run_copy<float>("f32", n) || run_copy<Q>("q16", n))
@@ -871,6 +1194,97 @@ int main(int argc, char** argv) {
   }
 
   {
+    // pred_press against the host.
+    const int n = 32 * 6 + 9;
+    std::vector<uint32_t> h(n);
+    uint64_t s = 0xD1B54A32D192ED03ull;
+    for (int i = 0; i < n; ++i) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; h[i] = static_cast<uint32_t>(s >> 9); }
+    uint32_t *din, *dout;
+    CK(cudaMalloc(&din, n * 4)); CK(cudaMalloc(&dout, n * 4));
+    CK(cudaMemcpy(din, h.data(), n * 4, cudaMemcpyHostToDevice));
+    for (int rounds : {1, 3}) {
+      CK(cudaMemset(dout, 0, n * 4));
+      pred_press<<<(n + 63) / 64, 64>>>(din, dout, n, rounds);
+      CK(cudaDeviceSynchronize());
+      std::vector<uint32_t> got(n);
+      CK(cudaMemcpy(got.data(), dout, n * 4, cudaMemcpyDeviceToHost));
+      int bad = 0;
+      uint64_t hh = 1469598103934665603ull;
+      for (int i = 0; i < n; ++i) {
+        bad += got[i] != pred_press_host(h, n, i, rounds);
+        hh = (hh ^ got[i]) * 1099511628211ull;
+      }
+      if (bad) { std::printf("WRONG pred_press rounds=%d: %d lanes\n", rounds, bad); ++wrong; }
+      std::printf("pred_press rounds=%d bits %016llx\n", rounds, static_cast<unsigned long long>(hh));
+    }
+    CK(cudaFree(din)); CK(cudaFree(dout));
+  }
+
+  {
+    // shared_atomic_forms: three blocks of 64 threads (the last partly used), each on a shared AtomMem copied from the host.
+    const int n = 32 * 5 + 11, threads = 64, blocks = (n + threads - 1) / threads;
+    AtomMem *dinit, *dfin; uint32_t* dout;
+    CK(cudaMalloc(&dinit, sizeof(AtomMem)));
+    CK(cudaMalloc(&dfin, blocks * sizeof(AtomMem)));
+    CK(cudaMalloc(&dout, static_cast<size_t>(n) * 12 * 4));
+    for (int pattern = 0; pattern < 4; ++pattern) {
+      AtomMem init = {};
+      for (int k = 0; k < kAtomSlots; ++k) {
+        init.smin[k] = 1000;
+        init.band[k] = 0xffffffffu;
+        init.dec[k] = 3;
+        init.inc[k] = 2;
+        init.cas[k] = k & 1;
+      }
+      CK(cudaMemcpy(dinit, &init, sizeof init, cudaMemcpyHostToDevice));
+      CK(cudaMemset(dout, 0, static_cast<size_t>(n) * 12 * 4));
+      shared_atomic_forms<<<blocks, threads>>>(dinit, dfin, dout, n, pattern);
+      CK(cudaDeviceSynchronize());
+      std::vector<AtomMem> got(blocks);
+      std::vector<uint32_t> gout(static_cast<size_t>(n) * 12);
+      CK(cudaMemcpy(got.data(), dfin, blocks * sizeof(AtomMem), cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(gout.data(), dout, gout.size() * 4, cudaMemcpyDeviceToHost));
+      int bad = 0;
+      for (int b = 0; b < blocks; ++b) {
+        AtomMem want = init;   // the order-independent ones, per block
+        for (int t = 0; t < threads; ++t) {
+          const int i = b * threads + t;
+          if (i >= n) break;
+          const unsigned idx = pattern == 0 ? 0u : pattern == 1 ? i % 4u : pattern == 2 ? static_cast<unsigned>(i) % kAtomSlots : (i * 7u) % 33u;
+          const bool take = pattern == 1 ? (i % 5) != 0 : pattern == 3 ? (i & 8) == 0 : true;
+          if (!take) continue;
+          want.add[idx] += i + 1u;
+          want.umax[idx] = std::max(want.umax[idx], static_cast<uint32_t>(i * 2654435761u));
+          want.smin[idx] = std::min(want.smin[idx], static_cast<int>(i * 31) - 500);
+          want.band[idx] &= ~(1u << (i & 31));
+          want.bor[idx] |= 1u << (i & 31);
+          want.bxor[idx] ^= i * 40503u;
+          want.add64[idx] += static_cast<unsigned long long>(i) << 33;
+          want.max64[idx] = std::max(want.max64[idx], static_cast<unsigned long long>(i) * 0x9E3779B97F4A7C15ull);
+          want.fadd[idx] += 0.5f * i;
+          want.dadd[idx] += 0.25 * i;
+          want.red[idx] += 3u;
+          want.fadd[(idx + 1) % kAtomSlots] += 1.0f;
+        }
+        const AtomMem& g = got[b];
+        for (int k = 0; k < kAtomSlots; ++k)
+          bad += g.add[k] != want.add[k] || g.umax[k] != want.umax[k] || g.smin[k] != want.smin[k] || g.band[k] != want.band[k] ||
+                 g.bor[k] != want.bor[k] || g.bxor[k] != want.bxor[k] || g.add64[k] != want.add64[k] || g.max64[k] != want.max64[k] ||
+                 g.fadd[k] != want.fadd[k] || g.dadd[k] != want.dadd[k] || g.red[k] != want.red[k];
+      }
+      if (bad) { std::printf("WRONG shared_atomic_forms pattern=%d: %d slots\n", pattern, bad); ++wrong; }
+      uint64_t hh = 1469598103934665603ull;
+      for (uint32_t v : gout) hh = (hh ^ v) * 1099511628211ull;
+      for (const AtomMem& g : got) {
+        const uint32_t* mw = reinterpret_cast<const uint32_t*>(&g);
+        for (size_t k = 0; k < sizeof g / 4; ++k) hh = (hh ^ mw[k]) * 1099511628211ull;
+      }
+      std::printf("shared_atomic_forms pattern=%d bits %016llx\n", pattern, static_cast<unsigned long long>(hh));
+    }
+    CK(cudaFree(dinit)); CK(cudaFree(dfin)); CK(cudaFree(dout));
+  }
+
+  {
     // float_forms over the special values and random bits (the NaNs include both signs and payloads).
     const uint32_t sp[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u,
                            0x3f800000u, 0xbf800000u, 0x3f000000u, 0x40000000u, 0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
@@ -936,6 +1350,7 @@ int main(int argc, char** argv) {
     }
     CK(cudaFree(din)); CK(cudaFree(dout)); CK(cudaFree(ddin)); CK(cudaFree(ddout));
   }
+  if (run_conv_forms()) return 1;
   std::printf("wrong: %d\n", wrong);
   return wrong != 0;
 }

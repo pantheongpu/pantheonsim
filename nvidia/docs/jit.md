@@ -34,6 +34,12 @@ exists for. Two things had to be true for it to work:
   module loader consumes PTX, so `cuLinkComplete` merges its PTX inputs and
   returns the merged text — everything the caller does with the result still
   works, because the result is genuinely what the loader wants.
+- **`CU_JIT_INPUT_LIBRARY` takes the device runtime, and only that.** A program whose kernels launch kernels
+  links `libcudadevrt.a` (LuisaCompute does so at start-up, to test whether indirect dispatch works). The simulator
+  implements the device runtime itself (`cudaGetParameterBufferV2`, `cudaLaunchDeviceV2` and the rest resolve by name
+  when a kernel calls them), so the archive is recognized by its member (`cuda_device_runtime.o`) and adds nothing to
+  the merged module; the kernel that launches a child then runs. Any other archive would be code to link in, and is
+  refused with `CUDA_ERROR_NOT_SUPPORTED` rather than dropped. `nvidia/tests/c_harness/link_devrt.c` checks both.
 
 Numba's PTX also needed three things the parser did not have: `.common` linkage
 (a tentative definition — zero-initialised, merged at link time — which Numba

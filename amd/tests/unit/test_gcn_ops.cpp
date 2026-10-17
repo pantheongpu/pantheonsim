@@ -54,7 +54,7 @@ uint64_t kernargs(MemoryManager& mem, const amd::Kernel& k, const std::vector<ui
   return p;
 }
 
-uint64_t bits_of(float f) {
+[[maybe_unused]] uint64_t bits_of(float f) {
   uint32_t b;
   std::memcpy(&b, &f, 4);
   return b;
@@ -93,7 +93,7 @@ VTEST(integer_math_comes_out_as_the_c_does) {
   const std::vector<int> out = download<int>(mem, pout, n);
   for (int i = 0; i < n; ++i) {
     const int x = a[i], y = b[i];
-    const int want = (x * y) + (x / 3) + (y % 5) - (x & y) + (x | y) ^ (x >> 2);
+    const int want = ((x * y) + (x / 3) + (y % 5) - (x & y) + (x | y)) ^ (x >> 2);
     if (out[i] != want)
       throw vtest::Failure("int_math[" + std::to_string(i) + "] is " + std::to_string(out[i]) + ", not " +
                            std::to_string(want));

@@ -29,7 +29,9 @@ enum class Err {
   Trap,                   // kernel executed "trap": an unreachable path
   IllegalInstruction,     // an instruction the hardware refuses to run: a *.sync with the thread outside its member mask
   DeviceAssert,           // a device-side assert() failed, with its own message
-  LaunchConfig,           // grid/block/shared config violates profile limits
+  LaunchConfig,           // grid/block/shared config violates profile limits (cudaErrorInvalidValue, as an RTX 3060's 13.0 runtime and driver)
+  LaunchResources,        // the block needs more registers than a multiprocessor has (cudaErrorLaunchOutOfResources, 701)
+  LaunchCluster,          // a thread-block cluster the launch or the part cannot have (cudaErrorInvalidClusterSize, 912)
   ExecLimit,              // step budget exceeded (likely infinite loop)
   EccUncorrectable,       // an uncorrectable ECC error in device memory (vgpu fault arm)
   DeviceLost,             // the GPU has fallen off the bus (vgpu fault lose)

@@ -16,7 +16,7 @@
 #define VGPU_EXPORT extern "C" __attribute__((visibility("default")))
 
 namespace {
-void vgpu_report_unimplemented(const char* fn) {
+[[maybe_unused]] void vgpu_report_unimplemented(const char* fn) {
   static std::mutex mu;
   static std::set<std::string> seen;
   std::lock_guard<std::mutex> lock(mu);

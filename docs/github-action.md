@@ -122,3 +122,5 @@ and 4 when the program did not run at all (`vgpu test --help`).
   root without `sudo`). On 22.04, Ubuntu's own CUDA toolkit is 11.5, older than
   the simulator supports, so an NVIDIA job there gets CUDA 12.6 from NVIDIA.
 - It checks behaviour, not performance: timings mean nothing here.
+
+Not on GitHub? See [ci-other-platforms.md](ci-other-platforms.md).

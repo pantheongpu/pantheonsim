@@ -1,8 +1,10 @@
 # PantheonSim front door: thin wrappers around scripts/ and build/vgpu.
 #
-#   make              this help
+#   make              install what a build is missing, then build (make deps build)
+#   make help         this help
+#   make deps         install the missing build tools (asks first; YES=1 to skip the question)
 #   make doctor       check the tools a build needs
-#   make build        build the simulator (build/vgpu)
+#   make build        build the simulator (build/vgpu), no installs
 #   make demo         run a built-in kernel on the simulated GPU
 #   make run APP=./my_app ARGS="..."
 #
@@ -18,7 +20,7 @@
 VGPU ?= build/vgpu
 NICE ?= nice -n 10
 
-.DEFAULT_GOAL := help
+.DEFAULT_GOAL := all
 .NOTPARALLEL:
 
 # --- variables -> flags -------------------------------------------------------
@@ -48,12 +50,16 @@ BUILD_FIRST := $(if $(wildcard $(VGPU)),,build)
 define HELP_TEXT
 PantheonSim: run CUDA and HIP programs on simulated GPUs, no GPU needed.
 
-First time:   make doctor && make build && make demo
+First time:   make        (installs missing build tools after asking, then builds)
+              ./run       (starts a simulated machine; settings in pantheonsim.yaml)
 Your program: make run APP=./my_app ARGS="--size 1024"
 
 Targets
+  make                 make deps, then make build, then say what to type next
+  make deps            install cmake and a C++20 compiler if missing (asks; YES=1 to skip the
+                       question; PPA=1 as well to add the g++ 13 PPA on Ubuntu 22.04)
   make doctor          check cmake, a C++20 compiler, memory; says what to install
-  make build           build the simulator into build/ (low priority; NICE= to change)
+  make build           build the simulator into build/ (low priority; NICE= to change); installs nothing
   make demo            run a built-in vectorAdd kernel end to end (builds first if needed)
   make list-gpus       the GPU models you can simulate
   make init            write a commented pantheonsim.yaml (FORCE=1 to overwrite)
@@ -78,10 +84,22 @@ Examples
 endef
 export HELP_TEXT
 
-.PHONY: help doctor build demo list-gpus init config shell run test clean need-vgpu check-app
+.PHONY: all help deps doctor build demo list-gpus init config shell run test clean need-vgpu check-app
+
+# The default goal: the tools, then the build, then what to do next. A compiler that
+# deps just installed (g++-13 on Ubuntu 22.04) is handed to the build through CXX;
+# `make build` itself is still exactly scripts/build.sh.
+all: deps
+	cxx="$$(./scripts/deps.sh --cxx)"; if [ -n "$$cxx" ]; then export CXX="$$cxx"; fi; $(NICE) ./scripts/build.sh
+	@printf '%s\n' 'Built. Next:' \
+	  '  ./run            starts a simulated GPU machine and takes you inside it' \
+	  '  its settings     pantheonsim.yaml in this directory (./run writes one); ./run my.yaml for another'
 
 help:
 	@printf '%s\n' "$$HELP_TEXT"
+
+deps:
+	./scripts/deps.sh
 
 doctor:
 	./scripts/doctor.sh

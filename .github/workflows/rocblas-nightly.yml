@@ -29,8 +29,10 @@ jobs:
     name: Build AMD's rocblas-test (cached)
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
       - id: cache
         uses: actions/cache@v4
         with:
@@ -81,8 +83,10 @@ jobs:
           - {gpu: amd/mi250x, filter: fp, first: 60, last: 79}
           - {gpu: amd/mi250x, filter: fp, first: 80, last: 99}
           - {gpu: amd/mi300x, filter: mixed, first: 0, last: 99}
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
       - uses: actions/cache/restore@v4
         with:
           path: ~/rocblas-client

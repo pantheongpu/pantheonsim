@@ -19,6 +19,7 @@
 
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "vgpu/exec/lockstep.hpp"
 
 #include <map>
 #include <set>
@@ -1046,6 +1047,8 @@ Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemet
   // AMD's HIP allocates device memory by the 4 KB page (MemoryManager::
   // set_page_size says what that lets a kernel read).
   if (profile_.vendor == "amd") mem_.set_page_size(4096);
+  // cudaMalloc's pointers are as aligned as a texture asks (cudaDeviceProp::textureAlignment, 512 bytes).
+  if (profile_.vendor == "nvidia") mem_.set_alloc_alignment(512);
   if (telemetry_) {
     int ord = physical_;
     telemetry::Publisher* pub = telemetry_;
@@ -1124,8 +1127,23 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
   }
 }
 
-void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg,
+void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
                         const std::vector<std::vector<uint8_t>>& args, const exec::SymbolTable* syms) {
+  // How many of this kernel's blocks the device holds at once: what a kernel whose blocks wait on one
+  // another needs to know (vgpu/exec/lockstep.hpp). The same figure cudaOccupancyMaxActiveBlocksPerMultiprocessor
+  // gives, times the SMs.
+  exec::LaunchConfig cfg = in_cfg;
+  if (!cfg.resident_blocks && exec::lockstep_mode() != exec::LockstepMode::Off) {
+    const uint64_t threads = uint64_t{cfg.block[0]} * cfg.block[1] * cfg.block[2];
+    if (threads && threads <= profile_.limits.max_threads_per_block) {
+      try {
+        const exec::KernelResources res = exec::kernel_resources(fn, profile_, static_cast<uint32_t>(threads), cfg.shared_bytes);
+        cfg.resident_blocks = uint64_t{res.occupancy.blocks_per_sm} * profile_.limits.multiprocessors;
+      } catch (const Error&) {
+        // The launch's own checks report what is wrong with the kernel; the blocks just run as before.
+      }
+    }
+  }
   if (fn.sass) {
     // SASS: the executor for machine code (nvidia/docs/sass.md), after the
     // launch checks both engines make. __cluster_dims__ applies whether or

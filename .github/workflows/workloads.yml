@@ -126,10 +126,12 @@ jobs:
         cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0
         cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0
         libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
         with:
           path: pantheonsim
+      - uses: ./pantheonsim/.github/actions/pr-guard
 
       - uses: actions/checkout@v4
         with:
@@ -241,6 +243,7 @@ jobs:
         with:
           sparse-checkout: |
             .github/workflows
+            ci
             tests/workloads
             nvidia/profiles
 
@@ -260,24 +263,12 @@ jobs:
 
       # While main is broken there is one open issue saying where, updated by
       # each run and closed by the first run that passes. A red scheduled run
-      # nobody opens is the failure this is here to prevent.
+      # nobody opens is the failure this is here to prevent. A run a later push
+      # cancelled says nothing about main, so the script leaves the issue alone.
       - name: Track failures in an issue
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
           RESULT: ${{ needs.machine.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          label=workloads-failing
-          gh label create "$label" --color B60205 --description "The nightly pantheon workloads run is failing" --force >/dev/null
-          open=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
-          if [[ "$RESULT" == success ]]; then
-            [[ -n "$open" ]] && gh issue close "$open" --comment "Passing again on every machine: $RUN_URL"
-            exit 0
-          fi
-          { echo "Workloads are failing on main ($GITHUB_EVENT_NAME, ${GITHUB_SHA::7}): $RUN_URL"; echo; cat matrix.md; } > body.md
-          if [[ -n "$open" ]]; then
-            gh issue comment "$open" --body-file body.md
-          else
-            gh issue create --title "Pantheon workloads failing on main" --label "$label" --body-file body.md
-          fi
+        run: ci/track-workloads-issue.sh

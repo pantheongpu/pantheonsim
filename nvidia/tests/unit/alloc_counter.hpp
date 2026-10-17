@@ -28,11 +28,15 @@ inline void* note(void* p) {
   while (now > pk && !g_peak.compare_exchange_weak(pk, now)) {}
   return p;
 }
+// The operator new below is malloc, so the free is the matching one; GCC 13 cannot see through the replacement.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
 inline void forget(void* p) {
   if (!p) return;
   g_live.fetch_sub(malloc_usable_size(p));
   std::free(p);
 }
+#pragma GCC diagnostic pop
 inline void* aligned(size_t n, size_t al) {
   void* p = nullptr;
   if (al < sizeof(void*)) al = sizeof(void*);

@@ -22,6 +22,7 @@ namespace vgpu::amd::hipprof {
 struct Device {
   int ordinal = 0;
   const char* gfx = "";          // "gfx942"
+  const char* hardware_gfx = "";   // the card's own target, where HSA_OVERRIDE_GFX_VERSION makes `gfx` another's
   const char* model = "";        // "AMD Instinct MI300X"
   uint16_t vendor_id = 0, device_id = 0;
   uint32_t compute_units = 0;
@@ -45,6 +46,7 @@ struct KernelSymbol {
   uint32_t kernarg_size = 0, kernarg_alignment = 0;
   uint32_t group_segment = 0, private_segment = 0;
   uint32_t sgprs = 0, vgprs = 0, agprs = 0;
+  uint32_t wave_size = 64;         // the wavefront size the kernel was compiled for
 };
 
 // A code object placed on a device.

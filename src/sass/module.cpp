@@ -18,10 +18,57 @@ bool runs_on(int cubin_sm, bool arch_specific, int device_sm) {
   return cubin_sm / 10 == device_sm / 10 && cubin_sm <= device_sm;
 }
 
-const Code* Module::code_at(uint64_t addr) const {
+const Code* Module::code_at_linear(uint64_t addr) const {
   for (const Code& c : code)
     if (addr >= c.base && addr < c.base + 16 * c.count) return &c;
   return nullptr;
+}
+
+void Module::index_code() {
+  code_bases.clear();
+  code_pages.clear();
+  code_page_base = 0;
+  for (size_t i = 0; i < code.size(); ++i) {
+    // Each section must end at or before the next one starts (an empty one ends where it starts). Then at most one
+    // section holds an address, and it is the last whose base is at or below it: the scan's first match.
+    if (i + 1 < code.size() && (code[i].base + 16 * code[i].count < code[i].base ||
+                                code[i].base + 16 * code[i].count > code[i + 1].base)) {
+      code_bases.clear();
+      return;
+    }
+    code_bases.push_back(code[i].base);
+  }
+  if (code.empty()) return;
+  // The page table: every section starts on a 256-byte boundary (load() pads each to one), so a page belongs to at most
+  // one section, and an empty section owns none.
+  constexpr uint64_t kMaxPages = (uint64_t{64} << 20) / 256;
+  const uint64_t first = code.front().base, end = code.back().base + 16 * code.back().count;
+  if (end < first || (end - first + 255) / 256 > kMaxPages) return;
+  for (const Code& c : code)
+    if ((c.base - first) % 256 != 0) return;
+  code_pages.assign(static_cast<size_t>((end - first + 255) / 256), 0);
+  for (size_t i = 0; i < code.size(); ++i) {
+    const uint64_t pages = (16 * code[i].count + 255) / 256;
+    const size_t at = static_cast<size_t>((code[i].base - first) / 256);
+    for (uint64_t k = 0; k < pages; ++k) code_pages[at + static_cast<size_t>(k)] = static_cast<uint32_t>(i + 1);
+  }
+  code_page_base = first;
+}
+
+const Code* Module::code_at(uint64_t addr) const {
+  if (!code_pages.empty()) {
+    const uint64_t page = (addr - code_page_base) >> 8;
+    if (addr < code_page_base || page >= code_pages.size()) return nullptr;
+    const uint32_t idx = code_pages[static_cast<size_t>(page)];
+    if (!idx) return nullptr;
+    const Code& c = code[idx - 1];
+    return addr >= c.base && addr < c.base + 16 * c.count ? &c : nullptr;
+  }
+  if (code_bases.size() != code.size() || code.empty()) return code_at_linear(addr);
+  const auto it = std::upper_bound(code_bases.begin(), code_bases.end(), addr);
+  if (it == code_bases.begin()) return nullptr;
+  const Code& c = code[static_cast<size_t>(it - code_bases.begin()) - 1];
+  return addr >= c.base && addr < c.base + 16 * c.count ? &c : nullptr;
 }
 
 // An instruction the decoder does not know is kept as an unknown one and
@@ -151,8 +198,14 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
 
   // Code: every .text section, placed in the code window; each is decoded
   // when it first runs (Code::instr). The cubin's sections outlive them.
+  // A device function the device link cloned (one copy per kernel that calls it, each with the constants
+  // of its own kernel) has the same section name in every copy, so a symbol is placed by its section's
+  // index, never by the name.
+  constexpr size_t kNone = static_cast<size_t>(-1);
+  std::vector<size_t> code_of(c.sections.size(), kNone);
   uint64_t code_va = kCodeBase;
-  for (const CubinSection& s : c.sections) {
+  for (size_t si = 0; si < c.sections.size(); ++si) {
+    const CubinSection& s = c.sections[si];
     if (s.name.rfind(".text.", 0) != 0) continue;
     Code code;
     code.section = s.name;
@@ -162,9 +215,11 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
     code.bytes = &s.bytes;
     const size_t n = code.count;
     code_va += (16 * n + 0xff) & ~uint64_t{0xff};
-    m->code_index[s.name] = m->code.size();
+    if (!m->code_index.count(s.name)) m->code_index[s.name] = m->code.size();   // the first copy, for the name
+    code_of[si] = m->code.size();
     m->code.push_back(std::move(code));
   }
+  m->index_code();
   for (size_t i = 0; i < c.kernels.size(); ++i) {
     if (!m->code_index.count(c.kernels[i].text_section))
       throw Error(Err::InvalidValue, "cubin: kernel " + c.kernels[i].name + " has no code");
@@ -229,10 +284,10 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
         bool builtin = false;
         for (const auto& [addr, b] : m->builtins) builtin = builtin || (sym.function && b == name);
         if (!builtin && !sym.section.empty()) {
-          if (const auto code = m->code_index.find(sym.section); code != m->code_index.end()) {
+          if (sym.section_idx != kNone && code_of[sym.section_idx] != kNone) {
             *in_code = true;
             *code_off = sym.value;
-            return m->code[code->second].base + sym.value;
+            return m->code[code_of[sym.section_idx]].base + sym.value;
           }
           if (const auto sec = section_va.find(sym.section); sec != section_va.end()) return sec->second + sym.value;
         }
@@ -242,10 +297,10 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
         if (b == name) return addr;
       for (const CubinSymbol& sym : c.symbols) {
         if (sym.name != name || sym.section.empty()) continue;
-        if (const auto code = m->code_index.find(sym.section); code != m->code_index.end()) {
+        if (sym.section_idx != kNone && code_of[sym.section_idx] != kNone) {
           *in_code = true;
           *code_off = sym.value;
-          return m->code[code->second].base + sym.value;
+          return m->code[code_of[sym.section_idx]].base + sym.value;
         }
         if (const auto sec = section_va.find(sym.section); sec != section_va.end()) return sec->second + sym.value;
       }

@@ -250,17 +250,30 @@ const HipApi kHipApis[] = {
 #include "rocprofiler_hip_ids.inc"
 };
 
-int hip_api_id(const char* name) {
+// The calls a program built by hipcc makes into the runtime on its own behalf: the HIP compiler API
+// (rocprofiler-sdk's hip/compiler_api_id.h, MIT licence; the notice is in vgpu/rocprofiler_abi.hpp).
+const HipApi kHipCompilerApis[] = {
+    {"__hipPopCallConfiguration", 0}, {"__hipPushCallConfiguration", 1}, {"__hipRegisterFatBinary", 2},
+    {"__hipRegisterFunction", 3},     {"__hipRegisterManagedVar", 4},    {"__hipRegisterSurface", 5},
+    {"__hipRegisterTexture", 6},      {"__hipRegisterVar", 7},           {"__hipUnregisterFatBinary", 8}};
+
+struct ApiId {
+  int op = -1;
+  bool compiler = false;
+};
+
+ApiId hip_api_id(const char* name) {
   // Never destroyed: HIP is called after static destruction has begun (a
   // library's own static destructor, at exit), and each call looks its name
   // up here.
-  static const std::map<std::string, int>& ids = *new std::map<std::string, int>([] {
-    std::map<std::string, int> m;
-    for (const HipApi& a : kHipApis) m.emplace(a.name, a.id);
+  static const std::map<std::string, ApiId>& ids = *new std::map<std::string, ApiId>([] {
+    std::map<std::string, ApiId> m;
+    for (const HipApi& a : kHipApis) m.emplace(a.name, ApiId{a.id, false});
+    for (const HipApi& a : kHipCompilerApis) m.emplace(a.name, ApiId{a.id, true});
     return m;
   }());
   const auto it = ids.find(name);
-  return it == ids.end() ? -1 : it->second;
+  return it == ids.end() ? ApiId{} : it->second;
 }
 
 // The operations of the kinds this names: the names are the enumerations'
@@ -289,11 +302,19 @@ const std::vector<const char*>* operation_names(const char* kind) {
 bool is_hip_api(const char* kind) {
   return std::strcmp(kind, "HIP_RUNTIME_API") == 0 || std::strcmp(kind, "HIP_RUNTIME_API_EXT") == 0;
 }
+bool is_hip_compiler_api(const char* kind) {
+  return std::strcmp(kind, "HIP_COMPILER_API") == 0 || std::strcmp(kind, "HIP_COMPILER_API_EXT") == 0;
+}
 
 // An operation's name, or nullptr. NONE (0) has no name a tool is shown.
 const char* operation_name(const char* kind, int op) {
   if (is_hip_api(kind)) {
     for (const HipApi& a : kHipApis)
+      if (a.id == op) return a.name;
+    return nullptr;
+  }
+  if (is_hip_compiler_api(kind)) {
+    for (const HipApi& a : kHipCompilerApis)
       if (a.id == op) return a.name;
     return nullptr;
   }
@@ -306,6 +327,11 @@ template <class Cb>
 rocprofiler_status_t iterate_operations(const char* kind, Cb&& each) {
   if (is_hip_api(kind)) {
     for (const HipApi& a : kHipApis)
+      if (each(a.id) != 0) break;
+    return ROCPROFILER_STATUS_SUCCESS;
+  }
+  if (is_hip_compiler_api(kind)) {
+    for (const HipApi& a : kHipCompilerApis)
       if (each(a.id) != 0) break;
     return ROCPROFILER_STATUS_SUCCESS;
   }
@@ -398,6 +424,9 @@ struct Sdk {
   };
   std::vector<LoadedObject> objects;
   std::atomic<uint64_t> next_correlation{1};
+  // Strings a tool is handed a pointer to and may keep (a code object's URI, a
+  // kernel's name): rocprofiler-sdk's live as long as the process, so these do.
+  std::set<std::string> interned;
 };
 
 // Never destroyed: a tool finalizes from an atexit handler, which may run
@@ -408,6 +437,9 @@ Sdk& sdk() {
 }
 
 uint64_t thread_id() { return static_cast<uint64_t>(::syscall(SYS_gettid)); }
+
+// The caller holds the lock.
+const char* intern(Sdk& s, const std::string& v) { return s.interned.insert(v).first->c_str(); }
 
 Context* context(Sdk& s, rocprofiler_context_id_t id) {
   for (Context& c : s.contexts)
@@ -448,6 +480,10 @@ uint32_t gfx_target_version(const std::string& gfx) {
   return major * 10000 + minor * 100 + step;
 }
 
+// gfx_target_version of the first RDNA part (gfx1000): the targets from there on
+// have no scalar register allocation to report, and count compute units in pairs.
+constexpr uint32_t kRdnaFirst = 100000;
+
 // The machine's agents as KFD numbers them: the CPU first, then each GPU.
 // What a GPU's profile does not say (its shader engines and arrays, its
 // XCDs, its engines' firmware) is left zero rather than guessed.
@@ -474,15 +510,22 @@ Agents build_agents() {
     rocprofiler_agent_v0_t g{};
     g.size = sizeof g;
     g.type = ROCPROFILER_AGENT_TYPE_GPU;
-    g.cu_count = d.compute_units;
-    // Four SIMDs to a compute unit is CDNA's (the CDNA3 ISA guide).
-    g.simd_per_cu = 4;
-    g.simd_count = d.compute_units * g.simd_per_cu;
+    // The agent is the card as KFD describes it: its own target, whatever HSA_OVERRIDE_GFX_VERSION makes
+    // the runtime report (an RX 6700 XT run as gfx1030 is still a gfx1031 agent).
+    const std::string gfx = d.hardware_gfx && *d.hardware_gfx ? d.hardware_gfx : d.gfx;
+    const bool rdna = gfx_target_version(gfx) >= kRdnaFirst;
+    // Four SIMDs to a compute unit is CDNA's (the CDNA3 ISA guide). On RDNA HIP's "compute unit" is a
+    // workgroup processor of two compute units with two SIMDs each, which is what KFD, and so a profiler,
+    // counts: an RX 6800 is 30 for HIP and 60 here, with 120 SIMDs either way, and 32 waves to a compute
+    // unit (rocprofv3 on an RX 6800 and an RX 6700 XT, ROCm 7.2).
+    g.cu_count = rdna ? d.compute_units * 2 : d.compute_units;
+    g.simd_per_cu = rdna ? 2 : 4;
+    g.simd_count = g.cu_count * g.simd_per_cu;
     g.wave_front_size = d.wave_size;
-    g.max_waves_per_cu = d.wave_size ? d.max_threads_per_cu / d.wave_size : 0;
+    g.max_waves_per_cu = d.wave_size ? d.max_threads_per_cu / d.wave_size / (rdna ? 2 : 1) : 0;
     g.max_waves_per_simd = g.max_waves_per_cu / g.simd_per_cu;
     g.lds_size_in_kb = d.lds_bytes / 1024;
-    g.gfx_target_version = gfx_target_version(d.gfx);
+    g.gfx_target_version = gfx_target_version(gfx);
     g.vendor_id = d.vendor_id;
     g.device_id = d.device_id;
     g.location_id = d.pci_bus << 8;
@@ -496,7 +539,7 @@ Agents build_agents() {
     for (int b = 0; b < 16; b += 2) g.gpu_id ^= static_cast<uint64_t>(d.uuid[b]) << 8 | d.uuid[b + 1];
     g.workgroup_max_dim = {d.max_block[0], d.max_block[1], d.max_block[2]};
     g.grid_max_dim = {d.max_grid[0], d.max_grid[1], d.max_grid[2]};
-    g.name = keep(d.gfx);
+    g.name = keep(gfx);
     g.vendor_name = keep("AMD");
     g.product_name = keep(d.model);
     g.model_name = keep("");
@@ -613,6 +656,7 @@ rocprofiler_user_data_t external_id(Context& c, rocprofiler_external_correlation
 struct ApiFrame {
   uint64_t correlation = 0;
   int op = -1;
+  bool compiler = false;   // a HIP compiler API call, not a runtime one
   uint64_t start = 0;
 };
 // A thread's HIP calls in progress. exit() destroys the thread's
@@ -735,7 +779,9 @@ uint64_t on_api_enter(const char* name) {
   if (s.finalized) return 0;
   ApiFrame f;
   f.correlation = s.next_correlation.fetch_add(1);
-  f.op = hip_api_id(name);
+  const ApiId id = hip_api_id(name);
+  f.op = id.op;
+  f.compiler = id.compiler;
   f.start = hp::now_ns();
   frames().push_back(f);
   return frames().size();
@@ -749,12 +795,16 @@ void on_api_exit(uint64_t token) {
   frames().pop_back();
   if (s.finalized || f.op < 0) return;
   const uint64_t end = hp::now_ns();
-  for (int kind : {ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API, ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT}) {
+  const int plain = f.compiler ? ROCPROFILER_BUFFER_TRACING_HIP_COMPILER_API : ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API;
+  const int ext = f.compiler ? ROCPROFILER_BUFFER_TRACING_HIP_COMPILER_API_EXT : ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT;
+  const auto request = f.compiler ? ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_HIP_COMPILER_API
+                                  : ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_HIP_RUNTIME_API;
+  for (int kind : {plain, ext}) {
     for_buffered(s, kind, f.op, [&](Context& c, uint64_t buf) {
       rocprofiler_correlation_id_t corr{};
       corr.internal = f.correlation;
-      corr.external = external_id(c, ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_HIP_RUNTIME_API, f.op, f.correlation);
-      if (kind == ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT) {
+      corr.external = external_id(c, request, f.op, f.correlation);
+      if (kind == ext) {
         rocprofiler_buffer_tracing_hip_api_ext_record_t r{};
         r.size = sizeof r;
         r.kind = static_cast<rocprofiler_buffer_tracing_kind_t>(kind);
@@ -787,7 +837,7 @@ void on_code_object(const hp::CodeObject& o, const hp::KernelSymbol* kernels, si
   load.size = sizeof load;
   load.code_object_id = o.id;
   load.agent_id = gpu_agent(s, o.device);
-  load.uri = o.uri;
+  load.uri = intern(s, o.uri);
   load.load_base = o.load_base;
   load.load_size = o.load_size;
   s.objects.push_back({o.id, load.agent_id.handle, o.load_base, o.load_size});
@@ -806,13 +856,18 @@ void on_code_object(const hp::CodeObject& o, const hp::KernelSymbol* kernels, si
                   rocprofiler_user_data_t user{};
                   svc.callback(r, &user, svc.data);
                 });
+  const rocprofiler_agent_v0_t* gpu = agent(s, load.agent_id.handle);
+  const bool rdna = gpu && gpu->gfx_target_version >= kRdnaFirst;
   for (size_t i = 0; i < count; ++i) {
     const hp::KernelSymbol& k = kernels[i];
     rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t sym{};
     sym.size = sizeof sym;
     sym.kernel_id = k.kernel_id;
     sym.code_object_id = o.id;
-    sym.kernel_name = k.name;
+    // The name of the kernel's descriptor in the code object ("<kernel>.kd"), which is what the HSA runtime
+    // names a kernel by and so what a profiler is told; its demangled form keeps the suffix, as
+    // "vadd(float const*, float const*, float*, int) [clone .kd]" (rocprofv3, ROCm 7.2).
+    sym.kernel_name = intern(s, std::string(k.name) + ".kd");
     sym.kernel_object = k.entry;
     sym.kernarg_segment_size = k.kernarg_size;
     sym.kernarg_segment_alignment = k.kernarg_alignment;
@@ -821,6 +876,15 @@ void on_code_object(const hp::CodeObject& o, const hp::KernelSymbol* kernels, si
     sym.sgpr_count = k.sgprs;
     sym.arch_vgpr_count = k.vgprs;
     sym.accum_vgpr_count = k.agprs;
+    if (rdna) {
+      // From gfx10 on a wave has no allocated scalar registers: a profiler reports the file, 128. The vector
+      // registers it reports are the code object's count rounded up to what the descriptor can say, a granule
+      // of 8 in wave32 and 4 in wave64 (rocprofv3 on an RX 6800: a kernel using 6 registers reports 8, one
+      // using 19 reports 24).
+      const uint32_t granule = k.wave_size == 32 ? 8 : 4;
+      sym.sgpr_count = 128;
+      sym.arch_vgpr_count = (k.vgprs + granule - 1) / granule * granule;
+    }
     sym.kernel_address.value = k.entry;
     for_callbacks(s, ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT, ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER,
                   [&](Context& c, CallbackService& svc) {
@@ -1008,11 +1072,27 @@ void on_launched(const hp::Launch&, const DispatchStats* stats, uint64_t start, 
                });
 }
 
+constexpr uint64_t kBlitCopyBytes = 16384;
+
 void on_copied(hp::Copy kind, int src_device, int dst_device, uint64_t bytes, uint64_t dst, uint64_t src,
                uint64_t start, uint64_t end) {
   Sdk& s = sdk();
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   if (s.finalized) return;
+  // ROCm's runtime hands a copy to a DMA engine, which is what a memory-copy record is about, only for a
+  // transfer between the host and a device of more than 16 KiB; shorter ones, and every copy within a device,
+  // it does with a kernel of its own (a dispatch it makes for the program, which this library does not
+  // report). Measured with rocprofv3 on an RX 6800 and an RX 6700 XT, ROCm 7.2: 16384 bytes is a kernel,
+  // 16388 is a DMA copy, in every combination of pageable, pinned, blocking and asynchronous. Nothing is
+  // known of the Instinct parts, which keep a record for every copy.
+  if (const rocprofiler_agent_v0_t* dev =
+          agent(s, gpu_agent(s, kind == hp::Copy::HostToDevice ? dst_device : src_device).handle);
+      dev && dev->gfx_target_version >= kRdnaFirst) {
+    const bool host_and_device = kind == hp::Copy::HostToDevice || kind == hp::Copy::DeviceToHost;
+    if ((host_and_device && bytes <= kBlitCopyBytes) || kind == hp::Copy::HostToHost ||
+        (kind == hp::Copy::DeviceToDevice && src_device == dst_device))
+      return;
+  }
   const int op = static_cast<int>(kind);
   const bool from_device = kind == hp::Copy::DeviceToHost || kind == hp::Copy::DeviceToDevice;
   const bool to_device = kind == hp::Copy::HostToDevice || kind == hp::Copy::DeviceToDevice;
@@ -1040,13 +1120,17 @@ void on_allocated(int device, uint64_t address, uint64_t bytes, bool freed, uint
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   if (s.finalized) return;
   const int op = freed ? ROCPROFILER_MEMORY_ALLOCATION_FREE : ROCPROFILER_MEMORY_ALLOCATION_ALLOCATE;
-  const uint64_t corr = current_correlation(s);
+  // The record has an id of its own, and names the HIP call that made it as its ancestor, as the real
+  // library's do (0 where no call is in progress).
+  const uint64_t ancestor = frames().empty() ? 0 : frames().back().correlation;
+  const uint64_t corr = s.next_correlation.fetch_add(1);
   for_buffered(s, ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION, op, [&](Context& c, uint64_t buf) {
     rocprofiler_buffer_tracing_memory_allocation_record_t r{};
     r.size = sizeof r;
     r.kind = ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION;
     r.operation = static_cast<rocprofiler_memory_allocation_operation_t>(op);
     r.correlation_id.internal = corr;
+    r.correlation_id.ancestor = ancestor;
     r.correlation_id.external =
         external_id(c, ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_MEMORY_ALLOCATION, op, corr);
     r.thread_id = thread_id();

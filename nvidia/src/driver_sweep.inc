@@ -1341,6 +1341,9 @@ static CUresult cuDestroyExternalSemaphore_impl(void* extSem) {
 
 // The external-semaphore graph nodes: no such node exists to read or change (cuGraphAddNode cannot make one here), so a
 // null node is CUDA_ERROR_INVALID_VALUE, as measured, and any other CUDA_ERROR_NOT_SUPPORTED.
+// The signatures name every parameter of the API; a refusal reads only some of them.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 #define VGPU_EXT_SEM_NODE(NAME, SIG, ARGS, NODEARG)                                                              \
   static CUresult NAME##_impl SIG;                                                                              \
   VGPU_EXPORT CUresult NAME SIG { return traced(#NAME, NAME##_impl, ARGS); }                                    \
@@ -1357,6 +1360,7 @@ VGPU_EXT_SEM_NODE(cuGraphExternalSemaphoresWaitNodeSetParams, (void* hNode, cons
 VGPU_EXT_SEM_NODE(cuGraphExecExternalSemaphoresSignalNodeSetParams, (void* hGraphExec, void* hNode, const void* nodeParams), hGraphExec COMMA hNode COMMA nodeParams, hGraphExec && hNode)
 VGPU_EXT_SEM_NODE(cuGraphExecExternalSemaphoresWaitNodeSetParams, (void* hGraphExec, void* hNode, const void* nodeParams), hGraphExec COMMA hNode COMMA nodeParams, hGraphExec && hNode)
 #undef VGPU_EXT_SEM_NODE
+#pragma GCC diagnostic pop
 
 // A conditional-node handle: the conditional nodes it is for (cuGraphAddNode with a conditional node, the driver
 // graph's if/while) are not offered by this driver graph, so a handle would be one nothing can use. Arguments
@@ -1551,6 +1555,8 @@ static CUresult cuDeviceGetDevResource_impl(CUdevice device, void* resource, int
   });
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 #define VGPU_GREEN(NAME, SIG, ARGS, NULLCHECK)                                                                   \
   static CUresult NAME##_impl SIG;                                                                              \
   VGPU_EXPORT CUresult NAME SIG { return traced(#NAME, NAME##_impl, ARGS); }                                    \
@@ -1572,6 +1578,7 @@ VGPU_GREEN(cuGreenCtxWaitEvent, (void* hCtx, void* hEvent), hCtx COMMA hEvent, !
 VGPU_GREEN(cuGreenCtxStreamCreate, (CUstream* phStream, void* greenCtx, unsigned int flags, int priority), phStream COMMA greenCtx COMMA flags COMMA priority, !greenCtx)
 VGPU_GREEN(cuGreenCtxGetId, (void* greenCtx, unsigned long long* greenCtxId), greenCtx COMMA greenCtxId, !greenCtx)
 #undef VGPU_GREEN
+#pragma GCC diagnostic pop
 
 // A stream made on a green context belongs to one; a plain stream is on none (CUDA_SUCCESS and a null result,
 // measured).

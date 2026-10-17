@@ -10,7 +10,9 @@
 // k order). Levels the host cannot run are reported as skipped, not passed.
 #pragma GCC optimize("fp-contract=off")
 
+#include <algorithm>
 #include <bit>
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -532,6 +534,107 @@ VTEST(masked_kernels_at_every_level) {
 
 namespace {
 
+// A double to bfloat16 in one rounding (to nearest, ties to the even one), a NaN the canonical 0x7fff. Written by scaling to an integer
+// significand and rounding there, not by the integer arithmetic on the bits that the kernel uses.
+uint16_t ref_f64_to_bf16(double v) {
+  if (v != v) return 0x7fff;
+  const uint16_t sign = std::signbit(v) ? 0x8000 : 0;
+  const double m = std::fabs(v);
+  if (m == 0) return sign;
+  if (std::isinf(m)) return sign | 0x7f80;
+  // Scale to an integer significand of 8 bits at the value's exponent (not below the smallest normal's), round to nearest even there
+  // (exact: the scaling is a power of two), scale back: the nearest bf16 value, whose bits are the top half of the float's.
+  const int e = std::max(std::ilogb(m), -126);
+  const double r = std::ldexp(std::nearbyint(std::ldexp(m, 7 - e)), e - 7);
+  if (r >= std::ldexp(1.0, 128)) return sign | 0x7f80;
+  return sign | static_cast<uint16_t>(fb(static_cast<float>(r)) >> 16);
+}
+
+// a * b + c rounded once to bfloat16: the fma in double rounded down and rounded up (the exact value lies between the two doubles, which
+// are adjacent when they differ), then the bfloat16 rounding of each; when they differ the exact value is on one side of the tie that
+// is one of the two (a double), and which one says which way it goes. (A single rounding to double first can land on the tie.)
+uint16_t ref_fma_bf16(double a, double b, double c) {
+  const int saved = std::fegetround();
+  std::fesetround(FE_DOWNWARD);
+  volatile double x = a, y = b, z = c;
+  const double lo = std::fma(x, y, z);
+  std::fesetround(FE_UPWARD);
+  const double hi = std::fma(x, y, z);
+  std::fesetround(saved);
+  if (lo != lo || hi != hi) return 0x7fff;
+  const uint16_t rl = ref_f64_to_bf16(lo), rh = ref_f64_to_bf16(hi);
+  if (lo == hi) return ref_f64_to_bf16(std::fma(a, b, c));   // exact (and a zero sum has the sign round-to-nearest gives it)
+  if (rl == rh) return rl;
+  // They differ: the tie between two bfloat16 values (a double whose mantissa is 1 followed by 44 zeros past the seventh bit) is lo or hi,
+  // and the exact value is strictly between them, so on the far side of the tie from it: lo a tie means above it (rh), hi a tie below (rl).
+  const auto is_tie = [](double v) { return (std::bit_cast<uint64_t>(v) & ((uint64_t{1} << 45) - 1)) == (uint64_t{1} << 44); };
+  return is_tie(lo) ? rh : rl;
+}
+
+}  // namespace
+
+// hfma2_bf_m: both bfloat16 halves of each word, a * b + c with the exact binary64 result rounded once to
+// bfloat16 (the executor's general form; an RTX 3060 rounds once: through a float it rounded twice and differed in the last place), on zeros, subnormals, the extremes, infinities, NaN payloads, cancellations and
+// random words, with part of the lanes masked off and the destination aliasing a source.
+VTEST(hfma2_bf_m_at_every_level) {
+  std::mt19937 rng(23);
+  static const uint16_t b16[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x007f, 0x0080, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x7f80, 0xff80,
+                                 0x7fc0, 0x7f81, 0xffc1, 0x4049, 0x0040, 0x4f80, 0x5f00, 0x1f80, 0x3fc0, 0x7f00, 0x0100, 0x3f81,
+                                 0x3f7f, 0x7e80, 0x2000, 0xa000};
+  constexpr size_t N = sizeof b16 / sizeof b16[0];
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 40000; ++round) {
+      const unsigned n = round & 1 ? 64 : 32;
+      uint32_t a[64], b[64], c[64], d[64], d0[64];
+      for (unsigned i = 0; i < n; ++i) {
+        if (round % 3 == 0) {
+          a[i] = rng(), b[i] = rng(), c[i] = rng();
+        } else {
+          a[i] = uint32_t{b16[rng() % N]} | (uint32_t{b16[rng() % N]} << 16);
+          b[i] = uint32_t{b16[rng() % N]} | (uint32_t{b16[rng() % N]} << 16);
+          c[i] = uint32_t{b16[rng() % N]} | (uint32_t{b16[rng() % N]} << 16);
+          if (round % 5 == 0) {   // c cancels the product, or is far below it: the rounding of the sum, not of the product
+            for (int h = 0; h < 2; ++h) {
+              const double p = static_cast<double>(asf(((a[i] >> (16 * h)) & 0xffffu) << 16)) *
+                               static_cast<double>(asf(((b[i] >> (16 * h)) & 0xffffu) << 16));
+              const float pf = static_cast<float>(-p);
+              const uint32_t cb = fb(pf) >> 16;
+              c[i] = (c[i] & ~(0xffffu << (16 * h))) | ((round % 10 == 0 ? cb : cb + 1) << (16 * h));
+            }
+          }
+        }
+        d0[i] = rng();
+      }
+      uint64_t mask = (static_cast<uint64_t>(rng()) << 32) | rng();
+      if (round % 7 == 0) mask = ~uint64_t{0};
+      if (round % 11 == 0) mask = 0;
+      std::memcpy(d, d0, sizeof d);
+      const uint32_t* src_a = a;
+      if (round % 4 == 1) {   // d is also the first source
+        std::memcpy(d, a, sizeof d);
+        std::memcpy(d0, a, sizeof d0);
+      }
+      k.hfma2_bf_m(d, src_a, b, c, mask, n);
+      for (unsigned i = 0; i < n; ++i) {
+        uint32_t out = 0;
+        for (unsigned h = 0; h < 2; ++h) {
+          const auto cv = [&](uint32_t w) { return static_cast<double>(asf(((w >> (16 * h)) & 0xffffu) << 16)); };
+          out |= uint32_t{ref_fma_bf16(cv(a[i]), cv(b[i]), cv(c[i]))} << (16 * h);
+        }
+        const uint32_t want = (mask >> i) & 1 ? out : d0[i];
+        if (d[i] != want)
+          throw vtest::Failure(lv + " hfma2_bf_m round " + std::to_string(round) + " lane " + std::to_string(i) + ": got 0x" +
+                               hex(d[i]) + " want 0x" + hex(want) + " (a=0x" + hex(a[i]) + " b=0x" + hex(b[i]) + " c=0x" +
+                               hex(c[i]) + ")");
+      }
+    }
+  }
+}
+
+namespace {
+
 // The narrow-float decode and the exact sum as they were before the tables and the integer form (copied from
 // src/exec/interpreter.cpp at the commit before this one): the references.
 double ref_fp8(uint32_t byte, int exp_bits, int man_bits, int bias, bool has_inf) {
@@ -792,20 +895,16 @@ VTEST(double_lanes_and_popcount) {
         const uint64_t u = (mask >> i) & 1 ? std::bit_cast<uint64_t>(r) : uint64_t{olo[i]} | (uint64_t{ohi[i]} << 32);
         const uint64_t g = uint64_t{dlo[i]} | (uint64_t{dhi[i]} << 32);
         // A NaN operand decides the result by the kernel's rule, not by the host instruction the compiler picked: the
-        // first NaN of (b, a) for a sum or product (as the scalar code and an RTX 3060 do) and of (b, a, c) for an fma,
-        // with its quiet bit set.
+        // first NaN of (b, a) for a sum or product and of (b, c, a) for an fma, with its quiet bit set, taken as the register
+        // holds it -- the |x| and -x modifiers change the arithmetic and not the NaN that is the answer (an RTX 3060, probed
+        // with distinct payloads in every position: float_half_forms.cu).
         uint64_t u2 = u;
         {
-          const auto raw = [&](int s) {
-            uint64_t v = uint64_t{lo[s][i]} | (uint64_t{hi[s][i]} << 32);
-            if (mods & (1u << (2 * s))) v &= 0x7fffffffffffffffull;
-            if (mods & (2u << (2 * s))) v ^= 0x8000000000000000ull;
-            return v;
-          };
+          const auto raw = [&](int s) { return uint64_t{lo[s][i]} | (uint64_t{hi[s][i]} << 32); };
           const auto nan = [](uint64_t v) { return (v & 0x7fffffffffffffffull) > 0x7ff0000000000000ull; };
           const uint64_t ra = raw(0), rb = raw(1), rc = kind == 2 ? raw(2) : 0;
           if (nan(ra) || nan(rb) || nan(rc)) {
-            const uint64_t pick = kind == 2 ? (nan(rb) ? rb : nan(ra) ? ra : rc) : (nan(rb) ? rb : ra);
+            const uint64_t pick = kind == 2 ? (nan(rb) ? rb : nan(rc) ? rc : ra) : (nan(rb) ? rb : ra);
             if ((mask >> i) & 1) u2 = pick | 0x0008000000000000ull;
           }
         }
@@ -1010,7 +1109,7 @@ VTEST(wide_integer_kernels_at_every_level) {
 // values (zeros of both signs, subnormals, the extremes, infinities, NaNs of both signs and payloads) and random bits.
 namespace {
 float ftz_ref(float f) { return std::fpclassify(f) == FP_SUBNORMAL ? std::copysign(0.0f, f) : f; }
-float sat_ref(float f) { return f != f ? 0.0f : f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }
+float sat_ref(float f) { return f != f ? 0.0f : f <= 0.0f ? 0.0f : f > 1.0f ? 1.0f : f; }   // (-0 is +0: an RTX 3060)
 bool fcmp_ref(unsigned cmp, double a, double b) {
   const bool un = a != a || b != b;
   switch (cmp) {
@@ -1101,7 +1200,7 @@ VTEST(float_forms_at_every_level) {
           volatile double x = ftz_ref(std::bit_cast<float>(a[i]));
           volatile double q = kind == 4 ? 1.0 / x : kind == 5 ? 1.0 / std::sqrt(x) : std::sqrt(x);
           const float f = ftz_ref(static_cast<float>(q));
-          const uint32_t want = std::bit_cast<uint32_t>(f);
+          const uint32_t want = f != f ? 0x7fffffffu : std::bit_cast<uint32_t>(f);   // (a NaN is the canonical one)
           if (r[i] != want) fail("mufu", i, a[i], 0, 0, r[i], want, static_cast<int>(kind));
         }
       }
@@ -1151,7 +1250,7 @@ VTEST(float_forms_at_every_level) {
               const float y = ftz ? ftz_ref(std::bit_cast<float>(b[i])) : std::bit_cast<float>(b[i]);
               const bool m = (mn >> i) & 1;
               uint32_t want;
-              if (nan && (x != x || y != y)) {
+              if ((nan && (x != x || y != y)) || (x != x && y != y)) {   // (two NaNs give the canonical one even without .NAN)
                 want = 0x7fffffffu;
               } else {
                 float v;
@@ -1171,6 +1270,123 @@ VTEST(float_forms_at_every_level) {
 
 // PRMT's default mode against the byte-by-byte rule: every selector nibble (all 16 values in each of the four positions), over
 // words of special and random bytes.
+namespace {
+// A 32-bit integer to float by the compiler's own conversion, in whatever rounding mode the host is in (out of line, and the
+// result stored through a volatile, so that nothing is evaluated before the mode is set).
+[[gnu::noinline]] uint32_t ref_i2f_in_mode(bool sgn, uint32_t a) {
+  volatile float f = sgn ? static_cast<float>(static_cast<int64_t>(static_cast<int32_t>(a))) : static_cast<float>(static_cast<int64_t>(a));
+  return std::bit_cast<uint32_t>(f);
+}
+}  // namespace
+
+// i2f runs inside a RoundingScope in the SASS executor (I2F.RM / .RP / .RZ): under every host rounding mode it must give the bits the
+// compiler's conversion gives -- including the sign of a zero (the unsigned conversion once made -0 from 0 when rounding down).
+VTEST(i2f_under_directed_rounding_at_every_level) {
+  std::mt19937 rng(77);
+  static const uint32_t edge[] = {0u, 1u, 2u, 0x7fffffffu, 0x80000000u, 0x80000001u, 0xffffffffu, 0xfffffffeu, 0x01000001u, 0x01000003u,
+                                  0x00ffffffu, 0xfeffffffu, 0xff000001u, 0x7f000001u, 0x40000001u, 0x3fffffffu, 0xc0000001u};
+  constexpr size_t N = sizeof edge / sizeof edge[0];
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+      for (int round = 0; round < 2000; ++round) {
+        uint32_t a[32], r[32], want[32];
+        for (int i = 0; i < 32; ++i) a[i] = round % 4 == 0 ? static_cast<uint32_t>(rng()) : edge[rng() % N] + (round % 3 == 0 ? static_cast<uint32_t>(rng() % 5) : 0u);
+        for (bool sgn : {false, true}) {
+          const int saved = std::fegetround();
+          std::fesetround(mode);
+          k.i2f(sgn, r, a);
+          for (int i = 0; i < 32; ++i) want[i] = ref_i2f_in_mode(sgn, a[i]);
+          std::fesetround(saved);
+          for (int i = 0; i < 32; ++i)
+            if (r[i] != want[i])
+              throw vtest::Failure(lv + " i2f mode " + std::to_string(mode) + (sgn ? " signed" : " unsigned") + " lane " + std::to_string(i) +
+                                   ": a=0x" + hex(a[i]) + " got 0x" + hex(r[i]) + " want 0x" + hex(want[i]));
+        }
+      }
+    }
+  }
+}
+
+// narrow_from_double / narrow_core (the SASS executor's F2F and I2F to f16 and bf16 in a given rounding mode, one rounding from the
+// exact value) against a brute-force reference: the finite values of the format in a table, the neighbours of the input found by
+// search, and the mode (0 nearest even, 1 toward -inf, 2 toward +inf, 3 toward zero) choosing between them. Inputs: random doubles over
+// the format's whole range and past it, every representable value and its neighbours, every midpoint, and 64-bit integers (what I2F
+// converts: through narrow_core, one rounding from the integer, where f32 first would round twice).
+namespace {
+struct NarrowRef {
+  unsigned mb, eb, inf_bits, sign_bit;
+  std::vector<long double> mag;   // the finite magnitudes by bit pattern; the last entry is 2^(emax+1), where infinity begins
+  explicit NarrowRef(unsigned dsize) : mb(dsize == 1 ? 10 : 7), eb(dsize == 1 ? 5 : 8) {
+    inf_bits = ((1u << eb) - 1) << mb;
+    sign_bit = 1u << (mb + eb);
+    mag.resize(inf_bits + 1);
+    for (uint32_t b = 0; b < inf_bits; ++b)
+      mag[b] = dsize == 1 ? static_cast<long double>(simd::f16_to_f32(static_cast<uint16_t>(b))) : static_cast<long double>(simd::bf16_to_f32(static_cast<uint16_t>(b)));
+    mag[inf_bits] = std::ldexp(1.0L, (1 << (eb - 1)));
+  }
+  uint32_t operator()(long double a, bool sign, unsigned rnd) const {
+    const uint32_t sb = sign ? sign_bit : 0u;
+    if (a == 0) return sb;
+    const bool away = (rnd == 1 && sign) || (rnd == 2 && !sign);
+    if (a >= mag[inf_bits]) return sb | ((rnd == 0 || away) ? inf_bits : inf_bits - 1);
+    const uint32_t lo = static_cast<uint32_t>(std::upper_bound(mag.begin(), mag.end(), a) - mag.begin()) - 1, hi = lo + 1;
+    if (mag[lo] == a) return sb | lo;
+    if (rnd != 0) return sb | (away ? hi : lo);
+    const long double dl = a - mag[lo], dh = mag[hi] - a;
+    return sb | (dl < dh ? lo : dh < dl ? hi : (lo & 1) == 0 ? lo : hi);
+  }
+};
+}  // namespace
+
+VTEST(narrow_in_every_mode_matches_a_table) {
+  for (unsigned dsize : {1u, 4u}) {
+    const NarrowRef ref(dsize);
+    const char* name = dsize == 1 ? "f16" : "bf16";
+    std::mt19937_64 rng(dsize * 1315423911u);
+    std::vector<double> xs;
+    for (int i = 0; i < 60000; ++i) {
+      const int e = static_cast<int>(rng() % (dsize == 1 ? 50 : 300)) - (dsize == 1 ? 30 : 150);
+      xs.push_back(std::ldexp(1.0 + static_cast<double>(rng() >> 11) / 9007199254740992.0, e) * ((rng() & 1) ? -1 : 1));
+    }
+    for (uint32_t b = 0; b + 1 < ref.inf_bits; ++b) {
+      const double v = static_cast<double>(ref.mag[b]), nx = static_cast<double>(ref.mag[b + 1]), mid = (v + nx) / 2;
+      for (double q : {v, std::nextafter(v, 0.0), std::nextafter(v, 1e300), mid, std::nextafter(mid, 0.0), std::nextafter(mid, 1e300)}) {
+        xs.push_back(q);
+        xs.push_back(-q);
+      }
+    }
+    for (double q : {0.0, -0.0, 1e300, -1e300, 65504.0, 65519.99, 65520.0, 65536.0, 3.3895313892515355e38, 3.39e38, 3.4e38})
+      xs.push_back(q);
+    for (double x : xs)
+      for (unsigned rnd = 0; rnd < 4; ++rnd) {
+        const uint32_t got = simd::narrow_from_double(x, dsize, rnd), want = ref(std::fabs(static_cast<long double>(x)), std::signbit(x), rnd);
+        if (got != want) {
+          char buf[200];
+          std::snprintf(buf, sizeof buf, "narrow_from_double(%a, %s, mode %u): got 0x%x want 0x%x", x, name, rnd, got, want);
+          throw vtest::Failure(buf);
+        }
+      }
+    for (int i = 0; i < 60000; ++i) {
+      uint64_t v = rng() >> (rng() % 64);
+      if (i % 5 == 0) v |= (uint64_t{1} << (rng() % 64)) - 1;   // many ones below a leading bit: just under a tie, or on one
+      if (i % 5 == 1) v = (v | 1) << (rng() % 16);
+      if (v == 0) continue;
+      const int z = std::countl_zero(v);
+      for (unsigned rnd = 0; rnd < 4; ++rnd)
+        for (bool neg : {false, true}) {
+          const uint32_t got = simd::narrow_core(neg, v << z, 63 - z, ref.mb, ref.eb, rnd), want = ref(static_cast<long double>(v), neg, rnd);
+          if (got != want) {
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "narrow_core(%s%llu, %s, mode %u): got 0x%x want 0x%x", neg ? "-" : "", static_cast<unsigned long long>(v), name, rnd, got, want);
+            throw vtest::Failure(buf);
+          }
+        }
+    }
+  }
+}
+
 VTEST(prmt0_at_every_level) {
   std::mt19937 rng(246);
   for (simd::Level l : levels()) {

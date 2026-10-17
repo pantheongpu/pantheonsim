@@ -18,6 +18,9 @@
 // type on the way out. Anything unimplemented returns
 // CUSPARSE_STATUS_NOT_SUPPORTED so a caller can fall back rather than receive a
 // plausible wrong answer.
+// The legacy routines and types below are deprecated in the toolkit's cusparse.h and removed in its next major
+// release; an application may still call them, so this library provides them all.
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #include <cusparse.h>
 
 #include <algorithm>

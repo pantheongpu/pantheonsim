@@ -54,8 +54,10 @@ jobs:
     env:
       # CUDA 12.4 and later take the runner's GCC (13 on 24.04, 11 on 22.04).
       NVCC_PREPEND_FLAGS: ''
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
 
       - name: Install CUDA ${{ matrix.cuda }}
         env:

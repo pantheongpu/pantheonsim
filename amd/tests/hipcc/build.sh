@@ -49,6 +49,10 @@ echo "wrote $(pwd)/textures.gfx942"
   sed -n 's/^\t\(.*\)\/\/ .*/\1/p' | sed 's/[[:space:]]*$//; s/  */ /g' > cooperative.gfx942.dis
 echo "wrote $(pwd)/cooperative.gfx942, cooperative.gfx942.o and its listing ($(wc -l < cooperative.gfx942.dis) instructions)"
 
+# Work-groups that wait on one another: a grid barrier, flag chains, a producer, locks.
+"$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx942 lockstep.cpp -o lockstep.gfx942
+echo "wrote $(pwd)/lockstep.gfx942"
+
 # HIP's calls beyond the everyday ones -- device flags and UUIDs, contexts, the
 # reserved stream handles, callbacks, waiting on memory, every launch form --
 # checked against what ROCm's HIP answers.
@@ -213,7 +217,7 @@ echo "wrote $(pwd)/workgroup.gfx1031 (ROCm 7.2, like memtest.gfx1031)"
 
 # The same programs for gfx1250 (CDNA 5, MI455X; wave32), which the runner executes on a simulated MI455X. Built
 # by ROCm 7.2's hipcc, which knows gfx1250; no card has run them.
-for src in atomics memory graphs cooperative streams smid errors pointers runtime gfx1250 wmma1250 trload1250 async1250 permlane1250 barrier1250 alu1250 vgprs1250 block1250 tensor1250 ds1250 forms1250 scalef32_narrow1250; do
+for src in atomics memory graphs cooperative streams lockstep smid errors pointers runtime gfx1250 wmma1250 trload1250 async1250 permlane1250 barrier1250 alu1250 vgprs1250 block1250 tensor1250 ds1250 forms1250 scalef32_narrow1250; do
   "$rocm/bin/hipcc" -O2 -std=c++17 -Wno-deprecated-declarations --offload-arch=gfx1250 $src.cpp -o $src.gfx1250
   echo "wrote $(pwd)/$src.gfx1250"
 done

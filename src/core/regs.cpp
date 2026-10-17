@@ -576,7 +576,7 @@ struct RegisterSpace::Impl {
     const uint32_t vendor = d.pci_device_id & 0xFFFF, device = d.pci_device_id >> 16;
     // A device replaying a capture of its own model has that board's subsystem
     // IDs; any other has its own vendor and device IDs there.
-    const bool same_card = image_src && (image_src->bytes[2] | image_src->bytes[3] << 8) == device;
+    const bool same_card = image_src && static_cast<uint32_t>(image_src->bytes[2] | image_src->bytes[3] << 8) == device;
     if ((k == "profile.subsystem_vendor_id" || k == "profile.subsystem_id") && same_card) return base(r);
     if (k == "profile.vendor_id" || k == "profile.subsystem_vendor_id") return vendor;
     if (k == "profile.device_id" || k == "profile.subsystem_id") return device;

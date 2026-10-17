@@ -848,6 +848,7 @@ class Parser {
     expect_punct("{");
     parse_body(fn);
     contract_mul_add(fn);
+    mark_nan_order(fn);
     fold_constant_sync_masks(fn);
     place_dynamic_shared(fn);
     current_kernel_.clear();
@@ -4860,10 +4861,42 @@ class Parser {
         }
       }
       ins.op = std::move(op);
+    } else if (op0 == "txq") {
+      // txq.<query>.b32 d, [tex]  /  txq.level.<query>.b32 d, [tex], lod
+      // A texture object answers width, height and depth, level by level. The other queries the ISA lists
+      // (channel_data_type, channel_order, normalized_coords, array_size, num_mipmap_levels, filter_mode,
+      // addr_mode_*) assemble but do not run: a kernel using one for a texture object fails to launch on an
+      // RTX 3060 (CUDA_ERROR_NOT_FOUND, measured with txq.* on texture objects from cudaCreateTextureObject),
+      // so there is no answer to reproduce.
+      OpTxq op;
+      bool have_query = false;
+      for (size_t i = 1; i < parts.size(); ++i) {
+        const std::string& p = parts[i];
+        if (p == "level") op.level = true;
+        else if (p == "width") { op.query = TxqQuery::Width; have_query = true; }
+        else if (p == "height") { op.query = TxqQuery::Height; have_query = true; }
+        else if (p == "depth") { op.query = TxqQuery::Depth; have_query = true; }
+        else if (p == "b32") ;
+        else
+          return unsupported("txq." + p + ": a kernel with this query does not launch on a card for a texture "
+                             "object (an RTX 3060 returns CUDA_ERROR_NOT_FOUND), so only width, height and depth "
+                             "are implemented");
+      }
+      if (!have_query) return unsupported("txq without a query");
+      op.dst = expect_reg_operand("txq destination");
+      expect_punct(",");
+      expect_punct("[");
+      op.obj = parse_operand();
+      expect_punct("]");
+      if (op.level) {
+        expect_punct(",");
+        op.lod = parse_operand();
+      }
+      ins.op = std::move(op);
     } else if (op0 == "suld" || op0 == "sust") {
       // suld.b.<geom>.<type>.<clamp> {d,...}, [obj, {x,y}]
       // sust.b.<geom>.<type>.<clamp> [obj, {x,y}], {s,...}
-      uint32_t dims = 0, bytes = 0;
+      uint32_t dims = 0, bytes = 0, vec = 1;   // vec: components per access, from .v2/.v4 (none is one)
       bool layered = false, formatted = false;
       uint8_t oob = kSurfTrap;
       for (size_t i = 1; i < parts.size(); ++i) {
@@ -4887,7 +4920,8 @@ class Parser {
         else if (p == "trap") oob = kSurfTrap;
         else if (p == "clamp") oob = kSurfClamp;
         else if (p == "zero") oob = kSurfZero;
-        else if (p == "v2" || p == "v4") ;
+        else if (p == "v2") vec = 2;
+        else if (p == "v4") vec = 4;
         else if (p == "b8") bytes = 1;
         else if (p == "b16") bytes = 2;
         else if (p == "b32") bytes = 4;
@@ -4903,7 +4937,11 @@ class Parser {
         op.oob = oob;
         op.layered = layered;
         op.bytes = bytes;
-        op.dsts = parse_reg_vector_any();
+        // The destination is a braced list for .v2/.v4 and a lone register without a vector suffix
+        // (NVRTC writes `suld.b.2d.b32.zero %f1, [...]` for a scalar read).
+        if (peek_punct("{")) op.dsts = parse_reg_vector_any();
+        else op.dsts.push_back(expect_reg_operand("suld destination"));
+        if (op.dsts.size() != vec) return unsupported("suld destination count does not match its vector suffix");
         expect_punct(",");
         expect_punct("[");
         op.obj = parse_operand();
@@ -4925,7 +4963,10 @@ class Parser {
         op.coords = parse_operand_vector_any();
         expect_punct("]");
         expect_punct(",");
-        op.srcs = parse_operand_vector_any();
+        // A braced list for .v2/.v4, a lone operand without a vector suffix.
+        if (peek_punct("{")) op.srcs = parse_operand_vector_any();
+        else op.srcs.push_back(parse_operand());
+        if (op.srcs.size() != vec) return unsupported("sust source count does not match its vector suffix");
         if (op.coords.size() < dims + (layered ? 1 : 0)) return unsupported("sust coordinate count");
         ins.op = std::move(op);
       }
@@ -5577,6 +5618,7 @@ Module parse(const std::string& src) {
   // Last, once nothing edits an instruction any more (mul/add contraction,
   // sync-mask folding and call resolution all do): the pre-decoded forms must
   // describe the body the interpreter will run.
+  intern_call_slots(m);
   for (auto& fn : m.entries) build_micro(fn);
   for (auto& fn : m.funcs) build_micro(*fn);
   return m;

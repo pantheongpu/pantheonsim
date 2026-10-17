@@ -44,6 +44,7 @@ enum class SrcKind : uint8_t {
 enum class Dyn : uint8_t {
   Reg,     // a register with a modifier: off = register
   Bank0,   // a word of constant bank 0 (kernel parameters, launch shape): off = byte offset
+  BankN,   // a word of another constant bank (the module's __constant__ data lives in memory): pad = the bank, off = byte offset
   UReg,    // a uniform register: off = its number
 };
 // The modifiers a Dyn source carries, applied to its value as the form's domain says (apply()).
@@ -53,7 +54,7 @@ struct Src {
   SrcKind kind = SrcKind::Pool;
   Dyn dyn = Dyn::Reg;
   uint8_t mod = 0;
-  uint8_t pad = 0;
+  uint8_t pad = 0;     // the constant bank of a Dyn::BankN source
   uint32_t off = 0;
 };
 
@@ -87,16 +88,59 @@ enum class Form : uint8_t {
   Fmul,
   Dop,       // DADD, DMUL, DFMA
   Bra,       // a plain relative BRA: run by tier_run itself when it ends a straight-line run
-  Bssy,      // BSSY and NOP, which end a run without moving any lane's program counter: run by tier_run too
+  Bssy,      // BSSY and NOP (and the barriers and fences that do nothing here), which end a run without moving any lane's program counter: run by tier_run too
   Nop,
   Plop3,     // PLOP3, S2R and SEL end a run (they are not straight-line ones) but need nothing of the interpreter
   S2r,
+  Cs2r,      // CS2R: a special register, or SRZ, into a register or a pair
   Sel,
   Prmt,
   Imnmx,
+  Fmnmx,     // FMNMX
+  Mufu,      // MUFU: every function the interpreter's fast path takes
+  F2i,       // F2I from f32 to 32 bits
+  I2f,       // I2F from 8, 16 or 32 bits to f32 (I2FP.F32 is I2fp)
+  F2fp,      // F2FP.PACK_AB to f16 or bf16
+  Dsetp,     // DSETP
+  Hop2,      // HADD2, HMUL2, HFMA2 (packed f16; the f32-result HADD2.F32 is the interpreter's)
+  Unary,     // BREV and FLO
+  Iabs,      // IABS
+  Ldc,       // LDC from a constant bank
+  Bsync,     // BSYNC: ends a run, run by tier_run itself
+  Yield,     // YIELD: ends a run, run by tier_run itself
+  Bar,       // BAR.SYNC / ARV / RED: ends a run, run by tier_run itself
+  Exit,      // EXIT (with up to two condition predicates) when nothing waits at a barrier of any kind: run by tier_run itself
+  Shfl,      // SHFL: ends a run, has a handler
+  Vote,      // VOTE.{ALL,ANY,EQ}: ends a run, has a handler
+  Umov,      // the uniform datapath: computed once for the warp, from the first lane that runs it, into UR/UP
+  Uldc,
+  Uiadd3,
+  Uimad,
+  Uisetp,
+  Ulea,
+  Ulop3,
+  Ushf,
+  Uunary,    // UFLO, UPOPC
+  Usel,
+  Hmma,      // HMMA (dense f16, bf16, tf32 with an f32 or f16 accumulator): the SIMD kernel; ends a run, has a handler
   Count_,
 };
 const char* form_name(Form f);
+
+// How a form's RESULT is computed, so that the rules of the interpreter cannot drift away from the tier's unnoticed (tests/unit/test_tier.cpp holds
+// this table to a checked-in list and reads tier_ops.inc for what a handler may not contain):
+//   Kernel: a call of the SIMD kernel (vgpu/simd/simd.hpp) or the shared function that Runner::fast_alu / fast_float / fast_wide calls for the
+//           same form, with the same arguments. The rules live in the kernel; the handler only resolves the operands.
+//   Interp: the interpreter's own code runs (Runner::fast_alu, then exec_float, exec_mma), for the whole form or for the part of it that has
+//           result rules of its own (named in the note). The tier adds only the dispatch.
+//   Own:    the tier computes it itself. Only for work with no result rules of a number format: integer and predicate arithmetic whose
+//           rules do not depend on a format or a card, scheduling and control, and addresses. Each says why.
+enum class Impl : uint8_t { Kernel, Interp, Own };
+struct FormImpl {
+  Impl impl;
+  const char* note;   // for Own: the reason; for Interp and Kernel: what is shared
+};
+const FormImpl& form_impl(Form f);
 
 struct MOp {
   // `ctx` is exec.cpp's TCtx: what a handler needs of the warp and the launch.
@@ -105,7 +149,7 @@ struct MOp {
   const Instr* ins = nullptr;    // for the interpreter, faults and statistics
   Src s[3];                      // sources, in the order the handler takes them
   Src p;                         // a predicate source (Dyn::Reg: a per-lane P<n>; Dyn::UReg: a uniform UP<n>), if any
-  Src p2;                        // a second one
+  Src p2;                        // a second one (a BRA's condition predicates are p and p2: aux says how many)
   int64_t imm = 0;               // a memory operand's offset
   uint32_t a = 0, b = 0;         // form-specific immediates (a LOP3's table, an IADD3's +1 count, a shift, ...)
   uint32_t c = 0;

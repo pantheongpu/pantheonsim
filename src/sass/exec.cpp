@@ -13,6 +13,7 @@
 // Every instruction completes before the next: the control bits' stall counts
 // and scoreboards are timing, which VirtualGPU does not model.
 #include "vgpu/exec/devrt.hpp"
+#include "vgpu/exec/lockstep.hpp"
 #include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/sass/exec.hpp"
 #include "tier.hpp"
@@ -23,8 +24,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <optional>
 #include <utility>
 #include <bit>
+#include <bitset>
+#include <cerrno>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -42,7 +46,9 @@
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/mem_counters.hpp"
+#include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
+#include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/texture_grad.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
@@ -98,7 +104,10 @@ struct Warp {
   uint64_t bssy_stamp[16] = {};       // when (Block::bssy_clock) each barrier was last set up: higher is more deeply nested
   uint64_t rpc[32] = {};              // the return-address register (RPCMOV)
   uint64_t gmma_issued = 0;           // warpgroup MMAs this warp has issued
-  const Code* code_hint = nullptr;    // the code section the tier last found this warp in
+  const Code* code_hint = nullptr;    // the code section this warp last ran in (step_warp, and the tier)
+  // The tier's chain (tier_ops.inc): how many more calls of step_warp the caller's turn has after this one, and how many the
+  // tier has taken over. Set by the caller before each call; the caller adds `extra` to its count and clears it.
+  uint32_t budget = 0, extra = 0;
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
   uint32_t local_size = 0;
   uint64_t steps = 0;
@@ -107,6 +116,13 @@ struct Warp {
   uint32_t spins = 0;
   bool give_way = false;
   uint32_t spin_yields = 0;   // YIELDs in a row with no other lane group able to run
+  // YIELDs since the warp last wrote memory (a store, or an atomic that changed a word), with several lane groups
+  // taking turns or not: a warp whose groups all spin on words only another warp's lanes can change is not
+  // making progress either, and spin_yields alone never sees it.
+  uint32_t idle_yields = 0;
+  // The group that last gave way (a YIELD, or a backward branch taken often enough while other lanes waited) and
+  // where it stands now: the next group to run is the one after it in address order, wrapping round.
+  uint64_t yield_pc = 0;
   Mask slice = 0;             // the group let in by a YIELD: it runs until its own next YIELD or until it blocks
   uint32_t b2r = 0;                   // the last block barrier reduction's result (B2R.RESULT)
   bool b2r_pred = false;
@@ -216,6 +232,21 @@ std::mutex& atomic_lock(uint64_t addr) {
 
 void tier_add_total(uint64_t n);   // tier_ops.inc
 
+// The budget of steps a warp may take: the launch's, or VGPU_MAX_STEPS (0: none), by the rule the PTX engine applies
+// (effective_max_steps in src/exec/interpreter.cpp). Read at the start of each launch.
+uint64_t sass_max_steps(uint64_t configured) {
+  static const char* const e = std::getenv("VGPU_MAX_STEPS");   // (once per process: a launch of a few instructions costs less than a getenv)
+  if (!e || !*e) return configured;
+  const char* p = e;
+  while (*p == ' ' || *p == '\t') ++p;
+  if (*p == '-' || *p == '+') return configured;   // (strtoull would wrap a negative into a huge budget)
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(e, &end, 10);
+  if (errno != 0 || end == e || *end != '\0') return configured;
+  return v == 0 ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(v);
+}
+
 // The lanes whose program counter is `p`, compared two to a vector register where SSE2 is there.
 inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
   Mask eq = 0;
@@ -233,11 +264,134 @@ inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
   return eq;
 }
 
+// ---- kernels whose blocks wait on one another (vgpu/exec/lockstep.hpp) ----------------------------
+//
+// A kernel polls global memory when it has a loop with an atomic that returns its old value, or a
+// strong load (a volatile or relaxed one, CTA scope aside), whose address and operands are the same
+// on every turn of the loop, and no store to global memory anywhere in the loop: `while (atomicCAS(lock,
+// 0, 1)) {}`, `while (*(volatile int*)flag != n) {}`. A compare-and-swap retry loop is not one: the value
+// it swaps in comes from the old value, which changes. The test is cheap and errs towards "no": a
+// kernel it misses runs as before, and one it takes for a poller only loses some speed.
+//
+// Going through the loop's instructions in address order, a register is "variable" when what it
+// holds can differ from one turn to the next: it was set from what a load, atomic, shuffle, vote or
+// clock returned, or from a variable register, or it is read before the loop sets it and the loop
+// does set it (it comes round from the last turn: a counter, an old value). A register the loop only
+// reads, or sets from constants and other fixed registers before it reads it, is fixed.
+bool kernel_polls_loop(const std::vector<const Instr*>& body) {
+  enum : uint8_t { Undef, Fixed, Variable };
+  uint8_t state[256] = {};
+  std::bitset<256> set_in_loop;
+  const auto touch = [](const Operand& o, const auto& f) {
+    if (o.kind == Kind::Reg && o.reg != kRZ) {
+      for (unsigned i = 0; i < std::max<unsigned>(1, o.width) && o.reg + i < 255; ++i) f(o.reg + i);
+    } else if (o.kind == Kind::Mem && o.reg != kRZ) {
+      f(o.reg);   // the base: a 64-bit address takes two
+      if (o.reg + 1 < 255) f(o.reg + 1);
+    }
+  };
+  for (const Instr* ins : body)
+    for (const Operand& d : ins->dst) touch(d, [&](unsigned r) { set_in_loop.set(r); });
+  const auto is_variable = [&](unsigned r) {
+    if (state[r] == Undef) return set_in_loop.test(r);
+    return state[r] == Variable;
+  };
+  const auto generates = [](const Instr& ins) {
+    switch (ins.op) {
+      case Op::LDG: case Op::LD: case Op::LDL: case Op::LDS: case Op::LDSM: case Op::LDGSTS: case Op::ATOM:
+      case Op::ATOMG: case Op::ATOMS: case Op::CS2R: case Op::SHFL: case Op::VOTE: case Op::MATCH: case Op::REDUX:
+      case Op::TEX: case Op::LDGMC:
+        return true;
+      case Op::S2R:   // thread and block ids are the same on every turn; the clocks are not
+        return !ins.src.empty() && ins.src[0].text.find("CLOCK") != std::string::npos;
+      default:
+        return false;
+    }
+  };
+  bool polls = false;
+  for (const Instr* ins : body) {
+    switch (ins->op) {
+      case Op::STG: case Op::ST: case Op::RED: case Op::CALL: case Op::UTMASTG: case Op::UTMAREDG:
+      case Op::UBLKRED: case Op::REDAS:
+        return false;   // the loop writes global memory, or calls something that might
+      default:
+        break;
+    }
+    bool var_src = false;
+    for (const Operand& s : ins->src) touch(s, [&](unsigned r) { var_src = var_src || is_variable(r); });
+    bool poll = false;
+    if (ins->op == Op::ATOM || ins->op == Op::ATOMG) {
+      if (ins->dst.empty() || (ins->dst.back().kind == Kind::Reg && ins->dst.back().reg == kRZ)) return false;   // no result: a store
+      poll = true;
+    } else if (ins->op == Op::LDG || ins->op == Op::LD) {
+      bool strong = false, cta = false;
+      for (const std::string& m : ins->mods) {
+        strong = strong || m == "STRONG";
+        cta = cta || m == "CTA";
+      }
+      poll = strong && !cta;
+    }
+    polls = polls || (poll && !var_src);
+    const uint8_t now = (generates(*ins) || var_src) ? Variable : Fixed;
+    for (const Operand& d : ins->dst) touch(d, [&](unsigned r) { state[r] = now; });
+  }
+  return polls;
+}
+
+bool kernel_polls(const Module& m, const CubinKernel& k) {
+  {
+    std::lock_guard<std::mutex> g(m.polling_mu);
+    if (const auto it = m.polling.find(k.name); it != m.polling.end()) return it->second;
+  }
+  std::vector<std::string> names = reachable(m, k.name);
+  names.push_back(k.name);
+  bool found = false;
+  for (const std::string& f : names) {
+    const auto it = m.code_index.find(f == k.name ? k.text_section : ".text." + f);
+    if (it == m.code_index.end()) continue;
+    const Code& code = m.code[it->second];
+    for (size_t i = 0; i < code.count && !found; ++i) {
+      const Instr& br = code.instr(i);
+      if (br.op != Op::BRA || br.src.empty()) continue;
+      const int64_t target = br.src.back().imm;
+      if (target < 0 || static_cast<uint64_t>(target) > br.pc) continue;   // a branch back
+      const size_t first = static_cast<size_t>(target) / 16;
+      if (i - first > 400) continue;
+      std::vector<const Instr*> body;
+      for (size_t j = first; j <= i; ++j) body.push_back(&code.instr(j));
+      found = kernel_polls_loop(body);
+    }
+    if (found) break;
+  }
+  std::lock_guard<std::mutex> g(m.polling_mu);
+  return m.polling.emplace(k.name, found).first->second;
+}
+
+// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds. With many lanes
+// running, as four independent chains over all 32 lanes, a lane that does not run counting as the largest address (an all-ones OR,
+// no branch on the lane's bit: those were mispredicted in a diverged warp); with few, the loop over just those lanes.
+inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) {
+  if (simd::popcount32(run) <= 5) {
+    uint64_t lo = first;
+    for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
+    return lo;
+  }
+  const auto pcv = [&](unsigned l) { return w.pc[l] | ((static_cast<uint64_t>((run >> l) & 1)) - 1); };
+  uint64_t a = ~uint64_t{0}, b = a, c = a, d = a;
+  for (unsigned l = 0; l < 32; l += 4) {
+    a = std::min(a, pcv(l));
+    b = std::min(b, pcv(l + 1));
+    c = std::min(c, pcv(l + 2));
+    d = std::min(d, pcv(l + 3));
+  }
+  return std::min(std::min(a, b), std::min(c, d));
+}
+
 class Runner {
  public:
   Runner(const Module& m, const CubinKernel& k, const exec::LaunchConfig& cfg,
          const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem, const DeviceProfile& profile)
-      : m_(m), k_(k), cfg_(cfg), mem_(mem), profile_(profile) {
+      : m_(m), k_(k), cfg_(cfg), mem_(mem), profile_(profile), max_steps_(sass_max_steps(cfg.max_steps)) {
     // A cooperative launch's grid-barrier workspace, as the PTX interpreter
     // makes it: 64 zeroed bytes, freed however the launch ends.
     if (cfg.cooperative) {
@@ -257,10 +411,11 @@ class Runner {
                                       static_cast<uint32_t>(std::min<uint64_t>(cfg.stack_bytes, 1u << 24))});
     local_size_ = (local_size_ + 15) & ~15u;
     shared_size_ = static_cast<uint64_t>(k.shared_bytes) + cfg.shared_bytes;
-    if (m.sm >= 100)
+    if (m.sm >= 100) {
       for (const CubinSymbol& sym : m.cubin.symbols)
         if (sym.name == ".nv.reservedSmem.offset0") alloc_handshake_ = static_cast<uint32_t>(sym.value);
         else if (sym.name == "__nv_reservedSMEM_tmem_allocation_pipeline_mbarrier") alloc_mbar_ = static_cast<uint32_t>(sym.value);
+    }
     // From compute capability 8.0 the driver reserves 1 KiB of shared memory
     // behind every block's own, which it rounds to its 128-byte allocation
     // unit (cooperative_groups keeps the scratch of multi-warp tiles there).
@@ -288,11 +443,14 @@ class Runner {
     // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
     // block. For checking that the fast paths compute what the general one does.
     if (const char* f = std::getenv("VGPU_FASTPATH"); f && f[0] == '0') fast_ = false;
+    vgpu::exec::tc86::refresh_exact();   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
     if (tier::requested()) {
       const char* tr = std::getenv("VGPU_SASS_TRACE");
       tier_ = fast_ && simd::enabled() && !(tr && *tr);
       const char* ts = std::getenv("VGPU_TIER_STATS");
-      tier_stats_ = tier_ && ts && ts[0] == '1';
+      tier_stats_ = tier_ && ts && (ts[0] == '1' || ts[0] == '2');
+      const char* tc = std::getenv("VGPU_TIER_CHAIN");
+      tier_chain_ = !(tc && tc[0] == '0');
     }
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
@@ -314,6 +472,16 @@ class Runner {
   MemoryManager& memory() { return mem_; }
   uint32_t tier_sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const { return sreg(blk, w, idx, lane); }
   void tier_exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mem(blk, w, ins, ex); }
+  uint32_t tier_cbank32(unsigned bank, uint64_t offset) const { return cbank32(bank, offset); }
+  void tier_exec_float(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_float(blk, w, ins, ex); }
+  // A float instruction as Runner::execute runs it: the 32-lane fast path first, then the general rule. The tier's handlers for the
+  // forms whose result rules are more than a call of a SIMD kernel use this (so that the rules stay in one place, exec_ops.inc).
+  void tier_float_op(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+    if (!fast_alu(w, ins, ex)) exec_float(blk, w, ins, ex);
+  }
+  // The `kind` argument of simd::Kernels::hmma for an f16 (0), bf16 (1) or tf32 (2) HMMA: an sm_86 cubin's sum is the RTX 3060 tensor core's
+  // (bit 4) unless VGPU_TC_EXACT=0. exec_mma (exec_ops.inc) and the tier's HMMA handler both call this, so that the choice is made in one place.
+  unsigned hmma_kernel_kind(unsigned kind) const { return kind | (m_.sm == 86 && vgpu::exec::tc86::exact_enabled() ? 16u : 0u); }
   ~Runner() {
     if (coop_ws_) {
       try {
@@ -329,10 +497,28 @@ class Runner {
 
   // ---- per-block ----
   void run_block(Block& blk);
+  bool block_round(Block& blk, int slice);
+  uint64_t fingerprint(const Block& blk) const;
   bool break_warpsync_standoff(Block& blk);
   bool break_bsync_standoff(Block& blk);
   void init_block(Block& blk, uint64_t linear);
   bool step_warp(Block& blk, Warp& w);
+  // A warp's turn: up to `limit` calls of step_warp, ending early when it cannot run or yields. With the tier, a call may do the work
+  // of several (the chain, tier_ops.inc): `budget` tells it how many calls the turn has left, `extra` how many it took over.
+  template <bool Tier>
+  void turn(Block& blk, Warp& w, int limit, bool& progress) {
+    for (int n = 0; n < limit; ++n) {
+      if (!(w.alive & ~w.exited)) break;
+      if constexpr (Tier) w.budget = static_cast<uint32_t>(limit - 1 - n);
+      if (!step_warp(blk, w)) break;
+      progress = true;
+      if constexpr (Tier) {
+        n += static_cast<int>(w.extra);
+        w.extra = 0;
+      }
+      if (w.yield) break;
+    }
+  }
   bool tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc
   bool break_spin_wait(const std::vector<Block*>& blocks);
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
@@ -421,11 +607,13 @@ class Runner {
   const exec::LaunchConfig& cfg_;
   MemoryManager& mem_;
   const DeviceProfile& profile_;
+  const uint64_t max_steps_;   // the step budget of a warp (cfg_.max_steps, or VGPU_MAX_STEPS)
   bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
   // The pre-decoded tier (src/sass/tier.hpp): VGPU_TIER=1, with the fast paths and the SIMD kernels it is held to on and
   // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
   bool tier_ = false;
   bool tier_stats_ = false;
+  bool tier_chain_ = true;   // VGPU_TIER_CHAIN=0: one run per call of step_warp, as the interpreter's (tier_ops.inc)
   std::vector<uint8_t> bank0_;
   std::map<unsigned, uint64_t> bank_va_, bank_size_;
   uint64_t entry_ = 0;
@@ -819,6 +1007,7 @@ void Runner::mem_read(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, v
 }
 
 void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, const void* in, uint32_t n) {
+  w.idle_yields = 0;   // a store is progress (an atomic that changed nothing puts the count back)
   switch (s) {
     case Space::Shared: {
       uint32_t off;
@@ -974,6 +1163,17 @@ exec::LaunchStats Runner::run() {
     if (const uint32_t sms = profile_.limits.multiprocessors)
       threads = std::min<unsigned>(threads, std::max<unsigned>(1, sms / static_cast<unsigned>(clustered_ ? csize_ : 1)));
   }
+  // Blocks that may wait on one another (vgpu/exec/lockstep.hpp): a kernel with a loop that polls
+  // global memory runs the blocks the device holds at once together, taking turns.
+  bool lockstep = false;
+  uint64_t capacity = 0;
+  if (!cfg_.cooperative && !clustered_) {
+    const exec::LockstepMode mode = exec::lockstep_mode();
+    if (mode == exec::LockstepMode::All || (mode == exec::LockstepMode::Auto && cfg_.resident_blocks && kernel_polls(m_, k_))) {
+      lockstep = true;
+      capacity = cfg_.resident_blocks ? cfg_.resident_blocks : units;
+    }
+  }
   if (cfg_.cooperative) {
     // Every block resident at once, taking turns, so one may wait on another.
     // With clusters, each cluster's blocks are built as run_cluster builds them (cluster k's
@@ -992,13 +1192,8 @@ exec::LaunchStats Runner::run() {
         for (Warp& w : blk.warps) {
           if (!(w.alive & ~w.exited)) continue;
           live = true;
-          for (int n = 0; n < 256 && (w.alive & ~w.exited); ++n)
-            if (step_warp(blk, w)) {
-              progress = true;
-              if (w.yield) break;
-            } else {
-              break;
-            }
+          if (tier_) turn<true>(blk, w, 256, progress);
+          else turn<false>(blk, w, 256, progress);
           w.yield = false;
         }
       if (live && !progress) {
@@ -1010,6 +1205,36 @@ exec::LaunchStats Runner::run() {
       }
     }
     for (Block& blk : all) stats_.add(blk.st);
+  } else if (lockstep) {
+    const exec::LockstepShape shape = exec::lockstep_shape(units, capacity, threads);
+    exec::lockstep_note(k_.name.c_str(), units, shape);
+    std::atomic<uint64_t> beat{0};
+    std::atomic<bool> failed{false};
+    const auto resident = [&](unsigned t) {
+      try {
+        exec::lockstep_worker<Block>(
+            next, beat, units, shape.window, shape.initial, shape.chunk,
+            [&](Block& b, uint64_t unit, size_t slot) {
+              init_block(b, unit);
+              // The SM number a block reads (SR_VIRTUALSMID): distinct among the blocks that are resident together.
+              b.worker = static_cast<uint32_t>((uint64_t{t} * shape.window + slot) % std::max<uint32_t>(1, profile_.limits.multiprocessors));
+            },
+            [&](Block& b) { return !block_round(b, static_cast<int>(exec::kLockstepSlice)); },
+            [](const Block& b) { return b.st.global_stores + b.st.shared_stores; },
+            [this](const Block& b) { return fingerprint(b); },
+            [&](Block& b) {
+              std::lock_guard<std::mutex> g(stats_mu_);
+              stats_.add(b.st);
+            },
+            [&] { return failed.load(std::memory_order_relaxed); });
+      } catch (...) {
+        failed.store(true, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> g(fail_mu);
+        if (!failure) failure = std::current_exception();
+      }
+    };
+    if (shape.workers <= 1) resident(0);
+    else exec::run_parallel(shape.workers, resident);
   } else if (threads <= 1) {
     worker(0);
   } else {
@@ -1143,31 +1368,50 @@ static std::string stall_summary(const Block& blk) {
 }
 
 void Runner::run_block(Block& blk) {
-  // Warps take turns: each runs until it waits, exits, or has had a turn of
-  // a few thousand instructions, so warps that spin on one another all move.
-  for (;;) {
-    bool live = false, progress = false;
-    for (Warp& w : blk.warps) {
-      if (!(w.alive & ~w.exited)) continue;
-      live = true;
-      for (int n = 0; n < 4096; ++n) {
-        if (!(w.alive & ~w.exited)) break;
-        if (!step_warp(blk, w)) break;
-        progress = true;
-        if (w.yield) break;
-      }
-      if (!w.yield) w.spin_yields = 0;
-      w.yield = false;
-    }
-    if (!live) return;
-    if (break_spin_wait({&blk})) continue;
-    if (!progress && break_warpsync_standoff(blk)) continue;
-    if (!progress && break_bsync_standoff(blk)) continue;
-    if (!progress)
-      throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of block (" + std::to_string(blk.ctaid[0]) +
-                                    ", " + std::to_string(blk.ctaid[1]) + ", " + std::to_string(blk.ctaid[2]) +
-                                    ") is waiting (a barrier some threads never reach)" + stall_summary(blk));
+  while (block_round(blk, 4096)) {
   }
+}
+
+// One round of a block's warps: each runs until it waits, exits, or has had a turn of `slice`
+// instructions, so warps that spin on one another all move. Says whether the block is still going.
+// (A block alone gets a long turn; blocks that share a host thread, which may wait on one another,
+// get a short one, see run().)
+bool Runner::block_round(Block& blk, int slice) {
+  bool live = false, progress = false;
+  for (Warp& w : blk.warps) {
+    if (!(w.alive & ~w.exited)) continue;
+    live = true;
+    if (tier_) turn<true>(blk, w, slice, progress);
+    else turn<false>(blk, w, slice, progress);
+    if (!w.yield) w.spin_yields = w.idle_yields = 0;
+    w.yield = false;
+  }
+  if (!live) return false;
+  if (break_spin_wait({&blk})) return true;
+  if (!progress && break_warpsync_standoff(blk)) return true;
+  if (!progress && break_bsync_standoff(blk)) return true;
+  if (!progress)
+    throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": every warp of block (" + std::to_string(blk.ctaid[0]) +
+                                  ", " + std::to_string(blk.ctaid[1]) + ", " + std::to_string(blk.ctaid[2]) +
+                                  ") is waiting (a barrier some threads never reach)" + stall_summary(blk));
+  return true;
+}
+
+// A hash of what a block's warps hold: registers, predicates, program counters and the block's shared
+// memory. Equal at two moments a long run of turns apart, the block has been going round a loop that
+// changes nothing (a wait), not computing (see exec/lockstep.hpp).
+uint64_t Runner::fingerprint(const Block& blk) const {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (const Warp& w : blk.warps) {
+    h = exec::lockstep_fold(h, w.r.data(), w.r.size() * sizeof(uint32_t));
+    h = exec::lockstep_fold(h, w.p, sizeof w.p);
+    h = exec::lockstep_fold(h, w.ur, sizeof w.ur);
+    h = exec::lockstep_fold(h, w.pc, sizeof w.pc);
+    const Mask m[2] = {w.waiting, w.exited};
+    h = exec::lockstep_fold(h, m, sizeof m);
+    if (!w.local.empty()) h = exec::lockstep_fold(h, w.local.data(), w.local.size());
+  }
+  return exec::lockstep_fold(h, blk.shared.data(), blk.shared.size());
 }
 
 // Cluster k's blocks, resident together and taking turns as a block's warps
@@ -1199,13 +1443,9 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
       for (Warp& w : blk.warps) {
         if (!(w.alive & ~w.exited)) continue;
         live = true;
-        for (int n = 0; n < 4096; ++n) {
-          if (!(w.alive & ~w.exited)) break;
-          if (!step_warp(blk, w)) break;
-          progress = true;
-          if (w.yield) break;
-        }
-        if (!w.yield) w.spin_yields = 0;
+        if (tier_) turn<true>(blk, w, 4096, progress);
+        else turn<false>(blk, w, 4096, progress);
+        if (!w.yield) w.spin_yields = w.idle_yields = 0;
         w.yield = false;
       }
     if (!live) break;
@@ -1239,13 +1479,16 @@ bool compute_straight(const Instr& ins);   // see annotate_instr
 // stall: letting the outer region's lanes go too runs them on past a barrier the spinners still count them
 // in, and the barriers then wait for each other.
 bool Runner::break_spin_wait(const std::vector<Block*>& blocks) {
+  constexpr uint32_t kIdleYields = 64;   // two turns of every lane group of a warp, and then some
   Warp* best = nullptr;
   unsigned bar = 0;
   uint64_t stamp = 0;
   for (Block* blk : blocks)
     for (Warp& w : blk->warps) {
       if (!(w.alive & ~w.exited)) continue;
-      if (w.runnable() && w.spin_yields < 2) return false;   // a warp still doing something other than spinning
+      // A warp still doing something other than spinning: its one lane group has not yielded twice in a row, and
+      // several groups taking turns have not yielded kIdleYields times without a write between them.
+      if (w.runnable() && w.spin_yields < 2 && w.idle_yields < kIdleYields) return false;
       for (unsigned l = 0; l < 32; ++l) {
         if (!((w.waiting >> l) & 1) || w.wait_kind[l] != Wait::BSync) continue;
         const unsigned x = static_cast<unsigned>(w.wait_arg[l]) & 15;
@@ -1266,6 +1509,8 @@ bool Runner::break_spin_wait(const std::vector<Block*>& blocks) {
     w.pc[l] += 16;
   }
   w.spin_yields = 0;
+  for (Block* blk : blocks)
+    for (Warp& o : blk->warps) o.idle_yields = 0;   // the released lanes get their turn before the stall is called again
   return true;
 }
 
@@ -1306,7 +1551,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     if (const Mask at = tier_lanes_at(w, lo); (run & ~at) == 0) {
       group = run;
     } else {   // diverged: the lowest address among the runnable lanes, and the lanes there
-      for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
+      lo = tier_lowest_pc(w, run, lo);
       group = tier_lanes_at(w, lo) & run;
     }
   } else
@@ -1340,15 +1585,20 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   }
   if (w.give_way) {
     w.give_way = false;
-    // The group that yielded is the one at the lowest address, so the group to let in is the next one up
-    // from there. Measured from the lowest-numbered lane's address instead, a lane that had won a spin
-    // lock and branched past the loop was the "current" group, nothing lay above it, and the lanes still
-    // spinning below it ran for ever.
-    uint64_t next = ~uint64_t{0};
+    // The group to let in is the next one up from the group that gave way, wrapping round to the lowest address:
+    // every group spinning here gets its turn. (Measured from the lowest address instead, a lane that had won a
+    // spin lock and branched past the loop was the "current" group, nothing lay above it, and the lanes still
+    // spinning below it ran for ever. Measured from the lowest address in every case, as this first did, a
+    // group that was let in and yielded in turn was followed by itself again: with two groups spinning, a
+    // third that held the lock they wait for never ran.)
+    uint64_t next = ~uint64_t{0}, lowest = ~uint64_t{0};
     for (Mask m = run; m; m &= m - 1) {
       const uint64_t p = w.pc[std::countr_zero(m)];
-      if (p > lo) next = std::min(next, p);
+      if (p == w.yield_pc) continue;   // the group that gave way
+      lowest = std::min(lowest, p);
+      if (p > w.yield_pc) next = std::min(next, p);
     }
+    if (next == ~uint64_t{0}) next = lowest;
     if (next == ~uint64_t{0}) {
       // Nothing else can run. A group that yields over and over like this is spinning on something only
       // the lanes parked at a BSYNC can supply (a lane that won a spin lock stands at the BSYNC closing
@@ -1376,17 +1626,18 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   // reads its own pc (LEPC) end the run and take the general path.
   uint64_t pc = pick;
   const Code* code = nullptr;
+  // The section the warp ran in last is most often the one it is in, so Module::code_at is asked only when it moves
+  // to another (a call into a device function, a return). A pc in no section is fetch's fault, as before.
+  if (w.code_hint && pc - w.code_hint->base < 16 * w.code_hint->count) {
+    code = w.code_hint;
+  } else {
+    fetch(pc, &code);
+    w.code_hint = code;
+  }
   if (tier_ && !w.mactive_force) {
-    // The section the warp ran in last is most often the one it is in (Module::code_at searches them all).
-    if (w.code_hint && pc - w.code_hint->base < 16 * w.code_hint->count) {
-      code = w.code_hint;
-    } else {
-      fetch(pc, &code);
-      w.code_hint = code;
-    }
     if (const tier::Program* tp = code->tier_program()) return tier_run(blk, w, group, pick, *code, *tp);
   }
-  const Instr* ins = &fetch(pc, &code);
+  const Instr* ins = &code->instr((pc - code->base) / 16);
   const uint64_t end = code->base + 16 * code->count;
   for (unsigned n = 0;; ++n) {
     // A warp's first store to global memory ends its turn, once, so that the block's other warps issue the loads
@@ -1405,8 +1656,8 @@ bool Runner::step_warp(Block& blk, Warp& w) {
         return true;
       }
     }
-    if (++w.steps > cfg_.max_steps)
-      throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(cfg_.max_steps) +
+    if (++w.steps > max_steps_)
+      throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(max_steps_) +
                                     " instructions (an infinite loop?)");
     if (n < 256 && pc + 16 < end && ins->straight) {
       execute(blk, w, *ins, group, /*advance=*/false);
@@ -1479,6 +1730,13 @@ const tier::Program* Code::tier_program() const {
       tier::MOp& op = prog->ops[i];
       tier::analyze(instr(i), sm, *prog, op);
       op.fn = tier_handler_for(op.form);
+      // VGPU_TIER_OFF=form,form,... (names as VGPU_TIER_STATS shows them in tier::form_name: iadd3, bsync, ...) leaves those forms to the
+      // interpreter, for finding which form a difference comes from.
+      static const std::string off = [] { const char* v = std::getenv("VGPU_TIER_OFF"); return v && *v ? std::string(",") + v + "," : std::string(); }();
+      if (!off.empty() && off.find(std::string(",") + tier::form_name(op.form) + ",") != std::string::npos) {
+        op.form = tier::Form::None;
+        op.fn = nullptr;
+      }
       if (op.fn) {
         ++prog->native;
         prog->max_reg = std::max(prog->max_reg, op.maxreg);
@@ -1523,6 +1781,7 @@ void ChildRunner::operator()(Child& c, Launches& out) {
   cc.cluster = k.cluster;   // __cluster_dims__, as a host launch applies it
   cc.cooperative = false;
   cc.coop_workspace = 0;
+  cc.resident_blocks = 0;   // the parent's figure is for the parent's kernel
   Runner r(m, k, cc, args, mem, profile);
   r.set_launches(&out);
   add_stats(r.run());

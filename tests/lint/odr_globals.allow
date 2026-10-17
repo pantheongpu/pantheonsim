@@ -1,0 +1,5 @@
+# Data symbols that libcuda and libcudart may both define with external linkage
+# (tests/lint/check_odr_globals.py). One regular expression per line, the reason
+# after a #. An entry here is a decision that AddressSanitizer's ODR check will
+# not abort a test that loads both libraries: prefer internal linkage, `inline`,
+# or hidden visibility to adding one. Empty today.

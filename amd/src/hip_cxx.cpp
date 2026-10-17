@@ -6,11 +6,13 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "vgpu_hip.h"
+
 struct ihipModuleSymbol_t;
 struct ihipStream_t;
 struct ihipEvent_t;
 
-using Error = int;   // hipError_t
+using Error = hipError_t;   // the type hip_api.cpp defines them with (a mismatch is an ODR violation under LTO)
 Error vgpu_ext_launch(ihipModuleSymbol_t*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, size_t,
                  ihipStream_t*, void**, void**, ihipEvent_t*, ihipEvent_t*, uint32_t) __asm__("hipExtModuleLaunchKernel");
 Error vgpu_hcc_launch(ihipModuleSymbol_t*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, size_t,

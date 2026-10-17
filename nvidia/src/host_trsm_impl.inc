@@ -80,9 +80,7 @@ struct ReflOps {
   static constexpr int W = WV * L;
 
   static void apply(const double* vcol, int64_t m, int64_t j, double t, double* xt) {
-    V d[WV];
-    for (int v = 0; v < WV; ++v)
-      for (int l = 0; l < L; ++l) d[v][l] = 0.0;
+    V d[WV] = {};   // zero
     for (int64_t i = j; i < m; ++i) {
       const double vi = i == j ? 1.0 : vcol[i];
       V vv;

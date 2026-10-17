@@ -189,7 +189,7 @@ void filt_taps(const Geom& g, const double* dyk, const double* xc, const double*
   const int64_t I0 = g.in[0], I1 = g.in[1], I2 = g.in[2];
   const int64_t O0 = g.out[0], O1 = g.out[1], O2 = g.out[2];
   const int64_t F0 = g.flt[0], F1 = g.flt[1], F2 = g.flt[2];
-  const int64_t isz = I0 * I1 * I2, osz = O0 * O1 * O2, fsz = F0 * F1 * F2;
+  const int64_t isz = I0 * I1 * I2, osz = O0 * O1 * O2;
   // Tap position t2 = lane; the output o2 reaches input o2*str + t2 - pad. The outputs that reach every lane's input are
   // [vlo, vhi); outside that a lane takes a step only if its own input is in range.
   int64_t vlo = 0, vhi = O2;

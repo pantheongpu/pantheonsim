@@ -74,13 +74,13 @@ void run(const amd::CodeObject& o, const char* name, MemoryManager& mem, const s
 
 const int kN = 64;
 
-uint64_t bits(float f) {
+[[maybe_unused]] uint64_t bits(float f) {
   uint32_t u = 0;
   std::memcpy(&u, &f, 4);
   return u;
 }
 
-uint16_t half_bits(float f) {
+[[maybe_unused]] uint16_t half_bits(float f) {
   const _Float16 h = static_cast<_Float16>(f);
   uint16_t u = 0;
   std::memcpy(&u, &h, 2);

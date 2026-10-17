@@ -2197,7 +2197,7 @@ namespace {
 // and -- where it allocates or frees -- that no other executable graph of it
 // is there, since both would map or unmap memory at the same addresses (ROCm's
 // HIP refuses a second one for a free node too).
-hipError_t instantiate(State& s, void** out, void* graph, unsigned long long flags) {
+hipError_t instantiate(State& /*s*/, void** out, void* graph, unsigned long long flags) {
   GraphObj* g = find_graph(graph);
   if (!out || !g) return hipErrorInvalidValue;
   if (!acyclic(*g)) return fail(hipErrorInvalidValue, "the graph's edges go round in a cycle");
