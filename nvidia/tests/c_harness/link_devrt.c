@@ -18,7 +18,8 @@
 
 #include "vgpu_cuda.h"
 
-/* The JIT-link entry points are not in vgpu_cuda.h. */
+/* These entry points are not in vgpu_cuda.h. */
+CUresult cuMemsetD32(CUdeviceptr dst, unsigned int value, size_t count);
 typedef struct CUlinkState_st* CUlinkState;
 CUresult cuLinkCreate(unsigned int numOptions, int* options, void** optionValues, CUlinkState* stateOut);
 CUresult cuLinkAddData(CUlinkState state, int type, void* data, size_t size, const char* name,
@@ -146,7 +147,7 @@ static const char* kModule =
 
 /* One `ar` member header: name(16) mtime(12) uid(6) gid(6) mode(8) size(10) "`\n". */
 static size_t put_header(char* out, const char* name, size_t body) {
-  snprintf(out, 61, "%-16s%-12s%-6s%-6s%-8s%-10zu`\n", name, "0", "0", "0", "100644", body);
+  snprintf(out, 61, "%-16.16s%-12s%-6s%-6s%-8s%-10u`\n", name, "0", "0", "0", "100644", (unsigned)body);
   return 60;
 }
 
