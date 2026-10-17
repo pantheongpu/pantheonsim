@@ -1152,10 +1152,6 @@ struct RoundingScope {
     }
   }
 }
-// binary64 to binary32 in the host's current rounding mode, 32 lanes.
-[[gnu::noinline]] void f64_to_f32_loop(const double* x, uint32_t* lo) {
-  for (unsigned l = 0; l < 32; ++l) lo[l] = f32_bits(static_cast<float>(x[l]));
-}
 
 }  // namespace
 
