@@ -429,14 +429,17 @@ VTEST(gfx90a_sine_cube_map_frexp_ldexp_fused_half_and_saturating_pack_instructio
     const int ints[11] = {-20, -7, -3, -1, 0, 1, 2, 5, 9, 13, 20};
     const uint16_t sat_hi[7] = {0xff9c, 0x0000, 0x0064, 0x00ff, 0x012c, 0x7fff, 0x8000};   // -100, 0, 100, 255, 300, 32767, -32768
     uint32_t seed = 777;
-    const auto rnd = [&](uint32_t n) { return (seed = seed * 1664525u + 1013904223u) >> 8, (seed >> 8) % n; };
+    const auto rnd = [&](uint32_t n) {
+      seed = seed * 1664525u + 1013904223u;
+      return (seed >> 8) % n;
+    };
     std::vector<uint32_t> in(64 * 8);
     for (uint32_t l = 0; l < 64; ++l) {
       uint32_t* k = &in[l * 8];
       k[0] = l % 10 < 6 ? ex[l % 10][0] : more[l % 10 - 6];
       for (int i = 1; i <= 3; ++i) k[i] = f32_bits(coords[rnd(9)]);
       for (int i = 4; i <= 6; ++i) k[i] = half_bits(ints[rnd(11)]) | uint32_t{half_bits(ints[rnd(11)])} << 16;
-      k[7] = static_cast<uint32_t>(rnd(7)) - 3 & 0xFFFF | uint32_t{sat_hi[rnd(7)]} << 16;
+      k[7] = ((static_cast<uint32_t>(rnd(7)) - 3) & 0xFFFF) | (uint32_t{sat_hi[rnd(7)]} << 16);
     }
     const uint64_t i0 = put(mem, in), out = mem.alloc(64 * 16 * 4);
     launch(o, "valu_gaps", mem, {i0, out});
