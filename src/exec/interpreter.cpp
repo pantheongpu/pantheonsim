@@ -2551,6 +2551,30 @@ bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
       set_in_loop[d] = true;
     }
   }
+  // The registers any instruction of the function reads, found once and only if the loop has an atom: nvcc writes
+  // `atom` even for an atomicAdd whose result the program ignores (ptxas turns it into a RED), and that is a
+  // reduction, which writes memory, not a poll. A result nothing ever reads is not an old value anyone waits on.
+  std::vector<bool> read_anywhere;
+  bool have_reads = false;
+  const auto result_unused = [&](const std::vector<uint32_t>& result) {
+    if (!have_reads) {
+      have_reads = true;
+      std::vector<uint32_t> d, u;
+      for (const Instr& x : f.body) {
+        d.clear();
+        u.clear();
+        instr_registers(x, d, u);
+        for (uint32_t k : u) {
+          if (k >= kMaxKey) continue;
+          if (k >= read_anywhere.size()) read_anywhere.resize(k + 1, false);
+          read_anywhere[k] = true;
+        }
+      }
+    }
+    for (uint32_t k : result)
+      if (k < kMaxKey && k < read_anywhere.size() && read_anywhere[k]) return false;
+    return true;
+  };
   bool polls = false;
   for (size_t i = first; i <= last; ++i) {
     const Instr& ins = f.body[i];
@@ -2570,7 +2594,7 @@ bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
     } else if (const auto* at = std::get_if<OpAtom>(&ins.op)) {
       generates = true;
       if (at->space == Space::Global || at->space == Space::Generic) {
-        if (at->discards_result) return false;   // red: a store
+        if (at->discards_result || result_unused(defs)) return false;   // red: a store
         poll = at->vec <= 1;
       }
     } else if (const auto* st = std::get_if<OpSt>(&ins.op)) {
