@@ -8308,7 +8308,7 @@ class Interpreter {
       uint32_t min_lane = lane & segmask;
       uint32_t max_lane = (lane & segmask) | (cval & ~segmask);
       uint32_t j = lane;
-      bool pred;
+      bool pred = false;
       switch (op.mode) {
         case ShflMode::Up:
           // The ISA's pval = (j >= maxLane): for .up, c's clamp field is the
@@ -14445,7 +14445,7 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
   if (lane128 && (op.ws || (G == 2 && M == 128)))
     refuse("the 128-lane scale-factor A layout with a CTA pair at M = 128: each CTA's rows then sit in D lanes the "
            "figures do not tie to a scale lane");
-  if (k64 && !((G == 1 && M == 128) || (G == 2 && M == 256)) || (k64 && op.ws))
+  if ((k64 && !((G == 1 && M == 128) || (G == 2 && M == 256))) || (k64 && op.ws))
     h.fail(Err::InvalidValue, "tcgen05.mma with K = 64 is 128xNxK1 on one CTA or 256xNxK1 on a pair (Table 48), and not .ws");
   if (op.a_tmem && trans_a) bad();
   // Below M = 128 the ISA draws only D's .ws layouts (E and G), not where A

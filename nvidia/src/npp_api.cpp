@@ -211,7 +211,7 @@ VGPU_EXPORT void nppiFree(void* p) { cudaFree(p); }
 #define VGPU_NPPS_MALLOC(SUFFIX, TYPE)                                      \
   VGPU_EXPORT TYPE* nppsMalloc_##SUFFIX(NppSignalLen n) {                   \
     if constexpr (std::is_signed_v<NppSignalLen>)                           \
-      if (n < 0) return nullptr;                                            \
+      if (static_cast<std::make_signed_t<NppSignalLen>>(n) < 0) return nullptr; \
     void* p = nullptr;                                                      \
     /* widen before multiplying: on the toolkits where the length is int,   \
        a large count times sizeof(TYPE) overflows the int otherwise */      \
@@ -680,7 +680,7 @@ VGPU_NPP_CTX(NppStatus, nppiCompare_8u_C1R,
    buffer it sizes for the caller. Nothing here needs scratch, but the size has
    to be non-zero or a caller's cudaMalloc of it fails. */
 
-VGPU_EXPORT NppStatus nppiSumGetBufferHostSize_8u_C1R(NppiSize roi, NppBufferSize* bytes) {
+VGPU_EXPORT NppStatus nppiSumGetBufferHostSize_8u_C1R(NppiSize /*roi*/, NppBufferSize* bytes) {
   if (!bytes) return NPP_NULL_POINTER_ERROR;
   *bytes = 4096;
   return NPP_SUCCESS;
@@ -1037,7 +1037,7 @@ template <class T> void store_signal(T* d, const std::vector<T>& h) {
     auto a = fetch_signal(s1, n);                                                        \
     auto b = fetch_signal(s2, n);                                                        \
     std::vector<Npp32f> o(n);                                                            \
-    for (size_t i = 0; i < n; ++i) {                                                     \
+    for (size_t i = 0; i < static_cast<size_t>(n); ++i) {                                \
       const double x = a[i], y = b[i];                                                   \
       o[i] = static_cast<Npp32f>(EXPR);                                                  \
     }                                                                                    \
@@ -1058,7 +1058,7 @@ VGPU_NPPS_BIN(Div, x == 0.0 ? 0.0 : y / x)
     if (!s || !d) return NPP_NULL_POINTER_ERROR;                                         \
     auto a = fetch_signal(s, n);                                                         \
     std::vector<Npp32f> o(n);                                                            \
-    for (size_t i = 0; i < n; ++i) {                                                     \
+    for (size_t i = 0; i < static_cast<size_t>(n); ++i) {                                \
       const double x = a[i], k = v;                                                      \
       o[i] = static_cast<Npp32f>(EXPR);                                                  \
     }                                                                                    \
@@ -1078,7 +1078,7 @@ VGPU_NPPS_CONST(DivC, k == 0.0 ? 0.0 : x / k)
     if (!s || !d) return NPP_NULL_POINTER_ERROR;                                         \
     auto a = fetch_signal(s, n);                                                         \
     std::vector<Npp32f> o(n);                                                            \
-    for (size_t i = 0; i < n; ++i) {                                                     \
+    for (size_t i = 0; i < static_cast<size_t>(n); ++i) {                                \
       const double x = a[i];                                                             \
       o[i] = static_cast<Npp32f>(EXPR);                                                  \
     }                                                                                    \
@@ -1111,7 +1111,7 @@ VGPU_NPP_CTX(NppStatus, nppsCopy_32f, (const Npp32f* s, Npp32f* d, NppSignalLen 
              (s, d, n))
 
 #define VGPU_NPPS_BUFSIZE(NAME)                                                          \
-  VGPU_EXPORT NppStatus npps##NAME##GetBufferSize_32f(NppSignalLen n,             \
+  VGPU_EXPORT NppStatus npps##NAME##GetBufferSize_32f(NppSignalLen /*n*/,             \
                                                       NppSignalBufferSize* bytes) {         \
     if (!bytes) return NPP_NULL_POINTER_ERROR;                                           \
     *bytes = 4096;                                                                       \

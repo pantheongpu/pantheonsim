@@ -3201,7 +3201,7 @@ VGPU_EXPORT cudnnStatus_t cudnnDeriveNormTensorDescriptor(cudnnTensorDescriptor_
                                                           cudnnTensorDescriptor_t mean_var,
                                                           const cudnnTensorDescriptor_t xd, cudnnNormMode_t mode,
                                                           int groups) {
-  cudnnBatchNormMode_t bn;
+  cudnnBatchNormMode_t bn = CUDNN_BATCHNORM_PER_ACTIVATION;
   cudnnStatus_t s = norm_mode("cudnnDeriveNormTensorDescriptor", mode, groups, &bn);
   if (s != CUDNN_STATUS_SUCCESS) return s;
   if ((s = cudnnDeriveBNTensorDescriptor(scale_bias, xd, bn)) != CUDNN_STATUS_SUCCESS) return s;

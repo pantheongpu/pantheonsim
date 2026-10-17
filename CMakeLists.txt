@@ -9,6 +9,13 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 add_compile_options(-Wall -Wextra)
+# CI builds with every warning an error (the build is warning-free under GCC 13: a new warning is a
+# failed build, not a line nobody reads in a log). Off by default: a compiler the sources were not
+# checked with may warn about code that is fine.
+option(VGPU_WERROR "Treat compiler warnings as errors" OFF)
+if(VGPU_WERROR)
+  add_compile_options(-Werror)
+endif()
 
 # The interpreter is the hot path and benefits measurably from cross-TU
 # inlining. Enabled only for Release builds, and only if the toolchain
@@ -763,7 +770,9 @@ if(CUDA_ABI_INCLUDE)
     message(STATUS "NCCL headers at ${NCCL_INCLUDE}: building libvgpunccl")
     add_library(vgpunccl SHARED nvidia/src/nccl_api.cpp)
     target_link_libraries(vgpunccl PRIVATE vgpu vgpucudart)
-    target_include_directories(vgpunccl PRIVATE ${NCCL_INCLUDE} ${CUDA_ABI_INCLUDE})
+    # NCCL's headers are NVIDIA's and unmodified: SYSTEM, so their warnings are not ours.
+    target_include_directories(vgpunccl SYSTEM PRIVATE ${NCCL_INCLUDE})
+    target_include_directories(vgpunccl PRIVATE ${CUDA_ABI_INCLUDE})
     set_target_properties(vgpunccl PROPERTIES OUTPUT_NAME nccl SOVERSION 2 VERSION 2.0)
     add_custom_command(TARGET vgpunccl POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shim"
@@ -1932,7 +1941,8 @@ if(TARGET vgpunccl)
   # unsupported when called.
   add_executable(test_nccl_symbols nvidia/tests/unit/test_nccl_symbols.cpp)
   target_link_libraries(test_nccl_symbols PRIVATE vgpunccl)
-  target_include_directories(test_nccl_symbols PRIVATE tests/framework ${NCCL_INCLUDE} ${CUDA_ABI_INCLUDE})
+  target_include_directories(test_nccl_symbols SYSTEM PRIVATE ${NCCL_INCLUDE})
+  target_include_directories(test_nccl_symbols PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_nccl_symbols COMMAND test_nccl_symbols)
   set_tests_properties(test_nccl_symbols PROPERTIES ENVIRONMENT "VGPU_QUIET=1")
   # Two ranks across two processes, the shape the RTX 3060 reference run has.
@@ -3207,6 +3217,11 @@ set_tests_properties(lint_ci_jobs PROPERTIES TIMEOUT 120)
 # ci/cancel-conflicting-prs.sh after main moves) against a fake gh and curl.
 add_test(NAME lint_pr_guard COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_pr_guard.sh)
 set_tests_properties(lint_pr_guard PROPERTIES TIMEOUT 120)
+
+# The "workloads failing on main" issue (ci/track-workloads-issue.sh) against a fake
+# gh: a failure opens or updates it, a pass closes it, a cancelled run touches nothing.
+add_test(NAME lint_workloads_issue COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_workloads_issue.sh)
+set_tests_properties(lint_workloads_issue PROPERTIES TIMEOUT 120)
 
 # Copies and fills with a shape in graphs, and the async copies a capture has to
 # record rather than run; two simulated devices, for the peer copy.

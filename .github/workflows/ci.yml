@@ -71,7 +71,8 @@ jobs:
           cmake --version | head -1
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        # -Werror: the build has no warnings (issue #284), and this keeps it that way.
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVGPU_WERROR=ON
 
       - name: Build
         run: cmake --build build -j"$(ci/jobs.sh -p release)"

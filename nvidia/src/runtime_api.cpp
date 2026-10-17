@@ -135,7 +135,7 @@ struct KernelInfo {
   bool load_told = false;             // a profiler has been told what loading this kernel cost
   // What the program has set with cudaFuncSetAttribute, per device (func_attrs.hpp): a second device starts
   // from the defaults, as on the card.
-  std::map<int, vgpu_funcattr::State> attrs;
+  std::map<int, vgpu_funcattr::State> attrs{};
   // The function this kernel resolved to on each of the first few devices, and what it was resolved
   // against (resolved_function below). Finding it is a search of the module's entries by name.
   struct Resolved {
@@ -143,7 +143,7 @@ struct KernelInfo {
     uint64_t unload_epoch = 0;
     const vgpu::ptx::EntryFn* fn = nullptr;
   };
-  Resolved resolved[4];
+  Resolved resolved[4]{};
 };
 
 // A __device__ or __constant__ variable. The host handle nvcc passes to
@@ -1742,7 +1742,7 @@ VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernel(const void* func, dim3 gridD
 // name with different types a conflict, which is exactly the check that caught
 // this.
 #if CUDART_VERSION < 13000
-static cudaError_t cudaLaunchCooperativeKernelMultiDevice_traced(struct cudaLaunchParams* p0, unsigned int p1, unsigned int p2) {
+static cudaError_t cudaLaunchCooperativeKernelMultiDevice_traced(struct cudaLaunchParams* /*p0*/, unsigned int /*p1*/, unsigned int /*p2*/) {
   return cudaErrorNotSupported;
 }
 
@@ -1785,7 +1785,7 @@ VGPU_EXPORT cudaError_t cudaSetDevice(int device) {
 }
 
 static cudaError_t cudaGetDevice_body(int* device) {
-  return guard_query("cudaGetDevice", [&](State& s) {
+  return guard_query("cudaGetDevice", [&](State&) {
     if (!device) return cudaErrorInvalidValue;
     *device = t_current_device;
     return cudaSuccess;
@@ -1860,7 +1860,7 @@ VGPU_EXPORT cudaError_t cudaInitDevice(int device, unsigned int deviceFlags, uns
   return traced_call("cudaInitDevice", cudaInitDevice_traced, device, deviceFlags, flags);
 }
 
-static cudaError_t cudaSetDeviceFlags_traced(unsigned int p0) { return cudaSuccess; }
+static cudaError_t cudaSetDeviceFlags_traced(unsigned int /*p0*/) { return cudaSuccess; }
 
 VGPU_EXPORT cudaError_t cudaSetDeviceFlags(unsigned int p0) {
   return traced_call("cudaSetDeviceFlags", cudaSetDeviceFlags_traced, p0);
@@ -2340,7 +2340,7 @@ static cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor_traced(int* num
 VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks, const void* func, int blockSize, size_t dynamicSMemSize) {
   return traced_call("cudaOccupancyMaxActiveBlocksPerMultiprocessor", cudaOccupancyMaxActiveBlocksPerMultiprocessor_traced, numBlocks, func, blockSize, dynamicSMemSize);
 }
-static cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_traced(int* n, const void* f, int bs, size_t dyn, unsigned int p4) {
+static cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_traced(int* n, const void* f, int bs, size_t dyn, unsigned int /*p4*/) {
   return cudaOccupancyMaxActiveBlocksPerMultiprocessor(n, f, bs, dyn);
 }
 
@@ -4451,7 +4451,7 @@ VGPU_EXPORT cudaError_t cudaDeviceGetByPCIBusId(int* device, const char* pciBusI
 
 // Callbacks run immediately: the stream they are attached to has no work left
 // outstanding by the time this is reached.
-static cudaError_t cudaStreamAddCallback_traced(cudaStream_t stream, cudaStreamCallback_t cb, void* user, unsigned int p3) {
+static cudaError_t cudaStreamAddCallback_traced(cudaStream_t stream, cudaStreamCallback_t cb, void* user, unsigned int /*p3*/) {
   if (const cudaError_t dead = dead_context()) return dead;
   // Not supported under stream capture, as documented -- cudaLaunchHostFunc is
   // the one that is -- so a capturing stream refuses it and the capture fails.
@@ -5916,7 +5916,7 @@ VGPU_EXPORT cudaError_t cudaMemAdvise(const void* p, size_t n, cudaMemoryAdvise 
   return traced_call("cudaMemAdvise", cudaMemAdvise_traced, p, n, kind, loc);
 }
 #else
-static cudaError_t cudaMemPrefetchAsync_traced(const void* p, size_t n, int device, cudaStream_t p3) {
+static cudaError_t cudaMemPrefetchAsync_traced(const void* p, size_t n, int device, cudaStream_t /*p3*/) {
   return guard("cudaMemPrefetchAsync", [&](State& s) { return prefetch(s, p, n, device); });
 }
 
@@ -7058,7 +7058,7 @@ std::unordered_map<uint64_t, CondHandle> g_cond_handles;
 // Handles are numbers to a kernel. An RTX 3060 numbers them from 1 in each
 // graph and tells graphs apart by the launch; here they are unique in the
 // process, so the number alone says whose it is. Zero is never one.
-uint64_t g_next_cond_handle = 1;
+[[maybe_unused]] uint64_t g_next_cond_handle = 1;   // used from CUDA 12.3 (cudaGraphConditionalHandleCreate)
 
 // `g` and every graph inside it: child graphs and conditional bodies.
 void graph_tree(const GraphRec& g, std::set<const GraphRec*>* out) {
@@ -10087,7 +10087,7 @@ VGPU_EXPORT cudaError_t cudaGraphExecEventWaitNodeSetEvent(cudaGraphExec_t exec,
 // A graph instantiated for device launch is the exception: what a kernel's
 // cudaGraphLaunch runs is the graph as it was last uploaded, so this keeps a
 // copy of it (see g_device_graphs).
-static cudaError_t cudaGraphUpload_traced(cudaGraphExec_t exec, cudaStream_t p1) {
+static cudaError_t cudaGraphUpload_traced(cudaGraphExec_t exec, cudaStream_t /*p1*/) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   const auto it = g_graph_execs.find(static_cast<void*>(exec));
   if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
@@ -11034,7 +11034,7 @@ extern "C" __attribute__((visibility("default"))) int vgpu_graph_node_ids_v1(voi
 
 // The graph as a DOT drawing: one node per node, one edge per dependency. It
 // used to print an empty graph, which is a picture of nothing.
-static cudaError_t cudaGraphDebugDotPrint_traced(cudaGraph_t graph, const char* path, unsigned int p2) {
+static cudaError_t cudaGraphDebugDotPrint_traced(cudaGraph_t graph, const char* path, unsigned int /*p2*/) {
   if (!path) return cudaErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_graph_mu);
   GraphRec* g = graph_from(graph);

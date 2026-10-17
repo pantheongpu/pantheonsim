@@ -241,10 +241,10 @@ struct Stream {
   unsigned long long id = next_stream_id();
   // hipStreamSetAttribute's values, by attribute, kept as set: none changes
   // how the stream runs here. The synchronization policy starts at Auto.
-  std::map<int, vgpu::amd::abi::LaunchAttributeValue> attrs;
+  std::map<int, vgpu::amd::abi::LaunchAttributeValue> attrs{};
   // How far into each other queue this stream has waited (hipStreamWaitEvent):
   // memory freed there before that point is the stream's to reuse.
-  std::map<const Queue*, uint64_t> waited;
+  std::map<const Queue*, uint64_t> waited{};
 
   static unsigned long long next_stream_id() {
     static std::atomic<unsigned long long> next{1};
@@ -4384,7 +4384,7 @@ hipError_t hipHccModuleLaunchKernel(hipFunction_t f, uint32_t gx, uint32_t gy, u
 namespace {
 
 // A call this does not implement, and why, said once.
-hipError_t refused(const char* name, const char* why) {
+[[maybe_unused]] hipError_t refused(const char* name, const char* why) {
   return record(state(), fail(hipErrorNotSupported, std::string(name) + " is not supported: " + why));
 }
 

@@ -76,14 +76,14 @@ struct FuncRec {
   const vgpu::exec::SymbolTable* syms = nullptr;
   uint64_t module_id = 0;             // the runtime's module on `device`, for what the module says of the kernel
   uintptr_t kernel = 0;               // the CUkernel this function was made from; the two share their attributes
-  vgpu_funcattr::State attrs;         // what cuFuncSetAttribute set, when no CUkernel owns the state
+  vgpu_funcattr::State attrs{};        // what cuFuncSetAttribute set, when no CUkernel owns the state
   // The launch the pre-CUDA 4 API builds up on the function itself
   // (cuFuncSetBlockShape, cuFuncSetSharedSize, cuParamSet*) and cuLaunchGrid
   // runs: a block of one thread, no shared memory and no parameters until
   // told otherwise, as on the card.
   unsigned block[3] = {1, 1, 1};
   unsigned shared_bytes = 0;
-  std::vector<uint8_t> params;   // the parameter buffer, as written
+  std::vector<uint8_t> params{};   // the parameter buffer, as written
   size_t param_size = 0;         // cuParamSetSize
 };
 
@@ -99,7 +99,7 @@ struct LibRec {
 struct KernelRec {
   uintptr_t library = 0;
   std::string name;
-  std::map<int, vgpu_funcattr::State> attrs;   // what cuKernelSetAttribute / cuFuncSetAttribute set, per device
+  std::map<int, vgpu_funcattr::State> attrs{};   // what cuKernelSetAttribute / cuFuncSetAttribute set, per device
 };
 
 struct EventRec {
@@ -1269,7 +1269,7 @@ VGPU_EXPORT CUresult cuCtxSetCurrent(CUcontext ctx) {
 }
 
 static CUresult cuCtxGetCurrent_impl(CUcontext* pctx) {
-  return api("cuCtxGetCurrent", true, false, [&](ShimState& s) {
+  return api("cuCtxGetCurrent", true, false, [&](ShimState&) {
     if (!pctx) return CUDA_ERROR_INVALID_VALUE;
     *pctx = ctx_stack().empty() ? nullptr : reinterpret_cast<CUcontext>(ctx_stack().back());
     return CUDA_SUCCESS;

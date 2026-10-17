@@ -886,7 +886,7 @@ Placement place(const Plan& p, int fmt) {
   }
   // Slabs: natural order splits axis 0, shuffled order axis 1.
   const std::vector<int> u = unit_shape(p);
-  const size_t inner = logical_elems(std::vector<int>(u.begin() + 2, u.end()));
+  const size_t inner = logical_elems(std::vector<int>(u.begin() + std::min<size_t>(2, u.size()), u.end()));
   for (int g = 0; g < G; ++g) {
     long long s0, c;
     if (fmt == CUFFT_XT_FORMAT_INPLACE_SHUFFLED) {
