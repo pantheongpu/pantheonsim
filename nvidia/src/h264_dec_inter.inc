@@ -8,8 +8,9 @@ void Dec::set_motion(int x4, int y4, int w4, int h4, int list, int ref, int mvx,
       mb_->mv[list][y * 4 + x][0] = static_cast<int16_t>(ref >= 0 ? mvx : 0);
       mb_->mv[list][y * 4 + x][1] = static_cast<int16_t>(ref >= 0 ? mvy : 0);
     }
-  for (int y = y4 >> 1; y <= (y4 + h4 - 1) >> 1; ++y)
-    for (int x = x4 >> 1; x <= (x4 + w4 - 1) >> 1; ++x) mb_->ref_idx[list][y * 2 + x] = static_cast<int8_t>(ref);
+  // The reference index is kept per 8x8 block, two by two; a motion block never reaches past the macroblock's.
+  for (int y = y4 >> 1; y <= std::min((y4 + h4 - 1) >> 1, 1); ++y)
+    for (int x = x4 >> 1; x <= std::min((x4 + w4 - 1) >> 1, 1); ++x) mb_->ref_idx[list][y * 2 + x] = static_cast<int8_t>(ref);
 }
 
 void Dec::set_mvd(int list, int x4, int y4, int w4, int h4, int dx, int dy) {
@@ -284,9 +285,11 @@ void Dec::direct_spatial(uint8_t mask) {
   blk_done_ = saved_done;
   const RefPic r1v = ref_val(1, 0);
   const bool l1_short = r1v.frame && !r1v.long_term;
+  // The flag is read once, here: read again below, the compiler cannot rule out an x4 of 3 beside a w of 2.
+  const bool d8 = pp_.direct_8x8_inference;
   for (int b8 = 0; b8 < 4; ++b8) {
     if (!(mask & (1 << b8))) continue;
-    const int nsub = pp_.direct_8x8_inference ? 1 : 4;
+    const int nsub = d8 ? 1 : 4;
     for (int s = 0; s < nsub; ++s) {
       bool col_zero = false;
       if (l1_short && !zero_pred && (ref[0] == 0 || ref[1] == 0)) {
@@ -295,8 +298,8 @@ void Dec::direct_spatial(uint8_t mask) {
         colocated(b8, s, &rc, mc, &cid, &cf, &vs);
         col_zero = rc == 0 && mc[0] >= -1 && mc[0] <= 1 && mc[1] >= -1 && mc[1] <= 1;
       }
-      const int x4 = (b8 & 1) * 2 + (pp_.direct_8x8_inference ? 0 : (s & 1)), y4 = (b8 >> 1) * 2 + (pp_.direct_8x8_inference ? 0 : (s >> 1));
-      const int w = pp_.direct_8x8_inference ? 2 : 1;
+      const int x4 = (b8 & 1) * 2 + (d8 ? 0 : (s & 1)), y4 = (b8 >> 1) * 2 + (d8 ? 0 : (s >> 1));
+      const int w = d8 ? 2 : 1;
       for (int l = 0; l < 2; ++l) {
         int mx = 0, my = 0;
         if (!zero_pred && ref[l] >= 0 && !(ref[l] == 0 && col_zero)) {
@@ -310,9 +313,11 @@ void Dec::direct_spatial(uint8_t mask) {
 }
 
 void Dec::direct_temporal(uint8_t mask) {
+  // The flag is read once, here: read again below, the compiler cannot rule out an x4 of 3 beside a w of 2.
+  const bool d8 = pp_.direct_8x8_inference;
   for (int b8 = 0; b8 < 4; ++b8) {
     if (!(mask & (1 << b8))) continue;
-    const int nsub = pp_.direct_8x8_inference ? 1 : 4;
+    const int nsub = d8 ? 1 : 4;
     for (int s = 0; s < nsub; ++s) {
       int rc, mc[2], cid, vs;
       bool cf;
@@ -371,8 +376,8 @@ void Dec::direct_temporal(uint8_t mask) {
           mv1[1] = mv0[1] - mc[1];
         }
       }
-      const int x4 = (b8 & 1) * 2 + (pp_.direct_8x8_inference ? 0 : (s & 1)), y4 = (b8 >> 1) * 2 + (pp_.direct_8x8_inference ? 0 : (s >> 1));
-      const int w = pp_.direct_8x8_inference ? 2 : 1;
+      const int x4 = (b8 & 1) * 2 + (d8 ? 0 : (s & 1)), y4 = (b8 >> 1) * 2 + (d8 ? 0 : (s >> 1));
+      const int w = d8 ? 2 : 1;
       set_motion(x4, y4, w, w, 0, ref0, mv0[0], mv0[1]);
       set_motion(x4, y4, w, w, 1, 0, mv1[0], mv1[1]);
     }

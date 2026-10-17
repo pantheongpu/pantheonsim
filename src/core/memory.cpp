@@ -132,7 +132,7 @@ uint64_t MemoryManager::alloc(uint64_t size) {
   if (used_ + size > capacity_ || used_ + size < used_)
     throw Error::make(Err::OutOfMemory, "device out of memory: requested ", size, " bytes, ", used_,
                       " of ", capacity_, " bytes already in use");
-  const uint64_t align = std::max(kAllocAlign, page_);
+  const uint64_t align = std::max(alloc_align_, page_);
   uint64_t base = (next_va_ + align - 1) / align * align;
   uint64_t padded = (size + align - 1) / align * align;
   next_va_ = base + padded;
@@ -320,7 +320,7 @@ const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t 
     // The VA range up to the alignment-padded end belongs to this allocation:
     // an access there is an overrun, which deserves a better diagnosis than
     // "unknown pointer".
-    const uint64_t align = std::max(kAllocAlign, page_);
+    const uint64_t align = std::max(alloc_align_, page_);
     uint64_t padded = (a.size + align - 1) / align * align;
     if (addr < base + padded)
       throw Error::make(Err::OutOfBounds, op, " at ", Hex{addr}, " is ", addr - (base + a.size),
@@ -793,7 +793,7 @@ void MemoryManager::address_free(uint64_t va, uint64_t size) {
   reserved_.erase(it);
 }
 
-uint64_t MemoryManager::create_handle(uint64_t size, int shareable_types) {
+uint64_t MemoryManager::create_handle(uint64_t size, int shareable_types, bool compressible) {
   ExclusiveGuard table_guard(table_lock_.get());
   if (size == 0 || size % kVmmGranularity)
     throw Error::make(Err::InvalidValue, "creating ", size,
@@ -806,6 +806,7 @@ uint64_t MemoryManager::create_handle(uint64_t size, int shareable_types) {
   Handle h;
   h.size = size;
   h.types = shareable_types;
+  h.compressible = compressible;
   h.mem.size = size;
   h.mem.chunk_count = static_cast<size_t>((size + kChunkSize - 1) / kChunkSize);
   h.mem.chunks = std::make_unique<std::atomic<uint8_t*>[]>(h.mem.chunk_count);
@@ -821,6 +822,14 @@ int MemoryManager::handle_types(uint64_t handle) const {
   if (it == handles_.end())
     throw Error::make(Err::InvalidValue, "no such memory handle: ", handle);
   return it->second.types;
+}
+
+bool MemoryManager::handle_compressible(uint64_t handle) const {
+  SharedGuard table_guard(table_lock_.get());
+  auto it = handles_.find(handle);
+  if (it == handles_.end())
+    throw Error::make(Err::InvalidValue, "no such memory handle: ", handle);
+  return it->second.compressible;
 }
 
 // Moves a handle's memory into an anonymous file mapped shared, once. The chunks become pieces of

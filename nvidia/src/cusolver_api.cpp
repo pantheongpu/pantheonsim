@@ -40,6 +40,7 @@
 #include "capture_defer.hpp"
 #include "complex_linalg.hpp"
 #include "host_dense.hpp"
+#include "host_jacobi.hpp"
 
 // Every read and write of device memory below is the commit point of a call made on a capturing stream
 // (capture_defer.hpp).
@@ -155,48 +156,24 @@ thread_local int tl_sweeps = 0;
 thread_local double tl_residual = 0;
 
 // Cyclic Jacobi for the symmetric eigenproblem. Eigenvalues come back ascending
-// with their vectors, matching LAPACK's syevd.
-void syev(std::vector<double>& a, int n, std::vector<double>* w, std::vector<double>* vecs) {
+// with their vectors, matching LAPACK's syevd. The sweeps are host_jacobi.hpp's
+// (the plain loops, or the same arithmetic in the same order on vector lanes).
+void syev(std::vector<double>& a, int n, std::vector<double>* w, std::vector<double>* vecs, bool vectors = true) {
   auto A = [&](int r, int c) -> double& { return a[(size_t)c * n + r]; };
-  vecs->assign((size_t)n * n, 0.0);
+  // The rotations of A do not depend on the vectors: without them (eigenvalues only) they are not accumulated.
+  vecs->assign(vectors ? (size_t)n * n : 0, 0.0);
   auto V = [&](int r, int c) -> double& { return (*vecs)[(size_t)c * n + r]; };
-  for (int i = 0; i < n; ++i) V(i, i) = 1.0;
-  tl_sweeps = 0;
-  for (int sweep = 0; sweep < 100; ++sweep) {
-    double off = 0.0;
-    for (int p = 0; p < n; ++p)
-      for (int q = p + 1; q < n; ++q) off += A(p, q) * A(p, q);
-    tl_residual = std::sqrt(2 * off);
-    if (off <= 1e-30) break;
-    ++tl_sweeps;
-    for (int p = 0; p < n; ++p)
-      for (int q = p + 1; q < n; ++q) {
-        if (std::fabs(A(p, q)) < 1e-300) continue;
-        const double theta = (A(q, q) - A(p, p)) / (2.0 * A(p, q));
-        const double t = (theta >= 0 ? 1.0 : -1.0) /
-                         (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
-        const double c = 1.0 / std::sqrt(t * t + 1.0), s = t * c;
-        for (int i = 0; i < n; ++i) {
-          const double aip = A(i, p), aiq = A(i, q);
-          A(i, p) = c * aip - s * aiq;
-          A(i, q) = s * aip + c * aiq;
-        }
-        for (int i = 0; i < n; ++i) {
-          const double api = A(p, i), aqi = A(q, i);
-          A(p, i) = c * api - s * aqi;
-          A(q, i) = s * api + c * aqi;
-        }
-        for (int i = 0; i < n; ++i) {
-          const double vip = V(i, p), viq = V(i, q);
-          V(i, p) = c * vip - s * viq;
-          V(i, q) = s * vip + c * viq;
-        }
-      }
-  }
+  if (vectors)
+    for (int i = 0; i < n; ++i) V(i, i) = 1.0;
+  tl_sweeps = vgpu::hostjac::syev_sweeps(a.data(), vecs->data(), n, &tl_residual, vgpu::hostjac::Isa::Auto, vectors);
   std::vector<int> order(n);
   for (int i = 0; i < n; ++i) order[i] = i;
   std::sort(order.begin(), order.end(), [&](int x, int y) { return A(x, x) < A(y, y); });
   w->resize(n);
+  if (!vectors) {
+    for (int i = 0; i < n; ++i) (*w)[i] = A(order[i], order[i]);
+    return;
+  }
   std::vector<double> sorted((size_t)n * n);
   for (int i = 0; i < n; ++i) {
     (*w)[i] = A(order[i], order[i]);
@@ -207,46 +184,14 @@ void syev(std::vector<double>& a, int n, std::vector<double>* w, std::vector<dou
 
 // One-sided Jacobi SVD of an m-by-n matrix with m >= n. Columns of `a` become
 // U*S; `vt` accumulates V, and is transposed by the caller.
-void svd(std::vector<double>& a, int m, int n, std::vector<double>* s, std::vector<double>* v) {
+// Without want_v (the right vectors are not asked for) they are not accumulated and v comes back empty.
+void svd(std::vector<double>& a, int m, int n, std::vector<double>* s, std::vector<double>* v, bool want_v = true) {
   auto A = [&](int r, int c) -> double& { return a[(size_t)c * m + r]; };
-  v->assign((size_t)n * n, 0.0);
+  v->assign(want_v ? (size_t)n * n : 0, 0.0);
   auto V = [&](int r, int c) -> double& { return (*v)[(size_t)c * n + r]; };
-  for (int i = 0; i < n; ++i) V(i, i) = 1.0;
-  tl_sweeps = 0;
-  tl_residual = 0;
-  for (int sweep = 0; sweep < 60; ++sweep) {
-    double worst = 0.0, off = 0.0;
-    ++tl_sweeps;
-    for (int p = 0; p < n; ++p)
-      for (int q = p + 1; q < n; ++q) {
-        double app = 0, aqq = 0, apq = 0;
-        for (int i = 0; i < m; ++i) {
-          app += A(i, p) * A(i, p);
-          aqq += A(i, q) * A(i, q);
-          apq += A(i, p) * A(i, q);
-        }
-        if (app == 0.0 || aqq == 0.0) continue;
-        worst = std::max(worst, std::fabs(apq) / std::sqrt(app * aqq));
-        off += apq * apq;
-        if (std::fabs(apq) <= 1e-15 * std::sqrt(app * aqq)) continue;
-        const double theta = (aqq - app) / (2.0 * apq);
-        const double t = (theta >= 0 ? 1.0 : -1.0) /
-                         (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
-        const double c = 1.0 / std::sqrt(t * t + 1.0), sn = t * c;
-        for (int i = 0; i < m; ++i) {
-          const double aip = A(i, p), aiq = A(i, q);
-          A(i, p) = c * aip - sn * aiq;
-          A(i, q) = sn * aip + c * aiq;
-        }
-        for (int i = 0; i < n; ++i) {
-          const double vip = V(i, p), viq = V(i, q);
-          V(i, p) = c * vip - sn * viq;
-          V(i, q) = sn * vip + c * viq;
-        }
-      }
-    tl_residual = std::sqrt(2 * off);
-    if (worst < 1e-14) break;
-  }
+  if (want_v)
+    for (int i = 0; i < n; ++i) V(i, i) = 1.0;
+  tl_sweeps = vgpu::hostjac::svd_sweeps(a.data(), v->data(), m, n, &tl_residual, vgpu::hostjac::Isa::Auto, want_v);
   s->assign(n, 0.0);
   for (int c = 0; c < n; ++c) {
     double norm = 0.0;
@@ -257,7 +202,7 @@ void svd(std::vector<double>& a, int m, int n, std::vector<double>* s, std::vect
   std::vector<int> order(n);
   for (int i = 0; i < n; ++i) order[i] = i;
   std::sort(order.begin(), order.end(), [&](int x, int y) { return (*s)[x] > (*s)[y]; });
-  std::vector<double> a2((size_t)m * n), v2((size_t)n * n), s2(n);
+  std::vector<double> a2((size_t)m * n), v2(want_v ? (size_t)n * n : 0), s2(n);
   for (int c = 0; c < n; ++c) {
     const int o = order[c];
     s2[c] = (*s)[o];
@@ -268,10 +213,11 @@ void svd(std::vector<double>& a, int m, int n, std::vector<double>* s, std::vect
     for (int i = 0; i < m; ++i)
       if (std::fabs(A(i, o)) > 1e-12) { sign = A(i, o) < 0 ? -1.0 : 1.0; break; }
     for (int i = 0; i < m; ++i) a2[(size_t)c * m + i] = sign * A(i, o);
-    for (int i = 0; i < n; ++i) v2[(size_t)c * n + i] = sign * V(i, o);
+    if (want_v)
+      for (int i = 0; i < n; ++i) v2[(size_t)c * n + i] = sign * V(i, o);
   }
   a = std::move(a2);
-  *v = std::move(v2);
+  if (want_v) *v = std::move(v2);
   *s = std::move(s2);
 }
 
@@ -511,7 +457,7 @@ VGPU_GEQRF(D, double)
         full[(size_t)c * n + r] = take ? a(r, c) : a(c, r);                                     \
       }                                                                                         \
     std::vector<double> w, v;                                                                   \
-    syev(full, n, &w, &v);                                                                      \
+    syev(full, n, &w, &v, jobz == CUSOLVER_EIG_MODE_VECTOR);                                    \
     set_info(info, 0);                                                                          \
     if (!save<T>(W, w)) return CUSOLVER_STATUS_EXECUTION_FAILED;                                \
     if (jobz == CUSOLVER_EIG_MODE_VECTOR) {                                                     \
@@ -547,7 +493,7 @@ VGPU_SYEVD(D, double)
     for (int c = 0; c < n; ++c)                                                                 \
       for (int r = 0; r < m; ++r) packed[(size_t)c * m + r] = a(r, c);                          \
     std::vector<double> s, v;                                                                   \
-    svd(packed, m, n, &s, &v);                                                                  \
+    svd(packed, m, n, &s, &v, VT && jobvt != 'N');                                              \
     set_info(info, 0);                                                                          \
     if (!save<T>(S, s)) return CUSOLVER_STATUS_EXECUTION_FAILED;                                \
     if (U && jobu != 'N') {                                                                     \
@@ -639,14 +585,22 @@ void complete_basis(std::vector<double>& Q, int m, int k) {
 // values, descending), U (m x ucols) and V (n x vcols), each column-major and
 // packed, with ucols/vcols = k (economy) or m/n (full). A zero singular value's
 // vector, and every column past k, completes an orthonormal basis.
+// With vectors false only S is made (and U and V come back empty): the rotations do not depend on the vectors, and the basis
+// completion is only for them.
 void svd_any(const Mat& a, int m, int n, bool full, std::vector<double>* S, std::vector<double>* U,
-             std::vector<double>* V) {
+             std::vector<double>* V, bool vectors = true) {
   const bool wide = m < n;
   const int r = wide ? n : m, c = wide ? m : n;   // factor the tall one: r >= c
   std::vector<double> t((size_t)r * c), s, v;
   for (int j = 0; j < c; ++j)
     for (int i = 0; i < r; ++i) t[(size_t)j * r + i] = wide ? a(j, i) : a(i, j);
-  svd(t, r, c, &s, &v);   // t becomes (left vectors x s), v is c x c
+  svd(t, r, c, &s, &v, vectors);   // t becomes (left vectors x s), v is c x c
+  if (!vectors) {
+    S->assign(s.begin(), s.begin() + c);
+    U->clear();
+    V->clear();
+    return;
+  }
   std::vector<double> L((size_t)r * r, 0.0), R((size_t)c * c, 0.0);
   int good = 0;
   for (int j = 0; j < c; ++j) {
@@ -702,7 +656,7 @@ cusolverStatus_t eig_into(void* A, int64_t n, int64_t lda, void* W, cusolverEigM
   Mat a;
   if (!load<T>(A, (size_t)lda * n, &a, (int)lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;
   std::vector<double> full = symmetric(a, (int)n, uplo), w, v;
-  syev(full, (int)n, &w, &v);
+  syev(full, (int)n, &w, &v, jobz == CUSOLVER_EIG_MODE_VECTOR);
   set_info(info, 0);
   if (!save<T>(W, w)) return CUSOLVER_STATUS_EXECUTION_FAILED;
   if (jobz == CUSOLVER_EIG_MODE_VECTOR) {
@@ -719,7 +673,7 @@ cusolverStatus_t svd_into(cusolverEigMode_t jobz, bool full, int m, int n, const
   Mat a;
   if (!load<T>(A, (size_t)lda * n, &a, lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;
   std::vector<double> s, u, v;
-  svd_any(a, m, n, full, &s, &u, &v);
+  svd_any(a, m, n, full, &s, &u, &v, jobz == CUSOLVER_EIG_MODE_VECTOR);
   set_info(info, 0);
   if (!save<T>(S, s)) return CUSOLVER_STATUS_EXECUTION_FAILED;
   if (jobz == CUSOLVER_EIG_MODE_VECTOR) {
@@ -959,7 +913,7 @@ VGPU_EXPORT cusolverStatus_t cusolverDnXgesvdjSetSortEig(gesvdjInfo_t info, int 
       Mat a;                                                                                                         \
       if (!load<T>(A + b * sA, (size_t)lda * n, &a, lda)) return CUSOLVER_STATUS_EXECUTION_FAILED;                   \
       std::vector<double> s, u, v;                                                                                   \
-      svd_any(a, m, n, false, &s, &u, &v);                                                                           \
+      svd_any(a, m, n, false, &s, &u, &v, jobz == CUSOLVER_EIG_MODE_VECTOR);                                         \
       s.resize(rank);                                                                                                \
       if (!save<T>(S + b * sS, s)) return CUSOLVER_STATUS_EXECUTION_FAILED;                                          \
       if (jobz == CUSOLVER_EIG_MODE_VECTOR) {                                                                        \

@@ -23,8 +23,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <optional>
 #include <utility>
 #include <bit>
+#include <cerrno>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -42,7 +44,9 @@
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/mem_counters.hpp"
+#include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
+#include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/texture_grad.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
@@ -98,7 +102,10 @@ struct Warp {
   uint64_t bssy_stamp[16] = {};       // when (Block::bssy_clock) each barrier was last set up: higher is more deeply nested
   uint64_t rpc[32] = {};              // the return-address register (RPCMOV)
   uint64_t gmma_issued = 0;           // warpgroup MMAs this warp has issued
-  const Code* code_hint = nullptr;    // the code section the tier last found this warp in
+  const Code* code_hint = nullptr;    // the code section this warp last ran in (step_warp, and the tier)
+  // The tier's chain (tier_ops.inc): how many more calls of step_warp the caller's turn has after this one, and how many the
+  // tier has taken over. Set by the caller before each call; the caller adds `extra` to its count and clears it.
+  uint32_t budget = 0, extra = 0;
   std::vector<uint8_t> local;         // per-lane local memory, local_size bytes each
   uint32_t local_size = 0;
   uint64_t steps = 0;
@@ -223,6 +230,21 @@ std::mutex& atomic_lock(uint64_t addr) {
 
 void tier_add_total(uint64_t n);   // tier_ops.inc
 
+// The budget of steps a warp may take: the launch's, or VGPU_MAX_STEPS (0: none), by the rule the PTX engine applies
+// (effective_max_steps in src/exec/interpreter.cpp). Read at the start of each launch.
+uint64_t sass_max_steps(uint64_t configured) {
+  static const char* const e = std::getenv("VGPU_MAX_STEPS");   // (once per process: a launch of a few instructions costs less than a getenv)
+  if (!e || !*e) return configured;
+  const char* p = e;
+  while (*p == ' ' || *p == '\t') ++p;
+  if (*p == '-' || *p == '+') return configured;   // (strtoull would wrap a negative into a huge budget)
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(e, &end, 10);
+  if (errno != 0 || end == e || *end != '\0') return configured;
+  return v == 0 ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(v);
+}
+
 // The lanes whose program counter is `p`, compared two to a vector register where SSE2 is there.
 inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
   Mask eq = 0;
@@ -240,11 +262,31 @@ inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
   return eq;
 }
 
+// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds. With many lanes
+// running, as four independent chains over all 32 lanes, a lane that does not run counting as the largest address (an all-ones OR,
+// no branch on the lane's bit: those were mispredicted in a diverged warp); with few, the loop over just those lanes.
+inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) {
+  if (simd::popcount32(run) <= 5) {
+    uint64_t lo = first;
+    for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
+    return lo;
+  }
+  const auto pcv = [&](unsigned l) { return w.pc[l] | ((static_cast<uint64_t>((run >> l) & 1)) - 1); };
+  uint64_t a = ~uint64_t{0}, b = a, c = a, d = a;
+  for (unsigned l = 0; l < 32; l += 4) {
+    a = std::min(a, pcv(l));
+    b = std::min(b, pcv(l + 1));
+    c = std::min(c, pcv(l + 2));
+    d = std::min(d, pcv(l + 3));
+  }
+  return std::min(std::min(a, b), std::min(c, d));
+}
+
 class Runner {
  public:
   Runner(const Module& m, const CubinKernel& k, const exec::LaunchConfig& cfg,
          const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem, const DeviceProfile& profile)
-      : m_(m), k_(k), cfg_(cfg), mem_(mem), profile_(profile) {
+      : m_(m), k_(k), cfg_(cfg), mem_(mem), profile_(profile), max_steps_(sass_max_steps(cfg.max_steps)) {
     // A cooperative launch's grid-barrier workspace, as the PTX interpreter
     // makes it: 64 zeroed bytes, freed however the launch ends.
     if (cfg.cooperative) {
@@ -264,10 +306,11 @@ class Runner {
                                       static_cast<uint32_t>(std::min<uint64_t>(cfg.stack_bytes, 1u << 24))});
     local_size_ = (local_size_ + 15) & ~15u;
     shared_size_ = static_cast<uint64_t>(k.shared_bytes) + cfg.shared_bytes;
-    if (m.sm >= 100)
+    if (m.sm >= 100) {
       for (const CubinSymbol& sym : m.cubin.symbols)
         if (sym.name == ".nv.reservedSmem.offset0") alloc_handshake_ = static_cast<uint32_t>(sym.value);
         else if (sym.name == "__nv_reservedSMEM_tmem_allocation_pipeline_mbarrier") alloc_mbar_ = static_cast<uint32_t>(sym.value);
+    }
     // From compute capability 8.0 the driver reserves 1 KiB of shared memory
     // behind every block's own, which it rounds to its 128-byte allocation
     // unit (cooperative_groups keeps the scratch of multi-warp tiles there).
@@ -295,11 +338,14 @@ class Runner {
     // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
     // block. For checking that the fast paths compute what the general one does.
     if (const char* f = std::getenv("VGPU_FASTPATH"); f && f[0] == '0') fast_ = false;
+    vgpu::exec::tc86::refresh_exact();   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
     if (tier::requested()) {
       const char* tr = std::getenv("VGPU_SASS_TRACE");
       tier_ = fast_ && simd::enabled() && !(tr && *tr);
       const char* ts = std::getenv("VGPU_TIER_STATS");
-      tier_stats_ = tier_ && ts && ts[0] == '1';
+      tier_stats_ = tier_ && ts && (ts[0] == '1' || ts[0] == '2');
+      const char* tc = std::getenv("VGPU_TIER_CHAIN");
+      tier_chain_ = !(tc && tc[0] == '0');
     }
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
@@ -321,6 +367,16 @@ class Runner {
   MemoryManager& memory() { return mem_; }
   uint32_t tier_sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const { return sreg(blk, w, idx, lane); }
   void tier_exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mem(blk, w, ins, ex); }
+  uint32_t tier_cbank32(unsigned bank, uint64_t offset) const { return cbank32(bank, offset); }
+  void tier_exec_float(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_float(blk, w, ins, ex); }
+  // A float instruction as Runner::execute runs it: the 32-lane fast path first, then the general rule. The tier's handlers for the
+  // forms whose result rules are more than a call of a SIMD kernel use this (so that the rules stay in one place, exec_ops.inc).
+  void tier_float_op(Block& blk, Warp& w, const Instr& ins, Mask ex) {
+    if (!fast_alu(w, ins, ex)) exec_float(blk, w, ins, ex);
+  }
+  // The `kind` argument of simd::Kernels::hmma for an f16 (0), bf16 (1) or tf32 (2) HMMA: an sm_86 cubin's sum is the RTX 3060 tensor core's
+  // (bit 4) unless VGPU_TC_EXACT=0. exec_mma (exec_ops.inc) and the tier's HMMA handler both call this, so that the choice is made in one place.
+  unsigned hmma_kernel_kind(unsigned kind) const { return kind | (m_.sm == 86 && vgpu::exec::tc86::exact_enabled() ? 16u : 0u); }
   ~Runner() {
     if (coop_ws_) {
       try {
@@ -340,6 +396,22 @@ class Runner {
   bool break_bsync_standoff(Block& blk);
   void init_block(Block& blk, uint64_t linear);
   bool step_warp(Block& blk, Warp& w);
+  // A warp's turn: up to `limit` calls of step_warp, ending early when it cannot run or yields. With the tier, a call may do the work
+  // of several (the chain, tier_ops.inc): `budget` tells it how many calls the turn has left, `extra` how many it took over.
+  template <bool Tier>
+  void turn(Block& blk, Warp& w, int limit, bool& progress) {
+    for (int n = 0; n < limit; ++n) {
+      if (!(w.alive & ~w.exited)) break;
+      if constexpr (Tier) w.budget = static_cast<uint32_t>(limit - 1 - n);
+      if (!step_warp(blk, w)) break;
+      progress = true;
+      if constexpr (Tier) {
+        n += static_cast<int>(w.extra);
+        w.extra = 0;
+      }
+      if (w.yield) break;
+    }
+  }
   bool tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc
   bool break_spin_wait(const std::vector<Block*>& blocks);
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
@@ -428,11 +500,13 @@ class Runner {
   const exec::LaunchConfig& cfg_;
   MemoryManager& mem_;
   const DeviceProfile& profile_;
+  const uint64_t max_steps_;   // the step budget of a warp (cfg_.max_steps, or VGPU_MAX_STEPS)
   bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
   // The pre-decoded tier (src/sass/tier.hpp): VGPU_TIER=1, with the fast paths and the SIMD kernels it is held to on and
   // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
   bool tier_ = false;
   bool tier_stats_ = false;
+  bool tier_chain_ = true;   // VGPU_TIER_CHAIN=0: one run per call of step_warp, as the interpreter's (tier_ops.inc)
   std::vector<uint8_t> bank0_;
   std::map<unsigned, uint64_t> bank_va_, bank_size_;
   uint64_t entry_ = 0;
@@ -1000,13 +1074,8 @@ exec::LaunchStats Runner::run() {
         for (Warp& w : blk.warps) {
           if (!(w.alive & ~w.exited)) continue;
           live = true;
-          for (int n = 0; n < 256 && (w.alive & ~w.exited); ++n)
-            if (step_warp(blk, w)) {
-              progress = true;
-              if (w.yield) break;
-            } else {
-              break;
-            }
+          if (tier_) turn<true>(blk, w, 256, progress);
+          else turn<false>(blk, w, 256, progress);
           w.yield = false;
         }
       if (live && !progress) {
@@ -1158,12 +1227,8 @@ void Runner::run_block(Block& blk) {
     for (Warp& w : blk.warps) {
       if (!(w.alive & ~w.exited)) continue;
       live = true;
-      for (int n = 0; n < 4096; ++n) {
-        if (!(w.alive & ~w.exited)) break;
-        if (!step_warp(blk, w)) break;
-        progress = true;
-        if (w.yield) break;
-      }
+      if (tier_) turn<true>(blk, w, 4096, progress);
+      else turn<false>(blk, w, 4096, progress);
       if (!w.yield) w.spin_yields = w.idle_yields = 0;
       w.yield = false;
     }
@@ -1207,12 +1272,8 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
       for (Warp& w : blk.warps) {
         if (!(w.alive & ~w.exited)) continue;
         live = true;
-        for (int n = 0; n < 4096; ++n) {
-          if (!(w.alive & ~w.exited)) break;
-          if (!step_warp(blk, w)) break;
-          progress = true;
-          if (w.yield) break;
-        }
+        if (tier_) turn<true>(blk, w, 4096, progress);
+        else turn<false>(blk, w, 4096, progress);
         if (!w.yield) w.spin_yields = w.idle_yields = 0;
         w.yield = false;
       }
@@ -1319,7 +1380,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     if (const Mask at = tier_lanes_at(w, lo); (run & ~at) == 0) {
       group = run;
     } else {   // diverged: the lowest address among the runnable lanes, and the lanes there
-      for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
+      lo = tier_lowest_pc(w, run, lo);
       group = tier_lanes_at(w, lo) & run;
     }
   } else
@@ -1394,17 +1455,18 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   // reads its own pc (LEPC) end the run and take the general path.
   uint64_t pc = pick;
   const Code* code = nullptr;
+  // The section the warp ran in last is most often the one it is in, so Module::code_at is asked only when it moves
+  // to another (a call into a device function, a return). A pc in no section is fetch's fault, as before.
+  if (w.code_hint && pc - w.code_hint->base < 16 * w.code_hint->count) {
+    code = w.code_hint;
+  } else {
+    fetch(pc, &code);
+    w.code_hint = code;
+  }
   if (tier_ && !w.mactive_force) {
-    // The section the warp ran in last is most often the one it is in (Module::code_at searches them all).
-    if (w.code_hint && pc - w.code_hint->base < 16 * w.code_hint->count) {
-      code = w.code_hint;
-    } else {
-      fetch(pc, &code);
-      w.code_hint = code;
-    }
     if (const tier::Program* tp = code->tier_program()) return tier_run(blk, w, group, pick, *code, *tp);
   }
-  const Instr* ins = &fetch(pc, &code);
+  const Instr* ins = &code->instr((pc - code->base) / 16);
   const uint64_t end = code->base + 16 * code->count;
   for (unsigned n = 0;; ++n) {
     // A warp's first store to global memory ends its turn, once, so that the block's other warps issue the loads
@@ -1423,8 +1485,8 @@ bool Runner::step_warp(Block& blk, Warp& w) {
         return true;
       }
     }
-    if (++w.steps > cfg_.max_steps)
-      throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(cfg_.max_steps) +
+    if (++w.steps > max_steps_)
+      throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(max_steps_) +
                                     " instructions (an infinite loop?)");
     if (n < 256 && pc + 16 < end && ins->straight) {
       execute(blk, w, *ins, group, /*advance=*/false);
@@ -1497,6 +1559,13 @@ const tier::Program* Code::tier_program() const {
       tier::MOp& op = prog->ops[i];
       tier::analyze(instr(i), sm, *prog, op);
       op.fn = tier_handler_for(op.form);
+      // VGPU_TIER_OFF=form,form,... (names as VGPU_TIER_STATS shows them in tier::form_name: iadd3, bsync, ...) leaves those forms to the
+      // interpreter, for finding which form a difference comes from.
+      static const std::string off = [] { const char* v = std::getenv("VGPU_TIER_OFF"); return v && *v ? std::string(",") + v + "," : std::string(); }();
+      if (!off.empty() && off.find(std::string(",") + tier::form_name(op.form) + ",") != std::string::npos) {
+        op.form = tier::Form::None;
+        op.fn = nullptr;
+      }
       if (op.fn) {
         ++prog->native;
         prog->max_reg = std::max(prog->max_reg, op.maxreg);

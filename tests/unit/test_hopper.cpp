@@ -10,6 +10,7 @@
 // same instruction against CuTe's own layouts, including the 128-byte swizzle
 // these examples do not cover.
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -382,6 +383,71 @@ VTEST(wgmma_tf32_k_major_no_swizzle_figure_169) {
   w.desc_b = desc(0, 64 * 4, 32 * 4, 0);
   w.a_words = tf32_a_regs(A);
   check_f32(w.run(), 16, 8, A, B, zero);
+}
+
+// A NaN in an f32 accumulator is the canonical 0x7fffffff, whichever NaNs went in and however the host's adds order
+// them. The warpgroup MMA sums its products in scalar f32 code, and which NaN comes out of an add of two NaNs is the
+// first source operand's -- the compiler picks that operand, so before the result was canonicalised it differed between
+// an optimised build and a ThreadSanitizer -O1 one. (Derived from the SASS executor's HMMA, which writes the canonical
+// NaN on an RTX 3060, and the PTX documentation; no card has wgmma to check it against.) Inputs: inf * 0 (the host's
+// default NaN, sign set), a NaN in A with a payload and a sign, a NaN in the accumulator alone, and one meeting a
+// product NaN; every other word must be the host's f32 sum.
+VTEST(wgmma_f32_nans_are_the_canonical_one) {
+  auto A = [](int m, int k) {
+    if (m == 0 && k == 0) return bits_f32(0x7F800000u);   // +inf, times B(0, n) = 0 in some columns
+    if (m == 2 && k == 0) return bits_f32(0xFF800000u);
+    if (m == 4 && k == 1) return bits_f32(0xFFC12000u);   // a NaN with a sign and a payload
+    return val(m, k, 1);
+  };
+  auto B = [](int k, int n) {
+    if (k == 0 && (n == 0 || n == 3 || n == 8)) return 0.0f;
+    return val(n, k, 2);
+  };
+  auto C = [](int m, int n) {
+    if (m == 0 && n == 0) return bits_f32(0x7FC02000u);   // meets inf * 0
+    if (m == 1 && n == 1) return bits_f32(0xFFC12000u);   // alone
+    if (m == 5 && n == 2) return bits_f32(0x7FC02000u);
+    return static_cast<float>((m + 3 * n) % 5) - 2.0f;
+  };
+  Wgmma w;
+  w.form = "m64n16k8.f32.tf32.tf32";
+  w.tail = ", 1, 1";
+  w.d_regs = 8;
+  for (int n = 0; n < 16; ++n)
+    for (int k = 0; k < 16; ++k) {
+      const int off = 4 * (n % 8) + 32 * (n / 8) + (k % 4) + 64 * (k / 4);
+      put_elem(w.smem_b, size_t(off) * 4, f32_bits(B(k, n)));
+    }
+  w.desc_b = desc(0, 64 * 4, 32 * 4, 0);
+  w.a_words = tf32_a_regs(A);
+  w.d_in.resize(128 * 8);
+  for (int t = 0; t < 128; ++t)
+    for (int e = 0; e < 8; ++e) {
+      int row, col;
+      d_pos(t, e, &row, &col);
+      w.d_in[size_t(t) * 8 + e] = f32_bits(C(row, col));
+    }
+  const auto out = w.run();
+  int nans = 0;
+  for (int t = 0; t < 128; ++t)
+    for (int e = 0; e < 8; ++e) {
+      int row, col;
+      d_pos(t, e, &row, &col);
+      volatile float want = C(row, col);
+      for (int k = 0; k < 8; ++k) want = want + A(row, k) * B(k, col);
+      const float wantf = want;
+      const uint32_t got = out[size_t(t) * 8 + e];
+      char buf[160];
+      std::snprintf(buf, sizeof buf, "D[%d][%d] = 0x%08x, expected %s", row, col, got,
+                    std::isnan(wantf) ? "the canonical NaN 0x7fffffff" : "the host's sum");
+      if (std::isnan(wantf)) {
+        ++nans;
+        if (got != 0x7FFFFFFFu) throw vtest::Failure(buf);
+      } else if (got != f32_bits(wantf)) {
+        throw vtest::Failure(buf);
+      }
+    }
+  VCHECK(nans > 20);   // the inputs do make NaNs
 }
 
 // Figure 170: K-major, 32-byte swizzle, tf32.

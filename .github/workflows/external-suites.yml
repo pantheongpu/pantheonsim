@@ -39,6 +39,10 @@ on:
       engines:
         description: "NVIDIA suites: the engines to run each program on (space separated): sass (the default engine), ptx (VGPU_SASS=0)"
         default: sass
+      verbose:
+        description: "NVIDIA suites: keep the simulator's own diagnostics in each program's log (runs without VGPU_QUIET)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -168,6 +172,7 @@ jobs:
           SUITE_GPU: ${{ matrix.gpu }}
           SUITE_ONLY: ${{ inputs.only }}
           ENGINES: ${{ inputs.engines || 'sass' }}
+          SUITE_VERBOSE: ${{ inputs.verbose && '1' || '' }}
         run: |
           # Each engine asked for, into its own report: report/ for the
           # default (SASS), report/ptx/ for the PTX interpreter (VGPU_SASS=0).

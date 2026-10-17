@@ -9,20 +9,21 @@
 // HIP over this runtime makes its virtual memory and IPC handles here.
 
 extern "C" {
-// HIP's calls, by the hidden names hip_api.cpp gives them (hipError_t is an
-// int's size): never the exported ones, which may be ROCm's own HIP's.
-int vgpu_own_hipMemAddressReserve(void** ptr, size_t size, size_t alignment, void* addr, unsigned long long flags);
-int vgpu_own_hipMemAddressFree(void* ptr, size_t size);
-int vgpu_own_hipMemCreate(void** handle, size_t size, const vgpu::amd::abi::MemAllocationProp* prop, unsigned long long flags);
-int vgpu_own_hipMemRelease(void* handle);
-int vgpu_own_hipMemMap(void* ptr, size_t size, size_t offset, void* handle, unsigned long long flags);
-int vgpu_own_hipMemUnmap(void* ptr, size_t size);
-int vgpu_own_hipMemSetAccess(void* ptr, size_t size, const vgpu::amd::abi::MemAccessDesc* desc, size_t count);
-int vgpu_own_hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemLocation* location, void* ptr);
-int vgpu_own_hipMemExportToShareableHandle(void* out, void* handle, int type, unsigned long long flags);
-int vgpu_own_hipMemImportFromShareableHandle(void** handle, void* os_handle, int type);
-int vgpu_own_hipMemRetainAllocationHandle(void** handle, void* addr);
-int vgpu_own_hipMemGetAllocationPropertiesFromHandle(vgpu::amd::abi::MemAllocationProp* prop, void* handle);
+// HIP's calls, by the hidden names hip_api.cpp gives them, declared with the
+// types it defines them with (a different return type is an ODR violation to
+// the linker's LTO): never the exported ones, which may be ROCm's own HIP's.
+hipError_t vgpu_own_hipMemAddressReserve(void** ptr, size_t size, size_t alignment, void* addr, unsigned long long flags);
+hipError_t vgpu_own_hipMemAddressFree(void* ptr, size_t size);
+hipError_t vgpu_own_hipMemCreate(void** handle, size_t size, const vgpu::amd::abi::MemAllocationProp* prop, unsigned long long flags);
+hipError_t vgpu_own_hipMemRelease(void* handle);
+hipError_t vgpu_own_hipMemMap(void* ptr, size_t size, size_t offset, void* handle, unsigned long long flags);
+hipError_t vgpu_own_hipMemUnmap(void* ptr, size_t size);
+hipError_t vgpu_own_hipMemSetAccess(void* ptr, size_t size, const vgpu::amd::abi::MemAccessDesc* desc, size_t count);
+hipError_t vgpu_own_hipMemGetAccess(unsigned long long* flags, const vgpu::amd::abi::MemLocation* location, void* ptr);
+hipError_t vgpu_own_hipMemExportToShareableHandle(void* out, void* handle, int type, unsigned long long flags);
+hipError_t vgpu_own_hipMemImportFromShareableHandle(void** handle, void* os_handle, int type);
+hipError_t vgpu_own_hipMemRetainAllocationHandle(void** handle, void* addr);
+hipError_t vgpu_own_hipMemGetAllocationPropertiesFromHandle(vgpu::amd::abi::MemAllocationProp* prop, void* handle);
 }
 
 namespace {

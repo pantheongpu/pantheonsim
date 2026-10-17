@@ -2,6 +2,8 @@
 // reference (they are nvenc_hevc_enc.cpp's fdct1d, idct1d, forward_transform, inverse_transform, mc_luma and mc_chroma as they were).
 // Integer arithmetic, so equal means equal bits: random inputs, the extremes (all samples 0 or 255, residuals of +-255, coefficients
 // of +-32768), every filter phase and every block shape the encoder uses.
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -322,6 +324,63 @@ VTEST(video_simd_decoder_inverse_transform_matches_the_dense_sums) {
         ++runs;
       }
   std::printf("  decoder inverse transform: %d blocks, %zu differ\n", runs, bad);
+  VCHECK_EQ(bad, static_cast<size_t>(0));
+}
+
+// MPEG-2's inverse DCT (mpeg2_idct.inc's idct as it was: two passes of eight-term sums in double, each term rounded then added, the
+// result floor(s + 0.5) saturated to -256 .. 255) against the vector form.
+void ref_mpeg2_idct(int16_t* blk) {
+  static double c[8][8];
+  static bool init = false;
+  if (!init) {
+    for (int x = 0; x < 8; ++x)
+      for (int u = 0; u < 8; ++u) c[x][u] = (u == 0 ? std::sqrt(0.5) : 1.0) * std::cos((2 * x + 1) * u * 3.14159265358979323846 / 16) / 2;
+    init = true;
+  }
+  double tmp[64];
+  for (int v = 0; v < 8; ++v)
+    for (int x = 0; x < 8; ++x) {
+      double s = 0;
+      for (int u = 0; u < 8; ++u) s += c[x][u] * blk[v * 8 + u];
+      tmp[v * 8 + x] = s;
+    }
+  for (int x = 0; x < 8; ++x)
+    for (int y = 0; y < 8; ++y) {
+      double s = 0;
+      for (int v = 0; v < 8; ++v) s += c[y][v] * tmp[v * 8 + x];
+      const int r = static_cast<int>(std::floor(s + 0.5));
+      blk[y * 8 + x] = static_cast<int16_t>(std::min(std::max(r, -256), 255));
+    }
+}
+
+VTEST(mpeg2_idct_matches_the_scalar_loops) {
+  if (!vgpu::videosimd::avx2_available()) return;
+  static double c[8][8];
+  for (int x = 0; x < 8; ++x)
+    for (int u = 0; u < 8; ++u) c[x][u] = (u == 0 ? std::sqrt(0.5) : 1.0) * std::cos((2 * x + 1) * u * 3.14159265358979323846 / 16) / 2;
+  std::mt19937_64 rng(77);
+  size_t bad = 0;
+  int blocks = 0;
+  for (int trial = 0; trial < 200000; ++trial) {
+    int16_t a[64], b[64];
+    const int kind = trial % 6;
+    for (int i = 0; i < 64; ++i) {
+      switch (kind) {
+        case 0: a[i] = static_cast<int16_t>(static_cast<int>(rng() % 4096) - 2048); break;       // what an 8-bit stream codes
+        case 1: a[i] = static_cast<int16_t>(rng()); break;                                       // anything 16 bits hold
+        case 2: a[i] = rng() % 2 ? 32767 : -32768; break;                                        // the extremes
+        case 3: a[i] = rng() % 8 == 0 ? static_cast<int16_t>(static_cast<int>(rng() % 801) - 400) : 0; break;   // sparse
+        case 4: a[i] = i == 0 ? static_cast<int16_t>(static_cast<int>(rng() % 4096) - 2048) : 0; break;        // DC only
+        default: a[i] = static_cast<int16_t>(static_cast<int>(rng() % 9) - 4); break;             // small: sums land near halves
+      }
+      b[i] = a[i];
+    }
+    ref_mpeg2_idct(a);
+    vgpu::videosimd::mpeg2_idct(b, c);
+    bad += std::memcmp(a, b, sizeof a) != 0;
+    ++blocks;
+  }
+  std::printf("  MPEG-2 inverse DCT: %d blocks, %zu differ\n", blocks, bad);
   VCHECK_EQ(bad, static_cast<size_t>(0));
 }
 

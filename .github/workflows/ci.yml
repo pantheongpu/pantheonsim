@@ -71,7 +71,8 @@ jobs:
           cmake --version | head -1
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        # -Werror: the build has no warnings (issue #284), and this keeps it that way.
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVGPU_WERROR=ON
 
       - name: Build
         run: cmake --build build -j"$(ci/jobs.sh -p release)"
@@ -85,7 +86,15 @@ jobs:
       - name: Unit and end-to-end tests
         # The ML tests are the ml job's: on the runner whose image has PyTorch
         # and rocBLAS they would run here too, and take an hour.
-        run: ctest --test-dir build --output-on-failure -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
+        # -j2 (fewer on a machine with under 12 GiB free, ci/jobs.sh): the two
+        # CUTLASS tests are 2200 s of this step's 3200 s (run 38424481981) and
+        # use one core for their nvcc compiles, so the other tests run beside
+        # them. The CUTLASS, CuTe and heavy nvcc tests take the nvcc_memory lock
+        # (CMakeLists.txt), so only one of them sizes its compiles from the free
+        # memory at a time, and the two CUTLASS tests start first (their COST),
+        # so the lock chain overlaps the rest. The ml job below runs the other
+        # tests at -j2 already.
+        run: ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
 
   workloads:
     name: pantheon workloads
@@ -160,7 +169,12 @@ jobs:
     # started while the pull request backlog is long and terminated when it is
     # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
     # the pool, and it runs in the toolchain image there as it does here.
-    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
+    # The pool's owner can cap what a job takes with the repository variables
+    # BURST_CONTAINER_OPTIONS (docker options such as `--cpus=12 --memory=16g`),
+    # BURST_MEM_LIMIT_GIB and BURST_JOBS_MAX (for a job outside a container).
+    # All are empty, meaning no cap, until set; tests/lint/check_burst_cap.py
+    # keeps every job on BURST_RUNS_ON passing them on.
+    runs-on: ${{ fromJSON(vars.CONTAINER_RUNS_ON || vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: ${{ inputs.cutlass_sass && 330 || 60 }}
     # The cuda13.0 toolchain image (.github/ci-image), or, when there is none,
     # the runner itself with the install step below.
@@ -170,7 +184,7 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
-      options: --shm-size=2g
+      options: --shm-size=2g ${{ vars.BURST_CONTAINER_OPTIONS }}
     env:
       NVCC_PREPEND_FLAGS: ''
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
@@ -248,7 +262,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ github.token }}
       # The IPC tests need more than Docker's 64 MB of /dev/shm.
-      options: --shm-size=2g
+      options: --shm-size=2g ${{ vars.BURST_CONTAINER_OPTIONS }}
     env:
       # Shims built against CUDA 13 make Ollama pick its cuda_v13 backend,
       # whose PTX starts at sm_75 and so covers every profile.
@@ -346,6 +360,9 @@ jobs:
         gpu: [amd/mi300x, amd/mi325x, amd/mi350x, amd/mi250x, amd/rx6900xt, amd/rx7900xtx, amd/rx9070xt]
     env:
       OLLAMA_VERSION: v0.21.0
+      # No container here, so the ceilings go to ci/jobs.sh (empty means none).
+      CI_MEM_LIMIT_GIB: ${{ vars.BURST_MEM_LIMIT_GIB }}
+      CI_JOBS_MAX: ${{ vars.BURST_JOBS_MAX }}
       # Pulled before the test (and cached), so a registry 503 is retried
       # rather than failing the job; the cache key names the model.
       VGPU_OLLAMA_MODEL: smollm2:135m
@@ -552,11 +569,16 @@ jobs:
         #                        (the 13.2-only runtime functions exist only there), and
         #                        this image has CUDA 13.0; no CI job has 13.2, so every job
         #                        skips it by design (it runs where 13.2 is installed).
+        #   e2e_rdc_clones       it checks device functions the device link cloned, and only means
+        #                        something where the link made two or more copies of pow; this
+        #                        image's nvcc makes none for the test's kernels and the test says
+        #                        so and skips (the cuobjdump count in run_rdc_clones.sh). It runs
+        #                        on a toolchain whose link clones them.
         # The last four above, and these three, are the image's or the branch's to fix; drop
         # them here when they are.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms|e2e_runtime_132)$'
+          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 4 -m 2)" \
@@ -564,7 +586,8 @@ jobs:
             2>&1 | tee rest.log
           skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
                     | sed -E 's/Test +#[0-9]+: ([A-Za-z0-9_]+).*/\1/' || true)
-          unexpected=$(grep -vE "$RUNNER_SKIPS_OK" <<<"$skipped" | grep . || true)
+          # amd_rocprof_*: the image has no rocprofv3 either (the reason amd_rocprofv3 is allowed above).
+          unexpected=$(grep -vE "$RUNNER_SKIPS_OK|^amd_rocprof_" <<<"$skipped" | grep . || true)
           if [[ -n "$skipped" ]]; then
             # ctest hides a skipped test's output; the reason is its SKIP line.
             echo "Skipped tests and why:"
@@ -582,7 +605,7 @@ jobs:
     # started while the pull request backlog is long and terminated when it is
     # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
     # the pool, and it runs in the toolchain image there as it does here.
-    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON(vars.CONTAINER_RUNS_ON || vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image
@@ -593,7 +616,7 @@ jobs:
         password: ${{ github.token }}
       # TSan's setarch -R needs personality() (seccomp), LeakSanitizer
       # ptrace; the IPC tests more than Docker's 64 MB of /dev/shm.
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined ${{ vars.BURST_CONTAINER_OPTIONS }}
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
@@ -631,7 +654,14 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: ctest --test-dir build-san --output-on-failure -E pantheon_workloads
+        # -j2 (fewer when under 12 GiB are free, ci/jobs.sh): 534 tests, 1840 s
+        # one at a time in run 38424481981 (2031 s in 38612576048), the
+        # longest 173 s, on a 24-core machine that otherwise idles through them;
+        # the pool has one runner (server2-1), so each minute here is also a
+        # minute the jobs queued behind this one wait. The ml job runs these
+        # tests at -j2 on every run, and the tests that take the nvcc_memory lock
+        # (CMakeLists.txt) still run one at a time.
+        run: ctest --test-dir build-san --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E pantheon_workloads
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
@@ -647,7 +677,7 @@ jobs:
     # started while the pull request backlog is long and terminated when it is
     # empty. This is one of the three long jobs (SASS, ASan, TSan) that go to
     # the pool, and it runs in the toolchain image there as it does here.
-    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
+    runs-on: ${{ fromJSON(vars.CONTAINER_RUNS_ON || vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image
@@ -658,7 +688,7 @@ jobs:
         password: ${{ github.token }}
       # TSan's setarch -R needs personality() (seccomp), LeakSanitizer
       # ptrace; the IPC tests more than Docker's 64 MB of /dev/shm.
-      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      options: --shm-size=2g --cap-add=SYS_PTRACE --security-opt seccomp=unconfined ${{ vars.BURST_CONTAINER_OPTIONS }}
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
       - uses: actions/checkout@v4
@@ -696,7 +726,12 @@ jobs:
         # TSan cannot map its shadow memory under this kernel's ASLR entropy, so
         # the run needs randomization off. Without this every test aborts with
         # "unexpected memory mapping" before it starts.
-        run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -E pantheon_workloads
+        #
+        # -j2 (fewer when under 12 GiB are free, ci/jobs.sh): 534 tests, 1436 s
+        # one at a time in run 38424481981 (1586 s in 38612576048), the longest
+        # 150 s, on a 24-core machine that otherwise idles through them. See the
+        # ASan job above for why it is safe.
+        run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E pantheon_workloads
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the

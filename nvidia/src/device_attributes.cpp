@@ -218,10 +218,10 @@ bool device_attribute(const DeviceProfile& p, int physical, int id, int* out) {
     // A real quantity: a divisor in occupancy arithmetic (CUB's scan launched
     // no blocks when it read zero).
     case kMaxBlocksPerMultiprocessor: v = static_cast<int>(lim.max_blocks_per_sm); break;
-    // cuMemCreate ignores the compression flag, so the capability is not
-    // claimed: a program that sees it asks for a compressed allocation and
-    // reads back that it is not.
-    case kGenericCompressionSupported: v = 0; break;
+    // Generic memory compression: cuMemCreate with the compression flag is granted, and the handle reports it
+    // (the bytes are the same either way). An RTX 3060, an L4, an L40S and an RTX PRO 6000 Server answer 1.
+    // No older card was measured, so those stay at 0.
+    case kGenericCompressionSupported: v = ampere ? 1 : 0; break;
     case kMaxPersistingL2CacheSize: v = sat(p.cuda.persisting_l2_bytes); break;
     // 128 MiB less a page, from compute capability 8.0 (an RTX 3060 answers it;
     // there is no access policy window before).

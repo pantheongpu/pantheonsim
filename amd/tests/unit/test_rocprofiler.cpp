@@ -231,7 +231,7 @@ VTEST(the_code_object_and_its_kernels_are_announced) {
   run_once();
   VCHECK_EQ(seen().code_objects, 1);
   bool found = false;
-  for (const auto& [id, name] : seen().kernels) found = found || name == "counted_mix";
+  for (const auto& [id, name] : seen().kernels) found = found || name == "counted_mix.kd";
   VCHECK(found);
 }
 
@@ -261,7 +261,7 @@ VTEST(the_dispatch_the_copies_and_the_calls_are_traced) {
   const Seen& s = seen();
   VCHECK_EQ(s.dispatches.size(), size_t{1});
   const auto& d = s.dispatches.at(0);
-  VCHECK_EQ(s.kernels.at(d.dispatch_info.kernel_id), std::string("counted_mix"));
+  VCHECK_EQ(s.kernels.at(d.dispatch_info.kernel_id), std::string("counted_mix.kd"));
   VCHECK_EQ(d.dispatch_info.grid_size.x, 192u);   // in work-items
   VCHECK_EQ(d.dispatch_info.workgroup_size.x, 64u);
   VCHECK(d.end_timestamp >= d.start_timestamp && d.start_timestamp > 0);

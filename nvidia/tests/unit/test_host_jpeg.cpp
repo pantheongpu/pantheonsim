@@ -210,4 +210,97 @@ VTEST(host_round_half_away_is_lround) {
   VCHECK_EQ(bad, 0L);
 }
 
+// The encoder's quantisation of a block: the plain loop (nvjpeg_api.cpp's, as it was) against the wide path. Blocks of coefficients
+// of the sizes real images give, halves and their neighbours after the division, values past what an int holds, NaN and infinity.
+VTEST(host_quantize_block_matches_the_plain_loop) {
+  static const int zz[64] = {0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,  12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,  7,  14, 21, 28,
+                              35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
+  std::mt19937_64 rng(404);
+  long blocks = 0, bad = 0;
+  for (int round = 0; round < 200000; ++round) {
+    uint16_t t[64];
+    alignas(32) double tz[64];
+    for (int k = 0; k < 64; ++k) {
+      t[k] = static_cast<uint16_t>(round % 3 == 0 ? 1 + rng() % 255 : (round % 3 == 1 ? 1 : 1 + rng() % 65535));
+      tz[k] = t[k];
+    }
+    double coef[64];
+    for (int k = 0; k < 64; ++k) {
+      switch (round % 7) {
+        case 0: coef[k] = (static_cast<double>(rng() % 40001) - 20000.0) / 8.0; break;
+        case 1: coef[k] = (static_cast<double>(static_cast<int>(rng() % 801) - 400)) * t[zz[k] % 64 ? k : k] + (rng() & 1 ? 0.5 * t[0] : 0.0); break;   // near halves of the quotient
+        case 2: coef[k] = static_cast<double>(static_cast<int>(rng() % 4001) - 2000) / 2.0 * 1.0; break;
+        case 3: { uint64_t bits = rng(); std::memcpy(&coef[k], &bits, 8); break; }   // anything, NaNs and infinities included
+        case 4: coef[k] = (rng() & 1 ? 1 : -1) * 3.0e9 * static_cast<double>(1 + rng() % 5); break;                       // too large for an int
+        case 5: coef[k] = (rng() % 50 == 0) ? 1.0e18 : static_cast<double>(static_cast<int>(rng() % 2001) - 1000); break;
+        default: coef[k] = 0.0; break;
+      }
+    }
+    int a[64], b[64];
+    for (int k = 0; k < 64; ++k) a[k] = static_cast<int>(vgpu::hostjpeg::round_half_away(coef[zz[k]] / t[k]));
+    vgpu::hostjpeg::quantize_block(coef, zz, tz, b);
+    ++blocks;
+    for (int k = 0; k < 64; ++k)
+      if (a[k] != b[k]) ++bad;
+  }
+  std::printf("  %ld blocks, %ld coefficients differ\n", blocks, bad);
+  VCHECK_EQ(bad, 0L);
+}
+
+// The mask of nonzero coefficients of a block.
+VTEST(host_nonzero_mask_matches_the_loop) {
+  std::mt19937_64 rng(808);
+  long bad = 0;
+  for (int round = 0; round < 100000; ++round) {
+    int q[64];
+    const int density = 1 + round % 9;
+    for (int k = 0; k < 64; ++k) q[k] = (rng() % 10 < static_cast<unsigned>(density)) ? static_cast<int>(rng()) : 0;
+    uint64_t want = 0;
+    for (int k = 0; k < 64; ++k)
+      if (q[k] != 0) want |= uint64_t(1) << k;
+    if (vgpu::hostjpeg::nonzero_mask(q) != want || vgpu::hostjpeg::nonzero_mask(q, false) != want) ++bad;
+  }
+  VCHECK_EQ(bad, 0L);
+}
+
+// The encoder's colour conversion: nvjpeg_api.cpp's loops as they were, against the wide path (interleaved and planar input).
+VTEST(host_ycc_matches_the_original_loops) {
+  std::mt19937_64 rng(2026);
+  long pixels = 0, bad = 0;
+  for (int round = 0; round < 4000; ++round) {
+    const size_t n = round % 40 == 0 ? 0 : 1 + rng() % 200;
+    std::vector<uint8_t> il(n * 3 + 8), r(n + 8), g(n + 8), b(n + 8);
+    for (auto& v : il) v = static_cast<uint8_t>(round % 5 == 0 ? (rng() % 2 ? 255 : 0) : rng());
+    for (size_t i = 0; i < n; ++i) { r[i] = il[i * 3]; g[i] = il[i * 3 + 1]; b[i] = il[i * 3 + 2]; }
+    std::vector<float> wy(n + 8), wcb(n + 8), wcr(n + 8), y(n + 8), cb(n + 8), cr(n + 8);
+    for (size_t i = 0; i < n; ++i) {   // the loops as they were
+      wy[i] = 0.299f * r[i] + 0.587f * g[i] + 0.114f * b[i];
+      wcb[i] = 128.0f - 0.168736f * r[i] - 0.331264f * g[i] + 0.5f * b[i];
+      wcr[i] = 128.0f + 0.5f * r[i] - 0.418688f * g[i] - 0.081312f * b[i];
+    }
+    for (const bool wide : {false, true}) {
+      vgpu::hostjpeg::ycc_from_interleaved(il.data(), 0, 2, n, y.data(), cb.data(), cr.data(), wide);
+      for (size_t i = 0; i < n; ++i) {
+        ++pixels;
+        if (std::memcmp(&y[i], &wy[i], 4) || std::memcmp(&cb[i], &wcb[i], 4) || std::memcmp(&cr[i], &wcr[i], 4)) ++bad;
+      }
+      vgpu::hostjpeg::ycc_from_planes(r.data(), g.data(), b.data(), n, y.data(), cb.data(), cr.data(), wide);
+      for (size_t i = 0; i < n; ++i) {
+        ++pixels;
+        if (std::memcmp(&y[i], &wy[i], 4) || std::memcmp(&cb[i], &wcb[i], 4) || std::memcmp(&cr[i], &wcr[i], 4)) ++bad;
+      }
+      // BGR order: red is the third byte
+      std::vector<uint8_t> bgr(n * 3 + 8);
+      for (size_t i = 0; i < n; ++i) { bgr[i * 3] = b[i]; bgr[i * 3 + 1] = g[i]; bgr[i * 3 + 2] = r[i]; }
+      vgpu::hostjpeg::ycc_from_interleaved(bgr.data(), 2, 0, n, y.data(), cb.data(), cr.data(), wide);
+      for (size_t i = 0; i < n; ++i) {
+        ++pixels;
+        if (std::memcmp(&y[i], &wy[i], 4) || std::memcmp(&cb[i], &wcb[i], 4) || std::memcmp(&cr[i], &wcr[i], 4)) ++bad;
+      }
+    }
+  }
+  std::printf("  %ld pixels, %ld differ\n", pixels, bad);
+  VCHECK_EQ(bad, 0L);
+}
+
 VTEST_MAIN

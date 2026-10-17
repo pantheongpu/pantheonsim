@@ -1,7 +1,7 @@
 # Command-line reference
 
 Everything the `vgpu` command and the environment variables can do. The
-[README](../README.md) has the short path (`make doctor`, `make build`, `make demo`); this page is the full list.
+[README](../README.md) has the short path (`make`, then `./run`) and [getting-started.md](getting-started.md) the step-by-step one (`make doctor`, `make build`, `make demo`); this page is the full list.
 
 Build once (`make build`, which runs `./scripts/build.sh`) and the command is `build/vgpu`. The build
 also puts it at `build/bin/vgpu`, next to drop-in `nvidia-smi`, `rocm-smi` and
@@ -134,6 +134,8 @@ vgpu shell -y --gpu amd/mi300x --count 8 --rocm 6.2.0 --driver 6.3.6 \
 | `-y`, `--no-prompt` | Take the defaults for anything not given, without asking. |
 | `--no-isolate` | Skip the namespaces (session tools only). |
 
+`./run [config.yaml] [-- command]` at the root of the repository starts this shell
+for you (see [machine-simulator.md](machine-simulator.md#start-it-with-run)).
 More in [machine-simulator.md](machine-simulator.md).
 
 ## `vgpu ncu`
@@ -237,7 +239,7 @@ variable is unset by default.
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `VGPU_THREADS` | Host threads used to run blocks. | one per core |
-| `VGPU_MAX_STEPS` | Raises the runaway-kernel step budget; `0` removes it. | built-in |
+| `VGPU_MAX_STEPS` | Raises (or lowers) the runaway-kernel step budget; `0` removes it. The PTX engine reads it at each launch; the SASS engine, which used not to read it (its budget was the built-in one whatever this said), once per process. | built-in |
 | `VGPU_SASS` | `0` forces the PTX engine; `1` insists on SASS and does not fall back. | SASS when the binary carries it, else PTX |
 | `VGPU_SASS_LOG` | `1` says when a fatbin falls back from SASS to PTX. | off |
 | `VGPU_SCHEDULER` | Warp scheduling order: `deterministic`, `random` or `adversarial`. Random and adversarial orders find bugs that depend on which warp runs first, and they run blocks one at a time so an order can be replayed. **PTX engine only:** kernels that run from SASS (the default whenever the binary carries it) use one fixed warp order, so set `VGPU_SASS=0` to use this. | deterministic |
@@ -247,8 +249,9 @@ variable is unset by default.
 | `VGPU_LOOKUP_CACHE` | `0` makes every kernel memory access look its address up in the allocation table, for ruling out the per-thread memory of recent lookups when an access looks wrong (tested to give the same values and errors) | unset (on) |
 | `VGPU_LAUNCH_CACHE` | `0` makes every launch work out again what it can remember (the table of every loaded kernel that a device-side launch looks its child up in, and which function a kernel handle names), for ruling the remembering out when a result looks wrong; the answers are tested to be the same either way | unset (on) |
 | `VGPU_SIMD` | `base` or `avx2` caps the vector instruction set the lane arithmetic, half-precision conversions and tensor-core kernels use (the default is the best the CPU has); `off` sends the engines back to their scalar code, for ruling the vector kernels out when a result looks wrong (they are tested to give the same bits) | best available |
-| `VGPU_TIER` | `1` runs the SASS engine's straight-line instructions through a pre-decoded tier: each instruction's form and operands are worked out once per code section instead of at every execution (about 1.2 to 2.7 times faster on the benchmark workloads, [performance](performance.md)). Results, counters, errors and the warp scheduling are those of the interpreter, which also runs everything the tier has no handler for; `VGPU_FASTPATH=0`, `VGPU_SIMD=off` and `VGPU_SASS_TRACE` turn it off. `VGPU_TIER_STATS=1` prints how many warp instructions it ran and which ones it left to the interpreter when the process exits. | off |
+| `VGPU_TIER` | `1` runs the SASS engine's straight-line instructions through a pre-decoded tier: each instruction's form and operands are worked out once per code section instead of at every execution (about 1.2 to 2.7 times faster on the benchmark workloads, [performance](performance.md)). Results, counters, errors and the warp scheduling are those of the interpreter, which also runs everything the tier has no handler for; `VGPU_FASTPATH=0`, `VGPU_SIMD=off` and `VGPU_SASS_TRACE` turn it off. `VGPU_TIER_STATS=1` prints how many warp instructions it ran and which ones it left to the interpreter when the process exits (`2` adds a few disassembled examples of each; `VGPU_TIER_STATS_FILE=<path>` appends it to that file instead of stderr). `VGPU_TIER_OFF=iadd3,bsync,...` leaves the forms it names (`tier::form_name`) to the interpreter, to find which form a difference comes from. `VGPU_TIER_CHAIN=0` makes it return to the scheduler after every run of straight instructions, as the interpreter does (by default it goes on by itself while the next call would pick the same lanes again: the same instructions run in the same order, and a warp's turn is counted in the same units). | off |
 | `VGPU_FASTCOUNT` | `0` counts memory sectors and bank passes with the earlier reference code instead of the allocation-free version, for ruling the new counting out when a counter looks wrong (tested to give the same numbers) | unset (on) |
+| `VGPU_TC_EXACT` | `0` turns the RTX 3060 (sm_86) tensor-core sum model off: wmma, `mma.sync` and SASS `HMMA` in f16, bf16 and tf32 then add the products one at a time in f32, as earlier releases did. The model (chunks of 8 products, truncating, measured on a card, `include/vgpu/exec/tc_ampere.hpp`) is what makes random-data results equal the card's, and costs 3.5 to 4.5 times the time of those instructions in the SASS and PTX engines (the bench workloads `wmma` and `mma_ptx`; a program that does little else spends that much more, one that mostly does other work little), except `mma.sync` on the PTX engine, where it is the faster of the two. Only sm_86 devices and cubins are affected; counters never change. Read at every launch, so it can be set between launches. `vgpu run` passes it through. | unset (on) |
 
 **Checks and counters** (see [diagnostics](diagnostics.md))
 
@@ -269,6 +272,7 @@ variable is unset by default.
 | `VGPU_SASS_TRACE=<warp>` | Print every SASS instruction one warp runs, with the lane group and the first lane's results; after a `BSSY`, `BSYNC`, `BREAK` or `BMOV` it adds the barrier masks. | off |
 | `VGPU_SASS_TRACE_KERNEL=<text>` | Restrict the trace to kernels whose name contains the text. | all |
 | `VGPU_SASS_TRACE_BLOCK=<x>` | Trace block `(x,0,0)` instead of block `(0,0,0)`. | `0` |
+| `VGPU_SASS_TRACE_RAW=1` | Add each traced instruction's 128 bits (high word first) to the trace, for finding where a field is encoded. | off |
 
 The code reads further `VGPU_*` variables that plumb the simulator's own parts
 together (NVSHMEM and NCCL rendezvous, the NVRTC and nvJitLink libraries, state

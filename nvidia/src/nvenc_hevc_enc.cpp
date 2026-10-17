@@ -1208,7 +1208,8 @@ struct HevcEncoder::Impl {
       const bool aB2 = pb_avail(xCb, yCb, nCbS, xPb, yPb, nW, nH, partIdx, xB2, yB2);
       if (aB2 && (!aA1 || !same_motion(mot_at(xA1, yA1), mot_at(xB2, yB2))) && (!aB1 || !same_motion(mot_at(xB1, yB1), mot_at(xB2, yB2)))) out[n++] = mot_at(xB2, yB2);
     }
-    const int maxc = sl.max_merge;
+    constexpr int kMaxCands = 6;   // the callers' candidate arrays hold six (HEVC allows five)
+    const int maxc = std::clamp(sl.max_merge, 0, kMaxCands);
     if (n > maxc) n = maxc;
     // combined bi-predictive candidates (B slices)
     if (sl.type == 0 && n > 1 && n < maxc) {
@@ -1231,7 +1232,7 @@ struct HevcEncoder::Impl {
     }
     // zero candidates
     const int num_ref_idx = sl.type == 1 ? sl.nref[0] : std::min(sl.nref[0], sl.nref[1]);
-    for (int zero = 0; n < maxc; ++zero) {
+    for (int zero = 0; n < maxc && n < kMaxCands; ++zero) {
       Mot m;
       const int r = zero < num_ref_idx ? zero : 0;
       m.ref[0] = static_cast<int8_t>(r);

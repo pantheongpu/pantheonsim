@@ -343,6 +343,54 @@ static void orderings() {
         "no generator", 0);
 }
 
+// A host generator (curandCreateGeneratorHost) writes to host memory and draws what a device generator of the
+// same type, seed and offset draws: CUDA Samples' MersenneTwisterGP11213 makes the same numbers both ways and
+// compares them. The device's output pointer would be a host pointer here, which cudaMemcpy cannot write to.
+static void host_generators() {
+  const size_t n = 1000;
+  const curandRngType_t types[] = {CURAND_RNG_PSEUDO_MTGP32, CURAND_RNG_PSEUDO_XORWOW, CURAND_RNG_PSEUDO_PHILOX4_32_10};
+  for (curandRngType_t type : types) {
+    curandGenerator_t dev, host;
+    CK(curandCreateGenerator(&dev, type));
+    CK(curandCreateGeneratorHost(&host, type));
+    CK(curandSetPseudoRandomGeneratorSeed(dev, 777));
+    CK(curandSetPseudoRandomGeneratorSeed(host, 777));
+    float* d_f = nullptr;
+    cudaMalloc(&d_f, n * sizeof(float));
+    std::vector<float> from_dev(n, -1.0f), from_host(n, -1.0f);
+    CK(curandGenerateUniform(dev, d_f, n));
+    cudaMemcpy(from_dev.data(), d_f, n * sizeof(float), cudaMemcpyDeviceToHost);
+    CK(curandGenerateUniform(host, from_host.data(), n));
+    bool in_range = true;
+    for (float v : from_host) in_range = in_range && v > 0.0f && v <= 1.0f;
+    check(in_range, "a host generator's uniforms are written to the host array, in (0, 1]", type);
+    check(std::memcmp(from_dev.data(), from_host.data(), n * sizeof(float)) == 0,
+          "and are the device generator's with the same seed", type);
+
+    // The integers and the normals take the same path; a second call carries on, as a device generator does.
+    std::vector<unsigned> ints(n, 0);
+    CK(curandGenerate(host, ints.data(), n));
+    size_t nonzero = 0;
+    for (unsigned v : ints) nonzero += v != 0;
+    check(nonzero > n * 9 / 10, "host integers are drawn", type);
+    std::vector<float> normals(n, 1e30f), logn(n, 1e30f);
+    CK(curandGenerateNormal(host, normals.data(), n, 0.0f, 1.0f));
+    CK(curandGenerateLogNormal(host, logn.data(), n, 0.0f, 1.0f));
+    double mean = 0;
+    bool finite = true, positive = true;
+    for (size_t i = 0; i < n; ++i) {
+      mean += normals[i];
+      finite = finite && std::isfinite(normals[i]) && std::isfinite(logn[i]);
+      positive = positive && logn[i] > 0.0f;
+    }
+    check(finite && std::fabs(mean / n) < 0.2, "host normals are drawn, with mean near 0", mean / n);
+    check(positive, "host log-normals are written, and positive", type);
+    cudaFree(d_f);
+    curandDestroyGenerator(dev);
+    curandDestroyGenerator(host);
+  }
+}
+
 int main() {
   curandGenerator_t g;
   if (curandCreateGenerator(&g, CURAND_RNG_PSEUDO_DEFAULT)) {
@@ -356,6 +404,7 @@ int main() {
   directions();
   sobol();
   orderings();
+  host_generators();
   std::printf(failures ? "FAIL: %d cuRAND checks\n" : "PASS: every cuRAND check\n", failures);
   return failures ? 1 : 0;
 }

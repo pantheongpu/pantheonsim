@@ -97,8 +97,8 @@ VTEST(an_add_and_a_subtract_thread_a_carry_through_the_pair) {
   for (int i = 0; i < kN; ++i) {
     // Half the lanes carry out of the low half and half do not, so a carry
     // that reached the wrong lane would change the answer.
-    a[i] = (uint64_t{i} << 32) | (i % 2 ? 0xFFFFFFF0ull : 0x10ull);
-    b[i] = (uint64_t{i * 3} << 32) | 0x20ull;
+    a[i] = (uint64_t{static_cast<uint64_t>(i)} << 32) | (i % 2 ? 0xFFFFFFF0ull : 0x10ull);
+    b[i] = (uint64_t{static_cast<uint64_t>(i * 3)} << 32) | 0x20ull;
   }
   const uint64_t pa = upload(mem, a), pb = upload(mem, b), pout = mem.alloc(kN * 8);
   run(o, "u64_addsub", mem, {pa, pb, pout, static_cast<uint64_t>(kN)});
@@ -138,8 +138,8 @@ VTEST(comparing_two_64_bit_values_is_one_instruction_over_the_pair) {
   for (int i = 0; i < kN; ++i) {
     // The halves disagree on purpose: a comparison that only looked at one of
     // them would answer some of these the other way round.
-    a[i] = (uint64_t{i % 8} << 32) | static_cast<uint64_t>(63 - i);
-    b[i] = (uint64_t{i / 8} << 32) | static_cast<uint64_t>(i);
+    a[i] = (uint64_t{static_cast<uint64_t>(i % 8)} << 32) | static_cast<uint64_t>(63 - i);
+    b[i] = (uint64_t{static_cast<uint64_t>(i / 8)} << 32) | static_cast<uint64_t>(i);
   }
   const uint64_t pa = upload(mem, a), pb = upload(mem, b), pout = mem.alloc(kN * 4);
   run(o, "u64_cmp", mem, {pa, pb, pout, static_cast<uint64_t>(kN)});
