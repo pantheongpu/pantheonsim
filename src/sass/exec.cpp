@@ -114,6 +114,13 @@ struct Warp {
   uint32_t spins = 0;
   bool give_way = false;
   uint32_t spin_yields = 0;   // YIELDs in a row with no other lane group able to run
+  // YIELDs since the warp last wrote memory (a store, or an atomic that changed a word), with several lane groups
+  // taking turns or not: a warp whose groups all spin on words only another warp's lanes can change is not
+  // making progress either, and spin_yields alone never sees it.
+  uint32_t idle_yields = 0;
+  // The group that last gave way (a YIELD, or a backward branch taken often enough while other lanes waited) and
+  // where it stands now: the next group to run is the one after it in address order, wrapping round.
+  uint64_t yield_pc = 0;
   Mask slice = 0;             // the group let in by a YIELD: it runs until its own next YIELD or until it blocks
   uint32_t b2r = 0;                   // the last block barrier reduction's result (B2R.RESULT)
   bool b2r_pred = false;
@@ -893,6 +900,7 @@ void Runner::mem_read(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, v
 }
 
 void Runner::mem_write(Block& blk, Warp& w, unsigned lane, Space s, uint64_t a, const void* in, uint32_t n) {
+  w.idle_yields = 0;   // a store is progress (an atomic that changed nothing puts the count back)
   switch (s) {
     case Space::Shared: {
       uint32_t off;
@@ -1221,7 +1229,7 @@ void Runner::run_block(Block& blk) {
       live = true;
       if (tier_) turn<true>(blk, w, 4096, progress);
       else turn<false>(blk, w, 4096, progress);
-      if (!w.yield) w.spin_yields = 0;
+      if (!w.yield) w.spin_yields = w.idle_yields = 0;
       w.yield = false;
     }
     if (!live) return;
@@ -1266,7 +1274,7 @@ void Runner::run_cluster(uint64_t k, unsigned worker) {
         live = true;
         if (tier_) turn<true>(blk, w, 4096, progress);
         else turn<false>(blk, w, 4096, progress);
-        if (!w.yield) w.spin_yields = 0;
+        if (!w.yield) w.spin_yields = w.idle_yields = 0;
         w.yield = false;
       }
     if (!live) break;
@@ -1300,13 +1308,16 @@ bool compute_straight(const Instr& ins);   // see annotate_instr
 // stall: letting the outer region's lanes go too runs them on past a barrier the spinners still count them
 // in, and the barriers then wait for each other.
 bool Runner::break_spin_wait(const std::vector<Block*>& blocks) {
+  constexpr uint32_t kIdleYields = 64;   // two turns of every lane group of a warp, and then some
   Warp* best = nullptr;
   unsigned bar = 0;
   uint64_t stamp = 0;
   for (Block* blk : blocks)
     for (Warp& w : blk->warps) {
       if (!(w.alive & ~w.exited)) continue;
-      if (w.runnable() && w.spin_yields < 2) return false;   // a warp still doing something other than spinning
+      // A warp still doing something other than spinning: its one lane group has not yielded twice in a row, and
+      // several groups taking turns have not yielded kIdleYields times without a write between them.
+      if (w.runnable() && w.spin_yields < 2 && w.idle_yields < kIdleYields) return false;
       for (unsigned l = 0; l < 32; ++l) {
         if (!((w.waiting >> l) & 1) || w.wait_kind[l] != Wait::BSync) continue;
         const unsigned x = static_cast<unsigned>(w.wait_arg[l]) & 15;
@@ -1327,6 +1338,8 @@ bool Runner::break_spin_wait(const std::vector<Block*>& blocks) {
     w.pc[l] += 16;
   }
   w.spin_yields = 0;
+  for (Block* blk : blocks)
+    for (Warp& o : blk->warps) o.idle_yields = 0;   // the released lanes get their turn before the stall is called again
   return true;
 }
 
@@ -1401,15 +1414,20 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   }
   if (w.give_way) {
     w.give_way = false;
-    // The group that yielded is the one at the lowest address, so the group to let in is the next one up
-    // from there. Measured from the lowest-numbered lane's address instead, a lane that had won a spin
-    // lock and branched past the loop was the "current" group, nothing lay above it, and the lanes still
-    // spinning below it ran for ever.
-    uint64_t next = ~uint64_t{0};
+    // The group to let in is the next one up from the group that gave way, wrapping round to the lowest address:
+    // every group spinning here gets its turn. (Measured from the lowest address instead, a lane that had won a
+    // spin lock and branched past the loop was the "current" group, nothing lay above it, and the lanes still
+    // spinning below it ran for ever. Measured from the lowest address in every case, as this first did, a
+    // group that was let in and yielded in turn was followed by itself again: with two groups spinning, a
+    // third that held the lock they wait for never ran.)
+    uint64_t next = ~uint64_t{0}, lowest = ~uint64_t{0};
     for (Mask m = run; m; m &= m - 1) {
       const uint64_t p = w.pc[std::countr_zero(m)];
-      if (p > lo) next = std::min(next, p);
+      if (p == w.yield_pc) continue;   // the group that gave way
+      lowest = std::min(lowest, p);
+      if (p > w.yield_pc) next = std::min(next, p);
     }
+    if (next == ~uint64_t{0}) next = lowest;
     if (next == ~uint64_t{0}) {
       // Nothing else can run. A group that yields over and over like this is spinning on something only
       // the lanes parked at a BSYNC can supply (a lane that won a spin lock stands at the BSYNC closing

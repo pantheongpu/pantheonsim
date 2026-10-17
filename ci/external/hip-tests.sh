@@ -19,6 +19,13 @@
 # otherwise load a second runtime and crash.
 #
 # HT_TIMEOUT (180 s per case), HT_JOBS (2 parallel compiles: each wants GBs).
+#
+# Slow suites: WarpTest and coopGrpTest are not hung, they are sweeps of ~10,000 launches
+# per case (hours on the simulator). HT_SLOW_SUITES="WarpTest coopGrpTest" runs the named
+# suites with HT_SLOW_TIMEOUT (18000 s = 5 h) per case instead of HT_TIMEOUT, runs their
+# baseline `timeout` cases too (they are not skipped-slow), and reports a case that still
+# does not finish as SLOW (listed in slow.txt and the summary), not as a failure. A case that
+# finishes is judged as any other. Other suites keep HT_TIMEOUT, where a timeout is a failure.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cmd="${1:?fetch|build|run}"; dir="${2:?dir}"; shift 2
@@ -63,32 +70,36 @@ run)
   base="$here/hip-tests/baseline-${gpu//\//-}.tsv"
   disabled="$here/hip-tests/disabled-$arch.txt"
   [[ -f $base ]] || { echo "no baseline $base"; exit 2; }
-  mkdir -p "$report/logs"; : > "$report/results.tsv"; : > "$report/new.txt"
+  mkdir -p "$report/logs"; : > "$report/results.tsv"; : > "$report/new.txt"; : > "$report/slow.txt"
   new=0
   for suite in "$@"; do
     exe=$(find "$b/catch_tests" -name "$suite" -type f -executable | head -1)
     if [[ -z $exe ]]; then echo "NEW  $suite: not built" | tee -a "$report/new.txt"; new=$((new + 1)); continue; fi
     d=$(dirname "$exe"); t0=$SECONDS; counts=""
+    limit=${HT_TIMEOUT:-180}; slow_suite=0
+    for s in ${HT_SLOW_SUITES:-}; do [[ $s == "$suite" ]] && { slow_suite=1; limit=${HT_SLOW_TIMEOUT:-18000}; }; done
     while IFS= read -r t; do
       [[ -n $t ]] || continue
       if grep -qxF -- "$t" "$disabled"; then st=disabled
-      elif awk -F'\t' -v t="$t" '$1 == t && $2 == "timeout" {f=1} END {exit !f}' "$base"; then st=skipped-slow
+      elif (( ! slow_suite )) && awk -F'\t' -v t="$t" '$1 == t && $2 == "timeout" {f=1} END {exit !f}' "$base"; then st=skipped-slow
       else
         spec=$(sed -e 's/\\/\\\\/g; s/,/\\,/g; s/\[/\\[/g; s/\]/\\]/g' <<<"$t")
         log="$report/logs/$suite.$(md5sum <<<"$t" | cut -c1-10).log"
         (cd "$d" && LD_LIBRARY_PATH="$shim" VGPU_GPU="$gpu" VGPU_DEVICE_COUNT=2 VGPU_VRAM_MB=4096 \
-           timeout -k 5 "${HT_TIMEOUT:-180}" ./"$suite" "$spec" > "$log" 2>&1 < /dev/null)
+           timeout -k 5 "$limit" ./"$suite" "$spec" > "$log" 2>&1 < /dev/null)
         rc=$?
         if [[ $rc == 0 ]]; then
           if grep -qE "No tests ran|test cases: +0" "$log"; then st=skip
           elif grep -qiE "^HIP_SKIP|skipped" "$log" && ! grep -q "assertions:.*passed" "$log"; then st=skip
           else st=pass; fi
-        elif [[ $rc == 124 || $rc == 137 ]]; then st=timeout
+        elif [[ $rc == 124 || $rc == 137 ]]; then
+          if (( slow_suite )); then st=slow; else st=timeout; fi
         elif grep -qE "test cases:.*failed" "$log"; then st=fail
         else st="crash($rc)"; fi
         known=$(awk -F'\t' -v t="$t" '$1 == t {print $2}' "$base")
         case $st in
           pass|skip) [[ -n $known ]] && echo "now passes (baseline: $known): $suite $t" ;;
+          slow) echo "SLOW (no result in ${limit} s): $suite $t" | tee -a "$report/slow.txt" ;;
           *) if [[ -z $known ]]; then
                new=$((new + 1))
                echo "NEW  $st: $suite $t" | tee -a "$report/new.txt"
@@ -102,8 +113,9 @@ run)
     echo "$suite on $gpu, $((SECONDS - t0)) s:$counts"
   done
   {
-    echo "### hip-tests on $gpu ($arch): $new new failures"
+    echo "### hip-tests on $gpu ($arch): $new new failures, $(wc -l < "$report/slow.txt") slow"
     echo
+    [[ -s $report/slow.txt ]] && { echo 'SLOW (a slow suite case that did not finish in its limit; not a failure):'; echo '```'; cat "$report/slow.txt"; echo '```'; echo; }
     [[ -s $report/new.txt ]] && { echo '```'; cat "$report/new.txt"; echo '```'; echo; }
     echo "Cases by result (skipped-slow: a baseline timeout, not run):"
     echo '```'

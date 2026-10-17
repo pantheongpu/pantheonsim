@@ -833,6 +833,7 @@ template <bool Store>
 static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
   const TCtx& c = *static_cast<const TCtx*>(vc);
   Warp& w = *c.w;
+  if constexpr (Store) w.idle_yields = 0;   // a store is progress (Runner::mem_write, Warp::idle_yields)
   Block& blk = *c.blk;
   const unsigned ra = op.s[0].off;
   const uint32_t* blo = ra != kRZ ? c.R + ra * 32u : nullptr;
@@ -876,6 +877,7 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
 // address, a misaligned or faulting access, an armed fault) is exec_mem's own, which has not been started.
 template <bool Store>
 static void h_global(void* vc, const tier::MOp& op, Mask ex) {
+  if constexpr (Store) static_cast<const TCtx*>(vc)->w->idle_yields = 0;   // a store is progress (Runner::mem_write)
   if (op.a > 8) {
     tier_global16<Store>(vc, op, ex);
     return;
@@ -997,6 +999,7 @@ template <bool Store>
 static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
   const TCtx& c = *static_cast<const TCtx*>(vc);
   Warp& w = *c.w;
+  if constexpr (Store) w.idle_yields = 0;   // a store is progress (Runner::mem_write)
   Block& blk = *c.blk;
   const unsigned bytes = op.a, stride = op.c;
   const unsigned ra = op.s[0].off;
@@ -1614,6 +1617,7 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
         if (++w.spins >= 64) {
           w.spins = 0;
           w.give_way = true;
+          w.yield_pc = target;   // the group that branched back, at the top of its loop (exec_control's BRA)
         }
       }
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::BRA)].fetch_add(1, std::memory_order_relaxed);
@@ -1652,6 +1656,8 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
       w.slice = 0;
       w.give_way = true;
       w.yield = true;
+      ++w.idle_yields;
+      w.yield_pc = here + 16;   // where the lanes that yielded stand once the YIELD is done (exec_control's YIELD)
       tier_set_pcs(w, group, here + 16);
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::YIELD)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Exit && w.waiting == 0 && [&] {
