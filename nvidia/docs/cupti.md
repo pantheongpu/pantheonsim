@@ -68,14 +68,25 @@ compute_120 only, so its kernels run on `nvidia/rtx5090`
 ([pytorch.md](pytorch.md)); on older profiles they do not.
 
 `torch.profiler` (Kineto) works. `nvidia/tests/pytorch/profiler_check.py` runs
-a small workload (random matrices, a product, a reduction, pinned and pageable
-copies) under the profiler and prints the names of the kernels, copies, fills
-and runtime calls it collected, so a run against NVIDIA's libcupti and a run
-against this one can be compared line by line. It was run both ways on an RTX
-3060 (torch 2.10 with CUDA 13): the kernel, copy and runtime-call name sets are
-the same except for what is listed below, and the result of the workload
-differs in its last float digit (NVIDIA's product sums in another order).
-It needs PyTorch, so it is not part of CI.
+a small workload (random matrices, a product, a reduction, a fill, pinned and
+pageable copies, a copy within the device) under the profiler and compares the
+names of the kernels, copies (with their memory kinds), fills, runtime and
+driver calls and ranges it collected with the lists NVIDIA's libcupti gave on
+an RTX 3060 (torch 2.10 with CUDA 13), committed as
+`nvidia/tests/data/pytorch_profiler.card.txt`. Names only: times are time spent
+simulating, ids and addresses differ by run. It is the ctest
+`e2e_pytorch_profiler` (through `nvidia/tests/e2e/run_pytorch.sh`, so it
+skips where no Python with PyTorch for CUDA 13 is installed), which runs with
+the other PyTorch tests in the ml job. The workload's result must also match
+the CPU's on the same inputs to 1e-4 (PyTorch's random numbers depend on the
+GPU, so not the card's number).
+
+The one difference the check allows is the cuBLAS kernel (below); the script
+lists it, with the reason, in `LIBRARY_ONLY`, and no copy, fill or runtime call
+of the workload came from inside a library on the card. On a real GPU,
+`profiler_check.py --card` runs the same check against NVIDIA's libcupti,
+`--print` prints the collected names, and `--write <file>` regenerates the
+committed lists (do that, on a card, when a PyTorch upgrade renames a kernel).
 
 What Kineto needed, found by tracing the calls it makes:
 
@@ -123,24 +134,86 @@ profiler asked of this library.
 
 ## Nsight Systems
 
-Does not collect CUDA data, and cannot yet.
+Does not collect CUDA data, and cannot without an undocumented CUPTI function
+and without an interface of NVIDIA's that is not specified. This is what was
+found, by watching what `nsys` loads and calls (`strace`, `LD_DEBUG`, this
+library's own `VGPU_TRACE=1` log) and by reading its documentation; nothing
+was learned from its code.
 
-`nsys` runs the program correctly, and its injection library loads and
-initializes through the same path nvprof uses -- but it does not use this
-library at all. It ships its own CUPTI and loads it by absolute path from its
-own install directory, and that copy reaches the driver through
-`cuGetExportTable`, NVIDIA's undocumented internal interface. Its own error
-strings say so: "Failed to get cuGetExportTable".
+`nsys` (measured with 2025.3.1, which bundles CUPTI 12.9, and 2026.5.1, which
+bundles 13.4) runs the program correctly. It sets, for the program:
+`CUDA_INJECTION64_PATH=<install>/target-linux-x64/libToolsInjection64.so`,
+`LD_PRELOAD` of its two proxy libraries, and a handful of `NSYS_*` variables.
+CUDA initialization loads that injection library through the path described
+above, and it opens its own CUPTI, `<install>/target-linux-x64/libcupti.so.12.9`,
+by absolute path, so the `libcupti` on `LD_LIBRARY_PATH` is not consulted. With
+nothing done about that, the injection library reaches the driver itself:
+`cuGetExportTable` is asked for seven tables (UUIDs `41ae717d...`,
+`1ece18f5...`, `21318c60...`, `b10541e1...`, `d7bd8af8...`, `fe605bbf...`,
+`8c13a01b...`), and the report holds OS runtime data and no CUDA trace.
 
-So an `nsys` report from a program running here contains OS runtime traces --
-`pthread_create`, file I/O -- and no CUDA trace data. The blocker is not
-anything in the public API; it is a set of version-specific tables of function
-pointers with no specification, which `TODO.md` has long listed as deferred for
-being brittle. Nothing about the CUPTI here changes that, and implementing the
-Activity API cannot route around it.
+What can be done legitimately is to present this library at that path in a
+private mount namespace, leaving NVIDIA's file untouched
+(`unshare -m`, `mount --bind libcupti.so.13 .../libcupti.so.12.9`; the same
+mechanism `vgpu shell` uses for its overlays). That loads, and shows what the
+injection library wants of a CUPTI: it looks up about thirty `cupti*` functions
+by name and fails as a whole when one is missing.
+
+* Two of them were missing here and are plain parts of `cupti_activity.h`:
+  `cuptiSetThreadIdType` / `cuptiGetThreadIdType`, and the `uuid` of the
+  `DEVICE` record, which was all zeros. Both are implemented now, measured on an
+  RTX 3060 and compared by `run_cupti_case.sh nsys`: the default names a thread
+  by `pthread_self()` truncated to 32 bits (as the header documents), `SYSTEM`
+  by `gettid()`, any other value is `CUPTI_ERROR_NOT_SUPPORTED`. Until then the
+  records always carried `gettid()`.
+* One is not in any CUPTI header: **`cuptiActivityEnableRawTimestamps`**. It is
+  exported by NVIDIA's libcupti and absent from the headers of CUDA 12.0, 12.6,
+  12.8, 12.9, 13.0 and 13.2 (the `CUPTI_API_VERSION` 18, 24, 26, 28, 130001 and
+  130200 headers were searched). Without it `InitializeInjection` throws
+  `NotFoundException` and nothing is collected. (The exception is not caught
+  here, so it reaches the program's first CUDA call; on an RTX 3060 an
+  injection library that throws ends the program with `terminate called`, so
+  that is left as the card has it.) What it takes, how
+  many arguments, and what "raw" is to mean for this library's records are not
+  specified anywhere. A stand-in that only logs the registers it is called with
+  sees three calls with different leading values (`0xff`, `0`, `1`); two of the
+  three disappear with the documented nsys option below, which says nothing
+  about the signature. Writing it would be guessing at a private interface, so
+  it is not here.
+
+With a stand-in for that one function (an experiment, not part of this tree),
+the injection library initializes, enables the activity kinds it wants (device,
+context, stream, kernel, memcpy, memset, runtime, driver, synchronization,
+memory, overhead, marker and others), the program passes, and 26 records are
+delivered. The import of the capture then fails on the host side:
+
+* "Throw in function ... ConvertGpuTicksToSyncNs": nsys converts raw GPU
+  timestamps itself. Its release notes document an option for platforms where
+  that is unreliable, `CuptiUseRawGpuTimestamps=false` in the file `nsys -z`
+  prints; with it the error goes away.
+* "Unrecognized GPU UUID: <the record's device uuid>". This stays after the
+  device record carries the right uuid (above), and after the output of the
+  GPU-information helper nsys runs (`CudaGpuInfoDumper`) was replaced in the
+  experiment by the file the real helper wrote on an RTX 3060 for the same UUID.
+  The helper is a separate program with the CUDA runtime linked in statically:
+  on the simulator it writes an empty archive (57 bytes, against 293 for one
+  RTX 3060 on the card), because a static runtime cannot initialize on a
+  simulated driver ([dark-api.md](dark-api.md)). That explains why the host side
+  knows no GPU; the experiment did not get past the error, so how the host
+  decides which devices it knows is not established.
+
+So the position is: loading the injection library and serving it public CUPTI
+works; collecting needs a function NVIDIA has not documented, and then a
+device-identification step that goes through the static runtime this project
+cannot support. Neither can be closed with public headers or with black-box
+measurements of a public interface, and the line drawn for the dark API
+applies: no disassembly of NVIDIA's software, no guessed private interface.
+Re-test when a release documents the function, or when nsys offers an option to
+profile without its own CUPTI.
 
 The practical answer today is nvprof, which collects through the public API
-this does implement.
+this does implement, and any tool that links `libcupti` by soname (PyTorch's
+profiler, above).
 
 ## What is implemented
 
@@ -151,6 +224,8 @@ The Activity API, which is what produces a timeline:
   `cuptiActivityGetNextRecord`, `cuptiActivityGetNumDroppedRecords`
 - `cuptiGetVersion`, `cuptiGetResultString`, `cuptiGetLastError`,
   `cuptiGetTimestamp`, `cuptiFinalize`
+- `cuptiSetThreadIdType` / `cuptiGetThreadIdType`: records name a thread by
+  `pthread_self()` (the default) or `gettid()`; `run_cupti_case.sh nsys`
 - `cuptiActivityPushExternalCorrelationId` / `Pop`
 - `cuptiGetCallbackName`, for the runtime and driver functions whose calls are
   recorded (`cudaMalloc_v3020`, `cuMemAlloc_v2`)
@@ -165,7 +240,7 @@ Records produced:
 | `RUNTIME` | the runtime call (`cbid`, for every function the toolkit's `cupti_runtime_cbid.h` names), process and thread, return value, correlation id |
 | `DRIVER` | the driver call a program made itself (`cbid` from the toolkit's `cupti_driver_cbid.h`), process and thread, return value, correlation id; see below for which calls |
 | `SYNCHRONIZATION` | event, stream-wait-event, stream and context waits, with stream and event ids |
-| `DEVICE` | every device once, when the kind is first flushed: name, compute capability, multiprocessors, memory and limits |
+| `DEVICE` | every device once, when the kind is first flushed: name, uuid, compute capability, multiprocessors, memory and limits |
 | `CONTEXT`, `STREAM` | a context or stream coming into being, while the kind is enabled; a context brings the eight streams the driver makes in it (ids, flags and priorities are an RTX 3060's) |
 | `MARKER`, `MARKER_DATA`, `NAME` | NVTX instants and ranges (start and end paired by id), their colour, category and payload, and named threads: see NVTX below |
 | `MEMORY2` (and `MEMORY`) | an allocation or a release: address, bytes, memory kind, the allocating context and device, the pool when there is one; `MEMORY` (the older kind) lists each allocation once when it is released or at the flush |

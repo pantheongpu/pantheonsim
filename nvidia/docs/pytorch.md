@@ -115,6 +115,9 @@ paths tested here do not call them.
   PyTorch's elementwise kernels use.
 - `e2e_pytorch_models_<gpu>`: `models.py` on one GPU per SASS image (T4,
   A100, RTX 3060, H100, B200, RTX 5090), where PyTorch is installed.
+- `e2e_pytorch_profiler`: `torch.profiler` (Kineto) over the simulator's CUPTI, its
+  kernel, copy, fill and runtime-call names against NVIDIA's libcupti's on a card
+  (`nvidia/docs/cupti.md`).
 - `e2e_pytorch_distributed`: `torch.distributed` across two processes, each its
   own simulated GPU, launched as torchrun launches them
   (`nvidia/tests/pytorch/distributed.py`). The collectives (all-reduce,

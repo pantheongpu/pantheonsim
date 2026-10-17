@@ -2872,7 +2872,7 @@ if(TARGET vgpucupti)
   # allocation and pool records, graphs, modules and streams, and the switches
   # (kinds, functions, callbacks, a clock). Each against what NVIDIA's printed on
   # an RTX 3060 (nvidia/docs/cupti.md).
-  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um compat12 driver_params)
+  foreach(_case params memory graph resource misc overhead filter filter_driver buffers um nsys compat12 driver_params)
     add_test(NAME e2e_cupti_${_case}
              COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh ${_case})
     set_tests_properties(e2e_cupti_${_case} PROPERTIES
@@ -3503,6 +3503,18 @@ if(TARGET vgpucudart)
   set_tests_properties(e2e_pytorch_sass_sm75 PROPERTIES
     DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
+  # torch.profiler (Kineto) over the simulator's CUPTI (nvidia/tests/pytorch/profiler_check.py):
+  # the kernel, copy, fill, runtime-call and range names it collects for a small program equal
+  # NVIDIA's libcupti's on an RTX 3060 (nvidia/tests/data/pytorch_profiler.card.txt), bar the
+  # cuBLAS kernel, which the script lists as an allowed difference. 8 checks.
+  add_test(NAME e2e_pytorch_profiler COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch.sh
+           ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/profiler_check.py 8 nvidia/rtx5090)
+  set_tests_properties(e2e_pytorch_profiler PROPERTIES
+    DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas;vgpucupti"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_E2E_DATA=${CMAKE_SOURCE_DIR}/nvidia/tests/data"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     RUN_SERIAL TRUE
     TIMEOUT 1800)
