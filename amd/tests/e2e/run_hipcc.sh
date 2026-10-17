@@ -351,6 +351,28 @@ echo "$out" | sed 's/^/      /'
 expect "the atomics program runs to the end" "0" "$status"
 expect "every one of its atomic checks holds" "0 failed" "$(grep -o '[0-9]* failed$' <<< "$out")"
 
+# Work-groups that wait on one another (hipcc/lockstep.cpp): a grid barrier made of atomics, a chain of flags run from the
+# last group to the first, a producer in the last group, locks taken by groups that all start together (exactly one wins
+# them all) and a chain across a grid larger than the device holds. A card keeps a grid that fits resident, so all of these
+# work there; the simulator runs the groups of a kernel with a polling loop together, taking turns (README: "Blocks that
+# wait on one another"). With the old behaviour (VGPU_LOCKSTEP=0, one thread) the locks fail, so the test would not
+# pass whatever the run did. Each wait is bounded, so a failure is a count, not a hang.
+for gpu_prog in "amd/mi300x lockstep.gfx942" "amd/mi455x lockstep.gfx1250"; do
+  read -r gpu prog <<< "$gpu_prog"
+  for threads in "" 1; do
+    out=$(env VGPU_QUIET=1 VGPU_GPU=$gpu LD_LIBRARY_PATH="$shim" ${threads:+VGPU_THREADS=$threads} timeout 300 \
+          "$(dirname "$exe")/$prog" 2>&1)
+    expect "$prog on $gpu${threads:+ with $threads thread}: every wait is satisfied" "PASS" "$(grep -x 'PASS\|FAIL' <<< "$out")"
+  done
+  out=$(VGPU_QUIET=1 VGPU_GPU=$gpu LD_LIBRARY_PATH="$shim" VGPU_LOCKSTEP=0 VGPU_THREADS=1 timeout 300 "$(dirname "$exe")/$prog" locks 2>&1)
+  expect "$prog on $gpu: with one group after another the locks fail" "FAIL" "$(grep -x 'PASS\|FAIL' <<< "$out")"
+  log=$(mktemp)
+  VGPU_QUIET=1 VGPU_GPU=$gpu LD_LIBRARY_PATH="$shim" VGPU_LOCKSTEP_LOG="$log" timeout 300 "$(dirname "$exe")/$prog" >/dev/null 2>&1
+  expect "$prog on $gpu: the barrier, chain, queue, lock and forward kernels are all found to poll" "5" \
+    "$(grep -o 'lockstep: kernel [^,]*' "$log" | sort -u | wc -l)"
+  rm -f "$log"
+done
+
 # The MI455X (gfx1250, CDNA 5; wave32): the same self-checking programs built for it by ROCm 7.2's hipcc and run on a
 # simulated one. Its compiler output reaches memory with a scalar base and a scaled offset register, takes the wave's
 # number from IB_STS2, finds globals and functions by 64-bit PC-relative relocations, and issues dual-issue pairs of

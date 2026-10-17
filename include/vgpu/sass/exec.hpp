@@ -89,6 +89,11 @@ struct Module {
   std::vector<uint64_t> allocations;          // freed on unload
   std::map<uint64_t, std::string> builtins;   // magic address -> vprintf, malloc, ...
   bool device_launches = false;               // it can launch kernels (dynamic parallelism)
+  // Whether a kernel has a loop that polls global memory, so that its resident blocks may wait on one
+  // another and a launch runs them together (vgpu/exec/lockstep.hpp). Found the first time a kernel
+  // launches, from its code and the functions it calls.
+  mutable std::mutex polling_mu;
+  mutable std::map<std::string, bool> polling;
 
   // The section holding a code address, or null for an address in no section (before the first, past the last, or
   // in the padding between two). load() places the sections in ascending order, never overlapping, each on a 256-byte
