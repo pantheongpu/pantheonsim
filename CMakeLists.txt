@@ -1610,6 +1610,13 @@ target_link_libraries(vector_add_driver PRIVATE vgpucuda)
 target_include_directories(vector_add_driver PRIVATE include)
 add_test(NAME c_harness_vector_add COMMAND vector_add_driver)
 set_tests_properties(c_harness_vector_add PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
+# The JIT linker taking libcudadevrt.a (CU_JIT_INPUT_LIBRARY), as LuisaCompute's CUDA backend links it,
+# and a kernel that launches a kernel running after the link.
+add_executable(link_devrt nvidia/tests/c_harness/link_devrt.c)
+target_include_directories(link_devrt PRIVATE nvidia/include)
+target_link_libraries(link_devrt PRIVATE vgpucuda)
+add_test(NAME c_harness_link_devrt COMMAND link_devrt)
+set_tests_properties(c_harness_link_devrt PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/h100")
 
 # The register C API for bring-up software (vgpu_regs.h), and a plain C
 # program against it.

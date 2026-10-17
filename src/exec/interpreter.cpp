@@ -8189,6 +8189,10 @@ class Interpreter {
       exec_tex(w, ctx, ins, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpTxq>(&ins.op)) {
+      exec_txq(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpSuld>(&ins.op)) {
       exec_suld(w, ctx, ins, *op, m);
       return;
@@ -8809,6 +8813,45 @@ class Interpreter {
     }
     for (uint32_t ch = 0; ch < 4 && ch < op.dsts.size(); ++ch)
       write_reg(w, op.dsts[ch], m, out[ch], 32);
+  }
+
+  // txq: the size of a texture object, or of its mipmap level `lod`, as an RTX 3060 answers (measured, every
+  // array and resource kind, levels 0 to 5, 255 and 2^32-1):
+  //   - a level at or past the texture's count, or any level above 0 of one that has no mipmaps, is 0 0 0;
+  //   - width and height halve per level, down to 1; a 3D texture's depth halves too;
+  //   - a 1D texture is (width, 0, 0) from linear memory and (width, 1, 0) from a CUDA array;
+  //   - a layered 1D texture puts its layers in the height: (width, layers, 0); a layered 2D texture and a layered
+  //     cubemap have the layer count (cubemaps, not faces) as depth, and every level has all the layers;
+  //   - a plain 2D texture or a cubemap has depth 0.
+  static uint32_t txq_size(const TextureDesc& d, TxqQuery q, uint32_t level) {
+    const uint32_t levels = d.mip_levels ? d.mip_levels : 1u;
+    if (level >= levels) return 0;
+    auto halve = [&](uint32_t v) { return std::max<uint32_t>(1u, v >> std::min<uint32_t>(level, 31u)); };
+    switch (q) {
+      case TxqQuery::Width: return halve(d.width);
+      case TxqQuery::Height:
+        if (d.height) return halve(d.height);
+        if (d.layers) return d.layers;
+        return d.from_array ? 1u : 0u;
+      case TxqQuery::Depth:
+        if (d.layers && d.height) return d.layers;
+        if (d.layers || d.cubemap) return 0;
+        return d.depth ? halve(d.depth) : 0u;
+    }
+    return 0;
+  }
+
+  void exec_txq(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpTxq& op, Mask m) {
+    Lanes _s_obj, _s_lod;
+    const Lanes& obj = read_operand(w, ctx, ins, op.obj, _s_obj);
+    const Lanes* lod = op.level ? &read_operand(w, ctx, ins, op.lod, _s_lod) : nullptr;
+    Lanes out{};
+    for (uint32_t lane = 0; lane < W_; ++lane) {
+      if (!(m & (Mask{1} << lane))) continue;
+      const TextureDesc& d = texture_for(ins, static_cast<int>(lane), obj[lane], TexKind::Texture);
+      out[lane] = txq_size(d, op.query, lod ? static_cast<uint32_t>((*lod)[lane]) : 0u);
+    }
+    write_reg(w, op.dst, m, out, 32);
   }
 
   std::optional<uint64_t> surface_address(const Instr& ins, uint32_t lane, const TextureDesc& d,
