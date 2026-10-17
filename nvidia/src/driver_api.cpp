@@ -14,6 +14,7 @@
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1756,6 +1757,52 @@ std::string merge_ptx(const std::vector<std::string>& inputs) {
   return out;
 }
 
+// Whether `data` is libcudadevrt.a: an `ar` archive (the 8-byte "!<arch>\n" magic, then members of a
+// 60-byte header and an even-padded body) whose members are all the toolkit's cuda_device_runtime
+// object. The member names come from the archive's long-name table ("//") or sit in the header
+// itself, so both are read.
+bool is_device_runtime_archive(const void* data, size_t size) {
+  static const char kMagic[] = "!<arch>\n";
+  const char* p = static_cast<const char*>(data);
+  if (size < 8 || std::memcmp(p, kMagic, 8) != 0) return false;
+  std::string longnames;
+  std::vector<std::string> names;
+  size_t at = 8;
+  while (at + 60 <= size) {
+    const char* h = p + at;
+    if (h[58] != '`' || h[59] != '\n') return false;
+    char field[17] = {};
+    std::memcpy(field, h, 16);
+    std::string name(field);
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+    char len[11] = {};
+    std::memcpy(len, h + 48, 10);
+    const size_t body = static_cast<size_t>(std::strtoull(len, nullptr, 10));
+    at += 60;
+    if (body > size - at) return false;
+    if (name == "/") {
+      // The symbol table: not a member.
+    } else if (name == "//") {
+      longnames.assign(p + at, body);
+    } else if (name.size() > 1 && name[0] == '/' && std::isdigit(static_cast<unsigned char>(name[1]))) {
+      const size_t off = static_cast<size_t>(std::strtoull(name.c_str() + 1, nullptr, 10));
+      if (off >= longnames.size()) return false;
+      const size_t end = longnames.find('\n', off);
+      std::string n = longnames.substr(off, end == std::string::npos ? std::string::npos : end - off);
+      if (!n.empty() && n.back() == '/') n.pop_back();
+      names.push_back(n);
+    } else {
+      if (!name.empty() && name.back() == '/') name.pop_back();
+      names.push_back(name);
+    }
+    at += body + (body & 1);
+  }
+  if (names.empty()) return false;
+  for (const std::string& n : names)
+    if (n.rfind("cuda_device_runtime", 0) != 0) return false;
+  return true;
+}
+
 // Accepts one input into a link state. PTX is taken as-is, a fatbin has its PTX
 // pulled out, and a bare cubin is refused with the same message the module
 // loader gives -- there is no SASS decoder behind this.
@@ -1770,6 +1817,19 @@ void link_add(LinkState& st, int type, const void* data, size_t size, const char
     return;
   }
   const char* text = static_cast<const char*>(data);
+  // CU_JIT_INPUT_LIBRARY (4): an `ar` archive of device code. The only one with a meaning here is
+  // libcudadevrt.a, the device runtime a kernel launching kernels (dynamic parallelism) links, and the
+  // simulator implements that runtime itself (vgpu/exec/devrt.hpp: cudaGetParameterBufferV2,
+  // cudaLaunchDeviceV2 and the rest of cuda_device_runtime_api.h resolve by name when a kernel calls
+  // them), so linking it adds nothing to the module. Any other archive holds code that would be linked
+  // in, and there is no SASS to link it into, so it is refused rather than dropped.
+  if (type == 4 /* CU_JIT_INPUT_LIBRARY */) {
+    if (!is_device_runtime_archive(data, size))
+      throw vgpu::Error::make(vgpu::Err::Unsupported, "cuLinkAddData: library '", what,
+                              "' is not the CUDA device runtime (libcudadevrt.a), the only library "
+                              "VirtualGPU links: it implements the device runtime itself and links PTX");
+    return;
+  }
   if (text[0] == 0x7f)
     throw vgpu::Error::make(vgpu::Err::Unsupported, "cuLinkAddData: input '", what,
                             "' is a cubin/ELF image; VirtualGPU links PTX (CU_JIT_INPUT_PTX or a "
