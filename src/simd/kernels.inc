@@ -1368,15 +1368,21 @@ void hfma2_bf_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint3
     // Four words are eight halves, in memory order: word w's low half then its high half.
     alignas(32) double f[8];
     for (int part = 0; part < 2; ++part) {
-      const auto wide = [&](const uint32_t* p) {
+      // Written through a pointer: returning a 32-byte vector by value from a function compiled without AVX
+      // changes the ABI (GCC's -Wpsabi, an error under -Werror).
+      const auto wide = [&](const uint32_t* p, double* out) {
         V8h h;
         std::memcpy(&h, p + i, sizeof h);
         const V8u u = __builtin_convertvector(h, V8u) << 16;
         V4u q;
         std::memcpy(&q, reinterpret_cast<const char*>(&u) + 16 * part, sizeof q);
-        return __builtin_convertvector(reinterpret_cast<V4f>(q), V4d);
+        const V4d v = __builtin_convertvector(reinterpret_cast<V4f>(q), V4d);
+        std::memcpy(out, &v, sizeof v);
       };
-      const V4d x = wide(a), y = wide(b), z = wide(c);
+      alignas(32) double x[4], y[4], z[4];
+      wide(a, x);
+      wide(b, y);
+      wide(c, z);
       for (int k = 0; k < 4; ++k) f[4 * part + k] = fma_round_odd(x[k], y[k], z[k]);
     }
     // Rounded once, from the double (a float in between rounded twice; an RTX 3060 rounds once).
