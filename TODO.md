@@ -2278,7 +2278,7 @@ with what `nvidia/src` defines):
   and vGPU management, GPM and units are absent, and `nvidia-smi` has no `-pm`, `-pl` or `-c`. Deliberately
   not done: an in-process-only setter would make `nvidia-smi -pm 1` look successful while the next process
   shows no change, so persistence across processes needs a design decision first.
-- **PTX**: `multimem` (needs the multicast fabric, which the driver refuses), `sured`, `txq`, `ldu`.
+- **PTX**: `multimem` (needs the multicast fabric, which the driver refuses), `sured`, `ldu`, and the `txq` queries other than width, height and depth (a kernel using one for a texture object does not launch on an RTX 3060).
 
 AMD:
 

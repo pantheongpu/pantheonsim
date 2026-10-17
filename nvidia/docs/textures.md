@@ -45,7 +45,7 @@ timing.
 
 | | |
 | --- | --- |
-| Instructions | `tex.{1d,2d,3d,a1d,a2d,cube,acube}` with `.level`, an offset vector, a depth reference, a destination predicate, and `.v4.f16` / `.v2.f16x2` results; `tld4.{r,g,b,a}.{2d,a2d,cube,acube}` with the same operands; `suld.b`/`sust.b` in `.1d`/`.2d`/`.3d`/`.a1d`/`.a2d`; `sust.p` (formatted) in `.1d`/`.2d`/`.3d` |
+| Instructions | `tex.{1d,2d,3d,a1d,a2d,cube,acube}` with `.level`, an offset vector, a depth reference, a destination predicate, and `.v4.f16` / `.v2.f16x2` results; `tld4.{r,g,b,a}.{2d,a2d,cube,acube}` with the same operands; `suld.b`/`sust.b` in `.1d`/`.2d`/`.3d`/`.a1d`/`.a2d`, scalar (`suld.b.2d.b32 %r1, [...]`) or `.v2`/`.v4`; `sust.p` (formatted) in `.1d`/`.2d`/`.3d`; `txq.{width,height,depth}` and `txq.level.*` on texture objects |
 | Backing memory | linear (`cudaResourceTypeLinear`), pitched 2D, `cudaArray` (1D/2D/3D, layered, cubemap, layered cubemap), mipmapped arrays |
 | Filtering | point and linear, within and between mip levels |
 | Addressing | clamp, wrap, mirror, border (any colour) |
@@ -53,6 +53,15 @@ timing.
 | Channels | 1–4, signed / unsigned / float, any width the format gives |
 | Read mode | `cudaReadModeElementType`, `cudaReadModeNormalizedFloat` |
 | Runtime API | `cudaCreateTextureObject`, `cudaCreateSurfaceObject`, their destroys, `cudaMallocArray`, `cudaMalloc3DArray`, `cudaFreeArray`, `cudaArrayGetInfo`, `cudaMallocMipmappedArray`, `cudaGetMipmappedArrayLevel`, `cudaFreeMipmappedArray`, `cudaMemcpy2DToArray`, `cudaMemcpy2DFromArray`, `cudaMemcpy3D`/`Async`, `cudaGetChannelDesc`, `cudaCreateChannelDesc` |
+
+`txq` answers the size of a texture object, and of each of its mipmap levels, as an RTX 3060 does (measured for every
+array and resource kind, levels 0 to 5, 255 and 2^32-1): sizes halve per level down to 1, a level past the last (any
+level above 0 of an unmipmapped texture) is `0 0 0`, 1D linear memory is `(w, 0, 0)` and a 1D array `(w, 1, 0)`, a
+layered 1D texture has its layer count as the height, and a layered 2D texture or layered cubemap has it as the depth.
+The other queries (`channel_data_type`, `channel_order`, `normalized_coords`, `array_size`, `num_mipmap_levels`,
+`filter_mode`, `addr_mode_*`) assemble but a kernel using one for a texture object does not launch on the card
+(`CUDA_ERROR_NOT_FOUND`), so they are refused by name rather than given an answer. They are checked by
+`txq_answers_the_size_of_a_texture_and_of_each_mipmap_level_as_a_card_does` in `tests/unit/test_exec3.cpp`.
 
 Two details worth naming because getting them wrong is invisible:
 
