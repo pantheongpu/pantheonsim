@@ -58,6 +58,11 @@
 
 namespace {
 
+// How many work-groups of `k` the device holds at once (defined with the occupancy arithmetic below);
+// 0 when that cannot be worked out.
+uint64_t resident_groups_of(const vgpu::DeviceProfile& p, const vgpu::amd::Kernel& k, uint32_t threads, size_t lds);
+
+
 using vgpu::amd::CodeObject;
 using vgpu::amd::Kernel;
 
@@ -929,6 +934,7 @@ hipError_t run_launch(const LaunchJob& job) {
     dispatch.code_base = module.code_base;
     dispatch.decoded = module.decoded.get();
     dispatch.cooperative = cooperative;
+    dispatch.resident_groups = resident_groups_of(d.profile(), kernel, block.x * block.y * block.z, shared);
     dispatch.grid_sync = grid_sync;
     dispatch.peers = job.peers;
     {
@@ -3472,6 +3478,15 @@ hipError_t occupancy(const vgpu::DeviceProfile& p, const Kernel& k, int block, s
   out->best_block = std::min(alu_threads, static_cast<int>(align_up(block, wave)));
   out->grid_blocks = static_cast<int>(p.limits.multiprocessors) * std::min(alu_threads / out->best_block, lds_groups);
   return hipSuccess;
+}
+
+uint64_t resident_groups_of(const vgpu::DeviceProfile& p, const Kernel& k, uint32_t threads, size_t lds) {
+  Occupancy o;
+  // (occupancy() reports an architecture it has no figures for as an error of the program's, which this is not.)
+  const bool known = p.gcn_arch.rfind("gfx9", 0) == 0 || p.gcn_arch.rfind("gfx11", 0) == 0 ||
+                     p.gcn_arch.rfind("gfx12", 0) == 0 || p.gcn_arch.rfind("gfx103", 0) == 0;
+  if (!known || !threads || occupancy(p, k, static_cast<int>(threads), lds, false, &o) != hipSuccess || o.blocks_per_cu <= 0) return 0;
+  return uint64_t(o.blocks_per_cu) * p.limits.multiprocessors;
 }
 
 // The kernel a hipcc-built program's host function stands for, on the current
