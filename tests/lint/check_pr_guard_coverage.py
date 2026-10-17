@@ -37,6 +37,9 @@ EXEMPT = {
         "its `if:` runs it on schedule and workflow_dispatch only, never on a pull request",
     ("action.yml", "container"):
         "runs in the bare ubuntu:24.04 image, which has neither gh nor curl, so the guard could not ask the API",
+    ("ci-setup-script.yml", "ci-setup"):
+        "runs in the bare ubuntu:24.04 image, as another CI system would, with neither gh nor curl; and only "
+        "when scripts/ci-setup.sh or the workflow itself changes",
 }
 
 SHARED = re.compile(r"BURST_RUNS_ON|CONTAINER_RUNS_ON|ML_RUNS_ON|SIM_RUNS_ON|pantheonsim-burst|self-hosted")
