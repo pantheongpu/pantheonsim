@@ -25,8 +25,9 @@ jobs:
   find:
     name: find the toolchain images
     # With the burst pool (BURST_RUNS_ON, ci.yml) it runs there too: every other job
-    # of a run waits for this one, so in GitHub's queue it holds the whole run up.
-    runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
+    # of a run waits for this one, so in GitHub's queue it holds the whole run up. It needs
+    # only docker, so it takes CONTAINER_RUNS_ON's pool first, as the container jobs do.
+    runs-on: ${{ fromJSON(vars.CONTAINER_RUNS_ON || vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}
     timeout-minutes: 10
     outputs:
       cuda12_0: ${{ steps.find.outputs.cuda12_0 }}

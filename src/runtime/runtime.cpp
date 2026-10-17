@@ -1047,6 +1047,8 @@ Device::Device(DeviceProfile profile, int ordinal, telemetry::Publisher* telemet
   // AMD's HIP allocates device memory by the 4 KB page (MemoryManager::
   // set_page_size says what that lets a kernel read).
   if (profile_.vendor == "amd") mem_.set_page_size(4096);
+  // cudaMalloc's pointers are as aligned as a texture asks (cudaDeviceProp::textureAlignment, 512 bytes).
+  if (profile_.vendor == "nvidia") mem_.set_alloc_alignment(512);
   if (telemetry_) {
     int ord = physical_;
     telemetry::Publisher* pub = telemetry_;

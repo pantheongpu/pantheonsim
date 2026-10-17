@@ -54,6 +54,8 @@ struct CubinSection {
 struct CubinSymbol {
   std::string name;
   std::string section;          // the section it lives in ("" when undefined)
+  size_t section_idx = static_cast<size_t>(-1);   // its place in Cubin::sections: names repeat (a device
+                                                   // function nvlink cloned per kernel keeps one name)
   uint64_t value = 0;           // offset within that section
   uint64_t size = 0;
   bool function = false;

@@ -1613,6 +1613,61 @@ streamcluster): output identical but for timing lines. SASS rows are within
 noise (wmma/mma_ptx read -3% in some runs and +3% in others with no SASS code
 changed: the build is layout-sensitive to a few percent either way).
 
+**2026-10-15, round 9 (the PTX interpreter's micro-ops and call path, VGPU_SASS=0; r9-ptxops).** Profiled first with perf (cpu-clock, addresses
+mapped through `nm`) over the bench workloads, the HeCBench reduced set (the 22 programs that finished in a minute) and the Rodinia set, and with a throwaway counter of the instructions
+that ran on the general path (by mnemonic, per program; not kept). What was left there, by share of all instructions averaged over the programs:
+loads and stores (about 15%, the memory layer's), f64 arithmetic (4%), `bra` of a diverged warp, `ret`, f16 arithmetic, the math functions
+(`div.approx`, `ex2.approx`, `rcp`, `sqrt`), `shfl`/`vote`, `popc`, `bar.sync`, float-to-integer `cvt`, the halves of a 64-bit register
+(`mov.b64 {lo, hi}`, in every f64 library routine), and `setp.f64` against a constant. New pre-decoded forms (`MicroOp`, tests in
+`tests/unit/test_fastpath.cpp`, each against the general path under both guards): `popc.b32`/`clz.b32`; `add`/`sub`/`mad.lo` with the carry bit
+(32-bit); `shfl.sync` (with and without a predicate out) and `vote.sync`; f64 `add`/`sub`/`mul`/`div` and `fma` to nearest (64-bit constants
+through `EntryFn::micro_consts`), `mov` of a 64-bit constant, the two halves of a 64-bit register both ways, f64 `setp` against registers or
+constants; `cvt` of f32/f64 to 32/64-bit integers (all four integer rounding modes), f32 <-> f64 to nearest, and the round-to-integral forms that
+keep the type. A lane with a NaN in both operands of an f64 add/sub/mul/div makes the instruction stay on the general path (the host's choice of
+which NaN comes out depends on the order the compiler gave the operands, which this must not pin); an f64 fma uses the fast path's own vector
+function and, negated, the general path's own expression. `convert()`'s float-to-integer tail is now `float_to_int_bits`, shared by both
+(`float_to_integer_conversions_match_a_reference` checks it against a reference written in the test).
+**Call path** (a kernel with device functions, a struct argument and recursion: 4 blocks x 256 threads; per call the profile had string hashing
+of the slot names 9%, `Slot::read`/`write` 17%, the builtin name tests and `devrt::lookup` of `dispatch`, and `classify()` of every
+instruction executed inside a device function, 11% of HeCBench merkle): slot names are numbered per module at parse time
+(`intern_call_slots`; callers and callees share a module), a warp's slots are a short list of heap nodes that are kept and reused
+(`Warp::SlotMap`) instead of an `unordered_map<string, Slot>`, `st.param`/`ld.param` of a scalar are one move per lane with the width a
+constant, a call is told apart by its callee's name once (`call_kind`, cached in the instruction) rather than by a chain of string
+comparisons at every execution, and a device function's instruction classes are computed once per function. Dropped as not measurably
+faster (1.03x, p=0.06 over 21 alternating runs): switching `dispatch` by `ins.op.index()` instead of testing each alternative in turn.
+Measured on a fresh build of `origin/r8-a` (A) against this branch (B), alternating, user CPU, counters and program output identical in every pair
+(`bench.sh --check-counters` passes; HeCBench/Rodinia output compared without their timing lines; particlefilter seeds from `time()`, so its
+runs were made with `time()` frozen by an `LD_PRELOAD`). The machine was shared (load 10-16), so ratios under about 3% are noise:
+
+| workload (PTX engine) | A | B | B/A (runs, p) |
+| --- | ---: | ---: | ---: |
+| bench int_alu (popc) | 47.6 M winst/s | 60.6 M | 1.27x (11, 0.013) |
+| bench f64_fma | 37.8 M | 48.8 M | 1.29x (11, 0.001) |
+| bench warp (shfl, vote) | 25.9 M | 43.9 M | 1.69x (11, <0.001) |
+| other 13 bench workloads, SASS rows | | | within noise (f32_fma, divergent: 25 runs, 0.93-1.06x, p>0.19) |
+| device-function kernel (calls) | 3.37 s | 1.72 s | 1.97x (15, <0.001) |
+| 128-bit arithmetic kernel (add.cc/addc) | 1.09 s | 0.67 s | 1.63x (15, <0.001) |
+| HeCBench lebesgue (f64) | 2.99 s | 2.48 s | 1.20x (9, 0.003) |
+| HeCBench lombscargle (cvt) | 7.14 s | 6.56 s | 1.09x (9, 0.005) |
+| Rodinia particlefilter (f64, halves of a double) | 6.86 s | 4.11 s | 1.67x (9, <0.001) |
+| Rodinia backprop / hotspot | 0.49 / 0.57 s | 0.41 / 0.48 s | 1.20x / 1.18x (9, <0.001; which change is not isolated) |
+| Rodinia lud, gaussian, sc_gpu, srad; HeCBench mandelbrot, mask, matern, md, mergeVS, logprob | | | within noise |
+
+Correction after CI (sync_masks, HeCBench bscan): the first version decoded `shfl.sync` and `vote.sync` whatever their member mask, but step() treats
+a *register* mask specially (lanes naming different masks run the instruction once per mask, a lane its own mask leaves out traps, and a
+warp on several paths waits for the lanes the mask names); only a constant mask is ignored by the hardware. They are now decoded only with a
+constant mask and only run from a warp on one path; `pre_decoded_shfl_and_vote_follow_register_member_masks_like_the_general_path` and
+`..._in_a_diverged_warp_...` cover it, with a mutation check for each half.
+Mutation check: 24 deliberate faults in the new handlers (popc/clz, carry and borrow, shuffle modes, vote, f64 operations, the constant table,
+conversion rounding and NaN, pack/unpack, slot lanes, call classes) each fail at least one test (VGPU_MUT in a throwaway build). Two
+disagreements between paths that are older than this round, found by the new tests and not changed here: an f64 `fma` with two signalling
+NaNs among its operands returns one NaN on the fast path (the vector instruction) and the other on the general path, and `cvt.rzi/rmi/rpi.f64.f64`
+of a signalling NaN leaves it signalling in both engines where an RTX 3060 sets the quiet bit (34 conversion forms over 4096 inputs each run on
+the card: 31 hashes equal to the simulator's, these three differ). Not done: `bar.sync` in batches (an arrival decides which warp runs next, so a batch that
+took it would have to show the same order of warps; not attempted), `match`, f16 arithmetic (one program), f64 min/max (the general path's `fmin` with
+two NaNs), `selp.f64`/`abs.f64`, the math functions (`ex2`, `rcp`, `div.approx`: bit patterns of their own), and loads and stores, which are
+the largest share left and the memory layer's. The new conversions and arithmetic are equal to the general path, so what they rest on a card
+for is what the general path rests on; nothing here was derived from hardware.
 **2026-10-15: the PTX wmma tile writes a canonical NaN.** The f32-accumulator tile
 (`wmma_tile`, behind `fast_wmma_mma` and `exec_wmma_mma`) used to leave whatever NaN the
 host's vector add or multiply returned for two NaN operands -- the first source
@@ -1629,8 +1684,11 @@ sums its rows as it writes them and goes over a tile again only when that sum is
 a NaN, so a tile without one pays one add per vector. The sanitizer skip and the
 `_nonan` twin lines in simd_lane_forms are gone: its pinned hashes are the same in
 Release 13.0 and 12.0 and in the CI ThreadSanitizer Debug configuration.
-`wgmma`, `tcgen05` and the `m8n8k4` form of `mma` still add f32 products in scalar
-code and are not covered by this.
+`wgmma`, `tcgen05` and the `m8n8k4` form of `mma` added f32 products in scalar
+code and were not covered by this: **round 9 (2026-10-15)** found the same compiler-order
+dependence there with a Debug TSan `-O1` / Release pair (wgmma's D[0][0] was 0x7fc02000 in Release and
+0xffc00000 under TSan, tcgen05's the other way round) and made all three write 0x7fffffff;
+see nvidia/docs/sass.md, "Numerics checked against an RTX 3060".
 **2026-10-13/15, round 8 (the SASS engine's operations, r8-sass).** The forms the general path still took -- 64-bit address arithmetic with
 carries, float forms with .FTZ/.SAT/a rounding mode, half-precision forms, MUFU, conversions, FMNMX, DSETP, PRMT, SHFL/VOTE, scattered, broadcast
 and 16-byte global accesses, atomics -- run over 32 lanes with SIMD kernels or batch memory calls; main vs this branch (SASS, 9 alternating runs):
@@ -1782,9 +1840,11 @@ scripts/run-pantheon-workloads.sh.
    only from NVIDIA's internal headers or by disassembling their runtime.
    Neither is available to a clean-room project, so this stays where it is.
    Now has two more consumers. Nsight Systems collects through its own bundled
-   CUPTI, loaded by absolute path from its install directory, and that copy
-   reaches the driver the same way -- so `nsys` produces a report with OS
-   runtime traces and no CUDA data. nvprof works, because its path goes through
+   CUPTI, loaded by absolute path from its install directory. Presenting the
+   shim's libcupti at that path (a private mount) loads, and exposes an
+   undocumented CUPTI function the injection library requires, then a host-side
+   failure to recognize the GPU (findings in nvidia/docs/cupti.md) -- so `nsys`
+   produces a report with OS runtime traces and no CUDA data. nvprof works, because its path goes through
    the public CUPTI this does implement. See nvidia/docs/cupti.md. CuPy is the other:
    it links the runtime statically and dies in the same place, at
    `getDeviceCount()`, before it compiles anything.
@@ -2258,6 +2318,65 @@ not work for the simulator:
   (`tiny causal transformer ... key biases left out of the update`, a full-tier check, passes). No tolerance was
   loosened. The entry can only go if the check changes what it tests.
 
+### CUDA Samples known differences
+
+The nightly's `cuda-samples` job (ci/external/suites.sh, ci/external/cuda-samples.txt) compares each of
+NVIDIA's CUDA Samples v13.0 with what an RTX 3060 printed. `ci/external/cuda-samples-known.txt` lists the
+programs that still differ, each with a class and a reason. It is a ratchet: a listed program that still
+differs is reported, one that starts matching fails the job until it is taken off, and any other difference
+fails as before. What was found on 2026-10-15 (run 38576253348 listed 18 differences; the others of
+the 133 matched):
+
+Fixed in the simulator, each with a test that fails without the fix:
+
+- `cudaCompressibleMemory`: `CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED` answered 0, where an RTX 3060,
+  L4, L40S and RTX PRO 6000 answer 1 and hand out memory whose properties say it is compressed, so the sample
+  waived itself (exit 2). `e2e_vmm`.
+- `MersenneTwisterGP11213`: `curandCreateGeneratorHost` copied its numbers to the caller's host array as if
+  it were device memory, so the reference was zeros (`L1 norm: INF`). `e2e_rand_paths`.
+- `convolutionFFT2D`: cudaMalloc pointers were 256-byte aligned and a texture over one needs 512
+  (`cudaCreateTextureObject` refused the second test's buffer). `e2e_malloc_alignment`.
+- `quasirandomGenerator` and its NVRTC twin: the SASS decoder read the byte select of `R2P` (`R2P PR, R5.B1`,
+  `.B2`, `.B3`, which ptxas makes of an unrolled shift-and-test loop) from the wrong bits from Ampere on, so
+  every group of tests after the first repeated the first group's. `e2e_constant_table_xor`.
+- `conjugateGradientCudaGraphs`: a cuBLAS call captured into a graph replayed in the handle's pointer mode at the
+  replay, not the one it was made in; the sample sets host mode for one `cublasSaxpy(&alpha)` and device mode
+  after it, so the host alpha was fetched as a device pointer, read as zero, and the loop diverged (residual up
+  by about 1025 an iteration, 10000 iterations, a timeout). `e2e_graph_cg_capture` compares the captured
+  conjugate-gradient loop with the call-by-call one, scalar by scalar.
+
+Fixed in the suite: `cuSolverDn_LinearSolver`, `cuSolverSp_LowlevelCholesky` and `cuSolverSp_LowlevelQR`
+had a `|` in their markers, which split the list's line; and the nine cuSPARSE and cuSOLVER C++ samples did
+not link where `libnvJitLink.so.13` is not installed (see `build()` in suites.sh).
+
+Still different, each listed in `cuda-samples-known.txt`:
+
+- `UnifiedMemoryPerf` (simulator gap): every launch runs to completion inside the launch call (ARCHITECTURE: the
+  engine is synchronous), so a kernel that waits for the host to do something after launching it never ends,
+  and the step budget stops it (`a warp ran 1073741824 instructions`, then `cudaErrorLaunchTimeout`).
+  Reproducer:
+  `__global__ void spin(volatile unsigned* f) { while (*f < 1); }  int main() { unsigned* f; cudaMallocHost(&f, 4); *f = 0; cudaStream_t s; cudaStreamCreate(&s); spin<<<1,1,0,s>>>(f); *f = 1; cudaStreamSynchronize(s); }`
+  finishes on a card and hangs here. The fix is kernels that run beside the host thread (a worker per stream, with
+  events and `cudaStreamWaitEvent` ordering them): `nvidia/src/runtime_api.cpp` (the launch entry points) and
+  `src/runtime/runtime.cpp`. Large, and every eager-error and capture path assumes the synchronous engine.
+- `simpleCUFFT_callback` (cannot match): the sample links `libcufft_static.a`, which carries NVIDIA's own CUDA
+  runtime; that asks the driver for its internal export table (`cuGetExportTable`), which a simulated driver
+  does not have, and `cufftMakePlan1d` returns `CUFFT_INTERNAL_ERROR`. The simulator's cuFFT shim has legacy
+  callbacks of its own (`e2e_fft_legacy_callbacks`), for programs that link the shared library.
+- `quasirandomGenerator` and `quasirandomGenerator_nvrtc`: with the decoder fixed the simulated GPU's numbers
+  agree with the CPU's to an L1 norm of 7.3e-12, where the card printed 9.439909E-08. The sample's CPU reference
+  is built by the sample's own host code from a table it generates, and the card's norm is that of a table built by
+  another compiler. The first norm printed is a property of the host build as much as of the GPU. Not proven here:
+  nothing but the card could say which build the 9.4e-8 came from.
+- `graphMemoryFootprint` and `simpleAttributes` (too slow): the first launches a 16.7M-thread kernel sixteen times,
+  each thread spinning on `clock()` for 8900 clocks (the simulator's `clock()` is its instruction count); it did not
+  finish in 3000 s. The second launches 65535 x 1024 threads that each loop about 700 times on a shared counter.
+  Neither is run (class `skipped`), where simpleAttributes used to burn the nightly's 600 s timeout every night.
+
+Also found, not in the list: on the hosted toolchain image `convolutionFFT2D` matches the card but its SASS and PTX
+engines leave different bytes after `spPostprocess2D_kernel` (launch 5; the digest in `external-smoke.yml`),
+which has not been looked into.
+
 ### Tooling, CI and process
 
 - Trace record/replay and a conformance database with compatibility scores: not started.
@@ -2283,3 +2402,23 @@ its roadmap (:278-285); docs/telemetry.md:454-456 and `src/cli/serve.cpp:8` ("AM
 implemented"); README.md:60 on Nsight; the header comment of `src/exec/interpreter.cpp` (barriers in
 divergent code, IPDOM); `vgpu counters`' spill note (`src/cli/main.cpp:103-114`, left as a comment in this
 file's "Registers and counters" because it is output text, not documentation).
+
+
+**2026-10-16 (r9-correct3): PTX NaN operand order.** r9-verify's probe found the PTX engine picking the second operand of a two-NaN f64 add/mul
+where the card picks the first, because r9-correct2 applied the SASS rule (Rb's NaN first) to PTX text, whose operands ptxas reorders by
+definition order. `mark_nan_order` (src/ptx/contract.cpp) now records that order per instruction; the probe's 1944 double results and 49
+driver-loaded PTX forms equal the card; see docs/performance.md ("Which NaN the PTX engine returns"). New e2e `round9_probe`.
+
+**2026-10-15 (round 9, r9-correct): SASS == PTX == card.** The new e2e `float_half_forms` hashes the
+single-instruction f32/f16/f64 forms and mma.sync/wmma/__sad per form against an RTX 3060, and both
+engines now print exactly the card's lines. Found: SASS `.SAT` of -0, `FMNMX` of two NaNs, `MUFU` NaNs
+and TANH subnormals, `PRMT` modes, `HADD2.F32`/`F2FP`/`F2F` NaNs and `.RELU` of -0, double NaN operand
+rules, `VABSDIFF` undecoded (silent PTX fallback); PTX `cvt.rmi.ftz`, f64 min/max/add/mul/fma NaNs,
+wmma tf32 (rounded at load, the card truncates). The tensor core's f32 sum is the chunked truncating
+one described in include/vgpu/exec/tc_ampere.hpp (measured, all 106496 results), for sm_86 only;
+`VGPU_TC_EXACT=0` returns both engines to the sequential sum (r9-correct2; docs/cli.md); cost: a SASS HMMA is about 3.4x slower than the sequential sum (0.047 s to 0.160 s for 96000 mma.sync/
+wmma in tools measured as A/B alternation below), the PTX engine 1.15x. Launch refusals report the
+card's 13.0 codes (cudaErrorInvalidValue, 701, 912). Still different from the card: the SFU
+approximations (rcp/sqrt/rsqrt/ex2 within 1 ulp, lg2/sin/cos/tanh more), the sign and NaN payload of a
+NaN that passes through a folded `neg`/`abs` on the PTX engine, the m8n8k4/sparse tensor forms and
+other architectures' tensor cores, device-side launch errors (cudaErrorInvalidConfiguration kept).

@@ -358,6 +358,9 @@ VTEST(cluster_occupancy_looks_the_function_up_and_checks_its_pointers) {
 // --- deprecated spellings ---------------------------------------------------
 
 #if CUDART_VERSION < 13000
+// What this section calls is deprecated in the toolkit; the tests are that it still answers.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 VTEST(shared_memory_banks_are_four_bytes_wide) {
   cudaSharedMemConfig c = cudaSharedMemBankSizeEightByte;
   VCHECK_EQ(cudaDeviceGetSharedMemConfig(&c), cudaSuccess);
@@ -397,6 +400,7 @@ VTEST(zz_thread_exit_resets_the_device) {
   VCHECK_EQ(cudaThreadExit(), cudaSuccess);
   VCHECK_EQ(cudaFree(p), cudaErrorInvalidValue);   // the allocation went with the reset
 }
+#pragma GCC diagnostic pop
 #endif
 
 }  // namespace

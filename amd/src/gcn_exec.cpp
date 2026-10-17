@@ -2184,7 +2184,7 @@ struct Machine {
       each([&](uint32_t lane) {
         const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane), z = lane_float(w, in.src[2], lane);
         const float lowest = -std::numeric_limits<float>::max();
-        write_float(w, in, lane, (y == lowest || std::isinf(y) && y < 0 || std::isnan(y) || z <= 0.0f || std::isnan(z)) ? lowest : x * y);
+        write_float(w, in, lane, (y == lowest || (std::isinf(y) && y < 0) || std::isnan(y) || z <= 0.0f || std::isnan(z)) ? lowest : x * y);
       });
     } else if (op == "v_pk_add_bf16"_op || op == "v_pk_mul_bf16"_op || op == "v_pk_fma_bf16"_op ||
                op == "v_pk_min_num_bf16"_op || op == "v_pk_max_num_bf16"_op) {
@@ -6138,7 +6138,7 @@ struct Machine {
   // d16, into a register's high half with d16_hi. A store leaves the
   // channels it does not give as they were; outside the buffer a load reads
   // 0 and a store is dropped.
-  void formatted_access(Wave& w, const Inst& in, std::string_view body, image::Format format, uint32_t d3,
+  void formatted_access(Wave& w, const Inst& /*in*/, std::string_view body, image::Format format, uint32_t d3,
                         const Operand& data, uint32_t lane, uint64_t addr, bool inside) {
     const bool storing = body.rfind("store", 0) == 0, d16 = body.find("_d16") != std::string_view::npos;
     const bool hi = body.ends_with("_hi_x");

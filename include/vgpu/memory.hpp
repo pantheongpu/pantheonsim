@@ -110,6 +110,11 @@ class MemoryManager {
   // every access to the bytes allocated.
   void set_page_size(uint64_t bytes) { page_ = bytes; }
 
+  // The alignment cudaMalloc-style allocations start on, kAllocAlign unless set. NVIDIA's runtime promises a
+  // pointer from cudaMalloc binds to a texture with no offset (cudaDeviceProp::textureAlignment, 512 bytes), and
+  // programs rely on it: convolutionFFT2D makes a texture over each buffer it allocates. `bytes` is a power of two.
+  void set_alloc_alignment(uint64_t bytes) { alloc_align_ = bytes; }
+
   // Frees an allocation. `ptr` must be the exact base returned by alloc().
   void free(uint64_t ptr);
 
@@ -303,9 +308,13 @@ class MemoryManager {
   // Returns a handle; handles are never 0 and are never reused.
   // `shareable_types` is the handle types the memory was asked to be exportable as (CUmemAllocationHandleType
   // bits); only the POSIX file descriptor (1) can be exported.
-  uint64_t create_handle(uint64_t size, int shareable_types = 0);
+  // `compressible` is the request for generic memory compression (cuMemCreate's compressionType). The bytes
+  // read and write the same either way; the handle only remembers that it was granted, which a program reads
+  // back from cuMemGetAllocationPropertiesFromHandle.
+  uint64_t create_handle(uint64_t size, int shareable_types = 0, bool compressible = false);
   uint64_t handle_size(uint64_t handle) const;
   int handle_types(uint64_t handle) const;
+  bool handle_compressible(uint64_t handle) const;
   // A file descriptor another process can map to reach a handle's memory (cuMemExportToShareableHandle):
   // the memory moves into an anonymous file the first time, and every descriptor made from it
   // (a dup) names that file. Throws InvalidValue for a handle not made shareable.
@@ -526,6 +535,7 @@ class MemoryManager {
   uint64_t used_ = 0;
   uint64_t next_va_;
   uint64_t page_ = 0;   // set_page_size
+  uint64_t alloc_align_ = kAllocAlign;   // set_alloc_alignment
   void notify_usage() const {
     if (usage_observer_) usage_observer_(used_);
   }
@@ -545,11 +555,13 @@ class MemoryManager {
     uint32_t refs = 1;      // cuMemCreate's own reference, plus every retain
     uint32_t mapped = 0;    // mappings pointing at it
     int types = 0;          // the handle types it can be exported as
+    bool compressible = false;   // created with generic compression
     int fd = -1;            // the anonymous file holding it once exported or imported (owned)
     Allocation mem;
     Handle() = default;
     Handle(Handle&& o) noexcept
-        : size(o.size), refs(o.refs), mapped(o.mapped), types(o.types), fd(o.fd), mem(std::move(o.mem)) {
+        : size(o.size), refs(o.refs), mapped(o.mapped), types(o.types), compressible(o.compressible), fd(o.fd),
+          mem(std::move(o.mem)) {
       o.fd = -1;
     }
     ~Handle() {

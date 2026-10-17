@@ -135,7 +135,7 @@ struct KernelInfo {
   bool load_told = false;             // a profiler has been told what loading this kernel cost
   // What the program has set with cudaFuncSetAttribute, per device (func_attrs.hpp): a second device starts
   // from the defaults, as on the card.
-  std::map<int, vgpu_funcattr::State> attrs;
+  std::map<int, vgpu_funcattr::State> attrs{};
   // The function this kernel resolved to on each of the first few devices, and what it was resolved
   // against (resolved_function below). Finding it is a search of the module's entries by name.
   struct Resolved {
@@ -143,7 +143,7 @@ struct KernelInfo {
     uint64_t unload_epoch = 0;
     const vgpu::ptx::EntryFn* fn = nullptr;
   };
-  Resolved resolved[4];
+  Resolved resolved[4]{};
 };
 
 // A __device__ or __constant__ variable. The host handle nvcc passes to
@@ -570,13 +570,16 @@ cudaError_t set_error(State& s, const vgpu::Error& e, const char* api) {
     // "unspecified launch failure" is the closest real code, and it is at least
     // true that the launch did not produce a result anyone should use.
     case Err::DataRace: code = cudaErrorLaunchFailure; break;
-    // Too many threads per block, a block or grid dimension past the device's
-    // limit, or a zero-sized one. CUDA's name for that is "invalid configuration
-    // argument"; it used to fall through to cudaErrorInvalidValue, which is not
-    // what anyone searching for that message would find. (The driver API's
-    // cuLaunchKernel reports CUDA_ERROR_INVALID_VALUE for the same launch, and
-    // keeps doing so in driver_api.cpp.)
-    case Err::LaunchConfig: code = cudaErrorInvalidConfiguration; break;
+    // A launch the device cannot run. An RTX 3060's CUDA 13.0 runtime answers cudaErrorInvalidValue for a block of too many threads
+    // or a dimension past the limit (1025 x 1, 1 x 1025, z of 65, 2048 as 32x32x2), a zero dimension of the grid or the block, a
+    // grid dimension past the limit (x of 2^31, y or z of 65536), dynamic shared memory past what the kernel may ask for (also
+    // together with its static memory), and a block past __launch_bounds__ -- not cudaErrorInvalidConfiguration (9), which this
+    // used to answer, and which the runtime keeps for a launch with no configuration. A block whose registers do not fit the
+    // multiprocessor is cudaErrorLaunchOutOfResources (701), and any cluster launch on a part without clusters
+    // cudaErrorInvalidClusterSize (912). The driver API's codes are the same (driver_api.cpp).
+    case Err::LaunchConfig: code = cudaErrorInvalidValue; break;
+    case Err::LaunchResources: code = cudaErrorLaunchOutOfResources; break;
+    case Err::LaunchCluster: code = static_cast<cudaError_t>(912); break;   // cudaErrorInvalidClusterSize
     default: code = cudaErrorInvalidValue; break;
   }
   if (!quiet()) std::fprintf(stderr, "[vgpu] %s: %s\n", api, e.what());
@@ -1522,7 +1525,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
       ev.end_ns = vgpu::profiling::host_ns();
       ev.correlation = vgpu::profiling::work_correlation();
       ev.process_id = static_cast<uint32_t>(::getpid());
-      ev.thread_id = static_cast<uint32_t>(::syscall(SYS_gettid));
+      ev.thread_id = vgpu::profiling::thread_id();
       vgpu::profiling::record(std::move(ev));
     }
 
@@ -1690,7 +1693,12 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     }
     return cudaSuccess;
   });
-  if (rc != cudaSuccess) g_async_error = rc;  // see g_async_error
+  // (A launch the device refuses for its configuration -- a block or grid past the limits, a zero dimension, too much shared memory, registers that
+  // do not fit, a cluster the part cannot have -- is reported by the launch and by cudaGetLastError and by nothing after: an RTX 3060's
+  // cudaDeviceSynchronize after each of those answers cudaSuccess, so they are not kept for the synchronize to report.)
+  if (rc != cudaSuccess && rc != cudaErrorInvalidValue && rc != cudaErrorLaunchOutOfResources && rc != cudaErrorInvalidConfiguration &&
+      rc != static_cast<cudaError_t>(912))
+    g_async_error = rc;  // see g_async_error
   return rc;
 }
 
@@ -1734,7 +1742,7 @@ VGPU_EXPORT cudaError_t cudaLaunchCooperativeKernel(const void* func, dim3 gridD
 // name with different types a conflict, which is exactly the check that caught
 // this.
 #if CUDART_VERSION < 13000
-static cudaError_t cudaLaunchCooperativeKernelMultiDevice_traced(struct cudaLaunchParams* p0, unsigned int p1, unsigned int p2) {
+static cudaError_t cudaLaunchCooperativeKernelMultiDevice_traced(struct cudaLaunchParams* /*p0*/, unsigned int /*p1*/, unsigned int /*p2*/) {
   return cudaErrorNotSupported;
 }
 
@@ -1777,7 +1785,7 @@ VGPU_EXPORT cudaError_t cudaSetDevice(int device) {
 }
 
 static cudaError_t cudaGetDevice_body(int* device) {
-  return guard_query("cudaGetDevice", [&](State& s) {
+  return guard_query("cudaGetDevice", [&](State&) {
     if (!device) return cudaErrorInvalidValue;
     *device = t_current_device;
     return cudaSuccess;
@@ -1852,7 +1860,7 @@ VGPU_EXPORT cudaError_t cudaInitDevice(int device, unsigned int deviceFlags, uns
   return traced_call("cudaInitDevice", cudaInitDevice_traced, device, deviceFlags, flags);
 }
 
-static cudaError_t cudaSetDeviceFlags_traced(unsigned int p0) { return cudaSuccess; }
+static cudaError_t cudaSetDeviceFlags_traced(unsigned int /*p0*/) { return cudaSuccess; }
 
 VGPU_EXPORT cudaError_t cudaSetDeviceFlags(unsigned int p0) {
   return traced_call("cudaSetDeviceFlags", cudaSetDeviceFlags_traced, p0);
@@ -2332,7 +2340,7 @@ static cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor_traced(int* num
 VGPU_EXPORT cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks, const void* func, int blockSize, size_t dynamicSMemSize) {
   return traced_call("cudaOccupancyMaxActiveBlocksPerMultiprocessor", cudaOccupancyMaxActiveBlocksPerMultiprocessor_traced, numBlocks, func, blockSize, dynamicSMemSize);
 }
-static cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_traced(int* n, const void* f, int bs, size_t dyn, unsigned int p4) {
+static cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_traced(int* n, const void* f, int bs, size_t dyn, unsigned int /*p4*/) {
   return cudaOccupancyMaxActiveBlocksPerMultiprocessor(n, f, bs, dyn);
 }
 
@@ -4443,7 +4451,7 @@ VGPU_EXPORT cudaError_t cudaDeviceGetByPCIBusId(int* device, const char* pciBusI
 
 // Callbacks run immediately: the stream they are attached to has no work left
 // outstanding by the time this is reached.
-static cudaError_t cudaStreamAddCallback_traced(cudaStream_t stream, cudaStreamCallback_t cb, void* user, unsigned int p3) {
+static cudaError_t cudaStreamAddCallback_traced(cudaStream_t stream, cudaStreamCallback_t cb, void* user, unsigned int /*p3*/) {
   if (const cudaError_t dead = dead_context()) return dead;
   // Not supported under stream capture, as documented -- cudaLaunchHostFunc is
   // the one that is -- so a capturing stream refuses it and the capture fails.
@@ -5908,7 +5916,7 @@ VGPU_EXPORT cudaError_t cudaMemAdvise(const void* p, size_t n, cudaMemoryAdvise 
   return traced_call("cudaMemAdvise", cudaMemAdvise_traced, p, n, kind, loc);
 }
 #else
-static cudaError_t cudaMemPrefetchAsync_traced(const void* p, size_t n, int device, cudaStream_t p3) {
+static cudaError_t cudaMemPrefetchAsync_traced(const void* p, size_t n, int device, cudaStream_t /*p3*/) {
   return guard("cudaMemPrefetchAsync", [&](State& s) { return prefetch(s, p, n, device); });
 }
 
@@ -6028,6 +6036,8 @@ static cudaError_t cudaLaunchKernelExC_traced(const cudaLaunchConfig_t* cfg, con
       cluster[0] = a.val.clusterDim.x;
       cluster[1] = a.val.clusterDim.y;
       cluster[2] = a.val.clusterDim.z;
+      // A cluster dimension of 0 is no cluster shape at all: cudaErrorInvalidClusterSize (an RTX 3060, for {0, 1, 1}).
+      if (!cluster[0] || !cluster[1] || !cluster[2]) return static_cast<cudaError_t>(912);
     }
     // A cooperative launch is what cudaLaunchCooperativeKernel does, asked for
     // through the attribute list instead, and it is not inert: its blocks are
@@ -7048,7 +7058,7 @@ std::unordered_map<uint64_t, CondHandle> g_cond_handles;
 // Handles are numbers to a kernel. An RTX 3060 numbers them from 1 in each
 // graph and tells graphs apart by the launch; here they are unique in the
 // process, so the number alone says whose it is. Zero is never one.
-uint64_t g_next_cond_handle = 1;
+[[maybe_unused]] uint64_t g_next_cond_handle = 1;   // used from CUDA 12.3 (cudaGraphConditionalHandleCreate)
 
 // `g` and every graph inside it: child graphs and conditional bodies.
 void graph_tree(const GraphRec& g, std::set<const GraphRec*>* out) {
@@ -10077,7 +10087,7 @@ VGPU_EXPORT cudaError_t cudaGraphExecEventWaitNodeSetEvent(cudaGraphExec_t exec,
 // A graph instantiated for device launch is the exception: what a kernel's
 // cudaGraphLaunch runs is the graph as it was last uploaded, so this keeps a
 // copy of it (see g_device_graphs).
-static cudaError_t cudaGraphUpload_traced(cudaGraphExec_t exec, cudaStream_t p1) {
+static cudaError_t cudaGraphUpload_traced(cudaGraphExec_t exec, cudaStream_t /*p1*/) {
   std::lock_guard<std::mutex> lock(g_graph_mu);
   const auto it = g_graph_execs.find(static_cast<void*>(exec));
   if (it == g_graph_execs.end()) return cudaErrorInvalidValue;
@@ -11024,7 +11034,7 @@ extern "C" __attribute__((visibility("default"))) int vgpu_graph_node_ids_v1(voi
 
 // The graph as a DOT drawing: one node per node, one edge per dependency. It
 // used to print an empty graph, which is a picture of nothing.
-static cudaError_t cudaGraphDebugDotPrint_traced(cudaGraph_t graph, const char* path, unsigned int p2) {
+static cudaError_t cudaGraphDebugDotPrint_traced(cudaGraph_t graph, const char* path, unsigned int /*p2*/) {
   if (!path) return cudaErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_graph_mu);
   GraphRec* g = graph_from(graph);

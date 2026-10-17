@@ -9,7 +9,7 @@ the checkout of such a job: it cancels the run when the PR conflicts. A new
 heavy job added without it would spend runner time on a conflicting PR again.
 
 A job needs the guard when its workflow has `pull_request` among its triggers
-and the job runs on a shared runner (BURST_RUNS_ON, ML_RUNS_ON, SIM_RUNS_ON,
+and the job runs on a shared runner (BURST_RUNS_ON, CONTAINER_RUNS_ON, ML_RUNS_ON, SIM_RUNS_ON,
 pantheonsim-burst or any self-hosted label), or its timeout-minutes is 20 or
 more (or an expression, which can be longer), or it has no timeout and is on a
 shared runner. Jobs that only call a reusable workflow, and light jobs on
@@ -37,9 +37,12 @@ EXEMPT = {
         "its `if:` runs it on schedule and workflow_dispatch only, never on a pull request",
     ("action.yml", "container"):
         "runs in the bare ubuntu:24.04 image, which has neither gh nor curl, so the guard could not ask the API",
+    ("ci-setup-script.yml", "ci-setup"):
+        "runs in the bare ubuntu:24.04 image, as another CI system would, with neither gh nor curl; and only "
+        "when scripts/ci-setup.sh or the workflow itself changes",
 }
 
-SHARED = re.compile(r"BURST_RUNS_ON|ML_RUNS_ON|SIM_RUNS_ON|pantheonsim-burst|self-hosted")
+SHARED = re.compile(r"BURST_RUNS_ON|CONTAINER_RUNS_ON|ML_RUNS_ON|SIM_RUNS_ON|pantheonsim-burst|self-hosted")
 GUARD = re.compile(r"^\s*-?\s*uses:\s*\./(?:[\w.\-/]+/)?\.github/actions/pr-guard\s*(?:#.*)?$")
 CHECKOUT = re.compile(r"^\s*-?\s*uses:\s*actions/checkout@")
 

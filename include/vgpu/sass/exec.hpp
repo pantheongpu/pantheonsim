@@ -95,7 +95,21 @@ struct Module {
   mutable std::mutex polling_mu;
   mutable std::map<std::string, bool> polling;
 
-  const Code* code_at(uint64_t addr) const;   // the section holding a code address
+  // The section holding a code address, or null for an address in no section (before the first, past the last, or
+  // in the padding between two). load() places the sections in ascending order, never overlapping, each on a 256-byte
+  // boundary, so a table with an entry for each 256 bytes of the code window says which section (if any) holds a
+  // page, and the lookup is one load and one range check. index_code() builds the table; for a module it cannot (the
+  // sections out of order, overlapping, off a boundary, or spread over more than 64 MB) it builds a sorted list of
+  // the sections' start addresses instead, searched in log n steps, and for one that is not even in order, nothing,
+  // and code_at scans. In every case the answer is the one code_at_linear gives -- the original first-match scan,
+  // kept as the reference the unit test (tests/unit/test_sass_code_at.cpp) compares with.
+  const Code* code_at(uint64_t addr) const;
+  const Code* code_at_linear(uint64_t addr) const;
+  // Builds the lookup structures above. Called by load() once the sections are placed.
+  void index_code();
+  std::vector<uint64_t> code_bases;           // code[i].base, when index_code() found the sections in order
+  std::vector<uint32_t> code_pages;           // per 256 bytes from code_page_base: 1 + the section index, or 0
+  uint64_t code_page_base = 0;                // the first section's base, when code_pages is in use
 };
 
 // Loads a cubin (checked against the device: it must be one the profile's

@@ -48,6 +48,7 @@ struct Generator {
   curandOrdering_t ordering = CURAND_ORDERING_PSEUDO_DEFAULT;   // kept; see curandSetGeneratorOrdering
   unsigned dims = 1;   // a quasirandom generator's dimensions
   cudaStream_t stream = nullptr;   // curandSetStream
+  bool host = false;   // curandCreateGeneratorHost: the output pointer is host memory, and nothing is a stream's
 
   bool quasi() const { return type >= CURAND_RNG_QUASI_DEFAULT; }
   bool quasi64() const { return type == CURAND_RNG_QUASI_SOBOL64 || type == CURAND_RNG_QUASI_SCRAMBLED_SOBOL64; }
@@ -74,7 +75,7 @@ bool valid(curandGenerator_t g) {
 template <class Call>
 bool record_generate(curandGenerator_t gen, size_t n, Call call) {
   auto* g = reinterpret_cast<Generator*>(gen);
-  if (!vgpu_capture::stream_capturing(g->stream)) return false;
+  if (g->host || !vgpu_capture::stream_capturing(g->stream)) return false;
   struct Replay {
     unsigned long long c0 = 0, launches = 0;
   };
@@ -135,9 +136,18 @@ inline double uniform_double(uint64_t r) {
   return (static_cast<double>(r >> 11) + 1.0) * (1.0 / 9007199254740992.0);
 }
 
+// A generator's output goes where its caller pointed: device memory, or host memory for a host generator.
 template <class T>
-void store(void* dev, const std::vector<T>& host) {
-  if (!host.empty()) cudaMemcpy(dev, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice);
+void store(const Generator* g, void* dst, const std::vector<T>& host) {
+  if (host.empty()) return;
+  if (g->host) std::memcpy(dst, host.data(), host.size() * sizeof(T));
+  else cudaMemcpy(dst, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice);
+}
+template <class T>
+void load(const Generator* g, std::vector<T>& host, const void* src) {
+  if (host.empty()) return;
+  if (g->host) std::memcpy(host.data(), src, host.size() * sizeof(T));
+  else cudaMemcpy(host.data(), src, host.size() * sizeof(T), cudaMemcpyDeviceToHost);
 }
 
 // ---- Sobol' direction vectors ----
@@ -310,7 +320,7 @@ curandStatus_t quasi_fill(Generator* g, T* out, size_t n, F&& convert) {
   if (g->quasi64()) fill(static_cast<unsigned long long>(0));
   else fill(static_cast<uint32_t>(0));
   g->counter += per;
-  store(out, h);
+  store(g, out, h);
   return CURAND_STATUS_SUCCESS;
 }
 
@@ -373,8 +383,12 @@ VGPU_EXPORT curandStatus_t curandCreateGenerator(curandGenerator_t* gen, curandR
                          "from NVIDIA's -- see nvidia/docs/libraries.md)\n");
   return CURAND_STATUS_SUCCESS;
 }
+// The same generators, run on the CPU: the output goes to host memory, and the numbers are the device
+// generator's for the same seed and offset (MersenneTwisterGP11213 compares one with the other).
 VGPU_EXPORT curandStatus_t curandCreateGeneratorHost(curandGenerator_t* g, curandRngType_t t) {
-  return curandCreateGenerator(g, t);
+  const curandStatus_t rc = curandCreateGenerator(g, t);
+  if (rc == CURAND_STATUS_SUCCESS) reinterpret_cast<Generator*>(*g)->host = true;
+  return rc;
 }
 
 VGPU_EXPORT curandStatus_t curandDestroyGenerator(curandGenerator_t gen) {
@@ -497,7 +511,7 @@ VGPU_EXPORT curandStatus_t curandGenerate(curandGenerator_t gen, unsigned int* o
     for (size_t i = b; i < e; ++i) h[i] = draw32(g->seed, g->offset + g->counter + i);
   });
   g->counter += n;
-  store(out, h);
+  store(g, out, h);
   return CURAND_STATUS_SUCCESS;
 }
 
@@ -520,7 +534,7 @@ VGPU_EXPORT curandStatus_t curandGenerateUniform(curandGenerator_t gen, float* o
     for (size_t i = b; i < e; ++i) h[i] = uniform_float(draw32(g->seed, g->offset + g->counter + i));
   });
   g->counter += n;
-  store(out, h);
+  store(g, out, h);
   return CURAND_STATUS_SUCCESS;
 }
 
@@ -535,7 +549,7 @@ VGPU_EXPORT curandStatus_t curandGenerateUniformDouble(curandGenerator_t gen, do
     for (size_t i = b; i < e; ++i) h[i] = uniform_double(mix(g->seed ^ mix(g->offset + g->counter + i)));
   });
   g->counter += n;
-  store(out, h);
+  store(g, out, h);
   return CURAND_STATUS_SUCCESS;
 }
 
@@ -565,7 +579,7 @@ VGPU_EXPORT curandStatus_t curandGenerateNormal(curandGenerator_t gen, float* ou
     }
   });
   g->counter += n;
-  store(out, h);
+  store(g, out, h);
   return CURAND_STATUS_SUCCESS;
 }
 
@@ -589,7 +603,7 @@ VGPU_EXPORT curandStatus_t curandGenerateNormalDouble(curandGenerator_t gen, dou
     }
   });
   g->counter += n;
-  store(out, h);
+  store(g, out, h);
   return CURAND_STATUS_SUCCESS;
 }
 
@@ -614,17 +628,17 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormal(curandGenerator_t gen, float*
       }
     });
     g->counter += n;
-    store(out, h);
+    store(g, out, h);
     return CURAND_STATUS_SUCCESS;
   }
   curandStatus_t s = curandGenerateNormal(gen, out, n, mean, stddev);
   if (s != CURAND_STATUS_SUCCESS) return s;
   std::vector<float> h(n);
-  cudaMemcpy(h.data(), out, n * sizeof(float), cudaMemcpyDeviceToHost);
+  load(g, h, out);
   for_pieces(n, 15, [&](size_t b, size_t e) {
     for (size_t i = b; i < e; ++i) h[i] = std::exp(h[i]);
   });
-  store(out, h);
+  store(g, out, h);
   return CURAND_STATUS_SUCCESS;
 }
 
@@ -648,16 +662,16 @@ VGPU_EXPORT curandStatus_t curandGenerateLogNormalDouble(curandGenerator_t gen, 
       }
     });
     g->counter += n;
-    store(out, h);
+    store(g, out, h);
     return CURAND_STATUS_SUCCESS;
   }
   curandStatus_t s = curandGenerateNormalDouble(gen, out, n, mean, stddev);
   if (s != CURAND_STATUS_SUCCESS) return s;
   std::vector<double> h(n);
-  cudaMemcpy(h.data(), out, n * sizeof(double), cudaMemcpyDeviceToHost);
+  load(g, h, out);
   for_pieces(n, 20, [&](size_t b, size_t e) {
     for (size_t i = b; i < e; ++i) h[i] = std::exp(h[i]);
   });
-  store(out, h);
+  store(g, out, h);
   return CURAND_STATUS_SUCCESS;
 }

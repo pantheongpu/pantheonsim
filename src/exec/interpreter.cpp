@@ -50,6 +50,7 @@
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/numerics.hpp"
+#include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
 #include "vgpu/exec/tma.hpp"
@@ -523,7 +524,51 @@ struct Warp {
       }
     }
   };
-  std::unordered_map<std::string, Slot> slots;
+  // A warp's call slots, by intern_call_slots number. A call has a handful at most, so a short list searched from the
+  // front costs less than a hash table; each slot is its own heap node, so a reference to one stays valid while others
+  // are added (the device-runtime handlers hold several at once); and the nodes of a cleared map are kept for the next
+  // slot to take, with the capacity of their byte vectors, since every call fills and empties a map of them.
+  struct SlotEntry {
+    uint32_t first = 0;
+    Slot second;
+  };
+  class SlotMap {
+   public:
+    SlotEntry* find(uint32_t id) const {
+      for (const auto& e : live_)
+        if (e->first == id) return e.get();
+      return nullptr;
+    }
+    SlotEntry* end() const { return nullptr; }
+    Slot& operator[](uint32_t id) {
+      if (SlotEntry* e = find(id)) return e->second;
+      std::unique_ptr<SlotEntry> n;
+      if (!spare_.empty()) {
+        n = std::move(spare_.back());
+        spare_.pop_back();
+        n->second.size = 8;   // a new Slot, with the byte vector's capacity kept
+        n->second.bytes.clear();
+      } else {
+        n = std::make_unique<SlotEntry>();
+      }
+      n->first = id;
+      live_.push_back(std::move(n));
+      return live_.back()->second;
+    }
+    void clear() {
+      for (auto& e : live_)
+        if (spare_.size() < 32) spare_.push_back(std::move(e));
+      live_.clear();
+    }
+    void swap(SlotMap& o) {
+      live_.swap(o.live_);
+      spare_.swap(o.spare_);
+    }
+   private:
+    std::vector<std::unique_ptr<SlotEntry>> live_, spare_;
+  };
+  SlotMap slots;
+  SlotMap call_args;   // exec_user_call's scratch: the arguments, renamed, on their way to the callee
   // The device functions this warp is inside, innermost last. Each frame is
   // what its caller was doing: the paths (the calling one already past the
   // call), registers and slots it resumes with when the callee's last path
@@ -539,8 +584,8 @@ struct Warp {
     RegFile<Lanes> regs64;
     std::vector<Mask> preds;
     std::vector<uint8_t> written32, written64;
-    std::unordered_map<std::string, Slot> slots;
-    std::string retval_from, retval_to;   // callee's return slot -> caller's
+    SlotMap slots;
+    uint32_t retval_from = kNoSlot, retval_to = kNoSlot;   // callee's return slot -> caller's (kNoSlot: none)
     Mask lanes = 0;                        // the lanes that made the call
     // The caller's stack pointer: what the callee allocas is freed when it
     // returns (9.7.19.3).
@@ -624,6 +669,7 @@ void refresh_modes() {
   g_race_strict.store(race && race[0] == '2', std::memory_order_relaxed);
   const char* fast = std::getenv("VGPU_FASTPATH");
   g_fast_path.store(!(fast && fast[0] == '0'), std::memory_order_relaxed);
+  vgpu::exec::tc86::refresh_exact();   // VGPU_TC_EXACT=0: the earlier sequential tensor sums (include/vgpu/exec/tc_ampere.hpp)
 }
 
 // IEEE 754 binary16 <-> double, implemented in software so the engine needs no
@@ -947,18 +993,6 @@ uint32_t double_to_small_float(double v, int eb, int mb, int bias) {
   return sign | std::min(code, max_code);
 }
 
-// tf32 is f32's sign and exponent with the mantissa cut to 10 bits. Round to
-// nearest even rather than truncating: truncation biases every product toward
-// zero, which accumulates over a reduction into a visible error.
-float f32_to_tf32(float x) {
-  uint32_t b = std::bit_cast<uint32_t>(x);
-  if ((b & 0x7F800000u) == 0x7F800000u) return x;  // inf/NaN keep their payload
-  const uint32_t lsb = (b >> 13) & 1u;
-  b += 0x0FFFu + lsb;
-  b &= ~0x1FFFu;
-  return std::bit_cast<float>(b);
-}
-
 float f32(uint64_t bits) { return std::bit_cast<float>(static_cast<uint32_t>(bits)); }
 uint64_t f32bits(float f) { return std::bit_cast<uint32_t>(f); }
 double f64(uint64_t bits) { return std::bit_cast<double>(bits); }
@@ -1025,6 +1059,8 @@ __attribute__((target("fma"))) void fma_lanes_f64_hw(uint64_t* d, const uint64_t
     std::memcpy(&z, &c[l], 8);
     const double r = __builtin_fma(x, y, z);
     std::memcpy(&d[l], &r, 8);
+    // A NaN operand: b's, else c's, else a's, quieted, as the general path's fma (an RTX 3060).
+    if (r != r && (x != x || y != y || z != z)) d[l] = (y != y ? b[l] : z != z ? c[l] : a[l]) | 0x0008000000000000ull;
   });
 }
 // fma.f16x2 lanes on the FMA unit, with the decode and the rounding inlined:
@@ -1052,11 +1088,16 @@ __attribute__((target("popcnt"))) void popc_lanes_hw(uint64_t* r, const uint64_t
                                                       uint64_t keep) {
   for_active(m, width, [&](uint32_t l) { r[l] = static_cast<uint64_t>(__builtin_popcountll(v[l] & keep)); });
 }
+__attribute__((target("popcnt"))) void popc32_lanes_hw(uint32_t* r, const uint32_t* v, Mask m, uint32_t width,
+                                                        uint32_t keep) {
+  for_active(m, width, [&](uint32_t l) { r[l] = static_cast<uint32_t>(__builtin_popcount(v[l] & keep)); });
+}
 #else
 constexpr bool g_hw_fma = false;
 double fma_hw(double a, double b, double c) { return std::fma(a, b, c); }
 constexpr bool g_hw_popcnt = false;
 void popc_lanes_hw(uint64_t*, const uint64_t*, Mask, uint32_t, uint64_t) {}
+void popc32_lanes_hw(uint32_t*, const uint32_t*, Mask, uint32_t, uint32_t) {}
 #endif
 // The number of set bits in x, by the bit-twiddling count (no table, no call).
 inline uint64_t popcount64_soft(uint64_t x) {
@@ -1135,29 +1176,29 @@ typedef int32_t WmmaBits8 __attribute__((vector_size(32)));
 // result rows as it writes them (one add each; a NaN anywhere makes the sum a NaN, and a sum that is not one holds
 // none) and only a tile whose sum is a NaN -- which an infinity minus an infinity also makes: then nothing changes --
 // is gone over again, a compare and a select on the bits.
-static inline WmmaRow8 wmma_canon_nan(WmmaRow8 v) {
+// (Everything here takes and gives pointers, never a 32-byte vector by value: the tile below is compiled twice, once for the
+// baseline and once with target("avx2"), and a vector passed between a function of one target and a function of the other is
+// passed in different places -- in a ymm register by the AVX function and in memory by the baseline one (GCC's -Wpsabi
+// "changes the ABI"). Optimised, the helpers are inlined and nothing is passed; at -O0, as in the AddressSanitizer Debug build,
+// nothing is inlined and the callee read whatever was on the stack. Round 8's version did that and passed on one CPU and
+// failed on another by luck of the stack.)
+__attribute__((noinline)) static void wmma_canon_row(float* p) {
+  WmmaRow8 v;
   WmmaBits8 b;
-  std::memcpy(&b, &v, sizeof b);
+  std::memcpy(&v, p, sizeof v);
+  std::memcpy(&b, p, sizeof b);
   const WmmaBits8 nan = v != v;   // all ones where the lane is a NaN
   const WmmaBits8 canon = {0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF};
   b = nan ? canon : b;
-  std::memcpy(&v, &b, sizeof v);
-  return v;
+  std::memcpy(p, &b, sizeof b);
 }
-static inline void wmma_canon_tile(float (&D)[16][16], WmmaRow8 sum) {
-  alignas(32) float s[8];
-  std::memcpy(s, &sum, sizeof sum);
+__attribute__((noinline)) static void wmma_canon_tile(float (&D)[16][16], const float* sum8) {
   bool any = false;
-  for (int l = 0; l < 8; ++l) any |= s[l] != s[l];
+  for (int l = 0; l < 8; ++l) any |= sum8[l] != sum8[l];
   if (!any) return;
   for (uint32_t i = 0; i < 16; ++i) {
-    WmmaRow8 lo, hi;
-    std::memcpy(&lo, &D[i][0], sizeof lo);
-    std::memcpy(&hi, &D[i][8], sizeof hi);
-    lo = wmma_canon_nan(lo);
-    hi = wmma_canon_nan(hi);
-    std::memcpy(&D[i][0], &lo, sizeof lo);
-    std::memcpy(&D[i][8], &hi, sizeof hi);
+    wmma_canon_row(&D[i][0]);
+    wmma_canon_row(&D[i][8]);
   }
 }
 #define VGPU_WMMA_TILE_BODY                                          \
@@ -1181,7 +1222,11 @@ static inline void wmma_canon_tile(float (&D)[16][16], WmmaRow8 sum) {
     std::memcpy(&D[i][0], &lo, sizeof lo);                           \
     std::memcpy(&D[i][8], &hi, sizeof hi);                           \
   }                                                                  \
-  wmma_canon_tile(D, chk);
+  {                                                                  \
+    alignas(32) float chk8[8];                                       \
+    std::memcpy(chk8, &chk, sizeof chk);                             \
+    wmma_canon_tile(D, chk8);                                        \
+  }
 void wmma_tile_base(float (&D)[16][16], const float (&A)[16][16], const float (&B)[16][16],
                     const float (&C)[16][16], uint32_t K) {
   VGPU_WMMA_TILE_BODY
@@ -3271,6 +3316,7 @@ class Interpreter {
       if (cur_ != micro_owner_) {
         micro_owner_ = cur_;
         micro_ = cur_->micro.size() == cur_->body.size() ? cur_->micro.data() : nullptr;
+        micro_consts_ = cur_->micro_consts.data();
       }
       // A warp on one path, at a run of such instructions: run them together.
       if (micro_ && fast_enabled_ && w.paths.size() == 1 &&
@@ -3460,6 +3506,18 @@ class Interpreter {
       case MicroOp::Int16: return micro_int16(w, u, fm);
       case MicroOp::Setp16: return micro_setp16(w, u, fm);
       case MicroOp::Mov16: return micro_mov16(w, u, fm);
+      case MicroOp::PopcClz32: return micro_popc_clz32(w, u, fm);
+      case MicroOp::Shfl32: return micro_shfl32(w, u, fm);
+      case MicroOp::CarryAddSub32: return micro_carry_add_sub32(w, u, fm);
+      case MicroOp::CarryMadLo32: return micro_carry_mad_lo32(w, u, fm);
+      case MicroOp::Float64: return micro_float64(w, u, fm);
+      case MicroOp::Fma64: return micro_fma64(w, u, fm);
+      case MicroOp::MovImm64: return micro_mov_imm64(w, u, fm);
+      case MicroOp::CvtF2I: return micro_cvt_f2i(w, u, fm);
+      case MicroOp::CvtF2F: return micro_cvt_f2f(w, u, fm);
+      case MicroOp::Unpack64: return micro_unpack64(w, u, fm);
+      case MicroOp::Pack64: return micro_pack64(w, u, fm);
+      case MicroOp::Vote: return micro_vote(w, u, fm);
       case MicroOp::Bra: return false;   // moves the pc: run_micro_batch's, or step()'s
       case MicroOp::None: break;
     }
@@ -3763,6 +3821,329 @@ class Interpreter {
     p = (p & ~fm) | (res & fm);
     return true;
   }
+  // popc.b32 and clz.b32, as the general path computes them.
+  [[gnu::noinline]] bool micro_popc_clz32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* v = micro_src(w, u, 0);
+    uint32_t* d = dst32(w, u.dst, fm);
+    if (u.sub) {
+      if (g_hw_popcnt) popc32_lanes_hw(d, v, fm, W_, ~0u);
+      else for_active(fm, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>(popcount64_soft(v[l])); });
+    } else {
+      for_active(fm, W_, [&](uint32_t l) { d[l] = v[l] ? static_cast<uint32_t>(__builtin_clz(v[l])) : 32u; });
+    }
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // shfl.sync over the 32 lanes: exec_shfl's arithmetic, on the narrow register file. A warp that is not 32 lanes
+  // wide is the general path's error to report.
+  [[gnu::noinline]] bool micro_shfl32(Warp& w, const MicroOp& u, Mask fm) {
+    // A warp on more than one path is step's: a *.sync instruction waits there for the lanes its mask names on the other
+    // paths (wait_for_members).
+    if (W_ != 32u || w.paths.size() != 1) return false;
+    const bool has_p = u.sub & 4;
+    if (has_p && u.pred >= w.preds.size()) return false;
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    const uint32_t* c = micro_src(w, u, 2);
+    const ShflMode mode = static_cast<ShflMode>(u.sub & 3);
+    uint32_t r[kMaxWarpSize];   // every result before any is written: the destination may be the source
+    Mask pred_out = 0;
+    for_active(fm, W_, [&](uint32_t lane) {
+      const uint32_t bval = b[lane] & 0x1F;
+      const uint32_t cval = c[lane] & 0x1F;
+      const uint32_t segmask = (c[lane] >> 8) & 0x1F;
+      const uint32_t min_lane = lane & segmask;
+      const uint32_t max_lane = (lane & segmask) | (cval & ~segmask);
+      uint32_t j = lane;
+      bool pred = false;
+      switch (mode) {
+        case ShflMode::Up:
+          j = lane - bval;
+          pred = static_cast<int32_t>(lane - bval) >= static_cast<int32_t>(max_lane);
+          break;
+        case ShflMode::Down:
+          j = lane + bval;
+          pred = j <= max_lane;
+          break;
+        case ShflMode::Bfly:
+          j = lane ^ bval;
+          pred = j <= max_lane;
+          break;
+        case ShflMode::Idx:
+          j = min_lane | (bval & ~segmask);
+          pred = j <= max_lane;
+          break;
+      }
+      if (!pred) j = lane;
+      r[lane] = (fm >> (j & 0x1F)) & 1 ? a[j & 0x1F] : 0;
+      if (pred) pred_out |= Mask{1} << lane;
+    });
+    uint32_t* d = dst32(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = r[l]; });
+    if (has_p) {
+      w.written32[u.pred] = 1;
+      Mask& p = w.preds[u.pred];
+      p = (p & ~fm) | (pred_out & fm);
+    }
+    return true;
+  }
+  // vote.sync / ballot.sync over the lanes that run it.
+  [[gnu::noinline]] bool micro_vote(Warp& w, const MicroOp& u, Mask fm) {
+    if (W_ != 32u || w.paths.size() != 1) return false;   // (as for shfl)
+    const uint32_t sid = u.src[0];
+    if (sid >= w.written32.size() || !w.written32[sid] || sid >= w.preds.size()) return false;
+    const bool ballot = u.sub & 8;
+    if (!ballot && u.dst >= w.preds.size()) return false;
+    Mask p = w.preds[sid];
+    if (u.sub & 4) p = ~p;
+    const Mask voters = p & fm;
+    if (ballot) {
+      uint32_t* d = dst32(w, u.dst, fm);
+      const uint32_t v = static_cast<uint32_t>(voters);
+      for_active(fm, W_, [&](uint32_t l) { d[l] = v; });
+      return true;
+    }
+    const bool all = (voters == fm), any = (voters != 0);
+    const VoteMode mode = static_cast<VoteMode>(u.sub & 3);
+    const bool val = mode == VoteMode::All   ? all
+                     : mode == VoteMode::Any ? any
+                                             : (voters == fm || voters == 0);   // uni
+    w.written32[u.dst] = 1;
+    Mask& dp = w.preds[u.dst];
+    dp = val ? (dp | fm) : (dp & ~fm);
+    return true;
+  }
+  // add/sub with the carry bit (exec_carry_add_sub), 32 bits wide. A subtraction is the addition of ~b with a carry-in
+  // that is 1 unless subc supplies the last carry-out.
+  [[gnu::noinline]] bool micro_carry_add_sub32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    const bool sub = (u.sub & 63) == static_cast<uint8_t>(IntBinOp::Sub);
+    const bool carry_in = u.sub & 64, carry_out = u.sub & 128;
+    uint32_t r[kMaxWarpSize];   // the destination may be a source
+    Mask out = w.carry;
+    for_active(fm, W_, [&](uint32_t l) {
+      const uint64_t x = a[l];
+      const uint64_t cin = carry_in ? ((w.carry >> l) & 1u) : (sub ? 1u : 0u);
+      const uint64_t y = sub ? static_cast<uint32_t>(~b[l]) : b[l];
+      const uint32_t sum = static_cast<uint32_t>(x + y + cin);
+      r[l] = sum;
+      if (carry_out) {
+        const bool cout = (sum < x) || (cin && sum == x);
+        out = (out & ~(Mask{1} << l)) | (Mask{cout} << l);
+      }
+    });
+    uint32_t* d = dst32(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = r[l]; });
+    if (carry_out) w.carry = out;
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // mad.lo.cc / madc.lo: the low half of a*b plus c, with the carry of that addition (exec_carry_mad).
+  [[gnu::noinline]] bool micro_carry_mad_lo32(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* a = micro_src(w, u, 0);
+    const uint32_t* b = micro_src(w, u, 1);
+    const uint32_t* c = micro_src(w, u, 2);
+    const bool carry_in = u.sub & 64, carry_out = u.sub & 128;
+    uint32_t r[kMaxWarpSize];
+    Mask out = w.carry;
+    for_active(fm, W_, [&](uint32_t l) {
+      const uint64_t p = static_cast<uint32_t>(a[l] * b[l]);
+      const uint64_t cin = carry_in ? ((w.carry >> l) & 1u) : 0u;
+      const uint32_t sum = static_cast<uint32_t>(p + c[l] + cin);
+      r[l] = sum;
+      if (carry_out) {
+        const bool cout = (sum < p) || (cin && sum == p);
+        out = (out & ~(Mask{1} << l)) | (Mask{cout} << l);
+      }
+    });
+    uint32_t* d = dst32(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = r[l]; });
+    if (carry_out) w.carry = out;
+    w.written32[u.dst] = 1;
+    return true;
+  }
+  // Source i of an f64 form as 64-bit lanes: a register of the 64-bit file in place (zeros for one nothing has written),
+  // or a constant of the function's table spread across the lanes, refilled only when the constant changes.
+  [[gnu::always_inline]] const uint64_t* micro_srcf(const Warp& w, const MicroOp& u, unsigned i) {
+    if (u.src_imm >> i & 1) {
+      const uint64_t v = micro_consts_[u.src[i]];
+      if (!immf_valid_[i] || immf_value_[i] != v) {
+        immf_lanes_[i].fill(v);
+        immf_value_[i] = v;
+        immf_valid_[i] = true;
+      }
+      return immf_lanes_[i].data();
+    }
+    const uint32_t id = u.src[i];
+    if (id >= w.regs64.size() || !w.written64[id]) return zero64_lanes_.data();
+    return w.regs64[id].data();
+  }
+  static bool f64_is_nan(uint64_t x) { return (x & 0x7FFF'FFFF'FFFF'FFFFull) > 0x7FF0'0000'0000'0000ull; }
+  // f64 add, sub, mul and div to nearest. The host's result for an operation with two NaN operands depends on which
+  // register the compiler put each in, so an instruction with such a lane is left to the general path (nothing is
+  // written); one NaN operand, or none, gives the same bits however the compiler orders them. (An fma is not held
+  // back: its plain form is the fast path's own function, whatever it does with two NaNs, and its negated forms
+  // are the general path's own expression.)
+  [[gnu::noinline]] bool micro_float64(Warp& w, const MicroOp& u, Mask fm) {
+    if (alu_armed()) return false;
+    const uint64_t* a = micro_srcf(w, u, 0);
+    const uint64_t* b = micro_srcf(w, u, 1);
+    uint64_t r[kMaxWarpSize];   // computed before anything is written, so that the instruction can still be declined
+    bool nan_result = false;
+    auto run = [&](auto f) {
+      for_active(fm, W_, [&](uint32_t l) {
+        r[l] = f64bits(f(f64(a[l]), f64(b[l])));
+        nan_result |= f64_is_nan(r[l]);
+      });
+    };
+    switch (static_cast<FloatBinOp>(u.sub)) {
+      case FloatBinOp::Add: run([](double x, double y) { return x + y; }); break;
+      case FloatBinOp::Sub: run([](double x, double y) { return x - y; }); break;
+      case FloatBinOp::Mul: run([](double x, double y) { return x * y; }); break;
+      case FloatBinOp::Div: run([](double x, double y) { return x / y; }); break;
+      default: return false;   // (min and max are never decoded)
+    }
+    // Two NaN operands always give a NaN, so only then is there anything to look for.
+    if (nan_result) {
+      bool two_nans = false;
+      for_active(fm, W_, [&](uint32_t l) { two_nans |= f64_is_nan(a[l]) & f64_is_nan(b[l]); });
+      if (two_nans) return false;
+    }
+    uint64_t* d = dst64(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = r[l]; });
+    w.written64[u.dst] = 1;
+    return true;
+  }
+  // f64 fma to nearest; a contracted sub negates the product or the addend by the multiplication the general path
+  // does it with.
+  [[gnu::noinline]] bool micro_fma64(Warp& w, const MicroOp& u, Mask fm) {
+    if (alu_armed()) return false;
+    const uint64_t* a = micro_srcf(w, u, 0);
+    const uint64_t* b = micro_srcf(w, u, 1);
+    const uint64_t* c = micro_srcf(w, u, 2);
+    uint64_t* d = dst64(w, u.dst, fm);
+    if (u.sub) {
+      const double sa = u.sub & 1 ? -1.0 : 1.0, sc = u.sub & 2 ? -1.0 : 1.0;
+      for_active(fm, W_, [&](uint32_t l) {
+        const double x = f64(a[l]), y = f64(b[l]), z = f64(c[l]);
+        // A NaN operand: b's, else c's, else a's, as the register holds it (the negations do not apply to a NaN), quieted
+        // (an RTX 3060; the general path's rule, whichever NaN the host's fma would have picked).
+        d[l] = x != x || y != y || z != z ? ((y != y ? b[l] : z != z ? c[l] : a[l]) | 0x0008000000000000ull)
+                                          : f64bits(std::fma(sa * x, y, sc * z));
+      });
+    } else {
+#if defined(__x86_64__) && defined(__GNUC__)
+      if (g_hw_fma) {
+        fma_lanes_f64_hw(d, a, b, c, fm, W_);
+        w.written64[u.dst] = 1;
+        return true;
+      }
+#endif
+      for_active(fm, W_, [&](uint32_t l) {
+        const double x = f64(a[l]), y = f64(b[l]), z = f64(c[l]);
+        d[l] = x != x || y != y || z != z ? ((y != y ? b[l] : z != z ? c[l] : a[l]) | 0x0008000000000000ull)
+                                          : f64bits(std::fma(x, y, z));
+      });
+    }
+    w.written64[u.dst] = 1;
+    return true;
+  }
+  // The source register of a float conversion as lanes of its width (zeros for a register nothing has written).
+  [[gnu::always_inline]] const uint32_t* micro_cvt_src32(const Warp& w, const MicroOp& u) {
+    const uint32_t id = u.src[0];
+    return (id >= w.regs32.size() || !w.written32[id]) ? zero_lanes_.data() : w.regs32[id].data();
+  }
+  [[gnu::always_inline]] const uint64_t* micro_cvt_src64(const Warp& w, const MicroOp& u) {
+    const uint32_t id = u.src[0];
+    return (id >= w.regs64.size() || !w.written64[id]) ? zero64_lanes_.data() : w.regs64[id].data();
+  }
+  // cvt of an f32 or f64 to a 32- or 64-bit integer: round_int, then float_to_int_bits -- the general path's own
+  // functions, applied to the same double.
+  [[gnu::noinline]] bool micro_cvt_f2i(Warp& w, const MicroOp& u, Mask fm) {
+    const Round rnd = static_cast<Round>(u.sub) == Round::None ? Round::Rzi : static_cast<Round>(u.sub);
+    const bool src64 = u.src_imm >> 3 & 1, sig = u.flags & MicroOp::kSigned;
+    const uint32_t db = u.src[1], sb = src64 ? 64 : 32;
+    uint64_t r[kMaxWarpSize];
+    if (src64) {
+      const uint64_t* v = micro_cvt_src64(w, u);
+      for_active(fm, W_, [&](uint32_t l) { r[l] = float_to_int_bits(round_int(f64(v[l]), rnd), sb, sig, db); });
+    } else {
+      const uint32_t* v = micro_cvt_src32(w, u);
+      for_active(fm, W_, [&](uint32_t l) {
+        r[l] = float_to_int_bits(round_int(static_cast<double>(f32(v[l])), rnd), sb, sig, db);
+      });
+    }
+    if (u.flags & MicroOp::kDstWide) {
+      uint64_t* d = dst64(w, u.dst, fm);
+      for_active(fm, W_, [&](uint32_t l) { d[l] = r[l]; });
+      w.written64[u.dst] = 1;
+    } else {
+      uint32_t* d = dst32(w, u.dst, fm);
+      for_active(fm, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>(r[l]); });
+      w.written32[u.dst] = 1;
+    }
+    return true;
+  }
+  // cvt between f32 and f64 to nearest, and rni/rzi/rmi/rpi of a float that keep its type (convert's real-to-real part).
+  [[gnu::noinline]] bool micro_cvt_f2f(Warp& w, const MicroOp& u, Mask fm) {
+    const Round rnd = static_cast<Round>(u.sub);
+    const bool integral = rnd == Round::Rni || rnd == Round::Rzi || rnd == Round::Rmi || rnd == Round::Rpi;
+    const bool src64 = u.src_imm >> 3 & 1, dst64_ = u.flags & MicroOp::kDstWide;
+    uint64_t r[kMaxWarpSize];
+    for_active(fm, W_, [&](uint32_t l) {
+      double x = src64 ? f64(micro_cvt_src64(w, u)[l]) : static_cast<double>(f32(micro_cvt_src32(w, u)[l]));
+      if (integral) x = round_int(x, rnd);
+      if (dst64_) {
+        r[l] = f64bits(x) | (x != x ? uint64_t{1} << 51 : 0);   // (a NaN that goes through an f64 rounding cvt is quieted)
+      } else {
+        const float f = static_cast<float>(x);
+        // f32 to f32 goes through the float pipeline, which writes the canonical NaN; a narrowing cvt.f32.f64 keeps
+        // the payload.
+        r[l] = (std::isnan(f) && !src64) ? 0x7FFF'FFFFu : f32bits(f);
+      }
+    });
+    if (dst64_) {
+      uint64_t* d = dst64(w, u.dst, fm);
+      for_active(fm, W_, [&](uint32_t l) { d[l] = r[l]; });
+      w.written64[u.dst] = 1;
+    } else {
+      uint32_t* d = dst32(w, u.dst, fm);
+      for_active(fm, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>(r[l]); });
+      w.written32[u.dst] = 1;
+    }
+    return true;
+  }
+  // mov.b64 {lo, hi}, %rd and mov.b64 %rd, {lo, hi}.
+  [[gnu::noinline]] bool micro_unpack64(Warp& w, const MicroOp& u, Mask fm) {
+    const uint64_t* v = micro_cvt_src64(w, u);
+    if (u.dst != kNoReg) {
+      uint32_t* d = dst32(w, u.dst, fm);
+      for_active(fm, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>(v[l]); });
+      w.written32[u.dst] = 1;
+    }
+    if (u.src[1] != kNoReg) {
+      uint32_t* d = dst32(w, u.src[1], fm);
+      for_active(fm, W_, [&](uint32_t l) { d[l] = static_cast<uint32_t>(v[l] >> 32); });
+      w.written32[u.src[1]] = 1;
+    }
+    return true;
+  }
+  [[gnu::noinline]] bool micro_pack64(Warp& w, const MicroOp& u, Mask fm) {
+    const uint32_t* lo = micro_src(w, u, 0);
+    const uint32_t* hi = micro_src(w, u, 1);
+    uint64_t* d = dst64(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = uint64_t{lo[l]} | (uint64_t{hi[l]} << 32); });
+    w.written64[u.dst] = 1;
+    return true;
+  }
+  [[gnu::noinline]] bool micro_mov_imm64(Warp& w, const MicroOp& u, Mask fm) {
+    const uint64_t v = micro_consts_[u.src[0]];
+    uint64_t* d = dst64(w, u.dst, fm);
+    for_active(fm, W_, [&](uint32_t l) { d[l] = v; });
+    w.written64[u.dst] = 1;
+    return true;
+  }
   [[gnu::noinline]] bool micro_mov16(Warp& w, const MicroOp& u, Mask fm) {
     const uint32_t* v = micro_src(w, u, 0);
     uint32_t* d = dst32(w, u.dst, fm);
@@ -3930,8 +4311,9 @@ class Interpreter {
     return true;
   }
   [[gnu::noinline]] bool micro_setp64(Warp& w, const MicroOp& u, Mask fm) {
-    const uint64_t* a = micro_src64(w, u, 0);
-    const uint64_t* b = micro_src64(w, u, 1);
+    const bool f = u.flags & MicroOp::kFloat;
+    const uint64_t* a = f ? micro_srcf(w, u, 0) : micro_src64(w, u, 0);
+    const uint64_t* b = f ? micro_srcf(w, u, 1) : micro_src64(w, u, 1);
     Mask res = 0;
     if (!setp64_lanes(static_cast<CmpOp>(u.sub), u.flags & MicroOp::kFloat, u.flags & MicroOp::kSigned, a, b, fm, W_,
                       res))
@@ -3981,11 +4363,25 @@ class Interpreter {
     }
   }
 
+  // A device function's classes are worked out once per function, the first time a warp is inside it.
+  [[gnu::noinline]] InstClass class_of_func_pc(size_t pc) const {
+    if (cur_ != func_class_fn_) {
+      auto it = func_classes_.find(cur_);
+      if (it == func_classes_.end()) {
+        std::vector<uint8_t> v(cur_->body.size());
+        for (size_t i = 0; i < v.size(); ++i) v[i] = static_cast<uint8_t>(classify(cur_->body[i]));
+        it = func_classes_.emplace(cur_, std::move(v)).first;
+      }
+      func_class_fn_ = cur_;
+      func_class_ = it->second.data();
+    }
+    return static_cast<InstClass>(func_class_[pc]);
+  }
+
   InstClass class_of_pc(size_t pc) const {
     // The cache is per kernel. Inside a device function the pc indexes a
-    // different body, so classify directly rather than reading another
-    // function's entry.
-    if (cur_ != &fn_) return classify(cur_->body[pc]);
+    // different body, so it has a cache of its own.
+    if (cur_ != &fn_) return class_of_func_pc(pc);
     if (class_by_pc_.empty()) {
       class_by_pc_.resize(fn_.body.size());
       for (size_t i = 0; i < fn_.body.size(); ++i)
@@ -5774,8 +6170,9 @@ class Interpreter {
     }
     if (op.ty.bits != 64 || !op.dst.wide) return false;
     Lanes sa, sb, sc;
-    const Lanes& a = read_wide(w, ctx, ins, op.a, sa);
-    const Lanes& b = read_wide(w, ctx, ins, op.b, sb);
+    // (The multiplicands in the order ptxas gives them, which decides a NaN; see OpFma::nan_swap_ab.)
+    const Lanes& a = read_wide(w, ctx, ins, op.nan_swap_ab ? op.b : op.a, sa);
+    const Lanes& b = read_wide(w, ctx, ins, op.nan_swap_ab ? op.a : op.b, sb);
     const Lanes& c = read_wide(w, ctx, ins, op.c, sc);
     uint64_t* d = dst64(w, op.dst.id, m);
 #if defined(__x86_64__) && defined(__GNUC__)
@@ -5785,7 +6182,11 @@ class Interpreter {
       return true;
     }
 #endif
-    for_active(m, W_, [&](uint32_t l) { d[l] = f64bits(std::fma(f64(a[l]), f64(b[l]), f64(c[l]))); });
+    for_active(m, W_, [&](uint32_t l) {
+      const double x = f64(a[l]), y = f64(b[l]), z = f64(c[l]);
+      d[l] = x != x || y != y || z != z ? ((y != y ? b[l] : z != z ? c[l] : a[l]) | 0x0008000000000000ull)
+                                        : f64bits(std::fma(x, y, z));
+    });
     w.written64[op.dst.id] = 1;
     return true;
   }
@@ -5966,6 +6367,80 @@ class Interpreter {
     return true;
   }
 
+  // What a call's callee name makes it: one of the interpreter's builtins, or (Plain) a call to a device function,
+  // direct or indirect, or to vprintf. Decided by name alone, once per call instruction; the order of the tests is
+  // the order the dispatch of a call has always had.
+  enum class CallKind : uint8_t {
+    Unclassified = 0, AssertFail, Heap, Devrt, GetDevice, GetDeviceCount, GetLastError, SetLastError,
+    GraphSetConditional, GraphLaunch, HandleCreate, Succeeds, Plain
+  };
+  static uint8_t call_kind(const OpCall& op) {
+    const std::string& c = op.callee;
+    CallKind k = CallKind::Plain;
+    if (c == "__assertfail") k = CallKind::AssertFail;
+    else if (c == "malloc" || c == "free") k = CallKind::Heap;
+    else if (devrt::lookup(c) != devrt::Fn::None) k = CallKind::Devrt;
+    else if (c == "__cuda_syscall_cnpv2GetDevice" || c == "cnpGetDevice") k = CallKind::GetDevice;
+    else if (c == "__cuda_syscall_cnpv2GetDeviceCount" || c == "cnpGetDeviceCount") k = CallKind::GetDeviceCount;
+    else if (c == "__cuda_syscall_cnpv2GetLastError") k = CallKind::GetLastError;
+    else if (c == "__cuda_syscall_cnpv2SetLastError") k = CallKind::SetLastError;
+    else if (c == "cudaGraphSetConditional") k = CallKind::GraphSetConditional;
+    else if (c == "cudaGraphLaunch") k = CallKind::GraphLaunch;
+    else if (c == "__cuda_syscall_cnpv2StreamCreate" || c == "__cuda_syscall_cnpv2EventCreate")
+      k = CallKind::HandleCreate;
+    else if (c == "__cuda_syscall_cnpv2StreamDestroy" || c == "__cuda_syscall_cnpv2EventDestroy" ||
+             c == "__cuda_syscall_cnpv2EventRecord" || c == "__cuda_syscall_cnpv2StreamWaitEvent")
+      k = CallKind::Succeeds;
+    return static_cast<uint8_t>(k);
+  }
+
+  // st.param / ld.param of a call slot, over the lanes of `m`, for the sizes a scalar has: one move per lane with the
+  // width a constant (Slot::write and read switch on it for every lane). False -- nothing done -- when the slot is
+  // not laid out for it (the general loops then run, and drop what falls outside the slot as they always did).
+  bool slot_lanes_fit(const Warp::Slot& slot, uint32_t at, uint32_t nbytes) const {
+    return (nbytes == 1 || nbytes == 2 || nbytes == 4 || nbytes == 8) && uint64_t{at} + nbytes <= slot.size &&
+           slot.bytes.size() >= static_cast<size_t>(slot.size) * W_;
+  }
+  template <typename T>
+  static void store_slot_as(Warp::Slot& slot, uint32_t at, const Lanes& v, Mask m, uint32_t width) {
+    uint8_t* base = slot.bytes.data() + at;
+    const size_t stride = slot.size;
+    for_active(m, width, [&](uint32_t l) {
+      const T x = static_cast<T>(v[l]);
+      std::memcpy(base + l * stride, &x, sizeof(T));
+    });
+  }
+  template <typename T>
+  static void load_slot_as(const Warp::Slot& slot, uint32_t at, Lanes& r, Mask m, uint32_t width) {
+    const uint8_t* base = slot.bytes.data() + at;
+    const size_t stride = slot.size;
+    for_active(m, width, [&](uint32_t l) {
+      T x;
+      std::memcpy(&x, base + l * stride, sizeof(T));
+      r[l] = x;
+    });
+  }
+  bool store_slot_lanes(Warp::Slot& slot, uint32_t at, uint32_t nbytes, uint32_t bits, const Lanes& v, Mask m) {
+    if (!fast_enabled_ || bits != nbytes * 8 || !slot_lanes_fit(slot, at, nbytes)) return false;
+    switch (nbytes) {
+      case 1: store_slot_as<uint8_t>(slot, at, v, m, W_); break;
+      case 2: store_slot_as<uint16_t>(slot, at, v, m, W_); break;
+      case 4: store_slot_as<uint32_t>(slot, at, v, m, W_); break;
+      default: store_slot_as<uint64_t>(slot, at, v, m, W_); break;
+    }
+    return true;
+  }
+  bool load_slot_lanes(const Warp::Slot& slot, uint32_t at, uint32_t nbytes, Lanes& r, Mask m) {
+    if (!fast_enabled_ || !slot_lanes_fit(slot, at, nbytes)) return false;
+    switch (nbytes) {
+      case 1: load_slot_as<uint8_t>(slot, at, r, m, W_); break;
+      case 2: load_slot_as<uint16_t>(slot, at, r, m, W_); break;
+      case 4: load_slot_as<uint32_t>(slot, at, r, m, W_); break;
+      default: load_slot_as<uint64_t>(slot, at, r, m, W_); break;
+    }
+    return true;
+  }
+
   void dispatch(Warp& w, const BlockCtx& ctx, const Instr& ins, Mask m) {
     if (g_fast_path.load(std::memory_order_relaxed) && fast_path(w, ctx, ins, m)) return;
     if (const auto* op = std::get_if<OpMov>(&ins.op)) {
@@ -6115,13 +6590,13 @@ class Interpreter {
           if (op->xorsign_abs) {
             // The smaller/larger magnitude, signed sign(a) ^ sign(b); a NaN
             // operand is ignored as in plain min/max (unless .NaN).
-            uint64_t v = float_bin(op->op, op->ty, av & ~sign, bvv & ~sign, op->nan_propagate);
+            uint64_t v = float_bin(op->op, op->ty, av & ~sign, bvv & ~sign, op->nan_propagate, op->nan_a_first);
             if (!float_is_nan(op->ty, v)) v = (v & ~sign) | ((av ^ bvv) & sign);
             r[lane] = v;
           } else if (op->approx) {
             r[lane] = div_approx32(static_cast<uint32_t>(av), static_cast<uint32_t>(bvv));
           } else {
-            r[lane] = float_bin(op->op, op->ty, av, bvv, op->nan_propagate);
+            r[lane] = float_bin(op->op, op->ty, av, bvv, op->nan_propagate, op->nan_a_first);
           }
           r[lane] = flush(r[lane]);
           if (op->sat) r[lane] = float_sat(op->ty, r[lane]);
@@ -6182,7 +6657,16 @@ class Interpreter {
           r[l] = canon32(ftz(std::fma(ftz(av), ftz(f32(b[l])), ftz(cv))));
         });
       else
-        for_active(m, W_, [&](uint32_t l) { r[l] = f64bits(std::fma(sa * f64(a[l]), f64(b[l]), sc * f64(c[l]))); });
+        for_active(m, W_, [&](uint32_t l) {
+          // The multiplicands in the order ptxas gives them (OpFma::nan_swap_ab): b's NaN, else c's, else a's, quieted (an RTX 3060).
+          const uint64_t am = op->nan_swap_ab ? b[l] : a[l], bm = op->nan_swap_ab ? a[l] : b[l];
+          const double av = f64(am), bv = f64(bm), cv = f64(c[l]);
+          if (std::isnan(av) || std::isnan(bv) || std::isnan(cv)) {
+            r[l] = (std::isnan(bv) ? bm : std::isnan(cv) ? c[l] : am) | 0x0008000000000000ull;
+            return;
+          }
+          r[l] = f64bits(std::fma(sa * av, bv, sc * cv));
+        });
       if (op->round != FRound::Nearest) {
         std::fesetround(prev_round);
         g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
@@ -7753,7 +8237,7 @@ class Interpreter {
     // warp there wiped the waiting lanes' arguments (Boost.Math's ibetac, with
     // lanes of one warp in different series).
     if (const auto* op = std::get_if<OpDeclSlot>(&ins.op)) {
-      Warp::Slot& slot = w.slots[op->name];
+      Warp::Slot& slot = w.slots[op->id];
       slot.fit(op->size ? op->size : 8u, W_);
       if (m == all_ && slot.bytes.size() == static_cast<size_t>(slot.size) * W_) {
         std::memset(slot.bytes.data(), 0, slot.bytes.size());   // every lane's bytes: one run
@@ -7765,7 +8249,7 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpStSlot>(&ins.op)) {
-      Warp::Slot& slot = w.slots[op->slot];
+      Warp::Slot& slot = w.slots[op->id];
       const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
       // A slot written before it was declared (or wider than declared) grows
       // to fit rather than dropping the write silently.
@@ -7774,88 +8258,90 @@ class Interpreter {
         Lanes _s_v;
         const Lanes& v = read_operand(w, ctx, ins, op->srcs[e], _s_v);
         const uint32_t at = static_cast<uint32_t>(op->offset) + nbytes * static_cast<uint32_t>(e);
-        for (uint32_t lane = 0; lane < W_; ++lane)
-          if (m & (Mask{1} << lane)) slot.write(lane, at, nbytes, mask_to_bits(v[lane], op->ty.bits));
+        if (!store_slot_lanes(slot, at, nbytes, op->ty.bits, v, m))
+          for (uint32_t lane = 0; lane < W_; ++lane)
+            if (m & (Mask{1} << lane)) slot.write(lane, at, nbytes, mask_to_bits(v[lane], op->ty.bits));
       }
       return;
     }
     if (const auto* op = std::get_if<OpLdSlot>(&ins.op)) {
-      auto it = w.slots.find(op->slot);
+      auto it = w.slots.find(op->id);
       if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister, "call slot '" + op->slot + "' read before write");
       const uint32_t nbytes = op->ty.bytes() ? op->ty.bytes() : 4u;
       for (size_t e = 0; e < op->dsts.size(); ++e) {
         const uint32_t at = static_cast<uint32_t>(op->offset) + nbytes * static_cast<uint32_t>(e);
         Lanes r{};
-        for (uint32_t lane = 0; lane < W_; ++lane)
-          if (m & (Mask{1} << lane)) r[lane] = it->second.read(lane, at, nbytes);
+        if (!load_slot_lanes(it->second, at, nbytes, r, m))
+          for (uint32_t lane = 0; lane < W_; ++lane)
+            if (m & (Mask{1} << lane)) r[lane] = it->second.read(lane, at, nbytes);
         write_loaded(w, op->dsts[e], m, r, op->ty);
       }
       return;
     }
     if (const auto* op = std::get_if<OpCall>(&ins.op)) {
-      if (op->callee == "__assertfail") {
-        exec_assertfail(w, ctx, ins, *op, m);
-        return;
+      // The callee's name settles which builtin this is, and so it is read once: the first execution of a call
+      // classifies it (call_kind), and the rest go straight to the right case.
+      uint8_t kind = op->klass.get();
+      if (kind == 0) {
+        kind = call_kind(*op);
+        op->klass.set(kind);
       }
-      if (op->callee == "malloc" || op->callee == "free") {
-        exec_device_heap(w, ctx, ins, *op, m);
-        return;
-      }
-      // The device runtime's entry points -- the launch pair as the CUDA
-      // programming guide documents them for code generators ("Device-side
-      // Launch from PTX"), and the rest of cuda_device_runtime_api.h. CUDA 12's
-      // CDP2 compiles to the __cudaCDP2 names, CDP1 to the cuda ones.
-      if (const devrt::Fn dfn = devrt::lookup(op->callee); dfn != devrt::Fn::None) {
-        exec_devrt(dfn, w, ctx, ins, *op, m);
-        return;
-      }
-      // Device-side cudaGetDevice and cudaGetDeviceCount: the device runtime
-      // library's wrappers call these driver entry points (CUDA 12's CDP2
-      // names, and CDP1's cnp ones), which write one int and return an error
-      // code. NanoVDB calls cudaGetDevice from a kernel.
-      if (op->callee == "__cuda_syscall_cnpv2GetDevice" || op->callee == "cnpGetDevice") {
-        exec_device_int_query(w, ctx, ins, *op, m, cfg_.device_ordinal);
-        return;
-      }
-      if (op->callee == "__cuda_syscall_cnpv2GetDeviceCount" || op->callee == "cnpGetDeviceCount") {
-        exec_device_int_query(w, ctx, ins, *op, m, cfg_.device_count);
-        return;
-      }
-      // Device-side streams and events (CUDA Samples' cdpSimpleQuicksort
-      // launches each child into a stream of its own). Child grids run here
-      // one after another in launch order, which every ordering these can
-      // ask for already satisfies: creation hands back a distinct handle,
-      // and destroying, recording and waiting have nothing left to do.
-      if (op->callee == "__cuda_syscall_cnpv2GetLastError") {
-        exec_device_get_last_error(w, *op, m);
-        return;
-      }
-      if (op->callee == "__cuda_syscall_cnpv2SetLastError") {
-        exec_device_set_last_error(w, ctx, ins, *op, m);
-        return;
-      }
-      // cudaGraphSetConditional(handle, value): nvcc leaves it a call to an
-      // external function of that name, which the driver supplies.
-      if (op->callee == "cudaGraphSetConditional") {
-        exec_graph_set_conditional(w, ins, *op, m);
-        return;
-      }
-      // Device-side cudaGraphLaunch(graphExec, stream): also a driver-supplied
-      // external, which the device runtime's header declares and no library
-      // defines.
-      if (op->callee == "cudaGraphLaunch") {
-        exec_device_graph_launch(w, ins, *op, m);
-        return;
-      }
-      if (op->callee == "__cuda_syscall_cnpv2StreamCreate" || op->callee == "__cuda_syscall_cnpv2EventCreate") {
-        exec_device_handle(w, ctx, ins, *op, m);
-        return;
-      }
-      if (op->callee == "__cuda_syscall_cnpv2StreamDestroy" || op->callee == "__cuda_syscall_cnpv2EventDestroy" ||
-          op->callee == "__cuda_syscall_cnpv2EventRecord" || op->callee == "__cuda_syscall_cnpv2StreamWaitEvent") {
-        write_call_result(w, *op, m, Lanes{}, 4);   // cudaSuccess
-        return;
+      switch (static_cast<CallKind>(kind)) {
+        case CallKind::AssertFail:
+          exec_assertfail(w, ctx, ins, *op, m);
+          return;
+        case CallKind::Heap:
+          exec_device_heap(w, ctx, ins, *op, m);
+          return;
+        // The device runtime's entry points -- the launch pair as the CUDA
+        // programming guide documents them for code generators ("Device-side
+        // Launch from PTX"), and the rest of cuda_device_runtime_api.h. CUDA 12's
+        // CDP2 compiles to the __cudaCDP2 names, CDP1 to the cuda ones.
+        case CallKind::Devrt:
+          exec_devrt(devrt::lookup(op->callee), w, ctx, ins, *op, m);
+          return;
+        // Device-side cudaGetDevice and cudaGetDeviceCount: the device runtime
+        // library's wrappers call these driver entry points (CUDA 12's CDP2
+        // names, and CDP1's cnp ones), which write one int and return an error
+        // code. NanoVDB calls cudaGetDevice from a kernel.
+        case CallKind::GetDevice:
+          exec_device_int_query(w, ctx, ins, *op, m, cfg_.device_ordinal);
+          return;
+        case CallKind::GetDeviceCount:
+          exec_device_int_query(w, ctx, ins, *op, m, cfg_.device_count);
+          return;
+        // Device-side streams and events (CUDA Samples' cdpSimpleQuicksort
+        // launches each child into a stream of its own). Child grids run here
+        // one after another in launch order, which every ordering these can
+        // ask for already satisfies: creation hands back a distinct handle,
+        // and destroying, recording and waiting have nothing left to do.
+        case CallKind::GetLastError:
+          exec_device_get_last_error(w, *op, m);
+          return;
+        case CallKind::SetLastError:
+          exec_device_set_last_error(w, ctx, ins, *op, m);
+          return;
+        // cudaGraphSetConditional(handle, value): nvcc leaves it a call to an
+        // external function of that name, which the driver supplies.
+        case CallKind::GraphSetConditional:
+          exec_graph_set_conditional(w, ins, *op, m);
+          return;
+        // Device-side cudaGraphLaunch(graphExec, stream): also a driver-supplied
+        // external, which the device runtime's header declares and no library
+        // defines.
+        case CallKind::GraphLaunch:
+          exec_device_graph_launch(w, ins, *op, m);
+          return;
+        case CallKind::HandleCreate:
+          exec_device_handle(w, ctx, ins, *op, m);
+          return;
+        case CallKind::Succeeds:
+          write_call_result(w, *op, m, Lanes{}, 4);   // cudaSuccess
+          return;
+        case CallKind::Plain:
+        case CallKind::Unclassified:
+          break;
       }
       if (op->indirect) {
         exec_indirect_call(w, ctx, ins, *op, m);
@@ -8000,7 +8486,7 @@ class Interpreter {
       uint32_t min_lane = lane & segmask;
       uint32_t max_lane = (lane & segmask) | (cval & ~segmask);
       uint32_t j = lane;
-      bool pred;
+      bool pred = false;
       switch (op.mode) {
         case ShflMode::Up:
           // The ISA's pval = (j >= maxLane): for .up, c's clamp field is the
@@ -8878,6 +9364,22 @@ class Interpreter {
     };
     const bool narrow_tensor_core = profile_.cc_major == 12 && narrow_elem(op.ab_type) && narrow_elem(op.b_type) &&
                                     !op.acc_int && !op.acc_f64 && !op.acc_f16;
+    // An RTX 3060's tensor core (sm_86) sums f16, bf16 and tf32 products in chunks (include/vgpu/exec/tc_ampere.hpp), not one at a time
+    // in f32: D for the whole tile first, then taken instead of the sequential sum below. Not the sparse, block-scaled or narrow forms.
+    const bool tc86_sum = vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && !op.sparse && !op.block_scale &&
+                          (op.ab_type == MmaElem::F16 || op.ab_type == MmaElem::BF16 || op.ab_type == MmaElem::TF32) &&
+                          op.b_type == op.ab_type && !op.acc_int && !op.acc_f64 && K % (op.ab_type == MmaElem::TF32 ? 4 : 8) == 0;
+    std::array<float, 16 * kN> Dtc{};
+    if (tc86_sum) {
+      std::array<float, 16 * 16> Af{};
+      std::array<float, 16 * kN> Bf{}, Cf{};
+      for (uint32_t x = 0; x < M * K; ++x) Af[x] = static_cast<float>(A[x]);
+      for (uint32_t x = 0; x < K * kN; ++x) Bf[x] = static_cast<float>(B[x]);
+      for (uint32_t x = 0; x < M * kN; ++x) Cf[x] = static_cast<float>(C[x]);
+      vgpu::exec::tc86::mma(M, kN, K, op.ab_type == MmaElem::TF32 ? 4 : 8,
+                            op.ab_type == MmaElem::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, op.acc_f16, Af.data(), K,
+                            Bf.data(), kN, Cf.data(), kN, Dtc.data(), kN);
+    }
     const int prev_round = std::fegetround();
     if (op.acc_f64) {
       switch (op.rnd) {
@@ -8922,6 +9424,8 @@ class Interpreter {
             terms[k] = op.block_scale ? (A[i * K + k] * SA[i][k / sblock]) * (B[k * kN + j] * SB[j][k / sblock])
                                       : A[i * K + k] * B[k * kN + j];
           D[i * kN + j] = static_cast<double>(vgpu::exec::mma_narrow_sum(terms, K, static_cast<float>(C[i * kN + j])));
+        } else if (tc86_sum) {
+          D[i * kN + j] = static_cast<double>(Dtc[i * kN + j]);
         } else {
           float acc = static_cast<float>(C[i * kN + j]);
           if (op.block_scale)
@@ -9022,7 +9526,7 @@ class Interpreter {
             if (op.acc_f16)
               out[i / 2][lane] |= (double_to_f16(acc) & 0xFFFF) << (16 * (i % 2));
             else
-              out[i][lane] = f32bits(acc);
+              out[i][lane] = canon32(acc);   // (a NaN is the canonical one, as in exec_mma)
           }
         }
     }
@@ -9253,7 +9757,10 @@ class Interpreter {
           const uint64_t h = double_to_f16(acc) & 0xFFFF;
           slot = (slot & ~(uint64_t{0xFFFF} << shift) & 0xFFFFFFFFu) | (h << shift);
         } else {
-          slot = f32bits(acc);
+          // A NaN is the canonical 0x7fffffff, not the one the host's add kept when two met (the first source operand's, which
+          // the compiler's operand order picks: a -O2 and a ThreadSanitizer -O1 build differed). Derived from the HMMA/mma
+          // rule (an RTX 3060) and the PTX documentation -- no card has wgmma. An f16 accumulator's NaN is double_to_f16's.
+          slot = canon32(acc);
         }
       }
     }
@@ -9870,7 +10377,11 @@ class Interpreter {
       }
     }
     alignas(32) float D[kMmaDim][kMmaDim];
-    wmma_tile(D, A, B, C, kMmaDim);
+    if (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor))   // (include/vgpu/exec/tc_ampere.hpp)
+      vgpu::exec::tc86::mma(kMmaDim, kMmaDim, kMmaDim, 8, bf ? vgpu::exec::tc86::kEminWide : vgpu::exec::tc86::kEminF16, false, af, kMmaDim,
+                            bff, kMmaDim, cf, kMmaDim, &D[0][0], kMmaDim);
+    else
+      wmma_tile(D, A, B, C, kMmaDim);
     const float* const df = &D[0][0];
     // Every register of D, written after all of A, B and C have been read:
     // D may name the same registers as C.
@@ -9919,7 +10430,9 @@ class Interpreter {
     switch (t) {
       case WmmaType::F16: return f16_to_double(bits & 0xFFFF);
       case WmmaType::BF16: return bf16_to_double(bits & 0xFFFF);
-      case WmmaType::TF32: case WmmaType::F32: return std::bit_cast<float>(static_cast<uint32_t>(bits));
+      // (A tf32 operand is read through its top 19 bits only; the accumulator's f32 is whole.)
+      case WmmaType::TF32: return std::bit_cast<float>(static_cast<uint32_t>(bits) & 0xFFFFE000u);
+      case WmmaType::F32: return std::bit_cast<float>(static_cast<uint32_t>(bits));
       case WmmaType::F64: return std::bit_cast<double>(bits);
       case WmmaType::S8: return static_cast<int8_t>(bits);
       case WmmaType::U8: return static_cast<uint8_t>(bits);
@@ -9950,7 +10463,6 @@ class Interpreter {
           const auto [row, col] = wmma_slot(g, lane, reg, e);
           const uint64_t elem = op.layout == MatLayout::Row ? uint64_t{row} * ld + col : uint64_t{col} * ld + row;
           uint64_t v = wmma_read(w, ctx, ins, lane, addr0, elem, g.bits) & mask;
-          if (op.type == WmmaType::TF32) v = f32bits(f32_to_tf32(f32(v)));
           packed |= v << (e * g.bits);
         }
         r[lane] = packed;
@@ -10045,14 +10557,29 @@ class Interpreter {
     std::vector<uint64_t> D(size_t{M} * N);
     const WmmaType at = op.atype;
     if (at == WmmaType::F16 || at == WmmaType::BF16 || at == WmmaType::TF32) {
-      // Products and sums in f32, k in order, as the f32-accumulator path does;
-      // an f16 result is that rounded once.
+      // On an RTX 3060 (sm_86) the tensor core's chunked truncating sum (include/vgpu/exec/tc_ampere.hpp); elsewhere products and sums in
+      // f32, k in order, as the f32-accumulator path does. An f16 result is that rounded once.
+      const bool tc = vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && M <= 32 && N <= 32 && K <= 16 &&
+                      K % (at == WmmaType::TF32 ? 4 : 8) == 0;
+      std::vector<float> Dtc;
+      if (tc) {
+        std::vector<float> Af(A.begin(), A.end()), Bf(B.begin(), B.end()), Cf(C.begin(), C.end());
+        Dtc.resize(size_t{M} * N);
+        // A tensor core with an f16 accumulator when both the accumulator and the result are f16; otherwise the f32 sum, then converted.
+        const bool acc16 = op.ctype == WmmaType::F16 && op.dtype == WmmaType::F16;
+        vgpu::exec::tc86::mma(M, N, K, at == WmmaType::TF32 ? 4 : 8, at == WmmaType::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide,
+                              acc16, Af.data(), K, Bf.data(), N, Cf.data(), N, Dtc.data(), N);
+      }
       for (uint32_t i = 0; i < M; ++i)
         for (uint32_t j = 0; j < N; ++j) {
           float acc = static_cast<float>(C[size_t{i} * N + j]);
-          for (uint32_t k = 0; k < K; ++k) {
-            const float prod = static_cast<float>(A[size_t{i} * K + k]) * static_cast<float>(B[size_t{k} * N + j]);
-            acc = acc + prod;
+          if (tc) {
+            acc = Dtc[size_t{i} * N + j];
+          } else {
+            for (uint32_t k = 0; k < K; ++k) {
+              const float prod = static_cast<float>(A[size_t{i} * K + k]) * static_cast<float>(B[size_t{k} * N + j]);
+              acc = acc + prod;
+            }
           }
           // (f16: double_to_f16 answers a NaN with the canonical 0x7fff; f32: the canonical 0x7fffffff, as the tile does.)
           D[size_t{i} * N + j] = op.dtype == WmmaType::F16 ? double_to_f16(acc) : canon32(acc);
@@ -10135,8 +10662,10 @@ class Interpreter {
           // A is 16x8, B is 8x16: different inner extents, so different maps.
           const uint32_t ar = linear / 8u, ac = linear % 8u;
           const uint32_t br = linear / kMmaDim, bc = linear % kMmaDim;
-          A[ar][ac] = f32(av[lane]);
-          B[br][bc] = f32(bv[lane]);
+          // The tensor core ignores the low 13 bits of a tf32 operand (they are truncated, not rounded, as the SASS
+          // executor's HMMA does and an RTX 3060 shows for fragments loaded without __float_to_tf32).
+          A[ar][ac] = f32(av[lane] & 0xFFFFE000u);
+          B[br][bc] = f32(bv[lane] & 0xFFFFE000u);
         }
       }
     } else
@@ -10181,7 +10710,11 @@ class Interpreter {
     // Each element still accumulates its products in k order, exactly as the
     // element-by-element form did; running j innermost lets it vectorize.
     float D[kMmaDim][kMmaDim];
-    wmma_tile(D, A, B, C, K);
+    if (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor))   // (include/vgpu/exec/tc_ampere.hpp)
+      vgpu::exec::tc86::mma(kMmaDim, kMmaDim, K, tf ? 4 : 8, bf || tf ? vgpu::exec::tc86::kEminWide : vgpu::exec::tc86::kEminF16, false,
+                            &A[0][0], kMmaDim, &B[0][0], kMmaDim, &C[0][0], kMmaDim, &D[0][0], kMmaDim);
+    else
+      wmma_tile(D, A, B, C, K);
     // Scatter D back into the destination fragment.
     for (int reg = 0; reg < 8; ++reg) {
       Lanes r;  // written for every active lane below
@@ -10250,10 +10783,10 @@ class Interpreter {
           const uint64_t elem = op.layout == MatLayout::Row ? (uint64_t{rr} * ld + cc)
                                                             : (uint64_t{cc} * ld + rr);
           const uint64_t bits = load_routed(w, ctx, ins, lane, addr0 + elem * 4, 4);
-          // tf32 keeps f32's exponent and 10 mantissa bits. Rounding to that
-          // here is what the hardware fragment holds; keeping all 23 would
-          // make the simulator more accurate than the part it stands in for.
-          r[lane] = f32bits(f32_to_tf32(f32(bits)));
+          // wmma.load of a tf32 fragment is a plain 32-bit load: the register holds the
+          // float as it is in memory (an RTX 3060: fa.x[i] reads back every bit), and
+          // the tensor core reads only the top 19 bits of it (see exec_wmma_mma).
+          r[lane] = bits;
         } else {
           uint64_t packed = 0;
           for (int h = 0; h < 2; ++h) {
@@ -10394,6 +10927,32 @@ class Interpreter {
     return (err > 0) == (nv > hv) ? n : h;
   }
 
+  // The end of a float-to-integer conversion, for the already rounded value: the destination's range, and what a NaN
+  // gives. The pre-decoded conversion calls it too.
+  // Saturate against the powers of two themselves, which a double holds
+  // exactly. Clamping to INT64_MAX as a double rounded it up to 2^63, and
+  // converting 2^63 back was undefined: +inf and 2^63 came out as INT64_MIN
+  // for s64, and as 0 for u64. The 32-bit limits are exact doubles, which is
+  // why only the 64-bit conversions were wrong.
+  // NaN: 0 from an f32 or f16 into 32 bits or fewer; the destination's
+  // sign bit alone from an f64 into any width, or from an f32 into 64
+  // (an RTX 3060: cvt.rzi.s16.f64 of NaN is 0x8000, .s32.f64 and .u32.f64
+  // 0x80000000, cvt.rzi.s64.f32 and .u64.f32 0x8000000000000000).
+  static uint64_t float_to_int_bits(double rounded, uint32_t src_bits, bool dst_signed, uint32_t dst_bits) {
+    if (std::isnan(rounded))
+      return (src_bits == 64 || dst_bits == 64) ? uint64_t{1} << (dst_bits - 1) : 0;
+    if (dst_signed) {
+      const double limit = std::ldexp(1.0, static_cast<int>(dst_bits) - 1);
+      const uint64_t max = (uint64_t{1} << (dst_bits - 1)) - 1;
+      if (rounded >= limit) return mask_to_bits(max, dst_bits);
+      if (rounded < -limit) return mask_to_bits(~max, dst_bits);
+      return mask_to_bits(static_cast<uint64_t>(static_cast<int64_t>(rounded)), dst_bits);
+    }
+    if (rounded < 0) return 0;
+    if (rounded >= std::ldexp(1.0, static_cast<int>(dst_bits))) return mask_to_bits(~uint64_t{0}, dst_bits);
+    return mask_to_bits(static_cast<uint64_t>(rounded), dst_bits);
+  }
+
   uint64_t convert(const OpCvt* op, uint64_t in) {
     const Type& s = op->src_ty;
     const Type& d = op->dst_ty;
@@ -10410,6 +10969,9 @@ class Interpreter {
                  : s.bits == 32 ? static_cast<double>(f32(in))
                                 : f64(in);
       if (d.is_real()) {
+        // .ftz flushes an f32 source's subnormal first (an RTX 3060: cvt.rmi.ftz.f32.f32 of -2^-149 is -0, not -1).
+        if (op->ftz && s.bits == 32 && !s.is_bfloat() && x != 0 && std::fabs(x) < static_cast<double>(std::numeric_limits<float>::min()))
+          x = std::copysign(0.0, x);
         // An "i" rounding mode rounds to an integral value and keeps the float
         // type: cvt.rpi.f32.f32 is ceilf. Skipping it here made ceilf, floorf
         // and truncf return their argument, and roundf return x + 0.5.
@@ -10457,7 +11019,8 @@ class Interpreter {
         // 0x7ffd540000000000, 0xffff 0xfffffc0000000000).
         if (d.bits == 64 && s.bits == 16 && !s.is_bfloat() && std::isnan(x))
           return (uint64_t{(in >> 15) & 1} << 63) | 0x7FF8'0000'0000'0000ull | (uint64_t{in & 0x3FFu} << 42);
-        if (d.bits == 64) return f64bits(x);
+        // (A NaN that goes through an f64 rounding cvt, cvt.rmi.f64.f64 and the like, is quieted: an RTX 3060.)
+        if (d.bits == 64) return f64bits(x) | (x != x ? uint64_t{1} << 51 : 0);
         const float f = static_cast<float>(x);
         if (op->ftz && subnormal32(f)) return f32bits(std::copysign(0.0f, f));
         // f32 to f32 goes through the float pipeline, which writes the
@@ -10465,29 +11028,11 @@ class Interpreter {
         if (std::isnan(f) && (s.bits == 32 || s.bits == 16)) return 0x7FFF'FFFFu;
         return f32bits(f);
       }
-      // float -> int: round then clamp to the destination range.
-      double rounded = round_int(x, op->round == Round::None ? Round::Rzi : op->round);
-      // Saturate against the powers of two themselves, which a double holds
-      // exactly. Clamping to INT64_MAX as a double rounded it up to 2^63, and
-      // converting 2^63 back was undefined: +inf and 2^63 came out as INT64_MIN
-      // for s64, and as 0 for u64. The 32-bit limits are exact doubles, which is
-      // why only the 64-bit conversions were wrong.
-      // NaN: 0 from an f32 or f16 into 32 bits or fewer; the destination's
-      // sign bit alone from an f64 into any width, or from an f32 into 64
-      // (an RTX 3060: cvt.rzi.s16.f64 of NaN is 0x8000, .s32.f64 and .u32.f64
-      // 0x80000000, cvt.rzi.s64.f32 and .u64.f32 0x8000000000000000).
-      if (std::isnan(rounded))
-        return (s.bits == 64 || d.bits == 64) ? uint64_t{1} << (d.bits - 1) : 0;
-      if (d.is_signed()) {
-        const double limit = std::ldexp(1.0, static_cast<int>(d.bits) - 1);
-        const uint64_t max = (uint64_t{1} << (d.bits - 1)) - 1;
-        if (rounded >= limit) return mask_to_bits(max, d.bits);
-        if (rounded < -limit) return mask_to_bits(~max, d.bits);
-        return mask_to_bits(static_cast<uint64_t>(static_cast<int64_t>(rounded)), d.bits);
-      }
-      if (rounded < 0) return 0;
-      if (rounded >= std::ldexp(1.0, static_cast<int>(d.bits))) return mask_to_bits(~uint64_t{0}, d.bits);
-      return mask_to_bits(static_cast<uint64_t>(rounded), d.bits);
+      // float -> int: round then clamp to the destination range. With .ftz an f32 subnormal is the zero of its sign first
+      // (an RTX 3060: cvt.rmi.ftz.s32.f32 of -2^-149 is 0, where the floor of the subnormal itself is -1).
+      if (op->ftz && s.bits == 32 && !s.is_bfloat() && x != 0 && std::fabs(x) < static_cast<double>(std::numeric_limits<float>::min()))
+        x = std::copysign(0.0, x);
+      return float_to_int_bits(round_int(x, op->round == Round::None ? Round::Rzi : op->round), s.bits, d.is_signed(), d.bits);
     }
     // Integer source: sign/zero-extend to 64 bits first.
     uint64_t sv = mask_to_bits(in, s.bits);
@@ -10500,7 +11045,9 @@ class Interpreter {
                                : static_cast<double>(sv);
       if (d.is_bfloat()) return double_to_bf16(x);
       if (d.bits == 16) return double_to_f16(x);
-      return d.bits == 32 ? f32bits(static_cast<float>(x)) : f64bits(x);
+      // (A 64-bit integer to f32 is one rounding, from the integer: through a double first it rounded twice, and an RTX 3060 does not.)
+      if (d.bits == 32) return f32bits(s.is_signed() ? static_cast<float>(static_cast<int64_t>(sv)) : static_cast<float>(sv));
+      return f64bits(x);
     }
     if (op->sat && d.bits < 64) {
       // Clamp to the destination's range, reading the source with its own
@@ -10690,7 +11237,7 @@ class Interpreter {
   static float rcp_approx32(float x) { return static_cast<float>(1.0 / static_cast<double>(x)); }
 
   uint64_t float_bin(FloatBinOp op, Type ty, uint64_t a, uint64_t b,
-                     bool nan_propagate = false) {
+                     bool nan_propagate = false, bool a_first = false) {
     if (nan_propagate && (op == FloatBinOp::Min || op == FloatBinOp::Max)) {
       const double x = ty.bits == 64 ? f64(a) : static_cast<double>(f32(a));
       const double y = ty.bits == 64 ? f64(b) : static_cast<double>(f32(b));
@@ -10702,10 +11249,11 @@ class Interpreter {
         return kCanonicalNaN16;
       }
     }
-    return float_bin_impl(op, ty, a, b);
+    return float_bin_impl(op, ty, a, b, a_first);
   }
 
-  uint64_t float_bin_impl(FloatBinOp op, Type ty, uint64_t a, uint64_t b) {
+  // `a_first` (f64): with a NaN in both operands the card returns a's, not b's (OpFloatBin::nan_a_first: ptxas puts the later-defined operand first).
+  uint64_t float_bin_impl(FloatBinOp op, Type ty, uint64_t a, uint64_t b, bool a_first = false) {
     if (ty.bits == 16) {
       double x = f16_to_double(a), y = f16_to_double(b), r = 0;
       switch (op) {
@@ -10731,13 +11279,22 @@ class Interpreter {
       return canon32(r);
     }
     double x = f64(a), y = f64(b), r = 0;
+    // A NaN operand: the NaN of b if b is one, else a's, quieted, with its own sign and payload (an RTX 3060, probed with a
+    // distinct payload in each position: the sum, product and difference, and the larger or smaller of two NaNs; the host gives the
+    // first operand's, which the compiler's operand order picks). A single NaN in min and max loses to the other operand.
+    // Division is a software sequence on the card and keeps the host's.
+    if ((op == FloatBinOp::Min || op == FloatBinOp::Max) && (std::isnan(x) != std::isnan(y)))
+      return std::isnan(x) ? b : a;   // (not the host's fmin, which turns a signalling NaN into a NaN result)
+    if ((std::isnan(x) || std::isnan(y)) && op != FloatBinOp::Div)
+      return ((std::isnan(x) && (!std::isnan(y) || a_first)) ? a : b) | 0x0008000000000000ull;
     switch (op) {
       case FloatBinOp::Add: r = x + y; break;
       case FloatBinOp::Sub: r = x - y; break;
       case FloatBinOp::Mul: r = x * y; break;
       case FloatBinOp::Div: r = x / y; break;
-      case FloatBinOp::Min: r = std::fmin(x, y); break;
-      case FloatBinOp::Max: r = std::fmax(x, y); break;
+      // -0 orders below +0 (an RTX 3060: min(-0, +0) is -0 in either order, max(-0, +0) is +0), as for f32.
+      case FloatBinOp::Min: r = x == 0 && y == 0 ? (std::signbit(x) || std::signbit(y) ? -0.0 : 0.0) : std::fmin(x, y); break;
+      case FloatBinOp::Max: r = x == 0 && y == 0 ? (std::signbit(x) && std::signbit(y) ? -0.0 : 0.0) : std::fmax(x, y); break;
     }
     return f64bits(r);
   }
@@ -12544,7 +13101,7 @@ class Interpreter {
     while (lane < W_ && !(m & (Mask{1} << lane))) ++lane;
     if (lane >= W_) return;
     auto slot = [&](size_t i) -> uint64_t {
-      auto it = w.slots.find(op.param_slots[i]);
+      auto it = w.slots.find(op.param_ids[i]);
       if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister, "__assertfail argument slot read before write");
       return it->second.read(lane, 0, std::min<uint32_t>(it->second.size, 8));
@@ -12650,15 +13207,16 @@ class Interpreter {
 
     // Bind arguments before anything is swapped out: they live in the caller's
     // slot map and are read per lane.
-    std::unordered_map<std::string, Warp::Slot> args;
+    Warp::SlotMap& args = w.call_args;
+    args.clear();
     for (size_t i = 0; i < op.param_slots.size(); ++i) {
-      auto it = w.slots.find(op.param_slots[i]);
+      auto it = w.slots.find(op.param_ids[i]);
       if (it == w.slots.end())
         ctx_fail(ins, -1, Err::UninitializedRegister,
                  "argument slot '" + op.param_slots[i] + "' read before write");
       // Copied whole, bytes and all: a struct argument is as much a slot as a
       // scalar one, and only the name changes across the call boundary.
-      args[callee.param_slot_names[i]] = it->second;
+      args[callee.param_slot_ids[i]] = it->second;
     }
 
     // The caller resumes after the call, so its path is saved already past it.
@@ -12679,8 +13237,8 @@ class Interpreter {
     f.written32.swap(w.written32);
     f.written64.swap(w.written64);
     f.slots.swap(w.slots);
-    f.retval_from = callee.retval_slot_name;
-    f.retval_to = op.retval_slot;
+    f.retval_from = callee.retval_slot_id;
+    f.retval_to = op.retval_id;
     f.lanes = m;
     f.sp = w.sp;
     f.sp_valid = w.sp_valid;
@@ -12703,7 +13261,7 @@ class Interpreter {
     w.preds.assign(callee.num_regs32 + callee.num_regs64, 0);
     w.written32.assign(callee.num_regs32, 0);
     w.written64.assign(callee.num_regs64, 0);
-    w.slots = std::move(args);
+    w.slots.swap(args);   // (what comes back into `args` is the frame's emptied map)
     w.entered_call = true;
   }
 
@@ -12713,7 +13271,7 @@ class Interpreter {
     Warp::Frame& f = w.frames.back();
     Warp::Slot retval;
     bool have_ret = false;
-    if (!f.retval_from.empty()) {
+    if (f.retval_from != kNoSlot) {
       auto it = w.slots.find(f.retval_from);
       if (it != w.slots.end()) {
         retval = std::move(it->second);
@@ -12736,7 +13294,7 @@ class Interpreter {
     w.sp_valid = f.sp_valid;
     // Only the calling lanes' return values: another path's lanes may have a
     // result in the same-named slot that they have not loaded yet.
-    if (have_ret && !f.retval_to.empty()) {
+    if (have_ret && f.retval_to != kNoSlot) {
       Warp::Slot& out = w.slots[f.retval_to];
       out.fit(retval.size, W_);
       for (uint32_t lane = 0; lane < W_; ++lane)
@@ -12798,14 +13356,14 @@ class Interpreter {
   // works on hardware works here, but one that copies a device-malloc'd
   // pointer to the host will pass here and fail there.
   const Warp::Slot& call_slot(const Warp& w, const Instr& ins, const OpCall& op, size_t i) {
-    auto it = w.slots.find(op.param_slots[i]);
+    auto it = w.slots.find(op.param_ids[i]);
     if (it == w.slots.end())
       ctx_fail(ins, -1, Err::UninitializedRegister, op.callee + " argument read before it was written");
     return it->second;
   }
   void write_call_result(Warp& w, const OpCall& op, Mask m, const Lanes& r, uint32_t bytes) {
-    if (op.retval_slot.empty()) return;
-    Warp::Slot& out = w.slots[op.retval_slot];
+    if (op.retval_id == kNoSlot) return;
+    Warp::Slot& out = w.slots[op.retval_id];
     if (out.bytes.empty()) out.reset(bytes, W_);
     for (uint32_t lane = 0; lane < W_; ++lane)
       if (m & (Mask{1} << lane)) out.write(lane, 0, bytes, r[lane]);
@@ -13507,7 +14065,7 @@ class Interpreter {
     if (op.param_slots.size() != 1)
       ctx_fail(ins, -1, Err::UnsupportedPtx,
                std::string(allocating ? "malloc" : "free") + " expects exactly one argument");
-    auto it = w.slots.find(op.param_slots[0]);
+    auto it = w.slots.find(op.param_ids[0]);
     if (it == w.slots.end())
       ctx_fail(ins, -1, Err::UninitializedRegister, "device heap argument slot read before write");
 
@@ -13525,8 +14083,8 @@ class Interpreter {
                  "device free() of a pointer the device heap did not allocate, or already freed");
       }
     }
-    if (allocating && !op.retval_slot.empty()) {
-      Warp::Slot& out = w.slots[op.retval_slot];
+    if (allocating && op.retval_id != kNoSlot) {
+      Warp::Slot& out = w.slots[op.retval_id];
       if (out.bytes.empty()) out.reset(8, W_);
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) out.write(lane, 0, 8, result[lane]);
@@ -13536,8 +14094,8 @@ class Interpreter {
   void exec_vprintf(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCall& op, Mask m) {
     if (op.param_slots.size() != 2)
       ctx_fail(ins, -1, Err::UnsupportedPtx, "vprintf expects exactly 2 arguments (format, valist)");
-    auto fmt_it = w.slots.find(op.param_slots[0]);
-    auto va_it = w.slots.find(op.param_slots[1]);
+    auto fmt_it = w.slots.find(op.param_ids[0]);
+    auto va_it = w.slots.find(op.param_ids[1]);
     if (fmt_it == w.slots.end() || va_it == w.slots.end())
       ctx_fail(ins, -1, Err::UninitializedRegister, "vprintf argument slot read before write");
 
@@ -13564,8 +14122,8 @@ class Interpreter {
       vgpu::exec::emit_device_printf(out);
       counts[lane] = out.size();
     }
-    if (!op.retval_slot.empty()) {
-      Warp::Slot& slot = w.slots[op.retval_slot];
+    if (op.retval_id != kNoSlot) {
+      Warp::Slot& slot = w.slots[op.retval_id];
       if (slot.bytes.empty()) slot.reset(4, W_);
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) slot.write(lane, 0, 4, counts[lane]);
@@ -13628,6 +14186,10 @@ class Interpreter {
   // One entry per instruction, filled on first use. Classifying costs a chain
   // of variant tests, and the instruction stream is the hottest path there is.
   mutable std::vector<uint8_t> class_by_pc_;
+  // The same for the device functions the kernel calls (see class_of_pc).
+  mutable std::map<const EntryFn*, std::vector<uint8_t>> func_classes_;
+  mutable const EntryFn* func_class_fn_ = nullptr;
+  mutable const uint8_t* func_class_ = nullptr;
   uint32_t cur_warp_ = 0;     // which warp of the block is running, for race reports
   bool fast_enabled_ = true;   // VGPU_FASTPATH, sampled at launch
   // The word that is non-zero while an arithmetic fault is armed (MemoryManager::alu_fault_armed's, taken once: the
@@ -13640,6 +14202,10 @@ class Interpreter {
   const BlockCtx* ctx_ = nullptr;          // the block of the warp being run (for the pre-decoded forms)
   const EntryFn* micro_owner_ = nullptr;   // the function micro_ was taken from
   const MicroOp* micro_ = nullptr;         // its pre-decoded instructions, or null
+  const uint64_t* micro_consts_ = nullptr;   // and the 64-bit constants they name (EntryFn::micro_consts)
+  std::array<Lanes, 3> immf_lanes_{};      // the constants spread across the lanes, with their values
+  std::array<uint64_t, 3> immf_value_{};
+  std::array<bool, 3> immf_valid_{};
   // Immediates spread across the lanes for micro_src, with the value each holds,
   // and the zeros an unwritten register reads as.
   std::array<Lanes32, 3> imm_lanes_{};
@@ -14057,7 +14623,7 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
   if (lane128 && (op.ws || (G == 2 && M == 128)))
     refuse("the 128-lane scale-factor A layout with a CTA pair at M = 128: each CTA's rows then sit in D lanes the "
            "figures do not tie to a scale lane");
-  if (k64 && !((G == 1 && M == 128) || (G == 2 && M == 256)) || (k64 && op.ws))
+  if ((k64 && !((G == 1 && M == 128) || (G == 2 && M == 256))) || (k64 && op.ws))
     h.fail(Err::InvalidValue, "tcgen05.mma with K = 64 is 128xNxK1 on one CTA or 256xNxK1 on a pair (Table 48), and not .ws");
   if (op.a_tmem && trans_a) bad();
   // Below M = 128 the ISA draws only D's .ws layouts (E and G), not where A
@@ -14417,8 +14983,12 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
             accf[i] = acc;
           }
           tc_rows_f32(accf.data(), Af.data(), Bf.data() + p * w, K, w, N);
+          // (A NaN in an f32 D is the canonical 0x7fffffff, whichever NaN the host's vector add kept when two met -- the compiler's
+          // operand order picks it, and a -O2 and a ThreadSanitizer -O1 build differed. Derived from the HMMA/mma rule of an RTX 3060
+          // and the PTX documentation: no card has tcgen05.)
           for (uint32_t i = 0; i < w; ++i)
-            cells[i] = d_f16 ? static_cast<uint32_t>(double_to_f16(accf[i]) & 0xFFFF) : f32bits(accf[i]);
+            cells[i] = d_f16 ? static_cast<uint32_t>(double_to_f16(accf[i]) & 0xFFFF)
+                             : (accf[i] != accf[i] ? 0x7FFFFFFFu : f32bits(accf[i]));
         }
         continue;
       }
@@ -14449,7 +15019,7 @@ void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
           const double b = B[size_t{k} * N + n] * SB[k / blk];
           acc += static_cast<float>(a) * static_cast<float>(b);
         }
-        cell = d_f16 ? static_cast<uint32_t>(double_to_f16(acc) & 0xFFFF) : f32bits(acc);
+        cell = d_f16 ? static_cast<uint32_t>(double_to_f16(acc) & 0xFFFF) : (acc != acc ? 0x7FFFFFFFu : f32bits(acc));
       }
     }
   }
@@ -14630,8 +15200,10 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
     // Clusters arrived with Hopper. Running one on an older profile would
     // report a scheduling level that part does not have, which is the kind of
     // wrong answer this whole engine exists to avoid.
+    // (An RTX 3060, sm_86, refuses every cluster launch -- 2 over 4 blocks, 3 over 4, a cluster of 0, 9 and 16 -- with
+    // cudaErrorInvalidClusterSize / CUDA_ERROR_INVALID_CLUSTER_SIZE (912), in the runtime and the driver alike.)
     if (p.cc_major < 9)
-      throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
+      throw Error::make(Err::LaunchCluster, "kernel '", fn.name,
                         "': thread-block clusters require compute capability 9.0 or later; ",
                         p.id, " is ", p.cc_major, ".", p.cc_minor);
     // A launch that contradicts the kernel's own __cluster_dims__ fails on
@@ -14648,7 +15220,7 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
       // them has blocks belonging to no cluster. Hardware rejects this; so
       // does this, rather than inventing a partial cluster.
       if (cfg.grid[i] % c != 0)
-        throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': grid dimension ", i,
+        throw Error::make(Err::LaunchCluster, "kernel '", fn.name, "': grid dimension ", i,
                           " is ", cfg.grid[i], ", which is not a multiple of the cluster "
                           "dimension ", c);
       ctas *= c;
@@ -14658,7 +15230,7 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
     // Hopper and Blackwell, the most those parts schedule.
     const uint64_t nonportable_max = p.cc_major >= 9 ? 16 : 8;
     if (ctas > 8 && !(cfg.nonportable_cluster && ctas <= nonportable_max))
-      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': cluster of ", ctas,
+      throw Error::make(Err::LaunchCluster, "kernel '", fn.name, "': cluster of ", ctas,
                         " blocks exceeds ",
                         cfg.nonportable_cluster
                             ? "the " + std::to_string(nonportable_max) + " this part can schedule"
@@ -14717,13 +15289,13 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
                                          cfg.shared_bytes);
   uint64_t block_regs = uint64_t{res.usage.regs_per_thread} * threads;
   if (block_regs > p.limits.registers_per_block)
-    throw Error::make(Err::LaunchConfig, "too many resources requested for launch: kernel '",
+    throw Error::make(Err::LaunchResources, "too many resources requested for launch: kernel '",
                       fn.name, "' uses ", res.usage.regs_per_thread, " registers per thread and ",
                       threads, " threads per block (", block_regs,
                       " registers), but profile ", p.id, " allows ", p.limits.registers_per_block,
                       " per block. Use a smaller block or fewer registers.");
   if (res.occupancy.blocks_per_sm == 0)
-    throw Error::make(Err::LaunchConfig, "kernel '", fn.name,
+    throw Error::make(Err::LaunchResources, "kernel '", fn.name,
                       "' cannot place a single block on a multiprocessor of ", p.id,
                       " (limited by ", res.occupancy.limited_by, ")");
 

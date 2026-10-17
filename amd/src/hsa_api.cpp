@@ -41,6 +41,7 @@
 #include "vgpu/amd_image.hpp"
 #include "vgpu/hip_abi.hpp"
 #include "vgpu/hsa_abi.h"
+#include "vgpu_hip.h"   // hipError_t, for the HIP calls hsa_vmem.inc declares
 
 namespace {
 
@@ -1657,7 +1658,8 @@ hsa_status_t hsa_executable_symbol_get_info(hsa_executable_symbol_t symbol, hsa_
   if (!value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
   const Symbol& s = *reinterpret_cast<const Symbol*>(symbol.handle);
   const bool kernel = s.kind == HSA_SYMBOL_KIND_KERNEL;
-  switch (attribute) {
+  // On the integer: some of the values below (3, 4, 6, 7, 8, 10, 18) are not named in this header's enum.
+  switch (static_cast<int>(attribute)) {
     case HSA_EXECUTABLE_SYMBOL_INFO_TYPE: put<uint32_t>(value, s.kind); break;
     case HSA_EXECUTABLE_SYMBOL_INFO_NAME_LENGTH: put<uint32_t>(value, static_cast<uint32_t>(s.name.size())); break;
     case HSA_EXECUTABLE_SYMBOL_INFO_NAME: std::memcpy(value, s.name.data(), s.name.size()); break;

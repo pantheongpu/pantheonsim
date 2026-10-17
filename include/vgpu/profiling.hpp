@@ -216,6 +216,13 @@ void notify_sync(SyncKind what, uint64_t stream);
 void set_host_clock(uint64_t (*fn)());
 uint64_t host_ns();
 
+// The number that names a thread in records. CUPTI's default is the POSIX
+// thread handle (pthread_self); cuptiSetThreadIdType switches it to the
+// system thread id (SYS_gettid), and a tool must not switch it mid-session.
+void set_thread_id_system(bool system);
+bool thread_id_system();
+uint32_t thread_id();
+
 // The arguments of the call about to be made: pointers to its parameters, in
 // declaration order. Taken by the next ApiCall on this thread. Costs nothing
 // when nobody listens.

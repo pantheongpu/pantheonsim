@@ -121,11 +121,14 @@ letting it fail later with an error that points nowhere.
   here, at `cudaGetDeviceCount`, before it compiles a kernel. See
   [jit.md](jit.md). Numba and Triton are unaffected, because neither loads a
   CUDA runtime at all.
-- **Nsight Systems** collects through its own bundled CUPTI, loaded by absolute
-  path, which reaches the driver the same way — so `nsys` produces a report with
-  OS runtime traces and no CUDA data. `nvprof` works, because its path goes
-  through the public CUPTI that VirtualGPU does implement. See
-  [cupti.md](cupti.md).
+- **Nsight Systems** loads its own CUPTI by absolute path and does call
+  `cuGetExportTable` itself (seven tables, served from the stubs above), but
+  with the shim's own libcupti put in that path (a private mount), the first
+  thing that stops it is an undocumented CUPTI function, and after it the host
+  side does not recognize the GPU; its GPU-information helper links the static
+  runtime. See
+  [cupti.md](cupti.md). `nvprof` works, because its path goes through the
+  public CUPTI that VirtualGPU does implement.
 
 ## The knobs used here
 

@@ -1,0 +1,15 @@
+# CUDA Samples whose result differs from the RTX 3060's today, the ratchet for
+# suites.sh: a program listed here that still differs is reported, not failed;
+# one that starts matching fails the job until its line is deleted; every other
+# difference fails as before. Columns: sample | class | reason | what fixes it.
+# Classes: image (the runner's toolchain lacks something), sim (a simulator
+# gap), card (cannot match: the program needs what the simulated card does not
+# have), slow (a timeout), skipped (too slow to run at all; not run).
+# The details of each, and a reproducer for the simulator gaps, are in TODO.md
+# under "CUDA Samples known differences".
+simpleAttributes|skipped|a 65535 x 1024-thread grid in which every thread loops about 700 times on a shared counter: some 5e10 simulated thread-iterations, past any timeout we can afford (600 s at the nightly's limit, every night)|nothing short of a much faster engine; see TODO.md#cuda-samples-known-differences
+graphMemoryFootprint|skipped|16 launches of a 16.7M-thread kernel in which every thread spins on clock() for 8900 clocks (the simulator's clock is its instruction count): did not finish in 3000 s|a faster clock() loop or a smaller grid; see TODO.md#cuda-samples-known-differences
+simpleCUFFT_callback|card|links libcufft_static.a, which carries NVIDIA's own CUDA runtime, and that asks the driver for its internal export table, which a simulated driver has not (cufftMakePlan1d: CUFFT_INTERNAL_ERROR)|the driver export table (nvidia/docs/dark-api.md), or cuFFT built on the shared runtime; see TODO.md#cuda-samples-known-differences
+UnifiedMemoryPerf|sim|launches run to completion inside the launch call, so a kernel that spins until the host sets a flag after launching it (spinWhileLessThanOne) hits the step budget (cudaErrorLaunchTimeout)|kernels that run beside the host thread (stream workers, nvidia/src/runtime_api.cpp and src/runtime/runtime.cpp); see TODO.md#cuda-samples-known-differences
+quasirandomGenerator|card|the simulated GPU's numbers now agree with the CPU's (L1 norm 7.3e-12; the SASS decoder bug that made it 0.55 is fixed), but the card printed 9.439909E-08, which the sample's host-built reference table decides|record the card with the reference table built as the job builds it; see TODO.md#cuda-samples-known-differences
+quasirandomGenerator_nvrtc|card|the same as quasirandomGenerator, through NVRTC|the same; see TODO.md#cuda-samples-known-differences

@@ -154,7 +154,7 @@ std::string uuid_of(const Sample& s) {
   if (!(p)) return kInval;                            \
   const int s##_i = ordinal((h), kGpuBase);           \
   if (s##_i < 0) return kNotFound;                    \
-  const Sample s = machine()[static_cast<size_t>(s##_i)]
+  [[maybe_unused]] const Sample s = machine()[static_cast<size_t>(s##_i)]
 
 AMDSMI_API int amdsmi_init(uint64_t flags) {
   // CPUs and non-AMD devices are not simulated; a caller asking only for

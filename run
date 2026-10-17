@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Start a simulated GPU machine and step inside it. After `make`:
+#
+#   ./run                      the machine in ./pantheonsim.yaml (written for you if missing)
+#   ./run my.yaml              the machine in my.yaml
+#   ./run my.yaml -- nvidia-smi -L     run one command in the machine and exit with its status
+#
+# This is `build/vgpu --config FILE shell -y` with the checks a first run needs
+# around it: the file is validated first, a missing build is built (never any
+# package installed), and where the system forbids user namespaces the machine
+# is started without them instead of failing. docs/machine-simulator.md says
+# what the machine is; docs/config.md lists the settings.
+#
+# Bash 4+, no dependencies beyond the simulator itself.
+set -u
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+vgpu="$here/build/vgpu"
+
+usage() {
+  cat <<'EOF'
+Usage: ./run [config.yaml] [-- command ...]
+
+Starts a simulated GPU machine and takes you inside it. Your own programs run
+there (nvcc, hipcc, python, pip, curl and git are the ones on your machine).
+Type exit to leave.
+
+  ./run                  use ./pantheonsim.yaml; written for you if there is none
+  ./run my.yaml          use my.yaml (gpu, count, vram_mb, cuda_version, os, ...)
+  ./run -- nvidia-smi -L run one command in the machine, print its output, exit
+                         with its status (this is how scripts and tests use it)
+  ./run -h, --help       this text
+
+The settings are listed in docs/config.md; `build/vgpu config keys` prints them.
+Build first with `make`.
+EOF
+}
+
+die() { printf 'run: %s\n' "$*" >&2; exit "${2:-1}"; }
+
+config=""
+have_cmd=0
+cmd=()
+while (( $# )); do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    --) shift; have_cmd=1; cmd=("$@"); break ;;
+    -*) die "unknown option '$1'. ./run --help shows the usage." 2 ;;
+    *)  [[ -z $config ]] || die "more than one settings file given ('$config' and '$1'). ./run --help shows the usage." 2
+        config=$1; shift ;;
+  esac
+done
+if (( have_cmd )) && (( ${#cmd[@]} == 0 )); then
+  die "nothing to run after --. Write the command, for example: ./run -- nvidia-smi -L" 2
+fi
+
+# ---- the build ---------------------------------------------------------------
+if [[ ! -x $vgpu ]]; then
+  echo "run: the simulator is not built yet (no build/vgpu). Building it now with 'make build'; this takes a few minutes."
+  command -v make >/dev/null 2>&1 || die "make is not installed. Install it, then run make."
+  if ! make -C "$here" build; then
+    die "the build failed. 'make doctor' shows what is missing and 'make deps' installs it."
+  fi
+  [[ -x $vgpu ]] || die "the build finished but there is still no build/vgpu."
+fi
+
+# ---- the settings file ---------------------------------------------------------
+if [[ -z $config ]]; then
+  xdg=${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/pantheonsim/config.yaml
+  if [[ -n ${VGPU_CONFIG:-} ]]; then config=$VGPU_CONFIG
+  elif [[ -e pantheonsim.yaml ]]; then config=pantheonsim.yaml
+  elif [[ -e $xdg ]]; then config=$xdg
+  else
+    config=pantheonsim.yaml
+    "$vgpu" config init "$config" >/dev/null || die "could not write $config."
+    echo "run: wrote $config (a commented starter, one simulated H100). Edit it any time to change the machine."
+  fi
+elif [[ ! -e $config ]]; then
+  die "no such settings file: $config. ./run with no argument writes a starter, or copy docs/config.md's example."
+fi
+
+if ! shown=$("$vgpu" --config "$config" config show 2>&1); then
+  printf '%s\n' "$shown" >&2
+  die "$config is not a valid settings file (the message above says which line). docs/config.md lists the keys."
+fi
+
+# A value from `config show`: the text in the value column of the row for a key.
+setting() {
+  awk -v k="$1" '
+    $1 == "key" && !a { a = index($0, "value"); b = index($0, "from"); next }
+    a && $1 == k { v = substr($0, a, b - a); gsub(/^ +| +$/, "", v); print v; exit }
+  ' <<<"$shown"
+}
+
+# ---- isolation ---------------------------------------------------------------
+# vgpu shell runs itself under `unshare -r -m -u`. Where unprivileged user
+# namespaces are restricted (Ubuntu 24.04 sets
+# kernel.apparmor_restrict_unprivileged_userns=1) that fails at start, so try
+# the same call first and fall back to the unisolated machine, which has the
+# same tools and programs.
+flags=()
+if ! command -v unshare >/dev/null 2>&1 || ! unshare -r -m -u true >/dev/null 2>&1; then
+  flags+=(--no-isolate)
+  echo "run: Your system restricts user namespaces, so the machine is not isolated; nvidia-smi, nvcc and your programs work the same."
+fi
+
+# ---- one command ------------------------------------------------------------------
+if (( have_cmd )); then
+  line=$(printf '%q ' "${cmd[@]}")
+  exec "$vgpu" --config "$config" shell -y ${flags[@]+"${flags[@]}"} -c "${line% }"
+fi
+
+# ---- the banner, then the machine ----------------------------------------------------
+gpu=$(setting gpu); count=$(setting count)
+case $gpu in
+  amd/*) ver=$(setting rocm_version); name=ROCm; tool=rocm-smi; cc=hipcc ;;
+  *)     ver=$(setting cuda_version); name=CUDA; tool=nvidia-smi; cc=nvcc ;;
+esac
+machine="${count:-1} x ${gpu:-nvidia/h100}"
+[[ -n $ver && $ver != "this build's" ]] && machine+=", $name $ver"
+echo
+echo "  PantheonSim: $machine, simulated (no GPU needed)"
+echo "  Try:  $tool                         the GPUs, as the real tool shows them"
+if command -v nvcc >/dev/null 2>&1 || command -v hipcc >/dev/null 2>&1; then
+  echo "        $cc prog.cu -o prog && ./prog     compile and run your own (CUDA: add -cudart shared)"
+else
+  echo "        nvcc/hipcc not found; prebuilt programs and Python work, see docs/toolchains.md"
+fi
+echo "        python3 -m venv ~/v && ~/v/bin/pip install torch    Python packages; curl and git clone work too"
+echo "  Leave with: exit"
+echo
+exec "$vgpu" --config "$config" shell -y ${flags[@]+"${flags[@]}"}

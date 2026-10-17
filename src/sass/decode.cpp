@@ -1226,6 +1226,15 @@ void dec_fsel(Instr& ins, const Word& w) {
   ins.src.push_back(pred_src(w, 87, 90));
 }
 
+// An f16 source's half of its register, bits 60-61 (the same field as I2F's narrow-source select): `.H1` is the high half. FRND, F2I and
+// F2F with an f16 source read the low half unless it says otherwise (an RTX 3060 converts the high half: probed with conv_forms).
+static void f16_part(Instr& ins, const Word& w, unsigned ssize) {
+  if (ssize != 1) return;
+  const unsigned part = static_cast<unsigned>(w.field(60, 2));
+  ins.f[5] = part;
+  if (part && ins.src[0].kind == Kind::Reg) ins.src[0].suffix = ".H" + std::to_string(part);
+}
+
 // FRND (0x107, 32-bit; 0x113 with a 64-bit side): round to an integral
 // value. 78-79 the rounding (none: to nearest even), 75-76 the result's
 // size and 84-85 the source's (log2 bytes), 80 FTZ.
@@ -1233,7 +1242,7 @@ void dec_frnd(Instr& ins, const Word& w) {
   ins.op = Op::FRND;
   ins.mnemonic = "FRND";
   const unsigned dsz = static_cast<unsigned>(w.field(75, 2)), ssz = static_cast<unsigned>(w.field(84, 2));
-  if (dsz == 3 && ssz == 3) ins.mods.push_back("F64");
+  if (dsz == ssz && dsz != 2) ins.mods.push_back(dsz == 3 ? "F64" : "F16");   // (nvdisasm names a same-size pair once)
   else if (dsz != 2 || ssz != 2) {
     ins.mods.push_back(dsz == 3 ? "F64" : dsz == 1 ? "F16" : "F32");
     ins.mods.push_back(ssz == 3 ? "F64" : ssz == 1 ? "F16" : "F32");
@@ -1251,6 +1260,7 @@ void dec_frnd(Instr& ins, const Word& w) {
   if (ssz == 3 && ins.src[0].kind == Kind::Reg) ins.src[0].width = 2;
   src_neg_abs(ins.src[0], w, true);
   if (ssz == 3) double_imm(ins);
+  f16_part(ins, w, ssz);
 }
 
 // FCHK: whether a / b needs the division's slow path.
@@ -1322,6 +1332,7 @@ void dec_f2i(Instr& ins, const Word& w) {
   one_src(ins, w, kFloat, false);
   src_neg_abs(ins.src[0], w, true);
   if (ssize == 3) ins.src[0].width = 2;
+  f16_part(ins, w, ssize);
 }
 
 // F2F: float (84-85) to float (75-76).
@@ -1343,6 +1354,7 @@ void dec_f2f(Instr& ins, const Word& w) {
   one_src(ins, w, kFloat, false);
   src_neg_abs(ins.src[0], w, true);
   if (ssize == 3) ins.src[0].width = 2;
+  f16_part(ins, w, ssize);
 }
 
 // I2I: saturating integer narrowing (sm_75+): 32-bit source to U8/S8/U16/S16.
@@ -1367,7 +1379,7 @@ void dec_i2i(Instr& ins, const Word& w) {
 // nvdisasm names both types.
 // The narrow formats an F2FP packs to or unpacks from, as one code: kept in
 // f[3] (packed to) or f[4] (unpacked from).
-enum : unsigned { kNarrowE4M3 = 10, kNarrowE5M2, kNarrowE3M2, kNarrowE2M3, kNarrowE2M1, kNarrowUE8M0 };
+enum : unsigned { kNarrowNone = 0, kNarrowE4M3 = 10, kNarrowE5M2, kNarrowE3M2, kNarrowE2M3, kNarrowE2M1, kNarrowUE8M0 };
 
 void dec_f2fp(Instr& ins, const Word& w) {
   ins.op = Op::F2FP;
@@ -1385,16 +1397,16 @@ void dec_f2fp(Instr& ins, const Word& w) {
   const char* sname = sts[st];
   unsigned narrow = 0;
   if (mode == 1) {
-    if (fam == 4) narrow = dt == 7 ? kNarrowE4M3 : dt == 6 ? kNarrowE5M2 : 0;
-    else if (fam == 3) narrow = dt == 7 ? kNarrowE3M2 : dt == 6 ? kNarrowE2M3 : 0;
-    else if (fam == 1) narrow = dt == 7 ? kNarrowE2M1 : 0;
-    else if (fam == 6) narrow = dt == 6 ? kNarrowUE8M0 : 0;
+    if (fam == 4) narrow = dt == 7 ? kNarrowE4M3 : dt == 6 ? kNarrowE5M2 : kNarrowNone;
+    else if (fam == 3) narrow = dt == 7 ? kNarrowE3M2 : dt == 6 ? kNarrowE2M3 : kNarrowNone;
+    else if (fam == 1) narrow = dt == 7 ? kNarrowE2M1 : kNarrowNone;
+    else if (fam == 6) narrow = dt == 6 ? kNarrowUE8M0 : kNarrowNone;
     static const char* const nn[] = {"E4M3", "E5M2", "E3M2", "E2M3", "E2M1", "E8"};
     if (narrow) dname = nn[narrow - kNarrowE4M3];
   } else if (mode == 4 && st != 0) {
-    if (ufam == 0) narrow = st == 3 ? kNarrowE4M3 : st == 2 ? kNarrowE5M2 : 0;
+    if (ufam == 0) narrow = st == 3 ? kNarrowE4M3 : st == 2 ? kNarrowE5M2 : kNarrowNone;
     else if (ufam == 1) narrow = st == 3 ? kNarrowE3M2 : st == 2 ? kNarrowE2M3 : kNarrowE2M1;
-    else if (ufam == 2) narrow = st == 3 ? kNarrowUE8M0 : 0;
+    else if (ufam == 2) narrow = st == 3 ? kNarrowUE8M0 : kNarrowNone;
     static const char* const nn[] = {"E4M3", "E5M2", "E3M2", "E2M3", "E2M1", "E8"};
     if (narrow) sname = nn[narrow - kNarrowE4M3];
   }
@@ -1773,9 +1785,11 @@ void dec_p2r(Instr& ins, const Word& w) {
 void dec_r2p(Instr& ins, const Word& w) {
   ins.op = Op::R2P;
   ins.mnemonic = "R2P";
-  // Which byte of the register: 72-73, printed as a modifier; Turing keeps
-  // it at 76-77 and prints it on the register.
-  const unsigned byte = static_cast<unsigned>(ins.sm < 80 ? w.field(76, 2) : w.field(72, 2));
+  // Which byte of the register: bits 76-77 on every architecture (ptxas's R2P PR, R5.B1 / .B2 / .B3 for the
+  // second to fourth byte of a loop counter's bits, which a fully unrolled shift-and-test loop makes: 0x...1000,
+  // 0x...2000, 0x...3000 in the high word of an sm_86 cubin). Printed as a modifier from Ampere on; Turing
+  // prints it on the register. It was read at 72-73 from Ampere on, so every R2P took byte 0.
+  const unsigned byte = static_cast<unsigned>(w.field(76, 2));
   if (byte && ins.sm >= 80) ins.mods.push_back("B" + std::to_string(byte));
   ins.f[0] = byte;
   ins.dst.push_back(Txt("PR"));
@@ -3471,6 +3485,20 @@ void dec_ugetnextworkid(Instr& ins, const Word& w) {
   ins.src.push_back(mem_addr(kRZ, false, "", ur + 1, 0, ins.sm));
 }
 
+// VABSDIFF Rd, Ra, Rb, Rc = |a - b| + c (the 32-bit sum of absolute difference, which is what __sad and __usad compile to): .U32 when bit
+// 73 is clear, otherwise the operands are signed. The difference is taken at full width (a - b of two int32 does not wrap before the
+// absolute value) and the sum with c wraps at 32 bits, as the PTX sad.s32 / sad.u32 the card agrees with (probed with INT_MIN, INT_MAX
+// and -1 operands). Bits 74-80 are not known to mean anything: an encoding that sets one is refused, not guessed at.
+void dec_vabsdiff(Instr& ins, const Word& w) {
+  if (w.field(74, 7) != 0) throw Error(Err::UnsupportedPtx, "SASS: VABSDIFF with modifier bits 74-80 set");
+  ins.op = Op::VABSDIFF;
+  ins.mnemonic = "VABSDIFF";
+  if (!w.bit(73)) ins.mods.push_back("U32");
+  ins.f[0] = w.bit(73);   // signed
+  ins.dst.push_back(dst_reg(w, false, ins.sm));
+  alu3(ins, w, kUnsigned);
+}
+
 void dec_vabsdiff4(Instr& ins, const Word& w) {
   ins.op = Op::VABSDIFF4;
   ins.mnemonic = "VABSDIFF4";
@@ -3633,6 +3661,7 @@ const std::unordered_map<unsigned, Dec>& float_table() {
       {0x104, dec_f2f}, {0x110, dec_f2f},
       {0x38, dec_i2i},
       {0x3e, dec_f2fp},
+      {0x14, dec_vabsdiff},
       {0x15, dec_vabsdiff4},
       {0x26, dec_idp},
       {0x1b, dec_bmsk},

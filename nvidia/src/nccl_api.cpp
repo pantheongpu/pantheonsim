@@ -334,7 +334,7 @@ Rendezvous* attach(const std::string& base, int nranks, std::string* err) {
     void* p = mmap(nullptr, sizeof(Meta), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) { close(fd); unlink(tmp.c_str()); *err = "mmap"; return nullptr; }
     auto* m = static_cast<Meta*>(p);
-    std::memset(m, 0, sizeof(Meta));
+    std::memset(static_cast<void*>(m), 0, sizeof(Meta));
     m->version = kVersion;
     m->nranks = (uint32_t)nranks;
     m->magic = kMagic;  // last: a reader that sees the magic sees a complete file
@@ -511,7 +511,7 @@ size_t type_size(ncclDataType_t t) {
 
 float half_to_float(uint16_t bits) {
   __half v;
-  std::memcpy(&v, &bits, sizeof v);
+  std::memcpy(static_cast<void*>(&v), &bits, sizeof v);
   return __half2float(v);
 }
 uint16_t float_to_half(float f) {
@@ -522,7 +522,7 @@ uint16_t float_to_half(float f) {
 }
 float bf16_to_float(uint16_t bits) {
   __nv_bfloat16 v;
-  std::memcpy(&v, &bits, sizeof v);
+  std::memcpy(static_cast<void*>(&v), &bits, sizeof v);
   return __bfloat162float(v);
 }
 uint16_t float_to_bf16(float f) {

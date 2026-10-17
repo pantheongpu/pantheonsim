@@ -24,6 +24,8 @@
 #            batch is made, not when it is delivered
 #   um       Unified Memory counters: configuring them, and (where the driver pages
 #            managed memory on demand) what a managed allocation produces
+#   nsys     what Nsight Systems found missing: the thread-id type and the device
+#            record's uuid
 #   peer     copies between two devices with a peer path (SKIPped where there is none)
 #   misc     which kinds can be enabled, per-function records, callback switches,
 #            CUDA event records, copies between devices, overhead, a program clock
@@ -37,7 +39,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
-case_name="${1:?usage: $0 <trace|nvtx|extcorr|params|memory|graph|resource|misc|overhead|filter|filter_driver|buffers|um|peer|compat12|driver_params> [--card [--update]]}"
+case_name="${1:?usage: $0 <trace|nvtx|extcorr|params|memory|graph|resource|misc|overhead|filter|filter_driver|buffers|um|nsys|peer|compat12|driver_params> [--card [--update]]}"
 shift
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 src="$root/nvidia/tests/e2e/cupti_${case_name}.cu"

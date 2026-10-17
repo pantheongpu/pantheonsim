@@ -240,10 +240,16 @@ inline void fdct8x8_scalar(const double* in, double* out) {
 #ifdef VGPU_HOSTJPEG_AVX2
 __attribute__((target("avx2"))) inline void fdct8x8_avx2(const double* in, double* out) {
   const double(*c)[8] = basis_d();
-  // ct[x][u]: the coefficient of input x for output u, so the lanes (u) of one x are adjacent.
-  alignas(32) double ct[8][8];
-  for (int x = 0; x < 8; ++x)
-    for (int u = 0; u < 8; ++u) ct[x][u] = c[u][x];
+  // ct[x][u]: the coefficient of input x for output u, so the lanes (u) of one x are adjacent (formed once).
+  static const struct Transposed {
+    alignas(32) double ct[8][8];
+    Transposed() {
+      const double(*b)[8] = basis_d();
+      for (int x = 0; x < 8; ++x)
+        for (int u = 0; u < 8; ++u) ct[x][u] = b[u][x];
+    }
+  } transposed;
+  const double(*ct)[8] = transposed.ct;
   alignas(32) double tmp[64];
   for (int y = 0; y < 8; ++y) {
     __m256d lo = _mm256_setzero_pd(), hi = _mm256_setzero_pd();   // outputs u = 0..3 and 4..7 of row y
@@ -290,6 +296,160 @@ inline long round_half_away(double x) {
   if (d >= 0.5) ++q;
   else if (d <= -0.5) --q;
   return q;
+}
+
+// ---- the encoder's quantisation of a block ----
+//
+// out[k] = round_half_away(coef[zz[k]] / t[k]) for k = 0 .. 63: a double division by the (integer) table entry, rounded to the
+// nearest integer with halves going away from zero. `tz` is the table as doubles in zig-zag order (tz[k] = t[k]); the wide path
+// divides four at a time (a division is correctly rounded whatever the width) and rounds as round_half_away does, with a
+// block holding a value that is not comfortably an int (or a NaN) left to the scalar function.
+inline void quantize_block_scalar(const double* coef, const int* zz, const double* tz, int* out) {
+  for (int k = 0; k < 64; ++k) out[k] = static_cast<int>(round_half_away(coef[zz[k]] / tz[k]));
+}
+
+#ifdef VGPU_HOSTJPEG_AVX2
+__attribute__((target("avx2"))) inline void quantize_block_avx2(const double* coef, const int* zz, const double* tz, int* out) {
+  alignas(32) double z[64];
+  for (int k = 0; k < 64; ++k) z[k] = coef[zz[k]];
+  const __m256d half = _mm256_set1_pd(0.5), nhalf = _mm256_set1_pd(-0.5), one = _mm256_set1_pd(1.0), lim = _mm256_set1_pd(1.0e9);
+  const __m256d sign = _mm256_set1_pd(-0.0);
+  int bad = 0;
+  alignas(16) int r[64];
+  for (int g = 0; g < 64; g += 4) {
+    const __m256d x = _mm256_div_pd(_mm256_load_pd(z + g), _mm256_load_pd(tz + g));
+    // |x| < 1e9 is false for a NaN and for anything too large
+    bad |= _mm256_movemask_pd(_mm256_cmp_pd(_mm256_andnot_pd(sign, x), lim, _CMP_NLT_UQ));
+    const __m256d q = _mm256_round_pd(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+    const __m256d d = _mm256_sub_pd(x, q);
+    __m256d y = _mm256_add_pd(q, _mm256_and_pd(_mm256_cmp_pd(d, half, _CMP_GE_OQ), one));
+    y = _mm256_sub_pd(y, _mm256_and_pd(_mm256_cmp_pd(d, nhalf, _CMP_LE_OQ), one));
+    _mm_store_si128(reinterpret_cast<__m128i*>(r + g), _mm256_cvttpd_epi32(y));
+  }
+  if (bad) {
+    for (int k = 0; k < 64; ++k) out[k] = static_cast<int>(round_half_away(z[k] / tz[k]));
+    return;
+  }
+  for (int k = 0; k < 64; ++k) out[k] = r[k];
+}
+#endif
+
+inline void quantize_block(const double* coef, const int* zz, const double* tz, int* out, bool wide = avx2_available()) {
+#ifdef VGPU_HOSTJPEG_AVX2
+  if (wide) {
+    quantize_block_avx2(coef, zz, tz, out);
+    return;
+  }
+#endif
+  (void)wide;
+  quantize_block_scalar(coef, zz, tz, out);
+}
+
+// Bit k of the result is set when q[k] != 0, for the 64 quantised coefficients of a block.
+inline uint64_t nonzero_mask_scalar(const int* q) {
+  uint64_t m = 0;
+  for (int k = 0; k < 64; ++k) m |= static_cast<uint64_t>(q[k] != 0) << k;
+  return m;
+}
+#ifdef VGPU_HOSTJPEG_AVX2
+__attribute__((target("avx2"))) inline uint64_t nonzero_mask_avx2(const int* q) {
+  uint64_t m = 0;
+  const __m256i zero = _mm256_setzero_si256();
+  for (int g = 0; g < 8; ++g) {
+    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 8 * g));
+    const unsigned eq = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, zero))));
+    m |= static_cast<uint64_t>(~eq & 0xFFu) << (8 * g);
+  }
+  return m;
+}
+#endif
+inline uint64_t nonzero_mask(const int* q, bool wide = avx2_available()) {
+#ifdef VGPU_HOSTJPEG_AVX2
+  if (wide) return nonzero_mask_avx2(q);
+#endif
+  (void)wide;
+  return nonzero_mask_scalar(q);
+}
+
+// ---- the encoder's colour conversion ----
+//
+// Y, Cb and Cr of RGB pixels, as float planes, the expressions of nvjpeg_api.cpp's loop (each product rounded to float, the sums
+// from left to right, no fusion: the wide path's target has no FMA):
+//     Y  =         0.299f    * r + 0.587f    * g + 0.114f    * b
+//     Cb = 128.0f - 0.168736f * r - 0.331264f * g + 0.5f      * b
+//     Cr = 128.0f + 0.5f      * r - 0.418688f * g - 0.081312f * b
+inline void ycc_pixel(float r, float g, float b, float* y, float* cb, float* cr) {
+  *y = 0.299f * r + 0.587f * g + 0.114f * b;
+  *cb = 128.0f - 0.168736f * r - 0.331264f * g + 0.5f * b;
+  *cr = 128.0f + 0.5f * r - 0.418688f * g - 0.081312f * b;
+}
+
+// From interleaved bytes, three to a pixel with red at offset ro and blue at offset bo (green is the middle one).
+inline void ycc_from_interleaved_scalar(const uint8_t* px, int ro, int bo, size_t n, float* y, float* cb, float* cr) {
+  for (size_t i = 0; i < n; ++i) ycc_pixel(px[i * 3 + ro], px[i * 3 + 1], px[i * 3 + bo], y + i, cb + i, cr + i);
+}
+// From three planes of bytes.
+inline void ycc_from_planes_scalar(const uint8_t* r, const uint8_t* g, const uint8_t* b, size_t n, float* y, float* cb, float* cr) {
+  for (size_t i = 0; i < n; ++i) ycc_pixel(r[i], g[i], b[i], y + i, cb + i, cr + i);
+}
+
+#ifdef VGPU_HOSTJPEG_AVX2
+__attribute__((target("avx2"))) inline void ycc_eight(__m256 r, __m256 g, __m256 b, float* y, float* cb, float* cr) {
+  const __m256 c128 = _mm256_set1_ps(128.0f);
+  const __m256 vy = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(0.299f), r), _mm256_mul_ps(_mm256_set1_ps(0.587f), g)),
+                                  _mm256_mul_ps(_mm256_set1_ps(0.114f), b));
+  const __m256 vcb = _mm256_add_ps(_mm256_sub_ps(_mm256_sub_ps(c128, _mm256_mul_ps(_mm256_set1_ps(0.168736f), r)), _mm256_mul_ps(_mm256_set1_ps(0.331264f), g)),
+                                   _mm256_mul_ps(_mm256_set1_ps(0.5f), b));
+  const __m256 vcr = _mm256_sub_ps(_mm256_sub_ps(_mm256_add_ps(c128, _mm256_mul_ps(_mm256_set1_ps(0.5f), r)), _mm256_mul_ps(_mm256_set1_ps(0.418688f), g)),
+                                   _mm256_mul_ps(_mm256_set1_ps(0.081312f), b));
+  _mm256_storeu_ps(y, vy);
+  _mm256_storeu_ps(cb, vcb);
+  _mm256_storeu_ps(cr, vcr);
+}
+__attribute__((target("avx2"))) inline void ycc_from_interleaved_avx2(const uint8_t* px, int ro, int bo, size_t n, float* y, float* cb, float* cr) {
+  const __m256i idx = _mm256_setr_epi32(0, 3, 6, 9, 12, 15, 18, 21), mask = _mm256_set1_epi32(0xFF);
+  size_t i = 0;
+  // (each gather reads four bytes at a channel's offset: the last group of pixels is left to the scalar loop so that none reads past the end)
+  for (; i + 9 <= n; i += 8) {
+    const int* base = reinterpret_cast<const int*>(px + 3 * i);
+    const __m256 r = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_i32gather_epi32(reinterpret_cast<const int*>(reinterpret_cast<const uint8_t*>(base) + ro), idx, 1), mask));
+    const __m256 g = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_i32gather_epi32(reinterpret_cast<const int*>(reinterpret_cast<const uint8_t*>(base) + 1), idx, 1), mask));
+    const __m256 b = _mm256_cvtepi32_ps(_mm256_and_si256(_mm256_i32gather_epi32(reinterpret_cast<const int*>(reinterpret_cast<const uint8_t*>(base) + bo), idx, 1), mask));
+    ycc_eight(r, g, b, y + i, cb + i, cr + i);
+  }
+  for (; i < n; ++i) ycc_pixel(px[i * 3 + ro], px[i * 3 + 1], px[i * 3 + bo], y + i, cb + i, cr + i);
+}
+__attribute__((target("avx2"))) inline void ycc_from_planes_avx2(const uint8_t* r, const uint8_t* g, const uint8_t* b, size_t n, float* y, float* cb, float* cr) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    const __m256 vr = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(r + i))));
+    const __m256 vg = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(g + i))));
+    const __m256 vb = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(b + i))));
+    ycc_eight(vr, vg, vb, y + i, cb + i, cr + i);
+  }
+  for (; i < n; ++i) ycc_pixel(r[i], g[i], b[i], y + i, cb + i, cr + i);
+}
+#endif
+
+inline void ycc_from_interleaved(const uint8_t* px, int ro, int bo, size_t n, float* y, float* cb, float* cr, bool wide = avx2_available()) {
+#ifdef VGPU_HOSTJPEG_AVX2
+  if (wide) {
+    ycc_from_interleaved_avx2(px, ro, bo, n, y, cb, cr);
+    return;
+  }
+#endif
+  (void)wide;
+  ycc_from_interleaved_scalar(px, ro, bo, n, y, cb, cr);
+}
+inline void ycc_from_planes(const uint8_t* r, const uint8_t* g, const uint8_t* b, size_t n, float* y, float* cb, float* cr, bool wide = avx2_available()) {
+#ifdef VGPU_HOSTJPEG_AVX2
+  if (wide) {
+    ycc_from_planes_avx2(r, g, b, n, y, cb, cr);
+    return;
+  }
+#endif
+  (void)wide;
+  ycc_from_planes_scalar(r, g, b, n, y, cb, cr);
 }
 
 }  // namespace vgpu::hostjpeg

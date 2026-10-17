@@ -148,4 +148,21 @@ VTEST(fields_straddle_the_two_words) {
   VCHECK_EQ(w.sfield(64, 3), -3);
 }
 
+// FRND, F2I and F2F with an f16 source read the half the instruction selects (bits 60-61, the field I2F's narrow sources use): the decoder
+// used to ignore it, so `FRND.F16 R204, R109.H1` converted the low half (an RTX 3060 converts the high one; sm_86.txt holds the .H1 lines
+// printed by cuobjdump, and sass_fastpath's conv_forms the card's results).
+VTEST(an_f16_source_carries_its_half_select) {
+  sass::Word w;
+  w.lo = 0x1000006d00c67307ull;   // FRND.F16.CEIL R198, R109.H1
+  w.hi = 0x0008300000108800ull;
+  sass::Instr high = sass::decode(w, 0x2690, 86);
+  VCHECK(high.op == sass::Op::FRND);
+  VCHECK_EQ(high.f[5], 1u);
+  VCHECK_EQ(high.src[0].suffix, std::string(".H1"));
+  w.lo &= ~(uint64_t{3} << 60);   // the same instruction on the low half
+  const sass::Instr low = sass::decode(w, 0x2690, 86);
+  VCHECK_EQ(low.f[5], 0u);
+  VCHECK_EQ(low.src[0].suffix, std::string());
+}
+
 VTEST_MAIN
