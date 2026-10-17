@@ -3142,6 +3142,10 @@ if(Python3_Interpreter_FOUND)
   # merge-conflict guard, so a new one cannot spend runner time on a PR that conflicts.
   add_test(NAME lint_pr_guard_coverage
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_pr_guard_coverage.py)
+  # Every job that can land on the shared burst pool carries the pool owner's resource cap
+  # (BURST_CONTAINER_OPTIONS, or BURST_MEM_LIMIT_GIB and BURST_JOBS_MAX for a job outside a container).
+  add_test(NAME lint_burst_cap
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_burst_cap.py)
   # Every exported runtime and driver function is a call a profiler is told of,
   # and the driver shim takes the argument sizes the toolkit declares (CUPTI
   # reads them by those sizes).
