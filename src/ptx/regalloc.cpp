@@ -128,6 +128,10 @@ void collect(const Instr& ins, std::vector<uint32_t>& defs, std::vector<uint32_t
           for (const auto& o : op.offset) use_operand(o);
           if (op.has_dref) use_operand(op.dref);
         }
+        if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpTxq>) {
+          use_operand(op.obj);
+          if (op.level) use_operand(op.lod);
+        }
         if constexpr (std::is_same_v<std::decay_t<decltype(op)>, OpSuld> ||
                       std::is_same_v<std::decay_t<decltype(op)>, OpSust>) {
           use_operand(op.obj);

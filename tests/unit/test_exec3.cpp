@@ -5415,7 +5415,7 @@ struct SurfCase {
 // is the instruction up to its operands, e.g. "suld.b.2d.b32.clamp"; loads
 // write their first component to out[thread].
 std::vector<uint32_t> surf_run(const std::string& access, const TextureDesc& d, const std::vector<SurfCase>& cs,
-                               Env& e, uint64_t data) {
+                               Env& e, uint64_t data, bool bare = false) {
   const bool load = access.rfind("suld", 0) == 0;
   const bool layered = access.find(".a1d") != std::string::npos || access.find(".a2d") != std::string::npos;
   const bool v4 = access.find(".v4") != std::string::npos;
@@ -5423,7 +5423,8 @@ std::vector<uint32_t> surf_run(const std::string& access, const TextureDesc& d, 
   std::string coords = layered ? "%r13, %r10" : "%r10";
   if (dims >= 2) coords += ", %r11";
   if (dims == 3 || (layered && dims == 2)) coords += ", %r12, %r12";
-  const std::string regs = v4 ? "{%r20, %r21, %r22, %r23}" : "{%r20}";
+  // `bare`: the scalar access with no vector suffix writes its register with no braces, as NVRTC does.
+  const std::string regs = v4 ? "{%r20, %r21, %r22, %r23}" : bare ? "%r20" : "{%r20}";
   std::string ptx = std::string(kHeader) + R"(
 .visible .entry k(.param .u64 s, .param .u64 c, .param .u64 out)
 {
@@ -5514,6 +5515,65 @@ VTEST(surface_clamp_and_zero_2d_as_an_rtx_3060_reads_them) {
   std::vector<uint32_t> b8 = surf_run("suld.b.2d.b8.clamp", d, c8, e, data);
   for (uint32_t& v : b8) v &= 0xFF;
   VCHECK_EQ(hex_list(b8), hex_list({0, 0, 0, 0x10, 0x10, 0, 0, 0, 0, 0, 0}));
+}
+
+// A scalar access (no .v2/.v4 suffix) names its one register without braces -- NVRTC writes
+// `suld.b.2d.b32.zero %f1, [...]` and `sust.b.2d.b32.zero [...], %f1`, as LuisaCompute's CUDA backend
+// emits them for a read or write of one 32-bit channel -- and means what the braced one-element list means.
+VTEST(scalar_surface_accesses_without_braces_match_the_braced_form) {
+  Env e;
+  const uint64_t data = e.mem.alloc(128);
+  for (uint32_t i = 0; i < 32; ++i) e.mem.store_scalar(data + 4 * i, 4, 0x1000u * (i / 8) + i % 8);
+  const TextureDesc d = surf_desc(8, 4);
+  const SurfCase cs[] = {{-4, 1, 0, 0}, {0, 0, 0, 0}, {4, 3, 0, 0}, {28, 2, 0, 0}, {32, 1, 0, 0}, {20, 9, 0, 0}};
+  const std::vector<SurfCase> all(std::begin(cs), std::end(cs));
+  for (const char* policy : {".clamp", ".zero"}) {
+    const std::string load = std::string("suld.b.2d.b32") + policy;
+    VCHECK_EQ(hex_list(surf_run(load, d, all, e, data, /*bare=*/true)), hex_list(surf_run(load, d, all, e, data)));
+  }
+  // The store writes the same texel either way.
+  for (int bare = 0; bare < 2; ++bare) {
+    Env e2;
+    const uint64_t at = e2.mem.alloc(128);
+    for (uint32_t i = 0; i < 32; ++i) e2.mem.store_scalar(at + 4 * i, 4, 0x1000u * (i / 8) + i % 8);
+    surf_run("sust.b.2d.b32.zero", surf_desc(8, 4), {{28, 1, 0, 0}}, e2, at, bare != 0);
+    for (uint32_t i = 0; i < 32; ++i) {
+      const bool here = i == 8 + 7;
+      VCHECK_EQ(e2.mem.load_scalar(at + 4 * i, 4), here ? uint64_t{0xABCD0000u} : uint64_t{0x1000u * (i / 8) + i % 8});
+    }
+  }
+}
+
+// A vector suffix and the registers named must agree.
+VTEST(a_surface_access_whose_registers_disagree_with_its_vector_suffix_is_refused) {
+  for (const char* body : {"suld.b.2d.v4.b32.zero %r1, [%rd1, {%r2, %r3}];",
+                           "suld.b.2d.b32.zero {%r1, %r2}, [%rd1, {%r2, %r3}];",
+                           "sust.b.2d.v2.b32.zero [%rd1, {%r2, %r3}], %r1;",
+                           "sust.b.2d.b32.zero [%rd1, {%r2, %r3}], {%r1, %r2};"}) {
+    std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 s)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [s];
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+    )" + body + R"(
+    ret;
+}
+)";
+    bool refused = false;
+    try {
+      auto m = ptx::parse(ptx);
+      Env e;
+      LaunchConfig cfg;
+      cfg.block = {1, 1, 1};
+      exec::launch(m.entries[0], cfg, {arg_u64(9)}, e.mem, e.prof);
+    } catch (const Error&) {
+      refused = true;
+    }
+    VCHECK(refused);
+  }
 }
 
 // Stores land where a load would read (.clamp) or not at all (.zero).
@@ -8536,6 +8596,121 @@ VTEST(a_calltargets_list_names_the_functions_an_indirect_call_may_reach) {
   dev.launch(*fn, cfg, {arg_u64(out)}, dev.symbols(mod));
   for (uint32_t t = 0; t < 32; ++t)
     VCHECK_EQ(dev.memory().load_scalar(out + 4 * t, 4), uint64_t{t & 1 ? t + 100 : 2 * t});
+}
+
+VTEST(txq_answers_the_size_of_a_texture_and_of_each_mipmap_level_as_a_card_does) {
+  // txq.{width,height,depth} and txq.level.* on texture objects, with the answers an RTX 3060 gave for each kind of
+  // array and resource (a probe over cudaCreateTextureObject; levels 0 to 5, 255 and 2^32-1): the sizes halve per
+  // level to 1, a level past the last (any level above 0 of an unmipmapped texture) is 0 0 0, 1D linear memory is
+  // (w, 0, 0) and a 1D array (w, 1, 0), a layered 1D texture has its layers as the height, a layered 2D texture
+  // or cubemap its layer count as the depth.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t, .param .u64 out)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [t];
+    ld.param.u64 %rd2, [out];
+    cvta.to.global.u64 %rd3, %rd2;
+    mov.u32 %r1, %tid.x;
+    txq.width.b32 %r2, [%rd1];
+    txq.height.b32 %r3, [%rd1];
+    txq.depth.b32 %r4, [%rd1];
+    txq.level.width.b32 %r5, [%rd1], %r1;
+    txq.level.height.b32 %r6, [%rd1], %r1;
+    txq.level.depth.b32 %r7, [%rd1], %r1;
+    mul.wide.u32 %rd4, %r1, 24;
+    add.s64 %rd5, %rd3, %rd4;
+    st.global.u32 [%rd5], %r2;
+    st.global.u32 [%rd5+4], %r3;
+    st.global.u32 [%rd5+8], %r4;
+    st.global.u32 [%rd5+12], %r5;
+    st.global.u32 [%rd5+16], %r6;
+    st.global.u32 [%rd5+20], %r7;
+    ret;
+}
+)";
+  Env e;
+  auto m = ptx::parse(ptx);
+  uint64_t out = e.mem.alloc(8 * 24);
+  struct Case {
+    const char* name;
+    uint32_t w, h, d, layers, mips;
+    bool cube, array;
+    // The size at levels 0..3: width, height, depth.
+    uint32_t want[4][3];
+  };
+  const Case cases[] = {
+      {"2d array 8x4", 8, 4, 0, 0, 0, false, true, {{8, 4, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+      {"1d array 16", 16, 0, 0, 0, 0, false, true, {{16, 1, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+      {"1d linear 100", 100, 0, 0, 0, 0, false, false, {{100, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+      {"pitch 2d 32x8", 32, 8, 0, 0, 0, false, false, {{32, 8, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+      {"3d 8x4x2", 8, 4, 2, 0, 0, false, true, {{8, 4, 2}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+      {"1d layered 8 x3", 8, 0, 0, 3, 0, false, true, {{8, 3, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+      {"2d layered 8x4 x3", 8, 4, 0, 3, 0, false, true, {{8, 4, 3}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+      {"cube 8", 8, 8, 0, 0, 0, true, true, {{8, 8, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+      {"cube layered 8 x2", 8, 8, 0, 2, 0, true, true, {{8, 8, 2}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}}},
+      {"mip 16x8, 4 levels", 16, 8, 0, 0, 4, false, true, {{16, 8, 0}, {8, 4, 0}, {4, 2, 0}, {2, 1, 0}}},
+      {"mip 3d 16x8x4, 3 levels", 16, 8, 4, 0, 3, false, true, {{16, 8, 4}, {8, 4, 2}, {4, 2, 1}, {0, 0, 0}}},
+      {"mip 2d layered 16x8 x3", 16, 8, 0, 3, 3, false, true, {{16, 8, 3}, {8, 4, 3}, {4, 2, 3}, {0, 0, 0}}},
+      {"mip 1d layered 16 x3", 16, 0, 0, 3, 3, false, true, {{16, 3, 0}, {8, 3, 0}, {4, 3, 0}, {0, 0, 0}}},
+      {"mip cube 16", 16, 16, 0, 0, 3, true, true, {{16, 16, 0}, {8, 8, 0}, {4, 4, 0}, {0, 0, 0}}},
+      {"mip cube layered 16 x2", 16, 16, 0, 2, 3, true, true, {{16, 16, 2}, {8, 8, 2}, {4, 4, 2}, {0, 0, 0}}},
+  };
+  for (const Case& c : cases) {
+    TextureTable tex;
+    TextureDesc d;
+    d.base = e.mem.alloc(64);
+    d.width = c.w;
+    d.height = c.h;
+    d.depth = c.d;
+    d.layers = c.layers;
+    d.mip_levels = c.mips;
+    d.cubemap = c.cube;
+    d.from_array = c.array;
+    d.channel_bits[0] = 32;
+    d.texel_bytes = 4;
+    tex[0x77] = d;
+    LaunchConfig cfg;
+    cfg.block = {4, 1, 1};
+    cfg.textures = &tex;
+    exec::launch(m.entries[0], cfg, {arg_u64(0x77), arg_u64(out)}, e.mem, e.prof);
+    for (uint32_t l = 0; l < 4; ++l) {
+      const uint64_t row = out + l * 24;
+      // The plain queries are level 0's (measured: they equal txq.level at 0 for every kind); the level ones are level l's.
+      for (uint32_t q = 0; q < 3; ++q) {
+        const uint64_t got_base = e.mem.load_scalar(row + 4 * q, 4), got_level = e.mem.load_scalar(row + 12 + 4 * q, 4);
+        VCHECK_EQ(got_base, uint64_t{c.want[0][q]});
+        VCHECK_EQ(got_level, uint64_t{c.want[l][q]});
+      }
+    }
+  }
+}
+
+VTEST(txq_queries_a_card_cannot_run_are_refused_by_name) {
+  // channel_data_type, array_size and the rest assemble, but a kernel using one for a texture object does not launch on an
+  // RTX 3060 (CUDA_ERROR_NOT_FOUND), so the module is refused when it is parsed or run, naming the query.
+  std::string ptx = std::string(kHeader) + R"(
+.visible .entry k(.param .u64 t)
+{
+    .reg .b32 %r<4>;
+    .reg .b64 %rd<4>;
+    ld.param.u64 %rd1, [t];
+    txq.array_size.b32 %r1, [%rd1];
+    ret;
+}
+)";
+  Env e;
+  bool refused = false;
+  try {
+    auto m = ptx::parse(ptx);
+    LaunchConfig cfg;
+    cfg.block = {1, 1, 1};
+    exec::launch(m.entries[0], cfg, {arg_u64(1)}, e.mem, e.prof);
+  } catch (const Error& err) {
+    refused = std::string(err.what()).find("array_size") != std::string::npos;
+  }
+  VCHECK(refused);
 }
 
 VTEST_MAIN
