@@ -2156,6 +2156,9 @@ CPU second, p from the harness's Mann-Whitney test. Loads are server2's, shared 
 | mma_ptx | ptx | 0.847 | 0.945 | 1.12x | < 0.001 | 7.8-10 |
 | (the same, with the PTX `mma.sync` route) mma_ptx | ptx | 0.885 | 2.165 | 2.45x | < 0.001 | 9 |
 
+The final tree (all four commits), SASS engine, 21 alternating runs on CPUs 12-15, load 26-28: wmma 1.932 -> 2.802 (1.45x, best 1.50x, p < 0.001), mma_ptx 3.788 -> 5.651
+(1.49x, best 1.48x, p < 0.001), counters identical.
+
 A second set at load 25-28 with every CPU busy (so every number is lower and the ratios are less sharp): wmma sass 1.15x (best of runs 1.50x,
 p 0.008), wmma ptx 1.46x, mma_ptx sass 1.48x, mma_ptx ptx 2.35x, all p < 0.001, counters identical.
 
