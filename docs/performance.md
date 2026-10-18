@@ -1227,8 +1227,8 @@ or whose preconditions the handler cannot prove (a register past the warp's file
 a global access that is not the ordinary case), goes to `Runner::execute` / `exec_mem`, which is the existing code.
 Divergent warps work: a handler takes the executing lane mask exactly as the interpreter's code does.
 
-Off unless `VGPU_TIER=1`; `VGPU_FASTPATH=0`, `VGPU_SIMD=off` and `VGPU_SASS_TRACE` switch it off even then.
-With it unset the engine takes the same path as before (the A/B below).
+Opt-in when this round was written (`VGPU_TIER=1`); it has been on by default since the section "The tier on by default" below. `VGPU_TIER=0`, `VGPU_FASTPATH=0`, `VGPU_SIMD=off` and `VGPU_SASS_TRACE` switch it off.
+The next paragraphs are as written then ("with `VGPU_TIER` unset" meant the interpreter).
 
 What has a handler (`tier::Form`): MOV; IADD3 (plain, and with carries in and out); IMAD (plain, with carries, `.WIDE`,
 `.HI`); LOP3 (with its predicate); LEA; SHF; ISETP (and `.EX`); FSETP; FSEL; FFMA/FADD/FMUL; DADD/DMUL/DFMA; POPC; I2FP.F32;
@@ -1298,7 +1298,7 @@ section when it first runs, on top of the 184-byte `Instr`.
 
 Round 8 left the tier opt-in with about half of the instructions of the control-heavy workloads still in the interpreter. This round
 widened what has a handler, made the tier's run loop cheaper, tested every behaviour of `Runner::step_warp`'s straight-line loop
-that the tier copies, and put the tier in the CI jobs that can soak it. It is still **not** the default.
+that the tier copies, and put the tier in the CI jobs that can soak it. It was still not the default then (it is now, see below).
 
 **What has a handler now** (`src/sass/tier.cpp`, `tier_ops.inc`; each is the SIMD kernel or the scalar rule the interpreter's fast
 path or general code uses, with the operands resolved once):
@@ -1459,6 +1459,56 @@ the second carry out of UIADD3 and the carry of ULEA with a negated addend (ptxa
 that some lanes of the group skip by a guard (no program here has one); and (19) the chain continuing past `give_way`, which is an equivalent mutant: the
 YIELD that sets `give_way` also sets `yield`, which the chain tests first, and the next call of `step_warp` consumes `give_way` before the
 tier runs. The form analysis of these is still checked over the disassembler corpora by `test_tier`.
+
+## The tier on by default (`VGPU_TIER=0` turns it off)
+
+The SASS engine now runs its straight-line instructions through the pre-decoded tier unless `VGPU_TIER=0`. The code change is one line
+(`tier::requested()`); `VGPU_FASTPATH=0`, `VGPU_SIMD=off` and `VGPU_SASS_TRACE` still switch it off. Evidence for the decision, all on
+the 32-thread AMD box ("server2", shared; Release, CUDA 13.0, GCC 13), A = origin/main 8f9eb524 (tier opt-in, unset = off), B = this change:
+
+* **Tier-related tests with the tier forced on, every architecture.** `e2e_sass_tier` with `VGPU_TIER_OTHER_ARCHS=1` (sm_75, 80, 86, 89, 90,
+  100, 120; `sass_tier`, `sass_tier_steps`, the 39 other programs of its list on every architecture each can be built for, the faults, four
+  host threads, the tier without its chain, `VGPU_TC_EXACT=0`): 264 runs compared byte for byte and counter for counter with the
+  interpreter, no difference (9 min 40 s). `sass_tier_steps` fails in both modes, identically, on sm_100 and sm_120 (exit 1; it was so
+  before). One build failure, not a difference: `sass_fastpath` uses bf16 `__hfma2`, which nvcc will not build for sm_75; the soak mode started
+  it at sm_75 (the list now says sm_80). `test_tier` and `test_fastpath` pass. The 16 bench workloads x SASS and PTX: the counters of
+  VGPU_TIER=0, of `VGPU_TIER=1` and of the default are the same in all 2,418 fields (checked with `bench.py --check-counters` against a
+  file written by the interpreter on this machine; the committed file is skipped by this box's nvcc 13.0.88, whose device code hashes
+  differently, and its counts equal the fresh ones in every field).
+* **The whole non-AMD ctest suite with the tier on (the default), 404 tests, `-j4`, 83 minutes under a loaded machine.** 357 pass. The
+  failures were: 12 `e2e_*_paths`/`nvcomp`/`cudss`/`cufile`/`nvshmem_host`/`blas_host_sums` tests that ran while other jobs took the host's
+  memory ("device out of memory ... below the reserve"), all of which pass when run again; `lint_curl_retries` (needs a git checkout; the
+  build tree here has none); `e2e_lockstep_blocks`, which fails with the tier on, with `VGPU_TIER=0` and on the unchanged A build
+  (timed-out waits on a busy host); `e2e_cutlass_hopper` (first run failed under the same memory pressure, then passed with the tier on in
+  9.0 min and with `VGPU_TIER=0` in 6.3 min on a machine whose load changed between the two, and not a timing measurement: it includes
+  compiling CUTLASS); and `e2e_cutlass_gemm`, whose `sm90 group_gemm` case ran for over 30 minutes with the tier on and was killed by the
+  1 h ctest limit; the same binary with `VGPU_TIER=0` ran 50 min and reported the same `Failure` (CUTLASS's own check at
+  group_gemm.cu:117), so the failure is not the tier's but the case is too slow on this box to say more. The PyTorch tests skipped (no torch
+  here). The passing tests are the whole suite less these, so the tier ran under every `e2e_*` that launches a kernel.
+* **Corpora** (`tools/verify/run_corpora.sh`, HeCBench reduced list 34, Rodinia 12, CUDA Samples 98; one host thread, counters on;
+  configurations: A, A again, B default, B with `VGPU_TIER=1 VGPU_TIER_STATS=1`, B with `VGPU_TIER=0`): 649 runs. B against A, and B with the
+  tier named against A: 0 programs differ in stdout, stderr, output files or counters. Programs that differ between two runs of A itself
+  (`atomicCost`, `backprop`, `cudaGraphsPerfScaling`, `memMapIPCDrv`, `radixSortThrust`, ...) are the same ones that differ between A and B.
+  The tier ran 97.0% (HeCBench), 99.1% (Rodinia) and 96.5% (Samples) of the warp instructions. 5 HeCBench and 13 Samples programs time out
+  (120 s) in A and were not compared. PolyBench was not run here.
+* **Speed and cost**, `tools/bench/bench.sh --ab` (A, B), `--engines sass`, `--cpus 20-23` of a quiet range (box load 2 to 9), no environment set
+  for either; counters identical in every row:
+
+| workload | A median | B median | B/A median | B/A best | p |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| launch (k launches/s, 11 runs) | 617 | 721 | 1.17x | 1.17x | <0.001 |
+| startup (wall s, 11 runs) | 0.002 | 0.002 | 1.01x | 1.00x | 0.90 (same) |
+| api (k calls/s, 11 runs) | 8887 | 8796 | 0.99x | 0.96x | 0.013 (below 2%: same) |
+| int_alu / warp / mem | 57 / 31 / 20 | 143 / 99 / 28 Minst/s | 2.49x / 3.17x / 1.40x | 2.50x / 3.16x / 1.41x | <0.001 |
+| f32_fma / f64_fma / f64_subnormal | 64 / 43 / 44 | 145 / 64 / 62 | 2.26x / 1.49x / 1.42x | 2.27x / 1.50x / 1.43x | <0.001 |
+| shared / atomics / local / divergent (9 runs) | 24 / 9.9 / 31 / 24 | 31 / 12.5 / 57 / 39 | 1.28x / 1.26x / 1.82x / 1.60x | 1.29x / 1.29x / 1.82x / 1.83x | <0.001 |
+| wmma / mma_ptx / texture | 2.0 / 3.8 / 5.2 | 2.2 / 4.2 / 5.5 | 1.10x / 1.11x / 1.06x | 1.09x / 1.10x / 1.06x | <0.001 |
+
+  Startup and the API-call workload do not regress (a section is analysed when its first warp runs, at 150 to 400 ns an instruction; the
+  startup program's one small kernel costs nothing measurable), and peak RSS is the same to the first decimal (launch 8.8 vs 8.9 MB, mem 40.9 vs
+  41.0 MB). Lazy or threshold-based analysis was therefore not pursued: there is no measured cost for it to remove. The cost that remains is
+  the opposite one: with `VGPU_TIER=0` the interpreter is what the round 9 notes say (2 to 4% slower on `launch` and `warp` than the
+  r8 build).
 
 ## Round 9: counting a memory access (`include/vgpu/exec/mem_counters.hpp`), `Module::code_at`, and the shared/local fast paths
 
