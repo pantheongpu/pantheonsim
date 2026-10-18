@@ -24,6 +24,8 @@ is the sum of the SQ_INSTS_{SALU,SMEM,VALU,VMEM,LDS,BRANCH,SENDMSG} counters:
 every instruction the interpreter classifies, which leaves out the SOPP
 instructions that are none of those (s_waitcnt, s_nop, s_endpgm, s_barrier ...).
 docs/performance.md ("The AMD engine") says by how much that undercounts.
+On a simulated Radeon card, which offers only the counters a real one lists, the count is the interpreter's own
+instruction total as the two by-wave-size counters (SQ_WAVE32_INSTS + SQ_WAVE64_INSTS).
 """
 import argparse
 import datetime
@@ -83,6 +85,10 @@ NO_KERNELS = ("api",)  # no dispatch at all, so nothing for the profiler to coun
 INSTS = ["SQ_INSTS_SALU", "SQ_INSTS_SMEM", "SQ_INSTS_VALU", "SQ_INSTS_VMEM", "SQ_INSTS_LDS", "SQ_INSTS_BRANCH",
          "SQ_INSTS_SENDMSG", "SQ_INSTS_MFMA"]
 EXTRA = ["SQ_WAVES", "SQ_INSTS_VMEM_RD", "SQ_INSTS_VMEM_WR", "TA_FLAT_ATOMIC_WAVEFRONTS"]
+# The counters a simulated Radeon card offers are the ones a real RX 6800 lists (rocprofv3-avail), which has no
+# per-class branch, vector-memory or message counters: its instruction total is the two by-wave-size counters.
+RDNA_INSTS = ["SQ_INSTS_SALU", "SQ_INSTS_SMEM", "SQ_INSTS_VALU", "SQ_INSTS_FLAT", "SQ_INSTS_LDS", "SQ_WAVE32_INSTS",
+              "SQ_WAVE64_INSTS", "SQ_WAVES"]
 
 
 def die(msg, code=2):
@@ -189,7 +195,9 @@ def timed_run(binary, wl, size, build, gpu, threads, tmp, args):
 def counting_run(binary, wl, size, build, gpu, tmp, args):
     """Counts from rocprofv3 inside `vgpu shell`: summed over the workload's dispatches."""
     out = tempfile.mkdtemp(prefix="cnt.", dir=tmp)
-    cmds = "rocprofv3 --pmc %s --output-format csv -d %s -- %s %s %s" % (" ".join(INSTS + EXTRA), out, binary, wl, size)
+    rdna = gpu.startswith("amd/rx")
+    cmds = "rocprofv3 --pmc %s --output-format csv -d %s -- %s %s %s" % (
+        " ".join(RDNA_INSTS if rdna else INSTS + EXTRA), out, binary, wl, size)
     argv = pin([os.path.join(build, "vgpu"), "shell", "-y", "--gpu", gpu, "--count", "1", "--no-isolate", "-c", cmds],
                args.cpus)
     res = C.run_argv(argv, clean_env(build, gpu, 1, tmp, args.env), max(args.timeout, 600))
@@ -208,7 +216,10 @@ def counting_run(binary, wl, size, build, gpu, tmp, args):
             totals[row["Counter_Name"]] = totals.get(row["Counter_Name"], 0) + int(float(row["Counter_Value"]))
             dispatches.add(row["Dispatch_Id"])
     totals["dispatches"] = len(dispatches)
-    totals["wave_instructions"] = sum(totals.get(n, 0) for n in INSTS if n != "SQ_INSTS_MFMA")  # MFMA is inside VALU
+    if rdna:
+        totals["wave_instructions"] = totals.get("SQ_WAVE32_INSTS", 0) + totals.get("SQ_WAVE64_INSTS", 0)
+    else:
+        totals["wave_instructions"] = sum(totals.get(n, 0) for n in INSTS if n != "SQ_INSTS_MFMA")  # MFMA is inside VALU
     shutil.rmtree(out, ignore_errors=True)
     return totals, ""
 
@@ -348,7 +359,7 @@ def expected_path(hv):
 
 
 def compact(counts):
-    keep = INSTS + EXTRA + ["dispatches", "wave_instructions"]
+    keep = INSTS + EXTRA + RDNA_INSTS + ["dispatches", "wave_instructions"]
     return {k: counts[k] for k in keep if k in counts}
 
 
