@@ -2,9 +2,26 @@
 
 **Run CUDA and HIP programs, unmodified, on a CPU. No GPU needed.** It pretends to be an NVIDIA or AMD GPU (a T4, an H100, an MI300X), so programs built with the real `nvcc` or `hipcc` run on it unchanged. It checks what your code does, not how fast it runs: there is no timing model, so a run on a physical GPU before a release still counts.
 
+[![CI](https://github.com/pantheongpu/pantheonsim/actions/workflows/ci.yml/badge.svg)](https://github.com/pantheongpu/pantheonsim/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/pantheongpu/pantheonsim)](https://github.com/pantheongpu/pantheonsim/releases)
+[![License](https://img.shields.io/github/license/pantheongpu/pantheonsim)](LICENSE)
+
 [![The PantheonSim playground: nvcc and nvidia-smi on eight simulated H100s](docs/img/playground.png)](https://pantheonsim.com/play/)
 
-## Run it
+## Try it in 60 seconds
+
+With Docker (no GPU, no driver, no `--gpus` flag):
+
+```bash
+docker run --rm ghcr.io/pantheongpu/pantheonsim:latest vgpu list-gpus
+docker run --rm -e VGPU_GPU=nvidia/h100 -e VGPU_DEVICE_COUNT=2 ghcr.io/pantheongpu/pantheonsim:latest nvidia-smi
+```
+
+The second command prints `nvidia-smi` output for two simulated H100s. The image has no compiler (`nvcc` and `hipcc` are not in it); see [docs/docker.md](docs/docker.md) to build a program inside a container, or use the source build below.
+
+**What it is:** a CPU-side simulator of NVIDIA and AMD GPUs, so programs compiled with the real `nvcc` or `hipcc` run on a machine without a GPU. **What it isn't:** a performance model (timings mean nothing), and not every CUDA or HIP feature is covered; [Status and limits](docs/status.md) lists what is.
+
+## Run it from source
 
 ```bash
 make     # installs cmake and a C++ compiler if missing (asks first), then builds
