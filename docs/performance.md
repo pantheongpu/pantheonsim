@@ -1645,15 +1645,11 @@ before `window_check.hpp` was made a header, which moves no code; `VGPU_COUNTERS
 
 ### Not done, and negative results
 
-* *Texel reads.* `texel_channel_bits` makes one `load_scalar` per channel, which on the `texture` workload is 15% of the samples
-  (`resolve_scalar` 3.8, `scalar_location` 3.4, `texel_raw` 4.0, `load_scalar` 2.0, `load_at` 1.9). The obvious change -- one `load_run`
-  for all the channels of a texel -- would not be cheaper: `MemoryManager::run_allocation` takes the allocation table's reader lock on every
-  call and has none of the per-thread lookup memory `load_scalar` uses (`find_ordinary`), so one locked lookup replaces four cached ones.
-  A cached multi-element read in the memory manager would be the right place; not done (the memory layer is not this branch's, and none of
-  the 51 HeCBench programs samples texture code).
-* *PTX atomics.* The interpreter's `exec_atom` does `load_scalar` then `store_scalar` for each lane: two lookups (40% of the PTX `atomics` workload is
-  in `resolve_scalar`, `scalar_location`, `load_scalar`, `store_scalar`). A read-modify-write that looks the address up once would halve it;
-  it belongs to the memory layer and the interpreter, and was not touched.
+* *Texel reads and PTX atomics* are done (see "Memory lookups" below).
+* *SASS atomics on the one-lookup read-modify-write.* Not done, and nothing to gain: the SASS executor's global atomics already take a warp
+  at once (`load_batch` / `store_batch`: each distinct address looked up and stored once), so `MemoryManager::rmw_scalar` would only replace
+  the loop that serves the general path (`VGPU_FASTPATH=0`), vector forms, shared/local and the faulting cases. The SASS `atomics` workload
+  is not in that loop (B/A 0.997x with the PTX change in the build, p 0.67).
 * *Local memory layout.* `base64e` spends about a third of its time in the local-memory fast path, where lane `l`'s byte `o` is at
   `local[l * local_size + o]`, so a warp-wide access touches 32 cache lines; interleaving by words, as the hardware does, would touch one. Every
   user of `Warp::local` would change; not done.
@@ -1663,6 +1659,51 @@ before `window_check.hpp` was made a header, which moves no code; `VGPU_COUNTERS
 * *Two-section ping-pong.* `bh` still spends about 5% in `fetch` and `Module::code_at`: a divergent warp alternates between a kernel's section
   and a device function's, so the one-entry `Warp::code_hint` misses; a two-entry hint would catch it.
 
+
+## Memory lookups: PTX atomics and texels
+
+**Atomics.** `exec_atom` did `load_routed` then `store_routed` for each lane: two address lookups (40% of the PTX `atomics` workload was in
+`resolve_scalar`, `scalar_location`, `load_scalar`, `store_scalar`). `MemoryManager::rmw_scalar` resolves the address once (the per-thread
+lookup memory of `find_ordinary`), reads the old value, calls the operation and stores. It declines (returns false having done nothing, and
+the interpreter then makes the two calls as before, with every diagnostic) whenever the two calls could differ: a stuck cell or a fault armed
+for loads or stores, a host mapping possibly in range, a width other than 1/2/4/8, a misaligned address, an access not wholly inside one
+ordinary allocation (freed, out of range, a mapped range, `VGPU_LOOKUP_CACHE=0`). The stripe lock, the host-atomic route and the order of
+effects are the interpreter's, unchanged; a store of a uniform chunk's own byte still does not make the chunk real.
+
+**Texels.** `texel_channel_bits` did one `load_scalar` per channel. `MemoryManager::load_fields` reads the end-to-end fields of a texel with
+one lookup (and a packed 10:10:10:2 texel as one word, not four), and declines under the same conditions, plus a field that is not naturally
+aligned or has no load (3 bytes). `tex_finish` and the point fetch use it (`texel_channels`, `VGPU_FASTPATH=0` turns it off); a gather reads
+one channel and is unchanged. It reads only the channels the caller would have read.
+
+**Measured**, `tools/bench/bench.sh --ab base new --engines ptx|sass --runs 25 --cpus 24-27`, Release, GCC 13.3, Ryzen 9 9950X (server2, shared:
+load 10-50), base = `speedup` at 8f9eb524, counters identical in every row:
+
+| workload | engine | B/A median | B/A best | p |
+| --- | --- | ---: | ---: | ---: |
+| atomics | ptx | 1.38x | 1.38x | <0.001 |
+| texture | ptx | 1.05x | 1.05x | <0.001 |
+| texture | sass | 1.06x | 1.06x | <0.001 |
+| atomics | sass | 1.01x (noise) | 1.01x | |
+| mem, shared, local | sass | 0.99x, 1.01x, 1.06x (all `same`) | | 0.8, 0.8, 0.7 |
+| mem | ptx | 0.99x (`same`) | 0.99x | 0.01 |
+| shared, local | ptx | 0.96-0.99x, 0.97-0.98x | 0.96-0.99x | <0.001 |
+
+The last row is code layout, not these changes: a build whose only difference from the base is an unused 7-line function in
+`interpreter.cpp` (and the new `memory.cpp`), measured the same way, gave shared 0.970x and 0.979x, local 0.983x and 0.971x (two sizes of
+dummy), with the harness's own verdict `slower` on three of four. The interpreter is one translation unit whose inlining and function
+placement move with any edit; the memory-layer changes alone (base interpreter) gave 0.990x and 0.993x, p 0.15. `texel_channels` is
+`noinline` for the same reason (it is not hot enough to need inlining and the large inlined body moved the other workloads). The texture
+gain is smaller than the 15% of samples the old code spent, because the sampling arithmetic around the reads dominates.
+
+**Tests.** `tests/unit/test_memrmw.cpp`: `rmw_scalar` and `load_fields` against the `load_scalar` / `store_scalar` calls over random
+addresses (inside, at the ends, past them, freed, outside every window, host pointers, misaligned; untouched, uniform and real chunks), with
+a stuck cell and with faults on loads and on stores, comparing values, errors and their text, final contents and which chunks became real;
+four threads adding under a stripe lock; PTX kernels for every atomic op, width and type (add/and/or/xor/exch/min/max/inc/dec/cas, u/s32/64,
+f32/f64, f16, bf16 and their x2 forms) on untouched, uniform and real chunks with several lanes on one word, run with and without the
+lookup memory, equal in the values found, memory, chunks made real and every counter, one block and eight blocks on several host threads, and
+the out-of-range and misaligned errors; texture fetches in nine formats (including 10:10:10:2 and a 3-byte texel) over real, uniform and
+untouched memory, point and linear, with and without the lookup memory. `e2e_sass_fastpath` also runs with `VGPU_LOOKUP_CACHE=0` and requires
+the same answers, counters and fault messages.
 
 ## Using this to check a change
 
