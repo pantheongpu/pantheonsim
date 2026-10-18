@@ -156,6 +156,18 @@ uint16_t as_bits(_Float16 h) {
   return b;
 }
 
+// floor, ceil and trunc as GCC expands them in line on x86-64 (SSE2 without roundss), which is how the vector
+// instructions below were compiled until their code moved: a value of 2^23 (2^52 for a double) or more in
+// magnitude, an infinity and a NaN come back as they are -- a signaling NaN stays signaling -- and anything
+// else is libm's exact result. (libm quiets a signaling NaN; the scalar instructions s_floor_f32 and the rest
+// still call it, and CMake keeps GCC from expanding those in line: -fno-fp-int-builtin-inexact.)
+inline float floor_inline(float x) { return std::fabs(x) < 8388608.0f ? std::floor(x) : x; }
+inline float ceil_inline(float x) { return std::fabs(x) < 8388608.0f ? std::ceil(x) : x; }
+inline float trunc_inline(float x) { return std::fabs(x) < 8388608.0f ? std::trunc(x) : x; }
+inline double floor_inline(double x) { return std::fabs(x) < 4503599627370496.0 ? std::floor(x) : x; }
+inline double ceil_inline(double x) { return std::fabs(x) < 4503599627370496.0 ? std::ceil(x) : x; }
+inline double trunc_inline(double x) { return std::fabs(x) < 4503599627370496.0 ? std::trunc(x) : x; }
+
 // The kinds of float v_cmp_class asks about, one bit each, in the ISA's order.
 template <typename T>
 bool matches_class(T f, uint32_t mask) {
@@ -3026,7 +3038,8 @@ struct Machine {
           if (o.abs) f = std::fabs(f);
           return o.neg ? -f : f;
         };
-        float r = std::fma(source(0), source(1), source(2));
+        const float m0 = source(0), m1 = source(1), m2 = source(2);
+        float r = std::fma(m1, m0, m2);   // (this order: with two NaNs among them the one libm returns follows it)
         if (in.clamp) r = clamp01(r);
         if (op == "v_fma_mix_f32_bf16"_op) {
           write_lane(w, in.dst[0], lane, as_bits(r));
@@ -4787,7 +4800,7 @@ struct Machine {
     if (!(op == "v_trunc_f64_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_double(w, in, lane, std::trunc(lane_double(w, in.src[0], lane)));
+        write_double(w, in, lane, trunc_inline(lane_double(w, in.src[0], lane)));
       });
     }
     break;
@@ -4795,7 +4808,7 @@ struct Machine {
     if (!(op == "v_ceil_f64_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_double(w, in, lane, std::ceil(lane_double(w, in.src[0], lane)));
+        write_double(w, in, lane, ceil_inline(lane_double(w, in.src[0], lane)));
       });
     }
     break;
@@ -4803,7 +4816,7 @@ struct Machine {
     if (!(op == "v_floor_f64_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_double(w, in, lane, std::floor(lane_double(w, in.src[0], lane)));
+        write_double(w, in, lane, floor_inline(lane_double(w, in.src[0], lane)));
       });
     }
     break;
@@ -4864,7 +4877,7 @@ struct Machine {
     if (!(op == "v_floor_f32_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::floor(lane_float(w, in.src[0], lane)));
+        write_float(w, in, lane, floor_inline(lane_float(w, in.src[0], lane)));
       });
     }
     break;
@@ -4872,7 +4885,7 @@ struct Machine {
     if (!(op == "v_ceil_f32_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::ceil(lane_float(w, in.src[0], lane)));
+        write_float(w, in, lane, ceil_inline(lane_float(w, in.src[0], lane)));
       });
     }
     break;
@@ -5650,7 +5663,7 @@ struct Machine {
     if (!(op == "v_trunc_f32_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::trunc(lane_float(w, in.src[0], lane)));
+        write_float(w, in, lane, trunc_inline(lane_float(w, in.src[0], lane)));
       });
     }
     break;
@@ -10474,6 +10487,143 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   }
   if (packet) mem.free(packet);
   return total;
+}
+
+
+// ---- the same-bits probe (amd_exec.hpp) -----------------------------------------------------------------------------
+
+namespace {
+struct Mix64 {
+  uint64_t h = 0x9E3779B97F4A7C15ull;
+  void add(uint64_t v) {
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 29;
+  }
+  void add_bytes(const void* p, size_t n) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+      uint64_t v;
+      std::memcpy(&v, b + i, 8);
+      add(v);
+    }
+    for (; i < n; ++i) add(b[i]);
+  }
+};
+struct Rng {
+  uint64_t s;
+  uint64_t next() {
+    s += 0x9E3779B97F4A7C15ull;
+    uint64_t z = s;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+  }
+};
+// A 32-bit value of the flavour: 0 any bits, 1 small, 2 a float (finite, special or tiny).
+uint32_t draw(Rng& r, uint32_t flavour) {
+  const uint64_t x = r.next();
+  if (flavour == 1) return static_cast<uint32_t>(x) & 0xFF;
+  if (flavour == 2) {
+    static constexpr uint32_t kSpecial[] = {0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x7F800000u, 0xFF800000u,
+                                            0x7FC00000u, 0x7F800001u, 0x00000001u, 0x007FFFFFu, 0x7F7FFFFFu, 0x40490FDBu,
+                                            0x7FF00000u, 0xFFF00000u, 0x7FF80000u, 0x7FF00001u, 0x3FF00000u, 0x000FFFFFu};
+    if ((x >> 40) % 4 == 0) return kSpecial[(x >> 32) % std::size(kSpecial)];
+    const float f = (static_cast<float>(static_cast<uint32_t>(x) >> 8) / 16777216.0f - 0.5f) * 64.0f;
+    return as_bits(f);
+  }
+  return static_cast<uint32_t>(x);
+}
+}  // namespace
+
+uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour) {
+  static constexpr uint32_t kMach[] = {0x4c, 0x3f, 0x4f, 0x41, 0x48, 0x36, 0x49};   // by gcn::Target's order
+  CodeObject co;
+  co.mach = kMach[static_cast<int>(target)];
+  co.text.assign(16, 0);
+  Kernel k;
+  k.name = "probe";
+  k.wave32 = gcn::is_rdna(target);
+  Dispatch d;
+  d.object = &co;
+  d.kernel = &k;
+  MemoryManager mem(4ull << 20);
+  const uint64_t region = mem.alloc(1 << 16);
+  DecodeCache cache(16);
+  cache.get(0, [&] { return in; });
+  d.decoded = &cache;
+  Machine m(d, mem, cache);
+  Rng r{seed * 0x2545F4914F6CDD1Dull + flavour};
+  Group g;
+  g.lds.assign(1 << 16, 0);
+  g.scratch_per_lane = 256;
+  g.scratch.assign(size_t{256} * kLanes, 0);
+  for (uint8_t& b : g.scratch) b = static_cast<uint8_t>(draw(r, 0));
+  k.private_segment = 256;
+  g.waves.resize(1);
+  Wave& w = g.waves[0];
+  w.lanes = k.wave32 ? 32 : kLanes;
+  w.mode = k.mode;
+  w.vgpr.grow(288);
+  w.agpr.resize(288);
+  for (uint8_t& b : g.lds) b = static_cast<uint8_t>(draw(r, 0));
+  {
+    std::vector<uint8_t> bytes(1 << 16);
+    for (uint8_t& b : bytes) b = static_cast<uint8_t>(draw(r, 0));
+    mem.write(region, bytes.data(), bytes.size());
+  }
+  for (uint32_t& s : w.sgpr) s = draw(r, flavour);
+  for (uint32_t& s : w.ttmp) s = draw(r, flavour);
+  for (auto& row : w.vgpr.r)
+    for (uint32_t& v : row) v = draw(r, flavour);
+  for (auto& row : w.agpr)
+    for (uint32_t& v : row) v = draw(r, flavour);
+  const uint64_t all = w.lanes == 64 ? ~uint64_t{0} : (uint64_t{1} << w.lanes) - 1;
+  w.exec = (flavour == 3 ? r.next() : ~uint64_t{0}) & all;
+  w.vcc = r.next() & all;
+  w.m0 = draw(r, flavour);
+  w.scc = r.next() & 1;
+  w.pc = 0;
+  Mix64 h;
+  std::string error;
+  bool ran = false;
+  try {
+    ran = m.step(w, g);
+  } catch (const Error& e) {
+    error = std::string(e.what()) + "|" + std::to_string(static_cast<int>(e.code()));
+  } catch (const std::exception& e) {
+    error = std::string("std:") + e.what();
+  }
+  if (std::getenv("VGPU_SAME_BITS_DUMP")) std::fprintf(stderr, "   ran=%d err=[%s] s0=%08x s2=%08x exec=%llx pc=%llx\n", ran, error.c_str(), w.sgpr[0], w.sgpr[2], (unsigned long long)w.exec, (unsigned long long)w.pc);
+  if (const char* dv = std::getenv("VGPU_SAME_BITS_DUMP_V")) {
+    const int r = std::atoi(dv);
+    std::fprintf(stderr, "   v%d:", r);
+    for (int l = 0; l < 64; ++l) std::fprintf(stderr, " %08x", w.vgpr[r][l]);
+    std::fprintf(stderr, "\n");
+  }
+  h.add(ran);
+  h.add_bytes(error.data(), error.size());
+  h.add(w.pc), h.add(w.exec), h.add(w.vcc), h.add(w.m0), h.add(w.scc), h.add(w.done), h.add(w.at_barrier);
+  h.add(w.loads_in_flight), h.add(w.soft_yield), h.add(w.vgpr_msb), h.add(w.mode), h.add(w.gpr_idx);
+  h.add_bytes(w.sgpr, sizeof w.sgpr);
+  h.add_bytes(w.ttmp, sizeof w.ttmp);
+  for (const auto& row : w.vgpr.r) h.add_bytes(row.data(), sizeof row);
+  for (const auto& row : w.agpr) h.add_bytes(row.data(), sizeof row);
+  h.add_bytes(g.lds.data(), g.lds.size());
+  h.add_bytes(g.scratch.data(), g.scratch.size());
+  {
+    std::vector<uint8_t> bytes(1 << 16);
+    mem.read(region, bytes.data(), bytes.size());
+    h.add_bytes(bytes.data(), bytes.size());
+  }
+  const InstructionCounts& c = m.stats.counts;
+  h.add(m.stats.instructions), h.add(m.stats.barriers);
+  h.add(c.valu), h.add(c.mfma), h.add(c.salu), h.add(c.smem), h.add(c.vmem), h.add(c.flat), h.add(c.lds), h.add(c.branch);
+  h.add(c.sendmsg), h.add(c.flat_read), h.add(c.flat_write), h.add(c.flat_atomic), h.add(c.vmem_rd), h.add(c.vmem_wr);
+  for (uint64_t v : c.mix) h.add(v);
+  for (uint64_t v : c.mops) h.add(v);
+  return h.h;
 }
 
 }  // namespace vgpu::amd

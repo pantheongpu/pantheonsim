@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "vgpu/amd_codeobject.hpp"
+#include "vgpu/amd_gcn.hpp"
 #include "vgpu/memory.hpp"
 
 namespace vgpu::amd {
@@ -168,6 +169,14 @@ struct DispatchStats {
 // Err::InvalidValue for a dispatch the kernel cannot take (a work-group
 // larger than it allows, or more LDS than the device has).
 DispatchStats execute(const Dispatch& d, MemoryManager& mem);
+
+// For tests (amd/tests/unit/test_gcn_same_bits.cpp): one decoded instruction run on a fresh wave whose
+// registers, EXEC, VCC, LDS and a memory region hold pseudo-random values drawn from `seed` (`flavour`
+// picks the kind: 0 any bits, 1 small integers, 2 floats with the special values among them, 3 half the
+// lanes off), and a digest of everything it changed or threw: all registers, the lane masks, SCC, M0,
+// the program counter, LDS, the memory, the instruction counts, or the error's text. Two builds that
+// interpret the instruction alike give the same digest.
+uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour);
 
 // The process is exiting: every dispatch still running stops within a few
 // thousand instructions a wave, throwing Err::DeviceLost, and none starts.
