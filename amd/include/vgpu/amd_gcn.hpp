@@ -14,9 +14,36 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vgpu::amd::gcn {
+
+// An instruction's name as the interpreter tells instructions apart: a 64-bit FNV-1a hash of its text. A literal
+// written "v_add_f32_e32"_op in gcn_exec.cpp has its hash taken by the compiler.
+constexpr uint64_t name_hash(std::string_view s) {
+  uint64_t h = 1469598103934665603ull;
+  for (char c : s) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
+  return h;
+}
+
+// What the executor asks of an instruction's name text, answered once, when it is decoded (finalize).
+enum InstFlag : uint32_t {
+  kInstFinal = 1u << 0,         // the flags and hashes below have been worked out
+  kInstMfma = 1u << 1,          // v_mfma* or v_smfmac*
+  kInstCmp = 1u << 2,           // v_cmp*
+  kInstF64 = 1u << 3,           // the name has "f64" in it
+  kInstStore = 1u << 4,         // "_store"
+  kInstAtomic = 1u << 5,        // "_atomic"
+  kInstLoadLds = 1u << 6,       // "_load_lds_"
+  kInstAsyncLds = 1u << 7,      // "_async_to_lds_" or "_async_from_lds_"
+  kInstGws = 1u << 8,           // ds_gws_*
+  kInstDsWrite = 1u << 9,       // ds_write* or ds_store*
+  kInstBranchCount = 1u << 10,  // s_branch, or s_cbranch_*: counted as a branch
+  kInstSWait = 1u << 11,        // s_wait_*, but s_wait_event
+  kInstTensor = 1u << 12,       // tensor_*
+  kInstBarrierSop1 = 1u << 13,  // s_barrier_*, s_get_barrier_state, s_wakeup_barrier
+};
 
 // The encodings, by the ISA's names for them.
 // Mtbuf and Vopd are RDNA's: a typed buffer access, and VOPD, two vector
@@ -218,7 +245,27 @@ struct Inst {
   // say how far a write is published. Every access here is already visible to
   // every wave, so they change nothing and are kept for the listing.
   uint32_t cache = 0;
+  // Worked out once, when the instruction is decoded (finalize): the hash of `name`; the name of the short form the
+  // instruction runs as when it is a sub-dword, cross-lane, promoted or 16-bit long form (vector_alu), empty for the
+  // rest, and its hash; and InstFlag bits. flags == 0 says none of it has been done, and the executor does it itself.
+  uint64_t name_hash = 0, short_hash = 0;
+  std::string short_name;
+  uint32_t flags = 0;
 };
+
+// The short form's name (Inst::short_name worked out), "" for an instruction that runs under its own.
+std::string short_name_of(const Inst& in);
+// Fills in Inst::name_hash, short_name, short_hash and flags.
+void finalize(Inst& in);
+// The flags of an instruction, finalized or not.
+inline uint32_t inst_flags(const Inst& in) {
+  if (in.flags & kInstFinal) return in.flags;
+  Inst copy;
+  copy.name = in.name;
+  copy.sdwa = in.sdwa, copy.dpp = in.dpp, copy.dpp8 = in.dpp8, copy.promoted = in.promoted, copy.enc = in.enc;
+  finalize(copy);
+  return copy.flags;
+}
 
 // The target a code object's e_flags machine field (EF_AMDGPU_MACH) names.
 inline Target target_of_mach(uint32_t mach) {

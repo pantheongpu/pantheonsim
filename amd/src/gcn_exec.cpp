@@ -89,17 +89,14 @@ constexpr uint64_t kPrivateBase = 0x1800'0000'0000ull;
 constexpr uint64_t kPrivateSize = 1ull << 32;
 
 // An instruction's name, as the interpreter tells instructions apart: its
-// text and a 64-bit FNV-1a hash of it, taken once per instruction. A literal
-// written "v_add_f32_e32"_op has its hash taken by the compiler, so telling
-// one instruction from another in a lane loop is an integer comparison rather
-// than a string one -- which is where the interpreter used to spend most of
-// its time. The text is compared as well whenever the hashes agree, so a
-// collision could never make one instruction run as another.
-constexpr uint64_t name_hash(std::string_view s) {
-  uint64_t h = 1469598103934665603ull;
-  for (char c : s) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
-  return h;
-}
+// text and a 64-bit FNV-1a hash of it, taken once per instruction (when it is
+// decoded: Inst::name_hash). A literal written "v_add_f32_e32"_op has its hash
+// taken by the compiler, so telling one instruction from another is an integer
+// comparison rather than a string one, and the instruction ladders are
+// switches on the hash (amd/tools/ladder-to-switch.py). The text is compared
+// as well whenever the hashes agree, so a collision could never make one
+// instruction run as another.
+using gcn::name_hash;
 struct OpLit {
   uint64_t hash;
   std::string_view text;
@@ -108,20 +105,24 @@ consteval OpLit operator""_op(const char* s, size_t n) { return {name_hash({s, n
 class OpName {
  public:
   explicit OpName(const std::string& s) : s_(s), hash_(name_hash(s)) {}
-  bool operator==(const OpLit& l) const { return hash_ == l.hash && std::string_view(s_) == l.text; }
+  OpName(std::string_view s, uint64_t hash) : s_(s), hash_(hash) {}
+  // The instruction's own name, with the hash its decoding took.
+  explicit OpName(const Inst& in) : s_(in.name), hash_(in.flags & gcn::kInstFinal ? in.name_hash : name_hash(in.name)) {}
+  bool operator==(const OpLit& l) const { return hash_ == l.hash && s_ == l.text; }
   bool operator!=(const OpLit& l) const { return !(*this == l); }
   uint64_t hash() const { return hash_; }
-  operator const std::string&() const { return s_; }
+  std::string_view view() const { return s_; }
+  operator std::string() const { return std::string(s_); }
   size_t size() const { return s_.size(); }
   size_t find(const char* t) const { return s_.find(t); }
   size_t rfind(const char* t, size_t at = std::string::npos) const { return s_.rfind(t, at); }
   size_t rfind(char c) const { return s_.rfind(c); }
   int compare(size_t at, size_t n, const char* t) const { return s_.compare(at, n, t); }
-  std::string substr(size_t at, size_t n = std::string::npos) const { return s_.substr(at, n); }
+  std::string substr(size_t at, size_t n = std::string::npos) const { return std::string(s_.substr(at, n)); }
   friend std::ostream& operator<<(std::ostream& o, const OpName& n) { return o << n.s_; }
 
  private:
-  const std::string& s_;
+  std::string_view s_;
   uint64_t hash_;
 };
 
@@ -650,11 +651,56 @@ struct Machine {
   // scalar value for every lane.
   uint32_t lane_src(const Wave& w, const Operand& o, uint32_t lane) const {
     if (&o == dpp_operand) return (*dpp_values)[lane];
+    if (o.kind == OperandKind::Vgpr) {
+      const uint32_t v = w.vgpr[o.index][lane];
+      return o.sel == 6 ? v : selected(v, o.sel, o.sext);
+    }
+    // A source that is the same in every lane, read once for the instruction (InvariantSources).
+    if (inv_mask_) {
+      const size_t k = (reinterpret_cast<uintptr_t>(&o) - reinterpret_cast<uintptr_t>(inv_ops_)) / sizeof(Operand);
+      if (k < kInvMax && (inv_mask_ >> k & 1)) return inv_value_[k];
+    }
     if (o.kind == OperandKind::Agpr)
       return o.index < w.agpr.size() ? w.agpr[o.index][lane] : 0;   // one never written holds nothing
-    const uint32_t v = o.kind == OperandKind::Vgpr ? w.vgpr[o.index][lane] : static_cast<uint32_t>(scalar(w, o));
+    const uint32_t v = static_cast<uint32_t>(scalar(w, o));
     return o.sel == 6 ? v : selected(v, o.sel, o.sext);
   }
+  // The sources of the instruction being run that are a scalar register, an inline constant or a literal: the same in
+  // every lane and unchanged while the lanes run (an instruction's scalar results are written after them), so
+  // lane_src reads each once, here, instead of once per lane. The value is what lane_src gives for lane 0 without it.
+  static constexpr size_t kInvMax = 4;
+  const Operand* inv_ops_ = nullptr;
+  uint32_t inv_mask_ = 0;
+  uint32_t inv_value_[kInvMax] = {};
+  struct InvariantSources {
+    Machine& m;
+    const Operand* saved_ops;
+    uint32_t saved_mask;
+    uint32_t saved_value[kInvMax];
+    InvariantSources(Machine& machine, const Wave& w, const Inst& in)
+        : m(machine), saved_ops(machine.inv_ops_), saved_mask(machine.inv_mask_) {
+      std::copy(std::begin(m.inv_value_), std::end(m.inv_value_), std::begin(saved_value));
+      m.inv_mask_ = 0;
+      m.inv_ops_ = in.src.data();
+      uint32_t mask = 0;
+      for (size_t k = 0; k < in.src.size() && k < kInvMax; ++k) {
+        const Operand& o = in.src[k];
+        const bool constant = o.kind == OperandKind::Inline || o.kind == OperandKind::InlineFloat || o.kind == OperandKind::Literal;
+        const bool sgpr = o.kind == OperandKind::Sgpr && o.index + (o.width >= 2 ? 2u : 1u) <= kSgprs;
+        if (&o == m.dpp_operand || !(constant || sgpr)) continue;
+        m.inv_value_[k] = m.lane_src(w, o, 0);
+        mask |= 1u << k;
+      }
+      m.inv_mask_ = mask;
+    }
+    ~InvariantSources() {
+      m.inv_ops_ = saved_ops;
+      m.inv_mask_ = saved_mask;
+      std::copy(std::begin(saved_value), std::end(saved_value), std::begin(m.inv_value_));
+    }
+    InvariantSources(const InvariantSources&) = delete;
+    InvariantSources& operator=(const InvariantSources&) = delete;
+  };
   // The part of a register a sub-dword instruction reads: a byte or a half of
   // it, taken into 32 bits with its sign or without.
   static uint32_t selected(uint32_t v, uint8_t sel, bool sext) {
@@ -1180,7 +1226,7 @@ struct Machine {
       w.scc = is_unsigned ? test(x, k) : test(static_cast<int32_t>(x), static_cast<int32_t>(k));
       return;
     }
-    const OpName op(in.name);
+    const OpName op(in);
     const uint64_t a = in.src.empty() ? 0 : scalar(w, in.src[0]);
     const uint64_t b = in.src.size() > 1 ? scalar(w, in.src[1]) : 0;
     switch (op.hash()) {
@@ -2038,7 +2084,7 @@ struct Machine {
       return;
     }
     const uint64_t a = scalar(w, in.src[0]), b = scalar(w, in.src[1]);
-    const OpName op(in.name);
+    const OpName op(in);
     // RDNA's scalar float comparisons: s_cmp_<test>_f32 and _f16, the vector
     // comparisons' tests.
     if (in.name.size() > 10 && in.name.rfind("s_cmp_", 0) == 0 &&
@@ -2150,14 +2196,14 @@ struct Machine {
     // on. s_memrealtime is the real-time clock (realtime_ticks), at the rate
     // the runtime reports: a kernel waiting on it for some milliseconds, as
     // wall_clock64() loops do, waits that long.
-    if (OpName(in.name) == "s_memtime"_op || OpName(in.name) == "s_memrealtime"_op) {
-      const uint64_t t = OpName(in.name) == "s_memtime"_op ? stats.instructions : realtime_ticks();
+    if (OpName(in) == "s_memtime"_op || OpName(in) == "s_memrealtime"_op) {
+      const uint64_t t = OpName(in) == "s_memtime"_op ? stats.instructions : realtime_ticks();
       set_sgpr(w, in.dst[0].index, static_cast<uint32_t>(t));
       set_sgpr(w, in.dst[0].index + 1, static_cast<uint32_t>(t >> 32));
       return;
     }
     // The scalar cache holds nothing here to write back or drop.
-    if (OpName(in.name) == "s_dcache_wb"_op || OpName(in.name) == "s_dcache_inv"_op) return;
+    if (OpName(in) == "s_dcache_wb"_op || OpName(in) == "s_dcache_inv"_op) return;
     // The base, the instruction's own offset, and a scalar register's where
     // it names one.
     // (RDNA's decoder keeps the register as the second source: null, reading
@@ -2208,8 +2254,8 @@ struct Machine {
     }
     // RDNA4's sub-dword scalar loads: a byte or a short, widened with its sign
     // or without.
-    if (OpName(in.name) == "s_load_u8"_op || OpName(in.name) == "s_load_i8"_op ||
-        OpName(in.name) == "s_load_u16"_op || OpName(in.name) == "s_load_i16"_op) {
+    if (OpName(in) == "s_load_u8"_op || OpName(in) == "s_load_i8"_op ||
+        OpName(in) == "s_load_u16"_op || OpName(in) == "s_load_i16"_op) {
       const uint32_t bytes = in.name.back() == '8' ? 1 : 2;
       const uint64_t raw = at(base).load_scalar(base, bytes);
       const bool sign = in.name[7] == 'i';
@@ -2249,7 +2295,7 @@ struct Machine {
   // this reciprocal is exact, so the sequence lands on the correctly rounded
   // quotient either way.
   void divide_step(Wave& w, const Inst& in, uint32_t lane) {
-    const OpName op(in.name);
+    const OpName op(in);
     // The same three steps, in double precision: the ISA gives each a form of
     // its own, and the scaling is by 2^128 rather than 2^64.
     if (op.size() > 4 && op.compare(op.size() - 4, 4, "_f64") == 0) {
@@ -2334,7 +2380,7 @@ struct Machine {
   // half. The mask goes to VCC in the short form, and to the pair the long
   // form names.
   bool carry_alu(Wave& w, const Inst& in) {
-    const OpName op(in.name);
+    const OpName op(in);
     if (op.find("_co_u32") == std::string::npos) return false;
     const bool add = op.rfind("v_add", 0) == 0;
     const bool takes_carry = op.find("_addc_") != std::string::npos || op.find("_subb") != std::string::npos;
@@ -2365,7 +2411,10 @@ struct Machine {
     const bool comparing = in_dpp.name.rfind("v_cmp", 0) == 0;
     if (comparing) {
       plain = in_dpp;
-      if (plain.name.ends_with("_dpp")) plain.name.resize(plain.name.size() - 4);
+      if (plain.name.ends_with("_dpp")) {
+        plain.name.resize(plain.name.size() - 4);
+        plain.flags = 0;   // (the hash and flags taken at decoding were of the longer name)
+      }
     }
     const Inst& in = comparing ? plain : in_dpp;
     std::array<uint32_t, kLanes> values{};
@@ -2448,10 +2497,11 @@ struct Machine {
   // add-then-clamp forms, packed saturating conversions, tanh and the bfloat16 transcendentals, and the
   // 8-bit float conversions to halves. False for an instruction that is not one of them.
   bool cdna5_alu(Wave& w, const Inst& in, const OpName& op_in) {
-    std::string name = op_in;
+    // The name without its _e32 or _e64 (no copy: a view of the instruction's own).
+    std::string_view name = op_in.view();
     if (name.size() > 4 && (name.compare(name.size() - 4, 4, "_e32") == 0 || name.compare(name.size() - 4, 4, "_e64") == 0))
-      name.resize(name.size() - 4);
-    const OpName op(name);
+      name.remove_suffix(4);
+    const OpName op(name, name.size() == op_in.size() ? op_in.hash() : name_hash(name));
     const auto each = [&](auto&& body) {
       for (uint32_t lane = 0; lane < kLanes; ++lane)
         if (w.exec >> lane & 1) body(lane);
@@ -3117,10 +3167,11 @@ struct Machine {
   }
 
   bool rdna_alu(Wave& w, const Inst& in, const OpName& op_in) {
-    std::string name = op_in;
+    // The name without its _e32 or _e64 (no copy: a view of the instruction's own).
+    std::string_view name = op_in.view();
     if (name.size() > 4 && (name.compare(name.size() - 4, 4, "_e32") == 0 || name.compare(name.size() - 4, 4, "_e64") == 0))
-      name.resize(name.size() - 4);
-    const OpName op(name);
+      name.remove_suffix(4);
+    const OpName op(name, name.size() == op_in.size() ? op_in.hash() : name_hash(name));
     const auto each = [&](auto&& body) {
       for (uint32_t lane = 0; lane < kLanes; ++lane)
         if (w.exec >> lane & 1) body(lane);
@@ -4469,20 +4520,34 @@ struct Machine {
     return true;
   }
 
+  // v_bcnt_u32_b32 over the lanes in a function compiled for the POPCNT instruction: the build's baseline (x86-64) has none,
+  // so __builtin_popcount is a call into libgcc for each lane.
+#if defined(__x86_64__)
+  static bool have_popcnt() {
+    static const bool yes = __builtin_cpu_supports("popcnt");
+    return yes;
+  }
+  __attribute__((target("popcnt"))) void bcnt_u32_popcnt(Wave& w, const Inst& in) {
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+      if (w.exec >> lane & 1)
+        write_lane(w, in.dst[0], lane,
+                   lane_src(w, in.src[1], lane) + static_cast<uint32_t>(__builtin_popcount(lane_src(w, in.src[0], lane))));
+  }
+#else
+  static bool have_popcnt() { return false; }
+  void bcnt_u32_popcnt(Wave&, const Inst&) {}
+#endif
+
   void vector_alu(Wave& w, const Inst& in) {
     // The sub-dword form of an instruction does what the short form does,
     // over the part of each register it names, and the cross-lane form does
     // it over the lanes it named, so both are the same arithmetic under the
     // name the short form has.
-    const std::string as_short =
-        in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
-        : (in.dpp || in.dpp8) ? (in.name.ends_with("_dpp") ? in.name.substr(0, in.name.size() - 4) + "_e32" : std::string())
-        : in.promoted ? in.name.substr(0, in.name.size() - 4) + "_e32"
-        : in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e64") == 0 &&
-                (in.name.find("_u16") != std::string::npos || in.name.find("_b16") != std::string::npos)
-                  ? in.name.substr(0, in.name.size() - 4) + "_e32"
-                  : std::string();
-    const OpName op(as_short.empty() ? in.name : as_short);
+    // (Worked out when the instruction was decoded: Inst::short_name.)
+    const bool decoded_once = in.flags & gcn::kInstFinal;
+    const std::string made = decoded_once ? std::string() : gcn::short_name_of(in);
+    const std::string& as_short = decoded_once ? in.short_name : made;
+    const OpName op = as_short.empty() ? OpName(in) : OpName(as_short, decoded_once ? in.short_hash : name_hash(as_short));
     // (A sub-dword instruction may write part of its destination and pad the
     // rest with zeroes, carry the part's sign into it, or keep what was
     // there: write_lane does each.)
@@ -4511,6 +4576,7 @@ struct Machine {
       return;
     }
     Narrowed narrowed(*this, in);
+    const InvariantSources invariant(*this, w, in);
     if (in.arch == gcn::Target::Gfx1250 && cdna5_alu(w, in, op)) {return;} else if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) {return;} else if (carry_alu(w, in)) {return;} else if (more_alu(w, in, op)) {return;} else {
   switch (op.hash()) {
     case "v_mov_b16_e32"_op.hash: case "v_mov_b16_e64"_op.hash: case "v_mov_b16"_op.hash:
@@ -5563,8 +5629,11 @@ struct Machine {
           std::memcpy(&h, &bits, 2);
           return static_cast<double>(h);
         };
-        const double sum = half(a, 0) * half(b, 0) + half(a, 1) * half(b, 1) +
-                           static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]));
+        // (Written in this order: with NaNs of different payloads among the operands, the one the sum keeps follows it.)
+        double p0 = half(a, 0) * half(b, 0), p1 = half(a, 1) * half(b, 1);
+        double c = static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]));
+        __asm__("" : "+x"(p1), "+x"(p0), "+x"(c));   // (this order of operands: the compiler may not swap them)
+        const double sum = p1 + p0 + c;
         write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
       });
     }
@@ -5857,6 +5926,10 @@ struct Machine {
   case "v_bcnt_u32_b32"_op.hash:
     if (!(op == "v_bcnt_u32_b32"_op)) goto L_ladder_9;
     {
+      if (have_popcnt()) {
+        bcnt_u32_popcnt(w, in);
+        break;
+      }
       each([&](uint32_t lane) {
         // The set bits of the first source, counted into the second.
         write_lane(w, in.dst[0], lane,
@@ -6112,6 +6185,7 @@ struct Machine {
                              (raw >= 0xB0 && raw < 0xC0) || (raw >= 0xD0 && raw < 0xE0) || raw >= 0xF0 ||
                              raw == 0x11 || raw == 0x13 || raw == 0x15;
     const uint32_t op = !writes_exec ? raw : raw < 0x20 ? raw - 1 : raw - 0x10;
+    const InvariantSources invariant(*this, w, in);
     const auto each = [&](auto&& test) {
       uint64_t result = 0;
       for (uint32_t lane = 0; lane < kLanes; ++lane)
@@ -6406,7 +6480,7 @@ struct Machine {
   }
 
   void lds_access(Wave& w, const Inst& in, Group& g) {
-    const OpName op(in.name);
+    const OpName op(in);
     if (uint32_t bits; in.name.rfind("ds_", 0) == 0 && transpose_kind(std::string_view(in.name).substr(3), &bits)) {
       if (!transpose_ready(w, in)) return;
       uint8_t raw[32][16] = {};
@@ -7368,7 +7442,7 @@ struct Machine {
 
   // A work-item's private memory, which a kernel spills into.
   void scratch_access(Wave& w, const Inst& in, Group& g) {
-    const OpName op(in.name);
+    const OpName op(in);
     const uint32_t words = op.rfind("scratch_store", 0) == 0 ? in.src[1].width : in.dst[0].width;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
@@ -8405,12 +8479,15 @@ struct Machine {
                                   : kind == Kind::Store   ? 4 * in.src[1].width
                                   : kind == Kind::StoreHi16 ? 2
                                                             : atomic.bytes;
+    // (The scalar base is the same for every lane, and nothing in the loop writes a scalar register; EXEC is not
+    // zero here, so a base that cannot be read was going to fail on the first lane just the same.)
+    const uint64_t saddr_base = in.has_saddr ? scalar_field(w, in.saddr, true) : 0;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // The address is a 64-bit one in a register pair, or a scalar base with
       // a 32-bit offset per lane.
       const uint64_t offset_reg = in.has_saddr ? scaled_offset(in, lane_src(w, in.src[0], lane), access_bytes) : 0;
-      const uint64_t addr = (in.has_saddr ? scalar_field(w, in.saddr, true) + offset_reg
+      const uint64_t addr = (in.has_saddr ? saddr_base + offset_reg
                                           : lane_src64(w, in.src[0], lane)) +
                             static_cast<uint64_t>(static_cast<int64_t>(in.offset));
       switch (kind) {
@@ -9252,7 +9329,7 @@ struct Machine {
       }
   }
   bool gws_barrier(Wave& w, const Inst& in) {
-    const OpName op(in.name);
+    const OpName op(in);
     if (op == "ds_gws_init"_op) return true;   // the count comes with each barrier
     if (op != "ds_gws_barrier"_op)
       throw Error::make(Err::Unsupported, in.name, ": GWS semaphores are not modelled");
@@ -9303,7 +9380,7 @@ struct Machine {
     }
   }
   bool gfx1250_barrier(Wave& w, const Inst& in, Group& g) {
-    const OpName op(in.name);
+    const OpName op(in);
     const BarrierRef b = barrier_ref(w, in.src.empty() ? Operand{} : in.src.back());
     const bool named = b.id >= 1 && b.id <= 16;
     switch (op.hash()) {
@@ -9403,13 +9480,12 @@ struct Machine {
   // wave's own, and not atomics, which a card orders where they arrive). Cheap for everything that is not a memory
   // instruction, since it runs on each instruction until the wave's first store of a round.
   static bool is_plain_store(const Inst& in) {
+    const uint32_t f = gcn::inst_flags(in);
     switch (in.enc) {
-      case gcn::Enc::Ds: return in.name.rfind("ds_write", 0) == 0 || in.name.rfind("ds_store", 0) == 0;
-      case gcn::Enc::Flat:
-        return in.segment != Inst::Segment::Scratch && in.name.find("_store") != std::string::npos &&
-               in.name.find("_atomic") == std::string::npos;
+      case gcn::Enc::Ds: return f & gcn::kInstDsWrite;
+      case gcn::Enc::Flat: return in.segment != Inst::Segment::Scratch && (f & gcn::kInstStore) && !(f & gcn::kInstAtomic);
       case gcn::Enc::Mubuf:
-      case gcn::Enc::Mtbuf: return in.name.find("_store") != std::string::npos && in.name.find("_atomic") == std::string::npos;
+      case gcn::Enc::Mtbuf: return (f & gcn::kInstStore) && !(f & gcn::kInstAtomic);
       default: return false;
     }
   }
@@ -9450,13 +9526,14 @@ struct Machine {
     w.pc += in.size;
     ++stats.instructions;
     InstructionCounts& n = stats.counts;
+    const uint32_t fl = gcn::inst_flags(in);   // (what the names say, worked out when decoded)
     switch (in.enc) {
       case gcn::Enc::Sop1:
       case gcn::Enc::Sop2:
       case gcn::Enc::Sopk:
         ++n.salu;
         if (in.arch == gcn::Target::Gfx1250 && in.enc == gcn::Enc::Sop1 &&
-            (in.name.rfind("s_barrier_", 0) == 0 || in.name == "s_get_barrier_state" || in.name == "s_wakeup_barrier"))
+            (fl & gcn::kInstBarrierSop1))
           return gfx1250_barrier(w, in, g);
         scalar_alu(w, in);
         return true;
@@ -9479,7 +9556,7 @@ struct Machine {
         const Inst& x = w.gpr_idx ? (indexed = in, index_gprs(w, &indexed), indexed) : in;
         // A comparison in its long form is still a comparison: it writes a
         // mask of the lanes that passed, not a value per lane.
-        if (x.name.rfind("v_mfma", 0) == 0 || x.name.rfind("v_smfmac", 0) == 0) {
+        if (fl & gcn::kInstMfma) {
           // The matrix instructions ignore MODE: round to nearest even,
           // denormals kept, always.
           ++n.mfma;
@@ -9487,9 +9564,9 @@ struct Machine {
           return true;
         }
         std::optional<FloatMode> fm;
-        if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, x.name.find("f64") != std::string::npos);
+        if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, (fl & gcn::kInstF64) != 0);
         if (x.dpp || x.dpp8) cross_lane_alu(w, x);
-        else if (x.name.rfind("v_cmp", 0) == 0) compare(w, x);
+        else if (fl & gcn::kInstCmp) compare(w, x);
         else vector_alu(w, x);
         return true;
       }
@@ -9528,34 +9605,34 @@ struct Machine {
       case gcn::Enc::Vopc: {
         ++n.valu;
         std::optional<FloatMode> fm;
-        if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, in.name.find("f64") != std::string::npos);
+        if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, (fl & gcn::kInstF64) != 0);
         if (in.dpp || in.dpp8) cross_lane_alu(w, in);
         else compare(w, in);
         return true;
       }
       case gcn::Enc::Ds:
         ++n.lds;
-        if (in.name.rfind("ds_gws_", 0) == 0) return gws_barrier(w, in);
+        if (fl & gcn::kInstGws) return gws_barrier(w, in);
         lds_access(w, in, g);
         return true;
       case gcn::Enc::Flat:
         // RDNA4's cache write-back and invalidate (global_wb, global_inv,
         // global_wbinv), which its fences compile to: every access here
         // reaches memory directly, so they order the host's threads and no more.
-        if (OpName(in.name) == "global_inv"_op || OpName(in.name) == "global_wb"_op ||
-            OpName(in.name) == "global_wbinv"_op) {
+        if (OpName(in) == "global_inv"_op || OpName(in) == "global_wb"_op ||
+            OpName(in) == "global_wbinv"_op) {
           std::atomic_thread_fence(std::memory_order_seq_cst);
           return true;
         }
         ++n.vmem;
         ++n.flat;
-        if (in.name.find("_atomic") != std::string::npos) ++n.flat_atomic, ++n.vmem_wr;
-        else if (in.name.find("_store") != std::string::npos) ++n.flat_write, ++n.vmem_wr;
+        if (fl & gcn::kInstAtomic) ++n.flat_atomic, ++n.vmem_wr;
+        else if (fl & gcn::kInstStore) ++n.flat_write, ++n.vmem_wr;
         else ++n.flat_read, ++n.vmem_rd, issued_load(w);
         if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
         else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
-        else if (in.name.find("_load_lds_") != std::string::npos) global_load_lds(w, in, g), ++n.lds;
-        else if (in.name.find("_async_to_lds_") != std::string::npos || in.name.find("_async_from_lds_") != std::string::npos)
+        else if (fl & gcn::kInstLoadLds) global_load_lds(w, in, g), ++n.lds;
+        else if (fl & gcn::kInstAsyncLds)
           global_async_lds(w, in, g), ++n.lds;
         else global_access(w, in);
         return true;
@@ -9566,30 +9643,30 @@ struct Machine {
         // to write back and nothing stale to drop -- but work-groups on other
         // host threads see this thread's writes in the order a fence
         // promises only if the host is told to keep it.
-        if (OpName(in.name) == "buffer_wbl2"_op || OpName(in.name) == "buffer_inv"_op ||
-            OpName(in.name) == "buffer_wbinvl1"_op || OpName(in.name) == "buffer_wbinvl1_vol"_op ||
-            OpName(in.name) == "buffer_invl2"_op || OpName(in.name) == "buffer_gl0_inv"_op ||
-            OpName(in.name) == "buffer_gl1_inv"_op) {
+        if (OpName(in) == "buffer_wbl2"_op || OpName(in) == "buffer_inv"_op ||
+            OpName(in) == "buffer_wbinvl1"_op || OpName(in) == "buffer_wbinvl1_vol"_op ||
+            OpName(in) == "buffer_invl2"_op || OpName(in) == "buffer_gl0_inv"_op ||
+            OpName(in) == "buffer_gl1_inv"_op) {
           std::atomic_thread_fence(std::memory_order_seq_cst);
           return true;
         }
-        if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
+        if (fl & (gcn::kInstStore | gcn::kInstAtomic)) ++n.vmem_wr;
         else ++n.vmem_rd, issued_load(w);
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Mtbuf:
         ++n.vmem;
-        if (in.name.find("_store") != std::string::npos) ++n.vmem_wr;
+        if (fl & gcn::kInstStore) ++n.vmem_wr;
         else ++n.vmem_rd, issued_load(w);
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Mimg:
-        if (in.name.rfind("tensor_", 0) == 0) {
+        if (fl & gcn::kInstTensor) {
           tensor_move(w, in, g);
           return true;
         }
         ++n.vmem;
-        if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
+        if (fl & (gcn::kInstStore | gcn::kInstAtomic)) ++n.vmem_wr;
         else ++n.vmem_rd, issued_load(w);
         image_access(w, in);
         return true;
@@ -9598,120 +9675,140 @@ struct Machine {
         throw Error::make(Err::Unsupported, gcn::enc_name(in.enc), " is decoded but not implemented");
     }
     // The program-flow instructions.
-    if (OpName(in.name) == "s_branch"_op || in.name.rfind("s_cbranch_", 0) == 0) ++n.branch;
-    if (OpName(in.name) == "s_sendmsg"_op) ++n.sendmsg;
-    if (OpName(in.name) == "s_endpgm"_op) {
-      w.done = true;
-      return false;
-    }
-    if (OpName(in.name) == "s_waitcnt"_op) return waited_for_loads(w, g, in, vm_count_of_waitcnt(in));
-    if (OpName(in.name) == "s_nop"_op) return true;   // nothing is out of order here
-    // RDNA's scheduling hints -- a clause of memory instructions, the delay
-    // an ALU result needs, the dependency and prefetch controls -- change
-    // nothing where every instruction completes before the next begins.
-    if (OpName(in.name) == "s_clause"_op || OpName(in.name) == "s_delay_alu"_op ||
-        OpName(in.name) == "s_waitcnt_depctr"_op || OpName(in.name) == "s_set_inst_prefetch_distance"_op)
-      return true;
-    // RDNA4's waits, a counter each (loads, stores, LDS, scalar memory, ...).
-    if (OpName(in.name) == "s_wait_loadcnt"_op) return waited_for_loads(w, g, in, in.simm & 0x3F);
-    if (in.name.rfind("s_wait_", 0) == 0 && in.name != "s_wait_event") return true;
-    if (in.arch == gcn::Target::Gfx1250 && OpName(in.name) == "s_barrier_leave"_op) {
-      gfx1250_barrier_leave(w, g);
-      return true;
-    }
-    if (OpName(in.name) == "s_barrier_wait"_op) {
-      // gfx1250: only the work-group barrier (-1) is the scheduler's; a named one has a count of its own.
-      if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) == -3 && !cluster_groups.empty()) {
-        if (w.cl_complete) {
-          w.cl_complete = false;
-          return true;
-        }
-        w.cl_wait = true;
+    if (fl & gcn::kInstBranchCount) ++n.branch;
+    const OpName op(in);
+    if (op == "s_sendmsg"_op) ++n.sendmsg;
+    // (A switch on the name's hash, in the order the rungs of the ladder this was had; a name appears in the cases of the
+    // rungs that tested it, and breaks out to the end where its extra condition does not hold.)
+    switch (op.hash()) {
+      case "s_endpgm"_op.hash:
+        if (!(op == "s_endpgm"_op)) break;
+        w.done = true;
         return false;
-      }
-      if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) != -1)
-        return gfx1250_named_wait(w, static_cast<int16_t>(in.simm));
-      w.at_barrier = true;
-      ++stats.barriers;
-      return false;
+      case "s_waitcnt"_op.hash:
+        if (!(op == "s_waitcnt"_op)) break;
+        return waited_for_loads(w, g, in, vm_count_of_waitcnt(in));
+      case "s_nop"_op.hash:
+        if (!(op == "s_nop"_op)) break;
+        return true;   // nothing is out of order here
+      // RDNA's scheduling hints -- a clause of memory instructions, the delay
+      // an ALU result needs, the dependency and prefetch controls -- change
+      // nothing where every instruction completes before the next begins.
+      case "s_clause"_op.hash: case "s_delay_alu"_op.hash: case "s_waitcnt_depctr"_op.hash: case "s_set_inst_prefetch_distance"_op.hash:
+        if (!(op == "s_clause"_op || op == "s_delay_alu"_op || op == "s_waitcnt_depctr"_op || op == "s_set_inst_prefetch_distance"_op)) break;
+        return true;
+      // RDNA4's waits, a counter each (loads, stores, LDS, scalar memory, ...).
+      case "s_wait_loadcnt"_op.hash:
+        if (!(op == "s_wait_loadcnt"_op)) break;
+        return waited_for_loads(w, g, in, in.simm & 0x3F);
+      case "s_barrier_leave"_op.hash:
+        if (!(in.arch == gcn::Target::Gfx1250 && op == "s_barrier_leave"_op)) break;
+        gfx1250_barrier_leave(w, g);
+        return true;
+      case "s_barrier_wait"_op.hash:
+        if (!(op == "s_barrier_wait"_op)) break;
+        // gfx1250: only the work-group barrier (-1) is the scheduler's; a named one has a count of its own.
+        if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) == -3 && !cluster_groups.empty()) {
+          if (w.cl_complete) {
+            w.cl_complete = false;
+            return true;
+          }
+          w.cl_wait = true;
+          return false;
+        }
+        if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) != -1)
+          return gfx1250_named_wait(w, static_cast<int16_t>(in.simm));
+        w.at_barrier = true;
+        ++stats.barriers;
+        return false;
+      case "s_sendmsg"_op.hash:
+        if (!(op == "s_sendmsg"_op)) break;
+        // Giving the wave's vector registers back as it ends (RDNA's
+        // MSG_DEALLOC_VGPRS), before its s_endpgm.
+        if (gcn::is_rdna(in.arch) && in.simm == 3) return true;
+        // The kernel raised the doorbell of its hostcall buffer and asks the
+        // host for attention (MSG_INTERRUPT, the one message decoded): the
+        // host answers now, and the wave, spinning on its packet, carries on.
+        if (!d.hostcall)
+          throw Error::make(Err::Unsupported, "the kernel asked the host for attention (s_sendmsg MSG_INTERRUPT), which ",
+                            "is how device-side printf reaches the host, and the launch was given no hostcall buffer");
+        d.hostcall->service();
+        return true;
+      case "s_setprio"_op.hash: case "s_setprio_inc_wg"_op.hash:
+        if (!(op == "s_setprio"_op || op == "s_setprio_inc_wg"_op)) break;
+        return true;   // waves are not scheduled by priority here
+      // gfx1250 addresses up to 1024 vector registers by setting the top bits of every VGPR number; a program that
+      // sets any is not one this runs yet.
+      case "s_set_vgpr_msb"_op.hash:
+        if (!(op == "s_set_vgpr_msb"_op)) break;
+        // The two high bits of the vector register numbers the following instructions name, until the next one (the same
+        // bits are in the MODE register, which s_setreg_b32 can write, and that is not modelled).
+        w.vgpr_msb = static_cast<uint8_t>(in.simm & 0xFF);
+        set_mode_msb_bits(w);
+        return true;
+      case "s_monitor_sleep"_op.hash:
+        if (!(op == "s_monitor_sleep"_op)) break;
+        return false;
+      // No wave sleeps past its own s_sleep to be woken, and there is no
+      // instruction cache to invalidate.
+      case "s_wakeup"_op.hash: case "s_icache_inv"_op.hash:
+        if (!(op == "s_wakeup"_op || op == "s_icache_inv"_op)) break;
+        return true;
+      case "s_set_gpr_idx_off"_op.hash:
+        if (!(op == "s_set_gpr_idx_off"_op)) break;
+        w.gpr_idx = 0;
+        return true;
+      case "s_trap"_op.hash:
+        if (!(op == "s_trap"_op)) break;
+        // A real card's trap handler reports it to the queue and the runtime
+        // aborts the launch; the launch fails here, and says why.
+        throw Error::make(Err::Trap, "the kernel executed s_trap ", in.simm,
+                          in.simm == 2 ? " (llvm.trap: __builtin_trap or abort() in device code)" : "");
+      case "s_barrier"_op.hash:
+        if (!(op == "s_barrier"_op)) break;
+        w.at_barrier = true;
+        ++stats.barriers;
+        return false;
+      case "s_branch"_op.hash:
+        if (!(op == "s_branch"_op)) break;
+        w.pc = in.target;
+        return true;
+      case "s_cbranch_execz"_op.hash:
+        if (!(op == "s_cbranch_execz"_op)) break;
+        if (!w.exec) w.pc = in.target;
+        return true;
+      case "s_cbranch_execnz"_op.hash:
+        if (!(op == "s_cbranch_execnz"_op)) break;
+        if (w.exec) w.pc = in.target;
+        return true;
+      // A wave32 wave's VCC is its low half: the high half is an ordinary
+      // register the compiler may keep anything in.
+      case "s_cbranch_vccz"_op.hash:
+        if (!(op == "s_cbranch_vccz"_op)) break;
+        if (!(w.lanes == 32 ? static_cast<uint32_t>(w.vcc) : w.vcc)) w.pc = in.target;
+        return true;
+      case "s_cbranch_vccnz"_op.hash:
+        if (!(op == "s_cbranch_vccnz"_op)) break;
+        if (w.lanes == 32 ? static_cast<uint32_t>(w.vcc) : w.vcc) w.pc = in.target;
+        return true;
+      // A wave waiting for something -- another work-group at a grid barrier,
+      // the host answering a call -- sleeps; here it gives way to the others,
+      // which is what lets a wave that spins on memory see the write it waits for.
+      case "s_sleep"_op.hash:
+        if (!(op == "s_sleep"_op)) break;
+        return false;
+      case "s_cbranch_scc0"_op.hash:
+        if (!(op == "s_cbranch_scc0"_op)) break;
+        if (!w.scc) w.pc = in.target;
+        return true;
+      case "s_cbranch_scc1"_op.hash:
+        if (!(op == "s_cbranch_scc1"_op)) break;
+        if (w.scc) w.pc = in.target;
+        return true;
+      default: break;
     }
-    // Giving the wave's vector registers back as it ends (RDNA's
-    // MSG_DEALLOC_VGPRS), before its s_endpgm.
-    if (OpName(in.name) == "s_sendmsg"_op && gcn::is_rdna(in.arch) && in.simm == 3) return true;
-    if (OpName(in.name) == "s_setprio"_op || OpName(in.name) == "s_setprio_inc_wg"_op) return true;   // waves are not scheduled by priority here
-    // gfx1250 addresses up to 1024 vector registers by setting the top bits of every VGPR number; a program that
-    // sets any is not one this runs yet.
-    if (OpName(in.name) == "s_set_vgpr_msb"_op) {
-      // The two high bits of the vector register numbers the following instructions name, until the next one (the same
-      // bits are in the MODE register, which s_setreg_b32 can write, and that is not modelled).
-      w.vgpr_msb = static_cast<uint8_t>(in.simm & 0xFF);
-      set_mode_msb_bits(w);
-      return true;
-    }
-    if (OpName(in.name) == "s_monitor_sleep"_op) return false;
-    // No wave sleeps past its own s_sleep to be woken, and there is no
-    // instruction cache to invalidate.
-    if (OpName(in.name) == "s_wakeup"_op || OpName(in.name) == "s_icache_inv"_op) return true;
-    if (OpName(in.name) == "s_set_gpr_idx_off"_op) {
-      w.gpr_idx = 0;
-      return true;
-    }
-    if (OpName(in.name) == "s_trap"_op) {
-      // A real card's trap handler reports it to the queue and the runtime
-      // aborts the launch; the launch fails here, and says why.
-      throw Error::make(Err::Trap, "the kernel executed s_trap ", in.simm,
-                        in.simm == 2 ? " (llvm.trap: __builtin_trap or abort() in device code)" : "");
-    }
-    if (OpName(in.name) == "s_barrier"_op) {
-      w.at_barrier = true;
-      ++stats.barriers;
-      return false;
-    }
-    if (OpName(in.name) == "s_branch"_op) {
-      w.pc = in.target;
-      return true;
-    }
-    if (OpName(in.name) == "s_cbranch_execz"_op) {
-      if (!w.exec) w.pc = in.target;
-      return true;
-    }
-    if (OpName(in.name) == "s_cbranch_execnz"_op) {
-      if (w.exec) w.pc = in.target;
-      return true;
-    }
-    // A wave32 wave's VCC is its low half: the high half is an ordinary
-    // register the compiler may keep anything in.
-    const uint64_t vcc = w.lanes == 32 ? static_cast<uint32_t>(w.vcc) : w.vcc;
-    if (OpName(in.name) == "s_cbranch_vccz"_op) {
-      if (!vcc) w.pc = in.target;
-      return true;
-    }
-    if (OpName(in.name) == "s_cbranch_vccnz"_op) {
-      if (vcc) w.pc = in.target;
-      return true;
-    }
-    // A wave waiting for something -- another work-group at a grid barrier,
-    // the host answering a call -- sleeps; here it gives way to the others,
-    // which is what lets a wave that spins on memory see the write it waits for.
-    if (OpName(in.name) == "s_sleep"_op) return false;
-    if (OpName(in.name) == "s_sendmsg"_op) {
-      // The kernel raised the doorbell of its hostcall buffer and asks the
-      // host for attention (MSG_INTERRUPT, the one message decoded): the
-      // host answers now, and the wave, spinning on its packet, carries on.
-      if (!d.hostcall)
-        throw Error::make(Err::Unsupported, "the kernel asked the host for attention (s_sendmsg MSG_INTERRUPT), which ",
-                          "is how device-side printf reaches the host, and the launch was given no hostcall buffer");
-      d.hostcall->service();
-      return true;
-    }
-    if (OpName(in.name) == "s_cbranch_scc0"_op) {
-      if (!w.scc) w.pc = in.target;
-      return true;
-    }
-    if (OpName(in.name) == "s_cbranch_scc1"_op) {
-      if (w.scc) w.pc = in.target;
-      return true;
-    }
+    // (The ladder tested this between the s_wait_loadcnt rung and the barrier ones; none of those names starts with it.)
+    if (fl & gcn::kInstSWait) return true;
     throw Error::make(Err::Unsupported, "instruction ", in.name, " is decoded but not implemented");
   }
 };

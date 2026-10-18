@@ -1442,11 +1442,47 @@ void classify(Inst& in) {
 }
 }  // namespace
 
+std::string short_name_of(const Inst& in) {
+  return in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
+         : (in.dpp || in.dpp8) ? (in.name.ends_with("_dpp") ? in.name.substr(0, in.name.size() - 4) + "_e32" : std::string())
+         : in.promoted ? in.name.substr(0, in.name.size() - 4) + "_e32"
+         : in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e64") == 0 &&
+                 (in.name.find("_u16") != std::string::npos || in.name.find("_b16") != std::string::npos)
+             ? in.name.substr(0, in.name.size() - 4) + "_e32"
+             : std::string();
+}
+
+void finalize(Inst& in) {
+  const std::string& n = in.name;
+  const auto has = [&](const char* t) { return n.find(t) != std::string::npos; };
+  const auto starts = [&](const char* t) { return n.rfind(t, 0) == 0; };
+  uint32_t f = kInstFinal;
+  if (starts("v_mfma") || starts("v_smfmac")) f |= kInstMfma;
+  if (starts("v_cmp")) f |= kInstCmp;
+  if (has("f64")) f |= kInstF64;
+  if (has("_store")) f |= kInstStore;
+  if (has("_atomic")) f |= kInstAtomic;
+  if (has("_load_lds_")) f |= kInstLoadLds;
+  if (has("_async_to_lds_") || has("_async_from_lds_")) f |= kInstAsyncLds;
+  if (starts("ds_gws_")) f |= kInstGws;
+  if (starts("ds_write") || starts("ds_store")) f |= kInstDsWrite;
+  if (n == "s_branch" || starts("s_cbranch_")) f |= kInstBranchCount;
+  if (starts("s_wait_") && n != "s_wait_event") f |= kInstSWait;
+  if (starts("tensor_")) f |= kInstTensor;
+  if (starts("s_barrier_") || n == "s_get_barrier_state" || n == "s_wakeup_barrier") f |= kInstBarrierSop1;
+  in.name_hash = name_hash(n);
+  in.short_name = short_name_of(in);
+  in.short_hash = name_hash(in.short_name);
+  in.flags = f;
+}
+
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
   if (is_rdna(target)) {
     Inst in = rdna::decode(code, at, pc, target, wave64);
     classify(in);
     for (Inst& half : in.dual) classify(half);
+    finalize(in);
+    for (Inst& half : in.dual) finalize(half);
     return in;
   }
   struct Using {
@@ -1456,6 +1492,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   Inst in = decode_one(code, at, pc);
   in.arch = target;
   classify(in);
+  finalize(in);
   return in;
 }
 
