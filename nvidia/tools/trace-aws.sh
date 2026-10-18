@@ -16,6 +16,7 @@ here="$(cd "$(dirname "$0")/../.." && pwd)"
 type_name="${1:?usage: trace-aws.sh <instance-type> [region]}"
 region="${2:-us-east-1}"
 outdir="${VGPU_CLOUD_OUT:-/tmp/vgpu-trace}"
+[[ -n "${TRACE_CUDA:-}" ]] && outdir="$outdir-cuda$TRACE_CUDA"
 key_name="${VGPU_AWS_KEY_NAME:-pantheon-bench-wsl}"
 key_file="${VGPU_AWS_KEY_FILE:-$HOME/.ssh/id_rsa}"
 sg_name="${VGPU_AWS_SG:-pantheon-bench-sg}"
@@ -158,7 +159,7 @@ SCP="scp -i $key_file -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/
 $SSH 'mkdir -p /tmp/tr'
 $SCP "$here"/nvidia/tests/e2e/cupti_*.cu "$here"/nvidia/tests/e2e/cupti_*.inc "$here"/nvidia/tests/e2e/cupti_test_util.h \
      "$here/nvidia/tools/trace-collect-remote.sh" ubuntu@"$IP":/tmp/tr/
-$SSH 'bash /tmp/tr/trace-collect-remote.sh /tmp/tr' > "$outdir/${type_name}.run.log" 2>&1
+$SSH "TRACE_CUDA=${TRACE_CUDA:-} bash /tmp/tr/trace-collect-remote.sh /tmp/tr" > "$outdir/${type_name}.run.log" 2>&1
 mkdir -p "$outdir/$type_name"
 $SCP -r ubuntu@"$IP":/tmp/tr/out/. "$outdir/$type_name/" 2>/dev/null
 if [[ -s "$outdir/$type_name/info.txt" ]] && [[ -s "$outdir/$type_name/trace.txt" ]] && ! grep -q "BUILD FAILED" "$outdir/$type_name/trace.txt"; then

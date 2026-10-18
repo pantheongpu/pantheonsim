@@ -98,6 +98,7 @@ set(VGPU_PROFILES
   nvidia/thor
   nvidia/rtx-pro-6000-server
   nvidia/rtx-pro-6000-max-q
+  nvidia/rtx-pro-4500
   nvidia/rtx6000-ada
   nvidia/rtx-a6000
   nvidia/rtx-a5000

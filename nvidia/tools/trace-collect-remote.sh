@@ -10,6 +10,14 @@ set -uo pipefail
 src="${1:?usage: trace-collect-remote.sh <dir with the cupti_*.cu files> }"
 out="$src/out"; mkdir -p "$out"
 export PATH=$PATH:/usr/local/cuda/bin
+# TRACE_CUDA=13-0 installs and uses that toolkit instead of the image's default, to
+# tell a toolkit difference from a driver or platform one.
+if [[ -n "${TRACE_CUDA:-}" ]]; then
+  sudo apt-get update -qq >/dev/null 2>&1
+  sudo apt-get install -y -qq "cuda-nvcc-$TRACE_CUDA" "cuda-cudart-dev-$TRACE_CUDA" "cuda-cupti-dev-$TRACE_CUDA" "cuda-nvtx-$TRACE_CUDA" >"$out/apt-pin.log" 2>&1 \
+    || { echo "cannot install toolkit $TRACE_CUDA" > "$out/trace.txt"; exit 1; }
+  export PATH="/usr/local/cuda-${TRACE_CUDA/-/.}/bin:$PATH"
+fi
 cuda_root="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
 find_cupti() {
   # The header and library must come from the toolkit nvcc is (an AMI can carry
@@ -54,6 +62,6 @@ for f in "$src"/cupti_*.cu; do
        -Wno-deprecated-gpu-targets -I"$src" -I"$inc" "$f" -o "$out/$c.bin" -lcupti -L"$libs" -lcuda -L"$stubs" 2>"$out/$c.build.err" \
     || { echo "BUILD FAILED" > "$out/$c.txt"; continue; }
   CUPTI_TEST_CUBIN="$([[ $c == resource ]] && echo "$cubin")" NVTX_INJECTION64_PATH="$(ls "$libs"/libcupti.so.[0-9]* | head -1)" \
-    LD_LIBRARY_PATH="$libs" timeout 300 "$out/$c.bin" > "$out/$c.txt" 2>"$out/$c.run.err" || echo "EXIT $?" >> "$out/$c.txt"
+    LD_LIBRARY_PATH="$libs:$(dirname "$libs")/../lib64:$cuda_root/lib64:$cuda_root/targets/x86_64-linux/lib" timeout 300 "$out/$c.bin" > "$out/$c.txt" 2>"$out/$c.run.err" || echo "EXIT $?" >> "$out/$c.txt"
   echo "$c: $(wc -l < "$out/$c.txt") lines"
 done

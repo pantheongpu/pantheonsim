@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+Tesla T4, 7.5, 15360 MiB, 595.91.07, GPU-45deabf4-8053-c41a-d552-d1bf46cb0acb
+Cuda compilation tools, release 13.0, V13.0.88
+Build cuda_13.0.r13.0/compiler.36424714_0
+ngpu=1 arch=sm_75 libs=/usr/local/cuda-13.0/extras/CUPTI/lib64 inc=/usr/local/cuda-13.0/extras/CUPTI/include

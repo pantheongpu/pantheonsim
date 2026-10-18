@@ -16,7 +16,7 @@ shim="${2:-$root/build}/shim"
 profile_for() {
   case "$1" in
     g4dn.*) echo t4 ;;     g5.*) echo a10g ;;  g6.*) echo l4 ;;     g6e.*) echo l40s ;;
-    g7e.*) echo rtx-pro-6000 ;;  p5.*|p5e.*|p5en.*) echo h100 ;;  p4d.*) echo a100-sxm4-40gb ;;
+    g7.*) echo rtx-pro-4500 ;;  g7e.*) echo rtx-pro-6000 ;;  p5.*|p5e.*|p5en.*) echo h100 ;;  p4d.*) echo a100-sxm4-40gb ;;
     p4de.*) echo a100 ;;   p6-b200.*) echo b200 ;;  p6-b300.*) echo b300 ;;  *) echo "" ;;
   esac
 }
