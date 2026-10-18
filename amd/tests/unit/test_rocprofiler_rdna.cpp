@@ -22,6 +22,8 @@ extern "C" {
 // Pinned host memory (vgpu_hip.h declares no more of HIP than the other tests use).
 hipError_t hipHostMalloc(void** ptr, size_t size, unsigned int flags);
 hipError_t hipHostFree(void* ptr);
+hipError_t hipMallocAsync(void** ptr, size_t size, hipStream_t stream);
+hipError_t hipFreeAsync(void* ptr, hipStream_t stream);
 rocprofiler_status_t rocprofiler_force_configure(rocprofiler_configure_func_t);
 rocprofiler_status_t rocprofiler_query_available_agents(rocprofiler_agent_version_t,
                                                         rocprofiler_query_available_agents_cb_t, size_t, void*);
@@ -58,6 +60,12 @@ struct Seen {
     uint32_t sgprs, vgprs;
   };
   std::vector<Kernel> kernels;
+  std::map<uint64_t, std::string> kernel_names;   // by kernel id
+  struct Dispatch {
+    std::string kernel;
+    uint64_t grid, workgroup;
+  };
+  std::vector<Dispatch> dispatches;
   std::vector<std::string> uris;
   std::vector<rocprofiler_buffer_tracing_memory_copy_record_t> copies;
   std::vector<rocprofiler_buffer_tracing_memory_allocation_record_t> allocations;
@@ -76,6 +84,7 @@ void on_code_object(rocprofiler_callback_tracing_record_t r, rocprofiler_user_da
   if (r.operation == ROCPROFILER_CODE_OBJECT_DEVICE_KERNEL_SYMBOL_REGISTER) {
     auto* k = static_cast<rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t*>(r.payload);
     seen().kernels.push_back({k->kernel_name, k->sgpr_count, k->arch_vgpr_count});
+    seen().kernel_names[k->kernel_id] = k->kernel_name;
   }
 }
 
@@ -86,6 +95,11 @@ void on_records(rocprofiler_context_id_t, rocprofiler_buffer_id_t, rocprofiler_r
     if (h->category != ROCPROFILER_BUFFER_CATEGORY_TRACING) continue;
     if (h->kind == ROCPROFILER_BUFFER_TRACING_MEMORY_COPY)
       seen().copies.push_back(*static_cast<rocprofiler_buffer_tracing_memory_copy_record_t*>(h->payload));
+    if (h->kind == ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH) {
+      auto* r = static_cast<rocprofiler_buffer_tracing_kernel_dispatch_record_t*>(h->payload);
+      seen().dispatches.push_back({seen().kernel_names[r->dispatch_info.kernel_id], r->dispatch_info.grid_size.x,
+                                   r->dispatch_info.workgroup_size.x});
+    }
     if (h->kind == ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION)
       seen().allocations.push_back(*static_cast<rocprofiler_buffer_tracing_memory_allocation_record_t*>(h->payload));
     if (h->kind == ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT) {
@@ -115,6 +129,7 @@ int tool_init(rocprofiler_client_finalize_t, void*) {
   rocprofiler_create_buffer(tracing, 1 << 16, 1 << 15, ROCPROFILER_BUFFER_POLICY_LOSSLESS, on_records, nullptr,
                             &s.buffer);
   for (auto kind : {ROCPROFILER_BUFFER_TRACING_MEMORY_COPY, ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION,
+                    ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH,
                     ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT})
     rocprofiler_configure_buffer_tracing_service(tracing, kind, nullptr, 0, s.buffer);
   for (auto c : {objects, tracing}) rocprofiler_start_context(c);
@@ -148,6 +163,23 @@ void run_once() {
   VCHECK_EQ(hipHostMalloc(&pinned, 1 << 20, 0), hipSuccess);
   VCHECK_EQ(hipMemcpy(a, pinned, 1 << 20, hipMemcpyHostToDevice), hipSuccess);
   VCHECK_EQ(hipHostFree(pinned), hipSuccess);
+  // Fills: 100 bytes are 96 and a tail of 4; 4096 bytes from 1 past a 16-byte boundary a head of 15, a body
+  // of 4080 and a tail of 1.
+  VCHECK_EQ(hipMemset(a, 0, 100), hipSuccess);
+  VCHECK_EQ(hipMemset(static_cast<char*>(a) + 1, 0, 4096), hipSuccess);
+  VCHECK_EQ(hipDeviceSynchronize(), hipSuccess);
+  // A stream, and the memory pool: 1 KiB and 40 MiB need two 32 MiB ranges; once both are freed, the
+  // synchronization gives them back.
+  hipStream_t stream = nullptr;
+  VCHECK_EQ(hipStreamCreate(&stream), hipSuccess);
+  void *p1 = nullptr, *p2 = nullptr;
+  VCHECK_EQ(hipMallocAsync(&p1, 1024, stream), hipSuccess);
+  VCHECK_EQ(hipMallocAsync(&p2, size_t{40} << 20, stream), hipSuccess);
+  VCHECK_EQ(hipFreeAsync(p1, stream), hipSuccess);
+  VCHECK_EQ(hipStreamSynchronize(stream), hipSuccess);
+  VCHECK_EQ(hipFreeAsync(p2, stream), hipSuccess);
+  VCHECK_EQ(hipStreamSynchronize(stream), hipSuccess);
+  VCHECK_EQ(hipStreamDestroy(stream), hipSuccess);
   VCHECK_EQ(hipFree(a), hipSuccess);
   VCHECK_EQ(hipFree(b), hipSuccess);
   rocprofiler_flush_buffer(seen().buffer);
@@ -190,9 +222,10 @@ VTEST(the_agent_is_the_card_as_kfd_counts_it) {
 VTEST(a_code_object_is_named_by_a_uri_and_its_kernels_by_their_descriptors) {
   run_once();
   const Seen& s = seen();
-  VCHECK_EQ(s.uris.size(), size_t{1});
+  // The runtime's own code object (copy and fill kernels) first, then the program's.
+  VCHECK_EQ(s.uris.size(), size_t{2});
   // The string must outlive the callback (rocprofv3 keeps the pointer); it is read here, after the program ran.
-  VCHECK(s.uris[0].rfind("memory://", 0) == 0 || s.uris[0].rfind("file://", 0) == 0);
+  for (const std::string& u : s.uris) VCHECK(u.rfind("memory://", 0) == 0 || u.rfind("file://", 0) == 0);
   VCHECK(!s.kernels.empty());
   for (const Seen::Kernel& k : s.kernels) {
     // "<kernel>.kd", the descriptor's symbol; from gfx10 on 128 scalar registers are reported whatever the kernel
@@ -229,8 +262,8 @@ VTEST(an_allocation_record_has_its_own_id_and_names_the_call_that_made_it) {
     VCHECK(call_of.count(r.correlation_id.ancestor) == 1);
     const std::string& by = call_of[r.correlation_id.ancestor];
     if (r.operation == ROCPROFILER_MEMORY_ALLOCATION_ALLOCATE) {
-      if (by == "hipMalloc" || by == "hipHostMalloc") VCHECK_EQ(r.allocation_size, uint64_t{1} << 20);
-      if (by == "hipMalloc") ++allocated;
+      // (The runtime's own blocks under a call are not the program's: sizes of 4 MiB, 16 MiB and 56 bytes.)
+      if (by == "hipMalloc" && r.allocation_size == uint64_t{1} << 20) ++allocated;
       if (by == "hipHostMalloc") ++host_allocated;
     } else if (r.operation == ROCPROFILER_MEMORY_ALLOCATION_FREE) {
       if (by == "hipFree") ++freed;
@@ -241,6 +274,65 @@ VTEST(an_allocation_record_has_its_own_id_and_names_the_call_that_made_it) {
   VCHECK_EQ(freed, 2);
   VCHECK_EQ(host_allocated, 1);
   VCHECK_EQ(host_freed, 1);
+}
+
+VTEST(the_runtimes_own_kernels_do_the_small_and_device_to_device_copies_and_the_fills) {
+  run_once();
+  const Seen& s = seen();
+  // Sixteen bytes to a thread in workgroups of 512 for aligned copies (4 KiB: one workgroup; 16 KiB: 1024
+  // threads; the 64 KiB copy within the device: 4096), then the two fills' kernels of 256 (a head, a body and a
+  // tail each). Measured with rocprofv3 on both cards.
+  const std::string copy = "__amd_rocclr_copyBuffer.kd", fill = "__amd_rocclr_fillBufferAligned.kd";
+  std::vector<Seen::Dispatch> want = {{copy, 512, 512},  {copy, 1024, 512}, {copy, 4096, 512},
+                                      {fill, 256, 256},  {fill, 256, 256}, {fill, 256, 256},
+                                      {fill, 256, 256},  {fill, 256, 256}};
+  VCHECK_EQ(s.dispatches.size(), want.size());
+  for (size_t i = 0; i < want.size() && i < s.dispatches.size(); ++i) {
+    VCHECK_EQ(s.dispatches[i].kernel, want[i].kernel);
+    VCHECK_EQ(s.dispatches[i].grid, want[i].grid);
+    VCHECK_EQ(s.dispatches[i].workgroup, want[i].workgroup);
+  }
+}
+
+VTEST(the_runtimes_own_allocations_are_staging_buffers_and_a_free_names_no_agent) {
+  run_once();
+  const Seen& s = seen();
+  std::map<uint64_t, std::string> call_of;
+  for (const Call& c : s.calls) call_of[c.id] = c.name;
+  // The first runtime call (hipModuleLoad here) starts the runtime: a 4 MiB staging block and one of 56 bytes on the
+  // host; the first work on the default stream (the first hipMemcpy) makes its queue: 4 MiB and 16 MiB.
+  std::vector<std::pair<std::string, uint64_t>> got;
+  for (const auto& r : s.allocations) {
+    if (r.operation != ROCPROFILER_MEMORY_ALLOCATION_ALLOCATE || r.agent_id.handle != s.agents[0].id.handle) continue;
+    got.push_back({call_of[r.correlation_id.ancestor], r.allocation_size});
+  }
+  const std::vector<std::pair<std::string, uint64_t>> want = {{"hipModuleLoad", uint64_t{4} << 20},
+                                                              {"hipModuleLoad", 56},
+                                                              {"hipMemcpy", uint64_t{4} << 20},
+                                                              {"hipMemcpy", uint64_t{16} << 20},
+                                                              {"hipHostMalloc", uint64_t{1} << 20},
+                                                              {"hipStreamCreate", uint64_t{4} << 20},
+                                                              {"hipStreamCreate", uint64_t{16} << 20}};
+  VCHECK(got == want);
+  // The pool's ranges and the frees, under the calls that made them; a stream's destruction frees three blocks
+  // (the first has no address), and no free names an agent.
+  std::vector<std::string> vmem, frees;
+  for (const auto& r : s.allocations) {
+    const std::string by = call_of[r.correlation_id.ancestor];
+    if (r.operation == ROCPROFILER_MEMORY_ALLOCATION_VMEM_ALLOCATE) {
+      VCHECK_EQ(r.allocation_size, uint64_t{32} << 20);
+      vmem.push_back("alloc " + by);
+    }
+    if (r.operation == ROCPROFILER_MEMORY_ALLOCATION_VMEM_FREE) vmem.push_back("free " + by);
+    if (r.operation == ROCPROFILER_MEMORY_ALLOCATION_FREE || r.operation == ROCPROFILER_MEMORY_ALLOCATION_VMEM_FREE) {
+      VCHECK_EQ(r.agent_id.handle, uint64_t{0});
+      if (by == "hipStreamDestroy") frees.push_back(r.address.value ? "block" : "null");
+    }
+  }
+  const std::vector<std::string> want_vmem = {"alloc hipMallocAsync", "alloc hipMallocAsync", "free hipStreamSynchronize",
+                                              "free hipStreamSynchronize"};
+  VCHECK(vmem == want_vmem);
+  VCHECK((frees == std::vector<std::string>{"null", "block", "block"}));
 }
 
 VTEST(the_compiler_api_has_its_operations) {

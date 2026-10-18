@@ -2197,7 +2197,7 @@ namespace {
 // and -- where it allocates or frees -- that no other executable graph of it
 // is there, since both would map or unmap memory at the same addresses (ROCm's
 // HIP refuses a second one for a free node too).
-hipError_t instantiate(State& /*s*/, void** out, void* graph, unsigned long long flags) {
+hipError_t instantiate(State& s, void** out, void* graph, unsigned long long flags) {
   GraphObj* g = find_graph(graph);
   if (!out || !g) return hipErrorInvalidValue;
   if (!acyclic(*g)) return fail(hipErrorInvalidValue, "the graph's edges go round in a cycle");
@@ -2212,6 +2212,11 @@ hipError_t instantiate(State& /*s*/, void** out, void* graph, unsigned long long
   take_refs(g->user_objects, &x->user_objects);
   ++g->live_execs;
   *out = x->handle;
+  if (const auto* p = profiler(); p && p->graph_instantiated) {
+    uint32_t kernels = 0;
+    for (const auto& n : g->nodes) kernels += n->type == vgpu::amd::abi::kNodeKernel;
+    p->graph_instantiated(s.current, reinterpret_cast<uint64_t>(x->handle), kernels);
+  }
   gt().execs[x->handle] = std::move(x);
   return hipSuccess;
 }
@@ -2271,6 +2276,7 @@ hipError_t hipGraphExecDestroy(void* exec) {
     if (it == gt().execs.end()) return record(s, hipErrorInvalidValue);
     std::unique_ptr<ExecObj> x = std::move(it->second);
     gt().execs.erase(it);
+    if (const auto* p = profiler(); p && p->graph_destroyed) p->graph_destroyed(reinterpret_cast<uint64_t>(exec));
     if (GraphObj* g = find_graph(x->graph)) --g->live_execs;
     if (x->last_queue && !x->last_queue->done(x->last_seq) && !x->user_objects.empty()) {
       auto refs = std::make_shared<UserRefs>(std::move(x->user_objects));

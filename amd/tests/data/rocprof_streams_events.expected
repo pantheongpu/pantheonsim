@@ -6,6 +6,23 @@ gpu name=gfx1030 product_name=AMD Radeon RX 6800 vendor_name=AMD cu_count=60 sim
 [kernels]
 _Z4bumpPi.kd kernarg=8 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
 _Z4vaddPKfS0_Pfi.kd kernarg=288 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+[runtime kernels]
+__amd_rocclr_batchMemOp.kd kernarg=272 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyBuffer.kd kernarg=48 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyBufferAligned.kd kernarg=304 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyBufferRect.kd kernarg=384 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyBufferRectAligned.kd kernarg=384 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyBufferToImage.kd kernarg=416 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyImage.kd kernarg=320 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyImage1DA.kd kernarg=320 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyImageToBuffer.kd kernarg=416 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_fillBufferAligned.kd kernarg=40 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_fillBufferAligned2D.kd kernarg=336 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_fillImage.kd kernarg=360 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_gwsInit.kd kernarg=4 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_initHeap.kd kernarg=24 group=0 private=0 sgpr=128 arch_vgpr=24 accum_vgpr=0
+__amd_rocclr_streamOpsWait.kd kernarg=40 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_streamOpsWrite.kd kernarg=24 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
 [hip api, thread 1]
 __hipRegisterFatBinary(data=<ptr>)
 __hipRegisterFunction(modules=<ptr>, hostFunction=<ptr>, deviceFunction=_Z4vaddPKfS0_Pfi, deviceName=_Z4vaddPKfS0_Pfi, threadLimit=4294967295, tid=(null), bid=(null), blockDim=(null), gridDim=(null), wSize=(null))
@@ -32,10 +49,28 @@ hipStreamDestroy(stream=<ptr>)
 hipStreamDestroy(stream=<ptr>)
 hipFree(ptr=<ptr>)
 [dispatches]
+__amd_rocclr_fillBufferAligned.kd grid=256,1,1 workgroup=256,1,1 group=0 private=0
 bump(int*) [clone .kd] grid=64,1,1 workgroup=64,1,1 group=0 private=0
 bump(int*) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=0
+__amd_rocclr_copyBuffer.kd grid=512,1,1 workgroup=512,1,1 group=0 private=0
 [copies]
+[scratch]
 [allocations]
 hipMalloc MEMORY_ALLOCATION_ALLOCATE bytes=4 on=gpu
-hipFree MEMORY_ALLOCATION_FREE
+hipFree MEMORY_ALLOCATION_FREE on=none
+[runtime allocations]
+hipMalloc MEMORY_ALLOCATION_ALLOCATE bytes=4194304 on=cpu
+hipMalloc MEMORY_ALLOCATION_ALLOCATE bytes=56 on=cpu
+hipMemset MEMORY_ALLOCATION_ALLOCATE bytes=4194304 on=cpu
+hipMemset MEMORY_ALLOCATION_ALLOCATE bytes=16777216 on=cpu
+hipStreamCreate MEMORY_ALLOCATION_ALLOCATE bytes=4194304 on=cpu
+hipStreamCreate MEMORY_ALLOCATION_ALLOCATE bytes=16777216 on=cpu
+hipStreamCreate MEMORY_ALLOCATION_ALLOCATE bytes=4194304 on=cpu
+hipStreamCreate MEMORY_ALLOCATION_ALLOCATE bytes=16777216 on=cpu
+hipStreamDestroy MEMORY_ALLOCATION_FREE address=null on=none
+hipStreamDestroy MEMORY_ALLOCATION_FREE on=none
+hipStreamDestroy MEMORY_ALLOCATION_FREE on=none
+hipStreamDestroy MEMORY_ALLOCATION_FREE address=null on=none
+hipStreamDestroy MEMORY_ALLOCATION_FREE on=none
+hipStreamDestroy MEMORY_ALLOCATION_FREE on=none
 [markers]
