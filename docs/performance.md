@@ -1695,6 +1695,12 @@ before `window_check.hpp` was made a header, which moves no code; `VGPU_COUNTERS
 
 ### Not done, and negative results
 
+* *Soft path for subnormal f64/f32 operands.* Not done: it cannot be measured on server2, whose CPU (AMD Ryzen 9 9950X, Zen 5) takes no
+  assist on FMA or ADD. Micro-benchmark (4096 values, -O2 -mfma, pinned to CPUs 28-31, ns per op, normal / all-subnormal operands): f64 fma
+  0.42 / 0.38, add 0.38 / 0.40, mul 0.38 / 0.71, div 0.75 / 2.13, sqrt 2.06 / 4.25; f32 fma 0.42 / 0.53, add 0.38 / 0.38, mul 0.38 / 1.39,
+  div 0.47 / 1.81, sqrt 2.12 / 5.43. The harness agrees: `f64_subnormal` runs at the rate of `f64_fma` (SASS 38.8 vs 40.3 Mi/s, PTX 21.6 vs
+  27.0, 3 runs, load 13). The 6-10x gap in the f64_subnormal / f64_fma rows was seen on Intel (i9-12900K), so any soft path has to be
+  measured there; on Zen it could only lose.
 * *Texel reads and PTX atomics* are done (see "Memory lookups" below).
 * *SASS atomics on the one-lookup read-modify-write.* Not done, and nothing to gain: the SASS executor's global atomics already take a warp
   at once (`load_batch` / `store_batch`: each distinct address looked up and stored once), so `MemoryManager::rmw_scalar` would only replace
