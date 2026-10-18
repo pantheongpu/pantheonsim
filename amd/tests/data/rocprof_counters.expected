@@ -1,0 +1,325 @@
+# the counters of the rx6800 (gfx1030) from rocprofv3-avail info --pmc, reduced by amd/tests/rocprof_counters.py
+# recorded on: AMD Radeon rx6800 (gfx1030), rocm-7.2.0, rocprofv3 1.1.0
+# regenerate: amd/tests/e2e/run_rocprof_counters.sh --card --update
+[offered by the card]
+ALUStalledByLDS
+CP_UTIL
+CU_NUM
+EA_UTIL
+FETCH_SIZE
+GDSInsts
+GDS_UTIL
+GL2C_EA_RDREQ_128B
+GL2C_EA_RDREQ_128B_sum
+GL2C_EA_RDREQ_32B
+GL2C_EA_RDREQ_32B_sum
+GL2C_EA_RDREQ_64B
+GL2C_EA_RDREQ_64B_sum
+GL2C_EA_RDREQ_96B
+GL2C_EA_RDREQ_96B_sum
+GL2C_EA_WRREQ_64B
+GL2C_EA_WRREQ_64B_sum
+GL2C_HIT
+GL2C_HIT_sum
+GL2C_MC_RDREQ
+GL2C_MC_RDREQ_sum
+GL2C_MC_WRREQ
+GL2C_MC_WRREQ_STALL
+GL2C_MC_WRREQ_sum
+GL2C_MISS
+GL2C_MISS_sum
+GL2C_WRREQ_STALL_max
+GPUBusy
+GPU_UTIL
+GRBM_COUNT
+GRBM_CP_BUSY
+GRBM_EA_BUSY
+GRBM_GDS_BUSY
+GRBM_GL2CC_BUSY
+GRBM_GUI_ACTIVE
+GRBM_SPI_BUSY
+GRBM_TA_BUSY
+L2CacheHit
+LDSBankConflict
+LdsLatency
+MAX_WAVE_SIZE
+MeanOccupancyPerCU
+MemUnitBusy
+OccupancyPercent
+SALUInsts
+SE_NUM
+SFetchInsts
+SIMD_NUM
+SPI_UTIL
+SQC_LDS_BANK_CONFLICT
+SQC_LDS_IDX_ACTIVE
+SQ_ACCUM_PREV
+SQ_BUSY_CYCLES
+SQ_INSTS_FLAT
+SQ_INSTS_GDS
+SQ_INSTS_LDS
+SQ_INSTS_SALU
+SQ_INSTS_SMEM
+SQ_INSTS_VALU
+SQ_INSTS_WAVE32
+SQ_INSTS_WAVE32_LDS
+SQ_INSTS_WAVE32_VALU
+SQ_INST_CYCLES_VMEM
+SQ_INST_LEVEL_GDS
+SQ_INST_LEVEL_LDS
+SQ_LEVEL_WAVES
+SQ_WAIT_ANY
+SQ_WAIT_INST_ANY
+SQ_WAIT_INST_LDS
+SQ_WAVE32_INSTS
+SQ_WAVE64_INSTS
+SQ_WAVES
+SQ_WAVES_sum
+SQ_WAVE_CYCLES
+TA_BUSY_avr
+TA_BUSY_max
+TA_BUSY_min
+TA_FLAT_LOAD_WAVEFRONTS
+TA_FLAT_LOAD_WAVEFRONTS_sum
+TA_FLAT_STORE_WAVEFRONTS
+TA_FLAT_STORE_WAVEFRONTS_sum
+TA_TA_BUSY
+TA_UTIL
+VALUInsts
+WAVE_DEP_WAIT
+WAVE_ISSUE_WAIT
+WRITE_SIZE
+Wavefronts
+WriteUnitStalled
+array_count
+association
+cache_line_size
+cache_lines_per_tag
+caches_count
+capability
+cpu_core_id_base
+cpu_cores_count
+cu_per_simd_array
+device_id
+domain
+drm_render_minor
+flags
+fw_version
+gds_size_in_kb
+gfx_target_version
+heap_type
+hive_id
+io_links_count
+latency
+lds_size_in_kb
+level
+local_mem_size
+location_id
+max_bandwidth
+max_engine_clk_ccompute
+max_engine_clk_fcompute
+max_latency
+max_slots_scratch_cu
+max_waves_per_simd
+mem_banks_count
+mem_clk_max
+min_bandwidth
+min_latency
+node_from
+node_to
+num_cp_queues
+num_gws
+num_sdma_engines
+num_sdma_queues_per_engine
+num_sdma_xgmi_engines
+num_xcc
+processor_id_low
+recommended_transfer_size
+sdma_fw_version
+simd_arrays_per_engine
+simd_count
+simd_id_base
+simd_per_cu
+size
+size_in_bytes
+type
+unique_id
+vendor_id
+version_major
+version_minor
+wave_front_size
+weight
+width
+[entries]
+Counter_Name        :	SQ_WAVES
+Description         :	Count number of waves sent to distributed sequencers (SQs). This value represents the number of waves that are sent to each SQ. This only counts new waves sent since the start of collection (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). A sum of all SQ_WAVES values will give the total number of waves started by the application during the collection timeframe. Returns one value per-SE (aggregates of SIMD values).
+Block               :	SQ
+
+Counter_Name        :	SQ_WAVES_sum
+Description         :	Gives the total number of waves currently enqueued by the application during the collection timeframe (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). See SQ_WAVES for more details.
+Expression          :	reduce(SQ_WAVES,sum)
+
+Counter_Name        :	Wavefronts
+Description         :	Total wavefronts.
+Expression          :	reduce(SQ_WAVES,sum)
+
+Counter_Name        :	SQ_INSTS_VALU
+Description         :	The number of VALU (Vector ALU) instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on VALU instructions.
+Block               :	SQ
+
+Counter_Name        :	SQ_INSTS_SALU
+Description         :	Total Number of SALU (Scalar ALU) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SALU instructions.
+Block               :	SQ
+
+Counter_Name        :	SQ_INSTS_SMEM
+Description         :	Total number of SMEM (Scalar Memory Read) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SMEM instructions.
+Block               :	SQ
+
+Counter_Name        :	SQ_INSTS_FLAT
+Description         :	Total number of FLAT instructions issued. When used in combination with SQ_ACTIVE_INST_FLAT (cycle count for executing instructions) the average latency of FLAT instruction execution can be calculated (SQ_ACTIVE_INST_FLAT / SQ_INSTS). This value is returned per-SE (aggregate of values in SIMDs in the SE).
+Block               :	SQ
+
+Counter_Name        :	SQ_INSTS_LDS
+Description         :	Total number of LDS instructions issued (including FLAT). This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on LDS instructions.
+Block               :	SQ
+
+Counter_Name        :	SQ_INSTS_GDS
+Description         :	Total number of GDS (global data sync) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on GDS (global data sync) instructions.
+Block               :	SQ
+
+Counter_Name        :	TA_FLAT_LOAD_WAVEFRONTS
+Description         :	 Number of flat load vec32 packets processed by TA, same as flat_read_wavefronts in earlier IP
+Block               :	TA
+
+Counter_Name        :	TA_FLAT_LOAD_WAVEFRONTS_sum
+Description         :	Number of flat load vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_FLAT_LOAD_WAVEFRONTS,sum)
+
+Counter_Name        :	TA_FLAT_STORE_WAVEFRONTS
+Description         :	Number of flat store vec32 packets processed by TA, same as flat_write_wavefronts in earlier IP
+Block               :	TA
+
+Counter_Name        :	TA_FLAT_STORE_WAVEFRONTS_sum
+Description         :	Number of flat store vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_FLAT_STORE_WAVEFRONTS,sum)
+
+Counter_Name        :	SQ_WAVE32_INSTS
+Description         :	Number of instructions issued by wave32 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+
+Counter_Name        :	SQ_WAVE64_INSTS
+Description         :	Number of instructions issued by wave64 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+
+Counter_Name        :	CU_NUM
+Description         :	CU_NUM
+Expression          :	simd_count/simd_per_cu
+
+Counter_Name        :	SIMD_NUM
+Description         :	SIMD Number
+Expression          :	simd_count
+
+Counter_Name        :	SE_NUM
+Description         :	SE_NUM
+Expression          :	array_count/simd_arrays_per_engine
+
+Counter_Name        :	MAX_WAVE_SIZE
+Description         :	Max wave size constant
+Expression          :	wave_front_size
+
+Counter_Name        :	num_xcc
+Description         :	Constant value num_xcc from agent properties
+
+Counter_Name        :	array_count
+Description         :	Constant value array_count from agent properties
+
+Counter_Name        :	num_gws
+Description         :	Constant value num_gws from agent properties
+
+Counter_Name        :	simd_id_base
+Description         :	Constant value simd_id_base from agent properties
+
+Counter_Name        :	max_waves_per_simd
+Description         :	Constant value max_waves_per_simd from agent properties
+
+Counter_Name        :	gfx_target_version
+Description         :	Constant value gfx_target_version from agent properties
+
+Counter_Name        :	cpu_core_id_base
+Description         :	Constant value cpu_core_id_base from agent properties
+
+Counter_Name        :	location_id
+Description         :	Constant value location_id from agent properties
+
+Counter_Name        :	wave_front_size
+Description         :	Constant value wave_front_size from agent properties
+
+Counter_Name        :	lds_size_in_kb
+Description         :	Constant value lds_size_in_kb from agent properties
+
+Counter_Name        :	simd_count
+Description         :	Constant value simd_count from agent properties
+
+Counter_Name        :	simd_per_cu
+Description         :	Constant value simd_per_cu from agent properties
+
+Counter_Name        :	mem_banks_count
+Description         :	Constant value mem_banks_count from agent properties
+
+Counter_Name        :	cpu_cores_count
+Description         :	Constant value cpu_cores_count from agent properties
+
+Counter_Name        :	io_links_count
+Description         :	Constant value io_links_count from agent properties
+
+Counter_Name        :	domain
+Description         :	Constant value domain from agent properties
+
+Counter_Name        :	max_engine_clk_fcompute
+Description         :	Constant value max_engine_clk_fcompute from agent properties
+
+Counter_Name        :	caches_count
+Description         :	Constant value caches_count from agent properties
+
+Counter_Name        :	simd_arrays_per_engine
+Description         :	Constant value simd_arrays_per_engine from agent properties
+
+Counter_Name        :	gds_size_in_kb
+Description         :	Constant value gds_size_in_kb from agent properties
+
+Counter_Name        :	cu_per_simd_array
+Description         :	Constant value cu_per_simd_array from agent properties
+
+Counter_Name        :	max_slots_scratch_cu
+Description         :	Constant value max_slots_scratch_cu from agent properties
+
+Counter_Name        :	vendor_id
+Description         :	Constant value vendor_id from agent properties
+
+Counter_Name        :	device_id
+Description         :	Constant value device_id from agent properties
+
+Counter_Name        :	drm_render_minor
+Description         :	Constant value drm_render_minor from agent properties
+
+Counter_Name        :	num_sdma_engines
+Description         :	Constant value num_sdma_engines from agent properties
+
+Counter_Name        :	num_sdma_xgmi_engines
+Description         :	Constant value num_sdma_xgmi_engines from agent properties
+
+Counter_Name        :	num_sdma_queues_per_engine
+Description         :	Constant value num_sdma_queues_per_engine from agent properties
+
+Counter_Name        :	hive_id
+Description         :	Constant value hive_id from agent properties
+
+Counter_Name        :	num_cp_queues
+Description         :	Constant value num_cp_queues from agent properties
+
+Counter_Name        :	max_engine_clk_ccompute
+Description         :	Constant value max_engine_clk_ccompute from agent properties
+
+Counter_Name        :	local_mem_size
+Description         :	Constant value local_mem_size from agent properties
+

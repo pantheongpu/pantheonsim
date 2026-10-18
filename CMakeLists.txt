@@ -279,6 +279,12 @@ add_custom_command(TARGET vgpucuda POST_BUILD
 add_library(vgpuhip SHARED amd/src/hip_api.cpp amd/src/hip_cxx.cpp amd/src/hsa_api.cpp)
 target_link_libraries(vgpuhip PRIVATE vgpu ${CMAKE_DL_LIBS})
 target_include_directories(vgpuhip PRIVATE amd/include)
+# A HIP program may pass any integer where the API names an enumeration (the tests pass values HIP does not
+# define, and the answer is an error code): the library reads those values without taking them as the enum,
+# so the sanitizer's enum check, which cannot tell, is off for it.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(vgpuhip PRIVATE -fno-sanitize=enum)
+endif()
 # The real runtime's identity: a HIP program records SONAME "libamdhip64.so.6"
 # and resolves to this library through LD_LIBRARY_PATH at run time.
 set_target_properties(vgpuhip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 VERSION 6.4)
@@ -1458,6 +1464,12 @@ target_link_libraries(test_amd_rocprofiler PRIVATE vgpurocprof vgpuhip)
 target_include_directories(test_amd_rocprofiler PRIVATE tests/framework amd/include)
 target_compile_definitions(test_amd_rocprofiler PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_rocprofiler COMMAND test_amd_rocprofiler)
+# The arguments of HIP calls in rocprofiler-sdk's records and callbacks, and the table behind them.
+add_executable(test_amd_rocprofiler_args amd/tests/unit/test_rocprofiler_args.cpp)
+target_link_libraries(test_amd_rocprofiler_args PRIVATE vgpurocprof vgpuhip)
+target_include_directories(test_amd_rocprofiler_args PRIVATE tests/framework include amd/include amd/src)
+add_test(NAME test_amd_rocprofiler_args COMMAND test_amd_rocprofiler_args)
+set_tests_properties(test_amd_rocprofiler_args PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
 # HIP from a static destructor after exit() has destroyed thread_local
 # objects, with the profiler's hooks on, as hipBLASLt does under PyTorch.
 add_executable(test_amd_hip_at_exit amd/tests/unit/test_hip_at_exit.cpp)
@@ -1560,17 +1572,33 @@ set_tests_properties(test_amd_rocprofiler_rx6800 PROPERTIES ENVIRONMENT "VGPU_GP
 add_test(NAME test_amd_rocprofiler_rx6700xt COMMAND test_amd_rocprofiler_rdna)
 set_tests_properties(test_amd_rocprofiler_rx6700xt PROPERTIES
   ENVIRONMENT "VGPU_GPU=amd/rx6700xt;HSA_OVERRIDE_GFX_VERSION=10.3.0;VGPU_QUIET=1")
-# What rocprofv3 recorded for small HIP programs on a real RX 6800 (and, for vecadd, an RX 6700 XT), compared with
+# What rocprofv3 recorded for small HIP programs on a real RX 6800 and an RX 6700 XT, compared with
 # what it records on the simulated card. Skips where there is no ROCm with rocprofv3 and hipcc.
-foreach(_case vecadd memset_d2d copies streams_events graph async_alloc markers geometry)
+foreach(_case vecadd memset_d2d copies streams_events graph async_alloc markers markers_control geometry args
+        runtime_kernels scratch first_calls graph_sizes async_sizes)
   add_test(NAME amd_rocprof_${_case} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh ${_case})
   set_tests_properties(amd_rocprof_${_case} PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+  add_test(NAME amd_rocprof_${_case}_rx6700xt
+    COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh ${_case} --gpu rx6700xt)
+  set_tests_properties(amd_rocprof_${_case}_rx6700xt PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 endforeach()
-add_test(NAME amd_rocprof_vecadd_rx6700xt
-  COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh vecadd --gpu rx6700xt)
-set_tests_properties(amd_rocprof_vecadd_rx6700xt PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+
+# The agent in every field, the files rocprofv3 writes besides results.json, and the counters a Radeon card offers
+# (amd/docs/rocprofiler.md), each compared with what the real cards printed.
+foreach(_gpu rx6800 rx6700xt)
+  foreach(_script agents outputs counters)
+    if(_script STREQUAL "agents")
+      set(_cmd ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh agents --gpu ${_gpu})
+    else()
+      set(_cmd ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_${_script}.sh --gpu ${_gpu})
+    endif()
+    add_test(NAME amd_rocprof_${_script}_${_gpu} COMMAND ${_cmd})
+    set_tests_properties(amd_rocprof_${_script}_${_gpu} PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+  endforeach()
+endforeach()
 
 # The host-memory guard seen from a HIP program: a reserve no host can meet makes every real chunk
 # of device memory an out-of-memory error (hipErrorOutOfMemory), not a crash.

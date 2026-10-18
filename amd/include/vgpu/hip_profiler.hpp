@@ -35,6 +35,7 @@ struct Device {
   uint32_t clock_mhz = 0;
   uint64_t vram_bytes = 0;
   uint32_t pci_bus = 0;           // where it sits: 0000:<bus>:00.0
+  uint32_t shader_engines = 0, arrays_per_engine = 0;   // as the chip is built (0: not known)
   uint8_t uuid[16] = {};
 };
 
@@ -72,6 +73,13 @@ struct Launch {
 
 enum class Copy : uint32_t { HostToHost = 1, HostToDevice, DeviceToHost, DeviceToDevice };
 
+// One argument of a HIP call as the entry point received it: where its value
+// is, and the size of the C++ type it was passed as.
+struct ArgRef {
+  const void* value;
+  uint32_t size;
+};
+
 struct Hooks {
   size_t size = sizeof(Hooks);
   // A HIP call begins; what it returns is handed back when the call ends.
@@ -89,6 +97,22 @@ struct Hooks {
                  uint64_t start_ns, uint64_t end_ns) = nullptr;
   void (*allocated)(int device, uint64_t address, uint64_t bytes, bool freed, uint64_t start_ns,
                     uint64_t end_ns) = nullptr;
+  // api_enter with the call's arguments, in the order of the HIP prototype
+  // (count may be 0). A profiler that sets this is called instead of api_enter;
+  // the values are copied before it returns. Added last: a profiler built
+  // before it has a smaller `size`.
+  uint64_t (*api_enter_args)(const char* name, size_t count, const ArgRef* args) = nullptr;
+  // What a real HIP runtime does with kernels, buffers and queues of its own for the program,
+  // which a profiler of a card is shown (amd/docs/rocprofiler.md, "The runtime's own work").
+  // A fill of one contiguous run of device memory: where it starts and how many bytes.
+  void (*filled)(int device, uint64_t dst, uint64_t bytes, uint64_t start_ns, uint64_t end_ns) = nullptr;
+  // Work (a launch, a copy, a fill) is being queued on a stream: 0, or a small handle, is the null stream.
+  void (*queue_used)(uint64_t stream) = nullptr;
+  // An executable graph made from a graph with that many kernel nodes, and one destroyed.
+  void (*graph_instantiated)(int device, uint64_t exec, uint32_t kernel_nodes) = nullptr;
+  void (*graph_destroyed)(uint64_t exec) = nullptr;
+  // A block taken from a memory pool (hipMallocAsync), or given back to it (hipFreeAsync).
+  void (*pool_block)(int device, uint64_t address, uint64_t bytes, bool freed) = nullptr;
 };
 
 // The clock every time above is on: CLOCK_BOOTTIME in nanoseconds, which is
@@ -107,4 +131,10 @@ extern "C" {
 int vgpu_hip_profiler_attach(const vgpu::amd::hipprof::Hooks* hooks);
 // The device with that ordinal. Returns 0, or -1 for one that does not exist.
 int vgpu_hip_profiler_device(int ordinal, vgpu::amd::hipprof::Device* out);
+// Takes a code object id and `kernels` kernel ids from the runtime's own counters, for a code object the
+// profiler reports on the runtime's behalf: the first kernel's id is returned, the rest follow it.
+void vgpu_hip_profiler_reserve_ids(uint32_t kernels, uint64_t* code_object, uint64_t* first_kernel);
+// A dispatch id from the runtime's counter, for a dispatch the profiler reports on the runtime's behalf: a tool
+// may index by the id, so it must come from the same small, dense sequence as the launches' own.
+uint64_t vgpu_hip_profiler_next_dispatch_id();
 }
