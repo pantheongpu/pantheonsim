@@ -279,6 +279,12 @@ add_custom_command(TARGET vgpucuda POST_BUILD
 add_library(vgpuhip SHARED amd/src/hip_api.cpp amd/src/hip_cxx.cpp amd/src/hsa_api.cpp)
 target_link_libraries(vgpuhip PRIVATE vgpu ${CMAKE_DL_LIBS})
 target_include_directories(vgpuhip PRIVATE amd/include)
+# A HIP program may pass any integer where the API names an enumeration (the tests pass values HIP does not
+# define, and the answer is an error code): the library reads those values without taking them as the enum,
+# so the sanitizer's enum check, which cannot tell, is off for it.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(vgpuhip PRIVATE -fno-sanitize=enum)
+endif()
 # The real runtime's identity: a HIP program records SONAME "libamdhip64.so.6"
 # and resolves to this library through LD_LIBRARY_PATH at run time.
 set_target_properties(vgpuhip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 VERSION 6.4)

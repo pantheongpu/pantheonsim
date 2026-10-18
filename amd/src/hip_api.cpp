@@ -2136,6 +2136,13 @@ struct ErrorText {
   const char* name;
   const char* text;
 };
+// A HIP error code as the caller passed it, read without taking it as a hipError_t: a program may pass a value
+// HIP does not define, and loading it as the enum is undefined (the sanitizers say so).
+int raw_code(const hipError_t& e) {
+  int v;
+  std::memcpy(&v, &e, sizeof v);
+  return v;
+}
 const ErrorText* error_text(int e) {
   static const std::map<int, ErrorText> table = [] {
     std::map<int, ErrorText> t;
@@ -2155,14 +2162,14 @@ const ErrorText* error_text(int e) {
 extern "C" {
 
 const char* hipGetErrorName(hipError_t e) {
-  const ApiCall api("hipGetErrorName", e);
-  const ErrorText* t = error_text(e);
+  const ApiCall api("hipGetErrorName", raw_code(e));
+  const ErrorText* t = error_text(raw_code(e));
   return t ? t->name : "hipErrorUnknown";
 }
 
 const char* hipGetErrorString(hipError_t e) {
-  const ApiCall api("hipGetErrorString", e);
-  const ErrorText* t = error_text(e);
+  const ApiCall api("hipGetErrorString", raw_code(e));
+  const ErrorText* t = error_text(raw_code(e));
   return t ? t->text : "unknown error";
 }
 
@@ -4836,16 +4843,16 @@ hipError_t hipDeviceGetLimit(size_t* value, int limit) {
 // The driver API's forms: a value HIP does not define is refused rather than
 // named "unknown".
 hipError_t hipDrvGetErrorString(hipError_t error, const char** text) {
-  const ApiCall api("hipDrvGetErrorString", error, text);
+  const ApiCall api("hipDrvGetErrorString", raw_code(error), text);
   // hipErrorTbd has a name and, for the driver, no text.
-  if (!text || !error_text(error) || static_cast<int>(error) == 1054) return record(state(), hipErrorInvalidValue);
-  *text = error_text(error)->text;
+  if (!text || !error_text(raw_code(error)) || raw_code(error) == 1054) return record(state(), hipErrorInvalidValue);
+  *text = error_text(raw_code(error))->text;
   return hipSuccess;
 }
 hipError_t hipDrvGetErrorName(hipError_t error, const char** name) {
-  const ApiCall api("hipDrvGetErrorName", error, name);
-  if (!name || !error_text(error)) return record(state(), hipErrorInvalidValue);
-  *name = error_text(error)->name;
+  const ApiCall api("hipDrvGetErrorName", raw_code(error), name);
+  if (!name || !error_text(raw_code(error))) return record(state(), hipErrorInvalidValue);
+  *name = error_text(raw_code(error))->name;
   return hipSuccess;
 }
 

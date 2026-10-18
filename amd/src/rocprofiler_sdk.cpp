@@ -607,7 +607,7 @@ struct CardAgent {
   std::vector<CardLink> links;
 };
 const std::vector<CardAgent>& card_agents() {
-  static const std::vector<CardAgent> cards = {
+  static const std::vector<CardAgent>& cards = *new std::vector<CardAgent>{
 #include "rocprofiler_rdna_agents.inc"
   };
   return cards;
@@ -1660,7 +1660,7 @@ void runtime_free(Sdk& s, int op, uint64_t address) {
 void load_runtime_code_object([[maybe_unused]] Sdk& s, int device) {
   // Zeros but for an ELF header of an AMDGPU code object with no sections: a tool that reads the code object
   // back (rocprofv3's rocpd output) must find an object it can parse, and finds nothing in it.
-  static const std::vector<uint8_t> image = [] {
+  static const std::vector<uint8_t>& image = *new std::vector<uint8_t>([] {
     std::vector<uint8_t> v(kRuntimeImageBytes, 0);
     const uint8_t ident[16] = {0x7f, 'E', 'L', 'F', 2, 1, 1, 0x40, 3};
     std::memcpy(v.data(), ident, sizeof ident);
@@ -1673,7 +1673,7 @@ void load_runtime_code_object([[maybe_unused]] Sdk& s, int device) {
     std::memcpy(v.data() + 54, &phentsize, 2);
     std::memcpy(v.data() + 58, &shentsize, 2);
     return v;
-  }();
+  }());
   RuntimeModel& m = runtime_model();
   // Ids from the HIP runtime's own counters: a tool indexes by them.
   vgpu_hip_profiler_reserve_ids(sizeof kRuntimeKernels / sizeof kRuntimeKernels[0], &m.code_object, &m.first_kernel);
@@ -1681,12 +1681,12 @@ void load_runtime_code_object([[maybe_unused]] Sdk& s, int device) {
   o.id = m.code_object;
   o.device = device;
   // Named the way a code object loaded from memory is: the tool reads the offset and size back from it.
-  static const std::string uri = [&] {
+  static const std::string& uri = *new std::string([&] {
     char u[128];
     std::snprintf(u, sizeof u, "memory://%d#offset=0x%llx&size=%zu", static_cast<int>(::getpid()),
                   static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(image.data())), image.size());
     return std::string(u);
-  }();
+  }());
   o.uri = uri.c_str();
   o.image = image.data();
   o.image_size = image.size();
@@ -1735,7 +1735,8 @@ void runtime_started(Sdk& s) {
 // HIP calls the model reacts to.
 enum RuntimeCall { kNoCall = 0, kStreamCreate, kStreamDestroy, kNullQueueCall, kSyncCall };
 int runtime_call_of(const char* name) {
-  static const std::map<std::string, int> calls = {
+  // Never destroyed: HIP is called after static destruction has begun (a library's own static destructor).
+  static const std::map<std::string, int>& calls = *new std::map<std::string, int>{
       {"hipStreamCreate", kStreamCreate},
       {"hipStreamCreateWithFlags", kStreamCreate},
       {"hipStreamCreateWithPriority", kStreamCreate},
