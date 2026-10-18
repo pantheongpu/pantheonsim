@@ -44,9 +44,11 @@
 
 #include "vgpu/hip_profiler.hpp"
 #include "vgpu/rocprofiler_abi.hpp"
+#include "rocprofiler_hip_args.hpp"
 
 using namespace vgpu::amd::rocprof;
 namespace hp = vgpu::amd::hipprof;
+namespace ha = vgpu::amd::hipargs;
 using vgpu::amd::DispatchStats;
 
 #define ROCPROFILER_API extern "C" __attribute__((visibility("default")))
@@ -270,6 +272,21 @@ ApiId hip_api_id(const char* name) {
   }());
   const auto it = ids.find(name);
   return it == ids.end() ? ApiId{} : it->second;
+}
+
+// The argument table of the HIP call with this operation number.
+const ha::CallSpec* call_spec(bool compiler, int op) {
+  static const std::map<std::pair<bool, int>, const ha::CallSpec*>& by_op =
+      *new std::map<std::pair<bool, int>, const ha::CallSpec*>([] {
+        std::map<std::pair<bool, int>, const ha::CallSpec*> m;
+        for (const HipApi& a : kHipApis)
+          if (const ha::CallSpec* c = ha::find(a.name)) m.emplace(std::make_pair(false, a.id), c);
+        for (const HipApi& a : kHipCompilerApis)
+          if (const ha::CallSpec* c = ha::find(a.name)) m.emplace(std::make_pair(true, a.id), c);
+        return m;
+      }());
+  const auto it = by_op.find({compiler, op});
+  return it == by_op.end() ? nullptr : it->second;
 }
 
 // The operations of the kinds this names: the names are the enumerations'
@@ -657,6 +674,11 @@ struct ApiFrame {
   bool compiler = false;   // a HIP compiler API call, not a runtime one
   uint64_t start = 0;
   uint64_t ancestor = 0;   // the ROCTx range the thread was in when the call began
+  // The call's arguments as rocprofiler_hip_api_args_t lays them out, when the entry point handed them over.
+  const ha::CallSpec* spec = nullptr;
+  bool has_args = false;
+  alignas(8) uint8_t args[ha::kArgsBytes] = {};
+  std::vector<rocprofiler_user_data_t> user;   // per context that took the call's callbacks, entry to exit
 };
 // A thread's HIP calls in progress. exit() destroys the thread's
 // thread_local objects before it runs the libraries' static destructors, and
@@ -1202,7 +1224,37 @@ uint64_t roctx_scope(Sdk&) { return roctx::scope_of(thread_id()); }
 
 // ---- What libamdhip64 reports -------------------------------------------------------
 
-uint64_t on_api_enter(const char* name) {
+// The callbacks a tool took for HIP calls, at entry (phase ENTER) and exit.
+// The payload is the call's arguments and return value in the unions rocprofiler-sdk defines;
+// the return value is not known here and stays zero.
+void deliver_hip_callbacks(Sdk& s, ApiFrame& f, rocprofiler_callback_phase_t phase) {
+  const int kind = f.compiler ? ROCPROFILER_CALLBACK_TRACING_HIP_COMPILER_API : ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API;
+  rocprofiler_callback_tracing_hip_api_data_t data{};
+  data.size = sizeof data;
+  if (f.has_args) std::memcpy(data.args, f.args, sizeof data.args);
+  else data.retval[sizeof data.retval - 1] = 1;   // no arguments to show (rocprofiler_abi.hpp)
+  const auto request = f.compiler ? ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_HIP_COMPILER_API
+                                  : ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_HIP_RUNTIME_API;
+  size_t index = 0;
+  for_callbacks(s, kind, f.op, [&](Context& c, CallbackService& svc) {
+    if (phase == ROCPROFILER_CALLBACK_PHASE_ENTER) f.user.push_back({});
+    rocprofiler_user_data_t* user = index < f.user.size() ? &f.user[index] : nullptr;
+    ++index;
+    rocprofiler_callback_tracing_record_t r{};
+    r.context_id = {c.id};
+    r.thread_id = thread_id();
+    r.correlation_id.internal = f.correlation;
+    r.correlation_id.external = external_id(c, request, f.op, f.correlation);
+    r.kind = static_cast<rocprofiler_callback_tracing_kind_t>(kind);
+    r.operation = f.op;
+    r.phase = phase;
+    r.payload = &data;
+    rocprofiler_user_data_t none{};
+    svc.callback(r, user ? user : &none, svc.data);
+  });
+}
+
+uint64_t on_api_enter_args(const char* name, size_t count, const hp::ArgRef* refs) {
   ensure_configured();
   Sdk& s = sdk();
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
@@ -1212,20 +1264,32 @@ uint64_t on_api_enter(const char* name) {
   const ApiId id = hip_api_id(name);
   f.op = id.op;
   f.compiler = id.compiler;
+  if (count) {
+    f.spec = ha::find(name);
+    f.has_args = f.spec && ha::store(*f.spec, count, refs, f.args);
+  } else {
+    // A call with no arguments has them all: none.
+    const ha::CallSpec* spec = ha::find(name);
+    f.has_args = spec && spec->count == 0;
+  }
+  if (f.op >= 0) deliver_hip_callbacks(s, f, ROCPROFILER_CALLBACK_PHASE_ENTER);
   f.start = hp::now_ns();
   if (frames().empty()) f.ancestor = roctx_scope(s);
   frames().push_back(f);
   return frames().size();
 }
 
+uint64_t on_api_enter(const char* name) { return on_api_enter_args(name, 0, nullptr); }
+
 void on_api_exit(uint64_t token) {
   Sdk& s = sdk();
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   if (!token || frames().size() != token) return;
-  const ApiFrame f = frames().back();
+  ApiFrame f = frames().back();
   frames().pop_back();
   if (s.finalized || f.op < 0) return;
   const uint64_t end = hp::now_ns();
+  deliver_hip_callbacks(s, f, ROCPROFILER_CALLBACK_PHASE_EXIT);
   const int plain = f.compiler ? ROCPROFILER_BUFFER_TRACING_HIP_COMPILER_API : ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API;
   const int ext = f.compiler ? ROCPROFILER_BUFFER_TRACING_HIP_COMPILER_API_EXT : ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT;
   const auto request = f.compiler ? ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_HIP_COMPILER_API
@@ -1245,6 +1309,8 @@ void on_api_exit(uint64_t token) {
         r.start_timestamp = f.start;
         r.end_timestamp = end;
         r.thread_id = thread_id();
+        if (f.has_args) std::memcpy(r.args, f.args, sizeof r.args);
+        else r.retval[sizeof r.retval - 1] = 1;   // no arguments to show (rocprofiler_abi.hpp)
         push(s, buf, ROCPROFILER_BUFFER_CATEGORY_TRACING, static_cast<uint32_t>(kind), r);
       } else {
         rocprofiler_buffer_tracing_hip_api_record_t r{};
@@ -1498,6 +1564,7 @@ void on_allocated(int device, uint64_t address, uint64_t bytes, bool freed, uint
 const hp::Hooks kHooks = [] {
   hp::Hooks h;
   h.api_enter = on_api_enter;
+  h.api_enter_args = on_api_enter_args;
   h.api_exit = on_api_exit;
   h.code_object_loaded = on_code_object;
   h.launching = on_launching;
@@ -2005,14 +2072,32 @@ ROCPROFILER_API int rocprofiler_set_api_table(const char* name, uint64_t, uint64
   return name && (tables || count == 0) ? 0 : -1;
 }
 
-// The arguments of the call a callback-tracing record is about, one by one.
-// The records this library delivers carry the operation, not the call's
-// arguments, so there are none to walk: a tool asking is told so, and PyTorch's
-// profiler records the call without them.
+// The arguments of the call a callback-tracing record is about, one by one, as
+// rocprofiler-sdk hands them to a tool: the address of each in the record, how many
+// pointers deep its type is, the type's typeid name, the parameter's name and its
+// value as text. Only HIP calls carry arguments here, and only those whose entry
+// point hands them over; pointers are shown as the address they hold (the
+// dereference count is 0), which is what a record delivered after the call has to
+// do too.
 ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_callback_tracing_kind_operation_args(
-    rocprofiler_callback_tracing_record_t, void* callback, int32_t, void*) {
+    rocprofiler_callback_tracing_record_t record, rocprofiler_callback_tracing_operation_args_cb_t callback, int32_t,
+    void* user_data) {
   if (!callback) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
-  return ROCPROFILER_STATUS_ERROR_NOT_IMPLEMENTED;
+  const bool runtime = record.kind == ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API;
+  if (!runtime && record.kind != ROCPROFILER_CALLBACK_TRACING_HIP_COMPILER_API)
+    return ROCPROFILER_STATUS_ERROR_NOT_IMPLEMENTED;
+  const auto* data = static_cast<const rocprofiler_callback_tracing_hip_api_data_t*>(record.payload);
+  const ha::CallSpec* spec = call_spec(!runtime, record.operation);
+  if (!data || !spec) return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  if (data->retval[sizeof data->retval - 1]) return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  for (size_t i = 0; i < spec->count; ++i) {
+    const ha::ArgSpec& a = spec->args[i];
+    const std::string text = ha::format(a, data->args);
+    if (callback(record.kind, record.operation, static_cast<uint32_t>(i), data->args + a.offset, ha::indirection(a),
+                 a.type, a.name, text.c_str(), 0, user_data) != 0)
+      break;
+  }
+  return ROCPROFILER_STATUS_SUCCESS;
 }
 
 ROCPROFILER_API rocprofiler_status_t rocprofiler_query_intercept_table_name(rocprofiler_intercept_table_t kind,
@@ -2042,10 +2127,28 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_at_intercept_table_registration
   return ROCPROFILER_STATUS_SUCCESS;
 }
 
-// The arguments of a traced call, which are not recorded here.
-ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_buffer_tracing_record_args(rocprofiler_record_header_t, void*,
-                                                                                    void*) {
-  return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+// The arguments of a traced HIP call, one by one, from a buffer record of the "extended" kinds
+// (HIP_RUNTIME_API_EXT, HIP_COMPILER_API_EXT), which carry them. A pointer is shown as the address it
+// holds: the record outlives the call's stack.
+ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_buffer_tracing_record_args(
+    rocprofiler_record_header_t header, rocprofiler_buffer_tracing_operation_args_cb_t callback, void* user_data) {
+  if (!callback) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
+  if (header.category != ROCPROFILER_BUFFER_CATEGORY_TRACING) return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  const bool runtime = header.kind == ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT;
+  if (!runtime && header.kind != ROCPROFILER_BUFFER_TRACING_HIP_COMPILER_API_EXT)
+    return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  const auto* r = static_cast<const rocprofiler_buffer_tracing_hip_api_ext_record_t*>(header.payload);
+  if (!r) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
+  const ha::CallSpec* spec = call_spec(!runtime, r->operation);
+  if (!spec || r->retval[sizeof r->retval - 1]) return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  for (size_t i = 0; i < spec->count; ++i) {
+    const ha::ArgSpec& a = spec->args[i];
+    const std::string text = ha::format(a, r->args);
+    if (callback(r->kind, r->operation, static_cast<uint32_t>(i), r->args + a.offset, ha::indirection(a), a.type, a.name,
+                 text.c_str(), user_data) != 0)
+      break;
+  }
+  return ROCPROFILER_STATUS_SUCCESS;
 }
 
 // -- what needs hardware there is no model of --

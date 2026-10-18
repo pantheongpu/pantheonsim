@@ -24,6 +24,8 @@
 #   markers         ROCTx marks and ranges
 #   markers_control ROCTx profiler pause and resume, a named stream, nested ranges, marks from another thread
 #   geometry        3D grid, static plus dynamic LDS, scratch
+#   args            one call per kind of HIP parameter: how null and live pointers, handles, strings,
+#                   enums, integers and structs by value print
 #
 # The simulator has no timing model, so nothing in the comparison is a time.
 # The card's expected files were recorded on an RX 6800 (gfx1030) and, for
@@ -35,7 +37,7 @@
 # ROCPROF_CARD_DEVICE picks the HIP device (default 0 for rx6800, 1 for rx6700xt).
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
-usage="usage: $0 <vecadd|memset_d2d|copies|streams_events|graph|async_alloc|markers|markers_control|geometry> [--gpu rx6800|rx6700xt] [--card [--update]]"
+usage="usage: $0 <vecadd|memset_d2d|copies|streams_events|graph|async_alloc|markers|markers_control|geometry|args> [--gpu rx6800|rx6700xt] [--card [--update]]"
 case_name="${1:?$usage}"
 shift
 gpu=rx6800; card=0; update=0

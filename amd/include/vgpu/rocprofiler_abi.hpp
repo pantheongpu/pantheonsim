@@ -602,8 +602,11 @@ typedef struct rocprofiler_buffer_tracing_hip_api_record_t {
 } rocprofiler_buffer_tracing_hip_api_record_t;
 
 // The call's arguments and return value follow, as unions over every HIP
-// function (rocprofiler_hip_api_args_t, rocprofiler_hip_api_retval_t). This
-// leaves them zero: they are written out only when a tool asks for arguments.
+// function (rocprofiler_hip_api_args_t, rocprofiler_hip_api_retval_t). The
+// arguments are the call's own, laid out as amd/src/rocprofiler_hip_args.inc
+// says. The last byte of retval, which no return type reaches (the largest,
+// hipChannelFormatDesc, is 20 of its 24), is 1 when the entry point did not hand
+// its arguments over: a tool is then told there are none to show.
 typedef struct rocprofiler_buffer_tracing_hip_api_ext_record_t {
   uint64_t size;
   rocprofiler_buffer_tracing_kind_t kind;
@@ -793,11 +796,31 @@ typedef struct rocprofiler_callback_tracing_runtime_initialization_data_t {
   uint64_t instance;
 } rocprofiler_callback_tracing_runtime_initialization_data_t;
 
+// A HIP call's callback record: its arguments and return value, as the unions
+// over every HIP function (rocprofiler_hip_api_args_t is 88 bytes,
+// rocprofiler_hip_api_retval_t 24). amd/src/rocprofiler_hip_args.inc says where
+// each call's arguments lie in the first.
+typedef struct rocprofiler_callback_tracing_hip_api_data_t {
+  uint64_t size;
+  alignas(8) uint8_t args[88];
+  alignas(8) uint8_t retval[24];
+} rocprofiler_callback_tracing_hip_api_data_t;
+
 typedef struct rocprofiler_callback_tracing_hip_stream_data_t {
   uint64_t size;
   rocprofiler_stream_id_t stream_id;
   rocprofiler_address_t stream_value;
 } rocprofiler_callback_tracing_hip_stream_data_t;
+
+// Called for each argument of a traced call (rocprofiler-sdk/callback_tracing.h, buffer_tracing.h).
+typedef int (*rocprofiler_callback_tracing_operation_args_cb_t)(
+    rocprofiler_callback_tracing_kind_t kind, rocprofiler_tracing_operation_t operation, uint32_t arg_number,
+    const void* const arg_value_addr, int32_t arg_indirection_count, const char* arg_type, const char* arg_name,
+    const char* arg_value_str, int32_t arg_dereference_count, void* data);
+typedef int (*rocprofiler_buffer_tracing_operation_args_cb_t)(
+    rocprofiler_buffer_tracing_kind_t kind, rocprofiler_tracing_operation_t operation, uint32_t arg_number,
+    const void* const arg_value_addr, int32_t arg_indirection_count, const char* arg_type, const char* arg_name,
+    const char* arg_value_str, void* data);
 
 typedef void (*rocprofiler_callback_tracing_cb_t)(rocprofiler_callback_tracing_record_t record,
                                                   rocprofiler_user_data_t* user_data, void* callback_data);

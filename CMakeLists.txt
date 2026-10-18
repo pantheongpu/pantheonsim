@@ -1456,6 +1456,12 @@ target_link_libraries(test_amd_rocprofiler PRIVATE vgpurocprof vgpuhip)
 target_include_directories(test_amd_rocprofiler PRIVATE tests/framework amd/include)
 target_compile_definitions(test_amd_rocprofiler PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_rocprofiler COMMAND test_amd_rocprofiler)
+# The arguments of HIP calls in rocprofiler-sdk's records and callbacks, and the table behind them.
+add_executable(test_amd_rocprofiler_args amd/tests/unit/test_rocprofiler_args.cpp)
+target_link_libraries(test_amd_rocprofiler_args PRIVATE vgpurocprof vgpuhip)
+target_include_directories(test_amd_rocprofiler_args PRIVATE tests/framework include amd/include amd/src)
+add_test(NAME test_amd_rocprofiler_args COMMAND test_amd_rocprofiler_args)
+set_tests_properties(test_amd_rocprofiler_args PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
 # HIP from a static destructor after exit() has destroyed thread_local
 # objects, with the profiler's hooks on, as hipBLASLt does under PyTorch.
 add_executable(test_amd_hip_at_exit amd/tests/unit/test_hip_at_exit.cpp)
@@ -1555,7 +1561,7 @@ set_tests_properties(test_amd_rocprofiler_rx6700xt PROPERTIES
   ENVIRONMENT "VGPU_GPU=amd/rx6700xt;HSA_OVERRIDE_GFX_VERSION=10.3.0;VGPU_QUIET=1")
 # What rocprofv3 recorded for small HIP programs on a real RX 6800 and an RX 6700 XT, compared with
 # what it records on the simulated card. Skips where there is no ROCm with rocprofv3 and hipcc.
-foreach(_case vecadd memset_d2d copies streams_events graph async_alloc markers markers_control geometry)
+foreach(_case vecadd memset_d2d copies streams_events graph async_alloc markers markers_control geometry args)
   add_test(NAME amd_rocprof_${_case} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh ${_case})
   set_tests_properties(amd_rocprof_${_case} PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)

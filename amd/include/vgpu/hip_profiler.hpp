@@ -72,6 +72,13 @@ struct Launch {
 
 enum class Copy : uint32_t { HostToHost = 1, HostToDevice, DeviceToHost, DeviceToDevice };
 
+// One argument of a HIP call as the entry point received it: where its value
+// is, and the size of the C++ type it was passed as.
+struct ArgRef {
+  const void* value;
+  uint32_t size;
+};
+
 struct Hooks {
   size_t size = sizeof(Hooks);
   // A HIP call begins; what it returns is handed back when the call ends.
@@ -89,6 +96,11 @@ struct Hooks {
                  uint64_t start_ns, uint64_t end_ns) = nullptr;
   void (*allocated)(int device, uint64_t address, uint64_t bytes, bool freed, uint64_t start_ns,
                     uint64_t end_ns) = nullptr;
+  // api_enter with the call's arguments, in the order of the HIP prototype
+  // (count may be 0). A profiler that sets this is called instead of api_enter;
+  // the values are copied before it returns. Added last: a profiler built
+  // before it has a smaller `size`.
+  uint64_t (*api_enter_args)(const char* name, size_t count, const ArgRef* args) = nullptr;
 };
 
 // The clock every time above is on: CLOCK_BOOTTIME in nanoseconds, which is
