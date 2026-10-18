@@ -1657,7 +1657,7 @@ void runtime_free(Sdk& s, int op, uint64_t address) {
 }
 
 // The runtime's own code object, loaded as the runtime starts (the same 16 kernels on both cards).
-void load_runtime_code_object(Sdk& s, int device) {
+void load_runtime_code_object([[maybe_unused]] Sdk& s, int device) {
   // Zeros but for an ELF header of an AMDGPU code object with no sections: a tool that reads the code object
   // back (rocprofv3's rocpd output) must find an object it can parse, and finds nothing in it.
   static const std::vector<uint8_t> image = [] {
