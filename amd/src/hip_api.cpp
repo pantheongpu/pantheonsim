@@ -3849,6 +3849,8 @@ void vgpu_hip_profiler_reserve_ids(uint32_t kernels, uint64_t* code_object, uint
   *first_kernel = g_next_kernel.fetch_add(kernels);
 }
 
+uint64_t vgpu_hip_profiler_next_dispatch_id() { return g_next_dispatch.fetch_add(1); }
+
 int vgpu_hip_profiler_device(int ordinal, vgpu::amd::hipprof::Device* out) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);

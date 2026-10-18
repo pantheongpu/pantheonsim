@@ -5,6 +5,7 @@ the simulator can be compared with diff.
 
     rocprof_normalize.py <results.json | directory of rocprofv3 -d output>
     rocprof_normalize.py --strip-known-gaps < normalised.txt > comparable.txt
+    rocprof_normalize.py --no-runtime ...   the same without the runtime's own kernels, scratch and allocations
     rocprof_normalize.py --agents <results.json | directory>
          every field of the GPU agent (shader engines, SDMA engines, queues, clocks, memory banks,
          caches, io links, firmware) but where the machine puts it: node, gpu_id, location, render minor, uuid
@@ -292,6 +293,20 @@ def main():
         out.append("[marker scopes]")
         out += scoped
 
+    if "--no-runtime" in sys.argv:
+        # For a case that is about something else (the arguments of HIP calls): what ROCm's runtime does on the
+        # program's behalf is compared by the cases that measure it, and some of what this program calls is not
+        # modelled (2D fills, ...).
+        kept, section = [], ""
+        for line in out:
+            if line.startswith("["):
+                section = line
+            if section in ("[runtime kernels]", "[scratch]", "[runtime allocations]") or (
+                    section == "[dispatches]" and line.startswith("__amd_rocclr_")):
+                if not line.startswith("["):
+                    continue
+            kept.append(line)
+        out = kept
     print("\n".join(out))
 
 

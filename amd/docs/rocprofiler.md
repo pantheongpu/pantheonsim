@@ -302,3 +302,15 @@ These are what the cards show or what the model cannot say without measuring; no
   failure of `graph` is the card dropping them, not a change.
 - **The single-use scratch block's size** (`128 * array_count * roundup(private, 32)`) is fitted to the
   two cards (8 and 4 arrays); a third card with another array count would test it.
+
+## Notes from merging the pieces
+
+- The `args` case is compared with `rocprof_normalize.py --no-runtime`: it calls many HIP functions to see how their arguments
+  print, some of which make runtime work that is not modelled (2D fills), and the runtime's own work is compared by the cases that
+  measure it.
+- A dispatch of the runtime's own kernels takes its id from the HIP runtime's dispatch counter
+  (`vgpu_hip_profiler_next_dispatch_id`): rocprofv3's rocpd output indexes by it, and an id far outside the launches' own
+  sequence made the tool allocate until it was killed.
+- Records of a dispatch (and of scratch) carry the id of the thread of the latest HIP call, as the card's do. Work on a stream
+  runs on a thread of the runtime's own here, and that thread's id made OTF2 write a location the card's trace does not have.
+  With several threads calling HIP at once this is the latest caller's, not necessarily the one that queued the work.

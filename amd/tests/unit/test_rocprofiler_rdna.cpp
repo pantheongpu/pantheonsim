@@ -573,7 +573,9 @@ VTEST(roctx_marks_and_ranges_are_records_with_the_range_they_were_made_in) {
   std::vector<std::pair<std::string, uint64_t>> hip;
   for (const Call& c : s.calls)
     if (c.name == "hipDeviceSynchronize" || c.name == "hipGetDevice") hip.push_back({c.name, c.ancestor});
-  VCHECK_EQ(hip.size(), size_t{4});
+  // Other tests of this file make HIP calls too, before this one's sequence: it is the last four.
+  VCHECK(hip.size() >= 4);
+  hip.erase(hip.begin(), hip.end() - 4);
   VCHECK_EQ(hip[0].second, id_of["setup"]);
   VCHECK_EQ(hip[1].second, id_of["launch"]);
   VCHECK_EQ(hip[2].second, id_of["compute"]);

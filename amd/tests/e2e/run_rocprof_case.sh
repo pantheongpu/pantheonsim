@@ -136,6 +136,7 @@ results=$(find "$work/out" -name '*_results.json' | head -1)
 # ROCPROF_KEEP=<dir> keeps the raw result, to see what the normaliser left out.
 [[ -n "${ROCPROF_KEEP:-}" ]] && cp "$results" "$ROCPROF_KEEP/${case_name}.$(( card ))card.json"
 norm_flags=""; [[ "$case_name" == agents ]] && norm_flags="--agents"
+[[ "$case_name" == args ]] && norm_flags="--no-runtime"   # about the arguments, not the runtime's own work
 python3 -I "$root/amd/tests/rocprof_normalize.py" $norm_flags "$results" >"$work/trace.txt" || { echo "FAIL: could not normalise $results"; exit 1; }
 
 if (( update )); then

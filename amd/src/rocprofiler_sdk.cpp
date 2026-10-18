@@ -535,6 +535,14 @@ Sdk& sdk() {
 
 uint64_t thread_id() { return static_cast<uint64_t>(::syscall(SYS_gettid)); }
 
+// Work on a stream runs on a thread of the runtime's own, not on the one that called the HIP function, but the
+// card's records of a dispatch carry the calling thread's id: the thread of the latest HIP call entered.
+std::atomic<uint64_t> g_api_thread{0};
+uint64_t dispatch_thread() {
+  const uint64_t t = g_api_thread.load(std::memory_order_relaxed);
+  return t ? t : thread_id();
+}
+
 // The caller holds the lock.
 const char* intern(Sdk& s, const std::string& v) { return s.interned.insert(v).first->c_str(); }
 
@@ -1422,6 +1430,7 @@ uint64_t on_api_enter_args(const char* name, size_t count, const hp::ArgRef* ref
   }
   if (f.op >= 0) deliver_hip_callbacks(s, f, ROCPROFILER_CALLBACK_PHASE_ENTER);
   f.start = hp::now_ns();
+  g_api_thread.store(thread_id(), std::memory_order_relaxed);
   if (frames().empty()) f.ancestor = roctx_scope(s);
   if (!f.compiler) f.runtime_call = runtime_call_of(name);
   frames().push_back(f);
@@ -1591,7 +1600,6 @@ struct RuntimeModel {
   uint64_t code_object = 0, first_kernel = 0;   // the ids the runtime's code object and kernels were given
   bool started = false;        // the program's first runtime call has been seen
   bool null_queue = false;     // the default stream's queue (and its staging buffers) exist
-  uint64_t next_dispatch = uint64_t{1} << 40;
   uint64_t next_address = 0x7e0000000000ull;
   std::map<uint64_t, uint64_t> graph_blocks;      // executable graph -> its allocation
   uint64_t pool_live = 0, pool_chunks = 0;        // memory-pool blocks held, 32 MiB chunks mapped for them
@@ -1650,7 +1658,22 @@ void runtime_free(Sdk& s, int op, uint64_t address) {
 
 // The runtime's own code object, loaded as the runtime starts (the same 16 kernels on both cards).
 void load_runtime_code_object(Sdk& s, int device) {
-  static const std::vector<uint8_t> image(kRuntimeImageBytes, 0);
+  // Zeros but for an ELF header of an AMDGPU code object with no sections: a tool that reads the code object
+  // back (rocprofv3's rocpd output) must find an object it can parse, and finds nothing in it.
+  static const std::vector<uint8_t> image = [] {
+    std::vector<uint8_t> v(kRuntimeImageBytes, 0);
+    const uint8_t ident[16] = {0x7f, 'E', 'L', 'F', 2, 1, 1, 0x40, 3};
+    std::memcpy(v.data(), ident, sizeof ident);
+    const uint16_t type = 3, machine = 224, ehsize = 64, phentsize = 56, shentsize = 64;
+    const uint32_t version = 1;
+    std::memcpy(v.data() + 16, &type, 2);
+    std::memcpy(v.data() + 18, &machine, 2);
+    std::memcpy(v.data() + 20, &version, 4);
+    std::memcpy(v.data() + 52, &ehsize, 2);
+    std::memcpy(v.data() + 54, &phentsize, 2);
+    std::memcpy(v.data() + 58, &shentsize, 2);
+    return v;
+  }();
   RuntimeModel& m = runtime_model();
   // Ids from the HIP runtime's own counters: a tool indexes by them.
   vgpu_hip_profiler_reserve_ids(sizeof kRuntimeKernels / sizeof kRuntimeKernels[0], &m.code_object, &m.first_kernel);
@@ -1817,7 +1840,7 @@ void runtime_dispatch(Sdk& s, int device, size_t kernel, uint64_t grid, uint32_t
   info.agent_id = gpu_agent(s, device);
   info.queue_id = {0};
   info.kernel_id = runtime_model().first_kernel + kernel;
-  info.dispatch_id = runtime_model().next_dispatch++;
+  info.dispatch_id = vgpu_hip_profiler_next_dispatch_id();
   info.workgroup_size = {workgroup, 1, 1};
   info.grid_size = {static_cast<uint32_t>(grid), 1, 1};
   const uint64_t corr = s.next_correlation.fetch_add(1);
@@ -1828,7 +1851,7 @@ void runtime_dispatch(Sdk& s, int device, size_t kernel, uint64_t grid, uint32_t
                  r.kind = ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH;
                  r.operation = ROCPROFILER_KERNEL_DISPATCH_COMPLETE;
                  r.correlation_id = {corr, external_id(c, ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_KERNEL_DISPATCH, 0, corr)};
-                 r.thread_id = thread_id();
+                 r.thread_id = dispatch_thread();
                  r.start_timestamp = start;
                  r.end_timestamp = end;
                  r.dispatch_info = info;
@@ -1896,7 +1919,7 @@ void emit_scratch(Sdk& s, int device, uint64_t queue, int op, uint32_t flags, ui
     r.operation = static_cast<rocprofiler_scratch_memory_operation_t>(op);
     r.agent_id = gpu_agent(s, device);
     r.queue_id = {queue};
-    r.thread_id = thread_id();
+    r.thread_id = dispatch_thread();
     r.start_timestamp = now;
     r.end_timestamp = now;
     r.flags = flags;
@@ -2029,7 +2052,7 @@ void on_launched(const hp::Launch&, const DispatchStats* stats, uint64_t start, 
                  r.kind = ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH;
                  r.operation = ROCPROFILER_KERNEL_DISPATCH_COMPLETE;
                  r.correlation_id = {f->correlation, f->external[c.id]};
-                 r.thread_id = thread_id();
+                 r.thread_id = dispatch_thread();
                  r.start_timestamp = start;
                  r.end_timestamp = end;
                  r.dispatch_info = f->info;

@@ -134,4 +134,7 @@ int vgpu_hip_profiler_device(int ordinal, vgpu::amd::hipprof::Device* out);
 // Takes a code object id and `kernels` kernel ids from the runtime's own counters, for a code object the
 // profiler reports on the runtime's behalf: the first kernel's id is returned, the rest follow it.
 void vgpu_hip_profiler_reserve_ids(uint32_t kernels, uint64_t* code_object, uint64_t* first_kernel);
+// A dispatch id from the runtime's counter, for a dispatch the profiler reports on the runtime's behalf: a tool
+// may index by the id, so it must come from the same small, dense sequence as the launches' own.
+uint64_t vgpu_hip_profiler_next_dispatch_id();
 }
