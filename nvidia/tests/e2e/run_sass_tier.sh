@@ -43,7 +43,7 @@ declare -A gpu=([sm_75]=nvidia/t4 [sm_80]=nvidia/a100 [sm_86]=nvidia/rtx3060 [sm
                 [sm_100]=nvidia/b200 [sm_120]=nvidia/rtx5090)
 archs=(${VGPU_TIER_ARCHS:-sm_75 sm_80 sm_86 sm_89 sm_90 sm_100 sm_120})
 # program:first architecture[:last]; each runs on one architecture except sass_tier, which runs on every one.
-others=(${VGPU_TIER_PROGRAMS:-sass_tier_steps:75 sass_fastpath:75 sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
+others=(${VGPU_TIER_PROGRAMS:-sass_tier_steps:75 sass_fastpath:80 sass_archs:75 vector_add:75 device_functions:75 device_intrinsics:75 video_forms:75
         symbols:75 surface_oob:75 textures:75 texture_filtering:75 texture_gather:75 texture_layers:75 texture_forms:75
         surface_formatted:75 texture_mipmaps:75 texture_mip_layers:75 texture_srgb:75 texture_int_coords:75 border_colour:75
         block_semaphore:75 cooperative_grid:75 alloca_stack:75 shared_max:75 named_barriers:75 smid:75 smem_size_regs:75

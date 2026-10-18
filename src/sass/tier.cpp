@@ -1202,7 +1202,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
 namespace {
 bool read_request() {
   const char* v = std::getenv("VGPU_TIER");
-  return v && v[0] == '1' && v[1] == 0;
+  return !(v && v[0] == '0' && v[1] == 0);   // on unless VGPU_TIER=0
 }
 }  // namespace
 

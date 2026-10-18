@@ -8,6 +8,9 @@ name: SASS and PTX
 #
 #   ptx     the build job's suite again with VGPU_SASS=0 (nightly and by
 #           hand: it repeats a 40-minute run).
+#   interp  the build job's suite again with VGPU_TIER=0: the SASS interpreter
+#           without the pre-decoded tier, which is on by default (nightly and
+#           by hand, as ptx).
 #   digest  representative e2e programs built for sm_75, sm_86, sm_90, sm_100
 #           and sm_120, each run on SASS and on PTX with VGPU_KERNEL_DIGEST,
 #           and the per-kernel memory digests compared
@@ -91,6 +94,55 @@ jobs:
           VGPU_SASS: '0'
         # The build job's set, less the AMD tests, which VGPU_SASS does not
         # touch.
+        run: |
+          ctest --test-dir build --output-on-failure \
+            -E '^(pantheon_workloads|amd_.*|test_amd.*|.*ollama.*)$'
+
+  interp:
+    name: the suite on the SASS interpreter (VGPU_TIER=0)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    container:
+      # The build job's toolchain (Ubuntu's CUDA 12.0), so this is that job's
+      # run with only the engine changed.
+      image: ${{ needs.image.outputs.cuda12_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g
+    env:
+      NVCC_PREPEND_FLAGS: -ccbin g++-12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is there a SASS path?
+        id: sass
+        run: |
+          if grep -q VGPU_SASS_LOG nvidia/src/fatbin.cpp; then echo "here=yes" >> "$GITHUB_OUTPUT"
+          else echo "::notice::no SASS executor in this tree: nothing to repeat"; fi
+
+      - name: Install toolchain
+        if: steps.sass.outputs.here && !job.container.id
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit nvidia-profiler
+
+      - name: Build
+        if: steps.sass.outputs.here
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)"
+
+      - name: Unit and end-to-end tests without the pre-decoded tier
+        if: steps.sass.outputs.here
+        env:
+          VGPU_TIER: '0'
+        # The build job's set, less the AMD tests, which VGPU_TIER does not
+        # touch. The build job runs the SASS engine with its default, the
+        # pre-decoded tier; this is the same run on the interpreter alone.
         run: |
           ctest --test-dir build --output-on-failure \
             -E '^(pantheon_workloads|amd_.*|test_amd.*|.*ollama.*)$'

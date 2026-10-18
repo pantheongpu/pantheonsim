@@ -2,7 +2,7 @@
 # Shared and local memory moved 1 to 16 bytes at a time; see sass_vector_memory.cu.
 #
 # The program compares every word with a host computation, so a pass on each engine is the engines agreeing with the
-# host and with each other: the SASS interpreter (the default), the SASS tier (VGPU_TIER=1) and the PTX interpreter
+# host and with each other: the SASS interpreter (VGPU_TIER=0), the SASS tier (the default) and the PTX interpreter
 # (VGPU_SASS=0). With --card it runs on the machine's real GPU and library instead (nothing is built against the shim).
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -32,7 +32,7 @@ if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 fail=0
 for engine in sass tier ptx; do
   case "$engine" in
-    sass) env_engine=() ;;
+    sass) env_engine=(VGPU_TIER=0) ;;
     tier) env_engine=(VGPU_TIER=1) ;;
     ptx)  env_engine=(VGPU_SASS=0) ;;
   esac

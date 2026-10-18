@@ -14,7 +14,7 @@
 // mask forced by BMOV.PQUAD MACTIVE, a register past the warp's file) -- goes to Runner::execute, which is the
 // existing code. Divergent warps work: a handler takes the executing lane mask like the interpreter's does.
 //
-// Off by default: VGPU_TIER=1 turns it on (docs/cli.md). Every handler is held to the bits of the interpreter's path
+// On by default: VGPU_TIER=0 turns it off (docs/cli.md). Every handler is held to the bits of the interpreter's path
 // for the same form (tests: nvidia/tests/e2e/run_sass_tier.sh, tests/unit/test_tier.cpp).
 //
 // This header is the data the analysis (tier.cpp: Instr -> MOp, no execution) and the handlers (tier_ops.inc,
@@ -181,7 +181,7 @@ struct Program {
 // `sm` is the architecture the code was decoded for. Never throws on an instruction it does not take: Form::None.
 void analyze(const Instr& ins, int sm, Program& prog, MOp& op);
 
-// Whether VGPU_TIER asks for the tier (read once per process). The executor also requires its fast paths
+// Whether the tier is on: it is, unless VGPU_TIER=0 (read once per process). The executor also requires its fast paths
 // (VGPU_FASTPATH) and the SIMD kernels (VGPU_SIMD) on, and no per-instruction trace.
 bool requested();
 

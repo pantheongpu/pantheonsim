@@ -2548,13 +2548,20 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "SKIP:"
     TIMEOUT 300)
-  # The same counters with the pre-decoded execution tier on (VGPU_TIER=1, src/sass/tier.hpp): it must count exactly
-  # what the interpreter does.
+  # The pre-decoded execution tier (src/sass/tier.hpp) is on by default, so the test above runs with it. The same
+  # counters with it named (VGPU_TIER=1) and with it off (VGPU_TIER=0): both must count exactly the same.
   add_test(NAME bench_counters_tier
            COMMAND ${CMAKE_SOURCE_DIR}/tools/bench/run_bench_check.sh)
   set_tests_properties(bench_counters_tier PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_TIER=1"
+    SKIP_REGULAR_EXPRESSION "SKIP:"
+    TIMEOUT 300)
+  add_test(NAME bench_counters_interp
+           COMMAND ${CMAKE_SOURCE_DIR}/tools/bench/run_bench_check.sh)
+  set_tests_properties(bench_counters_interp PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_TIER=0"
     SKIP_REGULAR_EXPRESSION "SKIP:"
     TIMEOUT 300)
 

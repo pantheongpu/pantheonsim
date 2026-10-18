@@ -609,7 +609,7 @@ class Runner {
   const DeviceProfile& profile_;
   const uint64_t max_steps_;   // the step budget of a warp (cfg_.max_steps, or VGPU_MAX_STEPS)
   bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
-  // The pre-decoded tier (src/sass/tier.hpp): VGPU_TIER=1, with the fast paths and the SIMD kernels it is held to on and
+  // The pre-decoded tier (src/sass/tier.hpp): on unless VGPU_TIER=0, with the fast paths and the SIMD kernels it is held to on and
   // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
   bool tier_ = false;
   bool tier_stats_ = false;

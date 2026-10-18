@@ -58,7 +58,7 @@ struct Code {
   int sm = 0;
   const std::vector<uint8_t>* bytes = nullptr;   // the section's, in the module's cubin
   const Instr& instr(size_t i) const;
-  // The section's execution tier (VGPU_TIER=1, src/sass/tier.hpp), built the first time it is asked for; null for
+  // The section's execution tier (on unless VGPU_TIER=0, src/sass/tier.hpp), built the first time it is asked for; null for
   // a section with no code. Defined in exec.cpp.
   const tier::Program* tier_program() const;
  private:
