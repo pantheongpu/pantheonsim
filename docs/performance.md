@@ -2143,19 +2143,36 @@ What is left, by dynamic count over all three corpora (share of the 5.98 G; the 
 No texture, BRX, generic LD/ST, 32-byte access, Turing global form, FRND or MUFU.RSQ64H stands above 0.01% in these corpora (TEX/TLD are 9% of the
 `texture` bench workload only).
 
-**What was kept: a handler for MATCH.** `Form::Match` (tier.cpp, `h_match` in tier_ops.inc; `MATCH.ANY`/`.ALL`, 32 and 64 bits). The interpreter's
-code compares every lane's value with every other's through nested lambdas (about a thousand comparisons for a warp); the handler reads the lanes'
-values once and works out the lane mask of one equality class at a time, giving it to every lane of the class (`MATCH.ANY`), or compares each
-value with the first lane's (`MATCH.ALL`). The results are the interpreter's (integers, no number format: form table entry O).
+**What was kept: handlers for MATCH, IMMA and LDSM.** Each was chosen from the table above and kept because its A/B, on a program that runs it,
+shows more than 2% with p <= 0.05. Each is a `tier::Form` with a handler in tier_ops.inc (form table entry O: integers and data movement, no number
+format), the same results as the interpreter's code, and a fallback to `exec_mem` / the interpreter for anything unusual.
 
-| workload | A | B | B/A median | B/A best | p | load |
+* `Form::Match` (`MATCH.ANY` / `.ALL`, 32 and 64 bits). The interpreter's code compares every lane's value with every other's through nested
+  lambdas (about a thousand comparisons for a warp); the handler reads the lanes' values once and works out the lane mask of one equality
+  class at a time, giving it to every lane of the class (`.ANY`), or compares each value with the first lane's (`.ALL`).
+* `Form::Imma` (dense `IMMA`, 8- and 4-bit elements of both operands, s32 accumulator, plain or `.SAT`). `exec_mma` builds `std::vector<double>`
+  matrices on the heap for every call and sums in doubles and int64; the handler gathers the fragments into two int16 matrices (B kept
+  column by column), sums the products in 32-bit wrapping integers (the same bits as the interpreter's int64 sum cut to 32 bits; under `.SAT`
+  in 64 bits, clamped to the s32 range after every 128 bits of K, as the interpreter does) and writes the executing lanes. Sparse IMMA (`.SP`)
+  and the non-integer MMAs stay the interpreter's.
+* `Form::Ldsm` (`LDSM` of 16-bit elements: `.M88`, `.MT88`, x1, x2, x4). A whole warp whose rows are all inside the block's own shared memory
+  is moved straight into the registers (the window test of `h_shared`: another block's window, a row that could end past the array, and a partial
+  warp, for which the interpreter reports a missing row address, all go to `exec_mem`). The 8-bit, 4-bit and 6-bit packed forms stay the
+  interpreter's. The counters (`shared_loads`, `shared_bytes_read`) are the interpreter's.
+
+| workload (what runs the instruction) | A | B | B/A median | B/A best | p | load |
 |---|---|---|---|---|---|---|
-| HeCBench atomicAggregate (`main 1`), the same build with `VGPU_TIER_OFF=match` (A) and not (B) | 7.30 s | 5.19 s | 1.41x | 1.39x | <0.001 | 14 to 27 |
-| the same, base build `a12f8d84` (A) against this build (B) | 9.66 s | 5.26 s | 1.84x | 1.46x | <0.001 | 27 |
+| HeCBench atomicAggregate `main 1`: same build, `VGPU_TIER_OFF=match` (A) / not (B), 15 runs | 7.30 s | 5.19 s | 1.41x | 1.39x | <0.001 | 14 to 27 |
+| the same, base build `a12f8d84` (A) against this build (B), 15 runs | 9.66 s | 5.26 s | 1.84x | 1.46x | <0.001 | 27 |
+| CUDA Sample immaTensorCoreGemm: same build, `VGPU_TIER_OFF=imma` (A) / not (B), 5 runs | 57.2 s | 20.6 s | 2.78x | 2.83x | 0.009 | 7 |
+| immaTensorCoreGemm: `VGPU_TIER_OFF=ldsm` (A) / not (B), IMMA on in both, 5 runs | 20.44 s | 17.52 s | 1.17x | 1.17x | 0.009 | 10 |
+| CUDA Sample cudaTensorCoreGemm (HMMA): `VGPU_TIER_OFF=ldsm` (A) / not (B), 5 runs | 39.28 s | 35.35 s | 1.11x | 1.12x | 0.009 | 14 |
 
-(User plus system CPU seconds of the process, 15 alternating runs each, CPUs 16-19, `VGPU_THREADS=1`.) The base build's median is high on a
-loaded machine; the best-of-15 ratios are the honest ones, and the same-build one removes any layout effect. MATCH is 0.4% of that program's
-warp instructions and about a third of its time.
+The three forms are 66.0 M of the corpora's 5.98 G warp instructions (1.1 points): the tier's share goes from 97.3% to about 98.4%.
+
+(User plus system CPU seconds of the process, alternating runs, CPUs 16-19, `VGPU_THREADS=1`; 5 runs is the least that can reach p 0.009.) The
+same-build rows remove any layout effect of the changed binary. MATCH is 3.8% of atomicAggregate's warp instructions and 29% of its time;
+IMMA is 62% of immaTensorCoreGemm's warp instructions and about two thirds of its time.
 
 **Tried and dropped, by the rule (an A/B that does not show more than 2% with p <= 0.05 on a workload that runs the instruction):**
 
@@ -2174,16 +2191,31 @@ warp instructions and about a third of its time.
   the upper bound of what a handler for them can save when it only resolves operands once (the interpreter reads a register operand inline,
   so there is little to resolve); no handler was written for them. MATCH was the one whose interpreter code does more work than its
   result needs.
-* *IMMA and LDSM* (the largest left by count, all in one Sample): not touched here; the tensor-core kernels are another piece's.
-* *Whole-suite A/B of the kept change.* `bench.sh --ab` base `a12f8d84` against this build, all SASS workloads, `--size full`, 9 runs, CPUs 16-19,
-  load 20: counters identical in all; no workload slower by more than the spread; `mem` 1.035x and `launch` 1.028x came out "faster"
-  although neither runs a MATCH (layout effects of the changed binary, not claimed).
+* *Whole-suite A/B of the kept changes.* `bench.sh --ab` base `a12f8d84` against this build, all SASS workloads, `--size full`, 9 runs,
+  CPUs 16-19, load 3: counters identical in all, every verdict "same" (medians 0.98x to 1.01x, `wmma` and `mma_ptx` 0.998x and 0.997x;
+  `launch` 0.970x median with p 0.008 but 0.988x best, `startup` is 2 ms of wall: code-layout noise of the kind this file documents
+  elsewhere, not claimed either way). An earlier run of the MATCH-only build at load 20 had `mem` 1.035x and `launch` 1.028x "faster", which
+  no MATCH explains.
 
-**How the kept handler is held.** `sass_tier.cu` gained `k_direct`: MATCH.ANY/.ALL/.ANY.U64 in whole and in diverged warps, blocks that are not
-whole warps (128, 48 and 33 threads), and, beside it, the instructions the interpreter keeps (global and shared atomics of every kind and width,
-RED, REDUX of every operation, the warp-aggregated increment's VOTEU/BRA.CONV, indirect and direct calls, `__syncwarp`, an IEEE division). Each
-block uses bins of its own so that four host threads give the one-thread answer. `e2e_sass_tier` (run with `VGPU_TIER=0` and `1`) holds every result
-and counter to the interpreter's, also under four threads and without the chain. `test_tier` requires MATCH to be taken in every corpus (sm_80, 86,
-89, 90, 120) and the form table lists `match:O`. Mutation checks (scratch copy of tier_ops.inc, `e2e_sass_tier` on sm_86): MATCH.ALL's predicate
-inverted, the 64-bit high word ignored, and MATCH.ALL's result written to all lanes instead of the executing ones are each caught by `sass_tier`
-(the `direct threads=` lines differ).
+**Same results with the tier off and on.** `tools/verify/run_corpora.sh` with `A` = the base build, `B` = this build, `T0` = this build with
+`VGPU_TIER=0`: HeCBench's 34 programs and Rodinia's 12 (each run three times, the 7 HeCBench programs that exceed the 120 s timeout in the
+base build are not comparable and were left out), and the CUDA Samples that run the new forms or the instructions around them (immaTensorCoreGemm,
+cudaTensorCoreGemm, bf16TensorCoreGemm, warpAggregatedAtomicsCG, reductionMultiBlockCG, mergeSort, cdpAdvancedQuicksort, shfl_scan,
+binaryPartitionCG, simpleAtomicIntrinsics, with a 500 s timeout). Exit status, stdout, stderr, output files and per-launch counters are
+identical between B and T0 and between B and A except: `rodinia/backprop`'s `output.dat` (three different hashes in A, B and T0: the program is
+not deterministic), `samples/UnifiedMemoryStreams` (host threads print in their own order), `atomicCost-cuda` (a stack address in an error
+message), `samples/immaTensorCoreGemm` (a `TOPS:` rate line, 0.01 against 0.00 because B is 3x faster), and a `black-scholes-cuda` run of B
+that the shared machine's memory ended with out-of-memory, which ran identically (B = T0 = A) when repeated.
+
+**How the kept handlers are held.** `sass_tier.cu` gained `k_direct` (MATCH.ANY/.ALL/.ANY.U64 in whole and in diverged warps, blocks that are not
+whole warps (128, 48 and 33 threads), and, beside it, the instructions the interpreter keeps: global and shared atomics of every kind and width,
+RED, REDUX of every operation, the warp-aggregated increment's VOTEU/BRA.CONV, indirect and direct calls, `__syncwarp`, an IEEE division; each
+block uses bins of its own so that four host threads give the one-thread answer), `k_imma` (mma.sync s8/u8/s4/u4 in m8n8k16, m16n8k16, m16n8k32,
+m16n8k64, plain and `.satfinite`, on registers of random bits) and `k_ldsm` (ldmatrix x1, x2, x4, plain and `.trans`, rows shared between lanes).
+`e2e_sass_tier` (every program run with `VGPU_TIER=0` and `1`) holds every result and counter to the interpreter's, also under four threads and
+without the chain. `test_tier` requires MATCH to be taken in every corpus (sm_80, 86, 89, 90, 120), checks the operand rows and register windows
+of IMMA and LDSM over every instruction of the disassembler corpora, and lists `match:O ldsm:O imma:O` in the form table. Mutation checks (a
+scratch copy of tier_ops.inc, `e2e_sass_tier` on sm_86, each one caught by `sass_tier`): MATCH.ALL's predicate inverted, MATCH's 64-bit high word
+ignored, MATCH.ALL's result written to all lanes; IMMA's A and B signedness exchanged, IMMA.SAT's clamp removed, the clamp interval doubled,
+the accumulator dropped under `.SAT`; LDSM's transposed column index changed, `shared_loads` counted 31 for 32 lanes, the two halves of a
+transposed word exchanged.
