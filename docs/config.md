@@ -115,7 +115,7 @@ story of each one.
 
 | Key | Accepts | Sets | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `threads` | whole number, 1 to 65536 | `VGPU_THREADS` | one per core | Host threads that run blocks. |
+| `threads` | whole number, 1 to 65536 | `VGPU_THREADS` | one per core (half the cores under `make run` and `./run`) | Host threads that run blocks. |
 | `max_steps` | whole number, 0 or more | `VGPU_MAX_STEPS` | built in | The per-thread instruction budget against a kernel that never ends. `0` removes it. |
 | `sass` | `auto`, `off` or `only` | `VGPU_SASS` | `auto` | The engine for NVIDIA kernels. `auto` runs SASS when the binary carries it and PTX otherwise, `off` forces PTX, `only` insists on SASS and does not fall back. |
 | `simd` | `auto`, `base`, `avx2` or `off` | `VGPU_SIMD` | `auto` | Caps the vector instruction set the engines use; `off` uses scalar code. For ruling them out when a result looks wrong. |
