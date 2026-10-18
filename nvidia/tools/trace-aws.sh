@@ -76,6 +76,7 @@ ami=$(aws ec2 describe-images --region "$region" --owners amazon \
       --filters "Name=name,Values=$ami_name" "Name=architecture,Values=${arch:-x86_64}" \
                 "Name=state,Values=available" \
       --query "reverse(sort_by(Images,&CreationDate))[:1].ImageId" --output text 2>/dev/null)
+ami="${TRACE_AMI:-$ami}"   # an older image for parts the current driver dropped (Volta)
 [[ -z "$ami" || "$ami" == "None" ]] && { echo "[$type_name] no Deep Learning AMI for $arch"; exit 1; }
 # Security groups are per region, so a name that exists in one is absent in the
 # next. Make a temporary one where it is missing and take it away again, rather
