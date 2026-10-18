@@ -2172,19 +2172,20 @@ alternating runs, load 25-28, output hash identical): SASS 0.344 s -> 0.051 s (6
   power-of-two neighbourhood, f16 grid ties and random sums for every frame.
 * `tests/unit/test_mma_fast.cpp`: PTX `mma.sync` of every dense form with `VGPU_FASTPATH=1` and `=0` on sm_86, sm_80 and sm_90 profiles, half the
   lanes of a warp predicated off, 2.9 million words compared.
-* Mutation checks (the test must fail), run by editing a copy of the header or `interpreter.cpp`: 29 mutants of the kernel (sentinel too small, the
+* Mutation checks (the test must fail), run by editing a copy of the header or `interpreter.cpp`: 33 mutants of the kernel (sentinel too small, the
   accumulator's frame position off by one, the `>> 4` bias, a dropped sign, `g` off by one, the bit-length mask, the remainder rows, the NaN/infinity masks
   of rows, columns and accumulator, the out-of-range redo, truncation replaced by rounding, the tie rules and overflow bound of the f16 rounding, the
-  sign of a zero) and 8 of the PTX route (no sm_86 sum, accumulator type, C and D register order, f16/bf16 kind): all killed. Survivors: a low-bit
-  mask of 63 instead of 127 (provably the same: |S| < 2^30.2, so the top 24 bits start at bit 6), `K` cut to 8 and a bf16/tf32 kind swap in the PTX route
-  (both only make it decline, arity mismatch, and the general path answers), and a wider "in range" test in the f16 sum (the shift it guards is
-  never past -10 for a finite sum).
+  sign of a zero) and 7 of the PTX route (no sm_86 sum, accumulator type, C and D register order, f16/bf16 kind, a wrong K, a bf16/tf32 kind swap). 35 of 40
+  are killed. The five survivors are all equivalent mutants: a low-bit mask of 63 instead of 127 in the sum's bit length (|S| < 2^30.2, so the
+  top 24 bits start at or above bit 6), a wider "in range" test in the f16 sum (the shift it guards is never past -10 for a finite sum), and the
+  PTX route with K cut to 8 or the bf16 and tf32 kinds swapped, which only make it decline (the fragment arity no longer matches) so the
+  general path answers.
 
 ### Tests run
 
 `ctest -j4` on the whole tree (629 tests): 97% passed. The 17 failures are not this change: 11 `amd_*` (no ROCm on server2), two lints that call
 `git ls-files` in the rsync'd copy, `e2e_lockstep_blocks` (timed-out waits under the box's load; the base build fails the same way, run side by
-side), and three nvcc CUTLASS compiles (`e2e_cutlass_hopper/gemm/sm100`) that the kernel's OOM killer ended while Postgres held 21 GB. They need a
+side), and three nvcc CUTLASS compiles (`e2e_cutlass_hopper/gemm/sm100`) that were `Killed` mid-compile while Postgres held 21 GB (re-run alone: killed again). They need a
 quiet machine or CI. Passed, among others: `test_tc_ampere`, `test_tc_ampere_fast`, `test_mma_fast`, `test_simd`, `test_fastpath`, `test_exec3`,
 `e2e_mma_forms`, `e2e_mma_layout`, `e2e_wmma_types`, `e2e_wmma_gemm`, `e2e_float_half_forms`, `e2e_simd_lane_forms`, `e2e_sass_tier`.
 
