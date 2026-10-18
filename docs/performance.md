@@ -2093,3 +2093,22 @@ except where the table above says so. Every change needs the same-bits test and 
 * Other GPU profiles / architectures (the program is compiled for sm_86; a Hopper
   profile runs its PTX, not its SASS). The AMD engine has its own section, "The AMD engine".
 * The pantheon soak workloads and the PyTorch/cuBLAS paths.
+
+## Tier 1 together (branch `speedup`: tier on by default, PTX atomics and texel reads, AMD baseline)
+
+Measured on server2 (Ryzen 9 9950X, 32 logical CPUs, load 1.4 to 2.8 during the runs, CPUs 24-27, one host thread, `nvidia/rtx3060`,
+CUDA 13.0.88, Release), `bench.sh --ab` base (`8f9eb524`) against the merged tree, 9 runs (SASS) and 11 runs (PTX), alternating. Counters
+are identical in every row.
+
+SASS engine (the default), B/A of the median, all p < 0.001 unless noted:
+int_alu 2.75x, f32_fma 2.30x, f64_fma 1.51x, f64_subnormal 1.45x, wmma 1.09x, mma_ptx 1.10x, mem 1.41x, shared 1.39x, atomics 1.28x,
+texture 1.12x, local 1.92x, divergent 1.94x, warp 3.38x, launch 1.21x; api 0.99x (p 0.014, under 2%: same) and startup 1.01x (same).
+
+PTX engine (VGPU_SASS=0 and PTX-only modules): atomics 1.38x, texture 1.06x, mem 1.01x (same), shared 0.99x (same), **local 0.93x
+(slower, p < 0.001)**. The PTX `local` regression comes with the memory-lookup change (`rmw_scalar`, `load_fields`); the branch that made
+it measured 3% on a loaded machine and attributed it to code layout, but on a quiet one it is 7%. It is kept because the SASS engine is the
+default on every NVIDIA GPU and PTX atomics gain 38%; a later change should look at the PTX local-memory path.
+
+Dropped after measurement: the two-entry code hint and the bank-pass rewrite (see "Not done, and negative results"). On the AMD side the
+harness (tools/bench-amd) counts a Radeon card's instructions with SQ_WAVE32_INSTS + SQ_WAVE64_INSTS, the counters a simulated RX 6800
+offers.
