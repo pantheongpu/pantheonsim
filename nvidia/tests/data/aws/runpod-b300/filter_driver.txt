@@ -1,0 +1,21 @@
+cuptiActivityEnableDriverApi(0, 1) -> CUPTI_SUCCESS
+cuptiActivityEnableDriverApi(99999, 1) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuMemAlloc_v2, 1) -> CUPTI_SUCCESS
+# only cuMemAlloc
+  cuMemAlloc_v2
+cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuMemFree_v2, 1) -> CUPTI_SUCCESS
+# and cuMemFree
+  cuMemAlloc_v2
+  cuMemFree_v2
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER) -> CUPTI_SUCCESS
+cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuMemsetD8_v2, 0) -> CUPTI_SUCCESS
+# the kind on, cuMemsetD8 off
+  cuMemAlloc_v2
+  cuMemFree_v2
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER) -> CUPTI_SUCCESS
+# the kind on again
+  cuMemAlloc_v2
+  cuMemsetD8_v2
+  cuMemFree_v2
+cuptiActivityDisable(CUPTI_ACTIVITY_KIND_DRIVER) -> CUPTI_SUCCESS
+# end

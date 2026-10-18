@@ -63,6 +63,20 @@
 | g6e.2xlarge | l40s | params | 251 | 8 | differs |
 | g6e.2xlarge | l40s | resource | 120 | 43 | differs |
 | g6e.2xlarge | l40s | trace | 99 | 0 | identical |
-| g6e.2xlarge | l40s | trace_driver | 225 | 354 | differs (collector bug, see README) |
+| g6e.2xlarge | l40s | trace_driver | 225 | 0 | identical |
 | g6e.2xlarge | l40s | um | 24 | 2 | differs |
-| g7.2xlarge | (none) | all | - | - | no simulator profile for this card |
+| g7.2xlarge | rtx-pro-4500 | buffers | 16 | 0 | identical |
+| g7.2xlarge | rtx-pro-4500 | driver_params | 536 | 4 | differs |
+| g7.2xlarge | rtx-pro-4500 | extcorr | 19 | 0 | identical |
+| g7.2xlarge | rtx-pro-4500 | filter | 37 | 2 | differs |
+| g7.2xlarge | rtx-pro-4500 | filter_driver | 20 | 1 | differs |
+| g7.2xlarge | rtx-pro-4500 | graph | 198 | 0 | identical |
+| g7.2xlarge | rtx-pro-4500 | memory | 86 | 12 | differs |
+| g7.2xlarge | rtx-pro-4500 | nsys | 12 | 0 | identical |
+| g7.2xlarge | rtx-pro-4500 | nvtx | 54 | 0 | identical |
+| g7.2xlarge | rtx-pro-4500 | overhead | 5 | 0 | identical |
+| g7.2xlarge | rtx-pro-4500 | params | 251 | 8 | differs |
+| g7.2xlarge | rtx-pro-4500 | resource | 120 | 43 | differs |
+| g7.2xlarge | rtx-pro-4500 | trace | 99 | 0 | identical |
+| g7.2xlarge | rtx-pro-4500 | trace_driver | 225 | 0 | identical |
+| g7.2xlarge | rtx-pro-4500 | um | 24 | 2 | differs |

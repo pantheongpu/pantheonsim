@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA H200, 9.0, 143771 MiB, 580.159.04, GPU-a98e0633-be78-867f-8301-29dc19eb2d2f
+Cuda compilation tools, release 13.0, V13.0.88
+Build cuda_13.0.r13.0/compiler.36424714_0
+ngpu=1 arch=sm_90 libs=/usr/local/cuda-13.0/lib64 inc=/usr/local/cuda-13.0/include

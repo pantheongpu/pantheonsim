@@ -12,10 +12,13 @@ set -uo pipefail
 dir="$(cd "${1:?usage: trace-compare.sh <collected dir> [build dir]}" && pwd)"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 shim="${2:-$root/build}/shim"
-# Instance type -> simulator profile. Types without a profile are listed, not guessed.
+# Instance type (or provider directory) -> simulator profile. Types without a profile are listed, not guessed.
 profile_for() {
   case "$1" in
     gpu_1x_a10) echo a10 ;;  gpu_1x_a100_sxm4) echo a100-sxm4-40gb ;;  gpu_1x_h100_pcie) echo h100-pcie ;;
+    runpod-a40) echo a40 ;;  runpod-a100pcie) echo a100-80gb-pcie ;;  runpod-a100sxm) echo a100 ;;
+    runpod-h100sxm) echo h100 ;;  runpod-h100nvl) echo h100-nvl ;;  runpod-h200sxm) echo h200 ;;
+    runpod-rtxpro6000) echo rtx-pro-6000-server ;;  runpod-b300) echo b300 ;;  runpod-l40) echo l40 ;;
     rtx4090) echo rtx4090 ;;  rtx5090) echo rtx5090 ;;  rtx4080) echo rtx4080 ;;
     g4dn.*) echo t4 ;;     g5.*) echo a10g ;;  g6.*) echo l4 ;;     g6e.*) echo l40s ;;
     g7.*) echo rtx-pro-4500 ;;  g7e.*) echo rtx-pro-6000 ;;  p5.*|p5e.*|p5en.*) echo h100 ;;  p4d.*) echo a100-sxm4-40gb ;;

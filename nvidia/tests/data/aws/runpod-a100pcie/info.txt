@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA A100 80GB PCIe, 8.0, 81920 MiB, 570.211.01, GPU-39bcf1b0-5f36-577e-2e52-2b71c75367a9
+Cuda compilation tools, release 13.0, V13.0.88
+Build cuda_13.0.r13.0/compiler.36424714_0
+ngpu=1 arch=sm_80 libs=/usr/local/cuda-13.0/lib64 inc=/usr/local/cuda-13.0/include
