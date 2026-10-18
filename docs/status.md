@@ -9,7 +9,7 @@ Working today, all CPU-only:
 
 | Area | State |
 | --- | --- |
-| Device profiles | Twelve NVIDIA profiles verified against physical cards across six architectures — Turing, Ampere sm_80/sm_86, Ada, Hopper, Grace-Hopper — each matching its device on 512 conformance values. `h200` and `b200` are not yet characterized. Fifteen more NVIDIA profiles (H200, B200, B300, GB200, Rubin, Jetson Thor, RTX 5090, RTX PRO 6000, GB10 in the DGX Spark, RTX 4090, L40, RTX 3090, A40, A30, RTX 2080 Ti) are built from public documents only and marked `verified: false`: nothing in them was measured, and Rubin and Thor carry placeholder PCI ids because NVIDIA has published none. [nvidia/docs/profiles.md](../nvidia/docs/profiles.md) lists them. AMD: MI325X is read from a physical card; MI300X and MI350X are placeholders. Each profile's header says where its values came from |
+| Device profiles | 47 profiles (`vgpu list-gpus`): 37 NVIDIA and 10 AMD. 13 NVIDIA profiles are read from physical cards (`verified: true`) across Turing, Ampere, Ada, Hopper, Grace Hopper and Blackwell, each matching its device on 512 conformance values; the other 24 (H200, B200, B300, GB200, Rubin, Jetson Thor, RTX 5090, RTX 4090, RTX 3090 and more) are built from public documents only and marked `verified: false`: nothing in them was measured, and Rubin and Thor carry placeholder PCI ids because NVIDIA has published none. [nvidia/docs/profiles.md](../nvidia/docs/profiles.md) lists both groups. AMD: MI325X, RX 6800 and RX 6700 XT are read from physical cards; the other seven (MI250X, MI300X, MI350X, MI455X, RX 6900 XT, RX 7900 XTX, RX 9070 XT) are placeholders. Each profile's header says where its values came from |
 | `vgpu` CLI | `list-gpus`, `info --gpu <id> [--json]`, `demo vectoradd` |
 | Virtual VRAM | sparse/lazy backing — a virtual H200 claims 141 GB on a 16 GB host, past `VGPU_MEMORY_RAM_MB` it spills to disk, and a host-memory guard turns "the host is out of RAM" into a device out-of-memory error instead of an OOM kill; OOB / use-after-free / double-free / misalignment diagnostics |
 | PTX | lexer/parser for a growing subset (see [ARCHITECTURE.md](../ARCHITECTURE.md)); precise `unsupported` errors for the rest |
@@ -71,8 +71,8 @@ The full list is in [TODO.md](../TODO.md).
 Done: shared memory, warp shuffles and the PTX and SASS coverage listed in
 TODO.md; `vgpu run` and `vgpu test --matrix`; random and adversarial warp
 scheduling with race detection; the AMD frontend (HIP/ROCm, CDNA2 to CDNA4 and
-RDNA2 to RDNA4); hardware characterization for 12 NVIDIA profiles and one AMD
-profile. Still open:
+RDNA2 to RDNA4); hardware characterization for 13 NVIDIA profiles and 3 AMD
+profiles. Still open:
 
 1. Static-cudart hosting (driver export tables) → no `-cudart shared` rebuild
    (investigated and blocked, see [TODO.md](../TODO.md))

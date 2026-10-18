@@ -84,6 +84,11 @@ if ! shown=$("$vgpu" --config "$config" config show 2>&1); then
   die "$config is not a valid settings file (the message above says which line). docs/config.md lists the keys."
 fi
 
+# Half the CPUs for the simulator, unless VGPU_THREADS or the file's threads: say otherwise.
+if [[ -x $here/scripts/half-threads.sh ]]; then
+  t=$("$here/scripts/half-threads.sh" "$config") && [[ -n $t ]] && export VGPU_THREADS=$t
+fi
+
 # A value from `config show`: the text in the value column of the row for a key.
 setting() {
   awk -v k="$1" '
