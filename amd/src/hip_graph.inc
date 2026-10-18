@@ -1213,7 +1213,7 @@ extern "C" {
 // ---- Graphs and their topology --------------------------------------------------------------
 
 hipError_t hipGraphCreate(void** graph, unsigned int flags) {
-  const ApiCall api("hipGraphCreate");
+  const ApiCall api("hipGraphCreate", graph, flags);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!graph || flags) return record(s, hipErrorInvalidValue);
@@ -1226,7 +1226,7 @@ hipError_t hipGraphCreate(void** graph, unsigned int flags) {
 
 // A graph embedded in a child-graph node is the node's, not the program's.
 hipError_t hipGraphDestroy(void* graph) {
-  const ApiCall api("hipGraphDestroy");
+  const ApiCall api("hipGraphDestroy", graph);
   State& s = state();
   Destructors d;
   {
@@ -1242,7 +1242,7 @@ hipError_t hipGraphDestroy(void* graph) {
 }
 
 hipError_t hipGraphAddEmptyNode(void** node, void* graph, const void* deps, size_t n) {
-  const ApiCall api("hipGraphAddEmptyNode");
+  const ApiCall api("hipGraphAddEmptyNode", node, graph, deps, n);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = nullptr;
@@ -1255,7 +1255,7 @@ hipError_t hipGraphAddEmptyNode(void** node, void* graph, const void* deps, size
 // Edges: each a pair of distinct nodes of the graph, not already joined. A
 // cycle is allowed here, and refused when the graph is instantiated.
 hipError_t hipGraphAddDependencies(void* graph, const void* from, const void* to, size_t n) {
-  const ApiCall api("hipGraphAddDependencies");
+  const ApiCall api("hipGraphAddDependencies", graph, from, to, n);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = find_graph(graph);
@@ -1280,7 +1280,7 @@ hipError_t hipGraphAddDependencies(void* graph, const void* from, const void* to
 }
 
 hipError_t hipGraphRemoveDependencies(void* graph, const void* from, const void* to, size_t n) {
-  const ApiCall api("hipGraphRemoveDependencies");
+  const ApiCall api("hipGraphRemoveDependencies", graph, from, to, n);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = find_graph(graph);
@@ -1330,7 +1330,7 @@ std::vector<void*> handles(const std::vector<GNode*>& nodes) {
 extern "C" {
 
 hipError_t hipGraphGetNodes(void* graph, void** nodes, size_t* count) {
-  const ApiCall api("hipGraphGetNodes");
+  const ApiCall api("hipGraphGetNodes", graph, nodes, count);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = find_graph(graph);
@@ -1340,7 +1340,7 @@ hipError_t hipGraphGetNodes(void* graph, void** nodes, size_t* count) {
   return record(s, list_out(all, nodes, count));
 }
 hipError_t hipGraphGetRootNodes(void* graph, void** nodes, size_t* count) {
-  const ApiCall api("hipGraphGetRootNodes");
+  const ApiCall api("hipGraphGetRootNodes", graph, nodes, count);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = find_graph(graph);
@@ -1351,7 +1351,7 @@ hipError_t hipGraphGetRootNodes(void* graph, void** nodes, size_t* count) {
   return record(s, list_out(all, nodes, count));
 }
 hipError_t hipGraphGetEdges(void* graph, void** from, void** to, size_t* count) {
-  const ApiCall api("hipGraphGetEdges");
+  const ApiCall api("hipGraphGetEdges", graph, from, to, count);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = find_graph(graph);
@@ -1370,7 +1370,7 @@ hipError_t hipGraphGetEdges(void* graph, void** from, void** to, size_t* count) 
   return record(s, hipSuccess);
 }
 hipError_t hipGraphNodeGetDependencies(void* node, void** deps, size_t* count) {
-  const ApiCall api("hipGraphNodeGetDependencies");
+  const ApiCall api("hipGraphNodeGetDependencies", node, deps, count);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = find_node(node);
@@ -1378,7 +1378,7 @@ hipError_t hipGraphNodeGetDependencies(void* node, void** deps, size_t* count) {
   return record(s, list_out(handles(n->in), deps, count));
 }
 hipError_t hipGraphNodeGetDependentNodes(void* node, void** deps, size_t* count) {
-  const ApiCall api("hipGraphNodeGetDependentNodes");
+  const ApiCall api("hipGraphNodeGetDependentNodes", node, deps, count);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = find_node(node);
@@ -1386,7 +1386,7 @@ hipError_t hipGraphNodeGetDependentNodes(void* node, void** deps, size_t* count)
   return record(s, list_out(handles(n->out), deps, count));
 }
 hipError_t hipGraphNodeGetType(void* node, int* type) {
-  const ApiCall api("hipGraphNodeGetType");
+  const ApiCall api("hipGraphNodeGetType", node, type);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = find_node(node);
@@ -1398,7 +1398,7 @@ hipError_t hipGraphNodeGetType(void* node, int* type) {
 // A node goes with its edges; the nodes on either side are not joined up.
 // An allocation node stays: the memory it stands for is already out there.
 hipError_t hipGraphDestroyNode(void* node) {
-  const ApiCall api("hipGraphDestroyNode");
+  const ApiCall api("hipGraphDestroyNode", node);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = find_node(node);
@@ -1423,7 +1423,7 @@ hipError_t hipGraphDestroyNode(void* node) {
 // A copy that owes the original nothing, with references of its own to the
 // user objects it holds. A graph with memory nodes cannot be copied.
 hipError_t hipGraphClone(void** out, void* graph) {
-  const ApiCall api("hipGraphClone");
+  const ApiCall api("hipGraphClone", out, graph);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = find_graph(graph);
@@ -1438,7 +1438,7 @@ hipError_t hipGraphClone(void** out, void* graph) {
 }
 // The node of a copy that a node of the graph it was copied from became.
 hipError_t hipGraphNodeFindInClone(void** out, void* original, void* clone) {
-  const ApiCall api("hipGraphNodeFindInClone");
+  const ApiCall api("hipGraphNodeFindInClone", out, original, clone);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = find_graph(clone);
@@ -1454,7 +1454,7 @@ hipError_t hipGraphNodeFindInClone(void** out, void* original, void* clone) {
 // A child-graph node embeds a copy of the graph as it is now: the graph
 // itself stays the program's (it may even be the graph the node joins).
 hipError_t hipGraphAddChildGraphNode(void** node, void* graph, const void* deps, size_t n, void* child) {
-  const ApiCall api("hipGraphAddChildGraphNode");
+  const ApiCall api("hipGraphAddChildGraphNode", node, graph, deps, n, child);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = nullptr;
@@ -1472,7 +1472,7 @@ hipError_t hipGraphAddChildGraphNode(void** node, void* graph, const void* deps,
 }
 // The node's own graph, which edits reach the node through.
 hipError_t hipGraphChildGraphNodeGetGraph(void* node, void** graph) {
-  const ApiCall api("hipGraphChildGraphNodeGetGraph");
+  const ApiCall api("hipGraphChildGraphNodeGetGraph", node, graph);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = find_node(node);
@@ -1485,7 +1485,7 @@ hipError_t hipGraphChildGraphNodeGetGraph(void* node, void** graph) {
 
 hipError_t hipGraphAddKernelNode(void** node, void* graph, const void* deps, size_t n,
                                  const vgpu::amd::abi::KernelNodeParams* params) {
-  const ApiCall api("hipGraphAddKernelNode");
+  const ApiCall api("hipGraphAddKernelNode", node, graph, deps, n, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = nullptr;
@@ -1498,7 +1498,7 @@ hipError_t hipGraphAddKernelNode(void** node, void* graph, const void* deps, siz
   return record(s, hipSuccess);
 }
 hipError_t hipGraphKernelNodeGetParams(void* node, vgpu::amd::abi::KernelNodeParams* params) {
-  const ApiCall api("hipGraphKernelNodeGetParams");
+  const ApiCall api("hipGraphKernelNodeGetParams", node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = find_node(node);
@@ -1507,7 +1507,7 @@ hipError_t hipGraphKernelNodeGetParams(void* node, vgpu::amd::abi::KernelNodePar
   return record(s, hipSuccess);
 }
 hipError_t hipGraphKernelNodeSetParams(void* node, const vgpu::amd::abi::KernelNodeParams* params) {
-  const ApiCall api("hipGraphKernelNodeSetParams");
+  const ApiCall api("hipGraphKernelNodeSetParams", node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = find_node(node);
@@ -1519,7 +1519,7 @@ hipError_t hipGraphKernelNodeSetParams(void* node, const vgpu::amd::abi::KernelN
 // a fraction, its size at most the device's largest, and what misses cannot
 // persist.
 hipError_t hipGraphKernelNodeSetAttribute(void* node, int attr, const vgpu::amd::abi::LaunchAttributeValue* value) {
-  const ApiCall api("hipGraphKernelNodeSetAttribute");
+  const ApiCall api("hipGraphKernelNodeSetAttribute", node, attr, value);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = find_node(node);
@@ -1534,7 +1534,7 @@ hipError_t hipGraphKernelNodeSetAttribute(void* node, int attr, const vgpu::amd:
   return record(s, hipSuccess);
 }
 hipError_t hipGraphKernelNodeGetAttribute(void* node, int attr, vgpu::amd::abi::LaunchAttributeValue* value) {
-  const ApiCall api("hipGraphKernelNodeGetAttribute");
+  const ApiCall api("hipGraphKernelNodeGetAttribute", node, attr, value);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = find_node(node);
@@ -1545,7 +1545,7 @@ hipError_t hipGraphKernelNodeGetAttribute(void* node, int attr, vgpu::amd::abi::
   return record(s, hipSuccess);
 }
 hipError_t hipGraphKernelNodeCopyAttributes(void* src, void* dst) {
-  const ApiCall api("hipGraphKernelNodeCopyAttributes");
+  const ApiCall api("hipGraphKernelNodeCopyAttributes", src, dst);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* a = find_node(src);
@@ -1603,7 +1603,7 @@ extern "C" {
 
 hipError_t hipGraphAddMemcpyNode(void** node, void* graph, const void* deps, size_t n,
                                  const vgpu::amd::abi::Memcpy3DParms* params) {
-  const ApiCall api("hipGraphAddMemcpyNode");
+  const ApiCall api("hipGraphAddMemcpyNode", node, graph, deps, n, params);
   if (const hipError_t e = add_precheck(node, graph, deps, n); e != hipSuccess) return record(state(), e);
   auto nd = std::make_unique<GNode>();
   nd->type = vgpu::amd::abi::kNodeMemcpy;
@@ -1612,7 +1612,7 @@ hipError_t hipGraphAddMemcpyNode(void** node, void* graph, const void* deps, siz
 }
 hipError_t hipGraphAddMemcpyNode1D(void** node, void* graph, const void* deps, size_t n, void* dst, const void* src,
                                    size_t count, hipMemcpyKind kind) {
-  const ApiCall api("hipGraphAddMemcpyNode1D");
+  const ApiCall api("hipGraphAddMemcpyNode1D", node, graph, deps, n, dst, src, count, kind);
   if (const hipError_t e = add_precheck(node, graph, deps, n); e != hipSuccess) return record(state(), e);
   auto nd = std::make_unique<GNode>();
   nd->type = vgpu::amd::abi::kNodeMemcpy;
@@ -1621,7 +1621,7 @@ hipError_t hipGraphAddMemcpyNode1D(void** node, void* graph, const void* deps, s
 }
 hipError_t hipGraphAddMemcpyNodeFromSymbol(void** node, void* graph, const void* deps, size_t n, void* dst,
                                            const void* symbol, size_t count, size_t offset, hipMemcpyKind kind) {
-  const ApiCall api("hipGraphAddMemcpyNodeFromSymbol");
+  const ApiCall api("hipGraphAddMemcpyNodeFromSymbol", node, graph, deps, n, dst, symbol, count, offset, kind);
   if (const hipError_t e = add_precheck(node, graph, deps, n); e != hipSuccess) return record(state(), e);
   auto nd = std::make_unique<GNode>();
   nd->type = vgpu::amd::abi::kNodeMemcpy;
@@ -1631,7 +1631,7 @@ hipError_t hipGraphAddMemcpyNodeFromSymbol(void** node, void* graph, const void*
 }
 hipError_t hipGraphAddMemcpyNodeToSymbol(void** node, void* graph, const void* deps, size_t n, const void* symbol,
                                          const void* src, size_t count, size_t offset, hipMemcpyKind kind) {
-  const ApiCall api("hipGraphAddMemcpyNodeToSymbol");
+  const ApiCall api("hipGraphAddMemcpyNodeToSymbol", node, graph, deps, n, symbol, src, count, offset, kind);
   if (const hipError_t e = add_precheck(node, graph, deps, n); e != hipSuccess) return record(state(), e);
   auto nd = std::make_unique<GNode>();
   nd->type = vgpu::amd::abi::kNodeMemcpy;
@@ -1641,7 +1641,7 @@ hipError_t hipGraphAddMemcpyNodeToSymbol(void** node, void* graph, const void* d
   return record(state(), add_made(node, graph, deps, n, std::move(nd)));
 }
 hipError_t hipGraphMemcpyNodeGetParams(void* node, vgpu::amd::abi::Memcpy3DParms* params) {
-  const ApiCall api("hipGraphMemcpyNodeGetParams");
+  const ApiCall api("hipGraphMemcpyNodeGetParams", node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = typed_node(node, vgpu::amd::abi::kNodeMemcpy);
@@ -1650,7 +1650,7 @@ hipError_t hipGraphMemcpyNodeGetParams(void* node, vgpu::amd::abi::Memcpy3DParms
   return record(s, hipSuccess);
 }
 hipError_t hipGraphMemcpyNodeSetParams(void* node, const vgpu::amd::abi::Memcpy3DParms* params) {
-  const ApiCall api("hipGraphMemcpyNodeSetParams");
+  const ApiCall api("hipGraphMemcpyNodeSetParams", node, params);
   if (!copy_node_live(node)) return record(state(), hipErrorInvalidValue);
   CopyData c;
   if (const hipError_t e = make_copy_3d(params, &c); e != hipSuccess) return record(state(), e);
@@ -1658,7 +1658,7 @@ hipError_t hipGraphMemcpyNodeSetParams(void* node, const vgpu::amd::abi::Memcpy3
 }
 // A 1D copy node's new copy: of something, not onto itself.
 hipError_t hipGraphMemcpyNodeSetParams1D(void* node, void* dst, const void* src, size_t count, hipMemcpyKind kind) {
-  const ApiCall api("hipGraphMemcpyNodeSetParams1D");
+  const ApiCall api("hipGraphMemcpyNodeSetParams1D", node, dst, src, count, kind);
   if (!copy_node_live(node) || !count || dst == src) return record(state(), hipErrorInvalidValue);
   CopyData c;
   if (const hipError_t e = make_copy_1d(dst, src, count, kind, &c); e != hipSuccess) return record(state(), e);
@@ -1666,7 +1666,7 @@ hipError_t hipGraphMemcpyNodeSetParams1D(void* node, void* dst, const void* src,
 }
 hipError_t hipGraphMemcpyNodeSetParamsFromSymbol(void* node, void* dst, const void* symbol, size_t count,
                                                  size_t offset, hipMemcpyKind kind) {
-  const ApiCall api("hipGraphMemcpyNodeSetParamsFromSymbol");
+  const ApiCall api("hipGraphMemcpyNodeSetParamsFromSymbol", node, dst, symbol, count, offset, kind);
   if (!copy_node_live(node)) return record(state(), hipErrorInvalidValue);
   CopyData c;
   if (const hipError_t e = make_copy_symbol(false, dst, symbol, count, offset, kind, &c); e != hipSuccess)
@@ -1675,7 +1675,7 @@ hipError_t hipGraphMemcpyNodeSetParamsFromSymbol(void* node, void* dst, const vo
 }
 hipError_t hipGraphMemcpyNodeSetParamsToSymbol(void* node, const void* symbol, const void* src, size_t count,
                                                size_t offset, hipMemcpyKind kind) {
-  const ApiCall api("hipGraphMemcpyNodeSetParamsToSymbol");
+  const ApiCall api("hipGraphMemcpyNodeSetParamsToSymbol", node, symbol, src, count, offset, kind);
   if (!copy_node_live(node)) return record(state(), hipErrorInvalidValue);
   CopyData c;
   if (const hipError_t e = make_copy_symbol(true, const_cast<void*>(src), symbol, count, offset, kind, &c);
@@ -1687,8 +1687,8 @@ hipError_t hipGraphMemcpyNodeSetParamsToSymbol(void* node, const void* symbol, c
 // The driver API's copy node, in HIP_MEMCPY3D's terms. The context is any
 // the program has; addresses are unified, so it is not needed to find them.
 hipError_t hipDrvGraphAddMemcpyNode(void** node, void* graph, const void* deps, size_t n,
-                                    const vgpu::amd::abi::Memcpy3D* params, void*) {
-  const ApiCall api("hipDrvGraphAddMemcpyNode");
+                                    const vgpu::amd::abi::Memcpy3D* params, void* hip_ctx) {
+  const ApiCall api("hipDrvGraphAddMemcpyNode", node, graph, deps, n, params, hip_ctx);
   if (const hipError_t e = add_precheck(node, graph, deps, n); e != hipSuccess) return record(state(), e);
   auto nd = std::make_unique<GNode>();
   nd->type = vgpu::amd::abi::kNodeMemcpy;
@@ -1696,7 +1696,7 @@ hipError_t hipDrvGraphAddMemcpyNode(void** node, void* graph, const void* deps, 
   return record(state(), add_made(node, graph, deps, n, std::move(nd)));
 }
 hipError_t hipDrvGraphMemcpyNodeGetParams(void* node, vgpu::amd::abi::Memcpy3D* params) {
-  const ApiCall api("hipDrvGraphMemcpyNodeGetParams");
+  const ApiCall api("hipDrvGraphMemcpyNodeGetParams", node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = typed_node(node, vgpu::amd::abi::kNodeMemcpy);
@@ -1725,7 +1725,7 @@ hipError_t hipDrvGraphMemcpyNodeGetParams(void* node, vgpu::amd::abi::Memcpy3D* 
   return record(s, hipSuccess);
 }
 hipError_t hipDrvGraphMemcpyNodeSetParams(void* node, const vgpu::amd::abi::Memcpy3D* params) {
-  const ApiCall api("hipDrvGraphMemcpyNodeSetParams");
+  const ApiCall api("hipDrvGraphMemcpyNodeSetParams", node, params);
   if (!copy_node_live(node)) return record(state(), hipErrorInvalidValue);
   CopyData c;
   if (const hipError_t e = make_copy_drv(params, &c); e != hipSuccess) return record(state(), e);
@@ -1736,7 +1736,7 @@ hipError_t hipDrvGraphMemcpyNodeSetParams(void* node, const vgpu::amd::abi::Memc
 
 hipError_t hipGraphAddMemsetNode(void** node, void* graph, const void* deps, size_t n,
                                  const vgpu::amd::abi::MemsetParams* params) {
-  const ApiCall api("hipGraphAddMemsetNode");
+  const ApiCall api("hipGraphAddMemsetNode", node, graph, deps, n, params);
   if (const hipError_t e = add_precheck(node, graph, deps, n); e != hipSuccess) return record(state(), e);
   auto nd = std::make_unique<GNode>();
   nd->type = vgpu::amd::abi::kNodeMemset;
@@ -1744,12 +1744,12 @@ hipError_t hipGraphAddMemsetNode(void** node, void* graph, const void* deps, siz
   return record(state(), add_made(node, graph, deps, n, std::move(nd)));
 }
 hipError_t hipDrvGraphAddMemsetNode(void** node, void* graph, const void* deps, size_t n,
-                                    const vgpu::amd::abi::MemsetParams* params, void*) {
-  const ApiCall api("hipDrvGraphAddMemsetNode");
+                                    const vgpu::amd::abi::MemsetParams* params, void* hip_ctx) {
+  const ApiCall api("hipDrvGraphAddMemsetNode", node, graph, deps, n, params, hip_ctx);
   return hipGraphAddMemsetNode(node, graph, deps, n, params);
 }
 hipError_t hipGraphMemsetNodeGetParams(void* node, vgpu::amd::abi::MemsetParams* params) {
-  const ApiCall api("hipGraphMemsetNodeGetParams");
+  const ApiCall api("hipGraphMemsetNodeGetParams", node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = typed_node(node, vgpu::amd::abi::kNodeMemset);
@@ -1758,7 +1758,7 @@ hipError_t hipGraphMemsetNodeGetParams(void* node, vgpu::amd::abi::MemsetParams*
   return record(s, hipSuccess);
 }
 hipError_t hipGraphMemsetNodeSetParams(void* node, const vgpu::amd::abi::MemsetParams* params) {
-  const ApiCall api("hipGraphMemsetNodeSetParams");
+  const ApiCall api("hipGraphMemsetNodeSetParams", node, params);
   {
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
@@ -1778,7 +1778,7 @@ hipError_t hipGraphMemsetNodeSetParams(void* node, const vgpu::amd::abi::MemsetP
 
 hipError_t hipGraphAddHostNode(void** node, void* graph, const void* deps, size_t n,
                                const vgpu::amd::abi::HostNodeParams* params) {
-  const ApiCall api("hipGraphAddHostNode");
+  const ApiCall api("hipGraphAddHostNode", node, graph, deps, n, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = nullptr;
@@ -1792,7 +1792,7 @@ hipError_t hipGraphAddHostNode(void** node, void* graph, const void* deps, size_
   return record(s, hipSuccess);
 }
 hipError_t hipGraphHostNodeGetParams(void* node, vgpu::amd::abi::HostNodeParams* params) {
-  const ApiCall api("hipGraphHostNodeGetParams");
+  const ApiCall api("hipGraphHostNodeGetParams", node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = typed_node(node, vgpu::amd::abi::kNodeHost);
@@ -1801,7 +1801,7 @@ hipError_t hipGraphHostNodeGetParams(void* node, vgpu::amd::abi::HostNodeParams*
   return record(s, hipSuccess);
 }
 hipError_t hipGraphHostNodeSetParams(void* node, const vgpu::amd::abi::HostNodeParams* params) {
-  const ApiCall api("hipGraphHostNodeSetParams");
+  const ApiCall api("hipGraphHostNodeSetParams", node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = typed_node(node, vgpu::amd::abi::kNodeHost);
@@ -1849,27 +1849,27 @@ hipError_t event_set(void* node, hipEvent_t event, int type) {
 extern "C" {
 
 hipError_t hipGraphAddEventRecordNode(void** node, void* graph, const void* deps, size_t n, hipEvent_t event) {
-  const ApiCall api("hipGraphAddEventRecordNode");
+  const ApiCall api("hipGraphAddEventRecordNode", node, graph, deps, n, event);
   return record(state(), add_event_node(node, graph, deps, n, event, vgpu::amd::abi::kNodeEventRecord));
 }
 hipError_t hipGraphAddEventWaitNode(void** node, void* graph, const void* deps, size_t n, hipEvent_t event) {
-  const ApiCall api("hipGraphAddEventWaitNode");
+  const ApiCall api("hipGraphAddEventWaitNode", node, graph, deps, n, event);
   return record(state(), add_event_node(node, graph, deps, n, event, vgpu::amd::abi::kNodeWaitEvent));
 }
 hipError_t hipGraphEventRecordNodeGetEvent(void* node, hipEvent_t* out) {
-  const ApiCall api("hipGraphEventRecordNodeGetEvent");
+  const ApiCall api("hipGraphEventRecordNodeGetEvent", node, out);
   return record(state(), event_get(node, out, vgpu::amd::abi::kNodeEventRecord));
 }
 hipError_t hipGraphEventRecordNodeSetEvent(void* node, hipEvent_t event) {
-  const ApiCall api("hipGraphEventRecordNodeSetEvent");
+  const ApiCall api("hipGraphEventRecordNodeSetEvent", node, event);
   return record(state(), event_set(node, event, vgpu::amd::abi::kNodeEventRecord));
 }
 hipError_t hipGraphEventWaitNodeGetEvent(void* node, hipEvent_t* out) {
-  const ApiCall api("hipGraphEventWaitNodeGetEvent");
+  const ApiCall api("hipGraphEventWaitNodeGetEvent", node, out);
   return record(state(), event_get(node, out, vgpu::amd::abi::kNodeWaitEvent));
 }
 hipError_t hipGraphEventWaitNodeSetEvent(void* node, hipEvent_t event) {
-  const ApiCall api("hipGraphEventWaitNodeSetEvent");
+  const ApiCall api("hipGraphEventWaitNodeSetEvent", node, event);
   return record(state(), event_set(node, event, vgpu::amd::abi::kNodeWaitEvent));
 }
 
@@ -1881,7 +1881,7 @@ hipError_t hipGraphEventWaitNodeSetEvent(void* node, hipEvent_t event) {
 // the graph lasts.
 hipError_t hipGraphAddMemAllocNode(void** node, void* graph, const void* deps, size_t n,
                                    vgpu::amd::abi::MemAllocNodeParams* params) {
-  const ApiCall api("hipGraphAddMemAllocNode");
+  const ApiCall api("hipGraphAddMemAllocNode", node, graph, deps, n, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = nullptr;
@@ -1902,7 +1902,7 @@ hipError_t hipGraphAddMemAllocNode(void** node, void* graph, const void* deps, s
   return record(s, hipSuccess);
 }
 hipError_t hipGraphMemAllocNodeGetParams(void* node, vgpu::amd::abi::MemAllocNodeParams* params) {
-  const ApiCall api("hipGraphMemAllocNodeGetParams");
+  const ApiCall api("hipGraphMemAllocNodeGetParams", node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = typed_node(node, vgpu::amd::abi::kNodeMemAlloc);
@@ -1913,7 +1913,7 @@ hipError_t hipGraphMemAllocNodeGetParams(void* node, vgpu::amd::abi::MemAllocNod
 // A free node for device memory -- a graph's, or any allocation's start --
 // that nothing else in any graph frees already.
 hipError_t hipGraphAddMemFreeNode(void** node, void* graph, const void* deps, size_t n, void* dptr) {
-  const ApiCall api("hipGraphAddMemFreeNode");
+  const ApiCall api("hipGraphAddMemFreeNode", node, graph, deps, n, dptr);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = nullptr;
@@ -1939,11 +1939,11 @@ hipError_t hipGraphAddMemFreeNode(void** node, void* graph, const void* deps, si
   return record(s, hipSuccess);
 }
 hipError_t hipDrvGraphAddMemFreeNode(void** node, void* graph, const void* deps, size_t n, void* dptr) {
-  const ApiCall api("hipDrvGraphAddMemFreeNode");
+  const ApiCall api("hipDrvGraphAddMemFreeNode", node, graph, deps, n, dptr);
   return hipGraphAddMemFreeNode(node, graph, deps, n, dptr);
 }
 hipError_t hipGraphMemFreeNodeGetParams(void* node, void* out) {
-  const ApiCall api("hipGraphMemFreeNodeGetParams");
+  const ApiCall api("hipGraphMemFreeNodeGetParams", node, out);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = typed_node(node, vgpu::amd::abi::kNodeMemFree);
@@ -1955,7 +1955,7 @@ hipError_t hipGraphMemFreeNodeGetParams(void* node, void* out) {
 // What graphs have allocated on a device: in use and reserved, now and at
 // most. Only the two high-water marks may be set, and only to zero.
 hipError_t hipDeviceGetGraphMemAttribute(int ordinal, int attr, void* value) {
-  const ApiCall api("hipDeviceGetGraphMemAttribute");
+  const ApiCall api("hipDeviceGetGraphMemAttribute", ordinal, attr, value);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
@@ -1966,7 +1966,7 @@ hipError_t hipDeviceGetGraphMemAttribute(int ordinal, int attr, void* value) {
   return record(s, hipSuccess);
 }
 hipError_t hipDeviceSetGraphMemAttribute(int ordinal, int attr, void* value) {
-  const ApiCall api("hipDeviceSetGraphMemAttribute");
+  const ApiCall api("hipDeviceSetGraphMemAttribute", ordinal, attr, value);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
@@ -1979,7 +1979,7 @@ hipError_t hipDeviceSetGraphMemAttribute(int ordinal, int attr, void* value) {
 }
 // What freed graph memory the device keeps goes back.
 hipError_t hipDeviceGraphMemTrim(int ordinal) {
-  const ApiCall api("hipDeviceGraphMemTrim");
+  const ApiCall api("hipDeviceGraphMemTrim", ordinal);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!valid_device(s, ordinal)) return record(s, hipErrorInvalidDevice);
@@ -1991,7 +1991,7 @@ hipError_t hipDeviceGraphMemTrim(int ordinal) {
 
 hipError_t hipGraphAddBatchMemOpNode(void** node, void* graph, const void* deps, size_t n,
                                      const vgpu::amd::abi::BatchMemOpNodeParams* params) {
-  const ApiCall api("hipGraphAddBatchMemOpNode");
+  const ApiCall api("hipGraphAddBatchMemOpNode", node, graph, deps, n, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = nullptr;
@@ -2008,7 +2008,7 @@ hipError_t hipGraphAddBatchMemOpNode(void** node, void* graph, const void* deps,
   return record(s, hipSuccess);
 }
 hipError_t hipGraphBatchMemOpNodeGetParams(void* node, vgpu::amd::abi::BatchMemOpNodeParams* params) {
-  const ApiCall api("hipGraphBatchMemOpNodeGetParams");
+  const ApiCall api("hipGraphBatchMemOpNodeGetParams", node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = typed_node(node, vgpu::amd::abi::kNodeBatchMemOp);
@@ -2018,7 +2018,7 @@ hipError_t hipGraphBatchMemOpNodeGetParams(void* node, vgpu::amd::abi::BatchMemO
   return record(s, hipSuccess);
 }
 hipError_t hipGraphBatchMemOpNodeSetParams(void* node, const vgpu::amd::abi::BatchMemOpNodeParams* params) {
-  const ApiCall api("hipGraphBatchMemOpNodeSetParams");
+  const ApiCall api("hipGraphBatchMemOpNodeSetParams", node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = typed_node(node, vgpu::amd::abi::kNodeBatchMemOp);
@@ -2037,38 +2037,38 @@ hipError_t hipGraphBatchMemOpNodeSetParams(void* node, const vgpu::amd::abi::Bat
 // refuses them), so there are none for a node to signal or wait on.
 hipError_t hipGraphAddExternalSemaphoresSignalNode(void** node, void* graph, const void* deps, size_t n,
                                                    const void* params) {
-  const ApiCall api("hipGraphAddExternalSemaphoresSignalNode");
+  const ApiCall api("hipGraphAddExternalSemaphoresSignalNode", node, graph, deps, n, params);
   if (const hipError_t e = add_precheck(node, graph, deps, n); e != hipSuccess) return record(state(), e);
   return record(state(), params ? hipErrorNotSupported : hipErrorInvalidValue);
 }
 hipError_t hipGraphAddExternalSemaphoresWaitNode(void** node, void* graph, const void* deps, size_t n,
                                                  const void* params) {
-  const ApiCall api("hipGraphAddExternalSemaphoresWaitNode");
+  const ApiCall api("hipGraphAddExternalSemaphoresWaitNode", node, graph, deps, n, params);
   if (const hipError_t e = add_precheck(node, graph, deps, n); e != hipSuccess) return record(state(), e);
   return record(state(), params ? hipErrorNotSupported : hipErrorInvalidValue);
 }
 hipError_t hipGraphExternalSemaphoresSignalNodeGetParams(void* node, void* params) {
-  const ApiCall api("hipGraphExternalSemaphoresSignalNodeGetParams");
+  const ApiCall api("hipGraphExternalSemaphoresSignalNodeGetParams", node, params);
   return record(state(), node && params ? hipErrorNotSupported : hipErrorInvalidValue);
 }
 hipError_t hipGraphExternalSemaphoresSignalNodeSetParams(void* node, const void* params) {
-  const ApiCall api("hipGraphExternalSemaphoresSignalNodeSetParams");
+  const ApiCall api("hipGraphExternalSemaphoresSignalNodeSetParams", node, params);
   return record(state(), node && params ? hipErrorNotSupported : hipErrorInvalidValue);
 }
 hipError_t hipGraphExternalSemaphoresWaitNodeGetParams(void* node, void* params) {
-  const ApiCall api("hipGraphExternalSemaphoresWaitNodeGetParams");
+  const ApiCall api("hipGraphExternalSemaphoresWaitNodeGetParams", node, params);
   return record(state(), node && params ? hipErrorNotSupported : hipErrorInvalidValue);
 }
 hipError_t hipGraphExternalSemaphoresWaitNodeSetParams(void* node, const void* params) {
-  const ApiCall api("hipGraphExternalSemaphoresWaitNodeSetParams");
+  const ApiCall api("hipGraphExternalSemaphoresWaitNodeSetParams", node, params);
   return record(state(), node && params ? hipErrorNotSupported : hipErrorInvalidValue);
 }
 hipError_t hipGraphExecExternalSemaphoresSignalNodeSetParams(void* exec, void* node, const void* params) {
-  const ApiCall api("hipGraphExecExternalSemaphoresSignalNodeSetParams");
+  const ApiCall api("hipGraphExecExternalSemaphoresSignalNodeSetParams", exec, node, params);
   return record(state(), exec && node && params ? hipErrorNotSupported : hipErrorInvalidValue);
 }
 hipError_t hipGraphExecExternalSemaphoresWaitNodeSetParams(void* exec, void* node, const void* params) {
-  const ApiCall api("hipGraphExecExternalSemaphoresWaitNodeSetParams");
+  const ApiCall api("hipGraphExecExternalSemaphoresWaitNodeSetParams", exec, node, params);
   return record(state(), exec && node && params ? hipErrorNotSupported : hipErrorInvalidValue);
 }
 
@@ -2076,7 +2076,7 @@ hipError_t hipGraphExecExternalSemaphoresWaitNodeSetParams(void* exec, void* nod
 
 hipError_t hipGraphAddNode(void** node, void* graph, const void* deps, size_t n,
                            vgpu::amd::abi::GraphNodeParams* params) {
-  const ApiCall api("hipGraphAddNode");
+  const ApiCall api("hipGraphAddNode", node, graph, deps, n, params);
   if (const hipError_t e = add_precheck(node, graph, deps, n); e != hipSuccess) return record(state(), e);
   if (!params) return record(state(), hipErrorInvalidValue);
   using namespace vgpu::amd::abi;
@@ -2097,7 +2097,7 @@ hipError_t hipGraphAddNode(void** node, void* graph, const void* deps, size_t n,
   }
 }
 hipError_t hipGraphNodeSetParams(void* node, vgpu::amd::abi::GraphNodeParams* params) {
-  const ApiCall api("hipGraphNodeSetParams");
+  const ApiCall api("hipGraphNodeSetParams", node, params);
   int type = -1;
   {
     State& s = state();
@@ -2126,7 +2126,7 @@ hipError_t hipGraphNodeSetParams(void* node, vgpu::amd::abi::GraphNodeParams* pa
 // gone, or giving back more than there are, changes nothing.
 hipError_t hipUserObjectCreate(void** object, void* ptr, void (*destroy)(void*), unsigned int refs,
                                unsigned int flags) {
-  const ApiCall api("hipUserObjectCreate");
+  const ApiCall api("hipUserObjectCreate", object, ptr, destroy, refs, flags);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!object || !destroy || !refs || flags > 1) return record(s, hipErrorInvalidValue);
@@ -2136,7 +2136,7 @@ hipError_t hipUserObjectCreate(void** object, void* ptr, void (*destroy)(void*),
   return record(s, hipSuccess);
 }
 hipError_t hipUserObjectRetain(void* object, unsigned int count) {
-  const ApiCall api("hipUserObjectRetain");
+  const ApiCall api("hipUserObjectRetain", object, count);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!object || !count) return record(s, hipErrorInvalidValue);
@@ -2145,7 +2145,7 @@ hipError_t hipUserObjectRetain(void* object, unsigned int count) {
   return record(s, hipSuccess);
 }
 hipError_t hipUserObjectRelease(void* object, unsigned int count) {
-  const ApiCall api("hipUserObjectRelease");
+  const ApiCall api("hipUserObjectRelease", object, count);
   State& s = state();
   Destructors d;
   {
@@ -2158,7 +2158,7 @@ hipError_t hipUserObjectRelease(void* object, unsigned int count) {
 }
 // A graph's references: new ones, or (hipGraphUserObjectMove) the caller's.
 hipError_t hipGraphRetainUserObject(void* graph, void* object, unsigned int count, unsigned int flags) {
-  const ApiCall api("hipGraphRetainUserObject");
+  const ApiCall api("hipGraphRetainUserObject", graph, object, count, flags);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = find_graph(graph);
@@ -2171,7 +2171,7 @@ hipError_t hipGraphRetainUserObject(void* graph, void* object, unsigned int coun
   return record(s, hipSuccess);
 }
 hipError_t hipGraphReleaseUserObject(void* graph, void* object, unsigned int count) {
-  const ApiCall api("hipGraphReleaseUserObject");
+  const ApiCall api("hipGraphReleaseUserObject", graph, object, count);
   State& s = state();
   Destructors d;
   {
@@ -2197,7 +2197,7 @@ namespace {
 // and -- where it allocates or frees -- that no other executable graph of it
 // is there, since both would map or unmap memory at the same addresses (ROCm's
 // HIP refuses a second one for a free node too).
-hipError_t instantiate(State& /*s*/, void** out, void* graph, unsigned long long flags) {
+hipError_t instantiate(State& s, void** out, void* graph, unsigned long long flags) {
   GraphObj* g = find_graph(graph);
   if (!out || !g) return hipErrorInvalidValue;
   if (!acyclic(*g)) return fail(hipErrorInvalidValue, "the graph's edges go round in a cycle");
@@ -2212,6 +2212,11 @@ hipError_t instantiate(State& /*s*/, void** out, void* graph, unsigned long long
   take_refs(g->user_objects, &x->user_objects);
   ++g->live_execs;
   *out = x->handle;
+  if (const auto* p = profiler(); p && p->graph_instantiated) {
+    uint32_t kernels = 0;
+    for (const auto& n : g->nodes) kernels += n->type == vgpu::amd::abi::kNodeKernel;
+    p->graph_instantiated(s.current, reinterpret_cast<uint64_t>(x->handle), kernels);
+  }
   gt().execs[x->handle] = std::move(x);
   return hipSuccess;
 }
@@ -2219,7 +2224,7 @@ hipError_t instantiate(State& /*s*/, void** out, void* graph, unsigned long long
 extern "C" {
 
 hipError_t hipGraphInstantiate(void** exec, void* graph, void** error_node, char* log, size_t log_size) {
-  const ApiCall api("hipGraphInstantiate");
+  const ApiCall api("hipGraphInstantiate", exec, graph, error_node, log, log_size);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   const hipError_t e = instantiate(s, exec, graph, 0);
@@ -2230,14 +2235,14 @@ hipError_t hipGraphInstantiate(void** exec, void* graph, void** error_node, char
 // AutoFreeOnLaunch (1) and UseNodePriority (8) are taken; an upload on
 // instantiation (2) and a launch from the device (4) are not.
 hipError_t hipGraphInstantiateWithFlags(void** exec, void* graph, unsigned long long flags) {
-  const ApiCall api("hipGraphInstantiateWithFlags");
+  const ApiCall api("hipGraphInstantiateWithFlags", exec, graph, flags);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (flags & ~9ull) return record(s, hipErrorInvalidValue);
   return record(s, instantiate(s, exec, graph, flags));
 }
 hipError_t hipGraphInstantiateWithParams(void** exec, void* graph, vgpu::amd::abi::GraphInstantiateParams* params) {
-  const ApiCall api("hipGraphInstantiateWithParams");
+  const ApiCall api("hipGraphInstantiateWithParams", exec, graph, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!exec || !graph || !params) return record(s, hipErrorInvalidValue);
@@ -2251,7 +2256,7 @@ hipError_t hipGraphInstantiateWithParams(void** exec, void* graph, vgpu::amd::ab
   return record(s, e);
 }
 hipError_t hipGraphExecGetFlags(void* exec, unsigned long long* flags) {
-  const ApiCall api("hipGraphExecGetFlags");
+  const ApiCall api("hipGraphExecGetFlags", exec, flags);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   ExecObj* x = find_exec(exec);
@@ -2262,7 +2267,7 @@ hipError_t hipGraphExecGetFlags(void* exec, unsigned long long* flags) {
 // Destroyed now; a launch still running finishes, and the user objects it
 // holds go once it has.
 hipError_t hipGraphExecDestroy(void* exec) {
-  const ApiCall api("hipGraphExecDestroy");
+  const ApiCall api("hipGraphExecDestroy", exec);
   State& s = state();
   Destructors d;
   {
@@ -2271,6 +2276,7 @@ hipError_t hipGraphExecDestroy(void* exec) {
     if (it == gt().execs.end()) return record(s, hipErrorInvalidValue);
     std::unique_ptr<ExecObj> x = std::move(it->second);
     gt().execs.erase(it);
+    if (const auto* p = profiler(); p && p->graph_destroyed) p->graph_destroyed(reinterpret_cast<uint64_t>(exec));
     if (GraphObj* g = find_graph(x->graph)) --g->live_execs;
     if (x->last_queue && !x->last_queue->done(x->last_seq) && !x->user_objects.empty()) {
       auto refs = std::make_shared<UserRefs>(std::move(x->user_objects));
@@ -2296,7 +2302,7 @@ hipError_t hipGraphExecDestroy(void* exec) {
 // after the graph's own last launch. One on the legacy null stream is waited
 // for. On a stream that is capturing, the graph goes into the capture.
 hipError_t hipGraphLaunch(void* exec, hipStream_t stream) {
-  const ApiCall api("hipGraphLaunch");
+  const ApiCall api("hipGraphLaunch", exec, stream);
   State& s = state();
   std::unique_lock<std::mutex> lock(s.mutex);
   ExecObj* x = find_exec(exec);
@@ -2346,7 +2352,7 @@ hipError_t hipGraphLaunch(void* exec, hipStream_t stream) {
 }
 // Nothing to put on the device ahead of a launch: it is all in host memory.
 hipError_t hipGraphUpload(void* exec, hipStream_t stream) {
-  const ApiCall api("hipGraphUpload");
+  const ApiCall api("hipGraphUpload", exec, stream);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!find_exec(exec)) return record(s, hipErrorInvalidValue);
@@ -2388,7 +2394,7 @@ hipError_t exec_set_copy(void* exec, void* node, const CopyData& c) {
 extern "C" {
 
 hipError_t hipGraphExecKernelNodeSetParams(void* exec, void* node, const vgpu::amd::abi::KernelNodeParams* params) {
-  const ApiCall api("hipGraphExecKernelNodeSetParams");
+  const ApiCall api("hipGraphExecKernelNodeSetParams", exec, node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = exec_node(exec, node, vgpu::amd::abi::kNodeKernel);
@@ -2396,7 +2402,7 @@ hipError_t hipGraphExecKernelNodeSetParams(void* exec, void* node, const vgpu::a
   return record(s, make_kernel(s, params, &n->kernel));
 }
 hipError_t hipGraphExecHostNodeSetParams(void* exec, void* node, const vgpu::amd::abi::HostNodeParams* params) {
-  const ApiCall api("hipGraphExecHostNodeSetParams");
+  const ApiCall api("hipGraphExecHostNodeSetParams", exec, node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = exec_node(exec, node, vgpu::amd::abi::kNodeHost);
@@ -2405,7 +2411,7 @@ hipError_t hipGraphExecHostNodeSetParams(void* exec, void* node, const vgpu::amd
   return record(s, hipSuccess);
 }
 hipError_t hipGraphExecMemcpyNodeSetParams(void* exec, void* node, const vgpu::amd::abi::Memcpy3DParms* params) {
-  const ApiCall api("hipGraphExecMemcpyNodeSetParams");
+  const ApiCall api("hipGraphExecMemcpyNodeSetParams", exec, node, params);
   if (!exec_node_live(exec, node, vgpu::amd::abi::kNodeMemcpy) || !params) return record(state(), hipErrorInvalidValue);
   CopyData c;
   // Any fault in the new copy is the wrong value here, a pitch too narrow too.
@@ -2415,7 +2421,7 @@ hipError_t hipGraphExecMemcpyNodeSetParams(void* exec, void* node, const vgpu::a
 }
 hipError_t hipGraphExecMemcpyNodeSetParams1D(void* exec, void* node, void* dst, const void* src, size_t count,
                                              hipMemcpyKind kind) {
-  const ApiCall api("hipGraphExecMemcpyNodeSetParams1D");
+  const ApiCall api("hipGraphExecMemcpyNodeSetParams1D", exec, node, dst, src, count, kind);
   if (!exec_node_live(exec, node, vgpu::amd::abi::kNodeMemcpy) || !count || dst == src)
     return record(state(), hipErrorInvalidValue);
   CopyData c;
@@ -2424,7 +2430,7 @@ hipError_t hipGraphExecMemcpyNodeSetParams1D(void* exec, void* node, void* dst, 
 }
 hipError_t hipGraphExecMemcpyNodeSetParamsFromSymbol(void* exec, void* node, void* dst, const void* symbol,
                                                      size_t count, size_t offset, hipMemcpyKind kind) {
-  const ApiCall api("hipGraphExecMemcpyNodeSetParamsFromSymbol");
+  const ApiCall api("hipGraphExecMemcpyNodeSetParamsFromSymbol", exec, node, dst, symbol, count, offset, kind);
   if (!exec_node_live(exec, node, vgpu::amd::abi::kNodeMemcpy)) return record(state(), hipErrorInvalidValue);
   CopyData c;
   if (const hipError_t e = make_copy_symbol(false, dst, symbol, count, offset, kind, &c); e != hipSuccess)
@@ -2434,7 +2440,7 @@ hipError_t hipGraphExecMemcpyNodeSetParamsFromSymbol(void* exec, void* node, voi
 // The new side has to be on the device the old one was on.
 hipError_t hipGraphExecMemcpyNodeSetParamsToSymbol(void* exec, void* node, const void* symbol, const void* src,
                                                    size_t count, size_t offset, hipMemcpyKind kind) {
-  const ApiCall api("hipGraphExecMemcpyNodeSetParamsToSymbol");
+  const ApiCall api("hipGraphExecMemcpyNodeSetParamsToSymbol", exec, node, symbol, src, count, offset, kind);
   if (!exec_node_live(exec, node, vgpu::amd::abi::kNodeMemcpy)) return record(state(), hipErrorInvalidValue);
   CopyData c;
   if (const hipError_t e = make_copy_symbol(true, const_cast<void*>(src), symbol, count, offset, kind, &c);
@@ -2453,8 +2459,8 @@ hipError_t hipGraphExecMemcpyNodeSetParamsToSymbol(void* exec, void* node, const
   }
   return record(state(), exec_set_copy(exec, node, c));
 }
-hipError_t hipDrvGraphExecMemcpyNodeSetParams(void* exec, void* node, const vgpu::amd::abi::Memcpy3D* params, void*) {
-  const ApiCall api("hipDrvGraphExecMemcpyNodeSetParams");
+hipError_t hipDrvGraphExecMemcpyNodeSetParams(void* exec, void* node, const vgpu::amd::abi::Memcpy3D* params, void* hip_ctx) {
+  const ApiCall api("hipDrvGraphExecMemcpyNodeSetParams", exec, node, params, hip_ctx);
   if (!exec_node_live(exec, node, vgpu::amd::abi::kNodeMemcpy)) return record(state(), hipErrorInvalidValue);
   CopyData c;
   if (const hipError_t e = make_copy_drv(params, &c); e != hipSuccess) return record(state(), e);
@@ -2468,7 +2474,7 @@ hipError_t hipDrvGraphExecMemcpyNodeSetParams(void* exec, void* node, const vgpu
 // A fill of one row, on the device the node's was: its value, where it
 // fills and how much.
 hipError_t hipGraphExecMemsetNodeSetParams(void* exec, void* node, const vgpu::amd::abi::MemsetParams* params) {
-  const ApiCall api("hipGraphExecMemsetNodeSetParams");
+  const ApiCall api("hipGraphExecMemsetNodeSetParams", exec, node, params);
   int old_device = -1;
   {
     State& s = state();
@@ -2495,12 +2501,12 @@ hipError_t hipGraphExecMemsetNodeSetParams(void* exec, void* node, const vgpu::a
   return record(s, hipSuccess);
 }
 hipError_t hipDrvGraphExecMemsetNodeSetParams(void* exec, void* node, const vgpu::amd::abi::MemsetParams* params,
-                                              void*) {
-  const ApiCall api("hipDrvGraphExecMemsetNodeSetParams");
+                                              void* hip_ctx) {
+  const ApiCall api("hipDrvGraphExecMemsetNodeSetParams", exec, node, params, hip_ctx);
   return hipGraphExecMemsetNodeSetParams(exec, node, params);
 }
 hipError_t hipGraphExecEventRecordNodeSetEvent(void* exec, void* node, hipEvent_t event) {
-  const ApiCall api("hipGraphExecEventRecordNodeSetEvent");
+  const ApiCall api("hipGraphExecEventRecordNodeSetEvent", exec, node, event);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = exec_node(exec, node, vgpu::amd::abi::kNodeEventRecord);
@@ -2509,7 +2515,7 @@ hipError_t hipGraphExecEventRecordNodeSetEvent(void* exec, void* node, hipEvent_
   return record(s, hipSuccess);
 }
 hipError_t hipGraphExecEventWaitNodeSetEvent(void* exec, void* node, hipEvent_t event) {
-  const ApiCall api("hipGraphExecEventWaitNodeSetEvent");
+  const ApiCall api("hipGraphExecEventWaitNodeSetEvent", exec, node, event);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = exec_node(exec, node, vgpu::amd::abi::kNodeWaitEvent);
@@ -2519,7 +2525,7 @@ hipError_t hipGraphExecEventWaitNodeSetEvent(void* exec, void* node, hipEvent_t 
 }
 hipError_t hipGraphExecBatchMemOpNodeSetParams(void* exec, void* node,
                                                const vgpu::amd::abi::BatchMemOpNodeParams* params) {
-  const ApiCall api("hipGraphExecBatchMemOpNodeSetParams");
+  const ApiCall api("hipGraphExecBatchMemOpNodeSetParams", exec, node, params);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = exec_node(exec, node, vgpu::amd::abi::kNodeBatchMemOp);
@@ -2533,7 +2539,7 @@ hipError_t hipGraphExecBatchMemOpNodeSetParams(void* exec, void* node,
 }
 hipError_t hipGraphExecChildGraphNodeSetParams(void* exec, void* node, void* child);
 hipError_t hipGraphExecNodeSetParams(void* exec, void* node, vgpu::amd::abi::GraphNodeParams* params) {
-  const ApiCall api("hipGraphExecNodeSetParams");
+  const ApiCall api("hipGraphExecNodeSetParams", exec, node, params);
   if (!exec_node_live(exec, node, -1) || !params) return record(state(), hipErrorInvalidValue);
   using namespace vgpu::amd::abi;
   switch (params->type) {
@@ -2588,7 +2594,7 @@ extern "C" {
 
 // A child-graph node's contents replaced by another graph of the same shape.
 hipError_t hipGraphExecChildGraphNodeSetParams(void* exec, void* node, void* child) {
-  const ApiCall api("hipGraphExecChildGraphNodeSetParams");
+  const ApiCall api("hipGraphExecChildGraphNodeSetParams", exec, node, child);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = exec_node(exec, node, vgpu::amd::abi::kNodeGraph);
@@ -2603,7 +2609,7 @@ hipError_t hipGraphExecChildGraphNodeSetParams(void* exec, void* node, void* chi
 // type, the edges the same, and no copy changing direction nor kernel its
 // device. What does not fit is told in the result.
 hipError_t hipGraphExecUpdate(void* exec, void* graph, void** error_node, int* result) {
-  const ApiCall api("hipGraphExecUpdate");
+  const ApiCall api("hipGraphExecUpdate", exec, graph, error_node, result);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   ExecObj* x = find_exec(exec);
@@ -2642,7 +2648,7 @@ hipError_t hipGraphExecUpdate(void* exec, void* graph, void** error_node, int* r
 // Whether a kernel, copy or fill node of an executable graph runs: one that
 // does not is an empty node, its edges kept.
 hipError_t hipGraphNodeSetEnabled(void* exec, void* node, unsigned int enabled) {
-  const ApiCall api("hipGraphNodeSetEnabled");
+  const ApiCall api("hipGraphNodeSetEnabled", exec, node, enabled);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = exec_node(exec, node, -1);
@@ -2653,7 +2659,7 @@ hipError_t hipGraphNodeSetEnabled(void* exec, void* node, unsigned int enabled) 
   return record(s, hipSuccess);
 }
 hipError_t hipGraphNodeGetEnabled(void* exec, void* node, unsigned int* enabled) {
-  const ApiCall api("hipGraphNodeGetEnabled");
+  const ApiCall api("hipGraphNodeGetEnabled", exec, node, enabled);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GNode* n = exec_node(exec, node, -1);
@@ -2701,7 +2707,7 @@ hipError_t begin_capture(State& s, hipStream_t stream, int mode, GraphObj* into,
 extern "C" {
 
 hipError_t hipStreamBeginCapture(hipStream_t stream, int mode) {
-  const ApiCall api("hipStreamBeginCapture");
+  const ApiCall api("hipStreamBeginCapture", stream, mode);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   return record(s, begin_capture(s, stream, mode, nullptr, {}));
@@ -2709,7 +2715,7 @@ hipError_t hipStreamBeginCapture(hipStream_t stream, int mode) {
 // A capture that adds to a graph the program has, after the nodes it names.
 hipError_t hipStreamBeginCaptureToGraph(hipStream_t stream, void* graph, const void* deps, const void* edge_data,
                                         size_t n, int mode) {
-  const ApiCall api("hipStreamBeginCaptureToGraph");
+  const ApiCall api("hipStreamBeginCaptureToGraph", stream, graph, deps, edge_data, n, mode);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = find_graph(graph);
@@ -2728,7 +2734,7 @@ hipError_t hipStreamBeginCaptureToGraph(hipStream_t stream, void* graph, const v
 // took in has to have been waited on again by the end; a capture something
 // gave up on hands back no graph.
 hipError_t hipStreamEndCapture(hipStream_t stream, void** graph) {
-  const ApiCall api("hipStreamEndCapture");
+  const ApiCall api("hipStreamEndCapture", stream, graph);
   State& s = state();
   Destructors d;
   hipError_t result = hipSuccess;
@@ -2759,7 +2765,7 @@ hipError_t hipStreamEndCapture(hipStream_t stream, void** graph) {
 // 0 none, 1 active, 2 invalidated. The null stream is implicated while a
 // blocking stream captures.
 hipError_t hipStreamIsCapturing(hipStream_t stream, int* status) {
-  const ApiCall api("hipStreamIsCapturing");
+  const ApiCall api("hipStreamIsCapturing", stream, status);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!status) return record(s, hipErrorInvalidValue);
@@ -2770,7 +2776,7 @@ hipError_t hipStreamIsCapturing(hipStream_t stream, int* status) {
   return record(s, hipSuccess);
 }
 hipError_t hipStreamGetCaptureInfo(hipStream_t stream, int* status, unsigned long long* id) {
-  const ApiCall api("hipStreamGetCaptureInfo");
+  const ApiCall api("hipStreamGetCaptureInfo", stream, status, id);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!status) return record(s, hipErrorInvalidValue);
@@ -2785,7 +2791,7 @@ hipError_t hipStreamGetCaptureInfo(hipStream_t stream, int* status, unsigned lon
 // add to -- and what the stream's next operation will follow.
 hipError_t hipStreamGetCaptureInfo_v2(hipStream_t stream, int* status, unsigned long long* id, void** graph,
                                       const void*** deps, size_t* n) {
-  const ApiCall api("hipStreamGetCaptureInfo_v2");
+  const ApiCall api("hipStreamGetCaptureInfo_v2", stream, status, id, graph, deps, n);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!status) return record(s, hipErrorInvalidValue);
@@ -2807,7 +2813,7 @@ hipError_t hipStreamGetCaptureInfo_v2(hipStream_t stream, int* status, unsigned 
 // What a capturing stream's next operation follows: these nodes as well
 // (hipStreamAddCaptureDependencies, 0) or instead (Set, 1).
 hipError_t hipStreamUpdateCaptureDependencies(hipStream_t stream, void** nodes, size_t n, unsigned int flags) {
-  const ApiCall api("hipStreamUpdateCaptureDependencies");
+  const ApiCall api("hipStreamUpdateCaptureDependencies", stream, nodes, n, flags);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if ((n && !nodes) || flags > 1) return record(s, hipErrorInvalidValue);
@@ -2827,7 +2833,7 @@ hipError_t hipStreamUpdateCaptureDependencies(hipStream_t stream, void** nodes, 
   return record(s, hipSuccess);
 }
 hipError_t hipThreadExchangeStreamCaptureMode(int* mode) {
-  const ApiCall api("hipThreadExchangeStreamCaptureMode");
+  const ApiCall api("hipThreadExchangeStreamCaptureMode", mode);
   if (!mode || *mode < 0 || *mode > 2) return record(state(), hipErrorInvalidValue);
   std::swap(*mode, t_capture_mode);
   return hipSuccess;
@@ -2905,8 +2911,8 @@ void draw(State& s, const GraphObj& g, std::string& out, int& cluster) {
 }  // namespace
 extern "C" {
 
-hipError_t hipGraphDebugDotPrint(void* graph, const char* path, unsigned int) {
-  const ApiCall api("hipGraphDebugDotPrint");
+hipError_t hipGraphDebugDotPrint(void* graph, const char* path, unsigned int hip_flags) {
+  const ApiCall api("hipGraphDebugDotPrint", graph, path, hip_flags);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   GraphObj* g = find_graph(graph);

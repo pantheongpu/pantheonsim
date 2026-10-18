@@ -25,11 +25,12 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 header="$root/amd/include/vgpu/rocprofiler_abi.hpp"
-structs=$(sed -n 's/^typedef struct \(rocprofiler_[a-z0-9_]*\) {$/\1/p' "$header")
+structs=$(sed -n 's/^typedef struct \(rocprofiler_[a-z0-9_]*\|roctx[A-Za-z]*ApiTable_t\) {$/\1/p' "$header")
 {
   echo '#include <cstddef>'
   echo '#include <rocprofiler-sdk/rocprofiler.h>'
   echo '#include <rocprofiler-sdk/registration.h>'
+  echo '#include <rocprofiler-sdk-roctx/api_trace.h>'
   echo '#include "vgpu/rocprofiler_abi.hpp"'
   echo 'namespace ours = vgpu::amd::rocprof;'
   for s in $structs; do

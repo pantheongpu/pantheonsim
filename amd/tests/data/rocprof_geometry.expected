@@ -8,6 +8,23 @@ _Z10lds_kernelPi.kd kernarg=8 group=2048 private=0 sgpr=128 arch_vgpr=8 accum_vg
 _Z11cube_kernelPi.kd kernarg=264 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
 _Z14scratch_kernelPii.kd kernarg=272 group=0 private=1040 sgpr=128 arch_vgpr=24 accum_vgpr=0
 _Z4vaddPKfS0_Pfi.kd kernarg=288 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+[runtime kernels]
+__amd_rocclr_batchMemOp.kd kernarg=272 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyBuffer.kd kernarg=48 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyBufferAligned.kd kernarg=304 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyBufferRect.kd kernarg=384 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyBufferRectAligned.kd kernarg=384 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyBufferToImage.kd kernarg=416 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyImage.kd kernarg=320 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyImage1DA.kd kernarg=320 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyImageToBuffer.kd kernarg=416 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_fillBufferAligned.kd kernarg=40 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_fillBufferAligned2D.kd kernarg=336 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_fillImage.kd kernarg=360 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_gwsInit.kd kernarg=4 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_initHeap.kd kernarg=24 group=0 private=0 sgpr=128 arch_vgpr=24 accum_vgpr=0
+__amd_rocclr_streamOpsWait.kd kernarg=40 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_streamOpsWrite.kd kernarg=24 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
 [hip api, thread 1]
 __hipRegisterFatBinary(data=<ptr>)
 __hipRegisterFunction(modules=<ptr>, hostFunction=<ptr>, deviceFunction=_Z4vaddPKfS0_Pfi, deviceName=_Z4vaddPKfS0_Pfi, threadLimit=4294967295, tid=(null), bid=(null), blockDim=(null), gridDim=(null), wSize=(null))
@@ -29,11 +46,20 @@ hipDeviceSynchronize()
 hipMemcpy(dst=<ptr>, src=<ptr>, sizeBytes=16384, kind=DeviceToHost)
 hipFree(ptr=<ptr>)
 [dispatches]
+__amd_rocclr_fillBufferAligned.kd grid=1024,1,1 workgroup=256,1,1 group=0 private=0
 lds_kernel(int*) [clone .kd] grid=384,1,1 workgroup=128,1,1 group=2560 private=0
 scratch_kernel(int*, int) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=1040
 cube_kernel(int*) [clone .kd] grid=16,8,4 workgroup=8,4,2 group=0 private=0
+__amd_rocclr_copyBuffer.kd grid=1024,1,1 workgroup=512,1,1 group=0 private=0
 [copies]
+[scratch]
+ALLOC queue=1 flags=0 bytes=64880640
 [allocations]
 hipMalloc MEMORY_ALLOCATION_ALLOCATE bytes=16384 on=gpu
-hipFree MEMORY_ALLOCATION_FREE
+hipFree MEMORY_ALLOCATION_FREE on=none
+[runtime allocations]
+hipMalloc MEMORY_ALLOCATION_ALLOCATE bytes=4194304 on=cpu
+hipMalloc MEMORY_ALLOCATION_ALLOCATE bytes=56 on=cpu
+hipMemset MEMORY_ALLOCATION_ALLOCATE bytes=4194304 on=cpu
+hipMemset MEMORY_ALLOCATION_ALLOCATE bytes=16777216 on=cpu
 [markers]
