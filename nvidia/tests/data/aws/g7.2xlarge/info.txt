@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA RTX PRO 4500 Blackwell Server Edition, 12.0, 32623 MiB, 595.91.07, GPU-369619e2-a024-09cf-c9ea-d733c7ae4591
+Cuda compilation tools, release 13.2, V13.2.51
+Build cuda_13.2.r13.2/compiler.37434383_0
+ngpu=1 arch=sm_120 libs=/usr/local/cuda-13.2/extras/CUPTI/lib64 inc=/usr/local/cuda-13.2/extras/CUPTI/include

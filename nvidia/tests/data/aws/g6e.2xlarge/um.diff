@@ -1,0 +1,9 @@
+--- /w/col/g6e.2xlarge//um.txt	2026-10-18 03:51:54.000000000 +0000
++++ /w/col/g6e.2xlarge//um.sim	2026-10-18 03:55:39.531113729 +0000
+@@ -20,5 +20,5 @@
+   a null list: CUPTI_ERROR_INVALID_PARAMETER
+ enable the kind: CUPTI_ERROR_NOT_READY
+ enable it again: CUPTI_ERROR_NOT_READY
+-disable it: CUPTI_SUCCESS
++disable it: CUPTI_ERROR_NOT_READY
+ # end

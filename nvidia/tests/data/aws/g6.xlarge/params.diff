@@ -1,0 +1,36 @@
+--- /w/col/g6.xlarge//params.txt	2026-10-18 03:38:07.000000000 +0000
++++ /w/col/g6.xlarge//params.sim	2026-10-18 03:55:39.284002870 +0000
+@@ -119,7 +119,7 @@
+ CB cudaMemPoolExportToShareableHandle ENTER shareableHandle=set memPool=set handleType=1 flags=0
+ CB cudaMemPoolExportToShareableHandle EXIT ret=1
+ CB cudaMemPoolImportFromShareableHandle ENTER memPool=set shareableHandle=set handleType=1 flags=0
+-CB cudaMemPoolImportFromShareableHandle EXIT ret=999
++CB cudaMemPoolImportFromShareableHandle EXIT ret=801
+ CB cudaMemPoolExportPointer ENTER exportData=set ptr=set
+ CB cudaMemPoolExportPointer EXIT ret=1
+ CB cudaMemPoolImportPointer ENTER ptr=set memPool=set exportData=set
+@@ -139,13 +139,13 @@
+ CB cudaStreamSynchronize ENTER stream=set
+ CB cudaStreamSynchronize EXIT ret=0
+ CB cudaImportExternalMemory ENTER extMem_out=set memHandleDesc=set
+-CB cudaImportExternalMemory EXIT ret=999
++CB cudaImportExternalMemory EXIT ret=801
+ CB cudaExternalMemoryGetMappedBuffer ENTER devPtr=set extMem=null bufferDesc=set
+ CB cudaExternalMemoryGetMappedBuffer EXIT ret=1
+ CB cudaDestroyExternalMemory ENTER extMem=null
+ CB cudaDestroyExternalMemory EXIT ret=1
+ CB cudaImportExternalSemaphore ENTER extSem_out=set semHandleDesc=set
+-CB cudaImportExternalSemaphore EXIT ret=999
++CB cudaImportExternalSemaphore EXIT ret=801
+ CB cudaSignalExternalSemaphoresAsync ENTER
+ CB cudaSignalExternalSemaphoresAsync EXIT ret=1
+ CB cudaWaitExternalSemaphoresAsync ENTER
+@@ -153,7 +153,7 @@
+ CB cudaDestroyExternalSemaphore ENTER extSem=null
+ CB cudaDestroyExternalSemaphore EXIT ret=1
+ CB cudaDeviceFlushGPUDirectRDMAWrites ENTER target=0 scope=100
+-CB cudaDeviceFlushGPUDirectRDMAWrites EXIT ret=0
++CB cudaDeviceFlushGPUDirectRDMAWrites EXIT ret=801
+ CB cudaFuncSetCacheConfig ENTER func=set cacheConfig=0
+ CB cudaFuncSetCacheConfig EXIT ret=0
+ CB cudaFuncSetAttribute ENTER func=set attr=8 value=1024
