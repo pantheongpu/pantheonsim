@@ -56,8 +56,10 @@ Three cases differ, by the same lines on both cards, and each is a **native Linu
   `cudaDeviceFlushGPUDirectRDMAWrites` returns 0 natively, 801 under WSL.
 - `resource`: WSL creates one extra stream record, which shifts later stream ids by one.
 
-The simulator answers like WSL here. Following native Linux needs a platform setting and a second
-set of expected files; that was not done.
+The simulator answers like WSL unless told otherwise. `VGPU_PLATFORM=linux` (nvidia/src/platform.hpp,
+nvidia/docs/cupti.md) switches these three behaviors to the native ones, and then the simulator matches
+the RTX 4090 and RTX 5090 on **all 15** cases (`summary-cuda13.0-platform-linux.md`). CI runs the three
+cases that differ against `cupti_<case>.linux.expected` as `e2e_cupti_<case>_linux`.
 
 **On CUDA 13.2 (the AWS machines)** four more cases differ (`filter`, `filter_driver`, `memory`,
 `um`), and they match again under 13.0 on the same hardware, so they are CUDA 13.2's libcupti, not

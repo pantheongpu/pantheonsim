@@ -55,6 +55,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "platform.hpp"
 #include "vgpu/profiling.hpp"
 
 #ifndef VGPU_EXPORT
@@ -245,8 +246,8 @@ const char* intern(const std::string& s) {
    integers that mean the same thing in the records and in the calls that ask
    (cuptiGetStreamId). The default stream is 7, as CUDA 12 and 13 number it.
    Ids 6 to 13 are the driver's own streams of the first context (see
-   internal_streams), so a program's streams start at 14, as they do on an RTX
-   3060 once a context exists. */
+   expand; 6 to 12 on native Linux, platform.hpp), so a program's streams start at
+   14, as they do on an RTX 3060 once a context exists (13 on native Linux). */
 
 std::mutex g_id_mu;
 std::unordered_map<uint64_t, uint32_t> g_stream_ids;
@@ -254,7 +255,7 @@ std::unordered_map<uint64_t, uint32_t> g_context_ids;
 std::unordered_map<uint64_t, uint32_t> g_event_ids;
 std::unordered_map<uint32_t, uint32_t> g_device_context;   // device -> its context's id
 std::unordered_map<uint32_t, uint32_t> g_device_first_stream;   // device -> the first of its context's own streams
-uint32_t g_next_stream_id = 14;
+uint32_t g_next_stream_id = 6u + static_cast<uint32_t>(vgpu::platform::internal_streams());
 uint32_t g_next_context_id = 1;
 bool g_first_context_streams_done = false;
 
@@ -351,7 +352,7 @@ uint32_t note_context(uint32_t device, uint64_t handle, uint64_t generation, uin
     first = 6;
   } else {
     first = g_next_stream_id;
-    g_next_stream_id += 8;
+    g_next_stream_id += static_cast<uint32_t>(vgpu::platform::internal_streams());
   }
   if (!handle) g_device_first_stream[device] = first;
   return first;
@@ -1323,8 +1324,8 @@ bool device_side(vgpu::profiling::EventKind k) {
 // g_mu.
 void expand(std::vector<vgpu::profiling::Event>& events, std::vector<vgpu::profiling::Event>& out) {
   using K = vgpu::profiling::EventKind;
-  // The driver makes eight streams of its own in each context, which CUPTI lists
-  // beside it: ids and flags are an RTX 3060's (a default stream, the null
+  // The driver makes eight streams of its own in each context (seven on native Linux, see
+  // platform.hpp), which CUPTI lists beside it: ids and flags are an RTX 3060's (a default stream, the null
   // stream, five non-blocking ones and one of the highest priority).
   static const struct { uint32_t flag; int32_t priority; } kInternal[8] = {
       {CUPTI_ACTIVITY_STREAM_CREATE_FLAG_DEFAULT, 0},      {CUPTI_ACTIVITY_STREAM_CREATE_FLAG_NULL, 0},
@@ -1337,7 +1338,11 @@ void expand(std::vector<vgpu::profiling::Event>& events, std::vector<vgpu::profi
       uint32_t ctx = 0;
       const uint32_t first = note_context(e.device, e.handle, e.sync_id, &ctx);
       if (first && g_kinds[CUPTI_ACTIVITY_KIND_STREAM]) {
-        for (uint32_t i = 0; i < 8; ++i) {
+        const int made = vgpu::platform::internal_streams();
+        for (uint32_t i = 0; i < static_cast<uint32_t>(made); ++i) {
+          // A native Linux driver makes one non-blocking stream fewer than WSL does: its last stream
+          // is still the highest-priority one.
+          const uint32_t row = (made < 8 && i == static_cast<uint32_t>(made) - 1) ? 7u : i;
           vgpu::profiling::Event st;
           st.kind = K::Stream;
           st.op = 1;
@@ -1346,8 +1351,8 @@ void expand(std::vector<vgpu::profiling::Event>& events, std::vector<vgpu::profi
           st.start_ns = st.end_ns = e.start_ns;
           st.context_id = ctx;
           st.stream_id = first + i;
-          st.flags = kInternal[i].flag;
-          st.priority = kInternal[i].priority;
+          st.flags = kInternal[row].flag;
+          st.priority = kInternal[row].priority;
           out.push_back(std::move(st));
         }
       }

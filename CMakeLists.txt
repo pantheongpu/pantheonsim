@@ -2897,6 +2897,18 @@ if(TARGET vgpucupti)
       TIMEOUT 600)
   endforeach()
 
+  # The cases a native Linux driver answers differently from WSL (nvidia/src/platform.hpp),
+  # against what an RTX 4090 and an RTX 5090 printed on Vast.ai with CUDA 13.0.
+  foreach(_case params driver_params resource)
+    add_test(NAME e2e_cupti_${_case}_linux
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh ${_case})
+    set_tests_properties(e2e_cupti_${_case}_linux PROPERTIES
+      DEPENDS vgpucupti
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_PLATFORM=linux"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 600)
+  endforeach()
+
   # The same for a program that uses only the driver API: the driver calls, the
   # kernels, copies, fills and waits they issue, and the context and streams.
   add_test(NAME e2e_cupti_trace_driver
