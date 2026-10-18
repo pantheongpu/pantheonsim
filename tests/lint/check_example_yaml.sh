@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pantheonsim.example.yaml lists every settings key, once, and names no key that
+# pantheonsim.example.yaml and the README's settings table list every settings key, once, and names no key that
 # docs/config.md does not document. Checked without building or running anything.
 set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -17,4 +17,8 @@ dup=$(echo "$ex" | uniq -d)
 [[ -z $dup ]] && echo "ok    no key twice" || { echo "FAIL  twice: $dup"; fail=1; }
 active=$(grep -E '^[a-z_]+: ' "$f" | sed -E 's/: .*//' | tr '\n' ' ')
 [[ $active == "gpu count " ]] && echo "ok    only gpu and count are switched on" || { echo "FAIL  active keys: $active"; fail=1; }
+# The README's settings table has exactly the documented keys too.
+rd=$(sed -n 's/^| `\([a-z_]*\)` | .*/\1/p' README.md | sort)
+if [[ $doc == "$rd" ]]; then echo "ok    the README table has exactly the documented keys"
+else echo "FAIL  keys differ between docs/config.md (<) and the README table (>)"; diff <(echo "$doc") <(echo "$rd"); fail=1; fi
 exit $fail
