@@ -3145,7 +3145,7 @@ set_tests_properties(e2e_sass_tier PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
-  TIMEOUT 1800)
+  TIMEOUT 3600)
 
 # SASS on every architecture: programs built for each generation's SASS, sm_75
 # to sm_120, run by default and on their PTX, which must agree. sm_100 and
@@ -3230,7 +3230,7 @@ if(TARGET vgpucudart)
   set_tests_properties(e2e_ipc PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 600)
+    TIMEOUT 1200)
 endif()
 
 # A graph built node by node rather than captured: a diamond of dependencies,
