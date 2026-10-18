@@ -1467,6 +1467,41 @@ void MemoryManager::store_quad(uint64_t addr, const uint64_t in[2]) {
   store16(chunk + off % kChunkSize, in);
 }
 
+bool MemoryManager::load_quad_run(uint64_t addr, size_t count, uint64_t* out) const {
+  if (!count || addr % 16 || (host_maps_ && host_maps_->may_contain(addr + 16 * (count - 1)))) return false;
+  uint64_t base = 0;
+  const Allocation* a = run_allocation(addr, 16 * count, 8, &base);   // (also declines while a fault is armed)
+  if (!a || (host_maps_ && host_maps_->may_contain(addr))) return false;
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addr + 16 * i - base;
+    const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (!chunk) {
+      out[2 * i] = out[2 * i + 1] = 0;
+    } else if (is_uniform(chunk)) {
+      out[2 * i] = out[2 * i + 1] = repeated(uniform_byte(chunk), 8);
+    } else {
+      load16(chunk + off % kChunkSize, out + 2 * i);
+    }
+  }
+  return true;
+}
+
+bool MemoryManager::store_quad_run(uint64_t addr, size_t count, const uint64_t* in) {
+  if (!count || addr % 16 || (host_maps_ && host_maps_->may_contain(addr + 16 * (count - 1)))) return false;
+  uint64_t base = 0;
+  Allocation* a = const_cast<Allocation*>(run_allocation(addr, 16 * count, 8, &base));
+  if (!a || (host_maps_ && host_maps_->may_contain(addr))) return false;
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addr + 16 * i - base;
+    const uint64_t chunk_idx = off / kChunkSize;
+    uint8_t* chunk = a->chunks[chunk_idx].load(std::memory_order_acquire);
+    if (is_uniform(chunk) && in[2 * i] == in[2 * i + 1] && in[2 * i] == repeated(uniform_byte(chunk), 8)) continue;
+    if (!chunk || is_uniform(chunk)) chunk = materialize(*a, chunk_idx);
+    store16(chunk + off % kChunkSize, in + 2 * i);
+  }
+  return true;
+}
+
 // Where a kernel's scalar load or store lives: bytes in a chunk (materialized
 // first when this is a store), memory nothing has written (only ever answered
 // for a load), or managed memory -- the caller's own buffer, which takes the

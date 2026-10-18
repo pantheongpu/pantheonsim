@@ -249,6 +249,14 @@ class MemoryManager {
   void load_quad(uint64_t addr, uint64_t out[2]) const;
   void store_quad(uint64_t addr, const uint64_t in[2]);
 
+  // `count` consecutive naturally aligned sixteen-byte values from `addr`, each made exactly as load_quad / store_quad
+  // make it (one access each, in order), for a run wholly inside one ordinary allocation, with one lookup for the lot.
+  // Returns false, having done nothing, whenever the calls could differ -- a fault armed or cells stuck, a host mapping
+  // possibly in range, a misaligned address, or a run not wholly inside one allocation (load_quad lets a read run on
+  // into the last page of an allocation; the caller then goes one at a time and gets that).
+  bool load_quad_run(uint64_t addr, size_t count, uint64_t* out) const;
+  bool store_quad_run(uint64_t addr, size_t count, const uint64_t* in);
+
   // Notified with the new total whenever allocated bytes change. Used to feed
   // live memory telemetry; optional and unset by default.
   void set_usage_observer(std::function<void(uint64_t)> obs) { usage_observer_ = std::move(obs); }

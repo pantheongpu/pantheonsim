@@ -303,4 +303,83 @@ VTEST(an_update_that_changes_nothing_stores_nothing_but_always_store_makes_the_c
   VCHECK_EQ(mm.load_scalar(p + kChunkSize, 4), 1u);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// load_quad_run / store_quad_run against load_quad / store_quad one value at a time.
+// ---------------------------------------------------------------------------------------------------------------
+VTEST(quad_runs_do_what_the_quads_one_at_a_time_do) {
+  uint64_t taken = 0, declined = 0;
+  for (int fault = 0; fault <= 3; ++fault)
+    for (uint64_t seed = 1; seed <= 12; ++seed) {
+      MemoryManager ma{1ull << 30}, mb{1ull << 30};
+      Faulty fa(fault), fb(fault);
+      if (fault) ma.set_access_fault(&fa), mb.set_access_fault(&fb);
+      Rng rng{seed * 977 + fault};
+      const uint64_t sizes[] = {64, 4096, kChunkSize, 3 * kChunkSize + 48, 3 * kChunkSize + 4096};
+      std::vector<uint64_t> live, sz;
+      for (uint64_t n : sizes) {
+        const uint64_t pa = ma.alloc(n);
+        if (pa != mb.alloc(n)) throw vtest::Failure("different addresses");
+        live.push_back(pa), sz.push_back(n);
+        for (uint64_t off = 0; off + kChunkSize <= n; off += kChunkSize) {
+          const uint64_t k = rng.below(3);
+          if (k == 0) {
+            const uint8_t pat[1] = {static_cast<uint8_t>(rng.below(2) ? 0xFF : 0x00)};
+            ma.fill(pa + off, pat, 1, kChunkSize), mb.fill(pa + off, pat, 1, kChunkSize);
+          } else if (k == 1) {
+            std::vector<uint8_t> junk(300);
+            for (auto& c : junk) c = static_cast<uint8_t>(rng.next());
+            ma.write(pa + off, junk.data(), junk.size()), mb.write(pa + off, junk.data(), junk.size());
+          }
+        }
+      }
+      for (int round = 0; round < 1500; ++round) {
+        const size_t k = rng.below(live.size());
+        const uint64_t count = 1 + rng.below(64);
+        uint64_t addr = live[k] + (rng.below(4) == 0 ? sz[k] - 16 * rng.below(70) : rng.below(sz[k]));
+        if (rng.below(8) != 0) addr &= ~uint64_t{15};
+        if (rng.below(40) == 0) addr = kDeviceVaBase + rng.below(1 << 20);
+        const bool store = rng.below(2);
+        std::vector<uint64_t> vals(2 * count), got_a(2 * count, 7), got_b(2 * count, 7);
+        for (auto& v : vals) v = rng.below(3) == 0 ? 0 : rng.next();
+        if (rng.below(6) == 0)
+          for (uint64_t i = 0; i < count; ++i) vals[2 * i] = vals[2 * i + 1] = 0x0101010101010101ull * (rng.below(2) ? 0xFF : 0);
+        // The run, with the fallback the interpreter makes: the quads one at a time.
+        Outcome x = attempt([&](Outcome& o) {
+          if (store) {
+            if (ma.store_quad_run(addr, count, vals.data())) ++taken;
+            else {
+              ++declined;
+              for (uint64_t i = 0; i < count; ++i) ma.store_quad(addr + 16 * i, vals.data() + 2 * i);
+            }
+          } else {
+            if (ma.load_quad_run(addr, count, got_a.data())) ++taken;
+            else {
+              ++declined;
+              for (uint64_t i = 0; i < count; ++i) ma.load_quad(addr + 16 * i, got_a.data() + 2 * i);
+            }
+          }
+          o.v0 = 0;
+        });
+        Outcome y = attempt([&](Outcome& o) {
+          for (uint64_t i = 0; i < count; ++i) {
+            if (store) mb.store_quad(addr + 16 * i, vals.data() + 2 * i);
+            else mb.load_quad(addr + 16 * i, got_b.data() + 2 * i);
+          }
+          o.v0 = 0;
+        });
+        if (!(x == y) || got_a != got_b) throw vtest::Failure("quad run differs, seed " + std::to_string(seed) + " round " + std::to_string(round) + " fault " + std::to_string(fault) + ": {" + x.text + "} vs {" + y.text + "}");
+      }
+      ma.set_access_fault(nullptr), mb.set_access_fault(nullptr);
+      for (size_t k = 0; k < live.size(); ++k) {
+        std::vector<uint8_t> p(sz[k]), q(sz[k]);
+        ma.read(live[k], p.data(), p.size());
+        mb.read(live[k], q.data(), q.size());
+        if (p != q) throw vtest::Failure("contents differ, seed " + std::to_string(seed));
+      }
+      VCHECK_EQ(ma.resident_bytes(), mb.resident_bytes());
+    }
+  VCHECK(taken > 1000);
+  VCHECK(declined > 300);
+}
+
 VTEST_MAIN

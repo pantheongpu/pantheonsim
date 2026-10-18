@@ -6713,13 +6713,16 @@ struct Machine {
         while (lane + count < kLanes && (w.exec >> (lane + count) & 1) && address_of(lane + count) == (next += stride)) ++count;
         // (A load whose first address the lane before it just read takes the value that read had: not a run.)
         const bool dup = kind == Kind::Load && memo && memo_addr == addr;
-        // 16-byte aligned fours are one access each; a run moves them as pairs.
+        // (Not 16-byte aligned fours, where a pair is the biggest access.)
         const uint32_t unit = addr % 8 == 0 && (run_words != 4 || addr % 16 != 0) ? 8 : 4;
         bool done = false;
-        if (count >= 2 && !dup && !(run_words == 4 && addr % 16 == 0)) {
-          uint32_t buf[kLanes * 4];
+        if (count >= 2 && !dup) {
+          alignas(16) uint32_t buf[kLanes * 4];
+          // (Sixteen-byte aligned fours are one access each, atomic as a whole: the quad calls make them so.)
+          const bool quads = run_words == 4 && addr % 16 == 0;
           if (kind == Kind::Load) {
-            done = at(addr).load_run(addr, buf, uint64_t{stride} * count, run_words == 1 ? 4 : unit);
+            done = quads ? at(addr).load_quad_run(addr, count, reinterpret_cast<uint64_t*>(buf))
+                         : at(addr).load_run(addr, buf, uint64_t{stride} * count, run_words == 1 ? 4 : unit);
             if (done) {
               for (uint32_t i = 0; i < count; ++i)
                 for (uint32_t k = 0; k < run_words; ++k) set_word(w, in.dst[0], k, lane + i, buf[i * run_words + k]);
@@ -6729,7 +6732,8 @@ struct Machine {
           } else {
             for (uint32_t i = 0; i < count; ++i)
               for (uint32_t k = 0; k < run_words; ++k) buf[i * run_words + k] = word(w, in.src[1], k, lane + i);
-            done = at(addr).store_run(addr, buf, uint64_t{stride} * count, run_words == 1 ? 4 : unit);
+            done = quads ? at(addr).store_quad_run(addr, count, reinterpret_cast<const uint64_t*>(buf))
+                         : at(addr).store_run(addr, buf, uint64_t{stride} * count, run_words == 1 ? 4 : unit);
           }
         }
         if (done) {
@@ -7071,6 +7075,45 @@ struct Machine {
       *row = 4 * (lane / 16) + r % 4;
     }
   }
+  // Where each lane's values go in matrix_multiply's buffers, and where each of its outputs reads from, worked out once for
+  // a shape (the divisions by the shape's sizes are not worth repeating for every instruction): `a_row` and `b_row` are
+  // the offsets of the lane's row of A and column of B, and for each output `c_off[lane * outs + r]` its place in C,
+  // `a_off` the row of A and `b_off` the column of B it is the product of.
+  struct MatrixPlan {
+    const MatrixShape* shape = nullptr;
+    uint32_t lanes_per_block = 0, groups = 0, per_lane = 0, outs = 0;
+    struct Lane {
+      uint32_t bl, within, g, a_row, b_row;
+    } lane[kLanes];
+    std::vector<uint32_t> c_off, a_off, b_off;
+    // The operands' values as doubles (A by row, B by column, C as it is), kept per thread between instructions.
+    std::vector<double> a, b, c;
+  };
+  // The thread's (reached once per machine, not once per instruction: a thread-local costs a call).
+  MatrixPlan* mplan = nullptr;
+  MatrixPlan& matrix_plan(const MatrixShape& s) {
+    if (!mplan) {
+      static thread_local MatrixPlan thread_plan;
+      mplan = &thread_plan;
+    }
+    MatrixPlan& p = *mplan;
+    if (p.shape == &s) return p;
+    p.shape = &s;
+    p.lanes_per_block = kLanes / s.blocks, p.groups = p.lanes_per_block / s.m, p.per_lane = s.k / p.groups;
+    p.outs = s.m * s.n * s.blocks / kLanes;
+    p.c_off.resize(size_t{kLanes} * p.outs), p.a_off.resize(p.c_off.size()), p.b_off.resize(p.c_off.size());
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t bl = lane / p.lanes_per_block, within = lane % p.lanes_per_block;
+      p.lane[lane] = {bl, within, within / s.m, (bl * s.m + within % s.m) * s.k, (bl * s.n + within % s.n) * s.k};
+      for (uint32_t r = 0; r < p.outs; ++r) {
+        uint32_t ob = 0, row = 0;
+        out_place(s, lane, r, &ob, &row);
+        const uint32_t j = lane % s.n, at = lane * p.outs + r;
+        p.c_off[at] = (ob * s.m + row) * s.n + j, p.a_off[at] = (ob * s.m + row) * s.k, p.b_off[at] = (ob * s.n + j) * s.k;
+      }
+    }
+    return p;
+  }
   void matrix_multiply(Wave& w, const Inst& in) {
     const MatrixShape* shape =
         matrix_shape(OpName(in.scaled ? "v_mfma_" + in.name.substr(std::string("v_mfma_scale_").size()) : in.name));
@@ -7123,20 +7166,16 @@ struct Machine {
       if (o.kind == OperandKind::InlineFloat) return o.fvalue;
       return as_double(reg(o, 2 * e, lane) | static_cast<uint64_t>(reg(o, 2 * e + 1, lane)) << 32);
     };
-    const uint32_t lanes_per_block = kLanes / s.blocks, groups = lanes_per_block / s.m, per_lane = s.k / groups;
-    const uint32_t outs = s.m * s.n * s.blocks / kLanes;
+    MatrixPlan& plan = matrix_plan(s);
+    const uint32_t lanes_per_block = plan.lanes_per_block, per_lane = plan.per_lane, outs = plan.outs;
     // The operands' values, widened to double: A by row, B by column (so each dot product reads two contiguous runs),
-    // C as it is. Buffers kept per thread between instructions, not made and freed by each.
-    static thread_local std::vector<double> a, b, c;
-    a.assign(size_t{s.blocks} * s.m * s.k, 0.0);
-    b.assign(size_t{s.blocks} * s.k * s.n, 0.0);
-    c.assign(size_t{s.blocks} * s.m * s.n, 0.0);
-    double* const ap = a.data();
-    double* const bp = b.data();
-    double* const cp = c.data();
-    const auto A = [&](uint32_t bl, uint32_t i, uint32_t k) -> double& { return ap[(size_t{bl} * s.m + i) * s.k + k]; };
-    const auto B = [&](uint32_t bl, uint32_t k, uint32_t j) -> double& { return bp[(size_t{bl} * s.n + j) * s.k + k]; };
-    const auto C = [&](uint32_t bl, uint32_t i, uint32_t j) -> double& { return cp[(size_t{bl} * s.m + i) * s.n + j]; };
+    // C as it is; the buffers are the thread's, not made and freed by each instruction.
+    plan.a.assign(size_t{s.blocks} * s.m * s.k, 0.0);
+    plan.b.assign(size_t{s.blocks} * s.k * s.n, 0.0);
+    plan.c.assign(size_t{s.blocks} * s.m * s.n, 0.0);
+    double* const ap = plan.a.data();
+    double* const bp = plan.b.data();
+    double* const cp = plan.c.data();
     // gfx950's scaled forms: each lane's A and B values are its one row (or
     // column) and one block of 32 along K, and are scaled by 2^(e - 127),
     // e the E8M0 byte of the lane's scale register its selector names -- or
@@ -7147,12 +7186,15 @@ struct Machine {
                              : (lane_src(w, o, lane) >> (8 * sel)) & 0xFF;
       return e == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, static_cast<int>(e) - 127);
     };
-    // The common case, binary16 sources in registers, a pair to a register, neither scaled nor sparse.
+    // The common cases, sources in registers and neither scaled nor sparse: binary16, a pair to a register, and a float
+    // accumulator, are read straight from the registers.
     const auto in_regs = [](const Operand& o) { return o.kind == OperandKind::Vgpr || o.kind == OperandKind::Agpr; };
     const bool halves = !sparse && !in.scaled && s.in == 'h' && (s.in_b == 0 || s.in_b == 'h') && per_lane % 2 == 0 &&
                         in_regs(in.src[0]) && in_regs(in.src[1]);
+    const bool float_c = !sparse && s.out == 'f' && in_regs(in.src[2]);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      const uint32_t bl = lane / lanes_per_block, within = lane % lanes_per_block, g = within / s.m;
+      const MatrixPlan::Lane& L = plan.lane[lane];
+      const uint32_t bl = L.bl, within = L.within, g = L.g;
       // With CBSZ, a block takes its A from block ABID of its group of 2^CBSZ:
       // the same place in that block's lanes.
       const uint32_t a_block = in.a_bcast_size ? (bl >> in.a_bcast_size << in.a_bcast_size) + in.a_bcast_id : bl;
@@ -7161,23 +7203,23 @@ struct Machine {
       const double sb = in.scaled ? scale_of(in.src[4], in.scale_sel >> 2, lane) : 1.0;
       if (halves) {
         // Two halves to a register: one read, two widenings (and no scale to apply).
+        double* const da = ap + L.a_row + g * per_lane;
+        double* const db = bp + L.b_row + g * per_lane;
         for (uint32_t e = 0; e < per_lane; e += 2) {
           const uint32_t ra = reg(in.src[0], e / 2, a_lane), rb = reg(in.src[1], e / 2, lane);
-          double* const da = &A(bl, within % s.m, g * per_lane + e);
-          da[0] = half_bits_to_double(static_cast<uint16_t>(ra)), da[1] = half_bits_to_double(static_cast<uint16_t>(ra >> 16));
-          B(bl, g * per_lane + e, within % s.n) = half_bits_to_double(static_cast<uint16_t>(rb));
-          B(bl, g * per_lane + e + 1, within % s.n) = half_bits_to_double(static_cast<uint16_t>(rb >> 16));
+          da[e] = half_bits_to_double(static_cast<uint16_t>(ra)), da[e + 1] = half_bits_to_double(static_cast<uint16_t>(ra >> 16));
+          db[e] = half_bits_to_double(static_cast<uint16_t>(rb)), db[e + 1] = half_bits_to_double(static_cast<uint16_t>(rb >> 16));
         }
       }
       for (uint32_t e = 0; e < per_lane && !halves; ++e) {
-        if (!sparse) A(bl, within % s.m, g * per_lane + e) = value(in.src[0], s.in, e, a_lane) * sa;
+        if (!sparse) ap[L.a_row + g * per_lane + e] = value(in.src[0], s.in, e, a_lane) * sa;
         // gfx950's sparse forms, whose B is eight registers, split it: the
         // first four hold the lane group's run of K in the first half, the
         // last four the same run K/2 on (the CDNA4 guide's layout tables),
         // where A's run is K's in one piece -- as hipSPARSELt lays both out.
         const uint32_t half = per_lane / 2;
         const uint32_t kb = sparse && in.src[1].width == 8 ? e / half * (s.k / 2) + g * half + e % half : g * per_lane + e;
-        B(bl, kb, within % s.n) = value(in.src[1], s.in_b ? s.in_b : s.in, e, lane) * sb;
+        bp[L.b_row + kb] = value(in.src[1], s.in_b ? s.in_b : s.in, e, lane) * sb;
       }
       if (sparse) {
         // A lane's A holds two values of each four along K, packed; the
@@ -7187,42 +7229,40 @@ struct Machine {
         const uint32_t sets = 32 / per_lane, set = (in.cbsz == 0 ? in.abid : 0u) % sets;
         const uint32_t idx = reg(in.src[2], 0, lane) >> (set * per_lane);
         for (uint32_t v = 0; v < per_lane / 2; ++v)
-          A(bl, within % s.m, g * per_lane + 4 * (v / 2) + ((idx >> (2 * v)) & 3)) = value(in.src[0], s.in, v, lane);
+          ap[L.a_row + g * per_lane + 4 * (v / 2) + ((idx >> (2 * v)) & 3)] = value(in.src[0], s.in, v, lane);
       }
-      for (uint32_t r = 0; r < outs; ++r) {
-        uint32_t ob = 0, row = 0;
-        out_place(s, lane, r, &ob, &row);
-        C(ob, row, lane % s.n) = value(sparse ? in.dst[0] : in.src[2], s.out, r, lane);
+      const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
+      if (float_c) {
+        for (uint32_t r = 0; r < outs; ++r) cp[place[r]] = static_cast<double>(as_float(reg(in.src[2], r, lane)));
+      } else {
+        for (uint32_t r = 0; r < outs; ++r) cp[place[r]] = value(sparse ? in.dst[0] : in.src[2], s.out, r, lane);
       }
     }
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      const uint32_t j = lane % s.n;
+      const uint32_t* const cs = &plan.c_off[size_t{lane} * outs];
+      const uint32_t* const as = &plan.a_off[size_t{lane} * outs];
+      const uint32_t* const bs = &plan.b_off[size_t{lane} * outs];
       uint32_t r = 0;
       // Float results four at a time: four sums with nothing between them, each taken in the order it always was.
       if (s.out == 'f') {
         for (; r + 4 <= outs; r += 4) {
-          const double* rows[4];
-          const double* cols[4];
-          double start[4], sum[4];
-          for (uint32_t t = 0; t < 4; ++t) {
-            uint32_t ob = 0, i = 0;
-            out_place(s, lane, r + t, &ob, &i);
-            rows[t] = &A(ob, i, 0), cols[t] = &B(ob, 0, j), start[t] = C(ob, i, j);
-          }
+          const double* const rows[4] = {ap + as[r], ap + as[r + 1], ap + as[r + 2], ap + as[r + 3]};
+          const double* const cols[4] = {bp + bs[r], bp + bs[r + 1], bp + bs[r + 2], bp + bs[r + 3]};
+          const double start[4] = {cp[cs[r]], cp[cs[r + 1]], cp[cs[r + 2]], cp[cs[r + 3]]};
+          double sum[4];
           mfma_dot4(rows, cols, s.k, start, sum);
           for (uint32_t t = 0; t < 4; ++t) set_word(w, in.dst[0], r + t, lane, as_bits(static_cast<float>(sum[t])));
         }
       }
       for (; r < outs; ++r) {
-        uint32_t ob = 0, i = 0;
-        out_place(s, lane, r, &ob, &i);
-        const double* const arow = &A(ob, i, 0);
-        const double* const bcol = &B(ob, 0, j);
+        const double* const arow = ap + as[r];
+        const double* const bcol = bp + bs[r];
+        const double c0 = cp[cs[r]];
         if (s.out == 'i') {
-          set_word(w, in.dst[0], r, lane, static_cast<uint32_t>(mfma_dot_int(arow, bcol, s.k, static_cast<int64_t>(C(ob, i, j)))));
+          set_word(w, in.dst[0], r, lane, static_cast<uint32_t>(mfma_dot_int(arow, bcol, s.k, static_cast<int64_t>(c0))));
           continue;
         }
-        const double sum = s.out == 'd' ? mfma_dot_fma(arow, bcol, s.k, C(ob, i, j)) : mfma_dot(arow, bcol, s.k, C(ob, i, j));
+        const double sum = s.out == 'd' ? mfma_dot_fma(arow, bcol, s.k, c0) : mfma_dot(arow, bcol, s.k, c0);
         if (s.out == 'd') {
           const uint64_t bits = as_bits(sum);
           set_word(w, in.dst[0], 2 * r, lane, static_cast<uint32_t>(bits));
