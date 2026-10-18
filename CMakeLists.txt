@@ -1511,6 +1511,11 @@ add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_
 add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
 set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
+# The AMD benchmark workloads' instruction counters (tools/bench-amd): counts, never times, on the simulated
+# MI300X and RX 6800, against tools/bench-amd/expected. An interpreter change that alters a counter fails here.
+add_test(NAME bench_amd_counters COMMAND ${CMAKE_SOURCE_DIR}/tools/bench-amd/run_bench_check.sh)
+set_tests_properties(bench_amd_counters PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "SKIP:" TIMEOUT 600)
 
 vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
 # HIP's grid sizes for every AMD profile, one process each (the runtime takes
