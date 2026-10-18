@@ -10,13 +10,27 @@ set -uo pipefail
 src="${1:?usage: trace-collect-remote.sh <dir with the cupti_*.cu files> }"
 out="$src/out"; mkdir -p "$out"
 export PATH=$PATH:/usr/local/cuda/bin
-# TRACE_CUDA=13-0 installs and uses that toolkit instead of the image's default, to
-# tell a toolkit difference from a driver or platform one.
-if [[ -n "${TRACE_CUDA:-}" ]]; then
-  sudo apt-get update -qq >/dev/null 2>&1
-  sudo apt-get install -y -qq "cuda-nvcc-$TRACE_CUDA" "cuda-cudart-dev-$TRACE_CUDA" "cuda-cupti-dev-$TRACE_CUDA" "cuda-nvtx-$TRACE_CUDA" >"$out/apt-pin.log" 2>&1 \
-    || { echo "cannot install toolkit $TRACE_CUDA" > "$out/trace.txt"; exit 1; }
-  export PATH="/usr/local/cuda-${TRACE_CUDA/-/.}/bin:$PATH"
+# Toolkit. TRACE_CUDA=13-0 installs and uses that toolkit instead of the image's default, to tell
+# a toolkit difference from a driver or platform one. With no nvcc on the machine (Lambda, the
+# marketplaces) one is installed from NVIDIA's repo: 13.0 when the driver can run it (the version
+# the simulator's expected files come from), else the newest the driver supports.
+SUDO=""; [[ "$(id -u)" != 0 ]] && SUDO="sudo"
+want="${TRACE_CUDA:-}"
+if [[ -z "$want" ]] && ! command -v nvcc >/dev/null 2>&1; then
+  read -r dmaj dmin < <(nvidia-smi | sed -n 's/.*CUDA Version: \([0-9]*\)\.\([0-9]*\).*/\1 \2/p' | head -1)
+  if (( ${dmaj:-0} >= 13 )); then want=13-0; else want="${dmaj:-12}-${dmin:-8}"; fi
+fi
+if [[ -n "$want" ]]; then
+  if ! apt-cache policy "cuda-nvcc-$want" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+    . /etc/os-release; arch="$(uname -m)"; [[ "$arch" == aarch64 ]] && arch=sbsa
+    $SUDO apt-get update -qq >/dev/null 2>&1; $SUDO apt-get install -y -qq wget ca-certificates >/dev/null 2>&1
+    wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${ID}${VERSION_ID//./}/$arch/cuda-keyring_1.1-1_all.deb" -O /tmp/cuda-keyring.deb \
+      && $SUDO dpkg -i /tmp/cuda-keyring.deb >/dev/null 2>&1
+  fi
+  $SUDO apt-get update -qq >/dev/null 2>&1
+  $SUDO apt-get install -y -qq "cuda-nvcc-$want" "cuda-cudart-dev-$want" "cuda-cupti-dev-$want" "cuda-nvtx-$want" >"$out/apt-pin.log" 2>&1 \
+    || { echo "cannot install toolkit $want" > "$out/trace.txt"; exit 1; }
+  export PATH="/usr/local/cuda-${want/-/.}/bin:$PATH"
 fi
 cuda_root="$(dirname "$(dirname "$(readlink -f "$(command -v nvcc)")")")"
 find_cupti() {
@@ -40,8 +54,8 @@ find_cupti
 if [[ -z "$libs" || -z "$inc" ]]; then
   # The base image ships the toolkit without CUPTI: add it from NVIDIA's repo.
   ver="$(nvcc --version | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1-\2/p')"
-  sudo apt-get update -qq >/dev/null 2>&1
-  sudo apt-get install -y -qq "cuda-cupti-dev-$ver" "cuda-nvtx-$ver" >"$out/apt.log" 2>&1 || sudo apt-get install -y -qq libcupti-dev >>"$out/apt.log" 2>&1
+  $SUDO apt-get update -qq >/dev/null 2>&1
+  $SUDO apt-get install -y -qq "cuda-cupti-dev-$ver" "cuda-nvtx-$ver" >"$out/apt.log" 2>&1 || $SUDO apt-get install -y -qq libcupti-dev >>"$out/apt.log" 2>&1
   find_cupti
 fi
 stubs="$libs/stubs"; [[ -e "$stubs/libcuda.so" ]] || stubs="$(dirname "$(find "$cuda_root" -name libcuda.so -path '*stubs*' | head -1)")"
