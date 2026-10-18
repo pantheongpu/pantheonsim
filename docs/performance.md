@@ -2065,6 +2065,70 @@ except where the table above says so. Every change needs the same-bits test and 
 | 7 | Cheaper one-wave launch (`set_up_group`, `VgprFile` zeroing) | 12.6% of `launch` samples | 5 to 10% of launch rate | low |
 | 8 | `popcnt` target attribute for `__popcountdi2` (1.4% of `valu_int`) | small | 1 to 2% | very low |
 
+### Ranked wins 1, 2, 4 and 8 applied (`speedup2-amdops`)
+
+Branch `speedup2-amdops` from `speedup` a12f8d84. Same machine, harness and pinning as above (server2, CPUs
+26-31, `VGPU_THREADS=1`, 11 alternating runs, Mann-Whitney p; load average 4.7 to 26 per workload, median 8);
+base is a12f8d84 built Release in its own directory, B the branch. Counters identical on every row
+(`--check-counters`: 21 of 21 pairs match).
+
+| workload | target | median ratio | best ratio | p |
+| --- | --- | ---: | ---: | ---: |
+| valu_int | mi300x / rx6800 | 2.11 / 2.59 | 2.16 / 2.58 | 0.000 |
+| valu_f32 | mi300x / rx6800 | 2.11 / 2.82 | 2.04 / 2.97 | 0.000 |
+| valu_f64 | mi300x / rx6800 | 1.89 / 2.66 | 1.93 / 2.67 | 0.000 |
+| mem | mi300x / rx6800 | 1.51 / 1.90 | 1.51 / 1.92 | 0.000 |
+| lds | mi300x / rx6800 | 2.24 / 2.33 | 2.28 / 2.33 | 0.000 |
+| atomics | mi300x / rx6800 | 1.86 / 2.34 | 1.84 / 2.35 | 0.000 |
+| divergent | mi300x / rx6800 | 2.51 / 3.03 | 2.50 / 3.12 | 0.000 |
+| wave | mi300x / rx6800 | 1.68 / 1.81 | 1.68 / 1.94 | 0.000 |
+
+What changed:
+
+* **Win 1, the ladders.** `amd/tools/ladder-to-switch.py` rewrote every `if (op == "a"_op || ...) ... else if` chain of
+  `gcn_exec.cpp` whose rungs test only names (783 case labels, 502 rungs, 30 chains; a chain with an impure rung in the
+  middle keeps that rung as an `if` and converts the pure runs either side) into `switch (op.hash())`. The case keeps the
+  rung's original condition, tested verbatim, so a hash collision still falls to the else-branch as the text comparison did;
+  `if` statements in a row count as one chain only where each body returns. The SOPP tail of `Machine::step` (about 30
+  rungs, each constructing and hashing an `OpName`) is a hand-written switch in the ladder's order. A first A/B of this alone
+  (`valu_int` 1.55x, `lds` 1.93x, `divergent` 2.17x, `mem` 1.20x, p <= 0.003) is what the sample shares of the profile above
+  said could be had; the rest of the table adds wins 2 and 4.
+* **Win 2, decode-time facts.** `gcn::finalize` (called at the end of `gcn::decode`, halves of a VOPD included) fills in
+  `Inst::name_hash`, the short form's name and hash that `vector_alu` built as a `std::string` on every instruction, and
+  `InstFlag` bits for the `rfind`/`find` tests of `step` (`v_mfma`, `v_cmp`, `f64`, `_store`, `_atomic`, `ds_gws_`, ...). An
+  `Inst` not decoded this way (`flags == 0`) works them out as before. `rdna_alu` and `cdna5_alu` take a view of the name
+  instead of copying it.
+* **Win 4, lane-invariant sources.** `InvariantSources` reads an SGPR, inline constant or literal source once per
+  instruction (in `vector_alu` and `compare`) and `lane_src` returns it from a four-entry table; the global-access loop reads
+  its scalar base once. Alone (A = the branch with the table switched off, 11 runs, MI300X): `valu_int` 1.37 (p 0.000),
+  `valu_f32` 1.12 (p 0.001), `mem` 1.21 (p 0.010), `wave` 1.09 and `divergent` 0.96 (not significant).
+* **Win 8, POPCNT: dropped.** A `target("popcnt")` copy of the `v_bcnt_u32_b32` lane loop: median ratio 1.013 on `valu_int`
+  (p 0.61), 1.004 to 1.018 on the others (p 0.056 to 0.70). Under the 2% bar and not significant; removed.
+
+The same-bits test is `test_amd_gcn_same_bits` (`amd/tests/unit/test_gcn_same_bits.cpp`, ctest-wired as a unit test): every
+instruction shape of the seven ISA corpora and of a SOPP corpus (15,566 shapes, `amd::digest_instruction` in
+`gcn_exec.cpp`) runs once on a wave of pseudo-random registers, LDS, scratch and memory in four ways (any bits, small
+integers, floats and doubles with the special values among them, half the lanes off; branches are sent to a distant target)
+and a digest of all registers, masks, LDS, memory, counts and error text is compared with
+`amd/tests/data/same_bits_digests.txt`, which was recorded from the unmodified a12f8d84 plus only the probe. Mutation
+checks (each makes it fail): two case labels swapped (123 shapes differ), the invariant table off by one (3,088), a wrong
+decode flag (1,527), `s_cbranch_scc0` inverted (6). Instructions that read the clock are recorded as unstable and skipped;
+`ds_nop`, `ds_consume` and `ds_append` are skipped because the interpreter crashes on them with the fuzz corpus's operands.
+
+Two things the digest caught that a pass over the ladders would not have: GCC expands `floor`, `ceil` and `trunc` in line
+where it thinks the code hot (a signaling NaN then comes back unchanged; libm returns a quiet one), and which places those
+are moved with the switch. The vector instructions (`v_floor/ceil/trunc_f32/f64`) were in-line before and are now
+`floor_inline` and friends with that behaviour spelled out; the scalar ones were libm and `-fno-fp-int-builtin-inexact`
+keeps them so. Likewise which of two NaN operands an `fma` or a double add propagates follows the order the compiler gives
+its operands: `v_fma_mix*_bf16` and `v_dot2c_f32_f16` needed their operands written in an order (and, for the dot product,
+held there with an empty `asm`) to give the bits the old build gave. Other sites with two NaN operands of different
+payloads (`fmin`/`fmax`, the other `fma`s) may be compiled differently now; the corpus run with these inputs found none
+beyond those two, but it cannot prove there are no more.
+
+Tests run on server2 against the branch: `test_amd_*` (all 38 unit binaries that run there: pass), ctest `amd|gcn|rocprof|
+hipcc|hip_` (all pass or skip but `amd_rocprofiler_abi` (rocprofiler-sdk header version), `amd_rocprofv3` and `amd_tools`'
+user-namespace steps, which fail for the host, not the change), `bench_amd_counters` (21 of 21), PyTorch tests skip there.
+
 ### Not done, and not measured here
 
 * The `std::optional<Inst>` change (X4) and the cached hash (X5) are negative results and stay out; X1 and X6 are inconclusive or small.

@@ -4520,24 +4520,6 @@ struct Machine {
     return true;
   }
 
-  // v_bcnt_u32_b32 over the lanes in a function compiled for the POPCNT instruction: the build's baseline (x86-64) has none,
-  // so __builtin_popcount is a call into libgcc for each lane.
-#if defined(__x86_64__)
-  static bool have_popcnt() {
-    static const bool yes = __builtin_cpu_supports("popcnt");
-    return yes;
-  }
-  __attribute__((target("popcnt"))) void bcnt_u32_popcnt(Wave& w, const Inst& in) {
-    for (uint32_t lane = 0; lane < kLanes; ++lane)
-      if (w.exec >> lane & 1)
-        write_lane(w, in.dst[0], lane,
-                   lane_src(w, in.src[1], lane) + static_cast<uint32_t>(__builtin_popcount(lane_src(w, in.src[0], lane))));
-  }
-#else
-  static bool have_popcnt() { return false; }
-  void bcnt_u32_popcnt(Wave&, const Inst&) {}
-#endif
-
   void vector_alu(Wave& w, const Inst& in) {
     // The sub-dword form of an instruction does what the short form does,
     // over the part of each register it names, and the cross-lane form does
@@ -5926,10 +5908,6 @@ struct Machine {
   case "v_bcnt_u32_b32"_op.hash:
     if (!(op == "v_bcnt_u32_b32"_op)) goto L_ladder_9;
     {
-      if (have_popcnt()) {
-        bcnt_u32_popcnt(w, in);
-        break;
-      }
       each([&](uint32_t lane) {
         // The set bits of the first source, counted into the second.
         write_lane(w, in.dst[0], lane,
