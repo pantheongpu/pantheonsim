@@ -2574,3 +2574,21 @@ All wired into CMake. Each was shown to fail when the change is wrong (mutation 
 | `test_amd_gcn_memruns` (new, kernels `amd/tests/data/memruns.c`, built for gfx942, 1030, 1100, 1201, 1250; run on all five) | seven copy kernels (1, 2 and 4 words, 32- and 64-bit offsets) over 18 address patterns (consecutive, reversed, strided, repeated, overlapping stores, misaligned, over chunk and allocation edges, off the end, wild, random) and 7 lane masks, 3 draws each, new path on and off against twin memories: memory images, resident bytes, error text, wave / instruction / VMEM / flat counts | stores in reverse lane order; the exec mask ignored when extending a run; a load run landing in the wrong lane |
 | `test_amd_mfma_math` (new) | all 65 536 binary16 values widened to the compiler's double, bit for bit (NaN payload, zero sign); the contiguous dot products against the strided ones they replaced; four at once against one at a time; order of summation | subnormal bias off by one; four-wide sums out of order |
 | `test_amd_gcn_asm` (extended, kernels `asm_mfma_order.s`) | `v_mfma_f32_4x4x4_16b_f16`, `16x16x16_f16` and `32x32x8_f16` with a non-zero accumulator on random halves and on powers of two whose sums depend on the order, against the arithmetic written out from the layouts | B halves swapped; four-wide sums out of order |
+
+## Tier 2 together (branch `speedup`, all pieces merged)
+
+Merged tree against the Tier 1 tree (both Release, server2, CPUs 24-27 for NVIDIA and 24-31 for AMD, one host thread unless the AMD row
+says `all`, 9 alternating runs, load 5-12). Counters are identical in every NVIDIA row; the AMD rows rest on the same-bits digest test
+because rocprofv3 counting was unavailable on that host.
+
+NVIDIA, B/A of the median: `wmma` SASS 1.48x, PTX 1.51x; `mma_ptx` SASS 1.47x, PTX 2.45x; PTX `local` 1.16x; `mem` SASS 1.03x;
+`shared` SASS and PTX 1.02x. Everything else is within 2% (the Tier 1 work already took the rest). The tier's new MATCH, IMMA and LDSM
+handlers show up only on programs that use them: atomicAggregate 1.4x, immaTensorCoreGemm 2.8x (IMMA) and 1.17x (LDSM).
+
+AMD, B/A of the median against Tier 1's tree, p < 0.001 (simulated MI300X / RX 6800): valu_int 2.1 / 2.5x, valu_f32 2.1 / 2.7x,
+valu_f64 1.9 / 2.5x, mfma 2.4x, mem 1.8 / 2.2x, lds 2.9 / 2.8x, atomics 1.8 / 2.3x at one thread and 12x / 8x with all threads, divergent
+2.4 / 3.0x, wave 1.7 / 2.0x, launch 1.2x. api and startup are unchanged.
+
+`test_amd_gcn_same_bits` (15,566 instruction shapes against digests recorded from the unmodified base) is the guard on all of the AMD
+changes: the first merge failed it on 65 MFMA shapes (a different NaN payload when both operands are NaNs) and the fix keeps the fast loops
+and recomputes only NaN results in the base's operand order.
