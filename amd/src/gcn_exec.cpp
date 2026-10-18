@@ -6610,6 +6610,51 @@ struct Machine {
     return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(reg)) * bytes);
   }
 
+  // The lane's address in a global access: a 64-bit one in a register pair, or a scalar base with a 32-bit offset a lane.
+  uint64_t global_lane_address(const Wave& w, const Inst& in, uint32_t lane, uint32_t access_bytes) const {
+    const uint64_t offset_reg = in.has_saddr ? scaled_offset(in, lane_src(w, in.src[0], lane), access_bytes) : 0;
+    return (in.has_saddr ? scalar_field(w, in.saddr, true) + offset_reg : lane_src64(w, in.src[0], lane)) +
+           static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+  }
+  // The lanes from `lane` (whose address is `addr`) that are active and take consecutive addresses, `run_words` whole words
+  // each, moved with one call to the memory manager (MemoryManager::load_run / store_run, or the quad calls where each lane
+  // moves sixteen aligned bytes, which are one access): what lane by lane would do -- every aligned word or pair still one
+  // atomic access, in lane order. Returns how many lanes it did, 0 having done nothing: fewer than two, or the memory
+  // manager refusing (a fault armed, a host mapping, a run not inside one allocation, misaligned), and the lanes then go one
+  // at a time and meet any error where they would. For a load `words` gets the last lane's words (what a lane that reads
+  // the same address next takes). Out of line, so the lane loop of global_access stays as small as it was.
+  [[gnu::noinline]] uint32_t memory_run(Wave& w, const Inst& in, bool load, uint32_t lane, uint64_t addr, uint32_t run_words,
+                                        uint32_t access_bytes, bool dup, uint32_t* words) {
+    const uint32_t stride = 4 * run_words;
+    uint32_t count = 1;
+    uint64_t next = addr;   // (the address lane + count would have)
+    while (lane + count < kLanes && (w.exec >> (lane + count) & 1) &&
+           global_lane_address(w, in, lane + count, access_bytes) == (next += stride))
+      ++count;
+    if (count < 2 || dup) return 0;
+    // (Not 16-byte aligned fours, where a pair is the biggest access.)
+    const uint32_t unit = run_words == 1 ? 4 : addr % 8 == 0 && (run_words != 4 || addr % 16 != 0) ? 8 : 4;
+    // (Sixteen-byte aligned fours are one access each, atomic as a whole: the quad calls make them so.)
+    const bool quads = run_words == 4 && addr % 16 == 0;
+    alignas(16) uint32_t buf[kLanes * 4];
+    MemoryManager& m = at(addr);
+    if (load) {
+      const bool done = quads ? m.load_quad_run(addr, count, reinterpret_cast<uint64_t*>(buf))
+                              : m.load_run(addr, buf, uint64_t{stride} * count, unit);
+      if (!done) return 0;
+      for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t k = 0; k < run_words; ++k) set_word(w, in.dst[0], k, lane + i, buf[i * run_words + k]);
+      std::memcpy(words, buf + (count - 1) * run_words, 4 * run_words);
+    } else {
+      for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t k = 0; k < run_words; ++k) buf[i * run_words + k] = word(w, in.src[1], k, lane + i);
+      const bool done = quads ? m.store_quad_run(addr, count, reinterpret_cast<const uint64_t*>(buf))
+                              : m.store_run(addr, buf, uint64_t{stride} * count, unit);
+      if (!done) return 0;
+    }
+    return count;
+  }
+
   void global_access(Wave& w, const Inst& in) {
     if (!w.exec) return;   // no lane to reach memory for
     const std::string& op = in.name;
@@ -6689,55 +6734,25 @@ struct Machine {
                                   : kind == Kind::Store   ? 4 * in.src[1].width
                                   : kind == Kind::StoreHi16 ? 2
                                                             : atomic.bytes;
-    // The address is a 64-bit one in a register pair, or a scalar base with
-    // a 32-bit offset per lane.
-    const auto address_of = [&](uint32_t lane) -> uint64_t {
-      const uint64_t offset_reg = in.has_saddr ? scaled_offset(in, lane_src(w, in.src[0], lane), access_bytes) : 0;
-      return (in.has_saddr ? scalar_field(w, in.saddr, true) + offset_reg : lane_src64(w, in.src[0], lane)) +
-             static_cast<uint64_t>(static_cast<int64_t>(in.offset));
-    };
     // A run of active lanes with consecutive addresses, each moving the same whole words, goes to memory as one
-    // call (MemoryManager::load_run / store_run: every aligned word or pair still one atomic access, in lane
-    // order) -- when nothing can differ from lane by lane: the call says so by refusing (a fault armed, a
-    // host mapping, a run not inside one allocation, misaligned), and the lanes then go one at a time below.
-    // A refused try, or no run, turns it off for the rest of the instruction.
+    // call (memory_run, below); a refused try, or no run, turns it off for the rest of the instruction.
     const uint32_t run_words = kind == Kind::Load ? in.dst[0].width : kind == Kind::Store ? in.src[1].width : 0;
     bool try_runs = (run_words == 1 || run_words == 2 || run_words == 4) && d.peers.empty() && runs_on;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      const uint64_t addr = address_of(lane);
+      // The address is a 64-bit one in a register pair, or a scalar base with
+      // a 32-bit offset per lane.
+      const uint64_t offset_reg = in.has_saddr ? scaled_offset(in, lane_src(w, in.src[0], lane), access_bytes) : 0;
+      const uint64_t addr = (in.has_saddr ? scalar_field(w, in.saddr, true) + offset_reg
+                                          : lane_src64(w, in.src[0], lane)) +
+                            static_cast<uint64_t>(static_cast<int64_t>(in.offset));
       if (try_runs) {
-        const uint32_t stride = 4 * run_words;
-        uint32_t count = 1;
-        uint64_t next = addr;   // (the address lane + count would have)
-        while (lane + count < kLanes && (w.exec >> (lane + count) & 1) && address_of(lane + count) == (next += stride)) ++count;
         // (A load whose first address the lane before it just read takes the value that read had: not a run.)
-        const bool dup = kind == Kind::Load && memo && memo_addr == addr;
-        // (Not 16-byte aligned fours, where a pair is the biggest access.)
-        const uint32_t unit = addr % 8 == 0 && (run_words != 4 || addr % 16 != 0) ? 8 : 4;
-        bool done = false;
-        if (count >= 2 && !dup) {
-          alignas(16) uint32_t buf[kLanes * 4];
-          // (Sixteen-byte aligned fours are one access each, atomic as a whole: the quad calls make them so.)
-          const bool quads = run_words == 4 && addr % 16 == 0;
-          if (kind == Kind::Load) {
-            done = quads ? at(addr).load_quad_run(addr, count, reinterpret_cast<uint64_t*>(buf))
-                         : at(addr).load_run(addr, buf, uint64_t{stride} * count, run_words == 1 ? 4 : unit);
-            if (done) {
-              for (uint32_t i = 0; i < count; ++i)
-                for (uint32_t k = 0; k < run_words; ++k) set_word(w, in.dst[0], k, lane + i, buf[i * run_words + k]);
-              std::memcpy(memo_words, buf + (count - 1) * run_words, 4 * run_words);
-              memo_addr = addr + uint64_t{stride} * (count - 1), memo = true;
-            }
-          } else {
-            for (uint32_t i = 0; i < count; ++i)
-              for (uint32_t k = 0; k < run_words; ++k) buf[i * run_words + k] = word(w, in.src[1], k, lane + i);
-            done = quads ? at(addr).store_quad_run(addr, count, reinterpret_cast<const uint64_t*>(buf))
-                         : at(addr).store_run(addr, buf, uint64_t{stride} * count, run_words == 1 ? 4 : unit);
-          }
-        }
-        if (done) {
-          lane += count - 1;
+        const uint32_t made = memory_run(w, in, kind == Kind::Load, lane, addr, run_words, access_bytes,
+                                         kind == Kind::Load && memo && memo_addr == addr, memo_words);
+        if (made) {
+          if (kind == Kind::Load) memo_addr = addr + uint64_t{4 * run_words} * (made - 1), memo = true;
+          lane += made - 1;
           continue;
         }
         try_runs = false;

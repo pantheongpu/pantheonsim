@@ -2112,3 +2112,91 @@ default on every NVIDIA GPU and PTX atomics gain 38%; a later change should look
 Dropped after measurement: the two-entry code hint and the bank-pass rewrite (see "Not done, and negative results"). On the AMD side the
 harness (tools/bench-amd) counts a Radeon card's instructions with SQ_WAVE32_INSTS + SQ_WAVE64_INSTS, the counters a simulated RX 6800
 offers.
+
+## The AMD engine: atomics across threads, contiguous lanes, and the matrix multiply (branch `speedup2-amdmem`)
+
+Four of the ranked wins of "The AMD engine" (3, 5, 6 and 7). Three kept, one dropped. Measured on server2 (Ryzen 9 9950X, 32 logical
+CPUs shared with other people's builds: 1-minute load 11 to 18 during the final A/B, pinned to the idle CPUs 8-15), Release, GCC 13.3,
+ROCm 7.2 `hipcc` programs, simulated MI300X and RX 6800 only (no AMD card touched). `tools/bench-amd` A/B, base `speedup` a12f8d84
+against this branch, 11 runs, alternating; ratios are B/A of the median (the best-of ratio agrees within 3% in every row but the 8-thread atomics, whose base runs 11 to 13 s and is the noisiest), all
+workloads self-check bit for bit against their host reference.
+
+| workload | target | threads | B/A median | B/A best | p | verdict |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| atomics | mi300x | 8 | **8.66x** | 8.00x | < 0.001 | faster (wall 12.7 s to 1.5 s) |
+| atomics | rx6800 | 8 | **4.27x** | 4.13x | < 0.001 | faster |
+| atomics | mi300x | 1 | 1.008 | 1.015 | 0.33 | same |
+| atomics | rx6800 | 1 | 1.032 | 1.041 | 0.10 | same |
+| mfma | mi300x | 1 | **2.31x** | 2.30x | < 0.001 | faster |
+| mfma | mi300x | 8 | **2.31x** | 2.33x | < 0.001 | faster |
+| mem | mi300x | 1 | **1.18x** | 1.16x | < 0.001 | faster |
+| mem | mi300x | 8 | 1.17x | 1.14x | < 0.001 | faster |
+| mem | rx6800 | 1 | 1.12x | 1.11x | < 0.001 | faster |
+| mem | rx6800 | 8 | 1.11x | 1.10x | < 0.001 | faster |
+| valu_int (control) | mi300x / rx6800 | 1, 8 | 1.005 to 1.017 | | 0.06 to 0.56 | same |
+| launch | mi300x / rx6800 | 1, 8 | 0.985 to 1.012 | | 0.24 to 0.75 | same |
+
+The `valu_int` and `launch` rows are controls, code this branch does not change; they bound the noise of the run (about 2%).
+`rocprofv3` wrote no counter CSV on this host during the session (the `--check-counters` path), so the harness was run with the
+documented full-size instruction counts and its "counters identical" column is only the same number twice; the evidence that counts
+and bits do not move is the unit tests below (they compare `DispatchStats` and memory images between the new and the old path) and
+`ctest` over the AMD and memory tests (119 of 119, including the four RDNA/CDNA 5 targets of the tests that have them).
+
+### What changed
+
+* **Atomics across threads** (`MemoryManager::atomic_rmw`, `src/core/memory.cpp`). The striped `memory_atomic_lock` was taken for every
+  lane of every atomic; at 8 threads `atomics` was slower than at one. With work-groups on several threads an atomic on an ordinary word
+  of device memory is now a compare-and-swap on the word itself (4 and 8 bytes; the operation is applied to the value the swap
+  replaces, and the result is stored only where the locked version stored it: when it differs, or, for buffer atomics, always, since
+  that made a never-written chunk real). A chunk that is not real yet is made so first and the swap runs on it. Everything else (a
+  fault armed, a host mapping, a word on the end of an allocation, an address that is no allocation's, a misaligned or 1/2/16-byte
+  access) returns false having done nothing, and the caller takes the lock as before; one address always takes one road, so the two
+  never meet on a word. One thread keeps its plain load and store with no lock. The scalar `s_atomic_*`, the vector and flat atomics,
+  the buffer atomics and the host side of the hostcall ready stack (`Hostcall::service`) all use it, so a host thread and a kernel
+  still exclude one another.
+* **Matrix multiply** (`matrix_multiply`, `amd/src/mfma_math.hpp`). The binary16 widening was a call into libgcc (`__extendhfdf2`: 35%
+  of the `mfma` samples; the baseline x86-64 has no F16C); it is now integer work, exact for all 65536 values including NaN payloads.
+  The per-instruction heap vectors are per-thread buffers; B is kept by column so each dot product reads two contiguous runs; a shape's
+  lane and output offsets (a handful of divisions by the shape's sizes each) are worked out once per thread and shape; binary16
+  sources and a float accumulator in registers are read without the generic operand lambda; and float results are summed four at a time
+  (four independent chains, each in the order it always was, so the bits do not change). A thread-local looked up per instruction
+  cost 6% (`__tls_get_addr`); the machine holds the pointer.
+* **Contiguous lanes** (`Machine::memory_run`, `MemoryManager::load_quad_run / store_quad_run`). A global load or store whose active
+  lanes take consecutive addresses, one, two or four words a lane, goes to the memory manager as one `load_run` / `store_run` call (or
+  the quad calls where each lane moves sixteen aligned bytes, which stay one 16-byte access each). Refused whenever lane by lane could
+  differ (a fault armed, a host mapping, a run not inside one allocation, misaligned, peers attached), and then the lanes go one at a
+  time as before and meet any error where they would. A load whose first address the lane before it just read does not start a run
+  (the one-read-per-address rule of `load_once`), and the last lane's words become that rule's memory.
+* **Dropped: cheaper one-wave launch set-up (7).** A launch's set-up is a work-group's register file, `Group`/`Wave` vectors and the
+  hand-off (`launch` is 350 to 450 klaunch/s). The one removable piece, the wave's 64 KB zero-initialised register file (256 rows), costs
+  0.7 us a launch measured in isolation on this host (`std::vector<std::array<uint32_t, 64>>(256)` built and freed, under load), against
+  2.2 to 2.9 us a launch. Sizing it by the kernel's declared VGPR count is not bit-safe (any instruction may index a register past
+  the declared count, as `s_set_gpr_idx` and a kernel's undefined reads do, and the file reads zero today), tracking what a wave wrote
+  would add a store to every register access, and clearing a recycled file costs as much as making a new one. Nothing was shipped and
+  `launch` is unchanged in the A/B above.
+
+### Lessons
+
+* The first version of the run path sat inside `global_access`'s lane loop, and `atomics` at **one** thread (which runs none of the new
+  code) got 2.2 to 2.4% slower (31 runs, p < 0.003, twice); removing the block gave 1.000. The cause was the size of that loop, not the
+  work: the same logic as a separate `[[gnu::noinline]]` member brought `atomics` back to 1.008 / 1.032 (same) and made `mem` faster than
+  inline (1.18x, from 1.13x). Keep a new fast path out of a hot loop's body.
+* The first matrix-multiply change (widening and the buffers only) measured 0.97x, slower: the generic operand lambda, not the
+  conversion, was the cost. The profile (`tools/bench-amd/profile`) is what pointed at the per-instruction thread-local and the
+  divisions.
+* A mutation that is an equivalent program proves nothing: transposing the matrix plan's C offsets changes no result (it is only a
+  storage map, read back through the same table), and the first version of the order test could not see a reversed dot product
+  because a float result rounded from a double hides the order unless products cancel exactly (the test now uses powers of two whose
+  products of 2^-28, 2^1 and 2^30 cancel or are swallowed according to the order).
+
+### Tests
+
+All wired into CMake. Each was shown to fail when the change is wrong (mutation checks, run on server2 against scratch copies):
+
+| test | what it holds | mutations that fail it |
+| --- | --- | --- |
+| `test_memrmw_lockfree` (`tests/unit`) | `atomic_rmw` against load_scalar / operation / store_scalar over 120 000 random accesses (aligned or not, over the edges, freed, host-mapped, faults armed or cells stuck, uniform, real and never-written chunks, `always_store` both ways): values, memory left, chunks made real, error text; declines without calling the operation; six threads, no lock, adding, xor-ing and taking maxima on words in an unwritten, a uniform and a real chunk, final values equal the serial result; `load_quad_run / store_quad_run` against the quads one at a time | CAS replaced by a plain store; `always_store` ignored; a quad run reading a uniform chunk as zero |
+| `test_amd_gcn_atomics` (extended) | 20 000 work-groups of `returning` (add, sub, xor, exchange) and 512 of `wide` (float and 64-bit add) on 8, 3 and 1 threads, lock-free and locked (`amd::set_fast_paths`): the words add up | CAS replaced by a plain store |
+| `test_amd_gcn_memruns` (new, kernels `amd/tests/data/memruns.c`, built for gfx942, 1030, 1100, 1201, 1250; run on all five) | seven copy kernels (1, 2 and 4 words, 32- and 64-bit offsets) over 18 address patterns (consecutive, reversed, strided, repeated, overlapping stores, misaligned, over chunk and allocation edges, off the end, wild, random) and 7 lane masks, 3 draws each, new path on and off against twin memories: memory images, resident bytes, error text, wave / instruction / VMEM / flat counts | stores in reverse lane order; the exec mask ignored when extending a run; a load run landing in the wrong lane |
+| `test_amd_mfma_math` (new) | all 65 536 binary16 values widened to the compiler's double, bit for bit (NaN payload, zero sign); the contiguous dot products against the strided ones they replaced; four at once against one at a time; order of summation | subnormal bias off by one; four-wide sums out of order |
+| `test_amd_gcn_asm` (extended, kernels `asm_mfma_order.s`) | `v_mfma_f32_4x4x4_16b_f16`, `16x16x16_f16` and `32x32x8_f16` with a non-zero accumulator on random halves and on powers of two whose sums depend on the order, against the arithmetic written out from the layouts | B halves swapped; four-wide sums out of order |

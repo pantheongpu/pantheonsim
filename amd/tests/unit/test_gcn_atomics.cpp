@@ -163,7 +163,7 @@ VTEST(atomics_from_work_groups_on_many_threads_lose_nothing) {
 }
 
 // The integer atomics of `returning` -- an add, a subtract and an exclusive or that give back what they found, and an
-// exchange -- from 512 work-groups on eight threads, both ways: the words end up what the operations add up to (the
+// exchange -- from 20000 work-groups on eight threads, both ways: the words end up what the operations add up to (the
 // exchange leaves one of the lanes' values), whichever order the groups landed in. The initial values make the
 // first-touch of a chunk (no chunk made real yet) part of the race.
 VTEST(integer_atomics_from_many_threads_add_up_with_and_without_the_lock) {
@@ -172,7 +172,7 @@ VTEST(integer_atomics_from_many_threads_add_up_with_and_without_the_lock) {
   VCHECK(k != nullptr);
   std::vector<int32_t> in(kN);
   for (int i = 0; i < kN; ++i) in[i] = (i * 7919) | 1;
-  const uint32_t groups = 512;
+  const uint32_t groups = 20000;   // many and tiny, so that threads meet on the words
   int32_t sum = 0, xo = 0;
   for (int i = 0; i < kN; ++i) sum += in[i], xo ^= in[i];
   for (const bool lock_free : {true, false})
