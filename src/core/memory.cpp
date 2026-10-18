@@ -1512,4 +1512,81 @@ MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t s
   return ScalarAt::Chunk;
 }
 
+// ---- read-modify-write and multi-field reads: load_scalar / store_scalar with one lookup ----
+
+bool MemoryManager::rmw_locate(uint64_t addr, uint32_t size, RmwSlot* s) const {
+  if ((size != 1 && size != 2 && size != 4 && size != 8) || (addr & (size - 1))) return false;
+  if (access_faults_armed()) return false;
+  if (host_maps_ && host_maps_->may_contain(addr)) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(addr, size, &base);
+  if (!a) return false;
+  const uint64_t off = addr - base;
+  s->a = const_cast<Allocation*>(a);
+  s->chunk_idx = off / kChunkSize;
+  s->coff = off % kChunkSize;
+  s->chunk = a->chunks[s->chunk_idx].load(std::memory_order_acquire);
+  return true;
+}
+
+bool MemoryManager::rmw_scalar_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out) {
+  RmwSlot s;
+  if (!rmw_locate(addr, size, &s)) return false;
+  const uint64_t old = rmw_load(s, size);
+  *old_out = old;
+  rmw_store(s, size, compute(ctx, old));
+  return true;
+}
+
+uint64_t MemoryManager::rmw_load(const RmwSlot& s, uint32_t size) const {
+  if (!s.chunk) return 0;
+  if (is_uniform(s.chunk)) return repeated(uniform_byte(s.chunk), size);
+  return load_at(s.chunk + s.coff, size);
+}
+
+void MemoryManager::rmw_store(RmwSlot& s, uint32_t size, uint64_t value) {
+  uint8_t* chunk = s.chunk;
+  // A chunk that was real stays so; one that was not may have been made real since.
+  if (!chunk || is_uniform(chunk)) chunk = s.a->chunks[s.chunk_idx].load(std::memory_order_acquire);
+  if (is_uniform(chunk)) {
+    // As store_scalar: a uniform chunk is left alone by a store of its own byte.
+    if (value == repeated(uniform_byte(chunk), size)) return;
+  }
+  if (!chunk || is_uniform(chunk)) chunk = materialize(*s.a, s.chunk_idx);
+  store_at(chunk + s.coff, size, value);
+}
+
+bool MemoryManager::load_fields(uint64_t addr, const uint8_t* sizes, unsigned n, uint64_t* out) const {
+  uint64_t total = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t sz = sizes[i];
+    if (sz == 0) continue;
+    if ((sz != 1 && sz != 2 && sz != 4 && sz != 8) || ((addr + total) & (sz - 1))) return false;
+    if (host_maps_ && host_maps_->may_contain(addr + total)) return false;
+    total += sz;
+  }
+  if (total == 0) {
+    for (unsigned i = 0; i < n; ++i) out[i] = 0;
+    return true;
+  }
+  if (access_faults_armed()) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(addr, total, &base);
+  if (!a) return false;
+  uint64_t off = addr - base;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t sz = sizes[i];
+    if (sz == 0) {
+      out[i] = 0;
+      continue;
+    }
+    const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (!chunk) out[i] = 0;
+    else if (is_uniform(chunk)) out[i] = repeated(uniform_byte(chunk), sz);
+    else out[i] = load_at(chunk + off % kChunkSize, sz);
+    off += sz;
+  }
+  return true;
+}
+
 }  // namespace vgpu

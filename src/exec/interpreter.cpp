@@ -1487,6 +1487,39 @@ uint64_t texel_raw(const MemoryManager& mem, const TextureDesc& d, uint64_t addr
   return texel_channel_bits(mem, d, addr, ch);
 }
 
+// The channels of the texel at `addr` that `need` (a mask of channels) asks for, read together -- texel_raw for each of
+// them, with one lookup of the address (MemoryManager::load_fields) instead of one per channel. True with out[ch] set for
+// each channel in `need`; false, having read nothing, whenever reading them one at a time could differ -- a block-compressed
+// format, a channel the caller does not need but the layout would read, a fault armed, a field the memory manager declines
+// (misaligned, outside the allocation, a size it has no load for) -- and the caller then calls texel_raw per channel,
+// and meets any error in the channel where it did.
+[[gnu::noinline]] bool texel_channels(const MemoryManager& mem, const TextureDesc& d, uint32_t need, uint64_t addr, uint64_t out[4]) {
+  if (d.block != BlockFormat::None) return false;
+  if (d.packed_1010102) {   // one 32-bit word, read once instead of once per channel
+    if (!(need & 0xF)) return false;
+    uint64_t w;
+    const uint8_t four = 4;
+    if (!mem.load_fields(addr, &four, 1, &w)) return false;
+    static constexpr uint32_t kShift[4] = {0, 10, 20, 30}, kBits[4] = {10, 10, 10, 2};
+    for (uint32_t ch = 0; ch < 4; ++ch)
+      if (need & (1u << ch)) out[ch] = (w >> kShift[ch]) & ((1u << kBits[ch]) - 1);
+    return true;
+  }
+  uint8_t sizes[4];
+  uint32_t any = 0;
+  for (uint32_t ch = 0; ch < 4; ++ch) {
+    sizes[ch] = static_cast<uint8_t>(d.channel_bits[ch] / 8);
+    if (sizes[ch] && !(need & (1u << ch))) return false;   // would read a channel the caller does not
+    any |= sizes[ch];
+  }
+  if (!any) return false;
+  uint64_t v[4];
+  if (!mem.load_fields(addr, sizes, 4, v)) return false;
+  for (uint32_t ch = 0; ch < 4; ++ch)
+    if (need & (1u << ch)) out[ch] = v[ch];
+  return true;
+}
+
 // sRGB decoding, as an RTX 3060's texture unit does it: through a table, not
 // the sRGB formula -- its entries (in 1/65536ths, measured for every code)
 // have at most 8 significant bits, and the low codes run at 20/65536 a
@@ -1922,13 +1955,19 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
   int64_t isum[4] = {0, 0, 0, 0};
   double fv[4][16];
   uint32_t codes[4][16] = {};
+  uint32_t need = 0;
+  for (uint32_t ch = 0; ch < 4; ++ch) need |= d.channel_bits[ch] ? 1u << ch : 0u;
   for (int k = 0; k < n; ++k) {
+    uint64_t pre[4];
+    const bool have = fast && terms[k].w != 0 && !terms[k].border &&
+                      texel_channels(mem, terms[k].src ? *terms[k].src : d, need, terms[k].addr, pre);
     for (uint32_t ch = 0; ch < 4; ++ch) {
       if (!d.channel_bits[ch]) continue;
       if (terms[k].w == 0) { fv[ch][k] = 0; continue; }
       const uint32_t bits = d.channel_bits[ch];   // the channels of a block-compressed format differ in width
       const TextureDesc& at = terms[k].src ? *terms[k].src : d;
       const uint64_t raw = terms[k].border ? tex_border_raw(d, ch)
+                                           : have ? pre[ch]
                                            : texel_raw(mem, at, terms[k].addr, terms[k].x, terms[k].y, terms[k].z, ch);
       if (is_float) {
         double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
@@ -2341,8 +2380,10 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
   const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
   const uint64_t plane = row * (v.height ? v.height : 1);
   const uint64_t addr = v.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * v.texel_bytes;
+  uint64_t pre[4];
+  const bool have = g_fast_path.load(std::memory_order_relaxed) && texel_channels(mem, v, 0xF, addr, pre);
   for (uint32_t ch = 0; ch < 4; ++ch)
-    out[ch] = convert_channel(v, ch, texel_raw(mem, v, addr, idx[0], idx[1], idx[2], ch), f.float_result);
+    out[ch] = convert_channel(v, ch, have ? pre[ch] : texel_raw(mem, v, addr, idx[0], idx[1], idx[2], ch), f.float_result);
 }
 
 // suld/sust address a surface in *bytes* along x and in whole rows along y
@@ -5346,6 +5387,30 @@ class Interpreter {
     try {
       mem_.store_scalar(addr, size, value);
     } catch (const Error& e) {
+      rethrow_with_context(e, ins, static_cast<int>(lane));
+    }
+  }
+
+  // The memory side of an atomic on global memory -- load_routed, `compute`, store_routed -- with the address looked up
+  // once (MemoryManager::rmw_scalar). False, having done nothing, when the access is not plain global memory or the
+  // manager could not promise the same as the two calls (a fault armed, a host mapping, a bad address): the caller
+  // then makes the two calls, with their diagnostics. An error from `compute` is the caller's own and passes as it is.
+  template <class F>
+  bool rmw_global(const Instr& ins, uint32_t lane, uint64_t addr, uint32_t size, F&& compute, uint64_t* old) {
+    if (is_shared(addr) || is_local(addr) || (addr >= kParamVaBase && addr < kParamVaBase + kParamVaSize)) return false;
+    bool in_compute = false;
+    try {
+      return mem_.rmw_scalar(
+          addr, size,
+          [&](uint64_t o) {
+            in_compute = true;
+            const uint64_t nv = compute(o);
+            in_compute = false;
+            return nv;
+          },
+          old);
+    } catch (const Error& e) {
+      if (in_compute) throw;
       rethrow_with_context(e, ins, static_cast<int>(lane));
     }
   }
@@ -13128,8 +13193,11 @@ class Interpreter {
             continue;
           }
         }
-        const uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
-        store_routed(w, ctx, ins, lane, addr, size, compute(old));
+        uint64_t old;
+        if (!rmw_global(ins, lane, addr, size, compute, &old)) {
+          old = load_routed(w, ctx, ins, lane, addr, size);
+          store_routed(w, ctx, ins, lane, addr, size, compute(old));
+        }
         r[lane] = old;
       }
     // `red` performed the read-modify-write and has nowhere to put the old
