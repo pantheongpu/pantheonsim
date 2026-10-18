@@ -80,6 +80,61 @@ __global__ void k_local(const uint32_t* in, uint32_t* out) {
   o[11] = mix(a16.x, b8.y);
 }
 
+
+// Local memory read back at other widths than it was written, through a callee's pointer, and in recursive frames. The
+// warp's local array is interleaved by words (include/vgpu/exec/local_layout.hpp); this is what finds a byte that landed in
+// the wrong word. One body, run on the device and on the host (volatile, so that the compiler leaves every access in
+// local memory and at its width), so the host is the reference.
+constexpr int kAliasWords = 24;
+__device__ __host__ __attribute__((noinline)) void fill_words(volatile uint32_t* p, int n, uint32_t seed) {
+  for (int i = 0; i < n; ++i) p[i] = seed * (2u * i + 1u) + static_cast<uint32_t>(i);
+}
+__device__ __host__ __attribute__((noinline)) uint32_t frame_fn(int depth, uint32_t seed) {
+  volatile uint32_t f[8];   // (indexed by the seed, so that the arrays stay in this call's local frame)
+  volatile uint8_t fb[16];
+  const uint32_t s1 = seed & 7u, s2 = (seed >> 3) & 15u;
+  for (uint32_t i = 0; i < 8; ++i) f[(i + s1) & 7u] = seed * (i + 3u) + static_cast<uint32_t>(depth);
+  for (uint32_t i = 0; i < 16; ++i) fb[(i + s2) & 15u] = static_cast<uint8_t>((seed >> (i & 7)) + i);
+  uint32_t acc = depth > 0 ? frame_fn(depth - 1, seed * 31u + 7u) : 0u;   // (this call's arrays must survive the callee's frames)
+  for (uint32_t i = 0; i < 8; ++i) acc = acc * 17u + f[(i * 5u + static_cast<uint32_t>(depth)) & 7u] + fb[(i * 3u + (seed & 3u)) & 15u];
+  return acc;
+}
+__device__ __host__ void alias_body(const uint32_t* in4, uint32_t* o) {
+  alignas(8) volatile uint8_t raw[72];
+  volatile uint8_t* b8 = raw;
+  volatile uint16_t* b16 = reinterpret_cast<volatile uint16_t*>(raw);
+  volatile uint32_t* b32 = reinterpret_cast<volatile uint32_t*>(raw);
+  volatile uint64_t* b64 = reinterpret_cast<volatile uint64_t*>(raw);
+  for (int i = 0; i < 72; ++i) b8[i] = static_cast<uint8_t>(in4[i & 3] >> ((i * 5) & 15)) ^ static_cast<uint8_t>(i);
+  const uint32_t a = in4[0], b = in4[1], c = in4[2], d = in4[3];
+  b32[a & 15] = b;                                   // words at lane-dependent places
+  b16[(b >> 3) & 31] = static_cast<uint16_t>(c);     // halves, both in a word
+  b16[(c >> 5) & 31] = static_cast<uint16_t>(d >> 4);
+  b64[(d >> 7) & 7] = (uint64_t{a} << 32) | c;       // a pair of words
+  b8[(a >> 2) & 63] = static_cast<uint8_t>(d);       // single bytes, any place
+  b8[(b >> 9) & 63] = static_cast<uint8_t>(a);
+  b8[(c >> 11) & 63] = static_cast<uint8_t>(b >> 8);
+  // Some lanes only (the warp diverges on the data), at constant offsets: part of a warp at one offset.
+  if (b & 1) { for (int i = 0; i < 4; ++i) b32[2 + i] = c + static_cast<uint32_t>(i); b8[5] = static_cast<uint8_t>(c); }
+  if (d & 2) { b64[3] = (uint64_t{d} << 32) | a; b16[9] = static_cast<uint16_t>(b); }
+  for (int i = 0; i < 16; ++i) o[i] = b32[i];       // whole words over what the narrower ones wrote
+  for (int i = 0; i < 4; ++i) o[16 + i] = static_cast<uint32_t>(b64[i * 2 + 1]) ^ static_cast<uint32_t>(b64[i * 2] >> 32);
+  uint32_t h = 0, g = 0;
+  for (int i = 0; i < 64; ++i) h = h * 31u + b8[i];
+  for (int i = 0; i < 32; ++i) g = g * 33u + b16[i];
+  o[20] = h;
+  o[21] = g;
+  // The frame of a callee that is handed a pointer into this one, and frames below that.
+  alignas(8) volatile uint32_t mine[6];
+  fill_words(mine, 6, a | 1u);
+  o[22] = mine[(b & 3) + 1] + frame_fn(static_cast<int>(c & 3), d);
+  o[23] = mine[0] ^ mine[5];
+}
+__global__ void k_alias(const uint32_t* in, uint32_t* out) {
+  const int g = blockIdx.x * kThreads + threadIdx.x;
+  alias_body(in + 4 * g, out + kAliasWords * g);
+}
+
 // The host's version of both kernels.
 static void expect_shared(const std::vector<uint32_t>& in, std::vector<uint32_t>& out) {
   for (int blk = 0; blk < kBlocks; ++blk) {
@@ -175,6 +230,25 @@ int main() {
                       i / 12, i % 12, got[i], want[i]);
       }
     std::printf("%s: %d of %zu words differ\n", which ? "local" : "shared", mismatches, got.size());
+    bad += mismatches;
+  }
+  // Local memory at mixed widths and in frames: the host runs the same body.
+  {
+    std::vector<uint32_t> gotA(kAliasWords * n), wantA(kAliasWords * n);
+    CHECK_CUDA(cudaFree(d_out));
+    CHECK_CUDA(cudaMalloc(&d_out, gotA.size() * 4));
+    CHECK_CUDA(cudaMemset(d_out, 0xff, gotA.size() * 4));
+    k_alias<<<kBlocks, kThreads>>>(d_in, d_out);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMemcpy(gotA.data(), d_out, gotA.size() * 4, cudaMemcpyDeviceToHost));
+    for (int g = 0; g < n; ++g) alias_body(&in[4 * g], &wantA[kAliasWords * g]);
+    int mismatches = 0;
+    for (size_t i = 0; i < gotA.size(); ++i)
+      if (gotA[i] != wantA[i] && mismatches++ < 5)
+        std::printf("alias: word %zu (thread %zu, field %zu): got %08x, expected %08x\n", i, i / kAliasWords,
+                    i % kAliasWords, gotA[i], wantA[i]);
+    std::printf("alias: %d of %zu words differ\n", mismatches, gotA.size());
     bad += mismatches;
   }
   cudaFree(d_in);

@@ -48,6 +48,7 @@
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
+#include "vgpu/exec/local_layout.hpp"
 #include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
@@ -604,7 +605,10 @@ struct Warp {
   // Set by a call that pushed a frame, so the caller's pc is not advanced a
   // second time: the frame already holds it past the call.
   bool entered_call = false;
-  std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
+  // The lanes' .local frames in one array, interleaved by words (exec/local_layout.hpp), local_cap bytes for each lane;
+  // made on the first access and grown to the frame a call needs.
+  std::vector<uint8_t> local;
+  uint64_t local_cap = 0;
   // The alloca stack: each lane's bytes, and its stack pointer (a local-space
   // offset, from kStackOffset up to kStackOffset + the stack size); unset
   // until the warp first touches the stack.
@@ -5202,12 +5206,15 @@ class Interpreter {
                    "-byte shared allocation for this block");
   }
 
-  std::vector<uint8_t>& lane_local(Warp& w, uint32_t lane) {
-    if (w.local.empty()) w.local.resize(W_);
-    auto& buf = w.local[lane];
+  // The warp's local array, big enough for the current function's frame (bytes added are zero); read and write it with
+  // exec::local_load / local_store (W_ lanes).
+  uint8_t* local_array(Warp& w) {
     const uint64_t top = local_top();
-    if (buf.size() < top) buf.resize(top, 0);
-    return buf;
+    if (w.local_cap < top) {
+      w.local.resize(exec::local_array_bytes(W_, top), 0);
+      w.local_cap = top;
+    }
+    return w.local.data();
   }
 
   // A lane's alloca stack (PTX ISA 9.7.19): its pointer starts at the top and
@@ -5336,7 +5343,7 @@ class Interpreter {
         return v;
       }
       check_local(ins, static_cast<int>(lane), addr, size);
-      std::memcpy(&v, lane_local(w, lane).data() + (addr - kLocalVaBase), size);
+      v = exec::local_load(local_array(w), W_, lane, addr - kLocalVaBase, size);
       return v;
     }
     // A generic pointer to a kernel parameter -- a __grid_constant__ taken by
@@ -5378,7 +5385,7 @@ class Interpreter {
         return;
       }
       check_local(ins, static_cast<int>(lane), addr, size);
-      std::memcpy(lane_local(w, lane).data() + (addr - kLocalVaBase), &value, size);
+      exec::local_store(local_array(w), W_, lane, addr - kLocalVaBase, size, value);
       return;
     }
     if (addr >= kParamVaBase && addr < kParamVaBase + kParamVaSize)
@@ -11775,9 +11782,9 @@ class Interpreter {
       uint64_t offs[kMaxWarpSize];
       if (local_lanes_inside(base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
         LaneSet got(n);
+        const uint8_t* buf = local_array(w);
         for_active(m, W_, [&](uint32_t lane) {
-          const uint8_t* buf = lane_local(w, lane).data();
-          for (size_t e = 0; e < n; ++e) got[e][lane] = load_bytes(buf + offs[lane] + e * size, size);
+          for (size_t e = 0; e < n; ++e) got[e][lane] = exec::local_load(buf, W_, lane, offs[lane] + e * size, size);
         });
         for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, got[e], op.ty);
         return;
@@ -11894,10 +11901,10 @@ class Interpreter {
     if (op.space == Space::Local && fast_enabled_ && !(op.ordered && n > 1)) {
       uint64_t offs[kMaxWarpSize];
       if (local_lanes_inside(base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
+        uint8_t* buf = local_array(w);
         for_active(m, W_, [&](uint32_t lane) {
-          uint8_t* buf = lane_local(w, lane).data();
           for (size_t e = 0; e < n; ++e)
-            store_bytes(buf + offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
+            exec::local_store(buf, W_, lane, offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
         });
         return;
       }
