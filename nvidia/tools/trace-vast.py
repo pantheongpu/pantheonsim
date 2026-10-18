@@ -58,7 +58,7 @@ def main() -> int:
                      + [os.path.join(E2E, "cupti_test_util.h"), os.path.join(HERE, "trace-collect-remote.sh")])
             for f in files:
                 host.push(f, "/tmp/tr/")
-            log = host.ssh("bash /tmp/tr/trace-collect-remote.sh /tmp/tr", timeout=3000, check=False)
+            log = host.ssh(f"TRACE_ONLY='{os.environ.get('TRACE_ONLY', '')}' bash /tmp/tr/trace-collect-remote.sh /tmp/tr", timeout=3000, check=False)
             open(os.path.join(outdir, "..", f"{slug}.run.log"), "w").write(log.stdout or "")
             host.pull("/tmp/tr/out/*", outdir)
             t = os.path.join(outdir, "trace.txt")

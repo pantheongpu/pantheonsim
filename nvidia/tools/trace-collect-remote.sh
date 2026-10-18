@@ -71,10 +71,18 @@ nvcc -cubin -arch=sm_$arch -Wno-deprecated-gpu-targets "$src/cupti_resource_modu
 for f in "$src"/cupti_*.cu; do
   c="$(basename "$f" .cu)"; c="${c#cupti_}"
   [[ "$c" == resource_module || "$c" == activity ]] && continue
+  [[ -n "${TRACE_ONLY:-}" && " $TRACE_ONLY " != *" $c "* ]] && continue
   if [[ "$c" == misc || "$c" == peer ]] && (( ngpu < 2 )); then echo "SKIP: needs two GPUs" > "$out/$c.txt"; continue; fi
+  if [[ "$c" == trace_driver ]]; then
+    # A driver-API program, built as the CI runner builds it (run_cupti_trace_driver.sh): no CUDA
+    # runtime in the process, since loading one changes what initializes the driver when.
+    nvcc -x c++ -std=c++17 -cudart none -Wno-deprecated-gpu-targets -I"$src" -I"$inc" "$f" -o "$out/$c.bin" -lcupti -L"$libs" -lcuda -L"$stubs" 2>"$out/$c.build.err" \
+      || { echo "BUILD FAILED" > "$out/$c.txt"; continue; }
+  else
   nvcc -std=c++17 -cudart shared -gencode arch=compute_$arch,code=sm_$arch -gencode arch=compute_$arch,code=compute_$arch \
-       -Wno-deprecated-gpu-targets -I"$src" -I"$inc" "$f" -o "$out/$c.bin" -lcupti -L"$libs" -lcuda -L"$stubs" 2>"$out/$c.build.err" \
-    || { echo "BUILD FAILED" > "$out/$c.txt"; continue; }
+         -Wno-deprecated-gpu-targets -I"$src" -I"$inc" "$f" -o "$out/$c.bin" -lcupti -L"$libs" -lcuda -L"$stubs" 2>"$out/$c.build.err" \
+      || { echo "BUILD FAILED" > "$out/$c.txt"; continue; }
+  fi
   CUPTI_TEST_CUBIN="$([[ $c == resource ]] && echo "$cubin")" NVTX_INJECTION64_PATH="$(ls "$libs"/libcupti.so.[0-9]* | head -1)" \
     LD_LIBRARY_PATH="$libs:$(dirname "$libs")/../lib64:$cuda_root/lib64:$cuda_root/targets/x86_64-linux/lib" timeout 300 "$out/$c.bin" > "$out/$c.txt" 2>"$out/$c.run.err" || echo "EXIT $?" >> "$out/$c.txt"
   echo "$c: $(wc -l < "$out/$c.txt") lines"

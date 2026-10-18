@@ -60,7 +60,7 @@ def main() -> int:
                  + [os.path.join(E2E, "cupti_test_util.h"), os.path.join(HERE, "trace-collect-remote.sh")])
         for f in files:
             host.push(f, "/tmp/tr/")
-        env = f"TRACE_CUDA={os.environ.get('TRACE_CUDA', '')}"
+        env = f"TRACE_CUDA={os.environ.get('TRACE_CUDA', '')} TRACE_ONLY='{os.environ.get('TRACE_ONLY', '')}'"
         log = host.ssh(f"{env} bash /tmp/tr/trace-collect-remote.sh /tmp/tr", timeout=3000, check=False)
         open(os.path.join(outdir, "..", f"{args.type}.run.log"), "w").write(log.stdout or "")
         host.pull("/tmp/tr/out/*", outdir)

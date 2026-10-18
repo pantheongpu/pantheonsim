@@ -14,7 +14,7 @@
 | g4dn.xlarge | t4 | params | 251 | 8 | differs |
 | g4dn.xlarge | t4 | resource | 120 | 43 | differs |
 | g4dn.xlarge | t4 | trace | 99 | 0 | identical |
-| g4dn.xlarge | t4 | trace_driver | 225 | 354 | differs |
+| g4dn.xlarge | t4 | trace_driver | 225 | 0 | identical |
 | g4dn.xlarge | t4 | um | 24 | 2 | differs |
 | g5.xlarge | a10g | buffers | 16 | 0 | identical |
 | g5.xlarge | a10g | compat12 | - | - | card: SKIP: this needs the CUDA 12.3 to 12.9 headers (the _v2 entry points) |
@@ -30,7 +30,7 @@
 | g5.xlarge | a10g | params | 251 | 8 | differs |
 | g5.xlarge | a10g | resource | 120 | 43 | differs |
 | g5.xlarge | a10g | trace | 99 | 0 | identical |
-| g5.xlarge | a10g | trace_driver | 225 | 354 | differs |
+| g5.xlarge | a10g | trace_driver | 225 | 0 | identical |
 | g5.xlarge | a10g | um | 24 | 2 | differs |
 | g5g.xlarge | (none) | all | - | - | no simulator profile for this card |
 | g6.xlarge | l4 | buffers | 16 | 0 | identical |
@@ -47,7 +47,7 @@
 | g6.xlarge | l4 | params | 251 | 8 | differs |
 | g6.xlarge | l4 | resource | 120 | 43 | differs |
 | g6.xlarge | l4 | trace | 99 | 0 | identical |
-| g6.xlarge | l4 | trace_driver | 225 | 354 | differs |
+| g6.xlarge | l4 | trace_driver | 225 | 0 | identical |
 | g6.xlarge | l4 | um | 24 | 2 | differs |
 | g6e.2xlarge | l40s | buffers | 16 | 0 | identical |
 | g6e.2xlarge | l40s | compat12 | - | - | card: SKIP: this needs the CUDA 12.3 to 12.9 headers (the _v2 entry points) |
@@ -63,6 +63,6 @@
 | g6e.2xlarge | l40s | params | 251 | 8 | differs |
 | g6e.2xlarge | l40s | resource | 120 | 43 | differs |
 | g6e.2xlarge | l40s | trace | 99 | 0 | identical |
-| g6e.2xlarge | l40s | trace_driver | 225 | 354 | differs |
+| g6e.2xlarge | l40s | trace_driver | 225 | 354 | differs (collector bug, see README) |
 | g6e.2xlarge | l40s | um | 24 | 2 | differs |
 | g7.2xlarge | (none) | all | - | - | no simulator profile for this card |

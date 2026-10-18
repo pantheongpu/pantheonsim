@@ -1,0 +1,12 @@
+get default -> CUPTI_SUCCESS, type 0
+get(NULL) -> CUPTI_ERROR_INVALID_PARAMETER
+device record for device 0: seen; uuid equals cudaDeviceProp.uuid: 1; uuid not all zero: 1
+default type: runtime records seen: 1; all carry pthread_self: 1; all carry gettid: 0
+set SYSTEM -> CUPTI_SUCCESS
+get -> CUPTI_SUCCESS, type 1
+system type: runtime records seen: 1; all carry pthread_self: 0; all carry gettid: 1
+set DEFAULT -> CUPTI_SUCCESS
+get -> CUPTI_SUCCESS, type 0
+default again: runtime records seen: 1; all carry pthread_self: 1; all carry gettid: 0
+set 7 -> CUPTI_ERROR_NOT_SUPPORTED
+get -> CUPTI_SUCCESS, type 0

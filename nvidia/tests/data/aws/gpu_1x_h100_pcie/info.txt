@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA H100 PCIe, 9.0, 81559 MiB, 570.148.08, GPU-aeff92e5-dfdc-5620-d255-d5ad1d0987be
+Cuda compilation tools, release 12.8, V12.8.93
+Build cuda_12.8.r12.8/compiler.35583870_0
+ngpu=1 arch=sm_90 libs=/usr/lib/x86_64-linux-gnu inc=/usr/include

@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA GeForce RTX 4090, 8.9, 49140 MiB, 580.178.04, GPU-fcc5d237-0a89-071f-57a2-3b0c04a9cf4e
+Cuda compilation tools, release 13.0, V13.0.88
+Build cuda_13.0.r13.0/compiler.36424714_0
+ngpu=1 arch=sm_89 libs=/usr/local/cuda-13.0/lib64 inc=/usr/local/cuda-13.0/include

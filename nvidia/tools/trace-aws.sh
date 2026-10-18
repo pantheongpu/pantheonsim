@@ -160,7 +160,7 @@ SCP="scp -i $key_file -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/
 $SSH 'mkdir -p /tmp/tr'
 $SCP "$here"/nvidia/tests/e2e/cupti_*.cu "$here"/nvidia/tests/e2e/cupti_*.inc "$here"/nvidia/tests/e2e/cupti_test_util.h \
      "$here/nvidia/tools/trace-collect-remote.sh" ubuntu@"$IP":/tmp/tr/
-$SSH "TRACE_CUDA=${TRACE_CUDA:-} bash /tmp/tr/trace-collect-remote.sh /tmp/tr" > "$outdir/${type_name}.run.log" 2>&1
+$SSH "TRACE_CUDA=${TRACE_CUDA:-} TRACE_ONLY='${TRACE_ONLY:-}' bash /tmp/tr/trace-collect-remote.sh /tmp/tr" > "$outdir/${type_name}.run.log" 2>&1
 mkdir -p "$outdir/$type_name"
 $SCP -r ubuntu@"$IP":/tmp/tr/out/. "$outdir/$type_name/" 2>/dev/null
 if [[ -s "$outdir/$type_name/info.txt" ]] && [[ -s "$outdir/$type_name/trace.txt" ]] && ! grep -q "BUILD FAILED" "$outdir/$type_name/trace.txt"; then

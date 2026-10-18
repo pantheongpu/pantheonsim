@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA A10, 8.6, 23028 MiB, 570.148.08, GPU-ea3949ec-af3b-e114-3416-8a6102e43d03
+Cuda compilation tools, release 12.8, V12.8.93
+Build cuda_12.8.r12.8/compiler.35583870_0
+ngpu=1 arch=sm_86 libs=/usr/lib/x86_64-linux-gnu inc=/usr/include
