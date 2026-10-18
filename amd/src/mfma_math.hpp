@@ -30,11 +30,52 @@ inline double half_bits_to_double(uint16_t h) {
   return d;
 }
 
+
+// A product and a sum with the NaN rule of the machine spelled out. Where both operands of an x86 SSE multiply or add are
+// NaNs the result is the first one (the destination register's), and which of two commutative operands the compiler puts
+// there is its choice -- one that differs between loops, and between a scalar and a vectorized form of the same loop. The
+// recorded results of the instructions (test_amd_gcn_same_bits) have NaN payloads that depend on it, so the order is fixed
+// here: the sum is the first operand of the add, B the first of the multiply, and the fused form takes B first as well
+// (found by trying the combinations against the recorded digests; random operands with NaNs among them, which the earlier
+// test data -- no NaNs, or one quiet NaN -- could not see).
+#ifndef MFMA_MUL_FIRST_A
+#define MFMA_MUL_FIRST_A 0
+#endif
+#ifndef MFMA_ADD_FIRST_SUM
+#define MFMA_ADD_FIRST_SUM 1
+#endif
+inline double mfma_mul(double a, double b) {
+#if defined(__x86_64__)
+#if MFMA_MUL_FIRST_A
+  __asm__("mulsd %1, %0" : "+x"(a) : "x"(b));
+  return a;
+#else
+  __asm__("mulsd %1, %0" : "+x"(b) : "x"(a));
+  return b;
+#endif
+#else
+  return a * b;
+#endif
+}
+inline double mfma_add(double sum, double p) {
+#if defined(__x86_64__)
+#if MFMA_ADD_FIRST_SUM
+  __asm__("addsd %1, %0" : "+x"(sum) : "x"(p));
+  return sum;
+#else
+  __asm__("addsd %1, %0" : "+x"(p) : "x"(sum));
+  return p;
+#endif
+#else
+  return sum + p;
+#endif
+}
+
 // One output of a matrix multiply-accumulate: c plus the dot product of a row of A with a column of B, k terms taken in
 // order and summed in double (so the order is the result). `bt` is that column, stored contiguously.
 inline double mfma_dot(const double* a, const double* bt, uint32_t k, double c) {
   double sum = c;
-  for (uint32_t i = 0; i < k; ++i) sum += a[i] * bt[i];
+  for (uint32_t i = 0; i < k; ++i) sum = mfma_add(sum, mfma_mul(a[i], bt[i]));
   return sum;
 }
 // Four of them at once, from four rows and four columns: four sums that nothing joins, each taken in order, so each
@@ -42,17 +83,17 @@ inline double mfma_dot(const double* a, const double* bt, uint32_t k, double c) 
 inline void mfma_dot4(const double* const a[4], const double* const bt[4], uint32_t k, const double c[4], double out[4]) {
   double s0 = c[0], s1 = c[1], s2 = c[2], s3 = c[3];
   for (uint32_t i = 0; i < k; ++i) {
-    s0 += a[0][i] * bt[0][i];
-    s1 += a[1][i] * bt[1][i];
-    s2 += a[2][i] * bt[2][i];
-    s3 += a[3][i] * bt[3][i];
+    s0 = mfma_add(s0, mfma_mul(a[0][i], bt[0][i]));
+    s1 = mfma_add(s1, mfma_mul(a[1][i], bt[1][i]));
+    s2 = mfma_add(s2, mfma_mul(a[2][i], bt[2][i]));
+    s3 = mfma_add(s3, mfma_mul(a[3][i], bt[3][i]));
   }
   out[0] = s0, out[1] = s1, out[2] = s2, out[3] = s3;
 }
 // The fused form, for the double-precision instruction.
 inline double mfma_dot_fma(const double* a, const double* bt, uint32_t k, double c) {
   double sum = c;
-  for (uint32_t i = 0; i < k; ++i) sum = std::fma(a[i], bt[i], sum);
+  for (uint32_t i = 0; i < k; ++i) sum = std::fma(bt[i], a[i], sum);
   return sum;
 }
 // Integers are summed exactly and wrap as the hardware's do.
