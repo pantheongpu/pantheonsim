@@ -4,7 +4,7 @@
 #   make help         this help
 #   make deps         install the missing build tools (asks first; YES=1 to skip the question)
 #   make doctor       check the tools a build needs
-#   make build        build the simulator (build/vgpu), no installs
+#   make build        build the simulator (build/vgpu), no installs (half the CPUs; JOBS=N)
 #   make demo         run a built-in kernel on the simulated GPU
 #   make run APP=./my_app ARGS="..."
 #
@@ -19,6 +19,15 @@
 
 VGPU ?= build/vgpu
 NICE ?= nice -n 10
+
+# Simulator threads for run, shell and demo: half the CPUs unless VGPU_THREADS is
+# set or the settings file has `threads:` (scripts/half-threads.sh). THREADS=N beats it.
+ifndef VGPU_THREADS
+DEFAULT_THREADS := $(shell ./scripts/half-threads.sh $(if $(filter command line,$(origin CONFIG)),'$(CONFIG)') 2>/dev/null)
+ifneq ($(DEFAULT_THREADS),)
+export VGPU_THREADS := $(DEFAULT_THREADS)
+endif
+endif
 
 .DEFAULT_GOAL := all
 .NOTPARALLEL:
@@ -42,6 +51,8 @@ SHELL_FLAGS := $(call flag,GPU,--gpu) $(call flag,COUNT,--count) $(call flag,VRA
                $(call flag,DRIVER_VERSION,--driver) $(call flag,SHELL_OS,--os) \
                $(if $(call on_cmdline,ASK),,-y)
 DEMO_FLAGS  := $(call flag,GPU,--gpu) $(call flag,N,-n)
+# JOBS=N forces the build's parallel jobs (CI_JOBS=N); without it the build uses half the CPUs.
+BUILD_ENV   := $(if $(call on_cmdline,JOBS),CI_JOBS='$(JOBS)' )
 INIT_ARGS   := $(if $(call on_cmdline,CONFIG),'$(CONFIG)') $(call switch,FORCE,--force)
 
 # run and demo build first when there is no build yet.
@@ -59,7 +70,8 @@ Targets
   make deps            install cmake and a C++20 compiler if missing (asks; YES=1 to skip the
                        question; PPA=1 as well to add the g++ 13 PPA on Ubuntu 22.04)
   make doctor          check cmake, a C++20 compiler, memory; says what to install
-  make build           build the simulator into build/ (low priority; NICE= to change); installs nothing
+  make build           build the simulator into build/ (low priority; NICE= to change); installs nothing.
+                       Uses half the CPUs; JOBS=N sets the number of parallel jobs
   make demo            run a built-in vectorAdd kernel end to end (builds first if needed)
   make list-gpus       the GPU models you can simulate
   make init            write a commented pantheonsim.yaml (FORCE=1 to overwrite)
@@ -69,7 +81,8 @@ Targets
   make test            build and run the test suite
   make clean           delete build/
 
-Settings come from pantheonsim.yaml (see docs/config.md). On the make command line
+Settings come from pantheonsim.yaml (see docs/config.md). The simulator runs on half the
+CPUs unless the file has threads: or VGPU_THREADS is set; THREADS=N overrides both. On the make command line
 these override it, for run, config and shell:
   GPU=nvidia/h100  COUNT=8  VRAM_MB=16384  THREADS=4  MAX_STEPS=0
   STRICT=1  RACE=1  COUNTERS=1  QUIET=1  TRACE=1  CONFIG=path/to/file.yaml
@@ -90,7 +103,7 @@ export HELP_TEXT
 # deps just installed (g++-13 on Ubuntu 22.04) is handed to the build through CXX;
 # `make build` itself is still exactly scripts/build.sh.
 all: deps
-	cxx="$$(./scripts/deps.sh --cxx)"; if [ -n "$$cxx" ]; then export CXX="$$cxx"; fi; $(NICE) ./scripts/build.sh
+	cxx="$$(./scripts/deps.sh --cxx)"; if [ -n "$$cxx" ]; then export CXX="$$cxx"; fi; $(BUILD_ENV)$(NICE) ./scripts/build.sh
 	@printf '%s\n' 'Built. Next:' \
 	  '  ./run            starts a simulated GPU machine and takes you inside it' \
 	  '  its settings     pantheonsim.yaml in this directory (./run writes one); ./run my.yaml for another'
@@ -105,7 +118,7 @@ doctor:
 	./scripts/doctor.sh
 
 build:
-	$(NICE) ./scripts/build.sh
+	$(BUILD_ENV)$(NICE) ./scripts/build.sh
 
 demo: $(BUILD_FIRST)
 	$(VGPU) $(CFG_FLAG) demo vectoradd $(DEMO_FLAGS)

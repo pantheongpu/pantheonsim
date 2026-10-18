@@ -238,7 +238,7 @@ variable is unset by default.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `VGPU_THREADS` | Host threads used to run blocks. | one per core |
+| `VGPU_THREADS` | Host threads used to run blocks. | one per core (`make run` and `./run` set half the cores unless this or `threads:` is set) |
 | `VGPU_LOCKSTEP` | `0` runs a grid's blocks one after another on each host thread, as before; `all` runs every launch with the blocks the device holds resident together taking turns; the default runs kernels with a loop that polls global memory that way (see the README). | polling kernels |
 | `VGPU_LOCKSTEP_LOG` | `1` prints a line on stderr for each launch that runs its blocks together; any other value is a file the lines are appended to (the tests count the kernels that do). | off |
 | `VGPU_MAX_STEPS` | Raises (or lowers) the runaway-kernel step budget; `0` removes it. The PTX engine reads it at each launch; the SASS engine, which used not to read it (its budget was the built-in one whatever this said), once per process. | built-in |
