@@ -89,17 +89,14 @@ constexpr uint64_t kPrivateBase = 0x1800'0000'0000ull;
 constexpr uint64_t kPrivateSize = 1ull << 32;
 
 // An instruction's name, as the interpreter tells instructions apart: its
-// text and a 64-bit FNV-1a hash of it, taken once per instruction. A literal
-// written "v_add_f32_e32"_op has its hash taken by the compiler, so telling
-// one instruction from another in a lane loop is an integer comparison rather
-// than a string one -- which is where the interpreter used to spend most of
-// its time. The text is compared as well whenever the hashes agree, so a
-// collision could never make one instruction run as another.
-constexpr uint64_t name_hash(std::string_view s) {
-  uint64_t h = 1469598103934665603ull;
-  for (char c : s) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
-  return h;
-}
+// text and a 64-bit FNV-1a hash of it, taken once per instruction (when it is
+// decoded: Inst::name_hash). A literal written "v_add_f32_e32"_op has its hash
+// taken by the compiler, so telling one instruction from another is an integer
+// comparison rather than a string one, and the instruction ladders are
+// switches on the hash (amd/tools/ladder-to-switch.py). The text is compared
+// as well whenever the hashes agree, so a collision could never make one
+// instruction run as another.
+using gcn::name_hash;
 struct OpLit {
   uint64_t hash;
   std::string_view text;
@@ -108,19 +105,24 @@ consteval OpLit operator""_op(const char* s, size_t n) { return {name_hash({s, n
 class OpName {
  public:
   explicit OpName(const std::string& s) : s_(s), hash_(name_hash(s)) {}
-  bool operator==(const OpLit& l) const { return hash_ == l.hash && std::string_view(s_) == l.text; }
+  OpName(std::string_view s, uint64_t hash) : s_(s), hash_(hash) {}
+  // The instruction's own name, with the hash its decoding took.
+  explicit OpName(const Inst& in) : s_(in.name), hash_(in.flags & gcn::kInstFinal ? in.name_hash : name_hash(in.name)) {}
+  bool operator==(const OpLit& l) const { return hash_ == l.hash && s_ == l.text; }
   bool operator!=(const OpLit& l) const { return !(*this == l); }
-  operator const std::string&() const { return s_; }
+  uint64_t hash() const { return hash_; }
+  std::string_view view() const { return s_; }
+  operator std::string() const { return std::string(s_); }
   size_t size() const { return s_.size(); }
   size_t find(const char* t) const { return s_.find(t); }
   size_t rfind(const char* t, size_t at = std::string::npos) const { return s_.rfind(t, at); }
   size_t rfind(char c) const { return s_.rfind(c); }
   int compare(size_t at, size_t n, const char* t) const { return s_.compare(at, n, t); }
-  std::string substr(size_t at, size_t n = std::string::npos) const { return s_.substr(at, n); }
+  std::string substr(size_t at, size_t n = std::string::npos) const { return std::string(s_.substr(at, n)); }
   friend std::ostream& operator<<(std::ostream& o, const OpName& n) { return o << n.s_; }
 
  private:
-  const std::string& s_;
+  std::string_view s_;
   uint64_t hash_;
 };
 
@@ -154,6 +156,18 @@ uint16_t as_bits(_Float16 h) {
   std::memcpy(&b, &h, 2);
   return b;
 }
+
+// floor, ceil and trunc as GCC expands them in line on x86-64 (SSE2 without roundss), which is how the vector
+// instructions below were compiled until their code moved: a value of 2^23 (2^52 for a double) or more in
+// magnitude, an infinity and a NaN come back as they are -- a signaling NaN stays signaling -- and anything
+// else is libm's exact result. (libm quiets a signaling NaN; the scalar instructions s_floor_f32 and the rest
+// still call it, and CMake keeps GCC from expanding those in line: -fno-fp-int-builtin-inexact.)
+inline float floor_inline(float x) { return std::fabs(x) < 8388608.0f ? std::floor(x) : x; }
+inline float ceil_inline(float x) { return std::fabs(x) < 8388608.0f ? std::ceil(x) : x; }
+inline float trunc_inline(float x) { return std::fabs(x) < 8388608.0f ? std::trunc(x) : x; }
+inline double floor_inline(double x) { return std::fabs(x) < 4503599627370496.0 ? std::floor(x) : x; }
+inline double ceil_inline(double x) { return std::fabs(x) < 4503599627370496.0 ? std::ceil(x) : x; }
+inline double trunc_inline(double x) { return std::fabs(x) < 4503599627370496.0 ? std::trunc(x) : x; }
 
 // The kinds of float v_cmp_class asks about, one bit each, in the ISA's order.
 template <typename T>
@@ -637,11 +651,56 @@ struct Machine {
   // scalar value for every lane.
   uint32_t lane_src(const Wave& w, const Operand& o, uint32_t lane) const {
     if (&o == dpp_operand) return (*dpp_values)[lane];
+    if (o.kind == OperandKind::Vgpr) {
+      const uint32_t v = w.vgpr[o.index][lane];
+      return o.sel == 6 ? v : selected(v, o.sel, o.sext);
+    }
+    // A source that is the same in every lane, read once for the instruction (InvariantSources).
+    if (inv_mask_) {
+      const size_t k = (reinterpret_cast<uintptr_t>(&o) - reinterpret_cast<uintptr_t>(inv_ops_)) / sizeof(Operand);
+      if (k < kInvMax && (inv_mask_ >> k & 1)) return inv_value_[k];
+    }
     if (o.kind == OperandKind::Agpr)
       return o.index < w.agpr.size() ? w.agpr[o.index][lane] : 0;   // one never written holds nothing
-    const uint32_t v = o.kind == OperandKind::Vgpr ? w.vgpr[o.index][lane] : static_cast<uint32_t>(scalar(w, o));
+    const uint32_t v = static_cast<uint32_t>(scalar(w, o));
     return o.sel == 6 ? v : selected(v, o.sel, o.sext);
   }
+  // The sources of the instruction being run that are a scalar register, an inline constant or a literal: the same in
+  // every lane and unchanged while the lanes run (an instruction's scalar results are written after them), so
+  // lane_src reads each once, here, instead of once per lane. The value is what lane_src gives for lane 0 without it.
+  static constexpr size_t kInvMax = 4;
+  const Operand* inv_ops_ = nullptr;
+  uint32_t inv_mask_ = 0;
+  uint32_t inv_value_[kInvMax] = {};
+  struct InvariantSources {
+    Machine& m;
+    const Operand* saved_ops;
+    uint32_t saved_mask;
+    uint32_t saved_value[kInvMax];
+    InvariantSources(Machine& machine, const Wave& w, const Inst& in)
+        : m(machine), saved_ops(machine.inv_ops_), saved_mask(machine.inv_mask_) {
+      std::copy(std::begin(m.inv_value_), std::end(m.inv_value_), std::begin(saved_value));
+      m.inv_mask_ = 0;
+      m.inv_ops_ = in.src.data();
+      uint32_t mask = 0;
+      for (size_t k = 0; k < in.src.size() && k < kInvMax; ++k) {
+        const Operand& o = in.src[k];
+        const bool constant = o.kind == OperandKind::Inline || o.kind == OperandKind::InlineFloat || o.kind == OperandKind::Literal;
+        const bool sgpr = o.kind == OperandKind::Sgpr && o.index + (o.width >= 2 ? 2u : 1u) <= kSgprs;
+        if (&o == m.dpp_operand || !(constant || sgpr)) continue;
+        m.inv_value_[k] = m.lane_src(w, o, 0);
+        mask |= 1u << k;
+      }
+      m.inv_mask_ = mask;
+    }
+    ~InvariantSources() {
+      m.inv_ops_ = saved_ops;
+      m.inv_mask_ = saved_mask;
+      std::copy(std::begin(saved_value), std::end(saved_value), std::begin(m.inv_value_));
+    }
+    InvariantSources(const InvariantSources&) = delete;
+    InvariantSources& operator=(const InvariantSources&) = delete;
+  };
   // The part of a register a sub-dword instruction reads: a byte or a half of
   // it, taken into 32 bits with its sign or without.
   static uint32_t selected(uint32_t v, uint8_t sel, bool sext) {
@@ -1003,48 +1062,144 @@ struct Machine {
     // Source k of a half instruction (scalar_half: an inline float constant
     // is the half's own encoding).
     const auto hs = [&](size_t k) { return scalar_half(w, in.src[k]); };
-    if (op == "s_add_f32"_op) put(x + y);
-    else if (op == "s_sub_f32"_op) put(x - y);
-    else if (op == "s_mul_f32"_op) put(x * y);
-    else if (op == "s_min_num_f32"_op || op == "s_min_f32"_op) put(hw_min(in, x, y));
-    else if (op == "s_max_num_f32"_op || op == "s_max_f32"_op) put(hw_max(in, x, y));
-    else if (op == "s_fmac_f32"_op) put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.dst[0])))));
-    else if (op == "s_fmaak_f32"_op) put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.src[2])))));
-    else if (op == "s_fmamk_f32"_op) put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.src[2])))));
-    else if (op == "s_cvt_f32_i32"_op) put(static_cast<float>(static_cast<int32_t>(a)));
-    else if (op == "s_cvt_f32_u32"_op) put(static_cast<float>(static_cast<uint32_t>(a)));
-    else if (op == "s_cvt_i32_f32"_op)
-      write_scalar(w, in.dst[0], static_cast<uint32_t>(std::isnan(x) ? 0 : x <= -2147483648.0f ? INT32_MIN
-                                                     : x >= 2147483648.0f ? INT32_MAX : static_cast<int32_t>(x)));
-    else if (op == "s_cvt_u32_f32"_op)
-      write_scalar(w, in.dst[0], std::isnan(x) || x <= 0 ? 0u : x >= 4294967296.0f ? 0xFFFFFFFFu : static_cast<uint32_t>(x));
-    else if (op == "s_cvt_f16_f32"_op) put_h(static_cast<_Float16>(x));
-    else if (op == "s_cvt_f32_f16"_op) put(static_cast<float>(hs(0)));
-    else if (op == "s_cvt_hi_f32_f16"_op) put(static_cast<float>(h(a >> 16)));
-    else if (op == "s_ceil_f32"_op) put(std::ceil(x));
-    else if (op == "s_floor_f32"_op) put(std::floor(x));
-    else if (op == "s_trunc_f32"_op) put(std::trunc(x));
-    else if (op == "s_rndne_f32"_op) put(std::nearbyint(x));
-    else if (op == "s_add_f16"_op) put_h(hs(0) + hs(1));
-    else if (op == "s_sub_f16"_op) put_h(hs(0) - hs(1));
-    else if (op == "s_mul_f16"_op) put_h(hs(0) * hs(1));
-    else if (op == "s_fmac_f16"_op)
-      put_h(static_cast<_Float16>(std::fma(static_cast<float>(hs(0)), static_cast<float>(hs(1)),
-                                           static_cast<float>(h(scalar(w, in.dst[0]))))));
-    else if (op == "s_ceil_f16"_op) put_h(static_cast<_Float16>(std::ceil(static_cast<float>(hs(0)))));
-    else if (op == "s_floor_f16"_op) put_h(static_cast<_Float16>(std::floor(static_cast<float>(hs(0)))));
-    else if (op == "s_trunc_f16"_op) put_h(static_cast<_Float16>(std::trunc(static_cast<float>(hs(0)))));
-    else if (op == "s_rndne_f16"_op) put_h(static_cast<_Float16>(std::nearbyint(static_cast<float>(hs(0)))));
-    else if (op == "s_minimum_f32"_op || op == "s_maximum_f32"_op)
-      write_scalar(w, in.dst[0], static_cast<uint32_t>(ieee_minmax(static_cast<uint32_t>(a), static_cast<uint32_t>(b), 8, 23, op == "s_maximum_f32"_op)));
-    else if (op == "s_minimum_f16"_op || op == "s_maximum_f16"_op) {
+    switch (op.hash()) {
+  case "s_add_f32"_op.hash:
+    if (!(op == "s_add_f32"_op)) goto L_ladder_22;
+    {put(x + y);}
+    break;
+  case "s_sub_f32"_op.hash:
+    if (!(op == "s_sub_f32"_op)) goto L_ladder_22;
+    {put(x - y);}
+    break;
+  case "s_mul_f32"_op.hash:
+    if (!(op == "s_mul_f32"_op)) goto L_ladder_22;
+    {put(x * y);}
+    break;
+  case "s_min_num_f32"_op.hash: case "s_min_f32"_op.hash:
+    if (!(op == "s_min_num_f32"_op || op == "s_min_f32"_op)) goto L_ladder_22;
+    {put(hw_min(in, x, y));}
+    break;
+  case "s_max_num_f32"_op.hash: case "s_max_f32"_op.hash:
+    if (!(op == "s_max_num_f32"_op || op == "s_max_f32"_op)) goto L_ladder_22;
+    {put(hw_max(in, x, y));}
+    break;
+  case "s_fmac_f32"_op.hash:
+    if (!(op == "s_fmac_f32"_op)) goto L_ladder_22;
+    {put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.dst[0])))));}
+    break;
+  case "s_fmaak_f32"_op.hash:
+    if (!(op == "s_fmaak_f32"_op)) goto L_ladder_22;
+    {put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.src[2])))));}
+    break;
+  case "s_fmamk_f32"_op.hash:
+    if (!(op == "s_fmamk_f32"_op)) goto L_ladder_22;
+    {put(std::fma(x, y, as_float(static_cast<uint32_t>(scalar(w, in.src[2])))));}
+    break;
+  case "s_cvt_f32_i32"_op.hash:
+    if (!(op == "s_cvt_f32_i32"_op)) goto L_ladder_22;
+    {put(static_cast<float>(static_cast<int32_t>(a)));}
+    break;
+  case "s_cvt_f32_u32"_op.hash:
+    if (!(op == "s_cvt_f32_u32"_op)) goto L_ladder_22;
+    {put(static_cast<float>(static_cast<uint32_t>(a)));}
+    break;
+  case "s_cvt_i32_f32"_op.hash:
+    if (!(op == "s_cvt_i32_f32"_op)) goto L_ladder_22;
+    {write_scalar(w, in.dst[0], static_cast<uint32_t>(std::isnan(x) ? 0 : x <= -2147483648.0f ? INT32_MIN
+                                                     : x >= 2147483648.0f ? INT32_MAX : static_cast<int32_t>(x)));}
+    break;
+  case "s_cvt_u32_f32"_op.hash:
+    if (!(op == "s_cvt_u32_f32"_op)) goto L_ladder_22;
+    {write_scalar(w, in.dst[0], std::isnan(x) || x <= 0 ? 0u : x >= 4294967296.0f ? 0xFFFFFFFFu : static_cast<uint32_t>(x));}
+    break;
+  case "s_cvt_f16_f32"_op.hash:
+    if (!(op == "s_cvt_f16_f32"_op)) goto L_ladder_22;
+    {put_h(static_cast<_Float16>(x));}
+    break;
+  case "s_cvt_f32_f16"_op.hash:
+    if (!(op == "s_cvt_f32_f16"_op)) goto L_ladder_22;
+    {put(static_cast<float>(hs(0)));}
+    break;
+  case "s_cvt_hi_f32_f16"_op.hash:
+    if (!(op == "s_cvt_hi_f32_f16"_op)) goto L_ladder_22;
+    {put(static_cast<float>(h(a >> 16)));}
+    break;
+  case "s_ceil_f32"_op.hash:
+    if (!(op == "s_ceil_f32"_op)) goto L_ladder_22;
+    {put(std::ceil(x));}
+    break;
+  case "s_floor_f32"_op.hash:
+    if (!(op == "s_floor_f32"_op)) goto L_ladder_22;
+    {put(std::floor(x));}
+    break;
+  case "s_trunc_f32"_op.hash:
+    if (!(op == "s_trunc_f32"_op)) goto L_ladder_22;
+    {put(std::trunc(x));}
+    break;
+  case "s_rndne_f32"_op.hash:
+    if (!(op == "s_rndne_f32"_op)) goto L_ladder_22;
+    {put(std::nearbyint(x));}
+    break;
+  case "s_add_f16"_op.hash:
+    if (!(op == "s_add_f16"_op)) goto L_ladder_22;
+    {put_h(hs(0) + hs(1));}
+    break;
+  case "s_sub_f16"_op.hash:
+    if (!(op == "s_sub_f16"_op)) goto L_ladder_22;
+    {put_h(hs(0) - hs(1));}
+    break;
+  case "s_mul_f16"_op.hash:
+    if (!(op == "s_mul_f16"_op)) goto L_ladder_22;
+    {put_h(hs(0) * hs(1));}
+    break;
+  case "s_fmac_f16"_op.hash:
+    if (!(op == "s_fmac_f16"_op)) goto L_ladder_22;
+    {put_h(static_cast<_Float16>(std::fma(static_cast<float>(hs(0)), static_cast<float>(hs(1)),
+                                           static_cast<float>(h(scalar(w, in.dst[0]))))));}
+    break;
+  case "s_ceil_f16"_op.hash:
+    if (!(op == "s_ceil_f16"_op)) goto L_ladder_22;
+    {put_h(static_cast<_Float16>(std::ceil(static_cast<float>(hs(0)))));}
+    break;
+  case "s_floor_f16"_op.hash:
+    if (!(op == "s_floor_f16"_op)) goto L_ladder_22;
+    {put_h(static_cast<_Float16>(std::floor(static_cast<float>(hs(0)))));}
+    break;
+  case "s_trunc_f16"_op.hash:
+    if (!(op == "s_trunc_f16"_op)) goto L_ladder_22;
+    {put_h(static_cast<_Float16>(std::trunc(static_cast<float>(hs(0)))));}
+    break;
+  case "s_rndne_f16"_op.hash:
+    if (!(op == "s_rndne_f16"_op)) goto L_ladder_22;
+    {put_h(static_cast<_Float16>(std::nearbyint(static_cast<float>(hs(0)))));}
+    break;
+  case "s_minimum_f32"_op.hash: case "s_maximum_f32"_op.hash:
+    if (!(op == "s_minimum_f32"_op || op == "s_maximum_f32"_op)) goto L_ladder_22;
+    {write_scalar(w, in.dst[0], static_cast<uint32_t>(ieee_minmax(static_cast<uint32_t>(a), static_cast<uint32_t>(b), 8, 23, op == "s_maximum_f32"_op)));}
+    break;
+  case "s_minimum_f16"_op.hash: case "s_maximum_f16"_op.hash:
+    if (!(op == "s_minimum_f16"_op || op == "s_maximum_f16"_op)) goto L_ladder_22;
+    {
       const auto hb = [&](size_t k) { const _Float16 v = hs(k); uint16_t bits; std::memcpy(&bits, &v, 2); return uint64_t{bits}; };
       write_scalar(w, in.dst[0], static_cast<uint32_t>(ieee_minmax(hb(0), hb(1), 5, 10, op == "s_maximum_f16"_op)));
-    } else if (op == "s_cvt_pk_rtz_f16_f32"_op)
-      write_scalar(w, in.dst[0], uint32_t{half_toward_zero(x)} | uint32_t{half_toward_zero(y)} << 16);
-    else if (op == "s_min_num_f16"_op) put_h(static_cast<_Float16>(num_min(static_cast<float>(hs(0)), static_cast<float>(hs(1)))));
-    else if (op == "s_max_num_f16"_op) put_h(static_cast<_Float16>(num_max(static_cast<float>(hs(0)), static_cast<float>(hs(1)))));
-    else return false;
+    }
+    break;
+  case "s_cvt_pk_rtz_f16_f32"_op.hash:
+    if (!(op == "s_cvt_pk_rtz_f16_f32"_op)) goto L_ladder_22;
+    {write_scalar(w, in.dst[0], uint32_t{half_toward_zero(x)} | uint32_t{half_toward_zero(y)} << 16);}
+    break;
+  case "s_min_num_f16"_op.hash:
+    if (!(op == "s_min_num_f16"_op)) goto L_ladder_22;
+    {put_h(static_cast<_Float16>(num_min(static_cast<float>(hs(0)), static_cast<float>(hs(1)))));}
+    break;
+  case "s_max_num_f16"_op.hash:
+    if (!(op == "s_max_num_f16"_op)) goto L_ladder_22;
+    {put_h(static_cast<_Float16>(num_max(static_cast<float>(hs(0)), static_cast<float>(hs(1)))));}
+    break;
+  default: L_ladder_22:
+    {return false;}
+    break;
+}
     return true;
   }
 
@@ -1071,50 +1226,93 @@ struct Machine {
       w.scc = is_unsigned ? test(x, k) : test(static_cast<int32_t>(x), static_cast<int32_t>(k));
       return;
     }
-    const OpName op(in.name);
+    const OpName op(in);
     const uint64_t a = in.src.empty() ? 0 : scalar(w, in.src[0]);
     const uint64_t b = in.src.size() > 1 ? scalar(w, in.src[1]) : 0;
-    if (op == "s_getpc_b64"_op) {
+    switch (op.hash()) {
+  case "s_getpc_b64"_op.hash:
+    if (!(op == "s_getpc_b64"_op)) goto L_ladder_19;
+    {
       // The address of the instruction after this one, which is what the
       // hardware gives: the program counter has already moved on.
       write_scalar(w, in.dst[0], w.pc);
-    } else if (op == "s_mov_b32"_op || op == "s_mov_b64"_op) {
+    }
+    break;
+  case "s_mov_b32"_op.hash: case "s_mov_b64"_op.hash:
+    if (!(op == "s_mov_b32"_op || op == "s_mov_b64"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], a);
-    } else if (op == "s_movk_i32"_op) {
+    }
+    break;
+  case "s_movk_i32"_op.hash:
+    if (!(op == "s_movk_i32"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], static_cast<uint64_t>(static_cast<int64_t>(in.simm)));
-    } else if (op == "s_addk_i32"_op) {
+    }
+    break;
+  case "s_addk_i32"_op.hash:
+    if (!(op == "s_addk_i32"_op)) goto L_ladder_19;
+    {
       // The destination is also a source, the constant is signed, and SCC
       // says whether the signed sum overflowed.
       const int32_t x = static_cast<int32_t>(scalar(w, in.dst[0])), k = static_cast<int32_t>(in.simm);
       const int32_t sum = static_cast<int32_t>(static_cast<uint32_t>(x) + static_cast<uint32_t>(k));
       write_scalar(w, in.dst[0], static_cast<uint32_t>(sum));
       w.scc = ((x >= 0) == (k >= 0)) && ((sum >= 0) != (x >= 0));
-    } else if (op == "s_mulk_i32"_op) {
+    }
+    break;
+  case "s_mulk_i32"_op.hash:
+    if (!(op == "s_mulk_i32"_op)) goto L_ladder_19;
+    {
       // The destination is also a source: it is multiplied in place.
       write_scalar(w, in.dst[0], static_cast<uint32_t>(scalar(w, in.dst[0]) * static_cast<uint32_t>(in.simm)));
-    } else if (op == "s_add_u32"_op) {
+    }
+    break;
+  case "s_add_u32"_op.hash:
+    if (!(op == "s_add_u32"_op)) goto L_ladder_19;
+    {
       const uint64_t sum = static_cast<uint32_t>(a) + static_cast<uint64_t>(static_cast<uint32_t>(b));
       write_scalar(w, in.dst[0], static_cast<uint32_t>(sum));
       w.scc = sum >> 32;                           // the carry out
-    } else if (op == "s_sub_u32"_op || op == "s_subb_u32"_op) {
+    }
+    break;
+  case "s_sub_u32"_op.hash: case "s_subb_u32"_op.hash:
+    if (!(op == "s_sub_u32"_op || op == "s_subb_u32"_op)) goto L_ladder_19;
+    {
       // A borrow is SCC, both out of the subtraction and, for the second,
       // into it: the low half of a 64-bit subtract, then the high half.
       const uint64_t take = static_cast<uint64_t>(static_cast<uint32_t>(b)) + (op == "s_subb_u32"_op ? w.scc : 0);
       write_scalar(w, in.dst[0], static_cast<uint32_t>(static_cast<uint32_t>(a) - take));
       w.scc = static_cast<uint32_t>(a) < take;
-    } else if (op == "s_lshl_b32"_op) {
+    }
+    break;
+  case "s_lshl_b32"_op.hash:
+    if (!(op == "s_lshl_b32"_op)) goto L_ladder_19;
+    {
       const uint32_t r = static_cast<uint32_t>(a) << (b & 31);
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_lshr_b64"_op) {
+    }
+    break;
+  case "s_lshr_b64"_op.hash:
+    if (!(op == "s_lshr_b64"_op)) goto L_ladder_19;
+    {
       const uint64_t r = a >> (b & 63);
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_orn2_b64"_op) {
+    }
+    break;
+  case "s_orn2_b64"_op.hash:
+    if (!(op == "s_orn2_b64"_op)) goto L_ladder_19;
+    {
       const uint64_t r = a | ~b;
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_orn2_b32"_op || op == "s_nand_b32"_op || op == "s_nor_b32"_op || op == "s_xnor_b32"_op) {
+    }
+    break;
+  case "s_orn2_b32"_op.hash: case "s_nand_b32"_op.hash: case "s_nor_b32"_op.hash: case "s_xnor_b32"_op.hash:
+    if (!(op == "s_orn2_b32"_op || op == "s_nand_b32"_op || op == "s_nor_b32"_op || op == "s_xnor_b32"_op)) goto L_ladder_19;
+    {
       // The rest of the bitwise family: or with the second inverted, and the
       // inverses of and, or and xor. SCC says whether any bit is set.
       const uint32_t x = static_cast<uint32_t>(a), y = static_cast<uint32_t>(b);
@@ -1124,16 +1322,28 @@ struct Machine {
                                                  : ~(x ^ y);
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_nand_b64"_op || op == "s_nor_b64"_op || op == "s_xnor_b64"_op) {
+    }
+    break;
+  case "s_nand_b64"_op.hash: case "s_nor_b64"_op.hash: case "s_xnor_b64"_op.hash:
+    if (!(op == "s_nand_b64"_op || op == "s_nor_b64"_op || op == "s_xnor_b64"_op)) goto L_ladder_19;
+    {
       const uint64_t r = op == "s_nand_b64"_op ? ~(a & b) : op == "s_nor_b64"_op ? ~(a | b) : ~(a ^ b);
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_bfm_b64"_op) {
+    }
+    break;
+  case "s_bfm_b64"_op.hash:
+    if (!(op == "s_bfm_b64"_op)) goto L_ladder_19;
+    {
       // A mask of the first source's low six bits' worth of ones, shifted up
       // by the second's. SCC is left alone.
       const uint32_t width = static_cast<uint32_t>(a) & 63, shift = static_cast<uint32_t>(b) & 63;
       write_scalar(w, in.dst[0], ((uint64_t{1} << width) - 1) << shift);
-    } else if (op == "s_bfe_u64"_op) {
+    }
+    break;
+  case "s_bfe_u64"_op.hash:
+    if (!(op == "s_bfe_u64"_op)) goto L_ladder_19;
+    {
       // A field of the 64-bit first source: the second source's low six bits
       // say where it starts, bits 16 to 22 how wide it is.
       const uint32_t start = static_cast<uint32_t>(b) & 63, width = (static_cast<uint32_t>(b) >> 16) & 0x7F;
@@ -1141,7 +1351,11 @@ struct Machine {
       const uint64_t r = width == 0 ? 0 : width >= 64 ? shifted : shifted & ((uint64_t{1} << width) - 1);
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_absdiff_i32"_op) {
+    }
+    break;
+  case "s_absdiff_i32"_op.hash:
+    if (!(op == "s_absdiff_i32"_op)) goto L_ladder_19;
+    {
       // gfx1250's (CDNA5 ISA): 32-bit arithmetic, so the difference wraps, as does its negation. The older instruction is
       // worked out in 64 bits here, which its tests keep.
       const uint32_t d = static_cast<uint32_t>(a) - static_cast<uint32_t>(b);
@@ -1150,59 +1364,115 @@ struct Machine {
                                                          : static_cast<uint32_t>(wide_d < 0 ? -wide_d : wide_d);
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_bcnt1_i32_b64"_op) {
+    }
+    break;
+  case "s_bcnt1_i32_b64"_op.hash:
+    if (!(op == "s_bcnt1_i32_b64"_op)) goto L_ladder_19;
+    {
       // The set bits of a 64-bit mask: how many lanes are active, which is
       // how a wave that adds one value for all its lanes knows how many.
       const uint32_t r = static_cast<uint32_t>(__builtin_popcountll(a));
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_or_saveexec_b64"_op) {
+    }
+    break;
+  case "s_or_saveexec_b64"_op.hash:
+    if (!(op == "s_or_saveexec_b64"_op)) goto L_ladder_19;
+    {
       const uint64_t saved = w.exec;
       w.exec = a | saved;
       write_scalar(w, in.dst[0], saved);
       w.scc = w.exec != 0;
-    } else if (op == "s_addc_u32"_op) {
+    }
+    break;
+  case "s_addc_u32"_op.hash:
+    if (!(op == "s_addc_u32"_op)) goto L_ladder_19;
+    {
       const uint64_t sum = static_cast<uint32_t>(a) + static_cast<uint64_t>(static_cast<uint32_t>(b)) + w.scc;
       write_scalar(w, in.dst[0], static_cast<uint32_t>(sum));
       w.scc = sum >> 32;
-    } else if (op == "s_add_i32"_op) {
+    }
+    break;
+  case "s_add_i32"_op.hash:
+    if (!(op == "s_add_i32"_op)) goto L_ladder_19;
+    {
       const int64_t sum = static_cast<int32_t>(a) + static_cast<int64_t>(static_cast<int32_t>(b));
       write_scalar(w, in.dst[0], static_cast<uint32_t>(sum));
       w.scc = sum != static_cast<int32_t>(sum);      // signed overflow
-    } else if (op == "s_sub_i32"_op) {
+    }
+    break;
+  case "s_sub_i32"_op.hash:
+    if (!(op == "s_sub_i32"_op)) goto L_ladder_19;
+    {
       const int64_t diff = static_cast<int32_t>(a) - static_cast<int64_t>(static_cast<int32_t>(b));
       write_scalar(w, in.dst[0], static_cast<uint32_t>(diff));
       w.scc = diff != static_cast<int32_t>(diff);
-    } else if (op == "s_or_b32"_op) {
+    }
+    break;
+  case "s_or_b32"_op.hash:
+    if (!(op == "s_or_b32"_op)) goto L_ladder_19;
+    {
       const uint32_t v = static_cast<uint32_t>(a) | static_cast<uint32_t>(b);
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_xor_b32"_op) {
+    }
+    break;
+  case "s_xor_b32"_op.hash:
+    if (!(op == "s_xor_b32"_op)) goto L_ladder_19;
+    {
       const uint32_t v = static_cast<uint32_t>(a) ^ static_cast<uint32_t>(b);
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_mul_i32"_op) {
+    }
+    break;
+  case "s_mul_i32"_op.hash:
+    if (!(op == "s_mul_i32"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(a) * static_cast<uint32_t>(b));
-    } else if (op == "s_ashr_i32"_op) {
+    }
+    break;
+  case "s_ashr_i32"_op.hash:
+    if (!(op == "s_ashr_i32"_op)) goto L_ladder_19;
+    {
       const uint32_t v = static_cast<uint32_t>(static_cast<int32_t>(a) >> (b & 31));
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_and_b32"_op) {
+    }
+    break;
+  case "s_and_b32"_op.hash:
+    if (!(op == "s_and_b32"_op)) goto L_ladder_19;
+    {
       const uint32_t v = static_cast<uint32_t>(a) & static_cast<uint32_t>(b);
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_xor_b64"_op) {
+    }
+    break;
+  case "s_xor_b64"_op.hash:
+    if (!(op == "s_xor_b64"_op)) goto L_ladder_19;
+    {
       const uint64_t v = a ^ b;
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_andn2_b64"_op) {
+    }
+    break;
+  case "s_andn2_b64"_op.hash:
+    if (!(op == "s_andn2_b64"_op)) goto L_ladder_19;
+    {
       const uint64_t v = a & ~b;
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_ff1_i32_b64"_op) {
+    }
+    break;
+  case "s_ff1_i32_b64"_op.hash:
+    if (!(op == "s_ff1_i32_b64"_op)) goto L_ladder_19;
+    {
       // The first set bit, counting from bit 0, or -1 when there is none.
       write_scalar(w, in.dst[0], a ? static_cast<uint32_t>(__builtin_ctzll(a)) : 0xFFFFFFFFu);
-    } else if (op == "s_getreg_b32"_op || op == "s_setreg_imm32_b32"_op || op == "s_setreg_b32"_op) {
+    }
+    break;
+  case "s_getreg_b32"_op.hash: case "s_setreg_imm32_b32"_op.hash: case "s_setreg_b32"_op.hash:
+    if (!(op == "s_getreg_b32"_op || op == "s_setreg_imm32_b32"_op || op == "s_setreg_b32"_op)) goto L_ladder_19;
+    {
       // A field of a hardware register: the immediate's low six bits say
       // which register, the next five where the field starts, the top five
       // how wide it is less one. MODE is kept per wave, and gfx12's SCHED_MODE;
@@ -1279,167 +1549,335 @@ struct Machine {
         else throw Error::make(Err::Unsupported, "s_getreg_b32 of hardware register ", id, ", which this does not model");
         write_scalar(w, in.dst[0], (reg & mask) >> at);
       }
-    } else if (op == "s_call_b64"_op) {
+    }
+    break;
+  case "s_call_b64"_op.hash:
+    if (!(op == "s_call_b64"_op)) goto L_ladder_19;
+    {
       // Where to come back to is the next instruction, which the program
       // counter already holds.
       write_scalar(w, in.dst[0], w.pc);
       w.pc = in.target;
-    } else if (op == "s_bfm_b32"_op) {
+    }
+    break;
+  case "s_bfm_b32"_op.hash:
+    if (!(op == "s_bfm_b32"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], ((1u << (a & 31)) - 1) << (b & 31));
-    } else if (op == "s_ff1_i32_b32"_op) {
+    }
+    break;
+  case "s_ff1_i32_b32"_op.hash:
+    if (!(op == "s_ff1_i32_b32"_op)) goto L_ladder_19;
+    {
       const uint32_t x = static_cast<uint32_t>(a);
       write_scalar(w, in.dst[0], x ? static_cast<uint32_t>(__builtin_ctz(x)) : 0xFFFFFFFFu);
-    } else if (op == "s_flbit_i32_b32"_op || op == "s_flbit_i32_b64"_op) {
+    }
+    break;
+  case "s_flbit_i32_b32"_op.hash: case "s_flbit_i32_b64"_op.hash:
+    if (!(op == "s_flbit_i32_b32"_op || op == "s_flbit_i32_b64"_op)) goto L_ladder_19;
+    {
       // The first set bit counting from the top, or -1 when there is none.
       const bool wide = op == "s_flbit_i32_b64"_op;
       const uint64_t x = wide ? a : static_cast<uint32_t>(a);
       write_scalar(w, in.dst[0], !x ? 0xFFFFFFFFu
                                     : static_cast<uint32_t>(wide ? __builtin_clzll(x) : __builtin_clz(static_cast<uint32_t>(x))));
-    } else if (op == "s_flbit_i32"_op) {
+    }
+    break;
+  case "s_flbit_i32"_op.hash:
+    if (!(op == "s_flbit_i32"_op)) goto L_ladder_19;
+    {
       // The first bit from the top that differs from the sign bit, or -1
       // when every bit is the sign.
       const uint32_t x = static_cast<uint32_t>(a), y = x >> 31 ? ~x : x;
       write_scalar(w, in.dst[0], y ? static_cast<uint32_t>(__builtin_clz(y)) : 0xFFFFFFFFu);
-    } else if (op == "s_bcnt1_i32_b32"_op) {
+    }
+    break;
+  case "s_bcnt1_i32_b32"_op.hash:
+    if (!(op == "s_bcnt1_i32_b32"_op)) goto L_ladder_19;
+    {
       const uint32_t r = static_cast<uint32_t>(__builtin_popcount(static_cast<uint32_t>(a)));
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_sext_i32_i8"_op) {
+    }
+    break;
+  case "s_sext_i32_i8"_op.hash:
+    if (!(op == "s_sext_i32_i8"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(a))));
-    } else if (op == "s_sext_i32_i16"_op) {
+    }
+    break;
+  case "s_sext_i32_i16"_op.hash:
+    if (!(op == "s_sext_i32_i16"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(a))));
-    } else if (op == "s_max_u32"_op) {
+    }
+    break;
+  case "s_max_u32"_op.hash:
+    if (!(op == "s_max_u32"_op)) goto L_ladder_19;
+    {
       const uint32_t x = static_cast<uint32_t>(a), y = static_cast<uint32_t>(b);
       w.scc = in.arch == gcn::Target::Gfx1250 ? x >= y : x > y;   // (gfx1250: SCC = S0 >= S1, so a tie sets it)
       write_scalar(w, in.dst[0], w.scc ? x : y);
-    } else if (op == "s_lshl1_add_u32"_op || op == "s_lshl2_add_u32"_op || op == "s_lshl3_add_u32"_op ||
-               op == "s_lshl4_add_u32"_op) {
+    }
+    break;
+  case "s_lshl1_add_u32"_op.hash: case "s_lshl2_add_u32"_op.hash: case "s_lshl3_add_u32"_op.hash: case "s_lshl4_add_u32"_op.hash:
+    if (!(op == "s_lshl1_add_u32"_op || op == "s_lshl2_add_u32"_op || op == "s_lshl3_add_u32"_op ||
+               op == "s_lshl4_add_u32"_op)) goto L_ladder_19;
+    {
       // SCC is the carry out of the whole: of the shift and of the add.
       const uint32_t by = static_cast<uint32_t>(op.substr(6, 1)[0] - '0');
       const uint64_t v = (static_cast<uint64_t>(static_cast<uint32_t>(a)) << by) + static_cast<uint32_t>(b);
       write_scalar(w, in.dst[0], static_cast<uint32_t>(v));
       w.scc = (v >> 32) != 0;
-    } else if (op == "s_pack_lh_b32_b16"_op) {
+    }
+    break;
+  case "s_pack_lh_b32_b16"_op.hash:
+    if (!(op == "s_pack_lh_b32_b16"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], (static_cast<uint32_t>(a) & 0xFFFFu) | (static_cast<uint32_t>(b) & 0xFFFF0000u));
-    } else if (op == "s_pack_hh_b32_b16"_op) {
+    }
+    break;
+  case "s_pack_hh_b32_b16"_op.hash:
+    if (!(op == "s_pack_hh_b32_b16"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(a) >> 16 | (static_cast<uint32_t>(b) & 0xFFFF0000u));
-    } else if (op == "s_and_b64"_op) {
+    }
+    break;
+  case "s_and_b64"_op.hash:
+    if (!(op == "s_and_b64"_op)) goto L_ladder_19;
+    {
       const uint64_t v = a & b;
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_or_b64"_op) {
+    }
+    break;
+  case "s_or_b64"_op.hash:
+    if (!(op == "s_or_b64"_op)) goto L_ladder_19;
+    {
       const uint64_t v = a | b;
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_lshl_b64"_op) {
+    }
+    break;
+  case "s_lshl_b64"_op.hash:
+    if (!(op == "s_lshl_b64"_op)) goto L_ladder_19;
+    {
       const uint64_t v = a << (b & 63);
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_cselect_b64"_op) {
+    }
+    break;
+  case "s_cselect_b64"_op.hash:
+    if (!(op == "s_cselect_b64"_op)) goto L_ladder_19;
+    {
       // What the last comparison decided picks a source.
       write_scalar(w, in.dst[0], w.scc ? a : b);
-    } else if (op == "s_and_saveexec_b64"_op) {
+    }
+    break;
+  case "s_and_saveexec_b64"_op.hash:
+    if (!(op == "s_and_saveexec_b64"_op)) goto L_ladder_19;
+    {
       // Divergence, as the compiler writes it: keep EXEC, narrow it to the
       // lanes the condition took.
       const uint64_t saved = w.exec;
       w.exec = a & saved;
       write_scalar(w, in.dst[0], saved);
       w.scc = w.exec != 0;
-    } else if (op == "s_swappc_b64"_op) {
+    }
+    break;
+  case "s_swappc_b64"_op.hash:
+    if (!(op == "s_swappc_b64"_op)) goto L_ladder_19;
+    {
       // A call: where to come back to is what the program counter already
       // holds, since it was moved past this instruction before it ran.
       const uint64_t to = scalar(w, in.src[0]);
       write_scalar(w, in.dst[0], w.pc);
       w.pc = to;
-    } else if (op == "s_setpc_b64"_op || op == "s_set_pc_i64"_op) {
+    }
+    break;
+  case "s_setpc_b64"_op.hash: case "s_set_pc_i64"_op.hash:
+    if (!(op == "s_setpc_b64"_op || op == "s_set_pc_i64"_op)) goto L_ladder_19;
+    {
       w.pc = scalar(w, in.src[0]);   // the return
-    } else if (op == "s_get_pc_i64"_op) {
+    }
+    break;
+  case "s_get_pc_i64"_op.hash:
+    if (!(op == "s_get_pc_i64"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], w.pc);   // (gfx1250's s_getpc_b64: the next instruction's address)
-    } else if (op == "s_swap_pc_i64"_op) {
+    }
+    break;
+  case "s_swap_pc_i64"_op.hash:
+    if (!(op == "s_swap_pc_i64"_op)) goto L_ladder_19;
+    {
       const uint64_t to = scalar(w, in.src[0]);
       write_scalar(w, in.dst[0], w.pc);
       w.pc = to;
-    } else if (op == "s_add_pc_i64"_op) {
+    }
+    break;
+  case "s_add_pc_i64"_op.hash:
+    if (!(op == "s_add_pc_i64"_op)) goto L_ladder_19;
+    {
       // The program counter (already past this instruction) moved by a signed offset; a 32-bit literal is sign-extended.
       const int64_t off = in.src[0].kind == OperandKind::Literal && !in.src[0].lit64
                               ? static_cast<int64_t>(static_cast<int32_t>(a))
                               : static_cast<int64_t>(a);
       w.pc = static_cast<uint64_t>(static_cast<int64_t>(w.pc) + off);
-    } else if (op == "s_call_i64"_op) {
+    }
+    break;
+  case "s_call_i64"_op.hash:
+    if (!(op == "s_call_i64"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], w.pc);
       w.pc = in.target;
-    } else if (op == "s_get_shader_cycles_u64"_op) {
+    }
+    break;
+  case "s_get_shader_cycles_u64"_op.hash:
+    if (!(op == "s_get_shader_cycles_u64"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], stats.instructions);
-    } else if (op == "s_lshr_b32"_op) {
+    }
+    break;
+  case "s_lshr_b32"_op.hash:
+    if (!(op == "s_lshr_b32"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(a) >> (b & 31));
       w.scc = static_cast<uint32_t>(a) >> (b & 31);
-    } else if (op == "s_mul_hi_u32"_op) {
+    }
+    break;
+  case "s_mul_hi_u32"_op.hash:
+    if (!(op == "s_mul_hi_u32"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0],
                    static_cast<uint32_t>((static_cast<uint64_t>(static_cast<uint32_t>(a)) *
                                           static_cast<uint32_t>(b)) >> 32));
-    } else if (op == "s_cselect_b32"_op) {
+    }
+    break;
+  case "s_cselect_b32"_op.hash:
+    if (!(op == "s_cselect_b32"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], w.scc ? a : b);
-    } else if (op == "s_brev_b32"_op) {
+    }
+    break;
+  case "s_brev_b32"_op.hash:
+    if (!(op == "s_brev_b32"_op)) goto L_ladder_19;
+    {
       uint32_t v = static_cast<uint32_t>(a), r = 0;
       for (uint32_t k = 0; k < 32; ++k) r |= ((v >> k) & 1) << (31 - k);
       write_scalar(w, in.dst[0], r);
       // A bit reversal sets no condition code, as the move it is a form of
       // does not.
-    } else if (op == "s_brev_b64"_op) {
+    }
+    break;
+  case "s_brev_b64"_op.hash:
+    if (!(op == "s_brev_b64"_op)) goto L_ladder_19;
+    {
       uint64_t r = 0;
       for (uint32_t k = 0; k < 64; ++k) r |= ((a >> k) & 1) << (63 - k);
       write_scalar(w, in.dst[0], r);
-    } else if (op == "s_cmov_b64"_op) {
+    }
+    break;
+  case "s_cmov_b64"_op.hash:
+    if (!(op == "s_cmov_b64"_op)) goto L_ladder_19;
+    {
       if (w.scc) write_scalar(w, in.dst[0], a);
-    } else if (op == "s_bcnt0_i32_b32"_op || op == "s_bcnt0_i32_b64"_op) {
+    }
+    break;
+  case "s_bcnt0_i32_b32"_op.hash: case "s_bcnt0_i32_b64"_op.hash:
+    if (!(op == "s_bcnt0_i32_b32"_op || op == "s_bcnt0_i32_b64"_op)) goto L_ladder_19;
+    {
       const uint32_t r = op == "s_bcnt0_i32_b32"_op ? 32 - __builtin_popcount(static_cast<uint32_t>(a))
                                                     : 64 - __builtin_popcountll(a);
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_ff0_i32_b32"_op || op == "s_ff0_i32_b64"_op) {
+    }
+    break;
+  case "s_ff0_i32_b32"_op.hash: case "s_ff0_i32_b64"_op.hash:
+    if (!(op == "s_ff0_i32_b32"_op || op == "s_ff0_i32_b64"_op)) goto L_ladder_19;
+    {
       // The first clear bit, counting from bit 0, or -1 when there is none.
       const uint64_t clear = op == "s_ff0_i32_b32"_op ? ~static_cast<uint32_t>(a) & 0xFFFFFFFFull : ~a;
       write_scalar(w, in.dst[0], clear ? static_cast<uint32_t>(__builtin_ctzll(clear)) : 0xFFFFFFFFu);
-    } else if (op == "s_wqm_b32"_op || op == "s_wqm_b64"_op) {
+    }
+    break;
+  case "s_wqm_b32"_op.hash: case "s_wqm_b64"_op.hash:
+    if (!(op == "s_wqm_b32"_op || op == "s_wqm_b64"_op)) goto L_ladder_19;
+    {
       uint64_t r = 0;
       for (uint32_t q = 0; q < (op == "s_wqm_b32"_op ? 8u : 16u); ++q)
         if ((a >> (4 * q)) & 0xF) r |= uint64_t{0xF} << (4 * q);
       write_scalar(w, in.dst[0], r);
       w.scc = r != 0;
-    } else if (op == "s_cmov_b32"_op) {
+    }
+    break;
+  case "s_cmov_b32"_op.hash:
+    if (!(op == "s_cmov_b32"_op)) goto L_ladder_19;
+    {
       if (w.scc) write_scalar(w, in.dst[0], a);
-    } else if (op == "s_abs_i32"_op) {
+    }
+    break;
+  case "s_abs_i32"_op.hash:
+    if (!(op == "s_abs_i32"_op)) goto L_ladder_19;
+    {
       const int32_t x = static_cast<int32_t>(a);
       const uint32_t v = x < 0 ? 0u - static_cast<uint32_t>(x) : static_cast<uint32_t>(x);
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_not_b32"_op || op == "s_not_b64"_op) {
+    }
+    break;
+  case "s_not_b32"_op.hash: case "s_not_b64"_op.hash:
+    if (!(op == "s_not_b32"_op || op == "s_not_b64"_op)) goto L_ladder_19;
+    {
       const uint64_t v = op == "s_not_b32"_op ? static_cast<uint32_t>(~a) : ~a;
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_bitset0_b32"_op || op == "s_bitset1_b32"_op) {
+    }
+    break;
+  case "s_bitset0_b32"_op.hash: case "s_bitset1_b32"_op.hash:
+    if (!(op == "s_bitset0_b32"_op || op == "s_bitset1_b32"_op)) goto L_ladder_19;
+    {
       // One bit of the destination, the source's low five bits say which;
       // the rest of it, and SCC, are kept.
       const uint32_t bit = 1u << (a & 31), was = static_cast<uint32_t>(scalar(w, in.dst[0]));
       write_scalar(w, in.dst[0], op == "s_bitset1_b32"_op ? was | bit : was & ~bit);
-    } else if (op == "s_min_i32"_op || op == "s_max_i32"_op) {
+    }
+    break;
+  case "s_min_i32"_op.hash: case "s_max_i32"_op.hash:
+    if (!(op == "s_min_i32"_op || op == "s_max_i32"_op)) goto L_ladder_19;
+    {
       // SCC says whether the first source was the one kept.
       const int32_t x = static_cast<int32_t>(a), y = static_cast<int32_t>(b);
       w.scc = op == "s_min_i32"_op ? x < y : in.arch == gcn::Target::Gfx1250 ? x >= y : x > y;
       write_scalar(w, in.dst[0], static_cast<uint32_t>(w.scc ? x : y));
-    } else if (op == "s_min_u32"_op) {
+    }
+    break;
+  case "s_min_u32"_op.hash:
+    if (!(op == "s_min_u32"_op)) goto L_ladder_19;
+    {
       const uint32_t x = static_cast<uint32_t>(a), y = static_cast<uint32_t>(b);
       w.scc = x < y;
       write_scalar(w, in.dst[0], w.scc ? x : y);
-    } else if (op == "s_andn2_b32"_op) {
+    }
+    break;
+  case "s_andn2_b32"_op.hash:
+    if (!(op == "s_andn2_b32"_op)) goto L_ladder_19;
+    {
       const uint32_t v = static_cast<uint32_t>(a & ~b);
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_ashr_i64"_op) {
+    }
+    break;
+  case "s_ashr_i64"_op.hash:
+    if (!(op == "s_ashr_i64"_op)) goto L_ladder_19;
+    {
       const uint64_t v = static_cast<uint64_t>(static_cast<int64_t>(a) >> (b & 63));
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_bfe_i32"_op) {
+    }
+    break;
+  case "s_bfe_i32"_op.hash:
+    if (!(op == "s_bfe_i32"_op)) goto L_ladder_19;
+    {
       const uint32_t start = static_cast<uint32_t>(b) & 31, width = (static_cast<uint32_t>(b) >> 16) & 0x7F;
       int32_t v = 0;
       if (width) {
@@ -1449,7 +1887,11 @@ struct Machine {
       }
       write_scalar(w, in.dst[0], static_cast<uint32_t>(v));
       w.scc = v != 0;
-    } else if (op == "s_bfe_u32"_op || op == "s_bfe_i64"_op) {
+    }
+    break;
+  case "s_bfe_u32"_op.hash: case "s_bfe_i64"_op.hash:
+    if (!(op == "s_bfe_u32"_op || op == "s_bfe_i64"_op)) goto L_ladder_19;
+    {
       // The field starts at the second source's low bits and is as wide as
       // its bits 16 to 22 say; the signed form carries the field's top bit up.
       const bool wide = op == "s_bfe_i64"_op;
@@ -1464,28 +1906,48 @@ struct Machine {
       if (!wide) v = static_cast<uint32_t>(v);
       write_scalar(w, in.dst[0], v);
       w.scc = v != 0;
-    } else if (op == "s_mul_hi_i32"_op) {
+    }
+    break;
+  case "s_mul_hi_i32"_op.hash:
+    if (!(op == "s_mul_hi_i32"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], static_cast<uint32_t>(static_cast<uint64_t>(
                                      static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int32_t>(b)) >> 32));
-    } else if (op == "s_pack_ll_b32_b16"_op) {
+    }
+    break;
+  case "s_pack_ll_b32_b16"_op.hash:
+    if (!(op == "s_pack_ll_b32_b16"_op)) goto L_ladder_19;
+    {
       write_scalar(w, in.dst[0], (static_cast<uint32_t>(a) & 0xFFFFu) | (static_cast<uint32_t>(b) & 0xFFFFu) << 16);
-    } else if (op == "s_xor_saveexec_b64"_op) {
+    }
+    break;
+  case "s_xor_saveexec_b64"_op.hash:
+    if (!(op == "s_xor_saveexec_b64"_op)) goto L_ladder_19;
+    {
       // With -1, the lanes that are off: how a function saves a register all
       // 64 lanes share without disturbing the ones its caller left running.
       const uint64_t saved = w.exec;
       w.exec = a ^ saved;
       write_scalar(w, in.dst[0], saved);
       w.scc = w.exec != 0;
-    } else if (op == "s_andn2_saveexec_b64"_op) {
+    }
+    break;
+  case "s_andn2_saveexec_b64"_op.hash:
+    if (!(op == "s_andn2_saveexec_b64"_op)) goto L_ladder_19;
+    {
       // The other half of a divergence: keep EXEC, and take the lanes the
       // condition did not.
       const uint64_t saved = w.exec;
       w.exec = a & ~saved;
       write_scalar(w, in.dst[0], saved);
       w.scc = w.exec != 0;
-    } else if (op == "s_and_saveexec_b32"_op || op == "s_or_saveexec_b32"_op || op == "s_xor_saveexec_b32"_op ||
+    }
+    break;
+  case "s_and_saveexec_b32"_op.hash: case "s_or_saveexec_b32"_op.hash: case "s_xor_saveexec_b32"_op.hash: case "s_and_not1_saveexec_b32"_op.hash: case "s_or_not1_saveexec_b32"_op.hash: case "s_and_not0_saveexec_b32"_op.hash: case "s_or_not0_saveexec_b32"_op.hash:
+    if (!(op == "s_and_saveexec_b32"_op || op == "s_or_saveexec_b32"_op || op == "s_xor_saveexec_b32"_op ||
                op == "s_and_not1_saveexec_b32"_op || op == "s_or_not1_saveexec_b32"_op ||
-               op == "s_and_not0_saveexec_b32"_op || op == "s_or_not0_saveexec_b32"_op) {
+               op == "s_and_not0_saveexec_b32"_op || op == "s_or_not0_saveexec_b32"_op)) goto L_ladder_19;
+    {
       // RDNA's wave32 forms of the same: EXEC is its low half (exec_lo).
       const uint32_t saved = static_cast<uint32_t>(w.exec), x = static_cast<uint32_t>(a);
       const uint32_t v = op == "s_and_saveexec_b32"_op        ? x & saved
@@ -1498,76 +1960,117 @@ struct Machine {
       w.exec = (w.exec & ~0xFFFFFFFFull) | v;
       write_scalar(w, in.dst[0], saved);
       w.scc = v != 0;
-    } else if (exec_logic_op(in.name)) {
-      // The rest of the EXEC-writing family (the NAND, NOR and XNOR forms, and the 64-bit and-not0, or-not0 and or-not1
-      // ones), and gfx1250's _wrexec forms, which write EXEC and the destination alike with the result where the
-      // _saveexec ones write the destination with EXEC's old value.
-      const std::string_view nm = in.name;
-      const bool wide = nm.ends_with("_b64"), wr = nm.find("_wrexec_") != std::string_view::npos;
-      const std::string_view stem = nm.substr(2, nm.find(wr ? "_wrexec_" : "_saveexec_") - 2);
-      const uint64_t mask = wide ? ~0ull : 0xFFFFFFFFull;
-      const uint64_t x = a & mask, e = w.exec & mask;
-      uint64_t v = stem == "nand" ? ~(x & e) : stem == "nor" ? ~(x | e) : stem == "xnor" ? ~(x ^ e)
-                   : stem == "and_not0" ? ~x & e : stem == "or_not0" ? ~x | e : stem == "or_not1" ? x | ~e : x & ~e;
-      v &= mask;
-      w.exec = (w.exec & ~mask) | v;
-      write_scalar(w, in.dst[0], wr ? v : e);
-      w.scc = v != 0;
-    } else if (op == "s_or_not1_b32"_op) {
-      const uint32_t v = static_cast<uint32_t>(a) | ~static_cast<uint32_t>(b);
-      write_scalar(w, in.dst[0], v);
-      w.scc = v != 0;
-    } else if (op == "s_pack_hl_b32_b16"_op) {
-      write_scalar(w, in.dst[0], static_cast<uint32_t>(a) >> 16 | static_cast<uint32_t>(b) << 16);
-    } else if (op == "s_sendmsg_rtn_b32"_op || op == "s_sendmsg_rtn_b64"_op) {
-      // A message that answers. The one compute code asks is the time
-      // (realtime_ticks).
-      // gfx1250 also answers 0x87, RTN_GET_SE_HW_ID ({XCC[19:16], SE_ID[3:0]}: shader engine 0 of XCC 0 here), and 0x88,
-      // RTN_GET_CLUSTER_BARRIER_STATE ({0, signalCnt, 5'b0, memberCnt, 3'b0, valid}: all zero, for no cluster barrier exists outside a
-      // cluster).
-      if (in.arch == gcn::Target::Gfx1250 && (in.simm == 0x87 || in.simm == 0x88)) {
-        write_scalar(w, in.dst[0], 0);
-      } else {
-        if (in.simm != 131)
-          throw Error::make(Err::Unsupported, "s_sendmsg_rtn of message ", in.simm, ", which this does not answer");
-        write_scalar(w, in.dst[0], realtime_ticks());
-      }
-    } else if (scalar_float(w, in, op, a, b)) {
-    } else if (op == "s_quadmask_b32"_op || op == "s_quadmask_b64"_op) {
-      // One bit for each group of four: set where any of the four is.
-      const uint32_t groups = op == "s_quadmask_b32"_op ? 8 : 16;
-      uint64_t v = 0;
-      for (uint32_t i = 0; i < groups; ++i) v |= uint64_t{((a >> (4 * i)) & 0xF) != 0} << i;
-      write_scalar(w, in.dst[0], v);
-      w.scc = v != 0;
-    } else if (op == "s_bitset0_b64"_op || op == "s_bitset1_b64"_op) {
-      const uint64_t d = scalar(w, in.dst[0]), bit = uint64_t{1} << (static_cast<uint32_t>(a) & 63);
-      write_scalar(w, in.dst[0], op == "s_bitset1_b64"_op ? d | bit : d & ~bit);
-    } else if (op == "s_bitreplicate_b64_b32"_op) {
-      // Each bit twice: a quad mask into a pixel mask.
-      uint64_t v = 0;
-      for (uint32_t i = 0; i < 32; ++i) v |= (uint64_t{3} * ((a >> i) & 1)) << (2 * i);
-      write_scalar(w, in.dst[0], v);
-    } else if (op == "s_cls_i32_i64"_op) {
-      // Leading bits equal to the sign bit; -1 where all are.
-      int32_t n = -1;
-      for (uint32_t i = 1; i < 64; ++i)
-        if (((a >> (63 - i)) & 1) != (a >> 63)) { n = static_cast<int32_t>(i); break; }
-      write_scalar(w, in.dst[0], static_cast<uint32_t>(n));
-    } else if (op == "s_add_nc_u64"_op || op == "s_sub_nc_u64"_op || op == "s_mul_u64"_op) {
-      // RDNA4's 64-bit scalar arithmetic, SCC untouched.
-      write_scalar(w, in.dst[0], op == "s_add_nc_u64"_op ? a + b : op == "s_sub_nc_u64"_op ? a - b : a * b);
-    } else if (op == "s_barrier_signal"_op || op == "s_barrier_signal_isfirst"_op) {
-      // RDNA4's split barrier: signalling arrives; s_barrier_wait is where the
-      // wave waits for the rest (and is the barrier here).
-      if (op == "s_barrier_signal_isfirst"_op) w.scc = false;
-    } else if (op == "s_waitcnt_vscnt"_op || op == "s_waitcnt_vmcnt"_op || op == "s_waitcnt_expcnt"_op ||
-               op == "s_waitcnt_lgkmcnt"_op || op == "s_version"_op) {
-      // RDNA's separate counters: nothing is outstanding here to wait for.
-      // (s_version only marks which ISA the code was written for.)
-    } else {
-      throw Error::make(Err::Unsupported, "scalar instruction ", op, " is decoded but not implemented");
     }
+    break;
+  default: L_ladder_19:
+    if (exec_logic_op(in.name)) {
+          // The rest of the EXEC-writing family (the NAND, NOR and XNOR forms, and the 64-bit and-not0, or-not0 and or-not1
+          // ones), and gfx1250's _wrexec forms, which write EXEC and the destination alike with the result where the
+          // _saveexec ones write the destination with EXEC's old value.
+          const std::string_view nm = in.name;
+          const bool wide = nm.ends_with("_b64"), wr = nm.find("_wrexec_") != std::string_view::npos;
+          const std::string_view stem = nm.substr(2, nm.find(wr ? "_wrexec_" : "_saveexec_") - 2);
+          const uint64_t mask = wide ? ~0ull : 0xFFFFFFFFull;
+          const uint64_t x = a & mask, e = w.exec & mask;
+          uint64_t v = stem == "nand" ? ~(x & e) : stem == "nor" ? ~(x | e) : stem == "xnor" ? ~(x ^ e)
+                       : stem == "and_not0" ? ~x & e : stem == "or_not0" ? ~x | e : stem == "or_not1" ? x | ~e : x & ~e;
+          v &= mask;
+          w.exec = (w.exec & ~mask) | v;
+          write_scalar(w, in.dst[0], wr ? v : e);
+          w.scc = v != 0;
+        } else {
+      switch (op.hash()) {
+        case "s_or_not1_b32"_op.hash:
+          if (!(op == "s_or_not1_b32"_op)) goto L_ladder_20;
+          {
+            const uint32_t v = static_cast<uint32_t>(a) | ~static_cast<uint32_t>(b);
+            write_scalar(w, in.dst[0], v);
+            w.scc = v != 0;
+          }
+          break;
+        case "s_pack_hl_b32_b16"_op.hash:
+          if (!(op == "s_pack_hl_b32_b16"_op)) goto L_ladder_20;
+          {
+            write_scalar(w, in.dst[0], static_cast<uint32_t>(a) >> 16 | static_cast<uint32_t>(b) << 16);
+          }
+          break;
+        case "s_sendmsg_rtn_b32"_op.hash: case "s_sendmsg_rtn_b64"_op.hash:
+          if (!(op == "s_sendmsg_rtn_b32"_op || op == "s_sendmsg_rtn_b64"_op)) goto L_ladder_20;
+          {
+            // A message that answers. The one compute code asks is the time
+            // (realtime_ticks).
+            // gfx1250 also answers 0x87, RTN_GET_SE_HW_ID ({XCC[19:16], SE_ID[3:0]}: shader engine 0 of XCC 0 here), and 0x88,
+            // RTN_GET_CLUSTER_BARRIER_STATE ({0, signalCnt, 5'b0, memberCnt, 3'b0, valid}: all zero, for no cluster barrier exists outside a
+            // cluster).
+            if (in.arch == gcn::Target::Gfx1250 && (in.simm == 0x87 || in.simm == 0x88)) {
+              write_scalar(w, in.dst[0], 0);
+            } else {
+              if (in.simm != 131)
+                throw Error::make(Err::Unsupported, "s_sendmsg_rtn of message ", in.simm, ", which this does not answer");
+              write_scalar(w, in.dst[0], realtime_ticks());
+            }
+          }
+          break;
+        default: L_ladder_20:
+          if (scalar_float(w, in, op, a, b)) {
+              } else if (op == "s_quadmask_b32"_op || op == "s_quadmask_b64"_op) {
+                // One bit for each group of four: set where any of the four is.
+                const uint32_t groups = op == "s_quadmask_b32"_op ? 8 : 16;
+                uint64_t v = 0;
+                for (uint32_t i = 0; i < groups; ++i) v |= uint64_t{((a >> (4 * i)) & 0xF) != 0} << i;
+                write_scalar(w, in.dst[0], v);
+                w.scc = v != 0;
+              } else if (op == "s_bitset0_b64"_op || op == "s_bitset1_b64"_op) {
+                const uint64_t d = scalar(w, in.dst[0]), bit = uint64_t{1} << (static_cast<uint32_t>(a) & 63);
+                write_scalar(w, in.dst[0], op == "s_bitset1_b64"_op ? d | bit : d & ~bit);
+              } else if (op == "s_bitreplicate_b64_b32"_op) {
+                // Each bit twice: a quad mask into a pixel mask.
+                uint64_t v = 0;
+                for (uint32_t i = 0; i < 32; ++i) v |= (uint64_t{3} * ((a >> i) & 1)) << (2 * i);
+                write_scalar(w, in.dst[0], v);
+              } else if (op == "s_cls_i32_i64"_op) {
+                // Leading bits equal to the sign bit; -1 where all are.
+                int32_t n = -1;
+                for (uint32_t i = 1; i < 64; ++i)
+                  if (((a >> (63 - i)) & 1) != (a >> 63)) { n = static_cast<int32_t>(i); break; }
+                write_scalar(w, in.dst[0], static_cast<uint32_t>(n));
+              } else {
+            switch (op.hash()) {
+              case "s_add_nc_u64"_op.hash: case "s_sub_nc_u64"_op.hash: case "s_mul_u64"_op.hash:
+                if (!(op == "s_add_nc_u64"_op || op == "s_sub_nc_u64"_op || op == "s_mul_u64"_op)) goto L_ladder_21;
+                {
+                  // RDNA4's 64-bit scalar arithmetic, SCC untouched.
+                  write_scalar(w, in.dst[0], op == "s_add_nc_u64"_op ? a + b : op == "s_sub_nc_u64"_op ? a - b : a * b);
+                }
+                break;
+              case "s_barrier_signal"_op.hash: case "s_barrier_signal_isfirst"_op.hash:
+                if (!(op == "s_barrier_signal"_op || op == "s_barrier_signal_isfirst"_op)) goto L_ladder_21;
+                {
+                  // RDNA4's split barrier: signalling arrives; s_barrier_wait is where the
+                  // wave waits for the rest (and is the barrier here).
+                  if (op == "s_barrier_signal_isfirst"_op) w.scc = false;
+                }
+                break;
+              case "s_waitcnt_vscnt"_op.hash: case "s_waitcnt_vmcnt"_op.hash: case "s_waitcnt_expcnt"_op.hash: case "s_waitcnt_lgkmcnt"_op.hash: case "s_version"_op.hash:
+                if (!(op == "s_waitcnt_vscnt"_op || op == "s_waitcnt_vmcnt"_op || op == "s_waitcnt_expcnt"_op ||
+                           op == "s_waitcnt_lgkmcnt"_op || op == "s_version"_op)) goto L_ladder_21;
+                {
+                  // RDNA's separate counters: nothing is outstanding here to wait for.
+                  // (s_version only marks which ISA the code was written for.)
+                }
+                break;
+              default: L_ladder_21:
+                {
+                      throw Error::make(Err::Unsupported, "scalar instruction ", op, " is decoded but not implemented");
+                    }
+                break;
+            }
+          }
+          break;
+      }
+    }
+    break;
+}
   }
 
   // A scalar comparison: SCC is the whole result.
@@ -1581,7 +2084,7 @@ struct Machine {
       return;
     }
     const uint64_t a = scalar(w, in.src[0]), b = scalar(w, in.src[1]);
-    const OpName op(in.name);
+    const OpName op(in);
     // RDNA's scalar float comparisons: s_cmp_<test>_f32 and _f16, the vector
     // comparisons' tests.
     if (in.name.size() > 10 && in.name.rfind("s_cmp_", 0) == 0 &&
@@ -1599,26 +2102,85 @@ struct Machine {
               : t == "nle" ? !(x <= y) : t == "neq" ? !(x == y) : t == "nlt" ? !(x < y)
               : throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
       return;
-    }
-    if (op == "s_cmp_lt_i32"_op) w.scc = static_cast<int32_t>(a) < static_cast<int32_t>(b);
-    else if (op == "s_cmp_eq_u32"_op) w.scc = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
-    else if (op == "s_cmp_ge_u32"_op) w.scc = static_cast<uint32_t>(a) >= static_cast<uint32_t>(b);
-    else if (op == "s_cmp_gt_u32"_op) w.scc = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
-    else if (op == "s_cmp_lg_u32"_op) w.scc = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
-    else if (op == "s_cmp_gt_i32"_op) w.scc = static_cast<int32_t>(a) > static_cast<int32_t>(b);
-    else if (op == "s_cmp_ge_i32"_op) w.scc = static_cast<int32_t>(a) >= static_cast<int32_t>(b);
-    else if (op == "s_cmp_eq_u64"_op) w.scc = a == b;
-    else if (op == "s_cmp_lt_u32"_op) w.scc = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
-    else if (op == "s_cmp_lg_u64"_op) w.scc = a != b;
-    else if (op == "s_cmp_le_i32"_op) w.scc = static_cast<int32_t>(a) <= static_cast<int32_t>(b);
-    else if (op == "s_cmp_eq_i32"_op) w.scc = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
-    else if (op == "s_cmp_lg_i32"_op) w.scc = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
-    else if (op == "s_cmp_le_u32"_op) w.scc = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
-    else if (op == "s_bitcmp0_b32"_op) w.scc = ((a >> (b & 31)) & 1) == 0;
-    else if (op == "s_bitcmp1_b32"_op) w.scc = ((a >> (b & 31)) & 1) == 1;
-    else if (op == "s_bitcmp0_b64"_op) w.scc = ((a >> (b & 63)) & 1) == 0;
-    else if (op == "s_bitcmp1_b64"_op) w.scc = ((a >> (b & 63)) & 1) == 1;
-    else throw Error::make(Err::Unsupported, "scalar comparison ", op, " is decoded but not implemented");
+    } else {
+  switch (op.hash()) {
+    case "s_cmp_lt_i32"_op.hash:
+      if (!(op == "s_cmp_lt_i32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<int32_t>(a) < static_cast<int32_t>(b);}
+      break;
+    case "s_cmp_eq_u32"_op.hash:
+      if (!(op == "s_cmp_eq_u32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);}
+      break;
+    case "s_cmp_ge_u32"_op.hash:
+      if (!(op == "s_cmp_ge_u32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<uint32_t>(a) >= static_cast<uint32_t>(b);}
+      break;
+    case "s_cmp_gt_u32"_op.hash:
+      if (!(op == "s_cmp_gt_u32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);}
+      break;
+    case "s_cmp_lg_u32"_op.hash:
+      if (!(op == "s_cmp_lg_u32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);}
+      break;
+    case "s_cmp_gt_i32"_op.hash:
+      if (!(op == "s_cmp_gt_i32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<int32_t>(a) > static_cast<int32_t>(b);}
+      break;
+    case "s_cmp_ge_i32"_op.hash:
+      if (!(op == "s_cmp_ge_i32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<int32_t>(a) >= static_cast<int32_t>(b);}
+      break;
+    case "s_cmp_eq_u64"_op.hash:
+      if (!(op == "s_cmp_eq_u64"_op)) goto L_ladder_18;
+      {w.scc = a == b;}
+      break;
+    case "s_cmp_lt_u32"_op.hash:
+      if (!(op == "s_cmp_lt_u32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);}
+      break;
+    case "s_cmp_lg_u64"_op.hash:
+      if (!(op == "s_cmp_lg_u64"_op)) goto L_ladder_18;
+      {w.scc = a != b;}
+      break;
+    case "s_cmp_le_i32"_op.hash:
+      if (!(op == "s_cmp_le_i32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<int32_t>(a) <= static_cast<int32_t>(b);}
+      break;
+    case "s_cmp_eq_i32"_op.hash:
+      if (!(op == "s_cmp_eq_i32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);}
+      break;
+    case "s_cmp_lg_i32"_op.hash:
+      if (!(op == "s_cmp_lg_i32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);}
+      break;
+    case "s_cmp_le_u32"_op.hash:
+      if (!(op == "s_cmp_le_u32"_op)) goto L_ladder_18;
+      {w.scc = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);}
+      break;
+    case "s_bitcmp0_b32"_op.hash:
+      if (!(op == "s_bitcmp0_b32"_op)) goto L_ladder_18;
+      {w.scc = ((a >> (b & 31)) & 1) == 0;}
+      break;
+    case "s_bitcmp1_b32"_op.hash:
+      if (!(op == "s_bitcmp1_b32"_op)) goto L_ladder_18;
+      {w.scc = ((a >> (b & 31)) & 1) == 1;}
+      break;
+    case "s_bitcmp0_b64"_op.hash:
+      if (!(op == "s_bitcmp0_b64"_op)) goto L_ladder_18;
+      {w.scc = ((a >> (b & 63)) & 1) == 0;}
+      break;
+    case "s_bitcmp1_b64"_op.hash:
+      if (!(op == "s_bitcmp1_b64"_op)) goto L_ladder_18;
+      {w.scc = ((a >> (b & 63)) & 1) == 1;}
+      break;
+    default: L_ladder_18:
+      {throw Error::make(Err::Unsupported, "scalar comparison ", op, " is decoded but not implemented");}
+      break;
+  }
+}
   }
 
   void scalar_load(Wave& w, const Inst& in) {
@@ -1634,14 +2196,14 @@ struct Machine {
     // on. s_memrealtime is the real-time clock (realtime_ticks), at the rate
     // the runtime reports: a kernel waiting on it for some milliseconds, as
     // wall_clock64() loops do, waits that long.
-    if (OpName(in.name) == "s_memtime"_op || OpName(in.name) == "s_memrealtime"_op) {
-      const uint64_t t = OpName(in.name) == "s_memtime"_op ? stats.instructions : realtime_ticks();
+    if (OpName(in) == "s_memtime"_op || OpName(in) == "s_memrealtime"_op) {
+      const uint64_t t = OpName(in) == "s_memtime"_op ? stats.instructions : realtime_ticks();
       set_sgpr(w, in.dst[0].index, static_cast<uint32_t>(t));
       set_sgpr(w, in.dst[0].index + 1, static_cast<uint32_t>(t >> 32));
       return;
     }
     // The scalar cache holds nothing here to write back or drop.
-    if (OpName(in.name) == "s_dcache_wb"_op || OpName(in.name) == "s_dcache_inv"_op) return;
+    if (OpName(in) == "s_dcache_wb"_op || OpName(in) == "s_dcache_inv"_op) return;
     // The base, the instruction's own offset, and a scalar register's where
     // it names one.
     // (RDNA's decoder keeps the register as the second source: null, reading
@@ -1692,8 +2254,8 @@ struct Machine {
     }
     // RDNA4's sub-dword scalar loads: a byte or a short, widened with its sign
     // or without.
-    if (OpName(in.name) == "s_load_u8"_op || OpName(in.name) == "s_load_i8"_op ||
-        OpName(in.name) == "s_load_u16"_op || OpName(in.name) == "s_load_i16"_op) {
+    if (OpName(in) == "s_load_u8"_op || OpName(in) == "s_load_i8"_op ||
+        OpName(in) == "s_load_u16"_op || OpName(in) == "s_load_i16"_op) {
       const uint32_t bytes = in.name.back() == '8' ? 1 : 2;
       const uint64_t raw = at(base).load_scalar(base, bytes);
       const bool sign = in.name[7] == 'i';
@@ -1733,7 +2295,7 @@ struct Machine {
   // this reciprocal is exact, so the sequence lands on the correctly rounded
   // quotient either way.
   void divide_step(Wave& w, const Inst& in, uint32_t lane) {
-    const OpName op(in.name);
+    const OpName op(in);
     // The same three steps, in double precision: the ISA gives each a form of
     // its own, and the scaling is by 2^128 rather than 2^64.
     if (op.size() > 4 && op.compare(op.size() - 4, 4, "_f64") == 0) {
@@ -1818,7 +2380,7 @@ struct Machine {
   // half. The mask goes to VCC in the short form, and to the pair the long
   // form names.
   bool carry_alu(Wave& w, const Inst& in) {
-    const OpName op(in.name);
+    const OpName op(in);
     if (op.find("_co_u32") == std::string::npos) return false;
     const bool add = op.rfind("v_add", 0) == 0;
     const bool takes_carry = op.find("_addc_") != std::string::npos || op.find("_subb") != std::string::npos;
@@ -1849,7 +2411,10 @@ struct Machine {
     const bool comparing = in_dpp.name.rfind("v_cmp", 0) == 0;
     if (comparing) {
       plain = in_dpp;
-      if (plain.name.ends_with("_dpp")) plain.name.resize(plain.name.size() - 4);
+      if (plain.name.ends_with("_dpp")) {
+        plain.name.resize(plain.name.size() - 4);
+        plain.flags = 0;   // (the hash and flags taken at decoding were of the longer name)
+      }
     }
     const Inst& in = comparing ? plain : in_dpp;
     std::array<uint32_t, kLanes> values{};
@@ -1932,10 +2497,11 @@ struct Machine {
   // add-then-clamp forms, packed saturating conversions, tanh and the bfloat16 transcendentals, and the
   // 8-bit float conversions to halves. False for an instruction that is not one of them.
   bool cdna5_alu(Wave& w, const Inst& in, const OpName& op_in) {
-    std::string name = op_in;
+    // The name without its _e32 or _e64 (no copy: a view of the instruction's own).
+    std::string_view name = op_in.view();
     if (name.size() > 4 && (name.compare(name.size() - 4, 4, "_e32") == 0 || name.compare(name.size() - 4, 4, "_e64") == 0))
-      name.resize(name.size() - 4);
-    const OpName op(name);
+      name.remove_suffix(4);
+    const OpName op(name, name.size() == op_in.size() ? op_in.hash() : name_hash(name));
     const auto each = [&](auto&& body) {
       for (uint32_t lane = 0; lane < kLanes; ++lane)
         if (w.exec >> lane & 1) body(lane);
@@ -1946,34 +2512,69 @@ struct Machine {
     const auto sat8 = [](int64_t v, bool is_signed) -> uint32_t {
       return static_cast<uint32_t>(is_signed ? std::clamp<int64_t>(v, -128, 127) : std::clamp<int64_t>(v, 0, 255)) & 0xFF;
     };
-    if (op == "v_add_nc_u64"_op) {
+    switch (op.hash()) {
+  case "v_add_nc_u64"_op.hash:
+    if (!(op == "v_add_nc_u64"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) { write_lane64(w, in.dst[0], lane, u64(0, lane) + u64(1, lane)); });
-    } else if (op == "v_sub_nc_u64"_op) {
+    }
+    break;
+  case "v_sub_nc_u64"_op.hash:
+    if (!(op == "v_sub_nc_u64"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) { write_lane64(w, in.dst[0], lane, u64(0, lane) - u64(1, lane)); });
-    } else if (op == "v_mul_u64"_op) {
+    }
+    break;
+  case "v_mul_u64"_op.hash:
+    if (!(op == "v_mul_u64"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) { write_lane64(w, in.dst[0], lane, u64(0, lane) * u64(1, lane)); });
-    } else if (op == "v_min_u64"_op || op == "v_max_u64"_op) {
+    }
+    break;
+  case "v_min_u64"_op.hash: case "v_max_u64"_op.hash:
+    if (!(op == "v_min_u64"_op || op == "v_max_u64"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const uint64_t a = u64(0, lane), b = u64(1, lane);
         write_lane64(w, in.dst[0], lane, op == "v_min_u64"_op ? std::min(a, b) : std::max(a, b));
       });
-    } else if (op == "v_min_i64"_op || op == "v_max_i64"_op) {
+    }
+    break;
+  case "v_min_i64"_op.hash: case "v_max_i64"_op.hash:
+    if (!(op == "v_min_i64"_op || op == "v_max_i64"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const int64_t a = static_cast<int64_t>(u64(0, lane)), b = static_cast<int64_t>(u64(1, lane));
         write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(op == "v_min_i64"_op ? std::min(a, b) : std::max(a, b)));
       });
-    } else if (op == "v_mad_u32"_op) {
+    }
+    break;
+  case "v_mad_u32"_op.hash:
+    if (!(op == "v_mad_u32"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, u(0, lane) * u(1, lane) + u(2, lane)); });
-    } else if (op == "v_mad_nc_u64_u32"_op) {
+    }
+    break;
+  case "v_mad_nc_u64_u32"_op.hash:
+    if (!(op == "v_mad_nc_u64_u32"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         write_lane64(w, in.dst[0], lane, uint64_t{u(0, lane)} * u(1, lane) + u64(2, lane));
       });
-    } else if (op == "v_mad_nc_i64_i32"_op) {
+    }
+    break;
+  case "v_mad_nc_i64_i32"_op.hash:
+    if (!(op == "v_mad_nc_i64_i32"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const int64_t p = int64_t{static_cast<int32_t>(u(0, lane))} * static_cast<int32_t>(u(1, lane));
         write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(p + static_cast<int64_t>(u64(2, lane))));
       });
-    } else if (op == "v_add_max_i32"_op || op == "v_add_min_i32"_op || op == "v_add_max_u32"_op || op == "v_add_min_u32"_op) {
+    }
+    break;
+  case "v_add_max_i32"_op.hash: case "v_add_min_i32"_op.hash: case "v_add_max_u32"_op.hash: case "v_add_min_u32"_op.hash:
+    if (!(op == "v_add_max_i32"_op || op == "v_add_min_i32"_op || op == "v_add_max_u32"_op || op == "v_add_min_u32"_op)) goto L_ladder_17;
+    {
       // The sum held to the type's range, then the larger or smaller of it and the third source.
       const bool is_signed = name.find("_i32") != std::string::npos, is_max = name.find("_max_") != std::string::npos;
       each([&](uint32_t lane) {
@@ -1991,14 +2592,22 @@ struct Machine {
           write_lane(w, in.dst[0], lane, static_cast<uint32_t>(is_max ? std::max(sum, c) : std::min(sum, c)));
         }
       });
-    } else if (op == "v_ashr_pk_i8_i32"_op || op == "v_ashr_pk_u8_i32"_op) {
+    }
+    break;
+  case "v_ashr_pk_i8_i32"_op.hash: case "v_ashr_pk_u8_i32"_op.hash:
+    if (!(op == "v_ashr_pk_i8_i32"_op || op == "v_ashr_pk_u8_i32"_op)) goto L_ladder_17;
+    {
       const bool is_signed = op == "v_ashr_pk_i8_i32"_op;
       each([&](uint32_t lane) {
         const uint32_t n = u(2, lane) & 31;
         write_lane(w, in.dst[0], lane,
                    sat8(static_cast<int32_t>(u(0, lane)) >> n, is_signed) | sat8(static_cast<int32_t>(u(1, lane)) >> n, is_signed) << 8);
       });
-    } else if (op == "v_sat_pk4_i4_i8"_op || op == "v_sat_pk4_u4_u8"_op) {
+    }
+    break;
+  case "v_sat_pk4_i4_i8"_op.hash: case "v_sat_pk4_u4_u8"_op.hash:
+    if (!(op == "v_sat_pk4_i4_i8"_op || op == "v_sat_pk4_u4_u8"_op)) goto L_ladder_17;
+    {
       const bool is_signed = op == "v_sat_pk4_i4_i8"_op;
       each([&](uint32_t lane) {
         const uint32_t x = u(0, lane);
@@ -2009,34 +2618,77 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, r);
       });
-    } else if (op == "v_tanh_f32"_op) {
+    }
+    break;
+  case "v_tanh_f32"_op.hash:
+    if (!(op == "v_tanh_f32"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) { write_float(w, in, lane, std::tanh(lane_float(w, in.src[0], lane))); });
-    } else if (op == "v_tanh_f16"_op) {
+    }
+    break;
+  case "v_tanh_f16"_op.hash:
+    if (!(op == "v_tanh_f16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) { write_half(w, in, lane, static_cast<_Float16>(std::tanh(static_cast<float>(lane_half(w, in.src[0], lane))))); });
-    } else if (op == "v_tanh_bf16"_op) {
+    }
+    break;
+  case "v_tanh_bf16"_op.hash:
+    if (!(op == "v_tanh_bf16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, to_bf16(std::tanh(bf(0, lane)))); });
-    } else if (op == "v_rcp_bf16"_op || op == "v_sqrt_bf16"_op || op == "v_rsq_bf16"_op || op == "v_log_bf16"_op ||
-               op == "v_exp_bf16"_op || op == "v_sin_bf16"_op || op == "v_cos_bf16"_op) {
+    }
+    break;
+  case "v_rcp_bf16"_op.hash: case "v_sqrt_bf16"_op.hash: case "v_rsq_bf16"_op.hash: case "v_log_bf16"_op.hash: case "v_exp_bf16"_op.hash: case "v_sin_bf16"_op.hash: case "v_cos_bf16"_op.hash:
+    if (!(op == "v_rcp_bf16"_op || op == "v_sqrt_bf16"_op || op == "v_rsq_bf16"_op || op == "v_log_bf16"_op ||
+               op == "v_exp_bf16"_op || op == "v_sin_bf16"_op || op == "v_cos_bf16"_op)) goto L_ladder_17;
+    {
       // The operand is a bfloat16 and so is the result; sine and cosine take the angle in turns, as the f32 forms do.
       each([&](uint32_t lane) {
         const float x = bf(0, lane);
         float r;
-        if (op == "v_rcp_bf16"_op) r = 1.0f / x;
-        else if (op == "v_sqrt_bf16"_op) r = std::sqrt(x);
-        else if (op == "v_rsq_bf16"_op) r = 1.0f / std::sqrt(x);
-        else if (op == "v_log_bf16"_op) r = std::log2(x);
-        else if (op == "v_exp_bf16"_op) r = std::exp2(x);
-        else r = turns_trig(static_cast<double>(x), op == "v_sin_bf16"_op);
+        switch (op.hash()) {
+  case "v_rcp_bf16"_op.hash:
+    if (!(op == "v_rcp_bf16"_op)) goto L_ladder_16;
+    {r = 1.0f / x;}
+    break;
+  case "v_sqrt_bf16"_op.hash:
+    if (!(op == "v_sqrt_bf16"_op)) goto L_ladder_16;
+    {r = std::sqrt(x);}
+    break;
+  case "v_rsq_bf16"_op.hash:
+    if (!(op == "v_rsq_bf16"_op)) goto L_ladder_16;
+    {r = 1.0f / std::sqrt(x);}
+    break;
+  case "v_log_bf16"_op.hash:
+    if (!(op == "v_log_bf16"_op)) goto L_ladder_16;
+    {r = std::log2(x);}
+    break;
+  case "v_exp_bf16"_op.hash:
+    if (!(op == "v_exp_bf16"_op)) goto L_ladder_16;
+    {r = std::exp2(x);}
+    break;
+  default: L_ladder_16:
+    {r = turns_trig(static_cast<double>(x), op == "v_sin_bf16"_op);}
+    break;
+}
         write_lane(w, in.dst[0], lane, to_bf16(r));
       });
-    } else if (op == "v_cvt_f16_fp8"_op || op == "v_cvt_f16_bf8"_op) {
+    }
+    break;
+  case "v_cvt_f16_fp8"_op.hash: case "v_cvt_f16_bf8"_op.hash:
+    if (!(op == "v_cvt_f16_fp8"_op || op == "v_cvt_f16_bf8"_op)) goto L_ladder_17;
+    {
       const F8& t = op == "v_cvt_f16_fp8"_op ? fp8() : bf8();
       each([&](uint32_t lane) {
         // The byte is OPSEL[0:1] -- "OPSEL bits are reversed": bit 0 is the high one of the pair -- times eight.
         const uint32_t shift = 8 * (((in.op_sel & 1) << 1) | ((in.op_sel >> 1) & 1));
         write_half(w, in, lane, static_cast<_Float16>(f8_to_float(u(0, lane) >> shift & 0xFF, t)));
       });
-    } else if (op == "v_cvt_pk_f16_fp8"_op || op == "v_cvt_pk_f16_bf8"_op) {
+    }
+    break;
+  case "v_cvt_pk_f16_fp8"_op.hash: case "v_cvt_pk_f16_bf8"_op.hash:
+    if (!(op == "v_cvt_pk_f16_fp8"_op || op == "v_cvt_pk_f16_bf8"_op)) goto L_ladder_17;
+    {
       const F8& t = op == "v_cvt_pk_f16_fp8"_op ? fp8() : bf8();
       each([&](uint32_t lane) {
         const auto h = [&](uint32_t byte) {
@@ -2048,27 +2700,43 @@ struct Machine {
         const uint32_t x = u(0, lane);
         write_lane(w, in.dst[0], lane, h(x & 0xFF) | h((x >> 8) & 0xFF) << 16);
       });
-    } else if (op == "v_minimum_f32"_op || op == "v_maximum_f32"_op) {
+    }
+    break;
+  case "v_minimum_f32"_op.hash: case "v_maximum_f32"_op.hash:
+    if (!(op == "v_minimum_f32"_op || op == "v_maximum_f32"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const uint64_t r = ieee_minmax(as_bits(lane_float(w, in.src[0], lane)), as_bits(lane_float(w, in.src[1], lane)), 8, 23,
                                        op == "v_maximum_f32"_op);
         write_float(w, in, lane, as_float(static_cast<uint32_t>(r)));
       });
-    } else if (op == "v_minimum_f16"_op || op == "v_maximum_f16"_op) {
+    }
+    break;
+  case "v_minimum_f16"_op.hash: case "v_maximum_f16"_op.hash:
+    if (!(op == "v_minimum_f16"_op || op == "v_maximum_f16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const uint64_t r = ieee_minmax(as_bits(lane_half(w, in.src[0], lane)), as_bits(lane_half(w, in.src[1], lane)), 5, 10,
                                        op == "v_maximum_f16"_op);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(r));
       });
-    } else if (op == "v_minimum_f64"_op || op == "v_maximum_f64"_op) {
+    }
+    break;
+  case "v_minimum_f64"_op.hash: case "v_maximum_f64"_op.hash:
+    if (!(op == "v_minimum_f64"_op || op == "v_maximum_f64"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const uint64_t r = ieee_minmax(as_bits(lane_double(w, in.src[0], lane)), as_bits(lane_double(w, in.src[1], lane)), 11, 52,
                                        op == "v_maximum_f64"_op);
         write_double(w, in, lane, as_double(r));
       });
-    } else if (op == "v_minimum3_f32"_op || op == "v_maximum3_f32"_op || op == "v_minimummaximum_f32"_op ||
+    }
+    break;
+  case "v_minimum3_f32"_op.hash: case "v_maximum3_f32"_op.hash: case "v_minimummaximum_f32"_op.hash: case "v_maximumminimum_f32"_op.hash: case "v_minimum3_f16"_op.hash: case "v_maximum3_f16"_op.hash: case "v_minimummaximum_f16"_op.hash: case "v_maximumminimum_f16"_op.hash:
+    if (!(op == "v_minimum3_f32"_op || op == "v_maximum3_f32"_op || op == "v_minimummaximum_f32"_op ||
                op == "v_maximumminimum_f32"_op || op == "v_minimum3_f16"_op || op == "v_maximum3_f16"_op ||
-               op == "v_minimummaximum_f16"_op || op == "v_maximumminimum_f16"_op) {
+               op == "v_minimummaximum_f16"_op || op == "v_maximumminimum_f16"_op)) goto L_ladder_17;
+    {
       // Three values, two steps of the IEEE minimum() or maximum(): the same twice, or one and then the other.
       const bool f16 = name.ends_with("_f16");
       const bool first_max = op == "v_maximum3_f32"_op || op == "v_maximum3_f16"_op || op == "v_maximumminimum_f32"_op ||
@@ -2082,10 +2750,14 @@ struct Machine {
         if (f16) write_lane(w, in.dst[0], lane, static_cast<uint32_t>(r));
         else write_float(w, in, lane, as_float(static_cast<uint32_t>(r)));
       });
-    } else if (op == "v_min3_num_f32"_op || op == "v_max3_num_f32"_op || op == "v_minmax_num_f32"_op ||
+    }
+    break;
+  case "v_min3_num_f32"_op.hash: case "v_max3_num_f32"_op.hash: case "v_minmax_num_f32"_op.hash: case "v_maxmin_num_f32"_op.hash: case "v_med3_num_f32"_op.hash: case "v_min3_num_f16"_op.hash: case "v_max3_num_f16"_op.hash: case "v_minmax_num_f16"_op.hash: case "v_maxmin_num_f16"_op.hash: case "v_med3_num_f16"_op.hash:
+    if (!(op == "v_min3_num_f32"_op || op == "v_max3_num_f32"_op || op == "v_minmax_num_f32"_op ||
                op == "v_maxmin_num_f32"_op || op == "v_med3_num_f32"_op || op == "v_min3_num_f16"_op ||
                op == "v_max3_num_f16"_op || op == "v_minmax_num_f16"_op || op == "v_maxmin_num_f16"_op ||
-               op == "v_med3_num_f16"_op) {
+               op == "v_med3_num_f16"_op)) goto L_ladder_17;
+    {
       const bool f16 = name.ends_with("_f16");
       const std::string_view kind = name.rfind("v_min3", 0) == 0 ? "min3" : name.rfind("v_max3", 0) == 0 ? "max3"
                                     : name.rfind("v_minmax", 0) == 0 ? "minmax" : name.rfind("v_maxmin", 0) == 0 ? "maxmin" : "med3";
@@ -2099,32 +2771,60 @@ struct Machine {
           write_float(w, in, lane, static_cast<float>(r));
         }
       });
-    } else if (op == "v_add_nc_i16"_op || op == "v_sub_nc_i16"_op) {
+    }
+    break;
+  case "v_add_nc_i16"_op.hash: case "v_sub_nc_i16"_op.hash:
+    if (!(op == "v_add_nc_i16"_op || op == "v_sub_nc_i16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const int32_t a = static_cast<int16_t>(u(0, lane)), b = static_cast<int16_t>(u(1, lane));
         int32_t r = op == "v_add_nc_i16"_op ? a + b : a - b;
         if (in.clamp) r = std::clamp(r, -32768, 32767);
         write_lane(w, in.dst[0], lane, static_cast<uint16_t>(r));
       });
-    } else if (op == "v_max_i16"_op || op == "v_min_i16"_op) {
+    }
+    break;
+  case "v_max_i16"_op.hash: case "v_min_i16"_op.hash:
+    if (!(op == "v_max_i16"_op || op == "v_min_i16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const int16_t a = static_cast<int16_t>(u(0, lane)), b = static_cast<int16_t>(u(1, lane));
         write_lane(w, in.dst[0], lane, static_cast<uint16_t>(op == "v_max_i16"_op ? std::max(a, b) : std::min(a, b)));
       });
-    } else if (op == "v_ashrrev_i16"_op) {
+    }
+    break;
+  case "v_ashrrev_i16"_op.hash:
+    if (!(op == "v_ashrrev_i16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, static_cast<uint16_t>(static_cast<int16_t>(u(1, lane)) >> (u(0, lane) & 15)));
       });
-    } else if (op == "v_cvt_i32_i16"_op) {
+    }
+    break;
+  case "v_cvt_i32_i16"_op.hash:
+    if (!(op == "v_cvt_i32_i16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(u(0, lane))))); });
-    } else if (op == "v_cvt_u32_u16"_op) {
+    }
+    break;
+  case "v_cvt_u32_u16"_op.hash:
+    if (!(op == "v_cvt_u32_u16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, u(0, lane) & 0xFFFFu); });
-    } else if (op == "v_sat_pk_u8_i16"_op) {
+    }
+    break;
+  case "v_sat_pk_u8_i16"_op.hash:
+    if (!(op == "v_sat_pk_u8_i16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const uint32_t x = u(0, lane);
         write_lane(w, in.dst[0], lane, sat8(static_cast<int16_t>(x), false) | sat8(static_cast<int16_t>(x >> 16), false) << 8);
       });
-    } else if (op == "v_sin_f16"_op || op == "v_cos_f16"_op) {
+    }
+    break;
+  case "v_sin_f16"_op.hash: case "v_cos_f16"_op.hash:
+    if (!(op == "v_sin_f16"_op || op == "v_cos_f16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         // The angle is in turns. Only its fraction matters, and taking that first keeps a whole number of turns at
         // exactly 0, as the ISA's examples have it (sin of the most negative half is +0, not a rounding error's).
@@ -2138,7 +2838,11 @@ struct Machine {
         }
         write_half(w, in, lane, static_cast<_Float16>(r));
       });
-    } else if (op == "v_frexp_mant_f16"_op || op == "v_frexp_exp_i16_f16"_op) {
+    }
+    break;
+  case "v_frexp_mant_f16"_op.hash: case "v_frexp_exp_i16_f16"_op.hash:
+    if (!(op == "v_frexp_mant_f16"_op || op == "v_frexp_exp_i16_f16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const float x = static_cast<float>(lane_half(w, in.src[0], lane));
         int e = 0;
@@ -2147,47 +2851,79 @@ struct Machine {
         if (op == "v_frexp_mant_f16"_op) write_half(w, in, lane, static_cast<_Float16>(m));
         else write_lane(w, in.dst[0], lane, static_cast<uint16_t>(e));
       });
-    } else if (op == "v_ldexp_f16"_op) {
+    }
+    break;
+  case "v_ldexp_f16"_op.hash:
+    if (!(op == "v_ldexp_f16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         write_half(w, in, lane, static_cast<_Float16>(std::ldexp(static_cast<float>(lane_half(w, in.src[0], lane)),
                                                                   static_cast<int16_t>(u(1, lane)))));
       });
-    } else if (op == "v_cvt_nearest_i32_f32"_op) {
+    }
+    break;
+  case "v_cvt_nearest_i32_f32"_op.hash:
+    if (!(op == "v_cvt_nearest_i32_f32"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const float x = lane_float(w, in.src[0], lane);
         const double r = std::floor(static_cast<double>(x) + 0.5);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(std::isnan(r) ? 0 : r <= -2147483648.0 ? INT32_MIN : r >= 2147483647.0 ? INT32_MAX : static_cast<int32_t>(r)));
       });
-    } else if (op == "v_cvt_off_f32_i4"_op) {
+    }
+    break;
+  case "v_cvt_off_f32_i4"_op.hash:
+    if (!(op == "v_cvt_off_f32_i4"_op)) goto L_ladder_17;
+    {
       // The signed 4-bit input over sixteen: the interpolation offsets -0.5 to +0.4375.
       each([&](uint32_t lane) {
         const int32_t n = (static_cast<int32_t>(u(0, lane) & 0xF) ^ 8) - 8;
         write_float(w, in, lane, static_cast<float>(n) / 16.0f);
       });
-    } else if (op == "v_cvt_norm_i16_f16"_op || op == "v_cvt_norm_u16_f16"_op) {
+    }
+    break;
+  case "v_cvt_norm_i16_f16"_op.hash: case "v_cvt_norm_u16_f16"_op.hash:
+    if (!(op == "v_cvt_norm_i16_f16"_op || op == "v_cvt_norm_u16_f16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(norm16(static_cast<double>(lane_half(w, in.src[0], lane)), op == "v_cvt_norm_i16_f16"_op)));
       });
-    } else if (op == "v_mul_dx9_zero_f32"_op) {
+    }
+    break;
+  case "v_mul_dx9_zero_f32"_op.hash:
+    if (!(op == "v_mul_dx9_zero_f32"_op)) goto L_ladder_17;
+    {
       // DX9: zero times anything, an infinity or a NaN included, is zero.
       each([&](uint32_t lane) {
         const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane);
         write_float(w, in, lane, x == 0.0f || y == 0.0f ? 0.0f : x * y);
       });
-    } else if (op == "v_fma_dx9_zero_f32"_op) {
+    }
+    break;
+  case "v_fma_dx9_zero_f32"_op.hash:
+    if (!(op == "v_fma_dx9_zero_f32"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane), z = lane_float(w, in.src[2], lane);
         write_float(w, in, lane, x == 0.0f || y == 0.0f ? z : std::fma(x, y, z));
       });
-    } else if (op == "v_mullit_f32"_op) {
+    }
+    break;
+  case "v_mullit_f32"_op.hash:
+    if (!(op == "v_mullit_f32"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane), z = lane_float(w, in.src[2], lane);
         const float lowest = -std::numeric_limits<float>::max();
         write_float(w, in, lane, (y == lowest || (std::isinf(y) && y < 0) || std::isnan(y) || z <= 0.0f || std::isnan(z)) ? lowest : x * y);
       });
-    } else if (op == "v_pk_add_bf16"_op || op == "v_pk_mul_bf16"_op || op == "v_pk_fma_bf16"_op ||
-               op == "v_pk_min_num_bf16"_op || op == "v_pk_max_num_bf16"_op) {
+    }
+    break;
+  case "v_pk_add_bf16"_op.hash: case "v_pk_mul_bf16"_op.hash: case "v_pk_fma_bf16"_op.hash: case "v_pk_min_num_bf16"_op.hash: case "v_pk_max_num_bf16"_op.hash:
+    if (!(op == "v_pk_add_bf16"_op || op == "v_pk_mul_bf16"_op || op == "v_pk_fma_bf16"_op ||
+               op == "v_pk_min_num_bf16"_op || op == "v_pk_max_num_bf16"_op)) goto L_ladder_17;
+    {
       // Each half a bfloat16, worked in double (a product of two is exact there, and a sum nearly always) and
       // rounded once to nearest even.
       each([&](uint32_t lane) {
@@ -2205,8 +2941,12 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, r);
       });
-    } else if (op == "v_pk_minimum_f16"_op || op == "v_pk_maximum_f16"_op || op == "v_pk_minimum3_f16"_op ||
-               op == "v_pk_maximum3_f16"_op || op == "v_pk_min3_num_f16"_op || op == "v_pk_max3_num_f16"_op) {
+    }
+    break;
+  case "v_pk_minimum_f16"_op.hash: case "v_pk_maximum_f16"_op.hash: case "v_pk_minimum3_f16"_op.hash: case "v_pk_maximum3_f16"_op.hash: case "v_pk_min3_num_f16"_op.hash: case "v_pk_max3_num_f16"_op.hash:
+    if (!(op == "v_pk_minimum_f16"_op || op == "v_pk_maximum_f16"_op || op == "v_pk_minimum3_f16"_op ||
+               op == "v_pk_maximum3_f16"_op || op == "v_pk_min3_num_f16"_op || op == "v_pk_max3_num_f16"_op)) goto L_ladder_17;
+    {
       const bool three = name.find("3") != std::string::npos, is_max = name.find("max") != std::string::npos,
                  is_num = name.find("_num") != std::string::npos;
       each([&](uint32_t lane) {
@@ -2230,7 +2970,11 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, r);
       });
-    } else if (op == "v_pk_fmac_f16"_op) {
+    }
+    break;
+  case "v_pk_fmac_f16"_op.hash:
+    if (!(op == "v_pk_fmac_f16"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const uint32_t d = word(w, in.dst[0], 0, lane);
         uint32_t r = 0;
@@ -2241,9 +2985,13 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, r);
       });
-    } else if (op == "v_pk_add_max_i16"_op || op == "v_pk_add_max_u16"_op || op == "v_pk_add_min_i16"_op ||
+    }
+    break;
+  case "v_pk_add_max_i16"_op.hash: case "v_pk_add_max_u16"_op.hash: case "v_pk_add_min_i16"_op.hash: case "v_pk_add_min_u16"_op.hash: case "v_pk_max3_i16"_op.hash: case "v_pk_max3_u16"_op.hash: case "v_pk_min3_i16"_op.hash: case "v_pk_min3_u16"_op.hash:
+    if (!(op == "v_pk_add_max_i16"_op || op == "v_pk_add_max_u16"_op || op == "v_pk_add_min_i16"_op ||
                op == "v_pk_add_min_u16"_op || op == "v_pk_max3_i16"_op || op == "v_pk_max3_u16"_op ||
-               op == "v_pk_min3_i16"_op || op == "v_pk_min3_u16"_op) {
+               op == "v_pk_min3_i16"_op || op == "v_pk_min3_u16"_op)) goto L_ladder_17;
+    {
       // The add saturates (whatever the CLAMP bit says); CLAMP asks instead for the final result to be at least zero.
       const bool is_signed = name.ends_with("_i16"), is_max = name.find("max") != std::string::npos, adds = name.find("add") != std::string::npos;
       each([&](uint32_t lane) {
@@ -2262,7 +3010,11 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, r);
       });
-    } else if (op == "v_cvt_pk_fp8_f16"_op || op == "v_cvt_pk_bf8_f16"_op) {
+    }
+    break;
+  case "v_cvt_pk_fp8_f16"_op.hash: case "v_cvt_pk_bf8_f16"_op.hash:
+    if (!(op == "v_cvt_pk_fp8_f16"_op || op == "v_cvt_pk_bf8_f16"_op)) goto L_ladder_17;
+    {
       // Two halves narrowed, to nearest even, into one half of the destination (op_sel's bit 3 says the high one), the
       // other half kept.
       const F8& t = op == "v_cvt_pk_fp8_f16"_op ? fp8() : bf8();
@@ -2277,7 +3029,11 @@ struct Machine {
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         write_lane(w, in.dst[0], lane, in.op_sel & 8 ? (was & 0xFFFFu) | two << 16 : (was & 0xFFFF0000u) | two);
       });
-    } else if (op == "v_cvt_sr_fp8_f16"_op || op == "v_cvt_sr_bf8_f16"_op) {
+    }
+    break;
+  case "v_cvt_sr_fp8_f16"_op.hash: case "v_cvt_sr_bf8_f16"_op.hash:
+    if (!(op == "v_cvt_sr_fp8_f16"_op || op == "v_cvt_sr_bf8_f16"_op)) goto L_ladder_17;
+    {
       // Stochastic rounding, as the ISA has it: the second source's top bits (seven for fp8, eight for bf8) are added to
       // the half's ten mantissa bits, wrapping, and the result narrowed to nearest even into the byte op_sel's bits 3:2 name.
       const bool is_fp8 = op == "v_cvt_sr_fp8_f16"_op;
@@ -2294,7 +3050,11 @@ struct Machine {
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         write_lane(w, in.dst[0], lane, (was & ~(0xFFu << at)) | b << at);
       });
-    } else if (op == "v_cvt_sr_pk_bf16_f32"_op) {
+    }
+    break;
+  case "v_cvt_sr_pk_bf16_f32"_op.hash:
+    if (!(op == "v_cvt_sr_pk_bf16_f32"_op)) goto L_ladder_17;
+    {
       // The seed's halves are added to the floats' bits and the top half of each sum kept: a truncation, after the add.
       each([&](uint32_t lane) {
         const uint32_t seed = u(2, lane);
@@ -2302,14 +3062,22 @@ struct Machine {
         const uint32_t hi = as_bits(lane_float(w, in.src[1], lane)) + (seed >> 16);
         write_lane(w, in.dst[0], lane, (lo >> 16) | (hi & 0xFFFF0000u));
       });
-    } else if (op == "v_cvt_sr_pk_f16_f32"_op) {
+    }
+    break;
+  case "v_cvt_sr_pk_f16_f32"_op.hash:
+    if (!(op == "v_cvt_sr_pk_f16_f32"_op)) goto L_ladder_17;
+    {
       each([&](uint32_t lane) {
         const uint32_t seed = u(2, lane);
         const float lo = as_float(as_bits(lane_float(w, in.src[0], lane)) + (seed & 0xFFFFu));
         const float hi = as_float(as_bits(lane_float(w, in.src[1], lane)) + (seed >> 16));
         write_lane(w, in.dst[0], lane, uint32_t{as_bits(static_cast<_Float16>(lo))} | uint32_t{as_bits(static_cast<_Float16>(hi))} << 16);
       });
-    } else if (op == "v_fma_mix_f32_bf16"_op || op == "v_fma_mixlo_bf16"_op || op == "v_fma_mixhi_bf16"_op) {
+    }
+    break;
+  case "v_fma_mix_f32_bf16"_op.hash: case "v_fma_mixlo_bf16"_op.hash: case "v_fma_mixhi_bf16"_op.hash:
+    if (!(op == "v_fma_mix_f32_bf16"_op || op == "v_fma_mixlo_bf16"_op || op == "v_fma_mixhi_bf16"_op)) goto L_ladder_17;
+    {
       // As the half forms: each source a float, or -- where its op_sel_hi bit is set -- the bfloat16 half op_sel names;
       // the "mix" forms read neg_hi as an absolute value.
       each([&](uint32_t lane) {
@@ -2320,7 +3088,8 @@ struct Machine {
           if (o.abs) f = std::fabs(f);
           return o.neg ? -f : f;
         };
-        float r = std::fma(source(0), source(1), source(2));
+        const float m0 = source(0), m1 = source(1), m2 = source(2);
+        float r = std::fma(m1, m0, m2);   // (this order: with two NaNs among them the one libm returns follows it)
         if (in.clamp) r = clamp01(r);
         if (op == "v_fma_mix_f32_bf16"_op) {
           write_lane(w, in.dst[0], lane, as_bits(r));
@@ -2330,13 +3099,21 @@ struct Machine {
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         w.vgpr[in.dst[0].index][lane] = op == "v_fma_mixlo_bf16"_op ? (was & 0xFFFF0000u) | bits : (was & 0x0000FFFFu) | bits << 16;
       });
-    } else if (op == "v_fmamk_f64"_op || op == "v_fmaak_f64"_op) {
+    }
+    break;
+  case "v_fmamk_f64"_op.hash: case "v_fmaak_f64"_op.hash:
+    if (!(op == "v_fmamk_f64"_op || op == "v_fmaak_f64"_op)) goto L_ladder_17;
+    {
       // A double multiply-add with a 64-bit constant: s0 * K + s1 (fmamk), or s0 * s1 + K (fmaak); the sources come in
       // that order either way, the constant in its place.
       each([&](uint32_t lane) {
         write_double(w, in, lane, std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane), lane_double(w, in.src[2], lane)));
       });
-    } else if (op == "v_cubeid_f32"_op || op == "v_cubesc_f32"_op || op == "v_cubetc_f32"_op || op == "v_cubema_f32"_op) {
+    }
+    break;
+  case "v_cubeid_f32"_op.hash: case "v_cubesc_f32"_op.hash: case "v_cubetc_f32"_op.hash: case "v_cubema_f32"_op.hash:
+    if (!(op == "v_cubeid_f32"_op || op == "v_cubesc_f32"_op || op == "v_cubetc_f32"_op || op == "v_cubema_f32"_op)) goto L_ladder_17;
+    {
       // The cube-face instructions, as the ISA has them: the face a direction (x, y, z) points at, a coordinate on it, and
       // twice the major axis.
       each([&](uint32_t lane) {
@@ -2349,7 +3126,11 @@ struct Machine {
         else r = (z_major ? z : y_major ? y : x) * 2.0f;
         write_float(w, in, lane, r);
       });
-    } else if (op == "v_perm_pk16_b4_u4"_op || op == "v_perm_pk16_b6_u4"_op || op == "v_perm_pk16_b8_u4"_op) {
+    }
+    break;
+  case "v_perm_pk16_b4_u4"_op.hash: case "v_perm_pk16_b6_u4"_op.hash: case "v_perm_pk16_b8_u4"_op.hash:
+    if (!(op == "v_perm_pk16_b4_u4"_op || op == "v_perm_pk16_b6_u4"_op || op == "v_perm_pk16_b8_u4"_op)) goto L_ladder_17;
+    {
       // Sixteen lookups in a table of sixteen 4-, 6- or 8-bit entries, each by a 4-bit index of the third source's 64: the
       // table is the first source over the second (the first the more significant), and the result 16 entries wide.
       const uint32_t width = op == "v_perm_pk16_b4_u4"_op ? 4 : op == "v_perm_pk16_b6_u4"_op ? 6 : 8;
@@ -2374,17 +3155,23 @@ struct Machine {
         }
         for (uint32_t k = 0; k < width / 2; ++k) set_word(w, in.dst[0], k, lane, result[k]);
       });
-    } else {
-      return false;
     }
+    break;
+  default: L_ladder_17:
+    {
+          return false;
+        }
+    break;
+}
     return true;
   }
 
   bool rdna_alu(Wave& w, const Inst& in, const OpName& op_in) {
-    std::string name = op_in;
+    // The name without its _e32 or _e64 (no copy: a view of the instruction's own).
+    std::string_view name = op_in.view();
     if (name.size() > 4 && (name.compare(name.size() - 4, 4, "_e32") == 0 || name.compare(name.size() - 4, 4, "_e64") == 0))
-      name.resize(name.size() - 4);
-    const OpName op(name);
+      name.remove_suffix(4);
+    const OpName op(name, name.size() == op_in.size() ? op_in.hash() : name_hash(name));
     const auto each = [&](auto&& body) {
       for (uint32_t lane = 0; lane < kLanes; ++lane)
         if (w.exec >> lane & 1) body(lane);
@@ -2394,20 +3181,35 @@ struct Machine {
     const auto i16 = [&](uint32_t k, uint32_t lane) { return static_cast<int16_t>(src(k, lane)); };
     const auto f32 = [&](uint32_t k, uint32_t lane) { return lane_float(w, in.src[k], lane); };
     const auto i32 = [&](uint32_t k, uint32_t lane) { return static_cast<int32_t>(src(k, lane)); };
-    if (op == "v_and_b16"_op || op == "v_or_b16"_op || op == "v_xor_b16"_op) {
+    switch (op.hash()) {
+  case "v_and_b16"_op.hash: case "v_or_b16"_op.hash: case "v_xor_b16"_op.hash:
+    if (!(op == "v_and_b16"_op || op == "v_or_b16"_op || op == "v_xor_b16"_op)) goto L_ladder_14;
+    {
       each([&](uint32_t lane) {
         const uint16_t a = u16(0, lane), b = u16(1, lane);
         write_lane(w, in.dst[0], lane, op == "v_and_b16"_op ? a & b : op == "v_or_b16"_op ? a | b : a ^ b);
       });
-    } else if (op == "v_not_b16"_op) {
+    }
+    break;
+  case "v_not_b16"_op.hash:
+    if (!(op == "v_not_b16"_op)) goto L_ladder_14;
+    {
       each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, static_cast<uint16_t>(~u16(0, lane))); });
-    } else if (op == "v_cndmask_b16"_op) {
+    }
+    break;
+  case "v_cndmask_b16"_op.hash:
+    if (!(op == "v_cndmask_b16"_op)) goto L_ladder_14;
+    {
       // The lane's bit of the mask (src2) picks the second source.
       const uint64_t cond = scalar(w, in.src[2]);
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_bits(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane) & 0xFFFF);
       });
-    } else if (op == "v_permlane16_b32"_op || op == "v_permlanex16_b32"_op) {
+    }
+    break;
+  case "v_permlane16_b32"_op.hash: case "v_permlanex16_b32"_op.hash:
+    if (!(op == "v_permlane16_b32"_op || op == "v_permlanex16_b32"_op)) goto L_ladder_14;
+    {
       // Each lane of a row of 16 reads the lane of its row (permlane16) or of
       // the other row of its pair (permlanex16) that its 4 bits of the
       // 64-bit selector {src2, src1} name. A source lane that is off is read
@@ -2425,7 +3227,11 @@ struct Machine {
         if (fi || (w.exec >> s & 1)) write_lane(w, in.dst[0], lane, from[s]);
         else if (bound) write_lane(w, in.dst[0], lane, 0);
       });
-    } else if (op == "v_permlane16_var_b32"_op || op == "v_permlanex16_var_b32"_op) {
+    }
+    break;
+  case "v_permlane16_var_b32"_op.hash: case "v_permlanex16_var_b32"_op.hash:
+    if (!(op == "v_permlane16_var_b32"_op || op == "v_permlanex16_var_b32"_op)) goto L_ladder_14;
+    {
       // gfx1250: the same gather within a row (or across the pair of rows), the lane to read chosen per lane, by
       // the low four bits of its second source. Every lane is read, on or off, as the ISA's pseudocode has it.
       const bool cross = op == "v_permlanex16_var_b32"_op;
@@ -2435,8 +3241,12 @@ struct Machine {
         const uint32_t row = lane / 16 ^ (cross ? 1 : 0);
         write_lane(w, in.dst[0], lane, from[row * 16 + (lane_src(w, in.src[1], lane) & 0xF)]);
       });
-    } else if (op == "v_permlane_bcast_b32"_op || op == "v_permlane_up_b32"_op || op == "v_permlane_down_b32"_op ||
-               op == "v_permlane_xor_b32"_op) {
+    }
+    break;
+  case "v_permlane_bcast_b32"_op.hash: case "v_permlane_up_b32"_op.hash: case "v_permlane_down_b32"_op.hash: case "v_permlane_xor_b32"_op.hash:
+    if (!(op == "v_permlane_bcast_b32"_op || op == "v_permlane_up_b32"_op || op == "v_permlane_down_b32"_op ||
+               op == "v_permlane_xor_b32"_op)) goto L_ladder_14;
+    {
       // gfx1250's group permutes: the lanes are cut into groups of S2 (a power of two), and each group takes, from the
       // lane S1 names (bcast), from S1 lanes below it (up) or above it (down) with the ends keeping their own, or from
       // the lane S1 xor-ed in within the group (xor). Every lane is read, on or off; only the lanes that are on are
@@ -2466,19 +3276,31 @@ struct Machine {
         got[lane] = from[src];
       }
       each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, got[lane]); });
-    } else if (op == "v_permlane_idx_gen_b32"_op) {
+    }
+    break;
+  case "v_permlane_idx_gen_b32"_op.hash:
+    if (!(op == "v_permlane_idx_gen_b32"_op)) goto L_ladder_14;
+    {
       // The byte address ds_bpermute wants for a lane's pick (S0, taken within its group of S1 lanes).
       const uint32_t mask = static_cast<uint32_t>(scalar(w, in.src[1])) - 1;
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, (((lane_src(w, in.src[0], lane) & 63) & mask) + (lane & ~mask)) << 2);
       });
-    } else if (op == "v_mad_u16"_op || op == "v_mad_i16"_op) {
+    }
+    break;
+  case "v_mad_u16"_op.hash: case "v_mad_i16"_op.hash:
+    if (!(op == "v_mad_u16"_op || op == "v_mad_i16"_op)) goto L_ladder_14;
+    {
       each([&](uint32_t lane) {
         const uint32_t v = op == "v_mad_u16"_op ? static_cast<uint32_t>(u16(0, lane)) * u16(1, lane) + u16(2, lane)
                                                 : static_cast<uint32_t>(i16(0, lane) * i16(1, lane) + i16(2, lane));
         write_lane(w, in.dst[0], lane, v & 0xFFFF);
       });
-    } else if (op == "v_fmac_f16"_op || op == "v_fmaak_f16"_op || op == "v_fmamk_f16"_op) {
+    }
+    break;
+  case "v_fmac_f16"_op.hash: case "v_fmaak_f16"_op.hash: case "v_fmamk_f16"_op.hash:
+    if (!(op == "v_fmac_f16"_op || op == "v_fmaak_f16"_op || op == "v_fmamk_f16"_op)) goto L_ladder_14;
+    {
       // fmac: the destination is the addend; fmaak: the constant is; fmamk:
       // the constant is the second factor.
       each([&](uint32_t lane) {
@@ -2500,13 +3322,21 @@ struct Machine {
         }
         write_half(w, in, lane, static_cast<_Float16>(std::fma(a, b, c)));
       });
-    } else if (op == "v_maxmin_f32"_op || op == "v_minmax_f32"_op) {
+    }
+    break;
+  case "v_maxmin_f32"_op.hash: case "v_minmax_f32"_op.hash:
+    if (!(op == "v_maxmin_f32"_op || op == "v_minmax_f32"_op)) goto L_ladder_14;
+    {
       // Two steps, each the IEEE-style min or max of two.
       each([&](uint32_t lane) {
         const float ab = op == "v_maxmin_f32"_op ? std::fmax(f32(0, lane), f32(1, lane)) : std::fmin(f32(0, lane), f32(1, lane));
         write_float(w, in, lane, op == "v_maxmin_f32"_op ? std::fmin(ab, f32(2, lane)) : std::fmax(ab, f32(2, lane)));
       });
-    } else if (op == "v_maxmin_i32"_op || op == "v_minmax_i32"_op || op == "v_maxmin_u32"_op || op == "v_minmax_u32"_op) {
+    }
+    break;
+  case "v_maxmin_i32"_op.hash: case "v_minmax_i32"_op.hash: case "v_maxmin_u32"_op.hash: case "v_minmax_u32"_op.hash:
+    if (!(op == "v_maxmin_i32"_op || op == "v_minmax_i32"_op || op == "v_maxmin_u32"_op || op == "v_minmax_u32"_op)) goto L_ladder_14;
+    {
       const bool max_first = op == "v_maxmin_i32"_op || op == "v_maxmin_u32"_op;
       const bool is_signed = op == "v_maxmin_i32"_op || op == "v_minmax_i32"_op;
       each([&](uint32_t lane) {
@@ -2520,54 +3350,73 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, v);
       });
-    } else if (op.rfind("v_s_", 0) == 0) {
-      // RDNA4's transcendentals on a scalar, into a scalar register: the
-      // vector unit's reciprocal, square root, exponent and logarithm, once.
-      // (A 16-bit one reads and writes the low half.)
-      const bool half = op.rfind("_f16") == op.size() - 4;
-      const uint32_t raw = static_cast<uint32_t>(scalar(w, in.src[0]));
-      double x;
-      if (half) {
-        _Float16 h;
-        const uint16_t b16 = static_cast<uint16_t>(raw);
-        std::memcpy(&h, &b16, 2);
-        x = static_cast<double>(h);
-      } else {
-        x = as_float(raw);
-      }
-      if (in.src[0].neg) x = -x;
-      if (in.src[0].abs) x = std::fabs(x);
-      const std::string f = op.substr(4, op.size() - 8);   // exp, log, rcp, rsq, sqrt
-      const double r = f == "exp" ? std::exp2(x) : f == "log" ? std::log2(x) : f == "rcp" ? 1.0 / x
-                       : f == "rsq" ? 1.0 / std::sqrt(x) : f == "sqrt" ? std::sqrt(x)
-                       : throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
-      if (half) {
-        const _Float16 h = static_cast<_Float16>(r);
-        uint16_t b16;
-        std::memcpy(&b16, &h, 2);
-        write_scalar(w, in.dst[0], b16);
-      } else {
-        write_scalar(w, in.dst[0], as_bits(static_cast<float>(r)));
-      }
-    } else if (in.arch == gcn::Target::Gfx1250 && (op.rfind("v_wmma_", 0) == 0 || op.rfind("v_swmmac_", 0) == 0)) {
-      wmma1250(w, in, op);
-    } else if (op.rfind("v_wmma_", 0) == 0) {
-      wmma(w, in, op);
-    } else if (op == "v_xor3_b32"_op) {
-      each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, src(0, lane) ^ src(1, lane) ^ src(2, lane)); });
-    } else if (op == "v_movrels_b32"_op || op == "v_movreld_b32"_op || op == "v_movrelsd_b32"_op) {
-      // Relative addressing: M0 moves the source register (movrels), the
-      // destination (movreld) or both on.
-      const uint32_t by = w.m0;
-      each([&](uint32_t lane) {
-        const uint32_t from = in.src[0].index + (op == "v_movreld_b32"_op ? 0 : by);
-        const uint32_t to = in.dst[0].index + (op == "v_movrels_b32"_op ? 0 : by);
-        if (from >= kVgprs || to >= kVgprs) throw Error::make(Err::InvalidValue, op, " past the vector registers");
-        w.vgpr[to][lane] = in.src[0].kind == OperandKind::Vgpr ? w.vgpr[from][lane] : src(0, lane);
-      });
-    } else {
-      return false;
     }
+    break;
+  default: L_ladder_14:
+    if (op.rfind("v_s_", 0) == 0) {
+          // RDNA4's transcendentals on a scalar, into a scalar register: the
+          // vector unit's reciprocal, square root, exponent and logarithm, once.
+          // (A 16-bit one reads and writes the low half.)
+          const bool half = op.rfind("_f16") == op.size() - 4;
+          const uint32_t raw = static_cast<uint32_t>(scalar(w, in.src[0]));
+          double x;
+          if (half) {
+            _Float16 h;
+            const uint16_t b16 = static_cast<uint16_t>(raw);
+            std::memcpy(&h, &b16, 2);
+            x = static_cast<double>(h);
+          } else {
+            x = as_float(raw);
+          }
+          if (in.src[0].neg) x = -x;
+          if (in.src[0].abs) x = std::fabs(x);
+          const std::string f = op.substr(4, op.size() - 8);   // exp, log, rcp, rsq, sqrt
+          const double r = f == "exp" ? std::exp2(x) : f == "log" ? std::log2(x) : f == "rcp" ? 1.0 / x
+                           : f == "rsq" ? 1.0 / std::sqrt(x) : f == "sqrt" ? std::sqrt(x)
+                           : throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
+          if (half) {
+            const _Float16 h = static_cast<_Float16>(r);
+            uint16_t b16;
+            std::memcpy(&b16, &h, 2);
+            write_scalar(w, in.dst[0], b16);
+          } else {
+            write_scalar(w, in.dst[0], as_bits(static_cast<float>(r)));
+          }
+        } else if (in.arch == gcn::Target::Gfx1250 && (op.rfind("v_wmma_", 0) == 0 || op.rfind("v_swmmac_", 0) == 0)) {
+          wmma1250(w, in, op);
+        } else if (op.rfind("v_wmma_", 0) == 0) {
+          wmma(w, in, op);
+        } else {
+      switch (op.hash()) {
+        case "v_xor3_b32"_op.hash:
+          if (!(op == "v_xor3_b32"_op)) goto L_ladder_15;
+          {
+            each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, src(0, lane) ^ src(1, lane) ^ src(2, lane)); });
+          }
+          break;
+        case "v_movrels_b32"_op.hash: case "v_movreld_b32"_op.hash: case "v_movrelsd_b32"_op.hash:
+          if (!(op == "v_movrels_b32"_op || op == "v_movreld_b32"_op || op == "v_movrelsd_b32"_op)) goto L_ladder_15;
+          {
+            // Relative addressing: M0 moves the source register (movrels), the
+            // destination (movreld) or both on.
+            const uint32_t by = w.m0;
+            each([&](uint32_t lane) {
+              const uint32_t from = in.src[0].index + (op == "v_movreld_b32"_op ? 0 : by);
+              const uint32_t to = in.dst[0].index + (op == "v_movrels_b32"_op ? 0 : by);
+              if (from >= kVgprs || to >= kVgprs) throw Error::make(Err::InvalidValue, op, " past the vector registers");
+              w.vgpr[to][lane] = in.src[0].kind == OperandKind::Vgpr ? w.vgpr[from][lane] : src(0, lane);
+            });
+          }
+          break;
+        default: L_ladder_15:
+          {
+                return false;
+              }
+          break;
+      }
+    }
+    break;
+}
     return true;
   }
 
@@ -2962,13 +3811,24 @@ struct Machine {
     const auto u16 = [&](uint32_t k, uint32_t lane) { return static_cast<uint16_t>(lane_src(w, in.src[k], lane)); };
     const auto i16 = [&](uint32_t k, uint32_t lane) { return static_cast<int16_t>(lane_src(w, in.src[k], lane)); };
     const auto half = [&](uint32_t k, uint32_t lane) { return static_cast<float>(lane_half(w, in.src[k], lane)); };
-    if (op == "v_nop"_op) {
-    } else if (op == "v_cvt_f32_ubyte1_e32"_op || op == "v_cvt_f32_ubyte2_e32"_op || op == "v_cvt_f32_ubyte3_e32"_op) {
+    switch (op.hash()) {
+  case "v_nop"_op.hash:
+    if (!(op == "v_nop"_op)) goto L_ladder_11;
+    {
+    }
+    break;
+  case "v_cvt_f32_ubyte1_e32"_op.hash: case "v_cvt_f32_ubyte2_e32"_op.hash: case "v_cvt_f32_ubyte3_e32"_op.hash:
+    if (!(op == "v_cvt_f32_ubyte1_e32"_op || op == "v_cvt_f32_ubyte2_e32"_op || op == "v_cvt_f32_ubyte3_e32"_op)) goto L_ladder_11;
+    {
       const uint32_t at = 8 * static_cast<uint32_t>(op.substr(15, 1)[0] - '0');   // "v_cvt_f32_ubyte1_e32"[15]
       each([&](uint32_t lane) {
         write_float(w, in, lane, static_cast<float>((lane_src(w, in.src[0], lane) >> at) & 0xFF));
       });
-    } else if (op == "v_cvt_flr_i32_f32_e32"_op) {
+    }
+    break;
+  case "v_cvt_flr_i32_f32_e32"_op.hash:
+    if (!(op == "v_cvt_flr_i32_f32_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         const float f = std::floor(lane_float(w, in.src[0], lane));
         write_lane(w, in.dst[0], lane,
@@ -2976,17 +3836,29 @@ struct Machine {
                                                           : f >= 2147483648.0f   ? INT32_MAX
                                                                                  : static_cast<int32_t>(f)));
       });
-    } else if (op == "v_ffbl_b32_e32"_op) {
+    }
+    break;
+  case "v_ffbl_b32_e32"_op.hash:
+    if (!(op == "v_ffbl_b32_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {   // the lowest set bit, or -1
         const uint32_t v = lane_src(w, in.src[0], lane);
         write_lane(w, in.dst[0], lane, v ? static_cast<uint32_t>(__builtin_ctz(v)) : 0xFFFFFFFFu);
       });
-    } else if (op == "v_ffbh_i32_e32"_op) {
+    }
+    break;
+  case "v_ffbh_i32_e32"_op.hash:
+    if (!(op == "v_ffbh_i32_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {   // the first bit from the top unlike the sign, or -1
         const uint32_t v = lane_src(w, in.src[0], lane), x = v >> 31 ? ~v : v;
         write_lane(w, in.dst[0], lane, x ? static_cast<uint32_t>(__builtin_clz(x)) : 0xFFFFFFFFu);
       });
-    } else if (op == "v_frexp_mant_f64_e32"_op || op == "v_frexp_exp_i32_f64_e32"_op) {
+    }
+    break;
+  case "v_frexp_mant_f64_e32"_op.hash: case "v_frexp_exp_i32_f64_e32"_op.hash:
+    if (!(op == "v_frexp_mant_f64_e32"_op || op == "v_frexp_exp_i32_f64_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {   // as the float forms: an infinity or a NaN is its own mantissa, exponent 0
         const double x = lane_double(w, in.src[0], lane);
         int e = 0;
@@ -2995,7 +3867,11 @@ struct Machine {
         if (op == "v_frexp_mant_f64_e32"_op) write_double(w, in, lane, m);
         else write_lane(w, in.dst[0], lane, static_cast<uint32_t>(e));
       });
-    } else if (op == "v_fract_f64_e32"_op) {
+    }
+    break;
+  case "v_fract_f64_e32"_op.hash:
+    if (!(op == "v_fract_f64_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         // x - floor(x), held below 1: the largest double under 1 for a tiny
         // negative x, where the difference would round up to 1.
@@ -3004,13 +3880,21 @@ struct Machine {
                                        : std::isnan(x) ? x : std::fmin(x - std::floor(x), 0x1.fffffffffffffp-1);
         write_double(w, in, lane, r);
       });
-    } else if (op == "v_cvt_f16_u16_e32"_op || op == "v_cvt_f16_i16_e32"_op) {
+    }
+    break;
+  case "v_cvt_f16_u16_e32"_op.hash: case "v_cvt_f16_i16_e32"_op.hash:
+    if (!(op == "v_cvt_f16_u16_e32"_op || op == "v_cvt_f16_i16_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         write_half(w, in, lane,
                    static_cast<_Float16>(op == "v_cvt_f16_u16_e32"_op ? static_cast<float>(u16(0, lane))
                                                                      : static_cast<float>(i16(0, lane))));
       });
-    } else if (op == "v_cvt_u16_f16_e32"_op || op == "v_cvt_i16_f16_e32"_op) {
+    }
+    break;
+  case "v_cvt_u16_f16_e32"_op.hash: case "v_cvt_i16_f16_e32"_op.hash:
+    if (!(op == "v_cvt_u16_f16_e32"_op || op == "v_cvt_i16_f16_e32"_op)) goto L_ladder_11;
+    {
       // Toward zero, held to what 16 bits hold, and a NaN to zero.
       each([&](uint32_t lane) {
         const float f = half(0, lane);
@@ -3018,9 +3902,13 @@ struct Machine {
         const int32_t v = std::isnan(f) ? 0 : static_cast<int32_t>(std::trunc(std::clamp(f, lo, hi)));
         write_lane(w, in.dst[0], lane, static_cast<uint16_t>(v));
       });
-    } else if (op == "v_rcp_f16_e32"_op || op == "v_sqrt_f16_e32"_op || op == "v_rsq_f16_e32"_op ||
+    }
+    break;
+  case "v_rcp_f16_e32"_op.hash: case "v_sqrt_f16_e32"_op.hash: case "v_rsq_f16_e32"_op.hash: case "v_log_f16_e32"_op.hash: case "v_exp_f16_e32"_op.hash: case "v_floor_f16_e32"_op.hash: case "v_ceil_f16_e32"_op.hash: case "v_trunc_f16_e32"_op.hash: case "v_rndne_f16_e32"_op.hash:
+    if (!(op == "v_rcp_f16_e32"_op || op == "v_sqrt_f16_e32"_op || op == "v_rsq_f16_e32"_op ||
                op == "v_log_f16_e32"_op || op == "v_exp_f16_e32"_op || op == "v_floor_f16_e32"_op ||
-               op == "v_ceil_f16_e32"_op || op == "v_trunc_f16_e32"_op || op == "v_rndne_f16_e32"_op) {
+               op == "v_ceil_f16_e32"_op || op == "v_trunc_f16_e32"_op || op == "v_rndne_f16_e32"_op)) goto L_ladder_11;
+    {
       // Worked out in float, which holds a half exactly, and rounded once
       // to a half. The log and the exponential are base 2.
       each([&](uint32_t lane) {
@@ -3036,50 +3924,98 @@ struct Machine {
                                                      : std::nearbyint(x);
         write_half(w, in, lane, static_cast<_Float16>(r));
       });
-    } else if (op == "v_subrev_f32_e32"_op) {
+    }
+    break;
+  case "v_subrev_f32_e32"_op.hash:
+    if (!(op == "v_subrev_f32_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) { write_float(w, in, lane, lane_float(w, in.src[1], lane) - lane_float(w, in.src[0], lane)); });
-    } else if (op == "v_subrev_f16_e32"_op) {
+    }
+    break;
+  case "v_subrev_f16_e32"_op.hash:
+    if (!(op == "v_subrev_f16_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) { write_half(w, in, lane, static_cast<_Float16>(half(1, lane) - half(0, lane))); });
-    } else if (op == "v_subrev_u16_e32"_op) {
+    }
+    break;
+  case "v_subrev_u16_e32"_op.hash:
+    if (!(op == "v_subrev_u16_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, static_cast<uint16_t>(u16(1, lane) - u16(0, lane))); });
-    } else if (op == "v_mul_hi_u32_u24_e32"_op) {
+    }
+    break;
+  case "v_mul_hi_u32_u24_e32"_op.hash:
+    if (!(op == "v_mul_hi_u32_u24_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         const uint64_t p = uint64_t{lane_src(w, in.src[0], lane) & 0xFFFFFF} * (lane_src(w, in.src[1], lane) & 0xFFFFFF);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(p >> 32));
       });
-    } else if (op == "v_ashrrev_i16_e32"_op) {
+    }
+    break;
+  case "v_ashrrev_i16_e32"_op.hash:
+    if (!(op == "v_ashrrev_i16_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, static_cast<uint16_t>(i16(1, lane) >> (lane_src(w, in.src[0], lane) & 15)));
       });
-    } else if (op == "v_max_u16_e32"_op || op == "v_min_u16_e32"_op) {
+    }
+    break;
+  case "v_max_u16_e32"_op.hash: case "v_min_u16_e32"_op.hash:
+    if (!(op == "v_max_u16_e32"_op || op == "v_min_u16_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         const uint16_t x = u16(0, lane), y = u16(1, lane);
         write_lane(w, in.dst[0], lane, op == "v_max_u16_e32"_op ? std::max(x, y) : std::min(x, y));
       });
-    } else if (op == "v_max_i16_e32"_op || op == "v_min_i16_e32"_op) {
+    }
+    break;
+  case "v_max_i16_e32"_op.hash: case "v_min_i16_e32"_op.hash:
+    if (!(op == "v_max_i16_e32"_op || op == "v_min_i16_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         const int16_t x = i16(0, lane), y = i16(1, lane);
         write_lane(w, in.dst[0], lane, static_cast<uint16_t>(op == "v_max_i16_e32"_op ? std::max(x, y) : std::min(x, y)));
       });
-    } else if (op == "v_xnor_b32_e32"_op) {
+    }
+    break;
+  case "v_xnor_b32_e32"_op.hash:
+    if (!(op == "v_xnor_b32_e32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) { write_lane(w, in.dst[0], lane, ~(lane_src(w, in.src[0], lane) ^ lane_src(w, in.src[1], lane))); });
-    } else if (op == "v_med3_u32"_op) {
+    }
+    break;
+  case "v_med3_u32"_op.hash:
+    if (!(op == "v_med3_u32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         const uint32_t x = lane_src(w, in.src[0], lane), y = lane_src(w, in.src[1], lane), z = lane_src(w, in.src[2], lane);
         write_lane(w, in.dst[0], lane, std::max(std::min(x, y), std::min(std::max(x, y), z)));
       });
-    } else if (op == "v_max3_u32"_op) {
+    }
+    break;
+  case "v_max3_u32"_op.hash:
+    if (!(op == "v_max3_u32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    std::max({lane_src(w, in.src[0], lane), lane_src(w, in.src[1], lane), lane_src(w, in.src[2], lane)}));
       });
-    } else if (op == "v_alignbyte_b32"_op) {
+    }
+    break;
+  case "v_alignbyte_b32"_op.hash:
+    if (!(op == "v_alignbyte_b32"_op)) goto L_ladder_11;
+    {
       // As v_alignbit_b32, in bytes: the 32 bits that start where the third source's low two bits say.
       each([&](uint32_t lane) {
         const uint64_t pair = static_cast<uint64_t>(lane_src(w, in.src[0], lane)) << 32 | lane_src(w, in.src[1], lane);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(pair >> (8 * (lane_src(w, in.src[2], lane) & 3))));
       });
-    } else if (op == "v_lerp_u8"_op) {
+    }
+    break;
+  case "v_lerp_u8"_op.hash:
+    if (!(op == "v_lerp_u8"_op)) goto L_ladder_11;
+    {
       // Each byte: the average of the two sources', 0.5 rounded up where the third's byte has its low bit set.
       each([&](uint32_t lane) {
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane), c = lane_src(w, in.src[2], lane);
@@ -3088,7 +4024,11 @@ struct Machine {
           r |= (((a >> 8 * k & 0xFF) + (b >> 8 * k & 0xFF) + (c >> 8 * k & 1)) >> 1) << 8 * k;
         write_lane(w, in.dst[0], lane, r);
       });
-    } else if (op == "v_sad_u8"_op || op == "v_sad_hi_u8"_op || op == "v_msad_u8"_op) {
+    }
+    break;
+  case "v_sad_u8"_op.hash: case "v_sad_hi_u8"_op.hash: case "v_msad_u8"_op.hash:
+    if (!(op == "v_sad_u8"_op || op == "v_sad_hi_u8"_op || op == "v_msad_u8"_op)) goto L_ladder_11;
+    {
       // The sum of the absolute differences of the four bytes, added to the third source (shifted up 16 first
       // for the hi form); the masked form leaves out the bytes where the second source, the reference, is zero.
       each([&](uint32_t lane) {
@@ -3096,20 +4036,32 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    (sad_bytes(a, b, op == "v_msad_u8"_op) << (op == "v_sad_hi_u8"_op ? 16 : 0)) + lane_src(w, in.src[2], lane));
       });
-    } else if (op == "v_sad_u16"_op) {
+    }
+    break;
+  case "v_sad_u16"_op.hash:
+    if (!(op == "v_sad_u16"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
         const auto d = [](uint32_t x, uint32_t y) { return x > y ? x - y : y - x; };
         write_lane(w, in.dst[0], lane, d(a & 0xFFFF, b & 0xFFFF) + d(a >> 16, b >> 16) + lane_src(w, in.src[2], lane));
       });
-    } else if (op == "v_sad_u32"_op) {
+    }
+    break;
+  case "v_sad_u32"_op.hash:
+    if (!(op == "v_sad_u32"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
         uint64_t r = uint64_t{a > b ? a - b : b - a} + lane_src(w, in.src[2], lane);
         if (in.clamp) r = std::min<uint64_t>(r, 0xFFFFFFFFu);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(r));
       });
-    } else if (op == "v_qsad_pk_u16_u8"_op || op == "v_mqsad_pk_u16_u8"_op) {
+    }
+    break;
+  case "v_qsad_pk_u16_u8"_op.hash: case "v_mqsad_pk_u16_u8"_op.hash:
+    if (!(op == "v_qsad_pk_u16_u8"_op || op == "v_mqsad_pk_u16_u8"_op)) goto L_ladder_11;
+    {
       // Four sums over the first source's (a 64-bit array of eight bytes) four overlapping windows of four
       // bytes, against the second source's four; each added to a 16-bit piece of the third, and kept to 16 bits.
       each([&](uint32_t lane) {
@@ -3121,7 +4073,11 @@ struct Machine {
                          static_cast<uint32_t>(c >> 16 * k)) & 0xFFFF} << 16 * k;
         write_lane64(w, in.dst[0], lane, r);
       });
-    } else if (op == "v_mqsad_u32_u8"_op) {
+    }
+    break;
+  case "v_mqsad_u32_u8"_op.hash:
+    if (!(op == "v_mqsad_u32_u8"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         const uint64_t a = lane_src64(w, in.src[0], lane);
         const uint32_t ref = lane_src(w, in.src[1], lane);
@@ -3130,7 +4086,11 @@ struct Machine {
         for (uint32_t k = 0; k < 4; ++k)
           set_word(w, in.dst[0], k, lane, sad_bytes(static_cast<uint32_t>(a >> 8 * k), ref, true) + acc[k]);
       });
-    } else if (op == "v_cvt_pk_u8_f32"_op) {
+    }
+    break;
+  case "v_cvt_pk_u8_f32"_op.hash:
+    if (!(op == "v_cvt_pk_u8_f32"_op)) goto L_ladder_11;
+    {
       // The first source as a byte (toward zero, held to 0..255) in the byte the second names, in the third.
       each([&](uint32_t lane) {
         const float x = lane_float(w, in.src[0], lane);
@@ -3138,12 +4098,20 @@ struct Machine {
         const uint32_t byte = std::isnan(x) || x <= 0 ? 0 : x >= 255 ? 255 : static_cast<uint32_t>(x);
         write_lane(w, in.dst[0], lane, (lane_src(w, in.src[2], lane) & ~(0xFFu << at)) | byte << at);
       });
-    } else if (op == "v_mad_i32_i16"_op) {
+    }
+    break;
+  case "v_mad_i32_i16"_op.hash:
+    if (!(op == "v_mad_i32_i16"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint32_t>(i16(0, lane) * i16(1, lane)) + lane_src(w, in.src[2], lane));   // wraps, as the hardware's 32-bit add does
       });
-    } else if (op == "v_med3_i16"_op || op == "v_med3_u16"_op) {
+    }
+    break;
+  case "v_med3_i16"_op.hash: case "v_med3_u16"_op.hash:
+    if (!(op == "v_med3_i16"_op || op == "v_med3_u16"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         if (op == "v_med3_i16"_op) {
           const int16_t x = i16(0, lane), y = i16(1, lane), z = i16(2, lane);
@@ -3153,7 +4121,11 @@ struct Machine {
           write_lane(w, in.dst[0], lane, std::max(std::min(x, y), std::min(std::max(x, y), z)));
         }
       });
-    } else if (op == "v_min3_f16"_op || op == "v_max3_f16"_op || op == "v_med3_f16"_op || op == "v_mad_f16"_op) {
+    }
+    break;
+  case "v_min3_f16"_op.hash: case "v_max3_f16"_op.hash: case "v_med3_f16"_op.hash: case "v_mad_f16"_op.hash:
+    if (!(op == "v_min3_f16"_op || op == "v_max3_f16"_op || op == "v_med3_f16"_op || op == "v_mad_f16"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         const float x = half(0, lane), y = half(1, lane), z = half(2, lane);
         float r;
@@ -3164,13 +4136,21 @@ struct Machine {
                                                                   : std::fmax(std::fmin(x, y), std::fmin(std::fmax(x, y), z));
         write_half(w, in, lane, static_cast<_Float16>(r));
       });
-    } else if (op == "v_mad_u16"_op || op == "v_mad_i16"_op) {
+    }
+    break;
+  case "v_mad_u16"_op.hash: case "v_mad_i16"_op.hash:
+    if (!(op == "v_mad_u16"_op || op == "v_mad_i16"_op)) goto L_ladder_11;
+    {
       each([&](uint32_t lane) {
         const uint32_t v = op == "v_mad_u16"_op ? static_cast<uint32_t>(u16(0, lane)) * u16(1, lane) + u16(2, lane)
                                                 : static_cast<uint32_t>(i16(0, lane) * i16(1, lane) + i16(2, lane));
         write_lane(w, in.dst[0], lane, v & 0xFFFF);
       });
-    } else if (op == "v_cvt_pk_i16_f32"_op || op == "v_cvt_pk_u16_f32"_op) {
+    }
+    break;
+  case "v_cvt_pk_i16_f32"_op.hash: case "v_cvt_pk_u16_f32"_op.hash:
+    if (!(op == "v_cvt_pk_i16_f32"_op || op == "v_cvt_pk_u16_f32"_op)) goto L_ladder_11;
+    {
       // Each float to a 16-bit integer, packed (CDNA5 ISA: v_cvt_i16_f32 and v_cvt_u16_f32 of S0 into the low half and S1 into
       // the high one). The document does not define those two helpers; assumed here, as the 32-bit conversions are: toward
       // zero, out-of-range values saturate, a NaN is zero.
@@ -3183,271 +4163,360 @@ struct Machine {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, conv(lane_float(w, in.src[0], lane)) | conv(lane_float(w, in.src[1], lane)) << 16);
       });
-    } else if (std::string_view(in.name).substr(0, 14) == "v_cvt_scale_pk") {
-      const std::string& name = in.name;
-      // 4-, 6- and 8-bit floats widened to 16- or 32-bit ones and scaled by an E8M0 block scale, 2^(scale - 127) (CDNA5 ISA, 7.6.3):
-      // v_cvt_scale_pk{8,16}_{f16,bf16,f32}_{fp4,fp6,bf6,fp8,bf8}, scale_sel in OPSEL. Which scale byte, of which lane's S1, a data lane
-      // takes is Table 36 (4- and 6-bit) or Table 37 (8-bit) of the document: lane L (row L & 15, half L / 16) reads S1 of lane
-      // (L & 15) + 16 * A, byte `byte`, with, for 4 and 6 bits, A = OPSEL[0] and byte = OPSEL[2] ? 2 * half + OPSEL[1] : 2 * OPSEL[1] + half;
-      // for 8 bits with OPSEL[3] = 0, A = OPSEL[0] and byte = 2 * OPSEL[1] + OPSEL[2] (the same for both halves); with OPSEL[3] = 1,
-      // A = OPSEL[1] and byte = 2 * OPSEL[1] + half, OPSEL[2] reserved (refused). (The pseudocode's `S1[OPSEL * 8 +: 8]` reads only
-      // the lane's own register, which agrees where S1 is the same in every lane.) Assumed, not stated: a scale of 0xFF (E8M0's NaN)
-      // gives NaN; results are exact but for overflow, then rounded to nearest even to the 16-bit type (denormals kept).
-      const bool pk16 = name.rfind("v_cvt_scale_pk16_", 0) == 0;
-      const std::string rest = name.substr(pk16 ? 17 : 16);
-      const size_t us = rest.find('_');
-      const std::string to = rest.substr(0, us), from = rest.substr(us + 1);
-      const F8* t = from == "fp4" ? &kFp4 : from == "fp6" ? &kFp6 : from == "bf6" ? &kBf6 : from == "fp8" ? &kOcpFp8 : &kOcpBf8;
-      const uint32_t sbits = t->bits, n = pk16 ? 16 : 8, opsel = in.op_sel & 15;
-      const bool narrow = sbits < 8;
-      if (!narrow && (opsel & 8) && (opsel & 4))
-        throw Error::make(Err::Unsupported, name, " with scale_sel ", opsel, ": Table 37 of the CDNA5 ISA marks it reserved");
-      each([&](uint32_t lane) {
-        const uint32_t row = lane & 15, half = lane >> 4;
-        uint32_t src_lane, byte;
-        if (narrow) {
-          src_lane = row + 16 * (opsel & 1);
-          byte = (opsel & 4) ? 2 * half + ((opsel >> 1) & 1) : 2 * ((opsel >> 1) & 1) + half;
-        } else if (!(opsel & 8)) {
-          src_lane = row + 16 * (opsel & 1);
-          byte = 2 * ((opsel >> 1) & 1) + ((opsel >> 2) & 1);
-        } else {
-          src_lane = row + 16 * ((opsel >> 1) & 1);
-          byte = 2 * ((opsel >> 1) & 1) + half;
-        }
-        const Operand& s1 = in.src[1];
-        const uint32_t sreg = s1.kind == OperandKind::Vgpr ? w.vgpr[s1.index][src_lane] : lane_src(w, s1, lane);
-        const uint32_t e = (sreg >> (8 * byte)) & 0xFF;
-        const uint32_t out_bits = to == "f32" ? 32 : 16;
-        for (uint32_t i = 0; i < n; ++i) {
-          const uint32_t at = i * sbits;
-          uint32_t code = word(w, in.src[0], at / 32, lane) >> (at % 32);
-          if (at % 32 + sbits > 32) code |= word(w, in.src[0], at / 32 + 1, lane) << (32 - at % 32);
-          const float v = f8_to_float(code & ((1u << sbits) - 1), *t);
-          const double scaled = e == 0xFF || std::isnan(v) ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(static_cast<double>(v), static_cast<int>(e) - 127);
-          const float f = static_cast<float>(scaled);
-          uint32_t bits;
-          if (to == "f32") {
-            bits = as_bits(f);
-          } else if (to == "f16") {
-            _Float16 h = static_cast<_Float16>(f);
-            if (std::isinf(static_cast<float>(h)) && std::isfinite(v) && e != 0xFF && fp16_ovfl(w, in)) h = static_cast<_Float16>(f < 0 ? -65504.0f : 65504.0f);
-            bits = as_bits(h);
-          } else {
-            bits = to_bf16(f);
-            if ((bits & 0x7FFF) == 0x7F80 && std::isfinite(v) && e != 0xFF && fp16_ovfl(w, in)) bits = (f < 0 ? 0x8000u : 0u) | 0x7F7Fu;
-          }
-          const uint32_t reg = i * out_bits / 32;
-          if (out_bits == 32) set_word(w, in.dst[0], reg, lane, bits);
-          else {
-            uint32_t cur = i % 2 ? word(w, in.dst[0], reg, lane) : 0;
-            cur = (cur & ~(0xFFFFu << (16 * (i % 2)))) | (bits & 0xFFFFu) << (16 * (i % 2));
-            set_word(w, in.dst[0], reg, lane, cur);
-          }
-        }
-      });
-    } else if (op == "v_cvt_pk_i16_i32"_op) {
-      each([&](uint32_t lane) {
-        const auto sat = [](int32_t v) { return static_cast<uint16_t>(std::clamp<int32_t>(v, INT16_MIN, INT16_MAX)); };
-        write_lane(w, in.dst[0], lane,
-                   sat(static_cast<int32_t>(lane_src(w, in.src[0], lane))) |
-                       static_cast<uint32_t>(sat(static_cast<int32_t>(lane_src(w, in.src[1], lane)))) << 16);
-      });
-    } else if (op == "v_cvt_pknorm_i16_f32"_op || op == "v_cvt_pknorm_u16_f32"_op ||
-               op == "v_cvt_pknorm_i16_f16"_op || op == "v_cvt_pknorm_u16_f16"_op) {
-      // Two floats (or halves) held to -1..1 (0..1 unsigned) and scaled to the 16-bit range, to nearest even;
-      // a NaN gives zero.
-      each([&](uint32_t lane) {
-        const bool half_in = op == "v_cvt_pknorm_i16_f16"_op || op == "v_cvt_pknorm_u16_f16"_op;
-        const bool is_signed = op == "v_cvt_pknorm_i16_f32"_op || op == "v_cvt_pknorm_i16_f16"_op;
-        const auto norm = [&](uint32_t k) -> uint32_t {
-          const double x = half_in ? static_cast<double>(half(k, lane)) : static_cast<double>(lane_float(w, in.src[k], lane));
-          if (std::isnan(x)) return 0;
-          if (is_signed) return static_cast<uint16_t>(static_cast<int16_t>(std::nearbyint(std::clamp(x, -1.0, 1.0) * 32767.0)));
-          return static_cast<uint16_t>(std::nearbyint(std::clamp(x, 0.0, 1.0) * 65535.0));
-        };
-        write_lane(w, in.dst[0], lane, norm(0) | norm(1) << 16);
-      });
-    } else if (op == "v_add_i16"_op || op == "v_sub_i16"_op) {
-      each([&](uint32_t lane) {
-        int32_t r = op == "v_add_i16"_op ? i16(0, lane) + i16(1, lane) : i16(0, lane) - i16(1, lane);
-        if (in.clamp) r = std::clamp<int32_t>(r, INT16_MIN, INT16_MAX);
-        write_lane(w, in.dst[0], lane, static_cast<uint16_t>(r));
-      });
-    } else if (op == "v_mul_legacy_f32"_op) {
-      // The DX9 multiply: zero times anything (infinity and NaN too) is zero.
-      each([&](uint32_t lane) {
-        const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane);
-        write_float(w, in, lane, x == 0 || y == 0 ? 0.0f : x * y);
-      });
-    } else if (op == "v_mad_u32_u16"_op) {
-      each([&](uint32_t lane) {
-        write_lane(w, in.dst[0], lane, uint32_t{u16(0, lane)} * u16(1, lane) + lane_src(w, in.src[2], lane));
-      });
-    } else if (op == "v_min3_i16"_op || op == "v_max3_i16"_op) {
-      each([&](uint32_t lane) {
-        const int16_t x = i16(0, lane), y = i16(1, lane), z = i16(2, lane);
-        write_lane(w, in.dst[0], lane,
-                   static_cast<uint16_t>(op == "v_min3_i16"_op ? std::min({x, y, z}) : std::max({x, y, z})));
-      });
-    } else if (op == "v_min3_u16"_op || op == "v_max3_u16"_op) {
-      each([&](uint32_t lane) {
-        const uint16_t x = u16(0, lane), y = u16(1, lane), z = u16(2, lane);
-        write_lane(w, in.dst[0], lane, op == "v_min3_u16"_op ? std::min({x, y, z}) : std::max({x, y, z}));
-      });
-    } else if (op == "v_div_fixup_f16"_op) {
-      // As the float form, over halves: the quotient, with what the
-      // division sequence cannot do filled in.
-      each([&](uint32_t lane) {
-        const float q = half(0, lane), den = half(1, lane), num = half(2, lane);
-        const float inf = std::numeric_limits<float>::infinity();
-        float out = q;
-        if (std::isnan(num) || std::isnan(den)) out = std::numeric_limits<float>::quiet_NaN();
-        else if (den == 0) out = num == 0 ? std::numeric_limits<float>::quiet_NaN()
-                                          : std::copysign(inf, num) * std::copysign(1.0f, den);
-        else if (std::isinf(den)) out = std::isinf(num) ? std::numeric_limits<float>::quiet_NaN()
-                                                       : std::copysign(0.0f, num) * std::copysign(1.0f, den);
-        else if (std::isinf(num)) out = std::copysign(inf, num) * std::copysign(1.0f, den);
-        write_half(w, in, lane, static_cast<_Float16>(out));
-      });
-    } else if (op == "v_trig_preop_f64"_op) {
-      // 53 bits of 2/pi, from the 53 * n'th on (n the second source's low
-      // five bits), further on for a large first source, scaled so that the
-      // pieces a kernel asks for add up to 2/pi.
-      each([&](uint32_t lane) {
-        const uint64_t bits = as_bits(lane_double(w, in.src[0], lane));
-        const int32_t exponent = static_cast<int32_t>((bits >> 52) & 0x7FF);
-        uint32_t shift = (lane_src(w, in.src[1], lane) & 31) * 53;
-        if (exponent > 1077) shift += static_cast<uint32_t>(exponent - 1077);
-        int scale = -53 - static_cast<int>(shift);
-        if (exponent >= 1968) scale += 128;
-        write_double(w, in, lane, std::ldexp(static_cast<double>(two_over_pi_bits(shift)), scale));
-      });
-    } else if (op == "v_bfm_b32"_op) {
-      each([&](uint32_t lane) {
-        const uint32_t width = lane_src(w, in.src[0], lane) & 31, at = lane_src(w, in.src[1], lane) & 31;
-        write_lane(w, in.dst[0], lane, ((1u << width) - 1) << at);
-      });
-    } else if (op == "v_cvt_pk_u16_u32"_op) {
-      each([&](uint32_t lane) {
-        write_lane(w, in.dst[0], lane,
-                   std::min(lane_src(w, in.src[0], lane), 0xFFFFu) | std::min(lane_src(w, in.src[1], lane), 0xFFFFu) << 16);
-      });
-    } else if (op == "v_add_i32"_op || op == "v_sub_i32"_op) {
-      // Signed, wrapping, or held to the int32 range where the clamp is asked.
-      each([&](uint32_t lane) {
-        const int64_t x = static_cast<int32_t>(lane_src(w, in.src[0], lane)), y = static_cast<int32_t>(lane_src(w, in.src[1], lane));
-        int64_t r = op == "v_add_i32"_op ? x + y : x - y;
-        if (in.clamp) r = std::clamp<int64_t>(r, INT32_MIN, INT32_MAX);
-        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(r));
-      });
-    } else if (op.rfind("v_pk_", 0) == 0 && (op.find("_u16") != std::string::npos || op.find("_i16") != std::string::npos ||
-                                               op.find("_b16") != std::string::npos)) {
-      // Two 16-bit integers in one register, each its own arithmetic.
-      const std::string name = op;
-      each([&](uint32_t lane) {
-        uint32_t r = 0;
-        for (uint32_t h = 0; h < 2; ++h) {
-          const uint16_t x = packed_bits(w, in, 0, h, lane), y = packed_bits(w, in, 1, h, lane);
-          const int16_t sx = static_cast<int16_t>(x), sy = static_cast<int16_t>(y);
-          const bool sgn = name.find("_i16") != std::string::npos;
-          int64_t v;
-          if (name == "v_pk_mul_lo_u16") v = int64_t{x} * y;
-          else if (name == "v_pk_add_u16") v = x + y;
-          else if (name == "v_pk_add_i16") v = sx + sy;
-          else if (name == "v_pk_sub_u16") v = x - y;
-          else if (name == "v_pk_sub_i16") v = sx - sy;
-          else if (name == "v_pk_lshlrev_b16") v = y << (x & 15);
-          else if (name == "v_pk_lshrrev_b16") v = y >> (x & 15);
-          else if (name == "v_pk_ashrrev_i16") v = sy >> (x & 15);
-          else if (name == "v_pk_max_i16") v = std::max(sx, sy);
-          else if (name == "v_pk_min_i16") v = std::min(sx, sy);
-          else if (name == "v_pk_max_u16") v = std::max(x, y);
-          else if (name == "v_pk_min_u16") v = std::min(x, y);
-          else if (name == "v_pk_mad_u16") v = int64_t{x} * y + packed_bits(w, in, 2, h, lane);
-          else if (name == "v_pk_mad_i16") v = int64_t{sx} * sy + static_cast<int16_t>(packed_bits(w, in, 2, h, lane));
-          else throw Error::make(Err::Unsupported, name, " is decoded but not implemented");
-          // The clamp holds an add or a subtract to what 16 bits hold.
-          if (in.clamp && (name.find("add") != std::string::npos || name.find("sub") != std::string::npos ||
-                           name.find("mad") != std::string::npos))
-            v = sgn ? std::clamp<int64_t>(v, -32768, 32767) : std::clamp<int64_t>(v, 0, 65535);
-          r |= uint32_t{static_cast<uint16_t>(v)} << (16 * h);
-        }
-        write_lane(w, in.dst[0], lane, r);
-      });
-    } else if (op == "v_dot2_f32_f16"_op) {
-      // Two pairs of halves multiplied and added into a float: each product
-      // exact in double, the sum rounded once.
-      // neg_lo negates a source's low half and neg_hi its high one; the
-      // addend is negated by its neg_lo bit.
-      each([&](uint32_t lane) {
-        const float c = lane_float(w, in.src[2], lane);
-        double sum = (in.neg_lo >> 2) & 1 ? -double(c) : double(c);
-        for (uint32_t h = 0; h < 2; ++h) {
-          _Float16 a, b;
-          const uint16_t ab = packed_bits(w, in, 0, h, lane), bb = packed_bits(w, in, 1, h, lane);
-          std::memcpy(&a, &ab, 2);
-          std::memcpy(&b, &bb, 2);
-          const uint8_t neg = h ? in.neg_hi : in.neg_lo;
-          sum += (neg & 1 ? -double(a) : double(a)) * (neg & 2 ? -double(b) : double(b));
-        }
-        // Its clamp bit does not hold the result to [0, 1], as other float
-        // results' does: hip-tests' amd_mixed_dot({1, 3}, {3, 3}, 2, true)
-        // is 14 on a card, and the compiler takes the clamped form for the
-        // unclamped one.
-        write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
-      });
-    } else if (op == "v_swap_b32"_op) {
-      each([&](uint32_t lane) {
-        // (gfx1250's table lists both registers as outputs, so the second is a destination there.)
-        const uint32_t other = (in.src.empty() ? in.dst[1] : in.src[0]).index;
-        const uint32_t a = w.vgpr[in.dst[0].index][lane], b = w.vgpr[other][lane];
-        w.vgpr[in.dst[0].index][lane] = b;
-        w.vgpr[other][lane] = a;
-      });
-    } else if (op == "v_permlane32_swap_b32_e32"_op || op == "v_permlane32_swap_b32_e64"_op ||
-               op == "v_permlane16_swap_b32_e32"_op || op == "v_permlane16_swap_b32_e64"_op) {
-      // gfx950: the upper 32 lanes of the first register trade places with
-      // the lower 32 of the second; or, 16 lanes to a row, each odd row of
-      // the first with the even row before it in the second. A pair is
-      // swapped where both its lanes are on.
-      // Every lane, whatever EXEC says, as the ISA's pseudocode has it.
-      const bool rows32 = op.find("permlane32") != std::string::npos;
-      // (gfx1250's table lists both registers as outputs, so the second is a destination there.)
-      auto& d = w.vgpr[in.dst[0].index];
-      auto& v = w.vgpr[(in.src.empty() ? in.dst[1] : in.src[0]).index];
-      for (uint32_t lane = 0; lane < kLanes; ++lane) {
-        const bool first = rows32 ? lane >= 32 : (lane / 16) % 2 == 1;
-        if (!first) continue;
-        const uint32_t other = rows32 ? lane - 32 : lane - 16;
-        // gfx1250's version writes only the lanes that are on (it reads them all).
-        if (in.arch == gcn::Target::Gfx1250) {
-          const uint32_t from_d = d[lane], from_v = v[other];
-          if (w.exec >> other & 1) v[other] = from_d;
-          if (w.exec >> lane & 1) d[lane] = from_v;
-        } else {
-          std::swap(d[lane], v[other]);
-        }
-      }
-    } else if (op == "v_prng_b32_e32"_op || op == "v_prng_b32_e64"_op) {
-      // One step of the LFSR the CDNA4 ISA gives: shift left, and where the
-      // top bit fell off, fold in 197.
-      each([&](uint32_t lane) {
-        const uint32_t x = lane_src(w, in.src[0], lane);
-        write_lane(w, in.dst[0], lane, (x << 1) ^ (x >> 31 ? 197u : 0u));
-      });
-    } else if (op == "v_cvt_f32_bf16_e32"_op || op == "v_cvt_f32_bf16_e64"_op) {
-      // gfx950: a bfloat16 (the low half, or the high one op_sel names) as
-      // the float it is the top half of.
-      each([&](uint32_t lane) {
-        const uint32_t x = lane_src(w, in.src[0], lane) >> (16 * (in.op_sel & 1));
-        write_float(w, in, lane, as_float((x & 0xFFFF) << 16));
-      });
-    } else if (op == "v_accvgpr_mov_b32"_op) {
-      each([&](uint32_t lane) { set_word(w, in.dst[0], 0, lane, lane_src(w, in.src[0], lane)); });
-    } else {
-      return false;
     }
+    break;
+  default: L_ladder_11:
+    if (std::string_view(in.name).substr(0, 14) == "v_cvt_scale_pk") {
+          const std::string& name = in.name;
+          // 4-, 6- and 8-bit floats widened to 16- or 32-bit ones and scaled by an E8M0 block scale, 2^(scale - 127) (CDNA5 ISA, 7.6.3):
+          // v_cvt_scale_pk{8,16}_{f16,bf16,f32}_{fp4,fp6,bf6,fp8,bf8}, scale_sel in OPSEL. Which scale byte, of which lane's S1, a data lane
+          // takes is Table 36 (4- and 6-bit) or Table 37 (8-bit) of the document: lane L (row L & 15, half L / 16) reads S1 of lane
+          // (L & 15) + 16 * A, byte `byte`, with, for 4 and 6 bits, A = OPSEL[0] and byte = OPSEL[2] ? 2 * half + OPSEL[1] : 2 * OPSEL[1] + half;
+          // for 8 bits with OPSEL[3] = 0, A = OPSEL[0] and byte = 2 * OPSEL[1] + OPSEL[2] (the same for both halves); with OPSEL[3] = 1,
+          // A = OPSEL[1] and byte = 2 * OPSEL[1] + half, OPSEL[2] reserved (refused). (The pseudocode's `S1[OPSEL * 8 +: 8]` reads only
+          // the lane's own register, which agrees where S1 is the same in every lane.) Assumed, not stated: a scale of 0xFF (E8M0's NaN)
+          // gives NaN; results are exact but for overflow, then rounded to nearest even to the 16-bit type (denormals kept).
+          const bool pk16 = name.rfind("v_cvt_scale_pk16_", 0) == 0;
+          const std::string rest = name.substr(pk16 ? 17 : 16);
+          const size_t us = rest.find('_');
+          const std::string to = rest.substr(0, us), from = rest.substr(us + 1);
+          const F8* t = from == "fp4" ? &kFp4 : from == "fp6" ? &kFp6 : from == "bf6" ? &kBf6 : from == "fp8" ? &kOcpFp8 : &kOcpBf8;
+          const uint32_t sbits = t->bits, n = pk16 ? 16 : 8, opsel = in.op_sel & 15;
+          const bool narrow = sbits < 8;
+          if (!narrow && (opsel & 8) && (opsel & 4))
+            throw Error::make(Err::Unsupported, name, " with scale_sel ", opsel, ": Table 37 of the CDNA5 ISA marks it reserved");
+          each([&](uint32_t lane) {
+            const uint32_t row = lane & 15, half = lane >> 4;
+            uint32_t src_lane, byte;
+            if (narrow) {
+              src_lane = row + 16 * (opsel & 1);
+              byte = (opsel & 4) ? 2 * half + ((opsel >> 1) & 1) : 2 * ((opsel >> 1) & 1) + half;
+            } else if (!(opsel & 8)) {
+              src_lane = row + 16 * (opsel & 1);
+              byte = 2 * ((opsel >> 1) & 1) + ((opsel >> 2) & 1);
+            } else {
+              src_lane = row + 16 * ((opsel >> 1) & 1);
+              byte = 2 * ((opsel >> 1) & 1) + half;
+            }
+            const Operand& s1 = in.src[1];
+            const uint32_t sreg = s1.kind == OperandKind::Vgpr ? w.vgpr[s1.index][src_lane] : lane_src(w, s1, lane);
+            const uint32_t e = (sreg >> (8 * byte)) & 0xFF;
+            const uint32_t out_bits = to == "f32" ? 32 : 16;
+            for (uint32_t i = 0; i < n; ++i) {
+              const uint32_t at = i * sbits;
+              uint32_t code = word(w, in.src[0], at / 32, lane) >> (at % 32);
+              if (at % 32 + sbits > 32) code |= word(w, in.src[0], at / 32 + 1, lane) << (32 - at % 32);
+              const float v = f8_to_float(code & ((1u << sbits) - 1), *t);
+              const double scaled = e == 0xFF || std::isnan(v) ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(static_cast<double>(v), static_cast<int>(e) - 127);
+              const float f = static_cast<float>(scaled);
+              uint32_t bits;
+              if (to == "f32") {
+                bits = as_bits(f);
+              } else if (to == "f16") {
+                _Float16 h = static_cast<_Float16>(f);
+                if (std::isinf(static_cast<float>(h)) && std::isfinite(v) && e != 0xFF && fp16_ovfl(w, in)) h = static_cast<_Float16>(f < 0 ? -65504.0f : 65504.0f);
+                bits = as_bits(h);
+              } else {
+                bits = to_bf16(f);
+                if ((bits & 0x7FFF) == 0x7F80 && std::isfinite(v) && e != 0xFF && fp16_ovfl(w, in)) bits = (f < 0 ? 0x8000u : 0u) | 0x7F7Fu;
+              }
+              const uint32_t reg = i * out_bits / 32;
+              if (out_bits == 32) set_word(w, in.dst[0], reg, lane, bits);
+              else {
+                uint32_t cur = i % 2 ? word(w, in.dst[0], reg, lane) : 0;
+                cur = (cur & ~(0xFFFFu << (16 * (i % 2)))) | (bits & 0xFFFFu) << (16 * (i % 2));
+                set_word(w, in.dst[0], reg, lane, cur);
+              }
+            }
+          });
+        } else {
+      switch (op.hash()) {
+        case "v_cvt_pk_i16_i32"_op.hash:
+          if (!(op == "v_cvt_pk_i16_i32"_op)) goto L_ladder_12;
+          {
+            each([&](uint32_t lane) {
+              const auto sat = [](int32_t v) { return static_cast<uint16_t>(std::clamp<int32_t>(v, INT16_MIN, INT16_MAX)); };
+              write_lane(w, in.dst[0], lane,
+                         sat(static_cast<int32_t>(lane_src(w, in.src[0], lane))) |
+                             static_cast<uint32_t>(sat(static_cast<int32_t>(lane_src(w, in.src[1], lane)))) << 16);
+            });
+          }
+          break;
+        case "v_cvt_pknorm_i16_f32"_op.hash: case "v_cvt_pknorm_u16_f32"_op.hash: case "v_cvt_pknorm_i16_f16"_op.hash: case "v_cvt_pknorm_u16_f16"_op.hash:
+          if (!(op == "v_cvt_pknorm_i16_f32"_op || op == "v_cvt_pknorm_u16_f32"_op ||
+                     op == "v_cvt_pknorm_i16_f16"_op || op == "v_cvt_pknorm_u16_f16"_op)) goto L_ladder_12;
+          {
+            // Two floats (or halves) held to -1..1 (0..1 unsigned) and scaled to the 16-bit range, to nearest even;
+            // a NaN gives zero.
+            each([&](uint32_t lane) {
+              const bool half_in = op == "v_cvt_pknorm_i16_f16"_op || op == "v_cvt_pknorm_u16_f16"_op;
+              const bool is_signed = op == "v_cvt_pknorm_i16_f32"_op || op == "v_cvt_pknorm_i16_f16"_op;
+              const auto norm = [&](uint32_t k) -> uint32_t {
+                const double x = half_in ? static_cast<double>(half(k, lane)) : static_cast<double>(lane_float(w, in.src[k], lane));
+                if (std::isnan(x)) return 0;
+                if (is_signed) return static_cast<uint16_t>(static_cast<int16_t>(std::nearbyint(std::clamp(x, -1.0, 1.0) * 32767.0)));
+                return static_cast<uint16_t>(std::nearbyint(std::clamp(x, 0.0, 1.0) * 65535.0));
+              };
+              write_lane(w, in.dst[0], lane, norm(0) | norm(1) << 16);
+            });
+          }
+          break;
+        case "v_add_i16"_op.hash: case "v_sub_i16"_op.hash:
+          if (!(op == "v_add_i16"_op || op == "v_sub_i16"_op)) goto L_ladder_12;
+          {
+            each([&](uint32_t lane) {
+              int32_t r = op == "v_add_i16"_op ? i16(0, lane) + i16(1, lane) : i16(0, lane) - i16(1, lane);
+              if (in.clamp) r = std::clamp<int32_t>(r, INT16_MIN, INT16_MAX);
+              write_lane(w, in.dst[0], lane, static_cast<uint16_t>(r));
+            });
+          }
+          break;
+        case "v_mul_legacy_f32"_op.hash:
+          if (!(op == "v_mul_legacy_f32"_op)) goto L_ladder_12;
+          {
+            // The DX9 multiply: zero times anything (infinity and NaN too) is zero.
+            each([&](uint32_t lane) {
+              const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane);
+              write_float(w, in, lane, x == 0 || y == 0 ? 0.0f : x * y);
+            });
+          }
+          break;
+        case "v_mad_u32_u16"_op.hash:
+          if (!(op == "v_mad_u32_u16"_op)) goto L_ladder_12;
+          {
+            each([&](uint32_t lane) {
+              write_lane(w, in.dst[0], lane, uint32_t{u16(0, lane)} * u16(1, lane) + lane_src(w, in.src[2], lane));
+            });
+          }
+          break;
+        case "v_min3_i16"_op.hash: case "v_max3_i16"_op.hash:
+          if (!(op == "v_min3_i16"_op || op == "v_max3_i16"_op)) goto L_ladder_12;
+          {
+            each([&](uint32_t lane) {
+              const int16_t x = i16(0, lane), y = i16(1, lane), z = i16(2, lane);
+              write_lane(w, in.dst[0], lane,
+                         static_cast<uint16_t>(op == "v_min3_i16"_op ? std::min({x, y, z}) : std::max({x, y, z})));
+            });
+          }
+          break;
+        case "v_min3_u16"_op.hash: case "v_max3_u16"_op.hash:
+          if (!(op == "v_min3_u16"_op || op == "v_max3_u16"_op)) goto L_ladder_12;
+          {
+            each([&](uint32_t lane) {
+              const uint16_t x = u16(0, lane), y = u16(1, lane), z = u16(2, lane);
+              write_lane(w, in.dst[0], lane, op == "v_min3_u16"_op ? std::min({x, y, z}) : std::max({x, y, z}));
+            });
+          }
+          break;
+        case "v_div_fixup_f16"_op.hash:
+          if (!(op == "v_div_fixup_f16"_op)) goto L_ladder_12;
+          {
+            // As the float form, over halves: the quotient, with what the
+            // division sequence cannot do filled in.
+            each([&](uint32_t lane) {
+              const float q = half(0, lane), den = half(1, lane), num = half(2, lane);
+              const float inf = std::numeric_limits<float>::infinity();
+              float out = q;
+              if (std::isnan(num) || std::isnan(den)) out = std::numeric_limits<float>::quiet_NaN();
+              else if (den == 0) out = num == 0 ? std::numeric_limits<float>::quiet_NaN()
+                                                : std::copysign(inf, num) * std::copysign(1.0f, den);
+              else if (std::isinf(den)) out = std::isinf(num) ? std::numeric_limits<float>::quiet_NaN()
+                                                             : std::copysign(0.0f, num) * std::copysign(1.0f, den);
+              else if (std::isinf(num)) out = std::copysign(inf, num) * std::copysign(1.0f, den);
+              write_half(w, in, lane, static_cast<_Float16>(out));
+            });
+          }
+          break;
+        case "v_trig_preop_f64"_op.hash:
+          if (!(op == "v_trig_preop_f64"_op)) goto L_ladder_12;
+          {
+            // 53 bits of 2/pi, from the 53 * n'th on (n the second source's low
+            // five bits), further on for a large first source, scaled so that the
+            // pieces a kernel asks for add up to 2/pi.
+            each([&](uint32_t lane) {
+              const uint64_t bits = as_bits(lane_double(w, in.src[0], lane));
+              const int32_t exponent = static_cast<int32_t>((bits >> 52) & 0x7FF);
+              uint32_t shift = (lane_src(w, in.src[1], lane) & 31) * 53;
+              if (exponent > 1077) shift += static_cast<uint32_t>(exponent - 1077);
+              int scale = -53 - static_cast<int>(shift);
+              if (exponent >= 1968) scale += 128;
+              write_double(w, in, lane, std::ldexp(static_cast<double>(two_over_pi_bits(shift)), scale));
+            });
+          }
+          break;
+        case "v_bfm_b32"_op.hash:
+          if (!(op == "v_bfm_b32"_op)) goto L_ladder_12;
+          {
+            each([&](uint32_t lane) {
+              const uint32_t width = lane_src(w, in.src[0], lane) & 31, at = lane_src(w, in.src[1], lane) & 31;
+              write_lane(w, in.dst[0], lane, ((1u << width) - 1) << at);
+            });
+          }
+          break;
+        case "v_cvt_pk_u16_u32"_op.hash:
+          if (!(op == "v_cvt_pk_u16_u32"_op)) goto L_ladder_12;
+          {
+            each([&](uint32_t lane) {
+              write_lane(w, in.dst[0], lane,
+                         std::min(lane_src(w, in.src[0], lane), 0xFFFFu) | std::min(lane_src(w, in.src[1], lane), 0xFFFFu) << 16);
+            });
+          }
+          break;
+        case "v_add_i32"_op.hash: case "v_sub_i32"_op.hash:
+          if (!(op == "v_add_i32"_op || op == "v_sub_i32"_op)) goto L_ladder_12;
+          {
+            // Signed, wrapping, or held to the int32 range where the clamp is asked.
+            each([&](uint32_t lane) {
+              const int64_t x = static_cast<int32_t>(lane_src(w, in.src[0], lane)), y = static_cast<int32_t>(lane_src(w, in.src[1], lane));
+              int64_t r = op == "v_add_i32"_op ? x + y : x - y;
+              if (in.clamp) r = std::clamp<int64_t>(r, INT32_MIN, INT32_MAX);
+              write_lane(w, in.dst[0], lane, static_cast<uint32_t>(r));
+            });
+          }
+          break;
+        default: L_ladder_12:
+          if (op.rfind("v_pk_", 0) == 0 && (op.find("_u16") != std::string::npos || op.find("_i16") != std::string::npos ||
+                                                         op.find("_b16") != std::string::npos)) {
+                // Two 16-bit integers in one register, each its own arithmetic.
+                const std::string name = op;
+                each([&](uint32_t lane) {
+                  uint32_t r = 0;
+                  for (uint32_t h = 0; h < 2; ++h) {
+                    const uint16_t x = packed_bits(w, in, 0, h, lane), y = packed_bits(w, in, 1, h, lane);
+                    const int16_t sx = static_cast<int16_t>(x), sy = static_cast<int16_t>(y);
+                    const bool sgn = name.find("_i16") != std::string::npos;
+                    int64_t v;
+                    if (name == "v_pk_mul_lo_u16") v = int64_t{x} * y;
+                    else if (name == "v_pk_add_u16") v = x + y;
+                    else if (name == "v_pk_add_i16") v = sx + sy;
+                    else if (name == "v_pk_sub_u16") v = x - y;
+                    else if (name == "v_pk_sub_i16") v = sx - sy;
+                    else if (name == "v_pk_lshlrev_b16") v = y << (x & 15);
+                    else if (name == "v_pk_lshrrev_b16") v = y >> (x & 15);
+                    else if (name == "v_pk_ashrrev_i16") v = sy >> (x & 15);
+                    else if (name == "v_pk_max_i16") v = std::max(sx, sy);
+                    else if (name == "v_pk_min_i16") v = std::min(sx, sy);
+                    else if (name == "v_pk_max_u16") v = std::max(x, y);
+                    else if (name == "v_pk_min_u16") v = std::min(x, y);
+                    else if (name == "v_pk_mad_u16") v = int64_t{x} * y + packed_bits(w, in, 2, h, lane);
+                    else if (name == "v_pk_mad_i16") v = int64_t{sx} * sy + static_cast<int16_t>(packed_bits(w, in, 2, h, lane));
+                    else throw Error::make(Err::Unsupported, name, " is decoded but not implemented");
+                    // The clamp holds an add or a subtract to what 16 bits hold.
+                    if (in.clamp && (name.find("add") != std::string::npos || name.find("sub") != std::string::npos ||
+                                     name.find("mad") != std::string::npos))
+                      v = sgn ? std::clamp<int64_t>(v, -32768, 32767) : std::clamp<int64_t>(v, 0, 65535);
+                    r |= uint32_t{static_cast<uint16_t>(v)} << (16 * h);
+                  }
+                  write_lane(w, in.dst[0], lane, r);
+                });
+              } else {
+            switch (op.hash()) {
+              case "v_dot2_f32_f16"_op.hash:
+                if (!(op == "v_dot2_f32_f16"_op)) goto L_ladder_13;
+                {
+                  // Two pairs of halves multiplied and added into a float: each product
+                  // exact in double, the sum rounded once.
+                  // neg_lo negates a source's low half and neg_hi its high one; the
+                  // addend is negated by its neg_lo bit.
+                  each([&](uint32_t lane) {
+                    const float c = lane_float(w, in.src[2], lane);
+                    double sum = (in.neg_lo >> 2) & 1 ? -double(c) : double(c);
+                    for (uint32_t h = 0; h < 2; ++h) {
+                      _Float16 a, b;
+                      const uint16_t ab = packed_bits(w, in, 0, h, lane), bb = packed_bits(w, in, 1, h, lane);
+                      std::memcpy(&a, &ab, 2);
+                      std::memcpy(&b, &bb, 2);
+                      const uint8_t neg = h ? in.neg_hi : in.neg_lo;
+                      sum += (neg & 1 ? -double(a) : double(a)) * (neg & 2 ? -double(b) : double(b));
+                    }
+                    // Its clamp bit does not hold the result to [0, 1], as other float
+                    // results' does: hip-tests' amd_mixed_dot({1, 3}, {3, 3}, 2, true)
+                    // is 14 on a card, and the compiler takes the clamped form for the
+                    // unclamped one.
+                    write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
+                  });
+                }
+                break;
+              case "v_swap_b32"_op.hash:
+                if (!(op == "v_swap_b32"_op)) goto L_ladder_13;
+                {
+                  each([&](uint32_t lane) {
+                    // (gfx1250's table lists both registers as outputs, so the second is a destination there.)
+                    const uint32_t other = (in.src.empty() ? in.dst[1] : in.src[0]).index;
+                    const uint32_t a = w.vgpr[in.dst[0].index][lane], b = w.vgpr[other][lane];
+                    w.vgpr[in.dst[0].index][lane] = b;
+                    w.vgpr[other][lane] = a;
+                  });
+                }
+                break;
+              case "v_permlane32_swap_b32_e32"_op.hash: case "v_permlane32_swap_b32_e64"_op.hash: case "v_permlane16_swap_b32_e32"_op.hash: case "v_permlane16_swap_b32_e64"_op.hash:
+                if (!(op == "v_permlane32_swap_b32_e32"_op || op == "v_permlane32_swap_b32_e64"_op ||
+                           op == "v_permlane16_swap_b32_e32"_op || op == "v_permlane16_swap_b32_e64"_op)) goto L_ladder_13;
+                {
+                  // gfx950: the upper 32 lanes of the first register trade places with
+                  // the lower 32 of the second; or, 16 lanes to a row, each odd row of
+                  // the first with the even row before it in the second. A pair is
+                  // swapped where both its lanes are on.
+                  // Every lane, whatever EXEC says, as the ISA's pseudocode has it.
+                  const bool rows32 = op.find("permlane32") != std::string::npos;
+                  // (gfx1250's table lists both registers as outputs, so the second is a destination there.)
+                  auto& d = w.vgpr[in.dst[0].index];
+                  auto& v = w.vgpr[(in.src.empty() ? in.dst[1] : in.src[0]).index];
+                  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+                    const bool first = rows32 ? lane >= 32 : (lane / 16) % 2 == 1;
+                    if (!first) continue;
+                    const uint32_t other = rows32 ? lane - 32 : lane - 16;
+                    // gfx1250's version writes only the lanes that are on (it reads them all).
+                    if (in.arch == gcn::Target::Gfx1250) {
+                      const uint32_t from_d = d[lane], from_v = v[other];
+                      if (w.exec >> other & 1) v[other] = from_d;
+                      if (w.exec >> lane & 1) d[lane] = from_v;
+                    } else {
+                      std::swap(d[lane], v[other]);
+                    }
+                  }
+                }
+                break;
+              case "v_prng_b32_e32"_op.hash: case "v_prng_b32_e64"_op.hash:
+                if (!(op == "v_prng_b32_e32"_op || op == "v_prng_b32_e64"_op)) goto L_ladder_13;
+                {
+                  // One step of the LFSR the CDNA4 ISA gives: shift left, and where the
+                  // top bit fell off, fold in 197.
+                  each([&](uint32_t lane) {
+                    const uint32_t x = lane_src(w, in.src[0], lane);
+                    write_lane(w, in.dst[0], lane, (x << 1) ^ (x >> 31 ? 197u : 0u));
+                  });
+                }
+                break;
+              case "v_cvt_f32_bf16_e32"_op.hash: case "v_cvt_f32_bf16_e64"_op.hash:
+                if (!(op == "v_cvt_f32_bf16_e32"_op || op == "v_cvt_f32_bf16_e64"_op)) goto L_ladder_13;
+                {
+                  // gfx950: a bfloat16 (the low half, or the high one op_sel names) as
+                  // the float it is the top half of.
+                  each([&](uint32_t lane) {
+                    const uint32_t x = lane_src(w, in.src[0], lane) >> (16 * (in.op_sel & 1));
+                    write_float(w, in, lane, as_float((x & 0xFFFF) << 16));
+                  });
+                }
+                break;
+              case "v_accvgpr_mov_b32"_op.hash:
+                if (!(op == "v_accvgpr_mov_b32"_op)) goto L_ladder_13;
+                {
+                  each([&](uint32_t lane) { set_word(w, in.dst[0], 0, lane, lane_src(w, in.src[0], lane)); });
+                }
+                break;
+              default: L_ladder_13:
+                {
+                      return false;
+                    }
+                break;
+            }
+          }
+          break;
+      }
+    }
+    break;
+}
     return true;
   }
 
@@ -3456,15 +4525,11 @@ struct Machine {
     // over the part of each register it names, and the cross-lane form does
     // it over the lanes it named, so both are the same arithmetic under the
     // name the short form has.
-    const std::string as_short =
-        in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
-        : (in.dpp || in.dpp8) ? (in.name.ends_with("_dpp") ? in.name.substr(0, in.name.size() - 4) + "_e32" : std::string())
-        : in.promoted ? in.name.substr(0, in.name.size() - 4) + "_e32"
-        : in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e64") == 0 &&
-                (in.name.find("_u16") != std::string::npos || in.name.find("_b16") != std::string::npos)
-                  ? in.name.substr(0, in.name.size() - 4) + "_e32"
-                  : std::string();
-    const OpName op(as_short.empty() ? in.name : as_short);
+    // (Worked out when the instruction was decoded: Inst::short_name.)
+    const bool decoded_once = in.flags & gcn::kInstFinal;
+    const std::string made = decoded_once ? std::string() : gcn::short_name_of(in);
+    const std::string& as_short = decoded_once ? in.short_name : made;
+    const OpName op = as_short.empty() ? OpName(in) : OpName(as_short, decoded_once ? in.short_hash : name_hash(as_short));
     // (A sub-dword instruction may write part of its destination and pad the
     // rest with zeroes, carry the part's sign into it, or keep what was
     // there: write_lane does each.)
@@ -3493,138 +4558,231 @@ struct Machine {
       return;
     }
     Narrowed narrowed(*this, in);
-    if (in.arch == gcn::Target::Gfx1250 && cdna5_alu(w, in, op)) return;
-    if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) return;
-    if (carry_alu(w, in)) return;
-    if (more_alu(w, in, op)) return;
-    if (op == "v_mov_b16_e32"_op || op == "v_mov_b16_e64"_op || op == "v_mov_b16"_op) {
-      // RDNA: a half register, or the low half of a constant, into a half.
-      for (uint32_t lane = 0; lane < kLanes; ++lane)
-        if (w.exec >> lane & 1) write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane) & 0xFFFF);
-      return;
-    }
-    if (op == "v_writelane_b32"_op) {
-      // The one instruction here that names the lane it writes: a scalar
-      // value into one lane of a register, whatever EXEC says.
-      const uint32_t lane = static_cast<uint32_t>(scalar(w, in.src[1])) & 63;
-      w.vgpr[in.dst[0].index][lane] = static_cast<uint32_t>(scalar(w, in.src[0]));
-      return;
-    }
-    if (op == "v_readlane_b32"_op) {
-      // And its reverse, one lane into a scalar register, which is just as
-      // blind to EXEC. Unoptimized code spills scalars into lanes and reads
-      // them back with every lane off, on the way out of a branch nobody took.
-      const uint32_t which = static_cast<uint32_t>(scalar(w, in.src[1])) & (w.lanes - 1);
-      write_scalar(w, in.dst[0], w.vgpr[in.src[0].index][which]);
-      return;
-    }
-    if (op == "v_readfirstlane_b32"_op) {
-      // The first active lane; with none active, lane 0.
-      write_scalar(w, in.dst[0], w.vgpr[in.src[0].index][first_active(w)]);
-      return;
-    }
+    const InvariantSources invariant(*this, w, in);
+    if (in.arch == gcn::Target::Gfx1250 && cdna5_alu(w, in, op)) {return;} else if (gcn::is_rdna(in.arch) && rdna_alu(w, in, op)) {return;} else if (carry_alu(w, in)) {return;} else if (more_alu(w, in, op)) {return;} else {
+  switch (op.hash()) {
+    case "v_mov_b16_e32"_op.hash: case "v_mov_b16_e64"_op.hash: case "v_mov_b16"_op.hash:
+      if (!(op == "v_mov_b16_e32"_op || op == "v_mov_b16_e64"_op || op == "v_mov_b16"_op)) goto L_ladder_10;
+      {
+        // RDNA: a half register, or the low half of a constant, into a half.
+        for (uint32_t lane = 0; lane < kLanes; ++lane)
+          if (w.exec >> lane & 1) write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane) & 0xFFFF);
+        return;
+      }
+      break;
+    case "v_writelane_b32"_op.hash:
+      if (!(op == "v_writelane_b32"_op)) goto L_ladder_10;
+      {
+        // The one instruction here that names the lane it writes: a scalar
+        // value into one lane of a register, whatever EXEC says.
+        const uint32_t lane = static_cast<uint32_t>(scalar(w, in.src[1])) & 63;
+        w.vgpr[in.dst[0].index][lane] = static_cast<uint32_t>(scalar(w, in.src[0]));
+        return;
+      }
+      break;
+    case "v_readlane_b32"_op.hash:
+      if (!(op == "v_readlane_b32"_op)) goto L_ladder_10;
+      {
+        // And its reverse, one lane into a scalar register, which is just as
+        // blind to EXEC. Unoptimized code spills scalars into lanes and reads
+        // them back with every lane off, on the way out of a branch nobody took.
+        const uint32_t which = static_cast<uint32_t>(scalar(w, in.src[1])) & (w.lanes - 1);
+        write_scalar(w, in.dst[0], w.vgpr[in.src[0].index][which]);
+        return;
+      }
+      break;
+    case "v_readfirstlane_b32"_op.hash:
+      if (!(op == "v_readfirstlane_b32"_op)) goto L_ladder_10;
+      {
+        // The first active lane; with none active, lane 0.
+        write_scalar(w, in.dst[0], w.vgpr[in.src[0].index][first_active(w)]);
+        return;
+      }
+      break;
+    default: L_ladder_10: break;
+  }
+}
     // Which operation it is is decided once; its body then runs for each
     // lane EXEC names.
     const auto each = [&](auto&& body) {
       for (uint32_t lane = 0; lane < kLanes; ++lane)
         if (w.exec >> lane & 1) body(lane);
     };
-    if (op == "v_mov_b32_e32"_op) {
+    switch (op.hash()) {
+  case "v_mov_b32_e32"_op.hash:
+    if (!(op == "v_mov_b32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane));
       });
-    } else if (op == "v_add_f32_e32"_op) {
+    }
+    break;
+  case "v_add_f32_e32"_op.hash:
+    if (!(op == "v_add_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane, lane_float(w, in.src[0], lane) + lane_float(w, in.src[1], lane));
       });
-    } else if (op == "v_mul_f32_e32"_op) {
+    }
+    break;
+  case "v_mul_f32_e32"_op.hash:
+    if (!(op == "v_mul_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane, lane_float(w, in.src[0], lane) * lane_float(w, in.src[1], lane));
       });
-    } else if (op == "v_lshlrev_b32_e32"_op) {
+    }
+    break;
+  case "v_lshlrev_b32_e32"_op.hash:
+    if (!(op == "v_lshlrev_b32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The "rev" forms shift the second source by the first.
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[1], lane) << (lane_src(w, in.src[0], lane) & 31));
       });
-    } else if (op == "v_lshrrev_b32_e32"_op) {
+    }
+    break;
+  case "v_lshrrev_b32_e32"_op.hash:
+    if (!(op == "v_lshrrev_b32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[1], lane) >> (lane_src(w, in.src[0], lane) & 31));
       });
-    } else if (op == "v_ashrrev_i32_e32"_op) {
+    }
+    break;
+  case "v_ashrrev_i32_e32"_op.hash:
+    if (!(op == "v_ashrrev_i32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint32_t>(static_cast<int32_t>(lane_src(w, in.src[1], lane)) >>
                                          (lane_src(w, in.src[0], lane) & 31)));
       });
-    } else if (op == "v_lshlrev_b64"_op) {
+    }
+    break;
+  case "v_lshlrev_b64"_op.hash:
+    if (!(op == "v_lshlrev_b64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane64(w, in.dst[0], lane, lane_src64(w, in.src[1], lane) << (lane_src(w, in.src[0], lane) & 63));
       });
-    } else if (op == "v_lshl_add_u32"_op) {
+    }
+    break;
+  case "v_lshl_add_u32"_op.hash:
+    if (!(op == "v_lshl_add_u32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) << (lane_src(w, in.src[1], lane) & 31)) +
                        lane_src(w, in.src[2], lane));
       });
-    } else if (op == "v_lshl_add_u64"_op) {
+    }
+    break;
+  case "v_lshl_add_u64"_op.hash:
+    if (!(op == "v_lshl_add_u64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The shift count is S1[2:0] and must be 0 to 4: "the design treats unsupported shift counts as a shift of zero".
         const uint32_t n = lane_src(w, in.src[1], lane) & 7;
         const uint32_t shift = in.arch != gcn::Target::Gfx1250 ? lane_src(w, in.src[1], lane) & 63 : n > 4 ? 0 : n;
         write_lane64(w, in.dst[0], lane, (lane_src64(w, in.src[0], lane) << shift) + lane_src64(w, in.src[2], lane));
       });
-    } else if (op == "v_ashrrev_i64"_op) {
+    }
+    break;
+  case "v_ashrrev_i64"_op.hash:
+    if (!(op == "v_ashrrev_i64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane64(w, in.dst[0], lane,
                      static_cast<uint64_t>(static_cast<int64_t>(lane_src64(w, in.src[1], lane)) >>
                                            (lane_src(w, in.src[0], lane) & 63)));
       });
-    } else if (op == "v_and_b32_e32"_op) {
+    }
+    break;
+  case "v_and_b32_e32"_op.hash:
+    if (!(op == "v_and_b32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane) & lane_src(w, in.src[1], lane));
       });
-    } else if (op == "v_or_b32_e32"_op || op == "v_or_b32_e64"_op) {
+    }
+    break;
+  case "v_or_b32_e32"_op.hash: case "v_or_b32_e64"_op.hash:
+    if (!(op == "v_or_b32_e32"_op || op == "v_or_b32_e64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane) | lane_src(w, in.src[1], lane));
       });
-    } else if (op == "v_xor_b32_e32"_op) {
+    }
+    break;
+  case "v_xor_b32_e32"_op.hash:
+    if (!(op == "v_xor_b32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane) ^ lane_src(w, in.src[1], lane));
       });
-    } else if (op == "v_add_u32_e32"_op || op == "v_add_u32_e64"_op) {
+    }
+    break;
+  case "v_add_u32_e32"_op.hash: case "v_add_u32_e64"_op.hash:
+    if (!(op == "v_add_u32_e32"_op || op == "v_add_u32_e64"_op)) goto L_ladder_9;
+    {
       // The VOP3 form's clamp saturates: an unsigned sum past 32 bits is
       // their maximum (as __clzll's sum of two leading-zero counts relies on).
       each([&](uint32_t lane) {
         const uint64_t sum = uint64_t{lane_src(w, in.src[0], lane)} + lane_src(w, in.src[1], lane);
         write_lane(w, in.dst[0], lane, in.clamp && sum > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(sum));
       });
-    } else if (op == "v_sub_u32_e32"_op || op == "v_sub_u32_e64"_op) {
+    }
+    break;
+  case "v_sub_u32_e32"_op.hash: case "v_sub_u32_e64"_op.hash:
+    if (!(op == "v_sub_u32_e32"_op || op == "v_sub_u32_e64"_op)) goto L_ladder_9;
+    {
       // Clamped, a difference below zero is zero.
       each([&](uint32_t lane) {
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
         write_lane(w, in.dst[0], lane, in.clamp && b > a ? 0u : a - b);
       });
-    } else if (op == "v_add3_u32"_op) {
+    }
+    break;
+  case "v_add3_u32"_op.hash:
+    if (!(op == "v_add3_u32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    lane_src(w, in.src[0], lane) + lane_src(w, in.src[1], lane) + lane_src(w, in.src[2], lane));
       });
-    } else if (op == "v_mul_lo_u32"_op) {
+    }
+    break;
+  case "v_mul_lo_u32"_op.hash:
+    if (!(op == "v_mul_lo_u32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane));
       });
-    } else if (op == "v_mul_hi_i32"_op) {
+    }
+    break;
+  case "v_mul_hi_i32"_op.hash:
+    if (!(op == "v_mul_hi_i32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const int64_t p = static_cast<int64_t>(static_cast<int32_t>(lane_src(w, in.src[0], lane))) *
                           static_cast<int32_t>(lane_src(w, in.src[1], lane));
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(static_cast<uint64_t>(p) >> 32));
       });
-    } else if (op == "v_sub_u16_e32"_op) {
+    }
+    break;
+  case "v_sub_u16_e32"_op.hash:
+    if (!(op == "v_sub_u16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const int32_t d = int32_t{static_cast<uint16_t>(lane_src(w, in.src[0], lane))} - static_cast<uint16_t>(lane_src(w, in.src[1], lane));
         write_lane(w, in.dst[0], lane, static_cast<uint16_t>(in.clamp ? std::max(d, 0) : d));
       });
-    } else if (op == "v_add_u16_e32"_op) {
+    }
+    break;
+  case "v_add_u16_e32"_op.hash:
+    if (!(op == "v_add_u16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // 16-bit arithmetic writes the low half of the destination and zeroes
         // the high half: the compiler leaves out the mask a widening would
@@ -3632,84 +4790,156 @@ struct Machine {
         const int32_t sum = int32_t{static_cast<uint16_t>(lane_src(w, in.src[0], lane))} + static_cast<uint16_t>(lane_src(w, in.src[1], lane));
         write_lane(w, in.dst[0], lane, static_cast<uint16_t>(in.clamp ? std::min(sum, 65535) : sum));
       });
-    } else if (op == "v_lshlrev_b16_e32"_op) {
+    }
+    break;
+  case "v_lshlrev_b16_e32"_op.hash:
+    if (!(op == "v_lshlrev_b16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[1], lane) << (lane_src(w, in.src[0], lane) & 15)));
       });
-    } else if (op == "v_mad_legacy_u16"_op) {
+    }
+    break;
+  case "v_mad_legacy_u16"_op.hash:
+    if (!(op == "v_mad_legacy_u16"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane) +
                                          lane_src(w, in.src[2], lane)));
       });
-    } else if (op == "v_accvgpr_read_b32"_op || op == "v_accvgpr_write_b32"_op) {
+    }
+    break;
+  case "v_accvgpr_read_b32"_op.hash: case "v_accvgpr_write_b32"_op.hash:
+    if (!(op == "v_accvgpr_read_b32"_op || op == "v_accvgpr_write_b32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane));
       });
-    } else if (op == "v_cvt_f64_f32_e32"_op) {
+    }
+    break;
+  case "v_cvt_f64_f32_e32"_op.hash:
+    if (!(op == "v_cvt_f64_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane64(w, in.dst[0], lane, as_bits(static_cast<double>(lane_float(w, in.src[0], lane))));
       });
-    } else if (op == "v_cvt_f64_i32_e32"_op) {
+    }
+    break;
+  case "v_cvt_f64_i32_e32"_op.hash:
+    if (!(op == "v_cvt_f64_i32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane64(w, in.dst[0], lane,
                      as_bits(static_cast<double>(static_cast<int32_t>(lane_src(w, in.src[0], lane)))));
       });
-    } else if (op == "v_cvt_f64_u32_e32"_op) {
+    }
+    break;
+  case "v_cvt_f64_u32_e32"_op.hash:
+    if (!(op == "v_cvt_f64_u32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane64(w, in.dst[0], lane, as_bits(static_cast<double>(lane_src(w, in.src[0], lane))));
       });
-    } else if (op == "v_trunc_f64_e32"_op) {
+    }
+    break;
+  case "v_trunc_f64_e32"_op.hash:
+    if (!(op == "v_trunc_f64_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
-        write_double(w, in, lane, std::trunc(lane_double(w, in.src[0], lane)));
+        write_double(w, in, lane, trunc_inline(lane_double(w, in.src[0], lane)));
       });
-    } else if (op == "v_ceil_f64_e32"_op) {
+    }
+    break;
+  case "v_ceil_f64_e32"_op.hash:
+    if (!(op == "v_ceil_f64_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
-        write_double(w, in, lane, std::ceil(lane_double(w, in.src[0], lane)));
+        write_double(w, in, lane, ceil_inline(lane_double(w, in.src[0], lane)));
       });
-    } else if (op == "v_floor_f64_e32"_op) {
+    }
+    break;
+  case "v_floor_f64_e32"_op.hash:
+    if (!(op == "v_floor_f64_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
-        write_double(w, in, lane, std::floor(lane_double(w, in.src[0], lane)));
+        write_double(w, in, lane, floor_inline(lane_double(w, in.src[0], lane)));
       });
-    } else if (op == "v_rndne_f64_e32"_op) {
+    }
+    break;
+  case "v_rndne_f64_e32"_op.hash:
+    if (!(op == "v_rndne_f64_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_double(w, in, lane, std::nearbyint(lane_double(w, in.src[0], lane)));
       });
-    } else if (op == "v_sqrt_f64_e32"_op) {
+    }
+    break;
+  case "v_sqrt_f64_e32"_op.hash:
+    if (!(op == "v_sqrt_f64_e32"_op)) goto L_ladder_9;
+    {
       // The hardware's is good to about a unit in the last place; this is the exact one.
       each([&](uint32_t lane) { write_double(w, in, lane, std::sqrt(lane_double(w, in.src[0], lane))); });
-    } else if (op == "v_rsq_f64_e32"_op) {
+    }
+    break;
+  case "v_rsq_f64_e32"_op.hash:
+    if (!(op == "v_rsq_f64_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // As with the reciprocal: the hardware's is a table and this is the
         // exact one, so the refinement the compiler builds around it lands on
         // the same answer either way.
         write_double(w, in, lane, 1.0 / std::sqrt(lane_double(w, in.src[0], lane)));
       });
-    } else if (op == "v_min_f64"_op || op == "v_max_f64"_op) {
+    }
+    break;
+  case "v_min_f64"_op.hash: case "v_max_f64"_op.hash:
+    if (!(op == "v_min_f64"_op || op == "v_max_f64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const double x = lane_double(w, in.src[0], lane), y = lane_double(w, in.src[1], lane);
         write_double(w, in, lane, op == "v_min_f64"_op ? hw_min(in, x, y) : hw_max(in, x, y));
       });
-    } else if (op == "v_ldexp_f64"_op) {
+    }
+    break;
+  case "v_ldexp_f64"_op.hash:
+    if (!(op == "v_ldexp_f64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_double(w, in, lane,
                      std::ldexp(lane_double(w, in.src[0], lane),
                                 static_cast<int32_t>(lane_src(w, in.src[1], lane))));
       });
-    } else if (op == "v_mov_b64_e32"_op) {
+    }
+    break;
+  case "v_mov_b64_e32"_op.hash:
+    if (!(op == "v_mov_b64_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane64(w, in.dst[0], lane, lane_src64(w, in.src[0], lane));
       });
-    } else if (op == "v_floor_f32_e32"_op) {
+    }
+    break;
+  case "v_floor_f32_e32"_op.hash:
+    if (!(op == "v_floor_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::floor(lane_float(w, in.src[0], lane)));
+        write_float(w, in, lane, floor_inline(lane_float(w, in.src[0], lane)));
       });
-    } else if (op == "v_ceil_f32_e32"_op) {
+    }
+    break;
+  case "v_ceil_f32_e32"_op.hash:
+    if (!(op == "v_ceil_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::ceil(lane_float(w, in.src[0], lane)));
+        write_float(w, in, lane, ceil_inline(lane_float(w, in.src[0], lane)));
       });
-    } else if (op == "v_fract_f32_e32"_op) {
+    }
+    break;
+  case "v_fract_f32_e32"_op.hash:
+    if (!(op == "v_fract_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // x - floor(x), held below 1 as v_fract_f64 is; an infinity is a NaN.
         const float x = lane_float(w, in.src[0], lane);
@@ -3717,19 +4947,31 @@ struct Machine {
                     std::isinf(x) ? std::numeric_limits<float>::quiet_NaN()
                                   : std::isnan(x) ? x : std::fmin(x - std::floor(x), 0x1.fffffep-1f));
       });
-    } else if (op == "v_fract_f16_e32"_op) {
+    }
+    break;
+  case "v_fract_f16_e32"_op.hash:
+    if (!(op == "v_fract_f16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const float x = static_cast<float>(lane_half(w, in.src[0], lane));
         const float r = std::isinf(x) ? std::numeric_limits<float>::quiet_NaN()
                                       : std::isnan(x) ? x : std::fmin(x - std::floor(x), 0x1.ffcp-1f);
         write_half(w, in, lane, static_cast<_Float16>(r));
       });
-    } else if (op == "v_rndne_f32_e32"_op) {
+    }
+    break;
+  case "v_rndne_f32_e32"_op.hash:
+    if (!(op == "v_rndne_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // To the nearest, and to the even one where it falls in the middle.
         write_float(w, in, lane, std::nearbyint(lane_float(w, in.src[0], lane)));
       });
-    } else if (op == "v_sin_f32_e32"_op || op == "v_cos_f32_e32"_op) {
+    }
+    break;
+  case "v_sin_f32_e32"_op.hash: case "v_cos_f32_e32"_op.hash:
+    if (!(op == "v_sin_f32_e32"_op || op == "v_cos_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The argument is in turns: a whole turn is 1.0, not 2pi.
         if (in.arch == gcn::Target::Gfx1250) {
@@ -3740,20 +4982,32 @@ struct Machine {
         const double radians = static_cast<double>(lane_float(w, in.src[0], lane)) * 6.283185307179586476925286766559;
         write_float(w, in, lane, static_cast<float>(op == "v_sin_f32_e32"_op ? std::sin(radians) : std::cos(radians)));
       });
-    } else if (op == "v_ldexp_f32"_op) {
+    }
+    break;
+  case "v_ldexp_f32"_op.hash:
+    if (!(op == "v_ldexp_f32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane,
                     std::ldexp(lane_float(w, in.src[0], lane),
                                static_cast<int32_t>(lane_src(w, in.src[1], lane))));
       });
-    } else if (op == "v_min3_f32"_op || op == "v_max3_f32"_op) {
+    }
+    break;
+  case "v_min3_f32"_op.hash: case "v_max3_f32"_op.hash:
+    if (!(op == "v_min3_f32"_op || op == "v_max3_f32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane),
                     z = lane_float(w, in.src[2], lane);
         write_float(w, in, lane, op == "v_min3_f32"_op ? std::fmin(std::fmin(x, y), z)
                                                     : std::fmax(std::fmax(x, y), z));
       });
-    } else if (op == "v_med3_f32"_op) {
+    }
+    break;
+  case "v_med3_f32"_op.hash:
+    if (!(op == "v_med3_f32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The middle one of three; with a NaN among them, the least, as
         // min3 gives it (a NaN losing to any number).
@@ -3764,8 +5018,12 @@ struct Machine {
                         ? std::fmin(std::fmin(x, y), z)
                         : std::fmax(std::fmin(x, y), std::fmin(std::fmax(x, y), z)));
       });
-    } else if (op == "v_cvt_f32_fp8_e32"_op || op == "v_cvt_f32_bf8_e32"_op ||
-               op == "v_cvt_pk_f32_fp8_e32"_op || op == "v_cvt_pk_f32_bf8_e32"_op) {
+    }
+    break;
+  case "v_cvt_f32_fp8_e32"_op.hash: case "v_cvt_f32_bf8_e32"_op.hash: case "v_cvt_pk_f32_fp8_e32"_op.hash: case "v_cvt_pk_f32_bf8_e32"_op.hash:
+    if (!(op == "v_cvt_f32_fp8_e32"_op || op == "v_cvt_f32_bf8_e32"_op ||
+               op == "v_cvt_pk_f32_fp8_e32"_op || op == "v_cvt_pk_f32_bf8_e32"_op)) goto L_ladder_9;
+    {
       // One 8-bit float widened, from the source's low byte, or two from its
       // low half -- the part SDWA picked, or the register's bottom.
       // The long form's op_sel picks the half (the pair) or the byte (the single) -- CDNA5 ISA, V_CVT_PK_F32_FP8 and
@@ -3780,7 +5038,11 @@ struct Machine {
         set_word(w, in.dst[0], 0, lane, as_bits(f8_to_float(v, t)));
         if (pair) set_word(w, in.dst[0], 1, lane, as_bits(f8_to_float(v >> 8, t)));
       });
-    } else if (op == "v_cvt_pk_fp8_f32"_op || op == "v_cvt_pk_bf8_f32"_op) {
+    }
+    break;
+  case "v_cvt_pk_fp8_f32"_op.hash: case "v_cvt_pk_bf8_f32"_op.hash:
+    if (!(op == "v_cvt_pk_fp8_f32"_op || op == "v_cvt_pk_bf8_f32"_op)) goto L_ladder_9;
+    {
       // Two floats narrowed into one half of the destination (op_sel's
       // bit 3 says the high one), the other half kept.
       const F8& t = op == "v_cvt_pk_fp8_f32"_op ? fp8() : bf8();
@@ -3790,7 +5052,11 @@ struct Machine {
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         write_lane(w, in.dst[0], lane, in.op_sel & 8 ? (was & 0xFFFFu) | two << 16 : (was & 0xFFFF0000u) | two);
       });
-    } else if (op == "v_cvt_sr_fp8_f32"_op || op == "v_cvt_sr_bf8_f32"_op) {
+    }
+    break;
+  case "v_cvt_sr_fp8_f32"_op.hash: case "v_cvt_sr_bf8_f32"_op.hash:
+    if (!(op == "v_cvt_sr_fp8_f32"_op || op == "v_cvt_sr_bf8_f32"_op)) goto L_ladder_9;
+    {
       // One float narrowed, rounded by the second source's random bits,
       // into the byte op_sel's bits 2 and 3 name, the others kept.
       const F8& t = op == "v_cvt_sr_fp8_f32"_op ? fp8() : bf8();
@@ -3801,7 +5067,11 @@ struct Machine {
         const uint32_t was = w.vgpr[in.dst[0].index][lane];
         write_lane(w, in.dst[0], lane, (was & ~(0xFFu << at)) | b << at);
       });
-    } else if (op == "v_min3_i32"_op || op == "v_max3_i32"_op) {
+    }
+    break;
+  case "v_min3_i32"_op.hash: case "v_max3_i32"_op.hash:
+    if (!(op == "v_min3_i32"_op || op == "v_max3_i32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const int32_t x = static_cast<int32_t>(lane_src(w, in.src[0], lane)),
                       y = static_cast<int32_t>(lane_src(w, in.src[1], lane)),
@@ -3810,7 +5080,11 @@ struct Machine {
                    static_cast<uint32_t>(op == "v_min3_i32"_op ? std::min(std::min(x, y), z)
                                                             : std::max(std::max(x, y), z)));
       });
-    } else if (op == "v_perm_b32"_op) {
+    }
+    break;
+  case "v_perm_b32"_op.hash:
+    if (!(op == "v_perm_b32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Four bytes chosen out of the eight the two sources make, the first
         // source holding the top four. Past those, a selector asks for the
@@ -3831,18 +5105,30 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, out);
       });
-    } else if (op == "v_or3_b32"_op) {
+    }
+    break;
+  case "v_or3_b32"_op.hash:
+    if (!(op == "v_or3_b32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    lane_src(w, in.src[0], lane) | lane_src(w, in.src[1], lane) | lane_src(w, in.src[2], lane));
       });
-    } else if (op == "v_min_i32_e32"_op || op == "v_max_i32_e32"_op) {
+    }
+    break;
+  case "v_min_i32_e32"_op.hash: case "v_max_i32_e32"_op.hash:
+    if (!(op == "v_min_i32_e32"_op || op == "v_max_i32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const int32_t x = static_cast<int32_t>(lane_src(w, in.src[0], lane)),
                       y = static_cast<int32_t>(lane_src(w, in.src[1], lane));
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(op == "v_min_i32_e32"_op ? std::min(x, y) : std::max(x, y)));
       });
-    } else if (op == "v_dot2_i32_i16"_op || op == "v_dot2_u32_u16"_op) {
+    }
+    break;
+  case "v_dot2_i32_i16"_op.hash: case "v_dot2_u32_u16"_op.hash:
+    if (!(op == "v_dot2_i32_i16"_op || op == "v_dot2_u32_u16"_op)) goto L_ladder_9;
+    {
       // Two pairs of 16-bit values (halves chosen as a packed instruction's
       // are) multiplied and added to the third source; clamped, the sum
       // saturates rather than wraps.
@@ -3857,7 +5143,11 @@ struct Machine {
         if (in.clamp) sum = is_signed ? std::clamp<int64_t>(sum, INT32_MIN, INT32_MAX) : std::clamp<int64_t>(sum, 0, UINT32_MAX);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(sum));
       });
-    } else if (op == "v_dot4_u32_u8"_op || op == "v_dot8_i32_i4"_op || op == "v_dot8_u32_u4"_op) {
+    }
+    break;
+  case "v_dot4_u32_u8"_op.hash: case "v_dot8_i32_i4"_op.hash: case "v_dot8_u32_u4"_op.hash:
+    if (!(op == "v_dot4_u32_u8"_op || op == "v_dot8_i32_i4"_op || op == "v_dot8_u32_u4"_op)) goto L_ladder_9;
+    {
       // Four unsigned bytes, or eight 4-bit values, of each source multiplied
       // pairwise and added to the third.
       const bool nibbles = op != "v_dot4_u32_u8"_op, is_signed = op == "v_dot8_i32_i4"_op;
@@ -3878,7 +5168,11 @@ struct Machine {
         if (in.clamp) sum = is_signed || iu ? std::clamp<int64_t>(sum, INT32_MIN, INT32_MAX) : std::clamp<int64_t>(sum, 0, UINT32_MAX);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(sum));
       });
-    } else if (op == "v_dot4_i32_i8"_op) {
+    }
+    break;
+  case "v_dot4_i32_i8"_op.hash:
+    if (!(op == "v_dot4_i32_i8"_op)) goto L_ladder_9;
+    {
       // Four signed bytes of each multiplied pairwise and added to the third
       // source; clamped, the sum saturates rather than wraps.
       each([&](uint32_t lane) {
@@ -3895,31 +5189,51 @@ struct Machine {
         if (in.clamp) sum = std::clamp<int64_t>(sum, INT32_MIN, INT32_MAX);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(sum));
       });
-    } else if (op == "v_min3_u32"_op) {
+    }
+    break;
+  case "v_min3_u32"_op.hash:
+    if (!(op == "v_min3_u32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    std::min({lane_src(w, in.src[0], lane), lane_src(w, in.src[1], lane), lane_src(w, in.src[2], lane)}));
       });
-    } else if (op == "v_lshrrev_b16_e32"_op) {
+    }
+    break;
+  case "v_lshrrev_b16_e32"_op.hash:
+    if (!(op == "v_lshrrev_b16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[1], lane)) >> (lane_src(w, in.src[0], lane) & 15));
       });
-    } else if (op == "v_min_f16_e32"_op || op == "v_max_f16_e32"_op) {
+    }
+    break;
+  case "v_min_f16_e32"_op.hash: case "v_max_f16_e32"_op.hash:
+    if (!(op == "v_min_f16_e32"_op || op == "v_max_f16_e32"_op)) goto L_ladder_9;
+    {
       // Where one is a NaN the other is kept, as fmin and fmax keep it.
       each([&](uint32_t lane) {
         const float x = static_cast<float>(lane_half(w, in.src[0], lane)),
                     y = static_cast<float>(lane_half(w, in.src[1], lane));
         write_half(w, in, lane, static_cast<_Float16>(op == "v_min_f16_e32"_op ? hw_min(in, x, y) : hw_max(in, x, y)));
       });
-    } else if (op == "v_cvt_u32_f64_e32"_op) {
+    }
+    break;
+  case "v_cvt_u32_f64_e32"_op.hash:
+    if (!(op == "v_cvt_u32_f64_e32"_op)) goto L_ladder_9;
+    {
       // Toward zero, held to what 32 unsigned bits hold, and a NaN to zero.
       each([&](uint32_t lane) {
         const double d = lane_double(w, in.src[0], lane);
         write_lane(w, in.dst[0], lane,
                    !(d > 0) ? 0u : d >= 4294967295.0 ? 0xFFFFFFFFu : static_cast<uint32_t>(d));
       });
-    } else if (op == "v_mad_i32_i24"_op) {
+    }
+    break;
+  case "v_mad_i32_i24"_op.hash:
+    if (!(op == "v_mad_i32_i24"_op)) goto L_ladder_9;
+    {
       // The low 24 bits of each factor, signed.
       each([&](uint32_t lane) {
         const auto i24 = [](uint32_t v) { return static_cast<int32_t>(v << 8) >> 8; };
@@ -3927,7 +5241,11 @@ struct Machine {
                    static_cast<uint32_t>(i24(lane_src(w, in.src[0], lane)) * i24(lane_src(w, in.src[1], lane)) +
                                          static_cast<int32_t>(lane_src(w, in.src[2], lane))));
       });
-    } else if (op == "v_mad_i64_i32"_op) {
+    }
+    break;
+  case "v_mad_i64_i32"_op.hash:
+    if (!(op == "v_mad_i64_i32"_op)) goto L_ladder_9;
+    {
       sdst_bits = 0;
       each([&](uint32_t lane) {
         // A signed 32x32 product added to a signed 64-bit value, and whether
@@ -3939,19 +5257,35 @@ struct Machine {
         if (p != static_cast<int64_t>(p)) sdst_bits |= uint64_t{1} << lane;
       });
       if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
-    } else if (op == "v_add_f16_e32"_op) {
+    }
+    break;
+  case "v_add_f16_e32"_op.hash:
+    if (!(op == "v_add_f16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_half(w, in, lane, lane_half(w, in.src[0], lane) + lane_half(w, in.src[1], lane));
       });
-    } else if (op == "v_sub_f16_e32"_op) {
+    }
+    break;
+  case "v_sub_f16_e32"_op.hash:
+    if (!(op == "v_sub_f16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_half(w, in, lane, lane_half(w, in.src[0], lane) - lane_half(w, in.src[1], lane));
       });
-    } else if (op == "v_mul_f16_e32"_op) {
+    }
+    break;
+  case "v_mul_f16_e32"_op.hash:
+    if (!(op == "v_mul_f16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_half(w, in, lane, lane_half(w, in.src[0], lane) * lane_half(w, in.src[1], lane));
       });
-    } else if (op == "v_fma_f16"_op) {
+    }
+    break;
+  case "v_fma_f16"_op.hash:
+    if (!(op == "v_fma_f16"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // A fused multiply-add: one rounding, which is what the C means by
         // fma and what the half the compiler folded into it expects.
@@ -3960,22 +5294,38 @@ struct Machine {
                                                   static_cast<float>(lane_half(w, in.src[1], lane)),
                                                   static_cast<float>(lane_half(w, in.src[2], lane)))));
       });
-    } else if (op == "v_cvt_f16_f32_e32"_op) {
+    }
+    break;
+  case "v_cvt_f16_f32_e32"_op.hash:
+    if (!(op == "v_cvt_f16_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_half(w, in, lane, static_cast<_Float16>(lane_float(w, in.src[0], lane)));
       });
-    } else if (op == "v_cvt_f32_f16_e32"_op) {
+    }
+    break;
+  case "v_cvt_f32_f16_e32"_op.hash:
+    if (!(op == "v_cvt_f32_f16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(lane_half(w, in.src[0], lane))));
       });
-    } else if (op == "v_mul_i32_i24_e32"_op) {
+    }
+    break;
+  case "v_mul_i32_i24_e32"_op.hash:
+    if (!(op == "v_mul_i32_i24_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The low 24 bits of each source, as signed numbers; the product wraps, so it is formed unsigned.
         const auto i24 = [](uint32_t v) { return static_cast<int32_t>(v << 8) >> 8; };
         write_lane(w, in.dst[0], lane,
                    static_cast<uint32_t>(i24(lane_src(w, in.src[0], lane))) * static_cast<uint32_t>(i24(lane_src(w, in.src[1], lane))));
       });
-    } else if (op == "v_mul_hi_i32_i24_e32"_op) {
+    }
+    break;
+  case "v_mul_hi_i32_i24_e32"_op.hash:
+    if (!(op == "v_mul_hi_i32_i24_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The high half of the 48-bit product of the sources' low 24 bits as signed numbers: what a compiler
         // emits for a multiply high of values it knows fit in 24 bits (llama.cpp's mul_mat_vec_q).
@@ -3983,67 +5333,119 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint32_t>((i24(lane_src(w, in.src[0], lane)) * i24(lane_src(w, in.src[1], lane))) >> 32));
       });
-    } else if (op == "v_mul_lo_u16_e32"_op) {
+    }
+    break;
+  case "v_mul_lo_u16_e32"_op.hash:
+    if (!(op == "v_mul_lo_u16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    static_cast<uint16_t>(lane_src(w, in.src[0], lane) * lane_src(w, in.src[1], lane)));
       });
-    } else if (op == "v_not_b32_e32"_op) {
+    }
+    break;
+  case "v_not_b32_e32"_op.hash:
+    if (!(op == "v_not_b32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, ~lane_src(w, in.src[0], lane));
       });
-    } else if (op == "v_cvt_f32_ubyte0_e32"_op) {
+    }
+    break;
+  case "v_cvt_f32_ubyte0_e32"_op.hash:
+    if (!(op == "v_cvt_f32_ubyte0_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(lane_src(w, in.src[0], lane) & 0xFF)));
       });
-    } else if (op == "v_rsq_f32_e32"_op) {
+    }
+    break;
+  case "v_rsq_f32_e32"_op.hash:
+    if (!(op == "v_rsq_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // As the reciprocal is: the host's exact answer, where a card's is a
         // table good to about one unit in the last place.
         write_float(w, in, lane, 1.0f / std::sqrt(lane_float(w, in.src[0], lane)));
       });
-    } else if (op == "v_mul_f32_e64"_op) {
+    }
+    break;
+  case "v_mul_f32_e64"_op.hash:
+    if (!(op == "v_mul_f32_e64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane, lane_float(w, in.src[0], lane) * lane_float(w, in.src[1], lane));
       });
-    } else if (op == "v_lshlrev_b32_e64"_op) {
+    }
+    break;
+  case "v_lshlrev_b32_e64"_op.hash:
+    if (!(op == "v_lshlrev_b32_e64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[1], lane) << (lane_src(w, in.src[0], lane) & 31));
       });
-    } else if (op == "v_lshrrev_b64"_op) {
+    }
+    break;
+  case "v_lshrrev_b64"_op.hash:
+    if (!(op == "v_lshrrev_b64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane64(w, in.dst[0], lane, lane_src64(w, in.src[1], lane) >> (lane_src(w, in.src[0], lane) & 63));
       });
-    } else if (op == "v_fmaak_f32"_op) {
+    }
+    break;
+  case "v_fmaak_f32"_op.hash:
+    if (!(op == "v_fmaak_f32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The constant the instruction carries is the addend, and comes last.
         write_float(w, in, lane,
                     std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane),
                              as_float(static_cast<uint32_t>(in.src[2].value))));
       });
-    } else if (op == "v_mad_u32_u24"_op) {
+    }
+    break;
+  case "v_mad_u32_u24"_op.hash:
+    if (!(op == "v_mad_u32_u24"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) & 0xFFFFFFu) * (lane_src(w, in.src[1], lane) & 0xFFFFFFu) +
                        lane_src(w, in.src[2], lane));
       });
-    } else if (op == "v_add_lshl_u32"_op) {
+    }
+    break;
+  case "v_add_lshl_u32"_op.hash:
+    if (!(op == "v_add_lshl_u32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) + lane_src(w, in.src[1], lane)) << (lane_src(w, in.src[2], lane) & 31));
       });
-    } else if (op == "v_and_or_b32"_op) {
+    }
+    break;
+  case "v_and_or_b32"_op.hash:
+    if (!(op == "v_and_or_b32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) & lane_src(w, in.src[1], lane)) | lane_src(w, in.src[2], lane));
       });
-    } else if (op == "v_pack_b32_f16"_op) {
+    }
+    break;
+  case "v_pack_b32_f16"_op.hash:
+    if (!(op == "v_pack_b32_f16"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The low half of each source, the first below the second.
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) & 0xFFFFu) | (lane_src(w, in.src[1], lane) & 0xFFFFu) << 16);
       });
-    } else if (op == "v_fma_mix_f32"_op || op == "v_fma_mixlo_f16"_op || op == "v_fma_mixhi_f16"_op) {
+    }
+    break;
+  case "v_fma_mix_f32"_op.hash: case "v_fma_mixlo_f16"_op.hash: case "v_fma_mixhi_f16"_op.hash:
+    if (!(op == "v_fma_mix_f32"_op || op == "v_fma_mixlo_f16"_op || op == "v_fma_mixhi_f16"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Each source is a float, or -- where its op_sel_hi bit is set -- a
         // half, the one op_sel names. The multiply-add is a float's; the
@@ -4070,28 +5472,44 @@ struct Machine {
         w.vgpr[in.dst[0].index][lane] = op == "v_fma_mixlo_f16"_op ? (was & 0xFFFF0000u) | bits
                                                                 : (was & 0x0000FFFFu) | bits << 16;
       });
-    } else if (op == "v_bfi_b32"_op) {
+    }
+    break;
+  case "v_bfi_b32"_op.hash:
+    if (!(op == "v_bfi_b32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The bits the first source selects come from the second, the rest
         // from the third.
         const uint32_t m = lane_src(w, in.src[0], lane);
         write_lane(w, in.dst[0], lane, (m & lane_src(w, in.src[1], lane)) | (~m & lane_src(w, in.src[2], lane)));
       });
-    } else if (op == "v_alignbit_b32"_op) {
+    }
+    break;
+  case "v_alignbit_b32"_op.hash:
+    if (!(op == "v_alignbit_b32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Two registers side by side, the first above the second, and the 32
         // bits that start where the third says: a rotate, when both are one.
         const uint64_t pair = static_cast<uint64_t>(lane_src(w, in.src[0], lane)) << 32 | lane_src(w, in.src[1], lane);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(pair >> (lane_src(w, in.src[2], lane) & 31)));
       });
-    } else if (op == "v_med3_i32"_op) {
+    }
+    break;
+  case "v_med3_i32"_op.hash:
+    if (!(op == "v_med3_i32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const int32_t x = static_cast<int32_t>(lane_src(w, in.src[0], lane)),
                       y = static_cast<int32_t>(lane_src(w, in.src[1], lane)),
                       z = static_cast<int32_t>(lane_src(w, in.src[2], lane));
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(std::max(std::min(x, y), std::min(std::max(x, y), z))));
       });
-    } else if (op == "v_frexp_mant_f32_e32"_op || op == "v_frexp_exp_i32_f32_e32"_op) {
+    }
+    break;
+  case "v_frexp_mant_f32_e32"_op.hash: case "v_frexp_exp_i32_f32_e32"_op.hash:
+    if (!(op == "v_frexp_mant_f32_e32"_op || op == "v_frexp_exp_i32_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // A float as a mantissa in [0.5, 1) and a power of two. An infinity
         // or a NaN has no such parts: the mantissa is the value itself and
@@ -4102,7 +5520,11 @@ struct Machine {
         if (!std::isfinite(x)) e = 0;
         write_lane(w, in.dst[0], lane, op == "v_frexp_mant_f32_e32"_op ? as_bits(m) : static_cast<uint32_t>(e));
       });
-    } else if (op == "v_dot8c_i32_i4_e32"_op) {
+    }
+    break;
+  case "v_dot8c_i32_i4_e32"_op.hash:
+    if (!(op == "v_dot8c_i32_i4_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Eight signed 4-bit pairs, added into the destination; it wraps.
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
@@ -4115,7 +5537,11 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, sum);
       });
-    } else if (op == "v_dot2c_i32_i16_e32"_op) {
+    }
+    break;
+  case "v_dot2c_i32_i16_e32"_op.hash:
+    if (!(op == "v_dot2c_i32_i16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Two signed 16-bit pairs, added into the destination; it wraps.
         const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
@@ -4125,7 +5551,11 @@ struct Machine {
                                        static_cast<int32_t>(static_cast<int16_t>(b >> (16 * h))));
         write_lane(w, in.dst[0], lane, sum);
       });
-    } else if (op == "v_dot4c_i32_i8_e32"_op) {
+    }
+    break;
+  case "v_dot4c_i32_i8_e32"_op.hash:
+    if (!(op == "v_dot4c_i32_i8_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Four signed bytes times four, added into the destination. Nothing
         // clamps it: a sum past what 32 bits hold wraps.
@@ -4136,7 +5566,11 @@ struct Machine {
                                        static_cast<int32_t>(static_cast<int8_t>(b >> (8 * k))));
         write_lane(w, in.dst[0], lane, sum);
       });
-    } else if (op == "v_dot2c_f32_bf16_e32"_op || op == "v_dot2_f32_bf16"_op) {
+    }
+    break;
+  case "v_dot2c_f32_bf16_e32"_op.hash: case "v_dot2_f32_bf16"_op.hash:
+    if (!(op == "v_dot2c_f32_bf16_e32"_op || op == "v_dot2_f32_bf16"_op)) goto L_ladder_9;
+    {
       // gfx950: two pairs of bfloat16s multiplied and added into a float,
       // the sum worked out in double and rounded once. The VOP2 form adds
       // into its destination; the packed one into its third source, with
@@ -4160,7 +5594,11 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
       });
-    } else if (op == "v_dot2c_f32_f16_e32"_op) {
+    }
+    break;
+  case "v_dot2c_f32_f16_e32"_op.hash:
+    if (!(op == "v_dot2c_f32_f16_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Two pairs of halves multiplied and added into a float. Each product
         // is exact in a float; the sum is worked out in double and rounded
@@ -4173,11 +5611,18 @@ struct Machine {
           std::memcpy(&h, &bits, 2);
           return static_cast<double>(h);
         };
-        const double sum = half(a, 0) * half(b, 0) + half(a, 1) * half(b, 1) +
-                           static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]));
+        // (Written in this order: with NaNs of different payloads among the operands, the one the sum keeps follows it.)
+        double p0 = half(a, 0) * half(b, 0), p1 = half(a, 1) * half(b, 1);
+        double c = static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]));
+        __asm__("" : "+x"(p1), "+x"(p0), "+x"(c));   // (this order of operands: the compiler may not swap them)
+        const double sum = p1 + p0 + c;
         write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(sum)));
       });
-    } else if (op == "v_bitop3_b32"_op || op == "v_bitop3_b16"_op) {
+    }
+    break;
+  case "v_bitop3_b32"_op.hash: case "v_bitop3_b16"_op.hash:
+    if (!(op == "v_bitop3_b32"_op || op == "v_bitop3_b16"_op)) goto L_ladder_9;
+    {
       // Each result bit is the truth table's entry for that bit of the three
       // sources, the first the most significant of the index: 0xF0, 0xCC and
       // 0xAA as the sources give the table itself. The 16-bit form reads the
@@ -4196,7 +5641,11 @@ struct Machine {
         if (b16) r &= 0xFFFF;
         write_lane(w, in.dst[0], lane, r);
       });
-    } else if (op == "v_cvt_pk_f16_f32"_op || op == "v_cvt_pk_bf16_f32"_op) {
+    }
+    break;
+  case "v_cvt_pk_f16_f32"_op.hash: case "v_cvt_pk_bf16_f32"_op.hash:
+    if (!(op == "v_cvt_pk_f16_f32"_op || op == "v_cvt_pk_bf16_f32"_op)) goto L_ladder_9;
+    {
       // Two floats to a packed pair, the first in the low half, each rounded
       // to nearest even.
       const bool bf = op == "v_cvt_pk_bf16_f32"_op;
@@ -4211,43 +5660,75 @@ struct Machine {
         };
         write_lane(w, in.dst[0], lane, narrow(a) | narrow(b) << 16);
       });
-    } else if (op == "v_cvt_pkrtz_f16_f32"_op) {
+    }
+    break;
+  case "v_cvt_pkrtz_f16_f32"_op.hash:
+    if (!(op == "v_cvt_pkrtz_f16_f32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Two floats narrowed to halves and packed, each rounded toward zero.
         write_lane(w, in.dst[0], lane,
                    half_toward_zero(lane_float(w, in.src[0], lane)) |
                        static_cast<uint32_t>(half_toward_zero(lane_float(w, in.src[1], lane))) << 16);
       });
-    } else if (op == "v_xad_u32"_op) {
+    }
+    break;
+  case "v_xad_u32"_op.hash:
+    if (!(op == "v_xad_u32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) ^ lane_src(w, in.src[1], lane)) + lane_src(w, in.src[2], lane));
       });
-    } else if (op == "v_bfrev_b32_e32"_op) {
+    }
+    break;
+  case "v_bfrev_b32_e32"_op.hash:
+    if (!(op == "v_bfrev_b32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         uint32_t v = lane_src(w, in.src[0], lane), r = 0;
         for (uint32_t k = 0; k < 32; ++k) r |= ((v >> k) & 1) << (31 - k);
         write_lane(w, in.dst[0], lane, r);
       });
-    } else if (op == "v_min_u32_e32"_op) {
+    }
+    break;
+  case "v_min_u32_e32"_op.hash:
+    if (!(op == "v_min_u32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, std::min(lane_src(w, in.src[0], lane), lane_src(w, in.src[1], lane)));
       });
-    } else if (op == "v_lshl_or_b32"_op) {
+    }
+    break;
+  case "v_lshl_or_b32"_op.hash:
+    if (!(op == "v_lshl_or_b32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) << (lane_src(w, in.src[1], lane) & 31)) |
                        lane_src(w, in.src[2], lane));
       });
-    } else if (op == "v_trunc_f32_e32"_op) {
+    }
+    break;
+  case "v_trunc_f32_e32"_op.hash:
+    if (!(op == "v_trunc_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, std::trunc(lane_float(w, in.src[0], lane)));
+        write_float(w, in, lane, trunc_inline(lane_float(w, in.src[0], lane)));
       });
-    } else if (op == "v_cvt_f32_f64_e32"_op) {
+    }
+    break;
+  case "v_cvt_f32_f64_e32"_op.hash:
+    if (!(op == "v_cvt_f32_f64_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(as_double(lane_src64(w, in.src[0], lane)))));
       });
-    } else if (op == "v_cvt_i32_f64_e32"_op) {
+    }
+    break;
+  case "v_cvt_i32_f64_e32"_op.hash:
+    if (!(op == "v_cvt_i32_f64_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Out-of-range values (infinities too) saturate and a NaN is zero (CDNA5 ISA, V_CVT_I32_F64).
         const double d = as_double(lane_src64(w, in.src[0], lane));
@@ -4255,8 +5736,12 @@ struct Machine {
                    std::isnan(d) ? 0u : d >= 2147483647.0 ? 0x7FFFFFFFu : d <= -2147483648.0 ? 0x80000000u
                                                                                            : static_cast<uint32_t>(static_cast<int32_t>(d)));
       });
-    } else if (op == "v_mad_f32"_op || op == "v_mad_legacy_f32"_op || op == "v_mac_f32_e32"_op ||
-               op == "v_mac_f32_e64"_op || op == "v_madmk_f32"_op) {
+    }
+    break;
+  case "v_mad_f32"_op.hash: case "v_mad_legacy_f32"_op.hash: case "v_mac_f32_e32"_op.hash: case "v_mac_f32_e64"_op.hash: case "v_madmk_f32"_op.hash:
+    if (!(op == "v_mad_f32"_op || op == "v_mad_legacy_f32"_op || op == "v_mac_f32_e32"_op ||
+               op == "v_mac_f32_e64"_op || op == "v_madmk_f32"_op)) goto L_ladder_9;
+    {
       // gfx90a's multiply-adds, which gfx940 dropped: the product rounded to
       // a float before the add, and denormals -- in or out -- flushed to
       // zero, which is why a compiler picks them only where denormals are
@@ -4273,14 +5758,22 @@ struct Machine {
         const float product = legacy && (a == 0.0f || b == 0.0f) ? 0.0f : ftz(a * b);
         write_float(w, in, lane, ftz(product + c));
       });
-    } else if (op == "v_fmamk_f32"_op) {
+    }
+    break;
+  case "v_fmamk_f32"_op.hash:
+    if (!(op == "v_fmamk_f32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The middle source is the constant the instruction carries.
         write_lane(w, in.dst[0], lane,
                    as_bits(std::fma(lane_float(w, in.src[0], lane), as_float(static_cast<uint32_t>(in.src[1].value)),
                                     lane_float(w, in.src[2], lane))));
       });
-    } else if (op == "v_bfe_i32"_op) {
+    }
+    break;
+  case "v_bfe_i32"_op.hash:
+    if (!(op == "v_bfe_i32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The same bits as v_bfe_u32, with the top one carried into the rest.
         const uint32_t value = lane_src(w, in.src[0], lane), start = lane_src(w, in.src[1], lane) & 31,
@@ -4294,34 +5787,58 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, out);
       });
-    } else if (op == "v_bfe_u32"_op) {
+    }
+    break;
+  case "v_bfe_u32"_op.hash:
+    if (!(op == "v_bfe_u32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The bits src2 wide starting at src1.
         const uint32_t value = lane_src(w, in.src[0], lane), start = lane_src(w, in.src[1], lane) & 31,
                        width = lane_src(w, in.src[2], lane) & 31;
         write_lane(w, in.dst[0], lane, width == 0 ? 0u : (value >> start) & ((width >= 32) ? ~0u : ((1u << width) - 1)));
       });
-    } else if (op == "v_cvt_f32_i32_e32"_op) {
+    }
+    break;
+  case "v_cvt_f32_i32_e32"_op.hash:
+    if (!(op == "v_cvt_f32_i32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(static_cast<int32_t>(lane_src(w, in.src[0], lane)))));
       });
-    } else if (op == "v_cvt_f32_u32_e32"_op) {
+    }
+    break;
+  case "v_cvt_f32_u32_e32"_op.hash:
+    if (!(op == "v_cvt_f32_u32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(lane_src(w, in.src[0], lane))));
       });
-    } else if (op == "v_fmac_f32_e32"_op || op == "v_fmac_f32_e64"_op) {
+    }
+    break;
+  case "v_fmac_f32_e32"_op.hash: case "v_fmac_f32_e64"_op.hash:
+    if (!(op == "v_fmac_f32_e32"_op || op == "v_fmac_f32_e64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The destination is also the addend.
         write_float(w, in, lane,
                     std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane),
                              as_float(w.vgpr[in.dst[0].index][lane])));
       });
-    } else if (op == "v_fma_f32"_op) {
+    }
+    break;
+  case "v_fma_f32"_op.hash:
+    if (!(op == "v_fma_f32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane,
                     std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane), lane_float(w, in.src[2], lane)));
       });
-    } else if (op == "v_cndmask_b32_e64"_op) {
+    }
+    break;
+  case "v_cndmask_b32_e64"_op.hash:
+    if (!(op == "v_cndmask_b32_e64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // One lane's bit of the condition register picks a source, with its
         // modifiers -- which is how the compiler negates a float, or takes
@@ -4329,48 +5846,88 @@ struct Machine {
         const uint64_t cond = scalar(w, in.src[2]);
         write_lane(w, in.dst[0], lane, lane_bits(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane));
       });
-    } else if (op == "v_sub_f32_e32"_op || op == "v_sub_f32_e64"_op) {
+    }
+    break;
+  case "v_sub_f32_e32"_op.hash: case "v_sub_f32_e64"_op.hash:
+    if (!(op == "v_sub_f32_e32"_op || op == "v_sub_f32_e64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane, lane_float(w, in.src[0], lane) - lane_float(w, in.src[1], lane));
       });
-    } else if (op == "v_min_f32_e32"_op) {
+    }
+    break;
+  case "v_min_f32_e32"_op.hash:
+    if (!(op == "v_min_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane, hw_min(in, lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
       });
-    } else if (op == "v_max_f32_e32"_op || op == "v_max_f32_e64"_op) {
+    }
+    break;
+  case "v_max_f32_e32"_op.hash: case "v_max_f32_e64"_op.hash:
+    if (!(op == "v_max_f32_e32"_op || op == "v_max_f32_e64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane, hw_max(in, lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
       });
-    } else if (op == "v_add_f32_e64"_op) {
+    }
+    break;
+  case "v_add_f32_e64"_op.hash:
+    if (!(op == "v_add_f32_e64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane, lane_float(w, in.src[0], lane) + lane_float(w, in.src[1], lane));
       });
-    } else if (op == "v_max_u32_e32"_op) {
+    }
+    break;
+  case "v_max_u32_e32"_op.hash:
+    if (!(op == "v_max_u32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, std::max(lane_src(w, in.src[0], lane), lane_src(w, in.src[1], lane)));
       });
-    } else if (op == "v_subrev_u32_e32"_op) {
+    }
+    break;
+  case "v_subrev_u32_e32"_op.hash:
+    if (!(op == "v_subrev_u32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_lane(w, in.dst[0], lane, lane_src(w, in.src[1], lane) - lane_src(w, in.src[0], lane));
       });
-    } else if (op == "v_mul_hi_u32"_op) {
+    }
+    break;
+  case "v_mul_hi_u32"_op.hash:
+    if (!(op == "v_mul_hi_u32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const uint64_t p = static_cast<uint64_t>(lane_src(w, in.src[0], lane)) * lane_src(w, in.src[1], lane);
         write_lane(w, in.dst[0], lane, static_cast<uint32_t>(p >> 32));
       });
-    } else if (op == "v_bcnt_u32_b32"_op) {
+    }
+    break;
+  case "v_bcnt_u32_b32"_op.hash:
+    if (!(op == "v_bcnt_u32_b32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The set bits of the first source, counted into the second.
         write_lane(w, in.dst[0], lane,
                    lane_src(w, in.src[1], lane) + static_cast<uint32_t>(__builtin_popcount(lane_src(w, in.src[0], lane))));
       });
-    } else if (op == "v_ffbh_u32_e32"_op) {
+    }
+    break;
+  case "v_ffbh_u32_e32"_op.hash:
+    if (!(op == "v_ffbh_u32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The leading zeros, and -1 when there is no set bit at all.
         const uint32_t v = lane_src(w, in.src[0], lane);
         write_lane(w, in.dst[0], lane, v ? static_cast<uint32_t>(__builtin_clz(v)) : 0xFFFFFFFFu);
       });
-    } else if (op == "v_cvt_i32_f32_e32"_op) {
+    }
+    break;
+  case "v_cvt_i32_f32_e32"_op.hash:
+    if (!(op == "v_cvt_i32_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const float f = lane_float(w, in.src[0], lane);
         write_lane(w, in.dst[0], lane,
@@ -4379,61 +5936,109 @@ struct Machine {
                                          : f >= 2147483648.0f   ? INT32_MAX
                                                                 : static_cast<int32_t>(f)));
       });
-    } else if (op == "v_mul_u32_u24_e32"_op) {
+    }
+    break;
+  case "v_mul_u32_u24_e32"_op.hash:
+    if (!(op == "v_mul_u32_u24_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Only the low 24 bits of each source take part.
         write_lane(w, in.dst[0], lane,
                    (lane_src(w, in.src[0], lane) & 0xFFFFFF) * (lane_src(w, in.src[1], lane) & 0xFFFFFF));
       });
-    } else if (op == "v_cvt_u32_f32_e32"_op) {
+    }
+    break;
+  case "v_cvt_u32_f32_e32"_op.hash:
+    if (!(op == "v_cvt_u32_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         const float f = lane_float(w, in.src[0], lane);
         write_lane(w, in.dst[0], lane,
                    std::isnan(f) || f <= 0 ? 0u : f >= 4294967296.0f ? 0xFFFFFFFFu : static_cast<uint32_t>(f));
       });
-    } else if (op == "v_sqrt_f32_e32"_op) {
+    }
+    break;
+  case "v_sqrt_f32_e32"_op.hash:
+    if (!(op == "v_sqrt_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane, std::sqrt(lane_float(w, in.src[0], lane)));
       });
-    } else if (op == "v_exp_f32_e32"_op) {
+    }
+    break;
+  case "v_exp_f32_e32"_op.hash:
+    if (!(op == "v_exp_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane, std::exp2(lane_float(w, in.src[0], lane)));
       });
-    } else if (op == "v_log_f32_e32"_op) {
+    }
+    break;
+  case "v_log_f32_e32"_op.hash:
+    if (!(op == "v_log_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_float(w, in, lane, std::log2(lane_float(w, in.src[0], lane)));
       });
-    } else if (op == "v_cndmask_b32_e32"_op) {
+    }
+    break;
+  case "v_cndmask_b32_e32"_op.hash:
+    if (!(op == "v_cndmask_b32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The sub-dword form's sources may carry modifiers too.
         const uint64_t cond = scalar(w, in.src[2]);
         write_lane(w, in.dst[0], lane, lane_bits(w, (cond >> lane) & 1 ? in.src[1] : in.src[0], lane));
       });
-    } else if (op == "v_add_f64"_op) {
+    }
+    break;
+  case "v_add_f64"_op.hash:
+    if (!(op == "v_add_f64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_double(w, in, lane, lane_double(w, in.src[0], lane) + lane_double(w, in.src[1], lane));
       });
-    } else if (op == "v_mul_f64"_op) {
+    }
+    break;
+  case "v_mul_f64"_op.hash:
+    if (!(op == "v_mul_f64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_double(w, in, lane, lane_double(w, in.src[0], lane) * lane_double(w, in.src[1], lane));
       });
-    } else if (op == "v_fma_f64"_op) {
+    }
+    break;
+  case "v_fma_f64"_op.hash:
+    if (!(op == "v_fma_f64"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_double(w, in, lane,
                      std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane),
                               lane_double(w, in.src[2], lane)));
       });
-    } else if (op == "v_fmac_f64_e32"_op) {
+    }
+    break;
+  case "v_fmac_f64_e32"_op.hash:
+    if (!(op == "v_fmac_f64_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_double(w, in, lane,
                      std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane),
                               as_double(lane_src64(w, in.dst[0], lane))));
       });
-    } else if (op == "v_rcp_f64_e32"_op) {
+    }
+    break;
+  case "v_rcp_f64_e32"_op.hash:
+    if (!(op == "v_rcp_f64_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         write_double(w, in, lane, 1.0 / lane_double(w, in.src[0], lane));
       });
-    } else if (op == "v_pk_fma_f32"_op || op == "v_pk_add_f32"_op || op == "v_pk_mul_f32"_op) {
+    }
+    break;
+  case "v_pk_fma_f32"_op.hash: case "v_pk_add_f32"_op.hash: case "v_pk_mul_f32"_op.hash:
+    if (!(op == "v_pk_fma_f32"_op || op == "v_pk_add_f32"_op || op == "v_pk_mul_f32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Two floats in a register pair, each its own arithmetic -- both
         // worked out before either is written, since the destination may be
@@ -4449,7 +6054,11 @@ struct Machine {
         set_word(w, in.dst[0], 0, lane, as_bits(r[0]));
         set_word(w, in.dst[0], 1, lane, as_bits(r[1]));
       });
-    } else if (op == "v_pk_mov_b32"_op) {
+    }
+    break;
+  case "v_pk_mov_b32"_op.hash:
+    if (!(op == "v_pk_mov_b32"_op)) goto L_ladder_9;
+    {
       // The low register from the first source and the high from the second,
       // each the register of its pair op_sel names.
       each([&](uint32_t lane) {
@@ -4458,8 +6067,12 @@ struct Machine {
         set_word(w, in.dst[0], 0, lane, lo);
         set_word(w, in.dst[0], 1, lane, hi);
       });
-    } else if (op == "v_pk_fma_f16"_op || op == "v_pk_add_f16"_op || op == "v_pk_mul_f16"_op ||
-               op == "v_pk_min_f16"_op || op == "v_pk_max_f16"_op) {
+    }
+    break;
+  case "v_pk_fma_f16"_op.hash: case "v_pk_add_f16"_op.hash: case "v_pk_mul_f16"_op.hash: case "v_pk_min_f16"_op.hash: case "v_pk_max_f16"_op.hash:
+    if (!(op == "v_pk_fma_f16"_op || op == "v_pk_add_f16"_op || op == "v_pk_mul_f16"_op ||
+               op == "v_pk_min_f16"_op || op == "v_pk_max_f16"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // Two halves in one register, each its own arithmetic, done in float
         // -- which holds a product of two halves exactly -- and rounded once
@@ -4480,7 +6093,11 @@ struct Machine {
         }
         write_lane(w, in.dst[0], lane, r);
       });
-    } else if (op == "v_rcp_f32_e32"_op || op == "v_rcp_iflag_f32_e32"_op) {
+    }
+    break;
+  case "v_rcp_f32_e32"_op.hash: case "v_rcp_iflag_f32_e32"_op.hash:
+    if (!(op == "v_rcp_f32_e32"_op || op == "v_rcp_iflag_f32_e32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The hardware's reciprocal is a table good to about one unit in the
         // last place; this is the exact one, so a program that refines it
@@ -4489,7 +6106,11 @@ struct Machine {
         // here raises any.
         write_float(w, in, lane, 1.0f / lane_float(w, in.src[0], lane));
       });
-    } else if (op == "v_mbcnt_lo_u32_b32"_op || op == "v_mbcnt_hi_u32_b32"_op) {
+    }
+    break;
+  case "v_mbcnt_lo_u32_b32"_op.hash: case "v_mbcnt_hi_u32_b32"_op.hash:
+    if (!(op == "v_mbcnt_lo_u32_b32"_op || op == "v_mbcnt_hi_u32_b32"_op)) goto L_ladder_9;
+    {
       each([&](uint32_t lane) {
         // The lanes below this one that are set in the mask, counted into the
         // second source: how a wave numbers its active lanes.
@@ -4500,27 +6121,32 @@ struct Machine {
         write_lane(w, in.dst[0], lane,
                    lane_src(w, in.src[1], lane) + static_cast<uint32_t>(__builtin_popcount(mask & below)));
       });
-    } else if (op.rfind("v_div_", 0) == 0) {
-      sdst_bits = 0;
-      each([&](uint32_t lane) {
-        divide_step(w, in, lane);
-      });
-      if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
-    } else if (op == "v_mad_u64_u32"_op) {
-      sdst_bits = 0;
-      each([&](uint32_t lane) {
-        // A 32x32 product added to a 64-bit value, with the carry out.
-        const unsigned __int128 p = static_cast<unsigned __int128>(lane_src(w, in.src[0], lane)) *
-                                        lane_src(w, in.src[1], lane) +
-                                    lane_src64(w, in.src[2], lane);
-        write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(p));
-        if (static_cast<uint64_t>(p >> 64)) sdst_bits |= uint64_t{1} << lane;
-      });
-      if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
-    } else if (w.exec) {
-      // With no lane to write, an instruction changes nothing, and is not refused.
-      throw Error::make(Err::Unsupported, "vector instruction ", op, " is decoded but not implemented");
     }
+    break;
+  default: L_ladder_9:
+    if (op.rfind("v_div_", 0) == 0) {
+          sdst_bits = 0;
+          each([&](uint32_t lane) {
+            divide_step(w, in, lane);
+          });
+          if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
+        } else if (op == "v_mad_u64_u32"_op) {
+          sdst_bits = 0;
+          each([&](uint32_t lane) {
+            // A 32x32 product added to a 64-bit value, with the carry out.
+            const unsigned __int128 p = static_cast<unsigned __int128>(lane_src(w, in.src[0], lane)) *
+                                            lane_src(w, in.src[1], lane) +
+                                        lane_src64(w, in.src[2], lane);
+            write_lane64(w, in.dst[0], lane, static_cast<uint64_t>(p));
+            if (static_cast<uint64_t>(p >> 64)) sdst_bits |= uint64_t{1} << lane;
+          });
+          if (in.dst.size() > 1) write_scalar(w, in.dst[1], sdst_bits);
+        } else if (w.exec) {
+          // With no lane to write, an instruction changes nothing, and is not refused.
+          throw Error::make(Err::Unsupported, "vector instruction ", op, " is decoded but not implemented");
+        }
+    break;
+}
   }
 
   // A comparison, one bit a lane. VOPC and VOP3 number the comparisons alike,
@@ -4537,6 +6163,7 @@ struct Machine {
                              (raw >= 0xB0 && raw < 0xC0) || (raw >= 0xD0 && raw < 0xE0) || raw >= 0xF0 ||
                              raw == 0x11 || raw == 0x13 || raw == 0x15;
     const uint32_t op = !writes_exec ? raw : raw < 0x20 ? raw - 1 : raw - 0x10;
+    const InvariantSources invariant(*this, w, in);
     const auto each = [&](auto&& test) {
       uint64_t result = 0;
       for (uint32_t lane = 0; lane < kLanes; ++lane)
@@ -4831,7 +6458,7 @@ struct Machine {
   }
 
   void lds_access(Wave& w, const Inst& in, Group& g) {
-    const OpName op(in.name);
+    const OpName op(in);
     if (uint32_t bits; in.name.rfind("ds_", 0) == 0 && transpose_kind(std::string_view(in.name).substr(3), &bits)) {
       if (!transpose_ready(w, in)) return;
       uint8_t raw[32][16] = {};
@@ -4855,7 +6482,10 @@ struct Machine {
       const Operand& data = op == "ds_bpermute_b32"_op || op == "ds_bpermute_fi_b32"_op ? in.src[1] : in.src[0];
       for (uint32_t lane = 0; lane < kLanes; ++lane) before[lane] = w.vgpr[data.index][lane];
     }
-    if (op == "ds_read_b64_tr_b16"_op || op == "ds_read_b64_tr_b8"_op || op == "ds_read_b64_tr_b4"_op) {
+    switch (op.hash()) {
+  case "ds_read_b64_tr_b16"_op.hash: case "ds_read_b64_tr_b8"_op.hash: case "ds_read_b64_tr_b4"_op.hash:
+    if (!(op == "ds_read_b64_tr_b16"_op || op == "ds_read_b64_tr_b8"_op || op == "ds_read_b64_tr_b4"_op)) goto L_ladder_8;
+    {
       // gfx950's transposing reads. Each lane reads 64 bits from its address
       // -- `tile` elements of `bits` bits -- and the hardware hands them out
       // across the wave: destination lane l's element r is element l mod
@@ -4891,7 +6521,10 @@ struct Machine {
       }
       return;
     }
-    if (op == "ds_permute_b32"_op) {
+    break;
+  case "ds_permute_b32"_op.hash:
+    if (!(op == "ds_permute_b32"_op)) goto L_ladder_8;
+    {
       // The other way round from bpermute: each lane sends its value to the
       // lane its address names, and a lane no one sent to gets zero. Where
       // two send to the same lane, the higher-numbered one's lands last.
@@ -4904,6 +6537,9 @@ struct Machine {
         if (w.exec >> lane & 1) write_lane(w, in.dst[0], lane, sent[lane]);
       return;
     }
+    break;
+  default: L_ladder_8: break;
+}
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // (The two that address by M0 and the lane's number name no address register.)
@@ -4931,31 +6567,54 @@ struct Machine {
         return outside;
       };
       const uint64_t off = static_cast<uint64_t>(in.offset);
-      if (op == "ds_write_b32"_op) {
+      switch (op.hash()) {
+  case "ds_write_b32"_op.hash:
+    if (!(op == "ds_write_b32"_op)) goto L_ladder_5;
+    {
         const uint32_t v = lane_src(w, in.src[1], lane);
         std::memcpy(at(static_cast<uint64_t>(in.offset)), &v, 4);
-      } else if (op == "ds_read_b32"_op) {
+      }
+    break;
+  case "ds_read_b32"_op.hash:
+    if (!(op == "ds_read_b32"_op)) goto L_ladder_5;
+    {
         uint32_t v = 0;
         std::memcpy(&v, at(static_cast<uint64_t>(in.offset)), 4);
         write_lane(w, in.dst[0], lane, v);
-      } else if (op == "ds_add_u32"_op) {
+      }
+    break;
+  case "ds_add_u32"_op.hash:
+    if (!(op == "ds_add_u32"_op)) goto L_ladder_5;
+    {
         // An atomic add in LDS: every lane's addition lands.
         uint32_t v = 0;
         std::memcpy(&v, at(static_cast<uint64_t>(in.offset)), 4);
         v += lane_src(w, in.src[1], lane);
         std::memcpy(at(static_cast<uint64_t>(in.offset)), &v, 4);
-      } else if (op == "ds_bpermute_b32"_op) {
+      }
+    break;
+  case "ds_bpermute_b32"_op.hash:
+    if (!(op == "ds_bpermute_b32"_op)) goto L_ladder_5;
+    {
         // A lane reads what another lane holds: the address says which, in
         // bytes, and the source register is read across the wave.
         // A lane that is switched off does not give its value: "if src_lane selects a disabled
         // thread then zero is returned" (the MI300 ISA guide, DS_BPERMUTE_B32).
         const uint32_t from = ((lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset)) >> 2) & (w.lanes - 1);
         write_lane(w, in.dst[0], lane, w.exec >> from & 1 ? before[from] : 0);
-      } else if (op == "ds_bpermute_fi_b32"_op) {
+      }
+    break;
+  case "ds_bpermute_fi_b32"_op.hash:
+    if (!(op == "ds_bpermute_fi_b32"_op)) goto L_ladder_5;
+    {
         // gfx1250's backward permute that fetches from lanes that are off too (EXEC says only which lanes are written).
         const uint32_t from = ((lane_src(w, in.src[0], lane) + static_cast<uint32_t>(in.offset)) >> 2) & (w.lanes - 1);
         write_lane(w, in.dst[0], lane, before[from]);
-      } else if (op == "ds_atomic_async_barrier_arrive_b64"_op || op == "ds_atomic_barrier_arrive_rtn_b64"_op) {
+      }
+    break;
+  case "ds_atomic_async_barrier_arrive_b64"_op.hash: case "ds_atomic_barrier_arrive_rtn_b64"_op.hash:
+    if (!(op == "ds_atomic_async_barrier_arrive_b64"_op || op == "ds_atomic_barrier_arrive_rtn_b64"_op)) goto L_ladder_5;
+    {
         // gfx1250's LDS barrier (CDNA5 ISA 11.2.2 and the instruction pseudocode in 15.15): a 64-bit word, the 32-bit state
         // (pending count in the low WIDTH bits, phase above) with the initial count in bits 47:32. An arrive subtracts 1 (the
         // async form) or DATA0's low dword (the _RTN form, which returns the whole word as it was) from the state; where
@@ -4968,8 +6627,12 @@ struct Machine {
         const bool rtn = op == "ds_atomic_barrier_arrive_rtn_b64"_op;
         const uint64_t old = lds_barrier_arrive(g, static_cast<uint32_t>(addr + off), rtn ? lane_src(w, in.src[1], lane) : 1u);
         if (rtn) write_lane64(w, in.dst[0], lane, old);
-      } else if (op == "ds_cond_sub_u32"_op || op == "ds_cond_sub_rtn_u32"_op || op == "ds_sub_clamp_u32"_op ||
-                 op == "ds_sub_clamp_rtn_u32"_op) {
+      }
+    break;
+  case "ds_cond_sub_u32"_op.hash: case "ds_cond_sub_rtn_u32"_op.hash: case "ds_sub_clamp_u32"_op.hash: case "ds_sub_clamp_rtn_u32"_op.hash:
+    if (!(op == "ds_cond_sub_u32"_op || op == "ds_cond_sub_rtn_u32"_op || op == "ds_sub_clamp_u32"_op ||
+                 op == "ds_sub_clamp_rtn_u32"_op)) goto L_ladder_5;
+    {
         // gfx1250's conditional subtract (only where memory is at least the operand) and subtract clamped at zero.
         uint32_t was = 0;
         std::memcpy(&was, at(off), 4);
@@ -4978,8 +6641,12 @@ struct Machine {
         const uint32_t now = cond ? (was >= v ? was - v : was) : (was < v ? 0u : was - v);
         std::memcpy(at(off), &now, 4);
         if (op == "ds_cond_sub_rtn_u32"_op || op == "ds_sub_clamp_rtn_u32"_op) write_lane(w, in.dst[0], lane, was);
-      } else if (op == "ds_pk_add_f16"_op || op == "ds_pk_add_rtn_f16"_op || op == "ds_pk_add_bf16"_op ||
-                 op == "ds_pk_add_rtn_bf16"_op) {
+      }
+    break;
+  case "ds_pk_add_f16"_op.hash: case "ds_pk_add_rtn_f16"_op.hash: case "ds_pk_add_bf16"_op.hash: case "ds_pk_add_rtn_bf16"_op.hash:
+    if (!(op == "ds_pk_add_f16"_op || op == "ds_pk_add_rtn_f16"_op || op == "ds_pk_add_bf16"_op ||
+                 op == "ds_pk_add_rtn_bf16"_op)) goto L_ladder_5;
+    {
         // Two halves (or bfloat16s) added in place.
         const bool bf = op == "ds_pk_add_bf16"_op || op == "ds_pk_add_rtn_bf16"_op;
         uint32_t was = 0;
@@ -4994,19 +6661,31 @@ struct Machine {
         }
         std::memcpy(at(off), &now, 4);
         if (op == "ds_pk_add_rtn_f16"_op || op == "ds_pk_add_rtn_bf16"_op) write_lane(w, in.dst[0], lane, was);
-      } else if (op == "ds_mskor_b32"_op || op == "ds_mskor_rtn_b32"_op) {
+      }
+    break;
+  case "ds_mskor_b32"_op.hash: case "ds_mskor_rtn_b32"_op.hash:
+    if (!(op == "ds_mskor_b32"_op || op == "ds_mskor_rtn_b32"_op)) goto L_ladder_5;
+    {
         uint32_t was = 0;
         std::memcpy(&was, at(off), 4);
         const uint32_t now = (was & ~lane_src(w, in.src[1], lane)) | lane_src(w, in.src[2], lane);
         std::memcpy(at(off), &now, 4);
         if (op == "ds_mskor_rtn_b32"_op) write_lane(w, in.dst[0], lane, was);
-      } else if (op == "ds_mskor_b64"_op || op == "ds_mskor_rtn_b64"_op) {
+      }
+    break;
+  case "ds_mskor_b64"_op.hash: case "ds_mskor_rtn_b64"_op.hash:
+    if (!(op == "ds_mskor_b64"_op || op == "ds_mskor_rtn_b64"_op)) goto L_ladder_5;
+    {
         uint64_t was = 0;
         std::memcpy(&was, at(off, 8), 8);
         const uint64_t now = (was & ~lane_src64(w, in.src[1], lane)) | lane_src64(w, in.src[2], lane);
         std::memcpy(at(off, 8), &now, 8);
         if (op == "ds_mskor_rtn_b64"_op) write_lane64(w, in.dst[0], lane, was);
-      } else if (op == "ds_cmpstore_b64"_op || op == "ds_cmpst_b64"_op) {
+      }
+    break;
+  case "ds_cmpstore_b64"_op.hash: case "ds_cmpst_b64"_op.hash:
+    if (!(op == "ds_cmpstore_b64"_op || op == "ds_cmpst_b64"_op)) goto L_ladder_5;
+    {
         // As the _rtn form, with nothing handed back.
         uint64_t was = 0;
         std::memcpy(&was, at(off, 8), 8);
@@ -5014,8 +6693,12 @@ struct Machine {
           const uint64_t v = lane_src64(w, in.src[2], lane);
           std::memcpy(at(off, 8), &v, 8);
         }
-      } else if (op == "ds_storexchg_2addr_rtn_b32"_op || op == "ds_storexchg_2addr_stride64_rtn_b32"_op ||
-                 op == "ds_storexchg_2addr_rtn_b64"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op) {
+      }
+    break;
+  case "ds_storexchg_2addr_rtn_b32"_op.hash: case "ds_storexchg_2addr_stride64_rtn_b32"_op.hash: case "ds_storexchg_2addr_rtn_b64"_op.hash: case "ds_storexchg_2addr_stride64_rtn_b64"_op.hash:
+    if (!(op == "ds_storexchg_2addr_rtn_b32"_op || op == "ds_storexchg_2addr_stride64_rtn_b32"_op ||
+                 op == "ds_storexchg_2addr_rtn_b64"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op)) goto L_ladder_5;
+    {
         // Two stores that each hand back what they replaced, to two addresses a count of elements (or of 64 elements) on.
         const bool wide = op == "ds_storexchg_2addr_rtn_b64"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op;
         const bool stride = op == "ds_storexchg_2addr_stride64_rtn_b32"_op || op == "ds_storexchg_2addr_stride64_rtn_b64"_op;
@@ -5037,7 +6720,11 @@ struct Machine {
           std::memcpy(a1, &v1, 4);
           set_word(w, in.dst[0], 0, lane, static_cast<uint32_t>(t0)), set_word(w, in.dst[0], 1, lane, static_cast<uint32_t>(t1));
         }
-      } else if (op == "ds_condxchg32_rtn_b64"_op) {
+      }
+    break;
+  case "ds_condxchg32_rtn_b64"_op.hash:
+    if (!(op == "ds_condxchg32_rtn_b64"_op)) goto L_ladder_5;
+    {
         // Two conditional exchanges of the neighbouring dwords at an 8-byte aligned address: each stores its half of the
         // data, without the top bit, only where that bit is set, and hands back what was there.
         const uint32_t base = (addr + static_cast<uint32_t>(in.offset)) & 0xFFF8u;
@@ -5057,266 +6744,367 @@ struct Machine {
         }
         set_word(w, in.dst[0], 0, lane, t0);
         set_word(w, in.dst[0], 1, lane, t1);
-      } else if (by_lane) {
-        // The address is the instruction's offset, M0's low 20 bits and four bytes a lane.
-        const uint64_t where = uint64_t{static_cast<uint32_t>(in.offset)} + (w.m0 & 0xFFFFF) + 4 * lane;
-        if (op == "ds_store_addtid_b32"_op || op == "ds_write_addtid_b32"_op) {
-          const uint32_t v = lane_src(w, in.src[0], lane);
-          std::memcpy(at(where, 4), &v, 4);
-        } else {
-          uint32_t v = 0;
-          std::memcpy(&v, at(where, 4), 4);
-          write_lane(w, in.dst[0], lane, v);
-        }
-      } else if (op == "ds_swizzle_b32"_op) {
-        // The same: "thread_valid[j] ? thread_in[j] : 0".
-        const uint32_t from = swizzle_source(static_cast<uint32_t>(in.offset), lane);
-        write_lane(w, in.dst[0], lane, w.exec >> from & 1 ? before[from] : 0);
-      } else if (op == "ds_add_f32"_op || op == "ds_add_rtn_f32"_op || op == "ds_min_f32"_op ||
-                 op == "ds_min_rtn_f32"_op || op == "ds_max_f32"_op || op == "ds_max_rtn_f32"_op) {
-        // Float atomics, lane by lane, as the integer ones are; the _rtn
-        // forms hand back what was there.
-        uint32_t was = 0;
-        std::memcpy(&was, at(off), 4);
-        const float a = as_float(was), b = as_float(lane_src(w, in.src[1], lane));
-        const float now = op == "ds_add_f32"_op || op == "ds_add_rtn_f32"_op   ? a + b
-                          : op == "ds_min_f32"_op || op == "ds_min_rtn_f32"_op ? std::fmin(a, b)
-                                                                               : std::fmax(a, b);
-        std::memcpy(at(off), &now, 4);
-        if (op == "ds_add_rtn_f32"_op || op == "ds_min_rtn_f32"_op || op == "ds_max_rtn_f32"_op)
-          write_lane(w, in.dst[0], lane, was);
-      } else if (op == "ds_cmpst_b32"_op || op == "ds_cmpst_f32"_op || op == "ds_cmpst_rtn_f32"_op) {
-        // The second value is stored where the first is found (compared as
-        // floats for the _f32 forms); the _rtn form hands back what was there.
-        uint32_t was = 0;
-        std::memcpy(&was, at(off), 4);
-        const uint32_t cmp = lane_src(w, in.src[1], lane);
-        const bool equal = op == "ds_cmpst_b32"_op ? was == cmp : as_float(was) == as_float(cmp);
-        if (equal) {
-          const uint32_t v = lane_src(w, in.src[2], lane);
-          std::memcpy(at(off), &v, 4);
-        }
-        if (op == "ds_cmpst_rtn_f32"_op) write_lane(w, in.dst[0], lane, was);
-      } else if (op == "ds_write_b8"_op || op == "ds_write_b16"_op) {
-        const uint32_t v = lane_src(w, in.src[1], lane);
-        const uint64_t bytes = op == "ds_write_b8"_op ? 1 : 2;
-        std::memcpy(at(off, bytes), &v, bytes);
-      } else if (Half h; half_access(std::string_view(in.name).substr(3), &h)) {
-        uint8_t* p = at(off, h.bytes);
-        if (h.store) {
-          const uint32_t v = half_store(lane_src(w, in.src[1], lane), h);
-          std::memcpy(p, &v, h.bytes);
-        } else {
-          uint32_t raw = 0;
-          std::memcpy(&raw, p, h.bytes);
-          write_half_load(w, in, in.dst[0], lane, half_load(raw, h), h);
-        }
-      } else if (op == "ds_read_u8"_op || op == "ds_read_i8"_op || op == "ds_read_u16"_op) {
-        const uint64_t bytes = op == "ds_read_u16"_op ? 2 : 1;
-        uint32_t v = 0;
-        std::memcpy(&v, at(off, bytes), bytes);
-        if (op == "ds_read_i8"_op) v = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v)));
-        write_lane(w, in.dst[0], lane, v);
-      } else if (op == "ds_write_b64"_op || op == "ds_write_b128"_op) {
-        const uint32_t words = in.src[1].width;
-        uint8_t* const a = at(off, 4 * words);
-        for (uint32_t k = 0; k < words; ++k) {
-          const uint32_t v = word(w, in.src[1], k, lane);
-          std::memcpy(a + 4 * k, &v, 4);
-        }
-      } else if (op == "ds_read_b64"_op || op == "ds_read_b128"_op) {
-        const uint32_t words = in.dst[0].width;
-        uint8_t* const a = at(off, 4 * words);
-        for (uint32_t k = 0; k < words; ++k) {
-          uint32_t v = 0;
-          std::memcpy(&v, a + 4 * k, 4);
-          set_word(w, in.dst[0], k, lane, v);
-        }
-      } else if (op == "ds_read2st64_b32"_op) {
-        // Two dwords, each offset by its own count of 64 dwords.
-        uint32_t v0 = 0, v1 = 0;
-        std::memcpy(&v0, at(uint64_t{static_cast<uint32_t>(in.offset)} * 64 * 4), 4);
-        std::memcpy(&v1, at(uint64_t{static_cast<uint32_t>(in.offset1)} * 64 * 4), 4);
-        set_word(w, in.dst[0], 0, lane, v0);
-        set_word(w, in.dst[0], 1, lane, v1);
-      } else if (op == "ds_sub_u32"_op || op == "ds_rsub_u32"_op || op == "ds_inc_u32"_op || op == "ds_dec_u32"_op ||
-                 op == "ds_sub_rtn_u32"_op || op == "ds_rsub_rtn_u32"_op || op == "ds_inc_rtn_u32"_op ||
-                 op == "ds_dec_rtn_u32"_op || op == "ds_min_rtn_i32"_op || op == "ds_max_rtn_i32"_op ||
-                 op == "ds_min_rtn_u32"_op || op == "ds_max_rtn_u32"_op || op == "ds_and_rtn_b32"_op ||
-                 op == "ds_or_rtn_b32"_op || op == "ds_xor_rtn_b32"_op || op == "ds_wrxchg_rtn_b32"_op) {
-        // The rest of LDS's 32-bit read-modify-writes; the _rtn forms hand
-        // back what was there.
-        std::string what(in.name);
-        const bool rtn = what.find("_rtn") != std::string::npos;
-        if (rtn) what.erase(what.find("_rtn"), 4);
-        uint32_t was = 0;
-        std::memcpy(&was, at(off), 4);
-        const uint32_t v = lane_src(w, in.src[1], lane);
-        const int32_t sw = static_cast<int32_t>(was), sv = static_cast<int32_t>(v);
-        uint32_t now = was;
-        if (what == "ds_sub_u32") now = was - v;
-        else if (what == "ds_rsub_u32") now = v - was;
-        else if (what == "ds_inc_u32") now = was >= v ? 0 : was + 1;
-        else if (what == "ds_dec_u32") now = was == 0 || was > v ? v : was - 1;
-        else if (what == "ds_min_i32") now = static_cast<uint32_t>(std::min(sw, sv));
-        else if (what == "ds_max_i32") now = static_cast<uint32_t>(std::max(sw, sv));
-        else if (what == "ds_min_u32") now = std::min(was, v);
-        else if (what == "ds_max_u32") now = std::max(was, v);
-        else if (what == "ds_and_b32") now = was & v;
-        else if (what == "ds_or_b32") now = was | v;
-        else if (what == "ds_xor_b32") now = was ^ v;
-        else if (what == "ds_wrxchg_b32") now = v;
-        std::memcpy(at(off), &now, 4);
-        if (rtn) write_lane(w, in.dst[0], lane, was);
-      } else if (op == "ds_min_i32"_op || op == "ds_min_u32"_op || op == "ds_max_u32"_op || op == "ds_and_b32"_op ||
-                 op == "ds_or_b32"_op || op == "ds_add_rtn_u32"_op) {
-        uint32_t was = 0;
-        std::memcpy(&was, at(off), 4);
-        const uint32_t v = lane_src(w, in.src[1], lane);
-        const uint32_t now = op == "ds_min_i32"_op ? static_cast<uint32_t>(std::min(static_cast<int32_t>(was), static_cast<int32_t>(v)))
-                             : op == "ds_min_u32"_op ? std::min(was, v)
-                             : op == "ds_max_u32"_op ? std::max(was, v)
-                             : op == "ds_and_b32"_op ? was & v
-                             : op == "ds_or_b32"_op  ? was | v
-                                                     : was + v;
-        std::memcpy(at(off), &now, 4);
-        if (op == "ds_add_rtn_u32"_op) write_lane(w, in.dst[0], lane, was);
-      } else if (op == "ds_cmpst_rtn_b32"_op) {
-        // The second value is stored where the first is found; either way
-        // the lane is told what was there.
-        uint32_t was = 0;
-        std::memcpy(&was, at(off), 4);
-        if (was == lane_src(w, in.src[1], lane)) {
-          const uint32_t v = lane_src(w, in.src[2], lane);
-          std::memcpy(at(off), &v, 4);
-        }
-        write_lane(w, in.dst[0], lane, was);
-      } else if (op == "ds_cmpst_rtn_b64"_op) {
-        uint64_t was = 0;
-        std::memcpy(&was, at(off, 8), 8);
-        if (was == lane_src64(w, in.src[1], lane)) {
-          const uint64_t v = lane_src64(w, in.src[2], lane);
-          std::memcpy(at(off, 8), &v, 8);
-        }
-        write_lane64(w, in.dst[0], lane, was);
-      } else if (op == "ds_write_b96"_op) {
-        uint8_t* const a = at(off, 12);
-        for (uint32_t k = 0; k < 3; ++k) {
-          const uint32_t v = word(w, in.src[1], k, lane);
-          std::memcpy(a + 4 * k, &v, 4);
-        }
-      } else if (op == "ds_read_i16"_op) {
-        int16_t v = 0;
-        std::memcpy(&v, at(off, 2), 2);
-        write_lane(w, in.dst[0], lane, static_cast<uint32_t>(static_cast<int32_t>(v)));
-      } else if (op == "ds_add_u64"_op ||
-                 op == "ds_sub_u64"_op ||
-                 op == "ds_rsub_u64"_op ||
-                 op == "ds_inc_u64"_op ||
-                 op == "ds_dec_u64"_op ||
-                 op == "ds_min_i64"_op ||
-                 op == "ds_max_i64"_op ||
-                 op == "ds_min_u64"_op ||
-                 op == "ds_max_u64"_op ||
-                 op == "ds_and_b64"_op ||
-                 op == "ds_or_b64"_op ||
-                 op == "ds_xor_b64"_op ||
-                 op == "ds_add_f64"_op ||
-                 op == "ds_min_f64"_op ||
-                 op == "ds_max_f64"_op ||
-                 op == "ds_add_rtn_u64"_op ||
-                 op == "ds_sub_rtn_u64"_op ||
-                 op == "ds_rsub_rtn_u64"_op ||
-                 op == "ds_inc_rtn_u64"_op ||
-                 op == "ds_dec_rtn_u64"_op ||
-                 op == "ds_min_rtn_i64"_op ||
-                 op == "ds_max_rtn_i64"_op ||
-                 op == "ds_min_rtn_u64"_op ||
-                 op == "ds_max_rtn_u64"_op ||
-                 op == "ds_and_rtn_b64"_op ||
-                 op == "ds_or_rtn_b64"_op ||
-                 op == "ds_xor_rtn_b64"_op ||
-                 op == "ds_wrxchg_rtn_b64"_op ||
-                 op == "ds_min_rtn_f64"_op ||
-                 op == "ds_max_rtn_f64"_op || op == "ds_add_rtn_f64"_op) {
-        // LDS's 64-bit read-modify-writes; the _rtn forms hand back what
-        // was there.
-        std::string what(in.name);
-        const bool rtn = what.find("_rtn") != std::string::npos;
-        if (rtn) what.erase(what.find("_rtn"), 4);
-        uint64_t was = 0;
-        std::memcpy(&was, at(off, 8), 8);
-        const uint64_t v = lane_src64(w, in.src[1], lane);
-        const int64_t sw = static_cast<int64_t>(was), sv = static_cast<int64_t>(v);
-        uint64_t now = was;
-        if (what == "ds_add_u64") now = was + v;
-        else if (what == "ds_sub_u64") now = was - v;
-        else if (what == "ds_rsub_u64") now = v - was;
-        else if (what == "ds_inc_u64") now = was >= v ? 0 : was + 1;
-        else if (what == "ds_dec_u64") now = was == 0 || was > v ? v : was - 1;
-        else if (what == "ds_min_i64") now = static_cast<uint64_t>(std::min(sw, sv));
-        else if (what == "ds_max_i64") now = static_cast<uint64_t>(std::max(sw, sv));
-        else if (what == "ds_min_u64") now = std::min(was, v);
-        else if (what == "ds_max_u64") now = std::max(was, v);
-        else if (what == "ds_and_b64") now = was & v;
-        else if (what == "ds_or_b64") now = was | v;
-        else if (what == "ds_xor_b64") now = was ^ v;
-        else if (what == "ds_wrxchg_b64") now = v;
-        else if (what == "ds_add_f64") now = as_bits(as_double(was) + as_double(v));
-        else if (what == "ds_min_f64") now = as_bits(std::fmin(as_double(was), as_double(v)));
-        else if (what == "ds_max_f64") now = as_bits(std::fmax(as_double(was), as_double(v)));
-        std::memcpy(at(off, 8), &now, 8);
-        if (rtn) write_lane64(w, in.dst[0], lane, was);
-      } else if (op == "ds_xor_b32"_op || op == "ds_max_i32"_op) {
-        uint32_t before = 0;
-        std::memcpy(&before, at(static_cast<uint64_t>(in.offset)), 4);
-        const uint32_t v = lane_src(w, in.src[1], lane);
-        const uint32_t after = op == "ds_xor_b32"_op
-                                   ? before ^ v
-                                   : static_cast<uint32_t>(std::max(static_cast<int32_t>(before),
-                                                                    static_cast<int32_t>(v)));
-        std::memcpy(at(static_cast<uint64_t>(in.offset)), &after, 4);
-      } else if (op == "ds_write2_b32"_op) {
-        // Two words, each at its own offset, counted in words.
-        const uint32_t v0 = lane_src(w, in.src[1], lane), v1 = lane_src(w, in.src[2], lane);
-        std::memcpy(at(uint64_t{static_cast<uint32_t>(in.offset)} * 4), &v0, 4);
-        std::memcpy(at(uint64_t{static_cast<uint32_t>(in.offset1)} * 4), &v1, 4);
-      } else if (op == "ds_write2st64_b32"_op || op == "ds_write2_b64"_op || op == "ds_write2st64_b64"_op) {
-        // Two values at two offsets, counted in values -- or, for the st64
-        // forms, in 64s of them.
-        const uint32_t words = in.src[1].width;
-        const uint64_t unit = 4 * words * (op == "ds_write2_b64"_op ? 1 : 64);
-        uint8_t* const a0 = at(uint64_t{static_cast<uint32_t>(in.offset)} * unit, 4 * words);
-        uint8_t* const a1 = at(uint64_t{static_cast<uint32_t>(in.offset1)} * unit, 4 * words);
-        for (uint32_t k = 0; k < words; ++k) {
-          const uint32_t v0 = word(w, in.src[1], k, lane), v1 = word(w, in.src[2], k, lane);
-          std::memcpy(a0 + 4 * k, &v0, 4);
-          std::memcpy(a1 + 4 * k, &v1, 4);
-        }
-      } else if (op == "ds_read2_b64"_op || op == "ds_read2st64_b64"_op) {
-        const uint64_t unit = 8 * (op == "ds_read2_b64"_op ? 1 : 64);
-        uint8_t* const a0 = at(uint64_t{static_cast<uint32_t>(in.offset)} * unit, 8);
-        uint8_t* const a1 = at(uint64_t{static_cast<uint32_t>(in.offset1)} * unit, 8);
-        uint32_t v[4];
-        std::memcpy(&v[0], a0, 8);
-        std::memcpy(&v[2], a1, 8);
-        for (uint32_t k = 0; k < 4; ++k) set_word(w, in.dst[0], k, lane, v[k]);
-      } else if (op == "ds_read_b96"_op) {
-        uint8_t* const a = at(off, 12);
-        for (uint32_t k = 0; k < 3; ++k) {
-          uint32_t v = 0;
-          std::memcpy(&v, a + 4 * k, 4);
-          set_word(w, in.dst[0], k, lane, v);
-        }
-      } else if (op == "ds_read2_b32"_op) {
-        uint32_t v0 = 0, v1 = 0;
-        std::memcpy(&v0, at(uint64_t{static_cast<uint32_t>(in.offset)} * 4), 4);
-        std::memcpy(&v1, at(uint64_t{static_cast<uint32_t>(in.offset1)} * 4), 4);
-        set_word(w, in.dst[0], 0, lane, v0);
-        set_word(w, in.dst[0], 1, lane, v1);
-      } else {
-        throw Error::make(Err::Unsupported, "LDS instruction ", op, " is decoded but not implemented");
       }
+    break;
+  default: L_ladder_5:
+    if (by_lane) {
+            // The address is the instruction's offset, M0's low 20 bits and four bytes a lane.
+            const uint64_t where = uint64_t{static_cast<uint32_t>(in.offset)} + (w.m0 & 0xFFFFF) + 4 * lane;
+            if (op == "ds_store_addtid_b32"_op || op == "ds_write_addtid_b32"_op) {
+              const uint32_t v = lane_src(w, in.src[0], lane);
+              std::memcpy(at(where, 4), &v, 4);
+            } else {
+              uint32_t v = 0;
+              std::memcpy(&v, at(where, 4), 4);
+              write_lane(w, in.dst[0], lane, v);
+            }
+          } else {
+      switch (op.hash()) {
+        case "ds_swizzle_b32"_op.hash:
+          if (!(op == "ds_swizzle_b32"_op)) goto L_ladder_6;
+          {
+              // The same: "thread_valid[j] ? thread_in[j] : 0".
+              const uint32_t from = swizzle_source(static_cast<uint32_t>(in.offset), lane);
+              write_lane(w, in.dst[0], lane, w.exec >> from & 1 ? before[from] : 0);
+            }
+          break;
+        case "ds_add_f32"_op.hash: case "ds_add_rtn_f32"_op.hash: case "ds_min_f32"_op.hash: case "ds_min_rtn_f32"_op.hash: case "ds_max_f32"_op.hash: case "ds_max_rtn_f32"_op.hash:
+          if (!(op == "ds_add_f32"_op || op == "ds_add_rtn_f32"_op || op == "ds_min_f32"_op ||
+                       op == "ds_min_rtn_f32"_op || op == "ds_max_f32"_op || op == "ds_max_rtn_f32"_op)) goto L_ladder_6;
+          {
+              // Float atomics, lane by lane, as the integer ones are; the _rtn
+              // forms hand back what was there.
+              uint32_t was = 0;
+              std::memcpy(&was, at(off), 4);
+              const float a = as_float(was), b = as_float(lane_src(w, in.src[1], lane));
+              const float now = op == "ds_add_f32"_op || op == "ds_add_rtn_f32"_op   ? a + b
+                                : op == "ds_min_f32"_op || op == "ds_min_rtn_f32"_op ? std::fmin(a, b)
+                                                                                     : std::fmax(a, b);
+              std::memcpy(at(off), &now, 4);
+              if (op == "ds_add_rtn_f32"_op || op == "ds_min_rtn_f32"_op || op == "ds_max_rtn_f32"_op)
+                write_lane(w, in.dst[0], lane, was);
+            }
+          break;
+        case "ds_cmpst_b32"_op.hash: case "ds_cmpst_f32"_op.hash: case "ds_cmpst_rtn_f32"_op.hash:
+          if (!(op == "ds_cmpst_b32"_op || op == "ds_cmpst_f32"_op || op == "ds_cmpst_rtn_f32"_op)) goto L_ladder_6;
+          {
+              // The second value is stored where the first is found (compared as
+              // floats for the _f32 forms); the _rtn form hands back what was there.
+              uint32_t was = 0;
+              std::memcpy(&was, at(off), 4);
+              const uint32_t cmp = lane_src(w, in.src[1], lane);
+              const bool equal = op == "ds_cmpst_b32"_op ? was == cmp : as_float(was) == as_float(cmp);
+              if (equal) {
+                const uint32_t v = lane_src(w, in.src[2], lane);
+                std::memcpy(at(off), &v, 4);
+              }
+              if (op == "ds_cmpst_rtn_f32"_op) write_lane(w, in.dst[0], lane, was);
+            }
+          break;
+        case "ds_write_b8"_op.hash: case "ds_write_b16"_op.hash:
+          if (!(op == "ds_write_b8"_op || op == "ds_write_b16"_op)) goto L_ladder_6;
+          {
+              const uint32_t v = lane_src(w, in.src[1], lane);
+              const uint64_t bytes = op == "ds_write_b8"_op ? 1 : 2;
+              std::memcpy(at(off, bytes), &v, bytes);
+            }
+          break;
+        default: L_ladder_6:
+          if (Half h; half_access(std::string_view(in.name).substr(3), &h)) {
+                  uint8_t* p = at(off, h.bytes);
+                  if (h.store) {
+                    const uint32_t v = half_store(lane_src(w, in.src[1], lane), h);
+                    std::memcpy(p, &v, h.bytes);
+                  } else {
+                    uint32_t raw = 0;
+                    std::memcpy(&raw, p, h.bytes);
+                    write_half_load(w, in, in.dst[0], lane, half_load(raw, h), h);
+                  }
+                } else {
+            switch (op.hash()) {
+              case "ds_read_u8"_op.hash: case "ds_read_i8"_op.hash: case "ds_read_u16"_op.hash:
+                if (!(op == "ds_read_u8"_op || op == "ds_read_i8"_op || op == "ds_read_u16"_op)) goto L_ladder_7;
+                {
+                    const uint64_t bytes = op == "ds_read_u16"_op ? 2 : 1;
+                    uint32_t v = 0;
+                    std::memcpy(&v, at(off, bytes), bytes);
+                    if (op == "ds_read_i8"_op) v = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v)));
+                    write_lane(w, in.dst[0], lane, v);
+                  }
+                break;
+              case "ds_write_b64"_op.hash: case "ds_write_b128"_op.hash:
+                if (!(op == "ds_write_b64"_op || op == "ds_write_b128"_op)) goto L_ladder_7;
+                {
+                    const uint32_t words = in.src[1].width;
+                    uint8_t* const a = at(off, 4 * words);
+                    for (uint32_t k = 0; k < words; ++k) {
+                      const uint32_t v = word(w, in.src[1], k, lane);
+                      std::memcpy(a + 4 * k, &v, 4);
+                    }
+                  }
+                break;
+              case "ds_read_b64"_op.hash: case "ds_read_b128"_op.hash:
+                if (!(op == "ds_read_b64"_op || op == "ds_read_b128"_op)) goto L_ladder_7;
+                {
+                    const uint32_t words = in.dst[0].width;
+                    uint8_t* const a = at(off, 4 * words);
+                    for (uint32_t k = 0; k < words; ++k) {
+                      uint32_t v = 0;
+                      std::memcpy(&v, a + 4 * k, 4);
+                      set_word(w, in.dst[0], k, lane, v);
+                    }
+                  }
+                break;
+              case "ds_read2st64_b32"_op.hash:
+                if (!(op == "ds_read2st64_b32"_op)) goto L_ladder_7;
+                {
+                    // Two dwords, each offset by its own count of 64 dwords.
+                    uint32_t v0 = 0, v1 = 0;
+                    std::memcpy(&v0, at(uint64_t{static_cast<uint32_t>(in.offset)} * 64 * 4), 4);
+                    std::memcpy(&v1, at(uint64_t{static_cast<uint32_t>(in.offset1)} * 64 * 4), 4);
+                    set_word(w, in.dst[0], 0, lane, v0);
+                    set_word(w, in.dst[0], 1, lane, v1);
+                  }
+                break;
+              case "ds_sub_u32"_op.hash: case "ds_rsub_u32"_op.hash: case "ds_inc_u32"_op.hash: case "ds_dec_u32"_op.hash: case "ds_sub_rtn_u32"_op.hash: case "ds_rsub_rtn_u32"_op.hash: case "ds_inc_rtn_u32"_op.hash: case "ds_dec_rtn_u32"_op.hash: case "ds_min_rtn_i32"_op.hash: case "ds_max_rtn_i32"_op.hash: case "ds_min_rtn_u32"_op.hash: case "ds_max_rtn_u32"_op.hash: case "ds_and_rtn_b32"_op.hash: case "ds_or_rtn_b32"_op.hash: case "ds_xor_rtn_b32"_op.hash: case "ds_wrxchg_rtn_b32"_op.hash:
+                if (!(op == "ds_sub_u32"_op || op == "ds_rsub_u32"_op || op == "ds_inc_u32"_op || op == "ds_dec_u32"_op ||
+                             op == "ds_sub_rtn_u32"_op || op == "ds_rsub_rtn_u32"_op || op == "ds_inc_rtn_u32"_op ||
+                             op == "ds_dec_rtn_u32"_op || op == "ds_min_rtn_i32"_op || op == "ds_max_rtn_i32"_op ||
+                             op == "ds_min_rtn_u32"_op || op == "ds_max_rtn_u32"_op || op == "ds_and_rtn_b32"_op ||
+                             op == "ds_or_rtn_b32"_op || op == "ds_xor_rtn_b32"_op || op == "ds_wrxchg_rtn_b32"_op)) goto L_ladder_7;
+                {
+                    // The rest of LDS's 32-bit read-modify-writes; the _rtn forms hand
+                    // back what was there.
+                    std::string what(in.name);
+                    const bool rtn = what.find("_rtn") != std::string::npos;
+                    if (rtn) what.erase(what.find("_rtn"), 4);
+                    uint32_t was = 0;
+                    std::memcpy(&was, at(off), 4);
+                    const uint32_t v = lane_src(w, in.src[1], lane);
+                    const int32_t sw = static_cast<int32_t>(was), sv = static_cast<int32_t>(v);
+                    uint32_t now = was;
+                    if (what == "ds_sub_u32") now = was - v;
+                    else if (what == "ds_rsub_u32") now = v - was;
+                    else if (what == "ds_inc_u32") now = was >= v ? 0 : was + 1;
+                    else if (what == "ds_dec_u32") now = was == 0 || was > v ? v : was - 1;
+                    else if (what == "ds_min_i32") now = static_cast<uint32_t>(std::min(sw, sv));
+                    else if (what == "ds_max_i32") now = static_cast<uint32_t>(std::max(sw, sv));
+                    else if (what == "ds_min_u32") now = std::min(was, v);
+                    else if (what == "ds_max_u32") now = std::max(was, v);
+                    else if (what == "ds_and_b32") now = was & v;
+                    else if (what == "ds_or_b32") now = was | v;
+                    else if (what == "ds_xor_b32") now = was ^ v;
+                    else if (what == "ds_wrxchg_b32") now = v;
+                    std::memcpy(at(off), &now, 4);
+                    if (rtn) write_lane(w, in.dst[0], lane, was);
+                  }
+                break;
+              case "ds_min_i32"_op.hash: case "ds_min_u32"_op.hash: case "ds_max_u32"_op.hash: case "ds_and_b32"_op.hash: case "ds_or_b32"_op.hash: case "ds_add_rtn_u32"_op.hash:
+                if (!(op == "ds_min_i32"_op || op == "ds_min_u32"_op || op == "ds_max_u32"_op || op == "ds_and_b32"_op ||
+                             op == "ds_or_b32"_op || op == "ds_add_rtn_u32"_op)) goto L_ladder_7;
+                {
+                    uint32_t was = 0;
+                    std::memcpy(&was, at(off), 4);
+                    const uint32_t v = lane_src(w, in.src[1], lane);
+                    const uint32_t now = op == "ds_min_i32"_op ? static_cast<uint32_t>(std::min(static_cast<int32_t>(was), static_cast<int32_t>(v)))
+                                         : op == "ds_min_u32"_op ? std::min(was, v)
+                                         : op == "ds_max_u32"_op ? std::max(was, v)
+                                         : op == "ds_and_b32"_op ? was & v
+                                         : op == "ds_or_b32"_op  ? was | v
+                                                                 : was + v;
+                    std::memcpy(at(off), &now, 4);
+                    if (op == "ds_add_rtn_u32"_op) write_lane(w, in.dst[0], lane, was);
+                  }
+                break;
+              case "ds_cmpst_rtn_b32"_op.hash:
+                if (!(op == "ds_cmpst_rtn_b32"_op)) goto L_ladder_7;
+                {
+                    // The second value is stored where the first is found; either way
+                    // the lane is told what was there.
+                    uint32_t was = 0;
+                    std::memcpy(&was, at(off), 4);
+                    if (was == lane_src(w, in.src[1], lane)) {
+                      const uint32_t v = lane_src(w, in.src[2], lane);
+                      std::memcpy(at(off), &v, 4);
+                    }
+                    write_lane(w, in.dst[0], lane, was);
+                  }
+                break;
+              case "ds_cmpst_rtn_b64"_op.hash:
+                if (!(op == "ds_cmpst_rtn_b64"_op)) goto L_ladder_7;
+                {
+                    uint64_t was = 0;
+                    std::memcpy(&was, at(off, 8), 8);
+                    if (was == lane_src64(w, in.src[1], lane)) {
+                      const uint64_t v = lane_src64(w, in.src[2], lane);
+                      std::memcpy(at(off, 8), &v, 8);
+                    }
+                    write_lane64(w, in.dst[0], lane, was);
+                  }
+                break;
+              case "ds_write_b96"_op.hash:
+                if (!(op == "ds_write_b96"_op)) goto L_ladder_7;
+                {
+                    uint8_t* const a = at(off, 12);
+                    for (uint32_t k = 0; k < 3; ++k) {
+                      const uint32_t v = word(w, in.src[1], k, lane);
+                      std::memcpy(a + 4 * k, &v, 4);
+                    }
+                  }
+                break;
+              case "ds_read_i16"_op.hash:
+                if (!(op == "ds_read_i16"_op)) goto L_ladder_7;
+                {
+                    int16_t v = 0;
+                    std::memcpy(&v, at(off, 2), 2);
+                    write_lane(w, in.dst[0], lane, static_cast<uint32_t>(static_cast<int32_t>(v)));
+                  }
+                break;
+              case "ds_add_u64"_op.hash: case "ds_sub_u64"_op.hash: case "ds_rsub_u64"_op.hash: case "ds_inc_u64"_op.hash: case "ds_dec_u64"_op.hash: case "ds_min_i64"_op.hash: case "ds_max_i64"_op.hash: case "ds_min_u64"_op.hash: case "ds_max_u64"_op.hash: case "ds_and_b64"_op.hash: case "ds_or_b64"_op.hash: case "ds_xor_b64"_op.hash: case "ds_add_f64"_op.hash: case "ds_min_f64"_op.hash: case "ds_max_f64"_op.hash: case "ds_add_rtn_u64"_op.hash: case "ds_sub_rtn_u64"_op.hash: case "ds_rsub_rtn_u64"_op.hash: case "ds_inc_rtn_u64"_op.hash: case "ds_dec_rtn_u64"_op.hash: case "ds_min_rtn_i64"_op.hash: case "ds_max_rtn_i64"_op.hash: case "ds_min_rtn_u64"_op.hash: case "ds_max_rtn_u64"_op.hash: case "ds_and_rtn_b64"_op.hash: case "ds_or_rtn_b64"_op.hash: case "ds_xor_rtn_b64"_op.hash: case "ds_wrxchg_rtn_b64"_op.hash: case "ds_min_rtn_f64"_op.hash: case "ds_max_rtn_f64"_op.hash: case "ds_add_rtn_f64"_op.hash:
+                if (!(op == "ds_add_u64"_op ||
+                             op == "ds_sub_u64"_op ||
+                             op == "ds_rsub_u64"_op ||
+                             op == "ds_inc_u64"_op ||
+                             op == "ds_dec_u64"_op ||
+                             op == "ds_min_i64"_op ||
+                             op == "ds_max_i64"_op ||
+                             op == "ds_min_u64"_op ||
+                             op == "ds_max_u64"_op ||
+                             op == "ds_and_b64"_op ||
+                             op == "ds_or_b64"_op ||
+                             op == "ds_xor_b64"_op ||
+                             op == "ds_add_f64"_op ||
+                             op == "ds_min_f64"_op ||
+                             op == "ds_max_f64"_op ||
+                             op == "ds_add_rtn_u64"_op ||
+                             op == "ds_sub_rtn_u64"_op ||
+                             op == "ds_rsub_rtn_u64"_op ||
+                             op == "ds_inc_rtn_u64"_op ||
+                             op == "ds_dec_rtn_u64"_op ||
+                             op == "ds_min_rtn_i64"_op ||
+                             op == "ds_max_rtn_i64"_op ||
+                             op == "ds_min_rtn_u64"_op ||
+                             op == "ds_max_rtn_u64"_op ||
+                             op == "ds_and_rtn_b64"_op ||
+                             op == "ds_or_rtn_b64"_op ||
+                             op == "ds_xor_rtn_b64"_op ||
+                             op == "ds_wrxchg_rtn_b64"_op ||
+                             op == "ds_min_rtn_f64"_op ||
+                             op == "ds_max_rtn_f64"_op || op == "ds_add_rtn_f64"_op)) goto L_ladder_7;
+                {
+                    // LDS's 64-bit read-modify-writes; the _rtn forms hand back what
+                    // was there.
+                    std::string what(in.name);
+                    const bool rtn = what.find("_rtn") != std::string::npos;
+                    if (rtn) what.erase(what.find("_rtn"), 4);
+                    uint64_t was = 0;
+                    std::memcpy(&was, at(off, 8), 8);
+                    const uint64_t v = lane_src64(w, in.src[1], lane);
+                    const int64_t sw = static_cast<int64_t>(was), sv = static_cast<int64_t>(v);
+                    uint64_t now = was;
+                    if (what == "ds_add_u64") now = was + v;
+                    else if (what == "ds_sub_u64") now = was - v;
+                    else if (what == "ds_rsub_u64") now = v - was;
+                    else if (what == "ds_inc_u64") now = was >= v ? 0 : was + 1;
+                    else if (what == "ds_dec_u64") now = was == 0 || was > v ? v : was - 1;
+                    else if (what == "ds_min_i64") now = static_cast<uint64_t>(std::min(sw, sv));
+                    else if (what == "ds_max_i64") now = static_cast<uint64_t>(std::max(sw, sv));
+                    else if (what == "ds_min_u64") now = std::min(was, v);
+                    else if (what == "ds_max_u64") now = std::max(was, v);
+                    else if (what == "ds_and_b64") now = was & v;
+                    else if (what == "ds_or_b64") now = was | v;
+                    else if (what == "ds_xor_b64") now = was ^ v;
+                    else if (what == "ds_wrxchg_b64") now = v;
+                    else if (what == "ds_add_f64") now = as_bits(as_double(was) + as_double(v));
+                    else if (what == "ds_min_f64") now = as_bits(std::fmin(as_double(was), as_double(v)));
+                    else if (what == "ds_max_f64") now = as_bits(std::fmax(as_double(was), as_double(v)));
+                    std::memcpy(at(off, 8), &now, 8);
+                    if (rtn) write_lane64(w, in.dst[0], lane, was);
+                  }
+                break;
+              case "ds_xor_b32"_op.hash: case "ds_max_i32"_op.hash:
+                if (!(op == "ds_xor_b32"_op || op == "ds_max_i32"_op)) goto L_ladder_7;
+                {
+                    uint32_t before = 0;
+                    std::memcpy(&before, at(static_cast<uint64_t>(in.offset)), 4);
+                    const uint32_t v = lane_src(w, in.src[1], lane);
+                    const uint32_t after = op == "ds_xor_b32"_op
+                                               ? before ^ v
+                                               : static_cast<uint32_t>(std::max(static_cast<int32_t>(before),
+                                                                                static_cast<int32_t>(v)));
+                    std::memcpy(at(static_cast<uint64_t>(in.offset)), &after, 4);
+                  }
+                break;
+              case "ds_write2_b32"_op.hash:
+                if (!(op == "ds_write2_b32"_op)) goto L_ladder_7;
+                {
+                    // Two words, each at its own offset, counted in words.
+                    const uint32_t v0 = lane_src(w, in.src[1], lane), v1 = lane_src(w, in.src[2], lane);
+                    std::memcpy(at(uint64_t{static_cast<uint32_t>(in.offset)} * 4), &v0, 4);
+                    std::memcpy(at(uint64_t{static_cast<uint32_t>(in.offset1)} * 4), &v1, 4);
+                  }
+                break;
+              case "ds_write2st64_b32"_op.hash: case "ds_write2_b64"_op.hash: case "ds_write2st64_b64"_op.hash:
+                if (!(op == "ds_write2st64_b32"_op || op == "ds_write2_b64"_op || op == "ds_write2st64_b64"_op)) goto L_ladder_7;
+                {
+                    // Two values at two offsets, counted in values -- or, for the st64
+                    // forms, in 64s of them.
+                    const uint32_t words = in.src[1].width;
+                    const uint64_t unit = 4 * words * (op == "ds_write2_b64"_op ? 1 : 64);
+                    uint8_t* const a0 = at(uint64_t{static_cast<uint32_t>(in.offset)} * unit, 4 * words);
+                    uint8_t* const a1 = at(uint64_t{static_cast<uint32_t>(in.offset1)} * unit, 4 * words);
+                    for (uint32_t k = 0; k < words; ++k) {
+                      const uint32_t v0 = word(w, in.src[1], k, lane), v1 = word(w, in.src[2], k, lane);
+                      std::memcpy(a0 + 4 * k, &v0, 4);
+                      std::memcpy(a1 + 4 * k, &v1, 4);
+                    }
+                  }
+                break;
+              case "ds_read2_b64"_op.hash: case "ds_read2st64_b64"_op.hash:
+                if (!(op == "ds_read2_b64"_op || op == "ds_read2st64_b64"_op)) goto L_ladder_7;
+                {
+                    const uint64_t unit = 8 * (op == "ds_read2_b64"_op ? 1 : 64);
+                    uint8_t* const a0 = at(uint64_t{static_cast<uint32_t>(in.offset)} * unit, 8);
+                    uint8_t* const a1 = at(uint64_t{static_cast<uint32_t>(in.offset1)} * unit, 8);
+                    uint32_t v[4];
+                    std::memcpy(&v[0], a0, 8);
+                    std::memcpy(&v[2], a1, 8);
+                    for (uint32_t k = 0; k < 4; ++k) set_word(w, in.dst[0], k, lane, v[k]);
+                  }
+                break;
+              case "ds_read_b96"_op.hash:
+                if (!(op == "ds_read_b96"_op)) goto L_ladder_7;
+                {
+                    uint8_t* const a = at(off, 12);
+                    for (uint32_t k = 0; k < 3; ++k) {
+                      uint32_t v = 0;
+                      std::memcpy(&v, a + 4 * k, 4);
+                      set_word(w, in.dst[0], k, lane, v);
+                    }
+                  }
+                break;
+              case "ds_read2_b32"_op.hash:
+                if (!(op == "ds_read2_b32"_op)) goto L_ladder_7;
+                {
+                    uint32_t v0 = 0, v1 = 0;
+                    std::memcpy(&v0, at(uint64_t{static_cast<uint32_t>(in.offset)} * 4), 4);
+                    std::memcpy(&v1, at(uint64_t{static_cast<uint32_t>(in.offset1)} * 4), 4);
+                    set_word(w, in.dst[0], 0, lane, v0);
+                    set_word(w, in.dst[0], 1, lane, v1);
+                  }
+                break;
+              default: L_ladder_7:
+                {
+                        throw Error::make(Err::Unsupported, "LDS instruction ", op, " is decoded but not implemented");
+                      }
+                break;
+            }
+          }
+          break;
+      }
+    }
+    break;
+}
     }
   }
 
@@ -5632,7 +7420,7 @@ struct Machine {
 
   // A work-item's private memory, which a kernel spills into.
   void scratch_access(Wave& w, const Inst& in, Group& g) {
-    const OpName op(in.name);
+    const OpName op(in);
     const uint32_t words = op.rfind("scratch_store", 0) == 0 ? in.src[1].width : in.dst[0].width;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
@@ -6669,12 +8457,15 @@ struct Machine {
                                   : kind == Kind::Store   ? 4 * in.src[1].width
                                   : kind == Kind::StoreHi16 ? 2
                                                             : atomic.bytes;
+    // (The scalar base is the same for every lane, and nothing in the loop writes a scalar register; EXEC is not
+    // zero here, so a base that cannot be read was going to fail on the first lane just the same.)
+    const uint64_t saddr_base = in.has_saddr ? scalar_field(w, in.saddr, true) : 0;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // The address is a 64-bit one in a register pair, or a scalar base with
       // a 32-bit offset per lane.
       const uint64_t offset_reg = in.has_saddr ? scaled_offset(in, lane_src(w, in.src[0], lane), access_bytes) : 0;
-      const uint64_t addr = (in.has_saddr ? scalar_field(w, in.saddr, true) + offset_reg
+      const uint64_t addr = (in.has_saddr ? saddr_base + offset_reg
                                           : lane_src64(w, in.src[0], lane)) +
                             static_cast<uint64_t>(static_cast<int64_t>(in.offset));
       switch (kind) {
@@ -6878,25 +8669,82 @@ struct Machine {
                           {32, 32, 16, 1, 'e', 'f', 'g'},
                           {32, 32, 16, 1, 'e', 'f', 'e'}};
     // The 8-bit float forms, named for A's type then B's.
-    if (op == "v_mfma_f32_16x16x32_bf8_bf8"_op) return &f8_16x16x32[0];
-    if (op == "v_mfma_f32_16x16x32_bf8_fp8"_op) return &f8_16x16x32[1];
-    if (op == "v_mfma_f32_16x16x32_fp8_bf8"_op) return &f8_16x16x32[2];
-    if (op == "v_mfma_f32_16x16x32_fp8_fp8"_op) return &f8_16x16x32[3];
-    if (op == "v_mfma_f32_32x32x16_bf8_bf8"_op) return &f8_32x32x16[0];
-    if (op == "v_mfma_f32_32x32x16_bf8_fp8"_op) return &f8_32x32x16[1];
-    if (op == "v_mfma_f32_32x32x16_fp8_bf8"_op) return &f8_32x32x16[2];
-    if (op == "v_mfma_f32_32x32x16_fp8_fp8"_op) return &f8_32x32x16[3];
-    if (op == "v_mfma_f32_16x16x16_f16"_op) return &f16_16x16x16;
-    // The reduced-precision float forms (gfx940 to gfx942): a float's mantissa cut to 10 bits.
-    if (op == "v_mfma_f32_16x16x8_xf32"_op) return &xf32_16x16x8;
-    if (op == "v_mfma_f32_32x32x4_xf32"_op) return &xf32_32x32x4;
-    if (op == "v_mfma_f32_16x16x4_f32"_op) return &f32_16x16x4;
-    if (op == "v_mfma_f32_32x32x2_f32"_op) return &f32_32x32x2;
-    if (op == "v_mfma_f32_16x16x1_4b_f32"_op) return &f32_16x16x1_4b;
-    if (op == "v_mfma_f32_4x4x1_16b_f32"_op) return &f32_4x4x1_16b;
-    if (op == "v_mfma_f32_32x32x1_2b_f32"_op) return &f32_32x32x1_2b;
-    if (op == "v_mfma_f64_16x16x4_f64"_op) return &f64_16x16x4;
-    if (op == "v_mfma_f32_16x16x16_bf16"_op) return &bf16_16x16x16;
+    switch (op.hash()) {
+  case "v_mfma_f32_16x16x32_bf8_bf8"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x32_bf8_bf8"_op)) goto L_ladder_4;
+    {return &f8_16x16x32[0];}
+    break;
+  case "v_mfma_f32_16x16x32_bf8_fp8"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x32_bf8_fp8"_op)) goto L_ladder_4;
+    {return &f8_16x16x32[1];}
+    break;
+  case "v_mfma_f32_16x16x32_fp8_bf8"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x32_fp8_bf8"_op)) goto L_ladder_4;
+    {return &f8_16x16x32[2];}
+    break;
+  case "v_mfma_f32_16x16x32_fp8_fp8"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x32_fp8_fp8"_op)) goto L_ladder_4;
+    {return &f8_16x16x32[3];}
+    break;
+  case "v_mfma_f32_32x32x16_bf8_bf8"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x16_bf8_bf8"_op)) goto L_ladder_4;
+    {return &f8_32x32x16[0];}
+    break;
+  case "v_mfma_f32_32x32x16_bf8_fp8"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x16_bf8_fp8"_op)) goto L_ladder_4;
+    {return &f8_32x32x16[1];}
+    break;
+  case "v_mfma_f32_32x32x16_fp8_bf8"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x16_fp8_bf8"_op)) goto L_ladder_4;
+    {return &f8_32x32x16[2];}
+    break;
+  case "v_mfma_f32_32x32x16_fp8_fp8"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x16_fp8_fp8"_op)) goto L_ladder_4;
+    {return &f8_32x32x16[3];}
+    break;
+  case "v_mfma_f32_16x16x16_f16"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x16_f16"_op)) goto L_ladder_4;
+    {return &f16_16x16x16;}
+    break;
+  // The reduced-precision float forms (gfx940 to gfx942): a float's mantissa cut to 10 bits.
+  case "v_mfma_f32_16x16x8_xf32"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x8_xf32"_op)) goto L_ladder_4;
+    {return &xf32_16x16x8;}
+    break;
+  case "v_mfma_f32_32x32x4_xf32"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x4_xf32"_op)) goto L_ladder_4;
+    {return &xf32_32x32x4;}
+    break;
+  case "v_mfma_f32_16x16x4_f32"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x4_f32"_op)) goto L_ladder_4;
+    {return &f32_16x16x4;}
+    break;
+  case "v_mfma_f32_32x32x2_f32"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x2_f32"_op)) goto L_ladder_4;
+    {return &f32_32x32x2;}
+    break;
+  case "v_mfma_f32_16x16x1_4b_f32"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x1_4b_f32"_op)) goto L_ladder_4;
+    {return &f32_16x16x1_4b;}
+    break;
+  case "v_mfma_f32_4x4x1_16b_f32"_op.hash:
+    if (!(op == "v_mfma_f32_4x4x1_16b_f32"_op)) goto L_ladder_4;
+    {return &f32_4x4x1_16b;}
+    break;
+  case "v_mfma_f32_32x32x1_2b_f32"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x1_2b_f32"_op)) goto L_ladder_4;
+    {return &f32_32x32x1_2b;}
+    break;
+  case "v_mfma_f64_16x16x4_f64"_op.hash:
+    if (!(op == "v_mfma_f64_16x16x4_f64"_op)) goto L_ladder_4;
+    {return &f64_16x16x4;}
+    break;
+  case "v_mfma_f32_16x16x16_bf16"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x16_bf16"_op)) goto L_ladder_4;
+    {return &bf16_16x16x16;}
+    break;
+  default: L_ladder_4: break;
+}
     // gfx950's, with K doubled.
     static const MatrixShape f16_16x16x32{16, 16, 32, 1, 'h', 'f'}, f16_32x32x16{32, 32, 16, 1, 'h', 'f'},
         bf16_16x16x32{16, 16, 32, 1, 'b', 'f'}, bf16_32x32x16{32, 32, 16, 1, 'b', 'f'},
@@ -6911,30 +8759,105 @@ struct Machine {
         bf16_32x32x4_2b{32, 32, 4, 2, 'b', 'f'};
     static const MatrixShape f16_32x32x4_2b{32, 32, 4, 2, 'h', 'f'}, i8_32x32x4_2b{32, 32, 4, 2, 'c', 'i'},
         i8_16x16x4_4b{16, 16, 4, 4, 'c', 'i'}, i8_4x4x4_16b{4, 4, 4, 16, 'c', 'i'};
-    if (op == "v_mfma_f32_32x32x4_2b_f16"_op) return &f16_32x32x4_2b;
-    if (op == "v_mfma_i32_32x32x4_2b_i8"_op) return &i8_32x32x4_2b;
-    if (op == "v_mfma_i32_16x16x4_4b_i8"_op) return &i8_16x16x4_4b;
-    if (op == "v_mfma_i32_4x4x4_16b_i8"_op) return &i8_4x4x4_16b;
-    if (op == "v_mfma_i32_32x32x8_i8"_op) return &i8_32x32x8;
-    if (op == "v_mfma_i32_16x16x16_i8"_op) return &i8_16x16x16;
-    if (op == "v_mfma_f32_32x32x2bf16"_op) return &bf16_32x32x2;
-    if (op == "v_mfma_f32_16x16x2bf16"_op) return &bf16_16x16x2;
-    if (op == "v_mfma_f32_4x4x2bf16"_op) return &bf16_4x4x2;
-    if (op == "v_mfma_f32_32x32x4bf16"_op) return &bf16_32x32x4;
-    if (op == "v_mfma_f32_16x16x8bf16"_op) return &bf16_16x16x8;
-    if (op == "v_mfma_f32_32x32x4_2b_bf16"_op) return &bf16_32x32x4_2b;
-    if (op == "v_mfma_i32_16x16x64_i8"_op) return &i8_16x16x64;
-    if (op == "v_mfma_i32_32x32x32_i8"_op) return &i8_32x32x32;
-    if (op == "v_mfma_f32_16x16x128_f8f6f4"_op) return &f8f6f4_16x16x128;
-    if (op == "v_mfma_f32_32x32x64_f8f6f4"_op) return &f8f6f4_32x32x64;
-    if (op == "v_mfma_f32_16x16x32_f16"_op) return &f16_16x16x32;
-    if (op == "v_mfma_f32_32x32x16_f16"_op) return &f16_32x32x16;
-    if (op == "v_mfma_f32_16x16x32_bf16"_op) return &bf16_16x16x32;
-    if (op == "v_mfma_f32_32x32x16_bf16"_op) return &bf16_32x32x16;
-    if (op == "v_mfma_f32_32x32x8_f16"_op) return &f16_32x32x8;
-    if (op == "v_mfma_f32_32x32x8_bf16"_op) return &bf16_32x32x8;
-    if (op == "v_mfma_i32_32x32x16_i8"_op) return &i8_32x32x16;
-    if (op == "v_mfma_i32_16x16x32_i8"_op) return &i8_16x16x32;
+    switch (op.hash()) {
+  case "v_mfma_f32_32x32x4_2b_f16"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x4_2b_f16"_op)) goto L_ladder_3;
+    {return &f16_32x32x4_2b;}
+    break;
+  case "v_mfma_i32_32x32x4_2b_i8"_op.hash:
+    if (!(op == "v_mfma_i32_32x32x4_2b_i8"_op)) goto L_ladder_3;
+    {return &i8_32x32x4_2b;}
+    break;
+  case "v_mfma_i32_16x16x4_4b_i8"_op.hash:
+    if (!(op == "v_mfma_i32_16x16x4_4b_i8"_op)) goto L_ladder_3;
+    {return &i8_16x16x4_4b;}
+    break;
+  case "v_mfma_i32_4x4x4_16b_i8"_op.hash:
+    if (!(op == "v_mfma_i32_4x4x4_16b_i8"_op)) goto L_ladder_3;
+    {return &i8_4x4x4_16b;}
+    break;
+  case "v_mfma_i32_32x32x8_i8"_op.hash:
+    if (!(op == "v_mfma_i32_32x32x8_i8"_op)) goto L_ladder_3;
+    {return &i8_32x32x8;}
+    break;
+  case "v_mfma_i32_16x16x16_i8"_op.hash:
+    if (!(op == "v_mfma_i32_16x16x16_i8"_op)) goto L_ladder_3;
+    {return &i8_16x16x16;}
+    break;
+  case "v_mfma_f32_32x32x2bf16"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x2bf16"_op)) goto L_ladder_3;
+    {return &bf16_32x32x2;}
+    break;
+  case "v_mfma_f32_16x16x2bf16"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x2bf16"_op)) goto L_ladder_3;
+    {return &bf16_16x16x2;}
+    break;
+  case "v_mfma_f32_4x4x2bf16"_op.hash:
+    if (!(op == "v_mfma_f32_4x4x2bf16"_op)) goto L_ladder_3;
+    {return &bf16_4x4x2;}
+    break;
+  case "v_mfma_f32_32x32x4bf16"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x4bf16"_op)) goto L_ladder_3;
+    {return &bf16_32x32x4;}
+    break;
+  case "v_mfma_f32_16x16x8bf16"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x8bf16"_op)) goto L_ladder_3;
+    {return &bf16_16x16x8;}
+    break;
+  case "v_mfma_f32_32x32x4_2b_bf16"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x4_2b_bf16"_op)) goto L_ladder_3;
+    {return &bf16_32x32x4_2b;}
+    break;
+  case "v_mfma_i32_16x16x64_i8"_op.hash:
+    if (!(op == "v_mfma_i32_16x16x64_i8"_op)) goto L_ladder_3;
+    {return &i8_16x16x64;}
+    break;
+  case "v_mfma_i32_32x32x32_i8"_op.hash:
+    if (!(op == "v_mfma_i32_32x32x32_i8"_op)) goto L_ladder_3;
+    {return &i8_32x32x32;}
+    break;
+  case "v_mfma_f32_16x16x128_f8f6f4"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x128_f8f6f4"_op)) goto L_ladder_3;
+    {return &f8f6f4_16x16x128;}
+    break;
+  case "v_mfma_f32_32x32x64_f8f6f4"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x64_f8f6f4"_op)) goto L_ladder_3;
+    {return &f8f6f4_32x32x64;}
+    break;
+  case "v_mfma_f32_16x16x32_f16"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x32_f16"_op)) goto L_ladder_3;
+    {return &f16_16x16x32;}
+    break;
+  case "v_mfma_f32_32x32x16_f16"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x16_f16"_op)) goto L_ladder_3;
+    {return &f16_32x32x16;}
+    break;
+  case "v_mfma_f32_16x16x32_bf16"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x32_bf16"_op)) goto L_ladder_3;
+    {return &bf16_16x16x32;}
+    break;
+  case "v_mfma_f32_32x32x16_bf16"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x16_bf16"_op)) goto L_ladder_3;
+    {return &bf16_32x32x16;}
+    break;
+  case "v_mfma_f32_32x32x8_f16"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x8_f16"_op)) goto L_ladder_3;
+    {return &f16_32x32x8;}
+    break;
+  case "v_mfma_f32_32x32x8_bf16"_op.hash:
+    if (!(op == "v_mfma_f32_32x32x8_bf16"_op)) goto L_ladder_3;
+    {return &bf16_32x32x8;}
+    break;
+  case "v_mfma_i32_32x32x16_i8"_op.hash:
+    if (!(op == "v_mfma_i32_32x32x16_i8"_op)) goto L_ladder_3;
+    {return &i8_32x32x16;}
+    break;
+  case "v_mfma_i32_16x16x32_i8"_op.hash:
+    if (!(op == "v_mfma_i32_16x16x32_i8"_op)) goto L_ladder_3;
+    {return &i8_16x16x32;}
+    break;
+  default: L_ladder_3: break;
+}
     // The sparse forms, by the dense product each works out: A 2:4 sparse
     // along the K here, the lanes and output placed as a dense one's.
     static const MatrixShape f8_16x16x64[4] = {{16, 16, 64, 1, 'g', 'f', 'g'},
@@ -6956,38 +8879,137 @@ struct Machine {
                              f16_16x16x64{16, 16, 64, 1, 'h', 'f'}, f16_32x32x32{32, 32, 32, 1, 'h', 'f'},
                              bf16_16x16x64{16, 16, 64, 1, 'b', 'f'}, bf16_32x32x32{32, 32, 32, 1, 'b', 'f'},
                              i8_16x16x128{16, 16, 128, 1, 'c', 'i'}, i8_32x32x64{32, 32, 64, 1, 'c', 'i'};
-    if (op == "v_smfmac_f32_16x16x32_f16"_op) return &f16_16x16x32;
-    if (op == "v_smfmac_f32_32x32x16_f16"_op) return &f16_32x32x16;
-    if (op == "v_smfmac_f32_16x16x32_bf16"_op) return &bf16_16x16x32;
-    if (op == "v_smfmac_f32_32x32x16_bf16"_op) return &bf16_32x32x16;
-    if (op == "v_smfmac_i32_16x16x64_i8"_op) return &i8_16x16x64;
-    if (op == "v_smfmac_i32_32x32x32_i8"_op) return &i8_32x32x32;
-    if (op == "v_smfmac_f32_16x16x64_bf8_bf8"_op) return &f8_16x16x64[0];
-    if (op == "v_smfmac_f32_16x16x64_bf8_fp8"_op) return &f8_16x16x64[1];
-    if (op == "v_smfmac_f32_16x16x64_fp8_bf8"_op) return &f8_16x16x64[2];
-    if (op == "v_smfmac_f32_16x16x64_fp8_fp8"_op) return &f8_16x16x64[3];
-    if (op == "v_smfmac_f32_32x32x32_bf8_bf8"_op) return &f8_32x32x32[0];
-    if (op == "v_smfmac_f32_32x32x32_bf8_fp8"_op) return &f8_32x32x32[1];
-    if (op == "v_smfmac_f32_32x32x32_fp8_bf8"_op) return &f8_32x32x32[2];
-    if (op == "v_smfmac_f32_32x32x32_fp8_fp8"_op) return &f8_32x32x32[3];
-    if (op == "v_smfmac_f32_16x16x64_f16"_op) return &f16_16x16x64;
-    if (op == "v_smfmac_f32_32x32x32_f16"_op) return &f16_32x32x32;
-    if (op == "v_smfmac_f32_16x16x64_bf16"_op) return &bf16_16x16x64;
-    if (op == "v_smfmac_f32_32x32x32_bf16"_op) return &bf16_32x32x32;
-    if (op == "v_smfmac_i32_16x16x128_i8"_op) return &i8_16x16x128;
-    if (op == "v_smfmac_i32_32x32x64_i8"_op) return &i8_32x32x64;
-    if (op == "v_smfmac_f32_16x16x128_bf8_bf8"_op) return &f8_16x16x128[0];
-    if (op == "v_smfmac_f32_16x16x128_bf8_fp8"_op) return &f8_16x16x128[1];
-    if (op == "v_smfmac_f32_16x16x128_fp8_bf8"_op) return &f8_16x16x128[2];
-    if (op == "v_smfmac_f32_16x16x128_fp8_fp8"_op) return &f8_16x16x128[3];
-    if (op == "v_smfmac_f32_32x32x64_bf8_bf8"_op) return &f8_32x32x64[0];
-    if (op == "v_smfmac_f32_32x32x64_bf8_fp8"_op) return &f8_32x32x64[1];
-    if (op == "v_smfmac_f32_32x32x64_fp8_bf8"_op) return &f8_32x32x64[2];
-    if (op == "v_smfmac_f32_32x32x64_fp8_fp8"_op) return &f8_32x32x64[3];
-    if (op == "v_mfma_f32_4x4x4_16b_f16"_op) return &f16_4x4x4_16b;
-    if (op == "v_mfma_f32_4x4x4_16b_bf16"_op) return &bf16_4x4x4_16b;
-    if (op == "v_mfma_f32_16x16x4_4b_f16"_op) return &f16_16x16x4_4b;
-    if (op == "v_mfma_f32_16x16x4_4b_bf16"_op) return &bf16_16x16x4_4b;
+    switch (op.hash()) {
+  case "v_smfmac_f32_16x16x32_f16"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x32_f16"_op)) goto L_ladder_2;
+    {return &f16_16x16x32;}
+    break;
+  case "v_smfmac_f32_32x32x16_f16"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x16_f16"_op)) goto L_ladder_2;
+    {return &f16_32x32x16;}
+    break;
+  case "v_smfmac_f32_16x16x32_bf16"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x32_bf16"_op)) goto L_ladder_2;
+    {return &bf16_16x16x32;}
+    break;
+  case "v_smfmac_f32_32x32x16_bf16"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x16_bf16"_op)) goto L_ladder_2;
+    {return &bf16_32x32x16;}
+    break;
+  case "v_smfmac_i32_16x16x64_i8"_op.hash:
+    if (!(op == "v_smfmac_i32_16x16x64_i8"_op)) goto L_ladder_2;
+    {return &i8_16x16x64;}
+    break;
+  case "v_smfmac_i32_32x32x32_i8"_op.hash:
+    if (!(op == "v_smfmac_i32_32x32x32_i8"_op)) goto L_ladder_2;
+    {return &i8_32x32x32;}
+    break;
+  case "v_smfmac_f32_16x16x64_bf8_bf8"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x64_bf8_bf8"_op)) goto L_ladder_2;
+    {return &f8_16x16x64[0];}
+    break;
+  case "v_smfmac_f32_16x16x64_bf8_fp8"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x64_bf8_fp8"_op)) goto L_ladder_2;
+    {return &f8_16x16x64[1];}
+    break;
+  case "v_smfmac_f32_16x16x64_fp8_bf8"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x64_fp8_bf8"_op)) goto L_ladder_2;
+    {return &f8_16x16x64[2];}
+    break;
+  case "v_smfmac_f32_16x16x64_fp8_fp8"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x64_fp8_fp8"_op)) goto L_ladder_2;
+    {return &f8_16x16x64[3];}
+    break;
+  case "v_smfmac_f32_32x32x32_bf8_bf8"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x32_bf8_bf8"_op)) goto L_ladder_2;
+    {return &f8_32x32x32[0];}
+    break;
+  case "v_smfmac_f32_32x32x32_bf8_fp8"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x32_bf8_fp8"_op)) goto L_ladder_2;
+    {return &f8_32x32x32[1];}
+    break;
+  case "v_smfmac_f32_32x32x32_fp8_bf8"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x32_fp8_bf8"_op)) goto L_ladder_2;
+    {return &f8_32x32x32[2];}
+    break;
+  case "v_smfmac_f32_32x32x32_fp8_fp8"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x32_fp8_fp8"_op)) goto L_ladder_2;
+    {return &f8_32x32x32[3];}
+    break;
+  case "v_smfmac_f32_16x16x64_f16"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x64_f16"_op)) goto L_ladder_2;
+    {return &f16_16x16x64;}
+    break;
+  case "v_smfmac_f32_32x32x32_f16"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x32_f16"_op)) goto L_ladder_2;
+    {return &f16_32x32x32;}
+    break;
+  case "v_smfmac_f32_16x16x64_bf16"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x64_bf16"_op)) goto L_ladder_2;
+    {return &bf16_16x16x64;}
+    break;
+  case "v_smfmac_f32_32x32x32_bf16"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x32_bf16"_op)) goto L_ladder_2;
+    {return &bf16_32x32x32;}
+    break;
+  case "v_smfmac_i32_16x16x128_i8"_op.hash:
+    if (!(op == "v_smfmac_i32_16x16x128_i8"_op)) goto L_ladder_2;
+    {return &i8_16x16x128;}
+    break;
+  case "v_smfmac_i32_32x32x64_i8"_op.hash:
+    if (!(op == "v_smfmac_i32_32x32x64_i8"_op)) goto L_ladder_2;
+    {return &i8_32x32x64;}
+    break;
+  case "v_smfmac_f32_16x16x128_bf8_bf8"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x128_bf8_bf8"_op)) goto L_ladder_2;
+    {return &f8_16x16x128[0];}
+    break;
+  case "v_smfmac_f32_16x16x128_bf8_fp8"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x128_bf8_fp8"_op)) goto L_ladder_2;
+    {return &f8_16x16x128[1];}
+    break;
+  case "v_smfmac_f32_16x16x128_fp8_bf8"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x128_fp8_bf8"_op)) goto L_ladder_2;
+    {return &f8_16x16x128[2];}
+    break;
+  case "v_smfmac_f32_16x16x128_fp8_fp8"_op.hash:
+    if (!(op == "v_smfmac_f32_16x16x128_fp8_fp8"_op)) goto L_ladder_2;
+    {return &f8_16x16x128[3];}
+    break;
+  case "v_smfmac_f32_32x32x64_bf8_bf8"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x64_bf8_bf8"_op)) goto L_ladder_2;
+    {return &f8_32x32x64[0];}
+    break;
+  case "v_smfmac_f32_32x32x64_bf8_fp8"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x64_bf8_fp8"_op)) goto L_ladder_2;
+    {return &f8_32x32x64[1];}
+    break;
+  case "v_smfmac_f32_32x32x64_fp8_bf8"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x64_fp8_bf8"_op)) goto L_ladder_2;
+    {return &f8_32x32x64[2];}
+    break;
+  case "v_smfmac_f32_32x32x64_fp8_fp8"_op.hash:
+    if (!(op == "v_smfmac_f32_32x32x64_fp8_fp8"_op)) goto L_ladder_2;
+    {return &f8_32x32x64[3];}
+    break;
+  case "v_mfma_f32_4x4x4_16b_f16"_op.hash:
+    if (!(op == "v_mfma_f32_4x4x4_16b_f16"_op)) goto L_ladder_2;
+    {return &f16_4x4x4_16b;}
+    break;
+  case "v_mfma_f32_4x4x4_16b_bf16"_op.hash:
+    if (!(op == "v_mfma_f32_4x4x4_16b_bf16"_op)) goto L_ladder_2;
+    {return &bf16_4x4x4_16b;}
+    break;
+  case "v_mfma_f32_16x16x4_4b_f16"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x4_4b_f16"_op)) goto L_ladder_2;
+    {return &f16_16x16x4_4b;}
+    break;
+  case "v_mfma_f32_16x16x4_4b_bf16"_op.hash:
+    if (!(op == "v_mfma_f32_16x16x4_4b_bf16"_op)) goto L_ladder_2;
+    {return &bf16_16x16x4_4b;}
+    break;
+  default: L_ladder_2: break;
+}
     return nullptr;
   }
   // Which block, and which row of it, output value r of lane l is: a 16- or
@@ -7285,7 +9307,7 @@ struct Machine {
       }
   }
   bool gws_barrier(Wave& w, const Inst& in) {
-    const OpName op(in.name);
+    const OpName op(in);
     if (op == "ds_gws_init"_op) return true;   // the count comes with each barrier
     if (op != "ds_gws_barrier"_op)
       throw Error::make(Err::Unsupported, in.name, ": GWS semaphores are not modelled");
@@ -7336,10 +9358,13 @@ struct Machine {
     }
   }
   bool gfx1250_barrier(Wave& w, const Inst& in, Group& g) {
-    const OpName op(in.name);
+    const OpName op(in);
     const BarrierRef b = barrier_ref(w, in.src.empty() ? Operand{} : in.src.back());
     const bool named = b.id >= 1 && b.id <= 16;
-    if (op == "s_barrier_signal"_op || op == "s_barrier_signal_isfirst"_op) {
+    switch (op.hash()) {
+  case "s_barrier_signal"_op.hash: case "s_barrier_signal_isfirst"_op.hash:
+    if (!(op == "s_barrier_signal"_op || op == "s_barrier_signal_isfirst"_op)) goto L_ladder_1;
+    {
       const bool isfirst = op == "s_barrier_signal_isfirst"_op;
       if (b.id == -1) {
         if (isfirst) w.scc = g.wg_signaled == 0;
@@ -7356,21 +9381,36 @@ struct Machine {
         ++g.nb_signaled[b.id];
         if (g.nb_members[b.id] && g.nb_signaled[b.id] >= g.nb_members[b.id]) named_barrier_complete(g, b.id);
       }
-    } else if (op == "s_barrier_init"_op) {
+    }
+    break;
+  case "s_barrier_init"_op.hash:
+    if (!(op == "s_barrier_init"_op)) goto L_ladder_1;
+    {
       if (named) {
         if (b.members) g.nb_members[b.id] = b.members;
         g.nb_signaled[b.id] = 0;
       }
-    } else if (op == "s_barrier_join"_op) {
+    }
+    break;
+  case "s_barrier_join"_op.hash:
+    if (!(op == "s_barrier_join"_op)) goto L_ladder_1;
+    {
       w.nb_joined = named ? static_cast<uint8_t>(b.id) : 0;
       w.nb_complete = false;
-    } else if (op == "s_get_barrier_state"_op) {
+    }
+    break;
+  case "s_get_barrier_state"_op.hash:
+    if (!(op == "s_get_barrier_state"_op)) goto L_ladder_1;
+    {
       // { 0:5, namedBarrierCount / 4 : 3, 0, signalCnt : 7, 0:5, memberCnt : 7, 0:3, valid }
       uint32_t members = 0, signaled = 0, valid = 0;
       if (b.id == -1) members = static_cast<uint32_t>(g.waves.size()), signaled = g.wg_signaled, valid = 1;
       else if (named) members = g.nb_members[b.id], signaled = g.nb_signaled[b.id], valid = 1;
       write_scalar(w, in.dst[0], (4u << 24) | (signaled & 0x7F) << 16 | (members & 0x7F) << 4 | valid);
     }
+    break;
+  default: L_ladder_1: break;
+}
     // s_wakeup_barrier wakes sleeping waves, and none here sleeps for good.
     return true;
   }
@@ -7418,13 +9458,12 @@ struct Machine {
   // wave's own, and not atomics, which a card orders where they arrive). Cheap for everything that is not a memory
   // instruction, since it runs on each instruction until the wave's first store of a round.
   static bool is_plain_store(const Inst& in) {
+    const uint32_t f = gcn::inst_flags(in);
     switch (in.enc) {
-      case gcn::Enc::Ds: return in.name.rfind("ds_write", 0) == 0 || in.name.rfind("ds_store", 0) == 0;
-      case gcn::Enc::Flat:
-        return in.segment != Inst::Segment::Scratch && in.name.find("_store") != std::string::npos &&
-               in.name.find("_atomic") == std::string::npos;
+      case gcn::Enc::Ds: return f & gcn::kInstDsWrite;
+      case gcn::Enc::Flat: return in.segment != Inst::Segment::Scratch && (f & gcn::kInstStore) && !(f & gcn::kInstAtomic);
       case gcn::Enc::Mubuf:
-      case gcn::Enc::Mtbuf: return in.name.find("_store") != std::string::npos && in.name.find("_atomic") == std::string::npos;
+      case gcn::Enc::Mtbuf: return (f & gcn::kInstStore) && !(f & gcn::kInstAtomic);
       default: return false;
     }
   }
@@ -7465,13 +9504,14 @@ struct Machine {
     w.pc += in.size;
     ++stats.instructions;
     InstructionCounts& n = stats.counts;
+    const uint32_t fl = gcn::inst_flags(in);   // (what the names say, worked out when decoded)
     switch (in.enc) {
       case gcn::Enc::Sop1:
       case gcn::Enc::Sop2:
       case gcn::Enc::Sopk:
         ++n.salu;
         if (in.arch == gcn::Target::Gfx1250 && in.enc == gcn::Enc::Sop1 &&
-            (in.name.rfind("s_barrier_", 0) == 0 || in.name == "s_get_barrier_state" || in.name == "s_wakeup_barrier"))
+            (fl & gcn::kInstBarrierSop1))
           return gfx1250_barrier(w, in, g);
         scalar_alu(w, in);
         return true;
@@ -7494,7 +9534,7 @@ struct Machine {
         const Inst& x = w.gpr_idx ? (indexed = in, index_gprs(w, &indexed), indexed) : in;
         // A comparison in its long form is still a comparison: it writes a
         // mask of the lanes that passed, not a value per lane.
-        if (x.name.rfind("v_mfma", 0) == 0 || x.name.rfind("v_smfmac", 0) == 0) {
+        if (fl & gcn::kInstMfma) {
           // The matrix instructions ignore MODE: round to nearest even,
           // denormals kept, always.
           ++n.mfma;
@@ -7502,9 +9542,9 @@ struct Machine {
           return true;
         }
         std::optional<FloatMode> fm;
-        if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, x.name.find("f64") != std::string::npos);
+        if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, (fl & gcn::kInstF64) != 0);
         if (x.dpp || x.dpp8) cross_lane_alu(w, x);
-        else if (x.name.rfind("v_cmp", 0) == 0) compare(w, x);
+        else if (fl & gcn::kInstCmp) compare(w, x);
         else vector_alu(w, x);
         return true;
       }
@@ -7543,34 +9583,34 @@ struct Machine {
       case gcn::Enc::Vopc: {
         ++n.valu;
         std::optional<FloatMode> fm;
-        if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, in.name.find("f64") != std::string::npos);
+        if (!FloatMode::is_default(w.mode)) fm.emplace(w.mode, (fl & gcn::kInstF64) != 0);
         if (in.dpp || in.dpp8) cross_lane_alu(w, in);
         else compare(w, in);
         return true;
       }
       case gcn::Enc::Ds:
         ++n.lds;
-        if (in.name.rfind("ds_gws_", 0) == 0) return gws_barrier(w, in);
+        if (fl & gcn::kInstGws) return gws_barrier(w, in);
         lds_access(w, in, g);
         return true;
       case gcn::Enc::Flat:
         // RDNA4's cache write-back and invalidate (global_wb, global_inv,
         // global_wbinv), which its fences compile to: every access here
         // reaches memory directly, so they order the host's threads and no more.
-        if (OpName(in.name) == "global_inv"_op || OpName(in.name) == "global_wb"_op ||
-            OpName(in.name) == "global_wbinv"_op) {
+        if (OpName(in) == "global_inv"_op || OpName(in) == "global_wb"_op ||
+            OpName(in) == "global_wbinv"_op) {
           std::atomic_thread_fence(std::memory_order_seq_cst);
           return true;
         }
         ++n.vmem;
         ++n.flat;
-        if (in.name.find("_atomic") != std::string::npos) ++n.flat_atomic, ++n.vmem_wr;
-        else if (in.name.find("_store") != std::string::npos) ++n.flat_write, ++n.vmem_wr;
+        if (fl & gcn::kInstAtomic) ++n.flat_atomic, ++n.vmem_wr;
+        else if (fl & gcn::kInstStore) ++n.flat_write, ++n.vmem_wr;
         else ++n.flat_read, ++n.vmem_rd, issued_load(w);
         if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
         else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
-        else if (in.name.find("_load_lds_") != std::string::npos) global_load_lds(w, in, g), ++n.lds;
-        else if (in.name.find("_async_to_lds_") != std::string::npos || in.name.find("_async_from_lds_") != std::string::npos)
+        else if (fl & gcn::kInstLoadLds) global_load_lds(w, in, g), ++n.lds;
+        else if (fl & gcn::kInstAsyncLds)
           global_async_lds(w, in, g), ++n.lds;
         else global_access(w, in);
         return true;
@@ -7581,30 +9621,30 @@ struct Machine {
         // to write back and nothing stale to drop -- but work-groups on other
         // host threads see this thread's writes in the order a fence
         // promises only if the host is told to keep it.
-        if (OpName(in.name) == "buffer_wbl2"_op || OpName(in.name) == "buffer_inv"_op ||
-            OpName(in.name) == "buffer_wbinvl1"_op || OpName(in.name) == "buffer_wbinvl1_vol"_op ||
-            OpName(in.name) == "buffer_invl2"_op || OpName(in.name) == "buffer_gl0_inv"_op ||
-            OpName(in.name) == "buffer_gl1_inv"_op) {
+        if (OpName(in) == "buffer_wbl2"_op || OpName(in) == "buffer_inv"_op ||
+            OpName(in) == "buffer_wbinvl1"_op || OpName(in) == "buffer_wbinvl1_vol"_op ||
+            OpName(in) == "buffer_invl2"_op || OpName(in) == "buffer_gl0_inv"_op ||
+            OpName(in) == "buffer_gl1_inv"_op) {
           std::atomic_thread_fence(std::memory_order_seq_cst);
           return true;
         }
-        if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
+        if (fl & (gcn::kInstStore | gcn::kInstAtomic)) ++n.vmem_wr;
         else ++n.vmem_rd, issued_load(w);
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Mtbuf:
         ++n.vmem;
-        if (in.name.find("_store") != std::string::npos) ++n.vmem_wr;
+        if (fl & gcn::kInstStore) ++n.vmem_wr;
         else ++n.vmem_rd, issued_load(w);
         buffer_access(w, in, g);
         return true;
       case gcn::Enc::Mimg:
-        if (in.name.rfind("tensor_", 0) == 0) {
+        if (fl & gcn::kInstTensor) {
           tensor_move(w, in, g);
           return true;
         }
         ++n.vmem;
-        if (in.name.find("_store") != std::string::npos || in.name.find("_atomic") != std::string::npos) ++n.vmem_wr;
+        if (fl & (gcn::kInstStore | gcn::kInstAtomic)) ++n.vmem_wr;
         else ++n.vmem_rd, issued_load(w);
         image_access(w, in);
         return true;
@@ -7613,120 +9653,140 @@ struct Machine {
         throw Error::make(Err::Unsupported, gcn::enc_name(in.enc), " is decoded but not implemented");
     }
     // The program-flow instructions.
-    if (OpName(in.name) == "s_branch"_op || in.name.rfind("s_cbranch_", 0) == 0) ++n.branch;
-    if (OpName(in.name) == "s_sendmsg"_op) ++n.sendmsg;
-    if (OpName(in.name) == "s_endpgm"_op) {
-      w.done = true;
-      return false;
-    }
-    if (OpName(in.name) == "s_waitcnt"_op) return waited_for_loads(w, g, in, vm_count_of_waitcnt(in));
-    if (OpName(in.name) == "s_nop"_op) return true;   // nothing is out of order here
-    // RDNA's scheduling hints -- a clause of memory instructions, the delay
-    // an ALU result needs, the dependency and prefetch controls -- change
-    // nothing where every instruction completes before the next begins.
-    if (OpName(in.name) == "s_clause"_op || OpName(in.name) == "s_delay_alu"_op ||
-        OpName(in.name) == "s_waitcnt_depctr"_op || OpName(in.name) == "s_set_inst_prefetch_distance"_op)
-      return true;
-    // RDNA4's waits, a counter each (loads, stores, LDS, scalar memory, ...).
-    if (OpName(in.name) == "s_wait_loadcnt"_op) return waited_for_loads(w, g, in, in.simm & 0x3F);
-    if (in.name.rfind("s_wait_", 0) == 0 && in.name != "s_wait_event") return true;
-    if (in.arch == gcn::Target::Gfx1250 && OpName(in.name) == "s_barrier_leave"_op) {
-      gfx1250_barrier_leave(w, g);
-      return true;
-    }
-    if (OpName(in.name) == "s_barrier_wait"_op) {
-      // gfx1250: only the work-group barrier (-1) is the scheduler's; a named one has a count of its own.
-      if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) == -3 && !cluster_groups.empty()) {
-        if (w.cl_complete) {
-          w.cl_complete = false;
-          return true;
-        }
-        w.cl_wait = true;
+    if (fl & gcn::kInstBranchCount) ++n.branch;
+    const OpName op(in);
+    if (op == "s_sendmsg"_op) ++n.sendmsg;
+    // (A switch on the name's hash, in the order the rungs of the ladder this was had; a name appears in the cases of the
+    // rungs that tested it, and breaks out to the end where its extra condition does not hold.)
+    switch (op.hash()) {
+      case "s_endpgm"_op.hash:
+        if (!(op == "s_endpgm"_op)) break;
+        w.done = true;
         return false;
-      }
-      if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) != -1)
-        return gfx1250_named_wait(w, static_cast<int16_t>(in.simm));
-      w.at_barrier = true;
-      ++stats.barriers;
-      return false;
+      case "s_waitcnt"_op.hash:
+        if (!(op == "s_waitcnt"_op)) break;
+        return waited_for_loads(w, g, in, vm_count_of_waitcnt(in));
+      case "s_nop"_op.hash:
+        if (!(op == "s_nop"_op)) break;
+        return true;   // nothing is out of order here
+      // RDNA's scheduling hints -- a clause of memory instructions, the delay
+      // an ALU result needs, the dependency and prefetch controls -- change
+      // nothing where every instruction completes before the next begins.
+      case "s_clause"_op.hash: case "s_delay_alu"_op.hash: case "s_waitcnt_depctr"_op.hash: case "s_set_inst_prefetch_distance"_op.hash:
+        if (!(op == "s_clause"_op || op == "s_delay_alu"_op || op == "s_waitcnt_depctr"_op || op == "s_set_inst_prefetch_distance"_op)) break;
+        return true;
+      // RDNA4's waits, a counter each (loads, stores, LDS, scalar memory, ...).
+      case "s_wait_loadcnt"_op.hash:
+        if (!(op == "s_wait_loadcnt"_op)) break;
+        return waited_for_loads(w, g, in, in.simm & 0x3F);
+      case "s_barrier_leave"_op.hash:
+        if (!(in.arch == gcn::Target::Gfx1250 && op == "s_barrier_leave"_op)) break;
+        gfx1250_barrier_leave(w, g);
+        return true;
+      case "s_barrier_wait"_op.hash:
+        if (!(op == "s_barrier_wait"_op)) break;
+        // gfx1250: only the work-group barrier (-1) is the scheduler's; a named one has a count of its own.
+        if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) == -3 && !cluster_groups.empty()) {
+          if (w.cl_complete) {
+            w.cl_complete = false;
+            return true;
+          }
+          w.cl_wait = true;
+          return false;
+        }
+        if (in.arch == gcn::Target::Gfx1250 && static_cast<int16_t>(in.simm) != -1)
+          return gfx1250_named_wait(w, static_cast<int16_t>(in.simm));
+        w.at_barrier = true;
+        ++stats.barriers;
+        return false;
+      case "s_sendmsg"_op.hash:
+        if (!(op == "s_sendmsg"_op)) break;
+        // Giving the wave's vector registers back as it ends (RDNA's
+        // MSG_DEALLOC_VGPRS), before its s_endpgm.
+        if (gcn::is_rdna(in.arch) && in.simm == 3) return true;
+        // The kernel raised the doorbell of its hostcall buffer and asks the
+        // host for attention (MSG_INTERRUPT, the one message decoded): the
+        // host answers now, and the wave, spinning on its packet, carries on.
+        if (!d.hostcall)
+          throw Error::make(Err::Unsupported, "the kernel asked the host for attention (s_sendmsg MSG_INTERRUPT), which ",
+                            "is how device-side printf reaches the host, and the launch was given no hostcall buffer");
+        d.hostcall->service();
+        return true;
+      case "s_setprio"_op.hash: case "s_setprio_inc_wg"_op.hash:
+        if (!(op == "s_setprio"_op || op == "s_setprio_inc_wg"_op)) break;
+        return true;   // waves are not scheduled by priority here
+      // gfx1250 addresses up to 1024 vector registers by setting the top bits of every VGPR number; a program that
+      // sets any is not one this runs yet.
+      case "s_set_vgpr_msb"_op.hash:
+        if (!(op == "s_set_vgpr_msb"_op)) break;
+        // The two high bits of the vector register numbers the following instructions name, until the next one (the same
+        // bits are in the MODE register, which s_setreg_b32 can write, and that is not modelled).
+        w.vgpr_msb = static_cast<uint8_t>(in.simm & 0xFF);
+        set_mode_msb_bits(w);
+        return true;
+      case "s_monitor_sleep"_op.hash:
+        if (!(op == "s_monitor_sleep"_op)) break;
+        return false;
+      // No wave sleeps past its own s_sleep to be woken, and there is no
+      // instruction cache to invalidate.
+      case "s_wakeup"_op.hash: case "s_icache_inv"_op.hash:
+        if (!(op == "s_wakeup"_op || op == "s_icache_inv"_op)) break;
+        return true;
+      case "s_set_gpr_idx_off"_op.hash:
+        if (!(op == "s_set_gpr_idx_off"_op)) break;
+        w.gpr_idx = 0;
+        return true;
+      case "s_trap"_op.hash:
+        if (!(op == "s_trap"_op)) break;
+        // A real card's trap handler reports it to the queue and the runtime
+        // aborts the launch; the launch fails here, and says why.
+        throw Error::make(Err::Trap, "the kernel executed s_trap ", in.simm,
+                          in.simm == 2 ? " (llvm.trap: __builtin_trap or abort() in device code)" : "");
+      case "s_barrier"_op.hash:
+        if (!(op == "s_barrier"_op)) break;
+        w.at_barrier = true;
+        ++stats.barriers;
+        return false;
+      case "s_branch"_op.hash:
+        if (!(op == "s_branch"_op)) break;
+        w.pc = in.target;
+        return true;
+      case "s_cbranch_execz"_op.hash:
+        if (!(op == "s_cbranch_execz"_op)) break;
+        if (!w.exec) w.pc = in.target;
+        return true;
+      case "s_cbranch_execnz"_op.hash:
+        if (!(op == "s_cbranch_execnz"_op)) break;
+        if (w.exec) w.pc = in.target;
+        return true;
+      // A wave32 wave's VCC is its low half: the high half is an ordinary
+      // register the compiler may keep anything in.
+      case "s_cbranch_vccz"_op.hash:
+        if (!(op == "s_cbranch_vccz"_op)) break;
+        if (!(w.lanes == 32 ? static_cast<uint32_t>(w.vcc) : w.vcc)) w.pc = in.target;
+        return true;
+      case "s_cbranch_vccnz"_op.hash:
+        if (!(op == "s_cbranch_vccnz"_op)) break;
+        if (w.lanes == 32 ? static_cast<uint32_t>(w.vcc) : w.vcc) w.pc = in.target;
+        return true;
+      // A wave waiting for something -- another work-group at a grid barrier,
+      // the host answering a call -- sleeps; here it gives way to the others,
+      // which is what lets a wave that spins on memory see the write it waits for.
+      case "s_sleep"_op.hash:
+        if (!(op == "s_sleep"_op)) break;
+        return false;
+      case "s_cbranch_scc0"_op.hash:
+        if (!(op == "s_cbranch_scc0"_op)) break;
+        if (!w.scc) w.pc = in.target;
+        return true;
+      case "s_cbranch_scc1"_op.hash:
+        if (!(op == "s_cbranch_scc1"_op)) break;
+        if (w.scc) w.pc = in.target;
+        return true;
+      default: break;
     }
-    // Giving the wave's vector registers back as it ends (RDNA's
-    // MSG_DEALLOC_VGPRS), before its s_endpgm.
-    if (OpName(in.name) == "s_sendmsg"_op && gcn::is_rdna(in.arch) && in.simm == 3) return true;
-    if (OpName(in.name) == "s_setprio"_op || OpName(in.name) == "s_setprio_inc_wg"_op) return true;   // waves are not scheduled by priority here
-    // gfx1250 addresses up to 1024 vector registers by setting the top bits of every VGPR number; a program that
-    // sets any is not one this runs yet.
-    if (OpName(in.name) == "s_set_vgpr_msb"_op) {
-      // The two high bits of the vector register numbers the following instructions name, until the next one (the same
-      // bits are in the MODE register, which s_setreg_b32 can write, and that is not modelled).
-      w.vgpr_msb = static_cast<uint8_t>(in.simm & 0xFF);
-      set_mode_msb_bits(w);
-      return true;
-    }
-    if (OpName(in.name) == "s_monitor_sleep"_op) return false;
-    // No wave sleeps past its own s_sleep to be woken, and there is no
-    // instruction cache to invalidate.
-    if (OpName(in.name) == "s_wakeup"_op || OpName(in.name) == "s_icache_inv"_op) return true;
-    if (OpName(in.name) == "s_set_gpr_idx_off"_op) {
-      w.gpr_idx = 0;
-      return true;
-    }
-    if (OpName(in.name) == "s_trap"_op) {
-      // A real card's trap handler reports it to the queue and the runtime
-      // aborts the launch; the launch fails here, and says why.
-      throw Error::make(Err::Trap, "the kernel executed s_trap ", in.simm,
-                        in.simm == 2 ? " (llvm.trap: __builtin_trap or abort() in device code)" : "");
-    }
-    if (OpName(in.name) == "s_barrier"_op) {
-      w.at_barrier = true;
-      ++stats.barriers;
-      return false;
-    }
-    if (OpName(in.name) == "s_branch"_op) {
-      w.pc = in.target;
-      return true;
-    }
-    if (OpName(in.name) == "s_cbranch_execz"_op) {
-      if (!w.exec) w.pc = in.target;
-      return true;
-    }
-    if (OpName(in.name) == "s_cbranch_execnz"_op) {
-      if (w.exec) w.pc = in.target;
-      return true;
-    }
-    // A wave32 wave's VCC is its low half: the high half is an ordinary
-    // register the compiler may keep anything in.
-    const uint64_t vcc = w.lanes == 32 ? static_cast<uint32_t>(w.vcc) : w.vcc;
-    if (OpName(in.name) == "s_cbranch_vccz"_op) {
-      if (!vcc) w.pc = in.target;
-      return true;
-    }
-    if (OpName(in.name) == "s_cbranch_vccnz"_op) {
-      if (vcc) w.pc = in.target;
-      return true;
-    }
-    // A wave waiting for something -- another work-group at a grid barrier,
-    // the host answering a call -- sleeps; here it gives way to the others,
-    // which is what lets a wave that spins on memory see the write it waits for.
-    if (OpName(in.name) == "s_sleep"_op) return false;
-    if (OpName(in.name) == "s_sendmsg"_op) {
-      // The kernel raised the doorbell of its hostcall buffer and asks the
-      // host for attention (MSG_INTERRUPT, the one message decoded): the
-      // host answers now, and the wave, spinning on its packet, carries on.
-      if (!d.hostcall)
-        throw Error::make(Err::Unsupported, "the kernel asked the host for attention (s_sendmsg MSG_INTERRUPT), which ",
-                          "is how device-side printf reaches the host, and the launch was given no hostcall buffer");
-      d.hostcall->service();
-      return true;
-    }
-    if (OpName(in.name) == "s_cbranch_scc0"_op) {
-      if (!w.scc) w.pc = in.target;
-      return true;
-    }
-    if (OpName(in.name) == "s_cbranch_scc1"_op) {
-      if (w.scc) w.pc = in.target;
-      return true;
-    }
+    // (The ladder tested this between the s_wait_loadcnt rung and the barrier ones; none of those names starts with it.)
+    if (fl & gcn::kInstSWait) return true;
     throw Error::make(Err::Unsupported, "instruction ", in.name, " is decoded but not implemented");
   }
 };
@@ -8502,6 +10562,143 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
   }
   if (packet) mem.free(packet);
   return total;
+}
+
+
+// ---- the same-bits probe (amd_exec.hpp) -----------------------------------------------------------------------------
+
+namespace {
+struct Mix64 {
+  uint64_t h = 0x9E3779B97F4A7C15ull;
+  void add(uint64_t v) {
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    h *= 0xBF58476D1CE4E5B9ull;
+    h ^= h >> 29;
+  }
+  void add_bytes(const void* p, size_t n) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+      uint64_t v;
+      std::memcpy(&v, b + i, 8);
+      add(v);
+    }
+    for (; i < n; ++i) add(b[i]);
+  }
+};
+struct Rng {
+  uint64_t s;
+  uint64_t next() {
+    s += 0x9E3779B97F4A7C15ull;
+    uint64_t z = s;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+  }
+};
+// A 32-bit value of the flavour: 0 any bits, 1 small, 2 a float (finite, special or tiny).
+uint32_t draw(Rng& r, uint32_t flavour) {
+  const uint64_t x = r.next();
+  if (flavour == 1) return static_cast<uint32_t>(x) & 0xFF;
+  if (flavour == 2) {
+    static constexpr uint32_t kSpecial[] = {0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x7F800000u, 0xFF800000u,
+                                            0x7FC00000u, 0x7F800001u, 0x00000001u, 0x007FFFFFu, 0x7F7FFFFFu, 0x40490FDBu,
+                                            0x7FF00000u, 0xFFF00000u, 0x7FF80000u, 0x7FF00001u, 0x3FF00000u, 0x000FFFFFu};
+    if ((x >> 40) % 4 == 0) return kSpecial[(x >> 32) % std::size(kSpecial)];
+    const float f = (static_cast<float>(static_cast<uint32_t>(x) >> 8) / 16777216.0f - 0.5f) * 64.0f;
+    return as_bits(f);
+  }
+  return static_cast<uint32_t>(x);
+}
+}  // namespace
+
+uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour) {
+  static constexpr uint32_t kMach[] = {0x4c, 0x3f, 0x4f, 0x41, 0x48, 0x36, 0x49};   // by gcn::Target's order
+  CodeObject co;
+  co.mach = kMach[static_cast<int>(target)];
+  co.text.assign(16, 0);
+  Kernel k;
+  k.name = "probe";
+  k.wave32 = gcn::is_rdna(target);
+  Dispatch d;
+  d.object = &co;
+  d.kernel = &k;
+  MemoryManager mem(4ull << 20);
+  const uint64_t region = mem.alloc(1 << 16);
+  DecodeCache cache(16);
+  cache.get(0, [&] { return in; });
+  d.decoded = &cache;
+  Machine m(d, mem, cache);
+  Rng r{seed * 0x2545F4914F6CDD1Dull + flavour};
+  Group g;
+  g.lds.assign(1 << 16, 0);
+  g.scratch_per_lane = 256;
+  g.scratch.assign(size_t{256} * kLanes, 0);
+  for (uint8_t& b : g.scratch) b = static_cast<uint8_t>(draw(r, 0));
+  k.private_segment = 256;
+  g.waves.resize(1);
+  Wave& w = g.waves[0];
+  w.lanes = k.wave32 ? 32 : kLanes;
+  w.mode = k.mode;
+  w.vgpr.grow(288);
+  w.agpr.resize(288);
+  for (uint8_t& b : g.lds) b = static_cast<uint8_t>(draw(r, 0));
+  {
+    std::vector<uint8_t> bytes(1 << 16);
+    for (uint8_t& b : bytes) b = static_cast<uint8_t>(draw(r, 0));
+    mem.write(region, bytes.data(), bytes.size());
+  }
+  for (uint32_t& s : w.sgpr) s = draw(r, flavour);
+  for (uint32_t& s : w.ttmp) s = draw(r, flavour);
+  for (auto& row : w.vgpr.r)
+    for (uint32_t& v : row) v = draw(r, flavour);
+  for (auto& row : w.agpr)
+    for (uint32_t& v : row) v = draw(r, flavour);
+  const uint64_t all = w.lanes == 64 ? ~uint64_t{0} : (uint64_t{1} << w.lanes) - 1;
+  w.exec = (flavour == 3 ? r.next() : ~uint64_t{0}) & all;
+  w.vcc = r.next() & all;
+  w.m0 = draw(r, flavour);
+  w.scc = r.next() & 1;
+  w.pc = 0;
+  Mix64 h;
+  std::string error;
+  bool ran = false;
+  try {
+    ran = m.step(w, g);
+  } catch (const Error& e) {
+    error = std::string(e.what()) + "|" + std::to_string(static_cast<int>(e.code()));
+  } catch (const std::exception& e) {
+    error = std::string("std:") + e.what();
+  }
+  if (std::getenv("VGPU_SAME_BITS_DUMP")) std::fprintf(stderr, "   ran=%d err=[%s] s0=%08x s2=%08x exec=%llx pc=%llx\n", ran, error.c_str(), w.sgpr[0], w.sgpr[2], (unsigned long long)w.exec, (unsigned long long)w.pc);
+  if (const char* dv = std::getenv("VGPU_SAME_BITS_DUMP_V")) {
+    const int r = std::atoi(dv);
+    std::fprintf(stderr, "   v%d:", r);
+    for (int l = 0; l < 64; ++l) std::fprintf(stderr, " %08x", w.vgpr[r][l]);
+    std::fprintf(stderr, "\n");
+  }
+  h.add(ran);
+  h.add_bytes(error.data(), error.size());
+  h.add(w.pc), h.add(w.exec), h.add(w.vcc), h.add(w.m0), h.add(w.scc), h.add(w.done), h.add(w.at_barrier);
+  h.add(w.loads_in_flight), h.add(w.soft_yield), h.add(w.vgpr_msb), h.add(w.mode), h.add(w.gpr_idx);
+  h.add_bytes(w.sgpr, sizeof w.sgpr);
+  h.add_bytes(w.ttmp, sizeof w.ttmp);
+  for (const auto& row : w.vgpr.r) h.add_bytes(row.data(), sizeof row);
+  for (const auto& row : w.agpr) h.add_bytes(row.data(), sizeof row);
+  h.add_bytes(g.lds.data(), g.lds.size());
+  h.add_bytes(g.scratch.data(), g.scratch.size());
+  {
+    std::vector<uint8_t> bytes(1 << 16);
+    mem.read(region, bytes.data(), bytes.size());
+    h.add_bytes(bytes.data(), bytes.size());
+  }
+  const InstructionCounts& c = m.stats.counts;
+  h.add(m.stats.instructions), h.add(m.stats.barriers);
+  h.add(c.valu), h.add(c.mfma), h.add(c.salu), h.add(c.smem), h.add(c.vmem), h.add(c.flat), h.add(c.lds), h.add(c.branch);
+  h.add(c.sendmsg), h.add(c.flat_read), h.add(c.flat_write), h.add(c.flat_atomic), h.add(c.vmem_rd), h.add(c.vmem_wr);
+  for (uint64_t v : c.mix) h.add(v);
+  for (uint64_t v : c.mops) h.add(v);
+  return h.h;
 }
 
 }  // namespace vgpu::amd

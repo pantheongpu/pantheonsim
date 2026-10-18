@@ -243,6 +243,10 @@ add_library(vgpu STATIC
 # and it passed on one CPU and failed on another (round 8's canonical NaN). GCC says so with -Wpsabi: make it an error here.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "-Werror=psabi")
+  # The AMD interpreter's floor, ceil, trunc and rint are libm's: GCC expands them in line (and so leaves a signaling NaN
+  # as it is, where roundss and libm quiet it) in the places its heuristics call hot, which moved when the instruction
+  # ladders became switches (s_trunc_f32 of a signaling NaN, amd/tests/unit/test_gcn_same_bits.cpp).
+  set_source_files_properties(amd/src/gcn_exec.cpp PROPERTIES COMPILE_OPTIONS "-fno-fp-int-builtin-inexact")
 endif()
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
@@ -1386,6 +1390,10 @@ target_compile_definitions(test_amd_gcn_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 # Doubles, packed halves, the modifiers, the transcendentals and the atomics.
 vgpu_unit_test(test_amd_gcn_math amd/tests/unit/test_gcn_math.cpp)
 target_compile_definitions(test_amd_gcn_math PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Every instruction of the ISA corpora run once on pseudo-random state, bit for bit against the recorded
+# digests of the baseline build (amd/tests/unit/test_gcn_same_bits.cpp).
+vgpu_unit_test(test_amd_gcn_same_bits amd/tests/unit/test_gcn_same_bits.cpp)
+target_compile_definitions(test_amd_gcn_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Scratch, LDS atomics, a cross-lane read, and flat pointers.
 vgpu_unit_test(test_amd_gcn_memory amd/tests/unit/test_gcn_memory.cpp)
 target_compile_definitions(test_amd_gcn_memory PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
