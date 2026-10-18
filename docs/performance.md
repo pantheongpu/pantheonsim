@@ -2329,3 +2329,91 @@ The SASS rows of the same final tree against `head` (SASS source unchanged; inte
 1.027x, atomics 0.992x, texture 0.988x, divergent 0.994x, int_alu 0.996x, `base64e` 1.019x. The first two are the placement effect
 described above (the same sources measured 0.998x and 0.93x in two builds that differed only in the PTX file). A merge that adds code
 elsewhere changes them again; judge SASS changes on the merged tree, with an A/A of two copies of the same build next to the A/B.
+## Tensor cores: the sm_86 chunked sum, faster (branch `speedup2-tensor`)
+
+The card-measured sum of an RTX 3060's tensor core (`include/vgpu/exec/tc_ampere.hpp`, `VGPU_TC_EXACT`, on by default for sm_86) cost
+3.5-4.5x over the plain sequential f32 model. Measured on server2 (`bench.py --ab`, base `speedup` a12f8d84 against this branch, CPUs
+pinned, one host thread, `nvidia/rtx3060`), `VGPU_TC_EXACT=1` against `=0` on the base build: SASS wmma 0.199 s against 0.058 s of CPU, mma_ptx
+0.102 s against 0.032 s. A sampling profile of the SASS `wmma` row (SIGPROF, `-g` build) put 66% of its samples in the vector kernel
+(`mma_avx2_chunked<8>`) and 17% in the `hmma_k` wrapper around it: the model's own kernel, not the dispatch around it, is where the time goes.
+The kernel alone, m16n8k16 f16, on one pinned core of a loaded box (a micro-benchmark that calls it 100,000 times; loads vary run to run,
+so only same-process comparisons are quoted): 668-690 ns before.
+
+What changed, all with the same result bits (the first is the test's oracle, a frozen copy of the earlier header):
+
+* **Chunk length as a template constant** (8 or 4 products), so the product loops unroll.
+* **Frame terms with a sentinel**: an operand that is zero gets a term of `-2^28` at decode time, so the largest frame position is a
+  plain `max` of `ta + tb` per product instead of `mullo`, compare and blend; an all-zero chunk needs no special case.
+* **One variable shift per product**: A's significands are kept times 16, so a product is already its magnitude `<< 4`, and the aligned term is
+  that shifted right by `top - T` (truncation toward zero), computed in registers that do not spill (the products are formed again in the second
+  pass, which measured faster than keeping sixteen vectors live: 566 -> 524 ns).
+* **The sum's bit length from one float conversion** of its magnitude with the low 7 bits cleared (24 significant bits at most, so exact),
+  replacing two double conversions and three permutes; the new accumulator stays in its register, and the lanes the vector code does not finish
+  (an infinity or a NaN in the chunk, a result outside the f32 normal range) are the only ones that go through memory.
+* **Four output rows at a time, stage by stage**: the 16 rows of an m16n8 tile are independent chains of about 60 cycles each, and one at a
+  time the out-of-order window held about one. Rows per pass, same kernel, ns per call: 1: 527-549, 2: 480-522, 3: 433, **4: 421-425**, 6: 450,
+  8: 413 (4 kept: it is the smallest that reaches the plateau, and 16 is a multiple of it; `VGPU_TC86_ROWS`).
+* **An f16 accumulator** (mma/wmma `.f16` C and D) had no vector form and ran the scalar one, 8,776 ns per m16n8k16; the sum rounded to nearest even to
+  f16 is now vector too (`sum_to_f16_avx2`), 552 ns.
+* **The PTX engine's `mma.sync`** for the dense f16, bf16 and tf32 forms (f32 or f16 accumulator) goes through the SIMD kernel the SASS HMMA already
+  uses (`Interpreter::exec_mma_simd`): the fragments are read register by register as before, gathered, and D is written the same way, instead of
+  building `std::vector<double>` tiles with a switch per element.
+
+### Results
+
+`bench.sh --ab`, 11 to 15 alternating runs, counters identical in every row (the harness compares them), B/A of the median of warp-instructions per
+CPU second, p from the harness's Mann-Whitney test. Loads are server2's, shared with other jobs (a quiet pair of CPUs was used where there was one):
+
+| workload | engine | A (base) | B (this branch) | B/A | p | load |
+|---|---|---|---|---|---|---|
+| wmma | sass | 2.012 | 2.852 | 1.42x | < 0.001 | 7.8-10 |
+| wmma | ptx | 1.179 | 1.672 | 1.42x | < 0.001 | 7.8-10 |
+| mma_ptx | sass | 3.833 | 5.348 | 1.40x | 0.004 | 7.8-10 |
+| mma_ptx | ptx | 0.847 | 0.945 | 1.12x | < 0.001 | 7.8-10 |
+| (the same, with the PTX `mma.sync` route) mma_ptx | ptx | 0.885 | 2.165 | 2.45x | < 0.001 | 9 |
+
+The final tree (all four commits), SASS engine, 21 alternating runs on CPUs 12-15, load 26-28: wmma 1.932 -> 2.802 (1.45x, best 1.50x, p < 0.001), mma_ptx 3.788 -> 5.651
+(1.49x, best 1.48x, p < 0.001), counters identical.
+
+A second set at load 25-28 with every CPU busy (so every number is lower and the ratios are less sharp): wmma sass 1.15x (best of runs 1.50x,
+p 0.008), wmma ptx 1.46x, mma_ptx sass 1.48x, mma_ptx ptx 2.35x, all p < 0.001, counters identical.
+
+An f16-accumulator program (`wmma` 16x16x16 and `mma.sync.m16n8k16` with half C and D, 6,000 iterations, 4 warps; CPU time of the process, 11
+alternating runs, load 25-28, output hash identical): SASS 0.344 s -> 0.051 s (6.8x, p < 0.001), PTX 0.462 s -> 0.117 s (3.9x, p < 0.001).
+
+### Same-bits tests (wired into CMake)
+
+* `tests/unit/test_tc_ampere_fast.cpp`: the current `tc86::mma`, `mma_avx2` and the f16-accumulator form against `tests/unit/tc86_v0.hpp`, a
+  frozen copy of the earlier header, over 26 million elements (13 shapes including M not a multiple of the row group, K not a multiple of the chunk, the
+  largest 32 x 32 x 16; f16, bf16 and tf32; f32 and f16 accumulators; eight operand modes: plain, zeros, subnormals, infinities and NaNs of both kinds,
+  largest finite values and powers of two, raw 32-bit patterns, cancelling pairs across chunk borders, one huge term among tiny ones; accumulators at,
+  above and below the products' size). Also `sum_to_f32_avx2` and `sum_to_f16_avx2` lane by lane against the scalar conversions on every
+  power-of-two neighbourhood, f16 grid ties and random sums for every frame.
+* `tests/unit/test_mma_fast.cpp`: PTX `mma.sync` of every dense form with `VGPU_FASTPATH=1` and `=0` on sm_86, sm_80 and sm_90 profiles, half the
+  lanes of a warp predicated off, 2.9 million words compared.
+* Mutation checks (the test must fail), run by editing a copy of the header or `interpreter.cpp`: 33 mutants of the kernel (sentinel too small, the
+  accumulator's frame position off by one, the `>> 4` bias, a dropped sign, `g` off by one, the bit-length mask, the remainder rows, the NaN/infinity masks
+  of rows, columns and accumulator, the out-of-range redo, truncation replaced by rounding, the tie rules and overflow bound of the f16 rounding, the
+  sign of a zero) and 7 of the PTX route (no sm_86 sum, accumulator type, C and D register order, f16/bf16 kind, a wrong K, a bf16/tf32 kind swap). 36 of 40
+  are killed. The four survivors are all equivalent mutants: a low-bit mask of 63 instead of 127 in the sum's bit length (|S| < 2^30.2, so the
+  top 24 bits start at or above bit 6), a wider "in range" test in the f16 sum (the shift it guards is never past -10 for a finite sum), and the
+  PTX route with K cut to 8 or the bf16 and tf32 kinds swapped, which only make it decline (the fragment arity no longer matches) so the
+  general path answers.
+
+### Tests run
+
+`ctest -j4` on the whole tree (629 tests): 97% passed. The 17 failures are not this change: 11 `amd_*` (no ROCm on server2), two lints that call
+`git ls-files` in the rsync'd copy, `e2e_lockstep_blocks` (timed-out waits under the box's load; the base build fails the same way, run side by
+side), and three nvcc CUTLASS compiles (`e2e_cutlass_hopper/gemm/sm100`) that were `Killed` mid-compile while Postgres held 21 GB (re-run alone, hopper was killed again and the other two were not completed). They need a
+quiet machine or CI. Passed, among others: `test_tc_ampere`, `test_tc_ampere_fast`, `test_mma_fast`, `test_simd`, `test_fastpath`, `test_exec3`,
+`e2e_mma_forms`, `e2e_mma_layout`, `e2e_wmma_types`, `e2e_wmma_gemm`, `e2e_float_half_forms`, `e2e_simd_lane_forms`, `e2e_sass_tier`.
+
+### Not done
+
+* **IMMA (int8/int4) and FP8 forms** still take the general element-by-element path (one `std::vector<double>` tile pair per instruction, a switch per
+  element): about 2.3 us per m16n8k32 s8 `mma.sync`, 4 to 5 times the f16 route. An integer SIMD kernel is straightforward (exact arithmetic) but the
+  `.satfinite` clamp after every 128 bits of K and the s4/u4/b1 layouts make it a piece of its own; none of the benchmark rows uses it.
+* **Fusing the f16->f32 conversion and layout transposes of `hmma_k` into the decode of the exact kernel** (the wrapper is about a fifth of an
+  HMMA now): not tried.
+* **Sparse `mma.sp`, m8n8k4, block-scaled and narrow-float forms** are unchanged; they do not use the chunked sum (sm_86 only) except through
+  the general path.
