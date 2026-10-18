@@ -141,6 +141,8 @@ void one_round(Gen& g, int round, const Shape& sh, int fmt, bool f16acc, Totals&
 #ifdef VGPU_TC86_AVX2
   if (!f16acc && sh.N % 8 == 0 && __builtin_cpu_supports("avx2"))
     now::mma_avx2(sh.M, sh.N, sh.K, sh.chunk, emin, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D2.data(), sh.N);
+  else if (f16acc && sh.N % 8 == 0 && sh.K % sh.chunk == 0 && __builtin_cpu_supports("avx2"))
+    now::mma_avx2_acc<true>(sh.M, sh.N, sh.K, sh.chunk, emin, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D2.data(), sh.N);
   else
     D2 = D1;
 #else
@@ -174,7 +176,7 @@ VTEST(vector_kernels_equal_the_frozen_form) {
     const Shape& sh = kShapes[round % (sizeof kShapes / sizeof kShapes[0])];
     const int fmt = static_cast<int>((round / 13) % 3);
     // (a K that is not a multiple of the chunk takes the generic vector form; both are held to the frozen form)
-    one_round(g, static_cast<int>(round), sh, fmt, fmt == 0 && (round / 39) % 4 == 3, tot);
+    one_round(g, static_cast<int>(round), sh, fmt, (round / 39) % 4 == 3, tot);
   }
   std::printf("  %ld rounds, %ld elements compared bit for bit\n", rounds, tot.elements);
   VCHECK_EQ(tot.mismatches, 0L);
@@ -228,6 +230,62 @@ __attribute__((target("avx2"))) static void check_sums(long& checked, long& bad)
         if (!ok && ++bad <= 5) std::fprintf(stderr, "S %d g %d: vector 0x%08x (nz %u in %u), scalar 0x%08x\n", S[l], g[l], r[l], nz[l], in[l], want);
       }
     }
+}
+
+__attribute__((target("avx2"))) static void check_sums16(long& checked, long& bad, long& answered) {
+  Gen gen(0xf16);
+  std::vector<int32_t> sums;
+  for (int n = 0; n <= 30; ++n)
+    for (int d = -40; d <= 40; ++d) {
+      const int64_t v = (int64_t{1} << n) + d;
+      if (v > 0 && v < (int64_t{1} << 31)) {
+        sums.push_back(static_cast<int32_t>(v));
+        sums.push_back(static_cast<int32_t>(-v));
+      }
+    }
+  // exact ties and their neighbours on the f16 grid: odd and even significands, half a step, a step and a half
+  for (int sig = 1000; sig <= 2100; ++sig)
+    for (int sh = 1; sh <= 18; ++sh)
+      for (int adj = -1; adj <= 1; ++adj) {
+        const int64_t v = ((int64_t{sig} << sh) | (int64_t{1} << (sh - 1))) + adj;
+        if (v > 0 && v < (int64_t{1} << 31)) {
+          sums.push_back(static_cast<int32_t>(v));
+          sums.push_back(static_cast<int32_t>(-v));
+        }
+      }
+  for (int i = 0; i < 200000; ++i) sums.push_back(static_cast<int32_t>(gen.u()) >> (gen.u() % 31));
+  while (sums.size() % 8) sums.push_back(0);
+  for (int pass = 0; pass < 14; ++pass)
+    for (size_t x = 0; x < sums.size(); x += 8) {
+      alignas(32) int32_t S[8], g[8];
+      for (int l = 0; l < 8; ++l) {
+        S[l] = sums[x + l];
+        g[l] = pass < 10 ? -50 + pass * 8 + static_cast<int>(gen.u() % 16) - 8 : static_cast<int>(gen.u() % 400) - 200;
+      }
+      __m256i res, snz, inr;
+      now::sum_to_f16_avx2(_mm256_load_si256(reinterpret_cast<const __m256i*>(S)), _mm256_load_si256(reinterpret_cast<const __m256i*>(g)), res, snz, inr);
+      alignas(32) uint32_t r[8], nz[8], in[8];
+      _mm256_store_si256(reinterpret_cast<__m256i*>(r), res);
+      _mm256_store_si256(reinterpret_cast<__m256i*>(nz), snz);
+      _mm256_store_si256(reinterpret_cast<__m256i*>(in), inr);
+      for (int l = 0; l < 8; ++l) {
+        ++checked;
+        const uint32_t want = bits(now::detail::to_f16_rn(S[l], g[l]));
+        const bool ans = S[l] != 0 && in[l] != 0;
+        if (ans) ++answered;
+        const bool ok = (nz[l] != 0) == (S[l] != 0) && (S[l] == 0 ? r[l] == 0 : (!ans || r[l] == want));
+        if (!ok && ++bad <= 5) std::fprintf(stderr, "S %d g %d: vector 0x%08x (nz %u in %u), scalar 0x%08x\n", S[l], g[l], r[l], nz[l], in[l], want);
+      }
+    }
+}
+
+VTEST(sum_to_f16_equals_the_scalar_conversion) {
+  if (!__builtin_cpu_supports("avx2")) return;
+  long checked = 0, bad = 0, answered = 0;
+  check_sums16(checked, bad, answered);
+  std::printf("  %ld sums converted, %ld answered by the vector code\n", checked, answered);
+  VCHECK_EQ(bad, 0L);
+  VCHECK(answered > checked / 2);   // (the vector code answers every sum a chunk can give)
 }
 
 VTEST(sum_to_f32_equals_the_scalar_conversion) {

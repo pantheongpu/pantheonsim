@@ -421,6 +421,42 @@ __attribute__((target("avx2"))) inline void sum_to_f32_avx2(__m256i S, __m256i g
   res = _mm256_and_si256(res, valid);
 }
 
+// The sum S * 2^g rounded to nearest even to f16, as the float that holds it (detail::to_f16_rn): the same lanes as sum_to_f32_avx2 give
+// (`snz` marks S != 0, `inrange` the lanes this code answers; a lane that is not is finished with the scalar conversion). The significand
+// is S's magnitude shifted right to the f16 grid of its binade (or of the subnormal range) with the remainder deciding the rounding, the
+// float is that integer times a power of two, an exponent past f16's is an infinity, a result that rounds to zero keeps the sign of S.
+__attribute__((target("avx2"))) inline void sum_to_f16_avx2(__m256i S, __m256i g, __m256i& res, __m256i& snz, __m256i& inrange) {
+  const __m256i zero = _mm256_setzero_si256(), one = _mm256_set1_epi32(1), ones = _mm256_set1_epi32(-1), sb = _mm256_set1_epi32(static_cast<int>(0x80000000u));
+  const __m256i neg = _mm256_srai_epi32(S, 31);
+  const __m256i mag = _mm256_abs_epi32(S);
+  const __m256i hi = _mm256_and_si256(mag, _mm256_set1_epi32(~127));
+  // floor(log2 mag) from a float that holds the magnitude, or its top 24 bits, exactly
+  const __m256i x = _mm256_blendv_epi8(mag, hi, _mm256_cmpgt_epi32(hi, zero));
+  const __m256i lg = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_castps_si256(_mm256_cvtepi32_ps(x)), 23), _mm256_set1_epi32(127));
+  const __m256i E = _mm256_add_epi32(lg, g);
+  const __m256i Eq = _mm256_sub_epi32(_mm256_max_epi32(E, _mm256_set1_epi32(-14)), _mm256_set1_epi32(10));   // exponent of the grid's step
+  const __m256i r = _mm256_sub_epi32(Eq, g);                                                                   // bits below the grid
+  const __m256i rp = _mm256_min_epi32(_mm256_max_epi32(r, zero), _mm256_set1_epi32(32));
+  const __m256i l = _mm256_max_epi32(_mm256_sub_epi32(zero, r), zero);
+  snz = _mm256_xor_si256(_mm256_cmpeq_epi32(S, zero), ones);
+  inrange = _mm256_cmpgt_epi32(r, _mm256_set1_epi32(-32));
+  const __m256i q = _mm256_srlv_epi32(mag, rp);
+  const __m256i rem = _mm256_and_si256(mag, _mm256_sub_epi32(_mm256_sllv_epi32(one, rp), one));
+  const __m256i half = _mm256_sllv_epi32(one, _mm256_sub_epi32(rp, one));   // (a count of -1 is past 31: zero)
+  const __m256i gt = _mm256_cmpgt_epi32(_mm256_xor_si256(rem, sb), _mm256_xor_si256(half, sb));   // unsigned
+  const __m256i tie = _mm256_and_si256(_mm256_and_si256(_mm256_cmpeq_epi32(rem, half), _mm256_cmpeq_epi32(_mm256_and_si256(q, one), one)),
+                                       _mm256_xor_si256(_mm256_cmpeq_epi32(half, zero), ones));
+  const __m256i up = _mm256_or_si256(gt, tie);   // -1 where the significand rounds up
+  const __m256i R = _mm256_sllv_epi32(_mm256_sub_epi32(q, up), l);
+  const __m256i fR = _mm256_castps_si256(_mm256_cvtepi32_ps(R));
+  const __m256i Rz = _mm256_cmpeq_epi32(R, zero);
+  const __m256i eres = _mm256_add_epi32(_mm256_sub_epi32(_mm256_srli_epi32(fR, 23), _mm256_set1_epi32(127)), Eq);
+  const __m256i ovf = _mm256_cmpgt_epi32(eres, _mm256_set1_epi32(15));
+  __m256i val = _mm256_andnot_si256(Rz, _mm256_add_epi32(fR, _mm256_slli_epi32(Eq, 23)));
+  val = _mm256_blendv_epi8(val, _mm256_set1_epi32(0x7f800000), ovf);
+  res = _mm256_and_si256(_mm256_or_si256(val, _mm256_and_si256(neg, sb)), snz);
+}
+
 // mma_avx2_generic with the chunk length a compile-time constant (K a multiple of it) and the work per chunk cut down; the same bits
 // (tests/unit/test_tc_ampere_fast.cpp holds it to the earlier form over random and adversarial operands):
 //   * a product with a zero factor is kept out of the largest frame position by a term of kNoTerm on its operand, not by a compare
@@ -431,7 +467,7 @@ __attribute__((target("avx2"))) inline void sum_to_f32_avx2(__m256i S, __m256i g
 //   * the bit length of the sum comes from a float conversion of its top 24 bits, not from two double conversions and permutes;
 //   * the new accumulator stays in its register; the lanes the vector code does not finish are the only ones that touch memory;
 //   * VGPU_TC86_ROWS rows at a time, stage by stage, so that their independent dependency chains overlap.
-template <unsigned NC>
+template <unsigned NC, bool ACC16>
 __attribute__((target("avx2"))) inline void mma_avx2_chunked(unsigned M, unsigned N, unsigned K, int emin, const float* A, size_t lda, const float* B,
                                                             size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
   constexpr unsigned kMaxM = 32, kMaxN = 32, kMaxK = 16;
@@ -504,7 +540,12 @@ __attribute__((target("avx2"))) inline void mma_avx2_chunked(unsigned M, unsigne
           }
         }
         __m256i res[R], snz[R], inrange[R];
-        for (unsigned r = 0; r < R; ++r) sum_to_f32_avx2(S[r], g[r], cff, c7fffff, res[r], snz[r], inrange[r]);
+        for (unsigned r = 0; r < R; ++r) {
+          if constexpr (ACC16)
+            sum_to_f16_avx2(S[r], g[r], res[r], snz[r], inrange[r]);
+          else
+            sum_to_f32_avx2(S[r], g[r], cff, c7fffff, res[r], snz[r], inrange[r]);
+        }
         for (unsigned r = 0; r < R; ++r) {
           const unsigned i = i0 + r;
           const unsigned redo = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_andnot_si256(inrange[r], snz[r]))));
@@ -521,7 +562,7 @@ __attribute__((target("avx2"))) inline void mma_avx2_chunked(unsigned M, unsigne
               if (special >> l & 1)
                 out[l] = std::bit_cast<uint32_t>(chunk_special(&A[i * lda + k0], 1, &B[k0 * ldb + jb * 8 + l], ldb, NC, std::bit_cast<float>(accv[l])));
               else if (redo >> l & 1)
-                out[l] = std::bit_cast<uint32_t>(detail::to_f32_rz(Sv[l], gv[l]));
+                out[l] = std::bit_cast<uint32_t>(ACC16 ? detail::to_f16_rn(Sv[l], gv[l]) : detail::to_f32_rz(Sv[l], gv[l]));
             }
             res[r] = _mm256_load_si256(reinterpret_cast<const __m256i*>(out));
           }
@@ -536,15 +577,20 @@ __attribute__((target("avx2"))) inline void mma_avx2_chunked(unsigned M, unsigne
   for (; i < M; ++i) rows(std::integral_constant<unsigned, 1>{}, i);
 }
 
-// The vector form for an f32 accumulator and an N that is a multiple of 8.
+// The vector form for an N that is a multiple of 8 (an f32 accumulator, or with acc_f16 an f16 one).
+template <bool ACC16>
+__attribute__((target("avx2"))) inline void mma_avx2_acc(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, const float* A, size_t lda, const float* B,
+                                                         size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
+  if (chunk == 8 && K % 8 == 0)
+    mma_avx2_chunked<8, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd);
+  else if (chunk == 4 && K % 4 == 0)
+    mma_avx2_chunked<4, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd);
+  else
+    mma_avx2_generic(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);   // (f32 accumulator only: mma() sends no other)
+}
 __attribute__((target("avx2"))) inline void mma_avx2(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, const float* A, size_t lda, const float* B,
                                                     size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
-  if (chunk == 8 && K % 8 == 0)
-    mma_avx2_chunked<8>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd);
-  else if (chunk == 4 && K % 4 == 0)
-    mma_avx2_chunked<4>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd);
-  else
-    mma_avx2_generic(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
+  mma_avx2_acc<false>(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
 }
 #endif
 
@@ -552,9 +598,15 @@ __attribute__((target("avx2"))) inline void mma_avx2(unsigned M, unsigned N, uns
 inline void mma(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, bool acc_f16, const float* A, size_t lda, const float* B,
                 size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
 #ifdef VGPU_TC86_AVX2
-  if (!acc_f16 && N % 8 == 0 && simd::enabled() && simd::kernels().level == simd::Level::Avx2) {
-    mma_avx2(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
-    return;
+  if (N % 8 == 0 && simd::enabled() && simd::kernels().level == simd::Level::Avx2) {
+    if (!acc_f16) {
+      mma_avx2(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
+      return;
+    }
+    if (K % chunk == 0 && (chunk == 8 || chunk == 4)) {   // (the f16 accumulator has the chunked form only)
+      mma_avx2_acc<true>(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
+      return;
+    }
   }
 #endif
   mma_scalar(M, N, K, chunk, emin, acc_f16, A, lda, B, ldb, C, ldc, D, ldd);
