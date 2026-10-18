@@ -206,7 +206,9 @@ for t in mfma_modes gfx9_added gfx9_semantics gfx9_decode; do
     out=$(VGPU_QUIET=1 VGPU_GPU=amd/${chip#*:} LD_LIBRARY_PATH="$shim" timeout 300 "$(dirname "$exe")/$t.${chip%%:*}" 2>&1)
     status=$?
     # A program that stops early leaves its reason in this output (a sanitizer's report, a refused instruction): show the end of it.
-    [[ $status -eq 0 ]] || printf '%s\n' "$out" | tail -40 | sed 's/^/      /'
+    # (A sanitizer's report: its first lines say what was touched and where; its last say where the thread was made.)
+    [[ $status -eq 0 ]] || { printf '%s\n' "$out" | awk '/ERROR: (Address|Leak|Thread|UndefinedBehavior)Sanitizer|runtime error:/ { p = 1 } p' | head -70
+                           printf '%s\n' "$out" | tail -8; } | sed 's/^/      /'
     expect "the $t program runs to the end on ${chip%%:*}" "0" "$status"
     expect "every $t check holds on ${chip%%:*}" "$t: 0 failed" "$(grep -E "^$t: [0-9]+ failed" <<< "$out")"
   done
