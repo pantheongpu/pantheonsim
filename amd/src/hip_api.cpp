@@ -114,6 +114,12 @@ std::atomic<uint64_t> g_next_code_object{1}, g_next_kernel{1}, g_next_dispatch{1
 
 const vgpu::amd::hipprof::Hooks* profiler() { return g_profiler.load(std::memory_order_acquire); }
 
+// Work is being queued on `stream` (a launch, a copy or a fill): a card's runtime makes the null stream's
+// queue, and its staging buffers, with the first of it.
+void note_queue_use(hipStream_t stream) {
+  if (const auto* p = profiler(); p && p->queue_used) p->queue_used(reinterpret_cast<uint64_t>(stream));
+}
+
 // One HIP call, from the outermost: a call one HIP function makes through
 // another is part of the first, as it is in ROCm's runtime.
 class ApiCall {
@@ -1049,6 +1055,7 @@ hipError_t launch_in_order(LaunchJob job) {
     (void)guard;
   }
   const hipStream_t stream = job.stream;
+  note_queue_use(stream);
   return in_order(stream, [job = std::move(job)] { return run_launch(job); });
 }
 
@@ -1495,6 +1502,7 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
     std::lock_guard<std::mutex> lock(s.mutex);
     for (const std::shared_ptr<Queue>& q : queues_of(s, from.ordinal, true)) after_source.push_back({q, q->tail()});
   }
+  if (!run_here) note_queue_use(stream);
   return run_here ? work() : in_order(stream, work, wait, std::move(after_source));
 }
 
@@ -1547,8 +1555,10 @@ hipError_t fill_region(void* dst, const Region& r, const uint8_t* pattern, uint3
   const std::vector<uint8_t> p(pattern, pattern + pattern_len);
   vgpu::MemoryManager* mem = side.mem;
   const bool on_device = side.device;
+  const int fill_device = side.ordinal;
   const uint64_t base = reinterpret_cast<uint64_t>(dst);
   const auto work = [=] {
+        const uint64_t fill_start = vgpu::amd::hipprof::now_ns();
         try {
           for (uint64_t z = 0; z < r.depth; ++z)
             for (uint64_t y = 0; y < r.rows; ++y) {
@@ -1564,10 +1574,15 @@ hipError_t fill_region(void* dst, const Region& r, const uint8_t* pattern, uint3
         } catch (const std::exception& e) {
           return fail(memory_error_code(e), e.what());
         }
+        // A run of device memory is one fill to a profiler; rows are the runtime's 2D fill, not reported.
+        if (on_device && r.rows == 1 && r.depth == 1)
+          if (const auto* pr = profiler(); pr && pr->filled)
+            pr->filled(fill_device, base, r.width, fill_start, vgpu::amd::hipprof::now_ns());
         return hipSuccess;
       };
   // A graph's launch runs its fill right here, on its stream's thread.
   if (sink) return work();
+  note_queue_use(stream);
   return in_order(stream, work, !async && !side.device);
 }
 // `bytes` bytes of a pattern.
@@ -3829,6 +3844,11 @@ int vgpu_hip_profiler_attach(const vgpu::amd::hipprof::Hooks* hooks) {
   return s.rt->device_count();
 }
 
+void vgpu_hip_profiler_reserve_ids(uint32_t kernels, uint64_t* code_object, uint64_t* first_kernel) {
+  *code_object = g_next_code_object.fetch_add(1);
+  *first_kernel = g_next_kernel.fetch_add(kernels);
+}
+
 int vgpu_hip_profiler_device(int ordinal, vgpu::amd::hipprof::Device* out) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
@@ -3852,6 +3872,11 @@ int vgpu_hip_profiler_device(int ordinal, vgpu::amd::hipprof::Device* out) {
   }
   d.clock_mhz = p.telemetry.sm_clock_max_mhz;
   d.vram_bytes = p.vram_bytes;
+  {
+    const vgpu::amd::Chip c = vgpu::amd::chip(p.architecture.c_str(), p.telemetry.pci_device_id);
+    d.shader_engines = c.engines;
+    d.arrays_per_engine = c.arrays;
+  }
   // The bus and UUID the device reports everywhere else: rocm-smi, sysfs.
   vgpu::telemetry::DeviceSample sample{};
   vgpu::telemetry::describe_device(p, s.rt->device(ordinal).physical(), &sample);
@@ -3933,6 +3958,11 @@ void release_to_thresholds(State& s) {   // the caller holds s.mutex
 // An allocation from `pool`, on the pool's device, in `stream`'s order: a
 // block the pool keeps where the reuse rules allow, or new memory as far as
 // the pool's maximum. The caller holds the lock.
+// A block taken from a memory pool or given back, as a profiler is told.
+void report_pool_block(int device, uint64_t address, uint64_t bytes, bool freed) {
+  if (const auto* p = profiler(); p && p->pool_block) p->pool_block(device, address, bytes, freed);
+}
+
 hipError_t pool_alloc(State& s, Pool* pool, void** ptr, size_t size, hipStream_t stream) {
   if (!ptr) return hipErrorInvalidValue;
   if (!size) {
@@ -3954,6 +3984,7 @@ hipError_t pool_alloc(State& s, Pool* pool, void** ptr, size_t size, hipStream_t
     *ptr = reinterpret_cast<void*>(k.va);
     pool->kept.erase(pool->kept.begin() + static_cast<std::ptrdiff_t>(i));
     s.pool_allocations[reinterpret_cast<uint64_t>(*ptr)] = {pool, size};
+    report_pool_block(pool->device, k.va, size, false);
     pool->used += size;
     pool->used_high = std::max(pool->used_high, pool->used);
     return hipSuccess;
@@ -3969,6 +4000,7 @@ hipError_t pool_alloc(State& s, Pool* pool, void** ptr, size_t size, hipStream_t
     return fail(hipErrorOutOfMemory, e.what());
   }
   s.pool_allocations[reinterpret_cast<uint64_t>(*ptr)] = {pool, size};
+  report_pool_block(pool->device, reinterpret_cast<uint64_t>(*ptr), size, false);
   pool->used += size;
   pool->used_high = std::max(pool->used_high, pool->used);
   pool->reserved_high = std::max(pool->reserved_high, pool->reserved());
@@ -4023,6 +4055,7 @@ hipError_t hipFreeAsync(void* ptr, hipStream_t stream) {
       const uint64_t size = pa->second.second;
       const uint64_t seq = o.queue->submit([] { return hipSuccess; }, std::move(o.after));
       p->kept.push_back({pa->first, size, o.queue, seq});
+      report_pool_block(p->device, pa->first, size, true);
       p->used -= size;
       s.pool_allocations.erase(pa);
       return record(s, hipSuccess);

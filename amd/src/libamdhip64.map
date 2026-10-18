@@ -589,4 +589,5 @@ VGPU_PRIVATE {
   global:
     vgpu_hip_profiler_attach;
     vgpu_hip_profiler_device;
+    vgpu_hip_profiler_reserve_ids;
 };

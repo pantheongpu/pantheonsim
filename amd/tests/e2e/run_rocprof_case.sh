@@ -27,6 +27,11 @@
 #   args            one call per kind of HIP parameter: how null and live pointers, handles, strings,
 #                   enums, integers and structs by value print
 #   agents          the GPU agent in every field (not a trace: rocprof_normalize.py --agents)
+#   runtime_kernels the runtime's own copy and fill kernels, by size and alignment
+#   scratch         private segments of several sizes on three queues (scratch-memory records)
+#   first_calls     which calls start the runtime and make its staging buffers
+#   graph_sizes     what a graph's instantiation allocates, by its kernel nodes
+#   async_sizes     the memory pool's mapped ranges, by size and synchronization
 #
 # The simulator has no timing model, so nothing in the comparison is a time.
 # The card's expected files were recorded on an RX 6800 (gfx1030) and, for
@@ -38,7 +43,7 @@
 # ROCPROF_CARD_DEVICE picks the HIP device (default 0 for rx6800, 1 for rx6700xt).
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
-usage="usage: $0 <vecadd|memset_d2d|copies|streams_events|graph|async_alloc|markers|markers_control|geometry|args|agents> [--gpu rx6800|rx6700xt] [--card [--update]]"
+usage="usage: $0 <vecadd|memset_d2d|copies|streams_events|graph|async_alloc|markers|markers_control|geometry|args|agents|runtime_kernels|scratch|first_calls|graph_sizes|async_sizes> [--gpu rx6800|rx6700xt] [--card [--update]]"
 case_name="${1:?$usage}"
 shift
 gpu=rx6800; card=0; update=0
