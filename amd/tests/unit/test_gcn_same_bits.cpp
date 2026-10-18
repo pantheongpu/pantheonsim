@@ -33,7 +33,7 @@ struct Corpus {
   amd::gcn::Target target;
 };
 const Corpus kCorpora[] = {
-    {"isa_corpus.txt", amd::gcn::Target::Gfx942},          {"isa_corpus_gfx950.txt", amd::gcn::Target::Gfx950},
+    {"isa_corpus.txt", amd::gcn::Target::Gfx942},          {"isa_corpus_sopp_gfx942.txt", amd::gcn::Target::Gfx942},          {"isa_corpus_gfx950.txt", amd::gcn::Target::Gfx950},
     {"isa_corpus_gfx90a.txt", amd::gcn::Target::Gfx90a},  {"isa_corpus_gfx1100.txt", amd::gcn::Target::Gfx1100},
     {"isa_corpus_gfx1201.txt", amd::gcn::Target::Gfx1200}, {"isa_corpus_gfx1250.txt", amd::gcn::Target::Gfx1250},
     {"isa_corpus_gfx1030.txt", amd::gcn::Target::Gfx1030},
@@ -74,7 +74,9 @@ void digest_corpus(const Corpus& c, std::vector<uint32_t>* digests, std::vector<
     }
     if (std::getenv("VGPU_SAME_BITS_TRACE")) std::fprintf(stderr, "%s: %s\n", c.file, text.c_str());
     try {
-      const amd::gcn::Inst in = amd::gcn::decode(code, 0, 0, c.target);
+      amd::gcn::Inst in = amd::gcn::decode(code, 0, 0, c.target);
+      // (A branch the corpus holds goes where it was: send it elsewhere, so that taking it shows.)
+      if (in.name.rfind("s_branch", 0) == 0 || in.name.rfind("s_cbranch", 0) == 0) in.target = 0x1000;
       if (skipped(in)) {
         digests->push_back(0);
         texts->push_back(text);
