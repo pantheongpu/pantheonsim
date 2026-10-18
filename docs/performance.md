@@ -1704,11 +1704,26 @@ before `window_check.hpp` was made a header, which moves no code; `VGPU_COUNTERS
   `local[l * local_size + o]`, so a warp-wide access touches 32 cache lines; interleaving by words, as the hardware does, would touch one. Every
   user of `Warp::local` would change; not done.
 * *Bank passes of warps that are not on a stride* (a tile read two rows at a time, a reduction's every-eighth lane) and sector counts
-  for 33 to 64 active lanes that are neither on a stride nor monotone still take the earlier code. `sass_bank_passes` is still 3 to 5% of
-  `blockScan`, `sortKV`, `fpdc`; `shmembench` 8.5%.
-* *Two-section ping-pong.* `bh` still spends about 5% in `fetch` and `Module::code_at`: a divergent warp alternates between a kernel's section
-  and a device function's, so the one-entry `Warp::code_hint` misses; a two-entry hint would catch it.
-
+  for 33 to 64 active lanes that are neither on a stride nor monotone still take the earlier code. Measured again on server2 (counting the
+  calls of `sass_bank_passes` that fall through `bank_passes_progression` to the table; `VGPU_THREADS=1`): `blockScan 64 1` 22.1 M calls,
+  3.2 M (15%) in the table, all 4-byte, 32 lanes, 78% of them one pass; `fpdc 255 8 1 2` 41.9 M calls, 2.1 M (5%) in the table, all one pass
+  of 16 lanes; `sortKV 65536 1` 0.63 M calls, 0.14 M (22%), 8-byte mostly unaligned, up to 17 passes; `shmembench 1` 167.9 M calls, none
+  in the table. So the table is not where the 3 to 9% is: for `shmembench` and most of `blockScan` and `fpdc` it is the stride test
+  (`lane_progression`, `on_stride`) that answers, once per access, which the program cannot avoid asking.
+  A tried alternative for the table's share: a 64-bit mask per bank over the 64 rows around the first lane's (bit = row, passes = the largest
+  popcount; a pre-test of "every lane in a bank of its own" for 4-byte accesses). Exact (same passes as the table over the cases tried) and,
+  alone, 1.5 to 2.5x faster on random, gathered and 8-byte unaligned warps, 2x on a permuted row of one pass, but 0.6 to 0.7x on a two-way
+  conflict of 4-byte lanes (the table is already cheap when banks hold one or two words), and a window of 64 rows sends wider warps back to
+  the table. Whole programs, A/B alternating 9 runs, one host thread, load average 10 to 24: `blockScan 64 1` 6.40 s vs 6.37 s median
+  (p=1.0), `sortKV 65536 1` 0.401 vs 0.404 s (B slower, p=0.002). Dropped: the calls that could gain are 0.6 to 15% of the calls, so even
+  a free table would be under 0.5% of a program. Not shipped.
+* *Two-section ping-pong.* This entry was stale: the one-entry `Warp::code_hint` already catches what `bh` did. A throwaway build with a
+  second entry and counters (first entry hit / second entry hit / `fetch`), over `bh 1500 2`, `bh 2000 2` and 28 other HeCBench programs of
+  `reduced.txt` (25 s each, one thread): the second entry was never hit (0 of 8.3e8 lookups in `bh`, 4.4k to 4.6k misses, which are the
+  first lookup of each warp); the other programs' misses are one per warp. A synthetic kernel whose lanes split between two `__noinline__`
+  device functions and the kernel's own code did not ping-pong either (64 misses of 15 M). A two-entry hint has nothing to catch, so
+  it was not shipped. (`bh` itself is not a usable benchmark here: with `VGPU_THREADS=1` it spins for minutes at `bh 2000 2` and above,
+  and with the default threads its instruction count differs from run to run, 8e8 to 1e9.)
 
 ## Memory lookups: PTX atomics and texels
 
