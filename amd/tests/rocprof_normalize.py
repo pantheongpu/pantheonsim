@@ -6,6 +6,9 @@ the simulator can be compared with diff.
     rocprof_normalize.py <results.json | directory of rocprofv3 -d output>
                          [--runtime-kernels]
     rocprof_normalize.py --strip-known-gaps < normalised.txt > comparable.txt
+    rocprof_normalize.py --agents <results.json | directory>
+         every field of the GPU agent (shader engines, SDMA engines, queues, clocks, memory banks,
+         caches, io links, firmware) but where the machine puts it: node, gpu_id, location, render minor, uuid
 
 What is kept, in the order the profiler numbered the calls (its correlation
 ids, which count API calls and dispatches as they happen):
@@ -110,7 +113,45 @@ def agent_lines(tool):
     return out
 
 
+# Where a GPU sits in a machine says nothing of the card: the machine numbers its nodes, hands out the render
+# minor and the KFD gpu_id, and the card's own UUID and handle are the machine's too.
+PLACEMENT = ("id", "size", "node_id", "logical_node_id", "logical_node_type_id", "gpu_id", "location_id",
+             "drm_render_minor", "uuid", "gpu_index")
+
+
+def flatten(prefix, v, out):
+    if isinstance(v, dict):
+        for k in v:
+            flatten("%s.%s" % (prefix, k) if prefix else k, v[k], out)
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            flatten("%s[%d]" % (prefix, i), x, out)
+    else:
+        out.append("%s=%s" % (prefix, v))
+
+
+def agent_fields(tool):
+    """Every field rocprofiler-sdk gives a GPU agent, one a line, but where it sits in the machine (--agents)."""
+    out = []
+    for a in tool["agents"]:
+        if a["type"] != 2 or not a.get("runtime_visibility", {}).get("hip", 1):
+            continue
+        out.append("[gpu agent %s]" % a["name"])
+        for k in a:
+            if k in PLACEMENT:
+                continue
+            fields = []
+            flatten(k, a[k], fields)
+            # An io link runs from the card's node, which the machine numbers.
+            out += [f for f in fields if not re.match(r"io_links\[\d+\]\.node_from=", f)]
+    return out
+
+
 def main():
+    if "--agents" in sys.argv:
+        argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+        print("\n".join(agent_fields(load(argv[0]))))
+        return
     if "--strip-known-gaps" in sys.argv:
         sys.stdout.write(strip_known_gaps(sys.stdin.read()))
         return

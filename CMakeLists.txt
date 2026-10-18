@@ -1571,6 +1571,21 @@ foreach(_case vecadd memset_d2d copies streams_events graph async_alloc markers 
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 endforeach()
 
+# The agent in every field, the files rocprofv3 writes besides results.json, and the counters a Radeon card offers
+# (amd/docs/rocprofiler.md), each compared with what the real cards printed.
+foreach(_gpu rx6800 rx6700xt)
+  foreach(_script agents outputs counters)
+    if(_script STREQUAL "agents")
+      set(_cmd ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh agents --gpu ${_gpu})
+    else()
+      set(_cmd ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_${_script}.sh --gpu ${_gpu})
+    endif()
+    add_test(NAME amd_rocprof_${_script}_${_gpu} COMMAND ${_cmd})
+    set_tests_properties(amd_rocprof_${_script}_${_gpu} PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+  endforeach()
+endforeach()
+
 # The host-memory guard seen from a HIP program: a reserve no host can meet makes every real chunk
 # of device memory an out-of-memory error (hipErrorOutOfMemory), not a crash.
 add_executable(test_amd_hip_host_guard amd/tests/unit/test_hip_host_guard.cpp)

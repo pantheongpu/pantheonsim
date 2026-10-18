@@ -6,6 +6,7 @@
 //
 // VGPU_GPU names the card (amd/rx6800, or amd/rx6700xt with HSA_OVERRIDE_GFX_VERSION=10.3.0, which makes
 // the HIP runtime see gfx1030 while the profiler's agent is still the gfx1031 card).
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -25,6 +26,9 @@ hipError_t hipHostFree(void* ptr);
 rocprofiler_status_t rocprofiler_force_configure(rocprofiler_configure_func_t);
 rocprofiler_status_t rocprofiler_query_available_agents(rocprofiler_agent_version_t,
                                                         rocprofiler_query_available_agents_cb_t, size_t, void*);
+rocprofiler_status_t rocprofiler_iterate_agent_supported_counters(rocprofiler_agent_id_t, rocprofiler_available_counters_cb_t,
+                                                                  void*);
+rocprofiler_status_t rocprofiler_query_counter_info(rocprofiler_counter_id_t, rocprofiler_counter_info_version_id_t, void*);
 rocprofiler_status_t rocprofiler_create_context(rocprofiler_context_id_t*);
 rocprofiler_status_t rocprofiler_start_context(rocprofiler_context_id_t);
 rocprofiler_status_t rocprofiler_configure_callback_tracing_service(rocprofiler_context_id_t,
@@ -263,6 +267,84 @@ VTEST(the_agent_is_the_card_as_kfd_counts_it) {
   VCHECK_EQ(g.wave_front_size, 32u);
   VCHECK_EQ(g.max_waves_per_cu, 32u);
   VCHECK_EQ(g.max_waves_per_simd, 16u);
+}
+
+// What rocprofv3 printed for the agent on the cards (amd/tests/data/rocprof_agents*.expected): the fields the
+// profile does not carry.
+VTEST(the_agent_has_the_fields_the_card_measured) {
+  run_once();
+  const rocprofiler_agent_v0_t& g = seen().agents[1];
+  VCHECK_EQ(g.num_xcc, 1u);
+  VCHECK_EQ(g.num_gws, 64u);
+  VCHECK_EQ(g.simd_arrays_per_engine, 2u);
+  VCHECK_EQ(g.cu_per_simd_array, 10u);
+  VCHECK_EQ(g.max_slots_scratch_cu, 32u);
+  VCHECK_EQ(g.num_sdma_queues_per_engine, 8u);
+  VCHECK_EQ(g.num_cp_queues, 8u);
+  VCHECK_EQ(g.max_engine_clk_ccompute, 5756u);
+  VCHECK_EQ(g.fw_version.Value, 116u);
+  VCHECK_EQ(g.family_id, 143u);
+  VCHECK_EQ(g.local_mem_size, uint64_t{0});   // KFD keeps a discrete card's memory in its bank
+  VCHECK_EQ(g.grid_max_size, 4294967295u);
+  VCHECK_EQ(g.grid_max_dim.y, 65535u);
+  VCHECK_EQ(g.mem_banks_count, 1u);
+  VCHECK_EQ(g.io_links_count, 1u);
+  VCHECK_EQ(g.io_links[0].max_bandwidth, 32000u);
+  VCHECK_EQ(g.io_links[0].node_to, 0u);
+  VCHECK_EQ(g.io_links[0].node_from, g.node_id);
+  if (is_rx6700xt()) {
+    VCHECK_EQ(std::string(g.model_name), std::string("navy_flounder"));
+    VCHECK_EQ(g.array_count, 4u);
+    VCHECK_EQ(g.num_shader_banks, 2u);
+    VCHECK_EQ(g.num_sdma_engines, 2u);
+    VCHECK_EQ(g.caches_count, 86u);
+    VCHECK_EQ(g.sdma_fw_version.Value, 80u);
+    VCHECK_EQ(g.max_engine_clk_fcompute, 2855u);
+    VCHECK_EQ(g.mem_banks[0].width, 192u);
+    VCHECK_EQ(g.mem_banks[0].size_in_bytes, uint64_t{12868124672});
+  } else {
+    VCHECK_EQ(std::string(g.model_name), std::string("sienna_cichlid"));
+    VCHECK_EQ(g.array_count, 8u);
+    VCHECK_EQ(g.num_shader_banks, 4u);
+    VCHECK_EQ(g.num_sdma_engines, 4u);
+    VCHECK_EQ(g.caches_count, 128u);
+    VCHECK_EQ(g.sdma_fw_version.Value, 83u);
+    VCHECK_EQ(g.max_engine_clk_fcompute, 2475u);
+    VCHECK_EQ(g.mem_banks[0].width, 256u);
+    VCHECK_EQ(g.mem_banks[0].size_in_bytes, uint64_t{17163091968});
+  }
+  VCHECK(g.caches[g.caches_count - 1].level == 3);
+}
+
+// The counters the card offers that are counted exactly: waves, and the agent's own properties. The cycle, stall and
+// cache counters are not offered, nor are the instruction counts the card could not be compared on.
+VTEST(only_the_counters_counted_exactly_are_offered) {
+  run_once();
+  const rocprofiler_agent_v0_t& g = seen().agents[1];
+  static std::vector<std::string> names;
+  names.clear();
+  VCHECK_EQ(rocprofiler_iterate_agent_supported_counters(
+                g.id,
+                [](rocprofiler_agent_id_t, rocprofiler_counter_id_t* ids, size_t n, void*) {
+                  for (size_t i = 0; i < n; ++i) {
+                    rocprofiler_counter_info_v0_t info{};
+                    rocprofiler_query_counter_info(ids[i], ROCPROFILER_COUNTER_INFO_VERSION_0, &info);
+                    names.push_back(info.name);
+                  }
+                  return ROCPROFILER_STATUS_SUCCESS;
+                },
+                nullptr),
+            ROCPROFILER_STATUS_SUCCESS);
+  auto has = [&](const char* n) { return std::find(names.begin(), names.end(), n) != names.end(); };
+  VCHECK(has("SQ_WAVES"));
+  VCHECK(has("SQ_WAVES_sum"));
+  VCHECK(has("Wavefronts"));
+  VCHECK(has("SE_NUM"));
+  VCHECK(has("num_sdma_engines"));
+  VCHECK(!has("SQ_WAVES_EQ_64"));   // CDNA's: a wave32 card has no counter of 64-lane waves
+  VCHECK(!has("SQ_INSTS_MFMA"));
+  VCHECK(!has("GRBM_COUNT"));
+  VCHECK(!has("SQ_INSTS_VALU"));
 }
 
 VTEST(a_code_object_is_named_by_a_uri_and_its_kernels_by_their_descriptors) {
