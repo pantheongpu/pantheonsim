@@ -1553,17 +1553,17 @@ set_tests_properties(test_amd_rocprofiler_rx6800 PROPERTIES ENVIRONMENT "VGPU_GP
 add_test(NAME test_amd_rocprofiler_rx6700xt COMMAND test_amd_rocprofiler_rdna)
 set_tests_properties(test_amd_rocprofiler_rx6700xt PROPERTIES
   ENVIRONMENT "VGPU_GPU=amd/rx6700xt;HSA_OVERRIDE_GFX_VERSION=10.3.0;VGPU_QUIET=1")
-# What rocprofv3 recorded for small HIP programs on a real RX 6800 (and, for vecadd, an RX 6700 XT), compared with
+# What rocprofv3 recorded for small HIP programs on a real RX 6800 and an RX 6700 XT, compared with
 # what it records on the simulated card. Skips where there is no ROCm with rocprofv3 and hipcc.
 foreach(_case vecadd memset_d2d copies streams_events graph async_alloc markers geometry)
   add_test(NAME amd_rocprof_${_case} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh ${_case})
   set_tests_properties(amd_rocprof_${_case} PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+  add_test(NAME amd_rocprof_${_case}_rx6700xt
+    COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh ${_case} --gpu rx6700xt)
+  set_tests_properties(amd_rocprof_${_case}_rx6700xt PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 endforeach()
-add_test(NAME amd_rocprof_vecadd_rx6700xt
-  COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh vecadd --gpu rx6700xt)
-set_tests_properties(amd_rocprof_vecadd_rx6700xt PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 
 # The host-memory guard seen from a HIP program: a reserve no host can meet makes every real chunk
 # of device memory an out-of-memory error (hipErrorOutOfMemory), not a crash.

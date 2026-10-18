@@ -16,7 +16,7 @@ is a time.
 ## The card oracle
 
 `amd/tests/rocprof/<case>.cpp` are small hipcc programs (milliseconds on a card). For each,
-`rocprofv3` was run on a real **Radeon RX 6800** (gfx1030, HIP device 0) and, for `vecadd`, a real
+`rocprofv3` was run on a real **Radeon RX 6800** (gfx1030, HIP device 0) and a real
 **Radeon RX 6700 XT** (gfx1031, run as gfx1030 under `HSA_OVERRIDE_GFX_VERSION=10.3.0`), with ROCm
 7.2.0 and rocprofv3 1.1.0:
 
@@ -27,11 +27,10 @@ rocprofv3 --hip-trace --kernel-trace --memory-copy-trace --memory-allocation-tra
 
 `amd/tests/rocprof_normalize.py` (Python standard library only) reduces the JSON to text that does not
 depend on time, addresses or the machine, and the result is `amd/tests/data/rocprof_<case>.expected`
-(`rocprof_vecadd.rx6700xt.expected` for the second card). The simulator runs the same program under the
+(`rocprof_<case>.rx6700xt.expected` for the second card). The simulator runs the same program under the
 same command, inside `vgpu shell --gpu amd/rx6800` (or `amd/rx6700xt`), and its trace is normalised the
 same way and compared. Both cards give the same trace for every case but the agent line (name, ISA,
-compute units), and the program is the same gfx1030 code object on both, so only one case is kept for
-the second card.
+compute units); all eight cases were recorded on both and the simulator matches each.
 
 | case | what the program does |
 | --- | --- |
@@ -68,7 +67,7 @@ VGPU_BUILD_DIR=build amd/tests/e2e/run_rocprof_case.sh vecadd --gpu rx6700xt
 amd/tests/e2e/run_rocprof_case.sh vecadd --card
 ```
 
-The tests are `amd_rocprof_<case>` and `amd_rocprof_vecadd_rx6700xt` in ctest; they print
+The tests are `amd_rocprof_<case>` and `amd_rocprof_<case>_rx6700xt` in ctest; they print
 `SKIP: ...` and are skipped where there is no rocprofv3 (GitHub's hosted runners, and the
 pantheonsim.com runner's image), or where ROCm's rocprofv3 is not the release the files were recorded with
 (`ROCPROF_ANY_VERSION=1` compares anyway). `ROCPROF_KEEP=<dir>` keeps the raw JSON of a run.
@@ -84,7 +83,9 @@ On a machine with the card, ROCm 7.2 (`hipcc`, `rocprofv3`) and nothing else on 
 for c in vecadd memset_d2d copies streams_events graph async_alloc markers geometry; do
   amd/tests/e2e/run_rocprof_case.sh $c --card --update          # the RX 6800 (HIP device 0)
 done
-amd/tests/e2e/run_rocprof_case.sh vecadd --card --update --gpu rx6700xt   # the RX 6700 XT (HIP device 1)
+for c in vecadd memset_d2d copies streams_events graph async_alloc markers geometry; do
+  amd/tests/e2e/run_rocprof_case.sh $c --card --update --gpu rx6700xt   # the RX 6700 XT (HIP device 1)
+done
 ```
 
 `ROCPROF_CARD_DEVICE=<n>` names another HIP device. The script sets `HIP_VISIBLE_DEVICES` itself: a
