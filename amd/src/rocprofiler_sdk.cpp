@@ -43,14 +43,17 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include "vgpu/hip_profiler.hpp"
 #include "vgpu/rocprofiler_abi.hpp"
+#include "rocprofiler_hip_args.hpp"
 
 using namespace vgpu::amd::rocprof;
 namespace hp = vgpu::amd::hipprof;
+namespace ha = vgpu::amd::hipargs;
 using vgpu::amd::DispatchStats;
 
 #define ROCPROFILER_API extern "C" __attribute__((visibility("default")))
@@ -68,7 +71,16 @@ struct Counter {
   const char* expression;     // "" for a hardware counter
   uint64_t (*value)(const DispatchStats&);
   const char* description;
+  // A counter that is a property of the agent, not something a dispatch does (what rocprofiler-sdk calls a
+  // constant): its value, whatever ran.
+  uint64_t (*constant)(const rocprofiler_agent_v0_t&) = nullptr;
+  // A counter of the instructions waves of one size issued: the other size's waves add nothing (0 for any).
+  uint32_t wave_only = 0;
 };
+
+#define AGENT_CONSTANT(field) \
+  {#field, "", "", nullptr, "Constant value " #field " from agent properties", \
+   [](const rocprofiler_agent_v0_t& a) -> uint64_t { return a.field; }}
 
 const Counter kCounters[] = {
     {"SQ_WAVES", "SQ", "", [](const DispatchStats& s) { return s.waves; },
@@ -207,6 +219,45 @@ const Counter kCounters[] = {
     {"TA_FLAT_ATOMIC_WAVEFRONTS_sum", "", "reduce(TA_FLAT_ATOMIC_WAVEFRONTS,sum)",
      [](const DispatchStats& s) { return s.counts.flat_atomic; },
      "Number of flat opcode atomics processed by the TA. Sum over TA instances."},
+    // Offered on Radeon cards only (rdna_counter below); the names and descriptions are the RX 6800's.
+    {"TA_FLAT_LOAD_WAVEFRONTS", "TA", "", [](const DispatchStats& s) { return s.counts.flat_read; },
+     " Number of flat load vec32 packets processed by TA, same as flat_read_wavefronts in earlier IP"},
+    {"TA_FLAT_STORE_WAVEFRONTS", "TA", "", [](const DispatchStats& s) { return s.counts.flat_write; },
+     "Number of flat store vec32 packets processed by TA, same as flat_write_wavefronts in earlier IP"},
+    {"TA_FLAT_LOAD_WAVEFRONTS_sum", "", "reduce(TA_FLAT_LOAD_WAVEFRONTS,sum)",
+     [](const DispatchStats& s) { return s.counts.flat_read; },
+     "Number of flat load vec32 packets processed by the TA. Sum over TA instances."},
+    {"TA_FLAT_STORE_WAVEFRONTS_sum", "", "reduce(TA_FLAT_STORE_WAVEFRONTS,sum)",
+     [](const DispatchStats& s) { return s.counts.flat_write; },
+     "Number of flat store vec32 packets processed by the TA. Sum over TA instances."},
+    {"SQ_WAVE32_INSTS", "SQ", "", [](const DispatchStats& s) { return s.instructions; },
+     "Number of instructions issued by wave32 waves. Skipped instructions are not counted. {emulated}", nullptr, 32},
+    {"SQ_WAVE64_INSTS", "SQ", "", [](const DispatchStats& s) { return s.instructions; },
+     "Number of instructions issued by wave64 waves. Skipped instructions are not counted. {emulated}", nullptr, 64},
+    // Offered on Radeon cards only (rdna_counter below).
+    {"Wavefronts", "", "reduce(SQ_WAVES,sum)", [](const DispatchStats& s) { return s.waves; }, "Total wavefronts."},
+    // The constants a Radeon card offers (rocprofv3-avail on the RX 6800 and RX 6700 XT): the agent's properties.
+    AGENT_CONSTANT(num_xcc), AGENT_CONSTANT(array_count), AGENT_CONSTANT(num_gws), AGENT_CONSTANT(simd_id_base),
+    AGENT_CONSTANT(max_waves_per_simd), AGENT_CONSTANT(gfx_target_version), AGENT_CONSTANT(cpu_core_id_base),
+    AGENT_CONSTANT(location_id), AGENT_CONSTANT(wave_front_size), AGENT_CONSTANT(lds_size_in_kb),
+    AGENT_CONSTANT(simd_count), AGENT_CONSTANT(simd_per_cu), AGENT_CONSTANT(mem_banks_count),
+    AGENT_CONSTANT(cpu_cores_count), AGENT_CONSTANT(io_links_count), AGENT_CONSTANT(domain),
+    AGENT_CONSTANT(max_engine_clk_fcompute), AGENT_CONSTANT(caches_count), AGENT_CONSTANT(simd_arrays_per_engine),
+    AGENT_CONSTANT(gds_size_in_kb), AGENT_CONSTANT(cu_per_simd_array), AGENT_CONSTANT(max_slots_scratch_cu),
+    AGENT_CONSTANT(vendor_id), AGENT_CONSTANT(device_id), AGENT_CONSTANT(drm_render_minor),
+    AGENT_CONSTANT(num_sdma_engines), AGENT_CONSTANT(num_sdma_xgmi_engines), AGENT_CONSTANT(num_sdma_queues_per_engine),
+    AGENT_CONSTANT(hive_id), AGENT_CONSTANT(num_cp_queues), AGENT_CONSTANT(max_engine_clk_ccompute),
+    AGENT_CONSTANT(local_mem_size),
+    {"CU_NUM", "", "simd_count/simd_per_cu", nullptr, "CU_NUM",
+     [](const rocprofiler_agent_v0_t& a) -> uint64_t { return a.simd_per_cu ? a.simd_count / a.simd_per_cu : 0; }},
+    {"SIMD_NUM", "", "simd_count", nullptr, "SIMD Number",
+     [](const rocprofiler_agent_v0_t& a) -> uint64_t { return a.simd_count; }},
+    {"SE_NUM", "", "array_count/simd_arrays_per_engine", nullptr, "SE_NUM",
+     [](const rocprofiler_agent_v0_t& a) -> uint64_t {
+       return a.simd_arrays_per_engine ? a.array_count / a.simd_arrays_per_engine : 0;
+     }},
+    {"MAX_WAVE_SIZE", "", "wave_front_size", nullptr, "Max wave size constant",
+     [](const rocprofiler_agent_v0_t& a) -> uint64_t { return a.wave_front_size; }},
 };
 constexpr size_t kCounterCount = sizeof kCounters / sizeof kCounters[0];
 
@@ -215,6 +266,33 @@ constexpr size_t kCounterCount = sizeof kCounters / sizeof kCounters[0];
 // or texture unit a wave used -- the value a tool gets by summing a real GPU's
 // instances. An instance id is the counter's id above its position.
 const Counter* counter(uint64_t id) { return id >= 1 && id <= kCounterCount ? &kCounters[id - 1] : nullptr; }
+
+// The counters a Radeon card (gfx10 and later) offers that the interpreter counts exactly: of what rocprofv3-avail
+// lists on the RX 6800 and RX 6700 XT (gfx1030, gfx1031), the waves a dispatch starts and the instructions its
+// waves issue, by unit (VALU, SALU, SMEM, FLAT, LDS, GDS), by wave size, and the flat loads and stores the texture
+// addresser takes. None of their values could be compared with a card's -- rocprofv3 --pmc aborts on the machine
+// the names were taken from -- so they are the interpreter's counts under the card's names and descriptions. The
+// card's other instruction counters stay refused: SQ_INSTS_WAVE32* count a wave64 instruction "1 or 2" times by what
+// gets issued, and the averages (VALUInsts, ...) are fractions. So do the cycle, stall and cache counters, which
+// need a model of time.
+bool rdna_counter(const Counter& c) {
+  static const char* const names[] = {"SQ_WAVES", "SQ_WAVES_sum", "Wavefronts", "SQ_INSTS_VALU", "SQ_INSTS_SALU",
+                                      "SQ_INSTS_SMEM", "SQ_INSTS_FLAT", "SQ_INSTS_LDS", "SQ_INSTS_GDS",
+                                      "TA_FLAT_LOAD_WAVEFRONTS", "TA_FLAT_LOAD_WAVEFRONTS_sum",
+                                      "TA_FLAT_STORE_WAVEFRONTS", "TA_FLAT_STORE_WAVEFRONTS_sum", "SQ_WAVE32_INSTS",
+                                      "SQ_WAVE64_INSTS"};
+  for (const char* n : names)
+    if (std::string_view(c.name) == n) return true;
+  return false;
+}
+bool offers(const rocprofiler_agent_v0_t& a, uint64_t id) {
+  const Counter* c = counter(id);
+  if (!c || a.type != ROCPROFILER_AGENT_TYPE_GPU) return false;
+  if (a.gfx_target_version >= 100000) return rdna_counter(*c) || c->constant;
+  const std::string_view n = c->name;
+  return !c->constant && n != "Wavefronts" && n.substr(0, 14) != "TA_FLAT_LOAD_W" && n.substr(0, 14) != "TA_FLAT_STORE_" &&
+         n != "SQ_WAVE32_INSTS" && n != "SQ_WAVE64_INSTS";
+}
 uint64_t instance_id(uint64_t counter_id) { return counter_id << 32; }
 
 const rocprofiler_counter_record_dimension_info_t kDimension{"DIMENSION_INSTANCE", 1, 0};
@@ -276,6 +354,21 @@ ApiId hip_api_id(const char* name) {
   return it == ids.end() ? ApiId{} : it->second;
 }
 
+// The argument table of the HIP call with this operation number.
+const ha::CallSpec* call_spec(bool compiler, int op) {
+  static const std::map<std::pair<bool, int>, const ha::CallSpec*>& by_op =
+      *new std::map<std::pair<bool, int>, const ha::CallSpec*>([] {
+        std::map<std::pair<bool, int>, const ha::CallSpec*> m;
+        for (const HipApi& a : kHipApis)
+          if (const ha::CallSpec* c = ha::find(a.name)) m.emplace(std::make_pair(false, a.id), c);
+        for (const HipApi& a : kHipCompilerApis)
+          if (const ha::CallSpec* c = ha::find(a.name)) m.emplace(std::make_pair(true, a.id), c);
+        return m;
+      }());
+  const auto it = by_op.find({compiler, op});
+  return it == by_op.end() ? nullptr : it->second;
+}
+
 // The operations of the kinds this names: the names are the enumerations'
 // own, less their prefix.
 const std::vector<const char*>* operation_names(const char* kind) {
@@ -294,6 +387,19 @@ const std::vector<const char*>* operation_names(const char* kind) {
                                   "RUNTIME_INITIALIZATION_RCCL", "RUNTIME_INITIALIZATION_ROCDECODE",
                                   "RUNTIME_INITIALIZATION_ROCJPEG"}},
       {"HIP_STREAM", {"HIP_STREAM_NONE", "HIP_STREAM_CREATE", "HIP_STREAM_DESTROY", "HIP_STREAM_SET"}},
+  };
+  const auto it = ops.find(kind);
+  return it == ops.end() ? nullptr : &it->second;
+}
+
+// ROCTx's operations count from 0 (roctxMarkA is operation 0), the other kinds' from 1.
+const std::vector<const char*>* marker_operation_names(const char* kind) {
+  static const std::map<std::string, std::vector<const char*>> ops = {
+      {"MARKER_CORE_API", {"roctxMarkA", "roctxRangePushA", "roctxRangePop", "roctxRangeStartA", "roctxRangeStop",
+                           "roctxGetThreadId"}},
+      {"MARKER_CONTROL_API", {"roctxProfilerPause", "roctxProfilerResume"}},
+      {"MARKER_NAME_API", {"roctxNameOsThread", "roctxNameHsaAgent", "roctxNameHipDevice", "roctxNameHipStream"}},
+      {"MARKER_CORE_RANGE_API", {"roctxMarkA", "roctxThreadRangeA", "roctxProcessRangeA", "roctxGetThreadId"}},
   };
   const auto it = ops.find(kind);
   return it == ops.end() ? nullptr : &it->second;
@@ -318,6 +424,8 @@ const char* operation_name(const char* kind, int op) {
       if (a.id == op) return a.name;
     return nullptr;
   }
+  if (const auto* names = marker_operation_names(kind))
+    return op >= 0 && static_cast<size_t>(op) < names->size() ? (*names)[static_cast<size_t>(op)] : nullptr;
   const auto* names = operation_names(kind);
   if (!names || op <= 0 || static_cast<size_t>(op) >= names->size()) return nullptr;
   return (*names)[static_cast<size_t>(op)];
@@ -333,6 +441,11 @@ rocprofiler_status_t iterate_operations(const char* kind, Cb&& each) {
   if (is_hip_compiler_api(kind)) {
     for (const HipApi& a : kHipCompilerApis)
       if (each(a.id) != 0) break;
+    return ROCPROFILER_STATUS_SUCCESS;
+  }
+  if (const auto* names = marker_operation_names(kind)) {
+    for (size_t op = 0; op < names->size(); ++op)
+      if (each(static_cast<int>(op)) != 0) break;
     return ROCPROFILER_STATUS_SUCCESS;
   }
   if (const auto* names = operation_names(kind))
@@ -404,6 +517,11 @@ struct Client {
 struct Agents {
   std::vector<rocprofiler_agent_v0_t> list;
   std::deque<std::string> strings;   // what the agents' names point into
+  // What a card's memory banks, caches and io links point into (kept where they were put: a deque's
+  // elements do not move when the agents do).
+  std::deque<std::vector<rocprofiler_agent_mem_bank_t>> banks;
+  std::deque<std::vector<rocprofiler_agent_cache_t>> caches;
+  std::deque<std::vector<rocprofiler_agent_io_link_t>> links;
   std::vector<int> ordinal;          // each agent's device, or -1 for the CPU
 };
 
@@ -414,6 +532,7 @@ struct Sdk {
   std::vector<Context> contexts;
   std::vector<Buffer> buffers;
   std::map<uint64_t, Config> configs;
+  std::map<uint64_t, uint32_t> kernel_wave_size;   // by kernel id: the wave size the kernel was compiled for
   uint64_t next_config = 1, next_callback_thread = 1;
   Agents agents;
   bool agents_ready = false;
@@ -437,6 +556,14 @@ Sdk& sdk() {
 }
 
 uint64_t thread_id() { return static_cast<uint64_t>(::syscall(SYS_gettid)); }
+
+// Work on a stream runs on a thread of the runtime's own, not on the one that called the HIP function, but the
+// card's records of a dispatch carry the calling thread's id: the thread of the latest HIP call entered.
+std::atomic<uint64_t> g_api_thread{0};
+uint64_t dispatch_thread() {
+  const uint64_t t = g_api_thread.load(std::memory_order_relaxed);
+  return t ? t : thread_id();
+}
 
 // The caller holds the lock.
 const char* intern(Sdk& s, const std::string& v) { return s.interned.insert(v).first->c_str(); }
@@ -484,6 +611,56 @@ uint32_t gfx_target_version(const std::string& gfx) {
 // have no scalar register allocation to report, and count compute units in pairs.
 constexpr uint32_t kRdnaFirst = 100000;
 
+// What KFD and rocprofv3 say of a Radeon card beyond what its profile carries, as rocprofv3 printed it on the
+// real card (amd/tools/rocprof-agent-inc.py generates the table from that output and the topology measured in
+// amd/registers/measurements). Keyed by the PCI device id; a card that was not measured has no entry and keeps
+// zeros there rather than a guess.
+struct CardBank { uint32_t heap, flags, width, clk; uint64_t size; };
+struct CardCache { uint64_t processor_id_low, size; uint32_t level, line, per_tag, association, type; };
+struct CardLink { uint32_t type, major, minor, weight, min_latency, max_latency, min_bandwidth, max_bandwidth,
+                  transfer, flags, node_to; };
+struct CardAgent {
+  uint32_t device_id;
+  const char* model_name;
+  uint64_t v[18];   // simd_id_base ... local_mem_size, in the order amd/tools/rocprof-agent-inc.py writes them
+  uint32_t sdma_fw, fw, capability, grid_x, grid_y, grid_z, rccl, rocdecode;
+  std::vector<CardBank> banks;
+  std::vector<CardCache> caches;
+  std::vector<CardLink> links;
+};
+const std::vector<CardAgent>& card_agents() {
+  static const std::vector<CardAgent>& cards = *new std::vector<CardAgent>{
+#include "rocprofiler_rdna_agents.inc"
+  };
+  return cards;
+}
+
+void apply_card(Agents& a, rocprofiler_agent_v0_t& g, const CardAgent& c) {
+  auto keep = [&](const char* v) { return a.strings.emplace_back(v).c_str(); };
+  g.simd_id_base = c.v[0], g.num_gws = c.v[1], g.num_xcc = c.v[2], g.array_count = c.v[3];
+  g.num_shader_banks = c.v[4], g.simd_arrays_per_engine = c.v[5], g.cu_per_simd_array = c.v[6];
+  g.max_slots_scratch_cu = c.v[7], g.num_sdma_engines = c.v[8], g.num_sdma_xgmi_engines = c.v[9];
+  g.num_sdma_queues_per_engine = c.v[10], g.num_cp_queues = c.v[11];
+  g.max_engine_clk_ccompute = c.v[12], g.max_engine_clk_fcompute = c.v[13];
+  g.cu_per_engine = c.v[14], g.family_id = c.v[15], g.grid_max_size = c.v[16], g.local_mem_size = c.v[17];
+  g.sdma_fw_version.Value = c.sdma_fw, g.fw_version.Value = c.fw, g.capability.Value = c.capability;
+  g.grid_max_dim = {c.grid_x, c.grid_y, c.grid_z};
+  g.runtime_visibility.rccl = c.rccl, g.runtime_visibility.rocdecode = c.rocdecode;
+  g.model_name = keep(c.model_name);
+  auto& banks = a.banks.emplace_back();
+  for (const CardBank& b : c.banks) banks.push_back({{b.heap}, {b.flags}, b.width, b.clk, b.size});
+  auto& caches = a.caches.emplace_back();
+  for (const CardCache& k : c.caches)
+    caches.push_back({k.processor_id_low, k.size, k.level, k.line, k.per_tag, k.association, 0, {k.type}});
+  auto& links = a.links.emplace_back();
+  for (const CardLink& l : c.links)
+    links.push_back({{l.type}, l.major, l.minor, 0, l.node_to, l.weight, l.min_latency, l.max_latency,
+                     l.min_bandwidth, l.max_bandwidth, l.transfer, {l.flags}});
+  g.mem_banks = banks.data(), g.mem_banks_count = static_cast<uint32_t>(banks.size());
+  g.caches = caches.data(), g.caches_count = static_cast<uint32_t>(caches.size());
+  g.io_links = links.data(), g.io_links_count = static_cast<uint32_t>(links.size());
+}
+
 // The machine's agents as KFD numbers them: the CPU first, then each GPU.
 // What a GPU's profile does not say (its shader engines and arrays, its
 // XCDs, its engines' firmware) is left zero rather than guessed.
@@ -525,6 +702,10 @@ Agents build_agents() {
     g.max_waves_per_cu = d.wave_size ? d.max_threads_per_cu / d.wave_size / (rdna ? 2 : 1) : 0;
     g.max_waves_per_simd = g.max_waves_per_cu / g.simd_per_cu;
     g.lds_size_in_kb = d.lds_bytes / 1024;
+    // The chip's shader engines and arrays, as KFD counts them (an RX 6800: 4 engines of 2 arrays).
+    g.num_shader_banks = d.shader_engines;
+    g.simd_arrays_per_engine = d.arrays_per_engine;
+    g.array_count = d.shader_engines * d.arrays_per_engine;
     g.gfx_target_version = gfx_target_version(gfx);
     g.vendor_id = d.vendor_id;
     g.device_id = d.device_id;
@@ -546,6 +727,8 @@ Agents build_agents() {
     g.runtime_visibility.hsa = 1;
     g.runtime_visibility.hip = 1;
     std::memcpy(g.uuid.bytes, d.uuid, sizeof g.uuid.bytes);
+    for (const CardAgent& c : card_agents())
+      if (c.device_id == d.device_id && rdna) apply_card(a, g, c);
     a.list.push_back(g);
     a.ordinal.push_back(i);
   }
@@ -555,6 +738,10 @@ Agents build_agents() {
     a.list[i].logical_node_type_id = a.ordinal[i] < 0 ? 0 : a.ordinal[i];
     // An agent's id is its node, from 1: zero is no agent.
     a.list[i].id.handle = i + 1;
+    // A card's io link runs from its own node.
+    if (a.list[i].io_links)
+      for (uint32_t k = 0; k < a.list[i].io_links_count; ++k)
+        const_cast<rocprofiler_agent_io_link_t&>(a.list[i].io_links[k]).node_from = a.list[i].node_id;
   }
   return a;
 }
@@ -657,7 +844,14 @@ struct ApiFrame {
   uint64_t correlation = 0;
   int op = -1;
   bool compiler = false;   // a HIP compiler API call, not a runtime one
+  int runtime_call = 0;    // what the runtime model does at this call (RuntimeCall)
   uint64_t start = 0;
+  uint64_t ancestor = 0;   // the ROCTx range the thread was in when the call began
+  // The call's arguments as rocprofiler_hip_api_args_t lays them out, when the entry point handed them over.
+  const ha::CallSpec* spec = nullptr;
+  bool has_args = false;
+  alignas(8) uint8_t args[ha::kArgsBytes] = {};
+  std::vector<rocprofiler_user_data_t> user;   // per context that took the call's callbacks, entry to exit
 };
 // A thread's HIP calls in progress. exit() destroys the thread's
 // thread_local objects before it runs the libraries' static destructors, and
@@ -770,9 +964,479 @@ void ensure_configured() {
   if (!s.configured && configures_itself()) configure(nullptr);
 }
 
+// ---- ROCTx ------------------------------------------------------------------------------
+//
+// ROCTx's library hands rocprofiler_set_api_table its three tables (core, control, name) when it starts and
+// rocprofiler-register finds this library. Each entry is wrapped here the way rocprofiler-sdk wraps them. A call a
+// context subscribed to takes a correlation id of its own and is delivered to the tool as callback-tracing records
+// (MARKER_CORE_API, MARKER_CONTROL_API, MARKER_NAME_API: enter, then exit, with the call's arguments and return
+// value in the payload) and as buffer-tracing records of the same kinds.
+//
+// The marks and ranges a program makes are a kind of their own, MARKER_CORE_RANGE_API (rocprofv3 asks for these,
+// and for MARKER_CONTROL_API, and reads the messages from their payloads): roctxMarkA is one callback with no
+// phase, roctxThreadRangeA (a roctxRangePushA and its roctxRangePop) and roctxProcessRangeA (a roctxRangeStartA and
+// its roctxRangeStop) an enter callback where the range begins and an exit callback where it ends, with the
+// message in both and the same user data pointer. A range's correlation id is the id of the call that began it.
+// A buffer record of a range is written when it ends.
+//
+// A call made while a range is open -- on its thread, innermost first, a range begun with roctxRangeStartA
+// included until it is stopped -- has that range's correlation id as its ancestor: a HIP call, a mark, a range
+// begun inside it. Measured on an RX 6800 and an RX 6700 XT (amd/tests/data/rocprof_markers*.expected).
+//
+// A call nobody subscribed to is passed through: it takes no correlation id and is not traced, as in
+// rocprofiler-sdk.
+namespace roctx {
+
+enum Group { kCore, kControl, kName };
+enum CoreOp { kMark = 0, kPush, kPop, kStart, kStop, kGetThreadId };
+enum RangeOp { kRangeMark = 0, kThreadRange = 1, kProcessRange = 2, kRangeThreadId = 3 };
+
+// An open range.
+struct Scope {
+  uint64_t correlation = 0;
+  uint64_t ancestor = 0;
+  uint64_t start = 0;
+  uint64_t thread = 0;
+  bool process = false;     // begun by roctxRangeStartA, not roctxRangePushA
+  uint64_t range_id = 0;    // what roctxRangeStartA returned, for roctxRangeStop
+  std::string message;
+  std::map<uint64_t, rocprofiler_user_data_t> user, external;   // by context
+};
+
+struct State {
+  std::map<uint64_t, std::vector<std::shared_ptr<Scope>>> threads;   // each thread's open ranges, outermost first
+  roctxCoreApiTable_t core{};                                        // ROCTx's own functions
+  roctxControlApiTable_t control{};
+  roctxNameApiTable_t name{};
+};
+State& state() {
+  static State* st = new State;
+  return *st;
+}
+
+struct Kind {
+  int callback, buffer, request;
+};
+Kind kind_of(Group g) {
+  switch (g) {
+    case kCore:
+      return {ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_API, ROCPROFILER_BUFFER_TRACING_MARKER_CORE_API,
+              ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_MARKER_CORE_API};
+    case kControl:
+      return {ROCPROFILER_CALLBACK_TRACING_MARKER_CONTROL_API, ROCPROFILER_BUFFER_TRACING_MARKER_CONTROL_API,
+              ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_MARKER_CONTROL_API};
+    default:
+      return {ROCPROFILER_CALLBACK_TRACING_MARKER_NAME_API, ROCPROFILER_BUFFER_TRACING_MARKER_NAME_API,
+              ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_MARKER_NAME_API};
+  }
+}
+
+// One call, from its first callback to its last record.
+struct Event {
+  Group group = kCore;
+  int op = 0;
+  bool traced = false;   // some active context asked for the call itself
+  bool ranged = false;   // ... for the range it begins
+  uint64_t correlation = 0, ancestor = 0, thread = 0, start = 0;
+  std::map<uint64_t, rocprofiler_user_data_t> user, external;   // by context
+};
+
+// The caller holds the lock.
+bool wanted(Sdk& s, Group g, int op) {
+  const Kind k = kind_of(g);
+  bool any = false;
+  for_callbacks(s, k.callback, op, [&](Context&, CallbackService&) { any = true; });
+  for_buffered(s, k.buffer, op, [&](Context&, uint64_t) { any = true; });
+  return any;
+}
+bool range_wanted(Sdk& s, int op) {
+  bool any = false;
+  for_callbacks(s, ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_RANGE_API, op, [&](Context&, CallbackService&) { any = true; });
+  for_buffered(s, ROCPROFILER_BUFFER_TRACING_MARKER_CORE_RANGE_API, op, [&](Context&, uint64_t) { any = true; });
+  return any;
+}
+
+uint64_t scope_of(uint64_t thread) {
+  State& st = state();
+  const auto it = st.threads.find(thread);
+  return it == st.threads.end() || it->second.empty() ? 0 : it->second.back()->correlation;
+}
+
+// Begins a call: its correlation id and ancestor, if anyone is watching it or the range it opens.
+Event begin(Group g, int op, int range_op = -1) {
+  Sdk& s = sdk();
+  Event e;
+  e.group = g;
+  e.op = op;
+  e.thread = thread_id();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  if (s.finalized) return e;
+  e.traced = wanted(s, g, op);
+  e.ranged = range_op >= 0 && range_wanted(s, range_op);
+  if (!e.traced && !e.ranged) return e;
+  e.correlation = s.next_correlation.fetch_add(1);
+  e.ancestor = scope_of(e.thread);
+  e.start = hp::now_ns();
+  return e;
+}
+
+void deliver(Sdk& s, Event& e, rocprofiler_callback_phase_t phase,
+             rocprofiler_callback_tracing_marker_api_data_t& data) {
+  const Kind k = kind_of(e.group);
+  for_callbacks(s, k.callback, e.op, [&](Context& c, CallbackService& svc) {
+    rocprofiler_callback_tracing_record_t r{};
+    r.context_id = {c.id};
+    r.thread_id = e.thread;
+    r.correlation_id.internal = e.correlation;
+    r.correlation_id.ancestor = e.ancestor;
+    if (phase == ROCPROFILER_CALLBACK_PHASE_ENTER)
+      e.external[c.id] = external_id(c, static_cast<rocprofiler_external_correlation_id_request_kind_t>(k.request), e.op,
+                                     e.correlation);
+    r.correlation_id.external = e.external[c.id];
+    r.kind = static_cast<rocprofiler_callback_tracing_kind_t>(k.callback);
+    r.operation = e.op;
+    r.phase = phase;
+    r.payload = &data;
+    svc.callback(r, &e.user[c.id], svc.data);
+  });
+}
+
+// The call's buffer-tracing record, at its end.
+void record(Sdk& s, const Event& e, uint64_t end) {
+  const Kind k = kind_of(e.group);
+  for_buffered(s, k.buffer, e.op, [&](Context& c, uint64_t buf) {
+    rocprofiler_buffer_tracing_marker_api_record_t r{};
+    r.size = sizeof r;
+    r.kind = static_cast<rocprofiler_buffer_tracing_kind_t>(k.buffer);
+    r.operation = e.op;
+    r.correlation_id.internal = e.correlation;
+    r.correlation_id.ancestor = e.ancestor;
+    const auto it = e.external.find(c.id);
+    if (it != e.external.end()) r.correlation_id.external = it->second;
+    r.start_timestamp = e.start;
+    r.end_timestamp = end;
+    r.thread_id = e.thread;
+    push(s, buf, ROCPROFILER_BUFFER_CATEGORY_TRACING, static_cast<uint32_t>(k.buffer), r);
+  });
+}
+
+// Runs ROCTx's function between the call's two callbacks, with the call's record after them. The lock is not
+// held across the function itself.
+template <class Fn>
+void run(Event& e, rocprofiler_callback_tracing_marker_api_data_t& data, Fn&& fn) {
+  Sdk& s = sdk();
+  data.size = sizeof data;
+  if (e.traced) {
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (!s.finalized) deliver(s, e, ROCPROFILER_CALLBACK_PHASE_ENTER, data);
+  }
+  fn();
+  if (e.traced) {
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (!s.finalized) {
+      deliver(s, e, ROCPROFILER_CALLBACK_PHASE_EXIT, data);
+      record(s, e, hp::now_ns());
+    }
+  }
+}
+
+// A MARKER_CORE_RANGE_API callback for a mark (no phase) or the beginning or end of a range.
+void range_callback(Sdk& s, Scope& sc, int op, rocprofiler_callback_phase_t phase) {
+  rocprofiler_callback_tracing_marker_api_data_t data{};
+  data.size = sizeof data;
+  if (op == kRangeMark) data.args.roctxMarkA.message = sc.message.c_str();
+  if (op == kThreadRange) data.args.roctxThreadRangeA.message = sc.message.c_str();
+  if (op == kProcessRange) data.args.roctxProcessRangeA.message = sc.message.c_str();
+  for_callbacks(s, ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_RANGE_API, op, [&](Context& c, CallbackService& svc) {
+    rocprofiler_callback_tracing_record_t r{};
+    r.context_id = {c.id};
+    r.thread_id = sc.thread;
+    r.correlation_id.internal = sc.correlation;
+    r.correlation_id.ancestor = sc.ancestor;
+    if (phase != ROCPROFILER_CALLBACK_PHASE_EXIT)
+      sc.external[c.id] =
+          external_id(c, ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_MARKER_CORE_RANGE_API, op, sc.correlation);
+    r.correlation_id.external = sc.external[c.id];
+    r.kind = ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_RANGE_API;
+    r.operation = op;
+    r.phase = phase;
+    r.payload = &data;
+    svc.callback(r, &sc.user[c.id], svc.data);
+  });
+}
+
+// The buffer record of a mark or a range that has ended.
+void range_record(Sdk& s, int op, const Scope& sc, uint64_t end) {
+  const int kind = ROCPROFILER_BUFFER_TRACING_MARKER_CORE_RANGE_API;
+  for_buffered(s, kind, op, [&](Context& c, uint64_t buf) {
+    rocprofiler_buffer_tracing_marker_api_record_t r{};
+    r.size = sizeof r;
+    r.kind = static_cast<rocprofiler_buffer_tracing_kind_t>(kind);
+    r.operation = op;
+    r.correlation_id.internal = sc.correlation;
+    r.correlation_id.ancestor = sc.ancestor;
+    const auto it = sc.external.find(c.id);
+    if (it != sc.external.end()) r.correlation_id.external = it->second;
+    r.start_timestamp = sc.start;
+    r.end_timestamp = end;
+    r.thread_id = sc.thread;
+    push(s, buf, ROCPROFILER_BUFFER_CATEGORY_TRACING, static_cast<uint32_t>(kind), r);
+  });
+}
+
+// The range a call began, from the call.
+std::shared_ptr<Scope> open_range(const Event& e, const char* message, bool process) {
+  auto sc = std::make_shared<Scope>();
+  sc->correlation = e.correlation;
+  sc->ancestor = e.ancestor;
+  sc->start = e.start;
+  sc->thread = e.thread;
+  sc->process = process;
+  sc->message = message ? message : "";
+  return sc;
+}
+
+void mark(const char* message) {
+  Event e = begin(kCore, kMark, kRangeMark);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxMarkA.message = message;
+  run(e, d, [&] { state().core.roctxMarkA_fn(message); });
+  if (e.ranged) {
+    Sdk& s = sdk();
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (s.finalized) return;
+    const auto sc = open_range(e, message, false);
+    range_callback(s, *sc, kRangeMark, ROCPROFILER_CALLBACK_PHASE_ENTER);
+    range_callback(s, *sc, kRangeMark, ROCPROFILER_CALLBACK_PHASE_EXIT);
+    range_record(s, kRangeMark, *sc, sc->start);
+  }
+}
+
+int range_push(const char* message) {
+  Event e = begin(kCore, kPush, kThreadRange);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxRangePushA.message = message;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().core.roctxRangePushA_fn(message); });
+  if (e.ranged) {
+    Sdk& s = sdk();
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (s.finalized) return r;
+    const auto sc = open_range(e, message, false);
+    state().threads[e.thread].push_back(sc);
+    range_callback(s, *sc, kThreadRange, ROCPROFILER_CALLBACK_PHASE_ENTER);
+  }
+  return r;
+}
+
+int range_pop() {
+  Event e = begin(kCore, kPop);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().core.roctxRangePop_fn(); });
+  Sdk& s = sdk();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  auto& open = state().threads[e.thread];
+  for (size_t i = open.size(); i-- > 0;)
+    if (!open[i]->process) {
+      const std::shared_ptr<Scope> sc = open[i];
+      open.erase(open.begin() + static_cast<std::ptrdiff_t>(i));
+      if (!s.finalized) {
+        range_callback(s, *sc, kThreadRange, ROCPROFILER_CALLBACK_PHASE_EXIT);
+        range_record(s, kThreadRange, *sc, hp::now_ns());
+      }
+      break;
+    }
+  return r;
+}
+
+uint64_t range_start(const char* message) {
+  Event e = begin(kCore, kStart, kProcessRange);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxRangeStartA.message = message;
+  uint64_t id = 0;
+  run(e, d, [&] { d.retval.roctx_range_id_t_retval = id = state().core.roctxRangeStartA_fn(message); });
+  if (e.ranged) {
+    Sdk& s = sdk();
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (s.finalized) return id;
+    const auto sc = open_range(e, message, true);
+    sc->range_id = id;
+    state().threads[e.thread].push_back(sc);
+    range_callback(s, *sc, kProcessRange, ROCPROFILER_CALLBACK_PHASE_ENTER);
+  }
+  return id;
+}
+
+void range_stop(uint64_t id) {
+  Event e = begin(kCore, kStop);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxRangeStop.id = id;
+  run(e, d, [&] { state().core.roctxRangeStop_fn(id); });
+  Sdk& s = sdk();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  for (auto& t : state().threads) {
+    auto& open = t.second;
+    for (size_t i = 0; i < open.size(); ++i)
+      if (open[i]->process && open[i]->range_id == id) {
+        const std::shared_ptr<Scope> sc = open[i];
+        open.erase(open.begin() + static_cast<std::ptrdiff_t>(i));
+        if (!s.finalized) {
+          range_callback(s, *sc, kProcessRange, ROCPROFILER_CALLBACK_PHASE_EXIT);
+          range_record(s, kProcessRange, *sc, hp::now_ns());
+        }
+        return;
+      }
+  }
+}
+
+int get_thread_id(uint64_t* tid) {
+  Event e = begin(kCore, kGetThreadId);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxGetThreadId.tid = tid;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().core.roctxGetThreadId_fn(tid); });
+  return r;
+}
+
+int profiler_pause(uint64_t tid) {
+  Event e = begin(kControl, 0);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxProfilerPause.tid = tid;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().control.roctxProfilerPause_fn(tid); });
+  return r;
+}
+
+int profiler_resume(uint64_t tid) {
+  Event e = begin(kControl, 1);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxProfilerResume.tid = tid;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().control.roctxProfilerResume_fn(tid); });
+  return r;
+}
+
+int name_os_thread(const char* name) {
+  Event e = begin(kName, 0);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxNameOsThread.name = name;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().name.roctxNameOsThread_fn(name); });
+  return r;
+}
+
+int name_hsa_agent(const char* name, const void* agent) {
+  Event e = begin(kName, 1);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxNameHsaAgent.name = name;
+  d.args.roctxNameHsaAgent.agent = agent;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().name.roctxNameHsaAgent_fn(name, agent); });
+  return r;
+}
+
+int name_hip_device(const char* name, int device_id) {
+  Event e = begin(kName, 2);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxNameHipDevice.name = name;
+  d.args.roctxNameHipDevice.device_id = device_id;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().name.roctxNameHipDevice_fn(name, device_id); });
+  return r;
+}
+
+int name_hip_stream(const char* name, const void* stream) {
+  Event e = begin(kName, 3);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxNameHipStream.name = name;
+  d.args.roctxNameHipStream.stream = stream;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().name.roctxNameHipStream_fn(name, stream); });
+  return r;
+}
+
+// Puts a wrapper in a table in place of ROCTx's function, keeping that one to call. A table is only as long as
+// its `size` says, and an entry ROCTx did not fill is left alone.
+template <class Table, class Fn>
+void wrap(Table& t, Fn Table::*entry, Fn& original, Fn wrapper) {
+  const size_t at = reinterpret_cast<const char*>(&(t.*entry)) - reinterpret_cast<const char*>(&t);
+  if (at + sizeof(Fn) > t.size || !(t.*entry) || (t.*entry) == wrapper) return;
+  original = t.*entry;
+  t.*entry = wrapper;
+}
+
+// rocprofiler_set_api_table("roctx", ...): the tables in the order of ROCPROFILER_MARKER_*_TABLE.
+void wrap_tables(void** tables, uint64_t count) {
+  if (!tables) return;
+  State& st = state();
+  std::lock_guard<std::recursive_mutex> lock(sdk().mutex);
+  if (count > 0 && tables[0]) {
+    auto& t = *static_cast<roctxCoreApiTable_t*>(tables[0]);
+    wrap(t, &roctxCoreApiTable_t::roctxMarkA_fn, st.core.roctxMarkA_fn, mark);
+    wrap(t, &roctxCoreApiTable_t::roctxRangePushA_fn, st.core.roctxRangePushA_fn, range_push);
+    wrap(t, &roctxCoreApiTable_t::roctxRangePop_fn, st.core.roctxRangePop_fn, range_pop);
+    wrap(t, &roctxCoreApiTable_t::roctxRangeStartA_fn, st.core.roctxRangeStartA_fn, range_start);
+    wrap(t, &roctxCoreApiTable_t::roctxRangeStop_fn, st.core.roctxRangeStop_fn, range_stop);
+    wrap(t, &roctxCoreApiTable_t::roctxGetThreadId_fn, st.core.roctxGetThreadId_fn, get_thread_id);
+  }
+  if (count > 1 && tables[1]) {
+    auto& t = *static_cast<roctxControlApiTable_t*>(tables[1]);
+    wrap(t, &roctxControlApiTable_t::roctxProfilerPause_fn, st.control.roctxProfilerPause_fn, profiler_pause);
+    wrap(t, &roctxControlApiTable_t::roctxProfilerResume_fn, st.control.roctxProfilerResume_fn, profiler_resume);
+  }
+  if (count > 2 && tables[2]) {
+    auto& t = *static_cast<roctxNameApiTable_t*>(tables[2]);
+    wrap(t, &roctxNameApiTable_t::roctxNameOsThread_fn, st.name.roctxNameOsThread_fn, name_os_thread);
+    wrap(t, &roctxNameApiTable_t::roctxNameHsaAgent_fn, st.name.roctxNameHsaAgent_fn, name_hsa_agent);
+    wrap(t, &roctxNameApiTable_t::roctxNameHipDevice_fn, st.name.roctxNameHipDevice_fn, name_hip_device);
+    wrap(t, &roctxNameApiTable_t::roctxNameHipStream_fn, st.name.roctxNameHipStream_fn, name_hip_stream);
+  }
+}
+
+}  // namespace roctx
+
+// The innermost ROCTx range this thread is in, for the ancestor of a HIP call. The caller holds the lock.
+uint64_t roctx_scope(Sdk&) { return roctx::scope_of(thread_id()); }
+
 // ---- What libamdhip64 reports -------------------------------------------------------
 
-uint64_t on_api_enter(const char* name) {
+// The runtime model's reaction to HIP calls (below, with the rest of it).
+int runtime_call_of(const char* name);
+void runtime_call_enter(Sdk& s, int call);
+void runtime_call_exit(Sdk& s, int call);
+
+// The callbacks a tool took for HIP calls, at entry (phase ENTER) and exit.
+// The payload is the call's arguments and return value in the unions rocprofiler-sdk defines;
+// the return value is not known here and stays zero.
+void deliver_hip_callbacks(Sdk& s, ApiFrame& f, rocprofiler_callback_phase_t phase) {
+  const int kind = f.compiler ? ROCPROFILER_CALLBACK_TRACING_HIP_COMPILER_API : ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API;
+  rocprofiler_callback_tracing_hip_api_data_t data{};
+  data.size = sizeof data;
+  if (f.has_args) std::memcpy(data.args, f.args, sizeof data.args);
+  else data.retval[sizeof data.retval - 1] = 1;   // no arguments to show (rocprofiler_abi.hpp)
+  const auto request = f.compiler ? ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_HIP_COMPILER_API
+                                  : ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_HIP_RUNTIME_API;
+  size_t index = 0;
+  for_callbacks(s, kind, f.op, [&](Context& c, CallbackService& svc) {
+    if (phase == ROCPROFILER_CALLBACK_PHASE_ENTER) f.user.push_back({});
+    rocprofiler_user_data_t* user = index < f.user.size() ? &f.user[index] : nullptr;
+    ++index;
+    rocprofiler_callback_tracing_record_t r{};
+    r.context_id = {c.id};
+    r.thread_id = thread_id();
+    r.correlation_id.internal = f.correlation;
+    r.correlation_id.external = external_id(c, request, f.op, f.correlation);
+    r.kind = static_cast<rocprofiler_callback_tracing_kind_t>(kind);
+    r.operation = f.op;
+    r.phase = phase;
+    r.payload = &data;
+    rocprofiler_user_data_t none{};
+    svc.callback(r, user ? user : &none, svc.data);
+  });
+}
+
+uint64_t on_api_enter_args(const char* name, size_t count, const hp::ArgRef* refs) {
   ensure_configured();
   Sdk& s = sdk();
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
@@ -782,19 +1446,36 @@ uint64_t on_api_enter(const char* name) {
   const ApiId id = hip_api_id(name);
   f.op = id.op;
   f.compiler = id.compiler;
+  if (count) {
+    f.spec = ha::find(name);
+    f.has_args = f.spec && ha::store(*f.spec, count, refs, f.args);
+  } else {
+    // A call with no arguments has them all: none.
+    const ha::CallSpec* spec = ha::find(name);
+    f.has_args = spec && spec->count == 0;
+  }
+  if (f.op >= 0) deliver_hip_callbacks(s, f, ROCPROFILER_CALLBACK_PHASE_ENTER);
   f.start = hp::now_ns();
+  g_api_thread.store(thread_id(), std::memory_order_relaxed);
+  if (frames().empty()) f.ancestor = roctx_scope(s);
+  if (!f.compiler) f.runtime_call = runtime_call_of(name);
   frames().push_back(f);
+  if (!f.compiler) runtime_call_enter(s, f.runtime_call);
   return frames().size();
 }
+
+uint64_t on_api_enter(const char* name) { return on_api_enter_args(name, 0, nullptr); }
 
 void on_api_exit(uint64_t token) {
   Sdk& s = sdk();
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   if (!token || frames().size() != token) return;
-  const ApiFrame f = frames().back();
+  ApiFrame f = frames().back();
+  if (!s.finalized && !f.compiler) runtime_call_exit(s, f.runtime_call);
   frames().pop_back();
   if (s.finalized || f.op < 0) return;
   const uint64_t end = hp::now_ns();
+  deliver_hip_callbacks(s, f, ROCPROFILER_CALLBACK_PHASE_EXIT);
   const int plain = f.compiler ? ROCPROFILER_BUFFER_TRACING_HIP_COMPILER_API : ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API;
   const int ext = f.compiler ? ROCPROFILER_BUFFER_TRACING_HIP_COMPILER_API_EXT : ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT;
   const auto request = f.compiler ? ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_HIP_COMPILER_API
@@ -803,6 +1484,7 @@ void on_api_exit(uint64_t token) {
     for_buffered(s, kind, f.op, [&](Context& c, uint64_t buf) {
       rocprofiler_correlation_id_t corr{};
       corr.internal = f.correlation;
+      corr.ancestor = f.ancestor;
       corr.external = external_id(c, request, f.op, f.correlation);
       if (kind == ext) {
         rocprofiler_buffer_tracing_hip_api_ext_record_t r{};
@@ -813,6 +1495,8 @@ void on_api_exit(uint64_t token) {
         r.start_timestamp = f.start;
         r.end_timestamp = end;
         r.thread_id = thread_id();
+        if (f.has_args) std::memcpy(r.args, f.args, sizeof r.args);
+        else r.retval[sizeof r.retval - 1] = 1;   // no arguments to show (rocprofiler_abi.hpp)
         push(s, buf, ROCPROFILER_BUFFER_CATEGORY_TRACING, static_cast<uint32_t>(kind), r);
       } else {
         rocprofiler_buffer_tracing_hip_api_record_t r{};
@@ -860,6 +1544,7 @@ void on_code_object(const hp::CodeObject& o, const hp::KernelSymbol* kernels, si
   const bool rdna = gpu && gpu->gfx_target_version >= kRdnaFirst;
   for (size_t i = 0; i < count; ++i) {
     const hp::KernelSymbol& k = kernels[i];
+    s.kernel_wave_size[k.kernel_id] = k.wave_size;
     rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t sym{};
     sym.size = sizeof sym;
     sym.kernel_id = k.kernel_id;
@@ -901,6 +1586,406 @@ void on_code_object(const hp::CodeObject& o, const hp::KernelSymbol* kernels, si
   }
 }
 
+// ---- What ROCm's runtime does for the program -----------------------------------------
+//
+// A real runtime (ROCm 7.2, measured on an RX 6800 and an RX 6700 XT, gfx1030 and gfx1031) is a profiler's
+// subject too: it copies small buffers and fills with kernels of its own, makes scratch for the kernels that
+// spill, and allocates staging buffers, queue state and graph state the program never asked for. None of
+// that is the simulated GPU's, but a trace of the card shows it, and the same trace of the simulator should.
+// Everything below is what the cards showed, the same on both, in amd/tests/data/rocprof_*.expected; what
+// was not measured is not guessed (amd/docs/rocprofiler.md, "The runtime's own work"). It applies to the
+// gfx1030 family only (RDNA 2), and uses no clock: the records' times are the simulation's own.
+
+constexpr uint32_t kMeasuredFirst = 100300, kMeasuredEnd = 100400;   // gfx1030 to gfx10ff
+
+// The kernels of the runtime's own code object, as the card lists them (the same on both cards): name,
+// kernarg segment size and architectural vector registers (the descriptor's, wave32).
+struct RuntimeKernel {
+  const char* name;
+  uint32_t kernarg, vgprs;
+};
+constexpr RuntimeKernel kRuntimeKernels[] = {
+    {"__amd_rocclr_gwsInit", 4, 8},          {"__amd_rocclr_streamOpsWait", 40, 8},
+    {"__amd_rocclr_fillBufferAligned", 40, 16}, {"__amd_rocclr_fillBufferAligned2D", 336, 8},
+    {"__amd_rocclr_copyImage1DA", 320, 8},   {"__amd_rocclr_copyBufferToImage", 416, 16},
+    {"__amd_rocclr_copyBuffer", 48, 16},     {"__amd_rocclr_copyBufferAligned", 304, 8},
+    {"__amd_rocclr_copyBufferRect", 384, 16}, {"__amd_rocclr_initHeap", 24, 24},
+    {"__amd_rocclr_fillImage", 360, 8},      {"__amd_rocclr_copyBufferRectAligned", 384, 16},
+    {"__amd_rocclr_batchMemOp", 272, 8},     {"__amd_rocclr_copyImage", 320, 8},
+    {"__amd_rocclr_copyImageToBuffer", 416, 16}, {"__amd_rocclr_streamOpsWrite", 24, 8}};
+constexpr size_t kCopyBuffer = 6, kFillBuffer = 2;
+constexpr uint64_t kRuntimeImageBytes = 45104;   // the code object the card loads is this large
+
+constexpr uint64_t kStagingSmall = 4u << 20, kStagingLarge = 16u << 20, kRuntimeBlock = 56;
+constexpr uint64_t kGraphBase = 131072, kGraphPerKernel = 384;
+constexpr uint64_t kPoolChunk = 32u << 20;
+// ROCr's HSA_SCRATCH_SINGLE_LIMIT: a queue's scratch pool larger than this is not made; the launch gets
+// a single-use block instead.
+constexpr uint64_t kScratchSingleLimit = 0x8C00000;
+
+struct RuntimeModel {
+  uint64_t code_object = 0, first_kernel = 0;   // the ids the runtime's code object and kernels were given
+  bool started = false;        // the program's first runtime call has been seen
+  bool null_queue = false;     // the default stream's queue (and its staging buffers) exist
+  uint64_t next_address = 0x7e0000000000ull;
+  std::map<uint64_t, uint64_t> graph_blocks;      // executable graph -> its allocation
+  uint64_t pool_live = 0, pool_chunks = 0;        // memory-pool blocks held, 32 MiB chunks mapped for them
+  std::map<uint64_t, uint64_t> queue_scratch;     // queue -> its scratch pool, in bytes
+};
+RuntimeModel& runtime_model() {
+  static RuntimeModel* m = new RuntimeModel;
+  return *m;
+}
+
+// Whether the model applies to this device: a GPU the measurements were made on.
+const rocprofiler_agent_v0_t* measured_gpu(Sdk& s, int device) {
+  const rocprofiler_agent_v0_t* a = agent(s, gpu_agent(s, device).handle);
+  return a && a->gfx_target_version >= kMeasuredFirst && a->gfx_target_version < kMeasuredEnd ? a : nullptr;
+}
+
+// One allocation record, named to its HIP call by `ancestor` (0: none). `agent` is zero for a record that
+// carries none (every FREE does).
+void emit_allocation(Sdk& s, int op, rocprofiler_agent_id_t agent_id, uint64_t address, uint64_t bytes,
+                     uint64_t ancestor, uint64_t start, uint64_t end) {
+  const uint64_t corr = s.next_correlation.fetch_add(1);
+  for_buffered(s, ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION, op, [&](Context& c, uint64_t buf) {
+    rocprofiler_buffer_tracing_memory_allocation_record_t r{};
+    r.size = sizeof r;
+    r.kind = ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION;
+    r.operation = static_cast<rocprofiler_memory_allocation_operation_t>(op);
+    r.correlation_id.internal = corr;
+    r.correlation_id.ancestor = ancestor;
+    r.correlation_id.external = external_id(c, ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_MEMORY_ALLOCATION, op, corr);
+    r.thread_id = thread_id();
+    r.start_timestamp = start;
+    r.end_timestamp = end;
+    r.agent_id = agent_id;
+    r.address.value = address;
+    r.allocation_size = bytes;
+    push(s, buf, ROCPROFILER_BUFFER_CATEGORY_TRACING, ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION, r);
+  });
+}
+
+// The HIP call this thread is in, or 0.
+uint64_t current_call() { return frames().empty() ? 0 : frames().back().correlation; }
+
+// A block of the runtime's own: on the host (the staging buffers) or on the device, at an address of its own.
+uint64_t runtime_allocate(Sdk& s, int op, rocprofiler_agent_id_t agent_id, uint64_t bytes) {
+  RuntimeModel& m = runtime_model();
+  const uint64_t address = m.next_address;
+  m.next_address += (bytes + 0xffff) & ~uint64_t{0xffff};
+  const uint64_t now = hp::now_ns();
+  emit_allocation(s, op, agent_id, address, bytes, current_call(), now, now);
+  return address;
+}
+void runtime_free(Sdk& s, int op, uint64_t address) {
+  const uint64_t now = hp::now_ns();
+  emit_allocation(s, op, {0}, address, 0, current_call(), now, now);
+}
+
+// The runtime's own code object, loaded as the runtime starts (the same 16 kernels on both cards).
+void load_runtime_code_object([[maybe_unused]] Sdk& s, int device) {
+  // Zeros but for an ELF header of an AMDGPU code object with no sections: a tool that reads the code object
+  // back (rocprofv3's rocpd output) must find an object it can parse, and finds nothing in it.
+  static const std::vector<uint8_t>& image = *new std::vector<uint8_t>([] {
+    std::vector<uint8_t> v(kRuntimeImageBytes, 0);
+    const uint8_t ident[16] = {0x7f, 'E', 'L', 'F', 2, 1, 1, 0x40, 3};
+    std::memcpy(v.data(), ident, sizeof ident);
+    const uint16_t type = 3, machine = 224, ehsize = 64, phentsize = 56, shentsize = 64;
+    const uint32_t version = 1;
+    std::memcpy(v.data() + 16, &type, 2);
+    std::memcpy(v.data() + 18, &machine, 2);
+    std::memcpy(v.data() + 20, &version, 4);
+    std::memcpy(v.data() + 52, &ehsize, 2);
+    std::memcpy(v.data() + 54, &phentsize, 2);
+    std::memcpy(v.data() + 58, &shentsize, 2);
+    return v;
+  }());
+  RuntimeModel& m = runtime_model();
+  // Ids from the HIP runtime's own counters: a tool indexes by them.
+  vgpu_hip_profiler_reserve_ids(sizeof kRuntimeKernels / sizeof kRuntimeKernels[0], &m.code_object, &m.first_kernel);
+  hp::CodeObject o;
+  o.id = m.code_object;
+  o.device = device;
+  // Named the way a code object loaded from memory is: the tool reads the offset and size back from it.
+  static const std::string& uri = *new std::string([&] {
+    char u[128];
+    std::snprintf(u, sizeof u, "memory://%d#offset=0x%llx&size=%zu", static_cast<int>(::getpid()),
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(image.data())), image.size());
+    return std::string(u);
+  }());
+  o.uri = uri.c_str();
+  o.image = image.data();
+  o.image_size = image.size();
+  o.load_base = reinterpret_cast<uint64_t>(image.data());
+  o.load_size = 45056;
+  std::vector<hp::KernelSymbol> symbols;
+  for (size_t i = 0; i < sizeof kRuntimeKernels / sizeof kRuntimeKernels[0]; ++i) {
+    hp::KernelSymbol k;
+    k.kernel_id = m.first_kernel + i;
+    k.name = kRuntimeKernels[i].name;
+    k.entry = reinterpret_cast<uint64_t>(image.data()) + 256 * i;
+    k.kernarg_size = kRuntimeKernels[i].kernarg;
+    k.kernarg_alignment = 16;
+    k.vgprs = kRuntimeKernels[i].vgprs;
+    k.wave_size = 32;
+    symbols.push_back(k);
+  }
+  on_code_object(o, symbols.data(), symbols.size());
+}
+
+// The staging buffers the runtime makes for a queue.
+void staging_buffers(Sdk& s) {
+  runtime_allocate(s, ROCPROFILER_MEMORY_ALLOCATION_ALLOCATE, cpu_agent(s), kStagingSmall);
+  runtime_allocate(s, ROCPROFILER_MEMORY_ALLOCATION_ALLOCATE, cpu_agent(s), kStagingLarge);
+}
+
+// The default stream's queue is made with the first work queued on it.
+void null_queue_used(Sdk& s) {
+  RuntimeModel& m = runtime_model();
+  if (m.null_queue) return;
+  m.null_queue = true;
+  staging_buffers(s);
+}
+
+// The first HIP runtime call of the program starts the runtime: its first staging block and a small one, and
+// its own code object. (hipGetDeviceCount, hipMalloc, hipStreamCreate: whichever comes first.)
+void runtime_started(Sdk& s) {
+  RuntimeModel& m = runtime_model();
+  if (m.started) return;
+  m.started = true;
+  load_runtime_code_object(s, 0);
+  runtime_allocate(s, ROCPROFILER_MEMORY_ALLOCATION_ALLOCATE, cpu_agent(s), kStagingSmall);
+  runtime_allocate(s, ROCPROFILER_MEMORY_ALLOCATION_ALLOCATE, cpu_agent(s), kRuntimeBlock);
+}
+
+// HIP calls the model reacts to.
+enum RuntimeCall { kNoCall = 0, kStreamCreate, kStreamDestroy, kNullQueueCall, kSyncCall };
+int runtime_call_of(const char* name) {
+  // Never destroyed: HIP is called after static destruction has begun (a library's own static destructor).
+  static const std::map<std::string, int>& calls = *new std::map<std::string, int>{
+      {"hipStreamCreate", kStreamCreate},
+      {"hipStreamCreateWithFlags", kStreamCreate},
+      {"hipStreamCreateWithPriority", kStreamCreate},
+      {"hipExtStreamCreateWithCUMask", kStreamCreate},
+      {"hipStreamDestroy", kStreamDestroy},
+      {"hipMallocAsync", kNullQueueCall},
+      {"hipMallocFromPoolAsync", kNullQueueCall},
+      {"hipGraphInstantiate", kNullQueueCall},
+      {"hipGraphInstantiateWithFlags", kNullQueueCall},
+      {"hipGraphInstantiateWithParams", kNullQueueCall},
+      {"hipStreamSynchronize", kSyncCall},
+      {"hipDeviceSynchronize", kSyncCall},
+  };
+  const auto it = calls.find(name);
+  return it == calls.end() ? kNoCall : it->second;
+}
+
+// A HIP runtime call begins (the caller holds the lock; the call is the thread's current one).
+void runtime_call_enter(Sdk& s, int call) {
+  if (!measured_gpu(s, 0)) return;
+  runtime_started(s);
+  if (call == kStreamCreate) staging_buffers(s);
+}
+
+// ... and ends.
+void runtime_call_exit(Sdk& s, int call) {
+  if (!measured_gpu(s, 0)) return;
+  RuntimeModel& m = runtime_model();
+  switch (call) {
+    case kStreamDestroy:
+      // Three blocks go with a stream: one with no address, then two.
+      runtime_free(s, ROCPROFILER_MEMORY_ALLOCATION_FREE, 0);
+      runtime_free(s, ROCPROFILER_MEMORY_ALLOCATION_FREE, m.next_address);
+      runtime_free(s, ROCPROFILER_MEMORY_ALLOCATION_FREE, m.next_address + 0x10000);
+      m.next_address += 0x20000;
+      break;
+    case kNullQueueCall:
+      null_queue_used(s);
+      break;
+    case kSyncCall:
+      // A synchronization with nothing left in the memory pool gives its mapped chunks back.
+      if (m.pool_chunks && !m.pool_live) {
+        for (; m.pool_chunks; --m.pool_chunks) runtime_free(s, ROCPROFILER_MEMORY_ALLOCATION_VMEM_FREE, m.next_address++);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+// Work is queued on a stream: the default stream's queue is made with its first.
+void runtime_queue_used(uint64_t stream) {
+  Sdk& s = sdk();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  if (s.finalized || stream >= 0x100 || !measured_gpu(s, 0)) return;
+  null_queue_used(s);
+}
+
+// A graph made executable allocates 128 KiB and 384 bytes for each kernel node, if it has one; destroying it
+// gives that back.
+void runtime_graph_instantiated(int device, uint64_t exec, uint32_t kernel_nodes) {
+  Sdk& s = sdk();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  if (s.finalized || !kernel_nodes || !measured_gpu(s, device)) return;
+  runtime_model().graph_blocks[exec] = runtime_allocate(s, ROCPROFILER_MEMORY_ALLOCATION_ALLOCATE, gpu_agent(s, device),
+                                                      kGraphBase + kGraphPerKernel * kernel_nodes);
+}
+void runtime_graph_destroyed(uint64_t exec) {
+  Sdk& s = sdk();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  RuntimeModel& m = runtime_model();
+  const auto it = m.graph_blocks.find(exec);
+  if (s.finalized || it == m.graph_blocks.end()) return;
+  runtime_free(s, ROCPROFILER_MEMORY_ALLOCATION_FREE, it->second);
+  m.graph_blocks.erase(it);
+}
+
+// Memory-pool blocks are carved from 32 MiB chunks of virtual memory the runtime maps as it needs them.
+void runtime_pool_block(int device, uint64_t address, uint64_t bytes, bool freed) {
+  (void)address;
+  Sdk& s = sdk();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  if (s.finalized || !measured_gpu(s, device)) return;
+  RuntimeModel& m = runtime_model();
+  if (freed) {
+    m.pool_live = m.pool_live > bytes ? m.pool_live - bytes : 0;
+    return;
+  }
+  m.pool_live += bytes;
+  const uint64_t want = (m.pool_live + kPoolChunk - 1) / kPoolChunk;
+  for (; m.pool_chunks < want; ++m.pool_chunks)
+    runtime_allocate(s, ROCPROFILER_MEMORY_ALLOCATION_VMEM_ALLOCATE, gpu_agent(s, device), kPoolChunk);
+}
+
+// ---- The runtime's own kernels ----
+
+// A dispatch of one of the runtime's kernels, in the order the work ran.
+void runtime_dispatch(Sdk& s, int device, size_t kernel, uint64_t grid, uint32_t workgroup, uint64_t start,
+                      uint64_t end) {
+  rocprofiler_kernel_dispatch_info_t info{};
+  info.size = offsetof(rocprofiler_kernel_dispatch_info_t, reserved_padding);
+  info.agent_id = gpu_agent(s, device);
+  info.queue_id = {0};
+  info.kernel_id = runtime_model().first_kernel + kernel;
+  info.dispatch_id = vgpu_hip_profiler_next_dispatch_id();
+  info.workgroup_size = {workgroup, 1, 1};
+  info.grid_size = {static_cast<uint32_t>(grid), 1, 1};
+  const uint64_t corr = s.next_correlation.fetch_add(1);
+  for_buffered(s, ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH, ROCPROFILER_KERNEL_DISPATCH_COMPLETE,
+               [&](Context& c, uint64_t buf) {
+                 rocprofiler_buffer_tracing_kernel_dispatch_record_t r{};
+                 r.size = sizeof r;
+                 r.kind = ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH;
+                 r.operation = ROCPROFILER_KERNEL_DISPATCH_COMPLETE;
+                 r.correlation_id = {corr, external_id(c, ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_KERNEL_DISPATCH, 0, corr)};
+                 r.thread_id = dispatch_thread();
+                 r.start_timestamp = start;
+                 r.end_timestamp = end;
+                 r.dispatch_info = info;
+                 push(s, buf, ROCPROFILER_BUFFER_CATEGORY_TRACING, ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH, r);
+               });
+}
+
+uint64_t round_up(uint64_t v, uint64_t unit) { return (v + unit - 1) / unit * unit; }
+
+// Its threads are limited to a few workgroups for each pair of compute units (a workgroup processor).
+uint64_t blit_cap(const rocprofiler_agent_v0_t& a, uint64_t workgroup) { return a.cu_count / 2 * workgroup; }
+
+// A copy the runtime does with a kernel of its own. Sixteen bytes to a thread when both ends are 16-byte
+// aligned, in workgroups of 512; four to a thread, in workgroups of 1024, when not.
+void runtime_copy_kernel(int device, uint64_t bytes, uint64_t dst, uint64_t src, uint64_t start, uint64_t end) {
+  Sdk& s = sdk();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  const rocprofiler_agent_v0_t* a = measured_gpu(s, device);
+  if (s.finalized || !a || !bytes) return;
+  const bool aligned = ((dst | src) & 15) == 0;
+  const uint64_t wg = aligned ? 512 : 1024, per_thread = aligned ? 16 : 4;
+  const uint64_t grid = std::min(std::max(round_up((bytes + per_thread - 1) / per_thread, wg), wg), blit_cap(*a, wg));
+  runtime_dispatch(s, device, kCopyBuffer, grid, static_cast<uint32_t>(wg), start, end);
+}
+
+// A fill of device memory: its unaligned head and tail (to 16 bytes) are one kernel each, a workgroup of 256;
+// the 16-byte units between are one kernel, sixteen bytes to a thread.
+void runtime_fill(int device, uint64_t dst, uint64_t bytes, uint64_t start, uint64_t end) {
+  Sdk& s = sdk();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  const rocprofiler_agent_v0_t* a = measured_gpu(s, device);
+  if (s.finalized || !a || !bytes) return;
+  const uint64_t head = std::min(bytes, (16 - dst % 16) % 16);
+  const uint64_t rest = bytes - head, body = rest - rest % 16, tail = rest - body;
+  if (head) runtime_dispatch(s, device, kFillBuffer, 256, 256, start, end);
+  if (body)
+    runtime_dispatch(s, device, kFillBuffer, std::min(std::max(round_up(body / 16, 256), uint64_t{256}), blit_cap(*a, 256)),
+                     256, start, end);
+  if (tail) runtime_dispatch(s, device, kFillBuffer, 256, 256, start, end);
+}
+
+// ---- Scratch ----
+
+// rocprofiler-sdk's scratch-memory record (buffer_tracing.h), which the header here does not carry.
+struct ScratchRecord {
+  uint64_t size;
+  rocprofiler_buffer_tracing_kind_t kind;
+  rocprofiler_scratch_memory_operation_t operation;
+  rocprofiler_correlation_id_t correlation_id;
+  rocprofiler_agent_id_t agent_id;
+  rocprofiler_queue_id_t queue_id;
+  rocprofiler_thread_id_t thread_id;
+  rocprofiler_timestamp_t start_timestamp;
+  rocprofiler_timestamp_t end_timestamp;
+  uint32_t flags;
+  uint64_t allocation_size;
+};
+
+void emit_scratch(Sdk& s, int device, uint64_t queue, int op, uint32_t flags, uint64_t bytes) {
+  const uint64_t now = hp::now_ns();
+  for_buffered(s, ROCPROFILER_BUFFER_TRACING_SCRATCH_MEMORY, op, [&](Context& c, uint64_t buf) {
+    ScratchRecord r{};
+    r.size = sizeof r;
+    r.kind = ROCPROFILER_BUFFER_TRACING_SCRATCH_MEMORY;
+    r.operation = static_cast<rocprofiler_scratch_memory_operation_t>(op);
+    r.agent_id = gpu_agent(s, device);
+    r.queue_id = {queue};
+    r.thread_id = dispatch_thread();
+    r.start_timestamp = now;
+    r.end_timestamp = now;
+    r.flags = flags;
+    r.allocation_size = bytes;
+    (void)c;
+    push(s, buf, ROCPROFILER_BUFFER_CATEGORY_TRACING, ROCPROFILER_BUFFER_TRACING_SCRATCH_MEMORY, r);
+  });
+}
+
+// A queue's scratch is a pool, for 1024 lanes (32 waves) on each compute unit at the kernel's private
+// segment rounded up to 32 bytes; it grows when a kernel needs more (a new pool, the old one freed). A kernel
+// that would take more than HSA_SCRATCH_SINGLE_LIMIT gets one wave-count's worth, once, and the pool goes.
+// Returns whether a single-use block was made, to be freed when the dispatch is.
+bool runtime_scratch(Sdk& s, const hp::Launch& l) {
+  const rocprofiler_agent_v0_t* a = measured_gpu(s, l.device);
+  if (!a || !l.private_segment) return false;
+  RuntimeModel& m = runtime_model();
+  const uint64_t lanes = uint64_t{a->max_waves_per_cu} * a->wave_front_size;
+  const uint64_t per_lane = round_up(l.private_segment, 32);
+  const uint64_t need = a->cu_count * lanes * per_lane;
+  uint64_t& pool = m.queue_scratch[l.stream];
+  if (need <= pool) return false;
+  if (need <= kScratchSingleLimit) {
+    emit_scratch(s, l.device, l.stream, ROCPROFILER_SCRATCH_MEMORY_ALLOC, 0, need);
+    if (pool) emit_scratch(s, l.device, l.stream, ROCPROFILER_SCRATCH_MEMORY_FREE, 0, 0);
+    pool = need;
+    return false;
+  }
+  // (The single-use block covers 128 lanes for each of the card's shader arrays: 1024 on an RX 6800, 512 on an RX 6700 XT.)
+  emit_scratch(s, l.device, l.stream, ROCPROFILER_SCRATCH_MEMORY_ALLOC, 1, uint64_t{128} * a->array_count * per_lane);
+  if (pool) emit_scratch(s, l.device, l.stream, ROCPROFILER_SCRATCH_MEMORY_FREE, 0, 0);
+  pool = 0;
+  return true;
+}
+void runtime_scratch_done(Sdk& s, const hp::Launch& l) {
+  emit_scratch(s, l.device, l.stream, ROCPROFILER_SCRATCH_MEMORY_FREE, 1, 0);
+}
+
 // A launch in flight: the dispatch as a tool is shown it, and which contexts
 // asked to count it, with what.
 struct Counting {
@@ -910,11 +1995,14 @@ struct Counting {
 };
 struct InFlight {
   uint64_t correlation = 0;
+  uint32_t wave_size = 0;
   rocprofiler_kernel_dispatch_info_t info{};
   std::vector<Counting> counting;
   // What each context's tool attached to the launch's correlation id, asked
   // once: a tool may allocate what it attaches.
   std::map<uint64_t, rocprofiler_user_data_t> external;
+  hp::Launch launch;           // for the runtime model's scratch
+  bool single_scratch = false;  // a single-use scratch block was made for this dispatch
   // PC sampling of this launch: the context whose service samples it (0: none)
   // and what its waves' samples came to, gathered by the host threads running
   // them.
@@ -932,7 +2020,10 @@ void* on_launching(const hp::Launch& l) {
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   if (s.finalized) return nullptr;
   auto* f = new InFlight;
+  if (const auto it = s.kernel_wave_size.find(l.kernel_id); it != s.kernel_wave_size.end()) f->wave_size = it->second;
   f->correlation = current_correlation(s);
+  f->launch = l;
+  f->single_scratch = runtime_scratch(s, l);
   rocprofiler_kernel_dispatch_info_t& i = f->info;
   i.size = offsetof(rocprofiler_kernel_dispatch_info_t, reserved_padding);
   i.agent_id = gpu_agent(s, l.device);
@@ -1033,6 +2124,7 @@ void on_launched(const hp::Launch&, const DispatchStats* stats, uint64_t start, 
   Sdk& s = sdk();
   std::unique_ptr<InFlight> f(static_cast<InFlight*>(token));
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  if (f && !s.finalized && f->single_scratch) runtime_scratch_done(s, f->launch);
   if (!f || s.finalized || !stats) return;   // a launch that failed counted nothing
   deliver_pc_samples(s, *f);
   for (const Counting& k : f->counting) {
@@ -1043,7 +2135,10 @@ void on_launched(const hp::Launch&, const DispatchStats* stats, uint64_t start, 
     for (uint64_t id : cfg.counters) {
       rocprofiler_counter_record_t r{};
       r.id = instance_id(id);
-      r.counter_value = static_cast<double>(counter(id)->value(*stats));
+      const Counter* ct = counter(id);
+      const rocprofiler_agent_v0_t* ag = ct->constant ? agent(s, f->info.agent_id.handle) : nullptr;
+      r.counter_value = static_cast<double>(ct->constant ? (ag ? ct->constant(*ag) : 0)
+                                          : ct->wave_only && ct->wave_only != f->wave_size ? 0 : ct->value(*stats));
       r.dispatch_id = f->info.dispatch_id;
       r.user_data = k.user;
       r.agent_id = f->info.agent_id;
@@ -1064,7 +2159,7 @@ void on_launched(const hp::Launch&, const DispatchStats* stats, uint64_t start, 
                  r.kind = ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH;
                  r.operation = ROCPROFILER_KERNEL_DISPATCH_COMPLETE;
                  r.correlation_id = {f->correlation, f->external[c.id]};
-                 r.thread_id = thread_id();
+                 r.thread_id = dispatch_thread();
                  r.start_timestamp = start;
                  r.end_timestamp = end;
                  r.dispatch_info = f->info;
@@ -1090,8 +2185,12 @@ void on_copied(hp::Copy kind, int src_device, int dst_device, uint64_t bytes, ui
       dev && dev->gfx_target_version >= kRdnaFirst) {
     const bool host_and_device = kind == hp::Copy::HostToDevice || kind == hp::Copy::DeviceToHost;
     if ((host_and_device && bytes <= kBlitCopyBytes) || kind == hp::Copy::HostToHost ||
-        (kind == hp::Copy::DeviceToDevice && src_device == dst_device))
+        (kind == hp::Copy::DeviceToDevice && src_device == dst_device)) {
+      // What the runtime does instead is a dispatch of its own kernel.
+      if (kind != hp::Copy::HostToHost)
+        runtime_copy_kernel(kind == hp::Copy::DeviceToHost ? src_device : dst_device, bytes, dst, src, start, end);
       return;
+    }
   }
   const int op = static_cast<int>(kind);
   const bool from_device = kind == hp::Copy::DeviceToHost || kind == hp::Copy::DeviceToDevice;
@@ -1136,7 +2235,8 @@ void on_allocated(int device, uint64_t address, uint64_t bytes, bool freed, uint
     r.thread_id = thread_id();
     r.start_timestamp = start;
     r.end_timestamp = end;
-    r.agent_id = gpu_agent(s, device);
+    // A FREE on the measured cards carries no agent.
+    r.agent_id = freed && measured_gpu(s, std::max(device, 0)) ? rocprofiler_agent_id_t{0} : gpu_agent(s, device);
     r.address.value = address;
     r.allocation_size = bytes;
     push(s, buf, ROCPROFILER_BUFFER_CATEGORY_TRACING, ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION, r);
@@ -1146,12 +2246,18 @@ void on_allocated(int device, uint64_t address, uint64_t bytes, bool freed, uint
 const hp::Hooks kHooks = [] {
   hp::Hooks h;
   h.api_enter = on_api_enter;
+  h.api_enter_args = on_api_enter_args;
   h.api_exit = on_api_exit;
   h.code_object_loaded = on_code_object;
   h.launching = on_launching;
   h.launched = on_launched;
   h.copied = on_copied;
   h.allocated = on_allocated;
+  h.filled = runtime_fill;
+  h.queue_used = runtime_queue_used;
+  h.graph_instantiated = runtime_graph_instantiated;
+  h.graph_destroyed = runtime_graph_destroyed;
+  h.pool_block = runtime_pool_block;
   h.sampling = on_sampling;
   return h;
 }();
@@ -1260,8 +2366,8 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_agent_supported_counter
   }
   if (!a) return ROCPROFILER_STATUS_ERROR_AGENT_NOT_FOUND;
   std::vector<rocprofiler_counter_id_t> ids;
-  if (a->type == ROCPROFILER_AGENT_TYPE_GPU)
-    for (uint64_t i = 1; i <= kCounterCount; ++i) ids.push_back({i});
+  for (uint64_t i = 1; i <= kCounterCount; ++i)
+    if (offers(*a, i)) ids.push_back({i});
   return cb(agent_id, ids.data(), ids.size(), user_data);
 }
 
@@ -1272,6 +2378,7 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_query_counter_info(rocprofiler_
   if (!c) return ROCPROFILER_STATUS_ERROR_COUNTER_NOT_FOUND;
   if (!info) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
   const bool derived = *c->expression != '\0';
+  const bool constant = c->constant != nullptr && !derived;
   if (version == ROCPROFILER_COUNTER_INFO_VERSION_0) {
     auto* v = static_cast<rocprofiler_counter_info_v0_t*>(info);
     *v = {};
@@ -1281,6 +2388,7 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_query_counter_info(rocprofiler_
     v->block = c->block;
     v->expression = c->expression;
     v->is_derived = derived;
+    v->is_constant = constant;
     return ROCPROFILER_STATUS_SUCCESS;
   }
   if (version == ROCPROFILER_COUNTER_INFO_VERSION_1) {
@@ -1311,6 +2419,7 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_query_counter_info(rocprofiler_
     v->block = c->block;
     v->expression = c->expression;
     v->is_derived = derived;
+    v->is_constant = constant;
     v->dimensions_count = 1;
     v->dimensions = const_cast<const rocprofiler_counter_record_dimension_info_t**>(kDimensions);
     v->dimensions_instances_count = 1;
@@ -1353,6 +2462,7 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_create_counter_config(rocprofil
   cfg.agent = agent_id.handle;
   for (size_t i = 0; i < counters_count; ++i) {
     if (!counter(counters_list[i].handle)) return ROCPROFILER_STATUS_ERROR_COUNTER_NOT_FOUND;
+    if (!offers(*a, counters_list[i].handle)) return ROCPROFILER_STATUS_ERROR_COUNTER_NOT_FOUND;
     cfg.counters.push_back(counters_list[i].handle);
   }
   config_id->handle = s.next_config++;
@@ -1648,19 +2758,39 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_callback_tracing_kind_o
 // libraries' tables as they are and wraps nothing. Without the function,
 // rocprofiler-register stops the program ("rocprofiler_set_api_table not
 // found") as soon as RCCL starts, which is how PyTorch's distributed setup
-// ended under vLLM.
+// ended under vLLM. ROCTx's tables are wrapped (the ROCTx block above); the others
+// are taken as they are.
 ROCPROFILER_API int rocprofiler_set_api_table(const char* name, uint64_t, uint64_t, void** tables, uint64_t count) {
+  if (name && std::strcmp(name, "roctx") == 0) roctx::wrap_tables(tables, count);
   return name && (tables || count == 0) ? 0 : -1;
 }
 
-// The arguments of the call a callback-tracing record is about, one by one.
-// The records this library delivers carry the operation, not the call's
-// arguments, so there are none to walk: a tool asking is told so, and PyTorch's
-// profiler records the call without them.
+// The arguments of the call a callback-tracing record is about, one by one, as
+// rocprofiler-sdk hands them to a tool: the address of each in the record, how many
+// pointers deep its type is, the type's typeid name, the parameter's name and its
+// value as text. Only HIP calls carry arguments here, and only those whose entry
+// point hands them over; pointers are shown as the address they hold (the
+// dereference count is 0), which is what a record delivered after the call has to
+// do too.
 ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_callback_tracing_kind_operation_args(
-    rocprofiler_callback_tracing_record_t, void* callback, int32_t, void*) {
+    rocprofiler_callback_tracing_record_t record, rocprofiler_callback_tracing_operation_args_cb_t callback, int32_t,
+    void* user_data) {
   if (!callback) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
-  return ROCPROFILER_STATUS_ERROR_NOT_IMPLEMENTED;
+  const bool runtime = record.kind == ROCPROFILER_CALLBACK_TRACING_HIP_RUNTIME_API;
+  if (!runtime && record.kind != ROCPROFILER_CALLBACK_TRACING_HIP_COMPILER_API)
+    return ROCPROFILER_STATUS_ERROR_NOT_IMPLEMENTED;
+  const auto* data = static_cast<const rocprofiler_callback_tracing_hip_api_data_t*>(record.payload);
+  const ha::CallSpec* spec = call_spec(!runtime, record.operation);
+  if (!data || !spec) return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  if (data->retval[sizeof data->retval - 1]) return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  for (size_t i = 0; i < spec->count; ++i) {
+    const ha::ArgSpec& a = spec->args[i];
+    const std::string text = ha::format(a, data->args);
+    if (callback(record.kind, record.operation, static_cast<uint32_t>(i), data->args + a.offset, ha::indirection(a),
+                 a.type, a.name, text.c_str(), 0, user_data) != 0)
+      break;
+  }
+  return ROCPROFILER_STATUS_SUCCESS;
 }
 
 ROCPROFILER_API rocprofiler_status_t rocprofiler_query_intercept_table_name(rocprofiler_intercept_table_t kind,
@@ -1690,10 +2820,28 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_at_intercept_table_registration
   return ROCPROFILER_STATUS_SUCCESS;
 }
 
-// The arguments of a traced call, which are not recorded here.
-ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_buffer_tracing_record_args(rocprofiler_record_header_t, void*,
-                                                                                    void*) {
-  return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+// The arguments of a traced HIP call, one by one, from a buffer record of the "extended" kinds
+// (HIP_RUNTIME_API_EXT, HIP_COMPILER_API_EXT), which carry them. A pointer is shown as the address it
+// holds: the record outlives the call's stack.
+ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_buffer_tracing_record_args(
+    rocprofiler_record_header_t header, rocprofiler_buffer_tracing_operation_args_cb_t callback, void* user_data) {
+  if (!callback) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
+  if (header.category != ROCPROFILER_BUFFER_CATEGORY_TRACING) return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  const bool runtime = header.kind == ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT;
+  if (!runtime && header.kind != ROCPROFILER_BUFFER_TRACING_HIP_COMPILER_API_EXT)
+    return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  const auto* r = static_cast<const rocprofiler_buffer_tracing_hip_api_ext_record_t*>(header.payload);
+  if (!r) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
+  const ha::CallSpec* spec = call_spec(!runtime, r->operation);
+  if (!spec || r->retval[sizeof r->retval - 1]) return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  for (size_t i = 0; i < spec->count; ++i) {
+    const ha::ArgSpec& a = spec->args[i];
+    const std::string text = ha::format(a, r->args);
+    if (callback(r->kind, r->operation, static_cast<uint32_t>(i), r->args + a.offset, ha::indirection(a), a.type, a.name,
+                 text.c_str(), user_data) != 0)
+      break;
+  }
+  return ROCPROFILER_STATUS_SUCCESS;
 }
 
 // -- PC sampling, and what needs hardware there is no model of --

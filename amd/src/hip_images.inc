@@ -257,7 +257,7 @@ hipError_t free_array(void* handle) {
 }  // namespace
 
 hipError_t hipDeviceGetTexture1DLinearMaxWidth(size_t* width, const ChannelFormatDesc* desc, int device) {
-  const ApiCall api("hipDeviceGetTexture1DLinearMaxWidth");
+  const ApiCall api("hipDeviceGetTexture1DLinearMaxWidth", width, desc, device);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (!width || !desc) return record(s, hipErrorInvalidValue);
@@ -285,9 +285,9 @@ void __hipRegisterSurface(void*, void*, char*, const char*, int, int) {}
 
 // A mipmapped array: its arguments checked, then refused -- ROCm's HIP on
 // Linux has no mipmaps (its texture objects refuse one on every device).
-hipError_t hipMallocMipmappedArray(void** array, const void* desc, vgpu::amd::abi::Extent, unsigned int, unsigned int) {
+hipError_t hipMallocMipmappedArray(void** array, const void* desc, vgpu::amd::abi::Extent hip_extent, unsigned int hip_numLevels, unsigned int hip_flags) {
   if (!array || !desc) {
-    const ApiCall api("hipMallocMipmappedArray");
+    const ApiCall api("hipMallocMipmappedArray", array, desc, hip_extent, hip_numLevels, hip_flags);
     return record(state(), hipErrorInvalidValue);
   }
   return no_images("hipMallocMipmappedArray");
@@ -298,7 +298,7 @@ hipError_t hipMallocMipmappedArray(void** array, const void* desc, vgpu::amd::ab
 hipError_t hipMallocArray(void** array, const ChannelFormatDesc* desc, size_t width, size_t height,
                           unsigned int flags) {
   if (!images_here()) return no_images("hipMallocArray");
-  const ApiCall api("hipMallocArray");
+  const ApiCall api("hipMallocArray", array, desc, width, height, flags);
   if (!array || !desc || !well_formed(*desc)) return record(state(), hipErrorInvalidValue);
   const Array3DDescriptor d{width, height, 0, array_format(*desc), channel_count(*desc), flags};
   return record(state(), make_array(array, d));
@@ -306,7 +306,7 @@ hipError_t hipMallocArray(void** array, const ChannelFormatDesc* desc, size_t wi
 hipError_t hipMalloc3DArray(void** array, const ChannelFormatDesc* desc, vgpu::amd::abi::Extent extent,
                             unsigned int flags) {
   if (!images_here()) return no_images("hipMalloc3DArray");
-  const ApiCall api("hipMalloc3DArray");
+  const ApiCall api("hipMalloc3DArray", array, desc, extent, flags);
   if (!array || !desc || !well_formed(*desc)) return record(state(), hipErrorInvalidValue);
   const Array3DDescriptor d{extent.width, extent.height, extent.depth, array_format(*desc), channel_count(*desc),
                             flags};
@@ -314,31 +314,31 @@ hipError_t hipMalloc3DArray(void** array, const ChannelFormatDesc* desc, vgpu::a
 }
 hipError_t hipArrayCreate(void** array, const ArrayDescriptor* desc) {
   if (!images_here()) return no_images("hipArrayCreate");
-  const ApiCall api("hipArrayCreate");
+  const ApiCall api("hipArrayCreate", array, desc);
   if (!desc) return record(state(), hipErrorInvalidValue);
   return record(state(), make_array(array, Array3DDescriptor{desc->Width, desc->Height, 0, desc->Format,
                                                               desc->NumChannels, 0}));
 }
 hipError_t hipArray3DCreate(void** array, const Array3DDescriptor* desc) {
   if (!images_here()) return no_images("hipArray3DCreate");
-  const ApiCall api("hipArray3DCreate");
+  const ApiCall api("hipArray3DCreate", array, desc);
   if (!desc) return record(state(), hipErrorInvalidValue);
   return record(state(), make_array(array, *desc));
 }
 hipError_t hipFreeArray(void* array) {
   if (!images_here()) return freeing_nothing("hipFreeArray");
-  const ApiCall api("hipFreeArray");
+  const ApiCall api("hipFreeArray", array);
   return record(state(), free_array(array));
 }
 hipError_t hipArrayDestroy(void* array) {
   if (!images_here()) return freeing_nothing("hipArrayDestroy");
-  const ApiCall api("hipArrayDestroy");
+  const ApiCall api("hipArrayDestroy", array);
   return record(state(), free_array(array));
 }
 
 hipError_t hipGetChannelDesc(ChannelFormatDesc* desc, const void* array) {
   if (!images_here()) return no_such_array("hipGetChannelDesc");
-  const ApiCall api("hipGetChannelDesc");
+  const ApiCall api("hipGetChannelDesc", desc, array);
   if (!desc) return record(state(), hipErrorInvalidValue);
   const HipArray* a = find_array(array);
   if (!a) return record(state(), hipErrorInvalidHandle);
@@ -348,7 +348,7 @@ hipError_t hipGetChannelDesc(ChannelFormatDesc* desc, const void* array) {
 hipError_t hipArrayGetInfo(ChannelFormatDesc* desc, vgpu::amd::abi::Extent* extent, unsigned int* flags,
                            void* array) {
   if (!images_here()) return no_such_array("hipArrayGetInfo");
-  const ApiCall api("hipArrayGetInfo");
+  const ApiCall api("hipArrayGetInfo", desc, extent, flags, array);
   if (!array) return record(state(), hipErrorInvalidHandle);
   if (!desc && !extent && !flags) return record(state(), hipSuccess);
   const HipArray* a = find_array(array);
@@ -360,7 +360,7 @@ hipError_t hipArrayGetInfo(ChannelFormatDesc* desc, vgpu::amd::abi::Extent* exte
 }
 hipError_t hipArrayGetDescriptor(ArrayDescriptor* desc, void* array) {
   if (!images_here()) return no_such_array("hipArrayGetDescriptor");
-  const ApiCall api("hipArrayGetDescriptor");
+  const ApiCall api("hipArrayGetDescriptor", desc, array);
   if (!array) return record(state(), hipErrorInvalidHandle);
   if (!desc) return record(state(), hipErrorInvalidValue);
   const HipArray* a = find_array(array);
@@ -370,7 +370,7 @@ hipError_t hipArrayGetDescriptor(ArrayDescriptor* desc, void* array) {
 }
 hipError_t hipArray3DGetDescriptor(Array3DDescriptor* desc, void* array) {
   if (!images_here()) return no_such_array("hipArray3DGetDescriptor");
-  const ApiCall api("hipArray3DGetDescriptor");
+  const ApiCall api("hipArray3DGetDescriptor", desc, array);
   if (!array) return record(state(), hipErrorInvalidHandle);
   if (!desc) return record(state(), hipErrorInvalidValue);
   const HipArray* a = find_array(array);
@@ -479,74 +479,74 @@ hipError_t copy_count_from_array(void* dst, const void* src, size_t x, size_t y,
 hipError_t hipMemcpy2DToArray(void* dst, size_t x, size_t y, const void* src, size_t spitch, size_t width,
                               size_t height, hipMemcpyKind kind) {
   if (!images_here()) return no_such_array("hipMemcpy2DToArray");
-  const ApiCall api("hipMemcpy2DToArray");
+  const ApiCall api("hipMemcpy2DToArray", dst, x, y, src, spitch, width, height, kind);
   return record(state(), copy_2d_to_array(dst, x, y, src, spitch, width, height, kind, nullptr, false));
 }
 hipError_t hipMemcpy2DToArray_spt(void* dst, size_t x, size_t y, const void* src, size_t spitch, size_t width,
                                   size_t height, hipMemcpyKind kind) {
   if (!images_here()) return no_such_array("hipMemcpy2DToArray_spt");
-  const ApiCall api("hipMemcpy2DToArray_spt");
+  const ApiCall api("hipMemcpy2DToArray_spt", dst, x, y, src, spitch, width, height, kind);
   return record(state(), copy_2d_to_array(dst, x, y, src, spitch, width, height, kind, spt(nullptr), false));
 }
 hipError_t hipMemcpy2DToArrayAsync(void* dst, size_t x, size_t y, const void* src, size_t spitch, size_t width,
                                    size_t height, hipMemcpyKind kind, hipStream_t stream) {
   if (!images_here()) return no_such_array("hipMemcpy2DToArrayAsync");
-  const ApiCall api("hipMemcpy2DToArrayAsync");
+  const ApiCall api("hipMemcpy2DToArrayAsync", dst, x, y, src, spitch, width, height, kind, stream);
   return record(state(), copy_2d_to_array(dst, x, y, src, spitch, width, height, kind, stream, true));
 }
 hipError_t hipMemcpy2DToArrayAsync_spt(void* dst, size_t x, size_t y, const void* src, size_t spitch,
                                        size_t width, size_t height, hipMemcpyKind kind, hipStream_t stream) {
   if (!images_here()) return no_such_array("hipMemcpy2DToArrayAsync_spt");
-  const ApiCall api("hipMemcpy2DToArrayAsync_spt");
+  const ApiCall api("hipMemcpy2DToArrayAsync_spt", dst, x, y, src, spitch, width, height, kind, stream);
   return record(state(), copy_2d_to_array(dst, x, y, src, spitch, width, height, kind,
                                           spt(stream), true));
 }
 hipError_t hipMemcpy2DFromArray(void* dst, size_t dpitch, const void* src, size_t x, size_t y, size_t width,
                                 size_t height, hipMemcpyKind kind) {
   if (!images_here()) return no_such_array("hipMemcpy2DFromArray");
-  const ApiCall api("hipMemcpy2DFromArray");
+  const ApiCall api("hipMemcpy2DFromArray", dst, dpitch, src, x, y, width, height, kind);
   return record(state(), copy_2d_from_array(dst, dpitch, src, x, y, width, height, kind, nullptr, false));
 }
 hipError_t hipMemcpy2DFromArray_spt(void* dst, size_t dpitch, const void* src, size_t x, size_t y, size_t width,
                                     size_t height, hipMemcpyKind kind) {
   if (!images_here()) return no_such_array("hipMemcpy2DFromArray_spt");
-  const ApiCall api("hipMemcpy2DFromArray_spt");
+  const ApiCall api("hipMemcpy2DFromArray_spt", dst, dpitch, src, x, y, width, height, kind);
   return record(state(),
                 copy_2d_from_array(dst, dpitch, src, x, y, width, height, kind, spt(nullptr), false));
 }
 hipError_t hipMemcpy2DFromArrayAsync(void* dst, size_t dpitch, const void* src, size_t x, size_t y, size_t width,
                                      size_t height, hipMemcpyKind kind, hipStream_t stream) {
   if (!images_here()) return no_such_array("hipMemcpy2DFromArrayAsync");
-  const ApiCall api("hipMemcpy2DFromArrayAsync");
+  const ApiCall api("hipMemcpy2DFromArrayAsync", dst, dpitch, src, x, y, width, height, kind, stream);
   return record(state(), copy_2d_from_array(dst, dpitch, src, x, y, width, height, kind, stream, true));
 }
 hipError_t hipMemcpy2DFromArrayAsync_spt(void* dst, size_t dpitch, const void* src, size_t x, size_t y,
                                          size_t width, size_t height, hipMemcpyKind kind, hipStream_t stream) {
   if (!images_here()) return no_such_array("hipMemcpy2DFromArrayAsync_spt");
-  const ApiCall api("hipMemcpy2DFromArrayAsync_spt");
+  const ApiCall api("hipMemcpy2DFromArrayAsync_spt", dst, dpitch, src, x, y, width, height, kind, stream);
   return record(state(), copy_2d_from_array(dst, dpitch, src, x, y, width, height, kind,
                                             spt(stream), true));
 }
 hipError_t hipMemcpyToArray(void* dst, size_t x, size_t y, const void* src, size_t count, hipMemcpyKind kind) {
   if (!images_here()) return no_such_array("hipMemcpyToArray");
-  const ApiCall api("hipMemcpyToArray");
+  const ApiCall api("hipMemcpyToArray", dst, x, y, src, count, kind);
   return record(state(), copy_count_to_array(dst, x, y, src, count, kind, nullptr, false));
 }
 hipError_t hipMemcpyFromArray(void* dst, const void* src, size_t x, size_t y, size_t count, hipMemcpyKind kind) {
   if (!images_here()) return no_such_array("hipMemcpyFromArray");
-  const ApiCall api("hipMemcpyFromArray");
+  const ApiCall api("hipMemcpyFromArray", dst, src, x, y, count, kind);
   return record(state(), copy_count_from_array(dst, src, x, y, count, kind, nullptr, false));
 }
 hipError_t hipMemcpyFromArray_spt(void* dst, const void* src, size_t x, size_t y, size_t count,
                                   hipMemcpyKind kind) {
   if (!images_here()) return no_such_array("hipMemcpyFromArray_spt");
-  const ApiCall api("hipMemcpyFromArray_spt");
+  const ApiCall api("hipMemcpyFromArray_spt", dst, src, x, y, count, kind);
   return record(state(), copy_count_from_array(dst, src, x, y, count, kind, spt(nullptr), false));
 }
 hipError_t hipMemcpy2DArrayToArray(void* dst, size_t dx, size_t dy, const void* src, size_t sx, size_t sy,
                                    size_t width, size_t height, hipMemcpyKind kind) {
   if (!images_here()) return no_such_array("hipMemcpy2DArrayToArray");
-  const ApiCall api("hipMemcpy2DArrayToArray");
+  const ApiCall api("hipMemcpy2DArrayToArray", dst, dx, dy, src, sx, sy, width, height, kind);
   if (!valid_kind(kind)) return record(state(), hipErrorInvalidMemcpyDirection);
   if (const hipError_t e = check_array_rows(src, sx, sy, width, height); e != hipSuccess) return record(state(), e);
   if (const hipError_t e = check_array_rows(dst, dx, dy, width, height); e != hipSuccess) return record(state(), e);
@@ -934,13 +934,13 @@ DrvTextureDesc texture_to_driver(const TextureDesc& t) {
 hipError_t hipCreateTextureObject(void** object, const ResourceDesc* res, const TextureDesc* tex,
                                   const ResourceViewDesc* view) {
   if (!images_here()) return no_images("hipCreateTextureObject");
-  const ApiCall api("hipCreateTextureObject");
+  const ApiCall api("hipCreateTextureObject", object, res, tex, view);
   return record(state(), create_texture(object, res, tex, view));
 }
 hipError_t hipTexObjectCreate(void** object, const DrvResourceDesc* res, const DrvTextureDesc* tex,
                               const DrvResourceViewDesc* view) {
   if (!images_here()) return no_images("hipTexObjectCreate");
-  const ApiCall api("hipTexObjectCreate");
+  const ApiCall api("hipTexObjectCreate", object, res, tex, view);
   if (!object || !res || !tex) return record(state(), hipErrorInvalidValue);
   const ResourceDesc r = resource_from_driver(*res);
   const TextureDesc t = texture_from_driver(*tex);
@@ -948,18 +948,18 @@ hipError_t hipTexObjectCreate(void** object, const DrvResourceDesc* res, const D
 }
 hipError_t hipDestroyTextureObject(void* object) {
   if (!images_here()) return destroying("hipDestroyTextureObject", reinterpret_cast<uint64_t>(object));
-  const ApiCall api("hipDestroyTextureObject");
+  const ApiCall api("hipDestroyTextureObject", object);
   return record(state(), destroy_object(object, true));
 }
 hipError_t hipTexObjectDestroy(void* object) {
   if (!images_here()) return destroying("hipTexObjectDestroy", reinterpret_cast<uint64_t>(object));
-  const ApiCall api("hipTexObjectDestroy");
+  const ApiCall api("hipTexObjectDestroy", object);
   return record(state(), destroy_object(object, true));
 }
 
 hipError_t hipGetTextureObjectResourceDesc(ResourceDesc* out, void* object) {
   if (!images_here()) return no_such_array("hipGetTextureObjectResourceDesc");
-  const ApiCall api("hipGetTextureObjectResourceDesc");
+  const ApiCall api("hipGetTextureObjectResourceDesc", out, object);
   if (!out || !object) return record(state(), hipErrorInvalidValue);
   Object o;
   if (const hipError_t e = object_of(object, true, &o); e != hipSuccess) return record(state(), e);
@@ -968,7 +968,7 @@ hipError_t hipGetTextureObjectResourceDesc(ResourceDesc* out, void* object) {
 }
 hipError_t hipGetTextureObjectTextureDesc(TextureDesc* out, void* object) {
   if (!images_here()) return no_such_array("hipGetTextureObjectTextureDesc");
-  const ApiCall api("hipGetTextureObjectTextureDesc");
+  const ApiCall api("hipGetTextureObjectTextureDesc", out, object);
   if (!out || !object) return record(state(), hipErrorInvalidValue);
   Object o;
   if (const hipError_t e = object_of(object, true, &o); e != hipSuccess) return record(state(), e);
@@ -977,7 +977,7 @@ hipError_t hipGetTextureObjectTextureDesc(TextureDesc* out, void* object) {
 }
 hipError_t hipGetTextureObjectResourceViewDesc(ResourceViewDesc* out, void* object) {
   if (!images_here()) return no_such_array("hipGetTextureObjectResourceViewDesc");
-  const ApiCall api("hipGetTextureObjectResourceViewDesc");
+  const ApiCall api("hipGetTextureObjectResourceViewDesc", out, object);
   if (!out || !object) return record(state(), hipErrorInvalidValue);
   Object o;
   if (const hipError_t e = object_of(object, true, &o); e != hipSuccess) return record(state(), e);
@@ -986,7 +986,7 @@ hipError_t hipGetTextureObjectResourceViewDesc(ResourceViewDesc* out, void* obje
 }
 hipError_t hipTexObjectGetResourceDesc(DrvResourceDesc* out, void* object) {
   if (!images_here()) return no_such_array("hipTexObjectGetResourceDesc");
-  const ApiCall api("hipTexObjectGetResourceDesc");
+  const ApiCall api("hipTexObjectGetResourceDesc", out, object);
   if (!out || !object) return record(state(), hipErrorInvalidValue);
   Object o;
   if (const hipError_t e = object_of(object, true, &o); e != hipSuccess) return record(state(), e);
@@ -995,7 +995,7 @@ hipError_t hipTexObjectGetResourceDesc(DrvResourceDesc* out, void* object) {
 }
 hipError_t hipTexObjectGetTextureDesc(DrvTextureDesc* out, void* object) {
   if (!images_here()) return no_such_array("hipTexObjectGetTextureDesc");
-  const ApiCall api("hipTexObjectGetTextureDesc");
+  const ApiCall api("hipTexObjectGetTextureDesc", out, object);
   if (!out || !object) return record(state(), hipErrorInvalidValue);
   Object o;
   if (const hipError_t e = object_of(object, true, &o); e != hipSuccess) return record(state(), e);
@@ -1004,7 +1004,7 @@ hipError_t hipTexObjectGetTextureDesc(DrvTextureDesc* out, void* object) {
 }
 hipError_t hipTexObjectGetResourceViewDesc(DrvResourceViewDesc* out, void* object) {
   if (!images_here()) return no_such_array("hipTexObjectGetResourceViewDesc");
-  const ApiCall api("hipTexObjectGetResourceViewDesc");
+  const ApiCall api("hipTexObjectGetResourceViewDesc", out, object);
   if (!out || !object) return record(state(), hipErrorInvalidValue);
   Object o;
   if (const hipError_t e = object_of(object, true, &o); e != hipSuccess) return record(state(), e);
@@ -1016,7 +1016,7 @@ hipError_t hipTexObjectGetResourceViewDesc(DrvResourceViewDesc* out, void* objec
 // read and written in its own format.
 hipError_t hipCreateSurfaceObject(void** object, const ResourceDesc* res) {
   if (!images_here()) return no_images("hipCreateSurfaceObject");
-  const ApiCall api("hipCreateSurfaceObject");
+  const ApiCall api("hipCreateSurfaceObject", object, res);
   if (!object || !res || res->resType != 0 || !res->res.array.array) return record(state(), hipErrorInvalidValue);
   const HipArray* a = find_array(res->res.array.array);
   if (!a) return record(state(), hipErrorInvalidValue);
@@ -1036,7 +1036,7 @@ hipError_t hipCreateSurfaceObject(void** object, const ResourceDesc* res) {
 }
 hipError_t hipDestroySurfaceObject(void* object) {
   if (!images_here()) return destroying("hipDestroySurfaceObject", reinterpret_cast<uint64_t>(object));
-  const ApiCall api("hipDestroySurfaceObject");
+  const ApiCall api("hipDestroySurfaceObject", object);
   return record(state(), destroy_object(object, false));
 }
 
@@ -1142,7 +1142,7 @@ hipError_t alignment_offset(size_t* offset, const void* p) {
 
 hipError_t hipGetTextureReference(const TextureReference** texref, const void* symbol) {
   if (!images_here()) return no_images("hipGetTextureReference");
-  const ApiCall api("hipGetTextureReference");
+  const ApiCall api("hipGetTextureReference", texref, symbol);
   if (!texref) return record(state(), hipErrorInvalidValue);
   *texref = static_cast<const TextureReference*>(symbol);
   return record(state(), hipSuccess);
@@ -1150,7 +1150,7 @@ hipError_t hipGetTextureReference(const TextureReference** texref, const void* s
 
 hipError_t hipModuleGetTexRef(TextureReference** texref, hipModule_t module, const char* name) {
   if (!images_here()) return no_images("hipModuleGetTexRef");
-  const ApiCall api("hipModuleGetTexRef");
+  const ApiCall api("hipModuleGetTexRef", texref, module, name);
   if (!texref || !name || !*name) return record(state(), hipErrorInvalidValue);
   if (!module) return record(state(), hipErrorInvalidResourceHandle);
   State& s = state();
@@ -1179,7 +1179,7 @@ hipError_t hipModuleGetTexRef(TextureReference** texref, hipModule_t module, con
 hipError_t hipBindTexture(size_t* offset, TextureReference* texref, const void* ptr, const ChannelFormatDesc* desc,
                           size_t size) {
   if (!images_here()) return no_images("hipBindTexture");
-  const ApiCall api("hipBindTexture");
+  const ApiCall api("hipBindTexture", offset, texref, ptr, desc, size);
   uint64_t at = 0;
   if (const hipError_t e = reference_on_device(texref, false, &at); e != hipSuccess) return record(state(), e);
   if (!texref) return record(state(), hipErrorUnknown);
@@ -1200,7 +1200,7 @@ hipError_t hipBindTexture(size_t* offset, TextureReference* texref, const void* 
 hipError_t hipBindTexture2D(size_t* offset, TextureReference* texref, const void* ptr, const ChannelFormatDesc* desc,
                             size_t width, size_t height, size_t pitch) {
   if (!images_here()) return no_images("hipBindTexture2D");
-  const ApiCall api("hipBindTexture2D");
+  const ApiCall api("hipBindTexture2D", offset, texref, ptr, desc, width, height, pitch);
   if (!texref) return record(state(), hipErrorUnknown);
   if (!ptr) return record(state(), hipErrorNotFound);
   uint64_t at = 0;
@@ -1222,7 +1222,7 @@ hipError_t hipBindTexture2D(size_t* offset, TextureReference* texref, const void
 
 hipError_t hipBindTextureToArray(TextureReference* texref, const void* array, const ChannelFormatDesc* desc) {
   if (!images_here()) return no_images("hipBindTextureToArray");
-  const ApiCall api("hipBindTextureToArray");
+  const ApiCall api("hipBindTextureToArray", texref, array, desc);
   if (!texref || !array || !desc) return record(state(), hipErrorInvalidValue);
   uint64_t at = 0;
   if (const hipError_t e = reference_on_device(texref, false, &at); e != hipSuccess) return record(state(), e);
@@ -1239,7 +1239,7 @@ hipError_t hipBindTextureToArray(TextureReference* texref, const void* array, co
 // A mipmapped array: there are none to bind (see hipMallocMipmappedArray).
 hipError_t hipBindTextureToMipmappedArray(TextureReference* texref, const void* array, const ChannelFormatDesc* desc) {
   if (!images_here()) return no_images("hipBindTextureToMipmappedArray");
-  const ApiCall api("hipBindTextureToMipmappedArray");
+  const ApiCall api("hipBindTextureToMipmappedArray", texref, array, desc);
   uint64_t at = 0;
   if (const hipError_t e = reference_on_device(texref, false, &at); e != hipSuccess) return record(state(), e);
   if (!texref || !array || !desc) return record(state(), hipErrorInvalidValue);
@@ -1251,7 +1251,7 @@ hipError_t hipBindTextureToMipmappedArray(TextureReference* texref, const void* 
 hipError_t hipUnbindTexture(TextureReference* texref) {
   if (!texref) return record(state(), hipErrorInvalidValue);
   if (!images_here()) return no_images("hipUnbindTexture");
-  const ApiCall api("hipUnbindTexture");
+  const ApiCall api("hipUnbindTexture", texref);
   if (const hipError_t e = destroy_object(texref->textureObject, true); e != hipSuccess) return record(state(), e);
   texref->textureObject = nullptr;
   return record(state(), hipSuccess);
@@ -1259,7 +1259,7 @@ hipError_t hipUnbindTexture(TextureReference* texref) {
 
 hipError_t hipGetTextureAlignmentOffset(size_t* offset, const TextureReference* texref) {
   if (!images_here()) return no_images("hipGetTextureAlignmentOffset");
-  const ApiCall api("hipGetTextureAlignmentOffset");
+  const ApiCall api("hipGetTextureAlignmentOffset", offset, texref);
   if (!texref) return record(state(), hipErrorInvalidTexture);
   if (!offset) return record(state(), hipErrorInvalidValue);
   *offset = 0;
@@ -1269,7 +1269,7 @@ hipError_t hipGetTextureAlignmentOffset(size_t* offset, const TextureReference* 
 // The driver API's form: a module's reference, bound to memory or an array.
 hipError_t hipTexRefSetAddress(size_t* offset, TextureReference* texref, void* ptr, size_t bytes) {
   if (!images_here()) return no_images("hipTexRefSetAddress");
-  const ApiCall api("hipTexRefSetAddress");
+  const ApiCall api("hipTexRefSetAddress", offset, texref, ptr, bytes);
   if (!texref) return record(state(), hipErrorInvalidValue);
   uint64_t at = 0;
   if (const hipError_t e = reference_on_device(texref, true, &at); e != hipSuccess) return record(state(), e);
@@ -1286,7 +1286,7 @@ hipError_t hipTexRefSetAddress(size_t* offset, TextureReference* texref, void* p
 }
 hipError_t hipTexRefSetAddress2D(TextureReference* texref, const ArrayDescriptor* desc, void* ptr, size_t pitch) {
   if (!images_here()) return no_images("hipTexRefSetAddress2D");
-  const ApiCall api("hipTexRefSetAddress2D");
+  const ApiCall api("hipTexRefSetAddress2D", texref, desc, ptr, pitch);
   if (!texref || !desc) return record(state(), hipErrorInvalidValue);
   uint64_t at = 0;
   if (const hipError_t e = reference_on_device(texref, true, &at); e != hipSuccess) return record(state(), e);
@@ -1302,7 +1302,7 @@ hipError_t hipTexRefSetAddress2D(TextureReference* texref, const ArrayDescriptor
 }
 hipError_t hipTexRefSetArray(TextureReference* texref, const void* array, unsigned flags) {
   if (!images_here()) return no_images("hipTexRefSetArray");
-  const ApiCall api("hipTexRefSetArray");
+  const ApiCall api("hipTexRefSetArray", texref, array, flags);
   if (!texref || !array) return record(state(), hipErrorInvalidValue);
   if (flags != 1 /* HIP_TRSA_OVERRIDE_FORMAT */) return record(state(), hipErrorInvalidValue);
   uint64_t at = 0;
@@ -1320,7 +1320,7 @@ hipError_t hipTexRefSetArray(TextureReference* texref, const void* array, unsign
 }
 hipError_t hipTexRefSetMipmappedArray(TextureReference* texref, void* array, unsigned flags) {
   if (!images_here()) return no_images("hipTexRefSetMipmappedArray");
-  const ApiCall api("hipTexRefSetMipmappedArray");
+  const ApiCall api("hipTexRefSetMipmappedArray", texref, array, flags);
   if (!texref || !array || flags != 1) return record(state(), hipErrorInvalidValue);
   uint64_t at = 0;
   if (const hipError_t e = reference_on_device(texref, true, &at); e != hipSuccess) return record(state(), e);
@@ -1339,7 +1339,7 @@ hipError_t bound_resource(const TextureReference* t, ResourceDesc* res) {
 }  // namespace
 hipError_t hipTexRefGetAddress(void** ptr, const TextureReference* texref) {
   if (!images_here()) return no_images("hipTexRefGetAddress");
-  const ApiCall api("hipTexRefGetAddress");
+  const ApiCall api("hipTexRefGetAddress", ptr, texref);
   if (!ptr || !texref) return record(state(), hipErrorInvalidValue);
   ResourceDesc res{};
   if (const hipError_t e = bound_resource(texref, &res); e != hipSuccess) return record(state(), e);
@@ -1350,7 +1350,7 @@ hipError_t hipTexRefGetAddress(void** ptr, const TextureReference* texref) {
 }
 hipError_t hipTexRefGetArray(void** array, const TextureReference* texref) {
   if (!images_here()) return no_images("hipTexRefGetArray");
-  const ApiCall api("hipTexRefGetArray");
+  const ApiCall api("hipTexRefGetArray", array, texref);
   if (!array || !texref) return record(state(), hipErrorInvalidValue);
   ResourceDesc res{};
   if (const hipError_t e = bound_resource(texref, &res); e != hipSuccess) return record(state(), e);
@@ -1360,7 +1360,7 @@ hipError_t hipTexRefGetArray(void** array, const TextureReference* texref) {
 }
 hipError_t hipTexRefGetMipMappedArray(void** array, const TextureReference* texref) {
   if (!images_here()) return no_images("hipTexRefGetMipMappedArray");
-  const ApiCall api("hipTexRefGetMipMappedArray");
+  const ApiCall api("hipTexRefGetMipMappedArray", array, texref);
   if (!array || !texref) return record(state(), hipErrorInvalidValue);
   ResourceDesc res{};
   if (const hipError_t e = bound_resource(texref, &res); e != hipSuccess) return record(state(), e);
@@ -1416,14 +1416,14 @@ VGPU_TEXREF_CALL(hipTexRefGetFlags, (unsigned* flags, const TextureReference* t)
 // An axis's address mode: three to set, two to ask about (as ROCm's HIP has it).
 hipError_t hipTexRefSetAddressMode(TextureReference* t, int dim, int mode) {
   if (!images_here()) return no_images("hipTexRefSetAddressMode");
-  const ApiCall api("hipTexRefSetAddressMode");
+  const ApiCall api("hipTexRefSetAddressMode", t, dim, mode);
   if (!t || dim < 0 || dim > 2) return record(state(), hipErrorInvalidValue);
   t->addressMode[dim] = mode;
   return record(state(), hipSuccess);
 }
 hipError_t hipTexRefGetAddressMode(int* mode, const TextureReference* t, int dim) {
   if (!images_here()) return no_images("hipTexRefGetAddressMode");
-  const ApiCall api("hipTexRefGetAddressMode");
+  const ApiCall api("hipTexRefGetAddressMode", mode, t, dim);
   if (!mode || !t || (dim != 0 && dim != 1)) return record(state(), hipErrorInvalidValue);
   *mode = t->addressMode[dim];
   return record(state(), hipSuccess);

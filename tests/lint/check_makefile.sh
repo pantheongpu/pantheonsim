@@ -106,6 +106,27 @@ lacks "a GPU in the environment does nothing" "zzz" "$out"
 lacks "a CUDA_VERSION in the environment does nothing" "--cuda" "$out"
 lacks "a STRICT in the environment does nothing" "--strict" "$out"
 
+# ---- threads: half the CPUs by default, always overridable -------------------------------------
+half=$(( ($(nproc) + 1) / 2 ))
+expect "half-threads.sh prints half the CPUs" "$half" "$(cd "$tmp" && HOME="$tmp" "$root/scripts/half-threads.sh")"
+expect "VGPU_THREADS set: half-threads.sh stays silent" "" "$(cd "$tmp" && VGPU_THREADS=3 "$root/scripts/half-threads.sh")"
+printf 'gpu: nvidia/h100\nthreads: 2\n' > "$tmp/t.yaml"
+expect "a threads: line in the file: half-threads.sh stays silent" "" "$("$root/scripts/half-threads.sh" "$tmp/t.yaml")"
+printf '# threads: 2\ngpu: nvidia/h100\n' > "$tmp/c.yaml"
+expect "a commented threads: line does not count" "$half" "$("$root/scripts/half-threads.sh" "$tmp/c.yaml")"
+out=$(make -pn run APP=./x 2>/dev/null | grep -E '^(export )?VGPU_THREADS')
+contains "make exports half the CPUs as VGPU_THREADS" "VGPU_THREADS := $half" "$out"
+out=$(VGPU_THREADS=5 make -pn run APP=./x 2>/dev/null | grep -E '^DEFAULT_THREADS')
+expect "make leaves a VGPU_THREADS from the environment alone" "" "$out"
+contains "THREADS=N is still a flag" "--threads '3'" "$(dry run APP=./x THREADS=3 | vl)"
+expect "make build: half the CPUs is scripts/build.sh's job, not a flag" "nice -n 10 ./scripts/build.sh" "$(dry build)"
+contains "JOBS=N becomes CI_JOBS" "CI_JOBS='4' nice -n 10 ./scripts/build.sh" "$(dry build JOBS=4)"
+lacks "a JOBS in the environment does nothing" "CI_JOBS" "$(JOBS=9 make -n build)"
+b=$(sed -n '/^if \[\[ -z \${CI_JOBS/,/^fi/p' scripts/build.sh)
+expect "build.sh caps at half the CPUs" "$half" "$(cd "$tmp" && env -u CI -u CI_JOBS -u CI_JOBS_MAX bash -c "$b"'; echo $CI_JOBS_MAX')"
+expect "build.sh keeps every CPU under CI=true" "" "$(cd "$tmp" && env CI=true -u CI_JOBS -u CI_JOBS_MAX bash -c "$b"'; echo ${CI_JOBS_MAX:-}')"
+expect "build.sh leaves an explicit CI_JOBS_MAX alone" "7" "$(cd "$tmp" && env -u CI -u CI_JOBS CI_JOBS_MAX=7 bash -c "$b"'; echo $CI_JOBS_MAX')"
+
 # ---- the failure paths (these run for real; each stops before anything is built) --------------
 out=$(make run NICE=false 2>&1); rc=$?
 fails "run without APP fails" "$rc"

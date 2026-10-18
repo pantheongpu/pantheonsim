@@ -16,7 +16,7 @@ is a time.
 ## The card oracle
 
 `amd/tests/rocprof/<case>.cpp` are small hipcc programs (milliseconds on a card). For each,
-`rocprofv3` was run on a real **Radeon RX 6800** (gfx1030, HIP device 0) and, for `vecadd`, a real
+`rocprofv3` was run on a real **Radeon RX 6800** (gfx1030, HIP device 0) and a real
 **Radeon RX 6700 XT** (gfx1031, run as gfx1030 under `HSA_OVERRIDE_GFX_VERSION=10.3.0`), with ROCm
 7.2.0 and rocprofv3 1.1.0:
 
@@ -27,11 +27,10 @@ rocprofv3 --hip-trace --kernel-trace --memory-copy-trace --memory-allocation-tra
 
 `amd/tests/rocprof_normalize.py` (Python standard library only) reduces the JSON to text that does not
 depend on time, addresses or the machine, and the result is `amd/tests/data/rocprof_<case>.expected`
-(`rocprof_vecadd.rx6700xt.expected` for the second card). The simulator runs the same program under the
+(`rocprof_<case>.rx6700xt.expected` for the second card). The simulator runs the same program under the
 same command, inside `vgpu shell --gpu amd/rx6800` (or `amd/rx6700xt`), and its trace is normalised the
 same way and compared. Both cards give the same trace for every case but the agent line (name, ISA,
-compute units), and the program is the same gfx1030 code object on both, so only one case is kept for
-the second card.
+compute units); all nine cases below were recorded on both and the simulator matches each.
 
 | case | what the program does |
 | --- | --- |
@@ -42,21 +41,34 @@ the second card.
 | `graph` | a stream captured into a graph (copy, kernel, copy), instantiated and launched twice |
 | `async_alloc` | `hipMallocAsync`, copies and a kernel on the block, `hipFreeAsync` |
 | `markers` | ROCTx marks, a nested pair of ranges and a range started and stopped by id |
+| `markers_control` | `roctxProfilerPause` and `roctxProfilerResume` around HIP calls, a named stream, nested ranges, marks and a range from a second thread |
 | `geometry` | a 3D grid, static plus dynamic LDS (2048 + 512 bytes), and a private segment (1040 bytes) |
+| `args` | one HIP call for each kind of parameter (null and live pointers, handles, strings, enumerations, integers of each width, structs by value, function pointers), mostly refused or harmless, their results not compared: the card's text for each is the oracle for `rocprofiler_hip_args.hpp` |
+| `runtime_kernels` | copies within a device and small host transfers, fills, by size and alignment: the runtime's own kernels |
+| `scratch` | kernels with private segments of 272 to 8208 bytes on three queues: scratch-memory records |
+| `first_calls` | which calls start the runtime and make its staging buffers; allocation variants; streams made with flags |
+| `graph_sizes` | what instantiating a graph allocates, by its kernel nodes, and what destroying it frees |
+| `async_sizes` | the memory pool's mapped ranges for blocks of 1 KiB to 100 MiB, and when a synchronization gives them back |
 
 What a normalised trace holds, in the order the profiler numbered the calls:
 
 - `[agent]`: the GPU the HIP runtime sees: names, compute units, SIMDs, wave size, LDS, ISA id.
 - `[kernels]`: the program's own kernels as the code object declares them: LDS, scratch, kernarg size
-  and the register counts rocprofiler-sdk reports.
+  and the register counts rocprofiler-sdk reports. `[runtime kernels]`: the same for the 16 kernels of
+  the runtime's own code object.
 - `[hip api, thread N]`: every HIP call, runtime and compiler (`__hipRegisterFatBinary`,
   `__hipPushCallConfiguration`, ...), with its arguments; a pointer or handle prints as `<ptr>`.
-- `[dispatches]`: each dispatch of the program's kernels: demangled name, grid and workgroup size, LDS
-  and scratch bytes.
+- `[dispatches]`: each dispatch, the program's and the runtime's own (`__amd_rocclr_copyBuffer`,
+  `__amd_rocclr_fillBufferAligned`): demangled name, grid and workgroup size, LDS and scratch bytes.
 - `[copies]`: memory-copy records: direction, bytes, the kind of agent at each end.
+- `[scratch]`: scratch-memory records by queue (numbered as they first appear): the allocations in
+  order with their flags and sizes, then the frees.
 - `[allocations]`: the allocations the program asked for (the record of the requested size under
-  `hipMalloc`, `hipHostMalloc`, ...) and the frees under `hipFree` and its relatives.
-- `[markers]`: ROCTx marks and ranges with their messages.
+  `hipMalloc`, `hipHostMalloc`, ...) and the frees under `hipFree` and its relatives, with the agent
+  (a free names none).
+- `[runtime allocations]`: every other allocation record, under the HIP call that made it.
+- `[markers]`: ROCTx marks and ranges with their messages, each with the range it was made in.
+- `[marker scopes]` (only when there is one): the HIP calls made inside a ROCTx range, with the range.
 
 ### Running it
 
@@ -68,7 +80,7 @@ VGPU_BUILD_DIR=build amd/tests/e2e/run_rocprof_case.sh vecadd --gpu rx6700xt
 amd/tests/e2e/run_rocprof_case.sh vecadd --card
 ```
 
-The tests are `amd_rocprof_<case>` and `amd_rocprof_vecadd_rx6700xt` in ctest; they print
+The tests are `amd_rocprof_<case>` and `amd_rocprof_<case>_rx6700xt` in ctest; they print
 `SKIP: ...` and are skipped where there is no rocprofv3 (GitHub's hosted runners, and the
 pantheonsim.com runner's image), or where ROCm's rocprofv3 is not the release the files were recorded with
 (`ROCPROF_ANY_VERSION=1` compares anyway). `ROCPROF_KEEP=<dir>` keeps the raw JSON of a run.
@@ -81,16 +93,21 @@ counts, which copies are copy records, and the allocation records' ids, and they
 On a machine with the card, ROCm 7.2 (`hipcc`, `rocprofv3`) and nothing else on the card:
 
 ```
-for c in vecadd memset_d2d copies streams_events graph async_alloc markers geometry; do
+cases="vecadd memset_d2d copies streams_events graph async_alloc markers markers_control geometry args
+       runtime_kernels scratch first_calls graph_sizes async_sizes"
+for c in $cases; do
   amd/tests/e2e/run_rocprof_case.sh $c --card --update          # the RX 6800 (HIP device 0)
 done
-amd/tests/e2e/run_rocprof_case.sh vecadd --card --update --gpu rx6700xt   # the RX 6700 XT (HIP device 1)
+for c in $cases; do
+  amd/tests/e2e/run_rocprof_case.sh $c --card --update --gpu rx6700xt   # the RX 6700 XT (HIP device 1)
+done
 ```
 
 `ROCPROF_CARD_DEVICE=<n>` names another HIP device. The script sets `HIP_VISIBLE_DEVICES` itself: a
 machine with an unsupported iGPU (gfx1036) must not see it. Each file starts with a header that says
 which card and ROCm it came from. Run each twice and `diff` the files before committing: the traces
-were identical from run to run on both cards. The comparison with `--card` needs no update, so it also
+were identical from run to run on both cards. (One update of `graph` came back with its last records
+missing, and a rerun was complete: check a fresh `--card` run, without `--update`, agrees.) The comparison with `--card` needs no update, so it also
 shows whether a new ROCm prints something different.
 
 ## Where the simulator and the card differed, and what was changed
@@ -122,6 +139,69 @@ All of these were found by the comparison; each is covered by an `.expected` fil
 - **The HIP compiler API** (`__hipRegisterFatBinary`, `__hipRegisterFunction`, `__hipRegisterVar`,
   `__hipRegisterManagedVar`, `__hipPushCallConfiguration`, `__hipPopCallConfiguration`,
   `__hipUnregisterFatBinary`) is recorded, with its operation names, as `--hip-trace` records it.
+- **Arguments of HIP calls** are recorded: `hipMalloc(ptr, size=4096)`,
+  `hipMemcpy(dst, src, sizeBytes, kind=HostToDevice)`, `hipLaunchKernel(function_address, numBlocks={z=1, y=1, x=4}, ...)`.
+  Every HIP entry point hands its arguments, in the order of the prototype, to the profiler hook
+  (`ApiCall` in `hip_api.cpp`, `api_enter_args` in `vgpu/hip_profiler.hpp`). `amd/src/rocprofiler_hip_args.hpp`
+  lays them out where rocprofiler-sdk's `rocprofiler_hip_api_args_t` has them (the `args` of a
+  `HIP_RUNTIME_API_EXT` or `HIP_COMPILER_API_EXT` buffer record, and the payload,
+  `rocprofiler_callback_tracing_hip_api_data_t`, of a callback-tracing record) and prints each as rocprofv3
+  does. The table of parameters (name, kind, offset, size, typeid name) for every call in ROCm's
+  `hip/api_args.h` is `amd/src/rocprofiler_hip_args.inc`, generated by `amd/tools/rocprofiler-hip-args.py`,
+  which compiles a probe against that header so the offsets are the compiler's. Both
+  `rocprofiler_iterate_buffer_tracing_record_args` and
+  `rocprofiler_iterate_callback_tracing_kind_operation_args` walk it. A pointer is shown as the address it
+  holds (the dereference count is 0), as the buffer form must; the callback payload has no return value
+  (zero), and tools that take HIP calls in callback tracing now receive them (phase ENTER, then EXIT, with
+  the tool's `user_data` between). A call whose entry point does not hand its arguments over, or hands over
+  values that do not fit the table, has none to show: the last byte of the record's `retval`, which no
+  return type reaches, is set, and the iterate functions answer NOT_AVAILABLE.
+
+  How a value prints was read off the card with the `args` case, not assumed: integers and enumerations as
+  numbers (only `hipMemcpyKind` by name: `HostToDevice`, ..., `Default`, `DeviceToDeviceNoCU`, else
+  `hipMemcpy_UNKNOWN=77`); `void*` and handles as hex, `0` when null; a pointer to a pointer or to data as hex,
+  `(null)` when null; a `char*` as its text, `(null)` when null; a function pointer as `1` or `0`; `dim3` as
+  `{z=1, y=1, x=4}`; `hipExtent` as `{depth=1, height=2, width=64}`; `hipPitchedPtr` as `{ysize=2, xsize=64,
+  pitch=256}` (no pointer); `hipMemLocation` as `{type=Device, id=0}`. What the card was not asked about
+  (floating-point parameters, which only the texture-reference calls have, and the other structs by value,
+  `hipIpcMemHandle_t` in two calls) is not printed: those calls have no arguments to show, rather than a guess.
+
+- **ROCTx** (`roctxMarkA`, `roctxRangePushA`/`Pop`, `roctxRangeStartA`/`Stop`, the profiler control and the
+  names): `rocprofiler_set_api_table` wraps the entries of ROCTx's core, control and name tables, as
+  rocprofiler-sdk does. A call a context subscribed to is delivered as `MARKER_CORE_API` /
+  `MARKER_CONTROL_API` / `MARKER_NAME_API` callbacks (enter, then exit, arguments and return value in the
+  payload) and buffer records. What rocprofv3 asks for is `MARKER_CORE_RANGE_API` callbacks: a mark is an
+  enter and an exit at once, a range an enter where it begins and an exit where it ends, with the message in
+  both and the same user data (rocprofv3 reads the messages from them, and writes the `marker_api` records
+  itself); the buffer kind has records too, written when a range ends. The correlation id of a range is the id
+  of the call that began it, and **a call made while a range is open has that range as its ancestor**
+  (`correlation_id.ancestor`), on the card as here: a HIP call, a mark, a range begun inside it, the innermost
+  first, a range begun with `roctxRangeStartA` until it is stopped. HIP records carry that ancestor now too,
+  and the normalised trace shows it: ` in 'compute'` after a mark or range, and a `[marker scopes]` section
+  for the HIP calls.
+
+### The agent in every field, the other output files, and the counters
+
+Three more comparisons with the same cards, each skipped where there is no rocprofv3:
+
+- **`agents`** (`run_rocprof_case.sh agents`, `rocprof_normalize.py --agents`): every field of the GPU agent in
+  `results.json` (shader engines and arrays, SDMA engines, queues, clocks, firmware, the memory bank, the 128 or 86
+  caches and the io link), against `rocprof_agents[.rx6700xt].expected`. The fields come from rocprofv3 on the cards
+  (`amd/src/rocprofiler_rdna_agents.inc`, written by `amd/tools/rocprof-agent-inc.py` from the card's results and the KFD topology
+  in `amd/registers/measurements/`). Where the card sits in the machine (node, `gpu_id`, `location_id`, render minor, UUID, handle)
+  is the machine's, not the card's, and is not compared. Cards that were not measured keep zeros there.
+- **`run_rocprof_outputs.sh`**: the files `--output-format csv json otf2 pftrace rocpd`, `--stats`, `--summary`,
+  `--sys-trace` and `--kernel-rename` write for `vecadd`: the file set, every csv's columns, the function names and call
+  counts of the stats files, the rocpd tables and columns, and the summary table. The simulator writes the same
+  files and columns; only what is in the table below (the HSA trace, the runtime's kernels and allocations) is left
+  out of both sides. `--summary-per-stream` does not exist in this rocprofv3. A `memory_copy_trace.csv` is not written for
+  vecadd on either (its copies are below the 16 KiB a DMA engine takes).
+- **`run_rocprof_counters.sh`**: `rocprofv3-avail info --pmc`. The cards offer about a hundred counters: cycles, stalls, cache and
+  memory traffic (which need a model of time and are refused here), instruction counts, waves, and the agent's properties as
+  constants. The simulated card offers `SQ_WAVES`, `SQ_WAVES_sum`, `Wavefronts`, the instruction counters the interpreter counts (`SQ_INSTS_VALU`, `_SALU`, `_SMEM`, `_FLAT`, `_LDS`, `_GDS`, `SQ_WAVE32_INSTS`, `SQ_WAVE64_INSTS`, `TA_FLAT_LOAD/STORE_WAVEFRONTS` and their `_sum`), `CU_NUM`, `SIMD_NUM`, `SE_NUM`, `MAX_WAVE_SIZE` and
+  the agent's scalar properties (`num_sdma_engines`, ...), with the card's descriptions and expressions
+  (`rocprof_counters[.rx6700xt].expected` holds the card's entries); every other counter is refused with rocprofv3's
+  "Missing". A Radeon agent no longer offers CDNA's `SQ_WAVES_EQ_64`, `SQ_INSTS_MFMA` and the like.
 
 ## Known differences
 
@@ -131,15 +211,106 @@ then on. `--card` compares everything.
 
 | what | the card | the simulator | where |
 | --- | --- | --- | --- |
-| **Arguments of HIP calls** | every record has its arguments: `hipMalloc(ptr, size=4096)`, `hipMemcpy(dst, src, sizeBytes, kind=HostToDevice)`, `hipLaunchKernel(function_address, numBlocks={z=1, y=1, x=4}, ...)` | `args` is empty. `rocprofiler_iterate_buffer_tracing_record_args` and `rocprofiler_iterate_callback_tracing_kind_operation_args` return NOT_AVAILABLE / NOT_IMPLEMENTED, and the hook libamdhip64 calls (`api_enter(name)`) carries the name only | `rocprofiler_sdk.cpp` near the end; `ApiCall` in `hip_api.cpp`. Closing it needs every HIP entry point to hand over its arguments and a table of their types and names |
-| **ROCTx markers** | `roctxMarkA`, `roctxRangePushA`/`Pop` (`roctxThreadRangeA` records) and `roctxRangeStartA`/`Stop` (`roctxProcessRangeA`), with their messages | none: `rocprofiler_set_api_table` accepts ROCTx's table and wraps nothing | `rocprofiler_set_api_table` in `rocprofiler_sdk.cpp` |
 | **HSA API trace** | 340 to 1100 HSA calls for these programs (queue, signal and memory-pool setup of ROCm's runtime) | none: the HIP runtime reaches the simulated devices directly | by design (the header of `rocprofiler_sdk.cpp`) |
-| **The runtime's own kernels** | `__amd_rocclr_copyBuffer` for small and device-to-device copies, `__amd_rocclr_fillBufferAligned` for fills, as dispatches | none | `rocprof_normalize.py --runtime-kernels` shows them in a card's trace |
-| **Scratch records** | a `SCRATCH_MEMORY_ALLOC` for a kernel with a private segment, sized as the runtime's pool (64880640 bytes in `geometry`) | none | not compared |
-| **The runtime's own allocations** | 4 MiB and 16 MiB staging blocks and a 56-byte block on the host, a 131456-byte allocation per graph instantiation, a `VMEM_ALLOCATE` pool range for `hipMallocAsync`; FREE records carry no agent | only the program's allocations; FREE records name the GPU | the normaliser keeps the program's (`ALLOCATORS` in `rocprof_normalize.py`) |
-| **Agent fields the profile does not have** | shader engines and arrays, SDMA engines, queues, clocks, memory banks, caches, io links, firmware | zero | `build_agents` in `rocprofiler_sdk.cpp`; not compared |
+| **Counter values on the card** | `rocprofv3 --pmc` aborts on the machine the cards are in (`std::out_of_range`, then a hang, with the iGPU in the agent list), so no counter value was read from a card | `SQ_WAVES` is the launch's geometry (vecadd: 32 waves of 32); the constants are the agent's fields | `run_rocprof_counters.sh` |
+| **Instruction counters on Radeon** | `SQ_INSTS_VALU`, `_SALU`, `_SMEM`, `_FLAT`, `_LDS`, `_GDS`, `SQ_WAVE32_INSTS`, `SQ_WAVE64_INSTS`, `TA_FLAT_LOAD/STORE_WAVEFRONTS` (and `_sum`), one value per shader engine; also `SQ_INSTS_WAVE32*` (a wave64 instruction counts 1 or 2 by what gets issued) and the averages built on them (`VALUInsts`, ...) | offered, with the card's names and descriptions, valued by what the interpreter counts, which no card value has checked (`--pmc` aborts on the machine); `SQ_INSTS_WAVE32*` and the averages stay refused | `rdna_counter` in `rocprofiler_sdk.cpp` |
+| **Per-shader-engine counters** | every hardware counter has a shader-engine dimension (`[0:3]` on the RX 6800, `[0:1]` on the RX 6700 XT) | one instance, the device's total | `rocprof_counters.py` leaves the dimensions out |
 | **Correlation ids** | the runtime's internal calls take ids too (a `hipMalloc` is 3, then 95, 97, 99) | consecutive | not compared |
 | **Copy records on Instinct cards** | not measured | one per copy | `on_copied` in `rocprofiler_sdk.cpp` |
 
 The programs print their own results (`wrong 0 of 1024`), so a case that runs under the profiler also
 computed the right answer.
+
+## The runtime's own work
+
+A real ROCm runtime does work of its own for a program, and `rocprofv3` shows it. The simulator's HIP
+runtime does not do it, so `rocprofiler_sdk.cpp` ("What ROCm's runtime does for the program") adds the
+records. Every rule below was measured on an RX 6800 and an RX 6700 XT, ROCm 7.2.0, and is checked
+against both cards by the cases named; it applies to the gfx1030 family (RDNA 2) and nothing else
+(`measured_gpu`). Nothing here has a time: the records' timestamps are the simulation's.
+
+**Kernels** (`runtime_kernels`, and every case that copies or fills). The runtime's code object (always
+loaded, the same 16 kernels on both cards: `[runtime kernels]`) runs:
+
+- `__amd_rocclr_copyBuffer` for a copy within a device and for a host transfer of up to 16384 bytes.
+  Both ends 16-byte aligned: workgroups of 512, 16 bytes to a thread, `grid = min(roundup(ceil(bytes/16),
+  512), cu/2 * 512)` (at least one workgroup). Otherwise (any end not 16-byte aligned): workgroups of
+  1024, 4 bytes to a thread, `min(roundup(ceil(bytes/4), 1024), cu/2 * 1024)`. `cu` is the agent's
+  compute-unit count (60 and 40), so the large copies' grids differ between the cards (15360 and
+  10240; 30720 and 20480 unaligned).
+- `__amd_rocclr_fillBufferAligned`, in workgroups of 256, for a fill of device memory: the bytes up to
+  the next 16-byte boundary (the head), the 16-byte units (the body, `min(roundup(units, 256), cu/2 * 256)`
+  threads), and the remainder (the tail), each its own dispatch, in that order, when not empty. The
+  head and tail are one workgroup.
+
+**Allocations** (`first_calls`, `graph_sizes`, `async_sizes`, and the cases that stream, copy or
+instantiate):
+
+- The first HIP runtime call of the program, whichever it is (`hipGetDeviceCount` as well as `hipMalloc`),
+  makes a 4 MiB block and a 56-byte block on the host.
+- A 4 MiB and a 16 MiB host block (staging buffers) for each stream a program creates
+  (`hipStreamCreate`, `...WithFlags`, `...WithPriority`), made by that call; and one pair for the default
+  stream, made by the first work queued on it (a launch, a copy or a fill with no stream), by
+  `hipMallocAsync`/`hipMallocFromPoolAsync`,, or by the first `hipGraphInstantiate`.
+- `hipStreamDestroy` frees three blocks: the first with the address 0, then two. Every FREE record
+  names no agent (the simulator named the GPU).
+- `hipGraphInstantiate` allocates on the device `131072 + 384 * kernel nodes` bytes (a graph of copies only
+  allocates nothing); `hipGraphExecDestroy` frees it.
+- The memory pool (`hipMallocAsync`) maps 32 MiB ranges as the blocks it holds need them
+  (`VMEM_ALLOCATE`, `ceil(live / 32 MiB)` of them in all), and the first `hipStreamSynchronize` or
+  `hipDeviceSynchronize` with no block held gives all of them back (`VMEM_FREE`). `hipFreeAsync` itself
+  records nothing.
+
+**Scratch** (`scratch`, `geometry`). A queue (a stream, or the default stream) has a scratch pool of
+`cu * 1024 * roundup(private, 32)` bytes (1024 lanes to a compute unit: 32 waves of 32), made with the
+first kernel on it that has a private segment: one `SCRATCH_MEMORY_ALLOC` record with flags 0. A kernel
+that needs more makes a bigger pool (an ALLOC) and frees the old (a FREE, flags 0, size 0). When the pool
+would be larger than ROCr's `HSA_SCRATCH_SINGLE_LIMIT` (140 MiB) the launch gets one block of `128 *
+array_count * roundup(private, 32)` bytes with flags 1 (`array_count` is 8 on the RX 6800, 4 on the
+RX 6700 XT) and a FREE with flags 1 when it ends; the pool is freed and the next kernel makes a new
+one. The comparison orders a queue's allocations and its frees apart, as the two records of one moment
+cannot be told apart in a trace.
+
+### Not modelled, and why
+
+These are what the cards show or what the model cannot say without measuring; none is compared.
+
+- **Instinct parts and other RDNA**: not measured, so they get none of the above (their small copies
+  are still not copy records, an older rule).
+- **Which call a block belongs to**, for programs whose first calls differ from the cases': a block is
+  attributed to the call that makes it in the cases; the default stream's pair for `hipEventRecord` or
+  `hipStreamWaitEvent` as the first use is not known.
+- **Peer copies, 2D and 3D copies and fills, `hipMemcpyToSymbol`, `hipMemset2D`**: the card uses other
+  kernels (`copyBufferRect`, `fillBufferAligned2D`) and splits; none was measured, so there is no
+  dispatch for them (a 2D copy is still no copy record).
+- **Pageable host memory** that is not 16-byte aligned: the copy goes through the runtime's staging
+  buffer on the card, and whether the kernel sees the program's alignment was not measured; the
+  simulator uses the program's.
+- **Counters of the runtime's kernels**: the simulator's dispatch counting does not see them, and what a
+  card's counter collection shows for them was not measured.
+- **Graph allocation nodes, memory pools made by the program, `hipMallocManaged`, `hipMallocPitch`,
+  `hipHostRegister`**: the runtime's own blocks, if any, were not measured beyond the cases (a
+  `hipMallocManaged` makes no record on the card; `hipMallocPitch` makes one of `pitch * height`).
+- **Exact values that are not a function of anything the program does**: the staging blocks' and
+  graph blocks' addresses, the runtime's code object (its URI, size, load base), queue ids, and the
+  timestamps. A queue is numbered in the order it first appears in a scratch record.
+- **FREE records after a graph**: the card's trace is sometimes one `hipGraphExecDestroy` FREE short
+  (`graph_sizes`, one run in four to five on either card), and the `graph` case now and then comes back
+  without the three FREE records of its stream's destruction (two `--update` runs did). The first are left
+  out of the comparison (`UNSTABLE` in `rocprof_normalize.py`); the simulator makes both. The expected
+  files hold the complete trace, confirmed by six card runs each for `graph`; an occasional `--card`
+  failure of `graph` is the card dropping them, not a change.
+- **The single-use scratch block's size** (`128 * array_count * roundup(private, 32)`) is fitted to the
+  two cards (8 and 4 arrays); a third card with another array count would test it.
+
+## Notes from merging the pieces
+
+- The `args` case is compared with `rocprof_normalize.py --no-runtime`: it calls many HIP functions to see how their arguments
+  print, some of which make runtime work that is not modelled (2D fills), and the runtime's own work is compared by the cases that
+  measure it.
+- A dispatch of the runtime's own kernels takes its id from the HIP runtime's dispatch counter
+  (`vgpu_hip_profiler_next_dispatch_id`): rocprofv3's rocpd output indexes by it, and an id far outside the launches' own
+  sequence made the tool allocate until it was killed.
+- Records of a dispatch (and of scratch) carry the id of the thread of the latest HIP call, as the card's do. Work on a stream
+  runs on a thread of the runtime's own here, and that thread's id made OTF2 write a location the card's trace does not have.
+  With several threads calling HIP at once this is the latest caller's, not necessarily the one that queued the work.

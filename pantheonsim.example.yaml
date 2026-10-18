@@ -1,0 +1,100 @@
+# PantheonSim example settings: one simulated H100. Use it as it is:
+#
+#     ./run pantheonsim.example.yaml
+#
+# or copy it to pantheonsim.yaml (the file ./run and `make run` read when you name
+# none; it is not tracked by git) and edit the copy. Every line below that starts
+# with "# key:" is a setting you can switch on by removing the "# ".
+#
+# A flag beats an environment variable, which beats this file.
+# `vgpu config show` prints what is in effect and where each value came from.
+# docs/config.md explains every key.
+
+# Virtual GPU model to present; `vgpu list-gpus` lists them.
+# a GPU profile id such as nvidia/h100 (vgpu list-gpus); default: nvidia/h100
+gpu: nvidia/h100
+
+# How many identical devices to present.
+# a whole number from 1 to 16; default: 1
+count: 1
+
+# Memory per device in MiB, instead of the profile's.
+# a whole number from 1 to 1073741824; default: the profile's own
+# vram_mb: 16384
+
+# CUDA version that nvidia-smi and NVML report (the compiler is not changed).
+# a CUDA version as major.minor, such as 13.0; default: this build's
+# cuda_version: 13.0
+
+# NVIDIA driver version that nvidia-smi and NVML report.
+# a dotted version such as 580.65.06; default: this build's
+# driver_version: 580.65.06
+
+# ROCm version that rocm-smi and amd-smi report (the compiler is not changed).
+# a dotted version such as 6.4.0; default: this build's
+# rocm_version: 6.4.0
+
+# Operating system `vgpu shell` presents: ubuntu, rocky or debian, with a version.
+# ubuntu, rocky or debian, optionally with a version (ubuntu:24.04); default: ubuntu:22.04
+# os: ubuntu:24.04
+
+# Host RAM in MiB that device memory may use before the rest goes to memory_dir.
+# a whole number from 1 to 1073741824; default: unlimited
+# ram_mb: 8192
+
+# Directory for device memory past ram_mb, so a card larger than the machine runs, at disk speed.
+# a path or other text; default: never spill
+# memory_dir: /var/tmp/pantheonsim
+
+# Host memory in MiB the guard leaves to the rest of the machine.
+# a whole number from 0 to 1073741824; default: 6% of the memory limit, 1 to 4 GiB
+# host_reserve_mb: 2048
+
+# false turns the host-memory guard off.
+# true or false; default: true
+# host_guard: true
+
+# Host threads that run blocks.
+# a whole number from 1 to 65536; default: one per core
+# threads: 4
+
+# Per-thread instruction budget against a kernel that never ends; 0 removes it.
+# a whole number of at least 0; default: built in
+# max_steps: 0
+
+# Engine for NVIDIA kernels: auto uses SASS when the binary has it, off forces PTX, only insists on SASS.
+# one of: auto, off, only; default: auto
+# sass: auto
+
+# Caps the vector instruction set the engines use; off uses scalar code. For ruling them out.
+# one of: auto, base, avx2, off; default: auto
+# simd: auto
+
+# Warp scheduling order. random and adversarial find order bugs (PTX engine only: set sass: off).
+# one of: deterministic, random, adversarial; default: deterministic
+# scheduler: random
+
+# Seed for random and adversarial scheduling; the same seed replays the same run.
+# a whole number of at least 0; default: 0
+# scheduler_seed: 1
+
+# Refuse undefined behaviour (integer division by zero, storing an unwritten register).
+# true or false; default: false
+# strict: false
+
+# Report unordered shared-memory access between warps; all also reports stores that change nothing.
+# one of: off, on, all; default: off
+# race: off
+
+# Print exact per-launch performance counters.
+# true or false; default: false
+# counters: false
+
+# Silence every simulator message on stderr, errors included.
+# true or false; default: false
+# quiet: false
+
+# Log every runtime and driver entry point.
+# true or false; default: false
+# trace: false
+
