@@ -3238,7 +3238,9 @@ struct Machine {
     // constant sits where the document puts SIMM16); the result is "{ 16'0, tmp.f16 }" (CDNA3 guide, V_MADMK_F16). Assumed, not stated: one
     // rounding (a fused multiply-add), as v_mad_f16 here, since a half's product is exact in a float.
     if (name == "v_madmk_f16" || name == "v_madak_f16") {
-      const OpName shared(name == "v_madmk_f16" ? "v_fmamk_f16" : "v_fmaak_f16");
+      // (An OpName refers to its string, so the string must outlive it: not a temporary.)
+      const std::string shared_name = name == "v_madmk_f16" ? "v_fmamk_f16" : "v_fmaak_f16";
+      const OpName shared(shared_name);
       return rdna_alu(w, in, shared);
     }
     if (canon == "v_fmac_f16") {   // (RDNA's)
