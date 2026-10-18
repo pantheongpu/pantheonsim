@@ -1263,6 +1263,41 @@ TIER_HANDLER(h_vote) {
   tier_setp(c, op.dst2, ex, r ? kAll : 0);
 }
 
+// MATCH.ANY / MATCH.ALL (exec_warp): the lanes' values are read first, then written, so a destination that is the source is no problem.
+// ANY gives every executing lane the mask of the executing lanes that hold the same value (lanes of a class share it, so it is worked out
+// once for each class); ALL gives every executing lane the executing mask when all hold one value and 0 otherwise, and the predicate says which.
+TIER_HANDLER(h_match) {
+  TIER_PRELUDE
+  const uint32_t* lo = tier_src<false>(c, op.s[0], nullptr);
+  const uint32_t* hi = (op.aux & 2) ? tier_src<false>(c, op.s[1], nullptr) : nullptr;
+  uint64_t v[32];
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    v[l] = lo[l] | (hi ? static_cast<uint64_t>(hi[l]) << 32 : 0);
+  }
+  uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
+  if (op.aux & 1) {
+    for (Mask todo = ex; todo;) {
+      const uint64_t x = v[std::countr_zero(todo)];
+      Mask cls = 0;
+      for (Mask m = ex; m; m &= m - 1) {
+        const unsigned k = static_cast<unsigned>(std::countr_zero(m));
+        cls |= static_cast<Mask>(v[k] == x) << k;
+      }
+      if (d)
+        for (Mask m = cls; m; m &= m - 1) d[std::countr_zero(m)] = cls;
+      todo &= ~cls;
+    }
+  } else {
+    const uint64_t first = v[std::countr_zero(ex)];
+    bool same = true;
+    for (Mask m = ex; m; m &= m - 1) same = same && v[std::countr_zero(m)] == first;
+    if (d)
+      for (Mask m = ex; m; m &= m - 1) d[std::countr_zero(m)] = same ? ex : 0;
+    tier_setp(c, op.dst2, ex, same ? kAll : 0);
+  }
+}
+
 // HMMA (the dense f16, bf16 and tf32 forms): one SIMD kernel over the warp's fragments, as exec_mma gives them to it, the
 // answer written to the executing lanes (RZ as an operand is a row of zeros, as a source accumulator a zero accumulator).
 TIER_HANDLER(h_hmma) {   // exec_mma's kernel call: the same kernel, and the same choice of the sum (hmma_kernel_kind: VGPU_TC_EXACT, sm_86)
@@ -1319,6 +1354,7 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Shfl: return &h_shfl;
     case F::Vote: return &h_vote;
     case F::Hmma: return &h_hmma;
+    case F::Match: return &h_match;
     case F::Umov: return &h_umov;
     case F::Uldc: return &h_uldc;
     case F::Uiadd3: return &h_uiadd3;

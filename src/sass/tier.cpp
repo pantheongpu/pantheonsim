@@ -272,7 +272,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "cs2r", "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "iabs", "ldc",
-                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
+                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -343,6 +343,7 @@ const FormImpl& form_impl(Form f) {
       {Impl::Own, "UFLO, UPOPC: uniform datapath, bit counts"},
       {Impl::Own, "USEL: uniform datapath, a select"},
       {Impl::Kernel, "hmma, with the kind from Runner::hmma_kernel_kind (VGPU_TC_EXACT and the sm_86 tensor-core model), as exec_mma calls it"},
+      {Impl::Own, "MATCH: lane-value equality classes of 32- or 64-bit integers, no format"},
   };
   static_assert(sizeof table / sizeof table[0] == static_cast<size_t>(Form::Count_), "form_impl: one entry per Form");
   const unsigned i = static_cast<unsigned>(f);
@@ -439,6 +440,24 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.c = ra;
       m.imm = ins.w.sfield(38, 16);
       accept(Form::Ldc);
+      return;
+    }
+    case Op::MATCH: {   // the lanes' values grouped by equality (exec_warp): ANY gives each lane the mask of the lanes holding its value, ALL whether every lane holds one
+      const bool any = ins.f[0], u64 = ins.f[1];
+      if (ins.dst.empty() || ins.src.empty() || ins.src[0].kind != Kind::Reg || ins.dst.back().kind != Kind::Reg) return;
+      if (ins.dst.size() > 1 && (any || ins.dst[0].kind != Kind::Pred)) return;
+      const unsigned ra = ins.src[0].reg;
+      if (ra != kRZ) {
+        if (u64 && ra + 1 >= kRZ) return;
+        maxreg = static_cast<uint16_t>(ra + (u64 ? 2 : 1));
+        m.s[0].kind = SrcKind::Row;
+        m.s[0].off = ra * 32u;
+        if (u64) { m.s[1].kind = SrcKind::Row; m.s[1].off = (ra + 1) * 32u; }
+      }
+      if (!reg_dst(ins.dst.back(), m.dst, maxreg)) return;
+      m.dst2 = ins.dst.size() > 1 ? static_cast<uint16_t>(ins.dst[0].reg) : static_cast<uint16_t>(kPT);
+      m.aux = static_cast<uint8_t>((any ? 1 : 0) | (u64 ? 2 : 0));
+      accept(Form::Match);
       return;
     }
     case Op::BRA: {
