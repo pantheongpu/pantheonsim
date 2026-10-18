@@ -43,8 +43,8 @@ capacity, or no vCPU quota while another job held the account's P quota. RunPod 
 NVL when asked (twice). RunPod's A100, H100, H200, RTX PRO 6000 and B300 stand in for most of those.
 
 `nvidia/rtx-pro-4500` is a new profile read from the g7.2xlarge with `characterize-aws.sh`
-(82 SMs, 32 GiB, PCI 0x2C3A, 165 W). ECC, memory type, PCIe link, L2 size and the GPC layout were
-not read and are left out.
+(82 SMs, 32 GiB, PCI 0x2C3A, 165 W). ECC, memory type, PCIe link and the GPC layout were
+not read and are left out; the L2 size (64 MB) is the datasheet's.
 
 ## Result
 
