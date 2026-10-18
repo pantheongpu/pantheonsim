@@ -29,6 +29,7 @@
 #include "vgpu/exec/lockstep.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
+#include "mfma_math.hpp"
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
@@ -365,6 +366,8 @@ struct Machine {
   // a set of locks striped by address. On one thread there is no need: a
   // wave's lanes take their turns in order, which is atomic already.
   bool concurrent = false;
+  // Across threads, an atomic on an ordinary word of device memory is a compare-and-swap on the word, not a lock.
+  const bool lock_free = atomics_lock_free(), runs_on = memory_runs();
   // A vector load or store of device memory. ROCm runs CDNA with unaligned
   // access enabled (SH_MEM_CONFIG's unaligned mode), so a word may start at
   // any byte, and the compiler counts on it -- printf packs its string eight
@@ -2227,25 +2230,31 @@ struct Machine {
       const std::string what = in.name.substr(9, in.name.size() - 9 - (wide ? 3 : 0));
       const uint64_t mask = wide ? ~uint64_t{0} : 0xFFFFFFFFull;
       const uint64_t data = wide ? sgpr64(w, r) : sgpr(w, r);
-      const auto guard = atomic_guard(base);
-      const uint64_t old = at(base).load_scalar(base, bytes);
       const auto sx = [&](uint64_t v) { return wide ? static_cast<int64_t>(v) : static_cast<int64_t>(static_cast<int32_t>(v)); };
-      uint64_t now;
-      if (what == "swap") now = data;
-      else if (what == "cmpswap") now = old == (wide ? sgpr64(w, r + 2) : sgpr(w, r + 1)) ? data : old;
-      else if (what == "add") now = old + data;
-      else if (what == "sub") now = old - data;
-      else if (what == "smin") now = sx(old) < sx(data) ? old : data;
-      else if (what == "umin") now = std::min(old, data);
-      else if (what == "smax") now = sx(old) > sx(data) ? old : data;
-      else if (what == "umax") now = std::max(old, data);
-      else if (what == "and") now = old & data;
-      else if (what == "or") now = old | data;
-      else if (what == "xor") now = old ^ data;
-      else if (what == "inc") now = old >= data ? 0 : old + 1;
-      else if (what == "dec") now = old == 0 || old > data ? data : old - 1;
-      else throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
-      at(base).store_scalar(base, bytes, now & mask);
+      const auto result = [&](uint64_t old) -> uint64_t {
+        uint64_t now;
+        if (what == "swap") now = data;
+        else if (what == "cmpswap") now = old == (wide ? sgpr64(w, r + 2) : sgpr(w, r + 1)) ? data : old;
+        else if (what == "add") now = old + data;
+        else if (what == "sub") now = old - data;
+        else if (what == "smin") now = sx(old) < sx(data) ? old : data;
+        else if (what == "umin") now = std::min(old, data);
+        else if (what == "smax") now = sx(old) > sx(data) ? old : data;
+        else if (what == "umax") now = std::max(old, data);
+        else if (what == "and") now = old & data;
+        else if (what == "or") now = old | data;
+        else if (what == "xor") now = old ^ data;
+        else if (what == "inc") now = old >= data ? 0 : old + 1;
+        else if (what == "dec") now = old == 0 || old > data ? data : old - 1;
+        else throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
+        return now & mask;
+      };
+      uint64_t old = 0;
+      if (!(concurrent && lock_free && at(base).atomic_rmw(base, bytes, result, &old, true))) {
+        const auto guard = atomic_guard(base);
+        old = at(base).load_scalar(base, bytes);
+        at(base).store_scalar(base, bytes, result(old));
+      }
       if (in.cache & 1) {
         if (wide) set_sgpr64(w, r, old);
         else set_sgpr(w, r, static_cast<uint32_t>(old));
@@ -8090,8 +8099,7 @@ struct Machine {
         const uint32_t bytes = wide ? 8 : 4;
         uint64_t before = 0;
         if (fits(offset, bytes)) {
-          const auto guard = atomic_guard(addr);
-          before = at(addr).load_scalar(addr, bytes);
+          const auto result = [&](uint64_t before) -> uint64_t {
           uint64_t after;
           if (body == "atomic_cmpswap_x2") {
             const uint64_t value = word(w, data, 0, lane) | uint64_t{word(w, data, 1, lane)} << 32;
@@ -8133,7 +8141,13 @@ struct Machine {
           } else {
             throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
           }
-          at(addr).store_scalar(addr, bytes, after);
+          return after;
+          };
+          if (!(concurrent && lock_free && at(addr).atomic_rmw(addr, bytes, result, &before, true))) {
+            const auto guard = atomic_guard(addr);
+            before = at(addr).load_scalar(addr, bytes);
+            at(addr).store_scalar(addr, bytes, result(before));
+          }
         }
         if (returns) {
           set_word(w, data, 0, lane, static_cast<uint32_t>(before));
@@ -8333,6 +8347,12 @@ struct Machine {
       }
       return before;
     }
+    // Work-groups on other threads: a compare-and-swap on the word itself, where it is an ordinary one in device memory;
+    // anything else (a fault armed, a word on the end of an allocation, an address that is no allocation's) under the lock.
+    if (concurrent && lock_free) {
+      uint64_t found = 0;
+      if (m.atomic_rmw(addr, a.bytes, [&](uint64_t old) { return atomic_result(a, old, v, expected); }, &found)) return found;
+    }
     const auto guard = atomic_guard(addr);
     uint64_t before = 0;
     uint32_t valid = a.bytes;   // fewer on the last word of an allocation (word_tail)
@@ -8376,6 +8396,51 @@ struct Machine {
   static uint64_t scaled_offset(const Inst& in, uint32_t reg, uint32_t bytes) {
     if (!in.scale_offset) return reg;
     return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(reg)) * bytes);
+  }
+
+  // The lane's address in a global access: a 64-bit one in a register pair, or a scalar base with a 32-bit offset a lane.
+  uint64_t global_lane_address(const Wave& w, const Inst& in, uint32_t lane, uint32_t access_bytes) const {
+    const uint64_t offset_reg = in.has_saddr ? scaled_offset(in, lane_src(w, in.src[0], lane), access_bytes) : 0;
+    return (in.has_saddr ? scalar_field(w, in.saddr, true) + offset_reg : lane_src64(w, in.src[0], lane)) +
+           static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+  }
+  // The lanes from `lane` (whose address is `addr`) that are active and take consecutive addresses, `run_words` whole words
+  // each, moved with one call to the memory manager (MemoryManager::load_run / store_run, or the quad calls where each lane
+  // moves sixteen aligned bytes, which are one access): what lane by lane would do -- every aligned word or pair still one
+  // atomic access, in lane order. Returns how many lanes it did, 0 having done nothing: fewer than two, or the memory
+  // manager refusing (a fault armed, a host mapping, a run not inside one allocation, misaligned), and the lanes then go one
+  // at a time and meet any error where they would. For a load `words` gets the last lane's words (what a lane that reads
+  // the same address next takes). Out of line, so the lane loop of global_access stays as small as it was.
+  [[gnu::noinline]] uint32_t memory_run(Wave& w, const Inst& in, bool load, uint32_t lane, uint64_t addr, uint32_t run_words,
+                                        uint32_t access_bytes, bool dup, uint32_t* words) {
+    const uint32_t stride = 4 * run_words;
+    uint32_t count = 1;
+    uint64_t next = addr;   // (the address lane + count would have)
+    while (lane + count < kLanes && (w.exec >> (lane + count) & 1) &&
+           global_lane_address(w, in, lane + count, access_bytes) == (next += stride))
+      ++count;
+    if (count < 2 || dup) return 0;
+    // (Not 16-byte aligned fours, where a pair is the biggest access.)
+    const uint32_t unit = run_words == 1 ? 4 : addr % 8 == 0 && (run_words != 4 || addr % 16 != 0) ? 8 : 4;
+    // (Sixteen-byte aligned fours are one access each, atomic as a whole: the quad calls make them so.)
+    const bool quads = run_words == 4 && addr % 16 == 0;
+    alignas(16) uint32_t buf[kLanes * 4];
+    MemoryManager& m = at(addr);
+    if (load) {
+      const bool done = quads ? m.load_quad_run(addr, count, reinterpret_cast<uint64_t*>(buf))
+                              : m.load_run(addr, buf, uint64_t{stride} * count, unit);
+      if (!done) return 0;
+      for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t k = 0; k < run_words; ++k) set_word(w, in.dst[0], k, lane + i, buf[i * run_words + k]);
+      std::memcpy(words, buf + (count - 1) * run_words, 4 * run_words);
+    } else {
+      for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t k = 0; k < run_words; ++k) buf[i * run_words + k] = word(w, in.src[1], k, lane + i);
+      const bool done = quads ? m.store_quad_run(addr, count, reinterpret_cast<const uint64_t*>(buf))
+                              : m.store_run(addr, buf, uint64_t{stride} * count, unit);
+      if (!done) return 0;
+    }
+    return count;
   }
 
   void global_access(Wave& w, const Inst& in) {
@@ -8460,6 +8525,10 @@ struct Machine {
     // (The scalar base is the same for every lane, and nothing in the loop writes a scalar register; EXEC is not
     // zero here, so a base that cannot be read was going to fail on the first lane just the same.)
     const uint64_t saddr_base = in.has_saddr ? scalar_field(w, in.saddr, true) : 0;
+    // A run of active lanes with consecutive addresses, each moving the same whole words, goes to memory as one
+    // call (memory_run, below); a refused try, or no run, turns it off for the rest of the instruction.
+    const uint32_t run_words = kind == Kind::Load ? in.dst[0].width : kind == Kind::Store ? in.src[1].width : 0;
+    bool try_runs = (run_words == 1 || run_words == 2 || run_words == 4) && d.peers.empty() && runs_on;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // The address is a 64-bit one in a register pair, or a scalar base with
@@ -8468,6 +8537,17 @@ struct Machine {
       const uint64_t addr = (in.has_saddr ? saddr_base + offset_reg
                                           : lane_src64(w, in.src[0], lane)) +
                             static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+      if (try_runs) {
+        // (A load whose first address the lane before it just read takes the value that read had: not a run.)
+        const uint32_t made = memory_run(w, in, kind == Kind::Load, lane, addr, run_words, access_bytes,
+                                         kind == Kind::Load && memo && memo_addr == addr, memo_words);
+        if (made) {
+          if (kind == Kind::Load) memo_addr = addr + uint64_t{4 * run_words} * (made - 1), memo = true;
+          lane += made - 1;
+          continue;
+        }
+        try_runs = false;
+      }
       switch (kind) {
         case Kind::Narrow:
           if (narrow_store) store(addr, n.bytes, lane_src(w, in.src[1], lane));
@@ -9032,6 +9112,45 @@ struct Machine {
       *row = 4 * (lane / 16) + r % 4;
     }
   }
+  // Where each lane's values go in matrix_multiply's buffers, and where each of its outputs reads from, worked out once for
+  // a shape (the divisions by the shape's sizes are not worth repeating for every instruction): `a_row` and `b_row` are
+  // the offsets of the lane's row of A and column of B, and for each output `c_off[lane * outs + r]` its place in C,
+  // `a_off` the row of A and `b_off` the column of B it is the product of.
+  struct MatrixPlan {
+    const MatrixShape* shape = nullptr;
+    uint32_t lanes_per_block = 0, groups = 0, per_lane = 0, outs = 0;
+    struct Lane {
+      uint32_t bl, within, g, a_row, b_row;
+    } lane[kLanes];
+    std::vector<uint32_t> c_off, a_off, b_off;
+    // The operands' values as doubles (A by row, B by column, C as it is), kept per thread between instructions.
+    std::vector<double> a, b, c;
+  };
+  // The thread's (reached once per machine, not once per instruction: a thread-local costs a call).
+  MatrixPlan* mplan = nullptr;
+  MatrixPlan& matrix_plan(const MatrixShape& s) {
+    if (!mplan) {
+      static thread_local MatrixPlan thread_plan;
+      mplan = &thread_plan;
+    }
+    MatrixPlan& p = *mplan;
+    if (p.shape == &s) return p;
+    p.shape = &s;
+    p.lanes_per_block = kLanes / s.blocks, p.groups = p.lanes_per_block / s.m, p.per_lane = s.k / p.groups;
+    p.outs = s.m * s.n * s.blocks / kLanes;
+    p.c_off.resize(size_t{kLanes} * p.outs), p.a_off.resize(p.c_off.size()), p.b_off.resize(p.c_off.size());
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t bl = lane / p.lanes_per_block, within = lane % p.lanes_per_block;
+      p.lane[lane] = {bl, within, within / s.m, (bl * s.m + within % s.m) * s.k, (bl * s.n + within % s.n) * s.k};
+      for (uint32_t r = 0; r < p.outs; ++r) {
+        uint32_t ob = 0, row = 0;
+        out_place(s, lane, r, &ob, &row);
+        const uint32_t j = lane % s.n, at = lane * p.outs + r;
+        p.c_off[at] = (ob * s.m + row) * s.n + j, p.a_off[at] = (ob * s.m + row) * s.k, p.b_off[at] = (ob * s.n + j) * s.k;
+      }
+    }
+    return p;
+  }
   void matrix_multiply(Wave& w, const Inst& in) {
     const MatrixShape* shape =
         matrix_shape(OpName(in.scaled ? "v_mfma_" + in.name.substr(std::string("v_mfma_scale_").size()) : in.name));
@@ -9072,12 +9191,7 @@ struct Machine {
       if (type == 'c') return static_cast<double>(static_cast<int8_t>(reg(o, e / 4, lane) >> (8 * (e % 4))));
       if (type == 'e' || type == 'g') return f8_to_float(reg(o, e / 4, lane) >> (8 * (e % 4)), type == 'e' ? fp8() : bf8());
       if (type == 'i') return static_cast<double>(static_cast<int32_t>(reg(o, e, lane)));
-      if (type == 'h') {
-        _Float16 h;
-        const uint16_t bits = static_cast<uint16_t>(reg(o, e / 2, lane) >> (16 * (e % 2)));
-        std::memcpy(&h, &bits, 2);
-        return static_cast<double>(h);
-      }
+      if (type == 'h') return half_bits_to_double(static_cast<uint16_t>(reg(o, e / 2, lane) >> (16 * (e % 2))));
       if (type == 'f') return static_cast<double>(as_float(reg(o, e, lane)));
       if (type == 'F') {
         // XF32: "32-bit floats but the mantissa truncated to 10 bits (not including the leading 1)"
@@ -9089,12 +9203,16 @@ struct Machine {
       if (o.kind == OperandKind::InlineFloat) return o.fvalue;
       return as_double(reg(o, 2 * e, lane) | static_cast<uint64_t>(reg(o, 2 * e + 1, lane)) << 32);
     };
-    const uint32_t lanes_per_block = kLanes / s.blocks, groups = lanes_per_block / s.m, per_lane = s.k / groups;
-    const uint32_t outs = s.m * s.n * s.blocks / kLanes;
-    std::vector<double> a(size_t{s.blocks} * s.m * s.k), b(size_t{s.blocks} * s.k * s.n), c(size_t{s.blocks} * s.m * s.n);
-    const auto A = [&](uint32_t bl, uint32_t i, uint32_t k) -> double& { return a[(size_t{bl} * s.m + i) * s.k + k]; };
-    const auto B = [&](uint32_t bl, uint32_t k, uint32_t j) -> double& { return b[(size_t{bl} * s.k + k) * s.n + j]; };
-    const auto C = [&](uint32_t bl, uint32_t i, uint32_t j) -> double& { return c[(size_t{bl} * s.m + i) * s.n + j]; };
+    MatrixPlan& plan = matrix_plan(s);
+    const uint32_t lanes_per_block = plan.lanes_per_block, per_lane = plan.per_lane, outs = plan.outs;
+    // The operands' values, widened to double: A by row, B by column (so each dot product reads two contiguous runs),
+    // C as it is; the buffers are the thread's, not made and freed by each instruction.
+    plan.a.assign(size_t{s.blocks} * s.m * s.k, 0.0);
+    plan.b.assign(size_t{s.blocks} * s.k * s.n, 0.0);
+    plan.c.assign(size_t{s.blocks} * s.m * s.n, 0.0);
+    double* const ap = plan.a.data();
+    double* const bp = plan.b.data();
+    double* const cp = plan.c.data();
     // gfx950's scaled forms: each lane's A and B values are its one row (or
     // column) and one block of 32 along K, and are scaled by 2^(e - 127),
     // e the E8M0 byte of the lane's scale register its selector names -- or
@@ -9105,23 +9223,40 @@ struct Machine {
                              : (lane_src(w, o, lane) >> (8 * sel)) & 0xFF;
       return e == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, static_cast<int>(e) - 127);
     };
+    // The common cases, sources in registers and neither scaled nor sparse: binary16, a pair to a register, and a float
+    // accumulator, are read straight from the registers.
+    const auto in_regs = [](const Operand& o) { return o.kind == OperandKind::Vgpr || o.kind == OperandKind::Agpr; };
+    const bool halves = !sparse && !in.scaled && s.in == 'h' && (s.in_b == 0 || s.in_b == 'h') && per_lane % 2 == 0 &&
+                        in_regs(in.src[0]) && in_regs(in.src[1]);
+    const bool float_c = !sparse && s.out == 'f' && in_regs(in.src[2]);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      const uint32_t bl = lane / lanes_per_block, within = lane % lanes_per_block, g = within / s.m;
+      const MatrixPlan::Lane& L = plan.lane[lane];
+      const uint32_t bl = L.bl, within = L.within, g = L.g;
       // With CBSZ, a block takes its A from block ABID of its group of 2^CBSZ:
       // the same place in that block's lanes.
       const uint32_t a_block = in.a_bcast_size ? (bl >> in.a_bcast_size << in.a_bcast_size) + in.a_bcast_id : bl;
       const uint32_t a_lane = a_block < s.blocks ? a_block * lanes_per_block + within : lane;
       const double sa = in.scaled ? scale_of(in.src[3], in.scale_sel & 3, lane) : 1.0;
       const double sb = in.scaled ? scale_of(in.src[4], in.scale_sel >> 2, lane) : 1.0;
-      for (uint32_t e = 0; e < per_lane; ++e) {
-        if (!sparse) A(bl, within % s.m, g * per_lane + e) = value(in.src[0], s.in, e, a_lane) * sa;
+      if (halves) {
+        // Two halves to a register: one read, two widenings (and no scale to apply).
+        double* const da = ap + L.a_row + g * per_lane;
+        double* const db = bp + L.b_row + g * per_lane;
+        for (uint32_t e = 0; e < per_lane; e += 2) {
+          const uint32_t ra = reg(in.src[0], e / 2, a_lane), rb = reg(in.src[1], e / 2, lane);
+          da[e] = half_bits_to_double(static_cast<uint16_t>(ra)), da[e + 1] = half_bits_to_double(static_cast<uint16_t>(ra >> 16));
+          db[e] = half_bits_to_double(static_cast<uint16_t>(rb)), db[e + 1] = half_bits_to_double(static_cast<uint16_t>(rb >> 16));
+        }
+      }
+      for (uint32_t e = 0; e < per_lane && !halves; ++e) {
+        if (!sparse) ap[L.a_row + g * per_lane + e] = value(in.src[0], s.in, e, a_lane) * sa;
         // gfx950's sparse forms, whose B is eight registers, split it: the
         // first four hold the lane group's run of K in the first half, the
         // last four the same run K/2 on (the CDNA4 guide's layout tables),
         // where A's run is K's in one piece -- as hipSPARSELt lays both out.
         const uint32_t half = per_lane / 2;
         const uint32_t kb = sparse && in.src[1].width == 8 ? e / half * (s.k / 2) + g * half + e % half : g * per_lane + e;
-        B(bl, kb, within % s.n) = value(in.src[1], s.in_b ? s.in_b : s.in, e, lane) * sb;
+        bp[L.b_row + kb] = value(in.src[1], s.in_b ? s.in_b : s.in, e, lane) * sb;
       }
       if (sparse) {
         // A lane's A holds two values of each four along K, packed; the
@@ -9131,31 +9266,40 @@ struct Machine {
         const uint32_t sets = 32 / per_lane, set = (in.cbsz == 0 ? in.abid : 0u) % sets;
         const uint32_t idx = reg(in.src[2], 0, lane) >> (set * per_lane);
         for (uint32_t v = 0; v < per_lane / 2; ++v)
-          A(bl, within % s.m, g * per_lane + 4 * (v / 2) + ((idx >> (2 * v)) & 3)) = value(in.src[0], s.in, v, lane);
+          ap[L.a_row + g * per_lane + 4 * (v / 2) + ((idx >> (2 * v)) & 3)] = value(in.src[0], s.in, v, lane);
       }
-      for (uint32_t r = 0; r < outs; ++r) {
-        uint32_t ob = 0, row = 0;
-        out_place(s, lane, r, &ob, &row);
-        C(ob, row, lane % s.n) = value(sparse ? in.dst[0] : in.src[2], s.out, r, lane);
+      const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
+      if (float_c) {
+        for (uint32_t r = 0; r < outs; ++r) cp[place[r]] = static_cast<double>(as_float(reg(in.src[2], r, lane)));
+      } else {
+        for (uint32_t r = 0; r < outs; ++r) cp[place[r]] = value(sparse ? in.dst[0] : in.src[2], s.out, r, lane);
       }
     }
-    for (uint32_t lane = 0; lane < kLanes; ++lane)
-      for (uint32_t r = 0; r < outs; ++r) {
-        uint32_t ob = 0, i = 0;
-        out_place(s, lane, r, &ob, &i);
-        const uint32_t j = lane % s.n;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t* const cs = &plan.c_off[size_t{lane} * outs];
+      const uint32_t* const as = &plan.a_off[size_t{lane} * outs];
+      const uint32_t* const bs = &plan.b_off[size_t{lane} * outs];
+      uint32_t r = 0;
+      // Float results four at a time: four sums with nothing between them, each taken in the order it always was.
+      if (s.out == 'f') {
+        for (; r + 4 <= outs; r += 4) {
+          const double* const rows[4] = {ap + as[r], ap + as[r + 1], ap + as[r + 2], ap + as[r + 3]};
+          const double* const cols[4] = {bp + bs[r], bp + bs[r + 1], bp + bs[r + 2], bp + bs[r + 3]};
+          const double start[4] = {cp[cs[r]], cp[cs[r + 1]], cp[cs[r + 2]], cp[cs[r + 3]]};
+          double sum[4];
+          mfma_dot4(rows, cols, s.k, start, sum);
+          for (uint32_t t = 0; t < 4; ++t) set_word(w, in.dst[0], r + t, lane, as_bits(static_cast<float>(sum[t])));
+        }
+      }
+      for (; r < outs; ++r) {
+        const double* const arow = ap + as[r];
+        const double* const bcol = bp + bs[r];
+        const double c0 = cp[cs[r]];
         if (s.out == 'i') {
-          // Integers are summed exactly, and wrap as the hardware's do.
-          int64_t isum = static_cast<int64_t>(C(ob, i, j));
-          for (uint32_t k = 0; k < s.k; ++k) isum += static_cast<int64_t>(A(ob, i, k)) * static_cast<int64_t>(B(ob, k, j));
-          set_word(w, in.dst[0], r, lane, static_cast<uint32_t>(isum));
+          set_word(w, in.dst[0], r, lane, static_cast<uint32_t>(mfma_dot_int(arow, bcol, s.k, static_cast<int64_t>(c0))));
           continue;
         }
-        double sum = C(ob, i, j);
-        for (uint32_t k = 0; k < s.k; ++k) {
-          if (s.out == 'd') sum = std::fma(A(ob, i, k), B(ob, k, j), sum);
-          else sum += A(ob, i, k) * B(ob, k, j);
-        }
+        const double sum = s.out == 'd' ? mfma_dot_fma(arow, bcol, s.k, c0) : mfma_dot(arow, bcol, s.k, c0);
         if (s.out == 'd') {
           const uint64_t bits = as_bits(sum);
           set_word(w, in.dst[0], 2 * r, lane, static_cast<uint32_t>(bits));
@@ -9164,6 +9308,7 @@ struct Machine {
           set_word(w, in.dst[0], r, lane, as_bits(static_cast<float>(sum)));
         }
       }
+    }
   }
 
 
@@ -10304,6 +10449,16 @@ bool amd_kernel_polls(Machine& m) {
 std::mutex& memory_atomic_lock(uint64_t addr) {
   static std::array<std::mutex, 251> locks;
   return locks[(addr >> 2) % locks.size()];
+}
+
+namespace {
+std::atomic<bool> g_lock_free_atomics{true}, g_memory_runs{true};
+}
+bool atomics_lock_free() { return g_lock_free_atomics.load(std::memory_order_relaxed); }
+bool memory_runs() { return g_memory_runs.load(std::memory_order_relaxed); }
+void set_fast_paths(bool lock_free_atomics, bool runs) {
+  g_lock_free_atomics.store(lock_free_atomics);
+  g_memory_runs.store(runs);
 }
 
 void abandon_dispatches() { g_abandoned.store(true); }

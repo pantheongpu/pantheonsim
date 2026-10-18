@@ -1280,6 +1280,8 @@ vgpu_unit_test(test_memfast)
 vgpu_unit_test(test_memrmw)
 # The warp's local memory, interleaved by words, against the per-lane layout it replaced.
 vgpu_unit_test(test_locallayout)
+# The lock-free read-modify-write (atomic_rmw) against load_scalar / the operation / store_scalar, and from threads.
+vgpu_unit_test(test_memrmw_lockfree)
 # The closed forms of the sector and bank-pass counters, against the definition of what they count.
 vgpu_unit_test(test_memcount_forms)
 # Module::code_at (a binary search over the code sections) against the scan it replaced.
@@ -1458,6 +1460,17 @@ foreach(_t ops math memory globals grid bytes int64 atomics mixed half calls pac
   # And for gfx1250 (CDNA 5, MI455X): gfx12's encodings with its additions, built by ROCm's clang.
   add_test(NAME test_amd_gcn_${_t}_gfx1250 COMMAND test_amd_gcn_${_t})
   set_tests_properties(test_amd_gcn_${_t}_gfx1250 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1250")
+endforeach()
+
+# The matrix instructions' arithmetic (half widening, dot products) against what it replaced.
+vgpu_unit_test(test_amd_mfma_math amd/tests/unit/test_mfma_math.cpp)
+
+# Lanes over consecutive addresses as one call to the memory manager, against lane by lane (memruns.c).
+vgpu_unit_test(test_amd_gcn_memruns amd/tests/unit/test_gcn_memruns.cpp)
+target_compile_definitions(test_amd_gcn_memruns PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+foreach(_t gfx1100 gfx1201 gfx1030 gfx1250)
+  add_test(NAME test_amd_gcn_memruns_${_t} COMMAND test_amd_gcn_memruns)
+  set_tests_properties(test_amd_gcn_memruns_${_t} PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=${_t}")
 endforeach()
 
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)

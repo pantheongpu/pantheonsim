@@ -211,6 +211,24 @@ class MemoryManager {
         const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out);
   }
 
+  // A lock-free atomic read-modify-write on a 4- or 8-byte naturally aligned word: `compute(old)` is applied with a
+  // compare-and-swap loop on the word itself (the value it is called with is the one the swap replaces, so it is
+  // called again when another thread got in between, and must be pure). Returns true with `*old_out` the value the
+  // successful swap replaced; the result is stored only where load_scalar / store_scalar under a lock would have
+  // stored it: when it differs from the old value, or (`always_store`) always -- a store that changes nothing still
+  // makes a never-written chunk real. A chunk that is not real yet is made so first (a uniform chunk is left alone
+  // by a store of its own byte). Returns false, having done nothing and not called `compute`, whenever the plain
+  // pair of calls could differ: a fault armed, a host mapping possibly in range, another size, a misaligned
+  // address, or an access not wholly inside one ordinary allocation; the caller then takes its lock and goes as
+  // before. Every thread that reaches the same address takes the same road, so the two never meet on one word.
+  bool atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out, bool always_store);
+  template <class F>
+  bool atomic_rmw(uint64_t addr, uint32_t size, F&& compute, uint64_t* old_out, bool always_store = false) {
+    return atomic_rmw_fn(
+        addr, size, [](void* c, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(old); },
+        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out, always_store);
+  }
+
   // The fields of one record (a texel's channels), `n` of them end to end from `addr`, field i `sizes[i]` bytes
   // (0, 1, 2, 4 or 8; a 0 reads nothing and gives 0), each one load_scalar of its width. Returns true with
   // `out[i]` set, or false having done nothing -- a fault or stuck cell armed, a host mapping possibly in range,
@@ -230,6 +248,14 @@ class MemoryManager {
   // load_scalar and store_scalar make them.
   void load_quad(uint64_t addr, uint64_t out[2]) const;
   void store_quad(uint64_t addr, const uint64_t in[2]);
+
+  // `count` consecutive naturally aligned sixteen-byte values from `addr`, each made exactly as load_quad / store_quad
+  // make it (one access each, in order), for a run wholly inside one ordinary allocation, with one lookup for the lot.
+  // Returns false, having done nothing, whenever the calls could differ -- a fault armed or cells stuck, a host mapping
+  // possibly in range, a misaligned address, or a run not wholly inside one allocation (load_quad lets a read run on
+  // into the last page of an allocation; the caller then goes one at a time and gets that).
+  bool load_quad_run(uint64_t addr, size_t count, uint64_t* out) const;
+  bool store_quad_run(uint64_t addr, size_t count, const uint64_t* in);
 
   // Notified with the new total whenever allocated bytes change. Used to feed
   // live memory telemetry; optional and unset by default.

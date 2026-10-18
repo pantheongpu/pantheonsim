@@ -189,5 +189,13 @@ bool dispatches_abandoned();
 // run on several threads -- what the host takes too when it changes memory a
 // kernel changes with atomics (vgpu/amd_hostcall.hpp).
 std::mutex& memory_atomic_lock(uint64_t addr);
+// Whether those read-modify-writes are made lock-free (a compare-and-swap on the word itself, where it is an ordinary
+// word of device memory) rather than under that lock; a host thread that changes memory a kernel changes with atomics
+// takes the same road as the kernel does. And whether the lanes of a global load or store that run over consecutive
+// addresses are made as one call to the memory manager. Both are on; the tests that hold each against the way it was
+// done before turn them off (set_fast_paths) for a dispatch, and must not run dispatches on other threads meanwhile.
+bool atomics_lock_free();
+bool memory_runs();
+void set_fast_paths(bool lock_free_atomics, bool memory_runs);
 
 }  // namespace vgpu::amd

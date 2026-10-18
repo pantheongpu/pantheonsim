@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 clang=${1:-clang}
-sources="vector_add ops math memory globals grid bytes int64 atomics mixed half calls builtins packed spill crosslane doubles narrow lds idioms counters"
+sources="vector_add ops math memory globals grid bytes int64 atomics mixed half calls builtins packed spill crosslane doubles narrow lds idioms counters memruns"
 for src in $sources; do
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx942 -nogpulib -O2 -c "$src.c" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"
@@ -20,7 +20,7 @@ done
 # and RDNA2, wave32), which the same tests run with VGPU_TEST_TARGET. builtins, crosslane, idioms and counters
 # use CDNA's own instructions (s_memtime, row broadcasts, sdot4, MFMA) and are
 # not built for it.
-for src in vector_add ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds; do
+for src in vector_add ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds memruns; do
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1100 -nogpulib -O2 -c "$src.c" -o "$src.gfx1100.o"
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nogpulib -O2 -c "$src.c" -o "$src.gfx1201.o"
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1030 -nogpulib -O2 -c "$src.c" -o "$src.gfx1030.o"
@@ -29,7 +29,7 @@ done
 
 # And for gfx1250 (CDNA 5, MI455X; wave32), with a clang that knows it (ROCm 7.2's). Built by compiler, run by
 # the simulator: no card has checked what these kernels do on it.
-for src in vector_add ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds; do
+for src in vector_add ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds memruns; do
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1250 -nogpulib -O2 -c "$src.c" -o "$src.gfx1250.o"
   echo "wrote $(pwd)/$src.gfx1250.o"
 done
@@ -48,7 +48,7 @@ echo "wrote $(pwd)/memory.gfx90a.o"
 
 # Kernels written in assembly, for instructions a compiler emits only now and
 # then (test_amd_gcn_asm).
-for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp asm_hwid asm_quad asm_mulhi asm_xf32 asm_permute_exec asm_barrier_order asm_vop3_gaps; do
+for src in asm_sopk asm_scalar asm_memory asm_vector asm_libs asm_logic asm_atomics asm_bcast asm_wait asm_realtime asm_isa_gaps asm_lds64 asm_ldsf32 asm_cvt_ubyte asm_dot_clamp asm_hwid asm_quad asm_mulhi asm_xf32 asm_permute_exec asm_barrier_order asm_vop3_gaps asm_mfma_order; do
   "$clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 -c "$src.s" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"
 done
