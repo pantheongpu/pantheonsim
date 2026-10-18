@@ -1475,7 +1475,7 @@ the 32-thread AMD box ("server2", shared; Release, CUDA 13.0, GCC 13), A = origi
   VGPU_TIER=0, of `VGPU_TIER=1` and of the default are the same in all 2,418 fields (checked with `bench.py --check-counters` against a
   file written by the interpreter on this machine; the committed file is skipped by this box's nvcc 13.0.88, whose device code hashes
   differently, and its counts equal the fresh ones in every field).
-* **The whole non-AMD ctest suite with the tier on (the default), 404 tests, `-j4`, 83 minutes under a loaded machine.** 357 pass. The
+* **The whole non-AMD ctest suite with the tier on (the default), 404 tests, `-j4`, 83 minutes under a loaded machine.** 364 pass, 24 skip (tool or library absent), 16 failed. The
   failures were: 12 `e2e_*_paths`/`nvcomp`/`cudss`/`cufile`/`nvshmem_host`/`blas_host_sums` tests that ran while other jobs took the host's
   memory ("device out of memory ... below the reserve"), all of which pass when run again; `lint_curl_retries` (needs a git checkout; the
   build tree here has none); `e2e_lockstep_blocks`, which fails with the tier on, with `VGPU_TIER=0` and on the unchanged A build
@@ -1484,7 +1484,7 @@ the 32-thread AMD box ("server2", shared; Release, CUDA 13.0, GCC 13), A = origi
   compiling CUTLASS); and `e2e_cutlass_gemm`, whose `sm90 group_gemm` case ran for over 30 minutes with the tier on and was killed by the
   1 h ctest limit; the same binary with `VGPU_TIER=0` ran 50 min and reported the same `Failure` (CUTLASS's own check at
   group_gemm.cu:117), so the failure is not the tier's but the case is too slow on this box to say more. The PyTorch tests skipped (no torch
-  here). The passing tests are the whole suite less these, so the tier ran under every `e2e_*` that launches a kernel.
+  here). Of the 16, 14 pass when run alone (or fail identically with the tier off), so the tier ran under every `e2e_*` that launches a kernel.
 * **Corpora** (`tools/verify/run_corpora.sh`, HeCBench reduced list 34, Rodinia 12, CUDA Samples 98; one host thread, counters on;
   configurations: A, A again, B default, B with `VGPU_TIER=1 VGPU_TIER_STATS=1`, B with `VGPU_TIER=0`): 649 runs. B against A, and B with the
   tier named against A: 0 programs differ in stdout, stderr, output files or counters. Programs that differ between two runs of A itself
