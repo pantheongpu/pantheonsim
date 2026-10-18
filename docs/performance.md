@@ -2198,8 +2198,8 @@ IMMA is 62% of immaTensorCoreGemm's warp instructions and about two thirds of it
   no MATCH explains.
 
 **Same results with the tier off and on.** `tools/verify/run_corpora.sh` with `A` = the base build, `B` = this build, `T0` = this build with
-`VGPU_TIER=0`: HeCBench's 34 programs and Rodinia's 12 (each run three times, the 7 HeCBench programs that exceed the 120 s timeout in the
-base build are not comparable and were left out), and the CUDA Samples that run the new forms or the instructions around them (immaTensorCoreGemm,
+`VGPU_TIER=0`: 28 of HeCBench's 34 programs (the other six, atomicReduction, babelstream, base64e, bh, binomial-small and atomicCost, time out
+at 120 s in the base build, so `--skip-timeouts A` left them out) and Rodinia's 12, each run three times, and the CUDA Samples that run the new forms or the instructions around them (immaTensorCoreGemm,
 cudaTensorCoreGemm, bf16TensorCoreGemm, warpAggregatedAtomicsCG, reductionMultiBlockCG, mergeSort, cdpAdvancedQuicksort, shfl_scan,
 binaryPartitionCG, simpleAtomicIntrinsics, with a 500 s timeout). Exit status, stdout, stderr, output files and per-launch counters are
 identical between B and T0 and between B and A except: `rodinia/backprop`'s `output.dat` (three different hashes in A, B and T0: the program is
