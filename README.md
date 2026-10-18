@@ -11,7 +11,7 @@ make     # installs cmake and a C++ compiler if missing (asks first), then build
 ./run    # starts a simulated GPU machine and takes you inside; type exit to leave
 ```
 
-`./run` reads `pantheonsim.yaml` and writes one on the first run. To start from a ready-made file instead, use the sample: `./run pantheonsim.example.yaml` runs it as it is (one simulated H100), and `cp pantheonsim.example.yaml pantheonsim.yaml` makes it your default to edit. It lists every setting; see [Choose your machine](#choose-your-machine).
+`./run` reads `pantheonsim.yaml` and writes one on the first run. To start from a ready-made file instead, use the sample: `./run pantheonsim.example.yaml` runs it as it is (one simulated H100), and `cp pantheonsim.example.yaml pantheonsim.yaml` makes it your default to edit. It lists every setting, and "Choose your machine" below explains them.
 
 You need Linux (WSL works), a C++20 compiler and CMake, and no GPU. Run both commands from the repository root: `make: *** No targets specified` or `./run: No such file or directory` means you are in another directory or on an old branch, so `git checkout main && git pull` first. `make doctor` checks the tools and says what to install, `make deps` installs them, and `make build` builds without installing anything. The build takes a few minutes and uses half your CPUs (`make JOBS=8` to choose). The simulator also runs on half your CPUs; set `threads: N` in the settings file, or `make run THREADS=N`, to change that. `./run` before `make` builds for you.
 
