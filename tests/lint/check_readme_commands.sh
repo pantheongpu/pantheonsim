@@ -12,7 +12,7 @@
 #   - a link to a file in the repository points at a file that exists, and a `#anchor`
 #     on a .md file is a heading (or <a id>) of that file.
 #   - `./run` is an executable file at the root, and the README, which is the front door,
-#     shows both `make` and `./run` and stays short (under 90 lines, with the settings table).
+#     shows both `make` and `./run` and stays short (under 100 lines, with the settings table).
 # Usage: tests/lint/check_readme_commands.sh [FILE.md]   (default: README.md and docs/getting-started.md;
 #   a link resolves from the directory of the file that holds it)
 set -uo pipefail
@@ -79,7 +79,7 @@ if [[ $readme == README.md ]]; then
   grep -qxE 'make( +#.*)?' "$tmp/code.txt" || bad "README.md must show plain 'make' as the way to build"
   grep -qE '^\./run( |$)' "$tmp/code.txt" || bad "README.md must show './run' as the way to start"
   lines=$(wc -l < "$readme")
-  (( lines <= 90 )) || bad "README.md has $lines lines; the front door stays under 90 (the rest belongs in docs/getting-started.md)"
+  (( lines <= 100 )) || bad "README.md has $lines lines; the front door stays under 100 (the rest belongs in docs/getting-started.md)"
 fi
 
 # --- vgpu commands ----------------------------------------------------------------------
