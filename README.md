@@ -11,6 +11,17 @@ make     # installs cmake and a C++ compiler if missing (asks first), then build
 ./run    # starts a simulated GPU machine and takes you inside; type exit to leave
 ```
 
+You need Linux (WSL works), a C++20 compiler and CMake, and no GPU. Run both commands from the repository root: `make: *** No targets specified` or `./run: No such file or directory` means you are in another directory or on an old branch, so `git checkout main && git pull` first. `make doctor` checks the tools and says what to install, `make deps` installs them, and `make build` builds without installing anything. The build takes a few minutes. `./run` before `make` builds for you.
+
+Other targets:
+
+```bash
+make demo                           # run a built-in vectorAdd kernel on a simulated H100; ends with PASS
+make run APP=./my_app ARGS="..."    # run one program on the simulated GPU, without the machine shell
+make test                           # build and run the test suite
+make help                           # every target and setting
+```
+
 Inside, `nvidia-smi` shows the GPUs, and you can compile, download programs with `curl` or `git clone`, and run them; for Python packages use a virtual environment (`python3 -m venv ~/v && ~/v/bin/pip install ...`); system packages (apt) are installed on your own machine, outside.
 
 ## Choose your machine
