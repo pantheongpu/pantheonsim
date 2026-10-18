@@ -616,6 +616,17 @@ typedef struct rocprofiler_buffer_tracing_hip_api_ext_record_t {
   alignas(8) uint8_t retval[24];
 } rocprofiler_buffer_tracing_hip_api_ext_record_t;
 
+// ROCTx (marker) API records: the same layout as a HIP API record.
+typedef struct rocprofiler_buffer_tracing_marker_api_record_t {
+  uint64_t size;
+  rocprofiler_buffer_tracing_kind_t kind;
+  rocprofiler_tracing_operation_t operation;
+  rocprofiler_correlation_id_t correlation_id;
+  rocprofiler_timestamp_t start_timestamp;
+  rocprofiler_timestamp_t end_timestamp;
+  rocprofiler_thread_id_t thread_id;
+} rocprofiler_buffer_tracing_marker_api_record_t;
+
 typedef struct rocprofiler_buffer_tracing_memory_copy_record_t {
   uint64_t size;
   rocprofiler_buffer_tracing_kind_t kind;
@@ -672,6 +683,68 @@ typedef enum rocprofiler_code_object_storage_type_t {
 struct HsaAgent {
   uint64_t handle;
 };
+
+// A ROCTx call as a callback-tracing record carries it (rocprofiler-sdk's marker/api_args.h): the arguments of
+// the call and, on exit, its return value. roctxProcessRangeA's message is the range's; roctxThreadRangeA's too.
+typedef union rocprofiler_marker_api_args_t {
+  struct {
+    const char* message;
+  } roctxMarkA;
+  struct {
+    const char* message;
+  } roctxRangePushA;
+  struct {
+    char empty;
+  } roctxRangePop;
+  struct {
+    const char* message;
+  } roctxRangeStartA;
+  struct {
+    uint64_t id;
+  } roctxRangeStop;
+  struct {
+    uint64_t* tid;
+  } roctxGetThreadId;
+  struct {
+    uint64_t tid;
+  } roctxProfilerPause;
+  struct {
+    uint64_t tid;
+  } roctxProfilerResume;
+  struct {
+    const char* name;
+  } roctxNameOsThread;
+  struct {
+    const char* name;
+    const void* agent;
+  } roctxNameHsaAgent;
+  struct {
+    const char* name;
+    int device_id;
+  } roctxNameHipDevice;
+  struct {
+    const char* name;
+    const void* stream;
+  } roctxNameHipStream;
+  struct {
+    const char* message;
+  } roctxThreadRangeA;
+  struct {
+    const char* message;
+  } roctxProcessRangeA;
+} rocprofiler_marker_api_args_t;
+
+typedef union rocprofiler_marker_api_retval_t {
+  int32_t int32_t_retval;
+  int64_t int64_t_retval;
+  uint64_t roctx_range_id_t_retval;
+} rocprofiler_marker_api_retval_t;
+
+typedef struct rocprofiler_callback_tracing_marker_api_data_t {
+  uint64_t size;
+  rocprofiler_marker_api_args_t args;
+  rocprofiler_marker_api_retval_t retval;
+} rocprofiler_callback_tracing_marker_api_data_t;
 
 typedef struct rocprofiler_callback_tracing_code_object_load_data_t {
   uint64_t size;
@@ -793,5 +866,32 @@ typedef int (*rocprofiler_external_correlation_id_request_cb_t)(
 typedef void (*rocprofiler_intercept_library_cb_t)(rocprofiler_intercept_table_t type, uint64_t lib_version,
                                                    uint64_t lib_instance, void** tables, uint64_t num_tables,
                                                    void* user_data);
+
+// ---- rocprofiler-sdk-roctx/api_trace.h ---------------------------------------
+// The tables ROCTx hands rocprofiler_set_api_table.
+
+typedef struct roctxCoreApiTable_t {
+  uint64_t size;
+  void (*roctxMarkA_fn)(const char* message);
+  int (*roctxRangePushA_fn)(const char* message);
+  int (*roctxRangePop_fn)(void);
+  uint64_t (*roctxRangeStartA_fn)(const char* message);
+  void (*roctxRangeStop_fn)(uint64_t id);
+  int (*roctxGetThreadId_fn)(uint64_t* tid);
+} roctxCoreApiTable_t;
+
+typedef struct roctxControlApiTable_t {
+  uint64_t size;
+  int (*roctxProfilerPause_fn)(uint64_t tid);
+  int (*roctxProfilerResume_fn)(uint64_t tid);
+} roctxControlApiTable_t;
+
+typedef struct roctxNameApiTable_t {
+  uint64_t size;
+  int (*roctxNameOsThread_fn)(const char* name);
+  int (*roctxNameHsaAgent_fn)(const char* name, const void* agent);
+  int (*roctxNameHipDevice_fn)(const char* name, int device_id);
+  int (*roctxNameHipStream_fn)(const char* name, const void* stream);
+} roctxNameApiTable_t;
 
 }  // namespace vgpu::amd::rocprof

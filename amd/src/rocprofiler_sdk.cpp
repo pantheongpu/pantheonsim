@@ -295,6 +295,19 @@ const std::vector<const char*>* operation_names(const char* kind) {
   return it == ops.end() ? nullptr : &it->second;
 }
 
+// ROCTx's operations count from 0 (roctxMarkA is operation 0), the other kinds' from 1.
+const std::vector<const char*>* marker_operation_names(const char* kind) {
+  static const std::map<std::string, std::vector<const char*>> ops = {
+      {"MARKER_CORE_API", {"roctxMarkA", "roctxRangePushA", "roctxRangePop", "roctxRangeStartA", "roctxRangeStop",
+                           "roctxGetThreadId"}},
+      {"MARKER_CONTROL_API", {"roctxProfilerPause", "roctxProfilerResume"}},
+      {"MARKER_NAME_API", {"roctxNameOsThread", "roctxNameHsaAgent", "roctxNameHipDevice", "roctxNameHipStream"}},
+      {"MARKER_CORE_RANGE_API", {"roctxMarkA", "roctxThreadRangeA", "roctxProcessRangeA", "roctxGetThreadId"}},
+  };
+  const auto it = ops.find(kind);
+  return it == ops.end() ? nullptr : &it->second;
+}
+
 bool is_hip_api(const char* kind) {
   return std::strcmp(kind, "HIP_RUNTIME_API") == 0 || std::strcmp(kind, "HIP_RUNTIME_API_EXT") == 0;
 }
@@ -314,6 +327,8 @@ const char* operation_name(const char* kind, int op) {
       if (a.id == op) return a.name;
     return nullptr;
   }
+  if (const auto* names = marker_operation_names(kind))
+    return op >= 0 && static_cast<size_t>(op) < names->size() ? (*names)[static_cast<size_t>(op)] : nullptr;
   const auto* names = operation_names(kind);
   if (!names || op <= 0 || static_cast<size_t>(op) >= names->size()) return nullptr;
   return (*names)[static_cast<size_t>(op)];
@@ -329,6 +344,11 @@ rocprofiler_status_t iterate_operations(const char* kind, Cb&& each) {
   if (is_hip_compiler_api(kind)) {
     for (const HipApi& a : kHipCompilerApis)
       if (each(a.id) != 0) break;
+    return ROCPROFILER_STATUS_SUCCESS;
+  }
+  if (const auto* names = marker_operation_names(kind)) {
+    for (size_t op = 0; op < names->size(); ++op)
+      if (each(static_cast<int>(op)) != 0) break;
     return ROCPROFILER_STATUS_SUCCESS;
   }
   if (const auto* names = operation_names(kind))
@@ -636,6 +656,7 @@ struct ApiFrame {
   int op = -1;
   bool compiler = false;   // a HIP compiler API call, not a runtime one
   uint64_t start = 0;
+  uint64_t ancestor = 0;   // the ROCTx range the thread was in when the call began
 };
 // A thread's HIP calls in progress. exit() destroys the thread's
 // thread_local objects before it runs the libraries' static destructors, and
@@ -744,6 +765,441 @@ void ensure_configured() {
   if (!s.configured && configures_itself()) configure(nullptr);
 }
 
+// ---- ROCTx ------------------------------------------------------------------------------
+//
+// ROCTx's library hands rocprofiler_set_api_table its three tables (core, control, name) when it starts and
+// rocprofiler-register finds this library. Each entry is wrapped here the way rocprofiler-sdk wraps them. A call a
+// context subscribed to takes a correlation id of its own and is delivered to the tool as callback-tracing records
+// (MARKER_CORE_API, MARKER_CONTROL_API, MARKER_NAME_API: enter, then exit, with the call's arguments and return
+// value in the payload) and as buffer-tracing records of the same kinds.
+//
+// The marks and ranges a program makes are a kind of their own, MARKER_CORE_RANGE_API (rocprofv3 asks for these,
+// and for MARKER_CONTROL_API, and reads the messages from their payloads): roctxMarkA is one callback with no
+// phase, roctxThreadRangeA (a roctxRangePushA and its roctxRangePop) and roctxProcessRangeA (a roctxRangeStartA and
+// its roctxRangeStop) an enter callback where the range begins and an exit callback where it ends, with the
+// message in both and the same user data pointer. A range's correlation id is the id of the call that began it.
+// A buffer record of a range is written when it ends.
+//
+// A call made while a range is open -- on its thread, innermost first, a range begun with roctxRangeStartA
+// included until it is stopped -- has that range's correlation id as its ancestor: a HIP call, a mark, a range
+// begun inside it. Measured on an RX 6800 and an RX 6700 XT (amd/tests/data/rocprof_markers*.expected).
+//
+// A call nobody subscribed to is passed through: it takes no correlation id and is not traced, as in
+// rocprofiler-sdk.
+namespace roctx {
+
+enum Group { kCore, kControl, kName };
+enum CoreOp { kMark = 0, kPush, kPop, kStart, kStop, kGetThreadId };
+enum RangeOp { kRangeMark = 0, kThreadRange = 1, kProcessRange = 2, kRangeThreadId = 3 };
+
+// An open range.
+struct Scope {
+  uint64_t correlation = 0;
+  uint64_t ancestor = 0;
+  uint64_t start = 0;
+  uint64_t thread = 0;
+  bool process = false;     // begun by roctxRangeStartA, not roctxRangePushA
+  uint64_t range_id = 0;    // what roctxRangeStartA returned, for roctxRangeStop
+  std::string message;
+  std::map<uint64_t, rocprofiler_user_data_t> user, external;   // by context
+};
+
+struct State {
+  std::map<uint64_t, std::vector<std::shared_ptr<Scope>>> threads;   // each thread's open ranges, outermost first
+  roctxCoreApiTable_t core{};                                        // ROCTx's own functions
+  roctxControlApiTable_t control{};
+  roctxNameApiTable_t name{};
+};
+State& state() {
+  static State* st = new State;
+  return *st;
+}
+
+struct Kind {
+  int callback, buffer, request;
+};
+Kind kind_of(Group g) {
+  switch (g) {
+    case kCore:
+      return {ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_API, ROCPROFILER_BUFFER_TRACING_MARKER_CORE_API,
+              ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_MARKER_CORE_API};
+    case kControl:
+      return {ROCPROFILER_CALLBACK_TRACING_MARKER_CONTROL_API, ROCPROFILER_BUFFER_TRACING_MARKER_CONTROL_API,
+              ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_MARKER_CONTROL_API};
+    default:
+      return {ROCPROFILER_CALLBACK_TRACING_MARKER_NAME_API, ROCPROFILER_BUFFER_TRACING_MARKER_NAME_API,
+              ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_MARKER_NAME_API};
+  }
+}
+
+// One call, from its first callback to its last record.
+struct Event {
+  Group group = kCore;
+  int op = 0;
+  bool traced = false;   // some active context asked for the call itself
+  bool ranged = false;   // ... for the range it begins
+  uint64_t correlation = 0, ancestor = 0, thread = 0, start = 0;
+  std::map<uint64_t, rocprofiler_user_data_t> user, external;   // by context
+};
+
+// The caller holds the lock.
+bool wanted(Sdk& s, Group g, int op) {
+  const Kind k = kind_of(g);
+  bool any = false;
+  for_callbacks(s, k.callback, op, [&](Context&, CallbackService&) { any = true; });
+  for_buffered(s, k.buffer, op, [&](Context&, uint64_t) { any = true; });
+  return any;
+}
+bool range_wanted(Sdk& s, int op) {
+  bool any = false;
+  for_callbacks(s, ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_RANGE_API, op, [&](Context&, CallbackService&) { any = true; });
+  for_buffered(s, ROCPROFILER_BUFFER_TRACING_MARKER_CORE_RANGE_API, op, [&](Context&, uint64_t) { any = true; });
+  return any;
+}
+
+uint64_t scope_of(uint64_t thread) {
+  State& st = state();
+  const auto it = st.threads.find(thread);
+  return it == st.threads.end() || it->second.empty() ? 0 : it->second.back()->correlation;
+}
+
+// Begins a call: its correlation id and ancestor, if anyone is watching it or the range it opens.
+Event begin(Group g, int op, int range_op = -1) {
+  Sdk& s = sdk();
+  Event e;
+  e.group = g;
+  e.op = op;
+  e.thread = thread_id();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  if (s.finalized) return e;
+  e.traced = wanted(s, g, op);
+  e.ranged = range_op >= 0 && range_wanted(s, range_op);
+  if (!e.traced && !e.ranged) return e;
+  e.correlation = s.next_correlation.fetch_add(1);
+  e.ancestor = scope_of(e.thread);
+  e.start = hp::now_ns();
+  return e;
+}
+
+void deliver(Sdk& s, Event& e, rocprofiler_callback_phase_t phase,
+             rocprofiler_callback_tracing_marker_api_data_t& data) {
+  const Kind k = kind_of(e.group);
+  for_callbacks(s, k.callback, e.op, [&](Context& c, CallbackService& svc) {
+    rocprofiler_callback_tracing_record_t r{};
+    r.context_id = {c.id};
+    r.thread_id = e.thread;
+    r.correlation_id.internal = e.correlation;
+    r.correlation_id.ancestor = e.ancestor;
+    if (phase == ROCPROFILER_CALLBACK_PHASE_ENTER)
+      e.external[c.id] = external_id(c, static_cast<rocprofiler_external_correlation_id_request_kind_t>(k.request), e.op,
+                                     e.correlation);
+    r.correlation_id.external = e.external[c.id];
+    r.kind = static_cast<rocprofiler_callback_tracing_kind_t>(k.callback);
+    r.operation = e.op;
+    r.phase = phase;
+    r.payload = &data;
+    svc.callback(r, &e.user[c.id], svc.data);
+  });
+}
+
+// The call's buffer-tracing record, at its end.
+void record(Sdk& s, const Event& e, uint64_t end) {
+  const Kind k = kind_of(e.group);
+  for_buffered(s, k.buffer, e.op, [&](Context& c, uint64_t buf) {
+    rocprofiler_buffer_tracing_marker_api_record_t r{};
+    r.size = sizeof r;
+    r.kind = static_cast<rocprofiler_buffer_tracing_kind_t>(k.buffer);
+    r.operation = e.op;
+    r.correlation_id.internal = e.correlation;
+    r.correlation_id.ancestor = e.ancestor;
+    const auto it = e.external.find(c.id);
+    if (it != e.external.end()) r.correlation_id.external = it->second;
+    r.start_timestamp = e.start;
+    r.end_timestamp = end;
+    r.thread_id = e.thread;
+    push(s, buf, ROCPROFILER_BUFFER_CATEGORY_TRACING, static_cast<uint32_t>(k.buffer), r);
+  });
+}
+
+// Runs ROCTx's function between the call's two callbacks, with the call's record after them. The lock is not
+// held across the function itself.
+template <class Fn>
+void run(Event& e, rocprofiler_callback_tracing_marker_api_data_t& data, Fn&& fn) {
+  Sdk& s = sdk();
+  data.size = sizeof data;
+  if (e.traced) {
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (!s.finalized) deliver(s, e, ROCPROFILER_CALLBACK_PHASE_ENTER, data);
+  }
+  fn();
+  if (e.traced) {
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (!s.finalized) {
+      deliver(s, e, ROCPROFILER_CALLBACK_PHASE_EXIT, data);
+      record(s, e, hp::now_ns());
+    }
+  }
+}
+
+// A MARKER_CORE_RANGE_API callback for a mark (no phase) or the beginning or end of a range.
+void range_callback(Sdk& s, Scope& sc, int op, rocprofiler_callback_phase_t phase) {
+  rocprofiler_callback_tracing_marker_api_data_t data{};
+  data.size = sizeof data;
+  if (op == kRangeMark) data.args.roctxMarkA.message = sc.message.c_str();
+  if (op == kThreadRange) data.args.roctxThreadRangeA.message = sc.message.c_str();
+  if (op == kProcessRange) data.args.roctxProcessRangeA.message = sc.message.c_str();
+  for_callbacks(s, ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_RANGE_API, op, [&](Context& c, CallbackService& svc) {
+    rocprofiler_callback_tracing_record_t r{};
+    r.context_id = {c.id};
+    r.thread_id = sc.thread;
+    r.correlation_id.internal = sc.correlation;
+    r.correlation_id.ancestor = sc.ancestor;
+    if (phase != ROCPROFILER_CALLBACK_PHASE_EXIT)
+      sc.external[c.id] =
+          external_id(c, ROCPROFILER_EXTERNAL_CORRELATION_REQUEST_MARKER_CORE_RANGE_API, op, sc.correlation);
+    r.correlation_id.external = sc.external[c.id];
+    r.kind = ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_RANGE_API;
+    r.operation = op;
+    r.phase = phase;
+    r.payload = &data;
+    svc.callback(r, &sc.user[c.id], svc.data);
+  });
+}
+
+// The buffer record of a mark or a range that has ended.
+void range_record(Sdk& s, int op, const Scope& sc, uint64_t end) {
+  const int kind = ROCPROFILER_BUFFER_TRACING_MARKER_CORE_RANGE_API;
+  for_buffered(s, kind, op, [&](Context& c, uint64_t buf) {
+    rocprofiler_buffer_tracing_marker_api_record_t r{};
+    r.size = sizeof r;
+    r.kind = static_cast<rocprofiler_buffer_tracing_kind_t>(kind);
+    r.operation = op;
+    r.correlation_id.internal = sc.correlation;
+    r.correlation_id.ancestor = sc.ancestor;
+    const auto it = sc.external.find(c.id);
+    if (it != sc.external.end()) r.correlation_id.external = it->second;
+    r.start_timestamp = sc.start;
+    r.end_timestamp = end;
+    r.thread_id = sc.thread;
+    push(s, buf, ROCPROFILER_BUFFER_CATEGORY_TRACING, static_cast<uint32_t>(kind), r);
+  });
+}
+
+// The range a call began, from the call.
+std::shared_ptr<Scope> open_range(const Event& e, const char* message, bool process) {
+  auto sc = std::make_shared<Scope>();
+  sc->correlation = e.correlation;
+  sc->ancestor = e.ancestor;
+  sc->start = e.start;
+  sc->thread = e.thread;
+  sc->process = process;
+  sc->message = message ? message : "";
+  return sc;
+}
+
+void mark(const char* message) {
+  Event e = begin(kCore, kMark, kRangeMark);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxMarkA.message = message;
+  run(e, d, [&] { state().core.roctxMarkA_fn(message); });
+  if (e.ranged) {
+    Sdk& s = sdk();
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (s.finalized) return;
+    const auto sc = open_range(e, message, false);
+    range_callback(s, *sc, kRangeMark, ROCPROFILER_CALLBACK_PHASE_ENTER);
+    range_callback(s, *sc, kRangeMark, ROCPROFILER_CALLBACK_PHASE_EXIT);
+    range_record(s, kRangeMark, *sc, sc->start);
+  }
+}
+
+int range_push(const char* message) {
+  Event e = begin(kCore, kPush, kThreadRange);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxRangePushA.message = message;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().core.roctxRangePushA_fn(message); });
+  if (e.ranged) {
+    Sdk& s = sdk();
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (s.finalized) return r;
+    const auto sc = open_range(e, message, false);
+    state().threads[e.thread].push_back(sc);
+    range_callback(s, *sc, kThreadRange, ROCPROFILER_CALLBACK_PHASE_ENTER);
+  }
+  return r;
+}
+
+int range_pop() {
+  Event e = begin(kCore, kPop);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().core.roctxRangePop_fn(); });
+  Sdk& s = sdk();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  auto& open = state().threads[e.thread];
+  for (size_t i = open.size(); i-- > 0;)
+    if (!open[i]->process) {
+      const std::shared_ptr<Scope> sc = open[i];
+      open.erase(open.begin() + static_cast<std::ptrdiff_t>(i));
+      if (!s.finalized) {
+        range_callback(s, *sc, kThreadRange, ROCPROFILER_CALLBACK_PHASE_EXIT);
+        range_record(s, kThreadRange, *sc, hp::now_ns());
+      }
+      break;
+    }
+  return r;
+}
+
+uint64_t range_start(const char* message) {
+  Event e = begin(kCore, kStart, kProcessRange);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxRangeStartA.message = message;
+  uint64_t id = 0;
+  run(e, d, [&] { d.retval.roctx_range_id_t_retval = id = state().core.roctxRangeStartA_fn(message); });
+  if (e.ranged) {
+    Sdk& s = sdk();
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    if (s.finalized) return id;
+    const auto sc = open_range(e, message, true);
+    sc->range_id = id;
+    state().threads[e.thread].push_back(sc);
+    range_callback(s, *sc, kProcessRange, ROCPROFILER_CALLBACK_PHASE_ENTER);
+  }
+  return id;
+}
+
+void range_stop(uint64_t id) {
+  Event e = begin(kCore, kStop);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxRangeStop.id = id;
+  run(e, d, [&] { state().core.roctxRangeStop_fn(id); });
+  Sdk& s = sdk();
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  for (auto& t : state().threads) {
+    auto& open = t.second;
+    for (size_t i = 0; i < open.size(); ++i)
+      if (open[i]->process && open[i]->range_id == id) {
+        const std::shared_ptr<Scope> sc = open[i];
+        open.erase(open.begin() + static_cast<std::ptrdiff_t>(i));
+        if (!s.finalized) {
+          range_callback(s, *sc, kProcessRange, ROCPROFILER_CALLBACK_PHASE_EXIT);
+          range_record(s, kProcessRange, *sc, hp::now_ns());
+        }
+        return;
+      }
+  }
+}
+
+int get_thread_id(uint64_t* tid) {
+  Event e = begin(kCore, kGetThreadId);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxGetThreadId.tid = tid;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().core.roctxGetThreadId_fn(tid); });
+  return r;
+}
+
+int profiler_pause(uint64_t tid) {
+  Event e = begin(kControl, 0);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxProfilerPause.tid = tid;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().control.roctxProfilerPause_fn(tid); });
+  return r;
+}
+
+int profiler_resume(uint64_t tid) {
+  Event e = begin(kControl, 1);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxProfilerResume.tid = tid;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().control.roctxProfilerResume_fn(tid); });
+  return r;
+}
+
+int name_os_thread(const char* name) {
+  Event e = begin(kName, 0);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxNameOsThread.name = name;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().name.roctxNameOsThread_fn(name); });
+  return r;
+}
+
+int name_hsa_agent(const char* name, const void* agent) {
+  Event e = begin(kName, 1);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxNameHsaAgent.name = name;
+  d.args.roctxNameHsaAgent.agent = agent;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().name.roctxNameHsaAgent_fn(name, agent); });
+  return r;
+}
+
+int name_hip_device(const char* name, int device_id) {
+  Event e = begin(kName, 2);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxNameHipDevice.name = name;
+  d.args.roctxNameHipDevice.device_id = device_id;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().name.roctxNameHipDevice_fn(name, device_id); });
+  return r;
+}
+
+int name_hip_stream(const char* name, const void* stream) {
+  Event e = begin(kName, 3);
+  rocprofiler_callback_tracing_marker_api_data_t d{};
+  d.args.roctxNameHipStream.name = name;
+  d.args.roctxNameHipStream.stream = stream;
+  int r = 0;
+  run(e, d, [&] { d.retval.int32_t_retval = r = state().name.roctxNameHipStream_fn(name, stream); });
+  return r;
+}
+
+// Puts a wrapper in a table in place of ROCTx's function, keeping that one to call. A table is only as long as
+// its `size` says, and an entry ROCTx did not fill is left alone.
+template <class Table, class Fn>
+void wrap(Table& t, Fn Table::*entry, Fn& original, Fn wrapper) {
+  const size_t at = reinterpret_cast<const char*>(&(t.*entry)) - reinterpret_cast<const char*>(&t);
+  if (at + sizeof(Fn) > t.size || !(t.*entry) || (t.*entry) == wrapper) return;
+  original = t.*entry;
+  t.*entry = wrapper;
+}
+
+// rocprofiler_set_api_table("roctx", ...): the tables in the order of ROCPROFILER_MARKER_*_TABLE.
+void wrap_tables(void** tables, uint64_t count) {
+  if (!tables) return;
+  State& st = state();
+  std::lock_guard<std::recursive_mutex> lock(sdk().mutex);
+  if (count > 0 && tables[0]) {
+    auto& t = *static_cast<roctxCoreApiTable_t*>(tables[0]);
+    wrap(t, &roctxCoreApiTable_t::roctxMarkA_fn, st.core.roctxMarkA_fn, mark);
+    wrap(t, &roctxCoreApiTable_t::roctxRangePushA_fn, st.core.roctxRangePushA_fn, range_push);
+    wrap(t, &roctxCoreApiTable_t::roctxRangePop_fn, st.core.roctxRangePop_fn, range_pop);
+    wrap(t, &roctxCoreApiTable_t::roctxRangeStartA_fn, st.core.roctxRangeStartA_fn, range_start);
+    wrap(t, &roctxCoreApiTable_t::roctxRangeStop_fn, st.core.roctxRangeStop_fn, range_stop);
+    wrap(t, &roctxCoreApiTable_t::roctxGetThreadId_fn, st.core.roctxGetThreadId_fn, get_thread_id);
+  }
+  if (count > 1 && tables[1]) {
+    auto& t = *static_cast<roctxControlApiTable_t*>(tables[1]);
+    wrap(t, &roctxControlApiTable_t::roctxProfilerPause_fn, st.control.roctxProfilerPause_fn, profiler_pause);
+    wrap(t, &roctxControlApiTable_t::roctxProfilerResume_fn, st.control.roctxProfilerResume_fn, profiler_resume);
+  }
+  if (count > 2 && tables[2]) {
+    auto& t = *static_cast<roctxNameApiTable_t*>(tables[2]);
+    wrap(t, &roctxNameApiTable_t::roctxNameOsThread_fn, st.name.roctxNameOsThread_fn, name_os_thread);
+    wrap(t, &roctxNameApiTable_t::roctxNameHsaAgent_fn, st.name.roctxNameHsaAgent_fn, name_hsa_agent);
+    wrap(t, &roctxNameApiTable_t::roctxNameHipDevice_fn, st.name.roctxNameHipDevice_fn, name_hip_device);
+    wrap(t, &roctxNameApiTable_t::roctxNameHipStream_fn, st.name.roctxNameHipStream_fn, name_hip_stream);
+  }
+}
+
+}  // namespace roctx
+
+// The innermost ROCTx range this thread is in, for the ancestor of a HIP call. The caller holds the lock.
+uint64_t roctx_scope(Sdk&) { return roctx::scope_of(thread_id()); }
+
 // ---- What libamdhip64 reports -------------------------------------------------------
 
 uint64_t on_api_enter(const char* name) {
@@ -757,6 +1213,7 @@ uint64_t on_api_enter(const char* name) {
   f.op = id.op;
   f.compiler = id.compiler;
   f.start = hp::now_ns();
+  if (frames().empty()) f.ancestor = roctx_scope(s);
   frames().push_back(f);
   return frames().size();
 }
@@ -777,6 +1234,7 @@ void on_api_exit(uint64_t token) {
     for_buffered(s, kind, f.op, [&](Context& c, uint64_t buf) {
       rocprofiler_correlation_id_t corr{};
       corr.internal = f.correlation;
+      corr.ancestor = f.ancestor;
       corr.external = external_id(c, request, f.op, f.correlation);
       if (kind == ext) {
         rocprofiler_buffer_tracing_hip_api_ext_record_t r{};
@@ -1540,8 +1998,10 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_callback_tracing_kind_o
 // libraries' tables as they are and wraps nothing. Without the function,
 // rocprofiler-register stops the program ("rocprofiler_set_api_table not
 // found") as soon as RCCL starts, which is how PyTorch's distributed setup
-// ended under vLLM.
+// ended under vLLM. ROCTx's tables are wrapped (the ROCTx block above); the others
+// are taken as they are.
 ROCPROFILER_API int rocprofiler_set_api_table(const char* name, uint64_t, uint64_t, void** tables, uint64_t count) {
+  if (name && std::strcmp(name, "roctx") == 0) roctx::wrap_tables(tables, count);
   return name && (tables || count == 0) ? 0 : -1;
 }
 

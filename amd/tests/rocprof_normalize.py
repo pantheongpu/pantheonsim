@@ -21,7 +21,9 @@ ids, which count API calls and dispatches as they happen):
   allocations the allocations the program asked for: ALLOCATE records of the
               requested size under hipMalloc, hipHostMalloc, ..., and the FREE
               records under hipFree and its relatives
-  markers     ROCTx marks and ranges with their messages
+  markers     ROCTx marks and ranges with their messages, each with the range it was made in
+  marker scopes  (only when a HIP call was made inside a ROCTx range) the HIP calls that were,
+              with the range: the ancestor of their records
 
 --strip-known-gaps drops from a normalised trace what the simulator does not record yet
 (KNOWN_GAPS below, each described in amd/docs/rocprofiler.md). The simulator's trace is
@@ -54,6 +56,8 @@ ALLOCATORS = {
     "hipMalloc": "size", "hipMallocManaged": "size", "hipHostMalloc": "size", "hipExtMallocWithFlags": "sizeBytes",
     "hipMallocAsync": "size", "hipMallocFromPoolAsync": "size", "hipMemAllocHost": "size", "hipHostAlloc": "size",
 }
+# The buffer-tracing kinds that put records in marker_api (rocprofiler-sdk's rocprofiler_buffer_tracing_kind_t).
+MARKER_KINDS = {7: "MARKER_CORE_API", 8: "MARKER_CONTROL_API", 9: "MARKER_NAME_API", 32: "MARKER_CORE_RANGE_API"}
 FREERS = {"hipFree", "hipHostFree", "hipFreeAsync", "hipFreeHost", "hipMemFreeHost"}
 
 
@@ -61,8 +65,7 @@ FREERS = {"hipFree", "hipHostFree", "hipFreeAsync", "hipFreeHost", "hipMemFreeHo
 #   hip-arguments    the arguments of a HIP call: the simulator's records name the call only
 #   hip-compiler-api the __hip* calls a hipcc-built program makes (fat binary and function
 #                    registration, the launch configuration push and pop)
-#   markers          ROCTx marks and ranges
-KNOWN_GAPS = ("hip-arguments", "markers")
+KNOWN_GAPS = ("hip-arguments",)
 
 
 def strip_known_gaps(text):
@@ -76,8 +79,6 @@ def strip_known_gaps(text):
                 continue
             if "hip-arguments" in KNOWN_GAPS:
                 line = re.sub(r"\(.*\)$", "()", line)
-        elif section == "[markers]" and "markers" in KNOWN_GAPS:
-            continue
         out.append(line)
     return "\n".join(out) + "\n"
 
@@ -145,11 +146,13 @@ def main():
     by_id = {}
     threads = {}
     api_lines = {}
+    hip_scopes = []
     for r in hip:
         kind = "HIP_COMPILER_API" if r["kind"] == 22 else "HIP_RUNTIME_API"
         name = names[kind][r["operation"]]
         args = {a["name"]: value(a) for a in r.get("args", [])}
         by_id[r["correlation_id"]["internal"]] = (name, {a["name"]: a["value"] for a in r.get("args", [])})
+        hip_scopes.append((name, r["correlation_id"]["ancestor"]))
         t = threads.setdefault(r["thread_id"], len(threads) + 1)
         api_lines.setdefault(t, []).append("%s(%s)" % (name, ", ".join("%s=%s" % kv for kv in args.items())))
     for t in sorted(api_lines):
@@ -191,8 +194,22 @@ def main():
 
     out.append("[markers]")
     messages = {m["key"]: m["value"] for m in tool["strings"].get("marker_api", [])}
+
+    def inside(ancestor):
+        return " in %r" % messages[ancestor] if ancestor in messages else ""
+
     for r in sorted(buf["marker_api"], key=lambda r: r["correlation_id"]["internal"]):
-        out.append("%s %r" % (names["MARKER_CORE_RANGE_API"][r["operation"]], messages.get(r["correlation_id"]["internal"], "")))
+        c = r["correlation_id"]
+        kind = MARKER_KINDS.get(r["kind"], "MARKER_CORE_RANGE_API")
+        text = names[kind][r["operation"]]
+        if kind == "MARKER_CORE_RANGE_API":   # the ranges and marks, which have their messages
+            text += " %r" % messages.get(c["internal"], "")
+        out.append(text + inside(c["ancestor"]))
+
+    scoped = ["%s%s" % (api, inside(a)) for api, a in hip_scopes if a in messages]
+    if scoped:
+        out.append("[marker scopes]")
+        out += scoped
 
     print("\n".join(out))
 

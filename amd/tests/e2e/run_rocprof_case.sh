@@ -22,6 +22,7 @@
 #   graph           a captured stream, instantiated and launched twice
 #   async_alloc     hipMallocAsync / hipFreeAsync around a copy and a kernel
 #   markers         ROCTx marks and ranges
+#   markers_control ROCTx profiler pause and resume, a named stream, nested ranges, marks from another thread
 #   geometry        3D grid, static plus dynamic LDS, scratch
 #
 # The simulator has no timing model, so nothing in the comparison is a time.
@@ -34,7 +35,7 @@
 # ROCPROF_CARD_DEVICE picks the HIP device (default 0 for rx6800, 1 for rx6700xt).
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
-usage="usage: $0 <vecadd|memset_d2d|copies|streams_events|graph|async_alloc|markers|geometry> [--gpu rx6800|rx6700xt] [--card [--update]]"
+usage="usage: $0 <vecadd|memset_d2d|copies|streams_events|graph|async_alloc|markers|markers_control|geometry> [--gpu rx6800|rx6700xt] [--card [--update]]"
 case_name="${1:?$usage}"
 shift
 gpu=rx6800; card=0; update=0
@@ -80,9 +81,9 @@ export ROCM_PATH="$rocm"
 
 # The cases are built for gfx1030, the RX 6800; the RX 6700 XT (gfx1031) runs
 # the same code object (HSA_OVERRIDE_GFX_VERSION=10.3.0 on the card).
-libs=""; [[ "$case_name" == markers ]] && libs="-lrocprofiler-sdk-roctx"
+libs=""; [[ "$case_name" == markers* ]] && libs="-lrocprofiler-sdk-roctx"
 if ! "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1030 -w "$src" -o "$exe" $libs >"$work/build.log" 2>&1; then
-  if grep -q "rocprofiler-sdk-roctx" "$work/build.log" && [[ "$case_name" == markers ]] && grep -qE "cannot find|not found|No such file" "$work/build.log"; then
+  if grep -q "rocprofiler-sdk-roctx" "$work/build.log" && [[ "$case_name" == markers* ]] && grep -qE "cannot find|not found|No such file" "$work/build.log"; then
     echo "SKIP: this ROCm has no ROCTx (rocprofiler-sdk-roctx)"; exit 0
   fi
   cat "$work/build.log"; echo "FAIL: hipcc could not build the $case_name case"; exit 1

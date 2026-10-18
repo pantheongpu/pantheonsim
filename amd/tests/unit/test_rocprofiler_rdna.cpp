@@ -38,6 +38,7 @@ rocprofiler_status_t rocprofiler_configure_buffer_tracing_service(rocprofiler_co
                                                                   const rocprofiler_tracing_operation_t*, size_t,
                                                                   rocprofiler_buffer_id_t);
 rocprofiler_status_t rocprofiler_flush_buffer(rocprofiler_buffer_id_t);
+int rocprofiler_set_api_table(const char*, uint64_t, uint64_t, void**, uint64_t);
 rocprofiler_status_t rocprofiler_query_buffer_tracing_kind_operation_name(rocprofiler_buffer_tracing_kind_t,
                                                                           rocprofiler_tracing_operation_t,
                                                                           const char**, uint64_t*);
@@ -50,6 +51,14 @@ const std::string kData = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/";
 struct Call {
   std::string name;
   uint64_t id;
+  uint64_t ancestor = 0;
+};
+// A ROCTx callback-tracing record as the tool saw it.
+struct MarkerCallback {
+  int kind, operation, phase;
+  uint64_t id, ancestor;
+  std::string message;
+  const void* user;
 };
 struct Seen {
   std::vector<rocprofiler_agent_v0_t> agents;
@@ -62,6 +71,8 @@ struct Seen {
   std::vector<rocprofiler_buffer_tracing_memory_copy_record_t> copies;
   std::vector<rocprofiler_buffer_tracing_memory_allocation_record_t> allocations;
   std::vector<Call> calls;
+  std::vector<MarkerCallback> marker_callbacks;
+  std::vector<rocprofiler_buffer_tracing_marker_api_record_t> ranges;
   rocprofiler_buffer_id_t buffer{};
 };
 Seen& seen() {
@@ -93,9 +104,26 @@ void on_records(rocprofiler_context_id_t, rocprofiler_buffer_id_t, rocprofiler_r
       const char* name = nullptr;
       rocprofiler_query_buffer_tracing_kind_operation_name(ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT, r->operation,
                                                            &name, nullptr);
-      seen().calls.push_back({name ? name : "?", r->correlation_id.internal});
+      seen().calls.push_back({name ? name : "?", r->correlation_id.internal, r->correlation_id.ancestor});
     }
+    if (h->kind == ROCPROFILER_BUFFER_TRACING_MARKER_CORE_RANGE_API)
+      seen().ranges.push_back(*static_cast<rocprofiler_buffer_tracing_marker_api_record_t*>(h->payload));
   }
+}
+
+// What rocprofv3 does with ROCTx: the messages of marks and ranges come from the range callbacks, the pause and
+// resume calls from the control ones.
+void on_marker(rocprofiler_callback_tracing_record_t r, rocprofiler_user_data_t* user, void*) {
+  std::string message;
+  if (r.kind == ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_RANGE_API) {
+    auto* d = static_cast<rocprofiler_callback_tracing_marker_api_data_t*>(r.payload);
+    const char* m = r.operation == 0   ? d->args.roctxMarkA.message
+                    : r.operation == 1 ? d->args.roctxThreadRangeA.message
+                                       : d->args.roctxProcessRangeA.message;
+    message = m ? m : "";
+  }
+  seen().marker_callbacks.push_back({static_cast<int>(r.kind), r.operation, static_cast<int>(r.phase),
+                                     r.correlation_id.internal, r.correlation_id.ancestor, message, user});
 }
 
 int tool_init(rocprofiler_client_finalize_t, void*) {
@@ -117,7 +145,14 @@ int tool_init(rocprofiler_client_finalize_t, void*) {
   for (auto kind : {ROCPROFILER_BUFFER_TRACING_MEMORY_COPY, ROCPROFILER_BUFFER_TRACING_MEMORY_ALLOCATION,
                     ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API_EXT})
     rocprofiler_configure_buffer_tracing_service(tracing, kind, nullptr, 0, s.buffer);
-  for (auto c : {objects, tracing}) rocprofiler_start_context(c);
+  rocprofiler_context_id_t markers{};
+  rocprofiler_create_context(&markers);
+  for (auto kind : {ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_RANGE_API, ROCPROFILER_CALLBACK_TRACING_MARKER_CONTROL_API,
+                    ROCPROFILER_CALLBACK_TRACING_MARKER_NAME_API})
+    rocprofiler_configure_callback_tracing_service(markers, kind, nullptr, 0, on_marker, nullptr);
+  rocprofiler_configure_buffer_tracing_service(tracing, ROCPROFILER_BUFFER_TRACING_MARKER_CORE_RANGE_API, nullptr, 0,
+                                               s.buffer);
+  for (auto c : {objects, tracing, markers}) rocprofiler_start_context(c);
   return 0;
 }
 
@@ -126,6 +161,48 @@ rocprofiler_tool_configure_result_t* configure(uint32_t, const char*, uint32_t, 
   static rocprofiler_tool_configure_result_t result{sizeof(rocprofiler_tool_configure_result_t), tool_init, nullptr,
                                                     nullptr};
   return &result;
+}
+
+// ROCTx's side of it: the library's own functions, which a profiler wraps in the tables it is handed (the library
+// passes them to rocprofiler_set_api_table as it starts). These keep a nesting depth and number the ranges they
+// start from 100, to see what the wrappers pass through.
+int g_depth = 0;
+uint64_t g_range = 100;
+std::vector<std::string> g_roctx;
+roctxCoreApiTable_t g_core{sizeof(roctxCoreApiTable_t),
+                           [](const char*) { g_roctx.push_back("mark"); },
+                           [](const char*) { g_roctx.push_back("push"); return g_depth++; },
+                           []() { g_roctx.push_back("pop"); return --g_depth; },
+                           [](const char*) { g_roctx.push_back("start"); return ++g_range; },
+                           [](uint64_t) { g_roctx.push_back("stop"); },
+                           [](uint64_t* tid) { *tid = 7; return 0; }};
+roctxControlApiTable_t g_control{sizeof(roctxControlApiTable_t), [](uint64_t) { return 0; }, [](uint64_t) { return 0; }};
+roctxNameApiTable_t g_name{sizeof(roctxNameApiTable_t), [](const char*) { return 0; },
+                           [](const char*, const void*) { return 0; }, [](const char*, int) { return 0; },
+                           [](const char*, const void*) { return 0; }};
+int g_returned_push[2];
+uint64_t g_returned_start;
+
+// The sequence of rocprof/markers.cpp, with a HIP call here and there.
+void run_markers() {
+  void* tables[3] = {&g_core, &g_control, &g_name};
+  VCHECK_EQ(rocprofiler_set_api_table("roctx", 0, 0, tables, 3), 0);
+  g_name.roctxNameOsThread_fn("main");
+  g_core.roctxMarkA_fn("start");
+  g_returned_push[0] = g_core.roctxRangePushA_fn("setup");
+  hipDeviceSynchronize();
+  g_core.roctxRangePop_fn();
+  g_returned_start = g_core.roctxRangeStartA_fn("compute");
+  g_returned_push[1] = g_core.roctxRangePushA_fn("launch");
+  int device = 0;
+  hipGetDevice(&device);
+  g_core.roctxRangePop_fn();
+  hipDeviceSynchronize();
+  g_core.roctxRangeStop_fn(g_returned_start);
+  hipGetDevice(&device);
+  g_core.roctxMarkA_fn("end");
+  g_control.roctxProfilerPause_fn(0);
+  g_control.roctxProfilerResume_fn(0);
 }
 
 // A card's memory traffic, once for every test to read: a module, then copies of 4 KiB, 16 KiB, 16 KiB and 4
@@ -150,6 +227,7 @@ void run_once() {
   VCHECK_EQ(hipHostFree(pinned), hipSuccess);
   VCHECK_EQ(hipFree(a), hipSuccess);
   VCHECK_EQ(hipFree(b), hipSuccess);
+  run_markers();
   rocprofiler_flush_buffer(seen().buffer);
 }
 
@@ -253,6 +331,93 @@ VTEST(the_compiler_api_has_its_operations) {
                                                                  nullptr),
             ROCPROFILER_STATUS_SUCCESS);
   VCHECK_EQ(std::string(name), std::string("__hipPopCallConfiguration"));
+}
+
+VTEST(roctx_marks_and_ranges_are_records_with_the_range_they_were_made_in) {
+  run_once();
+  const Seen& s = seen();
+  // The wrappers pass through to ROCTx: its return values come back, and each function ran once.
+  VCHECK_EQ(g_returned_push[0], 0);
+  VCHECK_EQ(g_returned_push[1], 0);
+  VCHECK_EQ(g_returned_start, uint64_t{101});
+  VCHECK_EQ(g_roctx.size(), size_t{8});
+
+  // The messages come from the callbacks, by correlation id, as rocprofv3 reads them.
+  std::map<uint64_t, std::string> message;
+  for (const MarkerCallback& c : s.marker_callbacks)
+    if (c.kind == ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_RANGE_API && !c.message.empty()) message[c.id] = c.message;
+  VCHECK_EQ(message.size(), size_t{5});
+
+  // The buffer records: marks at once, a range when it ends, each with the operation of its kind.
+  std::vector<std::string> got;
+  std::map<std::string, uint64_t> id_of;
+  for (const auto& r : s.ranges) {
+    const char* name = nullptr;
+    VCHECK_EQ(rocprofiler_query_buffer_tracing_kind_operation_name(ROCPROFILER_BUFFER_TRACING_MARKER_CORE_RANGE_API,
+                                                                   r.operation, &name, nullptr),
+              ROCPROFILER_STATUS_SUCCESS);
+    const std::string m = message[r.correlation_id.internal];
+    id_of[m] = r.correlation_id.internal;
+    got.push_back(std::string(name) + " " + m + " in " +
+                  (r.correlation_id.ancestor ? message[r.correlation_id.ancestor] : std::string("-")));
+  }
+  const std::vector<std::string> want = {"roctxMarkA start in -", "roctxThreadRangeA setup in -",
+                                         "roctxThreadRangeA launch in compute", "roctxProcessRangeA compute in -",
+                                         "roctxMarkA end in -"};
+  VCHECK(got == want);
+
+  // A range is entered where it begins and exited where it ends, with the same user data; a mark does both at once.
+  std::map<uint64_t, std::vector<const MarkerCallback*>> by_id;
+  for (const MarkerCallback& c : s.marker_callbacks)
+    if (c.kind == ROCPROFILER_CALLBACK_TRACING_MARKER_CORE_RANGE_API) by_id[c.id].push_back(&c);
+  VCHECK_EQ(by_id.size(), size_t{5});
+  for (const auto& entry : by_id) {
+    const uint64_t id = entry.first;
+    const auto& calls = entry.second;
+    VCHECK_EQ(calls.size(), size_t{2});
+    VCHECK_EQ(calls[0]->phase, static_cast<int>(ROCPROFILER_CALLBACK_PHASE_ENTER));
+    VCHECK_EQ(calls[1]->phase, static_cast<int>(ROCPROFILER_CALLBACK_PHASE_EXIT));
+    VCHECK(calls[0]->user == calls[1]->user);
+    VCHECK_EQ(calls[1]->message, message[id]);
+  }
+
+  // The names and the profiler control are traced as calls, enter and exit.
+  int names = 0, controls = 0;
+  for (const MarkerCallback& c : s.marker_callbacks) {
+    names += c.kind == ROCPROFILER_CALLBACK_TRACING_MARKER_NAME_API;
+    controls += c.kind == ROCPROFILER_CALLBACK_TRACING_MARKER_CONTROL_API;
+  }
+  VCHECK_EQ(names, 2);
+  VCHECK_EQ(controls, 4);
+
+  // The HIP calls made inside a range have it as their ancestor, the innermost open one, a range started by id
+  // included until it is stopped.
+  std::vector<std::pair<std::string, uint64_t>> hip;
+  for (const Call& c : s.calls)
+    if (c.name == "hipDeviceSynchronize" || c.name == "hipGetDevice") hip.push_back({c.name, c.ancestor});
+  VCHECK_EQ(hip.size(), size_t{4});
+  VCHECK_EQ(hip[0].second, id_of["setup"]);
+  VCHECK_EQ(hip[1].second, id_of["launch"]);
+  VCHECK_EQ(hip[2].second, id_of["compute"]);
+  VCHECK_EQ(hip[3].second, uint64_t{0});
+}
+
+VTEST(roctx_operations_have_their_names) {
+  const char* name = nullptr;
+  const struct {
+    rocprofiler_buffer_tracing_kind_t kind;
+    int op;
+    const char* want;
+  } names[] = {{ROCPROFILER_BUFFER_TRACING_MARKER_CORE_API, 0, "roctxMarkA"},
+               {ROCPROFILER_BUFFER_TRACING_MARKER_CORE_API, 4, "roctxRangeStop"},
+               {ROCPROFILER_BUFFER_TRACING_MARKER_CONTROL_API, 1, "roctxProfilerResume"},
+               {ROCPROFILER_BUFFER_TRACING_MARKER_NAME_API, 3, "roctxNameHipStream"},
+               {ROCPROFILER_BUFFER_TRACING_MARKER_CORE_RANGE_API, 2, "roctxProcessRangeA"}};
+  for (const auto& n : names) {
+    VCHECK_EQ(rocprofiler_query_buffer_tracing_kind_operation_name(n.kind, n.op, &name, nullptr),
+              ROCPROFILER_STATUS_SUCCESS);
+    VCHECK_EQ(std::string(name), std::string(n.want));
+  }
 }
 
 VTEST_MAIN

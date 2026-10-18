@@ -41,6 +41,7 @@ compute units); all eight cases were recorded on both and the simulator matches 
 | `graph` | a stream captured into a graph (copy, kernel, copy), instantiated and launched twice |
 | `async_alloc` | `hipMallocAsync`, copies and a kernel on the block, `hipFreeAsync` |
 | `markers` | ROCTx marks, a nested pair of ranges and a range started and stopped by id |
+| `markers_control` | `roctxProfilerPause` and `roctxProfilerResume` around HIP calls, a named stream, nested ranges, marks and a range from a second thread |
 | `geometry` | a 3D grid, static plus dynamic LDS (2048 + 512 bytes), and a private segment (1040 bytes) |
 
 What a normalised trace holds, in the order the profiler numbered the calls:
@@ -55,7 +56,8 @@ What a normalised trace holds, in the order the profiler numbered the calls:
 - `[copies]`: memory-copy records: direction, bytes, the kind of agent at each end.
 - `[allocations]`: the allocations the program asked for (the record of the requested size under
   `hipMalloc`, `hipHostMalloc`, ...) and the frees under `hipFree` and its relatives.
-- `[markers]`: ROCTx marks and ranges with their messages.
+- `[markers]`: ROCTx marks and ranges with their messages, each with the range it was made in.
+- `[marker scopes]` (only when there is one): the HIP calls made inside a ROCTx range, with the range.
 
 ### Running it
 
@@ -80,10 +82,10 @@ counts, which copies are copy records, and the allocation records' ids, and they
 On a machine with the card, ROCm 7.2 (`hipcc`, `rocprofv3`) and nothing else on the card:
 
 ```
-for c in vecadd memset_d2d copies streams_events graph async_alloc markers geometry; do
+for c in vecadd memset_d2d copies streams_events graph async_alloc markers markers_control geometry; do
   amd/tests/e2e/run_rocprof_case.sh $c --card --update          # the RX 6800 (HIP device 0)
 done
-for c in vecadd memset_d2d copies streams_events graph async_alloc markers geometry; do
+for c in vecadd memset_d2d copies streams_events graph async_alloc markers markers_control geometry; do
   amd/tests/e2e/run_rocprof_case.sh $c --card --update --gpu rx6700xt   # the RX 6700 XT (HIP device 1)
 done
 ```
@@ -124,6 +126,20 @@ All of these were found by the comparison; each is covered by an `.expected` fil
   `__hipRegisterManagedVar`, `__hipPushCallConfiguration`, `__hipPopCallConfiguration`,
   `__hipUnregisterFatBinary`) is recorded, with its operation names, as `--hip-trace` records it.
 
+- **ROCTx** (`roctxMarkA`, `roctxRangePushA`/`Pop`, `roctxRangeStartA`/`Stop`, the profiler control and the
+  names): `rocprofiler_set_api_table` wraps the entries of ROCTx's core, control and name tables, as
+  rocprofiler-sdk does. A call a context subscribed to is delivered as `MARKER_CORE_API` /
+  `MARKER_CONTROL_API` / `MARKER_NAME_API` callbacks (enter, then exit, arguments and return value in the
+  payload) and buffer records. What rocprofv3 asks for is `MARKER_CORE_RANGE_API` callbacks: a mark is an
+  enter and an exit at once, a range an enter where it begins and an exit where it ends, with the message in
+  both and the same user data (rocprofv3 reads the messages from them, and writes the `marker_api` records
+  itself); the buffer kind has records too, written when a range ends. The correlation id of a range is the id
+  of the call that began it, and **a call made while a range is open has that range as its ancestor**
+  (`correlation_id.ancestor`), on the card as here: a HIP call, a mark, a range begun inside it, the innermost
+  first, a range begun with `roctxRangeStartA` until it is stopped. HIP records carry that ancestor now too,
+  and the normalised trace shows it: ` in 'compute'` after a mark or range, and a `[marker scopes]` section
+  for the HIP calls.
+
 ## Known differences
 
 The comparison leaves these out, on both sides, with `rocprof_normalize.py --strip-known-gaps`
@@ -133,7 +149,6 @@ then on. `--card` compares everything.
 | what | the card | the simulator | where |
 | --- | --- | --- | --- |
 | **Arguments of HIP calls** | every record has its arguments: `hipMalloc(ptr, size=4096)`, `hipMemcpy(dst, src, sizeBytes, kind=HostToDevice)`, `hipLaunchKernel(function_address, numBlocks={z=1, y=1, x=4}, ...)` | `args` is empty. `rocprofiler_iterate_buffer_tracing_record_args` and `rocprofiler_iterate_callback_tracing_kind_operation_args` return NOT_AVAILABLE / NOT_IMPLEMENTED, and the hook libamdhip64 calls (`api_enter(name)`) carries the name only | `rocprofiler_sdk.cpp` near the end; `ApiCall` in `hip_api.cpp`. Closing it needs every HIP entry point to hand over its arguments and a table of their types and names |
-| **ROCTx markers** | `roctxMarkA`, `roctxRangePushA`/`Pop` (`roctxThreadRangeA` records) and `roctxRangeStartA`/`Stop` (`roctxProcessRangeA`), with their messages | none: `rocprofiler_set_api_table` accepts ROCTx's table and wraps nothing | `rocprofiler_set_api_table` in `rocprofiler_sdk.cpp` |
 | **HSA API trace** | 340 to 1100 HSA calls for these programs (queue, signal and memory-pool setup of ROCm's runtime) | none: the HIP runtime reaches the simulated devices directly | by design (the header of `rocprofiler_sdk.cpp`) |
 | **The runtime's own kernels** | `__amd_rocclr_copyBuffer` for small and device-to-device copies, `__amd_rocclr_fillBufferAligned` for fills, as dispatches | none | `rocprof_normalize.py --runtime-kernels` shows them in a card's trace |
 | **Scratch records** | a `SCRATCH_MEMORY_ALLOC` for a kernel with a private segment, sized as the runtime's pool (64880640 bytes in `geometry`) | none | not compared |
