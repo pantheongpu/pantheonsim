@@ -58,11 +58,10 @@ FREERS = {"hipFree", "hipHostFree", "hipFreeAsync", "hipFreeHost", "hipMemFreeHo
 
 
 # What the simulator does not record yet, as it appears in a normalised trace.
-#   hip-arguments    the arguments of a HIP call: the simulator's records name the call only
 #   hip-compiler-api the __hip* calls a hipcc-built program makes (fat binary and function
 #                    registration, the launch configuration push and pop)
 #   markers          ROCTx marks and ranges
-KNOWN_GAPS = ("hip-arguments", "markers")
+KNOWN_GAPS = ("markers",)
 
 
 def strip_known_gaps(text):
@@ -74,8 +73,6 @@ def strip_known_gaps(text):
         elif section.startswith("[hip api"):
             if "hip-compiler-api" in KNOWN_GAPS and line.startswith("__hip"):
                 continue
-            if "hip-arguments" in KNOWN_GAPS:
-                line = re.sub(r"\(.*\)$", "()", line)
         elif section == "[markers]" and "markers" in KNOWN_GAPS:
             continue
         out.append(line)
@@ -182,8 +179,7 @@ def main():
         api, args = owner
         if op == "MEMORY_ALLOCATION_ALLOCATE":
             want = ALLOCATORS.get(api)
-            # A call whose arguments are not recorded (the simulator's) cannot be checked for its size.
-            if want and (not args or args.get(want) == str(r["allocation_size"])):
+            if want and args.get(want) == str(r["allocation_size"]):
                 out.append("%s %s bytes=%d on=%s" % (api, op, r["allocation_size"], agent_type.get(r["agent_id"]["handle"], "?")))
         elif op == "MEMORY_ALLOCATION_FREE":
             if api in FREERS and int(r["address"], 16) != 0:
