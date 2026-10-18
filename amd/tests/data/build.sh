@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 clang=${1:-clang}
-sources="vector_add ops math memory globals grid bytes int64 atomics mixed half calls builtins packed spill crosslane doubles narrow lds idioms counters"
+sources="vector_add ops math memory globals grid bytes int64 atomics mixed half calls builtins packed spill crosslane doubles narrow lds idioms counters memruns"
 for src in $sources; do
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx942 -nogpulib -O2 -c "$src.c" -o "$src.gfx942.o"
   echo "wrote $(pwd)/$src.gfx942.o"
@@ -20,7 +20,7 @@ done
 # and RDNA2, wave32), which the same tests run with VGPU_TEST_TARGET. builtins, crosslane, idioms and counters
 # use CDNA's own instructions (s_memtime, row broadcasts, sdot4, MFMA) and are
 # not built for it.
-for src in vector_add ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds; do
+for src in vector_add ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds memruns; do
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1100 -nogpulib -O2 -c "$src.c" -o "$src.gfx1100.o"
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1201 -nogpulib -O2 -c "$src.c" -o "$src.gfx1201.o"
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1030 -nogpulib -O2 -c "$src.c" -o "$src.gfx1030.o"
@@ -29,7 +29,7 @@ done
 
 # And for gfx1250 (CDNA 5, MI455X; wave32), with a clang that knows it (ROCm 7.2's). Built by compiler, run by
 # the simulator: no card has checked what these kernels do on it.
-for src in vector_add ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds; do
+for src in vector_add ops math memory globals grid bytes int64 atomics mixed half calls packed spill doubles narrow lds memruns; do
   "$clang" -x c -target amdgcn-amd-amdhsa -mcpu=gfx1250 -nogpulib -O2 -c "$src.c" -o "$src.gfx1250.o"
   echo "wrote $(pwd)/$src.gfx1250.o"
 done

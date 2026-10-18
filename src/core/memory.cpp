@@ -1538,6 +1538,48 @@ bool MemoryManager::rmw_scalar_fn(uint64_t addr, uint32_t size, RmwFn compute, v
   return true;
 }
 
+bool MemoryManager::atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out,
+                                  bool always_store) {
+  if (size != 4 && size != 8) return false;
+  RmwSlot s;
+  if (!rmw_locate(addr, size, &s)) return false;
+  for (;;) {
+    if (s.chunk && !is_uniform(s.chunk)) {
+      uint8_t* p = s.chunk + s.coff;
+      if (size == 4) {
+        uint32_t* w = reinterpret_cast<uint32_t*>(p);
+        uint32_t old = __atomic_load_n(w, __ATOMIC_RELAXED);
+        for (;;) {
+          const uint32_t now = static_cast<uint32_t>(compute(ctx, old));
+          if (now == old) break;   // nothing to change: the load was the whole operation
+          if (__atomic_compare_exchange_n(w, &old, now, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break;
+        }
+        *old_out = old;
+      } else {
+        uint64_t* w = reinterpret_cast<uint64_t*>(p);
+        uint64_t old = __atomic_load_n(w, __ATOMIC_RELAXED);
+        for (;;) {
+          const uint64_t now = compute(ctx, old);
+          if (now == old) break;
+          if (__atomic_compare_exchange_n(w, &old, now, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break;
+        }
+        *old_out = old;
+      }
+      return true;
+    }
+    // Nothing real to swap on: what the chunk reads as, and whether the result would change it.
+    const uint64_t old = rmw_load(s, size);
+    const uint64_t now = compute(ctx, old);
+    const bool uniform = s.chunk != nullptr;
+    if (uniform ? now == old : (now == old && !always_store)) {
+      *old_out = old;
+      return true;
+    }
+    // The store makes the chunk real; the swap then runs on it, from whatever it holds by then.
+    s.chunk = materialize(*s.a, s.chunk_idx);
+  }
+}
+
 uint64_t MemoryManager::rmw_load(const RmwSlot& s, uint32_t size) const {
   if (!s.chunk) return 0;
   if (is_uniform(s.chunk)) return repeated(uniform_byte(s.chunk), size);
