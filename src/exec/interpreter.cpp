@@ -9343,8 +9343,44 @@ class Interpreter {
   // column 2t + i % 2. The m8n8kK shapes are the same with one register of
   // A and B and two elements of C. m8n8k4 f16 (Volta's) is four products at
   // once and has its own layouts.
+  // The dense f16, bf16 and tf32 forms of m16n8k8 / m16n8k16 / m16n8k4 (f32 or f16 accumulator, C and D alike) through the SIMD kernel the SASS
+  // engine's HMMA uses (vgpu/simd/simd.hpp: hmma): the fragments are read register by register exactly as the general form below reads them,
+  // gathered into the kernel's contiguous layout, and D is written the same way (alu_fault, write_reg). The kernel gives the general form's
+  // bits (tests/unit/test_simd.cpp, and test_mma_fast.cpp for this path against VGPU_FASTPATH=0). Returns false for any other form.
+  bool exec_mma_simd(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
+    if (!fast_enabled_ || W_ != 32 || !simd::enabled() || op.sparse || op.block_scale || op.m != 16 || op.acc_int || op.acc_f64 ||
+        op.b_type != op.ab_type || op.c_f16 != op.acc_f16)
+      return false;
+    const uint32_t kind = op.ab_type == MmaElem::F16 ? 0u : op.ab_type == MmaElem::BF16 ? 1u : op.ab_type == MmaElem::TF32 ? 2u : 3u;
+    if (kind == 3u) return false;
+    const uint32_t K = op.k, per_reg = kind == 2u ? 1u : 2u;
+    if (K == 0 || K > 16 || K % (4 * per_reg) != 0) return false;
+    const uint32_t a_regs = 16 * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = op.acc_f16 ? 2u : 4u;
+    if (op.a.size() != a_regs || op.b.size() != b_regs || op.c.size() != c_regs || op.d.size() != c_regs) return false;
+    alignas(32) uint32_t fa[4 * 32], fb[2 * 32], fc[4 * 32], out[4 * 32];
+    const auto gather = [&](const Reg& r, uint32_t* dst) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{r}}, _s);
+      for (uint32_t lane = 0; lane < 32; ++lane) dst[lane] = static_cast<uint32_t>(v[lane]);
+    };
+    for (uint32_t r = 0; r < a_regs; ++r) gather(op.a[r], fa + r * 32);
+    for (uint32_t r = 0; r < b_regs; ++r) gather(op.b[r], fb + r * 32);
+    for (uint32_t r = 0; r < c_regs; ++r) gather(op.c[r], fc + r * 32);
+    // (An sm_86 device sums as an RTX 3060's tensor core does: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
+    simd::kernels().hmma(kind | (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) ? 16u : 0u), K, op.acc_f16, fa, fb, fc, out);
+    for (uint32_t reg = 0; reg < c_regs; ++reg) {
+      Lanes r;
+      for (uint32_t lane = 0; lane < 32; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = out[reg * 32 + lane];
+      alu_fault(r, m, 32);
+      write_reg(w, op.d[reg], m, r, 32);
+    }
+    return true;
+  }
+
   void exec_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
     if (op.m == 8 && op.ab_type == MmaElem::F16) return exec_mma_m8n8k4(w, ctx, ins, op, m);
+    if (exec_mma_simd(w, ctx, ins, op, m)) return;
     constexpr uint32_t kN = 8;
     const uint32_t M = op.m, K = op.k;
     const uint32_t bits = mma_bits(op.ab_type);

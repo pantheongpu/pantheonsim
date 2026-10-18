@@ -1284,6 +1284,8 @@ vgpu_unit_test(test_simd)
 vgpu_unit_test(test_tc_ampere)
 # The vector kernels of that sum against a frozen copy of the earlier form, bit for bit, over random and adversarial operands.
 vgpu_unit_test(test_tc_ampere_fast)
+# The PTX engine's SIMD route for mma.sync against its general path (VGPU_FASTPATH=0), bit for bit.
+vgpu_unit_test(test_mma_fast)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
