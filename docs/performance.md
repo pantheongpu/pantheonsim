@@ -1700,9 +1700,8 @@ before `window_check.hpp` was made a header, which moves no code; `VGPU_COUNTERS
   at once (`load_batch` / `store_batch`: each distinct address looked up and stored once), so `MemoryManager::rmw_scalar` would only replace
   the loop that serves the general path (`VGPU_FASTPATH=0`), vector forms, shared/local and the faulting cases. The SASS `atomics` workload
   is not in that loop (B/A 0.997x with the PTX change in the build, p 0.67).
-* *Local memory layout.* `base64e` spends about a third of its time in the local-memory fast path, where lane `l`'s byte `o` is at
-  `local[l * local_size + o]`, so a warp-wide access touches 32 cache lines; interleaving by words, as the hardware does, would touch one. Every
-  user of `Warp::local` would change; not done.
+* *Local memory layout.* Done for the PTX interpreter, not for the SASS executor; see "Local memory layout and the PTX `local`
+  regression" below (the SASS executor's interleaved layout was neutral on `local` and `base64e` and its whole-warp row copies cost 6% on `local`).
 * *Bank passes of warps that are not on a stride* (a tile read two rows at a time, a reduction's every-eighth lane) and sector counts
   for 33 to 64 active lanes that are neither on a stride nor monotone still take the earlier code. Measured again on server2 (counting the
   calls of `sass_bank_passes` that fall through `bank_passes_progression` to the table; `VGPU_THREADS=1`): `blockScan 64 1` 22.1 M calls,
@@ -2107,7 +2106,7 @@ texture 1.12x, local 1.92x, divergent 1.94x, warp 3.38x, launch 1.21x; api 0.99x
 PTX engine (VGPU_SASS=0 and PTX-only modules): atomics 1.38x, texture 1.06x, mem 1.01x (same), shared 0.99x (same), **local 0.93x
 (slower, p < 0.001)**. The PTX `local` regression comes with the memory-lookup change (`rmw_scalar`, `load_fields`); the branch that made
 it measured 3% on a loaded machine and attributed it to code layout, but on a quiet one it is 7%. It is kept because the SASS engine is the
-default on every NVIDIA GPU and PTX atomics gain 38%; a later change should look at the PTX local-memory path.
+default on every NVIDIA GPU and PTX atomics gain 38%; the PTX local-memory path is the next section's subject (the cause, and a rewrite of the PTX local array that more than makes it up).
 
 Dropped after measurement: the two-entry code hint and the bank-pass rewrite (see "Not done, and negative results"). On the AMD side the
 harness (tools/bench-amd) counts a Radeon card's instructions with SQ_WAVE32_INSTS + SQ_WAVE64_INSTS, the counters a simulated RX 6800
@@ -2219,3 +2218,114 @@ scratch copy of tier_ops.inc, `e2e_sass_tier` on sm_86, each one caught by `sass
 ignored, MATCH.ALL's result written to all lanes; IMMA's A and B signedness exchanged, IMMA.SAT's clamp removed, the clamp interval doubled,
 the accumulator dropped under `.SAT`; LDSM's transposed column index changed, `shared_loads` counted 31 for 32 lanes, the two halves of a
 transposed word exchanged.
+## Local memory layout and the PTX `local` regression (branch `speedup2-localmem`)
+
+Measured on server2 (Ryzen 9 9950X, shared with other jobs: load 6 to 35 during the runs, so every row is an alternating A/B of 31 runs
+(`bench.sh --ab`, 15 for the HeCBench program) on CPUs 22-23 whose SMT siblings were idle (checked with `mpstat` before each batch), one host
+thread, `nvidia/rtx3060`, CUDA 13.0.88, Release with LTO, GCC 13.3). Builds: `base` = `8f9eb524`, `head` = `speedup` at `a12f8d84`,
+`new` = this branch. Counters are identical in every row (the `counters` column of `bench.sh --ab`, and `VGPU_COUNTERS=1` output of the
+HeCBench program diffed on both engines).
+
+### Where the PTX `local` regression came from: code placement
+
+The 7% (3% on a loaded machine) that arrived with `26e5d708` (`rmw_scalar`, `load_fields`) is not in any instruction the `local` workload runs:
+
+* `libcudart.so` built at `c8ace690` (before) and at `8f9eb524` are byte-identical (`cmp`); an A/B of the two nevertheless read 0.967x median
+  (best 1.005x, p < 0.001) once and 0.999x the next time. The harness's p-value does not see drift that is shared by the runs of one
+  batch: a single batch on this machine is good for about +-3%, and the 7% of the Tier 1 text was one such batch. Alternating A/B of `base`
+  and `post` (`26e5d708`), 41 runs each: post/base 0.895x (a noisy batch), 0.966x, 0.988x, and with A and B swapped base/post 1.030x, 1.030x, 1.028x: `post` is about 3% slower.
+* The hot functions of the PTX `local` run, `exec_ld`, `exec_st`, `run_warp_until_yield`, `fast_int_bin` and `check_local`, are
+  instruction for instruction the same in the two builds: `objdump -d` with addresses and call targets masked, 1885, 1557, 2249, 114 and
+  127 lines, 0 lines differ. Their sizes are equal. They sit 0x660 bytes later (32 bytes modulo the 64-byte cache line:
+  `exec_ld` 0x27c1c0 -> 0x27c820), because the texel and atomic code before them in the one LTO image grew.
+* Putting 64-byte alignment on those three functions (`__attribute__((aligned(64)))`) took `post` from 0.97x to 0.987x, 0.986x, 0.990x of
+  the base on `local`. On the tree of this branch the same pins gave `local` 1.014x, 1.007x but `shared` 0.957x and `mem` 0.981x: a
+  different placement is faster for one workload and slower for another, so the pins are not kept. `-falign-functions=64` on all of
+  `interpreter.cpp` (and, in a separate build, on all of `sass/exec.cpp`: SASS `shared` 0.93x, `local` 0.965x) was no better.
+* The same holds the other way round: a build that changes only `interpreter.cpp` (this branch without its SASS edits; the SASS source is
+  `head`'s) moves the SASS engine's `shared` to 0.93x and 0.935x of `head`, and the final tree's SASS `local` / `shared` read 0.964x /
+  0.967x of `head` with no SASS source change at all (below). Any edit to the interpreter moves the placement of everything after it.
+
+So there is no code to fix in `rmw_scalar` or `load_fields`, and nothing that a source change can promise to keep: the PTX `local` loss is a
+property of where the linker happened to put code. What this branch does instead is make the PTX local-memory path itself cheaper, which
+moves the workload far past the old 3%.
+
+### The PTX local array, interleaved by words (`include/vgpu/exec/local_layout.hpp`)
+
+`Warp::local` of the PTX interpreter was `std::vector<std::vector<uint8_t>>`: a vector per lane, each grown to the current frame on
+its own, and every access went `lane_local(w, lane)` (an emptiness test, a `local_top()`, a size test) then a pointer chase to the lane's
+heap block. It is now one array, `local_array(w)` (one size test per warp access, not per lane), laid out as the hardware does: byte `o`
+of lane `l` at `(o / 4) * 128 + l * 4 + o % 4`. A warp-wide 4-byte access at one offset is 128 contiguous bytes. Growing the array for a
+callee's frame is appending zero words (rows already there stay where they are). Every user of `Warp::local` in the PTX interpreter
+goes through `exec::local_load` / `local_store` (fast paths: `exec_ld`, `exec_st`) or `load_routed` / `store_routed` (the general path);
+the checks (`check_local`, the frame bounds, the alloca stack, which has its own per-lane buffers) and every message are unchanged, so
+faults, out-of-range texts with offsets and counters are the same. Nothing else reads the array: no debugger, checkpoint or inspection
+code touches `Warp::local`.
+
+PTX engine, B/A of the medians (> 1: new is faster), p from the harness's Mann-Whitney test:
+
+| workload | new / base (8f9eb524) | p | new / head (a12f8d84) | p |
+| --- | ---: | ---: | ---: | ---: |
+| local | **1.094x** | <0.001 | **1.141x** (best 1.098x) | <0.001 |
+| shared | 1.004x (same) | 0.12 | 1.049x (best 1.005x, same) | 0.004 |
+| mem | 1.007x (same) | 0.19 | 0.983x (same) | 0.89 |
+| atomics | 1.375x | <0.001 | 0.983x (same) | 0.12 |
+| texture | 1.119x | <0.001 | 1.041x (same) | 0.16 |
+| divergent | 0.992x (same) | 0.57 | 1.011x (same) | 0.25 |
+| HeCBench `base64e` (reduced: 1,572,864 elements, 4 cycles) | | | **1.198x** (best 1.204x) | <0.001 |
+
+PTX `local` is back above the base (1.094x, with the atomics gain of 1.375x intact), and `base64e` is 1.20x. Other batches of the same comparison read `local` 1.09x to 1.11x of the base (three batches) and 1.11x to 1.18x of head (six), and
+`base64e` 1.198x to 1.217x (five).
+
+Why it wins: not cache lines. The warp's 8 KB of touched local memory is L1-resident in either layout; what was removed is the per-lane
+indirection and the per-lane `lane_local` bookkeeping.
+
+### Not done: the same layout in the SASS executor
+
+The SASS executor (`Warp::local` in `src/sass/exec.cpp`, the loop in `exec_mem`, the tier's `h_local`, `mem_read` / `mem_write`) was
+converted in a scratch build too, with the same helper, and with a second step on top: when all 32 lanes access one offset (a spilled
+register, a constant index) the access is a 128-byte `memcpy` between the array and the register file instead of 32 lane moves. It does
+not win, so it is not in this branch:
+
+| SASS, `head` vs scratch build | local | base64e |
+| --- | ---: | ---: |
+| interleaved array, lane loops only | 0.997x, 0.999x (same) | 0.991x (p 0.007, same) |
+| plus whole-warp row copies | 0.942x (p < 0.001, slower) | 1.001x, 1.028x, 1.045x (p 0.26, 0.03, 0.05) |
+
+`local` indexes by lane-dependent values, so no warp-wide row exists there and the branch and the larger handler (`h_local` 1.4 KB ->
+2.5 to 2.9 KB once each width has a row-copy and a lane-loop body) cost 6%; `base64e` stores its 65-byte table with 65 one-byte `STL`s at constant
+offsets, the case the row copy is for, and gains at most 4% (not significant on a quiet run). The doc's expectation that touching 32 cache lines
+was the cost did not hold: the working set fits in L1. The SASS executor keeps one frame per lane.
+
+### Tests
+
+* `tests/unit/test_locallayout.cpp` (`LocalLayout32Lanes`, `LocalLayoutOtherWarpWidths`): 60,000 random stores and loads per seed, of 1 to 16
+  bytes at every offset (also across words), in random lanes, against a plain array per lane (the old layout), the array grown four times
+  mid-run, then every byte read back and "a warp-wide word is contiguous" checked; 32, 64 and 8 lanes. Nine mutants of the header (a
+  wrong row stride, the lane term, the in-word offset of a store and a load of 1 byte, the high word of 8 bytes in store and load, a 2-byte
+  access at offset 3, the chunk length of the byte-wise copy, a 4-byte access at offset 1) are all caught (one by an abort).
+* `nvidia/tests/e2e/sass_vector_memory.cu` gains `k_alias`: local memory written at one width and read at others (bytes, halves, words
+  and pairs at lane-dependent places over a byte-filled array, and only some lanes), a callee handed a pointer into its caller's frame, and a
+  recursive function whose per-call arrays (indexed by the seed, so they stay in local memory) must survive the callee's frames; the host
+  runs the same body as the reference, so the layout is not in the oracle. `run_sass_vector_memory.sh` now also runs the SASS executor and
+  the PTX interpreter with `VGPU_FASTPATH=0`, which are the only runs that reach `Runner::mem_read` / `mem_write` and the PTX
+  `load_routed` / `store_routed` for local memory. The test passes on `head` too (it does not know the layout). A recursion that
+  grows the array under live data was missing from the tests before: the PTX interpreter logged 96 -> 144 -> 192 -> 240 -> 288 growths on it.
+* Mutation check of the PTX paths (each a one-line change, rebuilt and run through `run_sass_vector_memory.sh`): the fast load (a wrong
+  element offset), the fast store (the element offset dropped), the routed load (+1), the routed store (low byte cleared) and the growth
+  (the array replaced by a zero one) are each caught, by the `ptx` run (fast paths) or the `ptx-general` run (routed paths).
+  The mutants of the discarded SASS half (fourteen of them, rows and lane loops of `exec_mem` and the tier, `mem_read`, `mem_write`) were all
+  caught by their engines too.
+* Run: the new unit test, all 208 `test_*` tests, `e2e_sass_vector_memory`, `e2e_sass_fastpath` and the 61 tests whose names contain
+  sass, tier, ptx, fastpath, exec, fault, lockstep, local, vector, debug, diag, race, trap, assert, stack, call, device_functions,
+  memcount, memfast or window: all pass but `e2e_lockstep_blocks`, which times out on a loaded server2 on `head` and `post` as well
+  (passed and failed in alternate runs of the same build). `bench.sh --check-counters` is skipped on server2 (its nvcc builds other
+  device code than the recorded counters), so the counters were compared between builds instead: `bench.sh --ab` over every workload
+  and both engines (`counters identical`), and the HeCBench program's `VGPU_COUNTERS=1` output.
+
+### Reading these numbers
+
+The SASS rows of the same final tree against `head` (SASS source unchanged; interpreter edits only): local 0.964x, shared 0.967x, mem
+1.027x, atomics 0.992x, texture 0.988x, divergent 0.994x, int_alu 0.996x, `base64e` 1.019x. The first two are the placement effect
+described above (the same sources measured 0.998x and 0.93x in two builds that differed only in the PTX file). A merge that adds code
+elsewhere changes them again; judge SASS changes on the merged tree, with an A/A of two copies of the same build next to the A/B.

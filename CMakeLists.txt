@@ -1274,6 +1274,8 @@ vgpu_unit_test(test_sass_access_count)
 vgpu_unit_test(test_memfast)
 # The one-lookup read-modify-write and multi-field read, against the load_scalar / store_scalar calls they replace.
 vgpu_unit_test(test_memrmw)
+# The warp's local memory, interleaved by words, against the per-lane layout it replaced.
+vgpu_unit_test(test_locallayout)
 # The closed forms of the sector and bank-pass counters, against the definition of what they count.
 vgpu_unit_test(test_memcount_forms)
 # Module::code_at (a binary search over the code sections) against the scan it replaced.
