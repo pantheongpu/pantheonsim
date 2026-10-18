@@ -34,7 +34,9 @@ suffix=""; [[ "$gpu" == rx6700xt ]] && suffix=".rx6700xt"
 expected="$root/amd/tests/data/rocprof_counters${suffix}.expected"
 if (( update )) && (( ! card )); then echo "--update needs --card: the expected files come from a real card" >&2; exit 2; fi
 # What the simulated card offers: the checked set.
-names="SQ_WAVES SQ_WAVES_sum Wavefronts CU_NUM SIMD_NUM SE_NUM MAX_WAVE_SIZE
+names="SQ_WAVES SQ_WAVES_sum Wavefronts SQ_INSTS_VALU SQ_INSTS_SALU SQ_INSTS_SMEM SQ_INSTS_FLAT SQ_INSTS_LDS
+  SQ_INSTS_GDS TA_FLAT_LOAD_WAVEFRONTS TA_FLAT_LOAD_WAVEFRONTS_sum TA_FLAT_STORE_WAVEFRONTS TA_FLAT_STORE_WAVEFRONTS_sum
+  SQ_WAVE32_INSTS SQ_WAVE64_INSTS CU_NUM SIMD_NUM SE_NUM MAX_WAVE_SIZE
   num_xcc array_count num_gws simd_id_base max_waves_per_simd gfx_target_version cpu_core_id_base location_id wave_front_size
   lds_size_in_kb simd_count simd_per_cu mem_banks_count cpu_cores_count io_links_count domain max_engine_clk_fcompute
   caches_count simd_arrays_per_engine gds_size_in_kb cu_per_simd_array max_slots_scratch_cu vendor_id device_id
@@ -106,8 +108,8 @@ want=$(echo $names | tr ' ' '\n' | LC_ALL=C sort)
 sed -n '/^\[entries\]/,$p' "$expected" >"$work/card_entries.txt"
 diff -u --label "expected (card)" --label "the simulated $gpu" "$work/card_entries.txt" "$work/sim_entries.txt" || fail=1
 # 3. A counter that needs a model of time or of the caches is refused, as on a GPU that lacks it.
-out=$(sim "rocprofv3 --pmc SQ_INSTS_VALU --kernel-trace -d '$work/refused' -- '$work/vecadd'")
-grep -q 'Missing: \[SQ_INSTS_VALU\]' <<<"$out" || { echo "FAIL: SQ_INSTS_VALU should be refused, not collected or invented"; fail=1; }
+out=$(sim "rocprofv3 --pmc SQ_INSTS_WAVE32 --kernel-trace -d '$work/refused' -- '$work/vecadd'")
+grep -q 'Missing: \[SQ_INSTS_WAVE32\]' <<<"$out" || { echo "FAIL: SQ_INSTS_WAVE32 should be refused, not collected or invented"; fail=1; }
 # 4. SQ_WAVES, per dispatch, is the geometry's: 1024 work-items in groups of 256, wave32.
 out=$(sim "rocprofv3 --pmc SQ_WAVES --kernel-trace --output-format csv -d '$work/pmc' -- '$work/vecadd'")
 csv=$(find "$work/pmc" -name '*_counter_collection.csv' | head -1)
@@ -115,5 +117,19 @@ got=$([[ -n "$csv" ]] && python3 -I -c '
 import csv, sys
 print(" ".join(str(int(float(r["Counter_Value"]))) for r in csv.DictReader(open(sys.argv[1])) if r["Counter_Name"] == "SQ_WAVES"))' "$csv")
 [[ "$got" == "32" ]] || { echo "FAIL: SQ_WAVES of vecadd should be 32, got '${got}'"; echo "$out" | tail -5; fail=1; }
+# 5. The instruction counters are the interpreter's: vecadd is a wave32 kernel that loads twice and stores once per
+# wave, so wave64 waves issued nothing, the loads and stores are as many as the waves, and the units add up.
+out=$(sim "rocprofv3 --pmc SQ_INSTS_VALU SQ_INSTS_SALU SQ_INSTS_SMEM SQ_WAVE32_INSTS SQ_WAVE64_INSTS TA_FLAT_LOAD_WAVEFRONTS TA_FLAT_STORE_WAVEFRONTS --kernel-trace --output-format csv -d '$work/pmc2' -- '$work/vecadd'")
+csv=$(find "$work/pmc2" -name '*_counter_collection.csv' | head -1)
+verdict=$([[ -n "$csv" ]] && python3 -I -c '
+import csv, sys
+v = {}
+for r in csv.DictReader(open(sys.argv[1])):
+    v[r["Counter_Name"]] = v.get(r["Counter_Name"], 0) + int(float(r["Counter_Value"]))
+w32, w64 = v.get("SQ_WAVE32_INSTS", 0), v.get("SQ_WAVE64_INSTS", -1)
+ok = w64 == 0 and w32 > 0 and v["SQ_INSTS_VALU"] > 0 and v["SQ_INSTS_VALU"] + v["SQ_INSTS_SALU"] + v["SQ_INSTS_SMEM"] <= w32
+ok = ok and v["TA_FLAT_LOAD_WAVEFRONTS"] == 2 * v["TA_FLAT_STORE_WAVEFRONTS"] > 0
+print("ok" if ok else "bad %r" % v)' "$csv")
+[[ "$verdict" == ok ]] || { echo "FAIL: vecadd's instruction counters are not what its code says: ${verdict:-no csv}"; echo "$out" | tail -5; fail=1; }
 (( fail )) && exit 1
 echo "the simulated $gpu offers the card's counters it counts exactly, as the card prints them"

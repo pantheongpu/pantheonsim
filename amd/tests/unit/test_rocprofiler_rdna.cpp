@@ -317,7 +317,7 @@ VTEST(the_agent_has_the_fields_the_card_measured) {
 }
 
 // The counters the card offers that are counted exactly: waves, and the agent's own properties. The cycle, stall and
-// cache counters are not offered, nor are the instruction counts the card could not be compared on.
+// cache counters are not offered, nor are the card's wave32-instruction counters and averages.
 VTEST(only_the_counters_counted_exactly_are_offered) {
   run_once();
   const rocprofiler_agent_v0_t& g = seen().agents[1];
@@ -344,7 +344,11 @@ VTEST(only_the_counters_counted_exactly_are_offered) {
   VCHECK(!has("SQ_WAVES_EQ_64"));   // CDNA's: a wave32 card has no counter of 64-lane waves
   VCHECK(!has("SQ_INSTS_MFMA"));
   VCHECK(!has("GRBM_COUNT"));
-  VCHECK(!has("SQ_INSTS_VALU"));
+  for (const char* n : {"SQ_INSTS_VALU", "SQ_INSTS_SALU", "SQ_INSTS_SMEM", "SQ_INSTS_FLAT", "SQ_INSTS_LDS", "SQ_INSTS_GDS",
+                        "TA_FLAT_LOAD_WAVEFRONTS", "TA_FLAT_STORE_WAVEFRONTS_sum", "SQ_WAVE32_INSTS", "SQ_WAVE64_INSTS"})
+    VCHECK(has(n));
+  VCHECK(!has("SQ_INSTS_WAVE32"));   // a wave64 instruction counts "1 or 2" by what gets issued
+  VCHECK(!has("VALUInsts"));         // an average is a fraction
 }
 
 VTEST(a_code_object_is_named_by_a_uri_and_its_kernels_by_their_descriptors) {

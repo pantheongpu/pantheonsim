@@ -70,6 +70,8 @@ struct Counter {
   // A counter that is a property of the agent, not something a dispatch does (what rocprofiler-sdk calls a
   // constant): its value, whatever ran.
   uint64_t (*constant)(const rocprofiler_agent_v0_t&) = nullptr;
+  // A counter of the instructions waves of one size issued: the other size's waves add nothing (0 for any).
+  uint32_t wave_only = 0;
 };
 
 #define AGENT_CONSTANT(field) \
@@ -213,6 +215,21 @@ const Counter kCounters[] = {
     {"TA_FLAT_ATOMIC_WAVEFRONTS_sum", "", "reduce(TA_FLAT_ATOMIC_WAVEFRONTS,sum)",
      [](const DispatchStats& s) { return s.counts.flat_atomic; },
      "Number of flat opcode atomics processed by the TA. Sum over TA instances."},
+    // Offered on Radeon cards only (rdna_counter below); the names and descriptions are the RX 6800's.
+    {"TA_FLAT_LOAD_WAVEFRONTS", "TA", "", [](const DispatchStats& s) { return s.counts.flat_read; },
+     " Number of flat load vec32 packets processed by TA, same as flat_read_wavefronts in earlier IP"},
+    {"TA_FLAT_STORE_WAVEFRONTS", "TA", "", [](const DispatchStats& s) { return s.counts.flat_write; },
+     "Number of flat store vec32 packets processed by TA, same as flat_write_wavefronts in earlier IP"},
+    {"TA_FLAT_LOAD_WAVEFRONTS_sum", "", "reduce(TA_FLAT_LOAD_WAVEFRONTS,sum)",
+     [](const DispatchStats& s) { return s.counts.flat_read; },
+     "Number of flat load vec32 packets processed by the TA. Sum over TA instances."},
+    {"TA_FLAT_STORE_WAVEFRONTS_sum", "", "reduce(TA_FLAT_STORE_WAVEFRONTS,sum)",
+     [](const DispatchStats& s) { return s.counts.flat_write; },
+     "Number of flat store vec32 packets processed by the TA. Sum over TA instances."},
+    {"SQ_WAVE32_INSTS", "SQ", "", [](const DispatchStats& s) { return s.instructions; },
+     "Number of instructions issued by wave32 waves. Skipped instructions are not counted. {emulated}", nullptr, 32},
+    {"SQ_WAVE64_INSTS", "SQ", "", [](const DispatchStats& s) { return s.instructions; },
+     "Number of instructions issued by wave64 waves. Skipped instructions are not counted. {emulated}", nullptr, 64},
     // Offered on Radeon cards only (rdna_counter below).
     {"Wavefronts", "", "reduce(SQ_WAVES,sum)", [](const DispatchStats& s) { return s.waves; }, "Total wavefronts."},
     // The constants a Radeon card offers (rocprofv3-avail on the RX 6800 and RX 6700 XT): the agent's properties.
@@ -247,19 +264,30 @@ constexpr size_t kCounterCount = sizeof kCounters / sizeof kCounters[0];
 const Counter* counter(uint64_t id) { return id >= 1 && id <= kCounterCount ? &kCounters[id - 1] : nullptr; }
 
 // The counters a Radeon card (gfx10 and later) offers that the interpreter counts exactly: of what rocprofv3-avail
-// lists on the RX 6800 and RX 6700 XT (gfx1030, gfx1031), the waves a dispatch starts. The card's other counters
-// are instruction counts the simulator also has (SQ_INSTS_VALU, ...), but none could be compared with the card's
-// own values -- rocprofv3 --pmc aborts on the machine they were measured on -- so they stay refused, like the
-// cycle, stall and cache counters that need a model of time. The names, blocks and descriptions are the card's.
+// lists on the RX 6800 and RX 6700 XT (gfx1030, gfx1031), the waves a dispatch starts and the instructions its
+// waves issue, by unit (VALU, SALU, SMEM, FLAT, LDS, GDS), by wave size, and the flat loads and stores the texture
+// addresser takes. None of their values could be compared with a card's -- rocprofv3 --pmc aborts on the machine
+// the names were taken from -- so they are the interpreter's counts under the card's names and descriptions. The
+// card's other instruction counters stay refused: SQ_INSTS_WAVE32* count a wave64 instruction "1 or 2" times by what
+// gets issued, and the averages (VALUInsts, ...) are fractions. So do the cycle, stall and cache counters, which
+// need a model of time.
 bool rdna_counter(const Counter& c) {
-  const std::string_view n = c.name;
-  return n == "SQ_WAVES" || n == "SQ_WAVES_sum" || n == "Wavefronts";
+  static const char* const names[] = {"SQ_WAVES", "SQ_WAVES_sum", "Wavefronts", "SQ_INSTS_VALU", "SQ_INSTS_SALU",
+                                      "SQ_INSTS_SMEM", "SQ_INSTS_FLAT", "SQ_INSTS_LDS", "SQ_INSTS_GDS",
+                                      "TA_FLAT_LOAD_WAVEFRONTS", "TA_FLAT_LOAD_WAVEFRONTS_sum",
+                                      "TA_FLAT_STORE_WAVEFRONTS", "TA_FLAT_STORE_WAVEFRONTS_sum", "SQ_WAVE32_INSTS",
+                                      "SQ_WAVE64_INSTS"};
+  for (const char* n : names)
+    if (std::string_view(c.name) == n) return true;
+  return false;
 }
 bool offers(const rocprofiler_agent_v0_t& a, uint64_t id) {
   const Counter* c = counter(id);
   if (!c || a.type != ROCPROFILER_AGENT_TYPE_GPU) return false;
   if (a.gfx_target_version >= 100000) return rdna_counter(*c) || c->constant;
-  return !c->constant && std::string_view(c->name) != "Wavefronts";
+  const std::string_view n = c->name;
+  return !c->constant && n != "Wavefronts" && n.substr(0, 14) != "TA_FLAT_LOAD_W" && n.substr(0, 14) != "TA_FLAT_STORE_" &&
+         n != "SQ_WAVE32_INSTS" && n != "SQ_WAVE64_INSTS";
 }
 uint64_t instance_id(uint64_t counter_id) { return counter_id << 32; }
 
@@ -488,6 +516,7 @@ struct Sdk {
   std::vector<Context> contexts;
   std::vector<Buffer> buffers;
   std::map<uint64_t, Config> configs;
+  std::map<uint64_t, uint32_t> kernel_wave_size;   // by kernel id: the wave size the kernel was compiled for
   uint64_t next_config = 1, next_callback_thread = 1;
   Agents agents;
   bool agents_ready = false;
@@ -1466,6 +1495,7 @@ void on_code_object(const hp::CodeObject& o, const hp::KernelSymbol* kernels, si
   const bool rdna = gpu && gpu->gfx_target_version >= kRdnaFirst;
   for (size_t i = 0; i < count; ++i) {
     const hp::KernelSymbol& k = kernels[i];
+    s.kernel_wave_size[k.kernel_id] = k.wave_size;
     rocprofiler_callback_tracing_code_object_kernel_symbol_register_data_t sym{};
     sym.size = sizeof sym;
     sym.kernel_id = k.kernel_id;
@@ -1516,6 +1546,7 @@ struct Counting {
 };
 struct InFlight {
   uint64_t correlation = 0;
+  uint32_t wave_size = 0;
   rocprofiler_kernel_dispatch_info_t info{};
   std::vector<Counting> counting;
   // What each context's tool attached to the launch's correlation id, asked
@@ -1528,6 +1559,7 @@ void* on_launching(const hp::Launch& l) {
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   if (s.finalized) return nullptr;
   auto* f = new InFlight;
+  if (const auto it = s.kernel_wave_size.find(l.kernel_id); it != s.kernel_wave_size.end()) f->wave_size = it->second;
   f->correlation = current_correlation(s);
   rocprofiler_kernel_dispatch_info_t& i = f->info;
   i.size = offsetof(rocprofiler_kernel_dispatch_info_t, reserved_padding);
@@ -1572,7 +1604,8 @@ void on_launched(const hp::Launch&, const DispatchStats* stats, uint64_t start, 
       r.id = instance_id(id);
       const Counter* ct = counter(id);
       const rocprofiler_agent_v0_t* ag = ct->constant ? agent(s, f->info.agent_id.handle) : nullptr;
-      r.counter_value = static_cast<double>(ct->constant ? (ag ? ct->constant(*ag) : 0) : ct->value(*stats));
+      r.counter_value = static_cast<double>(ct->constant ? (ag ? ct->constant(*ag) : 0)
+                                          : ct->wave_only && ct->wave_only != f->wave_size ? 0 : ct->value(*stats));
       r.dispatch_id = f->info.dispatch_id;
       r.user_data = k.user;
       r.agent_id = f->info.agent_id;

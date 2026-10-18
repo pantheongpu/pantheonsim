@@ -163,6 +163,54 @@ Counter_Name        :	Wavefronts
 Description         :	Total wavefronts.
 Expression          :	reduce(SQ_WAVES,sum)
 
+Counter_Name        :	SQ_INSTS_VALU
+Description         :	The number of VALU (Vector ALU) instructions issued. The value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on VALU instructions.
+Block               :	SQ
+
+Counter_Name        :	SQ_INSTS_SALU
+Description         :	Total Number of SALU (Scalar ALU) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SALU instructions.
+Block               :	SQ
+
+Counter_Name        :	SQ_INSTS_SMEM
+Description         :	Total number of SMEM (Scalar Memory Read) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on SMEM instructions.
+Block               :	SQ
+
+Counter_Name        :	SQ_INSTS_FLAT
+Description         :	Total number of FLAT instructions issued. When used in combination with SQ_ACTIVE_INST_FLAT (cycle count for executing instructions) the average latency of FLAT instruction execution can be calculated (SQ_ACTIVE_INST_FLAT / SQ_INSTS). This value is returned per-SE (aggregate of values in SIMDs in the SE).
+Block               :	SQ
+
+Counter_Name        :	SQ_INSTS_LDS
+Description         :	Total number of LDS instructions issued (including FLAT). This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on LDS instructions.
+Block               :	SQ
+
+Counter_Name        :	SQ_INSTS_GDS
+Description         :	Total number of GDS (global data sync) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on GDS (global data sync) instructions.
+Block               :	SQ
+
+Counter_Name        :	TA_FLAT_LOAD_WAVEFRONTS
+Description         :	 Number of flat load vec32 packets processed by TA, same as flat_read_wavefronts in earlier IP
+Block               :	TA
+
+Counter_Name        :	TA_FLAT_LOAD_WAVEFRONTS_sum
+Description         :	Number of flat load vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_FLAT_LOAD_WAVEFRONTS,sum)
+
+Counter_Name        :	TA_FLAT_STORE_WAVEFRONTS
+Description         :	Number of flat store vec32 packets processed by TA, same as flat_write_wavefronts in earlier IP
+Block               :	TA
+
+Counter_Name        :	TA_FLAT_STORE_WAVEFRONTS_sum
+Description         :	Number of flat store vec32 packets processed by the TA. Sum over TA instances.
+Expression          :	reduce(TA_FLAT_STORE_WAVEFRONTS,sum)
+
+Counter_Name        :	SQ_WAVE32_INSTS
+Description         :	Number of instructions issued by wave32 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+
+Counter_Name        :	SQ_WAVE64_INSTS
+Description         :	Number of instructions issued by wave64 waves. Skipped instructions are not counted. {emulated}
+Block               :	SQ
+
 Counter_Name        :	CU_NUM
 Description         :	CU_NUM
 Expression          :	simd_count/simd_per_cu
