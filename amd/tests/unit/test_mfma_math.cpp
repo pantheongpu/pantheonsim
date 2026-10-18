@@ -109,6 +109,39 @@ VTEST(four_dot_products_at_once_give_what_four_one_at_a_time_do) {
   }
 }
 
+VTEST(nans_with_different_payloads_come_out_as_the_fixed_operand_order_gives) {
+  // Both operands of a multiply or an add NaN: the payload that wins is the first operand's. The plain loops may have either
+  // first, so a sum that ends as a NaN is redone in the fixed order; all three forms must agree with it.
+  Rng rng{0xFACE};
+  for (int round = 0; round < 3000; ++round) {
+    const uint32_t k = 1 + static_cast<uint32_t>(rng.next() % 16);
+    std::vector<double> a[4], b[4];
+    const double* rows[4];
+    const double* cols[4];
+    double start[4], got4[4];
+    for (int t = 0; t < 4; ++t) {
+      a[t].resize(k), b[t].resize(k);
+      const auto nan_or = [&](double v) {
+        if (rng.next() % 3) return v;
+        const uint64_t bits = 0x7FF8000000000000ull | (rng.next() & 0x8007FFFFFFFFFFFFull);
+        double d;
+        std::memcpy(&d, &bits, 8);
+        return d;
+      };
+      for (auto& x : a[t]) x = nan_or(any_double(rng));
+      for (auto& x : b[t]) x = nan_or(any_double(rng));
+      rows[t] = a[t].data(), cols[t] = b[t].data(), start[t] = nan_or(any_double(rng));
+    }
+    vgpu::amd::mfma_dot4(rows, cols, k, start, got4);
+    for (int t = 0; t < 4; ++t) {
+      const double want = vgpu::amd::mfma_dot_ordered(rows[t], cols[t], k, start[t]);
+      VCHECK_EQ(bits_of(got4[t]), bits_of(want));
+      // (a sum that is a number is the same either way)
+      VCHECK_EQ(bits_of(vgpu::amd::mfma_dot(rows[t], cols[t], k, start[t])), bits_of(want));
+    }
+  }
+}
+
 VTEST(the_terms_are_summed_in_order) {
   // Large, small and negative-large: (1e16 + 1) - 1e16 is 0 in this order, 1 in another.
   const double a[3] = {1.0, 1.0, 1.0}, b[3] = {1e16, 1.0, -1e16};

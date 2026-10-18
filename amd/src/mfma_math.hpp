@@ -73,22 +73,35 @@ inline double mfma_add(double sum, double p) {
 
 // One output of a matrix multiply-accumulate: c plus the dot product of a row of A with a column of B, k terms taken in
 // order and summed in double (so the order is the result). `bt` is that column, stored contiguously.
-inline double mfma_dot(const double* a, const double* bt, uint32_t k, double c) {
+//
+// The plain loops are what the compiler may schedule and vectorize as it likes; they give the same bits as any other order
+// of the two operands of a multiply or an add, except when both are NaNs (the result then takes one operand's payload, and
+// which is the compiler's choice). A NaN stays in a sum once it is there, so a sum that ends as a number never met one, and
+// one that ends as a NaN is done again below with the operand order fixed above.
+inline double mfma_dot_ordered(const double* a, const double* bt, uint32_t k, double c) {
   double sum = c;
   for (uint32_t i = 0; i < k; ++i) sum = mfma_add(sum, mfma_mul(a[i], bt[i]));
   return sum;
+}
+inline double mfma_dot(const double* a, const double* bt, uint32_t k, double c) {
+  double sum = c;
+  for (uint32_t i = 0; i < k; ++i) sum += a[i] * bt[i];
+  return sum != sum ? mfma_dot_ordered(a, bt, k, c) : sum;
 }
 // Four of them at once, from four rows and four columns: four sums that nothing joins, each taken in order, so each
 // is what mfma_dot gives; they overlap in the machine instead of waiting on one another.
 inline void mfma_dot4(const double* const a[4], const double* const bt[4], uint32_t k, const double c[4], double out[4]) {
   double s0 = c[0], s1 = c[1], s2 = c[2], s3 = c[3];
   for (uint32_t i = 0; i < k; ++i) {
-    s0 = mfma_add(s0, mfma_mul(a[0][i], bt[0][i]));
-    s1 = mfma_add(s1, mfma_mul(a[1][i], bt[1][i]));
-    s2 = mfma_add(s2, mfma_mul(a[2][i], bt[2][i]));
-    s3 = mfma_add(s3, mfma_mul(a[3][i], bt[3][i]));
+    s0 += a[0][i] * bt[0][i];
+    s1 += a[1][i] * bt[1][i];
+    s2 += a[2][i] * bt[2][i];
+    s3 += a[3][i] * bt[3][i];
   }
-  out[0] = s0, out[1] = s1, out[2] = s2, out[3] = s3;
+  out[0] = s0 != s0 ? mfma_dot_ordered(a[0], bt[0], k, c[0]) : s0;
+  out[1] = s1 != s1 ? mfma_dot_ordered(a[1], bt[1], k, c[1]) : s1;
+  out[2] = s2 != s2 ? mfma_dot_ordered(a[2], bt[2], k, c[2]) : s2;
+  out[3] = s3 != s3 ? mfma_dot_ordered(a[3], bt[3], k, c[3]) : s3;
 }
 // The fused form, for the double-precision instruction.
 inline double mfma_dot_fma(const double* a, const double* bt, uint32_t k, double c) {
