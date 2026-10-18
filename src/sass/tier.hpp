@@ -124,6 +124,8 @@ enum class Form : uint8_t {
   Usel,
   Hmma,      // HMMA (dense f16, bf16, tf32 with an f32 or f16 accumulator): the SIMD kernel; ends a run, has a handler
   Match,     // MATCH.ANY / MATCH.ALL on 32 or 64 bits: ends a run, has a handler
+  Ldsm,      // LDSM, the 16-bit forms (ldmatrix .M88, .MT88): ends a run, has a handler
+  Imma,      // IMMA (dense, 8- or 4-bit elements into s32, plain or .SAT): ends a run, has a handler
   Count_,
 };
 const char* form_name(Form f);

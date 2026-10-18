@@ -2112,3 +2112,78 @@ default on every NVIDIA GPU and PTX atomics gain 38%; a later change should look
 Dropped after measurement: the two-entry code hint and the bank-pass rewrite (see "Not done, and negative results"). On the AMD side the
 harness (tools/bench-amd) counts a Radeon card's instructions with SQ_WAVE32_INSTS + SQ_WAVE64_INSTS, the counters a simulated RX 6800
 offers.
+
+## Tier 2: what the tier still hands back to the interpreter (branch `speedup2-tiercov`)
+
+**Measured first.** `VGPU_TIER_STATS=2` (it already prints, per mnemonic, the straight-line instructions the interpreter ran and the ones that
+ended a run and were the interpreter's) over the bench workloads (`quick` size) and over the corpora: HeCBench's `reduced.txt` (34 programs), the
+Rodinia apps of `run.sh`, and the CUDA Samples of `exes.txt` (85 programs gave statistics; the others fail without a card or are not CUDA programs),
+every one with the base build `a12f8d84`, `VGPU_THREADS=1`, the RTX 3060 profile. The tier ran 97.3% of the corpora's 5.98 G warp instructions
+(HeCBench 97.2%, Rodinia 99.1%, Samples 97.4%); 0.34% were straight-line instructions with no handler and 2.31% ended a run in the interpreter.
+Bench workloads: 100% for `int_alu`, `f32_fma`, `f64_subnormal`, `local`, `divergent`, `warp`, `launch`, `wmma`, `mma_ptx`; 99.8% `f64_fma`
+(`I2F.F64.U32`), 99.5% `mem` (`UIMAD.WIDE.U32`), 98.9% `shared` (`P2R`, a waiting `EXIT`), 91.0% `texture` (`TEX`, `TLD`), 81.3% `atomics`
+(`ATOMG.CAS`, `RED`, `REDUX`, `VOTEU`, `S2UR`). So the chain-ending instructions named in the notes above (divergent branches 35% of `divergent`'s
+runs, barriers 25% of `shared`'s) are already the tier's: they end a *run* and return to the scheduler, they are not handed to the interpreter.
+
+What is left, by dynamic count over all three corpora (share of the 5.98 G; the tier cannot do much about a count this small):
+
+| instruction (mnemonic.modifiers) | warp instructions | share | where |
+|---|---|---|---|
+| IMMA.16816.U8.U8 | 33.6 M | 0.56% | one CUDA Sample (immaTensorCoreGemm) |
+| LDSM.16.M88.2 / .4 | 12.6 M each | 0.21% each | the same sample |
+| BRA.CONV | 11.5 M | 0.19% | atomicAggregate (3.1 M), CUB-style code |
+| FCHK | 10.6 M | 0.18% | black-scholes 8.2 M, bilateral 1.2 M, silu |
+| CALL.REL.NOINC / RET.REL.NODEC | 10.4 M / 8.0 M | 0.17% / 0.13% | the IEEE-division slow path of the same three programs |
+| F2F.F64.F32 | 7.3 M | 0.12% | |
+| ATOMS.CAST.SPIN.64 | 6.0 M | 0.10% | aop 4.4 M, atomicPerf 1.6 M |
+| MATCH.ANY / .ANY.U64 | 4.1 M / 3.1 M | 0.07% / 0.05% | atomicAggregate |
+| REDUX.OR, P2R, VOTEU.ANY, S2UR, RED.E.ADD | 3.4 to 4.1 M each | 0.06 to 0.07% each | atomicAggregate, atomicIntrinsics, radixsort2 |
+| everything else (ATOMS.POPC.INC, ATOMG, R2UR, REDUX.MAX, BRA.DIV, CALL.ABS, ATOMS.ADD, R2P, MUFU.RCP64H, WARPSYNC, ...) | | under 0.04% each | |
+
+No texture, BRX, generic LD/ST, 32-byte access, Turing global form, FRND or MUFU.RSQ64H stands above 0.01% in these corpora (TEX/TLD are 9% of the
+`texture` bench workload only).
+
+**What was kept: a handler for MATCH.** `Form::Match` (tier.cpp, `h_match` in tier_ops.inc; `MATCH.ANY`/`.ALL`, 32 and 64 bits). The interpreter's
+code compares every lane's value with every other's through nested lambdas (about a thousand comparisons for a warp); the handler reads the lanes'
+values once and works out the lane mask of one equality class at a time, giving it to every lane of the class (`MATCH.ANY`), or compares each
+value with the first lane's (`MATCH.ALL`). The results are the interpreter's (integers, no number format: form table entry O).
+
+| workload | A | B | B/A median | B/A best | p | load |
+|---|---|---|---|---|---|---|
+| HeCBench atomicAggregate (`main 1`), the same build with `VGPU_TIER_OFF=match` (A) and not (B) | 7.30 s | 5.19 s | 1.41x | 1.39x | <0.001 | 14 to 27 |
+| the same, base build `a12f8d84` (A) against this build (B) | 9.66 s | 5.26 s | 1.84x | 1.46x | <0.001 | 27 |
+
+(User plus system CPU seconds of the process, 15 alternating runs each, CPUs 16-19, `VGPU_THREADS=1`.) The base build's median is high on a
+loaded machine; the best-of-15 ratios are the honest ones, and the same-build one removes any layout effect. MATCH is 0.4% of that program's
+warp instructions and about a third of its time.
+
+**Tried and dropped, by the rule (an A/B that does not show more than 2% with p <= 0.05 on a workload that runs the instruction):**
+
+* *A "direct" dispatch for the instructions that end a run and have no handler.* `tier_run` called `exec_mem`, `exec_warp`, `exec_control`,
+  `exec_tex` or `exec_int` itself for ATOMG/ATOM/ATOMS/RED, REDUX, VOTEU, TEX/TLD, CALL/RET/BRX/WARPSYNC, BRA.DIV/.CONV and R2P/S2UR/R2UR, with the
+  counters and the advance of `execute()` and without its guard, `fast_alu` probe and tracing check. It passed `e2e_sass_tier` and `test_tier`.
+  The same build with `VGPU_TIER_OFF=direct` against without, 11 alternating runs (CPUs 28-31, load 11 to 28): atomicAggregate 1.089x median
+  (best 1.027x, p 0.18), aop 1.031x (best 1.036x, p 0.053), atomicPerf 1.019x (best 1.032x, p 0.58); `bench.sh --ab` base against the build with it,
+  11 runs: `atomics` 1.008x (p 0.047), `texture` 1.005x (p 0.047), both "same". These instructions spend their time in the memory manager's locks,
+  `texture_fetch` and the lane loops, not in `execute()`'s prologue. Removed; nothing to keep.
+* *A handler for FCHK* (the IEEE division's check; the interpreter answers "slow path" for every lane, so it is one predicate write). Same
+  build, `VGPU_TIER_OFF=fchk` (A) against not (B), 15 alternating runs, CPUs 28-31, load 8 to 29: black-scholes 22.88 s vs 22.60 s, 1.012x (p 0.017);
+  bilateral 1.736 s vs 1.705 s, 1.018x (p 0.011). Under the 2% line. Removed. (`sass_tier.cu` now runs an IEEE division so the
+  FCHK, CALL and RET paths are held to the interpreter whatever is done to them later.)
+* *CALL/RET, BRA.CONV/.DIV, REDUX, VOTEU, shared and global atomics, RED, TEX/TLD as handlers of their own.* The "direct" experiment above is
+  the upper bound of what a handler for them can save when it only resolves operands once (the interpreter reads a register operand inline,
+  so there is little to resolve); no handler was written for them. MATCH was the one whose interpreter code does more work than its
+  result needs.
+* *IMMA and LDSM* (the largest left by count, all in one Sample): not touched here; the tensor-core kernels are another piece's.
+* *Whole-suite A/B of the kept change.* `bench.sh --ab` base `a12f8d84` against this build, all SASS workloads, `--size full`, 9 runs, CPUs 16-19,
+  load 20: counters identical in all; no workload slower by more than the spread; `mem` 1.035x and `launch` 1.028x came out "faster"
+  although neither runs a MATCH (layout effects of the changed binary, not claimed).
+
+**How the kept handler is held.** `sass_tier.cu` gained `k_direct`: MATCH.ANY/.ALL/.ANY.U64 in whole and in diverged warps, blocks that are not
+whole warps (128, 48 and 33 threads), and, beside it, the instructions the interpreter keeps (global and shared atomics of every kind and width,
+RED, REDUX of every operation, the warp-aggregated increment's VOTEU/BRA.CONV, indirect and direct calls, `__syncwarp`, an IEEE division). Each
+block uses bins of its own so that four host threads give the one-thread answer. `e2e_sass_tier` (run with `VGPU_TIER=0` and `1`) holds every result
+and counter to the interpreter's, also under four threads and without the chain. `test_tier` requires MATCH to be taken in every corpus (sm_80, 86,
+89, 90, 120) and the form table lists `match:O`. Mutation checks (scratch copy of tier_ops.inc, `e2e_sass_tier` on sm_86): MATCH.ALL's predicate
+inverted, the 64-bit high word ignored, and MATCH.ALL's result written to all lanes instead of the executing ones are each caught by `sass_tier`
+(the `direct threads=` lines differ).

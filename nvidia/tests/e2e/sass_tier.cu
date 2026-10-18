@@ -635,6 +635,84 @@ __global__ void k_direct(const u32* A, const u32* Bv, u32* out, u32* bins, unsig
   if (t < 64) out[(size_t)n * kDir + blockIdx.x * 64 + t] = sh[t];
 }
 
+// The integer tensor cores (IMMA): mma.sync of s8, u8 and s4 products into s32, plain and .satfinite, in the shapes m8n8k16, m16n8k16, m16n8k32
+// (s8, u8) and m8n8k32, m16n8k32, m16n8k64 (s4), on registers of random bits (sums that wrap, and that clamp under .satfinite).
+constexpr int kImma = 40;
+#define IMMA4(shape, mods, T1, T2)                                                                                                         \
+  {                                                                                                                                         \
+    u32 d0, d1, d2, d3;                                                                                                                     \
+    asm volatile("mma.sync.aligned." shape ".row.col." mods "s32." T1 "." T2 ".s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};" \
+                 : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)                                                                                   \
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));          \
+    o[k++] = d0; o[k++] = d1; o[k++] = d2; o[k++] = d3;                                                                                     \
+  }
+#define IMMA2(shape, mods, T1, T2)                                                                                                          \
+  {                                                                                                                                         \
+    u32 d0, d1, d2, d3;                                                                                                                     \
+    asm volatile("mma.sync.aligned." shape ".row.col." mods "s32." T1 "." T2 ".s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};"          \
+                 : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)                                                                                   \
+                 : "r"(a[0]), "r"(a[1]), "r"(b[0]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));                                            \
+    o[k++] = d0; o[k++] = d1; o[k++] = d2; o[k++] = d3;                                                                                     \
+  }
+#define IMMA1(shape, mods, T1, T2)                                                                                                          \
+  {                                                                                                                                         \
+    u32 d0, d1;                                                                                                                             \
+    asm volatile("mma.sync.aligned." shape ".row.col." mods "s32." T1 "." T2 ".s32 {%0,%1}, {%2}, {%3}, {%4,%5};"                           \
+                 : "=r"(d0), "=r"(d1) : "r"(a[0]), "r"(b[0]), "r"(c[0]), "r"(c[1]));                                                        \
+    o[k++] = d0; o[k++] = d1;                                                                                                               \
+  }
+__global__ void k_imma(const u32* A, const u32* Bv, const u32* C, u32* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  u32 a[4], b[2], c[4], o[kImma] = {};
+  for (int j = 0; j < 4; ++j) { a[j] = A[((size_t)i * 4 + j) % n]; c[j] = C[((size_t)i * 4 + j) % n]; }
+  for (int j = 0; j < 2; ++j) b[j] = Bv[((size_t)i * 2 + j) % n];
+  int k = 0;
+#if __CUDA_ARCH__ >= 800
+  IMMA4("m16n8k32", "", "s8", "s8")
+  IMMA4("m16n8k32", "", "u8", "u8")
+  IMMA4("m16n8k32", "", "s8", "u8")
+  IMMA4("m16n8k32", "satfinite.", "s8", "s8")
+  IMMA4("m16n8k32", "satfinite.", "u8", "s8")
+  IMMA2("m16n8k16", "", "s8", "s8")
+  IMMA2("m16n8k16", "", "u8", "s8")
+  IMMA2("m16n8k16", "satfinite.", "u8", "u8")
+  IMMA4("m16n8k64", "", "s4", "s4")
+  IMMA4("m16n8k64", "", "u4", "u4")
+  IMMA4("m16n8k64", "satfinite.", "s4", "u4")
+  IMMA2("m16n8k32", "", "s4", "s4")
+  IMMA2("m16n8k32", "satfinite.", "u4", "u4")
+#endif
+  IMMA1("m8n8k16", "", "s8", "u8")
+  IMMA1("m8n8k16", "satfinite.", "s8", "s8")
+  IMMA1("m8n8k32", "", "s4", "s4")
+  IMMA1("m8n8k32", "satfinite.", "u4", "s4")
+  if (i < n)
+    for (int j = 0; j < kImma; ++j) out[(size_t)i * kImma + j] = o[j];
+}
+
+// ldmatrix (LDSM): one, two and four 8x8 matrices of 16-bit elements, plain and transposed, from rows at addresses of the lanes' own (16-byte
+// aligned, some rows shared between lanes, some past the first kilobyte). Whole warps only: ldmatrix takes the rows from all the lanes.
+constexpr int kLdsm = 16;
+__global__ void k_ldsm(const u32* A, u32* out, int n) {
+  __shared__ __align__(16) u32 sm[1024];
+  const int t = threadIdx.x;
+  for (int j = t; j < 1024; j += blockDim.x) sm[j] = A[((size_t)blockIdx.x * 1024 + j) % n];
+  __syncthreads();
+  const u32 lane = t & 31;
+  const u32 base = (u32)__cvta_generic_to_shared(sm);
+  const u32 row = base + ((lane * 5 + blockIdx.x * 3 + (t >> 5)) % 64) * 16;
+  u32 r[kLdsm] = {};
+  int k = 0;
+  asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];" : "=r"(r[0]) : "r"(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%0}, [%1];" : "=r"(r[1]) : "r"(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r[2]), "=r"(r[3]) : "r"(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];" : "=r"(r[4]), "=r"(r[5]) : "r"(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[6]), "=r"(r[7]), "=r"(r[8]), "=r"(r[9]) : "r"(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[10]), "=r"(r[11]), "=r"(r[12]), "=r"(r[13]) : "r"(row));
+  (void)k;
+  for (int j = 0; j < kLdsm; ++j) out[((size_t)blockIdx.x * blockDim.x + t) * kLdsm + j] = r[j];
+}
+
 // The store gate (Runner::step_warp): a warp's first store to global memory ends its turn, once, so every warp of the block
 // loads the word before any warp stores. Four warps each doing `*w += 1` end with 1, not 4, as on a card. The tier must
 // stop at the store as the interpreter does.
@@ -910,6 +988,29 @@ int main() {
     k_mma<<<32, 128>>>(da, db, dc, out, 4096);
     if (report("mma special", out, (size_t)4096 * kMma)) return 1;
     CK(cudaFree(out)); CK(cudaFree(dma)); CK(cudaFree(dmb)); CK(cudaFree(dmc));
+  }
+  {   // ldmatrix
+    u32* out;
+    CK(cudaMalloc(&out, (size_t)16 * 128 * kLdsm * 4));
+    for (int threads : {64, 128}) {
+      k_ldsm<<<16, threads>>>(da, out, n);
+      char label[64];
+      std::snprintf(label, sizeof label, "ldsm threads=%d", threads);
+      if (report(label, out, (size_t)16 * threads * kLdsm)) return 1;
+    }
+    CK(cudaFree(out));
+  }
+  {   // the integer tensor cores
+    const int nm = 2048;
+    u32* out;
+    CK(cudaMalloc(&out, (size_t)nm * kImma * 4));
+    for (int threads : {64, 128}) {
+      k_imma<<<nm / threads, threads>>>(da, db, dc, out, nm);
+      char label[64];
+      std::snprintf(label, sizeof label, "imma threads=%d", threads);
+      if (report(label, out, (size_t)nm * kImma)) return 1;
+    }
+    CK(cudaFree(out));
   }
   {
     std::vector<u64> xa(n), xb(n), xc(n);
