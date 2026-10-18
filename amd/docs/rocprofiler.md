@@ -124,6 +124,29 @@ All of these were found by the comparison; each is covered by an `.expected` fil
   `__hipRegisterManagedVar`, `__hipPushCallConfiguration`, `__hipPopCallConfiguration`,
   `__hipUnregisterFatBinary`) is recorded, with its operation names, as `--hip-trace` records it.
 
+### The agent in every field, the other output files, and the counters
+
+Three more comparisons with the same cards, each skipped where there is no rocprofv3:
+
+- **`agents`** (`run_rocprof_case.sh agents`, `rocprof_normalize.py --agents`): every field of the GPU agent in
+  `results.json` (shader engines and arrays, SDMA engines, queues, clocks, firmware, the memory bank, the 128 or 86
+  caches and the io link), against `rocprof_agents[.rx6700xt].expected`. The fields come from rocprofv3 on the cards
+  (`amd/src/rocprofiler_rdna_agents.inc`, written by `amd/tools/rocprof-agent-inc.py` from the card's results and the KFD topology
+  in `amd/registers/measurements/`). Where the card sits in the machine (node, `gpu_id`, `location_id`, render minor, UUID, handle)
+  is the machine's, not the card's, and is not compared. Cards that were not measured keep zeros there.
+- **`run_rocprof_outputs.sh`**: the files `--output-format csv json otf2 pftrace rocpd`, `--stats`, `--summary`,
+  `--sys-trace` and `--kernel-rename` write for `vecadd`: the file set, every csv's columns, the function names and call
+  counts of the stats files, the rocpd tables and columns, and the summary table. The simulator writes the same
+  files and columns; only what is in the table below (the HSA trace, the runtime's kernels and allocations) is left
+  out of both sides. `--summary-per-stream` does not exist in this rocprofv3. A `memory_copy_trace.csv` is not written for
+  vecadd on either (its copies are below the 16 KiB a DMA engine takes).
+- **`run_rocprof_counters.sh`**: `rocprofv3-avail info --pmc`. The cards offer about a hundred counters: cycles, stalls, cache and
+  memory traffic (which need a model of time and are refused here), instruction counts, waves, and the agent's properties as
+  constants. The simulated card offers `SQ_WAVES`, `SQ_WAVES_sum`, `Wavefronts`, `CU_NUM`, `SIMD_NUM`, `SE_NUM`, `MAX_WAVE_SIZE` and
+  the agent's scalar properties (`num_sdma_engines`, ...), with the card's descriptions and expressions
+  (`rocprof_counters[.rx6700xt].expected` holds the card's entries); every other counter is refused with rocprofv3's
+  "Missing". A Radeon agent no longer offers CDNA's `SQ_WAVES_EQ_64`, `SQ_INSTS_MFMA` and the like.
+
 ## Known differences
 
 The comparison leaves these out, on both sides, with `rocprof_normalize.py --strip-known-gaps`
@@ -138,7 +161,9 @@ then on. `--card` compares everything.
 | **The runtime's own kernels** | `__amd_rocclr_copyBuffer` for small and device-to-device copies, `__amd_rocclr_fillBufferAligned` for fills, as dispatches | none | `rocprof_normalize.py --runtime-kernels` shows them in a card's trace |
 | **Scratch records** | a `SCRATCH_MEMORY_ALLOC` for a kernel with a private segment, sized as the runtime's pool (64880640 bytes in `geometry`) | none | not compared |
 | **The runtime's own allocations** | 4 MiB and 16 MiB staging blocks and a 56-byte block on the host, a 131456-byte allocation per graph instantiation, a `VMEM_ALLOCATE` pool range for `hipMallocAsync`; FREE records carry no agent | only the program's allocations; FREE records name the GPU | the normaliser keeps the program's (`ALLOCATORS` in `rocprof_normalize.py`) |
-| **Agent fields the profile does not have** | shader engines and arrays, SDMA engines, queues, clocks, memory banks, caches, io links, firmware | zero | `build_agents` in `rocprofiler_sdk.cpp`; not compared |
+| **Counter values on the card** | `rocprofv3 --pmc` aborts on the machine the cards are in (`std::out_of_range`, then a hang, with the iGPU in the agent list), so no counter value was read from a card | `SQ_WAVES` is the launch's geometry (vecadd: 32 waves of 32); the constants are the agent's fields | `run_rocprof_counters.sh` |
+| **Instruction counters on Radeon** | `SQ_INSTS_VALU`, `_SALU`, `_SMEM`, `_FLAT`, `_LDS`, `_GDS`, `SQ_INSTS_WAVE32*`, `SQ_WAVE32_INSTS`, `TA_FLAT_LOAD/STORE_WAVEFRONTS` and the averages built on them (`VALUInsts`, ...), one value per shader engine | the interpreter counts the first six exactly, but there is no card value to compare with, so they are refused | `offers` in `rocprofiler_sdk.cpp` |
+| **Per-shader-engine counters** | every hardware counter has a shader-engine dimension (`[0:3]` on the RX 6800, `[0:1]` on the RX 6700 XT) | one instance, the device's total | `rocprof_counters.py` leaves the dimensions out |
 | **Correlation ids** | the runtime's internal calls take ids too (a `hipMalloc` is 3, then 95, 97, 99) | consecutive | not compared |
 | **Copy records on Instinct cards** | not measured | one per copy | `on_copied` in `rocprofiler_sdk.cpp` |
 

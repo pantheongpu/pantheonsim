@@ -1,0 +1,120 @@
+# what rocprofv3 writes besides results.json for the vecadd case, reduced by amd/tests/rocprof_outputs.py
+# recorded on: the rx6800 card, rocm-7.2.0, rocprofv3 1.1.0
+# regenerate: amd/tests/e2e/run_rocprof_outputs.sh --card --update
+[all-formats files]
+agent_info.csv
+domain_stats.csv
+hip_api_stats.csv
+hip_api_trace.csv
+kernel_stats.csv
+kernel_trace.csv
+memory_allocation_stats.csv
+memory_allocation_trace.csv
+results.db
+results.def
+results.json
+results.otf2
+results.pftrace
+results/1.def
+results/1.evt
+results/2.def
+results/2.evt
+results/3.def
+results/3.evt
+results/4.def
+results/4.evt
+[all-formats agent_info.csv]
+columns: Node_Id,Logical_Node_Id,Agent_Type,Cpu_Cores_Count,Simd_Count,Cpu_Core_Id_Base,Simd_Id_Base,Max_Waves_Per_Simd,Lds_Size_In_Kb,Gds_Size_In_Kb,Num_Gws,Wave_Front_Size,Num_Xcc,Cu_Count,Array_Count,Num_Shader_Banks,Simd_Arrays_Per_Engine,Cu_Per_Simd_Array,Simd_Per_Cu,Max_Slots_Scratch_Cu,Gfx_Target_Version,Vendor_Id,Device_Id,Location_Id,Domain,Drm_Render_Minor,Num_Sdma_Engines,Num_Sdma_Xgmi_Engines,Num_Sdma_Queues_Per_Engine,Num_Cp_Queues,Max_Engine_Clk_Ccompute,Max_Engine_Clk_Fcompute,Sdma_Fw_Version,Fw_Version,Capability,Cu_Per_Engine,Max_Waves_Per_Cu,Family_Id,Workgroup_Max_Size,Grid_Max_Size,Local_Mem_Size,Hive_Id,Gpu_Id,Workgroup_Max_Dim_X,Workgroup_Max_Dim_Y,Workgroup_Max_Dim_Z,Grid_Max_Dim_X,Grid_Max_Dim_Y,Grid_Max_Dim_Z,Name,Vendor_Name,Product_Name,Model_Name
+[all-formats domain_stats.csv]
+columns: Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev
+[all-formats hip_api_stats.csv]
+columns: Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev
+__hipPopCallConfiguration calls=1
+__hipPushCallConfiguration calls=1
+__hipRegisterFatBinary calls=1
+__hipRegisterFunction calls=1
+hipDeviceSynchronize calls=1
+hipFree calls=3
+hipLaunchKernel calls=1
+hipMalloc calls=3
+hipMemcpy calls=3
+[all-formats hip_api_trace.csv]
+columns: Domain,Function,Process_Id,Thread_Id,Correlation_Id,Start_Timestamp,End_Timestamp
+[all-formats kernel_stats.csv]
+columns: Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev
+vadd(float const*, float const*, float*, int) calls=1
+[all-formats kernel_trace.csv]
+columns: Kind,Agent_Id,Queue_Id,Stream_Id,Thread_Id,Dispatch_Id,Kernel_Id,Kernel_Name,Correlation_Id,Start_Timestamp,End_Timestamp,LDS_Block_Size,Scratch_Size,VGPR_Count,Accum_VGPR_Count,SGPR_Count,Workgroup_Size_X,Workgroup_Size_Y,Workgroup_Size_Z,Grid_Size_X,Grid_Size_Y,Grid_Size_Z
+[all-formats memory_allocation_stats.csv]
+columns: Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev
+[all-formats memory_allocation_trace.csv]
+columns: Kind,Operation,Agent_Id,Allocation_Size,Address,Correlation_Id,Start_Timestamp,End_Timestamp
+[all-formats results.db]
+rocpd_arg_<uuid>: id,guid,event_id,position,type,name,value,extdata
+rocpd_event_<uuid>: id,guid,category_id,stack_id,parent_stack_id,correlation_id,call_stack,line_info,extdata
+rocpd_info_agent_<uuid>: id,guid,nid,pid,type,absolute_index,logical_index,type_index,uuid,name,model_name,vendor_name,product_name,user_name,extdata
+rocpd_info_code_object_<uuid>: id,guid,nid,pid,agent_id,uri,load_base,load_size,load_delta,storage_type,extdata
+rocpd_info_kernel_symbol_<uuid>: id,guid,nid,pid,code_object_id,kernel_name,display_name,kernel_object,kernarg_segment_size,kernarg_segment_alignment,group_segment_size,private_segment_size,sgpr_count,arch_vgpr_count,accum_vgpr_count,extdata
+rocpd_info_node_<uuid>: id,guid,hash,machine_id,system_name,hostname,release,version,hardware_name,domain_name
+rocpd_info_pmc_<uuid>: id,guid,nid,pid,agent_id,target_arch,event_code,instance_id,name,symbol,description,long_description,component,units,value_type,block,expression,is_constant,is_derived,extdata
+rocpd_info_process_<uuid>: id,guid,nid,ppid,pid,init,fini,start,end,command,environment,extdata
+rocpd_info_queue_<uuid>: id,guid,nid,pid,name,extdata
+rocpd_info_stream_<uuid>: id,guid,nid,pid,name,extdata
+rocpd_info_thread_<uuid>: id,guid,nid,ppid,pid,tid,name,start,end,extdata
+rocpd_kernel_dispatch_<uuid>: id,guid,nid,pid,tid,agent_id,kernel_id,dispatch_id,queue_id,stream_id,start,end,private_segment_size,group_segment_size,workgroup_size_x,workgroup_size_y,workgroup_size_z,grid_size_x,grid_size_y,grid_size_z,region_name_id,event_id,extdata
+rocpd_memory_allocate_<uuid>: id,guid,nid,pid,tid,agent_id,type,level,start,end,address,size,queue_id,stream_id,event_id,extdata
+rocpd_memory_copy_<uuid>: id,guid,nid,pid,tid,start,end,name_id,dst_agent_id,dst_address,src_agent_id,src_address,size,queue_id,stream_id,region_name_id,event_id,extdata
+rocpd_metadata_<uuid>: id,tag,value
+rocpd_pmc_event_<uuid>: id,guid,event_id,pmc_id,value,extdata
+rocpd_region_<uuid>: id,guid,nid,pid,tid,start,end,name_id,event_id,extdata
+rocpd_sample_<uuid>: id,guid,track_id,timestamp,event_id,extdata
+rocpd_string_<uuid>: id,guid,string
+rocpd_track_<uuid>: id,guid,nid,pid,tid,name_id,extdata
+sqlite_sequence: name,seq
+[all-formats results.def] not empty
+[all-formats results.json] not empty
+[all-formats results.otf2] not empty
+[all-formats results.pftrace] not empty
+[all-formats summary]
+columns: NAME | DOMAIN | CALLS | DURATION (nsec) | AVERAGE (nsec) | PERCENT (INC) | MIN (nsec) | MAX (nsec) | STDDEV
+__hipPopCallConfiguration | HIP_API | 1
+__hipPushCallConfiguration | HIP_API | 1
+__hipRegisterFatBinary | HIP_API | 1
+__hipRegisterFunction | HIP_API | 1
+hipDeviceSynchronize | HIP_API | 1
+hipFree | HIP_API | 3
+hipLaunchKernel | HIP_API | 1
+hipMalloc | HIP_API | 3
+hipMemcpy | HIP_API | 3
+vadd(float const*, float const*, float*, int) | KERNEL_DISPATCH | 1
+[sys-trace files]
+agent_info.csv
+hip_api_trace.csv
+kernel_trace.csv
+memory_allocation_trace.csv
+[sys-trace agent_info.csv]
+columns: Node_Id,Logical_Node_Id,Agent_Type,Cpu_Cores_Count,Simd_Count,Cpu_Core_Id_Base,Simd_Id_Base,Max_Waves_Per_Simd,Lds_Size_In_Kb,Gds_Size_In_Kb,Num_Gws,Wave_Front_Size,Num_Xcc,Cu_Count,Array_Count,Num_Shader_Banks,Simd_Arrays_Per_Engine,Cu_Per_Simd_Array,Simd_Per_Cu,Max_Slots_Scratch_Cu,Gfx_Target_Version,Vendor_Id,Device_Id,Location_Id,Domain,Drm_Render_Minor,Num_Sdma_Engines,Num_Sdma_Xgmi_Engines,Num_Sdma_Queues_Per_Engine,Num_Cp_Queues,Max_Engine_Clk_Ccompute,Max_Engine_Clk_Fcompute,Sdma_Fw_Version,Fw_Version,Capability,Cu_Per_Engine,Max_Waves_Per_Cu,Family_Id,Workgroup_Max_Size,Grid_Max_Size,Local_Mem_Size,Hive_Id,Gpu_Id,Workgroup_Max_Dim_X,Workgroup_Max_Dim_Y,Workgroup_Max_Dim_Z,Grid_Max_Dim_X,Grid_Max_Dim_Y,Grid_Max_Dim_Z,Name,Vendor_Name,Product_Name,Model_Name
+[sys-trace hip_api_trace.csv]
+columns: Domain,Function,Process_Id,Thread_Id,Correlation_Id,Start_Timestamp,End_Timestamp
+[sys-trace kernel_trace.csv]
+columns: Kind,Agent_Id,Queue_Id,Stream_Id,Thread_Id,Dispatch_Id,Kernel_Id,Kernel_Name,Correlation_Id,Start_Timestamp,End_Timestamp,LDS_Block_Size,Scratch_Size,VGPR_Count,Accum_VGPR_Count,SGPR_Count,Workgroup_Size_X,Workgroup_Size_Y,Workgroup_Size_Z,Grid_Size_X,Grid_Size_Y,Grid_Size_Z
+[sys-trace memory_allocation_trace.csv]
+columns: Kind,Operation,Agent_Id,Allocation_Size,Address,Correlation_Id,Start_Timestamp,End_Timestamp
+[sys-trace summary]
+
+[kernel-rename files]
+agent_info.csv
+domain_stats.csv
+kernel_stats.csv
+kernel_trace.csv
+[kernel-rename agent_info.csv]
+columns: Node_Id,Logical_Node_Id,Agent_Type,Cpu_Cores_Count,Simd_Count,Cpu_Core_Id_Base,Simd_Id_Base,Max_Waves_Per_Simd,Lds_Size_In_Kb,Gds_Size_In_Kb,Num_Gws,Wave_Front_Size,Num_Xcc,Cu_Count,Array_Count,Num_Shader_Banks,Simd_Arrays_Per_Engine,Cu_Per_Simd_Array,Simd_Per_Cu,Max_Slots_Scratch_Cu,Gfx_Target_Version,Vendor_Id,Device_Id,Location_Id,Domain,Drm_Render_Minor,Num_Sdma_Engines,Num_Sdma_Xgmi_Engines,Num_Sdma_Queues_Per_Engine,Num_Cp_Queues,Max_Engine_Clk_Ccompute,Max_Engine_Clk_Fcompute,Sdma_Fw_Version,Fw_Version,Capability,Cu_Per_Engine,Max_Waves_Per_Cu,Family_Id,Workgroup_Max_Size,Grid_Max_Size,Local_Mem_Size,Hive_Id,Gpu_Id,Workgroup_Max_Dim_X,Workgroup_Max_Dim_Y,Workgroup_Max_Dim_Z,Grid_Max_Dim_X,Grid_Max_Dim_Y,Grid_Max_Dim_Z,Name,Vendor_Name,Product_Name,Model_Name
+[kernel-rename domain_stats.csv]
+columns: Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev
+[kernel-rename kernel_stats.csv]
+columns: Name,Calls,TotalDurationNs,AverageNs,Percentage,MinNs,MaxNs,StdDev
+vadd(float const*, float const*, float*, int) calls=1
+[kernel-rename kernel_trace.csv]
+columns: Kind,Agent_Id,Queue_Id,Stream_Id,Thread_Id,Dispatch_Id,Kernel_Id,Kernel_Name,Correlation_Id,Start_Timestamp,End_Timestamp,LDS_Block_Size,Scratch_Size,VGPR_Count,Accum_VGPR_Count,SGPR_Count,Workgroup_Size_X,Workgroup_Size_Y,Workgroup_Size_Z,Grid_Size_X,Grid_Size_Y,Grid_Size_Z
+[kernel-rename summary]
+

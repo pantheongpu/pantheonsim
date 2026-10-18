@@ -39,6 +39,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -64,7 +65,14 @@ struct Counter {
   const char* expression;     // "" for a hardware counter
   uint64_t (*value)(const DispatchStats&);
   const char* description;
+  // A counter that is a property of the agent, not something a dispatch does (what rocprofiler-sdk calls a
+  // constant): its value, whatever ran.
+  uint64_t (*constant)(const rocprofiler_agent_v0_t&) = nullptr;
 };
+
+#define AGENT_CONSTANT(field) \
+  {#field, "", "", nullptr, "Constant value " #field " from agent properties", \
+   [](const rocprofiler_agent_v0_t& a) -> uint64_t { return a.field; }}
 
 const Counter kCounters[] = {
     {"SQ_WAVES", "SQ", "", [](const DispatchStats& s) { return s.waves; },
@@ -203,6 +211,30 @@ const Counter kCounters[] = {
     {"TA_FLAT_ATOMIC_WAVEFRONTS_sum", "", "reduce(TA_FLAT_ATOMIC_WAVEFRONTS,sum)",
      [](const DispatchStats& s) { return s.counts.flat_atomic; },
      "Number of flat opcode atomics processed by the TA. Sum over TA instances."},
+    // Offered on Radeon cards only (rdna_counter below).
+    {"Wavefronts", "", "reduce(SQ_WAVES,sum)", [](const DispatchStats& s) { return s.waves; }, "Total wavefronts."},
+    // The constants a Radeon card offers (rocprofv3-avail on the RX 6800 and RX 6700 XT): the agent's properties.
+    AGENT_CONSTANT(num_xcc), AGENT_CONSTANT(array_count), AGENT_CONSTANT(num_gws), AGENT_CONSTANT(simd_id_base),
+    AGENT_CONSTANT(max_waves_per_simd), AGENT_CONSTANT(gfx_target_version), AGENT_CONSTANT(cpu_core_id_base),
+    AGENT_CONSTANT(location_id), AGENT_CONSTANT(wave_front_size), AGENT_CONSTANT(lds_size_in_kb),
+    AGENT_CONSTANT(simd_count), AGENT_CONSTANT(simd_per_cu), AGENT_CONSTANT(mem_banks_count),
+    AGENT_CONSTANT(cpu_cores_count), AGENT_CONSTANT(io_links_count), AGENT_CONSTANT(domain),
+    AGENT_CONSTANT(max_engine_clk_fcompute), AGENT_CONSTANT(caches_count), AGENT_CONSTANT(simd_arrays_per_engine),
+    AGENT_CONSTANT(gds_size_in_kb), AGENT_CONSTANT(cu_per_simd_array), AGENT_CONSTANT(max_slots_scratch_cu),
+    AGENT_CONSTANT(vendor_id), AGENT_CONSTANT(device_id), AGENT_CONSTANT(drm_render_minor),
+    AGENT_CONSTANT(num_sdma_engines), AGENT_CONSTANT(num_sdma_xgmi_engines), AGENT_CONSTANT(num_sdma_queues_per_engine),
+    AGENT_CONSTANT(hive_id), AGENT_CONSTANT(num_cp_queues), AGENT_CONSTANT(max_engine_clk_ccompute),
+    AGENT_CONSTANT(local_mem_size),
+    {"CU_NUM", "", "simd_count/simd_per_cu", nullptr, "CU_NUM",
+     [](const rocprofiler_agent_v0_t& a) -> uint64_t { return a.simd_per_cu ? a.simd_count / a.simd_per_cu : 0; }},
+    {"SIMD_NUM", "", "simd_count", nullptr, "SIMD Number",
+     [](const rocprofiler_agent_v0_t& a) -> uint64_t { return a.simd_count; }},
+    {"SE_NUM", "", "array_count/simd_arrays_per_engine", nullptr, "SE_NUM",
+     [](const rocprofiler_agent_v0_t& a) -> uint64_t {
+       return a.simd_arrays_per_engine ? a.array_count / a.simd_arrays_per_engine : 0;
+     }},
+    {"MAX_WAVE_SIZE", "", "wave_front_size", nullptr, "Max wave size constant",
+     [](const rocprofiler_agent_v0_t& a) -> uint64_t { return a.wave_front_size; }},
 };
 constexpr size_t kCounterCount = sizeof kCounters / sizeof kCounters[0];
 
@@ -211,6 +243,22 @@ constexpr size_t kCounterCount = sizeof kCounters / sizeof kCounters[0];
 // or texture unit a wave used -- the value a tool gets by summing a real GPU's
 // instances. An instance id is the counter's id above its position.
 const Counter* counter(uint64_t id) { return id >= 1 && id <= kCounterCount ? &kCounters[id - 1] : nullptr; }
+
+// The counters a Radeon card (gfx10 and later) offers that the interpreter counts exactly: of what rocprofv3-avail
+// lists on the RX 6800 and RX 6700 XT (gfx1030, gfx1031), the waves a dispatch starts. The card's other counters
+// are instruction counts the simulator also has (SQ_INSTS_VALU, ...), but none could be compared with the card's
+// own values -- rocprofv3 --pmc aborts on the machine they were measured on -- so they stay refused, like the
+// cycle, stall and cache counters that need a model of time. The names, blocks and descriptions are the card's.
+bool rdna_counter(const Counter& c) {
+  const std::string_view n = c.name;
+  return n == "SQ_WAVES" || n == "SQ_WAVES_sum" || n == "Wavefronts";
+}
+bool offers(const rocprofiler_agent_v0_t& a, uint64_t id) {
+  const Counter* c = counter(id);
+  if (!c || a.type != ROCPROFILER_AGENT_TYPE_GPU) return false;
+  if (a.gfx_target_version >= 100000) return rdna_counter(*c) || c->constant;
+  return !c->constant && std::string_view(c->name) != "Wavefronts";
+}
 uint64_t instance_id(uint64_t counter_id) { return counter_id << 32; }
 
 const rocprofiler_counter_record_dimension_info_t kDimension{"DIMENSION_INSTANCE", 1, 0};
@@ -388,6 +436,11 @@ struct Client {
 struct Agents {
   std::vector<rocprofiler_agent_v0_t> list;
   std::deque<std::string> strings;   // what the agents' names point into
+  // What a card's memory banks, caches and io links point into (kept where they were put: a deque's
+  // elements do not move when the agents do).
+  std::deque<std::vector<rocprofiler_agent_mem_bank_t>> banks;
+  std::deque<std::vector<rocprofiler_agent_cache_t>> caches;
+  std::deque<std::vector<rocprofiler_agent_io_link_t>> links;
   std::vector<int> ordinal;          // each agent's device, or -1 for the CPU
 };
 
@@ -462,6 +515,56 @@ uint32_t gfx_target_version(const std::string& gfx) {
 // have no scalar register allocation to report, and count compute units in pairs.
 constexpr uint32_t kRdnaFirst = 100000;
 
+// What KFD and rocprofv3 say of a Radeon card beyond what its profile carries, as rocprofv3 printed it on the
+// real card (amd/tools/rocprof-agent-inc.py generates the table from that output and the topology measured in
+// amd/registers/measurements). Keyed by the PCI device id; a card that was not measured has no entry and keeps
+// zeros there rather than a guess.
+struct CardBank { uint32_t heap, flags, width, clk; uint64_t size; };
+struct CardCache { uint64_t processor_id_low, size; uint32_t level, line, per_tag, association, type; };
+struct CardLink { uint32_t type, major, minor, weight, min_latency, max_latency, min_bandwidth, max_bandwidth,
+                  transfer, flags, node_to; };
+struct CardAgent {
+  uint32_t device_id;
+  const char* model_name;
+  uint64_t v[18];   // simd_id_base ... local_mem_size, in the order amd/tools/rocprof-agent-inc.py writes them
+  uint32_t sdma_fw, fw, capability, grid_x, grid_y, grid_z, rccl, rocdecode;
+  std::vector<CardBank> banks;
+  std::vector<CardCache> caches;
+  std::vector<CardLink> links;
+};
+const std::vector<CardAgent>& card_agents() {
+  static const std::vector<CardAgent> cards = {
+#include "rocprofiler_rdna_agents.inc"
+  };
+  return cards;
+}
+
+void apply_card(Agents& a, rocprofiler_agent_v0_t& g, const CardAgent& c) {
+  auto keep = [&](const char* v) { return a.strings.emplace_back(v).c_str(); };
+  g.simd_id_base = c.v[0], g.num_gws = c.v[1], g.num_xcc = c.v[2], g.array_count = c.v[3];
+  g.num_shader_banks = c.v[4], g.simd_arrays_per_engine = c.v[5], g.cu_per_simd_array = c.v[6];
+  g.max_slots_scratch_cu = c.v[7], g.num_sdma_engines = c.v[8], g.num_sdma_xgmi_engines = c.v[9];
+  g.num_sdma_queues_per_engine = c.v[10], g.num_cp_queues = c.v[11];
+  g.max_engine_clk_ccompute = c.v[12], g.max_engine_clk_fcompute = c.v[13];
+  g.cu_per_engine = c.v[14], g.family_id = c.v[15], g.grid_max_size = c.v[16], g.local_mem_size = c.v[17];
+  g.sdma_fw_version.Value = c.sdma_fw, g.fw_version.Value = c.fw, g.capability.Value = c.capability;
+  g.grid_max_dim = {c.grid_x, c.grid_y, c.grid_z};
+  g.runtime_visibility.rccl = c.rccl, g.runtime_visibility.rocdecode = c.rocdecode;
+  g.model_name = keep(c.model_name);
+  auto& banks = a.banks.emplace_back();
+  for (const CardBank& b : c.banks) banks.push_back({{b.heap}, {b.flags}, b.width, b.clk, b.size});
+  auto& caches = a.caches.emplace_back();
+  for (const CardCache& k : c.caches)
+    caches.push_back({k.processor_id_low, k.size, k.level, k.line, k.per_tag, k.association, 0, {k.type}});
+  auto& links = a.links.emplace_back();
+  for (const CardLink& l : c.links)
+    links.push_back({{l.type}, l.major, l.minor, 0, l.node_to, l.weight, l.min_latency, l.max_latency,
+                     l.min_bandwidth, l.max_bandwidth, l.transfer, {l.flags}});
+  g.mem_banks = banks.data(), g.mem_banks_count = static_cast<uint32_t>(banks.size());
+  g.caches = caches.data(), g.caches_count = static_cast<uint32_t>(caches.size());
+  g.io_links = links.data(), g.io_links_count = static_cast<uint32_t>(links.size());
+}
+
 // The machine's agents as KFD numbers them: the CPU first, then each GPU.
 // What a GPU's profile does not say (its shader engines and arrays, its
 // XCDs, its engines' firmware) is left zero rather than guessed.
@@ -524,6 +627,8 @@ Agents build_agents() {
     g.runtime_visibility.hsa = 1;
     g.runtime_visibility.hip = 1;
     std::memcpy(g.uuid.bytes, d.uuid, sizeof g.uuid.bytes);
+    for (const CardAgent& c : card_agents())
+      if (c.device_id == d.device_id && rdna) apply_card(a, g, c);
     a.list.push_back(g);
     a.ordinal.push_back(i);
   }
@@ -533,6 +638,10 @@ Agents build_agents() {
     a.list[i].logical_node_type_id = a.ordinal[i] < 0 ? 0 : a.ordinal[i];
     // An agent's id is its node, from 1: zero is no agent.
     a.list[i].id.handle = i + 1;
+    // A card's io link runs from its own node.
+    if (a.list[i].io_links)
+      for (uint32_t k = 0; k < a.list[i].io_links_count; ++k)
+        const_cast<rocprofiler_agent_io_link_t&>(a.list[i].io_links[k]).node_from = a.list[i].node_id;
   }
   return a;
 }
@@ -937,7 +1046,9 @@ void on_launched(const hp::Launch&, const DispatchStats* stats, uint64_t start, 
     for (uint64_t id : cfg.counters) {
       rocprofiler_counter_record_t r{};
       r.id = instance_id(id);
-      r.counter_value = static_cast<double>(counter(id)->value(*stats));
+      const Counter* ct = counter(id);
+      const rocprofiler_agent_v0_t* ag = ct->constant ? agent(s, f->info.agent_id.handle) : nullptr;
+      r.counter_value = static_cast<double>(ct->constant ? (ag ? ct->constant(*ag) : 0) : ct->value(*stats));
       r.dispatch_id = f->info.dispatch_id;
       r.user_data = k.user;
       r.agent_id = f->info.agent_id;
@@ -1153,8 +1264,8 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_agent_supported_counter
   }
   if (!a) return ROCPROFILER_STATUS_ERROR_AGENT_NOT_FOUND;
   std::vector<rocprofiler_counter_id_t> ids;
-  if (a->type == ROCPROFILER_AGENT_TYPE_GPU)
-    for (uint64_t i = 1; i <= kCounterCount; ++i) ids.push_back({i});
+  for (uint64_t i = 1; i <= kCounterCount; ++i)
+    if (offers(*a, i)) ids.push_back({i});
   return cb(agent_id, ids.data(), ids.size(), user_data);
 }
 
@@ -1165,6 +1276,7 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_query_counter_info(rocprofiler_
   if (!c) return ROCPROFILER_STATUS_ERROR_COUNTER_NOT_FOUND;
   if (!info) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
   const bool derived = *c->expression != '\0';
+  const bool constant = c->constant != nullptr && !derived;
   if (version == ROCPROFILER_COUNTER_INFO_VERSION_0) {
     auto* v = static_cast<rocprofiler_counter_info_v0_t*>(info);
     *v = {};
@@ -1174,6 +1286,7 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_query_counter_info(rocprofiler_
     v->block = c->block;
     v->expression = c->expression;
     v->is_derived = derived;
+    v->is_constant = constant;
     return ROCPROFILER_STATUS_SUCCESS;
   }
   if (version == ROCPROFILER_COUNTER_INFO_VERSION_1) {
@@ -1204,6 +1317,7 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_query_counter_info(rocprofiler_
     v->block = c->block;
     v->expression = c->expression;
     v->is_derived = derived;
+    v->is_constant = constant;
     v->dimensions_count = 1;
     v->dimensions = const_cast<const rocprofiler_counter_record_dimension_info_t**>(kDimensions);
     v->dimensions_instances_count = 1;
@@ -1246,6 +1360,7 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_create_counter_config(rocprofil
   cfg.agent = agent_id.handle;
   for (size_t i = 0; i < counters_count; ++i) {
     if (!counter(counters_list[i].handle)) return ROCPROFILER_STATUS_ERROR_COUNTER_NOT_FOUND;
+    if (!offers(*a, counters_list[i].handle)) return ROCPROFILER_STATUS_ERROR_COUNTER_NOT_FOUND;
     cfg.counters.push_back(counters_list[i].handle);
   }
   config_id->handle = s.next_config++;
