@@ -17,6 +17,11 @@ each key, sets the matching `VGPU_*` variable unless that variable is already
 set. The libraries your program loads only ever see the variables, so
 everything in [cli.md](cli.md) about those variables still holds.
 
+A complete example, with every key and its allowed values, is
+[pantheonsim.example.yaml](../pantheonsim.example.yaml) at the repository root:
+`./run pantheonsim.example.yaml` uses it as it is, and copying it to
+`pantheonsim.yaml` makes it your default.
+
 ## Where the file is looked for
 
 The first of these that exists is used. Only one file is read; they are not

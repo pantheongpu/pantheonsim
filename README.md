@@ -26,7 +26,7 @@ Inside, `nvidia-smi` shows the GPUs, and you can compile, download programs with
 
 ## Choose your machine
 
-Put the settings in a file (`./run` writes a commented one), for example `my.yaml`, then `./run my.yaml`:
+Put the settings in a file, for example `my.yaml`, then `./run my.yaml`. [pantheonsim.example.yaml](pantheonsim.example.yaml) lists every setting and runs as it is (`./run pantheonsim.example.yaml`); copy it to `pantheonsim.yaml` to make it the default, which is also what `./run` writes for you on a first run:
 
 ```yaml
 gpu: nvidia/h100     # which GPU (build/vgpu list-gpus shows them all)
