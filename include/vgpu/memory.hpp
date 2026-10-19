@@ -193,6 +193,30 @@ class MemoryManager {
   // naturally aligned. Values are zero-extended into the returned u64.
   uint64_t load_scalar(uint64_t addr, uint32_t size) const;
   void store_scalar(uint64_t addr, uint32_t size, uint64_t value);
+  // A read-modify-write of one naturally aligned scalar (a device atomic) with one
+  // table lookup instead of load_scalar's and store_scalar's two. rmw_begin
+  // returns true and the value in memory only for the ordinary case -- no fault
+  // armed or stuck cell, no host mapping in reach, an aligned access inside one
+  // ordinary allocation; otherwise it returns false having changed nothing and
+  // the caller makes the two accesses with load_scalar and store_scalar, errors
+  // and all. rmw_commit then does what store_scalar does for `value` (a store of
+  // the byte a uniform chunk already holds changes nothing; an untouched or
+  // uniform chunk becomes real) and throws what it would.
+  struct ScalarRmw {
+    void* allocation = nullptr;
+    uint64_t chunk_idx = 0, in_chunk = 0;
+  };
+  bool rmw_begin(uint64_t addr, uint32_t size, ScalarRmw& at, uint64_t* old) const;
+  void rmw_commit(const ScalarRmw& at, uint32_t size, uint64_t value);
+  // The fields of one record (a texel's channels) read together: field i is
+  // `bytes[i]` bytes (0, 1, 2, 4 or 8; 0 reads as zero and takes no space) at the
+  // end of the one before, each read as load_scalar would read it. One table
+  // lookup serves all four. Returns false, having read nothing, whenever the
+  // fields could differ from four load_scalar calls -- a fault armed or a stuck
+  // cell, a host mapping in reach, a field not naturally aligned or outside the
+  // one ordinary allocation the first lies in -- and the caller then reads them
+  // one at a time, errors and all.
+  bool load_fields(uint64_t addr, const uint8_t bytes[4], uint64_t out[4]) const;
   // Sixteen naturally aligned bytes as one access, as a GPU moves a wide load
   // or store (global_load_dwordx4): a kernel on another host thread sees them
   // all old or all new, never half of each. rocPRIM's decoupled look-back

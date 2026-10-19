@@ -1436,6 +1436,14 @@ bool wrap_coord(TexAddress mode, int64_t v, uint32_t size, uint32_t* out) {
   return true;
 }
 
+struct TexelCache {
+  bool valid = false;
+  uint64_t addr = 0;
+  decltype(TextureDesc::channel_bits) bits{};
+  uint64_t raw[4] = {};
+};
+thread_local TexelCache t_texel;
+
 // Reads one channel's raw bits out of a texel.
 uint64_t texel_channel_bits(const MemoryManager& mem, const TextureDesc& d, uint64_t texel_addr, uint32_t ch) {
   if (d.packed_1010102) {   // 10:10:10:2, x in the low bits
@@ -1447,6 +1455,26 @@ uint64_t texel_channel_bits(const MemoryManager& mem, const TextureDesc& d, uint
   for (uint32_t i = 0; i < ch; ++i) offset += d.channel_bits[i] / 8;
   const uint32_t bytes = d.channel_bits[ch] / 8;
   if (bytes == 0) return 0;
+  // A texel of several channels: the first channel read reads all of them, with one lookup of the
+  // address (MemoryManager::load_fields) instead of one per channel; the rest of
+  // the fetch finds them here. texture_fetch clears this, the memory being free to
+  // change between fetches. Whenever load_fields declines, the channel is read as
+  // before, errors and all.
+  if (d.channel_bits[1] != 0 && ch < 4 && g_fast_path.load(std::memory_order_relaxed)) {
+    TexelCache& c = t_texel;
+    if (!(c.valid && c.addr == texel_addr && c.bits[0] == d.channel_bits[0] && c.bits[1] == d.channel_bits[1] &&
+          c.bits[2] == d.channel_bits[2] && c.bits[3] == d.channel_bits[3])) {
+      uint8_t nb[4];
+      for (uint32_t i = 0; i < 4; ++i) nb[i] = static_cast<uint8_t>(d.channel_bits[i] / 8);
+      c.valid = false;
+      if (mem.load_fields(texel_addr, nb, c.raw)) {
+        c.valid = true;
+        c.addr = texel_addr;
+        for (uint32_t i = 0; i < 4; ++i) c.bits[i] = d.channel_bits[i];
+      }
+    }
+    if (c.valid) return c.raw[ch];
+  }
   return mem.load_scalar(texel_addr + offset, bytes);
 }
 
@@ -13128,6 +13156,25 @@ class Interpreter {
             continue;
           }
         }
+        // Device memory in the ordinary case: one table lookup serves the read
+        // and the write (rmw_begin declines whenever load_scalar and
+        // store_scalar could behave differently: a fault armed, a host mapping,
+        // a misaligned or unmapped address, which then take the two-step path).
+        if (fast_enabled_ && !is_shared(addr) && !is_local(addr) &&
+            !(addr >= kParamVaBase && addr < kParamVaBase + kParamVaSize)) {
+          MemoryManager::ScalarRmw at;
+          uint64_t old = 0;
+          if (mem_.rmw_begin(addr, size, at, &old)) {
+            const uint64_t nv = compute(old);
+            try {
+              mem_.rmw_commit(at, size, nv);
+            } catch (const Error& e) {
+              rethrow_with_context(e, ins, static_cast<int>(lane));
+            }
+            r[lane] = old;
+            continue;
+          }
+        }
         const uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
         store_routed(w, ctx, ins, lane, addr, size, compute(old));
         r[lane] = old;
@@ -15656,6 +15703,7 @@ const TextureDesc& texture_lookup(const TextureTable* table, uint64_t handle, Te
 }
 
 void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetch& f, uint32_t out[4]) {
+  t_texel.valid = false;
   t_bc.valid = false;   // the memory a block was decoded from may have changed since the last fetch
   if (!f.grad) {
     fetch_texel(mem, d, f, out);
