@@ -75,6 +75,7 @@ WORKLOADS = {
     "smem": ("memory", "scalar loads: s_load_dword / s_load_dwordx4 of wave-uniform table entries", BOTH),
     "buf": ("memory", "raw buffer loads and stores with per-lane offsets, some past the end of the resource", BOTH),
     "ldsx": ("memory", "wide LDS accesses (ds_write_b128 / ds_read_b128) and LDS atomic adds with barriers", BOTH),
+    "flat": ("memory", "generic-pointer loads and stores that reach global memory (flat_load_dword / flat_store_dword)", BOTH),
     "atomics": ("memory", "global atomic add (one address, 256 bins), max, a CAS loop", BOTH),
     "divergent": ("control", "data-dependent while loop (collatz) and a switch: divergent branches", BOTH),
     "wave": ("control", "shuffles (ds_bpermute / DPP), ballot, any/all", BOTH),

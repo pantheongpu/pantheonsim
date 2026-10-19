@@ -274,6 +274,18 @@ __global__ void k_ldsx(const uint32_t* in, uint32_t* out, uint32_t* hist, uint32
   if (threadIdx.x < 64) hist[blockIdx.x * 64 + threadIdx.x] = bins[threadIdx.x];
 }
 
+// Generic pointers: flat loads and stores that reach global memory (the aperture checks and then the access).
+__global__ void k_flat(const uint32_t* in, uint32_t* out, uint32_t n, uint32_t reps, uint32_t sel) {
+  __shared__ uint32_t s[256];
+  s[threadIdx.x] = threadIdx.x * 7u;
+  __syncthreads();
+  const uint32_t* src = sel ? (const uint32_t*)s : in;   // (sel is 0: the global array; the compiler cannot know)
+  uint32_t* dst = sel ? (uint32_t*)s : out;
+  uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+  for (uint32_t r = 0; r < reps; ++r)
+    for (uint32_t i = t; i < n; i += gridDim.x * blockDim.x) dst[i] = src[(sel ? threadIdx.x : i)] * 3u + r;
+}
+
 // ---------------------------------------------------------------- atomics
 
 __global__ void k_atomics(uint32_t* one, uint32_t* bins, uint32_t* maxv, uint32_t* cas, uint32_t iters) {
@@ -593,6 +605,20 @@ static void run_ldsx(const std::string& size) {
   expect_eq("ldsx_out", go.data(), ro.data(), blocks * 256 * 4);
   expect_eq("ldsx_hist", gh.data(), rh.data(), blocks * 64 * 4);
 }
+static void run_flat(const std::string& size) {
+  const uint32_t n = 1u << 16, reps = scale(size, 4, 400);
+  std::vector<uint32_t> in(n);
+  for (uint32_t i = 0; i < n; ++i) in[i] = i * 2654435761u + 3;
+  uint32_t *din = dev_copy(in), *o;
+  HC(hipMalloc(&o, n * 4));
+  Phase p;
+  LAUNCH(k_flat, dim3(64), dim3(256), 0, 0, (const uint32_t*)din, o, n, reps, 0u);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  std::vector<uint32_t> got = dev_read(o, n), ref(n);
+  for (uint32_t i = 0; i < n; ++i) ref[i] = in[i] * 3u + (reps - 1);
+  expect_eq("flat", got.data(), ref.data(), n * 4);
+}
 static void run_atomics(const std::string& size) {
   const uint32_t blocks = 16, threads = 256, iters = scale(size, 4, 200), n = blocks * threads;
   uint32_t* d;
@@ -736,6 +762,7 @@ int main(int argc, char** argv) {
   else if (w == "smem") run_smem(size);
   else if (w == "buf") run_buf(size);
   else if (w == "ldsx") run_ldsx(size);
+  else if (w == "flat") run_flat(size);
   else if (w == "atomics") run_atomics(size);
   else if (w == "divergent") run_divergent(size);
   else if (w == "wave") run_wave(size);

@@ -7462,13 +7462,23 @@ struct Machine {
     const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);
     const uint32_t bytes_per_lane = access_bytes(in, mf);
     bool lds = false, priv = false;
-    for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      if (!(w.exec >> lane & 1)) continue;
-      const uint64_t addr = flat_address(w, in, lane, bytes_per_lane);
-      lds = lds || in_lds(addr);
-      uint32_t owner;
-      uint64_t where;
-      priv = priv || private_flat(lane, addr, &owner, &where);
+    if (w.exec) {
+      // Which aperture each lane's address is in, for the instruction as a whole: flat_address and private_flat for every
+      // lane, with what does not change between lanes (the scalar base, the immediate offset, the target) worked out once
+      // and a plain vector register read straight out of the file, as lane_src does.
+      const Operand& a0 = in.src[0];
+      const bool direct = a0.kind == OperandKind::Vgpr && a0.sel == 6 && !dpp_operand;
+      const uint64_t sbase = in.has_saddr ? scalar_field(w, in.saddr, true) : 0;
+      const uint64_t imm = static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+      const bool g1250 = d.object && d.object->gfx1250();
+      for (uint64_t live = w.exec; live; live &= live - 1) {
+        const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(live));
+        const uint64_t addr = (in.has_saddr ? sbase + scaled_offset(in, direct ? w.vgpr[a0.index][lane] : lane_src(w, a0, lane), bytes_per_lane)
+                               : direct    ? (w.vgpr[a0.index][lane] | static_cast<uint64_t>(w.vgpr[a0.index + 1][lane]) << 32)
+                                           : lane_src64(w, a0, lane)) + imm;
+        lds = lds || addr - kSharedBase < kSharedSize;
+        priv = priv || (g1250 && (addr >> 58) == 1) || addr - kPrivateBase < kPrivateSize;
+      }
     }
     if (!lds && !priv) {
       global_access(w, in);
