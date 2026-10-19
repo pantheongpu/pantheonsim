@@ -3,7 +3,9 @@
 // disassembler corpora (nvidia/tests/data/sass, sm_75 to sm_120), each decoded for every architecture, and for
 // a few hundred thousand words made by flipping bits of the corpus words (so refusals, odd forms and the
 // architecture-specific paths are covered too). Each pass is folded into a 128-bit digest and compared with the
-// digest the unmodified decoder gave (the table below).
+// digest the unmodified decoder gave (the table below). (Round 10b regenerated the table for FFMA2/FMUL2/FADD2: with the corpora grown by the
+// packed fp32 lines, the unmodified decoder's dump and the new one's differ in exactly the words with low opcode bits 0x49-0x4b on sm_100 and sm_103
+// that have an operand form -- docs/perf-design/round10-ffma2.md, "Same bits".)
 //
 // VGPU_DECODE_PRINT=1 prints the digests (to regenerate the table after a decoder change that is meant to change
 // them); VGPU_DECODE_DUMP=<dir> writes the full dump of every pass, so two builds can be diffed to see which
@@ -140,7 +142,7 @@ VTEST(the_corpora_decode_to_the_same_bits_on_every_architecture) {
   uint64_t pc = 0;
   for (const sass::Word& w : corpus_words()) words.push_back({w, (pc += 16) & 0xfffff0});
   const std::vector<int> archs(std::begin(kArchs), std::end(kArchs));
-  check("corpora", run_pass("corpora", words, archs), "4c20784191a7780b12b947e4d2c50776");
+  check("corpora", run_pass("corpora", words, archs), "b0610253d22d34de67f2b6ad5afa5614");
 }
 
 VTEST(words_with_flipped_bits_decode_to_the_same_bits) {
@@ -157,7 +159,7 @@ VTEST(words_with_flipped_bits_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {75, 86, 90, 100, 120};
-  check("flipped", run_pass("flipped", words, archs), "9efdd73006b48260b5fc29ebf789d258");
+  check("flipped", run_pass("flipped", words, archs), "fe295cb00fa3a656faf229a23b70e6d6");
 }
 
 VTEST(random_opcodes_decode_to_the_same_bits) {
@@ -170,7 +172,7 @@ VTEST(random_opcodes_decode_to_the_same_bits) {
     words.push_back({w, 16 * (rng.next() % 4096)});
   }
   const std::vector<int> archs = {80, 89, 103, 120};
-  check("random", run_pass("random", words, archs), "ef9d581527f0ef870f34e41a5fb49465");
+  check("random", run_pass("random", words, archs), "6f63ec9a7e4ce0e932ee94353385d6af");
 }
 
 VTEST(bench_decode) {
