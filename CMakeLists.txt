@@ -1363,6 +1363,13 @@ target_sources(test_mpeg2_decode PRIVATE nvidia/src/mpeg2_decode.cpp nvidia/src/
 target_compile_definitions(test_mpeg2_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_sass_decode nvidia/tests/unit/test_sass_decode.cpp)
 target_compile_definitions(test_sass_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The decoder's output, bit for bit, over the same corpora and mutations of them (round 10: the decoder is made faster).
+vgpu_unit_test(test_decode_same_bits nvidia/tests/unit/test_decode_same_bits.cpp)
+target_include_directories(test_decode_same_bits PRIVATE src)
+target_compile_definitions(test_decode_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# sass::unsupported's table of words it has seen: the answer and the text of a refusal are the same with or without it.
+vgpu_unit_test(test_unsupported_memo tests/unit/test_unsupported_memo.cpp)
+target_compile_definitions(test_unsupported_memo PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The tier's analysis (src/sass/tier.cpp) over the same corpora.
 vgpu_unit_test(test_tier)
 target_include_directories(test_tier PRIVATE src)

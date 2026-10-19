@@ -3810,16 +3810,49 @@ const std::unordered_map<unsigned, Dec>& fixed_table() {
 
 }  // namespace
 
+// The decoder tables as arrays indexed by the opcode (or its low bits): the maps above stay the one place that lists
+// them, and a look-up is a load instead of a hash and a bucket walk -- it ran once per instruction decoded, and a
+// process decodes a million of them loading the cubins of a PyTorch run.
+namespace {
+
+template <class F>
+struct DirectTable {
+  std::vector<F> by_key;
+  DirectTable(const std::unordered_map<unsigned, F>& m, unsigned size) : by_key(size, nullptr) {
+    for (const auto& [k, f] : m) by_key.at(k) = f;
+  }
+  F find(unsigned k) const { return k < by_key.size() ? by_key[k] : nullptr; }
+};
+
+const DirectTable<Dec>& fixed_direct() {
+  static const DirectTable<Dec> t(fixed_table(), 4096);
+  return t;
+}
+const DirectTable<Dec>& float_direct() {
+  static const DirectTable<Dec> t(float_table(), 512);
+  return t;
+}
+const DirectTable<AluDec>& alu_direct() {
+  static const DirectTable<AluDec> t(alu_table(), 128);
+  return t;
+}
+
+}  // namespace
+
 Instr decode(const Word& w, uint64_t pc, int sm) {
   Instr ins;
+  // Most instructions have up to three sources and one destination: the vectors grow once, not by 1, 2, 4.
+  ins.src.reserve(4);
+  ins.dst.reserve(2);
+  ins.mods.reserve(4);
   ins.w = w;
   ins.pc = pc;
   ins.sm = sm;
   ins.guard = static_cast<uint8_t>(w.field(12, 3));
   ins.guard_not = w.bit(15);
   const unsigned opc = static_cast<unsigned>(w.field(0, 12));
-  if (const auto it = fixed_table().find(opc); it != fixed_table().end()) {
-    it->second(ins, w);
+  if (const Dec fixed = fixed_direct().find(opc)) {
+    fixed(ins, w);
     // The uniform datapath's own ops take a UP guard.
     if (opc == 0x9c3 || opc == 0xab9 || opc == 0xabb || opc == 0x89c || opc == 0x5b2 || opc == 0x5b4 || opc == 0x3b4 ||
         opc == 0x3b5 || opc == 0x3b6 || opc == 0x3ba || opc == 0x3bb || opc == 0x3bc || opc == 0x5b8 ||
@@ -3833,8 +3866,8 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
   // Ops with their own decoders that take the ALU operand forms (bits 9-11),
   // whatever bit 8 holds.
   if (w.field(9, 3) != 0) {
-    if (const auto it = float_table().find(low9); it != float_table().end()) {
-      it->second(ins, w);
+    if (const Dec dec = float_direct().find(low9)) {
+      dec(ins, w);
       if ((low9 & 0x180) == 0x80) ins.guard_uniform = true;
       return ins;
     }
@@ -3861,13 +3894,13 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
       ins.guard_uniform = true;
       return ins;
     }
-    if (const auto it = alu_table().find(low9 & 0x7f); it != alu_table().end()) {
-      it->second(ins, w, uniform);
+    if (const AluDec dec = alu_direct().find(low9 & 0x7f)) {
+      dec(ins, w, uniform);
       ins.guard_uniform = uniform;   // the uniform datapath's guards are UP<n>
       return ins;
     }
-    if (const auto it = float_table().find(low9); it != float_table().end()) {
-      it->second(ins, w);
+    if (const Dec dec = float_direct().find(low9)) {
+      dec(ins, w);
       return ins;
     }
   }
