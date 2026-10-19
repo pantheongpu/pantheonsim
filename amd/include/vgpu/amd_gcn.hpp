@@ -70,18 +70,23 @@ struct MemFacts {
   uint8_t atomic_bytes = 0;     // an atomic: its size, else 0
   uint8_t transpose_bits = 0;   // a transposing load: its element size in bits, else 0
   uint8_t smem_bytes = 0;       // s_load_u8 / i8 / u16 / i16: 1 or 2
-  bool narrow_sign = false;
-  bool half_sign = false, half_hi = false, half_store = false;
-  bool body_store = false;      // the name past its segment begins "store"
-  bool body_atomic = false;     // ... begins "atomic_"
-  bool load_dword = false, store_dword = false, load_monitor = false;   // ... begins "load_dword", "store_dword", "load_monitor_b"
-  bool formatted = false;       // ... begins "load_format_" or "store_format_"
-  bool buf_wide = false;        // a buffer atomic on 64 bits (atomic_cmpswap_x2)
-  bool s_wide = false;          // a scalar atomic on 64 bits
-  bool smem_sign = false;       // s_load_i8 / i16
-  bool smem_realtime = false;   // s_memrealtime (s_memtime is the other of the Time kind)
-  bool ds_name = false;         // the name begins "ds_" (then past-"ds_" is the part this calls the body)
-  bool scratch_store = false, scratch_load = false;   // the name begins "scratch_store" / "scratch_load"
+  bool narrow_sign : 1 = false;
+  bool half_sign : 1 = false;
+  bool half_hi : 1 = false;
+  bool half_store : 1 = false;
+  bool body_store : 1 = false;      // the name past its segment begins "store"
+  bool body_atomic : 1 = false;     // ... begins "atomic_"
+  bool load_dword : 1 = false;
+  bool store_dword : 1 = false;
+  bool load_monitor : 1 = false;   // ... begins "load_dword", "store_dword", "load_monitor_b"
+  bool formatted : 1 = false;       // ... begins "load_format_" or "store_format_"
+  bool buf_wide : 1 = false;        // a buffer atomic on 64 bits (atomic_cmpswap_x2)
+  bool s_wide : 1 = false;          // a scalar atomic on 64 bits
+  bool smem_sign : 1 = false;       // s_load_i8 / i16
+  bool smem_realtime : 1 = false;   // s_memrealtime (s_memtime is the other of the Time kind)
+  bool ds_name : 1 = false;         // the name begins "ds_" (then past-"ds_" is the part this calls the body)
+  bool scratch_store : 1 = false;
+  bool scratch_load : 1 = false;   // the name begins "scratch_store" / "scratch_load"
 };
 
 // The encodings, by the ISA's names for them.

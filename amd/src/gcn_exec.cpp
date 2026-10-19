@@ -127,6 +127,23 @@ class OpName {
   uint64_t hash_;
 };
 
+// A copy of an instruction, made only where one is changed (VGPR indexing, the VGPR MSBs of gfx1250). Out of line, so that
+// the code of Machine::step that runs for every instruction stays small enough for the compiler to inline its callees.
+struct InstCopy {
+  Inst* p = nullptr;
+  InstCopy() = default;
+  InstCopy(const InstCopy&) = delete;
+  InstCopy& operator=(const InstCopy&) = delete;
+  ~InstCopy() {
+    if (p) release();
+  }
+  [[gnu::noinline]] void make(const Inst& in) { p = new Inst(in); }
+  [[gnu::noinline]] void release() {
+    delete p;
+    p = nullptr;
+  }
+};
+
 float as_float(uint32_t bits) {
   float f;
   std::memcpy(&f, &bits, 4);
@@ -6474,6 +6491,15 @@ struct Machine {
   // address past the work-group's LDS (a read gives zero and a write goes nowhere; a work-group given no LDS at all
   // is caught) as the cases of lds_access's ladder. False, having done nothing, where an operand is not a plain
   // vector register or a cross-lane instruction is running; the ladder then does it.
+  // An LDS access past the work-group's LDS: a read gives zero and a write goes nowhere, but a work-group given no LDS at
+  // all is almost always a launch that did not pay for the LDS its kernel uses, and is caught (see lds_access).
+  [[gnu::noinline]] uint8_t* outside_lds(const Group& g, uint64_t a, uint8_t* outside) const {
+    if (g.lds.empty() && a < lds_limit(d))
+      throw Error::make(Err::InvalidValue, "an LDS access at ", a, " in a work-group given no LDS: the launch ",
+                        "did not pay for the LDS its kernel uses");
+    std::memset(outside, 0, 16);
+    return outside;
+  }
   bool lds_fast(Wave& w, const Inst& in, Group& g, gcn::LdsOp op) {
     using L = gcn::LdsOp;
     if (dpp_operand || narrow_dst) return false;
@@ -6491,14 +6517,12 @@ struct Machine {
     const uint64_t off = static_cast<uint64_t>(in.offset);
     const uint64_t off0 = uint64_t{static_cast<uint32_t>(in.offset)} * 4, off1 = uint64_t{static_cast<uint32_t>(in.offset1)} * 4;
     alignas(16) uint8_t outside[16];
-    const auto at = [&](uint32_t addr, uint64_t offset, uint64_t bytes) -> uint8_t* {
+    uint8_t* const lds = g.lds.data();
+    const uint64_t lds_size = g.lds.size();
+    const auto at = [&](uint32_t addr, uint64_t offset, uint64_t bytes) __attribute__((always_inline)) -> uint8_t* {
       const uint64_t a = static_cast<uint32_t>(addr + offset);
-      if (a + bytes <= g.lds.size()) return &g.lds[a];
-      if (g.lds.empty() && a < lds_limit(d))
-        throw Error::make(Err::InvalidValue, "an LDS access at ", a, " in a work-group given no LDS: the launch ",
-                          "did not pay for the LDS its kernel uses");
-      std::memset(outside, 0, sizeof outside);
-      return outside;
+      if (a + bytes <= lds_size) return lds + a;
+      return outside_lds(g, a, outside);
     };
     for (uint64_t live = w.exec; live; live &= live - 1) {
       const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(live));
@@ -8484,12 +8508,6 @@ struct Machine {
     return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(reg)) * bytes);
   }
 
-  // The lane's address in a global access: a 64-bit one in a register pair, or a scalar base with a 32-bit offset a lane.
-  uint64_t global_lane_address(const Wave& w, const Inst& in, uint32_t lane, uint32_t access_bytes) const {
-    const uint64_t offset_reg = in.has_saddr ? scaled_offset(in, lane_src(w, in.src[0], lane), access_bytes) : 0;
-    return (in.has_saddr ? scalar_field(w, in.saddr, true) + offset_reg : lane_src64(w, in.src[0], lane)) +
-           static_cast<uint64_t>(static_cast<int64_t>(in.offset));
-  }
   // The lanes from `lane` (whose address is `addr`) that are active and take consecutive addresses, `run_words` whole words
   // each, moved with one call to the memory manager (MemoryManager::load_run / store_run, or the quad calls where each lane
   // moves sixteen aligned bytes, which are one access): what lane by lane would do -- every aligned word or pair still one
@@ -8502,8 +8520,17 @@ struct Machine {
     const uint32_t stride = 4 * run_words;
     uint32_t count = 1;
     uint64_t next = addr;   // (the address lane + count would have)
-    while (lane + count < kLanes && (w.exec >> (lane + count) & 1) &&
-           global_lane_address(w, in, lane + count, access_bytes) == (next += stride))
+    // (The lane's address in a global access -- a 64-bit one in a register pair, or a scalar base with a 32-bit offset a lane -- with the scalar base read once -- nothing in the loop writes a scalar register -- and a
+    // plain vector register read straight out of the file, as lane_src does.)
+    const Operand& a0 = in.src[0];
+    const bool direct = a0.kind == OperandKind::Vgpr && a0.sel == 6 && !dpp_operand;
+    const uint64_t sbase = in.has_saddr ? scalar_field(w, in.saddr, true) : 0;
+    const uint64_t imm = static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+    const auto address = [&](uint32_t l) -> uint64_t {
+      if (in.has_saddr) return sbase + scaled_offset(in, direct ? w.vgpr[a0.index][l] : lane_src(w, a0, l), access_bytes) + imm;
+      return (direct ? (w.vgpr[a0.index][l] | static_cast<uint64_t>(w.vgpr[a0.index + 1][l]) << 32) : lane_src64(w, a0, l)) + imm;
+    };
+    while (lane + count < kLanes && (w.exec >> (lane + count) & 1) && address(lane + count) == (next += stride))
       ++count;
     if (count < 2 || dup) return 0;
     // (Not 16-byte aligned fours, where a pair is the biggest access.)
@@ -8603,13 +8630,17 @@ struct Machine {
     // call (memory_run, below); a refused try, or no run, turns it off for the rest of the instruction.
     const uint32_t run_words = kind == Kind::Load ? in.dst[0].width : kind == Kind::Store ? in.src[1].width : 0;
     bool try_runs = (run_words == 1 || run_words == 2 || run_words == 4) && d.peers.empty() && runs_on;
+    // (The address register read straight out of the file where it is a plain vector register, as lane_src does.)
+    const Operand& a0 = in.src[0];
+    const bool a0_vgpr = a0.kind == OperandKind::Vgpr && a0.sel == 6 && !dpp_operand;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // The address is a 64-bit one in a register pair, or a scalar base with
       // a 32-bit offset per lane.
-      const uint64_t offset_reg = in.has_saddr ? scaled_offset(in, lane_src(w, in.src[0], lane), access_bytes) : 0;
+      const uint64_t offset_reg = in.has_saddr ? scaled_offset(in, a0_vgpr ? w.vgpr[a0.index][lane] : lane_src(w, a0, lane), access_bytes) : 0;
       const uint64_t addr = (in.has_saddr ? saddr_base + offset_reg
-                                          : lane_src64(w, in.src[0], lane)) +
+                             : a0_vgpr    ? (w.vgpr[a0.index][lane] | static_cast<uint64_t>(w.vgpr[a0.index + 1][lane]) << 32)
+                                          : lane_src64(w, a0, lane)) +
                             static_cast<uint64_t>(static_cast<int64_t>(in.offset));
       if (try_runs) {
         // (A load whose first address the lane before it just read takes the value that read had: not a run.)
@@ -8624,8 +8655,15 @@ struct Machine {
       }
       switch (kind) {
         case Kind::Narrow:
-          if (narrow_store) store(addr, n.bytes, lane_src(w, in.src[1], lane));
-          else write_lane(w, in.dst[0], lane, widen(load_once(addr, n.bytes), n));
+          if (narrow_store) {
+            const Operand& data = in.src[1];
+            store(addr, n.bytes, data.kind == OperandKind::Vgpr && data.sel == 6 && !dpp_operand ? w.vgpr[data.index][lane] : lane_src(w, data, lane));
+          } else {
+            const Operand& dst = in.dst[0];
+            const uint32_t v = widen(load_once(addr, n.bytes), n);
+            if (dst.kind == OperandKind::Vgpr && !narrow_dst) w.vgpr[dst.index][lane] = v;
+            else write_lane(w, dst, lane, v);
+          }
           break;
         case Kind::Load: {
           // One word, or two, or four: a register each, in order.
@@ -9693,11 +9731,11 @@ struct Machine {
       debug_stop(w, g);
     const Inst& decoded = fetch(w.pc);
     // gfx1250's vector register numbers past v255: the instruction as it names them with the wave's MSBs on.
-    std::optional<Inst> remapped;   // (made only when the wave has VGPR MSBs: building and tearing down an Inst for each step cost 2-5%)
+    InstCopy remapped;   // (made only when the wave has VGPR MSBs: building and tearing down an Inst for each step cost 2-5%)
     const bool vector_enc = decoded.enc == gcn::Enc::Vop1 || decoded.enc == gcn::Enc::Vop2 || decoded.enc == gcn::Enc::Vop3 ||
                             decoded.enc == gcn::Enc::Vop3p || decoded.enc == gcn::Enc::Vopc || decoded.enc == gcn::Enc::Vopd ||
                             decoded.enc == gcn::Enc::Flat || decoded.enc == gcn::Enc::Ds;
-    const Inst& in = w.vgpr_msb && vector_enc ? (remapped.emplace(decoded), apply_vgpr_msb(w, &*remapped), *remapped) : decoded;
+    const Inst& in = w.vgpr_msb && vector_enc ? (remapped.make(decoded), apply_vgpr_msb(w, remapped.p), *remapped.p) : decoded;
     // A wave's first store of a round lets the group's other waves run first, once (Wave::store_gate): the loads they
     // make before their own stores come before this one lands, as the few cycles between the waves of a group make
     // them on a card. Nothing of the instruction has run: not counted yet, pc not moved, and the wave is back on this
@@ -9749,8 +9787,8 @@ struct Machine {
         ++n.valu;
         // Under VGPR indexing, the operands it names read and write the
         // vector register M0's low byte further on.
-        Inst indexed;
-        const Inst& x = w.gpr_idx ? (indexed = in, index_gprs(w, &indexed), indexed) : in;
+        InstCopy indexed;   // (made only under VGPR indexing: a default Inst built and torn down for each vector instruction cost 2-5%)
+        const Inst& x = w.gpr_idx ? (indexed.make(in), index_gprs(w, indexed.p), *indexed.p) : in;
         // A comparison in its long form is still a comparison: it writes a
         // mask of the lanes that passed, not a value per lane.
         if (fl & gcn::kInstMfma) {
