@@ -1,0 +1,178 @@
+BASE 0xfc6000000000a 0x604107249 | FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit   0: VIMNMX.U32 R16, P0, P0, R4, R6, P0
+  bit   1: FADD2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit   2: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   3: <none: >
+  bit   4: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   5: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   6: FMNMX.IS_A R16, P2, R4, R6, P0
+  bit   7: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   8: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   9: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit  10: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit  11: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit  12: @P6 FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  13: @P5 FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  14: @P3 FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  15: @!PT FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  16: FFMA2 R17, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  17: FFMA2 R18, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  18: FFMA2 R20, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  19: FFMA2 R24, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  20: FFMA2 R0, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  21: FFMA2 R48, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  22: FFMA2 R80, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  23: FFMA2 R144, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  24: FFMA2 R16, R5.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  25: FFMA2 R16, R6.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  26: FFMA2 R16, R0.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  27: FFMA2 R16, R12.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  28: FFMA2 R16, R20.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  29: FFMA2 R16, R36.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  30: FFMA2 R16, R68.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  31: FFMA2 R16, R132.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  32: FFMA2 R16, R4.F32x2.HI_LO, R7.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  33: FFMA2 R16, R4.F32x2.HI_LO, R4.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  34: FFMA2 R16, R4.F32x2.HI_LO, R2.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  35: FFMA2 R16, R4.F32x2.HI_LO, R14.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  36: FFMA2 R16, R4.F32x2.HI_LO, R22.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  37: FFMA2 R16, R4.F32x2.HI_LO, R38.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  38: FFMA2 R16, R4.F32x2.HI_LO, R70.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  39: FFMA2 R16, R4.F32x2.HI_LO, R134.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  62: FFMA2 R16, R4.F32x2.HI_LO, |R6|.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  63: FFMA2 R16, R4.F32x2.HI_LO, -R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  64: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R11.F32x2.HI_LO
+  bit  65: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R8.F32x2.HI_LO
+  bit  66: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R14.F32x2.HI_LO
+  bit  67: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R2.F32x2.HI_LO
+  bit  68: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R26.F32x2.HI_LO
+  bit  69: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R42.F32x2.HI_LO
+  bit  70: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R74.F32x2.HI_LO
+  bit  71: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R138.F32x2.HI_LO
+  bit  72: FFMA2 R16, -R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  73: FFMA2 R16, |R4|.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  74: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, |R10|.F32x2.HI_LO
+  bit  75: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, -R10.F32x2.HI_LO
+  bit  76: FFMA2.FMZ R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  78: FFMA2.RM R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  79: FFMA2.RP R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  80: FFMA2.FTZ R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  81: FFMA2 R16, R4.F32x2.LO_HI, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  82: FFMA2 R16, R4.F32, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  83: FFMA2 R16, R4.F32x2.HI_LO.NP, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit  84: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.LO_HI
+  bit  85: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32
+  bit  86: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO.NP
+  bit  87: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.LO_HI, R10.F32x2.HI_LO
+  bit  88: FFMA2 R16, R4.F32x2.HI_LO, R6.F32, R10.F32x2.HI_LO
+  bit  91: <none: nvdisasm error   : Unrecognized operation for functional uni>
+BASE 0xfc6000000000a 0x60410724b | FADD2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit   0: FMUL2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit   1: FFMA2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO
+  bit   2: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   3: F2IP.U8.F32 R16, R4, R6, R10
+  bit   4: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   5: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   6: FSETP.F.AND P0, P0, R4, R6, P0
+  bit   7: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   8: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   9: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit  10: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit  11: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit  12: @P6 FADD2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  13: @P5 FADD2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  14: @P3 FADD2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  15: @!PT FADD2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  16: FADD2 R17, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  17: FADD2 R18, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  18: FADD2 R20, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  19: FADD2 R24, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  20: FADD2 R0, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  21: FADD2 R48, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  22: FADD2 R80, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  23: FADD2 R144, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  24: FADD2 R16, R5.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  25: FADD2 R16, R6.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  26: FADD2 R16, R0.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  27: FADD2 R16, R12.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  28: FADD2 R16, R20.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  29: FADD2 R16, R36.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  30: FADD2 R16, R68.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  31: FADD2 R16, R132.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  32: FADD2 R16, R4.F32x2.HI_LO, R7.F32x2.HI_LO
+  bit  33: FADD2 R16, R4.F32x2.HI_LO, R4.F32x2.HI_LO
+  bit  34: FADD2 R16, R4.F32x2.HI_LO, R2.F32x2.HI_LO
+  bit  35: FADD2 R16, R4.F32x2.HI_LO, R14.F32x2.HI_LO
+  bit  36: FADD2 R16, R4.F32x2.HI_LO, R22.F32x2.HI_LO
+  bit  37: FADD2 R16, R4.F32x2.HI_LO, R38.F32x2.HI_LO
+  bit  38: FADD2 R16, R4.F32x2.HI_LO, R70.F32x2.HI_LO
+  bit  39: FADD2 R16, R4.F32x2.HI_LO, R134.F32x2.HI_LO
+  bit  62: FADD2 R16, R4.F32x2.HI_LO, |R6|.F32x2.HI_LO
+  bit  63: FADD2 R16, R4.F32x2.HI_LO, -R6.F32x2.HI_LO
+  bit  72: FADD2 R16, -R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  73: FADD2 R16, |R4|.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  78: FADD2.RM R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  79: FADD2.RP R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  80: FADD2.FTZ R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  81: FADD2 R16, R4.F32x2.LO_HI, R6.F32x2.HI_LO
+  bit  82: FADD2 R16, R4.F32, R6.F32x2.HI_LO
+  bit  83: FADD2 R16, R4.F32x2.HI_LO.NP, R6.F32x2.HI_LO
+  bit  84: FADD2 R16, R4.F32x2.HI_LO, R6.F32x2.LO_HI
+  bit  85: FADD2 R16, R4.F32x2.HI_LO, R6.F32
+  bit  86: FADD2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO.NP
+  bit  91: <none: nvdisasm error   : Unrecognized operation for functional uni>
+BASE 0xfc6000000000a 0x60410724a | FMUL2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit   0: FADD2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit   1: VIMNMX.U32 R16, P0, P0, R4, R6, P0
+  bit   2: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   3: <none: >
+  bit   4: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   5: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   6: FSET.BF.F.AND R16, R4, R6, P0
+  bit   7: R2UR P0, UR16, R4
+  bit   8: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit   9: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit  10: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit  11: <none: nvdisasm error   : Unrecognized operation for functional uni>
+  bit  12: @P6 FMUL2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  13: @P5 FMUL2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  14: @P3 FMUL2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  15: @!PT FMUL2 R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  16: FMUL2 R17, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  17: FMUL2 R18, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  18: FMUL2 R20, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  19: FMUL2 R24, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  20: FMUL2 R0, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  21: FMUL2 R48, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  22: FMUL2 R80, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  23: FMUL2 R144, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  24: FMUL2 R16, R5.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  25: FMUL2 R16, R6.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  26: FMUL2 R16, R0.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  27: FMUL2 R16, R12.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  28: FMUL2 R16, R20.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  29: FMUL2 R16, R36.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  30: FMUL2 R16, R68.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  31: FMUL2 R16, R132.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  32: FMUL2 R16, R4.F32x2.HI_LO, R7.F32x2.HI_LO
+  bit  33: FMUL2 R16, R4.F32x2.HI_LO, R4.F32x2.HI_LO
+  bit  34: FMUL2 R16, R4.F32x2.HI_LO, R2.F32x2.HI_LO
+  bit  35: FMUL2 R16, R4.F32x2.HI_LO, R14.F32x2.HI_LO
+  bit  36: FMUL2 R16, R4.F32x2.HI_LO, R22.F32x2.HI_LO
+  bit  37: FMUL2 R16, R4.F32x2.HI_LO, R38.F32x2.HI_LO
+  bit  38: FMUL2 R16, R4.F32x2.HI_LO, R70.F32x2.HI_LO
+  bit  39: FMUL2 R16, R4.F32x2.HI_LO, R134.F32x2.HI_LO
+  bit  62: FMUL2 R16, R4.F32x2.HI_LO, |R6|.F32x2.HI_LO
+  bit  63: FMUL2 R16, R4.F32x2.HI_LO, -R6.F32x2.HI_LO
+  bit  72: FMUL2 R16, -R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  73: FMUL2 R16, |R4|.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  76: FMUL2.FMZ R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  78: FMUL2.RM R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  79: FMUL2.RP R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  80: FMUL2.FTZ R16, R4.F32x2.HI_LO, R6.F32x2.HI_LO
+  bit  81: FMUL2 R16, R4.F32x2.LO_HI, R6.F32x2.HI_LO
+  bit  82: FMUL2 R16, R4.F32, R6.F32x2.HI_LO
+  bit  83: FMUL2 R16, R4.F32x2.HI_LO.NP, R6.F32x2.HI_LO
+  bit  87: FMUL2 R16, R4.F32x2.HI_LO, R6.F32x2.LO_HI
+  bit  88: FMUL2 R16, R4.F32x2.HI_LO, R6.F32
+  bit  91: <none: nvdisasm error   : Unrecognized operation for functional uni>

@@ -1,0 +1,127 @@
+# probe5: one kernel per variant (k_<operand>_<modifier>), the packed instruction and the scalar ones around it, from nvdisasm
+.text.k_a_na_both:
+ FMUL2 R6, -|R4|.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_b_na_both:
+ FADD2 R6, R4.F32x2.HI_LO, -|R6|.F32x2.HI_LO ;
+.text.k_c_na_both:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, -|R8|.F32x2.HI_LO ;
+.text.k_a_a_both:
+ FMUL2 R6, |R4|.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_b_a_both:
+ FADD2 R6, R4.F32x2.HI_LO, |R6|.F32x2.HI_LO ;
+.text.k_c_a_both:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, |R8|.F32x2.HI_LO ;
+.text.k_a_nl_nh:
+ FMUL2 R6, -R4.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_b_nl_nh:
+ FADD2 R6, R4.F32x2.HI_LO, -R6.F32x2.HI_LO ;
+.text.k_c_nl_nh:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, -R8.F32x2.HI_LO ;
+.text.k_a_nal_ah:
+ FMUL2 R6, -|R4|.F32x2.HI_LO.NP, R6.F32x2.HI_LO ;
+.text.k_b_nal_ah:
+ FADD2 R6, R4.F32x2.HI_LO, -|R6|.F32x2.HI_LO.NP ;
+.text.k_c_nal_ah:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, -|R8|.F32x2.HI_LO.NP ;
+.text.k_a_al_nah:
+ FMUL2 R6, |R4|.F32x2.HI_LO.NP, R6.F32x2.HI_LO ;
+.text.k_b_al_nah:
+ FADD2 R6, R4.F32x2.HI_LO, |R6|.F32x2.HI_LO.NP ;
+.text.k_c_al_nah:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, |R8|.F32x2.HI_LO.NP ;
+.text.k_a_nal_nh:
+ FADD R4, -|R4|, -RZ ;
+ FADD R5, -R5, -RZ ;
+ FMUL2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_b_nal_nh:
+ FADD R6, -|R6|, -RZ ;
+ FADD R7, -R7, -RZ ;
+ FADD2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_c_nal_nh:
+ FADD R8, -|R8|, -RZ ;
+ FADD R9, -R9, -RZ ;
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R8.F32x2.HI_LO ;
+.text.k_a_nl_nah:
+ FADD R5, -|R5|, -RZ ;
+ FADD R4, -R4, -RZ ;
+ FMUL2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_b_nl_nah:
+ FADD R7, -|R7|, -RZ ;
+ FADD R6, -R6, -RZ ;
+ FADD2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_c_nl_nah:
+ FADD R9, -|R9|, -RZ ;
+ FADD R8, -R8, -RZ ;
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R8.F32x2.HI_LO ;
+.text.k_a_al_nh:
+ FADD R4, |R4|, -RZ ;
+ FADD R5, -R5, -RZ ;
+ FMUL2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_b_al_nh:
+ FADD R6, |R6|, -RZ ;
+ FADD R7, -R7, -RZ ;
+ FADD2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_c_al_nh:
+ FADD R8, |R8|, -RZ ;
+ FADD R9, -R9, -RZ ;
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R8.F32x2.HI_LO ;
+.text.k_a_nl_ah:
+ FADD R5, |R5|, -RZ ;
+ FADD R4, -R4, -RZ ;
+ FMUL2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_b_nl_ah:
+ FADD R7, |R7|, -RZ ;
+ FADD R6, -R6, -RZ ;
+ FADD2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO ;
+.text.k_c_nl_ah:
+ FADD R9, |R9|, -RZ ;
+ FADD R8, -R8, -RZ ;
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R8.F32x2.HI_LO ;
+.text.k_a_nah:
+ FADD R9, -|R9|, -RZ ;
+ FMUL2 R8, R8.F32x2.HI_LO, R4.F32x2.HI_LO ;
+.text.k_b_nah:
+ FADD R9, -|R9|, -RZ ;
+ FADD2 R8, R4.F32x2.HI_LO, R8.F32x2.HI_LO ;
+.text.k_c_nah:
+ FADD R13, -|R13|, -RZ ;
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R12.F32x2.HI_LO ;
+.text.k_a_nal:
+ FADD R8, -|R8|, -RZ ;
+ FMUL2 R8, R8.F32x2.HI_LO, R4.F32x2.HI_LO ;
+.text.k_b_nal:
+ FADD R8, -|R8|, -RZ ;
+ FADD2 R8, R4.F32x2.HI_LO, R8.F32x2.HI_LO ;
+.text.k_c_nal:
+ FADD R12, -|R12|, -RZ ;
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R12.F32x2.HI_LO ;
+.text.k_a_ah:
+ FADD R9, |R9|, -RZ ;
+ FMUL2 R8, R8.F32x2.HI_LO, R4.F32x2.HI_LO ;
+.text.k_b_ah:
+ FADD R9, |R9|, -RZ ;
+ FADD2 R8, R4.F32x2.HI_LO, R8.F32x2.HI_LO ;
+.text.k_c_ah:
+ FADD R13, |R13|, -RZ ;
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R12.F32x2.HI_LO ;
+.text.k_a_al:
+ FADD R8, |R8|, -RZ ;
+ FMUL2 R8, R8.F32x2.HI_LO, R4.F32x2.HI_LO ;
+.text.k_b_al:
+ FADD R8, |R8|, -RZ ;
+ FADD2 R8, R4.F32x2.HI_LO, R8.F32x2.HI_LO ;
+.text.k_c_al:
+ FADD R12, |R12|, -RZ ;
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R12.F32x2.HI_LO ;
+.text.k_a_nh:
+ FMUL2 R6, R4.F32x2.HI_LO.NP, R6.F32x2.HI_LO ;
+.text.k_b_nh:
+ FADD2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO.NP ;
+.text.k_c_nh:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R8.F32x2.HI_LO.NP ;
+.text.k_a_nl:
+ FMUL2 R6, -R4.F32x2.HI_LO.NP, R6.F32x2.HI_LO ;
+.text.k_b_nl:
+ FADD2 R6, R4.F32x2.HI_LO, -R6.F32x2.HI_LO.NP ;
+.text.k_c_nl:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, -R8.F32x2.HI_LO.NP ;

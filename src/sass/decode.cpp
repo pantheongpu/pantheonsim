@@ -612,6 +612,70 @@ void dec_fadd(Instr& ins, const Word& w) {
   float_srcs(ins, w);
 }
 
+// ---- sm_100's packed fp32: FFMA2, FMUL2, FADD2 -----------------------------------
+//
+// Low nine bits 0x49, 0x4a, 0x4b with the ALU operand forms in bits 9-11 (registers, an immediate, a uniform register; the
+// constant-bank forms are not ones ptxas emits, and nvdisasm refuses them). Every operand is a register pair (R14 is
+// R14:R15), the destination too; the lower half of each is the first lane. Fields beyond FFMA/FMUL/FADD's (written down in
+// docs/perf-design/round10-ffma2.md, from nvdisasm's own output for flipped bits):
+//   rounding 78-79 as FFMA's; 80 .FTZ; 76 .FMZ (FFMA2, FMUL2); both is nvdisasm's ".INVALID3"
+//   |.| and -: a at 73 and 72, the operand in the register field at 64 at 74 and 75, any other operand (the field at 32, a
+//   uniform register) at 62 and 63
+//   per operand (a, b, c; FADD2's second operand is "c" for all of these): bit 81/87/84 .F32x2.LO_HI (the halves swapped),
+//   82/88/85 .F32 (one 32-bit register for both halves), neither .F32x2.HI_LO, both ".INVALID3"; and .NP at 83/-/86:
+//   the sign change of the second lane is the opposite of the first's (its - flipped), |.| unchanged
+// The swizzle applies first, then |.| and - (and .NP) on the lanes that come out. An immediate is one float for both lanes.
+void dec_f32x2(Instr& ins, const Word& w) {
+  const unsigned k = static_cast<unsigned>(w.field(0, 9));
+  const bool fma = k == 0x49, add = k == 0x4b;
+  ins.op = fma ? Op::FFMA2 : add ? Op::FADD2 : Op::FMUL2;
+  ins.mnemonic = fma ? "FFMA2" : add ? "FADD2" : "FMUL2";
+  const bool ftz = w.bit(80), fmz = !add && w.bit(76);
+  const unsigned rnd = static_cast<unsigned>(w.field(78, 2));
+  if (ftz && fmz) ins.mods.push_back("INVALID3");
+  else if (ftz) ins.mods.push_back("FTZ");
+  else if (fmz) ins.mods.push_back("FMZ");
+  if (rnd) ins.mods.push_back(kRnd[rnd]);
+  ins.f[0] = rnd;
+  ins.f[1] = ftz;
+  ins.f[2] = fmz;
+  uint32_t refuse = fmz;   // f[4]: a form whose meaning is not known stays with the PTX engine (runs_instr)
+  Operand d = dst_reg(w, false, ins.sm);
+  d.width = 2;
+  ins.dst.push_back(d);
+  if (fma) {
+    alu3(ins, w, kFloat);
+  } else {
+    alu2(ins, w, kFloat);
+    // Like FADD, FADD2's second operand takes the third operand's place for reuse.
+    if (add && ins.src[1].kind == Kind::Reg) ins.src[1].reuse = reuse(w, 2);
+  }
+  float_srcs(ins, w);
+  static const unsigned kLoHi[3] = {81, 87, 84}, kF32[3] = {82, 88, 85}, kNp[3] = {83, 0, 86};
+  uint32_t modes = 0;
+  for (size_t i = 0; i < ins.src.size(); ++i) {
+    Operand& o = ins.src[i];
+    if (o.kind == Kind::CBank || o.kind == Kind::UCBank)
+      throw Error(Err::UnsupportedPtx, "SASS: " + ins.mnemonic + " with a constant bank operand");
+    const unsigned p = add && i == 1 ? 2 : static_cast<unsigned>(i);
+    const bool lohi = w.bit(kLoHi[p]), f32 = w.bit(kF32[p]), np = kNp[p] && w.bit(kNp[p]);
+    const unsigned mode = f32 ? 2 : lohi ? 1 : 0;
+    std::string sfx = f32 && lohi ? ".INVALID3" : f32 ? ".F32" : lohi ? ".F32x2.LO_HI" : ".F32x2.HI_LO";
+    if (f32 && lohi) refuse = 1;
+    if (o.kind == Kind::FImm) {   // nvdisasm prints the float alone; ptxas sets .F32, which is all the executor knows
+      sfx.clear();
+      if (mode != 2) refuse = 1;
+    }
+    if (np) sfx += ".NP";
+    o.suffix = sfx;
+    o.bars_after = o.kind == Kind::UReg;   // |UR8.F32x2.HI_LO|, where a vector register's bars close before the swizzle
+    o.width = mode == 2 ? 1 : 2;
+    modes |= (mode | (np ? 4u : 0u)) << (4 * i);
+  }
+  ins.f[3] = modes;
+  ins.f[4] = refuse;
+}
+
 // ---- control -----------------------------------------------------------------
 
 // A relative branch target: a signed offset in bytes from the next
@@ -3863,6 +3927,11 @@ Instr decode(const Word& w, uint64_t pc, int sm) {
     return ins;
   }
   const unsigned low9 = opc & 0x1ff;
+  // sm_100's packed fp32 ops (sm_120 lowers the same PTX to scalar ones, and has sm_120's UVIMNMX at 0x4a).
+  if (sm >= 100 && sm < 120 && w.field(9, 3) != 0 && (low9 == 0x49 || low9 == 0x4a || low9 == 0x4b)) {
+    dec_f32x2(ins, w);
+    return ins;
+  }
   // Ops with their own decoders that take the ALU operand forms (bits 9-11),
   // whatever bit 8 holds.
   if (w.field(9, 3) != 0) {
@@ -3967,9 +4036,10 @@ std::string operand_text(const Operand& o, int sm) {
     case Kind::SReg:
     case Kind::Text: s = o.text; break;
   }
-  if (o.abs) s = "|" + s + "|";
+  const bool inside = o.abs && o.bars_after;   // the suffix goes inside the bars: |UR8.F32x2.HI_LO|
+  if (o.abs) s = "|" + s + (inside ? o.suffix : std::string()) + "|";
   if (o.reuse) s += ".reuse";   // after the bars: |R4|.reuse
-  s += o.suffix;                // then the swizzle: R4.reuse.H0_H0
+  if (!inside) s += o.suffix;   // then the swizzle: R4.reuse.H0_H0
   if (o.neg && o.kind != Kind::Pred && o.kind != Kind::UPred) s = "-" + s;
   if (o.bnot) s = "~" + s;
   return s;
