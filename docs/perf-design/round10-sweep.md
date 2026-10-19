@@ -14,7 +14,7 @@ Frequency on the unmodified build (baseline, `sweep-base`):
 
 | how | runs | aborts |
 | --- | --- | --- |
-| quick sweep via `run_pytorch_sweep.sh`, 4 CPUs (2 cores), 5 sweeps, plus 5 on 4 other CPUs | 10 sweeps, ~13 groups each | 0 |
+| quick sweep via `run_pytorch_sweep.sh`, 4 CPUs (2 cores), 5 sweeps on each of two disjoint 4-CPU sets | 10 sweeps, 13 groups each | 0 |
 | groups fft / losses / nn run directly, 4 CPUs (2 cores), 30 runs each, two parallel jobs | 180 | 0 |
 | same, `taskset` to ONE CPU (cpu 4), 30 runs each | 90 | 19 (nn 15 of 30, losses 3 of 30, fft 1 of 30) |
 | same, ONE CPU (cpu 6), 30 runs each (repeat for the A/B) | 90 | 17 (nn 15, losses 2, fft 0) |
@@ -60,7 +60,7 @@ Not the simulator and not PyTorch's own code: it is the **core dump of the abort
   same, 100 to 108 %). Nothing waits. (The brief's "CPU 3.1 to 3.5 s" is the user time; sys adds 0.77 s, which is page-fault work on 1.6 GB of RSS: 388 k minor
   faults.)
 * The runs that do wait are exactly the aborted ones: `5.0 s wall, 3.1 user, 0.75 sys, 77 %` (and `Command terminated by signal 6`), against
-  `4.5 s, 3.7 user, 99 %` for the others, in 3 aborted runs out of 12 in this sample and half of the single-CPU runs. The user time of an aborted run is
+  `4.5 s, 3.7 user, 99 %` for the others, (4 of 12 timed single-CPU runs of the base build aborted, 2 with and 2 without `ulimit -c 0`). The user time of an aborted run is
   lower because it never finishes finalising.
 * The core pattern on Ubuntu is `|/usr/share/apport/apport`; `/var/log/apport.log` shows it called for each of these processes, spending about 1 s
   per crash before the process is reaped (a `gdbus` call timing out, then writing a 330 MB crash file in `/var/crash`). `ulimit -c 0` does not stop
