@@ -13128,6 +13128,25 @@ class Interpreter {
             continue;
           }
         }
+        // Device memory in the ordinary case: one table lookup serves the read
+        // and the write (rmw_begin declines whenever load_scalar and
+        // store_scalar could behave differently: a fault armed, a host mapping,
+        // a misaligned or unmapped address, which then take the two-step path).
+        if (fast_enabled_ && !is_shared(addr) && !is_local(addr) &&
+            !(addr >= kParamVaBase && addr < kParamVaBase + kParamVaSize)) {
+          MemoryManager::ScalarRmw at;
+          uint64_t old = 0;
+          if (mem_.rmw_begin(addr, size, at, &old)) {
+            const uint64_t nv = compute(old);
+            try {
+              mem_.rmw_commit(at, size, nv);
+            } catch (const Error& e) {
+              rethrow_with_context(e, ins, static_cast<int>(lane));
+            }
+            r[lane] = old;
+            continue;
+          }
+        }
         const uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
         store_routed(w, ctx, ins, lane, addr, size, compute(old));
         r[lane] = old;

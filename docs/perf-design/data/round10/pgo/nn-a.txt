@@ -1,0 +1,10 @@
+build-plain 52.12 9.26 ok=79 fail=0
+build-pgo 52.31 10.02 ok=79 fail=0
+build-plain 8.79 8.78 ok=79 fail=0
+build-pgo 10.70 9.88 ok=79 fail=0
+build-plain 8.80 8.79 ok=79 fail=0
+build-pgo 10.71 9.89 ok=79 fail=0
+build-plain 10.22 9.12 ok=79 fail=0
+build-pgo 9.60 9.55 ok=79 fail=0
+build-plain 10.00 9.23 ok=79 fail=0
+build-pgo 10.68 9.88 ok=79 fail=0

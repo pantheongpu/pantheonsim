@@ -1,0 +1,9 @@
+== generate
+SECONDS 767 :: bash -c cmake -S . -B build-pgo2 -DCMAKE_BUILD_TYPE=Release -DVGPU_PGO=generate >/dev/null && cmake --build build-pgo2 -j4 >$0/generate-pgo2.log 2>&1 /results/small-pgo
+== train
+SECONDS 334 :: bash docs/perf-design/data/round10/r10small-pgo-train.sh build-pgo2 /results/small-mb/bench_kernels amp attention fft graphs linalg losses ops optim rnn sdpa sparse
+5.5M	build-pgo2/pgo
+155
+== use
+SECONDS 598 :: bash -c cmake -S . -B build-pgo2 -DCMAKE_BUILD_TYPE=Release -DVGPU_PGO=use >/dev/null && cmake --build build-pgo2 -j4 >$0/use-pgo2.log 2>&1 /results/small-pgo
+DONE
