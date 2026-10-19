@@ -2739,6 +2739,12 @@ Run on server2 against this branch: `ctest -R ^test_amd` (143 of 143), `amd_rocb
 * `mfma_dot_fma` gave a different NaN than an identical loop elsewhere (above); `part += a * bv` in `wmma_reference` and `wmma1250` had no
   fixed order; both are explicit now.
 
+* Under `-fsanitize=address,undefined` (-O1, server2): `test_amd_mfma_math`, `test_amd_matrix_fast` and `test_amd_gcn_asm` have no
+  AddressSanitizer report; UBSan reports one thing in the matrix code, the signed overflow of `isum += a * b` in `wmma_reference` (the
+  signed-input bug above: 4294967234 * 4294967287); `test_amd_gcn_same_bits` at -O1 differs from the digests on 85 shapes, none of them
+  matrix instructions (`v_pk_add_f32`, `v_fma_mixlo_f16`, `v_div_fixup_f16`, ...: float codegen that depends on the optimisation level, as the
+  test's header says).
+
 ### Not done
 
 * `v_wmma_f16_16x16x16_f16` / `v_wmma_bf16_*` (16-bit results) stay at 3 us: 256 `static_cast<_Float16>(double)` calls into libgcc,
