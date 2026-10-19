@@ -2592,3 +2592,147 @@ valu_f64 1.9 / 2.5x, mfma 2.4x, mem 1.8 / 2.2x, lds 2.9 / 2.8x, atomics 1.8 / 2.
 `test_amd_gcn_same_bits` (15,566 instruction shapes against digests recorded from the unmodified base) is the guard on all of the AMD
 changes: the first merge failed it on 65 MFMA shapes (a different NaN payload when both operands are NaNs) and the fix keeps the fast loops
 and recomputes only NaN results in the base's operand order.
+
+## The AMD engine: memory instruction names read once, and the LDS accesses (branch `speedup4-amdmemtext`)
+
+What was left of the text work on the memory instructions, and what the profile of the memory workloads showed after it.
+Measured on server2 (Ryzen 9 9950X, 32 logical CPUs shared with other people's builds and benchmarks), Release, GCC 13.3, ROCm 7.2
+`hipcc` programs, simulated MI300X and RX 6800 only (no AMD card touched), `tools/bench-amd` with a cache of its own, one host
+thread unless the row says 8, pinned to CPUs 24-31, A and B alternating, 11 runs (9 for 8 threads), the benchmark lock held for each
+run. Base: `speedup` f81cc0c1 built in its own directory. Every workload checks its result bit for bit against a host reference, and
+the harness's "counters identical" column is `yes` in every row (the instruction counts of the two builds agree, quick size, through
+rocprofv3 inside `vgpu shell`).
+
+### What changed
+
+* **Names parsed at decode, not at every execution** (`gcn::MemFacts`, `Inst::mem`, filled in by `gcn::finalize`). `narrow`,
+  `half_access` and `parse_atomic` ran on the instruction's name text for every global, flat, scratch, buffer and LDS instruction
+  executed, and `buffer_access` and the LDS ladder's default case ran them again for **every lane** (a `find("_d16")` per lane for
+  every `ds_read_b64`, `ds_read2_b32`, `buffer_load_dword`...; a compare chain of up to sixteen strings per lane for a buffer atomic).
+  `scalar_load` did a `find("prefetch")`, three prefix tests and, for `s_atomic_*`, a `std::string` and a chain of string compares.
+  `mem_facts_of` works out, once, what the name says: the width and sign of a narrow access, the `_d16` forms, the atomic operation
+  (global/flat, buffer and scalar atomics each have their own list of names), the prefix tests, the transposing loads, how
+  `global_access` takes the instruction, how scalar memory does, and which LDS access it is. The parsers moved from `gcn_exec.cpp`
+  to `gcn_decode.cpp` (one copy, `gcn::parse_narrow`, `parse_half`, `parse_atomic_body`, `transpose_bits_of`; the executor's
+  `narrow`, `half_access` and `parse_atomic` call them) and an instruction nobody finalized (a test's hand-built one) gets the same
+  facts from `gcn::mem_facts(in, scratch)`. The struct is 13 bytes: `Inst` is copied for VGPR indexing and gfx1250's VGPR MSBs.
+* **The LDS accesses of real kernels without the ladder** (`Machine::lds_fast`): `ds_read_b32`, `ds_write_b32`, `ds_read_b64` /
+  `_b96` / `_b128`, `ds_write_b64` / `_b128`, `ds_add_u32`, `ds_read2_b32`, `ds_write2_b32`, `ds_read_u8` / `i8` / `u16`,
+  `ds_write_b8` / `b16`: one lane loop over the active lanes, the vector registers read and written directly, the same 32-bit
+  address arithmetic and the same rules for an address past the work-group's LDS (a read gives zero, a write goes nowhere, a
+  work-group given no LDS is caught, same text). Before it each lane went through a `switch` on the name's hash and then a text
+  compare of the whole name (`OpName::operator==` was 8% of `ldsx`, a function call per lane), three more name tests, `lane_src`,
+  `set_word` and `write_lane` calls, and, for the wide forms, the `half_access` scan. A fast path declines (the ladder runs) when
+  an operand is not a plain vector register or a cross-lane instruction is running.
+* **Global accesses read the address register directly** where it is a plain vector register (`lane_src` and `lane_src64` were
+  separate calls per lane: 8-11% of the memory workloads), and so do the byte and short loads and stores; `memory_run`'s run
+  detection reads the scalar base once instead of once per lane; a flat access finds its aperture (`flat_access`) with the scalar base,
+  the immediate offset and the target worked out once. Same lanes, same order, same errors.
+* **`Machine::step` no longer builds and tears down an `Inst` for every instruction.** `Inst remapped;` (gfx1250's VGPR MSBs) and
+  `Inst indexed;` (the vector case, for VGPR indexing) were default-constructed on every step and every vector instruction: 2.3% +
+  2.6% of the `smem` profile (`gcn::Inst::Inst`, `~Inst`), 4% of `divergent`. They are now a pointer made by a `noinline` copy where
+  one is needed (`InstCopy`). The first version used `std::optional<Inst>`: its inlined copy constructor made `step` so large that
+  the compiler stopped inlining `scalar_alu`, `OpName::operator==` and `debug::active` into it, and the whole engine measured 4 to
+  12% **slower** than the base (`valu_int`, `divergent`, `wave`, even `launch`; the controls caught it); out of line it measures
+  faster. This part is `step`'s and the vector case's, not the memory instructions': the `amdtier` piece edits the same lines.
+
+### Results (B/A of the median, base f81cc0c1 against this branch)
+
+One thread, 11 runs, load average 3.5 to 6.6 (the second set 1.9 to 16.6, median 4.3), p < 0.001 unless noted:
+
+| workload | what it runs | mi300x | rx6800 |
+| --- | --- | ---: | ---: |
+| `ldsx` (new) | `ds_write_b128`, `ds_read_b96`, `ds_read2_b32`, `ds_add_u32` with barriers | **2.28x** | **1.99x** |
+| `lds` | tree reduction, tile transpose | **2.14x** | **1.90x** |
+| `buf` (new) | buffer loads and stores with offsets, some past the end | **1.33x** | **1.32x** |
+| `flat` (new) | generic-pointer loads and stores that reach global memory | 1.15x | 1.14x |
+| `smem` (new) | `s_load_dword`, `s_load_dwordx4` of uniform table entries | 1.11x | 1.19x |
+| `narrow` (new) | byte and short global loads and stores | 1.10x | 1.09x |
+| `mem` | 16-byte copy, scalar scale, gather | 1.10x | 1.12x |
+| `atomics` | global atomic add, max, CAS loop | 1.13x | 1.18x |
+| `valu_int`, `valu_f32` (controls: no memory instructions) | | 1.04x, 1.04x | 1.05x, 1.09x |
+| `divergent` | | 1.09x (p 0.04) | 1.15x (p 0.02) |
+| `wave` | | 1.01x (p 0.15, same) | 1.05x |
+| `launch` | | 1.00x (same) | same (spread 60%) |
+
+Eight threads (9 runs, load 2.1 to 6.0): `ldsx` 2.30x / 2.01x, `lds` 2.13x / 1.88x, `flat` 1.13x / 1.13x, `mem` 1.10x / 1.12x,
+`atomics` 1.14x / 1.13x, `valu_int` 1.02x. The rows without a name for a change above are the `Inst` construction (all workloads) and
+whatever the compiler made of the new layout; this table does not split them. What was split: the `scalar_load` facts alone, against
+the same tree with the base's `scalar_load` text tests put back (15 runs, load 2 to 4): `smem` 1.034x on the MI300X and 1.050x on the
+RX 6800 (p < 0.001; the `valu_int` control 0.99x and 1.00x, p 0.2 to 0.4).
+
+### What the profile says is left
+
+`MemoryManager::scalar_location` (15 to 19% of `buf`, `narrow`, `mem`: the chunk lookup of every lane's access), `load_scalar` and
+`store_scalar`, then `lane_src` and `write_lane` called from `vector_alu`. The buffer path has no run detection (the global one does):
+a lane-by-lane `load_words` for every lane of every `buffer_load_dword`. None of this is name text.
+
+### Tests
+
+Wired into CMake. Each was shown to fail when the change is wrong (mutation checks on scratch copies of the source, run on server2,
+the build rebuilt each time; "caught" is a failing, crashing or silent test run).
+
+* `test_amd_gcn_same_bits` (the existing guard, 15,566 shapes, digests from the unmodified base): passes unchanged. It runs memory
+  instructions on random registers, so most of its addresses fault; it could not see most of the changes above.
+* `test_amd_gcn_memory_same_bits` (new; `amd/tests/data/mem_same_bits_digests.txt`): every DS, flat, global, scratch, MUBUF, MTBUF and
+  scalar memory shape of the ISA corpora (1,150 of them) run in twelve ways on a wave whose address registers are **aimed** at three
+  allocations (`amd::digest_memory_instruction`, in `gcn_exec.cpp` next to `digest_instruction`): aligned, misaligned, on the end of an
+  allocation, past it, wild, in the shared and the private aperture (gfx1250's too), runs of consecutive lanes, the same address in every
+  lane, mixed per lane, half the lanes off; buffer resources valid, invalid, swizzled, scratch-resource, too small; LDS accesses past the
+  work-group's LDS. Each of the first few shapes of a family (the atomic operations, the byte and short loads and stores, the LDS
+  widths) is also run **under every name of its family**, so every atomic operation and width is reached. The digest holds registers,
+  LDS, scratch, the three allocations, the instruction counts and the error text. The golden was recorded from a build of the **base**
+  commit plus the probe function and nothing else (a scratch tree of f81cc0c1 with the function spliced in, run twice for
+  determinism), never from the tree under test. About half of the (instruction, mode) pairs complete; the rest end in the error the
+  base gives (invalid pointer, out of bounds, misaligned, past the LDS...) and so compare error texts. `s_memtime` and
+  `s_memrealtime` (a clock) are left out.
+* `test_amd_gcn_mem_facts` (new): `mem_facts_of` against the old per-execution tests, copied into the test as they were, for every
+  instruction name of the corpora and for about 4,000 made-up names (every segment, form and suffix in combination); and the
+  executor's fallback for an unfinalized instruction against the finalized one.
+* `bench_amd_counters`: the new workloads have entries in `tools/bench-amd/expected/amd-hip-7.2.26015.json` (counts recorded with the
+  base build; the existing entries are unchanged).
+
+| mutation | caught by |
+| --- | --- |
+| `sbyte` loses its sign in `parse_narrow` | `test_amd_gcn_memory_same_bits`, `test_amd_gcn_mem_facts` |
+| a `_x2` atomic's size not set to 8 in `parse_atomic_body` | both |
+| narrow stores not told apart from loads in `global_access` | `memory_same_bits` |
+| buffer `atomic_sub` adds | `memory_same_bits` |
+| buffer `atomic_add_f32` with two NaNs takes the other operand's payload (see below) | `memory_same_bits` |
+| scalar `s_atomic_umin` takes the maximum | `memory_same_bits` |
+| scalar `s_load_i8` / `i16` with the sign inverted | `memory_same_bits` |
+| `ds_read_i8` without its sign extension | `memory_same_bits` |
+| `ds_write_b16` writes one byte | `memory_same_bits` |
+| `ds_read2_b32` reads both words from the second offset | `memory_same_bits` |
+| the `_d16` test of the LDS default case inverted | `memory_same_bits` (a crash) |
+| atomics always four bytes | `memory_same_bits` |
+| `scratch_store` sub-dword stores told apart from loads wrongly | `memory_same_bits` |
+| narrow load written to the next register | `memory_same_bits` |
+| run detection that over-reaches (`>=` for `==`) | `memory_same_bits` |
+| flat access ignoring gfx1250's private aperture / the shared aperture | `memory_same_bits` |
+| run detection and flat aperture detection that drop SCALE_OFFSET | **not caught**: the first only makes runs not be found (which is invisible, runs being exact), the second changes which aperture a lane is in only for addresses within a factor of 16 of an aperture's edge, which the probe's 32-bit offsets do not reach |
+
+### Lessons
+
+* **The two-NaN trap again.** The first run of the memory digests failed on one instruction, `buffer_atomic_add_f32` (gfx1250), where
+  both the memory word and the register data are NaNs: x86 returns the first operand's payload, and which operand GCC makes the first
+  is its choice. The base's build had the register's data first; the rewrite of the chain of `if`s into a `switch` put the other
+  first. The rewrite now says it (`nan(b) && nan(v) ? v | quiet : b + v`), which is the base's bits.
+* **A control that is not a control.** The first full A/B of the branch showed the memory workloads 10 to 120% faster and `valu_int`
+  and `divergent` 6 to 12% slower; the controls were right. `std::optional<Inst>` in `step` was the cause (see above); out of line
+  the same code is faster than the base for every workload. Always run the ALU workloads and `launch` next to the memory ones.
+* **Tests that cannot reach the code.** The mutation of the `_d16` test in the LDS default case was first reported as not caught;
+  the test had crashed, printing nothing, and the script looked for the word FAIL. And a mutation run left its object files newer
+  than a restored source (rsync keeps the old modification time), so the next build used the mutant: touch after restoring.
+* **A latent bug the probe found, left alone.** `scratch_at` checks `offset + bytes > scratch_per_lane`, which wraps for a negative
+  `offset:` immediate with a small register offset (`scratch_store_b128 v9, ..., offset:-16` with v9 = 0): the check passes and
+  the store lands before the lane's scratch, on the heap. The base does it, so does this branch (fixing it changes
+  `test_amd_gcn_same_bits`'s recorded digests of those shapes, which may not be re-recorded); the probe skips scratch accesses with a
+  negative offset. The fix is one line: `offset > per_lane || bytes > per_lane - offset`.
+
+### Not done
+
+* Scalar-load facts, `lds_fast`, the direct register reads and `memory_run`'s hoisted base were each kept only on the evidence of
+  the table above; none was dropped. Not tried: a fast path for the rest of the ladder's LDS cases (`ds_read2st64`, the atomics with
+  return, `ds_bpermute`), run detection for buffer loads, and moving `Inst plain;` out of `cross_lane_alu` (a default `Inst` per DPP
+  instruction, the `wave` workload's remaining construction cost; it is the vector paths').

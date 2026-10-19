@@ -6486,11 +6486,6 @@ struct Machine {
     if (barrier) lds_barrier_arrive(g, uint64_t{g1[1] & 0xFFFFu} << 3, 1);
   }
 
-  // The LDS accesses kernels make all the time, each as one lane loop with the registers read and written directly:
-  // the same lanes in the same order, the same address arithmetic (32-bit, offset added) and the same rules for an
-  // address past the work-group's LDS (a read gives zero and a write goes nowhere; a work-group given no LDS at all
-  // is caught) as the cases of lds_access's ladder. False, having done nothing, where an operand is not a plain
-  // vector register or a cross-lane instruction is running; the ladder then does it.
   // An LDS access past the work-group's LDS: a read gives zero and a write goes nowhere, but a work-group given no LDS at
   // all is almost always a launch that did not pay for the LDS its kernel uses, and is caught (see lds_access).
   [[gnu::noinline]] uint8_t* outside_lds(const Group& g, uint64_t a, uint8_t* outside) const {
@@ -6500,6 +6495,11 @@ struct Machine {
     std::memset(outside, 0, 16);
     return outside;
   }
+  // The LDS accesses kernels make all the time, each as one lane loop with the registers read and written directly:
+  // the same lanes in the same order, the same address arithmetic (32-bit, offset added) and the same rules for an
+  // address past the work-group's LDS (a read gives zero and a write goes nowhere; a work-group given no LDS at all
+  // is caught) as the cases of lds_access's ladder. False, having done nothing, where an operand is not a plain
+  // vector register or a cross-lane instruction is running; the ladder then does it.
   bool lds_fast(Wave& w, const Inst& in, Group& g, gcn::LdsOp op) {
     using L = gcn::LdsOp;
     if (dpp_operand || narrow_dst) return false;
