@@ -9608,6 +9608,13 @@ struct Machine {
           }
           break;
         }
+        // (Handled above, before the lanes: -Wswitch wants them named.)
+        case Kind::Unknown:
+        case Kind::Prefetch:
+        case Kind::Block:
+        case Kind::Transpose:
+        case Kind::AddTid:
+          break;
       }
     }
   }
@@ -12719,7 +12726,7 @@ uint64_t digest_memory_instruction(const gcn::Inst& in, gcn::Target target, uint
           w.sgpr[rs + 1] &= 0xFFFF;
           w.sgpr[rs + 2] = kRecords[r.next() % 7];
         } else {
-          set_pair(rs, address(0) & ~uint64_t{(mode % 2) ? 0 : 3});
+          set_pair(rs, address(0) & ~uint64_t{(mode % 2) ? 0u : 3u});
         }
       }
       break;
