@@ -22,15 +22,22 @@ __host__ __device__ static unsigned relu_s32(unsigned a, unsigned b, bool mx) {
   int r = mx ? (x > y ? x : y) : (x < y ? x : y);
   return static_cast<unsigned>(r < 0 ? 0 : r);
 }
-__host__ __device__ static unsigned relu_s16x2(unsigned a, unsigned b, bool mx) {
+// Per 16-bit half, signed or unsigned, with or without .relu (signed only).
+__host__ __device__ static unsigned lanes16(unsigned a, unsigned b, bool mx, bool sgn, bool relu) {
   unsigned out = 0;
   for (int h = 0; h < 2; ++h) {
-    int x = static_cast<short>((a >> (16 * h)) & 0xffff), y = static_cast<short>((b >> (16 * h)) & 0xffff);
+    const unsigned ua = (a >> (16 * h)) & 0xffff, ub = (b >> (16 * h)) & 0xffff;
+    int x = sgn ? static_cast<int>(static_cast<short>(ua)) : static_cast<int>(ua);
+    int y = sgn ? static_cast<int>(static_cast<short>(ub)) : static_cast<int>(ub);
     int r = mx ? (x > y ? x : y) : (x < y ? x : y);
-    out |= static_cast<unsigned>(r < 0 ? 0 : r) << (16 * h);
+    if (relu && r < 0) r = 0;
+    out |= (static_cast<unsigned>(r) & 0xffffu) << (16 * h);
   }
   return out;
 }
+__host__ __device__ static unsigned relu_s16x2(unsigned a, unsigned b, bool mx) { return lanes16(a, b, mx, true, true); }
+__host__ __device__ static unsigned s16x2_plain(unsigned a, unsigned b, bool mx) { return lanes16(a, b, mx, true, false); }
+__host__ __device__ static unsigned u16x2_plain(unsigned a, unsigned b, bool mx) { return lanes16(a, b, mx, false, false); }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define PTX_RELU(name, ptx, a, b, model) \
@@ -47,19 +54,23 @@ PTX_RELU(ptx_max_relu_s16x2, "max.relu.s16x2 %0, %1, %2;", true, 0, relu_s16x2)
 PTX_RELU(ptx_max_s16x2_relu, "max.s16x2.relu %0, %1, %2;", true, 0, relu_s16x2)
 PTX_RELU(ptx_min_relu_s16x2, "min.relu.s16x2 %0, %1, %2;", false, 0, relu_s16x2)
 PTX_RELU(ptx_min_s16x2_relu, "min.s16x2.relu %0, %1, %2;", false, 0, relu_s16x2)
+PTX_RELU(ptx_max_s16x2, "max.s16x2 %0, %1, %2;", true, 0, s16x2_plain)
+PTX_RELU(ptx_min_s16x2, "min.s16x2 %0, %1, %2;", false, 0, s16x2_plain)
+PTX_RELU(ptx_max_u16x2, "max.u16x2 %0, %1, %2;", true, 0, u16x2_plain)
+PTX_RELU(ptx_min_u16x2, "min.u16x2 %0, %1, %2;", false, 0, u16x2_plain)
 
-// The plain two-operand forms are the C++ min and max (and the SIMD intrinsics for the lanes).
-__host__ __device__ static int smax(int a, int b) { return a > b ? a : b; }
-__host__ __device__ static int smin(int a, int b) { return a < b ? a : b; }
-__host__ __device__ static unsigned umax(unsigned a, unsigned b) { return a > b ? a : b; }
-__host__ __device__ static unsigned umin(unsigned a, unsigned b) { return a < b ? a : b; }
+// The plain two-operand forms are the C++ min and max; the packed ones are PTX's, below.
+__host__ __device__ static int s32_max(int a, int b) { return a > b ? a : b; }
+__host__ __device__ static int s32_min(int a, int b) { return a < b ? a : b; }
+__host__ __device__ static unsigned u32_max(unsigned a, unsigned b) { return a > b ? a : b; }
+__host__ __device__ static unsigned u32_min(unsigned a, unsigned b) { return a < b ? a : b; }
 
 // ---- the intrinsics ---------------------------------------------------------------------------
 // S2/U2: two operands (signed ints / unsigned, which also carry the packed types); S3/U3: three;
 // SB/UB: the choice as a predicate; B16: the choice per half; M: a PTX form, against the model.
 #define DPX_LIST(S2, U2, S3, U3, SB, UB, B16, M)                                                                  \
-  S2(smax) S2(smin) U2(umax) U2(umin) S2(__vimax_s32_relu) S2(__vimin_s32_relu)                                   \
-  U2(__vmaxs2) U2(__vmins2) U2(__vmaxu2) U2(__vminu2) U2(__vimax_s16x2_relu) U2(__vimin_s16x2_relu)               \
+  S2(s32_max) S2(s32_min) U2(u32_max) U2(u32_min) S2(__vimax_s32_relu) S2(__vimin_s32_relu)                       \
+  U2(__vimax_s16x2_relu) U2(__vimin_s16x2_relu)                                                                   \
   S3(__vimax3_s32) S3(__vimin3_s32) S3(__vimax3_s32_relu) S3(__vimin3_s32_relu)                                   \
   U3(__vimax3_u32) U3(__vimin3_u32)                                                                               \
   U3(__vimax3_s16x2) U3(__vimin3_s16x2) U3(__vimax3_s16x2_relu) U3(__vimin3_s16x2_relu)                           \
@@ -71,7 +82,8 @@ __host__ __device__ static unsigned umin(unsigned a, unsigned b) { return a < b 
   SB(__vibmax_s32) SB(__vibmin_s32) UB(__vibmax_u32) UB(__vibmin_u32)                                             \
   B16(__vibmax_s16x2) B16(__vibmin_s16x2) B16(__vibmax_u16x2) B16(__vibmin_u16x2)                                 \
   M(ptx_max_relu_s32) M(ptx_max_s32_relu) M(ptx_min_relu_s32) M(ptx_min_s32_relu)                                 \
-  M(ptx_max_relu_s16x2) M(ptx_max_s16x2_relu) M(ptx_min_relu_s16x2) M(ptx_min_s16x2_relu)
+  M(ptx_max_relu_s16x2) M(ptx_max_s16x2_relu) M(ptx_min_relu_s16x2) M(ptx_min_s16x2_relu)           \
+  M(ptx_max_s16x2) M(ptx_min_s16x2) M(ptx_max_u16x2) M(ptx_min_u16x2)
 
 // One function, one operand triple -> two words: the result and the predicates.
 #define CASE_S2(f) case __COUNTER__ - kBase: o0 = (unsigned)f((int)a, (int)b); break;

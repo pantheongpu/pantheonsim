@@ -68,7 +68,12 @@ executor does not run is passed over for the fatbin's PTX when there is PTX,
 so a program keeps working while the SASS path grows; with no PTX the image
 runs and the kernel reports the instruction it stopped at. A binary with SASS
 only for another architecture and no PTX gets `cudaErrorNoKernelImageForDevice`,
-as on the hardware.
+as on the hardware. So does one whose PTX is for a newer architecture than the
+GPU (PTX runs on newer GPUs, never older ones): that PTX is no fallback for SASS
+the executor cannot run, and the SASS runs. When several translation units
+register the same host stub (a template kernel instantiated in a unit built for
+sm_80 and sm_90 and in another for sm_90 alone), the module this GPU has code for
+is the one used, whichever registered last (`e2e_multiarch_modules`).
 
 | Variable | Effect |
 | --- | --- |
@@ -257,6 +262,11 @@ of it and not others, and `WARPSYNC` lets out one mask's lanes at a time.
   nvdisasm printed it.
 - `e2e_sass_path`: which code a binary runs -- SASS by default, PTX as the
   fallback, the overrides -- and that both give the right answer.
+- `e2e_multiarch_modules`: one template kernel registered by units built for
+  different architectures, on sm_80, sm_89 and sm_90 and in both link orders.
+- `e2e_dpx_intrinsics`: Hopper's DPX intrinsics (`__vimax3_s32_relu`,
+  `__viaddmax_s16x2`, `__vibmin_u32` ... and the PTX `min`/`max` `.relu` forms)
+  against NVIDIA's own host implementations, on SASS and PTX.
 - `e2e_sass_archs`: twenty programs built for each generation's SASS, sm_75 to
   sm_120, plus Hopper's (wgmma, TMA, tensor maps, stmatrix) for sm_90a and
   Blackwell's tensor core for sm_100a, each run by default -- checked to be
