@@ -2615,7 +2615,7 @@ rocprofv3 inside `vgpu shell`).
   `global_access` takes the instruction, how scalar memory does, and which LDS access it is. The parsers moved from `gcn_exec.cpp`
   to `gcn_decode.cpp` (one copy, `gcn::parse_narrow`, `parse_half`, `parse_atomic_body`, `transpose_bits_of`; the executor's
   `narrow`, `half_access` and `parse_atomic` call them) and an instruction nobody finalized (a test's hand-built one) gets the same
-  facts from `gcn::mem_facts(in, scratch)`. The struct is 13 bytes: `Inst` is copied for VGPR indexing and gfx1250's VGPR MSBs.
+  facts from `gcn::mem_facts(in, scratch)`. The struct is 14 bytes (an `Inst` is 352): it is copied for VGPR indexing and gfx1250's VGPR MSBs.
 * **The LDS accesses of real kernels without the ladder** (`Machine::lds_fast`): `ds_read_b32`, `ds_write_b32`, `ds_read_b64` /
   `_b96` / `_b128`, `ds_write_b64` / `_b128`, `ds_add_u32`, `ds_read2_b32`, `ds_write2_b32`, `ds_read_u8` / `i8` / `u16`,
   `ds_write_b8` / `b16`: one lane loop over the active lanes, the vector registers read and written directly, the same 32-bit
@@ -2630,15 +2630,17 @@ rocprofv3 inside `vgpu shell`).
   the immediate offset and the target worked out once. Same lanes, same order, same errors.
 * **`Machine::step` no longer builds and tears down an `Inst` for every instruction.** `Inst remapped;` (gfx1250's VGPR MSBs) and
   `Inst indexed;` (the vector case, for VGPR indexing) were default-constructed on every step and every vector instruction: 2.3% +
-  2.6% of the `smem` profile (`gcn::Inst::Inst`, `~Inst`), 4% of `divergent`. They are now a pointer made by a `noinline` copy where
-  one is needed (`InstCopy`). The first version used `std::optional<Inst>`: its inlined copy constructor made `step` so large that
-  the compiler stopped inlining `scalar_alu`, `OpName::operator==` and `debug::active` into it, and the whole engine measured 4 to
-  12% **slower** than the base (`valu_int`, `divergent`, `wave`, even `launch`; the controls caught it); out of line it measures
-  faster. This part is `step`'s and the vector case's, not the memory instructions': the `amdtier` piece edits the same lines.
+  2.6% of the `smem` profile (`gcn::Inst::Inst`, `~Inst`), 4.8% of `divergent`. They are now a pointer made by a `noinline` copy where
+  one is needed (`InstCopy`). The first version used `std::optional<Inst>`: with it `step` went from 6% to 21% of the `divergent` samples and `scalar_alu` and
+  `more_alu` turned up as functions of their own (the inlined copy constructor and destructor made `step` larger, which is the likely
+  reason the compiler stopped inlining them), and the whole engine measured 4 to 12% **slower** than the base (`valu_int`,
+  `divergent`, `wave`, even `launch`; the controls caught it); out of line `step` is back to 6% and it measures faster. This part is `step`'s and the vector case's, not the memory instructions': the `amdtier` piece edits the same lines.
 
 ### Results (B/A of the median, base f81cc0c1 against this branch)
 
-One thread, 11 runs, load average 3.5 to 6.6 (the second set 1.9 to 16.6, median 4.3), p < 0.001 unless noted:
+One thread, 11 runs, p < 0.001 unless noted. The rows from `ldsx` to `mem` and the `valu_int` control are one A/B (load average 3.5 to 6.6, median 5.2);
+`atomics`, `valu_f32`, `divergent`, `wave` and `launch` are from another, base against the tree before the `flat_access` edit (load 1.9 to
+16.6, median 4.3):
 
 | workload | what it runs | mi300x | rx6800 |
 | --- | --- | ---: | ---: |
@@ -2675,7 +2677,7 @@ the build rebuilt each time; "caught" is a failing, crashing or silent test run)
 * `test_amd_gcn_same_bits` (the existing guard, 15,566 shapes, digests from the unmodified base): passes unchanged. It runs memory
   instructions on random registers, so most of its addresses fault; it could not see most of the changes above.
 * `test_amd_gcn_memory_same_bits` (new; `amd/tests/data/mem_same_bits_digests.txt`): every DS, flat, global, scratch, MUBUF, MTBUF and
-  scalar memory shape of the ISA corpora (1,150 of them) run in twelve ways on a wave whose address registers are **aimed** at three
+  scalar memory shape of the ISA corpora (2,927 of them) run in twelve ways on a wave whose address registers are **aimed** at three
   allocations (`amd::digest_memory_instruction`, in `gcn_exec.cpp` next to `digest_instruction`): aligned, misaligned, on the end of an
   allocation, past it, wild, in the shared and the private aperture (gfx1250's too), runs of consecutive lanes, the same address in every
   lane, mixed per lane, half the lanes off; buffer resources valid, invalid, swizzled, scratch-resource, too small; LDS accesses past the
