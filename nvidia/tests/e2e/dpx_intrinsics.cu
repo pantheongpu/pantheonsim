@@ -71,6 +71,24 @@ __host__ __device__ static int s32_min(int a, int b) { return a < b ? a : b; }
 __host__ __device__ static unsigned u32_max(unsigned a, unsigned b) { return a > b ? a : b; }
 __host__ __device__ static unsigned u32_min(unsigned a, unsigned b) { return a < b ? a : b; }
 
+// The fused add of the signed 32-bit forms wraps (VIADDMNMX is a plain 32-bit add), but NVIDIA's host version adds
+// two ints and overflows, which UBSan reports. The host side is therefore this program's own: the sum in unsigned
+// arithmetic, then the minimum or maximum, then .relu. The device side is the intrinsic.
+#define PICK_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define PICK_MIN(a, b) ((a) < (b) ? (a) : (b))
+#ifdef __CUDA_ARCH__
+__device__ static int viaddmax_s32(int a, int b, int c) { return __viaddmax_s32(a, b, c); }
+__device__ static int viaddmin_s32(int a, int b, int c) { return __viaddmin_s32(a, b, c); }
+__device__ static int viaddmax_s32_relu(int a, int b, int c) { return __viaddmax_s32_relu(a, b, c); }
+__device__ static int viaddmin_s32_relu(int a, int b, int c) { return __viaddmin_s32_relu(a, b, c); }
+#else
+__host__ __device__ static int wrap_add(int a, int b) { return static_cast<int>(static_cast<unsigned>(a) + static_cast<unsigned>(b)); }
+__host__ __device__ static int viaddmax_s32(int a, int b, int c) { return PICK_MAX(wrap_add(a, b), c); }
+__host__ __device__ static int viaddmin_s32(int a, int b, int c) { return PICK_MIN(wrap_add(a, b), c); }
+__host__ __device__ static int viaddmax_s32_relu(int a, int b, int c) { const int r = PICK_MAX(wrap_add(a, b), c); return r < 0 ? 0 : r; }
+__host__ __device__ static int viaddmin_s32_relu(int a, int b, int c) { const int r = PICK_MIN(wrap_add(a, b), c); return r < 0 ? 0 : r; }
+#endif
+
 // ---- the intrinsics ---------------------------------------------------------------------------
 // S2/U2: two operands (signed ints / unsigned, which also carry the packed types); S3/U3: three;
 // SB/UB: the choice as a predicate; B16: the choice per half; M: a PTX form, against the model.
@@ -81,7 +99,7 @@ __host__ __device__ static unsigned u32_min(unsigned a, unsigned b) { return a <
   U3(__vimax3_u32) U3(__vimin3_u32)                                                                               \
   U3(__vimax3_s16x2) U3(__vimin3_s16x2) U3(__vimax3_s16x2_relu) U3(__vimin3_s16x2_relu)                           \
   U3(__vimax3_u16x2) U3(__vimin3_u16x2)                                                                           \
-  S3(__viaddmax_s32) S3(__viaddmin_s32) S3(__viaddmax_s32_relu) S3(__viaddmin_s32_relu)                           \
+  S3(viaddmax_s32) S3(viaddmin_s32) S3(viaddmax_s32_relu) S3(viaddmin_s32_relu)                                \
   U3(__viaddmax_u32) U3(__viaddmin_u32)                                                                           \
   U3(__viaddmax_s16x2) U3(__viaddmin_s16x2) U3(__viaddmax_s16x2_relu) U3(__viaddmin_s16x2_relu)                   \
   U3(__viaddmax_u16x2) U3(__viaddmin_u16x2)                                                                       \
