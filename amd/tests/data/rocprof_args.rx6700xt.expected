@@ -1,0 +1,96 @@
+# rocprofv3 trace of the args case, normalised by amd/tests/rocprof_normalize.py
+# recorded on: AMD Radeon RX 6700 XT (gfx1031), rocm-7.2.0, rocprofv3 1.1.0
+# regenerate: amd/tests/e2e/run_rocprof_case.sh args --card --update --gpu rx6700xt
+[agent]
+gpu name=gfx1031 product_name=AMD Radeon RX 6700 XT vendor_name=AMD cu_count=40 simd_per_cu=2 wave_front_size=32 lds_size_in_kb=64 max_waves_per_cu=32 workgroup_max_size=1024 gfx_target_version=100301 vendor_id=4098 device_id=29663 workgroup_max_dim=1024,1024,1024
+[kernels]
+[runtime kernels]
+[hip api, thread 1]
+__hipRegisterFatBinary(data=<ptr>)
+__hipRegisterFunction(modules=<ptr>, hostFunction=<ptr>, deviceFunction=_Z4vaddPKfS0_Pfi, deviceName=_Z4vaddPKfS0_Pfi, threadLimit=4294967295, tid=(null), bid=(null), blockDim=(null), gridDim=(null), wSize=(null))
+hipMemcpy(dst=0, src=0, sizeBytes=0, kind=HostToHost)
+hipMemcpy(dst=0, src=0, sizeBytes=0, kind=Default)
+hipMemcpy(dst=0, src=0, sizeBytes=0, kind=DeviceToDeviceNoCU)
+hipMemcpy(dst=0, src=0, sizeBytes=0, kind=hipMemcpy_UNKNOWN=77)
+hipMalloc(ptr=<ptr>, size=256)
+hipMemset(dst=<ptr>, value=7, sizeBytes=256)
+hipMemsetD8(dest=<ptr>, value=9, count=64)
+hipMemsetD16(dest=<ptr>, value=9, count=32)
+hipMemsetD32(dest=<ptr>, value=9, count=16)
+hipMemcpyHtoD(dst=<ptr>, src=<ptr>, sizeBytes=4)
+hipMemcpyDtoH(dst=<ptr>, src=<ptr>, sizeBytes=4)
+hipFree(ptr=<ptr>)
+hipFree(ptr=0)
+hipStreamSynchronize(stream=0)
+hipStreamCreateWithFlags(stream=<ptr>, flags=1)
+hipStreamCreateWithPriority(stream=<ptr>, flags=0, priority=0)
+hipDeviceGetStreamPriorityRange(leastPriority=<ptr>, greatestPriority=<ptr>)
+hipStreamGetFlags(stream=<ptr>, flags=<ptr>)
+hipStreamQuery(stream=<ptr>)
+hipEventCreateWithFlags(event=<ptr>, flags=2)
+hipEventCreate(event=<ptr>)
+hipEventRecord(event=<ptr>, stream=<ptr>)
+hipEventQuery(event=<ptr>)
+hipEventElapsedTime(ms=<ptr>, start=<ptr>, stop=<ptr>)
+hipEventDestroy(event=0)
+hipEventDestroy(event=<ptr>)
+hipEventDestroy(event=<ptr>)
+hipLaunchHostFunc(stream=<ptr>, fn=1, userData=0)
+hipLaunchHostFunc(stream=<ptr>, fn=0, userData=0)
+hipStreamAddCallback(stream=<ptr>, callback=1, userData=0, flags=0)
+hipStreamSynchronize(stream=<ptr>)
+hipStreamDestroy(stream=<ptr>)
+hipStreamDestroy(stream=<ptr>)
+hipDeviceGetName(name=<ptr>, len=64, device=0)
+hipDeviceGetPCIBusId(pciBusId=0, len=0, device=0)
+hipModuleGetFunction(function=(null), module=0, kname=(null))
+hipModuleGetFunction(function=(null), module=0, kname=kernel_name)
+hipGetErrorName(hip_error=1)
+hipGetErrorString(hipError=1)
+hipDeviceSetCacheConfig(cacheConfig=0)
+hipDeviceSetSharedMemConfig(config=0)
+hipDeviceGetAttribute(pi=<ptr>, attr=87, deviceId=0)
+hipDeviceGetLimit(pValue=<ptr>, limit=0)
+hipSetDevice(deviceId=0)
+hipGetDevice(deviceId=<ptr>)
+hipGetDeviceCount(count=<ptr>)
+hipDriverGetVersion(driverVersion=<ptr>)
+hipRuntimeGetVersion(runtimeVersion=<ptr>)
+hipMemGetInfo(free=<ptr>, total=<ptr>)
+hipMallocPitch(ptr=<ptr>, pitch=<ptr>, width=100, height=4)
+hipMemset2D(dst=<ptr>, pitch=256, value=3, width=100, height=4)
+hipFree(ptr=<ptr>)
+hipMallocManaged(dev_ptr=<ptr>, size=4096, flags=1)
+hipMemAdvise(dev_ptr=<ptr>, count=4096, advice=1, device=0)
+hipMemAdvise_v2(dev_ptr=<ptr>, count=4096, advice=1, location={type=Device, id=0})
+hipMemPrefetchAsync_v2(dev_ptr=<ptr>, count=4096, location={type=Device, id=0}, flags=0, stream=0)
+hipMemAdvise_v2(dev_ptr=<ptr>, count=4096, advice=1, location={type=Invalid, id=0})
+hipMemAdvise_v2(dev_ptr=<ptr>, count=4096, advice=1, location={type=Host, id=0})
+hipMemAdvise_v2(dev_ptr=<ptr>, count=4096, advice=1, location={type=HostNuma, id=0})
+hipMemAdvise_v2(dev_ptr=<ptr>, count=4096, advice=1, location={type=HostNumaCurrent, id=0})
+hipMemAdvise_v2(dev_ptr=<ptr>, count=4096, advice=1, location={type=hipMemLocationType_UNKNOWN=9, id=0})
+hipFree(ptr=<ptr>)
+hipHostMalloc(ptr=<ptr>, size=4096, flags=0)
+hipHostFree(ptr=<ptr>)
+hipMalloc3D(pitchedDevPtr=<ptr>, extent={depth=1, height=2, width=64})
+hipMemset3D(pitchedDevPtr={ysize=2, xsize=64, pitch=256}, value=5, extent={depth=1, height=2, width=64})
+hipFree(ptr=<ptr>)
+hipGetDevicePropertiesR0600(prop=<ptr>, deviceId=0)
+hipCtxGetCurrent(ctx=<ptr>)
+hipGraphCreate(pGraph=<ptr>, flags=0)
+hipGraphAddEmptyNode(pGraphNode=<ptr>, graph=<ptr>, pDependencies=(null), numDependencies=0)
+hipGraphGetNodes(graph=<ptr>, nodes=(null), numNodes=<ptr>)
+hipGraphDestroy(graph=<ptr>)
+hipGraphDestroy(graph=0)
+[dispatches]
+[copies]
+[scratch]
+[allocations]
+hipMalloc MEMORY_ALLOCATION_ALLOCATE bytes=256 on=gpu
+hipFree MEMORY_ALLOCATION_FREE on=none
+hipFree MEMORY_ALLOCATION_FREE on=none
+hipHostMalloc MEMORY_ALLOCATION_ALLOCATE bytes=4096 on=cpu
+hipHostFree MEMORY_ALLOCATION_FREE on=none
+hipFree MEMORY_ALLOCATION_FREE on=none
+[runtime allocations]
+[markers]

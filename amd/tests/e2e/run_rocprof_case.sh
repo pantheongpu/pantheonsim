@@ -22,7 +22,16 @@
 #   graph           a captured stream, instantiated and launched twice
 #   async_alloc     hipMallocAsync / hipFreeAsync around a copy and a kernel
 #   markers         ROCTx marks and ranges
+#   markers_control ROCTx profiler pause and resume, a named stream, nested ranges, marks from another thread
 #   geometry        3D grid, static plus dynamic LDS, scratch
+#   args            one call per kind of HIP parameter: how null and live pointers, handles, strings,
+#                   enums, integers and structs by value print
+#   agents          the GPU agent in every field (not a trace: rocprof_normalize.py --agents)
+#   runtime_kernels the runtime's own copy and fill kernels, by size and alignment
+#   scratch         private segments of several sizes on three queues (scratch-memory records)
+#   first_calls     which calls start the runtime and make its staging buffers
+#   graph_sizes     what a graph's instantiation allocates, by its kernel nodes
+#   async_sizes     the memory pool's mapped ranges, by size and synchronization
 #
 # The simulator has no timing model, so nothing in the comparison is a time.
 # The card's expected files were recorded on an RX 6800 (gfx1030) and, for
@@ -34,7 +43,7 @@
 # ROCPROF_CARD_DEVICE picks the HIP device (default 0 for rx6800, 1 for rx6700xt).
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
-usage="usage: $0 <vecadd|memset_d2d|copies|streams_events|graph|async_alloc|markers|geometry> [--gpu rx6800|rx6700xt] [--card [--update]]"
+usage="usage: $0 <vecadd|memset_d2d|copies|streams_events|graph|async_alloc|markers|markers_control|geometry|args|agents|runtime_kernels|scratch|first_calls|graph_sizes|async_sizes> [--gpu rx6800|rx6700xt] [--card [--update]]"
 case_name="${1:?$usage}"
 shift
 gpu=rx6800; card=0; update=0
@@ -80,9 +89,9 @@ export ROCM_PATH="$rocm"
 
 # The cases are built for gfx1030, the RX 6800; the RX 6700 XT (gfx1031) runs
 # the same code object (HSA_OVERRIDE_GFX_VERSION=10.3.0 on the card).
-libs=""; [[ "$case_name" == markers ]] && libs="-lrocprofiler-sdk-roctx"
+libs=""; [[ "$case_name" == markers* ]] && libs="-lrocprofiler-sdk-roctx"
 if ! "$rocm/bin/hipcc" -O2 -std=c++17 --offload-arch=gfx1030 -w "$src" -o "$exe" $libs >"$work/build.log" 2>&1; then
-  if grep -q "rocprofiler-sdk-roctx" "$work/build.log" && [[ "$case_name" == markers ]] && grep -qE "cannot find|not found|No such file" "$work/build.log"; then
+  if grep -q "rocprofiler-sdk-roctx" "$work/build.log" && [[ "$case_name" == markers* ]] && grep -qE "cannot find|not found|No such file" "$work/build.log"; then
     echo "SKIP: this ROCm has no ROCTx (rocprofiler-sdk-roctx)"; exit 0
   fi
   cat "$work/build.log"; echo "FAIL: hipcc could not build the $case_name case"; exit 1
@@ -126,11 +135,17 @@ results=$(find "$work/out" -name '*_results.json' | head -1)
 [[ -s "$results" ]] || { sed 's/^/      /' "$work/run.log" | tail -30; echo "FAIL: rocprofv3 wrote no results.json"; exit 1; }
 # ROCPROF_KEEP=<dir> keeps the raw result, to see what the normaliser left out.
 [[ -n "${ROCPROF_KEEP:-}" ]] && cp "$results" "$ROCPROF_KEEP/${case_name}.$(( card ))card.json"
-python3 -I "$root/amd/tests/rocprof_normalize.py" "$results" >"$work/trace.txt" || { echo "FAIL: could not normalise $results"; exit 1; }
+norm_flags=""; [[ "$case_name" == agents ]] && norm_flags="--agents"
+[[ "$case_name" == args ]] && norm_flags="--no-runtime"   # about the arguments, not the runtime's own work
+python3 -I "$root/amd/tests/rocprof_normalize.py" $norm_flags "$results" >"$work/trace.txt" || { echo "FAIL: could not normalise $results"; exit 1; }
 
 if (( update )); then
   product=$(sed -n 's/^gpu .*product_name=\(AMD Radeon [^=]*\) vendor_name=.*/\1/p' "$work/trace.txt" | head -1)
   isa=$(sed -n 's/^gpu name=\([^ ]*\) .*/\1/p' "$work/trace.txt" | head -1)
+  if [[ "$case_name" == agents ]]; then
+    isa=$(sed -n 's/^\[gpu agent \(.*\)\]$/\1/p' "$work/trace.txt" | head -1)
+    product=$(sed -n 's/^product_name=//p' "$work/trace.txt" | head -1)
+  fi
   {
     echo "# rocprofv3 trace of the $case_name case, normalised by amd/tests/rocprof_normalize.py"
     echo "# recorded on: $product ($isa), $(basename "$(readlink -f "$rocm")"), rocprofv3 ${rocprof_version:-?}"

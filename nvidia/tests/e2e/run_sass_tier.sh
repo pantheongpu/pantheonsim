@@ -85,6 +85,10 @@ printf '%s\n' "${jobs[@]}" | xargs -P "${VGPU_TIER_JOBS:-$("$root/ci/jobs.sh" -p
 
 [[ -n ${VGPU_TIER_BUILD_ONLY:-} ]] && { echo "built in $work"; exit 0; }
 
+# The limit on one program's run: 900 s, or 2400 s under a sanitizer, which makes the interpreter
+# side of sass_tier_steps (1.7 billion warp instructions) several times slower on a busy machine.
+run_limit="${VGPU_TIER_TIMEOUT:-$([[ -n $(shim_sanitizer "$shim") ]] && echo 2400 || echo 900)}"
+
 fails=0
 extra_env=()   # (an environment variable for a variant of a run: VGPU_TC_EXACT=0)
 variant=""
@@ -95,11 +99,11 @@ check() {
   fi
   require_shim_libs "$shim" "$bin" >/dev/null || return
   local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_SASS_LOG=1 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim") "${extra_env[@]}")
-  a="$(cd "$work" && env "${env[@]}" VGPU_TIER=0 timeout 900 "$bin" 2>&1)"; ra=$?
+  a="$(cd "$work" && env "${env[@]}" VGPU_TIER=0 timeout "$run_limit" "$bin" 2>&1)"; ra=$?
   # (The tier's statistics go to a file of their own: printed at exit among the program's buffered output, they tear a line.)
   local stats bq sf="$work/$p.$arch.stats"
   rm -f "$sf"
-  b="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 VGPU_TIER_STATS_FILE="$sf" timeout 900 "$bin" 2>&1)"; rb=$?
+  b="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_STATS=1 VGPU_TIER_STATS_FILE="$sf" timeout "$run_limit" "$bin" 2>&1)"; rb=$?
   stats="$(grep -h '^tier: ' "$sf" 2>/dev/null | head -1)"
   bq="$b"
   grep -q "running SASS" <<< "$a" || why="its SASS did not run"
@@ -118,7 +122,7 @@ check() {
     grep -q '^store gate: .* ok$' <<< "$bq" || why="${why:+$why; }the tier's store gate line is not ok"
     # The tier is shared by the host threads of a launch: four of them must give what one thread of the interpreter does.
     local c4
-    c4="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_THREADS=4 timeout 900 "$bin" 2>&1)"
+    c4="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_THREADS=4 timeout "$run_limit" "$bin" 2>&1)"
     [[ "$a" == "$c4" ]] || why="${why:+$why; }four threads with the tier print differently from the interpreter's one"
     local ran total
     ran="$(sed -n 's/^tier: \([0-9]*\) of \([0-9]*\) warp.*/\1/p' <<< "$stats")"
@@ -131,7 +135,7 @@ check() {
     # The tier without its chain (one run of straight instructions per call of the scheduler, as the interpreter has it): the
     # same again, so that a difference of the chain's is told from one of the handlers'.
     local nc
-    nc="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_CHAIN=0 timeout 900 "$bin" 2>&1)"
+    nc="$(cd "$work" && env "${env[@]}" VGPU_TIER=1 VGPU_TIER_CHAIN=0 timeout "$run_limit" "$bin" 2>&1)"
     [[ "$a" == "$nc" ]] || why="${why:+$why; }the tier without its chain prints differently from the interpreter"
   fi
   if [[ $p == sass_tier_steps && -z $why ]]; then

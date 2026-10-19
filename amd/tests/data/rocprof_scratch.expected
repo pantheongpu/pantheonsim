@@ -1,0 +1,121 @@
+# rocprofv3 trace of the scratch case, normalised by amd/tests/rocprof_normalize.py
+# recorded on: AMD Radeon RX 6800 (gfx1030), rocm-7.2.0, rocprofv3 1.1.0
+# regenerate: amd/tests/e2e/run_rocprof_case.sh scratch --card --update
+[agent]
+gpu name=gfx1030 product_name=AMD Radeon RX 6800 vendor_name=AMD cu_count=60 simd_per_cu=2 wave_front_size=32 lds_size_in_kb=64 max_waves_per_cu=32 workgroup_max_size=1024 gfx_target_version=100300 vendor_id=4098 device_id=29631 workgroup_max_dim=1024,1024,1024
+[kernels]
+_Z4vaddPKfS0_Pfi.kd kernarg=288 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+_Z5spillILi1024EEvPii.kd kernarg=272 group=0 private=4112 sgpr=128 arch_vgpr=24 accum_vgpr=0
+_Z5spillILi2048EEvPii.kd kernarg=272 group=0 private=8208 sgpr=128 arch_vgpr=24 accum_vgpr=0
+_Z5spillILi512EEvPii.kd kernarg=272 group=0 private=2064 sgpr=128 arch_vgpr=24 accum_vgpr=0
+_Z5spillILi64EEvPii.kd kernarg=272 group=0 private=272 sgpr=128 arch_vgpr=24 accum_vgpr=0
+[runtime kernels]
+__amd_rocclr_batchMemOp.kd kernarg=272 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyBuffer.kd kernarg=48 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyBufferAligned.kd kernarg=304 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyBufferRect.kd kernarg=384 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyBufferRectAligned.kd kernarg=384 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyBufferToImage.kd kernarg=416 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_copyImage.kd kernarg=320 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyImage1DA.kd kernarg=320 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_copyImageToBuffer.kd kernarg=416 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_fillBufferAligned.kd kernarg=40 group=0 private=0 sgpr=128 arch_vgpr=16 accum_vgpr=0
+__amd_rocclr_fillBufferAligned2D.kd kernarg=336 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_fillImage.kd kernarg=360 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_gwsInit.kd kernarg=4 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_initHeap.kd kernarg=24 group=0 private=0 sgpr=128 arch_vgpr=24 accum_vgpr=0
+__amd_rocclr_streamOpsWait.kd kernarg=40 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+__amd_rocclr_streamOpsWrite.kd kernarg=24 group=0 private=0 sgpr=128 arch_vgpr=8 accum_vgpr=0
+[hip api, thread 1]
+__hipRegisterFatBinary(data=<ptr>)
+__hipRegisterFunction(modules=<ptr>, hostFunction=<ptr>, deviceFunction=_Z4vaddPKfS0_Pfi, deviceName=_Z4vaddPKfS0_Pfi, threadLimit=4294967295, tid=(null), bid=(null), blockDim=(null), gridDim=(null), wSize=(null))
+__hipRegisterFunction(modules=<ptr>, hostFunction=<ptr>, deviceFunction=_Z5spillILi64EEvPii, deviceName=_Z5spillILi64EEvPii, threadLimit=4294967295, tid=(null), bid=(null), blockDim=(null), gridDim=(null), wSize=(null))
+__hipRegisterFunction(modules=<ptr>, hostFunction=<ptr>, deviceFunction=_Z5spillILi512EEvPii, deviceName=_Z5spillILi512EEvPii, threadLimit=4294967295, tid=(null), bid=(null), blockDim=(null), gridDim=(null), wSize=(null))
+__hipRegisterFunction(modules=<ptr>, hostFunction=<ptr>, deviceFunction=_Z5spillILi1024EEvPii, deviceName=_Z5spillILi1024EEvPii, threadLimit=4294967295, tid=(null), bid=(null), blockDim=(null), gridDim=(null), wSize=(null))
+__hipRegisterFunction(modules=<ptr>, hostFunction=<ptr>, deviceFunction=_Z5spillILi2048EEvPii, deviceName=_Z5spillILi2048EEvPii, threadLimit=4294967295, tid=(null), bid=(null), blockDim=(null), gridDim=(null), wSize=(null))
+hipMalloc(ptr=<ptr>, size=16384)
+hipStreamCreate(stream=<ptr>)
+hipStreamCreate(stream=<ptr>)
+__hipPushCallConfiguration(gridDim={z=1, y=1, x=2}, blockDim={z=1, y=1, x=64}, sharedMem=0, stream=<ptr>)
+__hipPopCallConfiguration(gridDim=<ptr>, blockDim=<ptr>, sharedMem=<ptr>, stream=<ptr>)
+hipLaunchKernel(function_address=<ptr>, numBlocks={z=1, y=1, x=2}, dimBlocks={z=1, y=1, x=64}, args=<ptr>, sharedMemBytes=0, stream=<ptr>)
+hipStreamSynchronize(stream=<ptr>)
+__hipPushCallConfiguration(gridDim={z=1, y=1, x=2}, blockDim={z=1, y=1, x=64}, sharedMem=0, stream=<ptr>)
+__hipPopCallConfiguration(gridDim=<ptr>, blockDim=<ptr>, sharedMem=<ptr>, stream=<ptr>)
+hipLaunchKernel(function_address=<ptr>, numBlocks={z=1, y=1, x=2}, dimBlocks={z=1, y=1, x=64}, args=<ptr>, sharedMemBytes=0, stream=<ptr>)
+hipStreamSynchronize(stream=<ptr>)
+__hipPushCallConfiguration(gridDim={z=1, y=1, x=2}, blockDim={z=1, y=1, x=64}, sharedMem=0, stream=<ptr>)
+__hipPopCallConfiguration(gridDim=<ptr>, blockDim=<ptr>, sharedMem=<ptr>, stream=<ptr>)
+hipLaunchKernel(function_address=<ptr>, numBlocks={z=1, y=1, x=2}, dimBlocks={z=1, y=1, x=64}, args=<ptr>, sharedMemBytes=0, stream=<ptr>)
+hipStreamSynchronize(stream=<ptr>)
+__hipPushCallConfiguration(gridDim={z=1, y=1, x=2}, blockDim={z=1, y=1, x=64}, sharedMem=0, stream=<ptr>)
+__hipPopCallConfiguration(gridDim=<ptr>, blockDim=<ptr>, sharedMem=<ptr>, stream=<ptr>)
+hipLaunchKernel(function_address=<ptr>, numBlocks={z=1, y=1, x=2}, dimBlocks={z=1, y=1, x=64}, args=<ptr>, sharedMemBytes=0, stream=<ptr>)
+hipStreamSynchronize(stream=<ptr>)
+__hipPushCallConfiguration(gridDim={z=1, y=1, x=2}, blockDim={z=1, y=1, x=64}, sharedMem=0, stream=<ptr>)
+__hipPopCallConfiguration(gridDim=<ptr>, blockDim=<ptr>, sharedMem=<ptr>, stream=<ptr>)
+hipLaunchKernel(function_address=<ptr>, numBlocks={z=1, y=1, x=2}, dimBlocks={z=1, y=1, x=64}, args=<ptr>, sharedMemBytes=0, stream=<ptr>)
+hipStreamSynchronize(stream=<ptr>)
+__hipPushCallConfiguration(gridDim={z=1, y=1, x=2}, blockDim={z=1, y=1, x=64}, sharedMem=0, stream=<ptr>)
+__hipPopCallConfiguration(gridDim=<ptr>, blockDim=<ptr>, sharedMem=<ptr>, stream=<ptr>)
+hipLaunchKernel(function_address=<ptr>, numBlocks={z=1, y=1, x=2}, dimBlocks={z=1, y=1, x=64}, args=<ptr>, sharedMemBytes=0, stream=<ptr>)
+hipStreamSynchronize(stream=<ptr>)
+__hipPushCallConfiguration(gridDim={z=1, y=1, x=2}, blockDim={z=1, y=1, x=64}, sharedMem=0, stream=<ptr>)
+__hipPopCallConfiguration(gridDim=<ptr>, blockDim=<ptr>, sharedMem=<ptr>, stream=<ptr>)
+hipLaunchKernel(function_address=<ptr>, numBlocks={z=1, y=1, x=2}, dimBlocks={z=1, y=1, x=64}, args=<ptr>, sharedMemBytes=0, stream=<ptr>)
+hipStreamSynchronize(stream=<ptr>)
+__hipPushCallConfiguration(gridDim={z=1, y=1, x=2}, blockDim={z=1, y=1, x=64}, sharedMem=0, stream=0)
+__hipPopCallConfiguration(gridDim=<ptr>, blockDim=<ptr>, sharedMem=<ptr>, stream=<ptr>)
+hipLaunchKernel(function_address=<ptr>, numBlocks={z=1, y=1, x=2}, dimBlocks={z=1, y=1, x=64}, args=<ptr>, sharedMemBytes=0, stream=0)
+hipDeviceSynchronize()
+__hipPushCallConfiguration(gridDim={z=1, y=1, x=2}, blockDim={z=1, y=1, x=64}, sharedMem=0, stream=0)
+__hipPopCallConfiguration(gridDim=<ptr>, blockDim=<ptr>, sharedMem=<ptr>, stream=<ptr>)
+hipLaunchKernel(function_address=<ptr>, numBlocks={z=1, y=1, x=2}, dimBlocks={z=1, y=1, x=64}, args=<ptr>, sharedMemBytes=0, stream=0)
+hipDeviceSynchronize()
+hipStreamDestroy(stream=<ptr>)
+hipStreamDestroy(stream=<ptr>)
+hipFree(ptr=<ptr>)
+[dispatches]
+void spill<64>(int*, int) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=272
+void spill<64>(int*, int) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=272
+void spill<512>(int*, int) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=2064
+void spill<64>(int*, int) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=272
+void spill<1024>(int*, int) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=4112
+void spill<64>(int*, int) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=272
+void spill<512>(int*, int) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=2064
+void spill<64>(int*, int) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=272
+void spill<2048>(int*, int) [clone .kd] grid=128,1,1 workgroup=64,1,1 group=0 private=8208
+[copies]
+[scratch]
+ALLOC queue=1 flags=0 bytes=17694720
+ALLOC queue=1 flags=0 bytes=127795200
+ALLOC queue=1 flags=1 bytes=4227072
+ALLOC queue=2 flags=0 bytes=17694720
+ALLOC queue=2 flags=0 bytes=127795200
+ALLOC queue=3 flags=0 bytes=17694720
+ALLOC queue=3 flags=1 bytes=8421376
+FREE queue=1 flags=0
+FREE queue=1 flags=0
+FREE queue=1 flags=1
+FREE queue=2 flags=0
+FREE queue=3 flags=0
+FREE queue=3 flags=1
+[allocations]
+hipMalloc MEMORY_ALLOCATION_ALLOCATE bytes=16384 on=gpu
+hipFree MEMORY_ALLOCATION_FREE on=none
+[runtime allocations]
+hipMalloc MEMORY_ALLOCATION_ALLOCATE bytes=4194304 on=cpu
+hipMalloc MEMORY_ALLOCATION_ALLOCATE bytes=56 on=cpu
+hipStreamCreate MEMORY_ALLOCATION_ALLOCATE bytes=4194304 on=cpu
+hipStreamCreate MEMORY_ALLOCATION_ALLOCATE bytes=16777216 on=cpu
+hipStreamCreate MEMORY_ALLOCATION_ALLOCATE bytes=4194304 on=cpu
+hipStreamCreate MEMORY_ALLOCATION_ALLOCATE bytes=16777216 on=cpu
+hipLaunchKernel MEMORY_ALLOCATION_ALLOCATE bytes=4194304 on=cpu
+hipLaunchKernel MEMORY_ALLOCATION_ALLOCATE bytes=16777216 on=cpu
+hipStreamDestroy MEMORY_ALLOCATION_FREE address=null on=none
+hipStreamDestroy MEMORY_ALLOCATION_FREE on=none
+hipStreamDestroy MEMORY_ALLOCATION_FREE on=none
+hipStreamDestroy MEMORY_ALLOCATION_FREE address=null on=none
+hipStreamDestroy MEMORY_ALLOCATION_FREE on=none
+hipStreamDestroy MEMORY_ALLOCATION_FREE on=none
+[markers]

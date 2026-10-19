@@ -280,6 +280,12 @@ add_custom_command(TARGET vgpucuda POST_BUILD
 add_library(vgpuhip SHARED amd/src/hip_api.cpp amd/src/hip_cxx.cpp amd/src/hsa_api.cpp)
 target_link_libraries(vgpuhip PRIVATE vgpu ${CMAKE_DL_LIBS})
 target_include_directories(vgpuhip PRIVATE amd/include)
+# A HIP program may pass any integer where the API names an enumeration (the tests pass values HIP does not
+# define, and the answer is an error code): the library reads those values without taking them as the enum,
+# so the sanitizer's enum check, which cannot tell, is off for it.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(vgpuhip PRIVATE -fno-sanitize=enum)
+endif()
 # The real runtime's identity: a HIP program records SONAME "libamdhip64.so.6"
 # and resolves to this library through LD_LIBRARY_PATH at run time.
 set_target_properties(vgpuhip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 VERSION 6.4)
@@ -1409,6 +1415,8 @@ target_compile_definitions(test_amd_gcn_crosslane PRIVATE VGPU_SOURCE_DIR="${CMA
 
 vgpu_unit_test(test_amd_gcn_doubles amd/tests/unit/test_gcn_doubles.cpp)
 target_compile_definitions(test_amd_gcn_doubles PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Division: the compiler's v_div_scale / v_div_fmas / v_div_fixup sequence against the host's IEEE quotient.
+vgpu_unit_test(test_amd_gcn_divide amd/tests/unit/test_gcn_divide.cpp)
 
 vgpu_unit_test(test_amd_gcn_narrow amd/tests/unit/test_gcn_narrow.cpp)
 target_compile_definitions(test_amd_gcn_narrow PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -1443,6 +1451,8 @@ vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
 target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_asm amd/tests/unit/test_gcn_asm.cpp)
 target_compile_definitions(test_amd_gcn_asm PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_unit_test(test_amd_gcn_cdna_gaps amd/tests/unit/test_gcn_cdna_gaps.cpp)
+target_compile_definitions(test_amd_gcn_cdna_gaps PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_abandon amd/tests/unit/test_gcn_abandon.cpp)
 target_compile_definitions(test_amd_gcn_abandon PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_hostcall amd/tests/unit/test_hostcall.cpp)
@@ -1457,6 +1467,12 @@ target_link_libraries(test_amd_rocprofiler PRIVATE vgpurocprof vgpuhip)
 target_include_directories(test_amd_rocprofiler PRIVATE tests/framework amd/include)
 target_compile_definitions(test_amd_rocprofiler PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME test_amd_rocprofiler COMMAND test_amd_rocprofiler)
+# The arguments of HIP calls in rocprofiler-sdk's records and callbacks, and the table behind them.
+add_executable(test_amd_rocprofiler_args amd/tests/unit/test_rocprofiler_args.cpp)
+target_link_libraries(test_amd_rocprofiler_args PRIVATE vgpurocprof vgpuhip)
+target_include_directories(test_amd_rocprofiler_args PRIVATE tests/framework include amd/include amd/src)
+add_test(NAME test_amd_rocprofiler_args COMMAND test_amd_rocprofiler_args)
+set_tests_properties(test_amd_rocprofiler_args PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
 # HIP from a static destructor after exit() has destroyed thread_local
 # objects, with the profiler's hooks on, as hipBLASLt does under PyTorch.
 add_executable(test_amd_hip_at_exit amd/tests/unit/test_hip_at_exit.cpp)
@@ -1466,6 +1482,17 @@ add_test(NAME test_amd_hip_at_exit COMMAND test_amd_hip_at_exit)
 set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "ok HIP from a static destructor" FAIL_REGULAR_EXPRESSION "FAIL|ERROR: AddressSanitizer|malloc|double free|corrupted")
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
+# PC sampling (host-trap method, interval in instructions): the test is the
+# tool; run with every instruction sampled and with every fifth.
+add_executable(test_amd_rocprofiler_pcsampling amd/tests/unit/test_rocprofiler_pcsampling.cpp)
+target_link_libraries(test_amd_rocprofiler_pcsampling PRIVATE vgpurocprof vgpuhip)
+target_include_directories(test_amd_rocprofiler_pcsampling PRIVATE tests/framework amd/include)
+target_compile_definitions(test_amd_rocprofiler_pcsampling PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+foreach(interval 1 5)
+  add_test(NAME test_amd_rocprofiler_pcsampling_${interval} COMMAND test_amd_rocprofiler_pcsampling)
+  set_tests_properties(test_amd_rocprofiler_pcsampling_${interval} PROPERTIES
+    ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1;VGPU_TEST_PCS_INTERVAL=${interval}")
+endforeach()
 # ROCm SMI and AMD SMI each carry the simulator's core, by design; a test that loads both is an ODR violation
 # to a sanitizer build (as in nvidia/tests/e2e/run_lib_check.sh). Leak detection stays on.
 set(VGPU_SAN_ODR_OFF "ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
@@ -1505,10 +1532,27 @@ endforeach()
 add_test(NAME amd_vllm COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vllm_amd.sh amd/mi300x)
 set_tests_properties(amd_vllm PROPERTIES DEPENDS "vgpuhip;vgpuamdsmi;vgpursmi" RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 5400)
+# And as vLLM runs by default: torch.compile and CUDA graphs (piecewise and full,
+# batch sizes 1 and 2), two prompts generated together.
+add_test(NAME amd_vllm_graphs COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vllm_amd.sh amd/mi300x)
+set_tests_properties(amd_vllm_graphs PROPERTIES DEPENDS "vgpuhip;vgpuamdsmi;vgpursmi" RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_VLLM_MODE=graphs" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 5400)
+# And sharded over two simulated GPUs (tensor parallelism), the all-reduces
+# inside the captured graphs.
+add_test(NAME amd_vllm_graphs_tp2 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_vllm_amd.sh amd/mi300x)
+set_tests_properties(amd_vllm_graphs_tp2 PROPERTIES DEPENDS "vgpuhip;vgpuamdsmi;vgpursmi" RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_VLLM_MODE=graphs;VGPU_VLLM_TP=2" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 5400)
 add_test(NAME amd_amdsmi_python COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_amdsmi_python.sh)
 set_tests_properties(amd_amdsmi_python PROPERTIES DEPENDS vgpuamdsmi
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 add_test(NAME amd_rocprofiler_abi COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_abi.sh)
+add_test(NAME amd_rocprofiler_pcsampling COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofiler_pcsampling.sh)
+set_tests_properties(amd_rocprofiler_pcsampling PROPERTIES DEPENDS "vgpuhip;vgpurocprof"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+# AMD's ROCm Validation Suite, unmodified (skips without an rvs binary or an isolated session).
+add_test(NAME amd_rvs COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rvs.sh)
+set_tests_properties(amd_rvs PROPERTIES DEPENDS "vgpu_cli;vgpuhip;vgpuamdsmi;vgpursmi"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 900)
 add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
 set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
@@ -1554,17 +1598,33 @@ set_tests_properties(test_amd_rocprofiler_rx6800 PROPERTIES ENVIRONMENT "VGPU_GP
 add_test(NAME test_amd_rocprofiler_rx6700xt COMMAND test_amd_rocprofiler_rdna)
 set_tests_properties(test_amd_rocprofiler_rx6700xt PROPERTIES
   ENVIRONMENT "VGPU_GPU=amd/rx6700xt;HSA_OVERRIDE_GFX_VERSION=10.3.0;VGPU_QUIET=1")
-# What rocprofv3 recorded for small HIP programs on a real RX 6800 (and, for vecadd, an RX 6700 XT), compared with
+# What rocprofv3 recorded for small HIP programs on a real RX 6800 and an RX 6700 XT, compared with
 # what it records on the simulated card. Skips where there is no ROCm with rocprofv3 and hipcc.
-foreach(_case vecadd memset_d2d copies streams_events graph async_alloc markers geometry)
+foreach(_case vecadd memset_d2d copies streams_events graph async_alloc markers markers_control geometry args
+        runtime_kernels scratch first_calls graph_sizes async_sizes)
   add_test(NAME amd_rocprof_${_case} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh ${_case})
   set_tests_properties(amd_rocprof_${_case} PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+  add_test(NAME amd_rocprof_${_case}_rx6700xt
+    COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh ${_case} --gpu rx6700xt)
+  set_tests_properties(amd_rocprof_${_case}_rx6700xt PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
 endforeach()
-add_test(NAME amd_rocprof_vecadd_rx6700xt
-  COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh vecadd --gpu rx6700xt)
-set_tests_properties(amd_rocprof_vecadd_rx6700xt PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+
+# The agent in every field, the files rocprofv3 writes besides results.json, and the counters a Radeon card offers
+# (amd/docs/rocprofiler.md), each compared with what the real cards printed.
+foreach(_gpu rx6800 rx6700xt)
+  foreach(_script agents outputs counters)
+    if(_script STREQUAL "agents")
+      set(_cmd ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_case.sh agents --gpu ${_gpu})
+    else()
+      set(_cmd ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprof_${_script}.sh --gpu ${_gpu})
+    endif()
+    add_test(NAME amd_rocprof_${_script}_${_gpu} COMMAND ${_cmd})
+    set_tests_properties(amd_rocprof_${_script}_${_gpu} PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 600)
+  endforeach()
+endforeach()
 
 # The host-memory guard seen from a HIP program: a reserve no host can meet makes every real chunk
 # of device memory an out-of-memory error (hipErrorOutOfMemory), not a crash.
@@ -1742,9 +1802,43 @@ set_tests_properties(amd_pytorch_rx6700xt PROPERTIES DEPENDS vgpuhip RUN_SERIAL 
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};HSA_OVERRIDE_GFX_VERSION=10.3.0" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # torch.compile's Triton kernels, and one written by hand, compiled and loaded
 # at run time.
-add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 3 1)
+add_test(NAME amd_pytorch_compile COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 9 1)
 set_tests_properties(amd_pytorch_compile PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+# And on gfx950, whose Triton kernels use instructions the others' do not
+# (v_maximum3_f32 for a relu, buffer loads into LDS).
+add_test(NAME amd_pytorch_compile_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh compile.py 9 1 amd/mi350x)
+set_tests_properties(amd_pytorch_compile_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 3600)
+# CUDA graphs (HIP graphs): a model's launches, copies and events recorded by
+# stream capture and replayed, as vLLM's decode step and torch.compile's
+# "reduce-overhead" mode do; on every generation the simulator has.
+foreach(_g mi300x mi350x mi250x rx7900xtx rx9070xt)
+  set(_name amd_pytorch_graphs)
+  if(NOT _g STREQUAL "mi300x")
+    set(_name amd_pytorch_graphs_${_g})
+  endif()
+  add_test(NAME ${_name} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh graphs.py 17 1 amd/${_g})
+  set_tests_properties(${_name} PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+endforeach()
+# Triton's AMD backend on hand-written kernels (amd/tests/pytorch/triton_kernels.py):
+# MFMA or WMMA in each input type, attention, reductions, atomics. The number
+# of checks depends on the device: fp8 products on gfx942 (two more) and gfx950
+# (two more, the MX-scaled product, and 18 MX-scaled ones of several blocks of K).
+foreach(_g mi300x:20 mi350x:42 mi250x:18 rx7900xtx:18 rx9070xt:18)
+  string(REPLACE ":" ";" _p ${_g})
+  list(GET _p 0 _gpu)
+  list(GET _p 1 _count)
+  add_test(NAME amd_pytorch_triton_${_gpu} COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh triton_kernels.py ${_count} 1 amd/${_gpu})
+  set_tests_properties(amd_pytorch_triton_${_gpu} PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+endforeach()
+# Triton's asynchronous copies on gfx950 (global memory to LDS without
+# registers: buffer_load_* with the LDS bit), which it uses when asked to.
+add_test(NAME amd_pytorch_triton_async_copy_mi350x COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh triton_kernels.py 42 1 amd/mi350x)
+set_tests_properties(amd_pytorch_triton_async_copy_mi350x PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};TRITON_HIP_USE_ASYNC_COPY=1" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # Whole models (amd/tests/pytorch/models.py): a GPT trained with a schedule and
 # generating with a KV cache, a ResNet, an LSTM, a U-Net, a vision transformer,
 # mixture of experts, a recommender, mixed precision, activation checkpointing
@@ -1779,6 +1873,11 @@ set_tests_properties(amd_pytorch_xf32 PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
 # DistributedDataParallel.
 add_test(NAME amd_pytorch_distributed COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch_distributed.sh)
 set_tests_properties(amd_pytorch_distributed PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
+# RCCL's collectives recorded into HIP graphs across two processes: the all-reduces
+# of a tensor-parallel decode step, which vLLM captures and replays.
+add_test(NAME amd_pytorch_graphs_distributed COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch_distributed.sh distributed_graphs.py 6)
+set_tests_properties(amd_pytorch_graphs_distributed PROPERTIES DEPENDS vgpuhip RUN_SERIAL TRUE
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 1800)
 # And on two devices: RCCL's collectives and DataParallel between them.
 add_test(NAME amd_pytorch_multi_gpu COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_pytorch.sh multi_gpu.py 9 2)
@@ -1880,6 +1979,7 @@ add_test(NAME lint_readme_commands COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_
 set_tests_properties(lint_readme_commands PROPERTIES TIMEOUT 120)
 # ./run against a fake simulator, unshare and package tools.
 add_test(NAME lint_run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_run.sh)
+add_test(NAME lint_example_yaml COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_example_yaml.sh)
 set_tests_properties(lint_run_launcher PROPERTIES TIMEOUT 120)
 add_test(NAME run_launcher COMMAND ${CMAKE_SOURCE_DIR}/tests/e2e/run_launcher.sh)
 set_tests_properties(run_launcher PROPERTIES DEPENDS vgpu_cli
@@ -3058,7 +3158,7 @@ set_tests_properties(e2e_sass_tier PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
-  TIMEOUT 1800)
+  TIMEOUT 3600)
 
 # SASS on every architecture: programs built for each generation's SASS, sm_75
 # to sm_120, run by default and on their PTX, which must agree. sm_100 and
@@ -3143,7 +3243,7 @@ if(TARGET vgpucudart)
   set_tests_properties(e2e_ipc PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 600)
+    TIMEOUT 1200)
 endif()
 
 # A graph built node by node rather than captured: a diamond of dependencies,

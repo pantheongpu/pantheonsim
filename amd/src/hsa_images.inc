@@ -17,7 +17,8 @@ namespace im = vgpu::amd::image;
 
 im::Gen agent_gen(int gpu) {
   const std::string& a = shared::profile(gpu).gcn_arch;
-  return a.rfind("gfx10", 0) == 0 ? im::Gen::Gfx10 : a.rfind("gfx11", 0) == 0 ? im::Gen::Gfx11 : im::Gen::Gfx12;
+  return a == "gfx90a" ? im::Gen::Gfx9
+         : a.rfind("gfx10", 0) == 0 ? im::Gen::Gfx10 : a.rfind("gfx11", 0) == 0 ? im::Gen::Gfx11 : im::Gen::Gfx12;
 }
 
 enum Geometry : uint32_t { k1D = 0, k2D = 1, k3D = 2, k1DA = 3, k2DA = 4, k1DB = 5, k2DDepth = 6, k2DADepth = 7 };

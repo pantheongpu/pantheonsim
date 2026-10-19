@@ -123,7 +123,7 @@ VTEST(scalar_bit_fields_shifts_and_comparisons_give_what_the_isa_says) {
         u(shifted), u(shifted >> 32),
         u(std::min(x, y)), x < y,
         std::min(ux, uy), ux < uy,
-        u(std::max(x, y)), x > y,
+        u(std::max(x, y)), x >= y,   // the CDNA3 guide: SCC is set on a tie
         (ux | 8u) & ~0x80000000u,
         (ux >> 5) & 1, !((ux >> 5) & 1),
         ux > 0x8000u, x < -32768,
@@ -156,8 +156,8 @@ VTEST(the_rest_of_the_scalar_bitwise_family_gives_what_the_isa_says) {
     const uint64_t bfm = ((uint64_t{1} << (y & 63)) - 1) << (x & 63);
     const uint32_t start = y & 63, width = (y >> 16) & 0x7F;
     const uint64_t bfe = width == 0 ? 0 : width >= 64 ? a >> start : (a >> start) & ((uint64_t{1} << width) - 1);
-    const int64_t d = int64_t{static_cast<int32_t>(x)} - static_cast<int32_t>(y);
-    const uint32_t absdiff = static_cast<uint32_t>(d < 0 ? -d : d);
+    const int32_t d = static_cast<int32_t>(static_cast<uint32_t>(x) - static_cast<uint32_t>(y));   // the guide's pseudocode works in 32 bits: INT_MIN stays negative
+    const uint32_t absdiff = d < 0 ? 0u - static_cast<uint32_t>(d) : static_cast<uint32_t>(d);
     const std::vector<uint32_t> want = {
         x | ~y, (x | ~y) != 0,
         ~(x & y), ~(x & y) != 0,
@@ -357,6 +357,171 @@ VTEST(global_loads_into_lds_land_where_m0_the_offset_and_the_lane_say) {
     for (uint32_t k = 0; k < 4; ++k) want[lane * 4 + k] = src[lane * 4 + k];            // x4: M0 0
     for (uint32_t k = 0; k < 3; ++k) want[257 + lane * 3 + k] = src[lane * 4 + 1 + k];  // x3: M0 1024, offset 4
     want[514 + lane] = src[lane * 4 + 2];                                                // x1: M0 2048, offset 8
+  }
+  int wrong = 0;
+  for (size_t i = 0; i < want.size(); ++i) wrong += r[i] != want[i];
+  VCHECK_EQ(wrong, 0);
+}
+
+// gfx950's three-way IEEE minimum and maximum, one and two halves: IEEE 754-2019's minimum() and
+// maximum() -- a NaN in, a NaN out, and -0 below +0 -- applied twice (CDNA4 ISA, V_MAXIMUM3_F32:
+// D0 = v_maximum_f32(v_maximum_f32(S0, S1), S2)).
+VTEST(three_way_ieee_minimum_and_maximum_on_gfx950) {
+  const amd::CodeObject o = object("asm_minmax3", "gfx950");
+  const auto bits = [](float x) { uint32_t b; std::memcpy(&b, &x, 4); return b; };
+  const auto flt = [](uint32_t b) { float x; std::memcpy(&x, &b, 4); return x; };
+  // IEEE 754-2019 maximum / minimum of two values, on values of either width.
+  const auto ieee = [](double a, double b, bool want_max, bool* nan) {
+    *nan = std::isnan(a) || std::isnan(b);
+    if (*nan) return 0.0;
+    if (a == 0 && b == 0) return want_max ? (std::signbit(a) ? b : a) : (std::signbit(a) ? a : b);
+    return want_max ? std::max(a, b) : std::min(a, b);
+  };
+  const auto three = [&](double a, double b, double c, bool want_max, bool* nan) {
+    bool n1, n2;
+    const double r = ieee(ieee(a, b, want_max, &n1), c, want_max, &n2);
+    *nan = n1 || n2;
+    return r;
+  };
+  std::vector<uint32_t> in(192);
+  const float special[] = {0.0f, -0.0f, 1.0f, -1.0f, INFINITY, -INFINITY, flt(0x7fc00000), flt(0x7f800001), 3.5f, -3.5f};
+  uint32_t seed = 99;
+  const auto next = [&]() { seed = seed * 1103515245u + 12345u; return seed >> 8; };
+  for (uint32_t l = 0; l < 64; ++l) {
+    if (l < 40) {   // the specials, each with each of the others
+      in[l] = bits(special[l % 10]);
+      in[64 + l] = bits(special[(l / 10 + l) % 10]);
+      in[128 + l] = bits(special[(l / 3 + 2 * l) % 10]);
+    } else {        // random bit patterns: floats, and in the halves a NaN, a zero or an infinity now and then
+      for (uint32_t k = 0; k < 3; ++k) in[64 * k + l] = next() << 16 ^ next();
+    }
+  }
+  MemoryManager mem(16ull << 20);
+  const uint64_t in_addr = mem.alloc(192 * 4), out_addr = mem.alloc(256 * 4);
+  mem.write(in_addr, in.data(), 192 * 4);
+  const std::vector<uint32_t> r = run(o, "minmax3", mem, out_addr, 256, {in_addr, out_addr});
+  int wrong = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    for (int want_max = 1; want_max >= 0; --want_max) {
+      bool nan;
+      const double want = three(flt(in[l]), flt(in[64 + l]), flt(in[128 + l]), want_max, &nan);
+      const float got = flt(r[(want_max ? 0 : 64) + l]);
+      wrong += nan ? !std::isnan(got) : (std::isnan(got) || got != want || std::signbit(got) != std::signbit(want));
+      // The packed form, a half at a time.
+      uint32_t packed = r[(want_max ? 128 : 192) + l];
+      for (int half = 0; half < 2; ++half) {
+        const auto h = [&](uint32_t w) { uint16_t v = static_cast<uint16_t>(w >> (16 * half)); _Float16 x; std::memcpy(&x, &v, 2); return static_cast<double>(x); };
+        const double hw = three(h(in[l]), h(in[64 + l]), h(in[128 + l]), want_max, &nan);
+        uint16_t gv = static_cast<uint16_t>(packed >> (16 * half));
+        _Float16 gx;
+        std::memcpy(&gx, &gv, 2);
+        const double g = static_cast<double>(gx);
+        wrong += nan ? !std::isnan(g) : (std::isnan(g) || g != hw || std::signbit(g) != std::signbit(hw));
+      }
+    }
+  }
+  VCHECK_EQ(wrong, 0);
+}
+
+// gfx950's V_CVT_SCALEF32_PK_BF16_{FP4,FP8,BF8}: two small floats of SRC0 (FP4: the byte OPSEL[1:0] names, low nibble
+// first; FP8, BF8: the 16-bit half OPSEL[0] names, low byte first), each times 2^(exponent(S1) - 127), as bfloat16.
+// The small floats are decoded here from the formats' tables (CDNA4 ISA, Table 30: E2M1, E4M3 with no infinity and its
+// NaN at S.1111.111, E5M2 with infinity and NaN).
+VTEST(scaled_conversions_of_small_floats_to_bfloat16_on_gfx950) {
+  const amd::CodeObject o = object("asm_scalef32", "gfx950");
+  const auto fp4 = [](uint32_t n) {
+    static const double v[8] = {0, 0.5, 1, 1.5, 2, 3, 4, 6};
+    return (n & 8 ? -1.0 : 1.0) * v[n & 7];
+  };
+  const auto fp8 = [](uint32_t b, int e_bits, int m_bits, int bias, bool e4m3) {
+    const uint32_t m = b & ((1u << m_bits) - 1), e = (b >> m_bits) & ((1u << e_bits) - 1);
+    const double sign = b & 0x80 ? -1.0 : 1.0;
+    if (e4m3 ? (e == 15 && m == 7) : (e == 31 && m != 0)) return std::numeric_limits<double>::quiet_NaN();
+    if (!e4m3 && e == 31) return sign * std::numeric_limits<double>::infinity();
+    if (e == 0) return sign * std::ldexp(static_cast<double>(m), 1 - bias - m_bits);
+    return sign * std::ldexp(1.0 + static_cast<double>(m) / (1 << m_bits), static_cast<int>(e) - bias);
+  };
+  const auto bf16 = [](double d) -> uint32_t {   // to nearest even
+    const float f = static_cast<float>(d);
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    if (std::isnan(f)) return 0x7FC0;
+    return (b + 0x7FFF + ((b >> 16) & 1)) >> 16;
+  };
+  std::vector<uint32_t> in(128);
+  uint32_t seed = 4242;
+  const auto next = [&]() { seed = seed * 1103515245u + 12345u; return seed >> 8; };
+  for (uint32_t l = 0; l < 64; ++l) {
+    in[l] = next() << 16 ^ next();
+    in[64 + l] = (100 + l % 50) << 23 | (next() & 0x7FFFFF);   // the mantissa is not read
+  }
+  MemoryManager mem(16ull << 20);
+  const uint64_t in_addr = mem.alloc(128 * 4), out_addr = mem.alloc(512 * 4);
+  mem.write(in_addr, in.data(), 128 * 4);
+  const std::vector<uint32_t> r = run(o, "scalef32", mem, out_addr, 512, {in_addr, out_addr});
+  int wrong = 0, nans = 0;
+  for (uint32_t l = 0; l < 64; ++l) {
+    const double scale = std::ldexp(1.0, static_cast<int>((in[64 + l] >> 23) & 0xFF) - 127);
+    for (uint32_t k = 0; k < 8; ++k) {   // the eight outputs: fp4 x4, fp8 x2, bf8 x2
+      for (uint32_t half = 0; half < 2; ++half) {
+        double v;
+        if (k < 4) v = fp4((in[l] >> (8 * k + 4 * half)) & 0xF);
+        else v = fp8((in[l] >> (16 * (k & 1) + 8 * half)) & 0xFF, k < 6 ? 4 : 5, k < 6 ? 3 : 2, k < 6 ? 7 : 15, k < 6);
+        const uint32_t want = bf16(v * scale), got = (r[64 * k + l] >> (16 * half)) & 0xFFFF;
+        const bool want_nan = std::isnan(v), got_nan = (got & 0x7F80) == 0x7F80 && (got & 0x7F);
+        nans += want_nan;
+        wrong += want_nan ? !got_nan : got != want;
+      }
+    }
+  }
+  VCHECK_EQ(wrong, 0);
+  VCHECK(nans > 0);   // the random bytes include NaNs of the 8-bit formats
+}
+
+// The buffer loads with the LDS bit (CDNA3 and CDNA4 ISA 9.1.9): lane L's data is read from
+//   mem_offset + inst_offset + off_vgpr  (off_vgpr = 16 L here)
+// of a 640-byte resource (zero where that lies past its end) and written to
+//   M0 + inst_offset + 4 L bytes of LDS, or 16 L for three or four dwords.
+// src[i] = 7 i + 1, so a wrong word shows.
+VTEST(buffer_loads_into_lds_land_where_m0_the_offset_and_the_lane_say_gfx950) {
+  const amd::CodeObject o = object("asm_buffer_lds", "gfx950");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> src(256);
+  for (uint32_t i = 0; i < src.size(); ++i) src[i] = i * 7 + 1;
+  const uint64_t in = mem.alloc(256 * 4), out = mem.alloc(768 * 4);
+  mem.write(in, src.data(), 256 * 4);
+  const std::vector<uint32_t> r = run(o, "buf_lds", mem, out, 768, {in, out});
+  std::vector<uint32_t> want(768, 0);
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    // dwordx4: M0 0, no offset, scalar offset 0: bytes 16 L .. 16 L + 15 of the resource.
+    for (uint32_t k = 0; k < 4; ++k)
+      if (16 * lane + 4 * k + 4 <= 640) want[lane * 4 + k] = src[lane * 4 + k];
+    // dwordx3: M0 0x400, offset 4, scalar offset 16: bytes 20 + 16 L ..; LDS at 0x404 + 16 L, the fourth dword skipped.
+    for (uint32_t k = 0; k < 3; ++k)
+      if (20 + 16 * lane + 4 * k + 4 <= 640) want[257 + lane * 4 + k] = src[5 + lane * 4 + k];
+    // dword: M0 0x800, offset 8: byte 8 + 16 L; LDS at 0x808 + 4 L.
+    if (8 + 16 * lane + 4 <= 640) want[514 + lane] = src[lane * 4 + 2];
+  }
+  int wrong = 0;
+  for (size_t i = 0; i < want.size(); ++i) wrong += r[i] != want[i];
+  VCHECK_EQ(wrong, 0);
+  VCHECK_EQ(r[4 * 40], 0u);   // lane 40 of the dwordx4: past the end of the resource
+}
+
+VTEST(buffer_loads_into_lds_land_where_m0_the_offset_and_the_lane_say_gfx942) {
+  const amd::CodeObject o = object("asm_buffer_lds_cdna3", "gfx942");
+  MemoryManager mem(16ull << 20);
+  std::vector<uint32_t> src(256);
+  for (uint32_t i = 0; i < src.size(); ++i) src[i] = i * 7 + 1;
+  const uint64_t in = mem.alloc(256 * 4), out = mem.alloc(768 * 4);
+  mem.write(in, src.data(), 256 * 4);
+  const std::vector<uint32_t> r = run(o, "buf_lds942", mem, out, 768, {in, out});
+  std::vector<uint32_t> want(768, 0);
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    // dword: M0 0x400, offset 4, scalar offset 16: byte 20 + 16 L; LDS at 0x404 + 4 L.
+    if (20 + 16 * lane + 4 <= 640) want[257 + lane] = src[5 + lane * 4];
+    // dword: M0 0x800, offset 8: byte 8 + 16 L; LDS at 0x808 + 4 L.
+    if (8 + 16 * lane + 4 <= 640) want[514 + lane] = src[lane * 4 + 2];
   }
   int wrong = 0;
   for (size_t i = 0; i < want.size(); ++i) wrong += r[i] != want[i];
@@ -1278,6 +1443,246 @@ VTEST(rdna_images_load_store_sample_gather_and_query_what_their_resources_descri
   VCHECK_EQ(bad, 0);
 }
 
+// gfx90a's (MI200) image instructions (asm_images90a.s) on resources written
+// here in the layout of the MI200 guide's Table 41: each result against the
+// texel arithmetic done on the host, from the guide's rules (DMASK, DA, a
+// store that zeroes the channels it leaves out).
+VTEST(gfx90a_images_load_store_sample_and_query_what_their_resources_describe) {
+  namespace im = amd::image;
+  const amd::CodeObject o = object("asm_images90a", "gfx90a");
+  constexpr im::Gen G = im::Gen::Gfx9;
+  MemoryManager mem(16ull << 20);
+  const auto t0 = [](int64_t x, int64_t y) {
+    x = std::clamp<int64_t>(x, 0, 7), y = std::clamp<int64_t>(y, 0, 3);
+    return static_cast<float>(x + 10 * y) + 0.25f;
+  };
+  std::vector<float> f0(32);
+  for (uint32_t i = 0; i < 32; ++i) f0[i] = t0(i % 8, i / 8);
+  std::vector<uint8_t> rgba(4 * 8);
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint8_t b[4] = {static_cast<uint8_t>((i % 4) * 40), static_cast<uint8_t>((i / 4) * 100), 7, 255};
+    std::memcpy(&rgba[4 * i], b, 4);
+  }
+  // T3: level 0 is 4x4 ones, level 1 is 2x2 of 100 + i. T4 and T5: 4x4x2.
+  std::vector<float> mips(16 + 4);
+  for (uint32_t i = 0; i < 20; ++i) mips[i] = i < 16 ? 1.0f : 100.0f + static_cast<float>(i - 16);
+  std::vector<float> a4(32), a5(32);
+  for (uint32_t i = 0; i < 32; ++i) {
+    const float x = static_cast<float>(i % 4), y = static_cast<float>(i / 4 % 4), z = static_cast<float>(i / 16);
+    a4[i] = x + 10 * y + 100 * z + 0.25f;
+    a5[i] = x + 10 * y + 100 * z + 0.5f;
+  }
+  const uint64_t d0 = mem.alloc(32 * 4), d1 = mem.alloc(rgba.size()), d2 = mem.alloc(32 * 4),
+                 d3 = mem.alloc(mips.size() * 4), d4 = mem.alloc(32 * 4), d5 = mem.alloc(32 * 4), d6 = mem.alloc(32 * 4),
+                 d7 = mem.alloc(32 * 8);
+  std::vector<uint64_t> wide(32);
+  for (uint32_t i = 0; i < 32; ++i) wide[i] = (uint64_t{7} + i) << 32 | static_cast<uint32_t>(0xfffffff0u + i);
+  mem.write(d7, wide.data(), 32 * 8);
+  mem.write(d0, f0.data(), 32 * 4);
+  mem.write(d1, rgba.data(), rgba.size());
+  const std::vector<uint32_t> zero(32, 0), ones(32, 0xFFFFFFFFu);
+  mem.write(d2, zero.data(), 32 * 4);
+  mem.write(d3, mips.data(), mips.size() * 4);
+  mem.write(d4, a4.data(), 32 * 4);
+  mem.write(d5, a5.data(), 32 * 4);
+  mem.write(d6, ones.data(), 32 * 4);
+
+  uint32_t desc[72] = {};
+  im::Image i0;
+  i0.base = d0, i0.width = 8, i0.height = 4, i0.format = {im::Data::D32, im::Num::Float};
+  im::encode(i0, G, &desc[0]);
+  im::Image i1;
+  i1.base = d1, i1.width = 4, i1.height = 2, i1.format = {im::Data::D8_8_8_8, im::Num::Unorm};
+  im::encode(i1, G, &desc[8]);
+  im::Image i2 = i0;
+  i2.base = d2, i2.format = {im::Data::D32, im::Num::Uint};
+  im::encode(i2, G, &desc[16]);
+  im::Sampler point, linear;
+  im::encode(point, G, &desc[24]);
+  linear.mag_linear = linear.min_linear = true;
+  im::encode(linear, G, &desc[28]);
+  im::Image i3;
+  i3.base = d3, i3.width = 4, i3.height = 4, i3.last_level = 1, i3.format = {im::Data::D32, im::Num::Float};
+  im::encode(i3, G, &desc[32]);
+  im::Image i4;
+  i4.base = d4, i4.width = 4, i4.height = 4, i4.depth = 2, i4.type = im::Type::Img2DArray;
+  i4.format = {im::Data::D32, im::Num::Float};
+  im::encode(i4, G, &desc[40]);
+  im::Image i5 = i4;
+  i5.base = d5, i5.type = im::Type::Img3D;
+  im::encode(i5, G, &desc[48]);
+  im::Image i6 = i0;
+  i6.base = d6, i6.format = {im::Data::D8_8_8_8, im::Num::Uint};
+  im::encode(i6, G, &desc[56]);
+  im::Image i7 = i0;
+  i7.base = d7, i7.format = {im::Data::D32_32, im::Num::Uint};
+  im::encode(i7, G, &desc[64]);
+  // The resources round-trip, in the guide's layout: the data and number
+  // formats in word 1, the width and height less one in word 2, the shape in
+  // the top of word 3, the pitch less one above the depth in word 4.
+  VCHECK_EQ(im::decode_image(&desc[8], G).width, 4u);
+  VCHECK(im::decode_image(&desc[8], G).format.data == im::Data::D8_8_8_8);
+  VCHECK_EQ(desc[1] >> 20 & 0x3F, 4u);                   // T0: IMG_DATA_FORMAT_32
+  VCHECK_EQ(desc[9] >> 20 & 0x3F, 10u);                  // T1: IMG_DATA_FORMAT_8_8_8_8
+  VCHECK_EQ(desc[9] >> 26 & 0xF, 0u);                    // unorm
+  VCHECK_EQ(desc[2] & 0x3FFF, 7u);                       // T0: 8 wide less one
+  VCHECK_EQ(desc[2] >> 14 & 0x3FFF, 3u);                 // 4 high less one
+  VCHECK_EQ(desc[3] >> 28, 9u);                          // T0: a 2D image
+  VCHECK_EQ(desc[43] >> 28, 13u);                        // T4's word 3: a 2D array
+  VCHECK_EQ(desc[44] & 0x1FFF, 1u);                      // its two layers less one
+  VCHECK_EQ(desc[44] >> 13 & 0xFFFF, 3u);                // and a pitch of 4 less one
+  VCHECK_EQ(im::texel_offset(i3, 1, 0, 0, 0), uint64_t{64});
+  VCHECK(im::decode_sampler(&desc[28], G).mag_linear);
+  const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(960 * 4);
+  mem.write(ddesc, desc, sizeof(desc));
+
+  const amd::Kernel* k = amd::find_kernel(o, "images");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  std::memcpy(&args[0], &out, 8);
+  std::memcpy(&args[8], &ddesc, 8);
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.group_size[0] = 32;
+  amd::execute(d, mem);
+  std::vector<uint32_t> r(960);
+  mem.read(out, r.data(), r.size() * 4);
+  const auto f = [&](uint32_t at) {
+    float v;
+    std::memcpy(&v, &r[at], 4);
+    return v;
+  };
+  const auto half = [](float v) {
+    const _Float16 h = static_cast<_Float16>(v);
+    uint16_t b;
+    std::memcpy(&b, &h, 2);
+    return uint32_t{b};
+  };
+  const auto pair = [&](uint32_t at) { return uint64_t{r[at + 1]} << 32 | r[at]; };
+  int wrong[14] = {};
+  for (uint32_t l = 0; l < 32; ++l) {
+    const int64_t x = l % 8, y = l / 8;
+    wrong[0] += f(l) != t0(x, y);
+    wrong[1] += f(32 + l) != t0(x, y);
+    wrong[2] += f(64 + l) != (x == 0 ? t0(0, y) : t0(x, y) - 0.5f);
+    const uint32_t t = (l % 4) + 4 * ((l / 4) % 2);
+    for (uint32_t c = 0; c < 4; ++c) wrong[3] += std::fabs(f(96 + 4 * l + c) - rgba[4 * t + c] / 255.0f) > 1e-6f;
+    const uint32_t level = l % 2;
+    wrong[4] += r[224 + 4 * l] != (4u >> level) || r[225 + 4 * l] != (4u >> level) || r[226 + 4 * l] != 1 ||
+                r[227 + 4 * l] != 2;
+    wrong[5] += f(352 + l) != 100.0f + static_cast<float>(l % 2 + 2 * (l / 2 % 2));
+    wrong[6] += f(384 + l) != a4[l];
+    wrong[7] += f(416 + l) != a4[l];
+    wrong[8] += f(448 + l) != a5[l];
+    wrong[9] += r[480 + l] != 3 * l;
+    wrong[10] += f(512 + l) != t0(x, y);
+    wrong[11] += r[544 + l] != (half(rgba[4 * t] / 255.0f) | half(rgba[4 * t + 1] / 255.0f) << 16);
+    // Red and alpha as stored; green and blue zero, not what was there.
+    wrong[12] += r[576 + 4 * l] != l + 1 || r[577 + 4 * l] != 0 || r[578 + 4 * l] != 0 || r[579 + 4 * l] != 200 - l;
+    // A 64-bit add finds the old texel and leaves the old plus 0x100000020 -- a carry out of the low half
+    // included -- for the 64-bit compare-and-swap to find, which returns it and stores its own.
+    wrong[13] += pair(704 + 2 * l) != wide[l] || pair(832 + 2 * l) != wide[l] + 0x100000020ull ||
+                 pair(896 + 2 * l) != (uint64_t{0xcafe} << 32 | static_cast<uint32_t>(0xbeef0000u + l)) ||
+                 r[768 + l] != 3 * l + 5 || r[800 + l] != 1000 + l;   // and the 32-bit compare-and-swap
+  }
+  for (int c = 0; c < 14; ++c) VCHECK_EQ(wrong[c], 0);
+  std::vector<uint32_t> stored(32);
+  mem.read(d2, stored.data(), 32 * 4);
+  int bad = 0;
+  for (uint32_t l = 0; l < 32; ++l) bad += stored[l] != 1000 + l;
+  VCHECK_EQ(bad, 0);
+}
+
+// gfx90a's formatted buffer accesses (asm_images90a.s, the "formats" kernel): MUBUF's load_format
+// and store_format forms, whose element format is in the resource (a V# with DATA_FORMAT [18:15] and
+// NUM_FORMAT [14:12]), each result against the same conversion done on the host.
+VTEST(gfx90a_formatted_buffer_loads_and_stores_convert_between_the_resources_format_and_registers) {
+  namespace im = amd::image;
+  const amd::CodeObject o = object("asm_images90a", "gfx90a");
+  constexpr im::Gen G = im::Gen::Gfx9;
+  MemoryManager mem(16ull << 20);
+  const auto half = [](float v) {
+    const _Float16 h = static_cast<_Float16>(v);
+    uint16_t b;
+    std::memcpy(&b, &h, 2);
+    return uint32_t{b};
+  };
+  std::vector<uint8_t> px(32 * 4);
+  std::vector<uint32_t> halves(32);
+  for (uint32_t i = 0; i < 32; ++i) {
+    const uint8_t b[4] = {static_cast<uint8_t>(i * 3), static_cast<uint8_t>(i * 5 + 1), static_cast<uint8_t>(255 - i),
+                          static_cast<uint8_t>(i * 7)};
+    std::memcpy(&px[4 * i], b, 4);
+    halves[i] = half(static_cast<float>(i) * 0.5f) | half(-static_cast<float>(i) * 0.25f) << 16;
+  }
+  const uint64_t d0 = mem.alloc(128), d1 = mem.alloc(128), d2 = mem.alloc(128), d3 = mem.alloc(128);
+  mem.write(d0, px.data(), 128);
+  mem.write(d1, halves.data(), 128);
+  const std::vector<uint32_t> zero(32, 0);
+  mem.write(d2, zero.data(), 128);
+  mem.write(d3, zero.data(), 128);
+  uint32_t desc[16] = {};
+  im::encode_buffer(d0, 4, 32, {im::Data::D8_8_8_8, im::Num::Unorm}, G, &desc[0]);
+  im::encode_buffer(d1, 4, 32, {im::Data::D16_16, im::Num::Float}, G, &desc[4]);
+  im::encode_buffer(d2, 4, 32, {im::Data::D8_8_8_8, im::Num::Uint}, G, &desc[8]);
+  im::encode_buffer(d3, 4, 32, {im::Data::D32, im::Num::Float}, G, &desc[12]);
+  // gfx9's V#: NUM_FORMAT in bits 14:12 and DATA_FORMAT in 18:15 of word 3.
+  VCHECK_EQ(desc[3] >> 12 & 7, 0u);
+  VCHECK_EQ(desc[3] >> 15 & 0xF, 10u);
+  VCHECK_EQ(desc[7] >> 12 & 7, 7u);
+  VCHECK_EQ(desc[7] >> 15 & 0xF, 5u);
+  const uint64_t ddesc = mem.alloc(sizeof(desc)), out = mem.alloc(736 * 4);
+  mem.write(ddesc, desc, sizeof(desc));
+  const amd::Kernel* k = amd::find_kernel(o, "formats");
+  VCHECK(k != nullptr);
+  if (!k) return;
+  std::vector<uint8_t> args(k->kernarg_size, 0);
+  std::memcpy(&args[0], &out, 8);
+  std::memcpy(&args[8], &ddesc, 8);
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = k;
+  d.kernarg = mem.alloc(args.size());
+  mem.write(d.kernarg, args.data(), args.size());
+  d.group_size[0] = 32;
+  amd::execute(d, mem);
+  std::vector<uint32_t> r(736);
+  mem.read(out, r.data(), r.size() * 4);
+  const auto f = [&](uint32_t at) {
+    float v;
+    std::memcpy(&v, &r[at], 4);
+    return v;
+  };
+  int wrong[8] = {};
+  for (uint32_t l = 0; l < 32; ++l) {
+    for (uint32_t c = 0; c < 4; ++c) {
+      wrong[0] += f(4 * l + c) != px[4 * l + c] / 255.0f;
+      wrong[3] += r[224 + 4 * l + c] != l * (c + 1);
+    }
+    wrong[1] += f(128 + 2 * l) != static_cast<float>(l) * 0.5f || f(129 + 2 * l) != -static_cast<float>(l) * 0.25f;
+    wrong[2] += r[192 + l] != (half(px[4 * l] / 255.0f) | half(px[4 * l + 1] / 255.0f) << 16);
+    const float v = static_cast<float>(l) + 0.5f;
+    uint32_t bits;
+    std::memcpy(&bits, &v, 4);
+    wrong[4] += r[352 + l] != bits;
+    wrong[5] += r[384 + l] != (0x1234u | half(px[4 * l] / 255.0f) << 16);
+    wrong[6] += r[416 + l] != (half(v) | half(v + 1.0f) << 16);
+    // A typed load takes its format from the instruction, whatever the resource says: V1's dword as four
+    // bytes, then as two halves and two zeroes (the identity DST_SEL, X, Y, and 0 for the channels the
+    // format lacks), and the pair stored as halves reads back as the dword it makes.
+    for (uint32_t c = 0; c < 4; ++c) {
+      wrong[7] += r[448 + 4 * l + c] != (halves[l] >> (8 * c) & 0xFF);
+      wrong[7] += r[576 + 4 * l + c] != (c < 2 ? halves[l] >> (16 * c) & 0xFFFF : 0u);
+    }
+    wrong[7] += r[704 + l] != (l | 2 * l << 16);
+  }
+  for (int c = 0; c < 8; ++c) VCHECK_EQ(wrong[c], 0);
+}
+
 VTEST(the_24_bit_multiplies_take_the_low_24_bits_signed_or_not_and_give_the_low_or_the_high_half) {
   // v_mul_hi_i32_i24 (VOP2 0x07) was not decoded: llama.cpp's mul_mat_vec_q for Q6_K stopped on it.
   const amd::CodeObject o = object("asm_mulhi");
@@ -1390,7 +1795,8 @@ VTEST(vop3_instructions_a_compiler_emits_give_what_the_isa_says) {
     check(l, 3, at(3), half_bits(std::min({h0, h1, h2})), "v_min3_f16");
     check(l, 4, at(4), half_bits(std::max({h0, h1, h2})), "v_max3_f16");
     {
-      const uint32_t want = half_bits(h0 * h1 + h2);
+      // The MAD form rounds the product to a half before the add (CDNA2/3/4 guides: "1ULP accuracy", where V_FMA_F16 is fused).
+      const uint32_t want = half_bits(half_val(h0 * h1) + h2);
       if (!both_nan(at(5), want)) check(l, 5, at(5), want, "v_mad_f16");
     }
     check(l, 6, at(6), static_cast<uint16_t>(uint32_t{u0} * u1 + u2), "v_mad_u16");   // unsigned, or two uint16_t promote to a signed int that overflows
