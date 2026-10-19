@@ -2190,7 +2190,10 @@ struct Machine {
     // gfx1250's scalar prefetches (s_prefetch_inst, s_prefetch_data, their PC-relative forms, s_buffer_prefetch_data) warm
     // the constant or instruction cache: "1 = enable ... 0 = ignore them (S_NOP)" (CDNA5 ISA, MODE, and 8.5). There is
     // no cache here to warm, and a prefetch changes no register, so it does nothing (the buffer form checks no bounds).
-    if (in.name.find("prefetch") != std::string::npos) return;
+    gcn::MemFacts mem_scratch;
+    const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);   // (what the name says, worked out when decoded)
+    using SK = gcn::SmemKind;
+    if (mf.smem == SK::Prefetch) return;
     // Counters, rather than loads. s_memtime is the shader clock, which on a
     // card runs with the core clock; here it is the instructions retired so
     // far by the host thread running the wave, which is this model's cycle
@@ -2199,14 +2202,14 @@ struct Machine {
     // on. s_memrealtime is the real-time clock (realtime_ticks), at the rate
     // the runtime reports: a kernel waiting on it for some milliseconds, as
     // wall_clock64() loops do, waits that long.
-    if (OpName(in) == "s_memtime"_op || OpName(in) == "s_memrealtime"_op) {
-      const uint64_t t = OpName(in) == "s_memtime"_op ? stats.instructions : realtime_ticks();
+    if (mf.smem == SK::Time) {
+      const uint64_t t = !mf.smem_realtime ? stats.instructions : realtime_ticks();
       set_sgpr(w, in.dst[0].index, static_cast<uint32_t>(t));
       set_sgpr(w, in.dst[0].index + 1, static_cast<uint32_t>(t >> 32));
       return;
     }
     // The scalar cache holds nothing here to write back or drop.
-    if (OpName(in) == "s_dcache_wb"_op || OpName(in) == "s_dcache_inv"_op) return;
+    if (mf.smem == SK::Nop) return;
     // The base, the instruction's own offset, and a scalar register's where
     // it names one.
     // (RDNA's decoder keeps the register as the second source: null, reading
@@ -2217,36 +2220,37 @@ struct Machine {
                                ? scaled_offset(in, static_cast<uint32_t>(scalar(w, in.src[1])),
                                                in.dst.empty() ? 4 : 4 * in.dst[0].width)
                                : 0);
-    if (in.name.rfind("s_store_dword", 0) == 0) {
+    if (mf.smem == SK::Store) {
       for (uint32_t i = 0; i < in.dst[0].width; ++i)
         at(base + 4 * i).store_scalar(base + 4 * i, 4, sgpr(w, in.dst[0].index + i));
       return;
     }
-    if (in.name.rfind("s_atomic_", 0) == 0) {
+    if (mf.smem == SK::Atomic) {
       // One value for the whole wave, read and replaced at once; with glc
       // the data register gets back what memory held.
-      const bool wide = in.name.size() > 3 && in.name.compare(in.name.size() - 3, 3, "_x2") == 0;
+      const bool wide = mf.s_wide;
       const uint32_t bytes = wide ? 8 : 4, r = in.dst[0].index;
-      const std::string what = in.name.substr(9, in.name.size() - 9 - (wide ? 3 : 0));
       const uint64_t mask = wide ? ~uint64_t{0} : 0xFFFFFFFFull;
       const uint64_t data = wide ? sgpr64(w, r) : sgpr(w, r);
       const auto sx = [&](uint64_t v) { return wide ? static_cast<int64_t>(v) : static_cast<int64_t>(static_cast<int32_t>(v)); };
       const auto result = [&](uint64_t old) -> uint64_t {
         uint64_t now;
-        if (what == "swap") now = data;
-        else if (what == "cmpswap") now = old == (wide ? sgpr64(w, r + 2) : sgpr(w, r + 1)) ? data : old;
-        else if (what == "add") now = old + data;
-        else if (what == "sub") now = old - data;
-        else if (what == "smin") now = sx(old) < sx(data) ? old : data;
-        else if (what == "umin") now = std::min(old, data);
-        else if (what == "smax") now = sx(old) > sx(data) ? old : data;
-        else if (what == "umax") now = std::max(old, data);
-        else if (what == "and") now = old & data;
-        else if (what == "or") now = old | data;
-        else if (what == "xor") now = old ^ data;
-        else if (what == "inc") now = old >= data ? 0 : old + 1;
-        else if (what == "dec") now = old == 0 || old > data ? data : old - 1;
-        else throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
+        switch (mf.s_rmw) {
+          case Rmw::Swap: now = data; break;
+          case Rmw::CmpSwap: now = old == (wide ? sgpr64(w, r + 2) : sgpr(w, r + 1)) ? data : old; break;
+          case Rmw::Add: now = old + data; break;
+          case Rmw::Sub: now = old - data; break;
+          case Rmw::SMin: now = sx(old) < sx(data) ? old : data; break;
+          case Rmw::UMin: now = std::min(old, data); break;
+          case Rmw::SMax: now = sx(old) > sx(data) ? old : data; break;
+          case Rmw::UMax: now = std::max(old, data); break;
+          case Rmw::And: now = old & data; break;
+          case Rmw::Or: now = old | data; break;
+          case Rmw::Xor: now = old ^ data; break;
+          case Rmw::Inc: now = old >= data ? 0 : old + 1; break;
+          case Rmw::Dec: now = old == 0 || old > data ? data : old - 1; break;
+          default: throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
+        }
         return now & mask;
       };
       uint64_t old = 0;
@@ -2263,18 +2267,17 @@ struct Machine {
     }
     // RDNA4's sub-dword scalar loads: a byte or a short, widened with its sign
     // or without.
-    if (OpName(in) == "s_load_u8"_op || OpName(in) == "s_load_i8"_op ||
-        OpName(in) == "s_load_u16"_op || OpName(in) == "s_load_i16"_op) {
-      const uint32_t bytes = in.name.back() == '8' ? 1 : 2;
+    if (mf.smem == SK::SubDword) {
+      const uint32_t bytes = mf.smem_bytes;
       const uint64_t raw = at(base).load_scalar(base, bytes);
-      const bool sign = in.name[7] == 'i';
+      const bool sign = mf.smem_sign;
       const uint32_t v = bytes == 1 ? (sign ? static_cast<uint32_t>(static_cast<int8_t>(raw)) : static_cast<uint32_t>(raw & 0xFF))
                                     : (sign ? static_cast<uint32_t>(static_cast<int16_t>(raw)) : static_cast<uint32_t>(raw & 0xFFFF));
       set_sgpr(w, in.dst[0].index, v);
       return;
     }
     const uint32_t words = in.dst[0].width;
-    if (in.name.rfind("s_buffer_load_", 0) == 0) {
+    if (mf.smem == SK::BufferLoad) {
       // Through a buffer resource: its base (48 bits) and its size in bytes
       // (num_records); each dword past the end reads 0.
       const uint32_t r = in.src[0].index;
@@ -6466,9 +6469,121 @@ struct Machine {
     if (barrier) lds_barrier_arrive(g, uint64_t{g1[1] & 0xFFFFu} << 3, 1);
   }
 
+  // The LDS accesses kernels make all the time, each as one lane loop with the registers read and written directly:
+  // the same lanes in the same order, the same address arithmetic (32-bit, offset added) and the same rules for an
+  // address past the work-group's LDS (a read gives zero and a write goes nowhere; a work-group given no LDS at all
+  // is caught) as the cases of lds_access's ladder. False, having done nothing, where an operand is not a plain
+  // vector register or a cross-lane instruction is running; the ladder then does it.
+  bool lds_fast(Wave& w, const Inst& in, Group& g, gcn::LdsOp op) {
+    using L = gcn::LdsOp;
+    if (dpp_operand || narrow_dst) return false;
+    const auto plain = [](const Operand& o) { return o.kind == OperandKind::Vgpr && o.sel == 6; };
+    const bool writes = op == L::WriteB32 || op == L::WriteWide || op == L::WriteB8 || op == L::WriteB16 || op == L::Write2B32;
+    const bool reads = !writes && op != L::AddU32;
+    if (in.src.empty() || !plain(in.src[0])) return false;
+    if (reads ? in.dst.empty() || in.dst[0].kind != OperandKind::Vgpr
+              : in.src.size() < (op == L::Write2B32 ? 3u : 2u) || !plain(in.src[1]) || (op == L::Write2B32 && !plain(in.src[2])))
+      return false;
+    const uint32_t addr_reg = in.src[0].index;
+    const uint32_t a_reg = reads ? in.dst[0].index : in.src[1].index;
+    const uint32_t words = op == L::ReadWide ? in.dst[0].width : op == L::WriteWide ? in.src[1].width : op == L::ReadB96 ? 3 : 1;
+    if ((op == L::ReadWide || op == L::WriteWide) && (words == 0 || words > 4)) return false;
+    const uint64_t off = static_cast<uint64_t>(in.offset);
+    const uint64_t off0 = uint64_t{static_cast<uint32_t>(in.offset)} * 4, off1 = uint64_t{static_cast<uint32_t>(in.offset1)} * 4;
+    alignas(16) uint8_t outside[16];
+    const auto at = [&](uint32_t addr, uint64_t offset, uint64_t bytes) -> uint8_t* {
+      const uint64_t a = static_cast<uint32_t>(addr + offset);
+      if (a + bytes <= g.lds.size()) return &g.lds[a];
+      if (g.lds.empty() && a < lds_limit(d))
+        throw Error::make(Err::InvalidValue, "an LDS access at ", a, " in a work-group given no LDS: the launch ",
+                          "did not pay for the LDS its kernel uses");
+      std::memset(outside, 0, sizeof outside);
+      return outside;
+    };
+    for (uint64_t live = w.exec; live; live &= live - 1) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(live));
+      const uint32_t addr = w.vgpr[addr_reg][lane];
+      switch (op) {
+        case L::WriteB32: {
+          const uint32_t v = w.vgpr[a_reg][lane];
+          std::memcpy(at(addr, off, 4), &v, 4);
+          break;
+        }
+        case L::ReadB32: {
+          uint32_t v = 0;
+          std::memcpy(&v, at(addr, off, 4), 4);
+          w.vgpr[a_reg][lane] = v;
+          break;
+        }
+        case L::AddU32: {
+          uint32_t v = 0;
+          std::memcpy(&v, at(addr, off, 4), 4);
+          v += w.vgpr[a_reg][lane];
+          std::memcpy(at(addr, off, 4), &v, 4);
+          break;
+        }
+        case L::WriteWide: {
+          uint8_t* const p = at(addr, off, 4 * words);
+          for (uint32_t k = 0; k < words; ++k) {
+            const uint32_t v = w.vgpr[a_reg + k][lane];
+            std::memcpy(p + 4 * k, &v, 4);
+          }
+          break;
+        }
+        case L::ReadWide:
+        case L::ReadB96: {
+          uint8_t* const p = at(addr, off, 4 * words);
+          for (uint32_t k = 0; k < words; ++k) {
+            uint32_t v = 0;
+            std::memcpy(&v, p + 4 * k, 4);
+            w.vgpr[a_reg + k][lane] = v;
+          }
+          break;
+        }
+        case L::Read2B32: {
+          uint32_t v0 = 0, v1 = 0;
+          std::memcpy(&v0, at(addr, off0, 4), 4);
+          std::memcpy(&v1, at(addr, off1, 4), 4);
+          w.vgpr[a_reg][lane] = v0;
+          w.vgpr[a_reg + 1][lane] = v1;
+          break;
+        }
+        case L::Write2B32: {
+          const uint32_t v0 = w.vgpr[in.src[1].index][lane], v1 = w.vgpr[in.src[2].index][lane];
+          std::memcpy(at(addr, off0, 4), &v0, 4);
+          std::memcpy(at(addr, off1, 4), &v1, 4);
+          break;
+        }
+        case L::ReadU8:
+        case L::ReadI8:
+        case L::ReadU16: {
+          const uint64_t bytes = op == L::ReadU16 ? 2 : 1;
+          uint32_t v = 0;
+          std::memcpy(&v, at(addr, off, bytes), bytes);
+          if (op == L::ReadI8) v = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v)));
+          w.vgpr[a_reg][lane] = v;
+          break;
+        }
+        default: {   // WriteB8, WriteB16
+          const uint32_t v = w.vgpr[a_reg][lane];
+          const uint64_t bytes = op == L::WriteB8 ? 1 : 2;
+          std::memcpy(at(addr, off, bytes), &v, bytes);
+          break;
+        }
+      }
+    }
+    return true;
+  }
+
   void lds_access(Wave& w, const Inst& in, Group& g) {
     const OpName op(in);
-    if (uint32_t bits; in.name.rfind("ds_", 0) == 0 && transpose_kind(std::string_view(in.name).substr(3), &bits)) {
+    gcn::MemFacts mem_scratch;
+    const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);
+    // (What the name says of a half-register access is settled here, not for each lane.)
+    Half ds_half;
+    const bool ds_is_half = mf.ds_name ? (ds_half = half_of(mf), mf.half_bytes != 0) : half_access(std::string_view(in.name).substr(3), &ds_half);
+    if (mf.lds_op != gcn::LdsOp::None && lds_fast(w, in, g, mf.lds_op)) return;
+    if (const uint32_t bits = mf.ds_name ? mf.transpose_bits : 0) {
       if (!transpose_ready(w, in)) return;
       uint8_t raw[32][16] = {};
       for (uint32_t lane = 0; lane < 32; ++lane) {
@@ -6819,7 +6934,8 @@ struct Machine {
             }
           break;
         default: L_ladder_6:
-          if (Half h; half_access(std::string_view(in.name).substr(3), &h)) {
+          if (ds_is_half) {
+                  const Half& h = ds_half;
                   uint8_t* p = at(off, h.bytes);
                   if (h.store) {
                     const uint32_t v = half_store(lane_src(w, in.src[1], lane), h);
@@ -7124,17 +7240,9 @@ struct Machine {
     uint32_t bytes = 0;
     bool sign = false;
   };
-  static bool narrow(const std::string& op, Narrow* n) {
-    const size_t at = op.rfind('_');
-    if (at == std::string::npos) return false;
-    const std::string what = op.substr(at + 1);
-    if (what == "ubyte" || what == "byte") *n = {1, false};
-    else if (what == "sbyte") *n = {1, true};
-    else if (what == "ushort" || what == "short") *n = {2, false};
-    else if (what == "sshort") *n = {2, true};
-    else return false;
-    return true;
-  }
+  static bool narrow(const std::string& op, Narrow* n) { return gcn::parse_narrow(op, &n->bytes, &n->sign); }
+  static bool narrow(const OpName& op, Narrow* n) { return gcn::parse_narrow(op.view(), &n->bytes, &n->sign); }
+  static Narrow narrow_of(const gcn::MemFacts& f) { return {f.narrow_bytes, f.narrow_sign}; }
 
   // Two halves, or two bfloat16s, added pairwise: each sum rounded to
   // nearest, as a single half or bfloat16 add would be.
@@ -7174,12 +7282,12 @@ struct Machine {
     bool sign = false, hi = false, store = false;
   };
   static bool half_access(std::string_view body, Half* h) {
-    if (body.find("_d16") == std::string_view::npos) return false;
-    h->hi = body.size() >= 3 && body.substr(body.size() - 3) == "_hi";
-    h->store = body.rfind("store", 0) == 0 || body.rfind("write", 0) == 0;
-    h->bytes = body.find("short") != std::string_view::npos || body.find("16_d16") != std::string_view::npos ? 2 : 1;
-    h->sign = body.find("sbyte") != std::string_view::npos || body.find("i8") != std::string_view::npos;
-    return true;
+    return gcn::parse_half(body, &h->bytes, &h->sign, &h->hi, &h->store);
+  }
+  static Half half_of(const gcn::MemFacts& f) {
+    Half h;
+    h.bytes = f.half_bytes, h.sign = f.half_sign, h.hi = f.half_hi, h.store = f.half_store;
+    return h;
   }
   // What a load puts in its half: the byte widened to 16 bits, with its sign
   // where the name says so, or the short.
@@ -7308,16 +7416,12 @@ struct Machine {
   // device's, and those are global accesses by another name.
   // Returns whether any lane's address was in LDS.
   // How many bytes a global or flat access moves per lane, for SCALE_OFFSET.
-  static uint32_t access_bytes(const Inst& in) {
-    const std::string_view body = std::string_view(in.name).substr(in.name.find('_') + 1);
-    Narrow n;
-    Half h;
-    AtomicOp a;
-    if (narrow(in.name, &n)) return n.bytes;
-    if (half_access(body, &h)) return h.bytes;
-    if ((body.rfind("load_dword", 0) == 0 || body.rfind("load_monitor_b", 0) == 0) && !in.dst.empty()) return 4 * in.dst[0].width;
-    if (body.rfind("store_dword", 0) == 0 && in.src.size() > 1) return 4 * in.src[1].width;
-    if (parse_atomic(body, &a)) return a.bytes;
+  static uint32_t access_bytes(const Inst& in, const gcn::MemFacts& f) {
+    if (f.narrow_bytes) return f.narrow_bytes;
+    if (f.half_bytes) return f.half_bytes;
+    if ((f.load_dword || f.load_monitor) && !in.dst.empty()) return 4 * in.dst[0].width;
+    if (f.store_dword && in.src.size() > 1) return 4 * in.src[1].width;
+    if (f.atomic_bytes) return f.atomic_bytes;
     return 4;
   }
   // A lane's address in a flat access: a 64-bit one in a register pair, or -- gfx1250 -- a scalar pair's with a 32-bit
@@ -7330,7 +7434,9 @@ struct Machine {
 
   bool flat_access(Wave& w, const Inst& in, Group& g) {
     const auto in_lds = [](uint64_t a) { return a >= kSharedBase && a < kSharedBase + kSharedSize; };
-    const uint32_t bytes_per_lane = access_bytes(in);
+    gcn::MemFacts mem_scratch;
+    const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);
+    const uint32_t bytes_per_lane = access_bytes(in, mf);
     bool lds = false, priv = false;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
@@ -7346,10 +7452,10 @@ struct Machine {
     }
     // Otherwise lane by lane, each to its own memory: loads and stores, of a
     // byte or a half or whole registers.
-    const std::string_view body = std::string_view(in.name).substr(in.name.find('_') + 1);
     // An atomic, lane by lane: in LDS or private memory, which only this
     // work-group reaches, done in place; in the device's, as a global one.
-    if (AtomicOp a; parse_atomic(body, &a)) {
+    if (mf.atomic_bytes) {
+      const AtomicOp a = atomic_of(mf);
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
         if (!(w.exec >> lane & 1)) continue;
         const uint64_t addr = flat_address(w, in, lane, bytes_per_lane);
@@ -7380,9 +7486,9 @@ struct Machine {
       }
       return lds;
     }
-    Narrow n;
-    const bool part = narrow(in.name, &n), storing = body.rfind("store", 0) == 0;
-    if (!part && body.rfind("load_dword", 0) != 0 && body.rfind("store_dword", 0) != 0)
+    const Narrow n = narrow_of(mf);
+    const bool part = mf.narrow_bytes != 0, storing = mf.body_store;
+    if (!part && !mf.load_dword && !mf.store_dword)
       throw Error::make(Err::Unsupported, in.name, " reaching LDS or private memory is not implemented");
     const uint32_t words = part ? 0 : storing ? in.src[1].width : in.dst[0].width;
     const uint32_t bytes = part ? n.bytes : 4 * words;
@@ -7430,7 +7536,9 @@ struct Machine {
   // A work-item's private memory, which a kernel spills into.
   void scratch_access(Wave& w, const Inst& in, Group& g) {
     const OpName op(in);
-    const uint32_t words = op.rfind("scratch_store", 0) == 0 ? in.src[1].width : in.dst[0].width;
+    gcn::MemFacts mem_scratch;
+    const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);
+    const uint32_t words = mf.scratch_store ? in.src[1].width : in.dst[0].width;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // An offset in a register, one in a scalar register, and the
@@ -7447,24 +7555,24 @@ struct Machine {
       }
       // A narrow access moves one byte or two; every other one moves whole
       // registers.
-      Narrow n;
-      const bool part = narrow(op, &n);
+      const Narrow n = narrow_of(mf);
+      const bool part = mf.narrow_bytes != 0;
       uint8_t* at = scratch_at(g, w, lane, offset, part ? n.bytes : 4 * words);
       // A byte or a half first: its name begins the same way a whole
       // register's does, so asking about the width has to come first.
-      if (part && op.rfind("scratch_store", 0) == 0) {
+      if (part && mf.scratch_store) {
         const uint32_t v = lane_src(w, in.src[1], lane);
         std::memcpy(at, &v, n.bytes);
       } else if (part) {
         uint64_t raw = 0;
         std::memcpy(&raw, at, n.bytes);
         write_lane(w, in.dst[0], lane, widen(raw, n));
-      } else if (op.rfind("scratch_store", 0) == 0) {
+      } else if (mf.scratch_store) {
         for (uint32_t k = 0; k < words; ++k) {
           const uint32_t v = word(w, in.src[1], k, lane);
           std::memcpy(at + 4 * k, &v, 4);
         }
-      } else if (op.rfind("scratch_load", 0) == 0) {
+      } else if (mf.scratch_load) {
         for (uint32_t k = 0; k < words; ++k) {
           uint32_t v = 0;
           std::memcpy(&v, at + 4 * k, 4);
@@ -7485,13 +7593,14 @@ struct Machine {
   // LLVM keeps it, moves every lane's frame alike.
   void scratch_buffer_access(Wave& w, const Inst& in, Group& g, const Operand& data, const Operand& vaddr,
                              const Operand& soff) {
-    const std::string_view body = std::string_view(in.name).substr(7);   // past "buffer_"
-    const bool store_op = body.rfind("store", 0) == 0;
-    Narrow n;
-    const bool part = narrow(in.name, &n);
-    Half h;
-    const bool half = half_access(body, &h);
-    if (!store_op && !part && !half && body.rfind("load_dword", 0) != 0)
+    gcn::MemFacts mem_scratch;
+    const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);
+    const bool store_op = mf.body_store;
+    const Narrow n = narrow_of(mf);
+    const bool part = mf.narrow_bytes != 0;
+    const Half h = half_of(mf);
+    const bool half = mf.half_bytes != 0;
+    if (!store_op && !part && !half && !mf.load_dword)
       throw Error::make(Err::Unsupported, in.name, " through the private segment buffer, which this does not model");
     const uint64_t soffset = static_cast<uint32_t>(scalar(w, soff));
     const uint32_t words = half || part ? 1 : data.width;
@@ -8020,10 +8129,12 @@ struct Machine {
     const bool valid_format = rdna ? ((d3 >> 12) & 0x7F) != 0 : ((d3 >> 15) & 0xF) != 0;
     const uint32_t oob_select = (d3 >> 28) & 3;
     const std::string_view body = std::string_view(in.name).substr(in.enc == gcn::Enc::Mtbuf ? 8 : 7);   // past "buffer_"
+    gcn::MemFacts mem_scratch;
+    const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);
     // A formatted access converts each element between its format (the
     // resource's, or MTBUF's own) and a register's floats or integers.
     image::Format format;
-    const bool formatted = body.rfind("load_format_", 0) == 0 || body.rfind("store_format_", 0) == 0;
+    const bool formatted = mf.formatted;
     if (formatted) {
       if (in.enc == gcn::Enc::Mtbuf) {
         format = image::from_code(in.format, image_gen(in.arch));
@@ -8038,9 +8149,11 @@ struct Machine {
         throw Error::make(Err::Unsupported, in.name, " of a format this does not convert (",
                           static_cast<int>(format.data), "/", static_cast<int>(format.num), ")");
     }
-    Narrow n;
-    const bool part = narrow(in.name, &n);
-    const bool atomic = body.rfind("atomic_", 0) == 0;
+    const Narrow n = narrow_of(mf);
+    const bool part = mf.narrow_bytes != 0;
+    const Half h = half_of(mf);
+    const bool is_half = mf.half_bytes != 0;
+    const bool atomic = mf.body_atomic;
     const bool returns = atomic && (in.cache & 1);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
@@ -8064,19 +8177,19 @@ struct Machine {
       };
       if (formatted) {
         formatted_access(w, in, body, format, d3, data, lane, addr, fits(offset, image::texel_bytes(format)));
-      } else if (Half h; half_access(body, &h)) {
+      } else if (is_half) {
         if (h.store) {
           if (fits(offset, h.bytes)) store(addr, h.bytes, half_store(lane_src(w, data, lane), h));
         } else {
           write_half_load(w, in, data, lane, half_load(fits(offset, h.bytes) ? load(addr, h.bytes) : 0, h), h);
         }
       } else if (part) {
-        if (body.rfind("store", 0) == 0) {
+        if (mf.body_store) {
           if (fits(offset, n.bytes)) store(addr, n.bytes, lane_src(w, data, lane));
         } else {
           write_lane(w, data, lane, fits(offset, n.bytes) ? widen(load(addr, n.bytes), n) : 0);
         }
-      } else if (body.rfind("load_dword", 0) == 0) {
+      } else if (mf.load_dword) {
         if (data.width <= kMaxWords && fits(offset, 4 * data.width)) {
           uint32_t words[kMaxWords];
           load_words(addr, data.width, words);
@@ -8085,7 +8198,7 @@ struct Machine {
           for (uint32_t k = 0; k < data.width; ++k)
             set_word(w, data, k, lane, fits(offset + 4 * k, 4) ? static_cast<uint32_t>(load(addr + 4 * k, 4)) : 0);
         }
-      } else if (body.rfind("store_dword", 0) == 0) {
+      } else if (mf.store_dword) {
         if (data.width <= kMaxWords && fits(offset, 4 * data.width)) {
           uint32_t words[kMaxWords];
           for (uint32_t k = 0; k < data.width; ++k) words[k] = word(w, data, k, lane);
@@ -8095,51 +8208,49 @@ struct Machine {
             if (fits(offset + 4 * k, 4)) store(addr + 4 * k, 4, word(w, data, k, lane));
         }
       } else if (atomic) {
-        const bool wide = body == "atomic_cmpswap_x2";
+        const bool wide = mf.buf_wide;
         const uint32_t bytes = wide ? 8 : 4;
         uint64_t before = 0;
         if (fits(offset, bytes)) {
           const auto result = [&](uint64_t before) -> uint64_t {
           uint64_t after;
-          if (body == "atomic_cmpswap_x2") {
+          if (mf.buf_rmw == Rmw::CmpSwap && wide) {
             const uint64_t value = word(w, data, 0, lane) | uint64_t{word(w, data, 1, lane)} << 32;
             const uint64_t expected = word(w, data, 2, lane) | uint64_t{word(w, data, 3, lane)} << 32;
             after = before == expected ? value : before;
-          } else if (body == "atomic_cmpswap") {
+          } else if (mf.buf_rmw == Rmw::CmpSwap) {
             after = before == word(w, data, 1, lane) ? word(w, data, 0, lane) : before;
-          } else if (body == "atomic_add") {
+          } else if (mf.buf_rmw == Rmw::Add) {
             after = static_cast<uint32_t>(before + word(w, data, 0, lane));
-          } else if (body == "atomic_swap") {
+          } else if (mf.buf_rmw == Rmw::Swap) {
             after = word(w, data, 0, lane);
-          } else if (body == "atomic_add_f32") {
-            after = as_bits(as_float(static_cast<uint32_t>(before)) + as_float(word(w, data, 0, lane)));
-          } else if (body == "atomic_pk_add_f16") {
+          } else if (mf.buf_rmw == Rmw::AddF32) {
+            // (Two NaNs: x86 gives the first operand's, and which operand the compiler makes the first is its choice. The
+            // recorded bits are those of the build that wrote this as `before + data`: the register's data was the first.)
+            const uint32_t b = static_cast<uint32_t>(before), v = word(w, data, 0, lane);
+            const auto nan = [](uint32_t x) { return (x & 0x7F800000u) == 0x7F800000u && (x & 0x7FFFFFu) != 0; };
+            after = nan(b) && nan(v) ? (v | 0x400000u) : as_bits(as_float(b) + as_float(v));
+          } else if (mf.buf_rmw == Rmw::PkAddF16) {
             after = packed_add(static_cast<uint32_t>(before), word(w, data, 0, lane), false);
-          } else if (const uint32_t old = static_cast<uint32_t>(before), v = word(w, data, 0, lane);
-                     body == "atomic_sub") {
-            after = old - v;
-          } else if (body == "atomic_smin" || body == "atomic_smax") {
-            const int32_t a = static_cast<int32_t>(old), b = static_cast<int32_t>(v);
-            after = static_cast<uint32_t>(body == "atomic_smin" ? std::min(a, b) : std::max(a, b));
-          } else if (body == "atomic_umin") {
-            after = std::min(old, v);
-          } else if (body == "atomic_umax") {
-            after = std::max(old, v);
-          } else if (body == "atomic_and") {
-            after = old & v;
-          } else if (body == "atomic_or") {
-            after = old | v;
-          } else if (body == "atomic_xor") {
-            after = old ^ v;
-          } else if (body == "atomic_inc") {
-            // Counts up to the data, then wraps to zero.
-            after = old >= v ? 0 : old + 1;
-          } else if (body == "atomic_dec") {
-            // Counts down to zero, then wraps to the data (as does anything
-            // above it).
-            after = old == 0 || old > v ? v : old - 1;
-          } else {
+          } else if (mf.buf_rmw == Rmw::Invalid) {
+            (void)word(w, data, 0, lane);
             throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
+          } else {
+            const uint32_t old = static_cast<uint32_t>(before), v = word(w, data, 0, lane);
+            switch (mf.buf_rmw) {
+              case Rmw::Sub: after = old - v; break;
+              case Rmw::SMin: after = static_cast<uint32_t>(std::min(static_cast<int32_t>(old), static_cast<int32_t>(v))); break;
+              case Rmw::SMax: after = static_cast<uint32_t>(std::max(static_cast<int32_t>(old), static_cast<int32_t>(v))); break;
+              case Rmw::UMin: after = std::min(old, v); break;
+              case Rmw::UMax: after = std::max(old, v); break;
+              case Rmw::And: after = old & v; break;
+              case Rmw::Or: after = old | v; break;
+              case Rmw::Xor: after = old ^ v; break;
+              // Counts up to the data, then wraps to zero.
+              case Rmw::Inc: after = old >= v ? 0 : old + 1; break;
+              // Counts down to zero, then wraps to the data (as does anything above it).
+              default: after = old == 0 || old > v ? v : old - 1; break;
+            }
           }
           return after;
           };
@@ -8223,43 +8334,18 @@ struct Machine {
 
   // A read-modify-write of global or flat memory: what it does, and how
   // wide it is.
-  enum class Rmw { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec,
-                   AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap };
+  using Rmw = gcn::Rmw;
   struct AtomicOp {
     Rmw rmw = Rmw::Add;
     uint32_t bytes = 4;
   };
   // An atomic, read from the name past its segment ("atomic_add_x2"); false
-  // for anything that is not one this knows.
+  // for anything that is not one this knows. (gcn::mem_facts_of has done this once, when the instruction was decoded.)
   static bool parse_atomic(std::string_view body, AtomicOp* a) {
-    if (body.rfind("atomic_", 0) != 0) return false;
-    std::string_view what = body.substr(7);
     a->bytes = 4;
-    if (what.size() > 3 && what.substr(what.size() - 3) == "_x2") {
-      a->bytes = 8;
-      what.remove_suffix(3);
-    }
-    static const std::pair<std::string_view, Rmw> kNames[] = {
-        {"add", Rmw::Add},       {"sub", Rmw::Sub},         {"and", Rmw::And},           {"or", Rmw::Or},
-        {"xor", Rmw::Xor},       {"swap", Rmw::Swap},       {"smin", Rmw::SMin},         {"umin", Rmw::UMin},
-        {"smax", Rmw::SMax},     {"umax", Rmw::UMax},       {"inc", Rmw::Inc},           {"dec", Rmw::Dec},
-        {"cmpswap", Rmw::CmpSwap}, {"add_f32", Rmw::AddF32}, {"pk_add_f16", Rmw::PkAddF16},
-        {"pk_add_bf16", Rmw::PkAddBf16}, {"add_f64", Rmw::AddF64}, {"min_f64", Rmw::MinF64},
-        {"max_f64", Rmw::MaxF64}, {"min_num_f64", Rmw::MinF64}, {"max_num_f64", Rmw::MaxF64},
-        // RDNA's float min and max, as each generation spells them: gfx10's
-        // fmin (fmin_x2 the double), gfx11's min_f32, gfx12's min_num_f32.
-        {"fmin", Rmw::MinF32}, {"fmax", Rmw::MaxF32}, {"min_f32", Rmw::MinF32}, {"max_f32", Rmw::MaxF32},
-        {"min_num_f32", Rmw::MinF32}, {"max_num_f32", Rmw::MaxF32}};
-    for (auto [name, rmw] : kNames)
-      if (what == name) {
-        if (a->bytes == 8 && rmw == Rmw::MinF32) rmw = Rmw::MinF64;
-        if (a->bytes == 8 && rmw == Rmw::MaxF32) rmw = Rmw::MaxF64;
-        a->rmw = rmw;
-        if (rmw == Rmw::AddF64 || rmw == Rmw::MinF64 || rmw == Rmw::MaxF64) a->bytes = 8;
-        return !(a->bytes == 8 && (rmw == Rmw::AddF32 || rmw == Rmw::PkAddF16 || rmw == Rmw::PkAddBf16));
-      }
-    return false;
+    return gcn::parse_atomic_body(body, &a->rmw, &a->bytes);
   }
+  static AtomicOp atomic_of(const gcn::MemFacts& f) { return {f.rmw, f.atomic_bytes}; }
   // What an atomic leaves where it found `before`, given its data `v` and,
   // for a compare-and-swap, what it must find. inc counts up to the data,
   // then wraps to zero; dec counts down to zero, then wraps to the data (as
@@ -8446,15 +8532,17 @@ struct Machine {
   void global_access(Wave& w, const Inst& in) {
     if (!w.exec) return;   // no lane to reach memory for
     const std::string& op = in.name;
-    // What the instruction does is settled once; its lanes then each do it.
-    // A flat access that reaches only the device's memory comes here too, so
-    // what it does is read from its name past the segment ("load_dwordx4").
-    const std::string_view body = std::string_view(op).substr(op.find('_') + 1);
-    if (body == "load_block" || body == "store_block") {
+    // What the instruction does is settled once, when it is decoded (Inst::mem; a flat access that reaches only the
+    // device's memory comes here too, so it is read from the name past the segment, "load_dwordx4"); its lanes then each do it.
+    gcn::MemFacts mem_scratch;
+    const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);
+    using Kind = gcn::MemKind;
+    const Kind kind = mf.kind;
+    if (kind == Kind::Block) {
       // gfx1250: up to 32 consecutive dwords to or from consecutive registers, those M0's bits pick (the ISA lets a block
       // skip "holes" in memory and in the registers alike). A scaled offset is not modelled: the ISA does not say by what.
       if (in.scale_offset) throw Error::make(Err::Unsupported, op, " with a scaled offset, which this does not model");
-      const bool loading = body == "load_block";
+      const bool loading = !mf.body_store;
       const Operand& address = in.src[0];
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
         if (!(w.exec >> lane & 1)) continue;
@@ -8468,7 +8556,8 @@ struct Machine {
       }
       return;
     }
-    if (uint32_t bits; transpose_kind(body, &bits)) {
+    if (kind == Kind::Transpose) {
+      const uint32_t bits = mf.transpose_bits;
       if (!transpose_ready(w, in)) return;
       const uint32_t n = transpose_bytes(bits);
       uint8_t raw[32][16] = {};
@@ -8480,27 +8569,12 @@ struct Machine {
       transpose_regs(w, in, bits, raw);
       return;
     }
-    enum class Kind { Narrow, HalfReg, Load, Store, StoreHi16, Atomic } kind;
-    Half half;
-    AtomicOp atomic;
-    Narrow n;
-    bool narrow_store = false;
-    if (narrow(op, &n)) {
-      kind = Kind::Narrow;
-      narrow_store = body.rfind("store", 0) == 0;
-    } else if (half_access(body, &half)) {
-      kind = Kind::HalfReg;
-    } else if (body.rfind("prefetch_", 0) == 0) {
-      return;   // gfx1250's prefetch into the cache: there is none to warm
-    } else if (body.rfind("load_dword", 0) == 0 || body.rfind("load_monitor_b", 0) == 0) {
-      kind = Kind::Load;
-    } else if (body.rfind("store_dword", 0) == 0) {
-      kind = Kind::Store;
-    } else if (parse_atomic(body, &atomic)) {
-      kind = Kind::Atomic;
-    } else {
-      throw Error::make(Err::Unsupported, "memory instruction ", op, " is decoded but not implemented");
-    }
+    const Half half = half_of(mf);
+    const AtomicOp atomic = atomic_of(mf);
+    const Narrow n = narrow_of(mf);
+    const bool narrow_store = mf.body_store;
+    if (kind == Kind::Prefetch) return;   // gfx1250's prefetch into the cache: there is none to warm
+    if (kind == Kind::Unknown) throw Error::make(Err::Unsupported, "memory instruction ", op, " is decoded but not implemented");
     // Lanes of one load that read the same address read it once, as the card
     // reads it in one transaction: the compiler counts on a wave-uniform
     // address giving every lane the same value (it branches the whole wave
@@ -9619,11 +9693,11 @@ struct Machine {
       debug_stop(w, g);
     const Inst& decoded = fetch(w.pc);
     // gfx1250's vector register numbers past v255: the instruction as it names them with the wave's MSBs on.
-    Inst remapped;
+    std::optional<Inst> remapped;   // (made only when the wave has VGPR MSBs: building and tearing down an Inst for each step cost 2-5%)
     const bool vector_enc = decoded.enc == gcn::Enc::Vop1 || decoded.enc == gcn::Enc::Vop2 || decoded.enc == gcn::Enc::Vop3 ||
                             decoded.enc == gcn::Enc::Vop3p || decoded.enc == gcn::Enc::Vopc || decoded.enc == gcn::Enc::Vopd ||
                             decoded.enc == gcn::Enc::Flat || decoded.enc == gcn::Enc::Ds;
-    const Inst& in = w.vgpr_msb && vector_enc ? (remapped = decoded, apply_vgpr_msb(w, &remapped), remapped) : decoded;
+    const Inst& in = w.vgpr_msb && vector_enc ? (remapped.emplace(decoded), apply_vgpr_msb(w, &*remapped), *remapped) : decoded;
     // A wave's first store of a round lets the group's other waves run first, once (Wave::store_gate): the loads they
     // make before their own stores come before this one lands, as the few cycles between the waves of a group make
     // them on a card. Nothing of the instruction has run: not counted yet, pc not moved, and the wave is back on this
@@ -10853,6 +10927,214 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   h.add(c.sendmsg), h.add(c.flat_read), h.add(c.flat_write), h.add(c.flat_atomic), h.add(c.vmem_rd), h.add(c.vmem_wr);
   for (uint64_t v : c.mix) h.add(v);
   for (uint64_t v : c.mops) h.add(v);
+  return h.h;
+}
+
+// The same for memory instructions, with registers aimed at memory: the address registers of the instruction hold
+// addresses (or offsets, or a buffer resource) that point into three allocations in the ways `mode` says -- aligned,
+// misaligned, on the end of an allocation, past it, wild, in the shared or the private aperture, runs of consecutive
+// lanes, the same address in every lane, a buffer whose resource is invalid, swizzled or too small -- and the digest
+// holds the three allocations too.
+uint64_t digest_memory_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t mode) {
+  // (A scratch access with a negative offset and a work-item offset near zero wraps the range check of scratch_at in the
+  // build this digest was recorded from, and writes before the scratch: not run.)
+  if (in.segment == Inst::Segment::Scratch && in.offset < 0) return 0;
+  static constexpr uint32_t kMach[] = {0x4c, 0x3f, 0x4f, 0x41, 0x48, 0x36, 0x49};   // by gcn::Target's order
+  CodeObject co;
+  co.mach = kMach[static_cast<int>(target)];
+  co.text.assign(16, 0);
+  Kernel k;
+  k.name = "probe";
+  k.wave32 = gcn::is_rdna(target);
+  Dispatch d;
+  d.object = &co;
+  d.kernel = &k;
+  MemoryManager mem(16ull << 20);
+  const uint64_t sizes[3] = {1 << 16, 4100, 8192};
+  uint64_t base[3];
+  for (int i = 0; i < 3; ++i) base[i] = mem.alloc(sizes[i]);
+  DecodeCache cache(16);
+  cache.get(0, [&] { return in; });
+  d.decoded = &cache;
+  Machine m(d, mem, cache);
+  Rng r{seed * 0x2545F4914F6CDD1Dull + mode * 0x9E3779B97F4A7C15ull + 7};
+  Group g;
+  g.lds.assign(mode % 5 == 4 ? (1 << 12) : (1 << 16), 0);   // (some with less LDS than the addresses reach)
+  g.scratch_per_lane = 256;
+  g.scratch.assign(size_t{256} * kLanes, 0);
+  for (uint8_t& b : g.scratch) b = static_cast<uint8_t>(draw(r, 0));
+  k.private_segment = 256;
+  g.waves.resize(1);
+  Wave& w = g.waves[0];
+  w.lanes = k.wave32 ? 32 : kLanes;
+  w.mode = k.mode;
+  w.vgpr.grow(288);
+  w.agpr.resize(288);
+  for (uint8_t& b : g.lds) b = static_cast<uint8_t>(draw(r, 0));
+  for (int i = 0; i < 3; ++i) {
+    std::vector<uint8_t> bytes(sizes[i]);
+    for (uint8_t& b : bytes) b = static_cast<uint8_t>(draw(r, 0));
+    mem.write(base[i], bytes.data(), bytes.size());
+  }
+  for (uint32_t& s : w.sgpr) s = draw(r, 0);
+  for (uint32_t& s : w.ttmp) s = draw(r, 0);
+  for (auto& row : w.vgpr.r)
+    for (uint32_t& v : row) v = draw(r, 0);
+  for (auto& row : w.agpr)
+    for (uint32_t& v : row) v = draw(r, 0);
+  const uint64_t all = w.lanes == 64 ? ~uint64_t{0} : (uint64_t{1} << w.lanes) - 1;
+  w.exec = ((mode % 3 == 2) ? r.next() : ~uint64_t{0}) & all;
+  w.vcc = r.next() & all;
+  w.m0 = static_cast<uint32_t>(r.next() % 0x6000);
+  w.scc = r.next() & 1;
+  w.pc = 0;
+  // Where lane `lane` of this access points (an address; also used as an offset from a base).
+  const uint64_t run_base = base[0] + 16 * (r.next() % 256);
+  const uint64_t run_stride = (uint64_t{4} << (r.next() % 3));
+  const uint64_t same = base[0] + 4 * (r.next() % 0x3000);
+  const auto address = [&](uint32_t lane) -> uint64_t {
+    uint32_t kind = mode % 12;
+    if (kind == 3) kind = 100 + static_cast<uint32_t>(r.next() % 8);
+    switch (kind) {
+      case 0: return base[0] + 4 * (r.next() % 0x3000);
+      case 1: return base[0] + r.next() % 0xF000;
+      case 2: return base[1] + 4100 - 1 - r.next() % 24;
+      case 4: return run_base + lane * run_stride;
+      case 5: return same;
+      case 6: return run_base + (63 - lane) * 4;
+      case 7: return (r.next() & 1) ? base[2] + 8192 + r.next() % 64 : 0xDEAD0000ull + (r.next() & 0xFFFFF);
+      case 8: return kSharedBase + r.next() % 0x11000;
+      case 9: return kPrivateBase + (r.next() % 80) * 4;
+      case 10: return base[0] + lane * 68;
+      case 11: return base[0] + 16 * (r.next() % 0xFF0);
+      case 100: return base[0] + 4 * (r.next() % 0x3000);
+      case 101: return base[0] + r.next() % 0xF000;
+      case 102: return base[1] + 4100 - 1 - r.next() % 24;
+      case 103: return base[2] + 8192 + r.next() % 64;
+      case 104: return r.next();
+      case 105: return kSharedBase + r.next() % 0x11000;
+      case 106: return kPrivateBase + (r.next() % 80) * 4;
+      default: return base[2] + 8 * (r.next() % 1000);
+    }
+  };
+  const auto set_pair = [&](uint32_t reg, uint64_t v) {
+    if (reg + 1 < kSgprs) w.sgpr[reg] = static_cast<uint32_t>(v), w.sgpr[reg + 1] = static_cast<uint32_t>(v >> 32);
+  };
+  const uint32_t scalar_pick = static_cast<uint32_t>(r.next() % 7);
+  static constexpr uint32_t kSmall[7] = {0, 4, 64, 256, 4096, 0x7FF0, 0xFFFFFFF8u};
+  switch (in.enc) {
+    case gcn::Enc::Flat:
+      if (!in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+        const uint32_t a = in.src[0].index;
+        if (in.segment == Inst::Segment::Scratch) {
+          for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[a][lane] = static_cast<uint32_t>(r.next() % (mode % 4 == 3 ? 400 : 240)) & ~3u;
+          if (in.has_saddr && in.saddr < kSgprs) w.sgpr[in.saddr] = kSmall[scalar_pick] & 0xFF;
+        } else if (in.has_saddr && in.saddr + 1 < kSgprs) {
+          const uint64_t b = base[mode % 2 ? 0 : 2];
+          set_pair(in.saddr, b);
+          for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[a][lane] = static_cast<uint32_t>(address(lane) - b);
+        } else {
+          for (uint32_t lane = 0; lane < kLanes; ++lane) {
+            const uint64_t v = address(lane);
+            w.vgpr[a][lane] = static_cast<uint32_t>(v);
+            w.vgpr[a + 1][lane] = static_cast<uint32_t>(v >> 32);
+          }
+        }
+      }
+      break;
+    case gcn::Enc::Ds:
+      if (!in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+        const uint32_t a = in.src[0].index;
+        for (uint32_t lane = 0; lane < kLanes; ++lane) {
+          uint32_t v;
+          switch (r.next() % 6) {
+            case 0: v = static_cast<uint32_t>(r.next() % 0x3F00) & ~3u; break;
+            case 1: v = static_cast<uint32_t>(r.next() % 0xF000); break;
+            case 2: v = 0xFFF0 + static_cast<uint32_t>(r.next() % 32); break;
+            case 3: v = 0x10000 + static_cast<uint32_t>(r.next() % 0x2000); break;
+            case 4: v = static_cast<uint32_t>(-8 - 4 * static_cast<int32_t>(r.next() % 4)); break;
+            default: v = (mode % 2 ? lane : 0) * 4 + static_cast<uint32_t>(r.next() % 4) * 64; break;
+          }
+          w.vgpr[a][lane] = v;
+        }
+      }
+      break;
+    case gcn::Enc::Mubuf:
+    case gcn::Enc::Mtbuf: {
+      const bool reads_data = in.dst.empty();
+      const size_t ri = reads_data ? 2 : 1;
+      if (in.src.size() <= ri + 1 || in.src[ri].kind != OperandKind::Sgpr || in.src[ri].index + 3 >= kSgprs) break;
+      const uint32_t rs = in.src[ri].index;
+      const bool rdna = gcn::is_rdna(in.arch);
+      static constexpr uint32_t kD3[] = {0x00027000u, 0x00020000u, 0x31014000u, 0x00000000u, 0x00A27000u, 0x31004000u, 0x20014000u,
+                                         0x10014000u, 0x00014000u, 0x00027000u};
+      static constexpr uint32_t kStride[] = {0, 0, 4, 16, 3, 0x3FFF};
+      static constexpr uint32_t kRecords[] = {4096, 65536, 65500, 100, 0, 0xFFFFFFFFu, 4100, 8192, 12};
+      const uint64_t b = base[mode % 3 == 1 ? 1 : 0];
+      uint32_t d1 = static_cast<uint32_t>(b >> 32) & 0xFFFF;
+      d1 |= kStride[r.next() % 6] << 16;
+      if (r.next() % 9 == 0) d1 |= 1u << (rdna ? 30 : 31);
+      uint32_t d3 = rdna ? 0x31014000u : 0x00027000u;
+      if (r.next() % 3 == 0) d3 = kD3[r.next() % 10];
+      uint32_t d0 = static_cast<uint32_t>(b);
+      if (mode == 5 && r.next() % 2) d0 = static_cast<uint32_t>(kScratchResourceBase), d1 = static_cast<uint32_t>(kScratchResourceBase >> 32) | 1u << 31;
+      w.sgpr[rs] = d0, w.sgpr[rs + 1] = d1, w.sgpr[rs + 2] = kRecords[r.next() % 9], w.sgpr[rs + 3] = d3;
+      const Operand& va = in.src[reads_data ? 1 : 0];
+      if (va.kind == OperandKind::Vgpr) {
+        const uint32_t regs = (in.idxen ? 1u : 0u) + (in.offen ? 1u : 0u);
+        for (uint32_t lane = 0; lane < kLanes; ++lane) {
+          uint32_t off = static_cast<uint32_t>(address(lane) - b);
+          if (regs == 2) w.vgpr[va.index][lane] = static_cast<uint32_t>(r.next() % 8), w.vgpr[va.index + 1][lane] = off;
+          else if (in.idxen) w.vgpr[va.index][lane] = static_cast<uint32_t>(r.next() % 80);
+          else w.vgpr[va.index][lane] = off;
+        }
+      }
+      const Operand& so = in.src[reads_data ? 3 : 2];
+      if (so.kind == OperandKind::Sgpr && so.index < kSgprs) w.sgpr[so.index] = kSmall[scalar_pick] & 0xFFF;
+      break;
+    }
+    case gcn::Enc::Smem:
+      if (!in.src.empty() && in.src[0].kind == OperandKind::Sgpr && in.src[0].index + 3 < kSgprs) {
+        const uint32_t rs = in.src[0].index;
+        if (in.src[0].width >= 4 || in.name.rfind("s_buffer", 0) == 0) {
+          static constexpr uint32_t kRecords[] = {4096, 65536, 100, 0, 4100, 12, 8192};
+          set_pair(rs, address(0) & ~uint64_t{3});
+          w.sgpr[rs + 1] &= 0xFFFF;
+          w.sgpr[rs + 2] = kRecords[r.next() % 7];
+        } else {
+          set_pair(rs, address(0) & ~uint64_t{(mode % 2) ? 0 : 3});
+        }
+      }
+      break;
+    default: break;
+  }
+  Mix64 h;
+  std::string error;
+  bool ran = false;
+  try {
+    ran = m.step(w, g);
+  } catch (const Error& e) {
+    error = std::string(e.what()) + "|" + std::to_string(static_cast<int>(e.code()));
+  } catch (const std::exception& e) {
+    error = std::string("std:") + e.what();
+  }
+  h.add(ran);
+  h.add_bytes(error.data(), error.size());
+  h.add(w.pc), h.add(w.exec), h.add(w.vcc), h.add(w.m0), h.add(w.scc), h.add(w.done), h.add(w.at_barrier);
+  h.add(w.loads_in_flight), h.add(w.soft_yield);
+  h.add_bytes(w.sgpr, sizeof w.sgpr);
+  for (const auto& row : w.vgpr.r) h.add_bytes(row.data(), sizeof row);
+  h.add_bytes(g.lds.data(), g.lds.size());
+  h.add_bytes(g.scratch.data(), g.scratch.size());
+  for (int i = 0; i < 3; ++i) {
+    std::vector<uint8_t> bytes(sizes[i]);
+    mem.read(base[i], bytes.data(), bytes.size());
+    h.add_bytes(bytes.data(), bytes.size());
+  }
+  const InstructionCounts& c = m.stats.counts;
+  h.add(m.stats.instructions), h.add(m.stats.barriers);
+  h.add(c.valu), h.add(c.mfma), h.add(c.salu), h.add(c.smem), h.add(c.vmem), h.add(c.flat), h.add(c.lds), h.add(c.branch);
+  h.add(c.sendmsg), h.add(c.flat_read), h.add(c.flat_write), h.add(c.flat_atomic), h.add(c.vmem_rd), h.add(c.vmem_wr);
   return h.h;
 }
 

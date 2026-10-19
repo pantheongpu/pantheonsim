@@ -177,6 +177,9 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem);
 // the program counter, LDS, the memory, the instruction counts, or the error's text. Two builds that
 // interpret the instruction alike give the same digest.
 uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour);
+// And a memory instruction run with its address registers aimed at memory in the ways `mode` says (see gcn_exec.cpp):
+// the digest also holds the three allocations the addresses point into. For amd/tests/unit/test_gcn_memory_same_bits.cpp.
+uint64_t digest_memory_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t mode);
 
 // The process is exiting: every dispatch still running stops within a few
 // thousand instructions a wave, throwing Err::DeviceLost, and none starts.

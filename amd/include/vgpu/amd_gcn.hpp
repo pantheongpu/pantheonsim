@@ -45,6 +45,45 @@ enum InstFlag : uint32_t {
   kInstBarrierSop1 = 1u << 13,  // s_barrier_*, s_get_barrier_state, s_wakeup_barrier
 };
 
+// The memory instructions' share of what the executor asks of the name text: what a load or store moves and how
+// (a byte, a short, a half register, whole words), which atomic operation it is, how scalar memory takes it. Worked
+// out once, when the instruction is decoded (finalize), by the same parsers the executor falls back on for an
+// instruction nobody finalized (mem_facts_of).
+enum class Rmw : uint8_t { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec,
+                           AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap, Invalid };
+// How a global or flat access (global_access) takes the instruction. Unknown: none this implements.
+enum class MemKind : uint8_t { Unknown, Narrow, HalfReg, Prefetch, Load, Store, StoreHi16, Atomic, Block, Transpose };
+// What a scalar memory instruction (scalar_load) is.
+enum class SmemKind : uint8_t { Load, Prefetch, Time, Nop, Store, Atomic, SubDword, BufferLoad };
+// The LDS accesses the executor runs without going through its ladder (lds_fast): the ones kernels use all the time.
+enum class LdsOp : uint8_t { None, ReadB32, WriteB32, ReadWide, ReadB96, WriteWide, AddU32, Read2B32, Write2B32, ReadU8, ReadI8,
+                             ReadU16, WriteB8, WriteB16 };
+struct MemFacts {
+  MemKind kind = MemKind::Unknown;
+  SmemKind smem = SmemKind::Load;
+  LdsOp lds_op = LdsOp::None;
+  Rmw rmw = Rmw::Invalid;       // the atomic operation of a global, flat or image atomic (parse_atomic)
+  Rmw buf_rmw = Rmw::Invalid;   // a buffer atomic's, which has its own list of names
+  Rmw s_rmw = Rmw::Invalid;     // a scalar atomic's
+  uint8_t narrow_bytes = 0;     // a byte or short load or store: its size, else 0
+  uint8_t half_bytes = 0;       // a _d16 access: its size, else 0
+  uint8_t atomic_bytes = 0;     // an atomic: its size, else 0
+  uint8_t transpose_bits = 0;   // a transposing load: its element size in bits, else 0
+  uint8_t smem_bytes = 0;       // s_load_u8 / i8 / u16 / i16: 1 or 2
+  bool narrow_sign = false;
+  bool half_sign = false, half_hi = false, half_store = false;
+  bool body_store = false;      // the name past its segment begins "store"
+  bool body_atomic = false;     // ... begins "atomic_"
+  bool load_dword = false, store_dword = false, load_monitor = false;   // ... begins "load_dword", "store_dword", "load_monitor_b"
+  bool formatted = false;       // ... begins "load_format_" or "store_format_"
+  bool buf_wide = false;        // a buffer atomic on 64 bits (atomic_cmpswap_x2)
+  bool s_wide = false;          // a scalar atomic on 64 bits
+  bool smem_sign = false;       // s_load_i8 / i16
+  bool smem_realtime = false;   // s_memrealtime (s_memtime is the other of the Time kind)
+  bool ds_name = false;         // the name begins "ds_" (then past-"ds_" is the part this calls the body)
+  bool scratch_store = false, scratch_load = false;   // the name begins "scratch_store" / "scratch_load"
+};
+
 // The encodings, by the ISA's names for them.
 // Mtbuf and Vopd are RDNA's: a typed buffer access, and VOPD, two vector
 // instructions issued as one.
@@ -251,12 +290,26 @@ struct Inst {
   uint64_t name_hash = 0, short_hash = 0;
   std::string short_name;
   uint32_t flags = 0;
+  MemFacts mem;   // (valid when flags has kInstFinal; mem_facts() says it for any instruction)
 };
 
 // The short form's name (Inst::short_name worked out), "" for an instruction that runs under its own.
 std::string short_name_of(const Inst& in);
 // Fills in Inst::name_hash, short_name, short_hash and flags.
 void finalize(Inst& in);
+// What the name of a memory instruction says (MemFacts), from the text.
+MemFacts mem_facts_of(const Inst& in);
+// The same parsers the executor uses on a name past its segment.
+bool parse_narrow(std::string_view name, uint32_t* bytes, bool* sign);
+bool parse_half(std::string_view body, uint32_t* bytes, bool* sign, bool* hi, bool* store);
+bool parse_atomic_body(std::string_view body, Rmw* rmw, uint32_t* bytes);
+uint32_t transpose_bits_of(std::string_view body);
+// An instruction's memory facts: filled in when decoded, worked out into `scratch` otherwise.
+inline const MemFacts& mem_facts(const Inst& in, MemFacts& scratch) {
+  if (in.flags & kInstFinal) return in.mem;
+  scratch = mem_facts_of(in);
+  return scratch;
+}
 // The flags of an instruction, finalized or not.
 inline uint32_t inst_flags(const Inst& in) {
   if (in.flags & kInstFinal) return in.flags;

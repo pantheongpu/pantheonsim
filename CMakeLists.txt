@@ -1396,6 +1396,13 @@ target_compile_definitions(test_amd_gcn_math PRIVATE VGPU_SOURCE_DIR="${CMAKE_SO
 # digests of the baseline build (amd/tests/unit/test_gcn_same_bits.cpp).
 vgpu_unit_test(test_amd_gcn_same_bits amd/tests/unit/test_gcn_same_bits.cpp)
 target_compile_definitions(test_amd_gcn_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# What a memory instruction's name says (width, sign, atomic operation, how scalar memory takes it) is worked out when
+# it is decoded: held against the old per-execution text tests, and every memory instruction of the corpora run on
+# registers aimed at memory against the recorded digests of the base build.
+vgpu_unit_test(test_amd_gcn_mem_facts amd/tests/unit/test_gcn_mem_facts.cpp)
+target_compile_definitions(test_amd_gcn_mem_facts PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_unit_test(test_amd_gcn_memory_same_bits amd/tests/unit/test_gcn_memory_same_bits.cpp)
+target_compile_definitions(test_amd_gcn_memory_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Scratch, LDS atomics, a cross-lane read, and flat pointers.
 vgpu_unit_test(test_amd_gcn_memory amd/tests/unit/test_gcn_memory.cpp)
 target_compile_definitions(test_amd_gcn_memory PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
