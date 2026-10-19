@@ -3286,3 +3286,159 @@ one reported; no claim is made about what the hoisting alone is worth.
 * Profiling the tier itself (`perf` is unusable here): what is left of the per-instruction cost is the fetch from the decode cache, the
   `Regs` frame and the indirect call.
 
+
+## The AMD runtime: calls, queues and work-group threads (branch `speedup4-amdmt`)
+
+What a HIP call, a stream's hand-off and a launch's threads cost, measured and cut where it could be cut without moving a result.
+Base is `speedup` f81cc0c1 (Tier 1 and Tier 2). Measured on server2 (Ryzen 9 9950X, 32 logical CPUs shared with other people's builds
+and benchmarks), Release, GCC 13.3, `tools/bench-amd` pinned to CPUs 24-31, simulated MI300X and RX 6800 only (no card touched), A and
+B alternating, 7 to 21 runs. The final A/B below ran at a 1-minute load of 5 to 9 (median 6); the leave-one-out runs at 7 to 15. Every
+ratio is the median wall time of A over B (above 1: B is faster), p the harness's Mann-Whitney p. Counts and bits cannot move in these
+changes, and `test_amd_gcn_same_bits` (the guard, 15,566 shapes against digests recorded from the unmodified base) passes unchanged.
+
+### New rows in the harness (`tools/bench-amd`)
+
+All self-checking, none counted by the profiler (`--no-counts`; rocprofv3 writes no counter CSV on this host).
+
+| workload | what it does | units |
+| --- | --- | --- |
+| `apicheap` | `hipGetDevice`, `hipGetLastError`, `hipPeekAtLastError`, `hipDeviceGetAttribute`: the fixed cost of a HIP call | calls |
+| `launch_mid` / `launch_wide` | launches of 128 / 1024 one-wave work-groups of a tiny kernel on one stream: the hand-off to the work-group threads | launches |
+| `launch_sync` | four chained one-wave launches, then `hipStreamSynchronize`: the hand-off between a stream's thread and its caller | calls |
+| `memcpy` | 16 KiB and 64 KiB `hipMemcpy` (H2D, D2D, D2H), `hipMemcpyAsync`, `hipMemsetAsync`, `hipMemset`, each round ending in a stream synchronize | calls |
+| `stream` | `hipStreamCreateWithFlags`, `hipEventRecord`, `hipStreamWaitEvent`, two launches, queries, synchronize, `hipStreamDestroy` | calls |
+| `graph` | a graph of four chained kernel nodes captured from a stream, launched in a loop | launches |
+
+### Where a launch's time goes
+
+`launch` (100,000 one-wave launches on two streams) at one work-group thread, `tools/bench-amd/profile` on a `-g` build of this
+branch (4000 Hz, call chains, so inclusive): the two stream threads are 94% of the samples and the calling thread 12%, so the rate is
+the stream thread's per-launch work and not the hand-off. Inside it: `execute` 49% (the work-group's set-up, `set_up_group`, 14%, the
+one wave's instructions 28%), `MemoryManager::free` 20% (the kernarg segment's, with its quarantine record), `find_ordinary_miss` 13%
+(every allocation and free changes the table lock's epoch, so each kernel's first accesses look the table up again); half of the
+samples have no source line, which is libc (malloc and free, the zeroing of the 64 KiB register file and of the kernarg chunk, futex). `strace -c` on 2,000 launches:
+2.7 futex calls a launch on the base, and 1.0 `gettid` and `getpid` each, which are the main-thread check of `launch_in_order`. An
+experiment that is not shippable (a scratch kernarg segment allocated once per thread and never freed, which moves every later device
+address and the quarantine) makes `launch` 1.65x (MI300X) and 1.42x (RX 6800) faster, p < 0.001: the allocate-write-free of the
+kernarg segment is about a third of a launch. Switching telemetry off (`VGPU_TELEMETRY=0`, 15 alternating pairs) is worth 2.8%.
+`alloc`+`free` of 128 bytes alone is 147 ns on one thread; with the 192-byte write into the fresh allocation, which makes a 64 KiB
+chunk real and frees it again, 455 ns.
+
+### What changed
+
+* **A HIP call with nothing watching is one load** (`ApiCall`, `hip_api.cpp`). The previous round's argument capture was already built
+  only after the profiler test, but each call still read a function-static, a thread-local depth and the profiler pointer, and the
+  profiler side was inline at ~560 call sites. One relaxed load of `g_api_watch` (0: nothing; 1: a profiler attached or `VGPU_TRACE_API`;
+  2: not settled yet) now decides, and entering and leaving are out of line, cold. A profiler attaching sets 1, so calls made after that
+  count their depth and report as before; one attaching while another thread is inside a call sees that call's nested calls reported as
+  outermost, which is the one difference.
+* **Hand-offs spin before they sleep** (`hip_queue.hpp`). A thread that waits for the other side of a stream's queue (the caller for a
+  result, the stream's thread for work) polls for 400 pauses (a few microseconds) before it takes the futex, with `VGPU_QUEUE_SPIN=0` for none
+  (it is also none when the process may use one CPU). The queue has a condition variable for each side, a notify that is a no-op with no
+  sleeper, and a thread that is spinning stops at once when its queue is destroyed (without that, `hipStreamDestroy` waited out the spin,
+  and `stream` was 14% slower).
+* **A waited-for call runs on the calling thread when its stream is idle** (`WorkQueue::run_inline`, used by `in_order`). `hipMemcpy`
+  and friends wake the stream's thread, sleep, and are woken in turn; with every item done, nothing running and every marker finished
+  the work is numbered, finished and counted as a queued item is, on the caller. Anything queued meanwhile waits for it, a failure is
+  the queue's as before, a profiler being attached (its copy records carry the thread) keeps the stream's thread. A stream used only
+  this way never starts its thread. Not done for asynchronous items: they must return before the work does.
+* **A launch's work-group threads are kept** (`gcn_pool.hpp`, used by the three places `execute` started and joined `std::thread`s).
+  The same static ranges, a thread for each task and all of them alive at once (work-groups may wait on one another), the first task
+  on the calling thread, the floating-point environment and signal mask of the launching thread, made afresh in a forked child. The
+  CPUs a program may use stay the limit (`worker_count`).
+* **Smaller things.** A wave's work-item ids are counted up, not divided out per lane (three 64-bit divisions a lane before); the
+  main-thread check in `launch_in_order` is asked once per thread and fork, not with two system calls a launch; a device-to-device
+  copy's buffer is no longer zero-filled first.
+
+### Results
+
+Base against this branch, 9 runs, one host thread and all of them (CPUs 24-31), load 5 to 9. p < 0.001 unless given.
+
+| workload | MI300X, 1 thread | MI300X, 8 | RX 6800, 1 | RX 6800, 8 |
+| --- | ---: | ---: | ---: | ---: |
+| `api` (13 calls, 5 of them hand-offs) | **3.29x** | **3.32x** | **3.27x** | **3.17x** |
+| `memcpy` | **2.22x** | **2.20x** | **2.21x** | **2.13x** |
+| `launch_sync` | **1.23x** | **1.24x** | 1.18x (p 0.004) | 1.16x (p 0.003) |
+| `stream` | 1.16x | 1.14x | 1.19x | 1.19x |
+| `apicheap` (about 30 ns a call) | 1.08x | 1.10x | 1.09x | 1.10x |
+| `graph` | 1.04x | 1.04x | 1.04x | 1.04x |
+| `launch_mid` (128 work-groups) | 1.04x (p 0.03) | **2.51x** | 1.02x (p 0.01) | **1.88x** |
+| `launch_wide` (1024 work-groups) | 1.07x | 1.11x (p 0.49) | 1.03x (p 0.003) | 1.19x (p 0.008) |
+| `launch` (one wave, two streams) | 1.01x (p 0.55) | 1.02x (p 0.09) | 1.04x (p 0.30) | 1.05x (p 0.34) |
+
+`launch` is the rate of the stream thread's own work (above), and none of this touches it. CPU time goes down where the hand-offs were
+the cost (`api` 1.23 to 0.96 s, `launch_mid` with all threads 2.40 to 1.91 s) and up where a thread now polls before it sleeps:
+`stream` +30%, `memcpy` +14%, `launch_sync` +10%, in processes that last 0.1 to 0.4 s; `VGPU_QUEUE_SPIN=0` gives that back and loses
+the wall-clock gain below.
+
+The same tree against itself with one change removed (11 to 21 runs, load 7 to 15; `ApiCall`'s single load touches only `apicheap`, whose
+base-against-branch row above is its effect, 1.08x to 1.10x):
+
+| change | workload | MI300X | RX 6800 |
+| --- | --- | ---: | ---: |
+| spinning (`VGPU_QUEUE_SPIN` 400 against 0) | `api` | 2.49x | 2.51x |
+| | `memcpy` | 1.82x | 1.77x |
+| | `launch_sync` | 1.18x | 1.13x |
+| the queue's changes together (spinning, waited-for calls on the caller, the separate counters) | `api` | 3.35x | 3.23x |
+| | `memcpy` | 2.24x | 2.24x |
+| | `stream` | 1.14x | 1.14x |
+| | `launch_sync` | 1.10x (p 0.24) | 1.15x |
+| the pool (against a thread for each task, one launch) | `launch_mid`, 8 threads | 2.40x | 1.81x |
+| | `launch_wide`, 8 threads | 1.05x (p 0.01) | 1.06x (p 0.02) |
+| ids counted up + the main-thread check cached | `launch_wide`, 1 thread | 1.10x (p 0.003) | 1.04x |
+| | `launch` | 0.99x | 1.07x (p 0.04) |
+| the device-to-device buffer not zeroed | `memcpy` | 1.04x | 1.05x |
+
+The workloads this does not touch (`valu_int`, `valu_f32`, `mem`, `lds`, `atomics`, `divergent`, `wave`, `mfma`, 7 runs, one thread
+and all, both cards) moved between 0.998x and 1.08x, none slower with p < 0.05 (the one ratio under 0.95, `mem` on the MI300X at one
+thread, 0.86x with p 0.21, has a best-of ratio of 1.19: noise). Small gains of 2 to 5% with p of 0.001 to 0.04 on several (`mfma`
+1.03x to 1.04x, `wave` and `atomics` on the RX 6800) are a launch's set-up, where the ids loop is the only change on their path.
+
+Scaling with the final pool, one to eight threads (MI300X, 5 runs, wall time of the device phase, speed-up over one thread):
+`mem` 1.96x, 3.81x, 7.43x at 2, 4 and 8; `lds` 1.96x, 3.88x, 7.41x; `divergent` 1.93x, 3.60x, 6.63x; `launch_mid` 1.92x, 3.61x, 6.42x;
+`launch_wide` 1.99x, 3.83x, 6.51x; `valu_int` 1.79x, 2.94x, 4.29x (0.336 s at eight threads, the base's time to the millisecond, so it is not this change; probably
+the host's other jobs on the sibling threads of CPUs 24-31). No false sharing or shared counter was found: a dispatch's
+`DispatchStats` are one for each thread, merged at the end; the allocation table's reader lock spreads threads over 64 slots by a hash
+of the thread id (26 distinct slots for 32 threads); the per-thread lookup memory is keyed by the lock's epoch. Past eight threads the host
+could not say: 16 CPUs (16-31) gave the same time as 8 for `valu_int` and `mem`, with other jobs on the sibling threads of every core.
+
+### Tests
+
+Both wired into CMake. Mutations were run on scratch copies and each fails the test named.
+
+| test | what it holds | mutations that fail it |
+| --- | --- | --- |
+| `test_amd_gcn_threads` (`amd/tests/unit`, also run for gfx1100 and gfx1030; the kernels are `vector_add.c` and its LDS reduction) | the pool: n tasks (1 to 40) that wait for one another all run once and at once; the first on the caller; six launching threads do not mix their tasks; a task starts with the launcher's rounding mode and signal mask; a forked child makes its own threads. A dispatch's memory image and counts (waves, instructions, barriers, the class counts and the mix) on 2, 3, 5, 8, 17 and 32 threads equal one thread's, for 1 to 3,000 work-groups of both kernels; 60 dispatches in a row and from four threads at once equal the serial run; a dispatch that fails (a store past its output) throws on 1, 2 and 8 threads and the next one runs | task index off by one; the first task on a new thread; the float environment not applied; the fork child keeping its parent's pool (killed by its alarm); the last work-group of the last range dropped; the first thread's counts not merged; the first error swallowed |
+| `test_amd_hip_queue` | order and thread of queued items; `run_inline` on an idle queue (caller's thread, numbered, counted, its failure kept until asked for); an exception is the queue's failure; refused when an item runs or waits or a marker is pending; an item queued while inline work runs waits for it; many threads queueing and waiting, each queued item before the waited-for one that follows it; a wait longer than the spin sleeps and wakes | the sleeper not told to wait for inline work; the idle check dropped; the marker check dropped; the exception not caught; the inline item not numbered; the inline item not marked done. Also clean under ASan, UBSan and TSan |
+
+Also run on the final tree (a full build on server2): every `test_amd_*` unit test (including `test_amd_gcn_same_bits`, which passes
+unchanged, `test_amd_gcn_atomics`, `test_amd_gcn_exec`, `test_amd_hip_abi`, `test_amd_rocprofiler`, `test_amd_rocprofiler_args` and the
+tests that run for gfx1100, gfx1201, gfx1030 and gfx1250), `test_worker_pool`, `test_memory`, and the AMD end-to-end set: `amd_hip`,
+`amd_hipcc`, `amd_graph_host_source`, `amd_hip_abi`, `amd_workgroup`, `amd_hsa`, `amd_hip_on_hsa`, `amd_lost_gpu`, `amd_memtest_patterns`,
+`amd_rocprof_*`, `amd_rocblas`, `amd_libraries`, `amd_session`, `amd_debugger`. 202 of 202 pass (`amd_hipsparselt` twice skipped: no
+hipSPARSELt). Not run: the PyTorch, vLLM and Ollama sets. Three tests that are not in that list fail on this host with causes that do not involve this change (not re-run on the base: `amd_rocprofiler_abi`: a rocprofiler-sdk header version assertion; `amd_rocprofv3`: `unshare` refused, no user
+namespaces; `amd_tools`: the same, and `rocminfo` against ROCm 7.2's).
+
+### Not done, and negative results
+
+* **The NVIDIA engines' worker pool (`vgpu::exec::run_parallel`) for the AMD dispatch, dropped.** The first version of this change
+  used it. It is the better pool for a launch with nothing else running, and it is slower than a thread for each task when the CPUs are
+  full: `launch_wide` with 8 threads on 8 CPUs 0.64x (MI300X) and 0.70x (RX 6800), p < 0.001 (the launching thread, which it leaves
+  waiting and polling, is the ninth thread and takes a CPU from a work-group thread for a time slice, about 200 us a launch);
+  `launch_mid` 1.28x (p < 0.001) and 0.94x (p 0.14). `gcn_pool.hpp` runs the first task on the launching thread instead, which
+  gave the results above. The shared pool's wait is the same for the NVIDIA engines: worth a look there with the CPUs full.
+* **Kernarg alloc and free per launch** (about a third of a `launch`, above): not changed. A scratch segment moves every later device
+  address (the allocator is a bump) and the quarantine of freed ranges, which diagnostics report; making `alloc` and `free` cheaper
+  while keeping both means the allocation table's nodes (`live_`, `freed_`, `freed_order_`, the last a map that is only ever popped at
+  the front), the lock's epoch and a 64 KiB zeroed chunk for 192 bytes. That is `src/core/memory.cpp` and `brlock.hpp`, not this piece.
+* **The wave's 64 KiB register file** (14% of `launch` in `set_up_group`, with the ids loop that is gone): the previous round's
+  conclusion stands, no bit-safe way to size or recycle it was found.
+* **Dynamic scheduling of work-groups across threads**: not done. The ranges are static and contiguous so that groups that wait on later
+  ones on their own thread (Stream-K GEMMs) behave as they did; handing out groups one by one changes which groups share a thread.
+* **Running small asynchronous copies, fills and event records on the caller when the stream is idle**: not done. It would be faster
+  (the hand-off is the cost) but it changes when `hipEventQuery` and `hipStreamQuery` first say yes, and a program may see that.
+* **Reusing a stream's thread for the next stream** (`stream` spends 30% in `pthread_create` and thread exit): not done, not
+  measured. The queue's thread runs host functions, which may use thread-local state of the runtime.
+* **Graph launches**: 12 us for four kernel nodes, 3 us a node, the cost of a plain launch's stream-thread work; the plan is rebuilt
+  each launch but is small beside it. Nothing cheap.
+* **Event records**: `hipEventRecord` takes `s.mutex` and the event table's mutex and queues an item; no measurement pointed at it.

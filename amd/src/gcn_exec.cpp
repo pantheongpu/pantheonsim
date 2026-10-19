@@ -33,6 +33,7 @@
 #include "vgpu/host_cpus.hpp"
 #include "mfma_math.hpp"
 #include "packed_math.hpp"
+#include "gcn_pool.hpp"
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
@@ -10987,19 +10988,8 @@ unsigned worker_count(uint64_t groups) {
   return want ? want : 1;
 }
 
-// Starts `body` on a new host thread. Where the host will not start one (std::system_error: EAGAIN at a process or user
-// limit, or no address space left), `body` runs here, to its end, before this returns: the ranges of work-groups the
-// threads share are independent, so the dispatch finishes, on fewer threads, with the bits it would have had. (A
-// std::thread that was never started and then destroyed joinable is a std::terminate; the pools' vectors hold only
-// started ones.)
-template <typename Body>
-void start_or_run_here(std::vector<std::thread>& pool, Body body) {
-  try {
-    pool.emplace_back(body);
-  } catch (const std::system_error&) {
-    body();
-  }
-}
+// (Where the host will not start a thread for a range of work-groups, pool::run in gcn_pool.hpp runs the range on the launching
+// thread: the ranges are independent, so the dispatch finishes, on fewer threads, with the bits it would have had.)
 
 // A work-group's waves, set up as the hardware leaves them.
 void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_segment, uint32_t gx,
@@ -11092,21 +11082,31 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     if (k.group_id_z) m.set_sgpr(w, at++, gz);
     if (k.group_info) m.set_sgpr(w, at++, 0);
     if (k.private_wave_offset && m.target() == gcn::Target::Gfx90a) m.set_sgpr(w, at++, 0);
+    // (The ids of consecutive work-items are counted up from the first lane's, rather than divided out of each
+    // lane's number: the same values, without a 64-bit division for each of three ids a lane.)
+    const bool packed_ids = d.object->packed_work_item_id() || gcn::packs_work_item_ids(m.target());
+    uint32_t x = static_cast<uint32_t>(w.first_lane % size[0]),
+             y = static_cast<uint32_t>(w.first_lane / size[0] % size[1]),
+             z = static_cast<uint32_t>(w.first_lane / size[0] / size[1]);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
-      const uint64_t flat = w.first_lane + lane;
-      const uint32_t x = static_cast<uint32_t>(flat % size[0]), y = static_cast<uint32_t>(flat / size[0] % size[1]),
-                     z = static_cast<uint32_t>(flat / size[0] / size[1]);
       // From ABI version 5 a work-item's three ids are packed into v0,
       // ten bits each, and the kernel pulls them out; before it each id
       // had a register of its own -- except where the hardware packs them
       // whatever the ABI (gcn::packs_work_item_ids): a version 4 object
       // built for gfx90a, gfx942 or gfx1100 still reads them from v0.
-      if (d.object->packed_work_item_id() || gcn::packs_work_item_ids(m.target())) {
+      if (packed_ids) {
         w.vgpr[0][lane] = x | y << 10 | z << 20;
       } else {
         w.vgpr[0][lane] = x;
         w.vgpr[1][lane] = y;
         w.vgpr[2][lane] = z;
+      }
+      if (++x == size[0]) {
+        x = 0;
+        if (++y == size[1]) {
+          y = 0;
+          ++z;
+        }
       }
     }
     ++m.stats.waves;
@@ -11503,26 +11503,22 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
       total = m.stats;
     } else {
       std::vector<DispatchStats> per_thread(nthreads_c);
-      std::vector<std::thread> pool;
       std::mutex err_mu;
       std::exception_ptr first_error;
       std::atomic<bool> failed{false};
-      for (unsigned t = 0; t < nthreads_c; ++t) {
+      pool::run(nthreads_c, [&](unsigned t) {
         const uint64_t begin = clusters * t / nthreads_c, end = clusters * (t + 1) / nthreads_c;
-        start_or_run_here(pool, [&, t, begin, end] {
-          try {
-            Machine m(d, mem, *cache);
-            m.concurrent = true;
-            run_clusters(m, d, packet, group_segment, begin, end, &failed);
-            per_thread[t] = m.stats;
-          } catch (...) {
-            failed = true;
-            std::lock_guard<std::mutex> lock(err_mu);
-            if (!first_error) first_error = std::current_exception();
-          }
-        });
-      }
-      for (std::thread& th : pool) th.join();
+        try {
+          Machine m(d, mem, *cache);
+          m.concurrent = true;
+          run_clusters(m, d, packet, group_segment, begin, end, &failed);
+          per_thread[t] = m.stats;
+        } catch (...) {
+          failed = true;
+          std::lock_guard<std::mutex> lock(err_mu);
+          if (!first_error) first_error = std::current_exception();
+        }
+      });
       if (first_error) {
         if (packet) mem.free(packet);
         std::rethrow_exception(first_error);
@@ -11610,21 +11606,12 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
       resident(0);
     } else {
       // (Its workers wait on one another's progress, so one the host would not start cannot be run here in its turn:
-      // the others are told to stop, and the launch fails.)
-      std::vector<std::thread> pool;
-      std::string refused;
-      for (unsigned t = 0; t < shape.workers && refused.empty(); ++t) {
-        try {
-          pool.emplace_back(resident, t);
-        } catch (const std::system_error& e) {
-          refused = e.what();
-          failed = true;
-        }
-      }
-      for (std::thread& th : pool) th.join();
-      if (!refused.empty()) {
+      // none starts, and the launch fails.)
+      try {
+        pool::run_together(shape.workers, resident);
+      } catch (const std::system_error& e) {
         if (packet) mem.free(packet);
-        throw Error::make(Err::Internal, "the host would not start a thread for the dispatch's work-groups: ", refused);
+        throw Error::make(Err::Internal, "the host would not start a thread for the dispatch's work-groups: ", e.what());
       }
     }
     if (first_error) {
@@ -11664,26 +11651,22 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     // share is device memory. The first failure stops the rest at their next
     // work-group, and is the one reported.
     std::vector<DispatchStats> per_thread(nthreads);
-    std::vector<std::thread> threads_;
     std::mutex err_mu;
     std::exception_ptr first_error;
     std::atomic<bool> failed{false};
-    for (unsigned t = 0; t < nthreads; ++t) {
+    pool::run(nthreads, [&](unsigned t) {
       const uint64_t begin = groups * t / nthreads, end = groups * (t + 1) / nthreads;
-      start_or_run_here(threads_, [&, t, begin, end] {
-        try {
-          Machine m(d, mem, *cache);
-          m.concurrent = true;
-          run_groups(m, d, packet, group_segment, begin, end, group_at, &failed);
-          per_thread[t] = m.stats;
-        } catch (...) {
-          failed = true;
-          std::lock_guard<std::mutex> lock(err_mu);
-          if (!first_error) first_error = std::current_exception();
-        }
-      });
-    }
-    for (std::thread& th : threads_) th.join();
+      try {
+        Machine m(d, mem, *cache);
+        m.concurrent = true;
+        run_groups(m, d, packet, group_segment, begin, end, group_at, &failed);
+        per_thread[t] = m.stats;
+      } catch (...) {
+        failed = true;
+        std::lock_guard<std::mutex> lock(err_mu);
+        if (!first_error) first_error = std::current_exception();
+      }
+    });
     if (first_error) {
       if (packet) mem.free(packet);
       std::rethrow_exception(first_error);

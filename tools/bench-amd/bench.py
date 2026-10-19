@@ -93,12 +93,20 @@ WORKLOADS = {
     "wave": ("control", "shuffles (ds_bpermute / DPP), ballot, any/all", BOTH),
     "launch": ("api", "kernel launches on two streams (cost = the launch path)", BOTH),
     "api": ("api", "hipMalloc/Memcpy/Memset/Free, events, streams in a loop", BOTH),
+    "apicheap": ("api", "hipGetDevice, hipGetLastError, hipPeekAtLastError, hipDeviceGetAttribute in a loop (the fixed cost of a HIP call)", BOTH),
+    "launch_wide": ("api", "launches of 1024 one-wave work-groups (the work-group hand-off to the workers)", BOTH),
+    "launch_mid": ("api", "launches of 128 one-wave work-groups (40 us of work to each of 8 host threads)", BOTH),
+    "launch_sync": ("api", "four chained one-wave launches then hipStreamSynchronize (the stream hand-off)", BOTH),
+    "memcpy": ("api", "16 KiB and 64 KiB hipMemcpy / hipMemcpyAsync / hipMemsetAsync, sync and async", BOTH),
+    "stream": ("api", "stream create/destroy, events, hipStreamWaitEvent, stream and event queries", BOTH),
+    "graph": ("api", "a captured graph of four kernel nodes, launched in a loop", BOTH),
     "startup": ("api", "one launch of a trivial kernel; read the whole-process wall time", BOTH),
 }
 # What an A/B verdict and the rate columns use. Default: wave-instructions per CPU second.
-PRIMARY = {"launch": "units_per_s", "api": "units_per_s", "startup": "wall_s"}
-NO_COUNTS = ("launch", "api", "startup")
-NO_KERNELS = ("api",)  # no dispatch at all, so nothing for the profiler to count  # rate is calls per second; no profiler pass at full size
+_NEW_API = ("apicheap", "launch_mid", "launch_wide", "launch_sync", "memcpy", "stream", "graph")
+PRIMARY = {"launch": "units_per_s", "api": "units_per_s", "startup": "wall_s", **{w: "units_per_s" for w in _NEW_API}}
+NO_COUNTS = ("launch", "api", "startup") + _NEW_API
+NO_KERNELS = ("api",) + _NEW_API  # no dispatch at all, so nothing for the profiler to count  # rate is calls per second; no profiler pass at full size
 INSTS = ["SQ_INSTS_SALU", "SQ_INSTS_SMEM", "SQ_INSTS_VALU", "SQ_INSTS_VMEM", "SQ_INSTS_LDS", "SQ_INSTS_BRANCH",
          "SQ_INSTS_SENDMSG", "SQ_INSTS_MFMA"]
 EXTRA = ["SQ_WAVES", "SQ_INSTS_VMEM_RD", "SQ_INSTS_VMEM_WR", "TA_FLAT_ATOMIC_WAVEFRONTS"]
