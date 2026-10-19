@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <type_traits>
 
 #include "vgpu/amd_debug.hpp"
 #include "vgpu/amd_decode_cache.hpp"
@@ -3570,6 +3571,27 @@ struct Machine {
     } else {
       std::array<double, 16 * 32> fa, fb;
       const auto fill = [&](const MatrixSrc& src, char kind, double* dst_tile, bool as_a) {
+#if defined(__SSE2__)
+        if (kind == 'h') {   // binary16: sixteen rows (columns) of one k at a time, in the lanes that hold them
+          for (uint32_t k = 0; k < K; ++k) {
+            const uint32_t* const words = src.rows[elem_of(k) / 2] + lane_of(0, k);
+            const int shift = 16 * static_cast<int>(elem_of(k) % 2);
+            for (uint32_t q = 0; q < 16; q += 4) {
+              __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(words + q));
+              raw = _mm_and_si128(_mm_srli_epi32(raw, shift), _mm_set1_epi32(0xFFFF));
+              __m128d lo, hi;
+              half4_to_double(raw, &lo, &hi);
+              if (as_a) {
+                _mm_storel_pd(dst_tile + (q + 0) * K + k, lo), _mm_storeh_pd(dst_tile + (q + 1) * K + k, lo);
+                _mm_storel_pd(dst_tile + (q + 2) * K + k, hi), _mm_storeh_pd(dst_tile + (q + 3) * K + k, hi);
+              } else {
+                _mm_storeu_pd(dst_tile + k * 16 + q, lo), _mm_storeu_pd(dst_tile + k * 16 + q + 2, hi);
+              }
+            }
+          }
+          return;
+        }
+#endif
         const auto go = [&](auto tag) {
           constexpr char T = decltype(tag)::value;
           for (uint32_t rc = 0; rc < 16; ++rc)
@@ -9346,6 +9368,8 @@ struct Machine {
     std::vector<uint32_t> c_off, a_off, b_off;
     // The fast path's: where a lane's column of B starts in a tile of B by row of k (its block's, and its column), and the tiles.
     uint32_t b_blk[kLanes], b_col[kLanes];
+    // where each lane's run of K starts in a tile of A (by row) and of B (by row of k), as floats are stored
+    uint32_t a_dst[kLanes], b_dst[kLanes];
     std::vector<double> fa, fbk, fc, fo;
     std::vector<int16_t> ia, bi;
     std::vector<int32_t> io, ic;
@@ -9369,6 +9393,8 @@ struct Machine {
       const uint32_t bl = lane / p.lanes_per_block, within = lane % p.lanes_per_block;
       p.lane[lane] = {bl, within, within / s.m, (bl * s.m + within % s.m) * s.k, (bl * s.n + within % s.n) * s.k};
       p.b_blk[lane] = bl * s.k * s.n, p.b_col[lane] = within % s.n;
+      p.a_dst[lane] = p.lane[lane].a_row + p.lane[lane].g * p.per_lane;
+      p.b_dst[lane] = p.b_blk[lane] + p.b_col[lane] + p.lane[lane].g * p.per_lane * s.n;
       for (uint32_t r = 0; r < p.outs; ++r) {
         uint32_t ob = 0, row = 0;
         out_place(s, lane, r, &ob, &row);
@@ -9450,6 +9476,14 @@ struct Machine {
       return as_double(d.rows[2 * e][lane] | static_cast<uint64_t>(d.rows[2 * e + 1][lane]) << 32);
     }
   }
+  // The value of an integer element as an int16 (the integer forms' tiles hold the 8- and 4-bit inputs as 16-bit integers): what
+  // matrix_elem<T> gives as a double, without the double.
+  template <char T, typename V>
+  static inline V matrix_value(const MatrixSrc& d, uint32_t e, uint32_t lane) {
+    if constexpr (std::is_same_v<V, int16_t> && T == 'c') return static_cast<int16_t>(static_cast<int8_t>(d.rows[e / 4][lane] >> (8 * (e % 4))));
+    else if constexpr (std::is_same_v<V, int16_t> && T == 'u') return static_cast<int16_t>((d.rows[e / 4][lane] >> (8 * (e % 4))) & 0xFF);
+    else return static_cast<V>(matrix_elem<T>(d, e, lane));
+  }
   // The instruction's operands, decoded: tiles of A (by row of k), B (by row of k, or in pairs of k for the integer forms),
   // and C.
   struct MatrixFast {
@@ -9469,6 +9503,55 @@ struct Machine {
     if constexpr (Int) return p.b_blk[lane] + size_t{p.b_col[lane]} * 2 + ((kk >> 1) * 2u * s.n) + (kk & 1);
     else return p.b_blk[lane] + p.b_col[lane] + size_t{kk} * s.n;
   }
+  // Operands that are 16 or 32 bits wide and become a double by a conversion of the bits (binary16, bfloat16, float, xf32), four
+  // lanes to an instruction: element e of every lane's run, from the register that holds it, to dst[dest[lane] + e * step].
+  // `dest` is the lane's run (MatrixPlan::a_dst / b_dst). The doubles are those matrix_elem<T> gives (half4_to_double for
+  // binary16, the exhaustive test of mfma_math.hpp; the others are a shift or a mask and the float to double conversion).
+  template <char T>
+  void matrix_decode_wide(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst) {
+#if defined(__SSE2__)
+    for (uint32_t e = 0; e < per_lane; ++e) {
+      constexpr bool packed = T == 'h' || T == 'b';   // two to a register
+      const uint32_t* const words = src.rows[packed ? e / 2 : e];
+      const int shift = packed ? 16 * static_cast<int>(e % 2) : 0;
+      const size_t off = size_t{e} * step;
+      for (uint32_t l = 0; l < kLanes; l += 4) {
+        const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(words + l));
+        __m128d lo, hi;
+        if constexpr (T == 'h') {
+          half4_to_double(_mm_and_si128(_mm_srli_epi32(raw, shift), _mm_set1_epi32(0xFFFF)), &lo, &hi);
+        } else {
+          __m128i bits = raw;
+          if constexpr (T == 'b') bits = shift ? _mm_and_si128(raw, _mm_set1_epi32(static_cast<int>(0xFFFF0000u))) : _mm_slli_epi32(raw, 16);
+          if constexpr (T == 'F') {   // xf32: the mantissa cut to ten bits, except an infinity or a NaN
+            const __m128i special = _mm_cmpeq_epi32(_mm_and_si128(raw, _mm_set1_epi32(0x7F800000)), _mm_set1_epi32(0x7F800000));
+            bits = _mm_or_si128(_mm_and_si128(special, raw), _mm_andnot_si128(special, _mm_and_si128(raw, _mm_set1_epi32(~0x1FFF))));
+          }
+          const __m128 f = _mm_castsi128_ps(bits);
+          lo = _mm_cvtps_pd(f);
+          hi = _mm_cvtps_pd(_mm_movehl_ps(f, f));
+        }
+        _mm_storel_pd(dst + dest[l] + off, lo);
+        _mm_storeh_pd(dst + dest[l + 1] + off, lo);
+        _mm_storel_pd(dst + dest[l + 2] + off, hi);
+        _mm_storeh_pd(dst + dest[l + 3] + off, hi);
+      }
+    }
+#else
+    for (uint32_t e = 0; e < per_lane; ++e)
+      for (uint32_t l = 0; l < kLanes; ++l) dst[dest[l] + size_t{e} * step] = matrix_elem<T>(src, e, l);
+#endif
+  }
+  template <typename F>
+  static bool matrix_wide_type(char t, F&& f) {
+    switch (t) {
+      case 'h': f(std::integral_constant<char, 'h'>{}); return true;
+      case 'b': f(std::integral_constant<char, 'b'>{}); return true;
+      case 'f': f(std::integral_constant<char, 'f'>{}); return true;
+      case 'F': f(std::integral_constant<char, 'F'>{}); return true;
+      default: return false;
+    }
+  }
   template <char T, typename V>
   void matrix_decode_a(MatrixFast& f, V* ap) {
     const MatrixPlan& plan = *f.plan;
@@ -9479,7 +9562,7 @@ struct Machine {
         const MatrixPlan::Lane& L = plan.lane[lane];
         const uint32_t idx = f.idx_row[lane] >> (f.idx_set * per_lane);
         for (uint32_t v = 0; v < per_lane / 2; ++v)
-          ap[L.a_row + L.g * per_lane + 4 * (v / 2) + ((idx >> (2 * v)) & 3)] = static_cast<V>(matrix_elem<T>(f.a, v, lane));
+          ap[L.a_row + L.g * per_lane + 4 * (v / 2) + ((idx >> (2 * v)) & 3)] = matrix_value<T, V>(f.a, v, lane);
       }
       return;
     }
@@ -9490,7 +9573,7 @@ struct Machine {
       if (f.scaled) {
         for (uint32_t e = 0; e < per_lane; ++e) d[e] = static_cast<V>(matrix_elem<T>(f.a, e, sl) * f.sa[lane]);
       } else {
-        for (uint32_t e = 0; e < per_lane; ++e) d[e] = static_cast<V>(matrix_elem<T>(f.a, e, sl));
+        for (uint32_t e = 0; e < per_lane; ++e) d[e] = matrix_value<T, V>(f.a, e, sl);
       }
     }
   }
@@ -9504,9 +9587,11 @@ struct Machine {
       for (uint32_t e = 0; e < per_lane; ++e) {
         // gfx950's sparse forms, whose B is eight registers, split it (as the reference does)
         const uint32_t kb = f.b_split ? e / half * (s.k / 2) + L.g * half + e % half : L.g * per_lane + e;
-        double v = matrix_elem<T>(f.b, e, lane);
-        if (f.scaled) v *= f.sb[lane];
-        bp[matrix_b_at<Int>(plan, s, lane, kb)] = static_cast<V>(v);
+        if (f.scaled) {
+          bp[matrix_b_at<Int>(plan, s, lane, kb)] = static_cast<V>(matrix_elem<T>(f.b, e, lane) * f.sb[lane]);
+        } else {
+          bp[matrix_b_at<Int>(plan, s, lane, kb)] = matrix_value<T, V>(f.b, e, lane);
+        }
       }
     }
   }
@@ -9637,8 +9722,15 @@ struct Machine {
       return true;
     }
     plan.fa.resize(asz), plan.fbk.resize(bsz), plan.fc.resize(tile_c), plan.fo.resize(tile_c);
-    bool ok = matrix_by_type(ta, [&](auto tag) { matrix_decode_a<decltype(tag)::value, double>(f, plan.fa.data()); });
-    ok = ok && matrix_by_type(tb, [&](auto tag) { matrix_decode_b<decltype(tag)::value, double, false>(f, plan.fbk.data()); });
+    bool a_identity = true;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) a_identity = a_identity && f.a_lane[lane] == lane;
+    bool ok = true;
+    if (sparse || in.scaled || !a_identity ||
+        !matrix_wide_type(ta, [&](auto tag) { matrix_decode_wide<decltype(tag)::value>(f.a, plan.a_dst, 1, per_lane, plan.fa.data()); }))
+      ok = matrix_by_type(ta, [&](auto tag) { matrix_decode_a<decltype(tag)::value, double>(f, plan.fa.data()); });
+    if (f.b_split || in.scaled ||
+        !matrix_wide_type(tb, [&](auto tag) { matrix_decode_wide<decltype(tag)::value>(f.b, plan.b_dst, s.n, per_lane, plan.fbk.data()); }))
+      ok = ok && matrix_by_type(tb, [&](auto tag) { matrix_decode_b<decltype(tag)::value, double, false>(f, plan.fbk.data()); });
     if (!ok) return false;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint32_t* const place = &plan.c_off[size_t{lane} * outs];

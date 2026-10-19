@@ -330,4 +330,20 @@ VTEST(the_four_wide_and_two_wide_tile_kernels_give_the_same_bits) {
 }
 #endif
 
+#if defined(__SSE2__)
+VTEST(every_binary16_converts_to_the_same_double_four_at_a_time) {
+  uint32_t wrong = 0;
+  for (uint32_t h = 0; h < 65536; h += 4) {
+    __m128d lo, hi;
+    // (the other bits of each 32-bit lane are zero, as the decoder leaves them)
+    vgpu::amd::half4_to_double(_mm_setr_epi32(static_cast<int>(h), static_cast<int>(h + 1), static_cast<int>(h + 2), static_cast<int>(h + 3)), &lo, &hi);
+    double got[4];
+    _mm_storeu_pd(got, lo), _mm_storeu_pd(got + 2, hi);
+    for (uint32_t i = 0; i < 4; ++i)
+      wrong += bits_of(got[i]) != bits_of(vgpu::amd::half_bits_to_double(static_cast<uint16_t>(h + i)));   // NaN payload, quiet bit, zero sign
+  }
+  VCHECK_EQ(wrong, 0u);
+}
+#endif
+
 VTEST_MAIN

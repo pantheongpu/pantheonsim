@@ -37,6 +37,29 @@ inline double half_bits_to_double(uint16_t h) {
 }
 
 
+#if defined(__SSE2__)
+// Four binary16 values (each in the low 16 bits of a 32-bit lane of `u`, the rest zero) as four doubles, in `lo` (the first two)
+// and `hi`: the same doubles half_bits_to_double gives, NaN payloads and the quiet bit included. Done in float, where every
+// binary16 value is exact: a normal number is a rebias of its exponent and a shift of its mantissa, a subnormal is its mantissa
+// times 2^-24, and an infinity or NaN keeps its payload (shifted) under the all-ones exponent; the float to double conversion
+// then widens it (making a signalling NaN quiet, as half_bits_to_double does).
+inline void half4_to_double(__m128i u, __m128d* lo, __m128d* hi) {
+  const __m128i sign = _mm_slli_epi32(_mm_and_si128(u, _mm_set1_epi32(0x8000)), 16);
+  const __m128i em = _mm_and_si128(u, _mm_set1_epi32(0x7FFF));
+  const __m128i e = _mm_srli_epi32(em, 10);
+  // normal (and, with the exponent corrected below, infinity and NaN): (em << 13) + (112 << 23)
+  __m128i bits = _mm_add_epi32(_mm_slli_epi32(em, 13), _mm_set1_epi32(112 << 23));
+  bits = _mm_add_epi32(bits, _mm_and_si128(_mm_cmpeq_epi32(e, _mm_set1_epi32(31)), _mm_set1_epi32(112 << 23)));
+  // zero and subnormal: mantissa * 2^-24 (exact)
+  const __m128 sub = _mm_mul_ps(_mm_cvtepi32_ps(_mm_and_si128(em, _mm_set1_epi32(0x3FF))), _mm_set1_ps(5.9604644775390625e-08f));
+  const __m128i is_sub = _mm_cmpeq_epi32(e, _mm_setzero_si128());
+  bits = _mm_or_si128(_mm_and_si128(is_sub, _mm_castps_si128(sub)), _mm_andnot_si128(is_sub, bits));
+  const __m128 f = _mm_castsi128_ps(_mm_or_si128(bits, sign));
+  *lo = _mm_cvtps_pd(f);
+  *hi = _mm_cvtps_pd(_mm_movehl_ps(f, f));
+}
+#endif
+
 // A product and a sum with the NaN rule of the machine spelled out. Where both operands of an x86 SSE multiply or add are
 // NaNs the result is the first one (the destination register's), and which of two commutative operands the compiler puts
 // there is its choice -- one that differs between loops, and between a scalar and a vectorized form of the same loop. The
