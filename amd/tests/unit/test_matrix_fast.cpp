@@ -29,11 +29,12 @@ const Corpus kCorpora[] = {
     {"isa_corpus_gfx90a.txt", amd::gcn::Target::Gfx90a},   {"isa_corpus_gfx1100.txt", amd::gcn::Target::Gfx1100},
     {"isa_corpus_gfx1201.txt", amd::gcn::Target::Gfx1200}, {"isa_corpus_matrix_gfx942.txt", amd::gcn::Target::Gfx942},
     {"isa_corpus_matrix_gfx950.txt", amd::gcn::Target::Gfx950}, {"isa_corpus_matrix_gfx1100.txt", amd::gcn::Target::Gfx1100},
-    {"isa_corpus_matrix_gfx1201.txt", amd::gcn::Target::Gfx1200},
+    {"isa_corpus_matrix_gfx1201.txt", amd::gcn::Target::Gfx1200}, {"isa_corpus_matrix_gfx1250.txt", amd::gcn::Target::Gfx1250},
+    {"isa_corpus_gfx1250.txt", amd::gcn::Target::Gfx1250},
 };
 
 bool is_matrix(const std::string& text) {
-  return text.rfind("v_mfma", 0) == 0 || text.rfind("v_smfmac", 0) == 0 || text.rfind("v_wmma", 0) == 0;
+  return text.rfind("v_mfma", 0) == 0 || text.rfind("v_smfmac", 0) == 0 || text.rfind("v_wmma", 0) == 0 || text.rfind("v_swmmac", 0) == 0;
 }
 
 // Runs every matrix instruction of the corpora (those that decode) under `seeds` seeds; returns how many digests it compared.

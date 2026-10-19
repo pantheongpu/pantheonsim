@@ -3930,8 +3930,49 @@ struct Machine {
       }
     };
     std::vector<double> arow;
+    // The matrices' elements, decoded once each (a dot product reads K of each of A's row and B's column for every one of the M * N
+    // outputs, and decoding an element looks up its layout, reads its bits and widens them: that was nearly all of the time), and
+    // the sums of products of every block of K (the whole of it, or one scale's) worked out a tile at a time (mfma_math.hpp).
+    const bool tile_decode = matrix_fast;
+    const uint32_t blk = scaled ? block : K, nblk = scaled ? K / block : 1;
+    std::vector<double> parts;      // [block][m][n] float sums of products
+    std::vector<int32_t> iparts;    // [block][m][n] integer ones
+    if (tile_decode) {
+      std::vector<double> adec(size_t{M} * K), bdec(size_t{N} * K);
+      for (uint32_t n = 0; n < N; ++n)
+        for (uint32_t k = 0; k < K; ++k) bdec[size_t{n} * K + k] = element(src_b, fb, lb, n, k, b_signed, 0);
+      for (uint32_t m = 0; m < M; ++m) {
+        if (sparse) {
+          sparse_expand(m, &arow);
+          std::copy(arow.begin(), arow.end(), adec.begin() + size_t{m} * K);
+        } else {
+          for (uint32_t k = 0; k < K; ++k) adec[size_t{m} * K + k] = element(src_a, fa, la, m % 16, k, a_signed, M == 32 && m >= 16 ? 8 : 0);
+        }
+      }
+      if (int_out) {
+        iparts.resize(size_t{nblk} * M * N);
+        std::vector<int16_t> ia(size_t{M} * blk), bi(size_t{blk} * N);
+        for (uint32_t b = 0; b < nblk; ++b) {
+          for (uint32_t m = 0; m < M; ++m)
+            for (uint32_t k = 0; k < blk; ++k) ia[size_t{m} * blk + k] = static_cast<int16_t>(adec[size_t{m} * K + b * blk + k]);
+          for (uint32_t k = 0; k < blk; ++k)
+            for (uint32_t n = 0; n < N; ++n) bi[((size_t{k} >> 1) * N + n) * 2 + (k & 1)] = static_cast<int16_t>(bdec[size_t{n} * K + b * blk + k]);
+          mfma_tile_int(M, N, blk, ia.data(), bi.data(), iparts.data() + size_t{b} * M * N);
+        }
+      } else {
+        parts.resize(size_t{nblk} * M * N);
+        std::vector<double> ab(size_t{M} * blk), bk(size_t{blk} * N), zero(size_t{M} * N, 0.0);
+        for (uint32_t b = 0; b < nblk; ++b) {
+          for (uint32_t m = 0; m < M; ++m)
+            for (uint32_t k = 0; k < blk; ++k) ab[size_t{m} * blk + k] = adec[size_t{m} * K + b * blk + k];
+          for (uint32_t k = 0; k < blk; ++k)
+            for (uint32_t n = 0; n < N; ++n) bk[size_t{k} * N + n] = bdec[size_t{n} * K + b * blk + k];
+          mfma_tile_f<WMMA_ORDER>(M, N, blk, ab.data(), bk.data(), zero.data(), parts.data() + size_t{b} * M * N);
+        }
+      }
+    }
     for (uint32_t m = 0; m < M; ++m) {
-      if (sparse) sparse_expand(m, &arow);
+      if (sparse && !tile_decode) sparse_expand(m, &arow);
       for (uint32_t n = 0; n < N; ++n) {
         uint32_t lane, reg, half;
         place(d_half, m, n, &lane, &reg, &half);
@@ -3947,11 +3988,16 @@ struct Machine {
           const uint32_t k_lo = scaled ? b * block : 0, k_hi = scaled ? k_lo + block : K;
           double part = 0;
           int64_t ipart = 0;
+          if (tile_decode) {
+            if (int_out) ipart = iparts[(size_t{b} * M + m) * N + n];
+            else part = parts[(size_t{b} * M + m) * N + n];
+          } else {
           for (uint32_t k = k_lo; k < k_hi; ++k) {
             const double a = sparse ? arow[k] : element(src_a, fa, la, mm, k, a_signed, a_base);
             const double bv = element(src_b, fb, lb, n, k, b_signed, 0);
             if (int_out) ipart += static_cast<int64_t>(a) * static_cast<int64_t>(bv);
-            else part += a * bv;
+            else part = mfma_add_o<WMMA_ORDER>(part, mfma_mul_o<WMMA_ORDER>(a, bv));   // (the recorded operand order, not the compiler's choice)
+          }
           }
           if (int_out) isum += ipart;
           else if (scaled) acc_blocks += part * scale_of(in.src[3], true, m, b) * scale_of(in.src[4], false, n, b);

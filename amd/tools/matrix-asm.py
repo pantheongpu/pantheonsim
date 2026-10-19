@@ -116,7 +116,45 @@ def wmma_lines():
     return out
 
 
-lines = mfma_lines() + smfmac_lines() if mcpu in ('gfx942', 'gfx950') else wmma_lines()
+def wmma1250_lines():
+    """gfx1250 (CDNA 5): the 16-lane-wide WMMA family; llvm-mc keeps what it accepts (see the file's header)."""
+    out = []
+    # (name, A regs, B regs, D regs, sparse)
+    forms = [('f32_16x16x4_f32', 2, 2, 8), ('f32_16x16x32_f16', 8, 8, 8), ('f32_16x16x32_bf16', 8, 8, 8),
+             ('f16_16x16x32_f16', 8, 8, 4), ('bf16_16x16x32_bf16', 8, 8, 4), ('bf16f32_16x16x32_bf16', 8, 8, 4),
+             ('i32_16x16x64_iu8', 8, 8, 8)]
+    for a8 in ('fp8', 'bf8'):
+        for b8 in ('fp8', 'bf8'):
+            forms.append((f'f32_16x16x64_{a8}_{b8}', 8, 8, 8))
+            forms.append((f'f16_16x16x64_{a8}_{b8}', 8, 8, 4))
+            forms.append((f'f32_16x16x128_{a8}_{b8}', 16, 16, 8))
+            forms.append((f'f16_16x16x128_{a8}_{b8}', 16, 16, 4))
+    for n, a, b, d in forms:
+        mn = f'v_wmma_{n}'
+        out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 40)}, 0')
+        out.append(f'{mn} {regs(d, 8)}, {regs(a, 16)}, {regs(b, 40)}, {regs(d, 8)}')
+        if 'iu' in n:
+            out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 40)}, {regs(d, 0)} neg_lo:[1,1,0]')
+            out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 40)}, {regs(d, 0)} neg_lo:[0,1,0]')
+        else:
+            out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 40)}, 1.0')
+            out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 40)}, {regs(d, 0)} neg_lo:[0,0,1]')
+    for sc in ('', 'scale_', 'scale16_'):
+        ext = ', v60, v61' if sc == 'scale_' else ', v[60:61], v[62:63]' if sc == 'scale16_' else ''
+        out.append(f'v_wmma_{sc}f32_16x16x128_f8f6f4 {regs(8, 0)}, {regs(16, 16)}, {regs(16, 40)}, {regs(8, 0)}{ext}')
+        for fa, na, fb, nb in (('BF8', 16, 'BF8', 16), ('FP6', 12, 'FP6', 12), ('BF6', 12, 'FP4', 8), ('FP4', 8, 'FP4', 8), ('FP4', 8, 'BF8', 16)):
+            out.append(f'v_wmma_{sc}f32_16x16x128_f8f6f4 {regs(8, 0)}, {regs(na, 16)}, {regs(nb, 40)}, {regs(8, 0)}{ext} matrix_a_fmt:MATRIX_FMT_{fa} matrix_b_fmt:MATRIX_FMT_{fb}')
+        out.append(f'v_wmma_{sc}f32_16x16x128_f8f6f4 {regs(8, 0)}, {regs(16, 16)}, {regs(16, 40)}, 0{ext}')
+        out.append(f'v_wmma_{sc}f32_32x16x128_f4 {regs(16, 0)}, {regs(16, 16)}, {regs(8, 40)}, {regs(16, 0)}{ext}')
+    for n, a, b, d in (('f32_16x16x64_f16', 8, 16, 8), ('f32_16x16x64_bf16', 8, 16, 8), ('f16_16x16x64_f16', 8, 16, 4),
+                       ('bf16_16x16x64_bf16', 8, 16, 4), ('f32_16x16x128_fp8_fp8', 16, 32, 8), ('f32_16x16x128_fp8_bf8', 16, 32, 8),
+                       ('f32_16x16x128_bf8_fp8', 16, 32, 8), ('f32_16x16x128_bf8_bf8', 16, 32, 8), ('i32_16x16x128_iu8', 16, 32, 8)):
+        out.append(f'v_swmmac_{n} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 40)}, v70')
+        out.append(f'v_swmmac_{n} {regs(d, 8)}, {regs(a, 16)}, {regs(b, 40)}, v71 index_key:1')
+    return out
+
+
+lines = mfma_lines() + smfmac_lines() if mcpu in ('gfx942', 'gfx950') else wmma1250_lines() if mcpu == 'gfx1250' else wmma_lines()
 print('.text')
 for l in lines:
     print('\t' + l)

@@ -40,6 +40,7 @@ const Corpus kCorpora[] = {
     // The matrix instructions (amd/tools/matrix-asm.py), every MFMA, SMFMAC and WMMA form the interpreter has, recorded from f81cc0c1.
     {"isa_corpus_matrix_gfx942.txt", amd::gcn::Target::Gfx942}, {"isa_corpus_matrix_gfx950.txt", amd::gcn::Target::Gfx950},
     {"isa_corpus_matrix_gfx1100.txt", amd::gcn::Target::Gfx1100}, {"isa_corpus_matrix_gfx1201.txt", amd::gcn::Target::Gfx1200},
+    {"isa_corpus_matrix_gfx1250.txt", amd::gcn::Target::Gfx1250},
 };
 
 std::vector<std::string> lines_of(const std::string& path) {

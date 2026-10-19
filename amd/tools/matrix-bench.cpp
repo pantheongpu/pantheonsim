@@ -32,7 +32,8 @@ int main(int argc, char** argv) {
                        {"isa_corpus_gfx90a.txt", amd::gcn::Target::Gfx90a}, {"isa_corpus_gfx1100.txt", amd::gcn::Target::Gfx1100},
                        {"isa_corpus_gfx1201.txt", amd::gcn::Target::Gfx1200}, {"isa_corpus_gfx1250.txt", amd::gcn::Target::Gfx1250},   // (slow: BENCH_1250=1)
                        {"isa_corpus_matrix_gfx942.txt", amd::gcn::Target::Gfx942}, {"isa_corpus_matrix_gfx950.txt", amd::gcn::Target::Gfx950},
-                       {"isa_corpus_matrix_gfx1100.txt", amd::gcn::Target::Gfx1100}, {"isa_corpus_matrix_gfx1201.txt", amd::gcn::Target::Gfx1200}};
+                       {"isa_corpus_matrix_gfx1100.txt", amd::gcn::Target::Gfx1100}, {"isa_corpus_matrix_gfx1201.txt", amd::gcn::Target::Gfx1200},
+                       {"isa_corpus_matrix_gfx1250.txt", amd::gcn::Target::Gfx1250}};
   struct Row {
     std::string text, file;
     double ns;
