@@ -24,6 +24,9 @@ nvcc -std=c++14 -arch=sm_86 -Wno-deprecated-gpu-targets -cudart shared \
      -o "$out/ipc" || { echo "FAIL: compile"; exit 1; }
 if ! require_shim_libs "$shim" "$out/ipc"; then exit 0; fi
 
+# Under a sanitizer the two processes take several times as long; wait for each other for five minutes.
+[[ -n $(shim_sanitizer "$shim") ]] && export IPC_WAIT_SECONDS="${IPC_WAIT_SECONDS:-300}"
+
 run() { VGPU_QUIET=1 VGPU_GPU=nvidia/a10 VGPU_VRAM_MB=256 \
         VGPU_TELEMETRY_PATH="$out/run" VGPU_STATE_DIR="$out/state" \
         LD_LIBRARY_PATH="$shim" "$out/ipc" "$@"; }

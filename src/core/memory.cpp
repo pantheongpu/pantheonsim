@@ -126,13 +126,13 @@ std::ostream& operator<<(std::ostream& os, Hex h) {
 
 }  // namespace
 
-uint64_t MemoryManager::alloc(uint64_t size) {
+uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
   ExclusiveGuard table_guard(table_lock_.get());
   if (size == 0) throw Error::make(Err::InvalidValue, "cudaMalloc-style allocation of 0 bytes is invalid");
   if (used_ + size > capacity_ || used_ + size < used_)
     throw Error::make(Err::OutOfMemory, "device out of memory: requested ", size, " bytes, ", used_,
                       " of ", capacity_, " bytes already in use");
-  const uint64_t align = std::max(alloc_align_, page_);
+  const uint64_t align = std::max({alloc_align_, page_, request});
   uint64_t base = (next_va_ + align - 1) / align * align;
   uint64_t padded = (size + align - 1) / align * align;
   next_va_ = base + padded;

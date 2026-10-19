@@ -46,7 +46,8 @@ hipError_t destroying(const char* name, uint64_t object) {   // none is ever mad
 
 // has_images (hip_api.cpp): whether a device has texture units.
 im::Gen image_gen(const vgpu::DeviceProfile& p) {
-  return p.gcn_arch.rfind("gfx10", 0) == 0 ? im::Gen::Gfx10
+  return p.gcn_arch == "gfx90a" ? im::Gen::Gfx9
+         : p.gcn_arch.rfind("gfx10", 0) == 0 ? im::Gen::Gfx10
          : p.gcn_arch.rfind("gfx11", 0) == 0 ? im::Gen::Gfx11
                                               : im::Gen::Gfx12;
 }
