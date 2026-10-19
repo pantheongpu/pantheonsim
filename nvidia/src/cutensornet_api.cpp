@@ -1886,8 +1886,10 @@ Status info_get(Info* info, int attr, void* buffer, size_t size, const char* api
     case CUTENSORNET_CONTRACTION_OPTIMIZER_INFO_PATH: {
       if (size != sizeof(cutensornetContractionPath_t)) return fail(CUTENSORNET_STATUS_INVALID_VALUE, api, "size mismatch");
       auto* cp = static_cast<cutensornetContractionPath_t*>(buffer);
+      // The caller's numContractions is not read: NVIDIA's library fills data with every pair of the path, and
+      // callers (Cytnx) pass 0 there with a buffer of numInputs pairs.
       if (cp->data)
-        for (size_t i = 0; i < p.steps.size() && (int32_t)i < cp->numContractions; ++i)
+        for (size_t i = 0; i < p.steps.size(); ++i)
           cp->data[i] = cutensornetNodePair_t{p.steps[i].first, p.steps[i].second};
       cp->numContractions = (int32_t)p.steps.size();
       return CUTENSORNET_STATUS_SUCCESS;
