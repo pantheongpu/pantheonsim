@@ -1,11 +1,12 @@
 // The AMD tier (amd/src/gcn_tier.cpp) against the interpreter, bit for bit: every instruction shape of the ISA corpora
 // that has a tier handler is run on pseudo-random state both ways (tier off, tier on) and the digests of everything the
 // instruction changed -- registers, masks, SCC, the program counter, LDS, memory, the instruction counts, or the error it
-// threw -- must agree. Ten flavours of state (any bits; small integers; floats with the specials and NaNs; half the lanes
-// off; NaN-free floats, so the fast path runs rather than hands the instruction back; the same with half the lanes off; and
-// two that put a second wave in the work-group and loads in flight, for the store gate and the waits: any bits, and small
-// integers with half the lanes off; and, for the flat and global accesses, two that point the address registers into memory that
-// exists, in consecutive lanes and scattered) and three seeds each (VGPU_TIER_SEEDS=n for more).
+// threw -- must agree. Flavours of state: 0 any bits, 1 small integers, 2 floats with the specials and NaNs, 3 half the lanes
+// off, 4 (the matrix probe's) small finite numbers; and the tier's six, 10 and 11 NaN-free floats (11 with half the lanes off, so
+// the fast path runs rather than hands the instruction back), 12 and 13 a second wave in the work-group and loads in flight, for
+// the store gate and the waits (any bits; small integers with half the lanes off), and, for the flat and global accesses only, 14
+// and 15, which point the address registers into memory that exists, in consecutive lanes and scattered (5 to 9 do not exist).
+// Three seeds each (VGPU_TIER_SEEDS=n for more).
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -75,8 +76,9 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
       // (A branch the corpus holds goes where it was: send it elsewhere, so that taking it shows.)
       if (in.name.rfind("s_branch", 0) == 0 || in.name.rfind("s_cbranch", 0) == 0) in.target = 0x1000;
       for (uint64_t seed = 0; seed < seeds; ++seed)
-        for (uint32_t flavour = 0; flavour < 10; ++flavour) {
-          if (flavour >= 8 && in.enc != amd::gcn::Enc::Flat) continue;   // (the flavours that give a global access real addresses)
+        for (uint32_t flavour = 0; flavour < 16; ++flavour) {
+          if (flavour >= 5 && flavour <= 9) continue;
+          if (flavour >= 14 && in.enc != amd::gcn::Enc::Flat) continue;   // (the flavours that give a global access real addresses)
           amd::gcn::tier::set_enabled(false);
           const uint64_t off = amd::digest_instruction(in, c.target, seed * 7919 + with_handler, flavour);
           amd::gcn::tier::set_enabled(true);

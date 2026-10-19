@@ -3180,10 +3180,10 @@ earlier atomics round took its share) and `v_lshlrev_b32_sdwa`.
 ### Tests (wired into CMake)
 
 * `test_amd_gcn_tier_same_bits` (`amd/tests/unit/test_gcn_tier_same_bits.cpp`): every instruction shape of the eight ISA corpora that has a
-  handler (5,129 of the 15,500 that decode) is run through `amd::digest_instruction` with the tier off and on, in ten flavours of
-  pseudo-random state and three seeds each (125,628 runs each way, about a minute): any bits; small integers; floats with the special values
-  and NaNs; half the lanes off; two flavours of floats without a NaN (`4`, `5`), so that the float handlers run instead of handing back;
-  two (`6`, `7`) that put a second wave in the work-group and loads in flight, for the store gates and `s_waitcnt`; and two (`8`, `9`, for
+  handler (5,129 of the 15,500 that decode) is run through `amd::digest_instruction` with the tier off and on, in eleven flavours of
+  pseudo-random state (numbered 0 to 4 and 10 to 15 after the merge with amdmatrix) and three seeds each (125,628 runs each way, about a minute): any bits; small integers; floats with the special values
+  and NaNs; half the lanes off; two flavours of floats without a NaN (`10`, `11`; the tier's flavours were numbered 4 to 9 on their branch and moved to 10 to 15 on merging, because amdmatrix's probe flavour 4 took that number), so that the float handlers run instead of handing back;
+  two (`12`, `13`) that put a second wave in the work-group and loads in flight, for the store gates and `s_waitcnt`; and two (`14`, `15`, for
   flat and global accesses only) that point the address registers into memory that exists, in consecutive lanes and scattered. The digest
   is everything the instruction changed or threw: all registers, masks, SCC, the program counter, LDS, memory, the wave's yield state,
   the counters and the text of an error. `VGPU_TIER_ONLY=<text>` restricts it to some instructions, `VGPU_TIER_SEEDS=n` runs more seeds.
@@ -3231,8 +3231,8 @@ fail (`FAIL`, with `VGPU_TIER_ONLY` set to the instruction concerned to keep eac
 | M18 | `global_store_short` stores a byte |
 | M19 | a byte access sized as a dword when the runs are found |
 
-M15 (run first, before flavours 8 and 9 existed) passed the real-kernel unit tests (`test_amd_gcn_memory`, `memruns`, `ops`, `lds`) with the
-tier on, and the digest saw no global access with a valid address either (random registers fault): that is why flavours 8 and 9 exist, and
+M15 (run first, before flavours 14 and 15 existed) passed the real-kernel unit tests (`test_amd_gcn_memory`, `memruns`, `ops`, `lds`) with the
+tier on, and the digest saw no global access with a valid address either (random registers fault): that is why flavours 14 and 15 (8 and 9 on the branch) exist, and
 M15 to M19 were run with them.
 
 ### Results

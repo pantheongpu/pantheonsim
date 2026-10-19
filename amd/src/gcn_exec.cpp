@@ -11736,9 +11736,9 @@ uint32_t draw(Rng& r, uint32_t flavour) {
     return v;
   }
   const uint64_t x = r.next();
-  if (flavour == 1 || flavour == 7) return static_cast<uint32_t>(x) & 0xFF;
-  if (flavour == 4 || flavour == 5) {
-    // (The tier's flavours: floats and doubles' halves with every special value but a NaN, so that the fast paths run rather
+  if (flavour == 1 || flavour == 13) return static_cast<uint32_t>(x) & 0xFF;
+  if (flavour == 10 || flavour == 11) {
+    // (The tier's flavours (10 to 15; 4 is the matrix instructions'): floats and doubles' halves with every special value but a NaN, so that the fast paths run rather
     // than hand the instruction back; 5 also switches half the lanes off.)
     static constexpr uint32_t kSpecialNoNan[] = {0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x7F800000u, 0xFF800000u,
                                                  0x00000001u, 0x007FFFFFu, 0x7F7FFFFFu, 0x40490FDBu, 0x3FF00000u, 0x000FFFFFu,
@@ -11783,7 +11783,7 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   g.scratch.assign(size_t{256} * kLanes, 0);
   for (uint8_t& b : g.scratch) b = static_cast<uint8_t>(draw(r, 0));
   k.private_segment = 256;
-  g.waves.resize(flavour == 6 || flavour == 7 ? 2 : 1);   // (flavours 6 and 7: a work-group of two waves, for the store gate and the waits)
+  g.waves.resize(flavour == 12 || flavour == 13 ? 2 : 1);   // (flavours 12 and 13: a work-group of two waves, for the store gate and the waits)
   Wave& w = g.waves[0];
   w.lanes = k.wave32 ? 32 : kLanes;
   w.mode = k.mode;
@@ -11802,17 +11802,17 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   for (auto& row : w.agpr)
     for (uint32_t& v : row) v = draw(r, flavour);
   const uint64_t all = w.lanes == 64 ? ~uint64_t{0} : (uint64_t{1} << w.lanes) - 1;
-  w.exec = (flavour == 3 || flavour == 5 || flavour == 7 ? r.next() : ~uint64_t{0}) & all;
+  w.exec = (flavour == 3 || flavour == 11 || flavour == 13 ? r.next() : ~uint64_t{0}) & all;
   w.vcc = r.next() & all;
   w.m0 = draw(r, flavour);
   w.scc = r.next() & 1;
-  if (flavour >= 8 && in.enc == gcn::Enc::Flat && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+  if (flavour >= 14 && in.enc == gcn::Enc::Flat && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
     // Flavours 8 and 9: a global access whose addresses are inside the region (8: consecutive lanes, 9: scattered words), so that the access
     // happens instead of faulting; 9 also has half the lanes off.
-    if (flavour == 9) w.exec = r.next() & all;
+    if (flavour == 15) w.exec = r.next() & all;
     if (in.has_saddr && in.saddr + 1 < kSgprs) w.sgpr[in.saddr] = static_cast<uint32_t>(region), w.sgpr[in.saddr + 1] = static_cast<uint32_t>(region >> 32);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      const uint64_t off = flavour == 8 ? uint64_t{lane} * 16 : r.next() & 0x7FFC;
+      const uint64_t off = flavour == 14 ? uint64_t{lane} * 16 : r.next() & 0x7FFC;
       if (in.has_saddr) {
         w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(off);
       } else {
@@ -11821,7 +11821,7 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
       }
     }
   }
-  if (flavour == 6 || flavour == 7) w.loads_in_flight = 3 + static_cast<uint32_t>(r.next() & 7);   // (loads to wait for)
+  if (flavour == 12 || flavour == 13) w.loads_in_flight = 3 + static_cast<uint32_t>(r.next() & 7);   // (loads to wait for)
   w.pc = 0;
   Mix64 h;
   std::string error;
