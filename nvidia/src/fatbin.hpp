@@ -178,4 +178,8 @@ bool cubin_linked(const void* data, size_t bytes);
 // reason.
 size_t pick_ptx(const std::vector<FatbinPtx>& ptxs, uint32_t cc);
 
+// Whether one PTX image can be JIT-compiled for a device of compute capability `cc` (pick_ptx's rule:
+// a PTX image runs on its own architecture and newer ones, never on an older one).
+bool ptx_runs_on(const FatbinPtx& ptx, uint32_t cc);
+
 }  // namespace vgpu::cuda

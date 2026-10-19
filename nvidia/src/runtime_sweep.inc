@@ -120,14 +120,15 @@ VGPU_EXPORT cudaError_t cudaDeviceGetTexture1DLinearMaxWidth(size_t* maxWidthInE
 static cudaError_t cudaOccupancyAvailableDynamicSMemPerBlock_traced(size_t* dynamicSmemSize, const void* func, int numBlocks, int blockSize) {
   return guard("cudaOccupancyAvailableDynamicSMemPerBlock", [&](State& s) -> cudaError_t {
     if (!dynamicSmemSize) return cudaErrorInvalidValue;
-    auto it = s.kernels.find(func);
+    auto it = find_kernel(s, func);
     if (it == s.kernels.end()) {
       if (!quiet() && func)
         std::fprintf(stderr, "[vgpu] cudaOccupancyAvailableDynamicSMemPerBlock: unregistered kernel stub %p\n", func);
       return cudaErrorInvalidDeviceFunction;
     }
     KernelInfo& ki = it->second;
-    if (!ki.mod || !registered_ptx(s, *ki.mod)) return cudaErrorInvalidDeviceFunction;
+    if (!ki.mod) return cudaErrorInvalidDeviceFunction;
+    if (!registered_ptx(s, *ki.mod)) return cudaErrorNoKernelImageForDevice;   // built for other GPUs only
     if (numBlocks <= 0 || blockSize <= 0) return cudaErrorInvalidValue;
     vgpu::runtime::Device& dev = current(s);
     const vgpu::DeviceProfile& p = dev.profile();
@@ -193,10 +194,11 @@ VGPU_EXPORT cudaError_t cudaGetExportTable(const void** ppExportTable, const cud
 // on an RTX 3060.
 static cudaError_t cudaGetFuncBySymbol_traced(cudaFunction_t* functionPtr, const void* symbolPtr) {
   return guard("cudaGetFuncBySymbol", [&](State& s) -> cudaError_t {
-    auto it = s.kernels.find(symbolPtr);
+    auto it = find_kernel(s, symbolPtr);
     if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
     KernelInfo& ki = it->second;
-    if (!ki.mod || !registered_ptx(s, *ki.mod)) return cudaErrorInvalidDeviceFunction;
+    if (!ki.mod) return cudaErrorInvalidDeviceFunction;
+    if (!registered_ptx(s, *ki.mod)) return cudaErrorNoKernelImageForDevice;   // built for other GPUs only
     if (!functionPtr) return cudaSuccess;
     using Bind = int (*)(int, uint64_t, const char*, void**, void**);
     static const Bind fn = reinterpret_cast<Bind>(dlsym(RTLD_DEFAULT, "vgpu_driver_function_for_v1"));

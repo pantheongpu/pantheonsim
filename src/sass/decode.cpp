@@ -1747,7 +1747,9 @@ void dec_viadd(Instr& ins, const Word& w) {
 void dec_vimnmx(Instr& ins, const Word& w, int nsrc, bool add) {
   ins.op = add ? Op::VIADDMNMX : nsrc == 3 ? Op::VIMNMX3 : Op::VIMNMX;
   ins.mnemonic = add ? "VIADDMNMX" : nsrc == 3 ? "VIMNMX3" : "VIMNMX";
-  const bool s16x2 = !add && w.bit(73);   // per 16-bit half
+  // Per 16-bit half: VIMNMX, VIMNMX3 and, with the add first, VIADDMNMX (__viaddmax_s16x2,
+  // __viaddmin_u16x2 ...; nvdisasm prints VIADDMNMX.S16x2[.RELU] and VIADDMNMX.U16x2).
+  const bool s16x2 = w.bit(73);
   const bool u8x4 = !add && w.bit(74);    // per byte (sm_120)
   if (s16x2) ins.mods.push_back(w.bit(72) ? "S16x2" : "U16x2");
   else if (u8x4) ins.mods.push_back(w.bit(72) ? "S8x4" : "U8x4");

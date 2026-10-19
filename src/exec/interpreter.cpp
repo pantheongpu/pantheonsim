@@ -7006,7 +7006,7 @@ class Interpreter {
       const Lanes b = op->kind == PackedIntOp::Neg ? Lanes{} : Lanes(read_operand(w, ctx, ins, op->b, _s_b));
       Lanes r;
       const uint32_t bits = op->lane_bits, n = 32 / bits;
-      const uint32_t mask = (1u << bits) - 1;
+      const uint32_t mask = bits >= 32 ? ~0u : (1u << bits) - 1;   // one 32-bit lane for min/max.relu.s32
       const int64_t lo = op->is_signed ? -(int64_t{1} << (bits - 1)) : 0,
                     hi = op->is_signed ? (int64_t{1} << (bits - 1)) - 1 : (int64_t{1} << bits) - 1;
       for (uint32_t lane = 0; lane < W_; ++lane) {

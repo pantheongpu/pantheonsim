@@ -737,7 +737,27 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         uint32_t a = read32(w, ins.src[0], l);
         const uint32_t b = ival(w, ins.src[1], l);
         const auto relu = [&](uint32_t r) { return ins.f[2] && static_cast<int32_t>(r) < 0 ? 0u : r; };
-        if (ins.op == Op::VIADDMNMX) {
+        if (ins.op == Op::VIADDMNMX && s16x2) {
+          // min/max(a + b, c) on each 16-bit half, the sum wrapping in its half (add.s16x2 / add.u16x2
+          // then min/max{.relu}.s16x2, as __viaddmax_s16x2 and the others are written), a negated b
+          // negating each half.
+          const uint32_t c = read32(w, ins.src[2], l), braw = read32(w, ins.src[1], l);
+          uint32_t r = 0;
+          for (unsigned h = 0; h < 2; ++h) {
+            const auto part = [&](uint32_t v) -> int32_t {
+              const uint32_t u = (v >> (16 * h)) & 0xffffu;
+              return sgn ? static_cast<int32_t>(static_cast<int16_t>(u)) : static_cast<int32_t>(u);
+            };
+            const uint32_t bh = ins.src[1].neg ? 0u - ((braw >> (16 * h)) & 0xffffu) : (braw >> (16 * h)) & 0xffffu;
+            const uint32_t sum = (((a >> (16 * h)) & 0xffffu) + bh) & 0xffffu;
+            const int32_t x = sgn ? static_cast<int32_t>(static_cast<int16_t>(sum)) : static_cast<int32_t>(sum);
+            const int32_t y = part(c);
+            int32_t m = mn ? std::min(x, y) : std::max(x, y);
+            if (ins.f[2] && m < 0) m = 0;   // .RELU: a negative lane becomes 0
+            r |= (static_cast<uint32_t>(m) & 0xffffu) << (16 * h);
+          }
+          write32(w, ins.dst[0], l, r);
+        } else if (ins.op == Op::VIADDMNMX) {
           write32(w, ins.dst[0], l, relu(pick(a + b, read32(w, ins.src[2], l), mn)));
         } else if (!s16x2) {
           const uint32_t r = pick(a, b, mn);
