@@ -3612,3 +3612,186 @@ ROCm libraries or cards. Among them `test_amd_gcn_same_bits`, `_packed_same_bits
 `test_amd_codeobject_same_bits`, `test_amd_matrix_fast`, `test_amd_gcn_threads*`, `test_amd_hip_queue`, `test_amd_gcn_thread_refused`,
 `test_amd_hip_thread_refused`, `bench_amd_counters`. The NVIDIA tests that share code (`test_memory`, `test_memrmw*`, `test_worker_pool`,
 `test_fastpath`, `test_exec*`): 8 of 8.
+
+
+## The speedup branch merged with origin/main (#382, #400) (branch `speedup6-main`)
+
+`speedup` bb46caaf with origin/main ab904cbc: "AMD: gfx942/gfx950 guide sweep, gfx90a images, hostcall, PC sampling, RVS, vLLM graphs"
+(#382, which changed the behaviour of many instructions and edited `gcn_exec.cpp` inside the old if-ladders) and #400 (cuTensorNet).
+
+**How the 32 conflicts of `gcn_exec.cpp` were merged.** `amd/tools/ladder-to-switch.py` is a deterministic rewrite, so the file was merged three
+ways *after* it: the merge base's ladders converted, origin/main's converted, and `speedup`'s file (already converted), `git merge-file`
+over the three. That took the 32 hunks down to 21, all real: the decoded memory facts of amdmemtext against #382's text-based memory code, the
+tile MFMA code of amdmatrix against #382's MFMA changes, the SOPP switch against new SOPP rungs, `Machine::step`, and the packed and conversion
+paths. Each was written by hand keeping both sides (and the build script's two `for src in` lists were joined).
+
+**The golden digests were re-recorded, from origin/main plus the probe only.** The arbiter is origin/main ab904cbc with the probe functions
+(`digest_instruction`, `digest_memory_instruction`, `time_instruction`, and stubs of `set_matrix_fast_path`) added and nothing else
+(the same four test programs, built there). Against the committed digests, run on the *old* corpora (so that every seed and position
+is the same), the arbiter differs from them in 1,044 of 16,304 `same_bits` shapes, 336 of 2,143 `packed_same_bits` shapes and 66 of
+15,566 `memory_same_bits` shapes; every one is a thing #382 changed on purpose:
+
+| family (shapes changed) | what #382 did |
+| --- | --- |
+| MFMA and SMFMAC, 639 | CBSZ/ABID checks and BLGP lane permutations, the f8f6f4 K layout, denormal flush of float inputs, sparse products skipping pruned places, the lane layout of several-block forms |
+| `v_div_scale`, `v_div_fmas`, `v_div_fixup` f16/f32/f64, 193 | the division sequence of the guides' pseudocode (`gcn_divide.hpp`) |
+| SOPP corpus, 60 | `s_setkill`, `s_sethalt`, `s_set_gpr_idx_mode`, `s_cbranch_cdbg*`, `s_incperflevel`, VSKIP, ... |
+| memory, 43 + 66 | 64-bit and `cond_sub`/`sub_clamp` atomics, ADDTID, buffer loads into LDS, scalar buffer stores and atomics |
+| `v_dot2*` 10 + 237, `v_cvt_f32_f16` 40 + 39, `v_sin`/`v_cos` 4 + 60, min/max, `v_fma_f16`, omod | the guides' denormal flush, `abs` of a NaN, `v_sin`/`v_cos` in turns, omod ignored by MODE |
+| scalar, 27 | `s_movrel*`, `s_round_mode`, `s_max` SCC on a tie, ... |
+
+#382 also grew the corpora (`isa_corpus.txt`, `_gfx90a`, `_gfx950`, `_images_gfx90a`: 16,806 shapes now, 502 more), and the seed of a
+shape is its position, so `same_bits_digests.txt` and `mem_same_bits_digests.txt` are re-recorded whole from the arbiter, `packed_same_bits_digests.txt`
+whole as well (its corpus did not change; 336 digests did), and `codeobject_digests.txt` from the arbiter with the six entries of `speedup`'s own
+code objects kept (one hipcc object's digest differs: #382 rebuilt it). The merged tree passes all of them as they are committed; the arbiter
+build, the old-corpora run and the recorded files are the evidence, and no digest was taken from this tree.
+
+**What the merge itself broke, found by those digests and the tests**, each fixed without touching a golden file:
+* GCC's operand order for two NaNs or two zeros moved (the trap of every round): `wmma1250`'s scaled products and sums, the packed min and max
+  on RDNA and gfx90a, `v_dot2_f32_f16` and `v_dot2c_f32_f16` (one order for the guides' flushing path, another for the rest) are pinned (`first_mul`,
+  `first_add`, `pk_fminf`, `pk_fmaxf`); `v_maxmin_f32` and its kin call libm's `fminf`/`fmaxf` explicitly, as the recorded build did.
+* `v_cvt_f32_f16` with `|x|`: `lane_half_f` cleared the sign of a NaN by comparison; #382 clears the bit.
+* `gfx9_added_alu` renames an instruction (`v_mad_legacy_u16` to `v_mad_u16`): the copy is now `finalize`d (the hash and the flags are of the name).
+* The matrix tile path hands to the reference whatever #382 changed in the reference: the small-float and scaled forms, CBSZ past the blocks, BLGP,
+  several blocks with several groups of K a lane; a sparse tile whose B has a NaN or infinity, a float tile with a denormal input (flush); EXEC is
+  ignored, as it is on the card. (`v_mfma_*_f8f6f4` and the scaled forms run at the reference's speed until the tile code learns the new K layout.)
+* The tier: no handler where gfx942/gfx950 apply or ignore an output modifier or a clamp, `s_max_*` SCC on a tie has its own handlers there, `v_lshl_add_u64`
+  has a guide-architecture one (count over 4 is zero), and no tier while PC sampling is attached or VSKIP is set.
+* `dot2_f16_wave` (amdlibs' whole-wave dot product) is not used on gfx942/gfx950, whose dot products flush denormals.
+* A tbuffer instruction through the private segment buffer stays refused, as in origin/main and the base (amdmemtext's decoded facts would have run it;
+  the corpora now have the shape).
+* `ds_append`/`ds_consume` run (#382 models them); amdcorrect's "not modelled" guard lets them through, and its test says so. The decoded memory
+  facts know the new names (`cond_sub`, `sub_clamp`, ADDTID, `s_buffer_*`, the volatile cache forms).
+
+**Tests** (server2, Release, each with `VGPU_AMD_TIER=1` and `=0`): `ctest -R "amd|gcn|rocprof|hipcc|hip_|memrmw|memruns|mem_facts|mfma|packed|matrix|tier|bench_amd|hostcall|pcsampl|rvs|vllm|graph|pytorch"`,
+310 tests; the same three fail as on `speedup` and on origin/main (`amd_rocprofiler_abi`, `amd_rocprofv3`, `amd_tools`: this host's ROCm and user
+namespaces); the vLLM, PyTorch and `amd_rvs` ones are skipped for want of the packages. #382's own (`test_amd_gcn_cdna_gaps`, `test_amd_gcn_divide`,
+`test_amd_hostcall`, `test_amd_rocprofiler_pcsampling*`, and the new programs of `amd_hipcc`) pass. #400's and the shared NVIDIA ones
+(`e2e_cutensornet_*`, `e2e_ipc`, `test_memory`, `test_memrmw*`, `test_worker_pool`, `test_fastpath`, `test_exec*`, `e2e_sass_tier`): 24 of 24.
+
+**A/B** (`tools/bench-amd`, 9 runs alternating, 1 thread and all threads, CPUs 24-31 under `flock`, full size, `--no-counts` because origin/main has no probe;
+`counters identical: yes` in every row; p < 0.001 except `startup`): the merged tree against a build of origin/main ab904cbc, and (one thread) against
+`speedup` bb46caaf, to see what the merge cost. Ratio of the medians, > 1 is faster.
+
+| workload | target | thr | merged / origin/main ab904cbc | merged / speedup bb46caaf (1 thread) |
+| --- | --- | ---: | ---: | ---: |
+| valu_int | mi300x | 1 | 20.22 | 0.99 |
+| valu_int | mi300x | all | 20.38 |  |
+| valu_int | rx6800 | 1 | 18.04 | 1.00 |
+| valu_int | rx6800 | all | 17.87 |  |
+| valu_f32 | mi300x | 1 | 21.32 | 1.04 |
+| valu_f32 | mi300x | all | 21.08 |  |
+| valu_f32 | rx6800 | 1 | 16.65 | 0.99 |
+| valu_f32 | rx6800 | all | 17.52 |  |
+| valu_f64 | mi300x | 1 | 9.30 | 0.91 |
+| valu_f64 | mi300x | all | 9.37 |  |
+| valu_f64 | rx6800 | 1 | 13.89 | 0.95 |
+| valu_f64 | rx6800 | all | 13.89 |  |
+| mfma | mi300x | 1 | 7.53 | 0.95 |
+| mfma | mi300x | all | 7.58 |  |
+| mfma_i8 | mi300x | 1 | 7.39 | 1.00 |
+| mfma_i8 | mi300x | all | 7.53 |  |
+| mfma_fp8 | mi300x | 1 | 9.12 | 0.94 |
+| mfma_fp8 | mi300x | all | 9.09 |  |
+| mfma_bf16 | mi300x | 1 | 6.22 | 0.94 |
+| mfma_bf16 | mi300x | all | 6.29 |  |
+| mfma_f64 | mi300x | 1 | 5.04 | 0.99 |
+| mfma_f64 | mi300x | all | 4.59 |  |
+| smfmac | mi300x | 1 | 7.11 | 0.89 |
+| smfmac | mi300x | all | 7.26 |  |
+| mem | mi300x | 1 | 5.85 | 0.98 |
+| mem | mi300x | all | 5.88 |  |
+| mem | rx6800 | 1 | 7.14 | 0.99 |
+| mem | rx6800 | all | 7.21 |  |
+| lds | mi300x | 1 | 11.31 | 0.98 |
+| lds | mi300x | all | 11.73 |  |
+| lds | rx6800 | 1 | 9.45 | 0.94 |
+| lds | rx6800 | all | 9.60 |  |
+| narrow | mi300x | 1 | 2.92 | 0.96 |
+| narrow | mi300x | all | 3.04 |  |
+| narrow | rx6800 | 1 | 3.80 | 0.99 |
+| narrow | rx6800 | all | 3.85 |  |
+| smem | mi300x | 1 | 8.69 | 0.89 |
+| smem | mi300x | all | 8.88 |  |
+| smem | rx6800 | 1 | 8.69 | 0.81 |
+| smem | rx6800 | all | 8.73 |  |
+| buf | mi300x | 1 | 2.69 | 1.01 |
+| buf | mi300x | all | 2.76 |  |
+| buf | rx6800 | 1 | 3.27 | 1.00 |
+| buf | rx6800 | all | 3.30 |  |
+| ldsx | mi300x | 1 | 27.56 | 0.95 |
+| ldsx | mi300x | all | 28.99 |  |
+| ldsx | rx6800 | 1 | 22.95 | 0.95 |
+| ldsx | rx6800 | all | 23.79 |  |
+| flat | mi300x | 1 | 6.67 | 0.95 |
+| flat | mi300x | all | 6.70 |  |
+| flat | rx6800 | 1 | 7.85 | 0.92 |
+| flat | rx6800 | all | 7.85 |  |
+| atomics | mi300x | 1 | 4.28 | 0.98 |
+| atomics | mi300x | all | 24.35 |  |
+| atomics | rx6800 | 1 | 5.86 | 1.01 |
+| atomics | rx6800 | all | 16.89 |  |
+| divergent | mi300x | 1 | 12.94 | 1.00 |
+| divergent | mi300x | all | 12.87 |  |
+| divergent | rx6800 | 1 | 13.89 | 1.00 |
+| divergent | rx6800 | all | 13.88 |  |
+| wave | mi300x | 1 | 18.76 | 0.97 |
+| wave | mi300x | all | 18.60 |  |
+| wave | rx6800 | 1 | 16.99 | 1.00 |
+| wave | rx6800 | all | 16.85 |  |
+| launch | mi300x | 1 | 1.44 | 1.00 |
+| launch | mi300x | all | 1.44 |  |
+| launch | rx6800 | 1 | 1.48 | 1.00 |
+| launch | rx6800 | all | 1.47 |  |
+| api | mi300x | 1 | 3.21 | 1.00 |
+| api | mi300x | all | 3.35 |  |
+| api | rx6800 | 1 | 3.33 | 1.01 |
+| api | rx6800 | all | 3.34 |  |
+| apicheap | mi300x | 1 | 1.11 | 0.98 |
+| apicheap | mi300x | all | 1.09 |  |
+| apicheap | rx6800 | 1 | 1.11 | 0.99 |
+| apicheap | rx6800 | all | 1.10 |  |
+| launch_wide | mi300x | 1 | 4.27 | 1.01 |
+| launch_wide | mi300x | all | 3.25 |  |
+| launch_wide | rx6800 | 1 | 4.08 | 1.02 |
+| launch_wide | rx6800 | all | 3.17 |  |
+| launch_mid | mi300x | 1 | 4.26 | 1.02 |
+| launch_mid | mi300x | all | 6.31 |  |
+| launch_mid | rx6800 | 1 | 4.09 | 1.01 |
+| launch_mid | rx6800 | all | 5.46 |  |
+| launch_sync | mi300x | 1 | 2.15 | 1.00 |
+| launch_sync | mi300x | all | 2.20 |  |
+| launch_sync | rx6800 | 1 | 2.10 | 1.00 |
+| launch_sync | rx6800 | all | 2.10 |  |
+| memcpy | mi300x | 1 | 2.17 | 1.01 |
+| memcpy | mi300x | all | 2.18 |  |
+| memcpy | rx6800 | 1 | 2.18 | 0.99 |
+| memcpy | rx6800 | all | 2.19 |  |
+| stream | mi300x | 1 | 1.47 | 0.99 |
+| stream | mi300x | all | 1.44 |  |
+| stream | rx6800 | 1 | 1.63 | 0.98 |
+| stream | rx6800 | all | 1.55 |  |
+| graph | mi300x | 1 | 1.91 | 1.01 |
+| graph | mi300x | all | 1.91 |  |
+| graph | rx6800 | 1 | 1.86 | 1.01 |
+| graph | rx6800 | all | 1.87 |  |
+| startup | mi300x | 1 | 1.06 | 1.09 |
+| startup | mi300x | all | 1.07 |  |
+| startup | rx6800 | 1 | 1.02 | 0.99 |
+| startup | rx6800 | all | 1.02 |  |
+| wmma | rx7900xtx | 1 | 26.52 | |
+| wmma | rx7900xtx | all | 26.82 | |
+| wmma | rx9070xt | 1 | 27.66 | |
+| wmma | rx9070xt | all | 28.24 | |
+| wmma_iu8 | rx7900xtx | 1 | 10.34 | |
+| wmma_iu8 | rx7900xtx | all | 10.52 | |
+| wmma_iu8 | rx9070xt | 1 | 7.46 | |
+| wmma_iu8 | rx9070xt | all | 7.77 | |
+
+Against origin/main every workload is faster (startup within noise); #382's guide sweep made main slower than the `speedup` pieces' baseline f81cc0c1
+on the gfx942 workloads (the ratios are larger than the 2-11 x of the pieces). Against `speedup` before the merge, the gfx942 and RX 6800 rows
+lost 3 to 19 % (`smem` 11 % and 19 %, `smfmac` 11 %, `valu_f64` on the MI300X 9 %, `flat` on the RX 6800 8 %, the MFMA rows 5 to 6 %,
+`lds` and `ldsx` 5 to 6 %): the checks #382 added to the interpreter's `step` (PC sampling, VSKIP), the denormal flushes and the omod/clamp rules of the guides, and
+the tile path's declines. Not profiled further. The first run of this A/B had `mem` and `flat` on the MI300X at 0.46 x and 0.48 x and
+`launch_wide`/`launch_mid` at 0.68 x: the tier had been told not to run `v_lshl_add_u64` on gfx942, which the address arithmetic of those kernels uses;
+it has a handler now.
