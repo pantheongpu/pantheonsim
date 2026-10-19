@@ -9613,11 +9613,52 @@ struct Machine {
     }
   }
 
+#include "gcn_tier_machine.inc"
+  // The pre-decoded tier (amd/src/gcn_tier.cpp): the instruction's handler, when the tier is on and the wave is in a state it
+  // models (no VGPR indexing or MSBs, MODE at its default, no tracing, no debugger). A handler does the whole instruction or
+  // nothing; what step() would have counted before running it is counted here.
+  // Returns 0 when the interpreter is to run the instruction, 1 when it is done, 2 when it is done and the wave gives up its turn.
+  int tier_step(Wave& w, Group& g, const Inst& in) {
+    if (!gcn::tier::enabled() || w.vgpr_msb || w.gpr_idx || !FloatMode::is_default(w.mode) || tracing() || debug::active()) return 0;
+    if (in.fast.mach) return in.fast.mach == 3 ? tier_barrier(w, in) : tier_global(w, g, in);
+    gcn::tier::Regs r{reinterpret_cast<uint32_t (*)[64]>(w.vgpr.r.data()), w.sgpr, &w.vcc, &w.exec, &w.pc, &w.scc, w.lanes,
+                      &w.loads_in_flight, &w.soft_yield, static_cast<uint32_t>(g.waves.size()), &w.store_gate, g.lds.data(), g.lds.size(),
+                      in.target};
+    w.pc += in.size;
+    const int done = in.fast.run(in.fast, r);
+    if (done == 3) {   // a plain store's first of a round: the other waves go first, and nothing of this instruction has happened
+      w.pc -= in.size;
+      return 2;
+    }
+    if (!done) {
+      w.pc -= in.size;
+      gcn::tier::note_bail();
+      if (gcn::tier::stats()) gcn::tier::note_interp(in.name.c_str(), true);
+      return 0;
+    }
+    InstructionCounts& c = stats.counts;
+    ++c.mix[static_cast<int>(in.mix)];
+    c.mops[static_cast<int>(in.mops_type)] += in.mops;
+    ++stats.instructions;
+    switch (in.fast.unit) {
+      case gcn::tier::kUnitValu: ++c.valu; break;
+      case gcn::tier::kUnitSalu: ++c.salu; break;
+      case gcn::tier::kUnitBranch: ++c.branch; break;
+      case gcn::tier::kUnitLds: ++c.lds; break;
+      default: break;
+    }
+    return done;
+  }
   bool step(Wave& w, Group& g) {
     if (debug::active() &&
         debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
       debug_stop(w, g);
     const Inst& decoded = fetch(w.pc);
+    if (decoded.fast.run) {
+      if (const int t = tier_step(w, g, decoded)) return t == 1;
+    } else if (gcn::tier::stats() && gcn::tier::enabled()) {
+      gcn::tier::note_interp(decoded.name.c_str(), false);
+    }
     // gfx1250's vector register numbers past v255: the instruction as it names them with the wave's MSBs on.
     Inst remapped;
     const bool vector_enc = decoded.enc == gcn::Enc::Vop1 || decoded.enc == gcn::Enc::Vop2 || decoded.enc == gcn::Enc::Vop3 ||
@@ -10754,7 +10795,17 @@ struct Rng {
 // A 32-bit value of the flavour: 0 any bits, 1 small, 2 a float (finite, special or tiny).
 uint32_t draw(Rng& r, uint32_t flavour) {
   const uint64_t x = r.next();
-  if (flavour == 1) return static_cast<uint32_t>(x) & 0xFF;
+  if (flavour == 1 || flavour == 7) return static_cast<uint32_t>(x) & 0xFF;
+  if (flavour == 4 || flavour == 5) {
+    // (The tier's flavours: floats and doubles' halves with every special value but a NaN, so that the fast paths run rather
+    // than hand the instruction back; 5 also switches half the lanes off.)
+    static constexpr uint32_t kSpecialNoNan[] = {0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x7F800000u, 0xFF800000u,
+                                                 0x00000001u, 0x007FFFFFu, 0x7F7FFFFFu, 0x40490FDBu, 0x3FF00000u, 0x000FFFFFu,
+                                                 0x80000001u, 0x3F000000u, 0x40000000u, 0xC0000000u, 0x7F000000u};
+    if ((x >> 40) % 4 == 0) return kSpecialNoNan[(x >> 32) % std::size(kSpecialNoNan)];
+    const float f = (static_cast<float>(static_cast<uint32_t>(x) >> 8) / 16777216.0f - 0.5f) * 64.0f;
+    return as_bits(f);
+  }
   if (flavour == 2) {
     static constexpr uint32_t kSpecial[] = {0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x7F800000u, 0xFF800000u,
                                             0x7FC00000u, 0x7F800001u, 0x00000001u, 0x007FFFFFu, 0x7F7FFFFFu, 0x40490FDBu,
@@ -10791,7 +10842,7 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   g.scratch.assign(size_t{256} * kLanes, 0);
   for (uint8_t& b : g.scratch) b = static_cast<uint8_t>(draw(r, 0));
   k.private_segment = 256;
-  g.waves.resize(1);
+  g.waves.resize(flavour >= 6 ? 2 : 1);   // (flavours 6 and 7: a work-group of two waves, for the store gate and the waits)
   Wave& w = g.waves[0];
   w.lanes = k.wave32 ? 32 : kLanes;
   w.mode = k.mode;
@@ -10810,10 +10861,11 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   for (auto& row : w.agpr)
     for (uint32_t& v : row) v = draw(r, flavour);
   const uint64_t all = w.lanes == 64 ? ~uint64_t{0} : (uint64_t{1} << w.lanes) - 1;
-  w.exec = (flavour == 3 ? r.next() : ~uint64_t{0}) & all;
+  w.exec = (flavour == 3 || flavour == 5 || flavour == 7 ? r.next() : ~uint64_t{0}) & all;
   w.vcc = r.next() & all;
   w.m0 = draw(r, flavour);
   w.scc = r.next() & 1;
+  if (flavour >= 6) w.loads_in_flight = 3 + static_cast<uint32_t>(r.next() & 7);   // (loads to wait for)
   w.pc = 0;
   Mix64 h;
   std::string error;
