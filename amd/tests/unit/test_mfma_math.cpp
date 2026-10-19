@@ -150,4 +150,152 @@ VTEST(the_terms_are_summed_in_order) {
   VCHECK_EQ(vgpu::amd::mfma_dot(a, b2, 3, 0.0), 1.0);
 }
 
+
+// ---- whole tiles --------------------------------------------------------------------------------------------------------
+
+namespace {
+struct TileCase {
+  uint32_t m, n, k;
+  std::vector<double> a, bk, bt, c;   // a: m rows of k; bk: k rows of n; bt: n columns of k (the same B); c: m rows of n
+};
+// A random tile whose entries `make` draws, with B kept both ways.
+template <typename Make>
+TileCase make_tile(Rng& rng, uint32_t m, uint32_t n, uint32_t k, Make make) {
+  TileCase t{m, n, k, {}, {}, {}, {}};
+  t.a.resize(size_t{m} * k), t.bk.resize(size_t{k} * n), t.bt.resize(size_t{n} * k), t.c.resize(size_t{m} * n);
+  for (auto& x : t.a) x = make(rng);
+  for (auto& x : t.bk) x = make(rng);
+  for (auto& x : t.c) x = make(rng);
+  for (uint32_t kk = 0; kk < k; ++kk)
+    for (uint32_t j = 0; j < n; ++j) t.bt[size_t{j} * k + kk] = t.bk[size_t{kk} * n + j];
+  return t;
+}
+double nan_or(Rng& rng, double v) {
+  if (rng.next() % 4) return v;
+  const uint64_t bits = 0x7FF8000000000000ull | (rng.next() & 0x8007FFFFFFFFFFFFull);
+  double d;
+  std::memcpy(&d, &bits, 8);
+  return d;
+}
+const uint32_t kShapes[][3] = {{4, 4, 1}, {4, 4, 4}, {16, 16, 1}, {16, 16, 4}, {16, 16, 16}, {16, 16, 32}, {16, 16, 128},
+                               {32, 32, 2}, {32, 32, 8}, {32, 32, 16}, {32, 32, 64}, {8, 4, 3}, {4, 12, 5}};
+}  // namespace
+
+VTEST(a_tile_gives_each_output_what_the_dot_product_of_its_row_and_column_gives) {
+  Rng rng{0x5EED};
+  for (int round = 0; round < 600; ++round) {
+    const auto& sh = kShapes[round % (sizeof kShapes / sizeof kShapes[0])];
+    // finite numbers of every size, a few infinities, and sometimes NaNs with payloads
+    const bool nans = round % 3 == 2;
+    const TileCase t = make_tile(rng, sh[0], sh[1], sh[2], [&](Rng& r) { return nans ? nan_or(r, any_double(r)) : any_double(r); });
+    std::vector<double> out(size_t{t.m} * t.n);
+    vgpu::amd::mfma_tile_f(t.m, t.n, t.k, t.a.data(), t.bk.data(), t.c.data(), out.data());
+    for (uint32_t i = 0; i < t.m; ++i)
+      for (uint32_t j = 0; j < t.n; ++j)
+        VCHECK_EQ(bits_of(out[size_t{i} * t.n + j]),
+                  bits_of(vgpu::amd::mfma_dot(t.a.data() + size_t{i} * t.k, t.bt.data() + size_t{j} * t.k, t.k, t.c[size_t{i} * t.n + j])));
+  }
+}
+
+VTEST(a_tile_sums_each_output_in_order_of_k) {
+  // 1, 2^-60 and -1 (and the same with the 2^-60 first): a sum that is not taken in order of k, or is taken in pairs, differs.
+  for (uint32_t k : {3u, 4u, 8u, 16u}) {
+    std::vector<double> a(4 * k, 1.0), bk(size_t{k} * 4), c(16, 0.0), out(16);
+    for (uint32_t kk = 0; kk < k; ++kk)
+      for (uint32_t j = 0; j < 4; ++j) bk[size_t{kk} * 4 + j] = kk == 0 ? 1.0 : kk == 1 ? std::ldexp(1.0, -60 - static_cast<int>(j)) : kk == 2 ? -1.0 : std::ldexp(1.0, -70);
+    vgpu::amd::mfma_tile_f(4, 4, k, a.data(), bk.data(), c.data(), out.data());
+    for (uint32_t j = 0; j < 4; ++j) {
+      double want = 0;
+      for (uint32_t kk = 0; kk < k; ++kk) want += a[kk] * bk[size_t{kk} * 4 + j];
+      for (uint32_t i = 0; i < 4; ++i) VCHECK_EQ(bits_of(out[size_t{i} * 4 + j]), bits_of(want));
+    }
+  }
+}
+
+namespace {
+template <int Order>
+void check_nan_order(Rng& rng) {
+  for (int round = 0; round < 200; ++round) {
+    const auto& sh = kShapes[round % (sizeof kShapes / sizeof kShapes[0])];
+    const TileCase t = make_tile(rng, sh[0], sh[1], sh[2], [&](Rng& r) { return nan_or(r, nan_or(r, any_double(r))); });
+    std::vector<double> out(size_t{t.m} * t.n);
+    vgpu::amd::mfma_tile_f<Order>(t.m, t.n, t.k, t.a.data(), t.bk.data(), t.c.data(), out.data());
+    for (uint32_t i = 0; i < t.m; ++i)
+      for (uint32_t j = 0; j < t.n; ++j) {
+        // the sum, a product at a time, the way the order says (a number is a number in any order)
+        double sum = t.c[size_t{i} * t.n + j];
+        for (uint32_t kk = 0; kk < t.k; ++kk)
+          sum = vgpu::amd::mfma_add_o<Order>(sum, vgpu::amd::mfma_mul_o<Order>(t.a[size_t{i} * t.k + kk], t.bt[size_t{j} * t.k + kk]));
+        VCHECK_EQ(bits_of(out[size_t{i} * t.n + j]), bits_of(sum));
+      }
+  }
+}
+}  // namespace
+
+VTEST(a_tile_of_nans_takes_the_payload_the_fixed_operand_order_gives_in_each_of_the_four_orders) {
+  Rng rng{0xBADC0DE};
+  check_nan_order<0>(rng);
+  check_nan_order<1>(rng);
+  check_nan_order<2>(rng);
+  check_nan_order<3>(rng);
+}
+
+VTEST(a_fused_tile_gives_each_output_the_chain_of_fmas) {
+  Rng rng{0xF00D};
+  for (int round = 0; round < 400; ++round) {
+    const auto& sh = kShapes[round % (sizeof kShapes / sizeof kShapes[0])];
+    const bool nans = round % 2;
+    const TileCase t = make_tile(rng, sh[0], sh[1], sh[2], [&](Rng& r) { return nans ? nan_or(r, any_double(r)) : any_double(r); });
+    std::vector<double> out(size_t{t.m} * t.n);
+    vgpu::amd::mfma_tile_fma(t.m, t.n, t.k, t.a.data(), t.bk.data(), t.c.data(), out.data());
+    for (uint32_t i = 0; i < t.m; ++i)
+      for (uint32_t j = 0; j < t.n; ++j) {
+        const double want = vgpu::amd::mfma_dot_fma(t.a.data() + size_t{i} * t.k, t.bt.data() + size_t{j} * t.k, t.k, t.c[size_t{i} * t.n + j]);
+        VCHECK_EQ(bits_of(out[size_t{i} * t.n + j]), bits_of(want));
+      }
+  }
+}
+
+VTEST(an_integer_tile_gives_the_exact_dot_products) {
+  Rng rng{0x1417};
+  for (int round = 0; round < 400; ++round) {
+    static const uint32_t kSizes[] = {1, 2, 3, 4, 5, 7, 8, 12, 16, 32};
+    const uint32_t m = kSizes[rng.next() % 10], n = kSizes[rng.next() % 10], k = 2 * (1 + static_cast<uint32_t>(rng.next() % 64));
+    std::vector<int16_t> ia(size_t{m} * k), bi(size_t{k} * n);
+    std::vector<int64_t> bk(size_t{k} * n);
+    for (auto& x : ia) x = static_cast<int16_t>(static_cast<int>(rng.next() % 511) - 255);
+    for (uint32_t kk = 0; kk < k; ++kk)
+      for (uint32_t j = 0; j < n; ++j) {
+        const int16_t v = static_cast<int16_t>(static_cast<int>(rng.next() % 511) - 255);
+        bi[((kk / 2) * n + j) * 2 + kk % 2] = v;
+        bk[size_t{kk} * n + j] = v;
+      }
+    std::vector<int32_t> out(size_t{m} * n);
+    vgpu::amd::mfma_tile_int(m, n, k, ia.data(), bi.data(), out.data());
+    for (uint32_t i = 0; i < m; ++i)
+      for (uint32_t j = 0; j < n; ++j) {
+        int64_t want = 0;
+        for (uint32_t kk = 0; kk < k; ++kk) want += int64_t{ia[size_t{i} * k + kk]} * bk[size_t{kk} * n + j];
+        VCHECK_EQ(int64_t{out[size_t{i} * n + j]}, want);
+      }
+  }
+}
+
+VTEST(a_fused_multiply_add_of_several_nans_passes_on_the_payload_of_b_then_a_then_the_sum) {
+  const auto nan = [](uint64_t payload, bool signalling) {
+    const uint64_t bits = 0x7FF0000000000000ull | payload | (signalling ? 0 : 1ull << 51);
+    double d;
+    std::memcpy(&d, &bits, 8);
+    return d;
+  };
+  const double nb = nan(0x111, false), na = nan(0x222, true), ns = nan(0x333, false);
+  VCHECK_EQ(bits_of(vgpu::amd::mfma_fma(nb, na, ns)), bits_of(nb));
+  VCHECK_EQ(bits_of(vgpu::amd::mfma_fma(2.0, na, ns)), bits_of(nan(0x222, false)));   // (a signalling NaN comes out quiet)
+  VCHECK_EQ(bits_of(vgpu::amd::mfma_fma(2.0, 3.0, ns)), bits_of(ns));
+  // no NaN in, one made by the operation: the default NaN
+  const double inf = std::numeric_limits<double>::infinity();
+  VCHECK_EQ(bits_of(vgpu::amd::mfma_fma(inf, 0.0, 1.0)), 0xFFF8000000000000ull);
+  VCHECK_EQ(bits_of(vgpu::amd::mfma_fma(inf, 1.0, -inf)), 0xFFF8000000000000ull);
+}
+
 VTEST_MAIN

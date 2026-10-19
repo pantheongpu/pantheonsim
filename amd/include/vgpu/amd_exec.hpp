@@ -178,6 +178,10 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem);
 // interpret the instruction alike give the same digest.
 uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour);
 
+// For tools/benchmarks (amd/tools/matrix-bench.cpp): the nanoseconds one execution of the instruction takes on a wave
+// set up as digest_instruction's is (all lanes on), averaged over `iterations` runs of it. Throws what it throws.
+double time_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour, uint32_t iterations);
+
 // The process is exiting: every dispatch still running stops within a few
 // thousand instructions a wave, throwing Err::DeviceLost, and none starts.
 // A card abandons a kernel the process leaves behind; here its thread must
@@ -197,5 +201,10 @@ std::mutex& memory_atomic_lock(uint64_t addr);
 bool atomics_lock_free();
 bool memory_runs();
 void set_fast_paths(bool lock_free_atomics, bool memory_runs);
+// Whether the matrix instructions (MFMA, SMFMAC, WMMA) are worked out a whole tile at a time (amd/src/mfma_math.hpp) rather than
+// an element at a time, as they were; the results are the same to the bit, and the tests that hold one against the other turn
+// it off. Read as a machine is made (a dispatch), not per instruction.
+bool matrix_fast_path();
+void set_matrix_fast_path(bool on);
 
 }  // namespace vgpu::amd

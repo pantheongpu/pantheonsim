@@ -323,6 +323,10 @@ target_include_directories(amd_fatbin_extract PRIVATE amd/include)
 add_executable(amd_exec_bench amd/tools/exec-bench.cpp)
 target_link_libraries(amd_exec_bench PRIVATE vgpu)
 target_include_directories(amd_exec_bench PRIVATE amd/include)
+# What one matrix instruction costs the interpreter (amd/tools/matrix-bench.cpp).
+add_executable(amd_matrix_bench amd/tools/matrix-bench.cpp)
+target_link_libraries(amd_matrix_bench PRIVATE vgpu)
+target_include_directories(amd_matrix_bench PRIVATE amd/include)
 # librocprofiler-sdk: rocprofiler-sdk's interface over the HIP shim, so AMD's
 # profiler (rocprofv3) runs unmodified on a simulated GPU. It sits beside
 # libamdhip64 in build/shim, where a tool linked to librocprofiler-sdk.so.1
@@ -1464,6 +1468,9 @@ endforeach()
 
 # The matrix instructions' arithmetic (half widening, dot products) against what it replaced.
 vgpu_unit_test(test_amd_mfma_math amd/tests/unit/test_mfma_math.cpp)
+# The matrix instructions on the tile path against the reference path, bit for bit, over the ISA corpora.
+vgpu_unit_test(test_amd_matrix_fast amd/tests/unit/test_matrix_fast.cpp)
+target_compile_definitions(test_amd_matrix_fast PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # Lanes over consecutive addresses as one call to the memory manager, against lane by lane (memruns.c).
 vgpu_unit_test(test_amd_gcn_memruns amd/tests/unit/test_gcn_memruns.cpp)

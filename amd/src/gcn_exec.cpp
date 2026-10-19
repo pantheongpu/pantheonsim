@@ -366,6 +366,8 @@ struct Machine {
   // a set of locks striped by address. On one thread there is no need: a
   // wave's lanes take their turns in order, which is atomic already.
   bool concurrent = false;
+  // Whether the matrix instructions take the tile path (set_matrix_fast_path); read once, as the machine is made.
+  bool matrix_fast = matrix_fast_path();
   // Across threads, an atomic on an ordinary word of device memory is a compare-and-swap on the word, not a lock.
   const bool lock_free = atomics_lock_free(), runs_on = memory_runs();
   // A vector load or store of device memory. ROCm runs CDNA with unaligned
@@ -3441,7 +3443,179 @@ struct Machine {
   // The integer forms read their inputs signed where NEG's bit for them is
   // set, and CLAMP saturates; gfx12's 8-bit floats are the OCP formats. Each
   // output's products and addend are summed exactly (double) and rounded once.
+  // RDNA3 and RDNA4's v_wmma_*, a whole tile at a time (wmma_reference is the element-at-a-time version). The same layouts, the
+  // same widening, every output a double sum of its products in order of k and rounded once (or the exact integer sum, saturated
+  // where CLAMP says); the operands are decoded once, by type, instead of by comparing the type's name for every element.
+  bool wmma_fast(Wave& w, const Inst& in, const OpName& op) {
+    constexpr int kWmmaOrder = WMMA_ORDER;
+    if (w.lanes != 32 || static_cast<uint32_t>(w.exec) != 0xFFFFFFFFu) return false;
+    const bool g12 = gcn::is_gfx12(in.arch);
+    const std::string_view name = op.view();   // v_wmma_<out>_16x16x<K>_<a>[_<b>]
+    const size_t out_end = name.find('_', 7), shape_at = name.find("16x16x");
+    if (out_end == std::string_view::npos || shape_at == std::string_view::npos) return false;
+    const std::string_view out = name.substr(7, out_end - 7);
+    uint32_t K = 0;
+    size_t at = shape_at + 6;
+    for (; at < name.size() && name[at] >= '0' && name[at] <= '9'; ++at) K = K * 10 + static_cast<uint32_t>(name[at] - '0');
+    const std::string_view types = name.substr(at + 1);   // "f16", "iu8", "fp8_bf8", ...
+    const size_t us = types.find('_');
+    const std::string_view ta = types.substr(0, us), tb = us == std::string_view::npos ? ta : types.substr(us + 1);
+    const bool is_int = out == "i32", half_out = out == "f16" || out == "bf16";
+    if (!is_int && out != "f32" && !half_out) return false;
+    if (K == 0 || K > 32 || (K & 1)) return false;
+    // (a signed 8- or 4-bit input is read as an unsigned 32-bit value, which only a saturating sum can tell from a signed one)
+    if (is_int && in.clamp && ((in.neg_lo & 1) || ((in.neg_lo >> 1) & 1))) return false;
+    const uint32_t per_lane = g12 ? K / 2 : K;
+    // The element type of a source: its kind (as matrix_elem names it), width in bits, and for the 8-bit floats the table.
+    struct Ty {
+      char kind;
+      uint32_t bits;
+    };
+    const bool a_signed = in.neg_lo & 1, b_signed = (in.neg_lo >> 1) & 1;
+    const auto type_of = [&](std::string_view t, bool sg) -> Ty {
+      if (t == "f16") return {'h', 16};
+      if (t == "bf16") return {'b', 16};
+      if (t == "fp8") return {'e', 8};
+      if (t == "bf8") return {'g', 8};
+      if (t == "iu8") return {sg ? 'c' : 'u', 8};
+      if (t == "iu4") return {sg ? 'm' : 'n', 4};
+      return {0, 0};
+    };
+    const Ty A = type_of(ta, a_signed), B = type_of(tb, b_signed);
+    if (!A.kind || !B.kind) return false;
+    if ((A.kind == 'c' || A.kind == 'u' || A.kind == 'm' || A.kind == 'n') != is_int ||
+        (B.kind == 'c' || B.kind == 'u' || B.kind == 'm' || B.kind == 'n') != is_int)
+      return false;
+    const uint32_t aregs = (per_lane * A.bits + 31) / 32, bregs = (per_lane * B.bits + 31) / 32;
+    if (aregs > 16 || bregs > 16) return false;
+    const Operand& ao = in.src[0];
+    const Operand& bo = in.src[1];
+    const Operand& co = in.src[2];
+    const Operand& dst = in.dst[0];
+    const auto vg = [&](const Operand& o, uint32_t n) { return o.kind == OperandKind::Vgpr && size_t{o.index} + n <= w.vgpr.r.size(); };
+    if (!vg(ao, aregs) || !vg(bo, bregs) || !vg(dst, 8) || (co.kind == OperandKind::Vgpr && !vg(co, 8))) return false;
+    MatrixSrc sa, sb;
+    for (uint32_t k = 0; k < aregs; ++k) sa.rows[k] = w.vgpr.r[ao.index + k].data();
+    for (uint32_t k = 0; k < bregs; ++k) sb.rows[k] = w.vgpr.r[bo.index + k].data();
+    sa.lut = A.kind == 'e' ? small_float_table(kOcpFp8) : A.kind == 'g' ? small_float_table(kOcpBf8) : nullptr;
+    sb.lut = B.kind == 'e' ? small_float_table(kOcpFp8) : B.kind == 'g' ? small_float_table(kOcpBf8) : nullptr;
+    // Where C and D are: D[row][col] is in lane `lane`, register `reg`, and (for 16-bit results) half `half`.
+    const bool high = (in.op_sel >> 2) & 1;
+    const auto place = [&](uint32_t row, uint32_t col, uint32_t* lane, uint32_t* reg, uint32_t* half) {
+      if (g12) {
+        *lane = col + 16 * (row / 8);
+        const uint32_t i = row % 8;
+        *reg = half_out ? i / 2 : i;
+        *half = half_out ? i % 2 : 0;
+      } else {
+        *lane = col + 16 * (row % 2);
+        *reg = row / 2;
+        *half = half_out && high ? 1 : 0;
+      }
+    };
+    double cd[256];
+    for (uint32_t row = 0; row < 16; ++row)
+      for (uint32_t col = 0; col < 16; ++col) {
+        uint32_t lane, reg, half;
+        place(row, col, &lane, &reg, &half);
+        double c;
+        if (co.kind != OperandKind::Vgpr) {
+          c = co.kind == OperandKind::InlineFloat ? co.fvalue : static_cast<double>(static_cast<int32_t>(scalar(w, co)));
+        } else {
+          const uint32_t v = w.vgpr.r[co.index + reg][lane];
+          if (out == "f32") c = static_cast<double>(as_float(v));
+          else if (is_int) c = static_cast<double>(static_cast<int32_t>(v));
+          else if (out == "bf16") c = static_cast<double>(as_float((half ? v >> 16 : v & 0xFFFF) << 16));
+          else c = half_bits_to_double(static_cast<uint16_t>(half ? v >> 16 : v));
+        }
+        cd[row * 16 + col] = c;
+      }
+    // (the destination as it is: a 16-bit result leaves the other half of its register alone)
+    std::array<std::array<uint32_t, 8>, 32> result;
+    for (uint32_t lane = 0; lane < 32; ++lane)
+      for (uint32_t r = 0; r < 8; ++r) result[lane][r] = w.vgpr.r[dst.index + r][lane];
+    // A[row][k] is element k % per_lane of lane row (+ 16 for the second half of k on gfx12); B[k][col] likewise.
+    const auto lane_of = [&](uint32_t rc, uint32_t k) { return g12 ? rc + 16 * (k / per_lane) : rc; };
+    const auto elem_of = [&](uint32_t k) { return g12 ? k % per_lane : k; };
+    if (is_int) {
+      std::array<int16_t, 16 * 32> ia, bi;
+      const auto fill = [&](const MatrixSrc& src, char kind, bool as_a) {
+        for (uint32_t rc = 0; rc < 16; ++rc)
+          for (uint32_t k = 0; k < K; ++k) {
+            const uint32_t l = lane_of(rc, k), e = elem_of(k);
+            double v;
+            switch (kind) {
+              case 'c': v = matrix_elem<'c'>(src, e, l); break;
+              case 'u': v = matrix_elem<'u'>(src, e, l); break;
+              case 'm': v = matrix_elem<'m'>(src, e, l); break;
+              default: v = matrix_elem<'n'>(src, e, l); break;
+            }
+            if (as_a) ia[rc * K + k] = static_cast<int16_t>(v);
+            else bi[((k >> 1) * 16 + rc) * 2 + (k & 1)] = static_cast<int16_t>(v);
+          }
+      };
+      fill(sa, A.kind, true);
+      fill(sb, B.kind, false);
+      int32_t dots[256];
+      mfma_tile_int(16, 16, K, ia.data(), bi.data(), dots);
+      for (uint32_t row = 0; row < 16; ++row)
+        for (uint32_t col = 0; col < 16; ++col) {
+          uint32_t lane, reg, half;
+          place(row, col, &lane, &reg, &half);
+          int64_t isum = static_cast<int64_t>(cd[row * 16 + col]) + dots[row * 16 + col];
+          if (in.clamp) isum = std::clamp<int64_t>(isum, INT32_MIN, INT32_MAX);
+          result[lane][reg] = static_cast<uint32_t>(isum);
+        }
+    } else {
+      std::array<double, 16 * 32> fa, fb;
+      const auto fill = [&](const MatrixSrc& src, char kind, double* dst_tile, bool as_a) {
+        const auto go = [&](auto tag) {
+          constexpr char T = decltype(tag)::value;
+          for (uint32_t rc = 0; rc < 16; ++rc)
+            for (uint32_t k = 0; k < K; ++k) {
+              const double v = matrix_elem<T>(src, elem_of(k), lane_of(rc, k));
+              if (as_a) dst_tile[rc * K + k] = v;
+              else dst_tile[k * 16 + rc] = v;
+            }
+        };
+        matrix_by_type(kind, go);
+      };
+      fill(sa, A.kind, fa.data(), true);
+      fill(sb, B.kind, fb.data(), false);
+      double sums[256];
+      mfma_tile_f<kWmmaOrder>(16, 16, K, fa.data(), fb.data(), cd, sums);
+      for (uint32_t row = 0; row < 16; ++row)
+        for (uint32_t col = 0; col < 16; ++col) {
+          uint32_t lane, reg, half;
+          place(row, col, &lane, &reg, &half);
+          const double sum = sums[row * 16 + col];
+          uint32_t& slot = result[lane][reg];
+          if (out == "f32") {
+            slot = as_bits(static_cast<float>(sum));
+          } else {
+            uint32_t bits;
+            if (out == "bf16") {
+              const uint32_t f = as_bits(static_cast<float>(sum));
+              bits = std::isnan(as_float(f)) ? 0x7FC0 : (f + 0x7FFF + ((f >> 16) & 1)) >> 16;   // to nearest even
+            } else {
+              const _Float16 h = static_cast<_Float16>(sum);
+              uint16_t b16;
+              std::memcpy(&b16, &h, 2);
+              bits = b16;
+            }
+            slot = half ? (slot & 0xFFFF) | bits << 16 : (slot & 0xFFFF0000u) | bits;
+          }
+        }
+    }
+    const uint32_t regs = dst.width;
+    for (uint32_t lane = 0; lane < 32; ++lane)
+      for (uint32_t r = 0; r < regs && r < 8; ++r) w.vgpr.r[dst.index + r][lane] = result[lane][r];
+    return true;
+  }
   void wmma(Wave& w, const Inst& in, const OpName& op) {
+    if (!(matrix_fast && wmma_fast(w, in, op))) wmma_reference(w, in, op);
+  }
+  void wmma_reference(Wave& w, const Inst& in, const OpName& op) {
     if (w.lanes != 32 || static_cast<uint32_t>(w.exec) != 0xFFFFFFFFu)
       throw Error::make(Err::Unsupported, in.name, " with lanes switched off, or in a wave64, which this does not model");
     const bool g12 = gcn::is_gfx12(in.arch);
@@ -3521,7 +3695,7 @@ struct Machine {
         for (uint32_t k = 0; k < K; ++k) {
           const double a = input(in.src[0], ta, row, k, a_signed), b = input(in.src[1], tb, col, k, b_signed);
           if (out == "i32") isum += static_cast<int64_t>(a) * static_cast<int64_t>(b);
-          else sum += a * b;
+          else sum = mfma_add_o<WMMA_ORDER>(sum, mfma_mul_o<WMMA_ORDER>(a, b));   // (the operand order is the recorded one, not the compiler's choice)
         }
         uint32_t& slot = result[lane][reg];
         if (out == "i32") {
@@ -9123,6 +9297,11 @@ struct Machine {
       uint32_t bl, within, g, a_row, b_row;
     } lane[kLanes];
     std::vector<uint32_t> c_off, a_off, b_off;
+    // The fast path's: where a lane's column of B starts in a tile of B by row of k (its block's, and its column), and the tiles.
+    uint32_t b_blk[kLanes], b_col[kLanes];
+    std::vector<double> fa, fbk, fc, fo;
+    std::vector<int16_t> ia, bi;
+    std::vector<int32_t> io, ic;
     // The operands' values as doubles (A by row, B by column, C as it is), kept per thread between instructions.
     std::vector<double> a, b, c;
   };
@@ -9142,6 +9321,7 @@ struct Machine {
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint32_t bl = lane / p.lanes_per_block, within = lane % p.lanes_per_block;
       p.lane[lane] = {bl, within, within / s.m, (bl * s.m + within % s.m) * s.k, (bl * s.n + within % s.n) * s.k};
+      p.b_blk[lane] = bl * s.k * s.n, p.b_col[lane] = within % s.n;
       for (uint32_t r = 0; r < p.outs; ++r) {
         uint32_t ob = 0, row = 0;
         out_place(s, lane, r, &ob, &row);
@@ -9151,7 +9331,309 @@ struct Machine {
     }
     return p;
   }
+  // ---- The matrix multiply, a whole tile at a time -------------------------------------------------------------------------
+  //
+  // matrix_multiply_reference (below) works an element at a time, through lambdas that look at the operand's kind and type for each
+  // one. This does the same arithmetic in the same order -- the values widened as the lambdas widen them, every output a double
+  // sum of its products taken in order of k, rounded once -- but decodes each operand with its type fixed, once for the instruction,
+  // and sums the tile with mfma_tile_f / _fma / _int (amd/src/mfma_math.hpp). It takes the usual case: sources and destination in
+  // registers that exist; anything else goes to the reference.
+
+  // The 8-, 6- and 4-bit floats as doubles, by code: f8_to_float's own results, so a lookup is that conversion.
+  static const double* small_float_table(const F8& t) {
+    static const std::vector<double> tables = [] {
+      const F8* formats[7] = {&kFp8, &kBf8, &kOcpFp8, &kOcpBf8, &kFp6, &kBf6, &kFp4};
+      std::vector<double> v(7 * 256, 0.0);
+      for (int f = 0; f < 7; ++f)
+        for (uint32_t c = 0; c < (1u << formats[f]->bits); ++c) v[f * 256 + c] = static_cast<double>(f8_to_float(c, *formats[f]));
+      return v;
+    }();
+    const int id = t.style == F8::Fnuz ? (t.mant == 3 ? 0 : 1)
+                   : t.style == F8::OcpE4M3 ? 2
+                   : t.style == F8::OcpE5M2 ? 3
+                   : t.bits == 6 ? (t.mant == 3 ? 4 : 5)
+                                 : 6;
+    return tables.data() + id * 256;
+  }
+  static uint32_t matrix_type_bits(char t, uint32_t small_bits) {
+    switch (t) {
+      case 'h': case 'b': return 16;
+      case 'c': case 'e': case 'g': return 8;
+      case 'd': return 64;
+      case 'x': return small_bits;
+      default: return 32;
+    }
+  }
+  // A source operand in registers: the rows of its registers, and what its type needs to read one.
+  struct MatrixSrc {
+    const uint32_t* rows[16];
+    const double* lut = nullptr;   // 'e', 'g' and 'x': the small float's value by code
+    uint32_t bits = 0, width = 0;  // 'x': the code's width, and the operand's width in registers
+  };
+  template <char T>
+  static inline double matrix_elem(const MatrixSrc& d, uint32_t e, uint32_t lane) {
+    if constexpr (T == 'h') {
+      return half_bits_to_double(static_cast<uint16_t>(d.rows[e / 2][lane] >> (16 * (e % 2))));
+    } else if constexpr (T == 'b') {
+      return static_cast<double>(as_float((d.rows[e / 2][lane] >> (16 * (e % 2))) << 16));
+    } else if constexpr (T == 'c') {
+      return static_cast<double>(static_cast<int8_t>(d.rows[e / 4][lane] >> (8 * (e % 4))));
+    } else if constexpr (T == 'e' || T == 'g') {
+      return d.lut[(d.rows[e / 4][lane] >> (8 * (e % 4))) & 0xFF];
+    } else if constexpr (T == 'u') {
+      return static_cast<double>((d.rows[e / 4][lane] >> (8 * (e % 4))) & 0xFF);
+    } else if constexpr (T == 'n') {
+      return static_cast<double>((d.rows[e / 8][lane] >> (4 * (e % 8))) & 0xF);
+    } else if constexpr (T == 'm') {
+      return static_cast<double>(static_cast<int32_t>(((d.rows[e / 8][lane] >> (4 * (e % 8))) & 0xF) << 28) >> 28);
+    } else if constexpr (T == 'i') {
+      return static_cast<double>(static_cast<int32_t>(d.rows[e][lane]));
+    } else if constexpr (T == 'f') {
+      return static_cast<double>(as_float(d.rows[e][lane]));
+    } else if constexpr (T == 'F') {
+      uint32_t bits = d.rows[e][lane];
+      if ((bits & 0x7F800000u) != 0x7F800000u) bits &= ~0x1FFFu;
+      return static_cast<double>(as_float(bits));
+    } else if constexpr (T == 'x') {
+      const uint32_t at = e * d.bits, word = at / 32, shift = at % 32;
+      uint64_t v = d.rows[word][lane];
+      if (shift + d.bits > 32 && word + 1 < d.width) v |= static_cast<uint64_t>(d.rows[word + 1][lane]) << 32;
+      return d.lut[static_cast<uint32_t>(v >> shift) & ((1u << d.bits) - 1)];
+    } else {   // 'd'
+      return as_double(d.rows[2 * e][lane] | static_cast<uint64_t>(d.rows[2 * e + 1][lane]) << 32);
+    }
+  }
+  // The instruction's operands, decoded: tiles of A (by row of k), B (by row of k, or in pairs of k for the integer forms),
+  // and C.
+  struct MatrixFast {
+    MatrixPlan* plan;
+    const MatrixShape* s;
+    MatrixSrc a, b;
+    bool sparse = false, scaled = false, b_split = false;
+    uint32_t a_lane[kLanes];
+    double sa[kLanes], sb[kLanes];
+    // (sparse) the register that holds the indices of A's values, and which set of them
+    const uint32_t* idx_row = nullptr;
+    uint32_t idx_set = 0;
+  };
+  // Where B's element k of the lane's column goes: by row of k for the float forms, in pairs of k for the integer ones.
+  template <bool Int>
+  static inline size_t matrix_b_at(const MatrixPlan& p, const MatrixShape& s, uint32_t lane, uint32_t kk) {
+    if constexpr (Int) return p.b_blk[lane] + size_t{p.b_col[lane]} * 2 + ((kk >> 1) * 2u * s.n) + (kk & 1);
+    else return p.b_blk[lane] + p.b_col[lane] + size_t{kk} * s.n;
+  }
+  template <char T, typename V>
+  void matrix_decode_a(MatrixFast& f, V* ap) {
+    const MatrixPlan& plan = *f.plan;
+    const uint32_t per_lane = plan.per_lane;
+    if (f.sparse) {
+      std::fill(ap, ap + size_t{f.s->blocks} * f.s->m * f.s->k, V{});
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const MatrixPlan::Lane& L = plan.lane[lane];
+        const uint32_t idx = f.idx_row[lane] >> (f.idx_set * per_lane);
+        for (uint32_t v = 0; v < per_lane / 2; ++v)
+          ap[L.a_row + L.g * per_lane + 4 * (v / 2) + ((idx >> (2 * v)) & 3)] = static_cast<V>(matrix_elem<T>(f.a, v, lane));
+      }
+      return;
+    }
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const MatrixPlan::Lane& L = plan.lane[lane];
+      V* const d = ap + L.a_row + L.g * per_lane;
+      const uint32_t sl = f.a_lane[lane];
+      if (f.scaled) {
+        for (uint32_t e = 0; e < per_lane; ++e) d[e] = static_cast<V>(matrix_elem<T>(f.a, e, sl) * f.sa[lane]);
+      } else {
+        for (uint32_t e = 0; e < per_lane; ++e) d[e] = static_cast<V>(matrix_elem<T>(f.a, e, sl));
+      }
+    }
+  }
+  template <char T, typename V, bool Int>
+  void matrix_decode_b(MatrixFast& f, V* bp) {
+    const MatrixPlan& plan = *f.plan;
+    const MatrixShape& s = *f.s;
+    const uint32_t per_lane = plan.per_lane, half = per_lane / 2;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const MatrixPlan::Lane& L = plan.lane[lane];
+      for (uint32_t e = 0; e < per_lane; ++e) {
+        // gfx950's sparse forms, whose B is eight registers, split it (as the reference does)
+        const uint32_t kb = f.b_split ? e / half * (s.k / 2) + L.g * half + e % half : L.g * per_lane + e;
+        double v = matrix_elem<T>(f.b, e, lane);
+        if (f.scaled) v *= f.sb[lane];
+        bp[matrix_b_at<Int>(plan, s, lane, kb)] = static_cast<V>(v);
+      }
+    }
+  }
+  // Calls f(tag) with the element type as a template argument.
+  template <typename F>
+  static bool matrix_by_type(char t, F&& f) {
+    switch (t) {
+      case 'h': f(std::integral_constant<char, 'h'>{}); return true;
+      case 'b': f(std::integral_constant<char, 'b'>{}); return true;
+      case 'c': f(std::integral_constant<char, 'c'>{}); return true;
+      case 'e': f(std::integral_constant<char, 'e'>{}); return true;
+      case 'g': f(std::integral_constant<char, 'g'>{}); return true;
+      case 'f': f(std::integral_constant<char, 'f'>{}); return true;
+      case 'F': f(std::integral_constant<char, 'F'>{}); return true;
+      case 'x': f(std::integral_constant<char, 'x'>{}); return true;
+      case 'u': f(std::integral_constant<char, 'u'>{}); return true;
+      case 'n': f(std::integral_constant<char, 'n'>{}); return true;
+      case 'm': f(std::integral_constant<char, 'm'>{}); return true;
+      case 'd': f(std::integral_constant<char, 'd'>{}); return true;
+      default: return false;
+    }
+  }
+  bool matrix_multiply_fast(Wave& w, const Inst& in, const MatrixShape& s, bool sparse) {
+    MatrixPlan& plan = matrix_plan(s);
+    const uint32_t per_lane = plan.per_lane, outs = plan.outs, lpb = plan.lanes_per_block;
+    const char ta = s.in, tb = s.in_b ? s.in_b : s.in;
+    if (ta == 'i' || tb == 'i') return false;
+    // The small floats of an f8f6f4 form: the format CBSZ (A) and BLGP (B) name.
+    const auto format_of = [&](uint32_t f) -> const F8& { return f == 0 ? kOcpFp8 : f == 1 ? kOcpBf8 : f == 2 ? kFp6 : f == 3 ? kBf6 : kFp4; };
+    const uint32_t abits = matrix_type_bits(ta, ta == 'x' ? static_cast<uint32_t>(format_of(in.cbsz).bits) : 0);
+    const uint32_t bbits = matrix_type_bits(tb, tb == 'x' ? static_cast<uint32_t>(format_of(in.blgp).bits) : 0);
+    const uint32_t a_elems = sparse ? per_lane / 2 : per_lane;
+    const uint32_t aregs = (a_elems * abits + 31) / 32, bregs = (per_lane * bbits + 31) / 32;
+    const uint32_t cwords = s.out == 'd' ? 2 * outs : outs;
+    if (aregs > 16 || bregs > 16 || cwords > 32 || (s.out != 'f' && s.out != 'i' && s.out != 'd')) return false;
+    const Operand& co = sparse ? in.dst[0] : in.src[2];
+    const Operand& dst = in.dst[0];
+    const auto is_reg = [](const Operand& o) { return o.kind == OperandKind::Vgpr || o.kind == OperandKind::Agpr; };
+    if (!is_reg(in.src[0]) || !is_reg(in.src[1]) || !is_reg(dst)) return false;
+    const auto readable = [&](const Operand& o, uint32_t n) {
+      return o.kind == OperandKind::Vgpr ? size_t{o.index} + n <= w.vgpr.r.size() : size_t{o.index} + n <= w.agpr.size();
+    };
+    if (!readable(in.src[0], aregs) || !readable(in.src[1], bregs)) return false;
+    // (a 'd' accumulator that is a constant floats are read as the double the constant is)
+    const bool c_reg = is_reg(co);
+    if (c_reg && co.kind == OperandKind::Vgpr && size_t{co.index} + cwords > w.vgpr.r.size()) return false;
+    if (dst.kind == OperandKind::Vgpr ? size_t{dst.index} + cwords > w.vgpr.r.size() : size_t{dst.index} + cwords > kVgprs) return false;
+    if (sparse && !(is_reg(in.src[2]) && readable(in.src[2], 1))) return false;
+    if (in.scaled && (in.src.size() < 5)) return false;
+    // The accumulation registers the destination names, as the writes would make them (this may move the bank, so it comes
+    // before any row is taken).
+    if (dst.kind == OperandKind::Agpr && w.agpr.size() < size_t{dst.index} + cwords) w.agpr.resize(size_t{dst.index} + cwords);
+    if (c_reg && co.kind == OperandKind::Agpr && w.agpr.size() < size_t{co.index} + cwords) return false;
+    if (sparse && in.src[2].kind == OperandKind::Agpr && w.agpr.size() <= in.src[2].index) return false;
+    const auto row_of = [&](const Operand& o, uint32_t k) -> uint32_t* {
+      return o.kind == OperandKind::Agpr ? w.agpr[o.index + k].data() : w.vgpr.r[o.index + k].data();
+    };
+    MatrixFast f;
+    f.plan = &plan, f.s = &s, f.sparse = sparse, f.scaled = in.scaled;
+    for (uint32_t k = 0; k < aregs; ++k) f.a.rows[k] = row_of(in.src[0], k);
+    for (uint32_t k = 0; k < bregs; ++k) f.b.rows[k] = row_of(in.src[1], k);
+    f.a.bits = abits, f.a.width = in.src[0].width, f.b.bits = bbits, f.b.width = in.src[1].width;
+    const auto lut_of = [&](char t, uint32_t fmt) -> const double* {
+      return t == 'e' ? small_float_table(fp8()) : t == 'g' ? small_float_table(bf8()) : t == 'x' ? small_float_table(format_of(fmt)) : nullptr;
+    };
+    f.a.lut = lut_of(ta, in.cbsz), f.b.lut = lut_of(tb, in.blgp);
+    f.b_split = sparse && in.src[1].width == 8;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const MatrixPlan::Lane& L = plan.lane[lane];
+      const uint32_t a_block = in.a_bcast_size ? (L.bl >> in.a_bcast_size << in.a_bcast_size) + in.a_bcast_id : L.bl;
+      f.a_lane[lane] = a_block < s.blocks ? a_block * lpb + L.within : lane;
+    }
+    if (in.scaled) {
+      const auto scale_of = [&](const Operand& o, uint32_t sel, uint32_t lane) -> double {
+        const uint32_t e = o.kind == OperandKind::InlineFloat
+                               ? (as_bits(static_cast<float>(o.fvalue)) >> 23) & 0xFF
+                               : (lane_src(w, o, lane) >> (8 * sel)) & 0xFF;
+        return e == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, static_cast<int>(e) - 127);
+      };
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        f.sa[lane] = scale_of(in.src[3], in.scale_sel & 3, lane);
+        f.sb[lane] = scale_of(in.src[4], in.scale_sel >> 2, lane);
+      }
+    }
+    if (sparse) {
+      // A lane's A holds two values of each four along K, packed; the index register says, two bits a value, which of the four
+      // each is. A lane's run of K has one bit of indices a value, so a register holds 32 / per_lane sets of them: CBSZ zero lets
+      // ABID pick one.
+      f.idx_row = row_of(in.src[2], 0);
+      f.idx_set = (in.cbsz == 0 ? in.abid : 0u) % (32 / per_lane);
+    }
+    // The accumulator's words: its rows, or the constant every lane and register of a non-register operand reads as.
+    const uint32_t* crows[32];
+    uint32_t cconst = 0;
+    double cconst_d = 0;
+    bool c_double_const = false;
+    if (c_reg) {
+      for (uint32_t k = 0; k < cwords; ++k) crows[k] = row_of(co, k);
+    } else if (s.out == 'd' && co.kind == OperandKind::InlineFloat) {
+      c_double_const = true, cconst_d = co.fvalue;
+    } else {
+      cconst = co.kind == OperandKind::InlineFloat ? as_bits(static_cast<float>(co.fvalue)) : static_cast<uint32_t>(scalar(w, co));
+    }
+    const uint32_t tile_m = s.blocks * s.m, tile_c = tile_m * s.n;
+    // The tiles' storage (the thread's).
+    const size_t asz = size_t{tile_m} * s.k, bsz = size_t{s.blocks} * s.k * s.n;
+    uint32_t* drows[32];
+    const bool int_out = s.out == 'i';
+    if (int_out) {
+      if (ta != 'c' || tb != 'c') return false;
+      plan.ia.resize(asz), plan.bi.resize(bsz), plan.io.resize(tile_c);
+      matrix_decode_a<'c', int16_t>(f, plan.ia.data());
+      matrix_decode_b<'c', int16_t, true>(f, plan.bi.data());
+      // C, gathered before anything is written (D may overlap it), then each block's dot products
+      plan.ic.resize(tile_c);
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
+        for (uint32_t r = 0; r < outs; ++r) plan.ic[place[r]] = c_reg ? crows[r][lane] : cconst;
+      }
+      for (uint32_t ob = 0; ob < s.blocks; ++ob)
+        mfma_tile_int(s.m, s.n, s.k, plan.ia.data() + size_t{ob} * s.m * s.k, plan.bi.data() + size_t{ob} * s.k * s.n,
+                      plan.io.data() + size_t{ob} * s.m * s.n);
+      for (uint32_t k = 0; k < cwords; ++k) drows[k] = row_of(dst, k);
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
+        for (uint32_t r = 0; r < outs; ++r) drows[r][lane] = plan.ic[place[r]] + static_cast<uint32_t>(plan.io[place[r]]);
+      }
+      return true;
+    }
+    plan.fa.resize(asz), plan.fbk.resize(bsz), plan.fc.resize(tile_c), plan.fo.resize(tile_c);
+    bool ok = matrix_by_type(ta, [&](auto tag) { matrix_decode_a<decltype(tag)::value, double>(f, plan.fa.data()); });
+    ok = ok && matrix_by_type(tb, [&](auto tag) { matrix_decode_b<decltype(tag)::value, double, false>(f, plan.fbk.data()); });
+    if (!ok) return false;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
+      if (s.out == 'd') {
+        for (uint32_t r = 0; r < outs; ++r)
+          plan.fc[place[r]] = c_double_const ? cconst_d : as_double(static_cast<uint64_t>(c_reg ? crows[2 * r][lane] : cconst) | static_cast<uint64_t>(c_reg ? crows[2 * r + 1][lane] : cconst) << 32);
+      } else {
+        for (uint32_t r = 0; r < outs; ++r) plan.fc[place[r]] = static_cast<double>(as_float(c_reg ? crows[r][lane] : cconst));
+      }
+    }
+    for (uint32_t ob = 0; ob < s.blocks; ++ob) {
+      const double* const a = plan.fa.data() + size_t{ob} * s.m * s.k;
+      const double* const b = plan.fbk.data() + size_t{ob} * s.k * s.n;
+      const double* const c = plan.fc.data() + size_t{ob} * s.m * s.n;
+      double* const o = plan.fo.data() + size_t{ob} * s.m * s.n;
+      if (s.out == 'd') mfma_tile_fma(s.m, s.n, s.k, a, b, c, o);
+      else mfma_tile_f(s.m, s.n, s.k, a, b, c, o);
+    }
+    for (uint32_t k = 0; k < cwords; ++k) drows[k] = row_of(dst, k);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
+      if (s.out == 'd') {
+        for (uint32_t r = 0; r < outs; ++r) {
+          const uint64_t bits = as_bits(plan.fo[place[r]]);
+          drows[2 * r][lane] = static_cast<uint32_t>(bits);
+          drows[2 * r + 1][lane] = static_cast<uint32_t>(bits >> 32);
+        }
+      } else {
+        for (uint32_t r = 0; r < outs; ++r) drows[r][lane] = as_bits(static_cast<float>(plan.fo[place[r]]));
+      }
+    }
+    return true;
+  }
   void matrix_multiply(Wave& w, const Inst& in) {
+    if (matrix_fast && w.exec == ~uint64_t{0}) {
+      const MatrixShape* shape =
+          matrix_shape(OpName(in.scaled ? "v_mfma_" + in.name.substr(std::string("v_mfma_scale_").size()) : in.name));
+      if (shape && matrix_multiply_fast(w, in, *shape, in.name.rfind("v_smfmac", 0) == 0)) return;
+    }
+    matrix_multiply_reference(w, in);
+  }
+  void matrix_multiply_reference(Wave& w, const Inst& in) {
     const MatrixShape* shape =
         matrix_shape(OpName(in.scaled ? "v_mfma_" + in.name.substr(std::string("v_mfma_scale_").size()) : in.name));
     if (!shape) throw Error::make(Err::Unsupported, in.name, " is decoded but not implemented");
@@ -10461,6 +10943,12 @@ void set_fast_paths(bool lock_free_atomics, bool runs) {
   g_memory_runs.store(runs);
 }
 
+namespace {
+std::atomic<bool> g_matrix_fast{true};
+}
+bool matrix_fast_path() { return g_matrix_fast.load(std::memory_order_relaxed); }
+void set_matrix_fast_path(bool on) { g_matrix_fast.store(on); }
+
 void abandon_dispatches() { g_abandoned.store(true); }
 bool dispatches_abandoned() { return g_abandoned.load(); }
 
@@ -10751,8 +11239,15 @@ struct Rng {
     return z ^ (z >> 31);
   }
 };
-// A 32-bit value of the flavour: 0 any bits, 1 small, 2 a float (finite, special or tiny).
+// A 32-bit value of the flavour: 0 any bits, 1 small, 2 a float (finite, special or tiny), 4 every byte 0x3C to 0x41: a small
+// finite number whether the word is read as a float, a double, two halves, two bfloat16s or four 8-bit floats (no NaNs, no
+// overflow), as a real program's operands are.
 uint32_t draw(Rng& r, uint32_t flavour) {
+  if (flavour == 4) {
+    uint32_t v = 0;
+    for (int b = 0; b < 4; ++b) v |= (0x3Cu + static_cast<uint32_t>(r.next() % 6)) << (8 * b);
+    return v;
+  }
   const uint64_t x = r.next();
   if (flavour == 1) return static_cast<uint32_t>(x) & 0xFF;
   if (flavour == 2) {
@@ -10854,6 +11349,51 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   for (uint64_t v : c.mix) h.add(v);
   for (uint64_t v : c.mops) h.add(v);
   return h.h;
+}
+
+
+// ---- the timing probe (amd_exec.hpp) ----------------------------------------------------------------------------------
+
+double time_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour, uint32_t iterations) {
+  static constexpr uint32_t kMach[] = {0x4c, 0x3f, 0x4f, 0x41, 0x48, 0x36, 0x49};   // by gcn::Target's order
+  CodeObject co;
+  co.mach = kMach[static_cast<int>(target)];
+  co.text.assign(16, 0);
+  Kernel k;
+  k.name = "probe";
+  k.wave32 = gcn::is_rdna(target);
+  Dispatch d;
+  d.object = &co;
+  d.kernel = &k;
+  MemoryManager mem(4ull << 20);
+  mem.alloc(1 << 16);
+  DecodeCache cache(16);
+  cache.get(0, [&] { return in; });
+  d.decoded = &cache;
+  Machine m(d, mem, cache);
+  Rng r{seed * 0x2545F4914F6CDD1Dull + flavour};
+  Group g;
+  g.lds.assign(1 << 16, 0);
+  g.waves.resize(1);
+  Wave& w = g.waves[0];
+  w.lanes = k.wave32 ? 32 : kLanes;
+  w.mode = k.mode;
+  w.vgpr.grow(288);
+  w.agpr.resize(288);
+  for (uint32_t& s : w.sgpr) s = draw(r, flavour);
+  for (auto& row : w.vgpr.r)
+    for (uint32_t& v : row) v = draw(r, flavour);
+  for (auto& row : w.agpr)
+    for (uint32_t& v : row) v = draw(r, flavour);
+  w.exec = w.lanes == 64 ? ~uint64_t{0} : (uint64_t{1} << w.lanes) - 1;
+  w.pc = 0;
+  m.step(w, g);   // (throws what the instruction throws)
+  const auto t0 = std::chrono::steady_clock::now();
+  for (uint32_t i = 0; i < iterations; ++i) {
+    w.pc = 0;
+    m.step(w, g);
+  }
+  return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / iterations;
 }
 
 }  // namespace vgpu::amd
