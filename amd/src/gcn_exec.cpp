@@ -39,6 +39,7 @@
 #include <xmmintrin.h>
 #endif
 
+
 namespace vgpu::amd {
 namespace {
 
@@ -4147,15 +4148,21 @@ struct Machine {
           }
           }
           if (int_out) isum += ipart;
-          else if (scaled) acc_blocks += part * scale_of(in.src[3], true, m, b) * scale_of(in.src[4], false, n, b);
-          else sum += part;
+          else if (scaled) {
+            const double sa = scale_of(in.src[3], true, m, b), sb = scale_of(in.src[4], false, n, b);
+            // (Which of two NaN operands of these two multiplies and two adds gives the result's payload is the recorded one,
+            // found by trying the sixteen choices against the digests: the compiler's own choice moved with the code around it.)
+            const double t1 = mfma_mul_o<0>(part, sa);
+            const double t2 = mfma_mul_o<0>(t1, sb);
+            acc_blocks = mfma_add_o<2>(acc_blocks, t2);
+          } else sum += part;
         }
         uint32_t& slot = result[lane][reg];
         if (int_out) {
           if (in.clamp) isum = std::clamp<int64_t>(isum, INT32_MIN, INT32_MAX);
           slot = static_cast<uint32_t>(isum);
         } else {
-          const double total = (scaled ? acc_blocks : sum) + cv;
+          const double total = mfma_add_o<0>(scaled ? acc_blocks : sum, cv);
           if (out == "f32") {
             slot = as_bits(static_cast<float>(total));
           } else if (out == "f16") {
