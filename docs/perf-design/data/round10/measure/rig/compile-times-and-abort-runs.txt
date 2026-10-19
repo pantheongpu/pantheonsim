@@ -1,0 +1,111 @@
+gemm_sm80_sparse_f16 rc=1 compile_s=0
+sm90_group_gemm rc=0 compile_s=41
+fmha rc=0 compile_s=109
+sm100_f16_f16_void_f32 rc=0 compile_s=96
+sm120_f4_f6 rc=0 compile_s=45
+tma_load rc=0 compile_s=304
+BUILD_DONE
+gemm_sm80_sparse_f16 rc=0 compile_s=35
+sm100_f8 rc=0 compile_s=99
+sm90_pingpong rc=0 compile_s=110
+sm100_blockscaled_mxf8 rc=0 compile_s=138
+sm90_sparse_f16 rc=0 compile_s=110
+sm120_bs_mxf4 rc=0 compile_s=108
+BUILD2_DONE
+nn r1 t0 rc=0 wall=9.71
+nn r1 t1 rc=0 wall=9.66
+sdpa r1 t0 rc=0 wall=7.19
+sdpa r1 t1 rc=0 wall=6.48
+losses r1 t0 rc=0 wall=7.37
+losses r1 t1 rc=0 wall=7.34
+amp r1 t0 rc=0 wall=6.30
+amp r1 t1 rc=0 wall=6.21
+nn r2 t0 rc=134 wall=10.41
+nn r2 t1 rc=0 wall=9.61
+sdpa r2 t0 rc=0 wall=7.07
+sdpa r2 t1 rc=0 wall=6.33
+losses r2 t0 rc=0 wall=7.29
+losses r2 t1 rc=134 wall=8.09
+amp r2 t0 rc=0 wall=6.14
+amp r2 t1 rc=0 wall=6.09
+nn r3 t0 rc=0 wall=9.66
+nn r3 t1 rc=134 wall=10.34
+sdpa r3 t0 rc=0 wall=7.21
+sdpa r3 t1 rc=0 wall=6.40
+losses r3 t0 rc=0 wall=7.34
+losses r3 t1 rc=134 wall=8.15
+amp r3 t0 rc=0 wall=6.31
+amp r3 t1 rc=0 wall=6.25
+nn r4 t0 rc=134 wall=10.38
+nn r4 t1 rc=0 wall=9.66
+sdpa r4 t0 rc=0 wall=7.27
+sdpa r4 t1 rc=0 wall=6.55
+losses r4 t0 rc=0 wall=7.38
+losses r4 t1 rc=134 wall=8.20
+amp r4 t0 rc=0 wall=6.52
+amp r4 t1 rc=0 wall=6.50
+nn r5 t0 rc=134 wall=10.50
+nn r5 t1 rc=134 wall=10.42
+sdpa r5 t0 rc=0 wall=7.39
+sdpa r5 t1 rc=0 wall=6.57
+losses r5 t0 rc=134 wall=8.20
+losses r5 t1 rc=134 wall=8.21
+amp r5 t0 rc=0 wall=6.39
+amp r5 t1 rc=0 wall=6.42
+nn r6 t0 rc=134 wall=10.48
+nn r6 t1 rc=0 wall=9.72
+sdpa r6 t0 rc=0 wall=7.25
+sdpa r6 t1 rc=0 wall=6.57
+losses r6 t0 rc=134 wall=8.18
+losses r6 t1 rc=134 wall=8.18
+amp r6 t0 rc=0 wall=6.44
+amp r6 t1 rc=134 wall=6.93
+nn r7 t0 rc=134 wall=10.45
+nn r7 t1 rc=134 wall=10.36
+sdpa r7 t0 rc=0 wall=7.30
+sdpa r7 t1 rc=0 wall=6.53
+losses r7 t0 rc=134 wall=8.17
+losses r7 t1 rc=134 wall=8.17
+amp r7 t0 rc=0 wall=6.40
+amp r7 t1 rc=0 wall=6.35
+nn r8 t0 rc=134 wall=10.46
+nn r8 t1 rc=0 wall=9.67
+sdpa r8 t0 rc=0 wall=7.19
+sdpa r8 t1 rc=0 wall=6.33
+losses r8 t0 rc=0 wall=7.31
+losses r8 t1 rc=134 wall=8.13
+amp r8 t0 rc=0 wall=6.19
+amp r8 t1 rc=0 wall=6.15
+nn r9 t0 rc=0 wall=9.64
+nn r9 t1 rc=0 wall=9.58
+sdpa r9 t0 rc=0 wall=7.07
+sdpa r9 t1 rc=0 wall=6.28
+losses r9 t0 rc=134 wall=8.10
+losses r9 t1 rc=134 wall=8.11
+amp r9 t0 rc=0 wall=6.30
+amp r9 t1 rc=0 wall=6.22
+nn r10 t0 rc=134 wall=10.39
+nn r10 t1 rc=134 wall=10.29
+sdpa r10 t0 rc=0 wall=7.08
+sdpa r10 t1 rc=0 wall=6.34
+losses r10 t0 rc=0 wall=7.30
+losses r10 t1 rc=134 wall=8.10
+amp r10 t0 rc=134 wall=6.86
+amp r10 t1 rc=0 wall=6.21
+nn r11 t0 rc=0 wall=9.69
+nn r11 t1 rc=0 wall=9.59
+sdpa r11 t0 rc=0 wall=7.16
+sdpa r11 t1 rc=0 wall=6.36
+losses r11 t0 rc=0 wall=7.32
+losses r11 t1 rc=134 wall=8.15
+amp r11 t0 rc=0 wall=6.27
+amp r11 t1 rc=0 wall=6.32
+nn r12 t0 rc=0 wall=9.73
+nn r12 t1 rc=134 wall=10.35
+sdpa r12 t0 rc=0 wall=7.25
+sdpa r12 t1 rc=0 wall=11.57
+losses r12 t0 rc=0 wall=15.13
+losses r12 t1 rc=134 wall=10.71
+amp r12 t0 rc=0 wall=6.37
+amp r12 t1 rc=0 wall=6.23
+DONE

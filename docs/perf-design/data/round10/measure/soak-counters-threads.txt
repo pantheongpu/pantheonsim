@@ -1,0 +1,3 @@
+c0t4 {'identical': 18} total lines compared 693
+c1t1 {'identical': 17, 'DIFF': 1} total lines compared 169511
+  DIFF ('sw_ops', '0', '0', ['[vgpu] cudaLaunchKernel: VirtualGPU error [out-of-memory]: SASS kernel _ZN14at_cuda_detail3cub6detai'], ['[vgpu] cudaLaunchKernel: VirtualGPU error [out-of-memory]: SASS kernel _ZN14at_cuda_detail3cub6detai'])
