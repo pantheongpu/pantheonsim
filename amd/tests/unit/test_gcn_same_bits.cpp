@@ -48,8 +48,10 @@ std::vector<std::string> lines_of(const std::string& path) {
   return out;
 }
 
-// Shapes the gfx1250 fuzz corpus holds that no assembler would write and the interpreter does not guard against
-// (an operand the encoding has no field for), which would take the probe down rather than throw.
+// Shapes the gfx1250 fuzz corpus holds that no assembler would write, which the digest does not cover: on the base
+// commit (f81cc0c1) they took the probe down (the executor read the address operand of an LDS instruction that has
+// none, off the end of an empty vector), so no base digest exists to record. They run, and are checked, in
+// ds_instructions_without_an_address_fail_gracefully below.
 bool skipped(const amd::gcn::Inst& in) {
   return in.name == "ds_nop" || in.name == "ds_consume" || in.name == "ds_append";
 }
@@ -147,6 +149,43 @@ VTEST(every_instruction_of_the_isa_corpora_gives_the_recorded_bits) {
   VCHECK(nonzero > 10000);   // most shapes ran (or threw a definite error), not all refused
   if (wrong_total)
     throw vtest::Failure(std::to_string(wrong_total) + " of " + std::to_string(checked) + " instructions differ from the recorded bits:" + report);
+}
+
+// ds_nop does nothing; ds_append and ds_consume (the wave-wide counters) are not modelled and say so. Neither may read an
+// address operand the decoder did not give them (a segfault in the build this test was added to).
+VTEST(ds_instructions_without_an_address_fail_gracefully) {
+  struct Case {
+    const char* name;
+    uint32_t word0;
+    bool runs;
+  };
+  const Case cases[] = {{"ds_nop", 0xD8500000u, true}, {"ds_consume", 0xD8F40000u, false}, {"ds_append", 0xD8F80000u, false}};
+  const amd::gcn::Target targets[] = {amd::gcn::Target::Gfx1030, amd::gcn::Target::Gfx1100, amd::gcn::Target::Gfx1200,
+                                      amd::gcn::Target::Gfx1250};
+  size_t checked = 0;
+  for (amd::gcn::Target t : targets)
+    for (const Case& c : cases)
+      for (uint32_t vdst : {0u, 5u, 0xC9u}) {
+        const uint32_t word1 = c.runs ? 0u : vdst << 24;
+        std::vector<uint8_t> code;
+        for (uint32_t v : {c.word0, word1})
+          for (int b = 0; b < 4; ++b) code.push_back(static_cast<uint8_t>(v >> (8 * b)));
+        amd::gcn::Inst in;
+        try {
+          in = amd::gcn::decode(code, 0, 0, t);
+        } catch (const std::exception&) {
+          continue;   // (an architecture without the instruction)
+        }
+        if (in.name != c.name) continue;
+        for (uint32_t flavour = 0; flavour < 4; ++flavour) {
+          std::string error;
+          amd::digest_instruction(in, t, 7 + flavour, flavour, &error);
+          if (c.runs) VCHECK(error.empty());
+          else VCHECK(error.find("not modelled") != std::string::npos);
+          ++checked;
+        }
+      }
+  VCHECK(checked >= 36);   // (the three instructions, three registers, four flavours, on at least one architecture)
 }
 
 VTEST_MAIN

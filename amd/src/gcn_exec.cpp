@@ -12,6 +12,7 @@
 #include <map>
 #include <cstdlib>
 #include <exception>
+#include <system_error>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -6468,6 +6469,13 @@ struct Machine {
 
   void lds_access(Wave& w, const Inst& in, Group& g) {
     const OpName op(in);
+    // An LDS instruction the decoder gives no address register: ds_nop (which does nothing), and the append/consume counters
+    // (ds_append, ds_consume: a wave-wide counter at M0's address, whose rules the ISA documents too thinly to model; their
+    // only operand is the destination). Reading src[0] of these ran off an empty vector. (The addtid forms name none either,
+    // and address by lane below.)
+    if (op == "ds_nop"_op) return;
+    if (in.src.empty() && !(op == "ds_load_addtid_b32"_op || op == "ds_read_addtid_b32"_op))
+      throw Error::make(Err::Unsupported, "LDS instruction ", op, " has no address operand and is not modelled");
     if (uint32_t bits; in.name.rfind("ds_", 0) == 0 && transpose_kind(std::string_view(in.name).substr(3), &bits)) {
       if (!transpose_ready(w, in)) return;
       uint8_t raw[32][16] = {};
@@ -10046,6 +10054,20 @@ unsigned worker_count(uint64_t groups) {
   return want ? want : 1;
 }
 
+// Starts `body` on a new host thread. Where the host will not start one (std::system_error: EAGAIN at a process or user
+// limit, or no address space left), `body` runs here, to its end, before this returns: the ranges of work-groups the
+// threads share are independent, so the dispatch finishes, on fewer threads, with the bits it would have had. (A
+// std::thread that was never started and then destroyed joinable is a std::terminate; the pools' vectors hold only
+// started ones.)
+template <typename Body>
+void start_or_run_here(std::vector<std::thread>& pool, Body body) {
+  try {
+    pool.emplace_back(body);
+  } catch (const std::system_error&) {
+    body();
+  }
+}
+
 // A work-group's waves, set up as the hardware leaves them.
 void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_segment, uint32_t gx,
                   uint32_t gy, uint32_t gz) {
@@ -10548,7 +10570,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
       std::atomic<bool> failed{false};
       for (unsigned t = 0; t < nthreads_c; ++t) {
         const uint64_t begin = clusters * t / nthreads_c, end = clusters * (t + 1) / nthreads_c;
-        pool.emplace_back([&, t, begin, end] {
+        start_or_run_here(pool, [&, t, begin, end] {
           try {
             Machine m(d, mem, *cache);
             m.concurrent = true;
@@ -10648,9 +10670,23 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     if (shape.workers <= 1) {
       resident(0);
     } else {
+      // (Its workers wait on one another's progress, so one the host would not start cannot be run here in its turn:
+      // the others are told to stop, and the launch fails.)
       std::vector<std::thread> pool;
-      for (unsigned t = 0; t < shape.workers; ++t) pool.emplace_back(resident, t);
+      std::string refused;
+      for (unsigned t = 0; t < shape.workers && refused.empty(); ++t) {
+        try {
+          pool.emplace_back(resident, t);
+        } catch (const std::system_error& e) {
+          refused = e.what();
+          failed = true;
+        }
+      }
       for (std::thread& th : pool) th.join();
+      if (!refused.empty()) {
+        if (packet) mem.free(packet);
+        throw Error::make(Err::Internal, "the host would not start a thread for the dispatch's work-groups: ", refused);
+      }
     }
     if (first_error) {
       if (packet) mem.free(packet);
@@ -10695,7 +10731,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     std::atomic<bool> failed{false};
     for (unsigned t = 0; t < nthreads; ++t) {
       const uint64_t begin = groups * t / nthreads, end = groups * (t + 1) / nthreads;
-      threads_.emplace_back([&, t, begin, end] {
+      start_or_run_here(threads_, [&, t, begin, end] {
         try {
           Machine m(d, mem, *cache);
           m.concurrent = true;
@@ -10767,7 +10803,7 @@ uint32_t draw(Rng& r, uint32_t flavour) {
 }
 }  // namespace
 
-uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour) {
+uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour, std::string* error_out) {
   static constexpr uint32_t kMach[] = {0x4c, 0x3f, 0x4f, 0x41, 0x48, 0x36, 0x49};   // by gcn::Target's order
   CodeObject co;
   co.mach = kMach[static_cast<int>(target)];
@@ -10832,6 +10868,7 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
     for (int l = 0; l < 64; ++l) std::fprintf(stderr, " %08x", w.vgpr[r][l]);
     std::fprintf(stderr, "\n");
   }
+  if (error_out) *error_out = error;
   h.add(ran);
   h.add_bytes(error.data(), error.size());
   h.add(w.pc), h.add(w.exec), h.add(w.vcc), h.add(w.m0), h.add(w.scc), h.add(w.done), h.add(w.at_barrier);

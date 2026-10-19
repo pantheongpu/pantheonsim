@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <pthread.h>
+#include <system_error>
 #include <thread>
 #include <climits>
 #include <cstddef>
@@ -76,6 +77,15 @@ bool quiet() {
 hipError_t fail(hipError_t code, const std::string& what) {
   if (!quiet()) std::fprintf(stderr, "VirtualGPU HIP: %s\n", what.c_str());
   return code;
+}
+
+// What a module that could not be put on the device is told as: the host being short of memory (the simulator's guard,
+// VGPU_MEMORY_HOST_RESERVE_MB) is hipErrorOutOfMemory, as ROCm's loader says it, not an invalid image. (A launch whose
+// module load hit the guard once showed as hipErrorInvalidImage and, in a program that does not read launch errors, as a
+// kernel that silently never ran.)
+hipError_t load_failure(const std::exception& e) {
+  const auto* v = dynamic_cast<const vgpu::Error*>(&e);
+  return fail(v && v->code() == vgpu::Err::OutOfMemory ? hipErrorOutOfMemory : hipErrorInvalidImage, e.what());
 }
 
 // The code for a copy or fill that threw: a chunk of host memory the device's bytes needed was not
@@ -655,17 +665,31 @@ hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std
     if (const hipError_t e = order_for(s, stream, &o); e != hipSuccess) return e;
   }
   for (Queue::Marker& m : also) o.after.push_back(std::move(m));
+  // A stream's thread starts with its first item. A host that will not start one (EAGAIN at a process or user limit)
+  // is a launch that failed, not an exception out of a C entry point, and the item is not queued.
+  const auto no_thread = [](const std::system_error& e) {
+    return fail(hipErrorOutOfMemory, std::string("the host would not start a thread for the stream: ") + e.what());
+  };
   if (!wait && !synchronous_launches()) {
-    o.queue->submit(std::move(work), std::move(o.after));
+    try {
+      o.queue->submit(std::move(work), std::move(o.after));
+    } catch (const std::system_error& e) {
+      return no_thread(e);
+    }
     return hipSuccess;
   }
   auto result = std::make_shared<hipError_t>(hipSuccess);
-  const uint64_t seq = o.queue->submit(
-      [result, work = std::move(work)] {
-        *result = work();
-        return hipSuccess;   // told to the caller, not kept for a later synchronization
-      },
-      std::move(o.after));
+  uint64_t seq = 0;
+  try {
+    seq = o.queue->submit(
+        [result, work = std::move(work)] {
+          *result = work();
+          return hipSuccess;   // told to the caller, not kept for a later synchronization
+        },
+        std::move(o.after));
+  } catch (const std::system_error& e) {
+    return no_thread(e);
+  }
   o.queue->wait(seq);
   // A blocking call also returns a failure the stream's earlier asynchronous
   // work left (HIP's "may also return error codes from previous,
@@ -874,6 +898,44 @@ hipError_t prepare_launch(State& s, int ordinal, const Module& module, const Ker
   return hipSuccess;
 }
 
+// VGPU_DISPATCH_STATS=<file> appends one line to the file for each kernel launch that finished, with what the dispatch
+// counted (vgpu::amd::DispatchStats: the numbers the profiler's SQ_* counters are made of, and the interpreter's own
+// instruction total). "1" writes the lines to stderr. It needs no profiler, so tools/bench-amd can count instructions
+// where rocprofv3 does not run. One line, one write, so launches on different streams do not interleave.
+void note_dispatch_stats(const Kernel& kernel, int ordinal, const vgpu::amd::DispatchStats& st) {
+  static const char* const target = [] {
+    const char* t = std::getenv("VGPU_DISPATCH_STATS");
+    return t && *t && std::strcmp(t, "0") != 0 ? t : nullptr;
+  }();
+  if (!target) return;
+  const vgpu::amd::InstructionCounts& c = st.counts;
+  char line[640];
+  const int n = std::snprintf(
+      line, sizeof line,
+      "VGPU_DISPATCH device=%d wave=%d waves=%llu instructions=%llu barriers=%llu valu=%llu mfma=%llu salu=%llu smem=%llu "
+      "vmem=%llu flat=%llu lds=%llu branch=%llu sendmsg=%llu gds=%llu flat_read=%llu flat_write=%llu flat_atomic=%llu "
+      "vmem_rd=%llu vmem_wr=%llu\n",
+      ordinal, kernel.wave32 ? 32 : 64, static_cast<unsigned long long>(st.waves),
+      static_cast<unsigned long long>(st.instructions), static_cast<unsigned long long>(st.barriers),
+      static_cast<unsigned long long>(c.valu), static_cast<unsigned long long>(c.mfma),
+      static_cast<unsigned long long>(c.salu), static_cast<unsigned long long>(c.smem),
+      static_cast<unsigned long long>(c.vmem), static_cast<unsigned long long>(c.flat),
+      static_cast<unsigned long long>(c.lds), static_cast<unsigned long long>(c.branch),
+      static_cast<unsigned long long>(c.sendmsg), static_cast<unsigned long long>(c.gds),
+      static_cast<unsigned long long>(c.flat_read), static_cast<unsigned long long>(c.flat_write),
+      static_cast<unsigned long long>(c.flat_atomic), static_cast<unsigned long long>(c.vmem_rd),
+      static_cast<unsigned long long>(c.vmem_wr));
+  if (n <= 0) return;
+  if (std::strcmp(target, "1") == 0) {
+    (void)!::write(2, line, static_cast<size_t>(n));
+    return;
+  }
+  const int fd = ::open(target, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+  if (fd < 0) return;
+  (void)!::write(fd, line, static_cast<size_t>(n));   // (O_APPEND: the line lands whole)
+  ::close(fd);
+}
+
 // Runs one kernel on one device: the arguments go into device memory as its
 // kernarg segment, and the dispatch runs to completion before this returns.
 // On a stream's thread, without s.mutex.
@@ -981,6 +1043,7 @@ hipError_t run_launch(const LaunchJob& job) {
       start = vgpu::amd::hipprof::now_ns();
     }
     const vgpu::amd::DispatchStats stats = vgpu::amd::execute(dispatch, mem);
+    note_dispatch_stats(kernel, ordinal, stats);
     if (prof && prof->launched) {
       prof->launched(launch, &stats, start, vgpu::amd::hipprof::now_ns(), token);
       prof = nullptr;   // told
@@ -1122,7 +1185,7 @@ hipError_t module_on(State& s, FatBinary& fb, int ordinal, Module** out) {
     *out = m.get();
     fb.on_device.emplace(ordinal, std::move(m));
   } catch (const std::exception& e) {
-    return fail(hipErrorInvalidImage, e.what());
+    return load_failure(e);
   }
   return hipSuccess;
 }
@@ -1907,7 +1970,7 @@ hipError_t load_module(State& s, vgpu::runtime::Device* d, const void* image, Mo
     *out = m.get();
     s.modules.push_back(std::move(m));
   } catch (const std::exception& e) {
-    return fail(hipErrorInvalidImage, e.what());
+    return load_failure(e);
   }
   return hipSuccess;
 }

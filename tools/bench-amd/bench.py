@@ -8,10 +8,12 @@ What it does
   * compiles tools/bench-amd/kernels/bench_amd.hip once per target with hipcc
     (gfx942 for the simulated MI300X, gfx1030 for the RX 6800) and runs one
     self-checking workload per process through VirtualGPU's libamdhip64;
-  * takes the instruction counts of a workload from rocprofv3's SQ_INSTS_*
-    counters inside `vgpu shell --no-isolate` (exact and deterministic: they come
-    from the interpreter's own DispatchStats), then times N runs without any
-    profiler: wave-instructions per CPU second of the device phase;
+  * takes the instruction counts of a workload (exact and deterministic: they are the interpreter's own
+    DispatchStats) in one untimed run on one host thread, then times N runs without any profiler:
+    wave-instructions per CPU second of the device phase. The counts come from the shim's own
+    VGPU_DISPATCH_STATS probe (no profiler needed: --counts-via probe, the default) or from rocprofv3's SQ_INSTS_*
+    counters inside `vgpu shell --no-isolate` (--counts-via rocprof), or both (--counts-via both: the probe's
+    counts are used, and rocprofv3's must equal them wherever rocprofv3 managed to run);
   * alternates the runs over every (build, thread count) configuration, so a slow
     drift of the machine falls on all of them, and reports median, best and
     spread; with two builds it also gives the ratio and a Mann-Whitney p-value;
@@ -89,6 +91,14 @@ EXTRA = ["SQ_WAVES", "SQ_INSTS_VMEM_RD", "SQ_INSTS_VMEM_WR", "TA_FLAT_ATOMIC_WAV
 # per-class branch, vector-memory or message counters: its instruction total is the two by-wave-size counters.
 RDNA_INSTS = ["SQ_INSTS_SALU", "SQ_INSTS_SMEM", "SQ_INSTS_VALU", "SQ_INSTS_FLAT", "SQ_INSTS_LDS", "SQ_WAVE32_INSTS",
               "SQ_WAVE64_INSTS", "SQ_WAVES"]
+
+
+# The probe's fields (VGPU_DISPATCH_STATS lines, amd/src/hip_api.cpp) behind each profiler counter, the same
+# DispatchStats members amd/src/rocprofiler_sdk.cpp's counter table reads.
+PROBE_FIELD = {"SQ_INSTS_SALU": "salu", "SQ_INSTS_SMEM": "smem", "SQ_INSTS_VALU": "valu", "SQ_INSTS_VMEM": "vmem",
+               "SQ_INSTS_LDS": "lds", "SQ_INSTS_BRANCH": "branch", "SQ_INSTS_SENDMSG": "sendmsg",
+               "SQ_INSTS_MFMA": "mfma", "SQ_WAVES": "waves", "SQ_INSTS_VMEM_RD": "vmem_rd",
+               "SQ_INSTS_VMEM_WR": "vmem_wr", "TA_FLAT_ATOMIC_WAVEFRONTS": "flat_atomic", "SQ_INSTS_FLAT": "flat"}
 
 
 def die(msg, code=2):
@@ -196,6 +206,14 @@ def counting_run(binary, wl, size, build, gpu, tmp, args):
     """Counts from rocprofv3 inside `vgpu shell`: summed over the workload's dispatches."""
     out = tempfile.mkdtemp(prefix="cnt.", dir=tmp)
     rdna = gpu.startswith("amd/rx")
+    # (By its bare name: `vgpu shell` puts its own rocprofv3 in front of PATH, ROCm's tool pointed at VirtualGPU's
+    # librocprofiler-sdk. Called by a path, or with that library not built, ROCm's own tool runs, finds no counters
+    # on the simulated agents, and writes no counter CSV although the program runs and passes.)
+    if not os.path.exists(os.path.join(build, "shim", "librocprofiler-sdk.so.1")):
+        return None, "%s has no shim/librocprofiler-sdk.so.1 (build the vgpurocprof target): without it `vgpu shell` runs ROCm's own rocprofv3, which writes no counter CSV" % build
+    if not shutil.which("rocprofv3") and not any(os.access(os.path.join(r, "bin", "rocprofv3"), os.X_OK) for r in
+                                                  (os.environ.get("ROCM_PATH") or "", "/opt/rocm")):
+        return None, "no rocprofv3 in PATH or in ROCM_PATH or /opt/rocm"
     cmds = "rocprofv3 --pmc %s --output-format csv -d %s -- %s %s %s" % (
         " ".join(RDNA_INSTS if rdna else INSTS + EXTRA), out, binary, wl, size)
     argv = pin([os.path.join(build, "vgpu"), "shell", "-y", "--gpu", gpu, "--count", "1", "--no-isolate", "-c", cmds],
@@ -209,7 +227,10 @@ def counting_run(binary, wl, size, build, gpu, tmp, args):
     for dp, _, fs in os.walk(out):
         files += [os.path.join(dp, f) for f in fs if f.endswith("_counter_collection.csv")]
     if not files:
-        return None, "rocprofv3 wrote no counter_collection.csv for %s" % wl
+        found = sorted(os.path.relpath(os.path.join(dp, f), out) for dp, _, fs in os.walk(out) for f in fs)
+        tail = (res["stderr"] + res["stdout"]).strip().splitlines()[-6:]
+        return None, "rocprofv3 wrote no counter_collection.csv for %s (it wrote: %s; last output:\n    %s)" % (
+            wl, ", ".join(found) or "nothing", "\n    ".join(tail))
     totals, dispatches = {}, set()
     with open(files[0]) as f:
         for row in csv.DictReader(f):
@@ -221,6 +242,49 @@ def counting_run(binary, wl, size, build, gpu, tmp, args):
     else:
         totals["wave_instructions"] = sum(totals.get(n, 0) for n in INSTS if n != "SQ_INSTS_MFMA")  # MFMA is inside VALU
     shutil.rmtree(out, ignore_errors=True)
+    return totals, ""
+
+
+def probe_counting_run(binary, wl, size, build, gpu, tmp, args):
+    """Counts from the shim's own VGPU_DISPATCH_STATS probe: the program run directly on one host thread, one line a
+    launch. The same DispatchStats numbers rocprofv3's counters are made of, without rocprofv3 (which needs ROCm's
+    profiler tool, a user namespace-free `vgpu shell` and a CSV that has gone missing on some hosts)."""
+    path = os.path.join(tmp, "dispatch-stats.%d.txt" % time.monotonic_ns())
+    res = C.run_argv(pin([binary, wl, size], args.cpus), clean_env(build, gpu, 1, tmp, list(args.env) + ["VGPU_DISPATCH_STATS=" + path]),
+                     max(args.timeout, 600))
+    if res["rc"] != 0 or not res["stdout"].rstrip().endswith("PASS"):
+        tail = (res["stderr"] + res["stdout"]).strip().splitlines()[-8:]
+        return None, "probe counting run of %s failed (rc=%s):\n    %s" % (wl, res["rc"], "\n    ".join(tail))
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith("VGPU_DISPATCH "):
+                    rows.append({k: int(v) for k, v in (kv.split("=") for kv in line.split()[1:])})
+    except OSError:
+        pass
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if not rows:
+        return None, "the probe wrote no VGPU_DISPATCH line for %s (is the build older than VGPU_DISPATCH_STATS?)" % wl
+    rdna = gpu.startswith("amd/rx")
+    names = RDNA_INSTS if rdna else INSTS + EXTRA
+    totals = {}
+    for n in names:
+        if n == "SQ_WAVE32_INSTS":
+            totals[n] = sum(r["instructions"] for r in rows if r["wave"] == 32)
+        elif n == "SQ_WAVE64_INSTS":
+            totals[n] = sum(r["instructions"] for r in rows if r["wave"] == 64)
+        else:
+            totals[n] = sum(r[PROBE_FIELD[n]] for r in rows)
+    totals["dispatches"] = len(rows)
+    if rdna:
+        totals["wave_instructions"] = totals.get("SQ_WAVE32_INSTS", 0) + totals.get("SQ_WAVE64_INSTS", 0)
+    else:
+        totals["wave_instructions"] = sum(totals.get(n, 0) for n in INSTS if n != "SQ_INSTS_MFMA")  # MFMA is inside VALU
     return totals, ""
 
 
@@ -377,7 +441,10 @@ def build_parser():
     p.add_argument("--cache", default=os.path.expanduser("~/.cache/vgpu-bench-amd"))
     p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--json", help="write everything to this file")
-    p.add_argument("--no-counts", action="store_true", help="skip the rocprofv3 counting runs")
+    p.add_argument("--no-counts", action="store_true", help="skip the counting runs")
+    p.add_argument("--counts-via", choices=("probe", "rocprof", "both"), default="probe",
+                   help="where instruction counts come from: the shim's VGPU_DISPATCH_STATS probe (default; needs no profiler), "
+                        "rocprofv3 inside `vgpu shell`, or both (the probe's stand; rocprofv3 must agree wherever it ran)")
     p.add_argument("--check-counters", action="store_true", help="compare counts with tools/bench-amd/expected (quick size)")
     p.add_argument("--update-expected", action="store_true")
     p.add_argument("--quiet", action="store_true")
@@ -402,6 +469,8 @@ def main():
     try:
         bins = {TARGETS[t][0]: ensure_binary(TARGETS[t][0], args.cache, hipcc, not args.quiet) for t in targets}
         counts = {}
+        notes = {}
+        crosschecked = 0
         if not args.no_counts or check:
             for wl in names:
                 if (wl in NO_COUNTS and not check) or wl in NO_KERNELS:
@@ -410,9 +479,26 @@ def main():
                     if tg not in WORKLOADS[wl][2]:
                         continue
                     for b in builds:
-                        cnt, err = counting_run(bins[TARGETS[tg][0]], wl, args.size, b, TARGETS[tg][1], tmp, args)
-                        if cnt is None:
-                            die(err, 1)
+                        binary, gpu = bins[TARGETS[tg][0]], TARGETS[tg][1]
+                        cnt = None
+                        if args.counts_via in ("probe", "both"):
+                            cnt, err = probe_counting_run(binary, wl, args.size, b, gpu, tmp, args)
+                            if cnt is None:
+                                die(err, 1)
+                        if args.counts_via in ("rocprof", "both"):
+                            prof, err = counting_run(binary, wl, args.size, b, gpu, tmp, args)
+                            if args.counts_via == "rocprof":
+                                if prof is None:
+                                    die(err, 1)
+                                cnt = prof
+                            elif prof is None:
+                                # (The probe's counts stand; what rocprofv3 would have said is not known.)
+                                notes.setdefault(err.replace(wl, "<workload>"), []).append("%s/%s" % (wl, tg))
+                            elif compact(prof) != compact(cnt):
+                                die("rocprofv3 and the probe disagree on %s/%s:\n    rocprofv3 %s\n    probe     %s" % (
+                                    wl, tg, json.dumps(compact(prof), sort_keys=True), json.dumps(compact(cnt), sort_keys=True)), 1)
+                            else:
+                                crosschecked += 1
                         counts[(wl, tg, b)] = cnt
                         if not args.quiet:
                             sys.stderr.write("  counted %s/%s: %d wave-instructions\n" % (wl, tg, cnt["wave_instructions"]))
@@ -449,7 +535,11 @@ def main():
             if bad:
                 print("counter drift:\n  " + "\n  ".join(bad))
                 return 1
-            print("counters match %s (%d workload/target pairs)" % (os.path.basename(path), len(new["counts"])))
+            print("counters match %s (%d workload/target pairs; counted by %s%s)" % (
+                os.path.basename(path), len(new["counts"]), args.counts_via,
+                ", rocprofv3 agreed on %d" % crosschecked if args.counts_via == "both" else ""))
+            for why, pairs in notes.items():
+                print("NOTE: rocprofv3 cross-check not made for %d of %d (%s): %s" % (len(pairs), len(new["counts"]), ", ".join(pairs[:4]) + (", ..." if len(pairs) > 4 else ""), why))
             return 0
         results = timing_flow(names, targets, builds, thread_list, counts, bins, args, tmp)
         meta = meta_block(args, builds, hipcc)

@@ -176,7 +176,9 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem);
 // lanes off), and a digest of everything it changed or threw: all registers, the lane masks, SCC, M0,
 // the program counter, LDS, the memory, the instruction counts, or the error's text. Two builds that
 // interpret the instruction alike give the same digest.
-uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour);
+// (`error`, if given, receives the error's text, empty where the instruction ran.)
+uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t flavour,
+                            std::string* error = nullptr);
 
 // The process is exiting: every dispatch still running stops within a few
 // thousand instructions a wave, throwing Err::DeviceLost, and none starts.

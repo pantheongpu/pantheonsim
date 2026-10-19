@@ -1437,6 +1437,9 @@ vgpu_unit_test(test_amd_gcn_narrow amd/tests/unit/test_gcn_narrow.cpp)
 target_compile_definitions(test_amd_gcn_narrow PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 vgpu_unit_test(test_amd_gcn_lds amd/tests/unit/test_gcn_lds.cpp)
+# A dispatch whose host threads the host refuses to start still finishes (it used to die in std::terminate).
+vgpu_unit_test(test_amd_gcn_thread_refused amd/tests/unit/test_gcn_thread_refused.cpp)
+target_compile_definitions(test_amd_gcn_thread_refused PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # Each AMD profile's chip facts are its own (amd/include/vgpu/amd_chip.hpp).
 vgpu_unit_test(test_amd_chip amd/tests/unit/test_amd_chip.cpp)
@@ -1503,6 +1506,21 @@ add_executable(test_amd_hip_at_exit amd/tests/unit/test_hip_at_exit.cpp)
 target_link_libraries(test_amd_hip_at_exit PRIVATE vgpurocprof vgpuhip)
 target_include_directories(test_amd_hip_at_exit PRIVATE tests/framework amd/include)
 add_test(NAME test_amd_hip_at_exit COMMAND test_amd_hip_at_exit)
+# A module the host has no memory for is hipErrorOutOfMemory, not an invalid image.
+add_executable(test_amd_hip_module_oom amd/tests/unit/test_hip_module_oom.cpp)
+target_link_libraries(test_amd_hip_module_oom PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_module_oom PRIVATE tests/framework amd/include)
+target_compile_definitions(test_amd_hip_module_oom PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_hip_module_oom COMMAND test_amd_hip_module_oom)
+set_tests_properties(test_amd_hip_module_oom PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1;VGPU_MEMORY_HOST_RESERVE_MB=1000000000"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL")
+# The host refusing to start a stream's thread is an error code, not a terminate.
+add_executable(test_amd_hip_thread_refused amd/tests/unit/test_hip_thread_refused.cpp)
+target_link_libraries(test_amd_hip_thread_refused PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_thread_refused PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_thread_refused COMMAND test_amd_hip_thread_refused)
+set_tests_properties(test_amd_hip_thread_refused PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^(ok|SKIP)" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
 set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "ok HIP from a static destructor" FAIL_REGULAR_EXPRESSION "FAIL|ERROR: AddressSanitizer|malloc|double free|corrupted")
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")

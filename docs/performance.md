@@ -1817,10 +1817,32 @@ statistics, Mann-Whitney p-value and process runner; the verdict rule is the sam
   first-attempt failure was seen once, during the first attempt of run B before this was added: valu_int
   printed MISMATCH with a device phase of 0.4 ms, i.e. the kernel apparently did not run; 160 quick runs
   under heavy CPU load and 25 harness repeats could not reproduce it, and run B as reported had no failures.
-  Unexplained; launch errors are checked now.)
-* A counting run per workload, target and build gives exact instruction counts:
-  `rocprofv3 --pmc SQ_INSTS_* ...` inside `vgpu shell -y --gpu amd/<profile> --count 1
-  --no-isolate -c`, one host thread, summed over the dispatches. Timed runs have no profiler.
+  Launch errors are checked now.
+
+  *Explained later (`speedup4-amdcorrect`).* About 28,000 further `valu_int` quick runs on the MI300X, in loops of 4
+  to 16 at once on 4 to 8 CPUs of a box at load 35 to 95, at `VGPU_THREADS` 1, 3, 16 and the default, found no
+  race: none gave a wrong answer, and the queue, the worker pool, the decode cache and the launch/synchronize
+  hand-off, read for a missed wake-up, an early completion or a stale flag, have none. What did fail, in 3 bursts of
+  50 to 400 consecutive runs on server2 while other sessions' builds held 28 of its 30 GB and its swap was full, was the
+  launch itself: the simulator's host-memory guard (`VGPU_MEMORY_HOST_RESERVE_MB`, default 6% of RAM clamped to 1 to
+  4 GiB) refuses device memory while `MemAvailable` is below the reserve (the message, with `VGPU_QUIET` unset:
+  "device out of memory: the host has 618 MB of memory left ... below the reserve of 1840 MB"), the first launch of a
+  program writes its linked code object into device memory (`place`), and that refusal came back as
+  `hipErrorInvalidImage` ("device kernel image is invalid"), blaming the program. A program that does not read
+  `hipGetLastError` after a launch then synchronizes (nothing queued), reads the untouched buffer back, and prints
+  MISMATCH with the time of a launch that did nothing: the 0.4 ms. Reproduced on demand with the guard's reserve set
+above the host's memory and the launch check taken out of the program: `MISMATCH in valu_int`,
+`device_wall_s=0.000427`, `FAIL` (with the check: exit 3, `hipGetLastError() -> out of memory`). The first attempt's
+stderr was not kept, so that this was that failure is the explanation that fits every fact, not a proof. Fixed in two ways: a module the host has no room
+  for is `hipErrorOutOfMemory` (`load_failure`; test `test_amd_hip_module_oom`, run with the reserve set to more than
+  any host has), and the benchmark program checks launch errors (it does since the first attempt above). A
+  benchmark on a machine near its memory limit therefore fails loudly now, and the harness repeats the run.
+* A counting run per workload, target and build gives exact instruction counts, one host thread, summed over the
+  dispatches, from the shim's own probe: `VGPU_DISPATCH_STATS=<file>` (amd/src/hip_api.cpp) appends one line per
+  finished launch with the `DispatchStats` numbers the profiler's SQ_* counters are made of, and needs no profiler
+  (`--counts-via probe`, the default). `--counts-via rocprof` takes them from `rocprofv3 --pmc SQ_INSTS_* ...` inside
+  `vgpu shell -y --gpu amd/<profile> --count 1 --no-isolate -c` instead, and `both` uses the probe's and requires
+  rocprofv3's to equal them wherever rocprofv3 ran. Timed runs have no profiler.
 * **Wave-instructions per CPU second** (Minst/s): counted instructions over the CPU time (all
   threads) of the device phase, which the program times around its launches and
   `hipDeviceSynchronize`. Launch and API workloads report calls per second; `startup` is the
@@ -1922,17 +1944,46 @@ but `atomics` is 7.3x to 7.7x faster by wall clock (best over best) at 3 to 16% 
 `atomics` is the exception, slower with threads (below). `launch` is 300 to 460 klaunch/s,
 `api` 1.0 to 1.4 Mcall/s, `startup` 2 ms (MI300X) and 5 ms (RX 6800), which is the whole process.
 
+### The host refusing a thread
+
+`execute()` spreads a grid over host threads and a stream's work runs on a host thread of its own. Where the host refuses to
+start one (EAGAIN at a process or user limit, or no address space left; reproduced with `ulimit -v` and `RLIMIT_NPROC`), the
+pool's vector was destroyed with a joinable `std::thread` in it, which is `std::terminate` (the program printed "terminate
+called without an active exception" mid-launch), and a stream's first `submit` threw `std::system_error` out of
+`hipLaunchKernel`, an extern "C" entry point. Now a range of work-groups whose thread is refused runs on the launching thread
+(the ranges are independent, so the answers and counts are the same; `start_or_run_here`), the lockstep pool, whose workers
+wait on one another, fails the launch with an `Err::Internal` that names the cause, and a refused stream thread is
+`hipErrorOutOfMemory` with the stream left usable. Tests: `test_amd_gcn_thread_refused` (an 8-group dispatch at
+`VGPU_THREADS=4` under `RLIMIT_NPROC=1` still gives the right answers and counts all 8 waves) and
+`test_amd_hip_thread_refused`; both say SKIP and pass where the process is exempt from the limit (root). Mutation checks: with
+the fallback removed the first dies with the `std::system_error`, with the catch removed the second aborts, with the DS guard
+removed `test_amd_gcn_same_bits` segfaults.
+
 ### The counter check
 
-`--check-counters` runs the workloads at the `quick` size on one host thread under `rocprofv3` and
-compares the `SQ_INSTS_*`, `SQ_WAVES`, `SQ_INSTS_VMEM_RD/WR` and `TA_FLAT_ATOMIC_WAVEFRONTS` totals,
+`--check-counters` runs the workloads at the `quick` size on one host thread, counted by the shim's
+`VGPU_DISPATCH_STATS` probe (and, where rocprofv3 is there and the shim is not sanitizer-built, by rocprofv3 too, which
+must agree: `--counts-via both`, what the ctest does), and compares the `SQ_INSTS_*`, `SQ_WAVES`, `SQ_INSTS_VMEM_RD/WR` and `TA_FLAT_ATOMIC_WAVEFRONTS` totals,
 per workload and target, with `tools/bench-amd/expected/amd-hip-7.2.26015.json` (counts depend on
 the compiler, so one file per hipcc release). It is the ctest test `bench_amd_counters` (about 6 s),
-and skips (`SKIP:`) without a ROCm that has `hipcc` and `rocprofv3`, without an expected file for
-the release, or with a sanitizer-built shim (both skip paths exercised). The counts at one
+and skips (`SKIP:`) without a ROCm that has `hipcc` or without an expected file for the release. A sanitizer-built
+shim, or no rocprofv3, no longer skips: the probe counts alone are compared (a NOTE says the rocprofv3 cross-check
+was not made). The counts at one
 thread are deterministic, including the `atomics` CAS loop: `--update-expected` followed by two
 `--check-counters` matched all 21 workload/target pairs. Mutation check: raising one stored count
 by one makes it exit 1 with `mi300x/valu_int: SQ_INSTS_VALU expected 666625, got 666624`.
+
+*Why rocprofv3 "wrote no counter CSV" on server2.* `vgpu shell` puts its own `rocprofv3` first on PATH (a wrapper that
+runs ROCm's tool with `--rocm-root` pointing at VirtualGPU's `librocprofiler-sdk.so.1`), and writes that wrapper only
+when `shim/librocprofiler-sdk.so.1` exists, i.e. when the `vgpurocprof` target was built. A build of only `vgpu` and
+`vgpuhip` (what a quick benchmark build is) has no wrapper, so the bare `rocprofv3` of the counting run is ROCm's own: it
+loads ROCm's profiler SDK over the simulated agents, finds no counters, writes nothing at all, and the program still
+passes (rc 0, `PASS`), which is why the harness could say only "no counter CSV". Reproduced on server2 by removing
+the library from a copy of the shim (no file written), and by running `/opt/rocm/bin/rocprofv3` by path inside the
+shell (the same). With `vgpurocprof` built, rocprofv3 wrote its CSV in all of about 2,500 counting runs under load
+(4 at a time, 1 and default threads), and the harness counted all 21 workload/target pairs identically to
+`expected/` by both routes (`counters match ... counted by both, rocprofv3 agreed on 21`). The harness now says which
+library is missing, and its default counts need no profiler, so "counters identical" is a real check on any host.
 
 ### Profiles
 
@@ -2118,7 +2169,13 @@ and a digest of all registers, masks, LDS, memory, counts and error text is comp
 `amd/tests/data/same_bits_digests.txt`, which was recorded from the unmodified a12f8d84 plus only the probe. Mutation
 checks (each makes it fail): two case labels swapped (123 shapes differ), the invariant table off by one (3,088), a wrong
 decode flag (1,527), `s_cbranch_scc0` inverted (6). Instructions that read the clock are recorded as unstable and skipped;
-`ds_nop`, `ds_consume` and `ds_append` are skipped because the interpreter crashes on them with the fuzz corpus's operands.
+`ds_nop`, `ds_consume` and `ds_append` are skipped because the interpreter crashed on them with the fuzz corpus's operands:
+the decoder gives these three no address operand (`Inst::src` is empty), and `lds_access` read `in.src[0]` off the end of an
+empty vector (a SEGV in `lane_src`, found with a signal handler on the base commit f81cc0c1: all three shapes of the
+gfx1250 corpus die there). They stay out of the digest, because the base crashes and so no base digest of them can exist;
+`ds_nop` now does nothing (it counts as an LDS instruction) and `ds_append`/`ds_consume` throw `Err::Unsupported` ("has
+no address operand and is not modelled"; the wave-wide counter at M0 is not documented well enough to model), checked by
+`ds_instructions_without_an_address_fail_gracefully` in the same test file on RDNA2, RDNA3, RDNA4 and gfx1250.
 
 Two things the digest caught that a pass over the ladders would not have: GCC expands `floor`, `ceil` and `trunc` in line
 where it thinks the code hot (a signaling NaN then comes back unchanged; libm returns a quiet one), and which places those
