@@ -32,6 +32,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
 #include "mfma_math.hpp"
+#include "packed_math.hpp"
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
@@ -743,6 +744,15 @@ struct Machine {
     if (o.abs) h = h < static_cast<_Float16>(0) ? -h : h;
     return o.neg ? -h : h;
   }
+  // The same source widened to a float (what `static_cast<float>(lane_half(...))` is), with the conversion done in
+  // integers (packed_math.hpp's, which is the compiler's for every one of the 65536 halves) rather than by a call into libgcc.
+  float lane_half_f(const Wave& w, const Operand& o, uint32_t lane) const {
+    float f;
+    if (o.kind == OperandKind::InlineFloat) f = static_cast<float>(static_cast<_Float16>(o.fvalue));
+    else f = packed::half_to_float(static_cast<uint16_t>(lane_src(w, o, lane)));
+    if (o.abs) f = f < 0.0f ? -f : f;
+    return o.neg ? -f : f;
+  }
   // A float narrowed to a half, rounded toward zero rather than to nearest:
   // the nearest half, stepped one toward zero where it landed further out
   // than the float was. A float past the largest half becomes the largest
@@ -841,13 +851,13 @@ struct Machine {
   // high half, as every 16-bit instruction here does.
   void write_half(Wave& w, const Inst& in, uint32_t lane, _Float16 v) {
     // FP16_OVFL: an infinity that no infinite operand explains is an overflow, and becomes the largest finite half.
-    if (std::isinf(static_cast<float>(v)) && fp16_ovfl(w, in) && overflow_only_op(in.name)) {
+    if (fp16_ovfl(w, in) && std::isinf(static_cast<float>(v)) && overflow_only_op(in.name)) {
       bool finite_in = true;
       const bool wide_src = in.name.find("cvt_f16_f32") != std::string::npos;
       for (size_t k = 0; k < in.src.size() && k < 3; ++k) {
         const Operand& o = in.src[k];
         if (o.kind == OperandKind::None) continue;
-        const float f = wide_src ? lane_float(w, o, lane) : static_cast<float>(lane_half(w, o, lane));
+        const float f = wide_src ? lane_float(w, o, lane) : lane_half_f(w, o, lane);
         finite_in = finite_in && std::isfinite(f);
       }
       if (finite_in) v = std::signbit(static_cast<float>(v)) ? static_cast<_Float16>(-65504.0f) : static_cast<_Float16>(65504.0f);
@@ -929,6 +939,97 @@ struct Machine {
     }
     const float f = static_cast<float>(as_half(bits));
     return ((half ? in.neg_hi : in.neg_lo) >> k) & 1 ? -f : f;
+  }
+
+  // Source k of a packed instruction as the two halves it supplies (low result, high), for packed_math.hpp. False where
+  // the source is not a vector register, a scalar register or a constant.
+  bool packed_halves(const Wave& w, const Inst& in, uint32_t k, packed::HalfSource out[2]) const {
+    const Operand& o = in.src[k];
+    for (uint32_t half = 0; half < 2; ++half) {
+      const uint32_t top = ((half ? in.op_sel_hi : in.op_sel) >> k) & 1;
+      packed::HalfSource& h = out[half];
+      h.flip = ((half ? in.neg_hi : in.neg_lo) >> k) & 1 ? 0x8000u : 0u;
+      if (o.kind == OperandKind::Vgpr) {
+        if (o.sel != 6 || o.index >= w.vgpr.r.size()) return false;
+        h.row = w.vgpr[o.index].data();
+        h.shift = static_cast<uint8_t>(16 * top);
+      } else if (o.kind == OperandKind::Inline || o.kind == OperandKind::InlineFloat || o.kind == OperandKind::Literal) {
+        h.imm = constant_half(in, o, top);
+      } else if (o.kind == OperandKind::Sgpr) {
+        h.imm = static_cast<uint16_t>(lane_src(w, o, 0) >> (16 * top));   // the same in every lane
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+  bool packed_plain(const Wave& w, const Inst& in) const {
+    return in.arch != gcn::Target::Gfx1250 && FloatMode::is_default(w.mode) && !narrow_dst && !dpp_operand && !in.dst.empty() &&
+           in.dst[0].kind == OperandKind::Vgpr && in.dst[0].index < w.vgpr.r.size();
+  }
+  // The packed 16-bit float instructions (v_pk_fma_f16, v_pk_add_f16, v_pk_mul_f16) for the whole wave at once
+  // (packed_math.hpp). False where the instruction is not the plain case (a source that is not a vector register, a
+  // scalar register or a constant, a MODE other than the default, gfx1250's overflow rule, a part-register
+  // destination), with nothing written; the per-lane code then runs it.
+  bool packed_f16_wave(Wave& w, const Inst& in, packed::Op kind) {
+    if (!packed_plain(w, in)) return false;
+    packed::WaveArgs a;
+    a.op = kind;
+    a.clamp = in.clamp;
+    a.exec = w.exec;
+    a.dst = w.vgpr[in.dst[0].index].data();
+    const uint32_t n = kind == packed::Op::Fma ? 3 : 2;
+    if (in.src.size() < n) return false;
+    for (uint32_t k = 0; k < n; ++k)
+      if (!packed_halves(w, in, k, a.src[k])) return false;
+    packed::packed_f16_wave(a);
+    return true;
+  }
+  // v_dot2_f32_f16 (VOP3P: two halves of two sources and a float addend) and v_dot2c_f32_f16 (VOP2: the addend is
+  // the destination itself), the same way.
+  bool dot2_f16_wave(Wave& w, const Inst& in, bool c_form, uint64_t* redo) {
+    if (!packed_plain(w, in)) return false;
+    packed::DotArgs d;
+    d.c_form = c_form;
+    d.exec = w.exec;
+    d.dst = w.vgpr[in.dst[0].index].data();
+    if (in.src.size() < (c_form ? 2u : 3u)) return false;
+    if (c_form) {
+      // src0 and src1 are whole registers (or constants): the low half and the high half, with no op_sel or neg.
+      for (uint32_t k = 0; k < 2; ++k) {
+        const Operand& o = in.src[k];
+        for (uint32_t half = 0; half < 2; ++half) {
+          packed::HalfSource& h = (k ? d.b : d.a)[half];
+          if (o.kind == OperandKind::Vgpr) {
+            if (o.sel != 6 || o.index >= w.vgpr.r.size()) return false;
+            h.row = w.vgpr[o.index].data();
+            h.shift = static_cast<uint8_t>(16 * half);
+          } else if (o.kind == OperandKind::Inline || o.kind == OperandKind::InlineFloat || o.kind == OperandKind::Literal ||
+                     o.kind == OperandKind::Sgpr) {
+            h.imm = static_cast<uint16_t>(lane_src(w, o, 0) >> (16 * half));
+          } else {
+            return false;
+          }
+        }
+      }
+      d.crow = d.dst;
+    } else {
+      if (!packed_halves(w, in, 0, d.a) || !packed_halves(w, in, 1, d.b)) return false;
+      const Operand& c = in.src[2];
+      if (c.kind == OperandKind::Vgpr) {
+        if (c.sel != 6 || c.index >= w.vgpr.r.size()) return false;
+        d.crow = w.vgpr[c.index].data();
+      } else if (c.kind == OperandKind::Inline || c.kind == OperandKind::InlineFloat || c.kind == OperandKind::Literal ||
+                 c.kind == OperandKind::Sgpr) {
+        d.cimm = lane_src(w, c, 0);
+      } else {
+        return false;
+      }
+      d.cand = c.abs ? 0x7FFFFFFFu : 0xFFFFFFFFu;
+      d.cflip = (c.neg != (((in.neg_lo >> 2) & 1) != 0)) ? 0x80000000u : 0u;
+    }
+    *redo = packed::dot2_f16_wave(d);
+    return true;
   }
 
   // A source read as a float, with the modifiers a VOP3 source carries: the
@@ -4632,32 +4733,41 @@ struct Machine {
                                                          op.find("_b16") != std::string::npos)) {
                 // Two 16-bit integers in one register, each its own arithmetic.
                 const std::string name = op;
+                // (Which arithmetic, worked out once for the instruction rather than by comparing its name in each half of each lane.)
+                enum Kind { MulLo, AddU, AddI, SubU, SubI, Shl, Shr, Ashr, MaxI, MinI, MaxU, MinU, MadU, MadI, Unimplemented };
+                const Kind kind = name == "v_pk_mul_lo_u16" ? MulLo : name == "v_pk_add_u16" ? AddU : name == "v_pk_add_i16" ? AddI
+                                  : name == "v_pk_sub_u16" ? SubU : name == "v_pk_sub_i16" ? SubI : name == "v_pk_lshlrev_b16" ? Shl
+                                  : name == "v_pk_lshrrev_b16" ? Shr : name == "v_pk_ashrrev_i16" ? Ashr : name == "v_pk_max_i16" ? MaxI
+                                  : name == "v_pk_min_i16" ? MinI : name == "v_pk_max_u16" ? MaxU : name == "v_pk_min_u16" ? MinU
+                                  : name == "v_pk_mad_u16" ? MadU : name == "v_pk_mad_i16" ? MadI : Unimplemented;
+                const bool sgn = name.find("_i16") != std::string::npos;
+                const bool clamps = in.clamp && (name.find("add") != std::string::npos || name.find("sub") != std::string::npos ||
+                                                 name.find("mad") != std::string::npos);
                 each([&](uint32_t lane) {
                   uint32_t r = 0;
                   for (uint32_t h = 0; h < 2; ++h) {
                     const uint16_t x = packed_bits(w, in, 0, h, lane), y = packed_bits(w, in, 1, h, lane);
                     const int16_t sx = static_cast<int16_t>(x), sy = static_cast<int16_t>(y);
-                    const bool sgn = name.find("_i16") != std::string::npos;
                     int64_t v;
-                    if (name == "v_pk_mul_lo_u16") v = int64_t{x} * y;
-                    else if (name == "v_pk_add_u16") v = x + y;
-                    else if (name == "v_pk_add_i16") v = sx + sy;
-                    else if (name == "v_pk_sub_u16") v = x - y;
-                    else if (name == "v_pk_sub_i16") v = sx - sy;
-                    else if (name == "v_pk_lshlrev_b16") v = y << (x & 15);
-                    else if (name == "v_pk_lshrrev_b16") v = y >> (x & 15);
-                    else if (name == "v_pk_ashrrev_i16") v = sy >> (x & 15);
-                    else if (name == "v_pk_max_i16") v = std::max(sx, sy);
-                    else if (name == "v_pk_min_i16") v = std::min(sx, sy);
-                    else if (name == "v_pk_max_u16") v = std::max(x, y);
-                    else if (name == "v_pk_min_u16") v = std::min(x, y);
-                    else if (name == "v_pk_mad_u16") v = int64_t{x} * y + packed_bits(w, in, 2, h, lane);
-                    else if (name == "v_pk_mad_i16") v = int64_t{sx} * sy + static_cast<int16_t>(packed_bits(w, in, 2, h, lane));
-                    else throw Error::make(Err::Unsupported, name, " is decoded but not implemented");
+                    switch (kind) {
+                      case MulLo: v = int64_t{x} * y; break;
+                      case AddU: v = x + y; break;
+                      case AddI: v = sx + sy; break;
+                      case SubU: v = x - y; break;
+                      case SubI: v = sx - sy; break;
+                      case Shl: v = y << (x & 15); break;
+                      case Shr: v = y >> (x & 15); break;
+                      case Ashr: v = sy >> (x & 15); break;
+                      case MaxI: v = std::max(sx, sy); break;
+                      case MinI: v = std::min(sx, sy); break;
+                      case MaxU: v = std::max(x, y); break;
+                      case MinU: v = std::min(x, y); break;
+                      case MadU: v = int64_t{x} * y + packed_bits(w, in, 2, h, lane); break;
+                      case MadI: v = int64_t{sx} * sy + static_cast<int16_t>(packed_bits(w, in, 2, h, lane)); break;
+                      default: throw Error::make(Err::Unsupported, name, " is decoded but not implemented");
+                    }
                     // The clamp holds an add or a subtract to what 16 bits hold.
-                    if (in.clamp && (name.find("add") != std::string::npos || name.find("sub") != std::string::npos ||
-                                     name.find("mad") != std::string::npos))
-                      v = sgn ? std::clamp<int64_t>(v, -32768, 32767) : std::clamp<int64_t>(v, 0, 65535);
+                    if (clamps) v = sgn ? std::clamp<int64_t>(v, -32768, 32767) : std::clamp<int64_t>(v, 0, 65535);
                     r |= uint32_t{static_cast<uint16_t>(v)} << (16 * h);
                   }
                   write_lane(w, in.dst[0], lane, r);
@@ -4671,6 +4781,20 @@ struct Machine {
                   // exact in double, the sum rounded once.
                   // neg_lo negates a source's low half and neg_hi its high one; the
                   // addend is negated by its neg_lo bit.
+                  // (The whole wave at once where nothing is unusual; the lanes whose sum is a NaN, and every lane
+                  // otherwise, by the loop below.)
+                  struct ExecKept {
+                    Wave& w;
+                    uint64_t exec;
+                    ~ExecKept() { w.exec = exec; }
+                  } exec_kept{w, w.exec};
+                  {
+                    uint64_t again = 0;
+                    if (dot2_f16_wave(w, in, false, &again)) {
+                      if (!again) break;
+                      w.exec = again;
+                    }
+                  }
                   each([&](uint32_t lane) {
                     const float c = lane_float(w, in.src[2], lane);
                     double sum = (in.neg_lo >> 2) & 1 ? -double(c) : double(c);
@@ -5552,8 +5676,11 @@ struct Machine {
   case "v_cvt_f16_f32_e32"_op.hash:
     if (!(op == "v_cvt_f16_f32_e32"_op)) goto L_ladder_9;
     {
+      // (To nearest even in integers where MODE says that, as the host's conversion does then; else the host's.)
+      const bool nearest = FloatMode::is_default(w.mode);
       each([&](uint32_t lane) {
-        write_half(w, in, lane, static_cast<_Float16>(lane_float(w, in.src[0], lane)));
+        const float f = lane_float(w, in.src[0], lane);
+        write_half(w, in, lane, nearest ? as_half(packed::float_to_half(f)) : static_cast<_Float16>(f));
       });
     }
     break;
@@ -5561,7 +5688,7 @@ struct Machine {
     if (!(op == "v_cvt_f32_f16_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_lane(w, in.dst[0], lane, as_bits(static_cast<float>(lane_half(w, in.src[0], lane))));
+        write_lane(w, in.dst[0], lane, as_bits(lane_half_f(w, in.src[0], lane)));
       });
     }
     break;
@@ -5852,6 +5979,20 @@ struct Machine {
   case "v_dot2c_f32_f16_e32"_op.hash:
     if (!(op == "v_dot2c_f32_f16_e32"_op)) goto L_ladder_9;
     {
+      // (The whole wave at once where nothing is unusual; the lanes whose sum is a NaN, and every lane otherwise, by the
+      // loop below.)
+      struct ExecKept {
+        Wave& w;
+        uint64_t exec;
+        ~ExecKept() { w.exec = exec; }
+      } exec_kept{w, w.exec};
+      {
+        uint64_t again = 0;
+        if (dot2_f16_wave(w, in, true, &again)) {
+          if (!again) break;
+          w.exec = again;
+        }
+      }
       each([&](uint32_t lane) {
         // Two pairs of halves multiplied and added into a float. Each product
         // is exact in a float; the sum is worked out in double and rounded
@@ -6326,6 +6467,10 @@ struct Machine {
     if (!(op == "v_pk_fma_f16"_op || op == "v_pk_add_f16"_op || op == "v_pk_mul_f16"_op ||
                op == "v_pk_min_f16"_op || op == "v_pk_max_f16"_op)) goto L_ladder_9;
     {
+      // The whole wave at once where the instruction is a plain fma, add or multiply (packed_f16_wave).
+      if ((op == "v_pk_fma_f16"_op || op == "v_pk_add_f16"_op || op == "v_pk_mul_f16"_op) &&
+          packed_f16_wave(w, in, op == "v_pk_fma_f16"_op ? packed::Op::Fma : op == "v_pk_add_f16"_op ? packed::Op::Add : packed::Op::Mul))
+        break;
       each([&](uint32_t lane) {
         // Two halves in one register, each its own arithmetic, done in float
         // -- which holds a product of two halves exactly -- and rounded once
@@ -6463,7 +6608,7 @@ struct Machine {
     if (op == 0x14) return each([&](uint32_t l) { return matches_class_half(lane_half(w, a, l), lane_src(w, b, l)); });
     {
       if (op >= 0x20 && op < 0x30)
-        return each([&](uint32_t l) { return float_test(op, lane_half(w, a, l), lane_half(w, b, l)); });
+        return each([&](uint32_t l) { return float_test(op, lane_half_f(w, a, l), lane_half_f(w, b, l)); });
       if (op >= 0x40 && op < 0x50)
         return each([&](uint32_t l) { return float_test(op, lane_float(w, a, l), lane_float(w, b, l)); });
       if (op >= 0x60 && op < 0x70)

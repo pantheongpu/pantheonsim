@@ -2812,3 +2812,172 @@ Run on server2 against this branch: `ctest -R ^test_amd` (143 of 143), `amd_rocb
 * The fast path is not taken for a source that is not a register, for registers past the end of the file, or (WMMA) with CLAMP on a
   signed integer input; those run the reference code, unchanged.
 * The harness has no gfx1250 target (hipcc has no gfx1250 programs here); those rows come from `amd_matrix_bench` only.
+## AMD libraries and real workloads: packed halves, dot products, half conversions, and the code object reader (branch `speedup4-amdlibs`)
+
+The AMD benchmarks above are synthetic. This piece profiled the interpreter on what actually runs on it -- rocBLAS (ROCm 7.2's, unmodified),
+hipBLASLt, MIOpen, the pantheon GPU workloads built for gfx942, the HIP and library samples of `amd/tests` -- all on the simulated MI300X, and
+kept the changes the profile and an A/B supported.
+
+### What was measured, and how
+
+* **Cost per instruction.** A scratch patch (not committed) wraps `Machine::step` in `rdtsc` and keeps, per mnemonic, the count, the CPU time
+  inside `step` and the mean active lanes, written at exit (`VGPU_THREADS=1`). It adds about 15 to 20 ns per instruction (`s_waitcnt` reads
+  19 to 22 ns), so the cheap forms are overstated and the expensive ones are not. Pinned to CPUs 24-31 (0-15 for the "after" columns; see the
+  caveat in the last paragraph of this section).
+* **Host functions.** `tools/bench-amd/profile` (SIGPROF), on a `-g` Release build.
+* **Programs** (1.70 billion wave-instructions in all): `amd/tests/rocblas/blas` (saxpy, sdot, sgemm, dgemm, `gemm_ex` on halves, bfloat16s and
+  bytes, complex); a scratch driver for larger rocBLAS calls (sgemm, dgemm, hgemm, `gemm_ex` f16, bf16 and i8, gemv, level 1, strided batched,
+  trsm, syrk, cgemm, 512 on a side); a hipBLASLt matmul (f16, bf16, f32 at 1024); `MIOpenDriver` (forward, backward-data and backward-weights
+  convolutions in fp32, fp16 and bf16, with the library's own search over its solvers; batch norm, pooling, softmax, activation, GEMM); the 46
+  pantheon workloads (built with the flags of `amd/tools/run-pantheon-workloads.sh`, 5 s each); `amd/tests/hipcc` and `amd/tests/libraries`
+  samples; hipSPARSELt's `spmm`. No PyTorch here, and no rocprofv3 counting on this host.
+
+### Ranked: which instruction forms cost the time
+
+Share of the wave-instructions ("count") and of the time inside `step` ("time"), and the cost of one execution (64 lanes). Forms that
+another piece of this round owns are marked: (tier) the vector ALU and compare forms of `amdtier`, (mem) memory and LDS of `amdmemtext`,
+(mfma) `amdmatrix`.
+
+| suite | form | count | time | ns per execution |
+| --- | --- | ---: | ---: | ---: |
+| MIOpen fp16 convolution (its search tries the slow solvers) | `v_dot2_f32_f16` | 24% | 42% | 1390 |
+| | `v_pk_fma_f16` | 3.0% | 13% | 3440 |
+| | `buffer_load_short_d16` (mem) | 3.3% | 5.6% | 1346 |
+| | `v_pk_mul_f16` / `v_pk_add_f16` | 1.1% / 1.0% | 4.2% / 3.3% | 2911 / 2518 |
+| | `ds_read_b128` (mem) | 2.3% | 4.0% | 1388 |
+| MIOpen fp32 convolution | `v_fmac_f32` (tier) | 40% | 42% | 299 |
+| | `ds_read_b128` (mem) | 3.8% | 16% | 1227 |
+| | the DPP forms (`v_fmac/add/mov_b32_dpp`) | 8.4% | 11% | 252 to 364 |
+| | `ds_write_b32`, `buffer_load_dword` (mem) | 2.9%, 2.0% | 6.1%, 5.4% | 606, 763 |
+| rocBLAS (blas + 14 larger calls) | `v_pk_fma_f16` (hgemm) | 3.9% | 28% | 3142 |
+| | `v_mfma_f32_16x16x4_f32`, `v_mfma_f64_16x16x4_f64` (mfma) | 4.1%, 0.9% | 9.9%, 7.0% | 1070, 3625 |
+| | `ds_read_b32/b64`, `buffer_load_*` (mem) | 7.2% | 10% | 552 to 1306 |
+| hipBLASLt (f16, bf16, f32) | `v_mfma_*` (mfma) | 27% | 61% | 999 to 3536 |
+| | `ds_read_*`, `ds_write_*`, `buffer_load_*` (mem) | 24% | 33% | 929 to 1230 |
+| pantheon, 46 workloads | `v_lshl_add_u64` (tier) | 5.3% | 11.6% | 497 |
+| | `v_pk_fma_f16` | 0.3% | 5.5% | 3824 |
+| | `v_xor_b32`, `v_add_u32`, `v_mov_b32`, `v_fma_f32` (tier) | 6.4%, 2.6%, 3.9%, 2.3% | 5.2%, 4.3%, 4.0%, 4.6% | 186, 385, 239, 452 |
+| | `global_load_dwordx4` / `dword` (mem) | 1.1% / 0.8% | 4.3% / 3.1% | 883 / 872 |
+| | `v_mfma_f32_16x16x16_f16` (mfma) | 0.5% | 4.2% | 2114 |
+
+By workload, the instruction that is most of the time: `compute_virus_agg` `v_pk_fma_f16` 69% (8144 ns) and `v_cmp_ngt_f16` 15% (7099 ns, tier's
+compare path); `omni_virus` `v_pk_fma_f16` 77%; `tensor_virus` `v_pk_fma_f16` 70%; `transformer_train_step` `v_pk_fma_f32` 52% (tier);
+`rope_stress` `v_sin_f32` 35% (1504 ns); `memory_retention_bake`, `pulse_virus`, `memory_thermal_asym` `v_fma_f32` 72 to 95% (tier); `fp64_virus`
+`v_fma_f64` 88% (tier); `mma_virus`, `transformer_virus` `v_mfma_f32_16x16x16_f16` 93%, 84% (mfma); `atomic_virus` `global_atomic_add` 54% (mem).
+
+The expensive non-memory forms, every one with at least 0.05% of all the time (cost of one execution, 64 lanes): `v_dot2_f32_f16` 1390 ns,
+`v_pk_fma_f16` 3514, `v_pk_mul_f16` 2911, `v_pk_add_f16` 2518, `v_cvt_flr_i32_f32_e64` 2207, `v_fmaak_f32` 929 (tier), `v_add_f16_e64` 1182,
+`v_subb_co_u32` 1419, `v_pk_fma_f32` 840 (tier), `v_cvt_f16_f32_sdwa` 1600, `v_sin_f32` 1504, `v_pk_mad_u16` 5110, `v_pk_max_f16` 2501,
+`v_cmp_ngt_f16_e64` 7099 (tier), `v_fma_mix_f32` 797; against 190 to 300 for an ordinary ALU form. The packed-half and dot-product forms are
+a few times the cost of anything else because every lane crosses libgcc's soft `_Float16` conversion (`__extendhfsf2`, `__truncsfhf2`: each a
+call, three or four per lane per half) and the operation is chosen by string comparison in the lane loop.
+
+**Host functions** (`blas`, 5 s, one thread, 2454 samples at 1 kHz): `Machine::step` 52% (`matrix_multiply` 12%, `vector_alu` 14%,
+`lds_access` 7.5%, `buffer_access` 7%); **`hipModuleLoadData` 31%** -- 25 Tensile code objects of 0.5 to 20 MB inflated, of which
+`load_code_object` 19.4% and `read_bundle` 8.9% (zstd 5%, the rest copies). A single 19.8 MB Tensile library
+(`TensileLibrary_Type_DD_*_gfx942.co`, 689 kernels) took 5.5 ms to inflate and 25.5 ms to parse.
+
+### What changed
+
+All of it bit for bit; the new files are `amd/src/packed_math.hpp` and the tests below.
+
+* **Packed 16-bit float arithmetic, a wave at a time** (`v_pk_fma_f16`, `v_pk_add_f16`, `v_pk_mul_f16`; `Machine::packed_f16_wave`).
+  Halves are widened and narrowed with integer code that equals the compiler's conversion for all 65536 halves and all 2^32 floats (the
+  libgcc call is gone); the multiply-add is the host's FMA unit's, and on a host with AVX2, F16C and FMA (checked at run time, and with
+  MXCSR in its default state) eight lanes at a time. A lane with a NaN in it follows the old code's rule exactly: the first operand's payload
+  for an add or a multiply (the order the recorded results show, held by inline assembly), libm's `fmaf` with the multiplicands in the
+  recorded order for a fused multiply-add. Not taken for a MODE other than the default, gfx1250, a source that is not a vector register, an SGPR or a
+  constant, a part-register destination: the old per-lane code runs those.
+* **`v_dot2_f32_f16` and `v_dot2c_f32_f16`** the same way (products exact in double, summed in the order the old code summed them; AVX2 four
+  doubles wide). A lane whose sum is a NaN is handed back to the old code.
+* **`v_cvt_f16_f32`, `v_cvt_f32_f16`, and half comparisons** use the same integer conversions (`lane_half_f`); `write_half` tests the cheap
+  `fp16_ovfl` before widening its result; the packed 16-bit integer instructions (`v_pk_mad_u16` and the other fourteen) resolve which
+  arithmetic they are once per instruction instead of comparing the name in each half of each lane.
+* **The code object reader** (`codeobject.cpp`): fields read with one bounds check, names as views of the file (no `std::string` per symbol),
+  hash maps for the lookups (names are only looked up, never iterated), `std::vector` room for the kernels reserved up front (a `Kernel` is
+  copied, not moved, when the vector grows), the MessagePack tree's arrays and maps reserved, `.text` copied with one `memcpy`.
+
+### Results
+
+Alternating A B, 9 runs after a warm-up, CPU seconds of the process (user + system), Mann-Whitney p, one host thread, CPUs 24-31 under
+`flock /tmp/speedup-bench.lock`. A is `speedup` f81cc0c1 as built (Release, `-g`), B this branch. Outputs were compared (a hash of the
+results printed by each program) and are equal in every row. The load average is that of the machine during the runs (others' builds).
+
+| program | A median [best] | B median [best] | A/B median | best | p | load |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `v_pk_fma_f16`, finite halves (microbenchmark) | 1.133 s [1.077] | 0.070 s [0.060] | 16.2x | 18.0x | 0.0000 | 15 to 16 |
+| `v_pk_fma_f16`, random bits (NaNs and infinities of every payload) | 1.250 s [1.171] | 0.094 s [0.077] | 13.3x | 15.3x | 0.0000 | 16 to 17 |
+| `v_pk_mul_f16` (the loop is a third other instructions) | 1.363 s [1.331] | 0.967 s [0.881] | 1.41x | 1.51x | 0.0000 | 17 to 18 |
+| `v_dot2c_f32_f16` | 1.287 s [1.244] | 0.300 s [0.249] | 4.29x | 5.00x | 0.0000 | 18 to 19 |
+| rocBLAS `hgemm` 512 (whole process) | 4.433 s [3.894] | 0.848 s [0.809] | 5.22x | 4.82x | 0.0000 | 19 to 26 |
+| `v_cvt_f16_f32` + `v_cvt_f32_f16` loop | 0.472 s [0.456] | 0.297 s [0.295] | 1.59x | 1.55x | 0.0000 | 9.5 to 10 |
+| half comparisons (`v_cmp_{lt,ge,neq}_f16`) | 1.154 s [1.143] | 0.464 s [0.455] | 2.49x | 2.51x | 0.0000 | 7.6 to 8.9 |
+| rocBLAS `blas` program (whole process, 25 Tensile objects) | 2.422 s [2.409] | 2.101 s [2.073] | 1.15x | 1.16x | 0.0000 | 12 to 19 |
+| rocBLAS sgemm 256 (one library load) | 0.082 s [0.080] | 0.073 s [0.071] | 1.12x | 1.13x | 0.0000 | 11 |
+| `load_code_object`, a 19.8 MB Tensile object (inflate + parse, 20 times) | 0.632 s | 0.310 s | 2.04x | 2.04x | 0.0000 | 7 |
+| `load_code_object`, rocBLAS `Kernels.so` 0.83 MB (40 times) | 0.090 s | 0.053 s | 1.71x | 1.73x | 0.0000 | 7 |
+| `v_sin_f32` + `v_cos_f32` (no change made: control) | 0.453 s | 0.450 s | 1.01x | 1.02x | 0.0040 | 10 |
+
+Cost of one execution (64 lanes, the step-timing patch, the same program before and after): `v_pk_fma_f16` 3103 to 261 ns (rocBLAS hgemm:
+3106 to 142), `v_pk_add_f16` 2464 to 248, `v_pk_mul_f16` 2304 to 148, `v_dot2c_f32_f16` 1130 to 149, `v_cvt_f16_f32` 789 to 293,
+`v_cvt_f32_f16` 375 to 243, `v_cmp_*_f16_sdwa` 905, 894, 1277 to 512, 518, 428. The pantheon workloads run for a fixed 5 s, so what changes is how much
+they do in it: wave-instructions executed in the 5 s, three alternating runs each, old / new: `omni_virus` 7.4 to 7.9 M / 24 to 34 M,
+`tensor_virus` 11.1 to 12.0 M / 29 to 33 M, `compute_virus_agg` 5.0 to 5.3 M / 24 to 28 M; `llm_prefill` and `rope_stress` (no
+change made to their forms) are the same within the run-to-run spread (15 to 22 M and 14 to 18 M both ways).
+
+### Tests
+
+* `test_amd_gcn_same_bits` (the 15,566 shapes of the ISA corpora against digests recorded from the unmodified base): passes unchanged.
+* `test_amd_gcn_packed_same_bits` (new): 2,143 instructions of the families this changed -- `v_pk_{fma,add,mul}_f16`, `v_dot2*_f32_f16`,
+  `v_cvt_f16_f32`/`v_cvt_f32_f16` with every output modifier, `v_cmp*_f16` with every condition and operand modifier, `v_sin/cos_f32`, the
+  fourteen packed 16-bit integer instructions -- in every modifier combination (`amd/tools/packed-corpus.py`, assembled by llvm-mc, with raw
+  VOP3P encodings for the op_sel/neg combinations the assembler refuses), run in the four flavours of the first test (random bits among them,
+  so NaNs of every payload), against `amd/tests/data/packed_same_bits_digests.txt`, recorded from the unmodified base.
+* `test_amd_packed_math` (new, 7 tests): the integer half conversions against the compiler's (all 65536 halves; all NaN floats; the
+  rounding boundaries of every exponent; millions at random; `VGPU_PACKED_EXHAUSTIVE=1` runs all 2^32 floats -- it passed); the packed
+  arithmetic against a copy of the old per-lane code on random waves with masks, constants, scalar sources, negation and clamp, with the host's
+  FMA and libm's, and the AVX2 code against the scalar code lane for lane; the F16C conversion against the integer one for every NaN; the dot
+  products (scalar and AVX2) against the old code.
+* `test_amd_codeobject_same_bits` (new): the 241 code objects in the repository (the objects, hsaco files, and the bundles inside the hipcc
+  executables) against digests of everything the reader returns, or of its error text, recorded from the unmodified base. 801 more -- every
+  gfx942 object of rocBLAS, hipBLASLt and hipSPARSELt -- were compared old against new once: identical digests (`VGPU_CODEOBJECT_EXTRA=<file>`).
+* Mutation checks, each of which makes the named test fail: the fused multiply-add's multiplicands in source order (both digest tests); the add's or the multiply's NaN order flipped (10 and 5 shapes of the first test); the AVX2 conversion rounding toward zero (both
+  digest tests, two unit tests); the dot2c sum order (AVX2) or the dot2 sum order (scalar), neither of which the digests see, both the unit test;
+  a rounding-boundary term dropped from the half narrowing (36 shapes and the unit test); global offsets 4 off in the reader (the code object
+  test).
+* ctest `amd|gcn|rocprof|hipcc|hip_` on server2 (a `-DVGPU_WERROR=ON` build of everything but a NVIDIA test that does not compile under
+  -Werror on this base, `test_mma_fast`): all pass or skip but `amd_rocprofv3`, `amd_rocprofiler_abi` and `amd_tools` (host: no counter CSV,
+  header version, user namespaces), as on the base; `amd_hipcc` and `amd_rocprof_first_calls_rx6700xt` failed once under `-j4` and passed alone.
+
+### Not done, and negative results
+
+* **Sine and cosine** (`v_sin_f32`, `v_cos_f32`, 35% of `rope_stress`): a double-precision sine with a three-part pi/2 reduction, a 25th-order
+  Taylor series and a rounding-boundary check, which gave libm's rounded-to-float answer on every one of the 4.7 billion arguments
+  checked (all floats under 2^14 turns, 91% answered; the rest fall back) -- and was **slower than glibc's `sin`** (18.7 ns against 11.9 per
+  lane). Dropped, together with its header and test. glibc's table-driven sine cannot be beaten at libm's own answer.
+* **A sweep of `static_cast<float>(lane_half(...))` over every site** was tried and reverted: it changed which NaN payload `v_fma_f16` and
+  `v_div_fixup_f16` produce (the operands of the libm call reached it in another order), which the first digest test caught on 20 shapes. The
+  conversion is used only where there is no arithmetic on the result (`v_cvt_f32_f16`, the comparisons, `write_half`'s test).
+* **`v_pk_min_f16`, `v_pk_max_f16`** (2501 ns): their NaN and signed-zero results are `std::fmin`/`fmax`, whose operand order is the compiler's
+  choice; left to the old code. **Dot product lanes with a NaN sum** go back to the old code too (the recorded digests hold only four dot shapes).
+* **Integer dot products** (`v_dot4_i32_i8`, `v_dot4c`, `v_dot2_i32_i16`): measured at 195 to 310 ns, already an ALU form's cost.
+* **DPP** (`*_dpp`, 252 to 364 ns, 4.5% of all the time): the shuffle adds 50 to 100 ns to an ordinary form; not worth a rewrite alone.
+* **`v_div_scale/fmas/fixup_f32`** (800 to 1200 ns): 0.24% of all the time.
+* **`carry_alu`** runs `op.find("_co_u32")` on every vector ALU form that reaches the generic path before its own ladder; a decode-time flag
+  would remove it (touches `amd_gcn.hpp`/`gcn_decode.cpp`, which `amdtier` edits). Not measured.
+* **`read_bundle`** still copies a bundle's code twice (the 4 MB window into the string, then `load_code_object` into the vector); 9% of the
+  `blas` run. A zstd window written straight into place, or a `CodeObject` that keeps the bundle's bytes, would take most of it.
+* Unexplained: `v_cvt_flr_i32_f32_e64` (2207 ns), `v_subb_co_u32` (1419) and `v_mul_f32` (3947 ns in the fp16 convolution) cost 5 to 15 times
+  their siblings in MIOpen's OpenCL-compiled direct convolutions; the three have the same execution count, as though in one loop. Denormal
+  operands would explain a float multiply but not an integer subtract.
+
+Caveat on the "after" columns: they were measured on CPUs 0-15 (the benchmark cores were taken by other pieces' runs), so compare them with
+the same-session A/B table above, not with the "before" columns' absolute values.
+
+### Shared lines this touches (for the merge)
+
+`amd/src/gcn_exec.cpp`: one `#include` after `mfma_math.hpp`; `lane_half_f` (new) after `lane_half`; one line of `write_half`; a block of new members
+(`packed_halves`, `packed_plain`, `packed_f16_wave`, `dot2_f16_wave`) before `lane_float`; the packed integer block of `vector_alu`'s default
+branch (rewritten in place); a prefix in each of `v_dot2_f32_f16`, `v_dot2c_f32_f16` and `v_pk_fma_f16`'s case; three lines each of
+`v_cvt_f16_f32`, `v_cvt_f32_f16`; **one line of `Machine::compare`** (the half comparison, `amdtier`'s area). `CMakeLists.txt`: three test registrations after
+`test_amd_mfma_math`.
