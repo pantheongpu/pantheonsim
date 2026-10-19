@@ -11052,7 +11052,9 @@ uint64_t digest_memory_instruction(const gcn::Inst& in, gcn::Target target, uint
       case 6: return run_base + (63 - lane) * 4;
       case 7: return (r.next() & 1) ? base[2] + 8192 + r.next() % 64 : 0xDEAD0000ull + (r.next() & 0xFFFFF);
       case 8: return kSharedBase + r.next() % 0x11000;
-      case 9: return kPrivateBase + (r.next() % 80) * 4;
+      case 9:
+        if (target == gcn::Target::Gfx1250 && (r.next() & 1)) return (uint64_t{1} << 58) | (r.next() % 32) << 52 | (r.next() % 80) * 4;
+        return kPrivateBase + (r.next() % 80) * 4;
       case 10: return base[0] + lane * 68;
       case 11: return base[0] + 16 * (r.next() % 0xFF0);
       case 100: return base[0] + 4 * (r.next() % 0x3000);
@@ -11061,7 +11063,9 @@ uint64_t digest_memory_instruction(const gcn::Inst& in, gcn::Target target, uint
       case 103: return base[2] + 8192 + r.next() % 64;
       case 104: return r.next();
       case 105: return kSharedBase + r.next() % 0x11000;
-      case 106: return kPrivateBase + (r.next() % 80) * 4;
+      case 106:
+        if (target == gcn::Target::Gfx1250 && (r.next() & 1)) return (uint64_t{1} << 58) | (r.next() % 32) << 52 | (r.next() % 80) * 4;
+        return kPrivateBase + (r.next() % 80) * 4;
       default: return base[2] + 8 * (r.next() % 1000);
     }
   };
