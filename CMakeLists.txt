@@ -1465,6 +1465,11 @@ endforeach()
 # The matrix instructions' arithmetic (half widening, dot products) against what it replaced.
 vgpu_unit_test(test_amd_mfma_math amd/tests/unit/test_mfma_math.cpp)
 
+# The code object reader (codeobject.cpp) against digests of what it read before it was made faster.
+vgpu_unit_test(test_amd_codeobject_same_bits amd/tests/unit/test_codeobject_same_bits.cpp)
+target_compile_definitions(test_amd_codeobject_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_include_directories(test_amd_codeobject_same_bits PRIVATE amd/include)
+
 # Lanes over consecutive addresses as one call to the memory manager, against lane by lane (memruns.c).
 vgpu_unit_test(test_amd_gcn_memruns amd/tests/unit/test_gcn_memruns.cpp)
 target_compile_definitions(test_amd_gcn_memruns PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

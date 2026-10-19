@@ -3,6 +3,8 @@
 #include <cstring>
 #include <algorithm>
 #include <map>
+#include <string_view>
+#include <unordered_map>
 
 #include "vgpu/error.hpp"
 
@@ -26,19 +28,36 @@ struct Reader {
     need(at, 1);
     return static_cast<uint8_t>(b[at]);
   }
-  uint16_t u16(uint64_t at) const { return static_cast<uint16_t>(u8(at) | u8(at + 1) << 8); }
-  uint32_t u32(uint64_t at) const { return u16(at) | static_cast<uint32_t>(u16(at + 2)) << 16; }
-  uint64_t u64(uint64_t at) const { return u32(at) | static_cast<uint64_t>(u32(at + 4)) << 32; }
+  // A field of n bytes: in range, one read (the file is little-endian, as is every host this runs on); out of range, the
+  // byte-by-byte reads, which refuse at the first byte that is not there.
+  template <typename T>
+  T field(uint64_t at) const {
+    if (at + sizeof(T) <= b.size() && at + sizeof(T) >= at) {
+      T v;
+      std::memcpy(&v, b.data() + at, sizeof(T));
+      return v;
+    }
+    T v = 0;
+    for (size_t i = 0; i < sizeof(T); ++i) v |= static_cast<T>(u8(at + i)) << (8 * i);
+    return v;
+  }
+  uint16_t u16(uint64_t at) const { return field<uint16_t>(at); }
+  uint32_t u32(uint64_t at) const { return field<uint32_t>(at); }
+  uint64_t u64(uint64_t at) const { return field<uint64_t>(at); }
   std::string str(uint64_t at, uint64_t n) const {
     need(at, n);
     return b.substr(at, n);
   }
-  // A NUL-terminated string in a table.
-  std::string cstr(uint64_t at) const {
-    std::string s;
-    for (uint64_t i = at; u8(i); ++i) s += static_cast<char>(u8(i));
-    return s;
+  // A NUL-terminated string in a table, as a view of the file's own bytes.
+  std::string_view cview(uint64_t at) const {
+    if (at < b.size()) {
+      const char* p = b.data() + at;
+      if (const void* z = std::memchr(p, 0, b.size() - at)) return {p, static_cast<size_t>(static_cast<const char*>(z) - p)};
+    }
+    for (uint64_t i = at; u8(i); ++i) {}   // (no terminator before the end of the file: refuses, as it always did)
+    return {};
   }
+  std::string cstr(uint64_t at) const { return std::string(cview(at)); }
 };
 
 // ---- MessagePack ----------------------------------------------------------------
@@ -59,16 +78,16 @@ struct Msgpack {
   std::vector<Msgpack> list;
   std::vector<std::pair<Msgpack, Msgpack>> map;
 
-  const Msgpack* at(const std::string& key) const {
+  const Msgpack* at(std::string_view key) const {
     for (const auto& [k, v] : map)
       if (k.kind == Kind::Str && k.s == key) return &v;
     return nullptr;
   }
-  int64_t number(const std::string& key, int64_t fallback = 0) const {
+  int64_t number(std::string_view key, int64_t fallback = 0) const {
     const Msgpack* v = at(key);
     return v && v->kind == Kind::Int ? v->i : fallback;
   }
-  std::string text(const std::string& key) const {
+  std::string text(std::string_view key) const {
     const Msgpack* v = at(key);
     return v && v->kind == Kind::Str ? v->s : "";
   }
@@ -87,16 +106,21 @@ Msgpack parse_msgpack(const Reader& r, uint64_t& at, uint64_t end, int depth = 0
   Msgpack v;
   const uint8_t tag = r.u8(at++);
   const auto bytes = [&](uint64_t n) {
-    const std::string s = r.str(at, n);
+    std::string s = r.str(at, n);
     at += n;
     return s;
   };
+  // (A count is the document's claim, not a size to allocate for: room for no more than the bytes left could hold, at
+  // least a byte an element.)
+  const auto room = [&](uint64_t n) { return static_cast<size_t>(std::min<uint64_t>(n, end > at ? end - at : 0)); };
   const auto fill_array = [&](uint64_t n) {
     v.kind = Msgpack::Kind::Array;
+    v.list.reserve(room(n));
     for (uint64_t i = 0; i < n; ++i) v.list.push_back(parse_msgpack(r, at, end, depth + 1));
   };
   const auto fill_map = [&](uint64_t n) {
     v.kind = Msgpack::Kind::Map;
+    v.map.reserve(room(n));
     for (uint64_t i = 0; i < n; ++i) {
       Msgpack key = parse_msgpack(r, at, end, depth + 1);
       v.map.emplace_back(std::move(key), parse_msgpack(r, at, end, depth + 1));
@@ -210,8 +234,8 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
   CodeObject out;
   if (const Section* text = section(".text")) {
     r.need(text->offset, text->size);
-    out.text.assign(bytes.begin() + static_cast<long>(text->offset),
-                    bytes.begin() + static_cast<long>(text->offset + text->size));
+    out.text.resize(text->size);
+    if (text->size) std::memcpy(out.text.data(), bytes.data() + text->offset, text->size);
     out.text_addr = text->addr;
   } else {
     throw Error::make(Err::ProfileParse, origin, ": no .text section");
@@ -258,17 +282,22 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
   // and where each kernel's code is, from the function symbol of its name.
   // The descriptor's entry offset is a relocation in an object that has not
   // been linked, so the symbol is what says where the code starts.
-  std::map<std::string, Descriptor> descriptors;
-  std::map<std::string, std::pair<uint64_t, uint64_t>> code;   // name -> address, size
-  std::map<std::string, uint64_t> symbol_at;                   // a global's offset in the data image
-  std::map<uint32_t, std::string> symbol_name;                 // by index, for the relocations
+  // (Names are views of the file's own bytes, which outlive this function's tables; lookups are by name only.)
+  std::unordered_map<std::string_view, Descriptor> descriptors;
+  std::unordered_map<std::string_view, std::pair<uint64_t, uint64_t>> code;   // name -> address, size
+  std::unordered_map<std::string_view, uint64_t> symbol_at;                   // a global's offset in the data image
+  std::vector<std::string_view> symbol_name;                                  // by index, for the relocations
+  std::vector<uint8_t> symbol_named;                                          // (which indices have been set)
   for (const auto& s : sections) {
     if (s.type != 2 /* SHT_SYMTAB */ || !s.entsize) continue;
     if (s.link >= sections.size()) continue;
     const uint64_t strtab = sections[s.link].offset;
     for (uint64_t at = s.offset; at + s.entsize <= s.offset + s.size; at += s.entsize) {
-      const std::string name = r.cstr(strtab + r.u32(at));
-      symbol_name[static_cast<uint32_t>((at - s.offset) / s.entsize)] = name;
+      const std::string_view name = r.cview(strtab + r.u32(at));
+      const size_t index = static_cast<size_t>((at - s.offset) / s.entsize);
+      if (index >= symbol_name.size()) symbol_name.resize(index + 1), symbol_named.resize(index + 1, 0);
+      symbol_name[index] = name;
+      symbol_named[index] = 1;
       const uint8_t type = r.u8(at + 4) & 0xF;
       const uint16_t shndx = r.u16(at + 6);
       const uint64_t value = r.u64(at + 8), size = r.u64(at + 16);
@@ -277,11 +306,11 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       const bool loaded = out.linked && shndx < sections.size() && (sections[shndx].flags & 2);
       if (type == 1 /* STT_OBJECT */ && !name.empty() && (data_at.count(shndx) || loaded)) {
         GlobalVar g;
-        g.name = name;
+        g.name = std::string(name);
         g.offset = out.linked ? value : data_at[shndx] + value;   // linked: its address in the image
         g.size = size;
         out.globals.push_back(std::move(g));
-        symbol_at[name] = g.offset;
+        symbol_at[name] = out.globals.back().offset;
       }
       if (name.size() < 4 || name.compare(name.size() - 3, 3, ".kd") != 0) continue;
       if (shndx >= sections.size() || size < 64) continue;
@@ -314,16 +343,16 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
       // instruction that reads it.
       // R_AMDGPU_REL64 (5): all of it, in the 64-bit literal gfx1250 adds to the program counter.
       if (kind != 10 && kind != 11 && kind != 5) continue;
-      const auto named = symbol_name.find(sym);
-      if (named == symbol_name.end()) continue;
-      if (const auto found = symbol_at.find(named->second); found != symbol_at.end()) {
+      if (sym >= symbol_name.size() || !symbol_named[sym]) continue;
+      const std::string_view named = symbol_name[sym];
+      if (const auto found = symbol_at.find(named); found != symbol_at.end()) {
         out.relocations.push_back({where, found->second, addend, kind == 11, false, kind == 5});
         continue;
       }
       // A call: the symbol is a function in this module's own code.
-      const auto called = code.find(named->second);
+      const auto called = code.find(named);
       if (called == code.end())
-        throw Error::make(Err::ProfileParse, origin, ": the code refers to ", named->second,
+        throw Error::make(Err::ProfileParse, origin, ": the code refers to ", named,
                           ", which is not a variable or a function this module defines");
       out.relocations.push_back({where, called->second.first, addend, kind == 11, true, kind == 5});
     }
@@ -392,6 +421,12 @@ CodeObject load_code_object(const std::string& bytes, const std::string& origin)
     out.abi_minor = static_cast<uint32_t>(v->list[1].i);
   }
 
+  {
+    // (A Kernel is copied, not moved, when the vector grows, so room for them all up front.)
+    size_t total = 0;
+    for (const Msgpack& note : notes) total += note.at("amdhsa.kernels")->list.size();
+    out.kernels.reserve(total);
+  }
   for (const Msgpack& note : notes)
   for (const Msgpack& k : note.at("amdhsa.kernels")->list) {
     if (k.kind != Msgpack::Kind::Map) continue;
