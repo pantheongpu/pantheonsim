@@ -539,6 +539,153 @@ static void run_api(const std::string& size) {
   p.finish(rounds * 13ull, "call");
   expect_true("api", good == rounds);
 }
+
+// ---- launch, stream, copy and graph rates (speedup4-amdmt) ----
+// Many small work-groups: what the work-group hand-off between the calling thread and the workers costs.
+__global__ void k_wide(uint32_t* out, uint32_t v) {
+  uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+  out[t] = (t * 2654435761u) ^ v;
+}
+static void run_launch_grid(uint32_t groups, uint32_t launches, const char* what) {
+  const uint32_t block = 64;
+  uint32_t* d;
+  HC(hipMalloc(&d, groups * block * 4));
+  hipStream_t s;
+  HC(hipStreamCreate(&s));
+  Phase p;
+  for (uint32_t i = 0; i < launches; ++i) LAUNCH(k_wide, dim3(groups), dim3(block), 0, s, d, i);
+  HC(hipDeviceSynchronize());
+  p.finish(launches, "launch");
+  std::vector<uint32_t> got = dev_read(d, groups * block), ref(groups * block);
+  for (uint32_t t = 0; t < groups * block; ++t) ref[t] = (t * 2654435761u) ^ (launches - 1);
+  expect_eq(what, got.data(), ref.data(), got.size() * 4);
+}
+static void run_launch_wide(const std::string& size) { run_launch_grid(1024, scale(size, 100, 1000), "launch_wide"); }
+// The same with 128 work-groups: about 40 microseconds of work to each of 8 host threads, where starting or waking
+// the threads is a good part of the launch.
+static void run_launch_mid(const std::string& size) { run_launch_grid(128, scale(size, 400, 6000), "launch_mid"); }
+// A chain of launches, each reading what the one before wrote, synchronised every few launches.
+__global__ void k_chain(uint32_t* p, uint32_t v) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) p[0] = p[0] * 31u + v;
+}
+static void run_launch_sync(const std::string& size) {
+  const uint32_t rounds = scale(size, 200, 20000);
+  uint32_t* d;
+  HC(hipMalloc(&d, 64 * 4));
+  HC(hipMemset(d, 0, 4));
+  hipStream_t s;
+  HC(hipStreamCreate(&s));
+  uint32_t ref = 0;
+  Phase p;
+  for (uint32_t r = 0; r < rounds; ++r) {
+    for (uint32_t j = 0; j < 4; ++j) {
+      LAUNCH(k_chain, dim3(1), dim3(64), 0, s, d, r + j);
+      ref = ref * 31u + (r + j);
+    }
+    HC(hipStreamSynchronize(s));
+  }
+  p.finish(rounds * 5ull, "call");
+  std::vector<uint32_t> got = dev_read(d, 1);
+  expect_true("launch_sync", got[0] == ref);
+}
+static void run_memcpy(const std::string& size) {
+  const uint32_t rounds = scale(size, 200, 20000);
+  const size_t small = 16 << 10, big = 64 << 10;
+  std::vector<uint8_t> h(big), back(big);
+  for (size_t i = 0; i < big; ++i) h[i] = static_cast<uint8_t>(i * 7 + 1);
+  void *a, *b;
+  HC(hipMalloc(&a, big));
+  HC(hipMalloc(&b, big));
+  hipStream_t s;
+  HC(hipStreamCreate(&s));
+  uint32_t good = 0;
+  Phase p;
+  for (uint32_t r = 0; r < rounds; ++r) {
+    HC(hipMemcpy(a, h.data(), small, hipMemcpyHostToDevice));
+    HC(hipMemcpy(b, a, small, hipMemcpyDeviceToDevice));
+    HC(hipMemcpy(back.data(), b, small, hipMemcpyDeviceToHost));
+    HC(hipMemcpy(a, h.data(), big, hipMemcpyHostToDevice));
+    HC(hipMemcpyAsync(b, a, big, hipMemcpyDeviceToDevice, s));
+    HC(hipMemsetAsync(b, (int)(r & 0xff), small, s));
+    HC(hipMemcpyAsync(back.data() + small, b, big - small, hipMemcpyDeviceToHost, s));
+    HC(hipStreamSynchronize(s));
+    HC(hipMemset(a, 1, small));
+    good += back[0] == h[0] && back[small - 1] == h[small - 1] && back[small] == (r & 0xff) && back[big - 1] == h[big - 1];
+  }
+  p.finish(rounds * 9ull, "call");
+  expect_true("memcpy", good == rounds);
+}
+static void run_stream(const std::string& size) {
+  const uint32_t rounds = scale(size, 100, 8000);
+  uint32_t* d;
+  HC(hipMalloc(&d, 64 * 4));
+  HC(hipMemset(d, 0, 4));
+  hipStream_t s0;
+  HC(hipStreamCreate(&s0));
+  hipEvent_t e;
+  HC(hipEventCreateWithFlags(&e, hipEventDisableTiming));
+  uint32_t ref = 0;
+  Phase p;
+  for (uint32_t r = 0; r < rounds; ++r) {
+    hipStream_t s1;
+    HC(hipStreamCreateWithFlags(&s1, hipStreamNonBlocking));
+    LAUNCH(k_chain, dim3(1), dim3(64), 0, s0, d, r);
+    ref = ref * 31u + r;
+    HC(hipEventRecord(e, s0));
+    HC(hipStreamWaitEvent(s1, e, 0));
+    LAUNCH(k_chain, dim3(1), dim3(64), 0, s1, d, r + 1);
+    ref = ref * 31u + (r + 1);
+    HC(hipStreamSynchronize(s1));
+    (void)hipEventQuery(e);
+    (void)hipStreamQuery(s0);
+    HC(hipStreamSynchronize(s0));
+    HC(hipStreamDestroy(s1));
+  }
+  p.finish(rounds * 11ull, "call");
+  std::vector<uint32_t> got = dev_read(d, 1);
+  expect_true("stream", got[0] == ref);
+}
+static void run_graph(const std::string& size) {
+  const uint32_t launches = scale(size, 100, 6000);
+  uint32_t* d;
+  HC(hipMalloc(&d, 64 * 4));
+  HC(hipMemset(d, 0, 4));
+  hipStream_t s;
+  HC(hipStreamCreate(&s));
+  hipGraph_t g;
+  hipGraphExec_t ge;
+  HC(hipStreamBeginCapture(s, hipStreamCaptureModeGlobal));
+  for (uint32_t j = 0; j < 4; ++j) LAUNCH(k_chain, dim3(1), dim3(64), 0, s, d, j + 1);
+  HC(hipStreamEndCapture(s, &g));
+  HC(hipGraphInstantiate(&ge, g, nullptr, nullptr, 0));
+  uint32_t ref = 0;
+  Phase p;
+  for (uint32_t i = 0; i < launches; ++i) {
+    HC(hipGraphLaunch(ge, s));
+    for (uint32_t j = 0; j < 4; ++j) ref = ref * 31u + (j + 1);
+    if ((i & 15) == 15) HC(hipStreamSynchronize(s));
+  }
+  HC(hipStreamSynchronize(s));
+  p.finish(launches, "launch");
+  std::vector<uint32_t> got = dev_read(d, 1);
+  expect_true("graph", got[0] == ref);
+  HC(hipGraphExecDestroy(ge));
+  HC(hipGraphDestroy(g));
+}
+static void run_apicheap(const std::string& size) {
+  const uint32_t rounds = scale(size, 20000, 1000000);
+  int dev = -1, warp = 0, ok = 0;
+  Phase p;
+  for (uint32_t r = 0; r < rounds; ++r) {
+    HC(hipGetDevice(&dev));
+    HC(hipGetLastError());
+    HC(hipPeekAtLastError());
+    HC(hipDeviceGetAttribute(&warp, hipDeviceAttributeWarpSize, dev));
+    ok += dev == 0 && warp == g_wave;
+  }
+  p.finish(rounds * 4ull, "call");
+  expect_true("apicheap", ok == (int)rounds);
+}
 static void run_startup(const std::string&) {
   uint32_t* d;
   HC(hipMalloc(&d, 64 * 4));
@@ -574,6 +721,13 @@ int main(int argc, char** argv) {
   else if (w == "launch") run_launch(size);
   else if (w == "api") run_api(size);
   else if (w == "startup") run_startup(size);
+  else if (w == "apicheap") run_apicheap(size);
+  else if (w == "launch_mid") run_launch_mid(size);
+  else if (w == "launch_wide") run_launch_wide(size);
+  else if (w == "launch_sync") run_launch_sync(size);
+  else if (w == "memcpy") run_memcpy(size);
+  else if (w == "stream") run_stream(size);
+  else if (w == "graph") run_graph(size);
   else {
     std::fprintf(stderr, "unknown workload %s\n", w.c_str());
     return 2;
