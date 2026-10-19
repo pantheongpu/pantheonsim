@@ -30,6 +30,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
 #include "mfma_math.hpp"
+#include "gcn_pool.hpp"
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
@@ -10137,21 +10138,31 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
     if (k.group_id_z) m.set_sgpr(w, at++, gz);
     if (k.group_info) m.set_sgpr(w, at++, 0);
     if (k.private_wave_offset && m.target() == gcn::Target::Gfx90a) m.set_sgpr(w, at++, 0);
+    // (The ids of consecutive work-items are counted up from the first lane's, rather than divided out of each
+    // lane's number: the same values, without a 64-bit division for each of three ids a lane.)
+    const bool packed_ids = d.object->packed_work_item_id() || gcn::packs_work_item_ids(m.target());
+    uint32_t x = static_cast<uint32_t>(w.first_lane % size[0]),
+             y = static_cast<uint32_t>(w.first_lane / size[0] % size[1]),
+             z = static_cast<uint32_t>(w.first_lane / size[0] / size[1]);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
-      const uint64_t flat = w.first_lane + lane;
-      const uint32_t x = static_cast<uint32_t>(flat % size[0]), y = static_cast<uint32_t>(flat / size[0] % size[1]),
-                     z = static_cast<uint32_t>(flat / size[0] / size[1]);
       // From ABI version 5 a work-item's three ids are packed into v0,
       // ten bits each, and the kernel pulls them out; before it each id
       // had a register of its own -- except where the hardware packs them
       // whatever the ABI (gcn::packs_work_item_ids): a version 4 object
       // built for gfx90a, gfx942 or gfx1100 still reads them from v0.
-      if (d.object->packed_work_item_id() || gcn::packs_work_item_ids(m.target())) {
+      if (packed_ids) {
         w.vgpr[0][lane] = x | y << 10 | z << 20;
       } else {
         w.vgpr[0][lane] = x;
         w.vgpr[1][lane] = y;
         w.vgpr[2][lane] = z;
+      }
+      if (++x == size[0]) {
+        x = 0;
+        if (++y == size[1]) {
+          y = 0;
+          ++z;
+        }
       }
     }
     ++m.stats.waves;
@@ -10542,26 +10553,22 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
       total = m.stats;
     } else {
       std::vector<DispatchStats> per_thread(nthreads_c);
-      std::vector<std::thread> pool;
       std::mutex err_mu;
       std::exception_ptr first_error;
       std::atomic<bool> failed{false};
-      for (unsigned t = 0; t < nthreads_c; ++t) {
+      pool::run(nthreads_c, [&](unsigned t) {
         const uint64_t begin = clusters * t / nthreads_c, end = clusters * (t + 1) / nthreads_c;
-        pool.emplace_back([&, t, begin, end] {
-          try {
-            Machine m(d, mem, *cache);
-            m.concurrent = true;
-            run_clusters(m, d, packet, group_segment, begin, end, &failed);
-            per_thread[t] = m.stats;
-          } catch (...) {
-            failed = true;
-            std::lock_guard<std::mutex> lock(err_mu);
-            if (!first_error) first_error = std::current_exception();
-          }
-        });
-      }
-      for (std::thread& th : pool) th.join();
+        try {
+          Machine m(d, mem, *cache);
+          m.concurrent = true;
+          run_clusters(m, d, packet, group_segment, begin, end, &failed);
+          per_thread[t] = m.stats;
+        } catch (...) {
+          failed = true;
+          std::lock_guard<std::mutex> lock(err_mu);
+          if (!first_error) first_error = std::current_exception();
+        }
+      });
       if (first_error) {
         if (packet) mem.free(packet);
         std::rethrow_exception(first_error);
@@ -10648,9 +10655,7 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     if (shape.workers <= 1) {
       resident(0);
     } else {
-      std::vector<std::thread> pool;
-      for (unsigned t = 0; t < shape.workers; ++t) pool.emplace_back(resident, t);
-      for (std::thread& th : pool) th.join();
+      pool::run(shape.workers, resident);
     }
     if (first_error) {
       if (packet) mem.free(packet);
@@ -10689,26 +10694,22 @@ DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
     // share is device memory. The first failure stops the rest at their next
     // work-group, and is the one reported.
     std::vector<DispatchStats> per_thread(nthreads);
-    std::vector<std::thread> threads_;
     std::mutex err_mu;
     std::exception_ptr first_error;
     std::atomic<bool> failed{false};
-    for (unsigned t = 0; t < nthreads; ++t) {
+    pool::run(nthreads, [&](unsigned t) {
       const uint64_t begin = groups * t / nthreads, end = groups * (t + 1) / nthreads;
-      threads_.emplace_back([&, t, begin, end] {
-        try {
-          Machine m(d, mem, *cache);
-          m.concurrent = true;
-          run_groups(m, d, packet, group_segment, begin, end, group_at, &failed);
-          per_thread[t] = m.stats;
-        } catch (...) {
-          failed = true;
-          std::lock_guard<std::mutex> lock(err_mu);
-          if (!first_error) first_error = std::current_exception();
-        }
-      });
-    }
-    for (std::thread& th : threads_) th.join();
+      try {
+        Machine m(d, mem, *cache);
+        m.concurrent = true;
+        run_groups(m, d, packet, group_segment, begin, end, group_at, &failed);
+        per_thread[t] = m.stats;
+      } catch (...) {
+        failed = true;
+        std::lock_guard<std::mutex> lock(err_mu);
+        if (!first_error) first_error = std::current_exception();
+      }
+    });
     if (first_error) {
       if (packet) mem.free(packet);
       std::rethrow_exception(first_error);

@@ -1473,6 +1473,18 @@ foreach(_t gfx1100 gfx1201 gfx1030 gfx1250)
   set_tests_properties(test_amd_gcn_memruns_${_t} PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=${_t}")
 endforeach()
 
+# A dispatch spread over host threads (amd/src/gcn_pool.hpp): the pool's tasks once each and all at once, forks, the caller's
+# floating-point environment; memory and counts the same on any thread count, over many dispatches and from several callers,
+# and a failing dispatch.
+vgpu_unit_test(test_amd_gcn_threads amd/tests/unit/test_gcn_threads.cpp)
+target_compile_definitions(test_amd_gcn_threads PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+foreach(_t gfx1100 gfx1030)
+  add_test(NAME test_amd_gcn_threads_${_t} COMMAND test_amd_gcn_threads)
+  set_tests_properties(test_amd_gcn_threads_${_t} PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=${_t}")
+endforeach()
+# A stream's queue (amd/src/hip_queue.hpp): order, the numbering of items, and a waited-for item run on the calling thread
+# when the stream is idle.
+vgpu_unit_test(test_amd_hip_queue amd/tests/unit/test_hip_queue.cpp)
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
 target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_asm amd/tests/unit/test_gcn_asm.cpp)
