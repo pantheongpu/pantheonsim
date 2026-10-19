@@ -123,7 +123,7 @@ constexpr uint32_t kVgprs = 256;
   X(MAX3_U, k_max3_u) X(XOR3, k_xor3) X(MBCNT_LO, k_mbcnt_lo) X(MBCNT_HI, k_mbcnt_hi) X(CVT_I32_F32, k_cvt_i32_f32) X(CVT_U32_F32, k_cvt_u32_f32) X(CVT_F32_U, k_cvt_f32_u) X(CVT_F32_I, k_cvt_f32_i) X(CVT_F32_UBYTE0, k_cvt_f32_ubyte0)
 #define TIER_F32_OPS(X) X(FADD, k_fadd) X(FSUB, k_fsub) X(FSUBREV, k_fsubrev) X(FMUL, k_fmul) X(FMA, k_ffma) X(FMIN, k_fmin) X(FMAX, k_fmax) X(FRCP, k_frcp)
 #define TIER_F64_OPS(X) X(DADD, k_dadd) X(DMUL, k_dmul) X(DFMA, k_dfma)
-#define TIER_L64_OPS(X) X(MOV, l_mov) X(LSHLREV, l_lshlrev) X(LSHRREV, l_lshrrev) X(ASHRREV, l_ashrrev) X(LSHL_ADD, l_lshl_add) X(CVT_F64_U, l_cvt_f64_u) X(CVT_F64_I, l_cvt_f64_i)
+#define TIER_L64_OPS(X) X(MOV, l_mov) X(LSHLREV, l_lshlrev) X(LSHRREV, l_lshrrev) X(ASHRREV, l_ashrrev) X(LSHL_ADD, l_lshl_add) X(LSHL_ADD_G, l_lshl_add_g) X(CVT_F64_U, l_cvt_f64_u) X(CVT_F64_I, l_cvt_f64_i)
 
 #define TIER_ENUM(id, fn) id,
 enum IntId { TIER_INT_OPS(TIER_ENUM) kIntCount };
@@ -1005,6 +1005,7 @@ const std::unordered_map<std::string_view, Entry>& table() {
     L("v_lshrrev_b64", L_LSHRREV, 2, 2);
     L("v_ashrrev_i64", L_ASHRREV, 2, 2);
     L("v_lshl_add_u64", L_LSHL_ADD, 3, 1 | 4);
+    L("v_lshl_add_u64_g", L_LSHL_ADD_G, 3, 1 | 4);
     L("v_cvt_f64_u32_e32", L_CVT_F64_U, 1, 0);
     L("v_cvt_f64_i32_e32", L_CVT_F64_I, 1, 0);
     m["v_mad_u64_u32"] = {Cat::Mad64, 0, 3};
@@ -1314,8 +1315,8 @@ void tier_classify(Inst& in) {
   } else {
     std::string eff = in.short_name.empty() ? in.name : in.short_name;
     if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (eff == "s_max_u32" || eff == "s_max_i32")) eff += "_ge";
-    // (gfx942 and gfx950 take a shift count of this one over 4 as zero, CDNA3 and CDNA4 guides: the interpreter's.)
-    if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && eff == "v_lshl_add_u64") return;
+    // (gfx942 and gfx950 take a shift count of this one over 4 as zero, CDNA3 and CDNA4 guides: a handler of its own.)
+    if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && eff == "v_lshl_add_u64") eff += "_g";
     const auto& tab = table();
     const auto it = tab.find(eff);
     if (it == tab.end()) return;

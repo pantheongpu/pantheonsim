@@ -155,6 +155,8 @@ TIER_L(l_lshlrev, d[i] = b[i] << (a[i] & 63))
 TIER_L(l_lshrrev, d[i] = b[i] >> (a[i] & 63))
 TIER_L(l_ashrrev, d[i] = static_cast<uint64_t>(static_cast<int64_t>(b[i]) >> (a[i] & 63)))
 TIER_L(l_lshl_add, d[i] = (a[i] << (b[i] & 63)) + c[i])
+// (gfx942 and gfx950, CDNA3 and CDNA4 guides: the count is bits 2:0 and a count over 4 is a shift of zero.)
+TIER_L(l_lshl_add_g, d[i] = (a[i] << ((b[i] & 7) > 4 ? 0 : (b[i] & 7))) + c[i])
 TIER_L(l_cvt_f64_u, reinterpret_cast<F64*>(d)[i] = static_cast<double>(static_cast<uint32_t>(a[i])))
 TIER_L(l_cvt_f64_i, reinterpret_cast<F64*>(d)[i] = static_cast<double>(static_cast<int32_t>(a[i])))
 
