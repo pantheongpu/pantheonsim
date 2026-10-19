@@ -3655,6 +3655,12 @@ if(TARGET vgpucudart)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     RUN_SERIAL TRUE
     TIMEOUT 3600)
+  # How sweep.py ends the process (os._exit after a flush, not interpreter finalisation, which PyTorch's
+  # autograd thread can abort): exit statuses, flushed output, no atexit; needs neither torch nor a GPU.
+  find_program(VGPU_PYTHON NAMES python3 python)
+  if(VGPU_PYTHON)
+    add_test(NAME sweep_exit COMMAND "${VGPU_PYTHON}" ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/test_sweep_exit.py)
+  endif()
   add_test(NAME e2e_pytorch_sweep_full COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_sweep.sh full nvidia/rtx5090)
   set_tests_properties(e2e_pytorch_sweep_full PROPERTIES
     DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"

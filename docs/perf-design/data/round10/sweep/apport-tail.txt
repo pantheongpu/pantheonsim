@@ -1,0 +1,5 @@
+INFO: apport (pid 144754) 2026-10-19 14:20:26,786: called for global pid 144526, signal 6, core limit 18446744073709551615, dump mode 1
+ERROR: apport (pid 144754) 2026-10-19 14:20:26,786: ignoring implausibly big core limit, treating as unlimited
+INFO: apport (pid 144754) 2026-10-19 14:20:26,787: executable: /usr/bin/python3.12 (command line "/root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py")
+ERROR: apport (pid 144754) 2026-10-19 14:20:26,788: this executable already crashed 2 times, ignoring
+INFO: apport (pid 144754) 2026-10-19 14:20:26,887: writing core dump to /var/lib/apport/coredump/core._usr_bin_python3_12.0.3450d6fe-2250-4f16-96b1-19b72ed39a9e.144526.418677 (limit: -1)
