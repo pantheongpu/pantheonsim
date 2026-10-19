@@ -25,7 +25,7 @@ VTEST(registry_lists_all_gpus) {
       "nvidia/rtx2080ti", "nvidia/rtx3090", "nvidia/a40", "nvidia/a30", "nvidia/rtx4090", "nvidia/l40",
       "nvidia/rtx-pro-6000", "nvidia/gb10", "nvidia/gb200",
       "nvidia/vr200", "nvidia/thor",
-      "nvidia/rtx-pro-6000-server", "nvidia/rtx-pro-6000-max-q", "nvidia/rtx6000-ada", "nvidia/rtx-a6000", "nvidia/rtx-a5000", "nvidia/a100-80gb-pcie", "nvidia/h100-nvl", "nvidia/h200-nvl", "nvidia/rtx4080", "nvidia/rtx3070",
+      "nvidia/rtx-pro-6000-server", "nvidia/rtx-pro-6000-max-q", "nvidia/rtx-pro-4500", "nvidia/rtx6000-ada", "nvidia/rtx-a6000", "nvidia/rtx-a5000", "nvidia/a100-80gb-pcie", "nvidia/h100-nvl", "nvidia/h200-nvl", "nvidia/rtx4080", "nvidia/rtx3070",
       "amd/mi250x", "amd/mi300x", "amd/mi325x", "amd/mi350x", "amd/mi455x", "amd/rx7900xtx", "amd/rx9070xt",
       "amd/rx6900xt", "amd/rx6800", "amd/rx6700xt"};
   VCHECK_EQ(ids.size(), expected.size());
@@ -50,7 +50,7 @@ VTEST(all_builtin_profiles_parse) {
                           p.id == "nvidia/h100" || p.id == "nvidia/gh200-480gb" ||
                           p.id == "nvidia/h100-pcie" || p.id == "nvidia/t4" ||
                           p.id == "nvidia/a10g" || p.id == "nvidia/l4" ||
-                          p.id == "nvidia/l40s" || p.id == "nvidia/rtx-pro-6000-server" ||
+                          p.id == "nvidia/l40s" || p.id == "nvidia/rtx-pro-6000-server" || p.id == "nvidia/rtx-pro-4500" ||
                           p.id == "amd/mi325x" || p.id == "amd/rx6800" || p.id == "amd/rx6700xt");
     // AMD parts have no compute capability, and the profile that carried a
     // plausible "9.4" was inventing one. Each vendor is asked for the thing it

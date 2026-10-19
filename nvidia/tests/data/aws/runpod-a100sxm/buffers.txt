@@ -1,0 +1,16 @@
+context made                       requested 0, completed 0
+kernel kind enabled                requested 0, completed 0
+allocated, nothing to record       requested 0, completed 0
+kernel launched                    requested 1, completed 0
+synchronized                       requested 1, completed 0
+flushed                            requested 1, completed 1
+delivered anything: yes
+flushed again                      requested 1, completed 1
+second kernel launched             requested 2, completed 1
+kind disabled, not flushed         requested 2, completed 1
+flushed                            requested 2, completed 2
+launch while disabled, flushed     requested 2, completed 2
+runtime kind enabled               requested 2, completed 2
+one call made                      requested 3, completed 2
+flushed                            requested 3, completed 3
+# end

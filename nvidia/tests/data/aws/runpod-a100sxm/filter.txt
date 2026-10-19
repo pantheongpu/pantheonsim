@@ -1,0 +1,39 @@
+cuptiActivityEnableRuntimeApi(0, 1) -> CUPTI_SUCCESS
+cuptiActivityEnableRuntimeApi(99999, 1) -> CUPTI_ERROR_INVALID_PARAMETER
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020, 1) -> CUPTI_SUCCESS
+# only cudaMalloc
+  cudaMalloc_v3020
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020, 1) -> CUPTI_SUCCESS
+# and cudaFree
+  cudaMalloc_v3020
+  cudaFree_v3020
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020, 2) -> CUPTI_SUCCESS
+# and cudaMemcpy (switched on with 2)
+  cudaMalloc_v3020
+  cudaMemcpy_v3020
+  cudaFree_v3020
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaMalloc_v3020, 0) -> CUPTI_SUCCESS
+# the kind on, cudaMalloc off
+  cudaMemcpy_v3020
+  cudaFree_v3020
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+# the kind on again
+  cudaMalloc_v3020
+  cudaMemcpy_v3020
+  cudaFree_v3020
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020, 0) -> CUPTI_SUCCESS
+# cudaFree off
+  cudaMalloc_v3020
+  cudaMemcpy_v3020
+cuptiActivityDisable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+# the kind off
+cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaMemcpy_v3020, 1) -> CUPTI_SUCCESS
+# the kind off, cudaMemcpy on
+cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+# the kind on
+  cudaMalloc_v3020
+  cudaMemcpy_v3020
+  cudaFree_v3020
+cuptiActivityDisable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+# end

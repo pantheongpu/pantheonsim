@@ -1,0 +1,83 @@
+peer path between devices 0 and 1: yes
+enable kind 1: yes
+enable kind 22: yes
+enable kind 5: yes
+# without peer access enabled
+  memcpy kind=2 src=device dst=device bytes=4096 device=0 context=x0 stream=s0 corr=c0 order=ok
+  memcpy kind=1 src=device dst=device bytes=4096 device=1 context=x1 stream=s1 corr=c0 order=ok
+  runtime cudaMemcpyPeer_v4000 corr=c0
+  memcpy kind=2 src=device dst=device bytes=8192 device=0 context=x0 stream=s2 corr=c1 order=ok
+  memcpy kind=1 src=device dst=device bytes=8192 device=1 context=x1 stream=s1 corr=c1 order=ok
+  runtime cudaMemcpyPeerAsync_v4000 corr=c1
+  runtime cudaStreamSynchronize_v3020 corr=c2
+  memcpy kind=2 src=device dst=device bytes=12288 device=0 context=x0 stream=s0 corr=c3 order=ok
+  memcpy kind=1 src=device dst=device bytes=12288 device=1 context=x1 stream=s1 corr=c3 order=ok
+  runtime cudaMemcpy_v3020 corr=c3
+  memcpy kind=2 src=device dst=device bytes=16384 device=0 context=x0 stream=s2 corr=c4 order=ok
+  memcpy kind=1 src=device dst=device bytes=16384 device=1 context=x1 stream=s1 corr=c4 order=ok
+  runtime cudaMemcpyAsync_v3020 corr=c4
+  runtime cudaStreamSynchronize_v3020 corr=c5
+  runtime cudaSetDevice_v3020 corr=c6
+  runtime cudaStreamCreate_v3020 corr=c7
+  memcpy kind=2 src=device dst=device bytes=4096 device=1 context=x1 stream=s3 corr=c8 order=ok
+  memcpy kind=1 src=device dst=device bytes=4096 device=0 context=x0 stream=s4 corr=c8 order=ok
+  runtime cudaMemcpyPeerAsync_v4000 corr=c8
+  runtime cudaStreamSynchronize_v3020 corr=c9
+  runtime cudaStreamDestroy_v5050 corr=c10
+  runtime cudaSetDevice_v3020 corr=c11
+# with peer access enabled
+  runtime cudaSetDevice_v3020 corr=c12
+  runtime cudaDeviceEnablePeerAccess_v4000 corr=c13
+  runtime cudaSetDevice_v3020 corr=c14
+  runtime cudaDeviceEnablePeerAccess_v4000 corr=c15
+  runtime cudaSetDevice_v3020 corr=c16
+  peer copy kind=10 src=device dst=device flags=0 bytes=4096 device=0 src=0/x0 dst=1/x1 context=x0 stream=s0 corr=c17 order=ok
+  runtime cudaMemcpyPeer_v4000 corr=c17
+  peer copy kind=10 src=device dst=device flags=1 bytes=8192 device=0 src=0/x0 dst=1/x1 context=x0 stream=s2 corr=c18 order=ok
+  runtime cudaMemcpyPeerAsync_v4000 corr=c18
+  runtime cudaStreamSynchronize_v3020 corr=c19
+  peer copy kind=10 src=device dst=device flags=0 bytes=12288 device=0 src=0/x0 dst=1/x1 context=x0 stream=s0 corr=c20 order=ok
+  runtime cudaMemcpy_v3020 corr=c20
+  peer copy kind=10 src=device dst=device flags=1 bytes=16384 device=0 src=0/x0 dst=1/x1 context=x0 stream=s2 corr=c21 order=ok
+  runtime cudaMemcpyAsync_v3020 corr=c21
+  runtime cudaStreamSynchronize_v3020 corr=c22
+  runtime cudaSetDevice_v3020 corr=c23
+  runtime cudaStreamCreate_v3020 corr=c24
+  peer copy kind=10 src=device dst=device flags=1 bytes=4096 device=1 src=1/x1 dst=0/x0 context=x1 stream=s5 corr=c25 order=ok
+  runtime cudaMemcpyPeerAsync_v4000 corr=c25
+  runtime cudaStreamSynchronize_v3020 corr=c26
+  runtime cudaStreamDestroy_v5050 corr=c27
+  runtime cudaSetDevice_v3020 corr=c28
+# a 3-D copy between devices
+  peer copy kind=10 src=device dst=device flags=0 bytes=2048 device=0 src=0/x0 dst=1/x1 context=x0 stream=s0 corr=c29 order=ok
+  runtime cudaMemcpy3DPeer_v4000 corr=c29
+  runtime cudaDeviceSynchronize_v3020 corr=c30
+# peer access disabled again
+  runtime cudaSetDevice_v3020 corr=c31
+  runtime cudaDeviceDisablePeerAccess_v4000 corr=c32
+  runtime cudaSetDevice_v3020 corr=c33
+  runtime cudaDeviceDisablePeerAccess_v4000 corr=c34
+  runtime cudaSetDevice_v3020 corr=c35
+  memcpy kind=2 src=device dst=device bytes=4096 device=0 context=x0 stream=s0 corr=c36 order=ok
+  memcpy kind=1 src=device dst=device bytes=4096 device=1 context=x1 stream=s1 corr=c36 order=ok
+  runtime cudaMemcpyPeer_v4000 corr=c36
+  memcpy kind=2 src=device dst=device bytes=8192 device=0 context=x0 stream=s2 corr=c37 order=ok
+  memcpy kind=1 src=device dst=device bytes=8192 device=1 context=x1 stream=s1 corr=c37 order=ok
+  runtime cudaMemcpyPeerAsync_v4000 corr=c37
+  runtime cudaStreamSynchronize_v3020 corr=c38
+  memcpy kind=2 src=device dst=device bytes=12288 device=0 context=x0 stream=s0 corr=c39 order=ok
+  memcpy kind=1 src=device dst=device bytes=12288 device=1 context=x1 stream=s1 corr=c39 order=ok
+  runtime cudaMemcpy_v3020 corr=c39
+  memcpy kind=2 src=device dst=device bytes=16384 device=0 context=x0 stream=s2 corr=c40 order=ok
+  memcpy kind=1 src=device dst=device bytes=16384 device=1 context=x1 stream=s1 corr=c40 order=ok
+  runtime cudaMemcpyAsync_v3020 corr=c40
+  runtime cudaStreamSynchronize_v3020 corr=c41
+  runtime cudaSetDevice_v3020 corr=c42
+  runtime cudaStreamCreate_v3020 corr=c43
+  memcpy kind=2 src=device dst=device bytes=4096 device=1 context=x1 stream=s6 corr=c44 order=ok
+  memcpy kind=1 src=device dst=device bytes=4096 device=0 context=x0 stream=s4 corr=c44 order=ok
+  runtime cudaMemcpyPeerAsync_v4000 corr=c44
+  runtime cudaStreamSynchronize_v3020 corr=c45
+  runtime cudaStreamDestroy_v5050 corr=c46
+  runtime cudaSetDevice_v3020 corr=c47
+# end

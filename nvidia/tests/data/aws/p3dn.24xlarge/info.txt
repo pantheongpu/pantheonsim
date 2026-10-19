@@ -1,0 +1,12 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+Tesla V100-SXM2-32GB, 7.0, 32768 MiB, 550.163.01, GPU-c835db09-0448-0b5b-4f49-ef472cb2a95e
+Tesla V100-SXM2-32GB, 7.0, 32768 MiB, 550.163.01, GPU-04ee64c5-47ac-ab82-2d17-caed9d508c2c
+Tesla V100-SXM2-32GB, 7.0, 32768 MiB, 550.163.01, GPU-08aa3c8b-baf2-defb-ad97-e3763926d44b
+Tesla V100-SXM2-32GB, 7.0, 32768 MiB, 550.163.01, GPU-170628c5-6198-4212-8fc7-8474e1cf90c0
+Tesla V100-SXM2-32GB, 7.0, 32768 MiB, 550.163.01, GPU-9c265a8a-aa82-52e7-8b3d-d26dca8a5418
+Tesla V100-SXM2-32GB, 7.0, 32768 MiB, 550.163.01, GPU-6719da4f-d726-8553-94a3-e546d4539940
+Tesla V100-SXM2-32GB, 7.0, 32768 MiB, 550.163.01, GPU-74c9f196-5aed-b7e8-c0c8-27eb1292867a
+Tesla V100-SXM2-32GB, 7.0, 32768 MiB, 550.163.01, GPU-c837a321-f989-8cbb-4068-f0f3515f49e5
+Cuda compilation tools, release 12.1, V12.1.105
+Build cuda_12.1.r12.1/compiler.32688072_0
+ngpu=8 arch=sm_70 libs=/usr/local/cuda-12.1/extras/CUPTI/lib64 inc=/usr/local/cuda-12.1/extras/CUPTI/include

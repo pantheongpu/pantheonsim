@@ -9,6 +9,7 @@
 #                                            file: the check that the expected
 #                                            output is what hardware prints
 #   run_cupti_case.sh <case> --card --update rewrite the expected file from the card
+#                                            (cupti_<case>.linux.expected with VGPU_PLATFORM=linux)
 #
 # Cases (nvidia/tests/e2e/cupti_<case>.cu):
 #   trace    runtime-API callbacks, resource and synchronize callbacks, and the
@@ -43,7 +44,13 @@ case_name="${1:?usage: $0 <trace|nvtx|extcorr|params|memory|graph|resource|misc|
 shift
 shim="${VGPU_BUILD_DIR:-$root/build}/shim"
 src="$root/nvidia/tests/e2e/cupti_${case_name}.cu"
+# The expected files are an RTX 3060's under WSL2. VGPU_PLATFORM=linux compares with what a native
+# Linux driver printed instead (cupti_<case>.linux.expected) for the cases that differ, and with the
+# shared file for the rest; nvidia/src/platform.hpp says what differs.
+export VGPU_PLATFORM="${VGPU_PLATFORM:-wsl}"
 expected="$root/nvidia/tests/data/cupti_${case_name}.expected"
+[[ "$VGPU_PLATFORM" == linux && -f "$root/nvidia/tests/data/cupti_${case_name}.linux.expected" ]] &&
+  expected="$root/nvidia/tests/data/cupti_${case_name}.linux.expected"
 out="${TMPDIR:-/tmp}/vgpu_e2e_cupti_${case_name}_$$"
 [[ -f "$src" ]] || { echo "no such case: $case_name" >&2; exit 2; }
 card=0; update=0
@@ -178,6 +185,7 @@ if [[ "$case_name" == compat12 ]]; then
   fi
 fi
 if (( card && update )); then
+  [[ "$VGPU_PLATFORM" == linux ]] && expected="$root/nvidia/tests/data/cupti_${case_name}.linux.expected"
   cp "$out.txt" "$expected"
   echo "wrote $expected"
   exit 0

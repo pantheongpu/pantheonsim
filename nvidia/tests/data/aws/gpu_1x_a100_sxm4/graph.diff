@@ -1,0 +1,10 @@
+--- /w/col/gpu_1x_a100_sxm4//graph.txt	2026-10-18 10:08:48.000000000 +0000
++++ /w/col/gpu_1x_a100_sxm4//graph.sim	2026-10-18 12:08:30.795581450 +0000
+@@ -166,6 +166,7 @@
+ RES 14 context=none graph=g5 original=- node=n14 originalNode=- type=0 dependency=- exec=-
+ RES 18 context=set graph=g3 original=- node=- originalNode=- type=0 dependency=- exec=g5
+ # change a node of the executable graph
++RES 23 context=none graph=- original=g3 node=n13 originalNode=n7 type=0 dependency=- exec=g5
+ # destroy a node
+ RES 14 context=none graph=g3 original=- node=n8 originalNode=- type=0 dependency=- exec=-
+ # destroy

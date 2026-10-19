@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA A10G, 8.6, 23028 MiB, 595.91.07, GPU-343a67d9-083b-2866-c792-c7a843127346
+Cuda compilation tools, release 13.2, V13.2.51
+Build cuda_13.2.r13.2/compiler.37434383_0
+ngpu=1 arch=sm_86 libs=/usr/local/cuda-13.2/extras/CUPTI/lib64 inc=/usr/local/cuda-13.2/extras/CUPTI/include

@@ -50,6 +50,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "platform.hpp"
 #include "enum_value.hpp"
 #include "func_attrs.hpp"
 #include "kept_args.hpp"
@@ -4060,7 +4061,7 @@ static cudaError_t cudaMemPoolImportFromShareableHandle_traced(cudaMemPool_t* me
 #if CUDART_VERSION >= 12040
       case cudaMemHandleTypeFabric:
 #endif
-        return cudaErrorNotSupported;
+        return vgpu::platform::native_linux() ? cudaErrorUnknown : cudaErrorNotSupported;
       default:
         return cudaErrorInvalidValue;
     }
@@ -9767,7 +9768,7 @@ static cudaError_t cudaImportExternalMemory_traced(cudaExternalMemory_t* extMem_
     if (!extMem_out || !memHandleDesc || memHandleDesc->size == 0) return cudaErrorInvalidValue;
     if (enum_value(memHandleDesc->type) != cudaExternalMemoryHandleTypeOpaqueFd) return cudaErrorInvalidValue;
     external_interop_note("cudaImportExternalMemory");
-    return cudaErrorNotSupported;
+    return vgpu::platform::native_linux() ? cudaErrorUnknown : cudaErrorNotSupported;
   });
 }
 static cudaError_t cudaExternalMemoryGetMappedBuffer_traced(void** devPtr, cudaExternalMemory_t extMem, const cudaExternalMemoryBufferDesc* bufferDesc);
@@ -9821,7 +9822,7 @@ static cudaError_t cudaImportExternalSemaphore_traced(cudaExternalSemaphore_t* e
     // The enumerators are 1 (opaque file descriptor) to 10 (timeline semaphore, Win32).
     if (type < 1 || type > 10 || semHandleDesc->flags != 0) return cudaErrorInvalidValue;
     external_interop_note("cudaImportExternalSemaphore");
-    return cudaErrorNotSupported;
+    return vgpu::platform::native_linux() ? cudaErrorUnknown : cudaErrorNotSupported;
   });
 }
 static cudaError_t external_semaphores_async(const char* api, const cudaExternalSemaphore_t* extSemArray,
@@ -9872,7 +9873,9 @@ VGPU_EXPORT cudaError_t cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDM
 static cudaError_t cudaDeviceFlushGPUDirectRDMAWrites_traced(cudaFlushGPUDirectRDMAWritesTarget target,
                                                            cudaFlushGPUDirectRDMAWritesScope scope) {
   (void)target; (void)scope;
-  return guard("cudaDeviceFlushGPUDirectRDMAWrites", [&](State&) -> cudaError_t { return cudaErrorNotSupported; });
+  return guard("cudaDeviceFlushGPUDirectRDMAWrites", [&](State&) -> cudaError_t {
+    return vgpu::platform::native_linux() ? cudaSuccess : cudaErrorNotSupported;
+  });
 }
 
 // External semaphore nodes: the arrays are copied in, and handed back from the node's own storage as the
