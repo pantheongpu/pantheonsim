@@ -786,6 +786,17 @@ TIER_S2(s_max_u32, {
   *R.scc = x > y;
   v = *R.scc ? x : y;
 })
+// (gfx942 and gfx950: SCC = S0 >= S1, so a tie sets it; the table has these under the names with _ge, chosen by the instruction's architecture.)
+TIER_S2(s_max_u32_ge, {
+  const uint32_t x = static_cast<uint32_t>(a), y = static_cast<uint32_t>(b);
+  *R.scc = x >= y;
+  v = *R.scc ? x : y;
+})
+TIER_S2(s_max_i32_ge, {
+  const int32_t x = static_cast<int32_t>(a), y = static_cast<int32_t>(b);
+  *R.scc = x >= y;
+  v = static_cast<uint32_t>(*R.scc ? x : y);
+})
 TIER_S2(s_min_i32, {
   const int32_t x = static_cast<int32_t>(a), y = static_cast<int32_t>(b);
   *R.scc = x < y;
@@ -1069,6 +1080,8 @@ const std::unordered_map<std::string_view, Entry>& table() {
     S("s_max_u32", s_max_u32, 2);
     S("s_min_i32", s_min_i32, 2);
     S("s_max_i32", s_max_i32, 2);
+    S("s_max_u32_ge", s_max_u32_ge, 2);
+    S("s_max_i32_ge", s_max_i32_ge, 2);
     S("s_bcnt1_i32_b32", s_bcnt1_b32, 1);
     S("s_bcnt1_i32_b64", s_bcnt1_b64, 1);
     S("s_ff1_i32_b32", s_ff1_b32, 1);
@@ -1299,7 +1312,8 @@ void tier_classify(Inst& in) {
   if (vector_enc && in.name.find("_co_u32") != std::string::npos) {   // (carry_alu takes these first, under their own names)
     ep = &kCarry;
   } else {
-    const std::string& eff = in.short_name.empty() ? in.name : in.short_name;
+    std::string eff = in.short_name.empty() ? in.name : in.short_name;
+    if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (eff == "s_max_u32" || eff == "s_max_i32")) eff += "_ge";
     const auto& tab = table();
     const auto it = tab.find(eff);
     if (it == tab.end()) return;
@@ -1314,6 +1328,8 @@ void tier_classify(Inst& in) {
       const bool is_f = e.cat == Cat::F32;
       if (!vgpr_dst(in.dst[0], f.dst, 1)) return fail();
       if ((e.flags & kNoClamp) && in.clamp) return fail();
+      // (gfx942 and gfx950 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA3 and CDNA4 guides, 6.5: the interpreter's.)
+      if (in.omod && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && !(e.flags & kIgnoreMods)) return fail();
       for (int k = 0; k < e.arity; ++k)
         if (!lane_src32(in.src[k], f.src[k], is_f || (e.flags & kFloatSrc))) return fail();
       if (is_f) {
@@ -1340,6 +1356,7 @@ void tier_classify(Inst& in) {
     case Cat::F64: {
       if (!vector_enc || in.dst.size() != 1 || in.src.size() < static_cast<size_t>(e.arity)) return;
       if (!vgpr_dst(in.dst[0], f.dst, 2)) return fail();
+      if (in.omod && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950)) return fail();
       for (int k = 0; k < e.arity; ++k)
         if (!lane_src64(in.src[k], f.src[k], true)) return fail();
       if (e.flags & kFmac) f.src[2] = Src(), f.src[2].kind = kVgpr, f.src[2].index = f.dst.index, f.src[2].wide = true;

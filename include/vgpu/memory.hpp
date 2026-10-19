@@ -100,7 +100,9 @@ class MemoryManager {
   }
 
   // Allocates `size` bytes of virtual device memory. size == 0 is invalid.
-  uint64_t alloc(uint64_t size);
+  // `align` (a power of two) starts the allocation on a multiple of it if that
+  // is more than the allocator's own alignment.
+  uint64_t alloc(uint64_t size, uint64_t align = 0);
 
   // AMD's HIP hands device memory out a 4 KB page at a time, so a kernel that
   // reads a little past the end of a buffer reads the rest of its page, and

@@ -143,10 +143,11 @@ library loads (zlib and zstd are the two methods clang defines; any other method
 were linked into, each keeping its own metadata. The stream-ordered
 allocations, pitched copies, pointer attributes and work-item-sized launches
 (`hipExtModuleLaunchKernel`) it calls are there. `tests/e2e/run_rocblas.sh`
-builds a program against rocBLAS and checks its level-1 routines and its
-float and double GEMMs -- ragged sizes, every transpose -- against the same
-arithmetic on the host; both need ROCm with rocBLAS installed and skip
-elsewhere. AMD's own rocBLAS test suite, built from ROCm 7.1's source, runs
+builds a program against rocBLAS and checks its level-1 routines, its
+float and double GEMMs -- ragged sizes, every transpose -- and its double
+triangular solves (`trsv` with a backwards stride, `trsm` from either side;
+every fill, transpose and diagonal) against the same arithmetic on the host;
+both need ROCm with rocBLAS installed and skip elsewhere. AMD's own rocBLAS test suite, built from ROCm 7.1's source, runs
 on it as well: all 162,807 of its quick float and double tests pass, each
 checked against OpenBLAS, and its half, bfloat16, int8 and FP8 GEMMs run too.
 
@@ -226,9 +227,15 @@ double (fused, for doubles) and rounded once; where a sum is not exact, a card
 may round it differently. The reduced-precision xf32 forms (`v_mfma_f32_16x16x8_xf32`
 and `32x32x4`, gfx940 to gfx942) multiply floats whose mantissa is cut to 10 bits,
 as the MI300 ISA guide describes them: the guide says "round" once and
-"truncated" in each instruction's own text, and the instruction's is taken
-(`test_amd_gcn_asm` checks the layout the guide's general formula gives and the
-cut). The B broadcast pattern (BLGP) and a wave with lanes switched off are
+"truncated" in each instruction's own text, and the instruction's is taken --
+which hipBLASLt's golden reference for its xf32 kernels bears out (`XFloat32` in
+`tensilelite/include/Tensile/DataTypes_XFloat32.hpp`: "truncate lower 13 bits of
+IEEE float to convert to XFloat32", and `client/cpu_gemm_driver.cpp`:
+"XFloat32 ... truncates float operands to a 10-bit mantissa"). The rounding
+`xfloat32` of rocBLAS and rocWMMA (`rocblas_xfloat32.h`, "add 0xFFF plus the lowest
+bit") is the host type a program converts its own floats with, not what the
+instruction does to the operands it is given (`test_amd_gcn_asm` checks the layout
+the guide's general formula gives and the cut). The B broadcast pattern (BLGP) and a wave with lanes switched off are
 refused.
 
 A lane can also read another lane's register through the cross-lane form,
@@ -254,12 +261,29 @@ Device-side `malloc` and `free` are the second (service 3, ockl's
 `__ockl_devmem_request`): the device library's allocator asks the host for
 its 2 MiB slabs and for large blocks, and gives them back; the host answers
 with device memory placed on the alignment the library finds slabs by, and a
-null pointer when the device is full (`tests/data/devmalloc.cpp`, run by
-`test_amd_runtime_gaps`). The address sanitizer's report (service 4) ends the
+null pointer when the device is full. A kernel built for code object version
+5 or later (every current hipcc) keeps the allocator's state in a block the
+runtime provides (`hidden_heap_v1`); the runtime makes it, 128 KiB with the
+counts of recordable slabs the allocator expects to find, when the first
+kernel that has the argument launches (`Hostcall::heap`, the layout is
+dm.cl's; ROCm's CLR does the same with the device library's own
+initialization kernel); earlier code objects keep it in their own data
+(`tests/data/devmalloc.cpp`, run by `test_amd_runtime_gaps`). The address
+sanitizer's report (service 4) ends the
 kernel with the report as the error (ROCm's runtime prints it and aborts); no
 sanitizer-instrumented code was available to run it, so it is checked against
-the device library's argument order only. A hostcall for any other service
-(a device function call) is refused by name. Vector loads and stores may be unaligned, as ROCm runs the
+the device library's argument order only. The device function call (service 1,
+`__ockl_call_host_function`) calls a host function the kernel names, once for
+each lane that makes the call: word 0 of a lane's slot is the function's
+address (`void f(uint64_t* output, const uint64_t* input)` -- seven words in,
+two out, the signature ROCm's CLR documents), and its two output words come
+back. Those are all the services the device library has; the fprintf
+interface (`__ockl_fprintf_*`, the stderr stream included, which `assert`
+uses) and printf are service 2. `tests/hipcc/hostcall.cpp` runs a host
+function, malloc and free, printf's conversions and fprintf from a kernel
+on the shim (wave64 and wave32), and the same program's host function,
+malloc and fprintf parts run on ROCm's own HIP over the HSA runtime.
+Vector loads and stores may be unaligned, as ROCm runs the
 hardware; the compiler counts on that when it packs a string.
 
 A program hipcc built carries linked code objects, whose code reaches its
@@ -338,6 +362,10 @@ modelled:
 - **8-bit floats:** the same fp8 instructions mean the OCP formats on gfx950 (E4M3 and E5M2), where gfx942's are FNUZ. Which one applies is read from the code object's target. `tests/hipcc/fp8.cpp`, built for each, checks every conversion against HIP's own software one.
 - **Block-scaled matrix instructions:** `v_mfma_scale_*_f8f6f4` scales each lane's row and 32 values along K by an E8M0 byte of its scale register, the byte `{OP_SEL_HI, OP_SEL}` names, as the CDNA4 ISA reference guide says. `v_prng_b32` is its LFSR step. `tests/hipcc/gfx950.cpp` checks both, and the lane swaps, against the guide.
 - **Sparse matrix instructions:** `v_smfmac_*`, gfx942's and gfx950's (whose K is twice as long), take A 2:4 sparse along K: two values held of each four, and an index register that says which of the four each is. CBSZ and ABID choose a set of indices in that register. On gfx950 their B is eight registers split into two runs of K, K/2 apart, where A's run is in one piece; the guide's B tables show this, and hipSPARSELt's gfx950 kernels are right only with it. `tests/hipcc/smfmac.cpp`, built for each target, checks every form against the guides, and hipSPARSELt checks them in real GEMMs.
+- **Guide semantics beyond the core matrix instructions (gfx942, gfx950):** matrix BLGP/EXEC/MODE/sparse-pruning rules (`tests/hipcc/mfma_modes.cpp`); instructions these chips added over gfx90a, such as the scalar saveexec/bitset/quadmask family, `v_cube*`, `v_sin/cos_f16`, `v_pk_fmac_f16` and gfx950's `v_ashr_pk_*` and 3-input minimum/maximum (`gfx9_added.cpp`); and ALU rules where the CDNA3/CDNA4 guides differ from older chips: float min/max signed zero and signaling NaNs, OMOD ignored under MODE.IEEE, half-precision absolute values, `v_div_fixup` sign, integer and conversion CLAMP, 32-bit literals sign-extended in 64-bit operands, DPP source-1 modifiers, `ttmp`/`src_scc`/`src_vccz` sources (`gfx9_semantics.cpp`). gfx90a and older chips keep their previous behavior (`is_guide_arch`). Each program is built for both chips and checked in `e2e/run_hipcc.sh`.
+- **What the guides settle, second pass (gfx942, gfx950):** `v_cvt_pkaccum_u8_f32`, `v_madmk_f16`, `v_madak_f16`, `s_movrels_*` and `s_movreld_*` (an address past s101 is refused: the guide does not say), `v_mfma_f64_4x4x4_4b_f64` (four blocks, in the layout of the guide's section 7.1.4), gfx950's `v_pk_minimum3_f16` and `v_pk_maximum3_f16`, and its widening `v_cvt_scalef32_*` (4-, 6- and 8-bit floats times 2^(scale - 127), the scale the exponent field of the second source). The float `v_dot2` forms flush denormal inputs and outputs whatever MODE says; `v_mad_f16`, `v_mad_u16`, `v_mad_i16`, `v_fma_f16` and `v_div_fixup_f16` keep the destination's high half when OPSEL[3] is clear, where the "legacy" forms zero it; MODE.FP16_OVFL clamps overflowed half results and the F32 to FP8/BF8 conversions' overflow as the guides' table says (`tests/hipcc/gfx9_decode.cpp`). Left refused because the guides are silent or contradict themselves: the stochastic-rounding conversions (`v_cvt_sr_f16_f32`, `v_cvt_sr_bf16_f32`, `v_cvt_scalef32_sr_*`; see the third-pass entry below), `v_div_scale`/`v_div_fmas`'s scaling and `v_exp_legacy_f32`/`v_log_legacy_f32`. (The narrowing `v_cvt_scalef32_*` and `v_cvt_scalef32_f16_fp8`/`_bf8` that this list once held are implemented: see the third pass.)
+- **Scaled narrowing conversions (gfx950 and gfx1250), from other public sources:** `v_cvt_scalef32_pk_{fp8,bf8}_{f32,f16,bf16}`, `_pk_fp4_*`, `_2xpk16_{fp6,bf6}_f32` and `_pk32_{fp6,bf6}_{f16,bf16}` (opcodes 565, 566, 573, 576, 577, 580, 581, 588, 589, 594, 595, 600 to 603 of the CDNA4 guide), gfx1250's `_pk8_*` and `_pk16_*`, and gfx950's `v_cvt_scalef32_f16_fp8` / `_bf8` (586, 587). The guides give where every source and result goes and leave `f32_to_fp8_scale` and its kin undefined. The value converted is `S / 2^(scale - 127)` (the scale the exponent field of its operand), rounded to nearest even: Composable Kernel's `cvt_float_to_fp8_scaled` (`include/ck/utility/mxf8_utils.hpp`, `cast_to_f8(f / scale, rng)`; "If fval / scale > max fp8, returns Nan") and its device tests on a gfx950 (`test/data_type/test_mx_fp8.cpp`: scale 2.0 turns {-8, 4} into {-4, 2}; infinity / 2, 256 / 0.5 and -256 / 0.5 are NaN in fp8; `test_mx_fp4.cpp`, `test_mx_fp6.cpp`: they are the largest value in fp4 and fp6, and 4.75 / 4 is 1.25), HIP's host reference (`amd_hip_ocp_host.hpp`, `fcbx::from_float`: `srcExp -= scale_exp`). To 8-bit floats the overflow rule is the guide's table for `v_cvt_pk_fp8_f32` applied after the scaling, with MODE.FP16_OVFL ("Conversion to F4/F6 does not support FP16_OVFL, while to F8 does"); to 4- and 6-bit floats a value past the largest saturates and one under the least subnormal becomes a zero, both keeping the sign (the guide's 7.3). The pair forms write the half (fp8: OPSEL[3]) or byte (fp4: OPSEL[3:2]) they name and keep the rest; `v_cvt_scalef32_f16_fp8` / `_bf8` write the half OPSEL[3] names from the byte OPSEL[1:0] names and keep the other half (the builtin's old-destination argument in clang's `BuiltinsAMDGPU.td`, LLVM's tied `vdst_in`). `tests/hipcc/scalef32_narrow.cpp` and `scalef32_narrow1250.cpp` check every form against HIP's host reference over a sweep of values and against the cases Composable Kernel's tests expect. Refused, with the reason in the message: a NaN into a 4- or 6-bit float (Composable Kernel's tests give the largest value, AMD's emulator tests -- `rocm-systems/emulation/rocjitsu/tests/hip_cvt_narrow_test.cpp`, written for a gfx950 -- zero), a scale of 255 (E8M0's NaN), input modifiers, clamp and omod on these conversions. A value between an 8-bit format's largest and the halfway point to the next step is a NaN here (the guide's "greater than max", as `v_cvt_pk_fp8_f32` has it); HIP's host reference and rocjitsu round first and give the largest value.
+- **Stochastic rounding, left refused (gfx950):** `v_cvt_scalef32_sr_*`, `v_cvt_sr_f16_f32` and `v_cvt_sr_bf16_f32` add the seed to the bits the narrowing drops and cut them off; which bits of the seed those are is where the public sources part. The CDNA3 and CDNA4 pseudocode of `V_CVT_SR_FP8_F32` adds `S1[31:12]` (the seed's top 20 bits; `S1[31:11]` for BF8) and its prose says "not use msbs of src1 mantissa" (the low ones); HIP's older `hip_fp8.h` (`cast_to_f8`) and Composable Kernel's `f8_utils.hpp` add the low bits (`rng & drop_mask`), HIP's newer `fcbx::from_float_sr` and rocjitsu (`f32_to_fp8_e4m3_sr`, `seed >> 12`) the top ones; for the half and bfloat16 forms the guide leaves `f32_to_f16_sr` undefined and only rocjitsu defines it. The existing `v_cvt_sr_fp8_f32` / `_bf8_f32` use the low bits (what `tests/hipcc/fp8.cpp` compares with HIP's header); the rule is unsettled, not confirmed. Each of the others says so by name when a kernel reaches it (`test_amd_gcn_cdna_gaps`).
 - **Decoder check:** `tests/data/isa_corpus_gfx950.txt` holds every instruction shape PyTorch's, hipBLASLt's and rocBLAS's gfx950 code uses. The decoder must print each one as `llvm-objdump` does.
 - **Extracting code objects:** `amd_fatbin_extract` (`tools/fatbin-extract.cpp`) writes out what a library carries for one target, which is how that corpus is gathered.
 
@@ -354,6 +382,53 @@ modelled:
   - FLAT_SCRATCH as a register
 - **Scratch:** gfx90a has no flat scratch set up by the hardware. A kernel reaches its private memory through the private segment buffer resource it is handed, with buffer loads and stores the card swizzles across the wave's lanes. The executor hands it that resource and a wave offset, and unswizzles its accesses. This is how rocBLAS's gfx90a kernels spill.
 - **Decoder check:** `tests/data/isa_corpus_gfx90a.txt` holds 1628 instruction shapes from PyTorch's, hipBLASLt's and rocBLAS's gfx90a code. Each decodes, and prints in gfx90a's names (`glc`, `slc`, `v_mfma_f32_32x32x8f16`), as `llvm-objdump` prints it.
+
+## What the CDNA parts still refuse
+
+A coverage probe keeps this list honest: every instruction `llvm-mc` will disassemble for a target (every opcode of each encoding,
+with and without DPP and SDWA, memory forms with and without the LDS bit: 1,894 forms for gfx90a, 1,922 for gfx942 and 2,031 for gfx950,
+and 4,400 to 5,300 more a target in modifier variants) goes into a kernel of its own, and each kernel runs in a process of its own; what stops with
+"decoded but not implemented", "not decoded" or any other unsupported error is the list. gfx90a, gfx942 and gfx950 had 239, 167
+and 211 plain forms in that state before this pass and 105, 66 and 109 after (the rest are a probe's zero resource descriptors, which no
+format or image instruction can read, jumps to address 0, and what the list below says is left); gfx1250's corpus of 4,549 forms went from 34 to 10; the CDNA2, CDNA3 and CDNA4 guides settle most of them, and `tests/unit/test_gcn_cdna_gaps.cpp`
+(kernels in `tests/data/asm_cdna_*.s`, one source for the three parts, with the expected values written again from the guides'
+pseudocode) runs what they say:
+
+- 64-bit and double buffer atomics (`buffer_atomic_*_x2`, `_add_f64`, `_min_f64`, `_max_f64`) and gfx950's `buffer_atomic_pk_add_bf16`; the
+  buffer atomics share FLAT's read-modify-write code now.
+- Buffer loads into LDS of a byte, a half and `format_x` (the guides' figure: LDS address `M0[15:0] + offset + 4 * lane`, the data a
+  dword, as `buffer_load_ubyte` and the others say "zero extend to 32 bits"), and on gfx90a the dword form too. `global_load_lds_{ubyte,sbyte,ushort,sshort}`
+  and `scratch_load_lds_*` on gfx942 and gfx950; FLAT's LDS offset is `M0[17:2] * 4`.
+- The rest of LDS's atomics: `ds_mskor_*`, `ds_wrxchg2_*` and `ds_wrxchg2st64_*`, `ds_cmpst_b64`, `ds_cmpst_f64` and `ds_cmpst_rtn_f64`
+  (the float compare), `ds_wrap_rtn_b32`, `ds_condxchg32_rtn_b64`, `ds_nop`, `ds_append` and `ds_consume` (on LDS), the ADDTID pair
+  (`M0[15:0]`), and gfx942's `ds_pk_add_*`.
+- Scalar buffer stores and atomics (`s_buffer_store_*`, `s_buffer_atomic_*`), the cache instructions `s_dcache_*_vol`,
+  `s_dcache_discard*` and gfx90a's `s_atc_probe*` (nothing a program can read changes), `s_setvskip` (vector instructions are skipped),
+  `s_set_gpr_idx_idx` and `_mode`, `s_setreg_b32`, `s_setkill`, `s_cbranch_cdbg*` (not taken: nothing sets the flags), the
+  performance and trace instructions, `v_clrexcp`.
+- Formatted buffer accesses (`buffer_{load,store}_format_*`, `tbuffer_*`) on gfx942 and gfx950: the guides list them, and the
+  executor had only gfx90a's decoder rows for them.
+- gfx90a's `v_sin_f16`, `v_cos_f16`, the cube-map instructions, `v_cvt_rpi_i32_f32`, `v_cvt_off_f32_i4`, `v_frexp_*_f16`, `v_ldexp_f16`,
+  `v_fma_legacy_f16`, `v_mad_legacy_i16`, `v_pk_fmac_f16` and `v_sat_pk_u8_i16`, which its guide defines (gfx942 had them already). The
+  half NaN of a sine or cosine of an infinity is 0xfe00, as the guides' examples have it.
+
+Left refused, with what the guides say (or do not):
+
+- `s_cbranch_g_fork`, `s_cbranch_i_fork`, `s_cbranch_join`: the stack is "six stack entries of 128-bits each, stored in SGPRS" at
+  `SGPR[CSP*4]`, and "requires three SGPRs for each fork/join block"; where it starts and what CSP is at the start are not said.
+- `s_rfe_b64`, `s_rfe_restore_b64`: "may only be used within a trap handler", and `s_trap` ends the launch here. `s_sethalt 1`
+  and `s_sendmsghalt` halt the wave, and nothing resumes a halted wave in this simulator.
+- `s_scratch_load_*` and `s_scratch_store_*`: `CalcScalarScratchAddr` is not defined. `buffer_store_lds_dword` (gfx90a): "Store one DWORD
+  from LDS memory to system memory without utilizing VGPRs", and no LDS address.
+- The image `_pck` forms and LWE (see Textures).
+- `v_exp_legacy_f32`, `v_log_legacy_f32` (the guides give `pow(2.0, S0.f)` and `log2(S0.f)` and not how "legacy" differs),
+  `v_screen_partition_4se_b32` (only in the opcode table), and on gfx90a `v_mac_f16` (not said whether the product is rounded before the add),
+  `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, `v_cvt_pkaccum_u8_f32` and `v_mad_legacy_f16` (only in the table).
+- gfx950: `ds_read_b96_tr_b6` ("Two instruction load a complete matrix. The first loads K values (0..15, 32..47)"), the stochastic `v_cvt_scalef32_sr_*`, `v_cvt_sr_f16_f32` and `v_cvt_sr_bf16_f32` (which bits of the seed are added is where the guide and AMD's
+  software part: see "Stochastic rounding, left refused"), `v_mfma_ld_scale_b32` (not in the guide), and an M0 of 64 KiB or more for MUBUF's LDS loads (CDNA4's text says `M0[17:0]`, its
+  figure `M0[15:0]`; gfx90a's and gfx942's text and figure agree on 16 bits, which is what they use).
+- `global_load_lds_dwordx3` writes 12 bytes a lane: the guide gives only DWORDX1 (4 bytes) and DWORDX4 (16) for FLAT, and 16 for the buffer
+  form's "3 or 4 dwords".
 
 ## gfx1250 (Instinct MI455X)
 
@@ -500,9 +575,9 @@ false` throughout. gfx1251 (MI430X) is not covered.
   from the code object, whichever call launches it, and refuses a grid that is not whole clusters. Assumed, not stated: work-groups and clusters are numbered x
   fastest, and CLUSTER_ID is the cluster's number modulo 15, plus 1. The multicast of cluster loads is ignored (it moves the same data to the same
   places).
-- **Decoded and printed, but refused when executed:** the narrowing `v_cvt_scalef32*` and `v_cvt_scalef32_sr*` families (the document does not say whether the
-  scale divides or multiplies, how an overflow before or after scaling is judged, or where the stochastic rounding's 16 random bits sit in the
-  dropped bits), `v_permlane64_b32` (assembled by LLVM, absent from the document, and gfx1250 is wave32 only), E5M3 (`CLAMP` on the fp8
+- **Decoded and printed, but refused when executed:** the stochastic `v_cvt_scalef32_sr*` families (where the stochastic rounding's random bits sit in the
+  dropped bits is where the public sources part: see "Stochastic rounding, left refused" above; the rounding-to-nearest `v_cvt_scalef32_pk8_*` and
+  `_pk16_*` are implemented, with the scale dividing, from Composable Kernel and HIP's host reference), `v_permlane64_b32` (assembled by LLVM, absent from the document, and gfx1250 is wave32 only), E5M3 (`CLAMP` on the fp8
   conversions: its largest value and infinity are not stated). Each says so by name
   when a kernel reaches it. The
   numerics test (`numerics.cpp`) is not run: the value MODE starts with on this part is unknown.
@@ -614,9 +689,30 @@ texture units, and the simulator models them from the kernel up:
 - **HSA:** the images extension (`src/hsa_images.inc`): images and samplers,
   import, export, copy and clear, and each agent's image limits.
 - **Checks:** `tests/data/asm_images.s` checks each instruction against the
-  host; `tests/hipcc/images.cpp` (20 checks) runs on all three generations, on
+  host; `tests/hipcc/images.cpp` (21 checks) runs on all three generations, on
   the shim and on ROCm's own HIP over the HSA runtime; `tests/hsa/hsa_images.c`
   checks the extension.
+
+The MI200 family (gfx90a, MI250X) has texture units too, and its instructions are MIMG in gfx9's own
+encoding, which has no DIM field (the resource's TYPE and the DA bit say the shape) and, per the MI200
+guide (12.15), exactly one sample, `image_sample` (implicit level of detail, no `_l`, `_lz`, `_b`, `_c`,
+`_d`, `_o` or `_cl` forms, no `image_gather4`): hipcc drops `tex2DLod` and `tex2Dgather` from the code it
+builds for gfx90a, so a program that calls them gets nothing there (that is the compiler's doing, not the
+simulator's). The executor runs loads (`_mip` included), stores, atomics (on 32- and 64-bit texels, with the
+DMASK values the guide lists), `get_resinfo` and `image_sample` on gfx90a through the same code as RDNA's, with the guide's rules where they differ (a store writes the
+whole texel, the channels DMASK leaves out as zero; with d16 DMASK is only a count), and MUBUF's
+`buffer_load_format_*` and `buffer_store_format_*` (opcodes 0-15, 38 and 39) that `tex1Dfetch` compiles to, and
+MTBUF's `tbuffer_*_format_*`, whose data and number formats are the instruction's own and whose DST_SEL is the
+identity (a channel the format lacks reads 0). A store of fewer components than the format has is refused:
+the guide does not say what becomes of the rest.
+The T# (Table 41 of the guide, ROCR-Runtime's `resource_ai.h`) names the format as GCN does, a data
+format and a number format. Left refused, with the guide's words in the error: the `_pck` forms (the
+guide says the resource's format is ignored and 8- and 16-bit components are zero- or sign-extended,
+and nothing about which channels a DMASK past the texel's returns), LWE (where `LOD_CLAMPED` goes is not
+said), 2D MSAA images and buffers behind a T#. `tests/data/asm_images90a.s`
+(`test_amd_gcn_asm`), `tests/data/isa_corpus_images_gfx90a.txt` (`test_amd_gcn`, the decoder against
+llvm-objdump), `tests/hipcc/images.gfx90a` (19 checks, on the shim and on ROCm's HIP over the HSA runtime)
+and OpenCL's images (`tests/opencl/cl.c`) cover it.
 
 The MI300 family (gfx942 and gfx950) has no texture units. hipcc refuses the
 texture API in their device code (`__HIP_NO_IMAGE_SUPPORT`), and ROCm's HIP on
@@ -680,7 +776,7 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 Two more ways to program an AMD GPU run on the simulated ones with ROCm's own runtimes, and neither goes through HIP.
 
 - **OpenMP target offloading.** LLVM's `libomptarget` has an AMD plugin that drives the HSA runtime directly: queues, signals, memory pools, executables, kernel dispatch packets. `tests/openmp/omp.cpp` is built by ROCm's `amdclang++ -fopenmp --offload-arch=gfx...` for each GPU's ISA and run on two simulated devices of each model (ctest `amd_openmp`, `tests/e2e/run_openmp.sh`): `target teams distribute parallel for` with map clauses, reductions (built-in and `declare reduction`), `declare mapper`, `target data` with `enter`/`exit`/`update`, `map(present)` and `map(always)`, `declare target` functions and variables, `omp_target_alloc`/`memcpy`/`associate_ptr`, atomics (update and capture), `collapse`, `teams loop`, `num_teams`/`thread_limit`/`num_threads`, `nowait` with `depend`, `device(n)` for every device, the device math library, and `printf` from a target region. All of them pass on the six GPUs.
-- **OpenCL.** ROCm's OpenCL runtime (`libamdocl64`, on the same CLR as HIP) builds each kernel with the compiler library and runs it through the HSA runtime. `tests/opencl/cl.c` is an ordinary OpenCL program (built by the system's compiler against the ICD loader) that runs on two devices of each model (ctest `amd_opencl`, `tests/e2e/run_opencl.sh`): vector add, a reduction through local memory and barriers, atomics, doubles, a 2D range, barriers over global memory, buffer fill, copy and map, a global offset with a range that is not a multiple of the work-group, coarse-grained shared virtual memory, and, on the Radeon GPUs, images and samplers. The MI300 family has no texture units, and says so (`CL_DEVICE_IMAGE_SUPPORT` is false). MI250X does have them and says so too; its image instructions (gfx9 MIMG) are not implemented yet, so the test leaves its images out.
+- **OpenCL.** ROCm's OpenCL runtime (`libamdocl64`, on the same CLR as HIP) builds each kernel with the compiler library and runs it through the HSA runtime. `tests/opencl/cl.c` is an ordinary OpenCL program (built by the system's compiler against the ICD loader) that runs on two devices of each model (ctest `amd_opencl`, `tests/e2e/run_opencl.sh`): vector add, a reduction through local memory and barriers, atomics, doubles, a 2D range, barriers over global memory, buffer fill, copy and map, a global offset with a range that is not a multiple of the work-group, coarse-grained shared virtual memory, and, on the Radeon GPUs and the MI250X, images and samplers. The MI300 family has no texture units, and says so (`CL_DEVICE_IMAGE_SUPPORT` is false).
 - **Which GPUs, and where.** Both need only ROCm's LLVM or OpenCL runtime beside the simulator's HSA runtime; the CI job `models` unpacks them from AMD's apt repository (`tests/openmp/fetch-rocm-llvm.sh`, `tests/opencl/fetch-rocm-opencl.sh`) with nothing installed, and the tests skip where neither is found. `offload-arch` (`amdgpu-arch`), which they and CMake's HIP language use to find the GPUs, reads the kernel driver's own directory `/sys/devices/virtual/kfd/kfd`: an isolated session has it, with `/sys/class/kfd/kfd` a link to it as on a machine with the driver.
 
 ## System tools
@@ -711,7 +807,10 @@ vLLM for ROCm, unmodified, generates on every simulated AMD GPU it supports -- M
 - vLLM's ROCm wheels (`wheels.vllm.ai/rocm`) bring a PyTorch that is linked against a ROCm installed on the machine: its RUNPATH names `/opt/rocm-7.2.3/lib`. The machine needs that ROCm's libraries (hipBLAS, hipBLASLt, MIOpen, RCCL, rocprofiler-sdk and the rest) and OpenMPI. The simulator's HIP runtime, ROCm SMI and AMD SMI go in front of them on the library path.
 - vLLM asks AMD SMI whether this is a ROCm machine, and NVML whether it is a CUDA one. NVML answers only for NVIDIA GPUs, and says a machine of AMD GPUs has no NVIDIA driver, as it does on one.
 - Its paged attention for ROCm multiplies with `v_mfma_f32_4x4x4_16b_f16` and CBSZ 4: every block takes block 0's query (A's broadcast, modelled; B's lane patterns, BLGP, are refused by name).
-- The run is eager (no graphs, no `torch.compile`), with one short sequence and a 3 GB device, so the KV cache fits in RAM.
+- The default test run is eager (no graphs, no `torch.compile`), with one short sequence and a 3 GB device, so the KV cache fits in RAM. `VGPU_VLLM_MODE=graphs` (ctest `amd_vllm_graphs`, and a second step of the nightly) runs vLLM as it runs by default on a card: Dynamo and Inductor compile the model into Triton kernels, which Triton compiles for the simulated GPU at run time, and the decode step is captured into HIP graphs (piecewise and full) for batch sizes 1 and 2 and replayed per token, two prompts generated together. The test checks the log for the compile and both captures, since vLLM falls back to eager quietly. It took 8 minutes on a simulated MI300X.
+- `VGPU_VLLM_TP=2` (ctest `amd_vllm_graphs_tp2`, the nightly's MI300X job) shards the model over two simulated GPUs, one worker process each: RCCL's all-reduces and vLLM's custom all-reduce, which shares the buffers its graphs capture through HIP's IPC handles, run inside the captured graphs, and the text is the CPU's (12 minutes). That needed two fixes in HIP's IPC: asking twice for the handle of one allocation gave a second handle naming a file that was never made (the first had made it), and `hipMemset` on memory opened from another process wrote through a device address as if it were a host pointer and faulted.
+- What the graph and compiler paths need is checked below vLLM, in PyTorch's own terms (`tests/pytorch/graphs.py`: stream capture of kernels, copies, events, forked streams, allocations, random numbers, attention, a KV-cache decode step replayed per token, `make_graphed_callables`, kept graphs; `compile.py`: `torch.compile` including `mode="reduce-overhead"`, scans, sorts, dynamic shapes, a training step; `triton_kernels.py`: hand-written Triton on MFMA or WMMA in every input type, attention, atomics, reductions; `distributed_graphs.py`: RCCL's all-reduce and all-gather recorded into graphs across two processes, a tensor-parallel block), on every simulated generation.
+- gfx950's Triton kernels needed three things beyond the other generations': `v_minimum3_f32`, `v_maximum3_f32` and the packed half forms (IEEE minimum and maximum of three, a relu in vLLM's compiled model), the scaled conversions of two 4- or 8-bit floats to bfloat16 (`v_cvt_scalef32_pk_bf16_{fp4,fp8,bf8}`, which MX-scaled `tl.dot_scaled` uses with one scale block of K; the other `v_cvt_scalef32_*` forms are still undecoded), and MUBUF loads into LDS (`buffer_load_dword`, `_dwordx3`, `_dwordx4` with the LDS bit, which Triton uses for asynchronous copies, `TRITON_HIP_USE_ASYNC_COPY=1`). The LDS loads are modelled for those three on gfx942 (dword) and gfx950, and the sub-dword and `format_x` forms too (a byte goes to LDS as a zero- or sign-extended dword, as the guides' instruction text and figure give it); an M0 of 64 KiB or more is refused on gfx950, because CDNA4's text gives the LDS offset as `M0[17:0]` and its figure as `M0[15:0]` (gfx90a and gfx942 take `M0[15:0]`, where the guides agree).
 - vLLM's process ended by aborting, after its output, on a damaged heap: exit() destroys a thread's `thread_local` objects, and then the libraries' static destructors, one of which (hipBLASLt's) still calls HIP. The profiler's per-thread call stack and its table of HIP call names were used after they were destroyed. Both now outlive static destruction (ctest `test_amd_hip_at_exit`: HIP from a static destructor, clean under AddressSanitizer).
 
 ## Debugging
@@ -782,10 +881,33 @@ well as `SQ_INSTS_FLAT` ("including FLAT").
 Times in the traces are the simulation's own, on the clock
 `/proc/<pid>/stat` uses: a truthful order and truthful durations of the
 simulation, and nothing about how long a card would take. There is no HSA
-runtime, so no HSA trace; no PC sampling or thread trace, which need the
-hardware's sampling and trace units; and no records of the kernels ROCm's
-runtime runs on its own behalf (a device-to-device copy or a memset is not a
-kernel here).
+runtime, so no HSA trace; no thread trace, or the stochastic method of PC
+sampling, which need the hardware's trace and sampling units; and no records of
+the kernels ROCm's runtime runs on its own behalf (a device-to-device copy or a
+memset is not a kernel here).
+
+PC sampling (`rocprofiler_configure_pc_sampling_service`) is offered on the
+Instinct GPUs that have it (gfx90a, gfx942, gfx950) by the host-trap method
+only, and **by instruction count, not time**: the simulator has no timing
+model, so there is no clock to sample on. The one configuration an agent lists
+is the host-trap method with the unit `ROCPROFILER_PC_SAMPLING_UNIT_INSTRUCTIONS`
+and any interval from 1. Each wave is sampled when it is about to issue its
+1st, (1 + interval)th, (1 + 2 * interval)th ... instruction, counting every
+instruction it issues; the program counters are therefore exact and repeatable
+for a kernel, and say nothing of where a card would spend its time. Samples are
+delivered to the buffer as `rocprofiler_pc_sampling_record_host_trap_v0_t`
+records when the dispatch completes: the code object and the offset of the
+instruction, EXEC, the work-group and the wave in it, where the work-group ran
+(compute die, shader engine and array, compute unit; the SIMD, pipe, VM id,
+queue and microengine of the hardware ID are not modelled and read 0), the
+dispatch and correlation ids, and the time the sample was taken on the clock
+the traces use. A tool that asks for the method in time or cycles
+(`rocprofv3 --pc-sampling-unit time`) is refused with
+`ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT` rather than given invented times;
+the stochastic method answers `ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE`, as for a
+GPU without it. `test_amd_rocprofiler_pcsampling_1` and `_5` check the samples
+against llvm-objdump's addresses for a kernel, every instruction and every
+fifth.
 
 `test_amd_rocprofiler` is a profiling tool of its own that runs everywhere;
 `amd_rocprofv3` runs AMD's rocprofv3 in a session wherever rocprofiler-sdk is
@@ -843,11 +965,38 @@ A profile id is `amd/<name>`, and its file is `profiles/<name>.yaml` here.
 ## ROCm Validation Suite
 
 AMD's open-source [ROCm Validation Suite](https://github.com/ROCm/ROCmValidationSuite)
-(RVS, MIT) is the public counterpart of NVIDIA's DCGM/NVVS. It was not built
-or run here (it needs ROCm's HSA, HIP, rocBLAS and AMD SMI development
-packages, which are not installable on this host); its source was read for the
-calls its modules make, and each was checked against what the simulator
-answers. What RVS asks, module by module:
+(RVS, MIT) is the public counterpart of NVIDIA's DCGM/NVVS. Built from its
+`rocm-7.2.3` source (and run from ROCm's package too), it runs unmodified inside
+`vgpu shell --gpu amd/mi300x`: `rvs -c <conf>` finds the simulated GPUs
+through the KFD topology (`src/kfd.cpp`), ties each to its AMD SMI handle and
+its PCI device, and runs its modules. What each does on the simulator:
+
+| Module | Result | Why |
+| --- | --- | --- |
+| `gpup` | pass | the KFD node properties (`simd_count 1216`, `wave_front_size 64`, `gfx_target_version 90402`, `num_xcc 8`, ids). `caches_count`, `cpu_cores_count`, `local_mem_size`, `fw_version` read 0 (no `caches/` directory) |
+| `peqt` | pass, 17 of 17 | link speed and width, slot, vendor and device ids, driver `amdgpu`, atomics routing and completer bits, from the PCI configuration space and capability chains (`docs/registers.md`) |
+| `pesm` | pass | PCIe link-state monitoring: no change in speed or power |
+| `smqt` | pass with a conf for the MI300X's BARs (256 GB, 2 MB, 512 KB); the shipped `smqt_single.conf` expects an older part's 256 KB register BAR and fails | BARs and the expansion ROM through libpci |
+| `gm` | pass | `amdsmi_get_temp_metric`, `_power_info`, `_clk_freq`, ... (`src/amd_smi.cpp`) |
+| `pebb`, `pbqt` | pass | the link info of `hsa_amd_agent_memory_pool_get_info` (`distance`, `PCIe:20`, `xGMI:15`) and async copies; the GB/s are the interpreter's, not a link's |
+| `babel` | pass | five HIP bandwidth kernels (copy, mul, add, triad, dot) |
+| `gst` | pass with a target any run meets; correctness checks work | with `self_check`, `accuracy_check` and `error_inject`, every rocBLAS SGEMM is compared with the host's result and with the last run, and a wrong element made on purpose is caught by both. The shipped targets (`target_stress` in GFLOPS) are far above what an interpreter does: the module reports GFLOPS 0 and fails |
+| `mem` | pass, all 11 tests, slowly | with `mem_blocks: 1` and `num_passes: 1`: six minutes a GPU (test 7, the 32-bit moving inversions, takes four of them), so it is not in the test |
+| `perf`, `iet`, `tst` | fail, by design | `perf`'s pass mark is a GFLOPS target; `iet`'s is the power a GEMM load draws (60 W, the idle floor, is all it ever sees) and `tst`'s the temperature it reaches (a junction sensor at 32 C, and the edge sensor an Instinct lacks reads 0). The telemetry follows how long the simulated work would have run on the card (the instructions retired over the clock), not the host time the interpreter takes, so a load of seconds of host time is microseconds of device time. There is no timing model to give them anything else |
+| `rcqt` | runs | it asks `dpkg` about ROCm's meta-packages: the host's answer, not the simulator's |
+
+The `rvs` summary header prints "ROCm version N/A" and "amdgpu version N/A": it
+reads `/opt/rocm/.info/version-rocm` and the output of `dkms status`, both of
+the host. Without AMD SMI's library in front of ROCm's, RVS's `gpulist` finds no
+processors and `peqt` and `pesm` crash in `gpu2gpuindex` (an RVS bug: it indexes
+an empty vector); in a session the simulator's library is always first. The
+same set (with `gst` at a target of 0.001 GFLOPS, which the Radeon GPUs need
+where 0.05 is out of reach) runs and passes on MI250X, MI325X, MI350X, RX 7900 XTX,
+RX 9070 XT and RX 6900 XT. `tests/e2e/run_rvs.sh` (ctest `amd_rvs`, which skips without an
+`rvs` binary or an isolated session) runs `gpup`, `peqt`, `pesm`, `smqt`, `babel`
+and `gst` in half a minute.
+
+What RVS asks, module by module:
 
 | Module | What it reads | State |
 | --- | --- | --- |
@@ -855,8 +1004,8 @@ answers. What RVS asks, module by module:
 | every module | `amdsmi_get_gpu_kfd_info`, `amdsmi_get_gpu_bdf_id`, `hipDeviceGetPCIBusId` to tie a HIP device to its KFD node and SMI handle | consistent: same bus, same `kfd_id` |
 | `gm`, `tst`, `pulse`, `iet`, `gst` | `amdsmi_get_temp_metric`, `amdsmi_get_power_info`, `amdsmi_get_power_cap_info`, `amdsmi_get_clk_freq`, `amdsmi_set_clk_freq`, `amdsmi_get_energy_count` | added (`src/amd_smi.cpp`); they were NOT_SUPPORTED stubs |
 | `pebb`, `pbqt` | `hsa_amd_agent_memory_pool_get_info` `NUM_LINK_HOPS` and `LINK_INFO`, async copy and its profiling | `LINK_INFO` added: system memory is one PCI Express hop, an Instinct peer one XGMI hop, a Radeon peer two PCI Express hops, as KFD lists them |
-| `mem`, `babel`, `gst` | HIP allocation, copies, kernels; rocBLAS GEMM | already run (`tests/hipcc`, `tests/rocblas`); RVS's own kernels are compiled for the card, so they need a gfx942 code object |
-| `peqt`, `pcie` | PCI configuration space through libpci | the configuration space and its capability chains are modelled (`docs/registers.md`); not exercised through RVS |
+| `mem`, `babel`, `gst` | HIP allocation, copies, kernels; rocBLAS GEMM | RVS's own kernels, compiled for the card, run |
+| `peqt`, `pcie` | PCI configuration space through libpci | the configuration space and its capability chains are modelled (`docs/registers.md`) and RVS reads them |
 
 The AMD SMI calls above are the ones described under "AMD SMI's library" in
 "RCCL, and PyTorch across GPUs"; the sensors follow each profile's class. Temperatures are

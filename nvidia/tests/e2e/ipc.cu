@@ -78,8 +78,15 @@ static bool read_file(const std::string& path, void* data, size_t n) {
 }
 
 static void touch(const std::string& path) { write_file(path, "x", 1); }
+// How long to wait for the other process: 60 s, or IPC_WAIT_SECONDS (run_ipc.sh raises it under a
+// sanitizer, where the other process's share of the race can take minutes on a busy machine).
 static bool wait_for(const std::string& path) {
-  for (int i = 0; i < 600; ++i) {
+  static const int tenths = [] {
+    const char* v = getenv("IPC_WAIT_SECONDS");
+    const int s = v ? atoi(v) : 0;
+    return (s > 0 ? s : 60) * 10;
+  }();
+  for (int i = 0; i < tenths; ++i) {
     if (access(path.c_str(), F_OK) == 0) return true;
     usleep(100000);
   }

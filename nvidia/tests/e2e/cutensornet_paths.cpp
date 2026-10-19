@@ -337,6 +337,24 @@ static void slicing() {
   }
 }
 
+// Cytnx's RegularNetwork::setOrder asks for the path with numContractions = 0 and a malloc'd buffer of numInputs
+// pairs; NVIDIA's library fills the buffer and sets numContractions. Reading the pairs afterwards must not see
+// the buffer's old bytes.
+static void path_with_zero_count() {
+  std::map<int32_t, int64_t> ext = {{'i', 4}, {'j', 5}, {'k', 8}, {'l', 3}, {'m', 2}};
+  T a = make({'i', 'j', 'k'}, ext, 1, false), b = make({'k', 'l'}, ext, 2, false), c = make({'j', 'l', 'm'}, ext, 3, false);
+  Net n = build({&a, &b, &c}, {'i', 'm'}, ext, CUDA_R_64F);
+  IS(cutensornetContractionOptimize(h, n.net, n.config, 1ull << 30, n.info), 0);
+  cutensornetNodePair_t pairs[3] = {{-7, -7}, {-7, -7}, {-7, -7}};
+  cutensornetContractionPath_t path{0, pairs};
+  IS(cutensornetContractionOptimizerInfoGetAttribute(h, n.info, CUTENSORNET_CONTRACTION_OPTIMIZER_INFO_PATH, &path, sizeof path), 0);
+  check(path.numContractions == 2, "a zero count in: the count out is the number of contractions");
+  bool ok = true;
+  for (int i = 0; i < path.numContractions; ++i) ok = ok && pairs[i].first >= 0 && pairs[i].second >= 0;
+  check(ok, "a zero count in: every pair of the path is written");
+  destroy(n);
+}
+
 static void network_shapes() {
   // Conjugated inputs (complex), a hyperedge (k in three tensors), and a
   // single tensor reduced and permuted.
@@ -678,6 +696,7 @@ int main() {
   }
   infrastructure();
   network_types();
+  path_with_zero_count();
   slicing();
   network_shapes();
   legacy();

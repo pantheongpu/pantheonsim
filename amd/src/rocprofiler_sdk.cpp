@@ -18,10 +18,13 @@
 // how rocprofv3 reports a counter a real GPU lacks, rather than given a
 // number that was made up.
 //
+// PC sampling is offered by the host-trap method only, and by instructions,
+// not by time: the simulator has no clock to sample on (see PcService).
+//
 // What is not here: HSA (there is no HSA runtime -- the HIP runtime reaches the
-// simulated devices directly), PC sampling and thread trace (which need the
-// hardware's sampling and trace units), and the kernels ROCm's runtime runs
-// on its own behalf, such as the ones that do a device-to-device copy or a
+// simulated devices directly), stochastic PC sampling and thread trace (which
+// need the hardware's sampling and trace units), and the kernels ROCm's runtime
+// runs on its own behalf, such as the ones that do a device-to-device copy or a
 // memset: here those happen without a kernel, so there is none to report.
 #include <dlfcn.h>
 #include <sys/syscall.h>
@@ -29,6 +32,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -462,9 +466,21 @@ struct BufferService {
   std::set<int> operations;
 };
 
+// The PC sampling a context has configured on one agent (host-trap method).
+// The interval counts instructions: the simulator has no timing model, so
+// there is no time or cycle to count in. Each wave of a dispatch on the agent
+// is sampled when it is about to issue its 1st, (1 + interval)th, ...
+// instruction (vgpu::amd::PcSampler), and the samples are delivered to the
+// buffer as the dispatch completes.
+struct PcService {
+  uint64_t interval = 0;
+  uint64_t buffer = 0;
+};
+
 struct Context {
   uint64_t id = 0;
   bool active = false;
+  std::map<uint64_t, PcService> pc_sampling;   // by agent id
   std::map<int, CallbackService> callbacks;   // by callback tracing kind
   std::map<int, BufferService> buffered;      // by buffer tracing kind
   rocprofiler_dispatch_counting_service_cb_t dispatch = nullptr;
@@ -520,6 +536,12 @@ struct Sdk {
   uint64_t next_config = 1, next_callback_thread = 1;
   Agents agents;
   bool agents_ready = false;
+  // The code objects placed on the devices, for telling which one a sampled
+  // program counter is in.
+  struct LoadedObject {
+    uint64_t id, agent, base, size;
+  };
+  std::vector<LoadedObject> objects;
   std::atomic<uint64_t> next_correlation{1};
   // Strings a tool is handed a pointer to and may keep (a code object's URI, a
   // kernel's name): rocprofiler-sdk's live as long as the process, so these do.
@@ -867,9 +889,13 @@ void finalize_all() {
   Sdk& s = sdk();
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   if (s.finalized) return;
+  // The contexts are stopped before the tools are told, as rocprofiler-sdk
+  // does (its PC sampling sample asserts that its context is inactive in its
+  // finalize callback). The tools flush their buffers there, which delivers
+  // what was recorded until now.
+  for (Context& c : s.contexts) c.active = false;
   for (Client& c : s.clients) finalize_client(c);
   s.finalized = true;
-  for (Context& c : s.contexts) c.active = false;
 }
 
 void client_finalize(rocprofiler_client_id_t id) {
@@ -1498,6 +1524,7 @@ void on_code_object(const hp::CodeObject& o, const hp::KernelSymbol* kernels, si
   load.uri = intern(s, o.uri);
   load.load_base = o.load_base;
   load.load_size = o.load_size;
+  s.objects.push_back({o.id, load.agent_id.handle, o.load_base, o.load_size});
   load.storage_type = ROCPROFILER_CODE_OBJECT_STORAGE_TYPE_MEMORY;
   load.memory_base = reinterpret_cast<uint64_t>(o.image);
   load.memory_size = o.image_size;
@@ -1976,6 +2003,16 @@ struct InFlight {
   std::map<uint64_t, rocprofiler_user_data_t> external;
   hp::Launch launch;           // for the runtime model's scratch
   bool single_scratch = false;  // a single-use scratch block was made for this dispatch
+  // PC sampling of this launch: the context whose service samples it (0: none)
+  // and what its waves' samples came to, gathered by the host threads running
+  // them.
+  uint64_t pc_context = 0, pc_buffer = 0, pc_interval = 0;
+  struct Sampled {
+    vgpu::amd::PcSample sample;
+    uint64_t timestamp;
+  };
+  std::mutex pc_mutex;
+  std::vector<Sampled> pc_samples;
 };
 
 void* on_launching(const hp::Launch& l) {
@@ -2012,7 +2049,75 @@ void* on_launching(const hp::Launch& l) {
     c.dispatch(data, &k.config, &k.user, c.dispatch_data);
     if (k.config.handle && s.configs.count(k.config.handle)) f->counting.push_back(k);
   }
+  // One context at most samples a process's PCs (the header's constraint 3).
+  for (Context& c : s.contexts) {
+    const auto it = c.pc_sampling.find(i.agent_id.handle);
+    if (!c.active || it == c.pc_sampling.end()) continue;
+    f->pc_context = c.id;
+    f->pc_buffer = it->second.buffer;
+    f->pc_interval = it->second.interval;
+    break;
+  }
   return f;
+}
+
+// Called by a host thread running a wave of a sampled launch.
+void on_pc_sample(void* user, const vgpu::amd::PcSample& sample) {
+  auto* f = static_cast<InFlight*>(user);
+  const uint64_t now = hp::now_ns();
+  std::lock_guard<std::mutex> lock(f->pc_mutex);
+  f->pc_samples.push_back({sample, now});
+}
+
+void on_sampling(void* token, vgpu::amd::PcSampler* out) {
+  auto* f = static_cast<InFlight*>(token);
+  if (!f || !f->pc_interval) return;
+  out->interval = f->pc_interval;
+  out->user = f;
+  out->sample = on_pc_sample;
+}
+
+// The host-trap records of a finished launch, in the order they were taken.
+void deliver_pc_samples(Sdk& s, InFlight& f) {
+  if (!f.pc_interval || f.pc_samples.empty()) return;
+  Context* c = context(s, {f.pc_context});
+  if (!c) return;
+  std::stable_sort(f.pc_samples.begin(), f.pc_samples.end(),
+                   [](const InFlight::Sampled& a, const InFlight::Sampled& b) { return a.timestamp < b.timestamp; });
+  const uint64_t agent_id = f.info.agent_id.handle;
+  for (const InFlight::Sampled& e : f.pc_samples) {
+    const vgpu::amd::PcSample& p = e.sample;
+    rocprofiler_pc_sampling_record_host_trap_v0_t r{};
+    r.size = sizeof r;
+    // Where the wave ran, as HW_ID says. The fields the simulator does not
+    // model (SIMD, pipe, VM id, queue, microengine, the thread group's
+    // number) are left 0, as the sample's other unknowns are.
+    r.hw_id.chiplet = p.die;
+    r.hw_id.wave_id = p.wave_in_group & 0xF;
+    r.hw_id.cu_or_wgp_id = p.unit & 0xF;
+    r.hw_id.shader_array_id = p.array & 1;
+    r.hw_id.shader_engine_id = p.engine & 0x1F;
+    // The code object the PC is in (the latest placed one that holds it, as a
+    // freed object's addresses may be given out again), and its offset from
+    // that object's load base, as the header defines it. A PC in none is its
+    // own address, with no object. (The header does not give the "no object"
+    // id's value; ids here start at 1, so 0 cannot be one.)
+    r.pc.code_object_id = 0;
+    r.pc.code_object_offset = p.pc;
+    for (auto it = s.objects.rbegin(); it != s.objects.rend(); ++it)
+      if (it->agent == agent_id && p.pc >= it->base && p.pc - it->base < it->size) {
+        r.pc.code_object_id = it->id;
+        r.pc.code_object_offset = p.pc - it->base;
+        break;
+      }
+    r.exec_mask = p.exec;
+    r.timestamp = e.timestamp;
+    r.dispatch_id = f.info.dispatch_id;
+    r.correlation_id = {f.correlation, f.external[f.pc_context]};
+    r.workgroup_id = {p.group[0], p.group[1], p.group[2]};
+    r.wave_in_group = p.wave_in_group & 0xFF;
+    push(s, f.pc_buffer, ROCPROFILER_BUFFER_CATEGORY_PC_SAMPLING, ROCPROFILER_PC_SAMPLING_RECORD_HOST_TRAP_V0_SAMPLE, r);
+  }
 }
 
 void on_launched(const hp::Launch&, const DispatchStats* stats, uint64_t start, uint64_t end, void* token) {
@@ -2021,6 +2126,7 @@ void on_launched(const hp::Launch&, const DispatchStats* stats, uint64_t start, 
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
   if (f && !s.finalized && f->single_scratch) runtime_scratch_done(s, f->launch);
   if (!f || s.finalized || !stats) return;   // a launch that failed counted nothing
+  deliver_pc_samples(s, *f);
   for (const Counting& k : f->counting) {
     Context* c = context(s, {k.context});
     if (!c || !c->record) continue;
@@ -2152,6 +2258,7 @@ const hp::Hooks kHooks = [] {
   h.graph_instantiated = runtime_graph_instantiated;
   h.graph_destroyed = runtime_graph_destroyed;
   h.pool_block = runtime_pool_block;
+  h.sampling = on_sampling;
   return h;
 }();
 
@@ -2471,6 +2578,7 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_configure_callback_dispatch_cou
   Context* c = context(s, context_id);
   if (!c) return ROCPROFILER_STATUS_ERROR_CONTEXT_NOT_FOUND;
   if (c->dispatch) return ROCPROFILER_STATUS_ERROR_SERVICE_ALREADY_CONFIGURED;
+  if (!c->pc_sampling.empty()) return ROCPROFILER_STATUS_ERROR_CONTEXT_CONFLICT;   // not with PC sampling
   c->dispatch = dispatch_callback;
   c->dispatch_data = dispatch_callback_args;
   c->record = record_callback;
@@ -2736,16 +2844,88 @@ ROCPROFILER_API rocprofiler_status_t rocprofiler_iterate_buffer_tracing_record_a
   return ROCPROFILER_STATUS_SUCCESS;
 }
 
-// -- what needs hardware there is no model of --
+// -- PC sampling, and what needs hardware there is no model of --
 
-ROCPROFILER_API rocprofiler_status_t rocprofiler_query_pc_sampling_agent_configurations(rocprofiler_agent_id_t, void*,
-                                                                                        void*) {
-  return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+// PC sampling, host-trap method (rocprofiler-sdk's pc_sampling.h).
+//
+// On a card a background host thread interrupts the waves every so many
+// microseconds and each wave reports where it was. The simulator has no
+// timing model, so it has no microseconds to count on: the one configuration
+// offered is the host-trap method with the interval in INSTRUCTIONS, each
+// wave sampled every `interval` instructions it issues (vgpu::amd::PcSampler).
+// A tool that asks for the method in time (rocprofv3 --pc-sampling-unit time)
+// is refused, not given invented times. The stochastic method reads the
+// hardware's arbiter and stall state, which the simulator does not have, and
+// is not offered. Which chips have the method is the header's: "Interval
+// sampling (MI200+)" -- gfx90a, gfx942 and gfx950 here; an RDNA agent or the
+// CPU offers none.
+bool host_trap_agent(const rocprofiler_agent_v0_t& a) {
+  if (a.type != ROCPROFILER_AGENT_TYPE_GPU || !a.name) return false;
+  const std::string gfx = a.name;
+  return gfx == "gfx90a" || gfx == "gfx942" || gfx == "gfx950";
 }
-ROCPROFILER_API rocprofiler_status_t rocprofiler_configure_pc_sampling_service(rocprofiler_context_id_t, rocprofiler_agent_id_t,
-                                                                               int, int, uint64_t, rocprofiler_buffer_id_t,
-                                                                               int) {
-  return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+
+ROCPROFILER_API rocprofiler_status_t rocprofiler_query_pc_sampling_agent_configurations(
+    rocprofiler_agent_id_t agent_id, rocprofiler_available_pc_sampling_configurations_cb_t cb, void* user_data) {
+  if (!cb) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
+  Sdk& s = sdk();
+  load_agents(s);
+  rocprofiler_pc_sampling_configuration_t cfg{};
+  bool offered = false;
+  {
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);
+    const rocprofiler_agent_v0_t* a = agent(s, agent_id.handle);
+    if (!a) return ROCPROFILER_STATUS_ERROR_AGENT_NOT_FOUND;
+    if (host_trap_agent(*a)) {
+      offered = true;
+      cfg.size = sizeof cfg;
+      cfg.method = ROCPROFILER_PC_SAMPLING_METHOD_HOST_TRAP;
+      cfg.unit = ROCPROFILER_PC_SAMPLING_UNIT_INSTRUCTIONS;
+      cfg.min_interval = 1;
+      cfg.max_interval = SIZE_MAX;
+      cfg.flags = ROCPROFILER_PC_SAMPLING_CONFIGURATION_FLAGS_NONE;
+      // Once configured on the agent, only the configuration in use is
+      // offered (the header: "the cb delivers information about the active
+      // PC sampling configuration"), its interval as both limits.
+      for (const Context& c : s.contexts) {
+        const auto it = c.pc_sampling.find(agent_id.handle);
+        if (it != c.pc_sampling.end()) cfg.min_interval = cfg.max_interval = it->second.interval;
+      }
+    }
+  }
+  // None, for an agent without the capability.
+  return cb(offered ? &cfg : nullptr, offered ? 1 : 0, user_data);
+}
+
+ROCPROFILER_API rocprofiler_status_t rocprofiler_configure_pc_sampling_service(
+    rocprofiler_context_id_t context_id, rocprofiler_agent_id_t agent_id, rocprofiler_pc_sampling_method_t method,
+    rocprofiler_pc_sampling_unit_t unit, uint64_t interval, rocprofiler_buffer_id_t buffer_id, int flags) {
+  if (method <= ROCPROFILER_PC_SAMPLING_METHOD_NONE || method >= ROCPROFILER_PC_SAMPLING_METHOD_LAST ||
+      unit <= ROCPROFILER_PC_SAMPLING_UNIT_NONE || unit >= ROCPROFILER_PC_SAMPLING_UNIT_LAST || interval == 0 || flags != 0)
+    return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
+  Sdk& s = sdk();
+  load_agents(s);
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);
+  Context* c = context(s, context_id);
+  if (!c) return ROCPROFILER_STATUS_ERROR_CONTEXT_NOT_FOUND;
+  if (!buffer(s, buffer_id.handle)) return ROCPROFILER_STATUS_ERROR_BUFFER_NOT_FOUND;
+  const rocprofiler_agent_v0_t* a = agent(s, agent_id.handle);
+  if (!a || a->type != ROCPROFILER_AGENT_TYPE_GPU) return ROCPROFILER_STATUS_ERROR_AGENT_NOT_FOUND;
+  // "GPU device does not support requested PC sampling method."
+  if (!host_trap_agent(*a) || method != ROCPROFILER_PC_SAMPLING_METHOD_HOST_TRAP)
+    return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  // Only the one unit is offered, whatever the interval.
+  if (unit != ROCPROFILER_PC_SAMPLING_UNIT_INSTRUCTIONS) return ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT;
+  // The counter collection service cannot share a context with PC sampling.
+  if (c->dispatch) return ROCPROFILER_STATUS_ERROR_CONTEXT_CONFLICT;
+  if (c->pc_sampling.count(agent_id.handle)) return ROCPROFILER_STATUS_ERROR_SERVICE_ALREADY_CONFIGURED;
+  // One configuration per agent, and one context in the process with PC
+  // sampling (the header's constraints 1 and 3): a second context asking is
+  // told it is not available.
+  for (const Context& other : s.contexts)
+    if (&other != c && !other.pc_sampling.empty()) return ROCPROFILER_STATUS_ERROR_NOT_AVAILABLE;
+  c->pc_sampling[agent_id.handle] = {interval, buffer_id.handle};
+  return ROCPROFILER_STATUS_SUCCESS;
 }
 ROCPROFILER_API const char* rocprofiler_get_pc_sampling_instruction_not_issued_reason_name(int) { return nullptr; }
 ROCPROFILER_API const char* rocprofiler_get_pc_sampling_instruction_type_name(int) { return nullptr; }

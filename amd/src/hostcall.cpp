@@ -41,6 +41,7 @@ uint64_t message_id(uint64_t d) { return d >> 8; }
 
 const char* service_name(uint32_t s) {
   switch (s) {
+    case 0: return "the reserved service";
     case 1: return "a device function call";
     case 2: return "printf";
     case 3: return "device memory";
@@ -102,6 +103,22 @@ uint64_t Hostcall::alloc(uint64_t bytes) {
   return a;
 }
 
+// The allocator's state block (ockl's dm.cl, heap_t): 128 KiB, which is where __ockl_dm_init_v1 stops
+// clearing; ROCm's CLR allocates the same size. The count of slabs that can be recorded for each of the
+// sixteen kinds of block sits in the third array of the structure, each element a 32-bit counter padded
+// to 128 bytes (start[16] and num_allocated_slabs[16] come first: 4096 bytes in), and starts at
+// NUM_SDATA, 256. Both are the values in dm.cl as of ROCm 7.2; the layout is the allocator's private
+// one, and the device library's source is where it is written down.
+uint64_t Hostcall::heap() {
+  constexpr uint64_t kHeapBytes = 128 << 10, kRecordableAt = 4096, kKindStride = 128, kKinds = 16, kSlabRecords = 256;
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!heap_) {
+    heap_ = alloc(kHeapBytes);
+    for (uint64_t k = 0; k < kKinds; ++k) mem_.store_scalar(heap_ + kRecordableAt + k * kKindStride, 4, kSlabRecords);
+  }
+  return heap_;
+}
+
 void Hostcall::service() {
   std::lock_guard<std::mutex> lock(mu_);
   // The whole ready stack at once. The kernel pushes onto it with a
@@ -126,16 +143,41 @@ void Hostcall::service() {
     const uint64_t next = mem_.load_scalar(header + kNext, 8);
     const uint64_t active = mem_.load_scalar(header + kActive, 8);
     const uint32_t service = static_cast<uint32_t>(mem_.load_scalar(header + kService, 4));
-    if (service == kServicePrintf) serve_printf(payload, active);
+    if (service == kServiceFunctionCall) serve_function_call(payload, active);
+    else if (service == kServicePrintf) serve_printf(payload, active);
     else if (service == kServiceDevmem) serve_devmem(payload, active);
     else if (service == kServiceSanitizer) serve_sanitizer(payload, active);
     else
       throw Error::make(Err::Unsupported, "the kernel called the host for ", service_name(service), " (hostcall service ",
-                        service, "), which is not modelled; printf, device memory and the address sanitizer's report are");
+                        service, "), which the device library does not have; function calls, printf, device memory and the ",
+                        "address sanitizer's report are its services");
     // Answered: the kernel, spinning on the ready bit, reads its slots.
     std::atomic_thread_fence(std::memory_order_release);
     mem_.store_scalar(header + kControl, 4, 0);
     top = next;
+  }
+}
+
+// A device function call (ockl's __ockl_call_host_function): word 0 of a lane's
+// slot is the address of a host function, words 1 to 7 are what it is given.
+// The function is called as `void f(uint64_t* output, const uint64_t* input)`,
+// input being those seven words and output two, which come back as the lane's
+// words 0 and 1 (ROCm's CLR, rocclr/device/devhostcall.cpp, calls it so; the
+// device library's own header says only that the call takes seven words and
+// returns two). The host function runs here, on the thread that does the
+// host's part, with the hostcall lock held: it may not wait for the kernel.
+void Hostcall::serve_function_call(uint64_t payload, uint64_t active) {
+  for (uint32_t lane = 0; lane < 64; ++lane) {
+    if (!(active >> lane & 1)) continue;
+    const uint64_t slot = payload + uint64_t{lane} * kSlotWords * 8;
+    const uint64_t address = mem_.load_scalar(slot, 8);
+    if (address == 0)
+      throw Error::make(Err::InvalidValue, "the kernel called a host function through a null pointer (lane ", lane, ")");
+    uint64_t input[7], output[2] = {0, 0};
+    for (uint32_t k = 0; k < 7; ++k) input[k] = mem_.load_scalar(slot + 8 * (1 + k), 8);
+    reinterpret_cast<HostFunction>(static_cast<uintptr_t>(address))(output, input);
+    mem_.store_scalar(slot, 8, output[0]);
+    mem_.store_scalar(slot + 8, 8, output[1]);
   }
 }
 

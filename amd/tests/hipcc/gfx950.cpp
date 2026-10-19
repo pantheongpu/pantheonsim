@@ -3,10 +3,15 @@
 // reference guide says they compute.
 //
 // v_mfma_scale_f32_{16x16x128,32x32x64}_f8f6f4 multiplies matrices of 8-, 6-
-// or 4-bit floats (each operand's format its own), each lane's one row and
-// 32 values along K scaled by 2^(e - 127) -- e an E8M0 byte of the lane's
-// scale register, the byte its selector names. The host works the same
-// product out from the ISA's format table and layouts. v_prng_b32 is one
+// or 4-bit floats (each operand's format its own); a value at K is scaled by
+// 2^(e - 127), e the E8M0 byte (the one the selector names) of the scale
+// register of lane row + M * (K / 32) -- one scale to a row and 32 values of
+// K. Where a lane keeps K depends on the format (CDNA4 guide, 7.1.5.1: 4- and
+// 6-bit values 32 to a lane group in order, 8-bit ones in two runs of 16, a
+// half of K apart), and a product pairs A's and B's values of one K whatever
+// their formats. The host works the same product out from the ISA's format
+// table and layouts (and Triton's dot_scaled, which real gfx950 hardware runs
+// correctly, builds its operands the same way). v_prng_b32 is one
 // step of the ISA's LFSR, and v_permlane32_swap_b32 trades the upper 32 lanes
 // of one register for the lower 32 of another. Built for gfx950 only
 // (gfx950.gfx950), and run on a simulated MI350X.
@@ -101,8 +106,13 @@ void fill(int* words, int fmt) {
   }
 }
 
+// Where lane group g keeps element e of its 32 values of a format, along K
+// (CDNA4 guide, 7.1.5.1): 4- and 6-bit values in a piece, 8-bit ones in two
+// runs of 16, registers 0-3 and 4-7, the second half of K on from the first.
+int k_of(int fmt, int g, int e, int K) { return kFormats[fmt].bits == 8 ? 16 * g + e % 16 + e / 16 * (K / 2) : 32 * g + e; }
+
 // M x N outputs from K = 64 * 32 / M values a lane; lane l holds row (or
-// column) l % M, K block l / M. Output (i, j) is in lane j + M * (block of
+// column) l % M of K group l / M. Output (i, j) is in lane j + M * (block of
 // four rows' place), as every 16- and 32-wide matrix instruction lays it.
 template <int M>
 int check_scaled(const char* what, int cbsz, int blgp, int sela, int selb, void (*launch)(const v8i*, const v8i*,
@@ -117,12 +127,21 @@ int check_scaled(const char* what, int cbsz, int blgp, int sela, int selb, void 
     fill(reinterpret_cast<int*>(&b[l]), blgp);
     sa[l] = next();
     sb[l] = next();
-    // Scales near 1 in the selected bytes, the rest noise.
-    reinterpret_cast<unsigned char*>(&sa[l])[sela] = static_cast<unsigned char>(124 + next() % 7);
-    reinterpret_cast<unsigned char*>(&sb[l])[selb] = static_cast<unsigned char>(124 + next() % 7);
+    // Scales near 1 in the selected bytes, the rest noise (an unselected byte used by mistake shows).
+    reinterpret_cast<unsigned char*>(&sa[l])[sela] = static_cast<unsigned char>(122 + next() % 11);
+    reinterpret_cast<unsigned char*>(&sb[l])[selb] = static_cast<unsigned char>(122 + next() % 11);
     for (int r = 0; r < outs; ++r) c[l * outs + r] = static_cast<float>(static_cast<int>(next() % 17) - 8);
   }
   launch(a.data(), b.data(), c.data(), sa.data(), sb.data(), d.data());
+  // A[i][k] and B[k][j] as the guide's layouts hold them, and the scale of each (row or column, block of 32 of K).
+  std::vector<double> A(M * K), B(K * M);
+  for (int g = 0; g < 64 / M; ++g)
+    for (int x = 0; x < M; ++x)
+      for (int e = 0; e < 32; ++e) {
+        const int ka = k_of(cbsz, g, e, K), kb = k_of(blgp, g, e, K);
+        A[x * K + ka] = small_float(element(reinterpret_cast<const int*>(&a[x + M * g]), kFormats[cbsz].bits, e), cbsz);
+        B[kb * M + x] = small_float(element(reinterpret_cast<const int*>(&b[x + M * g]), kFormats[blgp].bits, e), blgp);
+      }
   int wrong = 0;
   for (int l = 0; l < 64; ++l)
     for (int r = 0; r < outs; ++r) {
@@ -131,13 +150,8 @@ int check_scaled(const char* what, int cbsz, int blgp, int sela, int selb, void 
       const int j = l % M;
       const int i = M == 16 ? 4 * (l / 16) + r : 8 * (r / 4) + 4 * (l / 32) + r % 4;
       double want = c[l * outs + r];
-      for (int k = 0; k < K; ++k) {
-        const int la = i + M * (k / 32), lb = j + M * (k / 32);
-        want += small_float(element(reinterpret_cast<const int*>(&a[la]), kFormats[cbsz].bits, k % 32), cbsz) *
-                scale(sa[la], sela) *
-                small_float(element(reinterpret_cast<const int*>(&b[lb]), kFormats[blgp].bits, k % 32), blgp) *
-                scale(sb[lb], selb);
-      }
+      for (int k = 0; k < K; ++k)
+        want += A[i * K + k] * scale(sa[i + M * (k / 32)], sela) * B[k * M + j] * scale(sb[j + M * (k / 32)], selb);
       const float got = d[l * outs + r];
       if (std::fabs(got - want) > 1e-5 * std::fmax(1.0, std::fabs(want)) && wrong++ < 2)
         std::printf("  %s: D[%d][%d] is %g, not %g\n", what, i, j, got, want);
@@ -182,12 +196,23 @@ void run(Kernel k, const v8i* a, const v8i* b, const float* c, const unsigned* s
                                                                                   b, c, sa, sb, d, 16); })
 
 int main() {
+  // Same-format pairs, then mixed ones: the 8-bit formats keep K in a different place from the 4- and 6-bit ones, and a
+  // product pairs the values of one K (not of one register slot), each scaled by its own K block's scale.
   SCALED16(0, 0, 0, 0);   // fp8 x fp8
   SCALED16(1, 0, 1, 2);   // bf8 x fp8
+  SCALED16(1, 1, 2, 0);   // bf8 x bf8
   SCALED16(2, 3, 3, 1);   // fp6 x bf6
   SCALED16(4, 4, 2, 3);   // fp4 x fp4
+  SCALED16(0, 4, 3, 0);   // fp8 x fp4
+  SCALED16(4, 0, 1, 3);   // fp4 x fp8
+  SCALED16(1, 2, 0, 2);   // bf8 x fp6
+  SCALED16(3, 1, 2, 1);   // bf6 x bf8
   SCALED32(0, 1, 0, 3);   // fp8 x bf8
+  SCALED32(0, 0, 3, 2);   // fp8 x fp8
   SCALED32(4, 2, 1, 0);   // fp4 x fp6
+  SCALED32(4, 1, 0, 1);   // fp4 x bf8
+  SCALED32(0, 3, 2, 3);   // fp8 x bf6
+  SCALED32(1, 4, 1, 1);   // bf8 x fp4
 
   // v_prng_b32: (x << 1) ^ (x's top bit ? 197 : 0).
   std::vector<unsigned> in(64), out(64);

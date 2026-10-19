@@ -52,11 +52,11 @@ enum InstFlag : uint32_t {
 // out once, when the instruction is decoded (finalize), by the same parsers the executor falls back on for an
 // instruction nobody finalized (mem_facts_of).
 enum class Rmw : uint8_t { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec,
-                           AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap, Invalid };
+                           AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap, CondSub, SubClamp, Invalid };
 // How a global or flat access (global_access) takes the instruction. Unknown: none this implements.
-enum class MemKind : uint8_t { Unknown, Narrow, HalfReg, Prefetch, Load, Store, StoreHi16, Atomic, Block, Transpose };
+enum class MemKind : uint8_t { Unknown, Narrow, HalfReg, Prefetch, Load, Store, StoreHi16, Atomic, Block, Transpose, AddTid };
 // What a scalar memory instruction (scalar_load) is.
-enum class SmemKind : uint8_t { Load, Prefetch, Time, Nop, Store, Atomic, SubDword, BufferLoad };
+enum class SmemKind : uint8_t { Load, Prefetch, Time, Nop, Store, Atomic, SubDword, BufferLoad, BufferStore };
 // The LDS accesses the executor runs without going through its ladder (lds_fast): the ones kernels use all the time.
 enum class LdsOp : uint8_t { None, ReadB32, WriteB32, ReadWide, ReadB96, WriteWide, AddU32, Read2B32, Write2B32, ReadU8, ReadI8,
                              ReadU16, WriteB8, WriteB16 };
@@ -67,6 +67,7 @@ struct MemFacts {
   Rmw rmw = Rmw::Invalid;       // the atomic operation of a global, flat or image atomic (parse_atomic)
   Rmw buf_rmw = Rmw::Invalid;   // a buffer atomic's, which has its own list of names
   Rmw s_rmw = Rmw::Invalid;     // a scalar atomic's
+  bool s_buffer = false;        // a scalar atomic or store through a buffer resource (s_buffer_atomic_*, s_buffer_store_*)
   uint8_t narrow_bytes = 0;     // a byte or short load or store: its size, else 0
   uint8_t half_bytes = 0;       // a _d16 access: its size, else 0
   uint8_t atomic_bytes = 0;     // an atomic: its size, else 0
@@ -106,7 +107,7 @@ const char* enc_name(Enc e);
 // apertures' limits beside their bases.
 enum class OperandKind {
   Sgpr, Vgpr, Agpr, Vcc, VccHi, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, FlatScratchLo, FlatScratchHi, Inline, InlineFloat, Literal,
-  Ttmp, Null, Scc, SharedLimit, PrivateLimit, None
+  Ttmp, Null, Scc, SharedLimit, PrivateLimit, Vccz, Execz, None
 };
 struct Operand {
   OperandKind kind = OperandKind::None;
@@ -180,6 +181,10 @@ struct Inst {
   uint32_t saddr = 0;            // a global_* instruction's scalar base, when it has one
   bool has_saddr = false;
   bool has_vaddr = true;         // a scratch_* instruction may address by offset alone
+  // CDNA's MUBUF load with the LDS bit set: its data goes to LDS, at M0 and the
+  // offset, not to a register, so it has no data operand (the sources are the
+  // address register, the resource and the scalar offset).
+  bool lds_dma = false;
   // Which of the one address space a memory instruction reaches: flat (the
   // address decides), global, or a work-item's private memory.
   enum class Segment { Flat, Scratch, Global } segment = Segment::Global;
@@ -278,6 +283,10 @@ struct Inst {
   // and where a load's lands), then each address, then the resource and,
   // for a sample, the sampler; dst[0] the data, when the instruction returns
   // any.
+  // gfx90a's MIMG has no DIM: the resource's TYPE says the shape, and DA
+  // (da) says whether the kernel passes an array index (the executor works the
+  // dimension out, and how many address registers there are, from the T#).
+  bool da = false;
   uint8_t dmask = 0, dim = 0;
   bool unorm = false, a16 = false, d16 = false, tfe = false, lwe = false, r128 = false, nsa = false;
   std::vector<Inst> dual;
