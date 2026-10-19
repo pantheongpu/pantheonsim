@@ -2592,3 +2592,162 @@ valu_f64 1.9 / 2.5x, mfma 2.4x, mem 1.8 / 2.2x, lds 2.9 / 2.8x, atomics 1.8 / 2.
 `test_amd_gcn_same_bits` (15,566 instruction shapes against digests recorded from the unmodified base) is the guard on all of the AMD
 changes: the first merge failed it on 65 MFMA shapes (a different NaN payload when both operands are NaNs) and the fix keeps the fast loops
 and recomputes only NaN results in the base's operand order.
+
+
+## The AMD pre-decoded tier (branch `speedup4-amdtier`, `VGPU_AMD_TIER`)
+
+The AMD interpreter had been given opcode `switch`es and decode-time flags (the "AMD engine" sections above). What those left was the
+frame every instruction still paid (`Inst remapped`, `FloatMode`, `debug::active()`, the mix counters, an `OpName` and a ladder per
+helper) and, in every lane loop, the operand reads (`lane_src`, the `InvariantSources` table) and the EXEC test. This tier is the NVIDIA
+tier's twin (`src/sass/tier*.cpp`): `gcn::finalize` calls `tier_classify` (`amd/src/gcn_tier.cpp`) when an instruction is decoded, which
+resolves the hottest forms into a handler pointer and operand classes (`Inst::fast`, `amd/include/vgpu/amd_gcn_tier.hpp`): a VGPR row,
+an SGPR, a constant, VCC, EXEC or the null register, each classified once; `Machine::step` calls the handler before it does anything else.
+A handler works on whole register rows with kernels written once and compiled twice (`amd/src/gcn_tier_kernels.inc`: the baseline, and
+under `#pragma GCC target("avx2,fma,popcnt")`, picked from `simd::level()` when the instruction is decoded). A scalar source becomes a
+row filled once, EXEC is applied by one merge (a full EXEC writes straight into the destination), and a 64-bit operand is gathered from
+its register pair. The part that needs the interpreter's `Machine` (global loads and stores) is `amd/src/gcn_tier_machine.inc`, included
+into it: `global_access` with the work its name asked for done at decode, and the lane loop, `memory_run`, the load memo and every memory
+call exactly as they were, in the same order.
+
+**The contract is the tier's usual one**: a handler does the whole instruction, or nothing and says so, and the interpreter then runs it
+as before. What it does not model it never claims (`tier_classify` leaves `fast.run` null): SDWA, DPP, VOPD, `op_sel` on a VOP3, 16-bit
+halves, gfx1250, VGPR indexing and the MSBs (the wave's state is tested at run time), a `MODE` other than round-to-nearest with denormals
+kept, tracing and the debugger. **NaNs.** Which of two NaN payloads wins depends on the order the compiler gave the operands, the trap the
+MFMA work met, so a float handler that finds a NaN in an active lane of its result gives the instruction back before it has written
+anything and the interpreter decides the bits; `v_min_f32` and `v_max_f32` also give back a pair of opposite zeros (which one wins is
+libm's). A NaN *input* to a comparison, a convert or a min/max needs no such care, as none can pass a payload on. `neg`, `abs`, `omod` and
+`clamp` are handled. Counters are those of the interpreter: `DispatchStats` is updated by the same instruction, before it can fail.
+
+What has a handler (about 5,100 of the 15,500 decodable shapes of the ISA corpora):
+
+* 32-bit vector integer and bit operations, VOP1/2/3 and their promoted forms with any scalar, constant, VCC or EXEC source: `v_mov_b32`,
+  `v_not_b32`, `v_add_u32`, `v_sub_u32`, `v_subrev_u32` (not with `clamp`), `v_mul_lo_u32`, `v_mul_hi_u32/i32`, `v_mul_u32_u24`,
+  `v_mul_i32_i24`, `v_mad_u32_u24`, `v_mad_i32_i24`, `v_and/or/xor_b32`, the three shifts, `v_min/max_u32/i32`, `v_bfi_b32`, `v_bfe_u32`,
+  `v_alignbit/alignbyte_b32`, `v_add3_u32`, `v_or3_b32`, `v_xor3_b32`, `v_and_or_b32`, `v_xad_u32`, `v_lshl_or_b32`, `v_lshl_add_u32`,
+  `v_add_lshl_u32`, `v_bcnt_u32_b32`, `v_mbcnt_lo/hi_u32_b32`, `v_med3_u32/i32`, `v_min3_u32`, `v_max3_u32`, `v_cvt_i32_f32`,
+  `v_cvt_u32_f32`, `v_cvt_f32_u32/i32/ubyte0`, `v_cndmask_b32`, `v_readfirstlane_b32`, `v_readlane_b32`, `v_writelane_b32`; the carry
+  family (`v_add_co_u32`, `v_addc_co_u32`, `v_sub_co_u32`, `v_subb_co_u32`, `v_subrev_co_u32`, `v_subbrev_co_u32`) and `v_mad_u64_u32`.
+* binary32: `v_add/sub/subrev/mul_f32`, `v_fma_f32`, `v_fmac_f32`, `v_fmaak_f32`, `v_fmamk_f32`, `v_min/max_f32`, `v_rcp_f32`, and the packed
+  `v_pk_add/mul/fma_f32`. binary64 and 64-bit integers: `v_add/mul/fma/fmac_f64`, `v_mov_b64`, `v_lshlrev/lshrrev_b64`, `v_ashrrev_i64`,
+  `v_lshl_add_u64`, `v_cvt_f64_u32/i32`.
+* `v_cmp` and `v_cmpx` of i32, u32, f32, i64, u64 and f64 (all sixteen float tests), into a scalar pair, VCC, a single SGPR (wave32) or EXEC.
+* scalar ALU (`s_mov`, add and subtract with their carries, `s_mul_i32`, the logic family at 32 and 64 bits, shifts, `s_cselect`,
+  `s_min/max`, `s_bcnt1`, `s_ff1`, `s_abs`, `s_bfe_u32`, `s_lshl1..4_add_u32`, `s_movk_i32`), the scalar compares, the `saveexec` family
+  at 64 and 32 bits, the branches (`s_branch`, `s_cbranch_scc0/1`, `execz/nz`, `vccz/nz`), `s_waitcnt` (and its yield), `s_barrier` and the
+  hints that do nothing.
+* LDS (`ds_read/write_b32/b64/b128`, `ds_read2/write2[st64]_b32`, `ds_bpermute_b32`: a wave whose accesses do not all land in the LDS hands
+  the instruction back) and global memory (`global_load/store_dword[x2,x3,x4]` and the byte and short loads and stores).
+
+`VGPU_AMD_TIER_STATS=1` prints, at exit, the instructions the interpreter ran anyway. Over the bench workloads that is the per-wave
+`s_load_*` and `s_endpgm` (about 1,000 of 570,000 on `valu_f32`), `global_atomic_*` (the `atomics` workload, which this piece leaves alone: the
+earlier atomics round took its share) and `v_lshlrev_b32_sdwa`.
+
+### Tests (wired into CMake)
+
+* `test_amd_gcn_tier_same_bits` (`amd/tests/unit/test_gcn_tier_same_bits.cpp`): every instruction shape of the eight ISA corpora that has a
+  handler (5,129 of the 15,500 that decode) is run through `amd::digest_instruction` with the tier off and on, in ten flavours of
+  pseudo-random state and three seeds each (125,628 runs each way, about a minute): any bits; small integers; floats with the special values
+  and NaNs; half the lanes off; two flavours of floats without a NaN (`4`, `5`), so that the float handlers run instead of handing back;
+  two (`6`, `7`) that put a second wave in the work-group and loads in flight, for the store gates and `s_waitcnt`; and two (`8`, `9`, for
+  flat and global accesses only) that point the address registers into memory that exists, in consecutive lanes and scattered. The digest
+  is everything the instruction changed or threw: all registers, masks, SCC, the program counter, LDS, memory, the wave's yield state,
+  the counters and the text of an error. `VGPU_TIER_ONLY=<text>` restricts it to some instructions, `VGPU_TIER_SEEDS=n` runs more seeds.
+* `test_amd_gcn_same_bits` (the guard; unchanged, digests recorded from the unmodified base) passes with the tier on, which is now the
+  default, and with `VGPU_AMD_TIER=0`.
+* Every `test_amd_gcn_*` unit test (25 binaries: real kernels, LDS, atomics, counters, memory runs, cross-lane, packed, doubles, spills)
+  passes with the tier on and off alike (`VGPU_AMD_TIER=1` and `0`), and so do `test_amd_mfma_math` and `test_amd_hipcc_ops` (kernels built by `hipcc`).
+* `amd_exec_bench` with `VGPU_BENCH_DUMP=1` prints all of a dispatch's counters (every `DispatchStats` field, the instruction mix) and a hash
+  of the buffers it was given, filled with pseudo-random bytes. The nine bench kernels on the simulated MI300X (gfx942) and RX 6800
+  (gfx1030): the counters and the hashes are identical with the tier on and off, and the two targets' buffers agree with each other.
+
+
+### Why not `include/vgpu/simd`
+
+The shared kernels (`simd.hpp`) were written for the NVIDIA executors and carry their semantics: a shift of 32 or more shifts every bit out
+(AMD takes the count modulo 32), a NaN result is the canonical `0x7fffffff`, and `ffma` is fused only where PTX says so. The AMD interpreter's
+own expressions are the specification here, so the tier has its own kernels (`gcn_tier_kernels.inc`, the same two-level scheme and the same
+`simd::level()` choice, `fp-contract=off` for the file) and the tier-vs-interpreter test is what holds them to it. The first thing that test caught is an instance: the sign of the zero in `fmaxf(-0, +0)` (and `fminf`) differed between the interpreter's
+compiled `v_max_f32` and the tier's, so the handlers give any pair of opposite zeros back to the interpreter.
+
+### Mutation checks
+
+Each of these was applied to a copy of the tree, built, and run against the new test (it must fail); the tree was then restored. All 19
+fail (`FAIL`, with `VGPU_TIER_ONLY` set to the instruction concerned to keep each run short):
+
+| # | mutation |
+| --- | --- |
+| M1 | `v_subrev_u32` with its operands swapped |
+| M2 | a float handler keeps a NaN result |
+| M3 | the integer handler writes lanes EXEC switched off |
+| M4 | `s_cbranch_scc0` inverted |
+| M5 | a comparison keeps the bits of inactive lanes |
+| M6 | the LDS store gate dropped |
+| M7 | a branch counted as a scalar instruction |
+| M8 | `s_add_u32` loses its carry |
+| M9 | `ds_bpermute_b32` reads a lane that is off |
+| M10 | `v_cmpx` leaves EXEC alone |
+| M11 | the global store gate dropped |
+| M12 | `s_waitcnt` never yields |
+| M13 | the reversed subtract in `v_subrev_co_u32` not reversed |
+| M14 | the LDS range check loosened |
+| M15 | `global_load_sbyte` loses its sign |
+| M16 | the load memo dropped after a run |
+| M17 | the last word of `global_load_dwordx2` lost |
+| M18 | `global_store_short` stores a byte |
+| M19 | a byte access sized as a dword when the runs are found |
+
+M15 (run first, before flavours 8 and 9 existed) passed the real-kernel unit tests (`test_amd_gcn_memory`, `memruns`, `ops`, `lds`) with the
+tier on, and the digest saw no global access with a valid address either (random registers fault): that is why flavours 8 and 9 exist, and
+M15 to M19 were run with them.
+
+### Results
+
+Measured on server2 (Ryzen 9 9950X, load average before each workload 2.0 to 24.7, median 5.8, other people's builds and benchmarks
+around, serialised with `flock /tmp/speedup-bench.lock`), Release, GCC 13.3, `hipcc` 7.2 programs, simulated MI300X (gfx942) and RX 6800
+(gfx1030) only. `tools/bench-amd/bench.py` A/B, 9 runs alternating on CPUs 24-31, one host thread; base = `speedup` f81cc0c1 built
+Release, B = this branch, `VGPU_AMD_TIER` unset (on). The host has no usable `rocprofv3` counter output, so the harness ran with
+`--no-counts` and its rate column is 1e6 over the device phase's CPU seconds (the same count on both sides; the ratio is the speed-up);
+what stands in for the counters is the bit-for-bit self-check of every workload and the `VGPU_BENCH_DUMP` comparison above. Ratios
+are B/A of the median (the best-of ratio agrees within 5%), p is the Mann-Whitney p of the harness:
+
+| workload | mi300x | rx6800 | p |
+| --- | ---: | ---: | ---: |
+| valu_int | **8.70x** | **8.09x** | < 0.001 |
+| valu_f32 | **10.0x** | **7.93x** | < 0.001 |
+| valu_f64 | **4.56x** | **5.27x** | < 0.001 |
+| mem | **2.95x** | **3.22x** | < 0.001 |
+| lds | **3.65x** | **3.17x** | < 0.001 |
+| divergent | **4.39x** | **4.35x** | < 0.001 |
+| wave | **11.2x** | **9.12x** | < 0.001 |
+| atomics | **1.81x** | **1.96x** | < 0.001 (the global atomics are still the interpreter's) |
+| launch | 1.12x | 1.10x | < 0.001 (kernels of a few instructions) |
+| api | 1.01 | 1.02 | 1.0 / 0.26 (same) |
+| startup | 1.00 | 0.99 | 0.93 / 0.22 (same) |
+
+`api` and `startup` (not interpreter-bound) are the controls that bound the noise. With the tier **off** (`VGPU_AMD_TIER=0`, the same
+build against the base): valu_int 0.966 / 0.965, mem 0.998 / 0.978, divergent 0.967 / 0.980, launch 0.986 / 1.001, startup 0.980 /
+0.992: the opt-out is not free, about 2 to 3.5% on the instruction-bound workloads (the extra test in `step` and the larger `Inst`;
+significant for valu_int on the RX 6800 and divergent, p <= 0.001), which does not matter as it exists to rule the tier out.
+
+With all the host threads of the pinned CPUs (`VGPU_THREADS` unset, 7 runs, CPU time as above, p at the harness's floor of 0.001): valu_int
+8.61 / 7.01x, valu_f32 9.69 / 6.70x, mem 3.00 / 3.25x, lds 3.65 / 3.14x, divergent 4.42 / 4.24x (MI300X / RX 6800); the work-group
+threads share nothing the tier writes (the table of kernels is read-only, a handler touches its own wave, the bail counter is off unless a
+test turns it on).
+
+A first run of the same A/B, before the tier's per-instruction checks were hoisted into the `Machine` (the tier flag, tracing and the debugger
+are now looked at once per dispatch instead of once per instruction; the other end of the same session's load differed), gave valu_int
+8.28 / 6.82x, valu_f32 9.25 / 6.69x, valu_f64 4.51 / 5.10x, mem 2.96 / 3.12x, lds 4.08 / 3.03x, divergent 4.25 / 4.03x, wave 10.1 / 8.65x,
+atomics 1.78 / 1.89x: within 5% of the table above except the RX 6800's valu rows (6.8 and 6.7 against 8.1 and 7.9). The second run is the
+one reported; no claim is made about what the hoisting alone is worth.
+
+### Not done
+
+* `s_load_*` and `s_endpgm` (a few per wave: about 1,000 of 570,000 instructions of `valu_f32`), `global_atomic_*` (the `atomics`
+  workload is 1.8 / 2.0x faster, from the instructions around the atomics; the atomics themselves are still the interpreter's), flat, scratch and buffer accesses, the narrow and 16-bit forms (SDWA, DPP, `op_sel`, halves, `v_cvt_f16_*`, `v_pk_*_f16`),
+  the transcendentals (`v_exp_f32`, `v_log_f32`, `v_sqrt_f32`, `v_floor_f32` and the like), the division
+  helpers (`v_div_scale`, `v_div_fmas`), MFMA (its own piece), gfx1250 (its own interceptions in `cdna5_alu`).
+* A NaN-aware float path: a NaN result hands the instruction back, which costs the interpreter's time on a program that computes NaNs
+  all the time (`VGPU_AMD_TIER_STATS=1` shows the count as "handed back").
+* Profiling the tier itself (`perf` is unusable here): what is left of the per-instruction cost is the fetch from the decode cache, the
+  `Regs` frame and the indirect call.
+

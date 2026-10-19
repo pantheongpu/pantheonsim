@@ -368,6 +368,8 @@ struct Machine {
   bool concurrent = false;
   // Across threads, an atomic on an ordinary word of device memory is a compare-and-swap on the word, not a lock.
   const bool lock_free = atomics_lock_free(), runs_on = memory_runs();
+  // The pre-decoded tier (gcn_tier.cpp) runs when it is on and nothing watches instructions one at a time (VGPU_TRACE_WAVE, the debugger).
+  const bool tier_on = gcn::tier::enabled() && !tracing() && !debug::active();
   // A vector load or store of device memory. ROCm runs CDNA with unaligned
   // access enabled (SH_MEM_CONFIG's unaligned mode), so a word may start at
   // any byte, and the compiler counts on it -- printf packs its string eight
@@ -9619,7 +9621,7 @@ struct Machine {
   // nothing; what step() would have counted before running it is counted here.
   // Returns 0 when the interpreter is to run the instruction, 1 when it is done, 2 when it is done and the wave gives up its turn.
   int tier_step(Wave& w, Group& g, const Inst& in) {
-    if (!gcn::tier::enabled() || w.vgpr_msb || w.gpr_idx || !FloatMode::is_default(w.mode) || tracing() || debug::active()) return 0;
+    if (w.vgpr_msb || w.gpr_idx || !FloatMode::is_default(w.mode)) return 0;
     if (in.fast.mach) return in.fast.mach == 3 ? tier_barrier(w, in) : tier_global(w, g, in);
     gcn::tier::Regs r{reinterpret_cast<uint32_t (*)[64]>(w.vgpr.r.data()), w.sgpr, &w.vcc, &w.exec, &w.pc, &w.scc, w.lanes,
                       &w.loads_in_flight, &w.soft_yield, static_cast<uint32_t>(g.waves.size()), &w.store_gate, g.lds.data(), g.lds.size(),
@@ -9654,10 +9656,12 @@ struct Machine {
         debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
       debug_stop(w, g);
     const Inst& decoded = fetch(w.pc);
-    if (decoded.fast.run) {
-      if (const int t = tier_step(w, g, decoded)) return t == 1;
-    } else if (gcn::tier::stats() && gcn::tier::enabled()) {
-      gcn::tier::note_interp(decoded.name.c_str(), false);
+    if (tier_on) {
+      if (decoded.fast.run) {
+        if (const int t = tier_step(w, g, decoded)) return t == 1;
+      } else if (gcn::tier::stats()) {
+        gcn::tier::note_interp(decoded.name.c_str(), false);
+      }
     }
     // gfx1250's vector register numbers past v255: the instruction as it names them with the wave's MSBs on.
     Inst remapped;
@@ -10842,7 +10846,7 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   g.scratch.assign(size_t{256} * kLanes, 0);
   for (uint8_t& b : g.scratch) b = static_cast<uint8_t>(draw(r, 0));
   k.private_segment = 256;
-  g.waves.resize(flavour >= 6 ? 2 : 1);   // (flavours 6 and 7: a work-group of two waves, for the store gate and the waits)
+  g.waves.resize(flavour == 6 || flavour == 7 ? 2 : 1);   // (flavours 6 and 7: a work-group of two waves, for the store gate and the waits)
   Wave& w = g.waves[0];
   w.lanes = k.wave32 ? 32 : kLanes;
   w.mode = k.mode;
@@ -10865,7 +10869,22 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   w.vcc = r.next() & all;
   w.m0 = draw(r, flavour);
   w.scc = r.next() & 1;
-  if (flavour >= 6) w.loads_in_flight = 3 + static_cast<uint32_t>(r.next() & 7);   // (loads to wait for)
+  if (flavour >= 8 && in.enc == gcn::Enc::Flat && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+    // Flavours 8 and 9: a global access whose addresses are inside the region (8: consecutive lanes, 9: scattered words), so that the access
+    // happens instead of faulting; 9 also has half the lanes off.
+    if (flavour == 9) w.exec = r.next() & all;
+    if (in.has_saddr && in.saddr + 1 < kSgprs) w.sgpr[in.saddr] = static_cast<uint32_t>(region), w.sgpr[in.saddr + 1] = static_cast<uint32_t>(region >> 32);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint64_t off = flavour == 8 ? uint64_t{lane} * 16 : r.next() & 0x7FFC;
+      if (in.has_saddr) {
+        w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(off);
+      } else {
+        w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(region + off);
+        w.vgpr[in.src[0].index + 1][lane] = static_cast<uint32_t>((region + off) >> 32);
+      }
+    }
+  }
+  if (flavour == 6 || flavour == 7) w.loads_in_flight = 3 + static_cast<uint32_t>(r.next() & 7);   // (loads to wait for)
   w.pc = 0;
   Mix64 h;
   std::string error;
