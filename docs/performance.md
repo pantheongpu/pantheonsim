@@ -2722,8 +2722,7 @@ unchanged, `test_amd_gcn_atomics`, `test_amd_gcn_exec`, `test_amd_hip_abi`, `tes
 tests that run for gfx1100, gfx1201, gfx1030 and gfx1250), `test_worker_pool`, `test_memory`, and the AMD end-to-end set: `amd_hip`,
 `amd_hipcc`, `amd_graph_host_source`, `amd_hip_abi`, `amd_workgroup`, `amd_hsa`, `amd_hip_on_hsa`, `amd_lost_gpu`, `amd_memtest_patterns`,
 `amd_rocprof_*`, `amd_rocblas`, `amd_libraries`, `amd_session`, `amd_debugger`. 202 of 202 pass (`amd_hipsparselt` twice skipped: no
-hipSPARSELt). Not run: the PyTorch, vLLM and Ollama sets. Three tests that are not in that list fail on this host with causes outside
-this change (`amd_rocprofiler_abi`: a rocprofiler-sdk header version assertion; `amd_rocprofv3`: `unshare` refused, no user
+hipSPARSELt). Not run: the PyTorch, vLLM and Ollama sets. Three tests that are not in that list fail on this host with causes that do not involve this change (not re-run on the base: `amd_rocprofiler_abi`: a rocprofiler-sdk header version assertion; `amd_rocprofv3`: `unshare` refused, no user
 namespaces; `amd_tools`: the same, and `rocminfo` against ROCm 7.2's).
 
 ### Not done, and negative results
