@@ -65,6 +65,11 @@ void digest_corpus(const Corpus& c, std::vector<uint32_t>* digests, std::vector<
     uint64_t d = 0;
     try {
       amd::gcn::Inst in = amd::gcn::decode(code, 0, 0, c.target);
+      if (const char* only = std::getenv("VGPU_MEM_SAME_BITS_ONLY"); only && in.name.find(only) == std::string::npos) {
+        digests->push_back(0);
+        texts->push_back(line.substr(tab + 1));
+        continue;
+      }
       if (std::getenv("VGPU_MEM_SAME_BITS_TRACE")) std::fprintf(stderr, "%s: %s\n", c.file, line.substr(tab + 1).c_str());
       if (is_memory(in) && in.name != "ds_nop" && in.name != "ds_consume" &&
           in.name != "ds_append" && in.name != "s_memtime" && in.name != "s_memrealtime") {   // (the last two read a clock)

@@ -11068,7 +11068,7 @@ uint64_t digest_memory_instruction(const gcn::Inst& in, gcn::Target target, uint
           for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[a][lane] = static_cast<uint32_t>(r.next() % (mode % 4 == 3 ? 400 : 240)) & ~3u;
           if (in.has_saddr && in.saddr < kSgprs) w.sgpr[in.saddr] = kSmall[scalar_pick] & 0xFF;
         } else if (in.has_saddr && in.saddr + 1 < kSgprs) {
-          const uint64_t b = base[mode % 2 ? 0 : 2];
+          const uint64_t b = base[0];   // (the allocations lie above it, so the offsets are not negative)
           set_pair(in.saddr, b);
           for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[a][lane] = static_cast<uint32_t>(address(lane) - b);
         } else {
@@ -11156,6 +11156,7 @@ uint64_t digest_memory_instruction(const gcn::Inst& in, gcn::Target target, uint
   } catch (const std::exception& e) {
     error = std::string("std:") + e.what();
   }
+  if (std::getenv("VGPU_MEM_SAME_BITS_DUMP")) std::fprintf(stderr, "   mode %u: ran=%d exec=%llx err=[%s]\n", mode, ran, (unsigned long long)w.exec, error.c_str());
   h.add(ran);
   h.add_bytes(error.data(), error.size());
   h.add(w.pc), h.add(w.exec), h.add(w.vcc), h.add(w.m0), h.add(w.scc), h.add(w.done), h.add(w.at_barrier);
