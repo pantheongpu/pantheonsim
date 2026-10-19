@@ -98,6 +98,7 @@ set(VGPU_PROFILES
   nvidia/thor
   nvidia/rtx-pro-6000-server
   nvidia/rtx-pro-6000-max-q
+  nvidia/rtx-pro-4500
   nvidia/rtx6000-ada
   nvidia/rtx-a6000
   nvidia/rtx-a5000
@@ -2992,6 +2993,18 @@ if(TARGET vgpucupti)
     set_tests_properties(e2e_cupti_${_case} PROPERTIES
       DEPENDS vgpucupti
       ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+      SKIP_REGULAR_EXPRESSION "^SKIP:"
+      TIMEOUT 600)
+  endforeach()
+
+  # The cases a native Linux driver answers differently from WSL (nvidia/src/platform.hpp),
+  # against what an RTX 4090 and an RTX 5090 printed on Vast.ai with CUDA 13.0.
+  foreach(_case params driver_params resource)
+    add_test(NAME e2e_cupti_${_case}_linux
+             COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_cupti_case.sh ${_case})
+    set_tests_properties(e2e_cupti_${_case}_linux PROPERTIES
+      DEPENDS vgpucupti
+      ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_PLATFORM=linux"
       SKIP_REGULAR_EXPRESSION "^SKIP:"
       TIMEOUT 600)
   endforeach()

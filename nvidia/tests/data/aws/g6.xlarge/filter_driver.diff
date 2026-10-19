@@ -1,0 +1,10 @@
+--- /w/col/g6.xlarge//filter_driver.txt	2026-10-18 03:38:09.000000000 +0000
++++ /w/col/g6.xlarge//filter_driver.sim	2026-10-18 03:55:39.209002902 +0000
+@@ -15,6 +15,7 @@
+ cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER) -> CUPTI_SUCCESS
+ # the kind on again
+   cuMemAlloc_v2
++  cuMemsetD8_v2
+   cuMemFree_v2
+ cuptiActivityDisable(CUPTI_ACTIVITY_KIND_DRIVER) -> CUPTI_SUCCESS
+ # end

@@ -1,0 +1,10 @@
+--- /w/col/gpu_1x_h100_pcie//nvtx.txt	2026-10-18 10:24:49.000000000 +0000
++++ /w/col/gpu_1x_h100_pcie//nvtx.sim	2026-10-18 12:08:31.067581340 +0000
+@@ -14,6 +14,7 @@
+ CB nvtx 3 nvtxMarkEx
+ CB nvtx 14 nvtxNameOsThreadA
+ CB nvtx 7 nvtxRangeEnd
++CB nvtx 11 nvtxRangePop
+ CB nvtx 41 nvtxDomainCreateA
+ CB nvtx 39 nvtxDomainRegisterStringA
+ CB nvtx 30 nvtxDomainMarkEx

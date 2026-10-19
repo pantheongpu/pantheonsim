@@ -23,6 +23,7 @@ before trusting a number.
 | `nvidia/l4`, `nvidia/l40s` | Ada Lovelace | 8.9 | 58, 142 |
 | `nvidia/h100`, `nvidia/h100-pcie`, `nvidia/gh200-480gb` | Hopper | 9.0 | 132, 114, 132 |
 | `nvidia/rtx-pro-6000-server` | Blackwell | 12.0 | 188 |
+| `nvidia/rtx-pro-4500` | Blackwell | 12.0 | 82 |
 
 ## Public documentation only (`verified: false`)
 

@@ -1,0 +1,33 @@
+--- /w/col/g6e.2xlarge//memory.txt	2026-10-18 03:51:50.000000000 +0000
++++ /w/col/g6e.2xlarge//memory.sim	2026-10-18 03:55:39.430002807 +0000
+@@ -1,13 +1,13 @@
+ # plain
+-REC memory2 op=alloc kind=device bytes=4096 async=0 stream=set pool=none poolsize=0 threshold=0 utilized=0 corr=c0
++REC memory2 op=alloc kind=device bytes=4096 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c0
+ REC runtime cudaMalloc_v3020 corr=c0
+ REC memory1 kind=device bytes=4096
+-REC memory2 op=release kind=device bytes=4096 async=0 stream=set pool=none poolsize=0 threshold=0 utilized=0 corr=c1
++REC memory2 op=release kind=device bytes=4096 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c1
+ REC runtime cudaFree_v3020 corr=c1
+-REC memory2 op=alloc kind=pinned bytes=4096 async=0 stream=set pool=none poolsize=0 threshold=0 utilized=0 corr=c2
++REC memory2 op=alloc kind=pinned bytes=4096 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c2
+ REC runtime cudaHostAlloc_v3020 corr=c2
+ REC memory1 kind=pinned bytes=4096
+-REC memory2 op=release kind=pinned bytes=4096 async=0 stream=set pool=none poolsize=0 threshold=0 utilized=0 corr=c3
++REC memory2 op=release kind=pinned bytes=4096 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c3
+ REC runtime cudaFreeHost_v3020 corr=c3
+ # default pool, one wait
+ REC runtime cudaStreamCreate_v3020 corr=c4
+@@ -76,10 +76,10 @@
+ REC pool op=destroyed type=local size=0 threshold=1073741824 utilized=0 minkeep=0 corr=c33
+ REC runtime cudaMemPoolDestroy_v11020 corr=c33
+ # left allocated
+-REC memory2 op=alloc kind=device bytes=8192 async=0 stream=set pool=none poolsize=0 threshold=0 utilized=0 corr=c34
++REC memory2 op=alloc kind=device bytes=8192 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c34
+ REC runtime cudaMalloc_v3020 corr=c34
+ REC memory1 kind=device bytes=8192
+-REC memory2 op=release kind=device bytes=8192 async=0 stream=set pool=none poolsize=0 threshold=0 utilized=0 corr=c35
++REC memory2 op=release kind=device bytes=8192 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c35
+ REC runtime cudaFree_v3020 corr=c35
+ REC runtime cudaStreamDestroy_v5050 corr=c36
+ REC runtime cudaStreamDestroy_v5050 corr=c37

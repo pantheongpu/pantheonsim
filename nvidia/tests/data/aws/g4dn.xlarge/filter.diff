@@ -1,0 +1,15 @@
+--- /w/col/g4dn.xlarge//filter.txt	2026-10-18 03:29:39.000000000 +0000
++++ /w/col/g4dn.xlarge//filter.sim	2026-10-18 03:55:38.803003078 +0000
+@@ -19,10 +19,12 @@
+   cudaFree_v3020
+ cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+ # the kind on again
++  cudaMalloc_v3020
+   cudaMemcpy_v3020
+   cudaFree_v3020
+ cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaFree_v3020, 0) -> CUPTI_SUCCESS
+ # cudaFree off
++  cudaMalloc_v3020
+   cudaMemcpy_v3020
+ cuptiActivityDisable(CUPTI_ACTIVITY_KIND_RUNTIME) -> CUPTI_SUCCESS
+ # the kind off

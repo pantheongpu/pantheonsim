@@ -545,3 +545,21 @@ reported through `VGPU_COUNTERS`; see the README.
 **Nothing derived from time.** No cycles, no stall reasons, no achieved
 occupancy, no cache hit rates. There is no timing model and no cache model to
 derive them from.
+
+## Platform: WSL or native Linux
+
+The expected files of the CUPTI cases were printed by an RTX 3060 under WSL2. A native Linux driver
+answers a few things differently, which `VGPU_PLATFORM=linux` switches on (the default is `wsl`; the
+switch is `nvidia/src/platform.hpp`). It changes exactly these, measured on an RTX 4090 and an
+RTX 5090 with CUDA 13.0 (`nvidia/tests/data/aws/README.md`):
+
+| | `wsl` (default) | `linux` |
+| --- | --- | --- |
+| `cudaMemPoolImportFromShareableHandle`, `cuMemPoolImportFromShareableHandle`, `cudaImportExternalMemory`, `cudaImportExternalSemaphore` with a handle that was not opened | 801 (not supported) | 999 (unknown) |
+| `cudaDeviceFlushGPUDirectRDMAWrites` | 801 | success |
+| streams the driver makes for itself in a context | 8 | 7 (one non-blocking stream fewer) |
+
+Nothing else depends on it: the device profile and every attribute keep one set of answers. The
+`params`, `driver_params` and `resource` cases have a `cupti_<case>.linux.expected` beside the
+WSL file and run as `e2e_cupti_<case>_linux`. Regenerate one on a native Linux machine with
+`VGPU_PLATFORM=linux run_cupti_case.sh <case> --card --update`.

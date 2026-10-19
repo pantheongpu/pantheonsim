@@ -38,6 +38,7 @@
 #include <set>
 #include <stdexcept>
 
+#include "platform.hpp"
 #include "driver_graph.hpp"
 #include "func_attrs.hpp"
 #include "vgpu_cuda_graph.h"
@@ -5204,7 +5205,9 @@ VGPU_EXPORT CUresult cuMemPoolImportFromShareableHandle(void** pool, void* handl
 static CUresult cuMemPoolImportFromShareableHandle_impl(void** pool, void* handle, int type, unsigned long long flags) {
   return api("cuMemPoolImportFromShareableHandle", true, false, [&](ShimState&) {
     if (!pool || !handle || flags != 0) return CUDA_ERROR_INVALID_VALUE;
-    return type == 1 || type == 2 || type == 8 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
+    if (type == 1 || type == 2 || type == 8)
+      return vgpu::platform::native_linux() ? CUDA_ERROR_UNKNOWN : CUDA_ERROR_NOT_SUPPORTED;
+    return CUDA_ERROR_INVALID_VALUE;
   });
 }
 static CUresult cuMemPoolExportPointer_impl(void*, CUdeviceptr);
