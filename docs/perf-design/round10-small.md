@@ -30,7 +30,7 @@ A/B, `build-base` (speed-round10) against `build`, 15 runs, CPU 6, load average 
 | atomics | ptx | 2.038 | 3.482 | **1.709x** | 1.691x | 1.7% / 1.1% | 0.000 | faster |
 | atomics | sass | 5.982 | 6.146 | 1.027x | 1.026x | 2.2% / 1.2% | 0.000 | faster (not attributed: SASS does not run this code; code placement) |
 
-Earlier batches of the same comparison: 9 runs 1.718x, 11 runs 1.743x, 15 runs 1.752x (PTX). The other 15 workloads on both engines,
+Earlier trees of the same change, same comparison: 9 runs 1.718x, 11 runs 1.743x, 15 runs 1.752x (PTX). The other 15 workloads on both engines,
 same batch (`docs/perf-design/data/round10/ab-final-atomics-build-base-vs-build.txt`): all within 0.98x to 1.02x; four read outside the 2%
 band with p = 0.000 and are layout noise, not attributed to a change: `mem` ptx 0.980x, `local` sass 1.022x, `launch` sass 1.026x,
 `warp` sass 1.010x. Counters identical in every pair; `bench.sh --check-counters` passes on the new build (tier off and on).
@@ -45,7 +45,7 @@ Tests, `tests/unit/test_atom_rmw.cpp` (new, wired in CMakeLists.txt, framework-f
 * `ptx_global_atomics_match_the_two_access_path`: 13 atom/red forms (add, exch, min.s32, max.u32, and/xor/or with constants that leave a
   uniform chunk uniform, cas, inc, add.u64, exch.b64, add.f32, red) x 6 strides x 5 offsets (aligned, misaligned, near the end, running off
   it) x 4 memory states, 64 threads, `VGPU_FASTPATH=1` against `=0`: same returned values, same final memory, same resident bytes, same
-  error text (about 1,500 kernels, some 400 of them errors).
+  error text (about 1,500 kernels; some are errors, and the test requires more than 20 so the error text is compared too).
 * **Seen to fail** on deliberately broken code (a temporary `MUT` switch, since removed): commit without the uniform "unchanged" rule
   (the PTX test fails: resident bytes), `rmw_begin` ignoring an armed store fault (the memory test fails: hook calls), `rmw_begin` without
   the alignment check (both fail), the interpreter returning the new value instead of the old (the PTX test fails).
@@ -57,8 +57,8 @@ per-fetch cache in `texel_channel_bits` (the first channel read of a texel with 
 clears it). Two tests with mutants that failed as expected. Measured:
 
 * First version (all texels): harness `texture` **0.916x sass, 0.922x ptx** (slower: the harness `texture` workload reads one-channel
-  float textures, so the lookup bought nothing and the cache cost). The note in this file's earlier "Not done" list, "one `load_scalar` per
-  channel", only holds for textures of several channels.
+  float textures, so the lookup bought nothing and the cache cost). The `docs/performance.md` note "one `load_scalar` per
+  channel" only holds for textures of several channels.
 * Restricted to texels with a second channel: harness `texture` 1.007x sass, 1.005x ptx (same, as it should be).
 * A new micro-workload with `float4` point, `float4` linear and `uchar4` normalised linear fetches
   (`docs/perf-design/data/round10/r10small_tex4.cu`, 11 alternating runs, CPU time): SASS 1.71 s -> 1.65 s (**1.036x**), PTX 1.58 s -> 1.525 s
@@ -165,9 +165,9 @@ builds are the same source):
 | `use` build | 645 s | 598 s |
 | `libcudart.so.13` size | 7,668,240 -> 5,916,152 bytes (-23%) | (not recorded) |
 
-So a PGO release build costs the plain build, plus the instrumented build, plus the training run, plus a second full build: about 3x the
-compile time (2,200 s against 642 s here, with every target and test built each time; a build of the shared libraries only would be less,
-NOT MEASURED).
+So the PGO flow (instrumented build + training + `use` build) costs 1,425 s with the harness profile and 1,699 s with the PyTorch groups,
+against 642 s for the plain build: 2.2x to 2.6x the compile time (every target and test is built each time; a build of the shared
+libraries only would be less, NOT MEASURED).
 
 ### Speed, harness workloads (ratio of medians of Minst/s or units/s, B = PGO, A = plain; 9 runs, CPU 6; verdict of the harness)
 
@@ -232,7 +232,7 @@ Tier off (SASS and PTX), then tier on (SASS). "run 1" and "run 2" are the same p
 | api | sass | 1.038x (faster) | 1.039x (faster) | 1.001x (same) |
 | startup | sass | 1.027x (faster) | 1.023x (faster) | 1.054x (faster) |
 
-Geometric mean of the ratio over the compute workloads (13 workloads, per engine): tier off, harness-trained **1.116x** (run 2: 1.117x;
+Geometric mean of the ratio over the compute workloads (workload/engine rows; launch, api and startup left out): tier off, harness-trained **1.116x** (run 2: 1.117x;
 range 0.965x to 1.331x), harness + PyTorch 1.092x (0.937x to 1.384x); tier on, harness-trained 1.054x (0.968x to 1.183x), harness +
 PyTorch **0.990x** (0.836x to 1.117x). The harness-trained profile is in sample for these rows (it was trained on them), so these are an
 upper bound; what the profile does to code it never ran is the next section.
@@ -283,8 +283,8 @@ workloads (f32/f64 fma chains, wmma, mma) match, but the whole-suite check is NO
   PGO builds from two training runs are identical is **NOT MEASURED**; the multi-threaded runs of the sweep and the order of counter
   merges make it unlikely unless the profile itself is kept as a build input (then the release would archive the `.gcda` set, 1.6 to 5.5
   MB, with the tag).
-* **Time and size.** About 3x build time (above) and a 23% smaller `libcudart.so`; the instrumented binary runs about 10x slower, so the
-  training budget is minutes, not hours. The `use` build is the artifact; the `generate` build is thrown away.
+* **Time and size.** 2.2x to 2.6x the build time (above) and a 23% smaller `libcudart.so`; the instrumented binary is slower (the CMake
+  comment says about ten times; the harness training took 13 s, the PyTorch groups 334 s), so the training budget is minutes. The `use` build is the artifact; the `generate` build is thrown away.
 * **Clang and other compilers.** `VGPU_PGO` is GCC-only (`FATAL_ERROR` otherwise). Clang's `-fprofile-instr-use` needs a different flow
   (`llvm-profdata merge`), not attempted. GCC versions: only 13.3 was used; a profile from 12 will not read with 13.
 * **Risk.** A profile that does not match the workload makes things slower (the 8% on `nn` above), and the harness cannot see it: it
