@@ -13,6 +13,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -334,6 +335,76 @@ __global__ void k_lds_transpose(const uint32_t* in, uint32_t* out, uint32_t reps
     for (uint32_t j = 0; j < 32; j += 8) out[base + (ty + j) * 32 + tx] = tile[tx][ty + j];
     __syncthreads();
   }
+}
+
+
+// ---------------------------------------------------------------- memory, the other instruction forms
+// (sub-dword global accesses, scalar loads, buffer loads with offsets, wide LDS accesses and LDS atomics)
+
+__global__ void k_narrow(const uint8_t* in8, const int8_t* ins8, const uint16_t* in16, uint8_t* o8, uint16_t* o16, int32_t* osum,
+                         uint32_t n, uint32_t reps) {
+  uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+  for (uint32_t r = 0; r < reps; ++r)
+    for (uint32_t i = t; i < n; i += gridDim.x * blockDim.x) {
+      o8[i] = (uint8_t)(in8[i] + r);
+      o16[i] = (uint16_t)(in16[i] * 3u + r);
+      osum[i] = (int32_t)ins8[i] + (int32_t)r;
+    }
+}
+// Every lane of a wave takes the same table entries: scalar loads (s_load_dword, s_load_dwordx4).
+__global__ void k_smem(const uint32_t* __restrict__ tab, uint32_t* __restrict__ out, uint32_t n, uint32_t reps) {
+  uint32_t acc = threadIdx.x;
+  for (uint32_t r = 0; r < reps; ++r)
+    for (uint32_t i = 0; i < n; i += 4) {
+      const uint4 v = *reinterpret_cast<const uint4*>(tab + i);
+      acc = acc * 31u + v.x;
+      acc ^= v.y + r;
+      acc += v.z * 7u;
+      acc ^= v.w;
+      acc += tab[(i * 5u + r) % n];
+    }
+  out[blockIdx.x * blockDim.x + threadIdx.x] = acc;
+}
+// Raw buffer loads and stores with a per-lane offset, some of them past the end of the resource (which read zero).
+__global__ void k_buf(const uint32_t* in, uint32_t* out, uint32_t n, uint32_t records_words, uint32_t reps, uint32_t flags) {
+  const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+  __amdgpu_buffer_rsrc_t ri = __builtin_amdgcn_make_buffer_rsrc(const_cast<uint32_t*>(in), 0, records_words * 4, flags);
+  __amdgpu_buffer_rsrc_t ro = __builtin_amdgcn_make_buffer_rsrc(out, 0, n * 4, flags);
+  for (uint32_t r = 0; r < reps; ++r)
+    for (uint32_t i = t; i < n; i += gridDim.x * blockDim.x) {
+      const uint32_t a = __builtin_amdgcn_raw_buffer_load_b32(ri, i * 4, 0, 0);
+      const uint32_t b = __builtin_amdgcn_raw_buffer_load_b32(ri, (i + 3) * 4, 0, 0);
+      __builtin_amdgcn_raw_buffer_store_b32(a * 3u + b + r, ro, i * 4, 0, 0);
+    }
+}
+__global__ void k_ldsx(const uint32_t* in, uint32_t* out, uint32_t* hist, uint32_t reps) {
+  __shared__ uint4 v[256];
+  __shared__ uint32_t bins[64];
+  uint32_t acc = 0;
+  if (threadIdx.x < 64) bins[threadIdx.x] = 0;
+  for (uint32_t r = 0; r < reps; ++r) {
+    const uint32_t x = in[blockIdx.x * 256 + threadIdx.x] + r;
+    v[threadIdx.x] = make_uint4(x, x ^ 1u, x + 2u, x ^ 3u);
+    __syncthreads();
+    const uint4 a = v[threadIdx.x ^ 1], b = v[(threadIdx.x + 17) & 255];
+    acc += a.x + a.y * 3u + a.z + b.w + b.x;
+    atomicAdd(&bins[(x >> 3) & 63], 1u);
+    __syncthreads();
+  }
+  out[blockIdx.x * 256 + threadIdx.x] = acc;
+  if (threadIdx.x < 64) hist[blockIdx.x * 64 + threadIdx.x] = bins[threadIdx.x];
+}
+
+// Generic pointers: flat loads and stores that reach global memory (the aperture checks and then the access).
+__global__ void k_flat(const uint32_t* in, uint32_t* out, uint32_t n, uint32_t reps, uint32_t sel) {
+  __shared__ uint32_t s[256];
+  s[threadIdx.x] = threadIdx.x * 7u;
+  __syncthreads();
+  const uint32_t* src = sel ? (const uint32_t*)s : in;   // (sel is 0: the global array; the compiler cannot know)
+  uint32_t* dst = sel ? (uint32_t*)s : out;
+  uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+  for (uint32_t r = 0; r < reps; ++r)
+    for (uint32_t i = t; i < n; i += gridDim.x * blockDim.x) dst[i] = src[(sel ? threadIdx.x : i)] * 3u + r;
 }
 
 // ---------------------------------------------------------------- atomics
@@ -738,6 +809,125 @@ static void run_lds(const std::string& size) {
   expect_eq("lds_reduce", g1.data(), r1.data(), blocks * 4);
   expect_eq("lds_transpose", g2.data(), r2.data(), blocks * 1024 * 4);
 }
+static void run_narrow(const std::string& size) {
+  const uint32_t n = 1u << 16, reps = scale(size, 4, 400);
+  std::vector<uint8_t> in8(n);
+  std::vector<int8_t> ins8(n);
+  std::vector<uint16_t> in16(n);
+  for (uint32_t i = 0; i < n; ++i) in8[i] = (uint8_t)(i * 2654435761u >> 24), ins8[i] = (int8_t)(i * 40503u >> 3), in16[i] = (uint16_t)(i * 2654435761u >> 11);
+  uint8_t *d8 = dev_copy(in8), *o8;
+  int8_t* ds8 = dev_copy(ins8);
+  uint16_t *d16 = dev_copy(in16), *o16;
+  int32_t* os;
+  HC(hipMalloc(&o8, n));
+  HC(hipMalloc(&o16, n * 2));
+  HC(hipMalloc(&os, n * 4));
+  Phase p;
+  LAUNCH(k_narrow, dim3(64), dim3(256), 0, 0, (const uint8_t*)d8, (const int8_t*)ds8, (const uint16_t*)d16, o8, o16, os, n, reps);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  std::vector<uint8_t> g8 = dev_read(o8, n), r8(n);
+  std::vector<uint16_t> g16 = dev_read(o16, n), r16(n);
+  std::vector<int32_t> gs = dev_read(os, n), rs(n);
+  const uint32_t last = reps - 1;
+  for (uint32_t i = 0; i < n; ++i) {
+    r8[i] = (uint8_t)(in8[i] + last);
+    r16[i] = (uint16_t)(in16[i] * 3u + last);
+    rs[i] = (int32_t)ins8[i] + (int32_t)last;
+  }
+  expect_eq("narrow_u8", g8.data(), r8.data(), n);
+  expect_eq("narrow_u16", g16.data(), r16.data(), n * 2);
+  expect_eq("narrow_s8", gs.data(), rs.data(), n * 4);
+}
+static void run_smem(const std::string& size) {
+  const uint32_t n = 1024, blocks = 16, threads = 256, reps = scale(size, 4, 60);
+  std::vector<uint32_t> tab(n);
+  for (uint32_t i = 0; i < n; ++i) tab[i] = i * 2654435761u + 7;
+  uint32_t *dt = dev_copy(tab), *o;
+  HC(hipMalloc(&o, blocks * threads * 4));
+  Phase p;
+  LAUNCH(k_smem, dim3(blocks), dim3(threads), 0, 0, (const uint32_t*)dt, o, n, reps);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  std::vector<uint32_t> got = dev_read(o, blocks * threads), ref(blocks * threads);
+  for (uint32_t b = 0; b < blocks; ++b)
+    for (uint32_t t = 0; t < threads; ++t) {
+      uint32_t acc = t;
+      for (uint32_t r = 0; r < reps; ++r)
+        for (uint32_t i = 0; i < n; i += 4) {
+          acc = acc * 31u + tab[i];
+          acc ^= tab[i + 1] + r;
+          acc += tab[i + 2] * 7u;
+          acc ^= tab[i + 3];
+          acc += tab[(i * 5u + r) % n];
+        }
+      ref[b * threads + t] = acc;
+    }
+  expect_eq("smem", got.data(), ref.data(), blocks * threads * 4);
+}
+static void run_buf(const std::string& size) {
+  const uint32_t n = 1u << 16, records = n - 2, reps = scale(size, 4, 400);   // the last two words of the input are outside the resource
+  std::vector<uint32_t> in(n);
+  for (uint32_t i = 0; i < n; ++i) in[i] = i * 2654435761u + 5;
+  uint32_t *din = dev_copy(in), *o;
+  HC(hipMalloc(&o, n * 4));
+  // The resource's last descriptor word: gfx9 (CDNA) takes a data format; RDNA2 a format and a raw out-of-range check.
+  const uint32_t flags = std::string(g_arch).find("gfx9") != std::string::npos ? 0x00020000u : 0x31014000u;
+  Phase p;
+  LAUNCH(k_buf, dim3(64), dim3(256), 0, 0, (const uint32_t*)din, o, n, records, reps, flags);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  std::vector<uint32_t> got = dev_read(o, n), ref(n);
+  const uint32_t last = reps - 1;
+  const auto word = [&](uint32_t i) { return i < records ? in[i] : 0u; };
+  for (uint32_t i = 0; i < n; ++i) ref[i] = word(i) * 3u + word(i + 3) + last;
+  expect_eq("buf", got.data(), ref.data(), n * 4);
+}
+static void run_ldsx(const std::string& size) {
+  const uint32_t blocks = 64, reps = scale(size, 10, 2000);
+  std::vector<uint32_t> in(blocks * 256);
+  for (size_t i = 0; i < in.size(); ++i) in[i] = (uint32_t)(i * 2654435761u) >> 20;
+  uint32_t *din = dev_copy(in), *o, *h;
+  HC(hipMalloc(&o, blocks * 256 * 4));
+  HC(hipMalloc(&h, blocks * 64 * 4));
+  Phase p;
+  LAUNCH(k_ldsx, dim3(blocks), dim3(256), 0, 0, (const uint32_t*)din, o, h, reps);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  std::vector<uint32_t> go = dev_read(o, blocks * 256), gh = dev_read(h, blocks * 64), ro(blocks * 256), rh(blocks * 64, 0);
+  for (uint32_t b = 0; b < blocks; ++b) {
+    for (uint32_t t = 0; t < 256; ++t) {
+      uint32_t acc = 0;
+      for (uint32_t r = 0; r < reps; ++r) {
+        const auto vec = [&](uint32_t u) {
+          const uint32_t x = in[b * 256 + u] + r;
+          return std::array<uint32_t, 4>{x, x ^ 1u, x + 2u, x ^ 3u};
+        };
+        const auto a = vec(t ^ 1), bb = vec((t + 17) & 255);
+        acc += a[0] + a[1] * 3u + a[2] + bb[3] + bb[0];
+      }
+      ro[b * 256 + t] = acc;
+    }
+    for (uint32_t r = 0; r < reps; ++r)
+      for (uint32_t t = 0; t < 256; ++t) ++rh[b * 64 + (((in[b * 256 + t] + r) >> 3) & 63)];
+  }
+  expect_eq("ldsx_out", go.data(), ro.data(), blocks * 256 * 4);
+  expect_eq("ldsx_hist", gh.data(), rh.data(), blocks * 64 * 4);
+}
+static void run_flat(const std::string& size) {
+  const uint32_t n = 1u << 16, reps = scale(size, 4, 400);
+  std::vector<uint32_t> in(n);
+  for (uint32_t i = 0; i < n; ++i) in[i] = i * 2654435761u + 3;
+  uint32_t *din = dev_copy(in), *o;
+  HC(hipMalloc(&o, n * 4));
+  Phase p;
+  LAUNCH(k_flat, dim3(64), dim3(256), 0, 0, (const uint32_t*)din, o, n, reps, 0u);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  std::vector<uint32_t> got = dev_read(o, n), ref(n);
+  for (uint32_t i = 0; i < n; ++i) ref[i] = in[i] * 3u + (reps - 1);
+  expect_eq("flat", got.data(), ref.data(), n * 4);
+}
 static void run_atomics(const std::string& size) {
   const uint32_t blocks = 16, threads = 256, iters = scale(size, 4, 200), n = blocks * threads;
   uint32_t* d;
@@ -884,6 +1074,11 @@ int main(int argc, char** argv) {
   else if (w == "wmma_iu8") run_wmma_iu8(size);
   else if (w == "mem") run_mem(size);
   else if (w == "lds") run_lds(size);
+  else if (w == "narrow") run_narrow(size);
+  else if (w == "smem") run_smem(size);
+  else if (w == "buf") run_buf(size);
+  else if (w == "ldsx") run_ldsx(size);
+  else if (w == "flat") run_flat(size);
   else if (w == "atomics") run_atomics(size);
   else if (w == "divergent") run_divergent(size);
   else if (w == "wave") run_wave(size);

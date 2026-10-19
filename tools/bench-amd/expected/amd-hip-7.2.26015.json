@@ -16,6 +16,22 @@
    "dispatches": 1,
    "wave_instructions": 239760
   },
+  "mi300x/buf": {
+   "SQ_INSTS_BRANCH": 7680,
+   "SQ_INSTS_LDS": 0,
+   "SQ_INSTS_MFMA": 0,
+   "SQ_INSTS_SALU": 16896,
+   "SQ_INSTS_SENDMSG": 0,
+   "SQ_INSTS_SMEM": 1024,
+   "SQ_INSTS_VALU": 23296,
+   "SQ_INSTS_VMEM": 12288,
+   "SQ_INSTS_VMEM_RD": 8192,
+   "SQ_INSTS_VMEM_WR": 4096,
+   "SQ_WAVES": 256,
+   "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
+   "dispatches": 1,
+   "wave_instructions": 61184
+  },
   "mi300x/divergent": {
    "SQ_INSTS_BRANCH": 141034,
    "SQ_INSTS_LDS": 0,
@@ -31,6 +47,22 @@
    "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
    "dispatches": 1,
    "wave_instructions": 952528
+  },
+  "mi300x/flat": {
+   "SQ_INSTS_BRANCH": 7680,
+   "SQ_INSTS_LDS": 256,
+   "SQ_INSTS_MFMA": 0,
+   "SQ_INSTS_SALU": 16640,
+   "SQ_INSTS_SENDMSG": 0,
+   "SQ_INSTS_SMEM": 1024,
+   "SQ_INSTS_VALU": 32000,
+   "SQ_INSTS_VMEM": 8192,
+   "SQ_INSTS_VMEM_RD": 4096,
+   "SQ_INSTS_VMEM_WR": 4096,
+   "SQ_WAVES": 256,
+   "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
+   "dispatches": 1,
+   "wave_instructions": 65792
   },
   "mi300x/launch": {
    "SQ_INSTS_BRANCH": 2000,
@@ -64,6 +96,22 @@
    "dispatches": 2,
    "wave_instructions": 169280
   },
+  "mi300x/ldsx": {
+   "SQ_INSTS_BRANCH": 3328,
+   "SQ_INSTS_LDS": 10560,
+   "SQ_INSTS_MFMA": 0,
+   "SQ_INSTS_SALU": 6400,
+   "SQ_INSTS_SENDMSG": 0,
+   "SQ_INSTS_SMEM": 768,
+   "SQ_INSTS_VALU": 30848,
+   "SQ_INSTS_VMEM": 2880,
+   "SQ_INSTS_VMEM_RD": 2560,
+   "SQ_INSTS_VMEM_WR": 320,
+   "SQ_WAVES": 256,
+   "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
+   "dispatches": 1,
+   "wave_instructions": 54784
+  },
   "mi300x/mem": {
    "SQ_INSTS_BRANCH": 47616,
    "SQ_INSTS_LDS": 0,
@@ -95,6 +143,38 @@
    "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
    "dispatches": 1,
    "wave_instructions": 104768
+  },
+  "mi300x/narrow": {
+   "SQ_INSTS_BRANCH": 7680,
+   "SQ_INSTS_LDS": 0,
+   "SQ_INSTS_MFMA": 0,
+   "SQ_INSTS_SALU": 14592,
+   "SQ_INSTS_SENDMSG": 0,
+   "SQ_INSTS_SMEM": 1280,
+   "SQ_INSTS_VALU": 38656,
+   "SQ_INSTS_VMEM": 24576,
+   "SQ_INSTS_VMEM_RD": 12288,
+   "SQ_INSTS_VMEM_WR": 12288,
+   "SQ_WAVES": 256,
+   "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
+   "dispatches": 1,
+   "wave_instructions": 86784
+  },
+  "mi300x/smem": {
+   "SQ_INSTS_BRANCH": 66432,
+   "SQ_INSTS_LDS": 0,
+   "SQ_INSTS_MFMA": 0,
+   "SQ_INSTS_SALU": 1444160,
+   "SQ_INSTS_SENDMSG": 0,
+   "SQ_INSTS_SMEM": 131264,
+   "SQ_INSTS_VALU": 393920,
+   "SQ_INSTS_VMEM": 64,
+   "SQ_INSTS_VMEM_RD": 0,
+   "SQ_INSTS_VMEM_WR": 64,
+   "SQ_WAVES": 64,
+   "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
+   "dispatches": 1,
+   "wave_instructions": 2035840
   },
   "mi300x/startup": {
    "SQ_INSTS_BRANCH": 1,
@@ -188,6 +268,18 @@
    "dispatches": 1,
    "wave_instructions": 283376
   },
+  "rx6800/buf": {
+   "SQ_INSTS_FLAT": 0,
+   "SQ_INSTS_LDS": 0,
+   "SQ_INSTS_SALU": 33280,
+   "SQ_INSTS_SMEM": 2048,
+   "SQ_INSTS_VALU": 46592,
+   "SQ_WAVE32_INSTS": 163840,
+   "SQ_WAVE64_INSTS": 0,
+   "SQ_WAVES": 512,
+   "dispatches": 1,
+   "wave_instructions": 163840
+  },
   "rx6800/divergent": {
    "SQ_INSTS_FLAT": 128,
    "SQ_INSTS_LDS": 0,
@@ -199,6 +291,18 @@
    "SQ_WAVES": 128,
    "dispatches": 1,
    "wave_instructions": 1827158
+  },
+  "rx6800/flat": {
+   "SQ_INSTS_FLAT": 16384,
+   "SQ_INSTS_LDS": 512,
+   "SQ_INSTS_SALU": 32768,
+   "SQ_INSTS_SMEM": 2048,
+   "SQ_INSTS_VALU": 94720,
+   "SQ_WAVE32_INSTS": 190464,
+   "SQ_WAVE64_INSTS": 0,
+   "SQ_WAVES": 512,
+   "dispatches": 1,
+   "wave_instructions": 190464
   },
   "rx6800/launch": {
    "SQ_INSTS_FLAT": 2000,
@@ -224,6 +328,18 @@
    "dispatches": 2,
    "wave_instructions": 568768
   },
+  "rx6800/ldsx": {
+   "SQ_INSTS_FLAT": 5760,
+   "SQ_INSTS_LDS": 21120,
+   "SQ_INSTS_SALU": 12800,
+   "SQ_INSTS_SMEM": 1536,
+   "SQ_INSTS_VALU": 60672,
+   "SQ_WAVE32_INSTS": 152704,
+   "SQ_WAVE64_INSTS": 0,
+   "SQ_WAVES": 512,
+   "dispatches": 1,
+   "wave_instructions": 152704
+  },
   "rx6800/mem": {
    "SQ_INSTS_FLAT": 180224,
    "SQ_INSTS_LDS": 0,
@@ -235,6 +351,30 @@
    "SQ_WAVES": 1536,
    "dispatches": 3,
    "wave_instructions": 1387520
+  },
+  "rx6800/narrow": {
+   "SQ_INSTS_FLAT": 49152,
+   "SQ_INSTS_LDS": 0,
+   "SQ_INSTS_SALU": 28672,
+   "SQ_INSTS_SMEM": 2560,
+   "SQ_INSTS_VALU": 110080,
+   "SQ_WAVE32_INSTS": 249856,
+   "SQ_WAVE64_INSTS": 0,
+   "SQ_WAVES": 512,
+   "dispatches": 1,
+   "wave_instructions": 249856
+  },
+  "rx6800/smem": {
+   "SQ_INSTS_FLAT": 128,
+   "SQ_INSTS_LDS": 0,
+   "SQ_INSTS_SALU": 3019264,
+   "SQ_INSTS_SMEM": 262528,
+   "SQ_INSTS_VALU": 394880,
+   "SQ_WAVE32_INSTS": 4076672,
+   "SQ_WAVE64_INSTS": 0,
+   "SQ_WAVES": 128,
+   "dispatches": 1,
+   "wave_instructions": 4076672
   },
   "rx6800/startup": {
    "SQ_INSTS_FLAT": 1,
