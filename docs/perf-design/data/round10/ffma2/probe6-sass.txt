@@ -1,0 +1,28 @@
+# probe6: one kernel per variant (k_<operand>_<modifier>), the packed instruction and the scalar ones around it, from nvdisasm
+.text.k_c_swap_a:
+ FFMA2 R6, R6.F32x2.HI_LO, R8.F32x2.HI_LO, |R4|.F32x2.LO_HI ;
+.text.k_c_swap_neg:
+ FFMA2 R6, R6.F32x2.HI_LO, R8.F32x2.HI_LO, -R4.F32x2.LO_HI ;
+.text.k_c_bh_na:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, -|R11|.F32 ;
+.text.k_c_bl_a:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, |R11|.F32 ;
+.text.k_c_bl_nh:
+ FADD R11, -R10, -RZ ;
+ FFMA2 R10, R4.F32x2.HI_LO, R6.F32x2.HI_LO, R10.F32x2.HI_LO ;
+.text.k_c_bh_neg:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, -R11.F32 ;
+.text.k_c_bl_neg:
+ FFMA2 R6, R4.F32x2.HI_LO, R6.F32x2.HI_LO, -R11.F32 ;
+.text.k_c_swap_al_nah:
+ FFMA2 R6, R6.F32x2.HI_LO, R8.F32x2.HI_LO, -|R4|.F32x2.LO_HI.NP ;
+.text.k_c_swap_nal_ah:
+ FFMA2 R6, R6.F32x2.HI_LO, R8.F32x2.HI_LO, |R4|.F32x2.LO_HI.NP ;
+.text.k_c_nh_swap:
+ FFMA2 R6, R6.F32x2.HI_LO, R8.F32x2.HI_LO, R4.F32x2.LO_HI.NP ;
+.text.k_c_nl_swap:
+ FFMA2 R6, R6.F32x2.HI_LO, R8.F32x2.HI_LO, -R4.F32x2.LO_HI.NP ;
+.text.k_c_swap_nh:
+ FFMA2 R6, R6.F32x2.HI_LO, R8.F32x2.HI_LO, -R4.F32x2.LO_HI.NP ;
+.text.k_c_swap_nl:
+ FFMA2 R6, R6.F32x2.HI_LO, R8.F32x2.HI_LO, R4.F32x2.LO_HI.NP ;
