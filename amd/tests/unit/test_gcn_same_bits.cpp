@@ -37,6 +37,10 @@ const Corpus kCorpora[] = {
     {"isa_corpus_gfx90a.txt", amd::gcn::Target::Gfx90a},  {"isa_corpus_gfx1100.txt", amd::gcn::Target::Gfx1100},
     {"isa_corpus_gfx1201.txt", amd::gcn::Target::Gfx1200}, {"isa_corpus_gfx1250.txt", amd::gcn::Target::Gfx1250},
     {"isa_corpus_gfx1030.txt", amd::gcn::Target::Gfx1030},
+    // The matrix instructions (amd/tools/matrix-asm.py), every MFMA, SMFMAC and WMMA form the interpreter has, recorded from f81cc0c1.
+    {"isa_corpus_matrix_gfx942.txt", amd::gcn::Target::Gfx942}, {"isa_corpus_matrix_gfx950.txt", amd::gcn::Target::Gfx950},
+    {"isa_corpus_matrix_gfx1100.txt", amd::gcn::Target::Gfx1100}, {"isa_corpus_matrix_gfx1201.txt", amd::gcn::Target::Gfx1200},
+    {"isa_corpus_matrix_gfx1250.txt", amd::gcn::Target::Gfx1250},
 };
 
 std::vector<std::string> lines_of(const std::string& path) {
@@ -107,6 +111,8 @@ void digest_corpus(const Corpus& c, std::vector<uint32_t>* digests, std::vector<
 }  // namespace
 
 VTEST(every_instruction_of_the_isa_corpora_gives_the_recorded_bits) {
+  // VGPU_SAME_BITS_REFERENCE=1: the matrix instructions the way they were worked out before the tile path (the reference must give the recorded bits too).
+  if (const char* r = std::getenv("VGPU_SAME_BITS_REFERENCE"); r && *r == '1') amd::set_matrix_fast_path(false);
   const std::string golden_path = std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/same_bits_digests.txt";
   if (const char* update = std::getenv("VGPU_SAME_BITS_UPDATE"); update && *update) {
     std::ofstream out(update);

@@ -161,6 +161,127 @@ __global__ void k_mfma(const _Float16* A, const _Float16* B, float* D, uint32_t 
 #endif
 }
 
+
+// The other matrix forms (docs/performance.md, "The matrix instructions"): each computes D = n * (A x B) for a 16x16 tile of small
+// integers, which every form represents and sums exactly, and compares with the host's. MI300X: integer, 8-bit float, bfloat16,
+// double and sparse MFMA. RX 7900 XTX and RX 9070 XT: WMMA (binary16 into float, and 8-bit integers). Lane layouts as in k_mfma:
+// A row l % 16 and B column l % 16, the lane's run of K after (l / 16) * (K / 4); D rows 4 * (l / 16) .. +3 of column l % 16 (the
+// double form: rows l / 16 + 4r). gfx11's WMMA lane holds all of K, gfx12's the half of it (l / 16); D rows are 2i + l / 16 (gfx11) or
+// i + 8 * (l / 16) (gfx12).
+#if defined(__gfx942__) || defined(__gfx950__)
+#define DEVICE_MFMA_MORE 1
+#endif
+typedef __attribute__((__vector_size__(4 * sizeof(int)))) int int4_v;
+typedef __attribute__((__vector_size__(4 * sizeof(short)))) short short4_v;
+typedef __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16 half8_v;
+typedef __attribute__((__vector_size__(4 * sizeof(double)))) double double4_v;
+typedef __attribute__((__vector_size__(8 * sizeof(float)))) float float8_v;
+typedef __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16 half16_v;
+typedef __attribute__((__vector_size__(8 * sizeof(int)))) int int8_v;
+
+__global__ void k_mfma_i8(const int8_t* A, const int8_t* B, int* D, uint32_t n) {
+#ifdef DEVICE_MFMA_MORE
+  const uint32_t l = threadIdx.x & 63, wave = blockIdx.x;
+  long a = 0, b = 0;
+  for (int i = 0; i < 8; ++i) {
+    a |= static_cast<long>(static_cast<uint8_t>(A[(l % 16) * 32 + (l / 16) * 8 + i])) << (8 * i);
+    b |= static_cast<long>(static_cast<uint8_t>(B[((l / 16) * 8 + i) * 16 + (l % 16)])) << (8 * i);
+  }
+  int4_v acc = {0, 0, 0, 0};
+  for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_mfma_i32_16x16x32_i8(a, b, acc, 0, 0, 0);
+  for (int i = 0; i < 4; ++i) D[wave * 256 + ((l / 16) * 4 + i) * 16 + (l % 16)] = acc[i];
+#endif
+}
+__global__ void k_mfma_fp8(const uint8_t* A, const uint8_t* B, float* D, uint32_t n) {
+#ifdef DEVICE_MFMA_MORE
+  const uint32_t l = threadIdx.x & 63, wave = blockIdx.x;
+  long a = 0, b = 0;
+  for (int i = 0; i < 8; ++i) {
+    a |= static_cast<long>(A[(l % 16) * 32 + (l / 16) * 8 + i]) << (8 * i);
+    b |= static_cast<long>(B[((l / 16) * 8 + i) * 16 + (l % 16)]) << (8 * i);
+  }
+  float4_v acc = {0, 0, 0, 0};
+  for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(a, b, acc, 0, 0, 0);
+  for (int i = 0; i < 4; ++i) D[wave * 256 + ((l / 16) * 4 + i) * 16 + (l % 16)] = acc[i];
+#endif
+}
+__global__ void k_mfma_bf16(const uint16_t* A, const uint16_t* B, float* D, uint32_t n) {
+#ifdef DEVICE_MFMA_MORE
+  const uint32_t l = threadIdx.x & 63, wave = blockIdx.x;
+  short4_v a, b;
+  for (int i = 0; i < 4; ++i) {
+    a[i] = static_cast<short>(A[(l % 16) * 16 + (l / 16) * 4 + i]);
+    b[i] = static_cast<short>(B[((l / 16) * 4 + i) * 16 + (l % 16)]);
+  }
+  float4_v acc = {0, 0, 0, 0};
+  for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+  for (int i = 0; i < 4; ++i) D[wave * 256 + ((l / 16) * 4 + i) * 16 + (l % 16)] = acc[i];
+#endif
+}
+__global__ void k_mfma_f64(const double* A, const double* B, double* D, uint32_t n) {
+#ifdef DEVICE_MFMA_MORE
+  const uint32_t l = threadIdx.x & 63, wave = blockIdx.x;
+  const double a = A[(l % 16) * 4 + l / 16], b = B[(l / 16) * 16 + l % 16];
+  double4_v acc = {0, 0, 0, 0};
+  for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_mfma_f64_16x16x4f64(a, b, acc, 0, 0, 0);
+  for (int i = 0; i < 4; ++i) D[wave * 256 + (l / 16 + 4 * i) * 16 + (l % 16)] = acc[i];
+#endif
+}
+// 2:4 sparse A: a lane's four stored halves are the dense k offsets 0, 1, 4, 5 of its run of eight (index bits 0b01000100 ...).
+__global__ void k_smfmac(const _Float16* A, const _Float16* B, float* D, uint32_t n) {
+#ifdef DEVICE_MFMA_MORE
+  const uint32_t l = threadIdx.x & 63, wave = blockIdx.x;
+  half4 a;
+  half8_v b;
+  static const int kOff[4] = {0, 1, 4, 5};
+  for (int i = 0; i < 4; ++i) a[i] = A[(l % 16) * 32 + (l / 16) * 8 + kOff[i]];
+  for (int i = 0; i < 8; ++i) b[i] = B[((l / 16) * 8 + i) * 16 + (l % 16)];
+  float4_v acc = {0, 0, 0, 0};
+  for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_smfmac_f32_16x16x32_f16(a, b, acc, 0x44444444, 0, 0);
+  for (int i = 0; i < 4; ++i) D[wave * 256 + ((l / 16) * 4 + i) * 16 + (l % 16)] = acc[i];
+#endif
+}
+__global__ void k_wmma_f16(const _Float16* A, const _Float16* B, float* D, uint32_t n) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
+  const uint32_t l = threadIdx.x & 31, wave = blockIdx.x;
+  half16_v a, b;
+  for (int i = 0; i < 16; ++i) a[i] = A[(l % 16) * 16 + i], b[i] = B[i * 16 + (l % 16)];
+  float8_v acc = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
+  for (int i = 0; i < 8; ++i) D[wave * 256 + (2 * i + l / 16) * 16 + (l % 16)] = acc[i];
+#elif defined(__gfx1200__) || defined(__gfx1201__)
+  const uint32_t l = threadIdx.x & 31, wave = blockIdx.x;
+  half8_v a, b;
+  for (int i = 0; i < 8; ++i) a[i] = A[(l % 16) * 16 + (l / 16) * 8 + i], b[i] = B[((l / 16) * 8 + i) * 16 + (l % 16)];
+  float8_v acc = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, acc);
+  for (int i = 0; i < 8; ++i) D[wave * 256 + (i + 8 * (l / 16)) * 16 + (l % 16)] = acc[i];
+#endif
+}
+__global__ void k_wmma_iu8(const uint8_t* A, const uint8_t* B, int* D, uint32_t n) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
+  const uint32_t l = threadIdx.x & 31, wave = blockIdx.x;
+  int4_v a = {0, 0, 0, 0}, b = {0, 0, 0, 0};
+  for (int i = 0; i < 16; ++i) {
+    a[i / 4] |= static_cast<int>(A[(l % 16) * 16 + i]) << (8 * (i % 4));
+    b[i / 4] |= static_cast<int>(B[i * 16 + (l % 16)]) << (8 * (i % 4));
+  }
+  int8_v acc = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, acc, false);
+  for (int i = 0; i < 8; ++i) D[wave * 256 + (2 * i + l / 16) * 16 + (l % 16)] = acc[i];
+#elif defined(__gfx1200__) || defined(__gfx1201__)
+  const uint32_t l = threadIdx.x & 31, wave = blockIdx.x;
+  __attribute__((__vector_size__(2 * sizeof(int)))) int a = {0, 0}, b = {0, 0};
+  for (int i = 0; i < 8; ++i) {
+    a[i / 4] |= static_cast<int>(A[(l % 16) * 16 + (l / 16) * 8 + i]) << (8 * (i % 4));
+    b[i / 4] |= static_cast<int>(B[((l / 16) * 8 + i) * 16 + (l % 16)]) << (8 * (i % 4));
+  }
+  int8_v acc = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, false, b, acc, false);
+  for (int i = 0; i < 8; ++i) D[wave * 256 + (i + 8 * (l / 16)) * 16 + (l % 16)] = acc[i];
+#endif
+}
+
 // ---------------------------------------------------------------- memory
 
 __global__ void k_mem_copy(const uint4* in, uint4* out, uint32_t n4, uint32_t reps) {
@@ -370,6 +491,194 @@ static void run_mfma(const std::string& size) {
       }
   expect_eq("mfma", got.data(), ref.data(), waves * 256 * 4);
 }
+// ---- the other matrix forms: host side
+
+// D[i][j] = n * sum_k A[i][k] * B[k][j], for A 16 x K and B K x 16 of small integers (exact in every format used).
+template <typename TA, typename TB>
+static std::vector<double> matrix_ref(const std::vector<TA>& A, const std::vector<TB>& B, int K, uint32_t n) {
+  std::vector<double> ref(256);
+  for (int i = 0; i < 16; ++i)
+    for (int j = 0; j < 16; ++j) {
+      double s = 0;
+      for (int k = 0; k < K; ++k) s += static_cast<double>(A[i * K + k]) * static_cast<double>(B[k * 16 + j]);
+      ref[i * 16 + j] = s * n;
+    }
+  return ref;
+}
+static int small_a(int i, int k) { return (i * 5 + k * 3) % 7 - 3; }
+static int small_b(int k, int j) { return (k * 3 + j * 5) % 5 - 2; }
+// An integer in -3..3 as an 8-bit float (E4M3: bias 8 on gfx942's FNUZ format, 7 on gfx950's OCP one).
+static uint8_t fp8_of(int v, bool ocp) {
+  const int bias = ocp ? 7 : 8, m = v < 0 ? -v : v;
+  uint8_t code = 0;
+  if (m == 1) code = static_cast<uint8_t>(bias << 3);
+  else if (m == 2) code = static_cast<uint8_t>((bias + 1) << 3);
+  else if (m == 3) code = static_cast<uint8_t>(((bias + 1) << 3) | 4);
+  return v < 0 ? static_cast<uint8_t>(code | 0x80) : code;
+}
+static uint16_t bf16_of(int v) {
+  const float f = static_cast<float>(v);
+  uint32_t b;
+  std::memcpy(&b, &f, 4);
+  return static_cast<uint16_t>(b >> 16);
+}
+static bool has_arch(const char* what) { return std::string(g_arch).find(what) != std::string::npos; }
+static void need_mfma_more() {
+  if (!has_arch("gfx942") && !has_arch("gfx950")) {
+    std::printf("SKIP no such matrix instructions for %s\n", g_arch);
+    std::exit(77);
+  }
+}
+static void need_wmma() {
+  if (!has_arch("gfx11") && !has_arch("gfx12")) {
+    std::printf("SKIP no WMMA for %s\n", g_arch);
+    std::exit(77);
+  }
+}
+static void run_mfma_i8(const std::string& size) {
+  need_mfma_more();
+  const uint32_t waves = 64, n = scale(size, 200, 4000);
+  std::vector<int8_t> A(16 * 32), B(32 * 16);
+  for (int i = 0; i < 16; ++i)
+    for (int k = 0; k < 32; ++k) A[i * 32 + k] = static_cast<int8_t>(small_a(i, k)), B[k * 16 + i] = static_cast<int8_t>(small_b(k, i));
+  int8_t *dA = dev_copy(A), *dB = dev_copy(B);
+  int* dD;
+  HC(hipMalloc(&dD, waves * 256 * 4));
+  Phase p;
+  LAUNCH(k_mfma_i8, dim3(waves), dim3(64), 0, 0, dA, dB, dD, n);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  const std::vector<int> got = dev_read(dD, waves * 256);
+  const std::vector<double> ref = matrix_ref(A, B, 32, n);
+  for (uint32_t w = 0; w < waves; ++w)
+    for (int e = 0; e < 256; ++e) expect_true("mfma_i8", got[w * 256 + e] == static_cast<int>(ref[e]));
+}
+static void run_mfma_fp8(const std::string& size) {
+  need_mfma_more();
+  const bool ocp = has_arch("gfx950");
+  const uint32_t waves = 64, n = scale(size, 200, 4000);
+  std::vector<uint8_t> A(16 * 32), B(32 * 16);
+  std::vector<int8_t> Av(16 * 32), Bv(32 * 16);
+  for (int i = 0; i < 16; ++i)
+    for (int k = 0; k < 32; ++k) {
+      Av[i * 32 + k] = static_cast<int8_t>(small_a(i, k)), Bv[k * 16 + i] = static_cast<int8_t>(small_b(k, i));
+      A[i * 32 + k] = fp8_of(Av[i * 32 + k], ocp), B[k * 16 + i] = fp8_of(Bv[k * 16 + i], ocp);
+    }
+  uint8_t *dA = dev_copy(A), *dB = dev_copy(B);
+  float* dD;
+  HC(hipMalloc(&dD, waves * 256 * 4));
+  Phase p;
+  LAUNCH(k_mfma_fp8, dim3(waves), dim3(64), 0, 0, dA, dB, dD, n);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  const std::vector<float> got = dev_read(dD, waves * 256);
+  const std::vector<double> ref = matrix_ref(Av, Bv, 32, n);
+  for (uint32_t w = 0; w < waves; ++w)
+    for (int e = 0; e < 256; ++e) expect_true("mfma_fp8", got[w * 256 + e] == static_cast<float>(ref[e]));
+}
+static void run_mfma_bf16(const std::string& size) {
+  need_mfma_more();
+  const uint32_t waves = 64, n = scale(size, 400, 8000);
+  std::vector<uint16_t> A(16 * 16), B(16 * 16);
+  std::vector<int8_t> Av(16 * 16), Bv(16 * 16);
+  for (int i = 0; i < 16; ++i)
+    for (int k = 0; k < 16; ++k) {
+      Av[i * 16 + k] = static_cast<int8_t>(small_a(i, k)), Bv[k * 16 + i] = static_cast<int8_t>(small_b(k, i));
+      A[i * 16 + k] = bf16_of(Av[i * 16 + k]), B[k * 16 + i] = bf16_of(Bv[k * 16 + i]);
+    }
+  uint16_t *dA = dev_copy(A), *dB = dev_copy(B);
+  float* dD;
+  HC(hipMalloc(&dD, waves * 256 * 4));
+  Phase p;
+  LAUNCH(k_mfma_bf16, dim3(waves), dim3(64), 0, 0, dA, dB, dD, n);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  const std::vector<float> got = dev_read(dD, waves * 256);
+  const std::vector<double> ref = matrix_ref(Av, Bv, 16, n);
+  for (uint32_t w = 0; w < waves; ++w)
+    for (int e = 0; e < 256; ++e) expect_true("mfma_bf16", got[w * 256 + e] == static_cast<float>(ref[e]));
+}
+static void run_mfma_f64(const std::string& size) {
+  need_mfma_more();
+  const uint32_t waves = 64, n = scale(size, 400, 8000);
+  std::vector<double> A(16 * 4), B(4 * 16);
+  for (int i = 0; i < 16; ++i)
+    for (int k = 0; k < 4; ++k) A[i * 4 + k] = small_a(i, k) * 0.25, B[k * 16 + i] = small_b(k, i) * 0.5;
+  double *dA = dev_copy(A), *dB = dev_copy(B);
+  double* dD;
+  HC(hipMalloc(&dD, waves * 256 * 8));
+  Phase p;
+  LAUNCH(k_mfma_f64, dim3(waves), dim3(64), 0, 0, dA, dB, dD, n);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  const std::vector<double> got = dev_read(dD, waves * 256);
+  const std::vector<double> ref = matrix_ref(A, B, 4, n);
+  for (uint32_t w = 0; w < waves; ++w)
+    for (int e = 0; e < 256; ++e) expect_true("mfma_f64", got[w * 256 + e] == ref[e]);
+}
+static void run_smfmac(const std::string& size) {
+  need_mfma_more();
+  const uint32_t waves = 64, n = scale(size, 200, 4000);
+  std::vector<_Float16> A(16 * 32), B(32 * 16);
+  std::vector<int8_t> Ad(16 * 32, 0), Bv(32 * 16);
+  for (int i = 0; i < 16; ++i)
+    for (int k = 0; k < 32; ++k) {
+      A[i * 32 + k] = static_cast<_Float16>(small_a(i, k));
+      if (k % 4 < 2) Ad[i * 32 + k] = static_cast<int8_t>(small_a(i, k));   // (the dense A: k offsets 0, 1 of each four)
+      B[k * 16 + i] = static_cast<_Float16>(small_b(k, i)), Bv[k * 16 + i] = static_cast<int8_t>(small_b(k, i));
+    }
+  _Float16 *dA = dev_copy(A), *dB = dev_copy(B);
+  float* dD;
+  HC(hipMalloc(&dD, waves * 256 * 4));
+  Phase p;
+  LAUNCH(k_smfmac, dim3(waves), dim3(64), 0, 0, dA, dB, dD, n);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  const std::vector<float> got = dev_read(dD, waves * 256);
+  const std::vector<double> ref = matrix_ref(Ad, Bv, 32, n);
+  for (uint32_t w = 0; w < waves; ++w)
+    for (int e = 0; e < 256; ++e) expect_true("smfmac", got[w * 256 + e] == static_cast<float>(ref[e]));
+}
+static void run_wmma(const std::string& size) {
+  need_wmma();
+  const uint32_t waves = 64, n = scale(size, 200, 4000);
+  std::vector<_Float16> A(16 * 16), B(16 * 16);
+  std::vector<int8_t> Av(16 * 16), Bv(16 * 16);
+  for (int i = 0; i < 16; ++i)
+    for (int k = 0; k < 16; ++k) {
+      Av[i * 16 + k] = static_cast<int8_t>(small_a(i, k)), Bv[k * 16 + i] = static_cast<int8_t>(small_b(k, i));
+      A[i * 16 + k] = static_cast<_Float16>(Av[i * 16 + k]), B[k * 16 + i] = static_cast<_Float16>(Bv[k * 16 + i]);
+    }
+  _Float16 *dA = dev_copy(A), *dB = dev_copy(B);
+  float* dD;
+  HC(hipMalloc(&dD, waves * 256 * 4));
+  Phase p;
+  LAUNCH(k_wmma_f16, dim3(waves), dim3(32), 0, 0, dA, dB, dD, n);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  const std::vector<float> got = dev_read(dD, waves * 256);
+  const std::vector<double> ref = matrix_ref(Av, Bv, 16, n);
+  for (uint32_t w = 0; w < waves; ++w)
+    for (int e = 0; e < 256; ++e) expect_true("wmma", got[w * 256 + e] == static_cast<float>(ref[e]));
+}
+static void run_wmma_iu8(const std::string& size) {
+  need_wmma();
+  const uint32_t waves = 64, n = scale(size, 200, 4000);
+  std::vector<uint8_t> A(16 * 16), B(16 * 16);   // (unsigned: 0..5)
+  for (int i = 0; i < 16; ++i)
+    for (int k = 0; k < 16; ++k) A[i * 16 + k] = static_cast<uint8_t>((i * 5 + k * 3) % 6), B[k * 16 + i] = static_cast<uint8_t>((k * 3 + i * 5) % 4);
+  uint8_t *dA = dev_copy(A), *dB = dev_copy(B);
+  int* dD;
+  HC(hipMalloc(&dD, waves * 256 * 4));
+  Phase p;
+  LAUNCH(k_wmma_iu8, dim3(waves), dim3(32), 0, 0, dA, dB, dD, n);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  const std::vector<int> got = dev_read(dD, waves * 256);
+  const std::vector<double> ref = matrix_ref(A, B, 16, n);
+  for (uint32_t w = 0; w < waves; ++w)
+    for (int e = 0; e < 256; ++e) expect_true("wmma_iu8", got[w * 256 + e] == static_cast<int>(ref[e]));
+}
 static void run_mem(const std::string& size) {
   const uint32_t n4 = 1u << 16, n = n4 * 4, reps = scale(size, 4, 40);
   std::vector<uint32_t> in(n), idx(n);
@@ -566,6 +875,13 @@ int main(int argc, char** argv) {
   else if (w == "valu_f32") run_valu_f32(size);
   else if (w == "valu_f64") run_valu_f64(size);
   else if (w == "mfma") run_mfma(size);
+  else if (w == "mfma_i8") run_mfma_i8(size);
+  else if (w == "mfma_fp8") run_mfma_fp8(size);
+  else if (w == "mfma_bf16") run_mfma_bf16(size);
+  else if (w == "mfma_f64") run_mfma_f64(size);
+  else if (w == "smfmac") run_smfmac(size);
+  else if (w == "wmma") run_wmma(size);
+  else if (w == "wmma_iu8") run_wmma_iu8(size);
   else if (w == "mem") run_mem(size);
   else if (w == "lds") run_lds(size);
   else if (w == "atomics") run_atomics(size);
