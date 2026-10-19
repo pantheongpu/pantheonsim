@@ -16,7 +16,7 @@ nvcc_bin="$(pick_nvcc_for_shim "$shim")"
 nvcc_host_compiler_fix
 trap 'rm -rf "$out"' EXIT
 read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
-"$nvcc_bin" -std=c++17 -w -cudart shared "${san_flags[@]}" "$root/nvidia/tests/e2e/exit_teardown.cu" -lcuda -o "$out/t" ||
+"$nvcc_bin" -std=c++17 -w -Wno-deprecated-gpu-targets -cudart shared "${san_flags[@]}" "$root/nvidia/tests/e2e/exit_teardown.cu" -lcuda -o "$out/t" ||
   { echo "FAIL: does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$out/t"; then exit 0; fi
 fails=0

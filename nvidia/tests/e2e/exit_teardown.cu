@@ -39,7 +39,7 @@ struct AtExit {
     cuCtxGetCurrent(&c);   // what main() made current, before anything is written here
     cuCtxSetCurrent(g_ctx);   // and what StringZilla's destructor does next
     const char* msg = c == g_ctx ? "exit-time: context kept\n" : "exit-time: context LOST\n";
-    const ssize_t n = write(1, msg, std::char_traits<char>::length(msg));
+    const ssize_t n = write(1, msg, __builtin_strlen(msg));
     (void)n;
     if (c != g_ctx) _exit(2);
   }
