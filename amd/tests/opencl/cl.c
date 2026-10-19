@@ -255,13 +255,10 @@ int main(void) {
       clReleaseMemObject(m1); clReleaseMemObject(m2);
     }
 
-    /* images, where the device has them (the MI300 family has no texture units) */
+    /* images, where the device has them (the MI300 family has no texture units; the MI250X does) */
     {
       cl_bool images = CL_FALSE;
       clGetDeviceInfo(devs[d], CL_DEVICE_IMAGE_SUPPORT, sizeof images, &images, NULL);
-      /* gfx9 image instructions (MIMG) are not implemented: a program is told the device has
-       * images, as MI250X does, and VGPU_CL_NO_IMAGES skips what it cannot yet do. */
-      if (getenv("VGPU_CL_NO_IMAGES") && getenv("VGPU_CL_NO_IMAGES")[0] == '1') images = CL_FALSE;
       if (images) {
         const int w = 24, h = 10;
         float src[24 * 10 * 4], dst[24 * 10 * 4];

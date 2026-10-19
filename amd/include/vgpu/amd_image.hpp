@@ -1,7 +1,8 @@
-// RDNA's image and sampler resources (T# and S#) and a formatted buffer's
-// resource (V#): what the runtime writes for a texture, a surface or a
-// sampler, and what the executor's image and formatted buffer instructions
-// read. The fields sit where AMD's RDNA ISA manuals put them wherever a
+// The image and sampler resources (T# and S#) and a formatted buffer's
+// resource (V#) of the GPUs with texture units -- RDNA and gfx90a (MI200) --
+// what the runtime writes for a texture, a surface or a sampler, and what the
+// executor's image and formatted buffer instructions read. The fields sit
+// where AMD's ISA manuals put them wherever a
 // kernel reads them itself (HIP's texture functions read the height from the
 // image resource's word 2 and two of the sampler's bits). A format is named
 // here as GCN names it, a data format (how the bits are laid out) and a
@@ -13,8 +14,10 @@
 namespace vgpu::amd::image {
 
 // Where the resources' fields sit differs by generation: RDNA2 (gfx10.3),
-// RDNA3 (gfx11) and RDNA4 (gfx12).
-enum class Gen : uint8_t { Gfx10, Gfx11, Gfx12 };
+// RDNA3 (gfx11) and RDNA4 (gfx12); and gfx9 (gfx90a, MI200), whose T# and V#
+// name a format as GCN does, a data format and a number format, rather than
+// by one code (Gfx9 has no code(); from_code gives no format).
+enum class Gen : uint8_t { Gfx10, Gfx11, Gfx12, Gfx9 };
 
 // GCN's data formats (BUF_DATA_FORMAT_*): the channels and their widths.
 enum class Data : uint8_t {
@@ -55,6 +58,7 @@ enum class Type : uint8_t { Img1D = 8, Img2D = 9, Img3D = 10, Cube = 11, Img1DAr
 // An image resource (T#), eight words. The texels are laid out linearly, row
 // by row: level 0 at the base, each later level after the one before it,
 // rows `pitch` texels apart at level 0 and as wide as the level after it.
+// (A gfx9 T# keeps the pitch of every shape; the others', of a 1D or 2D image.)
 struct Image {
   uint64_t base = 0;
   uint32_t width = 1, height = 1, depth = 1;   // depth: a 3D image's depth, an array's layers

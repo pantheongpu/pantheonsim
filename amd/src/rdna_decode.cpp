@@ -212,7 +212,9 @@ std::string exec_name(const std::string& name, Enc enc, bool dpp) {
   // older instructions they replaced did not: they keep their own names, and the executor has them.
   static const std::set<std::string> kOwnNames = {
       "v_min3_num_f32", "v_max3_num_f32", "v_minmax_num_f32", "v_maxmin_num_f32", "v_med3_num_f32",
-      "v_min3_num_f16", "v_max3_num_f16", "v_minmax_num_f16", "v_maxmin_num_f16", "v_med3_num_f16"};
+      "v_min3_num_f16", "v_max3_num_f16", "v_minmax_num_f16", "v_maxmin_num_f16", "v_med3_num_f16",
+      // (gfx942's v_cvt_rpi_i32_f32 is now a gfx9 name too, and the specification's alias would send this one to it)
+      "v_cvt_nearest_i32_f32"};
   const bool own = g_cdna5 && kOwnNames.count(name);
   std::vector<std::string> candidates;
   if (const auto it = kRenamed.find(name); it != kRenamed.end()) candidates.push_back(it->second);
@@ -1216,6 +1218,8 @@ std::string reg_text(const Operand& o) {
     case OperandKind::Ttmp: return range("ttmp");
     case OperandKind::Null: return "null";
     case OperandKind::Scc: return "src_scc";
+    case OperandKind::Vccz: return "src_vccz";
+    case OperandKind::Execz: return "src_execz";
     case OperandKind::SharedLimit: return "src_shared_limit";
     case OperandKind::PrivateLimit: return "src_private_limit";
     default: return operand_text(o);

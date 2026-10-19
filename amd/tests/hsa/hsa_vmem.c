@@ -144,6 +144,22 @@ int main(void) {
         hsa_amd_ipc_memory_attach(&bad, 4096, 1, &gpu, &nothing) != HSA_STATUS_SUCCESS);
   MUST(hsa_amd_memory_pool_free(buf));
 
+  /* A big buffer is placed on the largest power of two up to a 2 MiB huge page that it holds twice or more
+   * (ROCT-Thunk-Interface's fmm.c, which ROCm's runtime allocates through): ROCm's CLR counts on a 2 MiB buffer
+   * being 2 MiB-aligned, because the device library's malloc finds a slab by masking an address. */
+  void *odd = NULL, *two = NULL, *eight = NULL, *sixteen_k = NULL;
+  MUST(hsa_amd_memory_pool_allocate(pool, 4096 + 256, 0, &odd));
+  MUST(hsa_amd_memory_pool_allocate(pool, 16384, 0, &sixteen_k));
+  MUST(hsa_amd_memory_pool_allocate(pool, 2u << 20, 0, &two));
+  MUST(hsa_amd_memory_pool_allocate(pool, 8u << 20, 0, &eight));
+  check("device buffers of 16 KiB, 2 MiB and 8 MiB start on 16 KiB, 2 MiB and 2 MiB",
+        ((uintptr_t)sixteen_k & 16383) == 0 && ((uintptr_t)two & ((2u << 20) - 1)) == 0 &&
+            ((uintptr_t)eight & ((2u << 20) - 1)) == 0);
+  MUST(hsa_amd_memory_pool_free(eight));
+  MUST(hsa_amd_memory_pool_free(two));
+  MUST(hsa_amd_memory_pool_free(sixteen_k));
+  MUST(hsa_amd_memory_pool_free(odd));
+
   /* SVM: host pages given to the GPU, advised, queried and prefetched. */
   bool svm = false;
   MUST(hsa_system_get_info((hsa_system_info_t)HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED, &svm));

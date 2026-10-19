@@ -302,10 +302,12 @@ jobs:
 
       - name: Install ollama
         run: |
-          mkdir -p "$RUNNER_TEMP/ollama"
+          # A directory of its own: on a runner that lasts, the last job left root-owned files in a fixed one, and tar
+          # could neither replace them nor set their times ("Cannot utime", "File exists").
+          ollama_dir="$(mktemp -d "$RUNNER_TEMP/ollama.XXXXXX")"
           wget -qO- "https://github.com/ollama/ollama/releases/download/$OLLAMA_VERSION/ollama-linux-amd64.tar.zst" |
-            zstd -d | tar -x -C "$RUNNER_TEMP/ollama"
-          echo "$RUNNER_TEMP/ollama/bin" >> "$GITHUB_PATH"
+            zstd -d | tar -x -C "$ollama_dir"
+          echo "$ollama_dir/bin" >> "$GITHUB_PATH"
 
       - name: Build VirtualGPU
         run: |
@@ -381,14 +383,16 @@ jobs:
         run: |
           sudo flock /tmp/pool-apt.lock apt-get update -qq
           sudo flock /tmp/pool-apt.lock apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates zstd
-          mkdir -p "$RUNNER_TEMP/ollama"
+          # A directory of its own: on a runner that lasts, the last job left root-owned files in a fixed one, and tar
+          # could neither replace them nor set their times ("Cannot utime", "File exists").
+          ollama_dir="$(mktemp -d "$RUNNER_TEMP/ollama.XXXXXX")"
           for t in ollama-linux-amd64.tar.zst ollama-linux-amd64-rocm.tar.zst; do
             wget -qO- "https://github.com/ollama/ollama/releases/download/$OLLAMA_VERSION/$t" |
-              zstd -d | tar -x -C "$RUNNER_TEMP/ollama"
+              zstd -d | tar -x -C "$ollama_dir"
           done
           # Its CUDA backends are not needed here.
-          rm -rf "$RUNNER_TEMP"/ollama/lib/ollama/cuda_* "$RUNNER_TEMP"/ollama/lib/ollama/mlx_*
-          echo "$RUNNER_TEMP/ollama/bin" >> "$GITHUB_PATH"
+          rm -rf "$ollama_dir"/lib/ollama/cuda_* "$ollama_dir"/lib/ollama/mlx_*
+          echo "$ollama_dir/bin" >> "$GITHUB_PATH"
 
       - name: Build VirtualGPU's HIP runtime
         run: |
@@ -544,8 +548,9 @@ jobs:
         # with the reason it cannot run on this machine: a skip that nobody
         # chose is a test that silently stopped running. Allowed now:
         #   e2e_nvprof           nvprof ships only up to CUDA 12; this shim is 13.
-        #   amd_rocprofiler_abi, amd_rocprofv3
+        #   amd_rocprofiler_abi, amd_rocprofv3, amd_rocprofiler_pcsampling
         #                        the image's ROCm has no rocprofiler-sdk (yet).
+        #   amd_rvs              the image's ROCm has no rocm-validation-suite (yet).
         #   e2e_jit_frameworks   numba and triton are not in the image (yet).
         #   e2e_nvshmem_device   NVIDIA's NVSHMEM (headers, libnvshmem_device.a)
         #                        is not in the image (yet); NVSHMEM_HOME or the
@@ -578,11 +583,11 @@ jobs:
         # them here when they are.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones)$'
+          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|amd_rocprofiler_pcsampling|amd_rvs)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 4 -m 2)" \
-            -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm|e2e_pytorch_sweep_full|e2e_pytorch_dist_full)$' \
+            -E '^(pantheon_workloads|.*ollama.*|e2e_cutlass.*|e2e_.*cute.*|e2e_tma.*|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*|amd_vllm.*|e2e_pytorch_sweep_full|e2e_pytorch_dist_full)$' \
             2>&1 | tee rest.log
           skipped=$(grep -oE 'Test +#[0-9]+: [A-Za-z0-9_]+ \.+\*\*\*(Skipped|Not Run)' rest.log \
                     | sed -E 's/Test +#[0-9]+: ([A-Za-z0-9_]+).*/\1/' || true)

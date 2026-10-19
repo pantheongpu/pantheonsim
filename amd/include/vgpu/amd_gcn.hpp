@@ -33,7 +33,7 @@ const char* enc_name(Enc e);
 // apertures' limits beside their bases.
 enum class OperandKind {
   Sgpr, Vgpr, Agpr, Vcc, VccHi, Exec, ExecLo, ExecHi, M0, SharedBase, PrivateBase, FlatScratchLo, FlatScratchHi, Inline, InlineFloat, Literal,
-  Ttmp, Null, Scc, SharedLimit, PrivateLimit, None
+  Ttmp, Null, Scc, SharedLimit, PrivateLimit, Vccz, Execz, None
 };
 struct Operand {
   OperandKind kind = OperandKind::None;
@@ -107,6 +107,10 @@ struct Inst {
   uint32_t saddr = 0;            // a global_* instruction's scalar base, when it has one
   bool has_saddr = false;
   bool has_vaddr = true;         // a scratch_* instruction may address by offset alone
+  // CDNA's MUBUF load with the LDS bit set: its data goes to LDS, at M0 and the
+  // offset, not to a register, so it has no data operand (the sources are the
+  // address register, the resource and the scalar offset).
+  bool lds_dma = false;
   // Which of the one address space a memory instruction reaches: flat (the
   // address decides), global, or a work-item's private memory.
   enum class Segment { Flat, Scratch, Global } segment = Segment::Global;
@@ -205,6 +209,10 @@ struct Inst {
   // and where a load's lands), then each address, then the resource and,
   // for a sample, the sampler; dst[0] the data, when the instruction returns
   // any.
+  // gfx90a's MIMG has no DIM: the resource's TYPE says the shape, and DA
+  // (da) says whether the kernel passes an array index (the executor works the
+  // dimension out, and how many address registers there are, from the T#).
+  bool da = false;
   uint8_t dmask = 0, dim = 0;
   bool unorm = false, a16 = false, d16 = false, tfe = false, lwe = false, r128 = false, nsa = false;
   std::vector<Inst> dual;

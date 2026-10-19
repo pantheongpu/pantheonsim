@@ -85,6 +85,39 @@ expect "the copies go the way the program sends them" "MEMORY_COPY_HOST_TO_DEVIC
 expect "the GPU agent is the MI300X the session simulates" "gfx942 AMD Instinct MI300X 304" \
   "$(python3 -c "import csv,sys; r=[r for r in csv.DictReader(open(sys.argv[1])) if r['Agent_Type']=='GPU'][0]; print(r['Name'], r['Product_Name'], r['Cu_Count'])" "$agents")"
 
+# PC sampling: the host-trap method, in instructions (there is no clock to
+# sample on, so rocprofv3's --pc-sampling-unit time is refused). rocprofv3 turns
+# each sample's program counter into the instruction at it from the code object
+# it was told of. pcsampling.gfx942's spin kernel issues 80015 instructions a
+# wave (see run_rocprofiler_pcsampling.sh), so four waves sampled every 10000 give
+# nine samples each: the kernel's first instruction, an s_load_dword, and eight
+# of the loop's closing branch.
+pcexe="$root/amd/tests/hipcc/pcsampling.gfx942"
+timeout 300 "$vgpu" shell -y --gpu amd/mi300x --count 1 -c \
+  "rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method host_trap --pc-sampling-unit instructions \
+     --pc-sampling-interval 10000 --output-format csv -d '$work/pcs' -- '$pcexe'" </dev/null >"$work/pcs.log" 2>&1
+pcs=$(find "$work/pcs" -name '*_pc_sampling_host_trap.csv' | head -1)
+expect "rocprofv3 samples a kernel's waves by instructions, and the program is right" "spin wrong 0 of 256" \
+  "$(grep -o 'spin wrong .*' "$work/pcs.log")"
+expect "it writes the samples" "yes" "$([[ -s "$pcs" ]] && echo yes || echo no)"
+if [[ -s "$pcs" ]]; then
+  expect "nine samples for each of four waves, each the instruction at the sampled program counter" \
+    "4 s_load_dword|32 s_cbranch_scc0" \
+    "$(python3 -c "
+import csv, collections, sys
+c = collections.Counter(r['Instruction'].split()[0] for r in csv.DictReader(open(sys.argv[1])))
+print('|'.join('%d %s' % (n, k) for k, n in sorted(c.items(), key=lambda kv: kv[1])))" "$pcs")"
+  expect "every lane was on" "1" \
+    "$(python3 -c "
+import csv, sys
+print(len({r['Exec_Mask'] for r in csv.DictReader(open(sys.argv[1]))}))" "$pcs")"
+fi
+timeout 300 "$vgpu" shell -y --gpu amd/mi300x --count 1 -c \
+  "rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method host_trap --pc-sampling-unit time \
+     --pc-sampling-interval 1000 --output-format csv -d '$work/pcs_time' -- '$pcexe'" </dev/null >"$work/pcs_time.log" 2>&1
+expect "and in time, which would need a clock, it is told the device cannot" "yes" \
+  "$(grep -q 'PC sampling configuration is not supported on any of the agents' "$work/pcs_time.log" && echo yes || echo no)"
+
 # rocprofv3-avail lists what a device counts, which is how a tool learns what
 # to ask for; it finds VirtualGPU's library through the session's own path.
 avail=$(timeout 120 "$vgpu" shell -y --gpu amd/mi300x --count 1 -c "rocprofv3-avail list --pmc" </dev/null 2>/dev/null)

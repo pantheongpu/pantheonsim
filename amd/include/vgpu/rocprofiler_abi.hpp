@@ -916,5 +916,88 @@ typedef struct roctxNameApiTable_t {
   int (*roctxNameHipDevice_fn)(const char* name, int device_id);
   int (*roctxNameHipStream_fn)(const char* name, const void* stream);
 } roctxNameApiTable_t;
+// ---- pc_sampling.h ------------------------------------------------------------
+//
+// Host-trap PC sampling only: the stochastic method's record (hardware arbiter
+// and stall state, which the simulator does not have) is not declared.
+
+typedef enum rocprofiler_pc_sampling_method_t {
+  ROCPROFILER_PC_SAMPLING_METHOD_NONE = 0,
+  ROCPROFILER_PC_SAMPLING_METHOD_STOCHASTIC,
+  ROCPROFILER_PC_SAMPLING_METHOD_HOST_TRAP,
+  ROCPROFILER_PC_SAMPLING_METHOD_LAST,
+} rocprofiler_pc_sampling_method_t;
+
+typedef enum rocprofiler_pc_sampling_unit_t {
+  ROCPROFILER_PC_SAMPLING_UNIT_NONE = 0,
+  ROCPROFILER_PC_SAMPLING_UNIT_INSTRUCTIONS,
+  ROCPROFILER_PC_SAMPLING_UNIT_CYCLES,
+  ROCPROFILER_PC_SAMPLING_UNIT_TIME,
+  ROCPROFILER_PC_SAMPLING_UNIT_LAST,
+} rocprofiler_pc_sampling_unit_t;
+
+typedef enum rocprofiler_pc_sampling_record_kind_t {
+  ROCPROFILER_PC_SAMPLING_RECORD_NONE = 0,
+  ROCPROFILER_PC_SAMPLING_RECORD_INVALID_SAMPLE,
+  ROCPROFILER_PC_SAMPLING_RECORD_HOST_TRAP_V0_SAMPLE,
+  ROCPROFILER_PC_SAMPLING_RECORD_STOCHASTIC_V0_SAMPLE,
+  ROCPROFILER_PC_SAMPLING_RECORD_LAST,
+} rocprofiler_pc_sampling_record_kind_t;
+
+typedef enum rocprofiler_pc_sampling_configuration_flags_t {
+  ROCPROFILER_PC_SAMPLING_CONFIGURATION_FLAGS_NONE = 0,
+  ROCPROFILER_PC_SAMPLING_CONFIGURATION_FLAGS_INTERVAL_POW2,
+  ROCPROFILER_PC_SAMPLING_CONFIGURATION_FLAGS_LAST,
+} rocprofiler_pc_sampling_configuration_flags_t;
+
+typedef struct rocprofiler_pc_sampling_configuration_t {
+  uint64_t size;
+  rocprofiler_pc_sampling_method_t method;
+  rocprofiler_pc_sampling_unit_t unit;
+  size_t min_interval;
+  size_t max_interval;
+  uint64_t flags;
+} rocprofiler_pc_sampling_configuration_t;
+
+typedef rocprofiler_status_t (*rocprofiler_available_pc_sampling_configurations_cb_t)(
+    const rocprofiler_pc_sampling_configuration_t* configs, size_t num_config, void* user_data);
+
+typedef struct rocprofiler_pc_sampling_hw_id_v0_t {
+  uint64_t chiplet : 6;
+  uint64_t wave_id : 7;
+  uint64_t simd_id : 2;
+  uint64_t pipe_id : 4;
+  uint64_t cu_or_wgp_id : 4;
+  uint64_t shader_array_id : 1;
+  uint64_t shader_engine_id : 5;
+  uint64_t workgroup_id : 7;
+  uint64_t vm_id : 6;
+  uint64_t queue_id : 4;
+  uint64_t microengine_id : 2;
+  uint64_t reserved0 : 16;
+} rocprofiler_pc_sampling_hw_id_v0_t;
+
+typedef struct rocprofiler_pc_t {
+  uint64_t code_object_id;
+  uint64_t code_object_offset;
+} rocprofiler_pc_t;
+
+typedef struct rocprofiler_pc_sampling_record_host_trap_v0_t {
+  uint64_t size;
+  rocprofiler_pc_sampling_hw_id_v0_t hw_id;
+  rocprofiler_pc_t pc;
+  uint64_t exec_mask;
+  uint64_t timestamp;
+  uint64_t dispatch_id;
+  rocprofiler_async_correlation_id_t correlation_id;
+  rocprofiler_dim3_t workgroup_id;
+  uint32_t wave_in_group : 8;
+  uint32_t reserved0 : 24;
+} rocprofiler_pc_sampling_record_host_trap_v0_t;
+
+typedef struct rocprofiler_pc_sampling_record_invalid_t {
+  uint64_t size;
+} rocprofiler_pc_sampling_record_invalid_t;
+
 
 }  // namespace vgpu::amd::rocprof
