@@ -24,8 +24,8 @@ n -c -gencode arch=compute_80,code=sm_80 -gencode arch=compute_90,code=sm_90 -ge
   "$src/base.cu" -o "$out/base.o" &&
 n -c -gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90 "$src/hopper.cu" -o "$out/hopper.o" &&
 n -c "$src/main.cu" -o "$out/main.o" -gencode arch=compute_80,code=sm_80 &&
-n "$out/main.o" "$out/base.o" "$out/hopper.o" -o "$out/hopper_last" &&
-n "$out/main.o" "$out/hopper.o" "$out/base.o" -o "$out/hopper_first" ||
+n "$out/main.o" "$out/base.o" "$out/hopper.o" -lcuda -o "$out/hopper_last" &&
+n "$out/main.o" "$out/hopper.o" "$out/base.o" -lcuda -o "$out/hopper_first" ||
   { echo "FAIL: does not compile"; exit 1; }
 if ! require_shim_libs "$shim" "$out/hopper_last"; then exit 0; fi
 fails=0
@@ -36,7 +36,7 @@ for spec in "nvidia/a100 80" "nvidia/l4 89" "nvidia/h100 90"; do
     log="$(VGPU_QUIET=1 VGPU_GPU=$gpu LD_LIBRARY_PATH="$shim" "$out/$order" "$cc" 2>&1)"
     rc=$?
     if [[ $rc != 0 || "$(tail -n 1 <<< "$log")" != PASS ]]; then
-      echo "$log" | sed "s/^/    $gpu $order: /"
+      echo "$log" | sed "s|^|    $gpu $order: |"
       echo "FAIL: $gpu, $order"; fails=1
     else
       echo "ok   $gpu $order"

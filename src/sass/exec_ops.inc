@@ -775,6 +775,12 @@ void Runner::exec_int(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             int32_t m = mn ? std::min({part(a), part(b), part(c)}) : std::max({part(a), part(b), part(c)});
             if (ins.f[2] && m < 0) m = 0;   // .RELU: a negative lane becomes 0
             r |= (static_cast<uint32_t>(m) & mask) << (bits * h);
+            // The packed minimum or maximum that also reports its choice: dst[1] for the low half, dst[2] for
+            // the high one (__vibmax_s16x2: a >= b, __vibmin_s16x2: a <= b), PT where it is not wanted.
+            if (ins.dst.size() == 3 && lanes == 2) {
+              const bool chose_a = mn ? part(a) <= part(b) : part(a) >= part(b);
+              set_pred(w, ins.dst[1 + h], l, chose_a);
+            }
           }
           write32(w, ins.dst[0], l, r);
         }

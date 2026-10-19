@@ -7,6 +7,7 @@
 //   cudaErrorNoKernelImageForDevice from cudaGetFuncBySymbol and from the launch -- not an invalid-PTX error.
 #include <cstdio>
 #include <cstdlib>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include "kernel.cuh"
 
@@ -23,6 +24,7 @@ static cudaError_t launch(const void* stub, int* out) {
 
 int main(int argc, char** argv) {
   const int cc = argc > 1 ? std::atoi(argv[1]) : 90;
+  cuInit(0);   // cudaGetFuncBySymbol hands back a driver CUfunction: the driver library has to be loaded
   int* out = nullptr;
   cudaMalloc(&out, 32 * sizeof(int));
   const void* shared_a = base_stub_shared();

@@ -1763,6 +1763,13 @@ void dec_vimnmx(Instr& ins, const Word& w, int nsrc, bool add) {
   if (ins.sm >= 100 && ins.sm < 120 && !add && nsrc == 2) {   // sm_100 prints two predicate results (PT so far)
     ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
     ins.dst.push_back(P(static_cast<unsigned>(w.field(84, 3))));
+  } else if (ins.sm >= 90 && ins.sm < 100 && s16x2 && !add && nsrc == 2 &&
+             (w.field(81, 3) != 7 || w.field(84, 3) != 7)) {
+    // sm_90: the packed min/max also says, per half, which operand it chose -- true for the low half in the
+    // first predicate, the high half in the second: a >= b for a maximum, a <= b for a minimum. This is what
+    // __vibmax_s16x2 and __vibmin_u16x2 return through their pred_lo and pred_hi. PT discards one.
+    ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
+    ins.dst.push_back(P(static_cast<unsigned>(w.field(84, 3))));
   }
   // VIMNMX prints a signed immediate as signed; the others print the bits.
   const ImmStyle imm = !add && nsrc == 2 ? kSigned : kUnsigned;
