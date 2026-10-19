@@ -2138,7 +2138,7 @@ user-namespace steps, which fail for the host, not the change), `bench_amd_count
 
 * The `std::optional<Inst>` change (X4) and the cached hash (X5) are negative results and stay out; X1 and X6 are inconclusive or small.
 * Loops over 64 lanes with a mask test (wave32 pays for 32 masked lanes), `ctz` lane iteration: not measured.
-* RDNA3/4 `v_wmma_*`, other MFMA shapes, gfx1250: not timed; one RDNA part only (RDNA2).
+* RDNA3/4 `v_wmma_*`, other MFMA shapes, gfx1250: not timed here; see "The AMD matrix instructions, every form" (branch `speedup4-amdmatrix`).
 * The effect of any ranked change on pantheon, PyTorch or rocBLAS workloads; those spend more time in
   `matrix_multiply`, the memory manager and `lds_access` than these microbenchmarks.
 * Host hardware counters (no PMU access here).
@@ -2592,3 +2592,160 @@ valu_f64 1.9 / 2.5x, mfma 2.4x, mem 1.8 / 2.2x, lds 2.9 / 2.8x, atomics 1.8 / 2.
 `test_amd_gcn_same_bits` (15,566 instruction shapes against digests recorded from the unmodified base) is the guard on all of the AMD
 changes: the first merge failed it on 65 MFMA shapes (a different NaN payload when both operands are NaNs) and the fix keeps the fast loops
 and recomputes only NaN results in the base's operand order.
+
+## The AMD matrix instructions, every form (branch `speedup4-amdmatrix`)
+
+The first rewrite of `matrix_multiply` (`speedup2-amdmem`) covered binary16 inputs into float accumulators on CDNA. This one measures what
+each other matrix form costs per instruction, and speeds the forms that cost most: integer and 8-bit-float MFMA, bfloat16, float, xf32,
+double and sparse (`v_smfmac_*`) MFMA, the gfx950 f8f6f4 and block-scaled forms, RDNA3/4 `v_wmma_*`, and gfx1250's `v_wmma_*` /
+`v_swmmac_*`. Results are bit for bit what they were: the guard is `test_amd_gcn_same_bits` (digests recorded from f81cc0c1: 16,304 shapes,
+the base's 15,566 and 738 new ones that cover every matrix form), plus the new old-vs-new test below.
+
+Measured on server2 (Ryzen 9 9950X, shared; load average 2 to 14 during the runs), Release, GCC 13.3, simulated MI300X, RX 7900 XTX and
+RX 9070 XT, one host thread, CPUs 24-31 for the harness (under `flock /tmp/speedup-bench.lock`), 20-21 for the per-instruction probe.
+
+### What each form cost (before)
+
+`amd_matrix_bench` (new, `amd/tools/matrix-bench.cpp`) runs one instruction of the ISA corpora over and over on a wave whose registers hold
+small finite numbers (`time_instruction`, flavour 4 of the same-bits probe), and prints nanoseconds. Median over the operand variants of
+a mnemonic (`amd/tests/data/isa_corpus_matrix_*.txt` holds several per mnemonic: registers and accumulation registers, constants for C,
+`cbsz`/`abid`, `neg_lo`, `clamp`), 3 alternating runs of base and new, 150 iterations each:
+
+| instruction | before ns | after ns | |
+| --- | ---: | ---: | ---: |
+| `v_mfma_f32_16x16x16_f16` (gfx942) | 1776 | 582 | 3.0x |
+| `v_mfma_f32_32x32x8_f16` | 4209 | 1178 | 3.6x |
+| `v_mfma_f32_16x16x16_bf16` | 2148 | 489 | 4.4x |
+| `v_mfma_f32_32x32x8_bf16` | 4747 | 1092 | 4.3x |
+| `v_mfma_f32_16x16x4_f32` | 1136 | 348 | 3.3x |
+| `v_mfma_f32_32x32x2_f32` | 3346 | 875 | 3.8x |
+| `v_mfma_f32_16x16x8_xf32` | 1547 | 401 | 3.9x |
+| `v_mfma_f64_16x16x4_f64` | 2490 | 654 | 3.8x |
+| `v_mfma_i32_16x16x32_i8` | 5223 | 893 | 5.8x |
+| `v_mfma_i32_32x32x16_i8` | 10660 | 1343 | 7.9x |
+| `v_mfma_f32_16x16x32_fp8_fp8` | 7609 | 1133 | 6.7x |
+| `v_mfma_f32_32x32x16_fp8_fp8` | 10530 | 1855 | 5.7x |
+| `v_smfmac_f32_16x16x32_f16` | 3223 | 1057 | 3.0x |
+| `v_smfmac_i32_16x16x64_i8` | 8454 | 1524 | 5.5x |
+| `v_smfmac_f32_16x16x64_fp8_fp8` | 11218 | 1696 | 6.6x |
+| `v_mfma_f32_16x16x128_f8f6f4` (gfx950) | 25121 | 3387 | 7.4x |
+| `v_mfma_f32_32x32x64_f8f6f4` | 29822 | 4785 | 6.2x |
+| `v_mfma_scale_f32_32x32x64_f8f6f4` | 31101 | 6116 | 5.1x |
+| `v_wmma_f32_16x16x16_f16` (gfx1100) | 33172 | 1242 | 26.7x |
+| `v_wmma_f16_16x16x16_f16` | 34596 | 2988 | 11.6x |
+| `v_wmma_f32_16x16x16_bf16` | 10496 | 1434 | 7.3x |
+| `v_wmma_i32_16x16x16_iu8` | 15105 | 1385 | 10.9x |
+| `v_wmma_i32_16x16x16_iu4` | 16440 | 1556 | 10.6x |
+| `v_wmma_f32_16x16x16_f16` (gfx1201) | 34113 | 1262 | 27.0x |
+| `v_wmma_f32_16x16x16_fp8_fp8` | 38463 | 2192 | 17.6x |
+| `v_wmma_i32_16x16x16_iu8` | 16198 | 2185 | 7.4x |
+| `v_wmma_i32_16x16x32_iu4` | 31470 | 3422 | 9.2x |
+| `v_wmma_f32_32x16x128_f4` (gfx1250, 20 iterations) | 783952 | 56200 | 13.9x |
+| `v_wmma_f32_16x16x128_f8f6f4` (gfx1250) | 277056 | 25570 | 10.8x |
+| `v_wmma_f32_16x16x32_f16` (gfx1250) | 81358 | 7956 | 10.2x |
+| `v_wmma_i32_16x16x64_iu8` (gfx1250) | 63663 | 7272 | 8.8x |
+| `v_swmmac_f32_16x16x64_f16` (gfx1250) | 89051 | 11309 | 7.9x |
+
+The ranking before: RDNA `v_wmma_*` at 10 to 40 us an instruction was ten times anything else (it compared the type's name, as a
+`std::string`, for each of the 2 x 16 x 16 x 16 element reads); the gfx1250 forms at 60 us to 0.8 ms were beyond that; then the 8-bit
+float and integer MFMA and the sparse ones at 5 to 30 us (an element decoded by a chain of `type ==` tests, an `ldexp` for each 8-bit
+float, a double for each integer); then the binary16, bfloat16 and float forms at 1 to 5 us. (The probe's numbers wobble by a few
+percent with the load and the operand variants: variants whose destination overlaps a source turn the data into NaNs and infinities
+after a few hundred repetitions, and the NaN redo costs the same before and after.)
+
+### What changed
+
+* **A tile at a time** (`matrix_multiply_fast`, `wmma_fast`; `matrix_multiply` and `wmma` keep the old element-at-a-time code as
+  `matrix_multiply_reference` / `wmma_reference`, used for anything the fast path does not take: operands that are not registers,
+  registers beyond the file, a sparse form whose A is not in registers). Each operand is decoded once, with its type fixed at compile time
+  (`matrix_elem<T>`, `matrix_decode_a/b`): A into rows of K, B into rows of K by column, C into the tile; the 8-, 6- and 4-bit floats by
+  a 256-entry table built from `f8_to_float` itself; then the whole tile is summed (`mfma_tile_f`, `mfma_tile_fma`, `mfma_tile_int` in
+  `amd/src/mfma_math.hpp`) and written back through the shape's place table.
+* **The sums**: every output is still a double sum of its products taken in order of k from the accumulator, rounded once to float, so the
+  bits are those of `mfma_dot`; what changed is that 4 rows x 4 columns (SSE2, 2-wide) or 4 x 8 (AVX2, 4-wide, chosen at run time by
+  `__builtin_cpu_supports`; no fused multiply-add, so each product and each sum is rounded as before) are worked out together,
+  and A's scalars are broadcast against a row of B. A sum that ends as a NaN is redone in the fixed operand order of last round
+  (`mfma_tile_ordered`), so NaN payloads are what they were. The double-precision forms use one hardware `fma` a term (`target("fma")`,
+  chosen at run time) with the same redo. Integer forms are exact: int16 tiles and `pmaddwd` (SSE2) or `vpmaddwd` (AVX2), four rows by
+  4 or 8 columns; the accumulator is added afterwards (wrap for MFMA, saturate for WMMA with CLAMP).
+* **Widening**: binary16 operands go to doubles four lanes at a time (`half4_to_double`, in float: a rebias and a shift, the subnormals as
+  mantissa x 2^-24, the NaN payload kept; exhaustively equal to the compiler's conversion for all 65,536 values), bfloat16, float and xf32
+  by a shift or mask and `cvtps2pd`; integer tiles are filled from the register bytes without going through doubles. The scalar
+  `half_bits_to_double` cost 1.8 ns a value, 512 of them 0.9 us of a 16x16x16 MFMA's 1.8 us.
+* **RDNA3/4 `v_wmma_*`** (`wmma_fast`): the old code looked up the element type by comparing `std::string`s for every one of the
+  2 x 16 x 16 x K element reads; now A (16 x K) and B (K x 16) are decoded once and summed as a 16 x 16 x K tile.
+* **gfx1250 `v_wmma_*` / `v_swmmac_*`** (`wmma1250`): the matrices are decoded once (`adec`, `bdec`), each block of K (the whole of it, or
+  one scale's 16 or 32) is summed as a tile, and the scale and the accumulator are applied to the block sums exactly as before.
+* **Operand order of the NaN rule, made explicit.** Where two operands of an x86 add or multiply are NaNs the first one's payload wins and the
+  compiler chooses which is first; three places depended on that choice and now spell it out, each matched to the recorded digests:
+  the MFMA dot (B first of the multiply, the sum first of the add, last round); the WMMA dot (`WMMA_ORDER` 2: B first of the multiply,
+  the product first of the add: found by trying all four against the digests: no digest wrong for 2, 19 to 79 wrong for each of the others); and
+  the double-precision fma (`mfma_fma`: the first NaN of B, A, the sum, quieted). The last was found by a unit test: two copies of the
+  same loop in one translation unit (`mfma_dot_fma` and the new tile code) gave different payloads for `fma(NaN, NaN, NaN)`, because
+  GCC swaps the first two operands of `fma` freely. The reference code uses the same functions, so it cannot drift either.
+
+### Results
+
+`tools/bench-amd/bench.sh --build <base> --build <new> --threads 1 --size full --runs 9 --cpus 24-31 --no-counts`, base = f81cc0c1 (plus the
+probe), new = this branch; ratio = B/A of the median (the best-of ratio agrees within 2% in every row); without the counting runs (rocprofv3
+wrote no counter CSV here) the harness takes the count as 1 and the ratios are the ratios of the speeds; the work is identical (the
+tests below are the evidence that bits and counts do not move). `mfma` is the existing workload; the other seven are new (`tools/bench-amd/kernels/bench_amd.hip`, `run_mfma_i8` ... `run_wmma_iu8`: each
+self-checks `D = n x (A x B)` for small integers against the host, bit for bit, and fails the run otherwise); the RDNA targets are the new
+`rx7900xtx` and `rx9070xt`, which the default `--target` (mi300x and rx6800) does not include.
+
+| workload | target | what it runs | A cpu s | B cpu s | B/A median | B/A best | p | spread A / B |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| mfma | mi300x | `v_mfma_f32_16x16x16_f16` (existing) | 0.910 | 0.358 | **2.54x** | 2.55x | < 0.001 | 1 / 3% |
+| mfma_i8 | mi300x | `v_mfma_i32_16x16x32_i8` | 1.213 | 0.246 | **4.93x** | 4.99x | < 0.001 | 2 / 4% |
+| mfma_fp8 | mi300x | `v_mfma_f32_16x16x32_fp8_fp8` | 2.050 | 0.314 | **6.53x** | 6.59x | < 0.001 | 46 / 66% |
+| mfma_bf16 | mi300x | `v_mfma_f32_16x16x16_bf16` | 0.978 | 0.316 | **3.09x** | 3.09x | < 0.001 | 1 / 4% |
+| mfma_f64 | mi300x | `v_mfma_f64_16x16x4_f64` | 1.312 | 0.395 | **3.32x** | 2.91x | < 0.001 | 43 / 115% |
+| smfmac | mi300x | `v_smfmac_f32_16x16x32_f16` | 0.864 | 0.298 | **2.90x** | 2.93x | < 0.001 | 19 / 79% |
+| wmma | rx7900xtx | `v_wmma_f32_16x16x16_f16` | 8.689 | 0.360 | **24.2x** | 24.3x | < 0.001 | 7 / 89% |
+| wmma | rx9070xt | `v_wmma_f32_16x16x16_f16` | 9.581 | 0.345 | **27.7x** | 26.2x | < 0.001 | 10 / 80% |
+| wmma_iu8 | rx7900xtx | `v_wmma_i32_16x16x16_iu8` | 6.124 | 0.711 | **8.61x** | 9.42x | < 0.001 | 32 / 36% |
+| wmma_iu8 | rx9070xt | `v_wmma_i32_16x16x16_iu8` | 4.482 | 0.571 | **7.84x** | 6.92x | < 0.001 | 51 / 54% |
+
+Final tree, 9 alternating runs, size full (64 waves, 4,000 to 8,000 instructions each), 1-minute load average before each workload 1.6 to
+31.9 (median 4.0: other people's builds arrived during the f64 to iu8 rows, which is where the spreads are large; the ratios are
+across alternating runs, so they carry the load of both builds alike). An earlier run of the same A/B on the tree before the
+vector widening (lower load, 1.9 to 6.0, spreads 1 to 3% except bf16 and the RX 9070 XT's `wmma`) gave `mfma` 1.50x, `mfma_i8` 4.83x, `mfma_fp8` 6.56x,
+`mfma_bf16` 2.22x, `mfma_f64` 3.17x, `smfmac` 2.03x, `wmma` 19.5x / 14.4x, `wmma_iu8` 8.94x / 6.78x, all p < 0.001, which shows what the widening
+(`half4_to_double`, `cvtps2pd`) added: 1.5x to 2.5x on `mfma`, 2.2x to 3.1x on `mfma_bf16`, 2.0x to 2.9x on `smfmac`. The counters are identical in every row
+(the harness compares the two builds' counts only with the counting runs, which are unavailable here; `test_amd_matrix_fast` compares
+`DispatchStats` and every counter through the digest instead).
+
+### Tests
+
+All wired into CMake; each was shown to fail on a scratch copy when the code is wrong (mutation checks, server2):
+
+| test | what it holds | mutations that fail it |
+| --- | --- | --- |
+| `test_amd_gcn_same_bits` (extended: four new MFMA/WMMA corpora and gfx1250's, `VGPU_SAME_BITS_REFERENCE=1` runs the reference path) | 738 more shapes (`amd/tests/data/isa_corpus_matrix_*.txt`, written by `amd/tools/matrix-asm.py`: every MFMA, SMFMAC and WMMA form of gfx942, gfx950, gfx1100, gfx1201 and gfx1250 in several operand variants), digests recorded from f81cc0c1 with the probe only; the 15,574 earlier digests are unchanged (the file is the base's plus the appended sections); passes on the tile path and on the reference path | k terms in reverse order (AVX2 kernel); NaN redo removed; wrong NaN operand order; fma NaN priority A first; integer pairs swapped; AVX2 kernel drops a row; fp8 table of the wrong format; sparse index set ignored; gfx12 WMMA half of K swapped; constant C ignored; A and B scales swapped; gfx1250 block offset ignored; gfx1250 sparse A not expanded; binary16 infinity exponent; subnormal scale; B step; xf32 mask; bfloat16 half; int8 sign; WMMA binary16 tile transposed |
+| `test_amd_matrix_fast` (new) | every matrix instruction of eleven corpora (all the shapes above and the CDNA3, CDNA4, RDNA3 and RDNA4 ones from ROCm's libraries) on 8 seeds x 5 register flavours (any bits, small integers, floats with specials, half the lanes off, small finite numbers), tile path against the reference path through `set_matrix_fast_path`: registers, LDS, memory, counters, errors; and again with the registers of each instruction moved to random places that overlap one another (the destination over a source, the accumulator half over the destination, either bank) | the same list except the fma priority (both paths share `mfma_fma`; the digests and `test_amd_mfma_math` catch that one); and, in the second test only, the accumulator of an integer form read after the destination is written |
+| `test_amd_mfma_math` (extended) | a tile against `mfma_dot` per output (random doubles of every magnitude, zeros, infinities, NaNs with random payloads) for 13 shapes; terms summed in order (1, 2^-60, -1); NaN payload for each of the four operand orders; fused tile against `mfma_dot_fma`; the priority of `mfma_fma`; integer tile against int64; the 4-wide kernels against the 2-wide ones (`mfma_avx2_switch`); all 65,536 binary16 values four at a time against `half_bits_to_double` | order, NaN redo, wrong order, integer pairs, AVX2 row, infinity exponent, subnormal scale |
+| `test_amd_gcn_asm`, `test_amd_hipcc_mfma`, `amd_rocblas` (existing) | the layouts, order and rocBLAS GEMMs of the first rewrite | (unchanged) |
+
+Run on server2 against this branch: `ctest -R ^test_amd` (143 of 143), `amd_rocblas`, `test_amd_hipcc_mfma_decode` (pass; `amd_hipsparselt` and
+`amd_pytorch_xf32` skip there, for lack of the libraries).
+
+### Found on the way
+
+* **WMMA with CLAMP and a signed integer input is wrong in the reference code, and so on both paths** (left as it is, as the digests
+  record it): `return is_signed ? static_cast<int8_t>(byte) : byte;` has the type `unsigned`, so a negative 8- or 4-bit element
+  becomes 4294967295 - |v| + 1 as a double. Without CLAMP only the low 32 bits are kept and those are right; with CLAMP the int64 sum
+  saturates the wrong way. `wmma_fast` hands exactly that case (CLAMP with a signed input) to the reference so the two keep agreeing.
+  The fix is one cast; it changes results, so it is not in a speed-up branch.
+* `mfma_dot_fma` gave a different NaN than an identical loop elsewhere (above); `part += a * bv` in `wmma_reference` and `wmma1250` had no
+  fixed order; both are explicit now.
+
+### Not done
+
+* `v_wmma_f16_16x16x16_f16` / `v_wmma_bf16_*` (16-bit results) stay at 3 us: 256 `static_cast<_Float16>(double)` calls into libgcc,
+  about 10 ns each, are most of it. A direct double to binary16 rounding would have to equal libgcc's on every double; not attempted.
+* gfx12 `v_swmmac_*` (RDNA4's sparse WMMA) is not implemented by the interpreter at all (an error), so there is nothing to speed up.
+* The per-instruction shape lookup (`matrix_shape(OpName(...))`, a hash and a string compare, about 50 ns) and the C gather / D scatter
+  loops (about 2 ns an output) are now the larger part of the small forms (4x4x4, 16x16x4): not worked on.
+* The fast path is not taken for a source that is not a register, for registers past the end of the file, or (WMMA) with CLAMP on a
+  signed integer input; those run the reference code, unchanged.
+* The harness has no gfx1250 target (hipcc has no gfx1250 programs here); those rows come from `amd_matrix_bench` only.

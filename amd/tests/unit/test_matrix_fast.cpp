@@ -39,7 +39,7 @@ bool is_matrix(const std::string& text) {
 
 // Runs every matrix instruction of the corpora (those that decode) under `seeds` seeds; returns how many digests it compared.
 // `mutated` is set when a digest differs, with the text of the first such instruction.
-size_t compare_all(uint32_t seeds, std::string* first_wrong, size_t* wrong_total) {
+size_t compare_all(uint32_t seeds, bool shuffle_registers, std::string* first_wrong, size_t* wrong_total) {
   size_t compared = 0;
   *wrong_total = 0;
   for (const Corpus& c : kCorpora) {
@@ -64,10 +64,25 @@ size_t compare_all(uint32_t seeds, std::string* first_wrong, size_t* wrong_total
       }
       for (uint32_t seed = 0; seed < seeds; ++seed)
         for (uint32_t flavour = 0; flavour < 5; ++flavour) {
+          amd::gcn::Inst shuffled = in;
+          if (shuffle_registers) {
+            // The same instruction with its registers elsewhere, overlapping or not, in either bank: the destination over a source, a
+            // source over another, the accumulator in the destination's registers or half over them.
+            uint64_t x = (seed * 5 + flavour + 1) * 0x9E3779B97F4A7C15ull + text.size();
+            const auto next = [&] { return x ^= x << 13, x ^= x >> 7, x ^= x << 17; };
+            const size_t movable = shuffled.src.size() < 3 ? shuffled.src.size() : 3;
+            const auto move = [&](amd::gcn::Operand& o) {
+              if (o.kind != amd::gcn::OperandKind::Vgpr && o.kind != amd::gcn::OperandKind::Agpr) return;
+              o.index = static_cast<uint32_t>(next() % 24) * (next() % 2 ? 1 : 2);
+              if (next() % 4 == 0) o.kind = o.kind == amd::gcn::OperandKind::Vgpr ? amd::gcn::OperandKind::Agpr : amd::gcn::OperandKind::Vgpr;
+            };
+            move(shuffled.dst[0]);
+            for (size_t k = 0; k < movable; ++k) move(shuffled.src[k]);
+          }
           amd::set_matrix_fast_path(true);
-          const uint64_t fast = amd::digest_instruction(in, c.target, 1000 + seed, flavour);
+          const uint64_t fast = amd::digest_instruction(shuffled, c.target, 1000 + seed, flavour);
           amd::set_matrix_fast_path(false);
-          const uint64_t slow = amd::digest_instruction(in, c.target, 1000 + seed, flavour);
+          const uint64_t slow = amd::digest_instruction(shuffled, c.target, 1000 + seed, flavour);
           ++compared;
           if (fast != slow && ++*wrong_total == 1) *first_wrong = text + " (" + c.file + ", seed " + std::to_string(seed) + ", flavour " + std::to_string(flavour) + ")";
         }
@@ -82,7 +97,15 @@ size_t compare_all(uint32_t seeds, std::string* first_wrong, size_t* wrong_total
 VTEST(every_matrix_instruction_gives_the_same_bits_on_the_tile_path_as_on_the_reference_path) {
   std::string first;
   size_t wrong = 0;
-  const size_t compared = compare_all(8, &first, &wrong);
+  const size_t compared = compare_all(8, false, &first, &wrong);
+  VCHECK(compared > 10000);
+  if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(compared) + " differ; first: " + first);
+}
+
+VTEST(the_same_holds_with_the_registers_moved_over_one_another) {
+  std::string first;
+  size_t wrong = 0;
+  const size_t compared = compare_all(8, true, &first, &wrong);
   VCHECK(compared > 10000);
   if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(compared) + " differ; first: " + first);
 }
