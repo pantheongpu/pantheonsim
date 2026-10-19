@@ -1,10 +1,8 @@
-// Round 10: the single-lookup read-modify-write behind the PTX interpreter's global atomics, and the texel read that takes a
-// texel's channels with one lookup, against the two-access / per-channel code they replace.
+// Round 10: the single-lookup read-modify-write behind the PTX interpreter's global atomics against the two-access code it replaces.
 //
 // A device atomic used to be load_scalar then store_scalar (two table lookups); now MemoryManager::rmw_begin / rmw_commit
-// serve the ordinary case with one, and decline -- changing nothing -- whenever the two accesses could differ. Likewise
-// MemoryManager::load_fields reads a texel's channels together. These run every operation both ways, on memory in each
-// of its states (untouched, uniform, real), and require the same value, the same memory afterwards, the same resident
+// serve the ordinary case with one, and decline -- changing nothing -- whenever the two accesses could differ. These run
+// every operation both ways, on memory in each of its states (untouched, uniform, real), and require the same value, the same memory afterwards, the same resident
 // bytes and the same error text, for accesses inside an allocation, misaligned, past its end, with a fault armed on
 // loads or on stores, and for whole PTX kernels with VGPU_FASTPATH on and off.
 #include <algorithm>
@@ -17,7 +15,6 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
-#include "vgpu/exec/texture.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/registry.hpp"
@@ -191,57 +188,6 @@ VTEST(rmw_matches_load_then_store_on_every_state_of_memory) {
   VT_ASSERT(failed > 100 && declined > 1000 && taken > 1000);   // the error paths and both ways were exercised
 }
 
-// A texel's channels read together against one load_scalar each: channel widths of 1, 2, 4 and 8 bytes in any mix, the
-// texel on a chunk's edge, misaligned, past the allocation's end, with a fault armed on loads.
-VTEST(load_fields_matches_one_load_scalar_per_channel) {
-  Rng rng{0xC0FFEEull};
-  int declined = 0, taken = 0;
-  for (int iter = 0; iter < 6000; ++iter) {
-    const uint64_t bytes = 2 * kChunkSize;
-    MemoryManager m{1ull << 30};
-    const uint64_t base = m.alloc(bytes);
-    Rng r{static_cast<uint64_t>(iter) + 5};
-    prepare(m, base, bytes, iter % 4, r);
-    Faults f;
-    if (iter % 7 == 0) {
-      m.set_access_fault(&f);
-      f.loads_armed = 1;
-    }
-    static const uint8_t widths[] = {0, 1, 2, 4, 8, 4, 4, 2};
-    uint8_t w[4];
-    for (auto& x : w) x = widths[rng.below(8)];
-    if (iter % 3 == 0) w[0] = 4, w[1] = 4, w[2] = 4, w[3] = 4;
-    uint64_t addr = base + rng.below(bytes + 32);
-    if (iter % 2) addr &= ~uint64_t{15};
-    if (iter % 5 == 0) addr = base + kChunkSize - 8 + rng.below(8);   // a texel across the chunks' edge
-    // Per channel, as texel_channel_bits did: stop at the first error.
-    Outcome one;
-    uint64_t expect[4] = {0, 0, 0, 0};
-    try {
-      uint64_t off = 0;
-      for (int i = 0; i < 4; ++i) {
-        if (w[i]) expect[i] = m.load_scalar(addr + off, w[i]);
-        off += w[i];
-      }
-    } catch (const Error&) {
-      one.failed = true;
-    }
-    uint64_t got[4] = {9, 9, 9, 9};
-    const bool ok = m.load_fields(addr, w, got);
-    if (!ok) {
-      ++declined;
-      continue;   // (the caller reads them one at a time, as above)
-    }
-    ++taken;
-    if (one.failed) throw vtest::Failure("iter " + std::to_string(iter) + ": load_fields answered where load_scalar throws");
-    for (int i = 0; i < 4; ++i)
-      if (got[i] != expect[i])
-        throw vtest::Failure("iter " + std::to_string(iter) + " channel " + std::to_string(i) + ": " + std::to_string(got[i]) +
-                             " vs " + std::to_string(expect[i]));
-  }
-  VT_ASSERT(taken > 1000 && declined > 100);
-}
-
 namespace {
 
 std::vector<uint8_t> arg_u64(uint64_t v) {
@@ -359,77 +305,6 @@ VTEST(ptx_global_atomics_match_the_two_access_path) {
           }
         }
   VT_ASSERT(ran > 1000 && failed > 20);   // some of the cases are errors, and the same ones
-}
-
-// The texel cache (a texel's channels read at the first channel, kept for the rest of the fetch): it must not outlive a fetch --
-// the texture's memory may change between two -- and must not serve one layout's channels to another reading the same
-// address. Fetches are compared with VGPU_FASTPATH=0, which reads each channel as before.
-VTEST(texel_reads_see_memory_changes_between_fetches_and_layouts) {
-  auto launch_noop = [&](MemoryManager& mem) {   // (the fast-path switch is read when a kernel launches)
-    DeviceProfile prof = load_gpu("nvidia/a10");
-    auto m = ptx::parse(".version 8.3\n.target sm_86\n.address_size 64\n.visible .entry k()\n{\n    ret;\n}\n");
-    LaunchConfig cfg;
-    cfg.block = {1, 1, 1};
-    exec::launch(m.entries[0], cfg, {}, mem, prof);
-  };
-  auto make = [&](uint64_t base, uint32_t bits, uint32_t channels, exec::ChannelKind kind) {
-    exec::TextureDesc d;
-    d.base = base;
-    d.width = 8;
-    d.height = 8;
-    d.channels = channels;
-    for (uint32_t i = 0; i < 4; ++i) d.channel_bits[i] = i < channels ? bits : 0;
-    d.texel_bytes = bits / 8 * channels;
-    d.kind = kind;
-    d.filter = exec::TexFilter::Point;
-    for (auto& a : d.address) a = exec::TexAddress::Clamp;
-    return d;
-  };
-  auto fetch = [&](MemoryManager& mem, const exec::TextureDesc& d, float x, float y) {
-    exec::TexFetch f;
-    f.dims = 2;
-    std::memcpy(&f.coord[0], &x, 4);
-    std::memcpy(&f.coord[1], &y, 4);
-    f.float_result = d.kind == exec::ChannelKind::Float;
-    uint32_t r[4] = {0, 0, 0, 0};
-    exec::texture_fetch(mem, d, f, r);
-    return std::vector<uint32_t>(r, r + 4);
-  };
-  for (int mode = 0; mode < 2; ++mode) {
-    Rng rng{77};   // the same memory and coordinates in both modes
-    setenv("VGPU_FASTPATH", mode ? "0" : "1", 1);
-    MemoryManager mem{1 << 20};
-    launch_noop(mem);
-    const uint64_t base = mem.alloc(8 * 8 * 16);
-    const exec::TextureDesc f32x4 = make(base, 32, 4, exec::ChannelKind::Float);
-    const exec::TextureDesc u16x4 = make(base, 16, 4, exec::ChannelKind::Unsigned);
-    const exec::TextureDesc u8x4 = make(base, 8, 4, exec::ChannelKind::Unsigned);
-    static std::vector<std::vector<uint32_t>> seen[2];
-    seen[mode].clear();
-    for (int round = 0; round < 40; ++round) {
-      std::vector<uint8_t> bytes(8 * 8 * 16);
-      for (auto& b : bytes) b = static_cast<uint8_t>(rng.next());
-      mem.write(base, bytes.data(), bytes.size());
-      const float x = static_cast<float>(rng.below(7)) + 0.5f, y = static_cast<float>(rng.below(7)) + 0.5f;
-      // Same address, three layouts, one after the other; then the memory changes under the same coordinates and the same
-      // layout is fetched again (a cache that survived the fetch returns the old texel).
-      seen[mode].push_back(fetch(mem, f32x4, x, y));
-      seen[mode].push_back(fetch(mem, u8x4, x, y));
-      seen[mode].push_back(fetch(mem, u16x4, x, y));
-      for (auto& b : bytes) b = static_cast<uint8_t>(rng.next());
-      mem.write(base, bytes.data(), bytes.size());
-      seen[mode].push_back(fetch(mem, u16x4, x, y));
-      seen[mode].push_back(fetch(mem, f32x4, x, y));
-      seen[mode].push_back(fetch(mem, f32x4, x, y));
-    }
-    if (mode == 1) {
-      unsetenv("VGPU_FASTPATH");
-      VCHECK_EQ(seen[0].size(), seen[1].size());
-      for (size_t i = 0; i < seen[0].size(); ++i)
-        if (seen[0][i] != seen[1][i])
-          throw vtest::Failure("fetch " + std::to_string(i) + ": the cached texel read differs from the per-channel read");
-    }
-  }
 }
 
 VTEST_MAIN

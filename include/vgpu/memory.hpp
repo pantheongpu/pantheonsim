@@ -208,15 +208,6 @@ class MemoryManager {
   };
   bool rmw_begin(uint64_t addr, uint32_t size, ScalarRmw& at, uint64_t* old) const;
   void rmw_commit(const ScalarRmw& at, uint32_t size, uint64_t value);
-  // The fields of one record (a texel's channels) read together: field i is
-  // `bytes[i]` bytes (0, 1, 2, 4 or 8; 0 reads as zero and takes no space) at the
-  // end of the one before, each read as load_scalar would read it. One table
-  // lookup serves all four. Returns false, having read nothing, whenever the
-  // fields could differ from four load_scalar calls -- a fault armed or a stuck
-  // cell, a host mapping in reach, a field not naturally aligned or outside the
-  // one ordinary allocation the first lies in -- and the caller then reads them
-  // one at a time, errors and all.
-  bool load_fields(uint64_t addr, const uint8_t bytes[4], uint64_t out[4]) const;
   // Sixteen naturally aligned bytes as one access, as a GPU moves a wide load
   // or store (global_load_dwordx4): a kernel on another host thread sees them
   // all old or all new, never half of each. rocPRIM's decoupled look-back

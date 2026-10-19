@@ -1,0 +1,11 @@
+== plain
+SECONDS 642 :: bash -c cmake -S . -B build-plain -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build-plain -j4 >$0/plain.log 2>&1 /results/small-pgo
+== generate
+SECONDS 767 :: bash -c cmake -S . -B build-pgo -DCMAKE_BUILD_TYPE=Release -DVGPU_PGO=generate >/dev/null && cmake --build build-pgo -j4 >$0/generate.log 2>&1 /results/small-pgo
+== train
+SECONDS 13 :: bash docs/perf-design/data/round10/r10small-pgo-train.sh build-pgo /results/small-mb/bench_kernels 
+1.6M	build-pgo/pgo
+39
+== use
+SECONDS 645 :: bash -c cmake -S . -B build-pgo -DCMAKE_BUILD_TYPE=Release -DVGPU_PGO=use >/dev/null && cmake --build build-pgo -j4 >$0/use.log 2>&1 /results/small-pgo
+DONE

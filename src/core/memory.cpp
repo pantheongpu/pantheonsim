@@ -1456,45 +1456,6 @@ void MemoryManager::rmw_commit(const ScalarRmw& at, uint32_t size, uint64_t valu
   store_at(chunk + at.in_chunk, size, value);
 }
 
-bool MemoryManager::load_fields(uint64_t addr, const uint8_t bytes[4], uint64_t out[4]) const {
-  if (access_fault_ &&
-      (any_stuck() || (access_fault_->load_pending && __atomic_load_n(access_fault_->load_pending, __ATOMIC_RELAXED))))
-    return false;
-  uint64_t offs[4], total = 0;
-  uint32_t first = 4;
-  for (uint32_t i = 0; i < 4; ++i) {
-    const uint32_t b = bytes[i];
-    if (b != 0 && b != 1 && b != 2 && b != 4 && b != 8) return false;
-    offs[i] = total;
-    if (b && first == 4) first = i;
-    if (b && ((addr + total) & (b - 1)) != 0) return false;
-    total += b;
-  }
-  if (first == 4) {
-    for (uint32_t i = 0; i < 4; ++i) out[i] = 0;
-    return true;
-  }
-  if (host_maps_ && (host_maps_->may_contain(addr) || host_maps_->may_contain(addr + total - 1))) return false;
-  uint64_t base = 0;
-  // Each field must be inside the allocation; the range from the first field
-  // to the last byte is, so every field is.
-  const Allocation* a = find_ordinary(addr + offs[first], total - offs[first], &base);
-  if (!a) return false;
-  for (uint32_t i = 0; i < 4; ++i) {
-    const uint32_t b = bytes[i];
-    if (!b) {
-      out[i] = 0;
-      continue;
-    }
-    const uint64_t off = addr + offs[i] - base;
-    const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
-    if (!chunk) out[i] = 0;
-    else if (is_uniform(chunk)) out[i] = repeated(uniform_byte(chunk), b);
-    else out[i] = load_at(chunk + off % kChunkSize, b);
-  }
-  return true;
-}
-
 void MemoryManager::load_quad(uint64_t addr, uint64_t out[2]) const {
   // A fault armed for loads, or stuck cells, change what a load returns, and
   // load_scalar applies them; the runtime attaches its faults to every device,
