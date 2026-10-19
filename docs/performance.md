@@ -3442,3 +3442,173 @@ namespaces; `amd_tools`: the same, and `rocminfo` against ROCm 7.2's).
 * **Graph launches**: 12 us for four kernel nodes, 3 us a node, the cost of a plain launch's stream-thread work; the plan is rebuilt
   each launch but is small beside it. Nothing cheap.
 * **Event records**: `hipEventRecord` takes `s.mutex` and the event table's mutex and queues an item; no measurement pointed at it.
+
+
+## The AMD pieces together (branch `speedup5-amdintegrate`)
+
+`speedup` b25ab636 (Tier 1 and 2, amdcorrect, amdmatrix, amdlibs) with `speedup4-amdmemtext`, `speedup4-amdtier` and `speedup4-amdmt` merged in that
+order. Every golden file is as recorded (none re-recorded; the base's build still passes them, so they still describe it).
+
+**Where the three clashed, and what was kept.**
+
+* `digest_instruction` / `time_instruction` / `digest_memory_instruction` (`gcn_exec.cpp`, `amd_exec.hpp`): all three probes, the `error` out-parameter
+  of the first included. Flavour 4 of `draw` was taken twice: amdmatrix's (every byte 0x3C to 0x41, used by `test_amd_matrix_fast` and
+  `amd_matrix_bench`) and the tier's NaN-free floats. The tier's six flavours (4 to 9 on their branch) are now 10 to 15, in `draw`,
+  `digest_instruction` and `test_amd_gcn_tier_same_bits`; flavours 0 to 3, which the golden digests use, are untouched.
+* `Machine::step`: the tier hook first (`tier_step`), then the lazy `InstCopy` of amdmemtext for VGPR MSBs and VGPR indexing; `Inst::fast` and
+  `Inst::mem` both live in `Inst`, and `finalize` fills in both.
+* `lds_access`: amdcorrect's `ds_nop` / append / consume guard first, then amdmemtext's `MemFacts` and `lds_fast`.
+* Dispatch threads: `pool::run` (amdmt) is the launcher, and it degrades as `start_or_run_here` did: a task the host gives no thread runs on the
+  launching thread after the task of its own, in turn, with the bits it would have had (`Pool::Refused::Degrade`). The lockstep launch (tasks that
+  wait on one another) uses `pool::run_together` (`Refused::Strict`): every thread is found or made before any task starts, and one the host
+  refuses throws `std::system_error` with nothing started, which the dispatch reports as amdcorrect's "the host would not start a thread for the
+  dispatch's work-groups: ..." error. `start_or_run_here` is gone. `test_amd_gcn_thread_refused` has a second test for both modes.
+* `hip_api.cpp` stream submit: amdmt's `run_inline` and spinning queue, with `no_thread` (hipErrorOutOfMemory) around both `submit` calls.
+* The NaN trap again: the merge moved GCC's choice of operand order in `wmma1250`'s scaled products and sums, and 73 gfx1250 WMMA shapes of
+  `test_amd_gcn_same_bits` changed their digests. The four operations are pinned (`mfma_mul_o<0>` twice, `mfma_add_o<2>`, `mfma_add_o<0>`), the
+  order found by trying all sixteen choices against the recorded digests (one passed).
+* `bench-amd`: every workload of every piece is kept; `--counts-via probe` works for all of them; `expected/` gained the five matrix workloads
+  that had no entry (recorded with the probe from b25ab636 and equal to the integrated tree's), nothing else changed.
+
+**A/B** (`tools/bench-amd/bench.sh`, 9 runs alternating, one thread and all threads, CPUs 24-31 under `flock /tmp/speedup-bench.lock`, size
+full, without counting runs (f81cc0c1 has no probe; the work is identical, `counters identical` is `yes` in every row), server2 load average
+1 to 4 before each workload, median ratio B/A, p < 0.001 in every row except `startup`). Columns: the integrated tree against `speedup` f81cc0c1
+and against b25ab636, and each of the three pieces' own branch against f81cc0c1 (the figures the pieces reported).
+
+| workload | target | thr | integrated / f81cc0c1 | integrated / b25ab636 | tier alone / f81 | memtext alone / f81 | mt alone / f81 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| valu_int | mi300x | 1 | 8.51 | 8.72 | 8.83 |  |  |
+| valu_int | mi300x | all | 8.49 | 8.59 |  |  |  |
+| valu_int | rx6800 | 1 | 7.01 | 7.15 | 7.45 |  |  |
+| valu_int | rx6800 | all | 7.01 | 7.09 |  |  |  |
+| valu_f32 | mi300x | 1 | 9.36 | 9.26 | 9.71 |  |  |
+| valu_f32 | mi300x | all | 9.61 | 9.44 |  |  |  |
+| valu_f32 | rx6800 | 1 | 6.49 | 6.36 | 6.88 |  |  |
+| valu_f32 | rx6800 | all | 6.72 | 6.54 |  |  |  |
+| valu_f64 | mi300x | 1 | 4.58 | 4.86 | 4.60 |  |  |
+| valu_f64 | mi300x | all | 4.59 | 4.82 |  |  |  |
+| valu_f64 | rx6800 | 1 | 5.64 | 5.73 | 5.38 |  |  |
+| valu_f64 | rx6800 | all | 5.37 | 5.57 |  |  |  |
+| mfma | mi300x | 1 | 2.70 | 1.08 | 1.05 |  |  |
+| mfma | mi300x | all | 2.72 | 1.08 |  |  |  |
+| mfma_i8 | mi300x | 1 | 4.95 | 0.97 |  |  |  |
+| mfma_i8 | mi300x | all | 4.96 | 0.98 |  |  |  |
+| mfma_fp8 | mi300x | 1 | 7.45 | 1.04 |  |  |  |
+| mfma_fp8 | mi300x | all | 7.45 | 1.04 |  |  |  |
+| mfma_bf16 | mi300x | 1 | 3.37 | 1.06 |  |  |  |
+| mfma_bf16 | mi300x | all | 3.36 | 1.06 |  |  |  |
+| mfma_f64 | mi300x | 1 | 3.73 | 1.12 |  |  |  |
+| mfma_f64 | mi300x | all | 3.25 | 1.11 |  |  |  |
+| smfmac | mi300x | 1 | 3.00 | 1.03 |  |  |  |
+| smfmac | mi300x | all | 3.01 | 1.02 |  |  |  |
+| mem | mi300x | 1 | 3.08 | 3.10 | 2.99 | 1.10 |  |
+| mem | mi300x | all | 3.09 | 3.12 |  |  |  |
+| mem | rx6800 | 1 | 3.28 | 3.14 | 3.28 | 1.13 |  |
+| mem | rx6800 | all | 3.27 | 3.17 |  |  |  |
+| lds | mi300x | 1 | 3.79 | 3.71 | 3.66 | 2.13 |  |
+| lds | mi300x | all | 3.87 | 3.86 |  |  |  |
+| lds | rx6800 | 1 | 3.30 | 3.31 | 3.12 | 1.90 |  |
+| lds | rx6800 | all | 3.30 | 3.33 |  |  |  |
+| narrow | mi300x | 1 | 1.94 | 1.98 | 1.91 | 1.11 |  |
+| narrow | mi300x | all | 1.95 | 1.99 |  |  |  |
+| narrow | rx6800 | 1 | 2.10 | 2.05 | 2.11 | 1.10 |  |
+| narrow | rx6800 | all | 2.08 | 2.06 |  |  |  |
+| smem | mi300x | 1 | 3.60 | 3.81 | 3.30 | 1.11 |  |
+| smem | mi300x | all | 3.64 | 3.85 |  |  |  |
+| smem | rx6800 | 1 | 3.12 | 3.17 | 2.81 | 1.18 |  |
+| smem | rx6800 | all | 3.15 | 3.23 |  |  |  |
+| buf | mi300x | 1 | 1.97 | 1.92 | 1.39 | 1.32 |  |
+| buf | mi300x | all | 1.98 | 1.93 |  |  |  |
+| buf | rx6800 | 1 | 2.06 | 2.02 | 1.45 | 1.32 |  |
+| buf | rx6800 | all | 2.07 | 2.03 |  |  |  |
+| ldsx | mi300x | 1 | 6.96 | 7.00 | 2.70 | 2.28 |  |
+| ldsx | mi300x | all | 7.39 | 7.37 |  |  |  |
+| ldsx | rx6800 | 1 | 6.32 | 6.17 | 2.83 | 2.02 |  |
+| ldsx | rx6800 | all | 6.46 | 6.40 |  |  |  |
+| flat | mi300x | 1 | 3.35 | 3.29 | 2.64 | 1.13 |  |
+| flat | mi300x | all | 3.27 | 3.31 |  |  |  |
+| flat | rx6800 | 1 | 3.50 | 3.55 | 2.78 | 1.13 |  |
+| flat | rx6800 | all | 3.53 | 3.54 |  |  |  |
+| atomics | mi300x | 1 | 2.05 | 2.08 | 1.85 | 1.15 |  |
+| atomics | mi300x | all | 1.96 | 1.91 |  |  |  |
+| atomics | rx6800 | 1 | 2.23 | 2.25 | 1.98 | 1.19 |  |
+| atomics | rx6800 | all | 2.06 | 1.97 |  |  |  |
+| divergent | mi300x | 1 | 4.40 | 4.47 | 4.53 |  |  |
+| divergent | mi300x | all | 4.41 | 4.48 |  |  |  |
+| divergent | rx6800 | 1 | 4.30 | 4.21 | 4.32 |  |  |
+| divergent | rx6800 | all | 4.24 | 4.27 |  |  |  |
+| wave | mi300x | 1 | 11.12 | 11.03 | 11.41 |  |  |
+| wave | mi300x | all | 10.92 | 10.75 |  |  |  |
+| wave | rx6800 | 1 | 8.84 | 8.79 | 9.12 |  |  |
+| wave | rx6800 | all | 8.74 | 8.66 |  |  |  |
+| launch | mi300x | 1 | 1.08 | 1.14 |  |  | 1.05 |
+| launch | mi300x | all | 1.08 | 1.14 |  |  | 0.99 |
+| launch | rx6800 | 1 | 1.14 | 1.15 |  |  | 1.04 |
+| launch | rx6800 | all | 1.14 | 1.14 |  |  | 1.04 |
+| api | mi300x | 1 | 3.27 | 3.23 |  |  | 3.50 |
+| api | mi300x | all | 3.34 | 3.44 |  |  | 3.49 |
+| api | rx6800 | 1 | 3.45 | 3.30 |  |  | 3.44 |
+| api | rx6800 | all | 3.30 | 3.27 |  |  | 3.31 |
+| apicheap | mi300x | 1 | 1.09 | 1.10 |  |  | 1.10 |
+| apicheap | mi300x | all | 1.10 | 1.10 |  |  | 1.11 |
+| apicheap | rx6800 | 1 | 1.11 | 1.09 |  |  | 1.11 |
+| apicheap | rx6800 | all | 1.11 | 1.09 |  |  | 1.12 |
+| launch_wide | mi300x | 1 | 2.31 | 2.33 |  |  | 1.04 |
+| launch_wide | mi300x | all | 2.66 | 2.70 |  |  | 1.14 |
+| launch_wide | rx6800 | 1 | 2.09 | 2.06 |  |  | 1.01 |
+| launch_wide | rx6800 | all | 1.42 | 1.62 |  |  | 1.01 |
+| launch_mid | mi300x | 1 | 2.31 | 2.33 |  |  | 1.05 |
+| launch_mid | mi300x | all | 4.86 | 4.85 |  |  | 2.46 |
+| launch_mid | rx6800 | 1 | 2.08 | 2.06 |  |  | 1.02 |
+| launch_mid | rx6800 | all | 3.57 | 3.50 |  |  | 1.93 |
+| launch_sync | mi300x | 1 | 1.61 | 1.59 |  |  | 1.22 |
+| launch_sync | mi300x | all | 1.62 | 1.62 |  |  | 1.23 |
+| launch_sync | rx6800 | 1 | 1.55 | 1.54 |  |  | 1.16 |
+| launch_sync | rx6800 | all | 1.56 | 1.55 |  |  | 1.16 |
+| memcpy | mi300x | 1 | 2.11 | 2.16 |  |  | 2.17 |
+| memcpy | mi300x | all | 2.13 | 2.18 |  |  | 2.17 |
+| memcpy | rx6800 | 1 | 2.12 | 2.15 |  |  | 2.11 |
+| memcpy | rx6800 | all | 2.13 | 2.12 |  |  | 2.15 |
+| stream | mi300x | 1 | 1.21 | 1.22 |  |  | 1.16 |
+| stream | mi300x | all | 1.22 | 1.21 |  |  | 1.18 |
+| stream | rx6800 | 1 | 1.29 | 1.47 |  |  | 1.20 |
+| stream | rx6800 | all | 1.26 | 1.45 |  |  | 1.20 |
+| graph | mi300x | 1 | 1.36 | 1.36 |  |  | 1.04 |
+| graph | mi300x | all | 1.38 | 1.36 |  |  | 1.04 |
+| graph | rx6800 | 1 | 1.33 | 1.34 |  |  | 1.03 |
+| graph | rx6800 | all | 1.33 | 1.33 |  |  | 1.04 |
+| startup | mi300x | 1 | 1.04 | 0.98 |  |  |  |
+| startup | mi300x | all | 1.02 | 1.00 |  |  |  |
+| startup | rx6800 | 1 | 1.01 | 1.00 |  |  |  |
+| startup | rx6800 | all | 1.01 | 1.01 |  |  |  |
+| wmma | rx7900xtx | 1 | 25.12 | | | | |
+| wmma | rx7900xtx | all | 25.38 | | | | |
+| wmma | rx9070xt | 1 | 25.30 | | | | |
+| wmma | rx9070xt | all | 25.63 | | | | |
+| wmma_iu8 | rx7900xtx | 1 | 9.24 | | | | |
+| wmma_iu8 | rx7900xtx | all | 9.50 | | | | |
+| wmma_iu8 | rx9070xt | 1 | 7.16 | | | | |
+| wmma_iu8 | rx9070xt | all | 7.34 | | | | |
+
+(`startup` is unchanged, 0.98 to 1.05. `wmma` and `wmma_iu8` on the simulated RX 7900 XTX and RX 9070 XT: 25.1 to 25.6 x and 7.2 to 9.5 x f81cc0c1.
+`v_pk_fma_f16` costs 200 to 260 ns an execution in b25ab636 and in the integrated tree alike (`amd_matrix_bench`; f81cc0c1's was 3103 ns), a
+`v_mfma_f32_16x16x16_f16` 1.6 us in both: the tier takes no packed 16-bit or matrix instruction, so those gains are untouched.)
+
+**What the claims became.** Tier: 4.6 to 11.1 x on `valu_*` / `wave` / `divergent` (alone 4.6 to 11.4 x; at most 6 % less, rx6800 `valu_f32`
+and `valu_int`). Mt: `api` 3.3 to 3.4 x (alone 3.3 to 3.5 x), `memcpy` 2.1 x (2.1 to 2.2 x), `launch_mid` with all threads 4.9 / 3.6 x
+(alone 2.5 / 1.9 x), no row below 0.93 of the piece alone. Matrix: the `mfma*` rows are 2.7 to 7.4 x and `wmma` 25 x, the same as b25ab636's
+(`mfma` is 1.08 x faster than b25ab636 for the tier's scalar and branch instructions). Libs: unchanged, as above.
+**One piece's gain shrank: amdmemtext's, on the instructions the tier now runs itself.** Its contribution on top of the tier (integrated / tier
+alone) against what it gave alone: `mem` 1.00 to 1.03 x (alone 1.10 to 1.13), `lds` 1.04 to 1.06 x (alone 1.9 to 2.1), `narrow` 1.00 to 1.02 x
+(alone 1.10), `atomics` 1.11 to 1.13 x (alone 1.15 to 1.19); not shrunk where the tier does not reach: `ldsx` 2.2 to 2.6 x (alone 2.0 to 2.3),
+`buf` 1.42 x (1.32), `flat` 1.26 x (1.13), `smem` 1.09 to 1.11 x (1.11 to 1.18). The memtext code is still what runs the instructions the tier hands
+back (a wave with VGPR MSBs or indexing, MODE not at its default, the debugger or tracing, an access that is not plain, wide LDS forms) and
+the interpreter's own steps of the other workloads.
+
+**Tests** (server2, Release; each with `VGPU_AMD_TIER=1` and `=0`): `ctest -R "amd|gcn|rocprof|hipcc|hip_|memrmw|memruns|mem_facts|mfma|packed|matrix|tier|bench_amd"`,
+251 tests, 3 failed in both modes (the rest passed or were skipped), the same three as in b25ab636 (`amd_rocprofiler_abi`: the host's rocprofiler-sdk is another
+version; `amd_rocprofv3` and `amd_tools`: unprivileged user namespaces and `rocminfo` do not work on server2); the rest skipped for want of
+ROCm libraries or cards. Among them `test_amd_gcn_same_bits`, `_packed_same_bits`, `_memory_same_bits`, `_tier_same_bits`,
+`test_amd_codeobject_same_bits`, `test_amd_matrix_fast`, `test_amd_gcn_threads*`, `test_amd_hip_queue`, `test_amd_gcn_thread_refused`,
+`test_amd_hip_thread_refused`, `bench_amd_counters`. The NVIDIA tests that share code (`test_memory`, `test_memrmw*`, `test_worker_pool`,
+`test_fastpath`, `test_exec*`): 8 of 8.
