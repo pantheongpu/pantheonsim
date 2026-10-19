@@ -16,6 +16,7 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <pthread.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -277,9 +278,31 @@ ShimState& state() {
 // push in a worker changed which device the main thread's next allocation
 // landed on. Contexts themselves stay process-wide (ShimState::contexts); only
 // which one is current is per thread, and a new thread starts with none.
+//
+// The stack outlives the thread's own thread_local destructors. A program may call the driver from code that runs
+// after them -- a static object's destructor at exit() (glibc runs the exiting thread's thread_local destructors
+// first), or a thread_local destroyed after this library's -- and a std::vector destroyed by then is freed memory
+// under those calls: a use after free that corrupts the heap and surfaces as "malloc_consolidate(): unaligned
+// fastbin chunk detected" at exit (StringZilla's device scope destroys its stream and context that way). So the
+// thread holds a bare pointer, which has no destructor, and a pthread key frees the vector when a thread other
+// than the exiting main thread ends (key destructors do not run for the main thread at exit(), whose stack is
+// reachable through its thread-local pointer to the end).
+static thread_local std::vector<uintptr_t>* t_ctx_stack = nullptr;
+static void drop_ctx_stack(void* p) {
+  delete static_cast<std::vector<uintptr_t>*>(p);
+  t_ctx_stack = nullptr;   // the next call from this thread, if any, starts a fresh stack
+}
 std::vector<uintptr_t>& ctx_stack() {
-  thread_local std::vector<uintptr_t> stack;
-  return stack;
+  if (!t_ctx_stack) {
+    static const pthread_key_t key = [] {
+      pthread_key_t k;
+      pthread_key_create(&k, drop_ctx_stack);
+      return k;
+    }();
+    t_ctx_stack = new std::vector<uintptr_t>;
+    pthread_setspecific(key, t_ctx_stack);
+  }
+  return *t_ctx_stack;
 }
 
 bool quiet() {

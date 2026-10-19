@@ -3138,6 +3138,17 @@ set_tests_properties(e2e_multiarch_modules PROPERTIES
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 600)
 
+# The driver API called after the thread's thread_local destructors have run (a static destructor at exit(), as
+# StringZilla's device scope does): the context stack must outlive them. It was a destroyed std::vector, whose freed
+# storage the next calls wrote -- a glibc "malloc_consolidate(): unaligned fastbin chunk detected" at exit.
+add_test(NAME e2e_exit_teardown
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_exit_teardown.sh)
+set_tests_properties(e2e_exit_teardown PROPERTIES
+  DEPENDS "vgpucuda;vgpucudart"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 600)
+
 # Hopper's DPX intrinsics (__vimax3, __viaddmax, __vibmin ... in s32/u32/s16x2/u16x2 and _relu), and the PTX
 # min/max .relu forms, on sm_80, sm_89 and sm_90 (SASS and PTX) and sm_120 against NVIDIA's host implementations.
 # e2e_sass_archs runs the same program on every architecture.
