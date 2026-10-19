@@ -1457,6 +1457,9 @@ vgpu_unit_test(test_amd_gcn_lds amd/tests/unit/test_gcn_lds.cpp)
 # A dispatch whose host threads the host refuses to start still finishes (it used to die in std::terminate).
 vgpu_unit_test(test_amd_gcn_thread_refused amd/tests/unit/test_gcn_thread_refused.cpp)
 target_compile_definitions(test_amd_gcn_thread_refused PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# A scratch access at a negative offset from a zero register is refused, not wrapped past 2^64 (amd/tests/unit/test_gcn_scratch_negative.cpp).
+vgpu_unit_test(test_amd_gcn_scratch_negative amd/tests/unit/test_gcn_scratch_negative.cpp)
+target_compile_definitions(test_amd_gcn_scratch_negative PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # Each AMD profile's chip facts are its own (amd/include/vgpu/amd_chip.hpp).
 vgpu_unit_test(test_amd_chip amd/tests/unit/test_amd_chip.cpp)

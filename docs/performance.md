@@ -3795,3 +3795,20 @@ lost 3 to 19 % (`smem` 11 % and 19 %, `smfmac` 11 %, `valu_f64` on the MI300X 9 
 the tile path's declines. Not profiled further. The first run of this A/B had `mem` and `flat` on the MI300X at 0.46 x and 0.48 x and
 `launch_wide`/`launch_mid` at 0.68 x: the tier had been told not to run `v_lshl_add_u64` on gfx942, which the address arithmetic of those kernels uses;
 it has a handler now.
+
+## A scratch access that wrapped its range check (branch `speedup7-scratch`)
+
+`scratch_at` tested `offset + bytes > scratch_per_lane` with an unsigned offset. An instruction offset that is negative (`scratch_store_b128 v9,
+v[1:4], off offset:-16`) with a register offset of zero is a number just under 2^64; adding the size wrapped the sum to zero and passed
+the test, and the access landed before the work-item's scratch, on the heap (amdmemtext found it as a crash of the memory digest probe, which
+skipped such shapes). The test is now `offset > per_lane || bytes > per_lane - offset`, and the access is refused with the error every other
+access past the work-item's scratch gets. The other range checks were read and left: flat accesses to the private aperture take their offset
+from an address that is at least the aperture's base (or 52 bits), the LDS ones from the shared aperture or a 32-bit field, so none of them wraps;
+`scratch_buffer_access`, `scratch_load_lds` and gfx1250's signed sum go through `scratch_at`.
+
+The golden digests changed only for the shapes this changes, recorded from origin/main plus the probe plus only this fix (the same arbiter as the merge's):
+3 shapes of `same_bits_digests.txt` (gfx1100 `scratch_load_b128 v[5:8], v9, off offset:-16`, `scratch_store_b128 v9, v[1:4], off offset:-16`,
+`scratch_store_b64 v1, v[2:3], off offset:-8`) and 28 of `mem_same_bits_digests.txt`: the 28 negative-offset scratch shapes of gfx1100 (7), gfx1201 (4) and
+gfx1250 (17), which the probe used to skip (the skip is gone; their digest was 0). `test_amd_gcn_scratch_negative` runs 12 stores and 12 loads of each of
+gfx942, gfx1030 (global accesses with the segment bits set to scratch), gfx1100 and gfx1250 at minus their size from zero registers (digest flavour 16, all zero)
+and wants the refusal; with the check as it was, it fails (`gave []`).

@@ -6912,7 +6912,9 @@ struct Machine {
   // One work-item's private memory: its own block of the group's scratch.
   uint8_t* scratch_at(Group& g, const Wave& w, uint32_t lane, uint64_t offset, uint32_t bytes) {
     const uint64_t base = uint64_t{w.first_lane + lane} * g.scratch_per_lane;
-    if (offset + bytes > g.scratch_per_lane || base + offset + bytes > g.scratch.size())
+    // (An offset is unsigned here, so a negative one -- an instruction's own `offset:-16` with a register that is zero -- is a huge number;
+    // adding the size to it wraps past 2^64 and used to pass the test, and the access landed before the lane's scratch.)
+    if (offset > g.scratch_per_lane || bytes > g.scratch_per_lane - offset || base + offset + bytes > g.scratch.size())
       throw Error::make(Err::InvalidValue, "a scratch access at ", offset, " is past the ", g.scratch_per_lane,
                         " bytes a work-item reserved");
     return &g.scratch[base + offset];
@@ -12359,10 +12361,11 @@ struct Rng {
     return z ^ (z >> 31);
   }
 };
-// A 32-bit value of the flavour: 0 any bits, 1 small, 2 a float (finite, special or tiny), 4 every byte 0x3C to 0x41: a small
+// A 32-bit value of the flavour (16: zero): 0 any bits, 1 small, 2 a float (finite, special or tiny), 4 every byte 0x3C to 0x41: a small
 // finite number whether the word is read as a float, a double, two halves, two bfloat16s or four 8-bit floats (no NaNs, no
 // overflow), as a real program's operands are.
 uint32_t draw(Rng& r, uint32_t flavour) {
+  if (flavour == 16) return 0;   // (every register zero: a test that needs to know what an instruction's operands are)
   if (flavour == 4) {
     uint32_t v = 0;
     for (int b = 0; b < 4; ++b) v |= (0x3Cu + static_cast<uint32_t>(r.next() % 6)) << (8 * b);
@@ -12439,7 +12442,7 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   w.vcc = r.next() & all;
   w.m0 = draw(r, flavour);
   w.scc = r.next() & 1;
-  if (flavour >= 14 && in.enc == gcn::Enc::Flat && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+  if ((flavour == 14 || flavour == 15) && in.enc == gcn::Enc::Flat && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
     // Flavours 8 and 9: a global access whose addresses are inside the region (8: consecutive lanes, 9: scattered words), so that the access
     // happens instead of faulting; 9 also has half the lanes off.
     if (flavour == 15) w.exec = r.next() & all;
@@ -12549,9 +12552,6 @@ double time_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, 
 // lanes, the same address in every lane, a buffer whose resource is invalid, swizzled or too small -- and the digest
 // holds the three allocations too.
 uint64_t digest_memory_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, uint32_t mode) {
-  // (A scratch access with a negative offset and a work-item offset near zero wraps the range check of scratch_at in the
-  // build this digest was recorded from, and writes before the scratch: not run.)
-  if (in.segment == Inst::Segment::Scratch && in.offset < 0) return 0;
   static constexpr uint32_t kMach[] = {0x4c, 0x3f, 0x4f, 0x41, 0x48, 0x36, 0x49};   // by gcn::Target's order
   CodeObject co;
   co.mach = kMach[static_cast<int>(target)];
