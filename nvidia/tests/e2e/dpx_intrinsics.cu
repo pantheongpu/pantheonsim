@@ -17,6 +17,10 @@
 #include <cstring>
 
 // ---- the PTX min/max with .relu, against a host model ----------------------------------------
+// add.{u,s}16x2: each half on its own, wrapping.
+__host__ __device__ static unsigned add_model(unsigned a, unsigned b, bool) {
+  return (((a & 0xffff) + (b & 0xffff)) & 0xffff) | ((((a >> 16) + (b >> 16)) & 0xffff) << 16);
+}
 __host__ __device__ static unsigned relu_s32(unsigned a, unsigned b, bool mx) {
   int x = static_cast<int>(a), y = static_cast<int>(b);
   int r = mx ? (x > y ? x : y) : (x < y ? x : y);
@@ -54,6 +58,8 @@ PTX_RELU(ptx_max_relu_s16x2, "max.relu.s16x2 %0, %1, %2;", true, 0, relu_s16x2)
 PTX_RELU(ptx_max_s16x2_relu, "max.s16x2.relu %0, %1, %2;", true, 0, relu_s16x2)
 PTX_RELU(ptx_min_relu_s16x2, "min.relu.s16x2 %0, %1, %2;", false, 0, relu_s16x2)
 PTX_RELU(ptx_min_s16x2_relu, "min.s16x2.relu %0, %1, %2;", false, 0, relu_s16x2)
+PTX_RELU(ptx_add_u16x2, "add.u16x2 %0, %1, %2;", true, 0, add_model)
+PTX_RELU(ptx_add_s16x2, "add.s16x2 %0, %1, %2;", true, 0, add_model)
 PTX_RELU(ptx_max_s16x2, "max.s16x2 %0, %1, %2;", true, 0, s16x2_plain)
 PTX_RELU(ptx_min_s16x2, "min.s16x2 %0, %1, %2;", false, 0, s16x2_plain)
 PTX_RELU(ptx_max_u16x2, "max.u16x2 %0, %1, %2;", true, 0, u16x2_plain)
@@ -83,7 +89,7 @@ __host__ __device__ static unsigned u32_min(unsigned a, unsigned b) { return a <
   B16(__vibmax_s16x2) B16(__vibmin_s16x2) B16(__vibmax_u16x2) B16(__vibmin_u16x2)                                 \
   M(ptx_max_relu_s32) M(ptx_max_s32_relu) M(ptx_min_relu_s32) M(ptx_min_s32_relu)                                 \
   M(ptx_max_relu_s16x2) M(ptx_max_s16x2_relu) M(ptx_min_relu_s16x2) M(ptx_min_s16x2_relu)           \
-  M(ptx_max_s16x2) M(ptx_min_s16x2) M(ptx_max_u16x2) M(ptx_min_u16x2)
+  M(ptx_max_s16x2) M(ptx_min_s16x2) M(ptx_max_u16x2) M(ptx_min_u16x2) M(ptx_add_u16x2) M(ptx_add_s16x2)
 
 // One function, one operand triple -> two words: the result and the predicates.
 #define CASE_S2(f) case __COUNTER__ - kBase: o0 = (unsigned)f((int)a, (int)b); break;

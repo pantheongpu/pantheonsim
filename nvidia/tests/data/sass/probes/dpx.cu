@@ -27,4 +27,9 @@ __global__ void k(unsigned* o, const unsigned* in) {
   o[24] = __vimax3_u32(a, b, c);
   o[25] = __vimin3_s32(a, b, c);
   o[26] = __viaddmin_s32_relu(a, b, c);
+  unsigned t;
+  asm("add.u16x2 %0, %1, %2;" : "=r"(t) : "r"(a), "r"(b));      // VIADD.16x2, the packed add on its own
+  o[27] = t;
+  asm("add.s16x2 %0, %1, %2;" : "=r"(t) : "r"(b), "r"(c));
+  o[28] = t;
 }

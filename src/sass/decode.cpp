@@ -1730,14 +1730,15 @@ void dec_viadd(Instr& ins, const Word& w) {
   const unsigned mode = static_cast<unsigned>(w.field(73, 3));
   static const char* const kModes[] = {"", "16x2", "S32", "S16x2", "U8x4", "S8x4", "(6)", "(7)"};
   if (ins.sm >= 120 && *kModes[mode]) ins.mods.push_back(kModes[mode]);
-  else if (ins.sm < 120) {   // before sm_120: S32 and the byte forms only
+  else if (ins.sm < 120) {   // before sm_120: S32, the byte forms and (add.u16x2 / add.s16x2) .16x2
     if (lanes == 1) ins.mods.push_back("S32");
     if (lanes == 2) ins.mods.push_back(w.bit(73) ? "S8x4" : "U8x4");
+    if (lanes == 0 && w.bit(73)) ins.mods.push_back("16x2");
   }
   if (w.bit(80)) ins.mods.push_back("ISAT");
   ins.f[0] = lanes;
   ins.f[1] = w.bit(80);
-  ins.f[2] = ins.sm >= 120 ? mode : (lanes == 1 ? 2 : lanes == 2 ? 4 + w.bit(73) : 0);
+  ins.f[2] = ins.sm >= 120 ? mode : (lanes == 1 ? 2 : lanes == 2 ? 4 + w.bit(73) : lanes == 0 && w.bit(73) ? 1 : 0);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   alu2(ins, w, kUnsigned);
   int_neg(ins.src[1], w);
