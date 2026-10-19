@@ -1620,6 +1620,7 @@ void finalize(Inst& in) {
   in.short_hash = name_hash(in.short_name);
   in.flags = f;
   in.mem = mem_facts_of(in);
+  tier_classify(in);
 }
 
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {

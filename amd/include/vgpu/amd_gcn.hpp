@@ -17,6 +17,8 @@
 #include <string_view>
 #include <vector>
 
+#include "vgpu/amd_gcn_tier.hpp"
+
 namespace vgpu::amd::gcn {
 
 // An instruction's name as the interpreter tells instructions apart: a 64-bit FNV-1a hash of its text. A literal
@@ -296,6 +298,9 @@ struct Inst {
   std::string short_name;
   uint32_t flags = 0;
   MemFacts mem;   // (valid when flags has kInstFinal; mem_facts() says it for any instruction)
+  // The pre-decoded tier's form of the instruction (vgpu/amd_gcn_tier.hpp), worked out by finalize; `fast.run` is null
+  // for an instruction the interpreter runs.
+  tier::Op fast;
 };
 
 // The short form's name (Inst::short_name worked out), "" for an instruction that runs under its own.
@@ -315,6 +320,8 @@ inline const MemFacts& mem_facts(const Inst& in, MemFacts& scratch) {
   scratch = mem_facts_of(in);
   return scratch;
 }
+// Fills in Inst::fast (amd/src/gcn_tier.cpp); finalize calls it.
+void tier_classify(Inst& in);
 // The flags of an instruction, finalized or not.
 inline uint32_t inst_flags(const Inst& in) {
   if (in.flags & kInstFinal) return in.flags;

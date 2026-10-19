@@ -1,0 +1,82 @@
+// The part of the AMD tier that needs the interpreter's Machine (included inside it, before step()): global loads and stores
+// of whole dwords. It is global_access with the work the instruction's name asked for done at decode (gcn_tier.cpp's
+// classify sets Inst::fast.mach and .words) and the address registers read as rows; the lane loop, the run detection
+// (memory_run), the load memo and every memory call are the interpreter's own, in the same order, so a fault in lane 17 happens
+// after lane 16's store as before.
+//
+// Everything step() counts for such an instruction is counted here, before the lanes run (an access that faults has been counted).
+int tier_global(Wave& w, Group& g, const Inst& in) {
+  const bool is_store = in.fast.mach == 2 || in.fast.mach == 5;
+  const bool sub_dword = in.fast.mach >= 4;   // a byte or a short (global_load_ubyte ..., global_store_byte, global_store_short)
+  // A wave's first plain store of a round lets the group's other waves run first (Wave::store_gate, in step()).
+  if (is_store && w.store_gate && w.exec != 0 && g.waves.size() > 1) {
+    w.store_gate = false;
+    w.soft_yield = true;
+    return 2;
+  }
+  InstructionCounts& n = stats.counts;
+  ++n.mix[static_cast<int>(in.mix)];
+  n.mops[static_cast<int>(in.mops_type)] += in.mops;
+  w.pc += in.size;
+  ++stats.instructions;
+  ++n.vmem;
+  ++n.flat;
+  if (is_store) ++n.flat_write, ++n.vmem_wr;
+  else ++n.flat_read, ++n.vmem_rd, issued_load(w);
+  if (!w.exec) return 1;
+  const uint32_t words = in.fast.words;
+  const uint32_t access_bytes = sub_dword ? words : 4 * words;
+  const uint64_t saddr_base = in.has_saddr ? scalar_field(w, in.saddr, true) : 0;
+  const uint64_t offset = static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+  const uint32_t* const lo = w.vgpr[in.src[0].index].data();
+  const uint32_t* const hi = in.has_saddr ? lo : w.vgpr[in.src[0].index + 1].data();
+  bool try_runs = !sub_dword && (words == 1 || words == 2 || words == 4) && d.peers.empty() && runs_on;
+  uint64_t memo_addr = 0;
+  bool memo = false;
+  uint32_t memo_words[kMaxWords];
+  uint32_t buf[4];
+  uint64_t memo_value = 0;
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    if (!(w.exec >> lane & 1)) continue;
+    const uint64_t addr = (in.has_saddr ? saddr_base + lo[lane] : static_cast<uint64_t>(hi[lane]) << 32 | lo[lane]) + offset;
+    if (try_runs) {
+      const uint32_t made = memory_run(w, in, !is_store, lane, addr, words, access_bytes, !is_store && memo && memo_addr == addr, memo_words);
+      if (made) {
+        if (!is_store) memo_addr = addr + uint64_t{4 * words} * (made - 1), memo = true;
+        lane += made - 1;
+        continue;
+      }
+      try_runs = false;
+    }
+    if (sub_dword) {
+      if (is_store) {
+        store(addr, words, w.vgpr[in.src[1].index][lane]);
+      } else {
+        if (!memo || memo_addr != addr) memo_value = load(addr, words), memo_addr = addr, memo = true;
+        w.vgpr[in.dst[0].index][lane] = widen(memo_value, Narrow{words, in.fast.sub != 0});
+      }
+    } else if (is_store) {
+      for (uint32_t k = 0; k < words; ++k) buf[k] = w.vgpr[in.src[1].index + k][lane];
+      store_words(addr, words, buf);
+    } else {
+      if (!memo || memo_addr != addr) {
+        load_words(addr, words, memo_words);
+        memo_addr = addr, memo = true;
+      }
+      for (uint32_t k = 0; k < words; ++k) w.vgpr[in.dst[0].index + k][lane] = memo_words[k];
+    }
+  }
+  return 1;
+}
+
+// s_barrier: the wave stops at it until the work-group's others arrive (run_round releases them).
+int tier_barrier(Wave& w, const Inst& in) {
+  InstructionCounts& n = stats.counts;
+  ++n.mix[static_cast<int>(in.mix)];
+  n.mops[static_cast<int>(in.mops_type)] += in.mops;
+  w.pc += in.size;
+  ++stats.instructions;
+  w.at_barrier = true;
+  ++stats.barriers;
+  return 2;
+}
