@@ -7251,11 +7251,11 @@ struct Machine {
   void lds_access(Wave& w, const Inst& in, Group& g) {
     const OpName op(in);
     // An LDS instruction the decoder gives no address register: ds_nop (which does nothing), and the append/consume counters
-    // (ds_append, ds_consume: a wave-wide counter at M0's address, whose rules the ISA documents too thinly to model; their
-    // only operand is the destination). Reading src[0] of these ran off an empty vector. (The addtid forms name none either,
-    // and address by lane below.)
+    // (ds_append, ds_consume: a wave-wide counter at the instruction's offset, below; their only operand is the destination). Reading
+    // src[0] of these ran off an empty vector. (The addtid forms name none either, and address by lane below.) Any other that has none
+    // is refused by name.
     if (op == "ds_nop"_op) return;
-    if (in.src.empty() && !(op == "ds_load_addtid_b32"_op || op == "ds_read_addtid_b32"_op))
+    if (in.src.empty() && !(op == "ds_load_addtid_b32"_op || op == "ds_read_addtid_b32"_op || op == "ds_append"_op || op == "ds_consume"_op))
       throw Error::make(Err::Unsupported, "LDS instruction ", op, " has no address operand and is not modelled");
     gcn::MemFacts mem_scratch;
     const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);

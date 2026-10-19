@@ -1314,6 +1314,8 @@ void tier_classify(Inst& in) {
   } else {
     std::string eff = in.short_name.empty() ? in.name : in.short_name;
     if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (eff == "s_max_u32" || eff == "s_max_i32")) eff += "_ge";
+    // (gfx942 and gfx950 take a shift count of this one over 4 as zero, CDNA3 and CDNA4 guides: the interpreter's.)
+    if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && eff == "v_lshl_add_u64") return;
     const auto& tab = table();
     const auto it = tab.find(eff);
     if (it == tab.end()) return;
@@ -1328,6 +1330,8 @@ void tier_classify(Inst& in) {
       const bool is_f = e.cat == Cat::F32;
       if (!vgpr_dst(in.dst[0], f.dst, 1)) return fail();
       if ((e.flags & kNoClamp) && in.clamp) return fail();
+      // (CDNA3 and CDNA4 apply the clamp bit to the integer instructions that have one and to the conversions to float: the interpreter's.)
+      if (in.clamp && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (!is_f || (e.flags & kIgnoreMods))) return fail();
       // (gfx942 and gfx950 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA3 and CDNA4 guides, 6.5: the interpreter's.)
       if (in.omod && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && !(e.flags & kIgnoreMods)) return fail();
       for (int k = 0; k < e.arity; ++k)

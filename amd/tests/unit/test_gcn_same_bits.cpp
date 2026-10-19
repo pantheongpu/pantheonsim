@@ -157,22 +157,22 @@ VTEST(every_instruction_of_the_isa_corpora_gives_the_recorded_bits) {
     throw vtest::Failure(std::to_string(wrong_total) + " of " + std::to_string(checked) + " instructions differ from the recorded bits:" + report);
 }
 
-// ds_nop does nothing; ds_append and ds_consume (the wave-wide counters) are not modelled and say so. Neither may read an
+// ds_nop does nothing; ds_append and ds_consume (the wave-wide counters, which origin/main's guide sweep models) run. None may read an
 // address operand the decoder did not give them (a segfault in the build this test was added to).
-VTEST(ds_instructions_without_an_address_fail_gracefully) {
+VTEST(ds_instructions_without_an_address_run_without_reading_one) {
   struct Case {
     const char* name;
     uint32_t word0;
-    bool runs;
+    bool has_vdst;
   };
-  const Case cases[] = {{"ds_nop", 0xD8500000u, true}, {"ds_consume", 0xD8F40000u, false}, {"ds_append", 0xD8F80000u, false}};
+  const Case cases[] = {{"ds_nop", 0xD8500000u, false}, {"ds_consume", 0xD8F40000u, true}, {"ds_append", 0xD8F80000u, true}};
   const amd::gcn::Target targets[] = {amd::gcn::Target::Gfx1030, amd::gcn::Target::Gfx1100, amd::gcn::Target::Gfx1200,
                                       amd::gcn::Target::Gfx1250};
   size_t checked = 0;
   for (amd::gcn::Target t : targets)
     for (const Case& c : cases)
       for (uint32_t vdst : {0u, 5u, 0xC9u}) {
-        const uint32_t word1 = c.runs ? 0u : vdst << 24;
+        const uint32_t word1 = c.has_vdst ? vdst << 24 : 0u;
         std::vector<uint8_t> code;
         for (uint32_t v : {c.word0, word1})
           for (int b = 0; b < 4; ++b) code.push_back(static_cast<uint8_t>(v >> (8 * b)));
@@ -186,8 +186,7 @@ VTEST(ds_instructions_without_an_address_fail_gracefully) {
         for (uint32_t flavour = 0; flavour < 4; ++flavour) {
           std::string error;
           amd::digest_instruction(in, t, 7 + flavour, flavour, &error);
-          if (c.runs) VCHECK(error.empty());
-          else VCHECK(error.find("not modelled") != std::string::npos);
+          VCHECK(error.empty());
           ++checked;
         }
       }

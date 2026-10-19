@@ -68,7 +68,8 @@ bool old_atomic(std::string_view body, OldAtomic* a) {
       {"pk_add_bf16", Rmw::PkAddBf16}, {"add_f64", Rmw::AddF64}, {"min_f64", Rmw::MinF64},
       {"max_f64", Rmw::MaxF64}, {"min_num_f64", Rmw::MinF64}, {"max_num_f64", Rmw::MaxF64},
       {"fmin", Rmw::MinF32}, {"fmax", Rmw::MaxF32}, {"min_f32", Rmw::MinF32}, {"max_f32", Rmw::MaxF32},
-      {"min_num_f32", Rmw::MinF32}, {"max_num_f32", Rmw::MaxF32}};
+      {"min_num_f32", Rmw::MinF32}, {"max_num_f32", Rmw::MaxF32},
+      {"cond_sub_u32", Rmw::CondSub}, {"sub_clamp_u32", Rmw::SubClamp}};
   for (auto [name, rmw] : kNames)
     if (what == name) {
       if (a->bytes == 8 && rmw == Rmw::MinF32) rmw = Rmw::MinF64;
@@ -93,6 +94,7 @@ MemKind old_kind(const std::string& op) {
   OldAtomic atomic;
   OldNarrow n;
   uint32_t bits;
+  if (body == "load_addtid_b32" || body == "store_addtid_b32") return MemKind::AddTid;
   if (body == "load_block" || body == "store_block") return MemKind::Block;
   if (old_transpose(body, &bits)) return MemKind::Transpose;
   if (old_narrow(op, &n)) return MemKind::Narrow;
@@ -143,9 +145,12 @@ Rmw old_scalar_rmw(const std::string& what) {
 SmemKind old_smem(const std::string& n) {
   if (n.find("prefetch") != std::string::npos) return SmemKind::Prefetch;
   if (n == "s_memtime" || n == "s_memrealtime") return SmemKind::Time;
-  if (n == "s_dcache_wb" || n == "s_dcache_inv") return SmemKind::Nop;
+  if (n == "s_dcache_wb" || n == "s_dcache_inv" || n == "s_dcache_wb_vol" || n == "s_dcache_inv_vol" || n == "s_dcache_discard" ||
+      n == "s_dcache_discard_x2" || n == "s_atc_probe" || n == "s_atc_probe_buffer")
+    return SmemKind::Nop;
   if (n.rfind("s_store_dword", 0) == 0) return SmemKind::Store;
-  if (n.rfind("s_atomic_", 0) == 0) return SmemKind::Atomic;
+  if (n.rfind("s_buffer_store_dword", 0) == 0) return SmemKind::BufferStore;
+  if (n.rfind("s_atomic_", 0) == 0 || n.rfind("s_buffer_atomic_", 0) == 0) return SmemKind::Atomic;
   if (n == "s_load_u8" || n == "s_load_i8" || n == "s_load_u16" || n == "s_load_i16") return SmemKind::SubDword;
   if (n.rfind("s_buffer_load_", 0) == 0) return SmemKind::BufferLoad;
   return SmemKind::Load;
@@ -186,7 +191,9 @@ std::string compare(const std::string& name) {
   if (f.smem == SmemKind::SubDword && (f.smem_bytes != (name.back() == '8' ? 1 : 2) || f.smem_sign != (name[7] == 'i'))) return bad("sub-dword");
   if (f.smem == SmemKind::Atomic) {
     const bool wide = name.size() > 3 && name.compare(name.size() - 3, 3, "_x2") == 0;
-    if (f.s_wide != wide || f.s_rmw != old_scalar_rmw(name.substr(9, name.size() - 9 - (wide ? 3 : 0)))) return bad("scalar atomic");
+    const size_t prefix = name.rfind("s_buffer_", 0) == 0 ? 16 : 9;   // "s_buffer_atomic_" or "s_atomic_"
+    if (f.s_wide != wide || f.s_buffer != (prefix == 16) || f.s_rmw != old_scalar_rmw(name.substr(prefix, name.size() - prefix - (wide ? 3 : 0))))
+      return bad("scalar atomic");
   }
   return "";
 }
