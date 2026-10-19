@@ -226,11 +226,6 @@ namespace {
 
 constexpr float kInf = __builtin_inff();
 
-float bits(uint32_t b) {
-  float f;
-  std::memcpy(&f, &b, 4);
-  return f;
-}
 uint32_t of(float f) {
   uint32_t b;
   std::memcpy(&b, &f, 4);
