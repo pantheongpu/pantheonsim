@@ -298,4 +298,36 @@ VTEST(a_fused_multiply_add_of_several_nans_passes_on_the_payload_of_b_then_a_the
   VCHECK_EQ(bits_of(vgpu::amd::mfma_fma(inf, 1.0, -inf)), 0xFFF8000000000000ull);
 }
 
+#if defined(__x86_64__) && defined(__GNUC__)
+// The 4-wide kernels (AVX2) and the 2-wide ones give each other's bits on the same tiles, NaNs and all.
+VTEST(the_four_wide_and_two_wide_tile_kernels_give_the_same_bits) {
+  Rng rng{0xA5A5};
+  const bool had = vgpu::amd::mfma_avx2_switch();
+  for (int round = 0; round < 500; ++round) {
+    static const uint32_t kWide[][3] = {{16, 16, 16}, {32, 32, 8}, {16, 16, 32}, {32, 32, 2}, {16, 16, 128}, {4, 8, 3}, {8, 16, 5}};
+    const auto& sh = kWide[round % 7];
+    const bool nans = round % 3 == 1;
+    const TileCase t = make_tile(rng, sh[0], sh[1], sh[2], [&](Rng& r) { return nans ? nan_or(r, any_double(r)) : any_double(r); });
+    std::vector<double> wide(size_t{t.m} * t.n), narrow(size_t{t.m} * t.n);
+    vgpu::amd::mfma_avx2_switch() = true;
+    vgpu::amd::mfma_tile_f(t.m, t.n, t.k, t.a.data(), t.bk.data(), t.c.data(), wide.data());
+    vgpu::amd::mfma_avx2_switch() = false;
+    vgpu::amd::mfma_tile_f(t.m, t.n, t.k, t.a.data(), t.bk.data(), t.c.data(), narrow.data());
+    for (size_t e = 0; e < wide.size(); ++e) VCHECK_EQ(bits_of(wide[e]), bits_of(narrow[e]));
+    // and the integer kernels
+    const uint32_t k2 = t.k + (t.k & 1);
+    std::vector<int16_t> ia(size_t{t.m} * k2), bi(size_t{k2} * t.n);
+    for (auto& x : ia) x = static_cast<int16_t>(static_cast<int>(rng.next() % 511) - 255);
+    for (auto& x : bi) x = static_cast<int16_t>(static_cast<int>(rng.next() % 511) - 255);
+    std::vector<int32_t> iw(size_t{t.m} * t.n), in(size_t{t.m} * t.n);
+    vgpu::amd::mfma_avx2_switch() = true;
+    vgpu::amd::mfma_tile_int(t.m, t.n, k2, ia.data(), bi.data(), iw.data());
+    vgpu::amd::mfma_avx2_switch() = false;
+    vgpu::amd::mfma_tile_int(t.m, t.n, k2, ia.data(), bi.data(), in.data());
+    for (size_t e = 0; e < iw.size(); ++e) VCHECK_EQ(iw[e], in[e]);
+  }
+  vgpu::amd::mfma_avx2_switch() = had;
+}
+#endif
+
 VTEST_MAIN

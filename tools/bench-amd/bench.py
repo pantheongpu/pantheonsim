@@ -61,7 +61,10 @@ C = _load_common()
 TARGETS = {
     "mi300x": ("gfx942", "amd/mi300x"),
     "rx6800": ("gfx1030", "amd/rx6800"),
+    "rx7900xtx": ("gfx1100", "amd/rx7900xtx"),   # RDNA3: WMMA
+    "rx9070xt": ("gfx1201", "amd/rx9070xt"),     # RDNA4: WMMA
 }
+DEFAULT_TARGETS = ("mi300x", "rx6800")
 # name -> (group, what it measures, targets)
 BOTH = ("mi300x", "rx6800")
 WORKLOADS = {
@@ -69,6 +72,13 @@ WORKLOADS = {
     "valu_f32": ("alu", "f32 fma chains plus unfused mul/add", BOTH),
     "valu_f64": ("alu", "f64 fma chains", BOTH),
     "mfma": ("matrix", "v_mfma_f32_16x16x16_f16 accumulated in a loop (CDNA only; RDNA2 has no matrix unit)", ("mi300x",)),
+    "mfma_i8": ("matrix", "v_mfma_i32_16x16x32_i8 accumulated in a loop (CDNA3)", ("mi300x",)),
+    "mfma_fp8": ("matrix", "v_mfma_f32_16x16x32_fp8_fp8 accumulated in a loop (CDNA3)", ("mi300x",)),
+    "mfma_bf16": ("matrix", "v_mfma_f32_16x16x16_bf16 accumulated in a loop (CDNA3)", ("mi300x",)),
+    "mfma_f64": ("matrix", "v_mfma_f64_16x16x4_f64 accumulated in a loop (CDNA3)", ("mi300x",)),
+    "smfmac": ("matrix", "v_smfmac_f32_16x16x32_f16 (2:4 sparse A) accumulated in a loop (CDNA3)", ("mi300x",)),
+    "wmma": ("matrix", "v_wmma_f32_16x16x16_f16 accumulated in a loop (RDNA3, RDNA4)", ("rx7900xtx", "rx9070xt")),
+    "wmma_iu8": ("matrix", "v_wmma_i32_16x16x16_iu8 accumulated in a loop (RDNA3, RDNA4)", ("rx7900xtx", "rx9070xt")),
     "mem": ("memory", "global memory: 16-byte vector copy, scalar scale, indexed gather", BOTH),
     "lds": ("memory", "LDS with barriers: tree reduction, 32x32 tile transpose", BOTH),
     "atomics": ("memory", "global atomic add (one address, 256 bins), max, a CAS loop", BOTH),
@@ -231,7 +241,7 @@ def selected(args):
     for n in names:
         if n not in WORKLOADS:
             die("unknown workload %s (have: %s)" % (n, ", ".join(WORKLOADS)))
-    targets = args.target.split(",") if args.target != "all" else list(TARGETS)
+    targets = args.target.split(",") if args.target != "all" else list(DEFAULT_TARGETS)
     for t in targets:
         if t not in TARGETS:
             die("unknown target %s (have: %s)" % (t, ", ".join(TARGETS)))
@@ -279,7 +289,9 @@ def metric(wl, run, instr):
         return run["units"] / run["device_wall_s"] if run["device_wall_s"] else 0.0
     if p == "wall_s":
         return run["wall"]
-    return instr / run["device_cpu_s"] if instr and run["device_cpu_s"] else 0.0
+    # (without the counting runs the count is taken as 1: a rate in arbitrary units, whose ratio between two builds is the
+    # ratio of their speeds, the same work being done by both)
+    return (instr or 1) / run["device_cpu_s"] if run["device_cpu_s"] else 0.0
 
 
 def fmt(st, scale=1e6, nd=2):
@@ -366,7 +378,7 @@ def compact(counts):
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--build", action="append", help="build directory (twice for an A/B comparison)")
-    p.add_argument("--target", default="all", help="mi300x, rx6800 or all (default)")
+    p.add_argument("--target", default="all", help="mi300x, rx6800, rx7900xtx, rx9070xt (comma list), or all (default: mi300x and rx6800)")
     p.add_argument("--workloads", help="comma-separated; default all: " + ",".join(WORKLOADS))
     p.add_argument("--runs", type=int, default=9)
     p.add_argument("--size", default="full", choices=("quick", "full"))

@@ -3462,6 +3462,7 @@ struct Machine {
     const std::string_view ta = types.substr(0, us), tb = us == std::string_view::npos ? ta : types.substr(us + 1);
     const bool is_int = out == "i32", half_out = out == "f16" || out == "bf16";
     if (!is_int && out != "f32" && !half_out) return false;
+    const bool out_bf16 = out == "bf16", out_f32 = out == "f32";
     if (K == 0 || K > 32 || (K & 1)) return false;
     // (a signed 8- or 4-bit input is read as an unsigned 32-bit value, which only a saturating sum can tell from a signed one)
     if (is_int && in.clamp && ((in.neg_lo & 1) || ((in.neg_lo >> 1) & 1))) return false;
@@ -3523,9 +3524,9 @@ struct Machine {
           c = co.kind == OperandKind::InlineFloat ? co.fvalue : static_cast<double>(static_cast<int32_t>(scalar(w, co)));
         } else {
           const uint32_t v = w.vgpr.r[co.index + reg][lane];
-          if (out == "f32") c = static_cast<double>(as_float(v));
+          if (out_f32) c = static_cast<double>(as_float(v));
           else if (is_int) c = static_cast<double>(static_cast<int32_t>(v));
-          else if (out == "bf16") c = static_cast<double>(as_float((half ? v >> 16 : v & 0xFFFF) << 16));
+          else if (out_bf16) c = static_cast<double>(as_float((half ? v >> 16 : v & 0xFFFF) << 16));
           else c = half_bits_to_double(static_cast<uint16_t>(half ? v >> 16 : v));
         }
         cd[row * 16 + col] = c;
@@ -3590,11 +3591,11 @@ struct Machine {
           place(row, col, &lane, &reg, &half);
           const double sum = sums[row * 16 + col];
           uint32_t& slot = result[lane][reg];
-          if (out == "f32") {
+          if (out_f32) {
             slot = as_bits(static_cast<float>(sum));
           } else {
             uint32_t bits;
-            if (out == "bf16") {
+            if (out_bf16) {
               const uint32_t f = as_bits(static_cast<float>(sum));
               bits = std::isnan(as_float(f)) ? 0x7FC0 : (f + 0x7FFF + ((f >> 16) & 1)) >> 16;   // to nearest even
             } else {

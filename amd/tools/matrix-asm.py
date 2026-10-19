@@ -4,7 +4,7 @@ shapes each, for amd/tools/isa-corpus.py to turn into amd/tests/data/isa_corpus_
 
   amd/tools/matrix-asm.py gfx942 > m.s
   llvm-mc -triple=amdgcn-amd-amdhsa -mcpu=gfx942 -filetype=obj m.s -o m.o
-  amd/tools/isa-corpus.py --mcpu=gfx942 llvm-objdump isa_corpus_matrix_gfx942.txt m.o
+  amd/tools/isa-corpus.py --mcpu=gfx942 --all llvm-objdump isa_corpus_matrix_gfx942.txt m.o
 
 Mnemonics the assembler refuses are left out (stderr says which when run with llvm-mc -show-encoding).
 """
@@ -54,7 +54,8 @@ def mfma_lines():
         out.append(f'{mn} {regs(outs, 0)}, {regs(areg, 64)}, {regs(areg, 80)}, 0')
         out.append(f'{mn} {regs(outs, 32)}, {regs(areg, 64)}, {regs(areg, 80)}, {regs(outs, 32)}')
         out.append(f'{mn} {regs(outs, 0, "a")}, {regs(areg, 64)}, {regs(areg, 80)}, {regs(outs, 0, "a")}')
-        out.append(f'{mn} {regs(outs, 0, "a")}, {regs(areg, 64)}, {regs(areg, 80)}, 1.0')
+        for const in (['1.0', '-0.5', '1'] if o != 'i32' else ['1', '-2']):
+            out.append(f'{mn} {regs(outs, 0, "a")}, {regs(areg, 64)}, {regs(areg, 80)}, {const}')
         if B > 1:
             out.append(f'{mn} {regs(outs, 0)}, {regs(areg, 64)}, {regs(areg, 80)}, {regs(outs, 0)} cbsz:1 abid:1')
     return out
@@ -103,10 +104,13 @@ def wmma_lines():
         out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 32)}, 0')
         out.append(f'{mn} {regs(d, 8)}, {regs(a, 16)}, {regs(b, 32)}, {regs(d, 8)}')
         if 'iu' in n:
+            out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 32)}, 7')
             out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 32)}, {regs(d, 0)} neg_lo:[1,1,0]')
+            out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 32)}, {regs(d, 0)} neg_lo:[0,1,0]')
             out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 32)}, {regs(d, 0)} neg_lo:[1,0,0] clamp')
         else:
-            out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 32)}, 1.0')
+            for const in ('1.0', '-0.5', '1'):
+                out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 32)}, {const}')
             if g11 and n.startswith(('f16_', 'bf16_')):
                 out.append(f'{mn} {regs(d, 0)}, {regs(a, 16)}, {regs(b, 32)}, {regs(d, 0)} op_sel:[0,0,1]')
     return out

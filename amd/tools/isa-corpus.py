@@ -5,7 +5,7 @@ distinct shape -- mnemonic, operand kinds, modifiers -- up to a few of each
 mnemonic. test_amd_gcn decodes every one and compares, so the decoder is
 checked against what ROCm's libraries actually contain, in CI, without ROCm.
 
-  amd/tools/isa-corpus.py [--mcpu=gfx950] <llvm-objdump> <out> <code object>...
+  amd/tools/isa-corpus.py [--mcpu=gfx950] [--all] <llvm-objdump> <out> <code object>...
 
 gfx942 unless --mcpu names another target (isa_corpus_gfx950.txt is gfx950's).
 
@@ -17,8 +17,13 @@ import sys
 
 args = sys.argv[1:]
 mcpu = 'gfx942'
-if args and args[0].startswith('--mcpu='):
-    mcpu = args.pop(0).split('=', 1)[1]
+keep_all = False   # --all: every instruction of the objects, in order (a hand-written set, amd/tools/matrix-asm.py's)
+while args and args[0].startswith('--'):
+    a = args.pop(0)
+    if a.startswith('--mcpu='):
+        mcpu = a.split('=', 1)[1]
+    elif a == '--all':
+        keep_all = True
 objdump, out, objects = args[0], args[1], args[2:]
 PER_MNEMONIC = 6
 line_re = re.compile(r'^\t(\S+)(.*?)\s*// [0-9A-F]+: ((?:[0-9A-F]{8} ?)+)$')
@@ -45,8 +50,8 @@ for obj in objects:
         # A branch prints its target as a label, which only the whole object has.
         if 'branch' in mnem or mnem == 's_call_b64' or 'label_' in ops:
             continue
-        key = shape(mnem, ops)
-        if key in seen or per.get(mnem, 0) >= PER_MNEMONIC:
+        key = shape(mnem, ops) if not keep_all else len(seen)
+        if not keep_all and (key in seen or per.get(mnem, 0) >= PER_MNEMONIC):
             continue
         text = re.sub(r'\s+', ' ', (mnem + ops).strip())
         seen[key] = (' '.join(words), text)
@@ -56,7 +61,7 @@ for obj in objects:
 with open(out, 'w') as f:
     f.write(f'# {mcpu} instructions from ROCm\'s libraries: the encoding (little-endian 32-bit words)\n'
             '# and llvm-objdump\'s text for it. Written by amd/tools/isa-corpus.py.\n')
-    for key in sorted(seen, key=lambda k: seen[k][1]):
+    for key in (list(seen) if keep_all else sorted(seen, key=lambda k: seen[k][1])):
         words, text = seen[key]
         f.write(f'{words}\t{text}\n')
 print(f'{len(seen)} instructions, {len(per)} mnemonics')
