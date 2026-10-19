@@ -7,13 +7,16 @@
 #include <sys/resource.h>
 
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
+#include <system_error>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "../../src/gcn_pool.hpp"
 #include "vgpu/amd_codeobject.hpp"
 #include "vgpu/amd_exec.hpp"
 #include "vtest.hpp"
@@ -84,6 +87,36 @@ VTEST(a_dispatch_finishes_when_the_host_will_not_start_its_threads) {
   mem.read(pout, out.data(), kN * 8);
   for (int i = 0; i < kN; ++i) VCHECK_EQ(out[i], in[(i + 1) & 63] * 2.0 + in[(i + 5) & 63] * 2.0);
   VCHECK_EQ(stats.waves, static_cast<uint64_t>(kGroups));   // every group ran, on the launching thread
+}
+
+// The worker pool (amd/src/gcn_pool.hpp) the dispatch's threads come from: tasks that are independent run, every one,
+// on the launching thread when the host gives no thread; tasks that wait on one another start none and throw.
+VTEST(the_pool_runs_tasks_here_when_the_host_gives_no_thread_and_refuses_tasks_that_must_run_together) {
+  NoNewThreads refuse;
+  if (!refuse.effective) {
+    std::printf("SKIP: this process is allowed to start threads past RLIMIT_NPROC\n");
+    return;
+  }
+  std::atomic<unsigned> ran{0}, mask{0};
+  const std::thread::id here = std::this_thread::get_id();
+  std::atomic<bool> all_here{true};
+  amd::pool::run(5, [&](unsigned i) {
+    ++ran;
+    mask |= 1u << i;
+    if (std::this_thread::get_id() != here) all_here = false;
+  });
+  VCHECK_EQ(ran.load(), 5u);
+  VCHECK_EQ(mask.load(), 31u);
+  VCHECK(all_here.load());   // (a worker the pool made before the limit may have taken some; none was made, as it is the first launch)
+  ran = 0;
+  bool threw = false;
+  try {
+    amd::pool::run_together(5, [&](unsigned) { ++ran; });
+  } catch (const std::system_error&) {
+    threw = true;
+  }
+  VCHECK(threw);
+  VCHECK_EQ(ran.load(), 0u);   // none started, so none is left waiting for a task that was never run
 }
 
 VTEST_MAIN
