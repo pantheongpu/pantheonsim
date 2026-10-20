@@ -1,0 +1,75 @@
+  done int_alu        sass
+  done f32_fma        sass
+  done f64_fma        sass
+  done f64_subnormal  sass
+  done wmma           sass
+  done mma_ptx        sass
+  done mem            sass
+  done shared         sass
+  done atomics        sass
+  done texture        sass
+  done local          sass
+  done divergent      sass
+  done warp           sass
+  done launch         sass
+  done api            sass
+  done startup        sass
+
+workload       eng    warp-instr  med Mi/s best Mi/s  spread   wall s    cpu s  RSS MB  note
+--------------------------------------------------------------------------------------------
+int_alu        sass     11142656     99.25    100.13    2.9%    0.130    0.128     8.7  build A
+int_alu        sass     11142656    100.92    101.44    0.8%    0.128    0.126     7.1  build B
+f32_fma        sass      5386752    109.01    109.35    2.3%    0.079    0.078     8.8  build A
+f32_fma        sass      5386752    114.66    115.87   17.0%    0.077    0.076     7.3  build B
+f64_fma        sass      2303744     46.23     46.34    1.1%    0.064    0.063     8.8  build A
+f64_fma        sass      2303744     50.90     51.06    1.0%    0.060    0.058     7.6  build B
+f64_subnormal  sass       852544      5.93      5.96    0.6%    0.148    0.146     8.5  build A
+f64_subnormal  sass       852544      6.09      6.12    0.9%    0.144    0.142     7.3  build B
+wmma           sass       308096      1.39      1.40    3.6%    0.227    0.224     8.7  build A
+wmma           sass       308096      1.40      1.40    0.4%    0.225    0.222     7.5  build B
+mma_ptx        sass       301728      2.71      2.71    0.5%    0.116    0.114     8.7  build A
+mma_ptx        sass       301728      2.71      2.72    0.3%    0.115    0.114     7.3  build B
+mem            sass      4896768     16.41     16.47    0.6%    0.317    0.310    40.6  build A
+mem            sass      4896768     18.51     18.54    0.4%    0.282    0.275    39.1  build B
+shared         sass      1395008     19.56     19.61    0.7%    0.076    0.074    10.3  build A
+shared         sass      1395008     21.20     21.27    0.5%    0.070    0.069     9.0  build B
+atomics        sass       313472      7.79      7.82    1.0%    0.044    0.043     9.0  build A
+atomics        sass       313472      8.50      8.59    2.3%    0.041    0.040     7.5  build B
+texture        sass       482304      3.44      3.45    0.3%    0.146    0.144     8.9  build A
+texture        sass       482304      4.07      4.07    0.5%    0.124    0.122     7.6  build B
+local          sass      6958848     37.74     37.83    1.1%    0.190    0.188     8.8  build A
+local          sass      6958848     38.81     38.88    0.6%    0.185    0.183     7.5  build B
+divergent      sass      9969033     30.86     30.92    0.5%    0.336    0.332     8.7  build A
+divergent      sass      9969033     31.85     31.89    0.4%    0.326    0.321     7.3  build B
+warp           sass      5126144     64.36     64.52    0.7%    0.086    0.085     8.7  build A
+warp           sass      5126144     62.29     62.42    0.4%    0.089    0.088     7.3  build B
+launch         sass       360000     467.0     470.6    1.1%    0.088    0.087     8.4  columns are k launches/s, build A
+launch         sass       360000     457.3     459.9    1.0%    0.090    0.089     7.0  columns are k launches/s, build B
+api            sass            0    4305.2    4329.1    1.2%    0.212    0.209     8.1  columns are k api_calls/s, build A
+api            sass            0    4467.8    4485.9    0.7%    0.204    0.201     6.8  columns are k api_calls/s, build B
+startup        sass            9         -         -    4.4%    0.004    0.004     7.0  wall time only, build A
+startup        sass            9         -         -    3.8%    0.004    0.003     5.8  wall time only, build B
+
+A/B, B relative to A (ratio > 1: B is faster). Metric: Minst/s, k units/s, or 1/wall.
+median/best = ratio of the medians / of the best runs; p = Mann-Whitney on the per-run values;
+verdict needs p <= 0.05 and both ratios beyond 2%, else 'same'.
+workload       eng  metric               A med     B med  med B/A best B/A      p  verdict counters
+---------------------------------------------------------------------------------------------------
+int_alu        sass winst_per_cpu_s     99.249   100.916   1.017x   1.013x  0.000  same   identical
+f32_fma        sass winst_per_cpu_s    109.006   114.658   1.052x   1.060x  0.004  faster identical
+f64_fma        sass winst_per_cpu_s     46.229    50.901   1.101x   1.102x  0.000  faster identical
+f64_subnormal  sass winst_per_cpu_s      5.932     6.095   1.027x   1.027x  0.000  faster identical
+wmma           sass winst_per_cpu_s      1.394     1.402   1.005x   1.004x  0.000  same   identical
+mma_ptx        sass winst_per_cpu_s      2.706     2.714   1.003x   1.003x  0.000  same   identical
+mem            sass winst_per_cpu_s     16.412    18.511   1.128x   1.125x  0.000  faster identical
+shared         sass winst_per_cpu_s     19.558    21.201   1.084x   1.085x  0.000  faster identical
+atomics        sass winst_per_cpu_s      7.789     8.497   1.091x   1.099x  0.000  faster identical
+texture        sass winst_per_cpu_s      3.439     4.067   1.183x   1.182x  0.000  faster identical
+local          sass winst_per_cpu_s     37.745    38.808   1.028x   1.028x  0.000  faster identical
+divergent      sass winst_per_cpu_s     30.857    31.854   1.032x   1.032x  0.000  faster identical
+warp           sass winst_per_cpu_s     64.359    62.292   0.968x   0.968x  0.000  slower identical
+launch         sass units_per_s        467.033   457.274   0.979x   0.977x  0.000  slower identical
+api            sass units_per_s       4305.190  4467.787   1.038x   1.036x  0.000  faster identical
+startup        sass wall_s               0.004     0.004   1.027x   1.029x  0.003  faster identical
+
+host: Intel(R) Xeon(R) Platinum 8488C, 16 logical CPUs, load 4.36 12.84 16.53 -> 3.64 11.46 15.89; nvcc 13.0.88; VGPU_THREADS=1; GPU profile nvidia/rtx3060; 9 timed runs after 1 warmup

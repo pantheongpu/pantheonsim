@@ -1,0 +1,19 @@
+uptime:  05:39:47 up  1:53,  8 users,  load average: 11.78, 19.14, 24.46
+== unsupported (7 cubins, one process each run), ms
+loadbase unsupported total: 519.3 ms over 7 cubins
+load unsupported total: 89.1 ms over 7 cubins
+loadbase unsupported total: 517.9 ms over 7 cubins
+load unsupported total: 89.4 ms over 7 cubins
+loadbase unsupported total: 517.3 ms over 7 cubins
+load unsupported total: 88.9 ms over 7 cubins
+loadbase unsupported total: 514.4 ms over 7 cubins
+load unsupported total: 88.9 ms over 7 cubins
+loadbase unsupported total: 515.8 ms over 7 cubins
+load unsupported total: 89.1 ms over 7 cubins
+== decode bench
+loadbase 
+load 
+loadbase 
+load 
+loadbase 
+load 

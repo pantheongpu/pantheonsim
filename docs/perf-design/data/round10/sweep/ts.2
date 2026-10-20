@@ -1,0 +1,165 @@
+0.31 +0.31 [vgpu] virtual GPU platform initialized: 1 x nvidia/rtx5090 (NVIDIA Ge
+1.18 +0.87 # start Conv1d stride 2, padding 1
+1.18 +0.00 [vgpu] cuDNN handle created (host-computed; see nvidia/docs/libraries.
+1.31 +0.12 [vgpu] cuDNN handle created (host-computed; see nvidia/docs/libraries.
+1.31 +0.01 ok Conv1d stride 2, padding 1  (0.1 s)
+1.31 +0.00 # start Conv2d groups 2, padding 1
+1.35 +0.04 ok Conv2d groups 2, padding 1  (0.0 s)
+1.35 +0.00 # start Conv2d dilation 2, stride 2, reflect padding
+1.37 +0.01 ok Conv2d dilation 2, stride 2, reflect padding  (0.0 s)
+1.37 +0.00 # start Conv2d 1x1 without bias
+1.37 +0.00 ok Conv2d 1x1 without bias  (0.0 s)
+1.37 +0.00 # start Conv2d depthwise 3x3
+1.40 +0.03 ok Conv2d depthwise 3x3  (0.0 s)
+1.40 +0.00 # start Conv2d half
+1.44 +0.04 ok Conv2d half  (0.0 s)
+1.44 +0.00 # start Conv2d bfloat16
+1.45 +0.01 ok Conv2d bfloat16  (0.0 s)
+1.45 +0.00 # start Conv3d padding 1
+1.46 +0.00 ok Conv3d padding 1  (0.0 s)
+1.46 +0.00 # start ConvTranspose1d stride 2
+1.46 +0.01 ok ConvTranspose1d stride 2  (0.0 s)
+1.46 +0.00 # start ConvTranspose2d stride 2, output padding
+1.47 +0.01 ok ConvTranspose2d stride 2, output padding  (0.0 s)
+1.47 +0.00 # start ConvTranspose2d groups 2
+1.48 +0.01 ok ConvTranspose2d groups 2  (0.0 s)
+1.48 +0.00 # start ConvTranspose3d stride 2
+1.48 +0.00 ok ConvTranspose3d stride 2  (0.0 s)
+1.48 +0.00 # start Conv2d with cuDNN disabled (PyTorch's native kernels)
+1.49 +0.00 [vgpu] cuBLAS handle created (host-computed; see nvidia/docs/cublas.md
+1.49 +0.00 [vgpu] cuBLAS handle created (host-computed; see nvidia/docs/cublas.md
+1.50 +0.01 ok Conv2d with cuDNN disabled (PyTorch's native kernels)  (0.0 s)
+1.50 +0.00 # start Conv + BatchNorm + ReLU, channels last
+1.56 +0.07 ok Conv + BatchNorm + ReLU, channels last  (0.1 s)
+1.56 +0.00 # start Unfold and Fold
+1.57 +0.01 ok Unfold and Fold  (0.0 s)
+1.57 +0.00 # start PixelShuffle and PixelUnshuffle
+1.58 +0.00 ok PixelShuffle and PixelUnshuffle  (0.0 s)
+1.58 +0.00 # start ChannelShuffle
+1.58 +0.00 ok ChannelShuffle  (0.0 s)
+1.58 +0.00 # start reflect padding 2d
+1.58 +0.00 ok reflect padding 2d  (0.0 s)
+1.58 +0.00 # start replicate padding 2d
+1.59 +0.01 ok replicate padding 2d  (0.0 s)
+1.59 +0.00 # start circular padding 2d
+1.59 +0.00 ok circular padding 2d  (0.0 s)
+1.59 +0.00 # start zero padding 2d
+1.60 +0.00 ok zero padding 2d  (0.0 s)
+1.60 +0.00 # start reflect padding 1d
+1.60 +0.00 ok reflect padding 1d  (0.0 s)
+1.60 +0.00 # start replicate padding 3d
+1.60 +0.00 ok replicate padding 3d  (0.0 s)
+1.60 +0.00 # start MaxPool1d
+1.61 +0.01 ok MaxPool1d  (0.0 s)
+1.61 +0.00 # start MaxPool2d ceil mode, dilation
+1.61 +0.00 ok MaxPool2d ceil mode, dilation  (0.0 s)
+1.61 +0.00 # start MaxPool3d
+1.62 +0.01 ok MaxPool3d  (0.0 s)
+1.62 +0.00 # start AvgPool1d
+1.63 +0.01 ok AvgPool1d  (0.0 s)
+1.63 +0.00 # start AvgPool2d divisor override
+1.63 +0.00 ok AvgPool2d divisor override  (0.0 s)
+1.63 +0.00 # start AvgPool3d
+1.64 +0.01 ok AvgPool3d  (0.0 s)
+1.64 +0.00 # start AdaptiveAvgPool1d
+1.65 +0.01 ok AdaptiveAvgPool1d  (0.0 s)
+1.65 +0.00 # start AdaptiveAvgPool2d
+1.66 +0.00 ok AdaptiveAvgPool2d  (0.0 s)
+1.66 +0.00 # start AdaptiveAvgPool3d
+1.67 +0.01 ok AdaptiveAvgPool3d  (0.0 s)
+1.67 +0.00 # start AdaptiveMaxPool2d
+1.68 +0.01 ok AdaptiveMaxPool2d  (0.0 s)
+1.68 +0.00 # start LPPool2d
+1.88 +0.20 ok LPPool2d  (0.2 s)
+1.88 +0.00 # start max_pool2d with indices, then max_unpool2d
+2.22 +0.34 ok max_pool2d with indices, then max_unpool2d  (0.3 s)
+2.22 +0.00 # start fractional_max_pool2d with fixed samples
+2.23 +0.01 ok fractional_max_pool2d with fixed samples  (0.0 s)
+2.23 +0.00 # start interpolate nearest
+2.24 +0.01 ok interpolate nearest  (0.0 s)
+2.24 +0.00 # start interpolate nearest-exact
+2.24 +0.00 ok interpolate nearest-exact  (0.0 s)
+2.24 +0.00 # start interpolate bilinear, align_corners=False
+2.25 +0.01 ok interpolate bilinear, align_corners=False  (0.0 s)
+2.25 +0.00 # start interpolate bilinear, align_corners=True
+2.26 +0.00 ok interpolate bilinear, align_corners=True  (0.0 s)
+2.26 +0.00 # start interpolate bicubic, align_corners=False
+2.27 +0.01 ok interpolate bicubic, align_corners=False  (0.0 s)
+2.27 +0.00 # start interpolate area
+2.27 +0.01 ok interpolate area  (0.0 s)
+2.27 +0.00 # start interpolate trilinear
+2.28 +0.01 ok interpolate trilinear  (0.0 s)
+2.28 +0.00 # start interpolate linear (1d)
+2.29 +0.01 ok interpolate linear (1d)  (0.0 s)
+2.29 +0.00 # start interpolate bilinear with antialias
+2.30 +0.01 ok interpolate bilinear with antialias  (0.0 s)
+2.30 +0.00 # start affine_grid and grid_sample, every mode and padding, with grad
+2.40 +0.11 ok affine_grid and grid_sample, every mode and padding, with gradients
+2.40 +0.00 # start BatchNorm1d training
+2.41 +0.00 ok BatchNorm1d training  (0.0 s)
+2.41 +0.00 # start BatchNorm2d training (running statistics)
+2.41 +0.00 ok BatchNorm2d training (running statistics)  (0.0 s)
+2.41 +0.00 # start BatchNorm3d training
+2.41 +0.00 ok BatchNorm3d training  (0.0 s)
+2.41 +0.00 # start BatchNorm2d eval
+2.46 +0.05 ok BatchNorm2d eval  (0.0 s)
+2.46 +0.00 # start BatchNorm2d half
+2.47 +0.01 ok BatchNorm2d half  (0.0 s)
+2.47 +0.00 # start BatchNorm2d without statistics
+2.47 +0.00 ok BatchNorm2d without statistics  (0.0 s)
+2.47 +0.00 # start LayerNorm
+2.51 +0.04 ok LayerNorm  (0.0 s)
+2.51 +0.00 # start LayerNorm without affine
+2.51 +0.01 ok LayerNorm without affine  (0.0 s)
+2.51 +0.00 # start LayerNorm half
+2.52 +0.01 ok LayerNorm half  (0.0 s)
+2.52 +0.00 # start LayerNorm bfloat16
+2.53 +0.01 ok LayerNorm bfloat16  (0.0 s)
+2.53 +0.00 # start GroupNorm
+2.58 +0.06 ok GroupNorm  (0.1 s)
+2.58 +0.00 # start GroupNorm half
+2.59 +0.01 ok GroupNorm half  (0.0 s)
+2.59 +0.00 # start InstanceNorm1d affine
+2.60 +0.00 ok InstanceNorm1d affine  (0.0 s)
+2.60 +0.00 # start InstanceNorm2d with running statistics
+2.64 +0.04 ok InstanceNorm2d with running statistics  (0.0 s)
+2.64 +0.00 # start LocalResponseNorm
+2.65 +0.01 ok LocalResponseNorm  (0.0 s)
+2.65 +0.00 # start RMSNorm
+2.65 +0.01 ok RMSNorm  (0.0 s)
+2.65 +0.00 # start RMSNorm half
+2.66 +0.01 ok RMSNorm half  (0.0 s)
+2.66 +0.00 # start BatchNorm2d running statistics over three steps, then eval
+2.66 +0.00 ok BatchNorm2d running statistics over three steps, then eval  (0.0 s)
+2.66 +0.00 # start activations (28 functions)
+3.04 +0.38 ok activations (28 functions)  (0.4 s)
+3.04 +0.00 # start Linear
+3.05 +0.01 ok Linear  (0.0 s)
+3.05 +0.00 # start Linear, three dimensions, no bias
+3.05 +0.00 ok Linear, three dimensions, no bias  (0.0 s)
+3.05 +0.00 # start Linear half
+3.06 +0.01 ok Linear half  (0.0 s)
+3.06 +0.00 # start Bilinear
+3.07 +0.01 ok Bilinear  (0.0 s)
+3.07 +0.00 # start Embedding with padding_idx
+3.09 +0.02 ok Embedding with padding_idx  (0.0 s)
+3.09 +0.00 # start EmbeddingBag sum
+3.20 +0.11 ok EmbeddingBag sum  (0.1 s)
+3.20 +0.00 # start EmbeddingBag mean
+3.24 +0.04 ok EmbeddingBag mean  (0.0 s)
+3.24 +0.00 # start EmbeddingBag max
+3.31 +0.07 ok EmbeddingBag max  (0.1 s)
+3.31 +0.00 # start embedding_bag with offsets, empty bag and per-sample weights
+3.35 +0.04 ok embedding_bag with offsets, empty bag and per-sample weights  (0.0 
+3.35 +0.00 # start Embedding with sparse gradients
+3.37 +0.02 ok Embedding with sparse gradients  (0.0 s)
+3.37 +0.00 # start one_hot
+3.41 +0.05 ok one_hot  (0.0 s)
+3.41 +0.00 # start Dropout variants in eval mode
+3.42 +0.00 ok Dropout variants in eval mode  (0.0 s)
+3.42 +0.00 # start cosine_similarity, pairwise_distance, pdist, cdist
+3.82 +0.40 ok cosine_similarity, pairwise_distance, pdist, cdist  (0.4 s)
+3.82 +0.00 # start normalize and softmax with a dtype
+3.89 +0.07 ok normalize and softmax with a dtype  (0.1 s)
+3.89 +0.00 # 79 of 79 checks ok, 0 known failures
+4.59 EOF

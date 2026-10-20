@@ -22,5 +22,32 @@ GROUPS = {
     'graphs': 'g_graphs', 'compile': 'g_compile', 'multi': 'g_multi', 'vision': 'g_vision',
     'audio': 'g_audio', 'hf': 'g_hf', 'sdpa': 'g_sdpa',
 }
-sys.exit(harness.main(sys.argv[1:], {g: m for g, m in GROUPS.items() if os.path.exists(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sweep', m + '.py'))}))
+
+
+def _run():
+    return harness.main(sys.argv[1:], {g: m for g, m in GROUPS.items() if os.path.exists(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sweep', m + '.py'))})
+
+
+if __name__ == '__main__':
+    # Leave without Py_FinalizeEx. PyTorch's autograd engine keeps a worker thread (pt_autograd_0) that, on a busy
+    # or single CPU, takes the GIL while the interpreter is being finalised and the process dies with "terminate
+    # called without an active exception" (exit 134) after every result is printed. Every check has printed its
+    # line by now, and nothing here needs finalisation (no atexit handler of ours writes a file), so flush and
+    # exit with the status sys.exit would have given: 0, 1 for an uncaught exception, or what SystemExit carried.
+    try:
+        _code = _run()
+    except SystemExit as e:
+        _code = e.code
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        _code = 1
+    if _code is None:
+        _code = 0
+    elif not isinstance(_code, int):
+        print(_code, file=sys.stderr)
+        _code = 1
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_code)

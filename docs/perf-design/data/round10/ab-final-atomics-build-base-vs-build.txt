@@ -1,0 +1,37 @@
+ 07:29:25 up  3:43,  0 user,  load average: 17.64, 17.67, 11.63
+workload       eng    warp-instr  med Mi/s best Mi/s  spread   wall s    cpu s  RSS MB  note
+workload       eng  metric               A med     B med  med B/A best B/A      p  verdict counters
+int_alu        sass winst_per_cpu_s     37.422    37.065   0.990x   0.992x  0.004  same   identical
+int_alu        ptx  winst_per_cpu_s     61.472    61.448   1.000x   1.003x  0.678  same   identical
+f32_fma        sass winst_per_cpu_s     41.589    41.482   0.997x   0.998x  0.561  same   identical
+f32_fma        ptx  winst_per_cpu_s     59.369    59.290   0.999x   0.997x  0.431  same   identical
+f64_fma        sass winst_per_cpu_s     29.386    29.478   1.003x   1.003x  0.031  same   identical
+f64_fma        ptx  winst_per_cpu_s     27.030    27.028   1.000x   1.002x  0.934  same   identical
+f64_subnormal  sass winst_per_cpu_s      5.572     5.574   1.000x   0.998x  0.868  same   identical
+f64_subnormal  ptx  winst_per_cpu_s      5.379     5.378   1.000x   1.001x  0.868  same   identical
+wmma           sass winst_per_cpu_s      1.258     1.266   1.006x   1.004x  0.000  same   identical
+wmma           ptx  winst_per_cpu_s      0.824     0.817   0.992x   0.992x  0.000  same   identical
+mma_ptx        sass winst_per_cpu_s      2.426     2.422   0.999x   0.999x  0.191  same   identical
+mma_ptx        ptx  winst_per_cpu_s      0.531     0.532   1.001x   1.001x  0.361  same   identical
+mem            sass winst_per_cpu_s     11.894    11.759   0.989x   0.990x  0.000  same   identical
+mem            ptx  winst_per_cpu_s     10.974    10.750   0.980x   0.978x  0.000  slower identical
+shared         sass winst_per_cpu_s     13.312    13.152   0.988x   0.988x  0.000  same   identical
+shared         ptx  winst_per_cpu_s      9.334     9.202   0.986x   0.990x  0.000  same   identical
+atomics        sass winst_per_cpu_s      5.982     6.146   1.027x   1.026x  0.000  faster identical
+atomics        ptx  winst_per_cpu_s      2.038     3.482   1.709x   1.691x  0.000  faster identical
+texture        sass winst_per_cpu_s      3.188     3.213   1.008x   1.009x  0.000  same   identical
+texture        ptx  winst_per_cpu_s      1.700     1.716   1.010x   1.009x  0.000  same   identical
+local          sass winst_per_cpu_s     18.957    19.378   1.022x   1.022x  0.000  faster identical
+local          ptx  winst_per_cpu_s     18.009    18.258   1.014x   1.010x  0.000  same   identical
+divergent      sass winst_per_cpu_s     16.190    16.154   0.998x   0.998x  0.000  same   identical
+divergent      ptx  winst_per_cpu_s     28.350    28.339   1.000x   0.995x  0.967  same   identical
+warp           sass winst_per_cpu_s     19.296    19.492   1.010x   1.010x  0.000  same   identical
+warp           ptx  winst_per_cpu_s     48.621    48.508   0.998x   0.997x  0.213  same   identical
+launch         sass units_per_s        384.660   394.672   1.026x   1.023x  0.000  faster identical
+launch         ptx  units_per_s        307.721   305.927   0.994x   0.993x  0.000  same   identical
+api            sass units_per_s       4341.597  4335.887   0.999x   0.997x  0.340  same   identical
+api            ptx  units_per_s       4341.597  4332.985   0.998x   0.997x  0.245  same   identical
+startup        sass wall_s               0.004     0.004   1.003x   1.003x  0.320  same   identical
+startup        ptx  wall_s               0.016     0.015   1.000x   0.999x  0.619  same   identical
+host: Intel(R) Xeon(R) Platinum 8488C, 16 logical CPUs, load 13.85 16.80 11.48 -> 1.43 8.71 9.31; nvcc 13.0.88; VGPU_THREADS=1; GPU profile nvidia/rtx3060; 15 timed runs after 1 warmup
+ 07:33:20 up  3:47,  0 user,  load average: 1.43, 8.71, 9.31

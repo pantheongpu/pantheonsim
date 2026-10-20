@@ -117,6 +117,13 @@ the first three no decoder produces) takes the kernel to its PTX, and the "not
 implemented yet" faults at the foot of the instruction groups are unreachable for
 the ones it lists.
 
+Blackwell's packed fp32 (`FFMA2`, `FMUL2`, `FADD2`, sm_100 and sm_103: what ptxas emits for `fma/mul/add.{rn,rz,rm,rp}{,.ftz}.f32x2`;
+sm_120 lowers the same PTX to scalar instructions) runs on SASS, with the register-pair, one-register-for-both-lanes (`.F32`), immediate and
+uniform-register operand forms, the swizzles (`.F32x2.LO_HI`), `|x|`, `-x` and `.NP` (the second lane's sign opposite to the first's). Each
+lane is the arithmetic of the PTX engine's `f32x2` (`vgpu/exec/f32x2.hpp`, shared by the two engines; a NaN result is the canonical
+`0x7fffffff`). Forms nothing here knows the meaning of (`.FMZ`, both swizzle bits, an immediate without the `.F32` bit) are left to the PTX
+engine. The encodings are derived from nvdisasm's output, in `docs/perf-design/round10-ffma2.md`; none of it has been checked on a card.
+
 Dynamic parallelism runs on SASS as on PTX. A program using it links CUDA's
 device runtime library into its cubin; the loader resolves the relocations
 that brings (`R_CUDA_G64`, function descriptors: a kernel's descriptor is its

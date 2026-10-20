@@ -1,0 +1,2 @@
+quick pairs: {'identical': 33, 'differ only by the exit abort line': 3} ; real differences: [] ; runs that ended in SIGABRT (rc 134), tier off / tier on: 4 / 7 of 36 each
+full pairs: {'identical': 52, 'differ only by the exit abort line': 8} ; real differences: [] ; runs that ended in SIGABRT (rc 134), tier off / tier on: 10 / 12 of 60 each

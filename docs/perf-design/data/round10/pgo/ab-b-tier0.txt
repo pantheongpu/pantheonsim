@@ -1,0 +1,140 @@
+bench: built bench_kernels.13.0.88.fbfe9ef9fc28316f with nvcc 13.0.88 in 2.2 s
+  done int_alu        sass
+  done int_alu        ptx 
+  done f32_fma        sass
+  done f32_fma        ptx 
+  done f64_fma        sass
+  done f64_fma        ptx 
+  done f64_subnormal  sass
+  done f64_subnormal  ptx 
+  done wmma           sass
+  done wmma           ptx 
+  done mma_ptx        sass
+  done mma_ptx        ptx 
+  done mem            sass
+  done mem            ptx 
+  done shared         sass
+  done shared         ptx 
+  done atomics        sass
+  done atomics        ptx 
+  done texture        sass
+  done texture        ptx 
+  done local          sass
+  done local          ptx 
+  done divergent      sass
+  done divergent      ptx 
+  done warp           sass
+  done warp           ptx 
+  done launch         sass
+  done launch         ptx 
+  done api            sass
+  done api            ptx 
+  done startup        sass
+  done startup        ptx 
+
+workload       eng    warp-instr  med Mi/s best Mi/s  spread   wall s    cpu s  RSS MB  note
+--------------------------------------------------------------------------------------------
+int_alu        sass     11142656     37.28     37.38    1.0%    0.320    0.315     8.7  build A
+int_alu        sass     11142656     39.87     40.13    1.4%    0.299    0.295     7.4  build B
+int_alu        ptx      11430656     62.00     62.36    5.2%    0.203    0.200    15.2  build A
+int_alu        ptx      11430656     60.62     60.82    1.6%    0.208    0.205    13.8  build B
+f32_fma        sass      5386752     41.18     41.35    0.8%    0.162    0.160     8.6  build A
+f32_fma        sass      5386752     43.67     43.81    2.0%    0.155    0.152     7.4  build B
+f32_fma        ptx       5426432     59.25     59.55    8.1%    0.124    0.121    15.2  build A
+f32_fma        ptx       5426432     63.90     64.20    7.6%    0.116    0.114    13.8  build B
+f64_fma        sass      2303744     29.19     29.26    2.2%    0.094    0.093     8.8  build A
+f64_fma        sass      2303744     31.70     31.85    0.8%    0.088    0.087     7.5  build B
+f64_fma        ptx       2270976     27.05     27.11    1.1%    0.100    0.098    15.2  build A
+f64_fma        ptx       2270976     29.80     29.94    1.2%    0.092    0.090    13.9  build B
+f64_subnormal  sass       852544      5.56      5.57    0.4%    0.158    0.156     8.6  build A
+f64_subnormal  sass       852544      5.71      5.71    0.3%    0.154    0.152     7.4  build B
+f64_subnormal  ptx        865120      5.37      5.38    0.6%    0.167    0.165    15.2  build A
+f64_subnormal  ptx        865120      5.40      5.41    0.8%    0.166    0.164    13.8  build B
+wmma           sass       308096      1.26      1.26    0.5%    0.251    0.248     8.8  build A
+wmma           sass       308096      1.26      1.26    0.7%    0.250    0.247     7.6  build B
+wmma           ptx        169888      0.81      0.81    0.5%    0.216    0.213    15.5  build A
+wmma           ptx        169888      0.76      0.76    0.4%    0.230    0.226    14.1  build B
+mma_ptx        sass       301728      2.42      2.43    1.4%    0.129    0.127     8.9  build A
+mma_ptx        sass       301728      2.44      2.44    0.4%    0.128    0.127     7.7  build B
+mma_ptx        ptx        169920      0.52      0.52    1.2%    0.335    0.331    15.3  build A
+mma_ptx        ptx        169920      0.64      0.65    1.4%    0.272    0.268    14.1  build B
+mem            sass      4896768     11.78     11.81    0.8%    0.436    0.427    40.6  build A
+mem            sass      4896768     13.70     13.74    0.8%    0.376    0.369    39.4  build B
+mem            ptx       3258368     10.89     10.93    0.9%    0.318    0.311    44.8  build A
+mem            ptx       3258368     12.89     12.93    0.8%    0.271    0.265    43.2  build B
+shared         sass      1395008     12.90     12.93    0.6%    0.113    0.111    10.2  build A
+shared         sass      1395008     14.64     14.70    0.8%    0.100    0.098     9.1  build B
+shared         ptx       1040704      9.15      9.18    0.9%    0.119    0.117    15.7  build A
+shared         ptx       1040704     11.49     11.54    1.0%    0.095    0.094    14.5  build B
+atomics        sass       313472      6.14      6.17    2.6%    0.055    0.054     8.9  build A
+atomics        sass       313472      6.91      6.93    0.6%    0.049    0.048     7.8  build B
+atomics        ptx        224000      3.58      3.59    0.5%    0.067    0.066    15.2  build A
+atomics        ptx        224000      3.84      3.86    0.6%    0.063    0.062    13.8  build B
+texture        sass       482304      3.21      3.22    0.5%    0.156    0.153     8.9  build A
+texture        sass       482304      3.61      3.62    0.5%    0.139    0.137     8.0  build B
+texture        ptx        250112      1.71      1.72    0.4%    0.152    0.149    15.5  build A
+texture        ptx        250112      2.08      2.09    0.7%    0.126    0.123    14.1  build B
+local          sass      6958848     19.42     19.47    0.5%    0.367    0.362     8.8  build A
+local          sass      6958848     21.41     21.50    1.1%    0.333    0.329     7.6  build B
+local          ptx       8880896     18.14     18.21    0.5%    0.501    0.494    15.1  build A
+local          ptx       8880896     25.11     25.14    4.0%    0.363    0.358    13.8  build B
+divergent      sass      9969033     16.07     16.09    0.4%    0.638    0.629     8.9  build A
+divergent      sass      9969033     16.63     16.66    0.5%    0.617    0.608     7.8  build B
+divergent      ptx       9976708     28.35     28.39    0.3%    0.366    0.361    15.3  build A
+divergent      ptx       9976708     30.86     30.91    1.3%    0.338    0.332    13.8  build B
+warp           sass      5126144     19.51     19.56    0.5%    0.272    0.269     8.8  build A
+warp           sass      5126144     20.45     20.52    1.7%    0.260    0.257     7.6  build B
+warp           ptx       5895424     49.13     49.22    2.1%    0.128    0.126    15.1  build A
+warp           ptx       5895424     48.12     48.30   11.6%    0.131    0.128    13.8  build B
+launch         sass       360000     393.3     395.3    0.9%    0.104    0.103     8.6  columns are k launches/s, build A
+launch         sass       360000     347.7     349.6    0.8%    0.118    0.116     7.3  columns are k launches/s, build B
+launch         ptx        360000     304.8     307.5    1.4%    0.134    0.132    15.0  columns are k launches/s, build A
+launch         ptx        360000     297.3     298.7    1.2%    0.138    0.135    13.9  columns are k launches/s, build B
+api            sass            0    4299.1    4329.3    1.1%    0.212    0.209     8.1  columns are k api_calls/s, build A
+api            sass            0    4318.9    4332.6    0.5%    0.211    0.208     6.8  columns are k api_calls/s, build B
+api            ptx             0    4309.7    4316.8    2.4%    0.212    0.209     8.0  columns are k api_calls/s, build A
+api            ptx             0    4309.6    4332.5    1.9%    0.212    0.209     6.8  columns are k api_calls/s, build B
+startup        sass            9         -         -    2.5%    0.004    0.004     7.0  wall time only, build A
+startup        sass            9         -         -    1.7%    0.004    0.003     5.9  wall time only, build B
+startup        ptx             9         -         -    1.4%    0.015    0.015    15.1  wall time only, build A
+startup        ptx             9         -         -    0.7%    0.016    0.015    13.8  wall time only, build B
+
+A/B, B relative to A (ratio > 1: B is faster). Metric: Minst/s, k units/s, or 1/wall.
+median/best = ratio of the medians / of the best runs; p = Mann-Whitney on the per-run values;
+verdict needs p <= 0.05 and both ratios beyond 2%, else 'same'.
+workload       eng  metric               A med     B med  med B/A best B/A      p  verdict counters
+---------------------------------------------------------------------------------------------------
+int_alu        sass winst_per_cpu_s     37.285    39.867   1.069x   1.074x  0.000  faster identical
+int_alu        ptx  winst_per_cpu_s     61.996    60.618   0.978x   0.975x  0.040  slower identical
+f32_fma        sass winst_per_cpu_s     41.176    43.667   1.061x   1.059x  0.000  faster identical
+f32_fma        ptx  winst_per_cpu_s     59.250    63.895   1.078x   1.078x  0.000  faster identical
+f64_fma        sass winst_per_cpu_s     29.188    31.702   1.086x   1.089x  0.000  faster identical
+f64_fma        ptx  winst_per_cpu_s     27.047    29.803   1.102x   1.105x  0.000  faster identical
+f64_subnormal  sass winst_per_cpu_s      5.558     5.706   1.027x   1.026x  0.000  faster identical
+f64_subnormal  ptx  winst_per_cpu_s      5.370     5.397   1.005x   1.005x  0.001  same   identical
+wmma           sass winst_per_cpu_s      1.258     1.262   1.003x   1.004x  0.019  same   identical
+wmma           ptx  winst_per_cpu_s      0.813     0.762   0.937x   0.937x  0.000  slower identical
+mma_ptx        sass winst_per_cpu_s      2.425     2.435   1.004x   1.002x  0.001  same   identical
+mma_ptx        ptx  winst_per_cpu_s      0.519     0.641   1.234x   1.231x  0.000  faster identical
+mem            sass winst_per_cpu_s     11.782    13.702   1.163x   1.164x  0.000  faster identical
+mem            ptx  winst_per_cpu_s     10.893    12.890   1.183x   1.183x  0.000  faster identical
+shared         sass winst_per_cpu_s     12.900    14.640   1.135x   1.136x  0.000  faster identical
+shared         ptx  winst_per_cpu_s      9.153    11.491   1.255x   1.257x  0.000  faster identical
+atomics        sass winst_per_cpu_s      6.145     6.910   1.124x   1.123x  0.000  faster identical
+atomics        ptx  winst_per_cpu_s      3.582     3.841   1.072x   1.075x  0.000  faster identical
+texture        sass winst_per_cpu_s      3.208     3.609   1.125x   1.123x  0.000  faster identical
+texture        ptx  winst_per_cpu_s      1.714     2.085   1.216x   1.216x  0.000  faster identical
+local          sass winst_per_cpu_s     19.423    21.409   1.102x   1.104x  0.000  faster identical
+local          ptx  winst_per_cpu_s     18.139    25.109   1.384x   1.380x  0.000  faster identical
+divergent      sass winst_per_cpu_s     16.070    16.633   1.035x   1.036x  0.000  faster identical
+divergent      ptx  winst_per_cpu_s     28.353    30.856   1.088x   1.089x  0.000  faster identical
+warp           sass winst_per_cpu_s     19.510    20.454   1.048x   1.049x  0.000  faster identical
+warp           ptx  winst_per_cpu_s     49.130    48.120   0.979x   0.981x  0.000  same   identical
+launch         sass units_per_s        393.302   347.714   0.884x   0.884x  0.000  slower identical
+launch         ptx  units_per_s        304.764   297.285   0.975x   0.971x  0.000  slower identical
+api            sass units_per_s       4299.123  4318.950   1.005x   1.001x  0.003  same   identical
+api            ptx  units_per_s       4309.746  4309.602   1.000x   1.004x  0.489  same   identical
+startup        sass wall_s               0.004     0.004   1.053x   1.043x  0.000  faster identical
+startup        ptx  wall_s               0.015     0.016   0.984x   0.976x  0.000  same   identical
+
+host: Intel(R) Xeon(R) Platinum 8488C, 16 logical CPUs, load 7.52 12.54 12.75 -> 2.68 8.93 11.39; nvcc 13.0.88; VGPU_THREADS=1; GPU profile nvidia/rtx3060; 9 timed runs after 1 warmup

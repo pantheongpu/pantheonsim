@@ -103,6 +103,10 @@ std::vector<FatbinPtx> extract_ptx(const void* data);
 // SASS architecture (86 for sm_86), `text` the ELF bytes.
 std::vector<FatbinPtx> extract_elf(const void* data, size_t bytes);
 std::vector<FatbinPtx> extract_elf(const void* data);
+// The same, keeping only the cubins a device of compute capability `cc` could run (the same major, an
+// architecture no newer than cc): the others are skipped without being decompressed. What pick_cubin
+// needs, since a fatbin of a PyTorch build holds a cubin per architecture and the pick uses one.
+std::vector<FatbinPtx> extract_elf_for(const void* data, uint32_t cc);
 
 // The cubin a device of compute capability `cc` runs from a fatbin, as the
 // driver picks it: SASS built for exactly this architecture, or else the
@@ -123,7 +127,7 @@ std::string pick_cubin(const void* fatbin, uint32_t cc);
 // selects entries; the rest are skipped without being decompressed, so a SASS
 // image the PTX path never reads cannot fail it.
 std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* consumed = nullptr,
-                                        uint16_t kinds = 0xffff);
+                                        uint16_t kinds = 0xffff, uint32_t elf_for_cc = 0);
 
 // A fatbin container holding `images`, laid out as NVIDIA's libnvfatbin lays it
 // out: the 16-byte container header, then per entry a 64-byte header, the

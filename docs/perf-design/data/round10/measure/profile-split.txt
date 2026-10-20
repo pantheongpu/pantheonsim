@@ -1,0 +1,36 @@
+== ops1
+samples 3725
+ 64.72%   2411  SASS decode/parse (incl. its malloc, snprintf)
+ 10.23%    381  fatbin decompress (zstd)
+  7.60%    283  SASS execution (launch/run_kernel)
+  6.79%    253  python import
+  3.36%    125  python/torch (host op code)
+  3.36%    125  other simulator
+  1.85%     69  other (kernel/loader/unknown)
+  1.74%     65  pick_cubin, other
+  0.35%     13  host-side library (cuBLAS host gemm etc)
+allocator-ish (innermost frame malloc/free/new/delete/page-fault/libc) within category:
+== nn1
+samples 4681
+ 45.35%   2123  SASS decode/parse (incl. its malloc, snprintf)
+ 26.08%   1221  other (kernel/loader/unknown)
+ 23.52%   1101  stack lost (python, libtorch, loader)
+  9.23%    432  python import
+  6.71%    314  python/torch (host op code)
+  6.30%    295  fatbin decompress (zstd)
+  3.05%    143  SASS execution (launch/run_kernel)
+  1.67%     78  other simulator
+  0.81%     38  host-side library (cuBLAS host gemm etc)
+  0.79%     37  pick_cubin, other
+== sdpa1
+samples 2751
+ 43.62%   1200  other (kernel/loader/unknown)
+ 33.48%    921  stack lost (python, libtorch, loader)
+ 29.15%    802  SASS decode/parse (incl. its malloc, snprintf)
+ 12.69%    349  SASS execution (launch/run_kernel)
+  6.11%    168  python import
+  4.94%    136  fatbin decompress (zstd)
+  2.07%     57  other simulator
+  0.69%     19  host-side library (cuBLAS host gemm etc)
+  0.65%     18  pick_cubin, other
+  0.07%      2  python/torch (host op code)

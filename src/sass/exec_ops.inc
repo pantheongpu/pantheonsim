@@ -70,6 +70,8 @@ bool executes(const Instr& ins) {
     case Op::VIMNMX3: case Op::IADD: case Op::UP2UR: case Op::ELECT: case Op::USETMAXREG: case Op::WARPGROUP:
     case Op::FMNMX3: case Op::STSM: case Op::RPCMOV: case Op::HGMMA: case Op::IGMMA: case Op::BGMMA: case Op::QGMMA:
       return true;
+    case Op::FFMA2: case Op::FMUL2: case Op::FADD2:
+      return !ins.f[4];   // all but the forms whose meaning is unknown (decode.cpp, dec_f32x2)
     case Op::UTMALDG:
       return !ins.f[6];   // not im2col::w or ::w::128, which the PTX engine does not run either
     case Op::SYNCS: case Op::ARRIVES: case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKCP:
@@ -102,7 +104,7 @@ exec::InstClass inst_class(Op op) {
   using C = exec::InstClass;
   switch (op) {
     case Op::FADD: case Op::FMUL: case Op::FFMA: case Op::FMNMX: case Op::FSETP: case Op::FSET: case Op::FSEL:
-    case Op::FCHK: case Op::MUFU: case Op::FSWZADD:
+    case Op::FCHK: case Op::MUFU: case Op::FSWZADD: case Op::FFMA2: case Op::FMUL2: case Op::FADD2:   // (the PTX engine's f32x2 is Fp32 too)
       return C::Fp32;
     case Op::DADD: case Op::DMUL: case Op::DFMA: case Op::DSETP: return C::Fp64;
     case Op::HADD2: case Op::HMUL2: case Op::HFMA2: case Op::HSETP2: case Op::HMNMX2: return C::Fp16;
@@ -196,7 +198,7 @@ void Runner::execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool adv
       case Op::FSEL: case Op::FCHK: case Op::FSWZADD: case Op::MUFU: case Op::DADD: case Op::DMUL: case Op::DFMA:
       case Op::DSETP: case Op::HADD2: case Op::HMUL2: case Op::HFMA2: case Op::HSETP2: case Op::HMNMX2:
       case Op::I2F: case Op::I2FP: case Op::F2I: case Op::F2IP: case Op::F2F: case Op::F2FP:
-      case Op::FRND: case Op::I2I: case Op::I2IP: case Op::HSET2: case Op::FMNMX3:
+      case Op::FRND: case Op::I2I: case Op::I2IP: case Op::HSET2: case Op::FMNMX3: case Op::FFMA2: case Op::FMUL2: case Op::FADD2:
         exec_float(blk, w, ins, ex);
         break;
       default:
@@ -1118,6 +1120,13 @@ struct RoundingScope {
     std::fesetround(saved);
   }
 };
+
+// FFMA2/FMUL2/FADD2 over the lanes in `ex`: the arithmetic of the PTX engine's f32x2 (vgpu/exec/f32x2.hpp), out of line so that
+// nothing is hoisted past the RoundingScope of the caller.
+[[gnu::noinline]] void f32x2_loop(exec::F32x2Op op, bool ftz, Mask ex, const uint64_t (*s)[32], uint64_t* r) {
+  for (unsigned l = 0; l < 32; ++l)
+    if ((ex >> l) & 1) r[l] = exec::f32x2_pair(op, ftz, s[0][l], s[1][l], s[2][l]);
+}
 
 // The conversion loops that depend on the host's rounding mode, out of line so that nothing is hoisted past the RoundingScope
 // of their caller (the callee is opaque to it): the 32 lanes of an I2F, and a double narrowed to a float.
@@ -2460,6 +2469,42 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
         // 0 here is 0xffc00000 on the host), as the PTX engine's canon32.
         write32(w, ins.dst[0], l, r != r ? 0x7fffffffu : f32_bits(r));
       });
+      return;
+    }
+    case Op::FFMA2: case Op::FMUL2: case Op::FADD2: {
+      // Two f32 lanes per 64-bit operand. Source i has its swizzle in f[3] (4 bits each: 0 pair as it is, 1 halves swapped,
+      // 2 one 32-bit register for both; +4 .NP) and |.| and - in the operand: the swizzle first, then the sign changes of the
+      // lanes that come out (.NP: the second lane's - is the opposite of the first's).
+      const unsigned nsrc = ins.op == Op::FFMA2 ? 3 : 2;
+      const exec::F32x2Op kind = ins.op == Op::FFMA2 ? exec::F32x2Op::Fma : ins.op == Op::FADD2 ? exec::F32x2Op::Add : exec::F32x2Op::Mul;
+      uint64_t s[3][32] = {};
+      uint64_t r[32] = {};
+      each_lane(ex, [&](unsigned l) {
+        for (unsigned i = 0; i < nsrc; ++i) {
+          const Operand& o = ins.src[i];
+          const unsigned mode = (ins.f[3] >> (4 * i)) & 3, np = (ins.f[3] >> (4 * i + 2)) & 1;
+          uint32_t lo, hi;
+          if (mode == 2) {
+            lo = hi = read32(w, o, l);
+          } else {
+            const uint64_t v = read64(w, o, l);
+            lo = static_cast<uint32_t>(v);
+            hi = static_cast<uint32_t>(v >> 32);
+            if (mode == 1) std::swap(lo, hi);
+          }
+          if (o.abs) lo &= 0x7fffffffu, hi &= 0x7fffffffu;
+          if (o.neg) lo ^= 0x80000000u;
+          if (o.neg != (np != 0)) hi ^= 0x80000000u;
+          s[i][l] = lo | static_cast<uint64_t>(hi) << 32;
+        }
+      });
+      if (ins.f[0]) {
+        RoundingScope scope(ins.f[0]);
+        f32x2_loop(kind, ins.f[1], ex, s, r);
+      } else {
+        f32x2_loop(kind, ins.f[1], ex, s, r);
+      }
+      each_lane(ex, [&](unsigned l) { write64(w, ins.dst[0], l, r[l]); });
       return;
     }
     case Op::FMNMX:

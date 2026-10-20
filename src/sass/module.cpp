@@ -384,6 +384,98 @@ void rebind(Module& m, MemoryManager& mem, const std::string& name, uint64_t va)
 
 bool runs_instr(const Instr& ins);   // exec.cpp
 
+namespace {
+
+// The instruction words unsupported() has already seen decode and run, per thread: the cubins of one process
+// (the kernels of a PyTorch build, one fatbin per source file) repeat the same words many times over, and
+// deciding a word again costs a full decode. Exact: a slot holds the whole 128 bits and the architecture, so a
+// hit is the very word that passed before, and decode/runs_instr depend on nothing else (a branch's pc only
+// shapes its label operand). Only words that passed are kept; the first one that does not is found by the
+// ordinary path, so the answer and its text are the same as without the table.
+class OkWords {
+ public:
+  bool contains(int sm, const Word& w) const {
+    const Table* t = find(sm);
+    if (!t) return false;
+    if (!w.lo && !w.hi) return t->zero;   // an empty slot is all zero, so that word is kept apart
+    if (t->slots.empty()) return false;
+    for (size_t i = hash(w) & t->mask;; i = (i + 1) & t->mask) {
+      const Slot& s = t->slots[i];
+      if (!s.lo && !s.hi) return false;
+      if (s.lo == w.lo && s.hi == w.hi) return true;
+    }
+  }
+  // Starts the memory read contains() will need, a few words before it does.
+  void prefetch(int sm, const Word& w) const {
+    const Table* t = find(sm);
+    if (t && !t->slots.empty()) __builtin_prefetch(&t->slots[hash(w) & t->mask]);
+  }
+  void insert(int sm, const Word& w) {
+    Table& t = table(sm);
+    if (!w.lo && !w.hi) {
+      t.zero = true;
+      return;
+    }
+    if (t.slots.empty()) grow(t, size_t{1} << 14);
+    if ((t.count + 1) * 2 > t.slots.size()) {
+      if (t.slots.size() >= kMaxSlots) return;   // full: later words are decided afresh, as before the table
+      grow(t, t.slots.size() * 2);
+    }
+    size_t i = hash(w) & t.mask;
+    while (t.slots[i].lo || t.slots[i].hi) {
+      if (t.slots[i].lo == w.lo && t.slots[i].hi == w.hi) return;
+      i = (i + 1) & t.mask;
+    }
+    t.slots[i] = {w.lo, w.hi};
+    ++t.count;
+  }
+
+ private:
+  struct Slot {
+    uint64_t lo = 0, hi = 0;
+  };
+  struct Table {
+    int sm = 0;
+    bool zero = false;
+    std::vector<Slot> slots;
+    size_t mask = 0, count = 0;
+  };
+  static constexpr size_t kMaxSlots = size_t{1} << 21;   // 32 MB at most per architecture
+  static size_t hash(const Word& w) {
+    uint64_t h = w.lo * 0x9e3779b97f4a7c15ull ^ w.hi * 0xc2b2ae3d27d4eb4full;
+    h ^= h >> 29;
+    h *= 0xbf58476d1ce4e5b9ull;
+    h ^= h >> 32;
+    return static_cast<size_t>(h);
+  }
+  const Table* find(int sm) const {
+    for (const Table& t : tables_)
+      if (t.sm == sm) return &t;
+    return nullptr;
+  }
+  Table& table(int sm) {
+    for (Table& t : tables_)
+      if (t.sm == sm) return t;
+    tables_.emplace_back();
+    tables_.back().sm = sm;
+    return tables_.back();
+  }
+  static void grow(Table& t, size_t n) {
+    std::vector<Slot> old = std::move(t.slots);
+    t.slots.assign(n, Slot{});
+    t.mask = n - 1;
+    for (const Slot& s : old) {
+      if (!s.lo && !s.hi) continue;
+      size_t i = hash(Word{s.lo, s.hi}) & t.mask;
+      while (t.slots[i].lo || t.slots[i].hi) i = (i + 1) & t.mask;
+      t.slots[i] = s;
+    }
+  }
+  std::vector<Table> tables_;
+};
+
+}  // namespace
+
 std::string unsupported(const uint8_t* image, size_t size) {
   const Cubin c = parse_cubin(image, size);
   // Relocations the loader applies (see load), against symbols it can
@@ -413,20 +505,37 @@ std::string unsupported(const uint8_t* image, size_t size) {
   // VGPU_SASS_REFUSE=<op>: treat that op as unsupported, for testing the
   // fallback to PTX.
   const char* refuse = std::getenv("VGPU_SASS_REFUSE");
+  static thread_local OkWords seen;
+  const bool memo = !(refuse && *refuse);
   for (const CubinSection& s : c.sections) {
     if (s.name.rfind(".text.", 0) != 0) continue;
     for (size_t i = 0; i + 16 <= s.bytes.size(); i += 16) {
       Word w;
       std::memcpy(&w.lo, &s.bytes[i], 8);
       std::memcpy(&w.hi, &s.bytes[i + 8], 8);
-      char at[96];
-      std::snprintf(at, sizeof at, "sm_%d %s+0x%zx: ", c.sm, s.name.c_str() + 6, i);
+      if (memo) {
+        // Fetch the table's memory for the word kAhead on: the table is megabytes, and each look-up would wait for it.
+        constexpr size_t kAhead = 16;
+        if (i + 16 * kAhead + 16 <= s.bytes.size()) {
+          Word ahead;
+          std::memcpy(&ahead.lo, &s.bytes[i + 16 * kAhead], 8);
+          std::memcpy(&ahead.hi, &s.bytes[i + 16 * kAhead + 8], 8);
+          seen.prefetch(c.sm, ahead);
+        }
+        if (seen.contains(c.sm, w)) continue;
+      }
+      const auto at = [&] {
+        char b[96];
+        std::snprintf(b, sizeof b, "sm_%d %s+0x%zx: ", c.sm, s.name.c_str() + 6, i);
+        return std::string(b);
+      };
       try {
         const Instr ins = decode(w, i, c.sm);
-        if (!runs_instr(ins) || (refuse && *refuse && ins.mnemonic == refuse)) return at + to_text(ins);
+        if (!runs_instr(ins) || (refuse && *refuse && ins.mnemonic == refuse)) return at() + to_text(ins);
       } catch (const Error& e) {
-        return at + e.message();
+        return at() + e.message();
       }
+      if (memo) seen.insert(c.sm, w);
     }
   }
   return {};

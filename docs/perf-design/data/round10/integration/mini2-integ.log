@@ -1,0 +1,12 @@
+[vgpu] virtual GPU platform initialized: 1 x nvidia/rtx5090 (NVIDIA GeForce RTX 5090)
+[vgpu] cuBLAS handle created (host-computed; see nvidia/docs/cublas.md)
+add (1st elementwise kernel)       0.026s
+add again (same kernel)            0.001s
+mul (new kernel, same file)        0.015s
+relu (new kernel)                  0.021s
+sum reduction (new kernel)         0.041s
+softmax (new kernel)               0.061s
+sum again                          0.001s
+matmul 256                         0.001s
+layer_norm                         0.026s
+layer_norm again                   0.008s

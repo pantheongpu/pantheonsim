@@ -50,6 +50,7 @@
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/local_layout.hpp"
 #include "vgpu/exec/mem_counters.hpp"
+#include "vgpu/exec/f32x2.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/wgmma.hpp"
@@ -8220,23 +8221,9 @@ class Interpreter {
         case FRound::PlusInf: std::fesetround(FE_UPWARD); break;
         case FRound::Nearest: break;
       }
-      auto flush = [&](float v) { return op->ftz && std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
-      auto half = [](uint64_t v, int h) { return f32(static_cast<uint32_t>(v >> (32 * h))); };
+      const F32x2Op kind = op->fma ? F32x2Op::Fma : op->op == FloatBinOp::Add ? F32x2Op::Add : op->op == FloatBinOp::Sub ? F32x2Op::Sub : F32x2Op::Mul;
       for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane)) {
-          uint64_t out = 0;
-          for (int h = 0; h < 2; ++h) {
-            const float x = flush(half(a[lane], h)), y = flush(half(b[lane], h));
-            float v;
-            if (op->fma) v = std::fmaf(x, y, flush(half(c[lane], h)));
-            else if (op->op == FloatBinOp::Add) v = x + y;
-            else if (op->op == FloatBinOp::Sub) v = x - y;
-            else v = x * y;
-            v = flush(v);
-            out |= (f32bits(v) & 0xFFFFFFFFull) << (32 * h);
-          }
-          r[lane] = out;
-        }
+        if (m & (Mask{1} << lane)) r[lane] = f32x2_pair(kind, op->ftz, a[lane], b[lane], c[lane]);   // vgpu/exec/f32x2.hpp
       if (op->round != FRound::Nearest) {
         std::fesetround(prev_round);
         g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
