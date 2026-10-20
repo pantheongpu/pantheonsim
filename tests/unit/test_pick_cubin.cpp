@@ -211,4 +211,44 @@ VTEST(of_two_cubins_for_one_architecture_the_arch_specific_one_wins_where_it_run
   VCHECK(picks(cuda::write_fatbin({newer, plain}), b200, plain.data));
 }
 
+// pick_cubin reads only the cubins a device could run (extract_elf_for): the others are skipped without being
+// decompressed, which is most of a PyTorch fatbin (a cubin per architecture, one of them used). What it returns must
+// be what extract_elf returns, filtered by the rule runs_on applies to a plain cubin.
+VTEST(extract_elf_for_returns_the_cubins_a_device_could_run) {
+  std::vector<FatbinImage> images;
+  for (uint32_t sm : {75u, 80u, 86u, 90u, 100u, 103u, 120u}) images.push_back(cubin_image(sm, sm >= 90));
+  images.push_back(ptx_image(120, "sm_120"));
+  const std::string fb = cuda::write_fatbin(images);
+  const auto all = cuda::extract_elf(fb.data(), fb.size());
+  VCHECK(all.size() == 7);
+  for (uint32_t cc : {75u, 80u, 86u, 89u, 90u, 100u, 103u, 107u, 120u, 121u, 0u, ~0u}) {
+    std::vector<uint32_t> want;
+    for (const auto& e : all)
+      if (e.arch / 10 == cc / 10 && e.arch <= cc) want.push_back(e.arch);
+    std::vector<uint32_t> got;
+    for (const auto& e : cuda::extract_elf_for(fb.data(), cc)) {
+      got.push_back(e.arch);
+      for (const auto& a : all)
+        if (a.arch == e.arch) VCHECK(a.text == e.text);
+    }
+    VCHECK(got == want);
+  }
+}
+
+// A cubin for another architecture is never read, so one whose payload will not decompress cannot get in the way
+// (it never could: extract_elf drops such an entry), and the picked cubin is the same with or without it.
+VTEST(a_cubin_for_another_architecture_is_left_alone_even_when_it_is_damaged) {
+  unsetenv("VGPU_SASS");
+  FatbinImage damaged = cubin_image(80, false);
+  damaged.flags |= cuda::kFatbinZstd;
+  damaged.uncompressed_size = damaged.data.size();
+  damaged.data = "not a zstd frame, and not a cubin either";
+  const FatbinImage good = cubin_image(90, false);
+  const std::string fb = cuda::write_fatbin({damaged, good, ptx_image(90, "sm_90")});
+  VCHECK(picks(fb, cc_of("nvidia/h100"), good.data));
+  VCHECK(picks(fb, cc_of("nvidia/a100"), ""));   // sm_80's own image is the damaged one: no cubin, the PTX runs
+  const auto only = cuda::extract_elf_for(fb.data(), cc_of("nvidia/h100"));
+  VCHECK(only.size() == 1 && only[0].arch == 90);
+}
+
 VTEST_MAIN

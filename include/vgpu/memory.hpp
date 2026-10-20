@@ -195,6 +195,21 @@ class MemoryManager {
   // naturally aligned. Values are zero-extended into the returned u64.
   uint64_t load_scalar(uint64_t addr, uint32_t size) const;
   void store_scalar(uint64_t addr, uint32_t size, uint64_t value);
+  // A read-modify-write of one naturally aligned scalar (a device atomic) with one
+  // table lookup instead of load_scalar's and store_scalar's two. rmw_begin
+  // returns true and the value in memory only for the ordinary case -- no fault
+  // armed or stuck cell, no host mapping in reach, an aligned access inside one
+  // ordinary allocation; otherwise it returns false having changed nothing and
+  // the caller makes the two accesses with load_scalar and store_scalar, errors
+  // and all. rmw_commit then does what store_scalar does for `value` (a store of
+  // the byte a uniform chunk already holds changes nothing; an untouched or
+  // uniform chunk becomes real) and throws what it would.
+  struct ScalarRmw {
+    void* allocation = nullptr;
+    uint64_t chunk_idx = 0, in_chunk = 0;
+  };
+  bool rmw_begin(uint64_t addr, uint32_t size, ScalarRmw& at, uint64_t* old) const;
+  void rmw_commit(const ScalarRmw& at, uint32_t size, uint64_t value);
   // Sixteen naturally aligned bytes as one access, as a GPU moves a wide load
   // or store (global_load_dwordx4): a kernel on another host thread sees them
   // all old or all new, never half of each. rocPRIM's decoupled look-back

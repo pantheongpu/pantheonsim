@@ -1,0 +1,50 @@
+Internal ctest changing into directory: /w/build
+Test project /w/build
+      Start  14: test_fastpath
+      Start  20: test_atom_rmw
+      Start  21: test_sass_code_at
+      Start  57: test_sass_decode
+      Start  58: test_decode_same_bits
+      Start  59: test_unsupported_memo
+      Start  60: test_tier
+      Start 231: test_pick_cubin
+ 1/22 Test #231: test_pick_cubin ..................   Passed    0.00 sec
+      Start 454: bench_counters
+ 2/22 Test  #57: test_sass_decode .................   Passed    0.03 sec
+      Start 455: bench_counters_tier
+ 3/22 Test  #60: test_tier ........................   Passed    0.03 sec
+      Start 477: e2e_ptx_forms
+ 4/22 Test  #21: test_sass_code_at ................   Passed    0.05 sec
+      Start 478: e2e_ptx_sweep
+ 5/22 Test  #59: test_unsupported_memo ............   Passed    0.18 sec
+      Start 479: e2e_ptx_warp_mem
+ 6/22 Test #477: e2e_ptx_forms ....................   Passed    0.69 sec
+      Start 480: e2e_ptx_memory_forms
+ 7/22 Test #479: e2e_ptx_warp_mem .................   Passed    0.74 sec
+      Start 482: e2e_ptx_half_forms
+ 8/22 Test #478: e2e_ptx_sweep ....................   Passed    0.96 sec
+      Start 493: e2e_cupti_trace
+ 9/22 Test #480: e2e_ptx_memory_forms .............   Passed    0.68 sec
+      Start 501: e2e_cupti_memory
+10/22 Test #482: e2e_ptx_half_forms ...............   Passed    0.79 sec
+      Start 513: e2e_cupti_trace_driver
+11/22 Test  #20: test_atom_rmw ....................   Passed    1.95 sec
+      Start 529: e2e_sass_path
+12/22 Test #513: e2e_cupti_trace_driver ...........   Passed    0.52 sec
+      Start 530: e2e_sass_fastpath
+13/22 Test  #58: test_decode_same_bits ............   Passed    2.24 sec
+      Start 531: e2e_sass_tier
+14/22 Test #493: e2e_cupti_trace ..................   Passed    1.78 sec
+      Start 532: e2e_sass_archs
+15/22 Test #454: bench_counters ...................   Passed    2.98 sec
+16/22 Test #455: bench_counters_tier ..............   Passed    2.96 sec
+17/22 Test #501: e2e_cupti_memory .................   Passed    1.72 sec
+18/22 Test #529: e2e_sass_path ....................   Passed    4.69 sec
+19/22 Test #530: e2e_sass_fastpath ................   Passed    4.50 sec
+20/22 Test  #14: test_fastpath ....................   Passed    7.92 sec
+21/22 Test #531: e2e_sass_tier ....................   Passed   83.16 sec
+22/22 Test #532: e2e_sass_archs ...................   Passed   93.40 sec
+
+100% tests passed, 0 tests failed out of 22
+
+Total Test time (real) =  96.21 sec

@@ -1,0 +1,77 @@
+sources 12 warp instr 73927508 in tier 88.6%
+fallback (interpreter) instructions listed: 8382928 = 11.34% of all warp instr; all-interpreter = 11.38%
+| rank | mnemonic | kind | warp instr | % of all | % of interpreter share | main sources |
+|---:|---|---|---:|---:|---:|---|
+| 1 | LDCU.64 | ends a run | 1,621,476 | 2.19 | 19.3 | torch:sdpa 48%, torch:ops 18%, torch:optim 14% |
+| 2 | IADD.64 | ends a run | 1,476,696 | 2.00 | 17.5 | torch:sdpa 32%, torch:optim 27%, torch:ops 20% |
+| 3 | LDCU | ends a run | 1,378,502 | 1.86 | 16.4 | torch:sdpa 45%, torch:ops 17%, torch:attention 10% |
+| 4 | S2UR | ends a run | 490,342 | 0.66 | 5.8 | torch:ops 29%, torch:attention 24%, torch:sdpa 13% |
+| 5 | ISETP.GE.S64.AND | straight | 321,690 | 0.44 | 3.8 | torch:optim 62%, torch:ops 19%, torch:attention 9% |
+| 6 | LDSM.16.M88.4 | ends a run | 199,808 | 0.27 | 2.4 | torch:sdpa 60%, torch:attention 36%, torch:amp 5% |
+| 7 | MOV.64 | straight | 192,455 | 0.26 | 2.3 | torch:optim 43%, torch:ops 21%, torch:attention 14% |
+| 8 | ATOMS.POPC.INC.32 | ends a run | 170,512 | 0.23 | 2.0 | torch:ops 100% |
+| 9 | ISETP.NE.S64.AND | straight | 151,511 | 0.20 | 1.8 | torch:ops 32%, torch:sdpa 28%, torch:attention 21% |
+| 10 | ISETP.GE.U64.AND | straight | 150,367 | 0.20 | 1.8 | torch:optim 74%, torch:ops 19%, torch:graphs 4% |
+| 11 | UIADD3.64 | straight | 135,666 | 0.18 | 1.6 | torch:ops 82%, torch:optim 7%, torch:attention 3% |
+| 12 | LDGSTS.E.BYPASS.LTC128B.128 | ends a run | 128,828 | 0.17 | 1.5 | torch:attention 55%, torch:sdpa 45%, torch:amp 0% |
+| 13 | LDSM.16.MT88.4 | ends a run | 117,056 | 0.16 | 1.4 | torch:sdpa 84%, torch:amp 10%, torch:attention 5% |
+| 14 | LDCU.128 | ends a run | 112,472 | 0.15 | 1.3 | torch:sdpa 60%, torch:attention 14%, torch:optim 10% |
+| 15 | WARPSYNC.ALL | ends a run | 97,808 | 0.13 | 1.2 | torch:ops 33%, torch:optim 30%, torch:attention 13% |
+
+by base opcode:
+LDCU 3,171,579 4.29%
+IADD 1,476,696 2.00%
+ISETP 699,354 0.95%
+S2UR 490,342 0.66%
+LDSM 316,864 0.43%
+ATOMS 247,687 0.34%
+MOV 192,455 0.26%
+UIADD3 135,666 0.18%
+LDGSTS 128,828 0.17%
+UIMAD 116,661 0.16%
+WARPSYNC 102,400 0.14%
+CALL 91,384 0.12%
+RET 91,352 0.12%
+BREAK 89,239 0.12%
+UISETP 88,191 0.12%
+P2R 76,543 0.10%
+IMNMX 73,384 0.10%
+VIMNMX 72,226 0.10%
+FCHK 63,085 0.09%
+R2P 54,816 0.07%
+UI2F 54,553 0.07%
+UIMNMX 53,031 0.07%
+LDGDEPBAR 52,064 0.07%
+R2UR 51,025 0.07%
+SEL 47,912 0.06%
+
+macro-averaged (each of 12 sources counts equally):
+| rank | mnemonic | mean % of a source's warp instr | sources where it is >0.1% |
+|---:|---|---:|---:|
+| 1 | LDCU.64 | 2.547 | 12 |
+| 2 | LDCU | 2.477 | 12 |
+| 3 | IADD.64 | 2.033 | 12 |
+| 4 | S2UR | 1.066 | 12 |
+| 5 | ISETP.GE.S64.AND | 0.490 | 11 |
+| 6 | MOV.64 | 0.317 | 9 |
+| 7 | WARPSYNC.ALL | 0.221 | 9 |
+| 8 | LDCU.128 | 0.207 | 7 |
+| 9 | ISETP.GE.U64.AND | 0.172 | 4 |
+| 10 | LDSM.16.M88.4 | 0.158 | 3 |
+| 11 | ISETP.NE.S64.AND | 0.148 | 7 |
+| 12 | BREAK.RELIABLE | 0.144 | 7 |
+| 13 | LDSM.16.MT88.4 | 0.130 | 2 |
+| 14 | UI2F.U32.RP | 0.127 | 1 |
+| 15 | ISETP.GT.S64.AND | 0.126 | 2 |
+| 16 | UIADD3.64 | 0.122 | 3 |
+| 17 | CALL.REL.NOINC | 0.116 | 4 |
+| 18 | RET.REL.NODEC | 0.116 | 4 |
+| 19 | SEL.64 | 0.108 | 3 |
+| 20 | VIMNMX.U32 | 0.103 | 3 |
+| 21 | FCHK | 0.086 | 3 |
+| 22 | ATOMS.POPC.INC.32 | 0.076 | 1 |
+| 23 | IMNMX.U64 | 0.074 | 2 |
+| 24 | ATOMS.ADD | 0.072 | 2 |
+| 25 | P2R | 0.070 | 4 |
+max list lengths 24 24
+listed 8382928 of 8416242 interpreter instrs (99.6%)

@@ -1424,6 +1424,38 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
   write(addr, &value, size);  // a managed host mapping, behind its own lock
 }
 
+bool MemoryManager::rmw_begin(uint64_t addr, uint32_t size, ScalarRmw& at, uint64_t* old) const {
+  if (size != 1 && size != 2 && size != 4 && size != 8) return false;
+  if ((addr & (size - 1)) != 0) return false;
+  if (access_fault_ &&
+      (any_stuck() ||
+       (access_fault_->load_pending && __atomic_load_n(access_fault_->load_pending, __ATOMIC_RELAXED)) ||
+       (access_fault_->store_pending && __atomic_load_n(access_fault_->store_pending, __ATOMIC_RELAXED))))
+    return false;
+  if (host_maps_ && host_maps_->may_contain(addr)) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(addr, size, &base);
+  if (!a) return false;
+  const uint64_t off = addr - base;
+  const uint64_t idx = off / kChunkSize;
+  const uint8_t* chunk = a->chunks[idx].load(std::memory_order_acquire);
+  at.allocation = const_cast<Allocation*>(a);
+  at.chunk_idx = idx;
+  at.in_chunk = off % kChunkSize;
+  if (!chunk) *old = 0;
+  else if (is_uniform(chunk)) *old = repeated(uniform_byte(chunk), size);
+  else *old = load_at(chunk + at.in_chunk, size);
+  return true;
+}
+
+void MemoryManager::rmw_commit(const ScalarRmw& at, uint32_t size, uint64_t value) {
+  Allocation& a = *static_cast<Allocation*>(at.allocation);
+  uint8_t* chunk = a.chunks[at.chunk_idx].load(std::memory_order_acquire);
+  if (is_uniform(chunk) && value == repeated(uniform_byte(chunk), size)) return;
+  if (!chunk || is_uniform(chunk)) chunk = materialize(a, at.chunk_idx);
+  store_at(chunk + at.in_chunk, size, value);
+}
+
 void MemoryManager::load_quad(uint64_t addr, uint64_t out[2]) const {
   // A fault armed for loads, or stuck cells, change what a load returns, and
   // load_scalar applies them; the runtime attaches its faults to every device,

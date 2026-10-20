@@ -1,0 +1,58 @@
+Internal ctest changing into directory: /w/build
+Test project /w/build
+      Start  10: test_exec3
+      Start  14: test_fastpath
+      Start  20: test_atom_rmw
+      Start  21: test_sass_code_at
+      Start  57: test_sass_decode
+      Start  58: test_decode_same_bits
+      Start  59: test_unsupported_memo
+      Start  60: test_f32x2_sass
+ 1/26 Test  #60: test_f32x2_sass ..................   Passed    0.02 sec
+      Start  61: test_tier
+ 2/26 Test  #57: test_sass_decode .................   Passed    0.05 sec
+      Start 240: test_pick_cubin
+ 3/26 Test #240: test_pick_cubin ..................   Passed    0.00 sec
+      Start 476: bench_counters
+ 4/26 Test  #61: test_tier ........................   Passed    0.03 sec
+      Start 477: bench_counters_tier
+ 5/26 Test  #21: test_sass_code_at ................   Passed    0.06 sec
+      Start 499: e2e_ptx_forms
+ 6/26 Test  #10: test_exec3 .......................   Passed    0.09 sec
+      Start 500: e2e_ptx_sweep
+ 7/26 Test  #59: test_unsupported_memo ............   Passed    0.19 sec
+      Start 501: e2e_ptx_warp_mem
+ 8/26 Test #499: e2e_ptx_forms ....................   Passed    0.74 sec
+      Start 502: e2e_ptx_memory_forms
+ 9/26 Test #501: e2e_ptx_warp_mem .................   Passed    0.79 sec
+      Start 504: e2e_ptx_half_forms
+10/26 Test #500: e2e_ptx_sweep ....................   Passed    1.03 sec
+      Start 515: e2e_cupti_trace
+11/26 Test #502: e2e_ptx_memory_forms .............   Passed    0.70 sec
+      Start 523: e2e_cupti_memory
+12/26 Test #504: e2e_ptx_half_forms ...............   Passed    0.81 sec
+      Start 535: e2e_cupti_trace_driver
+13/26 Test  #20: test_atom_rmw ....................   Passed    1.97 sec
+      Start 551: e2e_sass_path
+14/26 Test #535: e2e_cupti_trace_driver ...........   Passed    0.54 sec
+      Start 552: e2e_sass_fastpath
+15/26 Test  #58: test_decode_same_bits ............   Passed    2.38 sec
+      Start 553: e2e_sass_tier
+16/26 Test #515: e2e_cupti_trace ..................   Passed    1.89 sec
+      Start 554: e2e_sass_archs
+17/26 Test #477: bench_counters_tier ..............   Passed    2.98 sec
+      Start 622: sweep_exit
+18/26 Test #476: bench_counters ...................   Passed    2.99 sec
+19/26 Test #622: sweep_exit .......................   Passed    0.15 sec
+20/26 Test #523: e2e_cupti_memory .................   Passed    1.77 sec
+21/26 Test #551: e2e_sass_path ....................   Passed    4.73 sec
+22/26 Test #552: e2e_sass_fastpath ................   Passed    4.65 sec
+23/26 Test  #14: test_fastpath ....................   Passed    8.37 sec
+24/26 Test #553: e2e_sass_tier ....................   Passed   80.69 sec
+25/26 Test #554: e2e_sass_archs ...................   Passed   98.83 sec
+      Start 556: e2e_packed_f32x2
+26/26 Test #556: e2e_packed_f32x2 .................   Passed    2.46 sec
+
+100% tests passed, 0 tests failed out of 26
+
+Total Test time (real) = 104.31 sec

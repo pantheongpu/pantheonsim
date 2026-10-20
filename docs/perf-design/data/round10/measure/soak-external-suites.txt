@@ -1,0 +1,23 @@
+## polybench: ran to the end in both: 15; timed out (300 s) only with tier off: []; only with tier on: []; in both: 0
+## polybench: 15 programs, identical output and verdict: 14, differ: 1
+  DIFF SYRK ('FAIL', '0', "non-matching outputs: 1046529 (the card's: 0)") ('ok', '22', 'non-matching outputs: 0') | ['Non-Matching CPU-GPU Outputs Beyond Error Threshold of 0.05 Percent: 1046529'] | ['Non-Matching CPU-GPU Outputs Beyond Error Threshold of 0.05 Percent: 0']
+  peak RSS MB off/on: median 56 / 57 ; largest on-off: (20.77734375, 28.453125, 'SYRK')
+  total wall (sum of per-program) off 651 s, on 516 s
+## rodinia: ran to the end in both: 4; timed out (300 s) only with tier off: []; only with tier on: []; in both: 0
+## rodinia: 4 programs, identical output and verdict: 4, differ: 0
+  peak RSS MB off/on: median 10 / 10 ; largest on-off: (10.06640625, 10.31640625, 'lud')
+  total wall (sum of per-program) off 1 s, on 1 s
+## hecbench: ran to the end in both: 103; timed out (300 s) only with tier off: ['car-cuda']; only with tier on: []; in both: 1
+## hecbench: 105 programs, identical output and verdict: 104, differ: 1
+  DIFF car-cuda ('FAIL', '303', "rc=124 (the card's: rc=0 1 PASS)") ('FAIL', '18', "rc=0 1 FAIL (the card's: rc=0 1 PASS)") | [] | ['RMSE: 100005.960938', 'FAIL']
+  peak RSS MB off/on: median 12 / 13 ; largest on-off: (136.81640625, 168.46484375, 'fwt-cuda')
+  total wall (sum of per-program) off 2166 s, on 1384 s
+## cuda-samples: ran to the end in both: 119; timed out (300 s) only with tier off: ['MonteCarloMultiGPU', 'simplePitchLinearTexture']; only with tier on: []; in both: 8
+## cuda-samples: 129 programs, identical output and verdict: 124, differ: 5
+  DIFF MonteCarloMultiGPU ('FAIL', '300', "exit 124 (the card's: 0)") ('ok', '279', '') | [] | ['./MonteCarloMultiGPU Starting...', 'Using single CPU thread for multiple GPUs']
+  DIFF SobolQRNG ('ok', '1', '') ('ok', '1', '') | ['Gsamples/s: 0.0193722', 'Gsamples/s: 0.489237'] | ['Gsamples/s: 0.0301556', 'Gsamples/s: 0.483372']
+  DIFF UnifiedMemoryStreams ('ok', '0', '') ('ok', '0', '') | ['Task [0], thread [0] executing on host (64)', 'Task [1], thread [0] executing on device (852)'] | ['Task [0], thread [0] executing on host (99)', 'Task [1], thread [0] executing on device (646)']
+  DIFF simplePitchLinearTexture ('FAIL', '300', "exit 124 (the card's: 0)") ('ok', '184', '') | [] | ['simplePitchLinearTexture starting...', 'GPU Device 0: "Ampere" with compute capability 8.6']
+  DIFF threadMigration ('ok', '0', '') ('ok', '0', '') | [] | []
+  peak RSS MB off/on: median 17 / 17 ; largest on-off: (122.7265625, 150.0859375, 'UnifiedMemoryStreams')
+  total wall (sum of per-program) off 1975 s, on 1565 s

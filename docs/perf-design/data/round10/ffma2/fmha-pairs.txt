@@ -1,0 +1,78 @@
+uptime: load average: 23.18, 28.79, 24.24
+[vgpu] running SASS: an sm_100 cubin
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 1 build build wall 33.667472440 s
+[vgpu] running PTX instead of SASS: sm_100 _ZN7cutlass13device_kernelINS_4fmha6kernel36Sm100FmhaFwdKernelTmaWarpspecializedIN4cute5SASS: unknown opcode 0xc49 (sm_100)
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 1 build build-base wall 97.462575398 s
+uptime: load average: 3.91, 19.13, 21.25
+[vgpu] running SASS: an sm_100 cubin
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 1 build build wall 33.212204784 s
+[vgpu] running PTX instead of SASS: sm_100 _ZN7cutlass13device_kernelINS_4fmha6kernel36Sm100FmhaFwdKernelTmaWarpspecializedIN4cute5SASS: unknown opcode 0xc49 (sm_100)
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 1 build build-base wall 97.386961057 s
+uptime: load average: 1.36, 12.75, 18.61
+[vgpu] running SASS: an sm_100 cubin
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 1 build build wall 33.327910619 s
+[vgpu] running PTX instead of SASS: sm_100 _ZN7cutlass13device_kernelINS_4fmha6kernel36Sm100FmhaFwdKernelTmaWarpspecializedIN4cute5SASS: unknown opcode 0xc49 (sm_100)
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 1 build build-base wall 97.424259687 s
+uptime: load average: 1.08, 8.63, 16.32
+[vgpu] running SASS: an sm_100 cubin
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 2 build build wall 30.900174121 s
+[vgpu] running PTX instead of SASS: sm_100 _ZN7cutlass13device_kernelINS_4fmha6kernel36Sm100FmhaFwdKernelTmaWarpspecializedIN4cute5SASS: unknown opcode 0xc49 (sm_100)
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 2 build build-base wall 83.779362732 s
+uptime: load average: 1.01, 6.19, 14.53
+[vgpu] running SASS: an sm_100 cubin
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 2 build build wall 28.543253373 s
+[vgpu] running PTX instead of SASS: sm_100 _ZN7cutlass13device_kernelINS_4fmha6kernel36Sm100FmhaFwdKernelTmaWarpspecializedIN4cute5SASS: unknown opcode 0xc49 (sm_100)
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 2 build build-base wall 83.870247106 s
+uptime: load average: 1.00, 4.53, 12.95
+[vgpu] running SASS: an sm_100 cubin
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 2 build build wall 28.495741775 s
+[vgpu] running PTX instead of SASS: sm_100 _ZN7cutlass13device_kernelINS_4fmha6kernel36Sm100FmhaFwdKernelTmaWarpspecializedIN4cute5SASS: unknown opcode 0xc49 (sm_100)
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 2 build build-base wall 83.817663132 s
+uptime: load average: 1.00, 3.43, 11.61
+[vgpu] running SASS: an sm_100 cubin
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 3 build build wall 30.672823442 s
+[vgpu] running PTX instead of SASS: sm_100 _ZN7cutlass13device_kernelINS_4fmha6kernel36Sm100FmhaFwdKernelTmaWarpspecializedIN4cute5SASS: unknown opcode 0xc49 (sm_100)
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 3 build build-base wall 86.346597779 s
+uptime: load average: 1.00, 2.65, 10.37
+[vgpu] running SASS: an sm_100 cubin
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 3 build build wall 30.573158478 s
+[vgpu] running PTX instead of SASS: sm_100 _ZN7cutlass13device_kernelINS_4fmha6kernel36Sm100FmhaFwdKernelTmaWarpspecializedIN4cute5SASS: unknown opcode 0xc49 (sm_100)
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 3 build build-base wall 86.287656538 s
+uptime: load average: 1.03, 2.11, 9.23
+[vgpu] running SASS: an sm_100 cubin
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 3 build build wall 30.555688866 s
+[vgpu] running PTX instead of SASS: sm_100 _ZN7cutlass13device_kernelINS_4fmha6kernel36Sm100FmhaFwdKernelTmaWarpspecializedIN4cute5SASS: unknown opcode 0xc49 (sm_100)
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 3 build build-base wall 86.378596345 s
+uptime: load average: 1.00, 1.75, 8.26
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 4 build build wall 41.537511352 s
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 4 build build-base wall 137.814761430 s
+uptime: load average: 1.00, 1.41, 6.98
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 4 build build wall 41.618030290 s
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 4 build build-base wall 137.803515429 s
+uptime: load average: 1.00, 1.22, 5.91
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 4 build build wall 41.548519978 s
+ [OK]  tma ws 256x128 acc fp32 individual : 0 TFLOPS/s
+case 4 build build-base wall 137.776677192 s

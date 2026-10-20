@@ -1275,6 +1275,8 @@ vgpu_unit_test(test_sass_access_count)
 vgpu_unit_test(test_memfast)
 # The closed forms of the sector and bank-pass counters, against the definition of what they count.
 vgpu_unit_test(test_memcount_forms)
+# The single-lookup atomic read-modify-write and the one-lookup texel read, against the per-access code they replace.
+vgpu_unit_test(test_atom_rmw)
 # Module::code_at (a binary search over the code sections) against the scan it replaced.
 vgpu_unit_test(test_sass_code_at)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
@@ -1364,6 +1366,17 @@ target_sources(test_mpeg2_decode PRIVATE nvidia/src/mpeg2_decode.cpp nvidia/src/
 target_compile_definitions(test_mpeg2_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_sass_decode nvidia/tests/unit/test_sass_decode.cpp)
 target_compile_definitions(test_sass_decode PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The decoder's output, bit for bit, over the same corpora and mutations of them (round 10: the decoder is made faster).
+vgpu_unit_test(test_decode_same_bits nvidia/tests/unit/test_decode_same_bits.cpp)
+target_include_directories(test_decode_same_bits PRIVATE src)
+target_compile_definitions(test_decode_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# sass::unsupported's table of words it has seen: the answer and the text of a refusal are the same with or without it.
+vgpu_unit_test(test_unsupported_memo tests/unit/test_unsupported_memo.cpp)
+target_compile_definitions(test_unsupported_memo PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# FFMA2/FMUL2/FADD2 (sm_100's packed fp32): the corpora's lines decode and are run, a cubin of them is supported, the forms of unknown
+# meaning are refused, and the arithmetic the PTX and SASS engines share.
+vgpu_unit_test(test_f32x2_sass tests/unit/test_f32x2_sass.cpp)
+target_compile_definitions(test_f32x2_sass PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The tier's analysis (src/sass/tier.cpp) over the same corpora.
 vgpu_unit_test(test_tier)
 target_include_directories(test_tier PRIVATE src)
@@ -3179,6 +3192,14 @@ if(TARGET vgpucudart)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SASS_PROGRAMS=cdp_device_api:75 cdp1_device_sync:75:89;VGPU_SASS_ARCHS=sm_75 sm_86 sm_90 sm_120"
     TIMEOUT 1800)
+  # Blackwell's packed fp32 (FFMA2, FMUL2, FADD2) through nvcc and ptxas for sm_100: the SASS engine, the PTX engine and the tier print
+  # the same, and the host's arithmetic agrees (e2e_sass_archs runs it with the rest).
+  add_test(NAME e2e_packed_f32x2 COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_archs.sh)
+  set_tests_properties(e2e_packed_f32x2 PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SASS_PROGRAMS=packed_f32x2:100:100 packed_f32x2:100a;VGPU_SASS_ARCHS=sm_100 sm_100a"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 1800)
   # The *.sync warp instructions' member masks, as an RTX 3060 (sm_86) ran them, on both engines
   # (e2e_sass_archs runs it with the rest).
   add_test(NAME e2e_sync_masks COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_archs.sh)
@@ -3659,6 +3680,12 @@ if(TARGET vgpucudart)
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     RUN_SERIAL TRUE
     TIMEOUT 3600)
+  # How sweep.py ends the process (os._exit after a flush, not interpreter finalisation, which PyTorch's
+  # autograd thread can abort): exit statuses, flushed output, no atexit; needs neither torch nor a GPU.
+  find_program(VGPU_PYTHON NAMES python3 python)
+  if(VGPU_PYTHON)
+    add_test(NAME sweep_exit COMMAND "${VGPU_PYTHON}" ${CMAKE_SOURCE_DIR}/nvidia/tests/pytorch/test_sweep_exit.py)
+  endif()
   add_test(NAME e2e_pytorch_sweep_full COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pytorch_sweep.sh full nvidia/rtx5090)
   set_tests_properties(e2e_pytorch_sweep_full PROPERTIES
     DEPENDS "vgpu_cli;vgpucudart;vgpucuda;vgpucudnn;vgpucublas"
@@ -3899,7 +3926,7 @@ endif()
 foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopper e2e_cutlass_sm103
            e2e_cutlass_sm100_conv e2e_cutlass_fmha e2e_tma_gemm_cute e2e_wgmma_cute
            e2e_tma_reduce_cute e2e_tensormap_replace_cute e2e_sass_archs e2e_device_runtime
-           e2e_sync_masks)
+           e2e_sync_masks e2e_packed_f32x2)
   if(TEST ${_t})
     set_property(TEST ${_t} APPEND PROPERTY RESOURCE_LOCK nvcc_memory)
   endif()

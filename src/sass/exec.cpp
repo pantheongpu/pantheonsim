@@ -43,6 +43,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/device_printf.hpp"
+#include "vgpu/exec/f32x2.hpp"
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/mem_counters.hpp"
