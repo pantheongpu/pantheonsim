@@ -1515,6 +1515,13 @@ target_compile_definitions(test_amd_gcn_packed_same_bits PRIVATE VGPU_SOURCE_DIR
 # The code object reader (codeobject.cpp) against digests of what it read before it was made faster.
 vgpu_unit_test(test_amd_codeobject_same_bits amd/tests/unit/test_codeobject_same_bits.cpp)
 target_compile_definitions(test_amd_codeobject_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The digest tests again on the baseline x86-64 code of the AMD engine's SIMD paths (VGPU_SIMD=base keeps mfma_math.hpp and packed_math.hpp off
+# AVX2, FMA and F16C): the recorded bits are the same on every CPU the engine runs on, not only on one with those units.
+foreach(_t test_amd_gcn_same_bits test_amd_gcn_packed_same_bits test_amd_gcn_tier_same_bits test_amd_matrix_fast test_amd_mfma_math
+           test_amd_packed_math)
+  add_test(NAME ${_t}_simd_base COMMAND ${_t})
+  set_tests_properties(${_t}_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base" TIMEOUT 1500)
+endforeach()
 target_include_directories(test_amd_codeobject_same_bits PRIVATE amd/include)
 
 # Lanes over consecutive addresses as one call to the memory manager, against lane by lane (memruns.c).

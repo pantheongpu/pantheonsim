@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+
+#include "amd_simd_cap.hpp"
 #if defined(__SSE2__)
 #include <emmintrin.h>
 #endif
@@ -237,7 +239,7 @@ inline double mfma_tile_ordered(const double* arow, const double* bcol, uint32_t
 #if defined(__x86_64__) && defined(__GNUC__)
 // Whether the 4-wide kernels are used: the host has AVX2 (a test turns it off to hold the 2-wide ones against the same cases).
 inline bool& mfma_avx2_switch() {
-  static bool on = __builtin_cpu_supports("avx2");
+  static bool on = !simd_capped_to_base() && __builtin_cpu_supports("avx2");
   return on;
 }
 inline bool mfma_have_avx2() { return mfma_avx2_switch(); }
@@ -330,7 +332,7 @@ __attribute__((target("fma"))) inline void mfma_tile_fma_hw(uint32_t m, uint32_t
     }
 }
 inline bool mfma_have_fma() {
-  static const bool have = __builtin_cpu_supports("fma");
+  static const bool have = !simd_capped_to_base() && __builtin_cpu_supports("fma");
   return have;
 }
 #endif
