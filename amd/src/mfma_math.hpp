@@ -165,10 +165,14 @@ inline double mfma_dot_fma(const double* a, const double* bt, uint32_t k, double
   for (uint32_t i = 0; i < k; ++i) sum = mfma_fma(bt[i], a[i], sum);
   return sum;
 }
+// acc + a * b in 64 bits, wrapping as the hardware's integer adders do (done unsigned: the signed overflow is undefined, and a sanitizer says so).
+inline int64_t wrap_madd(int64_t acc, int64_t a, int64_t b) {
+  return static_cast<int64_t>(static_cast<uint64_t>(acc) + static_cast<uint64_t>(a) * static_cast<uint64_t>(b));
+}
 // Integers are summed exactly and wrap as the hardware's do.
 inline int64_t mfma_dot_int(const double* a, const double* bt, uint32_t k, int64_t c) {
   int64_t sum = c;
-  for (uint32_t i = 0; i < k; ++i) sum += static_cast<int64_t>(a[i]) * static_cast<int64_t>(bt[i]);
+  for (uint32_t i = 0; i < k; ++i) sum = wrap_madd(sum, static_cast<int64_t>(a[i]), static_cast<int64_t>(bt[i]));
   return sum;
 }
 

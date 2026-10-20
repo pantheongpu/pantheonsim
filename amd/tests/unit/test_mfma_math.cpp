@@ -78,11 +78,17 @@ VTEST(a_dot_product_reads_the_same_sum_from_a_contiguous_column_as_from_the_stri
     for (uint32_t kk = 0; kk < k; ++kk) {
       old_sum += a[kk] * b[kk * n + j];
       old_fma = std::fma(a[kk], b[kk * n + j], old_fma);
-      old_int += static_cast<int64_t>(ia[kk]) * static_cast<int64_t>(ib[kk * n + j]);
+        old_int += static_cast<int64_t>(ia[kk]) * static_cast<int64_t>(ib[kk * n + j]);
       icol[kk] = ib[kk * n + j];
     }
-    VCHECK_EQ(bits_of(vgpu::amd::mfma_dot(a.data(), column.data(), k, c)), bits_of(old_sum));
-    VCHECK_EQ(bits_of(vgpu::amd::mfma_dot_fma(a.data(), column.data(), k, c)), bits_of(old_fma));
+    // (Two NaNs of different payloads in one multiply or add leave the payload of the operand the compiler made the first; the reference
+    // loop here is the compiler's choice at whatever optimization level this is built at, mfma_dot's is the fixed one, tested by
+    // nans_with_different_payloads_come_out_as_the_fixed_operand_order_gives. So a NaN is compared as a NaN.)
+    const double got_dot = vgpu::amd::mfma_dot(a.data(), column.data(), k, c), got_fma = vgpu::amd::mfma_dot_fma(a.data(), column.data(), k, c);
+    if (std::isnan(old_sum)) VCHECK(std::isnan(got_dot));
+    else VCHECK_EQ(bits_of(got_dot), bits_of(old_sum));
+    if (std::isnan(old_fma)) VCHECK(std::isnan(got_fma));
+    else VCHECK_EQ(bits_of(got_fma), bits_of(old_fma));
     VCHECK_EQ(vgpu::amd::mfma_dot_int(ia.data(), icol.data(), k, int_start), old_int);
     ++checked;
   }
