@@ -218,6 +218,15 @@ _Float16 as_half(uint16_t bits) {
   std::memcpy(&h, &bits, 2);
   return h;
 }
+// A single's value rounded to a half now, not when something later stores it. GCC 12 on x86 does half
+// arithmetic in single precision and may leave a result unrounded until it is stored, so what a program that
+// looks at the result before the store (an infinity test, a clamp) sees depends on what the compiler inlined.
+// The volatile read is what makes the rounding happen here.
+inline _Float16 half_rounded(float f) {
+  volatile _Float16 h = static_cast<_Float16>(f);
+  return h;
+}
+
 uint16_t as_bits(_Float16 h) {
   uint16_t b;
   std::memcpy(&b, &h, 2);
@@ -5895,7 +5904,7 @@ struct Machine {
     if (!(op == "v_add_f16_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_half(w, in, lane, lane_half(w, in.src[0], lane) + lane_half(w, in.src[1], lane));
+        write_half(w, in, lane, half_rounded(static_cast<float>(lane_half(w, in.src[0], lane)) + static_cast<float>(lane_half(w, in.src[1], lane))));
       });
     }
     break;
@@ -5903,7 +5912,7 @@ struct Machine {
     if (!(op == "v_sub_f16_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_half(w, in, lane, lane_half(w, in.src[0], lane) - lane_half(w, in.src[1], lane));
+        write_half(w, in, lane, half_rounded(static_cast<float>(lane_half(w, in.src[0], lane)) - static_cast<float>(lane_half(w, in.src[1], lane))));
       });
     }
     break;
@@ -5911,7 +5920,7 @@ struct Machine {
     if (!(op == "v_mul_f16_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_half(w, in, lane, lane_half(w, in.src[0], lane) * lane_half(w, in.src[1], lane));
+        write_half(w, in, lane, half_rounded(static_cast<float>(lane_half(w, in.src[0], lane)) * static_cast<float>(lane_half(w, in.src[1], lane))));
       });
     }
     break;
