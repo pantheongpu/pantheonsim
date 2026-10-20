@@ -93,7 +93,7 @@ std::vector<uint32_t> make_input(const Form& f, std::mt19937& g) {
   for (int t = 0; t < kTrials; ++t) {
     const bool wide = (t / 2) % 2 == 1;
     for (int th = 0; th < kThreads; ++th) {
-      uint32_t* w = &in[(size_t{t} * kThreads + th) * kWords];
+      uint32_t* w = &in[(static_cast<size_t>(t) * kThreads + th) * kWords];
       for (int r = 0; r < 6; ++r) {
         if (f.fmt == 0) w[r] = half_class(g, wide) | uint32_t{half_class(g, wide)} << 16;
         else if (f.fmt == 1) w[r] = bf16_class(g, wide) | uint32_t{bf16_class(g, wide)} << 16;
