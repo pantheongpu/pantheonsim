@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <string>
 #include <functional>
+#include <deque>
 #include <map>
 #include <memory>
 #include <vector>
@@ -478,20 +479,22 @@ class MemoryManager {
   struct Allocation {
     uint64_t size = 0;
     size_t chunk_count = 0;
+    size_t chunk_capacity = 0;   // entries chunks has room for: a recycled allocation keeps its array
     std::unique_ptr<std::atomic<uint8_t*>[]> chunks;
-    // Set when the chunks are pieces of one shared file mapping (export_handle, import_handle).
     uint8_t* external = nullptr;
     size_t external_len = 0;
+    // Whether any chunk was ever filled past the allocation's own end: a chunk made from a uniform
+    // chunk of a byte other than zero is written whole. Otherwise every byte past `size` is still
+    // zero, which is what lets a chunk go back to the backing having cleared only the bytes below it.
+    std::atomic<bool> wide_dirty{false};
 
     Allocation() = default;
-    // The move has to clear the source's count as well as its pointer: a
-    // defaulted move leaves chunk_count behind, and the moved-from destructor
-    // then walks a null array.
     Allocation(Allocation&& o) noexcept
-        : size(o.size), chunk_count(o.chunk_count), chunks(std::move(o.chunks)),
-          external(o.external), external_len(o.external_len) {
+        : size(o.size), chunk_count(o.chunk_count), chunk_capacity(o.chunk_capacity), chunks(std::move(o.chunks)),
+          external(o.external), external_len(o.external_len), wide_dirty(o.wide_dirty.load(std::memory_order_relaxed)) {
       o.size = 0;
       o.chunk_count = 0;
+      o.chunk_capacity = 0;
       o.external = nullptr;
     }
     Allocation& operator=(Allocation&& o) noexcept {
@@ -499,11 +502,14 @@ class MemoryManager {
         release();
         size = o.size;
         chunk_count = o.chunk_count;
+        chunk_capacity = o.chunk_capacity;
         chunks = std::move(o.chunks);
         external = o.external;
         external_len = o.external_len;
+        wide_dirty.store(o.wide_dirty.load(std::memory_order_relaxed), std::memory_order_relaxed);
         o.size = 0;
         o.chunk_count = 0;
+        o.chunk_capacity = 0;
         o.external = nullptr;
       }
       return *this;
@@ -512,19 +518,48 @@ class MemoryManager {
     Allocation& operator=(const Allocation&) = delete;
     ~Allocation() { release(); }
 
+    // Gives the chunks back and leaves an empty allocation that still owns its (small) array, ready
+    // for set_up().
+    void recycle() {
+      release();
+      if (chunks && chunk_capacity <= kRecycledChunkEntries && !external) {
+        for (size_t i = 0; i < chunk_count; ++i) chunks[i].store(nullptr, std::memory_order_relaxed);
+      } else {
+        chunks.reset();
+        chunk_capacity = 0;
+      }
+      size = 0;
+      chunk_count = 0;
+      external = nullptr;
+      external_len = 0;
+      wide_dirty.store(false, std::memory_order_relaxed);
+    }
+    // A fresh allocation of `bytes`: every chunk untouched.
+    void set_up(uint64_t bytes) {
+      size = bytes;
+      chunk_count = static_cast<size_t>((bytes + kChunkSize - 1) / kChunkSize);
+      if (!chunks || chunk_capacity < chunk_count) {
+        chunks = std::make_unique<std::atomic<uint8_t*>[]>(chunk_count);
+        chunk_capacity = chunk_count;
+      }
+    }
+
    private:
+    static constexpr size_t kRecycledChunkEntries = 16;
     void release() {
       if (!chunks) return;
-      // Memory in a file two processes map: the chunks are pieces of that mapping, which goes in one
-      // piece.
       if (external) {
         ::munmap(external, external_len);
         external = nullptr;
         return;
       }
+      const bool wide = wide_dirty.load(std::memory_order_relaxed);
       for (size_t i = 0; i < chunk_count; ++i) {
         uint8_t* c = chunks[i].load(std::memory_order_relaxed);
-        if (!is_uniform(c)) backing::release(c);
+        if (is_uniform(c)) continue;
+        // What may be non-zero in this chunk: all of it, or only the part below the allocation's end.
+        const uint64_t dirty = wide || i + 1 < chunk_count ? kChunkSize : size - i * kChunkSize;
+        backing::release(c, dirty);
       }
     }
 
@@ -738,8 +773,15 @@ class MemoryManager {
   std::map<uint64_t, Allocation> live_;        // base -> allocation
   // base -> record, bounded to kQuarantineEntries (oldest evicted first).
   std::map<uint64_t, FreedRecord> freed_;
-  std::map<uint64_t, uint64_t> freed_order_;  // seq -> base, for eviction
-  uint64_t freed_seq_ = 0;
+  // The frees, oldest first, as bases: the quarantine's eviction order. The entry at the front has
+  // sequence number freed_front_seq_, the next one that of the entry after it, and so on.
+  std::deque<uint64_t> freed_order_;
+  uint64_t freed_front_seq_ = 0;
+  // A node of live_ and one of freed_ kept from the last free and eviction, for the next allocation
+  // and free to put back without asking the heap (used under the table's writer lock only).
+  std::map<uint64_t, Allocation>::node_type spare_live_;
+  std::map<uint64_t, FreedRecord>::node_type spare_freed_;
+  void remember_freed(uint64_t ptr, uint64_t size);
   // Highest VA ever handed out, so a pointer inside the retired range can be
   // called out as stale even after it leaves the quarantine.
   uint64_t high_water_va_;

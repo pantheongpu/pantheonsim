@@ -127,7 +127,8 @@ std::ostream& operator<<(std::ostream& os, Hex h) {
 }  // namespace
 
 uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
-  ExclusiveGuard table_guard(table_lock_.get());
+  // A new entry in the table makes no answer a thread remembered wrong, so readers' memories stay.
+  ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
   if (size == 0) throw Error::make(Err::InvalidValue, "cudaMalloc-style allocation of 0 bytes is invalid");
   if (used_ + size > capacity_ || used_ + size < used_)
     throw Error::make(Err::OutOfMemory, "device out of memory: requested ", size, " bytes, ", used_,
@@ -138,24 +139,55 @@ uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
   next_va_ = base + padded;
   high_water_va_ = next_va_;
   used_ += size;
-  Allocation a;
-  a.size = size;
-  a.chunk_count = static_cast<size_t>((size + kChunkSize - 1) / kChunkSize);
-  a.chunks = std::make_unique<std::atomic<uint8_t*>[]>(a.chunk_count);
-  live_.emplace(base, std::move(a));
+  // The node of the last freed allocation, with its array of chunk slots, when there is one.
+  auto node = std::move(spare_live_);
+  if (node.empty()) {
+    Allocation a;
+    a.set_up(size);
+    live_.emplace(base, std::move(a));
+  } else {
+    node.key() = base;
+    node.mapped().set_up(size);
+    live_.insert(std::move(node));
+  }
   notify_usage();
   return base;
 }
 
+void MemoryManager::remember_freed(uint64_t ptr, uint64_t size) {
+  const FreedRecord record{size, freed_front_seq_ + freed_order_.size()};
+  auto at = freed_.lower_bound(ptr);
+  if (at != freed_.end() && at->first == ptr) {
+    at->second = record;
+  } else if (!spare_freed_.empty()) {
+    spare_freed_.key() = ptr;
+    spare_freed_.mapped() = record;
+    freed_.insert(at, std::move(spare_freed_));
+  } else {
+    freed_.emplace_hint(at, ptr, record);
+  }
+  freed_order_.push_back(ptr);
+  // Evict the oldest entries once the bound is reached; the node of the last goes to the next free.
+  while (freed_order_.size() > kQuarantineEntries) {
+    auto stale = freed_.find(freed_order_.front());
+    // Only drop it if this record is the one that entry refers to.
+    if (stale != freed_.end() && stale->second.seq == freed_front_seq_) spare_freed_ = freed_.extract(stale);
+    freed_order_.pop_front();
+    ++freed_front_seq_;
+  }
+}
+
 void MemoryManager::free(uint64_t ptr) {
-  ExclusiveGuard table_guard(table_lock_.get());
+  // Quiet: a free says which allocation it takes (note_free) and leaves every other answer a thread
+  // remembered as it was.
+  ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
   // An allocation that was exported for another process lives in a file now,
   // not in chunks. Freeing it takes the mapping and the file with it, which is
   // what the exporting process owns.
   if (const auto sh = shared_.find(ptr); sh != shared_.end() && sh->second.owner) {
     used_ -= sh->second.size;
-    freed_[ptr] = FreedRecord{sh->second.size, freed_seq_};
-    freed_order_[freed_seq_++] = ptr;
+    remember_freed(ptr, sh->second.size);
+    table_lock_->note_free(ptr);
     drop_shared(sh);
     notify_usage();
     return;
@@ -165,16 +197,11 @@ void MemoryManager::free(uint64_t ptr) {
     used_ -= it->second.size;
     // Quarantine the freed range so use-after-free stays diagnosable, evicting
     // the oldest entry once the bound is reached.
-    freed_[ptr] = FreedRecord{it->second.size, freed_seq_};
-    freed_order_[freed_seq_++] = ptr;
-    while (freed_order_.size() > kQuarantineEntries) {
-      auto oldest = freed_order_.begin();
-      auto stale = freed_.find(oldest->second);
-      // Only drop it if this record is the one that entry refers to.
-      if (stale != freed_.end() && stale->second.seq == oldest->first) freed_.erase(stale);
-      freed_order_.erase(oldest);
-    }
-    live_.erase(it);
+    remember_freed(ptr, it->second.size);
+    table_lock_->note_free(ptr);
+    auto node = live_.extract(it);
+    node.mapped().recycle();
+    spare_live_ = std::move(node);
     notify_usage();
     return;
   }
@@ -374,7 +401,29 @@ struct LookupMemory {
                          // kernel cycling through more allocations than there are ways
                          // still hits some of the time instead of never
 };
-thread_local LookupMemory t_lookups;
+// A thread's memory is made on its first lookup and given back when it ends. The pointer is the
+// thread-local that is read on every access, so it is initial-exec (one load off the thread pointer;
+// a general-dynamic thread-local of a shared library is a call), and a pointer so that a library
+// loaded late needs eight bytes of static TLS and not the memory's three hundred. A thread that is
+// ending reads an empty memory that is never written (`g_ended_lookups`), and so finds nothing.
+LookupMemory g_ended_lookups;
+[[gnu::tls_model("initial-exec")]] thread_local LookupMemory* t_lookups = nullptr;
+struct LookupOwner {
+  LookupMemory* memory;
+  ~LookupOwner() {
+    t_lookups = &g_ended_lookups;
+    delete memory;
+  }
+};
+[[gnu::noinline]] LookupMemory* make_lookups() {
+  thread_local LookupOwner owner{new LookupMemory};
+  t_lookups = owner.memory;
+  return owner.memory;
+}
+inline LookupMemory& lookups() {
+  LookupMemory* m = t_lookups;
+  return *(__builtin_expect(m != nullptr, 1) ? m : make_lookups());
+}
 }  // namespace
 
 bool MemoryManager::lookup_cache_default() {
@@ -386,12 +435,19 @@ bool MemoryManager::lookup_cache_default() {
 [[gnu::noinline]] const MemoryManager::Allocation* MemoryManager::find_ordinary_miss(uint64_t addr, uint64_t len,
                                                                                        uint64_t* base_out) const {
   BigReaderLock* lock = table_lock_.get();
-  LookupMemory& mem = t_lookups;
+  LookupMemory& mem = lookups();
   const uint64_t epoch = lock->epoch();
   for (unsigned i = 0; i < LookupMemory::kWays; ++i) {
-    const LookupMemory::Entry& e = mem.way[i];
+    LookupMemory::Entry& e = mem.way[i];
     const uint64_t off = addr - e.base;
-    if (e.epoch != epoch || off >= e.size || len > e.size - off) continue;
+    if (off >= e.size || len > e.size - off) continue;
+    if (e.epoch != epoch) {
+      // Stale, but perhaps only by the frees of other allocations (a launch frees its argument block
+      // every time): then it is still right, and is remembered under the new epoch.
+      uint64_t now = 0;
+      if (&mem == &g_ended_lookups || e.epoch == 0 || !lock->still_valid(e.epoch, e.base, &now)) continue;
+      e.epoch = now;
+    }
     mem.last = i;
     if (base_out) *base_out = e.base;
     return static_cast<const Allocation*>(e.allocation);
@@ -404,6 +460,10 @@ bool MemoryManager::lookup_cache_default() {
   const Allocation& a = prev->second;
   const uint64_t off = addr - prev->first;
   if (!(off < a.size && len <= a.size - off)) return nullptr;
+  if (&mem == &g_ended_lookups) {
+    if (base_out) *base_out = prev->first;
+    return &a;
+  }
   // The epoch read under the shared lock cannot move while it is held.
   uint32_t v = mem.victim;
   v ^= v << 13, v ^= v >> 17, v ^= v << 5;
@@ -422,7 +482,7 @@ bool MemoryManager::lookup_cache_default() {
     uint64_t addr, uint64_t len, uint64_t* base_out) const {
   BigReaderLock* lock = table_lock_.get();
   if (!lock || !lookup_cache_) return nullptr;
-  LookupMemory& mem = t_lookups;
+  LookupMemory& mem = lookups();
   const uint64_t epoch = lock->epoch();
   const LookupMemory::Entry& e = mem.way[mem.last];
   const uint64_t off = addr - e.base;
@@ -526,10 +586,15 @@ uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
   uint8_t* expected = a.chunks[chunk_idx].load(std::memory_order_acquire);
   while (!expected || is_uniform(expected)) {
     uint8_t* fresh = backing::acquire();
-    if (expected && uniform_byte(expected)) std::memset(fresh, uniform_byte(expected), kChunkSize);
+    const bool wide = expected && uniform_byte(expected);
+    if (wide) {
+      // Written whole, past the allocation's end too: its chunks go back to the backing as they are.
+      a.wide_dirty.store(true, std::memory_order_relaxed);
+      std::memset(fresh, uniform_byte(expected), kChunkSize);
+    }
     if (a.chunks[chunk_idx].compare_exchange_strong(expected, fresh, std::memory_order_acq_rel))
       return fresh;
-    backing::release(fresh);
+    backing::release(fresh, wide ? backing::kAllBytesDirty : 0);
   }
   return expected;
 }
@@ -1253,6 +1318,7 @@ const MemoryManager::Allocation* MemoryManager::run_allocation(uint64_t addr, ui
                         armed(access_fault_->store_pending)))
     return nullptr;
   if (addr % unit || len % unit || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
+  if (const Allocation* a = find_ordinary(addr, len, base)) return a;
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up == live_.begin()) return nullptr;
