@@ -524,7 +524,7 @@ class Runner {
   }
   bool tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc
   template <bool Jit>
-  [[gnu::always_inline]] bool tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc: the run loop; Jit adds the hook of tier 2
+  [[gnu::always_inline]] inline bool tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc: the run loop; Jit adds the hook of tier 2
   bool tier_run_jit(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc: tier_run_t<true>, not inlined
   bool break_spin_wait(const std::vector<Block*>& blocks);
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);

@@ -236,7 +236,7 @@ struct Stats {
 };
 Stats& stats();
 // Whether the statistics are being kept (VGPU_JIT_STATS): the executor counts nothing otherwise, an atomic add per region call being a visible cost on small regions.
-namespace detail { extern bool g_stats_on; }
+namespace detail { extern bool g_stats_on __attribute__((visibility("hidden"))); }   // libcuda and libcudart both contain this code (tests/lint/check_odr_globals.py)
 inline bool stats_on() { return detail::g_stats_on; }
 // Waits until the worker has nothing queued (tests).
 void drain();
