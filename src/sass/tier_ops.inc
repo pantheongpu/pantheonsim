@@ -1671,16 +1671,56 @@ inline void tier_release_bar(Block& blk, unsigned id) {
   b = Block::Barrier{};
 }
 
+// ---- tier 2 (src/sass/jit.hpp) ----------------------------------------------------------------------------------
+
+// What the generated code's escape needs: the handler's context, where the region's first op is, and the op the escape last ran (the one a
+// fault names: tier_run's `cur`).
+struct JitHost {
+  TCtx* c;
+  const tier::MOp* ops;      // the region's first op
+  const tier::MOp* last;
+  bool stats;
+};
+
+// One op of a region, as the run loop runs it after counting it: the handler for the lanes that execute it, then the tier's statistics
+// (reported even when no lane executes, as the loop reports them). `ex` is the generated code's own count of the guard, the loop's.
+void jit_escape(jit::Ctx* j, uint32_t i, uint32_t ex) {
+  JitHost& h = *static_cast<JitHost*>(j->host);
+  const tier::MOp& op = h.ops[i];
+  h.last = &op;
+  if (ex) op.fn(h.c, op, ex);
+  if (h.stats) [[unlikely]] tier_stats().native[static_cast<size_t>(op.ins->op)].fetch_add(1, std::memory_order_relaxed);
+}
+
 bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
   TCtx c{&w, &blk, this, w.r.data(), bank0_.data(), bank0_.size(), tp.pool.data(), &simd::kernels()};
   exec::LaunchStats& st = blk.st;
   const tier::MOp* ops = tp.ops.data();
   const size_t count = code.count;
   bool regs_ok = true;
+  jit::Unit* const ju = jit_ ? tp.jit.get() : nullptr;
+  JitHost jh{&c, ops, nullptr, tier_stats_};
+  jit::Ctx jc{};
+  if (ju) [[unlikely]] {
+    jc.abi = jit::kAbiVersion;
+    jc.flags = tier_stats_ ? 1u : 0u;
+    jc.up = w.up;
+    jc.p = w.p;
+    jc.steps = &w.steps;
+    jc.instructions = &st.instructions;
+    jc.thread_instructions = &st.thread_instructions;
+    jc.by_class = st.inst_by_class;
+    jc.escape = &jit_escape;
+    jc.host = &jh;
+    jc.b0 = c.b0;
+    jc.b0n = c.b0n;
+    jc.pool = c.pool;
+  }
   for (bool again = false;; again = true) {   // one pass is one call of step_warp
   // The warp's register file may have been resized since the last pass (USETMAXREG.TRY_ALLOC grows it, and a vector that grows moves):
   // the row pointer and the check that a program's registers are inside the file are worked out again for every pass.
   c.R = w.r.data();
+  jc.R = c.R;
   regs_ok = tp.max_reg <= w.nregs;
   if (tier_stats_) [[unlikely]] {
     tier_stats().passes.fetch_add(1, std::memory_order_relaxed);
@@ -1692,6 +1732,35 @@ bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code
   const tier::MOp* cur = &ops[idx];
   try {
     for (unsigned n = 0;; ++n) {
+      // Tier 2: a region that starts here, compiled, is run in place of its ops. What the loop checks for each of them is checked once for
+      // all: the 256-instruction run (n + k), the step budget (steps + k), the registers its handlers touch. A region holds no store, so
+      // the store gate below cannot trip inside one. When any check fails the ops go the old way, one at a time, and the result is the
+      // tier's. The generated code counts every op as the loop does; a fault names the op the escape last ran.
+      if (ju) [[unlikely]] {
+        if (const uint32_t ri = ju->region_at[idx]) {
+          const jit::Region& rg = ju->regions[ri - 1];
+          if (n + rg.k <= 256 && w.steps + rg.k <= max_steps_ && rg.maxreg <= w.nregs) {
+            if (!ju->ready()) ju->note(rg.k);
+            if (ju->ready()) {
+              jh.ops = &ops[idx];
+              jh.last = nullptr;
+              try {
+                ju->fn(ri - 1)(&jc, group, glanes);
+              } catch (...) {
+                if (jh.last) cur = jh.last;
+                jit::stats().region_throws.fetch_add(1, std::memory_order_relaxed);
+                throw;
+              }
+              jit::stats().regions_run.fetch_add(1, std::memory_order_relaxed);
+              jit::stats().instructions_run.fetch_add(rg.k, std::memory_order_relaxed);
+              cur = &ops[idx + rg.k - 1];
+              idx += rg.k;
+              n += rg.k - 1;
+              continue;
+            }
+          }
+        }
+      }
       // step_warp's store gate: a warp's first store to global memory ends its turn, once, so that the block's other warps
       // issue the loads their prologues make before it lands (the comment there says why). The tier must stop where
       // the interpreter does, or a block's warps see each other's stores in another order.

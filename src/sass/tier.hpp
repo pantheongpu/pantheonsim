@@ -28,6 +28,10 @@
 
 #include "vgpu/sass/sass.hpp"
 
+namespace vgpu::sass::jit {
+struct Unit;
+}
+
 namespace vgpu::sass::tier {
 
 // 32 lanes of constant, the shape a source row has in the register file.
@@ -178,6 +182,7 @@ struct Program {
   std::map<uint32_t, uint32_t> const_index;   // value -> pool row, while the program is built
   uint16_t max_reg = 0;          // the largest MOp::maxreg: a warp whose file holds this needs no per-op check
   size_t native = 0;             // instructions with a handler
+  std::shared_ptr<jit::Unit> jit;   // tier 2 (VGPU_JIT=1, src/sass/jit.hpp): the regions of this section, null when there are none or the JIT is off
 };
 
 // The analysis half. Fills in everything of `op` but `fn` (the executor binds handlers by `form`).

@@ -17,6 +17,7 @@
 #include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/sass/exec.hpp"
 #include "tier.hpp"
+#include "jit.hpp"
 
 #if defined(__SSE2__)
 #include <emmintrin.h>
@@ -452,6 +453,7 @@ class Runner {
       tier_stats_ = tier_ && ts && (ts[0] == '1' || ts[0] == '2');
       const char* tc = std::getenv("VGPU_TIER_CHAIN");
       tier_chain_ = !(tc && tc[0] == '0');
+      jit_ = tier_ && jit::requested();
     }
     build_bank0(args);
     for (const auto& [name, va] : m.bank_va) {
@@ -614,6 +616,7 @@ class Runner {
   // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
   bool tier_ = false;
   bool tier_stats_ = false;
+  bool jit_ = false;         // VGPU_JIT=1 (src/sass/jit.hpp): regions of straight tier ops run as generated code once compiled
   bool tier_chain_ = true;   // VGPU_TIER_CHAIN=0: one run per call of step_warp, as the interpreter's (tier_ops.inc)
   std::vector<uint8_t> bank0_;
   std::map<unsigned, uint64_t> bank_va_, bank_size_;
@@ -1744,6 +1747,7 @@ const tier::Program* Code::tier_program() const {
       }
     }
     prog->const_index.clear();
+    if (jit::requested()) prog->jit = jit::make_unit(*prog, sm);
     d.tier_owner = prog;
     d.tier.store(prog.get(), std::memory_order_release);
   });
