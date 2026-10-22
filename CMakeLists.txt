@@ -3438,6 +3438,10 @@ if(Python3_Interpreter_FOUND)
   # (BURST_CONTAINER_OPTIONS, or BURST_MEM_LIMIT_GIB and BURST_JOBS_MAX for a job outside a container).
   add_test(NAME lint_burst_cap
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_burst_cap.py)
+  # The AMD interpreter's instruction ladders are switches on the name's hash (amd/tools/ladder-to-switch.py): a merge that
+  # brings an if-ladder back (or a `break` that makes the converter skip a chain) costs a hash comparison per rung per instruction.
+  add_test(NAME lint_amd_ladders
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_ladders.py)
   # Every exported runtime and driver function is a call a profiler is told of,
   # and the driver shim takes the argument sizes the toolkit declares (CUPTI
   # reads them by those sizes).
