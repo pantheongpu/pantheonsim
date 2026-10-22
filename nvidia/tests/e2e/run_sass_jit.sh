@@ -182,6 +182,28 @@ shopt -u nullglob
 (( ${#programs[@]} )) || { echo "SKIP: no test programs were built"; exit 0; }
 for j in "${programs[@]}"; do check $j; done
 
+# Random straight-line kernels (jit_random.py): u32 / u64 / float statements over a small pool of variables, guards, loads; blocks of 128, 48 and
+# 33 threads. The tier and the JIT with every region compiled must print the same hashes and counters (VGPU_JIT_RANDOM_SEEDS seeds of
+# VGPU_JIT_RANDOM_KERNELS kernels each; default 3 of 16; VGPU_JIT_RANDOM_ARCH, default sm_86).
+if command -v python3 >/dev/null 2>&1 && [[ -z ${VGPU_JIT_PROGRAMS:-} ]]; then
+  rarch="${VGPU_JIT_RANDOM_ARCH:-sm_86}"
+  if grep -qx "$rarch" <<< "$("$nvcc_bin" --list-gpu-code 2>/dev/null)"; then
+    for seed in $(seq 1 "${VGPU_JIT_RANDOM_SEEDS:-3}"); do
+      src="$work/jit_random.$seed.cu"; bin="$work/jit_random.$seed.$rarch"
+      python3 "$root/nvidia/tests/e2e/jit_random.py" "$seed" "${VGPU_JIT_RANDOM_KERNELS:-16}" > "$src"
+      if ! "$nvcc_bin" -std=c++17 -arch="$rarch" -cudart shared -w -Wno-deprecated-gpu-targets -Xlinker --as-needed $san "$src" -o "$bin" -lcuda 2> "$bin.build"; then
+        echo "FAIL $rarch jit_random seed $seed: does not build"; tail -3 "$bin.build" | sed 's/^/    /'; fails=1; continue
+      fi
+      ra="$(runit "$bin" $rarch VGPU_TIER=1)"; rb="$(runit "$bin" $rarch "${jitenv[@]}" VGPU_JIT_STATS=1 VGPU_JIT_STATS_FILE="$work/jr.$seed.stats")"
+      rb="$(runit "$bin" $rarch "${jitenv[@]}")"; rc="$(runit "$bin" $rarch "${jitenv[@]}" VGPU_THREADS=4)"
+      jl="$(jit_line "$work/jr.$seed.stats")"
+      if [[ "$ra" != "$rb" ]]; then echo "FAIL $rarch jit_random seed $seed: the tier and the JIT print differently"; diff <(echo "$ra") <(echo "$rb") | head -6 | sed 's/^/    /'; fails=1
+      elif [[ "$(runit "$bin" $rarch VGPU_TIER=1 VGPU_THREADS=4)" == "$ra" && "$ra" != "$rc" ]]; then echo "FAIL $rarch jit_random seed $seed: four threads with the JIT print differently"; fails=1
+      else echo "ok   $rarch jit_random seed $seed  (${jl#jit: })"; fi
+    done
+  fi
+fi
+
 # The failure modes: the JIT cannot do its job and the program must not notice (stdout and stderr, the notices aside: VGPU_QUIET).
 prog=sass_tier; arch=sm_86
 if [[ -x "$work/$prog.$arch" ]]; then
