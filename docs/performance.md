@@ -3858,10 +3858,11 @@ agents' builds), median ratio of the rate (> 1: faster); the A/A noise on the sa
 
 The `scalar_alu` switch alone (before the other two) took `smem` from 0.88 and 0.84 of `pre` to 0.96 and 0.98, `lds` on the RX 6800 5 % up; the other two
 pieces gave the rest. Left: `mfma_fp8` (0.89) and `smfmac` (0.93). Profiled, the matrix tile path's code is the same in both trees and the
-samples are the same lines; the extra time is in the small-float table lookup of the decode (`matrix_elem<'e'>`, 61 samples of `pre`, 100 of the tree with
-the split `step`): which build is slow in it moves with the layout of the code and the heap (the merged tree was 0.97 of `pre` on `mfma_fp8` by direct runs, the split one 0.89, `smfmac` the other way), a
-store-to-load false dependency between the tile buffers and the table is the likely cause, and it is for the matrix tile path's rewrite to avoid, not for
-a fix here. The SAME-BITS guards pass unchanged in Release (`test_amd_gcn_same_bits`, `_packed_`, `_memory_`, `_tier_`, `test_amd_codeobject_same_bits`, `test_amd_matrix_fast`,
+samples are on the same lines; the extra time is in the small-float table lookup of the decode (`matrix_elem<'e'>`: 61 samples of `pre`, 63 of the merged tree, 100 of the tree with
+the split `step`), and by direct runs the merged tree was 0.97 of `pre` on `mfma_fp8` and 0.91 on `smfmac`, the split one 0.89 and 0.93. Code that is the same
+running at different speeds with the layout of the code and the heap points at an effect of addresses (a store-to-load false dependency between the tile buffers and the
+table is a guess, not measured); it is left for the matrix tile path's rewrite, not a fix here.
+The same-bits guards pass unchanged in Release (`test_amd_gcn_same_bits`, `_packed_`, `_memory_`, `_tier_`, `test_amd_codeobject_same_bits`, `test_amd_matrix_fast`,
 `test_amd_mfma_math`, `test_amd_nan_order`, each also at `VGPU_SIMD=base`).
 
 ## A scratch access that wrapped its range check (branch `speedup7-scratch`)
