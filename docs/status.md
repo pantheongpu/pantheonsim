@@ -16,7 +16,7 @@ Working today, all CPU-only:
 | Execution | SIMT warp interpreter: 32-lane warps, divergence masks, shared memory, `bar.sync`, warp shuffles/vote, atomics, tensor-core `wmma`, f16/f16x2, deterministic scheduling |
 | Driver API | `libvgpucuda.so` + clean-room `vgpu_cuda.h`: init/discovery/context/memory/module/`cuLaunchKernel`, `cuLibrary`/`cuKernel`, `cuGetProcAddress` |
 | Runtime API | `libvgpucudart` (drop-in `libcudart.so.13`): the CUDA **Runtime** API + nvcc host-registration ABI, so unmodified nvcc apps run unchanged |
-| Fatbin | extracts embedded PTX from nvcc fatbins (uncompressed, zstd and LZ4 — so binaries from CUDA 12 and 13 both work) |
+| Fatbin | extracts embedded PTX and SASS cubins from nvcc fatbins (uncompressed, zstd and LZ4, so the fatbins of CUDA 12 and 13 both read) |
 | Virtual memory | the `cuMem*` mapping API: address space reserved without memory, physical handles with no address, mappings that are unusable until access is granted — so a buffer grows in place, which is what PyTorch's expandable segments and NCCL's windows need. Reserved-but-unmapped, no-access and read-only faults each say which they were |
 | Multi-GPU | a virtual rack of N devices with disjoint address windows; peer copies and per-device isolation match a real two-GPU machine; `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER` read as the driver reads them, and every device attribute and `cudaDeviceProp` member (L2, bus width, texture limits, PCI identity, UUID matching NVML's) answers from one table checked against an RTX 3060 — see [nvidia/docs/devices.md](../nvidia/docs/devices.md) |
 | Vendor libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSPARSELt, cuSOLVER, cuTENSOR, cuTensorNet, NCCL, NVRTC, NPP and nvJPEG under their real sonames, each differential-tested against NVIDIA's own library on a physical GPU; also cuStateVec, cuDSS, nvJitLink, nvFatbin, cuFile (GPUDirect Storage's compatibility mode), nvCOMP (its standard formats and GDeflate, interoperable with NVIDIA's) and NVSHMEM (one simulated GPU per PE process, NVIDIA's device API on the simulator's host library) — see [nvidia/docs/libraries.md](../nvidia/docs/libraries.md) |
@@ -70,7 +70,7 @@ The full list is in [TODO.md](../TODO.md).
 
 Done: shared memory, warp shuffles and the PTX and SASS coverage listed in
 TODO.md; `vgpu run` and `vgpu test --matrix`; random and adversarial warp
-scheduling with race detection; the AMD frontend (HIP/ROCm, CDNA2 to CDNA4 and
+scheduling with race detection; the AMD frontend (HIP/ROCm, CDNA2 to CDNA5 and
 RDNA2 to RDNA4); hardware characterization for 14 NVIDIA profiles and 3 AMD
 profiles. Still open:
 

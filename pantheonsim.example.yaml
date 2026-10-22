@@ -30,8 +30,8 @@ count: 1
 # a dotted version such as 580.65.06; default: this build's
 # driver_version: 580.65.06
 
-# ROCm version that rocm-smi and amd-smi report (the compiler is not changed).
-# a dotted version such as 6.4.0; default: this build's
+# ROCm version that amd-smi reports (the compiler is not changed).
+# a dotted version such as 6.4.0; default: 6.2.0 in vgpu shell
 # rocm_version: 6.4.0
 
 # Operating system `vgpu shell` presents: ubuntu, rocky or debian, with a version.

@@ -187,7 +187,7 @@ sm80 sparse f16 35 s, sm90 group GEMM 41 s, sm120 f4_f6 45 s, sm120 mxf4 108 s, 
 sm90 ping-pong 110 s, sm90 sparse f16 110 s, FMHA 109 s, CuTe `tma_load` 304 s. The first nvcc invocation for sm80 failed (`sm_80a` is not a
 target); that is not counted.
 
-Where the time goes (perf `-F 300`, tier on, one CPU, flat self time by symbol class; the classes are in `scripts/pcat.py`):
+Where the time goes (perf `-F 300`, tier on, one CPU, flat self time by symbol class; the classes are in `docs/perf-design/data/round10/measure/scripts/pcat.py`):
 
 | case | tensor-core math | test program (host reference, fills) | memory system / TMA | libc / libm | tier handlers / SIMD | other |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
@@ -214,7 +214,7 @@ binary shows 0xc49 is **`FFMA2`**; the same cubin also contains `FMUL2` (6144 in
 
 ### D. The PyTorch process: where the time goes
 
-`perf record --call-graph dwarf`, tier on, one CPU, full-tier groups (`scripts/profgrp.sh`, `prof2.py`); every sample is put in the first
+`perf record --call-graph dwarf`, tier on, one CPU, full-tier groups (`docs/perf-design/data/round10/measure/scripts/profgrp.sh`, `prof2.py` beside it); every sample is put in the first
 class whose function is anywhere in its stack, innermost class first (execution, then zstd, then decode, ...):
 
 | class (share of samples) | `ops` (14.3 s, longest) | `nn` (9.3 s) | `sdpa` (6.7 s) |

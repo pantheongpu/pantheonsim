@@ -1677,8 +1677,12 @@ before `window_check.hpp` was made a header, which moves no code; `VGPU_COUNTERS
 
 ## Not measured
 
+This list is the baseline's; later rounds measured some of it, as noted.
+
 * Host instruction counts and IPC (no PMU on this VM; unknown on hosted runners).
-* `VGPU_THREADS` > 1 scaling (harness supports `--threads`; not part of the baseline).
-* Other GPU profiles / architectures (the program is compiled for sm_86; a Hopper
-  profile runs its PTX, not its SASS).
-* The pantheon soak workloads and the PyTorch/cuBLAS paths.
+* `VGPU_THREADS` > 1 scaling in the baseline (harness supports `--threads`); later host-thread measurements
+  are in [perf-design/host-parallelism.md](perf-design/host-parallelism.md).
+* Other GPU profiles / architectures in the baseline (the program is compiled for sm_86); the SASS engine
+  now runs every generation from sm_75 to sm_120a, and [perf-design/round10-real-workloads.md](perf-design/round10-real-workloads.md)
+  runs programs on their own generation's profile.
+* The pantheon soak workloads outside the optional mode above, and the PyTorch/cuBLAS paths in the baseline.

@@ -69,7 +69,7 @@ datacenter parts (B200, B300, GB200: secondary sources disagree and NVIDIA's own
 | `rtx-pro-6000-server` | the same | derived: the same SM count |
 | Ampere: `a100*` 7/54/108, `a40`, `rtx-a6000` 7/42/84, `rtx3090` 7/41/82, `rtx3080ti` 7/40/80, `rtx3070` 6/23/46 | | A100 and GA102 whitepapers, Ada whitepaper Table 3 |
 | Turing: `t4` 5/20/40, `rtx2080ti` 6/34/68 | | Ada whitepaper Tables 1 and 5 |
-| Ada: `rtx4090` 11/64/128, `rtx4080` 7/38/76, `l4` 5/29/58, `l40`, `rtx6000-ada` 12/71/142 | | Ada and RTX Blackwell whitepapers |
+| Ada: `rtx4090` 11/64/128, `rtx4080` 7/38/76, `l4` 5/29/58, `l40`, `l40s`, `rtx6000-ada` 12/71/142 | | Ada and RTX Blackwell whitepapers |
 
 The Ampere, Turing and Ada layouts decide nothing (those parts have no clusters); they are recorded because
 the figures are published. No device attribute depends on the layout: `cudaDevAttrClusterLaunch` is the only

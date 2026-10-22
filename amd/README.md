@@ -1,13 +1,15 @@
 # AMD
 
-Support for AMD GPUs and ROCm, which is at the start.
+Support for AMD GPUs and ROCm: ten simulated GPU models (`profiles/`), the HIP and HSA runtimes, ROCm
+SMI and AMD SMI, rocprofiler-sdk, and AMD's own libraries, tools and frameworks running on them.
 
 **Discovery** works: a simulated AMD machine answers `rocm-smi`, `amd-smi` and
 `rocm_agent_enumerator` from its profile, as the real tools would, and its
 registers, RAS counts, CPER records and amdgpu sysfs files are modelled
 (`docs/registers.md`, `docs/telemetry.md`).
 
-**Execution** is being built, and CDNA kernels now run:
+**Execution** works for CDNA kernels first of all, and the sections below say what the other parts add
+(gfx90a, gfx950, gfx1250 and the Radeon cards):
 
 - `src/codeobject.cpp` reads the code object a HIP program hands the driver --
   the ELF, each kernel's descriptor, and the metadata note naming the kernels
@@ -84,7 +86,7 @@ them -- executable graphs and everything that changes one, child graphs,
 clones, allocation nodes whose memory outlives the graph, user objects, and a
 drawing in Graphviz's dot. A launch is one piece of its stream's work, its
 nodes run in an order their edges allow. Every function ROCm 7.1's `libamdhip64`
-exports is here, down to `__managed__` variables, modules loaded as CUDA 12's
+exports is here, and ROCm 7.2's additions (the `hipLibrary*` calls), down to `__managed__` variables, modules loaded as CUDA 12's
 libraries or as fat binaries, the run-time linker for code objects (`hipLink*`: one input comes back as it
 is; several become one module holding them, a kernel defined twice is a link
 error, and the binary `hipLinkComplete` writes is this runtime's own
@@ -110,7 +112,7 @@ it. The version each function carries is the same in all of them, and each
 later release only adds functions. `hipGetDeviceProperties` without a suffix
 fills the older layout (hipDeviceProp_tR0000) that every release keeps under
 that name for programs built to it; one built with the headers as they are
-calls `hipGetDevicePropertiesR0600`. `tests/hipcc/rocm/` holds five programs
+calls `hipGetDevicePropertiesR0600`. `tests/hipcc/rocm/` holds six programs
 built by each release -- each with that release's own device library, so its
 printf and grid barrier -- and `tests/e2e/run_rocm_versions.sh` runs them all
 against the same expected output. `tests/e2e/run_hip_abi.sh` checks the
@@ -144,6 +146,10 @@ every fill, transpose and diagonal) against the same arithmetic on the host;
 both need ROCm with rocBLAS installed and skip elsewhere. AMD's own rocBLAS test suite, built from ROCm 7.1's source, runs
 on it as well: all 162,807 of its quick float and double tests pass, each
 checked against OpenBLAS, and its half, bfloat16, int8 and FP8 GEMMs run too.
+The rest of the stack runs the same way, through PyTorch's ROCm wheel and the ROCm packages: hipBLASLt,
+MIOpen, rocPRIM, rocRAND, rocFFT and rocSOLVER (`tests/pytorch/check.py`), hipFFT, hipRAND, hipSOLVER
+and hipSPARSE (ctest `amd_libraries`), Composable Kernel (ctest `amd_pytorch_ck`), RCCL, and
+Triton (see the sections below).
 
 hipSPARSELt, from PyTorch's ROCm wheel, runs its 2:4 structured-sparse GEMMs
 on it: its own kernels prune a matrix, compress it into values and indices,
@@ -229,14 +235,15 @@ IEEE float to convert to XFloat32", and `client/cpu_gemm_driver.cpp`:
 `xfloat32` of rocBLAS and rocWMMA (`rocblas_xfloat32.h`, "add 0xFFF plus the lowest
 bit") is the host type a program converts its own floats with, not what the
 instruction does to the operands it is given (`test_amd_gcn_asm` checks the layout
-the guide's general formula gives and the cut). The B broadcast pattern (BLGP) and a wave with lanes switched off are
-refused.
+the guide's general formula gives and the cut). The B broadcast pattern (BLGP) permutes B's lanes as the guides' table gives it, and the matrix core
+ignores EXEC, as the guides say (`tests/hipcc/mfma_modes.cpp`).
 
 A lane can also read another lane's register through the cross-lane form,
 within its row of sixteen: the shifts and the rotate, the two mirrors, the
 broadcasts that carry a row into the next, and the masks that say which lanes
-are written. The forms that reach across the whole wave are decoded and
-refused, since nothing available here settles which way they carry.
+are written. GCN's shifts and rotates of the whole wave by one lane (`wave_shl`,
+`wave_shr`, `wave_rol`, `wave_ror`) are done too; any other form that reaches across the whole wave
+is decoded and refused.
 
 A memory fence compiles to a write-back and an invalidate of the caches;
 every access here reaches memory directly, so both do nothing beyond fencing
@@ -287,8 +294,8 @@ goes on the device as one image and runs from there, so a format string or a
 the symbol calls (`hipMemcpyToSymbol` and the rest) find a program's
 variables in it.
 
-The source modifiers are applied -- an absolute value, a negation, a clamp of
-the result -- and so is the sub-dword form, where an instruction reads a
+The source modifiers are applied -- an absolute value, a negation, an output
+multiplier and a clamp of the result -- and so is the sub-dword form, where an instruction reads a
 named byte or half of each source, with its sign or without, and writes its
 result into a named part of the destination with the rest zeroed. That form
 is how the compiler mixes widths and how it packs two values into one
@@ -299,11 +306,10 @@ Packed instructions take op_sel and op_sel_hi -- which half, or which
 register of a pair, of each source feeds each result -- and negate each half
 on its own.
 Filling the rest of a destination with the sign instead of zeroes, or leaving
-it as it was, is refused: nothing here has been seen to ask for either.
+it as it was, is done as well.
 
 Any other instruction is refused by name, and so is anything this does not
-model: an output multiplier, a packed operation that asks for the second half
-of a constant. A wrong guess would run and give a wrong answer, which is worse
+model: a packed operation that asks for the second half of a constant. A wrong guess would run and give a wrong answer, which is worse
 than a refusal. An error while a kernel runs names the instruction: the
 kernel, how far into it, and the instruction as the assembler writes it. And
 `VGPU_TRACE_LAUNCHES=1` prints each launch -- the kernel, its grid and
@@ -375,7 +381,7 @@ modelled:
   - `buffer_wbinvl1` and `buffer_invl2`
   - FLAT_SCRATCH as a register
 - **Scratch:** gfx90a has no flat scratch set up by the hardware. A kernel reaches its private memory through the private segment buffer resource it is handed, with buffer loads and stores the card swizzles across the wave's lanes. The executor hands it that resource and a wave offset, and unswizzles its accesses. This is how rocBLAS's gfx90a kernels spill.
-- **Decoder check:** `tests/data/isa_corpus_gfx90a.txt` holds 1628 instruction shapes from PyTorch's, hipBLASLt's and rocBLAS's gfx90a code. Each decodes, and prints in gfx90a's names (`glc`, `slc`, `v_mfma_f32_32x32x8f16`), as `llvm-objdump` prints it.
+- **Decoder check:** `tests/data/isa_corpus_gfx90a.txt` holds 1769 instruction shapes from PyTorch's, hipBLASLt's and rocBLAS's gfx90a code. Each decodes, and prints in gfx90a's names (`glc`, `slc`, `v_mfma_f32_32x32x8f16`), as `llvm-objdump` prints it.
 
 ## What the CDNA parts still refuse
 
@@ -403,7 +409,7 @@ pseudocode) runs what they say:
 - Formatted buffer accesses (`buffer_{load,store}_format_*`, `tbuffer_*`) on gfx942 and gfx950: the guides list them, and the
   executor had only gfx90a's decoder rows for them.
 - gfx90a's `v_sin_f16`, `v_cos_f16`, the cube-map instructions, `v_cvt_rpi_i32_f32`, `v_cvt_off_f32_i4`, `v_frexp_*_f16`, `v_ldexp_f16`,
-  `v_fma_legacy_f16`, `v_mad_legacy_i16`, `v_pk_fmac_f16` and `v_sat_pk_u8_i16`, which its guide defines (gfx942 had them already). The
+  `v_fma_legacy_f16`, `v_mad_legacy_i16`, `v_pk_fmac_f16`, `v_sat_pk_u8_i16`, and `v_mac_f16` and `v_mad_legacy_f16` (the MAD forms: the product rounded to a half first), which its guide defines (gfx942 had them already). The
   half NaN of a sine or cosine of an infinity is 0xfe00, as the guides' examples have it.
 
 Left refused, with what the guides say (or do not):
@@ -416,8 +422,8 @@ Left refused, with what the guides say (or do not):
   from LDS memory to system memory without utilizing VGPRs", and no LDS address.
 - The image `_pck` forms and LWE (see Textures).
 - `v_exp_legacy_f32`, `v_log_legacy_f32` (the guides give `pow(2.0, S0.f)` and `log2(S0.f)` and not how "legacy" differs),
-  `v_screen_partition_4se_b32` (only in the opcode table), and on gfx90a `v_mac_f16` (not said whether the product is rounded before the add),
-  `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, `v_cvt_pkaccum_u8_f32` and `v_mad_legacy_f16` (only in the table).
+  `v_screen_partition_4se_b32` (only in the opcode table), and on gfx90a
+  `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16` and `v_cvt_pkaccum_u8_f32` (only in the table).
 - gfx950: `ds_read_b96_tr_b6` ("Two instruction load a complete matrix. The first loads K values (0..15, 32..47)"), the stochastic `v_cvt_scalef32_sr_*`, `v_cvt_sr_f16_f32` and `v_cvt_sr_bf16_f32` (which bits of the seed are added is where the guide and AMD's
   software part: see "Stochastic rounding, left refused"), `v_mfma_ld_scale_b32` (not in the guide), and an M0 of 64 KiB or more for MUBUF's LDS loads (CDNA4's text says `M0[17:0]`, its
   figure `M0[15:0]`; gfx90a's and gfx942's text and figure agree on 16 bits, which is what they use).
@@ -588,7 +594,7 @@ passes the same 20 checks as the Instinct parts (ctest
 `amd_pytorch_rx7900xtx`). The fp8 matmul check is refused by PyTorch, as on
 the card, because RDNA3 has no 8-bit floats.
 
-- **Decoder:** gfx11 has its own encodings and instruction numbering. They come from AMD's machine-readable ISA specification (MIT), which `tools/rdna-ops.py` turns into `src/rdna_ops_rdna3.inc`. Every one of the 13 million distinct encodings in the wheel's gfx1100 code decodes and prints as `llvm-objdump` does. That includes VOPD pairs, 16-bit register halves (`v1.l`, `v1.h`), DPP8 and the null register. `tests/data/isa_corpus_gfx1100.txt` keeps 1,759 of their shapes for CI.
+- **Decoder:** gfx11 has its own encodings and instruction numbering. They come from AMD's machine-readable ISA specification (MIT), which `tools/rdna-ops.py` turns into `src/rdna_ops_rdna3.inc`. Every one of the 13 million distinct encodings in the wheel's gfx1100 code decodes and prints as `llvm-objdump` does. That includes VOPD pairs, 16-bit register halves (`v1.l`, `v1.h`), DPP8 and the null register. `tests/data/isa_corpus_gfx1100.txt` keeps 1,757 of their shapes for CI.
 - **Execution:** an RDNA instruction runs as the gfx9 instruction that does the same. The decoder names it after that instruction, using the specification's own record of renamings. On top of that, gfx11 adds:
   - wave32 (and wave64, where a kernel's descriptor asks for it);
   - VOPD, whose two halves both read their sources before either writes;
@@ -655,7 +661,7 @@ with what its destination holds after it for lane 0 (or the lane
 
 ## Memory tests
 
-`amd/tests/hipcc/memtest.cpp` is a HIP memory test written for this repository: walking ones and zeros, address in address, checkerboard and its inverse, moving inversions, seeded random data (verified on the device and on the host), block copies and strided sweeps, on `hipMalloc` memory and on mapped pinned host memory. It never looks at the wave size, so it runs the same on wave 64 (MI300X, MI250X) and wave 32 (RX 6900 XT, RX 7900 XTX). Checked-in builds for gfx942, gfx90a, gfx1030 and gfx1100 are run by ctest `amd_memtest_patterns`, which also arms the simulator's faults and requires the test to find them: a host-flipped bit exactly, a `vgpu fault stuck` cell, bit flips armed on stores, an uncorrectable HBM ECC error on a load (the kernel fails and a row is remapped; corrected errors are counted and change nothing; a card without ECC refuses the fault), and a wild pointer (`hipErrorLaunchFailure`). The programs were built with Ubuntu's ROCm 5.7 `hipcc` (the only toolchain installable without AMD's repositories), so they ask for `libamdhip64.so.5`, which the script maps to the shim; gfx950 and gfx1201 need a newer compiler. `ci/external/babelstream.sh` runs UoB-HPC's BabelStream (HIP), whose own validation must pass, and must fail against a stuck cell, in the nightly external suites.
+`amd/tests/hipcc/memtest.cpp` is a HIP memory test written for this repository: walking ones and zeros, address in address, checkerboard and its inverse, moving inversions, seeded random data (verified on the device and on the host), block copies and strided sweeps, on `hipMalloc` memory and on mapped pinned host memory. It never looks at the wave size, so it runs the same on wave 64 (MI300X, MI250X) and wave 32 (RX 6900 XT, RX 7900 XTX). Checked-in builds for gfx942, gfx90a, gfx1030 and gfx1100 (and gfx1031, built by ROCm 7.2) are run by ctest `amd_memtest_patterns`, which also arms the simulator's faults and requires the test to find them: a host-flipped bit exactly, a `vgpu fault stuck` cell, bit flips armed on stores, an uncorrectable HBM ECC error on a load (the kernel fails and a row is remapped; corrected errors are counted and change nothing; a card without ECC refuses the fault), and a wild pointer (`hipErrorLaunchFailure`). The programs were built with Ubuntu's ROCm 5.7 `hipcc` (the only toolchain installable without AMD's repositories), so they ask for `libamdhip64.so.5`, which the script maps to the shim (the gfx1031 one asks for `.so.7`); gfx950 and gfx1201 need a newer compiler. `ci/external/babelstream.sh` runs UoB-HPC's BabelStream (HIP), whose own validation must pass, and must fail against a stuck cell, in the nightly external suites.
 
 ## Textures
 
@@ -740,7 +746,7 @@ against ROCm's `hsa.h` where that is installed, and both builds run
 (ctest `amd_hsa`). A grid need not be a whole number of work-groups, as HSA
 allows: the last group in a dimension runs short, numbered across its own
 shape, and the kernel's `hidden_remainder` arguments say by how much.
-The HSA 1.1 queries a tool makes of an agent are answered too: `hsa_agent_iterate_caches` and `hsa_cache_get_info` (the levels, L1 to L3 where the chip has one, with the sizes the deprecated `HSA_AGENT_INFO_CACHE_SIZE` gives; the CPU agent reports none), `hsa_isa_iterate_wavefronts` and `hsa_wavefront_get_info`, `hsa_isa_compatible` (the same full target name only), and signal groups (`hsa_signal_group_create`, `_destroy` and both `_wait_any` forms). `tests/hsa/hsa_caches.c` checks them, built against this header and against ROCm's (ctest `amd_hsa`). Not answered: `hsa_amd_signal_wait_any` (the header does not say what a timeout returns), the deprecated code-object and finalizer calls, `hsa_amd_queue_intercept_*`, `hsa_amd_register_deallocation_callback`, `hsa_amd_memory_migrate` and `hsa_amd_spm_*`.
+The HSA 1.1 queries a tool makes of an agent are answered too: `hsa_agent_iterate_caches` and `hsa_cache_get_info` (the levels, L1 to L3 where the chip has one, with the sizes the deprecated `HSA_AGENT_INFO_CACHE_SIZE` gives; the CPU agent reports none), `hsa_isa_iterate_wavefronts` and `hsa_wavefront_get_info`, `hsa_isa_compatible` (the same full target name only), and signal groups (`hsa_signal_group_create`, `_destroy` and both `_wait_any` forms). `tests/hsa/hsa_caches.c` checks them, built against this header and against ROCm's (ctest `amd_hsa`). Not answered: the deprecated code-object and finalizer calls, `hsa_amd_queue_intercept_*` and `hsa_amd_spm_*`. (The list of what is refused by name, and what is absent, is under "ROCm's own tools" below.)
 
 ROCm's own tools and HIP runtime run on it unmodified:
 
@@ -769,7 +775,7 @@ That works because the runtime keeps to what ROCm's does where CLR looks:
 
 Two more ways to program an AMD GPU run on the simulated ones with ROCm's own runtimes, and neither goes through HIP.
 
-- **OpenMP target offloading.** LLVM's `libomptarget` has an AMD plugin that drives the HSA runtime directly: queues, signals, memory pools, executables, kernel dispatch packets. `tests/openmp/omp.cpp` is built by ROCm's `amdclang++ -fopenmp --offload-arch=gfx...` for each GPU's ISA and run on two simulated devices of each model (ctest `amd_openmp`, `tests/e2e/run_openmp.sh`): `target teams distribute parallel for` with map clauses, reductions (built-in and `declare reduction`), `declare mapper`, `target data` with `enter`/`exit`/`update`, `map(present)` and `map(always)`, `declare target` functions and variables, `omp_target_alloc`/`memcpy`/`associate_ptr`, atomics (update and capture), `collapse`, `teams loop`, `num_teams`/`thread_limit`/`num_threads`, `nowait` with `depend`, `device(n)` for every device, the device math library, and `printf` from a target region. All of them pass on the six GPUs.
+- **OpenMP target offloading.** LLVM's `libomptarget` has an AMD plugin that drives the HSA runtime directly: queues, signals, memory pools, executables, kernel dispatch packets. `tests/openmp/omp.cpp` is built by ROCm's `amdclang++ -fopenmp --offload-arch=gfx...` for each GPU's ISA and run on two simulated devices of each model (ctest `amd_openmp`, `tests/e2e/run_openmp.sh`): `target teams distribute parallel for` with map clauses, reductions (built-in and `declare reduction`), `declare mapper`, `target data` with `enter`/`exit`/`update`, `map(present)` and `map(always)`, `declare target` functions and variables, `omp_target_alloc`/`memcpy`/`associate_ptr`, atomics (update and capture), `collapse`, `teams loop`, `num_teams`/`thread_limit`/`num_threads`, `nowait` with `depend`, `device(n)` for every device, the device math library, and `printf` from a target region. All of them pass on the eight GPUs (MI300X, MI250X, MI350X, RX 7900 XTX, RX 9070 XT, RX 6900 XT, RX 6800 and RX 6700 XT).
 - **OpenCL.** ROCm's OpenCL runtime (`libamdocl64`, on the same CLR as HIP) builds each kernel with the compiler library and runs it through the HSA runtime. `tests/opencl/cl.c` is an ordinary OpenCL program (built by the system's compiler against the ICD loader) that runs on two devices of each model (ctest `amd_opencl`, `tests/e2e/run_opencl.sh`): vector add, a reduction through local memory and barriers, atomics, doubles, a 2D range, barriers over global memory, buffer fill, copy and map, a global offset with a range that is not a multiple of the work-group, coarse-grained shared virtual memory, and, on the Radeon GPUs and the MI250X, images and samplers. The MI300 family has no texture units, and says so (`CL_DEVICE_IMAGE_SUPPORT` is false).
 - **Which GPUs, and where.** Both need only ROCm's LLVM or OpenCL runtime beside the simulator's HSA runtime; the CI job `models` unpacks them from AMD's apt repository (`tests/openmp/fetch-rocm-llvm.sh`, `tests/opencl/fetch-rocm-opencl.sh`) with nothing installed, and the tests skip where neither is found. `offload-arch` (`amdgpu-arch`), which they and CMake's HIP language use to find the GPUs, reads the kernel driver's own directory `/sys/devices/virtual/kfd/kfd`: an isolated session has it, with `/sys/class/kfd/kfd` a link to it as on a machine with the driver.
 
@@ -800,7 +806,7 @@ vLLM for ROCm, unmodified, generates on every simulated AMD GPU it supports -- M
 
 - vLLM's ROCm wheels (`wheels.vllm.ai/rocm`) bring a PyTorch that is linked against a ROCm installed on the machine: its RUNPATH names `/opt/rocm-7.2.3/lib`. The machine needs that ROCm's libraries (hipBLAS, hipBLASLt, MIOpen, RCCL, rocprofiler-sdk and the rest) and OpenMPI. The simulator's HIP runtime, ROCm SMI and AMD SMI go in front of them on the library path.
 - vLLM asks AMD SMI whether this is a ROCm machine, and NVML whether it is a CUDA one. NVML answers only for NVIDIA GPUs, and says a machine of AMD GPUs has no NVIDIA driver, as it does on one.
-- Its paged attention for ROCm multiplies with `v_mfma_f32_4x4x4_16b_f16` and CBSZ 4: every block takes block 0's query (A's broadcast, modelled; B's lane patterns, BLGP, are refused by name).
+- Its paged attention for ROCm multiplies with `v_mfma_f32_4x4x4_16b_f16` and CBSZ 4: every block takes block 0's query (A's broadcast, modelled; B's lane patterns, BLGP, too).
 - The default test run is eager (no graphs, no `torch.compile`), with one short sequence and a 3 GB device, so the KV cache fits in RAM. `VGPU_VLLM_MODE=graphs` (ctest `amd_vllm_graphs`, and a second step of the nightly) runs vLLM as it runs by default on a card: Dynamo and Inductor compile the model into Triton kernels, which Triton compiles for the simulated GPU at run time, and the decode step is captured into HIP graphs (piecewise and full) for batch sizes 1 and 2 and replayed per token, two prompts generated together. The test checks the log for the compile and both captures, since vLLM falls back to eager quietly. It took 8 minutes on a simulated MI300X.
 - `VGPU_VLLM_TP=2` (ctest `amd_vllm_graphs_tp2`, the nightly's MI300X job) shards the model over two simulated GPUs, one worker process each: RCCL's all-reduces and vLLM's custom all-reduce, which shares the buffers its graphs capture through HIP's IPC handles, run inside the captured graphs, and the text is the CPU's (12 minutes). That needed two fixes in HIP's IPC: asking twice for the handle of one allocation gave a second handle naming a file that was never made (the first had made it), and `hipMemset` on memory opened from another process wrote through a device address as if it were a host pointer and faulted.
 - What the graph and compiler paths need is checked below vLLM, in PyTorch's own terms (`tests/pytorch/graphs.py`: stream capture of kernels, copies, events, forked streams, allocations, random numbers, attention, a KV-cache decode step replayed per token, `make_graphed_callables`, kept graphs; `compile.py`: `torch.compile` including `mode="reduce-overhead"`, scans, sorts, dynamic shapes, a training step; `triton_kernels.py`: hand-written Triton on MFMA or WMMA in every input type, attention, atomics, reductions; `distributed_graphs.py`: RCCL's all-reduce and all-gather recorded into graphs across two processes, a tensor-parallel block), on every simulated generation.
@@ -861,9 +867,12 @@ waves by how many lanes they start with, the instructions each unit issues
 `_BRANCH`, `_SENDMSG`, `_GDS`), and the flat reads, writes and atomics the
 texture addresser takes (`TA_FLAT_*`). There is also the instruction mix, each
 instruction classed once as it is decoded:
+
 - `SQ_INSTS_VALU_{ADD,MUL,FMA,TRANS}_{F16,F32,F64}`, `_CVT`, `_INT32` and `_INT64`;
 - matrix work in 512-operation units, `SQ_INSTS_VALU_MFMA_MOPS_{I8,F16,BF16,F32,F64,F8}`, with RDNA's WMMA included;
-- vector memory reads and writes, `SQ_INSTS_VMEM_RD` and `_WR`. Each is the device's total, as one
+- vector memory reads and writes, `SQ_INSTS_VMEM_RD` and `_WR`.
+
+Each counter is the device's total, as one
 instance. A counter of cycles, stalls, cache hits or memory traffic would
 need a model of the hardware's timing, and there is none, so those are not
 offered: rocprofv3 says the device does not have one, as it does for a
@@ -874,8 +883,8 @@ well as `SQ_INSTS_FLAT` ("including FLAT").
 
 Times in the traces are the simulation's own, on the clock
 `/proc/<pid>/stat` uses: a truthful order and truthful durations of the
-simulation, and nothing about how long a card would take. There is no HSA
-runtime, so no HSA trace; no thread trace, or the stochastic method of PC
+simulation, and nothing about how long a card would take. The HIP runtime reaches
+its devices directly rather than through HSA calls, so there is no HSA trace; no thread trace, or the stochastic method of PC
 sampling, which need the hardware's trace and sampling units; and no records of
 the kernels ROCm's runtime runs on its own behalf (a device-to-device copy or a
 memset is not a kernel here).
@@ -945,14 +954,14 @@ would on a card: its kernel's own `printf` (`[SDC FAULT] ...`), then
 
 | Folder | What |
 | --- | --- |
-| `profiles/` | MI300X, MI325X and MI350X. MI325X was read from a physical card with `tools/rocminfo-to-profile.py`; the others are placeholders, and each file's header says which |
-| `registers/` | the MMIO database, each model's registers and their power-on values, and the amdgpu headers' licence |
-| `src/` | the register model, the metrics table and CPER records; code objects and CDNA decoding; the HIP runtime and ROCm libraries once they are written |
-| `tools/` | `rocm-smi`, `amd-smi` and `rocm_agent_enumerator` for simulated machines, the generators of the HIP version script and rocprofiler-sdk's HIP call numbers, and the scripts that characterize a card (`characterize-hip.cpp`, the DigitalOcean scripts) |
+| `profiles/` | MI250X, MI300X, MI325X, MI350X, MI455X, RX 6700 XT, RX 6800, RX 6900 XT, RX 7900 XTX and RX 9070 XT. MI325X was read from a physical card with `tools/rocminfo-to-profile.py`, and the RX 6800 and RX 6700 XT from real cards (`registers/measurements/`); the others come from public documentation and are placeholders (`verified: false`), and each file's header says which |
+| `registers/` | the MMIO database (`mmio.yaml`), each model's registers and their power-on values (`gpus/`), the measurements from real cards, and the amdgpu headers' licence |
+| `src/` | the register model, the metrics table and CPER records; code objects, the CDNA and RDNA decoders and the executor; the HIP and HSA runtimes; ROCm SMI, AMD SMI and rocprofiler-sdk; the KFD topology |
+| `tools/` | `rocm-smi`, `amd-smi` and `rocm_agent_enumerator` for simulated machines, the generators of the HIP version script, the instruction tables and corpora (`rdna-ops.py`, `isa-corpus.py`, `isa-fuzz.py`) and rocprofiler-sdk's HIP call numbers, the scripts that characterize a card (`characterize-hip.cpp`, the DigitalOcean scripts), and `amd_exec_bench` and `amd_fatbin_extract` |
 | `tests/` | the AMD unit and end-to-end tests, and the code object they read (`tests/data/build.sh` rebuilds it with clang; no ROCm needed) |
 
-The libraries follow the runtime, each checked against the real one on
-hardware the way the NVIDIA side is.
+The libraries run on the runtime: see above for which ones, and `docs/rocprofiler.md` for how
+the profiler is checked against real cards.
 
 A profile id is `amd/<name>`, and its file is `profiles/<name>.yaml` here.
 

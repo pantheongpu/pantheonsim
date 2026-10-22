@@ -64,7 +64,7 @@ Every setting the file accepts (the full text for each is in [Settings](docs/con
 | `vram_mb` | MiB, at least 1 | the profile's own | Memory per device |
 | `cuda_version` | `major.minor`, such as `13.0` | this build's | The CUDA version `nvidia-smi` and NVML report |
 | `driver_version` | such as `580.65.06` | this build's | The NVIDIA driver version reported |
-| `rocm_version` | such as `6.4.0` | this build's | The ROCm version `rocm-smi` and `amd-smi` report |
+| `rocm_version` | such as `6.4.0` | `6.2.0` in the machine shell | The ROCm version `amd-smi version` reports |
 | `os` | `ubuntu`, `rocky` or `debian`, with a version (`ubuntu:24.04`) | `ubuntu:22.04` | The operating system the machine presents |
 | `ram_mb` | MiB, at least 1 | unlimited | Host RAM device memory may use before it spills to `memory_dir` |
 | `memory_dir` | a directory | never spill | Where device memory past `ram_mb` goes (runs at disk speed) |

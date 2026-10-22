@@ -160,10 +160,10 @@ Makefile variables are in [docs/config.md](config.md).
   The simulator will not let your computer run out of memory, so it refuses an
   allocation instead of letting the system kill programs. Ask for less memory
   (`vram_mb`), let the rest spill to disk (`ram_mb` and `memory_dir`), or lower
-  the memory it keeps free (`host_reserve_mb`, which is the variable
+  the memory it keeps free (`host_reserve_mb`, which sets
   `VGPU_MEMORY_HOST_RESERVE_MB`). See
   [the memory settings](config.md#a-small-machine-that-spills-to-disk).
-- **`nvidia-smi` shows a CUDA, driver or ROCm version you do not want.** The
+- **`nvidia-smi` or `amd-smi` shows a CUDA, driver or ROCm version you do not want.** The
   versions are settings: `cuda_version`, `driver_version` and `rocm_version`.
   They change what the tools report, not your compiler.
 - **A result looks wrong and you want to know why.** Run with `STRICT=1`,

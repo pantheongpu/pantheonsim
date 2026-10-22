@@ -46,7 +46,7 @@ locks you out of the commands that explain it.
 command-line flag  >  environment variable  >  settings file  >  default
 ```
 
-A flag always won over the environment, and the file sits below both. So the
+A flag always wins over the environment, and the file sits below both. So the
 file is the machine you usually want, an exported variable changes it for a
 shell session, and a flag changes it for one command.
 
@@ -104,7 +104,7 @@ story of each one.
 | `vram_mb` | whole number of MiB, at least 1 | `VGPU_VRAM_MB` | the profile's own | Memory per device, instead of the profile's. |
 | `cuda_version` | `major.minor`, such as `13.0` | `VGPU_CUDA_VERSION` | this build's | The CUDA version `nvidia-smi` and NVML report. |
 | `driver_version` | dotted version, such as `580.65.06` | `VGPU_DRIVER_VERSION` | this build's | The NVIDIA driver version `nvidia-smi` and NVML report. |
-| `rocm_version` | dotted version, such as `6.4.0` | `VGPU_ROCM_VERSION` | this build's | The ROCm version `rocm-smi` and `amd-smi` report. |
+| `rocm_version` | dotted version, such as `6.4.0` | `VGPU_ROCM_VERSION` | `6.2.0` in `vgpu shell` (`N/A` elsewhere) | The ROCm version `amd-smi version` reports. |
 | `os` | `ubuntu`, `rocky` or `debian`, with an optional version (`ubuntu:24.04`) | `VGPU_SHELL_OS` | `ubuntu:22.04` | The operating system `vgpu shell` presents. Read by `vgpu shell` only. |
 
 **Memory** (see [Memory](#a-small-machine-that-spills-to-disk) below)
@@ -231,7 +231,7 @@ scheduler_seed: 17
 ## What `cuda_version`, `driver_version` and `rocm_version` do
 
 They change what the machine reports: what `nvidia-smi`, NVML (`nvmlSystemGetCudaDriverVersion`
-and friends), `rocm-smi`, `amd-smi` and a `vgpu shell`'s `nvcc --version` print,
+and friends), `amd-smi version` and a `vgpu shell`'s `nvcc --version` print,
 so you can check that a program or an installer takes the version it finds. They
 do not change the compiler. Your own `nvcc` or `hipcc` still builds the program,
 at whatever release is installed on your machine, and the simulator runs the

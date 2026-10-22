@@ -12,7 +12,7 @@ The status snapshot, the inventories and the gap register at the end are new in 
 
 | Area | State | Where to look |
 | --- | --- | --- |
-| NVIDIA execution | PTX interpreter and a SASS executor (the default; sm_75 to sm_120a); both run unmodified nvcc programs through `libvgpucudart` / `libvgpucuda` | nvidia/docs/sass.md, "Implemented" |
+| NVIDIA execution | PTX interpreter and a SASS executor (the default; sm_75 to sm_120a); both run unmodified nvcc programs through `libvgpucudart` / `libvgpucuda` | nvidia/docs/sass.md, "Coverage" |
 | AMD execution | GCN/CDNA and RDNA executors (64- and 32-lane); unmodified hipcc programs from ROCm 6.4 to 7.2 on MI250X, MI300X, MI325X, MI350X, RX 6900 XT, RX 6800, RX 6700 XT, RX 7900 XTX, RX 9070 XT | amd/README.md |
 | Device profiles | 38 NVIDIA (14 read from hardware) and 10 AMD (3 read from hardware) | "Profile inventory" |
 | NVIDIA libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP, nvJPEG, cuDSS, cuSPARSELt, cuTENSOR, cuTensorNet, cuStateVec, cuFile, nvCOMP, NVSHMEM, nvJitLink, nvFatbin, NVENC | nvidia/docs/libraries.md |
@@ -165,9 +165,10 @@ The status snapshot, the inventories and the gap register at the end are new in 
   into every element, which a test of mine had asserted the wrong way round.
   Copy and fill nodes carry their full shape, so 2D fills and pitched 3D copies
   are nodes like any other, and read back exactly as they were given.
-  Not yet: capture modes. Global and thread-local capture prohibit "potentially
-  unsafe" calls (cudaMalloc, a synchronous copy) anywhere in the process; every
-  capture here behaves as relaxed.
+  Capture modes are modelled (round 3, `runtime_capture_modes`): Global and
+  thread-local capture refuse "potentially unsafe" calls (cudaMalloc, a
+  synchronous copy) with cudaErrorStreamCaptureUnsupported and invalidate the
+  capture; relaxed never does.
   Two checks guard these classes: lint_capture_coverage fails when an exported
   function that takes a stream neither consults capture nor says why it need
   not, and lint_shim_symbols fails when a shim library has a reference nothing
@@ -463,7 +464,7 @@ The status snapshot, the inventories and the gap register at the end are new in 
   `.bf16` in two, four or eight and on `.f16x2`/`.bf16x2` in two or four. Each 32-bit word is its own atomic
   under the striped lock, the vector aligned to its whole size (`MisalignedAccess` otherwise), in both
   engines; the SASS twin is REDG/ATOMG's F32x2/F32x4/F16x4/F16x8/BF16x4/BF16x8 forms (decoder checked against
-  nvdisasm for sm_90 to sm_120, `probes/vector_atomics.cu`; `e2e_sass_archs` runs `vector_atomics` on every
+  nvdisasm for sm_90 to sm_120, `nvidia/tests/data/sass/probes/vector_atomics.cu`; `e2e_sass_archs` runs `vector_atomics` on every
   Hopper and Blackwell profile, SASS and PTX). Derived from the PTX documentation and ptxas's output, not checked on a card
   (the local cards are sm_86): how a NaN, a subnormal or a signed zero combines follows the scalar atomics'
   rules and is not asserted by the test.
@@ -595,10 +596,10 @@ an instance left running bills by the hour).
 `nvidia/tools/compare-profile.py` diffs a measured profile against the one in the
 tree, so corrections are visible rather than silently applied.
 
-Verified against real hardware: thirteen devices (twelve NVIDIA across six
-architectures, plus the first AMD part, CDNA3). Eleven are in the table; the
-A100 80GB (`nvidia/a100`) was read from a physical device on an 8x instance,
-as the note after the table says:
+Verified against real hardware: seventeen profiles (fourteen NVIDIA, three AMD). The
+table has the first twelve; the A100 80GB (`nvidia/a100`) was read from a physical
+device on an 8x instance, as the note after the table says, and the later NVIDIA
+and AMD ones are in the "Profile inventory" and nvidia/docs/profiles.md:
 
 | profile | device | how |
 | --- | --- | --- |
@@ -614,8 +615,11 @@ as the note after the table says:
 | `nvidia/l4` | L4 (sm_89, Ada Lovelace, AD104) | EC2 `g6.xlarge` |
 | `nvidia/l40s` | L40S (sm_89, Ada Lovelace, AD102) | EC2 `g6e.2xlarge` |
 | `amd/mi325x` | MI325X (gfx942, CDNA3) | DigitalOcean `gpu-mi325x1-256gb` |
+| `nvidia/rtx-pro-6000-server` | RTX PRO 6000 Blackwell Server (sm_120) | EC2 `g7e.2xlarge` (2026-10-09) |
+| `nvidia/rtx-pro-4500` | RTX PRO 4500 Blackwell (sm_120) | EC2 `g7.2xlarge` (2026-10-18) |
+| `amd/rx6800`, `amd/rx6700xt` | RX 6800, RX 6700 XT (RDNA2) | physical cards (`amd/registers/measurements/`) |
 
-The eleven NVIDIA parts in the table match the physical device on **512
+The first eleven NVIDIA parts in the table match the physical device on **512
 conformance values each** -- the same binary run on hardware and on VirtualGPU,
 diffed (`nvidia/tests/conformance/run_conformance.sh`,
 `nvidia/tools/verify-profile.sh`).
@@ -683,8 +687,9 @@ Clocks, power caps, SM counts, shared-memory limits and PCI ids were already
 right. Capacity values being wrong is exactly what this process is for.
 
 Still not read from hardware: H200 (inherited from H100), B200 (its framebuffer
-was measured, the rest is public documentation), B300, RTX 5090, and six AMD
-profiles (MI250X, MI300X, MI350X, RX 6900 XT, RX 7900 XTX, RX 9070 XT). B200 had
+was measured, the rest is public documentation), B300, RTX 5090 (and every other
+profile marked **no** in the "Profile inventory"), and seven AMD profiles (MI250X,
+MI300X, MI350X, MI455X, RX 6900 XT, RX 7900 XTX, RX 9070 XT). B200 had
 no Lambda capacity; AMD parts are not offered there. The A100 80GB was read
 from a physical device on an 8x instance.
 
@@ -777,7 +782,7 @@ because none of them uses NVRTC:
 
 Multi-GPU is verified against real hardware in four places: the local two-GPU
 box, and rented 2x H100 SXM5, 4x H100 SXM5 and 8x A100 80GB instances. All
-the conformance suites that existed then (thirteen; there are seventeen in
+the conformance suites that existed then (thirteen; there are eighteen in
 `nvidia/tests/conformance/` now) match on every one of them, with NCCL compared
 against NVIDIA's libnccl at two, four and eight ranks respectively. The 2x
 instance runs CUDA 12.8, so it also covers the older toolkit's LZ4 fatbins,
@@ -799,7 +804,7 @@ it ran against an external llama.cpp checkout's `test-backend-ops`, not
 against anything under `ci/external/`, and the llama.cpp commit is not
 recorded. Whether the upstream bug has been fixed since is unknown. What *is*
 in the tree, and tested, is the detector: `VGPU_RACE=1` and `=2`
-(`src/exec/interpreter.cpp:535-548`; README.md), with
+(`g_race` and `g_race_strict` in `src/exec/interpreter.cpp`, set by `refresh_modes()`; README.md), with
 `a_shared_race_between_warps_is_reported`, `two_warps_writing_the_same_value_is_not_reported`,
 `the_same_value_write_is_still_a_race_under_strict_mode`,
 `a_differing_write_after_a_redundant_one_is_still_reported` and
@@ -895,11 +900,11 @@ narrows what counts as observable, not what the detector looks at.
   distinct project. It takes its documented "driver not installed" path (and is
   skipped on hosts with the real driver libraries): `OUT_OF_SCOPE="rt_virus"` in
   `tests/workloads/run_pantheon_workloads.sh`, docs/pantheon-workloads.md.
-  (`media_enc_virus` runs per the prose in that document: `libvgpunvenc`
-  implements NVENC, now writing real (lossless PCM) H.264 and HEVC streams that are
-  identical for identical frames, as the workload's golden-bitstream check needs; its
-  status block still lists it as skipped, which is a contradiction inside that
-  document, not here.)
+  (`media_enc_virus` runs there: `libvgpunvenc` implements NVENC, now writing
+  real (lossless PCM) H.264 and HEVC streams that are identical for identical
+  frames, as the workload's golden-bitstream check needs. It is skipped only when
+  the NVENC shim was not built, and always by the older
+  `scripts/run-pantheon-workloads.sh`.)
 - Nsight Systems and Nsight Compute as the vendor ships them. `vgpu ncu` is this
   project's own `ncu` (src/cli/ncu.cpp, `e2e_ncu`); `nsys` runs but collects no
   CUDA data (it uses its own bundled CUPTI, see nvidia/docs/cupti.md).
@@ -913,9 +918,7 @@ the sense that something specific is still missing, and each entry says what.
 - Divergence: min-PC reconvergence (`src/exec/interpreter.cpp`) -- paths at the
   same pc merge and the lowest pc runs next, so bar.sync after a divergent
   region works (`tests/unit/test_barriers.cpp`). Not full IPDOM: irreducible
-  control flow is not handled, and nothing pins that with a test. (The header
-  comment at the top of interpreter.cpp still says barriers in divergent code
-  are rejected and IPDOM is planned; it predates the min-PC code and is stale.)
+  control flow is not handled, and nothing pins that with a test.
 - (cuCtxSetCurrent(NULL) pops the top of the context stack; the card does the same, measured and checked by
   `driver_context_gaps`, so this is not a bug.)
 - Reliability: ECC counts by location, retired pages, remapped rows and PCIe
@@ -1001,7 +1004,7 @@ the sense that something specific is still missing, and each entry says what.
   profiles, its registers found through its capability chain; an
   nvidia/rtx3080ti profile of that card is verified on 512 values, and its
   measured BAR0 (identification 0xb72000a1, unmapped 0xbadf5040) is its MMIO
-  space. Next: map more of BAR0 as headers publish it, and capture data-center and AMD cards. The
+  space. Next: map more of BAR0 as headers publish it, and capture data-center and AMD Instinct cards (the RX 6800 and RX 6700 XT are captured in amd/registers/measurements). The
   session's /sys/bus/pci devices carry config, resource, IDs and link files
   from the registers, and NVML and nvidia-smi read the link through them, each
   access logged under the tool's name. Every GPU model's registers and
@@ -1302,21 +1305,21 @@ health-surface refusals, which are far more numerous than the ones named here.
 
 - **PTX, refused by name** (`src/ptx/parser.cpp`, `src/exec/interpreter.cpp`,
   `include/vgpu/exec/tensormap.hpp`):
-  - TMA's `.im2col::w` modes (Blackwell; parser.cpp:4770, and on SASS
-    src/sass/exec_ops.inc:3800); see nvidia/docs/blackwell.md.
-  - TMA attribute overrides and reports (parser.cpp:4770, :4651).
+  - TMA's `.im2col::w` modes (Blackwell; `cp.async.bulk` in parser.cpp, and on SASS
+    src/sass/exec_ops.inc, "im2col::w tensor copies are not implemented"); see nvidia/docs/blackwell.md.
+  - TMA attribute overrides and reports (the `cp.async.bulk` and `cp.reduce.async.bulk` modifier checks in parser.cpp).
   - Interleaved tensor-map layouts and the 128B swizzle's 8-byte-flip variant
-    `CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B` (tensormap.hpp:275-276, :362-363).
-  - tcgen05's `.ashift` (parser.cpp:2980), `.ws` with A in Tensor Memory below
-    M = 128, and `.ws.sp` (interpreter.cpp:11305-11312) -- the ISA draws neither
+    `CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B` (tensormap.hpp, the `swizzle == 5` checks at :276 and :363).
+  - tcgen05's `.ashift` (parser.cpp, `tcgen05.mma.ashift`), `.ws` with A in Tensor Memory below
+    M = 128, and `.ws.sp` (interpreter.cpp, the two `refuse(".ws ...` calls in the tcgen05.mma checks) -- the ISA draws neither
     layout.
-  - sm_107 additions (`kind::ti16`, `decompress::lut`).
+  - sm_107's `tcgen05.mma` `.decompress` modifiers and `tcgen05.commit`'s `.multicast::cluster::32b`/`.sync_restrict` (`kind::ti16` itself is implemented, see below).
   - Inline-asm-only instructions: anything the parser has no name for is refused
     by that name, not run as something else.
   - Not on this list any more: the TMA out-of-bounds NaN fill (`oobFill`) is
     *accepted* -- stored in the descriptor, carried by `tensormap.replace`
-    (interpreter.cpp:9277) and honoured by loads that go out of bounds
-    (interpreter.cpp:9534, tests/unit/test_hopper.cpp:1236). What is not
+    (interpreter.cpp, `oob_nan`) and honoured by loads that go out of bounds
+    (interpreter.cpp, `map.oob_nan` in the tile load; tests/unit/test_hopper.cpp). What is not
     established is the exact value the hardware writes, which the ISA does not
     state; treat it as unverified, not as unsupported.
   - Done, so not refused: `wgmma`, TMA, mbarrier transaction counts,
@@ -1329,7 +1332,7 @@ health-surface refusals, which are far more numerous than the ones named here.
   and grids too large to be resident are refused (docs/cooperative.md). The
   async copy that this item used to name is done: `cp.async`, `cp.async.bulk`,
   `cp.reduce.async.bulk`, stream-ordered allocation, and AMD's queued
-  `hipMemcpyAsync` (amd/src/hip_api.cpp:1705).
+  `hipMemcpyAsync` (amd/src/hip_api.cpp, `hipMemcpyAsync`).
 - **Frontends**: nothing missing on NVIDIA -- PTX and SASS both run (SASS is the
   default engine on every generation from sm_75 to sm_120a, src/sass/,
   nvidia/docs/sass.md; `VGPU_SASS=0` selects PTX). Static-cudart binaries are the
@@ -1340,9 +1343,9 @@ health-surface refusals, which are far more numerous than the ones named here.
   random and adversarial schedulers, and fault injection are done.) Counters
   that need a timing model are refused by design, below.
 - **Profilers**: Nsight Compute and Nsight Systems as the vendor ships them (see
-  "Known out of scope"); CUPTI's Callback API delivers the runtime, resource and synchronize domains only (no driver, module, graph or NVTX callbacks), the Event
+  "Known out of scope"); CUPTI's Callback API covers the runtime, driver, resource, synchronize and NVTX domains (driver calls outside the documented list, and driver-API pool and graph calls, raise none), the Event
   and Profiling metrics APIs are absent, and nothing derived from time is
-  reported (nvidia/docs/cupti.md:70-139).
+  reported (nvidia/docs/cupti.md, "What is not implemented, and why").
 
 ## Registers and counters: what is modelled, and what cannot be
 
@@ -1767,7 +1770,7 @@ Next, in order of expected payoff:
    re-profile before committing to a JIT.
 2. Block-level parallelism across host threads, behind the scheduler
    abstraction so determinism is preserved. **Done**: the grid runs on every core
-   (`VGPU_THREADS`, default `host_cpus()`, interpreter.cpp:11997).
+   (`VGPU_THREADS`, default `host_cpus()`, interpreter.cpp).
 
 A GPU still retires ~10^13 ops/s, so saturation-style stress tests are run at
 reduced intensity via their own CLI knobs; see
@@ -1778,7 +1781,7 @@ scripts/run-pantheon-workloads.sh.
 0. **AMD** -- the list this item held is done; rev 5 checked each entry
    (amd/README.md has the evidence). rocBLAS runs 162,807 of its own quick
    float and double tests, and its half, bfloat16, int8 and FP8 GEMMs run;
-   hipBLASLt, MIOpen, rocPRIM/hipCUB (`tests/hipcc/prim.cpp`), rocRAND, rocFFT,
+   hipBLASLt, MIOpen, rocPRIM/hipCUB (`amd/tests/hipcc/prim.cpp`), rocRAND, rocFFT,
    rocSPARSE, rocSOLVER (`amd/tests/libraries`, `amd_libraries`), hipSPARSELt,
    Composable Kernel (`amd_pytorch_ck`) and RCCL, single- and multi-process with
    IPC memory handles (`amd_pytorch_distributed`, `amd_pytorch_multi_gpu`), run
@@ -1820,8 +1823,9 @@ scripts/run-pantheon-workloads.sh.
    `verified` bits in the profiles. **Done as v0, now ongoing per profile**: the
    harness exists (`nvidia/tools/characterize*.sh`, `characterize.cu`,
    `compare-profile.py`, `verify-profile.sh`, `amd/tools/characterize-do.sh`) and
-   12 NVIDIA profiles and `amd/mi325x` are verified. Open: `h200`, `b200`,
-   `b300`, `rtx5090` and six AMD profiles (Hardware characterization).
+   14 NVIDIA profiles and three AMD ones (`mi325x`, `rx6800`, `rx6700xt`) are verified.
+   Open: `h200`, `b200`, `b300`, `rtx5090`, the rest of the "Profile inventory"'s
+   **no** rows and seven AMD profiles (Hardware characterization).
 4. **Static cudart hosting**: satisfy NVIDIA's undocumented driver export
    tables (cuGetExportTable dark API) so binaries built with the *default*
    (static) cudart also run without a `-cudart shared` rebuild. **Investigated
@@ -1901,10 +1905,10 @@ scripts/run-pantheon-workloads.sh.
 
 ## Gap work in flight (2026-10-07)
 
-Pull requests open when rev 5 was written, each closing a gap from the register below. They are
-listed so the register is not read as if nothing were being done; a merged PR should move its entry
-into "Implemented" and out of here. All were written by agents from public documentation and
-public headers, tested by their authors under ASan + UBSan, and are awaiting CI and review.
+Pull requests open when rev 5 was written, each closing a gap from the register below. All of the
+pantheonsim ones have since merged (checked in the git log, 2026-10-22); the table is kept as the
+record of what each closed, and a gap still named in the register at the end is open whatever this
+table says. `pantheonworkloads #10` lives in another repository and was not checked.
 
 | PR | Gap it closes |
 | --- | --- |
@@ -1984,7 +1988,7 @@ and a future audit should check the fields too.
 
 ## CI inventory (rev 5)
 
-Workflows under `.github/workflows/` at 2ce1f45.
+Workflows under `.github/workflows/` at 2ce1f45; the `bench.yml`, `pytorch-sweep-nightly.yml`, `docker.yml`, `ci-setup-script.yml` and `cancel-conflicting-prs.yml` rows were added on 2026-10-22.
 
 | Workflow | Triggers | Jobs |
 | --- | --- | --- |
@@ -1999,7 +2003,12 @@ Workflows under `.github/workflows/` at 2ce1f45.
 | `rocm-libraries.yml` | push, PR, weekly | PyTorch, rocBLAS and hipSPARSELt on simulated AMD GPUs |
 | `sass-ptx.yml` | daily, PR | the suite on PTX (`VGPU_SASS=0`); SASS and PTX leave the same memory (digest compare) |
 | `vllm-nightly.yml` | daily, PR | vLLM on mi300x, mi325x, mi250x, mi350x, rx7900xtx, rx9070xt |
-| `workloads.yml` | push, daily, PR, dispatch | pantheon workloads: one row per NVIDIA profile (1 to 8 GPUs, CUDA 12.0 or 13.0); `coverage` fails when a profile has no row |
+| `bench.yml` | nightly, dispatch | tools/bench/bench.sh timings as an artifact, plus `--check-counters` as a cross-check; gates nothing |
+| `pytorch-sweep-nightly.yml` | daily, dispatch | the full PyTorch sweep and the full torch.distributed set on a simulated NVIDIA GPU |
+| `docker.yml` | PR touching docker/, version tags, dispatch | builds the container images (pushed only for a `v*` tag or by hand) |
+| `ci-setup-script.yml` | PR and push touching scripts/ci-setup.sh | runs the portable setup script in a bare ubuntu:24.04 container |
+| `cancel-conflicting-prs.yml` | push to main, every 20 minutes, dispatch | cancels CI runs of pull requests that have a merge conflict (docs/ci-merge-conflicts.md) |
+| `workloads.yml` | push to main, daily, dispatch | pantheon workloads: one row per NVIDIA profile (1 to 8 GPUs, CUDA 12.0 or 13.0); `coverage` fails when a profile has no row |
 
 What no workflow covers: an AMD row in `workloads` or its `coverage` check, and the
 real-GPU card check designed in docs/ci-card-check.md (design, not enabled). The
@@ -2022,7 +2031,7 @@ CUDA 12.4 and 12.8 headers are what CI compiles against, so newer APIs need
 
 ## Test inventory (rev 5)
 
-57 `vgpu_unit_test` and about 190 `add_test` entries in `CMakeLists.txt`, grouped. Some names
+96 `vgpu_unit_test` and 322 `add_test` entries in `CMakeLists.txt` (counted 2026-10-22; 57 and about 190 when rev 5 was written), grouped. Some names
 are generated per GPU (`e2e_pytorch_models_<gpu>`, `amd_pytorch_<gpu>`, `e2e_nccl_comm_ops_N`)
 and the per-library path tests (cuDSS, cuTENSOR, cuTensorNet, cuSPARSELt, cuStateVec, cuFile,
 nvCOMP, nvFatbin, nvJitLink, NVRTC, cuFFT, cuSOLVER, cuSPARSE, cuBLAS, cuBLASLt) are
@@ -2089,6 +2098,7 @@ refusals the project wants; the heaviest files are `src/ptx/parser.cpp` (about 4
 `nvidia/src/runtime_api.cpp` (117) and `cudnn_api.cpp` (106). The register below groups them; it is
 not a promise to remove them -- several are right to stay refused (undocumented hardware
 behaviour, timing).
+The `file:line` and `docs:line` references in this register are from rev 5 (2ce1f45) and have drifted since; search for the quoted name or section instead of jumping to the line.
 
 ### NVIDIA vendor libraries (nvidia/docs/libraries.md "What is not implemented", from line 746)
 
@@ -2202,8 +2212,9 @@ Still open, each with the reason:
   from different paths (no document, no sample), `SYNCS.ARRIVE` modes 6 and 7 and `UTCCP` shapes 1 and 7
   (no PTX produces them).
 - Static cudart, `cuGetExportTable`: blocked (see "Next milestones" 4; nvidia/docs/dark-api.md).
-- CUPTI (nvidia/docs/cupti.md): per-API activity controls, the timestamp callback and device-side timestamps
-  (:70); no Callback API deliveries, no Event or Profiling metrics, nothing derived from time (:121-139).
+- CUPTI (nvidia/docs/cupti.md, "What is not implemented, and why"): Unified Memory counters, the `OVERHEAD`
+  kinds beyond function loading and buffer request, driver-API pool and graph callbacks, no Event or Profiling
+  metrics, nothing derived from time.
 - Performance counters and `%pm0`-`%pm7`: refused by design (no timing model).
 
 ### AMD (amd/README.md, amd/src)
@@ -2385,14 +2396,15 @@ which has not been looked into.
 - Real-GPU card check (docs/ci-card-check.md): designed on a 3080 Ti, not enabled.
 - AMD rows in `workloads.yml` and its `coverage` check: absent.
 - The hip-tests disabled-case lists and the SASS-vs-PTX digest differences (see "CI inventory"): unreconciled.
-- Pantheon workloads: 44 of 46 pass and `media_enc_virus` and `rt_virus` are skipped, per
-  docs/pantheon-workloads.md; that document's status block and prose disagree about `media_enc_virus`.
+- Pantheon workloads: 44 of 46 pass with `scripts/run-pantheon-workloads.sh`, which skips `media_enc_virus` and
+  `rt_virus`; the CI runner (`tests/workloads/run_pantheon_workloads.sh`) runs `media_enc_virus` too and skips
+  only `rt_virus` (docs/pantheon-workloads.md).
 - GitHub Action constraints (docs/github-action.md:82-124): it must use the shared cudart, needs
   `library-path: false` when linking vendor libraries, Ubuntu 22.04's CUDA 11.5 is too old (so 12.6 is
   installed), and its timings mean nothing.
-- External suites: `gpu-burn` and `cuda-memtest` exist as PR #290 (not yet merged when rev 5 was written); until it
-  merges the NVIDIA memory tests are the pantheon `memory_*`, `galpat`, `march_test` and `memory_hammer`
-  workloads, and the AMD ones are `amd_memtest_patterns`.
+- External suites: `gpu-burn` and `cuda-memtest` merged as PR #290 (`ci/external/gpu-burn.txt`,
+  `ci/external/cuda-memtest.txt`, `external-suites.yml`); the pantheon `memory_*`, `galpat`, `march_test` and
+  `memory_hammer` workloads and, on AMD, `amd_memtest_patterns` cover the same ground.
 
 ### Documents that disagreed with the code at rev 5
 

@@ -11,7 +11,8 @@ by running the suite on a developer machine.
 |---|---|---|
 | build + unit tests, pantheon workloads, AMD code objects | GitHub-hosted `ubuntu-24.04` (4 cores, 16 GB) | `SIM_RUNS_ON` if set |
 | PyTorch, ROCm and the rest of the suite (`ml`) | runner `pantheonsim-ci` on the pantheonsim.com host | `ML_RUNS_ON` |
-| SASS, ASan + UBSan, ThreadSanitizer, ollama (NVIDIA and each AMD GPU), and `find the toolchain images` | the burst pool, label `pantheonsim-burst` | `BURST_RUNS_ON` |
+| ollama (NVIDIA and each AMD GPU) | the burst pool, label `pantheonsim-burst` | `BURST_RUNS_ON` |
+| SASS, ASan + UBSan, ThreadSanitizer, and `find the toolchain images` | the burst pool too, unless `CONTAINER_RUNS_ON` is set | `CONTAINER_RUNS_ON`, else `BURST_RUNS_ON` |
 
 The burst pool on 2026-10-15 is one runner, `server2-1` (24 CPUs; 15 to 23 GiB
 available when the jobs in these logs started; `scripts/ci-pool.sh` lists it). Every container job of a run `needs:` the image
@@ -177,8 +178,9 @@ are waiting, as the maintainer:
 
        gh variable delete BURST_RUNS_ON --repo pantheongpu/pantheonsim
 
-   With the variable unset, every `runs-on: ${{ fromJSON(vars.BURST_RUNS_ON ||
-   '"ubuntu-24.04"') }}` takes the hosted runner, and the jobs install their
+   With the variable unset (and `CONTAINER_RUNS_ON` too, if it was ever set),
+   every `runs-on: ${{ fromJSON(vars.BURST_RUNS_ON || '"ubuntu-24.04"') }}` takes
+   the hosted runner, and the jobs install their
    toolchain with apt (the image finder returns no image only if the registry
    is unreachable; the container jobs run on the hosted runner either way).
 2. A job that is already queued keeps the label it was queued with. Cancel the
