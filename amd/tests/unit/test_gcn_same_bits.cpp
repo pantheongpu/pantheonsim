@@ -26,20 +26,6 @@
 
 using namespace vgpu;
 
-// The digests were recorded from an optimized build. A build with no optimization (a sanitizer job's Debug) lets the compiler order the operands of
-// float operations on two NaNs, and of a few libm calls, another way, so a few of the shapes that have NaNs among their inputs come out with other
-// payloads there: up to 2 % of the shapes may differ in such a build (and a note says so); an optimized build must match every one.
-inline bool digests_may_differ(size_t wrong, size_t checked) {
-#if defined(__OPTIMIZE__)
-  (void)wrong, (void)checked;
-  return false;
-#else
-  if (wrong * 50 > checked) return false;
-  std::printf("NOTE: %zu of %zu digests differ in this unoptimized build (NaN payloads and libm calls the compiler orders as it likes)\n", wrong, checked);
-  return true;
-#endif
-}
-
 namespace {
 
 struct Corpus {
@@ -167,7 +153,7 @@ VTEST(every_instruction_of_the_isa_corpora_gives_the_recorded_bits) {
     wrong_total += wrong;
   }
   VCHECK(nonzero > 10000);   // most shapes ran (or threw a definite error), not all refused
-  if (wrong_total && !digests_may_differ(wrong_total, checked))
+  if (wrong_total)
     throw vtest::Failure(std::to_string(wrong_total) + " of " + std::to_string(checked) + " instructions differ from the recorded bits:" + report);
 }
 

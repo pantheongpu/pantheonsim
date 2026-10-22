@@ -3838,3 +3838,56 @@ engines use) and `load_fields` stay.
   support threads started in a forked child of a threaded process. That case is skipped under TSan.
 * **Lint**: the `interp` job of `sass-ptx.yml` has the pr-guard step; `test_mma_fast.cpp` had a narrowing conversion; the whole tree builds with `-DVGPU_WERROR=ON`
   (a missing `default:` in `global_access`'s switch and a narrowing in the probe were ours).
+
+## Sanitizer fixes (round 11) (branch `speedup-merge`, pushed to `speedup`)
+
+PR #403's sanitizer jobs failed on its own AMD code. Reproduced on the rig (c7i.4xlarge, the CI image `cuda12.0-9f7f0f8400f7`, CUDA 12.0 and gcc 12) with the
+CI recipe: `-DCMAKE_BUILD_TYPE=Debug -fsanitize=address,undefined` and `-fsanitize=thread -O1`. Both jobs' failures were in the AMD interpreter
+and its tests. Three kinds of cause, none a race and none a timeout.
+
+**1. Signed integer overflow (undefined behaviour; the three UBSan lines of the ASan job).** The hardware wraps; x86 does too, so the results were right, but
+the compiler may assume they do not happen. Fixed with unsigned arithmetic, the same bits: `v_mad_i32_i24` (the product of two 24-bit signed factors and
+the sum, 2 places), the integer multiply-accumulate of the matrix instructions (`mfma_dot_int`, the tile path's `int64` sum in `matrix_multiply` and the
+sparse one, through `wrap_madd` in `amd/src/mfma_math.hpp`), and the 32-bit sum of `mfma_tile_int_scalar`. Test: `test_amd_mfma_math`
+`integer_dot_products_wrap_without_overflowing_a_signed_type` (fails under UBSan with the old arithmetic). After the fix the ASan+UBSan run of the whole AMD set
+(`ctest -R '^test_amd'`, 162 tests, 2 skipped by design) is green: 1762 s (`test_amd_gcn_tier_same_bits` 1762 s, `test_amd_matrix_fast` 1155 s,
+`test_amd_gcn_same_bits` 999 s, `test_amd_gcn_atomics_gfx1250` 677 s, `test_amd_gcn_memory_same_bits` 666 s, the rest under 100 s) at `-j8` on 8 hyper-threads while
+another session used the other 8.
+
+**2. The NaN a float instruction leaves was the compiler's choice.** `x + y`, `x * y`, `std::fma(x, y, z)` and `std::fmin/fmax(x, y)` with two NaN operands give the
+payload and sign of one of them (the hardware and SSE take the first operand's), and C++ does not say which operand is first. GCC swaps them
+as it likes: differently at -O0, -O1 and -O3, differently in two copies of one loop, and `fminf`/`fmaxf` it passes to libm as `(y, x)` even at -O0 (checked in the
+disassembly). The recorded digests of `test_amd_gcn_same_bits`, `_memory_same_bits` and `_packed_same_bits` held the choices of the Release build, so those tests were
+right in the Release build and wrong in every other one: the same tests fail at plain `-O0` and plain `-O1` without any sanitizer (measured at the head `224874ea`: 50 and 22 instructions of
+16806), under ASan 50 (after the overflow fixes), under TSan 82 in CI's run (that one was before `224874ea` fixed the f16 add). It is a real defect of the
+interpreter (the result of an instruction depended on the optimization level) and not of the tests. Fixed at the cause: `amd/src/nan_order.hpp` has `nan_add`, `nan_sub`, `nan_mul`, `nan_fma`,
+`nan_fmin`, `nan_fmax` with the operand order as a template argument; the result is the plain operation unless it is a NaN with a NaN operand, and
+then the first NaN operand of that order, quieted. The orders are the ones that reproduce the recorded digests (found by trying them against the digests in the Release
+build with the order of each site chosen at run time, then frozen as template arguments), so no golden digest moved; they are not the same at every site:
+`v_add_f32`, `v_mul_f32`, `v_add_f64`, `v_mul_f64`, `v_pk_add_f32`, `v_pk_mul_f32` take the second operand first (GCC commuted them), `v_sub_f32`, `v_subrev_f32`, `v_mul_legacy_f32`
+the first; `fma` takes (b, a, c) in `v_fma_f32`, `v_fmac_f32`, `v_fmaak/fmamk_f32`, `v_fma_mix*`, `v_fma_f64`, `v_fmac_f16`, and (a, b, c) in
+`v_fma_f16`, `v_pk_fma_f32`, `v_pk_fmac_f16`; `v_max3_f32` and the max in `v_med3_f32` take the library's answer for `(y, x)`; the packed adds of the atomics are `y`-first in both halves for float16 and `x`-first in the low half and `y`-first in the high half for bfloat16, `ds_pk_add_f16` is `x`-first in the low half and
+`y`-first in the high half (all found by trying). `nan_fmin`/`nan_fmax` are glibc 2.39's fmin and fmax written out (a tie of the two zeros gives the
+second argument, two NaNs the first, quieted, a signaling NaN beside a number that NaN quieted, a quiet one beside a number the number), checked against the library on 9 x 9 values of
+both widths. Two more that are not an order: `v_sin_f32`/`v_cos_f32` on gfx942, gfx950 and gfx1250 and `v_fract_f16` pass a NaN through as it came (the float to double to float round trip that would quiet a
+signaling NaN is folded away by the optimizer at -O1 and above and not at -O0, and the recorded bits are the folded one's). Test: `test_amd_nan_order` (4 tests: the
+helpers are the plain operation for numbers, the order named for NaNs, the library's fmin/fmax where its answer does not depend on the argument order), and the same-bits tests themselves,
+which now pass at -O0 (also with ASan+UBSan), -O1, -O3 and with TSan. Not covered by any digest, so the order chosen is a guess that matches the natural one (first operand first): the bfloat16
+`ds_pk_add`, `v_fmac_f64`, the scalar float instructions, `v_fmaak/fmamk_f64`, and `v_pk_fma_bf16`; they pass today and are not changed.
+
+**3. Two test defects.** `test_amd_mfma_math` compared `mfma_dot` with a plain `old_sum += a * b` loop; with two NaNs the plain loop's payload is the compiler's, and
+`mfma_dot` has the fixed order (that was the TSan failure at -O1 and the ASan one at -O0): the NaN case is now compared with the same sum in the fixed order,
+spelled out on the strided layout. `test_amd_gcn_threads` `a_forked_child_launches_on_threads_of_its_own` (and the two `_gfx1100`/`_gfx1030` runs) died under TSan with
+"starting new threads after multi-threaded fork is not supported": that is what the test checks on purpose (the pool is rebuilt in the child), so the test binary sets
+`die_after_fork=0` through `__tsan_default_options` when built with TSan. Not a finding.
+
+**Merge with `origin/speedup` (e50e35c5).** The other session had meanwhile made the same overflow fixes (`wrap_madd`, kept; `mfma_mac_wrap` is gone), made `test_amd_mfma_math`
+compare a NaN as a NaN (mine compares the fixed order exactly, kept), skipped the forked-child case of `test_amd_gcn_threads` under TSan (it runs again, with `die_after_fork=0`), and let the
+three digest tests differ in up to 2 % of the shapes in a build without optimization or under a sanitizer. With the order of the NaNs spelled out the digests hold in every build, so that
+tolerance is removed again (the three tests are as they were at `224874ea`): an instruction that differs in any build is a failure. The tier test's one seed under TSan is kept.
+
+**Slow, not failing.** Under a sanitizer these tests take long: `test_amd_gcn_tier_same_bits` 1762 s (ASan), 2373 s (TSan), `test_amd_matrix_fast` 1155 s and 1527 s,
+`test_amd_gcn_same_bits` 999 s and 1398 s, `test_amd_gcn_memory_same_bits` 666 s and 897 s, `test_amd_gcn_atomics_gfx1250` 677 s and 463 s (loaded rig, `-j8`; CI's own times
+were 79 s to fail and 900 s for the tier test under TSan). CMake sets no `TIMEOUT` for them and ctest's default here is none, so none timed out; the CI job's own time limit
+is what they eat: the proposal (not made) is a `TIMEOUT` property of 3600 on these five, and moving `test_amd_gcn_tier_same_bits` and `test_amd_matrix_fast` out of the TSan job's list
+(they run no threads of their own; `-E` in `ci.yml` line 739) if the job's limit is tight.

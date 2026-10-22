@@ -370,12 +370,12 @@ inline void mfma_tile_int_scalar(uint32_t m, uint32_t n, uint32_t k, const int16
   for (uint32_t i = 0; i < m; ++i) {
     const int16_t* const arow = ia + size_t{i} * k;
     for (uint32_t j = 0; j < n; ++j) {
-      int32_t sum = 0;
+      uint32_t sum = 0;   // (unsigned: the sum wraps, and that is not undefined)
       for (uint32_t t = 0; t < k; t += 2) {
         const int16_t* const bp = bi + (size_t{t / 2} * n + j) * 2;
-        sum += int32_t{arow[t]} * bp[0] + int32_t{arow[t + 1]} * bp[1];
+        sum += static_cast<uint32_t>(int32_t{arow[t]} * bp[0]) + static_cast<uint32_t>(int32_t{arow[t + 1]} * bp[1]);
       }
-      out[size_t{i} * n + j] = sum;
+      out[size_t{i} * n + j] = static_cast<int32_t>(sum);
     }
   }
 }

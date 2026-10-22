@@ -68,7 +68,7 @@ VTEST(a_dot_product_reads_the_same_sum_from_a_contiguous_column_as_from_the_stri
     for (auto& x : b) x = any_double(rng);
     for (uint32_t kk = 0; kk < k; ++kk) column[kk] = b[kk * n + j];
     const double c = any_double(rng);
-    double old_sum = c, old_fma = c;
+    double old_sum = c, old_fma = c, ordered_sum = c;
     int64_t old_int = static_cast<int64_t>(rng.next() % 1000);
     const int64_t int_start = old_int;
     std::vector<double> ia(k), ib(k * n);
@@ -77,18 +77,17 @@ VTEST(a_dot_product_reads_the_same_sum_from_a_contiguous_column_as_from_the_stri
     std::vector<double> icol(k);
     for (uint32_t kk = 0; kk < k; ++kk) {
       old_sum += a[kk] * b[kk * n + j];
+      ordered_sum = vgpu::amd::mfma_add(ordered_sum, vgpu::amd::mfma_mul(a[kk], b[kk * n + j]));
       old_fma = std::fma(a[kk], b[kk * n + j], old_fma);
         old_int += static_cast<int64_t>(ia[kk]) * static_cast<int64_t>(ib[kk * n + j]);
       icol[kk] = ib[kk * n + j];
     }
-    // (Two NaNs of different payloads in one multiply or add leave the payload of the operand the compiler made the first; the reference
-    // loop here is the compiler's choice at whatever optimization level this is built at, mfma_dot's is the fixed one, tested by
-    // nans_with_different_payloads_come_out_as_the_fixed_operand_order_gives. So a NaN is compared as a NaN.)
-    const double got_dot = vgpu::amd::mfma_dot(a.data(), column.data(), k, c), got_fma = vgpu::amd::mfma_dot_fma(a.data(), column.data(), k, c);
-    if (std::isnan(old_sum)) VCHECK(std::isnan(got_dot));
-    else VCHECK_EQ(bits_of(got_dot), bits_of(old_sum));
-    if (std::isnan(old_fma)) VCHECK(std::isnan(got_fma));
-    else VCHECK_EQ(bits_of(got_fma), bits_of(old_fma));
+    // A sum that is not a NaN is the same whatever order the compiler gives the two operands of the plain loop above. A NaN is
+    // not: when both operands of an add or multiply are NaNs the payload and sign that come out are the operand order's, which
+    // the optimizer picks differently at -O0 and -O1 (the sanitizer builds). Those are compared with the fixed order, written
+    // out here on the strided layout.
+    VCHECK_EQ(bits_of(vgpu::amd::mfma_dot(a.data(), column.data(), k, c)), bits_of(old_sum == old_sum ? old_sum : ordered_sum));
+    VCHECK_EQ(bits_of(vgpu::amd::mfma_dot_fma(a.data(), column.data(), k, c)), bits_of(old_fma));
     VCHECK_EQ(vgpu::amd::mfma_dot_int(ia.data(), icol.data(), k, int_start), old_int);
     ++checked;
   }
@@ -335,6 +334,23 @@ VTEST(the_four_wide_and_two_wide_tile_kernels_give_the_same_bits) {
   vgpu::amd::mfma_avx2_switch() = had;
 }
 #endif
+
+// Integer sums wrap as the hardware's do, and wrapping is not undefined here: a signed product of two large factors would trip the
+// sanitizer build (this test fails there with the old signed arithmetic).
+VTEST(integer_dot_products_wrap_without_overflowing_a_signed_type) {
+  const double a[3] = {4294967234.0, -8325582.0, 3037000500.0}, b[3] = {4294967287.0, -8325582.0, 3037000500.0};
+  uint64_t want = 0x1234;
+  for (int i = 0; i < 3; ++i) want += static_cast<uint64_t>(static_cast<int64_t>(a[i])) * static_cast<uint64_t>(static_cast<int64_t>(b[i]));
+  VCHECK_EQ(static_cast<uint64_t>(vgpu::amd::mfma_dot_int(a, b, 3, 0x1234)), want);
+  VCHECK_EQ(vgpu::amd::wrap_madd(INT64_MAX, INT64_MAX, 3), static_cast<int64_t>(uint64_t{INT64_MAX} + uint64_t{INT64_MAX} * 3));
+  // (The 16-bit integer tile: sums that pass 2^31 wrap in the 32 bits.)
+  std::vector<int16_t> ia(2 * 64, 32767), bi(64 * 2, 32767);
+  int32_t out[1] = {};
+  vgpu::amd::mfma_tile_int_scalar(1, 1, 64, ia.data(), bi.data(), out);
+  uint32_t sum = 0;
+  for (int t = 0; t < 64; ++t) sum += static_cast<uint32_t>(32767 * 32767);
+  VCHECK_EQ(static_cast<uint32_t>(out[0]), sum);
+}
 
 #if defined(__SSE2__)
 VTEST(every_binary16_converts_to_the_same_double_four_at_a_time) {

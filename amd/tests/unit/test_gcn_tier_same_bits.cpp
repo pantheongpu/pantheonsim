@@ -51,7 +51,12 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
   const bool was_on = amd::gcn::tier::enabled();
   amd::gcn::tier::count_bails(true);
   const char* only = std::getenv("VGPU_TIER_ONLY");   // (a substring of the instructions to run)
-  const uint64_t seeds = std::getenv("VGPU_TIER_SEEDS") ? std::strtoull(std::getenv("VGPU_TIER_SEEDS"), nullptr, 0) : 3;
+#if defined(__SANITIZE_THREAD__)
+  constexpr uint64_t kDefaultSeeds = 1;   // (ThreadSanitizer runs it twenty times slower; one seed still covers every shape)
+#else
+  constexpr uint64_t kDefaultSeeds = 3;
+#endif
+  const uint64_t seeds = std::getenv("VGPU_TIER_SEEDS") ? std::strtoull(std::getenv("VGPU_TIER_SEEDS"), nullptr, 0) : kDefaultSeeds;
   for (const Corpus& c : kCorpora) {
     for (const std::string& line : lines_of(std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + c.file)) {
       if (line[0] == '#') continue;
