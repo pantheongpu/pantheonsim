@@ -47,6 +47,10 @@ cache="$work/jit-cache"
 rm -rf "$cache"
 fails=0
 fault_throws=""
+nvcc_bin="$(pick_nvcc_for_shim "$shim")"
+nvcc_host_compiler_fix
+read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
+san="${san_flags[*]}"
 
 # Runs $bin with the shim, one host thread, counters on, quiet; $1 is the label of the extra environment that follows.
 runit() {
@@ -180,7 +184,7 @@ for f in "$work"/*.sm_*; do
 done
 shopt -u nullglob
 (( ${#programs[@]} )) || { echo "SKIP: no test programs were built"; exit 0; }
-for j in "${programs[@]}"; do check $j; done
+[[ -n ${VGPU_JIT_ONLY_RANDOM:-} ]] || for j in "${programs[@]}"; do check $j; done
 
 # Random straight-line kernels (jit_random.py): u32 / u64 / float statements over a small pool of variables, guards, loads; blocks of 128, 48 and
 # 33 threads. The tier and the JIT with every region compiled must print the same hashes and counters (VGPU_JIT_RANDOM_SEEDS seeds of
@@ -206,7 +210,7 @@ fi
 
 # The failure modes: the JIT cannot do its job and the program must not notice (stdout and stderr, the notices aside: VGPU_QUIET).
 prog=sass_tier; arch=sm_86
-if [[ -x "$work/$prog.$arch" ]]; then
+if [[ -z ${VGPU_JIT_ONLY_RANDOM:-} && -x "$work/$prog.$arch" ]]; then
   bin="$work/$prog.$arch"
   ref="$(runit "$bin" $arch VGPU_TIER=1)"
   mode() {
