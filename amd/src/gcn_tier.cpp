@@ -1792,19 +1792,6 @@ bool classify_sdwa(Inst& in) {
   return true;
 }
 
-// A vector memory instruction with no handler of its own: the Machine's functions for it, without step()'s frame (Op::mach 9). The cache
-// operations (global_inv, buffer_wbl2, ...), the forms that move data to LDS, and the GWS instructions stay with step().
-void classify_mem(Inst& in) {
-  if (in.enc != Enc::Flat && in.enc != Enc::Mubuf && in.enc != Enc::Mtbuf && in.enc != Enc::Ds) return;
-  if ((in.flags & (kInstLoadLds | kInstAsyncLds | kInstGws)) || in.gds) return;
-  const std::string& n = in.name;
-  if (n.rfind("global_inv", 0) == 0 || n.rfind("global_wb", 0) == 0 || n.rfind("buffer_wb", 0) == 0 || n.rfind("buffer_inv", 0) == 0 ||
-      n.rfind("buffer_gl", 0) == 0)
-    return;
-  in.fast.mach = 9;
-  in.fast.run = h_never;
-}
-
 }  // namespace
 
 void tier_classify(Inst& in) {
@@ -1837,7 +1824,7 @@ void tier_classify(Inst& in) {
     if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && eff == "v_lshl_add_u64") eff += "_g";
     const auto& tab = table();
     const auto it = tab.find(eff);
-    if (it == tab.end()) return classify_mem(in);
+    if (it == tab.end()) return;
     ep = &it->second;
   }
   const Entry& e = *ep;
