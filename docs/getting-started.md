@@ -146,9 +146,9 @@ Makefile variables are in [docs/config.md](config.md).
 ## When something goes wrong
 
 - **`make doctor` says cmake or the compiler is too old.** You need CMake 3.20
-  or newer and g++ 13 or newer (or clang++ 17). `doctor` prints the install
-  command for your system. On Ubuntu 22.04 that means g++ 13 from a PPA; then
-  run `export CXX=g++-13`, `make clean` and `make build`.
+  or newer and g++ 12 or newer (or clang++ 17). `doctor` prints the install
+  command for your system. On Ubuntu 22.04 that means `sudo apt-get install g++-12`; then
+  run `export CXX=g++-12`, `make clean` and `make build`.
 - **Your CUDA program fails with a message about the static runtime.** It was
   built without `-cudart shared`. Rebuild with it. Programs that link the CUDA
   runtime statically, such as CuPy, cannot be simulated yet

@@ -3,7 +3,7 @@
 # cannot. Run it with `make doctor`.
 #
 # Required (the exit status is 1 when one is missing):
-#   cmake 3.20 or newer, and a C++20 compiler: g++ 13+ or clang++ 17+.
+#   cmake 3.20 or newer, and a C++20 compiler: g++ 12+ or clang++ 17+.
 # Reported only (the simulator needs none of them to run):
 #   nvcc and hipcc, which compile your own CUDA or HIP programs; the ROCm
 #   release; the free memory and the parallel build jobs that fits in it.
@@ -58,7 +58,7 @@ fi
 # ---- C++20 compiler --------------------------------------------------------
 good_cxx=""
 old_cxx=""
-for cxx in "${CXX:-}" g++ g++-14 g++-13 clang++ clang++-19 clang++-18 clang++-17; do
+for cxx in "${CXX:-}" g++ g++-14 g++-13 g++-12 clang++ clang++-19 clang++-18 clang++-17; do
   [[ -n $cxx ]] && have "$cxx" || continue
   v=""
   if [[ $cxx == *clang* ]]; then
@@ -68,7 +68,7 @@ for cxx in "${CXX:-}" g++ g++-14 g++-13 clang++ clang++-19 clang++-18 clang++-17
   else
     out=$("$cxx" -dumpversion 2>/dev/null)
     [[ $out =~ ^([0-9]+) ]] && v=${BASH_REMATCH[1]}
-    need=13; kind="g++"
+    need=12; kind="g++"
   fi
   [[ -n $v ]] || continue
   if (( v >= need )); then
@@ -87,17 +87,16 @@ else
   if [[ -n $old_cxx ]]; then
     gone "no C++20 compiler new enough; found $old_cxx"
   else
-    gone "no C++ compiler found (needs g++ 13+ or clang++ 17+)"
+    gone "no C++ compiler found (needs g++ 12+ or clang++ 17+)"
   fi
   if [[ $os_id == ubuntu && $os_ver == 22.04 ]]; then
-    hint "Ubuntu 22.04 ships g++ 11. Install g++ 13 from the toolchain PPA:"
-    hint "  sudo add-apt-repository ppa:ubuntu-toolchain-r/test && sudo apt-get update"
-    hint "  sudo apt-get install g++-13"
-    hint "then build with: export CXX=g++-13"
+    hint "Ubuntu 22.04 ships g++ 11. Install g++ 12 from the main archive:"
+    hint "  sudo apt-get install g++-12"
+    hint "then build with: export CXX=g++-12"
   elif [[ $os_id == ubuntu ]]; then
-    hint "sudo apt-get install g++-13        (then: export CXX=g++-13 if g++ is older)"
+    hint "sudo apt-get install g++-12        (then: export CXX=g++-12 if g++ is older)"
   else
-    hint "install g++ 13 or newer (apt: g++-13, dnf: gcc-c++) or clang 17 or newer"
+    hint "install g++ 12 or newer (apt: g++-12, dnf: gcc-c++) or clang 17 or newer"
   fi
 fi
 

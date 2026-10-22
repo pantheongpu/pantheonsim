@@ -263,7 +263,7 @@ file is named (writing the commented starter if there is none).
 | Target | Runs |
 | --- | --- |
 | `make` | `make deps`, then `make build` (with the compiler `deps` found, if the default is too old), then prints what to type next |
-| `make deps` | `scripts/deps.sh`: installs cmake and a C++20 compiler when missing (Debian and Ubuntu; it asks first, `YES=1` answers yes, no terminal means it only prints the command; `PPA=1` with `YES=1` adds the g++ 13 PPA on Ubuntu 22.04). Never installs CUDA or ROCm |
+| `make deps` | `scripts/deps.sh`: installs cmake and a C++20 compiler when missing (Debian and Ubuntu; it asks first, `YES=1` answers yes, no terminal means it only prints the command; `PPA=1` with `YES=1` adds the g++ 12 PPA on Ubuntu 20.04 and older). Never installs CUDA or ROCm |
 | `make doctor` | `scripts/doctor.sh`: checks cmake, a C++20 compiler and memory, and says what to install |
 | `make build` | `scripts/build.sh` at low priority (`NICE=` to change) |
 | `make demo` | `build/vgpu demo vectoradd`, building first if needed |
