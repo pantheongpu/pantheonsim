@@ -144,11 +144,11 @@ uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
   if (node.empty()) {
     Allocation a;
     a.set_up(size);
-    live_.emplace(base, std::move(a));
+    live_.emplace_hint(live_.end(), base, std::move(a));
   } else {
     node.key() = base;
     node.mapped().set_up(size);
-    live_.insert(std::move(node));
+    live_.insert(live_.end(), std::move(node));   // the newest address is the highest
   }
   notify_usage();
   return base;
@@ -156,22 +156,25 @@ uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
 
 void MemoryManager::remember_freed(uint64_t ptr, uint64_t size) {
   const FreedRecord record{size, freed_front_seq_ + freed_order_.size()};
-  auto at = freed_.lower_bound(ptr);
+  // Frees mostly come in the order of allocation, which is the order of address: the end is the place.
+  auto at = freed_.empty() || ptr > freed_.rbegin()->first ? freed_.end() : freed_.lower_bound(ptr);
+  std::map<uint64_t, FreedRecord>::iterator entry;
   if (at != freed_.end() && at->first == ptr) {
     at->second = record;
+    entry = at;
   } else if (!spare_freed_.empty()) {
     spare_freed_.key() = ptr;
     spare_freed_.mapped() = record;
-    freed_.insert(at, std::move(spare_freed_));
+    entry = freed_.insert(at, std::move(spare_freed_));
   } else {
-    freed_.emplace_hint(at, ptr, record);
+    entry = freed_.emplace_hint(at, ptr, record);
   }
-  freed_order_.push_back(ptr);
+  freed_order_.push_back(entry);
   // Evict the oldest entries once the bound is reached; the node of the last goes to the next free.
   while (freed_order_.size() > kQuarantineEntries) {
-    auto stale = freed_.find(freed_order_.front());
+    const auto stale = freed_order_.front();
     // Only drop it if this record is the one that entry refers to.
-    if (stale != freed_.end() && stale->second.seq == freed_front_seq_) spare_freed_ = freed_.extract(stale);
+    if (stale->second.seq == freed_front_seq_) spare_freed_ = freed_.extract(stale);
     freed_order_.pop_front();
     ++freed_front_seq_;
   }

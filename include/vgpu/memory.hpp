@@ -771,9 +771,10 @@ class MemoryManager {
   std::map<uint64_t, Allocation> live_;        // base -> allocation
   // base -> record, bounded to kQuarantineEntries (oldest evicted first).
   std::map<uint64_t, FreedRecord> freed_;
-  // The frees, oldest first, as bases: the quarantine's eviction order. The entry at the front has
-  // sequence number freed_front_seq_, the next one that of the entry after it, and so on.
-  std::deque<uint64_t> freed_order_;
+  // The frees, oldest first, as their entries in freed_ (a node of a map keeps its place): the
+  // quarantine's eviction order. The entry at the front has sequence number freed_front_seq_, the
+  // next one that of the entry after it, and so on.
+  std::deque<std::map<uint64_t, FreedRecord>::iterator> freed_order_;
   uint64_t freed_front_seq_ = 0;
   // A node of live_ and one of freed_ kept from the last free and eviction, for the next allocation
   // and free to put back without asking the heap (used under the table's writer lock only).

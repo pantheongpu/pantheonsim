@@ -1012,9 +1012,9 @@ hipError_t run_launch(const LaunchJob& job) {
     } else {
       const size_t padded = (args.size() + 63) / 64 * 64 + 64;
       kernarg = mem.alloc(padded);
-      std::vector<uint8_t> segment(padded, 0);
-      std::copy(args.begin(), args.end(), segment.begin());
-      mem.write(kernarg, segment.data(), segment.size());
+      // A new allocation reads zero, so only the arguments are written; the padding past them is
+      // the zero it would be written as.
+      if (!args.empty()) mem.write(kernarg, args.data(), args.size());
     }
     if (cooperative && !job.kernarg_at) {
       // What the device library's grid barrier counts on (ockl's mg_info): a
