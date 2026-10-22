@@ -45,7 +45,7 @@ Inside, `nvidia-smi` shows the GPUs, and you can compile, download programs with
 
 ## Choose your machine
 
-Which GPUs: `make list-gpus` (or `build/vgpu list-gpus`) prints every id you can use, about 50 NVIDIA and AMD cards from a T4 to a B300 and from an RX 6700 XT to an MI455X. Use the id as printed: `gpu: nvidia/t4` in the settings file, or `make run GPU=nvidia/t4`. `build/vgpu info --gpu nvidia/t4` shows one card. Some profiles were measured on a physical card and some come from public documents only; [Status and limits](docs/status.md) says which.
+Which GPUs: `make list-gpus` (or `build/vgpu list-gpus`) prints every id you can use, 48 NVIDIA and AMD cards from a T4 to a B300 and from an RX 6700 XT to an MI455X. Use the id as printed: `gpu: nvidia/t4` in the settings file, or `make run GPU=nvidia/t4`. `build/vgpu info --gpu nvidia/t4` shows one card. Some profiles were measured on a physical card and some come from public documents only; [Status and limits](docs/status.md) says which.
 
 Put the settings in a file, for example `my.yaml`, then `./run my.yaml`. [pantheonsim.example.yaml](pantheonsim.example.yaml) lists every setting and runs as it is (`./run pantheonsim.example.yaml`); copy it to `pantheonsim.yaml` to make it the default, which is also what `./run` writes for you on a first run:
 

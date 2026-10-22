@@ -1,6 +1,6 @@
 # TODO / status
 
-Updated: 2026-10-07 (rev 5). See ARCHITECTURE.md for the design behind these.
+Updated: 2026-10-22 (rev 5; profile counts refreshed). See ARCHITECTURE.md for the design behind these.
 
 Rev 5 is an audit, not an addition: every claim below was checked against the tree at
 `origin/main` 2ce1f45 (code, the CMake test list, the docs, the git log). The checks were
@@ -14,7 +14,7 @@ The status snapshot, the inventories and the gap register at the end are new in 
 | --- | --- | --- |
 | NVIDIA execution | PTX interpreter and a SASS executor (the default; sm_75 to sm_120a); both run unmodified nvcc programs through `libvgpucudart` / `libvgpucuda` | nvidia/docs/sass.md, "Implemented" |
 | AMD execution | GCN/CDNA and RDNA executors (64- and 32-lane); unmodified hipcc programs from ROCm 6.4 to 7.2 on MI250X, MI300X, MI325X, MI350X, RX 6900 XT, RX 6800, RX 6700 XT, RX 7900 XTX, RX 9070 XT | amd/README.md |
-| Device profiles | 16 NVIDIA (12 read from hardware) and 7 AMD (1 read from hardware) | "Profile inventory" |
+| Device profiles | 38 NVIDIA (14 read from hardware) and 10 AMD (3 read from hardware) | "Profile inventory" |
 | NVIDIA libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP, nvJPEG, cuDSS, cuSPARSELt, cuTENSOR, cuTensorNet, cuStateVec, cuFile, nvCOMP, NVSHMEM, nvJitLink, nvFatbin, NVENC | nvidia/docs/libraries.md |
 | AMD libraries | rocBLAS, hipBLASLt, hipSPARSELt, MIOpen, rocPRIM/hipCUB, rocRAND, rocFFT, rocSPARSE, rocSOLVER, Composable Kernel, RCCL; ROCm SMI, AMD SMI, rocprofv3/rocprofiler-sdk shims | amd/README.md |
 | Frameworks | PyTorch (CUDA on 12 whole-model checks; ROCm on six AMD GPUs), vLLM (ROCm), llama.cpp and Ollama (every NVIDIA and AMD profile), Triton, Numba, `torch.compile` | nvidia/docs/pytorch.md, "CI inventory" |
@@ -26,8 +26,8 @@ The status snapshot, the inventories and the gap register at the end are new in 
 ## Implemented (tested)
 
 - M0 build system: CMake + zero-dep C++20; `scripts/build.sh`, `scripts/test.sh`
-- M1 profiles: 16 NVIDIA and 7 AMD (see "Profile inventory" below; 12 NVIDIA and
-  1 AMD are read from hardware); `vgpu list-gpus`, `vgpu info --gpu <id> [--json]`
+- M1 profiles: 38 NVIDIA and 10 AMD (see "Profile inventory" below; 14 NVIDIA and
+  3 AMD are read from hardware); `vgpu list-gpus`, `vgpu info --gpu <id> [--json]`
   (`tests/unit/test_profile.cpp`)
 - M2 runtime core: devices, primary-context model, sparse virtual VRAM,
   H2D/D2H/D2D, OOB/UAF/double-free/interior-free/misalignment diagnostics
@@ -1924,7 +1924,7 @@ public headers, tested by their authors under ASan + UBSan, and are awaiting CI 
 
 ## Profile inventory (rev 6)
 
-45 profiles (rev 5 counted 23 at 2ce1f45; rev 6 adds eleven NVIDIA profiles and rev 7 ten more, built from public documents only, all `verified: false`, see nvidia/docs/profiles.md). `verified: true` means the
+48 profiles (38 NVIDIA, 10 AMD; 14 and 3 read from a card) (rev 5 counted 23 at 2ce1f45; rev 6 adds eleven NVIDIA profiles and rev 7 ten more, built from public documents only, all `verified: false`, see nvidia/docs/profiles.md). `verified: true` means the
 profile's values were read from a physical device (see "Hardware characterization").
 
 | id | vendor | arch | cc / gfx | verified |
@@ -1956,7 +1956,8 @@ profile's values were read from a physical device (see "Hardware characterizatio
 | `nvidia/a40` | NVIDIA | Ampere | 8.6 | **no** |
 | `nvidia/a30` | NVIDIA | Ampere | 8.0 | **no** (SM count derived from OEM Tensor Core counts) |
 | `nvidia/rtx2080ti` | NVIDIA | Turing | 7.5 | **no** |
-| `nvidia/rtx-pro-6000-server` | NVIDIA | Blackwell | 12.0 | **no** (the g7e part; the rental was not obtained, see nvidia/docs/profiles.md) |
+| `nvidia/rtx-pro-6000-server` | NVIDIA | Blackwell | 12.0 | yes (the g7e part, read on an AWS g7e.2xlarge on 2026-10-09; see nvidia/docs/profiles.md) |
+| `nvidia/rtx-pro-4500` | NVIDIA | Blackwell | 12.0 | yes (read on an AWS g7.2xlarge, 2026-10-18) |
 | `nvidia/rtx-pro-6000-max-q` | NVIDIA | Blackwell | 12.0 | **no** |
 | `nvidia/rtx6000-ada` | NVIDIA | Ada | 8.9 | **no** |
 | `nvidia/rtx-a6000` | NVIDIA | Ampere | 8.6 | **no** |
