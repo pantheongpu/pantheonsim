@@ -107,6 +107,48 @@ TIER_K(k_cvt_u32_f32, {
 TIER_K(k_cvt_f32_u, reinterpret_cast<F32*>(d)[i] = static_cast<float>(a[i]))
 TIER_K(k_cvt_f32_i, reinterpret_cast<F32*>(d)[i] = static_cast<float>(static_cast<int32_t>(a[i])))
 TIER_K(k_cvt_f32_ubyte0, reinterpret_cast<F32*>(d)[i] = static_cast<float>(a[i] & 0xFF))
+// ---- 16-bit integer operations of the CDNA parts (a 16-bit result fills the low half of the register and zeroes the high one)
+TIER_K(k_add_u16, d[i] = static_cast<uint16_t>(static_cast<uint16_t>(a[i]) + static_cast<uint16_t>(b[i])))
+TIER_K(k_sub_u16, d[i] = static_cast<uint16_t>(static_cast<uint16_t>(a[i]) - static_cast<uint16_t>(b[i])))
+TIER_K(k_subrev_u16, d[i] = static_cast<uint16_t>(static_cast<uint16_t>(b[i]) - static_cast<uint16_t>(a[i])))
+TIER_K(k_lshlrev_b16, d[i] = static_cast<uint16_t>(b[i] << (a[i] & 15)))
+TIER_K(k_lshrrev_b16, d[i] = static_cast<uint16_t>(b[i]) >> (a[i] & 15))
+TIER_K(k_ashrrev_i16, d[i] = static_cast<uint16_t>(static_cast<int16_t>(b[i]) >> (a[i] & 15)))
+TIER_K(k_mul_lo_u16, d[i] = static_cast<uint16_t>(a[i] * b[i]))
+TIER_K(k_min_u16, d[i] = std::min(static_cast<uint16_t>(a[i]), static_cast<uint16_t>(b[i])))
+TIER_K(k_max_u16, d[i] = std::max(static_cast<uint16_t>(a[i]), static_cast<uint16_t>(b[i])))
+TIER_K(k_min_i16, d[i] = static_cast<uint16_t>(std::min(static_cast<int16_t>(a[i]), static_cast<int16_t>(b[i]))))
+TIER_K(k_max_i16, d[i] = static_cast<uint16_t>(std::max(static_cast<int16_t>(a[i]), static_cast<int16_t>(b[i]))))
+TIER_K(k_pack_b32_f16, d[i] = (a[i] & 0xFFFFu) | (b[i] & 0xFFFFu) << 16)
+// v_bfe_i32: the field, with its top bit carried into the rest of the register.
+TIER_K(k_bfe_i, {
+  const uint32_t start = b[i] & 31, width = c[i] & 31;
+  uint32_t out = 0;
+  if (width != 0) {
+    const uint32_t shifted = static_cast<uint32_t>(static_cast<int32_t>(a[i]) >> start);
+    out = shifted & ((1u << width) - 1);
+    if (out >> (width - 1) & 1) out |= ~((1u << width) - 1);
+  }
+  d[i] = out;
+})
+// v_perm_b32: four bytes chosen out of the eight the two sources make (the first holding the top four); selectors 8 to 11 ask for the
+// sign of a byte spread over a byte, 12 for a zero byte, and more for a byte of ones.
+TIER_K(k_perm, {
+  const uint64_t bytes = static_cast<uint64_t>(a[i]) << 32 | b[i];
+  const uint32_t sel = c[i];
+  uint32_t out = 0;
+  for (uint32_t k = 0; k < 4; ++k) {
+    const uint32_t which = (sel >> (8 * k)) & 0xFF;
+    const uint32_t byte = which < 8 ? (bytes >> (8 * which)) & 0xFF
+                          : which < 12 ? ((bytes >> (8 * (2 * (which - 8) + 1) + 7)) & 1) * 0xFFu
+                          : which == 12 ? 0u
+                                        : 0xFFu;
+    out |= byte << (8 * k);
+  }
+  d[i] = out;
+})
+// v_cvt_f16_f32: the float (source modifiers applied to it) rounded to a half, in the low half of the register.
+TIER_K(k_cvt_f16_f32, d[i] = vgpu::amd::packed::float_to_half(reinterpret_cast<const F32*>(a)[i]))
 
 // ---- binary32 (one IEEE operation each; the handler throws away a NaN result and lets the interpreter decide the bits)
 #define TIER_F(name, ...)                                                                                    \
@@ -128,6 +170,36 @@ TIER_F(k_ffma, r[i] = __builtin_fmaf(a[i], b[i], c[i]))
 TIER_F(k_fmin, r[i] = __builtin_fminf(a[i], b[i]))
 TIER_F(k_fmax, r[i] = __builtin_fmaxf(a[i], b[i]))
 TIER_F(k_frcp, r[i] = 1.0f / a[i])
+// (the one-input functions of the vector unit: the host's own, as the interpreter calls them; a NaN result goes back to the interpreter)
+TIER_F(k_fsqrt, r[i] = __builtin_sqrtf(a[i]))
+TIER_F(k_frsq, r[i] = 1.0f / __builtin_sqrtf(a[i]))
+TIER_F(k_fexp, r[i] = __builtin_exp2f(a[i]))
+TIER_F(k_flog, r[i] = __builtin_log2f(a[i]))
+// (floor, ceil and trunc of a value of 2^23 or more in magnitude are the value, as the interpreter's floor_inline and the rest have it)
+TIER_F(k_ffloor, r[i] = __builtin_fabsf(a[i]) < 8388608.0f ? __builtin_floorf(a[i]) : a[i])
+TIER_F(k_fceil, r[i] = __builtin_fabsf(a[i]) < 8388608.0f ? __builtin_ceilf(a[i]) : a[i])
+TIER_F(k_ftrunc, r[i] = __builtin_fabsf(a[i]) < 8388608.0f ? __builtin_truncf(a[i]) : a[i])
+TIER_F(k_frndne, r[i] = __builtin_nearbyintf(a[i]))
+// (x - floor(x) held below 1; an infinity gives a NaN, which goes back)
+TIER_F(k_ffract, r[i] = __builtin_fminf(a[i] - __builtin_floorf(a[i]), 0x1.fffffep-1f))
+// v_sin_f32 and v_cos_f32 count their angle in turns. The host's sin and cos of the angle in radians (the architectures the guides
+// cover keep only the fraction of a turn, which is exact in a double, so the argument stays small).
+TIER_F(k_fsin_r, r[i] = static_cast<float>(__builtin_sin(static_cast<double>(a[i]) * 6.283185307179586476925286766559)))
+TIER_F(k_fsin_t, {
+  const double turns = static_cast<double>(a[i]);
+  const double frac = turns == 0 ? turns : turns - __builtin_trunc(turns);
+  r[i] = static_cast<float>(__builtin_sin(frac * 6.283185307179586476925286766559));
+})
+TIER_F(k_fcos_r, r[i] = static_cast<float>(__builtin_cos(static_cast<double>(a[i]) * 6.283185307179586476925286766559)))
+TIER_F(k_fcos_t, {
+  const double turns = static_cast<double>(a[i]);
+  const double frac = turns == 0 ? turns : turns - __builtin_trunc(turns);
+  r[i] = static_cast<float>(__builtin_cos(frac * 6.283185307179586476925286766559));
+})
+// v_cvt_f32_f16: the half in the low 16 bits of the register, widened (a NaN stays one, quieted, its payload shifted up).
+TIER_F(k_fcvt_f32_f16, r[i] = vgpu::amd::packed::half_to_float(static_cast<uint16_t>(ua[i])))
+// (the exponent is the second source's bits as an integer)
+TIER_F(k_fldexp, r[i] = __builtin_ldexpf(a[i], static_cast<int32_t>(ub[i])))
 
 // ---- binary64 on 64-bit lanes (the handler gathers the register pairs)
 #define TIER_D(name, ...)                                                                                    \
@@ -309,7 +381,90 @@ static const Cmp64Fn kCmpI64[8] = {cmp_i64<0, true>, cmp_i64<1, true>, cmp_i64<2
 static const Cmp64Fn kCmpF64[16] = {cmp_f64<0>, cmp_f64<1>, cmp_f64<2>,  cmp_f64<3>,  cmp_f64<4>,  cmp_f64<5>,  cmp_f64<6>,  cmp_f64<7>,
                                     cmp_f64<8>, cmp_f64<9>, cmp_f64<10>, cmp_f64<11>, cmp_f64<12>, cmp_f64<13>, cmp_f64<14>, cmp_f64<15>};
 
+// 16-bit integers (the low half of each register), and halves (widened to float, so that every test is the float's), and the class tests.
+template <int T, bool Signed>
+static uint64_t cmp_i16(const uint32_t* a, const uint32_t* b, unsigned n) {
+  uint64_t out = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    bool r;
+    if constexpr (Signed) {
+      const int16_t x = static_cast<int16_t>(a[i]), y = static_cast<int16_t>(b[i]);
+      r = T == 0 ? false : T == 1 ? x < y : T == 2 ? x == y : T == 3 ? x <= y : T == 4 ? x > y : T == 5 ? x != y : T == 6 ? x >= y : true;
+    } else {
+      const uint16_t x = static_cast<uint16_t>(a[i]), y = static_cast<uint16_t>(b[i]);
+      r = T == 0 ? false : T == 1 ? x < y : T == 2 ? x == y : T == 3 ? x <= y : T == 4 ? x > y : T == 5 ? x != y : T == 6 ? x >= y : true;
+    }
+    out |= static_cast<uint64_t>(r) << i;
+  }
+  return out;
+}
+template <int T>
+static uint64_t cmp_f16(const uint32_t* a, const uint32_t* b, unsigned n) {
+  uint64_t out = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const float x = vgpu::amd::packed::half_to_float(static_cast<uint16_t>(a[i])), y = vgpu::amd::packed::half_to_float(static_cast<uint16_t>(b[i]));
+    bool r;
+    switch (T) {
+      case 0: r = false; break;
+      case 1: r = x < y; break;
+      case 2: r = x == y; break;
+      case 3: r = x <= y; break;
+      case 4: r = x > y; break;
+      case 5: r = x < y || x > y; break;
+      case 6: r = x >= y; break;
+      case 7: r = x == x && y == y; break;
+      case 8: r = x != x || y != y; break;
+      case 9: r = !(x >= y); break;
+      case 10: r = !(x < y || x > y); break;
+      case 11: r = !(x > y); break;
+      case 12: r = !(x <= y); break;
+      case 13: r = !(x == y); break;
+      case 14: r = !(x < y); break;
+      default: r = true; break;
+    }
+    out |= static_cast<uint64_t>(r) << i;
+  }
+  return out;
+}
+// v_cmp_class_f32: which of ten kinds of number the value is (signaling NaN, quiet NaN, -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf: one bit
+// each, in that order) against the mask in the second operand.
+static uint64_t cmp_class_f32(const uint32_t* a, const uint32_t* m, unsigned n) {
+  uint64_t out = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t b = a[i], ab = b & 0x7FFFFFFFu;
+    const bool negative = b >> 31;
+    uint32_t bit;
+    if (ab > 0x7F800000u) bit = (b & 0x400000u) ? 1u << 1 : 1u << 0;
+    else if (ab == 0x7F800000u) bit = negative ? 1u << 2 : 1u << 9;
+    else if (ab == 0) bit = negative ? 1u << 5 : 1u << 6;
+    else if (ab < 0x00800000u) bit = negative ? 1u << 4 : 1u << 7;
+    else bit = negative ? 1u << 3 : 1u << 8;
+    out |= static_cast<uint64_t>((m[i] & bit) != 0) << i;
+  }
+  return out;
+}
+static uint64_t cmp_class_f16(const uint32_t* a, const uint32_t* m, unsigned n) {
+  uint64_t out = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t b = a[i] & 0xFFFFu, ab = b & 0x7FFFu;
+    const bool negative = b >> 15;
+    uint32_t bit;
+    if (ab > 0x7C00u) bit = (b & 0x200u) ? 1u << 1 : 1u << 0;
+    else if (ab == 0x7C00u) bit = negative ? 1u << 2 : 1u << 9;
+    else if (ab == 0) bit = negative ? 1u << 5 : 1u << 6;
+    else if (ab < 0x0400u) bit = negative ? 1u << 4 : 1u << 7;
+    else bit = negative ? 1u << 3 : 1u << 8;
+    out |= static_cast<uint64_t>((m[i] & bit) != 0) << i;
+  }
+  return out;
+}
 using CmpFn = uint64_t (*)(const uint32_t*, const uint32_t*, unsigned);
+static const CmpFn kCmpI16[8] = {cmp_i16<0, true>, cmp_i16<1, true>, cmp_i16<2, true>, cmp_i16<3, true>,
+                                 cmp_i16<4, true>, cmp_i16<5, true>, cmp_i16<6, true>, cmp_i16<7, true>};
+static const CmpFn kCmpU16[8] = {cmp_i16<0, false>, cmp_i16<1, false>, cmp_i16<2, false>, cmp_i16<3, false>,
+                                 cmp_i16<4, false>, cmp_i16<5, false>, cmp_i16<6, false>, cmp_i16<7, false>};
+static const CmpFn kCmpF16[16] = {cmp_f16<0>, cmp_f16<1>, cmp_f16<2>,  cmp_f16<3>,  cmp_f16<4>,  cmp_f16<5>,  cmp_f16<6>,  cmp_f16<7>,
+                                  cmp_f16<8>, cmp_f16<9>, cmp_f16<10>, cmp_f16<11>, cmp_f16<12>, cmp_f16<13>, cmp_f16<14>, cmp_f16<15>};
 static const CmpFn kCmpU32[8] = {cmp_i32<0, false>, cmp_i32<1, false>, cmp_i32<2, false>, cmp_i32<3, false>,
                                  cmp_i32<4, false>, cmp_i32<5, false>, cmp_i32<6, false>, cmp_i32<7, false>};
 static const CmpFn kCmpI32[8] = {cmp_i32<0, true>, cmp_i32<1, true>, cmp_i32<2, true>, cmp_i32<3, true>,

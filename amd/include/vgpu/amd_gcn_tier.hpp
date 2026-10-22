@@ -84,7 +84,7 @@ struct Op {
   uint32_t sub = 0;            // handler-specific (a comparison's test, a shift count, ...)
   int32_t off0 = 0, off1 = 0;  // a memory instruction's offsets
   uint8_t words = 0;           // ... and how many registers it moves
-  uint8_t mach = 0;            // 1: a global load, 2: a global store (the interpreter's Machine runs them, with the name work done)
+  uint8_t mach = 0;            // the Machine runs it: 1 a global load, 2 a global store (name work done at decode), 3 s_barrier, 6 s_endpgm, 7 scalar memory
   bool store = false;          // a plain store (it takes Wave::store_gate)
 };
 

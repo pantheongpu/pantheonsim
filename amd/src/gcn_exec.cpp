@@ -11188,7 +11188,7 @@ struct Machine {
   // Returns 0 when the interpreter is to run the instruction, 1 when it is done, 2 when it is done and the wave gives up its turn.
   int tier_step(Wave& w, Group& g, const Inst& in) {
     if (w.vgpr_msb || w.gpr_idx || w.vskip || !FloatMode::is_default(w.mode)) return 0;
-    if (in.fast.mach) return in.fast.mach == 3 ? tier_barrier(w, in) : tier_global(w, g, in);
+    if (in.fast.mach) return tier_mach(w, g, in);
     gcn::tier::Regs r{reinterpret_cast<uint32_t (*)[64]>(w.vgpr.r.data()), w.sgpr, &w.vcc, &w.exec, &w.pc, &w.scc, w.lanes,
                       &w.loads_in_flight, &w.soft_yield, static_cast<uint32_t>(g.waves.size()), &w.store_gate, g.lds.data(), g.lds.size(),
                       in.target};

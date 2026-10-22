@@ -21,6 +21,7 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "packed_math.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/simd/simd.hpp"
 
@@ -120,8 +121,8 @@ constexpr uint32_t kVgprs = 256;
   X(MAX_I, k_max_i) X(BFI, k_bfi) X(ALIGNBIT, k_alignbit) X(ALIGNBYTE, k_alignbyte) X(ADD3, k_add3) X(OR3, k_or3)  \
   X(AND_OR, k_and_or) X(XAD, k_xad) X(LSHL_OR, k_lshl_or) X(LSHL_ADD, k_lshl_add) X(ADD_LSHL, k_add_lshl)          \
   X(BCNT, k_bcnt) X(BFE_U, k_bfe_u) X(MED3_U, k_med3_u) X(MED3_I, k_med3_i) X(MIN3_U, k_min3_u)                     \
-  X(MAX3_U, k_max3_u) X(XOR3, k_xor3) X(MBCNT_LO, k_mbcnt_lo) X(MBCNT_HI, k_mbcnt_hi) X(CVT_I32_F32, k_cvt_i32_f32) X(CVT_U32_F32, k_cvt_u32_f32) X(CVT_F32_U, k_cvt_f32_u) X(CVT_F32_I, k_cvt_f32_i) X(CVT_F32_UBYTE0, k_cvt_f32_ubyte0)
-#define TIER_F32_OPS(X) X(FADD, k_fadd) X(FSUB, k_fsub) X(FSUBREV, k_fsubrev) X(FMUL, k_fmul) X(FMA, k_ffma) X(FMIN, k_fmin) X(FMAX, k_fmax) X(FRCP, k_frcp)
+  X(MAX3_U, k_max3_u) X(XOR3, k_xor3) X(MBCNT_LO, k_mbcnt_lo) X(MBCNT_HI, k_mbcnt_hi) X(CVT_I32_F32, k_cvt_i32_f32) X(CVT_U32_F32, k_cvt_u32_f32) X(CVT_F32_U, k_cvt_f32_u) X(CVT_F32_I, k_cvt_f32_i) X(CVT_F32_UBYTE0, k_cvt_f32_ubyte0) X(ADD_U16, k_add_u16) X(SUB_U16, k_sub_u16) X(SUBREV_U16, k_subrev_u16) X(LSHLREV_B16, k_lshlrev_b16) X(LSHRREV_B16, k_lshrrev_b16) X(ASHRREV_I16, k_ashrrev_i16) X(MUL_LO_U16, k_mul_lo_u16) X(MIN_U16, k_min_u16) X(MAX_U16, k_max_u16) X(MIN_I16, k_min_i16) X(MAX_I16, k_max_i16) X(PACK_B32_F16, k_pack_b32_f16) X(BFE_I, k_bfe_i) X(PERM, k_perm) X(CVT_F16_F32, k_cvt_f16_f32)
+#define TIER_F32_OPS(X) X(FADD, k_fadd) X(FSUB, k_fsub) X(FSUBREV, k_fsubrev) X(FMUL, k_fmul) X(FMA, k_ffma) X(FMIN, k_fmin) X(FMAX, k_fmax) X(FRCP, k_frcp) X(FSQRT, k_fsqrt) X(FRSQ, k_frsq) X(FEXP, k_fexp) X(FLOG, k_flog) X(FFLOOR, k_ffloor) X(FCEIL, k_fceil) X(FTRUNC, k_ftrunc) X(FRNDNE, k_frndne) X(FFRACT, k_ffract) X(FSIN_R, k_fsin_r) X(FSIN_T, k_fsin_t) X(FCOS_R, k_fcos_r) X(FCOS_T, k_fcos_t) X(FLDEXP, k_fldexp) X(FCVT_F32_F16, k_fcvt_f32_f16)
 #define TIER_F64_OPS(X) X(DADD, k_dadd) X(DMUL, k_dmul) X(DFMA, k_dfma)
 #define TIER_L64_OPS(X) X(MOV, l_mov) X(LSHLREV, l_lshlrev) X(LSHRREV, l_lshrrev) X(ASHRREV, l_ashrrev) X(LSHL_ADD, l_lshl_add) X(LSHL_ADD_G, l_lshl_add_g) X(CVT_F64_U, l_cvt_f64_u) X(CVT_F64_I, l_cvt_f64_i)
 
@@ -168,14 +169,21 @@ struct Tables {
   const Cmp64Fn* cmp_u64;
   const Cmp64Fn* cmp_i64;
   const Cmp64Fn* cmp_f64;
+  const CmpFn* cmp_i16;
+  const CmpFn* cmp_u16;
+  const CmpFn* cmp_f16;
+  CmpFn cmp_class32;
+  CmpFn cmp_class16;
 };
 const Tables& tables() {
   static const Tables base = {base_impl::base_impl_ns::kIntTab, base_impl::base_impl_ns::kF32Tab, base_impl::base_impl_ns::kF64Tab,
                               base_impl::base_impl_ns::kL64Tab, base_impl::base_impl_ns::kCmpU32, base_impl::base_impl_ns::kCmpI32,
-                              base_impl::base_impl_ns::kCmpF32, base_impl::base_impl_ns::kCmpU64, base_impl::base_impl_ns::kCmpI64, base_impl::base_impl_ns::kCmpF64};
+                              base_impl::base_impl_ns::kCmpF32, base_impl::base_impl_ns::kCmpU64, base_impl::base_impl_ns::kCmpI64, base_impl::base_impl_ns::kCmpF64,
+                              base_impl::base_impl_ns::kCmpI16, base_impl::base_impl_ns::kCmpU16, base_impl::base_impl_ns::kCmpF16, base_impl::base_impl_ns::cmp_class_f32, base_impl::base_impl_ns::cmp_class_f16};
   static const Tables avx2 = {avx2_impl::avx2_impl_ns::kIntTab, avx2_impl::avx2_impl_ns::kF32Tab, avx2_impl::avx2_impl_ns::kF64Tab,
                               avx2_impl::avx2_impl_ns::kL64Tab, avx2_impl::avx2_impl_ns::kCmpU32, avx2_impl::avx2_impl_ns::kCmpI32,
-                              avx2_impl::avx2_impl_ns::kCmpF32, avx2_impl::avx2_impl_ns::kCmpU64, avx2_impl::avx2_impl_ns::kCmpI64, avx2_impl::avx2_impl_ns::kCmpF64};
+                              avx2_impl::avx2_impl_ns::kCmpF32, avx2_impl::avx2_impl_ns::kCmpU64, avx2_impl::avx2_impl_ns::kCmpI64, avx2_impl::avx2_impl_ns::kCmpF64,
+                              avx2_impl::avx2_impl_ns::kCmpI16, avx2_impl::avx2_impl_ns::kCmpU16, avx2_impl::avx2_impl_ns::kCmpF16, avx2_impl::avx2_impl_ns::cmp_class_f32, avx2_impl::avx2_impl_ns::cmp_class_f16};
   return simd::enabled() && simd::level() == simd::Level::Avx2 ? avx2 : base;
 }
 
@@ -1041,7 +1049,7 @@ int b_vccnz(const Op&, Regs& R) { if (R.lanes == 32 ? static_cast<uint32_t>(*R.v
 
 // ---- Classification
 
-enum class Cat { None, Carry, Lane, Global, Ds, Pk, Int, F32, F64, L64, Mad64, Cmp, Cndmask, Readfirstlane, S2, ScalarCmp, Saveexec, Branch, Sopk, Cmpk, Bitcmp };
+enum class Cat { None, Carry, Lane, Global, Ds, Pk, Int, F32, F64, L64, Mad64, Cmp, Cndmask, Readfirstlane, S2, ScalarCmp, Saveexec, Branch, Sopk, Cmpk, Bitcmp, Endpgm };
 
 struct Entry {
   Cat cat = Cat::None;
@@ -1058,6 +1066,11 @@ constexpr uint32_t kConstMid = 4;    // fmamk: source 1 is the instruction's own
 constexpr uint32_t kConstLast = 8;   // fmaak: source 2 is the instruction's own constant
 constexpr uint32_t kFloatSrc = 32;   // an integer result from a float source: the source's modifiers apply
 constexpr uint32_t kIgnoreMods = 16;
+constexpr uint32_t kTrigTurns = 128;  // v_sin_f32, v_cos_f32: the kernel after the listed one on the architectures whose guides count the angle in whole turns (gfx942, gfx950)
+constexpr uint32_t kIntSrc1 = 256;    // v_ldexp_f32: the second source is an integer (its bits, no float modifiers)
+constexpr uint32_t kCdnaOnly = 512;   // 16-bit forms: only the CDNA parts (gfx90a, gfx942, gfx950), whose 16-bit results fill the low half of the register
+constexpr uint32_t kNoOmod = 1024;    // the instruction's output modifier means something the kernel does not do
+constexpr uint32_t kRawSrc = 2048;    // the source is not a float of 32 bits (a half): float modifiers on it would flip the wrong bit
 constexpr uint32_t kMinMax = 64;     // (v_min_f32, v_max_f32: opposite zeros go to the interpreter) // the interpreter ignores omod and clamp on this one
 
 const std::unordered_map<std::string_view, Entry>& table() {
@@ -1113,6 +1126,21 @@ const std::unordered_map<std::string_view, Entry>& table() {
     I("v_cvt_f32_u32_e32", CVT_F32_U, 1);
     I("v_cvt_f32_i32_e32", CVT_F32_I, 1);
     I("v_cvt_f32_ubyte0_e32", CVT_F32_UBYTE0, 1);
+    I("v_add_u16_e32", ADD_U16, 2, kNoClamp | kCdnaOnly);
+    I("v_sub_u16_e32", SUB_U16, 2, kNoClamp | kCdnaOnly);
+    I("v_subrev_u16_e32", SUBREV_U16, 2, kNoClamp | kCdnaOnly);
+    I("v_lshlrev_b16_e32", LSHLREV_B16, 2, kCdnaOnly);
+    I("v_lshrrev_b16_e32", LSHRREV_B16, 2, kCdnaOnly);
+    I("v_ashrrev_i16_e32", ASHRREV_I16, 2, kCdnaOnly);
+    I("v_mul_lo_u16_e32", MUL_LO_U16, 2, kCdnaOnly);
+    I("v_min_u16_e32", MIN_U16, 2, kCdnaOnly);
+    I("v_max_u16_e32", MAX_U16, 2, kCdnaOnly);
+    I("v_min_i16_e32", MIN_I16, 2, kCdnaOnly);
+    I("v_max_i16_e32", MAX_I16, 2, kCdnaOnly);
+    I("v_pack_b32_f16", PACK_B32_F16, 2, kCdnaOnly);
+    I("v_bfe_i32", BFE_I, 3);
+    I("v_perm_b32", PERM, 3);
+    I("v_cvt_f16_f32_e32", CVT_F16_F32, 1, kFloatSrc | kNoClamp | kNoOmod | kCdnaOnly);
     // The same operations in their VOP3 form (the sources may be any of the operands, the modifiers and the constants the short form's are).
     I("v_mov_b32_e64", MOV, 1);
     I("v_not_b32_e64", NOT, 1);
@@ -1139,6 +1167,19 @@ const std::unordered_map<std::string_view, Entry>& table() {
     F("v_min_f32_e64", FMIN, 2, kMinMax);
     F("v_rcp_f32_e64", FRCP, 1);
     F("v_rcp_iflag_f32_e32", FRCP, 1);
+    F("v_sqrt_f32_e32", FSQRT, 1);
+    F("v_rsq_f32_e32", FRSQ, 1);
+    F("v_exp_f32_e32", FEXP, 1);
+    F("v_log_f32_e32", FLOG, 1);
+    F("v_floor_f32_e32", FFLOOR, 1);
+    F("v_ceil_f32_e32", FCEIL, 1);
+    F("v_trunc_f32_e32", FTRUNC, 1);
+    F("v_rndne_f32_e32", FRNDNE, 1);
+    F("v_fract_f32_e32", FFRACT, 1);
+    F("v_sin_f32_e32", FSIN_R, 1, kTrigTurns);
+    F("v_cos_f32_e32", FCOS_R, 1, kTrigTurns);
+    F("v_ldexp_f32", FLDEXP, 2, kIntSrc1);
+    F("v_cvt_f32_f16_e32", FCVT_F32_F16, 1, kRawSrc | kCdnaOnly);
     F("v_rcp_iflag_f32_e64", FRCP, 1);
     m["v_cndmask_b32_e64"] = {Cat::Cndmask, 0, 3};
     F("v_add_f32_e32", FADD, 2);
@@ -1283,6 +1324,7 @@ const std::unordered_map<std::string_view, Entry>& table() {
     m["s_bitcmp1_b32"] = {Cat::Bitcmp, 2, 2};
     m["s_bitcmp0_b64"] = {Cat::Bitcmp, 1, 2};
     m["s_bitcmp1_b64"] = {Cat::Bitcmp, 3, 2};
+    m["s_endpgm"] = {Cat::Endpgm, 0, 0};
     const auto C = [&](std::string_view n, ScalarCmp k) { m[n] = {Cat::ScalarCmp, static_cast<int>(k), 2}; };
     C("s_cmp_eq_u32", kEqU32);
     C("s_cmp_lg_u32", kLgU32);
@@ -1374,6 +1416,18 @@ bool lane_src32(const Operand& o, Src& s, bool float_mods) {
   if (float_mods) s.neg = o.neg, s.abs = o.abs;
   return true;
 }
+// A source a 16-bit float instruction reads (lane_half, lane_half_f): an inline float constant is a half, in the low 16 bits.
+bool lane_src32_half(const Operand& o, Src& s) {
+  if (o.kind != OperandKind::InlineFloat) return lane_src32(o, s, false);
+  if (o.sel != 6 || o.sext || o.half || o.bits16 || o.hi) return false;
+  s = Src();
+  s.kind = kConst;
+  const _Float16 h = static_cast<_Float16>(o.fvalue);
+  uint16_t bits;
+  std::memcpy(&bits, &h, 2);
+  s.value = bits;
+  return true;
+}
 // The same for a 64-bit consumer (lane_src64).
 bool lane_src64(const Operand& o, Src& s, bool float_mods) {
   if (o.sel != 6 || o.sext || o.half || o.bits16 || o.hi) return false;
@@ -1451,6 +1505,8 @@ bool vgpr_dst(const Operand& o, Src& s, uint32_t regs) {
 
 namespace {
 
+bool cdna(const Inst& in) { return in.arch == gcn::Target::Gfx90a || in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950; }
+
 // A comparison: named by its opcode, as compare() reads it. False for a type or test the tier does not model.
 void classify_cmp(Inst& in, const Tables& T) {
   if (in.src.size() < 2 || in.dst.size() > 1) return;
@@ -1462,7 +1518,19 @@ void classify_cmp(Inst& in, const Tables& T) {
   Op& f = in.fast;
   CmpFn k = nullptr;
   bool fmods = false;
-  if (op >= 0x40 && op < 0x50) k = T.cmp_f32[op & 0xF], fmods = true;
+  bool raw16 = false;   // (a half or a 16-bit integer source: float modifiers would act on the wrong bits)
+  if (op == 0x10 || op == 0x14) {   // v_cmp_class_f32, v_cmp_class_f16: the mask is the second operand's bits
+    if (op == 0x14 && !cdna(in)) return;
+    k = op == 0x10 ? T.cmp_class32 : T.cmp_class16;
+    fmods = op == 0x10;
+    raw16 = op == 0x14;
+  } else if (op >= 0x20 && op < 0x30) {
+    if (!cdna(in)) return;
+    k = T.cmp_f16[op & 0xF], raw16 = true;
+  } else if (op >= 0xA0 && op < 0xB0) {
+    if (!cdna(in)) return;
+    k = op < 0xA8 ? T.cmp_i16[op & 7] : T.cmp_u16[op & 7], raw16 = true;
+  } else if (op >= 0x40 && op < 0x50) k = T.cmp_f32[op & 0xF], fmods = true;
   else if (op >= 0xC0 && op < 0xC8) k = T.cmp_i32[op & 7];
   else if (op >= 0xC8 && op < 0xD0) k = T.cmp_u32[op & 7];
   else if ((op >= 0x60 && op < 0x70) || (op >= 0xE0 && op < 0xF0)) {
@@ -1476,7 +1544,11 @@ void classify_cmp(Inst& in, const Tables& T) {
     f.run = h_cmp64;
     return;
   } else return;
-  if (!lane_src32(in.src[0], f.src[0], fmods) || !lane_src32(in.src[1], f.src[1], fmods)) return void(f = Op());
+  if (raw16 && (in.src[0].neg || in.src[0].abs || in.src[1].neg || in.src[1].abs)) return void(f = Op());
+  const bool half_src = op == 0x14 || (op >= 0x20 && op < 0x30);
+  if (half_src ? !lane_src32_half(in.src[0], f.src[0]) || !lane_src32_half(in.src[1], f.src[1])
+               : !lane_src32(in.src[0], f.src[0], fmods) || !lane_src32(in.src[1], f.src[1], op == 0x10 ? false : fmods))
+    return void(f = Op());
   if (!in.dst.empty() && !scalar_dst(in.dst[0], f.dst)) return void(f = Op());
   f.kern = reinterpret_cast<AnyFn>(k);
   f.sub = writes_exec;
@@ -1527,6 +1599,12 @@ void tier_classify(Inst& in) {
     if (in.enc == Enc::Vopc || in.enc == Enc::Vop3) classify_cmp(in, T);
     return;
   }
+  if (in.enc == Enc::Smem) {   // (scalar memory: the Machine's scalar_load, without step()'s frame; the real-time clock reads differently each time)
+    if (in.mem.smem == SmemKind::Time && in.mem.smem_realtime) return;
+    f.mach = 7;
+    f.run = h_never;
+    return;
+  }
   static const Entry kCarry = {Cat::Carry, 0, 0, 0, nullptr, 0};
   const Entry* ep = nullptr;
   if (vector_enc && in.name.find("_co_u32") != std::string::npos) {   // (carry_alu takes these first, under their own names)
@@ -1550,12 +1628,20 @@ void tier_classify(Inst& in) {
       const bool is_f = e.cat == Cat::F32;
       if (!vgpr_dst(in.dst[0], f.dst, 1)) return fail();
       if ((e.flags & kNoClamp) && in.clamp) return fail();
+      if ((e.flags & kCdnaOnly) && in.arch != gcn::Target::Gfx90a && in.arch != gcn::Target::Gfx942 && in.arch != gcn::Target::Gfx950) return fail();
+      if ((e.flags & kNoOmod) && in.omod) return fail();
+      if ((e.flags & kRawSrc) && (in.src[0].neg || in.src[0].abs)) return fail();
       // (CDNA3 and CDNA4 apply the clamp bit to the integer instructions that have one and to the conversions to float: the interpreter's.)
       if (in.clamp && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (!is_f || (e.flags & kIgnoreMods))) return fail();
       // (gfx942 and gfx950 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA3 and CDNA4 guides, 6.5: the interpreter's.)
       if (in.omod && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && !(e.flags & kIgnoreMods)) return fail();
-      for (int k = 0; k < e.arity; ++k)
-        if (!lane_src32(in.src[k], f.src[k], is_f || (e.flags & kFloatSrc))) return fail();
+      for (int k = 0; k < e.arity; ++k) {
+        if (e.flags & kRawSrc) {   // (a half: its inline float constants too)
+          if (!lane_src32_half(in.src[k], f.src[k])) return fail();
+        } else if (!lane_src32(in.src[k], f.src[k], (is_f && !((e.flags & kIntSrc1) && k == 1)) || (e.flags & kFloatSrc))) {
+          return fail();
+        }
+      }
       if (is_f) {
         if (e.flags & kFmac) f.src[2] = Src(), f.src[2].kind = kVgpr, f.src[2].index = f.dst.index;
         if (e.flags & kConstLast) {
@@ -1568,7 +1654,8 @@ void tier_classify(Inst& in) {
         }
         if (!(e.flags & kIgnoreMods)) f.omod = in.omod, f.clamp = in.clamp;
         if (e.flags & kMinMax) f.sub = 1;
-        f.kern = reinterpret_cast<AnyFn>(T.f32[e.k]);
+        const int kernel = (e.flags & kTrigTurns) && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) ? e.k + 1 : e.k;
+        f.kern = reinterpret_cast<AnyFn>(T.f32[kernel]);
         f.run = h_f32;
       } else {
         f.kern = reinterpret_cast<AnyFn>(T.ints[e.k]);
@@ -1774,6 +1861,12 @@ void tier_classify(Inst& in) {
       f.sub = static_cast<uint32_t>(e.k);
       f.run = s_cmp;
       f.unit = kUnitSalu;
+      return;
+    }
+    case Cat::Endpgm: {
+      if (in.enc != Enc::Sopp) return;
+      f.mach = 6;   // (the Machine ends the wave)
+      f.run = h_never;
       return;
     }
     case Cat::Sopk: {
