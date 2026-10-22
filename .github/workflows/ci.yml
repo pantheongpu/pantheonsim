@@ -583,7 +583,7 @@ jobs:
         # them here when they are.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|amd_rocprofiler_pcsampling|amd_rvs)$'
+          RUNNER_SKIPS_OK: '^(bench_amd_counters|e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|amd_rocprofiler_pcsampling|amd_rvs)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 4 -m 2)" \

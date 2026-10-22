@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vgpu/amd_codeobject.hpp"
@@ -44,6 +45,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   vgpu::MemoryManager mem(8ull << 30);
+  std::vector<std::pair<uint64_t, uint64_t>> buffers;   // (address, bytes) of the b: arguments, for VGPU_BENCH_DUMP
   std::vector<uint8_t> kernarg(k->kernarg_size, 0);
   size_t arg = 0;
   for (int i = 5; i < argc; ++i, ++arg) {
@@ -58,6 +60,13 @@ int main(int argc, char** argv) {
     if (s.rfind("b:", 0) == 0) {
       const uint64_t bytes = std::strtoull(s.c_str() + 2, nullptr, 0);
       v = mem.alloc(bytes ? bytes : 1);
+      buffers.emplace_back(v, bytes);
+      if (const char* dump = std::getenv("VGPU_BENCH_DUMP"); dump && *dump && *dump != '0') {   // data to read, not zeros
+        std::vector<uint8_t> fill(bytes);
+        uint64_t x = 0x9E3779B97F4A7C15ull ^ bytes;
+        for (uint8_t& b : fill) x ^= x << 13, x ^= x >> 7, x ^= x << 17, b = static_cast<uint8_t>(x >> 24);
+        if (bytes) mem.write(v, fill.data(), bytes);
+      }
     } else if (s.rfind("i:", 0) == 0 || s.rfind("l:", 0) == 0) {
       v = std::strtoull(s.c_str() + 2, nullptr, 0);
     } else {
@@ -76,15 +85,44 @@ int main(int argc, char** argv) {
   const char* rep = std::getenv("VGPU_BENCH_REPEAT");
   const int repeat = rep ? std::atoi(rep) : 1;
   uint64_t instructions = 0, waves = 0;
+  vgpu::amd::DispatchStats last;
   const auto t0 = std::chrono::steady_clock::now();
   for (int r = 0; r < repeat; ++r) {
     const vgpu::amd::DispatchStats s = vgpu::amd::execute(d, mem);
     instructions += s.instructions;
     waves += s.waves;
+    last = s;
   }
   const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   std::printf("%s: %llu waves, %llu wave-instructions in %.3f s = %.2f M wave-instructions/s\n", k->name.c_str(),
               static_cast<unsigned long long>(waves), static_cast<unsigned long long>(instructions), sec,
               instructions / sec / 1e6);
+  // VGPU_BENCH_DUMP=1: everything the dispatch counted and a hash of the buffers it was given, for comparing two builds or the tier
+  // on and off (nothing here is timed).
+  if (const char* dump = std::getenv("VGPU_BENCH_DUMP"); dump && *dump && *dump != '0') {
+    uint64_t h = 1469598103934665603ull;
+    for (const auto& [addr, bytes] : buffers) {
+      std::vector<uint8_t> data(bytes);
+      if (bytes) mem.read(addr, data.data(), bytes);
+      for (uint8_t b : data) h = (h ^ b) * 1099511628211ull;
+    }
+    const vgpu::amd::InstructionCounts& c = last.counts;
+    std::printf("dump: buffers=%016llx waves=%llu instructions=%llu barriers=%llu valu=%llu mfma=%llu salu=%llu smem=%llu vmem=%llu flat=%llu lds=%llu "
+                "branch=%llu sendmsg=%llu gds=%llu flat_read=%llu flat_write=%llu flat_atomic=%llu vmem_rd=%llu vmem_wr=%llu lt16=%llu lt32=%llu lt48=%llu "
+                "lt64=%llu eq64=%llu\n",
+                static_cast<unsigned long long>(h), static_cast<unsigned long long>(last.waves), static_cast<unsigned long long>(last.instructions),
+                static_cast<unsigned long long>(last.barriers), static_cast<unsigned long long>(c.valu), static_cast<unsigned long long>(c.mfma),
+                static_cast<unsigned long long>(c.salu), static_cast<unsigned long long>(c.smem), static_cast<unsigned long long>(c.vmem),
+                static_cast<unsigned long long>(c.flat), static_cast<unsigned long long>(c.lds), static_cast<unsigned long long>(c.branch),
+                static_cast<unsigned long long>(c.sendmsg), static_cast<unsigned long long>(c.gds), static_cast<unsigned long long>(c.flat_read),
+                static_cast<unsigned long long>(c.flat_write), static_cast<unsigned long long>(c.flat_atomic), static_cast<unsigned long long>(c.vmem_rd),
+                static_cast<unsigned long long>(c.vmem_wr), static_cast<unsigned long long>(last.waves_lt16), static_cast<unsigned long long>(last.waves_lt32),
+                static_cast<unsigned long long>(last.waves_lt48), static_cast<unsigned long long>(last.waves_lt64), static_cast<unsigned long long>(last.waves_eq64));
+    std::printf("mix:");
+    for (uint64_t v : c.mix) std::printf(" %llu", static_cast<unsigned long long>(v));
+    std::printf("\nmops:");
+    for (uint64_t v : c.mops) std::printf(" %llu", static_cast<unsigned long long>(v));
+    std::printf("\n");
+  }
   return 0;
 }

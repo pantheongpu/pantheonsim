@@ -127,9 +127,13 @@ void Hostcall::service() {
   // lock is what keeps the two from losing a packet between them.
   uint64_t top = 0;
   {
-    std::lock_guard<std::mutex> stripe(memory_atomic_lock(buffer_ + kReadyStack));
-    top = mem_.load_scalar(buffer_ + kReadyStack, 8);
-    if (top) mem_.store_scalar(buffer_ + kReadyStack, 8, 0);
+    // (The kernel's compare-and-swap is lock-free where the stack is an ordinary word of device memory, so the exchange
+    // is made the same way; the lock is the road for the rest.)
+    if (!atomics_lock_free() || !mem_.atomic_rmw(buffer_ + kReadyStack, 8, [](uint64_t) { return uint64_t{0}; }, &top)) {
+      std::lock_guard<std::mutex> stripe(memory_atomic_lock(buffer_ + kReadyStack));
+      top = mem_.load_scalar(buffer_ + kReadyStack, 8);
+      if (top) mem_.store_scalar(buffer_ + kReadyStack, 8, 0);
+    }
   }
   std::atomic_thread_fence(std::memory_order_acquire);
   const uint64_t mask = packets_ - 1;

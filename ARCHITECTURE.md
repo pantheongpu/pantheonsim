@@ -95,7 +95,7 @@ external dependencies, so faster execution comes from inside the tree: decoded
 forms, lane kernels and fast paths that give the same bits as the general path.
 Translating whole kernels to a faster tier, still behind the same
 `exec::launch()` boundary and still dependency-free, is studied in
-`docs/perf-design/`. Its first step is built for the SASS engine and off by default: `VGPU_TIER=1` runs the straight-line
+`docs/perf-design/`. Its first step is built for the SASS engine and on by default (`VGPU_TIER=0` turns it off): it runs the straight-line
 instructions of a warp through micro-ops decided once per code section (`src/sass/tier*`), inside the interpreter's own scheduling
 loop and with the interpreter as the fallback for anything it has no handler for. The rest of the study is not built.
 

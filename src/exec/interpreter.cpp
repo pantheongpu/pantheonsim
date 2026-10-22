@@ -48,6 +48,7 @@
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
+#include "vgpu/exec/local_layout.hpp"
 #include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/f32x2.hpp"
 #include "vgpu/exec/numerics.hpp"
@@ -605,7 +606,10 @@ struct Warp {
   // Set by a call that pushed a frame, so the caller's pc is not advanced a
   // second time: the frame already holds it past the call.
   bool entered_call = false;
-  std::vector<std::vector<uint8_t>> local;       // per-lane .local frames (lazy)
+  // The lanes' .local frames in one array, interleaved by words (exec/local_layout.hpp), local_cap bytes for each lane;
+  // made on the first access and grown to the frame a call needs.
+  std::vector<uint8_t> local;
+  uint64_t local_cap = 0;
   // The alloca stack: each lane's bytes, and its stack pointer (a local-space
   // offset, from kStackOffset up to kStackOffset + the stack size); unset
   // until the warp first touches the stack.
@@ -1488,6 +1492,39 @@ uint64_t texel_raw(const MemoryManager& mem, const TextureDesc& d, uint64_t addr
   return texel_channel_bits(mem, d, addr, ch);
 }
 
+// The channels of the texel at `addr` that `need` (a mask of channels) asks for, read together -- texel_raw for each of
+// them, with one lookup of the address (MemoryManager::load_fields) instead of one per channel. True with out[ch] set for
+// each channel in `need`; false, having read nothing, whenever reading them one at a time could differ -- a block-compressed
+// format, a channel the caller does not need but the layout would read, a fault armed, a field the memory manager declines
+// (misaligned, outside the allocation, a size it has no load for) -- and the caller then calls texel_raw per channel,
+// and meets any error in the channel where it did.
+[[gnu::noinline]] bool texel_channels(const MemoryManager& mem, const TextureDesc& d, uint32_t need, uint64_t addr, uint64_t out[4]) {
+  if (d.block != BlockFormat::None) return false;
+  if (d.packed_1010102) {   // one 32-bit word, read once instead of once per channel
+    if (!(need & 0xF)) return false;
+    uint64_t w;
+    const uint8_t four = 4;
+    if (!mem.load_fields(addr, &four, 1, &w)) return false;
+    static constexpr uint32_t kShift[4] = {0, 10, 20, 30}, kBits[4] = {10, 10, 10, 2};
+    for (uint32_t ch = 0; ch < 4; ++ch)
+      if (need & (1u << ch)) out[ch] = (w >> kShift[ch]) & ((1u << kBits[ch]) - 1);
+    return true;
+  }
+  uint8_t sizes[4];
+  uint32_t any = 0;
+  for (uint32_t ch = 0; ch < 4; ++ch) {
+    sizes[ch] = static_cast<uint8_t>(d.channel_bits[ch] / 8);
+    if (sizes[ch] && !(need & (1u << ch))) return false;   // would read a channel the caller does not
+    any |= sizes[ch];
+  }
+  if (!any) return false;
+  uint64_t v[4];
+  if (!mem.load_fields(addr, sizes, 4, v)) return false;
+  for (uint32_t ch = 0; ch < 4; ++ch)
+    if (need & (1u << ch)) out[ch] = v[ch];
+  return true;
+}
+
 // sRGB decoding, as an RTX 3060's texture unit does it: through a table, not
 // the sRGB formula -- its entries (in 1/65536ths, measured for every code)
 // have at most 8 significant bits, and the low codes run at 20/65536 a
@@ -1923,13 +1960,19 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
   int64_t isum[4] = {0, 0, 0, 0};
   double fv[4][16];
   uint32_t codes[4][16] = {};
+  uint32_t need = 0;
+  for (uint32_t ch = 0; ch < 4; ++ch) need |= d.channel_bits[ch] ? 1u << ch : 0u;
   for (int k = 0; k < n; ++k) {
+    uint64_t pre[4];
+    const bool have = fast && terms[k].w != 0 && !terms[k].border &&
+                      texel_channels(mem, terms[k].src ? *terms[k].src : d, need, terms[k].addr, pre);
     for (uint32_t ch = 0; ch < 4; ++ch) {
       if (!d.channel_bits[ch]) continue;
       if (terms[k].w == 0) { fv[ch][k] = 0; continue; }
       const uint32_t bits = d.channel_bits[ch];   // the channels of a block-compressed format differ in width
       const TextureDesc& at = terms[k].src ? *terms[k].src : d;
       const uint64_t raw = terms[k].border ? tex_border_raw(d, ch)
+                                           : have ? pre[ch]
                                            : texel_raw(mem, at, terms[k].addr, terms[k].x, terms[k].y, terms[k].z, ch);
       if (is_float) {
         double t = bits == 32 ? static_cast<double>(f32(raw)) : f16_to_double(raw);
@@ -2342,8 +2385,10 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
   const uint64_t row = v.pitch_bytes ? v.pitch_bytes : uint64_t{v.width} * v.texel_bytes;
   const uint64_t plane = row * (v.height ? v.height : 1);
   const uint64_t addr = v.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * v.texel_bytes;
+  uint64_t pre[4];
+  const bool have = g_fast_path.load(std::memory_order_relaxed) && texel_channels(mem, v, 0xF, addr, pre);
   for (uint32_t ch = 0; ch < 4; ++ch)
-    out[ch] = convert_channel(v, ch, texel_raw(mem, v, addr, idx[0], idx[1], idx[2], ch), f.float_result);
+    out[ch] = convert_channel(v, ch, have ? pre[ch] : texel_raw(mem, v, addr, idx[0], idx[1], idx[2], ch), f.float_result);
 }
 
 // suld/sust address a surface in *bytes* along x and in whole rows along y
@@ -5162,12 +5207,15 @@ class Interpreter {
                    "-byte shared allocation for this block");
   }
 
-  std::vector<uint8_t>& lane_local(Warp& w, uint32_t lane) {
-    if (w.local.empty()) w.local.resize(W_);
-    auto& buf = w.local[lane];
+  // The warp's local array, big enough for the current function's frame (bytes added are zero); read and write it with
+  // exec::local_load / local_store (W_ lanes).
+  uint8_t* local_array(Warp& w) {
     const uint64_t top = local_top();
-    if (buf.size() < top) buf.resize(top, 0);
-    return buf;
+    if (w.local_cap < top) {
+      w.local.resize(exec::local_array_bytes(W_, top), 0);
+      w.local_cap = top;
+    }
+    return w.local.data();
   }
 
   // A lane's alloca stack (PTX ISA 9.7.19): its pointer starts at the top and
@@ -5296,7 +5344,7 @@ class Interpreter {
         return v;
       }
       check_local(ins, static_cast<int>(lane), addr, size);
-      std::memcpy(&v, lane_local(w, lane).data() + (addr - kLocalVaBase), size);
+      v = exec::local_load(local_array(w), W_, lane, addr - kLocalVaBase, size);
       return v;
     }
     // A generic pointer to a kernel parameter -- a __grid_constant__ taken by
@@ -5338,7 +5386,7 @@ class Interpreter {
         return;
       }
       check_local(ins, static_cast<int>(lane), addr, size);
-      std::memcpy(lane_local(w, lane).data() + (addr - kLocalVaBase), &value, size);
+      exec::local_store(local_array(w), W_, lane, addr - kLocalVaBase, size, value);
       return;
     }
     if (addr >= kParamVaBase && addr < kParamVaBase + kParamVaSize)
@@ -5347,6 +5395,30 @@ class Interpreter {
     try {
       mem_.store_scalar(addr, size, value);
     } catch (const Error& e) {
+      rethrow_with_context(e, ins, static_cast<int>(lane));
+    }
+  }
+
+  // The memory side of an atomic on global memory -- load_routed, `compute`, store_routed -- with the address looked up
+  // once (MemoryManager::rmw_scalar). False, having done nothing, when the access is not plain global memory or the
+  // manager could not promise the same as the two calls (a fault armed, a host mapping, a bad address): the caller
+  // then makes the two calls, with their diagnostics. An error from `compute` is the caller's own and passes as it is.
+  template <class F>
+  bool rmw_global(const Instr& ins, uint32_t lane, uint64_t addr, uint32_t size, F&& compute, uint64_t* old) {
+    if (is_shared(addr) || is_local(addr) || (addr >= kParamVaBase && addr < kParamVaBase + kParamVaSize)) return false;
+    bool in_compute = false;
+    try {
+      return mem_.rmw_scalar(
+          addr, size,
+          [&](uint64_t o) {
+            in_compute = true;
+            const uint64_t nv = compute(o);
+            in_compute = false;
+            return nv;
+          },
+          old);
+    } catch (const Error& e) {
+      if (in_compute) throw;
       rethrow_with_context(e, ins, static_cast<int>(lane));
     }
   }
@@ -9265,8 +9337,44 @@ class Interpreter {
   // column 2t + i % 2. The m8n8kK shapes are the same with one register of
   // A and B and two elements of C. m8n8k4 f16 (Volta's) is four products at
   // once and has its own layouts.
+  // The dense f16, bf16 and tf32 forms of m16n8k8 / m16n8k16 / m16n8k4 (f32 or f16 accumulator, C and D alike) through the SIMD kernel the SASS
+  // engine's HMMA uses (vgpu/simd/simd.hpp: hmma): the fragments are read register by register exactly as the general form below reads them,
+  // gathered into the kernel's contiguous layout, and D is written the same way (alu_fault, write_reg). The kernel gives the general form's
+  // bits (tests/unit/test_simd.cpp, and test_mma_fast.cpp for this path against VGPU_FASTPATH=0). Returns false for any other form.
+  bool exec_mma_simd(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
+    if (!fast_enabled_ || W_ != 32 || !simd::enabled() || op.sparse || op.block_scale || op.m != 16 || op.acc_int || op.acc_f64 ||
+        op.b_type != op.ab_type || op.c_f16 != op.acc_f16)
+      return false;
+    const uint32_t kind = op.ab_type == MmaElem::F16 ? 0u : op.ab_type == MmaElem::BF16 ? 1u : op.ab_type == MmaElem::TF32 ? 2u : 3u;
+    if (kind == 3u) return false;
+    const uint32_t K = op.k, per_reg = kind == 2u ? 1u : 2u;
+    if (K == 0 || K > 16 || K % (4 * per_reg) != 0) return false;
+    const uint32_t a_regs = 16 * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = op.acc_f16 ? 2u : 4u;
+    if (op.a.size() != a_regs || op.b.size() != b_regs || op.c.size() != c_regs || op.d.size() != c_regs) return false;
+    alignas(32) uint32_t fa[4 * 32], fb[2 * 32], fc[4 * 32], out[4 * 32];
+    const auto gather = [&](const Reg& r, uint32_t* dst) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{r}}, _s);
+      for (uint32_t lane = 0; lane < 32; ++lane) dst[lane] = static_cast<uint32_t>(v[lane]);
+    };
+    for (uint32_t r = 0; r < a_regs; ++r) gather(op.a[r], fa + r * 32);
+    for (uint32_t r = 0; r < b_regs; ++r) gather(op.b[r], fb + r * 32);
+    for (uint32_t r = 0; r < c_regs; ++r) gather(op.c[r], fc + r * 32);
+    // (An sm_86 device sums as an RTX 3060's tensor core does: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
+    simd::kernels().hmma(kind | (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) ? 16u : 0u), K, op.acc_f16, fa, fb, fc, out);
+    for (uint32_t reg = 0; reg < c_regs; ++reg) {
+      Lanes r;
+      for (uint32_t lane = 0; lane < 32; ++lane)
+        if (m & (Mask{1} << lane)) r[lane] = out[reg * 32 + lane];
+      alu_fault(r, m, 32);
+      write_reg(w, op.d[reg], m, r, 32);
+    }
+    return true;
+  }
+
   void exec_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
     if (op.m == 8 && op.ab_type == MmaElem::F16) return exec_mma_m8n8k4(w, ctx, ins, op, m);
+    if (exec_mma_simd(w, ctx, ins, op, m)) return;
     constexpr uint32_t kN = 8;
     const uint32_t M = op.m, K = op.k;
     const uint32_t bits = mma_bits(op.ab_type);
@@ -11697,9 +11805,9 @@ class Interpreter {
       uint64_t offs[kMaxWarpSize];
       if (local_lanes_inside(base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
         LaneSet got(n);
+        const uint8_t* buf = local_array(w);
         for_active(m, W_, [&](uint32_t lane) {
-          const uint8_t* buf = lane_local(w, lane).data();
-          for (size_t e = 0; e < n; ++e) got[e][lane] = load_bytes(buf + offs[lane] + e * size, size);
+          for (size_t e = 0; e < n; ++e) got[e][lane] = exec::local_load(buf, W_, lane, offs[lane] + e * size, size);
         });
         for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, got[e], op.ty);
         return;
@@ -11816,10 +11924,10 @@ class Interpreter {
     if (op.space == Space::Local && fast_enabled_ && !(op.ordered && n > 1)) {
       uint64_t offs[kMaxWarpSize];
       if (local_lanes_inside(base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
+        uint8_t* buf = local_array(w);
         for_active(m, W_, [&](uint32_t lane) {
-          uint8_t* buf = lane_local(w, lane).data();
           for (size_t e = 0; e < n; ++e)
-            store_bytes(buf + offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
+            exec::local_store(buf, W_, lane, offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
         });
         return;
       }
@@ -13115,27 +13223,11 @@ class Interpreter {
             continue;
           }
         }
-        // Device memory in the ordinary case: one table lookup serves the read
-        // and the write (rmw_begin declines whenever load_scalar and
-        // store_scalar could behave differently: a fault armed, a host mapping,
-        // a misaligned or unmapped address, which then take the two-step path).
-        if (fast_enabled_ && !is_shared(addr) && !is_local(addr) &&
-            !(addr >= kParamVaBase && addr < kParamVaBase + kParamVaSize)) {
-          MemoryManager::ScalarRmw at;
-          uint64_t old = 0;
-          if (mem_.rmw_begin(addr, size, at, &old)) {
-            const uint64_t nv = compute(old);
-            try {
-              mem_.rmw_commit(at, size, nv);
-            } catch (const Error& e) {
-              rethrow_with_context(e, ins, static_cast<int>(lane));
-            }
-            r[lane] = old;
-            continue;
-          }
+        uint64_t old;
+        if (!rmw_global(ins, lane, addr, size, compute, &old)) {
+          old = load_routed(w, ctx, ins, lane, addr, size);
+          store_routed(w, ctx, ins, lane, addr, size, compute(old));
         }
-        const uint64_t old = load_routed(w, ctx, ins, lane, addr, size);
-        store_routed(w, ctx, ins, lane, addr, size, compute(old));
         r[lane] = old;
       }
     // `red` performed the read-modify-write and has nowhere to put the old

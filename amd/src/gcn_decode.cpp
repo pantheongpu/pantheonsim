@@ -1759,11 +1759,203 @@ void classify(Inst& in) {
 }
 }  // namespace
 
+std::string short_name_of(const Inst& in) {
+  return in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
+         : (in.dpp || in.dpp8) ? (in.name.ends_with("_dpp") ? in.name.substr(0, in.name.size() - 4) + "_e32" : std::string())
+         : in.promoted ? in.name.substr(0, in.name.size() - 4) + "_e32"
+         : in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e64") == 0 &&
+                 (in.name.find("_u16") != std::string::npos || in.name.find("_b16") != std::string::npos)
+             ? in.name.substr(0, in.name.size() - 4) + "_e32"
+             : std::string();
+}
+
+// ---- What a memory instruction's name says (Inst::mem) ------------------------------------------------------------
+// The parsers the executor used to run on every execution of a memory instruction; one copy, called from finalize
+// and from the executor for an instruction that was never finalized.
+
+bool parse_narrow(std::string_view op, uint32_t* bytes, bool* sign) {
+  const size_t at = op.rfind('_');
+  if (at == std::string_view::npos) return false;
+  const std::string_view what = op.substr(at + 1);
+  if (what == "ubyte" || what == "byte") *bytes = 1, *sign = false;
+  else if (what == "sbyte") *bytes = 1, *sign = true;
+  else if (what == "ushort" || what == "short") *bytes = 2, *sign = false;
+  else if (what == "sshort") *bytes = 2, *sign = true;
+  else return false;
+  return true;
+}
+
+bool parse_half(std::string_view body, uint32_t* bytes, bool* sign, bool* hi, bool* store) {
+  if (body.find("_d16") == std::string_view::npos) return false;
+  *hi = body.size() >= 3 && body.substr(body.size() - 3) == "_hi";
+  *store = body.rfind("store", 0) == 0 || body.rfind("write", 0) == 0;
+  *bytes = body.find("short") != std::string_view::npos || body.find("16_d16") != std::string_view::npos ? 2 : 1;
+  *sign = body.find("sbyte") != std::string_view::npos || body.find("i8") != std::string_view::npos;
+  return true;
+}
+
+bool parse_atomic_body(std::string_view body, Rmw* out, uint32_t* out_bytes) {
+  if (body.rfind("atomic_", 0) != 0) return false;
+  std::string_view what = body.substr(7);
+  uint32_t bytes = 4;
+  if (what.size() > 3 && what.substr(what.size() - 3) == "_x2") {
+    bytes = 8;
+    what.remove_suffix(3);
+  }
+  static const std::pair<std::string_view, Rmw> kNames[] = {
+      {"add", Rmw::Add},       {"sub", Rmw::Sub},         {"and", Rmw::And},           {"or", Rmw::Or},
+      {"xor", Rmw::Xor},       {"swap", Rmw::Swap},       {"smin", Rmw::SMin},         {"umin", Rmw::UMin},
+      {"smax", Rmw::SMax},     {"umax", Rmw::UMax},       {"inc", Rmw::Inc},           {"dec", Rmw::Dec},
+      {"cmpswap", Rmw::CmpSwap}, {"add_f32", Rmw::AddF32}, {"pk_add_f16", Rmw::PkAddF16},
+      {"pk_add_bf16", Rmw::PkAddBf16}, {"add_f64", Rmw::AddF64}, {"min_f64", Rmw::MinF64},
+      {"max_f64", Rmw::MaxF64}, {"min_num_f64", Rmw::MinF64}, {"max_num_f64", Rmw::MaxF64},
+      // RDNA's float min and max, as each generation spells them: gfx10's
+      // fmin (fmin_x2 the double), gfx11's min_f32, gfx12's min_num_f32.
+      {"fmin", Rmw::MinF32}, {"fmax", Rmw::MaxF32}, {"min_f32", Rmw::MinF32}, {"max_f32", Rmw::MaxF32},
+      {"min_num_f32", Rmw::MinF32}, {"max_num_f32", Rmw::MaxF32},
+      // gfx1250's: subtract only where memory is at least the data ("MEM = tmp >= src ? tmp - src : tmp"), and subtract clamped at zero
+      // ("if old_value < DATA.u32 then new_value = 0U else new_value = old_value - DATA.u32").
+      {"cond_sub_u32", Rmw::CondSub}, {"sub_clamp_u32", Rmw::SubClamp}};
+  for (auto [name, rmw] : kNames)
+    if (what == name) {
+      if (bytes == 8 && rmw == Rmw::MinF32) rmw = Rmw::MinF64;
+      if (bytes == 8 && rmw == Rmw::MaxF32) rmw = Rmw::MaxF64;
+      *out = rmw;
+      if (rmw == Rmw::AddF64 || rmw == Rmw::MinF64 || rmw == Rmw::MaxF64) bytes = 8;
+      *out_bytes = bytes;
+      return !(bytes == 8 && (rmw == Rmw::AddF32 || rmw == Rmw::PkAddF16 || rmw == Rmw::PkAddBf16));
+    }
+  // (A name this does not know leaves the size as it was read, the way the executor's version did.)
+  *out_bytes = bytes;
+  return false;
+}
+
+uint32_t transpose_bits_of(std::string_view body) {
+  if (body == "load_tr16_b128") return 16;
+  if (body == "load_tr8_b64") return 8;
+  if (body == "load_tr6_b96") return 6;
+  if (body == "load_tr4_b64") return 4;
+  return 0;
+}
+
+MemFacts mem_facts_of(const Inst& in) {
+  MemFacts f;
+  const std::string& n = in.name;
+  const size_t us = n.find('_');
+  const std::string_view body = std::string_view(n).substr(us + 1);   // (npos + 1 is 0: the whole name)
+  const auto starts = [&](const char* t) { return body.rfind(t, 0) == 0; };
+  uint32_t b = 0;
+  bool sign = false, hi = false, store = false;
+  if (parse_narrow(n, &b, &sign)) f.narrow_bytes = static_cast<uint8_t>(b), f.narrow_sign = sign;
+  if (parse_half(body, &b, &sign, &hi, &store))
+    f.half_bytes = static_cast<uint8_t>(b), f.half_sign = sign, f.half_hi = hi, f.half_store = store;
+  Rmw r = Rmw::Invalid;
+  b = 4;
+  if (parse_atomic_body(body, &r, &b)) f.rmw = r, f.atomic_bytes = static_cast<uint8_t>(b);
+  f.transpose_bits = static_cast<uint8_t>(transpose_bits_of(body));
+  f.body_store = starts("store");
+  f.body_atomic = starts("atomic_");
+  f.load_dword = starts("load_dword");
+  f.store_dword = starts("store_dword");
+  f.load_monitor = starts("load_monitor_b");
+  f.formatted = starts("load_format_") || starts("store_format_");
+  f.ds_name = n.rfind("ds_", 0) == 0;
+  f.scratch_store = n.rfind("scratch_store", 0) == 0;
+  f.scratch_load = n.rfind("scratch_load", 0) == 0;
+  // global_access: the first of these that holds.
+  if (body == "load_addtid_b32" || body == "store_addtid_b32") f.kind = MemKind::AddTid;
+  else if (body == "load_block" || body == "store_block") f.kind = MemKind::Block;
+  else if (f.transpose_bits) f.kind = MemKind::Transpose;
+  else if (f.narrow_bytes) f.kind = MemKind::Narrow;
+  else if (f.half_bytes) f.kind = MemKind::HalfReg;
+  else if (starts("prefetch_")) f.kind = MemKind::Prefetch;
+  else if (f.load_dword || f.load_monitor) f.kind = MemKind::Load;
+  else if (f.store_dword) f.kind = MemKind::Store;
+  else if (f.atomic_bytes) f.kind = MemKind::Atomic;
+  // The LDS accesses run without the ladder (exact names).
+  if (f.ds_name) {
+    static const std::pair<std::string_view, LdsOp> kLds[] = {
+        {"ds_read_b32", LdsOp::ReadB32}, {"ds_write_b32", LdsOp::WriteB32}, {"ds_read_b64", LdsOp::ReadWide},
+        {"ds_read_b128", LdsOp::ReadWide}, {"ds_read_b96", LdsOp::ReadB96}, {"ds_write_b64", LdsOp::WriteWide},
+        {"ds_write_b128", LdsOp::WriteWide}, {"ds_add_u32", LdsOp::AddU32}, {"ds_read2_b32", LdsOp::Read2B32},
+        {"ds_write2_b32", LdsOp::Write2B32}, {"ds_read_u8", LdsOp::ReadU8}, {"ds_read_i8", LdsOp::ReadI8},
+        {"ds_read_u16", LdsOp::ReadU16}, {"ds_write_b8", LdsOp::WriteB8}, {"ds_write_b16", LdsOp::WriteB16}};
+    for (auto [name, op] : kLds)
+      if (n == name) f.lds_op = op;
+  }
+  // A buffer atomic: its own list of names, and 64 bits only for the compare-and-swap.
+  if (f.body_atomic) {
+    f.buf_wide = body == "atomic_cmpswap_x2";
+    static const std::pair<std::string_view, Rmw> kBuf[] = {
+        {"atomic_cmpswap_x2", Rmw::CmpSwap}, {"atomic_cmpswap", Rmw::CmpSwap}, {"atomic_add", Rmw::Add},
+        {"atomic_swap", Rmw::Swap}, {"atomic_add_f32", Rmw::AddF32}, {"atomic_pk_add_f16", Rmw::PkAddF16},
+        {"atomic_sub", Rmw::Sub}, {"atomic_smin", Rmw::SMin}, {"atomic_smax", Rmw::SMax}, {"atomic_umin", Rmw::UMin},
+        {"atomic_umax", Rmw::UMax}, {"atomic_and", Rmw::And}, {"atomic_or", Rmw::Or}, {"atomic_xor", Rmw::Xor},
+        {"atomic_inc", Rmw::Inc}, {"atomic_dec", Rmw::Dec}};
+    for (auto [name, rmw] : kBuf)
+      if (body == name) f.buf_rmw = rmw;
+  }
+  // Scalar memory, in the order scalar_load asks.
+  if (n.find("prefetch") != std::string::npos) f.smem = SmemKind::Prefetch;
+  else if (n == "s_memtime" || n == "s_memrealtime") f.smem = SmemKind::Time, f.smem_realtime = n == "s_memrealtime";
+  else if (n == "s_dcache_wb" || n == "s_dcache_inv" || n == "s_dcache_wb_vol" || n == "s_dcache_inv_vol" || n == "s_dcache_discard" ||
+           n == "s_dcache_discard_x2" || n == "s_atc_probe" || n == "s_atc_probe_buffer")
+    f.smem = SmemKind::Nop;
+  else if (n.rfind("s_store_dword", 0) == 0) f.smem = SmemKind::Store;
+  else if (n.rfind("s_buffer_store_dword", 0) == 0) f.smem = SmemKind::BufferStore, f.s_buffer = true;
+  else if (n.rfind("s_atomic_", 0) == 0 || n.rfind("s_buffer_atomic_", 0) == 0) {
+    f.smem = SmemKind::Atomic;
+    f.s_buffer = n.rfind("s_buffer_", 0) == 0;
+    f.s_wide = n.size() > 3 && n.compare(n.size() - 3, 3, "_x2") == 0;
+    const size_t prefix = f.s_buffer ? 16 : 9;   // "s_buffer_atomic_" or "s_atomic_"
+    const std::string what = n.substr(prefix, n.size() - prefix - (f.s_wide ? 3 : 0));
+    static const std::pair<std::string_view, Rmw> kS[] = {
+        {"swap", Rmw::Swap}, {"cmpswap", Rmw::CmpSwap}, {"add", Rmw::Add}, {"sub", Rmw::Sub}, {"smin", Rmw::SMin},
+        {"umin", Rmw::UMin}, {"smax", Rmw::SMax}, {"umax", Rmw::UMax}, {"and", Rmw::And}, {"or", Rmw::Or},
+        {"xor", Rmw::Xor}, {"inc", Rmw::Inc}, {"dec", Rmw::Dec}};
+    for (auto [name, rmw] : kS)
+      if (what == name) f.s_rmw = rmw;
+  } else if (n == "s_load_u8" || n == "s_load_i8" || n == "s_load_u16" || n == "s_load_i16") {
+    f.smem = SmemKind::SubDword;
+    f.smem_bytes = n.back() == '8' ? 1 : 2;
+    f.smem_sign = n[7] == 'i';
+  } else if (n.rfind("s_buffer_load_", 0) == 0) f.smem = SmemKind::BufferLoad;
+  return f;
+}
+
+void finalize(Inst& in) {
+  const std::string& n = in.name;
+  const auto has = [&](const char* t) { return n.find(t) != std::string::npos; };
+  const auto starts = [&](const char* t) { return n.rfind(t, 0) == 0; };
+  uint32_t f = kInstFinal;
+  if (starts("v_mfma") || starts("v_smfmac")) f |= kInstMfma;
+  if (starts("v_cmp")) f |= kInstCmp;
+  if (has("f64")) f |= kInstF64;
+  if (has("_store")) f |= kInstStore;
+  if (has("_atomic")) f |= kInstAtomic;
+  if (has("_load_lds_")) f |= kInstLoadLds;
+  if (has("_async_to_lds_") || has("_async_from_lds_")) f |= kInstAsyncLds;
+  if (starts("ds_gws_")) f |= kInstGws;
+  if (starts("ds_write") || starts("ds_store")) f |= kInstDsWrite;
+  if (n == "s_branch" || starts("s_cbranch_")) f |= kInstBranchCount;
+  if (starts("s_wait_") && n != "s_wait_event") f |= kInstSWait;
+  if (starts("tensor_")) f |= kInstTensor;
+  if (starts("s_barrier_") || n == "s_get_barrier_state" || n == "s_wakeup_barrier") f |= kInstBarrierSop1;
+  in.name_hash = name_hash(n);
+  in.short_name = short_name_of(in);
+  in.short_hash = name_hash(in.short_name);
+  in.flags = f;
+  in.mem = mem_facts_of(in);
+  tier_classify(in);
+}
+
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
   if (is_rdna(target)) {
     Inst in = rdna::decode(code, at, pc, target, wave64);
     classify(in);
     for (Inst& half : in.dual) classify(half);
+    finalize(in);
+    for (Inst& half : in.dual) finalize(half);
     return in;
   }
   struct Using {
@@ -1776,6 +1968,7 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   Inst in = decode_one(code, at, pc);
   in.arch = target;
   classify(in);
+  finalize(in);
   return in;
 }
 

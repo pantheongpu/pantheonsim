@@ -14,7 +14,7 @@
 // mask forced by BMOV.PQUAD MACTIVE, a register past the warp's file) -- goes to Runner::execute, which is the
 // existing code. Divergent warps work: a handler takes the executing lane mask like the interpreter's does.
 //
-// Off by default: VGPU_TIER=1 turns it on (docs/cli.md). Every handler is held to the bits of the interpreter's path
+// On by default: VGPU_TIER=0 turns it off (docs/cli.md). Every handler is held to the bits of the interpreter's path
 // for the same form (tests: nvidia/tests/e2e/run_sass_tier.sh, tests/unit/test_tier.cpp).
 //
 // This header is the data the analysis (tier.cpp: Instr -> MOp, no execution) and the handlers (tier_ops.inc,
@@ -123,6 +123,9 @@ enum class Form : uint8_t {
   Uunary,    // UFLO, UPOPC
   Usel,
   Hmma,      // HMMA (dense f16, bf16, tf32 with an f32 or f16 accumulator): the SIMD kernel; ends a run, has a handler
+  Match,     // MATCH.ANY / MATCH.ALL on 32 or 64 bits: ends a run, has a handler
+  Ldsm,      // LDSM, the 16-bit forms (ldmatrix .M88, .MT88): ends a run, has a handler
+  Imma,      // IMMA (dense, 8- or 4-bit elements into s32, plain or .SAT): ends a run, has a handler
   Count_,
 };
 const char* form_name(Form f);
@@ -181,7 +184,7 @@ struct Program {
 // `sm` is the architecture the code was decoded for. Never throws on an instruction it does not take: Form::None.
 void analyze(const Instr& ins, int sm, Program& prog, MOp& op);
 
-// Whether VGPU_TIER asks for the tier (read once per process). The executor also requires its fast paths
+// Whether the tier is on: it is, unless VGPU_TIER=0 (read once per process). The executor also requires its fast paths
 // (VGPU_FASTPATH) and the SIMD kernels (VGPU_SIMD) on, and no per-instruction trace.
 bool requested();
 

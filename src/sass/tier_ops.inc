@@ -1263,6 +1263,142 @@ TIER_HANDLER(h_vote) {
   tier_setp(c, op.dst2, ex, r ? kAll : 0);
 }
 
+// MATCH.ANY / MATCH.ALL (exec_warp): the lanes' values are read first, then written, so a destination that is the source is no problem.
+// ANY gives every executing lane the mask of the executing lanes that hold the same value (lanes of a class share it, so it is worked out
+// once for each class); ALL gives every executing lane the executing mask when all hold one value and 0 otherwise, and the predicate says which.
+TIER_HANDLER(h_match) {
+  TIER_PRELUDE
+  const uint32_t* lo = tier_src<false>(c, op.s[0], nullptr);
+  const uint32_t* hi = (op.aux & 2) ? tier_src<false>(c, op.s[1], nullptr) : nullptr;
+  uint64_t v[32];
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    v[l] = lo[l] | (hi ? static_cast<uint64_t>(hi[l]) << 32 : 0);
+  }
+  uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
+  if (op.aux & 1) {
+    for (Mask todo = ex; todo;) {
+      const uint64_t x = v[std::countr_zero(todo)];
+      Mask cls = 0;
+      for (Mask m = ex; m; m &= m - 1) {
+        const unsigned k = static_cast<unsigned>(std::countr_zero(m));
+        cls |= static_cast<Mask>(v[k] == x) << k;
+      }
+      if (d)
+        for (Mask m = cls; m; m &= m - 1) d[std::countr_zero(m)] = cls;
+      todo &= ~cls;
+    }
+  } else {
+    const uint64_t first = v[std::countr_zero(ex)];
+    bool same = true;
+    for (Mask m = ex; m; m &= m - 1) same = same && v[std::countr_zero(m)] == first;
+    if (d)
+      for (Mask m = ex; m; m &= m - 1) d[std::countr_zero(m)] = same ? ex : 0;
+    tier_setp(c, op.dst2, ex, same ? kAll : 0);
+  }
+}
+
+// LDSM (ldmatrix of 16-bit elements, exec_mem): matrix i's row r is at the address of lane 8i + r; lane t gets row t/4's 32-bit word t%4
+// (.MT88: the halves of column t/4 from rows 2(t%4) and 2(t%4)+1). A whole warp, every row inside the block's own shared memory: the words
+// move straight into the registers. A partial warp (a lane that holds a row address may be missing: the interpreter reports it), an address in
+// another block's window and a row that would end past the array are exec_mem's.
+TIER_HANDLER(h_ldsm) {
+  const TCtx& c = *static_cast<const TCtx*>(vc);
+  Block& blk = *c.blk;
+  const unsigned nmat = op.a;
+  uint32_t rows[32];
+  const unsigned ra = op.s[0].off;
+  const uint32_t* base = ra != kRZ ? c.R + ra * 32u : nullptr;
+  const uint64_t urv = op.s[1].off != ~0u ? c.w->ur[op.s[1].off] : 0;
+  const uint64_t imm = static_cast<uint64_t>(op.imm);
+  exec::SharedWindowCheck window;
+  for (unsigned l = 0; l < 32; ++l) {
+    rows[l] = static_cast<uint32_t>((base ? base[l] : 0u) + urv + imm);
+    window.add(rows[l], blk.rank);
+  }
+  if (ex != kAll || !window.inside(blk.shared.size(), 16, true)) {
+    c.r->tier_exec_mem(blk, *c.w, *op.ins, ex);
+    return;
+  }
+  const uint8_t* sh = blk.shared.data();
+  uint32_t out[4][32];
+  for (unsigned i = 0; i < nmat; ++i)
+    for (unsigned t = 0; t < 32; ++t) {
+      if (!op.b) {
+        std::memcpy(&out[i][t], sh + (rows[8 * i + t / 4] & 0xffffff) + 4 * (t % 4), 4);
+      } else {
+        uint16_t lo, hi;
+        std::memcpy(&lo, sh + (rows[8 * i + 2 * (t % 4)] & 0xffffff) + 2 * (t / 4), 2);
+        std::memcpy(&hi, sh + (rows[8 * i + 2 * (t % 4) + 1] & 0xffffff) + 2 * (t / 4), 2);
+        out[i][t] = lo | (static_cast<uint32_t>(hi) << 16);
+      }
+    }
+  if (op.dst != tier::kNoReg)
+    for (unsigned i = 0; i < nmat; ++i) std::memcpy(c.R + (op.dst + i) * 32u, out[i], 32 * sizeof(uint32_t));
+  blk.st.shared_loads += 32;
+  blk.st.shared_bytes_read += 32u * 4 * nmat;
+}
+
+// IMMA, the dense integer forms (exec_mma): the 8- or 4-bit elements of A (M x K, row-major) and of B (K x 8, kept column by column so that
+// a dot product runs along contiguous elements) read out of the fragment registers as exec_mma lays them out, each product summed with the
+// accumulator in 64 bits and the result cut to 32 -- the same as a wrapping 32-bit sum -- or, under .SAT, clamped to the s32 range after every
+// 128 bits of K. The destination is written for the executing lanes.
+TIER_HANDLER(h_imma) {
+  TIER_PRELUDE
+  if (op.dst == tier::kNoReg) return;   // (an RZ destination: the interpreter computes and throws it away)
+  const unsigned M = op.a, K = op.b;
+  const bool sa = op.aux & 1, sb = op.aux & 2, sat = op.aux & 4, four = op.aux & 8;
+  const unsigned per_reg = four ? 8 : 4, a_regs = M * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = M * 8 / 32;
+  const auto elem = [&](uint32_t v, unsigned e, bool sgn) -> int16_t {
+    if (four) {
+      const unsigned x = (v >> (4 * e)) & 0xfu;
+      return sgn ? static_cast<int16_t>(static_cast<int8_t>(static_cast<uint8_t>(x << 4)) >> 4) : static_cast<int16_t>(x);
+    }
+    const unsigned x = (v >> (8 * e)) & 0xffu;
+    return sgn ? static_cast<int16_t>(static_cast<int8_t>(x)) : static_cast<int16_t>(x);
+  };
+  const auto word = [&](uint32_t base, unsigned i, unsigned l) -> uint32_t { return base == kRZ ? 0u : c.R[(base + i) * 32u + l]; };
+  alignas(32) int16_t A[16 * 128], Bt[8 * 128];
+  for (unsigned r = 0; r < a_regs; ++r)
+    for (unsigned l = 0; l < 32; ++l) {
+      const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8, col0 = t * per_reg + (r / 2) * (per_reg * 4);
+      const uint32_t v = word(op.s[0].off, r, l);
+      for (unsigned e = 0; e < per_reg; ++e) A[row * K + col0 + e] = elem(v, e, sa);
+    }
+  for (unsigned r = 0; r < b_regs; ++r)
+    for (unsigned l = 0; l < 32; ++l) {
+      const unsigned g = l / 4, t = l % 4, row0 = t * per_reg + r * (per_reg * 4);
+      const uint32_t v = word(op.s[1].off, r, l);
+      for (unsigned e = 0; e < per_reg; ++e) Bt[g * K + row0 + e] = elem(v, e, sb);
+    }
+  const auto cd = [](unsigned l, unsigned slot) { return (l / 4 + (slot / 2) * 8) * 8 + (l % 4) * 2 + slot % 2; };
+  int32_t C[16 * 8], D[16 * 8];
+  for (unsigned l = 0; l < 32; ++l)
+    for (unsigned s = 0; s < c_regs; ++s) C[cd(l, s)] = static_cast<int32_t>(word(op.s[2].off, s, l));
+  const unsigned block = sat ? (four ? 32u : 16u) : K;   // 128 bits of K under .SAT
+  for (unsigned i = 0; i < M; ++i)
+    for (unsigned j = 0; j < 8; ++j) {
+      const int16_t* a = A + i * K;
+      const int16_t* b = Bt + j * K;
+      if (!sat) {
+        int32_t acc = 0;
+        for (unsigned k = 0; k < K; ++k) acc += static_cast<int32_t>(a[k]) * static_cast<int32_t>(b[k]);   // (|product| < 2^16, K <= 128: no overflow)
+        D[i * 8 + j] = static_cast<int32_t>(static_cast<uint32_t>(C[i * 8 + j]) + static_cast<uint32_t>(acc));
+      } else {
+        int64_t acc = C[i * 8 + j];
+        for (unsigned k0 = 0; k0 < K; k0 += block) {
+          for (unsigned k = k0; k < k0 + block && k < K; ++k) acc += static_cast<int64_t>(a[k]) * static_cast<int64_t>(b[k]);
+          acc = std::clamp<int64_t>(acc, INT32_MIN, INT32_MAX);
+        }
+        D[i * 8 + j] = static_cast<int32_t>(acc);
+      }
+    }
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    for (unsigned s = 0; s < c_regs; ++s) c.R[(op.dst + s) * 32u + l] = static_cast<uint32_t>(D[cd(l, s)]);
+  }
+}
+
 // HMMA (the dense f16, bf16 and tf32 forms): one SIMD kernel over the warp's fragments, as exec_mma gives them to it, the
 // answer written to the executing lanes (RZ as an operand is a row of zeros, as a source accumulator a zero accumulator).
 TIER_HANDLER(h_hmma) {   // exec_mma's kernel call: the same kernel, and the same choice of the sum (hmma_kernel_kind: VGPU_TC_EXACT, sm_86)
@@ -1319,6 +1455,9 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Shfl: return &h_shfl;
     case F::Vote: return &h_vote;
     case F::Hmma: return &h_hmma;
+    case F::Match: return &h_match;
+    case F::Imma: return &h_imma;
+    case F::Ldsm: return &h_ldsm;
     case F::Umov: return &h_umov;
     case F::Uldc: return &h_uldc;
     case F::Uiadd3: return &h_uiadd3;
@@ -1364,6 +1503,8 @@ struct TierStats {
     if (const char* f = std::getenv("VGPU_TIER_STATS_FILE"); f && *f)
       if (std::FILE* g = std::fopen(f, "a")) out = g;
     const uint64_t all = total.load();
+    // (VGPU_TIER_STATS=2 lists every mnemonic, 1 the top 24 of each list)
+    const size_t shown = [] { const char* v = std::getenv("VGPU_TIER_STATS"); return v && v[0] == '2' ? size_t{1000} : size_t{24}; }();
     std::fprintf(out, "tier: %llu of %llu warp instructions ran in the tier (%.1f%%); %llu straight-line ones in the interpreter\n",
                  (unsigned long long)nat, (unsigned long long)all, all ? 100.0 * double(nat) / double(all) : 0.0,
                  (unsigned long long)fb);
@@ -1373,7 +1514,7 @@ struct TierStats {
         if (native[i].load()) v.emplace_back(native[i].load(), i);
       std::sort(v.rbegin(), v.rend());
       std::string line = "tier native:";
-      for (size_t i = 0; i < v.size() && i < 24; ++i)
+      for (size_t i = 0; i < v.size() && i < shown; ++i)
         line += std::string(" ") + op_name(static_cast<Op>(v[i].second)) + "=" + std::to_string(v[i].first);
       std::fprintf(out, "%s\n", line.c_str());
     }
@@ -1382,7 +1523,7 @@ struct TierStats {
       for (const auto& [k, n] : m) v.emplace_back(n, k);
       std::sort(v.rbegin(), v.rend());
       std::string line = std::string("tier ") + what + ":";
-      for (size_t i = 0; i < v.size() && i < 24; ++i) line += " " + v[i].second + "=" + std::to_string(v[i].first);
+      for (size_t i = 0; i < v.size() && i < shown; ++i) line += " " + v[i].second + "=" + std::to_string(v[i].first);
       std::fprintf(out, "%s\n", line.c_str());
     };
     std::fprintf(out, "tier runs: %llu runs of straight instructions, %llu of them started by the tier's chain instead of a call of the scheduler\n",

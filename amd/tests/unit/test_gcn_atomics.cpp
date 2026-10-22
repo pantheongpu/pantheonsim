@@ -138,8 +138,11 @@ VTEST(atomics_from_work_groups_on_many_threads_lose_nothing) {
   std::vector<int32_t> in(kN);
   for (int i = 0; i < kN; ++i) in[i] = i + 1;
   const uint64_t groups = 512;
+  // With the compare-and-swap on the word (the default) and with the lock it replaced.
+  for (const bool lock_free : {true, false})
   for (const char* threads : {"8", "1"}) {
     ::setenv("VGPU_THREADS", threads, 1);
+    amd::set_fast_paths(lock_free, true);
     MemoryManager mem(64ull << 20);
     const uint64_t pin = upload(mem, in), pf = upload(mem, std::vector<float>{0.0f}),
                    pq = upload(mem, std::vector<uint64_t>{0});
@@ -155,6 +158,43 @@ VTEST(atomics_from_work_groups_on_many_threads_lose_nothing) {
     VCHECK_EQ(download<float>(mem, pf, 1)[0], static_cast<float>(groups * per_group));
     VCHECK_EQ(stats.waves, groups * kN / vtest::amd_wave());   // what each thread counted, added up
   }
+  amd::set_fast_paths(true, true);
+  ::unsetenv("VGPU_THREADS");
+}
+
+// The integer atomics of `returning` -- an add, a subtract and an exclusive or that give back what they found, and an
+// exchange -- from 20000 work-groups on eight threads, both ways: the words end up what the operations add up to (the
+// exchange leaves one of the lanes' values), whichever order the groups landed in. The initial values make the
+// first-touch of a chunk (no chunk made real yet) part of the race.
+VTEST(integer_atomics_from_many_threads_add_up_with_and_without_the_lock) {
+  const amd::CodeObject o = object();
+  const amd::Kernel* k = amd::find_kernel(o, "returning");
+  VCHECK(k != nullptr);
+  std::vector<int32_t> in(kN);
+  for (int i = 0; i < kN; ++i) in[i] = (i * 7919) | 1;
+  const uint32_t groups = 20000;   // many and tiny, so that threads meet on the words
+  int32_t sum = 0, xo = 0;
+  for (int i = 0; i < kN; ++i) sum += in[i], xo ^= in[i];
+  for (const bool lock_free : {true, false})
+    for (const char* threads : {"8", "3", "1"}) {
+      ::setenv("VGPU_THREADS", threads, 1);
+      amd::set_fast_paths(lock_free, true);
+      MemoryManager mem(64ull << 20);
+      const uint64_t p = mem.alloc(4096), out = mem.alloc(4096), pin = upload(mem, in);   // p never written
+      amd::Dispatch d;
+      d.object = &o;
+      d.kernel = k;
+      d.kernarg = kernargs(mem, *k, {p, out, pin, static_cast<uint64_t>(kN)});
+      d.groups[0] = groups;
+      d.group_size[0] = kN;
+      amd::execute(d, mem);
+      const std::vector<int32_t> got = download<int32_t>(mem, p, 4);
+      VCHECK_EQ(got[0], static_cast<int32_t>(static_cast<uint32_t>(sum) * groups));
+      VCHECK_EQ(got[1], static_cast<int32_t>(0u - static_cast<uint32_t>(sum) * groups));
+      VCHECK_EQ(got[2], (groups % 2) ? xo : 0);
+      VCHECK(std::find(in.begin(), in.end(), got[3]) != in.end());
+    }
+  amd::set_fast_paths(true, true);
   ::unsetenv("VGPU_THREADS");
 }
 

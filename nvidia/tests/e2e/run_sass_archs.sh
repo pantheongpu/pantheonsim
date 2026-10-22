@@ -147,9 +147,9 @@ check() {
   local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
   [[ $p == runtime_conformance ]] && env+=(VGPU_DEVICE_COUNT=2)   # as run_runtime_conformance.sh runs it
   [[ $p == managed_vars ]] && env+=(VGPU_DEVICE_COUNT=2)          # as its own test runs it: two devices
-  sass="$(cd "$work" && env "${env[@]}" VGPU_SASS_LOG=1 timeout 600 "$bin" 2>&1)"; rs=$?
+  sass="$(cd "$work" && env "${env[@]}" VGPU_SASS_LOG=1 VGPU_TIER=0 timeout 600 "$bin" 2>&1)"; rs=$?
   ptx="$(cd "$work" && env "${env[@]}" VGPU_SASS=0 timeout 600 "$bin" 2>&1)"; rp=$?
-  # The pre-decoded tier (VGPU_TIER=1, src/sass/tier.hpp) is opt-in until it has been soaked; this is its soak on every
+  # The pre-decoded tier (VGPU_TIER=1, src/sass/tier.hpp) is on by default; this holds it to the interpreter (VGPU_TIER=0) on every
   # program and architecture this job builds, Hopper's and Blackwell's own programs among them: it must print what the
   # interpreter did. (nvidia/tests/e2e/run_sass_tier.sh also holds the counters to the interpreter's.) VGPU_SASS_TIER=0 skips it.
   local tier="" rt=0

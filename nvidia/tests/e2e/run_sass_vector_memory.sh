@@ -2,8 +2,9 @@
 # Shared and local memory moved 1 to 16 bytes at a time; see sass_vector_memory.cu.
 #
 # The program compares every word with a host computation, so a pass on each engine is the engines agreeing with the
-# host and with each other: the SASS interpreter (the default), the SASS tier (VGPU_TIER=1) and the PTX interpreter
-# (VGPU_SASS=0). With --card it runs on the machine's real GPU and library instead (nothing is built against the shim).
+# host and with each other: the SASS interpreter (VGPU_TIER=0), the SASS tier (the default) and the PTX interpreter
+# (VGPU_SASS=0), and the first and the last of these again without the fast paths. With --card it runs on the machine's real
+# GPU and library instead (nothing is built against the shim).
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -30,11 +31,15 @@ nvcc -std=c++17 -cudart shared -gencode arch=compute_86,code=sm_86 -gencode arch
      -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out"
 if ! require_shim_libs "$shim" "$out"; then rm -f "$out"; exit 0; fi
 fail=0
-for engine in sass tier ptx; do
+# (The "general" runs send every access down the executors' general path, not the fast paths: local memory is then read and
+# written by Runner::mem_read / mem_write and the PTX interpreter's load_routed / store_routed.)
+for engine in sass tier ptx sass-general ptx-general; do
   case "$engine" in
-    sass) env_engine=() ;;
+    sass) env_engine=(VGPU_TIER=0) ;;
     tier) env_engine=(VGPU_TIER=1) ;;
     ptx)  env_engine=(VGPU_SASS=0) ;;
+    sass-general) env_engine=(VGPU_TIER=0 VGPU_FASTPATH=0) ;;
+    ptx-general)  env_engine=(VGPU_SASS=0 VGPU_FASTPATH=0) ;;
   esac
   result="$(env VGPU_QUIET=1 VGPU_GPU=nvidia/rtx3060 "${env_engine[@]}" LD_LIBRARY_PATH="$shim" "$out" 2>&1)" || {
     echo "== $engine: $result"; fail=1; continue; }

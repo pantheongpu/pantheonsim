@@ -23,6 +23,7 @@
 //    (these diagnostics are a product feature for CI, not just debug aids).
 #pragma once
 
+#include <type_traits>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <mutex>
@@ -195,21 +196,48 @@ class MemoryManager {
   // naturally aligned. Values are zero-extended into the returned u64.
   uint64_t load_scalar(uint64_t addr, uint32_t size) const;
   void store_scalar(uint64_t addr, uint32_t size, uint64_t value);
-  // A read-modify-write of one naturally aligned scalar (a device atomic) with one
-  // table lookup instead of load_scalar's and store_scalar's two. rmw_begin
-  // returns true and the value in memory only for the ordinary case -- no fault
-  // armed or stuck cell, no host mapping in reach, an aligned access inside one
-  // ordinary allocation; otherwise it returns false having changed nothing and
-  // the caller makes the two accesses with load_scalar and store_scalar, errors
-  // and all. rmw_commit then does what store_scalar does for `value` (a store of
-  // the byte a uniform chunk already holds changes nothing; an untouched or
-  // uniform chunk becomes real) and throws what it would.
-  struct ScalarRmw {
-    void* allocation = nullptr;
-    uint64_t chunk_idx = 0, in_chunk = 0;
-  };
-  bool rmw_begin(uint64_t addr, uint32_t size, ScalarRmw& at, uint64_t* old) const;
-  void rmw_commit(const ScalarRmw& at, uint32_t size, uint64_t value);
+  // An atomic's memory side: the load_scalar of `size` bytes at `addr`, `compute(old)`, and the store_scalar of its
+  // result, with the address resolved once. Returns true having done all three (`*old_out` the value loaded, which
+  // `compute` also got); a `compute` that throws leaves memory as it was and the exception passes through. Returns
+  // false having done nothing -- and not called `compute` -- whenever the pair of calls could differ from this:
+  // a fault or stuck cell armed, a host mapping possibly in range, a size that is not 1/2/4/8, a misaligned address,
+  // or an access not wholly inside one ordinary allocation (freed, out of range, mapped, no lookup cache). The
+  // caller then makes the two calls as before and meets any error where it would have. A chunk that cannot get host
+  // memory throws what store_scalar would (the store is the only thing here that can).
+  using RmwFn = uint64_t (*)(void* ctx, uint64_t old);
+  bool rmw_scalar_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out);
+  template <class F>
+  bool rmw_scalar(uint64_t addr, uint32_t size, F&& compute, uint64_t* old_out) {
+    return rmw_scalar_fn(
+        addr, size, [](void* c, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(old); },
+        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out);
+  }
+
+  // A lock-free atomic read-modify-write on a 4- or 8-byte naturally aligned word: `compute(old)` is applied with a
+  // compare-and-swap loop on the word itself (the value it is called with is the one the swap replaces, so it is
+  // called again when another thread got in between, and must be pure). Returns true with `*old_out` the value the
+  // successful swap replaced; the result is stored only where load_scalar / store_scalar under a lock would have
+  // stored it: when it differs from the old value, or (`always_store`) always -- a store that changes nothing still
+  // makes a never-written chunk real. A chunk that is not real yet is made so first (a uniform chunk is left alone
+  // by a store of its own byte). Returns false, having done nothing and not called `compute`, whenever the plain
+  // pair of calls could differ: a fault armed, a host mapping possibly in range, another size, a misaligned
+  // address, or an access not wholly inside one ordinary allocation; the caller then takes its lock and goes as
+  // before. Every thread that reaches the same address takes the same road, so the two never meet on one word.
+  bool atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out, bool always_store);
+  template <class F>
+  bool atomic_rmw(uint64_t addr, uint32_t size, F&& compute, uint64_t* old_out, bool always_store = false) {
+    return atomic_rmw_fn(
+        addr, size, [](void* c, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(old); },
+        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out, always_store);
+  }
+
+  // The fields of one record (a texel's channels), `n` of them end to end from `addr`, field i `sizes[i]` bytes
+  // (0, 1, 2, 4 or 8; a 0 reads nothing and gives 0), each one load_scalar of its width. Returns true with
+  // `out[i]` set, or false having done nothing -- a fault or stuck cell armed, a host mapping possibly in range,
+  // a field not naturally aligned or not wholly inside the one ordinary allocation the record lies in -- and the
+  // caller then reads the fields one at a time and meets any error where it would have. One lookup serves the lot.
+  bool load_fields(uint64_t addr, const uint8_t* sizes, unsigned n, uint64_t* out) const;
+
   // Sixteen naturally aligned bytes as one access, as a GPU moves a wide load
   // or store (global_load_dwordx4): a kernel on another host thread sees them
   // all old or all new, never half of each. rocPRIM's decoupled look-back
@@ -222,6 +250,14 @@ class MemoryManager {
   // load_scalar and store_scalar make them.
   void load_quad(uint64_t addr, uint64_t out[2]) const;
   void store_quad(uint64_t addr, const uint64_t in[2]);
+
+  // `count` consecutive naturally aligned sixteen-byte values from `addr`, each made exactly as load_quad / store_quad
+  // make it (one access each, in order), for a run wholly inside one ordinary allocation, with one lookup for the lot.
+  // Returns false, having done nothing, whenever the calls could differ -- a fault armed or cells stuck, a host mapping
+  // possibly in range, a misaligned address, or a run not wholly inside one allocation (load_quad lets a read run on
+  // into the last page of an allocation; the caller then goes one at a time and gets that).
+  bool load_quad_run(uint64_t addr, size_t count, uint64_t* out) const;
+  bool store_quad_run(uint64_t addr, size_t count, const uint64_t* in);
 
   // Notified with the new total whenever allocated bytes change. Used to feed
   // live memory telemetry; optional and unset by default.
@@ -515,6 +551,22 @@ class MemoryManager {
   // threads at once.
   static uint8_t* materialize(Allocation& a, uint64_t chunk_idx);
   const Allocation* run_allocation(uint64_t addr, uint64_t len, uint32_t unit, uint64_t* base) const;
+  // rmw_scalar's parts. The slot holds where the access is; a chunk that is real stays the same pointer.
+  struct RmwSlot {
+    Allocation* a;
+    uint64_t chunk_idx;
+    uint64_t coff;      // offset in the chunk
+    uint8_t* chunk;     // as read by rmw_locate: null, a uniform tag, or the bytes
+  };
+  bool rmw_locate(uint64_t addr, uint32_t size, RmwSlot* s) const;
+  uint64_t rmw_load(const RmwSlot& s, uint32_t size) const;
+  void rmw_store(RmwSlot& s, uint32_t size, uint64_t value);
+  // Whether a fault is armed that load_scalar or store_scalar would apply.
+  bool access_faults_armed() const {
+    const auto armed = [](const uint64_t* pending) { return pending && __atomic_load_n(pending, __ATOMIC_RELAXED); };
+    return access_fault_ && (armed(access_fault_->stuck_pending) || armed(access_fault_->load_pending) ||
+                             armed(access_fault_->store_pending));
+  }
 
   // Maps addr to (allocation base, allocation); throws with diagnostics.
   // `writing` picks the diagnostic for a read-only mapping.

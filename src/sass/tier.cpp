@@ -272,7 +272,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "cs2r", "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "iabs", "ldc",
-                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
+                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -343,6 +343,9 @@ const FormImpl& form_impl(Form f) {
       {Impl::Own, "UFLO, UPOPC: uniform datapath, bit counts"},
       {Impl::Own, "USEL: uniform datapath, a select"},
       {Impl::Kernel, "hmma, with the kind from Runner::hmma_kernel_kind (VGPU_TC_EXACT and the sm_86 tensor-core model), as exec_mma calls it"},
+      {Impl::Own, "MATCH: lane-value equality classes of 32- or 64-bit integers, no format"},
+      {Impl::Own, "LDSM: 32-bit words of the block's shared memory moved into the fragment registers; faults and the slow cases go to exec_mem"},
+      {Impl::Own, "IMMA: integer products summed in 64 bits and cut to 32 (or clamped per 128 bits under .SAT), no number format"},
   };
   static_assert(sizeof table / sizeof table[0] == static_cast<size_t>(Form::Count_), "form_impl: one entry per Form");
   const unsigned i = static_cast<unsigned>(f);
@@ -439,6 +442,71 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.c = ra;
       m.imm = ins.w.sfield(38, 16);
       accept(Form::Ldc);
+      return;
+    }
+    case Op::LDSM: {   // ldmatrix of 16-bit elements (the packed 4-, 6- and 8-bit forms are the interpreter's): matrix i's rows are at the addresses of lanes 8i..8i+7
+      if (ins.f[3] != 0 && ins.f[3] != 2) return;
+      if (ins.f[2] != 0 || ins.f[0] < 1 || ins.f[0] > 4 || ins.dst.empty() || ins.dst[0].kind != Kind::Reg || ins.src.empty()) return;
+      const bool ur = ins.w.bit(91);
+      const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
+      unsigned u = ~0u;
+      if (ur) {
+        u = static_cast<unsigned>(ins.w.field(32, sm >= 100 ? 8 : 6));
+        if (u == (sm >= 100 ? 255u : 63u)) u = ~0u;
+      }
+      const unsigned d = ins.dst[0].reg;
+      if (ra != kRZ) maxreg = static_cast<uint16_t>(ra + 1);
+      if (d != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(d + ins.f[0]));
+      m.a = ins.f[0];
+      m.b = ins.f[1] ? 1 : 0;
+      m.s[0].off = ra;
+      m.s[1].off = u;
+      m.imm = ins.src[0].imm;
+      m.dst = d == kRZ ? kNoReg : static_cast<uint16_t>(d);
+      accept(Form::Ldsm);
+      return;
+    }
+    case Op::IMMA: {   // exec_mma's integer path: dense, 8- or 4-bit elements of both operands, s32 accumulator
+      if (ins.f[3] || ins.dst.empty() || ins.dst[0].kind != Kind::Reg || ins.src.size() < 3) return;
+      for (int i = 0; i < 3; ++i)
+        if (ins.src[i].kind != Kind::Reg) return;
+      static const unsigned ks[] = {16, 0, 32, 0, 16, 32, 64, 128};
+      const unsigned shape = ins.f[0];
+      if (shape >= 8 || !ks[shape] || ins.f[4] != ins.f[5]) return;
+      const unsigned M = shape < 4 ? 8 : 16, K = ks[shape], per_reg = ins.f[4] ? 8 : 4;
+      const unsigned a_regs = M * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = M * 8 / 32;
+      const unsigned ra = ins.src[0].reg, rb = ins.src[1].reg, rc = ins.src[2].reg, rd = ins.dst[0].reg;
+      if (rd != kRZ) maxreg = std::max<unsigned>(maxreg, rd + c_regs);
+      if (ra != kRZ) maxreg = std::max<unsigned>(maxreg, ra + a_regs);
+      if (rb != kRZ) maxreg = std::max<unsigned>(maxreg, rb + b_regs);
+      if (rc != kRZ) maxreg = std::max<unsigned>(maxreg, rc + c_regs);
+      if (maxreg > 255) return;
+      m.s[0].off = ra;   // raw register numbers (kRZ: zeros)
+      m.s[1].off = rb;
+      m.s[2].off = rc;
+      m.dst = rd == kRZ ? kNoReg : static_cast<uint16_t>(rd);
+      m.a = M;
+      m.b = K;
+      m.aux = static_cast<uint8_t>((ins.f[1] ? 1 : 0) | (ins.f[2] ? 2 : 0) | (ins.f[6] ? 4 : 0) | (ins.f[4] ? 8 : 0));
+      accept(Form::Imma);
+      return;
+    }
+    case Op::MATCH: {   // the lanes' values grouped by equality (exec_warp): ANY gives each lane the mask of the lanes holding its value, ALL whether every lane holds one
+      const bool any = ins.f[0], u64 = ins.f[1];
+      if (ins.dst.empty() || ins.src.empty() || ins.src[0].kind != Kind::Reg || ins.dst.back().kind != Kind::Reg) return;
+      if (ins.dst.size() > 1 && (any || ins.dst[0].kind != Kind::Pred)) return;
+      const unsigned ra = ins.src[0].reg;
+      if (ra != kRZ) {
+        if (u64 && ra + 1 >= kRZ) return;
+        maxreg = static_cast<uint16_t>(ra + (u64 ? 2 : 1));
+        m.s[0].kind = SrcKind::Row;
+        m.s[0].off = ra * 32u;
+        if (u64) { m.s[1].kind = SrcKind::Row; m.s[1].off = (ra + 1) * 32u; }
+      }
+      if (!reg_dst(ins.dst.back(), m.dst, maxreg)) return;
+      m.dst2 = ins.dst.size() > 1 ? static_cast<uint16_t>(ins.dst[0].reg) : static_cast<uint16_t>(kPT);
+      m.aux = static_cast<uint8_t>((any ? 1 : 0) | (u64 ? 2 : 0));
+      accept(Form::Match);
       return;
     }
     case Op::BRA: {
@@ -1202,7 +1270,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
 namespace {
 bool read_request() {
   const char* v = std::getenv("VGPU_TIER");
-  return v && v[0] == '1' && v[1] == 0;
+  return !(v && v[0] == '0' && v[1] == 0);   // on unless VGPU_TIER=0
 }
 }  // namespace
 
