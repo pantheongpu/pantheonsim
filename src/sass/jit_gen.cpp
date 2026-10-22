@@ -130,31 +130,31 @@ void setp2(W& w, const OpFacts& o, bool negate_second) {   // ISETP / FSETP: the
 
 std::string RowCtx::row(unsigned reg, bool write) {
   char buf[64];
-  if (!enabled || (!decl.count(reg) && decl.size() >= cap)) {
+  const auto direct = [&] {
     std::snprintf(buf, sizeof buf, "(R + %uu)", reg * 32u);
-    return buf;
+    return std::string(buf);
+  };
+  if (!write) {
+    reads.insert(reg);
+    // A row this region has not written is the register file's own (nothing to copy); one it has written is the local copy.
+    const auto it = st.find(reg);
+    if (!enabled || it == st.end()) return direct();
+    std::snprintf(buf, sizeof buf, "X%u", reg);
+    return std::string(buf);
   }
+  if (!enabled || (!decl.count(reg) && decl.size() >= cap)) return direct();
   decl.insert(reg);
   char name[16];
   std::snprintf(name, sizeof name, "X%u", reg);
   const auto it = st.find(reg);
-  if (!write) {
-    reads.insert(reg);
-    if (it == st.end()) {
-      std::snprintf(buf, sizeof buf, "    ldrow(%s, R + %uu);\n", name, reg * 32u);
+  if (it == st.end()) {   // lanes outside the executing mask keep the old value: it must be here first (a whole-row write needs no load)
+    if (!mut("res_nomask")) {
+      std::snprintf(buf, sizeof buf, "    if (ex != 0xffffffffu) ldrow(%s, R + %uu);\n", name, reg * 32u);
       pre += buf;
-      st[reg] = 1;
     }
-  } else {
-    if (it == st.end()) {   // lanes outside the executing mask keep the old value: it must be here first (a whole-row write needs no load)
-      if (!mut("res_nomask")) {
-        std::snprintf(buf, sizeof buf, "    if (ex != 0xffffffffu) ldrow(%s, R + %uu);\n", name, reg * 32u);
-        pre += buf;
-      }
-      st[reg] = 2;
-    } else if (!(mut("res_dstsrc") && reads.count(reg))) {
-      it->second = 2;
-    }
+    st[reg] = (mut("res_dstsrc") && reads.count(reg)) ? 1 : 2;
+  } else if (!(mut("res_dstsrc") && reads.count(reg))) {
+    it->second = 2;
   }
   return name;
 }

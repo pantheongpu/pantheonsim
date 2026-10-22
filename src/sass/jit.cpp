@@ -363,8 +363,15 @@ std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence) {
     std::map<unsigned, uint64_t> pend_cls;     // unguarded ops since the last flush, by class
     std::set<unsigned> pend_dyn;                // classes with a guarded op since the last flush
     bool pend_dyn_any = false;
+    std::vector<size_t> pend_notes;
     const auto flush = [&] {
       if (pend_ops == 0) return;
+      if (!pend_notes.empty()) {
+        s += "  if (c->flags & 1u) {\n";
+        for (size_t n : pend_notes) put("    c->note(c, %zuu);\n", n);
+        s += "  }\n";
+        pend_notes.clear();
+      }
       put("  *c->steps += %lluu; *c->instructions += %lluu;\n", static_cast<unsigned long long>(pend_ops), static_cast<unsigned long long>(pend_ops));
       if (pend_unguarded || pend_dyn_any)
         put("  *c->thread_instructions += %s%s%s;\n", pend_unguarded ? ("static_cast<uint64_t>(glanes) * " + std::to_string(pend_unguarded) + "u").c_str() : "",
@@ -425,7 +432,7 @@ std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence) {
           s += body;
           s += "    }\n";
         }
-        put("    if (c->flags & 1u) c->note(c, %zuu);\n", i);
+        pend_notes.push_back(i);   // (the tier's statistics of the op: written at the next flush, so that no call sits between two generated ops)
       }
       s += "  }\n";
     }
@@ -447,6 +454,9 @@ std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence) {
 }
 
 // ---- the engine -----------------------------------------------------------------------------------------------------------------------
+
+// (process-wide: two engines in one process, as the tests have, must not make the same temporary file name)
+static std::atomic<uint64_t> g_seq{0};
 
 struct Engine::Impl {
   std::mutex mu;
@@ -615,7 +625,7 @@ Result Engine::obtain_selected(const UnitSpec& full, const std::vector<uint32_t>
   for (uint32_t i : sel) text += " " + std::to_string(i);
   text += "\n";
   const std::string dir = cache_path();
-  const std::string tmp = dir + "/" + skey + "." + std::to_string(::getpid()) + "." + std::to_string(p_->seq.fetch_add(1)) + ".seltmp";
+  const std::string tmp = dir + "/" + skey + "." + std::to_string(::getpid()) + "." + std::to_string(g_seq.fetch_add(1)) + ".seltmp";
   if (!write_file(tmp, text) || ::rename(tmp.c_str(), (dir + "/" + skey + ".sel").c_str()) != 0) ::unlink(tmp.c_str());   // (a failure only costs the next run its lookup)
   return r;
 }
@@ -636,7 +646,7 @@ std::string Engine::ensure_rt() {
     const std::string path = p_->rt_dir + "/" + name;
     std::string have;
     if (read_file(path, have) && have == *text) continue;
-    const std::string tmp = path + "." + std::to_string(::getpid()) + "." + std::to_string(p_->seq.fetch_add(1)) + ".tmp";
+    const std::string tmp = path + "." + std::to_string(::getpid()) + "." + std::to_string(g_seq.fetch_add(1)) + ".tmp";
     if (!write_file(tmp, *text) || ::rename(tmp.c_str(), path.c_str()) != 0) {
       ::unlink(tmp.c_str());
       p_->rt_err = std::string("cannot write ") + path + ": " + std::strerror(errno);
@@ -765,7 +775,7 @@ Result Engine::obtain(const UnitSpec& spec) {
   Result out;
   out.key = key;
   out.replaced_corrupt = damaged || again.replaced_corrupt;
-  const std::string stem = dir + "/" + key + "." + std::to_string(::getpid()) + "." + std::to_string(p_->seq.fetch_add(1));
+  const std::string stem = dir + "/" + key + "." + std::to_string(::getpid()) + "." + std::to_string(g_seq.fetch_add(1));
   const std::string tmp_cpp = stem + ".cpp", tmp_so = stem + ".so";
   if (const std::string rterr = ensure_rt(); !rterr.empty()) {
     out.status = Status::CacheUnusable;
