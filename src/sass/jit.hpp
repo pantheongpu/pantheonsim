@@ -17,8 +17,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -97,8 +99,30 @@ struct OpFacts {
 // Whether the generator computes this form itself (a form it does not, or a source it cannot, stays an escape). Called on a facts record
 // with `form` set to the MOp's, by make_unit, which then clears `form` if this says no.
 bool generates(const OpFacts& o);
+
+// Register residence (milestone 3). Within a region the generated code keeps the register-file rows it touches in local arrays (and
+// predicates in locals): a row is loaded at its first read (or, for a write that may not cover every lane, at its first write, since the
+// lanes outside the executing mask keep their old value), kept, and stored back before every escape (the tier's handler reads and writes the
+// real register file) and at the region's end; after an escape no row is trusted. RowCtx is the generator's account of that, per region.
+struct RowCtx {
+  bool enabled = true;                  // false: every access goes straight to the register file (milestone 2's code)
+  unsigned cap = 32;                    // at most this many rows get an array; others are accessed in place
+  std::map<unsigned, uint8_t> st;       // rows with a valid local copy: 1 clean, 2 dirty
+  std::set<unsigned> decl;              // rows that have an array
+  uint8_t pst[8] = {};                  // predicates P0..P6 likewise (0: not loaded)
+  std::set<unsigned> pdecl;
+  std::set<unsigned> reads;             // rows the op being generated reads (for the mutation checks)
+  std::string pre;                      // loads the op being generated needs; emitted before its body, outside the guard
+  std::string row(unsigned reg, bool write);                 // a pointer expression for the row
+  std::string pred(unsigned reg, bool neg);                  // the lane mask of a predicate register
+  std::string setp(unsigned reg, const std::string& value);  // the statement that writes the executing lanes of a predicate
+  std::string flush_pre();                                    // takes `pre`
+  void sync(std::string& out, bool invalidate);              // stores every dirty row and predicate; invalidate: forget all copies (an escape follows)
+  std::string decls() const;
+};
+
 // The C++ for a generated op: a block that reads `R` (the register file), `c` (the Ctx) and `ex` (the executing lanes).
-std::string gen_op_body(const OpFacts& o);
+std::string gen_op_body(const OpFacts& o, RowCtx& rc);
 struct RegionSpec {
   std::vector<OpFacts> ops;
 };
@@ -112,6 +136,7 @@ struct Config {
   std::string cxx;                  // "": c++, g++, clang++ on PATH
   std::string path;                 // PATH to search; "": the process's
   std::string extra_flags;          // appended to the compile command (and part of the key)
+  bool residence = true;            // keep register-file rows in locals within a region (VGPU_JIT_RESIDENCE=0: not)
   unsigned timeout_s = 120;         // wall limit of one compile
   unsigned mem_mb = 4096;           // RLIMIT_AS of the compiler
   // For tests: replaces dlopen (returns null and fills the error on a failure), and the ISA level the key and flags use.
@@ -155,7 +180,7 @@ class Engine {
   explicit Engine(Config cfg);
   ~Engine();
   // The C++ the generator writes for the unit (deterministic: a function of the spec only).
-  static std::string source(const UnitSpec& spec, bool avx2 = true);
+  static std::string source(const UnitSpec& spec, bool avx2 = true, bool residence = true);
   // The words the object's metadata array must hold for the spec.
   static std::vector<uint32_t> meta(const UnitSpec& spec);
   // The 32-hex-digit key: the source, the compiler's identity, flags, ISA level, ABI and generator versions. Empty (and `why` set) with no compiler.

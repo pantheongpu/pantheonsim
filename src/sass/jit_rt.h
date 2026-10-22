@@ -68,6 +68,14 @@ using namespace jk::jk_kernels;
   }
 }
 
+// The register file's row and a local copy of it (register residence).
+[[gnu::always_inline]] inline void ldrow(u32* x, const u32* r) {
+  for (unsigned l = 0; l < 32; ++l) x[l] = r[l];
+}
+[[gnu::always_inline]] inline void strow(u32* r, const u32* x) {
+  for (unsigned l = 0; l < 32; ++l) r[l] = x[l];
+}
+
 inline u32 combine(unsigned bop, u32 r, u32 acc) { return bop == 0 ? (r & acc) : bop == 1 ? (r | acc) : (r ^ acc); }
 
 alignas(32) const u32 kZeros32[32] = {};

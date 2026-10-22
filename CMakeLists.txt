@@ -191,7 +191,7 @@ file(WRITE "${_img_gen}" "${_content}")
 # ---------------------------------------------------------------------------
 option(VGPU_JIT_MUTANTS "Build the JIT's code generator with its mutation hooks (VGPU_JIT_MUTANT=<form>), for the mutation checks of the differential tests" OFF)
 if(VGPU_JIT_MUTANTS)
-  set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sass/jit_gen.cpp PROPERTIES COMPILE_DEFINITIONS VGPU_JIT_MUTANTS=1)
+  set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sass/jit_gen.cpp ${CMAKE_SOURCE_DIR}/src/sass/jit.cpp PROPERTIES COMPILE_DEFINITIONS VGPU_JIT_MUTANTS=1)
 endif()
 # The text the JIT's generated code includes (src/sass/jit.hpp), embedded in the binary.
 file(READ "${CMAKE_SOURCE_DIR}/src/simd/kernels.inc" VGPU_JIT_KERNELS)
@@ -1414,6 +1414,9 @@ target_include_directories(test_tier PRIVATE src)
 # Tier 2 (src/sass/jit.hpp), milestone 1: the generator, the cache and its verification, the failure modes, discovery, promotion.
 vgpu_unit_test(test_jit)
 target_include_directories(test_jit PRIVATE src)
+# Register residence of the generated code against the register-file code, on random regions (VGPU_JIT_RANDOM_UNITS=<n> for more).
+vgpu_unit_test(test_jit_resid)
+target_include_directories(test_jit_resid PRIVATE src)
 target_compile_definitions(test_tier PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
 target_compile_definitions(test_amd_gcn PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
