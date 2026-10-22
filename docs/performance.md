@@ -3812,3 +3812,29 @@ The golden digests changed only for the shapes this changes, recorded from origi
 gfx1250 (17), which the probe used to skip (the skip is gone; their digest was 0). `test_amd_gcn_scratch_negative` runs 12 stores and 12 loads of each of
 gfx942, gfx1030 (global accesses with the segment bits set to scratch), gfx1100 and gfx1250 at minus their size from zero registers (digest flavour 16, all zero)
 and wants the refusal; with the check as it was, it fails (`gave []`).
+
+## One PTX atomic read-modify-write (branch `speedup8-ci`)
+
+`speedup` and origin/main (#402, round 10) each had made a PTX device atomic one table lookup instead of two: `MemoryManager::rmw_scalar` with
+the interpreter's `rmw_global`, and `rmw_begin` / `rmw_commit` with the interpreter's inline fast path. Main's is the one kept (it covers the same
+cases, declines in the same ones, and has its own mutation-checked test, `test_atom_rmw`); `rmw_scalar_fn`, `rmw_scalar` and `rmw_global` are gone, and
+`test_memrmw` makes its one-lookup read-modify-writes with `rmw_begin` / `rmw_commit`. `atomic_rmw` (the lock-free compare-and-swap form the SASS and AMD
+engines use) and `load_fields` stay.
+
+## What PR #403's CI found (branch `speedup8-ci`)
+
+* **`test_amd_gcn_same_bits` on the CUDA 12.4 job, 11 of 16,806 shapes** (`v_add_f16` / `v_mul_f16` and their sdwa, e64 and dpp forms): the job builds with GCC 12
+  (this machine's is 13). Reproduced here with GCC 12.4's packages unpacked in a directory (`apt-get download` and `dpkg -x`, no root). A half add
+  or multiply is done in float, and with a NaN in both operands the result keeps one operand's payload; GCC 12 made the first operand that one, GCC 13
+  the second (the recorded digests are the second's). `half_add`, `half_sub` and `half_mul` spell the order out (`first_addf` / `first_mulf` in
+  `gcn_exec.cpp`). All the digest tests pass with both compilers, and with `VGPU_SIMD=base` (the AMD engine's AVX2/FMA/F16C paths now obey it too, and the
+  digest tests are registered a second time with it: `*_simd_base`).
+* **The sanitizer jobs (Debug, no optimization)**: signed overflow in the integer reference code (`v_mad_i32_i24`, the WMMA/MFMA integer sums, which the
+  hardware wraps) is now done unsigned (`wrap_madd`), with the same results. `test_amd_mfma_math` compared a NaN-carrying sum of the fixed operand
+  order with the compiler's own order in the test; it compares a NaN as a NaN now. In an unoptimized build 25 to 82 of the 16,000 shapes of the digest tests have other NaN payloads
+  (or, for `v_cos_f32` and a few atomics, other results; those were not traced further: the same shapes pass in every optimized build and with the tier off or on),
+  so the three digest tests allow 2 % of the shapes to differ in a build without optimization, with a note, and none in an optimized one.
+* **ThreadSanitizer**: no data race was reported anywhere. `test_amd_gcn_threads` died in `a_forked_child_launches_on_threads_of_its_own`: TSan does not
+  support threads started in a forked child of a threaded process. That case is skipped under TSan.
+* **Lint**: the `interp` job of `sass-ptx.yml` has the pr-guard step; `test_mma_fast.cpp` had a narrowing conversion; the whole tree builds with `-DVGPU_WERROR=ON`
+  (a missing `default:` in `global_access`'s switch and a narrowing in the probe were ours).

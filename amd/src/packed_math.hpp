@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "amd_simd_cap.hpp"
+
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -160,7 +162,7 @@ inline void packed_f16_lanes(const WaveArgs& a) {
 #if defined(__x86_64__)
 __attribute__((target("fma"))) inline void packed_f16_lanes_fma(const WaveArgs& a) { packed_f16_lanes<true>(a); }
 inline bool host_has_fma() {
-  static const bool has = __builtin_cpu_supports("fma");
+  static const bool has = !simd_capped_to_base() && __builtin_cpu_supports("fma");
   return has;
 }
 
@@ -220,7 +222,7 @@ __attribute__((target("avx2,fma,f16c"))) inline void packed_f16_wave_avx2(const 
 
 // Whether the AVX2 code may run: the host has the units, and its MXCSR neither flushes denormals nor reads them as zero.
 inline bool host_has_avx2_f16c() {
-  static const bool has = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
+  static const bool has = !simd_capped_to_base() && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
   return has;
 }
 #endif

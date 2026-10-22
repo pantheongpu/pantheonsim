@@ -12,6 +12,7 @@
 #include <cfenv>
 #include <csignal>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -187,6 +188,12 @@ VTEST(a_task_starts_with_the_launching_threads_float_environment_and_signal_mask
 
 // A forked child has none of its parent's threads; its first launch makes its own.
 VTEST(a_forked_child_launches_on_threads_of_its_own) {
+#if defined(__SANITIZE_THREAD__)
+  // ThreadSanitizer does not support a child that starts threads after a fork of a process that has them ("starting new threads after
+  // multi-threaded fork is not supported. Dying"): that is the case this test makes. Under it, the case is left to the other builds.
+  std::printf("SKIP: ThreadSanitizer does not support starting threads in a forked child\n");
+  return;
+#endif
   std::atomic<unsigned> sum{0};
   amd::pool::run(4, [&](unsigned i) { sum += i; });   // (the parent's pool exists)
   VCHECK_EQ(sum.load(), 6u);
