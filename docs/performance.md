@@ -3796,6 +3796,74 @@ the tile path's declines. Not profiled further. The first run of this A/B had `m
 `launch_wide`/`launch_mid` at 0.68 x: the tier had been told not to run `v_lshl_add_u64` on gfx942, which the address arithmetic of those kernels uses;
 it has a handler now.
 
+## The AMD merge's cost, found and won back (branch `sn-amdmerge`)
+
+The merge of #382 into `speedup` (above) left the gfx942 and RX 6800 rows 3 to 19 % slower than `speedup` before it (`bb46caaf`), "not profiled
+further". Profiled now, with the SIGPROF sampler (`tools/bench-amd/profile/`, a `-g` build of each tree, `SIGPROF_STACK=1`), instruction counts and the
+set of instructions that run in the interpreter (`VGPU_AMD_TIER_STATS=1`) identical in both trees on every bench workload (so the tier's declines, the
+omod/clamp rules and the denormal flushes are not the cause: nothing the benchmarks run was handed back), the causes were three:
+
+* **`scalar_alu` was an if-ladder of 81 rungs again.** The interpreter's `op == "name"_op` ladders are switches on the name's hash
+  (`amd/tools/ladder-to-switch.py`); #382 edited inside the old ladders, and the merge kept its ladder form for `scalar_alu`. One rung of it
+  (`s_flbit_i32_i64`, #382's) had a `break` inside a `for`, which is outside a loop of the converter's own: the converter leaves a chain alone that has one (a switch would
+  capture the `break`), and said nothing (`chains: 0`). Every scalar instruction the tier does not do (`s_mul_hi_u32`, `s_cselect`, `s_lshr_b32` ...) walked down up
+  to 81 hash comparisons: 9 % of the RX 6800 `smem` kernel's samples (`OpName::operator==`). The rung is written without the `break`, the converter run, and
+  `lint_amd_ladders` (`tests/lint/check_ladders.py`) fails for any chain of 12 or more instruction names left as an if-ladder in `gcn_exec.cpp`
+  (on the file before this change it fails with `gcn_exec.cpp:1484: an if-ladder of 81 rungs naming 111 instructions`).
+* **`scalar_load` grew a frame.** #382 added the buffer stores and buffer atomics to it, and the plain dword load (`s_load_dword*`, the case that matters) paid
+  for the function's size. The plain load is the function now (`scalar_load`, address in `scalar_load_base`) and the rest is `scalar_load_general`, out of line.
+* **`Machine::step` was one big function.** Its frame (0x6f8 bytes, a stack protector, six callee-saved registers pushed) was paid for by every
+  instruction, the tier's included, and #382's additions (PC sampling, VSKIP) made it bigger. `step` is now the debugger check (once per machine, `debug_on`,
+  instead of a call to `debug::active()` per instruction; the session's check is `debug_check`, out of line), the fetch and the tier; the interpreter's own work is
+  `step_interp`, out of line. This is where the rows beyond the pre-merge numbers come from.
+
+Alternating A/B, `tools/bench-amd/bench.sh --build pre --build work`, 11 runs, size full, 1 thread, pinned to CPUs 20-27 of server2 (load 14 to 26: other
+agents' builds), median ratio of the rate (> 1: faster); the A/A noise on the same rows (two copies of one build) is 0.2 to 1 %. `pre` is `bb46caaf`;
+"merged" is the ratio the merge had (the table above); counters identical in every row.
+
+| workload | target | merged / pre | now / pre |
+| --- | --- | ---: | ---: |
+| valu_int | mi300x | | 1.22 |
+| valu_int | rx6800 | | 1.21 |
+| valu_f32 | mi300x | | 1.13 |
+| valu_f32 | rx6800 | | 1.05 |
+| valu_f64 | mi300x | 0.91 | 1.08 |
+| valu_f64 | rx6800 | 0.95 | 1.10 |
+| mfma | mi300x | 0.95 | 1.05 |
+| mfma_i8 | mi300x | 1.00 | 1.07 |
+| mfma_fp8 | mi300x | 0.94 | 0.89 |
+| mfma_bf16 | mi300x | 0.94 | 1.12 |
+| mfma_f64 | mi300x | 0.99 | 1.00 |
+| smfmac | mi300x | 0.89 | 0.93 |
+| mem | mi300x | 0.98 | 1.05 |
+| mem | rx6800 | 0.99 | 1.08 |
+| lds | mi300x | 0.98 | 1.09 |
+| lds | rx6800 | 0.94 | 1.13 |
+| narrow | mi300x | 0.96 | 0.98 |
+| narrow | rx6800 | 0.99 | 1.04 |
+| smem | mi300x | 0.89 | 1.22 |
+| smem | rx6800 | 0.81 | 1.27 |
+| buf | mi300x | 1.01 | 1.03 |
+| buf | rx6800 | 1.00 | 1.04 |
+| ldsx | mi300x | 0.95 | 1.12 |
+| ldsx | rx6800 | 0.95 | 1.19 |
+| flat | mi300x | 0.95 | 1.04 |
+| flat | rx6800 | 0.92 | 1.05 |
+| atomics | mi300x | 0.98 | 1.05 |
+| atomics | rx6800 | 1.01 | 1.06 |
+| divergent | mi300x | 1.00 | 1.21 |
+| divergent | rx6800 | 1.00 | 1.27 |
+| wave | mi300x | 0.97 | 1.20 |
+| wave | rx6800 | 1.00 | 1.26 |
+
+The `scalar_alu` switch alone (before the other two) took `smem` from 0.88 and 0.84 of `pre` to 0.96 and 0.98, `lds` on the RX 6800 5 % up; the other two
+pieces gave the rest. Left: `mfma_fp8` (0.89) and `smfmac` (0.93). Profiled, the matrix tile path's code is the same in both trees and the
+samples are the same lines; the extra time is in the small-float table lookup of the decode (`matrix_elem<'e'>`, 61 samples of `pre`, 100 of the tree with
+the split `step`): which build is slow in it moves with the layout of the code and the heap (the merged tree was 0.97 of `pre` on `mfma_fp8` by direct runs, the split one 0.89, `smfmac` the other way), a
+store-to-load false dependency between the tile buffers and the table is the likely cause, and it is for the matrix tile path's rewrite to avoid, not for
+a fix here. The SAME-BITS guards pass unchanged in Release (`test_amd_gcn_same_bits`, `_packed_`, `_memory_`, `_tier_`, `test_amd_codeobject_same_bits`, `test_amd_matrix_fast`,
+`test_amd_mfma_math`, `test_amd_nan_order`, each also at `VGPU_SIMD=base`).
+
 ## A scratch access that wrapped its range check (branch `speedup7-scratch`)
 
 `scratch_at` tested `offset + bytes > scratch_per_lane` with an unsigned offset. An instruction offset that is negative (`scratch_store_b128 v9,

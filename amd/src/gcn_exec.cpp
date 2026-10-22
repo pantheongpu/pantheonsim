@@ -456,7 +456,9 @@ struct Machine {
   const bool lock_free = atomics_lock_free(), runs_on = memory_runs();
   // The pre-decoded tier (gcn_tier.cpp) runs when it is on and nothing watches instructions one at a time (VGPU_TRACE_WAVE, the debugger).
   // (Not while PC sampling is attached: the tier would step past the instructions that are to be sampled.)
-  const bool tier_on = gcn::tier::enabled() && !tracing() && !debug::active() && !(d.sampler && d.sampler->interval);
+  // (Whether the debugger is on is fixed for the process, so step asks once, here, and not through a call on each instruction.)
+  const bool debug_on = debug::active();
+  const bool tier_on = gcn::tier::enabled() && !tracing() && !debug_on && !(d.sampler && d.sampler->interval);
   // A vector load or store of device memory. ROCm runs CDNA with unaligned
   // access enabled (SH_MEM_CONFIG's unaligned mode), so a word may start at
   // any byte, and the compiler counts on it -- printf packs its string eight
@@ -2557,12 +2559,33 @@ struct Machine {
 }
   }
 
+  // A scalar load's address: the base, the instruction's own offset, and a scalar register's where it names one.
+  // (RDNA's decoder keeps the register as the second source: null, reading zero, where there is none.)
+  uint64_t scalar_load_base(const Wave& w, const Inst& in) const {
+    return scalar(w, in.src[0]) + static_cast<uint64_t>(in.offset) + (in.has_saddr ? scalar_field(w, in.saddr, false) : 0) +
+           (gcn::is_rdna(in.arch) && in.src.size() > 1
+                ? scaled_offset(in, static_cast<uint32_t>(scalar(w, in.src[1])), in.dst.empty() ? 4 : 4 * in.dst[0].width)
+                : 0);
+  }
+  // The plain dword loads (s_load_dword .. dwordx16) are the case that matters; the rest (counters, stores, atomics, buffer forms,
+  // sub-dword loads) is out of line, so this one stays small (the general function's frame and spills cost an RX 6800 scalar-load
+  // kernel 5 %).
   void scalar_load(Wave& w, const Inst& in) {
+    gcn::MemFacts mem_scratch;
+    const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);   // (what the name says, worked out when decoded)
+    if (mf.smem == gcn::SmemKind::Load) {
+      const uint64_t base = scalar_load_base(w, in);
+      const uint32_t words = in.dst[0].width;
+      for (uint32_t i = 0; i < words; ++i)
+        set_sgpr(w, in.dst[0].index + i, static_cast<uint32_t>(at(base + 4 * i).load_scalar(base + 4 * i, 4)));
+      return;
+    }
+    scalar_load_general(w, in, mf);
+  }
+  [[gnu::noinline]] void scalar_load_general(Wave& w, const Inst& in, const gcn::MemFacts& mf) {
     // gfx1250's scalar prefetches (s_prefetch_inst, s_prefetch_data, their PC-relative forms, s_buffer_prefetch_data) warm
     // the constant or instruction cache: "1 = enable ... 0 = ignore them (S_NOP)" (CDNA5 ISA, MODE, and 8.5). There is
     // no cache here to warm, and a prefetch changes no register, so it does nothing (the buffer form checks no bounds).
-    gcn::MemFacts mem_scratch;
-    const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);   // (what the name says, worked out when decoded)
     using SK = gcn::SmemKind;
     if (mf.smem == SK::Prefetch) return;
     // Counters, rather than loads. s_memtime is the shader clock, which on a
@@ -2587,12 +2610,7 @@ struct Machine {
     // it names one.
     // (RDNA's decoder keeps the register as the second source: null, reading
     // zero, where there is none.)
-    const uint64_t base = scalar(w, in.src[0]) + static_cast<uint64_t>(in.offset) +
-                          (in.has_saddr ? scalar_field(w, in.saddr, false) : 0) +
-                          (gcn::is_rdna(in.arch) && in.src.size() > 1
-                               ? scaled_offset(in, static_cast<uint32_t>(scalar(w, in.src[1])),
-                                               in.dst.empty() ? 4 : 4 * in.dst[0].width)
-                               : 0);
+    const uint64_t base = scalar_load_base(w, in);
     if (mf.smem == SK::Store) {
       for (uint32_t i = 0; i < in.dst[0].width; ++i)
         at(base + 4 * i).store_scalar(base + 4 * i, 4, sgpr(w, in.dst[0].index + i));
@@ -11489,10 +11507,16 @@ struct Machine {
     }
     return done;
   }
-  bool step(Wave& w, Group& g) {
-    if (debug::active() &&
-        debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
+  // A debugger session's check before an instruction (the std::string it builds for the kernel's name kept this frame's stack and its
+  // protector on every step).
+  [[gnu::noinline]] void debug_check(Wave& w, Group& g) {
+    if (debug::should_stop(d.kernel ? d.kernel->name : std::string(), w.pc - d.code_base - (d.kernel ? d.kernel->entry : 0), &w))
       debug_stop(w, g);
+  }
+  // What runs for every instruction a wave issues is this, kept small (a frame of a few words and no stack protector, for the
+  // instructions the tier does whole); the interpreter's own work is step_interp's, out of line.
+  bool step(Wave& w, Group& g) {
+    if (__builtin_expect(debug_on, 0)) debug_check(w, g);
     const Inst& decoded = fetch(w.pc);
     if (tier_on) {
       if (decoded.fast.run) {
@@ -11501,6 +11525,9 @@ struct Machine {
         gcn::tier::note_interp(decoded.name.c_str(), false);
       }
     }
+    return step_interp(w, g, decoded);
+  }
+  [[gnu::noinline]] bool step_interp(Wave& w, Group& g, const Inst& decoded) {
     const uint64_t pc_here = w.pc;
     // gfx1250's vector register numbers past v255: the instruction as it names them with the wave's MSBs on.
     InstCopy remapped;   // (made only when the wave has VGPR MSBs: building and tearing down an Inst for each step cost 2-5%)
@@ -11513,7 +11540,7 @@ struct Machine {
     // them on a card. Nothing of the instruction has run: not counted yet, pc not moved, and the wave is back on this
     // instruction in the round's next pass. A masked-off store waits for no one (and keeps the gate for a real one),
     // nor does a lone wave, nor a debugger session, which steps in a fixed order.
-    if (w.store_gate && w.exec != 0 && g.waves.size() > 1 && !debug::active() && is_plain_store(in)) {
+    if (w.store_gate && w.exec != 0 && g.waves.size() > 1 && !debug_on && is_plain_store(in)) {
       w.store_gate = false;
       w.soft_yield = true;
       return false;
