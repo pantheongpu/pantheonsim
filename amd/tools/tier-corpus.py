@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 
-llvm_mc, mcpu, out = sys.argv[1], sys.argv[2], sys.argv[3]
+llvm_mc, mcpu, out = sys.argv[1], sys.argv[2], sys.argv[3]   # (--show-refused: also lists the lines the target refuses)
 
 lines = []
 
@@ -154,6 +154,57 @@ for op in ['s_bitcmp0_b64', 's_bitcmp1_b64']:
         add('%s %s' % (op, ops))
 add('s_endpgm')
 
+# ---- packed, divide helpers, mixed precision, double-precision one-input functions
+for ops in ['v[2:3], v[4:5], v[6:7]', 'v[2:3], v[4:5], v[6:7] op_sel:[1,0]', 'v[2:3], v[4:5], v[6:7] op_sel:[0,1]', 'v[2:3], v[4:5], v[6:7] op_sel:[1,1]',
+            'v[2:3], s[4:5], v[6:7]', 'v[2:3], s[4:5], v[6:7] op_sel:[1,1]', 'v[2:3], s4, s5', 'v[2:3], v[4:5], 1.0', 'v[2:3], 0x1234567, v[6:7]',
+            'v[2:3], v[2:3], v[2:3] op_sel:[1,0]', 'v[2:3], v[3:4], v[2:3] op_sel:[1,1]']:
+    add('v_pk_mov_b32 ' + ops)
+for op in ['v_pk_fma_f16', 'v_pk_add_f16', 'v_pk_mul_f16']:
+    n = 3 if 'fma' in op else 2
+    arr = lambda *v: '[' + ','.join(str(x) for x in v[:n]) + ']'
+    srcs = ['v2, v3, v4', 'v2, s3, v4', 'v2, 1.0, v4', 'v2, v3, 0x3c00', 'v2, v3, v3']
+    mods = ['', ' op_sel:%s op_sel_hi:%s' % (arr(1, 0, 1), arr(0, 1, 0)), ' neg_lo:%s neg_hi:%s' % (arr(1, 0, 0), arr(0, 1, 1)), ' clamp',
+            ' op_sel_hi:%s' % arr(1, 1, 1), ' op_sel:%s op_sel_hi:%s' % (arr(1, 1, 1), arr(0, 0, 0))]
+    for sx in srcs:
+        for m in mods:
+            add('%s v1, %s%s' % (op, ', '.join(sx.split(', ')[:n]), m))
+for op in ['v_pk_fma_f32', 'v_pk_add_f32', 'v_pk_mul_f32']:
+    n = 3 if 'fma' in op else 2
+    for sx in ['v[2:3], v[4:5], v[6:7]', 'v[2:3], s[4:5], v[6:7]', 'v[2:3], v[4:5], v[6:7] op_sel:[1,0,1] op_sel_hi:[0,1,0]',
+               'v[2:3], v[4:5], v[6:7] neg_lo:[1,0,0] neg_hi:[0,1,1]', 'v[2:3], v[4:5], v[6:7] clamp']:
+        regs = sx.split(' ', 1)
+        r = regs[0].split(', ')[:n]
+        add('%s v[0:1], %s%s' % (op, ', '.join(r), (' ' + regs[1]) if len(regs) > 1 else ''))
+for t in ['f32', 'f64']:
+    for sx in ['v1, vcc, v2, v3, v4', 's[2:3], v2, v3, v4']:
+        pass
+for ops in ['v1, vcc, v2, v3, v4', 'v1, s[2:3], v2, v3, v4', 'v1, vcc, -v2, |v3|, v4', 'v1, vcc, 1.0, v3, v4', 'v1, vcc, v2, v3, 0x3f800000']:
+    add('v_div_scale_f32 ' + ops)
+for ops in ['v[0:1], vcc, v[2:3], v[4:5], v[6:7]', 'v[0:1], s[2:3], v[2:3], v[4:5], v[6:7]', 'v[0:1], vcc, -v[2:3], |v[4:5]|, v[6:7]']:
+    add('v_div_scale_f64 ' + ops)
+for op in ['v_div_fmas_f32', 'v_div_fixup_f32']:
+    for ops in ['v1, v2, v3, v4', 'v1, -v2, v3, |v4|', 'v1, s2, v3, v4', 'v1, 1.0, v3, v4', 'v1, v2, v3, v4 clamp']:
+        add('%s %s' % (op, ops))
+for op in ['v_div_fmas_f64', 'v_div_fixup_f64']:
+    for ops in ['v[0:1], v[2:3], v[4:5], v[6:7]', 'v[0:1], -v[2:3], v[4:5], |v[6:7]|', 'v[0:1], v[2:3], v[4:5], 1.0']:
+        add('%s %s' % (op, ops))
+for op in ['v_fma_mix_f32', 'v_fma_mixlo_f16', 'v_fma_mixhi_f16']:
+    for mods in ['', ' op_sel_hi:[1,0,0]', ' op_sel_hi:[1,1,1]', ' op_sel:[1,0,1] op_sel_hi:[1,1,1]', ' op_sel_hi:[1,1,0] clamp', ' op_sel_hi:[0,1,1] neg_lo:[1,0,1]',
+                 ' op_sel_hi:[1,1,1] neg_hi:[0,1,0]']:
+        for srcs in ['v1, v2, v3, v4', 'v1, s2, v3, v4', 'v1, 1.0, v3, v4', 'v1, v2, v3, 0.5', 'v1, -v2, |v3|, v4', 'v1, v2, v3, 0x3f800000']:
+            add('%s %s%s' % (op, srcs, mods))
+for op in ['v_rcp_f64', 'v_sqrt_f64', 'v_floor_f64', 'v_ceil_f64', 'v_trunc_f64', 'v_rndne_f64']:
+    for ops in ['v[2:3], v[4:5]', 'v[2:3], s[4:5]', 'v[2:3], 0.5', 'v[2:3], 0x41f00000']:
+        add('%s_e32 %s' % (op, ops))
+    for ops in ['v[2:3], -v[4:5]', 'v[2:3], |v[4:5]|', 'v[2:3], v[4:5] clamp', 'v[2:3], v[4:5] mul:2']:
+        add('%s_e64 %s' % (op, ops))
+for op in ['v_add_f64', 'v_mul_f64']:
+    for ops in ['v[2:3], v[4:5], v[6:7]', 'v[2:3], -v[4:5], |v[6:7]|', 'v[2:3], s[4:5], v[6:7]', 'v[2:3], 1.0, v[6:7]', 'v[2:3], v[4:5], v[6:7] clamp']:
+        add('%s %s' % (op, ops))
+for ops in ['v[2:3], v[4:5], v[6:7], v[8:9]', 'v[2:3], -v[4:5], v[6:7], |v[8:9]|', 'v[2:3], s[4:5], v[6:7], v[8:9]', 'v[2:3], v[4:5], v[6:7], 1.0']:
+    add('v_fma_f64 ' + ops)
+add('v_fmac_f64_e32 v[2:3], v[4:5], v[6:7]')
+
 # ---- assemble: drop what the target refuses
 def assemble(ls):
     src = '\n'.join(ls) + '\n'
@@ -163,6 +214,7 @@ def assemble(ls):
 
 
 p, bad = assemble(lines)
+refused = [l for i, l in enumerate(lines, 1) if i in bad]
 lines = [l for i, l in enumerate(lines, 1) if i not in bad]
 p, bad = assemble(lines)
 if bad:
@@ -177,4 +229,6 @@ for m in re.finditer(r'^\t(.*?)\s*; encoding: \[(.*?)\]$', p.stdout, re.M):
 assert len(rows) == len(lines), (len(rows), len(lines))
 with open(out, 'w') as f:
     f.write('\n'.join(rows) + '\n')
-print('%s: %d instructions' % (out, len(rows)))
+print('%s: %d instructions (%d refused by the target)' % (out, len(rows), len(refused)))
+if '--show-refused' in sys.argv:
+    print('\n'.join(refused))

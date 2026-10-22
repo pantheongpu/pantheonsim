@@ -79,6 +79,8 @@ struct Op {
   Src dst, dst2;
   uint8_t unit = kUnitNone;
   uint8_t omod = 0;
+  uint8_t nan = 0;             // a float result that is a NaN: 0 the interpreter decides (the handler hands back), 1 the kernel's is the interpreter's, else
+                               // the NaN lanes are worked out again by the rule the interpreter's instruction uses (nan_order.hpp; see gcn_tier.cpp's fix_nan)
   uint8_t dsel = 6, dunused = 0;   // SDWA: the part of the destination written (dst_sel), and what the rest becomes (0 zeroes, 1 the sign, 2 kept)
   bool clamp = false;
   uint32_t sub = 0;            // handler-specific (a comparison's test, a shift count, ...)

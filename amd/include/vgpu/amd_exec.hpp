@@ -242,7 +242,7 @@ void set_fast_paths(bool lock_free_atomics, bool memory_runs);
 // it off. Read as a machine is made (a dispatch), not per instruction.
 bool matrix_fast_path();
 void set_matrix_fast_path(bool on);
-// How many matrix instructions the tile path has done since the process began (those it does not do go to the reference path).
+// How many matrix instructions the tile path has done on the calling thread since it began (those it does not do go to the reference path).
 uint64_t matrix_tile_count();
 
 }  // namespace vgpu::amd

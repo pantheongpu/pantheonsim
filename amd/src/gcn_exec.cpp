@@ -87,8 +87,8 @@ static inline double first_mul(double first, double second) { __asm__("mulsd %1,
 static inline double first_add(double first, double second) { __asm__("addsd %1, %0" : "+x"(first) : "x"(second)); return first; }
 namespace vgpu::amd {
 namespace {
-// The matrix instructions the tile path did (a test reads it: matrix_tile_count); one relaxed add each.
-std::atomic<uint64_t> g_matrix_tiles{0};
+// The matrix instructions the tile path did on this thread (a test reads it: matrix_tile_count).
+thread_local uint64_t g_matrix_tiles = 0;
 
 using gcn::Inst;
 using gcn::Operand;
@@ -10418,16 +10418,21 @@ struct Machine {
     const MatrixPlan& plan = *f.plan;
     const MatrixShape& s = *f.s;
     const uint32_t per_lane = plan.per_lane, half = per_lane / 2;
+    if (f.small) {   // (the small floats: K where the CDNA4 guide puts it, and the block scales)
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const MatrixPlan::Lane& L = plan.lane[lane];
+        for (uint32_t e = 0; e < per_lane; ++e) {
+          const uint32_t kb = matrix_small_k(f.fmt_b, L.g, e, s.k);
+          const double v = matrix_elem<T>(f.b, e, f.b_lane[lane]);
+          bp[matrix_b_at<Int>(plan, s, lane, kb)] = static_cast<V>(f.scaled ? mfma_scale_mul(v, f.sb_t[kb / 32 * 32 + lane % s.n]) : v);
+        }
+      }
+      return;
+    }
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const MatrixPlan::Lane& L = plan.lane[lane];
       const uint32_t sl = f.b_lane[lane];
       for (uint32_t e = 0; e < per_lane; ++e) {
-        if (f.small) {
-          const uint32_t kb = matrix_small_k(f.fmt_b, L.g, e, s.k);
-          const double v = matrix_elem<T>(f.b, e, sl);
-          bp[matrix_b_at<Int>(plan, s, lane, kb)] = static_cast<V>(f.scaled ? mfma_scale_mul(v, f.sb_t[kb / 32 * 32 + lane % s.n]) : v);
-          continue;
-        }
         // gfx950's sparse forms, whose B is eight registers, split it (as the reference does)
         const uint32_t kb = f.b_split ? e / half * (s.k / 2) + L.g * half + e % half : L.g * per_lane + e;
         bp[matrix_b_at<Int>(plan, s, lane, kb)] = matrix_value<T, V>(f.b, e, sl);
@@ -10645,10 +10650,16 @@ struct Machine {
     // fast path does not follow go to the reference: the small-float (f8f6f4) and scaled ones, a broadcast or lane permutation of A or
     // B (CBSZ, BLGP), and several blocks that also have several groups of K in a lane.
     if (matrix_fast) {
-      const MatrixShape* shape = matrix_shape(OpName(in.scaled ? "v_mfma_" + in.name.substr(std::string("v_mfma_scale_").size()) : in.name));
+      const MatrixShape* shape = nullptr;
+      if (in.scaled) {   // (v_mfma_scale_f32_16x16x128_f8f6f4 is the shape of v_mfma_f32_16x16x128_f8f6f4)
+        const std::string unscaled = "v_mfma_" + in.name.substr(std::string("v_mfma_scale_").size());
+        shape = matrix_shape(OpName(unscaled));
+      } else {
+        shape = matrix_shape(OpName(in.name));
+      }
       if (shape && !(in.a_bcast_size && (1u << in.a_bcast_size) > shape->blocks) &&
           matrix_multiply_fast(w, in, *shape, in.name.rfind("v_smfmac", 0) == 0)) {
-        g_matrix_tiles.fetch_add(1, std::memory_order_relaxed);
+        ++g_matrix_tiles;
         return;
       }
     }
@@ -12154,7 +12165,7 @@ namespace {
 std::atomic<bool> g_matrix_fast{true};
 }
 bool matrix_fast_path() { return g_matrix_fast.load(std::memory_order_relaxed); }
-uint64_t matrix_tile_count() { return g_matrix_tiles.load(std::memory_order_relaxed); }
+uint64_t matrix_tile_count() { return g_matrix_tiles; }
 void set_matrix_fast_path(bool on) { g_matrix_fast.store(on); }
 
 void abandon_dispatches() { g_abandoned.store(true); }

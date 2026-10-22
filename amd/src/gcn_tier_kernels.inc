@@ -214,6 +214,13 @@ TIER_F(k_fldexp, r[i] = __builtin_ldexpf(a[i], static_cast<int32_t>(ub[i])))
 TIER_D(k_dadd, r[i] = a[i] + b[i])
 TIER_D(k_dmul, r[i] = a[i] * b[i])
 TIER_D(k_dfma, r[i] = __builtin_fma(a[i], b[i], c[i]))
+// (the one-input functions: the host's exact ones; floor, ceil and trunc of a value of 2^52 or more in magnitude are the value, as the interpreter's)
+TIER_D(k_drcp, r[i] = 1.0 / a[i])
+TIER_D(k_dsqrt, r[i] = __builtin_sqrt(a[i]))
+TIER_D(k_dfloor, r[i] = __builtin_fabs(a[i]) < 4503599627370496.0 ? __builtin_floor(a[i]) : a[i])
+TIER_D(k_dceil, r[i] = __builtin_fabs(a[i]) < 4503599627370496.0 ? __builtin_ceil(a[i]) : a[i])
+TIER_D(k_dtrunc, r[i] = __builtin_fabs(a[i]) < 4503599627370496.0 ? __builtin_trunc(a[i]) : a[i])
+TIER_D(k_drndne, r[i] = __builtin_nearbyint(a[i]))
 
 // ---- 64-bit integer lanes (gathered register pairs)
 using K64 = void (*)(uint64_t* d, const uint64_t* a, const uint64_t* b, const uint64_t* c, unsigned n);

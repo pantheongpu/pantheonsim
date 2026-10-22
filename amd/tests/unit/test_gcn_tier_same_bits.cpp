@@ -105,13 +105,13 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
   amd::gcn::tier::set_enabled(was_on);
   std::fprintf(stderr, "tier handlers: %zu of %zu shapes, %zu runs each way, %llu handed back to the interpreter\n", with_handler, shapes,
                runs, static_cast<unsigned long long>(amd::gcn::tier::bails()));
-  VCHECK(with_handler > 300);
   if (wrong) {
     report += "\n  differing mnemonics:";
     for (const auto& [name, count] : failing) report += " " + name + "(" + std::to_string(count) + ")";
     for (const auto& [name, text] : example) report += "\n  " + name + ":" + text;
   }
   if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(runs) + " runs differ with the tier on:" + report);
+  VCHECK(with_handler > 300 || only);   // (a run restricted to some instructions finds few)
 }
 
 VTEST_MAIN
