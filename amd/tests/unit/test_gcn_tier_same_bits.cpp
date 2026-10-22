@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -32,6 +33,9 @@ const Corpus kCorpora[] = {
     {"isa_corpus_gfx950.txt", amd::gcn::Target::Gfx950},   {"isa_corpus_gfx90a.txt", amd::gcn::Target::Gfx90a},
     {"isa_corpus_gfx1100.txt", amd::gcn::Target::Gfx1100}, {"isa_corpus_gfx1201.txt", amd::gcn::Target::Gfx1200},
     {"isa_corpus_gfx1250.txt", amd::gcn::Target::Gfx1250}, {"isa_corpus_gfx1030.txt", amd::gcn::Target::Gfx1030},
+    // The forms of the handlers written by hand (amd/tools/tier-corpus.py): every operand kind, the VOP3 modifiers, SDWA selectors, constants.
+    {"isa_corpus_tier_gfx942.txt", amd::gcn::Target::Gfx942}, {"isa_corpus_tier_gfx90a.txt", amd::gcn::Target::Gfx90a},
+    {"isa_corpus_tier_gfx950.txt", amd::gcn::Target::Gfx950},
 };
 
 std::vector<std::string> lines_of(const std::string& path) {
@@ -48,6 +52,8 @@ std::vector<std::string> lines_of(const std::string& path) {
 VTEST(every_tier_handler_gives_the_interpreters_bits) {
   size_t shapes = 0, with_handler = 0, runs = 0, wrong = 0;
   std::string report;
+  std::map<std::string, size_t> failing;   // (by mnemonic)
+  std::map<std::string, std::string> example;   // (the first failing run of each)
   const bool was_on = amd::gcn::tier::enabled();
   amd::gcn::tier::count_bails(true);
   const char* only = std::getenv("VGPU_TIER_ONLY");   // (a substring of the instructions to run)
@@ -89,6 +95,8 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
           amd::gcn::tier::set_enabled(true);
           const uint64_t on = amd::digest_instruction(in, c.target, seed * 7919 + with_handler, flavour);
           ++runs;
+          if (off != on && ++failing[in.name] <= 2)
+            example[in.name] += std::string("\n    ") + c.file + ": " + text + " (flavour " + std::to_string(flavour) + ", seed " + std::to_string(seed) + ")";
           if (off != on && ++wrong <= 12)
             report += std::string("\n  ") + c.file + ": " + text + " (flavour " + std::to_string(flavour) + ", seed " + std::to_string(seed) + ")";
         }
@@ -98,6 +106,11 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
   std::fprintf(stderr, "tier handlers: %zu of %zu shapes, %zu runs each way, %llu handed back to the interpreter\n", with_handler, shapes,
                runs, static_cast<unsigned long long>(amd::gcn::tier::bails()));
   VCHECK(with_handler > 300);
+  if (wrong) {
+    report += "\n  differing mnemonics:";
+    for (const auto& [name, count] : failing) report += " " + name + "(" + std::to_string(count) + ")";
+    for (const auto& [name, text] : example) report += "\n  " + name + ":" + text;
+  }
   if (wrong) throw vtest::Failure(std::to_string(wrong) + " of " + std::to_string(runs) + " runs differ with the tier on:" + report);
 }
 

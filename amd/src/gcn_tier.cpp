@@ -1070,6 +1070,7 @@ constexpr uint32_t kTrigTurns = 128;  // v_sin_f32, v_cos_f32: the kernel after 
 constexpr uint32_t kIntSrc1 = 256;    // v_ldexp_f32: the second source is an integer (its bits, no float modifiers)
 constexpr uint32_t kCdnaOnly = 512;   // 16-bit forms: only the CDNA parts (gfx90a, gfx942, gfx950), whose 16-bit results fill the low half of the register
 constexpr uint32_t kNoOmod = 1024;    // the instruction's output modifier means something the kernel does not do
+constexpr uint32_t kFloatOut = 4096;  // an integer kernel with a float result: the instruction's output modifier and clamp mean something the kernel does not do
 constexpr uint32_t kRawSrc = 2048;    // the source is not a float of 32 bits (a half): float modifiers on it would flip the wrong bit
 constexpr uint32_t kMinMax = 64;     // (v_min_f32, v_max_f32: opposite zeros go to the interpreter) // the interpreter ignores omod and clamp on this one
 
@@ -1123,9 +1124,9 @@ const std::unordered_map<std::string_view, Entry>& table() {
     I("v_mbcnt_hi_u32_b32", MBCNT_HI, 2);
     I("v_cvt_i32_f32_e32", CVT_I32_F32, 1, kFloatSrc);
     I("v_cvt_u32_f32_e32", CVT_U32_F32, 1, kFloatSrc);
-    I("v_cvt_f32_u32_e32", CVT_F32_U, 1);
-    I("v_cvt_f32_i32_e32", CVT_F32_I, 1);
-    I("v_cvt_f32_ubyte0_e32", CVT_F32_UBYTE0, 1);
+    I("v_cvt_f32_u32_e32", CVT_F32_U, 1, kFloatOut);
+    I("v_cvt_f32_i32_e32", CVT_F32_I, 1, kFloatOut);
+    I("v_cvt_f32_ubyte0_e32", CVT_F32_UBYTE0, 1, kFloatOut);
     I("v_add_u16_e32", ADD_U16, 2, kNoClamp | kCdnaOnly);
     I("v_sub_u16_e32", SUB_U16, 2, kNoClamp | kCdnaOnly);
     I("v_subrev_u16_e32", SUBREV_U16, 2, kNoClamp | kCdnaOnly);
@@ -1158,9 +1159,9 @@ const std::unordered_map<std::string_view, Entry>& table() {
     I("v_max_i32_e64", MAX_I, 2);
     I("v_cvt_i32_f32_e64", CVT_I32_F32, 1, kFloatSrc);
     I("v_cvt_u32_f32_e64", CVT_U32_F32, 1, kFloatSrc);
-    I("v_cvt_f32_u32_e64", CVT_F32_U, 1);
-    I("v_cvt_f32_i32_e64", CVT_F32_I, 1);
-    I("v_cvt_f32_ubyte0_e64", CVT_F32_UBYTE0, 1);
+    I("v_cvt_f32_u32_e64", CVT_F32_U, 1, kFloatOut);
+    I("v_cvt_f32_i32_e64", CVT_F32_I, 1, kFloatOut);
+    I("v_cvt_f32_ubyte0_e64", CVT_F32_UBYTE0, 1, kFloatOut);
     const auto F = [&](std::string_view n, int k, int arity, uint32_t fl = 0) { m[n] = {Cat::F32, k, arity, fl}; };
     F("v_subrev_f32_e64", FSUBREV, 2);
     F("v_mul_f32_e64", FMUL, 2);
@@ -1629,7 +1630,8 @@ void tier_classify(Inst& in) {
       if (!vgpr_dst(in.dst[0], f.dst, 1)) return fail();
       if ((e.flags & kNoClamp) && in.clamp) return fail();
       if ((e.flags & kCdnaOnly) && in.arch != gcn::Target::Gfx90a && in.arch != gcn::Target::Gfx942 && in.arch != gcn::Target::Gfx950) return fail();
-      if ((e.flags & kNoOmod) && in.omod) return fail();
+      if ((e.flags & (kNoOmod | kFloatOut)) && in.omod) return fail();
+      if ((e.flags & kFloatOut) && in.clamp) return fail();
       if ((e.flags & kRawSrc) && (in.src[0].neg || in.src[0].abs)) return fail();
       // (CDNA3 and CDNA4 apply the clamp bit to the integer instructions that have one and to the conversions to float: the interpreter's.)
       if (in.clamp && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (!is_f || (e.flags & kIgnoreMods))) return fail();

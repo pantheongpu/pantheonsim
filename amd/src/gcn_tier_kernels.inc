@@ -181,7 +181,7 @@ TIER_F(k_fceil, r[i] = __builtin_fabsf(a[i]) < 8388608.0f ? __builtin_ceilf(a[i]
 TIER_F(k_ftrunc, r[i] = __builtin_fabsf(a[i]) < 8388608.0f ? __builtin_truncf(a[i]) : a[i])
 TIER_F(k_frndne, r[i] = __builtin_nearbyintf(a[i]))
 // (x - floor(x) held below 1; an infinity gives a NaN, which goes back)
-TIER_F(k_ffract, r[i] = __builtin_fminf(a[i] - __builtin_floorf(a[i]), 0x1.fffffep-1f))
+TIER_F(k_ffract, r[i] = a[i] != a[i] ? a[i] : __builtin_isinf(a[i]) ? __builtin_nanf("") : __builtin_fminf(a[i] - __builtin_floorf(a[i]), 0x1.fffffep-1f))
 // v_sin_f32 and v_cos_f32 count their angle in turns. The host's sin and cos of the angle in radians (the architectures the guides
 // cover keep only the fraction of a turn, which is exact in a double, so the argument stays small).
 TIER_F(k_fsin_r, r[i] = static_cast<float>(__builtin_sin(static_cast<double>(a[i]) * 6.283185307179586476925286766559)))
