@@ -24,11 +24,11 @@
 
 using namespace vgpu;
 
-// The digests were recorded from an optimized build. A build with no optimization (a sanitizer job's Debug) lets the compiler order the operands of
+// The digests were recorded from an optimized build. A build with no optimization (a sanitizer job's build) lets the compiler order the operands of
 // float operations on two NaNs, and of a few libm calls, another way, so a few of the shapes that have NaNs among their inputs come out with other
 // payloads there: up to 2 % of the shapes may differ in such a build (and a note says so); an optimized build must match every one.
 inline bool digests_may_differ(size_t wrong, size_t checked) {
-#if defined(__OPTIMIZE__)
+#if defined(__OPTIMIZE__) && !defined(__SANITIZE_THREAD__) && !defined(__SANITIZE_ADDRESS__)
   (void)wrong, (void)checked;
   return false;
 #else
