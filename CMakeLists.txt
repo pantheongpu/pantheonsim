@@ -1507,6 +1507,8 @@ target_compile_definitions(test_amd_matrix_fast PRIVATE VGPU_SOURCE_DIR="${CMAKE
 
 # The packed 16-bit float arithmetic (packed_math.hpp) against the per-lane code it replaced, and the half conversions against the compiler's.
 vgpu_unit_test(test_amd_packed_math amd/tests/unit/test_packed_math.cpp)
+# The NaN-order helpers (amd/src/nan_order.hpp) that make the float instructions give the same bits at every optimization level.
+vgpu_unit_test(test_amd_nan_order amd/tests/unit/test_nan_order.cpp)
 
 # The packed half, dot product, conversion, comparison, sine/cosine and integer instructions against digests recorded before they were made faster.
 vgpu_unit_test(test_amd_gcn_packed_same_bits amd/tests/unit/test_gcn_packed_same_bits.cpp)

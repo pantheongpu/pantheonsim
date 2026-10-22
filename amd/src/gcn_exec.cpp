@@ -34,6 +34,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
 #include "mfma_math.hpp"
+#include "nan_order.hpp"
 #ifndef SPARSE_ORDER
 #define SPARSE_ORDER 0   /* the sparse MFMA sum: which operand of the multiply and of the add a NaN takes the payload of */
 #endif
@@ -3024,7 +3025,7 @@ struct Machine {
         uint32_t r = 0;
         for (uint32_t half = 0; half < 2; ++half) {
           const float acc = static_cast<float>(as_half(static_cast<uint16_t>(d >> (16 * half))));
-          r |= uint32_t{as_bits(static_cast<_Float16>(std::fma(packed_half(w, in, 0, half, lane), packed_half(w, in, 1, half, lane), acc)))}
+          r |= uint32_t{as_bits(static_cast<_Float16>(nan_fma<0>(packed_half(w, in, 0, half, lane), packed_half(w, in, 1, half, lane), acc)))}
                << (16 * half);
         }
         write_lane(w, in.dst[0], lane, r);
@@ -3133,7 +3134,7 @@ struct Machine {
           return o.neg ? -f : f;
         };
         const float m0 = source(0), m1 = source(1), m2 = source(2);
-        float r = std::fma(m1, m0, m2);   // (this order: with two NaNs among them the one libm returns follows it)
+        float r = nan_fma<0>(m0, m1, m2);   // (with NaNs among them, m0 first and then m1 and m2: what libm gave std::fma(m1, m0, m2), spelled out so that no build swaps it)
         if (in.clamp) r = clamp01(r);
         if (op == "v_fma_mix_f32_bf16"_op) {
           write_lane(w, in.dst[0], lane, as_bits(r));
@@ -3373,10 +3374,10 @@ struct Machine {
         // v_mac_f16 on the CDNA chips is the MAD form (mad_f16_rounds_twice_, see gfx9_added_alu): the product rounded to a half
         // before the add. A half's product is exact in a float, so rounding it to a half is the one rounding.
         if (mad_f16_rounds_twice_) {
-          const float p = static_cast<float>(static_cast<_Float16>(a * b));
-          write_half(w, in, lane, static_cast<_Float16>(p + c));
+          const float p = static_cast<float>(static_cast<_Float16>(nan_mul<0>(a, b)));
+          write_half(w, in, lane, static_cast<_Float16>(nan_add<0>(p, c)));
         } else {
-          write_half(w, in, lane, static_cast<_Float16>(std::fma(a, b, c)));
+          write_half(w, in, lane, static_cast<_Float16>(nan_fma<2>(a, b, c)));
         }
       });
     }
@@ -3762,7 +3763,7 @@ struct Machine {
         int64_t isum = static_cast<int64_t>(sum);
         for (uint32_t k = 0; k < K; ++k) {
           const double a = input(in.src[0], ta, row, k, a_signed), b = input(in.src[1], tb, col, k, b_signed);
-          if (out == "i32") isum += static_cast<int64_t>(a) * static_cast<int64_t>(b);
+          if (out == "i32") isum = mfma_mac_wrap(isum, static_cast<int64_t>(a), static_cast<int64_t>(b));
           else sum = mfma_add_o<WMMA_ORDER>(sum, mfma_mul_o<WMMA_ORDER>(a, b));   // (the operand order is the recorded one, not the compiler's choice)
         }
         uint32_t& slot = result[lane][reg];
@@ -4062,7 +4063,7 @@ struct Machine {
           for (uint32_t k = k_lo; k < k_hi; ++k) {
             const double a = sparse ? arow[k] : element(src_a, fa, la, mm, k, a_signed, a_base);
             const double bv = element(src_b, fb, lb, n, k, b_signed, 0);
-            if (int_out) ipart += static_cast<int64_t>(a) * static_cast<int64_t>(bv);
+            if (int_out) ipart = mfma_mac_wrap(ipart, static_cast<int64_t>(a), static_cast<int64_t>(bv));
             else part = mfma_add_o<WMMA_ORDER>(part, mfma_mul_o<WMMA_ORDER>(a, bv));   // (the recorded operand order, not the compiler's choice)
           }
           }
@@ -4508,7 +4509,7 @@ struct Machine {
   case "v_subrev_f32_e32"_op.hash:
     if (!(op == "v_subrev_f32_e32"_op)) goto L_ladder_11;
     {
-      each([&](uint32_t lane) { write_float(w, in, lane, lane_float(w, in.src[1], lane) - lane_float(w, in.src[0], lane)); });
+      each([&](uint32_t lane) { write_float(w, in, lane, nan_sub<0>(lane_float(w, in.src[1], lane), lane_float(w, in.src[0], lane))); });
     }
     break;
   case "v_subrev_f16_e32"_op.hash:
@@ -4877,7 +4878,7 @@ struct Machine {
             // The DX9 multiply: zero times anything (infinity and NaN too) is zero.
             each([&](uint32_t lane) {
               const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane);
-              write_float(w, in, lane, x == 0 || y == 0 ? 0.0f : x * y);
+              write_float(w, in, lane, x == 0 || y == 0 ? 0.0f : nan_mul<0>(x, y));
             });
           }
           break;
@@ -5258,7 +5259,7 @@ struct Machine {
     if (!(op == "v_add_f32_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, lane_float(w, in.src[0], lane) + lane_float(w, in.src[1], lane));
+        write_float(w, in, lane, nan_add<1>(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
       });
     }
     break;
@@ -5266,7 +5267,7 @@ struct Machine {
     if (!(op == "v_mul_f32_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, lane_float(w, in.src[0], lane) * lane_float(w, in.src[1], lane));
+        write_float(w, in, lane, nan_mul<1>(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
       });
     }
     break;
@@ -5589,9 +5590,13 @@ struct Machine {
     if (!(op == "v_fract_f16_e32"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        const float x = static_cast<float>(lane_half(w, in.src[0], lane));
-        const float r = std::isinf(x) ? std::numeric_limits<float>::quiet_NaN()
-                                      : std::isnan(x) ? x : std::fmin(x - std::floor(x), 0x1.ffcp-1f);
+        const _Float16 h = lane_half(w, in.src[0], lane);
+        const float x = static_cast<float>(h);
+        if (std::isnan(x)) {   // (a NaN goes through as it came, a signaling one too: see v_sin_f32)
+          write_half(w, in, lane, h);
+          return;
+        }
+        const float r = std::isinf(x) ? std::numeric_limits<float>::quiet_NaN() : std::fmin(x - std::floor(x), 0x1.ffcp-1f);
         write_half(w, in, lane, static_cast<_Float16>(r));
       });
     }
@@ -5611,7 +5616,10 @@ struct Machine {
       each([&](uint32_t lane) {
         // The argument is in turns: a whole turn is 1.0, not 2pi.
         if (in.arch == gcn::Target::Gfx1250 || is_guide_arch(in)) {
-          write_float(w, in, lane, turns_trig(static_cast<double>(lane_float(w, in.src[0], lane)), op == "v_sin_f32_e32"_op));
+          const float x = lane_float(w, in.src[0], lane);
+          // (A NaN goes through as it came, a signaling one too: the round trip through a double that would quiet it is one the
+          // optimizer removes at -O1 and above and not at -O0, and the recorded bits are the removed one's.)
+          write_float(w, in, lane, std::isnan(x) ? x : turns_trig(static_cast<double>(x), op == "v_sin_f32_e32"_op));
           return;
         }
         // The argument is in turns: a whole turn is 1.0, not 2pi.
@@ -5636,8 +5644,8 @@ struct Machine {
       each([&](uint32_t lane) {
         const float x = lane_float(w, in.src[0], lane), y = lane_float(w, in.src[1], lane),
                     z = lane_float(w, in.src[2], lane);
-        write_float(w, in, lane, op == "v_min3_f32"_op ? std::fmin(std::fmin(x, y), z)
-                                                    : std::fmax(std::fmax(x, y), z));
+        write_float(w, in, lane, op == "v_min3_f32"_op ? nan_fmin<0>(nan_fmin<0>(x, y), z)
+                                                    : nan_fmax<1>(nan_fmax<1>(x, y), z));
       });
     }
     break;
@@ -5651,8 +5659,8 @@ struct Machine {
                     z = lane_float(w, in.src[2], lane);
         write_float(w, in, lane,
                     std::isnan(x) || std::isnan(y) || std::isnan(z)
-                        ? std::fmin(std::fmin(x, y), z)
-                        : std::fmax(std::fmin(x, y), std::fmin(std::fmax(x, y), z)));
+                        ? nan_fmin<0>(nan_fmin<0>(x, y), z)
+                        : nan_fmax<1>(nan_fmin<0>(x, y), nan_fmin<1>(nan_fmax<0>(x, y), z)));
       });
     }
     break;
@@ -5879,8 +5887,8 @@ struct Machine {
       each([&](uint32_t lane) {
         const auto i24 = [](uint32_t v) { return static_cast<int32_t>(v << 8) >> 8; };
         write_lane(w, in.dst[0], lane,
-                   static_cast<uint32_t>(i24(lane_src(w, in.src[0], lane)) * i24(lane_src(w, in.src[1], lane)) +
-                                         static_cast<int32_t>(lane_src(w, in.src[2], lane))));
+                   static_cast<uint32_t>(i24(lane_src(w, in.src[0], lane))) * static_cast<uint32_t>(i24(lane_src(w, in.src[1], lane))) +
+                       lane_src(w, in.src[2], lane));   // (unsigned: the wrap is the same bits and is not undefined)
       });
     }
     break;
@@ -5931,7 +5939,7 @@ struct Machine {
         // A fused multiply-add: one rounding, which is what the C means by
         // fma and what the half the compiler folded into it expects.
         write_half(w, in, lane,
-                   static_cast<_Float16>(std::fma(static_cast<float>(lane_half(w, in.src[0], lane)),
+                   static_cast<_Float16>(nan_fma<0>(static_cast<float>(lane_half(w, in.src[0], lane)),
                                                   static_cast<float>(lane_half(w, in.src[1], lane)),
                                                   static_cast<float>(lane_half(w, in.src[2], lane)))));
       });
@@ -6018,7 +6026,7 @@ struct Machine {
     if (!(op == "v_mul_f32_e64"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, lane_float(w, in.src[0], lane) * lane_float(w, in.src[1], lane));
+        write_float(w, in, lane, nan_mul<1>(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
       });
     }
     break;
@@ -6044,7 +6052,7 @@ struct Machine {
       each([&](uint32_t lane) {
         // The constant the instruction carries is the addend, and comes last.
         write_float(w, in, lane,
-                    std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane),
+                    nan_fma<2>(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane),
                              as_float(static_cast<uint32_t>(in.src[2].value))));
       });
     }
@@ -6105,7 +6113,7 @@ struct Machine {
           if (o.abs) f = std::fabs(f);
           return o.neg ? -f : f;
         };
-        float r = std::fma(source(0), source(1), source(2));
+        float r = nan_fma<2>(source(0), source(1), source(2));
         if (in.clamp) r = clamp01(r);
         if (op == "v_fma_mix_f32"_op) {
           write_lane(w, in.dst[0], lane, as_bits(r));
@@ -6225,15 +6233,15 @@ struct Machine {
         double sum;
         if (into_dst) {
           const uint32_t a = lane_src(w, in.src[0], lane), b = lane_src(w, in.src[1], lane);
-          sum = bf(a & 0xFFFF) * bf(b & 0xFFFF) + bf(a >> 16) * bf(b >> 16) +
-                dot_flush_float(in, static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane])));
+          sum = nan_add<0>(nan_add<0>(nan_mul<0>(bf(a & 0xFFFF), bf(b & 0xFFFF)), nan_mul<0>(bf(a >> 16), bf(b >> 16))),
+                        dot_flush_float(in, static_cast<double>(as_float(w.vgpr[in.dst[0].index][lane]))));
         } else {
           const float c = lane_float(w, in.src[2], lane);
           sum = dot_flush_float(in, (in.neg_lo >> 2) & 1 ? -double(c) : double(c));
           for (uint32_t h = 0; h < 2; ++h) {
             const double a = bf(packed_bits(w, in, 0, h, lane)), b = bf(packed_bits(w, in, 1, h, lane));
             const uint8_t neg = h ? in.neg_hi : in.neg_lo;
-            sum += (neg & 1 ? -a : a) * (neg & 2 ? -b : b);
+            sum = nan_add<0>(sum, nan_mul<0>(neg & 1 ? -a : a, neg & 2 ? -b : b));
           }
         }
         write_lane(w, in.dst[0], lane, as_bits(dot_flush_out(in, sum)));
@@ -6430,7 +6438,7 @@ struct Machine {
       each([&](uint32_t lane) {
         // The middle source is the constant the instruction carries.
         write_lane(w, in.dst[0], lane,
-                   as_bits(std::fma(lane_float(w, in.src[0], lane), as_float(static_cast<uint32_t>(in.src[1].value)),
+                   as_bits(nan_fma<2>(lane_float(w, in.src[0], lane), as_float(static_cast<uint32_t>(in.src[1].value)),
                                     lane_float(w, in.src[2], lane))));
       });
     }
@@ -6486,7 +6494,7 @@ struct Machine {
       each([&](uint32_t lane) {
         // The destination is also the addend.
         write_float(w, in, lane,
-                    std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane),
+                    nan_fma<2>(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane),
                              as_float(w.vgpr[in.dst[0].index][lane])));
       });
     }
@@ -6496,7 +6504,7 @@ struct Machine {
     {
       each([&](uint32_t lane) {
         write_float(w, in, lane,
-                    std::fma(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane), lane_float(w, in.src[2], lane)));
+                    nan_fma<2>(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane), lane_float(w, in.src[2], lane)));
       });
     }
     break;
@@ -6516,7 +6524,7 @@ struct Machine {
     if (!(op == "v_sub_f32_e32"_op || op == "v_sub_f32_e64"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, lane_float(w, in.src[0], lane) - lane_float(w, in.src[1], lane));
+        write_float(w, in, lane, nan_sub<0>(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
       });
     }
     break;
@@ -6540,7 +6548,7 @@ struct Machine {
     if (!(op == "v_add_f32_e64"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_float(w, in, lane, lane_float(w, in.src[0], lane) + lane_float(w, in.src[1], lane));
+        write_float(w, in, lane, nan_add<1>(lane_float(w, in.src[0], lane), lane_float(w, in.src[1], lane)));
       });
     }
     break;
@@ -6661,7 +6669,7 @@ struct Machine {
     if (!(op == "v_add_f64"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_double(w, in, lane, lane_double(w, in.src[0], lane) + lane_double(w, in.src[1], lane));
+        write_double(w, in, lane, nan_add<1>(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane)));
       });
     }
     break;
@@ -6669,7 +6677,7 @@ struct Machine {
     if (!(op == "v_mul_f64"_op)) goto L_ladder_9;
     {
       each([&](uint32_t lane) {
-        write_double(w, in, lane, lane_double(w, in.src[0], lane) * lane_double(w, in.src[1], lane));
+        write_double(w, in, lane, nan_mul<1>(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane)));
       });
     }
     break;
@@ -6678,7 +6686,7 @@ struct Machine {
     {
       each([&](uint32_t lane) {
         write_double(w, in, lane,
-                     std::fma(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane),
+                     nan_fma<2>(lane_double(w, in.src[0], lane), lane_double(w, in.src[1], lane),
                               lane_double(w, in.src[2], lane)));
       });
     }
@@ -6711,9 +6719,9 @@ struct Machine {
         float r[2];
         for (uint32_t half = 0; half < 2; ++half) {
           const float x = packed_float(w, in, 0, half, lane), y = packed_float(w, in, 1, half, lane);
-          r[half] = op == "v_pk_add_f32"_op   ? x + y
-                    : op == "v_pk_mul_f32"_op ? x * y
-                                           : std::fma(x, y, packed_float(w, in, 2, half, lane));
+          r[half] = op == "v_pk_add_f32"_op   ? nan_add<1>(x, y)
+                    : op == "v_pk_mul_f32"_op ? nan_mul<1>(x, y)
+                                           : nan_fma<0>(x, y, packed_float(w, in, 2, half, lane));
         }
         if (in.clamp) r[0] = clamp01(r[0]), r[1] = clamp01(r[1]);
         set_word(w, in.dst[0], 0, lane, as_bits(r[0]));
@@ -7488,8 +7496,11 @@ struct Machine {
         uint32_t now = 0;
         for (uint32_t h = 0; h < 2; ++h) {
           const uint16_t x = static_cast<uint16_t>(was >> (16 * h)), y = static_cast<uint16_t>(v >> (16 * h));
-          const uint32_t r = bf ? to_bf16(as_float(uint32_t{x} << 16) + as_float(uint32_t{y} << 16))
-                                : uint32_t{as_bits(static_cast<_Float16>(static_cast<float>(as_half(x)) + static_cast<float>(as_half(y))))};
+          // (The order of the two NaNs of a sum is the recorded one, which differs between the halves: see nan_order.hpp.)
+          const float fx = bf ? as_float(uint32_t{x} << 16) : static_cast<float>(as_half(x));
+          const float fy = bf ? as_float(uint32_t{y} << 16) : static_cast<float>(as_half(y));
+          const float sum = h ? nan_add<1>(fx, fy) : nan_add<0>(fx, fy);
+          const uint32_t r = bf ? to_bf16(sum) : uint32_t{as_bits(static_cast<_Float16>(sum))};
           now |= (r & 0xFFFFu) << (16 * h);
         }
         std::memcpy(at(off), &now, 4);
@@ -8001,12 +8012,14 @@ struct Machine {
       const uint16_t x = static_cast<uint16_t>(a >> (16 * k)), y = static_cast<uint16_t>(b >> (16 * k));
       uint16_t r;
       if (bf16) {
-        r = to_bf16(as_float(uint32_t{x} << 16) + as_float(uint32_t{y} << 16));
+        // (The order of the two NaNs of a sum is the recorded one, which differs between the halves: see nan_order.hpp.)
+        const float fx = as_float(uint32_t{x} << 16), fy = as_float(uint32_t{y} << 16);
+        r = to_bf16(k ? nan_add<1>(fx, fy) : nan_add<0>(fx, fy));
       } else {
         _Float16 hx, hy;
         std::memcpy(&hx, &x, 2);
         std::memcpy(&hy, &y, 2);
-        const _Float16 sum = static_cast<_Float16>(static_cast<float>(hx) + static_cast<float>(hy));
+        const _Float16 sum = static_cast<_Float16>(nan_add<1>(static_cast<float>(hx), static_cast<float>(hy)));
         std::memcpy(&r, &sum, 2);
       }
       out |= uint32_t{r} << (16 * k);
@@ -8143,13 +8156,13 @@ struct Machine {
   template <typename T>
   static T hw_min(const Inst& in, uint32_t mode, T x, T y) {
     if (is_guide_arch(in)) return gfx9_minmax(x, y, true, (mode >> 9) & 1);
-    if (in.arch != gcn::Target::Gfx1250) return std::fmin(x, y);
+    if (in.arch != gcn::Target::Gfx1250) return nan_fmin<0>(x, y);
     return std::isnan(x) && std::isnan(y) ? quieted(x) : static_cast<T>(num_min(x, y));
   }
   template <typename T>
   static T hw_max(const Inst& in, uint32_t mode, T x, T y) {
     if (is_guide_arch(in)) return gfx9_minmax(x, y, false, (mode >> 9) & 1);
-    if (in.arch != gcn::Target::Gfx1250) return std::fmax(x, y);
+    if (in.arch != gcn::Target::Gfx1250) return nan_fmax<0>(x, y);
     return std::isnan(x) && std::isnan(y) ? quieted(x) : static_cast<T>(num_max(x, y));
   }
   // The "_num" family on three values (minimumNumber and maximumNumber: a number beats a NaN), and the median.
@@ -9287,7 +9300,7 @@ struct Machine {
         case Rmw::Or: return b | x;
         case Rmw::Xor: return b ^ x;
         case Rmw::Swap: return x;
-        case Rmw::AddF32: return as_bits(as_float(b) + as_float(x));
+        case Rmw::AddF32: return as_bits(nan_add<0>(as_float(b), as_float(x)));
         case Rmw::MinF32: return as_bits(std::fmin(as_float(b), as_float(x)));
         case Rmw::MaxF32: return as_bits(std::fmax(as_float(b), as_float(x)));
         case Rmw::SMin: return static_cast<uint32_t>(std::min(sb, sx));
@@ -9318,7 +9331,7 @@ struct Machine {
       case Rmw::UMax: return std::max(before, v);
       case Rmw::Inc: return before >= v ? 0 : before + 1;
       case Rmw::Dec: return before == 0 || before > v ? v : before - 1;
-      case Rmw::AddF64: return as_bits(as_double(before) + as_double(v));
+      case Rmw::AddF64: return as_bits(nan_add<0>(as_double(before), as_double(v)));
       case Rmw::MinF64: return as_bits(std::fmin(as_double(before), as_double(v)));
       case Rmw::MaxF64: return as_bits(std::fmax(as_double(before), as_double(v)));
       case Rmw::CmpSwap: return before == expected ? v : before;
@@ -10784,7 +10797,7 @@ struct Machine {
           if (sparse) {   // (only the products A's indices keep: a NaN or infinity in B at a pruned place changes nothing)
             int64_t isum = static_cast<int64_t>(c0);
             for (uint32_t k = 0; k < s.k; ++k)
-              if (kept[as[r] + k]) isum += static_cast<int64_t>(arow[k]) * static_cast<int64_t>(bcol[k]);
+              if (kept[as[r] + k]) isum = mfma_mac_wrap(isum, static_cast<int64_t>(arow[k]), static_cast<int64_t>(bcol[k]));
             set_word(w, in.dst[0], r, lane, static_cast<uint32_t>(isum));
             continue;
           }

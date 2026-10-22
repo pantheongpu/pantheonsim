@@ -165,10 +165,14 @@ inline double mfma_dot_fma(const double* a, const double* bt, uint32_t k, double
   for (uint32_t i = 0; i < k; ++i) sum = mfma_fma(bt[i], a[i], sum);
   return sum;
 }
-// Integers are summed exactly and wrap as the hardware's do.
+// Integers are summed exactly and wrap as the hardware's do. The wrap is done in unsigned arithmetic (the same bits as the
+// signed one gives on this target, but not undefined where it overflows).
+inline int64_t mfma_mac_wrap(int64_t acc, int64_t a, int64_t b) {
+  return static_cast<int64_t>(static_cast<uint64_t>(acc) + static_cast<uint64_t>(a) * static_cast<uint64_t>(b));
+}
 inline int64_t mfma_dot_int(const double* a, const double* bt, uint32_t k, int64_t c) {
   int64_t sum = c;
-  for (uint32_t i = 0; i < k; ++i) sum += static_cast<int64_t>(a[i]) * static_cast<int64_t>(bt[i]);
+  for (uint32_t i = 0; i < k; ++i) sum = mfma_mac_wrap(sum, static_cast<int64_t>(a[i]), static_cast<int64_t>(bt[i]));
   return sum;
 }
 
@@ -364,12 +368,12 @@ inline void mfma_tile_int_scalar(uint32_t m, uint32_t n, uint32_t k, const int16
   for (uint32_t i = 0; i < m; ++i) {
     const int16_t* const arow = ia + size_t{i} * k;
     for (uint32_t j = 0; j < n; ++j) {
-      int32_t sum = 0;
+      uint32_t sum = 0;   // (unsigned: the sum wraps, and that is not undefined)
       for (uint32_t t = 0; t < k; t += 2) {
         const int16_t* const bp = bi + (size_t{t / 2} * n + j) * 2;
-        sum += int32_t{arow[t]} * bp[0] + int32_t{arow[t + 1]} * bp[1];
+        sum += static_cast<uint32_t>(int32_t{arow[t]} * bp[0]) + static_cast<uint32_t>(int32_t{arow[t + 1]} * bp[1]);
       }
-      out[size_t{i} * n + j] = sum;
+      out[size_t{i} * n + j] = static_cast<int32_t>(sum);
     }
   }
 }
