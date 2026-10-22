@@ -70,6 +70,25 @@ __global__ void k_int(const u32* A, const u32* Bv, const u32* C, u32* out, int n
   for (int j = k; j < kInt; ++j) out[(size_t)i * kInt + j] = 0;
 }
 
+// IMNMX, signed and unsigned, minimum and maximum, with a predicate chosen per lane (the tier's and the JIT's generated form), and under guards.
+constexpr int kMM = 12;
+__global__ void k_minmax(const u32* A, const u32* Bv, const u32* C, u32* out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  u32 a = A[i], b = Bv[i], c = C[i];
+  i32 sa = (i32)a, sb = (i32)b, sc = (i32)c;
+  u32 r[kMM];
+  r[0] = min(a, b);  r[1] = max(a, b);  r[2] = (u32)min(sa, sb);  r[3] = (u32)max(sa, sb);
+  r[4] = (c & 1) ? min(a, c) : max(a, c);  r[5] = (b & 2) ? (u32)min(sb, sc) : (u32)max(sb, sc);
+  r[6] = min(min(a, b), c);  r[7] = (u32)max(max(sa, sb), sc);
+  r[8] = 7; r[9] = 9; r[10] = 11; r[11] = 13;
+  if (a & 4) r[8] = min(b, 0x80000000u);
+  if (b & 8) r[9] = (u32)max(sa, -5);
+  if (c & 16) r[10] = (u32)min(sc, 5);
+  if (!(a & 32)) r[11] = max(c, 0x7fffffffu);
+  for (int j = 0; j < kMM; ++j) out[(size_t)i * kMM + j] = r[j];
+}
+
 // 128-bit and 64-bit-index arithmetic: carries and borrows that cross words (IADD3.X, IMAD.X, LEA.HI.X, ISETP.EX).
 __global__ void k_wide(const u32* A, const u32* Bv, const u32* C, const u64* P, u32* out, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -906,6 +925,17 @@ int main() {
       char label[64];
       std::snprintf(label, sizeof label, "int threads=%d", threads);
       if (report(label, out, (size_t)n * kInt)) return 1;
+    }
+    CK(cudaFree(out));
+  }
+  {   // IMNMX
+    u32* out;
+    CK(cudaMalloc(&out, (size_t)n * kMM * 4));
+    for (int threads : {128, 48, 33}) {
+      k_minmax<<<(n + threads - 1) / threads, threads>>>(da, db, dc, out, n);
+      char label[64];
+      std::snprintf(label, sizeof label, "minmax threads=%d", threads);
+      if (report(label, out, (size_t)n * kMM)) return 1;
     }
     CK(cudaFree(out));
   }

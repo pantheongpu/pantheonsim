@@ -68,7 +68,7 @@ void decl_src(W& w, const SrcFacts& x, int k, bool flt) {
   } else if (is_dyn(x, Dyn::Reg)) {
     w.f("    u32 T%d[32]; const u32* A%d = dynreg(T%d, R + %uu, %s, %uu);\n", k, k, k, x.off * 32u, flt ? "true" : "false", unsigned{x.mod});
   } else if (is_dyn(x, Dyn::Bank0)) {
-    w.f("    u32 T%d[32]; splat(T%d, tmod(%s, %uu, b0w(c, %uull))); const u32* A%d = T%d;\n", k, k, flt ? "true" : "false", unsigned{x.mod}, static_cast<unsigned long long>(x.off), k, k);
+    w.f("    u32 T%d[32]; splat(T%d, tmod(%s, %uu, b0w(c, %uu))); const u32* A%d = T%d;\n", k, k, flt ? "true" : "false", unsigned{x.mod}, x.off, k, k);
   } else {   // UReg
     w.f("    u32 T%d[32]; splat(T%d, tmod(%s, %uu, c->ur[%u])); const u32* A%d = T%d;\n", k, k, flt ? "true" : "false", unsigned{x.mod}, x.off, k, k);
   }
@@ -81,8 +81,8 @@ void decl_src64(W& w, const SrcFacts& x, int k) {
   } else if (is_pool(x)) {
     w.f("    u32 TL%d[32], TH%d[32]; splat(TL%d, 0x%xu); splat(TH%d, 0x%xu); const u32* L%d = TL%d; const u32* H%d = TH%d;\n", k, k, k, x.val, k, x.val2, k, k, k, k);
   } else if (is_dyn(x, Dyn::Bank0)) {
-    w.f("    u32 TL%d[32], TH%d[32]; splat(TL%d, b0w(c, %uull)); splat(TH%d, b0w(c, %uull)); const u32* L%d = TL%d; const u32* H%d = TH%d;\n", k, k, k,
-        x.off, k, static_cast<unsigned long long>(x.off) + 4ull, k, k, k, k);
+    w.f("    u32 TL%d[32], TH%d[32]; splat(TL%d, b0w(c, %uu)); splat(TH%d, b0w(c, %uu)); const u32* L%d = TL%d; const u32* H%d = TH%d;\n", k, k, k,
+        x.off, k, x.off + 4u, k, k, k, k);
   } else {   // UReg pair
     w.f("    u32 TL%d[32], TH%d[32]; splat(TL%d, c->ur[%u]); splat(TH%d, c->ur[%u]); const u32* L%d = TL%d; const u32* H%d = TH%d;\n", k, k, k, x.off, k, x.off + 1u,
         k, k, k, k);
