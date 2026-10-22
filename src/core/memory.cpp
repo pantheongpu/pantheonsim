@@ -604,11 +604,7 @@ uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
   while (!expected || is_uniform(expected)) {
     uint8_t* fresh = backing::acquire();
     const bool wide = expected && uniform_byte(expected);
-    if (wide) {
-      // Written whole, past the allocation's end too: its chunks go back to the backing as they are.
-      a.wide_dirty.store(true, std::memory_order_relaxed);
-      std::memset(fresh, uniform_byte(expected), kChunkSize);
-    }
+    if (wide) std::memset(fresh, uniform_byte(expected), kChunkSize);
     if (a.chunks[chunk_idx].compare_exchange_strong(expected, fresh, std::memory_order_acq_rel))
       return fresh;
     backing::release(fresh, wide ? backing::kAllBytesDirty : 0);

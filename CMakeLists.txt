@@ -1282,6 +1282,9 @@ vgpu_unit_test(test_sched)
 vgpu_unit_test(test_sass_access_count)
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
+# The allocation table's bookkeeping (alloc, free, quarantine, recycled chunks, the lock and its epoch) against a model
+# and against the digest of the implementation before the speed work.
+vgpu_unit_test(test_memalloc)
 # The one-lookup read-modify-write and multi-field read, against the load_scalar / store_scalar calls they replace.
 vgpu_unit_test(test_memrmw)
 # The warp's local memory, interleaved by words, against the per-lane layout it replaced.

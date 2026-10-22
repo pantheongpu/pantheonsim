@@ -483,15 +483,11 @@ class MemoryManager {
     std::unique_ptr<std::atomic<uint8_t*>[]> chunks;
     uint8_t* external = nullptr;
     size_t external_len = 0;
-    // Whether any chunk was ever filled past the allocation's own end: a chunk made from a uniform
-    // chunk of a byte other than zero is written whole. Otherwise every byte past `size` is still
-    // zero, which is what lets a chunk go back to the backing having cleared only the bytes below it.
-    std::atomic<bool> wide_dirty{false};
 
     Allocation() = default;
     Allocation(Allocation&& o) noexcept
         : size(o.size), chunk_count(o.chunk_count), chunk_capacity(o.chunk_capacity), chunks(std::move(o.chunks)),
-          external(o.external), external_len(o.external_len), wide_dirty(o.wide_dirty.load(std::memory_order_relaxed)) {
+          external(o.external), external_len(o.external_len) {
       o.size = 0;
       o.chunk_count = 0;
       o.chunk_capacity = 0;
@@ -506,7 +502,6 @@ class MemoryManager {
         chunks = std::move(o.chunks);
         external = o.external;
         external_len = o.external_len;
-        wide_dirty.store(o.wide_dirty.load(std::memory_order_relaxed), std::memory_order_relaxed);
         o.size = 0;
         o.chunk_count = 0;
         o.chunk_capacity = 0;
@@ -532,7 +527,6 @@ class MemoryManager {
       chunk_count = 0;
       external = nullptr;
       external_len = 0;
-      wide_dirty.store(false, std::memory_order_relaxed);
     }
     // A fresh allocation of `bytes`: every chunk untouched.
     void set_up(uint64_t bytes) {
@@ -553,12 +547,15 @@ class MemoryManager {
         external = nullptr;
         return;
       }
-      const bool wide = wide_dirty.load(std::memory_order_relaxed);
       for (size_t i = 0; i < chunk_count; ++i) {
         uint8_t* c = chunks[i].load(std::memory_order_relaxed);
         if (is_uniform(c)) continue;
-        // What may be non-zero in this chunk: all of it, or only the part below the allocation's end.
-        const uint64_t dirty = wide || i + 1 < chunk_count ? kChunkSize : size - i * kChunkSize;
+        // What may be non-zero in this chunk: all of it, or for the last only the part below the
+        // allocation's end, because every write is bounds-checked against the size, and the one
+        // write that goes past it, a chunk made from a uniform chunk of one byte, is of a whole
+        // chunk, which only a whole chunk of the allocation can be (fill makes uniform chunks of
+        // whole chunks only).
+        const uint64_t dirty = i + 1 < chunk_count ? kChunkSize : size - i * kChunkSize;
         backing::release(c, dirty);
       }
     }
