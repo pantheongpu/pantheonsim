@@ -1,0 +1,31 @@
+m2: built; 1703c1703 <   if (n + rg.k > 257 || w.steps + rg.k > max_steps || rg.maxreg > w.nregs) return 0; --- >   if (n + rg.k > 256 || w.steps + rg.k > max_steps || rg.maxreg > w.nregs) return 0; 
+m2: test_jit: 19/19 tests passed
+ok   sm_86 sass_tier  (29 units (430 regions), 29 ready, 0 cache hits, 29 compiles (3937.2 ms), 0 failures, 0 damaged objects replaced; 207181 region calls ran 1441143 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier_steps  (26 units (342 regions), 26 ready, 1 cache hits, 25 compiles (7057.7 ms), 0 failures, 0 damaged objects replaced; 8324569 region calls ran 556933868 warp instructions, 0 exceptions unwound through them)  [2 faults thrown inside regions]
+ok   sm_86 sass_tier (no compiler)  (1 units (27 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a compiler that fails)  (29 units (430 regions), 0 ready, 0 cache hits, 29 compiles (463.2 ms), 29 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a cache that cannot be created)  (1 units (27 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a cache others can write to)  (1 units (27 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a compile that times out)  (29 units (430 regions), 0 ready, 0 cache hits, 29 compiles (29141.7 ms), 29 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+PASS
+m4: built; 1703c1703 <   if (n + rg.k > 256 || rg.maxreg > w.nregs) return 0; --- >   if (n + rg.k > 256 || w.steps + rg.k > max_steps || rg.maxreg > w.nregs) return 0; 
+m4: test_jit: 19/19 tests passed
+ok   sm_86 sass_tier  (29 units (430 regions), 29 ready, 0 cache hits, 29 compiles (3749.8 ms), 0 failures, 0 damaged objects replaced; 207181 region calls ran 1441143 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier_steps  (26 units (342 regions), 26 ready, 1 cache hits, 25 compiles (7154.1 ms), 0 failures, 0 damaged objects replaced; 8324569 region calls ran 556933868 warp instructions, 0 exceptions unwound through them)  [2 faults thrown inside regions]
+ok   sm_86 sass_tier (no compiler)  (1 units (27 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a compiler that fails)  (29 units (430 regions), 0 ready, 0 cache hits, 29 compiles (463.3 ms), 29 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a cache that cannot be created)  (1 units (27 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a cache others can write to)  (1 units (27 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a compile that times out)  (29 units (430 regions), 0 ready, 0 cache hits, 29 compiles (29104.4 ms), 29 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+PASS
+m5: built; 1690c1690 <  --- >   h.last = &op; 
+m5: test_jit: 19/19 tests passed
+ok   sm_86 sass_tier  (29 units (430 regions), 29 ready, 0 cache hits, 29 compiles (3843.4 ms), 0 failures, 0 damaged objects replaced; 207181 region calls ran 1441143 warp instructions, 0 exceptions unwound through them)
+FAIL sm_86 sass_tier_steps: the gather fault is reported differently with the JIT; the shared fault is reported differently with the JIT
+ok   sm_86 sass_tier (no compiler)  (1 units (27 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a compiler that fails)  (29 units (430 regions), 0 ready, 0 cache hits, 29 compiles (464.7 ms), 29 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a cache that cannot be created)  (1 units (27 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a cache others can write to)  (1 units (27 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a compile that times out)  (29 units (430 regions), 0 ready, 0 cache hits, 29 compiles (29108.1 ms), 29 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions, 0 exceptions unwound through them)
+FAIL: the tier and the JIT differ
+mutants done

@@ -34,6 +34,15 @@ inline constexpr uint32_t kAbiVersion = 1;
 // cannot make a stale object load; the number is for people reading a cache directory.)
 inline constexpr uint32_t kGeneratorVersion = 1;
 inline constexpr uint32_t kMinRegion = 2;
+// The run loop of the tier executes at most this many straight instructions in one pass (n < 256), then one more that ends the pass.
+inline constexpr unsigned kRunLimit = 256;
+
+// Whether a region of k ops may run in one go in a pass that has run n ops, for a warp that has taken `steps` steps under a budget of
+// max_steps, whose file holds nregs registers when the region's handlers touch maxreg of them: what the loop checks op by op (the run of 256,
+// the step budget, the register file) holds for every op of the region. When it does not, the ops go through the loop one at a time.
+inline bool admissible(unsigned n, uint32_t k, uint64_t steps, uint64_t max_steps, uint32_t maxreg, uint32_t nregs) {
+  return n + k <= kRunLimit && steps + k <= max_steps && maxreg <= nregs;
+}
 
 // What a generated region sees of the warp and the launch. A plain C layout; the generated source repeats it and static_asserts
 // every offset against this one's, so a drift fails the compile instead of corrupting memory.

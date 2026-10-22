@@ -680,6 +680,28 @@ VTEST(jit_processes_compiling_one_key_compile_it_once) {
   VCHECK_EQ(hit, 5);
 }
 
+// ---- admission: what the run loop checks per op, checked once for a region ---------------------------------------------------------------------
+
+VTEST(jit_a_region_runs_in_one_go_only_where_every_op_would_have_run_in_the_loop) {
+  // n: ops already run in this pass; the loop runs an op while n < 256, so a region of k ops fits when n + k <= 256.
+  VCHECK(jit::kRunLimit == 256u);
+  VCHECK(jit::admissible(0, 256, 0, 1000, 10, 10));
+  VCHECK(!jit::admissible(0, 257, 0, 1000, 10, 10));
+  VCHECK(jit::admissible(160, 96, 0, 1000, 10, 10));
+  VCHECK(!jit::admissible(161, 96, 0, 1000, 10, 10));
+  VCHECK(jit::admissible(255, 1, 0, 1000, 10, 10));
+  VCHECK(!jit::admissible(255, 2, 0, 1000, 10, 10));
+  VCHECK(!jit::admissible(256, 2, 0, 1000, 10, 10));
+  // steps: each op takes one, one past the budget is the error, so steps + k <= max_steps.
+  VCHECK(jit::admissible(0, 50, 950, 1000, 10, 10));
+  VCHECK(!jit::admissible(0, 50, 951, 1000, 10, 10));
+  VCHECK(!jit::admissible(0, 2, 1000, 1000, 10, 10));
+  // registers: the file holds what the region touches.
+  VCHECK(jit::admissible(0, 4, 0, 1000, 32, 32));
+  VCHECK(!jit::admissible(0, 4, 0, 1000, 33, 32));
+  VCHECK(jit::admissible(0, 4, 0, 1000, 0, 0));
+}
+
 // ---- discovery and promotion (the executor's side of the machinery, without an executor) -------------------------------------------------------------
 
 namespace {

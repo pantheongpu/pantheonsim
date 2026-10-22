@@ -1700,7 +1700,7 @@ void jit_escape(jit::Ctx* j, uint32_t i, uint32_t ex) {
 [[gnu::noinline]] uint32_t jit_run_region(jit::Unit& ju, uint32_t ri, TCtx& c, Warp& w, exec::LaunchStats& st, const tier::MOp* ops, size_t idx,
                                           unsigned n, Mask group, unsigned glanes, uint64_t max_steps, bool stats, const tier::MOp*& faulting) {
   const jit::Region& rg = ju.regions[ri - 1];
-  if (n + rg.k > 256 || w.steps + rg.k > max_steps || rg.maxreg > w.nregs) return 0;
+  if (!jit::admissible(n, rg.k, w.steps, max_steps, rg.maxreg, w.nregs)) return 0;
   if (!ju.ready()) {
     ju.note(rg.k);
     if (!ju.ready()) return 0;
@@ -1991,9 +1991,12 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   }
 }
 
-// The run loop without tier 2's hook is the loop of every run that does not ask for the JIT, so it has no trace of it; with VGPU_JIT=1 a
-// section that has regions runs the other instance.
+// The run loop without tier 2's hook is the loop of every run that does not ask for the JIT, so it has no trace of it (and it is inlined where
+// it was before tier 2: tier_run_t is always_inline); with VGPU_JIT=1 a section that has regions runs the other instance, out of line.
+[[gnu::noinline]] bool Runner::tier_run_jit(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
+  return tier_run_t<true>(blk, w, group, pick, code, tp);
+}
 bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
-  if (jit_ && tp.jit) return tier_run_t<true>(blk, w, group, pick, code, tp);
+  if (jit_ && tp.jit) [[unlikely]] return tier_run_jit(blk, w, group, pick, code, tp);
   return tier_run_t<false>(blk, w, group, pick, code, tp);
 }

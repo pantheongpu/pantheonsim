@@ -117,7 +117,7 @@ check() {
   fi
   if [[ $p == sass_tier_steps && -z $why ]]; then
     # Faults deep into a run of straight instructions, and the step limit, with the generated code compiled with and without -fexceptions.
-    local f fa fb fc thr=0 fsf fenv=(VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_MAX_STEPS=50000 VGPU_QUIET=1 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
+    local f fa fb fc thr=0 fsf fenv=(VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_MAX_STEPS=50000 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
     for f in gather scatter local shared atomic trap forever; do
       fa="$(cd "$work" && env "${fenv[@]}" VGPU_TIER=1 timeout 300 "$bin" fault $f 2>&1)"
       fsf="$work/fault.$f.stats"; rm -f "$fsf"
@@ -127,6 +127,33 @@ check() {
       if ! grep -q "^fault $f: " <<< "$fa" || grep -q "^fault $f: no error" <<< "$fa"; then why="${why:+$why; }the $f fault did not happen"
       elif [[ "$fa" != "$fb" ]]; then why="${why:+$why; }the $f fault is reported differently with the JIT"
       elif [[ "$fa" != "$fc" ]]; then why="${why:+$why; }the $f fault is reported differently with the JIT built without exceptions"; fi
+    done
+    # The step budget is checked once for a whole region (steps + k): a limit that falls inside the region the fault is in must give the
+    # limit's error, not the fault's. For each fault that is thrown inside a region: the smallest VGPU_MAX_STEPS at which the tier reports the
+    # fault (found by bisection), then the limits just below it, tier against JIT.
+    local lim la lb lo hi mid off
+    for f in gather shared; do
+      lo=1; hi=20000
+      while (( lo < hi )); do
+        mid=$(( (lo + hi) / 2 ))
+        la="$(cd "$work" && env "${fenv[@]}" VGPU_MAX_STEPS=$mid VGPU_TIER=1 timeout 300 "$bin" fault $f 2>&1)"
+        if grep -q "illegal memory access" <<< "$la"; then hi=$mid; else lo=$((mid + 1)); fi
+      done
+      for off in 0 1 2 3 5 8 13 21 34 55 89 97; do
+        lim=$(( lo - off ))
+        (( lim >= 1 )) || continue
+        la="$(cd "$work" && env "${fenv[@]}" VGPU_MAX_STEPS=$lim VGPU_TIER=1 timeout 300 "$bin" fault $f 2>&1)"
+        lb="$(cd "$work" && env "${fenv[@]}" "${jitenv[@]}" VGPU_MAX_STEPS=$lim timeout 300 "$bin" fault $f 2>&1)"
+        [[ "$la" == "$lb" ]] || why="${why:+$why; }$f with VGPU_MAX_STEPS=$lim (the fault is at step $lo): the JIT reports '$(head -c 80 <<< "$lb")' where the tier reports '$(head -c 80 <<< "$la")'"
+      done
+    done
+    # The most a region can hold: the chunk of 256 straight instructions the run loop gives a turn is checked once for a whole region, and a
+    # region of 257 ops (the 256-instruction run, then the one that ends it) must be left to the tier. Output of the whole program, all
+    # three limits against the tier's.
+    local cap co
+    for cap in 255 256 257; do
+      co="$(runit "$bin" $arch "${jitenv[@]}" VGPU_JIT_MAX_REGION=$cap "VGPU_JIT_CACHE=$cache-cap$cap")"
+      [[ "$a" == "$co" ]] || why="${why:+$why; }regions of up to $cap ops print differently from the tier"
     done
     # The comparison above means something only if faults really were thrown from inside generated regions.
     (( thr >= ${VGPU_JIT_MIN_THROWS:-2} )) || why="${why:+$why; }only $thr of the faults were thrown inside a generated region"

@@ -1,0 +1,5 @@
+perf stat, launch workload (41.6 k launches), CPU 4, 3 alternations, instructions / cycles:
+base        940.9-941.0 M / 304.0-305.9 M
+final       943.8-944.3 M / 312.9-314.6 M   (+0.3% instructions, +2.5% cycles)
+control (base + jit.cpp compiled in, unused): equal to base
+base + Runner::jit_, the tier_program() call and Program::jit, no run-loop split: 943.2 M / 310.0 M
