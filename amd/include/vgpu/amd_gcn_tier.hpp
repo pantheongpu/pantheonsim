@@ -62,6 +62,8 @@ struct Src {
   uint8_t kind = kNone;
   bool wide = false;   // the operand covers two registers (scalar reads give the pair; writes write both)
   bool neg = false, abs = false;
+  uint8_t sel = 6;     // SDWA: the part of the 32 bits the instruction reads (0 to 3 a byte, 4 and 5 a half, 6 all)
+  bool sext = false;   // ... and whether it is taken with its sign
   uint32_t index = 0;
   uint32_t value = 0;
   uint64_t value64 = 0;
@@ -77,6 +79,7 @@ struct Op {
   Src dst, dst2;
   uint8_t unit = kUnitNone;
   uint8_t omod = 0;
+  uint8_t dsel = 6, dunused = 0;   // SDWA: the part of the destination written (dst_sel), and what the rest becomes (0 zeroes, 1 the sign, 2 kept)
   bool clamp = false;
   uint32_t sub = 0;            // handler-specific (a comparison's test, a shift count, ...)
   int32_t off0 = 0, off1 = 0;  // a memory instruction's offsets
