@@ -62,6 +62,7 @@ struct Src {
   uint8_t kind = kNone;
   bool wide = false;   // the operand covers two registers (scalar reads give the pair; writes write both)
   bool neg = false, abs = false;
+  bool h16 = false;    // the modifiers act on bit 15 (a half in the low 16 bits), not on bit 31
   uint8_t sel = 6;     // SDWA: the part of the 32 bits the instruction reads (0 to 3 a byte, 4 and 5 a half, 6 all)
   bool sext = false;   // ... and whether it is taken with its sign
   uint32_t index = 0;

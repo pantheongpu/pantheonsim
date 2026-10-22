@@ -205,6 +205,11 @@ for ops in ['v[2:3], v[4:5], v[6:7], v[8:9]', 'v[2:3], -v[4:5], v[6:7], |v[8:9]|
     add('v_fma_f64 ' + ops)
 add('v_fmac_f64_e32 v[2:3], v[4:5], v[6:7]')
 
+for ops in ['v1, a2', 'v255, a255', 'v1, a0']:
+    add('v_accvgpr_read_b32 ' + ops)
+for ops in ['a1, v2', 'a255, v255', 'a1, s2', 'a1, 7', 'a1, 1.0', 'a1, 0x12345678', 'a1, exec_lo']:
+    add('v_accvgpr_write_b32 ' + ops)
+
 # ---- assemble: drop what the target refuses
 def assemble(ls):
     src = '\n'.join(ls) + '\n'

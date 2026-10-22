@@ -117,13 +117,77 @@ int tier_pkf16(Wave& w, const Inst& in) {
   return 1;
 }
 
-// The instructions the tier hands to the Machine, by Op::mach: 3 s_barrier, 6 s_endpgm, 7 scalar memory, 8 packed halves, else a global access.
+// A vector memory instruction the tier has no handler of its own for (an atomic, a flat or scratch access, a buffer access, any LDS access but the
+// plain dword ones): step()'s case for it, without step()'s frame -- the store gate first, then what step() counts, then the same function.
+int tier_mem(Wave& w, Group& g, const Inst& in) {
+  const uint32_t fl = gcn::inst_flags(in);
+  if (w.store_gate && w.exec != 0 && g.waves.size() > 1 && is_plain_store(in)) {
+    w.store_gate = false;
+    w.soft_yield = true;
+    return 2;
+  }
+  InstructionCounts& n = stats.counts;
+  ++n.mix[static_cast<int>(in.mix)];
+  n.mops[static_cast<int>(in.mops_type)] += in.mops;
+  w.pc += in.size;
+  ++stats.instructions;
+  switch (in.enc) {
+    case gcn::Enc::Ds:
+      ++n.lds;
+      lds_access(w, in, g);
+      return 1;
+    case gcn::Enc::Flat:
+      ++n.vmem;
+      ++n.flat;
+      if (fl & gcn::kInstAtomic) ++n.flat_atomic, ++n.vmem_wr;
+      else if (fl & gcn::kInstStore) ++n.flat_write, ++n.vmem_wr;
+      else ++n.flat_read, ++n.vmem_rd, issued_load(w);
+      if (in.segment == Inst::Segment::Scratch) scratch_access(w, in, g);
+      else if (in.segment == Inst::Segment::Flat) n.lds += flat_access(w, in, g);
+      else global_access(w, in);
+      return 1;
+    case gcn::Enc::Mubuf:
+      ++n.vmem;
+      if (fl & (gcn::kInstStore | gcn::kInstAtomic)) ++n.vmem_wr;
+      else ++n.vmem_rd, issued_load(w);
+      buffer_access(w, in, g);
+      if (in.lds_dma) ++n.lds;
+      return 1;
+    default:   // Mtbuf
+      ++n.vmem;
+      if (fl & gcn::kInstStore) ++n.vmem_wr;
+      else ++n.vmem_rd, issued_load(w);
+      buffer_access(w, in, g);
+      return 1;
+  }
+}
+
+// v_accvgpr_read_b32 and v_accvgpr_write_b32: a register of one bank (or a scalar or a constant) into a register of the other, for the lanes EXEC
+// names. The Machine's own lane_src and write_lane (the accumulation bank grows where a write reaches past it).
+int tier_acc(Wave& w, const Inst& in) {
+  InstructionCounts& n = stats.counts;
+  ++n.mix[static_cast<int>(in.mix)];
+  n.mops[static_cast<int>(in.mops_type)] += in.mops;
+  w.pc += in.size;
+  ++stats.instructions;
+  ++n.valu;
+  const InvariantSources invariant(*this, w, in);
+  for (uint64_t m = w.exec; m; m &= m - 1) {
+    const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+    write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane));
+  }
+  return 1;
+}
+
+// The instructions the tier hands to the Machine, by Op::mach: 3 s_barrier, 6 s_endpgm, 7 scalar memory, 8 packed halves, 9 any other vector memory instruction, 10 the accumulation register moves, else a global access.
 int tier_mach(Wave& w, Group& g, const Inst& in) {
   switch (in.fast.mach) {
     case 3: return tier_barrier(w, in);
     case 6: return tier_endpgm(w, in);
     case 7: return tier_smem(w, in);
     case 8: return tier_pkf16(w, in);
+    case 9: return tier_mem(w, g, in);
+    case 10: return tier_acc(w, in);
     default: return tier_global(w, g, in);
   }
 }

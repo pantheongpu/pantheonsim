@@ -2636,3 +2636,12 @@ D1CC0402 24220D04	v_fma_f64 v[2:3], -v[4:5], v[6:7], |v[8:9]|
 D1CC0002 04220C04	v_fma_f64 v[2:3], s[4:5], v[6:7], v[8:9]
 D1CC0002 03CA0D04	v_fma_f64 v[2:3], v[4:5], v[6:7], 1.0
 08040D04	v_fmac_f64_e32 v[2:3], v[4:5], v[6:7]
+D3D84001 18000102	v_accvgpr_read_b32 v1, a2
+D3D840FF 180001FF	v_accvgpr_read_b32 v255, a255
+D3D84001 18000100	v_accvgpr_read_b32 v1, a0
+D3D94001 18000102	v_accvgpr_write_b32 a1, v2
+D3D940FF 180001FF	v_accvgpr_write_b32 a255, v255
+D3D94001 18000002	v_accvgpr_write_b32 a1, s2
+D3D94001 18000087	v_accvgpr_write_b32 a1, 7
+D3D94001 180000F2	v_accvgpr_write_b32 a1, 1.0
+D3D94001 1800007E	v_accvgpr_write_b32 a1, exec_lo

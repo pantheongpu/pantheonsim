@@ -227,8 +227,8 @@ inline void fill(uint32_t* t, uint32_t v, unsigned n) {
   for (unsigned i = 0; i < n; ++i) t[i] = v;
 }
 inline uint32_t mods32(const Src& s, uint32_t v) {
-  if (s.abs) v &= 0x7FFFFFFFu;
-  if (s.neg) v ^= 0x80000000u;
+  if (s.abs) v &= s.h16 ? ~0x8000u : 0x7FFFFFFFu;
+  if (s.neg) v ^= s.h16 ? 0x8000u : 0x80000000u;
   return v;
 }
 // A 32-bit lane source as a row: the register's own, or a copy in `t` where a modifier changes it or the value is the same in every lane.
@@ -237,7 +237,7 @@ inline const uint32_t* load32(const Src& s, Regs& R, uint32_t* t, unsigned n) {
     case kVgpr: {
       const uint32_t* p = R.vgpr[s.index];
       if (!(s.neg | s.abs)) return p;
-      const uint32_t keep = s.abs ? 0x7FFFFFFFu : ~0u, flip = s.neg ? 0x80000000u : 0u;
+      const uint32_t keep = s.abs ? (s.h16 ? ~0x8000u : 0x7FFFFFFFu) : ~0u, flip = s.neg ? (s.h16 ? 0x8000u : 0x80000000u) : 0u;
       for (unsigned i = 0; i < n; ++i) t[i] = (p[i] & keep) ^ flip;
       return t;
     }
@@ -1223,7 +1223,7 @@ int b_vccnz(const Op&, Regs& R) { if (R.lanes == 32 ? static_cast<uint32_t>(*R.v
 
 // ---- Classification
 
-enum class Cat { None, Carry, Lane, Global, Ds, Pk, Int, F32, F64, L64, Mad64, Cmp, Cndmask, Readfirstlane, S2, ScalarCmp, Saveexec, Branch, Sopk, Cmpk, Bitcmp, Endpgm, PkF16, PkMov, Div, FmaMix };
+enum class Cat { None, Carry, Lane, Global, Ds, Pk, Int, F32, F64, L64, Mad64, Cmp, Cndmask, Readfirstlane, S2, ScalarCmp, Saveexec, Branch, Sopk, Cmpk, Bitcmp, Endpgm, PkF16, PkMov, Div, FmaMix, Acc };
 
 struct Entry {
   Cat cat = Cat::None;
@@ -1516,6 +1516,8 @@ const std::unordered_map<std::string_view, Entry>& table() {
     m["v_div_scale_f64"] = {Cat::Div, 4, 3};
     m["v_div_fmas_f64"] = {Cat::Div, 5, 3};
     m["v_div_fixup_f64"] = {Cat::Div, 6, 3};
+    m["v_accvgpr_read_b32"] = {Cat::Acc, 0, 1};
+    m["v_accvgpr_write_b32"] = {Cat::Acc, 0, 1};
     m["v_fma_mix_f32"] = {Cat::FmaMix, 0, 3};
     m["v_fma_mixlo_f16"] = {Cat::FmaMix, 1, 3};
     m["v_fma_mixhi_f16"] = {Cat::FmaMix, 2, 3};
@@ -1611,15 +1613,20 @@ bool lane_src32(const Operand& o, Src& s, bool float_mods) {
   return true;
 }
 // A source a 16-bit float instruction reads (lane_half, lane_half_f): an inline float constant is a half, in the low 16 bits.
+// Its modifiers (negation, absolute value) act on the half's sign, bit 15.
 bool lane_src32_half(const Operand& o, Src& s) {
-  if (o.kind != OperandKind::InlineFloat) return lane_src32(o, s, false);
-  if (o.sel != 6 || o.sext || o.half || o.bits16 || o.hi) return false;
-  s = Src();
-  s.kind = kConst;
-  const _Float16 h = static_cast<_Float16>(o.fvalue);
-  uint16_t bits;
-  std::memcpy(&bits, &h, 2);
-  s.value = bits;
+  if (o.kind != OperandKind::InlineFloat) {
+    if (!lane_src32(o, s, false)) return false;
+  } else {
+    if (o.sel != 6 || o.sext || o.half || o.bits16 || o.hi) return false;
+    s = Src();
+    s.kind = kConst;
+    const _Float16 h = static_cast<_Float16>(o.fvalue);
+    uint16_t bits;
+    std::memcpy(&bits, &h, 2);
+    s.value = bits;
+  }
+  s.h16 = true, s.neg = o.neg, s.abs = o.abs;
   return true;
 }
 // The same for a 64-bit consumer (lane_src64).
@@ -1738,11 +1745,13 @@ void classify_cmp(Inst& in, const Tables& T) {
     f.run = h_cmp64;
     return;
   } else return;
-  if (raw16 && (in.src[0].neg || in.src[0].abs || in.src[1].neg || in.src[1].abs)) return void(f = Op());
-  const bool half_src = op == 0x14 || (op >= 0x20 && op < 0x30);
-  if (half_src ? !lane_src32_half(in.src[0], f.src[0]) || !lane_src32_half(in.src[1], f.src[1])
-               : !lane_src32(in.src[0], f.src[0], fmods) || !lane_src32(in.src[1], f.src[1], op == 0x10 ? false : fmods))
-    return void(f = Op());
+  // (a 16-bit integer compare ignores the modifiers a VOP3 form could carry; a half's act on its sign bit)
+  if (raw16 && !(op == 0x14 || (op >= 0x20 && op < 0x30)) && (in.src[0].neg || in.src[0].abs || in.src[1].neg || in.src[1].abs)) return void(f = Op());
+  bool ok;
+  if (op == 0x14) ok = lane_src32_half(in.src[0], f.src[0]) && lane_src32(in.src[1], f.src[1], false);   // (class of a half; the mask is bits)
+  else if (op >= 0x20 && op < 0x30) ok = lane_src32_half(in.src[0], f.src[0]) && lane_src32_half(in.src[1], f.src[1]);
+  else ok = lane_src32(in.src[0], f.src[0], fmods) && lane_src32(in.src[1], f.src[1], op == 0x10 ? false : fmods);
+  if (!ok) return void(f = Op());
   if (!in.dst.empty() && !scalar_dst(in.dst[0], f.dst)) return void(f = Op());
   f.kern = reinterpret_cast<AnyFn>(k);
   f.sub = writes_exec;
@@ -1778,6 +1787,19 @@ bool classify_sdwa(Inst& in) {
   return true;
 }
 
+// A vector memory instruction with no handler of its own: the Machine's functions for it, without step()'s frame (Op::mach 9). The cache
+// operations (global_inv, buffer_wbl2, ...), the forms that move data to LDS, and the GWS instructions stay with step().
+void classify_mem(Inst& in) {
+  if (in.enc != Enc::Flat && in.enc != Enc::Mubuf && in.enc != Enc::Mtbuf && in.enc != Enc::Ds) return;
+  if ((in.flags & (kInstLoadLds | kInstAsyncLds | kInstGws)) || in.gds) return;
+  const std::string& n = in.name;
+  if (n.rfind("global_inv", 0) == 0 || n.rfind("global_wb", 0) == 0 || n.rfind("buffer_wb", 0) == 0 || n.rfind("buffer_inv", 0) == 0 ||
+      n.rfind("buffer_gl", 0) == 0)
+    return;
+  in.fast.mach = 9;
+  in.fast.run = h_never;
+}
+
 }  // namespace
 
 void tier_classify(Inst& in) {
@@ -1810,7 +1832,7 @@ void tier_classify(Inst& in) {
     if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && eff == "v_lshl_add_u64") eff += "_g";
     const auto& tab = table();
     const auto it = tab.find(eff);
-    if (it == tab.end()) return;
+    if (it == tab.end()) return classify_mem(in);
     ep = &it->second;
   }
   const Entry& e = *ep;
@@ -1825,7 +1847,6 @@ void tier_classify(Inst& in) {
       if ((e.flags & kCdnaOnly) && in.arch != gcn::Target::Gfx90a && in.arch != gcn::Target::Gfx942 && in.arch != gcn::Target::Gfx950) return fail();
       if ((e.flags & (kNoOmod | kFloatOut)) && in.omod) return fail();
       if ((e.flags & kFloatOut) && in.clamp) return fail();
-      if ((e.flags & kRawSrc) && (in.src[0].neg || in.src[0].abs)) return fail();
       // (CDNA3 and CDNA4 apply the clamp bit to the integer instructions that have one and to the conversions to float: the interpreter's.)
       if (in.clamp && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (!is_f || (e.flags & kIgnoreMods))) return fail();
       // (gfx942 and gfx950 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA3 and CDNA4 guides, 6.5: the interpreter's.)
@@ -2073,6 +2094,12 @@ void tier_classify(Inst& in) {
       f.sub = static_cast<uint32_t>(e.k);
       f.run = s_cmp;
       f.unit = kUnitSalu;
+      return;
+    }
+    case Cat::Acc: {
+      if ((in.enc != Enc::Vop1 && in.enc != Enc::Vop3) || in.dst.size() != 1 || in.src.size() != 1) return;
+      f.mach = 10;
+      f.run = h_never;
       return;
     }
     case Cat::PkF16: {   // (the Machine's packed_f16_wave does the arithmetic whole-wave; it says if the instruction is not the plain case)
