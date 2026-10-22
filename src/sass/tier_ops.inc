@@ -1768,6 +1768,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   bool regs_ok = true;
   [[maybe_unused]] jit::Unit* const ju = Jit ? tp.jit.get() : nullptr;
   [[maybe_unused]] JitFrame jf;
+  [[maybe_unused]] const uint32_t* const region_at = Jit ? ju->region_at.data() : nullptr;
   for (bool again = false;; again = true) {   // one pass is one call of step_warp
   // The warp's register file may have been resized since the last pass (USETMAXREG.TRY_ALLOC grows it, and a vector that grows moves):
   // the row pointer and the check that a program's registers are inside the file are worked out again for every pass.
@@ -1785,7 +1786,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
     for (unsigned n = 0;; ++n) {
       // Tier 2: a region that starts here, compiled, is run in place of its ops (jit_run_region says how, and when not).
       if constexpr (Jit) {
-        if (const uint32_t ri = ju->region_at[idx]) {
+        if (const uint32_t ri = region_at[idx]) {
           const tier::MOp* faulting = nullptr;   // (not `cur`: its address would keep it out of a register in the loop below)
           uint32_t k;
           try {
@@ -2024,6 +2025,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   return tier_run_t<true>(blk, w, group, pick, code, tp);
 }
 bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
-  if (jit_ && tp.jit) [[unlikely]] return tier_run_jit(blk, w, group, pick, code, tp);
+  if (jit_ && tp.jit && tp.jit->state.load(std::memory_order_relaxed) != static_cast<int>(jit::State::Failed)) [[unlikely]]
+    return tier_run_jit(blk, w, group, pick, code, tp);   // (a section whose JIT has failed or found nothing to compile runs the plain loop)
   return tier_run_t<false>(blk, w, group, pick, code, tp);
 }

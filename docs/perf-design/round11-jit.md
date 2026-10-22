@@ -196,3 +196,64 @@ cache that is the read-only mount's root:        pantheonsim: JIT: /ro is not ow
   (4) the compiler flag set is `-O1`; milestone 2 will want `-O2` and the simulator's SIMD headers on the include path, which makes the key depend on them and the
   source no longer self-contained; (5) whether `VGPU_JIT_STATS` should join `VGPU_TIER_STATS`'s file output by default.
 * **Milestone 2 was not started.** No arithmetic is generated.
+
+# Milestone 2: the ALU subset (2026-10-22, second rig)
+
+Approved by the user after milestone 1. Branch `jit-tier2`; checkpoints `e0c2ad1e` (WIP), `9e2902d7`, and the final commit. Raw output: `data/round11/m2-*`.
+
+## What changed
+
+* **Generated forms**: MOV, IADD3 (plain and with carries), IMAD (plain, with carry, WIDE, HI), LOP3 (with its predicate output), LEA (all variants), SHF, ISETP, FSETP (no |x|/-x), FSEL, FFMA/FADD/FMUL (plain and the ftz/sat `_x` kernels; a directed rounding mode stays an escape), PRMT (default mode), IMNMX, I2FP. Every other op of a region stays an escape call of the tier's handler (`src/sass/jit_gen.cpp`; each case names the handler it follows).
+* **One source of truth for the arithmetic**: the generated code `#include`s `src/simd/kernels.inc`, the text the simulator's own kernels are compiled from. `kernels.inc` got `VGPU_LANES_ONLY` guards (leaving out half conversions, HMMA, binary64, which need other headers) and two attribute macros (`VGPU_KN`, `VGPU_KA`: empty in the simulator, `always_inline` in the generated code). `kernels.inc` and the new `jit_rt.h` are embedded in the binary by CMake (`jit_embed.cpp.in`), written into `<cache>/rt-<hash>/` at first use (rewritten if different, so the compiler reads what this binary embeds), and the hash of both is part of every key. Nothing of the source tree is needed at run time. The ISA level is the simulator's own (`simd::level()`: AVX2 or base; there is no AVX-512 kernel, so an AVX-512 host builds AVX2).
+* **The simulator is unchanged by the refactor of `kernels.inc`**: `test_simd` 25/25, `test_fastpath` 38/38, `test_tier` 8/8, `bench.sh --check-counters` PASS (16 workloads), `e2e_sass_tier` PASS (52), and with the JIT forced on: `e2e_sass_archs` PASS (292 ok, every architecture the script covers), `run_sass_jit.sh` PASS (52).
+* **Compile**: `-O2 -funroll-loops` (unrolling the 4-chunk kernel loops was worth 25% on `int_alu`), the kernels forced inline; each region body is compiled twice (a whole warp, group all ones, where every unguarded store is a plain row copy and the counters are constants; and any other group). Counters are accumulated in locals and written out before every escape call and at the end.
+* **Only hot regions are compiled** (a compile costs by the size of the source: 15 s for an 844 KB unit, 1.0 to 2.1 s for the hot loops of `int_alu`, `compute_virus` and `int_virus`). Regions are counted per run while the section is `Idle`; the cache is asked once the regions have run `VGPU_JIT_LOOKUP_AFTER` (1 M) instructions; at the threshold the regions that ran at least 0.1% of the counted total (`VGPU_JIT_HOT_PERMILLE`), are at least half generated, and fit in 1500 ops (`VGPU_JIT_MAX_OPS`) are compiled as the unit; the selection is recorded in `<section key>.sel` so a later run finds it without counting. Regions under 4 ops stay on the tier (`VGPU_JIT_MIN_REGION`: a call of generated code has a cost). A section with no region that is at least half generated has no unit at all.
+* The threshold default is now **100 M region instructions**. How it was chosen: the generated code saves about 5.7 ns per warp instruction on `int_alu` (87 to 150..207 Mi/s) and a hot-loop compile costs 1 to 2 s, so a compile pays back after 180 to 350 M instructions of that kind of work; waiting for 100 M (1.2 s of tier time) means a run that gets that far has, by then, shown that it is long. It is a knob.
+
+## Tests and gates
+
+* **(a) Special values, tier == JIT bit for bit, per form**: `sass_tier` (random inputs with zeros of both signs, extremes, NaNs with payloads, infinities, subnormals, shift counts past the width, carries at every word boundary; blocks of 128, 48 and 33 threads so the last warp is half empty; guards) on 7 architectures, now with an IMNMX kernel (`k_minmax`) added, runs identically with the JIT forced on (threshold 1, every region compiled). `e2e` shows 63 to 80% of its region instructions computed by generated code (`sass_tier_steps`: 99.9%). **Mutation check per form** (`-DVGPU_JIT_MUTANTS=ON`, `VGPU_JIT_MUTANT=<form>` flips one bit of lane 3 of the form's result, or of lane 2 of a predicate result; `maskless` makes every generated store ignore the executing lanes): all 20 mutants (19 forms and `maskless`) change the output (`m2-final-form-mutants.log`; `imnmx` survived until the `k_minmax` kernel was added to `sass_tier.cu`).
+* **(b) Everything of milestone 1**: `test_jit` 21/21 (a test of the selection record and a changed promotion test added), `run_sass_jit.sh` PASS with 52 checks (counters, faults inside a region, 1 and 4 threads, threshold-1 differential across all of `run_sass_tier.sh`'s programs, failure modes). The e2e script's JIT environment now sets `VGPU_JIT_HOT_PERMILLE=0 VGPU_JIT_MAX_OPS=100000000 VGPU_JIT_MIN_REGION=2` so that every region is compiled.
+* **(c)** `e2e_sass_tier` PASS; `e2e_sass_archs` with `VGPU_JIT=1 VGPU_JIT_THRESHOLD=1 VGPU_JIT_SYNC=1` and all regions selected: PASS, 292 ok.
+
+## Measurements (rig, CPU 4, sibling idle)
+
+**Harness workloads, tier against JIT** (5 alternating passes of 3 runs, warm cache, `VGPU_JIT_THRESHOLD=100000 VGPU_JIT_SYNC=1`, wall seconds; `data/round11/m2-harness-tier-vs-jit-sync-threshold100k.txt`):
+
+| workload | tier | JIT | JIT/tier | share of warp instructions computed by generated code |
+| --- | --- | --- | --- | --- |
+| int_alu | 0.1466 | 0.0797 | **0.54 (1.84x faster)** | 90.5% |
+| f32_fma | 0.0950 | 0.0695 | **0.73 (1.37x)** | 97.2% |
+| local | 0.2111 | 0.1784 | 0.85 (1.18x) | 80.7% |
+| mem | 0.3439 | 0.2968 | 0.86 (1.16x) | 65.7% |
+| warp | 0.0940 | 0.0961 | 1.02 | 33.0% |
+| divergent | 0.3601 | 0.3869 | 1.07 slower | 2.3% |
+| shared | 0.0829 | 0.0923 | 1.11 slower | 7.2% |
+| f64_fma | 0.0797 | 0.0934 | 1.17 slower | 0.2% |
+
+The slowdowns are the cost of the infrastructure on a run too short and too escape-heavy to pay it: the loop that has the region hook (`tier_run_t<true>`) is 10% slower than the plain one for every op that is not in a compiled region, plus the cache lookup and compiler-identity queries (about 10 ms of CPU) done once a section has run 1 M region instructions. The hook is used only for sections with a region that is at least half generated, and a section whose compile finds nothing (or fails) goes back to the plain loop. The default-threshold mode (async) on these 0.1 to 0.4 s runs showed +4% to +16% on `divergent`, `shared`, `f64_fma` and `warp` (`m2ae`, not saved as a file; the number is from the run on 2026-10-22 17:50 UTC). **Cold**: a fresh cache pays the compile inside the run in sync mode (1.4 s for the 5-region `int_alu` unit); in the default async mode the compile runs on another thread while the tier goes on.
+
+**Pantheon stress workloads** (prebuilt `build-vgpu-86` binaries from the WSL checkout, `bench.sh pantheon`, 10 s each, 3 passes, `data/round11/m2-pantheon-workloads.txt`; warm instruction rate per CPU second):
+
+| workload | tier | JIT cold (default async mode, threshold 100 M) | JIT warm |
+| --- | --- | --- | --- |
+| int_virus | 60.4 Mi/s | 107.1 (**1.77x**) | 107.7 (1.78x) |
+| compute_virus | 38.5 | 45.0 (1.17x) | 44.3 (1.15x) |
+| fp64_virus | 37.7 | 37.3 (no unit: DFMA is an escape) | 37.1 |
+
+Compile of the hot unit: int_virus 2.1 s, compute_virus 1.0 s (the cold int_virus run spent its first 2 to 3 s on the tier: 57% of its instructions ran in generated regions; warm: 93%). `pulse_virus` mostly sleeps; its rate means nothing.
+
+**JIT off against the base build** (`m2-jit-off-vs-base-all-workloads.txt`, 16 workloads, 7 alternations): 0.97 to 1.01 on 15 workloads, `launch` 1.016. The earlier +2% on `launch` was not looked into further (no time-box left after the measurements; NOT FOUND).
+
+**Compile time per section**: 0.9 to 2.1 s for the hot units above; 1.5 s mean (0.7 to 3.7 s) per unit when every region of `sass_tier` (29 units) or `mma_forms` is compiled. Parsing the embedded kernels costs 0.6 s of each. A precompiled header was tried and not used by the compiler (the generated file does not start with the include).
+
+## Verdict
+
+**Kept, as an opt-in feature that wins where it was meant to**: ALU-bound loops (`int_alu` 1.84x, `int_virus` 1.77x with the compile hidden in a background thread, `f32_fma` 1.37x, `compute_virus` 1.17x), with a cost of a few to 17% on short runs of kernels that are mostly escapes (`f64_fma`, `divergent`, `shared`, 0.1 to 0.4 s) and a lower bound of zero when `VGPU_JIT` is unset. It does nothing for fp64, divergent code, or memory-bound kernels (milestone 4's job), and nothing for the PyTorch tests (51 M warp instructions in 100 s).
+
+## Not done / NOT MEASURED
+
+* Register residence across ops (the 4 to 5x of study 1): not attempted; values go through the register file between ops (the compiler forwards stores to loads inside a region, but does not remove them).
+* `e2e_sass_archs` was run with every region compiled, not with the default selection; `m2ae` (async short runs) not saved; clang++; AVX-512; the launch-path +1.6% unexplained.
+* The default `VGPU_JIT_HOT_PERMILLE` (1) and `MIN_REGION` (4) are not tuned beyond the harness results above.
+* Milestone 4 (memory forms) was not started.

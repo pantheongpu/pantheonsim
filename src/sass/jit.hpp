@@ -195,20 +195,22 @@ struct Region {
   uint32_t gen = 0;       // how many of its ops the generated code computes itself (the others are escapes to the tier's handlers)
 };
 
-enum class State : int { Looking, Counting, Queued, Ready, Failed };
+// Idle: counting only (a section that runs little never asks the cache or the compiler anything); Looking: the cache is being asked; Counting:
+// the cache had nothing, counting towards the compile; Queued: a compile is queued or running.
+enum class State : int { Idle, Looking, Counting, Queued, Ready, Failed };
 
 // One per code section: the regions found in its tier program, and where the JIT stands for it.
 struct Unit : std::enable_shared_from_this<Unit> {
   UnitSpec spec;
   std::vector<Region> regions;
   std::vector<uint32_t> region_at;     // op index -> region number + 1 (0: no region starts there)
-  std::atomic<int> state{static_cast<int>(State::Looking)};
+  std::atomic<int> state{static_cast<int>(State::Idle)};
   std::atomic<uint64_t> executed{0};   // warp instructions the tier ran in the regions while counting
   std::unique_ptr<std::atomic<uint64_t>[]> counts;   // ... per region: which ones are hot decides which are compiled
   std::shared_ptr<Loaded> lib;         // valid once state is Ready (published with release)
   std::vector<int32_t> fn_index;       // region -> its function in lib, -1 for a region that was not compiled (valid once Ready)
   bool ready() const { return state.load(std::memory_order_acquire) == static_cast<int>(State::Ready); }
-  bool counting() const { return state.load(std::memory_order_relaxed) == static_cast<int>(State::Counting); }
+  bool counting() const { return state.load(std::memory_order_relaxed) <= static_cast<int>(State::Counting); }
   // The tier ran region `region` (k ops) uncompiled: count it, and ask for the compile once the threshold is passed.
   void note(uint32_t region, uint32_t k);
   // The compiled function of a region, null if it is not compiled (yet, or not selected).

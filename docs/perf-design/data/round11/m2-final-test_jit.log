@@ -1,0 +1,23 @@
+jit: 6 units (15 regions), 2 ready, 1 cache hits, 1 compiles (48.2 ms), 0 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions (0 computed by generated code), 0 exceptions unwound through them
+[ PASS ] jit_source_is_a_function_of_the_spec_and_names_every_layout_offset
+[ PASS ] jit_key_depends_on_everything_it_must
+[ PASS ] jit_generated_regions_count_and_call_the_escape_as_the_run_loop_does
+[ PASS ] jit_exceptions_unwind_through_the_generated_frames_with_and_without_fexceptions
+[ PASS ] jit_second_engine_hits_the_cache_without_compiling
+[ PASS ] jit_damaged_objects_are_replaced_never_loaded
+[ PASS ] jit_an_object_of_another_abi_or_generator_is_rejected
+[ PASS ] jit_a_selection_of_regions_is_compiled_and_found_again_by_the_section
+[ PASS ] jit_no_compiler
+[ PASS ] jit_a_failing_compile_leaves_nothing_in_the_cache
+[ PASS ] jit_a_compile_that_takes_too_long_is_killed
+[ PASS ] jit_the_compiler_runs_under_an_address_space_limit
+[ PASS ] jit_an_unusable_cache_directory_is_reported
+[ PASS ] jit_an_object_that_cannot_be_mapped_is_a_cache_problem_not_a_crash
+[ PASS ] jit_threads_compiling_one_key_compile_it_once
+[ PASS ] jit_processes_compiling_one_key_compile_it_once
+[ PASS ] jit_a_region_runs_in_one_go_only_where_every_op_would_have_run_in_the_loop
+[ PASS ] jit_regions_are_straight_runs_of_ops_with_a_handler_and_no_store
+[ PASS ] jit_long_runs_are_split_and_the_last_op_of_a_section_is_never_in_a_region
+[ PASS ] jit_a_unit_is_promoted_after_the_threshold_and_a_second_one_with_the_same_words_hits_the_cache
+[ PASS ] jit_cost_of_compiling_and_of_a_cache_hit
+21/21 tests passed

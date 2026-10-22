@@ -831,6 +831,7 @@ struct Manager {
   bool sync;
   bool quiet;
   unsigned max_region;
+  uint64_t lookup_after;   // the section asks the cache after its regions have run this many instructions (not before: a short run costs nothing)
   uint64_t check_mask;     // Unit::note works out the section's total when a region's count passes a multiple of check_mask + 1
   unsigned min_region;     // shorter runs of ops stay on the tier: a call of generated code has a cost of its own
   unsigned hot_permille;   // a region is compiled if it ran at least this many thousandths of the section's counted instructions (0: every region)
@@ -857,8 +858,9 @@ struct Manager {
       const char* v = std::getenv(n);
       return v && *v ? static_cast<uint64_t>(std::strtoull(v, nullptr, 10)) : d;
     };
-    threshold = num("VGPU_JIT_THRESHOLD", 10000000ull);
-    check_mask = (uint64_t{1} << std::min<unsigned>(12, 63 - static_cast<unsigned>(__builtin_clzll(threshold ? threshold : 1)))) - 1;
+    threshold = num("VGPU_JIT_THRESHOLD", 100000000ull);
+    lookup_after = std::min<uint64_t>(num("VGPU_JIT_LOOKUP_AFTER", 1000000ull), threshold);
+    check_mask = (uint64_t{1} << std::min<unsigned>(12, 63 - static_cast<unsigned>(__builtin_clzll(lookup_after ? lookup_after : 1)))) - 1;
     const char* sy = std::getenv("VGPU_JIT_SYNC");
     sync = sy && sy[0] == '1';
     const char* q_ = std::getenv("VGPU_QUIET");
@@ -919,6 +921,9 @@ struct Manager {
       uint64_t ops = 0;
       for (uint32_t i : order) {
         if (cnt[i] == 0) break;
+        // A region that is mostly calls of the tier's handlers is slower compiled than not (an indirect call and the counting on top of the
+        // handler): only regions at least half of whose ops the generated code computes are worth the compile.
+        if (u.regions[i].gen * 2 < u.regions[i].k) continue;
         const bool hot = cnt[i] * 1000 >= total * hot_permille;
         if (!hot && !sel.empty()) break;
         if (ops + u.regions[i].k > max_ops && !sel.empty()) continue;
@@ -927,7 +932,6 @@ struct Manager {
       }
       std::sort(sel.begin(), sel.end());
     }
-    if (sel.empty()) sel.push_back(0);
     return sel;
   }
 
@@ -951,6 +955,10 @@ struct Manager {
       }
     } else {
       const std::vector<uint32_t> sel = select(*u);
+      if (sel.empty()) {   // nothing worth compiling: the section stays on the tier
+        u->state.store(static_cast<int>(State::Failed), std::memory_order_release);
+        return;
+      }
       Result r = engine.obtain_selected(u->spec, sel);
       if (r.compiled) {
         stats().compiles.fetch_add(1);
@@ -1007,17 +1015,23 @@ Manager& manager() {
 
 
 void Unit::note(uint32_t region, uint32_t k) {
-  const uint64_t check_mask = manager().check_mask;
-  if (state.load(std::memory_order_relaxed) != static_cast<int>(State::Counting)) return;
+  Manager& mgr = manager();
+  int s = state.load(std::memory_order_relaxed);
+  if (s > static_cast<int>(State::Counting)) return;
   const uint64_t c = counts[region].fetch_add(k, std::memory_order_relaxed) + k;
-  // (The section's total is worked out only when this region's count passes a multiple of 4096: one atomic add per run, not two.)
-  if ((c & check_mask) >= k) return;
+  // (The section's total is worked out only when this region's count passes a multiple of check_mask + 1: one atomic add per run, not two.)
+  if ((c & mgr.check_mask) >= k) return;
   uint64_t total = 0;
   for (size_t i = 0; i < regions.size(); ++i) total += counts[i].load(std::memory_order_relaxed);
   executed.store(total, std::memory_order_relaxed);
-  if (total < manager().threshold) return;
+  if (s == static_cast<int>(State::Idle) && total >= mgr.lookup_after) {
+    int exp = static_cast<int>(State::Idle);
+    if (state.compare_exchange_strong(exp, static_cast<int>(State::Looking))) mgr.submit(Job::Lookup, shared_from_this());   // (inline in synchronous mode)
+    s = state.load(std::memory_order_acquire);
+  }
+  if (total < mgr.threshold || s != static_cast<int>(State::Counting)) return;
   int exp = static_cast<int>(State::Counting);
-  if (state.compare_exchange_strong(exp, static_cast<int>(State::Queued))) manager().submit(Job::Compile, shared_from_this());
+  if (state.compare_exchange_strong(exp, static_cast<int>(State::Queued))) mgr.submit(Job::Compile, shared_from_this());
 }
 
 void drain() { manager().drain(); }
@@ -1139,10 +1153,14 @@ std::shared_ptr<Unit> make_unit(const tier::Program& prog, int sm) {
     i = j;
   }
   if (u->regions.empty()) return nullptr;
+  if (mgr.hot_permille != 0) {   // a section none of whose regions is mostly arithmetic the generated code computes would never be compiled (select()): it costs nothing, not even its hook
+    bool any = false;
+    for (const Region& r : u->regions) any |= r.gen * 2 >= r.k;
+    if (!any) return nullptr;
+  }
   u->counts.reset(new std::atomic<uint64_t>[u->regions.size()]());
   stats().units.fetch_add(1);
   stats().regions.fetch_add(u->regions.size());
-  mgr.submit(Job::Lookup, u);
   return u;
 }
 

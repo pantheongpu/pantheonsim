@@ -814,14 +814,14 @@ VTEST(jit_a_unit_is_promoted_after_the_threshold_and_a_second_one_with_the_same_
   auto u = jit::make_unit(a.prog, 80);
   VCHECK(u != nullptr);
   VCHECK_EQ(u->regions.size(), size_t{2});
-  VCHECK(u->state.load() == static_cast<int>(jit::State::Counting));   // (synchronous mode: the lookup is done, and missed)
+  VCHECK(u->state.load() == static_cast<int>(jit::State::Idle));   // (nothing asked of the cache before the regions have run)
   VCHECK(!u->ready());
   u->note(0, 40);
   VCHECK(!u->ready());   // 40 of 100
   u->note(1, 40);
   VCHECK(!u->ready());   // 80
   u->note(0, 40);
-  VCHECK(u->ready());    // 120: compiled, loaded
+  VCHECK(u->ready());    // 120: the cache asked (a miss, synchronous mode), then compiled and loaded
   VCHECK_EQ(jit::stats().compiles.load(), compiles0 + 1);
   check_against_model(u->spec, *u->lib, 23, 30);
   u->note(0, 1000);   // (counting is over: nothing happens)
@@ -830,6 +830,8 @@ VTEST(jit_a_unit_is_promoted_after_the_threshold_and_a_second_one_with_the_same_
   FakeProgram b("aaaaxaaaaaxa");
   const auto u2 = jit::make_unit(b.prog, 80);
   VCHECK(u2 != nullptr);
+  VCHECK(!u2->ready());
+  u2->note(0, 100);   // the lookup threshold (the smaller of 1 M and the compile threshold) reached: the cache has it
   VCHECK(u2->ready());
   VCHECK_EQ(jit::stats().compiles.load(), compiles0 + 1);
   VCHECK_EQ(jit::stats().cache_hits.load(), hits0 + 1);
@@ -837,6 +839,8 @@ VTEST(jit_a_unit_is_promoted_after_the_threshold_and_a_second_one_with_the_same_
   FakeProgram c("aaaaxaaaaaxa");
   const auto u3 = jit::make_unit(c.prog, 90);
   VCHECK(u3 != nullptr && !u3->ready());
+  u3->note(0, 100);
+  VCHECK(u3->state.load() == static_cast<int>(jit::State::Counting) || u3->ready());   // (a miss: counting on; or, the threshold being reached by the same note, compiled already)
 }
 
 // ---- cost (VGPU_JIT_REPORT=1 prints it) ---------------------------------------------------------------------------------------------------------
