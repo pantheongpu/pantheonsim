@@ -521,6 +521,198 @@ __global__ void k_generic(u32* g, u32* cnt, const u32* A, int n) {
   g[blockIdx.x * blockDim.x + t] ^= __shfl_xor_sync(0xffffffffu, v, 3) + __popc(__ballot_sync(0xffffffffu, v & 4));
 }
 
+// The warp-wide, atomic and call instructions that end a run: MATCH (the tier's own handler: every mode, 32 and 64 bits, whole and diverged
+// warps) beside the ones the interpreter keeps (global atomics and RED, shared atomics, REDUX, VOTEU, CALL/RET, WARPSYNC, BRA.DIV/.CONV),
+// so that the tier is held to the interpreter's answers on the neighbours of each. Each block works on bins of its own, so that the order in which the host
+// threads run the blocks changes nothing; the order of the lanes and of the block's warps is the executor's, the same both ways.
+__device__ __noinline__ u32 d_leaf(u32 x, u32 y) { return (x * 2654435761u) ^ (y >> 3); }
+__device__ __noinline__ u32 d_f0(u32 x) { return x > 100u ? d_leaf(x, x + 1u) : x * 7u; }
+__device__ __noinline__ u32 d_f1(u32 x) { return x ^ (x << 5); }
+__device__ __noinline__ u32 d_f2(u32 x) { return d_f0(x) + d_f1(x); }
+__device__ __noinline__ u32 d_f3(u32 x) { return ~x; }
+typedef u32 (*d_fn)(u32);
+__device__ d_fn d_ftab[4] = {d_f0, d_f1, d_f2, d_f3};
+constexpr int kDir = 40;
+__global__ void k_direct(const u32* A, const u32* Bv, u32* out, u32* bins, unsigned long long* bins64, float* binsf, double* binsd, int n) {
+  const int t = threadIdx.x, i = blockIdx.x * blockDim.x + t;
+  const bool in = i < n;
+  const u32 a = in ? A[i] : 0u, b = in ? Bv[i] : 0u;
+  u32* bn = bins + blockIdx.x * 64;
+  unsigned long long* b64 = bins64 + blockIdx.x * 8;
+  float* bf = binsf + blockIdx.x * 8;
+  double* bd = binsd + blockIdx.x * 8;
+  __shared__ u32 sh[64];
+  __shared__ unsigned long long sh64[8];
+  if (t < 64) sh[t] = t * 3u;
+  if (t < 8) sh64[t] = t;
+  __syncthreads();
+  u32 r[kDir];
+  int k = 0;
+  const u32 lane = threadIdx.x & 31;
+  const u32 full = __activemask();
+  r[k++] = __match_any_sync(full, a & 7u);
+  int pr = 0;
+  r[k++] = __match_all_sync(full, (u32)(a & 0xf0u) | ((lane >> 5)), &pr);
+  r[k++] = (u32)pr;
+  r[k++] = __match_any_sync(full, ((u64)a << 20) | (b & 3u));
+#if __CUDA_ARCH__ >= 800
+  r[k++] = __reduce_add_sync(full, a);
+  r[k++] = __reduce_min_sync(full, a);
+  r[k++] = __reduce_max_sync(full, b);
+  r[k++] = __reduce_or_sync(full, a);
+  r[k++] = __reduce_and_sync(full, a | b);
+  r[k++] = __reduce_xor_sync(full, a ^ b);
+  r[k++] = (u32)__reduce_min_sync(full, (i32)a);
+  r[k++] = (u32)__reduce_max_sync(full, (i32)b);
+#else
+  for (int j = 0; j < 8; ++j) r[k++] = a + j;
+#endif
+  // a warp-aggregated increment: the leader adds for everyone (VOTEU/REDUX/BRA.CONV in ptxas's code)
+  {
+    const u32 m = __activemask();
+    const u32 leader = __ffs(m) - 1;
+    u32 old = 0;
+    if (lane == leader) old = atomicAdd(&bn[0], (u32)__popc(m));
+    old = __shfl_sync(m, old, leader);
+    r[k++] = old + __popc(m & ((1u << lane) - 1u));
+  }
+  // atomics of every kind, with their old values, and the same without (RED)
+  r[k++] = atomicAdd(&bn[1], a | 1u);
+  r[k++] = atomicMax(&bn[2], a);
+  r[k++] = atomicMin(&bn[3], b);
+  r[k++] = atomicAnd(&bn[4], a | 0x0f0f0f0fu);
+  r[k++] = atomicOr(&bn[5], b & 0xff00u);
+  r[k++] = atomicXor(&bn[6], a & 0xfffu);
+  r[k++] = atomicExch(&bn[7 + (lane & 3)], a);
+  r[k++] = atomicCAS(&bn[12], b & 7u, a);
+  r[k++] = atomicInc(&bn[13], b & 63u);
+  r[k++] = atomicDec(&bn[14], b & 63u);
+  if (in) {
+    atomicAdd(&bn[16 + (a & 7)], 1u);
+    atomicMax(&bn[24], a);
+    atomicMin((i32*)&bn[25], (i32)b);
+    atomicOr(&bn[26], 1u << (a & 31));
+    atomicXor(&bn[27], b);
+  }
+  r[k++] = (u32)atomicAdd(&b64[0], (unsigned long long)a * 3u + b);
+  r[k++] = (u32)(atomicAdd(&b64[1], (unsigned long long)a << 32) >> 32);
+  r[k++] = (u32)atomicCAS(&b64[2], (unsigned long long)(b & 3u), (unsigned long long)a);
+  r[k++] = (u32)atomicExch(&b64[3], (unsigned long long)a);
+  r[k++] = __float_as_uint(atomicAdd(&bf[0], (float)(a & 0xff) * 0.25f));
+  atomicAdd(&bf[1], (float)(b & 0x3f));
+#if __CUDA_ARCH__ >= 600
+  r[k++] = (u32)__double_as_longlong(atomicAdd(&bd[0], (double)(a & 0xff) * 0.5));
+#else
+  r[k++] = a;
+#endif
+  // shared atomics
+  r[k++] = atomicAdd(&sh[a & 15], b | 1u);
+  r[k++] = atomicMax(&sh[16 + (b & 7)], a);
+  r[k++] = atomicCAS(&sh[24 + (a & 3)], a & 7u, b);
+  r[k++] = (u32)atomicAdd(&sh64[a & 3], (unsigned long long)b);
+  __syncthreads();
+  // calls and returns, through a table (an indirect call) and directly, in a diverged warp
+  r[k++] = d_ftab[a & 3](b);
+  r[k++] = d_f2(a);
+  // collectives inside divergent code: BRA.DIV/.CONV and WARPSYNC
+  if (a & 1) {
+    const u32 m = __activemask();
+    r[k++] = __match_any_sync(m, b & 3u);
+    __syncwarp(m);
+  } else {
+    const u32 m = __activemask();
+    r[k++] = __ballot_sync(m, b & 8u) + __popc(m);
+    __syncwarp(m);
+  }
+  // an IEEE division: FCHK, then the slow path through a CALL when the check says so (the interpreter says so always); FCHK itself is the
+  // interpreter's (a handler for it measured +1.2% and +1.8%, docs/performance.md)
+  r[k++] = B(F(a) / F(b));
+  r[k++] = B(F(b ^ 0x3f800000u) / F(a | 0x00800000u));
+  while (k < kDir) r[k++] = lane;
+  if (in)
+    for (int j = 0; j < kDir; ++j) out[(size_t)i * kDir + j] = r[j];
+  __syncthreads();
+  if (t < 64) out[(size_t)n * kDir + blockIdx.x * 64 + t] = sh[t];
+}
+
+// The integer tensor cores (IMMA): mma.sync of s8, u8 and s4 products into s32, plain and .satfinite, in the shapes m8n8k16, m16n8k16, m16n8k32
+// (s8, u8) and m8n8k32, m16n8k32, m16n8k64 (s4), on registers of random bits (sums that wrap, and that clamp under .satfinite).
+constexpr int kImma = 40;
+#define IMMA4(shape, mods, T1, T2)                                                                                                         \
+  {                                                                                                                                         \
+    u32 d0, d1, d2, d3;                                                                                                                     \
+    asm volatile("mma.sync.aligned." shape ".row.col." mods "s32." T1 "." T2 ".s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};" \
+                 : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)                                                                                   \
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));          \
+    o[k++] = d0; o[k++] = d1; o[k++] = d2; o[k++] = d3;                                                                                     \
+  }
+#define IMMA2(shape, mods, T1, T2)                                                                                                          \
+  {                                                                                                                                         \
+    u32 d0, d1, d2, d3;                                                                                                                     \
+    asm volatile("mma.sync.aligned." shape ".row.col." mods "s32." T1 "." T2 ".s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};"          \
+                 : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)                                                                                   \
+                 : "r"(a[0]), "r"(a[1]), "r"(b[0]), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));                                            \
+    o[k++] = d0; o[k++] = d1; o[k++] = d2; o[k++] = d3;                                                                                     \
+  }
+#define IMMA1(shape, mods, T1, T2)                                                                                                          \
+  {                                                                                                                                         \
+    u32 d0, d1;                                                                                                                             \
+    asm volatile("mma.sync.aligned." shape ".row.col." mods "s32." T1 "." T2 ".s32 {%0,%1}, {%2}, {%3}, {%4,%5};"                           \
+                 : "=r"(d0), "=r"(d1) : "r"(a[0]), "r"(b[0]), "r"(c[0]), "r"(c[1]));                                                        \
+    o[k++] = d0; o[k++] = d1;                                                                                                               \
+  }
+__global__ void k_imma(const u32* A, const u32* Bv, const u32* C, u32* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  u32 a[4], b[2], c[4], o[kImma] = {};
+  for (int j = 0; j < 4; ++j) { a[j] = A[((size_t)i * 4 + j) % n]; c[j] = C[((size_t)i * 4 + j) % n]; }
+  for (int j = 0; j < 2; ++j) b[j] = Bv[((size_t)i * 2 + j) % n];
+  int k = 0;
+#if __CUDA_ARCH__ >= 800
+  IMMA4("m16n8k32", "", "s8", "s8")
+  IMMA4("m16n8k32", "", "u8", "u8")
+  IMMA4("m16n8k32", "", "s8", "u8")
+  IMMA4("m16n8k32", "satfinite.", "s8", "s8")
+  IMMA4("m16n8k32", "satfinite.", "u8", "s8")
+  IMMA2("m16n8k16", "", "s8", "s8")
+  IMMA2("m16n8k16", "", "u8", "s8")
+  IMMA2("m16n8k16", "satfinite.", "u8", "u8")
+  IMMA4("m16n8k64", "", "s4", "s4")
+  IMMA4("m16n8k64", "", "u4", "u4")
+  IMMA4("m16n8k64", "satfinite.", "s4", "u4")
+  IMMA2("m16n8k32", "", "s4", "s4")
+  IMMA2("m16n8k32", "satfinite.", "u4", "u4")
+#endif
+  IMMA1("m8n8k16", "", "s8", "u8")
+  IMMA1("m8n8k16", "satfinite.", "s8", "s8")
+  IMMA1("m8n8k32", "", "s4", "s4")
+  IMMA1("m8n8k32", "satfinite.", "u4", "s4")
+  if (i < n)
+    for (int j = 0; j < kImma; ++j) out[(size_t)i * kImma + j] = o[j];
+}
+
+// ldmatrix (LDSM): one, two and four 8x8 matrices of 16-bit elements, plain and transposed, from rows at addresses of the lanes' own (16-byte
+// aligned, some rows shared between lanes, some past the first kilobyte). Whole warps only: ldmatrix takes the rows from all the lanes.
+constexpr int kLdsm = 16;
+__global__ void k_ldsm(const u32* A, u32* out, int n) {
+  __shared__ __align__(16) u32 sm[1024];
+  const int t = threadIdx.x;
+  for (int j = t; j < 1024; j += blockDim.x) sm[j] = A[((size_t)blockIdx.x * 1024 + j) % n];
+  __syncthreads();
+  const u32 lane = t & 31;
+  const u32 base = (u32)__cvta_generic_to_shared(sm);
+  const u32 row = base + ((lane * 5 + blockIdx.x * 3 + (t >> 5)) % 64) * 16;
+  u32 r[kLdsm] = {};
+  int k = 0;
+  asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];" : "=r"(r[0]) : "r"(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%0}, [%1];" : "=r"(r[1]) : "r"(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r[2]), "=r"(r[3]) : "r"(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];" : "=r"(r[4]), "=r"(r[5]) : "r"(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[6]), "=r"(r[7]), "=r"(r[8]), "=r"(r[9]) : "r"(row));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[10]), "=r"(r[11]), "=r"(r[12]), "=r"(r[13]) : "r"(row));
+  (void)k;
+  for (int j = 0; j < kLdsm; ++j) out[((size_t)blockIdx.x * blockDim.x + t) * kLdsm + j] = r[j];
+}
+
 // The store gate (Runner::step_warp): a warp's first store to global memory ends its turn, once, so every warp of the block
 // loads the word before any warp stores. Four warps each doing `*w += 1` end with 1, not 4, as on a card. The tier must
 // stop at the store as the interpreter does.
@@ -797,6 +989,29 @@ int main() {
     if (report("mma special", out, (size_t)4096 * kMma)) return 1;
     CK(cudaFree(out)); CK(cudaFree(dma)); CK(cudaFree(dmb)); CK(cudaFree(dmc));
   }
+  {   // ldmatrix
+    u32* out;
+    CK(cudaMalloc(&out, (size_t)16 * 128 * kLdsm * 4));
+    for (int threads : {64, 128}) {
+      k_ldsm<<<16, threads>>>(da, out, n);
+      char label[64];
+      std::snprintf(label, sizeof label, "ldsm threads=%d", threads);
+      if (report(label, out, (size_t)16 * threads * kLdsm)) return 1;
+    }
+    CK(cudaFree(out));
+  }
+  {   // the integer tensor cores
+    const int nm = 2048;
+    u32* out;
+    CK(cudaMalloc(&out, (size_t)nm * kImma * 4));
+    for (int threads : {64, 128}) {
+      k_imma<<<nm / threads, threads>>>(da, db, dc, out, nm);
+      char label[64];
+      std::snprintf(label, sizeof label, "imma threads=%d", threads);
+      if (report(label, out, (size_t)nm * kImma)) return 1;
+    }
+    CK(cudaFree(out));
+  }
   {
     std::vector<u64> xa(n), xb(n), xc(n);
     fill64(xa, 0);
@@ -857,6 +1072,33 @@ int main() {
     k_generic<<<4, 256>>>(g, cnt, da, n);
     if (report("generic", g, 1024) || report("generic atomics", cnt, 64)) return 1;
     CK(cudaFree(g)); CK(cudaFree(cnt));
+  }
+  {   // MATCH, atomics, REDUX, VOTEU, calls, WARPSYNC, BRA.DIV/.CONV (see k_direct)
+    for (int threads : {128, 48, 33}) {
+      const int blocks = (n + threads - 1) / threads;
+      u32 *out, *bins;
+      unsigned long long* bins64;
+      float* binsf;
+      double* binsd;
+      CK(cudaMalloc(&out, ((size_t)n * kDir + (size_t)blocks * 64) * 4));
+      CK(cudaMalloc(&bins, (size_t)blocks * 64 * 4));
+      CK(cudaMalloc(&bins64, (size_t)blocks * 8 * 8));
+      CK(cudaMalloc(&binsf, (size_t)blocks * 8 * 4));
+      CK(cudaMalloc(&binsd, (size_t)blocks * 8 * 8));
+      CK(cudaMemset(out, 0, ((size_t)n * kDir + (size_t)blocks * 64) * 4));
+      CK(cudaMemset(bins, 0x11, (size_t)blocks * 64 * 4));
+      CK(cudaMemset(bins64, 0x22, (size_t)blocks * 8 * 8));
+      CK(cudaMemset(binsf, 0, (size_t)blocks * 8 * 4));
+      CK(cudaMemset(binsd, 0, (size_t)blocks * 8 * 8));
+      k_direct<<<blocks, threads>>>(da, db, out, bins, bins64, binsf, binsd, n);
+      char label[64];
+      std::snprintf(label, sizeof label, "direct threads=%d", threads);
+      if (report(label, out, (size_t)n * kDir + (size_t)blocks * 64)) return 1;
+      if (report("direct bins", bins, (size_t)blocks * 64) || report("direct bins64", bins64, (size_t)blocks * 8) ||
+          report("direct binsf", binsf, (size_t)blocks * 8) || report("direct binsd", binsd, (size_t)blocks * 8))
+        return 1;
+      CK(cudaFree(out)); CK(cudaFree(bins)); CK(cudaFree(bins64)); CK(cudaFree(binsf)); CK(cudaFree(binsd));
+    }
   }
   {
     u32 *word, *seen;

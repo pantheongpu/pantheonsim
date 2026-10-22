@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <pthread.h>
+#include <system_error>
 #include <thread>
 #include <climits>
 #include <cstddef>
@@ -78,6 +79,15 @@ hipError_t fail(hipError_t code, const std::string& what) {
   return code;
 }
 
+// What a module that could not be put on the device is told as: the host being short of memory (the simulator's guard,
+// VGPU_MEMORY_HOST_RESERVE_MB) is hipErrorOutOfMemory, as ROCm's loader says it, not an invalid image. (A launch whose
+// module load hit the guard once showed as hipErrorInvalidImage and, in a program that does not read launch errors, as a
+// kernel that silently never ran.)
+hipError_t load_failure(const std::exception& e) {
+  const auto* v = dynamic_cast<const vgpu::Error*>(&e);
+  return fail(v && v->code() == vgpu::Err::OutOfMemory ? hipErrorOutOfMemory : hipErrorInvalidImage, e.what());
+}
+
 // The code for a copy or fill that threw: a chunk of host memory the device's bytes needed was not
 // to be had (the simulator's host-memory guard, or a spill file with no room), which is what a full
 // card says; anything else is a bad argument.
@@ -120,24 +130,58 @@ void note_queue_use(hipStream_t stream) {
   if (const auto* p = profiler(); p && p->queue_used) p->queue_used(reinterpret_cast<uint64_t>(stream));
 }
 
+// Whether anything watches the HIP calls: 0 nothing (VGPU_TRACE_API unset, no profiler ever attached), 1 something
+// may (a profiler attached, or VGPU_TRACE_API is set), 2 not worked out yet (the first call does). A call made while
+// 0 is a read of this and nothing else -- no argument is looked at -- which is what a program that is not profiled
+// pays for every HIP call.
+std::atomic<int> g_api_watch{2};
+
+// The call's side of watching, out of line: the arguments follow the name in the order of the HIP prototype, and a
+// profiler that asks for them (rocprofiler's records carry them) is handed each one's value and the size of the type
+// it was passed as.
+struct ApiWatch {
+  static bool trace() {
+    static const bool v = [] {
+      const char* t = std::getenv("VGPU_TRACE_API");
+      return t && t[0] == '1';
+    }();
+    return v;
+  }
+  // Settles state 2: watching if VGPU_TRACE_API is set or a profiler is attached by now.
+  [[gnu::noinline]] static bool settle() {
+    int expected = 2;
+    g_api_watch.compare_exchange_strong(expected, (trace() || profiler()) ? 1 : 0);
+    return g_api_watch.load(std::memory_order_relaxed) != 0;
+  }
+};
+
 // One HIP call, from the outermost: a call one HIP function makes through
 // another is part of the first, as it is in ROCm's runtime.
 class ApiCall {
  public:
-  // The arguments follow the name, in the order of the HIP prototype: a profiler
-  // that asks for them (rocprofiler's records carry them) is handed each one's
-  // value and the size of the type it was passed as.
   template <class... Args>
   explicit ApiCall(const char* name, const Args&... args) {
+    const int watch = g_api_watch.load(std::memory_order_relaxed);
+    if (__builtin_expect(watch == 0, 1)) return;
+    if (watch == 2 && !ApiWatch::settle()) return;
+    enter(name, args...);
+  }
+  ~ApiCall() {
+    if (__builtin_expect(!counted_, 1)) return;
+    leave();
+  }
+  ApiCall(const ApiCall&) = delete;
+  ApiCall& operator=(const ApiCall&) = delete;
+
+ private:
+  template <class... Args>
+  [[gnu::noinline, gnu::cold]] void enter(const char* name, const Args&... args) {
+    counted_ = true;
     if (depth()++ != 0) return;
     // VGPU_TRACE_API=1 names each HIP call a program makes, one line to
     // stderr: what a library does through HIP, when it does not do what it
     // should, is otherwise invisible.
-    static const bool trace = [] {
-      const char* t = std::getenv("VGPU_TRACE_API");
-      return t && t[0] == '1';
-    }();
-    if (trace) std::fprintf(stderr, "VirtualGPU HIP: %s\n", name);
+    if (ApiWatch::trace()) std::fprintf(stderr, "VirtualGPU HIP: %s\n", name);
     if (const auto* p = profiler(); p && p->api_enter) {
       hooks_ = p;
       if (p->size >= offsetof(vgpu::amd::hipprof::Hooks, api_enter_args) + sizeof(p->api_enter_args) &&
@@ -153,18 +197,15 @@ class ApiCall {
       }
     }
   }
-  ~ApiCall() {
+  [[gnu::noinline, gnu::cold]] void leave() {
     --depth();
     if (hooks_ && hooks_->api_exit) hooks_->api_exit(token_);
   }
-  ApiCall(const ApiCall&) = delete;
-  ApiCall& operator=(const ApiCall&) = delete;
-
- private:
   static int& depth() {
     thread_local int d = 0;
     return d;
   }
+  bool counted_ = false;
   const vgpu::amd::hipprof::Hooks* hooks_ = nullptr;
   uint64_t token_ = 0;
 };
@@ -655,18 +696,37 @@ hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std
     if (const hipError_t e = order_for(s, stream, &o); e != hipSuccess) return e;
   }
   for (Queue::Marker& m : also) o.after.push_back(std::move(m));
+  // A stream's thread starts with its first item. A host that will not start one (EAGAIN at a process or user limit)
+  // is a launch that failed, not an exception out of a C entry point, and the item is not queued.
+  const auto no_thread = [](const std::system_error& e) {
+    return fail(hipErrorOutOfMemory, std::string("the host would not start a thread for the stream: ") + e.what());
+  };
   if (!wait && !synchronous_launches()) {
-    o.queue->submit(std::move(work), std::move(o.after));
+    try {
+      o.queue->submit(std::move(work), std::move(o.after));
+    } catch (const std::system_error& e) {
+      return no_thread(e);
+    }
     return hipSuccess;
   }
   auto result = std::make_shared<hipError_t>(hipSuccess);
-  const uint64_t seq = o.queue->submit(
-      [result, work = std::move(work)] {
-        *result = work();
-        return hipSuccess;   // told to the caller, not kept for a later synchronization
-      },
-      std::move(o.after));
-  o.queue->wait(seq);
+  Queue::Work told = [result, work = std::move(work)] {
+    *result = work();
+    return hipSuccess;   // told to the caller, not kept for a later synchronization
+  };
+  // A call that waits for its own work, on a stream with nothing in it, runs the work here: the stream's thread
+  // would only be woken to do it while this one sleeps. (A profiler's copy and fill records carry the id of the
+  // thread that did them, so with one attached the stream's thread keeps them.)
+  hipError_t unused = hipSuccess;
+  if (profiler() || !o.queue->run_inline(told, o.after, &unused)) {
+    uint64_t seq = 0;
+    try {
+      seq = o.queue->submit(std::move(told), std::move(o.after));
+    } catch (const std::system_error& e) {
+      return no_thread(e);
+    }
+    o.queue->wait(seq);
+  }
   // A blocking call also returns a failure the stream's earlier asynchronous
   // work left (HIP's "may also return error codes from previous,
   // asynchronous launches"): a copy back after a kernel that failed says so,
@@ -874,6 +934,44 @@ hipError_t prepare_launch(State& s, int ordinal, const Module& module, const Ker
   return hipSuccess;
 }
 
+// VGPU_DISPATCH_STATS=<file> appends one line to the file for each kernel launch that finished, with what the dispatch
+// counted (vgpu::amd::DispatchStats: the numbers the profiler's SQ_* counters are made of, and the interpreter's own
+// instruction total). "1" writes the lines to stderr. It needs no profiler, so tools/bench-amd can count instructions
+// where rocprofv3 does not run. One line, one write, so launches on different streams do not interleave.
+void note_dispatch_stats(const Kernel& kernel, int ordinal, const vgpu::amd::DispatchStats& st) {
+  static const char* const target = [] {
+    const char* t = std::getenv("VGPU_DISPATCH_STATS");
+    return t && *t && std::strcmp(t, "0") != 0 ? t : nullptr;
+  }();
+  if (!target) return;
+  const vgpu::amd::InstructionCounts& c = st.counts;
+  char line[640];
+  const int n = std::snprintf(
+      line, sizeof line,
+      "VGPU_DISPATCH device=%d wave=%d waves=%llu instructions=%llu barriers=%llu valu=%llu mfma=%llu salu=%llu smem=%llu "
+      "vmem=%llu flat=%llu lds=%llu branch=%llu sendmsg=%llu gds=%llu flat_read=%llu flat_write=%llu flat_atomic=%llu "
+      "vmem_rd=%llu vmem_wr=%llu\n",
+      ordinal, kernel.wave32 ? 32 : 64, static_cast<unsigned long long>(st.waves),
+      static_cast<unsigned long long>(st.instructions), static_cast<unsigned long long>(st.barriers),
+      static_cast<unsigned long long>(c.valu), static_cast<unsigned long long>(c.mfma),
+      static_cast<unsigned long long>(c.salu), static_cast<unsigned long long>(c.smem),
+      static_cast<unsigned long long>(c.vmem), static_cast<unsigned long long>(c.flat),
+      static_cast<unsigned long long>(c.lds), static_cast<unsigned long long>(c.branch),
+      static_cast<unsigned long long>(c.sendmsg), static_cast<unsigned long long>(c.gds),
+      static_cast<unsigned long long>(c.flat_read), static_cast<unsigned long long>(c.flat_write),
+      static_cast<unsigned long long>(c.flat_atomic), static_cast<unsigned long long>(c.vmem_rd),
+      static_cast<unsigned long long>(c.vmem_wr));
+  if (n <= 0) return;
+  if (std::strcmp(target, "1") == 0) {
+    (void)!::write(2, line, static_cast<size_t>(n));
+    return;
+  }
+  const int fd = ::open(target, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+  if (fd < 0) return;
+  (void)!::write(fd, line, static_cast<size_t>(n));   // (O_APPEND: the line lands whole)
+  ::close(fd);
+}
+
 // Runs one kernel on one device: the arguments go into device memory as its
 // kernarg segment, and the dispatch runs to completion before this returns.
 // On a stream's thread, without s.mutex.
@@ -986,6 +1084,7 @@ hipError_t run_launch(const LaunchJob& job) {
       start = vgpu::amd::hipprof::now_ns();
     }
     const vgpu::amd::DispatchStats stats = vgpu::amd::execute(dispatch, mem);
+    note_dispatch_stats(kernel, ordinal, stats);
     if (prof && prof->launched) {
       prof->launched(launch, &stats, start, vgpu::amd::hipprof::now_ns(), token);
       prof = nullptr;   // told
@@ -1052,12 +1151,21 @@ struct MainThreadExitGuard {
   }
 };
 
+// Counts the forks this process is the child of, for launch_in_order: a thread's answer to "am I the main thread" (two
+// system calls) is asked once per thread and fork, not for every launch.
+std::atomic<uint32_t> g_fork_epoch{0};
+
 hipError_t launch_in_order(LaunchJob job) {
-  static const bool at_exit = (std::atexit(stop_work_at_exit), true);
+  static const bool at_exit = (std::atexit(stop_work_at_exit),
+                               pthread_atfork(nullptr, nullptr, [] { g_fork_epoch.fetch_add(1); }), true);
   (void)at_exit;
-  if (static_cast<pid_t>(syscall(SYS_gettid)) == getpid()) {
-    thread_local MainThreadExitGuard guard;
-    (void)guard;
+  thread_local uint32_t asked = UINT32_MAX;
+  if (const uint32_t epoch = g_fork_epoch.load(std::memory_order_relaxed); asked != epoch) {
+    asked = epoch;
+    if (static_cast<pid_t>(syscall(SYS_gettid)) == getpid()) {
+      thread_local MainThreadExitGuard guard;
+      (void)guard;
+    }
   }
   const hipStream_t stream = job.stream;
   note_queue_use(stream);
@@ -1127,7 +1235,7 @@ hipError_t module_on(State& s, FatBinary& fb, int ordinal, Module** out) {
     *out = m.get();
     fb.on_device.emplace(ordinal, std::move(m));
   } catch (const std::exception& e) {
-    return fail(hipErrorInvalidImage, e.what());
+    return load_failure(e);
   }
   return hipSuccess;
 }
@@ -1472,15 +1580,17 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
   auto work = [=] {
     const uint64_t start = vgpu::amd::hipprof::now_ns();
     try {
-      std::vector<uint8_t> buf(to_device && from_device ? w : 0);
+      // (a device-to-device row goes through a buffer; not zeroed first, since all of it is written before it is read)
+      const std::unique_ptr<uint8_t[]> buf =
+          to_device && from_device ? std::make_unique_for_overwrite<uint8_t[]>(w) : nullptr;
       for (uint64_t z = 0; z < depth; ++z)
         for (uint64_t y = 0; y < rows; ++y) {
           const uint64_t dva = dst_va + z * dr.slice + y * dr.pitch, sva = src_va + z * sr.slice + y * sr.pitch;
           const void* source = staged ? static_cast<const void*>(staged->data() + (z * rows + y) * w)
                                       : reinterpret_cast<const void*>(sva);
           if (to_device && from_device) {
-            fm->read(sva, buf.data(), w);
-            tm->write(dva, buf.data(), w);
+            fm->read(sva, buf.get(), w);
+            tm->write(dva, buf.get(), w);
           } else if (to_device) {
             tm->write(dva, source, w);
           } else if (from_device) {
@@ -1921,7 +2031,7 @@ hipError_t load_module(State& s, vgpu::runtime::Device* d, const void* image, Mo
     *out = m.get();
     s.modules.push_back(std::move(m));
   } catch (const std::exception& e) {
-    return fail(hipErrorInvalidImage, e.what());
+    return load_failure(e);
   }
   return hipSuccess;
 }
@@ -3862,6 +3972,7 @@ int vgpu_hip_profiler_attach(const vgpu::amd::hipprof::Hooks* hooks) {
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   g_profiler.store(hooks, std::memory_order_release);
+  g_api_watch.store(1, std::memory_order_release);   // (ApiWatch)
   if (ensure_runtime(s) != hipSuccess) return -1;
   return s.rt->device_count();
 }

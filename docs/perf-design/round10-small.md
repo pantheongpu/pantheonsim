@@ -13,7 +13,7 @@ Result: **one change kept (PTX atomics, 1.71x on the PTX `atomics` workload)**, 
 ### a. PTX atomics: one lookup instead of two. KEPT
 
 `exec_atom` did `load_routed` (-> `load_scalar`) then `store_routed` (-> `store_scalar`) for each lane: two table lookups, two
-`scalar_location` calls. Now `MemoryManager::rmw_begin` (src/core/memory.cpp) answers the ordinary case with one lookup and returns the
+`scalar_location` calls. Now `MemoryManager::rmw_begin` (src/core/memory.cpp; replaced by `rmw_scalar` when this was merged with #403) answers the ordinary case with one lookup and returns the
 old value, the interpreter computes the new one, and `rmw_commit` writes it (it re-reads the chunk pointer, as `store_scalar` did, and
 keeps the "a store of the byte a uniform chunk already holds changes nothing" and "an untouched or uniform chunk becomes real" rules).
 `rmw_begin` declines, having changed nothing, whenever the two-access path could behave differently, and the caller then runs the old

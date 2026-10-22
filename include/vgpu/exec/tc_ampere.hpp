@@ -35,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <type_traits>
 
 #include "vgpu/simd/fp16.hpp"
 #include "vgpu/simd/simd.hpp"
@@ -42,6 +43,10 @@
 #if defined(__x86_64__) && defined(__GNUC__)
 #include <immintrin.h>
 #define VGPU_TC86_AVX2 1
+#endif
+
+#ifndef VGPU_TC86_ROWS
+#define VGPU_TC86_ROWS 4
 #endif
 
 namespace vgpu::exec::tc86 {
@@ -263,8 +268,8 @@ __attribute__((target("avx2"))) inline unsigned decode8_avx2(const float* p, int
 // The same rule over eight columns of the output at a time, in 32-bit lanes: every aligned term is below 2^27, so the sum of nine
 // is below 2^31. For an f32 accumulator and an N that is a multiple of 8; an element with an infinity or a NaN in its chunk, or a
 // result outside the f32 normal range, is finished by the scalar code, so the two agree on every input (test_tc_ampere.cpp).
-__attribute__((target("avx2"))) inline void mma_avx2(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, const float* A, size_t lda,
-                                                    const float* B, size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
+__attribute__((target("avx2"))) inline void mma_avx2_generic(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, const float* A, size_t lda,
+                                                              const float* B, size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
   constexpr unsigned kMaxM = 32, kMaxN = 32, kMaxK = 16;
   alignas(32) int32_t bsig[kMaxK * kMaxN], blsb[kMaxK * kMaxN], bex[kMaxK * kMaxN];
   uint8_t colmask[4][kMaxN / 8] = {};   // [chunk][block of 8 columns]: bit l set if column l has an infinity or a NaN in the chunk
@@ -371,15 +376,237 @@ __attribute__((target("avx2"))) inline void mma_avx2(unsigned M, unsigned N, uns
       _mm256_storeu_si256(reinterpret_cast<__m256i*>(D + i * ldd + jb * 8), accb);
     }
 }
+
+// Eight operands at once, as decode8_avx2, for the kernel below: the frame term is stored in place of the frame exponent, with an
+// operand that is zero (or an infinity or a NaN, decoded as a zero) given kNoTerm so that a product with a zero factor never
+// chooses the largest frame position; `bias` is added to a live term (1 for the A side: a product's position is ea + eb + 1).
+inline constexpr int32_t kNoTerm = -(1 << 28);
+__attribute__((target("avx2"))) inline unsigned decode8_term_avx2(const float* p, int emin, int bias, int32_t* sig_out, int32_t* lsb_out, int32_t* term_out) {
+  const __m256i bits = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+  const __m256i e = _mm256_and_si256(_mm256_srli_epi32(bits, 23), _mm256_set1_epi32(0xff)), m = _mm256_and_si256(bits, _mm256_set1_epi32(0x7fffff));
+  const __m256i nonfin = _mm256_cmpeq_epi32(e, _mm256_set1_epi32(255));
+  const __m256i enz = _mm256_xor_si256(_mm256_cmpeq_epi32(e, _mm256_setzero_si256()), _mm256_set1_epi32(-1));
+  __m256i sig = _mm256_or_si256(_mm256_srli_epi32(m, 13), _mm256_and_si256(enz, _mm256_set1_epi32(0x400)));
+  const __m256i lsb = _mm256_blendv_epi8(_mm256_set1_epi32(-136), _mm256_sub_epi32(e, _mm256_set1_epi32(137)), enz);
+  const __m256i ex = _mm256_blendv_epi8(_mm256_set1_epi32(-126), _mm256_max_epi32(_mm256_sub_epi32(e, _mm256_set1_epi32(127)), _mm256_set1_epi32(emin)), enz);
+  sig = _mm256_andnot_si256(nonfin, sig);
+  const __m256i term = _mm256_blendv_epi8(_mm256_add_epi32(ex, _mm256_set1_epi32(bias)), _mm256_set1_epi32(kNoTerm), _mm256_cmpeq_epi32(sig, _mm256_setzero_si256()));
+  sig = _mm256_sign_epi32(sig, _mm256_or_si256(_mm256_srai_epi32(bits, 31), _mm256_set1_epi32(1)));
+  if (bias != 0) sig = _mm256_slli_epi32(sig, 4);   // the A side keeps its significand times 16 (see mma_avx2_chunked)
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(sig_out), sig);
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(lsb_out), lsb);
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(term_out), term);
+  return static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(nonfin)));
+}
+
+// The sum S * 2^g (S a signed 32-bit integer per lane, |S| below 2^31) truncated toward zero to 24 significant bits, as an f32 (detail::to_f32_rz
+// for the lanes that are normal): `res` holds it, `snz` marks the lanes with S != 0 and `inrange` those whose result is a normal f32;
+// a lane with S != 0 outside that range (res is 0 there) is finished by the caller with the scalar conversion. The bit length comes from
+// the float of the magnitude with its low 7 bits cleared (at most 24 significant bits for a magnitude below 2^31, so exact; a magnitude
+// below 128 needs no truncation).
+__attribute__((target("avx2"))) inline void sum_to_f32_avx2(__m256i S, __m256i g, __m256i cff, __m256i c7fffff, __m256i& res, __m256i& snz, __m256i& inrange) {
+  const __m256i zero = _mm256_setzero_si256(), c150 = _mm256_set1_epi32(150), c255 = _mm256_set1_epi32(255);
+  const __m256i neg = _mm256_srai_epi32(S, 31);
+  const __m256i mag = _mm256_abs_epi32(S);
+  const __m256i hi = _mm256_castps_si256(_mm256_cvtepi32_ps(_mm256_and_si256(mag, _mm256_set1_epi32(~127))));
+  const __m256i sh = _mm256_max_epi32(_mm256_sub_epi32(_mm256_srli_epi32(hi, 23), c150), zero);   // floor(log2) - 23, at least 0
+  const __m256i magt = _mm256_sllv_epi32(_mm256_srlv_epi32(mag, sh), sh);
+  const __m256i fb = _mm256_castps_si256(_mm256_cvtepi32_ps(magt));
+  const __m256i newexp = _mm256_add_epi32(_mm256_and_si256(_mm256_srli_epi32(fb, 23), cff), g);
+  snz = _mm256_xor_si256(_mm256_cmpeq_epi32(S, zero), _mm256_set1_epi32(-1));
+  inrange = _mm256_and_si256(_mm256_cmpgt_epi32(newexp, zero), _mm256_cmpgt_epi32(c255, newexp));
+  const __m256i valid = _mm256_and_si256(snz, inrange);
+  res = _mm256_or_si256(_mm256_or_si256(_mm256_and_si256(fb, c7fffff), _mm256_slli_epi32(newexp, 23)),
+                        _mm256_and_si256(neg, _mm256_set1_epi32(static_cast<int>(0x80000000u))));
+  res = _mm256_and_si256(res, valid);
+}
+
+// The sum S * 2^g rounded to nearest even to f16, as the float that holds it (detail::to_f16_rn): the same lanes as sum_to_f32_avx2 give
+// (`snz` marks S != 0, `inrange` the lanes this code answers; a lane that is not is finished with the scalar conversion). The significand
+// is S's magnitude shifted right to the f16 grid of its binade (or of the subnormal range) with the remainder deciding the rounding, the
+// float is that integer times a power of two, an exponent past f16's is an infinity, a result that rounds to zero keeps the sign of S.
+__attribute__((target("avx2"))) inline void sum_to_f16_avx2(__m256i S, __m256i g, __m256i& res, __m256i& snz, __m256i& inrange) {
+  const __m256i zero = _mm256_setzero_si256(), one = _mm256_set1_epi32(1), ones = _mm256_set1_epi32(-1), sb = _mm256_set1_epi32(static_cast<int>(0x80000000u));
+  const __m256i neg = _mm256_srai_epi32(S, 31);
+  const __m256i mag = _mm256_abs_epi32(S);
+  const __m256i hi = _mm256_and_si256(mag, _mm256_set1_epi32(~127));
+  // floor(log2 mag) from a float that holds the magnitude, or its top 24 bits, exactly
+  const __m256i x = _mm256_blendv_epi8(mag, hi, _mm256_cmpgt_epi32(hi, zero));
+  const __m256i lg = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_castps_si256(_mm256_cvtepi32_ps(x)), 23), _mm256_set1_epi32(127));
+  const __m256i E = _mm256_add_epi32(lg, g);
+  const __m256i Eq = _mm256_sub_epi32(_mm256_max_epi32(E, _mm256_set1_epi32(-14)), _mm256_set1_epi32(10));   // exponent of the grid's step
+  const __m256i r = _mm256_sub_epi32(Eq, g);                                                                   // bits below the grid
+  const __m256i rp = _mm256_min_epi32(_mm256_max_epi32(r, zero), _mm256_set1_epi32(32));
+  const __m256i l = _mm256_max_epi32(_mm256_sub_epi32(zero, r), zero);
+  snz = _mm256_xor_si256(_mm256_cmpeq_epi32(S, zero), ones);
+  inrange = _mm256_cmpgt_epi32(r, _mm256_set1_epi32(-32));
+  const __m256i q = _mm256_srlv_epi32(mag, rp);
+  const __m256i rem = _mm256_and_si256(mag, _mm256_sub_epi32(_mm256_sllv_epi32(one, rp), one));
+  const __m256i half = _mm256_sllv_epi32(one, _mm256_sub_epi32(rp, one));   // (a count of -1 is past 31: zero)
+  const __m256i gt = _mm256_cmpgt_epi32(_mm256_xor_si256(rem, sb), _mm256_xor_si256(half, sb));   // unsigned
+  const __m256i tie = _mm256_and_si256(_mm256_and_si256(_mm256_cmpeq_epi32(rem, half), _mm256_cmpeq_epi32(_mm256_and_si256(q, one), one)),
+                                       _mm256_xor_si256(_mm256_cmpeq_epi32(half, zero), ones));
+  const __m256i up = _mm256_or_si256(gt, tie);   // -1 where the significand rounds up
+  const __m256i R = _mm256_sllv_epi32(_mm256_sub_epi32(q, up), l);
+  const __m256i fR = _mm256_castps_si256(_mm256_cvtepi32_ps(R));
+  const __m256i Rz = _mm256_cmpeq_epi32(R, zero);
+  const __m256i eres = _mm256_add_epi32(_mm256_sub_epi32(_mm256_srli_epi32(fR, 23), _mm256_set1_epi32(127)), Eq);
+  const __m256i ovf = _mm256_cmpgt_epi32(eres, _mm256_set1_epi32(15));
+  __m256i val = _mm256_andnot_si256(Rz, _mm256_add_epi32(fR, _mm256_slli_epi32(Eq, 23)));
+  val = _mm256_blendv_epi8(val, _mm256_set1_epi32(0x7f800000), ovf);
+  res = _mm256_and_si256(_mm256_or_si256(val, _mm256_and_si256(neg, sb)), snz);
+}
+
+// mma_avx2_generic with the chunk length a compile-time constant (K a multiple of it) and the work per chunk cut down; the same bits
+// (tests/unit/test_tc_ampere_fast.cpp holds it to the earlier form over random and adversarial operands):
+//   * a product with a zero factor is kept out of the largest frame position by a term of kNoTerm on its operand, not by a compare
+//     of the product, and an all-zero chunk needs no special case (every aligned term is then zero whatever the shift);
+//   * the accumulator's own frame position is not blended away when it is zero (it is below every product's, so it never wins);
+//   * A's significands are kept times 16, so that a product is already its magnitude << 4 (a product's shift is at most 4 to the left
+//     of the largest frame position, so it is that magnitude shifted right by 4 - s: truncation toward zero with one variable shift);
+//   * the bit length of the sum comes from a float conversion of its top 24 bits, not from two double conversions and permutes;
+//   * the new accumulator stays in its register; the lanes the vector code does not finish are the only ones that touch memory;
+//   * VGPU_TC86_ROWS rows at a time, stage by stage, so that their independent dependency chains overlap.
+template <unsigned NC, bool ACC16>
+__attribute__((target("avx2"))) inline void mma_avx2_chunked(unsigned M, unsigned N, unsigned K, int emin, const float* A, size_t lda, const float* B,
+                                                            size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
+  constexpr unsigned kMaxM = 32, kMaxN = 32, kMaxK = 16;
+  alignas(32) int32_t bsig[kMaxK * kMaxN], blsb[kMaxK * kMaxN], bterm[kMaxK * kMaxN];
+  uint8_t colmask[4][kMaxN / 8] = {};
+  alignas(32) int32_t asg[kMaxM * kMaxK + 8], als[kMaxM * kMaxK + 8], aterm[kMaxM * kMaxK + 8];
+  uint8_t row_special[kMaxM];
+  for (unsigned i = 0; i < M; ++i) {
+    uint8_t bits = 0;
+    unsigned k = 0;
+    for (; k + 8 <= K; k += 8) {
+      const unsigned nf = decode8_term_avx2(A + i * lda + k, emin, 1, &asg[i * K + k], &als[i * K + k], &aterm[i * K + k]);
+      for (unsigned l = 0; l < 8; ++l)
+        if (nf >> l & 1) bits |= static_cast<uint8_t>(1u << ((k + l) / NC));
+    }
+    for (; k < K; ++k) {
+      const float v = A[i * lda + k];
+      if (!std::isfinite(v)) bits |= static_cast<uint8_t>(1u << (k / NC));
+      const Dec d = decode_operand(std::isfinite(v) ? v : 0.0f, emin);
+      asg[i * K + k] = d.sig * 16;
+      als[i * K + k] = d.lsb;
+      aterm[i * K + k] = d.sig == 0 ? kNoTerm : d.ex + 1;
+    }
+    row_special[i] = bits;
+  }
+  for (unsigned k = 0; k < K; ++k)
+    for (unsigned jb = 0; jb < N / 8; ++jb)
+      colmask[k / NC][jb] |= static_cast<uint8_t>(
+          decode8_term_avx2(B + k * ldb + jb * 8, emin, 0, &bsig[k * N + jb * 8], &blsb[k * N + jb * 8], &bterm[k * N + jb * 8]));
+  const __m256i c255 = _mm256_set1_epi32(255), c7fffff = _mm256_set1_epi32(0x7fffff), cff = _mm256_set1_epi32(0xff), zero = _mm256_setzero_si256(),
+                one = _mm256_set1_epi32(1), c25 = _mm256_set1_epi32(25), c4 = _mm256_set1_epi32(4);
+  const __m256i c150 = _mm256_set1_epi32(150);
+  // R rows at a time, stage by stage, so that their independent dependency chains sit next to each other in the instruction stream.
+  const auto rows = [&]<unsigned R>(std::integral_constant<unsigned, R>, unsigned i0) __attribute__((target("avx2"))) {
+    for (unsigned jb = 0; jb < N / 8; ++jb) {
+      __m256i accb[R];
+      for (unsigned r = 0; r < R; ++r) accb[r] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(C + (i0 + r) * ldc + jb * 8));
+      for (unsigned k0 = 0, c = 0; k0 < K; k0 += NC, ++c) {
+        __m256i top[R], g[R], S[R], acc_nonfin[R];
+        for (unsigned r = 0; r < R; ++r) {
+          const unsigned i = i0 + r;
+          top[r] = _mm256_set1_epi32(kNoTerm);
+          for (unsigned t = 0; t < NC; ++t) {
+            const unsigned k = k0 + t;
+            top[r] = _mm256_max_epi32(top[r], _mm256_add_epi32(_mm256_set1_epi32(aterm[i * K + k]), _mm256_load_si256(reinterpret_cast<const __m256i*>(&bterm[k * N + jb * 8]))));
+          }
+        }
+        for (unsigned r = 0; r < R; ++r) {
+          const __m256i ae = _mm256_and_si256(_mm256_srli_epi32(accb[r], 23), cff), am = _mm256_and_si256(accb[r], c7fffff);
+          const __m256i aenz = _mm256_xor_si256(_mm256_cmpeq_epi32(ae, zero), _mm256_set1_epi32(-1));
+          acc_nonfin[r] = _mm256_cmpeq_epi32(ae, c255);
+          __m256i asig = _mm256_or_si256(am, _mm256_and_si256(aenz, _mm256_set1_epi32(0x800000)));
+          const __m256i alsb = _mm256_blendv_epi8(_mm256_set1_epi32(-149), _mm256_sub_epi32(ae, c150), aenz);
+          const __m256i lead = _mm256_sub_epi32(_mm256_srli_epi32(_mm256_castps_si256(_mm256_cvtepi32_ps(asig)), 23), _mm256_set1_epi32(127));
+          top[r] = _mm256_max_epi32(top[r], _mm256_add_epi32(_mm256_add_epi32(lead, alsb), one));   // (a zero accumulator: -275 at most, below any product's)
+          asig = _mm256_sign_epi32(asig, _mm256_or_si256(_mm256_srai_epi32(accb[r], 31), one));
+          g[r] = _mm256_sub_epi32(top[r], c25);
+          S[r] = shift_term_avx2(asig, _mm256_sub_epi32(alsb, g[r]));
+        }
+        // (The products are formed again here, not kept from the pass above: sixteen live vectors would spill.)
+        for (unsigned r = 0; r < R; ++r) {
+          const unsigned i = i0 + r;
+          const __m256i g4 = _mm256_add_epi32(g[r], c4);
+          for (unsigned t = 0; t < NC; ++t) {
+            const unsigned k = k0 + t;
+            const __m256i p = _mm256_mullo_epi32(_mm256_set1_epi32(asg[i * K + k]), _mm256_load_si256(reinterpret_cast<const __m256i*>(&bsig[k * N + jb * 8])));
+            const __m256i cnt = _mm256_sub_epi32(_mm256_sub_epi32(g4, _mm256_set1_epi32(als[i * K + k])), _mm256_load_si256(reinterpret_cast<const __m256i*>(&blsb[k * N + jb * 8])));
+            const __m256i v = _mm256_srlv_epi32(_mm256_abs_epi32(p), cnt);
+            S[r] = _mm256_add_epi32(S[r], _mm256_sign_epi32(v, p));
+          }
+        }
+        __m256i res[R], snz[R], inrange[R];
+        for (unsigned r = 0; r < R; ++r) {
+          if constexpr (ACC16)
+            sum_to_f16_avx2(S[r], g[r], res[r], snz[r], inrange[r]);
+          else
+            sum_to_f32_avx2(S[r], g[r], cff, c7fffff, res[r], snz[r], inrange[r]);
+        }
+        for (unsigned r = 0; r < R; ++r) {
+          const unsigned i = i0 + r;
+          const unsigned redo = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_andnot_si256(inrange[r], snz[r]))));
+          const unsigned special = ((row_special[i] >> c) & 1 ? 0xffu : 0u) | colmask[c][jb] |
+                                   static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(acc_nonfin[r])));
+          if (__builtin_expect(redo | special, 0)) {
+            alignas(32) int32_t Sv[8], gv[8];
+            alignas(32) uint32_t accv[8], out[8];
+            _mm256_store_si256(reinterpret_cast<__m256i*>(Sv), S[r]);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(gv), g[r]);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(accv), accb[r]);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(out), res[r]);
+            for (unsigned l = 0; l < 8; ++l) {
+              if (special >> l & 1)
+                out[l] = std::bit_cast<uint32_t>(chunk_special(&A[i * lda + k0], 1, &B[k0 * ldb + jb * 8 + l], ldb, NC, std::bit_cast<float>(accv[l])));
+              else if (redo >> l & 1)
+                out[l] = std::bit_cast<uint32_t>(ACC16 ? detail::to_f16_rn(Sv[l], gv[l]) : detail::to_f32_rz(Sv[l], gv[l]));
+            }
+            res[r] = _mm256_load_si256(reinterpret_cast<const __m256i*>(out));
+          }
+          accb[r] = res[r];
+        }
+      }
+      for (unsigned r = 0; r < R; ++r) _mm256_storeu_si256(reinterpret_cast<__m256i*>(D + (i0 + r) * ldd + jb * 8), accb[r]);
+    }
+  };
+  unsigned i = 0;
+  for (; i + VGPU_TC86_ROWS <= M; i += VGPU_TC86_ROWS) rows(std::integral_constant<unsigned, VGPU_TC86_ROWS>{}, i);
+  for (; i < M; ++i) rows(std::integral_constant<unsigned, 1>{}, i);
+}
+
+// The vector form for an N that is a multiple of 8 (an f32 accumulator, or with acc_f16 an f16 one).
+template <bool ACC16>
+__attribute__((target("avx2"))) inline void mma_avx2_acc(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, const float* A, size_t lda, const float* B,
+                                                         size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
+  if (chunk == 8 && K % 8 == 0)
+    mma_avx2_chunked<8, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd);
+  else if (chunk == 4 && K % 4 == 0)
+    mma_avx2_chunked<4, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd);
+  else
+    mma_avx2_generic(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);   // (f32 accumulator only: mma() sends no other)
+}
+__attribute__((target("avx2"))) inline void mma_avx2(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, const float* A, size_t lda, const float* B,
+                                                    size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
+  mma_avx2_acc<false>(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
+}
 #endif
 
 // D = C + A x B, by the rule above, with the vector code where there is a CPU level for it.
 inline void mma(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, bool acc_f16, const float* A, size_t lda, const float* B,
                 size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
 #ifdef VGPU_TC86_AVX2
-  if (!acc_f16 && N % 8 == 0 && simd::enabled() && simd::kernels().level == simd::Level::Avx2) {
-    mma_avx2(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
-    return;
+  if (N % 8 == 0 && simd::enabled() && simd::kernels().level == simd::Level::Avx2) {
+    if (!acc_f16) {
+      mma_avx2(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
+      return;
+    }
+    if (K % chunk == 0 && (chunk == 8 || chunk == 4)) {   // (the f16 accumulator has the chunked form only)
+      mma_avx2_acc<true>(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
+      return;
+    }
   }
 #endif
   mma_scalar(M, N, K, chunk, emin, acc_f16, A, lda, B, ldb, C, ldc, D, ldd);

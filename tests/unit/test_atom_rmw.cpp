@@ -1,10 +1,8 @@
-// Round 10: the single-lookup read-modify-write behind the PTX interpreter's global atomics against the two-access code it replaces.
+// Round 10: the PTX interpreter's global atomics, whole kernels with VGPU_FASTPATH on and off.
 //
-// A device atomic used to be load_scalar then store_scalar (two table lookups); now MemoryManager::rmw_begin / rmw_commit
-// serve the ordinary case with one, and decline -- changing nothing -- whenever the two accesses could differ. These run
-// every operation both ways, on memory in each of its states (untouched, uniform, real), and require the same value, the same memory afterwards, the same resident
-// bytes and the same error text, for accesses inside an allocation, misaligned, past its end, with a fault armed on
-// loads or on stores, and for whole PTX kernels with VGPU_FASTPATH on and off.
+// The single-lookup read-modify-write behind them (MemoryManager::rmw_scalar) has its own memory-level test, test_memrmw.cpp.
+// These run 13 atom/red forms as PTX kernels, on memory in each of its states (untouched, uniform, real), and require the same
+// old values, the same memory afterwards, the same resident bytes and the same error text with the fast path on and off.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -34,27 +32,6 @@ struct Rng {
     return s;
   }
   uint64_t below(uint64_t n) { return next() % n; }
-};
-
-// A fault that changes what a load returns / what a store writes, so a path that skipped the hook would show.
-struct Faults : MemoryManager::AccessFault {
-  uint64_t loads_armed = 0, stores_armed = 0;
-  int load_calls = 0, store_calls = 0;
-  Faults() { load_pending = &loads_armed, store_pending = &stores_armed; }
-  uint64_t on_load(uint64_t, uint32_t, uint64_t value) override { ++load_calls; return value ^ 0xFF; }
-  uint64_t on_store(uint64_t, uint32_t, uint64_t value) override { ++store_calls; return value ^ 0x100; }
-  uint64_t on_shared_load(uint64_t, uint32_t, uint64_t value) override { return value; }
-  void on_read(uint64_t, uint8_t*, uint64_t) override {}
-  uint64_t on_alu(uint64_t value, uint32_t) override { return value; }
-  void on_copy(uint64_t, uint8_t*, uint64_t) override {}
-};
-
-struct Outcome {
-  bool failed = false;
-  int code = -1;
-  std::string text;
-  uint64_t v = 0;
-  bool operator==(const Outcome& o) const { return failed == o.failed && code == o.code && text == o.text && v == o.v; }
 };
 
 // The memory in one of its four states: untouched (zero), uniform (a memset), real (written), mixed.
@@ -88,105 +65,7 @@ void prepare(MemoryManager& m, uint64_t base, uint64_t bytes, int state, Rng& rn
   }
 }
 
-// What a device atomic did before: load_scalar, compute, store_scalar.
-Outcome rmw_old(MemoryManager& m, uint64_t addr, uint32_t size, uint64_t operand) {
-  Outcome o;
-  try {
-    o.v = m.load_scalar(addr, size);
-    m.store_scalar(addr, size, o.v + operand);
-  } catch (const Error& e) {
-    o.failed = true, o.code = static_cast<int>(e.code()), o.text = e.what();
-  }
-  return o;
-}
-
-// What it does now (the interpreter's sequence).
-Outcome rmw_new(MemoryManager& m, uint64_t addr, uint32_t size, uint64_t operand) {
-  Outcome o;
-  try {
-    MemoryManager::ScalarRmw at;
-    uint64_t old = 0;
-    if (m.rmw_begin(addr, size, at, &old)) {
-      o.v = old;
-      m.rmw_commit(at, size, old + operand);
-    } else {
-      o.v = m.load_scalar(addr, size);
-      m.store_scalar(addr, size, o.v + operand);
-    }
-  } catch (const Error& e) {
-    o.failed = true, o.code = static_cast<int>(e.code()), o.text = e.what();
-  }
-  return o;
-}
-
-std::vector<uint8_t> dump(const MemoryManager& m, uint64_t base, uint64_t bytes) {
-  std::vector<uint8_t> v(bytes);
-  m.read(base, v.data(), bytes);
-  return v;
-}
-
 }  // namespace
-
-VTEST(rmw_matches_load_then_store_on_every_state_of_memory) {
-  Rng rng{0x9E3779B97F4A7C15ull};
-  int failed = 0, declined = 0, taken = 0;
-  for (int iter = 0; iter < 4000; ++iter) {
-    const uint64_t bytes = (1 + rng.below(3)) * kChunkSize;
-    MemoryManager a{1ull << 30}, b{1ull << 30};
-    const uint64_t pa = a.alloc(bytes), pb = b.alloc(bytes);
-    Rng r1{static_cast<uint64_t>(iter) * 7919 + 1}, r2 = r1;
-    const int state = iter % 4;
-    prepare(a, pa, bytes, state, r1);
-    prepare(b, pb, bytes, state, r2);
-    Faults fa, fb;
-    const int mode = static_cast<int>(rng.below(8));   // 0..4 no fault, 5 loads, 6 stores, 7 both
-    if (mode >= 5) {
-      a.set_access_fault(&fa), b.set_access_fault(&fb);
-      if (mode != 6) fa.loads_armed = fb.loads_armed = 1;
-      if (mode != 5) fa.stores_armed = fb.stores_armed = 1;
-    } else if (mode == 4) {   // attached, not armed: the runtime's usual state
-      a.set_access_fault(&fa), b.set_access_fault(&fb);
-    }
-    for (int op = 0; op < 24; ++op) {
-      static const uint32_t sizes[] = {1, 2, 4, 8, 4, 8, 4, 3};
-      const uint32_t size = sizes[rng.below(8)];
-      uint64_t off = rng.below(bytes + 64);   // past the end now and then
-      switch (rng.below(5)) {
-        case 0: off &= ~uint64_t{size - 1}; break;                 // aligned
-        case 1: off = (off & ~uint64_t{size - 1}) + (size > 1 ? 1 : 0); break;   // misaligned
-        case 2: off = (rng.below(bytes / kChunkSize + 1)) * kChunkSize - size; break;   // at a chunk's end
-        default: off &= ~uint64_t{size - 1}; break;
-      }
-      const uint64_t operand = rng.next() | (rng.below(3) == 0 ? 0 : 1);
-      const Outcome x = rmw_old(a, pa + off, size, operand);
-      const Outcome y = rmw_new(b, pb + off, size, operand);
-      // (the allocation bases differ, so error text naming an address is compared with it removed)
-      Outcome xs = x, ys = y;
-      auto strip = [](std::string& s, uint64_t base) {
-        char hex[40];
-        std::snprintf(hex, sizeof hex, "%llx", static_cast<unsigned long long>(base));
-        for (size_t p; (p = s.find(hex)) != std::string::npos;) s.replace(p, std::strlen(hex), "BASE");
-      };
-      strip(xs.text, pa), strip(ys.text, pb);
-      if (!(xs == ys)) {
-        throw vtest::Failure("iter " + std::to_string(iter) + " op " + std::to_string(op) + " size " + std::to_string(size) +
-                             " off " + std::to_string(off) + ": old (" + std::to_string(x.failed) + ", " + std::to_string(x.v) +
-                             ", '" + xs.text + "') vs new (" + std::to_string(y.failed) + ", " + std::to_string(y.v) + ", '" + ys.text + "')");
-      }
-      failed += x.failed;
-      if (mode >= 5) ++declined;
-      else ++taken;
-    }
-    if (dump(a, pa, bytes) != dump(b, pb, bytes)) throw vtest::Failure("iter " + std::to_string(iter) + ": memory differs afterwards");
-    if (a.resident_bytes() != b.resident_bytes())
-      throw vtest::Failure("iter " + std::to_string(iter) + ": resident bytes " + std::to_string(a.resident_bytes()) + " vs " +
-                           std::to_string(b.resident_bytes()));
-    if (fa.load_calls != fb.load_calls || fa.store_calls != fb.store_calls)
-      throw vtest::Failure("iter " + std::to_string(iter) + ": fault hooks called " + std::to_string(fa.load_calls) + "/" +
-                           std::to_string(fa.store_calls) + " times vs " + std::to_string(fb.load_calls) + "/" + std::to_string(fb.store_calls));
-  }
-  VT_ASSERT(failed > 100 && declined > 1000 && taken > 1000);   // the error paths and both ways were exercised
-}
 
 namespace {
 

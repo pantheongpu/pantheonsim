@@ -205,6 +205,7 @@ add_library(vgpu STATIC
   amd/src/rdna_decode.cpp
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
+  amd/src/gcn_tier.cpp
   amd/src/image.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
@@ -244,6 +245,10 @@ add_library(vgpu STATIC
 # and it passed on one CPU and failed on another (round 8's canonical NaN). GCC says so with -Wpsabi: make it an error here.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "-Werror=psabi")
+  # The AMD interpreter's floor, ceil, trunc and rint are libm's: GCC expands them in line (and so leaves a signaling NaN
+  # as it is, where roundss and libm quiet it) in the places its heuristics call hot, which moved when the instruction
+  # ladders became switches (s_trunc_f32 of a signaling NaN, amd/tests/unit/test_gcn_same_bits.cpp).
+  set_source_files_properties(amd/src/gcn_exec.cpp PROPERTIES COMPILE_OPTIONS "-fno-fp-int-builtin-inexact")
 endif()
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 
@@ -320,6 +325,10 @@ target_include_directories(amd_fatbin_extract PRIVATE amd/include)
 add_executable(amd_exec_bench amd/tools/exec-bench.cpp)
 target_link_libraries(amd_exec_bench PRIVATE vgpu)
 target_include_directories(amd_exec_bench PRIVATE amd/include)
+# What one matrix instruction costs the interpreter (amd/tools/matrix-bench.cpp).
+add_executable(amd_matrix_bench amd/tools/matrix-bench.cpp)
+target_link_libraries(amd_matrix_bench PRIVATE vgpu)
+target_include_directories(amd_matrix_bench PRIVATE amd/include)
 # librocprofiler-sdk: rocprofiler-sdk's interface over the HIP shim, so AMD's
 # profiler (rocprofv3) runs unmodified on a simulated GPU. It sits beside
 # libamdhip64 in build/shim, where a tool linked to librocprofiler-sdk.so.1
@@ -1273,6 +1282,12 @@ vgpu_unit_test(test_sched)
 vgpu_unit_test(test_sass_access_count)
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
+# The one-lookup read-modify-write and multi-field read, against the load_scalar / store_scalar calls they replace.
+vgpu_unit_test(test_memrmw)
+# The warp's local memory, interleaved by words, against the per-lane layout it replaced.
+vgpu_unit_test(test_locallayout)
+# The lock-free read-modify-write (atomic_rmw) against load_scalar / the operation / store_scalar, and from threads.
+vgpu_unit_test(test_memrmw_lockfree)
 # The closed forms of the sector and bank-pass counters, against the definition of what they count.
 vgpu_unit_test(test_memcount_forms)
 # The single-lookup atomic read-modify-write and the one-lookup texel read, against the per-access code they replace.
@@ -1283,6 +1298,10 @@ vgpu_unit_test(test_sass_code_at)
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
 vgpu_unit_test(test_tc_ampere)
+# The vector kernels of that sum against a frozen copy of the earlier form, bit for bit, over random and adversarial operands.
+vgpu_unit_test(test_tc_ampere_fast)
+# The PTX engine's SIMD route for mma.sync against its general path (VGPU_FASTPATH=0), bit for bit.
+vgpu_unit_test(test_mma_fast)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
@@ -1392,6 +1411,20 @@ target_compile_definitions(test_amd_gcn_ops PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOU
 # Doubles, packed halves, the modifiers, the transcendentals and the atomics.
 vgpu_unit_test(test_amd_gcn_math amd/tests/unit/test_gcn_math.cpp)
 target_compile_definitions(test_amd_gcn_math PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Every instruction of the ISA corpora run once on pseudo-random state, bit for bit against the recorded
+# digests of the baseline build (amd/tests/unit/test_gcn_same_bits.cpp).
+vgpu_unit_test(test_amd_gcn_same_bits amd/tests/unit/test_gcn_same_bits.cpp)
+target_compile_definitions(test_amd_gcn_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# What a memory instruction's name says (width, sign, atomic operation, how scalar memory takes it) is worked out when
+# it is decoded: held against the old per-execution text tests, and every memory instruction of the corpora run on
+# registers aimed at memory against the recorded digests of the base build.
+vgpu_unit_test(test_amd_gcn_mem_facts amd/tests/unit/test_gcn_mem_facts.cpp)
+target_compile_definitions(test_amd_gcn_mem_facts PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+vgpu_unit_test(test_amd_gcn_memory_same_bits amd/tests/unit/test_gcn_memory_same_bits.cpp)
+target_compile_definitions(test_amd_gcn_memory_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The pre-decoded tier against the interpreter over the same corpora (amd/tests/unit/test_gcn_tier_same_bits.cpp).
+vgpu_unit_test(test_amd_gcn_tier_same_bits amd/tests/unit/test_gcn_tier_same_bits.cpp)
+target_compile_definitions(test_amd_gcn_tier_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Scratch, LDS atomics, a cross-lane read, and flat pointers.
 vgpu_unit_test(test_amd_gcn_memory amd/tests/unit/test_gcn_memory.cpp)
 target_compile_definitions(test_amd_gcn_memory PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -1435,6 +1468,12 @@ vgpu_unit_test(test_amd_gcn_narrow amd/tests/unit/test_gcn_narrow.cpp)
 target_compile_definitions(test_amd_gcn_narrow PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 vgpu_unit_test(test_amd_gcn_lds amd/tests/unit/test_gcn_lds.cpp)
+# A dispatch whose host threads the host refuses to start still finishes (it used to die in std::terminate).
+vgpu_unit_test(test_amd_gcn_thread_refused amd/tests/unit/test_gcn_thread_refused.cpp)
+target_compile_definitions(test_amd_gcn_thread_refused PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# A scratch access at a negative offset from a zero register is refused, not wrapped past 2^64 (amd/tests/unit/test_gcn_scratch_negative.cpp).
+vgpu_unit_test(test_amd_gcn_scratch_negative amd/tests/unit/test_gcn_scratch_negative.cpp)
+target_compile_definitions(test_amd_gcn_scratch_negative PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # Each AMD profile's chip facts are its own (amd/include/vgpu/amd_chip.hpp).
 vgpu_unit_test(test_amd_chip amd/tests/unit/test_amd_chip.cpp)
@@ -1460,6 +1499,56 @@ foreach(_t ops math memory globals grid bytes int64 atomics mixed half calls pac
   set_tests_properties(test_amd_gcn_${_t}_gfx1250 PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=gfx1250")
 endforeach()
 
+# The matrix instructions' arithmetic (half widening, dot products) against what it replaced.
+vgpu_unit_test(test_amd_mfma_math amd/tests/unit/test_mfma_math.cpp)
+# The matrix instructions on the tile path against the reference path, bit for bit, over the ISA corpora.
+vgpu_unit_test(test_amd_matrix_fast amd/tests/unit/test_matrix_fast.cpp)
+target_compile_definitions(test_amd_matrix_fast PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+# The packed 16-bit float arithmetic (packed_math.hpp) against the per-lane code it replaced, and the half conversions against the compiler's.
+vgpu_unit_test(test_amd_packed_math amd/tests/unit/test_packed_math.cpp)
+# The NaN-order helpers (amd/src/nan_order.hpp) that make the float instructions give the same bits at every optimization level.
+vgpu_unit_test(test_amd_nan_order amd/tests/unit/test_nan_order.cpp)
+
+# The packed half, dot product, conversion, comparison, sine/cosine and integer instructions against digests recorded before they were made faster.
+vgpu_unit_test(test_amd_gcn_packed_same_bits amd/tests/unit/test_gcn_packed_same_bits.cpp)
+target_compile_definitions(test_amd_gcn_packed_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+# The code object reader (codeobject.cpp) against digests of what it read before it was made faster.
+vgpu_unit_test(test_amd_codeobject_same_bits amd/tests/unit/test_codeobject_same_bits.cpp)
+target_compile_definitions(test_amd_codeobject_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The digest tests again on the baseline x86-64 code of the AMD engine's SIMD paths (VGPU_SIMD=base keeps mfma_math.hpp and packed_math.hpp off
+# AVX2, FMA and F16C): the recorded bits are the same on every CPU the engine runs on, not only on one with those units.
+# (Not under ThreadSanitizer, where it would only repeat the same checks twenty times slower.)
+if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize=thread")
+  foreach(_t test_amd_gcn_same_bits test_amd_gcn_packed_same_bits test_amd_gcn_tier_same_bits test_amd_matrix_fast test_amd_mfma_math
+             test_amd_packed_math)
+    add_test(NAME ${_t}_simd_base COMMAND ${_t})
+    set_tests_properties(${_t}_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base" TIMEOUT 1500)
+  endforeach()
+endif()
+target_include_directories(test_amd_codeobject_same_bits PRIVATE amd/include)
+
+# Lanes over consecutive addresses as one call to the memory manager, against lane by lane (memruns.c).
+vgpu_unit_test(test_amd_gcn_memruns amd/tests/unit/test_gcn_memruns.cpp)
+target_compile_definitions(test_amd_gcn_memruns PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+foreach(_t gfx1100 gfx1201 gfx1030 gfx1250)
+  add_test(NAME test_amd_gcn_memruns_${_t} COMMAND test_amd_gcn_memruns)
+  set_tests_properties(test_amd_gcn_memruns_${_t} PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=${_t}")
+endforeach()
+
+# A dispatch spread over host threads (amd/src/gcn_pool.hpp): the pool's tasks once each and all at once, forks, the caller's
+# floating-point environment; memory and counts the same on any thread count, over many dispatches and from several callers,
+# and a failing dispatch.
+vgpu_unit_test(test_amd_gcn_threads amd/tests/unit/test_gcn_threads.cpp)
+target_compile_definitions(test_amd_gcn_threads PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+foreach(_t gfx1100 gfx1030)
+  add_test(NAME test_amd_gcn_threads_${_t} COMMAND test_amd_gcn_threads)
+  set_tests_properties(test_amd_gcn_threads_${_t} PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=${_t}")
+endforeach()
+# A stream's queue (amd/src/hip_queue.hpp): order, the numbering of items, and a waited-for item run on the calling thread
+# when the stream is idle.
+vgpu_unit_test(test_amd_hip_queue amd/tests/unit/test_hip_queue.cpp)
 vgpu_unit_test(test_amd_gcn_idioms amd/tests/unit/test_gcn_idioms.cpp)
 target_compile_definitions(test_amd_gcn_idioms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_asm amd/tests/unit/test_gcn_asm.cpp)
@@ -1492,6 +1581,21 @@ add_executable(test_amd_hip_at_exit amd/tests/unit/test_hip_at_exit.cpp)
 target_link_libraries(test_amd_hip_at_exit PRIVATE vgpurocprof vgpuhip)
 target_include_directories(test_amd_hip_at_exit PRIVATE tests/framework amd/include)
 add_test(NAME test_amd_hip_at_exit COMMAND test_amd_hip_at_exit)
+# A module the host has no memory for is hipErrorOutOfMemory, not an invalid image.
+add_executable(test_amd_hip_module_oom amd/tests/unit/test_hip_module_oom.cpp)
+target_link_libraries(test_amd_hip_module_oom PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_module_oom PRIVATE tests/framework amd/include)
+target_compile_definitions(test_amd_hip_module_oom PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_amd_hip_module_oom COMMAND test_amd_hip_module_oom)
+set_tests_properties(test_amd_hip_module_oom PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1;VGPU_MEMORY_HOST_RESERVE_MB=1000000000"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL")
+# The host refusing to start a stream's thread is an error code, not a terminate.
+add_executable(test_amd_hip_thread_refused amd/tests/unit/test_hip_thread_refused.cpp)
+target_link_libraries(test_amd_hip_thread_refused PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_thread_refused PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_thread_refused COMMAND test_amd_hip_thread_refused)
+set_tests_properties(test_amd_hip_thread_refused PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^(ok|SKIP)" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
 set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "ok HIP from a static destructor" FAIL_REGULAR_EXPRESSION "FAIL|ERROR: AddressSanitizer|malloc|double free|corrupted")
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
@@ -1569,6 +1673,11 @@ set_tests_properties(amd_rvs PROPERTIES DEPENDS "vgpu_cli;vgpuhip;vgpuamdsmi;vgp
 add_test(NAME amd_rocprofv3 COMMAND ${CMAKE_SOURCE_DIR}/amd/tests/e2e/run_rocprofv3.sh)
 set_tests_properties(amd_rocprofv3 PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 600)
+# The AMD benchmark workloads' instruction counters (tools/bench-amd): counts, never times, on the simulated
+# MI300X and RX 6800, against tools/bench-amd/expected. An interpreter change that alters a counter fails here.
+add_test(NAME bench_amd_counters COMMAND ${CMAKE_SOURCE_DIR}/tools/bench-amd/run_bench_check.sh)
+set_tests_properties(bench_amd_counters PROPERTIES DEPENDS "vgpu_cli;vgpurocprof"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" SKIP_REGULAR_EXPRESSION "SKIP:" TIMEOUT 600)
 
 vgpu_unit_test(test_amd_hip_abi amd/tests/unit/test_hip_abi.cpp)
 # HIP's grid sizes for every AMD profile, one process each (the runtime takes
@@ -2662,13 +2771,20 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "SKIP:"
     TIMEOUT 300)
-  # The same counters with the pre-decoded execution tier on (VGPU_TIER=1, src/sass/tier.hpp): it must count exactly
-  # what the interpreter does.
+  # The pre-decoded execution tier (src/sass/tier.hpp) is on by default, so the test above runs with it. The same
+  # counters with it named (VGPU_TIER=1) and with it off (VGPU_TIER=0): both must count exactly the same.
   add_test(NAME bench_counters_tier
            COMMAND ${CMAKE_SOURCE_DIR}/tools/bench/run_bench_check.sh)
   set_tests_properties(bench_counters_tier PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_TIER=1"
+    SKIP_REGULAR_EXPRESSION "SKIP:"
+    TIMEOUT 300)
+  add_test(NAME bench_counters_interp
+           COMMAND ${CMAKE_SOURCE_DIR}/tools/bench/run_bench_check.sh)
+  set_tests_properties(bench_counters_interp PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_TIER=0"
     SKIP_REGULAR_EXPRESSION "SKIP:"
     TIMEOUT 300)
 
