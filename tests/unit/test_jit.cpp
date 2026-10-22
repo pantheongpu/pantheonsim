@@ -50,6 +50,9 @@ struct EnvInit {
     ::setenv("VGPU_JIT", "1", 1);
     ::setenv("VGPU_JIT_SYNC", "1", 1);
     ::setenv("VGPU_JIT_THRESHOLD", "100", 1);
+    ::setenv("VGPU_JIT_MIN_REGION", "2", 1);
+    ::setenv("VGPU_JIT_STATS", "1", 1);
+    ::setenv("VGPU_JIT_HOT_PERMILLE", "0", 1);   // (every region is compiled: the model test below runs them all)
     ::setenv("VGPU_JIT_CACHE", (dir / "cache").c_str(), 1);
     ::setenv("VGPU_QUIET", "1", 1);
     ::unsetenv("VGPU_TIER");
@@ -165,7 +168,7 @@ Run run_region(jit::RegionFn fn, uint32_t group, const uint32_t* p, const bool* 
   c.abi = jit::kAbiVersion;
   c.flags = stats ? 1u : 0u;
   c.up = up;
-  c.p = p;
+  c.p = const_cast<uint32_t*>(p);
   c.steps = &out.counters.steps;
   c.instructions = &out.counters.instructions;
   c.thread_instructions = &out.counters.thread_instructions;
@@ -476,6 +479,37 @@ VTEST(jit_an_object_of_another_abi_or_generator_is_rejected) {
   VCHECK(std::system(("c++ -std=c++20 -fPIC -shared -w -o " + d.str("w.so") + " " + d.str("w.cpp") + " 2>/dev/null").c_str()) != 0);
 }
 
+VTEST(jit_a_selection_of_regions_is_compiled_and_found_again_by_the_section) {
+  NEED_COMPILER();
+  TmpDir d;
+  jit::Config cfg;
+  cfg.cache_dir = d.str("c");
+  const jit::UnitSpec full = make_spec(5, 10, 81);
+  const std::vector<uint32_t> sel{1, 3, 4};
+  {
+    jit::Engine e(cfg);
+    const jit::Result r = e.obtain_selected(full, sel);
+    VCHECK(r.found && r.compiled);
+    VCHECK_EQ(r.lib->fns.size(), size_t{3});
+    check_against_model(jit::Engine::subspec(full, sel), *r.lib, 83, 20);
+  }
+  jit::Engine e2(cfg);
+  std::vector<uint32_t> got;
+  const jit::Result l = e2.lookup_selected(full, &got);
+  VCHECK(l.found && l.hit && !l.compiled);
+  VCHECK(got == sel);
+  // Another section (one word changed) has no selection recorded.
+  jit::UnitSpec other = full;
+  other.regions[2].ops[0].lo ^= 1;
+  VCHECK(!e2.lookup_selected(other, nullptr).found);
+  // A damaged selection file is a miss, not a crash or a wrong load.
+  const std::string skey = e2.section_key(full);
+  for (const char* junk : {"", "VJSEL1 0\n", "VJSEL1 2 4 1\n", "VJSEL1 9 0 1 2 3 4 5 6 7 8\n", "garbage", "VJSEL1 2 1 99\n"}) {
+    std::ofstream(d.str("c") + "/" + skey + ".sel", std::ios::trunc) << junk;
+    VCHECK(!e2.lookup_selected(full, nullptr).found);
+  }
+}
+
 // ---- failure modes: every one is a Status, none a crash ---------------------------------------------------------------------------------------
 
 VTEST(jit_no_compiler) {
@@ -723,7 +757,7 @@ struct FakeProgram {
       op.ins = &instrs[i];
       op.straight = kinds[i] != 'b';
       op.fn = (kinds[i] == 'a' || kinds[i] == 's') ? &dummy_handler : nullptr;
-      op.form = kinds[i] == 'b' ? tier::Form::Bra : kinds[i] == 's' ? tier::Form::Stg : tier::Form::Iadd3;
+      op.form = kinds[i] == 'b' ? tier::Form::Bra : kinds[i] == 's' ? tier::Form::Stg : tier::Form::None;   // (None: the generated code calls the handler, which these tests give the fake context for)
       op.never = kinds[i] == 'n';
       op.unguarded = kinds[i] != 'n';
       op.maxreg = static_cast<uint16_t>(4 + i);
@@ -782,15 +816,15 @@ VTEST(jit_a_unit_is_promoted_after_the_threshold_and_a_second_one_with_the_same_
   VCHECK_EQ(u->regions.size(), size_t{2});
   VCHECK(u->state.load() == static_cast<int>(jit::State::Counting));   // (synchronous mode: the lookup is done, and missed)
   VCHECK(!u->ready());
-  u->note(40);
+  u->note(0, 40);
   VCHECK(!u->ready());   // 40 of 100
-  u->note(40);
+  u->note(1, 40);
   VCHECK(!u->ready());   // 80
-  u->note(40);
+  u->note(0, 40);
   VCHECK(u->ready());    // 120: compiled, loaded
   VCHECK_EQ(jit::stats().compiles.load(), compiles0 + 1);
   check_against_model(u->spec, *u->lib, 23, 30);
-  u->note(1000);   // (counting is over: nothing happens)
+  u->note(0, 1000);   // (counting is over: nothing happens)
   VCHECK_EQ(jit::stats().compiles.load(), compiles0 + 1);
   // The same words in another program: ready at once, from the cache.
   FakeProgram b("aaaaxaaaaaxa");

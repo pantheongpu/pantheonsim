@@ -189,7 +189,17 @@ file(WRITE "${_img_gen}" "${_content}")
 # ---------------------------------------------------------------------------
 # Core static library: profiles, memory, PTX, execution engine, runtime.
 # ---------------------------------------------------------------------------
+option(VGPU_JIT_MUTANTS "Build the JIT's code generator with its mutation hooks (VGPU_JIT_MUTANT=<form>), for the mutation checks of the differential tests" OFF)
+if(VGPU_JIT_MUTANTS)
+  set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sass/jit_gen.cpp PROPERTIES COMPILE_DEFINITIONS VGPU_JIT_MUTANTS=1)
+endif()
+# The text the JIT's generated code includes (src/sass/jit.hpp), embedded in the binary.
+file(READ "${CMAKE_SOURCE_DIR}/src/simd/kernels.inc" VGPU_JIT_KERNELS)
+file(READ "${CMAKE_SOURCE_DIR}/src/sass/jit_rt.h" VGPU_JIT_RT)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/simd/kernels.inc" "${CMAKE_SOURCE_DIR}/src/sass/jit_rt.h")
+configure_file("${CMAKE_SOURCE_DIR}/src/sass/jit_embed.cpp.in" "${CMAKE_BINARY_DIR}/jit_embed.cpp" @ONLY)
 add_library(vgpu STATIC
+  ${CMAKE_BINARY_DIR}/jit_embed.cpp
   src/core/error.cpp
   src/core/yamlish.cpp
   src/core/shared_state.cpp
@@ -203,6 +213,7 @@ add_library(vgpu STATIC
   src/sass/exec.cpp
   src/sass/tier.cpp
   src/sass/jit.cpp
+  src/sass/jit_gen.cpp
   amd/src/rdna_decode.cpp
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp

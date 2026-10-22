@@ -1684,6 +1684,11 @@ struct JitHost {
 
 // One op of a region, as the run loop runs it after counting it: the handler for the lanes that execute it, then the tier's statistics
 // (reported even when no lane executes, as the loop reports them). `ex` is the generated code's own count of the guard, the loop's.
+void jit_note(jit::Ctx* j, uint32_t i) {
+  JitHost& h = *static_cast<JitHost*>(j->host);
+  if (h.stats) [[unlikely]] tier_stats().native[static_cast<size_t>(h.ops[i].ins->op)].fetch_add(1, std::memory_order_relaxed);
+}
+
 void jit_escape(jit::Ctx* j, uint32_t i, uint32_t ex) {
   JitHost& h = *static_cast<JitHost*>(j->host);
   const tier::MOp& op = h.ops[i];
@@ -1697,39 +1702,60 @@ void jit_escape(jit::Ctx* j, uint32_t i, uint32_t ex) {
 // holds no store, so the store gate cannot trip inside one. When a check fails, or the region is not compiled yet (counting towards its
 // promotion), nothing is run and the ops go the old way, one at a time. The generated code counts every op as the loop does; when it throws,
 // `faulting` is the op the escape last ran, which the fault names (the loop's `cur`). Returns the number of ops run, 0 for none.
-[[gnu::noinline]] uint32_t jit_run_region(jit::Unit& ju, uint32_t ri, TCtx& c, Warp& w, exec::LaunchStats& st, const tier::MOp* ops, size_t idx,
+// (What a tier_run call keeps for its regions: the context the generated code is given, set up once, on the first region it runs.)
+struct JitFrame {
+  jit::Ctx jc;
+  JitHost jh;
+  bool init = false;
+};
+
+[[gnu::noinline]] uint32_t jit_run_region(JitFrame& f, jit::Unit& ju, uint32_t ri, TCtx& c, Warp& w, exec::LaunchStats& st, const tier::MOp* ops, size_t idx,
                                           unsigned n, Mask group, unsigned glanes, uint64_t max_steps, bool stats, const tier::MOp*& faulting) {
   const jit::Region& rg = ju.regions[ri - 1];
   if (!jit::admissible(n, rg.k, w.steps, max_steps, rg.maxreg, w.nregs)) return 0;
-  if (!ju.ready()) {
-    ju.note(rg.k);
-    if (!ju.ready()) return 0;
+  jit::RegionFn fn = ju.fn(ri - 1);
+  if (!fn) {   // not compiled (yet, or not worth it): while the section is being counted, this run counts for it
+    if (!ju.counting()) return 0;
+    ju.note(ri - 1, rg.k);
+    fn = ju.fn(ri - 1);
+    if (!fn) return 0;
   }
-  JitHost jh{&c, &ops[idx], nullptr, stats};
-  jit::Ctx jc{};
-  jc.abi = jit::kAbiVersion;
-  jc.flags = stats ? 1u : 0u;
-  jc.up = w.up;
-  jc.p = w.p;
-  jc.steps = &w.steps;
-  jc.instructions = &st.instructions;
-  jc.thread_instructions = &st.thread_instructions;
-  jc.by_class = st.inst_by_class;
-  jc.escape = &jit_escape;
-  jc.host = &jh;
-  jc.R = c.R;
-  jc.b0 = c.b0;
-  jc.b0n = c.b0n;
-  jc.pool = c.pool;
+  if (!f.init) [[unlikely]] {
+    f.init = true;
+    f.jh = JitHost{&c, ops, nullptr, stats};
+    jit::Ctx& jc = f.jc;
+    jc = jit::Ctx{};
+    jc.abi = jit::kAbiVersion;
+    jc.flags = stats ? 1u : 0u;
+    jc.up = w.up;
+    jc.p = w.p;
+    jc.ur = w.ur;
+    jc.note = &jit_note;
+    jc.steps = &w.steps;
+    jc.instructions = &st.instructions;
+    jc.thread_instructions = &st.thread_instructions;
+    jc.by_class = st.inst_by_class;
+    jc.escape = &jit_escape;
+    jc.host = &f.jh;
+    jc.b0 = c.b0;
+    jc.b0n = c.b0n;
+    jc.pool = c.pool;
+  }
+  f.jc.R = c.R;   // (the register file may have moved since the last pass)
+  f.jh.ops = &ops[idx];
+  f.jh.last = nullptr;
   try {
-    ju.fn(ri - 1)(&jc, group, glanes);
+    fn(&f.jc, group, glanes);
   } catch (...) {
-    faulting = jh.last;
-    jit::stats().region_throws.fetch_add(1, std::memory_order_relaxed);
+    faulting = f.jh.last;
+    if (jit::stats_on()) jit::stats().region_throws.fetch_add(1, std::memory_order_relaxed);
     throw;
   }
-  jit::stats().regions_run.fetch_add(1, std::memory_order_relaxed);
-  jit::stats().instructions_run.fetch_add(rg.k, std::memory_order_relaxed);
+  if (jit::stats_on()) [[unlikely]] {
+    jit::stats().regions_run.fetch_add(1, std::memory_order_relaxed);
+    jit::stats().instructions_run.fetch_add(rg.k, std::memory_order_relaxed);
+    jit::stats().generated_run.fetch_add(rg.gen, std::memory_order_relaxed);
+  }
   return rg.k;
 }
 
@@ -1741,6 +1767,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   const size_t count = code.count;
   bool regs_ok = true;
   [[maybe_unused]] jit::Unit* const ju = Jit ? tp.jit.get() : nullptr;
+  [[maybe_unused]] JitFrame jf;
   for (bool again = false;; again = true) {   // one pass is one call of step_warp
   // The warp's register file may have been resized since the last pass (USETMAXREG.TRY_ALLOC grows it, and a vector that grows moves):
   // the row pointer and the check that a program's registers are inside the file are worked out again for every pass.
@@ -1762,7 +1789,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
           const tier::MOp* faulting = nullptr;   // (not `cur`: its address would keep it out of a register in the loop below)
           uint32_t k;
           try {
-            k = jit_run_region(*ju, ri, c, w, st, ops, idx, n, group, glanes, max_steps_, tier_stats_, faulting);
+            k = jit_run_region(jf, *ju, ri, c, w, st, ops, idx, n, group, glanes, max_steps_, tier_stats_, faulting);
           } catch (...) {
             if (faulting) cur = faulting;
             throw;

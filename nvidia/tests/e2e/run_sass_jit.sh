@@ -53,7 +53,7 @@ runit() {
   local bin=$1 arch=$2; shift 2
   (cd "$work" && env VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} VGPU_THREADS=1 VGPU_COUNTERS=1 VGPU_SASS_LOG=1 LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim") "$@" timeout "$run_limit" "$bin" 2>&1)
 }
-jitenv=(VGPU_TIER=1 VGPU_JIT=1 VGPU_JIT_THRESHOLD=1 VGPU_JIT_SYNC=1 "VGPU_JIT_CACHE=$cache")
+jitenv=(VGPU_TIER=1 VGPU_JIT=1 VGPU_JIT_THRESHOLD=1 VGPU_JIT_SYNC=1 VGPU_JIT_HOT_PERMILLE=0 VGPU_JIT_MAX_OPS=100000000 VGPU_JIT_MIN_REGION=2 "VGPU_JIT_CACHE=$cache")
 
 # The "jit: ..." line of a statistics file, and one number from it.
 jit_line() { grep -h '^jit: ' "$1" 2>/dev/null | tail -1; }

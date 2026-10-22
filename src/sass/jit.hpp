@@ -29,10 +29,10 @@ struct Program;
 namespace vgpu::sass::jit {
 
 // Bumped when the layout of Ctx, the symbols of an object or the meaning of its metadata change: an object of another ABI is not loaded.
-inline constexpr uint32_t kAbiVersion = 1;
+inline constexpr uint32_t kAbiVersion = 2;
 // Bumped when the text the generator writes for the same regions changes. (The key also hashes the text itself, so a forgotten bump
 // cannot make a stale object load; the number is for people reading a cache directory.)
-inline constexpr uint32_t kGeneratorVersion = 1;
+inline constexpr uint32_t kGeneratorVersion = 2;
 inline constexpr uint32_t kMinRegion = 2;
 // The run loop of the tier executes at most this many straight instructions in one pass (n < 256), then one more that ends the pass.
 inline constexpr unsigned kRunLimit = 256;
@@ -48,25 +48,38 @@ inline bool admissible(unsigned n, uint32_t k, uint64_t steps, uint64_t max_step
 // every offset against this one's, so a drift fails the compile instead of corrupting memory.
 struct Ctx {
   uint32_t abi;               // kAbiVersion
-  uint32_t flags;             // bit 0: the tier's statistics are on (every op is reported to the escape, even one with no lane)
+  uint32_t flags;             // bit 0: the tier's statistics are on (every op is reported, even one with no lane)
   const bool* up;             // Warp::up, the uniform predicates
-  const uint32_t* p;          // Warp::p, the predicates as lane masks
+  uint32_t* p;                // Warp::p, the predicates as lane masks (generated code writes them)
+  const uint32_t* ur;         // Warp::ur, the uniform registers
   uint64_t* steps;            // Warp::steps
   uint64_t* instructions;     // LaunchStats::instructions
   uint64_t* thread_instructions;
   uint64_t* by_class;         // LaunchStats::inst_by_class
   void (*escape)(Ctx*, uint32_t op, uint32_t ex);   // op: index inside the region; ex: the lanes that execute it
+  void (*note)(Ctx*, uint32_t op);                  // the tier's statistics for an op the generated code ran itself
   void* host;                 // the executor's, opaque to the generated code
-  // (reserved for milestone 2: the warp's register file, constant bank 0, the pool)
-  uint32_t* R;
-  const uint8_t* b0;
+  uint32_t* R;                // the warp's register file: register n is R + 32 * n
+  const uint8_t* b0;          // constant bank 0 of the launch
   uint64_t b0n;
   const void* pool;
 };
 
 using RegionFn = void (*)(Ctx*, uint32_t group, uint32_t glanes);
 
-// What the generator needs of one op: the instruction's 128 bits and the facts the run loop uses to count it.
+// A source operand of a generated op, as the tier's MOp holds it (tier.hpp), with a Pool source's row replaced by the constant it holds
+// (all 32 lanes are equal): `val`, and for a 64-bit constant pair `val2`, the high word's.
+struct SrcFacts {
+  uint8_t kind = 2;     // tier::SrcKind: 0 Row, 1 Pool, 2 Dyn
+  uint8_t dyn = 0;      // tier::Dyn
+  uint8_t mod = 0;
+  uint8_t pad = 0;
+  uint32_t off = 0;     // Row: register * 32; Dyn: the register, byte offset or uniform register
+  uint32_t val = 0, val2 = 0;
+};
+
+// What the generator needs of one op: the instruction's 128 bits, the facts the run loop uses to count it, and, when the generated code
+// runs the op itself rather than calling the tier's handler, the form and the MOp's fields.
 struct OpFacts {
   uint64_t lo = 0, hi = 0;
   uint8_t cls = 0;
@@ -74,7 +87,18 @@ struct OpFacts {
   bool guard_not = false;
   bool guard_uniform = false;
   bool unguarded = true;       // MOp::unguarded: the op runs on the whole group
+  uint8_t form = 0;            // tier::Form of an op the generated code computes; 0: an escape to the tier's handler
+  SrcFacts s[3], p, p2;
+  int64_t imm = 0;
+  uint32_t a = 0, b = 0, c = 0;
+  uint16_t dst = 0xffff, dst2 = 0xffff;
+  uint8_t aux = 0;
 };
+// Whether the generator computes this form itself (a form it does not, or a source it cannot, stays an escape). Called on a facts record
+// with `form` set to the MOp's, by make_unit, which then clears `form` if this says no.
+bool generates(const OpFacts& o);
+// The C++ for a generated op: a block that reads `R` (the register file), `c` (the Ctx) and `ex` (the executing lanes).
+std::string gen_op_body(const OpFacts& o);
 struct RegionSpec {
   std::vector<OpFacts> ops;
 };
@@ -131,7 +155,7 @@ class Engine {
   explicit Engine(Config cfg);
   ~Engine();
   // The C++ the generator writes for the unit (deterministic: a function of the spec only).
-  static std::string source(const UnitSpec& spec);
+  static std::string source(const UnitSpec& spec, bool avx2 = true);
   // The words the object's metadata array must hold for the spec.
   static std::vector<uint32_t> meta(const UnitSpec& spec);
   // The 32-hex-digit key: the source, the compiler's identity, flags, ISA level, ABI and generator versions. Empty (and `why` set) with no compiler.
@@ -140,12 +164,19 @@ class Engine {
   Result lookup(const UnitSpec& spec);
   // The cache, else the compiler (under a per-key lock file, so that threads and processes compile one key once).
   Result obtain(const UnitSpec& spec);
+  // A unit's selected regions: the object holds only those (a compile costs by the size of the source), and a small file beside the objects
+  // names the selection of each section, so that a later run finds it without counting. `sel` is region numbers in increasing order.
+  static UnitSpec subspec(const UnitSpec& spec, const std::vector<uint32_t>& sel);
+  Result lookup_selected(const UnitSpec& full, std::vector<uint32_t>* sel);   // the cache alone, by the section's own key
+  Result obtain_selected(const UnitSpec& full, const std::vector<uint32_t>& sel);   // compile (or find) the selection, and record it
+  std::string section_key(const UnitSpec& full, std::string* why = nullptr);
   uint64_t compiles() const { return compiles_.load(); }
   void cancel();                                   // kills a compile in progress (process exit)
   const Config& config() const { return cfg_; }
   std::string cache_path() const;                  // the directory in use (created on demand)
   std::string object_path(const std::string& key) const;
   std::string compiler_id(std::string* why = nullptr);
+  std::string ensure_rt();                         // writes the embedded headers the generated code includes; "" or the error
 
  private:
   struct Impl;
@@ -161,6 +192,7 @@ struct Region {
   uint32_t first = 0;     // index of its first op in the section
   uint32_t k = 0;         // its length
   uint32_t maxreg = 0;    // one past the highest register any of its ops touches: the warp's file must hold it
+  uint32_t gen = 0;       // how many of its ops the generated code computes itself (the others are escapes to the tier's handlers)
 };
 
 enum class State : int { Looking, Counting, Queued, Ready, Failed };
@@ -172,11 +204,19 @@ struct Unit : std::enable_shared_from_this<Unit> {
   std::vector<uint32_t> region_at;     // op index -> region number + 1 (0: no region starts there)
   std::atomic<int> state{static_cast<int>(State::Looking)};
   std::atomic<uint64_t> executed{0};   // warp instructions the tier ran in the regions while counting
+  std::unique_ptr<std::atomic<uint64_t>[]> counts;   // ... per region: which ones are hot decides which are compiled
   std::shared_ptr<Loaded> lib;         // valid once state is Ready (published with release)
+  std::vector<int32_t> fn_index;       // region -> its function in lib, -1 for a region that was not compiled (valid once Ready)
   bool ready() const { return state.load(std::memory_order_acquire) == static_cast<int>(State::Ready); }
-  // The tier ran a region of k ops that was not yet compiled: count it, and ask for the compile once the threshold is passed.
-  void note(uint32_t k);
-  RegionFn fn(uint32_t region) const { return lib->fns[region]; }
+  bool counting() const { return state.load(std::memory_order_relaxed) == static_cast<int>(State::Counting); }
+  // The tier ran region `region` (k ops) uncompiled: count it, and ask for the compile once the threshold is passed.
+  void note(uint32_t region, uint32_t k);
+  // The compiled function of a region, null if it is not compiled (yet, or not selected).
+  RegionFn fn(uint32_t region) const {
+    if (!ready()) return nullptr;
+    const int32_t i = fn_index[region];
+    return i < 0 ? nullptr : lib->fns[static_cast<size_t>(i)];
+  }
 };
 
 // Whether VGPU_JIT=1 is set, the tier is on, and this is not a sanitizer build. Read once.
@@ -189,10 +229,13 @@ std::shared_ptr<Unit> make_unit(const tier::Program& prog, int sm);
 struct Stats {
   std::atomic<uint64_t> units{0}, regions{0};
   std::atomic<uint64_t> cache_hits{0}, compiles{0}, failures{0}, corrupt{0};
-  std::atomic<uint64_t> regions_run{0}, instructions_run{0}, region_throws{0};   // calls of generated regions, and the warp instructions in them
+  std::atomic<uint64_t> regions_run{0}, instructions_run{0}, generated_run{0}, region_throws{0};   // calls of generated regions, and the warp instructions in them
   std::atomic<uint64_t> compile_us{0}, lookup_us{0}, units_ready{0};
 };
 Stats& stats();
+// Whether the statistics are being kept (VGPU_JIT_STATS): the executor counts nothing otherwise, an atomic add per region call being a visible cost on small regions.
+namespace detail { extern bool g_stats_on; }
+inline bool stats_on() { return detail::g_stats_on; }
 // Waits until the worker has nothing queued (tests).
 void drain();
 
