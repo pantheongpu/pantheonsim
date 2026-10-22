@@ -3813,6 +3813,32 @@ gfx1250 (17), which the probe used to skip (the skip is gone; their digest was 0
 gfx942, gfx1030 (global accesses with the segment bits set to scratch), gfx1100 and gfx1250 at minus their size from zero registers (digest flavour 16, all zero)
 and wants the refusal; with the check as it was, it fails (`gave []`).
 
+## One PTX atomic read-modify-write (branch `speedup8-ci`)
+
+`speedup` and origin/main (#402, round 10) each had made a PTX device atomic one table lookup instead of two: `MemoryManager::rmw_scalar` with
+the interpreter's `rmw_global`, and `rmw_begin` / `rmw_commit` with the interpreter's inline fast path. Main's is the one kept (it covers the same
+cases, declines in the same ones, and has its own mutation-checked test, `test_atom_rmw`); `rmw_scalar_fn`, `rmw_scalar` and `rmw_global` are gone, and
+`test_memrmw` makes its one-lookup read-modify-writes with `rmw_begin` / `rmw_commit`. `atomic_rmw` (the lock-free compare-and-swap form the SASS and AMD
+engines use) and `load_fields` stay.
+
+## What PR #403's CI found (branch `speedup8-ci`)
+
+* **`test_amd_gcn_same_bits` on the CUDA 12.4 job, 11 of 16,806 shapes** (`v_add_f16` / `v_mul_f16` and their sdwa, e64 and dpp forms): the job builds with GCC 12
+  (this machine's is 13). Reproduced here with GCC 12.4's packages unpacked in a directory (`apt-get download` and `dpkg -x`, no root). A half add
+  or multiply is done in float, and with a NaN in both operands the result keeps one operand's payload; GCC 12 made the first operand that one, GCC 13
+  the second (the recorded digests are the second's). `half_add`, `half_sub` and `half_mul` spell the order out (`first_addf` / `first_mulf` in
+  `gcn_exec.cpp`). All the digest tests pass with both compilers, and with `VGPU_SIMD=base` (the AMD engine's AVX2/FMA/F16C paths now obey it too, and the
+  digest tests are registered a second time with it: `*_simd_base`).
+* **The sanitizer jobs (Debug, no optimization)**: signed overflow in the integer reference code (`v_mad_i32_i24`, the WMMA/MFMA integer sums, which the
+  hardware wraps) is now done unsigned (`wrap_madd`), with the same results. `test_amd_mfma_math` compared a NaN-carrying sum of the fixed operand
+  order with the compiler's own order in the test; it compares a NaN as a NaN now. In an unoptimized build 25 to 82 of the 16,000 shapes of the digest tests have other NaN payloads
+  (or, for `v_cos_f32` and a few atomics, other results; those were not traced further: the same shapes pass in every optimized build and with the tier off or on),
+  so the three digest tests allow 2 % of the shapes to differ in a build without optimization, with a note, and none in an optimized one.
+* **ThreadSanitizer**: no data race was reported anywhere. `test_amd_gcn_threads` died in `a_forked_child_launches_on_threads_of_its_own`: TSan does not
+  support threads started in a forked child of a threaded process. That case is skipped under TSan.
+* **Lint**: the `interp` job of `sass-ptx.yml` has the pr-guard step; `test_mma_fast.cpp` had a narrowing conversion; the whole tree builds with `-DVGPU_WERROR=ON`
+  (a missing `default:` in `global_access`'s switch and a narrowing in the probe were ours).
+
 ## Sanitizer fixes (round 11) (branch `speedup-merge`, pushed to `speedup`)
 
 PR #403's sanitizer jobs failed on its own AMD code. Reproduced on the rig (c7i.4xlarge, the CI image `cuda12.0-9f7f0f8400f7`, CUDA 12.0 and gcc 12) with the
@@ -3822,7 +3848,7 @@ and its tests. Three kinds of cause, none a race and none a timeout.
 **1. Signed integer overflow (undefined behaviour; the three UBSan lines of the ASan job).** The hardware wraps; x86 does too, so the results were right, but
 the compiler may assume they do not happen. Fixed with unsigned arithmetic, the same bits: `v_mad_i32_i24` (the product of two 24-bit signed factors and
 the sum, 2 places), the integer multiply-accumulate of the matrix instructions (`mfma_dot_int`, the tile path's `int64` sum in `matrix_multiply` and the
-sparse one, through `mfma_mac_wrap` in `amd/src/mfma_math.hpp`), and the 32-bit sum of `mfma_tile_int_scalar`. Test: `test_amd_mfma_math`
+sparse one, through `wrap_madd` in `amd/src/mfma_math.hpp`), and the 32-bit sum of `mfma_tile_int_scalar`. Test: `test_amd_mfma_math`
 `integer_dot_products_wrap_without_overflowing_a_signed_type` (fails under UBSan with the old arithmetic). After the fix the ASan+UBSan run of the whole AMD set
 (`ctest -R '^test_amd'`, 162 tests, 2 skipped by design) is green: 1762 s (`test_amd_gcn_tier_same_bits` 1762 s, `test_amd_matrix_fast` 1155 s,
 `test_amd_gcn_same_bits` 999 s, `test_amd_gcn_atomics_gfx1250` 677 s, `test_amd_gcn_memory_same_bits` 666 s, the rest under 100 s) at `-j8` on 8 hyper-threads while
@@ -3854,6 +3880,11 @@ which now pass at -O0 (also with ASan+UBSan), -O1, -O3 and with TSan. Not covere
 spelled out on the strided layout. `test_amd_gcn_threads` `a_forked_child_launches_on_threads_of_its_own` (and the two `_gfx1100`/`_gfx1030` runs) died under TSan with
 "starting new threads after multi-threaded fork is not supported": that is what the test checks on purpose (the pool is rebuilt in the child), so the test binary sets
 `die_after_fork=0` through `__tsan_default_options` when built with TSan. Not a finding.
+
+**Merge with `origin/speedup` (e50e35c5).** The other session had meanwhile made the same overflow fixes (`wrap_madd`, kept; `mfma_mac_wrap` is gone), made `test_amd_mfma_math`
+compare a NaN as a NaN (mine compares the fixed order exactly, kept), skipped the forked-child case of `test_amd_gcn_threads` under TSan (it runs again, with `die_after_fork=0`), and let the
+three digest tests differ in up to 2 % of the shapes in a build without optimization or under a sanitizer. With the order of the NaNs spelled out the digests hold in every build, so that
+tolerance is removed again (the three tests are as they were at `224874ea`): an instruction that differs in any build is a failure. The tier test's one seed under TSan is kept.
 
 **Slow, not failing.** Under a sanitizer these tests take long: `test_amd_gcn_tier_same_bits` 1762 s (ASan), 2373 s (TSan), `test_amd_matrix_fast` 1155 s and 1527 s,
 `test_amd_gcn_same_bits` 999 s and 1398 s, `test_amd_gcn_memory_same_bits` 666 s and 897 s, `test_amd_gcn_atomics_gfx1250` 677 s and 463 s (loaded rig, `-j8`; CI's own times

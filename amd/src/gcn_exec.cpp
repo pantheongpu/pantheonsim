@@ -3610,7 +3610,7 @@ struct Machine {
         for (uint32_t col = 0; col < 16; ++col) {
           uint32_t lane, reg, half;
           place(row, col, &lane, &reg, &half);
-          int64_t isum = static_cast<int64_t>(cd[row * 16 + col]) + dots[row * 16 + col];
+          int64_t isum = static_cast<int64_t>(static_cast<uint64_t>(static_cast<int64_t>(cd[row * 16 + col])) + static_cast<uint64_t>(dots[row * 16 + col]));
           if (in.clamp) isum = std::clamp<int64_t>(isum, INT32_MIN, INT32_MAX);
           result[lane][reg] = static_cast<uint32_t>(isum);
         }
@@ -3763,7 +3763,7 @@ struct Machine {
         int64_t isum = static_cast<int64_t>(sum);
         for (uint32_t k = 0; k < K; ++k) {
           const double a = input(in.src[0], ta, row, k, a_signed), b = input(in.src[1], tb, col, k, b_signed);
-          if (out == "i32") isum = mfma_mac_wrap(isum, static_cast<int64_t>(a), static_cast<int64_t>(b));
+          if (out == "i32") isum = wrap_madd(isum, static_cast<int64_t>(a), static_cast<int64_t>(b));
           else sum = mfma_add_o<WMMA_ORDER>(sum, mfma_mul_o<WMMA_ORDER>(a, b));   // (the operand order is the recorded one, not the compiler's choice)
         }
         uint32_t& slot = result[lane][reg];
@@ -4063,11 +4063,11 @@ struct Machine {
           for (uint32_t k = k_lo; k < k_hi; ++k) {
             const double a = sparse ? arow[k] : element(src_a, fa, la, mm, k, a_signed, a_base);
             const double bv = element(src_b, fb, lb, n, k, b_signed, 0);
-            if (int_out) ipart = mfma_mac_wrap(ipart, static_cast<int64_t>(a), static_cast<int64_t>(bv));
+            if (int_out) ipart = wrap_madd(ipart, static_cast<int64_t>(a), static_cast<int64_t>(bv));
             else part = mfma_add_o<WMMA_ORDER>(part, mfma_mul_o<WMMA_ORDER>(a, bv));   // (the recorded operand order, not the compiler's choice)
           }
           }
-          if (int_out) isum += ipart;
+          if (int_out) isum = static_cast<int64_t>(static_cast<uint64_t>(isum) + static_cast<uint64_t>(ipart));
           else if (scaled) {
             const double sa = scale_of(in.src[3], true, m, b), sb = scale_of(in.src[4], false, n, b);
             // (Which of two NaN operands of these two multiplies and two adds gives the result's payload is the recorded one,
@@ -10797,7 +10797,7 @@ struct Machine {
           if (sparse) {   // (only the products A's indices keep: a NaN or infinity in B at a pruned place changes nothing)
             int64_t isum = static_cast<int64_t>(c0);
             for (uint32_t k = 0; k < s.k; ++k)
-              if (kept[as[r] + k]) isum = mfma_mac_wrap(isum, static_cast<int64_t>(arow[k]), static_cast<int64_t>(bcol[k]));
+              if (kept[as[r] + k]) isum = wrap_madd(isum, static_cast<int64_t>(arow[k]), static_cast<int64_t>(bcol[k]));
             set_word(w, in.dst[0], r, lane, static_cast<uint32_t>(isum));
             continue;
           }

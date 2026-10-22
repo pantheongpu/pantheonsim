@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+
+#include "amd_simd_cap.hpp"
 #if defined(__SSE2__)
 #include <emmintrin.h>
 #endif
@@ -165,14 +167,14 @@ inline double mfma_dot_fma(const double* a, const double* bt, uint32_t k, double
   for (uint32_t i = 0; i < k; ++i) sum = mfma_fma(bt[i], a[i], sum);
   return sum;
 }
-// Integers are summed exactly and wrap as the hardware's do. The wrap is done in unsigned arithmetic (the same bits as the
-// signed one gives on this target, but not undefined where it overflows).
-inline int64_t mfma_mac_wrap(int64_t acc, int64_t a, int64_t b) {
+// acc + a * b in 64 bits, wrapping as the hardware's integer adders do (done unsigned: the signed overflow is undefined, and a sanitizer says so).
+inline int64_t wrap_madd(int64_t acc, int64_t a, int64_t b) {
   return static_cast<int64_t>(static_cast<uint64_t>(acc) + static_cast<uint64_t>(a) * static_cast<uint64_t>(b));
 }
+// Integers are summed exactly and wrap as the hardware's do.
 inline int64_t mfma_dot_int(const double* a, const double* bt, uint32_t k, int64_t c) {
   int64_t sum = c;
-  for (uint32_t i = 0; i < k; ++i) sum = mfma_mac_wrap(sum, static_cast<int64_t>(a[i]), static_cast<int64_t>(bt[i]));
+  for (uint32_t i = 0; i < k; ++i) sum = wrap_madd(sum, static_cast<int64_t>(a[i]), static_cast<int64_t>(bt[i]));
   return sum;
 }
 
@@ -237,7 +239,7 @@ inline double mfma_tile_ordered(const double* arow, const double* bcol, uint32_t
 #if defined(__x86_64__) && defined(__GNUC__)
 // Whether the 4-wide kernels are used: the host has AVX2 (a test turns it off to hold the 2-wide ones against the same cases).
 inline bool& mfma_avx2_switch() {
-  static bool on = __builtin_cpu_supports("avx2");
+  static bool on = !simd_capped_to_base() && __builtin_cpu_supports("avx2");
   return on;
 }
 inline bool mfma_have_avx2() { return mfma_avx2_switch(); }
@@ -330,7 +332,7 @@ __attribute__((target("fma"))) inline void mfma_tile_fma_hw(uint32_t m, uint32_t
     }
 }
 inline bool mfma_have_fma() {
-  static const bool have = __builtin_cpu_supports("fma");
+  static const bool have = !simd_capped_to_base() && __builtin_cpu_supports("fma");
   return have;
 }
 #endif

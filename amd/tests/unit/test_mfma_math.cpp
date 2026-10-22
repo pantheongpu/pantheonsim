@@ -79,7 +79,7 @@ VTEST(a_dot_product_reads_the_same_sum_from_a_contiguous_column_as_from_the_stri
       old_sum += a[kk] * b[kk * n + j];
       ordered_sum = vgpu::amd::mfma_add(ordered_sum, vgpu::amd::mfma_mul(a[kk], b[kk * n + j]));
       old_fma = std::fma(a[kk], b[kk * n + j], old_fma);
-      old_int += static_cast<int64_t>(ia[kk]) * static_cast<int64_t>(ib[kk * n + j]);
+        old_int += static_cast<int64_t>(ia[kk]) * static_cast<int64_t>(ib[kk * n + j]);
       icol[kk] = ib[kk * n + j];
     }
     // A sum that is not a NaN is the same whatever order the compiler gives the two operands of the plain loop above. A NaN is
@@ -342,7 +342,7 @@ VTEST(integer_dot_products_wrap_without_overflowing_a_signed_type) {
   uint64_t want = 0x1234;
   for (int i = 0; i < 3; ++i) want += static_cast<uint64_t>(static_cast<int64_t>(a[i])) * static_cast<uint64_t>(static_cast<int64_t>(b[i]));
   VCHECK_EQ(static_cast<uint64_t>(vgpu::amd::mfma_dot_int(a, b, 3, 0x1234)), want);
-  VCHECK_EQ(vgpu::amd::mfma_mac_wrap(INT64_MAX, INT64_MAX, 3), static_cast<int64_t>(uint64_t{INT64_MAX} + uint64_t{INT64_MAX} * 3));
+  VCHECK_EQ(vgpu::amd::wrap_madd(INT64_MAX, INT64_MAX, 3), static_cast<int64_t>(uint64_t{INT64_MAX} + uint64_t{INT64_MAX} * 3));
   // (The 16-bit integer tile: sums that pass 2^31 wrap in the 32 bits.)
   std::vector<int16_t> ia(2 * 64, 32767), bi(64 * 2, 32767);
   int32_t out[1] = {};
