@@ -619,6 +619,7 @@ class MemoryManager {
   // The ordinary allocation holding [addr, addr + len), from the memory of
   // recent lookups or the table; null if there is none or the memory is off.
   const Allocation* find_ordinary(uint64_t addr, uint64_t len, uint64_t* base_out) const;
+  uint8_t* hot_location(uint64_t addr, uint32_t size) const;
   const Allocation* find_ordinary_miss(uint64_t addr, uint64_t len, uint64_t* base_out) const;
   bool batch_ok(const uint64_t* addrs, size_t count, uint32_t size, bool store, const Allocation** alloc,
                 uint64_t* base) const;

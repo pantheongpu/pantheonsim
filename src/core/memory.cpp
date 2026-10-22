@@ -494,6 +494,23 @@ bool MemoryManager::lookup_cache_default() {
   return find_ordinary_miss(addr, len, base_out);
 }
 
+// The bytes of a naturally aligned scalar in a chunk that is real, when the last allocation this
+// thread found holds it and nothing else needs a say (no host mapping in reach): the answer the
+// general path gives for such an access, without its calls. Null for anything else -- another
+// allocation, an untouched or uniform chunk, a miss -- and the caller takes the general path.
+[[gnu::always_inline]] inline uint8_t* MemoryManager::hot_location(uint64_t addr, uint32_t size) const {
+  BigReaderLock* lock = table_lock_.get();
+  if (!lock || !lookup_cache_ || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
+  const LookupMemory& mem = lookups();
+  const LookupMemory::Entry& e = mem.way[mem.last];
+  const uint64_t off = addr - e.base;
+  if (e.epoch != lock->epoch() || off >= e.size || size > e.size - off) return nullptr;
+  const Allocation* a = static_cast<const Allocation*>(e.allocation);
+  uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+  if (!chunk || is_uniform(chunk)) return nullptr;
+  return chunk + off % kChunkSize;
+}
+
 const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, uint64_t len, const char* op,
                                                                uint64_t* base_out, bool writing,
                                                                bool page_slack) const {
@@ -1418,7 +1435,9 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
                       " is not naturally aligned (real GPUs fault on this)");
   const uint8_t* p = nullptr;
   uint64_t v = 0;
-  switch (scalar_location(addr, size, /*store=*/nullptr, &p)) {
+  if ((p = hot_location(addr, size)) != nullptr) {
+    v = load_at(p, size);
+  } else switch (scalar_location(addr, size, /*store=*/nullptr, &p)) {
     case ScalarAt::Chunk:
       v = load_at(p, size);
       break;
@@ -1467,6 +1486,10 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
   if (access_fault_ && access_fault_->store_pending &&
       __atomic_load_n(access_fault_->store_pending, __ATOMIC_RELAXED) && !is_host_mapped(addr))
     value = access_fault_->on_store(addr, size, value);
+  if (uint8_t* hot = hot_location(addr, size)) {
+    store_at(hot, size, value);
+    return;
+  }
   const uint8_t* p = nullptr;
   switch (scalar_location(addr, size, &value, &p)) {
     case ScalarAt::Chunk:
