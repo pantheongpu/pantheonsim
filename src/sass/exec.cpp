@@ -523,6 +523,8 @@ class Runner {
     }
   }
   bool tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc
+  template <bool Jit>
+  bool tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc: the run loop; Jit adds the hook of tier 2
   bool break_spin_wait(const std::vector<Block*>& blocks);
   void execute(Block& blk, Warp& w, const Instr& ins, Mask group, bool advance = true);
   bool fast_alu(Warp& w, const Instr& ins, Mask ex);   // exec_ops.inc

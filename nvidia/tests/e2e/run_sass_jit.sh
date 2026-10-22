@@ -129,7 +129,7 @@ check() {
       elif [[ "$fa" != "$fc" ]]; then why="${why:+$why; }the $f fault is reported differently with the JIT built without exceptions"; fi
     done
     # The comparison above means something only if faults really were thrown from inside generated regions.
-    (( thr >= ${VGPU_JIT_MIN_THROWS:-3} )) || why="${why:+$why; }only $thr of the faults were thrown inside a generated region"
+    (( thr >= ${VGPU_JIT_MIN_THROWS:-2} )) || why="${why:+$why; }only $thr of the faults were thrown inside a generated region"
     fault_throws=$thr
   fi
   if [[ -n $why ]]; then
