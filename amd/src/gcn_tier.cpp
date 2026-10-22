@@ -176,16 +176,19 @@ struct Tables {
   const CmpFn* cmp_f16;
   CmpFn cmp_class32;
   CmpFn cmp_class16;
+  CmpFn cmp_class16_neg;
 };
 const Tables& tables() {
   static const Tables base = {base_impl::base_impl_ns::kIntTab, base_impl::base_impl_ns::kF32Tab, base_impl::base_impl_ns::kF64Tab,
                               base_impl::base_impl_ns::kL64Tab, base_impl::base_impl_ns::kCmpU32, base_impl::base_impl_ns::kCmpI32,
                               base_impl::base_impl_ns::kCmpF32, base_impl::base_impl_ns::kCmpU64, base_impl::base_impl_ns::kCmpI64, base_impl::base_impl_ns::kCmpF64,
-                              base_impl::base_impl_ns::kCmpI16, base_impl::base_impl_ns::kCmpU16, base_impl::base_impl_ns::kCmpF16, base_impl::base_impl_ns::cmp_class_f32, base_impl::base_impl_ns::cmp_class_f16};
+                              base_impl::base_impl_ns::kCmpI16, base_impl::base_impl_ns::kCmpU16, base_impl::base_impl_ns::kCmpF16, base_impl::base_impl_ns::cmp_class_f32, base_impl::base_impl_ns::cmp_class_f16<false>,
+                              base_impl::base_impl_ns::cmp_class_f16<true>};
   static const Tables avx2 = {avx2_impl::avx2_impl_ns::kIntTab, avx2_impl::avx2_impl_ns::kF32Tab, avx2_impl::avx2_impl_ns::kF64Tab,
                               avx2_impl::avx2_impl_ns::kL64Tab, avx2_impl::avx2_impl_ns::kCmpU32, avx2_impl::avx2_impl_ns::kCmpI32,
                               avx2_impl::avx2_impl_ns::kCmpF32, avx2_impl::avx2_impl_ns::kCmpU64, avx2_impl::avx2_impl_ns::kCmpI64, avx2_impl::avx2_impl_ns::kCmpF64,
-                              avx2_impl::avx2_impl_ns::kCmpI16, avx2_impl::avx2_impl_ns::kCmpU16, avx2_impl::avx2_impl_ns::kCmpF16, avx2_impl::avx2_impl_ns::cmp_class_f32, avx2_impl::avx2_impl_ns::cmp_class_f16};
+                              avx2_impl::avx2_impl_ns::kCmpI16, avx2_impl::avx2_impl_ns::kCmpU16, avx2_impl::avx2_impl_ns::kCmpF16, avx2_impl::avx2_impl_ns::cmp_class_f32, avx2_impl::avx2_impl_ns::cmp_class_f16<false>,
+                              avx2_impl::avx2_impl_ns::cmp_class_f16<true>};
   return simd::enabled() && simd::level() == simd::Level::Avx2 ? avx2 : base;
 }
 
@@ -1509,6 +1512,8 @@ const std::unordered_map<std::string_view, Entry>& table() {
     m["v_pk_fma_f16"] = {Cat::PkF16, 0, 3};
     m["v_pk_add_f16"] = {Cat::PkF16, 1, 2};
     m["v_pk_mul_f16"] = {Cat::PkF16, 2, 2};
+    m["v_pk_min_f16"] = {Cat::PkF16, 3, 2};
+    m["v_pk_max_f16"] = {Cat::PkF16, 4, 2};
     m["v_pk_mov_b32"] = {Cat::PkMov, 0, 2};
     m["v_div_scale_f32"] = {Cat::Div, 0, 3};
     m["v_div_fmas_f32"] = {Cat::Div, 1, 3};
@@ -1722,7 +1727,7 @@ void classify_cmp(Inst& in, const Tables& T) {
   bool raw16 = false;   // (a half or a 16-bit integer source: float modifiers would act on the wrong bits)
   if (op == 0x10 || op == 0x14) {   // v_cmp_class_f32, v_cmp_class_f16: the mask is the second operand's bits
     if (op == 0x14 && !cdna(in)) return;
-    k = op == 0x10 ? T.cmp_class32 : T.cmp_class16;
+    k = op == 0x10 ? T.cmp_class32 : in.src[0].neg ? T.cmp_class16_neg : T.cmp_class16;
     fmods = op == 0x10;
     raw16 = op == 0x14;
   } else if (op >= 0x20 && op < 0x30) {

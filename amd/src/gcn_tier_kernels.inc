@@ -450,10 +450,14 @@ static uint64_t cmp_class_f32(const uint32_t* a, const uint32_t* m, unsigned n) 
   }
   return out;
 }
+// (`Negated`: the half was negated by the instruction, and the negation of a half quiets a signaling NaN, as the interpreter's `-h` does.)
+template <bool Negated>
 static uint64_t cmp_class_f16(const uint32_t* a, const uint32_t* m, unsigned n) {
   uint64_t out = 0;
   for (unsigned i = 0; i < n; ++i) {
-    const uint32_t b = a[i] & 0xFFFFu, ab = b & 0x7FFFu;
+    uint32_t b = a[i] & 0xFFFFu;
+    if (Negated && (b & 0x7FFFu) > 0x7C00u) b |= 0x200u;
+    const uint32_t ab = b & 0x7FFFu;
     const bool negative = b >> 15;
     uint32_t bit;
     if (ab > 0x7C00u) bit = (b & 0x200u) ? 1u << 1 : 1u << 0;

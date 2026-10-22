@@ -60,25 +60,7 @@ static float libm_fmaxf(float x, float y) {
   return fn(x, y);
 }
 
-// The packed min and max on RDNA and gfx90a as the build the recorded digests come from ran them: an inline expansion of std::fmin and
-// std::fmax that returns the first operand for a tie of the two zeros of a max and the second for a min, and the sum of the two where
-// both are NaNs (the second operand's payload first for a min, the first's... see pin_add): the compiler's choice moved with the code
-// around the call, so it is spelled out.
-template <typename T> static T pin_add(T a, T b) {   // a + b, a first (its payload is the one a NaN sum keeps)
-  if constexpr (sizeof(T) == 4) __asm__("addss %1, %0" : "+x"(a) : "x"(b));
-  else __asm__("addsd %1, %0" : "+x"(a) : "x"(b));
-  return a;
-}
-static float pk_fminf(float x, float y) {
-  if (x != x) return y != y ? pin_add(y, x) : y;
-  if (y != y) return x;
-  return x < y ? x : y;   // (a tie: the second)
-}
-static float pk_fmaxf(float x, float y) {
-  if (x != x) return y != y ? pin_add(y, x) : y;
-  if (y != y) return x;
-  return x == y ? x : x > y ? x : y;   // (a tie: the first)
-}
+// (The packed minimum and maximum of RDNA and gfx90a, pk_fminf and pk_fmaxf, are in packed_math.hpp, with the whole-wave code that runs them.)
 
 // A multiply or an add of doubles with the first operand named: where both are NaNs the x86 instruction keeps the first one's payload, and
 // which operand the compiler makes the first is its choice, which moves with the code around (the recorded digests are of the choice the
@@ -1095,6 +1077,8 @@ struct Machine {
     packed::WaveArgs a;
     a.op = kind;
     a.clamp = in.clamp;
+    a.guide = is_guide_arch(in);
+    a.ieee = (w.mode >> 9) & 1;
     a.exec = w.exec;
     a.dst = w.vgpr[in.dst[0].index].data();
     const uint32_t n = kind == packed::Op::Fma ? 3 : 2;
@@ -6748,9 +6732,9 @@ struct Machine {
     if (!(op == "v_pk_fma_f16"_op || op == "v_pk_add_f16"_op || op == "v_pk_mul_f16"_op ||
                op == "v_pk_min_f16"_op || op == "v_pk_max_f16"_op)) goto L_ladder_9;
     {
-      // The whole wave at once where the instruction is a plain fma, add or multiply (packed_f16_wave).
-      if ((op == "v_pk_fma_f16"_op || op == "v_pk_add_f16"_op || op == "v_pk_mul_f16"_op) &&
-          packed_f16_wave(w, in, op == "v_pk_fma_f16"_op ? packed::Op::Fma : op == "v_pk_add_f16"_op ? packed::Op::Add : packed::Op::Mul))
+      // The whole wave at once where the instruction is a plain fma, add, multiply, minimum or maximum (packed_f16_wave).
+      if (packed_f16_wave(w, in, op == "v_pk_fma_f16"_op ? packed::Op::Fma : op == "v_pk_add_f16"_op ? packed::Op::Add
+                                 : op == "v_pk_mul_f16"_op ? packed::Op::Mul : op == "v_pk_min_f16"_op ? packed::Op::Min : packed::Op::Max))
         break;
       each([&](uint32_t lane) {
         // Two halves in one register, each its own arithmetic, done in float
@@ -6771,8 +6755,8 @@ struct Machine {
           const float x = packed_half(w, in, 0, half, lane), y = packed_half(w, in, 1, half, lane);
           const float v = op == "v_pk_add_f16"_op   ? x + y
                           : op == "v_pk_mul_f16"_op ? x * y
-                          : op == "v_pk_min_f16"_op ? (is_guide_arch(in) || in.arch == gcn::Target::Gfx1250 ? hw_min(in, w.mode, x, y) : pk_fminf(x, y))
-                          : op == "v_pk_max_f16"_op ? (is_guide_arch(in) || in.arch == gcn::Target::Gfx1250 ? hw_max(in, w.mode, x, y) : pk_fmaxf(x, y))
+                          : op == "v_pk_min_f16"_op ? (is_guide_arch(in) || in.arch == gcn::Target::Gfx1250 ? hw_min(in, w.mode, x, y) : packed::pk_fminf(x, y))
+                          : op == "v_pk_max_f16"_op ? (is_guide_arch(in) || in.arch == gcn::Target::Gfx1250 ? hw_max(in, w.mode, x, y) : packed::pk_fmaxf(x, y))
                                                  : std::fma(x, y, packed_half(w, in, 2, half, lane));
           _Float16 h = static_cast<_Float16>(in.clamp ? clamp01(v) : v);
           if (std::isinf(static_cast<float>(h)) && fp16_ovfl(w, in) && std::isfinite(x) && std::isfinite(y) &&
@@ -8144,17 +8128,7 @@ struct Machine {
     return is_min ? (x < y ? x : y) : (ieee ? (x >= y ? x : y) : (x > y ? x : y));
   }
   // The same over half-precision bit patterns (a half's signaling NaN has bit 9 of the mantissa clear).
-  static uint16_t gfx9_minmax_half(uint16_t a, uint16_t b, bool is_min, bool ieee) {
-    const auto is_nan = [](uint16_t v) { return (v & 0x7C00) == 0x7C00 && (v & 0x3FF) != 0; };
-    const auto signaling = [&](uint16_t v) { return is_nan(v) && !(v & 0x200); };
-    if (ieee && signaling(a)) return a | 0x200;
-    if (ieee && signaling(b)) return b | 0x200;
-    if (is_nan(a)) return b;
-    if (is_nan(b)) return a;
-    const float x = static_cast<float>(as_half(a)), y = static_cast<float>(as_half(b));
-    if (x == 0 && y == 0 && (a >> 15) != (b >> 15)) return is_min == static_cast<bool>(a >> 15) ? a : b;
-    return is_min ? (x < y ? a : b) : (ieee ? (x >= y ? a : b) : (x > y ? a : b));
-  }
+  static uint16_t gfx9_minmax_half(uint16_t a, uint16_t b, bool is_min, bool ieee) { return packed::minmax_half_bits(a, b, is_min, ieee); }
   template <typename T>
   static T hw_min(const Inst& in, uint32_t mode, T x, T y) {
     if (is_guide_arch(in)) return gfx9_minmax(x, y, true, (mode >> 9) & 1);
@@ -10410,7 +10384,14 @@ struct Machine {
       const MatrixPlan::Lane& L = plan.lane[lane];
       V* const d = ap + L.a_row + L.g * per_lane;
       const uint32_t sl = f.a_lane[lane];
-      for (uint32_t e = 0; e < per_lane; ++e) d[e] = matrix_value<T, V>(f.a, e, sl);
+      if constexpr (T == 'e' || T == 'g') {   // (8-bit floats: a register's word read once, its four bytes looked up)
+        for (uint32_t e = 0; e < per_lane; e += 4) {
+          const uint32_t word = f.a.rows[e / 4][sl];
+          for (uint32_t q = 0; q < 4; ++q) d[e + q] = static_cast<V>(f.a.lut[(word >> (8 * q)) & 0xFF]);
+        }
+      } else {
+        for (uint32_t e = 0; e < per_lane; ++e) d[e] = matrix_value<T, V>(f.a, e, sl);
+      }
     }
   }
   template <char T, typename V, bool Int>
@@ -10432,10 +10413,16 @@ struct Machine {
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const MatrixPlan::Lane& L = plan.lane[lane];
       const uint32_t sl = f.b_lane[lane];
+      [[maybe_unused]] uint32_t word = 0;
       for (uint32_t e = 0; e < per_lane; ++e) {
         // gfx950's sparse forms, whose B is eight registers, split it (as the reference does)
         const uint32_t kb = f.b_split ? e / half * (s.k / 2) + L.g * half + e % half : L.g * per_lane + e;
-        bp[matrix_b_at<Int>(plan, s, lane, kb)] = matrix_value<T, V>(f.b, e, sl);
+        if constexpr (T == 'e' || T == 'g') {
+          if (e % 4 == 0) word = f.b.rows[e / 4][sl];   // (8-bit floats: a register's word read once)
+          bp[matrix_b_at<Int>(plan, s, lane, kb)] = static_cast<V>(f.b.lut[(word >> (8 * (e % 4))) & 0xFF]);
+        } else {
+          bp[matrix_b_at<Int>(plan, s, lane, kb)] = matrix_value<T, V>(f.b, e, sl);
+        }
       }
     }
   }
@@ -12466,6 +12453,14 @@ uint32_t draw(Rng& r, uint32_t flavour) {
     return v;
   }
   const uint64_t x = r.next();
+  if (flavour == 17) {
+    // (Two halves, each a special value one time in four -- infinities, zeros, quiet and signaling NaNs, a subnormal, the largest -- else any bits: the 16-bit
+    // instructions of the tier's test, whose NaN rules the other flavours' floats do not reach.)
+    static constexpr uint16_t kHalf[] = {0x0000, 0x8000, 0x3C00, 0xBC00, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7C01, 0xFC01, 0x7D55,
+                                         0x0001, 0x03FF, 0x7BFF, 0xFBFF, 0x4248};
+    const auto half = [&](uint32_t bits, uint32_t pick) { return (bits >> 14) % 4 == 0 ? kHalf[pick % std::size(kHalf)] : static_cast<uint16_t>(bits); };
+    return half(static_cast<uint32_t>(x), static_cast<uint32_t>(x >> 40)) | uint32_t{half(static_cast<uint32_t>(x >> 32), static_cast<uint32_t>(x >> 48))} << 16;
+  }
   if (flavour == 1 || flavour == 13) return static_cast<uint32_t>(x) & 0xFF;
   if (flavour == 10 || flavour == 11) {
     // (The tier's flavours (10 to 15; 4 is the matrix instructions'): floats and doubles' halves with every special value but a NaN, so that the fast paths run rather

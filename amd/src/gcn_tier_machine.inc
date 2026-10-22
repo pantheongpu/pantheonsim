@@ -105,9 +105,11 @@ int tier_smem(Wave& w, const Inst& in) {
 }
 
 // v_pk_fma_f16, v_pk_add_f16, v_pk_mul_f16: the whole-wave arithmetic of packed_math.hpp, for the plain case (it says whether this is one: nothing
-// has happened if not). Op::sub is 0 for the fused multiply-add, 1 for the add, 2 for the multiply.
+// has happened if not). Op::sub is 0 for the fused multiply-add, 1 for the add, 2 for the multiply, 3 for the minimum, 4 for the maximum.
 int tier_pkf16(Wave& w, const Inst& in) {
-  if (!packed_f16_wave(w, in, in.fast.sub == 0 ? packed::Op::Fma : in.fast.sub == 1 ? packed::Op::Add : packed::Op::Mul)) return 0;
+  if (!packed_f16_wave(w, in, in.fast.sub == 0 ? packed::Op::Fma : in.fast.sub == 1 ? packed::Op::Add : in.fast.sub == 2 ? packed::Op::Mul
+                                : in.fast.sub == 3 ? packed::Op::Min : packed::Op::Max))
+    return 0;
   InstructionCounts& n = stats.counts;
   ++n.mix[static_cast<int>(in.mix)];
   n.mops[static_cast<int>(in.mops_type)] += in.mops;

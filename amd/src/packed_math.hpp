@@ -68,7 +68,7 @@ inline uint16_t float_to_half(float f) {
   return static_cast<uint16_t>(sign | r);
 }
 
-enum class Op { Fma, Add, Mul };
+enum class Op { Fma, Add, Mul, Min, Max };
 
 // One half of one source: where its 16 bits come from, and the sign flip the instruction asks for. A register's lanes
 // are read from `row` (the 32-bit words, `shift` 0 or 16 picking the half); with no row the half is `imm`.
@@ -86,6 +86,8 @@ struct HalfSource {
 struct WaveArgs {
   Op op = Op::Fma;
   bool clamp = false;
+  bool guide = false;   // (Min and Max) gfx942 and gfx950's rule, on the halves' bits (minmax_half_bits); else RDNA's and gfx90a's, on floats (pk_fminf)
+  bool ieee = false;    // (Min and Max, guide) MODE.IEEE: a signaling NaN operand gives that NaN, quieted
   uint64_t exec = 0;
   HalfSource src[3][2];   // source k, low result then high
   uint32_t* dst = nullptr;
@@ -128,6 +130,67 @@ inline float mul_ordered(float first, float second) {
 inline float fmaf_libm(float x, float y, float z) {
   static float (*volatile const fma_fn)(float, float, float) = &::fmaf;
   return PACKED_FMA_SWAPPED ? fma_fn(y, x, z) : fma_fn(x, y, z);
+}
+
+// The packed minimum and maximum of RDNA and gfx90a as the build the recorded digests come from ran them: an inline expansion of std::fmin and
+// std::fmax that returns the first operand for a tie of the two zeros of a max and the second for a min, and for two NaNs the second operand's payload
+// first (pin_add: an add of the two, the second first). The compiler's choice moved with the code around the call, so it is spelled out.
+inline float pin_add_ss(float first, float second) {
+#if defined(__x86_64__)
+  __asm__("addss %1, %0" : "+x"(first) : "x"(second));
+  return first;
+#else
+  return first + second;
+#endif
+}
+inline float pk_fminf(float x, float y) {
+  if (x != x) return y != y ? pin_add_ss(y, x) : y;
+  if (y != y) return x;
+  return x < y ? x : y;   // (a tie: the second)
+}
+inline float pk_fmaxf(float x, float y) {
+  if (x != x) return y != y ? pin_add_ss(y, x) : y;
+  if (y != y) return x;
+  return x == y ? x : x > y ? x : y;   // (a tie: the first)
+}
+// gfx942's and gfx950's minimum and maximum of two halves, on their bits (CDNA3 and CDNA4 guides, V_MIN_F16 and V_MAX_F16): with MODE.IEEE a
+// signaling NaN operand gives that NaN quieted (the first operand first); otherwise a NaN operand gives the other; -0 is below +0; and the rest is
+// the comparison.
+inline uint16_t minmax_half_bits(uint16_t a, uint16_t b, bool is_min, bool ieee) {
+  const auto is_nan = [](uint16_t v) { return (v & 0x7C00) == 0x7C00 && (v & 0x3FF) != 0; };
+  const auto signaling = [&](uint16_t v) { return is_nan(v) && !(v & 0x200); };
+  if (ieee && signaling(a)) return a | 0x200;
+  if (ieee && signaling(b)) return b | 0x200;
+  if (is_nan(a)) return b;
+  if (is_nan(b)) return a;
+  const float x = half_to_float(a), y = half_to_float(b);
+  if (x == 0 && y == 0 && (a >> 15) != (b >> 15)) return is_min == static_cast<bool>(a >> 15) ? a : b;
+  return is_min ? (x < y ? a : b) : (ieee ? (x >= y ? a : b) : (x > y ? a : b));
+}
+inline float clamp01_f(float v) { return v != v || v <= 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+
+// v_pk_min_f16 and v_pk_max_f16, a lane at a time.
+inline void packed_minmax_lanes(const WaveArgs& a) {
+  const bool is_min = a.op == Op::Min;
+  for (uint64_t todo = a.exec; todo; todo &= todo - 1) {
+    const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(todo));
+    uint32_t r = 0;
+    for (uint32_t half = 0; half < 2; ++half) {
+      const uint16_t xb = a.src[0][half].at(lane), yb = a.src[1][half].at(lane);
+      uint16_t rb;
+      if (a.guide) {
+        rb = minmax_half_bits(xb, yb, is_min, a.ieee);
+        if (a.clamp) rb = float_to_half(clamp01_f(half_to_float(rb)));
+      } else {
+        const float x = half_to_float(xb), y = half_to_float(yb);
+        float v = is_min ? pk_fminf(x, y) : pk_fmaxf(x, y);
+        if (a.clamp) v = clamp01_f(v);
+        rb = float_to_half(v);
+      }
+      r |= static_cast<uint32_t>(rb) << (16 * half);
+    }
+    a.dst[lane] = r;
+  }
 }
 
 template <bool Hw>
@@ -229,6 +292,7 @@ inline bool host_has_avx2_f16c() {
 
 // Every lane of EXEC gets its result.
 inline void packed_f16_wave(const WaveArgs& a) {
+  if (a.op == Op::Min || a.op == Op::Max) return packed_minmax_lanes(a);
 #if defined(__x86_64__)
   if (!a.clamp && host_has_avx2_f16c() && (_mm_getcsr() & ((1u << 15) | (1u << 6))) == 0 && (_mm_getcsr() & 0x6000) == 0)
     return packed_f16_wave_avx2(a);
