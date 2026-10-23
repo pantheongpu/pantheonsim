@@ -381,7 +381,7 @@ VTEST(jit_residence_random_regions_equal_the_register_file_code) {
           randomize(a, rng);
           uint32_t group = trial < 2 ? 0xffffffffu : trial == 2 ? 0x0000ffffu : trial == 3 ? 0x00000001u : static_cast<uint32_t>(rng()) | 1u;
           if (trial == 5) group = 0xffffu << 16;   // the second half of a warp (a 48-thread block's last warp is the first half)
-          std::memcpy(&bsim, &a, sizeof a);
+          bsim = a;
           a.seed = bsim.seed = rng();
           const bool stats = trial & 1;
           const bool throw_case = trial == 4 && r % 2 == 0;
