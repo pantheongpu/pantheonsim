@@ -60,25 +60,7 @@ static float libm_fmaxf(float x, float y) {
   return fn(x, y);
 }
 
-// The packed min and max on RDNA and gfx90a as the build the recorded digests come from ran them: an inline expansion of std::fmin and
-// std::fmax that returns the first operand for a tie of the two zeros of a max and the second for a min, and the sum of the two where
-// both are NaNs (the second operand's payload first for a min, the first's... see pin_add): the compiler's choice moved with the code
-// around the call, so it is spelled out.
-template <typename T> static T pin_add(T a, T b) {   // a + b, a first (its payload is the one a NaN sum keeps)
-  if constexpr (sizeof(T) == 4) __asm__("addss %1, %0" : "+x"(a) : "x"(b));
-  else __asm__("addsd %1, %0" : "+x"(a) : "x"(b));
-  return a;
-}
-static float pk_fminf(float x, float y) {
-  if (x != x) return y != y ? pin_add(y, x) : y;
-  if (y != y) return x;
-  return x < y ? x : y;   // (a tie: the second)
-}
-static float pk_fmaxf(float x, float y) {
-  if (x != x) return y != y ? pin_add(y, x) : y;
-  if (y != y) return x;
-  return x == y ? x : x > y ? x : y;   // (a tie: the first)
-}
+// (The packed minimum and maximum of RDNA and gfx90a, pk_fminf and pk_fmaxf, are in packed_math.hpp, with the whole-wave code that runs them.)
 
 // A multiply or an add of doubles with the first operand named: where both are NaNs the x86 instruction keeps the first one's payload, and
 // which operand the compiler makes the first is its choice, which moves with the code around (the recorded digests are of the choice the
@@ -87,6 +69,8 @@ static inline double first_mul(double first, double second) { __asm__("mulsd %1,
 static inline double first_add(double first, double second) { __asm__("addsd %1, %0" : "+x"(first) : "x"(second)); return first; }
 namespace vgpu::amd {
 namespace {
+// The matrix instructions the tile path did on this thread (a test reads it: matrix_tile_count).
+thread_local uint64_t g_matrix_tiles = 0;
 
 using gcn::Inst;
 using gcn::Operand;
@@ -1095,6 +1079,8 @@ struct Machine {
     packed::WaveArgs a;
     a.op = kind;
     a.clamp = in.clamp;
+    a.guide = is_guide_arch(in);
+    a.ieee = (w.mode >> 9) & 1;
     a.exec = w.exec;
     a.dst = w.vgpr[in.dst[0].index].data();
     const uint32_t n = kind == packed::Op::Fma ? 3 : 2;
@@ -7089,9 +7075,9 @@ struct Machine {
     if (!(op == "v_pk_fma_f16"_op || op == "v_pk_add_f16"_op || op == "v_pk_mul_f16"_op ||
                op == "v_pk_min_f16"_op || op == "v_pk_max_f16"_op)) goto L_ladder_9;
     {
-      // The whole wave at once where the instruction is a plain fma, add or multiply (packed_f16_wave).
-      if ((op == "v_pk_fma_f16"_op || op == "v_pk_add_f16"_op || op == "v_pk_mul_f16"_op) &&
-          packed_f16_wave(w, in, op == "v_pk_fma_f16"_op ? packed::Op::Fma : op == "v_pk_add_f16"_op ? packed::Op::Add : packed::Op::Mul))
+      // The whole wave at once where the instruction is a plain fma, add, multiply, minimum or maximum (packed_f16_wave).
+      if (packed_f16_wave(w, in, op == "v_pk_fma_f16"_op ? packed::Op::Fma : op == "v_pk_add_f16"_op ? packed::Op::Add
+                                 : op == "v_pk_mul_f16"_op ? packed::Op::Mul : op == "v_pk_min_f16"_op ? packed::Op::Min : packed::Op::Max))
         break;
       each([&](uint32_t lane) {
         // Two halves in one register, each its own arithmetic, done in float
@@ -7112,8 +7098,8 @@ struct Machine {
           const float x = packed_half(w, in, 0, half, lane), y = packed_half(w, in, 1, half, lane);
           const float v = op == "v_pk_add_f16"_op   ? x + y
                           : op == "v_pk_mul_f16"_op ? x * y
-                          : op == "v_pk_min_f16"_op ? (is_guide_arch(in) || in.arch == gcn::Target::Gfx1250 ? hw_min(in, w.mode, x, y) : pk_fminf(x, y))
-                          : op == "v_pk_max_f16"_op ? (is_guide_arch(in) || in.arch == gcn::Target::Gfx1250 ? hw_max(in, w.mode, x, y) : pk_fmaxf(x, y))
+                          : op == "v_pk_min_f16"_op ? (is_guide_arch(in) || in.arch == gcn::Target::Gfx1250 ? hw_min(in, w.mode, x, y) : packed::pk_fminf(x, y))
+                          : op == "v_pk_max_f16"_op ? (is_guide_arch(in) || in.arch == gcn::Target::Gfx1250 ? hw_max(in, w.mode, x, y) : packed::pk_fmaxf(x, y))
                                                  : std::fma(x, y, packed_half(w, in, 2, half, lane));
           _Float16 h = static_cast<_Float16>(in.clamp ? clamp01(v) : v);
           if (std::isinf(static_cast<float>(h)) && fp16_ovfl(w, in) && std::isfinite(x) && std::isfinite(y) &&
@@ -8485,17 +8471,7 @@ struct Machine {
     return is_min ? (x < y ? x : y) : (ieee ? (x >= y ? x : y) : (x > y ? x : y));
   }
   // The same over half-precision bit patterns (a half's signaling NaN has bit 9 of the mantissa clear).
-  static uint16_t gfx9_minmax_half(uint16_t a, uint16_t b, bool is_min, bool ieee) {
-    const auto is_nan = [](uint16_t v) { return (v & 0x7C00) == 0x7C00 && (v & 0x3FF) != 0; };
-    const auto signaling = [&](uint16_t v) { return is_nan(v) && !(v & 0x200); };
-    if (ieee && signaling(a)) return a | 0x200;
-    if (ieee && signaling(b)) return b | 0x200;
-    if (is_nan(a)) return b;
-    if (is_nan(b)) return a;
-    const float x = static_cast<float>(as_half(a)), y = static_cast<float>(as_half(b));
-    if (x == 0 && y == 0 && (a >> 15) != (b >> 15)) return is_min == static_cast<bool>(a >> 15) ? a : b;
-    return is_min ? (x < y ? a : b) : (ieee ? (x >= y ? a : b) : (x > y ? a : b));
-  }
+  static uint16_t gfx9_minmax_half(uint16_t a, uint16_t b, bool is_min, bool ieee) { return packed::minmax_half_bits(a, b, is_min, ieee); }
   template <typename T>
   static T hw_min(const Inst& in, uint32_t mode, T x, T y) {
     if (is_guide_arch(in)) return gfx9_minmax(x, y, true, (mode >> 9) & 1);
@@ -10648,8 +10624,13 @@ struct Machine {
     const MatrixShape* s;
     MatrixSrc a, b;
     bool sparse = false, scaled = false, b_split = false;
-    uint32_t a_lane[kLanes];
-    double sa[kLanes], sb[kLanes];
+    // f8f6f4: the formats CBSZ (A) and BLGP (B) name, and where each puts K (matrix_small_k); the scales, by block of 32 K and row
+    bool small = false;
+    uint32_t fmt_a = 0, fmt_b = 0;
+    double sa_t[4 * 32], sb_t[4 * 32];
+    // BLGP's lane permutation of B (not for the small floats or the doubles), and the doubles' negations of A, B and C
+    bool b_perm = false;
+    uint32_t a_lane[kLanes], b_lane[kLanes];
     // (sparse) the register that holds the indices of A's values, and which set of them
     const uint32_t* idx_row = nullptr;
     uint32_t idx_set = 0;
@@ -10709,10 +10690,29 @@ struct Machine {
       default: return false;
     }
   }
+  // Where an f8f6f4 source keeps K (CDNA4 guide, 7.1.5.1): lane group g holds 32 values, element e of its run. 4- and 6-bit ones are
+  // 32 in a piece, K = 32 g + e; 8-bit ones are two runs of 16, the second half the instruction's K on (matrix_multiply_reference's
+  // f8f6f4_k, which this follows).
+  static inline uint32_t matrix_small_k(uint32_t fmt, uint32_t g, uint32_t e, uint32_t K) {
+    return fmt <= 1 ? 16 * g + e % 16 + e / 16 * (K / 2) : 32 * g + e;
+  }
   template <char T, typename V>
   void matrix_decode_a(MatrixFast& f, V* ap) {
     const MatrixPlan& plan = *f.plan;
     const uint32_t per_lane = plan.per_lane;
+    if (f.small) {
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const MatrixPlan::Lane& L = plan.lane[lane];
+        V* const d = ap + L.a_row;
+        const uint32_t sl = f.a_lane[lane];
+        for (uint32_t e = 0; e < per_lane; ++e) {
+          const uint32_t k = matrix_small_k(f.fmt_a, L.g, e, f.s->k);
+          const double v = matrix_elem<T>(f.a, e, sl);
+          d[k] = static_cast<V>(f.scaled ? mfma_scale_mul(v, f.sa_t[k / 32 * 32 + lane % f.s->m]) : v);
+        }
+      }
+      return;
+    }
     if (f.sparse) {
       std::fill(ap, ap + size_t{f.s->blocks} * f.s->m * f.s->k, V{});
       for (uint32_t lane = 0; lane < kLanes; ++lane) {
@@ -10727,8 +10727,11 @@ struct Machine {
       const MatrixPlan::Lane& L = plan.lane[lane];
       V* const d = ap + L.a_row + L.g * per_lane;
       const uint32_t sl = f.a_lane[lane];
-      if (f.scaled) {
-        for (uint32_t e = 0; e < per_lane; ++e) d[e] = static_cast<V>(matrix_elem<T>(f.a, e, sl) * f.sa[lane]);
+      if constexpr (T == 'e' || T == 'g') {   // (8-bit floats: a register's word read once, its four bytes looked up)
+        for (uint32_t e = 0; e < per_lane; e += 4) {
+          const uint32_t word = f.a.rows[e / 4][sl];
+          for (uint32_t q = 0; q < 4; ++q) d[e + q] = static_cast<V>(f.a.lut[(word >> (8 * q)) & 0xFF]);
+        }
       } else {
         for (uint32_t e = 0; e < per_lane; ++e) d[e] = matrix_value<T, V>(f.a, e, sl);
       }
@@ -10739,15 +10742,29 @@ struct Machine {
     const MatrixPlan& plan = *f.plan;
     const MatrixShape& s = *f.s;
     const uint32_t per_lane = plan.per_lane, half = per_lane / 2;
+    if (f.small) {   // (the small floats: K where the CDNA4 guide puts it, and the block scales)
+      for (uint32_t lane = 0; lane < kLanes; ++lane) {
+        const MatrixPlan::Lane& L = plan.lane[lane];
+        for (uint32_t e = 0; e < per_lane; ++e) {
+          const uint32_t kb = matrix_small_k(f.fmt_b, L.g, e, s.k);
+          const double v = matrix_elem<T>(f.b, e, f.b_lane[lane]);
+          bp[matrix_b_at<Int>(plan, s, lane, kb)] = static_cast<V>(f.scaled ? mfma_scale_mul(v, f.sb_t[kb / 32 * 32 + lane % s.n]) : v);
+        }
+      }
+      return;
+    }
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const MatrixPlan::Lane& L = plan.lane[lane];
+      const uint32_t sl = f.b_lane[lane];
+      [[maybe_unused]] uint32_t word = 0;
       for (uint32_t e = 0; e < per_lane; ++e) {
         // gfx950's sparse forms, whose B is eight registers, split it (as the reference does)
         const uint32_t kb = f.b_split ? e / half * (s.k / 2) + L.g * half + e % half : L.g * per_lane + e;
-        if (f.scaled) {
-          bp[matrix_b_at<Int>(plan, s, lane, kb)] = static_cast<V>(matrix_elem<T>(f.b, e, lane) * f.sb[lane]);
+        if constexpr (T == 'e' || T == 'g') {
+          if (e % 4 == 0) word = f.b.rows[e / 4][sl];   // (8-bit floats: a register's word read once)
+          bp[matrix_b_at<Int>(plan, s, lane, kb)] = static_cast<V>(f.b.lut[(word >> (8 * (e % 4))) & 0xFF]);
         } else {
-          bp[matrix_b_at<Int>(plan, s, lane, kb)] = matrix_value<T, V>(f.b, e, lane);
+          bp[matrix_b_at<Int>(plan, s, lane, kb)] = matrix_value<T, V>(f.b, e, sl);
         }
       }
     }
@@ -10797,7 +10814,7 @@ struct Machine {
     if (c_reg && co.kind == OperandKind::Vgpr && size_t{co.index} + cwords > w.vgpr.r.size()) return false;
     if (dst.kind == OperandKind::Vgpr ? size_t{dst.index} + cwords > w.vgpr.r.size() : size_t{dst.index} + cwords > kVgprs) return false;
     if (sparse && !(is_reg(in.src[2]) && readable(in.src[2], 1))) return false;
-    if (in.scaled && (in.src.size() < 5)) return false;
+    if (in.scaled && (in.src.size() < 5 || ta != 'x' || tb != 'x')) return false;
     // The accumulation registers the destination names, as the writes would make them (this may move the bank, so it comes
     // before any row is taken).
     if (dst.kind == OperandKind::Agpr && w.agpr.size() < size_t{dst.index} + cwords) w.agpr.resize(size_t{dst.index} + cwords);
@@ -10816,22 +10833,44 @@ struct Machine {
     };
     f.a.lut = lut_of(ta, in.cbsz), f.b.lut = lut_of(tb, in.blgp);
     f.b_split = sparse && in.src[1].width == 8;
+    f.small = ta == 'x';
+    f.fmt_a = in.cbsz, f.fmt_b = in.blgp;
+    // BLGP: B is read from a permuted lane (Table 29), except for the small floats (where it names B's format) and the doubles (where
+    // its bits negate A, B and C): as matrix_multiply_reference's b_lane_of.
+    const bool f64 = s.out == 'd';
+    f.b_perm = in.blgp && !f64 && !f.small;
+    const double sign_a = f64 && (in.blgp & 1) ? -1.0 : 1.0, sign_b = f64 && (in.blgp & 2) ? -1.0 : 1.0, sign_c = f64 && (in.blgp & 4) ? -1.0 : 1.0;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const MatrixPlan::Lane& L = plan.lane[lane];
       const uint32_t a_block = in.a_bcast_size ? (L.bl >> in.a_bcast_size << in.a_bcast_size) + in.a_bcast_id : L.bl;
-      f.a_lane[lane] = a_block < s.blocks ? a_block * lpb + L.within : lane;
+      f.a_lane[lane] = in.a_bcast_size && a_block < s.blocks ? a_block * lpb + L.within : lane;
+      uint32_t bl = lane;
+      if (f.b_perm) {
+        switch (in.blgp) {
+          case 1: bl = lane % 32; break;
+          case 2: bl = lane % 32 + 32; break;
+          case 3: bl = (lane + 16) % 64; break;
+          case 4: bl = lane % 16; break;
+          case 5: bl = lane % 16 + 16; break;
+          case 6: bl = lane % 16 + 32; break;
+          default: bl = lane % 16 + 48; break;
+        }
+      }
+      f.b_lane[lane] = bl;
     }
     if (in.scaled) {
-      const auto scale_of = [&](const Operand& o, uint32_t sel, uint32_t lane) -> double {
+      // The scale layout (CDNA4 guide, 7.2.1): block q of K (32 values) of row i is byte OPSEL of the scale register of lane i + M * q.
+      const auto scale_of = [&](const Operand& o, uint32_t sel, uint32_t row, uint32_t block) -> double {
         const uint32_t e = o.kind == OperandKind::InlineFloat
                                ? (as_bits(static_cast<float>(o.fvalue)) >> 23) & 0xFF
-                               : (lane_src(w, o, lane) >> (8 * sel)) & 0xFF;
+                               : (lane_src(w, o, row + s.m * block) >> (8 * sel)) & 0xFF;
         return e == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, static_cast<int>(e) - 127);
       };
-      for (uint32_t lane = 0; lane < kLanes; ++lane) {
-        f.sa[lane] = scale_of(in.src[3], in.scale_sel & 3, lane);
-        f.sb[lane] = scale_of(in.src[4], in.scale_sel >> 2, lane);
-      }
+      for (uint32_t q = 0; q < s.k / 32; ++q)
+        for (uint32_t row = 0; row < s.m; ++row) {
+          f.sa_t[q * 32 + row] = scale_of(in.src[3], in.scale_sel & 3, row, q);
+          f.sb_t[q * 32 + row] = scale_of(in.src[4], in.scale_sel >> 2, row, q);
+        }
     }
     if (sparse) {
       // A lane's A holds two values of each four along K, packed; the index register says, two bits a value, which of the four
@@ -10885,10 +10924,13 @@ struct Machine {
     if (sparse || in.scaled || !a_identity ||
         !matrix_wide_type(ta, [&](auto tag) { matrix_decode_wide<decltype(tag)::value>(f.a, plan.a_dst, 1, per_lane, plan.fa.data()); }))
       ok = matrix_by_type(ta, [&](auto tag) { matrix_decode_a<decltype(tag)::value, double>(f, plan.fa.data()); });
-    if (f.b_split || in.scaled ||
+    if (f.b_split || in.scaled || f.b_perm ||
         !matrix_wide_type(tb, [&](auto tag) { matrix_decode_wide<decltype(tag)::value>(f.b, plan.b_dst, s.n, per_lane, plan.fbk.data()); }))
       ok = ok && matrix_by_type(tb, [&](auto tag) { matrix_decode_b<decltype(tag)::value, double, false>(f, plan.fbk.data()); });
     if (!ok) return false;
+    // The doubles' BLGP negations (a multiply by -1, as the reference's, so a NaN is as it makes it)
+    if (sign_a != 1.0) for (double& v : plan.fa) v = v * sign_a;
+    if (sign_b != 1.0) for (double& v : plan.fbk) v = v * sign_b;
     // Two things the reference does that a plain tile does not: the sparse forms multiply only the B values A's indices select (so a
     // NaN or infinity of B at a pruned place changes nothing), and the 32-bit float forms flush a denormal input unless MODE keeps them.
     if (sparse)
@@ -10902,8 +10944,10 @@ struct Machine {
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
       if (s.out == 'd') {
-        for (uint32_t r = 0; r < outs; ++r)
-          plan.fc[place[r]] = c_double_const ? cconst_d : as_double(static_cast<uint64_t>(c_reg ? crows[2 * r][lane] : cconst) | static_cast<uint64_t>(c_reg ? crows[2 * r + 1][lane] : cconst) << 32);
+        for (uint32_t r = 0; r < outs; ++r) {
+          const double c0 = c_double_const ? cconst_d : as_double(static_cast<uint64_t>(c_reg ? crows[2 * r][lane] : cconst) | static_cast<uint64_t>(c_reg ? crows[2 * r + 1][lane] : cconst) << 32);
+          plan.fc[place[r]] = sign_c != 1.0 ? c0 * sign_c : c0;
+        }
       } else {
         for (uint32_t r = 0; r < outs; ++r) plan.fc[place[r]] = static_cast<double>(as_float(c_reg ? crows[r][lane] : cconst));
       }
@@ -10935,12 +10979,19 @@ struct Machine {
     // (The matrix core ignores EXEC: every lane is read and written, as the fast path does.) The forms whose layout or arithmetic the
     // fast path does not follow go to the reference: the small-float (f8f6f4) and scaled ones, a broadcast or lane permutation of A or
     // B (CBSZ, BLGP), and several blocks that also have several groups of K in a lane.
-    if (matrix_fast && !in.scaled && !in.blgp) {
-      const MatrixShape* shape = matrix_shape(OpName(in.name));
-      if (shape && shape->in != 'x' && (shape->blocks == 1 || kLanes / shape->blocks == shape->m) &&
-          !(in.a_bcast_size && (1u << in.a_bcast_size) > shape->blocks) &&
-          matrix_multiply_fast(w, in, *shape, in.name.rfind("v_smfmac", 0) == 0))
+    if (matrix_fast) {
+      const MatrixShape* shape = nullptr;
+      if (in.scaled) {   // (v_mfma_scale_f32_16x16x128_f8f6f4 is the shape of v_mfma_f32_16x16x128_f8f6f4)
+        const std::string unscaled = "v_mfma_" + in.name.substr(std::string("v_mfma_scale_").size());
+        shape = matrix_shape(OpName(unscaled));
+      } else {
+        shape = matrix_shape(OpName(in.name));
+      }
+      if (shape && !(in.a_bcast_size && (1u << in.a_bcast_size) > shape->blocks) &&
+          matrix_multiply_fast(w, in, *shape, in.name.rfind("v_smfmac", 0) == 0)) {
+        ++g_matrix_tiles;
         return;
+      }
     }
     matrix_multiply_reference(w, in);
   }
@@ -11058,7 +11109,7 @@ struct Machine {
     // The common cases, sources in registers and neither scaled nor sparse: binary16, a pair to a register, and a float
     // accumulator, are read straight from the registers.
     const auto in_regs = [](const Operand& o) { return o.kind == OperandKind::Vgpr || o.kind == OperandKind::Agpr; };
-    const bool halves = !sparse && !in.scaled && s.in == 'h' && (s.in_b == 0 || s.in_b == 'h') && per_lane % 2 == 0 &&
+    const bool halves = !sparse && !in.scaled && !b_perm && s.in == 'h' && (s.in_b == 0 || s.in_b == 'h') && per_lane % 2 == 0 &&
                         in_regs(in.src[0]) && in_regs(in.src[1]);
     const bool float_c = !sparse && s.out == 'f' && in_regs(in.src[2]);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
@@ -11087,14 +11138,14 @@ struct Machine {
         const uint32_t kb_small = small ? f8f6f4_k(in.src[1], g, e) : 0;
         const double sa = in.scaled ? scale_of(in.src[3], in.scale_sel & 3, lane % s.m, ka / 32) : 1.0;
         const double sb = in.scaled ? scale_of(in.src[4], in.scale_sel >> 2, lane % s.n, kb_small / 32) : 1.0;
-        if (!sparse) ap[L.a_row + ka] = flushed(value(in.src[0], s.in, e, a_lane), s.in) * sa * sign_a;
+        if (!sparse) ap[L.a_row + ka] = mfma_scale_mul(flushed(value(in.src[0], s.in, e, a_lane), s.in), sa) * sign_a;
         // gfx950's sparse forms, whose B is eight registers, split it: the
         // first four hold the lane group's run of K in the first half, the
         // last four the same run K/2 on (the CDNA4 guide's layout tables),
         // where A's run is K's in one piece -- as hipSPARSELt lays both out.
         const uint32_t half = per_lane / 2;
         const uint32_t kb = sparse && in.src[1].width == 8 ? e / half * (s.k / 2) + g * half + e % half : small ? kb_small : g * per_lane + e;
-        bp[L.b_row + kb] = flushed(value(in.src[1], s.in_b ? s.in_b : s.in, e, b_lane_of(lane)), s.in_b ? s.in_b : s.in) * sb * sign_b;
+        bp[L.b_row + kb] = mfma_scale_mul(flushed(value(in.src[1], s.in_b ? s.in_b : s.in, e, b_lane_of(lane)), s.in_b ? s.in_b : s.in), sb) * sign_b;
       }
       if (sparse) {
         // A lane's A holds two values of each four along K, packed; the
@@ -11478,7 +11529,7 @@ struct Machine {
   // Returns 0 when the interpreter is to run the instruction, 1 when it is done, 2 when it is done and the wave gives up its turn.
   int tier_step(Wave& w, Group& g, const Inst& in) {
     if (w.vgpr_msb || w.gpr_idx || w.vskip || !FloatMode::is_default(w.mode)) return 0;
-    if (in.fast.mach) return in.fast.mach == 3 ? tier_barrier(w, in) : tier_global(w, g, in);
+    if (in.fast.mach) return tier_mach(w, g, in);
     gcn::tier::Regs r{reinterpret_cast<uint32_t (*)[64]>(w.vgpr.r.data()), w.sgpr, &w.vcc, &w.exec, &w.pc, &w.scc, w.lanes,
                       &w.loads_in_flight, &w.soft_yield, static_cast<uint32_t>(g.waves.size()), &w.store_gate, g.lds.data(), g.lds.size(),
                       in.target};
@@ -12453,6 +12504,7 @@ namespace {
 std::atomic<bool> g_matrix_fast{true};
 }
 bool matrix_fast_path() { return g_matrix_fast.load(std::memory_order_relaxed); }
+uint64_t matrix_tile_count() { return g_matrix_tiles; }
 void set_matrix_fast_path(bool on) { g_matrix_fast.store(on); }
 
 void abandon_dispatches() { g_abandoned.store(true); }
@@ -12753,6 +12805,14 @@ uint32_t draw(Rng& r, uint32_t flavour) {
     return v;
   }
   const uint64_t x = r.next();
+  if (flavour == 17) {
+    // (Two halves, each a special value one time in four -- infinities, zeros, quiet and signaling NaNs, a subnormal, the largest -- else any bits: the 16-bit
+    // instructions of the tier's test, whose NaN rules the other flavours' floats do not reach.)
+    static constexpr uint16_t kHalf[] = {0x0000, 0x8000, 0x3C00, 0xBC00, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7C01, 0xFC01, 0x7D55,
+                                         0x0001, 0x03FF, 0x7BFF, 0xFBFF, 0x4248};
+    const auto half = [&](uint32_t bits, uint32_t pick) { return (bits >> 14) % 4 == 0 ? kHalf[pick % std::size(kHalf)] : static_cast<uint16_t>(bits); };
+    return half(static_cast<uint32_t>(x), static_cast<uint32_t>(x >> 40)) | uint32_t{half(static_cast<uint32_t>(x >> 32), static_cast<uint32_t>(x >> 48))} << 16;
+  }
   if (flavour == 1 || flavour == 13) return static_cast<uint32_t>(x) & 0xFF;
   if (flavour == 10 || flavour == 11) {
     // (The tier's flavours (10 to 15; 4 is the matrix instructions'): floats and doubles' halves with every special value but a NaN, so that the fast paths run rather
