@@ -3316,6 +3316,15 @@ set_tests_properties(e2e_sass_jit PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 3600)
+# The whole matrix (every program on every architecture, three random seeds): about an hour on an idle 16-CPU machine, so it runs only
+# where VGPU_NIGHTLY=1 (the schedule-only `jit` job of .github/workflows/sass-ptx.yml) and SKIPs elsewhere. e2e_sass_jit above is the PR gate.
+add_test(NAME e2e_sass_jit_full
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_jit.sh --full)
+set_tests_properties(e2e_sass_jit_full PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 14400)
 
 # SASS on every architecture: programs built for each generation's SASS, sm_75
 # to sm_120, run by default and on their PTX, which must agree. sm_100 and
