@@ -370,6 +370,18 @@ jobs:
       VGPU_OLLAMA_MODEL: smollm2:135m
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
+      # The container jobs (ASan, TSan, SASS) run as root in a workspace that belongs to the
+      # runner's user, and when one is cancelled mid-build its own hand-back step is skipped,
+      # leaving root-owned build directories. The checkout below cannot clean those ("EACCES:
+      # unlink build-san/.ninja_deps"), so every ollama job queued behind it failed in seconds.
+      # This job runs on the host, so take the workspace back before the checkout touches it.
+      - name: Take back a workspace a container job left
+        run: |
+          ws="$GITHUB_WORKSPACE"
+          if [[ -d "$ws" ]] && [[ -n "$(find "$ws" -maxdepth 3 ! -user "$(id -un)" -print -quit 2>/dev/null)" ]]; then
+            sudo -n chown -R "$(id -u):$(id -g)" "$ws" || echo "::warning::could not take back $ws; the checkout may fail"
+          fi
+
       - uses: actions/checkout@v4
       - uses: ./.github/actions/pr-guard
 
