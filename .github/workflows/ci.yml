@@ -379,7 +379,13 @@ jobs:
         run: |
           ws="$GITHUB_WORKSPACE"
           if [[ -d "$ws" ]] && [[ -n "$(find "$ws" -maxdepth 3 ! -user "$(id -un)" -print -quit 2>/dev/null)" ]]; then
-            sudo -n chown -R "$(id -u):$(id -g)" "$ws" || echo "::warning::could not take back $ws; the checkout may fail"
+            # sudo when the runner user has it without a password; otherwise docker, which the
+            # runner user always has on these hosts, as root in a throwaway container.
+            if ! sudo -n chown -R "$(id -u):$(id -g)" "$ws" 2>/dev/null; then
+              docker run --rm --entrypoint /bin/sh -v "$(dirname "$ws"):/w" alpine \
+                -c "chown -R $(id -u):$(id -g) /w/$(basename "$ws")" \
+                || echo "::warning::could not take back $ws; the checkout may fail"
+            fi
           fi
 
       - uses: actions/checkout@v4
