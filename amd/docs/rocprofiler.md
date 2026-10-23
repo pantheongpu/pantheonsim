@@ -30,7 +30,7 @@ depend on time, addresses or the machine, and the result is `amd/tests/data/rocp
 (`rocprof_<case>.rx6700xt.expected` for the second card). The simulator runs the same program under the
 same command, inside `vgpu shell --gpu amd/rx6800` (or `amd/rx6700xt`), and its trace is normalised the
 same way and compared. Both cards give the same trace for every case but the agent line (name, ISA,
-compute units); all nine cases below were recorded on both and the simulator matches each.
+compute units); all fifteen cases below were recorded on both and the simulator matches each (`agents` is compared separately, see below).
 
 | case | what the program does |
 | --- | --- |
@@ -205,9 +205,11 @@ Three more comparisons with the same cards, each skipped where there is no rocpr
 
 ## Known differences
 
-The comparison leaves these out, on both sides, with `rocprof_normalize.py --strip-known-gaps`
-(`KNOWN_GAPS` in that script); a gap that is closed is removed from the list and the tests cover it from
-then on. `--card` compares everything.
+The normaliser drops the HSA API records from both sides (`rocprof_normalize.py`); the other rows
+below are not compared either, as the last column says. `rocprof_normalize.py --strip-known-gaps`
+(`KNOWN_GAPS` in that script) leaves out what the simulator does not record yet; the list is empty now,
+since the HIP compiler API is recorded, and a gap that is closed is removed from it and the tests cover
+it from then on. `--card` compares everything.
 
 | what | the card | the simulator | where |
 | --- | --- | --- | --- |

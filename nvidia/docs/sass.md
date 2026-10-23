@@ -264,7 +264,8 @@ of it and not others, and `WARPSYNC` lets out one mask's lanes at a time.
   nvdisasm printed it.
 - `e2e_sass_path`: which code a binary runs -- SASS by default, PTX as the
   fallback, the overrides -- and that both give the right answer.
-- `e2e_sass_archs`: twenty programs built for each generation's SASS, sm_75 to
+- `e2e_sass_archs`: 64 program entries (the `progs` list of `run_sass_archs.sh`,
+  each built for one architecture or more) for each generation's SASS, sm_75 to
   sm_120, plus Hopper's (wgmma, TMA, tensor maps, stmatrix) for sm_90a and
   Blackwell's tensor core for sm_100a, each run by default -- checked to be
   running its SASS -- and on its PTX; the two must agree.

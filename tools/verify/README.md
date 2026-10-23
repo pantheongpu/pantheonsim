@@ -2,7 +2,8 @@
 
 Runs the external program corpora on two simulator builds (A = a baseline, B = the build under
 test) and reports, per corpus, how many programs gave identical output and counters, how many
-differ, and how many failed. It changes no simulator source and runs no GPU card: simulator runs only.
+differ, and how many failed. It changes no simulator source. It runs simulator builds only, unless you ask
+for the optional real-card configuration `C` (see "The real card" below).
 
 Written for the round 7 + 8 speed work (A = `origin/main` before round 8, B = `origin/r8-a`, with
 `VGPU_TIER=1` and the PTX engine as extra configurations), but nothing in it is specific to that pair.
@@ -66,6 +67,7 @@ Configurations (all with `VGPU_THREADS=1`, `VGPU_COUNTERS=1`, `VGPU_COUNTERS_FIL
 | `A2` | A | the same again: finds programs that differ from themselves |
 | `B` | B | |
 | `Bt` | B | `VGPU_TIER=1 VGPU_TIER_STATS=1` |
+| `Bx` | B | `VGPU_TC_EXACT=0` (the earlier sequential tensor-core sums; only for builds that have the switch) |
 | `Ap` | A | `VGPU_SASS=0` (PTX engine) |
 | `Bp` | B | `VGPU_SASS=0` |
 
@@ -105,5 +107,5 @@ only (the card has no simulator diagnostics and no counters). Do not run the car
 Do not run two `run_corpora.sh` instances on one results directory at the same time unless their program selections do not overlap (the
 runs would otherwise remove each other's results); each instance reads its own copy of the program list.
 
-Not covered: the real card (no GPU runs), more than one host thread (`VGPU_THREADS=1` is what makes the order, and so the output, deterministic),
+Not covered: the real card in the default configurations (only an explicit `C` runs it), more than one host thread (`VGPU_THREADS=1` is what makes the order, and so the output, deterministic),
 programs the corpora do not contain, and anything that needs more than the per-corpus timeout.

@@ -49,8 +49,8 @@ Nothing was measured on Hopper (no `p5.4xlarge` capacity came in any of three re
 `g7e.2xlarge` capacity in us-east-1 at nine attempts over four hours (every zone
 for `p5.4xlarge`; for a while no `g6.xlarge` or `g6e.xlarge` either), the Spot
 quota for the G and P families is 0, and no other region has any quota for them.
-So the H100, RTX PRO 6000 and B200 columns are documentation-derived (below), and
-the `ptx120` probe has its programs and runner but no transcript. Nothing was
+So the H100 and B200 columns are documentation-derived (below); the RTX PRO 6000
+Server Edition was read later (below), including its `ptx120` transcript. Nothing was
 launched that was not terminated: three `g6.xlarge` sessions in all (about two
 hours of GPU time, under $2).
 
@@ -251,7 +251,7 @@ Marked "documentation-derived" in the code, and not checked against a card:
 - cuSPARSELt on Hopper and Blackwell other than 12.0 (sparse FP4 and block scales are implemented for 12.0 only).
 - cuDNN FP8 and MXFP8 attention (not implemented), and the F16x16 and FP8-128x4
   tensor reorderings.
-- The block-scaled `tcgen05` forms of `docs/blackwell.md` (sm_100 only; AWS offers
+- The block-scaled `tcgen05` forms of [blackwell.md](blackwell.md) (sm_100 only; AWS offers
   it only as an eight-GPU p6-b200.48xlarge, which the round's rules exclude).
 - sm_120's `mma.sync` block-scaled forms: measured (above); the simulator does not reproduce 11 of the 29 hashes.
 
@@ -265,7 +265,7 @@ over and cuSPARSELt's `libcusparseLt.so.0` (the pip wheel `nvidia-cusparselt-cu1
 run_lowprec.sh lt --card h100 --update          # cuBLASLt from the toolkit, the transcript for nvidia/h100
 LOWPREC_LIB_DIR=<wheel lib dir> run_lowprec.sh sparselt --card h100 --update
 run_lowprec.sh cvt --card h100 --update
-run_lowprec.sh ptx120 --card rtx-pro-6000 --update
+run_lowprec.sh ptx120 --card rtx-pro-6000-server --update
 ```
 
 then `run_lowprec.sh <probe>` on the simulator shows what the shim does not yet
