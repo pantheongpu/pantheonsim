@@ -1294,6 +1294,9 @@ vgpu_unit_test(test_sched)
 vgpu_unit_test(test_sass_access_count)
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
+# The allocation table's bookkeeping (alloc, free, quarantine, recycled chunks, the lock and its epoch) against a model
+# and against the digest of the implementation before the speed work.
+vgpu_unit_test(test_memalloc)
 # The one-lookup read-modify-write and multi-field read, against the load_scalar / store_scalar calls they replace.
 vgpu_unit_test(test_memrmw)
 # The warp's local memory, interleaved by words, against the per-lane layout it replaced.
@@ -1538,9 +1541,18 @@ target_compile_definitions(test_amd_codeobject_same_bits PRIVATE VGPU_SOURCE_DIR
 # The digest tests again on the baseline x86-64 code of the AMD engine's SIMD paths (VGPU_SIMD=base keeps mfma_math.hpp and packed_math.hpp off
 # AVX2, FMA and F16C): the recorded bits are the same on every CPU the engine runs on, not only on one with those units.
 # (Not under ThreadSanitizer, where it would only repeat the same checks twenty times slower.)
+# There is no test_amd_gcn_tier_same_bits twin: VGPU_SIMD=base is read only by amd_simd_cap.hpp, which only mfma_math.hpp and
+# packed_math.hpp use and only gcn_exec.cpp includes; gcn_tier.cpp includes neither, so the twin could only change the interpreter
+# arm, which the twins below already check against the same digests.
+# Under AddressSanitizer the two heaviest twins (test_amd_matrix_fast, test_amd_gcn_same_bits, about 1200 s there) are left out as
+# well: the SIMD headers' baseline code is still run instrumented by the direct twins (mfma_math, packed_math, packed_same_bits),
+# and the full-executor twins run in the plain build on every pull request.
 if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize=thread")
-  foreach(_t test_amd_gcn_same_bits test_amd_gcn_packed_same_bits test_amd_gcn_tier_same_bits test_amd_matrix_fast test_amd_mfma_math
-             test_amd_packed_math)
+  set(_simd_base_tests test_amd_gcn_packed_same_bits test_amd_mfma_math test_amd_packed_math)
+  if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize=[a-z,]*address")
+    list(APPEND _simd_base_tests test_amd_gcn_same_bits test_amd_matrix_fast)
+  endif()
+  foreach(_t ${_simd_base_tests})
     add_test(NAME ${_t}_simd_base COMMAND ${_t})
     set_tests_properties(${_t}_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base" TIMEOUT 1500)
   endforeach()
@@ -3475,6 +3487,10 @@ if(Python3_Interpreter_FOUND)
   # (BURST_CONTAINER_OPTIONS, or BURST_MEM_LIMIT_GIB and BURST_JOBS_MAX for a job outside a container).
   add_test(NAME lint_burst_cap
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_burst_cap.py)
+  # The AMD interpreter's instruction ladders are switches on the name's hash (amd/tools/ladder-to-switch.py): a merge that
+  # brings an if-ladder back (or a `break` that makes the converter skip a chain) costs a hash comparison per rung per instruction.
+  add_test(NAME lint_amd_ladders
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_ladders.py)
   # Every exported runtime and driver function is a call a profiler is told of,
   # and the driver shim takes the argument sizes the toolkit declares (CUPTI
   # reads them by those sizes).
@@ -3509,6 +3525,16 @@ add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shi
 set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
+# No shim library takes static TLS (glibc leaves ~1.6 KB for every library loaded late).
+# (Not under a sanitizer: its runtime keeps initial-exec thread-locals in every library it is linked into, so the check would report the
+# runtime, not the simulator.)
+if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize")
+  add_test(NAME lint_static_tls COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_static_tls.sh)
+  set_tests_properties(lint_static_tls PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+endif()
 
 # No file under NVIDIA's proprietary terms in the tree, and the fetch that
 # stands in for the cuDNN headers that used to be vendored.

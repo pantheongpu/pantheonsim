@@ -80,3 +80,70 @@ int tier_barrier(Wave& w, const Inst& in) {
   ++stats.barriers;
   return 2;
 }
+
+// s_endpgm: the wave is done (step() counts it as it counts any instruction, and returns false).
+int tier_endpgm(Wave& w, const Inst& in) {
+  InstructionCounts& n = stats.counts;
+  ++n.mix[static_cast<int>(in.mix)];
+  n.mops[static_cast<int>(in.mops_type)] += in.mops;
+  w.pc += in.size;
+  ++stats.instructions;
+  w.done = true;
+  return 2;
+}
+
+// A scalar memory instruction: scalar_load does the work, as step() would have it done (counted, the pc moved on first).
+int tier_smem(Wave& w, const Inst& in) {
+  InstructionCounts& n = stats.counts;
+  ++n.mix[static_cast<int>(in.mix)];
+  n.mops[static_cast<int>(in.mops_type)] += in.mops;
+  w.pc += in.size;
+  ++stats.instructions;
+  ++n.smem;
+  scalar_load(w, in);
+  return 1;
+}
+
+// v_pk_fma_f16, v_pk_add_f16, v_pk_mul_f16: the whole-wave arithmetic of packed_math.hpp, for the plain case (it says whether this is one: nothing
+// has happened if not). Op::sub is 0 for the fused multiply-add, 1 for the add, 2 for the multiply, 3 for the minimum, 4 for the maximum.
+int tier_pkf16(Wave& w, const Inst& in) {
+  if (!packed_f16_wave(w, in, in.fast.sub == 0 ? packed::Op::Fma : in.fast.sub == 1 ? packed::Op::Add : in.fast.sub == 2 ? packed::Op::Mul
+                                : in.fast.sub == 3 ? packed::Op::Min : packed::Op::Max))
+    return 0;
+  InstructionCounts& n = stats.counts;
+  ++n.mix[static_cast<int>(in.mix)];
+  n.mops[static_cast<int>(in.mops_type)] += in.mops;
+  w.pc += in.size;
+  ++stats.instructions;
+  ++n.valu;
+  return 1;
+}
+
+// v_accvgpr_read_b32 and v_accvgpr_write_b32: a register of one bank (or a scalar or a constant) into a register of the other, for the lanes EXEC
+// names. The Machine's own lane_src and write_lane (the accumulation bank grows where a write reaches past it).
+int tier_acc(Wave& w, const Inst& in) {
+  InstructionCounts& n = stats.counts;
+  ++n.mix[static_cast<int>(in.mix)];
+  n.mops[static_cast<int>(in.mops_type)] += in.mops;
+  w.pc += in.size;
+  ++stats.instructions;
+  ++n.valu;
+  const InvariantSources invariant(*this, w, in);
+  for (uint64_t m = w.exec; m; m &= m - 1) {
+    const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+    write_lane(w, in.dst[0], lane, lane_src(w, in.src[0], lane));
+  }
+  return 1;
+}
+
+// The instructions the tier hands to the Machine, by Op::mach: 3 s_barrier, 6 s_endpgm, 7 scalar memory, 8 packed halves, 10 the accumulation register moves, else a global access.
+int tier_mach(Wave& w, Group& g, const Inst& in) {
+  switch (in.fast.mach) {
+    case 3: return tier_barrier(w, in);
+    case 6: return tier_endpgm(w, in);
+    case 7: return tier_smem(w, in);
+    case 8: return tier_pkf16(w, in);
+    case 10: return tier_acc(w, in);
+    default: return tier_global(w, g, in);
+  }
+}

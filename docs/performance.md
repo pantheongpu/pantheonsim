@@ -3432,10 +3432,11 @@ namespaces; `amd_tools`: the same, and `rocminfo` against ROCm 7.2's).
   waiting and polling, is the ninth thread and takes a CPU from a work-group thread for a time slice, about 200 us a launch);
   `launch_mid` 1.28x (p < 0.001) and 0.94x (p 0.14). `gcn_pool.hpp` runs the first task on the launching thread instead, which
   gave the results above. The shared pool's wait is the same for the NVIDIA engines: worth a look there with the CPUs full.
-* **Kernarg alloc and free per launch** (about a third of a `launch`, above): not changed. A scratch segment moves every later device
+* **Kernarg alloc and free per launch** (about a third of a `launch`, above): not changed here. A scratch segment moves every later device
   address (the allocator is a bump) and the quarantine of freed ranges, which diagnostics report; making `alloc` and `free` cheaper
   while keeping both means the allocation table's nodes (`live_`, `freed_`, `freed_order_`, the last a map that is only ever popped at
-  the front), the lock's epoch and a 64 KiB zeroed chunk for 192 bytes. That is `src/core/memory.cpp` and `brlock.hpp`, not this piece.
+  the front), the lock's epoch and a 64 KiB zeroed chunk for 192 bytes. That is `src/core/memory.cpp` and `brlock.hpp`, not this piece;
+  it was done afterwards, keeping every address and diagnostic: "The allocation table and a launch's bookkeeping" at the end.
 * **The wave's 64 KiB register file** (14% of `launch` in `set_up_group`, with the ids loop that is gone): the previous round's
   conclusion stands, no bit-safe way to size or recycle it was found.
 * **Dynamic scheduling of work-groups across threads**: not done. The ranges are static and contiguous so that groups that wait on later
@@ -3801,6 +3802,75 @@ the tile path's declines. Not profiled further. The first run of this A/B had `m
 `launch_wide`/`launch_mid` at 0.68 x: the tier had been told not to run `v_lshl_add_u64` on gfx942, which the address arithmetic of those kernels uses;
 it has a handler now.
 
+## The AMD merge's cost, found and won back (branch `sn-amdmerge`)
+
+The merge of #382 into `speedup` (above) left the gfx942 and RX 6800 rows 3 to 19 % slower than `speedup` before it (`bb46caaf`), "not profiled
+further". Profiled now, with the SIGPROF sampler (`tools/bench-amd/profile/`, a `-g` build of each tree, `SIGPROF_STACK=1`), instruction counts and the
+set of instructions that run in the interpreter (`VGPU_AMD_TIER_STATS=1`) identical in both trees on every bench workload (so the tier's declines, the
+omod/clamp rules and the denormal flushes are not the cause: nothing the benchmarks run was handed back), the causes were three:
+
+* **`scalar_alu` was an if-ladder of 81 rungs again.** The interpreter's `op == "name"_op` ladders are switches on the name's hash
+  (`amd/tools/ladder-to-switch.py`); #382 edited inside the old ladders, and the merge kept its ladder form for `scalar_alu`. One rung of it
+  (`s_flbit_i32_i64`, #382's) had a `break` inside a `for`, which is outside a loop of the converter's own: the converter leaves a chain alone that has one (a switch would
+  capture the `break`), and said nothing (`chains: 0`). Every scalar instruction the tier does not do (`s_mul_hi_u32`, `s_cselect`, `s_lshr_b32` ...) walked down up
+  to 81 hash comparisons: 9 % of the RX 6800 `smem` kernel's samples (`OpName::operator==`). The rung is written without the `break`, the converter run, and
+  `lint_amd_ladders` (`tests/lint/check_ladders.py`) fails for any chain of 12 or more instruction names left as an if-ladder in `gcn_exec.cpp`
+  (on the file before this change it fails with `gcn_exec.cpp:1484: an if-ladder of 81 rungs naming 111 instructions`).
+* **`scalar_load` grew a frame.** #382 added the buffer stores and buffer atomics to it, and the plain dword load (`s_load_dword*`, the case that matters) paid
+  for the function's size. The plain load is the function now (`scalar_load`, address in `scalar_load_base`) and the rest is `scalar_load_general`, out of line.
+* **`Machine::step` was one big function.** Its frame (0x6f8 bytes, a stack protector, six callee-saved registers pushed) was paid for by every
+  instruction, the tier's included, and #382's additions (PC sampling, VSKIP) made it bigger. `step` is now the debugger check (once per machine, `debug_on`,
+  instead of a call to `debug::active()` per instruction; the session's check is `debug_check`, out of line), the fetch and the tier; the interpreter's own work is
+  `step_interp`, out of line. This is where the rows beyond the pre-merge numbers come from.
+
+Alternating A/B, `tools/bench-amd/bench.sh --build pre --build work`, 11 runs, size full, 1 thread, pinned to CPUs 20-27 of server2 (load 14 to 26: other
+agents' builds), median ratio of the rate (> 1: faster); the A/A noise on the same rows (two copies of one build) is 0.2 to 1 %. `pre` is `bb46caaf`;
+"merged" is the ratio the merge had (the table above); counters identical in every row.
+
+| workload | target | merged / pre | now / pre |
+| --- | --- | ---: | ---: |
+| valu_int | mi300x | | 1.22 |
+| valu_int | rx6800 | | 1.21 |
+| valu_f32 | mi300x | | 1.13 |
+| valu_f32 | rx6800 | | 1.05 |
+| valu_f64 | mi300x | 0.91 | 1.08 |
+| valu_f64 | rx6800 | 0.95 | 1.10 |
+| mfma | mi300x | 0.95 | 1.05 |
+| mfma_i8 | mi300x | 1.00 | 1.07 |
+| mfma_fp8 | mi300x | 0.94 | 0.89 |
+| mfma_bf16 | mi300x | 0.94 | 1.12 |
+| mfma_f64 | mi300x | 0.99 | 1.00 |
+| smfmac | mi300x | 0.89 | 0.93 |
+| mem | mi300x | 0.98 | 1.05 |
+| mem | rx6800 | 0.99 | 1.08 |
+| lds | mi300x | 0.98 | 1.09 |
+| lds | rx6800 | 0.94 | 1.13 |
+| narrow | mi300x | 0.96 | 0.98 |
+| narrow | rx6800 | 0.99 | 1.04 |
+| smem | mi300x | 0.89 | 1.22 |
+| smem | rx6800 | 0.81 | 1.27 |
+| buf | mi300x | 1.01 | 1.03 |
+| buf | rx6800 | 1.00 | 1.04 |
+| ldsx | mi300x | 0.95 | 1.12 |
+| ldsx | rx6800 | 0.95 | 1.19 |
+| flat | mi300x | 0.95 | 1.04 |
+| flat | rx6800 | 0.92 | 1.05 |
+| atomics | mi300x | 0.98 | 1.05 |
+| atomics | rx6800 | 1.01 | 1.06 |
+| divergent | mi300x | 1.00 | 1.21 |
+| divergent | rx6800 | 1.00 | 1.27 |
+| wave | mi300x | 0.97 | 1.20 |
+| wave | rx6800 | 1.00 | 1.26 |
+
+The `scalar_alu` switch alone (before the other two) took `smem` from 0.88 and 0.84 of `pre` to 0.96 and 0.98, `lds` on the RX 6800 5 % up; the other two
+pieces gave the rest. Left: `mfma_fp8` (0.89) and `smfmac` (0.93). Profiled, the matrix tile path's code is the same in both trees and the
+samples are on the same lines; the extra time is in the small-float table lookup of the decode (`matrix_elem<'e'>`: 61 samples of `pre`, 63 of the merged tree, 100 of the tree with
+the split `step`), and by direct runs the merged tree was 0.97 of `pre` on `mfma_fp8` and 0.91 on `smfmac`, the split one 0.89 and 0.93. Code that is the same
+running at different speeds with the layout of the code and the heap points at an effect of addresses (a store-to-load false dependency between the tile buffers and the
+table is a guess, not measured); it is left for the matrix tile path's rewrite, not a fix here.
+The same-bits guards pass unchanged in Release (`test_amd_gcn_same_bits`, `_packed_`, `_memory_`, `_tier_`, `test_amd_codeobject_same_bits`, `test_amd_matrix_fast`,
+`test_amd_mfma_math`, `test_amd_nan_order`, each also at `VGPU_SIMD=base`).
+
 ## A scratch access that wrapped its range check (branch `speedup7-scratch`)
 
 `scratch_at` tested `offset + bytes > scratch_per_lane` with an unsigned offset. An instruction offset that is negative (`scratch_store_b128 v9,
@@ -3896,3 +3966,165 @@ tolerance is removed again (the three tests are as they were at `224874ea`): an 
 were 79 s to fail and 900 s for the tier test under TSan). CMake sets no `TIMEOUT` for them and ctest's default here is none, so none timed out; the CI job's own time limit
 is what they eat: the proposal (not made) is a `TIMEOUT` property of 3600 on these five, and moving `test_amd_gcn_tier_same_bits` and `test_amd_matrix_fast` out of the TSan job's list
 (they run no threads of their own; `-E` in `ci.yml` line 739) if the job's limit is tight.
+
+## The allocation table and a launch's bookkeeping (branch `sn-memalloc`, from `speedup-next`)
+
+`src/core/memory.cpp`, `include/vgpu/memory.hpp`, `include/vgpu/brlock.hpp`, `src/core/memory_backing.cpp` and the kernarg write of
+`run_launch` (`amd/src/hip_api.cpp`). Both vendors' memory accesses and the AMD launch go through them. Every address, quarantine
+entry, diagnostic, count and result is as it was: `test_memalloc` holds the answers to those of the code before this change (digest
+recorded from it), and the guards of the speed work pass in every build.
+
+### What was measured first
+
+The leads of the previous round held. `tools/bench-amd/profile` (SIGPROF) on a `-g` build of the base: `buf` 27% in
+`MemoryManager::scalar_location` (4% in `__tls_get_addr`: the lookup memory is a `thread_local` of a shared library, so every access called
+for its address), `MemoryManager::free` 15% and `alloc` 6% of `launch`, `materialize` 14% (a 64 KiB chunk made and zeroed for a 192-byte
+kernarg segment), `find_ordinary_miss` and `BigReaderLock::lock` visible. The NVIDIA `launch` workload makes no allocation and spends none
+of its time here (the 13% of the earlier note was the AMD launch); NVIDIA's memory workloads reach the table through `find_ordinary`.
+A loop of `alloc(192)`, `write`, four loads, a load and a store of a long-lived allocation and `free` (one thread, pinned, minimum of 9)
+took 560 ns on the base.
+
+### What changed
+
+* **An allocation does not void what threads remember, and a free voids only what it frees.** Each thread keeps the last eight
+  allocations it found, with the table lock's epoch; every `alloc` and `free` took the lock with two epoch changes, so every kernel's
+  first accesses after a launch's kernarg `free` went back to the table. Now the lock has a quiet hold (`lock_quiet`, `ExclusiveGuard(l,
+  true)`) that leaves the epoch alone, used by `alloc` (a new entry changes no other) and by `free`, which calls `note_free(base)` first.
+  The epoch's low 16 bits count frees since its random part was drawn, and a 64-entry log of the bases freed holds the last ones:
+  `still_valid(seen, base, &now)` answers whether an entry remembered at `seen` survived the frees since (none of them its own, the
+  log not overrun, the random part unchanged), and `find_ordinary_miss` renews such an entry in place of walking the table. Every other
+  mutator still takes the full lock. A nested full hold inside a quiet one voids at once and again at its end (`bumped_`).
+* **The writer looks at the slots in use.** The lock keeps a mask of the slots some thread has counted in (set the first time, before
+  the count, so the Dekker argument of the flag and the counts holds), and a writer waits for those and not for all 64 cache lines.
+* **The lock's thread identity and the lookup memory are found from the thread pointer, not through a thread-local.** (The first
+  version kept them in initial-exec thread-locals; the core is linked into every shim library, so each library took static TLS, and
+  glibc's roughly 1.6 KB surplus ran out in a process that loads several of them: `dlopen` of libamdhip64 or the profiler failed with
+  'cannot allocate memory in static TLS block'. `lint_static_tls` now holds every shim to no static TLS.) The lock reads
+  `__builtin_thread_pointer()` for identity and hashes it into a slot; the memory of lookups sits in a 1024-slot table keyed by the thread
+  pointer (8 probes, claimed by compare-and-swap on a thread's first lookup, given back by a destructor when it ends); a thread that finds
+  no free slot, or is ending, reads an empty memory that is never written. The price against the initial-exec version is one dependent
+  load per access: about 3-6% on `buf`, `narrow` and `atomics`; the gains of the allocation work on `launch` are untouched.
+* **`load_scalar` / `store_scalar` try one inline lookup first** (`hot_location`): the thread's last allocation, no host mapping in
+  reach, a chunk that is real. Anything else (another allocation, an untouched or uniform chunk, a fault armed, a miss) takes the
+  general path, which is unchanged. `run_allocation` (`load_run`, `store_run`, which the AMD engine uses for contiguous lanes) uses the
+  lookup memory too, where it took the lock and walked the map on every call.
+* **Nodes and chunks come back.** `free` keeps the node of `live_` (with the allocation's array of chunk slots) for the next `alloc`,
+  `freed_` keeps the node of the entry the quarantine evicted for the next free, the eviction order is a deque of iterators (it was a
+  map popped only at its front), and inserts take the end as their hint (addresses are a bump). A chunk of an allocation that was
+  never written past its end goes back to `backing` with `release(chunk, dirty_bytes)`: below 4 KiB dirty it is cleared there and kept
+  (at most 64) and the next `acquire()` hands it out, counted as in use again, without a 64 KiB zero. Every write is bounds-checked
+  against the allocation's size, and a chunk made whole from a uniform chunk is a whole chunk of the allocation, so for the last
+  chunk the bytes past `size` are still zero.
+* **The kernarg segment is written, not copied through a padded vector.** A new allocation reads zero, so `run_launch` writes the
+  arguments only.
+
+### Results
+
+Alternating runs, 11 per cell, one host thread pinned to CPUs 12-13 (`--threads all`: CPUs 8-15), `flock /tmp/speedup-bench.lock`,
+load 3 to 5 on server2 (32 threads, shared). Ratio is B/A of the medians (base `90bf40da`, this branch), p is Mann-Whitney, counters
+identical in every pair (the NVIDIA `atomics` counters at 8 threads differ between two runs of the base too: a spin loop).
+
+| workload | MI300X, 1 thread | RX 6800, 1 thread | MI300X, all | RX 6800, all |
+| --- | ---: | ---: | ---: | ---: |
+| `launch` | 1.319x (p 0.000) | 1.116x (0.001) | 1.303x (0.000) | 1.212x (0.000) |
+| `launch_sync` | 1.474x | 1.151x | | |
+| `graph` | 1.228x | 1.167x | | |
+| `narrow` | 1.246x | 1.190x | | |
+| `atomics` | 1.167x | 1.145x | | |
+| `buf` | 1.139x | 1.134x | 1.148x | 1.120x |
+| `mem` | 1.056x | 1.036x | 1.059x | 1.045x |
+| `stream` | 1.028x | 1.033x | 1.055x | 1.030x |
+| `api` | 1.025x | 1.029x (same) | | |
+| `flat` | 1.019x (same) | 1.019x (same) | 1.026x | 1.025x |
+| `smem`, `ldsx`, `launch_mid`, `launch_wide`, `apicheap`, `memcpy` | same (0.98x to 1.01x) | same | same | same |
+
+NVIDIA (RTX 3060 profile, SASS and PTX, 11 runs): `atomics` 1.053x SASS and 1.063x PTX (p 0.000 and 0.002), `mem` 1.018x / 1.019x at
+one thread (p 0.000, under the 2% bar: "same") and 1.028x at 8 threads (faster), `texture`, `launch`, `shared` same. `local` SASS reads
+0.975x (p 0.000) at one thread and 0.968x at 8: it does not use the memory manager (`h_local` works in the warp's own vector), and
+the same loss appears in builds of the base to which only dead functions were added in front of `load_scalar` (90 and 160 lines of
+volatile arithmetic in `memory.cpp`: 0.975x each), and not with 12 or 40 lines, with 24, 200 or 1000 bytes allocated at start-up, or in
+the commit before `hot_location` (all 1.00x). That is a code-placement effect (not located further), so it is not dropped for a cause
+in this change. `local` on PTX: same.
+
+`alloc`+`write`+loads+`free` of the loop above: 560 ns to 179 ns (3.1x, min of 9, one thread); a load and a store in one allocation
+8.1 ns to 5.5 ns.
+
+### Tests (wired into CMake)
+
+`test_memalloc` (13 tests; also run under ASan+UBSan and TSan): a model of the bump allocator with a bounded quarantine
+(addresses, `OutOfMemory`, `DoubleFree`, `InvalidFree`, `InvalidPointer`, `UseAfterFree` and `OutOfBounds` for 33,000 random operations
+on four configurations, `used()` and `live_allocations()` after every one); the quarantine's exact bound (4096 entries: the 4097th
+oldest is "retired", the rest are double frees); the digest of 12,000 to 40,000 random operations (values, addresses, error codes and
+texts, `used()`, `resident_bytes()`; four configurations including OOM and the quarantine's bound) equal to the one the code before this
+change gives (recorded from `90bf40da` with `-DVGPU_MEMALLOC_DIGESTS_ONLY`); a freed allocation read through the thread's memory after
+0 to 140,000 other frees (the count wraps at 65,536) is a use-after-free and its neighbours stay right; six remembered allocations
+freed in random orders; four readers beside two threads that allocate and free; a new allocation reads zero, in its slack too,
+after the last one held scalar writes, a copy, a uniform fill and a write over a uniform chunk (3 page sizes, sizes from 1 byte to 200,000);
+the backing's counts and zeroing for chunks given back nearly clean; `resident_bytes()` through 300 allocate-write-free cycles; the lock:
+a quiet hold leaves the epoch, a full one changes it (nested both ways), `note_free`/`still_valid` (other bases survive, the freed one and
+more than 64 frees and a full hold and the count's wrap do not), and exclusion of 80 reader threads by quiet and full writers.
+
+Mutations (scratch copies, each run on a clean rebuild), what fails: no `note_free` in `free`: the digest, the stale-read test, the
+frees test; `still_valid` ignoring the log: the same and the epoch test; recycled node keeping its chunk pointers: aborts (double
+free); pool clearing one byte short or not at all, the last chunk's dirty bound one byte short: the digest, the zero test, the pool test;
+quarantine bound off by one: the quarantine test; the writer ignoring the slots in use or readers not announcing their slot:
+segmentation faults in the first test with readers beside a writer (the exclusion tests would fail); a full hold nested in a quiet one
+not voiding: the epoch test. Not killed, by construction: the wrap handling of the count (an unhandled carry only changes the random part,
+which `still_valid` treats as a full void) and not reusing the quarantine's node (speed only); the `seq` comparison on eviction guards a
+pointer freed twice, which the bump allocator never produces.
+
+Also passed on this tree: `test_memory`, `test_memfast`, `test_memrmw`, `test_memrmw_lockfree`, `test_worker_pool`, the guards
+(`test_amd_gcn_same_bits`, `_memory_`, `_tier_`, `_packed_`, `test_amd_codeobject_same_bits`, `test_amd_matrix_fast`, `test_amd_mfma_math`,
+`test_amd_nan_order`, `test_amd_packed_math`, `test_amd_gcn_threads`, `test_amd_hip_queue`) and `e2e_sass_tier` in Release, ASan+UBSan (-O0) and
+TSan (-O1) (the sanitizer runs build without `VGPU_WERROR`: GCC 13 rejects `atomic_thread_fence` under `-fsanitize=thread -Werror`), every
+`test_*` and the AMD end-to-end set and `e2e_sass_*` in Release (267 of 267), `bench-amd --check-counters` (36 pairs match). The NVIDIA
+`bench --check-counters` skips on this host (its nvcc builds different device code than the recorded counters); `--ab` reports identical counters.
+
+### Not done, and negative results
+
+* **`local` on SASS reads 2.5% slower** in these builds with nothing of it in this change (above): a code-placement effect.
+* **`load_scalar` of an untouched or uniform chunk, a miss and the fault-armed case** take the general path; the hot path is the real
+  chunk in the thread's last allocation, which is what the lanes of one instruction do.
+* **A flat sorted array for the quarantine** (`freed_`): inserts at the end and evictions at the front would be free, but the access
+  pattern is the program's and a free in the middle moves up to 64 KiB; the map with recycled nodes keeps the worst case.
+* **Sizing the chunk to the allocation** (a 192-byte allocation holding 192 bytes): `kChunkSize` is assumed by every read and by
+  `resident_bytes()`, `ram_bytes()` and the spill file; recycling the 64 KiB chunk keeps them.
+* **A dirty-extent flag for chunks made from uniform ones** (`wide_dirty`) was written and dropped: a uniform chunk exists only as a
+  whole chunk of an allocation (`fill`), and the last chunk of an allocation that is a whole chunk has its whole size as dirty bound, so
+  no input reaches it (the mutation that removes it cannot fail a test).
+* **`SIGPROF_STACK=1` on the AMD `launch` workload** hung twice in five runs of one `-g` build (all three threads in a futex wait) and
+  never in 350 runs without the sampler (150 `launch`, 100 `launch_mid` and 100 `launch_wide` at 8 threads) or in 16 more with it:
+  the sampler's unwinder takes the loader's lock inside a signal handler. Not a finding of the memory manager; noted so that the
+  profile is read with that in mind.
+## AMD speed gaps closed (branch `sn-amdgaps`)
+
+**Matrix tile path.** The f8f6f4 forms (`v_mfma_f32_16x16x128_f8f6f4`, `v_mfma_f32_32x32x64_f8f6f4`) and their block-scaled twins, BLGP's lane permutation
+of B, the doubles' BLGP negations and the four-block `v_mfma_f64_4x4x4_4b_f64` now take the tile path (`matrix_multiply_fast`, `matrix_small_k`, scale
+tables by block of 32 K and row). `mfma_scale_mul` (mfma_math.hpp) fixes the order of the two operands of the scale multiply, used by both paths. A bug of
+the reference path found on the way: its binary16 shortcut ignored BLGP's permutation of B. New bench-amd workloads `mfma_f8f6f4`, `mfma_scale` (target
+`mi350x`, gfx950) and `mfma_f64_4b`. A/B (9 runs, one thread, CPUs 24-31, server2 load 3 to 25): mfma_f8f6f4 7.7x, mfma_scale 8.0x, mfma_f64_4b 2.7x, p < 0.001,
+counters identical. 8-bit float operands decode each register word once (mfma_fp8 1.15x of the base).
+
+**Tier coverage** (`VGPU_AMD_TIER_STATS=1`). Over the 46 pantheon workloads (run-pantheon-workloads.sh) the interpreter ran 7.1% of the instructions (574 M of
+8.07 G: `v_xor_b32_sdwa`, `s_load_*`, `v_cndmask_b32_e64`, `s_mul_hi_u32`, `s_endpgm`, `v_pk_fma_f16`, 29 M NaN handbacks of `v_fma_f32`); rocBLAS's test
+program 12.7%. Added: SDWA integer forms, VOP3 forms of existing handlers, `v_cndmask_b32_e64`, scalar ALU leftovers (`s_mul_hi`, `s_brev`, `s_cmpk_*`,
+`s_bitcmp*`, `s_getpc`), `s_load_*`/`s_endpgm` through the Machine without step()'s frame, one-input float functions (single and double), 16-bit integer and
+half forms on the CDNA parts, class and 16-bit compares, `v_pk_fma/add/mul/min/max_f16` (routed to packed_math.hpp), `v_pk_mov_b32`, `v_div_scale/fmas/fixup`,
+`v_fma_mix*`, `v_accvgpr_read/write`. After: 0.5% of the pantheon instructions (MFMA, atomics, a few 16-bit forms), 7.1% of rocBLAS's. A/B on bench-amd:
+smem 1.14x, valu_int 1.03x, atomics 1.04x, others unchanged.
+
+**NaN-aware float path.** A NaN result of `v_add/sub/mul/fma_f32`, the double forms and `v_pk_*_f32` is worked out again in the tier by the interpreter's rule
+(`nan_add<1>`, `nan_sub<0>`, `nan_mul<1>`, `nan_fma<2>`, `nan_fma<0>` for the packed fma); one-input functions of the host's libm pass their NaN through. The 29 M
+handbacks came from the pantheon virus workloads (random data). Min/max, nearbyint, angles in turns and `v_div_fmas` still hand a NaN back. The tier test gained
+flavour 17 (halves with specials and signaling NaNs) and generated corpora `isa_corpus_tier_<gfx942|gfx90a|gfx950>.txt` (amd/tools/tier-corpus.py; tier on against
+tier off, no recorded digests); they caught bugs of this branch's own (`v_fract_f32` NaN, clamp on cvt_f32_* off the guide parts, a negated signaling half NaN in class,
+`v_div_fmas_f64` under -O1).
+
+**Packed min/max.** `v_pk_min/max_f16` run whole-wave (`packed_minmax_lanes`; `pk_fminf`/`pk_fmaxf` and the guide parts' bit rule now live in packed_math.hpp;
+unit test against the per-lane code). The dot2 NaN lanes are unchanged.
+
+### Not done, and negative results (this branch)
+
+* Trampolines for the vector memory instructions the tier has no handler for (buffer, flat, scratch, LDS, atomics) through the Machine's functions without
+  step()'s frame: no measurable gain on mem, flat, buf, ldsx (p > 0.05); dropped.
+* NaN lanes of `v_min/max_f32` (MODE.IEEE decides) and the dot2 NaN lanes stay with the interpreter.

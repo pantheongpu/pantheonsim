@@ -21,6 +21,9 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "gcn_divide.hpp"
+#include "nan_order.hpp"
+#include "packed_math.hpp"
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/simd/simd.hpp"
 
@@ -120,9 +123,9 @@ constexpr uint32_t kVgprs = 256;
   X(MAX_I, k_max_i) X(BFI, k_bfi) X(ALIGNBIT, k_alignbit) X(ALIGNBYTE, k_alignbyte) X(ADD3, k_add3) X(OR3, k_or3)  \
   X(AND_OR, k_and_or) X(XAD, k_xad) X(LSHL_OR, k_lshl_or) X(LSHL_ADD, k_lshl_add) X(ADD_LSHL, k_add_lshl)          \
   X(BCNT, k_bcnt) X(BFE_U, k_bfe_u) X(MED3_U, k_med3_u) X(MED3_I, k_med3_i) X(MIN3_U, k_min3_u)                     \
-  X(MAX3_U, k_max3_u) X(XOR3, k_xor3) X(MBCNT_LO, k_mbcnt_lo) X(MBCNT_HI, k_mbcnt_hi) X(CVT_I32_F32, k_cvt_i32_f32) X(CVT_U32_F32, k_cvt_u32_f32) X(CVT_F32_U, k_cvt_f32_u) X(CVT_F32_I, k_cvt_f32_i) X(CVT_F32_UBYTE0, k_cvt_f32_ubyte0)
-#define TIER_F32_OPS(X) X(FADD, k_fadd) X(FSUB, k_fsub) X(FSUBREV, k_fsubrev) X(FMUL, k_fmul) X(FMA, k_ffma) X(FMIN, k_fmin) X(FMAX, k_fmax) X(FRCP, k_frcp)
-#define TIER_F64_OPS(X) X(DADD, k_dadd) X(DMUL, k_dmul) X(DFMA, k_dfma)
+  X(MAX3_U, k_max3_u) X(XOR3, k_xor3) X(MBCNT_LO, k_mbcnt_lo) X(MBCNT_HI, k_mbcnt_hi) X(CVT_I32_F32, k_cvt_i32_f32) X(CVT_U32_F32, k_cvt_u32_f32) X(CVT_F32_U, k_cvt_f32_u) X(CVT_F32_I, k_cvt_f32_i) X(CVT_F32_UBYTE0, k_cvt_f32_ubyte0) X(ADD_U16, k_add_u16) X(SUB_U16, k_sub_u16) X(SUBREV_U16, k_subrev_u16) X(LSHLREV_B16, k_lshlrev_b16) X(LSHRREV_B16, k_lshrrev_b16) X(ASHRREV_I16, k_ashrrev_i16) X(MUL_LO_U16, k_mul_lo_u16) X(MIN_U16, k_min_u16) X(MAX_U16, k_max_u16) X(MIN_I16, k_min_i16) X(MAX_I16, k_max_i16) X(PACK_B32_F16, k_pack_b32_f16) X(BFE_I, k_bfe_i) X(PERM, k_perm) X(CVT_F16_F32, k_cvt_f16_f32)
+#define TIER_F32_OPS(X) X(FADD, k_fadd) X(FSUB, k_fsub) X(FSUBREV, k_fsubrev) X(FMUL, k_fmul) X(FMA, k_ffma) X(FMIN, k_fmin) X(FMAX, k_fmax) X(FRCP, k_frcp) X(FSQRT, k_fsqrt) X(FRSQ, k_frsq) X(FEXP, k_fexp) X(FLOG, k_flog) X(FFLOOR, k_ffloor) X(FCEIL, k_fceil) X(FTRUNC, k_ftrunc) X(FRNDNE, k_frndne) X(FFRACT, k_ffract) X(FSIN_R, k_fsin_r) X(FSIN_T, k_fsin_t) X(FCOS_R, k_fcos_r) X(FCOS_T, k_fcos_t) X(FLDEXP, k_fldexp) X(FCVT_F32_F16, k_fcvt_f32_f16)
+#define TIER_F64_OPS(X) X(DADD, k_dadd) X(DMUL, k_dmul) X(DFMA, k_dfma) X(DRCP, k_drcp) X(DSQRT, k_dsqrt) X(DFLOOR, k_dfloor) X(DCEIL, k_dceil) X(DTRUNC, k_dtrunc) X(DRNDNE, k_drndne)
 #define TIER_L64_OPS(X) X(MOV, l_mov) X(LSHLREV, l_lshlrev) X(LSHRREV, l_lshrrev) X(ASHRREV, l_ashrrev) X(LSHL_ADD, l_lshl_add) X(LSHL_ADD_G, l_lshl_add_g) X(CVT_F64_U, l_cvt_f64_u) X(CVT_F64_I, l_cvt_f64_i)
 
 #define TIER_ENUM(id, fn) id,
@@ -168,14 +171,24 @@ struct Tables {
   const Cmp64Fn* cmp_u64;
   const Cmp64Fn* cmp_i64;
   const Cmp64Fn* cmp_f64;
+  const CmpFn* cmp_i16;
+  const CmpFn* cmp_u16;
+  const CmpFn* cmp_f16;
+  CmpFn cmp_class32;
+  CmpFn cmp_class16;
+  CmpFn cmp_class16_neg;
 };
 const Tables& tables() {
   static const Tables base = {base_impl::base_impl_ns::kIntTab, base_impl::base_impl_ns::kF32Tab, base_impl::base_impl_ns::kF64Tab,
                               base_impl::base_impl_ns::kL64Tab, base_impl::base_impl_ns::kCmpU32, base_impl::base_impl_ns::kCmpI32,
-                              base_impl::base_impl_ns::kCmpF32, base_impl::base_impl_ns::kCmpU64, base_impl::base_impl_ns::kCmpI64, base_impl::base_impl_ns::kCmpF64};
+                              base_impl::base_impl_ns::kCmpF32, base_impl::base_impl_ns::kCmpU64, base_impl::base_impl_ns::kCmpI64, base_impl::base_impl_ns::kCmpF64,
+                              base_impl::base_impl_ns::kCmpI16, base_impl::base_impl_ns::kCmpU16, base_impl::base_impl_ns::kCmpF16, base_impl::base_impl_ns::cmp_class_f32, base_impl::base_impl_ns::cmp_class_f16<false>,
+                              base_impl::base_impl_ns::cmp_class_f16<true>};
   static const Tables avx2 = {avx2_impl::avx2_impl_ns::kIntTab, avx2_impl::avx2_impl_ns::kF32Tab, avx2_impl::avx2_impl_ns::kF64Tab,
                               avx2_impl::avx2_impl_ns::kL64Tab, avx2_impl::avx2_impl_ns::kCmpU32, avx2_impl::avx2_impl_ns::kCmpI32,
-                              avx2_impl::avx2_impl_ns::kCmpF32, avx2_impl::avx2_impl_ns::kCmpU64, avx2_impl::avx2_impl_ns::kCmpI64, avx2_impl::avx2_impl_ns::kCmpF64};
+                              avx2_impl::avx2_impl_ns::kCmpF32, avx2_impl::avx2_impl_ns::kCmpU64, avx2_impl::avx2_impl_ns::kCmpI64, avx2_impl::avx2_impl_ns::kCmpF64,
+                              avx2_impl::avx2_impl_ns::kCmpI16, avx2_impl::avx2_impl_ns::kCmpU16, avx2_impl::avx2_impl_ns::kCmpF16, avx2_impl::avx2_impl_ns::cmp_class_f32, avx2_impl::avx2_impl_ns::cmp_class_f16<false>,
+                              avx2_impl::avx2_impl_ns::cmp_class_f16<true>};
   return simd::enabled() && simd::level() == simd::Level::Avx2 ? avx2 : base;
 }
 
@@ -217,8 +230,8 @@ inline void fill(uint32_t* t, uint32_t v, unsigned n) {
   for (unsigned i = 0; i < n; ++i) t[i] = v;
 }
 inline uint32_t mods32(const Src& s, uint32_t v) {
-  if (s.abs) v &= 0x7FFFFFFFu;
-  if (s.neg) v ^= 0x80000000u;
+  if (s.abs) v &= s.h16 ? ~0x8000u : 0x7FFFFFFFu;
+  if (s.neg) v ^= s.h16 ? 0x8000u : 0x80000000u;
   return v;
 }
 // A 32-bit lane source as a row: the register's own, or a copy in `t` where a modifier changes it or the value is the same in every lane.
@@ -227,7 +240,7 @@ inline const uint32_t* load32(const Src& s, Regs& R, uint32_t* t, unsigned n) {
     case kVgpr: {
       const uint32_t* p = R.vgpr[s.index];
       if (!(s.neg | s.abs)) return p;
-      const uint32_t keep = s.abs ? 0x7FFFFFFFu : ~0u, flip = s.neg ? 0x80000000u : 0u;
+      const uint32_t keep = s.abs ? (s.h16 ? ~0x8000u : 0x7FFFFFFFu) : ~0u, flip = s.neg ? (s.h16 ? 0x8000u : 0x80000000u) : 0u;
       for (unsigned i = 0; i < n; ++i) t[i] = (p[i] & keep) ^ flip;
       return t;
     }
@@ -329,6 +342,41 @@ inline bool nan64(const uint64_t* r, uint64_t ex, unsigned n) {
   }
   return any != 0;
 }
+// The NaN rules of the interpreter's instructions (the Order of each is the one its source line uses, which reproduces the recorded
+// digests): codes for Op::nan above 1.
+enum NanRule : uint8_t { kNanHandBack = 0, kNanPass = 1, kNanAdd, kNanSub, kNanSubRev, kNanMul, kNanFma, kNanPkFma };
+template <typename T>
+inline T nan_rule(uint8_t rule, T x, T y, T z) {
+  switch (rule) {
+    case kNanAdd: return vgpu::amd::nan_add<1>(x, y);
+    case kNanSub: return vgpu::amd::nan_sub<0>(x, y);
+    case kNanSubRev: return vgpu::amd::nan_sub<0>(y, x);
+    case kNanMul: return vgpu::amd::nan_mul<1>(x, y);
+    case kNanFma: return vgpu::amd::nan_fma<2>(x, y, z);
+    default: return vgpu::amd::nan_fma<0>(x, y, z);   // kNanPkFma
+  }
+}
+// The lanes of a binary32 result that are NaNs (among EXEC's), done again by the interpreter's rule from the operands the kernel had.
+inline void fix_nan32(uint8_t rule, uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex) {
+  for (uint64_t m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+    if ((r[l] & 0x7FFFFFFFu) <= 0x7F800000u) continue;
+    float x, y, z, v;
+    std::memcpy(&x, &a[l], 4), std::memcpy(&y, &b[l], 4), std::memcpy(&z, &c[l], 4);
+    v = nan_rule<float>(rule, x, y, z);
+    std::memcpy(&r[l], &v, 4);
+  }
+}
+inline void fix_nan64(uint8_t rule, uint64_t* r, const uint64_t* a, const uint64_t* b, const uint64_t* c, uint64_t ex) {
+  for (uint64_t m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+    if ((r[l] & 0x7FFFFFFFFFFFFFFFull) <= 0x7FF0000000000000ull) continue;
+    double x, y, z, v;
+    std::memcpy(&x, &a[l], 8), std::memcpy(&y, &b[l], 8), std::memcpy(&z, &c[l], 8);
+    v = nan_rule<double>(rule, x, y, z);
+    std::memcpy(&r[l], &v, 8);
+  }
+}
 // A float result as write_float / write_double leave it: the output multiplier, then the clamp.
 inline void post32(uint32_t* r, uint64_t ex, unsigned omod, bool clamp) {
   for (uint64_t m = ex; m; m &= m - 1) {
@@ -371,6 +419,55 @@ int h_int(const Op& o, Regs& R) {
   return true;
 }
 
+// ---- SDWA (an integer operation on parts of its registers)
+// The part of a 32-bit value an SDWA source names, with or without its sign (the interpreter's selected()).
+inline uint32_t sdwa_pick(uint32_t v, uint8_t sel, bool sext) {
+  if (sel <= 3) {
+    const uint8_t byte = static_cast<uint8_t>(v >> (8 * sel));
+    return sext ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(byte))) : byte;
+  }
+  if (sel <= 5) {
+    const uint16_t half = static_cast<uint16_t>(sel == 4 ? v : v >> 16);
+    return sext ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(half))) : half;
+  }
+  return v;
+}
+// A source row as load32 gives it, cut to its part (in place in `t`, which a scalar source already is).
+inline const uint32_t* load32_sel(const Src& s, Regs& R, uint32_t* t, unsigned n) {
+  const uint32_t* p = load32(s, R, t, n);
+  if (s.sel == 6) return p;
+  for (unsigned i = 0; i < n; ++i) t[i] = sdwa_pick(p[i], s.sel, s.sext);
+  return t;
+}
+// The result's part of the destination, and the rest of it as dst_unused says (the interpreter's write_lane with a narrowed destination):
+// zero for 0, the part's sign for 1, what the register held for 2.
+inline uint32_t sdwa_dst(uint32_t v, uint32_t was, uint8_t sel, uint8_t unused) {
+  const uint32_t mask = sel <= 3 ? 0xFFu << (8 * sel) : sel == 4 ? 0xFFFFu : sel == 5 ? 0xFFFF0000u : ~0u;
+  v = sel <= 3 ? (v & 0xFFu) << (8 * sel) : sel == 4 ? v & 0xFFFFu : sel == 5 ? (v & 0xFFFFu) << 16 : v;
+  if (unused == 1 && sel < 6) {
+    const uint32_t top = mask & ~(mask >> 1);
+    if (v & top) v |= ~(mask | (top - 1));
+  }
+  if (unused == 2) v = (was & ~mask) | (v & mask);
+  return v;
+}
+int h_int_sdwa(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t t0[64], t1[64], t2[64], r[64];
+  const uint32_t* a = load32_sel(o.src[0], R, t0, n);
+  const uint32_t* b = o.src[1].kind ? load32_sel(o.src[1], R, t1, n) : a;
+  const uint32_t* c = o.src[2].kind ? load32_sel(o.src[2], R, t2, n) : a;
+  reinterpret_cast<K3>(o.kern)(r, a, b, c, n);
+  uint32_t* d = R.vgpr[o.dst.index];
+  for (uint64_t m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+    d[l] = sdwa_dst(r[l], d[l], o.dsel, o.dunused);
+  }
+  return true;
+}
+
 // A binary32 operation: the result is thrown away if any active lane is a NaN.
 int h_f32(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
@@ -389,7 +486,10 @@ int h_f32(const Op& o, Regs& R) {
     if (any) return false;
   }
   reinterpret_cast<K3>(o.kern)(r, a, b, c, n);
-  if (nan32(r, ex, n)) return false;
+  if (nan32(r, ex, n)) {
+    if (o.nan == kNanHandBack) return false;
+    if (o.nan != kNanPass) fix_nan32(o.nan, r, a, b, c, ex);
+  }
   if (o.omod | o.clamp) post32(r, ex, o.omod, o.clamp);
   uint32_t* d = R.vgpr[o.dst.index];
   if (full(ex, n)) std::memcpy(d, r, n * 4);
@@ -407,7 +507,10 @@ int h_f64(const Op& o, Regs& R) {
   if (o.src[1].kind) load64(o.src[1], R, b, n);
   if (o.src[2].kind) load64(o.src[2], R, c, n);
   reinterpret_cast<K64>(o.kern)(r, a, b, c, n);
-  if (nan64(r, ex, n)) return false;
+  if (nan64(r, ex, n)) {
+    if (o.nan == kNanHandBack) return false;
+    if (o.nan != kNanPass) fix_nan64(o.nan, r, a, b, c, ex);
+  }
   if (o.omod | o.clamp) post64(r, ex, o.omod, o.clamp);
   uint32_t* lo = R.vgpr[o.dst.index];
   uint32_t* hi = R.vgpr[o.dst.index + 1];
@@ -477,7 +580,10 @@ int h_pk(const Op& o, Regs& R) {
   const K3 kern = reinterpret_cast<K3>(o.kern);
   kern(r[0], p[0][0], p[0][1], p[0][2], n);
   kern(r[1], p[1][0], p[1][1], p[1][2], n);
-  if (nan32(r[0], ex, n) || nan32(r[1], ex, n)) return false;
+  if (nan32(r[0], ex, n) || nan32(r[1], ex, n)) {
+    if (o.nan == kNanHandBack) return false;
+    for (int h = 0; h < 2; ++h) fix_nan32(o.nan, r[h], p[h][0], p[h][1], p[h][2], ex);
+  }
   if (o.clamp) post32(r[0], ex, 0, true), post32(r[1], ex, 0, true);
   uint32_t* d0 = R.vgpr[o.dst.index];
   uint32_t* d1 = R.vgpr[o.dst.index + 1];
@@ -487,6 +593,141 @@ int h_pk(const Op& o, Regs& R) {
   } else {
     merge(d0, r[0], ex, n);
     merge(d1, r[1], ex, n);
+  }
+  return true;
+}
+
+// v_pk_mov_b32: the low register of the destination pair from the first source, the high from the second, each the register of its pair
+// op_sel names (`sub` bits 0 and 1). Both are read before either is written.
+int h_pkmov(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t w[2][64];
+  for (int k = 0; k < 2; ++k) {
+    const Src& s = o.src[k];
+    const unsigned top = o.sub >> k & 1;
+    if (s.kind == kVgpr) {
+      std::memcpy(w[k], R.vgpr[s.index + top], n * 4);
+    } else {
+      const uint32_t v = s.kind == kSgpr ? (s.wide ? R.sgpr[s.index + top] : top ? 0u : R.sgpr[s.index]) : s.value;
+      fill(w[k], v, n);
+    }
+  }
+  uint32_t* d0 = R.vgpr[o.dst.index];
+  uint32_t* d1 = R.vgpr[o.dst.index + 1];
+  if (full(ex, n)) {
+    std::memcpy(d0, w[0], n * 4);
+    std::memcpy(d1, w[1], n * 4);
+  } else {
+    merge(d0, w[0], ex, n);
+    merge(d1, w[1], ex, n);
+  }
+  return true;
+}
+
+// v_div_scale_*, v_div_fmas_* and v_div_fixup_* (gcn_divide.hpp): per lane, the interpreter's divide_step. `sub`: 0 scale, 1 fmas, 2 fixup,
+// plus 4 for the double forms. The scale writes a mask of the lanes whose condition holds to its scalar destination, whatever EXEC says;
+// fmas reads VCC. The sources carry the float modifiers; the result is written whole (no output modifier or clamp).
+int h_div(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  const unsigned what = o.sub & 3;
+  const bool dbl = o.sub & 4;
+  uint64_t cond = 0;
+  if (ex) {
+    const unsigned n = lanes_of(ex);
+    if (dbl) {
+      alignas(32) uint64_t a[64], b[64], c[64], r[64];
+      load64(o.src[0], R, a, n), load64(o.src[1], R, b, n), load64(o.src[2], R, c, n);
+      for (uint64_t m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+        double x, y, z, v;
+        std::memcpy(&x, &a[l], 8), std::memcpy(&y, &b[l], 8), std::memcpy(&z, &c[l], 8);
+        if (what == 0) {
+          const auto res = gcn::divide::div_scale(x, y, z);
+          v = res.value;
+          if (res.vcc) cond |= uint64_t{1} << l;
+        } else if (what == 1) {
+          v = gcn::divide::div_fmas(x, y, z, (*R.vcc >> l) & 1);
+          if (v != v) return false;   // (a fused multiply-add with NaNs: which payload comes through is the compiler's choice; the interpreter's)
+        } else {
+          v = gcn::divide::div_fixup(x, y, z);
+        }
+        std::memcpy(&r[l], &v, 8);
+      }
+      uint32_t* lo = R.vgpr[o.dst.index];
+      uint32_t* hi = R.vgpr[o.dst.index + 1];
+      for (uint64_t m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+        lo[l] = static_cast<uint32_t>(r[l]), hi[l] = static_cast<uint32_t>(r[l] >> 32);
+      }
+    } else {
+      alignas(32) uint32_t t0[64], t1[64], t2[64];
+      const uint32_t* a = load32(o.src[0], R, t0, n);
+      const uint32_t* b = load32(o.src[1], R, t1, n);
+      const uint32_t* c = load32(o.src[2], R, t2, n);
+      uint32_t* d = R.vgpr[o.dst.index];
+      alignas(32) uint32_t rr[64];
+      for (uint64_t m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+        float x, y, z, v;
+        std::memcpy(&x, &a[l], 4), std::memcpy(&y, &b[l], 4), std::memcpy(&z, &c[l], 4);
+        if (what == 0) {
+          const auto res = gcn::divide::div_scale(x, y, z);
+          v = res.value;
+          if (res.vcc) cond |= uint64_t{1} << l;
+        } else if (what == 1) {
+          v = gcn::divide::div_fmas(x, y, z, (*R.vcc >> l) & 1);
+          if (v != v) return false;   // (see above)
+        } else {
+          v = gcn::divide::div_fixup(x, y, z);
+        }
+        std::memcpy(&rr[l], &v, 4);
+      }
+      for (uint64_t m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+        d[l] = rr[l];
+      }
+    }
+  }
+  if (what == 0 && o.dst2.kind) wr(R, o.dst2, cond);
+  return true;
+}
+
+// v_fma_mix_f32 / v_fma_mixlo_f16 / v_fma_mixhi_f16: each source is a float, or -- where its op_sel_hi bit is set -- a half, the one op_sel names;
+// a fused multiply-add of floats (nan_order.hpp's rule for NaNs), clamped if asked, then the whole of the destination (mix), or rounded to a
+// half into its low (mixlo) or high (mixhi) half with the other half kept. `sub`: bit k a half source, bit 3 + k its high half, bit 6 + k negated,
+// bit 9 + k absolute value, bits 12-13 the kind (0 mix, 1 mixlo, 2 mixhi).
+int h_fma_mix(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t t[3][64];
+  const uint32_t* p[3];
+  for (int k = 0; k < 3; ++k) p[k] = load32(o.src[k], R, t[k], n);
+  const unsigned kind = o.sub >> 12 & 3;
+  uint32_t* d = R.vgpr[o.dst.index];
+  for (uint64_t m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+    float v[3];
+    for (int k = 0; k < 3; ++k) {
+      float f;
+      if (o.sub >> k & 1) {
+        f = vgpu::amd::packed::half_to_float(static_cast<uint16_t>(p[k][l] >> ((o.sub >> (3 + k) & 1) ? 16 : 0)));
+      } else {
+        std::memcpy(&f, &p[k][l], 4);
+      }
+      if (o.sub >> (9 + k) & 1) f = std::fabs(f);
+      v[k] = (o.sub >> (6 + k) & 1) ? -f : f;
+    }
+    float r = vgpu::amd::nan_fma<2>(v[0], v[1], v[2]);
+    if (o.clamp) r = std::isnan(r) || r <= 0.0f ? 0.0f : r > 1.0f ? 1.0f : r;
+    if (kind == 0) {
+      std::memcpy(&d[l], &r, 4);
+    } else {
+      const uint32_t bits = vgpu::amd::packed::float_to_half(r);
+      d[l] = kind == 1 ? (d[l] & 0xFFFF0000u) | bits : (d[l] & 0x0000FFFFu) | bits << 16;
+    }
   }
   return true;
 }
@@ -829,6 +1070,92 @@ TIER_S2(s_bfe_u32, {
   TIER_SCC(v != 0);
 })
 
+TIER_S2(s_mul_hi_u32, v = static_cast<uint32_t>((static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32))
+TIER_S2(s_mul_hi_i32, v = static_cast<uint32_t>(static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(a)) * static_cast<int32_t>(b)) >> 32))
+TIER_S2(s_brev_b32, {
+  const uint32_t x = static_cast<uint32_t>(a);
+  uint32_t r = 0;
+  for (uint32_t k = 0; k < 32; ++k) r |= ((x >> k) & 1) << (31 - k);
+  v = r;
+})
+TIER_S2(s_brev_b64, {
+  uint64_t r = 0;
+  for (uint32_t k = 0; k < 64; ++k) r |= ((a >> k) & 1) << (63 - k);
+  v = r;
+})
+TIER_S2(s_bcnt0_b32, { v = 32 - __builtin_popcount(static_cast<uint32_t>(a)); TIER_SCC(v != 0); })
+TIER_S2(s_bcnt0_b64, { v = 64 - __builtin_popcountll(a); TIER_SCC(v != 0); })
+TIER_S2(s_ff0_b32, { const uint64_t clear = ~static_cast<uint32_t>(a) & 0xFFFFFFFFull; v = clear ? static_cast<uint32_t>(__builtin_ctzll(clear)) : 0xFFFFFFFFu; })
+TIER_S2(s_ff0_b64, { const uint64_t clear = ~a; v = clear ? static_cast<uint32_t>(__builtin_ctzll(clear)) : 0xFFFFFFFFu; })
+TIER_S2(s_sext_i8, v = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(a))))
+TIER_S2(s_sext_i16, v = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(a))))
+TIER_S2(s_pack_ll, v = (static_cast<uint32_t>(a) & 0xFFFFu) | (static_cast<uint32_t>(b) & 0xFFFFu) << 16)
+TIER_S2(s_pack_lh, v = (static_cast<uint32_t>(a) & 0xFFFFu) | (static_cast<uint32_t>(b) & 0xFFFF0000u))
+TIER_S2(s_pack_hh, v = static_cast<uint32_t>(a) >> 16 | (static_cast<uint32_t>(b) & 0xFFFF0000u))
+TIER_S2(s_pack_hl, v = static_cast<uint32_t>(a) >> 16 | static_cast<uint32_t>(b) << 16)
+TIER_S2(s_bfm_b32, v = ((1u << (a & 31)) - 1) << (b & 31))
+// (conditional moves: the destination is written only where SCC is set)
+int s_cmov(const Op& o, Regs& R) {
+  const uint64_t a = rd(R, o.src[0]);
+  if (*R.scc) wr(R, o.dst, a);
+  return true;
+}
+int s_getpc(const Op& o, Regs& R) {
+  wr(R, o.dst, *R.pc);   // (the address of the instruction after this one: the pc has moved on already)
+  return true;
+}
+// SOPK: the sign-extended 16-bit constant is `off0`. sub 0: s_addk_i32, 1: s_mulk_i32, 2: s_cmovk_i32 (the destination is the source too).
+int s_sopk(const Op& o, Regs& R) {
+  const int32_t k = o.off0;
+  if (o.sub == 0) {
+    const int32_t x = static_cast<int32_t>(rd(R, o.src[0]));
+    const int32_t sum = static_cast<int32_t>(static_cast<uint32_t>(x) + static_cast<uint32_t>(k));
+    wr(R, o.dst, static_cast<uint32_t>(sum));
+    *R.scc = ((x >= 0) == (k >= 0)) && ((sum >= 0) != (x >= 0));
+  } else if (o.sub == 1) {
+    wr(R, o.dst, static_cast<uint32_t>(rd(R, o.src[0]) * static_cast<uint32_t>(k)));
+  } else if (*R.scc) {
+    wr(R, o.dst, static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(k))));
+  }
+  return true;
+}
+// s_cmpk_*: the register against the constant, signed (sub 0 to 5: eq, lg, gt, ge, lt, le) or, for sub 6 to 11, unsigned with the constant's low 16 bits.
+int s_cmpk(const Op& o, Regs& R) {
+  const uint32_t x = static_cast<uint32_t>(rd(R, o.src[0]));
+  const bool is_unsigned = o.sub >= 6;
+  const uint32_t k = is_unsigned ? static_cast<uint16_t>(o.off0) : static_cast<uint32_t>(o.off0);
+  bool r;
+  if (is_unsigned) {
+    switch (o.sub - 6) {
+      case 0: r = x == k; break;
+      case 1: r = x != k; break;
+      case 2: r = x > k; break;
+      case 3: r = x >= k; break;
+      case 4: r = x < k; break;
+      default: r = x <= k; break;
+    }
+  } else {
+    const int32_t sx = static_cast<int32_t>(x), sk = static_cast<int32_t>(k);
+    switch (o.sub) {
+      case 0: r = sx == sk; break;
+      case 1: r = sx != sk; break;
+      case 2: r = sx > sk; break;
+      case 3: r = sx >= sk; break;
+      case 4: r = sx < sk; break;
+      default: r = sx <= sk; break;
+    }
+  }
+  *R.scc = r;
+  return true;
+}
+// s_bitcmp0/1_b32/b64 (SOPC): SCC is the bit, or its complement. sub bit 0: the 64-bit form, bit 1: tests for a set bit.
+int s_bitcmp(const Op& o, Regs& R) {
+  const uint64_t a = rd(R, o.src[0]), b = rd(R, o.src[1]);
+  const uint64_t bit = (a >> (b & (o.sub & 1 ? 63 : 31))) & 1;
+  *R.scc = (o.sub & 2) ? bit == 1 : bit == 0;
+  return true;
+}
+
 // SOPC: only SCC changes. `sub` is the test and the type.
 enum ScalarCmp : uint32_t {
   kEqU32, kLgU32, kLtU32, kLeU32, kGtU32, kGeU32, kEqI32, kLgI32, kLtI32, kLeI32, kGtI32, kGeI32, kEqU64, kLgU64
@@ -906,7 +1233,7 @@ int b_vccnz(const Op&, Regs& R) { if (R.lanes == 32 ? static_cast<uint32_t>(*R.v
 
 // ---- Classification
 
-enum class Cat { None, Carry, Lane, Global, Ds, Pk, Int, F32, F64, L64, Mad64, Cmp, Cndmask, Readfirstlane, S2, ScalarCmp, Saveexec, Branch };
+enum class Cat { None, Carry, Lane, Global, Ds, Pk, Int, F32, F64, L64, Mad64, Cmp, Cndmask, Readfirstlane, S2, ScalarCmp, Saveexec, Branch, Sopk, Cmpk, Bitcmp, Endpgm, PkF16, PkMov, Div, FmaMix, Acc };
 
 struct Entry {
   Cat cat = Cat::None;
@@ -923,6 +1250,12 @@ constexpr uint32_t kConstMid = 4;    // fmamk: source 1 is the instruction's own
 constexpr uint32_t kConstLast = 8;   // fmaak: source 2 is the instruction's own constant
 constexpr uint32_t kFloatSrc = 32;   // an integer result from a float source: the source's modifiers apply
 constexpr uint32_t kIgnoreMods = 16;
+constexpr uint32_t kTrigTurns = 128;  // v_sin_f32, v_cos_f32: the kernel after the listed one on the architectures whose guides count the angle in whole turns (gfx942, gfx950)
+constexpr uint32_t kIntSrc1 = 256;    // v_ldexp_f32: the second source is an integer (its bits, no float modifiers)
+constexpr uint32_t kCdnaOnly = 512;   // 16-bit forms: only the CDNA parts (gfx90a, gfx942, gfx950), whose 16-bit results fill the low half of the register
+constexpr uint32_t kNoOmod = 1024;    // the instruction's output modifier means something the kernel does not do
+constexpr uint32_t kFloatOut = 4096;  // an integer kernel with a float result: the instruction's output modifier and clamp mean something the kernel does not do
+constexpr uint32_t kRawSrc = 2048;    // the source is not a float of 32 bits (a half): float modifiers on it would flip the wrong bit
 constexpr uint32_t kMinMax = 64;     // (v_min_f32, v_max_f32: opposite zeros go to the interpreter) // the interpreter ignores omod and clamp on this one
 
 const std::unordered_map<std::string_view, Entry>& table() {
@@ -975,10 +1308,65 @@ const std::unordered_map<std::string_view, Entry>& table() {
     I("v_mbcnt_hi_u32_b32", MBCNT_HI, 2);
     I("v_cvt_i32_f32_e32", CVT_I32_F32, 1, kFloatSrc);
     I("v_cvt_u32_f32_e32", CVT_U32_F32, 1, kFloatSrc);
-    I("v_cvt_f32_u32_e32", CVT_F32_U, 1);
-    I("v_cvt_f32_i32_e32", CVT_F32_I, 1);
-    I("v_cvt_f32_ubyte0_e32", CVT_F32_UBYTE0, 1);
+    I("v_cvt_f32_u32_e32", CVT_F32_U, 1, kFloatOut);
+    I("v_cvt_f32_i32_e32", CVT_F32_I, 1, kFloatOut);
+    I("v_cvt_f32_ubyte0_e32", CVT_F32_UBYTE0, 1, kFloatOut);
+    I("v_add_u16_e32", ADD_U16, 2, kNoClamp | kCdnaOnly);
+    I("v_sub_u16_e32", SUB_U16, 2, kNoClamp | kCdnaOnly);
+    I("v_subrev_u16_e32", SUBREV_U16, 2, kNoClamp | kCdnaOnly);
+    I("v_lshlrev_b16_e32", LSHLREV_B16, 2, kCdnaOnly);
+    I("v_lshrrev_b16_e32", LSHRREV_B16, 2, kCdnaOnly);
+    I("v_ashrrev_i16_e32", ASHRREV_I16, 2, kCdnaOnly);
+    I("v_mul_lo_u16_e32", MUL_LO_U16, 2, kCdnaOnly);
+    I("v_min_u16_e32", MIN_U16, 2, kCdnaOnly);
+    I("v_max_u16_e32", MAX_U16, 2, kCdnaOnly);
+    I("v_min_i16_e32", MIN_I16, 2, kCdnaOnly);
+    I("v_max_i16_e32", MAX_I16, 2, kCdnaOnly);
+    I("v_pack_b32_f16", PACK_B32_F16, 2, kCdnaOnly);
+    I("v_bfe_i32", BFE_I, 3);
+    I("v_perm_b32", PERM, 3);
+    I("v_cvt_f16_f32_e32", CVT_F16_F32, 1, kFloatSrc | kNoClamp | kNoOmod | kCdnaOnly);
+    // The same operations in their VOP3 form (the sources may be any of the operands, the modifiers and the constants the short form's are).
+    I("v_mov_b32_e64", MOV, 1);
+    I("v_not_b32_e64", NOT, 1);
+    I("v_subrev_u32_e64", SUBREV, 2);
+    I("v_mul_u32_u24_e64", MUL_U24, 2);
+    I("v_mul_i32_i24_e64", MUL_I24, 2);
+    I("v_and_b32_e64", AND, 2);
+    I("v_xor_b32_e64", XOR, 2);
+    I("v_lshlrev_b32_e64", LSHLREV, 2);
+    I("v_lshrrev_b32_e64", LSHRREV, 2);
+    I("v_ashrrev_i32_e64", ASHRREV, 2);
+    I("v_min_u32_e64", MIN_U, 2);
+    I("v_max_u32_e64", MAX_U, 2);
+    I("v_min_i32_e64", MIN_I, 2);
+    I("v_max_i32_e64", MAX_I, 2);
+    I("v_cvt_i32_f32_e64", CVT_I32_F32, 1, kFloatSrc);
+    I("v_cvt_u32_f32_e64", CVT_U32_F32, 1, kFloatSrc);
+    I("v_cvt_f32_u32_e64", CVT_F32_U, 1, kFloatOut);
+    I("v_cvt_f32_i32_e64", CVT_F32_I, 1, kFloatOut);
+    I("v_cvt_f32_ubyte0_e64", CVT_F32_UBYTE0, 1, kFloatOut);
     const auto F = [&](std::string_view n, int k, int arity, uint32_t fl = 0) { m[n] = {Cat::F32, k, arity, fl}; };
+    F("v_subrev_f32_e64", FSUBREV, 2);
+    F("v_mul_f32_e64", FMUL, 2);
+    F("v_min_f32_e64", FMIN, 2, kMinMax);
+    F("v_rcp_f32_e64", FRCP, 1);
+    F("v_rcp_iflag_f32_e32", FRCP, 1);
+    F("v_sqrt_f32_e32", FSQRT, 1);
+    F("v_rsq_f32_e32", FRSQ, 1);
+    F("v_exp_f32_e32", FEXP, 1);
+    F("v_log_f32_e32", FLOG, 1);
+    F("v_floor_f32_e32", FFLOOR, 1);
+    F("v_ceil_f32_e32", FCEIL, 1);
+    F("v_trunc_f32_e32", FTRUNC, 1);
+    F("v_rndne_f32_e32", FRNDNE, 1);
+    F("v_fract_f32_e32", FFRACT, 1);
+    F("v_sin_f32_e32", FSIN_R, 1, kTrigTurns);
+    F("v_cos_f32_e32", FCOS_R, 1, kTrigTurns);
+    F("v_ldexp_f32", FLDEXP, 2, kIntSrc1);
+    F("v_cvt_f32_f16_e32", FCVT_F32_F16, 1, kRawSrc | kCdnaOnly);
+    F("v_rcp_iflag_f32_e64", FRCP, 1);
+    m["v_cndmask_b32_e64"] = {Cat::Cndmask, 0, 3};
     F("v_add_f32_e32", FADD, 2);
     F("v_add_f32_e64", FADD, 2);
     F("v_sub_f32_e32", FSUB, 2);
@@ -999,6 +1387,12 @@ const std::unordered_map<std::string_view, Entry>& table() {
     D("v_mul_f64", DMUL, 2);
     D("v_fma_f64", DFMA, 3);
     D("v_fmac_f64_e32", DFMA, 2, kFmac);
+    D("v_rcp_f64_e32", DRCP, 1);
+    D("v_sqrt_f64_e32", DSQRT, 1);
+    D("v_floor_f64_e32", DFLOOR, 1);
+    D("v_ceil_f64_e32", DCEIL, 1);
+    D("v_trunc_f64_e32", DTRUNC, 1);
+    D("v_rndne_f64_e32", DRNDNE, 1);
     const auto L = [&](std::string_view n, int k, int arity, uint32_t sub) { m[n] = {Cat::L64, k, arity, 0, nullptr, sub}; };
     L("v_mov_b64_e32", L_MOV, 1, 1);
     L("v_lshlrev_b64", L_LSHLREV, 2, 2);
@@ -1093,6 +1487,52 @@ const std::unordered_map<std::string_view, Entry>& table() {
     S("s_lshl4_add_u32", s_lshl4_add_u32, 2);
     S("s_abs_i32", s_abs_i32, 1);
     S("s_bfe_u32", s_bfe_u32, 2);
+    S("s_mul_hi_u32", s_mul_hi_u32, 2);
+    S("s_mul_hi_i32", s_mul_hi_i32, 2);
+    S("s_brev_b32", s_brev_b32, 1);
+    S("s_brev_b64", s_brev_b64, 1);
+    S("s_bcnt0_i32_b32", s_bcnt0_b32, 1);
+    S("s_bcnt0_i32_b64", s_bcnt0_b64, 1);
+    S("s_ff0_i32_b32", s_ff0_b32, 1);
+    S("s_ff0_i32_b64", s_ff0_b64, 1);
+    S("s_sext_i32_i8", s_sext_i8, 1);
+    S("s_sext_i32_i16", s_sext_i16, 1);
+    S("s_pack_ll_b32_b16", s_pack_ll, 2);
+    S("s_pack_lh_b32_b16", s_pack_lh, 2);
+    S("s_pack_hh_b32_b16", s_pack_hh, 2);
+    S("s_pack_hl_b32_b16", s_pack_hl, 2);
+    S("s_bfm_b32", s_bfm_b32, 2);
+    S("s_cmov_b32", s_cmov, 1);
+    S("s_cmov_b64", s_cmov, 1);
+    S("s_getpc_b64", s_getpc, 0);
+    m["s_addk_i32"] = {Cat::Sopk, 0, 0};
+    m["s_mulk_i32"] = {Cat::Sopk, 1, 0};
+    m["s_cmovk_i32"] = {Cat::Sopk, 2, 0};
+    for (const char* t : {"s_cmpk_eq_i32", "s_cmpk_lg_i32", "s_cmpk_gt_i32", "s_cmpk_ge_i32", "s_cmpk_lt_i32", "s_cmpk_le_i32",
+                          "s_cmpk_eq_u32", "s_cmpk_lg_u32", "s_cmpk_gt_u32", "s_cmpk_ge_u32", "s_cmpk_lt_u32", "s_cmpk_le_u32"})
+      m[t] = {Cat::Cmpk, 0, 0};
+    m["s_bitcmp0_b32"] = {Cat::Bitcmp, 0, 2};
+    m["s_bitcmp1_b32"] = {Cat::Bitcmp, 2, 2};
+    m["s_bitcmp0_b64"] = {Cat::Bitcmp, 1, 2};
+    m["s_bitcmp1_b64"] = {Cat::Bitcmp, 3, 2};
+    m["s_endpgm"] = {Cat::Endpgm, 0, 0};
+    m["v_pk_fma_f16"] = {Cat::PkF16, 0, 3};
+    m["v_pk_add_f16"] = {Cat::PkF16, 1, 2};
+    m["v_pk_mul_f16"] = {Cat::PkF16, 2, 2};
+    m["v_pk_min_f16"] = {Cat::PkF16, 3, 2};
+    m["v_pk_max_f16"] = {Cat::PkF16, 4, 2};
+    m["v_pk_mov_b32"] = {Cat::PkMov, 0, 2};
+    m["v_div_scale_f32"] = {Cat::Div, 0, 3};
+    m["v_div_fmas_f32"] = {Cat::Div, 1, 3};
+    m["v_div_fixup_f32"] = {Cat::Div, 2, 3};
+    m["v_div_scale_f64"] = {Cat::Div, 4, 3};
+    m["v_div_fmas_f64"] = {Cat::Div, 5, 3};
+    m["v_div_fixup_f64"] = {Cat::Div, 6, 3};
+    m["v_accvgpr_read_b32"] = {Cat::Acc, 0, 1};
+    m["v_accvgpr_write_b32"] = {Cat::Acc, 0, 1};
+    m["v_fma_mix_f32"] = {Cat::FmaMix, 0, 3};
+    m["v_fma_mixlo_f16"] = {Cat::FmaMix, 1, 3};
+    m["v_fma_mixhi_f16"] = {Cat::FmaMix, 2, 3};
     const auto C = [&](std::string_view n, ScalarCmp k) { m[n] = {Cat::ScalarCmp, static_cast<int>(k), 2}; };
     C("s_cmp_eq_u32", kEqU32);
     C("s_cmp_lg_u32", kLgU32);
@@ -1184,6 +1624,23 @@ bool lane_src32(const Operand& o, Src& s, bool float_mods) {
   if (float_mods) s.neg = o.neg, s.abs = o.abs;
   return true;
 }
+// A source a 16-bit float instruction reads (lane_half, lane_half_f): an inline float constant is a half, in the low 16 bits.
+// Its modifiers (negation, absolute value) act on the half's sign, bit 15.
+bool lane_src32_half(const Operand& o, Src& s) {
+  if (o.kind != OperandKind::InlineFloat) {
+    if (!lane_src32(o, s, false)) return false;
+  } else {
+    if (o.sel != 6 || o.sext || o.half || o.bits16 || o.hi) return false;
+    s = Src();
+    s.kind = kConst;
+    const _Float16 h = static_cast<_Float16>(o.fvalue);
+    uint16_t bits;
+    std::memcpy(&bits, &h, 2);
+    s.value = bits;
+  }
+  s.h16 = true, s.neg = o.neg, s.abs = o.abs;
+  return true;
+}
 // The same for a 64-bit consumer (lane_src64).
 bool lane_src64(const Operand& o, Src& s, bool float_mods) {
   if (o.sel != 6 || o.sext || o.half || o.bits16 || o.hi) return false;
@@ -1261,6 +1718,8 @@ bool vgpr_dst(const Operand& o, Src& s, uint32_t regs) {
 
 namespace {
 
+bool cdna(const Inst& in) { return in.arch == gcn::Target::Gfx90a || in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950; }
+
 // A comparison: named by its opcode, as compare() reads it. False for a type or test the tier does not model.
 void classify_cmp(Inst& in, const Tables& T) {
   if (in.src.size() < 2 || in.dst.size() > 1) return;
@@ -1272,7 +1731,19 @@ void classify_cmp(Inst& in, const Tables& T) {
   Op& f = in.fast;
   CmpFn k = nullptr;
   bool fmods = false;
-  if (op >= 0x40 && op < 0x50) k = T.cmp_f32[op & 0xF], fmods = true;
+  bool raw16 = false;   // (a half or a 16-bit integer source: float modifiers would act on the wrong bits)
+  if (op == 0x10 || op == 0x14) {   // v_cmp_class_f32, v_cmp_class_f16: the mask is the second operand's bits
+    if (op == 0x14 && !cdna(in)) return;
+    k = op == 0x10 ? T.cmp_class32 : in.src[0].neg ? T.cmp_class16_neg : T.cmp_class16;
+    fmods = op == 0x10;
+    raw16 = op == 0x14;
+  } else if (op >= 0x20 && op < 0x30) {
+    if (!cdna(in)) return;
+    k = T.cmp_f16[op & 0xF], raw16 = true;
+  } else if (op >= 0xA0 && op < 0xB0) {
+    if (!cdna(in)) return;
+    k = op < 0xA8 ? T.cmp_i16[op & 7] : T.cmp_u16[op & 7], raw16 = true;
+  } else if (op >= 0x40 && op < 0x50) k = T.cmp_f32[op & 0xF], fmods = true;
   else if (op >= 0xC0 && op < 0xC8) k = T.cmp_i32[op & 7];
   else if (op >= 0xC8 && op < 0xD0) k = T.cmp_u32[op & 7];
   else if ((op >= 0x60 && op < 0x70) || (op >= 0xE0 && op < 0xF0)) {
@@ -1286,7 +1757,13 @@ void classify_cmp(Inst& in, const Tables& T) {
     f.run = h_cmp64;
     return;
   } else return;
-  if (!lane_src32(in.src[0], f.src[0], fmods) || !lane_src32(in.src[1], f.src[1], fmods)) return void(f = Op());
+  // (a 16-bit integer compare ignores the modifiers a VOP3 form could carry; a half's act on its sign bit)
+  if (raw16 && !(op == 0x14 || (op >= 0x20 && op < 0x30)) && (in.src[0].neg || in.src[0].abs || in.src[1].neg || in.src[1].abs)) return void(f = Op());
+  bool ok;
+  if (op == 0x14) ok = lane_src32_half(in.src[0], f.src[0]) && lane_src32(in.src[1], f.src[1], false);   // (class of a half; the mask is bits)
+  else if (op >= 0x20 && op < 0x30) ok = lane_src32_half(in.src[0], f.src[0]) && lane_src32_half(in.src[1], f.src[1]);
+  else ok = lane_src32(in.src[0], f.src[0], fmods) && lane_src32(in.src[1], f.src[1], op == 0x10 ? false : fmods);
+  if (!ok) return void(f = Op());
   if (!in.dst.empty() && !scalar_dst(in.dst[0], f.dst)) return void(f = Op());
   f.kern = reinterpret_cast<AnyFn>(k);
   f.sub = writes_exec;
@@ -1294,10 +1771,39 @@ void classify_cmp(Inst& in, const Tables& T) {
   f.run = h_cmp;
 }
 
+// The SDWA form of a 32-bit integer operation: sources cut to the parts they name, the result put in the part dst_sel names.
+bool lane_src32_sdwa(const Operand& o, Src& s) {
+  if (o.neg || o.abs) return false;
+  Operand plain = o;
+  plain.sel = 6, plain.sext = false;
+  if (!lane_src32(plain, s, false)) return false;
+  s.sel = o.sel, s.sext = o.sext;
+  return true;
+}
+bool classify_sdwa(Inst& in) {
+  if (in.arch == Target::Gfx1250 || !in.dual.empty() || in.dpp || in.dpp8 || in.bitop3 || in.scaled) return false;
+  if ((in.enc != Enc::Vop1 && in.enc != Enc::Vop2) || in.dst.size() != 1 || in.short_name.empty() || in.clamp || in.omod) return false;
+  const auto& tab = table();
+  const auto it = tab.find(in.short_name);
+  if (it == tab.end() || it->second.cat != Cat::Int) return false;
+  const Entry& e = it->second;
+  if ((e.flags & kFloatSrc) || in.src.size() < static_cast<size_t>(e.arity)) return false;
+  Op& f = in.fast;
+  if (!vgpr_dst(in.dst[0], f.dst, 1)) return false;
+  for (int k = 0; k < e.arity; ++k)
+    if (!lane_src32_sdwa(in.src[k], f.src[k])) return f = Op(), false;
+  f.dsel = in.dst_sel, f.dunused = in.dst_unused;
+  f.kern = reinterpret_cast<AnyFn>(tables().ints[e.k]);
+  f.run = h_int_sdwa;
+  f.unit = kUnitValu;
+  return true;
+}
+
 }  // namespace
 
 void tier_classify(Inst& in) {
   in.fast = Op();
+  if (in.sdwa && classify_sdwa(in)) return;
   // Not modelled: gfx1250 (it has its own instruction interceptions), VOPD, sub-dword and cross-lane forms, 16-bit halves,
   // per-source op_sel.
   if (in.arch == Target::Gfx1250 || !in.dual.empty() || in.sdwa || in.dpp || in.dpp8 || (in.op_sel != 0 && in.enc != Enc::Vop3p) || in.bitop3 || in.scaled) return;
@@ -1306,6 +1812,12 @@ void tier_classify(Inst& in) {
   const bool vector_enc = in.enc == Enc::Vop1 || in.enc == Enc::Vop2 || in.enc == Enc::Vop3 || in.enc == Enc::Vopc;
   if (in.flags & kInstCmp) {
     if (in.enc == Enc::Vopc || in.enc == Enc::Vop3) classify_cmp(in, T);
+    return;
+  }
+  if (in.enc == Enc::Smem) {   // (scalar memory: the Machine's scalar_load, without step()'s frame; the real-time clock reads differently each time)
+    if (in.mem.smem == SmemKind::Time && in.mem.smem_realtime) return;
+    f.mach = 7;
+    f.run = h_never;
     return;
   }
   static const Entry kCarry = {Cat::Carry, 0, 0, 0, nullptr, 0};
@@ -1331,12 +1843,20 @@ void tier_classify(Inst& in) {
       const bool is_f = e.cat == Cat::F32;
       if (!vgpr_dst(in.dst[0], f.dst, 1)) return fail();
       if ((e.flags & kNoClamp) && in.clamp) return fail();
+      if ((e.flags & kCdnaOnly) && in.arch != gcn::Target::Gfx90a && in.arch != gcn::Target::Gfx942 && in.arch != gcn::Target::Gfx950) return fail();
+      if ((e.flags & (kNoOmod | kFloatOut)) && in.omod) return fail();
+      if ((e.flags & kFloatOut) && in.clamp) return fail();
       // (CDNA3 and CDNA4 apply the clamp bit to the integer instructions that have one and to the conversions to float: the interpreter's.)
       if (in.clamp && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && (!is_f || (e.flags & kIgnoreMods))) return fail();
       // (gfx942 and gfx950 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA3 and CDNA4 guides, 6.5: the interpreter's.)
       if (in.omod && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && !(e.flags & kIgnoreMods)) return fail();
-      for (int k = 0; k < e.arity; ++k)
-        if (!lane_src32(in.src[k], f.src[k], is_f || (e.flags & kFloatSrc))) return fail();
+      for (int k = 0; k < e.arity; ++k) {
+        if (e.flags & kRawSrc) {   // (a half: its inline float constants too)
+          if (!lane_src32_half(in.src[k], f.src[k])) return fail();
+        } else if (!lane_src32(in.src[k], f.src[k], (is_f && !((e.flags & kIntSrc1) && k == 1)) || (e.flags & kFloatSrc))) {
+          return fail();
+        }
+      }
       if (is_f) {
         if (e.flags & kFmac) f.src[2] = Src(), f.src[2].kind = kVgpr, f.src[2].index = f.dst.index;
         if (e.flags & kConstLast) {
@@ -1349,7 +1869,20 @@ void tier_classify(Inst& in) {
         }
         if (!(e.flags & kIgnoreMods)) f.omod = in.omod, f.clamp = in.clamp;
         if (e.flags & kMinMax) f.sub = 1;
-        f.kern = reinterpret_cast<AnyFn>(T.f32[e.k]);
+        switch (e.k) {
+          case FADD: f.nan = kNanAdd; break;
+          case FSUB: f.nan = kNanSub; break;
+          case FSUBREV: f.nan = kNanSubRev; break;
+          case FMUL: f.nan = kNanMul; break;
+          case FMA: f.nan = kNanFma; break;
+          // (one-input functions of the host's libm or one instruction: the kernel's NaN is the interpreter's, there being no second payload to choose)
+          case FRCP: case FSQRT: case FRSQ: case FEXP: case FLOG: case FFLOOR: case FCEIL: case FTRUNC: case FFRACT: case FLDEXP: case FCVT_F32_F16:
+            f.nan = kNanPass;
+            break;
+          default: break;   // v_min_f32 and v_max_f32 (MODE.IEEE decides), the rounding and the angles in turns: the interpreter's
+        }
+        const int kernel = (e.flags & kTrigTurns) && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) ? e.k + 1 : e.k;
+        f.kern = reinterpret_cast<AnyFn>(T.f32[kernel]);
         f.run = h_f32;
       } else {
         f.kern = reinterpret_cast<AnyFn>(T.ints[e.k]);
@@ -1366,6 +1899,10 @@ void tier_classify(Inst& in) {
         if (!lane_src64(in.src[k], f.src[k], true)) return fail();
       if (e.flags & kFmac) f.src[2] = Src(), f.src[2].kind = kVgpr, f.src[2].index = f.dst.index, f.src[2].wide = true;
       f.omod = in.omod, f.clamp = in.clamp;
+      if (e.k == DADD) f.nan = kNanAdd;
+      else if (e.k == DMUL) f.nan = kNanMul;
+      else if (e.k == DFMA && !(e.flags & kFmac)) f.nan = kNanFma;   // (v_fmac_f64 is a plain std::fma: the interpreter's)
+      else if (e.k != DFMA && e.k != DRNDNE) f.nan = kNanPass;      // (a one-input function of the host's: no second payload to choose; nearbyint's quieting is the compiler's)
       f.kern = reinterpret_cast<AnyFn>(T.f64[e.k]);
       f.run = h_f64;
       f.unit = kUnitValu;
@@ -1508,6 +2045,7 @@ void tier_classify(Inst& in) {
       }
       f.sub = sub;
       f.clamp = in.clamp;
+      f.nan = e.k == FADD ? kNanAdd : e.k == FMUL ? kNanMul : kNanPkFma;
       f.kern = reinterpret_cast<AnyFn>(T.f32[e.k]);
       f.run = h_pk;
       f.unit = kUnitValu;
@@ -1554,6 +2092,119 @@ void tier_classify(Inst& in) {
         if (!scalar_src(in.src[k], f.src[k])) return fail();
       f.sub = static_cast<uint32_t>(e.k);
       f.run = s_cmp;
+      f.unit = kUnitSalu;
+      return;
+    }
+    case Cat::Acc: {
+      if ((in.enc != Enc::Vop1 && in.enc != Enc::Vop3) || in.dst.size() != 1 || in.src.size() != 1) return;
+      f.mach = 10;
+      f.run = h_never;
+      return;
+    }
+    case Cat::PkF16: {   // (the Machine's packed_f16_wave does the arithmetic whole-wave; it says if the instruction is not the plain case)
+      if (in.enc != Enc::Vop3p || in.dst.size() != 1 || in.src.size() < static_cast<size_t>(e.arity)) return;
+      f.mach = 8;
+      f.sub = static_cast<uint32_t>(e.k);
+      f.run = h_never;
+      return;
+    }
+    case Cat::PkMov: {
+      if (in.enc != Enc::Vop3p || in.dst.size() != 1 || in.src.size() < 2) return;
+      if (!vgpr_dst(in.dst[0], f.dst, 2)) return fail();
+      for (int k = 0; k < 2; ++k) {
+        const Operand& o = in.src[k];
+        const unsigned top = in.op_sel >> k & 1;
+        Src& s = f.src[k];
+        s = Src();
+        if (o.sel != 6 || o.half || o.bits16) return fail();
+        if (o.kind == OperandKind::Vgpr) {
+          if (o.index + 2 > kVgprs) return fail();
+          s.kind = kVgpr, s.index = o.index;
+        } else if (o.kind == OperandKind::Sgpr) {
+          if (o.index + (o.width >= 2 ? 2u : 1u) > kSgprs) return fail();
+          s.kind = kSgpr, s.index = o.index, s.wide = o.width >= 2;
+        } else if (o.kind == OperandKind::Inline || o.kind == OperandKind::Literal) {
+          if (top) return fail();   // (the interpreter refuses the second part of a constant)
+          s.kind = kConst, s.value = static_cast<uint32_t>(o.value);
+        } else if (o.kind == OperandKind::InlineFloat) {
+          if (top) return fail();
+          const float fv = static_cast<float>(o.fvalue);
+          s.kind = kConst, std::memcpy(&s.value, &fv, 4);
+        } else {
+          return fail();
+        }
+      }
+      f.sub = in.op_sel & 3;
+      f.run = h_pkmov;
+      f.unit = kUnitValu;
+      return;
+    }
+    case Cat::Div: {
+      if (!vector_enc || in.src.size() < 3) return;
+      const bool dbl = e.k >= 4, scale = (e.k & 3) == 0;
+      if (!vgpr_dst(in.dst.empty() ? Operand() : in.dst[0], f.dst, dbl ? 2 : 1)) return fail();
+      if (scale ? (in.dst.size() != 2 || !scalar_dst(in.dst[1], f.dst2)) : in.dst.size() != 1) return fail();
+      for (int k = 0; k < 3; ++k)
+        if (!(dbl ? lane_src64(in.src[k], f.src[k], true) : lane_src32(in.src[k], f.src[k], true))) return fail();
+      f.sub = static_cast<uint32_t>(e.k);
+      f.run = h_div;
+      f.unit = kUnitValu;
+      return;
+    }
+    case Cat::FmaMix: {
+      if (in.enc != Enc::Vop3p || in.dst.size() != 1 || in.src.size() < 3) return;
+      if (!vgpr_dst(in.dst[0], f.dst, 1)) return fail();
+      uint32_t sub = static_cast<uint32_t>(e.k) << 12;
+      for (int k = 0; k < 3; ++k) {
+        const Operand& o = in.src[k];
+        const bool half = in.op_sel_hi >> k & 1;
+        // (a half read from an inline float constant is that constant as a half; any other source's 32 bits are shifted by op_sel)
+        if (half && o.kind == OperandKind::InlineFloat) {
+          if (!lane_src32_half(o, f.src[k])) return fail();
+        } else if (!lane_src32(o, f.src[k], false)) {
+          return fail();
+        }
+        sub |= (half ? 1u : 0u) << k | (half && !(o.kind == OperandKind::InlineFloat) && (in.op_sel >> k & 1) ? 1u : 0u) << (3 + k) |
+               (o.neg ? 1u : 0u) << (6 + k) | (o.abs ? 1u : 0u) << (9 + k);
+      }
+      f.sub = sub;
+      f.clamp = in.clamp;
+      f.run = h_fma_mix;
+      f.unit = kUnitValu;
+      return;
+    }
+    case Cat::Endpgm: {
+      if (in.enc != Enc::Sopp) return;
+      f.mach = 6;   // (the Machine ends the wave)
+      f.run = h_never;
+      return;
+    }
+    case Cat::Sopk: {
+      if (in.enc != Enc::Sopk || in.dst.size() != 1) return;
+      if (!scalar_dst(in.dst[0], f.dst) || !scalar_src(in.dst[0], f.src[0])) return fail();
+      f.sub = static_cast<uint32_t>(e.k);
+      f.off0 = in.simm;
+      f.run = s_sopk;
+      f.unit = kUnitSalu;
+      return;
+    }
+    case Cat::Cmpk: {
+      if (in.enc != Enc::Sopk || in.opcode < 0x02 || in.opcode > 0x0d) return;
+      if (in.dst.empty() && in.src.empty()) return;
+      const Operand& x = in.dst.empty() ? in.src[0] : in.dst[0];   // (gfx9 keeps the compared register as the destination field, RDNA as the source)
+      if (!scalar_src(x, f.src[0])) return fail();
+      f.sub = (in.opcode - 0x02) % 6 + (in.opcode >= 0x08 ? 6u : 0u);
+      f.off0 = in.simm;
+      f.run = s_cmpk;
+      f.unit = kUnitSalu;
+      return;
+    }
+    case Cat::Bitcmp: {
+      if (in.enc != Enc::Sopc || in.src.size() != 2) return;
+      for (size_t k = 0; k < 2; ++k)
+        if (!scalar_src(in.src[k], f.src[k])) return fail();
+      f.sub = static_cast<uint32_t>(e.k);
+      f.run = s_bitcmp;
       f.unit = kUnitSalu;
       return;
     }

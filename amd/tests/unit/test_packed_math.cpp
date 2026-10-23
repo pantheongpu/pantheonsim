@@ -401,4 +401,88 @@ VTEST(the_conversions_of_the_f16c_unit_are_the_integer_ones_including_every_nan)
 }
 #endif
 
+namespace {
+
+// v_pk_min_f16 / v_pk_max_f16 as the interpreter ran them a lane at a time before packed_minmax_lanes: gfx942 and gfx950 on the halves' bits (the
+// compiler's _Float16 for the comparisons), the others on floats, with the two-NaN payload of an inline fmin / fmax spelled out.
+uint16_t reference_gfx9_minmax(uint16_t a, uint16_t b, bool is_min, bool ieee) {
+  const auto is_nan = [](uint16_t v) { return (v & 0x7C00) == 0x7C00 && (v & 0x3FF) != 0; };
+  const auto signaling = [&](uint16_t v) { return is_nan(v) && !(v & 0x200); };
+  if (ieee && signaling(a)) return a | 0x200;
+  if (ieee && signaling(b)) return b | 0x200;
+  if (is_nan(a)) return b;
+  if (is_nan(b)) return a;
+  const float x = reference_to_float(a), y = reference_to_float(b);
+  if (x == 0 && y == 0 && (a >> 15) != (b >> 15)) return is_min == static_cast<bool>(a >> 15) ? a : b;
+  return is_min ? (x < y ? a : b) : (ieee ? (x >= y ? a : b) : (x > y ? a : b));
+}
+float reference_fmin(float x, float y) {
+  if (x != x) return y != y ? add_ordered(y, x) : y;
+  if (y != y) return x;
+  return x < y ? x : y;
+}
+float reference_fmax(float x, float y) {
+  if (x != x) return y != y ? add_ordered(y, x) : y;
+  if (y != y) return x;
+  return x == y ? x : x > y ? x : y;
+}
+
+}  // namespace
+
+VTEST(packed_minimum_and_maximum_match_the_per_lane_code_bit_for_bit) {
+  Rng rng{0x424242};
+  uint64_t wrong = 0, lanes = 0;
+  for (int round = 0; round < 60000; ++round) {
+    std::vector<uint32_t> row[2];
+    for (auto& r : row) {
+      r.resize(64);
+      for (auto& v : r) v = static_cast<uint32_t>(any_half(rng)) | static_cast<uint32_t>(any_half(rng)) << 16;
+    }
+    WaveArgs a;
+    a.op = round % 2 ? Op::Min : Op::Max;
+    a.clamp = rng.next() % 4 == 0;
+    a.guide = rng.next() % 2;
+    a.ieee = rng.next() % 2;
+    a.exec = rng.next() | (rng.next() & 1 ? 0 : rng.next());
+    if (rng.next() % 5 == 0) a.exec = ~0ull;
+    for (uint32_t k = 0; k < 2; ++k)
+      for (uint32_t half = 0; half < 2; ++half) {
+        HalfSource& h = a.src[k][half];
+        if (rng.next() % 6 == 0) h.imm = any_half(rng);
+        else {
+          h.row = row[k].data();
+          h.shift = static_cast<uint8_t>(16 * (rng.next() & 1));
+        }
+        h.flip = rng.next() % 3 == 0 ? 0x8000u : 0u;
+      }
+    std::vector<uint32_t> out(64, 0xDEADBEEFu);
+    a.dst = out.data();
+    packed_f16_wave(a);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+      if (!(a.exec >> lane & 1)) {
+        wrong += out[lane] != 0xDEADBEEFu;
+        continue;
+      }
+      ++lanes;
+      uint32_t r = 0;
+      for (uint32_t half = 0; half < 2; ++half) {
+        const uint16_t xb = a.src[0][half].at(lane), yb = a.src[1][half].at(lane);
+        uint16_t rb;
+        if (a.guide) {
+          rb = reference_gfx9_minmax(xb, yb, a.op == Op::Min, a.ieee);
+          if (a.clamp) rb = reference_to_half(clamp01(reference_to_float(rb)));
+        } else {
+          const float x = reference_to_float(xb), y = reference_to_float(yb);
+          const float v = a.op == Op::Min ? reference_fmin(x, y) : reference_fmax(x, y);
+          rb = reference_to_half(a.clamp ? clamp01(v) : v);
+        }
+        r |= static_cast<uint32_t>(rb) << (16 * half);
+      }
+      wrong += out[lane] != r;
+    }
+  }
+  VCHECK_EQ(wrong, 0ull);
+  VCHECK(lanes > 1000000);
+}
+
 VTEST_MAIN

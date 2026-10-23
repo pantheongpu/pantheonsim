@@ -228,6 +228,44 @@ __global__ void k_mfma_f64(const double* A, const double* B, double* D, uint32_t
   for (int i = 0; i < 4; ++i) D[wave * 256 + (l / 16 + 4 * i) * 16 + (l % 16)] = acc[i];
 #endif
 }
+// gfx950's small-float matrix forms (v_mfma_f32_16x16x128_f8f6f4 with 8-bit operands, and its block-scaled twin), and the 4-block double
+// form (v_mfma_f64_4x4x4_4b_f64): the other layouts of the matrix instructions. An 8-bit operand holds 32 values a lane, value e of lane
+// group g (l / 16) at K = 16 g + e % 16 + 64 (e / 16); a scale is one byte for each row and block of 32 K, in lane i + 16 q.
+typedef __attribute__((__vector_size__(8 * sizeof(int)))) int int8f_v;
+__global__ void k_mfma_f8f6f4(const uint8_t* A, const uint8_t* B, float* D, uint32_t n, uint32_t scaled) {
+#if defined(__gfx950__)
+  const uint32_t l = threadIdx.x & 63, wave = blockIdx.x;
+  int8f_v a, b;
+  for (int r = 0; r < 8; ++r) {
+    int va = 0, vb = 0;
+    for (int by = 0; by < 4; ++by) {
+      const int e = r * 4 + by, k = 16 * (l / 16) + e % 16 + 64 * (e / 16);
+      va |= static_cast<int>(A[(l % 16) * 128 + k]) << (8 * by);
+      vb |= static_cast<int>(B[k * 16 + (l % 16)]) << (8 * by);
+    }
+    a[r] = va, b[r] = vb;
+  }
+  float4_v acc = {0, 0, 0, 0};
+  if (scaled) {
+    const int sa = 127 + static_cast<int>((l % 16 + l / 16) % 3) - 1, sb = 127 + static_cast<int>((l % 16 + 2 * (l / 16)) % 3) - 1;
+    for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(a, b, acc, 0, 0, 0, sa, 0, sb);
+  } else {
+    for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(a, b, acc, 0, 0, 0, 127, 0, 127);   // (scales of 2^0: the compiler emits the unscaled instruction)
+  }
+  for (int i = 0; i < 4; ++i) D[wave * 256 + ((l / 16) * 4 + i) * 16 + (l % 16)] = acc[i];
+#endif
+}
+// Four 4x4 blocks of doubles: lane l holds A[b][i][k] and B[b][k][j] of block b = l / 4 % 4, row or column i = l % 4, k = l / 16;
+// D[b][i][j] is in lane j + 4 (i + 4 b).
+__global__ void k_mfma_f64_4b(const double* A, const double* B, double* D, uint32_t n) {
+#ifdef DEVICE_MFMA_MORE
+  const uint32_t l = threadIdx.x & 63, wave = blockIdx.x;
+  const double a = A[((l / 4 % 4) * 4 + l % 4) * 4 + l / 16], b = B[((l / 4 % 4) * 4 + l / 16) * 4 + l % 4];
+  double acc = 0;
+  for (uint32_t i = 0; i < n; ++i) acc = __builtin_amdgcn_mfma_f64_4x4x4f64(a, b, acc, 0, 0, 0);
+  D[wave * 64 + l] = acc;
+#endif
+}
 // 2:4 sparse A: a lane's four stored halves are the dense k offsets 0, 1, 4, 5 of its run of eight (index bits 0b01000100 ...).
 __global__ void k_smfmac(const _Float16* A, const _Float16* B, float* D, uint32_t n) {
 #ifdef DEVICE_MFMA_MORE
@@ -686,6 +724,66 @@ static void run_mfma_f64(const std::string& size) {
   const std::vector<double> ref = matrix_ref(A, B, 4, n);
   for (uint32_t w = 0; w < waves; ++w)
     for (int e = 0; e < 256; ++e) expect_true("mfma_f64", got[w * 256 + e] == ref[e]);
+}
+static void run_mfma_f8f6f4(const std::string& size, bool scaled) {
+  need_mfma_more();
+  if (!has_arch("gfx950")) {
+    std::printf("SKIP no f8f6f4 matrix instructions for %s\n", g_arch);
+    std::exit(77);
+  }
+  const uint32_t waves = 64, n = scale(size, 100, 2000);
+  std::vector<uint8_t> A(16 * 128), B(128 * 16);
+  std::vector<int8_t> Av(16 * 128), Bv(128 * 16);
+  for (int i = 0; i < 16; ++i)
+    for (int k = 0; k < 128; ++k) {
+      Av[i * 128 + k] = static_cast<int8_t>(small_a(i, k)), Bv[k * 16 + i] = static_cast<int8_t>(small_b(k, i));
+      A[i * 128 + k] = fp8_of(Av[i * 128 + k], true), B[k * 16 + i] = fp8_of(Bv[k * 16 + i], true);
+    }
+  uint8_t *dA = dev_copy(A), *dB = dev_copy(B);
+  float* dD;
+  HC(hipMalloc(&dD, waves * 256 * 4));
+  Phase p;
+  LAUNCH(k_mfma_f8f6f4, dim3(waves), dim3(64), 0, 0, dA, dB, dD, n, scaled ? 1u : 0u);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  const std::vector<float> got = dev_read(dD, waves * 256);
+  std::vector<double> ref(256);
+  for (int i = 0; i < 16; ++i)
+    for (int j = 0; j < 16; ++j) {
+      double s = 0;
+      for (int k = 0; k < 128; ++k) {
+        const int q = k / 32;
+        const double fa = scaled ? std::ldexp(1.0, (i + q) % 3 - 1) : 1.0, fb = scaled ? std::ldexp(1.0, (j + 2 * q) % 3 - 1) : 1.0;
+        s += static_cast<double>(Av[i * 128 + k]) * fa * (static_cast<double>(Bv[k * 16 + j]) * fb);
+      }
+      ref[i * 16 + j] = s * n;
+    }
+  for (uint32_t w = 0; w < waves; ++w)
+    for (int e = 0; e < 256; ++e) expect_true(scaled ? "mfma_scale" : "mfma_f8f6f4", got[w * 256 + e] == static_cast<float>(ref[e]));
+}
+static void run_mfma_f64_4b(const std::string& size) {
+  need_mfma_more();
+  const uint32_t waves = 64, n = scale(size, 400, 8000);
+  std::vector<double> A(4 * 4 * 4), B(4 * 4 * 4);
+  for (int b = 0; b < 4; ++b)
+    for (int i = 0; i < 4; ++i)
+      for (int k = 0; k < 4; ++k) A[(b * 4 + i) * 4 + k] = small_a(i + b, k) * 0.25, B[(b * 4 + k) * 4 + i] = small_b(k, i + 2 * b) * 0.5;
+  double *dA = dev_copy(A), *dB = dev_copy(B);
+  double* dD;
+  HC(hipMalloc(&dD, waves * 64 * 8));
+  Phase p;
+  LAUNCH(k_mfma_f64_4b, dim3(waves), dim3(64), 0, 0, dA, dB, dD, n);
+  HC(hipDeviceSynchronize());
+  p.finish(1, "launch");
+  const std::vector<double> got = dev_read(dD, waves * 64);
+  for (uint32_t w = 0; w < waves; ++w)
+    for (int b = 0; b < 4; ++b)
+      for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+          double s = 0;
+          for (int k = 0; k < 4; ++k) s += A[(b * 4 + i) * 4 + k] * B[(b * 4 + k) * 4 + j];
+          expect_true("mfma_f64_4b", got[w * 64 + j + 4 * (i + 4 * b)] == s * n);
+        }
 }
 static void run_smfmac(const std::string& size) {
   need_mfma_more();
@@ -1216,6 +1314,9 @@ int main(int argc, char** argv) {
   else if (w == "mfma_fp8") run_mfma_fp8(size);
   else if (w == "mfma_bf16") run_mfma_bf16(size);
   else if (w == "mfma_f64") run_mfma_f64(size);
+  else if (w == "mfma_f8f6f4") run_mfma_f8f6f4(size, false);
+  else if (w == "mfma_scale") run_mfma_f8f6f4(size, true);
+  else if (w == "mfma_f64_4b") run_mfma_f64_4b(size);
   else if (w == "smfmac") run_smfmac(size);
   else if (w == "wmma") run_wmma(size);
   else if (w == "wmma_iu8") run_wmma_iu8(size);
