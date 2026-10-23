@@ -525,8 +525,8 @@ the code base. All speed-ups are the measured ones above; nothing was built. I r
 * **Lost:** nothing; it does not replace the simulation, it audits it. It needs a real card of the same architecture (profile = card) to be meaningful; across
   architectures it compares different machines (section 4).
 * **Integration cost (estimate):** 1 to 2 engineer-weeks for a `vgpu check ./program` or a script (run both ways, timing/identity filter, card-vs-card noise
-  pass, classify), reusing [corpus.py](data/round12/corpus.py), [compare.py](data/round12/compare.py) and [classify_e2.py](data/round12/classify_e2.py); the cost of a GPU
-  runner is the same one `ci-card-check.md` already priced.
+  pass, classify), reusing [corpus.py](data/round12/corpus.py), [compare.py](data/round12/compare.py) and [classify_e2.py](data/round12/classify_e2.py); the GPU
+  runner is the one `ci-card-check.md` proposes.
 * **Worth building: yes, as a separate tool / CI job outside the runtime** (no change to the simulator's launch path), same-architecture only.
 
 ### (5) Library offload (cuBLAS, cuDNN, cuFFT ... run by NVIDIA's libraries on the card)
