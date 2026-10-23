@@ -127,7 +127,7 @@ vgpu shell -y --gpu amd/mi300x --count 8 --rocm 6.2.0 --driver 6.3.6 \
 | Option | Meaning |
 | --- | --- |
 | `--gpu`, `--count 1..16`, `--vram-mb` | The rack. |
-| `--cuda`, `--rocm`, `--driver` | Reported toolkit and driver versions. The defaults are the ones this build's runtime carries. |
+| `--cuda`, `--rocm`, `--driver` | Reported toolkit and driver versions. The CUDA and driver defaults are the ones this build's runtime carries; the ROCm default is `6.2.0`. |
 | `--os ubuntu:22.04\|ubuntu:24.04\|rocky\|debian`, `--kernel`, `--hostname` | Machine identity. |
 | `--load 0..1` | Background load, so the telemetry columns move. |
 | `-c`, `--command <cmd>` | Run one command in the machine instead of an interactive shell. |
@@ -223,7 +223,7 @@ variable is unset by default.
 | `VGPU_DEVICE_COUNT` | Number of identical virtual devices. | `1` |
 | `VGPU_VRAM_MB` | Virtual VRAM size, overriding the profile. | profile |
 | `VGPU_CUDA_VERSION`, `VGPU_DRIVER_VERSION` | CUDA and driver version strings that `nvidia-smi` and NVML report. | this build's |
-| `VGPU_ROCM_VERSION` | ROCm version string that the AMD tools report. | this build's |
+| `VGPU_ROCM_VERSION` | ROCm version string that `amd-smi version` reports. | `6.2.0` in `vgpu shell`, else `N/A` |
 
 **Memory**
 
@@ -239,9 +239,9 @@ variable is unset by default.
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `VGPU_THREADS` | Host threads used to run blocks. | one per core (`make run` and `./run` set half the cores unless this or `threads:` is set) |
-| `VGPU_LOCKSTEP` | `0` runs a grid's blocks one after another on each host thread, as before; `all` runs every launch with the blocks the device holds resident together taking turns; the default runs kernels with a loop that polls global memory that way (see the README). | polling kernels |
+| `VGPU_LOCKSTEP` | `0` runs a grid's blocks one after another on each host thread, as before; `all` runs every launch with the blocks the device holds resident together taking turns; the default runs kernels with a loop that polls global memory that way (see [cooperative.md](cooperative.md)). | polling kernels |
 | `VGPU_LOCKSTEP_LOG` | `1` prints a line on stderr for each launch that runs its blocks together; any other value is a file the lines are appended to (the tests count the kernels that do). | off |
-| `VGPU_MAX_STEPS` | Raises (or lowers) the runaway-kernel step budget; `0` removes it. The PTX engine reads it at each launch; the SASS engine, which used not to read it (its budget was the built-in one whatever this said), once per process. | built-in |
+| `VGPU_MAX_STEPS` | Raises (or lowers) the runaway-kernel step budget; `0` removes it. The PTX engine reads it at each launch; the SASS engine reads it once per process. | built-in |
 | `VGPU_SASS` | `0` forces the PTX engine; `1` insists on SASS and does not fall back. | SASS when the binary carries it, else PTX |
 | `VGPU_SASS_LOG` | `1` says when a fatbin falls back from SASS to PTX. | off |
 | `VGPU_SCHEDULER` | Warp scheduling order: `deterministic`, `random` or `adversarial`. Random and adversarial orders find bugs that depend on which warp runs first, and they run blocks one at a time so an order can be replayed. **PTX engine only:** kernels that run from SASS (the default whenever the binary carries it) use one fixed warp order, so set `VGPU_SASS=0` to use this. | deterministic |

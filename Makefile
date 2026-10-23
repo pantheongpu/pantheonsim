@@ -68,7 +68,7 @@ Your program: make run APP=./my_app ARGS="--size 1024"
 Targets
   make                 make deps, then make build, then say what to type next
   make deps            install cmake and a C++20 compiler if missing (asks; YES=1 to skip the
-                       question; PPA=1 as well to add the g++ 13 PPA on Ubuntu 22.04)
+                       question; PPA=1 as well to add the g++ 12 PPA on Ubuntu 20.04 and older)
   make doctor          check cmake, a C++20 compiler, memory; says what to install
   make build           build the simulator into build/ (low priority; NICE= to change); installs nothing.
                        Uses half the CPUs; JOBS=N sets the number of parallel jobs
@@ -100,7 +100,7 @@ export HELP_TEXT
 .PHONY: all help deps doctor build demo list-gpus init config shell run test clean need-vgpu check-app
 
 # The default goal: the tools, then the build, then what to do next. A compiler that
-# deps just installed (g++-13 on Ubuntu 22.04) is handed to the build through CXX;
+# deps just installed (g++-12 on Ubuntu 22.04) is handed to the build through CXX;
 # `make build` itself is still exactly scripts/build.sh.
 all: deps
 	cxx="$$(./scripts/deps.sh --cxx)"; if [ -n "$$cxx" ]; then export CXX="$$cxx"; fi; $(BUILD_ENV)$(NICE) ./scripts/build.sh

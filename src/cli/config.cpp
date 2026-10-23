@@ -98,8 +98,8 @@ std::vector<Key> build_keys() {
   t.push_back(make("driver_version", "VGPU_DRIVER_VERSION", Type::Version, "this build's", "580.65.06",
                    "NVIDIA driver version that nvidia-smi and NVML report."));
   t.back().shell = true;
-  t.push_back(make("rocm_version", "VGPU_ROCM_VERSION", Type::Version, "this build's", "6.4.0",
-                   "ROCm version that rocm-smi and amd-smi report (the compiler is not changed)."));
+  t.push_back(make("rocm_version", "VGPU_ROCM_VERSION", Type::Version, "6.2.0 in vgpu shell", "6.4.0",
+                   "ROCm version that amd-smi version reports (the compiler is not changed)."));
   t.back().shell = true;
   t.push_back(make("os", "VGPU_SHELL_OS", Type::Os, "ubuntu:22.04", "ubuntu:24.04",
                    "Operating system `vgpu shell` presents: ubuntu, rocky or debian, with a version."));

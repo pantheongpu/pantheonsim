@@ -115,6 +115,10 @@ paths tested here do not call them.
   PyTorch's elementwise kernels use.
 - `e2e_pytorch_models_<gpu>`: `models.py` on one GPU per SASS image (T4,
   A100, RTX 3060, H100, B200, RTX 5090), where PyTorch is installed.
+- `e2e_pytorch_ops_rtx5090`: `nvidia/tests/pytorch/ops.py`, one operator at a time
+  against the CPU: the libraries PyTorch ships (cuBLAS and cuBLASLt with fp8, cuDNN,
+  cuFFT, cuRAND, cuSOLVER, cuSPARSE), each SDPA backend, autocast and the jiterator's
+  NVRTC kernels.
 - `e2e_pytorch_profiler`: `torch.profiler` (Kineto) over the simulator's CUPTI, its
   kernel, copy, fill and runtime-call names against NVIDIA's libcupti's on a card
   (`nvidia/docs/cupti.md`).

@@ -3,7 +3,7 @@
 # Run it with `make deps` (which `make` does first).
 #
 # Needed (the same list as scripts/doctor.sh): cmake 3.20 or newer, and a C++20
-# compiler: g++ 13+ or clang++ 17+. It never installs CUDA or ROCm (docs/toolchains.md).
+# compiler: g++ 12+ or clang++ 17+. It never installs CUDA or ROCm (docs/toolchains.md).
 #
 # What it will and will not do:
 #   * Nothing missing: says so and exits 0.
@@ -12,7 +12,7 @@
 #     installs nothing and exits 1 with the exact command to run, so it never
 #     waits for an answer and never changes a system unasked.
 #   * Not root: uses sudo when there is one. Without it, prints the command.
-#   * Ubuntu 22.04 and older have no g++ 13 in the main archive. Adding a PPA is
+#   * Ubuntu 20.04 and older have no g++ 12 in the main archive (22.04 does). Adding a PPA is
 #     a bigger step, so it is only done with YES=1 PPA=1; otherwise the three
 #     commands are printed.
 #   * dnf, pacman, zypper: the exact command is printed, never run.
@@ -55,7 +55,7 @@ cmake_ok() {
   (( BASH_REMATCH[1] > 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] >= 20) ))
 }
 
-# cxx_good <compiler>: it exists and speaks C++20 well enough (g++ 13, clang++ 17).
+# cxx_good <compiler>: it exists and speaks C++20 well enough (g++ 12, clang++ 17).
 cxx_good() {
   have "$1" || return 1
   local out v
@@ -66,7 +66,7 @@ cxx_good() {
   else
     v=$("$1" -dumpversion 2>/dev/null)
     [[ $v =~ ^([0-9]+) ]] || return 1
-    (( BASH_REMATCH[1] >= 13 ))
+    (( BASH_REMATCH[1] >= 12 ))
   fi
 }
 
@@ -77,7 +77,7 @@ if cxx_good "$default_cxx"; then
   good_cxx=$default_cxx; cxx_is_default=1
 else
   cxx_is_default=0
-  for c in g++ g++-14 g++-13 clang++ clang++-19 clang++-18 clang++-17; do
+  for c in g++ g++-14 g++-13 g++-12 clang++ clang++-19 clang++-18 clang++-17; do
     cxx_good "$c" && { good_cxx=$c; break; }
   done
 fi
@@ -98,7 +98,7 @@ fi
 # ---- what to install -----------------------------------------------------------
 say "Missing for 'make build':"
 (( need_cmake )) && say "  cmake 3.20 or newer"
-(( need_cxx ))   && say "  a C++20 compiler (g++ 13 or newer, or clang++ 17 or newer)"
+(( need_cxx ))   && say "  a C++20 compiler (g++ 12 or newer, or clang++ 17 or newer)"
 
 family=""
 for w in $os_id $os_like; do
@@ -138,18 +138,19 @@ case $family in
     fi
     if (( need_cxx )); then
       gxx=""
-      for p in g++-14 g++-13; do
+      for p in g++-14 g++-13 g++-12; do
         [[ -n $(apt_cand "$p") ]] && { gxx=$p; break; }
       done
       # No package lists fetched yet (a fresh container): go by the release.
       if [[ -z $gxx && -z $(apt_cand g++) ]]; then
-        { [[ $os_id == ubuntu && $os_major -ge 24 ]] || [[ $os_id == debian && $os_major -ge 13 ]]; } && gxx=g++
+        { [[ $os_id == ubuntu && $os_major -ge 24 ]] || [[ $os_id == debian && $os_major -ge 12 ]]; } && gxx=g++
+        [[ $os_id == ubuntu && $os_major -eq 22 ]] && gxx=g++-12
       fi
       if [[ -z $gxx ]]; then
         if [[ $os_id == ubuntu ]]; then
-          ppa=1; gxx=g++-13
+          ppa=1; gxx=g++-12
         else
-          echo "This system has no g++ 13 or newer in its package archive."
+          echo "This system has no g++ 12 or newer in its package archive."
           echo "Use a newer release, or build in the container (docs/docker.md), or install clang 17 or newer."
           exit 1
         fi
@@ -164,10 +165,10 @@ case $family in
     fi
     cmds+=("${sudo_pfx:+$sudo_pfx }apt-get update" "${sudo_pfx:+$sudo_pfx }apt-get install -y ${pkgs[*]}")
     if (( ppa )) && [[ ${YES:-} != 1 || ${PPA:-} != 1 ]]; then
-      echo "Ubuntu $os_ver has no g++ 13 in its main archive. It is in the toolchain test PPA"
+      echo "Ubuntu $os_ver has no g++ 12 in its main archive. It is in the toolchain test PPA"
       echo "(ppa:ubuntu-toolchain-r/test), which this will not add on its own. The commands:"
       for c in "${cmds[@]}"; do echo "  $c"; done
-      echo "  export CXX=g++-13        # then run make again"
+      echo "  export CXX=g++-12        # then run make again"
       echo "To let make do all of it: make deps YES=1 PPA=1"
       exit 1
     fi
@@ -205,13 +206,13 @@ case $family in
     pk=(); (( need_cmake )) && pk+=(cmake); (( need_cxx )) && pk+=(gcc13-c++)
     echo "Run:  ${as_root}zypper install ${pk[*]} make"; exit 1 ;;
   *)
-    echo "This system's package manager is not known here. Install cmake 3.20+ and g++ 13+ (or clang++ 17+) with it."
+    echo "This system's package manager is not known here. Install cmake 3.20+ and g++ 12+ (or clang++ 17+) with it."
     echo "'make doctor' says what is missing."; exit 1 ;;
 esac
 
 # ---- did it work --------------------------------------------------------------
 hash -r
-if cmake_ok && { cxx_good "$default_cxx" || cxx_good g++-14 || cxx_good g++-13 || cxx_good g++; }; then
+if cmake_ok && { cxx_good "$default_cxx" || cxx_good g++-14 || cxx_good g++-13 || cxx_good g++-12 || cxx_good g++; }; then
   echo "Installed. 'make build' is next."
   exit 0
 fi

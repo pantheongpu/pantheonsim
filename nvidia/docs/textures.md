@@ -451,7 +451,7 @@ Each with its own message, rather than a plausible wrong number:
   `MUFU.RCP` bit for bit) and a texture with `maxAnisotropy` above 1 (the card then filters along the major axis of
   the gradients' ellipse).
   Round 6 measured the anisotropic case on an RTX 3060 and could not reproduce it bit for bit, so it stays
-  refused; what was found is in "tex.grad with anisotropy, measured but not reproduced" below.
+  refused; what was found is in "tex.grad with anisotropy, measured but not reproduced" above.
 - **Multi-sample textures** (`tex.2dms`, `tex.a2dms`). CUDA cannot create one -- they
   come from graphics interop -- so there is no layout to read and nothing on the card
   to measure.
