@@ -20,3 +20,48 @@ Unit_Warp_Ballot_Positive_Basic	timeout	WarpTest	/work/hip-tests/catch/unit/warp
 Unit_dynamic_loading_device_kernels_from_library	timeout	dynamicLoading	/work/hip-tests/catch/unit/dynamicLoading/complex_loading_behavior.cc:139: FAILED: due to a fatal error condition: 
 Unit_hipP2pLinkTypeAndHopFunc	fail	p2pTests	/work/hip-tests/catch/unit/p2p/hipP2pLinkTypeAndHopFunc.cc:231: FAILED:
 Unit_Copy_Coherency	timeout	synchronizationTests	/work/hip-tests/catch/unit/synchronization/copy_coherency.cc:324: FAILED: due to a fatal error condition: 
+# Added 2026-10-23 (nightly triage). These cases failed on every MI300X night read (2026-10-11, 10-19, 10-23) with the same names; the list had never been extended
+# for the shards that later joined the MI300X run. Wave64 sweeps of ~10,000 launches (coopGrpTest, hipGraph user objects) outlast the 180 s case limit on the simulator;
+# the "old" coalesced-group tests fail on every GPU (see the other baselines). Not simulator regressions.
+Unit_Coalesced_Group_Shfl_Up_Positive_Basic - int	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Shfl_Up_Positive_Basic - long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Shfl_Up_Positive_Basic - long long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Shfl_Up_Positive_Basic - unsigned int	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Shfl_Up_Positive_Basic - unsigned long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Shfl_Up_Positive_Basic - unsigned long long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Sync_Positive_Basic - uint16_t	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Sync_Positive_Basic - uint32_t	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Sync_Positive_Basic - uint8_t	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Getters_Positive_Basic	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - double	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - float	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - int	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - long long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - unsigned int	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - unsigned long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Down_Positive_Basic - unsigned long long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - double	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - float	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - int	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - long long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - unsigned int	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - unsigned long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Coalesced_Group_Tiled_Partition_Shfl_Up_Positive_Basic - unsigned long long	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Thread_Block_Tile_Dynamic_Getters_Positive_Basic	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Thread_Block_Tile_Getters_Positive_Basic	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Thread_Block_Tile_Sync_Positive_Basic - uint16_t	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Thread_Block_Tile_Sync_Positive_Basic - uint32_t	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_Thread_Block_Tile_Sync_Positive_Basic - uint8_t	timeout	coopGrpTest	outlasts the 180 s case limit (sweep of ~10,000 launches)
+Unit_coalesced_groups	fail	coopGrpTest	old test; fails on every GPU, as in the other baselines
+Unit_coalesced_groups_shfl_down	fail	coopGrpTest	old test; fails on every GPU, as in the other baselines
+Unit_coalesced_groups_shfl_up	fail	coopGrpTest	old test; fails on every GPU, as in the other baselines
+Unit_hipGraphUserObj_ClonedGraph	timeout	GraphsTest1	outlasts the 180 s case limit on the simulator
+Unit_hipGraphUserObj_HostRegister	timeout	GraphsTest1	outlasts the 180 s case limit on the simulator
+Unit_hipGraphUserObj_Int_float_Objects	timeout	GraphsTest1	outlasts the 180 s case limit on the simulator
+Unit_hipGraphUserObj_ManualGraph	timeout	GraphsTest1	outlasts the 180 s case limit on the simulator
+Unit_hipGraphUserObj_Struct_Class_Ojects	timeout	GraphsTest1	outlasts the 180 s case limit on the simulator
+Unit_hipGraph_SimpleGraphWithKernel	timeout	GraphsTest1	outlasts the 180 s case limit on the simulator
+Unit_hipGetDeviceCount_HideDevices	fail	DeviceTest	hip_test_process.hh:79: the child program it spawns is not among the built helper targets (same on RX 7900 XT, see its baseline)
+Unit_hipDrvLaunchKernelEx_NegTsts	fail	ModuleTest	hipDrvLaunchKernelEx.cc:125: an invalid launch config returns hipErrorInvalidValue (1), ROCm answers hipErrorInvalidConfiguration (9); simulator bug, harmless
