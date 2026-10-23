@@ -189,7 +189,17 @@ file(WRITE "${_img_gen}" "${_content}")
 # ---------------------------------------------------------------------------
 # Core static library: profiles, memory, PTX, execution engine, runtime.
 # ---------------------------------------------------------------------------
+option(VGPU_JIT_MUTANTS "Build the JIT's code generator with its mutation hooks (VGPU_JIT_MUTANT=<form>), for the mutation checks of the differential tests" OFF)
+if(VGPU_JIT_MUTANTS)
+  set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sass/jit_gen.cpp PROPERTIES COMPILE_DEFINITIONS VGPU_JIT_MUTANTS=1)
+endif()
+# The text the JIT's generated code includes (src/sass/jit.hpp), embedded in the binary.
+file(READ "${CMAKE_SOURCE_DIR}/src/simd/kernels.inc" VGPU_JIT_KERNELS)
+file(READ "${CMAKE_SOURCE_DIR}/src/sass/jit_rt.h" VGPU_JIT_RT)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/simd/kernels.inc" "${CMAKE_SOURCE_DIR}/src/sass/jit_rt.h")
+configure_file("${CMAKE_SOURCE_DIR}/src/sass/jit_embed.cpp.in" "${CMAKE_BINARY_DIR}/jit_embed.cpp" @ONLY)
 add_library(vgpu STATIC
+  ${CMAKE_BINARY_DIR}/jit_embed.cpp
   src/core/error.cpp
   src/core/yamlish.cpp
   src/core/shared_state.cpp
@@ -202,6 +212,8 @@ add_library(vgpu STATIC
   src/sass/module.cpp
   src/sass/exec.cpp
   src/sass/tier.cpp
+  src/sass/jit.cpp
+  src/sass/jit_gen.cpp
   amd/src/rdna_decode.cpp
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
@@ -1399,6 +1411,9 @@ target_compile_definitions(test_f32x2_sass PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOUR
 # The tier's analysis (src/sass/tier.cpp) over the same corpora.
 vgpu_unit_test(test_tier)
 target_include_directories(test_tier PRIVATE src)
+# Tier 2 (src/sass/jit.hpp), milestone 1: the generator, the cache and its verification, the failure modes, discovery, promotion.
+vgpu_unit_test(test_jit)
+target_include_directories(test_jit PRIVATE src)
 target_compile_definitions(test_tier PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
 target_compile_definitions(test_amd_gcn PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -3284,6 +3299,16 @@ set_tests_properties(e2e_sass_fastpath PROPERTIES
 add_test(NAME e2e_sass_tier
          COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_tier.sh)
 set_tests_properties(e2e_sass_tier PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 3600)
+
+# Tier 2 (src/sass/jit.hpp, VGPU_JIT=1) against the tier, on the same programs: results and every counter, with the JIT forced on at once, one
+# and four host threads, a warm cache, the faults of sass_tier_steps, and every way the JIT can fail (the output must not change).
+add_test(NAME e2e_sass_jit
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_jit.sh)
+set_tests_properties(e2e_sass_jit PROPERTIES
   DEPENDS vgpucudart
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"

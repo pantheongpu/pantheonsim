@@ -33,6 +33,12 @@ a kernel affect the rest of the process.
 Treat running an untrusted binary through PantheonSim exactly like running it
 directly: do it in a container or a virtual machine.
 
+The opt-in JIT (`VGPU_JIT=1`, off by default) runs your C++ compiler on text it generates from the kernel's instruction words, and loads the
+result into the process. The text holds only numbers and fixed templates, never a string taken from the program being simulated. The cache
+directory is created `0700`, must belong to you and be writable by no one else, and an object is loaded only after its checksum and its
+instruction words match; but the objects are native code that runs with your permissions, so do not point `VGPU_JIT_CACHE` at a directory
+other users can write to.
+
 ## Supported versions
 
 Fixes land on `main`. The `pantheongpu/setup-pantheonsim` action pins a commit

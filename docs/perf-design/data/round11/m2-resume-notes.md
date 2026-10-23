@@ -1,0 +1,7 @@
+# Milestone 2 WIP notes (rig lost at ~13:21 UTC 2026-10-22)
+
+State: generated arithmetic for Mov, Iadd3(x), Imad(32/Wide/Hi), Lop3, Lea, Shf, Isetp, Fsetp, Fsel, Ffma/Fadd/Fmul, Prmt, Imnmx, I2fp works; sass_tier + sass_tier_steps + whole run_sass_jit.sh passed (52 ok) before the hot-region selection, Full-warp specialisation, JitFrame and -funroll-loops changes (those compiled and test_jit 21/21 passed, e2e NOT re-run).
+Measured (short harness workloads, warm cache): int_alu 87 -> 150..207 Mi/s, f32_fma 86 -> 145..168, local 34 -> 39, mem 15.2 -> 17.3, divergent/warp/shared ~no gain or -7%.
+Compile: ~1 s for a ~100-op unit at -O2, 15 s for an 844 KB unit (hence hot-region selection, VGPU_JIT_HOT_PERMILLE / MAX_OPS / MIN_REGION).
+TODO: rerun run_sass_jit.sh (full), mutation checks per form (cmake -DVGPU_JIT_MUTANTS=ON, VGPU_JIT_MUTANT=<form>|maskless), e2e_sass_archs/e2e_sass_tier with VGPU_JIT=1, bench --check-counters, test_fastpath/test_tier (kernels.inc was edited: VGPU_LANES_ONLY guards, VGPU_KN/VGPU_KA), harness A/B all 8 workloads warm+cold, dynamic coverage, pantheon stress workloads, threshold choice, docs.
+Rig recipe: to-rig.sh <worktree> jit; ~/drx.sh jit <cpus> "cmake -S . -B build; cmake --build build -j8"; build/test_jit; VGPU_TIER_WORK=/w/build-work VGPU_BUILD_DIR=/w/build nvidia/tests/e2e/run_sass_jit.sh (needs programs built by run_sass_tier.sh with VGPU_TIER_BUILD_ONLY=1).
