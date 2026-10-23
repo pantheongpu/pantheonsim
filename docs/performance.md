@@ -3991,10 +3991,14 @@ took 560 ns on the base.
   mutator still takes the full lock. A nested full hold inside a quiet one voids at once and again at its end (`bumped_`).
 * **The writer looks at the slots in use.** The lock keeps a mask of the slots some thread has counted in (set the first time, before
   the count, so the Dekker argument of the flag and the counts holds), and a writer waits for those and not for all 64 cache lines.
-* **The lock's thread identity and the lookup memory are initial-exec thread-locals.** Reading `std::this_thread::get_id()` and a
-  function-local `thread_local` took a call each; the owner is now a `uintptr_t` compared with a constant-initialised tag, and the memory
-  of lookups is a pointer in an initial-exec slot (8 bytes of static TLS for a library loaded late, not the memory's 300), made on a
-  thread's first lookup and deleted when it ends; a thread that is ending reads an empty memory that is never written.
+* **The lock's thread identity and the lookup memory are found from the thread pointer, not through a thread-local.** (The first
+  version kept them in initial-exec thread-locals; the core is linked into every shim library, so each library took static TLS, and
+  glibc's roughly 1.6 KB surplus ran out in a process that loads several of them: `dlopen` of libamdhip64 or the profiler failed with
+  'cannot allocate memory in static TLS block'. `lint_static_tls` now holds every shim to no static TLS.) The lock reads
+  `__builtin_thread_pointer()` for identity and hashes it into a slot; the memory of lookups sits in a 1024-slot table keyed by the thread
+  pointer (8 probes, claimed by compare-and-swap on a thread's first lookup, given back by a destructor when it ends); a thread that finds
+  no free slot, or is ending, reads an empty memory that is never written. The price against the initial-exec version is one dependent
+  load per access: about 3-6% on `buf`, `narrow` and `atomics`; the gains of the allocation work on `launch` are untouched.
 * **`load_scalar` / `store_scalar` try one inline lookup first** (`hot_location`): the thread's last allocation, no host mapping in
   reach, a chunk that is real. Anything else (another allocation, an untouched or uniform chunk, a fault armed, a miss) takes the
   general path, which is unchanged. `run_allocation` (`load_run`, `store_run`, which the AMD engine uses for contiguous lanes) uses the
