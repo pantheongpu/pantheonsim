@@ -27,6 +27,9 @@
 
 namespace vgpu::simd {
 
+#define VGPU_LANES_ONLY 0
+#define VGPU_KN   // (attributes of the lane kernels: none here; the JIT forces them inline, src/sass/jit_rt.h)
+#define VGPU_KA
 #define VGPU_SIMD_NS base_impl
 #define VGPU_SIMD_AVX2 0
 #include "kernels.inc"

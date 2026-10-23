@@ -1,0 +1,5 @@
+workload          tier s     jit s jit/tier  tier spread   jit spread
+divergent         0.3596    0.3651   1.015         0.9%         1.2%
+shared            0.0798    0.0821   1.029         0.9%         1.2%
+int_alu           0.1440    0.1478   1.026         1.0%         1.5%
+local             0.2060    0.2129   1.033         1.1%         1.6%

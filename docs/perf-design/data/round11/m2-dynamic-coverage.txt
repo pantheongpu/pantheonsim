@@ -1,0 +1,11 @@
+Dynamic coverage, harness workloads (VGPU_TIER_STATS=1 and VGPU_JIT_STATS=1, hot-region selection, threshold 100000, sync, one run):
+workload   warp instructions   in regions   computed by generated code   share generated
+int_alu         11,142,656      10,841,628        10,080,812                  90.5%
+f32_fma          5,386,752       5,236,825         5,236,825                  97.2%
+f64_fma          2,303,744           5,124             5,124                   0.2%   (DFMA is an escape; those regions are not compiled)
+local            6,958,848       6,755,028         5,612,252                  80.7%
+divergent        9,969,033         225,405           225,233                   2.3%
+warp             5,126,144       1,691,209         1,691,209                  33.0%
+mem              4,896,768       3,887,142         3,215,274                  65.7%
+shared           1,395,008         127,306           100,684                   7.2%
+The tier ran all the rest (the interpreter ran under 0.2% of any of them). pantheon, 10 s runs (cold = the compile happens during the run, warm = cache filled): int_virus cold 610,958,413 of 1,073,592,000 warp instructions in generated regions (57%), warm 1,006,414,090 of 1,077,976,800 (93%); compute_virus cold 145,997,280 of 450,373,824 (32%), warm 300,071,777 of 449,615,232 (67%); fp64_virus: no unit compiled (its regions are DFMA escapes), 0%.

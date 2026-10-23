@@ -57,8 +57,8 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
   const bool was_on = amd::gcn::tier::enabled();
   amd::gcn::tier::count_bails(true);
   const char* only = std::getenv("VGPU_TIER_ONLY");   // (a substring of the instructions to run)
-#if defined(__SANITIZE_THREAD__)
-  constexpr uint64_t kDefaultSeeds = 1;   // (ThreadSanitizer runs it twenty times slower; one seed still covers every shape)
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+  constexpr uint64_t kDefaultSeeds = 1;   // (a sanitizer runs it ten to twenty times slower; one seed still covers every shape)
 #else
   constexpr uint64_t kDefaultSeeds = 3;
 #endif

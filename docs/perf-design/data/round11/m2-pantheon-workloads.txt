@@ -1,0 +1,3 @@
+pantheon:int_virus tier [60.4, 60.5, 60.1] median 60.4 Mi/s | cold [106.7, 107.3, 107.1] median 107.1 Mi/s | warm [106.6, 107.7, 108.1] median 107.7 Mi/s
+pantheon:compute_virus tier [38.6, 38.3, 38.5] median 38.5 Mi/s | cold [44.7, 45.0, 45.0] median 45.0 Mi/s | warm [44.1, 44.9, 44.3] median 44.3 Mi/s
+pantheon:fp64_virus tier [37.8, 37.6, 37.7] median 37.7 Mi/s | cold [37.5, 37.3, 37.0] median 37.3 Mi/s | warm [37.1, 36.9, 38.5] median 37.1 Mi/s
