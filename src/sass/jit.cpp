@@ -1196,4 +1196,9 @@ std::shared_ptr<Unit> make_unit(const tier::Program& prog, int sm) {
   return u;
 }
 
+
+void attach(tier::Program& prog, int sm) {
+  if (requested()) prog.jit = make_unit(prog, sm);
+}
+
 }  // namespace vgpu::sass::jit

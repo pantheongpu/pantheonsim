@@ -251,6 +251,8 @@ bool requested();
 
 // Region discovery over the tier's program; null if the unit has none. `max_region` caps a region's length.
 std::shared_ptr<Unit> make_unit(const tier::Program& prog, int sm);
+// Gives `prog` its unit when the JIT is on (VGPU_JIT=1); otherwise does nothing.
+void attach(tier::Program& prog, int sm);
 
 // Test and statistics access.
 struct Stats {
