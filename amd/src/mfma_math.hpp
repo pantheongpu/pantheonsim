@@ -102,6 +102,25 @@ inline double mfma_add(double sum, double p) {
 #endif
 }
 
+// A value times the scale of the block-scaled forms (or 1.0). Where both are NaNs the product is the first operand's payload, which
+// the compiler would choose, so the order is fixed (the reference path and the tile path both use this).
+#ifndef MFMA_SCALE_FIRST_V
+#define MFMA_SCALE_FIRST_V 1
+#endif
+inline double mfma_scale_mul(double v, double s) {
+#if defined(__x86_64__)
+#if MFMA_SCALE_FIRST_V
+  __asm__("mulsd %1, %0" : "+x"(v) : "x"(s));
+  return v;
+#else
+  __asm__("mulsd %1, %0" : "+x"(s) : "x"(v));
+  return s;
+#endif
+#else
+  return v * s;
+#endif
+}
+
 // One output of a matrix multiply-accumulate: c plus the dot product of a row of A with a column of B, k terms taken in
 // order and summed in double (so the order is the result). `bt` is that column, stored contiguously.
 //

@@ -62,6 +62,7 @@ C = _load_common()
 # target -> (offload arch, VGPU_GPU profile)
 TARGETS = {
     "mi300x": ("gfx942", "amd/mi300x"),
+    "mi350x": ("gfx950", "amd/mi350x"),   # CDNA4: the small-float (f8f6f4) and block-scaled matrix forms
     "rx6800": ("gfx1030", "amd/rx6800"),
     "rx7900xtx": ("gfx1100", "amd/rx7900xtx"),   # RDNA3: WMMA
     "rx9070xt": ("gfx1201", "amd/rx9070xt"),     # RDNA4: WMMA
@@ -78,6 +79,9 @@ WORKLOADS = {
     "mfma_fp8": ("matrix", "v_mfma_f32_16x16x32_fp8_fp8 accumulated in a loop (CDNA3)", ("mi300x",)),
     "mfma_bf16": ("matrix", "v_mfma_f32_16x16x16_bf16 accumulated in a loop (CDNA3)", ("mi300x",)),
     "mfma_f64": ("matrix", "v_mfma_f64_16x16x4_f64 accumulated in a loop (CDNA3)", ("mi300x",)),
+    "mfma_f64_4b": ("matrix", "v_mfma_f64_4x4x4_4b_f64 (four 4x4 blocks, several groups of K a block) accumulated in a loop (CDNA3)", ("mi300x",)),
+    "mfma_f8f6f4": ("matrix", "v_mfma_f32_16x16x128_f8f6f4 with 8-bit operands accumulated in a loop (CDNA4)", ("mi350x",)),
+    "mfma_scale": ("matrix", "v_mfma_scale_f32_16x16x128_f8f6f4 (block scales, 8-bit operands) accumulated in a loop (CDNA4)", ("mi350x",)),
     "smfmac": ("matrix", "v_smfmac_f32_16x16x32_f16 (2:4 sparse A) accumulated in a loop (CDNA3)", ("mi300x",)),
     "wmma": ("matrix", "v_wmma_f32_16x16x16_f16 accumulated in a loop (RDNA3, RDNA4)", ("rx7900xtx", "rx9070xt")),
     "wmma_iu8": ("matrix", "v_wmma_i32_16x16x16_iu8 accumulated in a loop (RDNA3, RDNA4)", ("rx7900xtx", "rx9070xt")),

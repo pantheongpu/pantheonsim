@@ -1294,6 +1294,9 @@ vgpu_unit_test(test_sched)
 vgpu_unit_test(test_sass_access_count)
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
+# The allocation table's bookkeeping (alloc, free, quarantine, recycled chunks, the lock and its epoch) against a model
+# and against the digest of the implementation before the speed work.
+vgpu_unit_test(test_memalloc)
 # The one-lookup read-modify-write and multi-field read, against the load_scalar / store_scalar calls they replace.
 vgpu_unit_test(test_memrmw)
 # The warp's local memory, interleaved by words, against the per-lane layout it replaced.
@@ -3472,6 +3475,10 @@ if(Python3_Interpreter_FOUND)
   # (BURST_CONTAINER_OPTIONS, or BURST_MEM_LIMIT_GIB and BURST_JOBS_MAX for a job outside a container).
   add_test(NAME lint_burst_cap
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_burst_cap.py)
+  # The AMD interpreter's instruction ladders are switches on the name's hash (amd/tools/ladder-to-switch.py): a merge that
+  # brings an if-ladder back (or a `break` that makes the converter skip a chain) costs a hash comparison per rung per instruction.
+  add_test(NAME lint_amd_ladders
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_ladders.py)
   # Every exported runtime and driver function is a call a profiler is told of,
   # and the driver shim takes the argument sizes the toolkit declares (CUPTI
   # reads them by those sizes).
@@ -3506,6 +3513,16 @@ add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shi
 set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
+# No shim library takes static TLS (glibc leaves ~1.6 KB for every library loaded late).
+# (Not under a sanitizer: its runtime keeps initial-exec thread-locals in every library it is linked into, so the check would report the
+# runtime, not the simulator.)
+if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize")
+  add_test(NAME lint_static_tls COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_static_tls.sh)
+  set_tests_properties(lint_static_tls PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+endif()
 
 # No file under NVIDIA's proprietary terms in the tree, and the fetch that
 # stands in for the cuDNN headers that used to be vendored.

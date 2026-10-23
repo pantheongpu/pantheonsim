@@ -176,6 +176,22 @@
    "dispatches": 1,
    "wave_instructions": 104256
   },
+  "mi300x/mfma_f64_4b": {
+   "SQ_INSTS_BRANCH": 25728,
+   "SQ_INSTS_LDS": 0,
+   "SQ_INSTS_MFMA": 25600,
+   "SQ_INSTS_SALU": 51264,
+   "SQ_INSTS_SENDMSG": 0,
+   "SQ_INSTS_SMEM": 192,
+   "SQ_INSTS_VALU": 26560,
+   "SQ_INSTS_VMEM": 192,
+   "SQ_INSTS_VMEM_RD": 128,
+   "SQ_INSTS_VMEM_WR": 64,
+   "SQ_WAVES": 64,
+   "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
+   "dispatches": 1,
+   "wave_instructions": 103936
+  },
   "mi300x/mfma_fp8": {
    "SQ_INSTS_BRANCH": 12928,
    "SQ_INSTS_LDS": 0,
@@ -335,6 +351,38 @@
    "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
    "dispatches": 1,
    "wave_instructions": 311168
+  },
+  "mi350x/mfma_f8f6f4": {
+   "SQ_INSTS_BRANCH": 6656,
+   "SQ_INSTS_LDS": 0,
+   "SQ_INSTS_MFMA": 6400,
+   "SQ_INSTS_SALU": 12992,
+   "SQ_INSTS_SENDMSG": 0,
+   "SQ_INSTS_SMEM": 64,
+   "SQ_INSTS_VALU": 9024,
+   "SQ_INSTS_VMEM": 2432,
+   "SQ_INSTS_VMEM_RD": 2176,
+   "SQ_INSTS_VMEM_WR": 256,
+   "SQ_WAVES": 64,
+   "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
+   "dispatches": 1,
+   "wave_instructions": 31168
+  },
+  "mi350x/mfma_scale": {
+   "SQ_INSTS_BRANCH": 6656,
+   "SQ_INSTS_LDS": 0,
+   "SQ_INSTS_MFMA": 6400,
+   "SQ_INSTS_SALU": 13056,
+   "SQ_INSTS_SENDMSG": 0,
+   "SQ_INSTS_SMEM": 64,
+   "SQ_INSTS_VALU": 9856,
+   "SQ_INSTS_VMEM": 2432,
+   "SQ_INSTS_VMEM_RD": 2176,
+   "SQ_INSTS_VMEM_WR": 256,
+   "SQ_WAVES": 64,
+   "TA_FLAT_ATOMIC_WAVEFRONTS": 0,
+   "dispatches": 1,
+   "wave_instructions": 32064
   },
   "rx6800/atomics": {
    "SQ_INSTS_FLAT": 18928,
