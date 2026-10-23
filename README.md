@@ -45,7 +45,7 @@ Inside, `nvidia-smi` shows the GPUs, and you can compile, download programs with
 
 ## Choose your machine
 
-Which GPUs: `make list-gpus` (or `build/vgpu list-gpus`) prints every id you can use, about 50 NVIDIA and AMD cards from a T4 to a B300 and from an RX 6700 XT to an MI455X. Use the id as printed: `gpu: nvidia/t4` in the settings file, or `make run GPU=nvidia/t4`. `build/vgpu info --gpu nvidia/t4` shows one card. Some profiles were measured on a physical card and some come from public documents only; [Status and limits](docs/status.md) says which.
+Which GPUs: `make list-gpus` (or `build/vgpu list-gpus`) prints every id you can use, 48 NVIDIA and AMD cards from a T4 to a B300 and from an RX 6700 XT to an MI455X. Use the id as printed: `gpu: nvidia/t4` in the settings file, or `make run GPU=nvidia/t4`. `build/vgpu info --gpu nvidia/t4` shows one card. Some profiles were measured on a physical card and some come from public documents only; [Status and limits](docs/status.md) says which.
 
 Put the settings in a file, for example `my.yaml`, then `./run my.yaml`. [pantheonsim.example.yaml](pantheonsim.example.yaml) lists every setting and runs as it is (`./run pantheonsim.example.yaml`); copy it to `pantheonsim.yaml` to make it the default, which is also what `./run` writes for you on a first run:
 
@@ -64,7 +64,7 @@ Every setting the file accepts (the full text for each is in [Settings](docs/con
 | `vram_mb` | MiB, at least 1 | the profile's own | Memory per device |
 | `cuda_version` | `major.minor`, such as `13.0` | this build's | The CUDA version `nvidia-smi` and NVML report |
 | `driver_version` | such as `580.65.06` | this build's | The NVIDIA driver version reported |
-| `rocm_version` | such as `6.4.0` | this build's | The ROCm version `rocm-smi` and `amd-smi` report |
+| `rocm_version` | such as `6.4.0` | `6.2.0` in the machine shell | The ROCm version `amd-smi version` reports |
 | `os` | `ubuntu`, `rocky` or `debian`, with a version (`ubuntu:24.04`) | `ubuntu:22.04` | The operating system the machine presents |
 | `ram_mb` | MiB, at least 1 | unlimited | Host RAM device memory may use before it spills to `memory_dir` |
 | `memory_dir` | a directory | never spill | Where device memory past `ram_mb` goes (runs at disk speed) |

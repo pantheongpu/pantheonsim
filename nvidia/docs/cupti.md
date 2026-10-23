@@ -540,7 +540,7 @@ performance counters. The exact counters this engine keeps -- instruction mix,
 sectors and coalescing, shared-memory bank conflicts, tensor-core issues -- are
 a different set from the ones a device exposes, and mapping them onto
 NVIDIA's metric names would claim an equivalence that does not hold. They are
-reported through `VGPU_COUNTERS`; see the README.
+reported through `VGPU_COUNTERS`; see [diagnostics.md](../../docs/diagnostics.md).
 
 **Nothing derived from time.** No cycles, no stall reasons, no achieved
 occupancy, no cache hit rates. There is no timing model and no cache model to

@@ -145,7 +145,7 @@ logger callback and `cublasXerbla` are there. What remains is listed in [librari
 ## The rest of the stack
 
 cuBLAS was the first of these; cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE,
-cuSOLVER and NCCL followed, all drawing the same library-vs-kernel boundary and
+cuSOLVER, NCCL and the rest (cuSPARSELt, cuTENSOR, cuDSS, nvCOMP, NVSHMEM, NPP, nvJPEG and others) followed, all drawing the same library-vs-kernel boundary and
 all proved the same way. **nvidia/docs/libraries.md** covers the set — what each one
 implements, what it deliberately does not, and how each was verified against a
 physical GPU.

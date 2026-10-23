@@ -73,7 +73,7 @@ reliability and its PCIe link:
 | `memory` | `hbm` or `gddr`. HBM cards remap failing rows; so does any card with ECC from Ampere on (an A10, L4 or L40S has GDDR and remaps), and a T4 or earlier retires pages | datasheet; NVIDIA's memory-error guide |
 | `memory_temperature` | the driver reports a memory sensor | real runs; most HBM cards report none |
 | `pcie_link` | the link real cards most often run at, such as `"Gen4 x8"` | the benchmark database of real runs |
-| `nvlink` | NVLink generation and link count, such as `"NVLink4 x18"`, on the SXM profiles (A100, H100, H200, B200, B300); absent on every other card | datasheet |
+| `nvlink` | NVLink generation and link count, such as `"NVLink4 x18"`, on the SXM profiles (A100, H100, H200, B200, B300, GB200); absent on every other card | datasheet |
 
 The link is a fact about how cards are hosted, not the slot they fit: a T4 is
 an x16 card that clouds attach at x8, and a GH200's Hopper die reaches its
@@ -120,7 +120,7 @@ NVML, nvidia-smi and a register read agree.
 | Retired pages and pending (`GetRetiredPages`, `_v2`, `GetRetiredPagesPendingStatus`, fields 29-31, 92, 93) | yes | NOT_SUPPORTED | NOT_SUPPORTED |
 | Remapped rows (`GetRemappedRows`, fields 142-145) | NOT_SUPPORTED | yes | NOT_SUPPORTED |
 | Row-remapper histogram | NOT_SUPPORTED | NOT_SUPPORTED (no profile has a bank count) | NOT_SUPPORTED |
-| NVLink (`GetNvLinkState`, `Version`, `Capability`, `ErrorCounter`, fields 91 and the error fields) | NOT_SUPPORTED | A100 and H100 only; link-count and version from the profile | NOT_SUPPORTED |
+| NVLink (`GetNvLinkState`, `Version`, `Capability`, `ErrorCounter`, fields 91 and the error fields) | NOT_SUPPORTED | the profiles with an `nvlink` key (A100, H100, H200, B200, B300, GB200); link-count and version from the profile | NOT_SUPPORTED |
 
 Also answered on every card: clock-event reasons, supported (the driver's
 bits 0-8) and current (`GetCurrentClocksThrottleReasons`,
@@ -413,8 +413,10 @@ correct, not decorative. Each virtual device gets its own bus slot
 
 ## AMD
 
-AMD profiles (`amd/mi300x`, `amd/mi325x`, `amd/mi350x`) are **discovery only**.
-`rocm-smi`, `rocm_agent_enumerator`, and `lspci` report them correctly, and
+The AMD profiles (every file in `amd/profiles`: `mi250x`, `mi300x`, `mi325x`,
+`mi350x`, `mi455x`, `rx6700xt`, `rx6800`, `rx6900xt`, `rx7900xtx`, `rx9070xt`)
+show up in the discovery tools. `rocm-smi`, `rocm_agent_enumerator`, and `lspci`
+report them correctly, and
 `rocm_agent_enumerator` prints the right ISA targets (`gfx942` for CDNA3,
 `gfx950` for CDNA4). `rocm-smi` takes its documented `-a`, `--showid`,
 `--showproductname`, `--showmeminfo vram`, `--showtemp`, `--showpower`,
@@ -456,8 +458,9 @@ execution still refuses is in the gap register at the end of TODO.md.
 
 ## Where telemetry lives
 
-A small file-backed shared segment, so observers in other processes can read
-it: `$XDG_RUNTIME_DIR/vgpu-telemetry`, or `/tmp/vgpu-telemetry-<uid>`.
+A small file-backed shared segment per publishing process, so observers in other
+processes can read it: in the directory `$XDG_RUNTIME_DIR/vgpu-telemetry.d`, or
+`/tmp/vgpu-telemetry-<uid>.d`.
 Override with `VGPU_TELEMETRY_PATH`; disable with `VGPU_TELEMETRY=0`. Readers
 use a seqlock, so a snapshot is never half-updated, and a segment left behind
 by a dead process reports no devices rather than phantom hardware.

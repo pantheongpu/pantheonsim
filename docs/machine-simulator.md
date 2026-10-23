@@ -29,7 +29,7 @@ build/bin/vgpu shell
   VirtualGPU machine simulator
   Configure the machine to simulate; press Enter to accept a default.
 
-  Available GPUs:
+  Available GPUs:        (the real list has every profile; this is an excerpt)
     nvidia/a10     NVIDIA A10                   24 GiB
     nvidia/a100    NVIDIA A100-SXM4-80GB        80 GiB
     nvidia/h100    NVIDIA H100 80GB HBM3        80 GiB
@@ -56,7 +56,7 @@ Then:
 ```
 (vgpu 8xNVIDIA H200) ~$ nvidia-smi
 +-----------------------------------------------------------------------------------------+
-| VGPU-SMI 0.1.0                  Driver Version: 560.35.03     CUDA Version: 12.6    |
+| NVIDIA-SMI 560.35.03            Driver Version: 560.35.03     CUDA Version: 12.6    |
 ...
 |   0  NVIDIA H200                  On  | 00000000:01:00.0 Off |                  N/A |
 | 25%   43C    P0        531W / 700W |        0MiB / 144384MiB |    80%      Default |
@@ -81,7 +81,7 @@ build/bin/vgpu shell -y --gpu amd/mi300x --count 8 --rocm 6.2.0 \
 | Flag | Meaning |
 | --- | --- |
 | `--gpu`, `--count 1..16`, `--vram-mb` | the rack |
-| `--cuda`, `--rocm`, `--driver` | reported toolkit and driver versions; the defaults are the ones this build's runtime carries (what `build/bin/nvidia-smi --version` prints outside a session) |
+| `--cuda`, `--rocm`, `--driver` | reported toolkit and driver versions; the CUDA and driver defaults are the ones this build's runtime carries (what `build/bin/nvidia-smi --version` prints outside a session), the ROCm default is 6.2.0 |
 | `--os ubuntu:22.04\|ubuntu:24.04\|rocky\|debian`, `--kernel`, `--hostname` | machine identity |
 | `--load 0..1` | background load, so the telemetry columns move |
 | `--no-isolate` | skip the namespaces (session tools only) |
@@ -101,7 +101,7 @@ without it, with the session's `PATH` and `LD_LIBRARY_PATH` already set.
 | `nvidia-smi` | live table, `-q [-d SECTIONS]`, `-x`, `--query-gpu=... --format=csv`, `-L`, `-i`, `-l`/`-lms`, `topo -m`, `--version`, `-h` |
 | `rocm-smi` | ROCm concise-info table; `-a`, `-i`, `--showproductname`, `--showmeminfo`, `-t`, `-P`, `-u`, `-c`, `-s`, `-g`, `-f`, `-v`, `--showbus`, `--showhw`, `--showdriverversion`, `--showpids`, `--showtopo`, `--showmemuse`, `--showperflevel`, `--showvoltage`, `--showenergycounter`, `--showcomputepartition`, `--showmemorypartition`, `--showpagesinfo`, `--showrasinfo`, `--showxgmierr`, `--showfwinfo`, `--showmaxpower`, `--showserial`, `--showuniqueid`, `-d N`, `--json`, `--csv` |
 | `amd-smi` | `list`, `static` (every section), `metric` (usage, power, clock, temperature, PCIe, ECC, fan, memory, ...), `process`, `topology`, `monitor`, `partition`, `xgmi`, `bad-pages`, `firmware`, `ras --cper`, `version`; `--json`, `-g N` |
-| `rocm_agent_enumerator` | `gfx000` plus each AMD device's own target (gfx942, gfx950, gfx90a, gfx1030, gfx1100, gfx1201) |
+| `rocm_agent_enumerator` | `gfx000` plus each AMD device's own target (gfx942, gfx950, gfx90a, gfx1030, gfx1031, gfx1100, gfx1201, gfx1250) |
 | ROCm's `rocm_agent_enumerator` | reads the session's KFD topology (`/sys/class/kfd/kfd/topology`) in an isolated AMD session, unmodified; the session also has `/dev/kfd` and `/dev/dri` |
 | ROCm's `rocm-smi` | runs unmodified in an isolated AMD session, on VirtualGPU's `librocm_smi64` (the session sets `ROCM_SMI_LIB_PATH` and shows `/sys/module/amdgpu` loaded), and reports what VirtualGPU's `rocm-smi` does |
 | `rocminfo` | ROCm's own where the host has it (it reads the simulated agents through the session's HSA runtime), otherwise VirtualGPU's, which prints the same |
@@ -185,8 +185,10 @@ cleaned up rather than reported as phantom hardware.
   real utilization, not predictions. See [telemetry.md](telemetry.md).
 - What a simulated AMD card has no value for -- VBIOS, serial numbers,
   firmware versions, energy counters -- `rocm-smi` and `amd-smi` report as
-  N/A rather than invent. There is no `/dev/kfd` or `/dev/dri`: programs
-  reach the GPUs through the session's HIP and HSA runtimes, not the kernel.
+  N/A rather than invent. `/dev/kfd` and `/dev/dri` exist in an isolated AMD
+  session but open as `/dev/null`, and a kernel-driver request (an ioctl) is
+  refused: programs reach the GPUs through the session's HIP and HSA runtimes,
+  not the kernel.
 - `dmesg` output is generated for the session, not a real kernel log; there is
   no kernel driver here to log anything.
 - The session simulates a machine's *GPU-facing* surfaces. It is not a

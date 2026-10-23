@@ -41,3 +41,10 @@ changed in three marked places -- see `metis/README.md`. It is compiled into
 `cusolverSpXcsrmetisndHost` as a wrapper of that function and its
 permutation is METIS's. It is vendored rather than fetched at build time so a
 build needs no network.
+
+## Sobol' direction numbers
+
+`joe_kuo/sobol_directions.inc` is Joe and Kuo's published Sobol' direction
+numbers (`new-joe-kuo-6.21201`, BSD-style licence, text at the top of the file),
+packed by `joe_kuo/gen_sobol_directions.py`. `libcurand`'s shim includes it
+(`nvidia/src/curand_api.cpp`) to answer the `*_JOEKUO6` direction-vector calls.

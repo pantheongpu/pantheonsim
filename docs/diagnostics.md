@@ -58,8 +58,8 @@ because you are looking for something. It found the flash-attention race in
 llama.cpp in one run, naming the kernel, the PTX line and both warps; that same
 bug took a day to corner by bisection.
 
-`VGPU_STRICT` is off by default for a reason worth knowing. Both of those
-checks find real bugs, and both fire on code that is perfectly correct: ptxas
+`VGPU_STRICT` is off by default for a reason worth knowing. Its two checks,
+integer division by zero and storing a register nothing has written, find real bugs, and both fire on code that is perfectly correct: ptxas
 emits arithmetic whose result is dead, ggml divides by a stride its
 configuration does not use, and CUB stores an undefined register into the
 unused part of a shared tile. A check that also rejects working programs
@@ -76,6 +76,6 @@ Errors return documented `CUresult` codes **and** print a rich diagnostic:
   GPU profile: nvidia/h100
 ```
 
-These diagnostics are a core product feature: VirtualGPU aims to grow into an
-ASan/TSan-analogue for GPU software (races, invalid memory, OOM injection),
-which real GPUs cannot give you cheaply.
+These diagnostics are a core product feature: VirtualGPU is built to be an
+ASan/TSan-analogue for GPU software (races, invalid memory, injected errors and
+hangs with `vgpu fault`), which real GPUs cannot give you cheaply.

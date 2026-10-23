@@ -344,8 +344,8 @@ CAVLC or CABAC, I, P and B slices, 4x4 and 8x8 transforms, scaling matrices,
 explicit and implicit weighted prediction, spatial and temporal direct prediction,
 multiple slices and references, long-term references, every deblocking setting,
 odd sizes with cropping, all decode to the checksums of the card's NVDEC
-(`nvidia/tests/data/h264`: 51 streams in 103 parser-driving runs; the card's
-transcript is `nvcuvid_h264.rtx3060.txt`, 12 991 lines, and holds the CRC-32 of
+(`nvidia/tests/data/h264`: 52 streams in 103 parser-driving runs; the card's
+transcript is `nvcuvid_h264.rtx3060.txt`, 14 637 lines, and holds the CRC-32 of
 every displayed frame, with `run_nvcuvid_h264.sh --card` running the same program
 against the driver). The parser reproduces what the card's does and the Recommendation
 leaves open: when a picture is complete, the number of decode surfaces it asks for,
@@ -548,6 +548,7 @@ unmeasured; `MatmulSearch` runs the product once and keeps the plan's
 configuration; NVIDIA's `CompressedSize2` counts one batch until a plan has
 used the descriptor, this one always counts them all; the workspace a plan
 asks for is the card's for the default split-K and is never used.
+
 ## cuTENSOR and cuTensorNet: tensor contractions, and networks of them
 
 NVIDIA's libcutensor and libcutensornet each carry a static CUDA runtime that
@@ -611,6 +612,8 @@ workspace sizes differ, the contracted tensor does not. A sliced extent means
 what NVIDIA reports -- the extent of the mode within one slice, so a mode of
 extent 8 sliced completely shows as 1 and gives 8 slices.
 
+## The libraries at a glance
+
 | library | soname | what it covers |
 | --- | --- | --- |
 | CUDA driver | `libcuda.so.1` | contexts, modules, memory, launches |
@@ -639,7 +642,7 @@ extent 8 sliced completely shows as 1 and gives 8 slices.
 | NPP | `libnppc.so.13` and ten siblings | image and signal primitives: arithmetic, logic and shifts, colour conversion, gamma and Bayer demosaicing, statistics, histograms and integral images, box, rank and morphological filters, gradients and Canny, affine and perspective warps, rotation, remapping, resizing and mirroring, watershed segmentation -- every entry point OpenCV, DALI, FFmpeg, jetson-utils and the CUDA Samples call (below) |
 | nvJPEG | `libnvjpeg.so.13` | JPEG decode (baseline, progressive, CMYK; single, batched and decoupled APIs) and encode (baseline, progressive) |
 | NVENC | `libnvidia-encode.so.1` | video encode: every status, query, capability, preset configuration and error string of the API as an RTX 3060 answers it; compressing H.264 (CAVLC and CABAC, 8x8 transform, P and B pictures, slices) and HEVC (intra, P and B pictures, in-loop deblocking) encoders, rate control, and the card's NEED_MORE_INPUT protocol for B pictures (below) |
-| NVDEC | `libnvcuvid.so.1` | video decode: the cuvid parser and decoder API, Motion JPEG decoded on the host into NV12 surfaces as the card writes them; every other codec reports itself unsupported (below) |
+| NVDEC | `libnvcuvid.so.1` | video decode: the cuvid parser and decoder API, Motion JPEG, H.264, HEVC and MPEG-2 decoded on the host into NV12 surfaces as the card writes them; every other codec reports itself unsupported (below) |
 
 ## Why the math runs on the host
 
@@ -669,7 +672,7 @@ and spread over the host's threads. `host_gemm.hpp` (cuBLAS and cuBLASLt matrix 
 convolution through an unrolled copy of the input), `host_conv.hpp` (cuDNN convolution rows and the filter gradient),
 `host_fft.hpp` (cuFFT's mixed radix, twiddle factors looked up in tables that are filled once per size), `host_dense.hpp`
 (cuSOLVER's LU, Cholesky, QR and triangular solves, with the loops run down columns), `host_jpeg.hpp` (nvJPEG's
-inverse and forward DCT and colour conversion) are the kernels; `tests/unit/test_host_*.cpp` keep the loops they replaced
+inverse and forward DCT and colour conversion) are the kernels; `nvidia/tests/unit/test_host_*.cpp` keep the loops they replaced
 as the reference and compare bits over shapes and values that break arithmetic (zeros, signed zeros, subnormals, infinities,
 NaNs, extremes).
 
@@ -685,7 +688,7 @@ operand is converted to the accumulator type (bf16, fp16, fp8 or a scaled value 
 as `host_gemm.hpp` packs it, through a *loader* (`gemm_with`), and cuBLASLt's sums come a strip of columns at a time
 (about 8 MiB) into the epilogue, so a 8192-cubed bf16 matmul that once held 1.9 GiB beside its operands holds 0.4 GiB
 (the raw bytes of A, B and D, 128 MiB each) plus a few MiB. The chain of each output is the same, so no bit moves;
-`tests/unit/test_cublaslt_matmul.cpp` and `test_cublas_gemmex_mixed.cpp` check the bits against the plain loops and
+`nvidia/tests/unit/test_cublaslt_matmul.cpp` and `test_cublas_gemmex_mixed.cpp` check the bits against the plain loops and
 count the heap a 2048-cubed call holds at its peak.
 
 ### What round 8 added, and what it measured
@@ -698,7 +701,7 @@ quieter machine, against the same sources (the files they involve are not touche
 
 The cuBLAS routines read their operands as the loaders of `host_gemm.hpp` do: the complex kernels take a loader per operand
 (`cgemm_with`, which hands each element as a `CPair`), a panel at a time, so the real and imaginary planes of a whole operand are never
-made; `tests/unit/test_cublas_complex_heap.cpp` bounds the heap a 512-cubed `Zgemm` and a 768 x 512 `Dsyrk` hold.
+made; `nvidia/tests/unit/test_cublas_complex_heap.cpp` bounds the heap a 512-cubed `Zgemm` and a 768 x 512 `Dsyrk` hold.
 
 | call | before | after | how |
 | --- | --- | --- | --- |
@@ -726,7 +729,7 @@ made; `tests/unit/test_cublas_complex_heap.cpp` bounds the heap a 512-cubed `Zge
 | H.264 encoder, same size, High / Baseline | 552 / 268 ms | 403 / 197 ms | the sample positions of a block chosen once, not per sample; AVX2 SAD |
 
 `video_simd.hpp` holds the AVX2 codec kernels (compiled under a target pragma and called after a CPU check, like the matrix product), and
-`tests/unit/test_video_simd.cpp` compares each with the scalar loops over random and extreme inputs. In the cuBLAS routines a result is
+`nvidia/tests/unit/test_video_simd.cpp` compares each with the scalar loops over random and extreme inputs. In the cuBLAS routines a result is
 computed by the new kernels only when it is certain to be the loops' answer: with an infinity or a NaN among the operands, or a sum that
 overflows to one, the std::complex<double> multiply's repair of a NaN product comes into play, which the kernels do not have, and the routine
 runs its old loops (`blas_host_sums.cu` checks this with operands that hold infinities, NaNs and values that overflow). The NaN sign and
@@ -759,7 +762,7 @@ equal in every row. The sizes are the ones the rounds before used.
 | cuDNN `ActivationForward` relu / sigmoid (beta 0.5) / tanh; `ActivationBackward` relu / tanh / sigmoid (beta 0.5), 1.6M floats | 13 / 15 / 23 ms; 8.8 / 9.2 / 14.7 ms | 1.9 / 7.5 / 18.6 ms; 3.6 / 3.9 / 4.9 ms | the tensor is decoded, activated, blended and encoded a block at a time in cache (one copy out of device memory and one back, as before), instead of as whole tensors of doubles |
 | cuDNN `AddTensor`, 1.6M floats: same shape / bias `[1,C,1,1]` added (beta 1) / bias with beta 0 | 20.7 / 16.1 / 9.9 ms | 8.8 / 5.6 / 3.2 ms | the broadcast of A is made a block at a time inside the same block loop (an odometer over C's dimensions started at the block's first element), not as a whole-tensor index vector and a whole-tensor copy |
 
-`tests/unit/test_host_jacobi.cpp`, `test_npp_simd.cpp` (also the morphology and box filter), `test_host_blas2.cpp`, `test_host_jpeg.cpp`,
+`nvidia/tests/unit/test_host_jacobi.cpp`, `test_npp_simd.cpp` (also the morphology and box filter), `test_host_blas2.cpp`, `test_host_jpeg.cpp`,
 `test_video_simd.cpp` and `test_mpeg2_decode.cpp` keep the plain loops (or their digests) as the reference and compare every element over
 many sizes and over values that break arithmetic; `nvidia/tests/e2e/solver_jacobi_paths.cu` pins the Jacobi solvers to the digests the loops gave,
 and `npp_host_ops.cu` covers thresholding, comparison, Dilate/Erode and `Resize_8u`. The conformance programs `npp_imgproc`, `npp_ops`, `npp_segment`, `cudnn_ops`, `cudnn_backward` and
@@ -2008,7 +2011,7 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   cuTensorMp and cuSOLVERMp: NVIDIA's library answers NOT_SUPPORTED on a machine without NCCL and
   so does this one on any, after the argument checks that library makes first) and the
   undocumented exports answer NOT_SUPPORTED. Distributed execution is done for contractions and
-  the state API's amplitudes, marginals and expectation values (see below): not done are the
+  the state API's amplitudes, marginals and expectation values (see above): not done are the
   sampler's exchange of samples (every rank samples alone, with the same seed), the hyper-optimizer
   exchanges of the preparation calls (the search here is deterministic, so the optimizer and the
   state API's prepare calls keep what each rank finds; the optimizer does exchange its plan, as
@@ -2098,8 +2101,11 @@ rather than a plausible wrong answer, so a caller's fallback path still works.
   vector prediction, asymmetric partitions, sample adaptive offset, transform skip,
   sign data hiding, scaling lists, several slices, tiles and wavefronts. The bytes are
   not NVIDIA's.
-- **NVDEC**: every codec but JPEG (reported unsupported), progressive JPEG
-  (the card refuses it too), display-area and target-rectangle cropping,
+- **NVDEC**: every codec but JPEG, H.264, HEVC and MPEG-2 (reported
+  unsupported; MPEG-1, MPEG-4, VC-1, VP8, VP9 and AV1 among them), progressive
+  JPEG (the card refuses it too), in H.264 flexible macroblock ordering,
+  redundant pictures, SP/SI slices and data partitioning, in HEVC 4:4:4,
+  4:2:2 and monochrome, in MPEG-2 the scalable extensions, display-area and target-rectangle cropping,
   deinterlacing, output formats other than NV12 (the card refuses those), video
   sources, and the card's decode of truncated or damaged pictures (the card
   returns success with whatever its engine makes of them; a picture the host
