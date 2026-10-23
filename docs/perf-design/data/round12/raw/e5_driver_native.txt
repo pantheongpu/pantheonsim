@@ -1,0 +1,10 @@
+module_load+getfunction_us 76.0
+cuLaunchKernel+sync_us 11.38
+cuLaunchKernel_pipelined_us 3.43
+cuMemAlloc_1MiB_us 82.38
+cuMemFree_1MiB_us 67.10
+vmm_reserve+create+map+access_2MiB_us 129.93 (hint honoured exactly 84 of 100)
+vmm_unmap+release+free_us 129.65
+copy 4096 B: H2D_us 8.4 D2H_us 13.3
+copy 1048576 B: H2D_us 146.9 D2H_us 166.8
+copy 67108864 B: H2D_us 5327.8 D2H_us 7267.7

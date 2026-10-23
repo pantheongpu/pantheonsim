@@ -8,7 +8,7 @@ from compare import load, classify
 d = sys.argv[1]
 notes = json.load(open(sys.argv[2])) if len(sys.argv) > 2 else {}
 N1, N2, S1, S2 = (load(d, t) for t in ("native1", "native2", "sim1", "sim2"))
-rows, tally = [], collections.Counter()
+rows, tally, raw = [], collections.Counter(), collections.Counter()
 for k in sorted(N1):
     nn = classify(N1.get(k), N2.get(k))[0]
     ns1 = classify(N1.get(k), S1.get(k))
@@ -17,7 +17,7 @@ for k in sorted(N1):
     best = ns2 if (ns2 and ns2[0] in ("identical", "timing-only") and ns1[0] not in ("identical", "timing-only")) else ns1
     if k in S2 and ns2 and ns1[0] in ("B-fails",) and ns2[0] not in ("B-fails",): best = ns2
     c = best[0]
-    if c in ("identical", "timing-only"): v = "bit-identical"
+    if c in ("identical", "timing-only"): v = "bit-identical"; raw[c] += 1
     elif c == "both-fail-same": v = "fails the same way on both"
     elif c == "both-fail-differ": v = "fails on both (differently)"
     elif k in notes: v = notes[k][0]
@@ -33,3 +33,4 @@ for r in rows: print("| " + " | ".join(x.replace("|", "/") for x in r) + " |")
 print()
 for v, n in tally.most_common(): print("* %s: %d" % (v, n))
 print("* total:", sum(tally.values()))
+print("* of the bit-identical: %d byte-identical, %d identical after the timing filter" % (raw["identical"], raw["timing-only"]))

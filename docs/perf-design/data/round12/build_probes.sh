@@ -5,3 +5,5 @@ nvcc -arch=sm_86 -cudart shared probe_props.cu -o ~/results/probes/probe_props
 nvcc -arch=sm_86 -O2 -cudart shared e5_launch.cu -o ~/results/probes/e5_launch
 nvcc -arch=sm_86 probe_va.cu -o ~/results/probes/probe_va -lcuda
 nvcc -arch=sm_86 -O2 -cudart shared e5_gemm.cu -o ~/results/probes/e5_gemm -lcublas
+nvcc -arch=sm_86 -O2 -cudart shared e5_driver.cu -o ~/results/probes/e5_driver -lcuda
+nvcc -arch=sm_86 -cubin empty.cu -o ~/results/probes/empty.cubin

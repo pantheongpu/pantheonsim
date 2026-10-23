@@ -26,12 +26,17 @@ BARE = re.compile(r"^\s*[-+]?[\d.]+(e[-+]?\d+)?\s*$", re.I)
 EXTRA = re.compile(r"(?i)(\d\s?s\b|\bTOOK\b|\bTIME TO\b|\bBACK:|\bFREE TIME|memcopy:|\bGPU Execution|\bcontext=0x|shm\d+|\b0x[0-9a-f]{6,}\b)")
 
 
+IDENT = re.compile(r"(?i)(A10G|H100|RTX ?5090|GeForce|\bL4\b|L40S|A100|Tesla T4|\bT4\b|Ampere|Hopper|Blackwell|Turing|Ada Lovelace|compute capability|Multi-?Processors|Compute \d\.\d|"
+                    r"Driver version|\bsm_\d\d|Device Name|device \d with name|Using CUDA Device|CUDA device|\bGPU Device|running on GPU|Estimating Pi on GPU|Pricing option on GPU|\bGPU \d?:?\s*NVIDIA|SMs?\b|multiprocessor)")
+IDENT_ON = os.environ.get("IDENT") == "1"  # IDENT=1: also drop lines that only state which device it is (name, capability, SM count, driver version)
+
+
 def filt(t):
     """Drops timing lines: those with a time/throughput word or a number followed by 's', and a bare-number line that follows one
     (PolyBench prints 'GPU Time in seconds:' then the number on the next line). Pointers and pids in names are dropped too."""
     out, prev_timing = [], False
     for l in t.splitlines():
-        timing = bool(TIME.search(l) or EXTRA.search(l))
+        timing = bool(TIME.search(l) or EXTRA.search(l) or (IDENT_ON and IDENT.search(l)))
         if timing or not l.strip() or (prev_timing and BARE.match(l)):
             prev_timing = timing or (prev_timing and bool(BARE.match(l)))
             continue
