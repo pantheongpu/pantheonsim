@@ -57,16 +57,34 @@ Lost for offloaded launches: counters, fault injection, OOB/use-after-free/race 
 `approx` only: results can differ from the simulator's and from another machine's (SFU rounding, tensor-core accumulation order). A per-kernel line in the
 summary says how many launches and how many warp-instruction-equivalents ran on the card, so a result is never silently mixed.
 
-Gain (07, E1): 8x to 105x on the device phase of short kernel-bound runs, 122x to 26,000x at full launch size. No gain, or a loss, below roughly 100 us of
-work per launch (card launch 7.7 us vs 2.5 us simulated, plus copies): the mode must keep a threshold (`host_gpu_min_threads`, default from measurement) and use
-the simulator below it.
+Gain (07, E1): 8x to 105x on the device phase of short kernel-bound runs, 122x to 26,000x at full launch size. No gain, or a loss, when the work is small
+(card launch + sync 7.7 us vs 2.5 us simulated, a 4,096-float copy 20 us, a 64 MiB copy 5 to 7 ms).
+
+### 5.1 The size rule: a per-launch cost model, not only a threshold (user, 2026-10-23)
+
+A launch goes to the card only when the simulator is expected to take longer than the card path including the data it must move:
+
+    offload  iff  sim_estimate  >  launch_sync + copy_in + copy_out + margin
+
+* `sim_estimate` = the kernel's expected warp instructions / the simulator's measured rate (tens to ~150 Mi warp instr per CPU-second, tier-dependent, per
+  thread count; a startup calibration or a table in `docs/performance.md`). The expected instructions come from history: the simulator already counts them, so the
+  first launch of each kernel (per grid shape class) always runs simulated and records its count; later launches use that count scaled by the grid. A kernel
+  with data-dependent length keeps an EWMA and a variance guard (offload only when the lower bound beats the cost).
+* `copy_in` / `copy_out` = bytes of `host`-resident chunks it must push plus bytes of `card` chunks the simulator will read back, at the measured link rate
+  (about 10 GB/s on the g5 rig). Residency makes chains cheap: consecutive offloaded kernels on the same buffers move nothing, so the model charges the
+  copy once and a run of kernels amortises it. A lone small kernel between two simulator phases pays both directions and stays simulated.
+* Hysteresis: a kernel flips mode only after N consecutive estimates on the other side, to avoid ping-ponging chunks between host and card.
+* Knobs: `host_gpu_min_work` (floor, warp instructions, default from the Phase 1 measurement), `host_gpu_margin` (default 2x), and a debug `host_gpu_log` that
+  prints each decision with its numbers. The summary line reports offloaded vs refused-as-too-small counts.
+* Phase 1 must measure the constants (launch, link rate, simulator rate) on the card and check the model's decisions against actual timings on the harness
+  workloads; the gate is that no workload is slower with the mode on than off, beyond noise.
 
 ## 6. Plan and gates (each phase ends with a decision; nothing starts without the user's go)
 
 | phase | content | estimate | gate to continue |
 | --- | --- | --- | --- |
 | 0 | `vgpu check ./prog`: run native and simulated, compare (07 verdict 4). Independent of the rest; gives the data on how often `exact` would have held | 1 to 2 weeks | none; useful alone |
-| 1 | spike, no product merge: VMM reservation + chunk residency + one-kernel offload for the 16 harness workloads, `exact` check as a hash compare against the simulator | 4 to 6 weeks | hot-path cost of the residency test < 1% on `bench.sh`; identical hashes on all eligible workloads; speed-up on `int_virus`-class > 10x including copies |
+| 1 | spike, no product merge: VMM reservation + chunk residency + one-kernel offload for the 16 harness workloads, `exact` check as a hash compare against the simulator | 4 to 6 weeks | hot-path cost of the residency test < 1% on `bench.sh`; no workload slower with the mode on (the size rule, 5.1); identical hashes on all eligible workloads; speed-up on `int_virus`-class > 10x including copies |
 | 2 | eligibility scanner (3), config and refusals (3, 4), summary line, docs, tests wired to a GPU runner | 4 to 6 weeks | the same-bits test passes on a card runner; CI cost agreed (a GPU runner does not exist today) |
 | 3 | `approx`, disclaimer, async streams only if measured as needed | 2 to 4 weeks | decided after Phase 2 data |
 | later | HIP/AMD (same design, unmeasured: no AMD GPU with ROCm was available), multi-GPU racks | not estimated | |
