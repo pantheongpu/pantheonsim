@@ -1,0 +1,349 @@
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.298}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.531}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.038}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.294}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.518}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.024}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.286}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.42}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.018}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.291}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.513}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.291}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.503}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.285}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.513}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.295}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.508}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.061}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.285}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.519}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.295}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.518}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.026}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.295}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.518}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.285}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.529}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.022}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.284}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.529}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.043}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.297}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.538}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.018}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.306}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.535}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.47}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.448}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.031}
+{"build": "sm_80", "side": "native-sass", "profile": null, "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.3}
+{"build": "sm_80", "side": "native-ptx", "profile": null, "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.516}
+{"build": "sm_80", "side": "sim", "profile": "nvidia/a100", "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.011}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.295}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.509}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.295}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.519}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.026}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.315}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.523}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.305}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.508}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.026}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.295}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.529}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.285}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.523}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.305}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.533}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.067}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.295}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.523}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.026}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.28}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.523}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.305}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.528}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.041}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.3}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.533}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.026}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.29}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.523}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.29}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.516}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.3}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.508}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.447}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.452}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "native-sass", "profile": null, "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.33}
+{"build": "sm_86", "side": "native-ptx", "profile": null, "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.514}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a10g", "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.014}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "int_alu", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL int_alu"], "wall": 0.293}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "int_alu", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL int_alu"], "wall": 0.301}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "f32_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f32_fma"], "wall": 0.28}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "f32_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f32_fma"], "wall": 0.285}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "f64_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_fma"], "wall": 0.29}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "f64_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_fma"], "wall": 0.295}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "f64_subnormal", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_subnormal"], "wall": 0.295}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "f64_subnormal", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_subnormal"], "wall": 0.285}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "wmma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL wmma"], "wall": 0.29}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "wmma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL wmma"], "wall": 0.292}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "mma_ptx", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mma_ptx"], "wall": 0.28}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "mma_ptx", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mma_ptx"], "wall": 0.295}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.011}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "mem", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mem"], "wall": 0.3}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "mem", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mem"], "wall": 0.326}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.067}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "shared", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL shared"], "wall": 0.29}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "shared", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL shared"], "wall": 0.295}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "atomics", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL atomics"], "wall": 0.3}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "atomics", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL atomics"], "wall": 0.285}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "texture", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL texture"], "wall": 0.3}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "texture", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL texture"], "wall": 0.301}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "local", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL local"], "wall": 0.295}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "local", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL local"], "wall": 0.291}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.036}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "divergent", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL divergent"], "wall": 0.285}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "divergent", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL divergent"], "wall": 0.292}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.036}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "warp", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL warp"], "wall": 0.285}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "warp", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL warp"], "wall": 0.285}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "launch", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL launch"], "wall": 0.295}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "launch", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL launch"], "wall": 0.291}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.452}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.438}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.031}
+{"build": "sm_89", "side": "native-sass", "profile": null, "workload": "startup", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL startup"], "wall": 0.295}
+{"build": "sm_89", "side": "native-ptx", "profile": null, "workload": "startup", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL startup"], "wall": 0.29}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l4", "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.011}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.011}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.061}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.026}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.026}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.036}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.041}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.031}
+{"build": "sm_89", "side": "sim", "profile": "nvidia/l40s", "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.011}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "int_alu", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL int_alu"], "wall": 0.29}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "int_alu", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL int_alu"], "wall": 0.29}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.041}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "f32_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f32_fma"], "wall": 0.3}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "f32_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f32_fma"], "wall": 0.305}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "f64_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_fma"], "wall": 0.29}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "f64_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_fma"], "wall": 0.295}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "f64_subnormal", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_subnormal"], "wall": 0.29}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "f64_subnormal", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_subnormal"], "wall": 0.3}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "wmma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL wmma"], "wall": 0.3}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "wmma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL wmma"], "wall": 0.3}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "mma_ptx", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mma_ptx"], "wall": 0.295}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "mma_ptx", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mma_ptx"], "wall": 0.305}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.011}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "mem", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mem"], "wall": 0.305}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "mem", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mem"], "wall": 0.3}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.072}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "shared", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL shared"], "wall": 0.337}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "shared", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL shared"], "wall": 0.334}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.029}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "atomics", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL atomics"], "wall": 0.312}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "atomics", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL atomics"], "wall": 0.306}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.032}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "texture", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL texture"], "wall": 0.28}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "texture", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL texture"], "wall": 0.293}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.04}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "local", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL local"], "wall": 0.29}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "local", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL local"], "wall": 0.305}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.03}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "divergent", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL divergent"], "wall": 0.283}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "divergent", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL divergent"], "wall": 0.288}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.038}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "warp", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL warp"], "wall": 0.296}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "warp", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL warp"], "wall": 0.294}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.023}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "launch", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL launch"], "wall": 0.283}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "launch", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL launch"], "wall": 0.28}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.018}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.501}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.463}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.031}
+{"build": "sm_90", "side": "native-sass", "profile": null, "workload": "startup", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL startup"], "wall": 0.297}
+{"build": "sm_90", "side": "native-ptx", "profile": null, "workload": "startup", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL startup"], "wall": 0.3}
+{"build": "sm_90", "side": "sim", "profile": "nvidia/h100", "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.011}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "int_alu", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL int_alu"], "wall": 0.287}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "int_alu", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL int_alu"], "wall": 0.286}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "f32_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f32_fma"], "wall": 0.29}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "f32_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f32_fma"], "wall": 0.285}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "f64_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_fma"], "wall": 0.285}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "f64_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_fma"], "wall": 0.295}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.036}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "f64_subnormal", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_subnormal"], "wall": 0.285}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "f64_subnormal", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL f64_subnormal"], "wall": 0.285}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "wmma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL wmma"], "wall": 0.28}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "wmma", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL wmma"], "wall": 0.285}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "mma_ptx", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mma_ptx"], "wall": 0.28}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "mma_ptx", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mma_ptx"], "wall": 0.285}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "mem", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mem"], "wall": 0.295}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "mem", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL mem"], "wall": 0.28}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.072}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "shared", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL shared"], "wall": 0.291}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "shared", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL shared"], "wall": 0.275}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "atomics", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL atomics"], "wall": 0.285}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "atomics", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL atomics"], "wall": 0.285}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.026}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "texture", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL texture"], "wall": 0.295}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "texture", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL texture"], "wall": 0.3}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.026}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "local", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL local"], "wall": 0.3}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "local", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL local"], "wall": 0.281}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.033}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "divergent", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL divergent"], "wall": 0.282}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "divergent", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL divergent"], "wall": 0.285}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.032}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "warp", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL warp"], "wall": 0.302}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "warp", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL warp"], "wall": 0.299}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.017}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "launch", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL launch"], "wall": 0.291}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "launch", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL launch"], "wall": 0.292}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.443}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": [], "tail": "", "wall": 0.441}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.034}
+{"build": "sm_120", "side": "native-sass", "profile": null, "workload": "startup", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL startup"], "wall": 0.284}
+{"build": "sm_120", "side": "native-ptx", "profile": null, "workload": "startup", "rc": 1, "timeout": false, "passed": false, "engine_log": [], "tail": ["FAIL startup"], "wall": 0.29}
+{"build": "sm_120", "side": "sim", "profile": "nvidia/rtx5090", "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.011}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.027}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.021}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.018}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.018}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.078}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.024}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.038}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.038}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.039}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.016}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.018}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l4", "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.011}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.034}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.02}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.023}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.022}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.017}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.017}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.071}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.022}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.027}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.024}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.014}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.019}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.033}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/l40s", "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": ["SASS"], "tail": "", "wall": 0.011}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.072}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.052}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.051}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.053}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.044}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.042}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.095}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.06}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.048}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.065}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.089}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.065}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.047}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.051}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/h100", "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "int_alu", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.07}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "f32_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.063}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "f64_fma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.056}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "f64_subnormal", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.06}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "wmma", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.041}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "mma_ptx", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.042}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "mem", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.098}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "shared", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.062}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "atomics", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.054}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "texture", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.065}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "local", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.074}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "divergent", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.059}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "warp", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.042}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "launch", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.051}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/rtx5090", "workload": "startup", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "int_alu", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL int_alu"], "wall": 0.037}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "f32_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL f32_fma"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "f64_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL f64_fma"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "f64_subnormal", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL f64_subnormal"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "wmma", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL wmma"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "mma_ptx", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL mma_ptx"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "mem", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL mem"], "wall": 0.158}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "shared", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL shared"], "wall": 0.087}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "atomics", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL atomics"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "texture", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL texture"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "local", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL local"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "divergent", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL divergent"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "warp", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL warp"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "launch", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL launch"], "wall": 34.465}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/a100", "workload": "startup", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL startup"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "int_alu", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL int_alu"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "f32_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL f32_fma"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "f64_fma", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL f64_fma"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "f64_subnormal", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL f64_subnormal"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "wmma", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL wmma"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "mma_ptx", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL mma_ptx"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "mem", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL mem"], "wall": 0.153}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "shared", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL shared"], "wall": 0.087}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "atomics", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL atomics"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "texture", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL texture"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "local", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL local"], "wall": 0.038}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "divergent", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL divergent"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "warp", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL warp"], "wall": 0.036}

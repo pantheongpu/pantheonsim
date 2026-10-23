@@ -1,0 +1,25 @@
+== sim launch
+launch+sync_us 2.47   launch_pipelined_us 2.38
+launch+sync_us 2.55   launch_pipelined_us 2.38
+launch+sync_us 2.54   launch_pipelined_us 2.36
+== sim copy
+n=256 iter_us 15.3 ok=1
+n=4096 iter_us 131.2 ok=1
+n=65536 iter_us 482.8 ok=1
+n=1048576 iter_us 6633.3 ok=1
+n=16777216 iter_us 99430.6 ok=1
+n=256 iter_us 15.5 ok=1
+n=4096 iter_us 148.2 ok=1
+n=65536 iter_us 496.8 ok=1
+n=1048576 iter_us 6608.0 ok=1
+n=16777216 iter_us 99979.6 ok=1
+n=256 iter_us 15.4 ok=1
+n=4096 iter_us 135.7 ok=1
+n=65536 iter_us 502.5 ok=1
+n=1048576 iter_us 6602.9 ok=1
+n=16777216 iter_us 99205.0 ok=1
+iters=1  seconds 0.0060  fma_per_s 1.74e+08  result_hash 856eeae8
+iters=10  seconds 0.0076  fma_per_s 1.38e+09  result_hash 7cb1f5bb
+iters=100  seconds 0.0144  fma_per_s 7.3e+09  result_hash d7468e9b
+iters=1000  seconds 0.0830  fma_per_s 1.26e+10  result_hash fec4c7e9
+iters=10000  seconds 0.7675  fma_per_s 1.37e+10  result_hash b41484af

@@ -54,6 +54,9 @@ def cases(corpora):
     return out
 
 
+CENSUS = "cuda*+__cuda*+cu*+nvml*+cublas*+cufft*+curand*+cusparse*+cusolver*+cudnn*+nccl*+nvrtc*+nvjpeg*+npp*+thrust*"
+
+
 def snapshot(d):
     s = {}
     for n in os.listdir(d):
@@ -82,7 +85,11 @@ def do_case(cs, mode, profile, threads, timeout, outdir, extra):
         tmp = tempfile.mkdtemp(prefix="c-", dir="/dev/shm")
         cwd = tmp
     before = snapshot(cwd)
-    env = env_for(mode, profile=profile, threads=threads, extra=extra)
+    lt = None
+    if mode == "census":  # native run under ltrace -c: how often the program calls each CUDA / library entry point
+        lt = tempfile.mktemp(prefix="lt-", dir="/dev/shm")
+        argv = ["ltrace", "-f", "-c", "-o", lt, "-e", CENSUS] + argv
+    env = env_for("native" if mode == "census" else mode, profile=profile, threads=threads, extra=extra)
     r = run(argv, env, cwd=cwd, timeout=timeout)
     after = snapshot(cwd)
     files = {n: [after[n][0], sha(os.path.join(cwd, n))] for n in after if before.get(n) != after[n] and after[n][0] < 64 << 20}
@@ -90,6 +97,12 @@ def do_case(cs, mode, profile, threads, timeout, outdir, extra):
         shutil.rmtree(tmp, ignore_errors=True)
     rec = dict(corpus=corpus, case=name, mode=mode, profile=profile if mode == "sim" else None, rc=r["rc"], timeout=r["timeout"],
                wall=round(r["wall"], 3), stdout=r["stdout"][-200000:], stderr=r["stderr"][-20000:], files=files, extra=extra)
+    if lt:
+        try:
+            rec["ltrace"] = open(lt).read()
+            os.unlink(lt)
+        except OSError:
+            rec["ltrace"] = ""
     with open(os.path.join(outdir, corpus + "__" + name + ".json"), "w") as f:
         json.dump(rec, f)
     return name, r["rc"], r["timeout"], r["wall"]
@@ -97,7 +110,7 @@ def do_case(cs, mode, profile, threads, timeout, outdir, extra):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("outdir"); ap.add_argument("mode", choices=["native", "ptxjit", "sim"])
+    ap.add_argument("outdir"); ap.add_argument("mode", choices=["native", "ptxjit", "sim", "census"])
     ap.add_argument("--profile", default="nvidia/a10g"); ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--jobs", type=int, default=1); ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--tag"); ap.add_argument("--only"); ap.add_argument("--corpus", default="rodinia,polybench,hecbench,samples")

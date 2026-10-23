@@ -22,8 +22,22 @@ def text(r):
     return r["stdout"] + (("\n--stderr--\n" + r["stderr"]) if r["stderr"].strip() else "")
 
 
+BARE = re.compile(r"^\s*[-+]?[\d.]+(e[-+]?\d+)?\s*$", re.I)
+EXTRA = re.compile(r"(?i)(\d\s?s\b|\bTOOK\b|\bTIME TO\b|\bBACK:|\bFREE TIME|memcopy:|\bGPU Execution|\bcontext=0x|shm\d+|\b0x[0-9a-f]{6,}\b)")
+
+
 def filt(t):
-    return "\n".join(l.rstrip() for l in t.splitlines() if not TIME.search(l) and l.strip())
+    """Drops timing lines: those with a time/throughput word or a number followed by 's', and a bare-number line that follows one
+    (PolyBench prints 'GPU Time in seconds:' then the number on the next line). Pointers and pids in names are dropped too."""
+    out, prev_timing = [], False
+    for l in t.splitlines():
+        timing = bool(TIME.search(l) or EXTRA.search(l))
+        if timing or not l.strip() or (prev_timing and BARE.match(l)):
+            prev_timing = timing or (prev_timing and bool(BARE.match(l)))
+            continue
+        prev_timing = False
+        out.append(l.rstrip())
+    return "\n".join(out)
 
 
 def close(a, b):
