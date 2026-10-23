@@ -153,14 +153,14 @@ class BigReaderLock {
     std::atomic<int> n{0};
   };
   // This thread's identity and slot, fixed for its life: threads that share a slot only share a
-  // count, which is still right. Initial-exec, so that reading them is one load off the thread
-  // pointer and not a call (the library is loaded by the program's own link, or has room for these
-  // few bytes).
+  // count, which is still right. An ordinary (general-dynamic) thread-local: this class is linked
+  // into every shim library, and an initial-exec one would take static TLS from each library a
+  // process loads late (the surplus is about 1.6 KB for all of them, shared with ROCm and CUDA).
   struct ThreadTag {
     uintptr_t self;
     unsigned slot;
   };
-  [[gnu::tls_model("initial-exec")]] static inline thread_local ThreadTag t_tag = {0, 0};
+  static inline thread_local ThreadTag t_tag = {0, 0};
   [[gnu::noinline]] static ThreadTag& make_tag() {
     ThreadTag& t = t_tag;
     t.self = reinterpret_cast<uintptr_t>(pthread_self());

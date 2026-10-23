@@ -405,12 +405,12 @@ struct LookupMemory {
                          // still hits some of the time instead of never
 };
 // A thread's memory is made on its first lookup and given back when it ends. The pointer is the
-// thread-local that is read on every access, so it is initial-exec (one load off the thread pointer;
-// a general-dynamic thread-local of a shared library is a call), and a pointer so that a library
-// loaded late needs eight bytes of static TLS and not the memory's three hundred. A thread that is
+// thread-local that is read on every access, so it is a pointer, made on first use. It is not initial-exec: every shim
+// library carries this code, and an initial-exec slot in each would use up the static TLS that a
+// process has for libraries it loads late. A thread that is
 // ending reads an empty memory that is never written (`g_ended_lookups`), and so finds nothing.
 LookupMemory g_ended_lookups;
-[[gnu::tls_model("initial-exec")]] thread_local LookupMemory* t_lookups = nullptr;
+thread_local LookupMemory* t_lookups = nullptr;
 struct LookupOwner {
   LookupMemory* memory;
   ~LookupOwner() {
