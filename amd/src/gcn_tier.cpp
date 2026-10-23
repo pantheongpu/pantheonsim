@@ -649,6 +649,7 @@ int h_div(const Op& o, Regs& R) {
           if (res.vcc) cond |= uint64_t{1} << l;
         } else if (what == 1) {
           v = gcn::divide::div_fmas(x, y, z, (*R.vcc >> l) & 1);
+          if (v != v) return false;   // (a fused multiply-add with NaNs: which payload comes through is the compiler's choice; the interpreter's)
         } else {
           v = gcn::divide::div_fixup(x, y, z);
         }
@@ -666,6 +667,7 @@ int h_div(const Op& o, Regs& R) {
       const uint32_t* b = load32(o.src[1], R, t1, n);
       const uint32_t* c = load32(o.src[2], R, t2, n);
       uint32_t* d = R.vgpr[o.dst.index];
+      alignas(32) uint32_t rr[64];
       for (uint64_t m = ex; m; m &= m - 1) {
         const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
         float x, y, z, v;
@@ -676,10 +678,15 @@ int h_div(const Op& o, Regs& R) {
           if (res.vcc) cond |= uint64_t{1} << l;
         } else if (what == 1) {
           v = gcn::divide::div_fmas(x, y, z, (*R.vcc >> l) & 1);
+          if (v != v) return false;   // (see above)
         } else {
           v = gcn::divide::div_fixup(x, y, z);
         }
-        std::memcpy(&d[l], &v, 4);
+        std::memcpy(&rr[l], &v, 4);
+      }
+      for (uint64_t m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+        d[l] = rr[l];
       }
     }
   }
