@@ -456,6 +456,32 @@ VTEST(readers_beside_allocations_and_frees_read_the_right_values) {
   for (int i = 0; i < kLive; ++i) VCHECK_EQ(mm.load_scalar(live[i], 8), (uint64_t{static_cast<uint64_t>(i)} << 32));
 }
 
+// A thread's lookup memory is found by its thread pointer in a table of 1024 slots: threads that come
+// and go (a stream makes one) give their slot back, and more threads at once than the table has slots
+// still read the right values (the ones without a slot find nothing remembered and take the table).
+VTEST(threads_that_come_and_go_and_more_than_the_table_holds_read_right) {
+  MemoryManager mm(1ull << 34);
+  const uint64_t a = mm.alloc(1 << 16);
+  for (int i = 0; i < 64; ++i) mm.store_scalar(a + 8 * i, 8, 1000 + i);
+  std::atomic<long> wrong{0};
+  auto reads = [&] {
+    for (int k = 0; k < 200; ++k)
+      for (int i = 0; i < 64; i += 7)
+        if (mm.load_scalar(a + 8 * i, 8) != uint64_t(1000 + i)) wrong.fetch_add(1);
+  };
+  for (int round = 0; round < 3000; ++round) std::thread(reads).join();   // slots are given back
+  std::atomic<bool> go{false};
+  std::vector<std::thread> many;
+  for (int t = 0; t < 1400; ++t)
+    many.emplace_back([&] {
+      while (!go.load()) std::this_thread::yield();
+      reads();
+    });
+  go = true;
+  for (auto& t : many) t.join();
+  VCHECK_EQ(wrong.load(), 0);
+}
+
 // ---- chunks that go back and come out again ------------------------------------
 
 namespace {

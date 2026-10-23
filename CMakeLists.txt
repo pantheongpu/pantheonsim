@@ -264,14 +264,6 @@ if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMP
   target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
 endif()
 
-# The core's thread-locals (the lookup memory, the lock's thread tag) are read on every simulated memory
-# access, in code that every shim library carries, so they cannot be initial-exec (static TLS is a few
-# hundred bytes for all libraries loaded late: tests/lint/check_static_tls.sh). TLS descriptors make the
-# general-dynamic access a call through the descriptor without __tls_get_addr's lookup.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  target_compile_options(vgpu PRIVATE -mtls-dialect=gnu2)
-endif()
-
 # libvgpucuda: the CUDA Driver API shim external programs link against.
 add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/driver_graph.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(vgpucuda PRIVATE vgpu ${CMAKE_DL_LIBS})

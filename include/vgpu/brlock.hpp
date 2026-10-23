@@ -153,28 +153,12 @@ class BigReaderLock {
     std::atomic<int> n{0};
   };
   // This thread's identity and slot, fixed for its life: threads that share a slot only share a
-  // count, which is still right. An ordinary (general-dynamic) thread-local: this class is linked
-  // into every shim library, and an initial-exec one would take static TLS from each library a
-  // process loads late (the surplus is about 1.6 KB for all of them, shared with ROCm and CUDA).
-  struct ThreadTag {
-    uintptr_t self;
-    unsigned slot;
-  };
-  static inline thread_local ThreadTag t_tag = {0, 0};
-  [[gnu::noinline]] static ThreadTag& make_tag() {
-    ThreadTag& t = t_tag;
-    t.self = reinterpret_cast<uintptr_t>(pthread_self());
-    t.slot = static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id())) % kSlots;
-    return t;
-  }
-  static uintptr_t self() {
-    const uintptr_t s = t_tag.self;
-    return __builtin_expect(s != 0, 1) ? s : make_tag().self;
-  }
-  static unsigned slot() {
-    self();
-    return t_tag.slot;
-  }
+  // count, which is still right. The identity is the thread pointer (the thread's control block),
+  // read with no call and no thread-local: this class is linked into every shim library, and a
+  // thread-local that is not general-dynamic would take static TLS from each library a process loads
+  // late (glibc leaves about 1.6 KB for all of them), while a general-dynamic one is a call.
+  static uintptr_t self() { return reinterpret_cast<uintptr_t>(__builtin_thread_pointer()); }
+  static unsigned slot() { return static_cast<unsigned>((self() * 0x9E3779B97F4A7C15ull) >> 58); }  // 64 slots
 
   Slot slots_[kSlots];
   alignas(64) std::atomic<bool> writer_{false};
