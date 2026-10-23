@@ -1226,7 +1226,7 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/ncu.cpp
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/check.cpp src/cli/ncu.cpp
                src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp
                src/cli/config.cpp src/cli/config_cmd.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
@@ -1263,6 +1263,8 @@ function(vgpu_unit_test name)
 endfunction()
 
 vgpu_unit_test(test_yamlish)
+vgpu_unit_test(test_check_compare)
+target_include_directories(test_check_compare PRIVATE src/cli)
 vgpu_unit_test(test_profile)
 # The settings file: its parser and key table (src/cli/config.cpp) need nothing from the simulator.
 vgpu_unit_test(test_config)
@@ -2144,6 +2146,9 @@ set_tests_properties(amd_session PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME test_matrix_exit COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_test_matrix.sh)
 set_tests_properties(test_matrix_exit PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+add_test(NAME check_exit COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_check.sh)
+set_tests_properties(check_exit PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME nvml_api COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_api.sh)
 set_tests_properties(nvml_api PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
