@@ -3891,3 +3891,36 @@ tolerance is removed again (the three tests are as they were at `224874ea`): an 
 were 79 s to fail and 900 s for the tier test under TSan). CMake sets no `TIMEOUT` for them and ctest's default here is none, so none timed out; the CI job's own time limit
 is what they eat: the proposal (not made) is a `TIMEOUT` property of 3600 on these five, and moving `test_amd_gcn_tier_same_bits` and `test_amd_matrix_fast` out of the TSan job's list
 (they run no threads of their own; `-E` in `ci.yml` line 739) if the job's limit is tight.
+
+## AMD speed gaps closed (branch `sn-amdgaps`)
+
+**Matrix tile path.** The f8f6f4 forms (`v_mfma_f32_16x16x128_f8f6f4`, `v_mfma_f32_32x32x64_f8f6f4`) and their block-scaled twins, BLGP's lane permutation
+of B, the doubles' BLGP negations and the four-block `v_mfma_f64_4x4x4_4b_f64` now take the tile path (`matrix_multiply_fast`, `matrix_small_k`, scale
+tables by block of 32 K and row). `mfma_scale_mul` (mfma_math.hpp) fixes the order of the two operands of the scale multiply, used by both paths. A bug of
+the reference path found on the way: its binary16 shortcut ignored BLGP's permutation of B. New bench-amd workloads `mfma_f8f6f4`, `mfma_scale` (target
+`mi350x`, gfx950) and `mfma_f64_4b`. A/B (9 runs, one thread, CPUs 24-31, server2 load 3 to 25): mfma_f8f6f4 7.7x, mfma_scale 8.0x, mfma_f64_4b 2.7x, p < 0.001,
+counters identical. 8-bit float operands decode each register word once (mfma_fp8 1.15x of the base).
+
+**Tier coverage** (`VGPU_AMD_TIER_STATS=1`). Over the 46 pantheon workloads (run-pantheon-workloads.sh) the interpreter ran 7.1% of the instructions (574 M of
+8.07 G: `v_xor_b32_sdwa`, `s_load_*`, `v_cndmask_b32_e64`, `s_mul_hi_u32`, `s_endpgm`, `v_pk_fma_f16`, 29 M NaN handbacks of `v_fma_f32`); rocBLAS's test
+program 12.7%. Added: SDWA integer forms, VOP3 forms of existing handlers, `v_cndmask_b32_e64`, scalar ALU leftovers (`s_mul_hi`, `s_brev`, `s_cmpk_*`,
+`s_bitcmp*`, `s_getpc`), `s_load_*`/`s_endpgm` through the Machine without step()'s frame, one-input float functions (single and double), 16-bit integer and
+half forms on the CDNA parts, class and 16-bit compares, `v_pk_fma/add/mul/min/max_f16` (routed to packed_math.hpp), `v_pk_mov_b32`, `v_div_scale/fmas/fixup`,
+`v_fma_mix*`, `v_accvgpr_read/write`. After: 0.5% of the pantheon instructions (MFMA, atomics, a few 16-bit forms), 7.1% of rocBLAS's. A/B on bench-amd:
+smem 1.14x, valu_int 1.03x, atomics 1.04x, others unchanged.
+
+**NaN-aware float path.** A NaN result of `v_add/sub/mul/fma_f32`, the double forms and `v_pk_*_f32` is worked out again in the tier by the interpreter's rule
+(`nan_add<1>`, `nan_sub<0>`, `nan_mul<1>`, `nan_fma<2>`, `nan_fma<0>` for the packed fma); one-input functions of the host's libm pass their NaN through. The 29 M
+handbacks came from the pantheon virus workloads (random data). Min/max, nearbyint, angles in turns and `v_div_fmas` still hand a NaN back. The tier test gained
+flavour 17 (halves with specials and signaling NaNs) and generated corpora `isa_corpus_tier_<gfx942|gfx90a|gfx950>.txt` (amd/tools/tier-corpus.py; tier on against
+tier off, no recorded digests); they caught bugs of this branch's own (`v_fract_f32` NaN, clamp on cvt_f32_* off the guide parts, a negated signaling half NaN in class,
+`v_div_fmas_f64` under -O1).
+
+**Packed min/max.** `v_pk_min/max_f16` run whole-wave (`packed_minmax_lanes`; `pk_fminf`/`pk_fmaxf` and the guide parts' bit rule now live in packed_math.hpp;
+unit test against the per-lane code). The dot2 NaN lanes are unchanged.
+
+### Not done, and negative results (this branch)
+
+* Trampolines for the vector memory instructions the tier has no handler for (buffer, flat, scratch, LDS, atomics) through the Machine's functions without
+  step()'s frame: no measurable gain on mem, flat, buf, ldsx (p > 0.05); dropped.
+* NaN lanes of `v_min/max_f32` (MODE.IEEE decides) and the dot2 NaN lanes stay with the interpreter.
