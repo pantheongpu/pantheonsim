@@ -83,6 +83,12 @@ jobs:
         # this one. Print it so a broken detection is visible in the log.
         run: ls build/shim/
 
+      - name: Which nvcc builds the CUTLASS tests
+        # Part of the cache key below, so a toolchain update starts a new directory
+        # instead of leaving the old key to hit forever with binaries nobody can use.
+        id: nvcc_version
+        run: echo "v=$(nvcc --version | sed -n 's/.*release \([0-9.]*\).*V\([0-9.]*\)/\1-\2/p')-$(g++ -dumpversion)" >> "$GITHUB_OUTPUT"
+
       - name: CUTLASS test binaries, from the cache
         # e2e_cutlass_hopper and e2e_cutlass_gemm are nvcc compiles (about
         # 2000 s of their 2200 s, an estimate) of programs that do not depend
@@ -95,7 +101,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: cutlass-bin-cache
-          key: cutlass-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('nvidia/tests/e2e/cutlass_fetch.sh', 'nvidia/tests/e2e/run_cutlass_hopper.sh', 'nvidia/tests/e2e/run_cutlass_gemm.sh') }}
+          key: cutlass-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.nvcc_version.outputs.v }}-${{ hashFiles('nvidia/tests/e2e/cutlass_fetch.sh', 'nvidia/tests/e2e/run_cutlass_hopper.sh', 'nvidia/tests/e2e/run_cutlass_gemm.sh') }}
 
       - name: Unit and end-to-end tests
         env:
