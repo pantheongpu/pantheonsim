@@ -659,6 +659,12 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          # The tier test builds and runs sass_tier for seven architectures and some forty other programs, every one twice or
+          # more; under a sanitizer that is about 2000 s. Two architectures and the one program that checks the interpreter
+          # steps keep the sanitizer on the tier's code; the other programs run under it, tier on and off, in e2e_sass_archs,
+          # and the plain builds run the full matrix.
+          VGPU_TIER_ARCHS: "sm_80 sm_90"
+          VGPU_TIER_PROGRAMS: "sass_tier_steps:75"
         # -j2 (fewer when under 12 GiB are free, ci/jobs.sh): 534 tests, 1840 s
         # one at a time in run 38424481981 (2031 s in 38612576048), the
         # longest 173 s, on a 24-core machine that otherwise idles through them;
@@ -736,7 +742,16 @@ jobs:
         # one at a time in run 38424481981 (1586 s in 38612576048), the longest
         # 150 s, on a 24-core machine that otherwise idles through them. See the
         # ASan job above for why it is safe.
-        run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E pantheon_workloads
+        #
+        # Left out: the golden-digest tests of the AMD executor and the video codecs. They run on one thread (nothing in their
+        # sources starts one), and ThreadSanitizer only reports races between threads, so they took about 1500 s of this job
+        # (it runs one test at a time) and could find nothing. ASan and UBSan run them, and so do the plain builds.
+        env:
+          VGPU_TIER_ARCHS: "sm_80 sm_90"
+          VGPU_TIER_PROGRAMS: "sass_tier_steps:75"
+        run: |
+          single_thread='test_amd_gcn_same_bits|test_amd_gcn_tier_same_bits|test_amd_gcn_memory_same_bits|test_amd_gcn_packed_same_bits|test_amd_matrix_fast|test_decode_same_bits|test_hevc_decode|test_h264_decode|test_mpeg2_decode|test_nvenc_.*'
+          setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E "^(pantheon_workloads|$single_thread)$"
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the
