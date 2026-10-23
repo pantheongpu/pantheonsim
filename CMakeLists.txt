@@ -3480,11 +3480,15 @@ set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
 # No shim library takes static TLS (glibc leaves ~1.6 KB for every library loaded late).
-add_test(NAME lint_static_tls COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_static_tls.sh)
-set_tests_properties(lint_static_tls PROPERTIES
-  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-  SKIP_REGULAR_EXPRESSION "^SKIP:"
-  TIMEOUT 300)
+# (Not under a sanitizer: its runtime keeps initial-exec thread-locals in every library it is linked into, so the check would report the
+# runtime, not the simulator.)
+if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize")
+  add_test(NAME lint_static_tls COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_static_tls.sh)
+  set_tests_properties(lint_static_tls PROPERTIES
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 300)
+endif()
 
 # No file under NVIDIA's proprietary terms in the tree, and the fetch that
 # stands in for the cuDNN headers that used to be vendored.
