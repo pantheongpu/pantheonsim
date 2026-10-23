@@ -404,28 +404,59 @@ struct LookupMemory {
                          // kernel cycling through more allocations than there are ways
                          // still hits some of the time instead of never
 };
-// A thread's memory is made on its first lookup and given back when it ends. The pointer is the
-// thread-local that is read on every access, so it is initial-exec (one load off the thread pointer;
-// a general-dynamic thread-local of a shared library is a call), and a pointer so that a library
-// loaded late needs eight bytes of static TLS and not the memory's three hundred. A thread that is
-// ending reads an empty memory that is never written (`g_ended_lookups`), and so finds nothing.
+// A thread's memory is made on its first lookup and given back when it ends. It is found by the
+// thread pointer in a table of slots, with no thread-local on the way: this code is linked into every
+// shim library, a thread-local that is not general-dynamic would take static TLS from each (glibc has
+// about 1.6 KB for all libraries loaded late) and a general-dynamic one is a call on every access.
+// A slot belongs to the thread whose pointer it holds: only that thread writes its memory or takes
+// the slot away, so the others' compare-and-swaps into other slots are all it can see. A thread that
+// finds no room (all probes taken), or that is ending, reads an empty memory that is never written
+// (`g_ended_lookups`), and so finds nothing and takes the table: slower, not wrong.
 LookupMemory g_ended_lookups;
-[[gnu::tls_model("initial-exec")]] thread_local LookupMemory* t_lookups = nullptr;
-struct LookupOwner {
-  LookupMemory* memory;
+constexpr size_t kLookupSlots = 1024, kLookupProbes = 8;
+struct LookupSlot {
+  std::atomic<uintptr_t> thread{0};
+  LookupMemory* memory = nullptr;
+};
+LookupSlot g_lookup_slots[kLookupSlots];
+inline uintptr_t this_thread() { return reinterpret_cast<uintptr_t>(__builtin_thread_pointer()); }
+inline size_t first_slot(uintptr_t t) { return static_cast<size_t>((t >> 6) ^ (t >> 16)) % 1024; }   // control blocks are 64-byte aligned
+struct LookupOwner {   // gives the slot and the memory back when the thread ends
+  uintptr_t thread = 0;
+  LookupMemory* memory = nullptr;
+  size_t slot = 0;
+  bool ended = false;
   ~LookupOwner() {
-    t_lookups = &g_ended_lookups;
+    ended = true;
+    if (!memory) return;
+    g_lookup_slots[slot].thread.store(0, std::memory_order_release);
     delete memory;
   }
 };
 [[gnu::noinline]] LookupMemory* make_lookups() {
-  thread_local LookupOwner owner{new LookupMemory};
-  t_lookups = owner.memory;
-  return owner.memory;
+  thread_local LookupOwner owner;
+  if (owner.ended || owner.memory) return &g_ended_lookups;
+  const uintptr_t t = this_thread();
+  for (size_t p = 0; p < kLookupProbes; ++p) {
+    const size_t i = (first_slot(t) + p) % kLookupSlots;
+    uintptr_t free_slot = 0;
+    if (g_lookup_slots[i].thread.compare_exchange_strong(free_slot, t, std::memory_order_acq_rel)) {
+      owner.memory = g_lookup_slots[i].memory = new LookupMemory;
+      owner.thread = t;
+      owner.slot = i;
+      return owner.memory;
+    }
+  }
+  return &g_ended_lookups;
 }
 inline LookupMemory& lookups() {
-  LookupMemory* m = t_lookups;
-  return *(__builtin_expect(m != nullptr, 1) ? m : make_lookups());
+  const uintptr_t t = this_thread();
+  const size_t h = first_slot(t);
+  for (size_t p = 0; p < kLookupProbes; ++p) {
+    const LookupSlot& s = g_lookup_slots[(h + p) % kLookupSlots];
+    if (s.thread.load(std::memory_order_relaxed) == t) return *s.memory;
+  }
+  return *make_lookups();
 }
 }  // namespace
 
