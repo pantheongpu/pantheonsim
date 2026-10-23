@@ -19,4 +19,4 @@
 | sm_86 | nvidia/h100 | PTX x16 | 16/16 | SASS 16/16, PTX-JIT 16/16 | - |
 | sm_86 | nvidia/rtx5090 | PTX x16 | 16/16 | SASS 16/16, PTX-JIT 16/16 | - |
 | sm_86 | nvidia/a100 | PTX x16 | 1/16 | SASS 16/16, PTX-JIT 16/16 | int_alu:FAIL int_alu; f32_fma:FAIL f32_fma; f64_fma:FAIL f64_fma; f64_subnormal:FAIL f64_subnormal; wmma:FAIL wmma; mma_ptx:FAIL mma_ptx; mem:FAIL mem; shared:FAIL shared; atomics:FAIL atomics; textur |
-| sm_86 | nvidia/t4 | PTX x13 | 0/13 | SASS 16/16, PTX-JIT 16/16 | int_alu:FAIL int_alu; f32_fma:FAIL f32_fma; f64_fma:FAIL f64_fma; f64_subnormal:FAIL f64_subnormal; wmma:FAIL wmma; mma_ptx:FAIL mma_ptx; mem:FAIL mem; shared:FAIL shared; atomics:FAIL atomics; textur |
+| sm_86 | nvidia/t4 | PTX x16 | 1/16 | SASS 16/16, PTX-JIT 16/16 | int_alu:FAIL int_alu; f32_fma:FAIL f32_fma; f64_fma:FAIL f64_fma; f64_subnormal:FAIL f64_subnormal; wmma:FAIL wmma; mma_ptx:FAIL mma_ptx; mem:FAIL mem; shared:FAIL shared; atomics:FAIL atomics; textur |

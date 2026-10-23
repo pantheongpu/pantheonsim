@@ -347,3 +347,6 @@
 {"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "local", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL local"], "wall": 0.038}
 {"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "divergent", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL divergent"], "wall": 0.036}
 {"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "warp", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL warp"], "wall": 0.036}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "launch", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL launch"], "wall": 35.052}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "api", "rc": 0, "timeout": false, "passed": true, "engine_log": ["PTX"], "tail": "", "wall": 0.031}
+{"build": "sm_86", "side": "sim", "profile": "nvidia/t4", "workload": "startup", "rc": 1, "timeout": false, "passed": false, "engine_log": ["PTX"], "tail": ["FAIL startup"], "wall": 0.036}

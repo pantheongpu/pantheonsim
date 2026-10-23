@@ -22,10 +22,10 @@ simulator's diagnostics, and a simulated H100 cannot be computed by an A10G, so 
    filter missed), 3 are SFU/fast-math rounding, 1 is a cuRAND stream, 1 an out-of-bounds read in the benchmark, 3 device-printf order, 1 more timing,
    3 reported identity (driver version, capability), 1 a capability gap in the simulator, 6 simulator timeouts, 3 failures common to both (section 3.2).
 4. **A different simulated card is mostly NOT computable by the A10G.** A program built for sm_89, sm_90 or sm_120 runs on the A10G in **1 of 16** harness
-   workloads (the one with no kernel); a program built for sm_80 (compute_80 PTX) runs 16 of 16 and agrees with the simulated A100. A program built for
-   sm_86 (the portable PTX case) runs on the A10G and on the simulated L4, L40S, H100 and RTX 5090 and passes everywhere, **but** device-identity-dependent
-   programs size their launches from the profile (an H100's 264-block, 1024-thread grid, 232 KB of shared memory) and the real launch would be refused
-   (section 4, 5.2).
+   workloads (the one with no kernel); built for sm_80 (compute_80 PTX) it runs 16 of 16 and agrees with the simulated A100. Where a program (built for
+   sm_86, or a multi-architecture fatbin) does run natively and on the simulated L4, H100 or RTX 5090, the outputs agree on 84% to 85% of the programs that ran
+   on both (87% for the A10G's own profile), and the difference is device identity: an H100's 264-block, 1024-thread grid and 232 KB of shared
+   memory would be refused by the real card (section 4, 5.2). That is agreement with the simulator's engine, not with a real H100 (no H100 here).
 5. **What an integration would have to cover is large and measured:** the 164 programs call 112 distinct CUDA runtime functions and 47 driver functions
    (section 5.1); the simulator's device pointers, streams (synchronous), events (host clock), graphs, IPC (files) and managed memory are its own (section 5.3).
    One thing is better than feared: the real device accepted a reservation at the simulator's own addresses (0x2000'0000'0000...) in 84 to 100% of tries, so
@@ -34,7 +34,7 @@ simulator's diagnostics, and a simulated H100 cannot be computed by an A10G, so 
    scheduling, CUPTI records, the NVML/telemetry model, the profile's identity (section 5.4).
 7. **Library offload does not preserve bits:** cuBLAS on the card and the simulator's cuBLAS gave 8 different hashes of 8 products, though the
    inputs were equal (section 6.2).
-8. **The verdicts (section 7):** (1) card in the machine, faster: measured 1,000x+ on kernel-bound work, but then the simulator is redundant for the
+8. **The verdicts (section 7):** (1) card in the machine, faster: measured 100x to 26,000x on kernel-bound work, but then the simulator is redundant for the
    answer and only worth it as an explicit per-launch opt-in; (2) a different card: **no**; (3) hybrid rack: no, research only; (4) validation against
    hardware (oracle mode): **yes, and it is cheap**, as a separate comparison tool, which is what this round's scripts already are; (5) library offload: no.
 9. **Default-on is contradicted by the data** in three ways: results differ per machine (section 3), the default profile is an H100 (`gpu` default in
@@ -56,9 +56,8 @@ simulator's diagnostics, and a simulated H100 cannot be computed by an A10G, so 
   `GPU Time in seconds:` and the number on the next line) are dropped. For E3 (`IDENT=1`) lines that only state which device it is (name, capability, SM count,
   driver version) are dropped too, and counted in neither direction. **Anything printed on a dropped line is NOT compared.** Classes: identical (bytes), timing-only
   (identical after the filter), numeric-close (same text, every number within 1e-4 relative), differs, one side fails.
-* Run-to-run noise is separated from divergence by running the card twice (`native1`, `native2`) and, for every program that differed or timed out in the
-  first simulator run, the simulator twice (`sim1`, `sim2`; the simulator was not rerun for programs that already matched, so its own determinism is
-  known only for the 38 programs that were rerun).
+* Run-to-run noise is separated from divergence by running the card twice (`native1`, `native2`) and the simulator twice (`sim1`, then `sim2` for the 38
+  programs that differed or timed out, with a longer timeout, and `sim3` for the other 126).
 
 ## 2. E1: the ceiling, same architecture (sm_86 program, `nvidia/a10g` profile vs the real A10G)
 
@@ -159,9 +158,11 @@ Of the 131 identical, 28 are byte-identical in stdout and files and 103 identica
 and some numbers: *identical* means identical in everything the program prints outside the dropped lines.
 
 Native vs native (two runs on the same card): 150 of 164 identical (42 byte-identical), 11 differ, 3 fail; **so 11 programs cannot be compared reliably at
-all** (the card disagrees with itself). Simulator vs simulator (only the 38 programs rerun, with a 400 s then a 1500 s timeout): 12 identical, 7 differ (backprop, particlefilter, fp16ScalarProduct,
-UnifiedMemoryStreams, cudaGraphsPerfScaling, simplePrintf, simpleStreams: the programs that are unstable on the card or print in an order that depends on the
-host-thread schedule), 18 hit a timeout or exit code in one or both runs.
+all** (the card disagrees with itself). Simulator vs simulator: the 126 programs that matched the card in run 1 were run again (`sim3`) and are identical again in all 126 (31 byte-identical, 95
+after the timing filter); the 38 that did not match were run again with a 1500 s timeout (`sim2`): 12 identical, 7 differ (backprop, particlefilter,
+fp16ScalarProduct, UnifiedMemoryStreams, cudaGraphsPerfScaling, simplePrintf, simpleStreams: the programs that are unstable on the card or print in an order that
+depends on the host-thread schedule), 18 hit a timeout or exit code in one or both runs. So **the simulator is run-to-run stable on every program that is stable on the
+card**, except device-printf order under several host threads (`simplePrintf`).
 
 ### 3.2 The 33 that are not identical, classified
 
@@ -169,14 +170,16 @@ host-thread schedule), 18 hit a timeout or exit code in one or both runs.
 | --- | ---: | --- | --- |
 | card nondeterministic (time-seeded, uninitialised, random choice) | 6 | backprop, particlefilter_float, fp16ScalarProduct, UnifiedMemoryStreams, cdpSimplePrint, ptxjit | card vs card differs |
 | timing / measured quantities the filter missed | 6 | babelstream, base64e, cudaGraphsPerfScaling, graphMemoryFootprint, UnifiedMemoryPerf, simpleStreams | card vs card (5) or sim vs sim (1) differs |
-| genuine arithmetic: SFU / fast-math (`ex2.approx`, `-use_fast_math`) | 3 | aobench (ao.ppm bytes), s3d (1e-8 relative), MC_SingleAsianOptionP (6th digit) | deterministic on both sides, differ between them; the documented divergence |
-| genuine: library stream | 1 | MC_EstimatePiP | cuRAND batch generator: 3.13632 (card) vs 3.13900 (sim), each stable run to run |
+| genuine arithmetic: SFU / fast-math (`ex2.approx`, `-use_fast_math`) | 3 | aobench (ao.ppm bytes), s3d (1e-8 relative), MC_SingleAsianOptionP (6th digit) | deterministic on both sides, differ between them; aobench and s3d match the documented SFU divergence (memory note hecbench-on-pantheonsim); the cause for MC_SingleAsianOptionP was not isolated |
+| genuine: library stream | 1 | MC_EstimatePiP | host-API cuRAND (likely the generator, not isolated): 3.13632 (card) vs 3.13900 (sim), each stable run to run |
 | program bug the card hides | 1 | srad_v2 | reads the row above its image; the simulator reports it (memory note: rodinia-on-pantheonsim) |
 | device printf / assert record order | 3 | simpleAssert, simpleAssert_nvrtc, simplePrintf | same messages, different thread/block order |
 | reported identity | 3 | graphConditionalNodes, graphMemoryNodes (driver 13.2 vs 13.0), systemWideAtomics (pageableMemoryAccess 1 vs 0) | text of the program's own output |
 | capability gap in the simulator | 1 | streamOrderedAllocationIPC | simulator says "does not support Memory pool based IPC" and skips |
 | simulator timeout (300 to 1500 s) | 6 | aligned-types, bh, binomial, dmmaTensorCoreGemm, globalToShmemAsyncCopy, simpleAttributes | the card finishes in seconds |
-| fail on both | 3 | simpleP2P, streamOrderedAllocationP2P (need 2 GPUs), simpleMPI (needs mpirun) | rc 2, 2, 1 on both | The table sums to the 33. **No program showed a difference that is an unexplained simulator arithmetic bug**: the arithmetic cases are the known SFU/library
+| fail on both | 3 | simpleP2P, streamOrderedAllocationP2P (need 2 GPUs), simpleMPI (needs mpirun) | rc 2, 2, 1 on both |
+
+The table sums to the 33. **No program showed a difference that is an unexplained simulator arithmetic bug**: the arithmetic cases are the known SFU/library
 divergences. The precision of that statement is limited by what the programs print (section 8).
 
 ### 3.3 What E2 means for "native stands in for the simulation"
@@ -216,25 +219,80 @@ Raw: [raw/e3_harness.jsonl](data/round12/raw/e3_harness.jsonl).
 | sm_86 | nvidia/h100 | PTX x16 | 16/16 | SASS 16/16, PTX-JIT 16/16 | - |
 | sm_86 | nvidia/rtx5090 | PTX x16 | 16/16 | SASS 16/16, PTX-JIT 16/16 | - |
 | sm_86 | nvidia/a100 | PTX x16 | 1/16 | SASS 16/16, PTX-JIT 16/16 | int_alu:FAIL int_alu; f32_fma:FAIL f32_fma; f64_fma:FAIL f64_fma; f64_subnormal:FAIL f64_subnormal; wmma:FAIL wmma; mma_ptx:FAIL mma_ptx; mem:FAIL mem; shared:FAIL shared; atomics:FAIL atomics; textur |
-| sm_86 | nvidia/t4 | PTX x13 | 0/13 | SASS 16/16, PTX-JIT 16/16 | int_alu:FAIL int_alu; f32_fma:FAIL f32_fma; f64_fma:FAIL f64_fma; f64_subnormal:FAIL f64_subnormal; wmma:FAIL wmma; mma_ptx:FAIL mma_ptx; mem:FAIL mem; shared:FAIL shared; atomics:FAIL atomics; textur |
+| sm_86 | nvidia/t4 | PTX x16 | 1/16 | SASS 16/16, PTX-JIT 16/16 | int_alu:FAIL int_alu; f32_fma:FAIL f32_fma; f64_fma:FAIL f64_fma; f64_subnormal:FAIL f64_subnormal; wmma:FAIL wmma; mma_ptx:FAIL mma_ptx; mem:FAIL mem; shared:FAIL shared; atomics:FAIL atomics; textur |
 
 * The A10G runs **16 of 16** for builds up to sm_86 (sm_80 PTX or SASS, sm_86) and **1 of 16** for sm_89, sm_90 and sm_120 builds (the one passing workload,
   `api`, launches no kernel): `no kernel image is available`, because PTX of a later architecture cannot be JIT-compiled for an earlier device and the SASS
   is for another chip. This is the common case of a user simulating a newer card: **programs built for the card being simulated cannot run on the host card.**
 * The sm_86 build (PTX plus sm_86 SASS) runs everywhere it should: the simulated L4 and L40S run the sm_86 SASS (cubin compatibility within sm_8x, as
-  hardware), the H100 and RTX 5090 run its PTX, all 16/16 PASS, and the A10G passes the same 16. The A100 and T4 profiles refuse it (`cudaErrorInvalidPtx`,
+  hardware), the H100 and RTX 5090 run its PTX, all 16/16 PASS, and the A10G passes the same 16. The A100 and T4 profiles refuse it (1 of 16 passes, the workload with no kernel; `cudaErrorInvalidPtx`,
   as real hardware would for compute_86 PTX on sm_80 and sm_75): the simulator is faithful there, and the A10G cannot stand in for them with this build.
 * The sm_80 build is the legitimate way to simulate an A100 through the A10G: native A10G JIT of compute_80 PTX and the simulator's A100 SASS both pass 16/16.
   A passing PASS here means both sides equalled the host reference bit for bit, so they equal each other on these 16 programs.
 
 ### 4.2 The corpora, native PTX-JIT on the A10G vs the simulator on other profiles
 
-The corpora are built for sm_86 only (SASS plus compute_86 PTX), so they can run natively as "sm_86 PTX JIT-compiled by the driver" and be compared
-with the simulator on every profile that accepts compute_86 PTX. `IDENT=1` removes the lines that state the device (name, capability, SM count, driver
-version); the comparison reference is `ptxjit1` (native run with `CUDA_FORCE_PTX_JIT=1`), 164 programs. 13 programs cannot run in PTX-JIT mode on the card at
-all (below), so the denominator for "identical" is the programs that run on both.
+Rodinia, PolyBench and HeCBench are sm_86 builds (sm_86 SASS plus compute_86 PTX). The CUDA Samples are multi-architecture fatbins (SASS for sm_75, 80,
+86, 87, 89, 90, 100, 110, 120; checked with `strings`, and `VGPU_SASS_LOG=1` shows "running SASS: an sm_75 / sm_80 / sm_89 / sm_90 cubin" for `vectorAdd` on the
+T4, A100, L4 and H100 profiles). So the two groups differ in what the simulator runs on another profile: the sm_86-only builds run through the sm_86 SASS (L4,
+L40S: cubin compatibility within sm_8x) or through the PTX engine (H100, RTX 5090), or are refused (A100, T4); the Samples run the **profile's own SASS**.
+The native side is `CUDA_FORCE_PTX_JIT=1` on the A10G in all cases (`ptxjit1`, 164 programs). `IDENT=1` removes the lines that state the device (name,
+capability, SM count, driver version); anything else counts. 13 programs cannot run in PTX-JIT mode on the card at all (below), so the denominator of the last
+column is the programs that ran on both sides. The first row is the reference: the A10G profile itself, which shows the noise floor of this comparison (card
+nondeterminism, SFU rounding, cuRAND, the OOB read, printf order).
 
-TBD
+| simulated profile | group | engine the simulator ran | programs | identical | numeric-close | differs | native cannot run | simulator timeout | simulator fails | fail on both | identical / (ran on both) |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| a10g | sm_86-only builds | SASS sm_86 | 66 | 56 | 1 | 6 | 0 | 3 | 0 | 0 | 56 / 63 (89%) |
+| a10g | CUDA Samples | SASS of the profile's own architecture | 98 | 66 | 1 | 10 | 13 | 4 | 1 | 3 | 66 / 77 (86%) |
+| l4 | sm_86-only builds | SASS sm_86 (cubin-compatible with sm_89) | 66 | 50 | 1 | 5 | 0 | 10 | 0 | 0 | 50 / 56 (89%) |
+| l4 | CUDA Samples | SASS sm_89 | 98 | 60 | 1 | 14 | 13 | 6 | 1 | 3 | 60 / 75 (80%) |
+| h100 | sm_86-only builds | PTX compute_86 (JIT in the simulator) | 66 | 49 | 1 | 5 | 0 | 11 | 0 | 0 | 49 / 55 (89%) |
+| h100 | CUDA Samples | SASS sm_90 | 98 | 58 | 1 | 13 | 12 | 9 | 1 | 4 | 58 / 72 (81%) |
+| rtx5090 | sm_86-only builds | PTX compute_86 | 66 | 50 | 1 | 5 | 0 | 10 | 0 | 0 | 50 / 56 (89%) |
+| rtx5090 | CUDA Samples | SASS sm_120 | 98 | 60 | 1 | 13 | 12 | 7 | 1 | 4 | 60 / 74 (81%) |
+| a100 | sm_86-only builds | none: sm_86 SASS and compute_86 PTX are refused | 66 | n/a | n/a | n/a | 0 | n/a | n/a | n/a | **no kernel ran**: every launch fails with 'module targets sm_86 but this device is compute capability 8.0; PTX runs on newer architectures, not older ones'; the programs do not check the error, so 24 of 66 print output that matches or looks plausible (not a comparison) |
+| a100 | CUDA Samples | SASS sm_80 | 98 | 61 | 1 | 13 | 13 | 6 | 1 | 3 | 61 / 75 (81%) |
+| t4 | sm_86-only builds | none: refused | 66 | n/a | n/a | n/a | 0 | n/a | n/a | n/a | **no kernel ran**: every launch fails with 'module targets sm_86 but this device is compute capability 7.5; PTX runs on newer architectures, not older ones'; the programs do not check the error, so 24 of 66 print output that matches or looks plausible (not a comparison) |
+| t4 | CUDA Samples | SASS sm_75 | 98 | 55 | 1 | 12 | 13 | 5 | 9 | 3 | 55 / 68 (81%) |
+
+Programs that run on both and differ on the H100 profile (first differing line; the lists for the other profiles are in [raw/e3_corpora_summary.md](data/round12/raw/e3_corpora_summary.md)):
+
+* **h100** (20)
+  * `hecbench/aobench-cuda` differs: output files: ao.ppm
+  * `hecbench/s3d-cuda` numeric-close: 
+  * `rodinia/backprop` differs: output files: output.dat
+  * `rodinia/gaussian` differs: -Total Global Memory			 - 23131776 KB | +Total Global Memory			 - 83036032 KB
+  * `rodinia/particlefilter_float` differs: -XE: 26.303270 | -YE: 35.531096
+  * `rodinia/srad_v2` differs: -1.69188 2.06711 1.87182 1.34890 1.12669 1.69617 2.51154 1.19081 1.58601 1.33976 1.57482 1.32192 2.00494 2.137 | -1.42858 1.79608 2.11331 1.75094 1.44
+  * `samples/MC_SingleAsianOptionP` numeric-close: 
+  * `samples/binaryPartitionCG` differs: -Launching 160 blocks with 768 threads... | +Launching 264 blocks with 1024 threads...
+  * `samples/cudaCompressibleMemory` differs: -allocating non-compressible Z buffer
+  * `samples/cudaGraphsPerfScaling` differs: -20, 1, 0, 22.421, 37.742, 10.861, 30.842, 3.620, 21.041, 17.408, 0.000, 16.384, 0.000, 9.770, 2.048, 1.000, | +20, 1, 0, 27.022, 26.061, 98.706, 99.1
+  * `samples/fp16ScalarProduct` differs: -Result native operators	: 646406.000000 | -Result intrinsics	: 646406.000000
+  * `samples/graphMemoryNodes` differs: -Check verified that d_negSquare and d_input share a virtual address. | -Check verified that d_negSquare and d_input share a virtual address.
+  * `samples/ptxjit` differs: -ptxas info    : 0 bytes gmem | -ptxas info    : Function properties for myKernel
+  * `samples/reductionMultiBlockCG` differs: -numThreads: 768 | -numBlocks: 80
+  * `samples/simpleAWBarrier` differs: -Launching normVecByDotProductAWBarrier kernel with numBlocks = 160 blockSize = 768 | +Launching normVecByDotProductAWBarrier kernel with numBlocks = 
+  * `samples/simpleAssert` differs: -/home/saqib/.cache/cuda-samples/Samples/0_Introduction/simpleAssert/simpleAssert.cu:64: void testKernel(int): | -/home/saqib/.cache/cuda-samples/Samp
+  * `samples/simpleAssert_nvrtc` differs: -./simpleAssert_kernel.cu:38: void testKernel(int): block: [1,0,0], thread: [28,0,0] Assertion 'gtid < N' fail | -./simpleAssert_kernel.cu:38: void te
+  * `samples/simpleOccupancy` differs: -Potential occupancy: 33.3333% | +Potential occupancy: 50%
+  * `samples/simplePrintf` differs: +[2, 0]:		Value is:10 | -[1, 6]:		Value is:10
+  * `samples/systemWideAtomics` differs: -CAN access pageable memory | +CANNOT access pageable memory
+
+Reading it:
+
+* **The profile adds little beyond the noise floor where the program runs:** the sm_86-only builds agree on 89% of the programs that ran on both for the A10G
+  profile itself, the L4, the H100 and the RTX 5090 (the PTX engine gives the same agreement as the SASS engine); the Samples agree on 86% for the A10G
+  profile and 80% to 81% for L4, H100, RTX 5090, A100 (their own SASS). The extra ~5 points are identity: launch geometry from the SM count
+  (`binaryPartitionCG`: 160 blocks of 768 threads on the A10G, 116 on the L4, 264 of 1024 on the H100, 340 on the RTX 5090; `reductionMultiBlockCG`: 80, 58, 170
+  blocks; `simpleAWBarrier` the same way), `simpleOccupancy` (33% vs 50%), `gaussian` printing the memory size, `cudaCompressibleMemory` (the capability differs).
+* **That is agreement between the A10G and the simulator's engine for the other profile, not agreement with a real H100 or L4: NOT MEASURED** (no such card).
+  It only says the simulator and the A10G do not disagree more on those profiles than on the A10G's own.
+* **A100 and T4: the sm_86-only builds do not run at all** on the simulated card (`ptx-parse: module targets sm_86 but this device is compute capability 8.0; PTX
+  runs on newer architectures, not older ones`), exactly as hardware refuses them. The programs do not check the launch error and print results that are
+  wrong (PolyBench `GEMM`: 261,121 non-matching outputs; HeCBench `adam`: `FAIL`, checksum 0) or by accident plausible; the table does not count them. The
+  Samples run their own sm_80 / sm_75 SASS and agree 81% for the programs that ran on both.
 
 Why 13 programs do not run natively in PTX-JIT mode (`A-fails` against every profile): `MC_EstimatePiP/Q` (cuRAND's device code is SASS only: "Could not
 generate pseudo-random numbers"), `UnifiedMemoryStreams` (cublasCreate fails: cuBLAS has no PTX for sm_86 JIT), the CUDA Dynamic Parallelism samples
@@ -390,7 +448,7 @@ order and, for f16, tensor-core accumulation): **offloading cuBLAS to the card w
 ### 6.3 Can the real device hold the simulator's pointer values?
 
 [probe_va.cu](data/round12/probe_va.cu), native only: `cuMemAddressReserve` with the simulator's addresses as hints, then map real memory, run a kernel through
-the same pointer value and read it back (raw output below).
+the same pointer value and read it back (raw output: [raw/probe_va.txt](data/round12/raw/probe_va.txt)).
 
 | hint (what the simulator would use) | result |
 | --- | --- |
@@ -434,7 +492,7 @@ the code base. All speed-ups are the measured ones above; nothing was built. I r
 
 * **Speed-up:** the same large factors where it runs, but **it mostly does not run**: sm_89 / sm_90 / sm_120 builds pass on the A10G in 1 of 16 harness workloads
   (the one without a kernel); the sm_86 PTX build runs and passes on the simulated L4, L40S, H100 and RTX 5090 and on the A10G, but the A100 and T4 profiles
-  refuse it (`InvalidPtx`) like hardware (section 4.1). TBD
+  refuse it (`InvalidPtx`) like hardware (section 4.1). On the corpora where it does run, the A10G's PTX-JIT output agrees with the simulator on 89% of the sm_86-only programs on the L4, H100 and RTX 5090 profiles (the same as for the A10G profile itself) and 80% to 81% of the Samples (86% for the A10G's own), the extra 5 points being launch geometry and reported identity; this is agreement with the simulator's engine for those profiles, not with a real H100 or L4 (NOT MEASURED).
 * **Wrong card:** identity-dependent programs differ by construction (binaryPartitionCG, simpleOccupancy, reductionMultiBlockCG: launch geometry from the profile;
   232 KB of shared memory refused with `cudaErrorInvalidValue`; no clusters, section 5.2). Programs for the simulated card's own features (wgmma, TMA, clusters,
   tcgen05, fp8: section 4.3) cannot execute on sm_86 at all. Arithmetic specific to the simulated architecture (SFU rounding, tensor-core accumulation) would be
@@ -506,7 +564,6 @@ with diagnostics is the only form with an equivalence argument, and (4) is the f
   pointers and pids were not compared; a difference confined to such lines would be missed. The filter was tuned on the card-vs-card pair (37 programs
   differed with the first filter, 14 after adding the number-next-to-a-time-label and number-followed-by-`s` rules, 11 after the pid rule), which is a form of fitting the
   filter to noise; the per-program table shows each decision.
-* Only the 38 non-identical programs were run twice on the simulator, so its own run-to-run stability is known for those only.
 * The corpora are sm_86 builds; builds for the simulated card's own architecture (the realistic case for "simulate an H100") were measured only for the 16 harness
   workloads (section 4.1), not for the corpora, because building the corpora was out of scope (no builds on the WSL machine, and the rig builds were limited to
   the harness).

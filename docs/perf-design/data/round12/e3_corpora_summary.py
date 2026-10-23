@@ -22,18 +22,28 @@ def cat(c, why):
     if c == "B-fails": return "simulator timeout" if why == "timeout" else "simulator fails (%s)" % why
     if c.startswith("both-fail"): return "fail on both"
     return c
-cats = ["identical", "numeric-close", "differs", "simulator timeout", "simulator fails", "native cannot run", "fail on both", "missing"]
-print("| simulated profile | engine the sim ran | programs | identical | numeric-close | differs | native cannot run | simulator timeout | simulator fails | fail on both | identical / (programs that ran on both) |")
-print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+GROUPS = [("sm_86-only builds (Rodinia 12, PolyBench 20, HeCBench 34)", lambda k: not k.startswith("samples/")),
+          ("CUDA Samples (98; multi-architecture fatbin sm_75..sm_120)", lambda k: k.startswith("samples/"))]
+ENGINE = {"a10g": ("SASS sm_86", "SASS of the profile's own architecture"), "l4": ("SASS sm_86 (cubin-compatible with sm_89)", "SASS sm_89"),
+          "h100": ("PTX compute_86 (JIT in the simulator)", "SASS sm_90"), "rtx5090": ("PTX compute_86", "SASS sm_120"),
+          "a100": ("none: sm_86 SASS and compute_86 PTX are refused", "SASS sm_80"), "t4": ("none: refused", "SASS sm_75")}
+print("| simulated profile | group | engine the simulator ran | programs | identical | numeric-close | differs | native cannot run | simulator timeout | simulator fails | fail on both | identical / (ran on both) |")
+print("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 for p, r in res.items():
-    c = collections.Counter(("simulator fails" if cat(*v).startswith("simulator fails") else cat(*v)) for v in r.values())
-    ran = sum(c[x] for x in ("identical", "numeric-close", "differs"))
-    print("| %s | %s | %d | %d | %d | %d | %d | %d | %d | %d | %d / %d (%.0f%%) |" % (p, "SASS (sm_86 cubin compatible)" if p in ("a10g", "l4", "l40s") else "PTX (compute_86 JIT)", len(r), c["identical"], c["numeric-close"], c["differs"], c["native cannot run"], c["simulator timeout"], c["simulator fails"], c["fail on both"], c["identical"], ran, 100.0 * c["identical"] / max(1, ran)))
+    for gname, f in GROUPS:
+        sub = {k: v for k, v in r.items() if f(k)}
+        c = collections.Counter(("simulator fails" if cat(*v).startswith("simulator fails") else cat(*v)) for v in sub.values())
+        ran = sum(c[x] for x in ("identical", "numeric-close", "differs"))
+        eng = ENGINE[p][0 if gname.startswith("sm_86") else 1]
+        if p in ("a100", "t4") and gname.startswith("sm_86"):
+            print("| %s | %s | %s | %d | n/a | n/a | n/a | 0 | n/a | n/a | n/a | **no kernel ran**: every launch fails with 'module targets sm_86 but this device is compute capability %s; PTX runs on newer architectures, not older ones'; the programs do not check the error, so %d of 66 print output that matches or looks plausible (not a comparison) |" % (p, gname.split(" (")[0], eng, len(sub), "8.0" if p == "a100" else "7.5", c["identical"]))
+            continue
+        print("| %s | %s | %s | %d | %d | %d | %d | %d | %d | %d | %d | %d / %d (%.0f%%) |" % (p, gname.split(" (")[0], eng, len(sub), c["identical"], c["numeric-close"], c["differs"], c["native cannot run"], c["simulator timeout"], c["simulator fails"], c["fail on both"], c["identical"], ran, 100.0 * c["identical"] / max(1, ran)))
 print()
 print("Programs that run on both and differ, by profile (first differing line):\n")
 for p, r in res.items():
     if p == "a10g": continue
-    rows = [(k, v) for k, v in sorted(r.items()) if v[0] in ("differs", "numeric-close")]
+    rows = [(k, v) for k, v in sorted(r.items()) if v[0] in ("differs", "numeric-close") and (p not in ("a100", "t4") or k.startswith("samples/"))]
     if not rows: continue
     print("* **%s** (%d)" % (p, len(rows)))
     for k, v in rows: print("  * `%s` %s: %s" % (k, v[0], v[1][:150].replace("`", "'")))
