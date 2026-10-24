@@ -709,9 +709,11 @@ hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std
     }
     return hipSuccess;
   }
-  auto result = std::make_shared<hipError_t>(hipSuccess);
-  Queue::Work told = [result, work = std::move(work)] {
-    *result = work();
+  // (the caller waits for the item below, so the work and the result can stay in this frame; two references are
+  // too small for the function to allocate for)
+  hipError_t value = hipSuccess;
+  Queue::Work told = [&value, &work] {
+    value = work();
     return hipSuccess;   // told to the caller, not kept for a later synchronization
   };
   // A call that waits for its own work, on a stream with nothing in it, runs the work here: the stream's thread
@@ -731,9 +733,9 @@ hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std
   // work left (HIP's "may also return error codes from previous,
   // asynchronous launches"): a copy back after a kernel that failed says so,
   // rather than handing over whatever the buffer held.
-  if (*result == hipSuccess)
+  if (value == hipSuccess)
     if (const hipError_t e = o.queue->take_error(); e != hipSuccess) return e;
-  return *result;
+  return value;
 }
 
 // Every queue of a device -- its null stream's and each of its streams' --
@@ -2583,14 +2585,23 @@ hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream) {
   // An interprocess event's record counts for every process that has it.
   std::shared_ptr<IpcEventState> ipc = e->ipc;
   const uint64_t made = ipc ? ipc->counters[0].fetch_add(1) + 1 : 0;
-  e->seq = o.queue->submit(
-      [stamp, ipc, made] {
-        stamp->when = std::chrono::steady_clock::now();
-        stamp->taken.store(true, std::memory_order_release);
-        if (ipc) ipc->done(made);
-        return hipSuccess;
-      },
-      std::move(o.after));
+  const auto take = [](Stamp& st, IpcEventState* shared, uint64_t n) {
+    st.when = std::chrono::steady_clock::now();
+    st.taken.store(true, std::memory_order_release);
+    if (shared) shared->done(n);
+    return hipSuccess;
+  };
+  // On a stream with nothing in it the record is taken here: the stream's thread would be woken (and started, with
+  // the stream's first item) to read the clock, and the event is complete when the call returns, as a card's is on
+  // an idle stream. (A profiler attached keeps the stream's thread, as for a waited-for call: see in_order.)
+  hipError_t unused = hipSuccess;
+  uint64_t seq = 0;
+  auto now = [&] { return take(*stamp, ipc.get(), made); };
+  if (!profiler() && o.queue->run_inline(now, o.after, &unused, &seq)) {
+    e->seq = seq;
+  } else {
+    e->seq = o.queue->submit([stamp, ipc, made, take] { return take(*stamp, ipc.get(), made); }, std::move(o.after));
+  }
   return record(s, hipSuccess);
 }
 

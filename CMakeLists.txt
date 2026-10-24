@@ -1628,6 +1628,13 @@ target_include_directories(test_amd_hip_thread_refused PRIVATE tests/framework a
 add_test(NAME test_amd_hip_thread_refused COMMAND test_amd_hip_thread_refused)
 set_tests_properties(test_amd_hip_thread_refused PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "^(ok|SKIP)" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# An event recorded on a stream with nothing in it is taken on the calling thread.
+add_executable(test_amd_hip_event_inline amd/tests/unit/test_hip_event_inline.cpp)
+target_link_libraries(test_amd_hip_event_inline PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_event_inline PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_event_inline COMMAND test_amd_hip_event_inline)
+set_tests_properties(test_amd_hip_event_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
 set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "ok HIP from a static destructor" FAIL_REGULAR_EXPRESSION "FAIL|ERROR: AddressSanitizer|malloc|double free|corrupted")
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
@@ -2259,13 +2266,6 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_user_objects PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
-# The driver's stream-ordered memory pools (cuMemPool*, cuMemAllocFromPoolAsync).
-if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
-  add_executable(test_driver_mempool nvidia/tests/unit/test_driver_mempool.cpp)
-  target_link_libraries(test_driver_mempool PRIVATE vgpucuda)
-  target_include_directories(test_driver_mempool PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
-  add_test(NAME test_driver_mempool COMMAND test_driver_mempool)
-  set_tests_properties(test_driver_mempool PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
 # The gate every allocation, copy and launch passes: refused during a capture, free of cost otherwise.
 if(TARGET vgpucudart)
   add_executable(test_runtime_capture_gate nvidia/tests/unit/test_runtime_capture_gate.cpp)
@@ -2275,6 +2275,13 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_capture_gate PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# The driver's stream-ordered memory pools (cuMemPool*, cuMemAllocFromPoolAsync).
+if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
+  add_executable(test_driver_mempool nvidia/tests/unit/test_driver_mempool.cpp)
+  target_link_libraries(test_driver_mempool PRIVATE vgpucuda)
+  target_include_directories(test_driver_mempool PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_driver_mempool COMMAND test_driver_mempool)
+  set_tests_properties(test_driver_mempool PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
 endif()
 # cuLaunchKernelEx's attribute list: the cluster shape and a cooperative launch.
 if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)

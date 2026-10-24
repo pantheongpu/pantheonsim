@@ -220,4 +220,60 @@ VTEST(a_long_item_is_waited_for_by_sleeping) {
   VCHECK(q.done(seq));
 }
 
+// idle(), tail() and take_error() answer without the lock, from the counters the items keep: a queue with an item
+// running is not idle, and its tail counts the item; a failure is there for the caller as soon as the item that had
+// it is seen to be done, however quickly that is asked.
+VTEST(idle_tail_and_take_error_follow_the_items_without_the_lock) {
+  Queue q(kOk, kFailed);
+  VCHECK(q.idle());
+  VCHECK_EQ(q.tail(), uint64_t{0});
+  VCHECK_EQ(q.take_error(), kOk);
+  std::atomic<bool> started{false}, release{false};
+  const uint64_t held = q.submit([&] {
+    started = true;
+    while (!release.load()) std::this_thread::sleep_for(100us);
+    return kOk;
+  });
+  VCHECK(until(started));
+  VCHECK(!q.idle());                         // running
+  VCHECK_EQ(q.tail(), held);
+  const uint64_t behind = q.submit([] { return kOk; });
+  VCHECK_EQ(behind, held + 1);
+  VCHECK_EQ(q.tail(), behind);
+  VCHECK(!q.idle());                         // queued behind it
+  release = true;
+  q.wait(behind);
+  VCHECK(q.idle());
+  VCHECK_EQ(q.take_error(), kOk);
+  // the first failure is kept, a later one does not replace it, and asking forgets it
+  for (int round = 0; round < 300; ++round) {
+    q.submit([] { return 5; });
+    const uint64_t last = q.submit([] { return 6; });
+    q.wait(last);
+    VCHECK_EQ(q.take_error(), 5);            // (the failure is there the moment the item is done)
+    VCHECK_EQ(q.take_error(), kOk);
+    VCHECK(q.idle());
+  }
+}
+
+// run_inline tells the number of the item it ran, and takes any callable (a lambda in the caller's frame, which a
+// Work would have to allocate for).
+VTEST(an_inline_item_reports_its_number_and_needs_no_function_object) {
+  Queue q(kOk, kFailed);
+  int ran = 0, result = -1;
+  uint64_t seq = 0;
+  auto first = [&] { return ++ran; };
+  VCHECK(q.run_inline(first, {}, &result, &seq));
+  VCHECK_EQ(seq, uint64_t{1});
+  VCHECK_EQ(result, 1);
+  const uint64_t queued = q.submit([] { return kOk; });
+  VCHECK_EQ(queued, uint64_t{2});
+  q.wait(queued);
+  auto second = [&] { return ++ran; };
+  VCHECK(q.run_inline(second, {}, &result, &seq));
+  VCHECK_EQ(seq, uint64_t{3});
+  VCHECK_EQ(q.take_error(), 1);              // (the first failure since the last ask)
+  VCHECK_EQ(q.take_error(), kOk);
+}
+
 VTEST_MAIN
