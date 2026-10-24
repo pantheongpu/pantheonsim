@@ -792,6 +792,14 @@ hipError_t drain_device(int device, bool blocking_only = false) {
 // The kernel's arguments, as HIP passes them: either one packed buffer
 // (`extra`), or one pointer per argument (`kernelParams`), which are packed
 // here at the offsets the code object's metadata gives.
+// Set when the first pool is made (under s.mutex): until then a synchronization has nothing to give back and does not
+// take the lock to find that out.
+std::atomic<bool> g_pools_made{false};
+void release_pools_at_sync(State& s) {
+  if (!g_pools_made.load(std::memory_order_acquire)) return;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  release_to_thresholds(s);
+}
 hipError_t build_kernargs(const Kernel& k, void** params, void** extra, std::vector<uint8_t>* out) {
   out->assign(k.kernarg_size, 0);
   if (extra) {
@@ -1777,8 +1785,7 @@ hipError_t hipDeviceSynchronize(void) {
   // any of it had: where an asynchronous error comes out. The pools then
   // keep no more than their release thresholds.
   const hipError_t e = drain_device(ordinal);
-  std::lock_guard<std::mutex> lock(s.mutex);
-  release_to_thresholds(s);
+  release_pools_at_sync(s);
   return record(s, e);
 }
 
@@ -1873,15 +1880,15 @@ hipError_t hipFree(void* ptr) {
   const ApiCall api("hipFree", ptr);
   State& s = state();
   if (!ptr) return record(s, hipSuccess);
-  int ordinal = 0;
+  std::vector<std::shared_ptr<Queue>> qs;
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-    ordinal = s.current;
+    int ordinal = s.current;
     for (int i = 0; i < s.rt->device_count(); ++i)
       if (s.rt->device(i).memory().owns(reinterpret_cast<uint64_t>(ptr))) ordinal = i;
   }
-  drain_device(ordinal);
+  drain(qs);
   return record(s, free_now(ptr));
 }
 
@@ -1894,6 +1901,7 @@ hipError_t hipMemset(void* dst, int value, size_t bytes) {
   const ApiCall api("hipMemset", dst, value, bytes);
   const uint8_t byte = static_cast<uint8_t>(value);
   return record(state(), fill_in_order(dst, &byte, 1, bytes, nullptr, false));
+    qs = queues_of(s, ordinal);   // (what drain_device(ordinal) waits for, without taking the lock a second time)
 }
 
 // The asynchronous forms: queued on the stream, and returned from at once
@@ -2415,8 +2423,7 @@ hipError_t hipStreamSynchronize(hipStream_t stream) {
     }
   }
   const hipError_t e = drain(qs);
-  std::lock_guard<std::mutex> lock(s.mutex);
-  release_to_thresholds(s);
+  release_pools_at_sync(s);
   return record(s, e);
 }
 
@@ -2648,9 +2655,7 @@ hipError_t hipEventSynchronize(hipEvent_t event) {
   bool exists = false;
   if (event_marker(event, &m, nullptr, &exists)) m.queue->wait(m.seq);
   if (!exists) return record(state(), hipErrorInvalidHandle);
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  release_to_thresholds(s);
+  release_pools_at_sync(state());
   return hipSuccess;
 }
 
@@ -4078,6 +4083,7 @@ Pool* current_pool(State& s, int ordinal) {
   const auto it = s.current_pools.find(ordinal);
   return it != s.current_pools.end() ? it->second : default_pool(s, ordinal);
 }
+    g_pools_made.store(true, std::memory_order_release);
 // An allocation from `pool`, on the pool's device. The caller holds the lock.
 // Gives back to the device what the pool keeps and no stream still has
 // ahead of it, until it keeps no more than `keep` bytes reserved. The caller
@@ -4270,6 +4276,7 @@ hipError_t hipMemPoolDestroy(void* pool) {
   Pool* p = find_pool(s, pool);
   if (!p) return record(s, hipErrorInvalidValue);
   for (const auto& d : s.default_pools)
+  g_pools_made.store(true, std::memory_order_release);
     if (d.second == p) return record(s, hipErrorInvalidValue);
   release_kept(s, p, 0);
   p->destroyed = true;
@@ -5952,6 +5959,7 @@ hipError_t hipMemPoolExportPointer(void* data, void* ptr) {
   settle_before_sharing(ptr);
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
+  g_pools_made.store(true, std::memory_order_release);
   if (!data || !ptr) return record(s, hipErrorInvalidValue);
   const auto pa = s.pool_allocations.find(reinterpret_cast<uint64_t>(ptr));
   if (pa == s.pool_allocations.end() || !(pa->second.first->handle_types & 1))
