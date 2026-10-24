@@ -4150,8 +4150,7 @@ Per-work-group and per-block set-up and the launch path, measured on server3 (on
 
 ### What changed
 
-* **AMD register file** (`VgprFile::Rows`, amd/src/gcn_exec.cpp). One block of memory, zeroed with `memset`, 64-byte aligned (every row
-  starts on a cache line: the lane-wise SIMD loads of a row no longer split lines). A file of the usual 256 rows goes back to a
+* **AMD register file** (`VgprFile::Rows`, amd/src/gcn_exec.cpp). One block of memory from `malloc`, zeroed with `memset`. (First 64-byte aligned, so that the lane-wise loads of a row never split a cache line: `mfma_f64` ran 23% slower, 2.74 G cycles against 2.22 G, with L1 misses doubling in the matrix tile loads; with malloc's 16-byte offset, which the vector had, it is back at 2.22 G.) A file of the usual 256 rows goes back to a
   per-thread pool (32 of them) with `dirty`, the number of rows that may be non-zero, and the next wave to take one clears only those. A
   work-group that ended normally (every wave `done`, no debugger) marks its files with the highest vector register any instruction the
   machine decoded names, plus 16 for the widest result, and at least v0 to v2 (`set_up_group` seeds them): `Group::~Group`. An
