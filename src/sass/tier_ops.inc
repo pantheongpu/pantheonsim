@@ -1024,6 +1024,47 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
   }
   uint8_t* sh = blk.shared.data();
   uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
+  if (bytes == 4 && ex == kAll) {
+    // A whole warp's words: the 32 consecutive words of an array indexed by the thread (the commonest shared access), or one word
+    // every lane names. The same bytes move as lane by lane (a word every lane stores is the last lane's); the lanes are on one pass
+    // through the banks, as the general count finds (a word that is not aligned spreads over one more bank).
+    const uint64_t o0 = addrs[0] & 0xffffff;
+    uint64_t seq = 0, same = 0;
+    for (unsigned l = 0; l < 32; ++l) {
+      const uint64_t o = addrs[l] & 0xffffff;
+      seq |= o ^ (o0 + 4 * l);
+      same |= o ^ o0;
+    }
+    if ((seq == 0 && (o0 & 3) == 0) || same == 0) {
+      uint8_t* at = sh + o0;
+      if (seq == 0) {
+        if (Store) {
+          if (d) {
+#if defined(__SSE2__)
+            __m128i v[8];
+            for (unsigned i = 0; i < 8; ++i) v[i] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(d) + i);
+            for (unsigned i = 0; i < 8; ++i) _mm_storeu_si128(reinterpret_cast<__m128i*>(at) + i, v[i]);
+#else
+            std::memcpy(at, d, 128);
+#endif
+          } else {
+            std::memset(at, 0, 128);
+          }
+        } else if (d) {
+          tier_copy_row(d, reinterpret_cast<const uint32_t*>(at));   // (a copy of any alignment: unaligned vector loads)
+        }
+      } else if (Store) {
+        const uint32_t v = d ? d[31] : 0u;
+        std::memcpy(at, &v, 4);
+      } else if (d) {
+        uint32_t v;
+        std::memcpy(&v, at, 4);
+        for (unsigned l = 0; l < 32; ++l) d[l] = v;
+      }
+      count_shared(blk.st, Store, 32, 4, 1);
+      return;
+    }
+  }
   const unsigned words = std::max(1u, bytes / 4);
   // (The widths the instruction can have move with copies of a size known at compile time: see store_lane_bytes.)
   const bool moved = with_lane_width(bytes, [&](auto width) {

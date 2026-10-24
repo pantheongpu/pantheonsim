@@ -2961,6 +2961,16 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
 
 // ---- memory ------------------------------------------------------------------
 
+// A warp's shared-memory access of `n` lanes of `bytes` bytes, taking `passes` passes through the banks.
+inline void count_shared(exec::LaunchStats& st, bool store, uint64_t n, uint32_t bytes, uint64_t passes) {
+  (store ? st.shared_stores : st.shared_loads) += n;
+  (store ? st.shared_bytes_written : st.shared_bytes_read) += n * bytes;
+  ++st.shared_requests;
+  ++(store ? st.shared_requests_st : st.shared_requests_ld);
+  st.shared_bank_conflicts += passes - 1;
+  (store ? st.shared_bank_conflicts_st : st.shared_bank_conflicts_ld) += passes - 1;
+}
+
 // Counts one warp-level access: per-lane operations and bytes, the 32-byte
 // sectors the lanes' addresses touch, and shared-memory bank conflicts.
 void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 local */, bool store,
@@ -2980,15 +2990,9 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
       break;
     }
     case 1: {
-      (store ? st.shared_stores : st.shared_loads) += n;
-      (store ? st.shared_bytes_written : st.shared_bytes_read) += n * bytes;
-      ++st.shared_requests;
-      ++(store ? st.shared_requests_st : st.shared_requests_ld);
       // 32 banks of 4 bytes: lanes on different words of one bank take a
       // pass each; lanes on the same word share one.
-      const uint64_t passes = exec::memcount::sass_bank_passes(addr, lanes, 32, bytes);
-      st.shared_bank_conflicts += passes - 1;
-      (store ? st.shared_bank_conflicts_st : st.shared_bank_conflicts_ld) += passes - 1;
+      count_shared(st, store, n, bytes, exec::memcount::sass_bank_passes(addr, lanes, 32, bytes));
       break;
     }
     default: {
