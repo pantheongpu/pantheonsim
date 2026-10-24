@@ -1730,6 +1730,50 @@ bool MemoryManager::atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, v
   if (size != 4 && size != 8) return false;
   RmwSlot s;
   if (!rmw_locate(addr, size, &s)) return false;
+  atomic_rmw_slot(s, size, compute, ctx, old_out, always_store);
+  return true;
+}
+
+bool MemoryManager::rmw_batch_fn(const uint64_t* addrs, size_t count, uint32_t size, RmwLaneFn compute, void* ctx,
+                                 uint64_t* olds, size_t* done, bool lock_free) {
+  *done = 0;
+  if (count == 0) return true;
+  if (lock_free && size != 4 && size != 8) return false;
+  if (access_faults_armed()) return false;
+  const Allocation* ca = nullptr;
+  uint64_t base = 0;
+  if (!batch_ok(addrs, count, size, /*store=*/true, &ca, &base)) return false;
+  Allocation& a = const_cast<Allocation&>(*ca);
+  struct Lane {
+    RmwLaneFn fn;
+    void* ctx;
+    size_t i;
+  } lane{compute, ctx, 0};
+  const auto trampoline = [](void* c, uint64_t old) -> uint64_t {
+    const Lane* l = static_cast<const Lane*>(c);
+    return l->fn(l->ctx, l->i, old);
+  };
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addrs[i] - base;
+    // (The chunk is read for each lane: an earlier lane's store may have made it real.)
+    RmwSlot s{&a, off / kChunkSize, off % kChunkSize, nullptr};
+    s.chunk = a.chunks[s.chunk_idx].load(std::memory_order_acquire);
+    lane.i = i;
+    if (lock_free) {
+      atomic_rmw_slot(s, size, trampoline, &lane, &olds[i], /*always_store=*/false);
+    } else {
+      const uint64_t old = rmw_load(s, size);
+      olds[i] = old;
+      const uint64_t now = compute(ctx, i, old);
+      if (now != old) rmw_store(s, size, now);
+    }
+    *done = i + 1;
+  }
+  return true;
+}
+
+void MemoryManager::atomic_rmw_slot(RmwSlot& s, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out,
+                                    bool always_store) {
   for (;;) {
     if (s.chunk && !is_uniform(s.chunk)) {
       uint8_t* p = s.chunk + s.coff;
@@ -1752,7 +1796,7 @@ bool MemoryManager::atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, v
         }
         *old_out = old;
       }
-      return true;
+      return;
     }
     // Nothing real to swap on: what the chunk reads as, and whether the result would change it.
     const uint64_t old = rmw_load(s, size);
@@ -1760,7 +1804,7 @@ bool MemoryManager::atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, v
     const bool uniform = s.chunk != nullptr;
     if (uniform ? now == old : (now == old && !always_store)) {
       *old_out = old;
-      return true;
+      return;
     }
     // The store makes the chunk real; the swap then runs on it, from whatever it holds by then.
     s.chunk = materialize(*s.a, s.chunk_idx);

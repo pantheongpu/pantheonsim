@@ -246,6 +246,23 @@ class MemoryManager {
         const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out, always_store);
   }
 
+  // A wave's read-modify-writes at once: `count` accesses of `size` bytes in order, access i loading the word, `compute(i, old)` and
+  // storing the result where it differs (`lock_free`: as atomic_rmw does, a compare-and-swap on the word, for 4 and 8 bytes; else
+  // the plain load and store of rmw_if_changed), with one lookup for the lot. `olds[i]` is what access i loaded; `*done` is how many
+  // were made (all of them, or those before a store that could not get host memory and threw). Returns false, having done nothing,
+  // wherever any access could differ from the calls these stand for: a fault armed, a host mapping in reach, an address misaligned or
+  // outside the one allocation the first is in, a size that is not 1/2/4/8 (4/8 when lock_free).
+  using RmwLaneFn = uint64_t (*)(void* ctx, size_t i, uint64_t old);
+  bool rmw_batch_fn(const uint64_t* addrs, size_t count, uint32_t size, RmwLaneFn compute, void* ctx, uint64_t* olds, size_t* done,
+                    bool lock_free);
+  template <class F>
+  bool rmw_batch(const uint64_t* addrs, size_t count, uint32_t size, F&& compute, uint64_t* olds, size_t* done, bool lock_free) {
+    return rmw_batch_fn(
+        addrs, count, size,
+        [](void* c, size_t i, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(i, old); },
+        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), olds, done, lock_free);
+  }
+
   // The fields of one record (a texel's channels), `n` of them end to end from `addr`, field i `sizes[i]` bytes
   // (0, 1, 2, 4 or 8; a 0 reads nothing and gives 0), each one load_scalar of its width. Returns true with
   // `out[i]` set, or false having done nothing -- a fault or stuck cell armed, a host mapping possibly in range,
@@ -605,6 +622,8 @@ class MemoryManager {
     uint8_t* chunk;     // as read by rmw_locate: null, a uniform tag, or the bytes
   };
   bool rmw_locate(uint64_t addr, uint32_t size, RmwSlot* s) const;
+  // atomic_rmw's swap loop on a located slot.
+  void atomic_rmw_slot(RmwSlot& s, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out, bool always_store);
   uint64_t rmw_load(const RmwSlot& s, uint32_t size) const;
   void rmw_store(RmwSlot& s, uint32_t size, uint64_t value);
   // Whether a fault is armed that load_scalar or store_scalar would apply.

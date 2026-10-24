@@ -9897,6 +9897,41 @@ struct Machine {
     return true;
   }
 
+  // The active lanes from `from` on, each making the atomic `a` at `lane_addr[lane]`, together (MemoryManager::rmw_batch): lane by
+  // lane in order, as they are one at a time, with one lookup for the allocation. Each lane's old value goes to the destination
+  // register (where the instruction returns one) once they are made, or, for those made before a store that could not get host
+  // memory, before the error leaves. False, having done nothing, where the memory manager declines (the lanes then go one at a time).
+  [[gnu::noinline]] bool wave_atomics(Wave& w, const Inst& in, uint32_t from, const uint64_t* lane_addr, const AtomicOp& a) {
+    uint64_t addrs[kLanes], v[kLanes], expected[kLanes], olds[kLanes];
+    uint32_t lanes[kLanes];
+    uint32_t n = 0;
+    for (uint64_t m = w.exec >> from << from; m; m &= m - 1) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+      addrs[n] = lane_addr[lane];
+      atomic_data(w, in, a, lane, &v[n], &expected[n]);
+      lanes[n++] = lane;
+    }
+    const auto give_back = [&](size_t count) {
+      if (in.dst.empty()) return;
+      for (size_t i = 0; i < count; ++i) {
+        if (a.bytes == 8) write_lane64(w, in.dst[0], lanes[i], olds[i]);
+        else if (in.dst[0].kind == OperandKind::Vgpr && !narrow_dst) w.vgpr[in.dst[0].index][lanes[i]] = static_cast<uint32_t>(olds[i]);
+        else write_lane(w, in.dst[0], lanes[i], static_cast<uint32_t>(olds[i]));
+      }
+    };
+    size_t done = 0;
+    bool made = false;
+    try {
+      made = mem.rmw_batch(addrs, n, a.bytes, [&](size_t i, uint64_t old) { return atomic_result(a, old, v[i], expected[i]); }, olds,
+                           &done, concurrent);
+    } catch (...) {
+      give_back(done);
+      throw;
+    }
+    if (made) give_back(n);
+    return made;
+  }
+
   void global_access(Wave& w, const Inst& in) {
     if (!w.exec) return;   // no lane to reach memory for
     const std::string& op = in.name;
@@ -9994,6 +10029,8 @@ struct Machine {
                       : kind == Kind::Narrow ? (narrow_store ? in.src[1].kind == OperandKind::Vgpr && in.src[1].sel == 6 && !dpp_operand
                                                              : in.dst[0].kind == OperandKind::Vgpr && !narrow_dst)
                                              : false);
+    // An atomic's lanes go to memory together (wave_atomics), once, where the lanes can take turns without a lock.
+    bool try_atomics = kind == Kind::Atomic && d.peers.empty() && runs_on && (!concurrent || lock_free);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // The address is a 64-bit one in a register pair, or a scalar base with
@@ -10013,6 +10050,18 @@ struct Machine {
           continue;
         }
         try_runs = false;
+      }
+      if (try_atomics) {
+        try_atomics = false;
+        uint64_t lane_addr[kLanes];
+        for (uint64_t m = w.exec >> lane << lane; m; m &= m - 1) {
+          const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
+          lane_addr[l] = (in.has_saddr ? saddr_base + scaled_offset(in, a0_vgpr ? w.vgpr[a0.index][l] : lane_src(w, a0, l), access_bytes)
+                          : a0_vgpr    ? (w.vgpr[a0.index][l] | static_cast<uint64_t>(w.vgpr[a0.index + 1][l]) << 32)
+                                       : lane_src64(w, a0, l)) +
+                         static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+        }
+        if (wave_atomics(w, in, lane, lane_addr, atomic)) return;
       }
       if (try_batch && (kind != Kind::Load || !memo)) {
         try_batch = false;
