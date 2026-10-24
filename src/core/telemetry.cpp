@@ -98,14 +98,21 @@ Publisher::~Publisher() {
   if (!path_.empty()) ::unlink(path_.c_str());
 }
 
+// The writers of one segment take writers_, so the sequence number has one writer at a time and is bumped by a
+// load and a store (two atomic read-modify-writes a call before): odd while an update is in progress, the data
+// stores ordered after the odd number by the fence and before the even one by the release store.
 void Publisher::begin_update() {
-  if (shared_) __atomic_add_fetch(&shared_->update_seq, 1, __ATOMIC_ACQ_REL);
+  if (!shared_) return;
+  const uint64_t seq = __atomic_load_n(&shared_->update_seq, __ATOMIC_RELAXED);
+  __atomic_store_n(&shared_->update_seq, seq + 1, __ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 int64_t Publisher::end_update(int64_t now) {
   if (!shared_) return now;
   const int64_t t = now >= 0 ? now : now_ns();
   shared_->update_ns = t;
-  __atomic_add_fetch(&shared_->update_seq, 1, __ATOMIC_ACQ_REL);
+  const uint64_t seq = __atomic_load_n(&shared_->update_seq, __ATOMIC_RELAXED);
+  __atomic_store_n(&shared_->update_seq, seq + 1, __ATOMIC_RELEASE);
   return t;
 }
 

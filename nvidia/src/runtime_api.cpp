@@ -881,7 +881,7 @@ void bind_driver_context() {
 // check, and errors thrown inside turned into codes. `needs_context` is false
 // for the calls an RTX 3060 still answers after a kernel has killed the
 // context -- which device is current, how many there are, what one is.
-static void announce_context();
+static void announce_context(bool silenced);
 template <class F>
 cudaError_t guard_impl(const char* api, bool needs_context, F&& body) {
   State& s = st();
@@ -900,10 +900,11 @@ cudaError_t guard_impl(const char* api, bool needs_context, F&& body) {
       }
       // A profiler's own question (vgpu::profiling::Silence) is not the
       // program using the runtime: it binds no context and creates none.
-      if (!vgpu::profiling::silenced()) bind_driver_context();
+      const bool silent = call.silenced();
+      if (!silent) bind_driver_context();
       // cudaSetDevice makes the context of the device it selects, which is not
       // the one that was current when it was called (see its body).
-      if (std::strcmp(api, "cudaSetDevice") != 0) announce_context();
+      if (std::strcmp(api, "cudaSetDevice") != 0) announce_context(silent);
       if (needs_context) {
         if (const cudaError_t sticky = static_cast<cudaError_t>(s.rt->context_fault())) {
           g_last_error = sticky;
@@ -963,9 +964,9 @@ struct SyncScope : vgpu::profiling::SyncScope {
 static std::atomic<uint32_t> g_announced_contexts{0};
 static std::atomic<uint32_t> g_context_generation[32];
 
-static void announce_context() {
+static void announce_context(bool silenced) {
   // A profiler asking what a device is has not made a context.
-  if (vgpu::profiling::silenced()) return;
+  if (silenced) return;
   vgpu::profiling::note_context_made();
   if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
   const uint32_t bit = 1u << (static_cast<unsigned>(t_current_device) & 31u);
@@ -1781,7 +1782,7 @@ static cudaError_t cudaSetDevice_body(int device) {
     // The real runtime makes the device's context here (measured: its streams
     // and the context record are told within cudaSetDevice), not at the next
     // call that needs it.
-    announce_context();
+    announce_context(vgpu::profiling::silenced());
     return cudaSuccess;
   });
 }

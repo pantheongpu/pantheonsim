@@ -19,6 +19,10 @@ namespace {
 std::mutex g_mu;
 std::vector<Event> g_events;
 std::atomic<uint32_t> g_correlation{1};
+
+}  // namespace
+
+namespace detail {
 // What every API call of a thread reads and writes, in one thread-local: a thread-local of a shim library is
 // reached through __tls_get_addr, and a call that touched several paid for each (the calls are made by the
 // million). `t` below is that one lookup, made once in a function.
@@ -30,9 +34,12 @@ struct ThreadApi {
   uint32_t correlation = 0;       // the API call this thread is inside
   bool have_sizes = false;
   const char* symbol = nullptr;
-  const void* args[16];
-  uint16_t sizes[16];
+  const void* args[16] = {};      // (every member has an initializer, so that the thread-local is constant-initialized:
+  uint16_t sizes[16] = {};        // otherwise every access asks whether this thread's __tls_init has run)
 };
+}  // namespace detail
+namespace {
+using detail::ThreadApi;
 thread_local ThreadApi t_api;
 
 thread_local std::vector<uint64_t> t_external[kExternalKinds];
@@ -286,28 +293,33 @@ SyncScope::~SyncScope() {
 
 ApiCall::ApiCall(const char* name, Domain domain) {
   ThreadApi& t = t_api;
-  // The arguments noted for this call are this call's, whether or not it is
-  // the one that reports them. Nothing is noted unless somebody listens.
-  int nargs = 0;
-  const char* symbol = nullptr;
-  bool have_sizes = false;
-  uint16_t sizes[16];
-  if (__builtin_expect(t.nargs != 0 || t.have_sizes || t.symbol != nullptr, 0)) {
-    nargs = t.nargs;
-    symbol = t.symbol;
-    have_sizes = t.have_sizes;
-    if (have_sizes)
-      for (int i = 0; i < nargs; ++i) sizes[i] = t.sizes[i];
-    t.have_sizes = false;
-    t.nargs = 0;
-    t.symbol = nullptr;
-  }
+  thread_ = &t;
+  // The arguments noted for this call are this call's, whether or not it is the one that reports them (begin takes
+  // them). Nothing is noted unless somebody listens.
+  const bool noted = __builtin_expect(t.nargs != 0 || t.have_sizes || t.symbol != nullptr, 0);
   outermost_ = t.depth++ == 0;
+  if (!noted && (!outermost_ || (!enabled() && !hooked()))) return;
+  begin(name, domain);
+}
+
+void ApiCall::begin(const char* name, Domain domain) {
+  ThreadApi& t = *thread_;
+  const int nargs = t.nargs;
+  const char* const symbol = t.symbol;
+  const bool have_sizes = t.have_sizes;
+  uint16_t sizes[16];
+  if (have_sizes)
+    for (int i = 0; i < nargs; ++i) sizes[i] = t.sizes[i];
+  t.have_sizes = false;
+  t.nargs = 0;
+  t.symbol = nullptr;
   if (!outermost_) return;
   hooked_ = hooked();
   if (!enabled() && !hooked_) return;
   name_ = name;
   domain_ = domain;
+  result_ = 0;
+  return_value_ = nullptr;
   correlation_ = next_correlation();
   outer_ = t.correlation;
   t.correlation = correlation_;
@@ -316,6 +328,7 @@ ApiCall::ApiCall(const char* name, Domain domain) {
   // call, in storage this object owns.
   for (int i = 0; i < nargs; ++i) saved_[i] = t.args[i];
   args_ = nargs ? saved_ : nullptr;
+  sizes_ = nullptr;
   if (have_sizes && nargs) {
     for (int i = 0; i < nargs; ++i) saved_sizes_[i] = sizes[i];
     sizes_ = saved_sizes_;
@@ -344,10 +357,14 @@ ApiCall::ApiCall(const char* name, Domain domain) {
 }
 
 ApiCall::~ApiCall() {
-  ThreadApi& t = t_api;
-  --t.depth;
-  if (!name_) return;
-  t.correlation = outer_;
+  --thread_->depth;
+  if (__builtin_expect(name_ != nullptr, 0)) end();
+}
+
+bool ApiCall::silenced() const { return thread_->silence > 0; }
+
+void ApiCall::end() {
+  thread_->correlation = outer_;
   const uint64_t end = host_ns();
   if (hooked_) {
     Hooks h;
