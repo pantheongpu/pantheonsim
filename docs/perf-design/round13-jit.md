@@ -97,7 +97,27 @@ test program that passes with the JIT passes with the verifier on (0 violations:
 
 ## Gates (the same-bits rule)
 
-@@GATES@@
+All on the final code (commit `ecd7fb8e`) unless it says otherwise. The speed measurements were taken on the binary of `e8d35026`, which differs from it by one static function
+(`escape_sets_on`: no retained rows across a call in code compiled with `-fno-exceptions`), a change that does not touch the text generated with the default flags.
+
+* **CUDA 13.0 build** (CI image, Release): `test_jit` 21/21, `test_jit_resid` PASS (64 units: 768 regions, 4608 runs, 1455 declared escapes, 0 failures; 300 units: still running at the time of this commit), `test_tier` 8/8,
+  `test_fastpath` 38/38, `test_simd` 25/25.
+* **`run_sass_jit.sh`, the PR gate** (`sass_tier` and `sass_tier_steps` on sm_86 with every variant: counters, 1 and 4 threads, warm cache, background compile, chain off, sets off,
+  every escape verified; the fault programs, tier against JIT, with and without `-fexceptions`; the sweeps of `VGPU_MAX_STEPS`; regions capped at 255/256/257; one seed of random kernels;
+  the failure modes): **PASS**. `sass_tier_steps` ran 557 M warp instructions in 342 regions (556 M of them computed by generated code). The first run of the gate on the branch **failed**: the
+  fault programs compiled with `-fno-exceptions` (generated code with a `try`) did not build and printed a compile notice; fixed by not retaining rows across calls in that mode
+  (`escape_sets_on`); the second run passed. (A run of the gate started while the build tree was being rebuilt under it failed in `jit_random`; that run is not counted.)
+* **`e2e_sass_tier`** (tier against the interpreter, `run_sass_tier.sh`; I kept the last six lines of its output): **PASS**.
+* **`e2e_sass_archs` with `VGPU_JIT=1 VGPU_JIT_THRESHOLD=1 VGPU_JIT_SYNC=1 VGPU_JIT_HOT_PERMILLE=0 VGPU_JIT_MAX_OPS=100000000 VGPU_JIT_MIN_REGION=2`**: still running at the time of this commit (started 18:37 UTC).
+* **Harness counter check** (`bench.sh --check-counters`): PASS without the JIT (16 workloads x SASS and PTX) and PASS with the JIT forced on every region
+  (`VGPU_JIT_THRESHOLD=1 VGPU_JIT_SYNC=1 VGPU_JIT_HOT_PERMILLE=0 VGPU_JIT_MIN_REGION=2`).
+* **Every escape verified** (`VGPU_JIT_VERIFY_SETS=1`) on every test program of `run_sass_tier.sh` (7 architectures plus the 44 others), the 16 harness workloads at quick size and the five
+  pantheon workloads: 0 violations (the run was with the table before the unverified forms were removed from it; the forms that remained were exercised as listed above).
+* **CI-style build** (the rig has `cuda12.0-30b119500e5a`, not the `9f7f0f8400f7` of the brief; Ninja, `-DVGPU_WERROR=ON`, a `git init`ed copy): clean build, `ctest -R '^lint_'`:
+  22 of 23 pass, `lint_curl_retries` fails (the container runs as root; known from round 11; I did not run it on `origin/main` here); `lint_odr_globals` and its self-test pass
+  (the new code has no global with external linkage: the verifier's `VerifyCount` is in the anonymous namespace of `exec.cpp`). `test_jit`, `test_jit_resid`, `test_tier`,
+  `test_fastpath`, `test_simd` pass on that build too.
+
 
 ## Measurements
 
