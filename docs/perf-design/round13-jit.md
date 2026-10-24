@@ -15,6 +15,11 @@ to 17% losses of short runs against the tier either: the data below show that th
 that does not beat the previous milestone outside the noise") **M4b (inline LDG) and M4c (LDS/STS/LDL/STL) were not started**; the reason each could not be expected to
 do better is in "Why" below.
 
+**Slower than the tier, in m3 and in m4 alike (5 passes of 3 runs, `m3/tier` and `m4/tier` of wall time):** `shared` 1.16 / 1.17, `f64_fma` 1.10 / 1.18, `warp` 1.12 / 1.13,
+`f64_subnormal` 1.05 / 1.07, `divergent` 1.07 / 1.05, `texture` 1.05 / 1.05, `launch` 1.05 / 1.03, `atomics` 1.01 / 1.03 (15 passes of 5 runs for `shared` 1.16 / 1.18, `warp` 1.13 /
+1.14, `f64_fma` 1.17 / 1.11, `divergent` 1.06 / 1.05). Faster than the tier: `int_alu` 0.47 / 0.46, `f32_fma` 0.64 / 0.63, `local` 0.84 / 0.80, `mem` 0.83 / 0.83, and on the pantheon
+workloads `int_virus` 2.56x / 2.51x the tier's rate, `memory_retention_bake` 2.2x / 2.2x, `memory_bank_thrash` 1.25x / 1.25x, `compute_virus` 1.23x / 1.21x.
+
 Recommendation to the parent: do not merge the generator change (about 700 lines for no measured speed). If the tests and the verifier are of value on their own, they
 are separable: `VGPU_JIT_VERIFY_SETS` and its report are independent of the generator.
 
@@ -169,6 +174,10 @@ counters identical. (`launch` 0.990, the workload where rounds 11 saw +1.6%.)
 | shared | 1.40 M | 9.1% | 7.2% | 795 / 832 |
 | warp | 5.13 M | 33% | 33.0% | 1070 / 1115 |
 | divergent | 9.97 M | 2.3% | 2.3% | 877 / 914 |
+| texture | 0.48 M | 54% | 54.0% | (not measured) |
+| atomics, wmma, mma_ptx | 0.31 M, 0.31 M, 0.30 M | 0% | 0% (no region ran 100 k instructions) | none compiled |
+| f64_subnormal | 0.85 M | 0.03% | 0.03% | none compiled |
+| launch, api, startup | | no unit | | |
 
 (Single cold compiles; m4 is 0% to 10% slower to compile, which is its landing code: every region with a retained dirty row has a switch of stores.)
 

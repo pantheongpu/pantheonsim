@@ -307,6 +307,9 @@ std::vector<uint32_t> Engine::meta(const UnitSpec& spec) {
   return m;
 }
 
+// The sets keep a row in a local across a call that can throw, which needs the landing code (a try/catch): not for code built with -fno-exceptions.
+static bool escape_sets_on(const Config& c) { return c.escape_sets && c.extra_flags.find("-fno-exceptions") == std::string::npos; }
+
 std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence, bool esc_sets) {
   std::string s;
   const auto put = [&](const char* fmt, auto... a) {
@@ -585,7 +588,7 @@ std::string Engine::key(const UnitSpec& spec, std::string* why) {
   const std::string cid = compiler_id(why);
   if (cid.empty()) return {};
   const std::string isa = cfg_.isa.empty() ? detect_isa() : cfg_.isa;
-  return hash_text(source(spec, isa == "avx2", cfg_.residence, cfg_.escape_sets) + key_suffix(cfg_, cid, isa));
+  return hash_text(source(spec, isa == "avx2", cfg_.residence, escape_sets_on(cfg_)) + key_suffix(cfg_, cid, isa));
 }
 
 // The key of a whole section (what the file naming its selection of regions is named by): the facts of every region, not their text.
@@ -815,7 +818,7 @@ Result Engine::obtain(const UnitSpec& spec) {
     return out;
   }
   const std::string isa = cfg_.isa.empty() ? detect_isa() : cfg_.isa;
-  if (!write_file(tmp_cpp, source(spec, isa == "avx2", cfg_.residence, cfg_.escape_sets))) {
+  if (!write_file(tmp_cpp, source(spec, isa == "avx2", cfg_.residence, escape_sets_on(cfg_)))) {
     out.status = Status::CacheUnusable;
     out.message = "cannot write to " + dir + ": " + std::strerror(errno);
     return out;
