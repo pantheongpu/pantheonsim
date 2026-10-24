@@ -43,6 +43,15 @@ struct TensorMemory {
     uint32_t b_fields = 0;
   };
   std::array<Collector, 4> collector_b{};
+  // Back to a fresh Tensor Memory's state, without building one (two deques take four allocations to make).
+  void reset() {
+    if (!cells.empty()) std::vector<uint32_t>().swap(cells);
+    live.clear();
+    exclusive = relinquished = false;
+    peer_alloc.clear();
+    peer_dealloc.clear();
+    collector_b = {};
+  }
   uint32_t& at(uint32_t lane, uint32_t col) { return cells[size_t{lane} * kCols + col]; }
   bool allocated(uint32_t col) const {
     auto it = live.upper_bound(col);

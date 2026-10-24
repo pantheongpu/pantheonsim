@@ -37,6 +37,8 @@
 #include <limits>
 #include <functional>
 #include <map>
+#include <memory>
+#include <new>
 #include <unordered_map>
 #include <mutex>
 #include <thread>
@@ -199,6 +201,37 @@ struct Block {
   std::unordered_map<uint32_t, MbarSide> mbar;
   exec::TensorMemory tmem;      // sm_100's Tensor Memory (tcgen05)
   exec::LaunchStats st;   // this block's counts, folded into the launch's
+};
+
+// A block's state, kept by the host thread between launches: the warps' register files and local memory, the shared memory and the
+// tensor memory are allocated once and reused, instead of for every launch (a launch of one warp spent a tenth of its time on
+// them). Taken for the length of a worker's run and given back, so a launch made from inside a block of another (dynamic
+// parallelism) takes one of its own. The state of a block is set again by Runner::init_block; bssy_clock, which init_block leaves
+// to count on through the blocks of a launch, starts from zero as it does in a new block.
+struct PooledBlock {
+  std::unique_ptr<Block> block;
+  PooledBlock() {
+    std::vector<std::unique_ptr<Block>>& pool = free_blocks();
+    if (pool.empty()) {
+      block = std::make_unique<Block>();
+    } else {
+      block = std::move(pool.back());
+      pool.pop_back();
+      block->bssy_clock = 0;
+    }
+  }
+  ~PooledBlock() {
+    std::vector<std::unique_ptr<Block>>& pool = free_blocks();
+    if (block && pool.size() < 4) pool.push_back(std::move(block));
+  }
+  PooledBlock(const PooledBlock&) = delete;
+  PooledBlock& operator=(const PooledBlock&) = delete;
+
+ private:
+  static std::vector<std::unique_ptr<Block>>& free_blocks() {
+    thread_local std::vector<std::unique_ptr<Block>> pool;
+    return pool;
+  }
 };
 
 struct Fault : std::exception {
@@ -1088,7 +1121,15 @@ void Runner::init_block(Block& blk, uint64_t linear) {
   const uint32_t nregs = std::max<uint32_t>(k_.regs + 8, 16);
   for (uint32_t i = 0; i < nwarps; ++i) {
     Warp& w = blk.warps[i];
-    w = Warp{};
+    // A fresh warp, built in place: assigning a temporary copies its three kilobytes, and its register file and local memory
+    // are given back to be allocated again. The two vectors keep their memory and start empty, as a new warp's do.
+    std::vector<uint32_t> regs = std::move(w.r);
+    std::vector<uint8_t> local = std::move(w.local);
+    local.clear();
+    w.~Warp();
+    new (&w) Warp();
+    w.local = std::move(local);
+    w.r = std::move(regs);
     w.index = i;
     w.nregs = std::min<uint32_t>(nregs, 256);
     w.r.assign(static_cast<size_t>(w.nregs) * 32, 0);
@@ -1097,12 +1138,12 @@ void Runner::init_block(Block& blk, uint64_t linear) {
     w.alive = n == 32 ? kAll : ((Mask{1} << n) - 1);
     for (unsigned l = 0; l < 32; ++l) w.pc[l] = entry_;
     w.local_size = local_size_;
-    w.local.clear();   // made on the warp's first local access
+    // (the local memory is made on the warp's first local access)
   }
   for (Block::Barrier& b : blk.bars) b = Block::Barrier{};
   blk.mbar.clear();
   blk.gmma.clear();
-  blk.tmem = exec::TensorMemory{};
+  blk.tmem.reset();
 }
 
 exec::LaunchStats Runner::run() {
@@ -1117,12 +1158,16 @@ exec::LaunchStats Runner::run() {
   std::atomic<uint64_t>& next = next_unit_;
   std::exception_ptr failure;
   std::mutex fail_mu;
+  // A launch on one host thread has no one to wait for: nothing else sets `failure`, adds to the launch's counts or takes
+  // the locks that guard them.
+  bool solo = false;
   const auto worker = [&](unsigned t) {
-    Block blk;
+    PooledBlock held;
+    Block& blk = *held.block;
     for (;;) {
       const uint64_t i = next.fetch_add(1);
       if (i >= units) return;
-      {
+      if (!solo) {
         std::lock_guard<std::mutex> g(fail_mu);
         if (failure) return;
       }
@@ -1134,8 +1179,12 @@ exec::LaunchStats Runner::run() {
         init_block(blk, i);
         blk.worker = t;
         run_block(blk);
-        std::lock_guard<std::mutex> g(stats_mu_);
-        stats_.add(blk.st);
+        if (solo) {
+          stats_.add(blk.st);
+        } else {
+          std::lock_guard<std::mutex> g(stats_mu_);
+          stats_.add(blk.st);
+        }
       } catch (...) {
         std::lock_guard<std::mutex> g(fail_mu);
         if (!failure) failure = std::current_exception();
@@ -1241,6 +1290,7 @@ exec::LaunchStats Runner::run() {
     if (shape.workers <= 1) resident(0);
     else exec::run_parallel(shape.workers, resident);
   } else if (threads <= 1) {
+    solo = true;
     worker(0);
   } else {
     // The host threads are the pool's (vgpu/exec/worker_pool.hpp), parked between launches.
