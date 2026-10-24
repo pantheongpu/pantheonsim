@@ -9341,6 +9341,33 @@ struct Machine {
     }
   }
 
+  // A buffer load or store of one word a lane, for the whole wave: each lane's address and whether it is inside the resource
+  // (`fits`, which reads `index`, the lane's), then the lanes that are inside made together (wave_scalars's way, one lookup for
+  // the lot); the others read zero or write nothing. False, having done nothing, where the memory manager declines.
+  template <class Fits>
+  [[gnu::noinline]] bool buffer_words(Wave& w, const Inst& in, bool store, const Operand& data, const Operand& vaddr, uint64_t origin,
+                                      uint32_t stride, Fits& fits, uint32_t& index) {
+    uint64_t addrs[kLanes], vals[kLanes];
+    uint32_t lanes[kLanes];
+    uint32_t n = 0;
+    uint64_t outside = 0;   // (lanes that read zero)
+    for (uint64_t m = w.exec; m; m &= m - 1) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+      index = in.idxen ? word(w, vaddr, 0, lane) : 0;
+      const uint64_t offset = uint64_t{in.offen ? word(w, vaddr, in.idxen ? 1 : 0, lane) : 0} + static_cast<uint32_t>(in.offset);
+      if (fits(offset, 4)) addrs[n] = origin + offset + uint64_t{index} * stride, lanes[n++] = lane;
+      else outside |= uint64_t{1} << lane;
+    }
+    if (store) {
+      for (uint32_t i = 0; i < n; ++i) vals[i] = word(w, data, 0, lanes[i]);
+      return n == 0 || mem.store_batch(addrs, n, 4, vals);
+    }
+    if (n && !mem.load_batch(addrs, n, 4, vals)) return false;
+    for (uint32_t i = 0; i < n; ++i) set_word(w, data, 0, lanes[i], static_cast<uint32_t>(vals[i]));
+    for (; outside; outside &= outside - 1) set_word(w, data, 0, static_cast<uint32_t>(__builtin_ctzll(outside)), 0);
+    return true;
+  }
+
   void buffer_access(Wave& w, const Inst& in, Group& g) {
     if (!w.exec) return;
     // A load with the LDS bit has no data register: its sources are the
@@ -9429,26 +9456,31 @@ struct Machine {
     const bool is_half = mf.half_bytes != 0;
     const bool atomic = mf.body_atomic;
     const bool returns = atomic && (in.cache & 1);
+    // A resource whose data format is 0 (BUF_DATA_FORMAT_INVALID) holds
+    // nothing: every access is out of range, which MIOpen's hand-written
+    // kernels use to switch a store off.
+    uint32_t index = 0;   // (the lane's, set by whichever loop is running)
+    const auto fits = [&](uint64_t at, uint64_t bytes) {
+      if (!valid_format) return false;
+      if (rdna) switch (oob_select) {
+          case 0:   // structured: the index within the records, the offset within an element
+            return stride ? index < records && at + bytes <= stride : soffset + at + bytes <= records;
+          case 1: return index < records;              // the index alone
+          case 2: return records != 0;                 // only an empty buffer is out of range
+          default: return soffset + at + bytes <= records;   // raw: bytes, from the offset
+        }
+      return stride ? index < records : soffset + at + bytes <= records;
+    };
+    // Plain dword loads and stores, one word a lane: the whole wave at once where the memory manager takes it (buffer_words).
+    if (!lds_dma && !formatted && !is_half && !part && (mf.load_dword || mf.store_dword) && data.width == 1 && d.peers.empty() &&
+        runs_on && buffer_words(w, in, mf.store_dword, data, vaddr, base + soffset, stride, fits, index))
+      return;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      const uint32_t index = in.idxen ? word(w, vaddr, 0, lane) : 0;
+      index = in.idxen ? word(w, vaddr, 0, lane) : 0;
       const uint64_t offset = uint64_t{in.offen ? word(w, vaddr, in.idxen ? 1 : 0, lane) : 0} +
                               static_cast<uint32_t>(in.offset);
       const uint64_t addr = base + soffset + offset + uint64_t{index} * stride;
-      // A resource whose data format is 0 (BUF_DATA_FORMAT_INVALID) holds
-      // nothing: every access is out of range, which MIOpen's hand-written
-      // kernels use to switch a store off.
-      const auto fits = [&](uint64_t at, uint64_t bytes) {
-        if (!valid_format) return false;
-        if (rdna) switch (oob_select) {
-            case 0:   // structured: the index within the records, the offset within an element
-              return stride ? index < records && at + bytes <= stride : soffset + at + bytes <= records;
-            case 1: return index < records;              // the index alone
-            case 2: return records != 0;                 // only an empty buffer is out of range
-            default: return soffset + at + bytes <= records;   // raw: bytes, from the offset
-          }
-        return stride ? index < records : soffset + at + bytes <= records;
-      };
       if (lds_dma) {
         // Out of range reads zero, as for any buffer load.
         const uint64_t to = lds_at + uint64_t{lane} * (lds_words > 1 ? 16 : 4);   // "(TIDinWave * 16)" for three or four dwords
@@ -9662,7 +9694,8 @@ struct Machine {
   void atomic_data(const Wave& w, const Inst& in, const AtomicOp& a, uint32_t lane, uint64_t* v,
                    uint64_t* expected) const {
     if (a.bytes == 4) {
-      *v = lane_src(w, in.src[1], lane);
+      const Operand& d = in.src[1];
+      *v = d.kind == OperandKind::Vgpr && d.sel == 6 && !dpp_operand ? w.vgpr[d.index][lane] : lane_src(w, d, lane);
       *expected = a.rmw == Rmw::CmpSwap ? w.vgpr[in.src[1].index + 1][lane] : 0;
     } else {
       *v = lane_src64(w, in.src[1], lane);
@@ -9678,6 +9711,13 @@ struct Machine {
   // take turns.
   uint64_t atomic_rmw(uint64_t addr, const AtomicOp& a, uint64_t v, uint64_t expected) {
     MemoryManager& m = at(addr);
+    if (!m.host_map_possible(addr)) {
+      // Device memory, not mapped host memory: one lookup serves the load and the store where the memory manager takes it.
+      uint64_t found = 0;
+      if (concurrent ? lock_free && m.atomic_rmw(addr, a.bytes, [&](uint64_t old) { return atomic_result(a, old, v, expected); }, &found)
+                     : runs_on && m.rmw_if_changed(addr, a.bytes, [&](uint64_t old) { return atomic_result(a, old, v, expected); }, &found))
+        return found;
+    }
     if (uint8_t* h = m.host_address(addr, a.bytes); h && reinterpret_cast<uintptr_t>(h) % a.bytes == 0) {
       if (a.bytes == 4) {
         std::atomic_ref<uint32_t> r(*reinterpret_cast<uint32_t*>(h));
@@ -9761,34 +9801,149 @@ struct Machine {
     const bool direct = a0.kind == OperandKind::Vgpr && a0.sel == 6 && !dpp_operand;
     const uint64_t sbase = in.has_saddr ? scalar_field(w, in.saddr, true) : 0;
     const uint64_t imm = static_cast<uint64_t>(static_cast<int64_t>(in.offset));
-    const auto address = [&](uint32_t l) -> uint64_t {
-      if (in.has_saddr) return sbase + scaled_offset(in, direct ? w.vgpr[a0.index][l] : lane_src(w, a0, l), access_bytes) + imm;
-      return (direct ? (w.vgpr[a0.index][l] | static_cast<uint64_t>(w.vgpr[a0.index + 1][l]) << 32) : lane_src64(w, a0, l)) + imm;
-    };
-    while (lane + count < kLanes && (w.exec >> (lane + count) & 1) && address(lane + count) == (next += stride))
-      ++count;
+    // (The lanes after this one that are active, with no gap: the run cannot go past the first that is off.)
+    const uint64_t off_mask = ~(w.exec >> lane);
+    const uint32_t reach = std::min<uint32_t>(off_mask ? static_cast<uint32_t>(__builtin_ctzll(off_mask)) : kLanes, kLanes - lane);
+    if (direct && !in.scale_offset) {
+      // The address registers as rows, and each lane's address compared with the one the run would give it.
+      const uint32_t* const lo = w.vgpr[a0.index].data();
+      if (in.has_saddr) {
+        for (; count < reach && sbase + lo[lane + count] + imm == (next += stride); ++count) {
+        }
+      } else {
+        const uint32_t* const hi = w.vgpr[a0.index + 1].data();
+        for (; count < reach && ((static_cast<uint64_t>(hi[lane + count]) << 32 | lo[lane + count]) + imm) == (next += stride); ++count) {
+        }
+      }
+    } else {
+      const auto address = [&](uint32_t l) -> uint64_t {
+        if (in.has_saddr) return sbase + scaled_offset(in, direct ? w.vgpr[a0.index][l] : lane_src(w, a0, l), access_bytes) + imm;
+        return (direct ? (w.vgpr[a0.index][l] | static_cast<uint64_t>(w.vgpr[a0.index + 1][l]) << 32) : lane_src64(w, a0, l)) + imm;
+      };
+      while (count < reach && address(lane + count) == (next += stride)) ++count;
+    }
     if (count < 2 || dup) return 0;
     // (Not 16-byte aligned fours, where a pair is the biggest access.)
     const uint32_t unit = run_words == 1 ? 4 : addr % 8 == 0 && (run_words != 4 || addr % 16 != 0) ? 8 : 4;
     // (Sixteen-byte aligned fours are one access each, atomic as a whole: the quad calls make them so.)
     const bool quads = run_words == 4 && addr % 16 == 0;
-    alignas(16) uint32_t buf[kLanes * 4];
     MemoryManager& m = at(addr);
+    const Operand& data = load ? in.dst[0] : in.src[1];
+    if (run_words == 1 && data.kind != OperandKind::Agpr) {
+      // One word a lane in a vector register: the run is the register's row from this lane on, moved in place.
+      uint32_t* row = w.vgpr[data.index].data() + lane;
+      if (load) {
+        if (!m.load_run(addr, row, uint64_t{4} * count, 4)) return 0;
+        words[0] = row[count - 1];
+      } else if (!m.store_run(addr, row, uint64_t{4} * count, 4)) {
+        return 0;
+      }
+      return count;
+    }
+    alignas(16) uint32_t buf[kLanes * 4];
     if (load) {
       const bool done = quads ? m.load_quad_run(addr, count, reinterpret_cast<uint64_t*>(buf))
                               : m.load_run(addr, buf, uint64_t{stride} * count, unit);
       if (!done) return 0;
-      for (uint32_t i = 0; i < count; ++i)
-        for (uint32_t k = 0; k < run_words; ++k) set_word(w, in.dst[0], k, lane + i, buf[i * run_words + k]);
+      if (data.kind != OperandKind::Agpr) {   // (register k's row, a word of each lane's data in turn)
+        for (uint32_t k = 0; k < run_words; ++k) {
+          uint32_t* row = w.vgpr[data.index + k].data() + lane;
+          for (uint32_t i = 0; i < count; ++i) row[i] = buf[i * run_words + k];
+        }
+      } else {
+        for (uint32_t i = 0; i < count; ++i)
+          for (uint32_t k = 0; k < run_words; ++k) set_word(w, in.dst[0], k, lane + i, buf[i * run_words + k]);
+      }
       std::memcpy(words, buf + (count - 1) * run_words, 4 * run_words);
     } else {
-      for (uint32_t i = 0; i < count; ++i)
-        for (uint32_t k = 0; k < run_words; ++k) buf[i * run_words + k] = word(w, in.src[1], k, lane + i);
+      if (data.kind != OperandKind::Agpr) {
+        for (uint32_t k = 0; k < run_words; ++k) {
+          const uint32_t* row = w.vgpr[data.index + k].data() + lane;
+          for (uint32_t i = 0; i < count; ++i) buf[i * run_words + k] = row[i];
+        }
+      } else {
+        for (uint32_t i = 0; i < count; ++i)
+          for (uint32_t k = 0; k < run_words; ++k) buf[i * run_words + k] = word(w, in.src[1], k, lane + i);
+      }
       const bool done = quads ? m.store_quad_run(addr, count, reinterpret_cast<const uint64_t*>(buf))
                               : m.store_run(addr, buf, uint64_t{stride} * count, unit);
       if (!done) return 0;
     }
     return count;
+  }
+
+  // The active lanes from `from` on, each moving one scalar (a byte, a short, a word or a pair; `lane_addr[lane]` its address),
+  // made together by the memory manager (MemoryManager::load_batch / store_batch): what lane by lane would do, one lookup for
+  // the allocation instead of one a lane. A load puts each lane's value in `data` (`words` registers, or the one a byte or a short is
+  // widened into, with `narrow`); a store reads it from there. Returns true having done every one of them, or false having done
+  // nothing -- a fault armed, a host mapping, an address misaligned or outside the one allocation the first is in -- and the lanes
+  // then go one at a time and meet any error where they would. Lanes of a load that follow a lane with the same address take the
+  // value that lane got (the one-read-per-address rule of the load memo). Out of line, as memory_run is.
+  [[gnu::noinline]] bool wave_scalars(Wave& w, bool store, uint32_t from, const uint64_t* lane_addr, const Operand& data,
+                                      uint32_t words, const Narrow* narrow_by) {
+    const uint32_t bytes = narrow_by ? narrow_by->bytes : 4 * words;
+    uint64_t addrs[kLanes], vals[kLanes];
+    uint32_t lanes[kLanes];
+    uint32_t n = 0;
+    for (uint64_t m = w.exec >> from << from; m; m &= m - 1) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+      addrs[n] = lane_addr[lane], lanes[n++] = lane;
+    }
+    if (!n) return true;
+    if (store) {
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t lo = word(w, data, 0, lanes[i]);
+        vals[i] = words == 2 ? lo | uint64_t{word(w, data, 1, lanes[i])} << 32 : lo;
+      }
+      return mem.store_batch(addrs, n, bytes, vals);
+    }
+    if (!mem.load_batch(addrs, n, bytes, vals)) return false;
+    for (uint32_t i = 1; i < n; ++i)
+      if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
+    for (uint32_t i = 0; i < n; ++i) {
+      if (narrow_by) {
+        set_word(w, data, 0, lanes[i], widen(vals[i], *narrow_by));
+      } else {
+        set_word(w, data, 0, lanes[i], static_cast<uint32_t>(vals[i]));
+        if (words == 2) set_word(w, data, 1, lanes[i], static_cast<uint32_t>(vals[i] >> 32));
+      }
+    }
+    return true;
+  }
+
+  // The active lanes from `from` on, each making the atomic `a` at `lane_addr[lane]`, together (MemoryManager::rmw_batch): lane by
+  // lane in order, as they are one at a time, with one lookup for the allocation. Each lane's old value goes to the destination
+  // register (where the instruction returns one) once they are made, or, for those made before a store that could not get host
+  // memory, before the error leaves. False, having done nothing, where the memory manager declines (the lanes then go one at a time).
+  [[gnu::noinline]] bool wave_atomics(Wave& w, const Inst& in, uint32_t from, const uint64_t* lane_addr, const AtomicOp& a) {
+    uint64_t addrs[kLanes], v[kLanes], expected[kLanes], olds[kLanes];
+    uint32_t lanes[kLanes];
+    uint32_t n = 0;
+    for (uint64_t m = w.exec >> from << from; m; m &= m - 1) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+      addrs[n] = lane_addr[lane];
+      atomic_data(w, in, a, lane, &v[n], &expected[n]);
+      lanes[n++] = lane;
+    }
+    const auto give_back = [&](size_t count) {
+      if (in.dst.empty()) return;
+      for (size_t i = 0; i < count; ++i) {
+        if (a.bytes == 8) write_lane64(w, in.dst[0], lanes[i], olds[i]);
+        else if (in.dst[0].kind == OperandKind::Vgpr && !narrow_dst) w.vgpr[in.dst[0].index][lanes[i]] = static_cast<uint32_t>(olds[i]);
+        else write_lane(w, in.dst[0], lanes[i], static_cast<uint32_t>(olds[i]));
+      }
+    };
+    size_t done = 0;
+    bool made = false;
+    try {
+      made = mem.rmw_batch(addrs, n, a.bytes, [&](size_t i, uint64_t old) { return atomic_result(a, old, v[i], expected[i]); }, olds,
+                           &done, concurrent);
+    } catch (...) {
+      give_back(done);
+      throw;
+    }
+    if (made) give_back(n);
+    return made;
   }
 
   void global_access(Wave& w, const Inst& in) {
@@ -9880,6 +10035,16 @@ struct Machine {
     // (The address register read straight out of the file where it is a plain vector register, as lane_src does.)
     const Operand& a0 = in.src[0];
     const bool a0_vgpr = a0.kind == OperandKind::Vgpr && a0.sel == 6 && !dpp_operand;
+    // The lanes that make no run go to memory together (wave_scalars), once: a word or a pair a lane, or a byte or a short, where the
+    // registers are plain vector ones.
+    bool try_batch = d.peers.empty() && runs_on &&
+                     (kind == Kind::Load ? run_words <= 2
+                      : kind == Kind::Store ? run_words <= 2
+                      : kind == Kind::Narrow ? (narrow_store ? in.src[1].kind == OperandKind::Vgpr && in.src[1].sel == 6 && !dpp_operand
+                                                             : in.dst[0].kind == OperandKind::Vgpr && !narrow_dst)
+                                             : false);
+    // An atomic's lanes go to memory together (wave_atomics), once, where the lanes can take turns without a lock.
+    bool try_atomics = kind == Kind::Atomic && d.peers.empty() && runs_on && (!concurrent || lock_free);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // The address is a 64-bit one in a register pair, or a scalar base with
@@ -9899,6 +10064,32 @@ struct Machine {
           continue;
         }
         try_runs = false;
+      }
+      if (try_atomics) {
+        try_atomics = false;
+        uint64_t lane_addr[kLanes];
+        for (uint64_t m = w.exec >> lane << lane; m; m &= m - 1) {
+          const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
+          lane_addr[l] = (in.has_saddr ? saddr_base + scaled_offset(in, a0_vgpr ? w.vgpr[a0.index][l] : lane_src(w, a0, l), access_bytes)
+                          : a0_vgpr    ? (w.vgpr[a0.index][l] | static_cast<uint64_t>(w.vgpr[a0.index + 1][l]) << 32)
+                                       : lane_src64(w, a0, l)) +
+                         static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+        }
+        if (wave_atomics(w, in, lane, lane_addr, atomic)) return;
+      }
+      if (try_batch && (kind != Kind::Load || !memo)) {
+        try_batch = false;
+        uint64_t lane_addr[kLanes];
+        for (uint64_t m = w.exec >> lane << lane; m; m &= m - 1) {
+          const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
+          lane_addr[l] = (in.has_saddr ? saddr_base + scaled_offset(in, a0_vgpr ? w.vgpr[a0.index][l] : lane_src(w, a0, l), access_bytes)
+                          : a0_vgpr    ? (w.vgpr[a0.index][l] | static_cast<uint64_t>(w.vgpr[a0.index + 1][l]) << 32)
+                                       : lane_src64(w, a0, l)) +
+                         static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+        }
+        if (kind == Kind::Narrow ? wave_scalars(w, narrow_store, lane, lane_addr, narrow_store ? in.src[1] : in.dst[0], 1, &n)
+                                 : wave_scalars(w, kind == Kind::Store, lane, lane_addr, kind == Kind::Store ? in.src[1] : in.dst[0], run_words, nullptr))
+          return;
       }
       switch (kind) {
         case Kind::Narrow:
@@ -9945,6 +10136,7 @@ struct Machine {
           const uint64_t before = atomic_rmw(addr, atomic, v, expected);
           if (!in.dst.empty()) {
             if (atomic.bytes == 8) write_lane64(w, in.dst[0], lane, before);
+            else if (in.dst[0].kind == OperandKind::Vgpr && !narrow_dst) w.vgpr[in.dst[0].index][lane] = static_cast<uint32_t>(before);
             else write_lane(w, in.dst[0], lane, static_cast<uint32_t>(before));
           }
           break;

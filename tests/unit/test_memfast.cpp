@@ -669,13 +669,14 @@ VTEST(batch_calls_do_what_one_by_one_calls_do_or_decline_untouched) {
     const size_t count = 1 + rng.below(40);
     const size_t k = rng.below(3);
     std::vector<uint64_t> addrs(count), vals(count);
-    const uint64_t mode = rng.below(10);
+    const uint64_t mode = rng.below(11);
     for (size_t i = 0; i < count; ++i) {
       uint64_t off;
       if (mode < 5) off = (i * sz * (1 + mode)) % sizes[k];                     // regular
       else if (mode < 7) off = rng.below(sizes[k]) & ~uint64_t{sz - 1};          // scattered
       else if (mode == 7) off = (i == count / 2) ? sizes[k] - sz + (rng.below(2) ? 1 : 0) : i * sz;   // edge/misaligned
       else if (mode == 8) off = kChunkSize - sz * (count / 2) + i * sz;          // straddling a chunk
+      else if (mode == 10) off = i * sz + (i == count / 3 ? 1 : 0);              // one lane misaligned, inside the allocation
       else off = (i % 3) * sz;                                                   // repeats
       addrs[i] = base[k] + off;
       if (mode == 9 && i == 2) addrs[i] = base[(k + 1) % 3] + 8;                 // another allocation
@@ -721,6 +722,28 @@ VTEST(batch_calls_do_what_one_by_one_calls_do_or_decline_untouched) {
   VCHECK(batched_loads > 500);
   VCHECK(batched_stores > 500);
   VCHECK(declined > 500);
+}
+
+VTEST(a_batch_declines_where_a_host_mapping_covers_one_of_its_addresses) {
+  // Mapped host memory over part of an allocation is read and written in place, not in the chunks: a batch with an address in it
+  // is the one-by-one calls' to make, and one without is not held up by the map.
+  MemoryManager mm(1ull << 28);
+  const uint64_t p = mm.alloc(1 << 16);
+  std::vector<uint32_t> host(1024, 7);
+  mm.map_host(p + 4096, host.data(), 4096);
+  uint64_t out[4] = {9, 9, 9, 9};
+  const uint64_t vals[4] = {1, 2, 3, 4};
+  const uint64_t over[4] = {p, p + 8, p + 4096 + 16, p + 64};
+  VCHECK(!mm.load_batch(over, 4, 4, out));
+  VCHECK(!mm.store_batch(over, 4, 4, vals));
+  VCHECK_EQ(out[2], 9u);
+  VCHECK_EQ(host[4], 7u);
+  const uint64_t beside[3] = {p, p + 8, p + 8192};
+  VCHECK(mm.load_batch(beside, 3, 4, out));
+  VCHECK(mm.store_batch(beside, 3, 4, vals));
+  VCHECK_EQ(mm.load_scalar(p + 8192, 4), 3u);
+  VCHECK_EQ(mm.load_scalar(p + 4096 + 16, 4), 7u);
+  mm.unmap_host(p + 4096);
 }
 
 VTEST(fill_with_a_repeating_pattern_is_the_pattern_at_every_offset) {

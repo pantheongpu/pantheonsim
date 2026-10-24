@@ -194,4 +194,33 @@ VTEST(every_memory_instruction_of_the_isa_corpora_gives_the_recorded_bits) {
     throw vtest::Failure(std::to_string(wrong_total) + " of " + std::to_string(checked) + " instructions differ from the recorded bits:" + report);
 }
 
+VTEST(the_wave_wide_memory_paths_give_the_bits_lane_by_lane_gives) {
+  // The same instructions in the same twelve ways, run with the memory manager's whole-wave calls on (the batches of lanes that
+  // make no run, the runs, the single-lookup atomics) and off (amd::set_fast_paths, which sends every lane down the calls it
+  // made before), digest against digest: this holds the fast paths to the old ones without a recording to trust.
+  size_t compared = 0, nonzero = 0;
+  std::string report;
+  for (const Corpus& c : kCorpora) {
+    std::vector<uint32_t> slow, fast;
+    std::vector<std::string> texts;
+    amd::set_fast_paths(true, false);
+    digest_corpus(c, &slow, &texts);
+    amd::set_fast_paths(true, true);
+    texts.clear();
+    digest_corpus(c, &fast, &texts);
+    VCHECK_EQ(slow.size(), fast.size());
+    for (size_t i = 0; i < slow.size(); ++i) {
+      ++compared;
+      nonzero += slow[i] != 0;
+      char buf[48];
+      std::snprintf(buf, sizeof buf, ": %08x with, %08x without", fast[i], slow[i]);
+      if (slow[i] != fast[i]) report += std::string("\n  ") + c.file + ": " + texts[i] + buf;
+    }
+  }
+  amd::set_fast_paths(true, true);
+  VCHECK(nonzero > 1000);
+  if (!report.empty()) throw vtest::Failure("the whole-wave paths differ from the lane-by-lane ones:" + report);
+  VCHECK(compared > 1000);
+}
+
 VTEST_MAIN
