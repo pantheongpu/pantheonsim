@@ -228,10 +228,14 @@ uint32_t param_bytes(const CubinKernel& k) {
   return end;
 }
 
-std::mutex& atomic_lock(uint64_t addr) {
+// The lock of an address's cache line (64 stripes, the line's number folded with the page's): the atomics of one line, or of a warp's
+// 32 consecutive words, take one or two locks, not one for every 8 bytes.
+inline unsigned atomic_stripe(uint64_t addr) { return static_cast<unsigned>(((addr >> 6) ^ (addr >> 12)) & 63); }
+std::mutex& atomic_stripe_lock(unsigned stripe) {
   static std::mutex locks[64];
-  return locks[(addr >> 3) % 64];
+  return locks[stripe];
 }
+std::mutex& atomic_lock(uint64_t addr) { return atomic_stripe_lock(atomic_stripe(addr)); }
 
 // The stripe locks of a warp's atomics, held in the order they were taken and let go together (also when a lane's atomic throws).
 struct StripeLocks {

@@ -3794,7 +3794,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
               k = nu;
               uaddr[nu++] = addr;
               seen[h] = static_cast<uint8_t>(nu);
-              stripes |= uint64_t{1} << ((addr >> 3) % 64);
+              stripes |= uint64_t{1} << atomic_stripe(addr);
             }
           }
           slot[l] = k;
@@ -3827,7 +3827,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           bool done = false;
           {   // (the locks are let go before the loop below might take them again)
             StripeLocks locks;
-            for (uint64_t sm = stripes; sm; sm &= sm - 1) locks.lock(atomic_lock(uint64_t{static_cast<unsigned>(std::countr_zero(sm))} << 3));
+            for (uint64_t sm = stripes; sm; sm &= sm - 1) locks.lock(atomic_stripe_lock(static_cast<unsigned>(std::countr_zero(sm))));
             uint64_t cur[32];
             if (mem_.load_batch(uaddr, nu, n, cur)) {
               // The lanes one after another, each finding what the lanes before it left. `step` is the value an atomic stores, given
