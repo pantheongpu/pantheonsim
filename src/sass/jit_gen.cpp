@@ -33,6 +33,7 @@ bool mut(const char* what) {
 constexpr bool mut(const char*) { return false; }
 #endif
 thread_local const char* g_form_name = "";
+thread_local RowCtx* g_rc = nullptr;
 
 struct W {
   std::string s;
@@ -62,11 +63,11 @@ bool pred_ok(const SrcFacts& x) { return is_dyn(x, Dyn::Reg) || is_dyn(x, Dyn::U
 // Declares `const u32* A<k>` for source k (tier_src<Flt>).
 void decl_src(W& w, const SrcFacts& x, int k, bool flt) {
   if (is_row(x)) {
-    w.f("    const u32* A%d = R + %uu;\n", k, x.off);
+    w.f("    const u32* A%d = %s;\n", k, g_rc->row(x.off / 32u, false).c_str());
   } else if (is_pool(x)) {
     w.f("    u32 T%d[32]; splat(T%d, 0x%xu); const u32* A%d = T%d;\n", k, k, x.val, k, k);
   } else if (is_dyn(x, Dyn::Reg)) {
-    w.f("    u32 T%d[32]; const u32* A%d = dynreg(T%d, R + %uu, %s, %uu);\n", k, k, k, x.off * 32u, flt ? "true" : "false", unsigned{x.mod});
+    w.f("    u32 T%d[32]; const u32* A%d = dynreg(T%d, %s, %s, %uu);\n", k, k, k, g_rc->row(x.off, false).c_str(), flt ? "true" : "false", unsigned{x.mod});
   } else if (is_dyn(x, Dyn::Bank0)) {
     w.f("    u32 T%d[32]; splat(T%d, tmod(%s, %uu, b0w(c, %uu))); const u32* A%d = T%d;\n", k, k, flt ? "true" : "false", unsigned{x.mod}, x.off, k, k);
   } else {   // UReg
@@ -77,7 +78,8 @@ void decl_src(W& w, const SrcFacts& x, int k, bool flt) {
 // Declares `const u32* L<k>, *H<k>` for a 64-bit source (tier_src64: no modifier is applied here).
 void decl_src64(W& w, const SrcFacts& x, int k) {
   if (is_row(x)) {
-    w.f("    const u32* L%d = R + %uu; const u32* H%d = R + %uu;\n", k, x.off, k, x.off + 32u);
+    { const std::string lo = g_rc->row(x.off / 32u, false), hi = g_rc->row(x.off / 32u + 1u, false);
+      w.f("    const u32* L%d = %s; const u32* H%d = %s;\n", k, lo.c_str(), k, hi.c_str()); }
   } else if (is_pool(x)) {
     w.f("    u32 TL%d[32], TH%d[32]; splat(TL%d, 0x%xu); splat(TH%d, 0x%xu); const u32* L%d = TL%d; const u32* H%d = TH%d;\n", k, k, k, x.val, k, x.val2, k, k, k, k);
   } else if (is_dyn(x, Dyn::Bank0)) {
@@ -90,28 +92,148 @@ void decl_src64(W& w, const SrcFacts& x, int k) {
 }
 
 const char* pm(W& w, const SrcFacts& x, char* buf, size_t n) {
-  std::snprintf(buf, n, "pmask(c, %s, %uu, %s)", x.dyn == static_cast<uint8_t>(Dyn::UReg) ? "true" : "false", x.off, (x.mod & 1u) ? "true" : "false");
+  const bool neg = x.mod & 1u;
+  if (x.dyn == static_cast<uint8_t>(Dyn::UReg)) {   // a uniform predicate: never cached (only an escape writes it)
+    std::snprintf(buf, n, "pmask(c, true, %uu, %s)", x.off, neg ? "true" : "false");
+  } else {
+    std::snprintf(buf, n, "%s", g_rc->pred(x.off, neg).c_str());
+  }
   (void)w;
   return buf;
 }
 
 void store(W& w, uint16_t dst, const char* row) {
   if (dst == kNoReg) return;
+  const std::string target = g_rc->row(dst, true);
   if (mut(g_form_name)) {
-    w.f("    { u32 mm[32]; for (unsigned l = 0; l < 32; ++l) mm[l] = %s[l]; mm[3] ^= 1u; store_row(R + %uu, ex, mm); }\n", row, dst * 32u);
+    w.f("    { u32 mm[32]; for (unsigned l = 0; l < 32; ++l) mm[l] = %s[l]; mm[3] ^= 1u; store_row(%s, ex, mm); }\n", row, target.c_str());
     return;
   }
   if (mut("maskless")) {
-    w.f("    store_row(R + %uu, 0xffffffffu, %s);\n", dst * 32u, row);
+    w.f("    store_row(%s, 0xffffffffu, %s);\n", target.c_str(), row);
     return;
   }
-  w.f("    store_row(R + %uu, ex, %s);\n", dst * 32u, row);
+  w.f("    store_row(%s, ex, %s);\n", target.c_str(), row);
 }
-void setp(W& w, uint16_t reg, const char* v) {
-  w.f("    setp(c, %uu, ex, %s);\n", unsigned{reg}, v);
+void setp(W& w, uint16_t reg, const char* v) { w.s += g_rc->setp(reg, v); }
+void setp2(W& w, const OpFacts& o, bool negate_second) {   // ISETP / FSETP: the two predicate outputs from r and acc
+  char a[96], b[96];
+  std::snprintf(a, sizeof a, "combine(%uu, r, acc)", o.b);
+  std::snprintf(b, sizeof b, negate_second ? "combine(%uu, ~r, acc)" : "combine(%uu, r, acc)", o.b);
+  setp(w, o.dst, a);
+  setp(w, o.dst2, b);
 }
 
 }  // namespace
+
+// ---- register residence (jit.hpp, RowCtx) ----------------------------------------------------------------------------------
+
+std::string RowCtx::row(unsigned reg, bool write) {
+  char buf[64];
+  const auto direct = [&] {
+    std::snprintf(buf, sizeof buf, "(R + %uu)", reg * 32u);
+    return std::string(buf);
+  };
+  if (!write) {
+    reads.insert(reg);
+    // A row this region has not written is the register file's own (nothing to copy); one it has written is the local copy.
+    const auto it = st.find(reg);
+    if (!enabled || it == st.end()) return direct();
+    std::snprintf(buf, sizeof buf, "X%u", reg);
+    return std::string(buf);
+  }
+  if (!enabled || (!decl.count(reg) && decl.size() >= cap)) return direct();
+  decl.insert(reg);
+  char name[16];
+  std::snprintf(name, sizeof name, "X%u", reg);
+  const auto it = st.find(reg);
+  if (it == st.end()) {   // lanes outside the executing mask keep the old value: it must be here first (a whole-row write needs no load)
+    if (!mut("res_nomask")) {
+      std::snprintf(buf, sizeof buf, "    if (ex != 0xffffffffu) ldrow(%s, R + %uu);\n", name, reg * 32u);
+      pre += buf;
+    }
+    st[reg] = (mut("res_dstsrc") && reads.count(reg)) ? 1 : 2;
+  } else if (!(mut("res_dstsrc") && reads.count(reg))) {
+    it->second = 2;
+  }
+  return name;
+}
+
+std::string RowCtx::pred(unsigned reg, bool neg) {
+  if (reg == 7) return neg ? "0u" : "0xffffffffu";
+  char buf[96];
+  if (!enabled) {
+    std::snprintf(buf, sizeof buf, neg ? "(~c->p[%u])" : "c->p[%u]", reg);
+    return buf;
+  }
+  pdecl.insert(reg);
+  if (!pst[reg]) {
+    std::snprintf(buf, sizeof buf, "    P%u = c->p[%u];\n", reg, reg);
+    pre += buf;
+    pst[reg] = 1;
+  }
+  std::snprintf(buf, sizeof buf, neg ? "(~P%u)" : "P%u", reg);
+  return buf;
+}
+
+std::string RowCtx::setp(unsigned reg, const std::string& value) {
+  if (reg == 7) return {};
+  char buf[256];
+  if (!enabled) {
+    std::snprintf(buf, sizeof buf, "    c->p[%u] = (c->p[%u] & ~ex) | ((%s) & ex);\n", reg, reg, value.c_str());
+    return buf;
+  }
+  pdecl.insert(reg);
+  if (!pst[reg]) {
+    std::snprintf(buf, sizeof buf, "    P%u = c->p[%u];\n", reg, reg);
+    pre += buf;
+  }
+  pst[reg] = 2;
+  std::snprintf(buf, sizeof buf, "    P%u = (P%u & ~ex) | ((%s) & ex);\n", reg, reg, value.c_str());
+  return buf;
+}
+
+std::string RowCtx::flush_pre() {
+  std::string t;
+  t.swap(pre);
+  return t;
+}
+
+void RowCtx::sync(std::string& out, bool invalidate) {
+  char buf[96];
+  if (!(invalidate && mut("res_nostore_escape")) && !(!invalidate && mut("res_noend"))) {
+    for (auto& [reg, state] : st)
+      if (state == 2) {
+        std::snprintf(buf, sizeof buf, "  strow(R + %uu, X%u);\n", reg * 32u, reg);
+        out += buf;
+        state = 1;
+      }
+    for (unsigned r = 0; r < 7; ++r)
+      if (pst[r] == 2) {
+        std::snprintf(buf, sizeof buf, "  c->p[%u] = P%u;\n", r, r);
+        out += buf;
+        pst[r] = 1;
+      }
+  }
+  if (invalidate && !mut("res_noreload")) {
+    st.clear();
+    for (unsigned r = 0; r < 8; ++r) pst[r] = 0;
+  }
+}
+
+std::string RowCtx::decls() const {
+  std::string t;
+  char buf[96];
+  for (unsigned r : decl) {
+    std::snprintf(buf, sizeof buf, "  alignas(32) u32 X%u[32];\n", r);
+    t += buf;
+  }
+  for (unsigned r : pdecl) {
+    std::snprintf(buf, sizeof buf, "  u32 P%u;\n", r);
+    t += buf;
+  }
+  return t;
+}
 
 bool generates(const OpFacts& o) {
   switch (static_cast<Form>(o.form)) {
@@ -139,7 +261,9 @@ bool generates(const OpFacts& o) {
   }
 }
 
-std::string gen_op_body(const OpFacts& o) {
+std::string gen_op_body(const OpFacts& o, RowCtx& rc) {
+  g_rc = &rc;
+  rc.reads.clear();
   W w;
   char pa[96], pb[96];
   const Form form = static_cast<Form>(o.form);
@@ -271,7 +395,7 @@ std::string gen_op_body(const OpFacts& o) {
       decl_src(w, o.s[1], 1, false);
       w.f("    u32 r = static_cast<u32>(icmp_mask_k(%uu, %s, A0, A1, 32)) & ex;\n    const u32 acc = %s;\n", kIntCmp[o.a], o.c ? "true" : "false", pm(w, o.p, pa, sizeof pa));
       if (mut(g_form_name)) w.f("    r ^= 4u;\n");
-      w.f("    setp(c, %uu, ex, combine(%uu, r, acc));\n    setp(c, %uu, ex, combine(%uu, ~r, acc));\n", unsigned{o.dst}, o.b, unsigned{o.dst2}, o.b);
+      setp2(w, o, true);
       break;
     }
     case Form::Fsetp:   // h_fsetp (the plain form: no |x| or -x)
@@ -279,7 +403,7 @@ std::string gen_op_body(const OpFacts& o) {
       decl_src(w, o.s[1], 1, false);
       w.f("    u32 r = fcmp_mask_k(%uu, %s, A0, A1) & ex;\n    const u32 acc = %s;\n", o.a, o.c ? "true" : "false", pm(w, o.p, pa, sizeof pa));
       if (mut(g_form_name)) w.f("    r ^= 4u;\n");
-      w.f("    setp(c, %uu, ex, combine(%uu, r, acc));\n    setp(c, %uu, ex, combine(%uu, ~r, acc));\n", unsigned{o.dst}, o.b, unsigned{o.dst2}, o.b);
+      setp2(w, o, true);
       break;
     case Form::Fsel:   // h_fsel
       decl_src(w, o.s[0], 0, true);

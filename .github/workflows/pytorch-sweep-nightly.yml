@@ -44,6 +44,8 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+      - name: This is the host with CUDA 13 and its PyTorch
+        run: ci/ml-runner-preflight.sh cuda13 torch13
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

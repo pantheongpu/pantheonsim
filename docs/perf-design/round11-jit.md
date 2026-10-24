@@ -257,3 +257,72 @@ Compile of the hot unit: int_virus 2.1 s, compute_virus 1.0 s (the cold int_viru
 * `e2e_sass_archs` was run with every region compiled, not with the default selection; `m2ae` (async short runs) not saved; clang++; AVX-512; the launch-path +1.6% unexplained.
 * The default `VGPU_JIT_HOT_PERMILLE` (1) and `MIN_REGION` (4) are not tuned beyond the harness results above.
 * Milestone 4 (memory forms) was not started.
+
+# Milestone 3: register residence (2026-10-22/23, third rig; branch `jit-tier2-regs`)
+
+Based on PR #407's `e2593ae0`, merged with the CI-fix commit of `jit-tier2` ("jit: the three CI failures"). Raw output: `data/round11/m3-*`.
+
+## What changed
+
+* **Residence** (`RowCtx` in `jit.hpp`, `jit_gen.cpp`; `Engine::source` in `jit.cpp`). Within a region the register-file rows the generated code *writes* live in local arrays `X<n>[32]`, the predicates P0..P6 in locals `P<n>`. A row that is only read is read **in place** from the register file (nothing to copy, found to be better than copying it at its first read: the copy was a pure extra pass over memory). Rules, all static (the region is straight-line):
+  * a write to a row not yet local first loads the old row, `if (ex != 0xffffffff) ldrow(...)` before the op's guard test (so a masked write keeps the lanes outside `ex`, a whole-warp write costs no load, and an op whose guard leaves no lane still leaves a valid copy);
+  * a predicate write loads the old predicate and writes `(P & ~ex) | (v & ex)`; guards and predicate sources read the local;
+  * **before every escape** every dirty row and predicate is stored back and nothing is trusted after it (the tier's handler may read or write any register; the generator knows nothing of an escape's operands), counters are flushed as before; **at the end of the region** every dirty row and predicate is stored back. Dead-store elimination is *not* done by the generator (a row is stored once, at the next escape or the end): the compiler may remove a store only where the same function overwrites the row without a read in between, which cannot happen across an escape, so every row an escape can see is the tier's.
+  * 64-bit pairs (`IMAD.WIDE` writes two rows, its addend reads two), RZ (never a row), `dst == kNoReg` (no store), destination equal to a source (the result goes through a temporary row as before), the second warp of a 33- or 48-thread block (a partial `ex` loads the old row first) all follow from the same rule. At most 32 rows per region get an array (`VGPU_JIT_RES_ROWS`); others are accessed in place. `VGPU_JIT_RESIDENCE=0` turns it off (the key changes with the source).
+* **Also changed, because the compiler could not keep values in registers across the old code**: the tier statistics of generated ops are written at the next flush point (before an escape, and at the end) instead of after each op (a call between two ops made every vector live across it spill); the row helpers (`splat`, `ldrow`, `strow`, `store_row`) copy in 32-byte vector chunks.
+* **Unit dispatch**: `step_warp` calls `tier_run_jit` for a section that has a unit (`tp->jit`) and the plain loop otherwise; the unit is attached through `jit::attach` (in `jit.cpp`); the per-Runner `jit_` flag is gone (see the launch-path section).
+* `Engine` temporary file names use a process-wide sequence (two engines in one process, as the randomized test has, could race on one name).
+
+## Tests and gates
+
+* `test_jit` 21/21; `test_tier`, `test_simd`, `test_fastpath` unchanged.
+* **New `test_jit_resid`** (randomized, engine level): random straight-line regions of the generated forms and escapes (4 to 40 ops over 16 rows; sources of every kind; guards @P, @!P, @UP, @!PT; carries, 64-bit pairs, predicate outputs; destination == source common), each compiled with and without residence and run on random register files, predicates, constant banks and groups (a whole warp, a half, one lane, a random group), stats on and off; an escape hashes the entire register file and predicates it sees and changes registers and predicates itself, and in one run in six throws in the middle. Register file, predicates, counters and the escape log must be identical. 96 units / 1152 regions / 6912 runs / 20973 generated ops / 18755 escapes: 0 failures (the CI-sized default is 4 units; `VGPU_JIT_RANDOM_UNITS=n`).
+* **Random CUDA kernels** (`jit_random.py`, in `run_sass_jit.sh`, `VGPU_JIT_RANDOM_SEEDS` seeds x 16 kernels, blocks of 128, 48 and 33 threads; u32, u64 and float statements over a small pool, guards, loads): tier and JIT (every region compiled) print identical hashes and counters, and so does 4 threads; 8 seeds x 16 kernels x 3 block sizes = 384 kernel runs, 93% of the region instructions computed by generated code.
+* **Mutation checks for residence** (`VGPU_JIT_MUTANT=`, `-DVGPU_JIT_MUTANTS=ON`), each seen to fail in all three: the engine-level test (`test_jit_resid`, 1000 to 2200 failing runs of 2304 each), the random CUDA kernels (`m3-random-cuda-kernels-residence-mutants.txt`), and `sass_tier` (`m3-form-and-residence-mutants-sass_tier.log`; also the 19 form mutants and `maskless`: 25 of 25 caught):
+  `res_nostore_escape` (no store of dirty rows before an escape), `res_noreload` (rows still trusted after an escape), `res_nomask` (no load of the old row before a masked write), `res_noend` (no write-back at the end of a region), `res_dstsrc` (a row that the op also reads is not marked dirty by its write).
+* **Gates of milestone 2 on the final code**: `run_sass_jit.sh` PASS (52 checks, 52 min on an idle 16-CPU rig; the sweeps of `VGPU_MAX_STEPS`, faults inside regions, 1 and 4 threads, failure modes), `e2e_sass_tier` PASS, `e2e_sass_archs` with the JIT forced on PASS (292 ok, 1 h 30 min), all after the last change to the generator; the dispatch/attach change that followed was checked with `test_jit`, `test_jit_resid`, the random kernels (8 seeds) and the CI-image build below.
+* **CI-style build** (`cuda12.0-9f7f0f8400f7`, Ninja, `-DVGPU_WERROR=ON`, a `git init`ed copy): clean build (one `-Werror=class-memaccess` in the new test found and fixed); `ctest -R '^lint_'`: all pass but `lint_curl_retries` (as root, known); `lint_odr_globals` and its self-test pass (the residence code has no new global with external linkage: `g_rc`, `g_form_name` are thread-locals in an anonymous namespace, `g_seq` is `static`).
+* **Cost of `e2e_sass_jit` on CI**: the script compiles every region of every program (not the hot ones, to cover everything), at -O2, several times (cold caches for the no-chain, background, no-exception and cap variants): 52 minutes wall on an idle 16-CPU machine, of which about 6 minutes are the new random-kernel stage (3 seeds, 16 compiles of about 3.5 s each, 4 runs each, per seed). On a CI runner with fewer CPUs it will be longer in proportion to the CPU count. NOT MEASURED on CI. If it exceeds the job limit: split by program (`VGPU_JIT_PROGRAMS`, the random stage has `VGPU_JIT_ONLY_RANDOM=1`), or compile the "other" programs at -O1 (`VGPU_JIT_FLAGS`), which tests the same generated source.
+
+## Measurements (rig: c7i.4xlarge, CPU 4, sibling idle, medians)
+
+**Harness workloads**, 5 alternating passes of 3 runs, warm cache, `VGPU_JIT_THRESHOLD=100000 VGPU_JIT_SYNC=1` (wall seconds; `m3-harness-tier-m2-m3off-m3.txt`). `m2` = the milestone-2 build, `m3off` = this build with `VGPU_JIT_RESIDENCE=0` (the deferred statistics and vector helpers, no residence), `m3` = residence:
+
+| workload | tier | m2 | m3off | m3 | m3 / m2 |
+| --- | --- | --- | --- | --- | --- |
+| int_alu | 0.1472 | 0.0779 | 0.0731 | **0.0656** | 0.84 |
+| f32_fma | 0.0891 | 0.0712 | 0.0578 | 0.0597 | 0.84 |
+| local | 0.2057 | 0.1771 | 0.1702 | 0.1729 | 0.98 |
+| mem | 0.3410 | 0.2962 | 0.2907 | 0.2945 | 0.99 |
+| warp | 0.0934 | 0.0950 | 0.1052 | 0.1070 | 1.13 (slower) |
+| divergent | 0.3627 | 0.3778 | 0.3856 | 0.3812 | 1.01 |
+| shared | 0.0821 | 0.0926 | 0.0933 | 0.0946 | 1.02 |
+| f64_fma | 0.0758 | 0.0864 | 0.0890 | 0.0915 | 1.06 |
+
+**Pantheon stress workloads** (prebuilt binaries, 10 s, 3 passes, warm = the cache filled by the cold pass; Mi warp instructions per CPU second; `m3-pantheon-workloads.txt`):
+
+| workload | tier | m2 cold / warm | m3off cold / warm | m3 cold / warm | m3 warm / m2 warm |
+| --- | --- | --- | --- | --- | --- |
+| int_virus | 57.6 | 104.6 / 107.3 | 122.7 / 128.7 | **141.1 / 147.6** | **1.38x** (tier: 2.56x) |
+| compute_virus | 38.6 | 42.9 / 44.4 | 43.9 / 46.8 | 44.9 / 45.5 | 1.02x (within noise; tier: 1.18x) |
+
+**Compile time per section, before and after**: int_virus' hot unit 2.18 / 2.22 / 2.17 s (m2) against 2.10 / 2.05 / 2.11 s (m3); compute_virus 0.99 / 1.01 / 0.97 s against 1.02 / 1.01 / 1.03 s: residence does not change the cost. A residence-heavy unit has more source (a `ldrow` per first write); the largest unit of `sass_tier` (545 regions) compiles in the same few seconds as before. The cap on rows per region was not needed to hold the compile time and was not tuned.
+
+**Where it helps and where not**: `int_virus` and `int_alu` have long escape-free stretches of arithmetic, where rows stay in vector registers between ops. `local`, `mem`, `warp` and `compute_virus` have an escape (a load) every few ops: each escape stores every dirty row and the next ops read from the register file again, so residence has nothing to keep. Making it work through escapes needs the generator to know which rows an escape reads and writes (a table over the tier's memory and conversion forms): not done. GCC does not scalarise the row arrays (the stack traffic in the generated code is still high); the gain on `int_virus` is the removal of store-then-load round trips through the register file's memory and of the temporaries, not a full register allocation of rows (NOT verified in detail: the assembly of a region was read, not a hardware-counter profile).
+
+**JIT off against the base build** (`m3-jit-off-vs-base-all-workloads.txt`, 7 alternations): 0.93 to 1.00 on 15 of 16 workloads, `launch` 1.016.
+
+## The launch +1.6% with the JIT off: a layout artifact (bounded bisection, `m3-launch-bisection.txt`)
+
+`perf stat` of the `launch` workload on build variants: removing all of {the `jit_` flag, the dispatch, the `tier_program` call} gives the base exactly (936.0 M instructions, 299 M cycles against 935.9 M and 299 M); **adding back any one of them** gives +1.6 to +2.4 M instructions (about 40 to 60 per launch) and +0.3 to +2.5% cycles, and the sum of all three is no larger than any one. Another path name (same length or not) changes nothing. A sampled comparison of the base and a one-change variant moves samples between a kernel (`imad_wide_k`) and its inlined copy and shows no new function. So it is an inlining/layout decision of the whole-program optimiser that flips with any change in these functions, not work that the code does; it is not removable from the JIT code, and I did not find a configuration that avoids it (tried: dispatch in `step_warp` instead of `tier_run`, the unit creation moved to `jit.cpp`, the flag removed). It remains +1.6% on a microbenchmark of 41,000 one-warp launches and zero on every workload that runs instructions.
+
+## Verdict
+
+**Kept**: residence beats milestone 2 outside the noise where it can act: `int_virus` 107.3 to 147.6 Mi/s warm (1.38x over m2, 2.56x over the tier), `int_alu` 0.0779 to 0.0656 s, `f32_fma` 0.0712 to 0.0597 s (this one mostly from the deferred statistics, `m3off` is as fast). It is neutral on `compute_virus`, `mem` and `local`, and 6 to 13% slower than m2 on `warp`, `shared` and `f64_fma` (short runs dominated by regions with many escapes, where the stores and reloads around every escape are pure overhead): the same classes of workload where the JIT already lost against the tier. The release valve is `VGPU_JIT_RESIDENCE=0`; an adaptive rule (do not use residence in a region with an escape every few ops) would remove that loss and was not tried.
+
+## Not done / NOT MEASURED
+
+* Rows across escapes (per-form read/write sets of the escape forms); an adaptive per-region choice of residence; scalarising rows into vector variables in the generated source.
+* The default threshold and selection constants were not re-tuned.
+* `e2e_sass_jit` runtime on CI; clang++; AVX-512 hosts.
+* `e2e_sass_archs` was not re-run on the very last dispatch/attach edit (it does not touch generated code), the random kernels, `test_jit`, `test_jit_resid` and the CI-image build were.

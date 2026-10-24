@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pantheonsim VERSION 0.1.0 LANGUAGES C CXX)
+project(pantheonsim VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -191,7 +191,7 @@ file(WRITE "${_img_gen}" "${_content}")
 # ---------------------------------------------------------------------------
 option(VGPU_JIT_MUTANTS "Build the JIT's code generator with its mutation hooks (VGPU_JIT_MUTANT=<form>), for the mutation checks of the differential tests" OFF)
 if(VGPU_JIT_MUTANTS)
-  set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sass/jit_gen.cpp PROPERTIES COMPILE_DEFINITIONS VGPU_JIT_MUTANTS=1)
+  set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sass/jit_gen.cpp ${CMAKE_SOURCE_DIR}/src/sass/jit.cpp PROPERTIES COMPILE_DEFINITIONS VGPU_JIT_MUTANTS=1)
 endif()
 # The text the JIT's generated code includes (src/sass/jit.hpp), embedded in the binary.
 file(READ "${CMAKE_SOURCE_DIR}/src/simd/kernels.inc" VGPU_JIT_KERNELS)
@@ -1230,6 +1230,8 @@ add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cl
                src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp
                src/cli/config.cpp src/cli/config_cmd.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
+# The one place the version is written is project() above; `vgpu --version` and `rocm-smi --version` print it.
+target_compile_definitions(vgpu_cli PRIVATE VGPU_VERSION="${PROJECT_VERSION}")
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
 # rocm_agent_enumerator do not exist at all, so VirtualGPU supplies them; they
@@ -1419,6 +1421,9 @@ target_include_directories(test_tier PRIVATE src)
 # Tier 2 (src/sass/jit.hpp), milestone 1: the generator, the cache and its verification, the failure modes, discovery, promotion.
 vgpu_unit_test(test_jit)
 target_include_directories(test_jit PRIVATE src)
+# Register residence of the generated code against the register-file code, on random regions (VGPU_JIT_RANDOM_UNITS=<n> for more).
+vgpu_unit_test(test_jit_resid)
+target_include_directories(test_jit_resid PRIVATE src)
 target_compile_definitions(test_tier PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn amd/tests/unit/test_gcn.cpp)
 target_compile_definitions(test_amd_gcn PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -3330,6 +3335,15 @@ set_tests_properties(e2e_sass_jit PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 3600)
+# The whole matrix (every program on every architecture, three random seeds): about an hour on an idle 16-CPU machine, so it runs only
+# where VGPU_NIGHTLY=1 (the schedule-only `jit` job of .github/workflows/sass-ptx.yml) and SKIPs elsewhere. e2e_sass_jit above is the PR gate.
+add_test(NAME e2e_sass_jit_full
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_jit.sh --full)
+set_tests_properties(e2e_sass_jit_full PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 14400)
 
 # SASS on every architecture: programs built for each generation's SASS, sm_75
 # to sm_120, run by default and on their PTX, which must agree. sm_100 and
@@ -3553,6 +3567,8 @@ set_tests_properties(lint_hip_tests_runner PROPERTIES TIMEOUT 120)
 # The "workloads failing on main" issue (ci/track-workloads-issue.sh) against a fake
 # gh: a failure opens or updates it, a pass closes it, a cancelled run touches nothing.
 add_test(NAME lint_workloads_issue COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_workloads_issue.sh)
+# The version in CMakeLists.txt is the newest entry of CHANGELOG.md, and no source file writes a version of its own.
+add_test(NAME lint_version COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_version.sh)
 set_tests_properties(lint_workloads_issue PROPERTIES TIMEOUT 120)
 
 # Copies and fills with a shape in graphs, and the async copies a capture has to
@@ -4104,8 +4120,10 @@ foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopp
   endif()
 endforeach()
 # Under `ctest -j` the tests holding that lock form a chain, and the two CUTLASS
-# tests are most of it (about 1200 s and 1000 s in the build job; every other
-# test is under 120 s). ctest starts tests in cost order (by number when it has
+# tests are most of it (about 1200 s and 1000 s in the build job when they compile
+# every binary; the build job's cache of those binaries, VGPU_CUTLASS_BIN_CACHE
+# in cutlass_fetch.sh, leaves them the run time; every other test is under
+# 120 s). ctest starts tests in cost order (by number when it has
 # no history, which a fresh CI checkout has not), so with these two last in the
 # order they would start only after everything else had finished and the
 # chain could overlap nothing. A cost starts them first: the lock chain then
