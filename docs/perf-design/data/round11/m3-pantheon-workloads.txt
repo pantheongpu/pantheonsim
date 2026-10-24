@@ -1,0 +1,16 @@
+pantheon:int_virus tier [61.2, 57.4, 57.6] median 57.6
+pantheon:int_virus m2-cold [106.0, 104.6, 102.5] median 104.6
+pantheon:int_virus m2-warm [107.3, 108.1, 106.2] median 107.3
+pantheon:int_virus m3off-cold [121.6, 122.9, 122.7] median 122.7
+pantheon:int_virus m3off-warm [128.7, 129.9, 127.4] median 128.7
+pantheon:int_virus m3-cold [138.2, 142.8, 141.1] median 141.1
+pantheon:int_virus m3-warm [146.4, 147.6, 150.3] median 147.6
+pantheon:compute_virus tier [38.7, 38.3, 38.6] median 38.6
+pantheon:compute_virus m2-cold [42.7, 42.9, 43.3] median 42.9
+pantheon:compute_virus m2-warm [44.4, 44.4, 44.1] median 44.4
+pantheon:compute_virus m3off-cold [43.9, 43.5, 44.0] median 43.9
+pantheon:compute_virus m3off-warm [45.9, 47.3, 46.8] median 46.8
+pantheon:compute_virus m3-cold [43.6, 45.7, 44.9] median 44.9
+pantheon:compute_virus m3-warm [45.5, 45.1, 47.7] median 45.5
+
+

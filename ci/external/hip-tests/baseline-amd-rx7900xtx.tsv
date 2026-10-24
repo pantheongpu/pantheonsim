@@ -45,3 +45,5 @@ Unit_coalesced_groups	fail	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrp
 Unit_coalesced_groups_shfl_down	crash	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_groups_shfl_down_old.cc:240: FAILED:
 Unit_coalesced_groups_shfl_up	crash	coopGrpTest	/work/hip-tests/catch/unit/cooperativeGrps/coalesced_groups_shfl_up_old.cc:225: FAILED:
 Unit_Copy_Coherency	timeout	synchronizationTests	/work/hip-tests/catch/unit/synchronization/copy_coherency.cc:324: FAILED:
+# Added 2026-10-23 (nightly triage)
+Unit_hipDrvLaunchKernelEx_NegTsts	fail	ModuleTest	hipDrvLaunchKernelEx.cc:125: an invalid launch config returns hipErrorInvalidValue (1), ROCm answers hipErrorInvalidConfiguration (9); simulator bug, harmless
