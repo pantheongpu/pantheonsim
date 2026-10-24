@@ -272,7 +272,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "cs2r", "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "iabs", "ldc",
-                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma"};
+                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma", "atom"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -346,6 +346,7 @@ const FormImpl& form_impl(Form f) {
       {Impl::Own, "MATCH: lane-value equality classes of 32- or 64-bit integers, no format"},
       {Impl::Own, "LDSM: 32-bit words of the block's shared memory moved into the fragment registers; faults and the slow cases go to exec_mem"},
       {Impl::Own, "IMMA: integer products summed in 64 bits and cut to 32 (or clamped per 128 bits under .SAT), no number format"},
+      {Impl::Own, "ATOMG, ATOM, ATOMS, RED: the interpreter's exec_mem runs it, so the rules are its own; the tier only skips execute()'s dispatch"},
   };
   static_assert(sizeof table / sizeof table[0] == static_cast<size_t>(Form::Count_), "form_impl: one entry per Form");
   const unsigned i = static_cast<unsigned>(f);
@@ -489,6 +490,14 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.b = K;
       m.aux = static_cast<uint8_t>((ins.f[1] ? 1 : 0) | (ins.f[2] ? 2 : 0) | (ins.f[6] ? 4 : 0) | (ins.f[4] ? 8 : 0));
       accept(Form::Imma);
+      return;
+    }
+    case Op::ATOMG: case Op::ATOM: case Op::ATOMS: case Op::RED: {
+      // Run by exec_mem, which has the warp's atomics in one pass (the tier saves execute()'s probe of fast_alu and its dispatch).
+      // ATOMS.ARRIVE.64 (an mbarrier, f[2] == 2) goes to exec_syncs and stays the interpreter's.
+      if (ins.straight || (ins.op == Op::ATOMS && ins.f[2] == 2)) return;
+      m.dst = kNoReg;   // (nothing is written by the handler itself)
+      accept(Form::Atom);
       return;
     }
     case Op::MATCH: {   // the lanes' values grouped by equality (exec_warp): ANY gives each lane the mask of the lanes holding its value, ALL whether every lane holds one

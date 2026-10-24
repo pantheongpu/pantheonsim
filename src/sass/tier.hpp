@@ -130,6 +130,7 @@ enum class Form : uint8_t {
   Match,     // MATCH.ANY / MATCH.ALL on 32 or 64 bits: ends a run, has a handler
   Ldsm,      // LDSM, the 16-bit forms (ldmatrix .M88, .MT88): ends a run, has a handler
   Imma,      // IMMA (dense, 8- or 4-bit elements into s32, plain or .SAT): ends a run, has a handler
+  Atom,      // ATOMG, ATOM, ATOMS, RED: ends a run; the handler is exec_mem, which batches a warp's atomics
   Count_,
 };
 const char* form_name(Form f);

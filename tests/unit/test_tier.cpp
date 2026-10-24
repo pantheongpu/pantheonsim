@@ -94,7 +94,7 @@ void check_corpus(const std::string& file, int sm) {
     const bool terminal = op.form == sass::tier::Form::Plop3 || op.form == sass::tier::Form::S2r || op.form == sass::tier::Form::Sel ||
                           op.form == sass::tier::Form::Shfl || op.form == sass::tier::Form::Vote || op.form == sass::tier::Form::Hmma ||
                           op.form == sass::tier::Form::Umov || op.form == sass::tier::Form::Uldc || op.form == sass::tier::Form::Usel ||
-                          op.form == sass::tier::Form::Cs2r || op.form == sass::tier::Form::Match || op.form == sass::tier::Form::Imma || op.form == sass::tier::Form::Ldsm;   // end a run, and have handlers
+                          op.form == sass::tier::Form::Cs2r || op.form == sass::tier::Form::Match || op.form == sass::tier::Form::Imma || op.form == sass::tier::Form::Ldsm || op.form == sass::tier::Form::Atom;   // end a run, and have handlers
     VCHECK(ins.straight != (ends || terminal));
     VCHECK(op.maxreg <= 256);   // 0 is possible: constants into RZ
     const std::string what = std::string(sass::tier::form_name(op.form)) + " " + sass::to_text(ins);
@@ -192,7 +192,7 @@ VTEST(tier_leaves_turing_global_memory_to_the_interpreter) {
 // reads tier_ops.inc: a handler of a K form must call a kernel, one of an I form the interpreter, and no handler may contain the scalar
 // float arithmetic a rule would be written in (the interpreter's functions for it are called, not copied).
 const char* const kExpectedImpl =
-    "none:O mov:O iadd3:K iadd3x:O imad:K imad32:O imadwide:O imadhi:O isetpex:O popc:K i2fp:K ldg:O stg:O lds:O sts:O ldl:O stl:O lop3:K lea:O shf:O isetp:K fsetp:K fsel:K ffma:K fadd:K fmul:K dop:K bra:O bssy:O nop:O plop3:O s2r:O cs2r:O sel:O prmt:K imnmx:K fmnmx:K mufu:K f2i:K i2f:K f2fp:I dsetp:K hop2:K unary:K iabs:O ldc:O bsync:O yield:O bar:O exit:O shfl:O vote:O umov:O uldc:O uiadd3:O uimad:O uisetp:O ulea:O ulop3:O ushf:O uunary:O usel:O hmma:K match:O ldsm:O imma:O";
+    "none:O mov:O iadd3:K iadd3x:O imad:K imad32:O imadwide:O imadhi:O isetpex:O popc:K i2fp:K ldg:O stg:O lds:O sts:O ldl:O stl:O lop3:K lea:O shf:O isetp:K fsetp:K fsel:K ffma:K fadd:K fmul:K dop:K bra:O bssy:O nop:O plop3:O s2r:O cs2r:O sel:O prmt:K imnmx:K fmnmx:K mufu:K f2i:K i2f:K f2fp:I dsetp:K hop2:K unary:K iabs:O ldc:O bsync:O yield:O bar:O exit:O shfl:O vote:O umov:O uldc:O uiadd3:O uimad:O uisetp:O ulea:O ulop3:O ushf:O uunary:O usel:O hmma:K match:O ldsm:O imma:O atom:O";
 
 std::string read_file(const std::string& path) {
   std::ifstream in(path);

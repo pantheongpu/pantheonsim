@@ -1302,6 +1302,13 @@ TIER_HANDLER(h_match) {
 // (.MT88: the halves of column t/4 from rows 2(t%4) and 2(t%4)+1). A whole warp, every row inside the block's own shared memory: the words
 // move straight into the registers. A partial warp (a lane that holds a row address may be missing: the interpreter reports it), an address in
 // another block's window and a row that would end past the array are exec_mem's.
+// Atomics and reductions: exec_mem's own code (a warp's global atomics are taken together there), without execute()'s probe of the
+// interpreter's fast path and its dispatch. The run loop counts the instruction and moves the group on, as execute() does.
+TIER_HANDLER(h_atom) {
+  TIER_PRELUDE
+  c.r->tier_exec_mem(*c.blk, *c.w, *op.ins, ex);
+}
+
 TIER_HANDLER(h_ldsm) {
   const TCtx& c = *static_cast<const TCtx*>(vc);
   Block& blk = *c.blk;
@@ -1457,6 +1464,7 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Hmma: return &h_hmma;
     case F::Match: return &h_match;
     case F::Imma: return &h_imma;
+    case F::Atom: return &h_atom;
     case F::Ldsm: return &h_ldsm;
     case F::Umov: return &h_umov;
     case F::Uldc: return &h_uldc;
