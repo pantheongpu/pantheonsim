@@ -249,16 +249,18 @@ uint64_t sass_max_steps(uint64_t configured) {
   return v == 0 ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(v);
 }
 
-// The lanes whose program counter is `p`, compared two to a vector register where SSE2 is there.
+// The lanes whose program counter is `p`, compared four to a movemask where SSE2 is there.
 inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
   Mask eq = 0;
 #if defined(__SSE2__)
   const __m128i want = _mm_set1_epi64x(static_cast<long long>(p));
-  for (unsigned i = 0; i < 32; i += 2) {
-    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i]));
-    const __m128i e = _mm_cmpeq_epi32(v, want);
-    const __m128i both = _mm_and_si128(e, _mm_shuffle_epi32(e, 0xB1));   // a 64-bit lane is equal when both halves are
-    eq |= static_cast<Mask>(_mm_movemask_pd(_mm_castsi128_pd(both))) << i;
+  for (unsigned i = 0; i < 32; i += 4) {
+    const __m128i a = _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i])), want);
+    const __m128i b = _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i + 2])), want);
+    // The low halves of the four lanes' addresses, and their high halves: a lane is equal when both are.
+    const __m128 lo = _mm_shuffle_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), _MM_SHUFFLE(2, 0, 2, 0));
+    const __m128 hi = _mm_shuffle_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), _MM_SHUFFLE(3, 1, 3, 1));
+    eq |= static_cast<Mask>(_mm_movemask_ps(_mm_and_ps(lo, hi))) << i;
   }
 #else
   for (unsigned i = 0; i < 32; ++i) eq |= static_cast<Mask>(w.pc[i] == p) << i;
