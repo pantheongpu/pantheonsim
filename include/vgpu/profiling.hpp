@@ -13,6 +13,7 @@
 #ifndef VGPU_PROFILING_HPP
 #define VGPU_PROFILING_HPP
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -116,7 +117,15 @@ struct Event {
 
 // Off until a front end asks for it, so a program nobody is profiling pays
 // nothing beyond one relaxed load per launch.
-bool enabled();
+//
+// The two flags a call tests (this and hooked()) are read inline, every API call asks both. They stay exported
+// (default visibility), so the library that sets them and the one that reads them are one state as the
+// functions they replace were (the profiling state is the process's, see the CUPTI shim's link line).
+namespace detail {
+extern std::atomic<bool> g_on;
+extern std::atomic<bool> g_hooked;
+}  // namespace detail
+inline bool enabled() { return detail::g_on.load(std::memory_order_relaxed); }
 void set_enabled(bool on);
 
 void record(Event&& e);
@@ -204,7 +213,7 @@ struct Hooks {
   bool wants_symbols = false;
 };
 void set_hooks(const Hooks& h);          // all-null removes
-bool hooked();
+inline bool hooked() { return detail::g_hooked.load(std::memory_order_acquire); }
 void notify_resource(Resource what, uint64_t handle, uint32_t device);
 void notify_resource(const ResourceInfo& info);
 void notify_sync(SyncKind what, uint64_t stream);

@@ -1027,8 +1027,13 @@ void note_kept(const vgpu_traced::KeptArgs<A...>& kept) {
 
 template <class Body, class... A>
 cudaError_t traced_call(const char* api, Body body, A... a) {
-  const vgpu_traced::KeptArgs<A...> kept(a...);
-  note_kept(kept);
+  // The arguments are kept in this frame for the whole call (the profiler reads them again at its exit), and
+  // only when somebody is listening at the call: a program nobody profiles does not copy them.
+  std::optional<vgpu_traced::KeptArgs<A...>> kept;
+  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
+    kept.emplace(a...);
+    note_kept(*kept);
+  }
   vgpu::profiling::ApiCall call(api);
   const cudaError_t rc = body(a...);
   call.set_result(rc);
@@ -7156,6 +7161,11 @@ struct StreamCapture {
   std::vector<GraphEdgeABI> edges_out;   // what cudaStreamGetCaptureInfo hands out
 };
 std::unordered_map<void*, std::unique_ptr<Capture>> g_captures;   // by the stream that began each
+// Whether g_captures has anything in it, kept beside it (set under g_graph_mu after each change) so that the
+// gate every allocation, copy and launch passes through (capture_unsafe_gate) asks without the lock when no
+// capture is going on, which is nearly always.
+std::atomic<bool> g_captures_active{false};
+void note_captures_changed() { g_captures_active.store(!g_captures.empty(), std::memory_order_release); }
 std::unordered_map<void*, StreamCapture> g_stream_capture;        // every stream taking part
 
 // The capture state of `stream`, or nullptr. Caller holds g_graph_mu.
@@ -7397,6 +7407,7 @@ void vgpu_drop_capture(cudaStream_t stream) {
   if (cap->owned) g_borrowed_graphs.erase(cap->graph);   // the stream that began it takes it along
   leave_capture(cap);
   g_captures.erase(reinterpret_cast<void*>(stream));
+  note_captures_changed();
 }
 
 // Marks any in-flight capture as unusable. Called by the operations that this
@@ -7463,6 +7474,7 @@ static cudaError_t cudaStreamBeginCapture_body(cudaStream_t stream, cudaStreamCa
   g_borrowed_graphs[cap->graph] = cap->graph;
   g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap.get(), {}, {}, {}, {}};
   g_captures[reinterpret_cast<void*>(stream)] = std::move(cap);
+  note_captures_changed();
   return cudaSuccess;
 }
 
@@ -7485,6 +7497,7 @@ static cudaError_t cudaStreamEndCapture_body(cudaStream_t stream, cudaGraph_t* p
     GraphRec* const wrong = cap->graph;
     leave_capture(cap);
     g_captures.erase(reinterpret_cast<void*>(stream));
+    note_captures_changed();
     if (dropped) g_borrowed_graphs.erase(wrong);
     if (pGraph) *pGraph = nullptr;
     return cudaErrorStreamCaptureWrongThread;
@@ -7512,6 +7525,7 @@ static cudaError_t cudaStreamEndCapture_body(cudaStream_t stream, cudaGraph_t* p
   std::unique_ptr<GraphRec> owned = std::move(cap->owned);
   leave_capture(cap);
   g_captures.erase(reinterpret_cast<void*>(stream));
+  note_captures_changed();
   if (owned) g_borrowed_graphs.erase(graph);   // no longer lent: returned, or dropped below
   const bool invalidated = graph->invalidated;
   const char* const invalidated_by = graph->invalidated_by;
@@ -7598,6 +7612,7 @@ static cudaError_t cudaStreamBeginCaptureToGraph_traced(cudaStream_t stream, cud
   cap->mode = mode_value;
   g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap.get(), std::move(deps), {}, std::move(edges), {}};
   g_captures[reinterpret_cast<void*>(stream)] = std::move(cap);
+  note_captures_changed();
   return cudaSuccess;
 }
 
@@ -10423,6 +10438,7 @@ bool capture_refuse(cudaStream_t stream, const char* what) {
 // destruction, cudaDeviceSetLimit and cudaDeviceSetCacheConfig, texture and surface objects,
 // cudaProfilerStart and Stop, and a synchronization or query on a stream or event.
 cudaError_t capture_unsafe_gate(const char* api) {
+  if (!g_captures_active.load(std::memory_order_acquire)) return cudaSuccess;
   std::lock_guard<std::mutex> lock(g_graph_mu);
   if (g_captures.empty()) return cudaSuccess;
   const int mode = t_capture_mode;

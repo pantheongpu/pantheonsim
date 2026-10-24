@@ -1264,6 +1264,8 @@ endfunction()
 
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_profile)
+# What every shim call does around its body: ApiCall's reports, depth and argument hand-over, the inline flags.
+vgpu_unit_test(test_profiling_api)
 # The settings file: its parser and key table (src/cli/config.cpp) need nothing from the simulator.
 vgpu_unit_test(test_config)
 target_sources(test_config PRIVATE src/cli/config.cpp)
@@ -2264,6 +2266,15 @@ if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   target_include_directories(test_driver_mempool PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_driver_mempool COMMAND test_driver_mempool)
   set_tests_properties(test_driver_mempool PROPERTIES ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_DEVICE_COUNT=2;VGPU_QUIET=1")
+# The gate every allocation, copy and launch passes: refused during a capture, free of cost otherwise.
+if(TARGET vgpucudart)
+  add_executable(test_runtime_capture_gate nvidia/tests/unit/test_runtime_capture_gate.cpp)
+  target_link_libraries(test_runtime_capture_gate PRIVATE vgpucudart)
+  target_include_directories(test_runtime_capture_gate PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_runtime_capture_gate COMMAND test_runtime_capture_gate)
+  set_tests_properties(test_runtime_capture_gate PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
 endif()
 # cuLaunchKernelEx's attribute list: the cluster shape and a cooperative launch.
 if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)

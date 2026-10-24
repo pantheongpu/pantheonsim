@@ -110,7 +110,7 @@ int64_t Publisher::end_update(int64_t now) {
 }
 
 void Publisher::set_device_count(uint32_t n) {
-  std::lock_guard<std::recursive_mutex> lock(writers_);
+  std::lock_guard<std::mutex> lock(writers_);
   if (!shared_) return;
   begin_update();
   shared_->device_count = std::min<uint32_t>(n, kMaxDevices);
@@ -123,34 +123,34 @@ DeviceSample* Publisher::device(uint32_t ordinal) {
 }
 
 void Publisher::set_driver_version(const std::string& driver, const std::string& cuda) {
-  std::lock_guard<std::recursive_mutex> lock(writers_);
+  std::lock_guard<std::mutex> lock(writers_);
   if (!shared_) return;
   std::snprintf(shared_->driver_version, sizeof shared_->driver_version, "%s", driver.c_str());
   std::snprintf(shared_->cuda_version, sizeof shared_->cuda_version, "%s", cuda.c_str());
 }
 
 void Publisher::note_memory(uint32_t ordinal, uint64_t used_bytes) {
-  std::lock_guard<std::recursive_mutex> lock(writers_);
+  std::lock_guard<std::mutex> lock(writers_);
   DeviceSample* d = device(ordinal);
   if (!d) return;
   begin_update();
   d->vram_used_bytes = used_bytes;
-  refresh(ordinal, end_update());
+  refresh_locked(ordinal, end_update());
 }
 
 void Publisher::note_kernel(uint32_t ordinal, double seconds_busy) {
-  std::lock_guard<std::recursive_mutex> lock(writers_);
+  std::lock_guard<std::mutex> lock(writers_);
   DeviceSample* d = device(ordinal);
   if (!d) return;
   Accum& a = accum_[ordinal];
   a.busy_seconds += seconds_busy;
   begin_update();
   ++d->kernels_launched;
-  refresh(ordinal, end_update());
+  refresh_locked(ordinal, end_update());
 }
 
 void Publisher::note_transfer(uint32_t ordinal, uint64_t bytes, double seconds_busy, int64_t now) {
-  std::lock_guard<std::recursive_mutex> lock(writers_);
+  std::lock_guard<std::mutex> lock(writers_);
   DeviceSample* d = device(ordinal);
   if (!d) return;
   Accum& a = accum_[ordinal];
@@ -158,11 +158,15 @@ void Publisher::note_transfer(uint32_t ordinal, uint64_t bytes, double seconds_b
   a.mem_busy_seconds += seconds_busy;
   begin_update();
   d->bytes_moved += bytes;
-  refresh(ordinal, end_update(now));
+  refresh_locked(ordinal, end_update(now));
 }
 
 void Publisher::refresh(uint32_t ordinal, int64_t now) {
-  std::lock_guard<std::recursive_mutex> lock(writers_);
+  std::lock_guard<std::mutex> lock(writers_);
+  refresh_locked(ordinal, now);
+}
+
+void Publisher::refresh_locked(uint32_t ordinal, int64_t now) {
   DeviceSample* d = device(ordinal);
   if (!d) return;
   Accum& a = accum_[ordinal];

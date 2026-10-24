@@ -16,19 +16,24 @@
 namespace vgpu::profiling {
 namespace {
 
-std::atomic<bool> g_on{false};
 std::mutex g_mu;
 std::vector<Event> g_events;
 std::atomic<uint32_t> g_correlation{1};
-thread_local uint32_t t_api_correlation = 0;   // the API call this thread is inside
-thread_local int t_api_depth = 0;              // public calls this thread is inside
-thread_local int t_silence = 0;                // Silence scopes this thread is inside
-thread_local int t_sync_depth = 0;             // waits this thread is inside
-thread_local const void* t_args[16];           // the next call's arguments (note_args)
-thread_local uint16_t t_sizes[16];
-thread_local bool t_have_sizes = false;
-thread_local int t_nargs = 0;
-thread_local const char* t_symbol = nullptr;
+// What every API call of a thread reads and writes, in one thread-local: a thread-local of a shim library is
+// reached through __tls_get_addr, and a call that touched several paid for each (the calls are made by the
+// million). `t` below is that one lookup, made once in a function.
+struct ThreadApi {
+  int depth = 0;                  // public calls this thread is inside
+  int silence = 0;                // Silence scopes this thread is inside
+  int sync_depth = 0;             // waits this thread is inside
+  int nargs = 0;                  // the next call's arguments (note_args)
+  uint32_t correlation = 0;       // the API call this thread is inside
+  bool have_sizes = false;
+  const char* symbol = nullptr;
+  const void* args[16];
+  uint16_t sizes[16];
+};
+thread_local ThreadApi t_api;
 
 thread_local std::vector<uint64_t> t_external[kExternalKinds];
 thread_local uint32_t t_graph_id = 0;          // the graph launch this thread is running (GraphWork)
@@ -36,7 +41,6 @@ thread_local uint32_t t_graph_node = 0;
 
 std::mutex g_hook_mu;
 Hooks g_hooks;
-std::atomic<bool> g_hooked{false};
 
 // A profiler that never drains must not grow the process without bound. The
 // oldest events go first, which is the right end to lose: a timeline is read
@@ -46,8 +50,9 @@ constexpr size_t kMaxBuffered = 1u << 20;
 
 }  // namespace
 
-bool enabled() { return g_on.load(std::memory_order_relaxed); }
-void set_enabled(bool on) { g_on.store(on, std::memory_order_relaxed); }
+std::atomic<bool> detail::g_on{false};
+std::atomic<bool> detail::g_hooked{false};
+void set_enabled(bool on) { detail::g_on.store(on, std::memory_order_relaxed); }
 
 namespace {
 std::mutex g_graph_mu;
@@ -118,7 +123,7 @@ void set_record_hook(void (*fn)(Event&)) { g_record_hook.store(fn, std::memory_o
 
 void record(Event&& e) {
   if (!enabled()) return;
-  if (t_silence > 0) return;   // not the program's: see Silence
+  if (t_api.silence > 0) return;   // not the program's: see Silence
   if (t_graph_id && (e.kind == EventKind::Kernel || e.kind == EventKind::Memcpy ||
                      e.kind == EventKind::Memset || e.kind == EventKind::Memcpy2)) {
     e.graph_id = t_graph_id;
@@ -145,7 +150,7 @@ uint64_t now_ns() {
 
 uint32_t next_correlation() { return g_correlation.fetch_add(1, std::memory_order_relaxed); }
 
-uint32_t work_correlation() { return t_api_correlation ? t_api_correlation : next_correlation(); }
+uint32_t work_correlation() { return t_api.correlation ? t_api.correlation : next_correlation(); }
 
 bool push_external(int kind, uint64_t id) {
   if (kind < 0 || kind >= kExternalKinds) return false;
@@ -162,9 +167,8 @@ bool pop_external(int kind, uint64_t* last) {
 void set_hooks(const Hooks& h) {
   std::lock_guard<std::mutex> lock(g_hook_mu);
   g_hooks = h;
-  g_hooked.store(h.api || h.resource || h.sync, std::memory_order_release);
+  detail::g_hooked.store(h.api || h.resource || h.sync, std::memory_order_release);
 }
-bool hooked() { return g_hooked.load(std::memory_order_acquire); }
 
 void notify_resource(const ResourceInfo& info) {
   if (!hooked()) return;
@@ -215,25 +219,28 @@ void notify_sync(SyncKind what, uint64_t stream) {
 
 void note_args(const void* const* args, int n, const uint16_t* sizes) {
   if (!enabled() && !hooked()) return;
-  t_nargs = n > 16 ? 16 : n;
-  for (int i = 0; i < t_nargs; ++i) t_args[i] = args[i];
-  t_have_sizes = sizes != nullptr;
+  ThreadApi& t = t_api;
+  t.nargs = n > 16 ? 16 : n;
+  for (int i = 0; i < t.nargs; ++i) t.args[i] = args[i];
+  t.have_sizes = sizes != nullptr;
   if (sizes)
-    for (int i = 0; i < t_nargs; ++i) t_sizes[i] = sizes[i];
+    for (int i = 0; i < t.nargs; ++i) t.sizes[i] = sizes[i];
 }
 void note_symbol(const char* name) {
-  if (enabled() || hooked()) t_symbol = name;
+  if (enabled() || hooked()) t_api.symbol = name;
 }
 
 Silence::Silence() {
-  ++t_api_depth;
-  ++t_silence;
+  ThreadApi& t = t_api;
+  ++t.depth;
+  ++t.silence;
 }
 Silence::~Silence() {
-  --t_api_depth;
-  --t_silence;
+  ThreadApi& t = t_api;
+  --t.depth;
+  --t.silence;
 }
-bool silenced() { return t_silence > 0; }
+bool silenced() { return t_api.silence > 0; }
 
 namespace {
 std::atomic<bool> g_context_made{false};
@@ -242,6 +249,7 @@ std::atomic<void (*)()> g_context_hook{nullptr};
 void set_context_hook(void (*fn)()) { g_context_hook.store(fn, std::memory_order_release); }
 bool context_made() { return g_context_made.load(std::memory_order_acquire); }
 void note_context_made() {
+  if (g_context_made.load(std::memory_order_acquire)) return;   // (every API call asks; the exchange is a locked instruction)
   if (g_context_made.exchange(true, std::memory_order_acq_rel)) return;
   if (const auto fn = g_context_hook.load(std::memory_order_acquire)) fn();
 }
@@ -253,13 +261,13 @@ void notify_init_finished() {
 }
 
 SyncScope::SyncScope(SyncKind kind, uint64_t stream, uint64_t event, uint32_t device)
-    : kind_(kind), stream_(stream), event_(event), device_(device), outermost_(t_sync_depth++ == 0) {
+    : kind_(kind), stream_(stream), event_(event), device_(device), outermost_(t_api.sync_depth++ == 0) {
   // The start is only a record's; nobody recording means nobody reads it (the destructor reads it only when
   // recording is on at the end, and a record that was switched on during the wait has no start to give).
   if (outermost_ && enabled()) t0_ = host_ns();
 }
 SyncScope::~SyncScope() {
-  --t_sync_depth;
+  --t_api.sync_depth;
   if (!outermost_) return;
   if (enabled()) {
     Event ev;
@@ -277,30 +285,36 @@ SyncScope::~SyncScope() {
 }
 
 ApiCall::ApiCall(const char* name, Domain domain) {
+  ThreadApi& t = t_api;
   // The arguments noted for this call are this call's, whether or not it is
-  // the one that reports them.
-  const int nargs = t_nargs;
-  const char* symbol = t_symbol;
-  const bool have_sizes = t_have_sizes;
+  // the one that reports them. Nothing is noted unless somebody listens.
+  int nargs = 0;
+  const char* symbol = nullptr;
+  bool have_sizes = false;
   uint16_t sizes[16];
-  if (have_sizes)
-    for (int i = 0; i < nargs; ++i) sizes[i] = t_sizes[i];
-  t_have_sizes = false;
-  t_nargs = 0;
-  t_symbol = nullptr;
-  outermost_ = t_api_depth++ == 0;
+  if (__builtin_expect(t.nargs != 0 || t.have_sizes || t.symbol != nullptr, 0)) {
+    nargs = t.nargs;
+    symbol = t.symbol;
+    have_sizes = t.have_sizes;
+    if (have_sizes)
+      for (int i = 0; i < nargs; ++i) sizes[i] = t.sizes[i];
+    t.have_sizes = false;
+    t.nargs = 0;
+    t.symbol = nullptr;
+  }
+  outermost_ = t.depth++ == 0;
   if (!outermost_) return;
   hooked_ = hooked();
   if (!enabled() && !hooked_) return;
   name_ = name;
   domain_ = domain;
   correlation_ = next_correlation();
-  outer_ = t_api_correlation;
-  t_api_correlation = correlation_;
+  outer_ = t.correlation;
+  t.correlation = correlation_;
   nargs_ = nargs;
   // The arguments live in the caller's frame; keep the pointers only for this
   // call, in storage this object owns.
-  for (int i = 0; i < nargs; ++i) saved_[i] = t_args[i];
+  for (int i = 0; i < nargs; ++i) saved_[i] = t.args[i];
   args_ = nargs ? saved_ : nullptr;
   if (have_sizes && nargs) {
     for (int i = 0; i < nargs; ++i) saved_sizes_[i] = sizes[i];
@@ -330,9 +344,10 @@ ApiCall::ApiCall(const char* name, Domain domain) {
 }
 
 ApiCall::~ApiCall() {
-  --t_api_depth;
+  ThreadApi& t = t_api;
+  --t.depth;
   if (!name_) return;
-  t_api_correlation = outer_;
+  t.correlation = outer_;
   const uint64_t end = host_ns();
   if (hooked_) {
     Hooks h;
