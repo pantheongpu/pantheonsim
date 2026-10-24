@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pantheonsim VERSION 0.1.0 LANGUAGES C CXX)
+project(pantheonsim VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -1230,6 +1230,8 @@ add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cl
                src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp
                src/cli/config.cpp src/cli/config_cmd.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
+# The one place the version is written is project() above; `vgpu --version` and `rocm-smi --version` print it.
+target_compile_definitions(vgpu_cli PRIVATE VGPU_VERSION="${PROJECT_VERSION}")
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
 # rocm_agent_enumerator do not exist at all, so VirtualGPU supplies them; they
@@ -3560,6 +3562,8 @@ set_tests_properties(lint_hip_tests_runner PROPERTIES TIMEOUT 120)
 # The "workloads failing on main" issue (ci/track-workloads-issue.sh) against a fake
 # gh: a failure opens or updates it, a pass closes it, a cancelled run touches nothing.
 add_test(NAME lint_workloads_issue COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_workloads_issue.sh)
+# The version in CMakeLists.txt is the newest entry of CHANGELOG.md, and no source file writes a version of its own.
+add_test(NAME lint_version COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_version.sh)
 set_tests_properties(lint_workloads_issue PROPERTIES TIMEOUT 120)
 
 # Copies and fills with a shape in graphs, and the async copies a capture has to
