@@ -245,12 +245,20 @@ VTEST(idle_tail_and_take_error_follow_the_items_without_the_lock) {
   q.wait(behind);
   VCHECK(q.idle());
   VCHECK_EQ(q.take_error(), kOk);
+  // a failure is there for the caller the moment its item is seen to be done
+  for (int round = 0; round < 2000; ++round) {
+    const uint64_t failing = q.submit([] { return 5; });
+    q.wait(failing);
+    VCHECK_EQ(q.take_error(), 5);
+    VCHECK_EQ(q.take_error(), kOk);
+    VCHECK(q.idle());
+  }
   // the first failure is kept, a later one does not replace it, and asking forgets it
   for (int round = 0; round < 300; ++round) {
     q.submit([] { return 5; });
     const uint64_t last = q.submit([] { return 6; });
     q.wait(last);
-    VCHECK_EQ(q.take_error(), 5);            // (the failure is there the moment the item is done)
+    VCHECK_EQ(q.take_error(), 5);
     VCHECK_EQ(q.take_error(), kOk);
     VCHECK(q.idle());
   }
