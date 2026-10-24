@@ -1635,6 +1635,13 @@ target_include_directories(test_amd_hip_event_inline PRIVATE tests/framework amd
 add_test(NAME test_amd_hip_event_inline COMMAND test_amd_hip_event_inline)
 set_tests_properties(test_amd_hip_event_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# A small asynchronous copy or fill on a stream with nothing in it is done on the calling thread.
+add_executable(test_amd_hip_async_inline amd/tests/unit/test_hip_async_inline.cpp)
+target_link_libraries(test_amd_hip_async_inline PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_async_inline PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_async_inline COMMAND test_amd_hip_async_inline)
+set_tests_properties(test_amd_hip_async_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
 # A synchronization gives back what the stream-ordered pools keep beyond their release thresholds.
 add_executable(test_amd_hip_pool_sync amd/tests/unit/test_hip_pool_sync.cpp)
 target_link_libraries(test_amd_hip_pool_sync PRIVATE vgpuhip)
