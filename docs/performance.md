@@ -4194,8 +4194,8 @@ up to 60%. It was layout, not work: padding the translation unit changed nothing
 thread-local sink with `gcn::decode` kept out of line (`[[gnu::noinline]]`) returned `fetch` to the code it had; `perf stat` cycles
 are then the base's within 1% on `valu_int`, `smem`, `lds`, `divergent`, `wave` for both targets (for example `divergent` rx6800 2.35 G
 cycles against 2.38 G, `wave` 0.757 G against 0.761 G). The A/B of the same build still reads `valu_int` rx6800 between 0.96 and 1.00
-from one run to the next, and the A/A control (the base's own libraries copied to another path) read 0.95 to 1.05 on `launch` and
-0.97 to 1.02 elsewhere: the harness cannot see 3% on a host this loaded (load 1 to 47 during these runs).
+from one run to the next, and the A/A control (the base's own libraries copied to another path) read 0.95 to 1.19 on `launch` (p 0.3 to 1)
+and 0.97 to 1.02 elsewhere: the harness cannot see 3% on a host this loaded (load 1 to 47 during these runs).
 
 ### Tests (wired into CMake)
 
