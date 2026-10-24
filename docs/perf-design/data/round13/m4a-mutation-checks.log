@@ -1,0 +1,46 @@
+== test_jit_resid, the unmodified generator
+  residence: 32 units, 384 regions, 2304 runs, 7019 generated ops, 708 escapes that declare their sets, 5931 escapes executed, 0 failures
+[ PASS ] jit_residence_random_regions_equal_the_register_file_code
+1/1 tests passed
+== test_jit_resid, VGPU_JIT_MUTANT=esc_small_read
+  residence: 32 units, 384 regions, 2304 runs, 7019 generated ops, 708 escapes that declare their sets, 5931 escapes executed, 591 failures
+[ FAIL ] jit_residence_random_regions_equal_the_register_file_code
+unit 0 region 10 trial 0: differs (R differs, p differs, counters same, escape logs differ, threw 0/0)
+0/1 tests passed
+== test_jit_resid, VGPU_JIT_MUTANT=esc_small_write
+  residence: 32 units, 384 regions, 2304 runs, 7019 generated ops, 708 escapes that declare their sets, 5931 escapes executed, 592 failures
+[ FAIL ] jit_residence_random_regions_equal_the_register_file_code
+unit 12 region 0 trial 0: differs (R differs, p differs, counters differ, escape logs differ, threw 0/0)
+0/1 tests passed
+== test_jit_resid, VGPU_JIT_MUTANT=esc_small_pread
+  residence: 32 units, 384 regions, 2304 runs, 7019 generated ops, 708 escapes that declare their sets, 5931 escapes executed, 421 failures
+[ FAIL ] jit_residence_random_regions_equal_the_register_file_code
+unit 4 region 8 trial 0: differs (R differs, p differs, counters same, escape logs differ, threw 0/0)
+0/1 tests passed
+== test_jit_resid, VGPU_JIT_MUTANT=esc_small_pwrite
+  residence: 32 units, 384 regions, 2304 runs, 7019 generated ops, 708 escapes that declare their sets, 5932 escapes executed, 538 failures
+[ FAIL ] jit_residence_random_regions_equal_the_register_file_code
+unit 4 region 8 trial 0: differs (R same, p differs, counters same, escape logs same, threw 0/0)
+0/1 tests passed
+== test_jit_resid, VGPU_JIT_MUTANT=res_nostore_escape
+  residence: 32 units, 384 regions, 2304 runs, 7019 generated ops, 708 escapes that declare their sets, 5945 escapes executed, 1283 failures
+[ FAIL ] jit_residence_random_regions_equal_the_register_file_code
+unit 4 region 0 trial 0: differs (R differs, p differs, counters differ, escape logs differ, threw 0/0)
+0/1 tests passed
+== test_jit_resid, VGPU_JIT_MUTANT=res_noreload
+  residence: 32 units, 384 regions, 2304 runs, 7019 generated ops, 708 escapes that declare their sets, 5931 escapes executed, 361 failures
+[ FAIL ] jit_residence_random_regions_equal_the_register_file_code
+unit 4 region 0 trial 1: differs (R differs, p same, counters same, escape logs same, threw 0/0)
+0/1 tests passed
+== sass_tier.sm_86 mutant none: output identical-to-tier; verifier lines: 0
+== sass_tier.sm_86 mutant set_mem_addr: output OUTPUT-DIFFERS; verifier lines: 0
+== sass_tier.sm_86 mutant set_mem_dst: output OUTPUT-DIFFERS; verifier lines: 266
+== sass_tier.sm_86 mutant set_mem_data: output OUTPUT-DIFFERS; verifier lines: 0
+== sass_tier.sm_86 mutant set_alu_src: output OUTPUT-DIFFERS; verifier lines: 31
+== sass_tier.sm_86 mutant set_dop_dst: output OUTPUT-DIFFERS; verifier lines: 63
+== sass_tier_steps.sm_86 mutant none: output identical-to-tier; verifier lines: 0
+== sass_tier_steps.sm_86 mutant set_mem_addr: output OUTPUT-DIFFERS; verifier lines: 1
+== sass_tier_steps.sm_86 mutant set_mem_dst: output OUTPUT-DIFFERS; verifier lines: 43
+== sass_tier_steps.sm_86 mutant set_mem_data: output OUTPUT-DIFFERS; verifier lines: 0
+== sass_tier_steps.sm_86 mutant set_alu_src: output OUTPUT-DIFFERS; verifier lines: 35
+== sass_tier_steps.sm_86 mutant set_dop_dst: output identical-to-tier; verifier lines: 3

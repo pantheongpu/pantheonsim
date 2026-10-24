@@ -1,0 +1,32 @@
+pass 0 tier done
+pass 0 m4off done
+pass 1 m4off done
+pass 1 tier done
+pass 2 tier done
+pass 2 m4off done
+pass 3 m4off done
+pass 3 tier done
+pass 4 tier done
+pass 4 m4off done
+pass 5 m4off done
+pass 5 tier done
+pass 6 tier done
+pass 6 m4off done
+COUNTERS: identical in every config for 16 workloads; no differences
+workload                        tier                 m4off   ratios vs tier
+int_alu          0.1425 (+- 2.8%)       0.1428 (+- 4.6%)      m4off=1.002
+f32_fma          0.0911 (+-12.8%)       0.0913 (+- 6.5%)      m4off=1.001
+f64_fma          0.0759 (+- 6.7%)       0.0752 (+- 4.5%)      m4off=0.991
+f64_subnormal    0.1709 (+- 5.8%)       0.1709 (+- 2.4%)      m4off=1.000
+wmma             0.2146 (+- 9.5%)       0.2107 (+- 8.7%)      m4off=0.982
+mma_ptx          0.1099 (+-10.2%)       0.1074 (+- 6.4%)      m4off=0.978
+mem              0.3095 (+- 2.3%)       0.3093 (+- 2.2%)      m4off=0.999
+shared           0.0776 (+- 8.8%)       0.0769 (+- 6.1%)      m4off=0.990
+atomics          0.0457 (+- 8.9%)       0.0461 (+- 4.1%)      m4off=1.009
+texture          0.1495 (+- 3.0%)       0.1493 (+- 2.5%)      m4off=0.999
+local            0.2041 (+- 1.9%)       0.2032 (+- 1.7%)      m4off=0.996
+divergent        0.3603 (+- 0.9%)       0.3557 (+- 3.4%)      m4off=0.987
+warp             0.0924 (+- 2.2%)       0.0922 (+- 5.3%)      m4off=0.998
+launch           0.0900 (+- 1.9%)       0.0891 (+- 2.1%)      m4off=0.990
+api              0.2053 (+- 1.7%)       0.2046 (+- 3.4%)      m4off=0.996
+startup          0.0036 (+- 8.2%)       0.0036 (+- 9.6%)      m4off=0.992
