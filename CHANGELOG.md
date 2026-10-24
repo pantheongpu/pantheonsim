@@ -15,6 +15,8 @@ release says what runs and what it produces, never how fast a real GPU would run
   (`docs/ci-other-platforms.md`).
 - Every document was checked against the code, and the profile counts, command lists, ROCm versions and
   limitations were corrected. 48 profiles (38 NVIDIA, 10 AMD); 14 NVIDIA and 3 AMD are read from physical cards.
+- `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, issue templates (bug, something unsupported, a wrong GPU profile) and a
+  pull request template say how to send a change and what it needs.
 
 ### Faster
 - The SASS engine's pre-decoded tier is on by default; the AMD engine has a tier of its own, and matrix and
