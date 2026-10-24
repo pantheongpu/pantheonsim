@@ -291,4 +291,53 @@ VTEST(tier_handlers_call_what_the_interpreter_calls) {
   }
 }
 
+// The shapes of a shuffle with the same lane and clamp in all 32 lanes (sass::tier::shfl_shape) against the per-lane rule exec_warp and the
+// tier's general handler use: for every mode, lanes 0 to 40 and clamp words with every clamp and segment mask, the shape moves every lane's
+// word where the rule says and its in-range predicate is the rule's -- or the shape says it knows none.
+VTEST(tier_shuffle_shapes_move_what_the_per_lane_rule_moves) {
+  using sass::tier::ShflShape;
+  size_t shaped = 0, total = 0;
+  for (unsigned mode = 0; mode < 4; ++mode)
+    for (uint32_t b = 0; b < 41; ++b)
+      for (uint32_t clamp = 0; clamp < 32; ++clamp)
+        for (uint32_t seg = 0; seg < 32; ++seg) {
+          const uint32_t cc = clamp | (seg << 8) | (seg == 7 ? 0xdead0000u : 0);   // (bits that are neither field are ignored)
+          ShflShape sh;
+          ++total;
+          if (!sass::tier::shfl_shape(mode, b, cc, sh)) {
+            VCHECK(sh.kind == ShflShape::None);
+            continue;
+          }
+          ++shaped;
+          uint32_t src[32], in_mask = 0;
+          for (uint32_t l = 0; l < 32; ++l) {
+            const uint32_t maxl = (l & seg) | (clamp & ~seg), minl = l & seg;
+            uint32_t j;
+            bool in;
+            switch (mode) {
+              case 0: j = minl | (b & ~seg & 0x1f); in = j <= maxl; break;
+              case 1: j = l - b; in = static_cast<int32_t>(j) >= static_cast<int32_t>(maxl); break;
+              case 2: j = l + b; in = j <= maxl; break;
+              default: j = l ^ b; in = j <= maxl; break;
+            }
+            if (!in) j = l;
+            src[l] = j & 31;
+            in_mask |= static_cast<uint32_t>(in) << l;
+          }
+          VCHECK(sh.in == in_mask);
+          for (uint32_t l = 0; l < 32; ++l) {
+            uint32_t got = l;   // (a lane out of range keeps its own word)
+            switch (sh.kind) {
+              case ShflShape::Splat: got = sh.x; break;
+              case ShflShape::Butterfly: got = l ^ sh.x; break;
+              case ShflShape::Down: got = ((sh.in >> l) & 1) ? (l + sh.x) & 31 : l; break;
+              case ShflShape::Up: got = ((sh.in >> l) & 1) ? (l - sh.x) & 31 : l; break;
+              default: break;
+            }
+            VCHECK(got == src[l]);
+          }
+        }
+  VCHECK(shaped > total / 100);   // (not vacuous: the full-width shuffles are shaped)
+}
+
 VTEST_MAIN

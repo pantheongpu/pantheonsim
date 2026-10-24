@@ -353,6 +353,34 @@ const FormImpl& form_impl(Form f) {
   return table[i < static_cast<unsigned>(Form::Count_) ? i : 0];
 }
 
+bool shfl_shape(unsigned mode, uint32_t b, uint32_t cc, ShflShape& s) {
+  s = ShflShape{};
+  if (b > 31 || ((cc >> 8) & 0x1f) != 0) return false;
+  const uint32_t clamp = cc & 0x1f;   // (with a segment mask of 0, the highest lane a lane may read)
+  s.x = b;
+  switch (mode) {
+    case 0:   // idx: lane b for every lane; in range when it is not past the clamp
+      s.kind = b <= clamp ? ShflShape::Splat : ShflShape::Ident;
+      s.in = b <= clamp ? ~uint32_t{0} : 0;
+      return true;
+    case 1: {   // up: lane l - b, in range when l - b >= clamp
+      const uint32_t t = b + clamp;
+      s.in = t >= 32 ? 0 : ~uint32_t{0} << t;
+      s.kind = s.in ? ShflShape::Up : ShflShape::Ident;
+      return true;
+    }
+    case 2:   // down: lane l + b, in range when l + b <= clamp
+      s.in = clamp < b ? 0 : clamp - b >= 31 ? ~uint32_t{0} : (uint32_t{1} << (clamp - b + 1)) - 1;
+      s.kind = s.in ? ShflShape::Down : ShflShape::Ident;
+      return true;
+    default:   // bfly: lane l ^ b, in range when that is not past the clamp (every lane, for a clamp of 31)
+      if (clamp != 31) return false;
+      s.kind = ShflShape::Butterfly;
+      s.in = ~uint32_t{0};
+      return true;
+  }
+}
+
 void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
   op = MOp{};
   op.ins = &ins;
@@ -615,6 +643,8 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
         m.s[1].off = static_cast<uint32_t>(prog.pool.size() - 1);   // the table of source lanes
         m.b = in_range;
         m.aux = 1;
+        ShflShape sh;
+        if (shfl_shape(m.a, b, cc, sh)) m.c = static_cast<uint32_t>(sh.kind) | (sh.x << 8);   // (the shape of a full warp's shuffle; in_range is its predicate)
       }
       accept(Form::Shfl);
       return;

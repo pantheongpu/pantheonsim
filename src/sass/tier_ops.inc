@@ -1204,11 +1204,90 @@ TIER_HANDLER(h_imnmx) {
 // SHFL: the value of another lane of the warp, picked by the lane operand and the clamp (fast path of exec_warp: the three sources as
 // 32 lanes, the answer worked out for all of them, then written for the executing lanes). A lane that is not running the
 // shuffle gives 0.
+// Whether all 32 words of a row are the same, and then that word.
+inline bool tier_row_uniform(const uint32_t* r, uint32_t& v) {
+#if defined(__SSE2__)
+  const __m128i first = _mm_set1_epi32(static_cast<int>(r[0]));
+  __m128i eq = _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r)), first);
+  for (unsigned i = 1; i < 8; ++i) eq = _mm_and_si128(eq, _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r) + i), first));
+  v = r[0];
+  return _mm_movemask_epi8(eq) == 0xffff;
+#else
+  v = r[0];
+  for (unsigned l = 1; l < 32; ++l)
+    if (r[l] != v) return false;
+  return true;
+#endif
+}
+
+// The shuffle `sh` of the 32 words at vp into out, for the whole warp.
+inline void tier_shfl_move(const tier::ShflShape& sh, const uint32_t* vp, uint32_t* out) {
+  using tier::ShflShape;
+  switch (sh.kind) {
+    case ShflShape::None:
+    case ShflShape::Ident: tier_copy_row(out, vp); return;
+    case ShflShape::Splat: {
+      const uint32_t v = vp[sh.x];
+      for (unsigned l = 0; l < 32; ++l) out[l] = v;
+      return;
+    }
+    case ShflShape::Butterfly: {
+#if defined(__SSE2__)
+      const unsigned vx = sh.x >> 2;   // (the vector the four lanes come from, then the order within it)
+      const __m128i* in = reinterpret_cast<const __m128i*>(vp);
+      __m128i* o = reinterpret_cast<__m128i*>(out);
+      const auto run = [&](auto imm) {
+        __m128i v[8];
+        for (unsigned i = 0; i < 8; ++i) v[i] = _mm_shuffle_epi32(_mm_loadu_si128(in + (i ^ vx)), decltype(imm)::value);
+        for (unsigned i = 0; i < 8; ++i) _mm_storeu_si128(o + i, v[i]);
+      };
+      switch (sh.x & 3) {
+        case 0: run(std::integral_constant<int, _MM_SHUFFLE(3, 2, 1, 0)>{}); break;
+        case 1: run(std::integral_constant<int, _MM_SHUFFLE(2, 3, 0, 1)>{}); break;
+        case 2: run(std::integral_constant<int, _MM_SHUFFLE(1, 0, 3, 2)>{}); break;
+        default: run(std::integral_constant<int, _MM_SHUFFLE(0, 1, 2, 3)>{}); break;
+      }
+#else
+      for (unsigned l = 0; l < 32; ++l) out[l] = vp[l ^ sh.x];
+#endif
+      return;
+    }
+    case ShflShape::Down:   // lanes 0 .. n-1 read the lane x above, the others their own
+      for (unsigned l = 0; l < 32; ++l) out[l] = ((sh.in >> l) & 1) ? vp[(l + sh.x) & 31] : vp[l];
+      return;
+    default:   // Up
+      for (unsigned l = 0; l < 32; ++l) out[l] = ((sh.in >> l) & 1) ? vp[(l - sh.x) & 31] : vp[l];
+      return;
+  }
+}
+
 TIER_HANDLER(h_shfl) {
   TIER_PRELUDE
   alignas(32) uint32_t t[3][32], out[32];
   const uint32_t* vp = tier_src<false>(c, op.s[0], t[0]);
   Mask in_range = 0;
+  const uint32_t *bp = nullptr, *cp = nullptr;
+  if (!(op.aux & 1)) {
+    bp = tier_src<false>(c, op.s[1], t[1]);
+    cp = tier_src<false>(c, op.s[2], t[2]);
+  }
+  if (ex == kAll) {   // a full warp whose lane and clamp are the same for all its lanes: the data moves in one of a few shapes
+    tier::ShflShape sh;
+    if (op.aux & 1) {   // (constants: worked out by the analysis)
+      sh.kind = static_cast<tier::ShflShape::Kind>(op.c & 0xff);
+      sh.x = op.c >> 8;
+      sh.in = op.b;
+    } else {
+      uint32_t b, cc;
+      if (tier_row_uniform(bp, b) && tier_row_uniform(cp, cc)) tier::shfl_shape(op.a, b, cc, sh);
+    }
+    if (sh.kind != tier::ShflShape::None) {
+      tier_shfl_move(sh, vp, out);
+      tier_store(c, op.dst, kAll, out);
+      tier_setp(c, op.dst2, kAll, sh.in);
+      return;
+    }
+  }
   if (op.aux & 1) {   // the lane and the clamp are constants: the source lane of each lane and the in-range lanes were worked out by the analysis
     const uint32_t* j = c.pool[op.s[1].off].v;
     if (ex == kAll) {
@@ -1220,8 +1299,6 @@ TIER_HANDLER(h_shfl) {
     tier_setp(c, op.dst2, ex, op.b);
     return;
   }
-  const uint32_t* bp = tier_src<false>(c, op.s[1], t[1]);
-  const uint32_t* cp = tier_src<false>(c, op.s[2], t[2]);
   // (the mode picked once, not per lane)
   const auto lanes = [&](auto pick) {
     for (unsigned l = 0; l < 32; ++l) {
