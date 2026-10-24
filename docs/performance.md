@@ -4450,3 +4450,9 @@ VOTEU 3,200 and S2UR 128 are the interpreter's, see below), the others 99.2% to 
   `detect_leaks=1`, `halt_on_error=1`: clean. The cached bench program run on a shim built the same way (`LD_PRELOAD` of libasan, quick size) for `divergent`, `shared`,
   `warp`, `atomics`, `mem` and `local`: all PASS, no report. The shim built `-fsanitize=thread -g -O1` (`setarch -R`, `VGPU_THREADS=4`) for `atomics`, `shared`,
   `divergent` and `mem`: PASS, no warning. Not run there: the e2e programs and their sanitizer legs (no nvcc), `test_jit` (fails on the base too: no `c++` on its PATH).
+
+## Round sp: the four pieces together, and what they cost (integration A/B on the Zen 4 box)
+
+The API-call, AMD-memory and SASS-control pieces above merged without a code conflict and with identical counters. A/B of the merged tree against its base (one pinned CPU, quiet machine, counters identical in every row): NVIDIA SASS `shared` 2.0x, `atomics` 1.75-1.85x, `mem` 1.47x, `local` 1.21x, `divergent` 1.20x, `warp` 1.18x, `launch` 1.14x, `api` 1.43x (SASS and PTX); AMD `buf` 2.4-2.8x, `narrow` 1.6-2.0x, `mem` 1.3-1.6x, `lds` 1.3-1.55x, `flat` 1.2-1.35x, `atomics` 1.25-1.6x, `api` about 2.9x.
+
+Known cost, not explained: the f64 matrix instructions of the AMD engine run slower in the merged tree, `mfma_f64` 0.93-0.94x, `mfma_f64_4b` 0.93x, `mfma` 0.96-0.98x (MI300X, p <= 0.02, A/A control 1.000). `perf stat` on `mfma_f64`: instructions identical (11.93 G), cycles 2.22 G -> 2.50 G, L1 data-cache misses not higher. Each piece alone costs 1-2% there; the sum is the 7%. None of the pieces changes the matrix code, so it reads as a code-placement or address-alignment effect on `mfma_tile_fma_hw` / `matrix_multiply_fast`, not extra work. Not yet fixed.
