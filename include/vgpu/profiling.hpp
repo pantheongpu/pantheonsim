@@ -13,6 +13,7 @@
 #ifndef VGPU_PROFILING_HPP
 #define VGPU_PROFILING_HPP
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -116,7 +117,15 @@ struct Event {
 
 // Off until a front end asks for it, so a program nobody is profiling pays
 // nothing beyond one relaxed load per launch.
-bool enabled();
+//
+// The two flags a call tests (this and hooked()) are read inline, every API call asks both. They stay exported
+// (default visibility), so the library that sets them and the one that reads them are one state as the
+// functions they replace were (the profiling state is the process's, see the CUPTI shim's link line).
+namespace detail {
+extern std::atomic<bool> g_on;
+extern std::atomic<bool> g_hooked;
+}  // namespace detail
+inline bool enabled() { return detail::g_on.load(std::memory_order_relaxed); }
 void set_enabled(bool on);
 
 void record(Event&& e);
@@ -204,7 +213,7 @@ struct Hooks {
   bool wants_symbols = false;
 };
 void set_hooks(const Hooks& h);          // all-null removes
-bool hooked();
+inline bool hooked() { return detail::g_hooked.load(std::memory_order_acquire); }
 void notify_resource(Resource what, uint64_t handle, uint32_t device);
 void notify_resource(const ResourceInfo& info);
 void notify_sync(SyncKind what, uint64_t stream);
@@ -323,6 +332,9 @@ class SyncScope {
 // not a call of its own: a real runtime does not route its API through itself,
 // so a profiler there lists the one the program made, and so does this. The
 // work it issues carries that call's correlation.
+namespace detail {
+struct ThreadApi;   // what every API call of a thread reads and writes (profiling.cpp)
+}
 class ApiCall {
  public:
   explicit ApiCall(const char* name, Domain domain = Domain::Runtime);
@@ -332,23 +344,31 @@ class ApiCall {
   void set_result(int32_t r) { result_ = r; }
   // For a call that returns something other than a status code.
   void set_return_value(const void* p) { return_value_ = p; }
+  // silenced() for the thread this call is made on, without looking the thread's state up again.
+  bool silenced() const;
 
  private:
+  // The work of a call somebody listens to, or that has arguments noted for it: out of line, so that a call nobody
+  // listens to (nearly all of them) is the few instructions of the constructor and destructor.
+  [[gnu::noinline]] void begin(const char* name, Domain domain);
+  [[gnu::noinline]] void end();
+
+  detail::ThreadApi* thread_;    // (this thread's, found once)
   const char* name_ = nullptr;   // null when nobody was profiling at the call
-  Domain domain_ = Domain::Runtime;
-  bool outermost_ = false;       // a call made through another public call is not a call of its own
+  bool outermost_;               // a call made through another public call is not a call of its own
   bool hooked_ = false;
-  // Only read once name_ is set (a call somebody is listening to), which is also when they are written.
+  // The rest is only read once name_ is set (a call somebody is listening to), which is also when it is written.
+  Domain domain_;
+  int nargs_;
+  int32_t result_;
+  const void* const* args_;
+  const uint16_t* sizes_;
+  const char* symbol_;
+  uint32_t correlation_, outer_;
+  uint64_t start_;
+  const void* return_value_;
   const void* saved_[16];
   uint16_t saved_sizes_[16];
-  const void* const* args_ = nullptr;
-  const uint16_t* sizes_ = nullptr;
-  int nargs_ = 0;
-  const char* symbol_ = nullptr;
-  uint32_t correlation_ = 0, outer_ = 0;
-  uint64_t start_ = 0;
-  int32_t result_ = 0;
-  const void* return_value_ = nullptr;
 };
 
 }  // namespace vgpu::profiling

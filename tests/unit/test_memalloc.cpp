@@ -563,6 +563,41 @@ VTEST(chunks_returned_nearly_untouched_come_back_zeroed_and_counted) {
   VCHECK_EQ(backing::ram_bytes(), ram);
 }
 
+// A chunk with up to 32 KiB written is kept for the next acquire() (cleared to the byte it promised), one with more
+// goes back to the heap. The size of a buffer a program allocates, fills and frees in a loop decides which of the two
+// each allocation costs.
+VTEST(chunks_with_up_to_32_KiB_dirty_are_kept_cleared_and_counted) {
+  static_assert(backing::kPoolMaxDirty == 32 * 1024, "the pool's limit is part of what this test pins");
+  {   // an empty pool: whatever earlier tests left in it is taken out and given back to the heap
+    std::vector<uint8_t*> held;
+    for (uint64_t n = backing::pooled_chunks(); n; --n) held.push_back(backing::acquire());
+    for (uint8_t* h : held) backing::release(h);
+    VCHECK_EQ(backing::pooled_chunks(), uint64_t{0});
+  }
+  const uint64_t ram = backing::ram_bytes();
+  uint8_t* c = backing::acquire();
+  std::memset(c, 0x5A, 20000);
+  backing::release(c, 20000);
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{1});   // kept
+  VCHECK_EQ(backing::ram_bytes(), ram);
+  uint8_t* again = backing::acquire();
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{0});
+  VCHECK_EQ(backing::ram_bytes(), ram + kChunkSize);
+  for (uint64_t i = 0; i < kChunkSize; ++i)
+    if (again[i]) throw vtest::Failure("a chunk kept with 20000 bytes dirty came back with a byte not cleared");
+  // the last byte it may promise, and the first past it
+  std::memset(again, 0x5A, backing::kPoolMaxDirty);
+  backing::release(again, backing::kPoolMaxDirty);
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{1});
+  uint8_t* edge = backing::acquire();
+  for (uint64_t i = 0; i < kChunkSize; ++i)
+    if (edge[i]) throw vtest::Failure("a chunk kept with 32 KiB dirty came back with a byte not cleared");
+  std::memset(edge, 0x5A, backing::kPoolMaxDirty + 1);
+  backing::release(edge, backing::kPoolMaxDirty + 1);
+  VCHECK_EQ(backing::pooled_chunks(), uint64_t{0});   // too much to clear under the lock: to the heap
+  VCHECK_EQ(backing::ram_bytes(), ram);
+}
+
 VTEST(resident_memory_follows_allocations_through_recycling) {
   MemoryManager mm(1ull << 34);
   VCHECK_EQ(mm.resident_bytes(), uint64_t{0});

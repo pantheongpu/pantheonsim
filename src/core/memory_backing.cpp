@@ -395,8 +395,7 @@ uint8_t* acquire() {
   return chunk;
 }
 
-// What may be cleared under the lock to keep a chunk, and how many are kept.
-constexpr uint64_t kPoolMaxDirty = 4096;
+// How many chunks are kept. (What may be cleared under the lock to keep one is kPoolMaxDirty, in the header.)
 constexpr size_t kPoolMax = 64;
 
 void release(uint8_t* chunk, uint64_t dirty_bytes) {
@@ -423,6 +422,12 @@ void release(uint8_t* chunk, uint64_t dirty_bytes) {
     return;
   }
   delete[] chunk;
+}
+
+uint64_t pooled_chunks() {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mu);
+  return s.pool.size();
 }
 
 uint64_t ram_bytes() {

@@ -4128,3 +4128,112 @@ unit test against the per-lane code). The dot2 NaN lanes are unchanged.
 * Trampolines for the vector memory instructions the tier has no handler for (buffer, flat, scratch, LDS, atomics) through the Machine's functions without
   step()'s frame: no measurable gain on mem, flat, buf, ldsx (p > 0.05); dropped.
 * NaN lanes of `v_min/max_f32` (MODE.IEEE decides) and the dot2 NaN lanes stay with the interpreter.
+
+## The API calls' own cost (branch `sp-apipath`, from `d8ec6128`)
+
+What a program pays for a runtime call that is not simulation: `cudaMalloc`, `cudaMemcpy`, `cudaEventRecord`, `hipMemsetAsync`, `hipFree`.
+The harness rows are `api` (NVIDIA: 15 calls a round; AMD: 13 calls a round, 5 of them hand-offs to a stream's thread), `apicheap`,
+`memcpy`, `stream`, `launch_sync`, `graph`. The numbers below come from the pinned benchmark CPU (`--cpus 6`), so on the AMD side the
+stream threads share that one CPU and every hand-off is two context switches (`VGPU_QUEUE_SPIN` is 0 there); wall-clock gains on the AMD rows
+are therefore much larger than the cycle counts, which are given beside them.
+
+### Where a call's time went (perf, one host thread, 4 KiB buffers)
+
+* NVIDIA `api`: 19% was the zeroing of a fresh 64 KiB chunk (`backing::acquire`, libc `rep stos`) for each `cudaMalloc` of 4 to 6 KiB: the
+  pool of chunks given back nearly clean took back only 4 KiB, and these buffers dirty more. Then `ApiCall::ApiCall` 5%, `__tls_get_addr` 3 to 5%
+  (nine thread-locals of the profiling core, each its own lookup), the clock 4%, `pthread_mutex_*` 5%, the telemetry writers 4%, and a per-call copy
+  of the arguments into a `KeptArgs` nobody reads. A call is `traced_call`'s `ApiCall` and `guard`'s, nested.
+* AMD `api`: 70 mutex acquisitions a round (13 calls), ~15 futex calls, 6.4 context switches. `hipFree` alone took 14 locks (every queue
+  asked `tail()`, `wait()` and `take_error()` under its mutex, though idle).
+
+### What changed
+
+* **Profiling core** (`include/vgpu/profiling.hpp`, `src/core/profiling.cpp`). The thread-locals are one struct (`ThreadApi`), constant-initialized
+  (otherwise every access asks whether the thread's `__tls_init` has run) and found once per call (`ApiCall` keeps the pointer: its destructor
+  and `silenced()` do not look it up again). `ApiCall`'s work for a call somebody listens to, or that has arguments noted, is out of line
+  (`begin`, `end`); for the others the constructor is a dozen instructions. `enabled()` and `hooked()` are inline loads of exported flags
+  (`detail::g_on`, `g_hooked`; the CUPTI shim still shares the runtime's, as it shared its functions). `note_context_made()` reads before it exchanges.
+* **Runtime and driver** (`nvidia/src/runtime_api.cpp`, `driver_api.cpp`). The arguments of a call are copied into `KeptArgs` only when a recorder
+  or subscriber is on (an `optional` in the frame). `capture_unsafe_gate()` (every allocation, copy and launch) reads an atomic that mirrors
+  `g_captures` before it takes `g_graph_mu`; the five places that change `g_captures` update it.
+* **Telemetry** (`src/core/telemetry.cpp`). The `note_*` calls refresh under the lock they hold (`refresh_locked`), so the writers' mutex is a plain
+  one; the segment's sequence number is stepped by a load and a store under that mutex (fence and release store for the ordering) instead of two locked increments.
+* **Memory backing** (`src/core/memory_backing.cpp`). The pool of chunks given back keeps those with up to 32 KiB written (`kPoolMaxDirty`, was 4 KiB):
+  cleared under the lock to the byte promised, as before. `pooled_chunks()` for the test.
+* **HIP queue** (`amd/src/hip_queue.hpp`). `idle()`, `tail()` and `take_error()` answer from atomics without the queue's mutex (`idle` reads the
+  completed count before the submitted one; a failure is noted before its item counts as done); `wait()` of a finished item returns without the
+  lock. `run_inline` takes any callable and can tell the item's number.
+* **HIP runtime** (`amd/src/hip_api.cpp`). `hipEventRecord` on a stream with nothing in it (and every marker it follows done) reads the clock on
+  the caller (a profiler attached keeps the stream's thread); the result of a waited-for item stays in `in_order`'s frame (a `shared_ptr` and a second
+  function object less); `hipFree` takes the lock once to find the owner and the queues; the three synchronizations take the lock for
+  `release_to_thresholds` only once a pool exists (`g_pools_made`). **A copy or fill of at most 256 KiB (`kInlineMemoryBytes`) queued on a stream with
+  nothing in it, nothing it follows unfinished and no profiler attached, is done in the call** (`in_order`): `hipMemsetAsync`, `hipMemcpyAsync`
+  and the device-to-device copy and fill that HIP queues and returns from at once. A failure is the stream's, kept for the next synchronization, as
+  for a queued item. Kernels, host functions, events behind work and larger copies are queued exactly as before. This moves *when* such work happens
+  (at the call, never later) and starts no stream thread for a stream used only this way; a program cannot tell except by timing or by a race.
+
+### Results
+
+15 alternating runs, `--cpus 6`, load 12 to 55 on the server (the A/A column is the base against a copy of itself: ratios of medians, all p > 0.1).
+
+| workload | MI300X 1 thread | MI300X all | RX 6800 1 | RX 6800 all | A/A |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `api` | **14.5x** | **14.5x** | **14.7x** | **14.7x** | 0.96 to 1.06 |
+| `memcpy` | **4.96x** | **5.10x** | **5.22x** | **5.13x** | 0.97 to 1.05 |
+| `apicheap`, `stream`, `launch_sync`, `graph` | 0.99 to 1.00 | 0.99 to 1.01 | 0.99 to 1.01 | 1.00 to 1.01 | 0.97 to 1.03 |
+
+| NVIDIA (RTX 3060 profile) | SASS | PTX | A/A |
+| --- | ---: | ---: | --- |
+| `api` | **1.48x** (p < 0.001) | **1.48x** (p < 0.001) | 1.02 / 1.00 |
+| `launch` | 1.03x (p 0.14) | 1.03x (p 0.004) | 1.00 |
+| `startup` | 1.00x | 1.00x | 1.01 |
+
+Counters are identical in every pair. The same builds under `perf stat` (user instructions, cycles, context switches of the process; 3 runs, spread under 1%):
+
+| | instructions | cycles | context switches |
+| --- | ---: | ---: | ---: |
+| NVIDIA `api`, base | 1187 M | 615 M | 5 |
+| NVIDIA `api`, now | 959 M | 414 M | 5 |
+| AMD RX 6800 `api`, base | 2.43 G | 1.6 to 2.0 G | 640 k |
+| AMD RX 6800 `api`, now | 1.52 G | 0.55 G | 6 |
+| AMD RX 6800 `memcpy`, base | 0.70 G | 1.29 G | 197 k |
+| AMD RX 6800 `memcpy`, now | 0.47 G | 0.75 G | 3 |
+
+Where it comes from, as the changes were added (NVIDIA `api`, wall clock, 15 runs against the base): the call-path, capture-gate, telemetry-mutex and chunk
+pool changes together 1.34x; the thread-local struct, `ApiCall`'s fast path and the sequence number then took the cycles from 456 M to 414 M (1.48x). The
+profile before any of it put 19% of the cycles in the chunk zeroing. AMD `api`: the lock-free queue methods and the inline event record alone left the process
+switching 600 k times (wall clock 1.1x); the inline small copies and fills took the switches to 6.
+
+### Tests (wired into CMake)
+
+`test_profiling_api` (the recorder and subscriber contracts of `ApiCall`: outermost call, nesting, correlation, whose arguments are whose, silence, threads,
+the context hook once; the flags), `test_runtime_capture_gate` (a global capture refuses an allocation on any thread and the gate opens after it; relaxed
+does not refuse), `test_telemetry` (two steps of the sequence number for each update, even between), `test_memalloc` (chunks with up to 32 KiB dirty are
+kept, cleared and counted; the limit is pinned by a `static_assert`), `test_amd_hip_queue` (`idle`/`tail`/`take_error`, a failure seen the moment its item is
+seen done, `run_inline` with a lambda and the item's number), `test_amd_hip_event_inline` (a record on an idle stream is complete at the call, also with the
+host refusing threads; behind a host function, and on a blocking stream behind the null stream's work, it is not), `test_amd_hip_async_inline` (a small fill
+and copy on an idle stream need no thread and are done; behind a running host function they are not; a megabyte is queued), `test_amd_hip_pool_sync` (each
+of the three synchronizations gives a pool's excess back, none made before), `test_amd_hip_thread_refused` (now with a host function as the first item).
+
+Mutations (a scratch copy, each rebuilt and run; what fails): every call outermost; noted argument count not cleared; the fast path ignoring noted
+arguments; `set_enabled` writing the other flag: `test_profiling_api`. Capture flag never set: `test_runtime_capture_gate`. `begin_update` storing nothing:
+`test_telemetry`; `note_memory` calling the locking `refresh` under the now plain mutex: `test_telemetry` (deadlock, killed by timeout). Pool limit 4 KiB:
+`test_memalloc` (the `static_assert`); the pool clearing one byte short: `test_memalloc`. `take_error` always ok, `idle()` always true (timeout),
+`run_inline` not telling the number, a failure noted after its item counts as done: `test_amd_hip_queue`. Event record never inline; ignoring what the stream
+follows: `test_amd_hip_event_inline`. Async copies never inline; no size limit; everything inline, host functions too: `test_amd_hip_async_inline`
+(and `test_amd_hip_thread_refused` for the last). Synchronizations never giving a pool back; the flag never set: `test_amd_hip_pool_sync`.
+
+### Not done, and negative results
+
+* **TLS descriptors** (`-mtls-dialect=gnu2`, which replaces the `__tls_get_addr` call with a descriptor call): `api` 1.034x SASS and 1.055x PTX
+  (p 0.003 and < 0.001) on the tree before the thread-local work above, `launch` same. Not kept: it needs the loader of the machine that runs the shims to support
+  TLS descriptors (glibc's x86-64 support is not something to assume of every distribution the shims are installed on), for a few percent.
+* **One `ApiCall` for a call that `traced_call` and `guard` both open**: the inner one is a nested no-op, but dropping it needs every `guard` caller
+  audited for a public entry that opens none of its own.
+* **A waiter running the queued work itself** (instead of sleeping while the stream's thread does): the wake-up at submission (a futex call and, on one CPU,
+  a switch to the woken thread) stays, so the gain would be the second switch only, and the work would run on another thread than the stream's.
+* **Stream threads kept for reuse**: `stream` creates and destroys a stream a round, so starts a thread a round (8000 `clone3` calls a run); a parked
+  thread would carry thread-locals from one stream to the next (the current device, the last error).
+* **`hipEventSynchronize` and `hipEventQuery`** each take three event/runtime locks to look at one event (`in_capture`, `remote_event`, `event_marker`); one
+  look under both would save two lock pairs of about 40 a round: not done.
+* The AMD `launch_sync`, `stream` and `graph` rows are the kernel launch (`set_up_group` is 55% of `launch_sync`), not the call.

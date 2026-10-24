@@ -1266,6 +1266,8 @@ endfunction()
 
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_profile)
+# What every shim call does around its body: ApiCall's reports, depth and argument hand-over, the inline flags.
+vgpu_unit_test(test_profiling_api)
 # The settings file: its parser and key table (src/cli/config.cpp) need nothing from the simulator.
 vgpu_unit_test(test_config)
 target_sources(test_config PRIVATE src/cli/config.cpp)
@@ -1628,6 +1630,27 @@ target_include_directories(test_amd_hip_thread_refused PRIVATE tests/framework a
 add_test(NAME test_amd_hip_thread_refused COMMAND test_amd_hip_thread_refused)
 set_tests_properties(test_amd_hip_thread_refused PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "^(ok|SKIP)" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# An event recorded on a stream with nothing in it is taken on the calling thread.
+add_executable(test_amd_hip_event_inline amd/tests/unit/test_hip_event_inline.cpp)
+target_link_libraries(test_amd_hip_event_inline PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_event_inline PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_event_inline COMMAND test_amd_hip_event_inline)
+set_tests_properties(test_amd_hip_event_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# A small asynchronous copy or fill on a stream with nothing in it is done on the calling thread.
+add_executable(test_amd_hip_async_inline amd/tests/unit/test_hip_async_inline.cpp)
+target_link_libraries(test_amd_hip_async_inline PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_async_inline PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_async_inline COMMAND test_amd_hip_async_inline)
+set_tests_properties(test_amd_hip_async_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# A synchronization gives back what the stream-ordered pools keep beyond their release thresholds.
+add_executable(test_amd_hip_pool_sync amd/tests/unit/test_hip_pool_sync.cpp)
+target_link_libraries(test_amd_hip_pool_sync PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_pool_sync PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_pool_sync COMMAND test_amd_hip_pool_sync)
+set_tests_properties(test_amd_hip_pool_sync PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
 set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "ok HIP from a static destructor" FAIL_REGULAR_EXPRESSION "FAIL|ERROR: AddressSanitizer|malloc|double free|corrupted")
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
@@ -2257,6 +2280,15 @@ if(TARGET vgpucudart)
   # The runtime and the driver shim each carry the simulator's core, by design; one process that loads both
   # is an ODR violation to a sanitizer build (as in nvidia/tests/e2e/run_lib_check.sh). Leak detection stays on.
   set_tests_properties(test_runtime_user_objects PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
+# The gate every allocation, copy and launch passes: refused during a capture, free of cost otherwise.
+if(TARGET vgpucudart)
+  add_executable(test_runtime_capture_gate nvidia/tests/unit/test_runtime_capture_gate.cpp)
+  target_link_libraries(test_runtime_capture_gate PRIVATE vgpucudart)
+  target_include_directories(test_runtime_capture_gate PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_runtime_capture_gate COMMAND test_runtime_capture_gate)
+  set_tests_properties(test_runtime_capture_gate PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
 # The driver's stream-ordered memory pools (cuMemPool*, cuMemAllocFromPoolAsync).
