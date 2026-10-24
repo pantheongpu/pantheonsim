@@ -76,11 +76,13 @@ bool frozen_apply(unsigned op, unsigned type, bool cas, bool popc_inc, uint64_t 
 // Operands: random words and the ones that matter to a type.
 uint64_t operand(std::mt19937_64& rng, unsigned type) {
   static const uint32_t f32s[] = {0x00000000, 0x80000000, 0x00000001, 0x007fffff, 0x80000001, 0x00800000, 0x3f800000, 0xbf800000, 0x7f7fffff,
-                                  0x7f800000, 0xff800000, 0x7fc00000, 0x7f800001, 0xffc00000, 0x00400000, 0x40490fdb};
+                                  0x7f800000, 0xff800000, 0x7fc00000, 0x7f800001, 0xffc00000, 0x00400000, 0x40490fdb,
+                                  // (normal numbers whose sum is subnormal: the result is flushed)
+                                  0x00c00000, 0x80a00000, 0x80800000, 0x00a00000, 0x80c00000, 0x00800001, 0x80800001, 0x00ffffff};
   static const uint64_t f64s[] = {0, 0x8000000000000000ull, 1, 0x000fffffffffffffull, 0x3ff0000000000000ull, 0x7ff0000000000000ull,
                                   0xfff0000000000000ull, 0x7ff8000000000000ull, 0x7ff0000000000001ull, 0x7fefffffffffffffull};
   const unsigned pick = static_cast<unsigned>(rng() % 8);
-  if (type == 3) return pick < 5 ? f32s[rng() % 16] : (rng() & 0xffffffffu);
+  if (type == 3) return pick < 6 ? f32s[rng() % 24] : (rng() & 0xffffffffu);
   if (type == 6) return pick < 5 ? f64s[rng() % 10] : rng();
   if (type == 2 || type == 5) {
     static const uint64_t e[] = {0, 1, ~uint64_t{0}, 0x8000000000000000ull, 0x7fffffffffffffffull, 0xffffffffull, 0x100000000ull};
