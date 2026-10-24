@@ -343,7 +343,7 @@ struct VgprFile {
     Rows& operator=(const Rows& o) {
       if (this != &o) {
         Rows copy;
-        copy.p = static_cast<Row*>(std::malloc(o.n * sizeof(Row) + 1));
+        copy.p = static_cast<Row*>(std::aligned_alloc(64, o.n * sizeof(Row) + 64));
         if (!copy.p) throw std::bad_alloc();
         copy.n = copy.dirty = o.n;
         if (o.n) std::memcpy(copy.p, o.p, o.n * sizeof(Row));
@@ -373,7 +373,7 @@ struct VgprFile {
     // Grows to `count` rows, the new ones zero.
     void resize(size_t count) {
       if (count <= n) return;
-      Row* q = static_cast<Row*>(std::malloc(count * sizeof(Row)));
+      Row* q = static_cast<Row*>(std::aligned_alloc(64, count * sizeof(Row)));
       if (!q) throw std::bad_alloc();
       if (n) std::memcpy(q, p, n * sizeof(Row));
       std::memset(q + n, 0, (count - n) * sizeof(Row));
@@ -595,7 +595,12 @@ struct Group {
 
 struct Machine {
   Machine(const Dispatch& dispatch, MemoryManager& memory, DecodeCache& cache)
-      : d(dispatch), mem(memory), decoded(&cache), sampler(dispatch.sampler && dispatch.sampler->interval ? dispatch.sampler : nullptr) {}
+      : d(dispatch), mem(memory), decoded(&cache), sampler(dispatch.sampler && dispatch.sampler->interval ? dispatch.sampler : nullptr),
+        prev_rows_sink_(gcn::set_vgpr_rows_sink(cache.vgpr_rows_cell())) {}
+  // (What the instructions this machine decodes can write is noted in its decode cache: gcn::decode does it, told where.)
+  ~Machine() { gcn::set_vgpr_rows_sink(prev_rows_sink_); }
+  Machine(const Machine&) = delete;
+  Machine& operator=(const Machine&) = delete;
   const Dispatch& d;
   MemoryManager& mem;
   DispatchStats stats;
@@ -759,9 +764,9 @@ struct Machine {
     const CodeObject& o = *d.object;
     const uint64_t at = pc - d.code_base - o.text_addr;
     const Inst* in = at % 4 == 0 && at < o.text.size()
-                         ? decoded->get(at / 4, [&] { return gcn::decode(o.text, at, pc, target(), wave64(), decoded->vgpr_rows_cell()); })
+                         ? decoded->get(at / 4, [&] { return gcn::decode(o.text, at, pc, target(), wave64()); })
                          : nullptr;
-    if (!in) return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc, target(), wave64(), decoded->vgpr_rows_cell(), true)));
+    if (!in) return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc, target(), wave64())));
     return *in;
   }
   std::unique_ptr<const Inst> scratch_inst;   // one that is not where an instruction starts
@@ -12129,6 +12134,9 @@ struct Machine {
     if (fl & gcn::kInstSWait) return true;
     throw Error::make(Err::Unsupported, "instruction ", in.name, " is decoded but not implemented");
   }
+
+  // (Last, so that no other member moves: where the machine's hot members sit in memory moves the interpreter's speed.)
+  std::atomic<uint32_t>* prev_rows_sink_ = nullptr;   // the decode-cache sink this thread had before this machine
 };
 
 }  // namespace
@@ -12376,6 +12384,16 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
 
 }
 
+// The work-groups a host thread holds at once. (The list's nodes, and the groups' vectors of waves, come from small per-thread free
+// lists: see PooledAllocator. Adding and dropping one is out of line, so that the loop that runs them stays the size it was.)
+struct Held {
+  Group group;
+  bool had_turn = false;
+};
+using GroupList = std::list<Held, PooledAllocator<Held>>;
+[[gnu::noinline]] void add_group(GroupList& groups) { groups.emplace_back(); }
+[[gnu::noinline]] GroupList::iterator drop_group(GroupList& groups, GroupList::iterator it) { return groups.erase(it); }
+
 // One turn for each of a group's waves: each runs until it stops, parks at a
 // barrier or yields (s_sleep, a wave waiting on something), and a barrier
 // every unfinished wave has reached is released. Says whether every wave has
@@ -12472,17 +12490,12 @@ void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_s
   // once are bounded by their waves' registers (256 waves to a thread).
   constexpr uint64_t kFirstTurn = 1 << 22, kLaterTurn = 1 << 15;
   constexpr uint64_t kMaxResidentWaves = 256;
-  struct Held {
-    Group group;
-    bool had_turn = false;
-  };
-  // (The list's nodes, and the groups' vectors of waves, come from small per-thread free lists: see PooledAllocator.)
-  std::list<Held, PooledAllocator<Held>> resident;
+  GroupList resident;
   uint64_t next = begin, resident_waves = 0;
   const auto admit = [&] {
     uint32_t gx, gy, gz;
     group_at(next++, &gx, &gy, &gz);
-    resident.emplace_back();
+    add_group(resident);
     set_up_group(resident.back().group, m, d, packet, group_segment, gx, gy, gz);
     resident_waves += resident.back().group.waves.size();
   };
@@ -12493,7 +12506,7 @@ void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_s
     for (auto it = resident.begin(); it != resident.end();) {
       if (run_round(m, it->group, it->had_turn ? kLaterTurn : kFirstTurn)) {
         resident_waves -= it->group.waves.size();
-        it = resident.erase(it);
+        it = drop_group(resident, it);
         all_waiting = false;
         continue;
       }

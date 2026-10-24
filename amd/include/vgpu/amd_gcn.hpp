@@ -375,10 +375,10 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
 // kVgprsAny, which no file is as big as.
 inline constexpr uint32_t kVgprsAny = 4096;
 uint32_t vgpr_rows_written(const Inst& in);
-// decode(), and then raises *rows to what the instruction can write (vgpr_rows_written; kVgprsAny where `anywhere`, an instruction from
-// outside the code) if it is more: for the decode cache, which tells the next wave to use a register file how much of it to clear.
-Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64, std::atomic<uint32_t>* rows,
-            bool anywhere = false);
+// Where this thread's decode() raises the count of rows a decoded instruction can write (to vgpr_rows_written of it, if that is more):
+// the decode cache of the machine that runs here, which tells the next wave to use a register file how much of it to clear. Null:
+// not kept. Returns the one it replaces.
+std::atomic<uint32_t>* set_vgpr_rows_sink(std::atomic<uint32_t>* sink);
 
 // The instruction as the assembler writes it, for tests and for a
 // disassembly listing.
