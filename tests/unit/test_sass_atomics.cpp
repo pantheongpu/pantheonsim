@@ -117,15 +117,28 @@ VTEST(the_specialised_steps_are_the_frozen_rule) {
         ++total;
         const bool is64 = type == 2 || type == 5 || type == 6;
         const uint64_t keep = is64 ? ~uint64_t{0} : 0xffffffffull;
-        const bool has = sa::dispatch(op, type, cas, [&](auto step) {
-          for (int i = 0; i < 4000; ++i) {
-            const uint64_t old = operand(rng, type), v = operand(rng, type), swap = operand(rng, type);
-            uint64_t want = 0;
-            VCHECK(frozen_apply(op, type, cas, false, old, v, swap, want));
-            VCHECK_EQ(step(old, v, swap) & keep, want);
+        const sa::Step which = sa::step_for(op, type, cas);
+        if (which == sa::Step::General) continue;
+        ++specialised;
+        for (int i = 0; i < 4000; ++i) {
+          const uint64_t old = operand(rng, type), v = operand(rng, type), swap = operand(rng, type);
+          uint64_t got = 0;
+          switch (which) {
+            case sa::Step::Cas: got = sa::CasStep{}(old, v, swap); break;
+            case sa::Step::Add: got = sa::AddStep{}(old, v, swap); break;
+            case sa::Step::AddF32: got = sa::AddF32Step{}(old, v, swap); break;
+            case sa::Step::Min: got = sa::MinStep{}(old, v, swap); break;
+            case sa::Step::Max: got = sa::MaxStep{}(old, v, swap); break;
+            case sa::Step::And: got = sa::AndStep{}(old, v, swap); break;
+            case sa::Step::Or: got = sa::OrStep{}(old, v, swap); break;
+            case sa::Step::Xor: got = sa::XorStep{}(old, v, swap); break;
+            case sa::Step::Exch: got = sa::ExchStep{}(old, v, swap); break;
+            default: break;
           }
-        });
-        if (has) ++specialised;
+          uint64_t want = 0;
+          VCHECK(frozen_apply(op, type, cas, false, old, v, swap, want));
+          VCHECK_EQ(got & keep, want);
+        }
       }
   VCHECK(specialised >= 20);   // (the add, min, max, bitwise, exchange and compare-and-swap forms have steps)
   VCHECK(specialised < total);   // (the halves and the signed min and max have none)

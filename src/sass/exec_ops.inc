@@ -3800,10 +3800,20 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
                   cur[slot[l]] = nw;
                 }
               };
-              if (!exec::sassatom::dispatch(ins.f[0], type, cas, [&](auto step) {
-                    lanes([&](unsigned, uint64_t old, uint64_t x, uint64_t swap) { return step(old, x, swap); });
-                  }))
-                lanes([&](unsigned l, uint64_t old, uint64_t x, uint64_t swap) { return apply(l, old, x, swap); });
+              using exec::sassatom::Step;
+              const auto with = [&](auto step) { lanes([&](unsigned, uint64_t old, uint64_t x, uint64_t swap) { return step(old, x, swap); }); };
+              switch (exec::sassatom::step_for(ins.f[0], type, cas)) {
+                case Step::Cas: with(exec::sassatom::CasStep{}); break;
+                case Step::Add: with(exec::sassatom::AddStep{}); break;
+                case Step::AddF32: with(exec::sassatom::AddF32Step{}); break;
+                case Step::Min: with(exec::sassatom::MinStep{}); break;
+                case Step::Max: with(exec::sassatom::MaxStep{}); break;
+                case Step::And: with(exec::sassatom::AndStep{}); break;
+                case Step::Or: with(exec::sassatom::OrStep{}); break;
+                case Step::Xor: with(exec::sassatom::XorStep{}); break;
+                case Step::Exch: with(exec::sassatom::ExchStep{}); break;
+                default: lanes([&](unsigned l, uint64_t old, uint64_t x, uint64_t swap) { return apply(l, old, x, swap); }); break;
+              }
               // (a store the memory declines leaves it as it was, and the loop does the lot: nothing above has an effect)
               done = mem_.store_batch(uaddr, nu, n, cur);
             }

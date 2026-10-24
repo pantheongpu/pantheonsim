@@ -69,41 +69,40 @@ inline bool apply(unsigned op, unsigned type, bool cas, bool popc_inc, uint64_t 
   return true;
 }
 
-// The same result as `apply` for the common operations, as a function of (old, v, swap) with the operation known when it is
-// compiled: `f(step)` is called with the step for (op, type, cas) and true is returned; false when the combination has none (the caller
-// uses `apply`). The step's result is not cut to 32 bits (the caller's mask does that).
-template <class F>
-inline bool dispatch(unsigned op, unsigned type, bool cas, F&& f) {
-  if (cas) {
-    f([](uint64_t old, uint64_t cmp, uint64_t swap) { return old == cmp ? swap : old; });
-    return true;
+// The steps of the common operations, each a function of (old, v, swap) with the operation known when it is compiled. Their result is
+// not cut to 32 bits (the caller's mask does that); each gives `apply`'s value for the operation it is named for.
+struct CasStep { uint64_t operator()(uint64_t old, uint64_t cmp, uint64_t swap) const { return old == cmp ? swap : old; } };
+struct AddStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return old + x; } };
+struct AddF32Step {
+  uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const {
+    // .ftz on inputs and result; a NaN result is the canonical one (the general rule works it out on floats).
+    const auto fz = [](uint32_t b) { return (b & 0x7f800000u) == 0 ? b & 0x80000000u : b; };
+    const float sum = as_f32(fz(static_cast<uint32_t>(old))) + as_f32(fz(static_cast<uint32_t>(x)));
+    return uint64_t{sum != sum ? 0x7fffffffu : fz(f32_bits(sum))};
   }
-  if (type == 4 || type == 7) return false;   // (every operation on the halves works on each half)
-  if (op == 0 && (type == 0 || type == 1 || type == 2 || type == 5)) {
-    f([](uint64_t old, uint64_t x, uint64_t) { return old + x; });
-  } else if (op == 0 && type == 3) {
-    f([](uint64_t old, uint64_t x, uint64_t) {
-      // .ftz on inputs and result; a NaN result is the canonical one (the general rule works it out on floats).
-      const auto fz = [](uint32_t b) { return (b & 0x7f800000u) == 0 ? b & 0x80000000u : b; };
-      const float sum = as_f32(fz(static_cast<uint32_t>(old))) + as_f32(fz(static_cast<uint32_t>(x)));
-      return uint64_t{sum != sum ? 0x7fffffffu : fz(f32_bits(sum))};
-    });
-  } else if (op == 1 && (type == 0 || type == 2)) {
-    f([](uint64_t old, uint64_t x, uint64_t) { return std::min(old, x); });
-  } else if (op == 2 && (type == 0 || type == 2)) {
-    f([](uint64_t old, uint64_t x, uint64_t) { return std::max(old, x); });
-  } else if (op == 5) {
-    f([](uint64_t old, uint64_t x, uint64_t) { return old & x; });
-  } else if (op == 6) {
-    f([](uint64_t old, uint64_t x, uint64_t) { return old | x; });
-  } else if (op == 7) {
-    f([](uint64_t old, uint64_t x, uint64_t) { return old ^ x; });
-  } else if (op == 8) {
-    f([](uint64_t, uint64_t x, uint64_t) { return x; });
-  } else {
-    return false;
+};
+struct MinStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return std::min(old, x); } };
+struct MaxStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return std::max(old, x); } };
+struct AndStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return old & x; } };
+struct OrStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return old | x; } };
+struct XorStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return old ^ x; } };
+struct ExchStep { uint64_t operator()(uint64_t, uint64_t x, uint64_t) const { return x; } };
+
+// Which step stands for (op, type, cas); General when none does (the halves, the signed min and max, INC, DEC, F64 and the rest: `apply`).
+enum class Step : uint8_t { General, Cas, Add, AddF32, Min, Max, And, Or, Xor, Exch };
+inline Step step_for(unsigned op, unsigned type, bool cas) {
+  if (cas) return Step::Cas;
+  if (type == 4 || type == 7) return Step::General;   // (every operation on the halves works on each half)
+  switch (op) {
+    case 0: return type == 3 ? Step::AddF32 : (type == 0 || type == 1 || type == 2 || type == 5) ? Step::Add : Step::General;
+    case 1: return (type == 0 || type == 2) ? Step::Min : Step::General;
+    case 2: return (type == 0 || type == 2) ? Step::Max : Step::General;
+    case 5: return Step::And;
+    case 6: return Step::Or;
+    case 7: return Step::Xor;
+    case 8: return Step::Exch;
+    default: return Step::General;
   }
-  return true;
 }
 
 }  // namespace vgpu::exec::sassatom
