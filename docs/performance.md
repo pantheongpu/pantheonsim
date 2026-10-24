@@ -4231,7 +4231,11 @@ VOTEU 3,200 and S2UR 128 are the interpreter's, see below), the others 99.2% to 
 * *Pick the first lane's group first, look only at the other lanes for a lower address* (`tier_pick_group`), and an early return of `tier_release_bsync` when a member is not
   waiting at all: `divergent` 1.000x (p 0.49), `warp` 0.987x; dropped.
 * *A tier form for REDUX and VOTEU* (exec_warp does not use the group, so the handler is one line): `atomics` 1.010x (p 0.51); dropped.
-* *The shared word run for any contiguous prefix of lanes* (a `memcpy` of `count` words, the lanes found by bit scan): `shared` 0.891x; only the full warp has the fast path.
+* *The shared word run for any contiguous prefix of lanes*: with a `memcpy` of `count` words and the lanes found by bit scan `shared` 0.891x; with counted loops
+  and four-word vector copies 1.008x (p 0.17); only the full warp has the fast path.
+* Earlier entries of this file say SASS atomics had nothing to gain ("the one-lookup read-modify-write", and the "direct" dispatch of the instructions that end a
+  run, `atomics` 1.008x). The first was about `MemoryManager::rmw_scalar`, which the batch already avoided; the second left `exec_mem` as it was. The gain here is in
+  `exec_mem`'s own lane code (the division, the scan, the probes, the locks) and, once that was cheap, in the tier form (1.074x).
 * *Atomics' value rules through a template taking the step as a generic lambda* (`sassatom::dispatch`): `atomics` 0.96x (p < 0.001) with one more percent of
   instructions and three times the L1i misses (`exec_mem` split in half, the lane loops in an out-of-line `dispatch`); replaced by named functors and a `switch`, 1.004x of the
   version it was cut from. A lesson for the next one: after moving code into a header, A/B again, whatever the instruction count says.
