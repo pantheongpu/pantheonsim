@@ -826,6 +826,30 @@ inline void tier_get(uint32_t* v, const uint8_t* at, unsigned bytes) {   // v is
   }
 }
 
+// The lanes' global addresses: a register (a pair if `bhi`) and a uniform register plus an offset. A full warp is a counted loop.
+inline void tier_global_addresses(const uint32_t* blo, const uint32_t* bhi, uint64_t add, Mask ex, uint64_t* addrs) {
+  if (ex == kAll) {
+    if (blo && bhi) {
+      for (unsigned l = 0; l < 32; ++l) addrs[l] = (blo[l] | (static_cast<uint64_t>(bhi[l]) << 32)) + add;
+    } else if (blo) {
+      for (unsigned l = 0; l < 32; ++l) addrs[l] = uint64_t{blo[l]} + add;
+    } else {
+      for (unsigned l = 0; l < 32; ++l) addrs[l] = add;
+    }
+    return;
+  }
+  for (unsigned l = 0; l < 32; ++l) addrs[l] = 0;   // (the lanes that do not run read as zero, as the counting functions find them)
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    uint64_t v = 0;
+    if (blo) {
+      v = blo[l];
+      if (bhi) v |= static_cast<uint64_t>(bhi[l]) << 32;
+    }
+    addrs[l] = v + add;
+  }
+}
+
 // A 16-byte global access (LDG.E.128, STG.E.128), as exec_mem's lane loop makes it: each active lane, in order, one 16-byte read or
 // write of memory (the memory manager's bulk operation; not the atomic pieces a narrower access is), four registers a lane. The
 // lane loop's decode of the instruction's fields at every execution is what this saves. An address in the constant window is exec_mem's.
@@ -840,16 +864,11 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
   const uint32_t* bhi = (ra != kRZ && (op.aux & 1)) ? c.R + (ra + 1u) * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
   const uint64_t imm = static_cast<uint64_t>(op.imm);
-  uint64_t addrs[32] = {};
+  uint64_t addrs[32];
   constexpr uint64_t kWinEnd = kConstWindow + (uint64_t{1} << 32);
+  tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    uint64_t v = 0;
-    if (blo) {
-      v = blo[l];
-      if (bhi) v |= static_cast<uint64_t>(bhi[l]) << 32;
-    }
-    addrs[l] = v + urv + imm;
     if (addrs[l] >= kConstWindow && addrs[l] < kWinEnd) {   // nothing is done yet: the interpreter runs the whole instruction
       c.r->tier_exec_mem(blk, w, *op.ins, ex);
       return;
@@ -917,16 +936,8 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
   const uint32_t* bhi = (ra != kRZ && (op.aux & 1)) ? c.R + (ra + 1u) * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
   const uint64_t imm = static_cast<uint64_t>(op.imm);
-  uint64_t addrs[32] = {};
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    uint64_t v = 0;
-    if (blo) {
-      v = blo[l];
-      if (bhi) v |= static_cast<uint64_t>(bhi[l]) << 32;
-    }
-    addrs[l] = v + urv + imm;
-  }
+  uint64_t addrs[32];
+  tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
   constexpr uint64_t kWinEnd = kConstWindow + (uint64_t{1} << 32);
   const uint32_t* dreg = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
   MemoryManager& mem = c.r->memory();
