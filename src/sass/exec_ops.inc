@@ -3776,7 +3776,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           uint64_t addr = ga[l];
           if (ins.op == Op::ATOM && classify(ga[l], &addr) != Space::Global) ok = false;
-          if (addr % n) ok = false;
+          if (addr & (n - 1)) ok = false;   // (n is 4 or 8)
           if (!ok) break;
           unsigned k;
           if (nu && uaddr[nu - 1] == addr) {   // (lanes of a warp mostly repeat or step on)
