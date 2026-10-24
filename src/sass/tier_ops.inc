@@ -1700,16 +1700,45 @@ void jit_escape(jit::Ctx* j, uint32_t i, uint32_t ex) {
 // VGPU_JIT_VERIFY_SETS=1 (milestone 4a): the escape that checks the read/write sets the generator was given (jit::escape_sets) against what the handler
 // does. Run once: the rows and predicates that changed must be in the write set. Run again from the same state with every row and predicate that is in
 // neither set scrambled (stores excepted: they cannot be run twice): the rows and predicates of the write set must come out the same, so the handler reads
-// nothing outside the read set. A mismatch is a bug in the table and ends the process.
-[[noreturn]] void jit_sets_violation(const tier::MOp& op, const char* what, unsigned n) {
-  std::fprintf(stderr, "JIT VERIFY SETS: %s (pc 0x%llx) %s %u\n", op.ins->mnemonic.c_str(), static_cast<unsigned long long>(op.ins->pc), what, n);
-  std::abort();
+// nothing outside the read set. A mismatch is a bug in the table: it is reported on stderr (once each), which fails the differential test.
+void jit_sets_violation(const tier::MOp& op, const char* what, unsigned n) {
+  static std::mutex mu;
+  static std::set<std::string> seen;   // each distinct report once
+  char buf[256];
+  std::snprintf(buf, sizeof buf, "JIT VERIFY SETS: %s (pc 0x%llx) %s %u", op.ins->mnemonic.c_str(), static_cast<unsigned long long>(op.ins->pc), what, n);
+  std::lock_guard<std::mutex> g(mu);
+  if (seen.insert(buf).second) std::fprintf(stderr, "%s\n", buf);
+}
+
+// What was checked, per form (VGPU_JIT_VERIFY_REPORT=<file>: appended at exit).
+struct VerifyCount {
+  std::mutex mu;
+  std::map<std::string, std::pair<uint64_t, uint64_t>> n;   // form -> (escapes checked, escapes with an unknown set, not checked)
+  ~VerifyCount() {
+    const char* f = std::getenv("VGPU_JIT_VERIFY_REPORT");
+    if (!f || !*f) return;
+    if (std::FILE* g = std::fopen(f, "a")) {
+      for (const auto& [k, v] : n) std::fprintf(g, "verify %s checked=%llu unchecked=%llu\n", k.c_str(), (unsigned long long)v.first, (unsigned long long)v.second);
+      std::fclose(g);
+    }
+  }
+};
+VerifyCount& verify_count() {
+  static VerifyCount c;
+  return c;
 }
 
 void jit_escape_verified(jit::Ctx* j, uint32_t i, uint32_t ex) {
   JitHost& h = *static_cast<JitHost*>(j->host);
   const tier::MOp& op = h.ops[i];
   const jit::EscapeSets sets = jit::escape_sets(op);
+  {
+    VerifyCount& vc = verify_count();
+    std::lock_guard<std::mutex> g(vc.mu);
+    auto& e = vc.n[tier::form_name(op.form)];
+    if (sets.known && ex) ++e.first;
+    else ++e.second;
+  }
   if (!sets.known || !ex) {
     jit_escape(j, i, ex);
     return;
@@ -1721,6 +1750,11 @@ void jit_escape_verified(jit::Ctx* j, uint32_t i, uint32_t ex) {
   Mask p0[8];
   std::memcpy(p0, w.p, sizeof p0);
   const exec::LaunchStats st0 = h.c->blk->st;
+  // (the uniform registers and predicates: an escape may write them, and the second run must start where the first did)
+  uint32_t ur0[256], ur1[256];
+  bool up0[8], up1[8];
+  std::memcpy(ur0, w.ur, sizeof ur0);
+  std::memcpy(up0, w.up, sizeof up0);
   h.last = &op;
   op.fn(h.c, op, ex);
   if (h.stats) [[unlikely]] tier_stats().native[static_cast<size_t>(op.ins->op)].fetch_add(1, std::memory_order_relaxed);
@@ -1734,6 +1768,10 @@ void jit_escape_verified(jit::Ctx* j, uint32_t i, uint32_t ex) {
   Mask p1[8];
   std::memcpy(p1, w.p, sizeof p1);
   const exec::LaunchStats st1 = h.c->blk->st;
+  std::memcpy(ur1, w.ur, sizeof ur1);
+  std::memcpy(up1, w.up, sizeof up1);
+  std::memcpy(w.ur, ur0, sizeof ur0);
+  std::memcpy(w.up, up0, sizeof up0);
   std::memcpy(R, r0.data(), n * 4);
   std::memcpy(w.p, p0, sizeof p0);
   h.c->blk->st = st0;
@@ -1742,7 +1780,11 @@ void jit_escape_verified(jit::Ctx* j, uint32_t i, uint32_t ex) {
       for (unsigned l = 0; l < 32; ++l) R[r * 32 + l] = 0x9e3779b1u * (r * 32 + l + 1) ^ 0xa5a5a5a5u;
   for (unsigned q = 0; q < 7; ++q)
     if (!((sets.rp | sets.wp) >> q & 1u)) w.p[q] = ~w.p[q] ^ 0x5a5a1234u;
-  op.fn(h.c, op, ex);
+  try {
+    op.fn(h.c, op, ex);
+  } catch (...) {   // (the scrambled rows were read: an address, most likely)
+    jit_sets_violation(op, "throws when the rows outside its read set are scrambled; the rows read include one of them:", 0);
+  }
   for (unsigned r = 0; r < w.nregs; ++r)
     if (sets.in_wr(r) && std::memcmp(R + r * 32, &r1[r * 32], 128) != 0) jit_sets_violation(op, "reads a row outside its read set; the result row is", r);
   for (unsigned q = 0; q < 7; ++q)
@@ -1750,6 +1792,8 @@ void jit_escape_verified(jit::Ctx* j, uint32_t i, uint32_t ex) {
   std::memcpy(R, r1.data(), n * 4);
   std::memcpy(w.p, p1, sizeof p1);
   h.c->blk->st = st1;
+  std::memcpy(w.ur, ur1, sizeof ur1);
+  std::memcpy(w.up, up1, sizeof up1);
 }
 
 // Runs the region that starts at ops[idx] if it is compiled and the run loop could run all its ops here: what the loop checks for each

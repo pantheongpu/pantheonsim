@@ -306,7 +306,9 @@ std::string RowCtx::decls() const {
 //
 // One entry per form, from the handler in tier_ops.inc that the form names (and, where a handler hands an unusual case to the
 // interpreter, from the operands of the instruction, which are the ones the MOp resolved). Anything not listed is unknown: it reads
-// and writes everything, as before. The sets may be larger than the truth, never smaller; `VGPU_JIT_VERIFY_SETS=1` (a test build,
+// and writes everything, as before. A form is listed only if an escape of it has been run under VGPU_JIT_VERIFY_SETS=1 (the test programs,
+// the harness workloads and the pantheon stress workloads: docs/perf-design/round13-jit.md says which and how often); the forms the JIT
+// generates itself (LEA, SHF, IMNMX, FSEL, IMAD.HI) are escapes only for a source it cannot make, and have no entry. The sets may be larger than the truth, never smaller; `VGPU_JIT_VERIFY_SETS=1` (a test build,
 // -DVGPU_JIT_MUTANTS=ON) checks each escape that runs against its set (tier_ops.inc, jit_escape).
 EscapeSets escape_sets(const tier::MOp& op) {
   using tier::Form;
@@ -350,15 +352,15 @@ EscapeSets escape_sets(const tier::MOp& op) {
   };
   const unsigned words = op.a >= 4 ? op.a / 4 : 1;
   switch (op.form) {
-    case Form::Mov: case Form::Popc: case Form::I2fp: case Form::Mufu: case Form::F2i: case Form::I2f: case Form::F2fp: case Form::Unary: case Form::Iabs:
-      src(op.s[0]);
+    case Form::Mov: case Form::Popc: case Form::I2fp: case Form::Mufu: case Form::F2i: case Form::I2f: case Form::Unary: case Form::Iabs:
+      if (!mut("set_alu_src")) src(op.s[0]);
       dst(1);
       break;
-    case Form::Iadd3: case Form::Imad: case Form::Shf: case Form::Ffma: case Form::Prmt:
+    case Form::Iadd3: case Form::Imad: case Form::Ffma: case Form::Prmt:
       for (int k = 0; k < 3; ++k) src(op.s[k]);
       dst(1);
       break;
-    case Form::Fadd: case Form::Fmul:
+    case Form::Fadd: case Form::Fmul: case Form::F2fp:
       src(op.s[0]);
       src(op.s[1]);
       dst(1);
@@ -372,14 +374,6 @@ EscapeSets escape_sets(const tier::MOp& op) {
       if ((op.aux & 1) && !(op.aux & 2)) prd(op.p);
       dst(1);
       if (op.aux & 1) pwr(op.dst2);
-      break;
-    case Form::Lea:
-      src(op.s[0]);
-      src(op.s[1]);
-      if (op.aux & 4) src(op.s[2]);
-      if (op.aux & 2) prd(op.p);
-      dst(1);
-      if (op.dst2 != tier::kNoReg) pwr(op.dst2);
       break;
     case Form::Iadd3x:
       for (int k = 0; k < 3; ++k) src(op.s[k]);
@@ -405,15 +399,6 @@ EscapeSets escape_sets(const tier::MOp& op) {
       dst(2);
       if (op.dst2 != tier::kNoReg) pwr(op.dst2);
       break;
-    case Form::ImadHi:
-      src(op.s[0]);
-      src(op.s[1]);
-      if (op.aux & 4) src2(op.s[2]);
-      else src(op.s[2]);
-      if (op.aux & 1) prd(op.p);
-      dst(1);
-      if (op.dst2 != tier::kNoReg) pwr(op.dst2);
-      break;
     case Form::Isetp: case Form::Fsetp:
       src(op.s[0]);
       src(op.s[1]);
@@ -429,7 +414,7 @@ EscapeSets escape_sets(const tier::MOp& op) {
       pwr(op.dst);
       pwr(op.dst2);
       break;
-    case Form::Fsel: case Form::Sel: case Form::Imnmx: case Form::Fmnmx:
+    case Form::Fmnmx:
       src(op.s[0]);
       src(op.s[1]);
       prd(op.p);
@@ -437,7 +422,7 @@ EscapeSets escape_sets(const tier::MOp& op) {
       break;
     case Form::Dop:
       for (int k = 0; k < 3; ++k) src2(op.s[k]);
-      dst(2);
+      dst(mut("set_dop_dst") ? 1 : 2);
       break;
     case Form::Dsetp:
       src2(op.s[0]);
@@ -446,42 +431,17 @@ EscapeSets escape_sets(const tier::MOp& op) {
       pwr(op.dst);
       pwr(op.dst2);
       break;
-    case Form::S2r:
-      dst(1);
-      break;
-    case Form::Cs2r:
-      dst(op.b ? 2 : 1);
-      break;
     case Form::Ldc:
       raw(op.c, 1, false);
       dst(op.b == 5 ? 2 : 1);
       break;
-    case Form::Ldg: case Form::Lds: case Form::Ldl: case Form::Stg: case Form::Sts: case Form::Stl: {
+    case Form::Ldg: case Form::Lds: case Form::Ldl: case Form::Sts: case Form::Stl: {
       const bool store = op.form == Form::Stg || op.form == Form::Sts || op.form == Form::Stl;
-      raw(op.s[0].off, (op.aux & 1) ? 2 : 1, false);
-      if (op.dst != tier::kNoReg) raw(op.dst, words, store ? false : true);
+      if (!mut("set_mem_addr")) raw(op.s[0].off, (op.aux & 1) ? 2 : 1, false);   // (mutation checks: an entry too small)
+      if (op.dst != tier::kNoReg && !mut(store ? "set_mem_data" : "set_mem_dst")) raw(op.dst, words, store ? false : true);
       break;
     }
-    case Form::Ldsm:
-      raw(op.s[0].off, 1, false);
-      dst(op.a);
-      break;
-    case Form::Hmma:
-      raw(op.s[0].off, 4, false);
-      raw(op.s[1].off, 4, false);
-      raw(op.s[2].off, 4, false);
-      dst(4);
-      break;
-    case Form::Imma: {
-      const unsigned per_reg = (op.aux & 8) ? 8 : 4, a_regs = op.a * op.b / (32 * per_reg), b_regs = op.b * 8 / (32 * per_reg), c_regs = op.a * 8 / 32;
-      raw(op.s[0].off, a_regs, false);
-      raw(op.s[1].off, b_regs, false);
-      raw(op.s[2].off, c_regs, false);
-      dst(c_regs);
-      break;
-    }
-    case Form::Umov: case Form::Uldc: case Form::Uiadd3: case Form::Uimad: case Form::Uisetp: case Form::Ulea: case Form::Ulop3: case Form::Ushf:
-    case Form::Uunary: case Form::Usel:
+    case Form::Uiadd3: case Form::Uimad: case Form::Uisetp: case Form::Ulea: case Form::Ulop3: case Form::Ushf: case Form::Uunary:
       // The uniform datapath reads a row only for a source that is a register (lane l = the first executing lane), and may write a lane's
       // own predicate: every predicate is read and written.
       for (int k = 0; k < 3; ++k) src(op.s[k]);
