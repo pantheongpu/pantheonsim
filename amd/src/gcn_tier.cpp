@@ -872,14 +872,33 @@ int h_ds(const Op& o, Regs& R) {
   const uint64_t span = o.sub == kDsRead || o.sub == kDsWrite ? 4ull * w : 4;
   // Every lane must land inside the LDS (an access past it reads zeros and writes nowhere on a card, or is an error: the
   // interpreter's business); nothing has changed yet when one does not.
-  for (uint64_t m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-    if (static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x0)) + span > size) return 0;
-    if ((o.sub == kDsRead2 || o.sub == kDsWrite2) && static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x1)) + span > size) return 0;
+  // (Branch-free: the lanes' tests are ORed and looked at once.)
+  {
+    unsigned past = 0;
+    if (o.sub == kDsRead2 || o.sub == kDsWrite2) {
+      for (uint64_t m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+        past |= (static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x0)) + span > size) | (static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x1)) + span > size);
+      }
+    } else {
+      for (uint64_t m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+        past |= static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x0)) + span > size;
+      }
+    }
+    if (past) return 0;
   }
   uint8_t* lds = R.lds;
   switch (o.sub) {
     case kDsRead:
+      if (w == 1) {   // (the common one: a word a lane)
+        uint32_t* const out = R.vgpr[o.dst.index];
+        for (uint64_t m = ex; m; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+          std::memcpy(&out[l], lds + static_cast<uint32_t>(addr[l] + x0), 4);
+        }
+        return 1;
+      }
       for (uint64_t m = ex; m; m &= m - 1) {
         const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
         const uint8_t* p = lds + static_cast<uint32_t>(addr[l] + x0);
@@ -891,6 +910,14 @@ int h_ds(const Op& o, Regs& R) {
       }
       return 1;
     case kDsWrite:
+      if (w == 1) {
+        const uint32_t* const in = R.vgpr[o.src[1].index];
+        for (uint64_t m = ex; m; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+          std::memcpy(lds + static_cast<uint32_t>(addr[l] + x0), &in[l], 4);
+        }
+        return 1;
+      }
       for (uint64_t m = ex; m; m &= m - 1) {
         const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
         uint8_t* p = lds + static_cast<uint32_t>(addr[l] + x0);
