@@ -128,6 +128,28 @@ Outcome rmw_old(MemoryManager& mm, uint64_t addr, uint32_t size, int code, uint6
   });
 }
 
+// The executors' atomics on one thread store only a result that differs from what they loaded (rmw_if_changed, against the
+// two calls with the store left out when nothing changed): a chunk nothing has written stays so.
+Outcome changed_new(MemoryManager& mm, uint64_t addr, uint32_t size, int code, uint64_t b) {
+  return attempt([&](Outcome& o) {
+    uint64_t old = 0;
+    if (!mm.rmw_if_changed(addr, size, [&](uint64_t v) { return op_result(code, size, v, b); }, &old)) {
+      old = mm.load_scalar(addr, size);
+      const uint64_t now = op_result(code, size, old, b);
+      if (now != old) mm.store_scalar(addr, size, now);
+    }
+    o.v0 = old;
+  });
+}
+Outcome changed_old(MemoryManager& mm, uint64_t addr, uint32_t size, int code, uint64_t b) {
+  return attempt([&](Outcome& o) {
+    const uint64_t old = mm.load_scalar(addr, size);
+    const uint64_t now = op_result(code, size, old, b);
+    if (now != old) mm.store_scalar(addr, size, now);
+    o.v0 = old;
+  });
+}
+
 // Fields: the channels of a texel, new (load_fields, else one load_scalar each) and old (one load_scalar each).
 Outcome fields_new(const MemoryManager& mm, uint64_t addr, const uint8_t* sizes, unsigned n) {
   return attempt([&](Outcome& o) {
@@ -233,10 +255,11 @@ Stats run_random(uint64_t seed, int rounds, int fault) {
     const uint32_t sz[] = {1, 2, 4, 8};
     const uint32_t size = sz[rng.below(4)];
     if (rng.below(10) != 0) addr &= ~uint64_t{size - 1};   // mostly aligned
-    if (rng.below(2)) {
+    if (const uint64_t pick = rng.below(3); pick < 2) {
       const int code = static_cast<int>(rng.below(8));
       const uint64_t b = rng.next();
-      same("atomic", r, rmw_new(p.a, addr, size, code, b), rmw_old(p.b, addr, size, code, b));
+      if (pick == 0) same("atomic", r, rmw_new(p.a, addr, size, code, b), rmw_old(p.b, addr, size, code, b));
+      else same("atomic, stored if changed", r, changed_new(p.a, addr, size, code, b), changed_old(p.b, addr, size, code, b));
     } else {
       // A texel's channels: end to end, sizes from {0, 1, 2, 4, 8} (a 3 sometimes, which has no load).
       uint8_t fs[4];
@@ -313,6 +336,43 @@ VTEST(read_modify_write_declines_without_doing_anything) {
   VCHECK(!mm.load_fields(q, sizes, 2, v));
   mm.set_lookup_cache(true);
   VCHECK(mm.load_fields(q, sizes, 2, v));
+}
+
+VTEST(a_single_thread_atomic_stores_only_a_changed_word_and_only_in_a_real_chunk) {
+  MemoryManager mm(1ull << 28);
+  const uint64_t p = mm.alloc(2 * kChunkSize);
+  uint64_t old = 77;
+  int stores = 0;
+  const auto same = [&](uint64_t v) { return v; };
+  const auto plus = [&](uint64_t v) { return ++stores, v + 5; };
+  VCHECK(!mm.rmw_if_changed(p + 16, 4, plus, &old));   // a chunk nothing has written: the general path's
+  VCHECK_EQ(stores, 0);
+  VCHECK_EQ(mm.resident_bytes(), 0u);
+  const uint32_t seed = 9;
+  mm.write(p, &seed, 4);                                // makes the first chunk real
+  (void)mm.load_scalar(p + 16, 4);                      // (and a load leaves the allocation in the thread's lookup memory)
+  VCHECK(mm.rmw_if_changed(p + 16, 4, plus, &old));
+  VCHECK_EQ(old, 0u);
+  VCHECK_EQ(mm.load_scalar(p + 16, 4), 5u);
+  VCHECK(mm.rmw_if_changed(p + 16, 4, same, &old));
+  VCHECK_EQ(old, 5u);
+  VCHECK(!mm.rmw_if_changed(p + 18, 4, plus, &old));   // misaligned
+  VCHECK(!mm.rmw_if_changed(p + 16, 3, plus, &old));   // no such width
+  VCHECK(!mm.rmw_if_changed(p + kChunkSize + 8, 4, plus, &old));   // the second chunk is still untouched
+  VCHECK_EQ(mm.resident_bytes(), kChunkSize);
+  struct Armed : MemoryManager::AccessFault {
+    uint64_t on = 1;
+    Armed() { store_pending = &on; }
+    uint64_t on_load(uint64_t, uint32_t, uint64_t v) override { return v; }
+    uint64_t on_store(uint64_t, uint32_t, uint64_t v) override { return v; }
+    uint64_t on_shared_load(uint64_t, uint32_t, uint64_t v) override { return v; }
+    void on_read(uint64_t, uint8_t*, uint64_t) override {}
+    uint64_t on_alu(uint64_t v, uint32_t) override { return v; }
+    void on_copy(uint64_t, uint8_t*, uint64_t) override {}
+  } armed;
+  mm.set_access_fault(&armed);
+  VCHECK(!mm.rmw_if_changed(p + 16, 4, plus, &old));   // a fault armed on stores: the stores take it
+  mm.set_access_fault(nullptr);
 }
 
 VTEST(concurrent_atomics_from_several_threads_add_up) {

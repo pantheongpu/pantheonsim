@@ -214,6 +214,20 @@ class MemoryManager {
         const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out);
   }
 
+  // The load, `compute(old)` and a store of the result where it differs (the executors' atomics on one thread), for a word in a
+  // chunk that is real in the last allocation this thread found: one lookup for the two. Returns false, having done nothing, for
+  // any other word (an untouched or uniform chunk, another allocation, a fault armed, a host mapping in reach, a misaligned
+  // address) and the caller then makes the two calls.
+  bool rmw_if_changed_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out);
+  template <class F>
+  bool rmw_if_changed(uint64_t addr, uint32_t size, F&& compute, uint64_t* old_out) {
+    return rmw_if_changed_fn(
+        addr, size, [](void* c, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(old); },
+        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out);
+  }
+  // Whether `addr` may be in a host mapping (false is a sure no, and the usual answer: nothing is mapped near a device window).
+  bool host_map_possible(uint64_t addr) const { return host_maps_ && host_maps_->may_contain(addr); }
+
   // A lock-free atomic read-modify-write on a 4- or 8-byte naturally aligned word: `compute(old)` is applied with a
   // compare-and-swap loop on the word itself (the value it is called with is the one the swap replaces, so it is
   // called again when another thread got in between, and must be pure). Returns true with `*old_out` the value the

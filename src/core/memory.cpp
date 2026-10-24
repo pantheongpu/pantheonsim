@@ -1712,6 +1712,19 @@ bool MemoryManager::rmw_scalar_fn(uint64_t addr, uint32_t size, RmwFn compute, v
   return true;
 }
 
+bool MemoryManager::rmw_if_changed_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out) {
+  if ((size != 1 && size != 2 && size != 4 && size != 8) || (addr & (size - 1)) || access_faults_armed()) return false;
+  // The word in a chunk that is real and the last allocation found holds it (as load_scalar and store_scalar take it first);
+  // anything else -- an untouched or uniform chunk, another allocation -- is the general path's.
+  uint8_t* p = hot_location(addr, size);
+  if (!p) return false;
+  const uint64_t old = load_at(p, size);
+  *old_out = old;
+  const uint64_t now = compute(ctx, old);
+  if (now != old) store_at(p, size, now);
+  return true;
+}
+
 bool MemoryManager::atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out,
                                   bool always_store) {
   if (size != 4 && size != 8) return false;
