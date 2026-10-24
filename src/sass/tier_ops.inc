@@ -1117,16 +1117,21 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
   // (The widths the instruction can have move with copies of a size known at compile time: see store_lane_bytes.)
   const bool moved = with_lane_width(bytes, [&](auto width) {
     constexpr unsigned B = decltype(width)::value;
-    for (Mask m = ex; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    const auto lane = [&](unsigned l) {
       uint8_t* at = sh + (addrs[l] & 0xffffff);
       if (Store) {
         store_lane_bytes<B>(at, [&](unsigned i) -> uint32_t { return d ? d[32 * i + l] : 0u; });
       } else if (d) {
-        if constexpr (B <= 4) d[l] = tier_extend(op.b, load_lane_word<B>(at));
+        if constexpr (B == 4) d[l] = load_lane_word<B>(at);
+        else if constexpr (B < 4) d[l] = tier_extend(op.b, load_lane_word<B>(at));
         else
           for (unsigned i = 0; i < B / 4; ++i) d[32 * i + l] = load_lane_word<B>(at, i);
       }
+    };
+    if (ex == kAll) {
+      for (unsigned l = 0; l < 32; ++l) lane(l);
+    } else {
+      for (Mask m = ex; m; m &= m - 1) lane(static_cast<unsigned>(std::countr_zero(m)));
     }
   });
   if (!moved) {
@@ -1162,13 +1167,18 @@ static void h_local(void* vc, const tier::MOp& op, Mask ex) {
   const uint32_t* base = ra != kRZ ? c.R + ra * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
   const uint64_t imm = static_cast<uint64_t>(op.imm);
-  uint64_t addrs[32] = {};
+  uint64_t addrs[32];
   exec::LocalWindowCheck window;
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+  const auto lane_address = [&](unsigned l) {
     const uint64_t off = static_cast<uint32_t>((base ? base[l] : 0) + urv + imm);
     addrs[l] = off;
     window.add(off);
+  };
+  if (ex == kAll) {   // a full warp: a counted loop
+    for (unsigned l = 0; l < 32; ++l) lane_address(l);
+  } else {
+    for (unsigned l = 0; l < 32; ++l) addrs[l] = 0;   // (the lanes that do not run read as zero, as the counting functions find them)
+    for (Mask m = ex; m; m &= m - 1) lane_address(static_cast<unsigned>(std::countr_zero(m)));
   }
   const bool inside = window.inside(w.local_size, bytes, ex != 0);
   if (!inside) {
@@ -1180,16 +1190,21 @@ static void h_local(void* vc, const tier::MOp& op, Mask ex) {
   const unsigned words = std::max(1u, bytes / 4);
   const bool moved = with_lane_width(bytes, [&](auto width) {
     constexpr unsigned B = decltype(width)::value;
-    for (Mask m = ex; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    const auto lane = [&](unsigned l) {
       uint8_t* at = &w.local[size_t{l} * w.local_size + addrs[l]];
       if (Store) {
         store_lane_bytes<B>(at, [&](unsigned i) -> uint32_t { return d ? d[32 * i + l] : 0u; });
       } else if (d) {
-        if constexpr (B <= 4) d[l] = tier_extend(op.b, load_lane_word<B>(at));
+        if constexpr (B == 4) d[l] = load_lane_word<B>(at);
+        else if constexpr (B < 4) d[l] = tier_extend(op.b, load_lane_word<B>(at));
         else
           for (unsigned i = 0; i < B / 4; ++i) d[32 * i + l] = load_lane_word<B>(at, i);
       }
+    };
+    if (ex == kAll) {
+      for (unsigned l = 0; l < 32; ++l) lane(l);
+    } else {
+      for (Mask m = ex; m; m &= m - 1) lane(static_cast<unsigned>(std::countr_zero(m)));
     }
   });
   if (!moved) {
