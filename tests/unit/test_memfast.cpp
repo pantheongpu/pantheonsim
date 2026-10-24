@@ -723,6 +723,28 @@ VTEST(batch_calls_do_what_one_by_one_calls_do_or_decline_untouched) {
   VCHECK(declined > 500);
 }
 
+VTEST(a_batch_declines_where_a_host_mapping_covers_one_of_its_addresses) {
+  // Mapped host memory over part of an allocation is read and written in place, not in the chunks: a batch with an address in it
+  // is the one-by-one calls' to make, and one without is not held up by the map.
+  MemoryManager mm(1ull << 28);
+  const uint64_t p = mm.alloc(1 << 16);
+  std::vector<uint32_t> host(1024, 7);
+  mm.map_host(p + 4096, host.data(), 4096);
+  uint64_t out[4] = {9, 9, 9, 9};
+  const uint64_t vals[4] = {1, 2, 3, 4};
+  const uint64_t over[4] = {p, p + 8, p + 4096 + 16, p + 64};
+  VCHECK(!mm.load_batch(over, 4, 4, out));
+  VCHECK(!mm.store_batch(over, 4, 4, vals));
+  VCHECK_EQ(out[2], 9u);
+  VCHECK_EQ(host[4], 7u);
+  const uint64_t beside[3] = {p, p + 8, p + 8192};
+  VCHECK(mm.load_batch(beside, 3, 4, out));
+  VCHECK(mm.store_batch(beside, 3, 4, vals));
+  VCHECK_EQ(mm.load_scalar(p + 8192, 4), 3u);
+  VCHECK_EQ(mm.load_scalar(p + 4096 + 16, 4), 7u);
+  mm.unmap_host(p + 4096);
+}
+
 VTEST(fill_with_a_repeating_pattern_is_the_pattern_at_every_offset) {
   // fill() repeats a pattern of any length from the phase the range starts at: compare it with
   // the byte-by-byte definition over lengths, phases and chunk boundaries.
