@@ -4128,3 +4128,90 @@ unit test against the per-lane code). The dot2 NaN lanes are unchanged.
 * Trampolines for the vector memory instructions the tier has no handler for (buffer, flat, scratch, LDS, atomics) through the Machine's functions without
   step()'s frame: no measurable gain on mem, flat, buf, ldsx (p > 0.05); dropped.
 * NaN lanes of `v_min/max_f32` (MODE.IEEE decides) and the dot2 NaN lanes stay with the interpreter.
+
+## The AMD engine: whole-wave memory accesses (branch `sp-amdmem`, the `speedup` round)
+
+The memory instructions of the AMD engine went to the memory manager a lane at a time: every lane of a gather, a buffer access or an atomic looked up its allocation
+(`lookups()` and the table behind it), asked `HostMaps::may_contain`, and made its own `load_scalar` / `store_scalar` (an atomic made two, one for the load and one
+for the store). The profile of `buf` was `load_scalar` 25%, `store_scalar` 18%, `buffer_access` 20%, `load_words` 7%, `may_contain` 4%; of `atomics`, the lookup
+chain in `Machine::atomic_rmw` and `global_access` 47%. Now a wave's accesses go to the memory manager together wherever the manager can take them as the calls
+they stand for, and decline (having done nothing) wherever it cannot, so the lanes then go one at a time and meet any error where they would.
+
+Measured on server3 (Ryzen 7 PRO 8840U, one SMT sibling of one core, the machine at a 1-minute load of 30 to 130 from other builds), Release, GCC 13.3, simulated
+MI300X and RX 6800, one host thread, `tools/bench-amd` A/B against `d8ec6128`, 11 alternating runs; ratios are B/A of the median (the best-of ratio agrees within
+3% in every row). Every row's counters are identical, and `bench-amd --check-counters` matches (37 pairs). The A/A control of the same harness (base against the
+same base, 9 runs) gave medians between 0.964 and 1.044 (`memcpy` mi300x 0.964, `ldsx` rx6800 1.044, the rest within 2%).
+
+| workload | what it runs | mi300x | rx6800 |
+| --- | --- | ---: | ---: |
+| `buf` | buffer dword loads and stores, some past the end | **2.74x** | **2.37x** |
+| `narrow` | byte and short global loads and stores | **1.78x** | **1.70x** |
+| `mem` | 16-byte copy, scalar scale, gather | **1.58x** | **1.36x** |
+| `lds` | tree reduction and tile transpose (global rows, LDS words) | **1.45x** | **1.27x** |
+| `flat` | generic pointers that reach global memory | **1.33x** | **1.16x** |
+| `atomics` | global atomic add, max, CAS loop | **1.23x** | **1.24x** |
+| `ldsx` | wide LDS accesses and LDS atomics | 1.13x | 1.05x (p 0.065, same) |
+| `smem`, `memcpy`, `stream` | not changed | 1.00, 1.00, 1.00 | 0.99, 0.99, 1.00 |
+| `valu_int`, `launch` (controls) | not changed | 0.99, 1.01 | 0.99, 0.99 |
+
+p < 0.001 for every "faster" row. Eight host threads were not measured (the benchmark is pinned to one CPU on this host); the threaded atomics path is held by the
+tests below, in Release and under ThreadSanitizer.
+
+NVIDIA: the SASS and PTX engines share `batch_ok` / `load_batch` / `store_batch`, which got the one-pass test below. `tools/bench` A/B, 9 runs, counters
+identical in every row: `mem` ptx 1.04x (p 0.004), the rest of mem, shared, atomics, texture, local, int_alu, divergent and warp within 2.5% of the base,
+`atomics` ptx 0.97x on a 85 ms workload whose spread is 11 to 17% (p 0.006, best-of 0.985; not beyond the harness's 2% on both).
+
+### What changed
+
+* **`MemoryManager::batch_ok`** (`src/core/memory.cpp`) makes one pass over the addresses for the three tests every access must pass (alignment by the OR of the
+  addresses, inside the first access's allocation by the largest offset, and no host mapping in reach by `HostMaps::may_overlap(lowest, highest)`, which rules a
+  range wholly inside the device windows out as one address, and otherwise asks `may_contain` of each as before). `load_batch` takes the width as a constant.
+* **A wave's gather or scatter** (`Machine::wave_scalars`, called from `tier_global` in `gcn_tier_machine.inc` and from `global_access`): the active lanes that
+  make no run (or the lanes after the run that ended) are one `load_batch` / `store_batch` of bytes, shorts, words or pairs; lanes of a load after a lane with the
+  same address take its value (the load memo's rule).
+* **Buffer dword loads and stores** (`Machine::buffer_words`): the wave's addresses and whether each is inside the resource, then the lanes inside as one batch; the
+  lanes outside read zero or write nothing, as before. `fits` moved out of the lane loop (it reads `index`, now declared before it).
+* **Contiguous runs** (`Machine::memory_run`): the run is found from the address registers' rows (the lane limit from EXEC at once, a 64-bit compare per lane),
+  and a run of one word a lane in a vector register is moved straight to or from the register's row (`load_run` into the row, `store_run` from it); two and four
+  words a lane are transposed row by row.
+* **Atomics** (`MemoryManager::rmw_batch`, `Machine::wave_atomics`): a wave's atomics are one call, lane by lane in order, with one lookup for the lot: the plain
+  load and store-if-changed on one thread, the compare-and-swap of `atomic_rmw` (one `atomic_rmw_slot` per lane, the loop that was `atomic_rmw_fn`'s) across
+  threads. The old values go to the destination register after the call, or, for the lanes made before a store that could not get host memory, before the error
+  leaves. A single atomic (`Machine::atomic_rmw`, the fallback and the scalar and buffer forms) uses `MemoryManager::rmw_if_changed` on one thread: the load, the
+  operation and the store of a changed result at the word `hot_location` finds, without a second lookup. The data and the old value are read and written in the
+  register rows.
+* **`h_ds`** (the tier's LDS handler): the bounds test of the lanes is branch-free and `ds_read_b32` / `ds_write_b32` have loops of their own (the other widths
+  keep the general one).
+
+### Tests (all wired in CMake; each shown to fail under the mutation next to it, built and run on server3)
+
+| test | what it holds | mutations that fail it |
+| --- | --- | --- |
+| `test_amd_gcn_memory_same_bits`, new `the_wave_wide_memory_paths_give_the_bits_lane_by_lane_gives` | every memory shape of the eight ISA corpora (DS, global, flat, buffer, scalar) in the twelve address modes, with half the lanes off in some: digest with the whole-wave paths on against off (`amd::set_fast_paths`), with no recording to trust | batch stores in reverse lane order (181 of 16068 instructions differ); narrow batch loads not sign-extended (114); buffer lanes outside the resource keep their register (28); atomics do not give the old value back (77); each also fails the recorded-digests test |
+| `test_amd_gcn_memruns` (existing) | runs of lanes against lane by lane, 18 address patterns and 7 masks, 7 kernels, 5 targets | the run reaches across lanes that are off (`copy32s`, mask 1); a load run one lane late (every pattern) |
+| `test_memrmw`, new `a_wave_of_atomics_as_a_batch_matches_the_same_accesses_one_at_a_time`, `..._declines_with_faults_armed_or_stuck_cells`, `a_single_thread_atomic_stores_only_a_changed_word_and_only_in_a_real_chunk`, and `changed_new`/`changed_old` in the random run | `rmw_batch` (plain and lock-free) and `rmw_if_changed` against the calls they stand for: 24 000 batches of 1 to 64 accesses of 1, 2, 4 and 8 bytes (repeats, chunk and allocation edges, misaligned, other allocations, host memory, uniform, real and untouched chunks, an operation that throws), values, errors and the accesses made before them, memory, chunks made real after every round; declines with faults armed | the plain batch stores an unchanged result (chunks made real differ, round 7); the lock-free batch stores always (round 0); `rmw_if_changed` ignores an armed fault |
+| `test_memfast`, new `a_batch_declines_where_a_host_mapping_covers_one_of_its_addresses`, mode 10 of the batch fuzz (a misaligned lane inside the allocation) | `batch_ok`'s three tests | host-map test removed; alignment test removed (`MisalignedAccess` out of the reference call); allocation-bound test removed (segmentation fault) |
+| `test_amd_gcn_tier_same_bits` (existing, `VGPU_TIER_ONLY=ds_write`) | the tier's handlers against the interpreter | `ds_write_b32` with the second offset (21 of 1140 runs differ) |
+
+Also run on this tree, Release: `test_amd_gcn_same_bits` (and the `simd_base` twin), `_packed_`, `_tier_`, `_memory_`, `test_amd_codeobject_same_bits`,
+`test_amd_matrix_fast`, `test_amd_mfma_math`, `test_amd_nan_order`, `test_amd_gcn_memruns` (five targets), `test_amd_gcn_atomics` (four), `test_memfast`, `test_memory`,
+`test_memrmw`, `test_memrmw_lockfree`, `test_atom_rmw`, `test_memalloc`, `test_memcount_forms`, `test_sass_access_count`, and the AMD execution tests (89 of 89:
+`test_amd_gcn_{exec,memory,bytes,int64,mixed,half,calls,builtins,packed,spill,crosslane,doubles,divide,narrow,lds,idioms,asm,cdna_gaps,abandon,threads,counters,mem_facts,globals,grid,ops}`
+on every target they have, `test_amd_hostcall`, `test_amd_hip_queue`). `e2e_sass_tier` and `e2e_sass_archs` skip on server3 (no nvcc): not run.
+
+### Not done, and negative results
+
+* **Wide scalar loads as one `load_run`** (`s_load_dwordx2` .. `x16`): `smem` 1.015x (p 0.30) on the MI300X and 1.038x (p 0.11) on the RX 6800; that workload is the
+  scalar ALU's, `load_scalar` is 1.4% of it. Dropped.
+* **`OpName::operator==` with the hash test inline and the text test out of line** (so the compare is small enough to be inlined at its uses): `lds` rx6800 1.038x and `flat`
+  mi300x 1.041x (p < 0.001), the other fourteen rows of `lds`, `ldsx`, `mem`, `flat`, `valu_int`, `divergent`, `wave`, `buf` the same. Dropped: a gain under 4% in two rows,
+  and a change of no behaviour, which no test can fail.
+* **A single atomic through `rmw_scalar`'s `rmw_locate`** (the first version of the one-lookup atomic): `atomics` mi300x 0.948x (p 0.05), rx6800 1.004x, slower than the two
+  calls: `rmw_locate` is out of line and checks the faults, the maps and the allocation on its own. `rmw_if_changed` on `hot_location` measured 1.058x / 1.046x before the
+  batch (and the batch is what is kept for a wave).
+* **`HostMaps::may_overlap`** is conservative where the maps' range and the addresses' range overlap (each address is then asked, as before): a program with a pinned
+  buffer whose range spans the device windows (`in_device_window` set) gets no gain from it.
+* **Not batched**: buffer atomics, byte and short buffer accesses, formatted (MTBUF) accesses, dwordx3 and dwordx4 gathers (a dwordx4 is one 16-byte access each, which
+  `load_batch` is not), anything with peers attached, a load after a run that read the lane's address (the load memo), and every access that reaches LDS or private memory
+  through a flat address.
+* **Bench noise**: the pinned CPU's sibling was idle, but the host's load was 30 to 130 throughout; a run of 9 to 11 alternating pairs held the medians within 2% (A/A above).
