@@ -1,0 +1,292 @@
+name: Skipped tests weekly
+
+# Tests that skip in every pull request job because the software they check
+# against is in no CI image. They run here, once a week and by hand, on GitHub's
+# hosted runners, each job installing what its tests need. Nothing here gates a
+# pull request.
+#
+# A test that skips fails its job (ci/ctest-no-skips.sh), unless it is named in
+# that job's ALLOW: a skip that nobody chose is a test that silently stopped
+# running, and the point of this workflow is that they run. Every ALLOW below is
+# empty ('^$'); add a test to it only with the reason, as ci.yml does for its
+# RUNNER_SKIPS_OK.
+#
+#   rocm-profiler  ROCm 7.2.0's rocprofv3, hipcc, rocprofiler-sdk and its headers and
+#                  samples: the 36 amd_rocprof_* tests (the simulated RX 6800 and RX 6700 XT
+#                  against what the real cards recorded, in amd/tests/data), amd_rocprofv3,
+#                  amd_rocprofiler_abi, amd_rocprofiler_pcsampling and bench_amd_counters.
+#                  It must be 7.2.0: the recordings are from rocprofv3 1.1.0 of that release and
+#                  tools/bench-amd/expected is keyed by hipcc 7.2.26015.
+#   rvs            ROCm Validation Suite 7.2.0 (amd_rvs).
+#   cuda-extras    CUDA 13.0 with nvJitLink, Open MPI, NVIDIA's NVSHMEM wheel: e2e_nvshmem_device,
+#                  e2e_nvshmem_bootstrap, e2e_cutensornet_mpi, e2e_fft_lto_callbacks.
+#   jit            Numba and Triton (e2e_jit_frameworks).
+#   cuda-132       CUDA 13.2, whose headers and ptxas two tests need: e2e_runtime_132,
+#                  e2e_packed_int_forms.
+#   cutlass        CUTLASS's Blackwell tests, its FMHA example and CuTe's tensormap.replace, which
+#                  need CUDA 12.8 to 12.9 or later and hours of nvcc each: ci.yml runs sm100 and
+#                  sm120 only when started by hand with cutlass_sass, and the other four nowhere.
+#
+# Not here: amd_opencl (rocm-libraries.yml runs it), e2e_cupti_compat12 (the CUDA 12.4 and 12.8
+# legs of cuda-toolkits.yml), e2e_nvprof (ci.yml's CUDA 12.0 image has nvprof), amd_vllm*
+# (vllm-nightly.yml), e2e_pytorch_*_full (pytorch-sweep-nightly.yml), the ollama tests (ci.yml).
+
+on:
+  schedule:
+    - cron: "29 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Jobs to run: a word from their ids, such as rocm, rvs, cuda-extras, jit, cuda-132 or cutlass (all if empty)"
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The ROCm release the rocprofv3 recordings were made with: the 7.2 repository is 7.2.0.
+  ROCM_REPO_RELEASE: "7.2"
+  ROCM_PREFIX: /home/runner/rocm/opt/rocm-7.2.0
+
+jobs:
+  rocm-profiler:
+    name: rocprofv3, hipcc and rocprofiler-sdk (ROCm 7.2.0)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.jobs == '' || contains(inputs.jobs, 'rocm') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+      - name: Install the toolchain
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build python3 \
+            libnuma1 libdrm2 libdrm-amdgpu1 libelf1 libtinfo6 zlib1g libzstd1
+      - name: Unpack ROCm 7.2.0
+        # rocprofv3 and the profiler tool (rocprofiler-sdk), hipcc with its compiler and HIP's and
+        # HSA's headers, and the SDK's samples for the PC sampling test.
+        run: |
+          amd/tests/e2e/fetch_rocm_release.sh "$HOME/rocm" "$ROCM_REPO_RELEASE" \
+            hipcc hip-dev hsa-rocr-dev rocprofiler-sdk rocprofiler-sdk-roctx rocprofiler-sdk-rocpd
+          "$ROCM_PREFIX/bin/rocprofv3" --version | head -3
+          "$ROCM_PREFIX/bin/hipcc" --version | head -2
+      - name: Build the simulator's AMD side
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpu_cli vgpuhip vgpursmi vgpuamdsmi vgpurocprof
+      - name: The profiler tests
+        env:
+          VGPU_ROCM_PATH: ${{ env.ROCM_PREFIX }}
+          VGPU_BUILD_DIR: ${{ github.workspace }}/build
+          ALLOW: '^$'
+        run: |
+          ci/ctest-no-skips.sh build "$ALLOW" -j"$(ci/jobs.sh -g 3 -m 2)" \
+            -R '^(amd_rocprof_.*|amd_rocprofv3|amd_rocprofiler_abi|amd_rocprofiler_pcsampling|bench_amd_counters)$'
+
+  rvs:
+    name: ROCm Validation Suite (ROCm 7.2.0)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.jobs == '' || contains(inputs.jobs, 'rvs') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+      - name: Install the toolchain
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build python3 \
+            libnuma1 libdrm2 libdrm-amdgpu1 libelf1 libtinfo6 zlib1g libzstd1 libpci3 libyaml-cpp0.8
+          # RVS runs inside an isolated session, which needs user namespaces; 24.04 restricts them.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Unpack ROCm 7.2.0's validation suite, with rocBLAS and hipBLASLt
+        run: |
+          amd/tests/e2e/fetch_rocm_release.sh "$HOME/rocm" "$ROCM_REPO_RELEASE" rocm-validation-suite
+          test -x "$ROCM_PREFIX/bin/rvs"
+      - name: Build the simulator's AMD side
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)" --target vgpu_cli vgpuhip vgpursmi vgpuamdsmi
+      - name: RVS
+        env:
+          VGPU_ROCM_PATH: ${{ env.ROCM_PREFIX }}
+          VGPU_BUILD_DIR: ${{ github.workspace }}/build
+          ALLOW: '^$'
+        run: ci/ctest-no-skips.sh build "$ALLOW" -R '^amd_rvs$'
+
+  cuda-extras:
+    name: CUDA 13.0 with nvJitLink, Open MPI and NVSHMEM
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.jobs == '' || contains(inputs.jobs, 'cuda-extras') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+      - name: Install CUDA 13.0, nvJitLink and Open MPI
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates \
+            python3-venv openmpi-bin libopenmpi-dev
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
+            cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
+            libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0 \
+            libnvjitlink-13-0 libnvjitlink-dev-13-0 cuda-profiler-api-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+      - name: NVSHMEM's headers and device library
+        # The tests look for NVSHMEM_HOME, or the nvidia.nvshmem package of the python3 on PATH.
+        run: |
+          python3 -m venv "$HOME/nvvenv"
+          "$HOME/nvvenv/bin/pip" install -q nvidia-nvshmem-cu13
+          echo "$HOME/nvvenv/bin" >> "$GITHUB_PATH"
+          "$HOME/nvvenv/bin/python" -c 'import os, nvidia.nvshmem as m; d = os.path.dirname(m.__file__); print(d); assert os.path.exists(d + "/include/nvshmem.h") and os.path.exists(d + "/lib/libnvshmem_device.a")'
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)"
+      - name: The tests
+        env:
+          ALLOW: '^$'
+        run: |
+          ci/ctest-no-skips.sh build "$ALLOW" \
+            -R '^(e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cutensornet_mpi|e2e_fft_lto_callbacks)$'
+
+  jit:
+    name: Numba and Triton
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.jobs == '' || contains(inputs.jobs, 'jit') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+      - name: Install CUDA 13.0
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates python3-venv
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
+            cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
+            libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+      - name: Numba and Triton
+        # Neither uses cudart; both reach the simulated driver. numba-cuda's cu13 extra brings the
+        # NVVM and NVRTC wheels Numba compiles with.
+        run: |
+          python3 -m venv "$HOME/jitvenv"
+          "$HOME/jitvenv/bin/pip" install -q numba "numba-cuda[cu13]" triton
+          "$HOME/jitvenv/bin/python" -c 'import numba, triton; print(numba.__version__, triton.__version__)'
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)"
+      - name: The test
+        env:
+          VGPU_PY: /home/runner/jitvenv/bin/python
+          ALLOW: '^$'
+        run: ci/ctest-no-skips.sh build "$ALLOW" -R '^e2e_jit_frameworks$'
+
+  cuda-132:
+    name: CUDA 13.2
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.jobs == '' || contains(inputs.jobs, 'cuda-132') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+      - name: Install CUDA 13.2
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cuda-nvcc-13-2 cuda-cudart-dev-13-2 cuda-crt-13-2 cuda-nvml-dev-13-2 cuda-cupti-dev-13-2 \
+            cuda-nvrtc-dev-13-2 libcublas-dev-13-2 libcufft-dev-13-2 libcurand-dev-13-2 \
+            libcusparse-dev-13-2 libnvjpeg-dev-13-2 libcusolver-dev-13-2 libnpp-dev-13-2 cuda-profiler-api-13-2
+          echo "/usr/local/cuda-13.2/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.2" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          nvcc --version | tail -2
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)"
+      - name: The shim follows 13.2
+        run: grep -qE 'define CUDART_VERSION +13020' "$CUDA_HOME/include/cuda_runtime_api.h"
+      - name: The tests
+        env:
+          ALLOW: '^$'
+        run: ci/ctest-no-skips.sh build "$ALLOW" -R '^(e2e_runtime_132|e2e_packed_int_forms)$'
+
+  cutlass:
+    name: ${{ matrix.test }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.jobs == '' || contains(inputs.jobs, 'cutlass') }}
+    runs-on: ubuntu-24.04
+    # Each compiles CUTLASS's tests with nvcc, one to two hours on this runner (the ctest
+    # timeouts in CMakeLists.txt are 5400 s and, for the convolutions, 7200 s).
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - e2e_cutlass_sm100
+          - e2e_cutlass_sm100_conv
+          - e2e_cutlass_sm103
+          - e2e_cutlass_sm120
+          - e2e_cutlass_fmha
+          - e2e_tensormap_replace_cute
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+      - name: Install CUDA 13.0
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends build-essential cmake ninja-build wget ca-certificates
+          wget -qO /tmp/keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-crt-13-0 cuda-nvml-dev-13-0 cuda-cupti-dev-13-0 \
+            cuda-nvrtc-dev-13-0 libcublas-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0 \
+            libcusparse-dev-13-0 libnvjpeg-dev-13-0 libcusolver-dev-13-0 libnpp-dev-13-0
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)"
+      - name: The test
+        env:
+          TEST: ${{ matrix.test }}
+          ALLOW: '^$'
+        run: ci/ctest-no-skips.sh build "$ALLOW" -R "^${TEST}\$"

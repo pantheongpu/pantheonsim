@@ -1479,7 +1479,11 @@ int cmd_rocm_smi(const std::vector<std::string>& args) {
       return 0;
     }
     if (a == "--version") {
-      std::printf("ROCm SMI version: VirtualGPU 0.1.0\n");
+      #ifdef VGPU_VERSION
+      std::printf("ROCm SMI version: VirtualGPU %s\n", VGPU_VERSION);
+#else
+      std::printf("ROCm SMI version: VirtualGPU\n");
+#endif
       return 0;
     }
     if (a == "-a" || a == "--showallinfo") all = true;

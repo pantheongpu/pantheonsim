@@ -83,11 +83,34 @@ jobs:
         # this one. Print it so a broken detection is visible in the log.
         run: ls build/shim/
 
+      - name: Which nvcc builds the CUTLASS tests
+        # Part of the cache key below, so a toolchain update starts a new directory
+        # instead of leaving the old key to hit forever with binaries nobody can use.
+        id: nvcc_version
+        run: echo "v=$(nvcc --version | sed -n 's/.*release \([0-9.]*\).*V\([0-9.]*\)/\1-\2/p')-$(g++ -dumpversion)" >> "$GITHUB_OUTPUT"
+
+      - name: CUTLASS test binaries, from the cache
+        # e2e_cutlass_hopper and e2e_cutlass_gemm are nvcc compiles (about
+        # 2000 s of their 2200 s, an estimate) of programs that do not depend
+        # on the simulator; the tests still run every binary against it. Each
+        # binary's file name carries a hash of all its inputs (cutlass_nvcc in
+        # nvidia/tests/e2e/cutlass_fetch.sh), so a restored directory never
+        # supplies a binary built from other inputs: it is only not found.
+        # The key below just decides when a new directory is worth saving.
+        id: cutlass_bin
+        uses: actions/cache/restore@v4
+        with:
+          path: cutlass-bin-cache
+          key: cutlass-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.nvcc_version.outputs.v }}-${{ hashFiles('nvidia/tests/e2e/cutlass_fetch.sh', 'nvidia/tests/e2e/run_cutlass_hopper.sh', 'nvidia/tests/e2e/run_cutlass_gemm.sh') }}
+
       - name: Unit and end-to-end tests
+        env:
+          VGPU_CUTLASS_BIN_CACHE: ${{ github.workspace }}/cutlass-bin-cache
         # The ML tests are the ml job's: on the runner whose image has PyTorch
         # and rocBLAS they would run here too, and take an hour.
         # -j2 (fewer on a machine with under 12 GiB free, ci/jobs.sh): the two
-        # CUTLASS tests are 2200 s of this step's 3200 s (run 38424481981) and
+        # CUTLASS tests were 2200 s of this step's 3200 s (run 38424481981,
+        # before the binary cache above) and
         # use one core for their nvcc compiles, so the other tests run beside
         # them. The CUTLASS, CuTe and heavy nvcc tests take the nvcc_memory lock
         # (CMakeLists.txt), so only one of them sizes its compiles from the free
@@ -95,6 +118,15 @@ jobs:
         # so the lock chain overlaps the rest. The ml job below runs the other
         # tests at -j2 already.
         run: ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
+
+      - name: Keep the CUTLASS test binaries
+        # Only after every test passed, so the directory holds both tests'
+        # binaries, and only when the restore missed (a key cannot be rewritten).
+        if: success() && steps.cutlass_bin.outputs.cache-hit != 'true' && hashFiles('cutlass-bin-cache/*') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: cutlass-bin-cache
+          key: ${{ steps.cutlass_bin.outputs.cache-primary-key }}
 
   workloads:
     name: pantheon workloads

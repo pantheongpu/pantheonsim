@@ -72,11 +72,11 @@ u="$cutlass/test/unit"
 jobs=$(cutlass_compile_jobs ${#tests[@]})
 compile() {
   local name="$1" arch="$2"
-  nvcc -std=c++17 -O1 -cudart shared -arch="$arch" -code="$(cutlass_code "$arch")" --expt-relaxed-constexpr \
+  cutlass_nvcc "$work/$name" -std=c++17 -O1 -cudart shared -arch="$arch" -code="$(cutlass_code "$arch")" --expt-relaxed-constexpr \
        -DCUTLASS_TARGET_NAME="\"$name\"" \
        -I "$cutlass/include" -I "$cutlass/tools/util/include" -I "$u/common" -I "$u" -I "$cutlass/test" \
        -I "$gtest/googletest/include" "$u/gemm/device/$name.cu" "$u/test_unit.cpp" \
-       "$u/common/filter_architecture.cpp" "$gtest/libgtest.a" -o "$work/$name" >"$work/$name.log" 2>&1
+       "$u/common/filter_architecture.cpp" "$gtest/libgtest.a" >"$work/$name.log" 2>&1
 }
 for ((first = 0; first < ${#tests[@]}; first += jobs)); do
   pids=()
@@ -92,6 +92,7 @@ for ((first = 0; first < ${#tests[@]}; first += jobs)); do
     fi
   done
 done
+echo "compiled: $(( ${#tests[@]} - $(ls "$work"/*.cached 2>/dev/null | wc -l) )) of ${#tests[@]}; the rest came from the build cache"
 fail=0
 for entry in "${tests[@]}"; do
   IFS='|' read -r name _ gpu filter <<<"$entry"

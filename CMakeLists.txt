@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pantheonsim VERSION 0.1.0 LANGUAGES C CXX)
+project(pantheonsim VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -1230,6 +1230,8 @@ add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cl
                src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp
                src/cli/config.cpp src/cli/config_cmd.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
+# The one place the version is written is project() above; `vgpu --version` and `rocm-smi --version` print it.
+target_compile_definitions(vgpu_cli PRIVATE VGPU_VERSION="${PROJECT_VERSION}")
 set_target_properties(vgpu_cli PROPERTIES OUTPUT_NAME vgpu)
 # Drop-in monitoring commands. On a CPU-only machine nvidia-smi / rocm-smi /
 # rocm_agent_enumerator do not exist at all, so VirtualGPU supplies them; they
@@ -3560,6 +3562,8 @@ set_tests_properties(lint_hip_tests_runner PROPERTIES TIMEOUT 120)
 # The "workloads failing on main" issue (ci/track-workloads-issue.sh) against a fake
 # gh: a failure opens or updates it, a pass closes it, a cancelled run touches nothing.
 add_test(NAME lint_workloads_issue COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_workloads_issue.sh)
+# The version in CMakeLists.txt is the newest entry of CHANGELOG.md, and no source file writes a version of its own.
+add_test(NAME lint_version COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_version.sh)
 set_tests_properties(lint_workloads_issue PROPERTIES TIMEOUT 120)
 
 # Copies and fills with a shape in graphs, and the async copies a capture has to
@@ -4111,8 +4115,10 @@ foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopp
   endif()
 endforeach()
 # Under `ctest -j` the tests holding that lock form a chain, and the two CUTLASS
-# tests are most of it (about 1200 s and 1000 s in the build job; every other
-# test is under 120 s). ctest starts tests in cost order (by number when it has
+# tests are most of it (about 1200 s and 1000 s in the build job when they compile
+# every binary; the build job's cache of those binaries, VGPU_CUTLASS_BIN_CACHE
+# in cutlass_fetch.sh, leaves them the run time; every other test is under
+# 120 s). ctest starts tests in cost order (by number when it has
 # no history, which a fresh CI checkout has not), so with these two last in the
 # order they would start only after everything else had finished and the
 # chain could overlap nothing. A cost starts them first: the lock chain then
