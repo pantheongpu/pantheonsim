@@ -38,7 +38,7 @@ const std::vector<uint32_t> kWriteIndexed = {
 const std::vector<uint32_t> kStoreGroupId = {
     0xC0060100, 0x00000000,   // s_load_dwordx2 s[4:5], s[0:1], 0x0
     0xBF8CC07F,               // s_waitcnt lgkmcnt(0)
-    0x8F068202,               // s_lshl_b32 s6, s2, 2
+    0x8E068202,               // s_lshl_b32 s6, s2, 2
     0x80040604,               // s_add_u32 s4, s4, s6
     0x82058005,               // s_addc_u32 s5, s5, 0
     0x7E040204,               // v_mov_b32 v2, s4
