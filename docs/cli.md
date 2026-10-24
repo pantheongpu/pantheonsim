@@ -24,6 +24,7 @@ Settings you use every time can live in a file (`pantheonsim.yaml`, written by
 | `vgpu config show\|init\|keys` | The settings file: what is in effect, a commented starter file, the list of keys. See [config.md](config.md). |
 | `vgpu shell` | An interactive simulated machine: `nvidia-smi`, `rocm-smi`, `lspci` and `dmesg` all answer for the GPUs you picked. [Options](#vgpu-shell). |
 | `vgpu test --matrix <program> [args...]` | Run a program on every device profile and compare the results. [Options](#vgpu-test---matrix). |
+| `vgpu check [options] <program> [args...]` | Run a program on this machine's real NVIDIA card and on the simulator, and compare. [Options](#vgpu-check). |
 | `vgpu ncu [options] <program> [args...]` | Nsight Compute's command line, answered from the simulator's exact counters. [Options](#vgpu-ncu). |
 | `vgpu counters` | What performance counters are reported, and which cannot be and why. |
 | `vgpu debug [-x FILE] -- <program>` | Run an AMD program under the kernel debugger. [Commands](#vgpu-debug). |
@@ -115,6 +116,42 @@ Exit status: `0` every profile matched the baseline; `1` `vgpu` itself failed
 (an unknown profile name, say); `2` usage error; `3` results differ; `4` the
 program did not run on the baseline profile, so there is nothing to compare
 against.
+
+## `vgpu check`
+
+```
+vgpu check [options] <program> [args...]
+```
+
+Runs the program on the real GPU of this machine (NVIDIA's own libraries) and on the simulator, with the profile of that same card,
+and compares what it printed. It audits the simulator: nothing in the launch path changes. Build the program with the shared runtime
+(`nvcc -cudart shared`) so `vgpu run` can put the simulator's `libcudart` in front of the real one on the simulated side.
+
+The card is run twice first. Lines that differ between those two runs are the card's own noise (a time-seeded random number, an
+uninitialised value) and are left out of the comparison, and the report says how many. Timing lines are dropped; lines that name the
+machine (device banner, driver and runtime versions) are compared apart, so a `Driver Version` difference is reported as an identity
+difference and not as a different answer. A line that states an outcome (`PASSED`, `FAILED`, `error`) is never dropped as a timing line;
+its numbers are masked instead. `--show-ignored` lists every dropped and set-aside line.
+
+| Option | Meaning |
+| --- | --- |
+| `--gpu <vendor/model>` | The profile to simulate. Default: the one whose model is the card's name. |
+| `--allow-cross` | Compare even when the profile is not the card. The two are then different machines, and the report says so. |
+| `--card <name>` | The card's name, when `nvidia-smi` cannot be used. |
+| `--native-runs <n>` | Runs on the card. Default 2; 1 skips the noise check. |
+| `--sim-runs <n>` | Runs on the simulator. Default 1; 2 also checks that it repeats. |
+| `--timeout <s>` | Per run. Default 600. |
+| `--tolerance <rel>` | Accept numbers within this relative difference. Default 0: any different digit is a difference. |
+| `--file <path>` | Also compare a file the program writes, byte for byte. Repeatable. |
+| `--show-diff` | Print the first differing pair of lines. |
+| `--show-ignored` | List the lines dropped as timing and the lines compared apart as identity. |
+
+Exit status: `0` the simulator agrees with the card; `1` `vgpu` itself failed; `2` usage error; `3` the outputs, exit codes or files differ;
+`4` the program did not run on the card (so there is nothing to compare); `5` inconclusive, the card's two runs cannot be lined up;
+`6` no usable card, or the profile is not that card.
+
+What it cannot tell: a data race or an uninitialised read gives one valid answer on the card and another in the simulator, and a
+program that prints only `Test passed` hides every number behind it. A match means "printed the same", not "computed the same bits".
 
 ## `vgpu shell`
 

@@ -45,6 +45,8 @@ int usage(FILE* to) {
                "                                       breakpoints, stepping, registers (vgpu debug --help)\n"
                "  vgpu test --matrix <program> [args]  Run a program on every device profile and\n"
                "                                       compare the results (vgpu test --help)\n"
+               "  vgpu check <program> [args]         Run a program on this machine's real NVIDIA card and\n"
+               "                                       on the simulator, and compare (vgpu check --help)\n"
                "  vgpu fault inject|arm|stuck|lose|... Inject faults: ECC, PCIe, hangs, a lost GPU,\n"
                "                                       a degraded link (vgpu fault --help)\n"
                "  vgpu regs list|read|write|dump|log   A device's registers: PCI configuration\n"
@@ -233,6 +235,8 @@ int cmd_run(const std::vector<std::string>& args);
 int cmd_debug(const std::vector<std::string>& args);
 // Implemented in test.cpp.
 int cmd_test(const std::vector<std::string>& args);
+// Implemented in check.cpp.
+int cmd_check(const std::vector<std::string>& args);
 // Implemented in ncu.cpp.
 int cmd_ncu(const std::vector<std::string>& args);
 // Implemented in config_cmd.cpp: `vgpu config`, and the settings file (see docs/config.md).
@@ -265,6 +269,7 @@ int main(int argc, char** argv) {
     if (cmd == "run") return cmd_run({args.begin() + 1, args.end()});
     if (cmd == "debug") return cmd_debug({args.begin() + 1, args.end()});
     if (cmd == "test") return cmd_test({args.begin() + 1, args.end()});
+    if (cmd == "check") return cmd_check({args.begin() + 1, args.end()});
     if (cmd == "ncu") return cmd_ncu({args.begin() + 1, args.end()});
     if (cmd == "info") {
       std::string gpu;
