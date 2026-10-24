@@ -916,12 +916,18 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
     const unsigned first = static_cast<unsigned>(std::countr_zero(ex));
     const unsigned count = popc(ex);
     const uint64_t g0 = addrs[first];
-    bool run = !(g0 >= kConstWindow && g0 < kWinEnd);
-    for (unsigned i = 0; run && i < count; ++i) run = addrs[first + i] == g0 + uint64_t{i} * bytes;
+    uint64_t differ = 0;   // (no short circuit: the lanes' addresses against the run, ORed)
+    for (unsigned i = 0; i < count; ++i) differ |= addrs[first + i] ^ (g0 + uint64_t{i} * bytes);
+    const bool run = differ == 0 && !(g0 >= kConstWindow && g0 < kWinEnd);
     if (run && (g0 + uint64_t{count} * bytes - 1 < kConstWindow || g0 >= kWinEnd)) {
       uint8_t buf[32 * 8];
       bool done = false;
-      if (Store) {
+      if (bytes == 4 && dreg) {
+        // Words of consecutive lanes are consecutive words of the register's row: moved straight between it and memory (a load that
+        // declines has written nothing; the lanes' addresses were read before).
+        uint32_t* row = c.R + op.dst * 32u + first;
+        done = Store ? mem.store_run(g0, row, uint64_t{count} * 4, 4) : mem.load_run(g0, row, uint64_t{count} * 4, 4);
+      } else if (Store) {
         for (unsigned i = 0; i < count; ++i) {
           uint32_t v[4] = {};
           data(first + i, v);
@@ -977,7 +983,7 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
         uint32_t* d = c.R + op.dst * 32u;
         for (unsigned i = 0; i < cnt; ++i) {
           if (bytes <= 4) {
-            d[lane_of[i]] = tier_extend(op.b, static_cast<uint32_t>(fv[i]));
+            d[lane_of[i]] = bytes == 4 ? static_cast<uint32_t>(fv[i]) : tier_extend(op.b, static_cast<uint32_t>(fv[i]));
           } else {
             d[lane_of[i]] = static_cast<uint32_t>(fv[i]);
             d[32 + lane_of[i]] = static_cast<uint32_t>(fv[i] >> 32);
