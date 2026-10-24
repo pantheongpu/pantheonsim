@@ -64,7 +64,7 @@ written: F2FP reads two sources, not one (`sass_tier`); the uniform datapath mus
 ran twice).
 
 Coverage (`data/round13/m4a-verify-sets-coverage.txt`: escapes checked, summed over every test program of `run_sass_tier.sh` on all 7 architectures plus `sass_tier_steps`,
-the 16 harness workloads at quick size, and the five pantheon workloads for 4 s each): all 38 forms of the table were checked at least once; the smallest counts are
+the 16 harness workloads at quick size, and the five pantheon workloads for 4 s each): all 39 forms of the table were checked at least once; the smallest counts are
 `i2fp` 1, `fadd` 50, `iadd3` 50, `isetp` 50, `lop3` 100, `mov` 158. The largest: `dop` 6.4 M, `ldg` 3.7 M, `isetpex` 1.2 M. Not covered: a particular flavour of a form
 (an `FSETP` with `|x|` is the interpreter's path; whether the harness's `FSETP` programs include one is not known) and any sm_100/sm_120 form the programs do not use. Every
 test program that passes with the JIT passes with the verifier on (0 violations: `data/round13/m4a-verify-sets-test-programs.log`).
