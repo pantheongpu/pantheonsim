@@ -7,6 +7,12 @@
 // predicates, as the tier's handlers do, so a row that is not stored before it, or not reloaded after it, shows. A second run throws from
 // an escape in the middle of the region: the register file and counters must then be identical too.
 //
+// Milestone 4a: most escapes declare what they read and write (jit::EscapeSets). Such an escape hashes only the rows and predicates of its
+// read set and changes only those of its write set, so the code under test may keep every other row in a local across it, and a row it
+// does read must have been stored first, a row it writes reloaded after. An entry of the sets that is smaller than what the escape does
+// (VGPU_JIT_MUTANT=esc_small_read, esc_small_write, esc_small_pread, esc_small_pwrite, in a build with -DVGPU_JIT_MUTANTS=ON) makes the
+// escape see a stale row or the code under test trust a stale one, and the test fails.
+//
 // VGPU_JIT_RANDOM_UNITS=<n> (default 4; the rig runs hundreds) units of VGPU_JIT_RANDOM_REGIONS (12) regions each.
 // The forms themselves are held to the tier by nvidia/tests/e2e/run_sass_jit.sh; this holds residence to the code without it.
 #include <sys/stat.h>
@@ -132,7 +138,23 @@ struct Gen {
       o.guard_not = coin(40);
       o.guard_uniform = coin(25);
     }
-    if (coin(14)) return o;   // an escape
+    if (coin(14)) {   // an escape: unknown reads and writes, or declared ones
+      if (coin(65)) {
+        jit::EscapeSets& e = o.sets;
+        e.known = true;
+        for (unsigned n = static_cast<unsigned>(u(4)); n; --n) {
+          const unsigned r = static_cast<unsigned>(u(kRegs));
+          e.rr[r >> 6] |= uint64_t{1} << (r & 63);
+        }
+        for (unsigned n = static_cast<unsigned>(u(4)); n; --n) {
+          const unsigned r = static_cast<unsigned>(u(kRegs));
+          e.wr[r >> 6] |= uint64_t{1} << (r & 63);
+        }
+        for (unsigned n = static_cast<unsigned>(u(3)); n; --n) e.rp = static_cast<uint8_t>(e.rp | (1u << u(7)));
+        for (unsigned n = static_cast<unsigned>(u(3)); n; --n) e.wp = static_cast<uint8_t>(e.wp | (1u << u(7)));
+      }
+      return o;
+    }
     static const Form forms[] = {Form::Mov,   Form::Iadd3,    Form::Iadd3x, Form::Imad,   Form::Imad32, Form::ImadWide, Form::ImadHi, Form::Lop3,
                                  Form::Lea,   Form::Shf,      Form::Isetp,  Form::Fsetp,  Form::Fsel,   Form::Ffma,     Form::Fadd,   Form::Fmul,
                                  Form::Prmt,  Form::Imnmx,    Form::I2fp};
@@ -249,6 +271,7 @@ struct Sim {
   std::vector<uint64_t> log;
   long throw_at = -1;
   long calls = 0;
+  const jit::RegionSpec* spec = nullptr;   // the region being run: an escape finds its declared sets here
 };
 
 uint64_t mix(uint64_t h, uint64_t v) {
@@ -259,13 +282,33 @@ uint64_t mix(uint64_t h, uint64_t v) {
 
 void sim_escape(jit::Ctx* c, uint32_t op, uint32_t ex) {
   Sim& s = *static_cast<Sim*>(c->host);
+  const jit::EscapeSets* es = (s.spec && op < s.spec->ops.size() && s.spec->ops[op].sets.known) ? &s.spec->ops[op].sets : nullptr;
   uint64_t h = mix(s.seed, op * 977u + ex);
-  for (unsigned i = 0; i < kRegs * 32; ++i) h = mix(h, s.R[i]);
-  for (unsigned i = 0; i < 8; ++i) h = mix(h, s.p[i]);
+  if (es) {   // a declared escape sees its read set only
+    for (unsigned r = 0; r < kRegs; ++r)
+      if (es->in_rr(r))
+        for (unsigned l = 0; l < 32; ++l) h = mix(h, s.R[r * 32 + l]);
+    for (unsigned q = 0; q < 7; ++q)
+      if ((es->rp >> q) & 1u) h = mix(h, s.p[q]);
+  } else {
+    for (unsigned i = 0; i < kRegs * 32; ++i) h = mix(h, s.R[i]);
+    for (unsigned i = 0; i < 8; ++i) h = mix(h, s.p[i]);
+  }
   s.log.push_back(h);
   if (s.throw_at == s.calls++) throw std::runtime_error("escape fault");
-  // The handler's effect: some rows (any of them: it is a handler the generator knows nothing of), for the executing lanes, and a predicate.
   std::mt19937_64 r(h);
+  if (es) {   // ... and changes its write set only, for the executing lanes (masked: the other lanes keep their values)
+    for (unsigned row = 0; row < kRegs; ++row)
+      if (es->in_wr(row)) {
+        const uint32_t v = static_cast<uint32_t>(r());
+        for (unsigned l = 0; l < 32; ++l)
+          if ((ex >> l) & 1u) s.R[row * 32 + l] = v ^ (l * 0x9e3779b1u);
+      }
+    for (unsigned q = 0; q < 7; ++q)
+      if ((es->wp >> q) & 1u) s.p[q] = (s.p[q] & ~ex) | (static_cast<uint32_t>(r()) & ex);
+    return;
+  }
+  // The handler's effect: some rows (any of them: it is a handler the generator knows nothing of), for the executing lanes, and a predicate.
   const unsigned nrows = static_cast<unsigned>(r() % 4);
   for (unsigned k = 0; k < nrows; ++k) {
     const unsigned row = static_cast<unsigned>(r() % kRegs);
@@ -340,7 +383,7 @@ VTEST(jit_residence_random_regions_equal_the_register_file_code) {
   b.push_back(0);
   if (!::mkdtemp(b.data())) throw vtest::Failure("mkdtemp failed");
   const std::string dir = b.data();
-  std::atomic<unsigned> next{0}, failures{0}, regions_checked{0}, runs{0}, escapes_seen{0}, gen_ops{0};
+  std::atomic<unsigned> next{0}, failures{0}, regions_checked{0}, runs{0}, escapes_seen{0}, gen_ops{0}, declared_ops{0};
   std::mutex mu;
   std::string first_failure;
   const auto worker = [&] {
@@ -356,10 +399,12 @@ VTEST(jit_residence_random_regions_equal_the_register_file_code) {
         for (unsigned i = 0; i < n; ++i) {
           rs.ops.push_back(g.op());
           if (rs.ops.back().form) ++gen_ops;
+          else if (rs.ops.back().sets.known) ++declared_ops;
         }
         spec.regions.push_back(std::move(rs));
       }
       jit::Config on, off;
+      on.escape_sets = true;   // (a test of the sets must not be switched off by VGPU_JIT_ESCAPE_SETS in the environment)
       on.cache_dir = dir + "/on";
       off.cache_dir = dir + "/off";
       off.residence = false;
@@ -386,6 +431,7 @@ VTEST(jit_residence_random_regions_equal_the_register_file_code) {
           const bool stats = trial & 1;
           const bool throw_case = trial == 4 && r % 2 == 0;
           if (throw_case) a.throw_at = bsim.throw_at = static_cast<long>(rng() % 3);
+          a.spec = bsim.spec = &spec.regions[r];
           jit::Ctx ca = make_ctx(a, stats), cb = make_ctx(bsim, stats);
           bool ta = false, tb = false;
           const uint32_t gl = static_cast<uint32_t>(__builtin_popcount(group));
@@ -411,8 +457,8 @@ VTEST(jit_residence_random_regions_equal_the_register_file_code) {
   std::vector<std::thread> pool;
   for (unsigned i = 0; i < nthreads; ++i) pool.emplace_back(worker);
   for (auto& th : pool) th.join();
-  std::printf("  residence: %u units, %u regions, %u runs, %u generated ops, %u escapes executed, %u failures\n", units, regions_checked.load(), runs.load(),
-              gen_ops.load(), escapes_seen.load(), failures.load());
+  std::printf("  residence: %u units, %u regions, %u runs, %u generated ops, %u escapes that declare their sets, %u escapes executed, %u failures\n", units,
+              regions_checked.load(), runs.load(), gen_ops.load(), declared_ops.load(), escapes_seen.load(), failures.load());
   std::error_code ec;
   fs::remove_all(dir, ec);
   if (failures) throw vtest::Failure(first_failure);

@@ -132,6 +132,13 @@ check() {
     local nc
     nc="$(runit "$bin" $arch "${jitenv[@]}" VGPU_TIER_CHAIN=0)"
     [[ "$a" == "$nc" ]] || why="${why:+$why; }the JIT without the tier's chain prints differently from the tier"
+    # Milestone 4a (rows kept in locals across an escape): the generator without the escape sets (milestone 3's code) prints the same, and so
+    # does a run in which every escape is checked against its sets (jit_escape_verified aborts with a "JIT VERIFY SETS" line on a mismatch).
+    local ns vs
+    ns="$(runit "$bin" $arch "${jitenv[@]}" VGPU_JIT_ESCAPE_SETS=0)"
+    [[ "$a" == "$ns" ]] || why="${why:+$why; }the JIT without the escape sets prints differently from the tier"
+    vs="$(runit "$bin" $arch "${jitenv[@]}" VGPU_JIT_VERIFY_SETS=1)"
+    [[ "$a" == "$vs" ]] || why="${why:+$why; }the JIT with every escape checked against its sets prints differently from the tier ($(grep -m1 'JIT VERIFY SETS' <<< "$vs"))"
   fi
   if [[ $p == sass_tier_steps && -z $why ]]; then
     # Faults deep into a run of straight instructions, and the step limit, with the generated code compiled with and without -fexceptions.

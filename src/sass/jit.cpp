@@ -257,6 +257,7 @@ Config Config::from_env() {
   c.cxx = env("VGPU_JIT_CXX");
   c.extra_flags = env("VGPU_JIT_FLAGS");
   if (const std::string r = env("VGPU_JIT_RESIDENCE"); r == "0") c.residence = false;
+  if (const std::string r = env("VGPU_JIT_ESCAPE_SETS"); r == "0") c.escape_sets = false;
   if (const std::string t = env("VGPU_JIT_TIMEOUT"); !t.empty()) c.timeout_s = static_cast<unsigned>(std::strtoul(t.c_str(), nullptr, 10));
   if (const std::string m = env("VGPU_JIT_MEM_MB"); !m.empty()) c.mem_mb = static_cast<unsigned>(std::strtoul(m.c_str(), nullptr, 10));
   return c;
@@ -275,7 +276,19 @@ std::vector<uint32_t> Engine::meta(const UnitSpec& spec) {
       m.push_back(static_cast<uint32_t>(o.hi >> 32));
       m.push_back(o.cls | uint32_t{o.guard} << 8 | uint32_t{o.guard_not} << 16 | uint32_t{o.guard_uniform} << 17 | uint32_t{o.unguarded} << 18);
       m.push_back(o.form);
-      if (o.form == 0) continue;
+      if (o.form == 0) {
+        m.push_back(o.sets.known ? 1u : 0u);
+        if (o.sets.known) {
+          for (int i = 0; i < 4; ++i) {
+            m.push_back(static_cast<uint32_t>(o.sets.rr[i]));
+            m.push_back(static_cast<uint32_t>(o.sets.rr[i] >> 32));
+            m.push_back(static_cast<uint32_t>(o.sets.wr[i]));
+            m.push_back(static_cast<uint32_t>(o.sets.wr[i] >> 32));
+          }
+          m.push_back(o.sets.rp | uint32_t{o.sets.wp} << 8);
+        }
+        continue;
+      }
       for (const SrcFacts* x : {&o.s[0], &o.s[1], &o.s[2], &o.p, &o.p2}) {
         m.push_back(uint32_t{x->kind} | uint32_t{x->dyn} << 8 | uint32_t{x->mod} << 16 | uint32_t{x->pad} << 24);
         m.push_back(x->off);
@@ -294,7 +307,7 @@ std::vector<uint32_t> Engine::meta(const UnitSpec& spec) {
   return m;
 }
 
-std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence) {
+std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence, bool esc_sets) {
   std::string s;
   const auto put = [&](const char* fmt, auto... a) {
     char buf[1024];
@@ -345,6 +358,7 @@ std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence) {
     saved.swap(s);
     RowCtx rc;
     rc.enabled = residence && any_gen;
+    rc.esc_sets = esc_sets;
     if (const char* cap = std::getenv("VGPU_JIT_RES_ROWS")) rc.cap = static_cast<unsigned>(std::strtoul(cap, nullptr, 10));
     // The counters. Steps and instructions are the op count; the lanes an unguarded op counts are the group's, known only as glanes,
     // so they are counted as multiples of it; a guarded op's are worked out and added to locals. All of it is written out before every
@@ -356,9 +370,11 @@ std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence) {
         dyn_classes.insert(o.cls);
         any_dyn = true;
       }
+    std::vector<std::pair<size_t, std::string>> landing;   // escape number + 1 -> the stores a throw from it must make
     if (any_gen) s += "  uint32_t* const R = c->R;\n";
     if (any_dyn) s += "  uint64_t tl = 0;\n";
     for (unsigned k : dyn_classes) put("  uint64_t bc%u = 0;\n", k);
+    const size_t body_start = s.size();
     uint64_t pend_ops = 0, pend_unguarded = 0;
     std::map<unsigned, uint64_t> pend_cls;     // unguarded ops since the last flush, by class
     std::set<unsigned> pend_dyn;                // classes with a guarded op since the last flush
@@ -421,7 +437,16 @@ std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence) {
       ++pend_ops;
       if (o.form == 0) {
         flush();
-        rc.sync(s, true);   // the tier's handler reads and writes the real register file: every dirty row and predicate goes back, none is trusted after
+        // The tier's handler reads and writes the real register file: the dirty rows and predicates it reads or writes go back, the ones it writes
+        // are not trusted after (all of them, for an escape whose reads and writes are not known). A row that stays in a local across the call
+        // must still reach the register file if the handler throws: the landing code below stores what was dirty at that call.
+        rc.sync_escape(s, o.sets);
+        if (rc.any_dirty()) {
+          landing.emplace_back(i + 1, rc.dirty_stores());
+          put("    esc = %zuu;\n", i + 1);
+        } else if (!landing.empty()) {
+          s += "    esc = 0;\n";   // (nothing is left in a local at this call: an earlier call's landing code must not run for it)
+        }
         put("    if (ex | (c->flags & 1u)) c->escape(c, %zuu, ex);\n", i);
       } else {
         const std::string body = gen_op_body(o, rc);
@@ -438,6 +463,13 @@ std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence) {
     }
     flush();
     rc.sync(s, false);
+    if (!landing.empty()) {
+      std::string tail = "  } catch (...) {\n    switch (esc) {\n";
+      for (const auto& [n, code] : landing) tail += "      case " + std::to_string(n) + "u:\n" + code + "        break;\n";
+      tail += "      default: break;\n    }\n    throw;\n  }\n";
+      s.insert(body_start, "  unsigned esc = 0;\n  try {\n");
+      s += tail;
+    }
     std::string region;
     region.swap(s);
     s.swap(saved);
@@ -553,7 +585,7 @@ std::string Engine::key(const UnitSpec& spec, std::string* why) {
   const std::string cid = compiler_id(why);
   if (cid.empty()) return {};
   const std::string isa = cfg_.isa.empty() ? detect_isa() : cfg_.isa;
-  return hash_text(source(spec, isa == "avx2", cfg_.residence) + key_suffix(cfg_, cid, isa));
+  return hash_text(source(spec, isa == "avx2", cfg_.residence, cfg_.escape_sets) + key_suffix(cfg_, cid, isa));
 }
 
 // The key of a whole section (what the file naming its selection of regions is named by): the facts of every region, not their text.
@@ -783,7 +815,7 @@ Result Engine::obtain(const UnitSpec& spec) {
     return out;
   }
   const std::string isa = cfg_.isa.empty() ? detect_isa() : cfg_.isa;
-  if (!write_file(tmp_cpp, source(spec, isa == "avx2", cfg_.residence))) {
+  if (!write_file(tmp_cpp, source(spec, isa == "avx2", cfg_.residence, cfg_.escape_sets))) {
     out.status = Status::CacheUnusable;
     out.message = "cannot write to " + dir + ": " + std::strerror(errno);
     return out;
@@ -1168,11 +1200,20 @@ std::shared_ptr<Unit> make_unit(const tier::Program& prog, int sm) {
           f.dst = op.dst;
           f.dst2 = op.dst2;
           f.aux = op.aux;
-          if (!generates(f)) {   // an escape: only what the counting needs
+          if (!generates(f)) {   // an escape: only what the counting needs, and what the handler reads and writes
             OpFacts e;
             e.lo = f.lo, e.hi = f.hi, e.cls = f.cls, e.guard = f.guard;
             e.guard_not = f.guard_not, e.guard_uniform = f.guard_uniform, e.unguarded = f.unguarded;
+            e.sets = escape_sets(op);
             f = e;
+          }
+        }
+        if (!f.form) {
+          if (op.never) {   // @!PT: no lane ever runs it (the escape only reports it to the tier's statistics)
+            f.sets = EscapeSets{};
+            f.sets.known = true;
+          } else if (f.sets.known && !op.guard_uniform && op.guard < 7) {   // (a handler may look at its own guard predicate)
+            f.sets.rp = static_cast<uint8_t>(f.sets.rp | (1u << op.guard));
           }
         }
         if (f.form) ++rg.gen;

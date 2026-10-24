@@ -221,6 +221,73 @@ void RowCtx::sync(std::string& out, bool invalidate) {
   }
 }
 
+bool RowCtx::any_dirty() const {
+  for (const auto& [reg, state] : st)
+    if (state == 2) return true;
+  for (unsigned r = 0; r < 7; ++r)
+    if (pst[r] == 2) return true;
+  return false;
+}
+
+std::string RowCtx::dirty_stores() const {
+  std::string t;
+  char buf[96];
+  for (const auto& [reg, state] : st)
+    if (state == 2) {
+      std::snprintf(buf, sizeof buf, "      strow(R + %uu, X%u);\n", reg * 32u, reg);
+      t += buf;
+    }
+  for (unsigned r = 0; r < 7; ++r)
+    if (pst[r] == 2) {
+      std::snprintf(buf, sizeof buf, "      c->p[%u] = P%u;\n", r, r);
+      t += buf;
+    }
+  return t;
+}
+
+// An escape runs the tier's handler on the real register file. The rows it reads must be there (stored if dirty), the rows it writes
+// must be there too (a masked write keeps the lanes outside the executing mask, which are the local copy's if it is dirty) and are
+// stale afterwards; every other row and predicate stays in its local, dirty or not.
+void RowCtx::sync_escape(std::string& out, const EscapeSets& e0) {
+  if (!esc_sets || !e0.known || !enabled) {
+    sync(out, true);
+    return;
+  }
+  EscapeSets e = e0;
+  const auto drop_low = [](uint64_t* w) {
+    for (int i = 0; i < 4; ++i)
+      if (w[i]) {
+        w[i] &= w[i] - 1;
+        return;
+      }
+  };
+  if (mut("esc_small_read")) drop_low(e.rr);
+  if (mut("esc_small_write")) drop_low(e.wr);
+  if (mut("esc_small_pread") && e.rp) e.rp = static_cast<uint8_t>(e.rp & (e.rp - 1));
+  if (mut("esc_small_pwrite") && e.wp) e.wp = static_cast<uint8_t>(e.wp & (e.wp - 1));
+  char buf[96];
+  for (auto it = st.begin(); it != st.end();) {
+    const unsigned reg = it->first;
+    const bool rd = e.in_rr(reg), wr = e.in_wr(reg);
+    if (it->second == 2 && (rd || wr)) {
+      std::snprintf(buf, sizeof buf, "  strow(R + %uu, X%u);\n", reg * 32u, reg);
+      out += buf;
+      it->second = 1;
+    }
+    if (wr) it = st.erase(it);
+    else ++it;
+  }
+  for (unsigned r = 0; r < 7; ++r) {
+    const bool rd = (e.rp >> r) & 1u, wr = (e.wp >> r) & 1u;
+    if (pst[r] == 2 && (rd || wr)) {
+      std::snprintf(buf, sizeof buf, "  c->p[%u] = P%u;\n", r, r);
+      out += buf;
+      pst[r] = 1;
+    }
+    if (wr) pst[r] = 0;
+  }
+}
+
 std::string RowCtx::decls() const {
   std::string t;
   char buf[96];
@@ -233,6 +300,197 @@ std::string RowCtx::decls() const {
     t += buf;
   }
   return t;
+}
+
+// ---- what the tier's handlers read and write (milestone 4a) --------------------------------------------------------------------
+//
+// One entry per form, from the handler in tier_ops.inc that the form names (and, where a handler hands an unusual case to the
+// interpreter, from the operands of the instruction, which are the ones the MOp resolved). Anything not listed is unknown: it reads
+// and writes everything, as before. The sets may be larger than the truth, never smaller; `VGPU_JIT_VERIFY_SETS=1` (a test build,
+// -DVGPU_JIT_MUTANTS=ON) checks each escape that runs against its set (tier_ops.inc, jit_escape).
+EscapeSets escape_sets(const tier::MOp& op) {
+  using tier::Form;
+  EscapeSets e;
+  const auto row = [](uint64_t* w, unsigned r) {
+    if (r < 256) w[r >> 6] |= uint64_t{1} << (r & 63);
+  };
+  const auto rd = [&](unsigned r) { row(e.rr, r); };
+  const auto wr = [&](unsigned r) { row(e.wr, r); };
+  // A 32-bit source: a register row, or a register with a modifier. A constant, a bank word and a uniform register read no row.
+  const auto src = [&](const tier::Src& s) {
+    if (s.kind == tier::SrcKind::Row) rd(s.off / 32u);
+    else if (s.kind == tier::SrcKind::Dyn && s.dyn == tier::Dyn::Reg) rd(s.off);
+  };
+  // A 64-bit source (a register pair; the others read no row).
+  const auto src2 = [&](const tier::Src& s) {
+    if (s.kind == tier::SrcKind::Row) {
+      rd(s.off / 32u);
+      rd(s.off / 32u + 1u);
+    }
+  };
+  const auto prd = [&](const tier::Src& s) {   // a predicate source
+    if (s.kind == tier::SrcKind::Dyn && s.dyn == tier::Dyn::Reg && s.off < 7) e.rp = static_cast<uint8_t>(e.rp | (1u << s.off));
+  };
+  const auto pwr = [&](unsigned r) {   // a predicate destination (PT and "none" are not written)
+    if (r < 7) e.wp = static_cast<uint8_t>(e.wp | (1u << r));
+  };
+  const auto dst = [&](unsigned n) {   // n consecutive rows from the destination; RZ is not written, and neither is the partner of R254
+    if (op.dst == tier::kNoReg) return;
+    for (unsigned i = 0; i < n; ++i)
+      if (op.dst + i != kRZ) wr(op.dst + i);
+  };
+  // Raw register numbers (the memory forms keep the register in `off`; RZ reads nothing).
+  const auto raw = [&](unsigned r, unsigned n, bool write) {
+    if (r == kRZ) return;
+    for (unsigned i = 0; i < n; ++i)
+      if (r + i != kRZ) {
+        if (write) wr(r + i);
+        else rd(r + i);
+      }
+  };
+  const unsigned words = op.a >= 4 ? op.a / 4 : 1;
+  switch (op.form) {
+    case Form::Mov: case Form::Popc: case Form::I2fp: case Form::Mufu: case Form::F2i: case Form::I2f: case Form::F2fp: case Form::Unary: case Form::Iabs:
+      src(op.s[0]);
+      dst(1);
+      break;
+    case Form::Iadd3: case Form::Imad: case Form::Shf: case Form::Ffma: case Form::Prmt:
+      for (int k = 0; k < 3; ++k) src(op.s[k]);
+      dst(1);
+      break;
+    case Form::Fadd: case Form::Fmul:
+      src(op.s[0]);
+      src(op.s[1]);
+      dst(1);
+      break;
+    case Form::Hop2:
+      for (int k = 0; k < 3; ++k) src(op.s[k]);
+      dst(1);
+      break;
+    case Form::Lop3:
+      for (int k = 0; k < 3; ++k) src(op.s[k]);
+      if ((op.aux & 1) && !(op.aux & 2)) prd(op.p);
+      dst(1);
+      if (op.aux & 1) pwr(op.dst2);
+      break;
+    case Form::Lea:
+      src(op.s[0]);
+      src(op.s[1]);
+      if (op.aux & 4) src(op.s[2]);
+      if (op.aux & 2) prd(op.p);
+      dst(1);
+      if (op.dst2 != tier::kNoReg) pwr(op.dst2);
+      break;
+    case Form::Iadd3x:
+      for (int k = 0; k < 3; ++k) src(op.s[k]);
+      if (op.aux & 1) {
+        prd(op.p);
+        prd(op.p2);
+      }
+      dst(1);
+      if (op.dst2 != tier::kNoReg) pwr(op.dst2);
+      if (op.c != tier::kNoReg) pwr(op.c);
+      break;
+    case Form::Imad32:
+      for (int k = 0; k < 3; ++k) src(op.s[k]);
+      if (op.aux & 1) prd(op.p);
+      dst(1);
+      if (op.dst2 != tier::kNoReg) pwr(op.dst2);
+      break;
+    case Form::ImadWide:
+      src(op.s[0]);
+      src(op.s[1]);
+      src2(op.s[2]);
+      if (op.aux & 1) prd(op.p);
+      dst(2);
+      if (op.dst2 != tier::kNoReg) pwr(op.dst2);
+      break;
+    case Form::ImadHi:
+      src(op.s[0]);
+      src(op.s[1]);
+      if (op.aux & 4) src2(op.s[2]);
+      else src(op.s[2]);
+      if (op.aux & 1) prd(op.p);
+      dst(1);
+      if (op.dst2 != tier::kNoReg) pwr(op.dst2);
+      break;
+    case Form::Isetp: case Form::Fsetp:
+      src(op.s[0]);
+      src(op.s[1]);
+      prd(op.p);
+      pwr(op.dst);
+      pwr(op.dst2);
+      break;
+    case Form::IsetpEx:
+      src(op.s[0]);
+      src(op.s[1]);
+      prd(op.p);
+      prd(op.p2);
+      pwr(op.dst);
+      pwr(op.dst2);
+      break;
+    case Form::Fsel: case Form::Sel: case Form::Imnmx: case Form::Fmnmx:
+      src(op.s[0]);
+      src(op.s[1]);
+      prd(op.p);
+      dst(1);
+      break;
+    case Form::Dop:
+      for (int k = 0; k < 3; ++k) src2(op.s[k]);
+      dst(2);
+      break;
+    case Form::Dsetp:
+      src2(op.s[0]);
+      src2(op.s[1]);
+      prd(op.p);
+      pwr(op.dst);
+      pwr(op.dst2);
+      break;
+    case Form::S2r:
+      dst(1);
+      break;
+    case Form::Cs2r:
+      dst(op.b ? 2 : 1);
+      break;
+    case Form::Ldc:
+      raw(op.c, 1, false);
+      dst(op.b == 5 ? 2 : 1);
+      break;
+    case Form::Ldg: case Form::Lds: case Form::Ldl: case Form::Stg: case Form::Sts: case Form::Stl: {
+      const bool store = op.form == Form::Stg || op.form == Form::Sts || op.form == Form::Stl;
+      raw(op.s[0].off, (op.aux & 1) ? 2 : 1, false);
+      if (op.dst != tier::kNoReg) raw(op.dst, words, store ? false : true);
+      break;
+    }
+    case Form::Ldsm:
+      raw(op.s[0].off, 1, false);
+      dst(op.a);
+      break;
+    case Form::Hmma:
+      raw(op.s[0].off, 4, false);
+      raw(op.s[1].off, 4, false);
+      raw(op.s[2].off, 4, false);
+      dst(4);
+      break;
+    case Form::Imma: {
+      const unsigned per_reg = (op.aux & 8) ? 8 : 4, a_regs = op.a * op.b / (32 * per_reg), b_regs = op.b * 8 / (32 * per_reg), c_regs = op.a * 8 / 32;
+      raw(op.s[0].off, a_regs, false);
+      raw(op.s[1].off, b_regs, false);
+      raw(op.s[2].off, c_regs, false);
+      dst(c_regs);
+      break;
+    }
+    case Form::Umov: case Form::Uldc: case Form::Uiadd3: case Form::Uimad: case Form::Uisetp: case Form::Ulea: case Form::Ulop3: case Form::Ushf:
+    case Form::Uunary: case Form::Usel:
+      // The uniform datapath reads a row only for a source that is a register (lane l = the first executing lane), and may write a lane's
+      // own predicate: every predicate is read and written.
+      for (int k = 0; k < 3; ++k) src(op.s[k]);
+      e.rp = e.wp = 0x7f;
+      break;
+    default: return EscapeSets{};   // unknown
+  }
+  e.known = true;
+  return e;
 }
 
 bool generates(const OpFacts& o) {

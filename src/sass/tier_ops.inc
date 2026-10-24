@@ -1697,6 +1697,61 @@ void jit_escape(jit::Ctx* j, uint32_t i, uint32_t ex) {
   if (h.stats) [[unlikely]] tier_stats().native[static_cast<size_t>(op.ins->op)].fetch_add(1, std::memory_order_relaxed);
 }
 
+// VGPU_JIT_VERIFY_SETS=1 (milestone 4a): the escape that checks the read/write sets the generator was given (jit::escape_sets) against what the handler
+// does. Run once: the rows and predicates that changed must be in the write set. Run again from the same state with every row and predicate that is in
+// neither set scrambled (stores excepted: they cannot be run twice): the rows and predicates of the write set must come out the same, so the handler reads
+// nothing outside the read set. A mismatch is a bug in the table and ends the process.
+[[noreturn]] void jit_sets_violation(const tier::MOp& op, const char* what, unsigned n) {
+  std::fprintf(stderr, "JIT VERIFY SETS: %s (pc 0x%llx) %s %u\n", op.ins->mnemonic.c_str(), static_cast<unsigned long long>(op.ins->pc), what, n);
+  std::abort();
+}
+
+void jit_escape_verified(jit::Ctx* j, uint32_t i, uint32_t ex) {
+  JitHost& h = *static_cast<JitHost*>(j->host);
+  const tier::MOp& op = h.ops[i];
+  const jit::EscapeSets sets = jit::escape_sets(op);
+  if (!sets.known || !ex) {
+    jit_escape(j, i, ex);
+    return;
+  }
+  Warp& w = *h.c->w;
+  uint32_t* const R = h.c->R;
+  const size_t n = size_t{w.nregs} * 32;
+  const std::vector<uint32_t> r0(R, R + n);
+  Mask p0[8];
+  std::memcpy(p0, w.p, sizeof p0);
+  const exec::LaunchStats st0 = h.c->blk->st;
+  h.last = &op;
+  op.fn(h.c, op, ex);
+  if (h.stats) [[unlikely]] tier_stats().native[static_cast<size_t>(op.ins->op)].fetch_add(1, std::memory_order_relaxed);
+  const bool store = op.form == tier::Form::Stg || op.form == tier::Form::Sts || op.form == tier::Form::Stl;
+  for (unsigned r = 0; r < w.nregs; ++r)
+    if (!sets.in_wr(r) && std::memcmp(R + r * 32, &r0[r * 32], 128) != 0) jit_sets_violation(op, "wrote a row outside its set:", r);
+  for (unsigned q = 0; q < 7; ++q)
+    if (!((sets.wp >> q) & 1u) && w.p[q] != p0[q]) jit_sets_violation(op, "wrote a predicate outside its set:", q);
+  if (store) return;
+  const std::vector<uint32_t> r1(R, R + n);
+  Mask p1[8];
+  std::memcpy(p1, w.p, sizeof p1);
+  const exec::LaunchStats st1 = h.c->blk->st;
+  std::memcpy(R, r0.data(), n * 4);
+  std::memcpy(w.p, p0, sizeof p0);
+  h.c->blk->st = st0;
+  for (unsigned r = 0; r < w.nregs; ++r)
+    if (!sets.in_rr(r) && !sets.in_wr(r))
+      for (unsigned l = 0; l < 32; ++l) R[r * 32 + l] = 0x9e3779b1u * (r * 32 + l + 1) ^ 0xa5a5a5a5u;
+  for (unsigned q = 0; q < 7; ++q)
+    if (!((sets.rp | sets.wp) >> q & 1u)) w.p[q] = ~w.p[q] ^ 0x5a5a1234u;
+  op.fn(h.c, op, ex);
+  for (unsigned r = 0; r < w.nregs; ++r)
+    if (sets.in_wr(r) && std::memcmp(R + r * 32, &r1[r * 32], 128) != 0) jit_sets_violation(op, "reads a row outside its read set; the result row is", r);
+  for (unsigned q = 0; q < 7; ++q)
+    if (((sets.wp >> q) & 1u) && w.p[q] != p1[q]) jit_sets_violation(op, "reads a predicate outside its read set; the result predicate is", q);
+  std::memcpy(R, r1.data(), n * 4);
+  std::memcpy(w.p, p1, sizeof p1);
+  h.c->blk->st = st1;
+}
+
 // Runs the region that starts at ops[idx] if it is compiled and the run loop could run all its ops here: what the loop checks for each
 // of them is checked once for all -- the 256-instruction run (n + k), the step budget (steps + k), the registers its handlers touch. A region
 // holds no store, so the store gate cannot trip inside one. When a check fails, or the region is not compiled yet (counting towards its
@@ -1735,7 +1790,8 @@ struct JitFrame {
     jc.instructions = &st.instructions;
     jc.thread_instructions = &st.thread_instructions;
     jc.by_class = st.inst_by_class;
-    jc.escape = &jit_escape;
+    static const bool verify = [] { const char* v = std::getenv("VGPU_JIT_VERIFY_SETS"); return v && v[0] == '1'; }();
+    jc.escape = verify ? &jit_escape_verified : &jit_escape;
     jc.host = &f.jh;
     jc.b0 = c.b0;
     jc.b0n = c.b0n;

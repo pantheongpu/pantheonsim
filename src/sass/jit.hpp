@@ -26,6 +26,7 @@
 
 namespace vgpu::sass::tier {
 struct Program;
+struct MOp;
 }
 
 namespace vgpu::sass::jit {
@@ -34,7 +35,7 @@ namespace vgpu::sass::jit {
 inline constexpr uint32_t kAbiVersion = 2;
 // Bumped when the text the generator writes for the same regions changes. (The key also hashes the text itself, so a forgotten bump
 // cannot make a stale object load; the number is for people reading a cache directory.)
-inline constexpr uint32_t kGeneratorVersion = 2;
+inline constexpr uint32_t kGeneratorVersion = 3;
 inline constexpr uint32_t kMinRegion = 2;
 // The run loop of the tier executes at most this many straight instructions in one pass (n < 256), then one more that ends the pass.
 inline constexpr unsigned kRunLimit = 256;
@@ -80,6 +81,17 @@ struct SrcFacts {
   uint32_t val = 0, val2 = 0;
 };
 
+// What an op that stays an escape reads and writes of the state the generated code keeps in locals (milestone 4a): register rows (a
+// bit per register, 0 to 255) and the predicates P0..P6. `known` false: unknown, which means everything is read and written. A set
+// may be larger than the truth (it costs a store or a reload) and never smaller.
+struct EscapeSets {
+  bool known = false;
+  uint64_t rr[4] = {}, wr[4] = {};   // register rows read, written
+  uint8_t rp = 0, wp = 0;            // predicates read, written (bit n: Pn)
+  bool in_rr(unsigned r) const { return (rr[r >> 6] >> (r & 63)) & 1u; }
+  bool in_wr(unsigned r) const { return (wr[r >> 6] >> (r & 63)) & 1u; }
+};
+
 // What the generator needs of one op: the instruction's 128 bits, the facts the run loop uses to count it, and, when the generated code
 // runs the op itself rather than calling the tier's handler, the form and the MOp's fields.
 struct OpFacts {
@@ -95,7 +107,10 @@ struct OpFacts {
   uint32_t a = 0, b = 0, c = 0;
   uint16_t dst = 0xffff, dst2 = 0xffff;
   uint8_t aux = 0;
+  EscapeSets sets;             // an escape's reads and writes (form == 0 only)
 };
+// The reads and writes of the tier's handler for `op`, from the MOp (jit_gen.cpp): unknown for a form that has no entry in the table.
+EscapeSets escape_sets(const tier::MOp& op);
 // Whether the generator computes this form itself (a form it does not, or a source it cannot, stays an escape). Called on a facts record
 // with `form` set to the MOp's, by make_unit, which then clears `form` if this says no.
 bool generates(const OpFacts& o);
@@ -118,6 +133,11 @@ struct RowCtx {
   std::string setp(unsigned reg, const std::string& value);  // the statement that writes the executing lanes of a predicate
   std::string flush_pre();                                    // takes `pre`
   void sync(std::string& out, bool invalidate);              // stores every dirty row and predicate; invalidate: forget all copies (an escape follows)
+  bool esc_sets = true;                                       // sync_escape uses the escape's sets (false: sync(out, true))
+  // Before an escape: stores the dirty rows and predicates the escape reads or writes, forgets the ones it writes, keeps the others.
+  void sync_escape(std::string& out, const EscapeSets& e);
+  std::string dirty_stores() const;                           // the stores of every dirty row and predicate (the landing code of an escape that throws)
+  bool any_dirty() const;
   std::string decls() const;
 };
 
@@ -137,6 +157,7 @@ struct Config {
   std::string path;                 // PATH to search; "": the process's
   std::string extra_flags;          // appended to the compile command (and part of the key)
   bool residence = true;            // keep register-file rows in locals within a region (VGPU_JIT_RESIDENCE=0: not)
+  bool escape_sets = true;          // keep rows an escape does not touch in locals across it (milestone 4a; VGPU_JIT_ESCAPE_SETS=0: milestone 3's code)
   unsigned timeout_s = 120;         // wall limit of one compile
   unsigned mem_mb = 4096;           // RLIMIT_AS of the compiler
   // For tests: replaces dlopen (returns null and fills the error on a failure), and the ISA level the key and flags use.
@@ -180,7 +201,7 @@ class Engine {
   explicit Engine(Config cfg);
   ~Engine();
   // The C++ the generator writes for the unit (deterministic: a function of the spec only).
-  static std::string source(const UnitSpec& spec, bool avx2 = true, bool residence = true);
+  static std::string source(const UnitSpec& spec, bool avx2 = true, bool residence = true, bool esc_sets = true);
   // The words the object's metadata array must hold for the spec.
   static std::vector<uint32_t> meta(const UnitSpec& spec);
   // The 32-hex-digit key: the source, the compiler's identity, flags, ISA level, ABI and generator versions. Empty (and `why` set) with no compiler.
