@@ -857,6 +857,32 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
   }
   MemoryManager& mem = c.r->memory();
   uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
+  if (ex && ((ex + (ex & -ex)) & ex) == 0) {
+    // Consecutive lanes on consecutive 16-byte pieces (a float4 or an int4 array indexed by the thread): one run of memory, made as
+    // 8-byte pieces like the general access, with the lanes' four words shuffled between it and the four register rows.
+    const unsigned first = static_cast<unsigned>(std::countr_zero(ex)), count = popc(ex);
+    const uint64_t g0 = addrs[first];
+    uint64_t differ = 0;
+    for (unsigned i = 0; i < count; ++i) differ |= addrs[first + i] ^ (g0 + uint64_t{i} * 16);
+    if (differ == 0 && (g0 >= kWinEnd || g0 + uint64_t{count} * 16 - 1 < kConstWindow)) {
+      uint32_t buf[32 * 4];
+      bool done;
+      if (Store) {
+        for (unsigned i = 0; i < count; ++i)
+          for (unsigned k = 0; k < 4; ++k) buf[4 * i + k] = d ? d[32 * k + first + i] : 0u;
+        done = mem.store_run(g0, buf, uint64_t{count} * 16, 8);
+      } else {
+        done = mem.load_run(g0, buf, uint64_t{count} * 16, 8);
+        if (done && d)
+          for (unsigned i = 0; i < count; ++i)
+            for (unsigned k = 0; k < 4; ++k) d[32 * k + first + i] = buf[4 * i + k];
+      }
+      if (done) {
+        count_run(blk.st, Store, g0, first, count, ex, 16);
+        return;
+      }
+    }
+  }
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     uint32_t v[4];
