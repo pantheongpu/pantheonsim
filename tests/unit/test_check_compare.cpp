@@ -37,6 +37,13 @@ VTEST(a_verdict_line_with_a_time_is_not_dropped) {
   VCHECK(cmp("PASSED in 0.3 s\n", "PASSED in 7.7 s\n").verdict == Verdict::TimingOnly);
   VCHECK(cmp("PASSED in 0.3 s\n", "FAILED in 0.3 s\n").verdict == Verdict::Differs);
   VCHECK(is_verdict_line("Result: FAILED"));
+  // A count on a verdict line that happens to say "CPU" is compared, not masked (PolyBench prints this line).
+  const std::string zero = "Non-Matching CPU-GPU Outputs Beyond Error Threshold of 0.05 Percent: 0\n";
+  const std::string some = "Non-Matching CPU-GPU Outputs Beyond Error Threshold of 0.05 Percent: 5\n";
+  VCHECK(is_timing_line(zero));
+  VCHECK(cmp(zero, zero).verdict == Verdict::Identical);
+  VCHECK(cmp(zero, some).verdict == Verdict::NumericClose);
+  VCHECK_EQ(detail::mask_time_numbers("took 0.3 s, 12 ms, 5 GB/s, 7 items"), std::string("took # s, # ms, # GB/s, 7 items"));
 }
 
 VTEST(identity_lines_are_set_aside) {
@@ -85,7 +92,7 @@ VTEST(noisy_lines_of_the_card_are_masked) {
 }
 
 VTEST(crlf_and_trailing_blank_lines) {
-  VCHECK(cmp("a 1\r\nb 2\r\n\n\n", "a 1\nb 2\n").verdict == Verdict::TimingOnly);  // the blank lines were dropped
+  VCHECK(cmp("a 1\r\nb 2\r\n\n\n", "a 1\nb 2\n").verdict == Verdict::Identical);  // blank lines never count
 }
 
 VTEST_MAIN

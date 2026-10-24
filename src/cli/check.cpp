@@ -486,6 +486,8 @@ int cmd_check(const std::vector<std::string>& args) {
   if (show_ignored) {
     for (const auto& l : fn.dropped_lines) std::printf("  dropped (card):      %s\n", l.c_str());
     for (const auto& l : fs.dropped_lines) std::printf("  dropped (simulator): %s\n", l.c_str());
+    for (const auto& l : fn.masked_lines) std::printf("  time masked (card):      %s\n", l.c_str());
+    for (const auto& l : fs.masked_lines) std::printf("  time masked (simulator): %s\n", l.c_str());
     for (const auto& l : fn.identity) std::printf("  identity (card):      %s\n", l.c_str());
     for (const auto& l : fs.identity) std::printf("  identity (simulator): %s\n", l.c_str());
   }

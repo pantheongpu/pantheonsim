@@ -27,13 +27,13 @@ c=("$vgpu" check --card "NVIDIA A10G" --gpu nvidia/a10g)
 
 status "the same output on both sides agrees" 0 -- "${c[@]}" sh -c 'echo answer 42'
 says "it says so" "the simulator agrees with the card"
-status "timing lines are ignored" 0 -- "${c[@]}" sh -c 'echo answer 42; echo "took $RANDOM s"'
+status "timing lines are ignored" 0 -- "${c[@]}" sh -c 'echo answer 42; echo "took $(od -An -N2 -tu2 /dev/urandom) s"'
 says "the ignored lines are counted" "timing/blank line"
 status "a difference has its own code" 3 -- "${c[@]}" sh -c 'echo "gpu=$VGPU_GPU"'
 status "a difference shows with --show-diff" 3 -- "${c[@]}" --show-diff sh -c 'echo "gpu=$VGPU_GPU"'
 says "the first differing pair is printed" "first difference"
 status "different exit codes are a difference" 3 -- "${c[@]}" sh -c 'if [ -n "$VGPU_GPU" ]; then exit 1; fi'
-status "a card that disagrees with itself is masked, not held against the simulator" 0 -- "${c[@]}" sh -c 'echo seed $RANDOM; echo answer 42'
+status "a card that disagrees with itself is masked, not held against the simulator" 0 -- "${c[@]}" sh -c 'echo seed $(od -An -N2 -tu2 /dev/urandom); echo answer 42'
 says "the noise is reported" "not reproducible"
 status "noise on the answer line is still compared" 0 -- "${c[@]}" --native-runs 1 sh -c 'echo answer 42'
 rm -f "$work/cnt"

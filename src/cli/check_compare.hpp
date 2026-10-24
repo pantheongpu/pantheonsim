@@ -108,7 +108,9 @@ inline bool is_identity_line(const std::string& line, const std::vector<std::str
 }
 
 // A line that states an outcome. If such a line also mentions a time ("PASSED in 0.3 s") it is not dropped: dropping it would let a
-// FAILED on one side hide behind a PASSED on the other. It is compared with its numbers replaced instead.
+// FAILED on one side hide behind a PASSED on the other. It is compared with only the numbers that carry a time unit masked, so a count
+// of mismatches ("Non-Matching CPU-GPU Outputs ...: 0") is still compared. A verdict line whose time number has no unit differs between
+// runs and is reported as a difference; --show-diff shows it.
 inline bool is_verdict_line(const std::string& line) {
   const std::string l = detail::lower(line);
   for (const char* w : {"pass", "passed", "fail", "failed", "failure", "error", "errors", "mismatch", "mismatches", "valid", "invalid",
@@ -122,6 +124,7 @@ struct Filtered {
   std::vector<std::string> identity;  // compared separately: a difference is an identity difference
   size_t dropped = 0;                 // timing lines and blank lines
   std::vector<std::string> dropped_lines;  // the timing lines, for --show-ignored
+  std::vector<std::string> masked_lines;   // verdict lines that mention a time: kept, with the numbers that carry a time unit masked
 };
 
 inline std::vector<std::string> split_lines(const std::string& t) {
@@ -149,7 +152,7 @@ inline bool bare_number(const std::string& l) {
 }
 
 namespace detail {
-inline std::string skeleton(const std::string& s, std::vector<double>& nums);  // defined below
+inline std::string mask_time_numbers(const std::string& s);  // defined below
 }
 
 // A bare number on the line after a timing line belongs to it (PolyBench prints "GPU Time in seconds:" and then the value).
@@ -160,8 +163,8 @@ inline Filtered filter(const std::string& text, const std::vector<std::string>& 
     const bool timing = is_timing_line(l);
     const bool blank = l.find_first_not_of(" \t") == std::string::npos;
     if (timing && !blank && is_verdict_line(l)) {
-      std::vector<double> ignored;
-      f.kept.push_back(detail::skeleton(l, ignored));
+      f.kept.push_back(detail::mask_time_numbers(l));
+      f.masked_lines.push_back(l);  // listed by --show-ignored, and what makes the pair "timing only" and not "identical"
       prev_timing = false;
       continue;
     }
@@ -263,6 +266,35 @@ inline std::string skeleton(const std::string& s, std::vector<double>& nums) {
   return out;
 }
 
+// Replaces each number that is followed by a unit of time or speed ("0.3 s", "12ms", "5 GB/s") with '#'.
+inline std::string mask_time_numbers(const std::string& s) {
+  static const char* const kUnits[] = {"s", "ms", "us", "ns", "sec", "secs", "second", "seconds", "msec", "usec", "min", "gb/s", "gib/s",
+                                       "mb/s", "gflops", "gflop/s", "tflops", "fps"};
+  std::string out;
+  for (size_t i = 0; i < s.size();) {
+    const char c = s[i];
+    if (std::isdigit(static_cast<unsigned char>(c)) || ((c == '-' || c == '+' || c == '.') && i + 1 < s.size())) {
+      const Num n = scan_number(s, i);
+      if (n.ok && n.e > i) {
+        size_t j = n.e;
+        while (j < s.size() && s[j] == ' ') ++j;
+        size_t k = j;
+        while (k < s.size() && (std::isalpha(static_cast<unsigned char>(s[k])) || s[k] == '/')) ++k;
+        const std::string unit = lower(s.substr(j, k - j));
+        bool is_unit = false;
+        for (const char* u : kUnits) is_unit = is_unit || unit == u;
+        if (is_unit) { out += '#'; i = n.e; continue; }
+        out.append(s, i, n.e - i);
+        i = n.e;
+        continue;
+      }
+    }
+    out += c;
+    ++i;
+  }
+  return out;
+}
+
 }  // namespace detail
 
 // Compares two filtered outputs. `mask`, if given, has one entry per kept line of `a`: true lines are skipped (lines that differ
@@ -304,7 +336,7 @@ inline Compared compare(const Filtered& a, const Filtered& b, const std::vector<
   }
   if (same_text) {
     if (a.identity != b.identity) r.verdict = Verdict::IdentityOnly;
-    else if (a.kept == b.kept && a.dropped_lines == b.dropped_lines) r.verdict = Verdict::Identical;
+    else if (a.kept == b.kept && a.dropped_lines == b.dropped_lines && a.masked_lines == b.masked_lines) r.verdict = Verdict::Identical;
     else r.verdict = Verdict::TimingOnly;
     return r;
   }
