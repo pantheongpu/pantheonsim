@@ -1049,16 +1049,21 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
   const uint32_t* base = ra != kRZ ? c.R + ra * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
   const uint64_t imm = static_cast<uint64_t>(op.imm);
-  uint64_t addrs[32] = {};
+  uint64_t addrs[32];
   const uint64_t ssize = blk.shared.size();
   exec::SharedWindowCheck window;   // (as exec_mem: see window_check.hpp)
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+  const auto lane_address = [&](unsigned l) {
     uint64_t v = base ? base[l] : 0;
     if (stride) v *= stride;
     const uint64_t off = static_cast<uint32_t>(v + urv + imm);
     addrs[l] = off;
     window.add(off, blk.rank);
+  };
+  if (ex == kAll) {   // a full warp: a counted loop
+    for (unsigned l = 0; l < 32; ++l) lane_address(l);
+  } else {
+    for (unsigned l = 0; l < 32; ++l) addrs[l] = 0;   // (the lanes that do not run read as zero, as the counting functions find them)
+    for (Mask m = ex; m; m &= m - 1) lane_address(static_cast<unsigned>(std::countr_zero(m)));
   }
   const bool inside = window.inside(ssize, bytes, ex != 0);
   if (!inside) {
