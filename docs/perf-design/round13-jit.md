@@ -100,15 +100,16 @@ test program that passes with the JIT passes with the verifier on (0 violations:
 All on the final code (commit `ecd7fb8e`) unless it says otherwise. The speed measurements were taken on the binary of `e8d35026`, which differs from it by one static function
 (`escape_sets_on`: no retained rows across a call in code compiled with `-fno-exceptions`), a change that does not touch the text generated with the default flags.
 
-* **CUDA 13.0 build** (CI image, Release): `test_jit` 21/21, `test_jit_resid` PASS (64 units: 768 regions, 4608 runs, 1455 declared escapes, 0 failures; 300 units: still running at the time of this commit), `test_tier` 8/8,
+* **CUDA 13.0 build** (CI image, Release): `test_jit` 21/21, `test_jit_resid` PASS (64 units: 768 regions, 4608 runs, 1455 declared escapes, 0 failures; 300 units: 3600 regions, 21600 runs, 67045 generated ops, 6964 escapes that declare their sets, 59760 escapes executed, 0 failures), `test_tier` 8/8,
   `test_fastpath` 38/38, `test_simd` 25/25.
 * **`run_sass_jit.sh`, the PR gate** (`sass_tier` and `sass_tier_steps` on sm_86 with every variant: counters, 1 and 4 threads, warm cache, background compile, chain off, sets off,
   every escape verified; the fault programs, tier against JIT, with and without `-fexceptions`; the sweeps of `VGPU_MAX_STEPS`; regions capped at 255/256/257; one seed of random kernels;
   the failure modes): **PASS**. `sass_tier_steps` ran 557 M warp instructions in 342 regions (556 M of them computed by generated code). The first run of the gate on the branch **failed**: the
   fault programs compiled with `-fno-exceptions` (generated code with a `try`) did not build and printed a compile notice; fixed by not retaining rows across calls in that mode
   (`escape_sets_on`); the second run passed. (A run of the gate started while the build tree was being rebuilt under it failed in `jit_random`; that run is not counted.)
+* **Random CUDA kernels** (`jit_random.py` through `run_sass_jit.sh`, `VGPU_JIT_ONLY_RANDOM=1 VGPU_JIT_RANDOM_SEEDS=8`: 8 seeds x 16 kernels x blocks of 128, 48 and 33 threads, every region compiled, tier against JIT, 1 and 4 threads): **PASS** (about 90% of the region instructions computed by generated code). These kernels have loads but no new generated form, so they test the sets only through the escapes they contain.
 * **`e2e_sass_tier`** (tier against the interpreter, `run_sass_tier.sh`; I kept the last six lines of its output): **PASS**.
-* **`e2e_sass_archs` with `VGPU_JIT=1 VGPU_JIT_THRESHOLD=1 VGPU_JIT_SYNC=1 VGPU_JIT_HOT_PERMILLE=0 VGPU_JIT_MAX_OPS=100000000 VGPU_JIT_MIN_REGION=2`**: still running at the time of this commit (started 18:37 UTC).
+* **`e2e_sass_archs` with `VGPU_JIT=1 VGPU_JIT_THRESHOLD=1 VGPU_JIT_SYNC=1 VGPU_JIT_HOT_PERMILLE=0 VGPU_JIT_MAX_OPS=100000000 VGPU_JIT_MIN_REGION=2`**: **PASS** (`nvidia/tests/e2e/run_sass_archs.sh`, every program on every generation from sm_75 to sm_120a; I kept only the last 15 lines of its output, so the count of `ok` lines is not recorded, and I did not capture the JIT's statistics of this run: that regions ran in it is inferred from the environment, not shown). 1 h 32 min on 16 CPUs, concurrently with other runs.
 * **Harness counter check** (`bench.sh --check-counters`): PASS without the JIT (16 workloads x SASS and PTX) and PASS with the JIT forced on every region
   (`VGPU_JIT_THRESHOLD=1 VGPU_JIT_SYNC=1 VGPU_JIT_HOT_PERMILLE=0 VGPU_JIT_MIN_REGION=2`).
 * **Every escape verified** (`VGPU_JIT_VERIFY_SETS=1`) on every test program of `run_sass_tier.sh` (7 architectures plus the 44 others), the 16 harness workloads at quick size and the five
