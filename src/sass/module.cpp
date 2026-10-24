@@ -225,6 +225,7 @@ std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& m
       throw Error(Err::InvalidValue, "cubin: kernel " + c.kernels[i].name + " has no code");
     m->kernel_index[c.kernels[i].name] = i;
   }
+  m->statics_slots = std::make_unique<std::atomic<const Module::KernelStatics*>[]>(c.kernels.size());
 
   // Device memory for everything a kernel addresses: constant banks (except
   // bank 0, which each launch builds) and the module's variables.

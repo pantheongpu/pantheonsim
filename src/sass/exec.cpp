@@ -422,6 +422,40 @@ inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) {
   return std::min(std::min(a, b), std::min(c, d));
 }
 
+// A kernel's Module::KernelStatics: the module's (made by the first launch of the kernel), or, for a module that load() did not make,
+// one of the launch's own in `own`.
+std::unique_ptr<Module::KernelStatics> compute_statics(const Module& m, const CubinKernel& k) {
+  auto ks = std::make_unique<Module::KernelStatics>();
+  for (const auto& [name, va] : m.bank_va) {
+    // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
+    const size_t dot = name.find('.', 12);
+    const unsigned bank = static_cast<unsigned>(std::stoul(name.substr(12, dot == std::string::npos ? std::string::npos : dot - 12)));
+    if (dot != std::string::npos && name.substr(dot + 1) != k.name) continue;
+    if (bank >= 32) continue;   // (a bank is named by five bits of an instruction)
+    ks->bank_bound |= 1u << bank;
+    ks->bank_va[bank] = va;
+    ks->bank_size[bank] = m.cubin.section(name)->size;
+  }
+  ks->bank0_template = m.cubin.section(".nv.constant0." + k.name);
+  const auto it = m.code_index.find(k.text_section);
+  ks->entry = m.code[it->second].base;
+  return ks;
+}
+
+const Module::KernelStatics* kernel_statics(const Module& m, const CubinKernel& k, std::unique_ptr<const Module::KernelStatics>& own) {
+  const size_t index = static_cast<size_t>(&k - m.cubin.kernels.data());
+  if (!m.statics_slots || index >= m.cubin.kernels.size()) return (own = compute_statics(m, k)).get();
+  std::atomic<const Module::KernelStatics*>& slot = m.statics_slots[index];
+  if (const Module::KernelStatics* have = slot.load(std::memory_order_acquire)) return have;
+  std::unique_ptr<const Module::KernelStatics> made = compute_statics(m, k);
+  std::lock_guard<std::mutex> g(m.statics_mu);
+  if (const Module::KernelStatics* have = slot.load(std::memory_order_relaxed)) return have;
+  const Module::KernelStatics* raw = made.get();
+  m.statics_owner.push_back(std::move(made));
+  slot.store(raw, std::memory_order_release);
+  return raw;
+}
+
 class Runner {
  public:
   Runner(const Module& m, const CubinKernel& k, const exec::LaunchConfig& cfg,
@@ -487,17 +521,9 @@ class Runner {
       const char* tc = std::getenv("VGPU_TIER_CHAIN");
       tier_chain_ = !(tc && tc[0] == '0');
     }
+    ks_ = kernel_statics(m, k, own_statics_);
+    entry_ = ks_->entry;
     build_bank0(args);
-    for (const auto& [name, va] : m.bank_va) {
-      // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
-      const size_t dot = name.find('.', 12);
-      const unsigned bank = static_cast<unsigned>(std::stoul(name.substr(12, dot == std::string::npos ? std::string::npos : dot - 12)));
-      if (dot != std::string::npos && name.substr(dot + 1) != k.name) continue;
-      bank_va_[bank] = va;
-      bank_size_[bank] = m.cubin.section(name)->size;
-    }
-    const auto it = m.code_index.find(k.text_section);
-    entry_ = m.code[it->second].base;
   }
 
   exec::LaunchStats run();
@@ -653,7 +679,8 @@ class Runner {
   bool tier_stats_ = false;
   bool tier_chain_ = true;   // VGPU_TIER_CHAIN=0: one run per call of step_warp, as the interpreter's (tier_ops.inc)
   std::vector<uint8_t> bank0_;
-  std::map<unsigned, uint64_t> bank_va_, bank_size_;
+  const Module::KernelStatics* ks_ = nullptr;
+  std::unique_ptr<const Module::KernelStatics> own_statics_;   // for a module that load() did not make
   uint64_t entry_ = 0;
   uint64_t coop_ws_ = 0;
   uint32_t local_size_ = 0;
@@ -715,7 +742,7 @@ struct ChildRunner {
 //   0x118 the global memory descriptor (64), which .E loads name
 //   param_base: the parameters, laid out as .nv.info says
 void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
-  const CubinSection* tmpl = m_.cubin.section(".nv.constant0." + k_.name);
+  const CubinSection* tmpl = ks_->bank0_template;
   bank0_.assign(std::max<size_t>(tmpl ? tmpl->size : 0, k_.param_base + k_.param_size + 16), 0);
   if (tmpl && !tmpl->bytes.empty()) std::memcpy(bank0_.data(), tmpl->bytes.data(), tmpl->bytes.size());
   const auto put32 = [&](size_t off, uint32_t v) { std::memcpy(&bank0_[off], &v, 4); };
@@ -830,9 +857,8 @@ uint32_t Runner::cbank32(unsigned bank, uint64_t offset) const {
     std::memcpy(&v, &bank0_[offset], 4);
     return v;
   }
-  const auto it = bank_va_.find(bank);
-  if (it == bank_va_.end() || offset + 4 > bank_size_.at(bank)) return 0;   // unbound: reads zero
-  return static_cast<uint32_t>(mem_.load_scalar(it->second + offset, 4));
+  if (bank >= 32 || !((ks_->bank_bound >> bank) & 1) || offset + 4 > ks_->bank_size[bank]) return 0;   // unbound: reads zero
+  return static_cast<uint32_t>(mem_.load_scalar(ks_->bank_va[bank] + offset, 4));
 }
 
 // ---- fetch and operands --------------------------------------------------------
@@ -978,8 +1004,7 @@ Runner::Space Runner::classify(uint64_t g, uint64_t* off) const {
   }
   if (g >= kConstWindow && g < kConstWindow + (uint64_t{1} << 32)) {
     // __constant__ data: a global address of the allocation that holds bank 3
-    const auto it = bank_va_.find(3);
-    *off = it == bank_va_.end() ? g : it->second + (g - kConstWindow);
+    *off = (ks_->bank_bound >> 3) & 1 ? ks_->bank_va[3] + (g - kConstWindow) : g;
     return Space::Global;
   }
   *off = g;
