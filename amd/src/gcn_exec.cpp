@@ -9845,12 +9845,26 @@ struct Machine {
       const bool done = quads ? m.load_quad_run(addr, count, reinterpret_cast<uint64_t*>(buf))
                               : m.load_run(addr, buf, uint64_t{stride} * count, unit);
       if (!done) return 0;
-      for (uint32_t i = 0; i < count; ++i)
-        for (uint32_t k = 0; k < run_words; ++k) set_word(w, in.dst[0], k, lane + i, buf[i * run_words + k]);
+      if (data.kind != OperandKind::Agpr) {   // (register k's row, a word of each lane's data in turn)
+        for (uint32_t k = 0; k < run_words; ++k) {
+          uint32_t* row = w.vgpr[data.index + k].data() + lane;
+          for (uint32_t i = 0; i < count; ++i) row[i] = buf[i * run_words + k];
+        }
+      } else {
+        for (uint32_t i = 0; i < count; ++i)
+          for (uint32_t k = 0; k < run_words; ++k) set_word(w, in.dst[0], k, lane + i, buf[i * run_words + k]);
+      }
       std::memcpy(words, buf + (count - 1) * run_words, 4 * run_words);
     } else {
-      for (uint32_t i = 0; i < count; ++i)
-        for (uint32_t k = 0; k < run_words; ++k) buf[i * run_words + k] = word(w, in.src[1], k, lane + i);
+      if (data.kind != OperandKind::Agpr) {
+        for (uint32_t k = 0; k < run_words; ++k) {
+          const uint32_t* row = w.vgpr[data.index + k].data() + lane;
+          for (uint32_t i = 0; i < count; ++i) buf[i * run_words + k] = row[i];
+        }
+      } else {
+        for (uint32_t i = 0; i < count; ++i)
+          for (uint32_t k = 0; k < run_words; ++k) buf[i * run_words + k] = word(w, in.src[1], k, lane + i);
+      }
       const bool done = quads ? m.store_quad_run(addr, count, reinterpret_cast<const uint64_t*>(buf))
                               : m.store_run(addr, buf, uint64_t{stride} * count, unit);
       if (!done) return 0;
