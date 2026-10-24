@@ -736,6 +736,12 @@ class MemoryManager {
     // below the mmap base first; if one is ever mapped there, this is set and
     // device addresses go through the range check again.
     std::atomic<bool> in_device_window{false};
+    // Whether any address from `first` to `last` (inclusive, first <= last) may_contain would not rule out: a range wholly in
+    // the device windows (one interval) is ruled out as one address is.
+    bool may_overlap(uint64_t first, uint64_t last) const {
+      if (is_device_va(first) && is_device_va(last) && !in_device_window.load(std::memory_order_relaxed)) return false;
+      return first < hi.load(std::memory_order_relaxed) && last >= lo.load(std::memory_order_relaxed);
+    }
     bool may_contain(uint64_t addr) const {
       if (is_device_va(addr) && !in_device_window.load(std::memory_order_relaxed)) return false;
       return addr >= lo.load(std::memory_order_relaxed) &&

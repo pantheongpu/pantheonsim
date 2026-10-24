@@ -9341,6 +9341,33 @@ struct Machine {
     }
   }
 
+  // A buffer load or store of one word a lane, for the whole wave: each lane's address and whether it is inside the resource
+  // (`fits`, which reads `index`, the lane's), then the lanes that are inside made together (wave_scalars's way, one lookup for
+  // the lot); the others read zero or write nothing. False, having done nothing, where the memory manager declines.
+  template <class Fits>
+  [[gnu::noinline]] bool buffer_words(Wave& w, const Inst& in, bool store, const Operand& data, const Operand& vaddr, uint64_t origin,
+                                      uint32_t stride, Fits& fits, uint32_t& index) {
+    uint64_t addrs[kLanes], vals[kLanes];
+    uint32_t lanes[kLanes];
+    uint32_t n = 0;
+    uint64_t outside = 0;   // (lanes that read zero)
+    for (uint64_t m = w.exec; m; m &= m - 1) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+      index = in.idxen ? word(w, vaddr, 0, lane) : 0;
+      const uint64_t offset = uint64_t{in.offen ? word(w, vaddr, in.idxen ? 1 : 0, lane) : 0} + static_cast<uint32_t>(in.offset);
+      if (fits(offset, 4)) addrs[n] = origin + offset + uint64_t{index} * stride, lanes[n++] = lane;
+      else outside |= uint64_t{1} << lane;
+    }
+    if (store) {
+      for (uint32_t i = 0; i < n; ++i) vals[i] = word(w, data, 0, lanes[i]);
+      return n == 0 || mem.store_batch(addrs, n, 4, vals);
+    }
+    if (n && !mem.load_batch(addrs, n, 4, vals)) return false;
+    for (uint32_t i = 0; i < n; ++i) set_word(w, data, 0, lanes[i], static_cast<uint32_t>(vals[i]));
+    for (; outside; outside &= outside - 1) set_word(w, data, 0, static_cast<uint32_t>(__builtin_ctzll(outside)), 0);
+    return true;
+  }
+
   void buffer_access(Wave& w, const Inst& in, Group& g) {
     if (!w.exec) return;
     // A load with the LDS bit has no data register: its sources are the
@@ -9429,26 +9456,31 @@ struct Machine {
     const bool is_half = mf.half_bytes != 0;
     const bool atomic = mf.body_atomic;
     const bool returns = atomic && (in.cache & 1);
+    // A resource whose data format is 0 (BUF_DATA_FORMAT_INVALID) holds
+    // nothing: every access is out of range, which MIOpen's hand-written
+    // kernels use to switch a store off.
+    uint32_t index = 0;   // (the lane's, set by whichever loop is running)
+    const auto fits = [&](uint64_t at, uint64_t bytes) {
+      if (!valid_format) return false;
+      if (rdna) switch (oob_select) {
+          case 0:   // structured: the index within the records, the offset within an element
+            return stride ? index < records && at + bytes <= stride : soffset + at + bytes <= records;
+          case 1: return index < records;              // the index alone
+          case 2: return records != 0;                 // only an empty buffer is out of range
+          default: return soffset + at + bytes <= records;   // raw: bytes, from the offset
+        }
+      return stride ? index < records : soffset + at + bytes <= records;
+    };
+    // Plain dword loads and stores, one word a lane: the whole wave at once where the memory manager takes it (buffer_words).
+    if (!lds_dma && !formatted && !is_half && !part && (mf.load_dword || mf.store_dword) && data.width == 1 && d.peers.empty() &&
+        runs_on && buffer_words(w, in, mf.store_dword, data, vaddr, base + soffset, stride, fits, index))
+      return;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
-      const uint32_t index = in.idxen ? word(w, vaddr, 0, lane) : 0;
+      index = in.idxen ? word(w, vaddr, 0, lane) : 0;
       const uint64_t offset = uint64_t{in.offen ? word(w, vaddr, in.idxen ? 1 : 0, lane) : 0} +
                               static_cast<uint32_t>(in.offset);
       const uint64_t addr = base + soffset + offset + uint64_t{index} * stride;
-      // A resource whose data format is 0 (BUF_DATA_FORMAT_INVALID) holds
-      // nothing: every access is out of range, which MIOpen's hand-written
-      // kernels use to switch a store off.
-      const auto fits = [&](uint64_t at, uint64_t bytes) {
-        if (!valid_format) return false;
-        if (rdna) switch (oob_select) {
-            case 0:   // structured: the index within the records, the offset within an element
-              return stride ? index < records && at + bytes <= stride : soffset + at + bytes <= records;
-            case 1: return index < records;              // the index alone
-            case 2: return records != 0;                 // only an empty buffer is out of range
-            default: return soffset + at + bytes <= records;   // raw: bytes, from the offset
-          }
-        return stride ? index < records : soffset + at + bytes <= records;
-      };
       if (lds_dma) {
         // Out of range reads zero, as for any buffer load.
         const uint64_t to = lds_at + uint64_t{lane} * (lds_words > 1 ? 16 : 4);   // "(TIDinWave * 16)" for three or four dwords
@@ -9789,6 +9821,45 @@ struct Machine {
       if (!done) return 0;
     }
     return count;
+  }
+
+  // The active lanes from `from` on, each moving one scalar (a byte, a short, a word or a pair; `lane_addr[lane]` its address),
+  // made together by the memory manager (MemoryManager::load_batch / store_batch): what lane by lane would do, one lookup for
+  // the allocation instead of one a lane. A load puts each lane's value in `data` (`words` registers, or the one a byte or a short is
+  // widened into, with `narrow`); a store reads it from there. Returns true having done every one of them, or false having done
+  // nothing -- a fault armed, a host mapping, an address misaligned or outside the one allocation the first is in -- and the lanes
+  // then go one at a time and meet any error where they would. Lanes of a load that follow a lane with the same address take the
+  // value that lane got (the one-read-per-address rule of the load memo). Out of line, as memory_run is.
+  [[gnu::noinline]] bool wave_scalars(Wave& w, bool store, uint32_t from, const uint64_t* lane_addr, const Operand& data,
+                                      uint32_t words, const Narrow* narrow_by) {
+    const uint32_t bytes = narrow_by ? narrow_by->bytes : 4 * words;
+    uint64_t addrs[kLanes], vals[kLanes];
+    uint32_t lanes[kLanes];
+    uint32_t n = 0;
+    for (uint64_t m = w.exec >> from << from; m; m &= m - 1) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+      addrs[n] = lane_addr[lane], lanes[n++] = lane;
+    }
+    if (!n) return true;
+    if (store) {
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t lo = word(w, data, 0, lanes[i]);
+        vals[i] = words == 2 ? lo | uint64_t{word(w, data, 1, lanes[i])} << 32 : lo;
+      }
+      return mem.store_batch(addrs, n, bytes, vals);
+    }
+    if (!mem.load_batch(addrs, n, bytes, vals)) return false;
+    for (uint32_t i = 1; i < n; ++i)
+      if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
+    for (uint32_t i = 0; i < n; ++i) {
+      if (narrow_by) {
+        set_word(w, data, 0, lanes[i], widen(vals[i], *narrow_by));
+      } else {
+        set_word(w, data, 0, lanes[i], static_cast<uint32_t>(vals[i]));
+        if (words == 2) set_word(w, data, 1, lanes[i], static_cast<uint32_t>(vals[i] >> 32));
+      }
+    }
+    return true;
   }
 
   void global_access(Wave& w, const Inst& in) {

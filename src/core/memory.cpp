@@ -571,11 +571,21 @@ bool MemoryManager::batch_ok(const uint64_t* addrs, size_t count, uint32_t size,
   }
   const Allocation* a = find_ordinary(addrs[0], size, base);
   if (!a) return false;
+  // One pass for the three tests every address must pass: aligned, inside the allocation (an address below its base wraps to
+  // an offset far above any size), and not in reach of a host mapping -- which the range of the lot answers unless it overlaps
+  // the maps' range, and then each address is asked.
+  uint64_t bits = 0, max_off = 0, lo = addrs[0], hi = addrs[0];
   for (size_t i = 0; i < count; ++i) {
     const uint64_t off = addrs[i] - *base;
-    if ((addrs[i] & (size - 1)) || off >= a->size || size > a->size - off) return false;
-    if (host_maps_ && host_maps_->may_contain(addrs[i])) return false;
+    bits |= addrs[i];
+    max_off = off > max_off ? off : max_off;
+    lo = addrs[i] < lo ? addrs[i] : lo;
+    hi = addrs[i] > hi ? addrs[i] : hi;
   }
+  if ((bits & (size - 1)) || max_off >= a->size || size > a->size - max_off) return false;
+  if (host_maps_ && host_maps_->may_overlap(lo, hi))
+    for (size_t i = 0; i < count; ++i)
+      if (host_maps_->may_contain(addrs[i])) return false;
   *alloc = a;
   return true;
 }
@@ -584,12 +594,22 @@ bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t siz
   const Allocation* a = nullptr;
   uint64_t base = 0;
   if (!batch_ok(addrs, count, size, /*store=*/false, &a, &base)) return false;
-  for (size_t i = 0; i < count; ++i) {
-    const uint64_t off = addrs[i] - base;
-    const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
-    if (!chunk) out[i] = 0;
-    else if (is_uniform(chunk)) out[i] = repeated(uniform_byte(chunk), size);
-    else out[i] = load_at(chunk + off % kChunkSize, size);
+  // (The width a constant, so each load is the one instruction.)
+  const auto each = [&](auto width) {
+    constexpr uint32_t kSize = decltype(width)::value;
+    for (size_t i = 0; i < count; ++i) {
+      const uint64_t off = addrs[i] - base;
+      const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+      if (!chunk) out[i] = 0;
+      else if (is_uniform(chunk)) out[i] = repeated(uniform_byte(chunk), kSize);
+      else out[i] = load_at(chunk + off % kChunkSize, kSize);
+    }
+  };
+  switch (size) {
+    case 1: each(std::integral_constant<uint32_t, 1>()); break;
+    case 2: each(std::integral_constant<uint32_t, 2>()); break;
+    case 4: each(std::integral_constant<uint32_t, 4>()); break;
+    default: each(std::integral_constant<uint32_t, 8>()); break;
   }
   return true;
 }
