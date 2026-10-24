@@ -4240,5 +4240,7 @@ VOTEU 3,200 and S2UR 128 are the interpreter's, see below), the others 99.2% to 
   forms for strides and windows, not for this; left.
 * `step_warp` itself is 45% of `divergent` and flat (the three counters, `w.steps`, the guard, the call per op): the divergent path's cost is the per-lane work of
   `tier_set_pcs` and the branch select, 64-bit addresses a lane. Keeping the counters in registers across a run would touch the loop that tier 2 hooks into.
-* Not run on the experiment server: the sanitizer legs of the e2e programs (they need nvcc), TSan on the atomics (no unit test launches a kernel; the 8-thread bench run above
-  checks the lock change for lost updates, `atomics` result and counters per its own check), `test_jit` (fails on the base too: no `c++` on its PATH).
+* Sanitizers, on the experiment server: `test_tier`, `test_sass_lanes` and `test_sass_atomics` built `-fsanitize=address,undefined -O0` (Debug) and run with
+  `detect_leaks=1`, `halt_on_error=1`: clean. The cached bench program run on a shim built the same way (`LD_PRELOAD` of libasan, quick size) for `divergent`, `shared`,
+  `warp`, `atomics`, `mem` and `local`: all PASS, no report. The shim built `-fsanitize=thread -g -O1` (`setarch -R`, `VGPU_THREADS=4`) for `atomics`, `shared`,
+  `divergent` and `mem`: PASS, no warning. Not run there: the e2e programs and their sanitizer legs (no nvcc), `test_jit` (fails on the base too: no `c++` on its PATH).
