@@ -198,6 +198,8 @@ struct ShflShape {
 };
 // The shape of mode `mode` (0 idx, 1 up, 2 down, 3 bfly) with lane `b` and clamp word `cc`; kind None for any other.
 bool shfl_shape(unsigned mode, uint32_t b, uint32_t cc, ShflShape& out);
+// The shuffle `sh` of the 32 words at `src` into `out` (a full warp).
+void shfl_move(const ShflShape& sh, const uint32_t* src, uint32_t* out);
 
 // The analysis half. Fills in everything of `op` but `fn` (the executor binds handlers by `form`).
 // `sm` is the architecture the code was decoded for. Never throws on an instruction it does not take: Form::None.

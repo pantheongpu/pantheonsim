@@ -3642,54 +3642,11 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       // value) writes nothing a spinning peer could be waiting for (see Warp::idle_yields).
       bool changed = false;
       const uint32_t idle0 = w.idle_yields;
-      // The value the atomic stores, given the one it finds (old), the operand (v) and the exchange value (swap) of lane l.
+      // The value the atomic stores, given the one it finds (old), the operand (v) and the exchange value (swap) of lane l
+      // (vgpu/exec/sass_atomics.hpp has the rules).
       const auto apply = [&](unsigned l, const uint64_t old, const uint64_t v, const uint64_t swap) -> uint64_t {
-        uint64_t nw = old;
-        if (cas) {
-          if (old == v) nw = swap;
-        } else {
-          if (type == 4 || type == 7) {   // F16x2, BF16x2 (and their vectors): add, min or max on each half
-            const ptx::AtomOp fop = ins.f[0] == 1 ? ptx::AtomOp::Min : ins.f[0] == 2 ? ptx::AtomOp::Max : ptx::AtomOp::Add;
-            nw = exec::atom_word(fop, type == 7 ? 2 : 1, static_cast<uint32_t>(old), static_cast<uint32_t>(v));
-          } else
-          switch (popc_inc ? 3 : ins.f[0]) {
-            case 0:   // ADD, by the PTX engine's rules (an RTX 3060's)
-              if (type == 3) {
-                // .ftz on inputs and result; a NaN result is the canonical one.
-                const auto fz = [](float x) { return std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0f, x) : x; };
-                const float r = fz(fz(as_f32(static_cast<uint32_t>(old))) + fz(as_f32(static_cast<uint32_t>(v))));
-                nw = r != r ? 0x7fffffffu : f32_bits(r);
-              } else if (type == 6) {
-                // A NaN comes through as it is: the one added, else the one in memory.
-                const double x = as_f64(old), y = as_f64(v);
-                nw = std::isnan(y) ? v : std::isnan(x) ? old : f64_bits(x + y);
-              } else if (type == 4 || type == 7) {   // F16x2, BF16x2: each half added once in double
-                const ptx::Type ht{type == 7 ? ptx::Type::Kind::BF : ptx::Type::Kind::F, 16};
-                const uint64_t lo = exec::reduce_value(ptx::AtomOp::Add, ht, old & 0xffff, v & 0xffff);
-                const uint64_t hi = exec::reduce_value(ptx::AtomOp::Add, ht, (old >> 16) & 0xffff, (v >> 16) & 0xffff);
-                nw = lo | (hi << 16);
-              } else nw = old + v;
-              break;
-            case 1:   // MIN
-              if (type == 1) nw = static_cast<uint32_t>(std::min(static_cast<int32_t>(old), static_cast<int32_t>(v)));
-              else if (type == 5) nw = static_cast<uint64_t>(std::min(static_cast<int64_t>(old), static_cast<int64_t>(v)));
-              else nw = std::min(old, v);
-              break;
-            case 2:   // MAX
-              if (type == 1) nw = static_cast<uint32_t>(std::max(static_cast<int32_t>(old), static_cast<int32_t>(v)));
-              else if (type == 5) nw = static_cast<uint64_t>(std::max(static_cast<int64_t>(old), static_cast<int64_t>(v)));
-              else nw = std::max(old, v);
-              break;
-            case 3: nw = popc_inc ? old + 1 : (static_cast<uint32_t>(old) >= static_cast<uint32_t>(v) ? 0 : old + 1); break;   // INC
-            case 4: nw = (old == 0 || static_cast<uint32_t>(old) > static_cast<uint32_t>(v)) ? v : old - 1; break;             // DEC
-            case 5: nw = old & v; break;
-            case 6: nw = old | v; break;
-            case 7: nw = old ^ v; break;
-            case 8: nw = v; break;   // EXCH
-            default: fault(w, ins, l, "atomic op " + std::to_string(ins.f[0]));
-          }
-        }
-        if (!is64) nw &= 0xffffffff;
+        uint64_t nw;
+        if (!exec::sassatom::apply(ins.f[0], type, cas, popc_inc, old, v, swap, nw)) fault(w, ins, l, "atomic op " + std::to_string(ins.f[0]));
         if (nw != old) changed = true;
         return nw;
       };
@@ -3843,38 +3800,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
                   cur[slot[l]] = nw;
                 }
               };
-              const unsigned op = ins.f[0];
-              const bool halfs = type == 4 || type == 7;
-              if (cas) {
-                lanes([](unsigned, uint64_t old, uint64_t cmp, uint64_t swap) { return old == cmp ? swap : old; });
-              } else if (halfs) {   // (F16x2 and BF16x2: every operation works on the halves)
+              if (!exec::sassatom::dispatch(ins.f[0], type, cas, [&](auto step) {
+                    lanes([&](unsigned, uint64_t old, uint64_t x, uint64_t swap) { return step(old, x, swap); });
+                  }))
                 lanes([&](unsigned l, uint64_t old, uint64_t x, uint64_t swap) { return apply(l, old, x, swap); });
-              } else if (op == 0 && (type == 0 || type == 1 || type == 2 || type == 5)) {
-                lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return old + x; });
-              } else if (op == 0 && type == 3) {
-                lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) {
-                  // .ftz on inputs and result; a NaN result is the canonical one (as apply, below, works it out on floats).
-                  const auto fz = [](uint32_t b) { return (b & 0x7f800000u) == 0 ? b & 0x80000000u : b; };
-                  const float sum = as_f32(fz(static_cast<uint32_t>(old))) + as_f32(fz(static_cast<uint32_t>(x)));
-                  return uint64_t{sum != sum ? 0x7fffffffu : fz(f32_bits(sum))};
-                });
-              } else if ((op == 1 || op == 2) && type == 0) {
-                if (op == 1) lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return std::min(old, x); });
-                else lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return std::max(old, x); });
-              } else if ((op == 1 || op == 2) && type == 2) {
-                if (op == 1) lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return std::min(old, x); });
-                else lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return std::max(old, x); });
-              } else if (op == 5) {
-                lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return old & x; });
-              } else if (op == 6) {
-                lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return old | x; });
-              } else if (op == 7) {
-                lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return old ^ x; });
-              } else if (op == 8) {
-                lanes([](unsigned, uint64_t, uint64_t x, uint64_t) { return x; });
-              } else {
-                lanes([&](unsigned l, uint64_t old, uint64_t x, uint64_t swap) { return apply(l, old, x, swap); });
-              }
               // (a store the memory declines leaves it as it was, and the loop does the lot: nothing above has an effect)
               done = mem_.store_batch(uaddr, nu, n, cur);
             }

@@ -48,6 +48,8 @@
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/mem_counters.hpp"
+#include "vgpu/exec/sass_atomics.hpp"
+#include "vgpu/exec/sass_lanes.hpp"
 #include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
@@ -267,24 +269,8 @@ uint64_t sass_max_steps(uint64_t configured) {
   return v == 0 ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(v);
 }
 
-// The lanes whose program counter is `p`, compared four to a movemask where SSE2 is there.
-inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
-  Mask eq = 0;
-#if defined(__SSE2__)
-  const __m128i want = _mm_set1_epi64x(static_cast<long long>(p));
-  for (unsigned i = 0; i < 32; i += 4) {
-    const __m128i a = _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i])), want);
-    const __m128i b = _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i + 2])), want);
-    // The low halves of the four lanes' addresses, and their high halves: a lane is equal when both are.
-    const __m128 lo = _mm_shuffle_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), _MM_SHUFFLE(2, 0, 2, 0));
-    const __m128 hi = _mm_shuffle_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), _MM_SHUFFLE(3, 1, 3, 1));
-    eq |= static_cast<Mask>(_mm_movemask_ps(_mm_and_ps(lo, hi))) << i;
-  }
-#else
-  for (unsigned i = 0; i < 32; ++i) eq |= static_cast<Mask>(w.pc[i] == p) << i;
-#endif
-  return eq;
-}
+// The lanes whose program counter is `p`.
+inline Mask tier_lanes_at(const Warp& w, uint64_t p) { return exec::sasslanes::lanes_at(w.pc, p); }
 
 // ---- kernels whose blocks wait on one another (vgpu/exec/lockstep.hpp) ----------------------------
 //
@@ -389,25 +375,8 @@ bool kernel_polls(const Module& m, const CubinKernel& k) {
   return m.polling.emplace(k.name, found).first->second;
 }
 
-// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds. With many lanes
-// running, as four independent chains over all 32 lanes, a lane that does not run counting as the largest address (an all-ones OR,
-// no branch on the lane's bit: those were mispredicted in a diverged warp); with few, the loop over just those lanes.
-inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) {
-  if (simd::popcount32(run) <= 5) {
-    uint64_t lo = first;
-    for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
-    return lo;
-  }
-  const auto pcv = [&](unsigned l) { return w.pc[l] | ((static_cast<uint64_t>((run >> l) & 1)) - 1); };
-  uint64_t a = ~uint64_t{0}, b = a, c = a, d = a;
-  for (unsigned l = 0; l < 32; l += 4) {
-    a = std::min(a, pcv(l));
-    b = std::min(b, pcv(l + 1));
-    c = std::min(c, pcv(l + 2));
-    d = std::min(d, pcv(l + 3));
-  }
-  return std::min(std::min(a, b), std::min(c, d));
-}
+// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds.
+inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) { return exec::sasslanes::lowest_pc(w.pc, run, first); }
 
 class Runner {
  public:

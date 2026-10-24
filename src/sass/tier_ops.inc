@@ -1293,63 +1293,6 @@ TIER_HANDLER(h_imnmx) {
 // SHFL: the value of another lane of the warp, picked by the lane operand and the clamp (fast path of exec_warp: the three sources as
 // 32 lanes, the answer worked out for all of them, then written for the executing lanes). A lane that is not running the
 // shuffle gives 0.
-// Whether all 32 words of a row are the same, and then that word.
-inline bool tier_row_uniform(const uint32_t* r, uint32_t& v) {
-#if defined(__SSE2__)
-  const __m128i first = _mm_set1_epi32(static_cast<int>(r[0]));
-  __m128i eq = _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r)), first);
-  for (unsigned i = 1; i < 8; ++i) eq = _mm_and_si128(eq, _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r) + i), first));
-  v = r[0];
-  return _mm_movemask_epi8(eq) == 0xffff;
-#else
-  v = r[0];
-  for (unsigned l = 1; l < 32; ++l)
-    if (r[l] != v) return false;
-  return true;
-#endif
-}
-
-// The shuffle `sh` of the 32 words at vp into out, for the whole warp.
-inline void tier_shfl_move(const tier::ShflShape& sh, const uint32_t* vp, uint32_t* out) {
-  using tier::ShflShape;
-  switch (sh.kind) {
-    case ShflShape::None:
-    case ShflShape::Ident: tier_copy_row(out, vp); return;
-    case ShflShape::Splat: {
-      const uint32_t v = vp[sh.x];
-      for (unsigned l = 0; l < 32; ++l) out[l] = v;
-      return;
-    }
-    case ShflShape::Butterfly: {
-#if defined(__SSE2__)
-      const unsigned vx = sh.x >> 2;   // (the vector the four lanes come from, then the order within it)
-      const __m128i* in = reinterpret_cast<const __m128i*>(vp);
-      __m128i* o = reinterpret_cast<__m128i*>(out);
-      const auto run = [&](auto imm) {
-        __m128i v[8];
-        for (unsigned i = 0; i < 8; ++i) v[i] = _mm_shuffle_epi32(_mm_loadu_si128(in + (i ^ vx)), decltype(imm)::value);
-        for (unsigned i = 0; i < 8; ++i) _mm_storeu_si128(o + i, v[i]);
-      };
-      switch (sh.x & 3) {
-        case 0: run(std::integral_constant<int, _MM_SHUFFLE(3, 2, 1, 0)>{}); break;
-        case 1: run(std::integral_constant<int, _MM_SHUFFLE(2, 3, 0, 1)>{}); break;
-        case 2: run(std::integral_constant<int, _MM_SHUFFLE(1, 0, 3, 2)>{}); break;
-        default: run(std::integral_constant<int, _MM_SHUFFLE(0, 1, 2, 3)>{}); break;
-      }
-#else
-      for (unsigned l = 0; l < 32; ++l) out[l] = vp[l ^ sh.x];
-#endif
-      return;
-    }
-    case ShflShape::Down:   // lanes 0 .. n-1 read the lane x above, the others their own
-      for (unsigned l = 0; l < 32; ++l) out[l] = ((sh.in >> l) & 1) ? vp[(l + sh.x) & 31] : vp[l];
-      return;
-    default:   // Up
-      for (unsigned l = 0; l < 32; ++l) out[l] = ((sh.in >> l) & 1) ? vp[(l - sh.x) & 31] : vp[l];
-      return;
-  }
-}
-
 TIER_HANDLER(h_shfl) {
   TIER_PRELUDE
   alignas(32) uint32_t t[3][32], out[32];
@@ -1368,10 +1311,10 @@ TIER_HANDLER(h_shfl) {
       sh.in = op.b;
     } else {
       uint32_t b, cc;
-      if (tier_row_uniform(bp, b) && tier_row_uniform(cp, cc)) tier::shfl_shape(op.a, b, cc, sh);
+      if (exec::sasslanes::row_uniform(bp, b) && exec::sasslanes::row_uniform(cp, cc)) tier::shfl_shape(op.a, b, cc, sh);
     }
     if (sh.kind != tier::ShflShape::None) {
-      tier_shfl_move(sh, vp, out);
+      tier::shfl_move(sh, vp, out);
       tier_store(c, op.dst, kAll, out);
       tier_setp(c, op.dst2, kAll, sh.in);
       return;
@@ -1781,70 +1724,9 @@ inline void tier_set_pcs(Warp& w, Mask group, uint64_t v) {
   }
 }
 
-// The lanes of `ex` start to wait with `kind` on `arg`.
-inline void tier_wait(Warp& w, Mask ex, Wait kind, unsigned arg) {
-#if defined(__SSE2__)
-  if (ex == kAll) {
-    const __m128i k = _mm_set1_epi8(static_cast<char>(kind)), a = _mm_set1_epi32(static_cast<int>(arg));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.wait_kind[0]), k);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.wait_kind[16]), k);
-    for (unsigned i = 0; i < 32; i += 4) _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.wait_arg[i]), a);
-    w.waiting |= ex;
-    return;
-  }
-#endif
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    w.wait_kind[l] = kind;
-    w.wait_arg[l] = arg;
-  }
-  w.waiting |= ex;
-}
-
-// The lanes of `w` that wait with `kind` on `arg` (the two arrays compared a vector at a time instead of looked at lane by lane).
-inline Mask tier_waiting_on(const Warp& w, Wait kind, unsigned arg) {
-  Mask arrived = w.waiting;
-  if (!arrived) return 0;
-#if defined(__SSE2__)
-  const __m128i k = _mm_set1_epi8(static_cast<char>(kind));
-  const uint32_t kinds = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_kind[0])), k))) |
-                         static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_kind[16])), k))) << 16;
-  const __m128i want = _mm_set1_epi32(static_cast<int>(arg));
-  uint32_t args = 0;
-  for (unsigned i = 0; i < 8; ++i)
-    args |= static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(
-                _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_arg[4 * i])), want)))) << (4 * i);
-  return arrived & kinds & args;
-#else
-  Mask match = 0;
-  for (Mask m = arrived; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    if (w.wait_kind[l] == kind && w.wait_arg[l] == arg) match |= Mask{1} << l;
-  }
-  return match;
-#endif
-}
-
-// The lanes of `m` (waiting) stop waiting and go on past the instruction they wait at.
-inline void tier_wake(Warp& w, Mask m) {
-  if (!m) return;
-  w.waiting &= ~m;
-#if defined(__SSE2__)
-  if (m == kAll) {   // a whole warp: the kinds cleared and the 32 addresses moved on a vector at a time
-    const __m128i zero = _mm_setzero_si128(), step = _mm_set1_epi64x(16);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.wait_kind[0]), zero);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.wait_kind[16]), zero);
-    for (unsigned i = 0; i < 32; i += 2)
-      _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.pc[i]), _mm_add_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i])), step));
-    return;
-  }
-#endif
-  for (; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    w.wait_kind[l] = Wait::None;
-    w.pc[l] += 16;
-  }
-}
+inline void tier_wait(Warp& w, Mask ex, Wait kind, unsigned arg) { exec::sasslanes::wait(w, ex, kind, arg); }
+inline Mask tier_waiting_on(const Warp& w, Wait kind, unsigned arg) { return exec::sasslanes::waiting_on(w, kind, arg); }
+inline void tier_wake(Warp& w, Mask m) { exec::sasslanes::wake(w, m); }
 
 // BSYNC's release (exec_control's release_bsync): once every lane of barrier Bx that is still a thread of the block waits at a
 // BSYNC on it, they all go on past it and the barrier is free for its next BSSY. Lanes that wait at a BSYNC on Bx but are not

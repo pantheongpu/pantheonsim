@@ -7,7 +7,12 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <map>
+#include <type_traits>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 namespace vgpu::sass::tier {
 
@@ -380,6 +385,57 @@ bool shfl_shape(unsigned mode, uint32_t b, uint32_t cc, ShflShape& s) {
       return true;
   }
 }
+
+// The shuffle `sh` of the 32 words at vp into out, for the whole warp.
+void shfl_move(const ShflShape& sh, const uint32_t* vp, uint32_t* out) {
+  switch (sh.kind) {
+    case ShflShape::None:
+    case ShflShape::Ident:
+    {
+#if defined(__SSE2__)
+      __m128i v[8];   // (all eight read before any is written: a row moved onto itself is fine)
+      for (unsigned i = 0; i < 8; ++i) v[i] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vp) + i);
+      for (unsigned i = 0; i < 8; ++i) _mm_storeu_si128(reinterpret_cast<__m128i*>(out) + i, v[i]);
+#else
+      std::memmove(out, vp, 32 * sizeof(uint32_t));
+#endif
+      return;
+    }
+    case ShflShape::Splat: {
+      const uint32_t v = vp[sh.x];
+      for (unsigned l = 0; l < 32; ++l) out[l] = v;
+      return;
+    }
+    case ShflShape::Butterfly: {
+#if defined(__SSE2__)
+      const unsigned vx = sh.x >> 2;   // (the vector the four lanes come from, then the order within it)
+      const __m128i* in = reinterpret_cast<const __m128i*>(vp);
+      __m128i* o = reinterpret_cast<__m128i*>(out);
+      const auto run = [&](auto imm) {
+        __m128i v[8];
+        for (unsigned i = 0; i < 8; ++i) v[i] = _mm_shuffle_epi32(_mm_loadu_si128(in + (i ^ vx)), decltype(imm)::value);
+        for (unsigned i = 0; i < 8; ++i) _mm_storeu_si128(o + i, v[i]);
+      };
+      switch (sh.x & 3) {
+        case 0: run(std::integral_constant<int, _MM_SHUFFLE(3, 2, 1, 0)>{}); break;
+        case 1: run(std::integral_constant<int, _MM_SHUFFLE(2, 3, 0, 1)>{}); break;
+        case 2: run(std::integral_constant<int, _MM_SHUFFLE(1, 0, 3, 2)>{}); break;
+        default: run(std::integral_constant<int, _MM_SHUFFLE(0, 1, 2, 3)>{}); break;
+      }
+#else
+      for (unsigned l = 0; l < 32; ++l) out[l] = vp[l ^ sh.x];
+#endif
+      return;
+    }
+    case ShflShape::Down:   // lanes 0 .. n-1 read the lane x above, the others their own
+      for (unsigned l = 0; l < 32; ++l) out[l] = ((sh.in >> l) & 1) ? vp[(l + sh.x) & 31] : vp[l];
+      return;
+    default:   // Up
+      for (unsigned l = 0; l < 32; ++l) out[l] = ((sh.in >> l) & 1) ? vp[(l - sh.x) & 31] : vp[l];
+      return;
+  }
+}
+
 
 void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
   op = MOp{};
