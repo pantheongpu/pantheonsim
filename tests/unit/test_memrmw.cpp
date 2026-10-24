@@ -483,6 +483,9 @@ uint64_t run_batches(uint64_t seed, int rounds, int fault) {
     if (!(x == y))
       throw vtest::Failure("seed " + std::to_string(seed) + " round " + std::to_string(r) + ": batch {" + x.error + "} " +
                            std::to_string(x.olds.size()) + " loaded, one at a time {" + y.error + "} " + std::to_string(y.olds.size()));
+    // (Each round, not only at the end: a store of a result that did not change makes a chunk nothing has written real.)
+    if (p.a.resident_bytes() != p.b.resident_bytes())
+      throw vtest::Failure("seed " + std::to_string(seed) + " round " + std::to_string(r) + ": chunks made real differ");
   }
   p.a.set_access_fault(nullptr), p.b.set_access_fault(nullptr);
   for (int k = 0; k < 4; ++k) {
