@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <list>
+#include <new>
 #include <map>
 #include <set>
 #include <cstdlib>
@@ -263,13 +264,59 @@ bool matches_class_half(_Float16 h, uint32_t mask) {
 // A wave's vector registers: 256 of them to begin with, and more -- up to the 1024 a gfx1250 wave may be given -- once an
 // instruction reaches past them (through s_set_vgpr_msb), which the file grows to meet. Indexed as a two-dimensional array.
 struct VgprFile {
-  std::vector<std::array<uint32_t, kLanes>> r;
+  // The rows are one block of memory, zeroed with a single memset: a vector of 256 value-initialised arrays is filled by
+  // copying one 256-byte row 255 times, which takes about three times as long, and every wave of every work-group pays for it.
+  struct Rows {
+    using Row = std::array<uint32_t, kLanes>;
+    Row* p = nullptr;
+    size_t n = 0;
+    Rows() = default;
+    explicit Rows(size_t count) { resize(count); }
+    Rows(const Rows& o) { *this = o; }
+    Rows(Rows&& o) noexcept : p(o.p), n(o.n) { o.p = nullptr, o.n = 0; }
+    Rows& operator=(const Rows& o) {
+      if (this != &o) {
+        Rows copy;
+        copy.p = static_cast<Row*>(std::malloc(o.n * sizeof(Row) + 1));
+        if (!copy.p) throw std::bad_alloc();
+        copy.n = o.n;
+        if (o.n) std::memcpy(copy.p, o.p, o.n * sizeof(Row));
+        *this = std::move(copy);
+      }
+      return *this;
+    }
+    Rows& operator=(Rows&& o) noexcept {
+      std::swap(p, o.p);
+      std::swap(n, o.n);
+      return *this;
+    }
+    ~Rows() { std::free(p); }
+    size_t size() const { return n; }
+    Row* data() { return p; }
+    const Row* data() const { return p; }
+    Row* begin() { return p; }
+    Row* end() { return p + n; }
+    const Row* begin() const { return p; }
+    const Row* end() const { return p + n; }
+    Row& operator[](size_t i) { return p[i]; }
+    const Row& operator[](size_t i) const { return p[i]; }
+    // Grows to `count` rows, the new ones zero.
+    void resize(size_t count) {
+      if (count <= n) return;
+      Row* q = static_cast<Row*>(std::malloc(count * sizeof(Row)));
+      if (!q) throw std::bad_alloc();
+      if (n) std::memcpy(q, p, n * sizeof(Row));
+      std::memset(q + n, 0, (count - n) * sizeof(Row));
+      std::free(p);
+      p = q;
+      n = count;
+    }
+  };
+  Rows r;
   VgprFile() : r(kVgprs) {}
   std::array<uint32_t, kLanes>& operator[](size_t i) { return r[i]; }
   const std::array<uint32_t, kLanes>& operator[](size_t i) const { return r[i]; }
-  void grow(size_t n) {
-    if (r.size() < n) r.resize(n);
-  }
+  void grow(size_t n) { r.resize(n); }
 };
 
 struct Wave {
