@@ -4162,20 +4162,22 @@ mutex pairs per instruction (the stripe was one per 8 bytes); `mem` called `Memo
 
 ### Results
 
-`bench.py --ab` base (build of d8ec6128) against this branch, `--size full`, 11 alternating runs, one host thread, CPU 4 of server3 (load 15 to 33 from the other
-sessions), counters identical in every row; the A/A control of the same 16 workloads (11 runs) reads 0.985x to 1.018x (startup 1.026x, p 0.019: 7 ms of wall).
+`bench.py --ab` base (build of d8ec6128) against this branch, `--size full`, 15 alternating runs, one host thread, CPU 4 of server3 (load 4 to 6: the other sessions
+were idle), counters identical in every row. The A/A control of the same build against itself (15 runs, the first six rows) reads 0.995x to 1.001x. An earlier
+11-run pass of all 16 workloads at load 15 to 33 gave the same picture (shared 1.99x, atomics 1.75x, mem 1.38x, local 1.20x, divergent 1.18x, warp 1.16x, launch
+1.10x; texture, f32_fma, f64_fma, f64_subnormal, wmma, mma_ptx, api and startup 0.984x to 1.018x, "same"; its A/A: 0.985x to 1.018x, startup 1.026x with p 0.019 on 7 ms).
 
 | workload | base Mi/s | this branch | B/A median | best | p | verdict |
 |---|---|---|---|---|---|---|
-| shared | 14.43 | 28.75 | **1.99x** | 1.99x | <0.001 | faster |
-| atomics | 6.19 | 10.86 | **1.75x** | 1.76x | <0.001 | faster |
-| mem | 12.15 | 16.72 | **1.38x** | 1.38x | <0.001 | faster |
-| local | 25.22 | 30.18 | **1.20x** | 1.22x | <0.001 | faster |
-| divergent | 24.14 | 28.44 | **1.18x** | 1.17x | <0.001 | faster |
-| warp | 40.61 | 47.13 | **1.16x** | 1.15x | <0.001 | faster |
-| launch (k/s) | 367 | 403 | 1.10x | 1.10x | <0.001 | faster (its kernel's coalesced load and store) |
-| int_alu | 63.84 | 64.96 | 1.018x | 1.013x | 0.010 | same |
-| texture, f32_fma, f64_fma, f64_subnormal, wmma, mma_ptx, api, startup | | | 0.984x to 1.018x | | 0.22 to 0.95 | same |
+| shared | 13.89 | 27.85 | **2.01x** | 2.01x | <0.001 | faster |
+| atomics | 8.14 | 14.27 | **1.75x** | 1.75x | <0.001 | faster |
+| mem | 18.80 | 26.90 | **1.43x** | 1.49x | <0.001 | faster |
+| local | 35.37 | 43.02 | **1.22x** | 1.21x | <0.001 | faster |
+| warp | 40.18 | 47.23 | **1.18x** | 1.20x | <0.001 | faster |
+| divergent | 23.57 | 27.67 | **1.17x** | 1.17x | <0.001 | faster |
+| launch (k/s) | 503 | 557 | 1.11x | 1.11x | <0.001 | faster (its kernel's coalesced load and store) |
+| int_alu | 86.30 | 88.41 | 1.024x | 1.024x | <0.001 | faster by the table's rule; not a function this branch changed (the first pass read 1.018x, p 0.010), take it as code placement |
+| texture | 4.16 | 4.17 | 1.002x | 0.999x | 0.51 | same |
 
 One change at a time (each against the build before it, 9 to 15 runs, the load of the day varying, so the product of these is not the table above):
 chain into a diverged group `divergent` 1.096x; `lanes_at` four per movemask `divergent` +6%, `warp` 1.08x; atomics batch 1.49x; `Form::Atom` 1.074x; the alignment
