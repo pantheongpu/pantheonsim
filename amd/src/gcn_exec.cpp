@@ -266,20 +266,29 @@ bool matches_class_half(_Float16 h, uint32_t mask) {
 struct VgprFile {
   // The rows are one block of memory, zeroed with a single memset: a vector of 256 value-initialised arrays is filled by
   // copying one 256-byte row 255 times, which takes about three times as long, and every wave of every work-group pays for it.
+  // A file of the usual 256 rows goes back to a per-thread pool when its wave is gone, with the number of rows that may hold
+  // something (`dirty`: all of them, unless the wave was released with a smaller number by release_waves), and the next wave
+  // to take it clears only those: the kernel's registers are a few rows of 256, and a one-wave work-group otherwise spends
+  // a quarter of its time zeroing the rest.
   struct Rows {
     using Row = std::array<uint32_t, kLanes>;
     Row* p = nullptr;
     size_t n = 0;
+    size_t dirty = 0;   // the first `dirty` rows may be non-zero; the rest are zero
     Rows() = default;
-    explicit Rows(size_t count) { resize(count); }
+    explicit Rows(size_t count) {
+      if (count == kVgprs && pool_take(*this)) return;
+      resize(count);
+      dirty = n;
+    }
     Rows(const Rows& o) { *this = o; }
-    Rows(Rows&& o) noexcept : p(o.p), n(o.n) { o.p = nullptr, o.n = 0; }
+    Rows(Rows&& o) noexcept : p(o.p), n(o.n), dirty(o.dirty) { o.p = nullptr, o.n = o.dirty = 0; }
     Rows& operator=(const Rows& o) {
       if (this != &o) {
         Rows copy;
         copy.p = static_cast<Row*>(std::malloc(o.n * sizeof(Row) + 1));
         if (!copy.p) throw std::bad_alloc();
-        copy.n = o.n;
+        copy.n = copy.dirty = o.n;
         if (o.n) std::memcpy(copy.p, o.p, o.n * sizeof(Row));
         *this = std::move(copy);
       }
@@ -288,9 +297,13 @@ struct VgprFile {
     Rows& operator=(Rows&& o) noexcept {
       std::swap(p, o.p);
       std::swap(n, o.n);
+      std::swap(dirty, o.dirty);
       return *this;
     }
-    ~Rows() { std::free(p); }
+    ~Rows() {
+      if (p && n == kVgprs && pool_give(*this)) return;
+      std::free(p);
+    }
     size_t size() const { return n; }
     Row* data() { return p; }
     const Row* data() const { return p; }
@@ -309,7 +322,43 @@ struct VgprFile {
       std::memset(q + n, 0, (count - n) * sizeof(Row));
       std::free(p);
       p = q;
-      n = count;
+      n = dirty = count;
+    }
+    // Says that only the first `rows` rows may hold anything: the wave is done, and nothing it ran names a register past them.
+    void release(size_t rows) { dirty = std::min(rows, n); }
+
+   private:
+    struct Pool {
+      static constexpr size_t kMax = 32;   // 64 KB each
+      struct Block {
+        Row* p;
+        size_t dirty;
+      };
+      Block blocks[kMax];
+      size_t count = 0;
+      bool alive = true;
+      ~Pool() {
+        alive = false;
+        for (size_t i = 0; i < count; ++i) std::free(blocks[i].p);
+      }
+    };
+    static Pool& pool() {
+      thread_local Pool pl;
+      return pl;
+    }
+    static bool pool_take(Rows& r) {
+      Pool& pl = pool();
+      if (!pl.count) return false;
+      const Pool::Block b = pl.blocks[--pl.count];
+      std::memset(b.p, 0, b.dirty * sizeof(Row));
+      r.p = b.p, r.n = r.dirty = kVgprs;
+      return true;
+    }
+    static bool pool_give(Rows& r) {
+      Pool& pl = pool();
+      if (!pl.alive || pl.count == Pool::kMax) return false;
+      pl.blocks[pl.count++] = {r.p, r.dirty};
+      return true;
     }
   };
   Rows r;
@@ -318,6 +367,23 @@ struct VgprFile {
   const std::array<uint32_t, kLanes>& operator[](size_t i) const { return r[i]; }
   void grow(size_t n) { r.resize(n); }
 };
+
+// How many rows of a wave's register file an instruction can write, and so how many a wave that ran only instructions like it can
+// have dirtied: past the highest vector register any operand names, with room for the widest result an instruction writes
+// (sixteen registers, a 32x32 matrix tile) beyond a base register that is named once. The instructions that index registers at
+// run time (VGPR indexing, v_movrel*, s_set_vgpr_msb) can reach any of them: kVgprsAny, which no file is as big as.
+constexpr uint32_t kVgprsAny = 4096;
+constexpr uint32_t kWidestResult = 16;
+uint32_t vgpr_rows_written(const Inst& in) {
+  const std::string_view n = in.name;
+  if (n.rfind("s_set_gpr_idx", 0) == 0 || n.rfind("v_movrel", 0) == 0 || n.rfind("v_swaprel", 0) == 0 || n.rfind("s_set_vgpr_msb", 0) == 0) return kVgprsAny;
+  uint32_t rows = 0;
+  for (const auto* ops : {&in.dst, &in.src})
+    for (const Operand& o : *ops)
+      if (o.kind == OperandKind::Vgpr) rows = std::max(rows, o.index + std::max<uint32_t>(o.width, 1) + kWidestResult);
+  for (const Inst& half : in.dual) rows = std::max(rows, vgpr_rows_written(half));
+  return rows;
+}
 
 struct Wave {
   uint32_t sgpr[kSgprs] = {};
@@ -635,9 +701,16 @@ struct Machine {
     const CodeObject& o = *d.object;
     const uint64_t at = pc - d.code_base - o.text_addr;
     const Inst* in = at % 4 == 0 && at < o.text.size()
-                         ? decoded->get(at / 4, [&] { return gcn::decode(o.text, at, pc, target(), wave64()); })
+                         ? decoded->get(at / 4, [&] {
+                             Inst fresh = gcn::decode(o.text, at, pc, target(), wave64());
+                             decoded->note_vgprs(vgpr_rows_written(fresh));
+                             return fresh;
+                           })
                          : nullptr;
-    if (!in) return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc, target(), wave64())));
+    if (!in) {
+      decoded->note_vgprs(kVgprsAny);
+      return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc, target(), wave64())));
+    }
     return *in;
   }
   std::unique_ptr<const Inst> scratch_inst;   // one that is not where an instruction starts
@@ -12251,6 +12324,15 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
 
 }
 
+// A finished work-group's waves have written only the registers the code they ran names (and v0 to v2, which set_up_group
+// fills): the register files go back to the pool with just those rows marked, and the next wave clears no more. Not under the
+// debugger, which can write any register.
+void release_registers(Machine& m, Group& group) {
+  if (m.debug_on || !m.decoded) return;
+  const size_t rows = std::max<size_t>(m.decoded->vgpr_rows(), 3);
+  for (Wave& w : group.waves) w.vgpr.r.release(rows);
+}
+
 // One turn for each of a group's waves: each runs until it stops, parks at a
 // barrier or yields (s_sleep, a wave waiting on something), and a barrier
 // every unfinished wave has reached is released. Says whether every wave has
@@ -12367,6 +12449,7 @@ void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_s
     for (auto it = resident.begin(); it != resident.end();) {
       if (run_round(m, it->group, it->had_turn ? kLaterTurn : kFirstTurn)) {
         resident_waves -= it->group.waves.size();
+        release_registers(m, it->group);
         it = resident.erase(it);
         all_waiting = false;
         continue;
