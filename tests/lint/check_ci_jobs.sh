@@ -114,6 +114,18 @@ out="$(CI_MEM_CHECK=0 run low 24 --check asan 2>&1)"; rc=$?
 expect "CI_MEM_CHECK=0 skips the check" 0 "$rc"
 run low 24 --check build >/dev/null 2>&1 || fail "a profile with no minimum failed the check"
 if run low 24 --check >/dev/null 2>&1; then fail "--check without a profile was accepted"; fi
+# Waiting: CI_MEM_WAIT_SECS makes --check look again before it refuses.
+out="$(CI_MEM_WAIT_SECS=2 CI_MEM_POLL_SECS=1 run low 24 --check asan 2>&1)"; rc=$?
+expect "a short wait on 3 GiB still refuses: exit" 1 "$rc"
+[[ $out == *"waiting up to 2 s"*"only 3.0 GiB"* ]] || fail "the wait's report: $out"
+fixture later "$(kib 3)"
+( sleep 1; printf 'MemTotal: %d kB\nMemFree: 1000 kB\nMemAvailable: %d kB\nCached: 5 kB\n' "$(kib 16)" "$(kib 8)" > "$d/later/meminfo" ) &
+out="$(CI_MEM_WAIT_SECS=10 CI_MEM_POLL_SECS=1 run later 24 --check asan 2>&1)"; rc=$?
+wait
+expect "memory that appears while waiting: exit" 0 "$rc"
+[[ $out == *"8.0 GiB available after waiting"* ]] || fail "the wait's success: $out"
+out="$(CI_MEM_WAIT_SECS=nonsense run low 24 --check asan 2>&1)"; rc=$?
+expect "a wait that is not a number is no wait: exit" 1 "$rc"
 # A cgroup cap, not the host's memory, is what the check refuses on.
 fixture sharedbox "$(kib 28)"
 echo $((26 * GiB)) > "$d/sharedbox/cg/ci/memory.max"
