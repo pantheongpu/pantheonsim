@@ -4133,8 +4133,9 @@ unit test against the per-lane code). The dot2 NaN lanes are unchanged.
 
 The memory instructions of the AMD engine went to the memory manager a lane at a time: every lane of a gather, a buffer access or an atomic looked up its allocation
 (`lookups()` and the table behind it), asked `HostMaps::may_contain`, and made its own `load_scalar` / `store_scalar` (an atomic made two, one for the load and one
-for the store). The profile of `buf` was `load_scalar` 25%, `store_scalar` 18%, `buffer_access` 20%, `load_words` 7%, `may_contain` 4%; of `atomics`, the lookup
-chain in `Machine::atomic_rmw` and `global_access` 47%. Now a wave's accesses go to the memory manager together wherever the manager can take them as the calls
+for the store). The profile of `buf` (RX 6800) was `load_scalar` 25%, `store_scalar` 18%, `buffer_access` 20%, `load_words` 7%, `may_contain` 4%; of `atomics`,
+`global_access` 20%, `load_scalar` 18%, `atomic_rmw` 6%, `store_scalar` 4%, and with a single lookup for the load and the store `Machine::atomic_rmw` alone was 47% of the
+MI300X run, nearly all of it the chain of dependent loads that finds the allocation (`lookups()`, the thread's last way, the chunk table). Now a wave's accesses go to the memory manager together wherever the manager can take them as the calls
 they stand for, and decline (having done nothing) wherever it cannot, so the lanes then go one at a time and meet any error where they would.
 
 Measured on server3 (Ryzen 7 PRO 8840U, one SMT sibling of one core, the machine at a 1-minute load of 30 to 130 from other builds), Release, GCC 13.3, simulated
