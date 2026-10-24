@@ -12,6 +12,7 @@
 // answer.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -367,6 +368,17 @@ inline Target target_of_mach(uint32_t mach) {
 // comparison's result, a carry) are register pairs rather than one register.
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target = Target::Gfx942,
             bool wave64 = false);
+
+// How many rows of a wave's vector register file an instruction can write, counted from v0: past the highest vector register any operand
+// names, with room for the widest result an instruction writes (sixteen registers, a 32x32 matrix tile) beyond a base register that is
+// named once. The instructions that index registers at run time (VGPR indexing, v_movrel*, s_set_vgpr_msb) can reach any of them:
+// kVgprsAny, which no file is as big as.
+inline constexpr uint32_t kVgprsAny = 4096;
+uint32_t vgpr_rows_written(const Inst& in);
+// decode(), and then raises *rows to what the instruction can write (vgpr_rows_written; kVgprsAny where `anywhere`, an instruction from
+// outside the code) if it is more: for the decode cache, which tells the next wave to use a register file how much of it to clear.
+Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64, std::atomic<uint32_t>* rows,
+            bool anywhere = false);
 
 // The instruction as the assembler writes it, for tests and for a
 // disassembly listing.

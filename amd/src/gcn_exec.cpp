@@ -259,6 +259,63 @@ bool matches_class_half(_Float16 h, uint32_t mask) {
   return (mask & (negative ? 1u << 4 : 1u << 7)) != 0;
 }
 
+// An allocator that keeps the last few blocks of one to four elements a thread freed, for the next request of that size: a work-group's
+// node in the list of the groups a thread holds, and its vector of waves, are made and dropped for every work-group, and a launch of
+// one small group spent a tenth of its time in malloc and free for them.
+template <class T>
+struct PooledAllocator {
+  using value_type = T;
+  PooledAllocator() = default;
+  template <class U>
+  PooledAllocator(const PooledAllocator<U>&) noexcept {}
+  T* allocate(size_t n) {
+    if (n >= 1 && n <= kSizes) {
+      Free& f = lists().f[n - 1];
+      if (f.count) return static_cast<T*>(f.item[--f.count]);
+    }
+    return static_cast<T*>(::operator new(n * sizeof(T)));
+  }
+  void deallocate(T* p, size_t n) noexcept {
+    if (n >= 1 && n <= kSizes) {
+      Lists& l = lists();
+      Free& f = l.f[n - 1];
+      if (l.alive && f.count < kKeep) {
+        f.item[f.count++] = p;
+        return;
+      }
+    }
+    ::operator delete(p);
+  }
+  template <class U>
+  bool operator==(const PooledAllocator<U>&) const noexcept {
+    return true;
+  }
+  template <class U>
+  bool operator!=(const PooledAllocator<U>&) const noexcept {
+    return false;
+  }
+
+ private:
+  static constexpr size_t kSizes = 4, kKeep = 4;
+  struct Free {
+    void* item[kKeep];
+    size_t count = 0;
+  };
+  struct Lists {
+    Free f[kSizes];
+    bool alive = true;
+    ~Lists() {
+      alive = false;
+      for (Free& x : f)
+        for (size_t i = 0; i < x.count; ++i) ::operator delete(x.item[i]);
+    }
+  };
+  static Lists& lists() {
+    thread_local Lists l;
+    return l;
+  }
+};
+
 // One wavefront: its own scalar registers, VCC, EXEC and SCC, and 64 lanes of
 // vector registers.
 // A wave's vector registers: 256 of them to begin with, and more -- up to the 1024 a gfx1250 wave may be given -- once an
@@ -267,7 +324,7 @@ struct VgprFile {
   // The rows are one block of memory, zeroed with a single memset: a vector of 256 value-initialised arrays is filled by
   // copying one 256-byte row 255 times, which takes about three times as long, and every wave of every work-group pays for it.
   // A file of the usual 256 rows goes back to a per-thread pool when its wave is gone, with the number of rows that may hold
-  // something (`dirty`: all of them, unless the wave was released with a smaller number by release_waves), and the next wave
+  // something (`dirty`: all of them, unless the work-group ended normally and ~Group marked fewer), and the next wave
   // to take it clears only those: the kernel's registers are a few rows of 256, and a one-wave work-group otherwise spends
   // a quarter of its time zeroing the rest.
   struct Rows {
@@ -367,23 +424,6 @@ struct VgprFile {
   const std::array<uint32_t, kLanes>& operator[](size_t i) const { return r[i]; }
   void grow(size_t n) { r.resize(n); }
 };
-
-// How many rows of a wave's register file an instruction can write, and so how many a wave that ran only instructions like it can
-// have dirtied: past the highest vector register any operand names, with room for the widest result an instruction writes
-// (sixteen registers, a 32x32 matrix tile) beyond a base register that is named once. The instructions that index registers at
-// run time (VGPR indexing, v_movrel*, s_set_vgpr_msb) can reach any of them: kVgprsAny, which no file is as big as.
-constexpr uint32_t kVgprsAny = 4096;
-constexpr uint32_t kWidestResult = 16;
-uint32_t vgpr_rows_written(const Inst& in) {
-  const std::string_view n = in.name;
-  if (n.rfind("s_set_gpr_idx", 0) == 0 || n.rfind("v_movrel", 0) == 0 || n.rfind("v_swaprel", 0) == 0 || n.rfind("s_set_vgpr_msb", 0) == 0) return kVgprsAny;
-  uint32_t rows = 0;
-  for (const auto* ops : {&in.dst, &in.src})
-    for (const Operand& o : *ops)
-      if (o.kind == OperandKind::Vgpr) rows = std::max(rows, o.index + std::max<uint32_t>(o.width, 1) + kWidestResult);
-  for (const Inst& half : in.dual) rows = std::max(rows, vgpr_rows_written(half));
-  return rows;
-}
 
 struct Wave {
   uint32_t sgpr[kSgprs] = {};
@@ -522,12 +562,30 @@ class FloatMode {
 // The work-group the waves share: its LDS, and how many waves are still to
 // reach the barrier.
 struct Group {
+  ~Group() {
+    // A work-group whose waves all ended has run nothing but decoded instructions, and has written only the registers they name (and
+    // v0 to v2, which set_up_group fills): its register files go back to the pool with just those rows marked, and the next wave
+    // to take one clears no more. A group that did not finish (an error, a debugger stop) leaves them all marked.
+    if (!cache || waves.empty()) return;
+    for (const Wave& w : waves)
+      if (!w.done) return;
+    const size_t rows = std::max<size_t>(cache->vgpr_rows(), 3);
+    for (Wave& w : waves) w.vgpr.r.release(rows);
+  }
+  Group() = default;
+  Group(const Group&) = delete;
+  Group& operator=(const Group&) = delete;
+  Group(Group&&) = default;
+  Group& operator=(Group&&) = default;
   std::vector<uint8_t> lds;
   // Each work-item's private memory, one block per lane of the group: what a
   // kernel spills into when it runs out of registers.
   std::vector<uint8_t> scratch;
   uint32_t scratch_per_lane = 0;
-  std::vector<Wave> waves;
+  std::vector<Wave, PooledAllocator<Wave>> waves;
+  // The decode cache of the code the waves run, for the destructor above; null where the registers may hold anything (the debugger can
+  // write them).
+  const DecodeCache* cache = nullptr;
   uint32_t id[3] = {};   // the work-group's id, for the debugger to say
   // gfx1250's barrier unit: each named barrier's member and signal counts (1 to 16), and how many waves have signalled
   // the work-group barrier in this round.
@@ -701,16 +759,9 @@ struct Machine {
     const CodeObject& o = *d.object;
     const uint64_t at = pc - d.code_base - o.text_addr;
     const Inst* in = at % 4 == 0 && at < o.text.size()
-                         ? decoded->get(at / 4, [&] {
-                             Inst fresh = gcn::decode(o.text, at, pc, target(), wave64());
-                             decoded->note_vgprs(vgpr_rows_written(fresh));
-                             return fresh;
-                           })
+                         ? decoded->get(at / 4, [&] { return gcn::decode(o.text, at, pc, target(), wave64(), decoded->vgpr_rows_cell()); })
                          : nullptr;
-    if (!in) {
-      decoded->note_vgprs(kVgprsAny);
-      return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc, target(), wave64())));
-    }
+    if (!in) return *(scratch_inst = std::make_unique<const Inst>(gcn::decode(o.text, at, pc, target(), wave64(), decoded->vgpr_rows_cell(), true)));
     return *in;
   }
   std::unique_ptr<const Inst> scratch_inst;   // one that is not where an instruction starts
@@ -12220,6 +12271,7 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
   group.id[0] = gx;
   group.id[1] = gy;
   group.id[2] = gz;
+  group.cache = m.debug_on ? nullptr : m.decoded;
   for (uint32_t i = 0; i < waves_per_group; ++i) {
     Wave& w = group.waves[i];
     w.pc = d.code_base + k.entry;
@@ -12324,30 +12376,6 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
 
 }
 
-// A finished work-group's waves have written only the registers the code they ran names (and v0 to v2, which set_up_group
-// fills): the register files go back to the pool with just those rows marked, and the next wave clears no more. Not under the
-// debugger, which can write any register.
-void release_registers(Machine& m, Group& group) {
-  if (m.debug_on || !m.decoded) return;
-  const size_t rows = std::max<size_t>(m.decoded->vgpr_rows(), 3);
-  for (Wave& w : group.waves) w.vgpr.r.release(rows);
-}
-
-// A finished work-group made ready to be set up again: as new as a Group{} is, but for the memory its vectors hold (the waves go,
-// and their register files back to the pool; set_up_group sizes and fills the LDS and the scratch afresh). Not the large ones.
-void recycle_group(Group& group) {
-  group.waves.clear();
-  group.lds.clear();
-  group.scratch.clear();
-  if (group.lds.capacity() > (1u << 20)) std::vector<uint8_t>().swap(group.lds);
-  if (group.scratch.capacity() > (1u << 20)) std::vector<uint8_t>().swap(group.scratch);
-  group.scratch_per_lane = 0;
-  std::fill(std::begin(group.id), std::end(group.id), 0u);
-  std::fill(std::begin(group.nb_members), std::end(group.nb_members), 0u);
-  std::fill(std::begin(group.nb_signaled), std::end(group.nb_signaled), 0u);
-  group.wg_signaled = 0;
-}
-
 // One turn for each of a group's waves: each runs until it stops, parks at a
 // barrier or yields (s_sleep, a wave waiting on something), and a barrier
 // every unfinished wave has reached is released. Says whether every wave has
@@ -12448,20 +12476,13 @@ void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_s
     Group group;
     bool had_turn = false;
   };
-  std::list<Held> resident;
-  // The groups this thread has finished, kept (a few) to be set up again: a group's list node, its LDS and scratch vectors and
-  // its waves' vector are allocated once and not for every work-group, which a launch of one small group spent a tenth of its time on.
-  thread_local std::list<Held> spare;
-  constexpr size_t kSpareGroups = 4;
+  // (The list's nodes, and the groups' vectors of waves, come from small per-thread free lists: see PooledAllocator.)
+  std::list<Held, PooledAllocator<Held>> resident;
   uint64_t next = begin, resident_waves = 0;
   const auto admit = [&] {
     uint32_t gx, gy, gz;
     group_at(next++, &gx, &gy, &gz);
-    if (spare.empty()) {
-      resident.emplace_back();
-    } else {
-      resident.splice(resident.end(), spare, std::prev(spare.end()));
-    }
+    resident.emplace_back();
     set_up_group(resident.back().group, m, d, packet, group_segment, gx, gy, gz);
     resident_waves += resident.back().group.waves.size();
   };
@@ -12472,15 +12493,7 @@ void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_s
     for (auto it = resident.begin(); it != resident.end();) {
       if (run_round(m, it->group, it->had_turn ? kLaterTurn : kFirstTurn)) {
         resident_waves -= it->group.waves.size();
-        release_registers(m, it->group);
-        if (spare.size() < kSpareGroups) {
-          recycle_group(it->group);
-          it->had_turn = false;
-          const auto done = it++;
-          spare.splice(spare.end(), resident, done);
-        } else {
-          it = resident.erase(it);
-        }
+        it = resident.erase(it);
         all_waiting = false;
         continue;
       }

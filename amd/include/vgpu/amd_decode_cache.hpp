@@ -32,14 +32,11 @@ class DecodeCache {
   DecodeCache& operator=(const DecodeCache&) = delete;
 
   // How many vector registers (rows of a wave's file, counted from v0) the instructions decoded so far can write, or a number
-  // past any file when one of them indexes registers at run time. A wave that ran only decoded instructions has left nothing
-  // past it, so the next wave to use its register file clears no more. Raised by the decoder (before the instruction is
-  // published, so a thread that reads it finds the number at least what it needs), never lowered.
-  void note_vgprs(uint32_t rows) {
-    uint32_t seen = vgpr_rows_.load(std::memory_order_relaxed);
-    while (seen < rows && !vgpr_rows_.compare_exchange_weak(seen, rows, std::memory_order_release, std::memory_order_relaxed)) {
-    }
-  }
+  // past any file when one of them indexes registers at run time (gcn::vgpr_rows_written). A wave that ran only decoded instructions
+  // has left nothing past it, so the next wave to use its register file clears no more. The decoder raises it (gcn::decode, given
+  // vgpr_rows_cell()) before the instruction is published, so a thread that reads the instruction finds the number at least what it
+  // needs; it is never lowered.
+  std::atomic<uint32_t>* vgpr_rows_cell() { return &vgpr_rows_; }
   uint32_t vgpr_rows() const { return vgpr_rows_.load(std::memory_order_acquire); }
 
   // The instruction at word `word` of .text, decoded by `decode` the first

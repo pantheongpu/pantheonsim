@@ -1972,6 +1972,29 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   return in;
 }
 
+uint32_t vgpr_rows_written(const Inst& in) {
+  const std::string_view n = in.name;
+  if (n.rfind("s_set_gpr_idx", 0) == 0 || n.rfind("v_movrel", 0) == 0 || n.rfind("v_swaprel", 0) == 0 || n.rfind("s_set_vgpr_msb", 0) == 0)
+    return kVgprsAny;
+  constexpr uint32_t kWidestResult = 16;
+  uint32_t rows = 0;
+  for (const auto* ops : {&in.dst, &in.src})
+    for (const Operand& o : *ops)
+      if (o.kind == OperandKind::Vgpr) rows = std::max(rows, o.index + std::max<uint32_t>(o.width, 1) + kWidestResult);
+  for (const Inst& half : in.dual) rows = std::max(rows, vgpr_rows_written(half));
+  return rows;
+}
+
+Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64, std::atomic<uint32_t>* rows,
+            bool anywhere) {
+  Inst in = decode(code, at, pc, target, wave64);
+  const uint32_t want = anywhere ? kVgprsAny : vgpr_rows_written(in);
+  uint32_t seen = rows->load(std::memory_order_relaxed);
+  while (seen < want && !rows->compare_exchange_weak(seen, want, std::memory_order_release, std::memory_order_relaxed)) {
+  }
+  return in;
+}
+
 namespace {
 Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc) {
   const uint32_t w0 = word(code, at);
