@@ -12333,6 +12333,21 @@ void release_registers(Machine& m, Group& group) {
   for (Wave& w : group.waves) w.vgpr.r.release(rows);
 }
 
+// A finished work-group made ready to be set up again: as new as a Group{} is, but for the memory its vectors hold (the waves go,
+// and their register files back to the pool; set_up_group sizes and fills the LDS and the scratch afresh). Not the large ones.
+void recycle_group(Group& group) {
+  group.waves.clear();
+  group.lds.clear();
+  group.scratch.clear();
+  if (group.lds.capacity() > (1u << 20)) std::vector<uint8_t>().swap(group.lds);
+  if (group.scratch.capacity() > (1u << 20)) std::vector<uint8_t>().swap(group.scratch);
+  group.scratch_per_lane = 0;
+  std::fill(std::begin(group.id), std::end(group.id), 0u);
+  std::fill(std::begin(group.nb_members), std::end(group.nb_members), 0u);
+  std::fill(std::begin(group.nb_signaled), std::end(group.nb_signaled), 0u);
+  group.wg_signaled = 0;
+}
+
 // One turn for each of a group's waves: each runs until it stops, parks at a
 // barrier or yields (s_sleep, a wave waiting on something), and a barrier
 // every unfinished wave has reached is released. Says whether every wave has
@@ -12434,11 +12449,19 @@ void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_s
     bool had_turn = false;
   };
   std::list<Held> resident;
+  // The groups this thread has finished, kept (a few) to be set up again: a group's list node, its LDS and scratch vectors and
+  // its waves' vector are allocated once and not for every work-group, which a launch of one small group spent a tenth of its time on.
+  thread_local std::list<Held> spare;
+  constexpr size_t kSpareGroups = 4;
   uint64_t next = begin, resident_waves = 0;
   const auto admit = [&] {
     uint32_t gx, gy, gz;
     group_at(next++, &gx, &gy, &gz);
-    resident.emplace_back();
+    if (spare.empty()) {
+      resident.emplace_back();
+    } else {
+      resident.splice(resident.end(), spare, std::prev(spare.end()));
+    }
     set_up_group(resident.back().group, m, d, packet, group_segment, gx, gy, gz);
     resident_waves += resident.back().group.waves.size();
   };
@@ -12450,7 +12473,14 @@ void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_s
       if (run_round(m, it->group, it->had_turn ? kLaterTurn : kFirstTurn)) {
         resident_waves -= it->group.waves.size();
         release_registers(m, it->group);
-        it = resident.erase(it);
+        if (spare.size() < kSpareGroups) {
+          recycle_group(it->group);
+          it->had_turn = false;
+          const auto done = it++;
+          spare.splice(spare.end(), resident, done);
+        } else {
+          it = resident.erase(it);
+        }
         all_waiting = false;
         continue;
       }

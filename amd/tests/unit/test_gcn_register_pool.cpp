@@ -6,6 +6,7 @@
 // ends, the next reads that register and stores it, and the two run one after the other on this thread, so the second gets the
 // first's register file. It has to read zero, as a fresh file does; and a kernel that writes the register itself, which makes
 // the check mean something, has to read what it wrote.
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -32,6 +33,19 @@ const std::vector<uint32_t> kWriteIndexed = {
     0xBF110804,                  // s_set_gpr_idx_on s4, gpr_idx(DST)
     0x7E0002FF, kMagic,          // v_mov_b32 v0, 0xDEADBEEF
     0xBF9C0000,                  // s_set_gpr_idx_off
+};
+// Stores the work-group's number (s2) in out[group].
+const std::vector<uint32_t> kStoreGroupId = {
+    0xC0060100, 0x00000000,   // s_load_dwordx2 s[4:5], s[0:1], 0x0
+    0xBF8CC07F,               // s_waitcnt lgkmcnt(0)
+    0x8F068202,               // s_lshl_b32 s6, s2, 2
+    0x80040604,               // s_add_u32 s4, s4, s6
+    0x82058005,               // s_addc_u32 s5, s5, 0
+    0x7E040204,               // v_mov_b32 v2, s4
+    0x7E060205,               // v_mov_b32 v3, s5
+    0x7E080202,               // v_mov_b32 v4, s2
+    0xDC708000, 0x007F0402,   // global_store_dword v[2:3], v4, off
+    0xBF8C0F70,               // s_waitcnt vmcnt(0)
 };
 // Stores v200 to the address in the kernel's first argument.
 const std::vector<uint32_t> kStoreHigh = {
@@ -108,7 +122,33 @@ uint32_t stored_by(const std::vector<uint32_t>& writer) {
   return read_word(mem, out);
 }
 
+// Many work-groups on one host thread, each of two waves: every one is a recycled group but the first, and has to run.
+void many_groups(uint32_t groups, uint32_t size) {
+  ::setenv("VGPU_THREADS", "1", 1);
+  MemoryManager mem(16ull << 20);
+  const uint64_t out = mem.alloc(groups * 4);
+  const std::vector<uint32_t> poison(groups, 0x5A5A5A5Au);
+  mem.write(out, poison.data(), groups * 4);
+  amd::CodeObject o = object(cat({&kStoreGroupId, &kEnd}));
+  amd::Dispatch d;
+  d.object = &o;
+  d.kernel = amd::find_kernel(o, "k");
+  d.kernarg = mem.alloc(8);
+  mem.write(d.kernarg, &out, 8);
+  d.groups[0] = groups;
+  d.group_size[0] = size;
+  amd::execute(d, mem);
+  ::unsetenv("VGPU_THREADS");
+  for (uint32_t g = 0; g < groups; ++g) VCHECK_EQ(read_word(mem, out + 4ull * g), g);
+}
+
 }  // namespace
+
+VTEST(every_work_group_of_a_launch_runs_when_the_groups_are_set_up_again) {
+  many_groups(9, 64);
+  many_groups(9, 128);
+  many_groups(33, 256);
+}
 
 VTEST(a_register_a_kernel_writes_reads_back_as_written) {
   VCHECK_EQ(stored_after(kWriteHigh, true), kMagic);
