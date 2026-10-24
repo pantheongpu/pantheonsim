@@ -5144,8 +5144,12 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
     case Op::EXIT: {
       const Mask go = with_condition(ex);   // EXIT Pn: the lanes where both hold
       each_lane(group, [&](unsigned l) {
-        if ((go >> l) & 1) w.exited |= Mask{1} << l;
-        else w.pc[l] += 16;
+        if ((go >> l) & 1) {
+          if (((w.alive & ~w.exited) >> l) & 1) --blk.live;
+          w.exited |= Mask{1} << l;
+        } else {
+          w.pc[l] += 16;
+        }
       });
       // Lanes that exit no longer hold anything up.
       for (unsigned x = 0; x < 16; ++x) release_bsync(x);

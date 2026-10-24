@@ -1775,9 +1775,7 @@ inline void tier_release_bsync(Warp& w, unsigned x) {
 // the barrier is reset.
 inline void tier_release_bar(Block& blk, unsigned id) {
   Block::Barrier& b = blk.bars[id];
-  uint32_t live = 0;
-  for (const Warp& ww : blk.warps) live += popc(ww.alive & ~ww.exited);
-  const uint32_t expected = b.expected ? b.expected : live;
+  const uint32_t expected = b.expected ? b.expected : blk.live;
   if (b.arrived < expected) return;
   for (Warp& ww : blk.warps) tier_wake(ww, tier_waiting_on(ww, Wait::Bar, id));
   for (Warp& ww : blk.warps) {
@@ -2046,6 +2044,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
         go &= tier_pmask(c, last.p);
         if (last.aux > 1) go &= tier_pmask(c, last.p2);
       }
+      blk.live -= popc(go & w.alive & ~w.exited);
       w.exited |= go;
       for (Mask m = group & ~go; m; m &= m - 1) w.pc[std::countr_zero(m)] = here + 16;
       cluster_barrier_check(blk);

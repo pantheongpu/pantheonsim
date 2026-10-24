@@ -174,6 +174,7 @@ struct Block {
   Cluster* cluster = nullptr;
   Cluster own;                  // the cluster when the launch has none
   std::vector<Warp> warps;
+  uint32_t live = 0;            // the block's threads that are alive and have not exited (init_block sets it, EXIT lowers it)
   uint64_t bssy_clock = 0;      // counts BSSYs, to order the warps' barriers by nesting
   std::vector<uint8_t> shared;
   std::map<std::pair<uint32_t, uint64_t>, GmmaSnapshot> gmma;   // (warpgroup, n-th MMA)
@@ -1114,6 +1115,7 @@ void Runner::init_block(Block& blk, uint64_t linear) {
     w.local_size = local_size_;
     w.local.clear();   // made on the warp's first local access
   }
+  blk.live = block_threads_;
   for (Block::Barrier& b : blk.bars) b = Block::Barrier{};
   blk.mbar.clear();
   blk.gmma.clear();
