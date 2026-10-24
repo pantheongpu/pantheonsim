@@ -1,0 +1,13 @@
+perf stat of `bench_kernels launch full` (41.6 k launches), CPU 4, median of 5 rounds, instructions:u / cycles:u (M):
+jit-base (main without the JIT)                                   935.9 / 299.0-300.3
+p2  base + the Program::jit member only                           935.9 / 301.2-301.7
+p4  current tree minus: jit_ flag, dispatch, the tier_program call (member and tier_run_t split kept)   936.0 / 298.0-299.6   (= base)
+p3  p4 + the jit_ flag in the Runner constructor                  938.3 / 303.4
+p1  jit tree minus the tier_program call                          938.8 / 303.7-304.4
+q1  p4 + the tier_program call only                               937.8 / 304.7
+q2  p4 + the call-site dispatch only                              937.6 / 300.3
+jit (this branch, step_warp dispatch, jit::attach)                937.8-938.2 / 302.9-307.3
+Any one of the small changes (the flag, the call, the dispatch) adds 1.6-2.4 M instructions (about 40-60 per launch); the sum is not larger than any one of them.
+A path name of another length (symlinks jit-curr, jit-bas, jit-p4x) changes nothing, so it is not the environment size. A perf record of base against q1 (25 runs, 4000-instruction
+period) moves samples between a kernel and its inlined copy (imad_wide_k +173 / imad_wide_avx2 -186) and between the same libc functions, and shows no new function: an inlining
+decision flipping under whole-program optimisation, not code that runs.

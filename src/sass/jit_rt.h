@@ -50,7 +50,8 @@ using namespace jk::jk_kernels;
 }
 
 [[gnu::always_inline]] inline void splat(u32* t, u32 v) {
-  for (unsigned l = 0; l < 32; ++l) t[l] = v;
+  const V8u x = {v, v, v, v, v, v, v, v};
+  for (unsigned i = 0; i < 32; i += 8) std::memcpy(t + i, &x, sizeof x);
 }
 
 // A register with a modifier: its 32 lanes worked through tmod.
@@ -62,9 +63,29 @@ using namespace jk::jk_kernels;
 // A result row to the destination register for the executing lanes (tier_store): the whole row, or a blend of the lanes.
 [[gnu::always_inline]] inline void store_row(u32* d, u32 ex, const u32* r) {
   if (ex == 0xffffffffu) {
-    for (unsigned l = 0; l < 32; ++l) d[l] = r[l];
+    for (unsigned i = 0; i < 32; i += 8) {
+      V8u v;
+      std::memcpy(&v, r + i, sizeof v);
+      std::memcpy(d + i, &v, sizeof v);
+    }
   } else {
     blend_m_k(d, r, ex);
+  }
+}
+
+// The register file's row and a local copy of it (register residence).
+[[gnu::always_inline]] inline void ldrow(u32* x, const u32* r) {
+  for (unsigned i = 0; i < 32; i += 8) {
+    V8u v;
+    std::memcpy(&v, r + i, sizeof v);
+    std::memcpy(x + i, &v, sizeof v);
+  }
+}
+[[gnu::always_inline]] inline void strow(u32* r, const u32* x) {
+  for (unsigned i = 0; i < 32; i += 8) {
+    V8u v;
+    std::memcpy(&v, x + i, sizeof v);
+    std::memcpy(r + i, &v, sizeof v);
   }
 }
 
