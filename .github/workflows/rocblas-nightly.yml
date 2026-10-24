@@ -61,8 +61,11 @@ jobs:
     runs-on: ubuntu-24.04
     # A shard of the float and double tests takes 3 to 7 minutes on this runner and
     # two run at a time, so twenty of them fit well inside the limit (fifty did not:
-    # every run since 2026-09-30 was cancelled at the limit).
-    timeout-minutes: 180
+    # every run since 2026-09-30 was cancelled at the limit). The MI250X shards took
+    # 85 to 178 minutes until the speed work of 2026-10-22 (#403) and now take 30 to 60;
+    # three of eight nights were cancelled at 180 before it. The limit stays generous so
+    # that a slow night is slow, not cancelled.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:

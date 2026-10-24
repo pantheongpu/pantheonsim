@@ -14,7 +14,11 @@
 # tier against JIT, with and without -fexceptions for the generated code.
 # And the failure modes (no compiler, a compiler that fails, a cache that cannot be written): output identical, the JIT never ran.
 #
-# VGPU_JIT_PROGRAMS="sass_tier.sm_86 sass_tier_steps.sm_86" narrows the programs; VGPU_TIER_WORK keeps the built programs between runs.
+# Two sizes. The default, run on every pull request (ctest e2e_sass_jit), is the gate: sass_tier and sass_tier_steps on sm_86 with every variant above,
+# one random-kernel seed, and the failure modes; only those two programs are built. `--full` (or VGPU_JIT_FULL=1; ctest e2e_sass_jit_full) is the whole
+# matrix: every program on every architecture, three random seeds. It costs an hour on an idle 16-CPU machine, so it SKIPs unless VGPU_NIGHTLY=1, which
+# the schedule-only `jit` job of sass-ptx.yml sets.
+# VGPU_JIT_PROGRAMS="sass_tier.sm_86 sass_tier_steps.sm_86" narrows the programs (and drops the random stage); VGPU_TIER_WORK keeps the built programs between runs.
 #
 # The comparison cannot pass by the JIT doing nothing: sass_tier's statistics must show the generated regions ran at least
 # VGPU_JIT_MIN_PERCENT (default 10) percent of its warp instructions.
@@ -28,6 +32,9 @@ shopt -u nullglob
 (( ${#carts[@]} )) || { echo "SKIP: libvgpucudart not built"; exit 0; }
 if [[ -n $(shim_sanitizer "$shim") ]]; then echo "SKIP: the JIT is off in sanitizer builds"; exit 0; fi
 command -v c++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1 || command -v clang++ >/dev/null 2>&1 || { echo "SKIP: no C++ compiler on PATH"; exit 0; }
+if [[ ${1:-} == --full || -n ${VGPU_JIT_FULL:-} ]] && [[ -z ${VGPU_NIGHTLY:-} ]]; then
+  echo "SKIP: the full JIT matrix runs in the nightly (set VGPU_NIGHTLY=1); ctest e2e_sass_jit is the gate"; exit 0
+fi
 if [[ -n ${VGPU_TIER_WORK:-} ]]; then
   work="$VGPU_TIER_WORK"; mkdir -p "$work"
 else
@@ -35,6 +42,13 @@ else
   trap 'rm -rf "$work"' EXIT
 fi
 export VGPU_TIER_WORK="$work"
+full=0
+[[ ${1:-} == --full || -n ${VGPU_JIT_FULL:-} ]] && full=1
+prog_filter="${VGPU_JIT_PROGRAMS:-}"
+if (( ! full )) && [[ -z $prog_filter ]]; then   # the gate: two programs, built for one architecture
+  prog_filter="sass_tier.sm_86 sass_tier_steps.sm_86"
+  export VGPU_TIER_ARCHS="${VGPU_TIER_ARCHS:-sm_86}" VGPU_TIER_PROGRAMS="${VGPU_TIER_PROGRAMS:-sass_tier_steps:75}"
+fi
 build_log="$(VGPU_TIER_BUILD_ONLY=1 "$root/nvidia/tests/e2e/run_sass_tier.sh" 2>&1)"; rc=$?
 if grep -q '^SKIP' <<< "$build_log" && ! compgen -G "$work/*.sm_*" >/dev/null; then echo "$build_log" | grep '^SKIP' | head -1; exit 0; fi
 (( rc == 0 )) || { echo "FAIL: building the test programs"; echo "$build_log" | tail -20; exit 1; }
@@ -47,6 +61,10 @@ cache="$work/jit-cache"
 rm -rf "$cache"
 fails=0
 fault_throws=""
+nvcc_bin="$(pick_nvcc_for_shim "$shim")"
+nvcc_host_compiler_fix
+read -r -a san_flags <<< "$(shim_sanitizer_nvcc_flags "$shim")"
+san="${san_flags[*]}"
 
 # Runs $bin with the shim, one host thread, counters on, quiet; $1 is the label of the extra environment that follows.
 runit() {
@@ -175,16 +193,38 @@ for f in "$work"/*.sm_*; do
   [[ -x $f && $f != *.build && $f != *.stats ]] || continue
   b="${f##*/}"
   # VGPU_JIT_PROGRAMS="name.arch name.arch" narrows the list (the mutation checks run two programs, not fifty).
-  [[ -z ${VGPU_JIT_PROGRAMS:-} || " $VGPU_JIT_PROGRAMS " == *" $b "* ]] || continue
+  [[ -z $prog_filter || " $prog_filter " == *" $b "* ]] || continue
   programs+=("${b%.*} ${b##*.}")
 done
 shopt -u nullglob
 (( ${#programs[@]} )) || { echo "SKIP: no test programs were built"; exit 0; }
-for j in "${programs[@]}"; do check $j; done
+[[ -n ${VGPU_JIT_ONLY_RANDOM:-} ]] || for j in "${programs[@]}"; do check $j; done
+
+# Random straight-line kernels (jit_random.py): u32 / u64 / float statements over a small pool of variables, guards, loads; blocks of 128, 48 and
+# 33 threads. The tier and the JIT with every region compiled must print the same hashes and counters (VGPU_JIT_RANDOM_SEEDS seeds of
+# VGPU_JIT_RANDOM_KERNELS kernels each; default 3 of 16 with --full, 1 in the gate; VGPU_JIT_RANDOM_ARCH, default sm_86).
+if command -v python3 >/dev/null 2>&1 && [[ -z ${VGPU_JIT_PROGRAMS:-} ]]; then
+  rarch="${VGPU_JIT_RANDOM_ARCH:-sm_86}"
+  if grep -qx "$rarch" <<< "$("$nvcc_bin" --list-gpu-code 2>/dev/null)"; then
+    for seed in $(seq 1 "${VGPU_JIT_RANDOM_SEEDS:-$(( full ? 3 : 1 ))}"); do
+      src="$work/jit_random.$seed.cu"; bin="$work/jit_random.$seed.$rarch"
+      python3 "$root/nvidia/tests/e2e/jit_random.py" "$seed" "${VGPU_JIT_RANDOM_KERNELS:-16}" > "$src"
+      if ! "$nvcc_bin" -std=c++17 -arch="$rarch" -cudart shared -w -Wno-deprecated-gpu-targets -Xlinker --as-needed $san "$src" -o "$bin" -lcuda 2> "$bin.build"; then
+        echo "FAIL $rarch jit_random seed $seed: does not build"; tail -3 "$bin.build" | sed 's/^/    /'; fails=1; continue
+      fi
+      ra="$(runit "$bin" $rarch VGPU_TIER=1)"; rb="$(runit "$bin" $rarch "${jitenv[@]}" VGPU_JIT_STATS=1 VGPU_JIT_STATS_FILE="$work/jr.$seed.stats")"
+      rb="$(runit "$bin" $rarch "${jitenv[@]}")"; rc="$(runit "$bin" $rarch "${jitenv[@]}" VGPU_THREADS=4)"
+      jl="$(jit_line "$work/jr.$seed.stats")"
+      if [[ "$ra" != "$rb" ]]; then echo "FAIL $rarch jit_random seed $seed: the tier and the JIT print differently"; diff <(echo "$ra") <(echo "$rb") | head -6 | sed 's/^/    /'; fails=1
+      elif [[ "$(runit "$bin" $rarch VGPU_TIER=1 VGPU_THREADS=4)" == "$ra" && "$ra" != "$rc" ]]; then echo "FAIL $rarch jit_random seed $seed: four threads with the JIT print differently"; fails=1
+      else echo "ok   $rarch jit_random seed $seed  (${jl#jit: })"; fi
+    done
+  fi
+fi
 
 # The failure modes: the JIT cannot do its job and the program must not notice (stdout and stderr, the notices aside: VGPU_QUIET).
 prog=sass_tier; arch=sm_86
-if [[ -x "$work/$prog.$arch" ]]; then
+if [[ -z ${VGPU_JIT_ONLY_RANDOM:-} && -x "$work/$prog.$arch" ]]; then
   bin="$work/$prog.$arch"
   ref="$(runit "$bin" $arch VGPU_TIER=1)"
   mode() {

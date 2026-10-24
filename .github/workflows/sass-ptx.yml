@@ -11,6 +11,9 @@ name: SASS and PTX
 #   interp  the build job's suite again with VGPU_TIER=0: the SASS interpreter
 #           without the pre-decoded tier, which is on by default (nightly and
 #           by hand, as ptx).
+#   jit     the full tier 2 (VGPU_JIT=1) matrix against the tier, every program on
+#           every architecture with three random-kernel seeds (nightly and by
+#           hand; the pull request gate is the short ctest e2e_sass_jit).
 #   digest  representative e2e programs built for sm_75, sm_86, sm_90, sm_100
 #           and sm_120, each run on SASS and on PTX with VGPU_KERNEL_DIGEST,
 #           and the per-kernel memory digests compared
@@ -148,6 +151,54 @@ jobs:
         run: |
           ctest --test-dir build --output-on-failure \
             -E '^(pantheon_workloads|amd_.*|test_amd.*|.*ollama.*)$'
+
+  jit:
+    name: the full tier 2 (JIT) matrix
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    container:
+      # The build job's toolchain (Ubuntu's CUDA 12.0), so this is that job's
+      # run with only the engine changed.
+      image: ${{ needs.image.outputs.cuda12_0 }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --shm-size=2g
+    env:
+      NVCC_PREPEND_FLAGS: -ccbin g++-12
+    permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pr-guard
+
+      - name: Is there a SASS path?
+        id: sass
+        run: |
+          if grep -q VGPU_SASS_LOG nvidia/src/fatbin.cpp; then echo "here=yes" >> "$GITHUB_OUTPUT"
+          else echo "::notice::no SASS executor in this tree: nothing to repeat"; fi
+
+      - name: Install toolchain
+        if: steps.sass.outputs.here && !job.container.id
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential cmake ninja-build g++-12 nvidia-cuda-toolkit nvidia-profiler
+
+      - name: Build
+        if: steps.sass.outputs.here
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(ci/jobs.sh -p release)"
+
+      - name: The full JIT matrix (the PR gate is ctest e2e_sass_jit)
+        if: steps.sass.outputs.here
+        env:
+          VGPU_NIGHTLY: '1'
+        # Every program on every architecture the toolchain can target, three random-kernel seeds; about an hour on a 16-CPU
+        # machine, several on a hosted one.
+        run: ctest --test-dir build --output-on-failure -R '^e2e_sass_jit_full$'
 
   digest:
     name: SASS and PTX leave the same memory

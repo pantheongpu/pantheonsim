@@ -256,6 +256,7 @@ Config Config::from_env() {
   c.cache_dir = env("VGPU_JIT_CACHE");
   c.cxx = env("VGPU_JIT_CXX");
   c.extra_flags = env("VGPU_JIT_FLAGS");
+  if (const std::string r = env("VGPU_JIT_RESIDENCE"); r == "0") c.residence = false;
   if (const std::string t = env("VGPU_JIT_TIMEOUT"); !t.empty()) c.timeout_s = static_cast<unsigned>(std::strtoul(t.c_str(), nullptr, 10));
   if (const std::string m = env("VGPU_JIT_MEM_MB"); !m.empty()) c.mem_mb = static_cast<unsigned>(std::strtoul(m.c_str(), nullptr, 10));
   return c;
@@ -293,7 +294,7 @@ std::vector<uint32_t> Engine::meta(const UnitSpec& spec) {
   return m;
 }
 
-std::string Engine::source(const UnitSpec& spec, bool avx2) {
+std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence) {
   std::string s;
   const auto put = [&](const char* fmt, auto... a) {
     char buf[1024];
@@ -339,10 +340,12 @@ std::string Engine::source(const UnitSpec& spec, bool avx2) {
   for (size_t ri = 0; ri < spec.regions.size(); ++ri) {
     const RegionSpec& r = spec.regions[ri];
     put("// region %zu: %zu ops\n", ri, r.ops.size());
-    // With a generated op in the region the body is a function of its own, called twice: for a whole warp (group all ones, glanes 32: the
-    // compiler then knows every unguarded op writes whole rows and counts a constant) and for any other group.
-    if (any_gen) put("static inline __attribute__((always_inline)) void body_%zu(Ctx* c, uint32_t group, uint32_t glanes) {\n", ri);
-    else put("extern \"C\" VJ_EXPORT void vgpu_jit_r%zu(Ctx* c, uint32_t group, uint32_t glanes) {\n", ri);
+    // The region's text is built apart (its declarations of local rows come first, and are known only at the end).
+    std::string saved;
+    saved.swap(s);
+    RowCtx rc;
+    rc.enabled = residence && any_gen;
+    if (const char* cap = std::getenv("VGPU_JIT_RES_ROWS")) rc.cap = static_cast<unsigned>(std::strtoul(cap, nullptr, 10));
     // The counters. Steps and instructions are the op count; the lanes an unguarded op counts are the group's, known only as glanes,
     // so they are counted as multiples of it; a guarded op's are worked out and added to locals. All of it is written out before every
     // call of the tier's handler (which can throw, and must find the counters as the run loop leaves them) and at the end.
@@ -360,8 +363,15 @@ std::string Engine::source(const UnitSpec& spec, bool avx2) {
     std::map<unsigned, uint64_t> pend_cls;     // unguarded ops since the last flush, by class
     std::set<unsigned> pend_dyn;                // classes with a guarded op since the last flush
     bool pend_dyn_any = false;
+    std::vector<size_t> pend_notes;
     const auto flush = [&] {
       if (pend_ops == 0) return;
+      if (!pend_notes.empty()) {
+        s += "  if (c->flags & 1u) {\n";
+        for (size_t n : pend_notes) put("    c->note(c, %zuu);\n", n);
+        s += "  }\n";
+        pend_notes.clear();
+      }
       put("  *c->steps += %lluu; *c->instructions += %lluu;\n", static_cast<unsigned long long>(pend_ops), static_cast<unsigned long long>(pend_ops));
       if (pend_unguarded || pend_dyn_any)
         put("  *c->thread_instructions += %s%s%s;\n", pend_unguarded ? ("static_cast<uint64_t>(glanes) * " + std::to_string(pend_unguarded) + "u").c_str() : "",
@@ -396,7 +406,11 @@ std::string Engine::source(const UnitSpec& spec, bool avx2) {
         // tier_guard: the guard predicate as a lane mask (PT: all lanes), negated for @!P, narrowed to the group.
         if (o.guard_uniform) put("    uint32_t g = (%s) ? 0xffffffffu : 0u;\n", o.guard == 7 ? "true" : (std::string("c->up[") + std::to_string(o.guard) + "]").c_str());
         else if (o.guard == 7) s += "    uint32_t g = 0xffffffffu;\n";
-        else put("    uint32_t g = c->p[%u];\n", unsigned{o.guard});
+        else {
+          const std::string pe = rc.pred(o.guard, false);
+          s += rc.flush_pre();
+          put("    uint32_t g = %s;\n", pe.c_str());
+        }
         if (o.guard_not) s += "    g = ~g;\n";
         s += "    const uint32_t ex = group & g;\n"
              "    const uint32_t lanes = static_cast<uint32_t>(__builtin_popcount(ex));\n";
@@ -407,20 +421,30 @@ std::string Engine::source(const UnitSpec& spec, bool avx2) {
       ++pend_ops;
       if (o.form == 0) {
         flush();
+        rc.sync(s, true);   // the tier's handler reads and writes the real register file: every dirty row and predicate goes back, none is trusted after
         put("    if (ex | (c->flags & 1u)) c->escape(c, %zuu, ex);\n", i);
       } else {
-        const std::string body = gen_op_body(o);
+        const std::string body = gen_op_body(o, rc);
+        s += rc.flush_pre();
         if (o.unguarded) s += body;
         else {
           s += "    if (ex) {\n";
           s += body;
           s += "    }\n";
         }
-        put("    if (c->flags & 1u) c->note(c, %zuu);\n", i);
+        pend_notes.push_back(i);   // (the tier's statistics of the op: written at the next flush, so that no call sits between two generated ops)
       }
       s += "  }\n";
     }
     flush();
+    rc.sync(s, false);
+    std::string region;
+    region.swap(s);
+    s.swap(saved);
+    if (any_gen) put("static inline __attribute__((always_inline)) void body_%zu(Ctx* c, uint32_t group, uint32_t glanes) {\n", ri);
+    else put("extern \"C\" VJ_EXPORT void vgpu_jit_r%zu(Ctx* c, uint32_t group, uint32_t glanes) {\n", ri);
+    s += rc.decls();
+    s += region;
     s += "}\n\n";
     if (any_gen)
       put("extern \"C\" VJ_EXPORT void vgpu_jit_r%zu(Ctx* c, uint32_t group, uint32_t glanes) {\n"
@@ -430,6 +454,9 @@ std::string Engine::source(const UnitSpec& spec, bool avx2) {
 }
 
 // ---- the engine -----------------------------------------------------------------------------------------------------------------------
+
+// (process-wide: two engines in one process, as the tests have, must not make the same temporary file name)
+static std::atomic<uint64_t> g_seq{0};
 
 struct Engine::Impl {
   std::mutex mu;
@@ -526,7 +553,7 @@ std::string Engine::key(const UnitSpec& spec, std::string* why) {
   const std::string cid = compiler_id(why);
   if (cid.empty()) return {};
   const std::string isa = cfg_.isa.empty() ? detect_isa() : cfg_.isa;
-  return hash_text(source(spec, isa == "avx2") + key_suffix(cfg_, cid, isa));
+  return hash_text(source(spec, isa == "avx2", cfg_.residence) + key_suffix(cfg_, cid, isa));
 }
 
 // The key of a whole section (what the file naming its selection of regions is named by): the facts of every region, not their text.
@@ -598,7 +625,7 @@ Result Engine::obtain_selected(const UnitSpec& full, const std::vector<uint32_t>
   for (uint32_t i : sel) text += " " + std::to_string(i);
   text += "\n";
   const std::string dir = cache_path();
-  const std::string tmp = dir + "/" + skey + "." + std::to_string(::getpid()) + "." + std::to_string(p_->seq.fetch_add(1)) + ".seltmp";
+  const std::string tmp = dir + "/" + skey + "." + std::to_string(::getpid()) + "." + std::to_string(g_seq.fetch_add(1)) + ".seltmp";
   if (!write_file(tmp, text) || ::rename(tmp.c_str(), (dir + "/" + skey + ".sel").c_str()) != 0) ::unlink(tmp.c_str());   // (a failure only costs the next run its lookup)
   return r;
 }
@@ -619,7 +646,7 @@ std::string Engine::ensure_rt() {
     const std::string path = p_->rt_dir + "/" + name;
     std::string have;
     if (read_file(path, have) && have == *text) continue;
-    const std::string tmp = path + "." + std::to_string(::getpid()) + "." + std::to_string(p_->seq.fetch_add(1)) + ".tmp";
+    const std::string tmp = path + "." + std::to_string(::getpid()) + "." + std::to_string(g_seq.fetch_add(1)) + ".tmp";
     if (!write_file(tmp, *text) || ::rename(tmp.c_str(), path.c_str()) != 0) {
       ::unlink(tmp.c_str());
       p_->rt_err = std::string("cannot write ") + path + ": " + std::strerror(errno);
@@ -748,7 +775,7 @@ Result Engine::obtain(const UnitSpec& spec) {
   Result out;
   out.key = key;
   out.replaced_corrupt = damaged || again.replaced_corrupt;
-  const std::string stem = dir + "/" + key + "." + std::to_string(::getpid()) + "." + std::to_string(p_->seq.fetch_add(1));
+  const std::string stem = dir + "/" + key + "." + std::to_string(::getpid()) + "." + std::to_string(g_seq.fetch_add(1));
   const std::string tmp_cpp = stem + ".cpp", tmp_so = stem + ".so";
   if (const std::string rterr = ensure_rt(); !rterr.empty()) {
     out.status = Status::CacheUnusable;
@@ -756,7 +783,7 @@ Result Engine::obtain(const UnitSpec& spec) {
     return out;
   }
   const std::string isa = cfg_.isa.empty() ? detect_isa() : cfg_.isa;
-  if (!write_file(tmp_cpp, source(spec, isa == "avx2"))) {
+  if (!write_file(tmp_cpp, source(spec, isa == "avx2", cfg_.residence))) {
     out.status = Status::CacheUnusable;
     out.message = "cannot write to " + dir + ": " + std::strerror(errno);
     return out;
@@ -1167,6 +1194,11 @@ std::shared_ptr<Unit> make_unit(const tier::Program& prog, int sm) {
   stats().units.fetch_add(1);
   stats().regions.fetch_add(u->regions.size());
   return u;
+}
+
+
+void attach(tier::Program& prog, int sm) {
+  if (requested()) prog.jit = make_unit(prog, sm);
 }
 
 }  // namespace vgpu::sass::jit

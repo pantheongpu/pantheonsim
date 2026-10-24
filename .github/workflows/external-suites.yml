@@ -68,6 +68,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: This is the host with CUDA 13.0 and ROCm 7.1
+        run: ci/ml-runner-preflight.sh cuda13 rocm71
+
       - name: Tonight's AMD GPU
         id: turn
         env:
@@ -137,6 +140,10 @@ jobs:
       - name: Unpack the simulator
         if: steps.want.outputs.yes
         run: tar -xzf sim-build.tgz && rm sim-build.tgz && ls build/shim | head -40
+
+      - name: The runner and the shim match the suites' CUDA
+        if: steps.want.outputs.yes
+        run: ci/ml-runner-preflight.sh cuda13 shim13
 
       - name: The suite's build, from the cache
         if: steps.want.outputs.yes
@@ -222,6 +229,9 @@ jobs:
       key: ${{ steps.arch.outputs.key }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: This is the host with ROCm 7.1
+        run: ci/ml-runner-preflight.sh rocm71
 
       - name: Architecture and suites
         id: arch
@@ -363,6 +373,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - name: This is the host with ROCm 7.1
+        run: ci/ml-runner-preflight.sh rocm71
 
       - uses: actions/download-artifact@v4
         with:

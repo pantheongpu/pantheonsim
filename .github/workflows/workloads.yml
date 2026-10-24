@@ -227,7 +227,7 @@ jobs:
           missing=$(comm -13 <(printf '%s\n' "$have" "$skip" | sort -u) <(printf '%s\n' "$want") | tr '\n' ' ')
           stale=$(comm -23 <(printf '%s\n' "$have" "$skip" | sort -u) <(printf '%s\n' "$want") | tr '\n' ' ')
           echo "matrix: $(printf '%s\n' "$have" | wc -l) profiles; not run: $(printf '%s\n' "$skip" | grep -c .); nvidia/profiles: $(printf '%s\n' "$want" | wc -l)"
-          [ -z "${missing// }" ] || { echo "::error::not in the workloads matrix: $missing"; exit 1; }
+          [ -z "${missing// }" ] || { echo "::error::nvidia/profiles has a profile with no row in .github/workflows/workloads.yml: $missing. Add a matrix row ({ key: <name>-x1-cuda13.0, gpu: nvidia/<name>, count: 1, cuda: '13.0' }) or a line '# not-run nvidia/<name>: <reason>'."; exit 1; }
           [ -z "${stale// }" ] || { echo "::error::in the matrix but not a profile: $stale"; exit 1; }
           [ -z "${both// }" ] || { echo "::error::both in the matrix and marked not-run: $both"; exit 1; }
 

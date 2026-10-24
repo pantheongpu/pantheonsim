@@ -2019,13 +2019,13 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   }
 }
 
-// The run loop without tier 2's hook is the loop of every run that does not ask for the JIT, so it has no trace of it (and it is inlined where
-// it was before tier 2: tier_run_t is always_inline); with VGPU_JIT=1 a section that has regions runs the other instance, out of line.
+// The run loop without tier 2's hook is the loop of every run that does not ask for the JIT, so it has no trace of it (tier_run_t is always_inline, so
+// it is inlined where the loop was before tier 2); step_warp calls tier_run_jit instead for a section that has a unit.
 [[gnu::noinline]] bool Runner::tier_run_jit(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
+  if (tp.jit->state.load(std::memory_order_relaxed) == static_cast<int>(jit::State::Failed))   // (failed, or nothing worth compiling: the plain loop)
+    return tier_run_t<false>(blk, w, group, pick, code, tp);
   return tier_run_t<true>(blk, w, group, pick, code, tp);
 }
 bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
-  if (jit_ && tp.jit && tp.jit->state.load(std::memory_order_relaxed) != static_cast<int>(jit::State::Failed)) [[unlikely]]
-    return tier_run_jit(blk, w, group, pick, code, tp);   // (a section whose JIT has failed or found nothing to compile runs the plain loop)
   return tier_run_t<false>(blk, w, group, pick, code, tp);
 }
