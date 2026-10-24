@@ -4111,8 +4111,10 @@ foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopp
   endif()
 endforeach()
 # Under `ctest -j` the tests holding that lock form a chain, and the two CUTLASS
-# tests are most of it (about 1200 s and 1000 s in the build job; every other
-# test is under 120 s). ctest starts tests in cost order (by number when it has
+# tests are most of it (about 1200 s and 1000 s in the build job when they compile
+# every binary; the build job's cache of those binaries, VGPU_CUTLASS_BIN_CACHE
+# in cutlass_fetch.sh, leaves them the run time; every other test is under
+# 120 s). ctest starts tests in cost order (by number when it has
 # no history, which a fresh CI checkout has not), so with these two last in the
 # order they would start only after everything else had finished and the
 # chain could overlap nothing. A cost starts them first: the lock chain then

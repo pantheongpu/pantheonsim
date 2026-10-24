@@ -139,3 +139,43 @@ cutlass_sass_check() {   # cutlass_sass_check <name> <output>: fails when the SA
   fi
   grep -q "running SASS" <<<"$2" || { echo "FAIL: $1 did not run its SASS"; return 1; }
 }
+
+# cutlass_nvcc <out> <nvcc args...>: nvcc <args> -o <out>, or, when
+# VGPU_CUTLASS_BIN_CACHE names a directory, the binary a previous run built
+# from the very same inputs. A CUTLASS test takes minutes of nvcc (10 GB and
+# 100 to 200 s each; e2e_cutlass_hopper and e2e_cutlass_gemm are 2200 s of the
+# unit job) and the binary does not depend on the simulator, which is only
+# needed to run it, so CI keeps the directory in actions/cache and the run
+# step still executes every binary. The entry is named for a hash of everything
+# that decides the binary, so a stale entry is never found, only unused:
+#   - the full argument list (flags, defines, include paths, the .cu and .cpp
+#     files named) and the contents of every .cu and .cpp among them;
+#   - this file (the CUTLASS and googletest tags);
+#   - nvcc's version and the host compilers' (nvcc's stdlib headers and the
+#     libstdc++ the binary links), NVCC_*_FLAGS, CUDAHOSTCXX and the CPU arch.
+# CUTLASS_DIR (a checkout of unknown content) turns the cache off. An entry is
+# written to a temporary name and renamed, so a killed job leaves no half file;
+# a restored binary leaves "<out>.cached" beside it for the caller to count.
+cutlass_nvcc() {
+  local out="$1" dir="${VGPU_CUTLASS_BIN_CACHE:-}" a key entry
+  shift
+  if [[ -z "$dir" || -n "${CUTLASS_DIR:-}" ]]; then
+    nvcc "$@" -o "$out"; return
+  fi
+  key="$({ printf '%s\0' "$@"
+           for a in "$@"; do
+             [[ "$a" == *.cu || "$a" == *.cpp ]] && [[ -f "$a" ]] && sha256sum "$a"
+           done
+           sha256sum "${BASH_SOURCE[0]}"
+           nvcc --version || true
+           { g++ --version; g++-12 --version; } | grep -E 'g\+\+|GCC' || true
+           printf '%s\n' "${NVCC_PREPEND_FLAGS:-}" "${NVCC_APPEND_FLAGS:-}" "${CUDAHOSTCXX:-}" "$(uname -m)"
+         } 2>/dev/null | sha256sum | cut -c1-32)"
+  entry="$dir/${out##*/}-$key"
+  if [[ -f "$entry" ]]; then
+    cp -p "$entry" "$out" && touch "$out.cached" && return 0
+  fi
+  nvcc "$@" -o "$out" || return
+  mkdir -p "$dir" && cp -p "$out" "$entry.tmp.$$" && mv -f "$entry.tmp.$$" "$entry" || rm -f "$entry.tmp.$$"
+  return 0
+}
