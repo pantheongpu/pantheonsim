@@ -118,12 +118,15 @@ struct Event {
 // Off until a front end asks for it, so a program nobody is profiling pays
 // nothing beyond one relaxed load per launch.
 //
-// The two flags a call tests (this and hooked()) are read inline, every API call asks both. They stay exported
-// (default visibility), so the library that sets them and the one that reads them are one state as the
+// The two flags a call tests (this and hooked()) are read inline, every API call asks both. They keep default
+// visibility, so the library that sets them and the one that reads them are one state as the
 // functions they replace were (the profiling state is the process's, see the CUPTI shim's link line).
 namespace detail {
-extern std::atomic<bool> g_on;
-extern std::atomic<bool> g_hooked;
+// Inline variables: one weak, default-visibility definition per library that includes this, which the dynamic linker
+// merges into one object. That is the shared state wanted here, and not an ODR violation for AddressSanitizer or
+// tests/lint/check_odr_globals.py, which only fail strong definitions that two libraries both carry.
+inline std::atomic<bool> g_on{false};
+inline std::atomic<bool> g_hooked{false};
 }  // namespace detail
 inline bool enabled() { return detail::g_on.load(std::memory_order_relaxed); }
 void set_enabled(bool on);

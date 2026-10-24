@@ -57,8 +57,6 @@ constexpr size_t kMaxBuffered = 1u << 20;
 
 }  // namespace
 
-std::atomic<bool> detail::g_on{false};
-std::atomic<bool> detail::g_hooked{false};
 void set_enabled(bool on) { detail::g_on.store(on, std::memory_order_relaxed); }
 
 namespace {
