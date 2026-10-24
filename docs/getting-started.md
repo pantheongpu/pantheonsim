@@ -187,9 +187,11 @@ each `vgpu` command before it runs, so you can copy it.
 ## Help, contributing and security
 
 Questions and ideas go in [Discussions](https://github.com/pantheongpu/pantheonsim/discussions),
-bugs in [issues](https://github.com/pantheongpu/pantheonsim/issues). How changes
-are decided is in [GOVERNANCE.md](../GOVERNANCE.md), and security problems should be
-reported privately as [SECURITY.md](../SECURITY.md) describes.
+bugs in [issues](https://github.com/pantheongpu/pantheonsim/issues). How to send a
+change is in [CONTRIBUTING.md](../CONTRIBUTING.md), the rules for taking part in
+[CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md), how changes are decided in
+[GOVERNANCE.md](../GOVERNANCE.md), and security problems should be reported privately
+as [SECURITY.md](../SECURITY.md) describes.
 
 ## License
 

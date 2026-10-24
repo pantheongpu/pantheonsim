@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or idea
+    url: https://github.com/pantheongpu/pantheonsim/discussions
+    about: Ask how to use PantheonSim or float an idea before it becomes an issue.
+  - name: Security problem
+    url: https://github.com/pantheongpu/pantheonsim/security/advisories/new
+    about: Report a vulnerability privately; see SECURITY.md. Please do not open a public issue.
