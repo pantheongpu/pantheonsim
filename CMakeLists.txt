@@ -1309,6 +1309,8 @@ vgpu_unit_test(test_memcount_forms)
 vgpu_unit_test(test_atom_rmw)
 # Module::code_at (a binary search over the code sections) against the scan it replaced.
 vgpu_unit_test(test_sass_code_at)
+# The SASS executor's block, kept between blocks and launches and set up again each time (Runner::init_block).
+vgpu_unit_test(test_sass_block_reuse)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
