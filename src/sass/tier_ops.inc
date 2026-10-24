@@ -1692,42 +1692,80 @@ inline void tier_set_pcs(Warp& w, Mask group, uint64_t v) {
   }
 }
 
+// The lanes of `ex` start to wait with `kind` on `arg`.
+inline void tier_wait(Warp& w, Mask ex, Wait kind, unsigned arg) {
+#if defined(__SSE2__)
+  if (ex == kAll) {
+    const __m128i k = _mm_set1_epi8(static_cast<char>(kind)), a = _mm_set1_epi32(static_cast<int>(arg));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.wait_kind[0]), k);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.wait_kind[16]), k);
+    for (unsigned i = 0; i < 32; i += 4) _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.wait_arg[i]), a);
+    w.waiting |= ex;
+    return;
+  }
+#endif
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    w.wait_kind[l] = kind;
+    w.wait_arg[l] = arg;
+  }
+  w.waiting |= ex;
+}
+
+// The lanes of `w` that wait with `kind` on `arg` (the two arrays compared a vector at a time instead of looked at lane by lane).
+inline Mask tier_waiting_on(const Warp& w, Wait kind, unsigned arg) {
+  Mask arrived = w.waiting;
+  if (!arrived) return 0;
+#if defined(__SSE2__)
+  const __m128i k = _mm_set1_epi8(static_cast<char>(kind));
+  const uint32_t kinds = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_kind[0])), k))) |
+                         static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_kind[16])), k))) << 16;
+  const __m128i want = _mm_set1_epi32(static_cast<int>(arg));
+  uint32_t args = 0;
+  for (unsigned i = 0; i < 8; ++i)
+    args |= static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(
+                _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_arg[4 * i])), want)))) << (4 * i);
+  return arrived & kinds & args;
+#else
+  Mask match = 0;
+  for (Mask m = arrived; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    if (w.wait_kind[l] == kind && w.wait_arg[l] == arg) match |= Mask{1} << l;
+  }
+  return match;
+#endif
+}
+
+// The lanes of `m` (waiting) stop waiting and go on past the instruction they wait at.
+inline void tier_wake(Warp& w, Mask m) {
+  if (!m) return;
+  w.waiting &= ~m;
+#if defined(__SSE2__)
+  if (m == kAll) {   // a whole warp: the kinds cleared and the 32 addresses moved on a vector at a time
+    const __m128i zero = _mm_setzero_si128(), step = _mm_set1_epi64x(16);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.wait_kind[0]), zero);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.wait_kind[16]), zero);
+    for (unsigned i = 0; i < 32; i += 2)
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(&w.pc[i]), _mm_add_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i])), step));
+    return;
+  }
+#endif
+  for (; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    w.wait_kind[l] = Wait::None;
+    w.pc[l] += 16;
+  }
+}
+
 // BSYNC's release (exec_control's release_bsync): once every lane of barrier Bx that is still a thread of the block waits at a
 // BSYNC on it, they all go on past it and the barrier is free for its next BSSY. Lanes that wait at a BSYNC on Bx but are not
 // named by the barrier (a callee that shares Bx with its caller) stay.
 inline void tier_release_bsync(Warp& w, unsigned x) {
   const Mask members = w.b[x] & w.alive & ~w.exited;
-  // The lanes that wait at a BSYNC on Bx: the lanes that wait, whose kind is BSync and whose barrier is x -- the two arrays
-  // compared a vector at a time instead of looked at lane by lane.
-  Mask arrived = w.waiting;
-  if (arrived) {
-#if defined(__SSE2__)
-    const __m128i kind = _mm_set1_epi8(static_cast<char>(Wait::BSync));
-    const uint32_t k = static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_kind[0])), kind))) |
-                       static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_kind[16])), kind))) << 16;
-    const __m128i want = _mm_set1_epi32(static_cast<int>(x));
-    uint32_t a = 0;
-    for (unsigned i = 0; i < 8; ++i)
-      a |= static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(
-               _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.wait_arg[4 * i])), want)))) << (4 * i);
-    arrived &= k & a;
-#else
-    Mask match = 0;
-    for (Mask m = arrived; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-      if (w.wait_kind[l] == Wait::BSync && w.wait_arg[l] == x) match |= Mask{1} << l;
-    }
-    arrived = match;
-#endif
-  }
+  Mask arrived = tier_waiting_on(w, Wait::BSync, x);   // (the lanes that wait at a BSYNC on Bx)
   if (members) arrived &= members;
   if ((members & ~arrived) == 0 && arrived) {
-    w.waiting &= ~arrived;
-    for (Mask m = arrived; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-      w.wait_kind[l] = Wait::None;
-      w.pc[l] += 16;
-    }
+    tier_wake(w, arrived);
     w.b[x] &= ~arrived;   // they have converged: the barrier is free for its next BSSY
   }
 }
@@ -1738,19 +1776,10 @@ inline void tier_release_bsync(Warp& w, unsigned x) {
 inline void tier_release_bar(Block& blk, unsigned id) {
   Block::Barrier& b = blk.bars[id];
   uint32_t live = 0;
-  for (const Warp& ww : blk.warps) live += static_cast<uint32_t>(std::popcount(ww.alive & ~ww.exited));
+  for (const Warp& ww : blk.warps) live += popc(ww.alive & ~ww.exited);
   const uint32_t expected = b.expected ? b.expected : live;
   if (b.arrived < expected) return;
-  for (Warp& ww : blk.warps) {
-    for (Mask m = ww.waiting; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-      if (ww.wait_kind[l] == Wait::Bar && ww.wait_arg[l] == id) {
-        ww.waiting &= ~(Mask{1} << l);
-        ww.wait_kind[l] = Wait::None;
-        ww.pc[l] += 16;
-      }
-    }
-  }
+  for (Warp& ww : blk.warps) tier_wake(ww, tier_waiting_on(ww, Wait::Bar, id));
   for (Warp& ww : blk.warps) {
     ww.b2r = b.red == 0 ? b.popc : b.red == 1 ? b.and_ : b.or_;
     ww.b2r_pred = b.red == 0 ? b.popc != 0 : b.red == 1 ? b.and_ : b.or_;
@@ -2051,12 +2080,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       if (last.a == 1) {   // ARV: arrive without waiting
         tier_set_pcs(w, group, here + 16);
       } else {
-        for (Mask m = ex; m; m &= m - 1) {
-          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-          w.wait_kind[l] = Wait::Bar;
-          w.wait_arg[l] = id;
-        }
-        w.waiting |= ex;
+        tier_wait(w, ex, Wait::Bar, id);
         for (Mask m = group & ~ex; m; m &= m - 1) w.pc[std::countr_zero(m)] = here + 16;
       }
       tier_release_bar(blk, id);
@@ -2071,12 +2095,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       st.inst_by_class[last.cls] += lanes;
       if (idx != first) tier_set_pcs(w, group, here);
       const unsigned x = last.c;
-      for (Mask m = ex; m; m &= m - 1) {
-        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-        w.wait_kind[l] = Wait::BSync;
-        w.wait_arg[l] = x;
-      }
-      w.waiting |= ex;
+      tier_wait(w, ex, Wait::BSync, x);
       for (Mask m = group & ~ex; m; m &= m - 1) w.pc[std::countr_zero(m)] += 16;
       tier_release_bsync(w, x);
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::BSYNC)].fetch_add(1, std::memory_order_relaxed);
