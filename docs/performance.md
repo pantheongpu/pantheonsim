@@ -4198,7 +4198,10 @@ Also run on this tree, Release: `test_amd_gcn_same_bits` (and the `simd_base` tw
 `test_amd_matrix_fast`, `test_amd_mfma_math`, `test_amd_nan_order`, `test_amd_gcn_memruns` (five targets), `test_amd_gcn_atomics` (four), `test_memfast`, `test_memory`,
 `test_memrmw`, `test_memrmw_lockfree`, `test_atom_rmw`, `test_memalloc`, `test_memcount_forms`, `test_sass_access_count`, and the AMD execution tests (89 of 89:
 `test_amd_gcn_{exec,memory,bytes,int64,mixed,half,calls,builtins,packed,spill,crosslane,doubles,divide,narrow,lds,idioms,asm,cdna_gaps,abandon,threads,counters,mem_facts,globals,grid,ops}`
-on every target they have, `test_amd_hostcall`, `test_amd_hip_queue`). `e2e_sass_tier` and `e2e_sass_archs` skip on server3 (no nvcc): not run.
+on every target they have, `test_amd_hostcall`, `test_amd_hip_queue`). Under ASan+UBSan (-O0, `halt_on_error`, leak detection on): `test_memrmw`, `test_memfast`,
+`test_amd_gcn_memruns`, `test_amd_gcn_atomics`, `test_amd_gcn_memory_same_bits` (both tests), and `test_amd_gcn_tier_same_bits` restricted to `ds_`, `global_`,
+`buffer_` and `flat_` (the full tier test at -O0 was not run). Under TSan (-O1, `setarch -R`): `test_memrmw`, `test_memrmw_lockfree`, `test_amd_gcn_memruns`,
+`test_amd_gcn_atomics` (the threaded atomics). `e2e_sass_tier` and `e2e_sass_archs` skip on server3 (no nvcc): not run.
 
 ### Not done, and negative results
 
