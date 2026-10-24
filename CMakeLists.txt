@@ -1293,6 +1293,11 @@ vgpu_unit_test(test_fastpath)
 # nesting, several callers, fork; and the same kernels at 1, 2 and N threads.
 vgpu_unit_test(test_worker_pool)
 vgpu_unit_test(test_sched)
+# The SASS executor's atomics (vgpu/exec/sass_atomics.hpp), and its lane-state helpers and shuffle shapes (vgpu/exec/sass_lanes.hpp,
+# src/sass/tier.hpp), against the lane-by-lane code they replaced.
+vgpu_unit_test(test_sass_atomics)
+vgpu_unit_test(test_sass_lanes)
+target_include_directories(test_sass_lanes PRIVATE src)
 # The SASS executor's memory-access counting, against the straightforward version it replaced
 # (vgpu/exec/mem_counters.hpp, which both engines count with).
 vgpu_unit_test(test_sass_access_count)

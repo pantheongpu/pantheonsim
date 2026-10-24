@@ -4328,3 +4328,125 @@ on every target they have, `test_amd_hostcall`, `test_amd_hip_queue`). Under ASa
   `load_batch` is not), anything with peers attached, a load after a run that read the lane's address (the load memo), and every access that reaches LDS or private memory
   through a flat address.
 * **Bench noise**: the pinned CPU's sibling was idle, but the host's load was 30 to 130 throughout; a run of 9 to 11 alternating pairs held the medians within 2% (A/A above).
+
+## The SASS engine outside the JIT: diverged groups, barriers, atomics and memory (branch `sp-sassctl`, base d8ec6128)
+
+Profiled first (one host thread, `cycles:u`, the RTX 3060 profile, `perf annotate` on a `-g` build): `divergent` spent 14% in `tier_lanes_at` and
+only 35% of its runs were chained; `shared` 12% in `tier_release_bar` (a lane-by-lane loop over the block's warps) and a `switch` on the load's
+sub-word extension in every lane of `h_shared`/`h_global`; `atomics` left the tier for `execute()` and spent 26% of `exec_mem` on a 64-bit
+**division** (`addr % n`, n = 4 or 8) per lane, an O(n^2) search for the distinct addresses, a `host_address` call per distinct address, and up to 26
+mutex pairs per instruction (the stripe was one per 8 bytes); `mem` called `MemoryManager::resolve` once per lane of every 16-byte access;
+`warp` did 32 scalar lookups per shuffle. The ALU handlers and the SIMD kernels were not touched.
+
+### What changed
+
+* **The chain goes on into a diverged warp** (`tier_run_t`, tail): when the runnable lanes stand at several addresses and nothing asks the scheduler
+  for more (no slice, give-way, WARPSYNC set or forced mask), the loop picks the group at the lowest address, as `step_warp` does, and goes on into it
+  if it is in this section. `divergent`: 99.98% of the runs are chained (was 35%). `tier_lanes_at` (now `exec::sasslanes::lanes_at`,
+  `include/vgpu/exec/sass_lanes.hpp`) compares four lanes per movemask.
+* **Atomics** (`exec_mem`, `include/vgpu/exec/sass_atomics.hpp`): the lanes' distinct addresses come from a 64-entry hash instead of a scan; the
+  alignment test is a mask; the host-mapping probe is gone (`load_batch` already declines every address `host_address` would answer); the stripe locks are
+  held by a `StripeLocks` (no `unique_lock` array) and are per cache line (`atomic_stripe`: a warp's 32 consecutive words take two locks, not sixteen);
+  operands are read as rows; the lane loop of each common operation (add, f32 add, min and max of unsigned, and, or, xor, exchange, compare-and-swap)
+  is its own loop over a named functor (`sassatom::*Step`, chosen by `step_for`), the rest runs `sassatom::apply`, the former lambda. ATOMG, ATOM, ATOMS and RED
+  are a tier form (`Form::Atom`) whose handler is `exec_mem`: the run loop counts and advances them, `execute()`'s probe of `fast_alu` and its dispatch are gone.
+* **Shuffles** (`h_shfl`, `tier::shfl_shape`, `tier::shfl_move`): a full warp whose lane and clamp are the same in all lanes, with a segment mask of 0 and a
+  lane under 32 (every `__shfl_xor/down/up/_sync` of a loop's offset), moves its words as a butterfly (`pshufd` and vector swaps), a shift or a splat; the
+  in-range predicate is worked out for the warp. The analysis does it for constant lanes, the handler for a lane held in a register (`row_uniform`).
+* **Barriers** (`sasslanes::wait/waiting_on/wake`): arrival and release of BAR and BSYNC move the 32 kinds, arguments and addresses a vector at a time;
+  a block keeps its live thread count (`Block::live`, set by `init_block`, lowered by both EXITs) instead of counting the warps' lanes at every arrival.
+* **Memory handlers**: `h_shared` moves a full warp's 32 consecutive words (or one word every lane names) as a block and counts them as one pass (`count_shared`,
+  also the tail of `count_access`); `h_global` moves a coalesced run of words straight between memory and the register row (a load that declines has
+  written nothing); a run of consecutive 16-byte pieces is one `load_run`/`store_run`; the addresses of a full warp in `h_global`, `h_shared` and
+  `h_local` are counted loops; a word load no longer goes through the sub-word extension `switch`.
+
+### Results
+
+`bench.py --ab` base (build of d8ec6128) against this branch, `--size full`, 15 alternating runs, one host thread, CPU 4 of server3 (load 4 to 6: the other sessions
+were idle), counters identical in every row. The A/A control of the same build against itself (15 runs, the first six rows) reads 0.995x to 1.001x. An earlier
+11-run pass of all 16 workloads at load 15 to 33 gave the same picture (shared 1.99x, atomics 1.75x, mem 1.38x, local 1.20x, divergent 1.18x, warp 1.16x, launch
+1.10x; texture, f32_fma, f64_fma, f64_subnormal, wmma, mma_ptx, api and startup 0.984x to 1.018x, "same"; its A/A: 0.985x to 1.018x, startup 1.026x with p 0.019 on 7 ms).
+
+| workload | base Mi/s | this branch | B/A median | best | p | verdict |
+|---|---|---|---|---|---|---|
+| shared | 13.89 | 27.85 | **2.01x** | 2.01x | <0.001 | faster |
+| atomics | 8.14 | 14.27 | **1.75x** | 1.75x | <0.001 | faster |
+| mem | 18.80 | 26.90 | **1.43x** | 1.49x | <0.001 | faster |
+| local | 35.37 | 43.02 | **1.22x** | 1.21x | <0.001 | faster |
+| warp | 40.18 | 47.23 | **1.18x** | 1.20x | <0.001 | faster |
+| divergent | 23.57 | 27.67 | **1.17x** | 1.17x | <0.001 | faster |
+| launch (k/s) | 503 | 557 | 1.11x | 1.11x | <0.001 | faster (its kernel's coalesced load and store) |
+| int_alu | 86.30 | 88.41 | 1.024x | 1.024x | <0.001 | faster by the table's rule; not a function this branch changed (the first pass read 1.018x, p 0.010), take it as code placement |
+| texture | 4.16 | 4.17 | 1.002x | 0.999x | 0.51 | same |
+
+One change at a time (each against the build before it, 9 to 15 runs, the load of the day varying, so the product of these is not the table above):
+chain into a diverged group `divergent` 1.096x; `lanes_at` four per movemask `divergent` +6%, `warp` 1.08x; atomics batch 1.49x; `Form::Atom` 1.074x; the alignment
+mask 1.034x (p 0.008); cache-line stripes 1.057x at one thread (and 2.0x at 8 host threads, load 94, counters differ there as the CAS loop's do); shuffle
+shapes `warp` 1.128x; barrier state `shared` 1.23x and `divergent` 1.028x; `Block::live` `shared` 1.047x (p 0.008); shared word runs `shared` 1.095x; direct
+row runs `mem` 1.133x and `shared` 1.152x; 16-byte runs `mem` 1.183x; counted address loops `mem` 1.067x, `shared` 1.086x and 1.088x; local and shared lane
+copies without the extension `switch` `local` 1.188x.
+
+`VGPU_TIER_STATS=1` after: `divergent` 3,592,605 of 3,594,537 runs chained (was 1.25 M of 3.6 M), `atomics` 94.9% of the warp instructions in the tier (REDUX 12,800,
+VOTEU 3,200 and S2UR 128 are the interpreter's, see below), the others 99.2% to 100%.
+
+### Tests (wired into CMake)
+
+* `test_sass_lanes` (new): `lanes_at` and `lowest_pc` against the lane loop (addresses that differ only in the low or the high half), `wait`, `waiting_on`
+  and `wake` against the lane loop (whole warps and masks, other kinds and arguments among the lanes), `row_uniform`, and `shfl_move` for every shape the analysis gives
+  against the per-lane rule.
+* `test_sass_atomics` (new): `sassatom::apply` and every `*Step` against a frozen copy of the lambda `exec_mem` had (all operations and types, compare-and-swap, the
+  edges of each type, f32 sums that are subnormal).
+* `test_tier`: the form table lists `atom`; `shfl_shape` against the per-lane rule for every mode, lane 0 to 40 and every clamp and segment mask.
+* The programs that run the whole engine are `bench_counters*` (results checked against the host, counters against the recorded ones), `e2e_sass_tier` (tier against
+  the interpreter, `k_direct` has the atomics of every operation and type with their old values), `e2e_sass_fastpath` (the fast paths against `VGPU_FASTPATH=0`: coalesced
+  and scattered loads and stores of 1 to 16 bytes, shared accesses with conflicts and broadcasts, `atomic_forms` over one address, a few, distinct and scattered ones,
+  `shared_atomic_forms`) and `e2e_sass_archs`. None of the e2e programs could be built on the experiment server (no nvcc); the harness of `tools/bench` ran with the
+  cached program, which checks every result and every counter against the base build.
+
+### Mutation checks (a one-line change on the experiment server, the test named failed; reverted)
+
+| mutation | test that failed |
+|---|---|
+| `lanes_at` without the high halves | `test_sass_lanes` |
+| `wake` of a whole warp adds 32, not 16, to the addresses | `test_sass_lanes` |
+| f32 atomic add without the flush of a subnormal result | `test_sass_atomics` (it did not fail until the operands included sums that are subnormal: the pool now has them) |
+| `step_for` gives the and-step to OR | `test_sass_atomics` |
+| shuffle shape Down's in-range count off by one | `test_tier`, `test_sass_lanes` |
+| butterfly `pshufd` order of the xor-1 swap | `test_sass_lanes` |
+| `Form::Atom` without `dst = kNoReg` | `test_tier` (3 of 8 failed before it was set) |
+| chain group = all runnable lanes | bench `divergent`: `collatz thread 0` |
+| atomic address hash treats a collision as the same address | bench `atomics`: `hist[0]` |
+| `h_atom` drops the lowest lane | bench `atomics`: launch timeout (a CAS loop never ends) |
+| atomics' stripe locks not taken (8 host threads) | bench `atomics`: `single counter` |
+| `Block::live` three warps short of the block | bench `shared`: `block 0 reduction` |
+| BAR arrival leaves out the lowest lane | bench `shared`: hangs (killed by the harness) |
+| shared word run copies from `at + 4` | bench `shared`: `block 0 reduction` |
+| shared word run counted as two passes | bench `shared`: counters differ (`shared_bank_conflicts`) |
+| direct row run starts one lane late | bench `shared`: `block 0 reduction` |
+| 16-byte run transposes the words | bench `mem`: `stream4[0]` |
+| local lane loop stops at lane 30 | bench `local`: `thread 351` |
+
+### Not done, and negative results
+
+* *Pick the first lane's group first, look only at the other lanes for a lower address* (`tier_pick_group`), and an early return of `tier_release_bsync` when a member is not
+  waiting at all: `divergent` 1.000x (p 0.49), `warp` 0.987x; dropped.
+* *A tier form for REDUX and VOTEU* (exec_warp does not use the group, so the handler is one line): `atomics` 1.010x (p 0.51); dropped.
+* *The shared word run for any contiguous prefix of lanes*: with a `memcpy` of `count` words and the lanes found by bit scan `shared` 0.891x; with counted loops
+  and four-word vector copies 1.008x (p 0.17); only the full warp has the fast path.
+* Earlier entries of this file say SASS atomics had nothing to gain ("the one-lookup read-modify-write", and the "direct" dispatch of the instructions that end a
+  run, `atomics` 1.008x). The first was about `MemoryManager::rmw_scalar`, which the batch already avoided; the second left `exec_mem` as it was. The gain here is in
+  `exec_mem`'s own lane code (the division, the scan, the probes, the locks) and, once that was cheap, in the tier form (1.074x).
+* *Atomics' value rules through a template taking the step as a generic lambda* (`sassatom::dispatch`): `atomics` 0.96x (p < 0.001) with one more percent of
+  instructions and three times the L1i misses (`exec_mem` split in half, the lane loops in an out-of-line `dispatch`); replaced by named functors and a `switch`, 1.004x of the
+  version it was cut from. A lesson for the next one: after moving code into a header, A/B again, whatever the instruction count says.
+* *Not taking the stripe locks at all* is 1.14x of `atomics` at one host thread (measured to see what is left); not a change one can make.
+  A spin lock for the stripes, and one `MemoryManager::rmw_batch` instead of `load_batch` and `store_batch` (each runs `batch_ok` over the addresses: 6 to 9% of
+  `atomics`) were not tried.
+* `memcount::detail::sectors_fast` is 25% of `local` (a thread's private array indexed by a value of its own: the window form walks all 32 lanes); the counts have closed
+  forms for strides and windows, not for this; left.
+* `step_warp` itself is 45% of `divergent` and flat (the three counters, `w.steps`, the guard, the call per op): the divergent path's cost is the per-lane work of
+  `tier_set_pcs` and the branch select, 64-bit addresses a lane. Keeping the counters in registers across a run would touch the loop that tier 2 hooks into.
+* Sanitizers, on the experiment server: `test_tier`, `test_sass_lanes` and `test_sass_atomics` built `-fsanitize=address,undefined -O0` (Debug) and run with
+  `detect_leaks=1`, `halt_on_error=1`: clean. The cached bench program run on a shim built the same way (`LD_PRELOAD` of libasan, quick size) for `divergent`, `shared`,
+  `warp`, `atomics`, `mem` and `local`: all PASS, no report. The shim built `-fsanitize=thread -g -O1` (`setarch -R`, `VGPU_THREADS=4`) for `atomics`, `shared`,
+  `divergent` and `mem`: PASS, no warning. Not run there: the e2e programs and their sanitizer legs (no nvcc), `test_jit` (fails on the base too: no `c++` on its PATH).

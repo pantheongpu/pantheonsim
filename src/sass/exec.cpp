@@ -48,6 +48,8 @@
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/mem_counters.hpp"
+#include "vgpu/exec/sass_atomics.hpp"
+#include "vgpu/exec/sass_lanes.hpp"
 #include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
@@ -174,6 +176,7 @@ struct Block {
   Cluster* cluster = nullptr;
   Cluster own;                  // the cluster when the launch has none
   std::vector<Warp> warps;
+  uint32_t live = 0;            // the block's threads that are alive and have not exited (init_block sets it, EXIT lowers it)
   uint64_t bssy_clock = 0;      // counts BSSYs, to order the warps' barriers by nesting
   std::vector<uint8_t> shared;
   std::map<std::pair<uint32_t, uint64_t>, GmmaSnapshot> gmma;   // (warpgroup, n-th MMA)
@@ -227,10 +230,27 @@ uint32_t param_bytes(const CubinKernel& k) {
   return end;
 }
 
-std::mutex& atomic_lock(uint64_t addr) {
+// The lock of an address's cache line (64 stripes, the line's number folded with the page's): the atomics of one line, or of a warp's
+// 32 consecutive words, take one or two locks, not one for every 8 bytes.
+inline unsigned atomic_stripe(uint64_t addr) { return static_cast<unsigned>(((addr >> 6) ^ (addr >> 12)) & 63); }
+std::mutex& atomic_stripe_lock(unsigned stripe) {
   static std::mutex locks[64];
-  return locks[(addr >> 3) % 64];
+  return locks[stripe];
 }
+std::mutex& atomic_lock(uint64_t addr) { return atomic_stripe_lock(atomic_stripe(addr)); }
+
+// The stripe locks of a warp's atomics, held in the order they were taken and let go together (also when a lane's atomic throws).
+struct StripeLocks {
+  std::mutex* held[64];
+  unsigned n = 0;
+  void lock(std::mutex& m) {
+    m.lock();
+    held[n++] = &m;
+  }
+  ~StripeLocks() {
+    while (n) held[--n]->unlock();
+  }
+};
 
 void tier_add_total(uint64_t n);   // tier_ops.inc
 
@@ -249,22 +269,8 @@ uint64_t sass_max_steps(uint64_t configured) {
   return v == 0 ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(v);
 }
 
-// The lanes whose program counter is `p`, compared two to a vector register where SSE2 is there.
-inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
-  Mask eq = 0;
-#if defined(__SSE2__)
-  const __m128i want = _mm_set1_epi64x(static_cast<long long>(p));
-  for (unsigned i = 0; i < 32; i += 2) {
-    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i]));
-    const __m128i e = _mm_cmpeq_epi32(v, want);
-    const __m128i both = _mm_and_si128(e, _mm_shuffle_epi32(e, 0xB1));   // a 64-bit lane is equal when both halves are
-    eq |= static_cast<Mask>(_mm_movemask_pd(_mm_castsi128_pd(both))) << i;
-  }
-#else
-  for (unsigned i = 0; i < 32; ++i) eq |= static_cast<Mask>(w.pc[i] == p) << i;
-#endif
-  return eq;
-}
+// The lanes whose program counter is `p`.
+inline Mask tier_lanes_at(const Warp& w, uint64_t p) { return exec::sasslanes::lanes_at(w.pc, p); }
 
 // ---- kernels whose blocks wait on one another (vgpu/exec/lockstep.hpp) ----------------------------
 //
@@ -369,25 +375,8 @@ bool kernel_polls(const Module& m, const CubinKernel& k) {
   return m.polling.emplace(k.name, found).first->second;
 }
 
-// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds. With many lanes
-// running, as four independent chains over all 32 lanes, a lane that does not run counting as the largest address (an all-ones OR,
-// no branch on the lane's bit: those were mispredicted in a diverged warp); with few, the loop over just those lanes.
-inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) {
-  if (simd::popcount32(run) <= 5) {
-    uint64_t lo = first;
-    for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
-    return lo;
-  }
-  const auto pcv = [&](unsigned l) { return w.pc[l] | ((static_cast<uint64_t>((run >> l) & 1)) - 1); };
-  uint64_t a = ~uint64_t{0}, b = a, c = a, d = a;
-  for (unsigned l = 0; l < 32; l += 4) {
-    a = std::min(a, pcv(l));
-    b = std::min(b, pcv(l + 1));
-    c = std::min(c, pcv(l + 2));
-    d = std::min(d, pcv(l + 3));
-  }
-  return std::min(std::min(a, b), std::min(c, d));
-}
+// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds.
+inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) { return exec::sasslanes::lowest_pc(w.pc, run, first); }
 
 class Runner {
  public:
@@ -1099,6 +1088,7 @@ void Runner::init_block(Block& blk, uint64_t linear) {
     w.local_size = local_size_;
     w.local.clear();   // made on the warp's first local access
   }
+  blk.live = block_threads_;
   for (Block::Barrier& b : blk.bars) b = Block::Barrier{};
   blk.mbar.clear();
   blk.gmma.clear();
