@@ -1585,7 +1585,9 @@ void tier_add_total(uint64_t n) { tier_stats().total.fetch_add(n, std::memory_or
 // group at the lowest address, honour a slice a YIELD gave and a give-way, find the code section. When none of the first and the last
 // applies (no ws_held, no slice, no give-way, no forced mask) and every runnable lane stands at one address inside this section,
 // that work is: group = the runnable lanes, pick = their address, nothing else changed. Then the next call would start exactly
-// where this loop is, and the loop goes on instead of returning, crediting the caller with the call it saved.
+// where this loop is, and the loop goes on instead of returning, crediting the caller with the call it saved. When the runnable lanes
+// stand at several addresses the call picks the group at the lowest (step_warp's own rule, without a slice or a give-way), and the loop
+// does that too, on to the group's first instruction if it is in this section.
 // guard_mask, inlined into the tier's run loop (the interpreter's copy is a call, which its own loop does not mind).
 [[gnu::always_inline]] inline Mask tier_guard(const Warp& w, const Instr& ins, Mask group) {
   if (ins.guard == kPT && !ins.guard_not) return group;
@@ -2010,11 +2012,16 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   if (!tier_chain_ || w.budget == 0 || w.yield || w.slice || w.give_way || w.ws_held || w.mactive_force) return true;
   const Mask run = w.runnable();
   if (!run) return true;
-  const uint64_t lo = w.pc[std::countr_zero(run)];
-  if ((run & ~tier_lanes_at(w, lo)) != 0 || lo - code.base >= 16 * static_cast<uint64_t>(count) || ((lo - code.base) & 15)) return true;
+  uint64_t lo = w.pc[std::countr_zero(run)];
+  Mask at = tier_lanes_at(w, lo);
+  if ((run & ~at) != 0) {   // diverged: the group at the lowest address, which is what step_warp picks when nothing else is asked of it
+    lo = tier_lowest_pc(w, run, lo);
+    at = tier_lanes_at(w, lo);
+  }
+  if (lo - code.base >= 16 * static_cast<uint64_t>(count) || ((lo - code.base) & 15)) return true;
   --w.budget;
   ++w.extra;
-  group = run;
+  group = run & at;
   pick = lo;
   }
 }
