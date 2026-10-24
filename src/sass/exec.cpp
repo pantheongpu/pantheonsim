@@ -232,6 +232,19 @@ std::mutex& atomic_lock(uint64_t addr) {
   return locks[(addr >> 3) % 64];
 }
 
+// The stripe locks of a warp's atomics, held in the order they were taken and let go together (also when a lane's atomic throws).
+struct StripeLocks {
+  std::mutex* held[64];
+  unsigned n = 0;
+  void lock(std::mutex& m) {
+    m.lock();
+    held[n++] = &m;
+  }
+  ~StripeLocks() {
+    while (n) held[--n]->unlock();
+  }
+};
+
 void tier_add_total(uint64_t n);   // tier_ops.inc
 
 // The budget of steps a warp may take: the launch's, or VGPU_MAX_STEPS (0: none), by the rule the PTX engine applies

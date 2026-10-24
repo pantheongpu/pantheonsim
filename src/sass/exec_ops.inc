@@ -3759,9 +3759,9 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       // address' stripe; here the lanes' addresses are grouped (a lane that shares an address with an earlier one finds
       // what that one left, as in the loop below), the stripes involved locked in order, each distinct address loaded
       // and stored once (MemoryManager::load_batch / store_batch, which decline, having done nothing, whenever the plain
-      // accesses could differ) and the lanes applied one after another in lane order. What every lane gets back and what
-      // memory holds are what the loop below gives; another host thread sees the warp's atomics as one step. Anything
-      // else -- shared or local memory, host-mapped memory, misaligned addresses, vector forms -- takes the loop.
+      // accesses could differ -- host-mapped memory among them) and the lanes applied one after another in lane order. What every
+      // lane gets back and what memory holds are what the loop below gives; another host thread sees the warp's atomics as one
+      // step. Anything else -- shared or local memory, host-mapped memory, misaligned addresses, vector forms -- takes the loop.
       if (fast_ && !shared && !popc_inc && ins.f[7] <= 1 && m_.sm >= 80 && ex && (red || ins.dst.back().kind == Kind::Reg)) {
         uint64_t ga[32];
         row_addresses(a, ins.w.bit(72) || ins.w.bit(90), ins.w.bit(91) && !ins.w.bit(72), 64, ex, ga);
@@ -3769,52 +3769,107 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         uint64_t uaddr[32], v[32], swp[32];
         unsigned nu = 0, slot[32];
         uint64_t stripes = 0;
+        // The distinct addresses, in the order the lanes first name them: a small table keyed by the address finds a lane's.
+        uint8_t seen[64];
+        std::memset(seen, 0, sizeof seen);
         for (Mask m = ex; m && ok; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           uint64_t addr = ga[l];
           if (ins.op == Op::ATOM && classify(ga[l], &addr) != Space::Global) ok = false;
           if (addr % n) ok = false;
           if (!ok) break;
-          // The slot of this address among the distinct ones (the last one first: lanes of a warp mostly repeat or step on).
-          unsigned k = nu;
-          if (nu && uaddr[nu - 1] == addr) k = nu - 1;
-          else
-            for (unsigned i = 0; i < nu; ++i)
-              if (uaddr[i] == addr) {
-                k = i;
-                break;
-              }
-          if (k == nu) {
-            uaddr[nu++] = addr;
-            stripes |= uint64_t{1} << ((addr >> 3) % 64);
+          unsigned k;
+          if (nu && uaddr[nu - 1] == addr) {   // (lanes of a warp mostly repeat or step on)
+            k = nu - 1;
+          } else {
+            unsigned h = static_cast<unsigned>(((addr >> (is64 ? 3 : 2)) * 0x9e3779b97f4a7c15ull) >> 58);
+            while (seen[h] && uaddr[seen[h] - 1] != addr) h = (h + 1) & 63;
+            if (seen[h]) {
+              k = seen[h] - 1u;
+            } else {
+              k = nu;
+              uaddr[nu++] = addr;
+              seen[h] = static_cast<uint8_t>(nu);
+              stripes |= uint64_t{1} << ((addr >> 3) % 64);
+            }
           }
           slot[l] = k;
-          v[l] = is64 ? read64(w, ins.src[1], l) : read32(w, ins.src[1], l);
-          swp[l] = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
-        }
-        // Memory the host maps (managed, pinned, shared through CUDA IPC) takes the CPU's atomic in the loop; asking also
-        // finds read-only host memory, which the loop's first lane to reach it reports.
-        for (unsigned i = 0; ok && i < nu; ++i) {
-          try {
-            if (mem_.host_address(uaddr[i], n)) ok = false;
-          } catch (const Error&) {
-            ok = false;
-          }
         }
         if (ok) {
+          // The operands of the lanes that run: a register's own lanes, or the one value every lane has.
+          const auto fetch = [&](const Operand& o, bool wide, uint64_t* out) {
+            if (o.kind == Kind::Reg && o.reg != kRZ) {
+              const uint32_t* lo = &w.reg(o.reg, 0);
+              if (wide) {
+                const uint32_t* hi = &w.reg(o.reg + 1, 0);
+                for (Mask m = ex; m; m &= m - 1) {
+                  const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                  out[l] = lo[l] | (static_cast<uint64_t>(hi[l]) << 32);
+                }
+              } else {
+                for (Mask m = ex; m; m &= m - 1) {
+                  const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                  out[l] = lo[l];
+                }
+              }
+              return;
+            }
+            const uint64_t x = wide ? read64(w, o, 0) : read32(w, o, 0);
+            for (Mask m = ex; m; m &= m - 1) out[std::countr_zero(m)] = x;
+          };
+          fetch(ins.src[1], is64, v);
+          if (cas) fetch(ins.src[2], is64, swp);
           uint64_t old_of[32];
           bool done = false;
           {   // (the locks are let go before the loop below might take them again)
-            std::unique_lock<std::mutex> locks[32];
-            unsigned held = 0;
-            for (uint64_t sm = stripes; sm; sm &= sm - 1)
-              locks[held++] = std::unique_lock<std::mutex>(atomic_lock(uint64_t{static_cast<unsigned>(std::countr_zero(sm))} << 3));
+            StripeLocks locks;
+            for (uint64_t sm = stripes; sm; sm &= sm - 1) locks.lock(atomic_lock(uint64_t{static_cast<unsigned>(std::countr_zero(sm))} << 3));
             uint64_t cur[32];
             if (mem_.load_batch(uaddr, nu, n, cur)) {
-              for (Mask m = ex; m; m &= m - 1) {
-                const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-                old_of[l] = cur[slot[l]];
-                cur[slot[l]] = apply(l, old_of[l], v[l], swp[l]);
+              // The lanes one after another, each finding what the lanes before it left. `step` is the value an atomic stores, given
+              // the one it finds, its operand and (a CAS) the exchange value; the common operations get a loop of their own.
+              const uint64_t keep = is64 ? ~uint64_t{0} : 0xffffffffull;
+              const auto lanes = [&](auto&& step) {
+                for (Mask m = ex; m; m &= m - 1) {
+                  const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                  const uint64_t old = cur[slot[l]];
+                  const uint64_t nw = step(l, old, v[l], swp[l]) & keep;
+                  old_of[l] = old;
+                  changed |= nw != old;
+                  cur[slot[l]] = nw;
+                }
+              };
+              const unsigned op = ins.f[0];
+              const bool halfs = type == 4 || type == 7;
+              if (cas) {
+                lanes([](unsigned, uint64_t old, uint64_t cmp, uint64_t swap) { return old == cmp ? swap : old; });
+              } else if (halfs) {   // (F16x2 and BF16x2: every operation works on the halves)
+                lanes([&](unsigned l, uint64_t old, uint64_t x, uint64_t swap) { return apply(l, old, x, swap); });
+              } else if (op == 0 && (type == 0 || type == 1 || type == 2 || type == 5)) {
+                lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return old + x; });
+              } else if (op == 0 && type == 3) {
+                lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) {
+                  // .ftz on inputs and result; a NaN result is the canonical one (as apply, below, works it out on floats).
+                  const auto fz = [](uint32_t b) { return (b & 0x7f800000u) == 0 ? b & 0x80000000u : b; };
+                  const float sum = as_f32(fz(static_cast<uint32_t>(old))) + as_f32(fz(static_cast<uint32_t>(x)));
+                  return uint64_t{sum != sum ? 0x7fffffffu : fz(f32_bits(sum))};
+                });
+              } else if ((op == 1 || op == 2) && type == 0) {
+                if (op == 1) lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return std::min(old, x); });
+                else lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return std::max(old, x); });
+              } else if ((op == 1 || op == 2) && type == 2) {
+                if (op == 1) lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return std::min(old, x); });
+                else lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return std::max(old, x); });
+              } else if (op == 5) {
+                lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return old & x; });
+              } else if (op == 6) {
+                lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return old | x; });
+              } else if (op == 7) {
+                lanes([](unsigned, uint64_t old, uint64_t x, uint64_t) { return old ^ x; });
+              } else if (op == 8) {
+                lanes([](unsigned, uint64_t, uint64_t x, uint64_t) { return x; });
+              } else {
+                lanes([&](unsigned l, uint64_t old, uint64_t x, uint64_t swap) { return apply(l, old, x, swap); });
               }
               // (a store the memory declines leaves it as it was, and the loop does the lot: nothing above has an effect)
               done = mem_.store_batch(uaddr, nu, n, cur);
@@ -3822,11 +3877,21 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           }
           if (done) {
             w.idle_yields = changed ? 0 : idle0;
-            for (Mask m = ex; m; m &= m - 1) {
-              const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-              ++blk.st.atomics;
-              blk.st.atomic_bytes += n;
-              if (!red) emit(l, 0, old_of[l], v[l]);
+            const unsigned count = popc(ex);
+            blk.st.atomics += count;
+            blk.st.atomic_bytes += uint64_t{count} * n;
+            if (!red) {
+              // What each lane gets back: the predicate ATOM and ATOMG set, and the old value in the destination (a CAS.SPIN's flag
+              // instead: whether it stored).
+              const Operand& d = ins.dst[1];
+              const bool flag = cas && ins.f[6] != 0;
+              for (Mask m = ex; m; m &= m - 1) {
+                const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                set_pred(w, ins.dst[0], l, true);
+                const uint64_t x = flag ? (old_of[l] == v[l] ? 1 : 0) : old_of[l];
+                if (is64) write64(w, d, l, x);
+                else write32(w, d, l, static_cast<uint32_t>(x));
+              }
             }
             return;
           }
