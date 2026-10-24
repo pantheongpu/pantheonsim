@@ -16,7 +16,10 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.1.0";
+#ifndef VGPU_VERSION
+#define VGPU_VERSION "unknown"   // (set by CMakeLists.txt from project(VERSION))
+#endif
+constexpr const char* kVersion = VGPU_VERSION;
 
 int usage(FILE* to) {
   std::fprintf(to,
