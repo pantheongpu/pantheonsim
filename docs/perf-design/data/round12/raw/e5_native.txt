@@ -1,0 +1,36 @@
+== native launch
+launch+sync_us 7.73   launch_pipelined_us 2.94
+launch+sync_us 7.76   launch_pipelined_us 2.92
+launch+sync_us 7.79   launch_pipelined_us 2.96
+== native copy
+n=256 iter_us 17.2 ok=1
+n=4096 iter_us 20.2 ok=1
+n=65536 iter_us 83.5 ok=1
+n=1048576 iter_us 890.0 ok=1
+n=16777216 iter_us 12091.0 ok=1
+n=256 iter_us 16.9 ok=1
+n=4096 iter_us 19.9 ok=1
+n=65536 iter_us 83.4 ok=1
+n=1048576 iter_us 890.3 ok=1
+n=16777216 iter_us 12121.0 ok=1
+n=256 iter_us 17.0 ok=1
+n=4096 iter_us 20.0 ok=1
+n=65536 iter_us 83.3 ok=1
+n=1048576 iter_us 891.0 ok=1
+n=16777216 iter_us 12112.9 ok=1
+== native scale
+iters=1  seconds 0.0000  fma_per_s 8.35e+10  result_hash 856eeae8
+iters=10  seconds 0.0000  fma_per_s 8.37e+11  result_hash 7cb1f5bb
+iters=100  seconds 0.0000  fma_per_s 5.67e+12  result_hash d7468e9b
+iters=1000  seconds 0.0001  fma_per_s 1.23e+13  result_hash fec4c7e9
+iters=10000  seconds 0.0007  fma_per_s 1.42e+13  result_hash b41484af
+iters=1  seconds 0.0000  fma_per_s 5.38e+10  result_hash 856eeae8
+iters=10  seconds 0.0000  fma_per_s 8.54e+11  result_hash 7cb1f5bb
+iters=100  seconds 0.0000  fma_per_s 5.55e+12  result_hash d7468e9b
+iters=1000  seconds 0.0001  fma_per_s 1.26e+13  result_hash fec4c7e9
+iters=10000  seconds 0.0007  fma_per_s 1.42e+13  result_hash b41484af
+iters=1  seconds 0.0000  fma_per_s 8.47e+10  result_hash 856eeae8
+iters=10  seconds 0.0000  fma_per_s 8.39e+11  result_hash 7cb1f5bb
+iters=100  seconds 0.0000  fma_per_s 5.67e+12  result_hash d7468e9b
+iters=1000  seconds 0.0001  fma_per_s 1.25e+13  result_hash fec4c7e9
+iters=10000  seconds 0.0007  fma_per_s 1.42e+13  result_hash b41484af

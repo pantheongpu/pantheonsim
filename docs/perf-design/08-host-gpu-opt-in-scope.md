@@ -1,6 +1,109 @@
+# Scope: an opt-in host-GPU mode (`host_gpu`)
+
+Status: scope, 2026-10-23. Nothing is built. It follows [07-host-gpu.md](07-host-gpu.md) (the measurements) and the user's decision to scope an opt-in mode
+with a rounding disclaimer. All costs are estimates by reading the code, not measurements. Off by default, always.
+
+## 1. What it is
+
+A launch whose kernel is eligible runs on the real card of the machine; every other launch, and every other API call, stays in the simulator. The user turns it on:
+
+    # pantheonsim.yaml                 # or VGPU_HOST_GPU=exact|approx|off
+    host_gpu: exact                    # off (default) | exact | approx
+
+* **`exact`**: only kernels whose every SASS instruction has a fully defined result (see 3) are offloaded. The result is bit-identical to the simulator's by
+  construction, so no rounding disclaimer is needed. This is the form with an equivalence argument.
+* **`approx`**: also offloads kernels with SFU/fast-math, tensor-core MMA, float atomics and the like. Results are the card's, may differ in the last bits
+  and, through accumulation, further. The disclaimer is printed once at start-up and written into the report. This is the user's proposal.
+
+Not a card swap: the simulated profile must equal the host card (see 4). "Simulate an H100 on an A10G" stays out of scope (07, verdict 2: 1 of 16 workloads runs).
+
+## 2. Architecture (the cheapest design that keeps pointers valid)
+
+1. **Same addresses on the card.** At context creation reserve the simulator's device address ranges on the card with `cuMemAddressReserve` (the driver honoured
+   84% to 100% of reservations in `probe_va`). If a reservation is refused the mode turns itself off for the process with one notice. This keeps pointers
+   stored inside device memory valid, which is what a mirror at other addresses cannot.
+2. **Chunk residency.** The simulator's sparse VRAM already tracks 64 KiB chunks. Add a state per chunk: `host`, `card`, `both-clean`. The simulator touching a
+   `card` chunk copies it back first (the check sits next to the existing materialise-on-first-write test in `src/core/memory.cpp`; its cost on the hot path
+   must be measured and is a gate, 6). An offloaded launch first pushes every `host` chunk of the allocations it may reach (all live allocations, since
+   pointers inside memory cannot be followed) and marks written chunks `card`. Page-granular copies; unchanged chunks are not re-sent.
+3. **Launch.** Load the cubin with `cuModuleLoadData` once per module (70 us measured), launch with the original grid, block, shared size and arguments, then
+   `cuStreamSynchronize` on a private stream: the simulator's streams are synchronous, so the offloaded launch is synchronous too.
+4. **Everything else is unchanged.** Allocation, copies, events, graphs, libraries (cuBLAS stays the simulator's; offloading libraries is out of scope, 07 verdict 5).
+
+## 3. Eligibility (a per-kernel static check, cached per function)
+
+Refuse (run in the simulator) when any of:
+
+* the profile is not the host card (4), or the module has no SASS for the card's architecture and PTX JIT would be needed (the card would compile it differently);
+* any diagnostic that needs the simulator is on: `counters`/profile runs, `race`, `strict`, `scheduler` != default, `fault*`, CUPTI subscribers or `VGPU_TRACE`,
+  `VGPU_SASS_TRACE`, `VGPU_MAX_STEPS`, `count` > 1, a debugger. The mode is rejected at start-up with a message when combined with these (not silently);
+* the kernel uses clusters, cooperative launch, dynamic parallelism, device `printf`/`assert`/`malloc`, texture/surface objects, or unified-memory
+  addresses the card does not map;
+* (`exact` only) the SASS contains MUFU, any `.approx`/fast-math form, tensor-core MMA, float atomics/reductions (order), shuffles with undefined lanes, or
+  anything outside a whitelist of integer ops, IEEE `FADD/FMUL/FFMA/FSETP`, converts with defined rounding, loads, stores and integer atomics on distinct
+  addresses. Whitelist built from `src/sass/tier_ops.inc`'s forms, which are already held to the interpreter's bits.
+  **Not provable statically** and so a stated limit: data races and reads of uninitialised memory (the card's answer is one valid outcome; the simulator's is
+  another; 07 found `srad_v2` reading out of bounds and 11 of 164 programs differing card vs card).
+
+## 4. Identity rule
+
+`host_gpu` requires: profile name equals the host card's model, or an explicit `host_gpu_device: <index>` plus an equal compute capability and SM count.
+Shared memory, SM count, driver and runtime versions the program reads are then the simulator's profile values, which equal the card's except driver/runtime
+strings (13.0 vs 13.2, 07 section 3.2): reported as the simulator's, as today.
+
+## 5. What the user loses and gets, in the disclaimer's words
+
+Lost for offloaded launches: counters, fault injection, OOB/use-after-free/race diagnostics, deterministic scheduling, CUPTI records (07 section 5.4).
+`approx` only: results can differ from the simulator's and from another machine's (SFU rounding, tensor-core accumulation order). A per-kernel line in the
+summary says how many launches and how many warp-instruction-equivalents ran on the card, so a result is never silently mixed.
+
+Gain (07, E1): 8x to 105x on the device phase of short kernel-bound runs, 122x to 26,000x at full launch size. No gain, or a loss, when the work is small
+(card launch + sync 7.7 us vs 2.5 us simulated, a 4,096-float copy 20 us, a 64 MiB copy 5 to 7 ms).
+
+### 5.1 The size rule: a per-launch cost model, not only a threshold (user, 2026-10-23)
+
+A launch goes to the card only when the simulator is expected to take longer than the card path including the data it must move:
+
+    offload  iff  sim_estimate  >  launch_sync + copy_in + copy_out + margin
+
+* `sim_estimate` = the kernel's expected warp instructions / the simulator's measured rate (tens to ~150 Mi warp instr per CPU-second, tier-dependent, per
+  thread count; a startup calibration or a table in `docs/performance.md`). The expected instructions come from history: the simulator already counts them, so the
+  first launch of each kernel (per grid shape class) always runs simulated and records its count; later launches use that count scaled by the grid. A kernel
+  with data-dependent length keeps an EWMA and a variance guard (offload only when the lower bound beats the cost).
+* `copy_in` / `copy_out` = bytes of `host`-resident chunks it must push plus bytes of `card` chunks the simulator will read back, at the measured link rate
+  (about 10 GB/s on the g5 rig). Residency makes chains cheap: consecutive offloaded kernels on the same buffers move nothing, so the model charges the
+  copy once and a run of kernels amortises it. A lone small kernel between two simulator phases pays both directions and stays simulated.
+* Hysteresis: a kernel flips mode only after N consecutive estimates on the other side, to avoid ping-ponging chunks between host and card.
+* Knobs: `host_gpu_min_work` (floor, warp instructions, default from the Phase 1 measurement), `host_gpu_margin` (default 2x), and a debug `host_gpu_log` that
+  prints each decision with its numbers. The summary line reports offloaded vs refused-as-too-small counts.
+* Phase 1 must measure the constants (launch, link rate, simulator rate) on the card and check the model's decisions against actual timings on the harness
+  workloads; the gate is that no workload is slower with the mode on than off, beyond noise.
+
+## 6. Plan and gates (each phase ends with a decision; nothing starts without the user's go)
+
+| phase | content | estimate | gate to continue |
+| --- | --- | --- | --- |
+| 0 | `vgpu check ./prog`: run native and simulated, compare (07 verdict 4). Independent of the rest; gives the data on how often `exact` would have held | 1 to 2 weeks | none; useful alone |
+| 1 | spike, no product merge: VMM reservation + chunk residency + one-kernel offload for the 16 harness workloads, `exact` check as a hash compare against the simulator | 4 to 6 weeks | hot-path cost of the residency test < 1% on `bench.sh`; no workload slower with the mode on (the size rule, 5.1); identical hashes on all eligible workloads; speed-up on `int_virus`-class > 10x including copies |
+| 2 | eligibility scanner (3), config and refusals (3, 4), summary line, docs, tests wired to a GPU runner | 4 to 6 weeks | the same-bits test passes on a card runner; CI cost agreed (a GPU runner does not exist today) |
+| 3 | `approx`, disclaimer, async streams only if measured as needed | 2 to 4 weeks | decided after Phase 2 data |
+| later | HIP/AMD (same design, unmeasured: no AMD GPU with ROCm was available), multi-GPU racks | not estimated | |
+
+Full API coverage (the 170 entry points, graphs, managed memory, IPC; 07 section 5.3) is not needed for this design: only launches and the memory they touch go
+to the card; the rest stays simulated. This is why the estimate is smaller than 07's 3 to 6 months for a full passthrough, and it is the main risk to that
+estimate: the residency model must be right for every API that touches device memory (memcpy, memset, graphs, VMM, IPC, managed). Each such path needs a
+"copy back first" hook, and one missed path is silent corruption. Tests: a differential run of every e2e program with `host_gpu` forced and random
+launch/read interleavings, and mutation checks on each hook.
+
+## 7. Open questions for the user
+
+1. Is `exact`-only (no disclaimer needed) enough to start, with `approx` later?
+2. A GPU runner for CI (an AWS g5 instance on demand, or a self-hosted card) is required from Phase 2; who pays and where?
+3. Phase 0 first (cheap, useful alone), or straight to the Phase 1 spike?
+
 
 ## 8. Phase 0 result (2026-10-23): `vgpu check` on an A10G
 
-Branch `vgpu-check`: `vgpu check` (`src/cli/check.cpp`, `check_compare.hpp`), `test_check_compare` (9 tests) and `check_exit` (36 cases, CPU-only machine), built with g++ 13 / CUDA 13.2 on a g5.4xlarge (not the CI image). On the card: PolyBench/GPU (20) and Rodinia (11, the round-12 argument lists), sim profile `nvidia/a10g`, card run twice each. **30 of 31 agree** (6 byte-identical, 24 identical after dropping timing lines); the one difference is `srad_v2` (4,096 numbers, up to 30% apart: the out-of-bounds read the card hides, 07 section 3.2). No program needed noise masking. Raw: `data/check/`.
+`vgpu check` (`src/cli/check.cpp`, `check_compare.hpp`), `test_check_compare` (9 tests) and `check_exit` (36 cases, CPU-only machine), built with g++ 13 / CUDA 13.2 on a g5.4xlarge (not the CI image). On the card: PolyBench/GPU (20) and Rodinia (11, the round-12 argument lists), sim profile `nvidia/a10g`, card run twice each. **30 of 31 agree** (6 byte-identical, 24 identical after dropping timing lines); the one difference is `srad_v2` (4,096 numbers, up to 30% apart: the out-of-bounds read the card hides, 07 section 3.2). No program needed noise masking. Raw: `data/check/`.
 Found while testing: PolyBench's `Non-Matching CPU-GPU Outputs ...: 0` line contains "CPU", so a timing filter drops it and the self-check goes unread. The filter now keeps lines that state an outcome and masks only numbers that carry a time unit; unit-tested with 0 against 5.
 Not done: HeCBench and CUDA Samples were not run through `vgpu check`; the build used the host toolchain, not the CI image; the CUPTI shim did not build on the rig (no `cupti.h`), which `check` does not need.
