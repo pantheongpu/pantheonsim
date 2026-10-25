@@ -2301,6 +2301,16 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_capture_gate PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# Activity records with no callback asked for, from the runtime, the driver and the CUPTI shim, loaded together.
+if(TARGET vgpucudart AND TARGET vgpucuda AND TARGET vgpucupti)
+  add_executable(test_cupti_activity_flags nvidia/tests/unit/test_cupti_activity_flags.cpp)
+  target_link_libraries(test_cupti_activity_flags PRIVATE vgpucupti vgpucuda vgpucudart)
+  target_link_options(test_cupti_activity_flags PRIVATE -Wl,--no-as-needed)
+  target_include_directories(test_cupti_activity_flags PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cupti_activity_flags COMMAND test_cupti_activity_flags)
+  set_tests_properties(test_cupti_activity_flags PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
 # The driver's stream-ordered memory pools (cuMemPool*, cuMemAllocFromPoolAsync).
 if(TARGET vgpucuda AND CUDA_ABI_INCLUDE)
   add_executable(test_driver_mempool nvidia/tests/unit/test_driver_mempool.cpp)

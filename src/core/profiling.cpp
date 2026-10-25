@@ -57,7 +57,14 @@ constexpr size_t kMaxBuffered = 1u << 20;
 
 }  // namespace
 
-void set_enabled(bool on) { detail::g_on.store(on, std::memory_order_relaxed); }
+namespace {
+// (internal: each library that carries this file has its own, and the functions below are what the others reach)
+std::atomic<bool> g_on{false};
+std::atomic<bool> g_hooked{false};
+}  // namespace
+bool enabled() { return g_on.load(std::memory_order_relaxed); }
+bool hooked() { return g_hooked.load(std::memory_order_acquire); }
+void set_enabled(bool on) { g_on.store(on, std::memory_order_relaxed); }
 
 namespace {
 std::mutex g_graph_mu;
@@ -172,7 +179,7 @@ bool pop_external(int kind, uint64_t* last) {
 void set_hooks(const Hooks& h) {
   std::lock_guard<std::mutex> lock(g_hook_mu);
   g_hooks = h;
-  detail::g_hooked.store(h.api || h.resource || h.sync, std::memory_order_release);
+  g_hooked.store(h.api || h.resource || h.sync, std::memory_order_release);
 }
 
 void notify_resource(const ResourceInfo& info) {
@@ -296,7 +303,10 @@ ApiCall::ApiCall(const char* name, Domain domain) {
   // them). Nothing is noted unless somebody listens.
   const bool noted = __builtin_expect(t.nargs != 0 || t.have_sizes || t.symbol != nullptr, 0);
   outermost_ = t.depth++ == 0;
-  if (!noted && (!outermost_ || (!enabled() && !hooked()))) return;
+  // (the flags are read here directly: this constructor and set_enabled/set_hooks are one library's, whichever copy
+  // of them the dynamic linker picks, so they agree; a call to the exported functions would be this path's cost)
+  if (!noted && (!outermost_ || (!g_on.load(std::memory_order_relaxed) &&
+                                 !g_hooked.load(std::memory_order_acquire)))) return;
   begin(name, domain);
 }
 
