@@ -53,6 +53,7 @@
 #include "vgpu/exec/f32x2.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
+#include "vgpu/exec/tile_mma.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
 #include "vgpu/exec/tma.hpp"
@@ -201,6 +202,10 @@ struct WgmmaSnapshot {
   std::vector<double> A;   // 64 x K when A is in shared memory, else empty
   std::vector<double> B;   // K x N
   uint8_t taken = 0;       // warp ranks within the group that have used it
+  // The SIMD form (exec_wgmma_fast) decodes the operands into float or int32 tiles instead; `fast` says which this snapshot is.
+  bool fast = false;
+  std::vector<float> Af, Bf;
+  std::vector<int32_t> Ai, Bi;
 };
 struct WgmmaSnapshots {
   std::map<std::pair<uint32_t, uint64_t>, WgmmaSnapshot> pending;   // (warpgroup, sequence)
@@ -9746,6 +9751,174 @@ class Interpreter {
     return 0.0;
   }
 
+  static bool wgmma_tile_elem(WgmmaElem t, TileElem* out) {
+    switch (t) {
+      case WgmmaElem::F16: *out = TileElem::F16; return true;
+      case WgmmaElem::BF16: *out = TileElem::BF16; return true;
+      case WgmmaElem::TF32: *out = TileElem::TF32; return true;
+      case WgmmaElem::E4M3: *out = TileElem::E4M3; return true;
+      case WgmmaElem::E5M2: *out = TileElem::E5M2; return true;
+      case WgmmaElem::S8: *out = TileElem::S8; return true;
+      case WgmmaElem::U8: *out = TileElem::U8; return true;
+      default: return false;
+    }
+  }
+
+  // exec_wgmma through the SIMD tile kernels (vgpu/simd/simd.hpp: tile_f32, tile_i32): the operands are decoded once into float (or
+  // int32) tiles -- the shared-memory ones by the first warp of the group, into the snapshot, as the general form reads them -- and each
+  // warp's 16 rows are one kernel call. The kernels sum in k order with every product rounded and then added, as the general form's
+  // loop does, so the bits are the same (tests/unit/test_tile_mma.cpp). Returns false, having changed nothing, for what it does not take
+  // (.b1, a scale other than +-1, shared memory it cannot read directly -- another CTA's, out of range, watched by the race detector or
+  // by an armed fault); exec_wgmma then runs the general form, which also raises that form's errors.
+  bool exec_wgmma_fast(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWgmma& op, Mask m, uint32_t warp_index) {
+    const uint32_t N = op.n, K = op.k;
+    if (W_ != 32 || (op.scale_a != 1 && op.scale_a != -1) || (op.scale_b != 1 && op.scale_b != -1) || N == 0 || N % 8 || N > 256 || K == 0 ||
+        K > 64)
+      return false;
+    TileElem ta, tb;
+    const bool int_form = op.d_type == WgmmaAcc::S32, f16_acc = op.d_type == WgmmaAcc::F16;
+    if (!wgmma_tile_elem(op.a_type, &ta) || !wgmma_tile_elem(op.b_type, &tb) || tile_elem_is_int(ta) != int_form ||
+        tile_elem_is_int(tb) != int_form)
+      return false;
+    const uint32_t nregs = f16_acc ? N / 4 : N / 2;   // accumulator registers
+    if (op.d.size() != nregs) return false;
+    const bool neg_a = op.scale_a < 0, neg_b = op.scale_b < 0;
+    const uint32_t group = warp_index / 4, row0 = (warp_index % 4) * 16;
+    const uint32_t Kp = op.sparse ? K / 2 : K;
+    const uint32_t abits = 8 * tile_elem_bytes(ta);
+    const uint32_t stored = abits == 32 ? 1 : 2;
+    const std::pair<uint32_t, uint64_t> key{group, w.wgmma_issued};
+    auto it = ctx.wgmma->pending.find(key);
+    if (it == ctx.wgmma->pending.end()) {
+      // The first warp of the group reads the shared-memory operands, for all four.
+      if (ctx.shadow || !ctx.shared || mem_.shared_fault_armed()) return false;
+      WgmmaSnapshot snap;
+      snap.fast = true;
+      const uint8_t* const smem = ctx.shared->data();
+      const size_t size = ctx.shared->size();
+      if (!op.a_regs) {
+        Lanes _s;
+        const Lanes& dv = read_operand(w, ctx, ins, op.a_desc, _s);
+        const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
+        if (int_form) {
+          snap.Ai.resize(size_t{64} * Kp);
+          if (!wgmma_read_i32(smem, size, d, op.trans_a == 0, ta, 64, Kp, neg_a, false, ~uint64_t{0}, snap.Ai.data())) return false;
+        } else {
+          snap.Af.resize(size_t{64} * Kp);
+          if (!wgmma_read_f32(smem, size, d, op.trans_a == 0, ta, 64, Kp, neg_a, false, ~uint64_t{0}, snap.Af.data())) return false;
+        }
+      }
+      Lanes _s;
+      const Lanes& dv = read_operand(w, ctx, ins, op.b_desc, _s);
+      const WgmmaDesc d = decode_wgmma_desc(ins, dv[0]);
+      if (int_form) {
+        snap.Bi.resize(size_t{K} * N);
+        if (!wgmma_read_i32(smem, size, d, op.trans_b == 0, tb, N, K, neg_b, true, ~uint64_t{0}, snap.Bi.data())) return false;
+      } else {
+        snap.Bf.resize(size_t{K} * N);
+        if (!wgmma_read_f32(smem, size, d, op.trans_b == 0, tb, N, K, neg_b, true, ~uint64_t{0}, snap.Bf.data())) return false;
+      }
+      it = ctx.wgmma->pending.emplace(key, std::move(snap)).first;
+    } else if (!it->second.fast) {
+      return false;
+    }
+    ++w.wgmma_issued;
+    WgmmaSnapshot& snap = it->second;
+
+    // Sparse A: half of each row stored, placed by this warp's metadata (as mma.sp does for an m16n8kK).
+    Lanes sp_meta{};
+    uint32_t sp_sel = 0;
+    if (op.sparse) {
+      Lanes _s;
+      sp_meta = read_operand(w, ctx, ins, op.sp_meta, _s);
+      sp_sel = static_cast<uint32_t>(std::get<ImmInt>(op.sp_sel).value);
+    }
+    thread_local std::vector<float> Af;
+    thread_local std::vector<int32_t> Ai;
+    // A, this warp's 16 x K slice.
+    if (int_form) Ai.assign(size_t{16} * K, 0);
+    else Af.assign(size_t{16} * K, 0.0f);
+    if (op.a_regs) {
+      const uint32_t per_reg = 32 / abits;
+      const uint32_t cpr = per_reg / stored;   // sparse chunks per register
+      for (uint32_t reg = 0; reg < 4; ++reg) {
+        Lanes _s;
+        const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
+        for (uint32_t lane = 0; lane < W_; ++lane) {
+          const uint32_t g = lane / 4, t = lane % 4;
+          const uint32_t row = g + (reg % 2) * 8;
+          const uint32_t col0 = t * per_reg + (reg / 2) * (per_reg * 4);
+          for (uint32_t e = 0; e < per_reg; ++e) {
+            const uint32_t col =
+                op.sparse ? sparse_column(abits, K, sp_sel, sp_meta, row, t * cpr + (reg / 2) * 4 * cpr + e / stored, e % stored)
+                          : col0 + e;
+            const uint32_t raw = static_cast<uint32_t>(v[lane] >> (abits * e));
+            if (int_form) {
+              const int32_t x = tile_decode_i32(ta, raw);
+              Ai[row * K + col] = neg_a ? -x : x;
+            } else {
+              Af[row * K + col] = std::bit_cast<float>(std::bit_cast<uint32_t>(tile_decode_f32(ta, raw)) ^ (neg_a ? 0x80000000u : 0u));
+            }
+          }
+        }
+      }
+    } else {
+      if (int_form ? snap.Ai.empty() : snap.Af.empty())
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "the warps of a warpgroup disagree on whether this wgmma's A is in registers or "
+                 "shared memory");
+      for (uint32_t r = 0; r < 16; ++r)
+        for (uint32_t j = 0; j < Kp; ++j) {
+          const uint32_t col = op.sparse ? sparse_column(abits, K, sp_sel, sp_meta, r, j / stored, j % stored) : j;
+          if (int_form) Ai[r * K + col] = snap.Ai[size_t{row0 + r} * Kp + j];
+          else Af[r * K + col] = snap.Af[size_t{row0 + r} * Kp + j];
+        }
+    }
+    Mask keep_d = all_;
+    if (const auto* imm = std::get_if<ImmInt>(&op.scale_d)) {
+      keep_d = imm->value ? all_ : 0;
+    } else if (const auto* r = std::get_if<RegOperand>(&op.scale_d)) {
+      keep_d = read_pred(w, ins, r->reg);
+    } else {
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "wgmma scale-d must be a predicate or 0/1");
+    }
+    // The accumulator registers as 32-bit words (a lane that does not accumulate starts from zero), their 16 x N tile (vgpu/exec/tile_mma.hpp),
+    // the kernel, and back.
+    thread_local std::vector<uint32_t> cw, dw;
+    cw.resize(size_t{nregs} * 32);
+    dw.resize(size_t{nregs} * 32);
+    for (uint32_t reg = 0; reg < nregs; ++reg) {
+      Lanes _s;
+      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.d[reg]}}, _s);
+      for (uint32_t lane = 0; lane < 32; ++lane) cw[size_t{reg} * 32 + lane] = (keep_d >> lane & 1) ? static_cast<uint32_t>(v[lane]) : 0u;
+    }
+    if (int_form) {
+      thread_local std::vector<int32_t> Ci, Di;
+      Ci.resize(size_t{16} * N);
+      Di.resize(size_t{16} * N);
+      wgmma_acc_to_tile_i32(cw.data(), N, Ci.data());
+      // (.satfinite clamps once, after the whole K.)
+      simd::kernels().tile_i32(16, N, K, Ai.data(), snap.Bi.data(), Ci.data(), K, op.satfinite, Di.data());
+      wgmma_tile_to_acc_i32(Di.data(), N, dw.data());
+    } else {
+      thread_local std::vector<float> Cf, Df;
+      Cf.resize(size_t{16} * N);
+      Df.resize(size_t{16} * N);
+      wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
+      simd::kernels().tile_f32(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), Df.data());
+      wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data());
+    }
+    for (uint32_t reg = 0; reg < nregs; ++reg) {
+      Lanes r{};
+      for (uint32_t lane = 0; lane < 32; ++lane) r[lane] = dw[size_t{reg} * 32 + lane];
+      if (!int_form) alu_fault(r, m, 32);
+      write_reg(w, op.d[reg], m, r, 32);
+    }
+    snap.taken |= static_cast<uint8_t>(1u << (warp_index % 4));
+    if (snap.taken == 0xF) ctx.wgmma->pending.erase(it);
+    return true;
+  }
+
   void exec_wgmma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWgmma& op, Mask m) {
     // Every form is .sync.aligned: the whole warp, and the whole warpgroup,
     // executes it together.
@@ -9764,6 +9937,7 @@ class Interpreter {
                "warp reached it with some lanes inactive or predicated off");
     if (op.kind == WgmmaKind::Commit) w.wgmma_commits.push_back(w.wgmma_issued);
     if (op.kind != WgmmaKind::Mma) return;
+    if (fast_enabled_ && simd::enabled() && exec_wgmma_fast(w, ctx, ins, op, m, warp_index)) return;
 
     const uint32_t N = op.n, K = op.k;
     const uint32_t row0 = (warp_index % 4) * 16;   // this warp's rows of A and D

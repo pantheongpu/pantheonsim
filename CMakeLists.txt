@@ -244,6 +244,7 @@ add_library(vgpu STATIC
   src/simd/simd.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
+  src/exec/tile_mma.cpp
   src/exec/devrt.cpp
   src/exec/worker_pool.cpp
   src/runtime/runtime.cpp
@@ -1328,6 +1329,8 @@ vgpu_unit_test(test_tc_ampere)
 vgpu_unit_test(test_tc_ampere_fast)
 # The PTX engine's SIMD route for mma.sync against its general path (VGPU_FASTPATH=0), bit for bit.
 vgpu_unit_test(test_mma_fast)
+# The tile-product kernels and the wgmma/mma operand code against the scalar loops they replace, bit for bit.
+vgpu_unit_test(test_tile_mma)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
