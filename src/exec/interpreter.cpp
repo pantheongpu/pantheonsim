@@ -3918,6 +3918,51 @@ class Interpreter {
     const ShflMode mode = static_cast<ShflMode>(u.sub & 3);
     uint32_t r[kMaxWarpSize];   // every result before any is written: the destination may be the source
     Mask pred_out = 0;
+    uint32_t differ = 0;   // (the lane and the clamp, the bits that count, of every lane against the first's)
+    if (fm == 0xFFFFFFFFu && (u.src_imm & 6) != 6)
+      for (uint32_t lane = 0; lane < 32; ++lane) differ |= ((b[lane] ^ b[0]) & 0x1Fu) | ((c[lane] ^ c[0]) & 0x1F1Fu);
+    if (fm == 0xFFFFFFFFu && differ == 0) {
+      // Every lane runs it and all have the same lane and clamp (every __shfl_xor/down/up of a loop's offset): the
+      // arithmetic below with b, c and the mode taken out of the lane loop, and every source lane live.
+      const uint32_t bval = b[0] & 0x1F, cval = c[0] & 0x1F, segmask = (c[0] >> 8) & 0x1F, clamp = cval & ~segmask;
+      const auto each = [&](auto&& jump) {
+        for (uint32_t lane = 0; lane < 32; ++lane) {
+          const uint32_t max_lane = (lane & segmask) | clamp;
+          uint32_t j;
+          const bool pred = jump(lane, max_lane, j);
+          r[lane] = a[(pred ? j : lane) & 0x1F];
+          pred_out |= Mask{pred} << lane;
+        }
+      };
+      switch (mode) {
+        case ShflMode::Up:
+          each([&](uint32_t lane, uint32_t max_lane, uint32_t& j) {
+            j = lane - bval;
+            return static_cast<int32_t>(lane - bval) >= static_cast<int32_t>(max_lane);
+          });
+          break;
+        case ShflMode::Down:
+          each([&](uint32_t lane, uint32_t max_lane, uint32_t& j) { j = lane + bval; return j <= max_lane; });
+          break;
+        case ShflMode::Bfly:
+          each([&](uint32_t lane, uint32_t max_lane, uint32_t& j) { j = lane ^ bval; return j <= max_lane; });
+          break;
+        case ShflMode::Idx:
+          each([&](uint32_t lane, uint32_t max_lane, uint32_t& j) {
+            j = (lane & segmask) | (bval & ~segmask);
+            return j <= max_lane;
+          });
+          break;
+      }
+      uint32_t* d = dst32(w, u.dst, fm);
+      std::memcpy(d, r, 32 * sizeof(uint32_t));
+      if (has_p) {
+        w.written32[u.pred] = 1;
+        Mask& p = w.preds[u.pred];
+        p = (p & ~fm) | (pred_out & fm);
+      }
+      return true;
+    }
     for_active(fm, W_, [&](uint32_t lane) {
       const uint32_t bval = b[lane] & 0x1F;
       const uint32_t cval = c[lane] & 0x1F;

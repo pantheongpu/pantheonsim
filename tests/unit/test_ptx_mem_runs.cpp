@@ -418,4 +418,29 @@ VTEST(atomics_on_shared_memory_match_the_lane_loop) {
   g_ran = g_faulted = 0;
 }
 
+VTEST(shuffles_with_constant_operands_match_the_lane_loop) {
+  // Every mode, every lane operand, and clamps with and without a segment mask; the warp full, with gaps and a lane short.
+  const char* modes[] = {"up", "down", "bfly", "idx"};
+  const uint32_t clamps[] = {0x1f, 0x00, 0x0f, 0x1c1f, 0x0c0f, 0x1010, 0x181f};
+  for (const char* mode : modes)
+    for (uint32_t lane_op : {0u, 1u, 2u, 7u, 8u, 16u, 31u})
+      for (uint32_t clamp : clamps) {
+        const std::string body = std::string("mad.lo.u32 %r11, %r1, 2654435761, 12345; shfl.sync.") + mode +
+                                 ".b32 %r10|%p6, %r11, " + std::to_string(lane_op) + ", " + std::to_string(clamp) +
+                                 ", 0xffffffff; selp.u32 %r12, 1, 0, %p6; shfl.sync." + mode + ".b32 %r13, %r11, " +
+                                 std::to_string(lane_op) + ", " + std::to_string(clamp) + ", 0xffffffff;";
+        for (const Shape& sh : {Shape{0, 4, 0, kThreads, 0}, Shape{0, 4, 0, 32, 0}, Shape{0, 4, 0, 32, 0x00800000u},
+                                Shape{0, 4, 32, 64, 0}, Shape{0, 4, 5, 20, 0}})
+          same(mode, body, sh);
+      }
+  // Operands held in registers: the same in every lane (taken as constants), and different from lane to lane (the lane loop).
+  for (const char* mode : modes)
+    for (uint32_t clamp : {0x1fu, 0x181fu})
+      same(mode, std::string("mov.u32 %r11, 5; mov.u32 %r14, ") + std::to_string(clamp) + "; shfl.sync." + mode +
+                     ".b32 %r10|%p6, %r1, %r11, %r14, 0xffffffff;",
+           {0, 4, 0, 32, 0});
+  for (const char* mode : modes)
+    same(mode, std::string("and.b32 %r11, %r1, 7; shfl.sync.") + mode + ".b32 %r10|%p6, %r1, %r11, 31, 0xffffffff;", {0, 4, 0, 32, 0});
+}
+
 VTEST_MAIN
