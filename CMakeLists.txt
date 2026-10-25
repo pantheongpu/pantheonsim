@@ -3034,10 +3034,14 @@ if(TARGET vgpucublas)
 
   add_test(NAME e2e_host_atomics
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_atomics.sh)
+  # Under ThreadSanitizer the SASS run alone takes 200 to 370 s on 4 cores (the PTX run 5 s): 262144 device atomics on
+  # host-mapped words, each through the host-atomic path while one thread spins on a flag. Measured on origin/main and on the
+  # speed branch, same host, same image: 202 s and 208 s on main, 230 s, 223 s and 370 s on the branch, so the time is the
+  # sanitizer's and not a hang, and 300 s left no room when the job also runs other tests beside it.
   set_tests_properties(e2e_host_atomics PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 300)
+    TIMEOUT 600)
 
   add_test(NAME e2e_uldc_narrow
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_uldc_narrow.sh)
