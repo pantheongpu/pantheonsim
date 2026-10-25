@@ -15,7 +15,7 @@ configuration `RUNS` times per pass in a rotating order, one untimed run of each
 **The rule works where the loss was, and the goal is met only with a warm cache.**
 
 * **Warm cache** (the protocol of rounds 11 to 13: `VGPU_JIT=1 VGPU_JIT_THRESHOLD=100000 VGPU_JIT_SYNC=1`, the cache filled by a first run): all 16 workloads are within +0.9% of the
-  tier *of the same binary* (36 samples each; the largest: `shared` +0.9%, `mma_ptx` +0.7%, `atomics` +0.3%). m3 against the same tier lost 17.4% (`warp`), 19.4% (`f64_fma`), 21.8%
+  tier *of the same binary* (36 samples each; the largest: `shared` +0.9%, `mma_ptx` +0.7%, `atomics` +0.3%; a repeat on the same binary with 45 samples per cell, `data/round14/rule-only-warm-repeat-15x3.txt`, gave 0.987 to 1.012 for the 12 workloads that are not winners, the largest being `atomics` +1.2% and `shared` +0.7%, and the winners at 0.415, 0.568, 0.799, 0.812). m3 against the same tier lost 17.4% (`warp`), 19.4% (`f64_fma`), 21.8%
   (`shared`), 8.0% (`divergent`), 7.8% (`f64_subnormal`), 6.3% (`texture`). The winners did not lose, they gained: `int_alu` 0.416 of the tier's time (m3 0.511), `f32_fma` 0.566
   (0.704), `local` 0.797 (0.854), `mem` 0.814 (0.863); pantheon `int_virus` 2.51x the tier's rate (m3 2.50x), `compute_virus` 1.26x (1.23x), `memory_bank_thrash` 1.24x (1.24x),
   `memory_retention_bake` 2.13x (2.14x, -0.7%, inside the spread), `fp64_virus` 1.004x (m3 0.995x). Most of the winners' extra gain over m3 is not the rule but the second change
@@ -30,11 +30,10 @@ configuration `RUNS` times per pass in a rotating order, one untimed run of each
 
 ## Step 1: where the loss sits (measured before the rule was written)
 
-The brief's four candidates, switched off one at a time in a throwaway build of `main` (the patch is `~/.cache/pantheonsim-briefs/jitx-experiment.patch`, not in the repository: the
+The five candidates (a) to (e) named in the brief, switched off one at a time in a throwaway build of `main` (the patch is `~/.cache/pantheonsim-briefs/jitx-experiment.patch`, not in the repository: the
 env knob `VGPU_JITX` bits: 8 no unit at all, 4 the manager only, 32 units built but `step_warp` never uses them, 2 `tier_run_jit` runs the plain loop, 16 the hook loop whose hook returns at
 once, 1 the hook without counting). Everything with `VGPU_JIT=1 VGPU_JIT_THRESHOLD=10^12` (nothing compiles), a valid empty cache directory, the same number of environment variables
-in every configuration, 30 samples per cell (10 passes of 3), medians of wall seconds, `data/round14/decomposition-main-plus-knobs-10x3.txt`. **No hardware-counter or callgrind profile
-decomposes it** (the rig has `perf` with working counters; I used it only for the checks below). The cells are *percentage points of the tier's time*; a difference of 1 to 1.5 points
+in every configuration, 30 samples per cell (10 passes of 3), medians of wall seconds, `data/round14/decomposition-main-plus-knobs-10x3.txt`. The decomposition is by wall time (the rig has `perf` with working counters; I used them only for the checks below). The cells are *percentage points of the tier's time*; a difference of 1 to 1.5 points
 is at the edge of what 30 samples with a 3% to 10% spread can show.
 
 | workload | tier (s) | unit built, not used (`unit32`) | dispatch through `tier_run_jit` (`plain2` - `unit32`) | hook loop (`hook16` - `plain2`) | region admission (`nocount1` - `hook16`) | counting (`nolook` - `nocount1`) | cache lookup (`full` - `nolook`) | all (`full`) |
@@ -57,7 +56,7 @@ Reading it:
   +3.5% to +4.1% cycles, and **no change** in L1 instruction-cache misses (about 0.29 M both) or branch misses (about 0.31 M both). So the cost is the code of the outlined loop (a call, a
   larger frame and its register allocation for every pass), not a cache effect; I did not take it further.
 * **(b) the hook loop** (the `region_at` test of every op and the call into `jit_run_region`) adds -0.7 to 2.2 points; **admission** (the checks, `fn()`) -0.5 to 0.6; **(a) counting** -0.3 to 1.4.
-  Together with (c): 3 to 7 points on a section whose regions are not the work, every run, from the first instruction.
+  Together with (c): 2 to 7 points on a section whose regions are not the work (`warp` 7.2, `shared` 5.8, `divergent` 4.3, `f64_fma` 3.7, `atomics` 2.1), every run, from the first instruction, before any lookup.
 * **(d) the cache lookup (the compiler-identity queries, the section key, the `.sel` file)** is the largest single piece where it happens, and it happens once a section has run 1 M
   region instructions: +9.9 points on `warp` (8.8 ms), +15.4 on `f64_fma` (10.8 ms), +10.2 on `int_alu` (13.5 ms), +5.7 on `mem` (16.8 ms for its three sections); none on `shared`,
   `divergent`, `texture`, which never reach 1 M region instructions. `strace` shows two child processes (`c++ --version`, `c++ -dumpmachine`) per process; `perf record` puts about
@@ -94,7 +93,7 @@ Reading it:
    and 896, `memory_bank_thrash` 507, `mem` 719/733/691, `compute_virus` 666, `texture` 755, `local` 819, `int_alu` 913, `int_virus` 938, `f32_fma` 992. The bar has to sit between 350 (`warp`
    loses with it kept, +3% even after this branch's other changes) and 444 (`memory_retention_bake`, which gains 2.1x); I first set 60% and `memory_bank_thrash` (507, 1.24x) and half of
    `memory_retention_bake` would have been declined. **The margin to 444 is 4 points; this is a heuristic with a knob, not a law.** The share is a share of instructions, not of time
-   (`texture` is kept at 755 and still gains nothing).
+   (`texture` is kept at 755 and gains 1% to 1.5% at most).
 5. **Costs and limits**: the sample is the first 50,000 warp instructions of the section, which is a few warps of the first blocks; a kernel whose first 50,000 look unlike the rest (a long
    setup phase before the hot loop) is judged by its setup and **declined for good** (the plain loop does not count, so nothing can change the decision). Until the decision the section pays
    the full cost of (b) and (c) and (a) for 50,000 instructions. NOT MEASURED: a kernel built to be misjudged.
@@ -109,7 +108,7 @@ cache stays valid. This is where most of the winners' gain over m3 comes from in
 ## Tests
 
 * `build/test_jit_share` (new, CMake-wired, 6 tests, no compiler needed): the rule's arithmetic (the bar exactly, nothing sampled, rule off, no overflow at 10^13); the settings read; **the static
-  decisions** (a region of escapes only, 1 of 7 generated, regions shorter than the minimum, 8 of 23 and 10 of 26 generated: no unit; 6 of 10: a unit that starts sampled and hooked); **the dynamic
+  decisions** (a region of escapes only, 1 of 7 generated, regions shorter than the minimum, 8 of 23 and 10 of 25 generated: no unit; 6 of 10: a unit that starts sampled and hooked); **the dynamic
   decision** (590 of 2000 declined: state `Declined`, hook off, counter, and 2 M more region instructions ask neither the cache nor the compiler; 1200 of 2000 kept exactly at the bar);
   and **the lookup waits for the decision** (1.5 M region instructions before any sample: still `Idle`, no cache access; after the sample the next note starts it).
 * `build/test_jit` (22 tests now, 21 before): `jit_the_compilers_identity_is_asked_once_and_remembered_in_the_cache_directory` uses a script as the compiler that logs each call: 2 calls in the
@@ -161,7 +160,7 @@ Wall seconds of the whole process (ratio to the tier of the same binary, `VGPU_J
 
 ### Warm cache with four CPUs (4-7, siblings idle) instead of one, 24 samples per cell
 
-The same configurations, `MX_CPU=4,5,6,7` (the worker thread that does the lookup can run on another core). `data/round14/rule-only-warm-four-cpus-8x3.txt`.
+The same configurations (the archs gate ran on CPUs 0-3,8-11 meanwhile), `MX_CPU=4,5,6,7` (the worker thread that does the lookup can run on another core). `data/round14/rule-only-warm-four-cpus-8x3.txt`.
 
 | workload | tier (s) | m3 | **rule on** |
 | --- | --- | --- | --- |
@@ -201,12 +200,12 @@ for these sections too.
 
 * **Still slower than the tier by more than 2%** (rule on): `int_alu` 1.054, `f32_fma` 1.049, `local` 1.036, `mem` 1.021. All kept by the rule (91%, 99%, 82%, 70% generated); the cost is m3's
   (2.3 + 1.9 + 1.3 points for `int_alu`), paid until the section is compiled, which in a default run is after 100 M region instructions. Every other workload is within 1.1%.
-* m3 in the same table: `int_alu` 1.144, `f32_fma` 1.228, `local` 1.103, `mem` 1.088, `warp` 1.167, `f64_fma` 1.203, `shared` 1.062, `divergent` 1.050: the lookup, which this branch makes cheap, was
-  half of it for the short ones.
+* m3 in the same table: `int_alu` 1.144, `f32_fma` 1.228, `local` 1.103, `mem` 1.088, `warp` 1.167, `f64_fma` 1.203, `shared` 1.062, `divergent` 1.050: the lookup, which this branch makes cheap, is a large part of
+  it for the short ones.
 
 ### Pantheon stress workloads (10 s runs, `--kernel_loops 2 --grid_size 4`, warm cache and `THRESHOLD=100000 SYNC=1`), Mi warp instructions per CPU second, 4 samples per cell
 
-`data/round14/rule-only-pantheon-warm-4x1.txt` (`mxp.py`, not in the repository; counters on in every run as `bench.sh pantheon`; rate = the run's own instructions over its own CPU seconds).
+`data/round14/rule-only-pantheon-warm-4x1.txt`, gates running on CPUs 0-3,8-11 (`mxp.py`, not in the repository; counters on in every run as `bench.sh pantheon`; rate = the run's own instructions over its own CPU seconds).
 The sources are the unmodified `kernels/<w>/<w>.cpp`, built with `-cudart shared` for sm_86 on the rig.
 
 | workload | tier | m3 | rule off | **rule on** | rule on / m3 | decision |
@@ -224,7 +223,7 @@ Spreads 0.4% to 8.2% (`fp64_virus` m3); with 4 samples a movement of 1% to 2% is
 * **Counting with a load and a store instead of an atomic add** (`Unit::note`, no locked instruction on the hot path): cold, `int_alu` 1.051 with the locked add against 1.050 without; `f32_fma`
   1.042 / 1.049; `mem` 1.026 / 1.017; `local` 1.019 / 1.033 (10 passes of 3, `data/round14/cold-counting-nonatomic-dropped-10x3.txt`). No effect outside the noise.
 * **Counting one pass in 16** (the hook loop only for passes picked by a hash of the warp's step count, a counted pass counting for 16; the other passes on the inlined plain loop; patch in
-  `~/.cache/pantheonsim-briefs/sparse-counting-dropped.patch`): `mem` and `f32_fma` fell to 0.998 and 1.043, but `int_alu` rose to 1.140 and `local` to 1.082. A call of the hook loop
+  `~/.cache/pantheonsim-briefs/sparse-counting-dropped.patch`): `mem` fell to 0.998 (the rule alone: 1.020) and `f32_fma` stayed at 1.043 (1.034), but `int_alu` rose to 1.140 (1.044) and `local` to 1.082 (1.021). A call of the hook loop
   runs a whole chain of passes (the tier chains them), so the passes are few and long and a sample of them is a poor estimate: the estimate reached the compile threshold of 100 M early
   (a compile was started in an 11 M instruction run: `1 compiles (54.2 ms)` in the statistics) and the compile steals the single core. `data/round14/sparse-counting-dropped-cold-12x3.txt`.
   A sampled count would need the share of the call, not the call, as the unit.
@@ -233,13 +232,13 @@ Spreads 0.4% to 8.2% (`fp64_virus` m3); with 4 samples a movement of 1% to 2% is
 ## Traps found on the way (they cost me a wrong measurement each)
 
 * **A cache directory that is group-writable is refused** ("writable by others"). `mkdir -p` under `umask 002` makes one; the JIT then fails silently (a `VGPU_QUIET=1` run prints nothing),
-  `disabled` is set and later sections get no unit at all. Three of my first experiments ran in that state. Create cache directories with `mkdir -m 700`.
+  `disabled` is set and later sections get no unit at all. Several of my first experiments ran in that state. Create cache directories with `mkdir -m 700`.
 * **The same, as root**: a `sudo perf` run does not accept a cache directory owned by the user; it then also spawns the compiler for every lookup.
 * **Extra environment variables slow `launch` by 3.7%** for two variables (`getenv` scans the environment on the launch path: `__strncmp_evex` 5.7% of its profile). A JIT configuration has
   3 to 5 more `VGPU_` variables than the tier's: pad the tier's environment with the same number of dummy `VGPU_PAD<n>` variables, or `launch` shows a loss that is not the JIT's
   (`data/round14/launch-env-size-15x3.txt`).
 * **Two builds of the same source differ by +-3%** on small workloads (layout), so compare a binary with its own JIT-unset runs.
-* The brief's "hook only" experiment is contaminated by a warm cache (above).
+* Round 13's "hook only" experiment may have been contaminated by a warm cache in the same way (above); mine was.
 
 ## Gates (the same-bits rule)
 
@@ -249,6 +248,7 @@ All on the binary measured above (the commit `badc5e14`, built once in the CUDA 
 * `ctest -R '^e2e_sass_jit$'` (the PR gate: counters, 1 and 4 threads, warm cache, background compile, chain off, faults tier against JIT, the new rule-on stage, one random seed, the failure modes): **PASS** (1038 s).
 * `ctest -R '^e2e_sass_tier$'`: **PASS** (79 s).
 * `bench.sh --check-counters`: **PASS** with the JIT unset, with every region forced (`THRESHOLD=1 SYNC=1 HOT_PERMILLE=0 MIN_REGION=2 MAX_OPS=10^8`), and with the rule on (`THRESHOLD=100000 SYNC=1`): 16 workloads x SASS and PTX each.
+* The same `--check-counters` with `--threads 4` (`VGPU_THREADS=4`), JIT unset and with the rule on (`THRESHOLD=100000 SYNC=1`): **PASS** both (the sampler runs from several host threads).
 * Random kernels (`jit_random.py` through `run_sass_jit.sh`, `VGPU_JIT_ONLY_RANDOM=1 VGPU_JIT_RANDOM_SEEDS=8`, tier against JIT with every region compiled, 1 and 4 threads): **8 of 8 seeds ok**.
 * `e2e_sass_archs` with the JIT forced (`VGPU_JIT=1 VGPU_JIT_THRESHOLD=1 VGPU_JIT_SYNC=1 VGPU_JIT_HOT_PERMILLE=0 VGPU_JIT_MAX_OPS=100000000 VGPU_JIT_MIN_REGION=2`): (running when this commit was made: the result is in the next commit)
 * CI-style build (CUDA 12.0 image, Ninja, `-DVGPU_WERROR=ON`, a `git init`ed copy) and `ctest -R '^lint_'`: **PASS**: the build is clean with `-Werror`; `ctest -R ^lint_` 24 of 24 passed (the `git init`ed copy, so `lint_curl_retries` runs and passes), including `lint_odr_globals` and its self-test; the same six unit tests pass on that build.
@@ -261,4 +261,4 @@ All on the binary measured above (the commit `badc5e14`, built once in the CUDA 
   `nvidia/rtx3060` and architectures other than sm_86 for timing; PyTorch (51 M warp instructions in 100 s: the sample is never reached with any effect); runs longer than 10 s; a kernel with a long
   setup phase before its hot loop (declined for good, above).
 * `mx.py`, `mxp.py` and the `VGPU_JITX` patch are not in the repository.
-* The `VGPU_JIT_MIN_SHARE` and `VGPU_JIT_SAMPLE` defaults come from 21 sections of 21 workloads on one machine; a different workload may sit between 350 and 444 per thousand.
+* The `VGPU_JIT_MIN_SHARE` and `VGPU_JIT_SAMPLE` defaults come from 23 sections of 18 workloads on one machine; a different workload may sit between 350 and 444 per thousand.
