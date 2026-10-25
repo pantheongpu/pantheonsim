@@ -2609,7 +2609,8 @@ and bits do not move is the unit tests below (they compare `DispatchStats` and m
   2.2 to 2.9 us a launch. Sizing it by the kernel's declared VGPR count is not bit-safe (any instruction may index a register past
   the declared count, as `s_set_gpr_idx` and a kernel's undefined reads do, and the file reads zero today), tracking what a wave wrote
   would add a store to every register access, and clearing a recycled file costs as much as making a new one. Nothing was shipped and
-  `launch` is unchanged in the A/B above.
+  `launch` is unchanged in the A/B above. (Superseded: "The cost of starting work", at the end of this file, found that the file's
+  construction was 85% of `set_up_group`, not a third of a launch, and ships a pooled file that clears only the rows the code names.)
 
 ### Lessons
 
@@ -4456,3 +4457,104 @@ VOTEU 3,200 and S2UR 128 are the interpreter's, see below), the others 99.2% to 
 The API-call, AMD-memory and SASS-control pieces above merged without a code conflict and with identical counters. A/B of the merged tree against its base (one pinned CPU, quiet machine, counters identical in every row): NVIDIA SASS `shared` 2.0x, `atomics` 1.75-1.85x, `mem` 1.47x, `local` 1.21x, `divergent` 1.20x, `warp` 1.18x, `launch` 1.14x, `api` 1.43x (SASS and PTX); AMD `buf` 2.4-2.8x, `narrow` 1.6-2.0x, `mem` 1.3-1.6x, `lds` 1.3-1.55x, `flat` 1.2-1.35x, `atomics` 1.25-1.6x, `api` about 2.9x.
 
 Known cost, not explained: the f64 matrix instructions of the AMD engine run slower in the merged tree, `mfma_f64` 0.93-0.94x, `mfma_f64_4b` 0.93x, `mfma` 0.96-0.98x (MI300X, p <= 0.02, A/A control 1.000). `perf stat` on `mfma_f64`: instructions identical (11.93 G), cycles 2.22 G -> 2.50 G, L1 data-cache misses not higher. Each piece alone costs 1-2% there; the sum is the 7%. None of the pieces changes the matrix code, so it reads as a code-placement or address-alignment effect on `mfma_tile_fma_hw` / `matrix_multiply_fast`, not extra work. Not yet fixed.
+
+## The cost of starting work (branch `sp-launch`)
+
+Per-work-group and per-block set-up and the launch path, measured on server3 (one host thread, cpu 2; `perf record -e cycles:u`, then
+`perf stat` for cycles, instructions and branch misses, which do not move with the load the way the harness's times do).
+
+### Where the time went
+
+* **AMD `launch` (one-wave launches).** `set_up_group` was 38 to 56% of the simulator's samples, and 85% of that was one loop: the wave's
+  register file, `std::vector<std::array<uint32_t, 64>>(256)`, is filled by copying one 256-byte row 255 times (sixteen 16-byte
+  loads and stores a row, 64 KB in all). The "dropped" entry above measured the vector in isolation at 0.7 us; in the launch loop it is the
+  largest single cost (about 1.3 us a wave at 3 GHz). After a memset instead, libc's memset of the same 64 KB was still 25% of the samples.
+* **NVIDIA SASS `launch`.** `Runner::init_block` 8.9%: `w = Warp{}` builds a 3 KB temporary and copies it over the warp (the register
+  file and local memory are freed and allocated again for every warp), `blk.tmem = exec::TensorMemory{}` builds two `std::deque`s (four
+  allocations and frees a block), and a `Block` was constructed for every launch. Per launch the Runner constructor parses the module's
+  constant-bank table (a `substr` and `stoul` for each symbol, two `std::map` insertions) and looks up `".nv.constant0." + name`;
+  `compute_occupancy` does about six 64-bit divisions with the same numbers every launch; `Runner::run` takes `fail_mu` and `stats_mu_` for
+  every block of a launch that has one thread.
+
+### What changed
+
+* **AMD register file** (`VgprFile::Rows`, amd/src/gcn_exec.cpp). One block of memory, zeroed with `memset`, 64-byte aligned (a row never splits a cache line). The matrix path's four tiles (`TileBuf`, amd/src/tile_buf.hpp) start at fixed places in the page: with the rows aligned and the tiles wherever the heap put them, `mfma_f64` read 23% more cycles (2.74 G against 2.22 G, L1 misses doubled; the cause was not isolated further than the tiles' places); with the rows from `malloc` instead, `valu_f32` (rx6800) and `wave` read 3% more, `valu_f64` 1.5%. Aligned rows and placed tiles are at the base's cycles on all of them. A file of the usual 256 rows goes back to a
+  per-thread pool (32 of them) with `dirty`, the number of rows that may be non-zero, and the next wave to take one clears only those. A
+  work-group that ended normally (every wave `done`, no debugger) marks its files with the highest vector register any instruction the
+  machine decoded names, plus 16 for the widest result, and at least v0 to v2 (`set_up_group` seeds them): `Group::~Group`. An
+  instruction that indexes registers at run time (`s_set_gpr_idx_*`, `v_movrel*`, `v_swaprel*`, `s_set_vgpr_msb`) makes the bound
+  "everything". The bound lives in the decode cache (`DecodeCache::vgpr_rows`) and is raised by `gcn::decode` through a per-thread sink
+  the `Machine` sets for its life (`gcn::set_vgpr_rows_sink`), so the interpreter's fetch path is the code it was (see the layout
+  note below). The registers stay bit-identical: a wave reads zero in every register it did before, because a row is cleared unless
+  every instruction that could have written it has been decoded and names a lower register.
+* **AMD per-group allocations** (`PooledAllocator`). The list node of the groups a thread holds and each group's vector of waves come from
+  small per-thread free lists (one to four elements, four of each).
+* **NVIDIA SASS block** (src/sass/exec.cpp). `init_block` builds each warp in place (`~Warp`, placement `Warp()`; the register file and local
+  vectors keep their memory and start empty), `TensorMemory::reset()` replaces the temporary, and a thread keeps its `Block`s between
+  launches (`PooledBlock`, up to four, taken for the length of a worker so a launch from inside a block takes its own). A launch on one host
+  thread skips `fail_mu` and `stats_mu_`. A module's per-kernel facts (the constant banks that are backed by memory, their addresses and sizes,
+  the bank 0 template, the code entry) are worked out by the first launch of the kernel and kept in the module (`Module::KernelStatics`,
+  an atomic slot per kernel); the banks are arrays of 32 (a bank is named by five bits of an instruction) instead of two `std::map`s that
+  `cbank32` searched for every constant read.
+* **`ptx::compute_occupancy`** keeps the thread's last answer (a loop of launches of one kernel asks the same thing every time).
+
+### Results (B/A of the medians, base d8ec6128, 9 alternating runs, p by Mann-Whitney; counters identical in every row)
+
+| workload | mi300x 1 thread | mi300x all | rx6800 1 thread | rx6800 all |
+| --- | ---: | ---: | ---: | ---: |
+| launch | 1.70 | 1.65 | 1.99 | 2.13 |
+| launch_wide | 2.39 | 2.39 | 2.43 | 2.40 |
+| launch_mid | 2.29 | 2.31 | 2.35 | 2.35 |
+| launch_sync | 1.34 | 1.35 | 1.63 | 1.62 |
+| graph | 1.54 | 1.54 | 1.85 | 1.87 |
+| stream | 1.03 | 1.03 (same) | 1.07 | 1.09 |
+| startup, api | same | same | same | same |
+
+p < 0.001 for every row marked faster. NVIDIA SASS: `launch` 1.26x (504 to 633 k launches/s, p < 0.001); `api`, `startup`, `int_alu`,
+`mem`, `shared`, `warp`, `divergent` and the PTX engine's rows are the same (the PTX `mem` and `atomics` rows read 0.95 to 0.98 and
+are the PTX engine, which this branch does not touch). `--check-counters` matches the recorded counts on 11 AMD workload/target pairs.
+
+**Interpreter workloads and code layout.** The first versions of the register-file pool measured `valu_int`, `smem`, `lds`, `divergent` and
+`wave` 3 to 6% slower with instruction counts up by under 1% and branch misses in `run_groups` (the interpreter's loop is inlined into it)
+up to 60%. It was layout, not work: padding the translation unit changed nothing, but putting the decode-cache note in the fetch lambda
+(then in `DecodeCache::get`, then in a noinline helper) each moved the numbers, and calling it from `Machine`'s constructor through a
+thread-local sink with `gcn::decode` kept out of line (`[[gnu::noinline]]`) returned `fetch` to the code it had; `perf stat` cycles
+are then the base's within 1% on `valu_int`, `smem`, `lds`, `divergent`, `wave` for both targets (for example `divergent` rx6800 2.35 G
+cycles against 2.38 G, `wave` 0.757 G against 0.761 G). The A/B of the same build still reads `valu_int` rx6800 between 0.96 and 1.00
+from one run to the next, and the A/A control (the base's own libraries copied to another path) read 0.95 to 1.19 on `launch` (p 0.3 to 1)
+and 0.97 to 1.02 elsewhere: the harness cannot see 3% on a host this loaded (load 1 to 47 during these runs).
+
+### Tests (wired into CMake)
+
+* `test_amd_gcn_register_pool` (amd/tests/unit/test_gcn_register_pool.cpp): kernels written out word by word (gfx942). One writes v200 and
+  ends, the next stores v200 without writing it; the pair runs on one thread, so the second gets the first's file, and has to read zero. The
+  same through `s_set_gpr_idx_on` (the code never names v200). A kernel that sets and stores v200 itself reads it back. Nine to
+  thirty-three work-groups of one to four waves on one thread each store their number. Mutations that fail it: the group's bound fixed at
+  3 rows (2 tests fail), the `s_set_gpr_idx` name left out of `vgpr_rows_written` (the indexed test), no sink set by the machine (2), no
+  clearing of the dirty rows when a file is taken (2).
+* `test_sass_block_reuse` (tests/unit/test_sass_block_reuse.cpp): SASS for sm_86 written out word by word (the test checks nvdisasm's text of
+  each word), loaded from a cubin it builds. Every block of a grid runs (one to 100 threads); a register a kernel sets reads zero in the next
+  block, the next launch and the next kernel; a module's second kernel starts at its own code. Mutations that fail it: `init_block` not
+  rebuilding the warp (2 tests), `assign` of the register file replaced by `resize` (1), the per-kernel facts shared by every kernel of every
+  module (the two-kernel test).
+* `test_regalloc`: `occupancy_answers_do_not_carry_over_from_the_call_before` (each of the nine numbers and the rules changed alone, right
+  after the base call and before it). Mutations that fail it: the key leaving out the warp size, the key being the registers alone, the
+  per-block register limit left out of the rules.
+* Run on server3: Release `ctest -R test_amd` (168 tests, the same-bits, packed, memory, tier, codeobject, matrix and nan-order guards among
+  them), all 699 (3 failures that are the host: no `c++` on the tests' PATH for `test_jit` and `e2e_private_loads`, no `.git` for
+  `lint_curl_retries`; the `e2e_*` tests skip, there is no nvcc), ASan+UBSan on the AMD and SASS tests above, `-fsanitize=thread` on the
+  register-pool, threads and atomics tests (the full sanitizer legs run in CI).
+
+### Not done, and negative results
+
+* The nine `getenv` calls of a SASS launch (`VGPU_FASTPATH`, `VGPU_THREADS`, `VGPU_LOCKSTEP` twice, `VGPU_TIER_*`, `VGPU_SASS_TRACE`,
+  `VGPU_TC_EXACT`, `VGPU_TRACE`) are 4% of the NVIDIA `launch` workload. Not cached: tests set `VGPU_FASTPATH` and `VGPU_THREADS` between
+  launches of one process. A single pass over `environ` for all of them would save about 2% and was left.
+* Reusing a finished work-group's `Group` (its LDS and scratch vectors, not only the node and the waves' vector) measured the same as the
+  allocator and moved the interpreter's layout; dropped.
+* Sizing the register file by the kernel's declared VGPR count is still not done (see the entry above): the pool clears by what the decoded
+  code names, which is exact.
+* `Warp` is 3 KB of state that must start as zero (`ur[256]`, the per-lane arrays); the in-place rebuild is a memset, and is what is left of
+  `init_block` (4.4% of the SASS `launch` samples). The PTX interpreter's `setup_block` (7%) was not touched.
+* The remaining AMD `launch` profile is the stream and queue plumbing (`pthread_mutex_lock/unlock` 17%, `Publisher::refresh` 5%, the work
+  queue thread hand-off), not set-up.

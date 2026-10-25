@@ -1949,7 +1949,7 @@ void finalize(Inst& in) {
   tier_classify(in);
 }
 
-Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
+static Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
   if (is_rdna(target)) {
     Inst in = rdna::decode(code, at, pc, target, wave64);
     classify(in);
@@ -1969,6 +1969,40 @@ Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target t
   in.arch = target;
   classify(in);
   finalize(in);
+  return in;
+}
+
+uint32_t vgpr_rows_written(const Inst& in) {
+  const std::string_view n = in.name;
+  if (n.rfind("s_set_gpr_idx", 0) == 0 || n.rfind("v_movrel", 0) == 0 || n.rfind("v_swaprel", 0) == 0 || n.rfind("s_set_vgpr_msb", 0) == 0)
+    return kVgprsAny;
+  constexpr uint32_t kWidestResult = 16;
+  uint32_t rows = 0;
+  for (const auto* ops : {&in.dst, &in.src})
+    for (const Operand& o : *ops)
+      if (o.kind == OperandKind::Vgpr) rows = std::max(rows, o.index + std::max<uint32_t>(o.width, 1) + kWidestResult);
+  for (const Inst& half : in.dual) rows = std::max(rows, vgpr_rows_written(half));
+  return rows;
+}
+
+namespace {
+thread_local std::atomic<uint32_t>* t_rows_sink = nullptr;
+}
+
+std::atomic<uint32_t>* set_vgpr_rows_sink(std::atomic<uint32_t>* sink) {
+  std::atomic<uint32_t>* previous = t_rows_sink;
+  t_rows_sink = sink;
+  return previous;
+}
+
+[[gnu::noinline]] Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target, bool wave64) {
+  Inst in = decode_one(code, at, pc, target, wave64);
+  if (std::atomic<uint32_t>* rows = t_rows_sink) {
+    const uint32_t want = vgpr_rows_written(in);
+    uint32_t seen = rows->load(std::memory_order_relaxed);
+    while (seen < want && !rows->compare_exchange_weak(seen, want, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+  }
   return in;
 }
 

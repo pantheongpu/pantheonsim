@@ -1318,6 +1318,8 @@ vgpu_unit_test(test_memcount_forms)
 vgpu_unit_test(test_atom_rmw)
 # Module::code_at (a binary search over the code sections) against the scan it replaced.
 vgpu_unit_test(test_sass_code_at)
+# The SASS executor's block, kept between blocks and launches and set up again each time (Runner::init_block).
+vgpu_unit_test(test_sass_block_reuse)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
@@ -1483,6 +1485,7 @@ target_compile_definitions(test_amd_gcn_builtins PRIVATE VGPU_SOURCE_DIR="${CMAK
 vgpu_unit_test(test_amd_gcn_packed amd/tests/unit/test_gcn_packed.cpp)
 target_compile_definitions(test_amd_gcn_packed PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
+vgpu_unit_test(test_amd_gcn_register_pool amd/tests/unit/test_gcn_register_pool.cpp)
 vgpu_unit_test(test_amd_gcn_spill amd/tests/unit/test_gcn_spill.cpp)
 target_compile_definitions(test_amd_gcn_spill PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
@@ -1531,6 +1534,8 @@ endforeach()
 
 # The matrix instructions' arithmetic (half widening, dot products) against what it replaced.
 vgpu_unit_test(test_amd_mfma_math amd/tests/unit/test_mfma_math.cpp)
+# The matrix path's tile, placed in the page and resized like a vector (amd/src/tile_buf.hpp).
+vgpu_unit_test(test_amd_tile_buf amd/tests/unit/test_tile_buf.cpp)
 # The matrix instructions on the tile path against the reference path, bit for bit, over the ISA corpora.
 vgpu_unit_test(test_amd_matrix_fast amd/tests/unit/test_matrix_fast.cpp)
 target_compile_definitions(test_amd_matrix_fast PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

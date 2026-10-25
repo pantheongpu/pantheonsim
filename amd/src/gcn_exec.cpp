@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <list>
+#include <new>
 #include <map>
 #include <set>
 #include <cstdlib>
@@ -34,6 +35,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
 #include "mfma_math.hpp"
+#include "tile_buf.hpp"
 #include "nan_order.hpp"
 #ifndef SPARSE_ORDER
 #define SPARSE_ORDER 0   /* the sparse MFMA sum: which operand of the multiply and of the add a NaN takes the payload of */
@@ -258,18 +260,170 @@ bool matches_class_half(_Float16 h, uint32_t mask) {
   return (mask & (negative ? 1u << 4 : 1u << 7)) != 0;
 }
 
+// An allocator that keeps the last few blocks of one to four elements a thread freed, for the next request of that size: a work-group's
+// node in the list of the groups a thread holds, and its vector of waves, are made and dropped for every work-group, and a launch of
+// one small group spent a tenth of its time in malloc and free for them.
+template <class T>
+struct PooledAllocator {
+  using value_type = T;
+  PooledAllocator() = default;
+  template <class U>
+  PooledAllocator(const PooledAllocator<U>&) noexcept {}
+  T* allocate(size_t n) {
+    if (n >= 1 && n <= kSizes) {
+      Free& f = lists().f[n - 1];
+      if (f.count) return static_cast<T*>(f.item[--f.count]);
+    }
+    return static_cast<T*>(::operator new(n * sizeof(T)));
+  }
+  void deallocate(T* p, size_t n) noexcept {
+    if (n >= 1 && n <= kSizes) {
+      Lists& l = lists();
+      Free& f = l.f[n - 1];
+      if (l.alive && f.count < kKeep) {
+        f.item[f.count++] = p;
+        return;
+      }
+    }
+    ::operator delete(p);
+  }
+  template <class U>
+  bool operator==(const PooledAllocator<U>&) const noexcept {
+    return true;
+  }
+  template <class U>
+  bool operator!=(const PooledAllocator<U>&) const noexcept {
+    return false;
+  }
+
+ private:
+  static constexpr size_t kSizes = 4, kKeep = 4;
+  struct Free {
+    void* item[kKeep];
+    size_t count = 0;
+  };
+  struct Lists {
+    Free f[kSizes];
+    bool alive = true;
+    ~Lists() {
+      alive = false;
+      for (Free& x : f)
+        for (size_t i = 0; i < x.count; ++i) ::operator delete(x.item[i]);
+    }
+  };
+  static Lists& lists() {
+    thread_local Lists l;
+    return l;
+  }
+};
+
 // One wavefront: its own scalar registers, VCC, EXEC and SCC, and 64 lanes of
 // vector registers.
 // A wave's vector registers: 256 of them to begin with, and more -- up to the 1024 a gfx1250 wave may be given -- once an
 // instruction reaches past them (through s_set_vgpr_msb), which the file grows to meet. Indexed as a two-dimensional array.
 struct VgprFile {
-  std::vector<std::array<uint32_t, kLanes>> r;
+  // The rows are one block of memory, zeroed with a single memset, 64-byte aligned (see TileBuf: with the rows aligned and the matrix path's tiles left to the heap, v_mfma_f64 ran 23% slower and the lane-wise SIMD loads of a row no longer split a cache line otherwise): a vector of 256 value-initialised arrays is filled by
+  // copying one 256-byte row 255 times, which takes about three times as long, and every wave of every work-group pays for it.
+  // A file of the usual 256 rows goes back to a per-thread pool when its wave is gone, with the number of rows that may hold
+  // something (`dirty`: all of them, unless the work-group ended normally and ~Group marked fewer), and the next wave
+  // to take it clears only those: the kernel's registers are a few rows of 256, and a one-wave work-group otherwise spends
+  // a quarter of its time zeroing the rest.
+  struct Rows {
+    using Row = std::array<uint32_t, kLanes>;
+    Row* p = nullptr;
+    size_t n = 0;
+    size_t dirty = 0;   // the first `dirty` rows may be non-zero; the rest are zero
+    Rows() = default;
+    explicit Rows(size_t count) {
+      if (count == kVgprs && pool_take(*this)) return;
+      resize(count);
+      dirty = n;
+    }
+    Rows(const Rows& o) { *this = o; }
+    Rows(Rows&& o) noexcept : p(o.p), n(o.n), dirty(o.dirty) { o.p = nullptr, o.n = o.dirty = 0; }
+    Rows& operator=(const Rows& o) {
+      if (this != &o) {
+        Rows copy;
+        copy.p = static_cast<Row*>(std::aligned_alloc(64, o.n * sizeof(Row) + 64));
+        if (!copy.p) throw std::bad_alloc();
+        copy.n = copy.dirty = o.n;
+        if (o.n) std::memcpy(copy.p, o.p, o.n * sizeof(Row));
+        *this = std::move(copy);
+      }
+      return *this;
+    }
+    Rows& operator=(Rows&& o) noexcept {
+      std::swap(p, o.p);
+      std::swap(n, o.n);
+      std::swap(dirty, o.dirty);
+      return *this;
+    }
+    ~Rows() {
+      if (p && n == kVgprs && pool_give(*this)) return;
+      std::free(p);
+    }
+    size_t size() const { return n; }
+    Row* data() { return p; }
+    const Row* data() const { return p; }
+    Row* begin() { return p; }
+    Row* end() { return p + n; }
+    const Row* begin() const { return p; }
+    const Row* end() const { return p + n; }
+    Row& operator[](size_t i) { return p[i]; }
+    const Row& operator[](size_t i) const { return p[i]; }
+    // Grows to `count` rows, the new ones zero.
+    void resize(size_t count) {
+      if (count <= n) return;
+      Row* q = static_cast<Row*>(std::aligned_alloc(64, count * sizeof(Row)));
+      if (!q) throw std::bad_alloc();
+      if (n) std::memcpy(q, p, n * sizeof(Row));
+      std::memset(q + n, 0, (count - n) * sizeof(Row));
+      std::free(p);
+      p = q;
+      n = dirty = count;
+    }
+    // Says that only the first `rows` rows may hold anything: the wave is done, and nothing it ran names a register past them.
+    void release(size_t rows) { dirty = std::min(rows, n); }
+
+   private:
+    struct Pool {
+      static constexpr size_t kMax = 32;   // 64 KB each
+      struct Block {
+        Row* p;
+        size_t dirty;
+      };
+      Block blocks[kMax];
+      size_t count = 0;
+      bool alive = true;
+      ~Pool() {
+        alive = false;
+        for (size_t i = 0; i < count; ++i) std::free(blocks[i].p);
+      }
+    };
+    static Pool& pool() {
+      thread_local Pool pl;
+      return pl;
+    }
+    static bool pool_take(Rows& r) {
+      Pool& pl = pool();
+      if (!pl.count) return false;
+      const Pool::Block b = pl.blocks[--pl.count];
+      std::memset(b.p, 0, b.dirty * sizeof(Row));
+      r.p = b.p, r.n = r.dirty = kVgprs;
+      return true;
+    }
+    static bool pool_give(Rows& r) {
+      Pool& pl = pool();
+      if (!pl.alive || pl.count == Pool::kMax) return false;
+      pl.blocks[pl.count++] = {r.p, r.dirty};
+      return true;
+    }
+  };
+  Rows r;
   VgprFile() : r(kVgprs) {}
   std::array<uint32_t, kLanes>& operator[](size_t i) { return r[i]; }
   const std::array<uint32_t, kLanes>& operator[](size_t i) const { return r[i]; }
-  void grow(size_t n) {
-    if (r.size() < n) r.resize(n);
-  }
+  void grow(size_t n) { r.resize(n); }
 };
 
 struct Wave {
@@ -409,12 +563,30 @@ class FloatMode {
 // The work-group the waves share: its LDS, and how many waves are still to
 // reach the barrier.
 struct Group {
+  ~Group() {
+    // A work-group whose waves all ended has run nothing but decoded instructions, and has written only the registers they name (and
+    // v0 to v2, which set_up_group fills): its register files go back to the pool with just those rows marked, and the next wave
+    // to take one clears no more. A group that did not finish (an error, a debugger stop) leaves them all marked.
+    if (!cache || waves.empty()) return;
+    for (const Wave& w : waves)
+      if (!w.done) return;
+    const size_t rows = std::max<size_t>(cache->vgpr_rows(), 3);
+    for (Wave& w : waves) w.vgpr.r.release(rows);
+  }
+  Group() = default;
+  Group(const Group&) = delete;
+  Group& operator=(const Group&) = delete;
+  Group(Group&&) = default;
+  Group& operator=(Group&&) = default;
   std::vector<uint8_t> lds;
   // Each work-item's private memory, one block per lane of the group: what a
   // kernel spills into when it runs out of registers.
   std::vector<uint8_t> scratch;
   uint32_t scratch_per_lane = 0;
-  std::vector<Wave> waves;
+  std::vector<Wave, PooledAllocator<Wave>> waves;
+  // The decode cache of the code the waves run, for the destructor above; null where the registers may hold anything (the debugger can
+  // write them).
+  const DecodeCache* cache = nullptr;
   uint32_t id[3] = {};   // the work-group's id, for the debugger to say
   // gfx1250's barrier unit: each named barrier's member and signal counts (1 to 16), and how many waves have signalled
   // the work-group barrier in this round.
@@ -424,7 +596,12 @@ struct Group {
 
 struct Machine {
   Machine(const Dispatch& dispatch, MemoryManager& memory, DecodeCache& cache)
-      : d(dispatch), mem(memory), decoded(&cache), sampler(dispatch.sampler && dispatch.sampler->interval ? dispatch.sampler : nullptr) {}
+      : d(dispatch), mem(memory), decoded(&cache), sampler(dispatch.sampler && dispatch.sampler->interval ? dispatch.sampler : nullptr),
+        prev_rows_sink_(gcn::set_vgpr_rows_sink(cache.vgpr_rows_cell())) {}
+  // (What the instructions this machine decodes can write is noted in its decode cache: gcn::decode does it, told where.)
+  ~Machine() { gcn::set_vgpr_rows_sink(prev_rows_sink_); }
+  Machine(const Machine&) = delete;
+  Machine& operator=(const Machine&) = delete;
   const Dispatch& d;
   MemoryManager& mem;
   DispatchStats stats;
@@ -10693,7 +10870,11 @@ struct Machine {
     uint32_t b_blk[kLanes], b_col[kLanes];
     // where each lane's run of K starts in a tile of A (by row) and of B (by row of k), as floats are stored
     uint32_t a_dst[kLanes], b_dst[kLanes];
-    std::vector<double> fa, fbk, fc, fo;
+    // (Staggered in the cache: see TileBuf.)
+    TileBuf<2> fa;
+    TileBuf<3> fbk;
+    TileBuf<0> fc;
+    TileBuf<0> fo;
     std::vector<int16_t> ia, bi;
     std::vector<int32_t> io, ic;
     // The operands' values as doubles (A by row, B by column, C as it is), kept per thread between instructions.
@@ -12150,6 +12331,9 @@ struct Machine {
     if (fl & gcn::kInstSWait) return true;
     throw Error::make(Err::Unsupported, "instruction ", in.name, " is decoded but not implemented");
   }
+
+  // (Last, so that no other member moves: where the machine's hot members sit in memory moves the interpreter's speed.)
+  std::atomic<uint32_t>* prev_rows_sink_ = nullptr;   // the decode-cache sink this thread had before this machine
 };
 
 }  // namespace
@@ -12292,6 +12476,7 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
   group.id[0] = gx;
   group.id[1] = gy;
   group.id[2] = gz;
+  group.cache = m.debug_on ? nullptr : m.decoded;
   for (uint32_t i = 0; i < waves_per_group; ++i) {
     Wave& w = group.waves[i];
     w.pc = d.code_base + k.entry;
@@ -12396,6 +12581,16 @@ void set_up_group(Group& group, Machine& m, const Dispatch& d, uint64_t packet, 
 
 }
 
+// The work-groups a host thread holds at once. (The list's nodes, and the groups' vectors of waves, come from small per-thread free
+// lists: see PooledAllocator. Adding and dropping one is out of line, so that the loop that runs them stays the size it was.)
+struct Held {
+  Group group;
+  bool had_turn = false;
+};
+using GroupList = std::list<Held, PooledAllocator<Held>>;
+[[gnu::noinline]] void add_group(GroupList& groups) { groups.emplace_back(); }
+[[gnu::noinline]] GroupList::iterator drop_group(GroupList& groups, GroupList::iterator it) { return groups.erase(it); }
+
 // One turn for each of a group's waves: each runs until it stops, parks at a
 // barrier or yields (s_sleep, a wave waiting on something), and a barrier
 // every unfinished wave has reached is released. Says whether every wave has
@@ -12492,16 +12687,12 @@ void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_s
   // once are bounded by their waves' registers (256 waves to a thread).
   constexpr uint64_t kFirstTurn = 1 << 22, kLaterTurn = 1 << 15;
   constexpr uint64_t kMaxResidentWaves = 256;
-  struct Held {
-    Group group;
-    bool had_turn = false;
-  };
-  std::list<Held> resident;
+  GroupList resident;
   uint64_t next = begin, resident_waves = 0;
   const auto admit = [&] {
     uint32_t gx, gy, gz;
     group_at(next++, &gx, &gy, &gz);
-    resident.emplace_back();
+    add_group(resident);
     set_up_group(resident.back().group, m, d, packet, group_segment, gx, gy, gz);
     resident_waves += resident.back().group.waves.size();
   };
@@ -12512,7 +12703,7 @@ void run_groups(Machine& m, const Dispatch& d, uint64_t packet, uint64_t group_s
     for (auto it = resident.begin(); it != resident.end();) {
       if (run_round(m, it->group, it->had_turn ? kLaterTurn : kFirstTurn)) {
         resident_waves -= it->group.waves.size();
-        it = resident.erase(it);
+        it = drop_group(resident, it);
         all_waiting = false;
         continue;
       }

@@ -31,6 +31,14 @@ class DecodeCache {
   DecodeCache(const DecodeCache&) = delete;
   DecodeCache& operator=(const DecodeCache&) = delete;
 
+  // How many vector registers (rows of a wave's file, counted from v0) the instructions decoded so far can write, or a number
+  // past any file when one of them indexes registers at run time (gcn::vgpr_rows_written). A wave that ran only decoded instructions
+  // has left nothing past it, so the next wave to use its register file clears no more. The decoder raises it (gcn::decode, given
+  // vgpr_rows_cell()) before the instruction is published, so a thread that reads the instruction finds the number at least what it
+  // needs; it is never lowered.
+  std::atomic<uint32_t>* vgpr_rows_cell() { return &vgpr_rows_; }
+  uint32_t vgpr_rows() const { return vgpr_rows_.load(std::memory_order_acquire); }
+
   // The instruction at word `word` of .text, decoded by `decode` the first
   // time. Null when the word is past the end.
   template <typename Decode>
@@ -57,6 +65,7 @@ class DecodeCache {
     std::atomic<const gcn::Inst*> slots[kPage] = {};
   };
   std::vector<std::atomic<Page*>> pages_;
+  std::atomic<uint32_t> vgpr_rows_{0};
 };
 
 }  // namespace vgpu::amd
