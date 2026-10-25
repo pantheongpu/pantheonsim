@@ -1470,63 +1470,37 @@ TIER_HANDLER(h_ldsm) {
   blk.st.shared_bytes_read += 32u * 4 * nmat;
 }
 
-// IMMA, the dense integer forms (exec_mma): the 8- or 4-bit elements of A (M x K, row-major) and of B (K x 8, kept column by column so that
-// a dot product runs along contiguous elements) read out of the fragment registers as exec_mma lays them out, each product summed with the
-// accumulator in 64 bits and the result cut to 32 -- the same as a wrapping 32-bit sum -- or, under .SAT, clamped to the s32 range after every
-// 128 bits of K. The destination is written for the executing lanes.
+// IMMA, the dense integer forms (exec_mma): the 8- or 4-bit elements of A (M x K, row-major) and of B (K x 8) read out of the fragment registers
+// as exec_mma lays them out (vgpu/exec/tile_mma.hpp), each product summed with the accumulator in 32 bits (a wrapping sum is the 64-bit sum cut to
+// 32) or, under .SAT, clamped to the s32 range after every 128 bits of K, by the tile kernel (vgpu/simd/simd.hpp: tile_i32). The destination is
+// written for the executing lanes.
 TIER_HANDLER(h_imma) {
   TIER_PRELUDE
   if (op.dst == tier::kNoReg) return;   // (an RZ destination: the interpreter computes and throws it away)
   const unsigned M = op.a, K = op.b;
   const bool sa = op.aux & 1, sb = op.aux & 2, sat = op.aux & 4, four = op.aux & 8;
+  const exec::FragType ta = four ? (sa ? exec::FragType::S4 : exec::FragType::U4) : (sa ? exec::FragType::S8 : exec::FragType::U8),
+                       tb = four ? (sb ? exec::FragType::S4 : exec::FragType::U4) : (sb ? exec::FragType::S8 : exec::FragType::U8);
   const unsigned per_reg = four ? 8 : 4, a_regs = M * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = M * 8 / 32;
-  const auto elem = [&](uint32_t v, unsigned e, bool sgn) -> int16_t {
-    if (four) {
-      const unsigned x = (v >> (4 * e)) & 0xfu;
-      return sgn ? static_cast<int16_t>(static_cast<int8_t>(static_cast<uint8_t>(x << 4)) >> 4) : static_cast<int16_t>(x);
-    }
-    const unsigned x = (v >> (8 * e)) & 0xffu;
-    return sgn ? static_cast<int16_t>(static_cast<int8_t>(x)) : static_cast<int16_t>(x);
+  static const uint32_t kZeros[32] = {};
+  alignas(32) uint32_t xa[8 * 32], xb[4 * 32], xc[4 * 32], xd[4 * 32];
+  const auto load = [&](unsigned base, unsigned n, uint32_t* dst) {
+    for (unsigned i = 0; i < n; ++i) std::memcpy(dst + 32 * i, base == kRZ ? kZeros : c.R + (base + i) * 32u, 32 * sizeof(uint32_t));
   };
-  const auto word = [&](uint32_t base, unsigned i, unsigned l) -> uint32_t { return base == kRZ ? 0u : c.R[(base + i) * 32u + l]; };
-  alignas(32) int16_t A[16 * 128], Bt[8 * 128];
-  for (unsigned r = 0; r < a_regs; ++r)
-    for (unsigned l = 0; l < 32; ++l) {
-      const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8, col0 = t * per_reg + (r / 2) * (per_reg * 4);
-      const uint32_t v = word(op.s[0].off, r, l);
-      for (unsigned e = 0; e < per_reg; ++e) A[row * K + col0 + e] = elem(v, e, sa);
-    }
-  for (unsigned r = 0; r < b_regs; ++r)
-    for (unsigned l = 0; l < 32; ++l) {
-      const unsigned g = l / 4, t = l % 4, row0 = t * per_reg + r * (per_reg * 4);
-      const uint32_t v = word(op.s[1].off, r, l);
-      for (unsigned e = 0; e < per_reg; ++e) Bt[g * K + row0 + e] = elem(v, e, sb);
-    }
-  const auto cd = [](unsigned l, unsigned slot) { return (l / 4 + (slot / 2) * 8) * 8 + (l % 4) * 2 + slot % 2; };
-  int32_t C[16 * 8], D[16 * 8];
-  for (unsigned l = 0; l < 32; ++l)
-    for (unsigned s = 0; s < c_regs; ++s) C[cd(l, s)] = static_cast<int32_t>(word(op.s[2].off, s, l));
-  const unsigned block = sat ? (four ? 32u : 16u) : K;   // 128 bits of K under .SAT
-  for (unsigned i = 0; i < M; ++i)
-    for (unsigned j = 0; j < 8; ++j) {
-      const int16_t* a = A + i * K;
-      const int16_t* b = Bt + j * K;
-      if (!sat) {
-        int32_t acc = 0;
-        for (unsigned k = 0; k < K; ++k) acc += static_cast<int32_t>(a[k]) * static_cast<int32_t>(b[k]);   // (|product| < 2^16, K <= 128: no overflow)
-        D[i * 8 + j] = static_cast<int32_t>(static_cast<uint32_t>(C[i * 8 + j]) + static_cast<uint32_t>(acc));
-      } else {
-        int64_t acc = C[i * 8 + j];
-        for (unsigned k0 = 0; k0 < K; k0 += block) {
-          for (unsigned k = k0; k < k0 + block && k < K; ++k) acc += static_cast<int64_t>(a[k]) * static_cast<int64_t>(b[k]);
-          acc = std::clamp<int64_t>(acc, INT32_MIN, INT32_MAX);
-        }
-        D[i * 8 + j] = static_cast<int32_t>(acc);
-      }
-    }
+  load(op.s[0].off, a_regs, xa);
+  load(op.s[1].off, b_regs, xb);
+  load(op.s[2].off, c_regs, xc);
+  alignas(32) int32_t ia[16 * 128], ib[128 * 8], ic[16 * 8], id[16 * 8];
+  exec::mma_frag_a(ta, M, K, false, xa, nullptr, 0, nullptr, ia);
+  exec::mma_frag_b(tb, K, xb, nullptr, ib);
+  if (M == 16) exec::wgmma_acc_to_tile_i32(xc, 8, ic);
+  else exec::mma_acc8_to_tile_i32(xc, ic);
+  c.sk->tile_i32(M, 8, K, ia, ib, ic, 8, sat ? 128 / (four ? 4 : 8) : K, sat, id, 8);   // (.SAT clamps after every 128 bits of K)
+  if (M == 16) exec::wgmma_tile_to_acc_i32(id, 8, xd);
+  else exec::mma_tile_to_acc8_i32(id, xd);
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    for (unsigned s = 0; s < c_regs; ++s) c.R[(op.dst + s) * 32u + l] = static_cast<uint32_t>(D[cd(l, s)]);
+    for (unsigned s = 0; s < c_regs; ++s) c.R[(op.dst + s) * 32u + l] = xd[s * 32 + l];
   }
 }
 
