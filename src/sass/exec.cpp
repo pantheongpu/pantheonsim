@@ -1805,11 +1805,10 @@ const tier::Program* Code::tier_program() const {
       }
     }
     prog->const_index.clear();
-    prog->run.assign(count, 0);
     for (size_t i = count; i-- > 0;) {   // (the last instruction never starts a run: the loop does not take it as a straight one)
-      const tier::MOp& op = prog->ops[i];
+      tier::MOp& op = prog->ops[i];
       if (i + 1 < count && op.fn && op.straight && op.unguarded && tier::pure_register_form(op.form))
-        prog->run[i] = static_cast<uint8_t>(std::min<unsigned>(255u, 1u + prog->run[i + 1]));
+        op.run = static_cast<uint8_t>(std::min<unsigned>(255u, 1u + prog->ops[i + 1].run));
     }
     jit::attach(*prog, sm);   // (a unit for tier 2 if VGPU_JIT=1: in jit.cpp, so nothing of it is in this function)
     d.tier_owner = prog;

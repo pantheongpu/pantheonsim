@@ -175,7 +175,12 @@ struct MOp {
   bool never = false;            // @!PT: the guard is false for every lane, so it does nothing but count
   bool straight = false;         // Instr::straight
   uint8_t aux = 0;               // form-specific flags
+  // How many instructions from this one on (at most 255) the run loop can issue back to back for a whole group (Runner::tier_run_t): straight,
+  // unguarded, with a handler, and a pure register form (no memory, no scheduler, nothing that can fault), none of them the section's last. Set
+  // when the section's program is built (the analysis does not know the next instruction); 0 for an instruction that is not in such a stretch.
+  uint8_t run = 0;
 };
+static_assert(sizeof(MOp) == 96, "an op is 96 bytes: a cache line and a half, which the run loop reads one after the other");
 inline constexpr uint16_t kNoReg = 0xffff;
 
 // The tier of one code section: a MOp per instruction, and the constant rows they point at.
@@ -185,9 +190,6 @@ struct Program {
   std::map<uint32_t, uint32_t> const_index;   // value -> pool row, while the program is built
   uint16_t max_reg = 0;          // the largest MOp::maxreg: a warp whose file holds this needs no per-op check
   size_t native = 0;             // instructions with a handler
-  // run[i]: how many instructions from i on (at most 255) are ones the run loop can issue back to back for a whole group (Runner::tier_run_t):
-  // straight, unguarded, with a handler, and a pure register form (no memory, no scheduler, nothing that can fault), none of them the section's last.
-  std::vector<uint8_t> run;
   std::shared_ptr<jit::Unit> jit;   // tier 2 (VGPU_JIT=1, src/sass/jit.hpp): the regions of this section, null when there are none or the JIT is off
 };
 

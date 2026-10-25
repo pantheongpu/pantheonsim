@@ -1935,7 +1935,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       // -- the store gate (none of them is a store), the step count, the guard (none has one) and the counters -- is done for the stretch.
       // Not in tier 2's loop (its regions would be skipped over), nor while the statistics count each instruction.
       if constexpr (!Jit) {
-        unsigned k = tp.run[idx];
+        unsigned k = ops[idx].run;
         if (k > 256 - n) k = 256 - n;
         if (k >= 2 && regs_ok && group && !tier_stats_ && w.steps + k <= max_steps_) {
           w.steps += k;
