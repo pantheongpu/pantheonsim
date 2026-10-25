@@ -302,9 +302,6 @@ uint64_t sass_max_steps(uint64_t configured) {
   return v == 0 ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(v);
 }
 
-// The lanes whose program counter is `p`.
-inline Mask tier_lanes_at(const Warp& w, uint64_t p) { return exec::sasslanes::lanes_at(w.pc, p); }
-
 // ---- kernels whose blocks wait on one another (vgpu/exec/lockstep.hpp) ----------------------------
 //
 // A kernel polls global memory when it has a loop with an atomic that returns its old value, or a
@@ -407,9 +404,6 @@ bool kernel_polls(const Module& m, const CubinKernel& k) {
   std::lock_guard<std::mutex> g(m.polling_mu);
   return m.polling.emplace(k.name, found).first->second;
 }
-
-// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds.
-inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) { return exec::sasslanes::lowest_pc(w.pc, run, first); }
 
 // A kernel's Module::KernelStatics: the module's (made by the first launch of the kernel), or, for a module that load() did not make,
 // one of the launch's own in `own`.
@@ -1618,12 +1612,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   // With the tier on, a warp whose runnable lanes all stand at one address (the usual case) is found by comparing
   // the 32 addresses at once: the same lo and group the pass below finds.
   if (tier_) {
-    if (const Mask at = tier_lanes_at(w, lo); (run & ~at) == 0) {
-      group = run;
-    } else {   // diverged: the lowest address among the runnable lanes, and the lanes there
-      lo = tier_lowest_pc(w, run, lo);
-      group = tier_lanes_at(w, lo) & run;
-    }
+    group = exec::sasslanes::pick_group(w.pc, run, lo);   // (the lowest address among the runnable lanes, and the lanes there)
   } else
   for (Mask m = run; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));

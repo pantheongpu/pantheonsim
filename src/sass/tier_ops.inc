@@ -2141,16 +2141,12 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   if (!tier_chain_ || w.budget == 0 || w.yield || w.slice || w.give_way || w.ws_held || w.mactive_force) return true;
   const Mask run = w.runnable();
   if (!run) return true;
-  uint64_t lo = w.pc[std::countr_zero(run)];
-  Mask at = tier_lanes_at(w, lo);
-  if ((run & ~at) != 0) {   // diverged: the group at the lowest address, which is what step_warp picks when nothing else is asked of it
-    lo = tier_lowest_pc(w, run, lo);
-    at = tier_lanes_at(w, lo);
-  }
+  uint64_t lo;
+  const Mask next = exec::sasslanes::pick_group(w.pc, run, lo);   // the group at the lowest address, which is what step_warp picks when nothing else is asked of it
   if (lo - code.base >= 16 * static_cast<uint64_t>(count) || ((lo - code.base) & 15)) return true;
   --w.budget;
   ++w.extra;
-  group = run & at;
+  group = next;
   pick = lo;
   }
 }
