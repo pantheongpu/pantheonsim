@@ -763,9 +763,9 @@ uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
 // the call's exit too.
 template <class Body, class... A>
 CUresult traced(const char* name, Body body, A... a) {
-  std::optional<vgpu_traced::KeptArgs<A...>> kept;   // (only when somebody listens: a program nobody profiles does not copy them)
+  vgpu_traced::LazyKept<A...> kept;   // (made only when somebody listens: a program nobody profiles does not copy them)
   if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
-    kept.emplace(a...);
+    kept.make(a...);
     vgpu::profiling::note_args(kept->argv(), kept->count(), kept->sizes());
   }
   vgpu::profiling::ApiCall call(name, vgpu::profiling::Domain::Driver);

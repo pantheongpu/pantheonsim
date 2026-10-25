@@ -2301,6 +2301,16 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_capture_gate PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# Enum parameters that carry values the enum does not declare: answered with an error code, never loaded as the enum.
+if(TARGET vgpucudart AND TARGET vgpucuda)
+  add_executable(test_api_enum_args nvidia/tests/unit/test_api_enum_args.cpp)
+  target_link_libraries(test_api_enum_args PRIVATE vgpucuda vgpucudart)
+  target_link_options(test_api_enum_args PRIVATE -Wl,--no-as-needed)
+  target_include_directories(test_api_enum_args PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_api_enum_args COMMAND test_api_enum_args)
+  set_tests_properties(test_api_enum_args PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
+endif()
 # Activity records with no callback asked for, from the runtime, the driver and the CUPTI shim, loaded together.
 if(TARGET vgpucudart AND TARGET vgpucuda AND TARGET vgpucupti)
   add_executable(test_cupti_activity_flags nvidia/tests/unit/test_cupti_activity_flags.cpp)
