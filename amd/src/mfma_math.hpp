@@ -342,6 +342,22 @@ inline void mfma_tile_f(uint32_t m, uint32_t n, uint32_t k, const double* a, con
 #if defined(__x86_64__) && defined(__GNUC__)
 __attribute__((target("fma"))) inline void mfma_tile_fma_hw(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk,
                                                            const double* c, double* out) {
+  if (k == 4) {
+    // The double-precision matrix instructions' K: four terms, the fused multiply-adds one after another on one sum, written out so that
+    // the loop has no trip count to run: its few instructions were three times as slow in some positions of the code as in others.
+    for (uint32_t i = 0; i < m; ++i) {
+      const double* arow = a + size_t{i} * 4;
+      for (uint32_t j = 0; j < n; ++j) {
+        double sum = c[size_t{i} * n + j];
+        sum = __builtin_fma(bk[j], arow[0], sum);
+        sum = __builtin_fma(bk[size_t{n} + j], arow[1], sum);
+        sum = __builtin_fma(bk[size_t{2} * n + j], arow[2], sum);
+        sum = __builtin_fma(bk[size_t{3} * n + j], arow[3], sum);
+        out[size_t{i} * n + j] = sum;
+      }
+    }
+    return;
+  }
   for (uint32_t i = 0; i < m; ++i)
     for (uint32_t j = 0; j < n; ++j) {
       double sum = c[size_t{i} * n + j];

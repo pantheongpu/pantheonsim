@@ -4558,3 +4558,14 @@ and 0.97 to 1.02 elsewhere: the harness cannot see 3% on a host this loaded (loa
   `init_block` (4.4% of the SASS `launch` samples). The PTX interpreter's `setup_block` (7%) was not touched.
 * The remaining AMD `launch` profile is the stream and queue plumbing (`pthread_mutex_lock/unlock` 17%, `Publisher::refresh` 5%, the work
   queue thread hand-off), not set-up.
+
+### The f64 tile and the position of its loop (merged tree)
+
+In the merged tree (launch, memory, API pieces together) `mfma_f64` read 2.7 G cycles against the base's 2.2 G, 8% of it without
+the launch piece, with identical instructions, branches, misses and tile addresses (the tiles sit at the same places in the page whatever
+`TileBuf` is told, and moving them changed nothing). What moved was the code: `mfma_tile_fma_hw`'s inner loop, `add; vfmadd231sd (mem);
+add; cmp; jne` for K = 4 (the f64 matrix instructions' K), is five instructions of a four-trip loop, and it ran three times as slow when
+it sat across a 64-byte boundary of the code (0x...cb0 to 0x...cc3) than inside one. The loop is now written out for K = 4 (four fused
+multiply-adds one after the other on one sum, the order of the loop: bit for bit the same, the existing `a_fused_tile_gives_each_output_the_chain_of_fmas`
+fails if two are swapped), so there is no loop to be placed: `mfma_f64` 175 against the base's 218 (units of 10M cycles), `mfma_f64_4b`
+112 against 120.
