@@ -1,0 +1,7 @@
+perf stat, warp full, pinned to CPU 4, base2 build (main + VGPU_JITX knobs), VGPU_JIT=1 VGPU_JIT_THRESHOLD=10^12, JITX=32: units built, step_warp never uses them (the inlined tier loop); JITX=2: tier_run_jit with the plain loop
+JITX=32: instructions:u=1531041111 instructions:k=5243538 cycles=314462344 branches=218733135 branch-misses=309332 L1-icache-load-misses=309208 task-clock=115.77 
+JITX=2: instructions:u=1541690652 instructions:k=5167052 cycles=325355277 branches=218621105 branch-misses=306710 L1-icache-load-misses=296697 task-clock=93.55 
+JITX=32: instructions:u=1531041145 instructions:k=5218511 cycles=313939891 branches=218724439 branch-misses=306541 L1-icache-load-misses=285415 task-clock=89.77 
+JITX=2: instructions:u=1541690744 instructions:k=5154702 cycles=325772500 branches=218619785 branch-misses=309134 L1-icache-load-misses=301353 task-clock=93.43 
+JITX=32: instructions:u=1531041132 instructions:k=5189160 cycles=313526714 branches=218723936 branch-misses=308691 L1-icache-load-misses=293768 task-clock=88.79 
+JITX=2: instructions:u=1541690669 instructions:k=5194749 cycles=327360589 branches=218626551 branch-misses=312106 L1-icache-load-misses=301203 task-clock=92.49 
