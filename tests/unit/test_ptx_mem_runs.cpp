@@ -6,6 +6,7 @@
 // allocation -- is run twice, once with the fast paths and once with VGPU_FASTPATH=0, which sends every access down the lane
 // loop. The two must leave the same bytes in memory, the same values in the registers (dumped to memory), the same counters
 // (sectors, requests, bank conflicts, every field of the launch's statistics) and, where the access faults, the same error.
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -194,6 +195,9 @@ Outcome run(const std::string& body, const Shape& s, bool fast, bool uniform_out
   return o;
 }
 
+// How many launches ran to the end and how many faulted (the same way in both, but a test in which every launch faults checks little).
+int g_ran = 0, g_faulted = 0;
+
 // Both ways; everything the launch leaves behind must be the same.
 void same(const char* what, const std::string& body, const Shape& s) {
   for (bool uniform_out : {false, true}) {
@@ -202,6 +206,7 @@ void same(const char* what, const std::string& body, const Shape& s) {
                               " lanes=[" + std::to_string(s.lo) + "," + std::to_string(s.hi) + ") skip=" +
                               std::to_string(s.skip) + (uniform_out ? " (out uniform)" : "");
     if (a.error != b.error) throw vtest::Failure(where + ": error differs\n  fast:    " + a.error + "\n  general: " + b.error);
+    ++(a.error.empty() ? g_ran : g_faulted);
     if (a.in != b.in) throw vtest::Failure(where + ": the input buffer differs");
     if (a.out != b.out) throw vtest::Failure(where + ": the output buffer differs");
     if (a.regs != b.regs) throw vtest::Failure(where + ": the registers differ");
@@ -304,11 +309,56 @@ const Access kAccesses[] = {
      "@%p1 ld.u32 %r10, [%rd6+4]; @%p1 st.u32 [%rd7+4], %r10;"},
 };
 
+// Atomics: the lanes of a warp read-modify-write one after another, whichever words they name (one, a few, each its own).
+// %r11 / %rd11 are the operand (the data pattern's bits for the lane), %r12 / %rd10 the compare and exchange values.
+const Access kAtomics[] = {
+    {"add.u32", 4, "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.global.add.u32 %r10, [%rd7], %r11;",
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.shared.add.u32 %r10, [%r3], %r11;"},
+    {"red.add.u32", 4, "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 red.global.add.u32 [%rd7], %r11;",
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 red.shared.add.u32 [%r3], %r11;"},
+    {"add.f32", 4, "@%p1 ld.global.f32 %r11, [%rd6]; @%p1 atom.global.add.f32 %r10, [%rd7], %r11;",
+     "@%p1 ld.global.f32 %r11, [%rd6]; @%p1 atom.shared.add.f32 %r10, [%r3], %r11;"},
+    {"add.u64", 8, "@%p1 ld.global.u64 %rd11, [%rd6]; @%p1 atom.global.add.u64 %rd10, [%rd7], %rd11;",
+     "@%p1 ld.global.u64 %rd11, [%rd6]; @%p1 atom.shared.add.u64 %rd10, [%r3], %rd11;"},
+    {"add.f64", 8, "@%p1 ld.global.f64 %rd11, [%rd6]; @%p1 atom.global.add.f64 %rd10, [%rd7], %rd11;",
+     "@%p1 ld.global.f64 %rd11, [%rd6]; @%p1 atom.shared.add.f64 %rd10, [%r3], %rd11;"},
+    {"min.s32", 4, "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.global.min.s32 %r10, [%rd7], %r11;",
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.shared.min.s32 %r10, [%r3], %r11;"},
+    {"max.u32", 4, "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.global.max.u32 %r10, [%rd7], %r11;",
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.shared.max.u32 %r10, [%r3], %r11;"},
+    {"max.s64", 8, "@%p1 ld.global.u64 %rd11, [%rd6]; @%p1 atom.global.max.s64 %rd10, [%rd7], %rd11;",
+     "@%p1 ld.global.u64 %rd11, [%rd6]; @%p1 atom.shared.max.s64 %rd10, [%r3], %rd11;"},
+    {"and/or/xor", 4,
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.global.and.b32 %r10, [%rd7], %r11; @%p1 atom.global.or.b32 %r12, [%rd7], %r11; "
+     "@%p1 atom.global.xor.b32 %r13, [%rd7], %r11;",
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.shared.and.b32 %r10, [%r3], %r11; @%p1 atom.shared.or.b32 %r12, [%r3], %r11; "
+     "@%p1 atom.shared.xor.b32 %r13, [%r3], %r11;"},
+    {"exch.b32", 4, "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.global.exch.b32 %r10, [%rd7], %r11;",
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.shared.exch.b32 %r10, [%r3], %r11;"},
+    {"cas.b32", 4,
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 ld.global.u32 %r12, [%rd7]; @%p1 atom.global.cas.b32 %r10, [%rd7], %r12, %r11; "
+     "@%p1 atom.global.cas.b32 %r13, [%rd7], %r11, %r12;",
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 ld.shared.u32 %r12, [%r3]; @%p1 atom.shared.cas.b32 %r10, [%r3], %r12, %r11;"},
+    {"inc and dec", 4,
+     "@%p1 ld.global.u32 %r11, [%rd6]; and.b32 %r11, %r11, 15; @%p1 atom.global.inc.u32 %r10, [%rd7], %r11; "
+     "@%p1 atom.global.dec.u32 %r12, [%rd7], %r11;",
+     "@%p1 ld.global.u32 %r11, [%rd6]; and.b32 %r11, %r11, 15; @%p1 atom.shared.inc.u32 %r10, [%r3], %r11; "
+     "@%p1 atom.shared.dec.u32 %r12, [%r3], %r11;"},
+    {"add.noftz.f16x2", 4,
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.global.add.noftz.f16x2 %r10, [%rd7], %r11;",
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.shared.add.noftz.f16x2 %r10, [%r3], %r11;"},
+    {"generic add.u32", 4, "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.add.u32 %r10, [%rd7], %r11;",
+     "@%p1 ld.global.u32 %r11, [%rd6]; @%p1 atom.add.u32 %r10, [%rd7+4], %r11;"},
+};
+
 }  // namespace
 
 VTEST(global_loads_and_stores_of_a_run_match_the_lane_loop) {
   for (const Access& a : kAccesses)
     for (const Shape& s : shapes(a.elem)) same(a.name, a.body, s);
+  std::printf("  %d launches ran, %d faulted\n", g_ran, g_faulted);
+  VCHECK(g_ran > 2 * g_faulted);
+  g_ran = g_faulted = 0;
 }
 
 VTEST(shared_loads_and_stores_of_a_run_match_the_lane_loop) {
@@ -321,6 +371,9 @@ VTEST(shared_loads_and_stores_of_a_run_match_the_lane_loop) {
     Shape off_end{8192 - 16 * a.elem, a.elem, 0, kThreads, 0};   // past the end of shared memory
     same(a.name, a.sbody, off_end);
   }
+  std::printf("  %d launches ran, %d faulted\n", g_ran, g_faulted);
+  VCHECK(g_ran > 2 * g_faulted);
+  g_ran = g_faulted = 0;
 }
 
 VTEST(the_stats_of_a_run_are_the_same_both_ways_for_a_warp_of_narrow_registers_stored_and_reloaded) {
@@ -338,6 +391,31 @@ $L:
     @%p6 bra $L;
 )";
   for (const Shape& s : shapes(4)) same("a loop over one run", body, s);
+}
+
+VTEST(atomics_of_a_warp_match_the_lane_loop) {
+  for (const Access& a : kAtomics) {
+    for (const Shape& s : shapes(a.elem)) same(a.name, a.body, s);
+    // The words each lane names are few: every lane on one word, and two words.
+    same(a.name, a.body, {0, 0, 0, kThreads, 0});
+    same(a.name, a.body, {0, a.elem, 0, kThreads, 0xF0F0F0F0u});
+    // A misaligned atomic faults where the lane loop faults.
+    same(a.name, a.body, {2, a.elem, 0, kThreads, 0});
+  }
+  std::printf("  %d launches ran, %d faulted\n", g_ran, g_faulted);
+  VCHECK(g_ran > 2 * g_faulted);
+  g_ran = g_faulted = 0;
+}
+
+VTEST(atomics_on_shared_memory_match_the_lane_loop) {
+  for (const Access& a : kAtomics)
+    for (Shape s : shapes(a.elem)) {
+      s.off %= 1000;
+      same(a.name, a.sbody, s);
+    }
+  std::printf("  %d launches ran, %d faulted\n", g_ran, g_faulted);
+  VCHECK(g_ran > 2 * g_faulted);
+  g_ran = g_faulted = 0;
 }
 
 VTEST_MAIN

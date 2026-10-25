@@ -13297,21 +13297,12 @@ class Interpreter {
     // same global address at once and lose an update. The stripe lock closes
     // that, and is skipped entirely when the launch is single-threaded, where
     // the fixed order was already enough.
-    const bool lock_needed = concurrent_ && op.space != Space::Shared && op.space != Space::Local;
-    for (uint32_t lane = 0; lane < W_; ++lane)
-      if (m & (Mask{1} << lane)) {
-        uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-        std::unique_lock<std::mutex> guard;
-        if (lock_needed)
-          guard = std::unique_lock<std::mutex>(atomic_lock_for(addr));
-        ++stats_.atomics;
-        stats_.atomic_bytes += size;
+    // The value the atomic of `lane` stores, given the one it finds.
+    const auto compute_lane = [&](const uint32_t lane, const uint64_t old) -> uint64_t {
         // Masked to the *access* width, not the element width: for an f16x2
         // atomic those differ, and masking to 16 bits threw away the high
         // half of every operand before it was ever added.
         const uint64_t b = mask_to_bits(bv[lane], size * 8u);
-        // The value the atomic stores, given the one it finds.
-        auto compute = [&](const uint64_t old) -> uint64_t {
         uint64_t nv = old;
         if (op.ty.is_real() && op.ty.bits == 16) {
           // f16/bf16 atomics. The packed forms update two independent halves
@@ -13420,7 +13411,55 @@ class Interpreter {
           case AtomOp::Dec: nv = (old == 0ull || old > b) ? b : old - 1ull; break;
         }
         return mask_to_bits(nv, size * 8u);
-        };
+    };
+    const bool lock_needed = concurrent_ && op.space != Space::Shared && op.space != Space::Local;
+    // The warp's atomics on ordinary device memory in one call (MemoryManager::rmw_batch), in lane order, when nothing needs a
+    // lock: one lookup for the lot instead of one a lane. It declines, having done nothing, for whatever the lane loop below
+    // treats differently (an address that is shared, local or host memory, a misaligned one, a fault armed), and the loop runs.
+    if (fast_enabled_ && !lock_needed && (op.space == Space::Global || op.space == Space::Generic)) {
+      uint64_t addrs[kMaxWarpSize], olds[kMaxWarpSize];
+      uint32_t lane_of[kMaxWarpSize];
+      size_t cnt = 0;
+      bool ok = true;
+      for_active(m, W_, [&](uint32_t lane) {
+        const uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+        ok &= (addr & (size - 1)) == 0;
+        addrs[cnt] = addr;
+        lane_of[cnt++] = lane;
+      });
+      size_t done = 0;
+      bool in_compute = false;
+      if (ok && cnt) {
+        try {
+          if (mem_.rmw_batch(addrs, cnt, size,
+                             [&](size_t i, uint64_t old) {
+                               in_compute = true;
+                               const uint64_t nv = compute_lane(lane_of[i], old);
+                               in_compute = false;
+                               return nv;
+                             },
+                             olds, &done, /*lock_free=*/false)) {
+            stats_.atomics += cnt;
+            stats_.atomic_bytes += uint64_t{size} * cnt;
+            for (size_t i = 0; i < cnt; ++i) r[lane_of[i]] = olds[i];
+            if (!op.discards_result) write_reg(w, op.dst, m, r, size * 8u);
+            return;
+          }
+        } catch (const Error& e) {
+          if (in_compute) throw;
+          rethrow_with_context(e, ins, static_cast<int>(lane_of[done < cnt ? done : cnt - 1]));
+        }
+      }
+    }
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) {
+        uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
+        std::unique_lock<std::mutex> guard;
+        if (lock_needed)
+          guard = std::unique_lock<std::mutex>(atomic_lock_for(addr));
+        ++stats_.atomics;
+        stats_.atomic_bytes += size;
+        auto compute = [&](const uint64_t old) -> uint64_t { return compute_lane(lane, old); };
         // Memory the host maps -- managed, pinned, or shared with another
         // process through CUDA IPC -- takes the CPU's own atomic, which host
         // code and other processes' kernels respect; the stripe lock is this
