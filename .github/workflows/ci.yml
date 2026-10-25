@@ -627,8 +627,6 @@ jobs:
         #                        machine code) is nowhere on the image: not beside nvcc, not
         #                        in a pip wheel. Installing libnvjitlink-13-0 (or
         #                        nvidia-nvjitlink-cu13) turns it on.
-        #   e2e_lowprec_ptx120   no sm_120 card transcript on this branch (it has one on
-        #                        r4): "no expected files for ptx120".
         #   e2e_packed_int_forms the image's nvcc ptxas does not assemble PTX ISA 9.2's
         #                        packed integer forms for sm_120f.
         #   e2e_runtime_132      it needs a runtime shim built with the CUDA 13.2 headers
@@ -644,7 +642,7 @@ jobs:
         # them here when they are.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_sass_jit_full|bench_amd_counters|e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|amd_rocprofiler_pcsampling|amd_rvs)$'
+          RUNNER_SKIPS_OK: '^(e2e_sass_jit_full|bench_amd_counters|e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|amd_rocprofiler_pcsampling|amd_rvs)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 4 -m 2)" \
