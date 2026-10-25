@@ -458,6 +458,17 @@ std::string Engine::source(const UnitSpec& spec, bool avx2, bool residence) {
 // (process-wide: two engines in one process, as the tests have, must not make the same temporary file name)
 static std::atomic<uint64_t> g_seq{0};
 
+#ifdef VGPU_JIT_MUTANTS
+// Mutation checks (tests only, -DVGPU_JIT_MUTANTS=ON; VGPU_JIT_MUTANT=<name>, as the generator's in jit_gen.cpp): share_all_on keeps every section, share_all_off declines
+// every section, share_no_defer lets a section ask the cache before the rule has decided, cid_nocache never believes a remembered compiler identity. A test that does not fail with each of them does not test the rule.
+static bool mutant(const char* what) {
+  const char* m = std::getenv("VGPU_JIT_MUTANT");
+  return m && std::strcmp(m, what) == 0;
+}
+#else
+static constexpr bool mutant(const char*) { return false; }
+#endif
+
 struct Engine::Impl {
   std::mutex mu;
   bool cxx_resolved = false;
@@ -514,7 +525,7 @@ std::string Engine::compiler_id(std::string* why) {
                    ".txt";
       }
       std::string saved;
-      if (!idfile.empty() && read_file(idfile, saved)) {
+      if (!idfile.empty() && !mutant("cid_nocache") && read_file(idfile, saved)) {
         const std::string head = "VJCID1\n" + found + "\n";
         if (saved.size() > head.size() + 1 && saved.compare(0, head.size(), head) == 0 && saved.back() == '\n') {
           p_->cxx_id = saved.substr(head.size(), saved.size() - head.size() - 1);
@@ -1096,7 +1107,7 @@ void Unit::note(uint32_t region, uint32_t k) {
   uint64_t total = 0;
   for (size_t i = 0; i < regions.size(); ++i) total += counts[i].load(std::memory_order_relaxed);
   executed.store(total, std::memory_order_relaxed);
-  if (s == static_cast<int>(State::Idle) && total >= mgr.lookup_after && !sampling.load(std::memory_order_acquire)) {   // (the share rule decides first: a declined section asks nobody)
+  if (s == static_cast<int>(State::Idle) && total >= mgr.lookup_after && (mutant("share_no_defer") || !sampling.load(std::memory_order_acquire))) {   // (the share rule decides first: a declined section asks nobody)
     int exp = static_cast<int>(State::Idle);
     if (state.compare_exchange_strong(exp, static_cast<int>(State::Looking))) mgr.submit(Job::Lookup, shared_from_this());   // (inline in synchronous mode)
     s = state.load(std::memory_order_acquire);
@@ -1107,6 +1118,7 @@ void Unit::note(uint32_t region, uint32_t k) {
 }
 
 const ShareRule& share_rule() { return manager().share; }
+
 
 uint64_t Unit::gen_work() const {
   uint64_t w = 0;
@@ -1122,7 +1134,7 @@ void Unit::sample(uint64_t instr) {
   if (t < r.sample_after) return;
   if (!sampling.exchange(false, std::memory_order_acq_rel)) return;   // (the thread that completes the sample decides, once)
   const uint64_t gw = gen_work();
-  const bool ok = share_ok(gw, t, r);
+  const bool ok = mutant("share_all_on") ? true : mutant("share_all_off") ? false : share_ok(gw, t, r);
   if (stats_on()) std::fprintf(stderr, "jit: share rule: a section sampled over %llu warp instructions, %llu per thousand of them computed by generated code (bar %u): %s\n",
                                (unsigned long long)t, (unsigned long long)(gw * 1000 / (t ? t : 1)), r.min_share_permille, ok ? "kept" : "declined");
   if (ok) {

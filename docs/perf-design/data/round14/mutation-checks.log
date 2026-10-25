@@ -1,0 +1,41 @@
+== no mutant
+[ PASS ] jit_share_rule_arithmetic
+[ PASS ] jit_share_rule_reads_its_settings
+[ PASS ] jit_a_section_with_no_region_that_is_half_generated_never_gets_the_hook
+[ PASS ] jit_a_section_whose_regions_are_a_small_share_of_its_work_is_declined_and_asks_nobody
+[ PASS ] jit_a_section_whose_regions_are_most_of_its_work_is_kept_and_asks_after_the_sample
+[ PASS ] jit_the_cache_is_not_asked_before_the_share_rule_has_decided
+6/6 tests passed
+22/22 tests passed
+== VGPU_JIT_MUTANT=share_all_on
+[ PASS ] jit_share_rule_arithmetic
+[ PASS ] jit_share_rule_reads_its_settings
+[ PASS ] jit_a_section_with_no_region_that_is_half_generated_never_gets_the_hook
+[ FAIL ] jit_a_section_whose_regions_are_a_small_share_of_its_work_is_declined_and_asks_nobody
+/w/tests/unit/test_jit_share.cpp:133: VCHECK(u->state.load() == static_cast<int>(jit::State::Declined)) failed
+[ PASS ] jit_a_section_whose_regions_are_most_of_its_work_is_kept_and_asks_after_the_sample
+[ PASS ] jit_the_cache_is_not_asked_before_the_share_rule_has_decided
+5/6 tests passed
+== VGPU_JIT_MUTANT=share_all_off
+[ PASS ] jit_share_rule_arithmetic
+[ PASS ] jit_share_rule_reads_its_settings
+[ PASS ] jit_a_section_with_no_region_that_is_half_generated_never_gets_the_hook
+[ PASS ] jit_a_section_whose_regions_are_a_small_share_of_its_work_is_declined_and_asks_nobody
+[ FAIL ] jit_a_section_whose_regions_are_most_of_its_work_is_kept_and_asks_after_the_sample
+/w/tests/unit/test_jit_share.cpp:155: VCHECK(u->state.load() != static_cast<int>(jit::State::Declined)) failed
+[ FAIL ] jit_the_cache_is_not_asked_before_the_share_rule_has_decided
+/w/tests/unit/test_jit_share.cpp:174: VCHECK(u->state.load() != static_cast<int>(jit::State::Declined)) failed
+4/6 tests passed
+== VGPU_JIT_MUTANT=cid_nocache
+[ FAIL ] jit_the_compilers_identity_is_asked_once_and_remembered_in_the_cache_directory
+/w/tests/unit/test_jit.cpp:578: VCHECK_EQ(asked(), size_t{2}) failed
+21/22 tests passed
+== VGPU_JIT_MUTANT=share_no_defer
+[ PASS ] jit_share_rule_arithmetic
+[ PASS ] jit_share_rule_reads_its_settings
+[ PASS ] jit_a_section_with_no_region_that_is_half_generated_never_gets_the_hook
+[ PASS ] jit_a_section_whose_regions_are_a_small_share_of_its_work_is_declined_and_asks_nobody
+[ PASS ] jit_a_section_whose_regions_are_most_of_its_work_is_kept_and_asks_after_the_sample
+[ FAIL ] jit_the_cache_is_not_asked_before_the_share_rule_has_decided
+/w/tests/unit/test_jit_share.cpp:170: VCHECK(u->state.load() == static_cast<int>(jit::State::Idle)) failed
+5/6 tests passed
