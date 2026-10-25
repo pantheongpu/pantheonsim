@@ -1525,6 +1525,8 @@ endforeach()
 
 # The matrix instructions' arithmetic (half widening, dot products) against what it replaced.
 vgpu_unit_test(test_amd_mfma_math amd/tests/unit/test_mfma_math.cpp)
+# The matrix path's tile, placed in the page and resized like a vector (amd/src/tile_buf.hpp).
+vgpu_unit_test(test_amd_tile_buf amd/tests/unit/test_tile_buf.cpp)
 # The matrix instructions on the tile path against the reference path, bit for bit, over the ISA corpora.
 vgpu_unit_test(test_amd_matrix_fast amd/tests/unit/test_matrix_fast.cpp)
 target_compile_definitions(test_amd_matrix_fast PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

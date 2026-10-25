@@ -35,6 +35,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
 #include "mfma_math.hpp"
+#include "tile_buf.hpp"
 #include "nan_order.hpp"
 #ifndef SPARSE_ORDER
 #define SPARSE_ORDER 0   /* the sparse MFMA sum: which operand of the multiply and of the add a NaN takes the payload of */
@@ -321,7 +322,7 @@ struct PooledAllocator {
 // A wave's vector registers: 256 of them to begin with, and more -- up to the 1024 a gfx1250 wave may be given -- once an
 // instruction reaches past them (through s_set_vgpr_msb), which the file grows to meet. Indexed as a two-dimensional array.
 struct VgprFile {
-  // The rows are one block of memory, zeroed with a single memset (from malloc, not aligned_alloc: with the rows 64-byte aligned mfma_f64 ran 23% slower, the tile loads colliding in the L1 with other buffers; malloc's 16-byte offset is what the vector had): a vector of 256 value-initialised arrays is filled by
+  // The rows are one block of memory, zeroed with a single memset, 64-byte aligned (see TileBuf: with the rows aligned and the matrix path's tiles left to the heap, v_mfma_f64 ran 23% slower and the lane-wise SIMD loads of a row no longer split a cache line otherwise): a vector of 256 value-initialised arrays is filled by
   // copying one 256-byte row 255 times, which takes about three times as long, and every wave of every work-group pays for it.
   // A file of the usual 256 rows goes back to a per-thread pool when its wave is gone, with the number of rows that may hold
   // something (`dirty`: all of them, unless the work-group ended normally and ~Group marked fewer), and the next wave
@@ -343,7 +344,7 @@ struct VgprFile {
     Rows& operator=(const Rows& o) {
       if (this != &o) {
         Rows copy;
-        copy.p = static_cast<Row*>(std::malloc(o.n * sizeof(Row) + 1));
+        copy.p = static_cast<Row*>(std::aligned_alloc(64, o.n * sizeof(Row) + 64));
         if (!copy.p) throw std::bad_alloc();
         copy.n = copy.dirty = o.n;
         if (o.n) std::memcpy(copy.p, o.p, o.n * sizeof(Row));
@@ -373,7 +374,7 @@ struct VgprFile {
     // Grows to `count` rows, the new ones zero.
     void resize(size_t count) {
       if (count <= n) return;
-      Row* q = static_cast<Row*>(std::malloc(count * sizeof(Row)));
+      Row* q = static_cast<Row*>(std::aligned_alloc(64, count * sizeof(Row)));
       if (!q) throw std::bad_alloc();
       if (n) std::memcpy(q, p, n * sizeof(Row));
       std::memset(q + n, 0, (count - n) * sizeof(Row));
@@ -10677,7 +10678,11 @@ struct Machine {
     uint32_t b_blk[kLanes], b_col[kLanes];
     // where each lane's run of K starts in a tile of A (by row) and of B (by row of k), as floats are stored
     uint32_t a_dst[kLanes], b_dst[kLanes];
-    std::vector<double> fa, fbk, fc, fo;
+    // (Staggered in the cache: see TileBuf.)
+    TileBuf<2> fa;
+    TileBuf<3> fbk;
+    TileBuf<0> fc;
+    TileBuf<0> fo;
     std::vector<int16_t> ia, bi;
     std::vector<int32_t> io, ic;
     // The operands' values as doubles (A by row, B by column, C as it is), kept per thread between instructions.
