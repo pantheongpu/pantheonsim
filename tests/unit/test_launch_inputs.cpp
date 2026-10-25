@@ -227,8 +227,9 @@ VTEST(work_group_memory_arguments_are_checked) {
   auto huge = VCAPTURE(Error, exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out), arg_u32(0x7FFFFFFFu), arg_u32(8)}, e.mem, e.prof));
   VCHECK(huge.code() == Err::LaunchConfig);
   auto too_much = VCAPTURE(Error, exec::launch(m.entries[0], LaunchConfig{}, {arg_u64(out), arg_u32(1u << 20), arg_u32(8)}, e.mem, e.prof));
-  VCHECK(too_much.code() == Err::LaunchConfig);
-  VCHECK_CONTAINS(too_much.what(), "bytes of shared memory");
+  // (A block that big fits no multiprocessor, which the launch checks first.)
+  VCHECK(too_much.code() == Err::LaunchResources || too_much.code() == Err::LaunchConfig);
+  VCHECK_CONTAINS(too_much.what(), "shared memory");
 }
 
 // SubgroupsPerWorkgroup: the block must be exactly that many warps at the launch's width.

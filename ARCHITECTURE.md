@@ -19,7 +19,8 @@ An H100 and an H200 differ only in their profile data. Hopper and Blackwell
 differ in feature gates over the same interpreter. NVIDIA and AMD differ
 in frontend + ISA, but share the execution engine and memory model (wavefront
 width 64 is a parameter, not a rewrite: the interpreter takes a warp size of
-32 or 64 and refuses any other).
+8, 16, 32 or 64 and refuses any other; a launch may pick its own width with
+`LaunchConfig::warp_size`).
 
 ## Fidelity levels
 
@@ -41,7 +42,7 @@ own folder.
 ```
 include/vgpu/…, src/          the engine, shared by every vendor
   core/      profiles, registry, restricted-YAML, device memory, errors
-  ptx/       lexer, parser, AST
+  ptx/       lexer, parser, AST, and the AST builder (builder.hpp) that other frontends make kernels with
   exec/      SIMT interpreter, scheduler              (common CPU engine)
   runtime/   Device/Runtime facade (primary-context model)
   sass/      SASS decoder and engine, and its pre-decoded tier
@@ -66,6 +67,14 @@ amd/                          AMD GPUs and ROCm
   tools/     rocm-smi, amd-smi, rocm_agent_enumerator, characterization
   src/       the HIP runtime, HSA, ROCm SMI and AMD SMI libraries, the GCN/CDNA/RDNA engine
 ```
+
+A frontend that does not read PTX text (a SPIR-V lowering, a test) builds its kernels with
+`ptx::KernelBuilder` and `ptx::ModuleBuilder` (`include/vgpu/ptx/builder.hpp`), hands the module to
+`Device::load_built_module`, and launches through the same `Device::launch` as everything else. The builder and the
+PTX parser share one finalisation path (`finalize_function`, `finalize_module`); the one PTX-only rewrite, mul/add
+contraction, is not in the builder's. A launch picks its own warp width (`LaunchConfig::warp_size`), and may carry a
+global offset and a work dimension count (`%global_offset_*`, `%work_dim`) and work-group memory arguments
+(`ParamDecl::local_mem`): the inputs OpenCL and SPIR-V kernels expect.
 
 C++20, CMake, **zero external dependencies** (hand-rolled restricted-YAML +
 micro test framework) so a bare CI container can build it.
