@@ -584,14 +584,14 @@ struct Group {
   std::vector<uint8_t> scratch;
   uint32_t scratch_per_lane = 0;
   std::vector<Wave, PooledAllocator<Wave>> waves;
-  // The decode cache of the code the waves run, for the destructor above; null where the registers may hold anything (the debugger can
-  // write them).
-  const DecodeCache* cache = nullptr;
   uint32_t id[3] = {};   // the work-group's id, for the debugger to say
   // gfx1250's barrier unit: each named barrier's member and signal counts (1 to 16), and how many waves have signalled
   // the work-group barrier in this round.
   uint32_t nb_members[17] = {}, nb_signaled[17] = {};
   uint32_t wg_signaled = 0;
+  // The decode cache of the code the waves run, for the destructor above; null where the registers may hold anything (the debugger can
+  // write them).
+  const DecodeCache* cache = nullptr;
 };
 
 struct Machine {

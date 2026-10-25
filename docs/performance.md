@@ -4569,3 +4569,7 @@ it sat across a 64-byte boundary of the code (0x...cb0 to 0x...cc3) than inside 
 multiply-adds one after the other on one sum, the order of the loop: bit for bit the same, the existing `a_fused_tile_gives_each_output_the_chain_of_fmas`
 fails if two are swapped), so there is no loop to be placed: `mfma_f64` 175 against the base's 218 (units of 10M cycles), `mfma_f64_4b`
 112 against 120.
+
+`valu_f64` (mi300x) read 1.8% more cycles in the merged tree than the pieces without launch, from a new pointer in `Group` (`cache`, for
+the destructor that marks the register files) placed in the middle of the struct, before `id`, `nb_members` and the rest: the hot
+loop's offsets into `Group` moved and its code with them. It is the last member now, and the cycles are the base's.
