@@ -11844,6 +11844,43 @@ class Interpreter {
     }
   }
 
+  // The lane loops of the shared and local fast paths, with the element size a constant (load_bytes, store_bytes and
+  // local_load switch on it for every lane otherwise): lane l's element e is at offs[l] + e * Size.
+  template <uint32_t Size>
+  static void gather_shared(const uint8_t* sh, const uint64_t* offs, Mask m, uint32_t width, size_t n, LaneSet& got) {
+    for_active(m, width, [&](uint32_t lane) {
+      for (size_t e = 0; e < n; ++e) {
+        uint64_t v = 0;
+        std::memcpy(&v, sh + offs[lane] + e * Size, Size);
+        got[e][lane] = v;
+      }
+    });
+  }
+  template <uint32_t Size>
+  static void scatter_shared(uint8_t* sh, const uint64_t* offs, Mask m, uint32_t width, size_t n, LaneSet& vals,
+                             uint32_t bits) {
+    for_active(m, width, [&](uint32_t lane) {
+      for (size_t e = 0; e < n; ++e) {
+        const uint64_t v = mask_to_bits(vals[e][lane], bits);
+        std::memcpy(sh + offs[lane] + e * Size, &v, Size);
+      }
+    });
+  }
+  template <uint32_t Size>
+  static void gather_local(const uint8_t* buf, const uint64_t* offs, Mask m, uint32_t width, size_t n, LaneSet& got) {
+    for_active(m, width, [&](uint32_t lane) {
+      for (size_t e = 0; e < n; ++e) got[e][lane] = exec::local_load(buf, width, lane, offs[lane] + e * Size, Size);
+    });
+  }
+  template <uint32_t Size>
+  static void scatter_local(uint8_t* buf, const uint64_t* offs, Mask m, uint32_t width, size_t n, LaneSet& vals,
+                            uint32_t bits) {
+    for_active(m, width, [&](uint32_t lane) {
+      for (size_t e = 0; e < n; ++e)
+        exec::local_store(buf, width, lane, offs[lane] + e * Size, Size, mask_to_bits(vals[e][lane], bits));
+    });
+  }
+
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
     uint32_t size = op.ty.bytes();
     size_t n = op.dsts.size();
@@ -11976,9 +12013,16 @@ class Interpreter {
       if (shared_lanes_inside(ctx, base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
         const uint8_t* sh = ctx.shared->data();
         LaneSet got(n);
-        for_active(m, W_, [&](uint32_t lane) {
-          for (size_t e = 0; e < n; ++e) got[e][lane] = load_bytes(sh + offs[lane] + e * size, size);
-        });
+        switch (size) {
+          case 1: gather_shared<1>(sh, offs, m, W_, n, got); break;
+          case 2: gather_shared<2>(sh, offs, m, W_, n, got); break;
+          case 4: gather_shared<4>(sh, offs, m, W_, n, got); break;
+          case 8: gather_shared<8>(sh, offs, m, W_, n, got); break;
+          default:
+            for_active(m, W_, [&](uint32_t lane) {
+              for (size_t e = 0; e < n; ++e) got[e][lane] = load_bytes(sh + offs[lane] + e * size, size);
+            });
+        }
         for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, got[e], op.ty);
         return;
       }
@@ -11989,9 +12033,17 @@ class Interpreter {
       if (local_lanes_inside(base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
         LaneSet got(n);
         const uint8_t* buf = local_array(w);
-        for_active(m, W_, [&](uint32_t lane) {
-          for (size_t e = 0; e < n; ++e) got[e][lane] = exec::local_load(buf, W_, lane, offs[lane] + e * size, size);
-        });
+        switch (size) {
+          case 1: gather_local<1>(buf, offs, m, W_, n, got); break;
+          case 2: gather_local<2>(buf, offs, m, W_, n, got); break;
+          case 4: gather_local<4>(buf, offs, m, W_, n, got); break;
+          case 8: gather_local<8>(buf, offs, m, W_, n, got); break;
+          default:
+            for_active(m, W_, [&](uint32_t lane) {
+              for (size_t e = 0; e < n; ++e)
+                got[e][lane] = exec::local_load(buf, W_, lane, offs[lane] + e * size, size);
+            });
+        }
         for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, got[e], op.ty);
         return;
       }
@@ -12167,10 +12219,17 @@ class Interpreter {
       uint64_t offs[kMaxWarpSize];
       if (shared_lanes_inside(ctx, base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
         uint8_t* sh = ctx.shared->data();
-        for_active(m, W_, [&](uint32_t lane) {
-          for (size_t e = 0; e < n; ++e)
-            store_bytes(sh + offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
-        });
+        switch (size) {
+          case 1: scatter_shared<1>(sh, offs, m, W_, n, vals, op.ty.bits); break;
+          case 2: scatter_shared<2>(sh, offs, m, W_, n, vals, op.ty.bits); break;
+          case 4: scatter_shared<4>(sh, offs, m, W_, n, vals, op.ty.bits); break;
+          case 8: scatter_shared<8>(sh, offs, m, W_, n, vals, op.ty.bits); break;
+          default:
+            for_active(m, W_, [&](uint32_t lane) {
+              for (size_t e = 0; e < n; ++e)
+                store_bytes(sh + offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
+            });
+        }
         return;
       }
     }
@@ -12179,10 +12238,17 @@ class Interpreter {
       uint64_t offs[kMaxWarpSize];
       if (local_lanes_inside(base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
         uint8_t* buf = local_array(w);
-        for_active(m, W_, [&](uint32_t lane) {
-          for (size_t e = 0; e < n; ++e)
-            exec::local_store(buf, W_, lane, offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
-        });
+        switch (size) {
+          case 1: scatter_local<1>(buf, offs, m, W_, n, vals, op.ty.bits); break;
+          case 2: scatter_local<2>(buf, offs, m, W_, n, vals, op.ty.bits); break;
+          case 4: scatter_local<4>(buf, offs, m, W_, n, vals, op.ty.bits); break;
+          case 8: scatter_local<8>(buf, offs, m, W_, n, vals, op.ty.bits); break;
+          default:
+            for_active(m, W_, [&](uint32_t lane) {
+              for (size_t e = 0; e < n; ++e)
+                exec::local_store(buf, W_, lane, offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
+            });
+        }
         return;
       }
     }

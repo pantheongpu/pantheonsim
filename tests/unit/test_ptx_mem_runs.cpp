@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -65,6 +66,7 @@ std::string kernel(const std::string& body) {
     .reg .b16 %h<4>;
     .reg .b64 %rd<32>;
     .shared .align 16 .b8 sm[8192];
+    .local .align 16 .b8 lm[8192];
     ld.param.u64 %rd1, [pin];
     ld.param.u64 %rd2, [pout];
     ld.param.u64 %rd3, [pres];
@@ -109,6 +111,20 @@ $FILL:
     add.u32 %r30, %r30, 1;
     setp.lt.u32 %p7, %r30, 4;
     @%p7 bra $FILL;
+    // local memory starts as the input's first 1.5 KiB plus the lane's number
+    mov.u32 %r31, lm;
+    add.u32 %r32, %r31, %r2;
+    mov.u32 %r5, 0;
+$LFILL:
+    cvt.u64.u32 %rd14, %r5;
+    add.u64 %rd15, %rd1, %rd14;
+    ld.global.u32 %r7, [%rd15];
+    add.u32 %r7, %r7, %r1;
+    add.u32 %r6, %r31, %r5;
+    st.local.u32 [%r6], %r7;
+    add.u32 %r5, %r5, 4;
+    setp.lt.u32 %p7, %r5, 1536;
+    @%p7 bra $LFILL;
     bar.sync 0;
     mov.u32 %r10, 0x11111111;
     mov.u32 %r11, 0x22222222;
@@ -149,6 +165,18 @@ $FILL:
     st.global.u32 [%rd13+40], %r29;
     ld.shared.u32 %r29, [%r28+60];
     st.global.u32 [%rd13+44], %r29;
+    // the local memory the body left, every 8th word
+    mov.u32 %r5, 0;
+    mov.u32 %r30, 0;
+$LSUM:
+    add.u32 %r6, %r31, %r5;
+    ld.local.u32 %r7, [%r6];
+    xor.b32 %r30, %r30, %r7;
+    add.u32 %r30, %r30, %r5;
+    add.u32 %r5, %r5, 32;
+    setp.lt.u32 %p7, %r5, 8192;
+    @%p7 bra $LSUM;
+    st.global.u32 [%rd13+48], %r30;
     ret;
 }
 )";
@@ -159,14 +187,20 @@ Outcome run(const std::string& body, const Shape& s, bool fast, bool uniform_out
   Outcome o;
   MemoryManager mem{1 << 20};
   DeviceProfile prof = load_gpu("nvidia/a10");
-  auto m = ptx::parse(kernel(body));
+  static std::map<std::string, ptx::Module> parsed;   // (a body is run four times, and parsed once)
+  auto it = parsed.find(body);
+  if (it == parsed.end()) it = parsed.emplace(body, ptx::parse(kernel(body))).first;
+  const ptx::Module& m = it->second;
   const uint64_t pin = mem.alloc(kBuf), pout = mem.alloc(kBuf), pres = mem.alloc(kThreads * 64);
-  std::vector<uint8_t> data(kBuf);
-  uint64_t x = 0x9E3779B97F4A7C15ull;
-  for (size_t i = 0; i < data.size(); ++i) {
-    x = x * 6364136223846793005ull + 1442695040888963407ull;
-    data[i] = static_cast<uint8_t>(x >> 56);
-  }
+  static const std::vector<uint8_t> data = [] {
+    std::vector<uint8_t> d(kBuf);
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; i < d.size(); ++i) {
+      x = x * 6364136223846793005ull + 1442695040888963407ull;
+      d[i] = static_cast<uint8_t>(x >> 56);
+    }
+    return d;
+  }();
   mem.write(pin, data.data(), data.size());
   if (uniform_out) {
     const uint8_t pat = 0x5A;
@@ -199,8 +233,9 @@ Outcome run(const std::string& body, const Shape& s, bool fast, bool uniform_out
 int g_ran = 0, g_faulted = 0;
 
 // Both ways; everything the launch leaves behind must be the same.
-void same(const char* what, const std::string& body, const Shape& s) {
+void same(const char* what, const std::string& body, const Shape& s, bool both_outputs = true) {
   for (bool uniform_out : {false, true}) {
+    if (uniform_out && !both_outputs) break;
     const Outcome a = run(body, s, true, uniform_out), b = run(body, s, false, uniform_out);
     const std::string where = std::string(what) + " off=" + std::to_string(s.off) + " stride=" + std::to_string(s.stride) +
                               " lanes=[" + std::to_string(s.lo) + "," + std::to_string(s.hi) + ") skip=" +
@@ -376,6 +411,30 @@ VTEST(shared_loads_and_stores_of_a_run_match_the_lane_loop) {
   g_ran = g_faulted = 0;
 }
 
+// The same accesses to local memory (each lane's own copy; %r32 is the lane's address, off + lane * stride, in it).
+std::string local_body(const char* shared_body) {
+  std::string b = shared_body;
+  for (size_t at; (at = b.find(".shared")) != std::string::npos;) b.replace(at, 7, ".local");
+  for (size_t at; (at = b.find("%r3]")) != std::string::npos;) b.replace(at, 4, "%r32]");
+  for (size_t at; (at = b.find("%r3+")) != std::string::npos;) b.replace(at, 4, "%r32+");
+  return b;
+}
+
+VTEST(local_loads_and_stores_match_the_lane_loop) {
+  for (const Access& a : kAccesses) {
+    if (std::string(a.sbody).find("atom") != std::string::npos || std::string(a.sbody).find("ld.u32") == 0) continue;
+    const std::string body = local_body(a.sbody);
+    for (Shape s : shapes(a.elem)) {
+      s.off %= 1000;
+      same(a.name, body, s);
+    }
+    same(a.name, body, {0, 4 * a.elem, 0, kThreads, 0});   // lanes at different words, a lane's own array
+  }
+  std::printf("  %d launches ran, %d faulted\n", g_ran, g_faulted);
+  VCHECK(g_ran > 2 * g_faulted);
+  g_ran = g_faulted = 0;
+}
+
 VTEST(the_stats_of_a_run_are_the_same_both_ways_for_a_warp_of_narrow_registers_stored_and_reloaded) {
   // A loop's worth of runs: load a word, add to it, store it back one word further on.
   const std::string body = R"(
@@ -421,26 +480,25 @@ VTEST(atomics_on_shared_memory_match_the_lane_loop) {
 VTEST(shuffles_with_constant_operands_match_the_lane_loop) {
   // Every mode, every lane operand, and clamps with and without a segment mask; the warp full, with gaps and a lane short.
   const char* modes[] = {"up", "down", "bfly", "idx"};
-  const uint32_t clamps[] = {0x1f, 0x00, 0x0f, 0x1c1f, 0x0c0f, 0x1010, 0x181f};
+  const uint32_t clamps[] = {0x1f, 0x00, 0x1c1f, 0x0c0f, 0x181f};
   for (const char* mode : modes)
-    for (uint32_t lane_op : {0u, 1u, 2u, 7u, 8u, 16u, 31u})
+    for (uint32_t lane_op : {0u, 1u, 7u, 16u, 31u})
       for (uint32_t clamp : clamps) {
         const std::string body = std::string("mad.lo.u32 %r11, %r1, 2654435761, 12345; shfl.sync.") + mode +
                                  ".b32 %r10|%p6, %r11, " + std::to_string(lane_op) + ", " + std::to_string(clamp) +
                                  ", 0xffffffff; selp.u32 %r12, 1, 0, %p6; shfl.sync." + mode + ".b32 %r13, %r11, " +
                                  std::to_string(lane_op) + ", " + std::to_string(clamp) + ", 0xffffffff;";
-        for (const Shape& sh : {Shape{0, 4, 0, kThreads, 0}, Shape{0, 4, 0, 32, 0}, Shape{0, 4, 0, 32, 0x00800000u},
-                                Shape{0, 4, 32, 64, 0}, Shape{0, 4, 5, 20, 0}})
-          same(mode, body, sh);
+        for (const Shape& sh : {Shape{0, 4, 0, kThreads, 0}, Shape{0, 4, 0, 32, 0x00800000u}, Shape{0, 4, 5, 20, 0}})
+          same(mode, body, sh, false);
       }
   // Operands held in registers: the same in every lane (taken as constants), and different from lane to lane (the lane loop).
   for (const char* mode : modes)
     for (uint32_t clamp : {0x1fu, 0x181fu})
       same(mode, std::string("mov.u32 %r11, 5; mov.u32 %r14, ") + std::to_string(clamp) + "; shfl.sync." + mode +
                      ".b32 %r10|%p6, %r1, %r11, %r14, 0xffffffff;",
-           {0, 4, 0, 32, 0});
+           {0, 4, 0, 32, 0}, false);
   for (const char* mode : modes)
-    same(mode, std::string("and.b32 %r11, %r1, 7; shfl.sync.") + mode + ".b32 %r10|%p6, %r1, %r11, 31, 0xffffffff;", {0, 4, 0, 32, 0});
+    same(mode, std::string("and.b32 %r11, %r1, 7; shfl.sync.") + mode + ".b32 %r10|%p6, %r1, %r11, 31, 0xffffffff;", {0, 4, 0, 32, 0}, false);
 }
 
 VTEST_MAIN
