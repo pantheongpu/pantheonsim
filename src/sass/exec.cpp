@@ -1640,7 +1640,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
     w.code_hint = code;
   }
   if (tier_ && !w.mactive_force) {
-    if (const tier::Program* tp = code->tier_program()) return tp->jit ? tier_run_jit(blk, w, group, pick, *code, *tp) : tier_run(blk, w, group, pick, *code, *tp);
+    if (const tier::Program* tp = code->tier_program()) return (tp->jit && tp->jit->hook()) ? tier_run_jit(blk, w, group, pick, *code, *tp) : tier_run(blk, w, group, pick, *code, *tp);
   }
   const Instr* ins = &code->instr((pc - code->base) / 16);
   const uint64_t end = code->base + 16 * code->count;

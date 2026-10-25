@@ -1421,6 +1421,9 @@ target_include_directories(test_tier PRIVATE src)
 # Tier 2 (src/sass/jit.hpp), milestone 1: the generator, the cache and its verification, the failure modes, discovery, promotion.
 vgpu_unit_test(test_jit)
 target_include_directories(test_jit PRIVATE src)
+# Tier 2, round 14: the share rule (a section whose regions are a small part of its work is declined and runs on the plain loop).
+vgpu_unit_test(test_jit_share)
+target_include_directories(test_jit_share PRIVATE src)
 # Register residence of the generated code against the register-file code, on random regions (VGPU_JIT_RANDOM_UNITS=<n> for more).
 vgpu_unit_test(test_jit_resid)
 target_include_directories(test_jit_resid PRIVATE src)
