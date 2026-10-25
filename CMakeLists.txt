@@ -1268,6 +1268,8 @@ vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_check_compare)
 target_include_directories(test_check_compare PRIVATE src/cli)
 vgpu_unit_test(test_profile)
+# What every shim call does around its body: ApiCall's reports, depth and argument hand-over, the inline flags.
+vgpu_unit_test(test_profiling_api)
 # The settings file: its parser and key table (src/cli/config.cpp) need nothing from the simulator.
 vgpu_unit_test(test_config)
 target_sources(test_config PRIVATE src/cli/config.cpp)
@@ -1293,6 +1295,11 @@ vgpu_unit_test(test_fastpath)
 # nesting, several callers, fork; and the same kernels at 1, 2 and N threads.
 vgpu_unit_test(test_worker_pool)
 vgpu_unit_test(test_sched)
+# The SASS executor's atomics (vgpu/exec/sass_atomics.hpp), and its lane-state helpers and shuffle shapes (vgpu/exec/sass_lanes.hpp,
+# src/sass/tier.hpp), against the lane-by-lane code they replaced.
+vgpu_unit_test(test_sass_atomics)
+vgpu_unit_test(test_sass_lanes)
+target_include_directories(test_sass_lanes PRIVATE src)
 # The SASS executor's memory-access counting, against the straightforward version it replaced
 # (vgpu/exec/mem_counters.hpp, which both engines count with).
 vgpu_unit_test(test_sass_access_count)
@@ -1313,6 +1320,8 @@ vgpu_unit_test(test_memcount_forms)
 vgpu_unit_test(test_atom_rmw)
 # Module::code_at (a binary search over the code sections) against the scan it replaced.
 vgpu_unit_test(test_sass_code_at)
+# The SASS executor's block, kept between blocks and launches and set up again each time (Runner::init_block).
+vgpu_unit_test(test_sass_block_reuse)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.
@@ -1481,6 +1490,7 @@ target_compile_definitions(test_amd_gcn_builtins PRIVATE VGPU_SOURCE_DIR="${CMAK
 vgpu_unit_test(test_amd_gcn_packed amd/tests/unit/test_gcn_packed.cpp)
 target_compile_definitions(test_amd_gcn_packed PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
+vgpu_unit_test(test_amd_gcn_register_pool amd/tests/unit/test_gcn_register_pool.cpp)
 vgpu_unit_test(test_amd_gcn_spill amd/tests/unit/test_gcn_spill.cpp)
 target_compile_definitions(test_amd_gcn_spill PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
@@ -1529,6 +1539,8 @@ endforeach()
 
 # The matrix instructions' arithmetic (half widening, dot products) against what it replaced.
 vgpu_unit_test(test_amd_mfma_math amd/tests/unit/test_mfma_math.cpp)
+# The matrix path's tile, placed in the page and resized like a vector (amd/src/tile_buf.hpp).
+vgpu_unit_test(test_amd_tile_buf amd/tests/unit/test_tile_buf.cpp)
 # The matrix instructions on the tile path against the reference path, bit for bit, over the ISA corpora.
 vgpu_unit_test(test_amd_matrix_fast amd/tests/unit/test_matrix_fast.cpp)
 target_compile_definitions(test_amd_matrix_fast PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -1633,6 +1645,27 @@ target_include_directories(test_amd_hip_thread_refused PRIVATE tests/framework a
 add_test(NAME test_amd_hip_thread_refused COMMAND test_amd_hip_thread_refused)
 set_tests_properties(test_amd_hip_thread_refused PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "^(ok|SKIP)" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# An event recorded on a stream with nothing in it is taken on the calling thread.
+add_executable(test_amd_hip_event_inline amd/tests/unit/test_hip_event_inline.cpp)
+target_link_libraries(test_amd_hip_event_inline PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_event_inline PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_event_inline COMMAND test_amd_hip_event_inline)
+set_tests_properties(test_amd_hip_event_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# A small asynchronous copy or fill on a stream with nothing in it is done on the calling thread.
+add_executable(test_amd_hip_async_inline amd/tests/unit/test_hip_async_inline.cpp)
+target_link_libraries(test_amd_hip_async_inline PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_async_inline PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_async_inline COMMAND test_amd_hip_async_inline)
+set_tests_properties(test_amd_hip_async_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# A synchronization gives back what the stream-ordered pools keep beyond their release thresholds.
+add_executable(test_amd_hip_pool_sync amd/tests/unit/test_hip_pool_sync.cpp)
+target_link_libraries(test_amd_hip_pool_sync PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_pool_sync PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_pool_sync COMMAND test_amd_hip_pool_sync)
+set_tests_properties(test_amd_hip_pool_sync PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
 set_tests_properties(test_amd_hip_at_exit PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "ok HIP from a static destructor" FAIL_REGULAR_EXPRESSION "FAIL|ERROR: AddressSanitizer|malloc|double free|corrupted")
 set_tests_properties(test_amd_rocprofiler PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1")
@@ -2265,6 +2298,35 @@ if(TARGET vgpucudart)
   # The runtime and the driver shim each carry the simulator's core, by design; one process that loads both
   # is an ODR violation to a sanitizer build (as in nvidia/tests/e2e/run_lib_check.sh). Leak detection stays on.
   set_tests_properties(test_runtime_user_objects PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
+# The gate every allocation, copy and launch passes: refused during a capture, free of cost otherwise.
+if(TARGET vgpucudart)
+  add_executable(test_runtime_capture_gate nvidia/tests/unit/test_runtime_capture_gate.cpp)
+  target_link_libraries(test_runtime_capture_gate PRIVATE vgpucudart)
+  target_include_directories(test_runtime_capture_gate PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_runtime_capture_gate COMMAND test_runtime_capture_gate)
+  set_tests_properties(test_runtime_capture_gate PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
+# Enum parameters that carry values the enum does not declare: answered with an error code, never loaded as the enum.
+if(TARGET vgpucudart AND TARGET vgpucuda)
+  add_executable(test_api_enum_args nvidia/tests/unit/test_api_enum_args.cpp)
+  target_link_libraries(test_api_enum_args PRIVATE vgpucuda vgpucudart)
+  target_link_options(test_api_enum_args PRIVATE -Wl,--no-as-needed)
+  target_include_directories(test_api_enum_args PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_api_enum_args COMMAND test_api_enum_args)
+  set_tests_properties(test_api_enum_args PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
+endif()
+# Activity records with no callback asked for, from the runtime, the driver and the CUPTI shim, loaded together.
+if(TARGET vgpucudart AND TARGET vgpucuda AND TARGET vgpucupti)
+  add_executable(test_cupti_activity_flags nvidia/tests/unit/test_cupti_activity_flags.cpp)
+  target_link_libraries(test_cupti_activity_flags PRIVATE vgpucupti vgpucuda vgpucudart)
+  target_link_options(test_cupti_activity_flags PRIVATE -Wl,--no-as-needed)
+  target_include_directories(test_cupti_activity_flags PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cupti_activity_flags COMMAND test_cupti_activity_flags)
+  set_tests_properties(test_cupti_activity_flags PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
 # The driver's stream-ordered memory pools (cuMemPool*, cuMemAllocFromPoolAsync).

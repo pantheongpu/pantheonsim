@@ -214,6 +214,20 @@ class MemoryManager {
         const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out);
   }
 
+  // The load, `compute(old)` and a store of the result where it differs (the executors' atomics on one thread), for a word in a
+  // chunk that is real in the last allocation this thread found: one lookup for the two. Returns false, having done nothing, for
+  // any other word (an untouched or uniform chunk, another allocation, a fault armed, a host mapping in reach, a misaligned
+  // address) and the caller then makes the two calls.
+  bool rmw_if_changed_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out);
+  template <class F>
+  bool rmw_if_changed(uint64_t addr, uint32_t size, F&& compute, uint64_t* old_out) {
+    return rmw_if_changed_fn(
+        addr, size, [](void* c, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(old); },
+        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out);
+  }
+  // Whether `addr` may be in a host mapping (false is a sure no, and the usual answer: nothing is mapped near a device window).
+  bool host_map_possible(uint64_t addr) const { return host_maps_ && host_maps_->may_contain(addr); }
+
   // A lock-free atomic read-modify-write on a 4- or 8-byte naturally aligned word: `compute(old)` is applied with a
   // compare-and-swap loop on the word itself (the value it is called with is the one the swap replaces, so it is
   // called again when another thread got in between, and must be pure). Returns true with `*old_out` the value the
@@ -230,6 +244,23 @@ class MemoryManager {
     return atomic_rmw_fn(
         addr, size, [](void* c, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(old); },
         const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out, always_store);
+  }
+
+  // A wave's read-modify-writes at once: `count` accesses of `size` bytes in order, access i loading the word, `compute(i, old)` and
+  // storing the result where it differs (`lock_free`: as atomic_rmw does, a compare-and-swap on the word, for 4 and 8 bytes; else
+  // the plain load and store of rmw_if_changed), with one lookup for the lot. `olds[i]` is what access i loaded; `*done` is how many
+  // were made (all of them, or those before a store that could not get host memory and threw). Returns false, having done nothing,
+  // wherever any access could differ from the calls these stand for: a fault armed, a host mapping in reach, an address misaligned or
+  // outside the one allocation the first is in, a size that is not 1/2/4/8 (4/8 when lock_free).
+  using RmwLaneFn = uint64_t (*)(void* ctx, size_t i, uint64_t old);
+  bool rmw_batch_fn(const uint64_t* addrs, size_t count, uint32_t size, RmwLaneFn compute, void* ctx, uint64_t* olds, size_t* done,
+                    bool lock_free);
+  template <class F>
+  bool rmw_batch(const uint64_t* addrs, size_t count, uint32_t size, F&& compute, uint64_t* olds, size_t* done, bool lock_free) {
+    return rmw_batch_fn(
+        addrs, count, size,
+        [](void* c, size_t i, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(i, old); },
+        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), olds, done, lock_free);
   }
 
   // The fields of one record (a texel's channels), `n` of them end to end from `addr`, field i `sizes[i]` bytes
@@ -591,6 +622,8 @@ class MemoryManager {
     uint8_t* chunk;     // as read by rmw_locate: null, a uniform tag, or the bytes
   };
   bool rmw_locate(uint64_t addr, uint32_t size, RmwSlot* s) const;
+  // atomic_rmw's swap loop on a located slot.
+  void atomic_rmw_slot(RmwSlot& s, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out, bool always_store);
   uint64_t rmw_load(const RmwSlot& s, uint32_t size) const;
   void rmw_store(RmwSlot& s, uint32_t size, uint64_t value);
   // Whether a fault is armed that load_scalar or store_scalar would apply.
@@ -736,6 +769,12 @@ class MemoryManager {
     // below the mmap base first; if one is ever mapped there, this is set and
     // device addresses go through the range check again.
     std::atomic<bool> in_device_window{false};
+    // Whether any address from `first` to `last` (inclusive, first <= last) may_contain would not rule out: a range wholly in
+    // the device windows (one interval) is ruled out as one address is.
+    bool may_overlap(uint64_t first, uint64_t last) const {
+      if (is_device_va(first) && is_device_va(last) && !in_device_window.load(std::memory_order_relaxed)) return false;
+      return first < hi.load(std::memory_order_relaxed) && last >= lo.load(std::memory_order_relaxed);
+    }
     bool may_contain(uint64_t addr) const {
       if (is_device_va(addr) && !in_device_window.load(std::memory_order_relaxed)) return false;
       return addr >= lo.load(std::memory_order_relaxed) &&

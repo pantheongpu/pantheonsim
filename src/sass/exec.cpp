@@ -37,6 +37,8 @@
 #include <limits>
 #include <functional>
 #include <map>
+#include <memory>
+#include <new>
 #include <unordered_map>
 #include <mutex>
 #include <thread>
@@ -48,6 +50,8 @@
 #include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/mem_counters.hpp"
+#include "vgpu/exec/sass_atomics.hpp"
+#include "vgpu/exec/sass_lanes.hpp"
 #include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
@@ -174,6 +178,7 @@ struct Block {
   Cluster* cluster = nullptr;
   Cluster own;                  // the cluster when the launch has none
   std::vector<Warp> warps;
+  uint32_t live = 0;            // the block's threads that are alive and have not exited (init_block sets it, EXIT lowers it)
   uint64_t bssy_clock = 0;      // counts BSSYs, to order the warps' barriers by nesting
   std::vector<uint8_t> shared;
   std::map<std::pair<uint32_t, uint64_t>, GmmaSnapshot> gmma;   // (warpgroup, n-th MMA)
@@ -199,6 +204,37 @@ struct Block {
   std::unordered_map<uint32_t, MbarSide> mbar;
   exec::TensorMemory tmem;      // sm_100's Tensor Memory (tcgen05)
   exec::LaunchStats st;   // this block's counts, folded into the launch's
+};
+
+// A block's state, kept by the host thread between launches: the warps' register files and local memory, the shared memory and the
+// tensor memory are allocated once and reused, instead of for every launch (a launch of one warp spent a tenth of its time on
+// them). Taken for the length of a worker's run and given back, so a launch made from inside a block of another (dynamic
+// parallelism) takes one of its own. The state of a block is set again by Runner::init_block; bssy_clock, which init_block leaves
+// to count on through the blocks of a launch, starts from zero as it does in a new block.
+struct PooledBlock {
+  std::unique_ptr<Block> block;
+  PooledBlock() {
+    std::vector<std::unique_ptr<Block>>& pool = free_blocks();
+    if (pool.empty()) {
+      block = std::make_unique<Block>();
+    } else {
+      block = std::move(pool.back());
+      pool.pop_back();
+      block->bssy_clock = 0;
+    }
+  }
+  ~PooledBlock() {
+    std::vector<std::unique_ptr<Block>>& pool = free_blocks();
+    if (block && pool.size() < 4) pool.push_back(std::move(block));
+  }
+  PooledBlock(const PooledBlock&) = delete;
+  PooledBlock& operator=(const PooledBlock&) = delete;
+
+ private:
+  static std::vector<std::unique_ptr<Block>>& free_blocks() {
+    thread_local std::vector<std::unique_ptr<Block>> pool;
+    return pool;
+  }
 };
 
 struct Fault : std::exception {
@@ -227,10 +263,27 @@ uint32_t param_bytes(const CubinKernel& k) {
   return end;
 }
 
-std::mutex& atomic_lock(uint64_t addr) {
+// The lock of an address's cache line (64 stripes, the line's number folded with the page's): the atomics of one line, or of a warp's
+// 32 consecutive words, take one or two locks, not one for every 8 bytes.
+inline unsigned atomic_stripe(uint64_t addr) { return static_cast<unsigned>(((addr >> 6) ^ (addr >> 12)) & 63); }
+std::mutex& atomic_stripe_lock(unsigned stripe) {
   static std::mutex locks[64];
-  return locks[(addr >> 3) % 64];
+  return locks[stripe];
 }
+std::mutex& atomic_lock(uint64_t addr) { return atomic_stripe_lock(atomic_stripe(addr)); }
+
+// The stripe locks of a warp's atomics, held in the order they were taken and let go together (also when a lane's atomic throws).
+struct StripeLocks {
+  std::mutex* held[64];
+  unsigned n = 0;
+  void lock(std::mutex& m) {
+    m.lock();
+    held[n++] = &m;
+  }
+  ~StripeLocks() {
+    while (n) held[--n]->unlock();
+  }
+};
 
 void tier_add_total(uint64_t n);   // tier_ops.inc
 
@@ -249,22 +302,8 @@ uint64_t sass_max_steps(uint64_t configured) {
   return v == 0 ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(v);
 }
 
-// The lanes whose program counter is `p`, compared two to a vector register where SSE2 is there.
-inline Mask tier_lanes_at(const Warp& w, uint64_t p) {
-  Mask eq = 0;
-#if defined(__SSE2__)
-  const __m128i want = _mm_set1_epi64x(static_cast<long long>(p));
-  for (unsigned i = 0; i < 32; i += 2) {
-    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(&w.pc[i]));
-    const __m128i e = _mm_cmpeq_epi32(v, want);
-    const __m128i both = _mm_and_si128(e, _mm_shuffle_epi32(e, 0xB1));   // a 64-bit lane is equal when both halves are
-    eq |= static_cast<Mask>(_mm_movemask_pd(_mm_castsi128_pd(both))) << i;
-  }
-#else
-  for (unsigned i = 0; i < 32; ++i) eq |= static_cast<Mask>(w.pc[i] == p) << i;
-#endif
-  return eq;
-}
+// The lanes whose program counter is `p`.
+inline Mask tier_lanes_at(const Warp& w, uint64_t p) { return exec::sasslanes::lanes_at(w.pc, p); }
 
 // ---- kernels whose blocks wait on one another (vgpu/exec/lockstep.hpp) ----------------------------
 //
@@ -369,24 +408,41 @@ bool kernel_polls(const Module& m, const CubinKernel& k) {
   return m.polling.emplace(k.name, found).first->second;
 }
 
-// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds. With many lanes
-// running, as four independent chains over all 32 lanes, a lane that does not run counting as the largest address (an all-ones OR,
-// no branch on the lane's bit: those were mispredicted in a diverged warp); with few, the loop over just those lanes.
-inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) {
-  if (simd::popcount32(run) <= 5) {
-    uint64_t lo = first;
-    for (Mask m = run & (run - 1); m; m &= m - 1) lo = std::min(lo, w.pc[std::countr_zero(m)]);
-    return lo;
+// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds.
+inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) { return exec::sasslanes::lowest_pc(w.pc, run, first); }
+
+// A kernel's Module::KernelStatics: the module's (made by the first launch of the kernel), or, for a module that load() did not make,
+// one of the launch's own in `own`.
+std::unique_ptr<Module::KernelStatics> compute_statics(const Module& m, const CubinKernel& k) {
+  auto ks = std::make_unique<Module::KernelStatics>();
+  for (const auto& [name, va] : m.bank_va) {
+    // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
+    const size_t dot = name.find('.', 12);
+    const unsigned bank = static_cast<unsigned>(std::stoul(name.substr(12, dot == std::string::npos ? std::string::npos : dot - 12)));
+    if (dot != std::string::npos && name.substr(dot + 1) != k.name) continue;
+    if (bank >= 32) continue;   // (a bank is named by five bits of an instruction)
+    ks->bank_bound |= 1u << bank;
+    ks->bank_va[bank] = va;
+    ks->bank_size[bank] = m.cubin.section(name)->size;
   }
-  const auto pcv = [&](unsigned l) { return w.pc[l] | ((static_cast<uint64_t>((run >> l) & 1)) - 1); };
-  uint64_t a = ~uint64_t{0}, b = a, c = a, d = a;
-  for (unsigned l = 0; l < 32; l += 4) {
-    a = std::min(a, pcv(l));
-    b = std::min(b, pcv(l + 1));
-    c = std::min(c, pcv(l + 2));
-    d = std::min(d, pcv(l + 3));
-  }
-  return std::min(std::min(a, b), std::min(c, d));
+  ks->bank0_template = m.cubin.section(".nv.constant0." + k.name);
+  const auto it = m.code_index.find(k.text_section);
+  ks->entry = m.code[it->second].base;
+  return ks;
+}
+
+const Module::KernelStatics* kernel_statics(const Module& m, const CubinKernel& k, std::unique_ptr<const Module::KernelStatics>& own) {
+  const size_t index = static_cast<size_t>(&k - m.cubin.kernels.data());
+  if (!m.statics_slots || index >= m.cubin.kernels.size()) return (own = compute_statics(m, k)).get();
+  std::atomic<const Module::KernelStatics*>& slot = m.statics_slots[index];
+  if (const Module::KernelStatics* have = slot.load(std::memory_order_acquire)) return have;
+  std::unique_ptr<const Module::KernelStatics> made = compute_statics(m, k);
+  std::lock_guard<std::mutex> g(m.statics_mu);
+  if (const Module::KernelStatics* have = slot.load(std::memory_order_relaxed)) return have;
+  const Module::KernelStatics* raw = made.get();
+  m.statics_owner.push_back(std::move(made));
+  slot.store(raw, std::memory_order_release);
+  return raw;
 }
 
 class Runner {
@@ -454,17 +510,9 @@ class Runner {
       const char* tc = std::getenv("VGPU_TIER_CHAIN");
       tier_chain_ = !(tc && tc[0] == '0');
     }
+    ks_ = kernel_statics(m, k, own_statics_);
+    entry_ = ks_->entry;
     build_bank0(args);
-    for (const auto& [name, va] : m.bank_va) {
-      // ".nv.constant<N>" for the module; ".nv.constant<N>.<kernel>" for ours.
-      const size_t dot = name.find('.', 12);
-      const unsigned bank = static_cast<unsigned>(std::stoul(name.substr(12, dot == std::string::npos ? std::string::npos : dot - 12)));
-      if (dot != std::string::npos && name.substr(dot + 1) != k.name) continue;
-      bank_va_[bank] = va;
-      bank_size_[bank] = m.cubin.section(name)->size;
-    }
-    const auto it = m.code_index.find(k.text_section);
-    entry_ = m.code[it->second].base;
   }
 
   exec::LaunchStats run();
@@ -620,7 +668,8 @@ class Runner {
   bool tier_stats_ = false;
   bool tier_chain_ = true;   // VGPU_TIER_CHAIN=0: one run per call of step_warp, as the interpreter's (tier_ops.inc)
   std::vector<uint8_t> bank0_;
-  std::map<unsigned, uint64_t> bank_va_, bank_size_;
+  const Module::KernelStatics* ks_ = nullptr;
+  std::unique_ptr<const Module::KernelStatics> own_statics_;   // for a module that load() did not make
   uint64_t entry_ = 0;
   uint64_t coop_ws_ = 0;
   uint32_t local_size_ = 0;
@@ -682,7 +731,7 @@ struct ChildRunner {
 //   0x118 the global memory descriptor (64), which .E loads name
 //   param_base: the parameters, laid out as .nv.info says
 void Runner::build_bank0(const std::vector<std::vector<uint8_t>>& args) {
-  const CubinSection* tmpl = m_.cubin.section(".nv.constant0." + k_.name);
+  const CubinSection* tmpl = ks_->bank0_template;
   bank0_.assign(std::max<size_t>(tmpl ? tmpl->size : 0, k_.param_base + k_.param_size + 16), 0);
   if (tmpl && !tmpl->bytes.empty()) std::memcpy(bank0_.data(), tmpl->bytes.data(), tmpl->bytes.size());
   const auto put32 = [&](size_t off, uint32_t v) { std::memcpy(&bank0_[off], &v, 4); };
@@ -797,9 +846,8 @@ uint32_t Runner::cbank32(unsigned bank, uint64_t offset) const {
     std::memcpy(&v, &bank0_[offset], 4);
     return v;
   }
-  const auto it = bank_va_.find(bank);
-  if (it == bank_va_.end() || offset + 4 > bank_size_.at(bank)) return 0;   // unbound: reads zero
-  return static_cast<uint32_t>(mem_.load_scalar(it->second + offset, 4));
+  if (bank >= 32 || !((ks_->bank_bound >> bank) & 1) || offset + 4 > ks_->bank_size[bank]) return 0;   // unbound: reads zero
+  return static_cast<uint32_t>(mem_.load_scalar(ks_->bank_va[bank] + offset, 4));
 }
 
 // ---- fetch and operands --------------------------------------------------------
@@ -945,8 +993,7 @@ Runner::Space Runner::classify(uint64_t g, uint64_t* off) const {
   }
   if (g >= kConstWindow && g < kConstWindow + (uint64_t{1} << 32)) {
     // __constant__ data: a global address of the allocation that holds bank 3
-    const auto it = bank_va_.find(3);
-    *off = it == bank_va_.end() ? g : it->second + (g - kConstWindow);
+    *off = (ks_->bank_bound >> 3) & 1 ? ks_->bank_va[3] + (g - kConstWindow) : g;
     return Space::Global;
   }
   *off = g;
@@ -1088,7 +1135,15 @@ void Runner::init_block(Block& blk, uint64_t linear) {
   const uint32_t nregs = std::max<uint32_t>(k_.regs + 8, 16);
   for (uint32_t i = 0; i < nwarps; ++i) {
     Warp& w = blk.warps[i];
-    w = Warp{};
+    // A fresh warp, built in place: assigning a temporary copies its three kilobytes, and its register file and local memory
+    // are given back to be allocated again. The two vectors keep their memory and start empty, as a new warp's do.
+    std::vector<uint32_t> regs = std::move(w.r);
+    std::vector<uint8_t> local = std::move(w.local);
+    local.clear();
+    w.~Warp();
+    new (&w) Warp();
+    w.local = std::move(local);
+    w.r = std::move(regs);
     w.index = i;
     w.nregs = std::min<uint32_t>(nregs, 256);
     w.r.assign(static_cast<size_t>(w.nregs) * 32, 0);
@@ -1097,12 +1152,13 @@ void Runner::init_block(Block& blk, uint64_t linear) {
     w.alive = n == 32 ? kAll : ((Mask{1} << n) - 1);
     for (unsigned l = 0; l < 32; ++l) w.pc[l] = entry_;
     w.local_size = local_size_;
-    w.local.clear();   // made on the warp's first local access
+    // (the local memory is made on the warp's first local access)
   }
+  blk.live = block_threads_;
   for (Block::Barrier& b : blk.bars) b = Block::Barrier{};
   blk.mbar.clear();
   blk.gmma.clear();
-  blk.tmem = exec::TensorMemory{};
+  blk.tmem.reset();
 }
 
 exec::LaunchStats Runner::run() {
@@ -1117,12 +1173,16 @@ exec::LaunchStats Runner::run() {
   std::atomic<uint64_t>& next = next_unit_;
   std::exception_ptr failure;
   std::mutex fail_mu;
+  // A launch on one host thread has no one to wait for: nothing else sets `failure`, adds to the launch's counts or takes
+  // the locks that guard them.
+  bool solo = false;
   const auto worker = [&](unsigned t) {
-    Block blk;
+    PooledBlock held;
+    Block& blk = *held.block;
     for (;;) {
       const uint64_t i = next.fetch_add(1);
       if (i >= units) return;
-      {
+      if (!solo) {
         std::lock_guard<std::mutex> g(fail_mu);
         if (failure) return;
       }
@@ -1134,8 +1194,12 @@ exec::LaunchStats Runner::run() {
         init_block(blk, i);
         blk.worker = t;
         run_block(blk);
-        std::lock_guard<std::mutex> g(stats_mu_);
-        stats_.add(blk.st);
+        if (solo) {
+          stats_.add(blk.st);
+        } else {
+          std::lock_guard<std::mutex> g(stats_mu_);
+          stats_.add(blk.st);
+        }
       } catch (...) {
         std::lock_guard<std::mutex> g(fail_mu);
         if (!failure) failure = std::current_exception();
@@ -1241,6 +1305,7 @@ exec::LaunchStats Runner::run() {
     if (shape.workers <= 1) resident(0);
     else exec::run_parallel(shape.workers, resident);
   } else if (threads <= 1) {
+    solo = true;
     worker(0);
   } else {
     // The host threads are the pool's (vgpu/exec/worker_pool.hpp), parked between launches.

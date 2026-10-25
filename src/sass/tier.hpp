@@ -130,6 +130,7 @@ enum class Form : uint8_t {
   Match,     // MATCH.ANY / MATCH.ALL on 32 or 64 bits: ends a run, has a handler
   Ldsm,      // LDSM, the 16-bit forms (ldmatrix .M88, .MT88): ends a run, has a handler
   Imma,      // IMMA (dense, 8- or 4-bit elements into s32, plain or .SAT): ends a run, has a handler
+  Atom,      // ATOMG, ATOM, ATOMS, RED: ends a run; the handler is exec_mem, which batches a warp's atomics
   Count_,
 };
 const char* form_name(Form f);
@@ -184,6 +185,21 @@ struct Program {
   size_t native = 0;             // instructions with a handler
   std::shared_ptr<jit::Unit> jit;   // tier 2 (VGPU_JIT=1, src/sass/jit.hpp): the regions of this section, null when there are none or the JIT is off
 };
+
+// A shuffle whose lane and clamp are the same for all 32 lanes, with a full width (a segment mask of 0) and a lane under 32 -- every
+// __shfl_xor_sync/__shfl_down_sync/__shfl_up_sync/__shfl_sync with a constant or a loop's variable lane -- moves the words in one of a few
+// shapes that need no per-lane work. `in` is the in-range predicate (the same arithmetic as exec_warp's per-lane code, worked out for the
+// whole warp). None: no such shape, the per-lane code runs.
+struct ShflShape {
+  enum Kind : uint8_t { None, Ident, Splat, Butterfly, Down, Up };
+  Kind kind = None;
+  uint32_t x = 0;    // the lane (Splat), the xor mask (Butterfly) or the distance (Down, Up)
+  uint32_t in = 0;
+};
+// The shape of mode `mode` (0 idx, 1 up, 2 down, 3 bfly) with lane `b` and clamp word `cc`; kind None for any other.
+bool shfl_shape(unsigned mode, uint32_t b, uint32_t cc, ShflShape& out);
+// The shuffle `sh` of the 32 words at `src` into `out` (a full warp).
+void shfl_move(const ShflShape& sh, const uint32_t* src, uint32_t* out);
 
 // The analysis half. Fills in everything of `op` but `fn` (the executor binds handlers by `form`).
 // `sm` is the architecture the code was decoded for. Never throws on an instruction it does not take: Form::None.

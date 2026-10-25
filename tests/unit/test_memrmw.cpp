@@ -128,6 +128,28 @@ Outcome rmw_old(MemoryManager& mm, uint64_t addr, uint32_t size, int code, uint6
   });
 }
 
+// The executors' atomics on one thread store only a result that differs from what they loaded (rmw_if_changed, against the
+// two calls with the store left out when nothing changed): a chunk nothing has written stays so.
+Outcome changed_new(MemoryManager& mm, uint64_t addr, uint32_t size, int code, uint64_t b) {
+  return attempt([&](Outcome& o) {
+    uint64_t old = 0;
+    if (!mm.rmw_if_changed(addr, size, [&](uint64_t v) { return op_result(code, size, v, b); }, &old)) {
+      old = mm.load_scalar(addr, size);
+      const uint64_t now = op_result(code, size, old, b);
+      if (now != old) mm.store_scalar(addr, size, now);
+    }
+    o.v0 = old;
+  });
+}
+Outcome changed_old(MemoryManager& mm, uint64_t addr, uint32_t size, int code, uint64_t b) {
+  return attempt([&](Outcome& o) {
+    const uint64_t old = mm.load_scalar(addr, size);
+    const uint64_t now = op_result(code, size, old, b);
+    if (now != old) mm.store_scalar(addr, size, now);
+    o.v0 = old;
+  });
+}
+
 // Fields: the channels of a texel, new (load_fields, else one load_scalar each) and old (one load_scalar each).
 Outcome fields_new(const MemoryManager& mm, uint64_t addr, const uint8_t* sizes, unsigned n) {
   return attempt([&](Outcome& o) {
@@ -233,10 +255,11 @@ Stats run_random(uint64_t seed, int rounds, int fault) {
     const uint32_t sz[] = {1, 2, 4, 8};
     const uint32_t size = sz[rng.below(4)];
     if (rng.below(10) != 0) addr &= ~uint64_t{size - 1};   // mostly aligned
-    if (rng.below(2)) {
+    if (const uint64_t pick = rng.below(3); pick < 2) {
       const int code = static_cast<int>(rng.below(8));
       const uint64_t b = rng.next();
-      same("atomic", r, rmw_new(p.a, addr, size, code, b), rmw_old(p.b, addr, size, code, b));
+      if (pick == 0) same("atomic", r, rmw_new(p.a, addr, size, code, b), rmw_old(p.b, addr, size, code, b));
+      else same("atomic, stored if changed", r, changed_new(p.a, addr, size, code, b), changed_old(p.b, addr, size, code, b));
     } else {
       // A texel's channels: end to end, sizes from {0, 1, 2, 4, 8} (a 3 sometimes, which has no load).
       uint8_t fs[4];
@@ -313,6 +336,181 @@ VTEST(read_modify_write_declines_without_doing_anything) {
   VCHECK(!mm.load_fields(q, sizes, 2, v));
   mm.set_lookup_cache(true);
   VCHECK(mm.load_fields(q, sizes, 2, v));
+}
+
+VTEST(a_single_thread_atomic_stores_only_a_changed_word_and_only_in_a_real_chunk) {
+  MemoryManager mm(1ull << 28);
+  const uint64_t p = mm.alloc(2 * kChunkSize);
+  uint64_t old = 77;
+  int stores = 0;
+  const auto same = [&](uint64_t v) { return v; };
+  const auto plus = [&](uint64_t v) { return ++stores, v + 5; };
+  VCHECK(!mm.rmw_if_changed(p + 16, 4, plus, &old));   // a chunk nothing has written: the general path's
+  VCHECK_EQ(stores, 0);
+  VCHECK_EQ(mm.resident_bytes(), 0u);
+  const uint32_t seed = 9;
+  mm.write(p, &seed, 4);                                // makes the first chunk real
+  (void)mm.load_scalar(p + 16, 4);                      // (and a load leaves the allocation in the thread's lookup memory)
+  VCHECK(mm.rmw_if_changed(p + 16, 4, plus, &old));
+  VCHECK_EQ(old, 0u);
+  VCHECK_EQ(mm.load_scalar(p + 16, 4), 5u);
+  VCHECK(mm.rmw_if_changed(p + 16, 4, same, &old));
+  VCHECK_EQ(old, 5u);
+  VCHECK(!mm.rmw_if_changed(p + 18, 4, plus, &old));   // misaligned
+  VCHECK(!mm.rmw_if_changed(p + 16, 3, plus, &old));   // no such width
+  VCHECK(!mm.rmw_if_changed(p + kChunkSize + 8, 4, plus, &old));   // the second chunk is still untouched
+  VCHECK_EQ(mm.resident_bytes(), kChunkSize);
+  struct Armed : MemoryManager::AccessFault {
+    uint64_t on = 1;
+    Armed() { store_pending = &on; }
+    uint64_t on_load(uint64_t, uint32_t, uint64_t v) override { return v; }
+    uint64_t on_store(uint64_t, uint32_t, uint64_t v) override { return v; }
+    uint64_t on_shared_load(uint64_t, uint32_t, uint64_t v) override { return v; }
+    void on_read(uint64_t, uint8_t*, uint64_t) override {}
+    uint64_t on_alu(uint64_t v, uint32_t) override { return v; }
+    void on_copy(uint64_t, uint8_t*, uint64_t) override {}
+  } armed;
+  mm.set_access_fault(&armed);
+  VCHECK(!mm.rmw_if_changed(p + 16, 4, plus, &old));   // a fault armed on stores: the stores take it
+  mm.set_access_fault(nullptr);
+}
+
+namespace {
+
+// A wave's atomics as one batch (rmw_batch, with the executors' fallback of one at a time when it declines) against the same accesses one
+// at a time through load_scalar, the operation and store_scalar where the result differs: the values each loaded, what was left in
+// memory, the chunks made real, and the error (and the accesses made before it).
+struct BatchResult {
+  std::string error;
+  std::vector<uint64_t> olds;
+  bool operator==(const BatchResult& o) const { return error == o.error && olds == o.olds; }
+};
+
+BatchResult batch_new(MemoryManager& mm, const std::vector<uint64_t>& addrs, uint32_t size, int code, const std::vector<uint64_t>& b,
+                      bool lock_free, bool* batched) {
+  BatchResult r;
+  r.olds.assign(addrs.size(), 0);
+  size_t done = 0;
+  try {
+    if (mm.rmw_batch(addrs.data(), addrs.size(), size, [&](size_t i, uint64_t v) { return op_result(code, size, v, b[i]); },
+                     r.olds.data(), &done, lock_free)) {
+      *batched = true;
+      return r;
+    }
+    for (size_t i = 0; i < addrs.size(); ++i, done = i) {
+      r.olds[i] = mm.load_scalar(addrs[i], size);
+      const uint64_t now = op_result(code, size, r.olds[i], b[i]);
+      if (now != r.olds[i]) mm.store_scalar(addrs[i], size, now);
+    }
+  } catch (const Error& e) {
+    r.error = e.what();
+  } catch (const std::runtime_error& e) {
+    r.error = e.what();
+  }
+  r.olds.resize(done);
+  return r;
+}
+BatchResult batch_old(MemoryManager& mm, const std::vector<uint64_t>& addrs, uint32_t size, int code, const std::vector<uint64_t>& b) {
+  BatchResult r;
+  try {
+    for (size_t i = 0; i < addrs.size(); ++i) {
+      const uint64_t old = mm.load_scalar(addrs[i], size);
+      const uint64_t now = op_result(code, size, old, b[i]);
+      if (now != old) mm.store_scalar(addrs[i], size, now);
+      r.olds.push_back(old);
+    }
+  } catch (const Error& e) {
+    r.error = e.what();
+  } catch (const std::runtime_error& e) {
+    r.error = e.what();
+  }
+  return r;
+}
+
+uint64_t run_batches(uint64_t seed, int rounds, int fault) {
+  Pair p;
+  Faulty fa(fault), fb(fault);
+  if (fault) p.a.set_access_fault(&fa), p.b.set_access_fault(&fb);
+  Rng rng{seed};
+  const uint64_t sizes[] = {64, 4096, 65536, 2 * kChunkSize + 100};
+  uint64_t base[4];
+  uint8_t stack_byte = 0;
+  for (int k = 0; k < 4; ++k) {
+    base[k] = p.a.alloc(sizes[k]);
+    if (base[k] != p.b.alloc(sizes[k])) throw vtest::Failure("different addresses");
+    for (uint64_t off = 0; off + kChunkSize <= sizes[k]; off += kChunkSize) {
+      const uint64_t kind = rng.below(3);   // uniform, real or never written
+      if (kind == 0) {
+        const uint8_t pat[1] = {static_cast<uint8_t>(rng.below(2) ? 0xFF : 0)};
+        p.a.fill(base[k] + off, pat, 1, kChunkSize), p.b.fill(base[k] + off, pat, 1, kChunkSize);
+      } else if (kind == 1) {
+        std::vector<uint8_t> junk(300);
+        for (auto& c : junk) c = static_cast<uint8_t>(rng.below(4));   // (small values, so a CAS sometimes matches)
+        p.a.write(base[k] + off, junk.data(), junk.size()), p.b.write(base[k] + off, junk.data(), junk.size());
+      }
+    }
+  }
+  uint64_t batched = 0;
+  for (int r = 0; r < rounds; ++r) {
+    const uint32_t kSz[] = {1, 2, 4, 8};
+    const uint32_t size = kSz[rng.below(4)];
+    const size_t count = 1 + rng.below(rng.below(4) ? 64 : 5);
+    const size_t k = rng.below(4);
+    const uint64_t shape = rng.below(10);
+    std::vector<uint64_t> addrs(count), b(count);
+    for (size_t i = 0; i < count; ++i) {
+      uint64_t a;
+      switch (shape) {
+        case 0: a = base[k] + (rng.below(8) * size); break;                                    // a few words, repeated
+        case 1: a = base[k] + i * size; break;                                                 // consecutive
+        case 2: a = base[k] + rng.below(sizes[k]); break;                                      // any byte
+        case 3: a = base[k] + sizes[k] - size * rng.below(6); break;                           // on the end, and over it
+        case 4: a = base[k] + kChunkSize - size * rng.below(4); break;                         // at a chunk edge
+        case 5: a = rng.below(5) == 0 ? base[rng.below(4)] + rng.below(32) : base[k] + 8 * i; break;   // another allocation now and then
+        case 6: a = rng.below(7) == 0 ? reinterpret_cast<uint64_t>(&stack_byte) : base[k] + 4 * i; break;   // host memory
+        default: a = base[k] + (rng.below(sizes[k] / size)) * size; break;                    // random, aligned
+      }
+      if (shape != 2 && shape != 3 && rng.below(40) != 0) a &= ~uint64_t{size - 1};
+      addrs[i] = a;
+      b[i] = rng.next();
+    }
+    const int code = static_cast<int>(rng.below(rng.below(6) ? 7 : 8));
+    const bool lock_free = rng.below(2) != 0 && (size == 4 || size == 8);
+    bool was_batched = false;
+    const BatchResult x = batch_new(p.a, addrs, size, code, b, lock_free, &was_batched);
+    const BatchResult y = batch_old(p.b, addrs, size, code, b);
+    batched += was_batched;
+    if (!(x == y))
+      throw vtest::Failure("seed " + std::to_string(seed) + " round " + std::to_string(r) + ": batch {" + x.error + "} " +
+                           std::to_string(x.olds.size()) + " loaded, one at a time {" + y.error + "} " + std::to_string(y.olds.size()));
+    // (Each round, not only at the end: a store of a result that did not change makes a chunk nothing has written real.)
+    if (p.a.resident_bytes() != p.b.resident_bytes())
+      throw vtest::Failure("seed " + std::to_string(seed) + " round " + std::to_string(r) + ": chunks made real differ");
+  }
+  p.a.set_access_fault(nullptr), p.b.set_access_fault(nullptr);
+  for (int k = 0; k < 4; ++k) {
+    std::vector<uint8_t> x(sizes[k]), y(sizes[k]);
+    p.a.read(base[k], x.data(), x.size());
+    p.b.read(base[k], y.data(), y.size());
+    if (x != y) throw vtest::Failure("contents differ in allocation " + std::to_string(k) + ", seed " + std::to_string(seed));
+  }
+  if (p.a.resident_bytes() != p.b.resident_bytes())
+    throw vtest::Failure("chunks made real differ: batch " + std::to_string(p.a.resident_bytes()) + " one at a time " +
+                         std::to_string(p.b.resident_bytes()) + ", seed " + std::to_string(seed));
+  return batched;
+}
+
+}  // namespace
+
+VTEST(a_wave_of_atomics_as_a_batch_matches_the_same_accesses_one_at_a_time) {
+  uint64_t batched = 0;
+  for (uint64_t seed = 1; seed <= 60; ++seed) batched += run_batches(seed * 6151, 400, /*fault=*/0);
+  VCHECK(batched > 3000);   // the batch path was taken, not only its fallback
+}
+
+VTEST(a_wave_of_atomics_as_a_batch_declines_with_faults_armed_or_stuck_cells) {
+  for (int fault = 1; fault <= 3; ++fault)
+    for (uint64_t seed = 1; seed <= 6; ++seed) VCHECK_EQ(run_batches(seed * 977 + fault, 300, fault), 0u);
 }
 
 VTEST(concurrent_atomics_from_several_threads_add_up) {
