@@ -5,7 +5,8 @@
 // off, 4 (the matrix probe's) small finite numbers; and the tier's six, 10 and 11 NaN-free floats (11 with half the lanes off, so
 // the fast path runs rather than hands the instruction back), 12 and 13 a second wave in the work-group and loads in flight, for
 // the store gate and the waits (any bits; small integers with half the lanes off), and, for the flat and global accesses only, 14
-// and 15, which point the address registers into memory that exists, in consecutive lanes and scattered (5 to 9 do not exist).
+// and 15, which point the address registers into memory that exists, in consecutive lanes and scattered (5 to 9 do not exist), 18 and 19
+// (LDS accesses only) which give the lanes consecutive LDS addresses, all on and one run of them on, and 20 the integers' edges (carries, borrows).
 // Three seeds each (VGPU_TIER_SEEDS=n for more).
 #include <cstdint>
 #include <cstdio>
@@ -87,7 +88,7 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
       // (A branch the corpus holds goes where it was: send it elsewhere, so that taking it shows.)
       if (in.name.rfind("s_branch", 0) == 0 || in.name.rfind("s_cbranch", 0) == 0) in.target = 0x1000;
       for (uint64_t seed = 0; seed < seeds; ++seed)
-        for (uint32_t flavour = 0; flavour < 20; ++flavour) {
+        for (uint32_t flavour = 0; flavour < 21; ++flavour) {
           if (flavour >= 5 && flavour <= 9) continue;
           if (flavour == 16) continue;   // (every register zero: not a state worth running)
           if ((flavour == 14 || flavour == 15) && in.enc != amd::gcn::Enc::Flat) continue;   // (the flavours that give a global access real addresses)

@@ -222,6 +222,71 @@ TIER_D(k_dceil, r[i] = __builtin_fabs(a[i]) < 4503599627370496.0 ? __builtin_cei
 TIER_D(k_dtrunc, r[i] = __builtin_fabs(a[i]) < 4503599627370496.0 ? __builtin_trunc(a[i]) : a[i])
 TIER_D(k_drndne, r[i] = __builtin_nearbyint(a[i]))
 
+// The same three operations (add, multiply, fused multiply-add) straight on register pairs: the low and high words of each operand in their rows,
+// the result's the same, and the lanes whose result is a NaN as the bits of the return value. Lane by lane the arithmetic is the one above.
+// UM: the operands that are the same in every lane (bit k: operand k, whose value is u[k] and whose rows are not read).
+using F64RowsFn = uint64_t (*)(uint32_t* rlo, uint32_t* rhi, const uint32_t* alo, const uint32_t* ahi, const uint32_t* blo, const uint32_t* bhi,
+                               const uint32_t* clo, const uint32_t* chi, const uint64_t* u, unsigned n);
+#if TIER_AVX2
+// Eight doubles from their low and high words, as two vectors of four (lanes 0 to 3 and 4 to 7).
+static inline __attribute__((always_inline)) void load_pairs(const uint32_t* lo, const uint32_t* hi, __m256d& d0, __m256d& d1) {
+  const __m256i l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lo)), h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hi));
+  const __m256i t0 = _mm256_unpacklo_epi32(l, h), t1 = _mm256_unpackhi_epi32(l, h);
+  d0 = _mm256_castsi256_pd(_mm256_permute2x128_si256(t0, t1, 0x20));
+  d1 = _mm256_castsi256_pd(_mm256_permute2x128_si256(t0, t1, 0x31));
+}
+// ... and back: the low and the high words of eight results.
+static inline __attribute__((always_inline)) void store_pairs(uint32_t* lo, uint32_t* hi, __m256d r0, __m256d r1) {
+  const __m256 a = _mm256_castpd_ps(r0), b = _mm256_castpd_ps(r1);
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(lo), _mm256_permute4x64_epi64(_mm256_castps_si256(_mm256_shuffle_ps(a, b, 0x88)), 0xD8));
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(hi), _mm256_permute4x64_epi64(_mm256_castps_si256(_mm256_shuffle_ps(a, b, 0xDD)), 0xD8));
+}
+#endif
+template <int OP, int UM>
+static uint64_t k_f64r(uint32_t* rlo, uint32_t* rhi, const uint32_t* alo, const uint32_t* ahi, const uint32_t* blo, const uint32_t* bhi,
+                       [[maybe_unused]] const uint32_t* clo, [[maybe_unused]] const uint32_t* chi, const uint64_t* u, unsigned n) {
+  uint64_t nan = 0;
+#if TIER_AVX2
+  const __m256d ua = _mm256_set1_pd(__builtin_bit_cast(double, u[0])), ub = _mm256_set1_pd(__builtin_bit_cast(double, u[1])),
+                uc = _mm256_set1_pd(__builtin_bit_cast(double, u[2]));
+  for (unsigned i = 0; i < n; i += 8) {
+    __m256d a0 = ua, a1 = ua, b0 = ub, b1 = ub, c0 = uc, c1 = uc;
+    if constexpr (!(UM & 1)) load_pairs(alo + i, ahi + i, a0, a1);
+    if constexpr (!(UM & 2)) load_pairs(blo + i, bhi + i, b0, b1);
+    __m256d r0, r1;
+    if constexpr (OP == 0) r0 = _mm256_add_pd(a0, b0), r1 = _mm256_add_pd(a1, b1);
+    else if constexpr (OP == 1) r0 = _mm256_mul_pd(a0, b0), r1 = _mm256_mul_pd(a1, b1);
+    else {
+      if constexpr (!(UM & 4)) load_pairs(clo + i, chi + i, c0, c1);
+      r0 = _mm256_fmadd_pd(a0, b0, c0), r1 = _mm256_fmadd_pd(a1, b1, c1);
+    }
+    nan |= static_cast<uint64_t>(_mm256_movemask_pd(_mm256_cmp_pd(r0, r0, _CMP_UNORD_Q)) | _mm256_movemask_pd(_mm256_cmp_pd(r1, r1, _CMP_UNORD_Q)) << 4) << i;
+    store_pairs(rlo + i, rhi + i, r0, r1);
+  }
+#else
+  for (unsigned i = 0; i < n; ++i) {
+    const uint64_t ua = UM & 1 ? u[0] : static_cast<uint64_t>(ahi[i]) << 32 | alo[i], ub = UM & 2 ? u[1] : static_cast<uint64_t>(bhi[i]) << 32 | blo[i];
+    double a, b, c = 0, r;
+    __builtin_memcpy(&a, &ua, 8);
+    __builtin_memcpy(&b, &ub, 8);
+    if constexpr (OP == 2) {
+      const uint64_t uc = UM & 4 ? u[2] : static_cast<uint64_t>(chi[i]) << 32 | clo[i];
+      __builtin_memcpy(&c, &uc, 8);
+    }
+    if constexpr (OP == 0) r = a + b;
+    else if constexpr (OP == 1) r = a * b;
+    else r = __builtin_fma(a, b, c);
+    uint64_t ur;
+    __builtin_memcpy(&ur, &r, 8);
+    nan |= static_cast<uint64_t>(r != r) << i;
+    rlo[i] = static_cast<uint32_t>(ur), rhi[i] = static_cast<uint32_t>(ur >> 32);
+  }
+#endif
+  return nan;
+}
+#define TIER_F64R_ROW(op) k_f64r<op, 0>, k_f64r<op, 1>, k_f64r<op, 2>, k_f64r<op, 3>, k_f64r<op, 4>, k_f64r<op, 5>, k_f64r<op, 6>, k_f64r<op, 7>
+static const F64RowsFn kF64Rows[24] = {TIER_F64R_ROW(0), TIER_F64R_ROW(1), TIER_F64R_ROW(2)};   // (operation * 8 + the uniform operands)
+
 // ---- 64-bit integer lanes (gathered register pairs)
 using K64 = void (*)(uint64_t* d, const uint64_t* a, const uint64_t* b, const uint64_t* c, unsigned n);
 #define TIER_L(name, ...)                                                                                    \
@@ -339,6 +404,38 @@ static uint64_t cmp_f32(const uint32_t* ua, const uint32_t* ub, unsigned n) {
 template <int T, bool Signed>
 static uint64_t cmp_i64(const uint64_t* a, const uint64_t* b, unsigned n) {
   uint64_t out = 0;
+#if TIER_AVX2
+  if constexpr (T == 0) return 0;
+  else if constexpr (T == 7) return n == 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
+  else {
+    typedef int64_t V4l __attribute__((vector_size(32)));
+    typedef uint64_t V4ul __attribute__((vector_size(32)));
+    for (unsigned i = 0; i < n; i += 4) {
+      V4ul x, y;
+      __builtin_memcpy(&x, a + i, 32);
+      __builtin_memcpy(&y, b + i, 32);
+      V4l m;
+      if constexpr (Signed) {
+        const V4l sx = reinterpret_cast<V4l>(x), sy = reinterpret_cast<V4l>(y);
+        if constexpr (T == 1) m = sx < sy;
+        else if constexpr (T == 2) m = sx == sy;
+        else if constexpr (T == 3) m = sx <= sy;
+        else if constexpr (T == 4) m = sx > sy;
+        else if constexpr (T == 5) m = sx != sy;
+        else m = sx >= sy;
+      } else {
+        if constexpr (T == 1) m = reinterpret_cast<V4l>(x < y);
+        else if constexpr (T == 2) m = reinterpret_cast<V4l>(x == y);
+        else if constexpr (T == 3) m = reinterpret_cast<V4l>(x <= y);
+        else if constexpr (T == 4) m = reinterpret_cast<V4l>(x > y);
+        else if constexpr (T == 5) m = reinterpret_cast<V4l>(x != y);
+        else m = reinterpret_cast<V4l>(x >= y);
+      }
+      out |= static_cast<uint64_t>(_mm256_movemask_pd(reinterpret_cast<__m256d>(m))) << i;
+    }
+    return out;
+  }
+#endif
   for (unsigned i = 0; i < n; ++i) {
     bool r;
     if constexpr (Signed) {

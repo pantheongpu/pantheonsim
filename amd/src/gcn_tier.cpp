@@ -160,6 +160,7 @@ using K64 = void (*)(uint64_t*, const uint64_t*, const uint64_t*, const uint64_t
 using CmpFn = uint64_t (*)(const uint32_t*, const uint32_t*, unsigned);
 using Cmp64Fn = uint64_t (*)(const uint64_t*, const uint64_t*, unsigned);
 using Mad64Fn = uint64_t (*)(uint32_t*, uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, unsigned);
+using F64RowsFn = uint64_t (*)(uint32_t*, uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint64_t*, unsigned);
 
 struct Tables {
   const K3* ints;
@@ -179,6 +180,7 @@ struct Tables {
   CmpFn cmp_class16;
   CmpFn cmp_class16_neg;
   Mad64Fn mad_u64;
+  const F64RowsFn* f64_rows;   // add, multiply, fused multiply-add, each for the 8 sets of uniform operands
   bool avx2;   // the handlers built for AVX2 (TIER_DUAL) are the ones to use
 };
 const Tables& tables() {
@@ -186,12 +188,12 @@ const Tables& tables() {
                               base_impl::base_impl_ns::kL64Tab, base_impl::base_impl_ns::kCmpU32, base_impl::base_impl_ns::kCmpI32,
                               base_impl::base_impl_ns::kCmpF32, base_impl::base_impl_ns::kCmpU64, base_impl::base_impl_ns::kCmpI64, base_impl::base_impl_ns::kCmpF64,
                               base_impl::base_impl_ns::kCmpI16, base_impl::base_impl_ns::kCmpU16, base_impl::base_impl_ns::kCmpF16, base_impl::base_impl_ns::cmp_class_f32, base_impl::base_impl_ns::cmp_class_f16<false>,
-                              base_impl::base_impl_ns::cmp_class_f16<true>, base_impl::base_impl_ns::k_mad_u64, false};
+                              base_impl::base_impl_ns::cmp_class_f16<true>, base_impl::base_impl_ns::k_mad_u64, base_impl::base_impl_ns::kF64Rows, false};
   static const Tables avx2 = {avx2_impl::avx2_impl_ns::kIntTab, avx2_impl::avx2_impl_ns::kF32Tab, avx2_impl::avx2_impl_ns::kF64Tab,
                               avx2_impl::avx2_impl_ns::kL64Tab, avx2_impl::avx2_impl_ns::kCmpU32, avx2_impl::avx2_impl_ns::kCmpI32,
                               avx2_impl::avx2_impl_ns::kCmpF32, avx2_impl::avx2_impl_ns::kCmpU64, avx2_impl::avx2_impl_ns::kCmpI64, avx2_impl::avx2_impl_ns::kCmpF64,
                               avx2_impl::avx2_impl_ns::kCmpI16, avx2_impl::avx2_impl_ns::kCmpU16, avx2_impl::avx2_impl_ns::kCmpF16, avx2_impl::avx2_impl_ns::cmp_class_f32, avx2_impl::avx2_impl_ns::cmp_class_f16<false>,
-                              avx2_impl::avx2_impl_ns::cmp_class_f16<true>, avx2_impl::avx2_impl_ns::k_mad_u64, true};
+                              avx2_impl::avx2_impl_ns::cmp_class_f16<true>, avx2_impl::avx2_impl_ns::k_mad_u64, avx2_impl::avx2_impl_ns::kF64Rows, true};
   return simd::enabled() && simd::level() == simd::Level::Avx2 ? avx2 : base;
 }
 
@@ -226,7 +228,40 @@ const MaskTable& mask_table() {
   }
 }
 
+// A register row (32 or 64 words) copied, in vector moves of a size known here (a copy of n * 4 bytes is `rep movs` otherwise).
+[[gnu::always_inline]] inline void copy_row(uint32_t* d, const uint32_t* s, unsigned n) {
+  if (n == 64) std::memcpy(d, s, 256);
+  else std::memcpy(d, s, 128);
+}
+// Bytes copied in 32-byte moves, then the rest.
+[[gnu::always_inline]] inline void copy_bytes(void* dst, const void* src, size_t bytes) {
+  uint8_t* d = static_cast<uint8_t*>(dst);
+  const uint8_t* s = static_cast<const uint8_t*>(src);
+  for (; bytes >= 32; bytes -= 32, d += 32, s += 32) {
+    V8u v;
+    std::memcpy(&v, s, 32);
+    std::memcpy(d, &v, 32);
+  }
+  if (bytes) std::memcpy(d, s, bytes);
+}
 [[gnu::always_inline]] inline bool full(uint64_t ex, unsigned n) { return n == 64 ? ex == ~uint64_t{0} : (ex & 0xFFFFFFFFull) == 0xFFFFFFFFull; }
+// The 64-bit results r[0..n) into the register pair (lo, hi), for the lanes of `ex` (a few lanes: their own loop; more: both words of all of them
+// and a merge, which the vector units do whole).
+[[gnu::always_inline]] inline void store64(uint32_t* lo, uint32_t* hi, const uint64_t* r, uint64_t ex, unsigned n) {
+  if (full(ex, n)) {
+    for (unsigned i = 0; i < n; ++i) lo[i] = static_cast<uint32_t>(r[i]), hi[i] = static_cast<uint32_t>(r[i] >> 32);
+  } else if (__builtin_popcountll(ex) > 8) {
+    alignas(32) uint32_t rl[64], rh[64];
+    for (unsigned i = 0; i < n; ++i) rl[i] = static_cast<uint32_t>(r[i]), rh[i] = static_cast<uint32_t>(r[i] >> 32);
+    merge(lo, rl, ex, n);
+    merge(hi, rh, ex, n);
+  } else {
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+      lo[l] = static_cast<uint32_t>(r[l]), hi[l] = static_cast<uint32_t>(r[l] >> 32);
+    }
+  }
+}
 
 [[gnu::always_inline]] inline uint64_t rd(const Regs& R, const Src& s);
 [[gnu::always_inline]] inline void fill(uint32_t* t, uint32_t v, unsigned n) {
@@ -431,6 +466,55 @@ inline void post64(uint64_t* r, uint64_t ex, unsigned omod, bool clamp) {
 }
 TIER_DUAL(h_int)
 
+// A 32-bit integer operation whose sources are all vector registers (no modifiers): the kernel reads the registers' rows and, with every lane on,
+// writes the destination's row, with nothing built on the way. A partial EXEC works in a row of its own and merges (out of line, so that this
+// frame has no arrays to guard).
+[[gnu::always_inline]] inline void int_partial_body(uint32_t* d, K3 k, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex, unsigned n) {
+  alignas(32) uint32_t r[64];
+  k(r, a, b, c, n);
+  merge(d, r, ex, n);
+}
+[[gnu::noinline]] void int_partial_base(uint32_t* d, K3 k, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex, unsigned n) {
+  int_partial_body(d, k, a, b, c, ex, n);
+}
+[[gnu::noinline, gnu::target("avx2,fma,popcnt")]] void int_partial_avx2(uint32_t* d, K3 k, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex, unsigned n) {
+  int_partial_body(d, k, a, b, c, ex, n);
+}
+template <bool Avx2>
+[[gnu::always_inline]] inline int h_intv_t(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  const uint32_t* a = R.vgpr[o.src[0].index];
+  const uint32_t* b = o.src[1].kind ? R.vgpr[o.src[1].index] : a;
+  const uint32_t* c = o.src[2].kind ? R.vgpr[o.src[2].index] : a;
+  uint32_t* d = R.vgpr[o.dst.index];
+  const K3 k = reinterpret_cast<K3>(o.kern);
+  if (__builtin_expect(full(ex, n), 1)) k(d, a, b, c, n);
+  else if (Avx2) int_partial_avx2(d, k, a, b, c, ex, n);
+  else int_partial_base(d, k, a, b, c, ex, n);
+  return true;
+}
+int h_intv_base(const Op& o, Regs& R) { return h_intv_t<false>(o, R); }
+[[gnu::target("avx2,fma,popcnt")]] int h_intv_avx2(const Op& o, Regs& R) { return h_intv_t<true>(o, R); }
+
+// v_mov_b32: a row copied, or a scalar spread into the destination itself (no temporary row to build and copy).
+[[gnu::always_inline]] inline int h_mov_body(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  uint32_t* d = R.vgpr[o.dst.index];
+  if (full(ex, n)) {
+    const uint32_t* a = load32(o.src[0], R, d, n);
+    if (a != d) copy_row(d, a, n);
+  } else {
+    alignas(32) uint32_t t[64];
+    merge(d, load32(o.src[0], R, t, n), ex, n);
+  }
+  return true;
+}
+TIER_DUAL(h_mov)
+
 // ---- SDWA (an integer operation on parts of its registers)
 // The part of a 32-bit value an SDWA source names, with or without its sign (the interpreter's selected()).
 inline uint32_t sdwa_pick(uint32_t v, uint8_t sel, bool sext) {
@@ -504,7 +588,7 @@ int h_int_sdwa(const Op& o, Regs& R) {
   }
   if (o.omod | o.clamp) post32(r, ex, o.omod, o.clamp);
   uint32_t* d = R.vgpr[o.dst.index];
-  if (full(ex, n)) std::memcpy(d, r, n * 4);
+  if (full(ex, n)) copy_row(d, r, n);
   else merge(d, r, ex, n);
   return true;
 }
@@ -525,19 +609,68 @@ TIER_DUAL(h_f32)
     if (o.nan != kNanPass) fix_nan64(o.nan, r, a, b, c, ex);
   }
   if (o.omod | o.clamp) post64(r, ex, o.omod, o.clamp);
-  uint32_t* lo = R.vgpr[o.dst.index];
-  uint32_t* hi = R.vgpr[o.dst.index + 1];
+  store64(R.vgpr[o.dst.index], R.vgpr[o.dst.index + 1], r, ex, n);
+  return true;
+}
+TIER_DUAL(h_f64)
+
+// binary64 add, multiply and fused multiply-add on register pairs, without the 64-bit arrays: the lane kernel reads the pairs' rows and writes a pair of
+// rows of its own, and says which lanes came out a NaN. None of EXEC's: the rows are copied to the destination (all of them, or the lanes of EXEC);
+// one: nothing has changed, and the general handler does the instruction (which of two NaN payloads wins is its business). A source that is a scalar or
+// a constant is a value the kernel spreads itself (the kernel is the one for that set of operands); a modifier on a vector pair is built into a row of
+// the high words (bit 63 is all they touch). `kern` is a kernel of Tables::f64_rows; Op::sub is the operation.
+// The general handler for the instruction (with the kernel on 64-bit lanes that Tables::f64 has for it).
+[[gnu::noinline]] int f64_general(const Op& o, Regs& R, bool avx2);
+template <bool Avx2>
+[[gnu::always_inline]] inline int h_f64r_t(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t th[3][64], rl[64], rh[64];
+  uint64_t u[3] = {0, 0, 0};
+  const uint32_t *lo[3] = {th[0], th[1], th[2]}, *hi[3] = {th[0], th[1], th[2]};
+  for (int k = 0; k < (o.sub == 2 ? 3 : 2); ++k) {
+    const Src& s = o.src[k];
+    if (s.kind == kVgpr) {
+      if (!s.wide) return f64_general(o, R, Avx2);   // (one register, not a pair: the general handler reads it as load64 does)
+      lo[k] = R.vgpr[s.index];
+      hi[k] = R.vgpr[s.index + 1];
+      if (s.neg | s.abs) {   // (the modifiers act on bit 63)
+        const uint32_t keep = s.abs ? 0x7FFFFFFFu : ~0u, flip = s.neg ? 0x80000000u : 0u;
+        for (unsigned i = 0; i < n; ++i) th[k][i] = (hi[k][i] & keep) ^ flip;
+        hi[k] = th[k];
+      }
+    } else {
+      const uint64_t keep = s.abs ? 0x7FFFFFFFFFFFFFFFull : ~uint64_t{0}, flip = s.neg ? 0x8000000000000000ull : 0;
+      u[k] = (s.kind == kConst ? s.value64 : s.kind == kSgpr ? (s.wide ? static_cast<uint64_t>(R.sgpr[s.index + 1]) << 32 | R.sgpr[s.index] : R.sgpr[s.index]) : 0) & keep;
+      u[k] ^= s.kind == kConst || s.kind == kSgpr ? flip : 0;   // (anything else reads as zero, whatever the modifiers: load64's)
+    }
+  }
+  const uint64_t nan = reinterpret_cast<F64RowsFn>(o.kern)(rl, rh, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], u, n);
+  if (nan & ex) return f64_general(o, R, Avx2);
+  uint32_t* dlo = R.vgpr[o.dst.index];
+  uint32_t* dhi = R.vgpr[o.dst.index + 1];
   if (full(ex, n)) {
-    for (unsigned i = 0; i < n; ++i) lo[i] = static_cast<uint32_t>(r[i]), hi[i] = static_cast<uint32_t>(r[i] >> 32);
+    copy_row(dlo, rl, n);
+    copy_row(dhi, rh, n);
+  } else if (__builtin_popcountll(ex) > 8) {
+    merge(dlo, rl, ex, n);
+    merge(dhi, rh, ex, n);
   } else {
     for (uint64_t m = ex; m; m &= m - 1) {
       const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-      lo[l] = static_cast<uint32_t>(r[l]), hi[l] = static_cast<uint32_t>(r[l] >> 32);
+      dlo[l] = rl[l], dhi[l] = rh[l];
     }
   }
   return true;
 }
-TIER_DUAL(h_f64)
+int f64_general(const Op& o, Regs& R, bool avx2) {
+  Op general = o;
+  general.kern = reinterpret_cast<AnyFn>(tables().f64[o.sub == 0 ? DADD : o.sub == 1 ? DMUL : DFMA]);
+  return avx2 ? h_f64_avx2(general, R) : h_f64_base(general, R);
+}
+int h_f64r_base(const Op& o, Regs& R) { return h_f64r_t<false>(o, R); }
+[[gnu::target("avx2,fma,popcnt")]] int h_f64r_avx2(const Op& o, Regs& R) { return h_f64r_t<true>(o, R); }
 
 // A 64-bit integer operation: sources by `sub` bits (bit k set: source k is a 64-bit pair, else a 32-bit count).
 [[gnu::always_inline]] inline int h_l64_body(const Op& o, Regs& R) {
@@ -553,15 +686,40 @@ TIER_DUAL(h_f64)
     else load32_to64(*s[k], R, t[k], n);
   }
   reinterpret_cast<K64>(o.kern)(r, a, b, c, n);
-  uint32_t* lo = R.vgpr[o.dst.index];
-  uint32_t* hi = R.vgpr[o.dst.index + 1];
-  for (uint64_t m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-    lo[l] = static_cast<uint32_t>(r[l]), hi[l] = static_cast<uint32_t>(r[l] >> 32);
-  }
+  store64(R.vgpr[o.dst.index], R.vgpr[o.dst.index + 1], r, ex, n);
   return true;
 }
 TIER_DUAL(h_l64)
+
+// v_mov_b64 of a register pair (as two row copies), a scalar pair or a constant (spread into the destination's rows), or the general path.
+[[gnu::always_inline]] inline int h_mov64_body(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  uint32_t* lo = R.vgpr[o.dst.index];
+  uint32_t* hi = R.vgpr[o.dst.index + 1];
+  const Src& s = o.src[0];
+  if (full(ex, n) && !(s.neg | s.abs)) {
+    if (s.kind == kVgpr && s.wide && (s.index == o.dst.index || s.index + 1 < o.dst.index || o.dst.index + 1 < s.index)) {   // (a pair that overlaps the destination in part is read whole first, below)
+      if (s.index != o.dst.index) {
+        copy_row(lo, R.vgpr[s.index], n);
+        copy_row(hi, R.vgpr[s.index + 1], n);
+      }
+      return true;
+    }
+    if (s.kind == kConst || s.kind == kSgpr) {
+      const uint64_t v = rd(R, s);
+      fill(lo, static_cast<uint32_t>(v), n);
+      fill(hi, static_cast<uint32_t>(v >> 32), n);
+      return true;
+    }
+  }
+  alignas(32) uint64_t a[64];
+  load64(s, R, a, n);
+  store64(lo, hi, a, ex, n);
+  return true;
+}
+TIER_DUAL(h_mov64)
 
 // Packed binary32 (v_pk_add_f32, _mul_f32, _fma_f32): two floats in a register pair, each half its own arithmetic. `sub`: bit k is
 // the half of source k the low result reads (op_sel), bit 3 + k the half the high result reads (op_sel_hi), bits 6 + k and 9 + k
@@ -603,8 +761,8 @@ int h_pk(const Op& o, Regs& R) {
   uint32_t* d0 = R.vgpr[o.dst.index];
   uint32_t* d1 = R.vgpr[o.dst.index + 1];
   if (full(ex, n)) {
-    std::memcpy(d0, r[0], n * 4);
-    std::memcpy(d1, r[1], n * 4);
+    copy_row(d0, r[0], n);
+    copy_row(d1, r[1], n);
   } else {
     merge(d0, r[0], ex, n);
     merge(d1, r[1], ex, n);
@@ -623,7 +781,7 @@ int h_pkmov(const Op& o, Regs& R) {
     const Src& s = o.src[k];
     const unsigned top = o.sub >> k & 1;
     if (s.kind == kVgpr) {
-      std::memcpy(w[k], R.vgpr[s.index + top], n * 4);
+      copy_row(w[k], R.vgpr[s.index + top], n);
     } else {
       const uint32_t v = s.kind == kSgpr ? (s.wide ? R.sgpr[s.index + top] : top ? 0u : R.sgpr[s.index]) : s.value;
       fill(w[k], v, n);
@@ -632,8 +790,8 @@ int h_pkmov(const Op& o, Regs& R) {
   uint32_t* d0 = R.vgpr[o.dst.index];
   uint32_t* d1 = R.vgpr[o.dst.index + 1];
   if (full(ex, n)) {
-    std::memcpy(d0, w[0], n * 4);
-    std::memcpy(d1, w[1], n * 4);
+    copy_row(d0, w[0], n);
+    copy_row(d1, w[1], n);
   } else {
     merge(d0, w[0], ex, n);
     merge(d1, w[1], ex, n);
@@ -842,7 +1000,7 @@ int h_carry(const Op& o, Regs& R) {
     std::memcpy(r + i, &x, 32);
   }
   uint32_t* d = R.vgpr[o.dst.index];
-  if (full(ex, n)) std::memcpy(d, r, n * 4);
+  if (full(ex, n)) copy_row(d, r, n);
   else merge(d, r, ex, n);
   return true;
 }
@@ -877,7 +1035,7 @@ TIER_DUAL(h_cmp)
 int h_never(const Op&, Regs&) { return 0; }
 
 // ---- LDS
-enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm };
+enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAdd };
 [[gnu::always_inline]] inline int h_ds_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   if (o.store && *R.store_gate && ex && R.nwaves > 1) {
@@ -912,54 +1070,58 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm };
   uint8_t* lds = R.lds;
   const unsigned n = R.lanes;
   const bool all_on = full(ex, n);
-  // Every lane on and the addresses a run of consecutive words (or, for the wide forms, of consecutive groups of w words): the whole
-  // wave is one copy to or from the LDS (a wide access also moves the words between the lane-major layout of the LDS and the
-  // register rows). Only the forms whose copies cannot overlap one another (the plain read and write, and the two-offset ones when the
-  // two runs are apart: otherwise the order the lanes store in decides the bytes).
-  if (all_on && (o.sub == kDsRead || o.sub == kDsWrite || o.sub == kDsRead2 || o.sub == kDsWrite2)) {
+  // The lanes that are on a single run of consecutive lanes (all of them, or a prefix as a reduction's last steps leave), their addresses a
+  // run of consecutive words (or, for the wide forms, of consecutive groups of w words): the whole run is one copy to or from the LDS (a
+  // wide access also moves the words between the lane-major layout of the LDS and the register rows). Only the forms whose copies cannot
+  // overlap one another (the plain read and write, and the two-offset ones when the two runs are apart: otherwise the order the lanes store
+  // in decides the bytes).
+  const unsigned first = static_cast<unsigned>(__builtin_ctzll(ex));
+  const uint64_t shifted = ex >> first;
+  if ((shifted & (shifted + 1)) == 0 && (o.sub == kDsRead || o.sub == kDsWrite || o.sub == kDsRead2 || o.sub == kDsWrite2) && w <= 4) {
+    const unsigned cnt = static_cast<unsigned>(__builtin_popcountll(ex));
     const uint32_t stride = o.sub == kDsRead || o.sub == kDsWrite ? 4u * w : 4u;
-    const uint32_t base = addr[0] + x0;
+    const uint32_t base = addr[first] + x0;
     uint32_t diff = 0;
-    for (unsigned l = 0; l < n; ++l) diff |= (addr[l] + x0) ^ (base + stride * l);
+    for (unsigned l = 0; l < cnt; ++l) diff |= (addr[first + l] + x0) ^ (base + stride * l);
     const bool two = o.sub == kDsRead2 || o.sub == kDsWrite2;
     const uint32_t base1 = base + (x1 - x0);
-    const uint64_t run = uint64_t{stride} * n;
+    const uint64_t run = uint64_t{stride} * cnt;
     const bool apart = !two || (base1 > base ? base1 - base : base - base1) >= run;
-    if (!diff && apart && w <= 4) {
+    if (!diff && apart) {
       // (the run, and the second run, inside the LDS: the same test as every lane's, the addresses being consecutive and not wrapping)
       if (uint64_t{base} + run > size || (two && uint64_t{base1} + run > size)) return 0;
       switch (o.sub) {
         case kDsRead:
           if (w == 1) {
-            std::memcpy(R.vgpr[o.dst.index], lds + base, 4u * n);
+            copy_bytes(R.vgpr[o.dst.index] + first, lds + base, 4u * cnt);
           } else {
             alignas(32) uint32_t tmp[256];
-            std::memcpy(tmp, lds + base, 4u * w * n);
+            copy_bytes(tmp, lds + base, 4u * w * cnt);
             for (unsigned k = 0; k < w; ++k) {
-              uint32_t* const out = R.vgpr[o.dst.index + k];
-              for (unsigned l = 0; l < n; ++l) out[l] = tmp[w * l + k];
+              uint32_t* const out = R.vgpr[o.dst.index + k] + first;
+              for (unsigned l = 0; l < cnt; ++l) out[l] = tmp[w * l + k];
             }
           }
           return 1;
         case kDsWrite:
           if (w == 1) {
-            std::memcpy(lds + base, R.vgpr[o.src[1].index], 4u * n);
+            copy_bytes(lds + base, R.vgpr[o.src[1].index] + first, 4u * cnt);
           } else {
             alignas(32) uint32_t tmp[256];
             for (unsigned k = 0; k < w; ++k) {
-              const uint32_t* const in = R.vgpr[o.src[1].index + k];
-              for (unsigned l = 0; l < n; ++l) tmp[w * l + k] = in[l];
+              const uint32_t* const in = R.vgpr[o.src[1].index + k] + first;
+              for (unsigned l = 0; l < cnt; ++l) tmp[w * l + k] = in[l];
             }
-            std::memcpy(lds + base, tmp, 4u * w * n);
+            copy_bytes(lds + base, tmp, 4u * w * cnt);
           }
           return 1;
         case kDsRead2:
-          std::memcpy(R.vgpr[o.dst.index], lds + base, 4u * n);
-          std::memcpy(R.vgpr[o.dst.index + 1], lds + base1, 4u * n);
+          copy_bytes(R.vgpr[o.dst.index] + first, lds + base, 4u * cnt);
+          copy_bytes(R.vgpr[o.dst.index + 1] + first, lds + base1, 4u * cnt);
           return 1;
         default:
-          std::memcpy(lds + base, R.vgpr[o.src[1].index], 4u * n);
-          std::memcpy(lds + base1, R.vgpr[o.src[2].index], 4u * n);
+          copy_bytes(lds + base, R.vgpr[o.src[1].index] + first, 4u * cnt);
+          copy_bytes(lds + base1, R.vgpr[o.src[2].index] + first, 4u * cnt);
           return 1;
       }
     }
@@ -985,6 +1147,28 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm };
       }
     }
     if (past) return 0;
+  }
+  if (o.sub == kDsAdd) {   // ds_add_u32: each lane in turn adds its register to the word (lanes that share a word add one after the other)
+    const uint32_t* const in = R.vgpr[o.src[1].index];
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+      uint8_t* const p = lds + static_cast<uint32_t>(addr[l] + x0);
+      uint32_t v;
+      std::memcpy(&v, p, 4);
+      v += in[l];
+      std::memcpy(p, &v, 4);
+    }
+    return 1;
+  }
+  if (all_on && w == 1 && (o.sub == kDsRead || o.sub == kDsWrite)) {   // (every lane on, any addresses: a counted loop, no mask to walk)
+    if (o.sub == kDsRead) {
+      uint32_t* const out = R.vgpr[o.dst.index];
+      for (unsigned l = 0; l < n; ++l) std::memcpy(&out[l], lds + static_cast<uint32_t>(addr[l] + x0), 4);
+    } else {
+      const uint32_t* const in = R.vgpr[o.src[1].index];
+      for (unsigned l = 0; l < n; ++l) std::memcpy(lds + static_cast<uint32_t>(addr[l] + x0), &in[l], 4);
+    }
+    return 1;
   }
   switch (o.sub) {
     case kDsRead:
@@ -1552,6 +1736,7 @@ const std::unordered_map<std::string_view, Entry>& table() {
     m["ds_write_b96"] = {Cat::Ds, kDsWrite, 1, 0, nullptr, 3};
     m["ds_write_b128"] = {Cat::Ds, kDsWrite, 1, 0, nullptr, 4};
     m["ds_bpermute_b32"] = {Cat::Ds, kDsBperm, 1, 0, nullptr, 1};
+    m["ds_add_u32"] = {Cat::Ds, kDsAdd, 1, 0, nullptr, 1};
     m["ds_read2st64_b32"] = {Cat::Ds, kDsRead2, 1, 1, nullptr, 2};
     m["ds_write2st64_b32"] = {Cat::Ds, kDsWrite2, 1, 1, nullptr, 2};
     m["ds_read2_b32"] = {Cat::Ds, kDsRead2, 1, 0, nullptr, 2};
@@ -2014,7 +2199,10 @@ void tier_classify(Inst& in) {
         f.run = TIER_RUN(h_f32);
       } else {
         f.kern = reinterpret_cast<AnyFn>(T.ints[e.k]);
-        f.run = TIER_RUN(h_int);
+        bool rows_only = true;   // (every source a vector register as it is)
+        for (const Src& src : f.src)
+          if (src.kind && (src.kind != kVgpr || src.neg || src.abs)) rows_only = false;
+        f.run = e.k == MOV ? TIER_RUN(h_mov) : rows_only ? TIER_RUN(h_intv) : TIER_RUN(h_int);
       }
       f.unit = kUnitValu;
       return;
@@ -2031,8 +2219,18 @@ void tier_classify(Inst& in) {
       else if (e.k == DMUL) f.nan = kNanMul;
       else if (e.k == DFMA && !(e.flags & kFmac)) f.nan = kNanFma;   // (v_fmac_f64 is a plain std::fma: the interpreter's)
       else if (e.k != DFMA && e.k != DRNDNE) f.nan = kNanPass;      // (a one-input function of the host's: no second payload to choose; nearbyint's quieting is the compiler's)
-      f.kern = reinterpret_cast<AnyFn>(T.f64[e.k]);
-      f.run = TIER_RUN(h_f64);
+      if ((e.k == DADD || e.k == DMUL || e.k == DFMA) && !f.omod && !f.clamp) {   // (the pairs' rows, no 64-bit arrays)
+        const uint32_t op = e.k == DADD ? 0 : e.k == DMUL ? 1 : 2;
+        uint32_t uniform = 0;   // (the operands that are one value in every lane)
+        for (uint32_t k = 0; k < (op == 2 ? 3u : 2u); ++k)
+          if (f.src[k].kind != kVgpr) uniform |= 1u << k;
+        f.sub = op;
+        f.kern = reinterpret_cast<AnyFn>(T.f64_rows[op * 8 + uniform]);
+        f.run = TIER_RUN(h_f64r);
+      } else {
+        f.kern = reinterpret_cast<AnyFn>(T.f64[e.k]);
+        f.run = TIER_RUN(h_f64);
+      }
       f.unit = kUnitValu;
       return;
     }
@@ -2043,7 +2241,7 @@ void tier_classify(Inst& in) {
         if (!((e.sub >> k & 1) ? lane_src64(in.src[k], f.src[k], false) : lane_src32(in.src[k], f.src[k], false))) return fail();
       f.sub = e.sub;
       f.kern = reinterpret_cast<AnyFn>(T.l64[e.k]);
-      f.run = TIER_RUN(h_l64);
+      f.run = e.k == L_MOV && (e.sub & 1) ? TIER_RUN(h_mov64) : TIER_RUN(h_l64);
       f.unit = kUnitValu;
       return;
     }
@@ -2130,7 +2328,7 @@ void tier_classify(Inst& in) {
           if (in.src[k].kind != OperandKind::Vgpr || in.src[k].index + width > kVgprs || in.src[k].width != width) return;
           f.src[k].kind = kVgpr, f.src[k].index = in.src[k].index;
         }
-        f.store = true;
+        f.store = e.k != kDsAdd;   // (ds_add_u32 is not one of the stores that wait for the group's other waves)
       }
       if (e.k == kDsRead2 || e.k == kDsWrite2) {
         // (Offsets in words: the instruction's two 8-bit counts.)

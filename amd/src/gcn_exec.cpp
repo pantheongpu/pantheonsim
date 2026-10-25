@@ -13217,11 +13217,15 @@ struct Rng {
     return z ^ (z >> 31);
   }
 };
-// A 32-bit value of the flavour (16: zero): 0 any bits, 1 small, 2 a float (finite, special or tiny), 4 every byte 0x3C to 0x41: a small
+// A 32-bit value of the flavour (16: zero, 20: the integers' edges): 0 any bits, 1 small, 2 a float (finite, special or tiny), 4 every byte 0x3C to 0x41: a small
 // finite number whether the word is read as a float, a double, two halves, two bfloat16s or four 8-bit floats (no NaNs, no
 // overflow), as a real program's operands are.
 uint32_t draw(Rng& r, uint32_t flavour) {
   if (flavour == 16) return 0;   // (every register zero: a test that needs to know what an instruction's operands are)
+  if (flavour == 20) {   // (the edges of the integers: a carry, a borrow or an overflow happens at these)
+    static constexpr uint32_t kEdge[] = {0u, 1u, 2u, 0x7FFFFFFFu, 0x80000000u, 0x80000001u, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFu, 0x10000u};
+    return kEdge[r.next() % (sizeof kEdge / sizeof kEdge[0])];
+  }
   if (flavour == 4) {
     uint32_t v = 0;
     for (int b = 0; b < 4; ++b) v |= (0x3Cu + static_cast<uint32_t>(r.next() % 6)) << (8 * b);
@@ -13323,8 +13327,11 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
   }
   if ((flavour == 18 || flavour == 19) && in.enc == gcn::Enc::Ds && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
     // Flavours 18 and 19: an LDS access whose lanes' addresses are consecutive words (or, for the wide forms, consecutive groups of words)
-    // from a random start, inside the LDS, so that the tier's whole-wave copy runs instead of the per-lane loop; 19 has half the lanes off.
-    if (flavour == 19) w.exec = r.next() & all;
+    // from a random start, inside the LDS, so that the tier's whole-wave copy runs instead of the per-lane loop; 19 has one run of lanes on.
+    if (flavour == 19) {   // (one run of lanes on, from a random lane: how a reduction's last steps leave EXEC)
+      const unsigned first = static_cast<unsigned>(r.next() % w.lanes), cnt = 1 + static_cast<unsigned>(r.next() % (w.lanes - first));
+      w.exec = ((cnt == 64 ? ~uint64_t{0} : (uint64_t{1} << cnt) - 1) << first) & all;
+    }
     const uint32_t stride = in.fast.sub <= 1 ? 4u * std::max<uint32_t>(in.fast.words, 1) : 4u;
     const uint32_t start = static_cast<uint32_t>(r.next() & 0x7FFC);
     for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[in.src[0].index][lane] = start + stride * lane;

@@ -1555,9 +1555,8 @@ target_compile_definitions(test_amd_codeobject_same_bits PRIVATE VGPU_SOURCE_DIR
 # The digest tests again on the baseline x86-64 code of the AMD engine's SIMD paths (VGPU_SIMD=base keeps mfma_math.hpp and packed_math.hpp off
 # AVX2, FMA and F16C): the recorded bits are the same on every CPU the engine runs on, not only on one with those units.
 # (Not under ThreadSanitizer, where it would only repeat the same checks twenty times slower.)
-# There is no test_amd_gcn_tier_same_bits twin: VGPU_SIMD=base is read only by amd_simd_cap.hpp, which only mfma_math.hpp and
-# packed_math.hpp use and only gcn_exec.cpp includes; gcn_tier.cpp includes neither, so the twin could only change the interpreter
-# arm, which the twins below already check against the same digests.
+# The tier's twin (test_amd_gcn_tier_same_bits_simd_base) picks the baseline x86-64 build of the tier's lane kernels and handlers
+# (gcn_tier.cpp reads VGPU_SIMD through simd::level(), as amd_simd_cap.hpp does): the same bits as the AVX2 build, on the CPUs without it.
 # Under AddressSanitizer the two heaviest twins (test_amd_matrix_fast, test_amd_gcn_same_bits, about 1200 s there) are left out as
 # well: the SIMD headers' baseline code is still run instrumented by the direct twins (mfma_math, packed_math, packed_same_bits),
 # and the full-executor twins run in the plain build on every pull request.
@@ -1566,6 +1565,7 @@ if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize=thread")
   if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize=[a-z,]*address")
     list(APPEND _simd_base_tests test_amd_gcn_same_bits test_amd_matrix_fast)
   endif()
+  list(APPEND _simd_base_tests test_amd_gcn_tier_same_bits)
   foreach(_t ${_simd_base_tests})
     add_test(NAME ${_t}_simd_base COMMAND ${_t})
     set_tests_properties(${_t}_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base" TIMEOUT 1500)
