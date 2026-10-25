@@ -159,6 +159,7 @@ using K3 = void (*)(uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*
 using K64 = void (*)(uint64_t*, const uint64_t*, const uint64_t*, const uint64_t*, unsigned);
 using CmpFn = uint64_t (*)(const uint32_t*, const uint32_t*, unsigned);
 using Cmp64Fn = uint64_t (*)(const uint64_t*, const uint64_t*, unsigned);
+using Mad64Fn = uint64_t (*)(uint32_t*, uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, unsigned);
 
 struct Tables {
   const K3* ints;
@@ -177,18 +178,19 @@ struct Tables {
   CmpFn cmp_class32;
   CmpFn cmp_class16;
   CmpFn cmp_class16_neg;
+  Mad64Fn mad_u64;
 };
 const Tables& tables() {
   static const Tables base = {base_impl::base_impl_ns::kIntTab, base_impl::base_impl_ns::kF32Tab, base_impl::base_impl_ns::kF64Tab,
                               base_impl::base_impl_ns::kL64Tab, base_impl::base_impl_ns::kCmpU32, base_impl::base_impl_ns::kCmpI32,
                               base_impl::base_impl_ns::kCmpF32, base_impl::base_impl_ns::kCmpU64, base_impl::base_impl_ns::kCmpI64, base_impl::base_impl_ns::kCmpF64,
                               base_impl::base_impl_ns::kCmpI16, base_impl::base_impl_ns::kCmpU16, base_impl::base_impl_ns::kCmpF16, base_impl::base_impl_ns::cmp_class_f32, base_impl::base_impl_ns::cmp_class_f16<false>,
-                              base_impl::base_impl_ns::cmp_class_f16<true>};
+                              base_impl::base_impl_ns::cmp_class_f16<true>, base_impl::base_impl_ns::k_mad_u64};
   static const Tables avx2 = {avx2_impl::avx2_impl_ns::kIntTab, avx2_impl::avx2_impl_ns::kF32Tab, avx2_impl::avx2_impl_ns::kF64Tab,
                               avx2_impl::avx2_impl_ns::kL64Tab, avx2_impl::avx2_impl_ns::kCmpU32, avx2_impl::avx2_impl_ns::kCmpI32,
                               avx2_impl::avx2_impl_ns::kCmpF32, avx2_impl::avx2_impl_ns::kCmpU64, avx2_impl::avx2_impl_ns::kCmpI64, avx2_impl::avx2_impl_ns::kCmpF64,
                               avx2_impl::avx2_impl_ns::kCmpI16, avx2_impl::avx2_impl_ns::kCmpU16, avx2_impl::avx2_impl_ns::kCmpF16, avx2_impl::avx2_impl_ns::cmp_class_f32, avx2_impl::avx2_impl_ns::cmp_class_f16<false>,
-                              avx2_impl::avx2_impl_ns::cmp_class_f16<true>};
+                              avx2_impl::avx2_impl_ns::cmp_class_f16<true>, avx2_impl::avx2_impl_ns::k_mad_u64};
   return simd::enabled() && simd::level() == simd::Level::Avx2 ? avx2 : base;
 }
 
@@ -738,23 +740,38 @@ int h_mad_u64(const Op& o, Regs& R) {
   uint64_t carry = 0;
   if (ex) {
     const unsigned n = lanes_of(ex);
-    alignas(32) uint32_t t0[64], t1[64];
-    alignas(32) uint64_t c[64];
+    alignas(32) uint32_t t0[64], t1[64], tcl[64], tch[64], rl[64], rh[64];
     const uint32_t* a = load32(o.src[0], R, t0, n);
     const uint32_t* b = load32(o.src[1], R, t1, n);
-    load64(o.src[2], R, c, n);
+    const Src& s2 = o.src[2];
+    const uint32_t *cl, *ch;
+    if (s2.kind == kVgpr && s2.wide && !(s2.neg | s2.abs)) {   // (the pair's two rows as they are)
+      cl = R.vgpr[s2.index], ch = R.vgpr[s2.index + 1];
+    } else {
+      alignas(32) uint64_t c[64];
+      load64(s2, R, c, n);
+      for (unsigned i = 0; i < n; ++i) tcl[i] = static_cast<uint32_t>(c[i]), tch[i] = static_cast<uint32_t>(c[i] >> 32);
+      cl = tcl, ch = tch;
+    }
     uint32_t* lo = R.vgpr[o.dst.index];
     uint32_t* hi = R.vgpr[o.dst.index + 1];
-    alignas(32) uint64_t r[64];
-    for (uint64_t m = ex; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-      const unsigned __int128 p = static_cast<unsigned __int128>(a[l]) * b[l] + c[l];
-      r[l] = static_cast<uint64_t>(p);
-      if (static_cast<uint64_t>(p >> 64)) carry |= uint64_t{1} << l;
-    }
-    for (uint64_t m = ex; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-      lo[l] = static_cast<uint32_t>(r[l]), hi[l] = static_cast<uint32_t>(r[l] >> 32);
+    const Mad64Fn k = reinterpret_cast<Mad64Fn>(o.kern);
+    if (full(ex, n)) {
+      carry = k(lo, hi, a, b, cl, ch, n);
+    } else if (__builtin_popcountll(ex) > 8) {
+      carry = k(rl, rh, a, b, cl, ch, n) & ex;
+      merge(lo, rl, ex, n);
+      merge(hi, rh, ex, n);
+    } else {   // (a few lanes: the lanes' own loop is cheaper than the row kernel and the two merges)
+      uint64_t r[8];
+      unsigned idx[8], cnt = 0;
+      for (uint64_t m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+        const unsigned __int128 p = static_cast<unsigned __int128>(a[l]) * b[l] + (static_cast<uint64_t>(ch[l]) << 32 | cl[l]);
+        r[cnt] = static_cast<uint64_t>(p), idx[cnt++] = l;
+        if (static_cast<uint64_t>(p >> 64)) carry |= uint64_t{1} << l;
+      }
+      for (unsigned i = 0; i < cnt; ++i) lo[idx[i]] = static_cast<uint32_t>(r[i]), hi[idx[i]] = static_cast<uint32_t>(r[i] >> 32);
     }
   }
   if (o.dst2.kind) wr(R, o.dst2, carry);
@@ -2083,6 +2100,7 @@ void tier_classify(Inst& in) {
       if (!vgpr_dst(in.dst[0], f.dst, 2)) return fail();
       if (!lane_src32(in.src[0], f.src[0], false) || !lane_src32(in.src[1], f.src[1], false) || !lane_src64(in.src[2], f.src[2], false)) return fail();
       if (in.dst.size() == 2 && !scalar_dst(in.dst[1], f.dst2)) return fail();
+      f.kern = reinterpret_cast<AnyFn>(T.mad_u64);
       f.run = h_mad_u64;
       f.unit = kUnitValu;
       return;

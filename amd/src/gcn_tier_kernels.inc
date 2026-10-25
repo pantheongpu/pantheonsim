@@ -484,6 +484,36 @@ static const CmpFn kCmpF32[16] = {cmp_f32<0>, cmp_f32<1>, cmp_f32<2>,  cmp_f32<3
                                   cmp_f32<6>, cmp_f32<7>, cmp_f32<8>,  cmp_f32<9>,  cmp_f32<10>, cmp_f32<11>,
                                   cmp_f32<12>, cmp_f32<13>, cmp_f32<14>, cmp_f32<15>};
 
+// v_mad_u64_u32 over n lanes: lo/hi receive the 64-bit sum a*b + c (c as two rows, its low and high words), and bit l of the result says
+// that lane l's sum carried out of 64 bits (the product of two 32-bit values fits in 64 bits, so that is exactly a wrapped sum: sum < c).
+// A lane reads its inputs before it writes its outputs, so lo and hi may be rows an input also is.
+static uint64_t k_mad_u64(uint32_t* lo, uint32_t* hi, const uint32_t* a, const uint32_t* b, const uint32_t* cl, const uint32_t* ch, unsigned n) {
+  uint64_t carry = 0;
+#if TIER_AVX2
+  const __m256i bias = _mm256_set1_epi64x(INT64_MIN);
+  const __m256i evens = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6), odds = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
+  for (unsigned i = 0; i < n; i += 4) {
+    const __m256i x = _mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)));
+    const __m256i y = _mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i)));
+    const __m256i c = _mm256_or_si256(_mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(cl + i))),
+                                      _mm256_slli_epi64(_mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(ch + i))), 32));
+    const __m256i sum = _mm256_add_epi64(_mm256_mul_epu32(x, y), c);
+    const __m256i wrapped = _mm256_cmpgt_epi64(_mm256_xor_si256(c, bias), _mm256_xor_si256(sum, bias));   // c > sum, unsigned
+    carry |= static_cast<uint64_t>(_mm256_movemask_pd(_mm256_castsi256_pd(wrapped))) << i;
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(lo + i), _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(sum, evens)));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(hi + i), _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(sum, odds)));
+  }
+#else
+  for (unsigned i = 0; i < n; ++i) {
+    const uint64_t c = static_cast<uint64_t>(ch[i]) << 32 | cl[i];
+    const uint64_t sum = static_cast<uint64_t>(a[i]) * b[i] + c;
+    carry |= static_cast<uint64_t>(sum < c) << i;
+    lo[i] = static_cast<uint32_t>(sum), hi[i] = static_cast<uint32_t>(sum >> 32);
+  }
+#endif
+  return carry;
+}
+
 static const K3 kIntTab[] = {TIER_INT_OPS(TIER_PICK)};
 static const K3 kF32Tab[] = {TIER_F32_OPS(TIER_PICK)};
 static const K64 kF64Tab[] = {TIER_F64_OPS(TIER_PICK)};
