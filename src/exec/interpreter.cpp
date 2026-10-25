@@ -81,6 +81,31 @@ using namespace vgpu::ptx;
 // plain fixed-size member, which is the trade the alternative (a vector per
 // register, indexed at every access) loses badly.
 constexpr uint32_t kMaxWarpSize = 64;
+// The most warps a block can have: 1024 threads at the narrowest warp the engine
+// runs (8 lanes). validate() refuses a launch with more, so a per-warp bit set
+// (WarpSet) of this many bits is always enough.
+constexpr uint32_t kMaxWarpsPerBlock = 128;
+// The warp widths a launch may run at. 8, 16 and 32 are the widths of an Intel Xe
+// sub-group, 32 an NVIDIA warp and 64 a CDNA wavefront. Anything else is not a
+// width this engine has storage for.
+constexpr bool supported_warp_size(uint32_t w) { return w == 8u || w == 16u || w == 32u || w == 64u; }
+
+// A set of the warps of one block, a bit each.
+struct WarpSet {
+  uint64_t bits[kMaxWarpsPerBlock / 64] = {};
+  void add(size_t i) { bits[i >> 6] |= uint64_t{1} << (i & 63); }
+  bool has(size_t i) const { return (bits[i >> 6] >> (i & 63)) & 1; }
+  bool any() const {
+    for (uint64_t b : bits)
+      if (b) return true;
+    return false;
+  }
+  uint32_t count() const {
+    uint32_t n = 0;
+    for (uint64_t b : bits) n += static_cast<uint32_t>(__builtin_popcountll(b));
+    return n;
+  }
+};
 // Per-thread .local window: distinct from both host pointers and device
 // globals. Addresses here are lane-relative (each lane sees its own frame).
 constexpr uint64_t kLocalVaBase = 0x6fff'0000'0000ull;
@@ -216,10 +241,10 @@ struct WgmmaSnapshots {
 // small -- which is exactly why it is worth checking here.
 //
 // An epoch is the count of barriers the block has completed, so "no barrier
-// between them" is "same epoch". Warps per block cap at 32 (1024 threads), so
-// the set of warps that read a word in an epoch fits in a uint32_t exactly.
+// between them" is "same epoch". Warps per block cap at 128 (1024 threads of an
+// 8-lane warp), so the set of warps that read a word in an epoch is a WarpSet.
 struct WordShadow {
-  uint32_t readers = 0;             // bitmask of warps that read it this epoch
+  WarpSet readers;                  // the warps that read it this epoch
   uint32_t read_epoch = 0xFFFFFFFF;
   uint32_t write_epoch = 0xFFFFFFFF;
   uint16_t writer = 0xFFFF;         // warp that wrote it, 0xFFFF for none
@@ -305,7 +330,7 @@ uint32_t param_space_bytes(const EntryFn& fn) {
 // when every warp that has not exited is waiting (see step_block).
 struct NamedBarrier {
   uint32_t arrived = 0;
-  uint64_t waiting = 0;   // bit per warp of the block
+  WarpSet waiting;        // the warps of the block waiting at it
   // A bar.red with a thread count gathers its answer here; the warps it
   // releases each carry the answer away (Warp::bar_red_result), since the
   // barrier is reusable the moment it completes.
@@ -3219,9 +3244,9 @@ class Interpreter {
         // Nothing can run and nothing more can arrive: a hang on hardware.
         std::string where;
         for (size_t i = 0; i < b.bars.bar.size(); ++i)
-          if (b.bars.bar[i].waiting)
+          if (b.bars.bar[i].waiting.any())
             where += "\n  barrier " + std::to_string(i) + ": " +
-                     std::to_string(__builtin_popcountll(b.bars.bar[i].waiting)) + " warp(s) waiting, " +
+                     std::to_string(b.bars.bar[i].waiting.count()) + " warp(s) waiting, " +
                      std::to_string(b.bars.bar[i].arrived) + " thread(s) arrived";
         throw Error::make(Err::LaunchConfig,
                           "deadlock: every warp of the block that has not exited is waiting at a "
@@ -4607,7 +4632,7 @@ class Interpreter {
       return scratch;
     }
     const auto& sr = std::get<SregOperand>(op);
-    if (is_lanemask_sreg(sr.reg)) require_warp32(ins, "%lanemask_*");
+    if (is_lanemask_sreg(sr.reg)) require_warp_le32(ins, "%lanemask_*");
     // The registers kernels read at every thread's start: the lanes' own ids, or one value for the whole block (what
     // sreg_value returns for them, without its switch once a lane).
     uint64_t same = 0;
@@ -4643,9 +4668,21 @@ class Interpreter {
   // the kernel would run and be wrong. So they are refused by name, and the
   // message says which primitive and what the profile's width is.
   //
+  // Narrower than 32 is different: a warp of 8 or 16 lanes (an Intel sub-group)
+  // has a mask that is the low W_ bits of the same 32, nothing is lost, and the
+  // operations mean what they mean at 32 over fewer lanes. require_warp_le32
+  // admits those widths; require_warp32 (the tensor-core instructions, whose
+  // fragments are laid out over exactly 32 lanes) does not.
+  //
   // A CDNA wavefront has its own 64-bit equivalents. They belong to the AMD
   // front-end, which reads a different ISA; they are not these instructions
   // with a wider mask.
+  void require_warp_le32(const Instr& ins, const char* what) {
+    if (W_ > 32u)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               std::string(what) + " is defined by PTX over a warp of at most 32 lanes (its masks are .b32);"
+               " this launch's warp is " + std::to_string(W_) + " lanes wide");
+  }
   void require_warp32(const Instr& ins, const char* what) {
     if (W_ != 32u)
       ctx_fail(ins, -1, Err::UnsupportedPtx,
@@ -4731,13 +4768,13 @@ class Interpreter {
       case Sreg::IsExplicitCluster: return ctx.explicit_cluster ? 1u : 0u;
 
       case Sreg::LaneId: return lane;
+      // The masks are the low W_ bits of a .b32 (require_warp_le32): at W_ = 32 these
+      // are the usual ones, and a narrower warp's lanes 0 to W_ - 1 are the bits it has.
       case Sreg::LaneMaskEq: return Mask{1} << lane;
-      case Sreg::LaneMaskLt: return lane == 0 ? 0u : (~0u >> (W_ - lane));
-      case Sreg::LaneMaskLe: return static_cast<uint32_t>((uint64_t{2} << lane) - 1);
-      case Sreg::LaneMaskGt: return lane == W_ - 1
-                                        ? 0u
-                                        : ~static_cast<uint32_t>((uint64_t{2} << lane) - 1);
-      case Sreg::LaneMaskGe: return ~0u << lane;
+      case Sreg::LaneMaskLt: return (Mask{1} << lane) - 1;
+      case Sreg::LaneMaskLe: return (Mask{2} << lane) - 1;
+      case Sreg::LaneMaskGt: return all_ & ~((Mask{2} << lane) - 1);
+      case Sreg::LaneMaskGe: return all_ & ~((Mask{1} << lane) - 1);
       // Warps are numbered within the block, which is how a kernel uses this:
       // to index a per-warp slot in shared memory.
       case Sreg::WarpId: {
@@ -4826,6 +4863,12 @@ class Interpreter {
       case Sreg::ReservedSmemCap: return reserved_smem_base() + reserved_smem_bytes();
       case Sreg::GridId: return grid_id_;
       case Sreg::CurrentGraphExec: return cfg_.current_graph_exec;
+      // Not PTX registers: the ones a SPIR-V / OpenCL frontend reads (see Sreg).
+      case Sreg::WarpSize: return W_;
+      case Sreg::GlobalOffsetX: return cfg_.global_offset[0];
+      case Sreg::GlobalOffsetY: return cfg_.global_offset[1];
+      case Sreg::GlobalOffsetZ: return cfg_.global_offset[2];
+      case Sreg::WorkDim: return cfg_.work_dim;
     }
     return 0;
   }
@@ -5173,8 +5216,13 @@ class Interpreter {
         if (!silent && s.write_epoch == sh.epoch && s.writer != 0xFFFF && s.writer != cur_warp_)
           report_race(ins, "write-write race", w, s.writer);
         if (!silent && s.read_epoch == sh.epoch) {
-          const uint32_t others = s.readers & ~(1u << cur_warp_);
-          if (others) report_race(ins, "read-write race", w, __builtin_ctzll(others));
+          WarpSet others = s.readers;
+          others.bits[cur_warp_ >> 6] &= ~(uint64_t{1} << (cur_warp_ & 63));
+          for (uint32_t i = 0; i < kMaxWarpsPerBlock; ++i)
+            if (others.has(i)) {
+              report_race(ins, "read-write race", w, i);
+              break;
+            }
         }
         s.writer = static_cast<uint16_t>(cur_warp_);
         s.write_epoch = sh.epoch;
@@ -5182,10 +5230,10 @@ class Interpreter {
         if (s.write_epoch == sh.epoch && s.writer != 0xFFFF && s.writer != cur_warp_)
           report_race(ins, "write-read race", w, s.writer);
         if (s.read_epoch != sh.epoch) {
-          s.readers = 0;
+          s.readers = WarpSet{};
           s.read_epoch = sh.epoch;
         }
-        s.readers |= (1u << cur_warp_);
+        s.readers.add(cur_warp_);
       }
     }
   }
@@ -5538,7 +5586,7 @@ class Interpreter {
         if (nb.arrived >= count) {
           const uint64_t result = nb.acc;
           for (size_t i = 0; i < ctx.warps->size(); ++i)
-            if (nb.waiting >> i & 1) {
+            if (nb.waiting.has(i)) {
               Warp& other = (*ctx.warps)[i];
               other.state = Warp::State::Ready;
               other.counted_barrier = false;
@@ -5549,7 +5597,7 @@ class Interpreter {
           deliver(result);
           return;
         }
-        nb.waiting |= uint64_t{1} << cur_warp_;
+        nb.waiting.add(cur_warp_);
         w.state = Warp::State::AtBarrier;
         w.counted_barrier = true;
         w.barrier_id = static_cast<uint8_t>(id);
@@ -5690,7 +5738,7 @@ class Interpreter {
       if (nb.arrived >= count) {
         // Complete: the waiters go, and the barrier is ready for reuse.
         for (size_t i = 0; i < ctx.warps->size(); ++i)
-          if (nb.waiting >> i & 1) {
+          if (nb.waiting.has(i)) {
             Warp& other = (*ctx.warps)[i];
             other.state = Warp::State::Ready;
             other.counted_barrier = false;
@@ -5700,7 +5748,7 @@ class Interpreter {
         return;
       }
       if (!bop->arrive) {
-        nb.waiting |= uint64_t{1} << cur_warp_;
+        nb.waiting.add(cur_warp_);
         w.state = Warp::State::AtBarrier;
         w.counted_barrier = true;
         w.barrier_id = static_cast<uint8_t>(id);
@@ -6576,7 +6624,7 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpActiveMask>(&ins.op)) {
-      require_warp32(ins, "activemask");
+      require_warp_le32(ins, "activemask");
       Lanes r;  // every active lane sees the same membership
       for (uint32_t lane = 0; lane < W_; ++lane)
         if (m & (Mask{1} << lane)) r[lane] = m;
@@ -7154,7 +7202,7 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpRedux>(&ins.op)) {
-      require_warp32(ins, "redux.sync");
+      require_warp_le32(ins, "redux.sync");
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->src, _s_a);
       // Every participating lane contributes and every one receives the result.
@@ -7493,7 +7541,7 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpElect>(&ins.op)) {
-      require_warp32(ins, "elect.sync");
+      require_warp_le32(ins, "elect.sync");
       Lanes _s_mm;
       const Lanes& mm = read_operand(w, ctx, ins, op->membermask, _s_mm);
       // One leader for the whole warp, not one per lane: every participating
@@ -7631,7 +7679,7 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpMatch>(&ins.op)) {
-      require_warp32(ins, "match.sync");
+      require_warp_le32(ins, "match.sync");
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
       Lanes r;
@@ -8085,12 +8133,12 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpShfl>(&ins.op)) {
-      require_warp32(ins, "shfl.sync");
+      require_warp_le32(ins, "shfl.sync");
       exec_shfl(w, ctx, ins, *op, m);
       return;
     }
     if (const auto* op = std::get_if<OpVote>(&ins.op)) {
-      require_warp32(ins, "vote/ballot");
+      require_warp_le32(ins, "vote/ballot");
       Mask p = read_pred(w, ins, op->src);
       if (op->negate_src) p = ~p;
       Mask voters = p & m;
@@ -8595,6 +8643,7 @@ class Interpreter {
           pred = j <= max_lane;
           break;
       }
+      if (j >= W_) pred = false;   // a source past this warp's width (warps narrower than 32): out of range too
       if (!pred) j = lane;  // out-of-range source: the lane reads its own value
       // A source lane that is not running this shuffle gives 0, not what its
       // register holds (an RTX 3060: lanes 0-15 of a diverged warp shuffling
@@ -15352,12 +15401,20 @@ KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile
 namespace {
 
 void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p) {
-  // 32 for an NVIDIA warp, 64 for a CDNA wavefront. Anything else is not a
-  // width this engine has storage for, and rounding it would silently execute
-  // a different machine than the profile describes.
-  if (p.warp_size != 32u && p.warp_size != kMaxWarpSize)
+  // 32 for an NVIDIA warp, 64 for a CDNA wavefront, 8 or 16 for an Intel Xe
+  // sub-group. Anything else is not a width this engine has storage for, and
+  // rounding it would silently execute a different machine than the profile
+  // describes. launch() hands this the profile with the launch's width already
+  // in it (LaunchConfig::warp_size), so the two agree there; the SASS path,
+  // which runs at the profile's width only, comes through validate_launch.
+  const uint32_t warp = cfg.warp_size ? cfg.warp_size : p.warp_size;
+  if (!supported_warp_size(warp)) {
+    if (cfg.warp_size)
+      throw Error::make(Err::Unsupported, "kernel '", fn.name, "': the launch asks for warp size ", warp,
+                        "; only 8, 16, 32 and 64 are implemented");
     throw Error::make(Err::Unsupported, "profile ", p.id, " has warp size ", p.warp_size,
-                      "; only 32 and 64 are implemented");
+                      "; only 8, 16, 32 and 64 are implemented");
+  }
   // ---- thread-block clusters ----
   const bool wants_cluster =
       cfg.cluster[0] > 1 || cfg.cluster[1] > 1 || cfg.cluster[2] > 1;
@@ -15426,6 +15483,16 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
     throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': ", threads,
                       " threads per block exceeds profile limit ", p.limits.max_threads_per_block, " (",
                       p.id, ")");
+  // The per-warp bit sets (WarpSet) hold kMaxWarpsPerBlock warps; 1024 threads of the narrowest warp is that many.
+  if ((threads + warp - 1) / warp > kMaxWarpsPerBlock)
+    throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': ", threads, " threads per block make ",
+                      (threads + warp - 1) / warp, " warps of ", warp, " lanes; at most ", kMaxWarpsPerBlock,
+                      " are implemented");
+  // SPIR-V's SubgroupsPerWorkgroup: the block must be exactly this many warps.
+  if (fn.req_subgroups && (threads + warp - 1) / warp != fn.req_subgroups)
+    throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' requires ", fn.req_subgroups,
+                      " sub-groups per work-group, and ", threads, " threads at warp size ", warp, " make ",
+                      (threads + warp - 1) / warp);
   // Launch bounds declared by the kernel (__launch_bounds__). Hardware
   // refuses a block larger than the kernel was compiled for.
   for (int i = 0; i < 3; ++i) {
@@ -15716,11 +15783,62 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
 
 }  // namespace
 
-LaunchStats launch(const EntryFn& fn, const LaunchConfig& cfg,
-                   const std::vector<std::vector<uint8_t>>& args, MemoryManager& mem,
-                   const DeviceProfile& profile, const SymbolTable* symbols,
+namespace {
+
+// ParamDecl::local_mem: each work-group-memory pointer argument arrives as the number of bytes wanted; give it that
+// much shared memory past the block's own (static, dynamic) bytes, 16-byte aligned, and make the argument the
+// reservation's offset in the shared window. The block's shared size grows by what was reserved.
+void bind_local_mem(const EntryFn& fn, LaunchConfig& cfg, std::vector<std::vector<uint8_t>>& args) {
+  uint64_t at = uint64_t{std::max(fn.static_shared_size, fn.dynamic_shared_offset)} + cfg.shared_bytes;
+  const uint64_t base = at;
+  for (size_t i = 0; i < fn.params.size() && i < args.size(); ++i) {
+    const ParamDecl& p = fn.params[i];
+    if (!p.local_mem) continue;
+    if (args[i].size() != p.size)
+      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' parameter '", p.name, "' is ", p.size,
+                        " bytes, launch supplied ", args[i].size(), " bytes");
+    uint64_t want = 0;
+    for (size_t b = 0; b < args[i].size() && b < 8; ++b) want |= uint64_t{args[i][b]} << (8 * b);
+    at = (at + 15) / 16 * 16;
+    if (want > (uint64_t{1} << 31) || at + want > (uint64_t{1} << 31))
+      throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' parameter '", p.name, "': ", want,
+                        " bytes of work-group memory is more than a block's shared memory can hold");
+    std::memset(args[i].data(), 0, args[i].size());
+    std::memcpy(args[i].data(), &at, std::min<size_t>(args[i].size(), sizeof at));
+    at += want;
+  }
+  cfg.shared_bytes = static_cast<uint32_t>(cfg.shared_bytes + (at - base));
+}
+
+}  // namespace
+
+LaunchStats launch(const EntryFn& fn, const LaunchConfig& in_cfg,
+                   const std::vector<std::vector<uint8_t>>& in_args, MemoryManager& mem,
+                   const DeviceProfile& in_profile, const SymbolTable* symbols,
                    const ProgressFn& progress) {
   refresh_modes();
+  // The launch's warp width (LaunchConfig::warp_size): the grid runs on a copy of the profile that has it, so the
+  // interpreter, the occupancy figures and the child grids all see one width, and the caller's profile is untouched.
+  DeviceProfile widened;
+  const DeviceProfile* profile_p = &in_profile;
+  if (in_cfg.warp_size && in_cfg.warp_size != in_profile.warp_size) {
+    widened = in_profile;
+    widened.warp_size = in_cfg.warp_size;
+    profile_p = &widened;
+  }
+  const DeviceProfile& profile = *profile_p;
+  // Work-group memory arguments become shared offsets (ParamDecl::local_mem).
+  LaunchConfig cfg = in_cfg;
+  std::vector<std::vector<uint8_t>> patched;
+  const std::vector<std::vector<uint8_t>>* args_p = &in_args;
+  for (const ParamDecl& pd : fn.params)
+    if (pd.local_mem) {
+      patched = in_args;
+      bind_local_mem(fn, cfg, patched);
+      args_p = &patched;
+      break;
+    }
+  const std::vector<std::vector<uint8_t>>& args = *args_p;
   DeviceLaunches dl;
   dl.mem = &mem;
   LaunchStats stats = launch_grid(fn, cfg, args, mem, profile, symbols, progress, &dl);
@@ -15989,6 +16107,10 @@ float mma_narrow_sum_libm(const double* terms, size_t n, float c) {
 }  // namespace
 
 void validate_launch(const ptx::EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& profile) {
+  // A SASS kernel is NVIDIA machine code for 32-lane warps: it runs at the profile's width and no other.
+  if (fn.sass && cfg.warp_size && cfg.warp_size != profile.warp_size)
+    throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' is SASS and runs at the profile's warp size (",
+                      profile.warp_size, "), not at ", cfg.warp_size);
   validate(fn, cfg, profile);
 }
 

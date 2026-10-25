@@ -70,6 +70,24 @@ struct LaunchConfig {
   // or __cluster_dims__ compiled into the kernel). All zeros means no explicit
   // cluster, which PTX defines as behaving like 1x1x1.
   std::array<uint32_t, 3> cluster{0, 0, 0};
+  // Lanes per warp for this launch: 8, 16, 32 or 64. Zero runs at the profile's
+  // warp_size, which is what every CUDA and HIP launch does. A frontend whose
+  // programming model picks the sub-group size per kernel (SPIR-V's SubgroupSize
+  // execution mode, Level Zero's required sub-group size) sets it here; launch()
+  // runs the grid on a copy of the profile with that width, so nothing else in
+  // the profile changes. Warp-wide PTX operations keep their 32-bit masks: shuffle,
+  // vote, ballot, activemask, match, redux, elect and the %lanemask registers run
+  // at 8, 16 and 32 (the mask is the low `warp_size` bits) and are refused at 64;
+  // the tensor-core instructions need exactly 32. A SASS kernel runs at 32 only.
+  uint32_t warp_size = 0;
+  // The NDRange origin (OpenCL's global work offset, Level Zero's group-count
+  // offset times the group size), read by %global_offset_x/y/z (Sreg::GlobalOffset*)
+  // and added by nothing: a frontend that wants get_global_id to include it adds
+  // it itself. Zero for every CUDA launch.
+  std::array<uint32_t, 3> global_offset{0, 0, 0};
+  // The number of dimensions the launch was made with, 1 to 3 (get_work_dim);
+  // read by Sreg::WorkDim. The grid and block are 3-D either way.
+  uint32_t work_dim = 3;
   SchedulerKind scheduler = SchedulerKind::Deterministic;
   // Seed for the random and adversarial schedulers; ignored by the
   // deterministic one. The same seed replays the same execution.

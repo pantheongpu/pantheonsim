@@ -241,6 +241,7 @@ add_library(vgpu STATIC
   src/ptx/regalloc.cpp
   src/ptx/contract.cpp
   src/ptx/sync_masks.cpp
+  src/ptx/builder.cpp
   src/simd/simd.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
@@ -1329,6 +1330,14 @@ vgpu_unit_test(test_barriers)
 vgpu_unit_test(test_dynpar)
 # What a device remembers between launches gives the answers a device that remembers nothing gives.
 vgpu_unit_test(test_launch_cache)
+# The AST builder: a kernel made with no PTX text, loaded and launched through the runtime facade (E9, E10); what it
+# lays out against what the parser lays out; no mul/add contraction.
+vgpu_unit_test(test_ast_builder)
+# A launch's warp width (8, 16, 32, 64) and the warp-level operations at the narrow ones, against host references; the
+# 128-warp bit sets (E2, E3).
+vgpu_unit_test(test_warp_width)
+# %warpsize, the global offset and work dim registers, work-group memory arguments and the sub-group count (E4, E5).
+vgpu_unit_test(test_launch_inputs)
 vgpu_unit_test(test_devrt)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)

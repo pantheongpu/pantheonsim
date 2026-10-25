@@ -105,6 +105,16 @@ enum class Sreg : uint8_t {
   // The executable graph the kernel runs in, if that graph was instantiated
   // for device launch (cudaGetCurrentGraphExec), and 0 otherwise.
   CurrentGraphExec,
+  // The registers a non-PTX frontend reads (the PTX parser has no names for
+  // them, so no PTX text can reach these). They were added after every PTX
+  // register so that no existing value moves.
+  //   WarpSize       the lanes per warp this launch runs at (LaunchConfig::warp_size
+  //                  or the profile's); what OpenCL's get_max_sub_group_size reads
+  //   GlobalOffsetX/Y/Z  LaunchConfig::global_offset, the NDRange origin (zero by default)
+  //   WorkDim        LaunchConfig::work_dim, 1..3 (3 by default)
+  WarpSize,
+  GlobalOffsetX, GlobalOffsetY, GlobalOffsetZ,
+  WorkDim,
 };
 
 // A virtual register reference. `id` is a dense per-kernel index assigned at
@@ -1318,6 +1328,14 @@ struct ParamDecl {
   Type ty;
   uint32_t size = 0;   // bytes; scalars: ty.bytes(), aggregates: array size
   uint32_t align = 0;  // 0 = natural (size for scalars)
+  // A pointer to work-group memory whose size the launch chooses (a SPIR-V
+  // Workgroup pointer kernel argument, OpenCL's __local). The launch supplies
+  // the argument as the number of bytes wanted, a little-endian integer filling
+  // `size` bytes; before the kernel runs the engine reserves that much shared
+  // memory after the block's static and dynamic bytes (16-byte aligned) and
+  // replaces the argument with the reservation's offset in the block's shared
+  // window, which is what a `.shared` address is. `size` is 4 or 8.
+  bool local_mem = false;
 };
 
 // A function-local .local depot (per-thread stack memory).
@@ -1382,6 +1400,10 @@ struct EntryFn {
   // is a launch failure on hardware, so both are enforced.
   std::array<uint32_t, 3> max_ntid{0, 0, 0};
   std::array<uint32_t, 3> req_ntid{0, 0, 0};
+  // The number of warps (sub-groups) the block must have, ceil(threads / warp
+  // width): SPIR-V's SubgroupsPerWorkgroup execution mode. Zero: not required.
+  // A launch whose block makes another count is refused, as a .reqntid one is.
+  uint32_t req_subgroups = 0;
   uint32_t min_ctas_per_sm = 0;
   uint32_t max_nreg = 0;   // .maxnreg: a register ceiling ptxas must meet
   // .reqnctapercluster: the cluster shape in CTAs the kernel was compiled for
