@@ -4436,6 +4436,21 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     std::memcpy(&v, &blk.shared[at_], eb_);
     return value(t, v);
   };
+  if (simd::enabled() && at != T::B1 && bt != T::B1) {
+    const auto tile_elem = [](T t) {
+      switch (t) {
+        case T::F16: return exec::TileElem::F16;
+        case T::BF16: return exec::TileElem::BF16;
+        case T::TF32: return exec::TileElem::TF32;
+        case T::E4M3: return exec::TileElem::E4M3;
+        case T::E5M2: return exec::TileElem::E5M2;
+        case T::S8: return exec::TileElem::S8;
+        default: return exec::TileElem::U8;
+      }
+    };
+    if (gmma_fast(blk, w, ins, ex, {N, K, desc_ur, sel, tile_elem(at), tile_elem(bt), int_form, acc32, sat, sa < 0, sb < 0, a_kmajor, b_kmajor, reg_a, sparse}))
+      return;
+  }
   const uint32_t row0 = (w.index % 4) * 16;
   // This warp's 16 x K slice of A.
   std::vector<double> A(size_t{16} * K, 0.0);
@@ -4517,6 +4532,130 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   });
   snap.taken |= static_cast<uint8_t>(1u << (w.index % 4));
   if (snap.taken == 0xF) blk.gmma.erase(it);
+}
+
+// exec_gmma through the SIMD tile kernels (vgpu/simd/simd.hpp: tile_f32, tile_i32): the operands decoded once into float (or int32) tiles
+// -- the shared-memory ones by the first warp of the group, into the snapshot, as the general form reads them -- and each warp's 16 rows
+// one kernel call, which sums in k order with every product rounded and then added, as the general form's loop does. The same
+// arithmetic as the PTX engine's Interpreter::exec_wgmma_fast, on this engine's operands. Returns false, having changed nothing, for what
+// it does not take (a shared-memory read out of range, which the general form reports); exec_gmma then runs the general form.
+bool Runner::gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const GmmaForm& f) {
+  const unsigned N = f.N, K = f.K;
+  if (N == 0 || N % 8 || N > 256 || K == 0 || K > 64) return false;
+  if (exec::tile_elem_is_int(f.at) != f.int_form || exec::tile_elem_is_int(f.bt) != f.int_form) return false;
+  const bool f16_acc = !f.acc32 && !f.int_form;
+  const unsigned nregs = f16_acc ? N / 4 : N / 2;   // accumulator registers
+  const unsigned Kp = f.sparse ? K / 2 : K;
+  const unsigned abits = 8 * exec::tile_elem_bytes(f.at);
+  const unsigned stored = abits == 32 ? 1 : 2;
+  const unsigned rd = ins.dst[0].reg, rc = ins.src[f.reg_a ? 2 : 1].reg;
+  const uint32_t row0 = (w.index % 4) * 16;
+  const std::pair<uint32_t, uint64_t> key{w.index / 4, w.gmma_issued};
+  auto it = blk.gmma.find(key);
+  if (it == blk.gmma.end()) {
+    // The first warp of the group reads the shared-memory operands, for all four.
+    GmmaSnapshot snap;
+    snap.fast = true;
+    const auto desc = [&](unsigned u) { return exec::decode_wgmma_desc(w.ur[u] | (static_cast<uint64_t>(w.ur[u + 1]) << 32)); };
+    const uint8_t* const smem = blk.shared.data();
+    const size_t size = blk.shared.size();
+    if (!f.reg_a) {
+      const exec::WgmmaDesc d = desc(f.desc_ur);
+      if (f.int_form) {
+        snap.Ai.resize(size_t{64} * Kp);
+        if (!exec::wgmma_read_i32(smem, size, d, f.a_kmajor, f.at, 64, Kp, f.neg_a, false, 0xffffff, snap.Ai.data())) return false;
+      } else {
+        snap.Af.resize(size_t{64} * Kp);
+        if (!exec::wgmma_read_f32(smem, size, d, f.a_kmajor, f.at, 64, Kp, f.neg_a, false, 0xffffff, snap.Af.data())) return false;
+      }
+    }
+    const exec::WgmmaDesc d = desc(f.desc_ur + 2);
+    if (f.int_form) {
+      snap.Bi.resize(size_t{K} * N);
+      if (!exec::wgmma_read_i32(smem, size, d, f.b_kmajor, f.bt, N, K, f.neg_b, true, 0xffffff, snap.Bi.data())) return false;
+    } else {
+      snap.Bf.resize(size_t{K} * N);
+      if (!exec::wgmma_read_f32(smem, size, d, f.b_kmajor, f.bt, N, K, f.neg_b, true, 0xffffff, snap.Bf.data())) return false;
+    }
+    it = blk.gmma.emplace(key, std::move(snap)).first;
+  } else if (!it->second.fast) {
+    return false;
+  }
+  ++w.gmma_issued;
+  GmmaSnapshot& snap = it->second;
+
+  uint32_t meta[32] = {};
+  if (f.sparse) {
+    const unsigned mr = ins.f[7] & 0xff;
+    for (unsigned l = 0; l < 32; ++l) meta[l] = mr == kRZ ? 0 : w.reg(mr, l);
+  }
+  thread_local std::vector<float> Af;
+  thread_local std::vector<int32_t> Ai;
+  // This warp's 16 x K slice of A.
+  if (f.int_form) Ai.assign(size_t{16} * K, 0);
+  else Af.assign(size_t{16} * K, 0.0f);
+  if (f.reg_a) {
+    // mma.m16n8kK's A fragment (mma.sp's, sparse).
+    const unsigned ra = ins.src[0].reg, per_reg = 32 / abits, cpr = per_reg / stored;
+    for (unsigned r = 0; r < 4; ++r)
+      for (unsigned l = 0; l < 32; ++l) {
+        const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8, col0 = t * per_reg + (r / 2) * (per_reg * 4);
+        const uint32_t v = ra == kRZ ? 0 : w.reg(ra + r, l);
+        for (unsigned e = 0; e < per_reg; ++e) {
+          const unsigned col = f.sparse ? exec::mma_sparse_column(abits, K, f.sel, meta, row, t * cpr + (r / 2) * 4 * cpr + e / stored, e % stored)
+                                        : col0 + e;
+          if (col >= K) continue;
+          const uint32_t raw = v >> (abits * e);
+          if (f.int_form) {
+            const int32_t x = exec::tile_decode_i32(f.at, raw);
+            Ai[row * K + col] = f.neg_a ? -x : x;
+          } else {
+            Af[row * K + col] = std::bit_cast<float>(std::bit_cast<uint32_t>(exec::tile_decode_f32(f.at, raw)) ^ (f.neg_a ? 0x80000000u : 0u));
+          }
+        }
+      }
+  } else {
+    if (f.int_form ? snap.Ai.empty() : snap.Af.empty()) fault(w, ins, 0, "the warps of a warpgroup disagree on where A is", Err::UnsupportedPtx);
+    for (uint32_t r = 0; r < 16; ++r)
+      for (uint32_t j = 0; j < Kp; ++j) {
+        const uint32_t col = f.sparse ? exec::mma_sparse_column(abits, K, f.sel, meta, r, j / stored, j % stored) : j;
+        if (col >= K) continue;
+        if (f.int_form) Ai[r * K + col] = snap.Ai[size_t{row0 + r} * Kp + j];
+        else Af[r * K + col] = snap.Af[size_t{row0 + r} * Kp + j];
+      }
+  }
+  // scale-d: stored as 7 - UPn (and a not); false means D = A*B.
+  const unsigned up = ins.f[6] & 7;
+  const bool keep = (up == 7 ? true : w.up[up]) != ((ins.f[6] & 8) != 0);
+  const bool accumulate = keep && rc != kRZ;
+  // The accumulator registers as words (zeros where there is none to add to), their 16 x N tile, the kernel, and back.
+  thread_local std::vector<uint32_t> cw, dw;
+  cw.assign(size_t{nregs} * 32, 0u);
+  dw.resize(size_t{nregs} * 32);
+  if (accumulate)
+    for (unsigned s = 0; s < nregs; ++s) std::memcpy(&cw[size_t{s} * 32], &w.reg(rc + s, 0), 32 * sizeof(uint32_t));
+  if (f.int_form) {
+    thread_local std::vector<int32_t> Ci, Di;
+    Ci.resize(size_t{16} * N);
+    Di.resize(size_t{16} * N);
+    exec::wgmma_acc_to_tile_i32(cw.data(), N, Ci.data());
+    simd::kernels().tile_i32(16, N, K, Ai.data(), snap.Bi.data(), Ci.data(), K, f.sat, Di.data());   // (.SAT clamps once, after the whole K)
+    exec::wgmma_tile_to_acc_i32(Di.data(), N, dw.data());
+  } else {
+    thread_local std::vector<float> Cf, Df;
+    Cf.resize(size_t{16} * N);
+    Df.resize(size_t{16} * N);
+    exec::wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
+    simd::kernels().tile_f32(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), Df.data());
+    exec::wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data());
+  }
+  if (rd != kRZ)
+    each_lane(ex, [&](unsigned l) {
+      for (unsigned s = 0; s < nregs; ++s) w.reg(rd + s, l) = dw[size_t{s} * 32 + l];
+    });
+  snap.taken |= static_cast<uint8_t>(1u << (w.index % 4));
+  if (snap.taken == 0xF) blk.gmma.erase(it);
+  return true;
 }
 
 void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
