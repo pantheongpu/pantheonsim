@@ -3283,6 +3283,9 @@ class Interpreter {
     }
   }
 
+  // How long a path may wait to issue before select_path gives it the turn.
+  static constexpr uint64_t kStarvedSteps = 1024;
+
   // Merges paths sitting at the same pc and returns the index of the one with
   // the lowest pc, which is the path that runs next.
   size_t select_path(Warp& w) {
@@ -3315,7 +3318,6 @@ class Interpreter {
     // warp-mates, so a path that has not issued for kStarvedSteps gets
     // kBoostSteps instructions in a row. Paths that reconverge normally never
     // wait that long, so ordinary code runs in the same order as before.
-    constexpr uint64_t kStarvedSteps = 1024;
     constexpr uint32_t kBoostSteps = 256;
     size_t pick = w.paths.size();
     for (size_t i = 0; i < w.paths.size() && pick == w.paths.size(); ++i)
@@ -3388,9 +3390,9 @@ class Interpreter {
         micro_ = cur_->micro.size() == cur_->body.size() ? cur_->micro.data() : nullptr;
         micro_consts_ = cur_->micro_consts.data();
       }
-      // A warp on one path, at a run of such instructions: run them together.
-      if (micro_ && fast_enabled_ && w.paths.size() == 1 &&
-          run_micro_batch(w, ctx, slice, issued) != 0)
+      // A warp at a run of such instructions: run them together (all of one path's, while it stays the one select_path
+      // would pick).
+      if (micro_ && fast_enabled_ && run_micro_batch(w, idx, ctx, slice, issued) != 0)
         continue;
       const Instr& ins = cur_->body[w.paths[idx].pc];
       const MicroOp* const mu = micro_ ? &micro_[w.paths[idx].pc] : nullptr;
@@ -3463,14 +3465,38 @@ class Interpreter {
   // checked here for the rest. Nothing else the loop does between two
   // instructions of a one-path warp changes: such an instruction cannot move
   // the pc but by one, change the warp's state, ask it to yield, or add a path.
-  uint64_t run_micro_batch(Warp& w, const BlockCtx& ctx, uint64_t slice, uint64_t& issued) {
-    Path& path = w.paths[0];
+  //
+  // A warp on several paths (diverged lanes) batches the path select_path picked, for as long as select_path, asked before
+  // each instruction, would pick that path again: no other path is at its pc (it would merge the two), or lower, or has gone
+  // unissued past kStarvedSteps; each such pick stamps the path, as select_path does. A path in a boost is not batched
+  // (select_path counts it down at every pick).
+  uint64_t run_micro_batch(Warp& w, size_t idx, const BlockCtx& ctx, uint64_t slice, uint64_t& issued) {
+    Path& path = w.paths[idx];
     const Mask mask = path.mask;
     size_t pc = path.pc;
     const size_t end = cur_->body.size();
     uint64_t steps = w.steps;
     const uint64_t max_steps = cfg_.max_steps;
     uint64_t n = 0;
+    // The other paths: every one's pc (a pc of ours that equals one merges the two) and, of those that could take the turn, the
+    // pc and the step at which each last issued (select_path's picks between instructions are worked out below).
+    constexpr size_t kMaxOthers = 7;
+    size_t others[kMaxOthers], live_pc[kMaxOthers];
+    uint64_t live_issued[kMaxOthers];
+    size_t nothers = 0, nlive = 0;
+    const bool multi = w.paths.size() > 1;
+    if (multi) {
+      if (w.paths.size() > kMaxOthers + 1) return 0;
+      for (size_t i = 0; i < w.paths.size(); ++i) {
+        if (w.paths[i].boost) return 0;
+        if (i == idx) continue;
+        others[nothers++] = w.paths[i].pc;
+        if (!w.paths[i].parked) {
+          live_pc[nlive] = w.paths[i].pc;
+          live_issued[nlive++] = w.paths[i].issued_at;
+        }
+      }
+    }
     uint64_t by_class[static_cast<size_t>(InstClass::Count)] = {};
     uint32_t seen = 0;   // the classes in by_class that are not zero (a batch is often a few instructions of one or two)
     while (pc < end) {
@@ -3478,6 +3504,15 @@ class Interpreter {
       if (u.kind == MicroOp::None) break;
       if (n != 0 && slice && issued >= slice) break;
       if (steps + 1 > max_steps) break;   // the loop reports it, with its message
+      if (multi && n != 0) {
+        // select_path before this instruction, with the paths as they are: it would not pick this one if another path is at
+        // this pc (it merges the two), or is lower, or has waited past kStarvedSteps. Otherwise it stamps this one.
+        bool other = false;
+        for (size_t i = 0; i < nothers; ++i) other |= others[i] == pc;
+        for (size_t i = 0; i < nlive; ++i) other |= live_pc[i] < pc || steps - live_issued[i] > kStarvedSteps;
+        if (other) break;
+        path.issued_at = steps;
+      }
       // The loop reports progress before the instruction that makes the count a
       // multiple of 2^20; leave that one to it.
       if (progress_ && ((stats_.instructions + n) & 0xFFFFF) == 0) break;
