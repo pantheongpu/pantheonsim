@@ -474,6 +474,10 @@ Engine::Engine(Config cfg) : cfg_(std::move(cfg)), p_(new Impl) {}
 Engine::~Engine() = default;
 void Engine::cancel() { p_->cancel.store(true); }
 
+namespace {
+std::string ensure_dir(const std::string& dir);   // (below)
+}
+
 std::string Engine::compiler_id(std::string* why) {
   std::lock_guard<std::mutex> g(p_->mu);
   if (!p_->cxx_resolved) {
@@ -492,15 +496,46 @@ std::string Engine::compiler_id(std::string* why) {
       if (found.empty()) p_->cxx_why = "no C++ compiler (c++, g++, clang++) on PATH; set VGPU_JIT_CXX";
     }
     if (!found.empty()) {
-      const Proc v = run_process({found, "--version"}, 20000, 0, &p_->cancel);
-      if (v.rc != 0 || v.out.empty()) {
-        p_->cxx_why = "cannot run '" + found + " --version'";
-      } else {
-        const Proc m = run_process({found, "-dumpmachine"}, 20000, 0, &p_->cancel);
-        std::string first = v.out.substr(0, v.out.find('\n'));
-        std::string mach = m.rc == 0 ? m.out.substr(0, m.out.find('\n')) : std::string();
-        p_->cxx_id = first + " | " + mach;
-        p_->cxx_path = found;
+      // The identity is what `--version` and `-dumpmachine` say, which costs two processes (about 7 ms of kernel time in a simulator with a large address
+      // space, on the core that is running the warps). It is remembered in the cache directory, named by the compiler's file (path, size, change time, inode):
+      // another binary, or the same path replaced, is another name and is asked again. (The directory is the one the objects are trusted from.)
+      std::string idfile;
+      struct stat cst;
+      if (::stat(found.c_str(), &cst) == 0) {
+        if (!p_->dir_checked) {
+          p_->dir = cache_path();
+          p_->dir_err = ensure_dir(p_->dir);
+          p_->dir_checked = true;
+        }
+        if (p_->dir_err.empty())
+          idfile = p_->dir + "/cid-" +
+                   hash_text(found + "|" + std::to_string(cst.st_size) + "|" + std::to_string(cst.st_mtim.tv_sec) + "." + std::to_string(cst.st_mtim.tv_nsec) + "|" +
+                             std::to_string(cst.st_ctim.tv_sec) + "." + std::to_string(cst.st_ctim.tv_nsec) + "|" + std::to_string(cst.st_ino)) +
+                   ".txt";
+      }
+      std::string saved;
+      if (!idfile.empty() && read_file(idfile, saved)) {
+        const std::string head = "VJCID1\n" + found + "\n";
+        if (saved.size() > head.size() + 1 && saved.compare(0, head.size(), head) == 0 && saved.back() == '\n') {
+          p_->cxx_id = saved.substr(head.size(), saved.size() - head.size() - 1);
+          p_->cxx_path = found;
+        }
+      }
+      if (p_->cxx_path.empty()) {
+        const Proc v = run_process({found, "--version"}, 20000, 0, &p_->cancel);
+        if (v.rc != 0 || v.out.empty()) {
+          p_->cxx_why = "cannot run '" + found + " --version'";
+        } else {
+          const Proc m = run_process({found, "-dumpmachine"}, 20000, 0, &p_->cancel);
+          std::string first = v.out.substr(0, v.out.find('\n'));
+          std::string mach = m.rc == 0 ? m.out.substr(0, m.out.find('\n')) : std::string();
+          p_->cxx_id = first + " | " + mach;
+          p_->cxx_path = found;
+          if (!idfile.empty() && p_->cxx_id.find('\n') == std::string::npos) {   // (best effort: a failure only costs the next process its two queries)
+            const std::string tmp = idfile + "." + std::to_string(::getpid()) + "." + std::to_string(g_seq.fetch_add(1)) + ".tmp";
+            if (!write_file(tmp, "VJCID1\n" + found + "\n" + p_->cxx_id + "\n") || ::rename(tmp.c_str(), idfile.c_str()) != 0) ::unlink(tmp.c_str());
+          }
+        }
       }
     }
   }
@@ -850,6 +885,10 @@ Stats& stats() {
 
 namespace {
 
+constexpr uint64_t kDefaultMinShare = 40;      // percent
+constexpr uint64_t kDefaultSample = 50000;     // warp instructions
+constexpr uint64_t kMinSample = 1000;
+
 enum class Job { Lookup, Compile };
 
 struct Manager {
@@ -863,6 +902,7 @@ struct Manager {
   unsigned min_region;     // shorter runs of ops stay on the tier: a call of generated code has a cost of its own
   unsigned hot_permille;   // a region is compiled if it ran at least this many thousandths of the section's counted instructions (0: every region)
   uint64_t max_ops;        // ... and the compiled regions hold at most this many ops
+  ShareRule share;         // the share rule (jit.hpp)
   std::atomic<bool> disabled{false};
   std::mutex mu;
   std::condition_variable cv, idle_cv;
@@ -896,6 +936,11 @@ struct Manager {
     hot_permille = static_cast<unsigned>(num("VGPU_JIT_HOT_PERMILLE", 1));
     min_region = static_cast<unsigned>(std::clamp<uint64_t>(num("VGPU_JIT_MIN_REGION", 4), 1, 4096));
     max_ops = num("VGPU_JIT_MAX_OPS", 1500);
+    // The share rule: VGPU_JIT_MIN_SHARE (percent of the sample; 0: no rule) and VGPU_JIT_SAMPLE (warp instructions). A sample is never taken from fewer than
+    // kMinSample instructions (a threshold of 1, "compile everything now", has no sample to judge), and not when every region is to be compiled (HOT_PERMILLE=0).
+    share.min_share_permille = static_cast<unsigned>(std::min<uint64_t>(num("VGPU_JIT_MIN_SHARE", kDefaultMinShare), 100) * 10);
+    share.sample_after = std::min<uint64_t>(num("VGPU_JIT_SAMPLE", kDefaultSample), lookup_after);
+    share.on = share.min_share_permille != 0 && hot_permille != 0 && share.sample_after >= kMinSample;
   }
   ~Manager() {
     {
@@ -1051,7 +1096,7 @@ void Unit::note(uint32_t region, uint32_t k) {
   uint64_t total = 0;
   for (size_t i = 0; i < regions.size(); ++i) total += counts[i].load(std::memory_order_relaxed);
   executed.store(total, std::memory_order_relaxed);
-  if (s == static_cast<int>(State::Idle) && total >= mgr.lookup_after) {
+  if (s == static_cast<int>(State::Idle) && total >= mgr.lookup_after && !sampling.load(std::memory_order_acquire)) {   // (the share rule decides first: a declined section asks nobody)
     int exp = static_cast<int>(State::Idle);
     if (state.compare_exchange_strong(exp, static_cast<int>(State::Looking))) mgr.submit(Job::Lookup, shared_from_this());   // (inline in synchronous mode)
     s = state.load(std::memory_order_acquire);
@@ -1059,6 +1104,34 @@ void Unit::note(uint32_t region, uint32_t k) {
   if (total < mgr.threshold || s != static_cast<int>(State::Counting)) return;
   int exp = static_cast<int>(State::Counting);
   if (state.compare_exchange_strong(exp, static_cast<int>(State::Queued))) mgr.submit(Job::Compile, shared_from_this());
+}
+
+const ShareRule& share_rule() { return manager().share; }
+
+uint64_t Unit::gen_work() const {
+  uint64_t w = 0;
+  for (size_t i = 0; i < regions.size(); ++i)
+    if (regions[i].k) w += counts[i].load(std::memory_order_relaxed) / regions[i].k * regions[i].gen;
+  return w;
+}
+
+void Unit::sample(uint64_t instr) {
+  if (!sampling.load(std::memory_order_relaxed)) return;
+  const ShareRule& r = manager().share;
+  const uint64_t t = sampled.fetch_add(instr, std::memory_order_relaxed) + instr;
+  if (t < r.sample_after) return;
+  if (!sampling.exchange(false, std::memory_order_acq_rel)) return;   // (the thread that completes the sample decides, once)
+  const uint64_t gw = gen_work();
+  const bool ok = share_ok(gw, t, r);
+  if (stats_on()) std::fprintf(stderr, "jit: share rule: a section sampled over %llu warp instructions, %llu per thousand of them computed by generated code (bar %u): %s\n",
+                               (unsigned long long)t, (unsigned long long)(gw * 1000 / (t ? t : 1)), r.min_share_permille, ok ? "kept" : "declined");
+  if (ok) {
+    stats().accepted.fetch_add(1);
+    return;
+  }
+  stats().declined.fetch_add(1);
+  for (int s = state.load(); s == static_cast<int>(State::Idle) || s == static_cast<int>(State::Counting);)
+    if (state.compare_exchange_weak(s, static_cast<int>(State::Declined), std::memory_order_acq_rel)) break;
 }
 
 void drain() { manager().drain(); }
@@ -1072,11 +1145,12 @@ void Manager::report() {
   Stats& s = stats();
   std::fprintf(out,
                "jit: %llu units (%llu regions), %llu ready, %llu cache hits, %llu compiles (%.1f ms), %llu failures, %llu damaged objects replaced; "
-               "%llu region calls ran %llu warp instructions (%llu computed by generated code), %llu exceptions unwound through them\n",
+               "%llu region calls ran %llu warp instructions (%llu computed by generated code), %llu exceptions unwound through them; share rule: %llu declined, %llu accepted\n",
                (unsigned long long)s.units.load(), (unsigned long long)s.regions.load(), (unsigned long long)s.units_ready.load(),
                (unsigned long long)s.cache_hits.load(), (unsigned long long)s.compiles.load(), double(s.compile_us.load()) / 1000.0,
                (unsigned long long)s.failures.load(), (unsigned long long)s.corrupt.load(), (unsigned long long)s.regions_run.load(),
-               (unsigned long long)s.instructions_run.load(), (unsigned long long)s.generated_run.load(), (unsigned long long)s.region_throws.load());
+               (unsigned long long)s.instructions_run.load(), (unsigned long long)s.generated_run.load(), (unsigned long long)s.region_throws.load(), (unsigned long long)s.declined.load(),
+               (unsigned long long)s.accepted.load());
   if (out != stderr) std::fclose(out);
 }
 
@@ -1191,6 +1265,7 @@ std::shared_ptr<Unit> make_unit(const tier::Program& prog, int sm) {
     if (!any) return nullptr;
   }
   u->counts.reset(new std::atomic<uint64_t>[u->regions.size()]());
+  u->sampling.store(mgr.share.on, std::memory_order_relaxed);
   stats().units.fetch_add(1);
   stats().regions.fetch_add(u->regions.size());
   return u;
