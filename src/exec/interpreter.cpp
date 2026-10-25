@@ -11707,6 +11707,19 @@ class Interpreter {
     return ok;
   }
 
+  // shared_lanes_inside for a run of consecutive accesses of `va` bytes (a power of two) at at[lo .. lo + cnt) (addresses_run):
+  // every access aligned and inside this block's own shared memory, and where the first is. The window, the rank and the
+  // offset only grow along a run, so its two ends say it for every lane in between.
+  bool shared_run_inside(const BlockCtx& ctx, const Lanes& at, uint32_t lo, uint32_t cnt, uint64_t va, uint64_t* off0) {
+    const uint64_t first = at[lo], last = at[lo + cnt - 1];
+    if ((first & (va - 1)) != 0 || !is_shared(first) || !is_shared(last)) return false;
+    const uint64_t r0 = first - kSharedVaBase, r1 = last - kSharedVaBase, rank = cluster_rank_of(ctx);
+    if ((r0 >> kClusterRankShift) != rank || (r1 >> kClusterRankShift) != rank) return false;
+    if ((r1 & kClusterOffsetMask) + va > ctx.shared->size()) return false;
+    *off0 = r0 & kClusterOffsetMask;
+    return true;
+  }
+
   // The same for a .local access: every lane of `m` aligned and inside the current function's frame (and below the alloca
   // stack), as check_local and load_routed's local case want, and the offset in the lane's frame, by lane.
   bool local_lanes_inside(const Lanes& base, int64_t offset, Mask m, uint32_t va, bool va_pow2, uint64_t total,
@@ -11846,10 +11859,10 @@ class Interpreter {
     Lanes at;   // read only at the active lanes, which are all written below
     uint32_t run_lo = 0, run_cnt = 0;
     // Lanes on consecutive elements of ordinary device memory, with nothing that makes the lane loop do more (see below).
-    bool coalesced = false;
+    bool coalesced = false, consecutive = false;
     {
       // Sectors and bank conflicts need the addresses, which only exist here.
-      const bool consecutive = lane_run(m, run_lo, run_cnt);
+      consecutive = lane_run(m, run_lo, run_cnt);
       lane_addresses(base, sbase + static_cast<uint64_t>(op.addr.offset), m, consecutive, run_lo, run_cnt, at);
       coalesced = consecutive && va_pow2 && size <= 8 && va <= 32 && fast_enabled_ &&
                   (op.space == Space::Global || op.space == Space::Generic) && !(op.ordered && n > 1) &&
@@ -11889,6 +11902,31 @@ class Interpreter {
     // a load_routed call per element. Anything else takes the lane loop, which meets an error at its lane.
     if (op.space == Space::Shared && fast_enabled_ && ctx.shared && !ctx.shadow && !(op.ordered && n > 1) &&
         !mem_.shared_fault_armed()) {
+      // Lanes on consecutive elements of this block's shared memory: moved between it and the registers as a run.
+      uint64_t off0;
+      if (consecutive && va_pow2 && size <= 8 && va <= 32 &&
+          addresses_run(at, run_lo, run_cnt, va) && shared_run_inside(ctx, at, run_lo, run_cnt, va, &off0)) {
+        const uint8_t* sh = ctx.shared->data() + off0;
+        if (n == 1 && size == 4 && op.ty.bits == 32 && !op.dsts[0].wide) {
+          std::memcpy(dst32(w, op.dsts[0].id, m) + run_lo, sh, size_t{run_cnt} * 4);
+          return;
+        }
+        if (n == 1 && size == 8 && op.ty.bits == 64 && op.dsts[0].wide) {
+          std::memcpy(dst64(w, op.dsts[0].id, m) + run_lo, sh, size_t{run_cnt} * 8);
+          return;
+        }
+        LaneSet got(n);
+        for (size_t e = 0; e < n; ++e) {
+          switch (size) {
+            case 1: unpack_run<1>(sh, run_lo, run_cnt, n, e, got[e]); break;
+            case 2: unpack_run<2>(sh, run_lo, run_cnt, n, e, got[e]); break;
+            case 4: unpack_run<4>(sh, run_lo, run_cnt, n, e, got[e]); break;
+            default: unpack_run<8>(sh, run_lo, run_cnt, n, e, got[e]); break;
+          }
+        }
+        for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, got[e], op.ty);
+        return;
+      }
       uint64_t offs[kMaxWarpSize];
       if (shared_lanes_inside(ctx, base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
         const uint8_t* sh = ctx.shared->data();
@@ -12015,9 +12053,9 @@ class Interpreter {
     const bool va_pow2 = va != 0 && (va & (va - 1)) == 0;
     Lanes at;   // read only at the active lanes, which are all written below
     uint32_t run_lo = 0, run_cnt = 0;
-    bool coalesced = false;   // as in exec_ld
+    bool coalesced = false, consecutive = false;   // as in exec_ld
     {
-      const bool consecutive = lane_run(m, run_lo, run_cnt);
+      consecutive = lane_run(m, run_lo, run_cnt);
       lane_addresses(base, sbase + static_cast<uint64_t>(op.addr.offset), m, consecutive, run_lo, run_cnt, at);
       coalesced = consecutive && va_pow2 && size <= 8 && va <= 32 && fast_enabled_ &&
                   (op.space == Space::Global || op.space == Space::Generic) && !(op.ordered && n > 1) &&
@@ -12052,9 +12090,35 @@ class Interpreter {
         rethrow_with_context(e, ins, static_cast<int>(run_lo));
       }
     }
-    read_values();
     // Shared memory, as in exec_ld: the stores done in one pass, in lane order and element order.
     if (op.space == Space::Shared && fast_enabled_ && ctx.shared && !ctx.shadow && !(op.ordered && n > 1)) {
+      uint64_t off0;
+      if (consecutive && va_pow2 && size <= 8 && va <= 32 && addresses_run(at, run_lo, run_cnt, va) &&
+          shared_run_inside(ctx, at, run_lo, run_cnt, va, &off0)) {
+        uint8_t* sh = ctx.shared->data() + off0;
+        if (pending) {
+          const Reg& r = std::get<RegOperand>(op.srcs[0]).reg;
+          if (size == 4 && op.ty.bits == 32 && !r.wide && r.id < w.regs32.size() && w.written32[r.id]) {
+            std::memcpy(sh, w.regs32[r.id].data() + run_lo, size_t{run_cnt} * 4);
+            return;
+          }
+          if (size == 8 && op.ty.bits == 64 && r.wide && r.id < w.regs64.size() && w.written64[r.id]) {
+            std::memcpy(sh, w.regs64[r.id].data() + run_lo, size_t{run_cnt} * 8);
+            return;
+          }
+        }
+        read_values();
+        for (size_t e = 0; e < n; ++e) {
+          switch (size) {
+            case 1: pack_run<1>(sh, run_lo, run_cnt, n, e, vals[e], op.ty.bits); break;
+            case 2: pack_run<2>(sh, run_lo, run_cnt, n, e, vals[e], op.ty.bits); break;
+            case 4: pack_run<4>(sh, run_lo, run_cnt, n, e, vals[e], op.ty.bits); break;
+            default: pack_run<8>(sh, run_lo, run_cnt, n, e, vals[e], op.ty.bits); break;
+          }
+        }
+        return;
+      }
+      read_values();
       uint64_t offs[kMaxWarpSize];
       if (shared_lanes_inside(ctx, base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
         uint8_t* sh = ctx.shared->data();
@@ -12065,6 +12129,7 @@ class Interpreter {
         return;
       }
     }
+    read_values();
     if (op.space == Space::Local && fast_enabled_ && !(op.ordered && n > 1)) {
       uint64_t offs[kMaxWarpSize];
       if (local_lanes_inside(base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {

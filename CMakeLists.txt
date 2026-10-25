@@ -1289,6 +1289,8 @@ vgpu_unit_test(test_blackwell)
 vgpu_unit_test(test_rubin)
 # The interpreter's fast paths, bit for bit against its general path.
 vgpu_unit_test(test_fastpath)
+# Loads and stores of a run of lanes (load_run / store_run, consecutive shared words), bit for bit against the lane loop.
+vgpu_unit_test(test_ptx_mem_runs)
 # The host threads that run a grid's blocks, kept between launches: reuse,
 # nesting, several callers, fork; and the same kernels at 1, 2 and N threads.
 vgpu_unit_test(test_worker_pool)
