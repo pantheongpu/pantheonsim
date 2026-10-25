@@ -179,18 +179,19 @@ struct Tables {
   CmpFn cmp_class16;
   CmpFn cmp_class16_neg;
   Mad64Fn mad_u64;
+  bool avx2;   // the handlers built for AVX2 (TIER_DUAL) are the ones to use
 };
 const Tables& tables() {
   static const Tables base = {base_impl::base_impl_ns::kIntTab, base_impl::base_impl_ns::kF32Tab, base_impl::base_impl_ns::kF64Tab,
                               base_impl::base_impl_ns::kL64Tab, base_impl::base_impl_ns::kCmpU32, base_impl::base_impl_ns::kCmpI32,
                               base_impl::base_impl_ns::kCmpF32, base_impl::base_impl_ns::kCmpU64, base_impl::base_impl_ns::kCmpI64, base_impl::base_impl_ns::kCmpF64,
                               base_impl::base_impl_ns::kCmpI16, base_impl::base_impl_ns::kCmpU16, base_impl::base_impl_ns::kCmpF16, base_impl::base_impl_ns::cmp_class_f32, base_impl::base_impl_ns::cmp_class_f16<false>,
-                              base_impl::base_impl_ns::cmp_class_f16<true>, base_impl::base_impl_ns::k_mad_u64};
+                              base_impl::base_impl_ns::cmp_class_f16<true>, base_impl::base_impl_ns::k_mad_u64, false};
   static const Tables avx2 = {avx2_impl::avx2_impl_ns::kIntTab, avx2_impl::avx2_impl_ns::kF32Tab, avx2_impl::avx2_impl_ns::kF64Tab,
                               avx2_impl::avx2_impl_ns::kL64Tab, avx2_impl::avx2_impl_ns::kCmpU32, avx2_impl::avx2_impl_ns::kCmpI32,
                               avx2_impl::avx2_impl_ns::kCmpF32, avx2_impl::avx2_impl_ns::kCmpU64, avx2_impl::avx2_impl_ns::kCmpI64, avx2_impl::avx2_impl_ns::kCmpF64,
                               avx2_impl::avx2_impl_ns::kCmpI16, avx2_impl::avx2_impl_ns::kCmpU16, avx2_impl::avx2_impl_ns::kCmpF16, avx2_impl::avx2_impl_ns::cmp_class_f32, avx2_impl::avx2_impl_ns::cmp_class_f16<false>,
-                              avx2_impl::avx2_impl_ns::cmp_class_f16<true>, avx2_impl::avx2_impl_ns::k_mad_u64};
+                              avx2_impl::avx2_impl_ns::cmp_class_f16<true>, avx2_impl::avx2_impl_ns::k_mad_u64, true};
   return simd::enabled() && simd::level() == simd::Level::Avx2 ? avx2 : base;
 }
 
@@ -213,7 +214,7 @@ const MaskTable& mask_table() {
 }
 
 // d[l] = r[l] for the lanes of `ex` among the first n; the others of d keep their value.
-inline void merge(uint32_t* d, const uint32_t* r, uint64_t ex, unsigned n) {
+[[gnu::always_inline]] inline void merge(uint32_t* d, const uint32_t* r, uint64_t ex, unsigned n) {
   const MaskTable& t = mask_table();
   for (unsigned i = 0; i < n; i += 8) {
     V8u m, x, y;
@@ -225,19 +226,19 @@ inline void merge(uint32_t* d, const uint32_t* r, uint64_t ex, unsigned n) {
   }
 }
 
-inline bool full(uint64_t ex, unsigned n) { return n == 64 ? ex == ~uint64_t{0} : (ex & 0xFFFFFFFFull) == 0xFFFFFFFFull; }
+[[gnu::always_inline]] inline bool full(uint64_t ex, unsigned n) { return n == 64 ? ex == ~uint64_t{0} : (ex & 0xFFFFFFFFull) == 0xFFFFFFFFull; }
 
-inline uint64_t rd(const Regs& R, const Src& s);
-inline void fill(uint32_t* t, uint32_t v, unsigned n) {
+[[gnu::always_inline]] inline uint64_t rd(const Regs& R, const Src& s);
+[[gnu::always_inline]] inline void fill(uint32_t* t, uint32_t v, unsigned n) {
   for (unsigned i = 0; i < n; ++i) t[i] = v;
 }
-inline uint32_t mods32(const Src& s, uint32_t v) {
+[[gnu::always_inline]] inline uint32_t mods32(const Src& s, uint32_t v) {
   if (s.abs) v &= s.h16 ? ~0x8000u : 0x7FFFFFFFu;
   if (s.neg) v ^= s.h16 ? 0x8000u : 0x80000000u;
   return v;
 }
 // A 32-bit lane source as a row: the register's own, or a copy in `t` where a modifier changes it or the value is the same in every lane.
-inline const uint32_t* load32(const Src& s, Regs& R, uint32_t* t, unsigned n) {
+[[gnu::always_inline]] inline const uint32_t* load32(const Src& s, Regs& R, uint32_t* t, unsigned n) {
   switch (s.kind) {
     case kVgpr: {
       const uint32_t* p = R.vgpr[s.index];
@@ -252,7 +253,7 @@ inline const uint32_t* load32(const Src& s, Regs& R, uint32_t* t, unsigned n) {
   }
 }
 // A 64-bit lane source: a register pair, a constant or scalar register(s), with the modifiers on bit 63.
-inline void load64(const Src& s, Regs& R, uint64_t* t, unsigned n) {
+[[gnu::always_inline]] inline void load64(const Src& s, Regs& R, uint64_t* t, unsigned n) {
   const uint64_t keep = s.abs ? 0x7FFFFFFFFFFFFFFFull : ~uint64_t{0}, flip = s.neg ? 0x8000000000000000ull : 0;
   switch (s.kind) {
     case kVgpr: {
@@ -288,7 +289,7 @@ inline void load32_to64(const Src& s, Regs& R, uint64_t* t, unsigned n) {
 
 // ---- Scalar operands (what the interpreter's scalar() and write_scalar do)
 
-inline uint64_t rd(const Regs& R, const Src& s) {
+[[gnu::always_inline]] inline uint64_t rd(const Regs& R, const Src& s) {
   switch (s.kind) {
     case kConst: return s.value64;
     case kSgpr: return s.wide ? static_cast<uint64_t>(R.sgpr[s.index + 1]) << 32 | R.sgpr[s.index] : R.sgpr[s.index];
@@ -300,7 +301,7 @@ inline uint64_t rd(const Regs& R, const Src& s) {
     default: return 0;
   }
 }
-inline void wr(Regs& R, const Src& s, uint64_t v) {
+[[gnu::always_inline]] inline void wr(Regs& R, const Src& s, uint64_t v) {
   switch (s.kind) {
     case kSgpr:
       R.sgpr[s.index] = static_cast<uint32_t>(v);
@@ -315,12 +316,20 @@ inline void wr(Regs& R, const Src& s, uint64_t v) {
   }
 }
 
+
+// A handler whose body is compiled twice: for the baseline x86-64 and for AVX2 (so that the loops of its glue -- the operand rows, the EXEC merge, the
+// scans for NaNs, the 64-bit pairs -- are vectorized as the lane kernels are). The tier picks one when the instruction is decoded (Tables::avx2).
+#define TIER_DUAL(h)                                                                      \
+  int h##_base(const Op& o, Regs& R) { return h##_body(o, R); }                           \
+  [[gnu::target("avx2,fma,popcnt")]] int h##_avx2(const Op& o, Regs& R) { return h##_body(o, R); }
+#define TIER_RUN(h) (T.avx2 ? h##_avx2 : h##_base)
+
 // ---- Vector handlers
 
-inline unsigned lanes_of(uint64_t ex) { return (ex >> 32) ? 64 : 32; }
+[[gnu::always_inline]] inline unsigned lanes_of(uint64_t ex) { return (ex >> 32) ? 64 : 32; }
 
 // NaN anywhere among the active lanes of a binary32 / binary64 result.
-inline bool nan32(const uint32_t* r, uint64_t ex, unsigned n) {
+[[gnu::always_inline]] inline bool nan32(const uint32_t* r, uint64_t ex, unsigned n) {
   uint32_t any = 0;
   if (full(ex, n)) {
     for (unsigned i = 0; i < n; ++i) any |= (r[i] & 0x7FFFFFFFu) > 0x7F800000u;
@@ -332,7 +341,7 @@ inline bool nan32(const uint32_t* r, uint64_t ex, unsigned n) {
   }
   return any != 0;
 }
-inline bool nan64(const uint64_t* r, uint64_t ex, unsigned n) {
+[[gnu::always_inline]] inline bool nan64(const uint64_t* r, uint64_t ex, unsigned n) {
   uint32_t any = 0;
   if (full(ex, n)) {
     for (unsigned i = 0; i < n; ++i) any |= (r[i] & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull;
@@ -402,7 +411,7 @@ inline void post64(uint64_t* r, uint64_t ex, unsigned omod, bool clamp) {
 }
 
 // A 32-bit integer (or bit) operation over 1 to 3 sources.
-int h_int(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_int_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   if (!ex) return true;
   const unsigned n = lanes_of(ex);
@@ -420,6 +429,7 @@ int h_int(const Op& o, Regs& R) {
   }
   return true;
 }
+TIER_DUAL(h_int)
 
 // ---- SDWA (an integer operation on parts of its registers)
 // The part of a 32-bit value an SDWA source names, with or without its sign (the interpreter's selected()).
@@ -471,7 +481,7 @@ int h_int_sdwa(const Op& o, Regs& R) {
 }
 
 // A binary32 operation: the result is thrown away if any active lane is a NaN.
-int h_f32(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_f32_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   if (!ex) return true;
   const unsigned n = lanes_of(ex);
@@ -498,9 +508,10 @@ int h_f32(const Op& o, Regs& R) {
   else merge(d, r, ex, n);
   return true;
 }
+TIER_DUAL(h_f32)
 
 // binary64: operands and result are register pairs.
-int h_f64(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_f64_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   if (!ex) return true;
   const unsigned n = lanes_of(ex);
@@ -526,9 +537,10 @@ int h_f64(const Op& o, Regs& R) {
   }
   return true;
 }
+TIER_DUAL(h_f64)
 
 // A 64-bit integer operation: sources by `sub` bits (bit k set: source k is a 64-bit pair, else a 32-bit count).
-int h_l64(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_l64_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   if (!ex) return true;
   const unsigned n = lanes_of(ex);
@@ -549,6 +561,7 @@ int h_l64(const Op& o, Regs& R) {
   }
   return true;
 }
+TIER_DUAL(h_l64)
 
 // Packed binary32 (v_pk_add_f32, _mul_f32, _fma_f32): two floats in a register pair, each half its own arithmetic. `sub`: bit k is
 // the half of source k the low result reads (op_sel), bit 3 + k the half the high result reads (op_sel_hi), bits 6 + k and 9 + k
@@ -735,7 +748,7 @@ int h_fma_mix(const Op& o, Regs& R) {
 }
 
 // v_mad_u64_u32: a 32x32 product added to a 64-bit value; the carry out of 64 bits is the scalar destination's bit.
-int h_mad_u64(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_mad_u64_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   uint64_t carry = 0;
   if (ex) {
@@ -777,6 +790,7 @@ int h_mad_u64(const Op& o, Regs& R) {
   if (o.dst2.kind) wr(R, o.dst2, carry);
   return true;
 }
+TIER_DUAL(h_mad_u64)
 
 // v_add_co_u32, v_addc_co_u32, v_sub_co_u32, v_subb_co_u32 and the reversed ones (carry_alu): the carry or borrow of each lane into a
 // scalar mask, written whatever EXEC is. `sub`: bit 0 add, bit 1 takes a carry in (source 2, a mask), bit 2 reversed.
@@ -810,7 +824,7 @@ int h_carry(const Op& o, Regs& R) {
 }
 
 // v_cndmask_b32: lane l takes source 1 where bit l of the scalar mask is set, else source 0 (modifiers on either).
-int h_cndmask(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_cndmask_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   if (!ex) return true;
   const unsigned n = lanes_of(ex);
@@ -832,6 +846,7 @@ int h_cndmask(const Op& o, Regs& R) {
   else merge(d, r, ex, n);
   return true;
 }
+TIER_DUAL(h_cndmask)
 
 // v_readfirstlane_b32: the first active lane's value (lane 0 with none) into a scalar destination.
 int h_readfirstlane(const Op& o, Regs& R) {
@@ -842,7 +857,7 @@ int h_readfirstlane(const Op& o, Regs& R) {
 }
 
 // A comparison: one bit a lane, into a scalar destination and, for the X forms, EXEC. `kern` is the test for the first n lanes.
-int h_cmp(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_cmp_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   uint64_t result = 0;
   if (ex) {
@@ -856,13 +871,14 @@ int h_cmp(const Op& o, Regs& R) {
   if (o.sub) *R.exec = result;   // the X forms
   return true;
 }
+TIER_DUAL(h_cmp)
 
 
 int h_never(const Op&, Regs&) { return 0; }
 
 // ---- LDS
 enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm };
-int h_ds(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_ds_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   if (o.store && *R.store_gate && ex && R.nwaves > 1) {
     *R.store_gate = false;
@@ -876,10 +892,16 @@ int h_ds(const Op& o, Regs& R) {
     alignas(32) uint32_t before[64];
     std::memcpy(before, R.vgpr[o.src[1].index], sizeof before);
     const uint32_t x = static_cast<uint32_t>(o.off0);
+    uint32_t* const out = R.vgpr[o.dst.index];
+    const unsigned lanes = R.lanes;
+    if (full(ex, lanes)) {   // (every lane on: every lane reads, and the source lane is on)
+      for (unsigned l = 0; l < lanes; ++l) out[l] = before[((addr[l] + x) >> 2) & (lanes - 1)];
+      return 1;
+    }
     for (uint64_t m = ex; m; m &= m - 1) {
       const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-      const uint32_t from = ((addr[l] + x) >> 2) & (R.lanes - 1);
-      R.vgpr[o.dst.index][l] = ex >> from & 1 ? before[from] : 0;
+      const uint32_t from = ((addr[l] + x) >> 2) & (lanes - 1);
+      out[l] = ex >> from & 1 ? before[from] : 0;
     }
     return 1;
   }
@@ -887,12 +909,71 @@ int h_ds(const Op& o, Regs& R) {
   const unsigned w = o.words;
   const uint64_t size = R.lds_size;
   const uint64_t span = o.sub == kDsRead || o.sub == kDsWrite ? 4ull * w : 4;
+  uint8_t* lds = R.lds;
+  const unsigned n = R.lanes;
+  const bool all_on = full(ex, n);
+  // Every lane on and the addresses a run of consecutive words (or, for the wide forms, of consecutive groups of w words): the whole
+  // wave is one copy to or from the LDS (a wide access also moves the words between the lane-major layout of the LDS and the
+  // register rows). Only the forms whose copies cannot overlap one another (the plain read and write, and the two-offset ones when the
+  // two runs are apart: otherwise the order the lanes store in decides the bytes).
+  if (all_on && (o.sub == kDsRead || o.sub == kDsWrite || o.sub == kDsRead2 || o.sub == kDsWrite2)) {
+    const uint32_t stride = o.sub == kDsRead || o.sub == kDsWrite ? 4u * w : 4u;
+    const uint32_t base = addr[0] + x0;
+    uint32_t diff = 0;
+    for (unsigned l = 0; l < n; ++l) diff |= (addr[l] + x0) ^ (base + stride * l);
+    const bool two = o.sub == kDsRead2 || o.sub == kDsWrite2;
+    const uint32_t base1 = base + (x1 - x0);
+    const uint64_t run = uint64_t{stride} * n;
+    const bool apart = !two || (base1 > base ? base1 - base : base - base1) >= run;
+    if (!diff && apart && w <= 4) {
+      // (the run, and the second run, inside the LDS: the same test as every lane's, the addresses being consecutive and not wrapping)
+      if (uint64_t{base} + run > size || (two && uint64_t{base1} + run > size)) return 0;
+      switch (o.sub) {
+        case kDsRead:
+          if (w == 1) {
+            std::memcpy(R.vgpr[o.dst.index], lds + base, 4u * n);
+          } else {
+            alignas(32) uint32_t tmp[256];
+            std::memcpy(tmp, lds + base, 4u * w * n);
+            for (unsigned k = 0; k < w; ++k) {
+              uint32_t* const out = R.vgpr[o.dst.index + k];
+              for (unsigned l = 0; l < n; ++l) out[l] = tmp[w * l + k];
+            }
+          }
+          return 1;
+        case kDsWrite:
+          if (w == 1) {
+            std::memcpy(lds + base, R.vgpr[o.src[1].index], 4u * n);
+          } else {
+            alignas(32) uint32_t tmp[256];
+            for (unsigned k = 0; k < w; ++k) {
+              const uint32_t* const in = R.vgpr[o.src[1].index + k];
+              for (unsigned l = 0; l < n; ++l) tmp[w * l + k] = in[l];
+            }
+            std::memcpy(lds + base, tmp, 4u * w * n);
+          }
+          return 1;
+        case kDsRead2:
+          std::memcpy(R.vgpr[o.dst.index], lds + base, 4u * n);
+          std::memcpy(R.vgpr[o.dst.index + 1], lds + base1, 4u * n);
+          return 1;
+        default:
+          std::memcpy(lds + base, R.vgpr[o.src[1].index], 4u * n);
+          std::memcpy(lds + base1, R.vgpr[o.src[2].index], 4u * n);
+          return 1;
+      }
+    }
+  }
   // Every lane must land inside the LDS (an access past it reads zeros and writes nowhere on a card, or is an error: the
   // interpreter's business); nothing has changed yet when one does not.
   // (Branch-free: the lanes' tests are ORed and looked at once.)
   {
     unsigned past = 0;
-    if (o.sub == kDsRead2 || o.sub == kDsWrite2) {
+    if (all_on) {
+      for (unsigned l = 0; l < n; ++l) past |= static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x0)) + span > size;
+      if (o.sub == kDsRead2 || o.sub == kDsWrite2)
+        for (unsigned l = 0; l < n; ++l) past |= static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x1)) + span > size;
+    } else if (o.sub == kDsRead2 || o.sub == kDsWrite2) {
       for (uint64_t m = ex; m; m &= m - 1) {
         const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
         past |= (static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x0)) + span > size) | (static_cast<uint64_t>(static_cast<uint32_t>(addr[l] + x1)) + span > size);
@@ -905,7 +986,6 @@ int h_ds(const Op& o, Regs& R) {
     }
     if (past) return 0;
   }
-  uint8_t* lds = R.lds;
   switch (o.sub) {
     case kDsRead:
       if (w == 1) {   // (the common one: a word a lane)
@@ -960,9 +1040,10 @@ int h_ds(const Op& o, Regs& R) {
       return 1;
   }
 }
+TIER_DUAL(h_ds)
 
 // A 64-bit comparison (integers, or binary64 with the source modifiers): `kern` is the test for the first n lanes.
-int h_cmp64(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_cmp64_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   uint64_t result = 0;
   if (ex) {
@@ -976,6 +1057,7 @@ int h_cmp64(const Op& o, Regs& R) {
   if (o.sub) *R.exec = result;
   return 1;
 }
+TIER_DUAL(h_cmp64)
 
 // v_readlane_b32: one lane (the selector's low bits) of a register into a scalar destination, whatever EXEC says.
 int h_readlane(const Op& o, Regs& R) {
@@ -1463,9 +1545,11 @@ const std::unordered_map<std::string_view, Entry>& table() {
     m["global_store_dwordx4"] = {Cat::Global, 2, 1, 0, nullptr, 4};
     m["ds_read_b32"] = {Cat::Ds, kDsRead, 1, 0, nullptr, 1};
     m["ds_read_b64"] = {Cat::Ds, kDsRead, 1, 0, nullptr, 2};
+    m["ds_read_b96"] = {Cat::Ds, kDsRead, 1, 0, nullptr, 3};
     m["ds_read_b128"] = {Cat::Ds, kDsRead, 1, 0, nullptr, 4};
     m["ds_write_b32"] = {Cat::Ds, kDsWrite, 1, 0, nullptr, 1};
     m["ds_write_b64"] = {Cat::Ds, kDsWrite, 1, 0, nullptr, 2};
+    m["ds_write_b96"] = {Cat::Ds, kDsWrite, 1, 0, nullptr, 3};
     m["ds_write_b128"] = {Cat::Ds, kDsWrite, 1, 0, nullptr, 4};
     m["ds_bpermute_b32"] = {Cat::Ds, kDsBperm, 1, 0, nullptr, 1};
     m["ds_read2st64_b32"] = {Cat::Ds, kDsRead2, 1, 1, nullptr, 2};
@@ -1798,7 +1882,7 @@ void classify_cmp(Inst& in, const Tables& T) {
     f.kern = reinterpret_cast<AnyFn>(k64);
     f.sub = writes_exec;
     f.unit = kUnitValu;
-    f.run = h_cmp64;
+    f.run = TIER_RUN(h_cmp64);
     return;
   } else return;
   // (a 16-bit integer compare ignores the modifiers a VOP3 form could carry; a half's act on its sign bit)
@@ -1812,7 +1896,7 @@ void classify_cmp(Inst& in, const Tables& T) {
   f.kern = reinterpret_cast<AnyFn>(k);
   f.sub = writes_exec;
   f.unit = kUnitValu;
-  f.run = h_cmp;
+  f.run = TIER_RUN(h_cmp);
 }
 
 // The SDWA form of a 32-bit integer operation: sources cut to the parts they name, the result put in the part dst_sel names.
@@ -1927,10 +2011,10 @@ void tier_classify(Inst& in) {
         }
         const int kernel = (e.flags & kTrigTurns) && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) ? e.k + 1 : e.k;
         f.kern = reinterpret_cast<AnyFn>(T.f32[kernel]);
-        f.run = h_f32;
+        f.run = TIER_RUN(h_f32);
       } else {
         f.kern = reinterpret_cast<AnyFn>(T.ints[e.k]);
-        f.run = h_int;
+        f.run = TIER_RUN(h_int);
       }
       f.unit = kUnitValu;
       return;
@@ -1948,7 +2032,7 @@ void tier_classify(Inst& in) {
       else if (e.k == DFMA && !(e.flags & kFmac)) f.nan = kNanFma;   // (v_fmac_f64 is a plain std::fma: the interpreter's)
       else if (e.k != DFMA && e.k != DRNDNE) f.nan = kNanPass;      // (a one-input function of the host's: no second payload to choose; nearbyint's quieting is the compiler's)
       f.kern = reinterpret_cast<AnyFn>(T.f64[e.k]);
-      f.run = h_f64;
+      f.run = TIER_RUN(h_f64);
       f.unit = kUnitValu;
       return;
     }
@@ -1959,7 +2043,7 @@ void tier_classify(Inst& in) {
         if (!((e.sub >> k & 1) ? lane_src64(in.src[k], f.src[k], false) : lane_src32(in.src[k], f.src[k], false))) return fail();
       f.sub = e.sub;
       f.kern = reinterpret_cast<AnyFn>(T.l64[e.k]);
-      f.run = h_l64;
+      f.run = TIER_RUN(h_l64);
       f.unit = kUnitValu;
       return;
     }
@@ -2029,7 +2113,7 @@ void tier_classify(Inst& in) {
         if (in.src[1].kind != OperandKind::Vgpr || in.src[1].index >= kVgprs) return;
         f.dst.kind = kVgpr, f.dst.index = in.dst[0].index;
         f.src[1].kind = kVgpr, f.src[1].index = in.src[1].index;
-        f.run = h_ds;
+        f.run = TIER_RUN(h_ds);
         f.unit = kUnitLds;
         return;
       }
@@ -2042,7 +2126,8 @@ void tier_classify(Inst& in) {
         const size_t need = e.k == kDsWrite2 ? 3 : 2;
         if (in.src.size() < need) return;
         for (size_t k = 1; k < need; ++k) {
-          if (in.src[k].kind != OperandKind::Vgpr || in.src[k].index + e.sub > kVgprs || in.src[k].width != e.sub) return;
+          const uint32_t width = e.k == kDsWrite2 ? 1 : e.sub;   // (write2's two data operands are a register each; read2's destination is the pair)
+          if (in.src[k].kind != OperandKind::Vgpr || in.src[k].index + width > kVgprs || in.src[k].width != width) return;
           f.src[k].kind = kVgpr, f.src[k].index = in.src[k].index;
         }
         f.store = true;
@@ -2053,7 +2138,7 @@ void tier_classify(Inst& in) {
         f.off0 = static_cast<int32_t>(static_cast<uint32_t>(in.offset) * unit);
         f.off1 = static_cast<int32_t>(static_cast<uint32_t>(in.offset1) * unit);
       }
-      f.run = h_ds;
+      f.run = TIER_RUN(h_ds);
       f.unit = kUnitLds;
       return;
     }
@@ -2101,7 +2186,7 @@ void tier_classify(Inst& in) {
       if (!lane_src32(in.src[0], f.src[0], false) || !lane_src32(in.src[1], f.src[1], false) || !lane_src64(in.src[2], f.src[2], false)) return fail();
       if (in.dst.size() == 2 && !scalar_dst(in.dst[1], f.dst2)) return fail();
       f.kern = reinterpret_cast<AnyFn>(T.mad_u64);
-      f.run = h_mad_u64;
+      f.run = TIER_RUN(h_mad_u64);
       f.unit = kUnitValu;
       return;
     }
@@ -2109,7 +2194,7 @@ void tier_classify(Inst& in) {
       if (!vector_enc || in.dst.size() != 1 || in.src.size() < 3) return;
       if (!vgpr_dst(in.dst[0], f.dst, 1)) return fail();
       if (!lane_src32(in.src[0], f.src[0], true) || !lane_src32(in.src[1], f.src[1], true) || !scalar_src(in.src[2], f.src[2])) return fail();
-      f.run = h_cndmask;
+      f.run = TIER_RUN(h_cndmask);
       f.unit = kUnitValu;
       return;
     }

@@ -13281,6 +13281,14 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
       }
     }
   }
+  if ((flavour == 18 || flavour == 19) && in.enc == gcn::Enc::Ds && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+    // Flavours 18 and 19: an LDS access whose lanes' addresses are consecutive words (or, for the wide forms, consecutive groups of words)
+    // from a random start, inside the LDS, so that the tier's whole-wave copy runs instead of the per-lane loop; 19 has half the lanes off.
+    if (flavour == 19) w.exec = r.next() & all;
+    const uint32_t stride = in.fast.sub <= 1 ? 4u * std::max<uint32_t>(in.fast.words, 1) : 4u;
+    const uint32_t start = static_cast<uint32_t>(r.next() & 0x7FFC);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[in.src[0].index][lane] = start + stride * lane;
+  }
   if (flavour == 12 || flavour == 13) w.loads_in_flight = 3 + static_cast<uint32_t>(r.next() & 7);   // (loads to wait for)
   w.pc = 0;
   Mix64 h;

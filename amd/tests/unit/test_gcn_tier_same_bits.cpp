@@ -87,10 +87,11 @@ VTEST(every_tier_handler_gives_the_interpreters_bits) {
       // (A branch the corpus holds goes where it was: send it elsewhere, so that taking it shows.)
       if (in.name.rfind("s_branch", 0) == 0 || in.name.rfind("s_cbranch", 0) == 0) in.target = 0x1000;
       for (uint64_t seed = 0; seed < seeds; ++seed)
-        for (uint32_t flavour = 0; flavour < 18; ++flavour) {
+        for (uint32_t flavour = 0; flavour < 20; ++flavour) {
           if (flavour >= 5 && flavour <= 9) continue;
           if (flavour == 16) continue;   // (every register zero: not a state worth running)
           if ((flavour == 14 || flavour == 15) && in.enc != amd::gcn::Enc::Flat) continue;   // (the flavours that give a global access real addresses)
+          if ((flavour == 18 || flavour == 19) && in.enc != amd::gcn::Enc::Ds) continue;   // (and an LDS access consecutive ones)
           amd::gcn::tier::set_enabled(false);
           const uint64_t off = amd::digest_instruction(in, c.target, seed * 7919 + with_handler, flavour);
           amd::gcn::tier::set_enabled(true);
