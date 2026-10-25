@@ -552,14 +552,7 @@ const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, ui
   return resolve(addr, len, op, base_out, writing, page_slack);
 }
 
-// A warp's accesses at once -- the lanes of one load or store instruction -- for
-// the case where nothing can differ from doing them one by one: no fault armed,
-// no host mapping in reach, every access aligned and inside the one ordinary
-// allocation the first lies in. Anything else returns false having changed
-// nothing, and the caller makes the accesses one at a time, errors and all.
-bool MemoryManager::batch_ok(const uint64_t* addrs, size_t count, uint32_t size, bool store,
-                             const Allocation** alloc, uint64_t* base) const {
-  if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
+bool MemoryManager::batch_faults_clear(bool store) const {
   if (store) {
     if (access_fault_ && access_fault_->store_pending &&
         __atomic_load_n(access_fault_->store_pending, __ATOMIC_RELAXED))
@@ -569,6 +562,11 @@ bool MemoryManager::batch_ok(const uint64_t* addrs, size_t count, uint32_t size,
                               __atomic_load_n(access_fault_->load_pending, __ATOMIC_RELAXED)))) {
     return false;
   }
+  return true;
+}
+
+bool MemoryManager::batch_addresses_ok(const uint64_t* addrs, size_t count, uint32_t size, const Allocation** alloc,
+                                       uint64_t* base) const {
   const Allocation* a = find_ordinary(addrs[0], size, base);
   if (!a) return false;
   // One pass for the three tests every address must pass: aligned, inside the allocation (an address below its base wraps to
@@ -590,16 +588,35 @@ bool MemoryManager::batch_ok(const uint64_t* addrs, size_t count, uint32_t size,
   return true;
 }
 
-bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
+// A warp's accesses at once -- the lanes of one load or store instruction -- for
+// the case where nothing can differ from doing them one by one: no fault armed,
+// no host mapping in reach, every access aligned and inside the one ordinary
+// allocation the first lies in. Anything else returns false having changed
+// nothing, and the caller makes the accesses one at a time, errors and all.
+bool MemoryManager::batch_ok(const uint64_t* addrs, size_t count, uint32_t size, bool store,
+                             const Allocation** alloc, uint64_t* base) const {
+  if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
+  if (!batch_faults_clear(store)) return false;
+  return batch_addresses_ok(addrs, count, size, alloc, base);
+}
+
+bool MemoryManager::batch_window(const uint64_t* addrs, size_t count, uint32_t size, BatchWindow* window) const {
+  if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
+  if (!batch_faults_clear(false) || !batch_faults_clear(true)) return false;
   const Allocation* a = nullptr;
-  uint64_t base = 0;
-  if (!batch_ok(addrs, count, size, /*store=*/false, &a, &base)) return false;
+  if (!batch_addresses_ok(addrs, count, size, &a, &window->base)) return false;
+  window->alloc = a;
+  return true;
+}
+
+void MemoryManager::load_batch_in(const Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size,
+                                  uint64_t* out) const {
   // (The width a constant, so each load is the one instruction.)
   const auto each = [&](auto width) {
     constexpr uint32_t kSize = decltype(width)::value;
     for (size_t i = 0; i < count; ++i) {
       const uint64_t off = addrs[i] - base;
-      const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+      const uint8_t* chunk = a.chunks[off / kChunkSize].load(std::memory_order_acquire);
       if (!chunk) out[i] = 0;
       else if (is_uniform(chunk)) out[i] = repeated(uniform_byte(chunk), kSize);
       else out[i] = load_at(chunk + off % kChunkSize, kSize);
@@ -611,15 +628,18 @@ bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t siz
     case 4: each(std::integral_constant<uint32_t, 4>()); break;
     default: each(std::integral_constant<uint32_t, 8>()); break;
   }
+}
+
+bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
+  const Allocation* a = nullptr;
+  uint64_t base = 0;
+  if (!batch_ok(addrs, count, size, /*store=*/false, &a, &base)) return false;
+  load_batch_in(*a, base, addrs, count, size, out);
   return true;
 }
 
-bool MemoryManager::store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
-                                size_t* failed_at) {
-  const Allocation* ca = nullptr;
-  uint64_t base = 0;
-  if (!batch_ok(addrs, count, size, /*store=*/true, &ca, &base)) return false;
-  Allocation& a = const_cast<Allocation&>(*ca);
+void MemoryManager::store_batch_in(Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size,
+                                   const uint64_t* vals, size_t* failed_at) {
   for (size_t i = 0; i < count; ++i) {
     const uint64_t off = addrs[i] - base;
     const uint64_t idx = off / kChunkSize;
@@ -639,7 +659,24 @@ bool MemoryManager::store_batch(const uint64_t* addrs, size_t count, uint32_t si
     }
     store_at(chunk + off % kChunkSize, size, vals[i]);
   }
+}
+
+bool MemoryManager::store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
+                                size_t* failed_at) {
+  const Allocation* ca = nullptr;
+  uint64_t base = 0;
+  if (!batch_ok(addrs, count, size, /*store=*/true, &ca, &base)) return false;
+  store_batch_in(const_cast<Allocation&>(*ca), base, addrs, count, size, vals, failed_at);
   return true;
+}
+
+void MemoryManager::batch_load(const BatchWindow& window, const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
+  load_batch_in(*static_cast<const Allocation*>(window.alloc), window.base, addrs, count, size, out);
+}
+
+void MemoryManager::batch_store(const BatchWindow& window, const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
+                                size_t* failed_at) {
+  store_batch_in(const_cast<Allocation&>(*static_cast<const Allocation*>(window.alloc)), window.base, addrs, count, size, vals, failed_at);
 }
 
 MemoryManager::Allocation& MemoryManager::resolve_mut(uint64_t addr, uint64_t len, const char* op,

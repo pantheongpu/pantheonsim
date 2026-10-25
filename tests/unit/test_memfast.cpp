@@ -746,6 +746,76 @@ VTEST(a_batch_declines_where_a_host_mapping_covers_one_of_its_addresses) {
   mm.unmap_host(p + 4096);
 }
 
+// Both faults at once, each armed on its own switch: a load fault and a store fault.
+struct FlipBoth : FlipLoads {
+  uint64_t store_armed = 0;
+  FlipBoth() { store_pending = &store_armed; }
+};
+
+VTEST(a_window_for_read_modify_writes_does_what_the_load_and_the_store_batch_do) {
+  // A warp's atomics load the words of their addresses, work out the new ones and store them (exec_mem): batch_window once, then batch_load and
+  // batch_store, must be the load_batch then store_batch it replaces -- the same acceptance (a fault armed on loads or on stores, a host mapping in
+  // reach, a misaligned address, one outside the allocation each decline it), the same values loaded, the same memory afterwards.
+  MemoryManager a(1ull << 28), b(1ull << 28);
+  FlipBoth fa, fb;
+  a.set_access_fault(&fa), b.set_access_fault(&fb);
+  const uint64_t pa = a.alloc(1 << 17), pb = b.alloc(1 << 17);
+  VCHECK_EQ(pa, pb);
+  std::vector<uint32_t> host(2048, 5);
+  a.map_host(pa + 8192, host.data(), 4096), b.map_host(pb + 8192, host.data(), 4096);
+  const uint8_t pat[1] = {0x3C};
+  a.fill(pa + kChunkSize, pat, 1, kChunkSize), b.fill(pb + kChunkSize, pat, 1, kChunkSize);   // (some memory uniform, some untouched)
+  Rng rng{99};
+  uint64_t windows = 0, declined = 0;
+  for (int step = 0; step < 4000; ++step) {
+    const uint32_t sz = 1u << rng.below(4);
+    const size_t count = 1 + rng.below(32);
+    std::vector<uint64_t> addrs(count);
+    const unsigned mode = static_cast<unsigned>(rng.below(8));
+    for (size_t i = 0; i < count; ++i) {
+      uint64_t off = (rng.below(1 << 17) & ~uint64_t{sz - 1});
+      if (mode < 3) off = (i * sz * (1 + mode)) % (1 << 15) + 16384;                      // regular, away from the host mapping
+      if (mode == 3 && i == count / 2) off = 8192 + sz * rng.below(100);                    // one in the host-mapped range
+      if (mode == 4 && i == count / 3) off += 1;                                            // one misaligned (a no-op for size 1)
+      if (mode == 5 && i == count - 1) off = (1 << 17) - sz + (rng.below(2) ? sz : 0);      // the last one at, or past, the end
+      addrs[i] = pa + off;
+    }
+    fa.armed = fb.armed = rng.below(5) == 0;
+    fa.store_armed = fb.store_armed = rng.below(7) == 0;
+    // The reference: the batches the old code made, then the lane loop's stores when the batch declined (here: nothing, only the acceptance).
+    std::vector<uint64_t> want(count, 0xDEAD), got(count, 0xDEAD);
+    bool ref = b.load_batch(addrs.data(), count, sz, want.data());
+    if (ref) {
+      for (uint64_t& v : want) v = v * 3 + 1;
+      ref = b.store_batch(addrs.data(), count, sz, want.data());   // (declined: nothing stored; the old code then left everything to the loop)
+      if (!ref) for (uint64_t& v : want) v = 0xDEAD;
+    }
+    uint64_t loaded[32];
+    MemoryManager::BatchWindow w;
+    const bool ok = a.batch_window(addrs.data(), count, sz, &w);
+    VCHECK_EQ(ok, ref);
+    if (ok) {
+      ++windows;
+      a.batch_load(w, addrs.data(), count, sz, loaded);
+      for (size_t i = 0; i < count; ++i) got[i] = loaded[i] * 3 + 1;
+      a.batch_store(w, addrs.data(), count, sz, got.data());
+      VCHECK(got == want);
+    } else {
+      ++declined;
+    }
+    if (step % 40 == 0) {
+      fa.armed = fb.armed = 0, fa.store_armed = fb.store_armed = 0;
+      std::vector<uint8_t> x(1 << 17), y(1 << 17);
+      a.read(pa, x.data(), x.size()), b.read(pb, y.data(), y.size());
+      VCHECK(x == y);
+    }
+  }
+  VCHECK(windows > 400);
+  VCHECK(declined > 400);
+  fa.armed = fb.armed = 0, fa.store_armed = fb.store_armed = 0;
+  a.unmap_host(pa + 8192), b.unmap_host(pb + 8192);
+}
+
 VTEST(fill_with_a_repeating_pattern_is_the_pattern_at_every_offset) {
   // fill() repeats a pattern of any length from the phase the range starts at: compare it with
   // the byte-by-byte definition over lengths, phases and chunk boundaries.
