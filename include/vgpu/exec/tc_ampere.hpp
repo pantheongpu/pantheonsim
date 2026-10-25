@@ -48,6 +48,11 @@
 #ifndef VGPU_TC86_ROWS
 #define VGPU_TC86_ROWS 4
 #endif
+// ... and for the float-product kernel, whose rows hold fewer live vectors: eight rows measured 3 to 10% fewer cycles than four on m16n8 (a loop
+// of tc86::mma, f16, bf16 and tf32 operands) and 1 to 2% on 16 columns.
+#ifndef VGPU_TC86_ROWS_F
+#define VGPU_TC86_ROWS_F 8
+#endif
 // (The loops over a few rows and a chunk's products must be unrolled for their arrays to live in registers; GCC leaves them rolled otherwise.)
 #define VGPU_TC86_UNROLL _Pragma("GCC unroll 8")
 
@@ -788,7 +793,7 @@ __attribute__((target("avx2"))) inline bool mma_avx2_chunked_f(unsigned M, unsig
     }
   };
   unsigned i = 0;
-  for (; i + VGPU_TC86_ROWS <= M; i += VGPU_TC86_ROWS) rows(std::integral_constant<unsigned, VGPU_TC86_ROWS>{}, i);
+  for (; i + VGPU_TC86_ROWS_F <= M; i += VGPU_TC86_ROWS_F) rows(std::integral_constant<unsigned, VGPU_TC86_ROWS_F>{}, i);
   for (; i < M; ++i) rows(std::integral_constant<unsigned, 1>{}, i);
   return true;
 }
