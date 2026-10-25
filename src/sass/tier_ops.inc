@@ -1878,6 +1878,15 @@ struct JitFrame {
   return rg.k;
 }
 
+// The ops of a stretch (Program::run) one after the other for `group`, with their class counts. A function of its own so that the loop keeps its few
+// values in registers (inside the run loop of step_warp they were on the stack).
+[[gnu::noinline]] void tier_issue(TCtx& c, const tier::MOp* o, unsigned k, Mask group, unsigned glanes, uint64_t* by_class) {
+  for (const tier::MOp* const end = o + k; o != end; ++o) {
+    by_class[o->cls] += glanes;
+    o->fn(&c, *o, group);
+  }
+}
+
 template <bool Jit>
 bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
   TCtx c{&w, &blk, this, w.r.data(), bank0_.data(), bank0_.size(), tp.pool.data(), &simd::kernels()};
@@ -1933,10 +1942,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
           st.instructions += k;
           st.thread_instructions += uint64_t{k} * glanes;
           const tier::MOp* const o = ops + idx;
-          for (unsigned j = 0; j < k; ++j) {
-            st.inst_by_class[o[j].cls] += glanes;
-            o[j].fn(&c, o[j], group);
-          }
+          tier_issue(c, o, k, group, glanes, st.inst_by_class);
           cur = o + k - 1;
           idx += k;
           n += k - 1;

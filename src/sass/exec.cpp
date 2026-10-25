@@ -13,6 +13,7 @@
 // Every instruction completes before the next: the control bits' stall counts
 // and scoreboards are timing, which VirtualGPU does not model.
 #include "vgpu/exec/devrt.hpp"
+#include "vgpu/exec/launch_env.hpp"
 #include "vgpu/exec/lockstep.hpp"
 #include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/sass/exec.hpp"
@@ -494,14 +495,15 @@ class Runner {
     // VGPU_FASTPATH=0 sends every instruction down the general path, as it does for the PTX interpreter: the
     // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
     // block. For checking that the fast paths compute what the general one does.
-    if (const char* f = std::getenv("VGPU_FASTPATH"); f && f[0] == '0') fast_ = false;
-    vgpu::exec::tc86::refresh_exact();   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
+    env_ = exec::read_launch_env();   // (one pass over the environment for all of the launch's variables)
+    if (const char* f = env_.fastpath; f && f[0] == '0') fast_ = false;
+    vgpu::exec::tc86::refresh_exact(env_.tc_exact);   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
     if (tier::requested()) {
-      const char* tr = std::getenv("VGPU_SASS_TRACE");
+      const char* tr = env_.sass_trace;
       tier_ = fast_ && simd::enabled() && !(tr && *tr);
-      const char* ts = std::getenv("VGPU_TIER_STATS");
+      const char* ts = env_.tier_stats;
       tier_stats_ = tier_ && ts && (ts[0] == '1' || ts[0] == '2');
-      const char* tc = std::getenv("VGPU_TIER_CHAIN");
+      const char* tc = env_.tier_chain;
       tier_chain_ = !(tc && tc[0] == '0');
     }
     ks_ = kernel_statics(m, k, own_statics_);
@@ -655,6 +657,7 @@ class Runner {
   MemoryManager& mem_;
   const DeviceProfile& profile_;
   const uint64_t max_steps_;   // the step budget of a warp (cfg_.max_steps, or VGPU_MAX_STEPS)
+  exec::LaunchEnv env_;   // the launch's environment variables, read once at its start
   bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
   // The pre-decoded tier (src/sass/tier.hpp): on unless VGPU_TIER=0, with the fast paths and the SIMD kernels it is held to on and
   // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
@@ -1203,7 +1206,7 @@ exec::LaunchStats Runner::run() {
   };
   unsigned threads = 1;
   if (!cfg_.cooperative) {
-    if (const char* v = std::getenv("VGPU_THREADS"); v && *v) threads = static_cast<unsigned>(std::max(1, std::atoi(v)));
+    if (const char* v = env_.threads; v && *v) threads = static_cast<unsigned>(std::max(1, std::atoi(v)));
     else {
 #ifdef VGPU_HAVE_HOST_CPUS
       threads = vgpu::host_cpus();
@@ -1231,7 +1234,7 @@ exec::LaunchStats Runner::run() {
   bool lockstep = false;
   uint64_t capacity = 0;
   if (!cfg_.cooperative && !clustered_) {
-    const exec::LockstepMode mode = exec::lockstep_mode();
+    const exec::LockstepMode mode = exec::lockstep_mode(env_.lockstep);
     if (mode == exec::LockstepMode::All || (mode == exec::LockstepMode::Auto && cfg_.resident_blocks && kernel_polls(m_, k_))) {
       lockstep = true;
       capacity = cfg_.resident_blocks ? cfg_.resident_blocks : units;
