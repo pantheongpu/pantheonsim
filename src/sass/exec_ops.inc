@@ -4639,14 +4639,14 @@ bool Runner::gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const Gmm
     Ci.resize(size_t{16} * N);
     Di.resize(size_t{16} * N);
     exec::wgmma_acc_to_tile_i32(cw.data(), N, Ci.data());
-    simd::kernels().tile_i32(16, N, K, Ai.data(), snap.Bi.data(), Ci.data(), K, f.sat, Di.data());   // (.SAT clamps once, after the whole K)
+    simd::kernels().tile_i32(16, N, K, Ai.data(), snap.Bi.data(), Ci.data(), N, K, f.sat, Di.data(), N);   // (.SAT clamps once, after the whole K)
     exec::wgmma_tile_to_acc_i32(Di.data(), N, dw.data());
   } else {
     thread_local std::vector<float> Cf, Df;
     Cf.resize(size_t{16} * N);
     Df.resize(size_t{16} * N);
     exec::wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
-    simd::kernels().tile_f32(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), Df.data());
+    simd::kernels().tile_f32(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
     exec::wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data());
   }
   if (rd != kRZ)
@@ -4779,6 +4779,125 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
           for (unsigned s = 0; s < c_regs; ++s) w.reg(rd + s, l) = out[s * 32 + l];
         });
       return;
+    }
+  }
+  // The rest of the dense and sparse forms -- the sums of f16, bf16, tf32, e4m3 and e5m2 operands the SIMD kernel above does not take, the
+  // s8, u8, s4 and u4 products, f64 and .b1 -- through the tile kernels and fragment code of vgpu/exec/tile_mma.hpp, which give the general form's
+  // bits (the PTX engine's twin of this route is tested against its general form in tests/unit/test_mma_tiles.cpp). Not the block-scaled forms,
+  // sm_120's narrow-float sum, the sm_86 chunked sum, the other element types, or a NaN in an f64 form.
+  if (simd::enabled() && K > 0 && !(ins.op == Op::QMMA && !ins.mods.empty() && ins.mods[0] == "SF")) {
+    const bool is_sparse = (ins.op == Op::HMMA || ins.op == Op::IMMA) && ins.f[3];
+    const auto frag_of = [](MmaT t, exec::FragType* out) {
+      switch (t) {
+        case MmaT::F16: *out = exec::FragType::F16; return true;
+        case MmaT::BF16: *out = exec::FragType::BF16; return true;
+        case MmaT::TF32: *out = exec::FragType::TF32; return true;
+        case MmaT::E4M3: *out = exec::FragType::E4M3; return true;
+        case MmaT::E5M2: *out = exec::FragType::E5M2; return true;
+        case MmaT::S8: *out = exec::FragType::S8; return true;
+        case MmaT::U8: *out = exec::FragType::U8; return true;
+        case MmaT::S4: *out = exec::FragType::S4; return true;
+        case MmaT::U4: *out = exec::FragType::U4; return true;
+        default: return false;
+      }
+    };
+    const bool f64 = acc == AccF64, b1 = at == MmaT::B1;
+    exec::FragType ta{}, tb{};
+    bool ok = f64 ? at == MmaT::F64 && bt == MmaT::F64 && M == 8 && K == 4 && !is_sparse
+              : b1 ? acc == AccS32 && bt == MmaT::B1 && !is_sparse
+                   : frag_of(at, &ta) && frag_of(bt, &tb) &&
+                         (acc == AccS32 ? exec::frag_is_int(ta) && exec::frag_is_int(tb) && (M == 16 || M == 8)
+                                        : acc != AccF64 && !exec::frag_is_int(ta) && !exec::frag_is_int(tb) && M == 16);
+    if (ok && !f64 && !b1 && acc != AccS32) {
+      const auto sum86 = [](MmaT t) { return t == MmaT::F16 || t == MmaT::BF16 || t == MmaT::TF32; };
+      const auto narrow = [](MmaT t) { return t == MmaT::E4M3 || t == MmaT::E5M2; };
+      if (m_.sm == 86 && vgpu::exec::tc86::exact_enabled() && ins.op == Op::HMMA && !is_sparse && sum86(at) && bt == at && K <= 16 &&
+          K % (at == MmaT::TF32 ? 4 : 8) == 0)
+        ok = false;   // the chunked sum of an RTX 3060
+      if (m_.sm / 10 == 12 && narrow(at) && narrow(bt) && acc == AccF32) ok = false;   // sm_120's narrow-float sum
+    }
+    const unsigned a_n = is_sparse ? a_regs / 2 : a_regs, c_n = acc == AccF16 ? c_elems / 2 : c_elems;
+    const auto in_file = [&](unsigned base, unsigned n) { return base == kRZ || base + n * rw <= w.nregs; };
+    if (ok && a_n <= 8 && b_regs <= 8 && c_n <= 4 && in_file(ra, a_n) && in_file(rb, b_regs) && in_file(rc, c_n) && in_file(rd, c_n)) {
+      static const uint32_t kZeros[32] = {};
+      alignas(32) uint32_t xa[8 * 32], xb[8 * 32], xc[4 * 32], xd[4 * 32], meta[32] = {};
+      const auto load = [&](unsigned base, unsigned n, uint32_t* dst) {
+        for (unsigned i = 0; i < n; ++i) std::memcpy(dst + 32 * i, base == kRZ ? kZeros : &w.reg(base + i, 0), 32 * sizeof(uint32_t));
+      };
+      const auto store = [&](unsigned n) {
+        if (rd != kRZ)
+          each_lane(ex, [&](unsigned l) {
+            for (unsigned i = 0; i < n; ++i) w.reg(rd + i, l) = xd[i * 32 + l];
+          });
+      };
+      if (f64) {
+        // (no host NaN: which payload a fused multiply-add keeps depends on its operand order)
+        alignas(32) double fa[32], fb[32], fc[64], fd[64];
+        alignas(32) uint64_t la[32], lb[32], lc[64], ld[64];
+        const auto wide = [&](unsigned base, unsigned i, unsigned l) -> uint64_t { return reg(base, i, l); };
+        for (unsigned l = 0; l < 32; ++l) {
+          la[l] = wide(ra, 0, l);
+          lb[l] = wide(rb, 0, l);
+          lc[l] = wide(rc, 0, l);
+          lc[32 + l] = wide(rc, 1, l);
+        }
+        exec::mma_f64_a_tile(8, 4, la, fa);
+        exec::mma_f64_b_tile(4, lb, fb);
+        exec::mma_f64_acc_to_tile(8, lc, fc);
+        bool nan = false;
+        for (double x : fa) nan |= x != x;
+        for (double x : fb) nan |= x != x;
+        for (double x : fc) nan |= x != x;
+        if (!nan) {
+          rounded(rnd, [&] {
+            simd::kernels().tile_f64(8, 8, 4, fa, fb, fc, fd);
+            return 0;
+          });
+          exec::mma_f64_tile_to_acc(8, fd, ld);
+          if (rd != kRZ)
+            each_lane(ex, [&](unsigned l) {
+              w.reg(rd, l) = static_cast<uint32_t>(ld[l]);
+              w.reg(rd + 1, l) = static_cast<uint32_t>(ld[l] >> 32);
+              w.reg(rd + 2, l) = static_cast<uint32_t>(ld[32 + l]);
+              w.reg(rd + 3, l) = static_cast<uint32_t>(ld[32 + l] >> 32);
+            });
+          return;
+        }
+      } else {
+        load(ra, a_n, xa);
+        load(rb, b_regs, xb);
+        load(rc, c_n, xc);
+        if (is_sparse) {
+          const Operand& mo = ins.src[3];
+          for (unsigned l = 0; l < 32; ++l) meta[l] = mo.reg == kRZ ? 0 : w.reg(mo.reg, l);
+        }
+        if (b1) {
+          exec::mma_b1(M, K, b1_and, xa, xb, xc, xd);
+          store(c_n);
+          return;
+        }
+        if (acc == AccS32) {
+          alignas(32) int32_t ia[16 * 128], ib[128 * 8], ic[16 * 8], id[16 * 8];
+          exec::mma_frag_a(ta, M, K, is_sparse, xa, meta, ins.f[7], nullptr, ia);
+          exec::mma_frag_b(tb, K, xb, nullptr, ib);
+          if (M == 16) exec::wgmma_acc_to_tile_i32(xc, kN, ic);
+          else exec::mma_acc8_to_tile_i32(xc, ic);
+          // (.SAT clamps after every 128 bits of K, not once at the end.)
+          simd::kernels().tile_i32(M, kN, K, ia, ib, ic, kN, sat ? 128 / bits : K, sat, id, kN);
+          if (M == 16) exec::wgmma_tile_to_acc_i32(id, kN, xd);
+          else exec::mma_tile_to_acc8_i32(id, xd);
+          store(c_n);
+          return;
+        }
+        alignas(32) float fa[16 * 64], fb[64 * 8], fc[16 * 8], fd[16 * 8];
+        exec::mma_frag_a(ta, M, K, is_sparse, xa, meta, ins.f[7], fa, nullptr);
+        exec::mma_frag_b(tb, K, xb, fb, nullptr);
+        exec::wgmma_acc_to_tile(xc, kN, acc == AccF16, fc);
+        simd::kernels().tile_f32(M, kN, K, fa, fb, fc, kN, fd, kN);
+        exec::wgmma_tile_to_acc(fd, kN, acc == AccF16, xd);
+        store(c_n);
+        return;
+      }
     }
   }
   std::vector<double> A(M * K, 0.0), B(K * kN, 0.0);
@@ -6599,6 +6718,7 @@ class SassTcHost final : public exec::Tcgen05Host {
     std::memcpy(&v, &sh[off], bytes);
     return v;
   }
+  const std::vector<uint8_t>* smem_direct(uint32_t c) override { return &cs_[c]->shared; }
   [[noreturn]] void fail(Err code, const std::string& why) override { throw Error(code, why); }
 
  private:

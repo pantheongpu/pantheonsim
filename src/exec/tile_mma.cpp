@@ -1,5 +1,6 @@
 #include "vgpu/exec/tile_mma.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -235,6 +236,130 @@ void wgmma_acc_to_tile_i32(const uint32_t* regs, uint32_t N, int32_t* tile) {
 }
 void wgmma_tile_to_acc_i32(const int32_t* tile, uint32_t N, uint32_t* regs) {
   tile_to_words<false>(reinterpret_cast<const uint32_t*>(tile), N, regs);
+}
+
+namespace {
+
+inline TileElem tile_elem_of(FragType t) {
+  switch (t) {
+    case FragType::F16: return TileElem::F16;
+    case FragType::BF16: return TileElem::BF16;
+    case FragType::TF32: return TileElem::TF32;
+    case FragType::E4M3: return TileElem::E4M3;
+    case FragType::E5M2: return TileElem::E5M2;
+    default: return TileElem::S8;
+  }
+}
+
+// Element e of a register: its raw bits, shifted down.
+inline float frag_float(FragType t, uint32_t reg, unsigned e) {
+  const unsigned bits = frag_bits(t);
+  return tile_decode_f32(tile_elem_of(t), bits == 32 ? reg : reg >> (bits * e));
+}
+inline int32_t frag_int(FragType t, uint32_t reg, unsigned e) {
+  switch (t) {
+    case FragType::S8: return static_cast<int8_t>(reg >> (8 * e));
+    case FragType::U8: return static_cast<uint8_t>(reg >> (8 * e));
+    case FragType::S4: return static_cast<int32_t>(((reg >> (4 * e)) & 0xfu) << 28) >> 28;
+    default: return static_cast<int32_t>((reg >> (4 * e)) & 0xfu);
+  }
+}
+
+}  // namespace
+
+void canon_nan_rows(uint32_t* base, uint32_t rows, uint32_t cols, size_t ld) {
+  for (uint32_t r = 0; r < rows; ++r) {
+    uint32_t* p = base + r * ld;
+    uint32_t i = 0;
+    for (; i + 4 <= cols; i += 4) {
+      V4u x;
+      std::memcpy(&x, p + i, sizeof x);
+      const V4u nan = reinterpret_cast<V4u>(reinterpret_cast<V4f>(x) != reinterpret_cast<V4f>(x));
+      x = (x & ~nan) | (0x7fffffffu & nan);
+      std::memcpy(p + i, &x, sizeof x);
+    }
+    for (; i < cols; ++i)
+      if ((p[i] & 0x7fffffffu) > 0x7f800000u) p[i] = 0x7fffffffu;
+  }
+}
+
+void mma_frag_a(FragType t, unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* iout) {
+  const bool is_int = frag_is_int(t);
+  const unsigned bits = frag_bits(t), p = 32 / bits;
+  const unsigned nregs = M * K / (sparse ? 2 : 1) / (32 * p);
+  if (sparse) {
+    if (is_int) std::fill(iout, iout + size_t{M} * K, 0);
+    else std::fill(f, f + size_t{M} * K, 0.0f);
+  }
+  const bool tf32 = t == FragType::TF32, int4 = bits == 4;
+  const unsigned chunk_elems = tf32 ? 2 : int4 ? 8 : 4, stored = chunk_elems / 2, cpr = p / stored;
+  for (unsigned r = 0; r < nregs; ++r)
+    for (unsigned l = 0; l < 32; ++l) {
+      const unsigned g = l / 4, tt = l % 4, row = g + 8 * (r % 2), col0 = tt * p + (r / 2) * 4 * p;
+      const uint32_t v = regs[size_t{r} * 32 + l];
+      for (unsigned e = 0; e < p; ++e) {
+        const unsigned col = sparse ? mma_sparse_column(bits, K, sel, meta, row, tt * cpr + (r / 2) * 4 * cpr + e / stored, e % stored) : col0 + e;
+        if (col >= K) continue;
+        if (is_int) iout[size_t{row} * K + col] = frag_int(t, v, e);
+        else f[size_t{row} * K + col] = frag_float(t, v, e);
+      }
+    }
+}
+
+void mma_frag_b(FragType t, unsigned K, const uint32_t* regs, float* f, int32_t* iout) {
+  const bool is_int = frag_is_int(t);
+  const unsigned p = 32 / frag_bits(t), nregs = K * 8 / (32 * p);
+  for (unsigned r = 0; r < nregs; ++r)
+    for (unsigned l = 0; l < 32; ++l) {
+      const unsigned g = l / 4, tt = l % 4, row0 = tt * p + r * 4 * p;
+      const uint32_t v = regs[size_t{r} * 32 + l];
+      for (unsigned e = 0; e < p; ++e) {
+        if (is_int) iout[size_t{row0 + e} * 8 + g] = frag_int(t, v, e);
+        else f[size_t{row0 + e} * 8 + g] = frag_float(t, v, e);
+      }
+    }
+}
+
+void mma_acc8_to_tile_i32(const uint32_t* regs, int32_t* tile) {
+  for (unsigned s = 0; s < 2; ++s)
+    for (unsigned l = 0; l < 32; ++l) tile[(l / 4) * 8 + 2 * (l % 4) + s] = static_cast<int32_t>(regs[s * 32 + l]);
+}
+void mma_tile_to_acc8_i32(const int32_t* tile, uint32_t* regs) {
+  for (unsigned s = 0; s < 2; ++s)
+    for (unsigned l = 0; l < 32; ++l) regs[s * 32 + l] = static_cast<uint32_t>(tile[(l / 4) * 8 + 2 * (l % 4) + s]);
+}
+
+void mma_f64_a_tile(unsigned M, unsigned K, const uint64_t* regs, double* tile) {
+  for (unsigned r = 0; r < M * K / 32; ++r)
+    for (unsigned l = 0; l < 32; ++l) tile[size_t{(l / 4) + 8 * (r % 2)} * K + (l % 4) + 4 * (r / 2)] = std::bit_cast<double>(regs[size_t{r} * 32 + l]);
+}
+void mma_f64_b_tile(unsigned K, const uint64_t* regs, double* tile) {
+  for (unsigned r = 0; r < K / 4; ++r)
+    for (unsigned l = 0; l < 32; ++l) tile[size_t{(l % 4) + 4 * r} * 8 + l / 4] = std::bit_cast<double>(regs[size_t{r} * 32 + l]);
+}
+void mma_f64_acc_to_tile(unsigned M, const uint64_t* regs, double* tile) {
+  for (unsigned s = 0; s < M * 8 / 32; ++s)
+    for (unsigned l = 0; l < 32; ++l) tile[size_t{(l / 4) + 8 * (s / 2)} * 8 + 2 * (l % 4) + s % 2] = std::bit_cast<double>(regs[size_t{s} * 32 + l]);
+}
+void mma_f64_tile_to_acc(unsigned M, const double* tile, uint64_t* regs) {
+  for (unsigned s = 0; s < M * 8 / 32; ++s)
+    for (unsigned l = 0; l < 32; ++l) regs[size_t{s} * 32 + l] = std::bit_cast<uint64_t>(tile[size_t{(l / 4) + 8 * (s / 2)} * 8 + 2 * (l % 4) + s % 2]);
+}
+
+void mma_b1(unsigned M, unsigned K, bool and_op, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t* d) {
+  // A's row g + 8 h, in words: word w of the row (K / 32 of them) is register 2 (w / 4) + h, lane 4g + w % 4. B's column g likewise: register w / 4,
+  // lane 4g + w % 4.
+  const unsigned words = K / 32;
+  for (unsigned s = 0; s < M * 8 / 32; ++s)
+    for (unsigned l = 0; l < 32; ++l) {
+      const unsigned g = l / 4, tt = l % 4, row = g + 8 * (s / 2), col = 2 * tt + s % 2;
+      int64_t acc = static_cast<int32_t>(c[s * 32 + l]);
+      for (unsigned w = 0; w < words; ++w) {
+        const uint32_t aw = a[size_t{2 * (w / 4) + row / 8} * 32 + 4 * (row % 8) + w % 4], bw = b[size_t{w / 4} * 32 + 4 * col + w % 4];
+        acc += std::popcount(and_op ? aw & bw : aw ^ bw);
+      }
+      d[s * 32 + l] = static_cast<uint32_t>(static_cast<int32_t>(acc));
+    }
 }
 
 }  // namespace vgpu::exec

@@ -101,7 +101,7 @@ VTEST(tile_f32_matches_the_scalar_loop) {
           fill(C);
           const bool null_c = trial % 3 == 0;
           ref_f32(s, A.data(), B.data(), null_c ? nullptr : C.data(), want.data());
-          k.tile_f32(s.M, s.N, s.K, A.data(), B.data(), null_c ? nullptr : C.data(), got.data());
+          k.tile_f32(s.M, s.N, s.K, A.data(), B.data(), null_c ? nullptr : C.data(), s.N, got.data(), s.N);
           for (size_t i = 0; i < got.size(); ++i) {
             ++compared;
             if (!same_f32(got[i], want[i]))
@@ -111,7 +111,7 @@ VTEST(tile_f32_matches_the_scalar_loop) {
           }
           if (!null_c) {   // D may be C
             std::vector<float> inplace = C;
-            k.tile_f32(s.M, s.N, s.K, A.data(), B.data(), inplace.data(), inplace.data());
+            k.tile_f32(s.M, s.N, s.K, A.data(), B.data(), inplace.data(), s.N, inplace.data(), s.N);
             for (size_t i = 0; i < got.size(); ++i)
               if (!same_f32(inplace[i], want[i])) throw vtest::Failure("tile_f32 with D = C differs at element " + std::to_string(i));
           }
@@ -153,7 +153,7 @@ VTEST(tile_i32_matches_the_scalar_loop) {
           const bool null_c = trial % 4 == 0, sat = trial % 2 == 1;
           const unsigned block = trial % 3 == 0 ? s.K : trial % 3 == 1 ? 16 : 3;
           ref_i32(s, A.data(), B.data(), null_c ? nullptr : C.data(), block, sat, want.data());
-          k.tile_i32(s.M, s.N, s.K, A.data(), B.data(), null_c ? nullptr : C.data(), block, sat, got.data());
+          k.tile_i32(s.M, s.N, s.K, A.data(), B.data(), null_c ? nullptr : C.data(), s.N, block, sat, got.data(), s.N);
           for (size_t i = 0; i < got.size(); ++i) {
             ++compared;
             if (got[i] != want[i])
@@ -164,6 +164,63 @@ VTEST(tile_i32_matches_the_scalar_loop) {
         }
   }
   VCHECK(compared > 400000);
+}
+
+// C and D with row strides of their own (tcgen05.mma works on Tensor Memory rows 512 words apart, a tile inside a wider one).
+VTEST(tile_kernels_take_strided_c_and_d) {
+  std::mt19937 g(0x3d3);
+  for (simd::Level l : levels()) {
+    const simd::Kernels& k = simd::kernels_for(l);
+    for (const Shape& s : kShapes)
+      for (int trial = 0; trial < 6; ++trial) {
+        const size_t ldc = s.N + 8 * (trial % 3) + (trial & 1 ? 24 : 0), ldd = s.N + 16 * (trial % 2) + 8;
+        std::vector<float> A(s.M * s.K), B(s.K * s.N), C(s.M * ldc), D(s.M * ldd, bf(0x7fc00001u)), want(s.M * s.N);
+        for (float& x : A) x = tame_f32(g, 8);
+        for (float& x : B) x = tame_f32(g, 8);
+        for (float& x : C) x = tame_f32(g, 12);
+        std::vector<float> Cdense(s.M * s.N);
+        for (unsigned i = 0; i < s.M; ++i)
+          for (unsigned j = 0; j < s.N; ++j) Cdense[i * s.N + j] = C[i * ldc + j];
+        ref_f32(s, A.data(), B.data(), Cdense.data(), want.data());
+        k.tile_f32(s.M, s.N, s.K, A.data(), B.data(), C.data(), ldc, D.data(), ldd);
+        for (unsigned i = 0; i < s.M; ++i) {
+          for (unsigned j = 0; j < s.N; ++j)
+            if (!same_f32(D[i * ldd + j], want[i * s.N + j])) throw vtest::Failure("strided tile_f32, element " + std::to_string(i * s.N + j));
+          for (size_t j = s.N; j < ldd; ++j)
+            if (fb(D[i * ldd + j]) != 0x7fc00001u) throw vtest::Failure("strided tile_f32 wrote past a row of D");
+        }
+        std::vector<int32_t> Ai(s.M * s.K), Bi(s.K * s.N), Ci(s.M * ldc), Di(s.M * ldd, 0x55555555), wi(s.M * s.N), Cid(s.M * s.N);
+        for (int32_t& x : Ai) x = int32_t(g() % 256) - 128;
+        for (int32_t& x : Bi) x = int32_t(g() % 256) - 128;
+        for (int32_t& x : Ci) x = static_cast<int32_t>(g());
+        for (unsigned i = 0; i < s.M; ++i)
+          for (unsigned j = 0; j < s.N; ++j) Cid[i * s.N + j] = Ci[i * ldc + j];
+        const bool sat = trial & 1;
+        ref_i32(s, Ai.data(), Bi.data(), Cid.data(), s.K, sat, wi.data());
+        k.tile_i32(s.M, s.N, s.K, Ai.data(), Bi.data(), Ci.data(), ldc, s.K, sat, Di.data(), ldd);
+        for (unsigned i = 0; i < s.M; ++i) {
+          for (unsigned j = 0; j < s.N; ++j)
+            if (Di[i * ldd + j] != wi[i * s.N + j]) throw vtest::Failure("strided tile_i32, element " + std::to_string(i * s.N + j));
+          for (size_t j = s.N; j < ldd; ++j)
+            if (Di[i * ldd + j] != 0x55555555) throw vtest::Failure("strided tile_i32 wrote past a row of D");
+        }
+      }
+  }
+}
+
+VTEST(canon_nan_rows_canonicalises_exactly_the_nans) {
+  std::mt19937 g(0x6a6e);
+  for (int trial = 0; trial < 400; ++trial) {
+    const uint32_t rows = 1 + g() % 9, cols = 1 + g() % 41, ld = cols + g() % 7;
+    std::vector<uint32_t> w(size_t{rows} * ld), want(w.size());
+    for (size_t i = 0; i < w.size(); ++i) {
+      w[i] = g() % 3 == 0 ? fb(special_f32(g)) : g();
+      want[i] = (w[i] & 0x7fffffffu) > 0x7f800000u && (i % ld) < cols ? 0x7fffffffu : w[i];
+    }
+    exec::canon_nan_rows(w.data(), rows, cols, ld);
+    for (size_t i = 0; i < w.size(); ++i)
+      if (w[i] != want[i]) throw vtest::Failure("canon_nan_rows, word " + std::to_string(i));
+  }
 }
 
 VTEST(tile_f64_matches_the_fma_chain_in_every_rounding_mode) {

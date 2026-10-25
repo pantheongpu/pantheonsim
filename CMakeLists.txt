@@ -1333,6 +1333,10 @@ vgpu_unit_test(test_mma_fast)
 vgpu_unit_test(test_tile_mma)
 # The PTX engine's SIMD wgmma route against its general form (VGPU_FASTPATH=0), bit for bit.
 vgpu_unit_test(test_wgmma_fast)
+# tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
+vgpu_unit_test(test_tcgen05_fast)
+# The PTX engine's tile route for the other mma.sync forms against the general form, bit for bit.
+vgpu_unit_test(test_mma_tiles)
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.

@@ -175,17 +175,17 @@ struct Kernels {
   //    as the SASS executor's general form does), a NaN the canonical 0x7fff. Writes only the lanes of `mask`.
   void (*hfma2_bf_m)(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n);
 
-  // Tile products, the tensor-core instructions' sums over a whole tile (A is M x K with row stride K, B is K x N and C, D are M x N,
-  // all row-major; N a multiple of 8; C null for zeros; D may be C, not A or B).
+  // Tile products, the tensor-core instructions' sums over a whole tile (A is M x K with row stride K, B is K x N with row stride N, all
+  // row-major; N a multiple of 8; C and D are M x N with row strides ldc and ldd, C null for zeros; D may be C, not A or B).
   //  tile_f32: D = C + A x B in f32, each element summed in k order, each product rounded and then added (never fused). A NaN
   //    result is whichever one the host's additions kept: callers write the canonical one themselves.
-  //  tile_i32: the same for 32-bit integers (8-bit elements or fewer, so a block's sum of products fits 32 bits). Without `sat` one
-  //    wrapping sum; with it the products are added `block` at a time and C, or the running value, plus a block's sum is clamped to
-  //    the s32 range after each block.
+  //  tile_i32: the same for 32-bit integers (8-bit elements or fewer, so a block's sum of products fits 32 bits). Without `sat`
+  //    one wrapping sum; with it the products are added `block` at a time and C, or the running value, plus a block's sum is
+  //    clamped to the s32 range after each block.
   //  tile_f64: D = C + A x B in binary64, k in order, each step a fused multiply-add in the host's current rounding mode.
-  void (*tile_f32)(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, float* D);
-  void (*tile_i32)(unsigned M, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, unsigned block, bool sat,
-                   int32_t* D);
+  void (*tile_f32)(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd);
+  void (*tile_i32)(unsigned M, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, size_t ldc, unsigned block,
+                   bool sat, int32_t* D, size_t ldd);
   void (*tile_f64)(unsigned M, unsigned N, unsigned K, const double* A, const double* B, const double* C, double* D);
 };
 
