@@ -134,6 +134,8 @@ enum class Form : uint8_t {
   Count_,
 };
 const char* form_name(Form f);
+// The forms whose handlers only read and write registers and predicates (and the uniform ones): see Program::run.
+bool pure_register_form(Form f);
 
 // How a form's RESULT is computed, so that the rules of the interpreter cannot drift away from the tier's unnoticed (tests/unit/test_tier.cpp holds
 // this table to a checked-in list and reads tier_ops.inc for what a handler may not contain):
@@ -183,6 +185,9 @@ struct Program {
   std::map<uint32_t, uint32_t> const_index;   // value -> pool row, while the program is built
   uint16_t max_reg = 0;          // the largest MOp::maxreg: a warp whose file holds this needs no per-op check
   size_t native = 0;             // instructions with a handler
+  // run[i]: how many instructions from i on (at most 255) are ones the run loop can issue back to back for a whole group (Runner::tier_run_t):
+  // straight, unguarded, with a handler, and a pure register form (no memory, no scheduler, nothing that can fault), none of them the section's last.
+  std::vector<uint8_t> run;
   std::shared_ptr<jit::Unit> jit;   // tier 2 (VGPU_JIT=1, src/sass/jit.hpp): the regions of this section, null when there are none or the JIT is off
 };
 
