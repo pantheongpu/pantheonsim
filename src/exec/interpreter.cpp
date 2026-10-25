@@ -4991,7 +4991,11 @@ class Interpreter {
     // Everything else moves in 32-byte sectors. Count the distinct ones the
     // warp touched: four for a coalesced 32-lane 4-byte load, up to 32 when
     // every lane lands in its own sector.
-    const uint32_t distinct = memcount::distinct_sectors(addrs.data(), m, W_, span, kMaxWarpSize * 8);
+    count_sectors(space, memcount::distinct_sectors(addrs.data(), m, W_, span, kMaxWarpSize * 8), span, m, is_store);
+  }
+
+  // The counters of a local or global access that touched `distinct` sectors.
+  void count_sectors(Space space, uint32_t distinct, uint64_t span, Mask m, bool is_store) {
     if (space == Space::Local) {
       stats_.local_sectors += distinct;
       ++stats_.local_requests;
@@ -11719,6 +11723,69 @@ class Interpreter {
     return ok;
   }
 
+  // The active lanes `m` as consecutive lanes: the lowest and how many. False for a mask with a gap, and for none.
+  static bool lane_run(Mask m, uint32_t& lo, uint32_t& cnt) {
+    if (m == 0) return false;
+    lo = static_cast<uint32_t>(__builtin_ctzll(m));
+    const Mask run = m >> lo;
+    if (run & (run + 1)) return false;
+    cnt = 64u - static_cast<uint32_t>(__builtin_clzll(run));
+    return true;
+  }
+
+  // at[lane] = base[lane] + add for the lanes of `m` (`consecutive`: lane_run found them, in lo and cnt): a counted loop
+  // for the usual case of a full warp or a run of lanes.
+  static void lane_addresses(const Lanes& base, uint64_t add, Mask m, bool consecutive, uint32_t lo, uint32_t cnt,
+                             Lanes& at) {
+    if (consecutive) {
+      for (uint32_t i = 0; i < cnt; ++i) at[lo + i] = base[lo + i] + add;
+    } else {
+      for (Mask r = m; r; r &= r - 1) {
+        const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(r));
+        at[l] = base[l] + add;
+      }
+    }
+  }
+
+  // Whether the lanes lo .. lo + cnt - 1 address consecutive elements of `va` bytes, each of the first lane's address plus
+  // its place in the run times va (the accesses of a warp's coalesced load or store), and the run does not reach the top
+  // of the address space.
+  static bool addresses_run(const Lanes& at, uint32_t lo, uint32_t cnt, uint64_t va) {
+    const uint64_t a0 = at[lo];
+    if (a0 >= (uint64_t{1} << 62)) return false;
+    uint64_t differ = 0;   // (no early exit: the lanes' addresses against the run, ORed)
+    for (uint32_t i = 0; i < cnt; ++i) differ |= at[lo + i] ^ (a0 + i * va);
+    return differ == 0;
+  }
+
+  // The counters of a coalesced run (addresses_run) of cnt accesses of `span` bytes from `a0`: its sectors are the span of
+  // sectors it covers, which distinct_sectors finds by its closed form for lanes on a stride. False (the caller counts the
+  // addresses) when memcount is not using its closed forms.
+  bool count_run(Space space, uint64_t a0, uint32_t cnt, uint64_t span, Mask m, bool is_store) {
+    uint64_t sectors;
+    if (!memcount::run_sectors(a0, span * cnt, sectors)) return false;
+    count_sectors(space, static_cast<uint32_t>(std::min<uint64_t>(sectors, kMaxWarpSize * 8)), span, m, is_store);
+    return true;
+  }
+
+  // Element e of the access made by lane i of a run, in the bytes a load_run delivered (a run of vectors of n elements of
+  // `size` bytes), as the value a load leaves in a lane.
+  template <uint32_t Size>
+  static void unpack_run(const uint8_t* buf, uint32_t lo, uint32_t cnt, size_t n, size_t e, Lanes& out) {
+    for (uint32_t i = 0; i < cnt; ++i) {
+      uint64_t v = 0;
+      std::memcpy(&v, buf + (i * n + e) * Size, Size);
+      out[lo + i] = v;
+    }
+  }
+  template <uint32_t Size>
+  static void pack_run(uint8_t* buf, uint32_t lo, uint32_t cnt, size_t n, size_t e, const Lanes& vals, uint32_t bits) {
+    for (uint32_t i = 0; i < cnt; ++i) {
+      const uint64_t v = mask_to_bits(vals[lo + i], bits);
+      std::memcpy(buf + (i * n + e) * Size, &v, Size);
+    }
+  }
+
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
     uint32_t size = op.ty.bytes();
     size_t n = op.dsts.size();
@@ -11776,13 +11843,46 @@ class Interpreter {
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);  // vector accesses need vector alignment
     const bool va_pow2 = va != 0 && (va & (va - 1)) == 0;   // a mask, not a division, then
+    Lanes at;   // read only at the active lanes, which are all written below
+    uint32_t run_lo = 0, run_cnt = 0;
+    // Lanes on consecutive elements of ordinary device memory, with nothing that makes the lane loop do more (see below).
+    bool coalesced = false;
     {
       // Sectors and bank conflicts need the addresses, which only exist here.
-      Lanes at;   // read only at the active lanes, which are all written below
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane))
-          at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-      count_addresses(op.space, at, m, size, n, /*is_store=*/false);
+      const bool consecutive = lane_run(m, run_lo, run_cnt);
+      lane_addresses(base, sbase + static_cast<uint64_t>(op.addr.offset), m, consecutive, run_lo, run_cnt, at);
+      coalesced = consecutive && va_pow2 && size <= 8 && va <= 32 && fast_enabled_ &&
+                  (op.space == Space::Global || op.space == Space::Generic) && !(op.ordered && n > 1) &&
+                  addresses_run(at, run_lo, run_cnt, va);
+      if (!(coalesced && count_run(op.space, at[run_lo], run_cnt, va, m, /*is_store=*/false)))
+        count_addresses(op.space, at, m, size, n, /*is_store=*/false);
+    }
+    // The whole run at once, straight from memory (MemoryManager::load_run): exactly the loads the batch below makes, in
+    // the case that needs no per-lane work. A run that is misaligned, or that memory declines for any reason, has written
+    // nothing and takes the paths below, which meet the error where it belongs.
+    if (coalesced && (at[run_lo] & (va - 1)) == 0) {
+      alignas(16) uint8_t buf[kMaxWarpSize * 32];
+      if (mem_.load_run(at[run_lo], buf, uint64_t{run_cnt} * va, size)) {
+        if (n == 1 && size == 4 && op.ty.bits == 32 && !op.dsts[0].wide) {
+          std::memcpy(dst32(w, op.dsts[0].id, m) + run_lo, buf, size_t{run_cnt} * 4);
+          return;
+        }
+        if (n == 1 && size == 8 && op.ty.bits == 64 && op.dsts[0].wide) {
+          std::memcpy(dst64(w, op.dsts[0].id, m) + run_lo, buf, size_t{run_cnt} * 8);
+          return;
+        }
+        LaneSet got(n);
+        for (size_t e = 0; e < n; ++e) {
+          switch (size) {
+            case 1: unpack_run<1>(buf, run_lo, run_cnt, n, e, got[e]); break;
+            case 2: unpack_run<2>(buf, run_lo, run_cnt, n, e, got[e]); break;
+            case 4: unpack_run<4>(buf, run_lo, run_cnt, n, e, got[e]); break;
+            default: unpack_run<8>(buf, run_lo, run_cnt, n, e, got[e]); break;
+          }
+        }
+        for (size_t e = 0; e < n; ++e) write_loaded(w, op.dsts[e], m, got[e], op.ty);
+        return;
+      }
     }
     // The block's own shared memory, every active lane's access aligned and inside it, nothing recording accesses
     // (no race detector) and no shared-memory fault armed: the loads are plain reads, done here in one pass instead of
@@ -11881,6 +11981,10 @@ class Interpreter {
     uint32_t size = op.ty.bytes();
     size_t n = op.srcs.size();
     LaneSet vals(n);
+    // One register's value is read after the address (a register read cannot fail, and with one value the address's
+    // widened copy is not overwritten by it); anything else is read first, as the failures of the reads go before the
+    // address's.
+    bool pending = n == 1 && std::holds_alternative<RegOperand>(op.srcs[0]);
     size_t vi = 0;
     for (const auto& src : op.srcs) {
       // A value nothing has written, on its way to memory, looks like a bug --
@@ -11894,21 +11998,61 @@ class Interpreter {
           ctx_fail(ins, -1, Err::UninitializedRegister,
                    "store writes register " + r->reg.name + ", which nothing has written");
       }
+      if (pending) break;
       Lanes tmp;
       vals[vi++] = read_operand(w, ctx, ins, src, tmp);
     }
+    const auto read_values = [&] {
+      if (!pending) return;
+      pending = false;
+      Lanes tmp;
+      vals[0] = read_operand(w, ctx, ins, op.srcs[0], tmp);
+    };
     Lanes _s_base;
     const Lanes& base = addr_base(w, ctx, ins, op.addr, _s_base);
     uint64_t sbase = space_base(op.space);
     uint32_t va = size * static_cast<uint32_t>(n);
     const bool va_pow2 = va != 0 && (va & (va - 1)) == 0;
+    Lanes at;   // read only at the active lanes, which are all written below
+    uint32_t run_lo = 0, run_cnt = 0;
+    bool coalesced = false;   // as in exec_ld
     {
-      Lanes at;   // read only at the active lanes, which are all written below
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane))
-          at[lane] = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
-      count_addresses(op.space, at, m, size, n, /*is_store=*/true);
+      const bool consecutive = lane_run(m, run_lo, run_cnt);
+      lane_addresses(base, sbase + static_cast<uint64_t>(op.addr.offset), m, consecutive, run_lo, run_cnt, at);
+      coalesced = consecutive && va_pow2 && size <= 8 && va <= 32 && fast_enabled_ &&
+                  (op.space == Space::Global || op.space == Space::Generic) && !(op.ordered && n > 1) &&
+                  addresses_run(at, run_lo, run_cnt, va);
+      if (!(coalesced && count_run(op.space, at[run_lo], run_cnt, va, m, /*is_store=*/true)))
+        count_addresses(op.space, at, m, size, n, /*is_store=*/true);
     }
+    // The whole run at once (MemoryManager::store_run), in the case exec_ld's load_run takes; a run that memory declines has
+    // stored nothing. A register's lanes in a run are consecutive words of its row: stored from there.
+    if (coalesced && (at[run_lo] & (va - 1)) == 0) {
+      try {
+        if (pending) {
+          const Reg& r = std::get<RegOperand>(op.srcs[0]).reg;
+          if (size == 4 && op.ty.bits == 32 && !r.wide && r.id < w.regs32.size() && w.written32[r.id]) {
+            if (mem_.store_run(at[run_lo], w.regs32[r.id].data() + run_lo, uint64_t{run_cnt} * 4, 4)) return;
+          } else if (size == 8 && op.ty.bits == 64 && r.wide && r.id < w.regs64.size() && w.written64[r.id]) {
+            if (mem_.store_run(at[run_lo], w.regs64[r.id].data() + run_lo, uint64_t{run_cnt} * 8, 8)) return;
+          }
+        }
+        read_values();
+        alignas(16) uint8_t buf[kMaxWarpSize * 32];
+        for (size_t e = 0; e < n; ++e) {
+          switch (size) {
+            case 1: pack_run<1>(buf, run_lo, run_cnt, n, e, vals[e], op.ty.bits); break;
+            case 2: pack_run<2>(buf, run_lo, run_cnt, n, e, vals[e], op.ty.bits); break;
+            case 4: pack_run<4>(buf, run_lo, run_cnt, n, e, vals[e], op.ty.bits); break;
+            default: pack_run<8>(buf, run_lo, run_cnt, n, e, vals[e], op.ty.bits); break;
+          }
+        }
+        if (mem_.store_run(at[run_lo], buf, uint64_t{run_cnt} * va, size)) return;
+      } catch (const Error& e) {
+        rethrow_with_context(e, ins, static_cast<int>(run_lo));
+      }
+    }
+    read_values();
     // Shared memory, as in exec_ld: the stores done in one pass, in lane order and element order.
     if (op.space == Space::Shared && fast_enabled_ && ctx.shared && !ctx.shadow && !(op.ordered && n > 1)) {
       uint64_t offs[kMaxWarpSize];
