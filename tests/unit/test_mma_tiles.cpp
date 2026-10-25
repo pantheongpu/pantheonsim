@@ -50,11 +50,11 @@ struct Form {
 const Form kForms[] = {
     // floating point, other C and D types than exec_mma_simd takes
     {"bf16 k16 f32<-f32 on h100", "nvidia/h100", "sm_90", "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32", 4, 2, 4, 4, D::BF16},
-    {"f16 sparse k32", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32", 2, 2, 4, 4, D::F16, true},
-    {"f16 sparse k16 f16", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16", 2, 1, 2, 2, D::F16, true},
-    {"bf16 sparse k32", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32", 2, 2, 4, 4, D::BF16, true},
-    {"tf32 sparse k16", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k16.row.col.f32.tf32.tf32.f32", 2, 2, 4, 4, D::TF32, true},
-    {"tf32 sparse k8", "nvidia/h100", "sm_90", "mma.sp.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32", 1, 1, 4, 4, D::TF32, true},
+    {"f16 sparse k32", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32", 4, 4, 4, 4, D::F16, true},
+    {"f16 sparse k16 f16", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16", 2, 2, 2, 2, D::F16, true},
+    {"bf16 sparse k32", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32", 4, 4, 4, 4, D::BF16, true},
+    {"tf32 sparse k16", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k16.row.col.f32.tf32.tf32.f32", 4, 4, 4, 4, D::TF32, true},
+    {"tf32 sparse k8", "nvidia/h100", "sm_90", "mma.sp.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32", 2, 2, 4, 4, D::TF32, true},
     // fp8 (sm_89)
     {"e4m3 k32 f32", "nvidia/rtx4090", "sm_89", "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32", 4, 2, 4, 4, D::Fp8},
     {"e5m2 k32 f32", "nvidia/rtx4090", "sm_89", "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32", 4, 2, 4, 4, D::Fp8},
