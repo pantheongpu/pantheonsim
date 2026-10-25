@@ -146,4 +146,17 @@ VTEST(the_specialised_steps_are_the_frozen_rule) {
   VCHECK(specialised < total);   // (the halves and the signed min and max have none)
 }
 
+VTEST(a_warp_with_an_address_in_host_mapped_memory_is_not_batched) {
+  struct Mem {
+    uint64_t lo, hi;
+    mutable int asked = 0;
+    bool host_map_possible(uint64_t a) const { ++asked; return a >= lo && a < hi; }
+  };
+  const Mem m{0x1000, 0x2000};
+  const uint64_t dev[3] = {0x10, 0x20, 0x4000}, mixed[3] = {0x10, 0x1800, 0x4000};
+  VCHECK(sa::batchable(m, dev, 3));
+  VCHECK(!sa::batchable(m, mixed, 3));
+  VCHECK(sa::batchable(m, dev, 0));
+}
+
 VTEST_MAIN
