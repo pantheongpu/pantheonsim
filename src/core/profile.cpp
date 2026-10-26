@@ -181,7 +181,7 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
   if (p.vendor == "intel") {
     const uint64_t words = p.xe.register_words_per_xe_core();
     if (!p.limits.registers_per_block) p.limits.registers_per_block = static_cast<uint32_t>(words);
-    d_threads = p.xe.threads_per_xe_core() * *std::max_element(p.xe.sub_group_sizes.begin(), p.xe.sub_group_sizes.end());   // the widest sub-group fills every thread
+    d_threads = p.xe.threads_per_xe_core() * p.warp_size;                       // one sub-group a hardware thread, at the default width
     d_blocks = p.xe.threads_per_xe_core();                                  // a work-group takes at least one thread
     d_regs = p.xe.grf_per_thread * p.xe.grf_bytes / 4 / p.warp_size;
   }

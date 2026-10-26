@@ -93,7 +93,7 @@ VTEST(the_register_file_and_thread_ceilings_are_derived_from_the_xe_core) {
     VCHECK_EQ(uint64_t{p.limits.registers_per_sm}, words);
     VCHECK_EQ(p.limits.registers_per_block, p.limits.registers_per_sm);   // a work-group lives in one Xe core
     VCHECK_EQ(p.limits.max_blocks_per_sm, threads);
-    VCHECK_EQ(p.limits.max_threads_per_sm, threads * 32u);                // the widest sub-group fills every thread
+    VCHECK_EQ(p.limits.max_threads_per_sm, threads * p.warp_size);       // one sub-group a hardware thread
     VCHECK_EQ(p.limits.max_registers_per_thread, p.xe.grf_per_thread * p.xe.grf_bytes / 4 / p.warp_size);
     VCHECK_EQ(p.limits.shared_mem_per_sm, p.limits.shared_mem_per_block_optin);
   }
@@ -147,9 +147,20 @@ VTEST(occupancy_follows_the_profiles_shared_memory_and_register_file) {
   auto r = exec::kernel_resources(m.entries[0], cri, 64, 192u * 1024);
   VCHECK_EQ(r.occupancy.blocks_per_sm, 2u);
   VCHECK_EQ(std::string(r.occupancy.limited_by), "shared");
-  // Nothing shared: bound by the hardware threads. 64 invocations at 16 lanes are 4 threads, 64 threads fit.
-  auto s = exec::kernel_resources(m.entries[0], cri, 64, 0);
-  VCHECK(s.occupancy.blocks_per_sm >= 1u);
+  // Nothing shared: bound by the hardware threads, one sub-group each. A 64-invocation group is 64 / width
+  // threads, and an Xe core has threads_per_eu * eus_per_xe_core of them, whatever the width.
+  const uint32_t threads = cri.xe.threads_per_xe_core();
+  for (uint32_t w : {8u, 16u, 32u}) {
+    DeviceProfile at = cri;
+    at.warp_size = w;
+    auto s = exec::kernel_resources(m.entries[0], at, 64, 0);
+    VCHECK_EQ(s.occupancy.blocks_per_sm, threads / (64 / w));
+  }
+  // The registers a lane has follow the width the same way: the thread's GRF words over the lanes.
+  DeviceProfile wide = cri;
+  wide.warp_size = 32;
+  VCHECK_EQ(cri.limits.max_registers_per_thread, 64u);
+  VCHECK_EQ(wide.xe.grf_per_thread * wide.xe.grf_bytes / 4 / wide.warp_size, 32u);
 }
 
 VTEST(a_sub_group_width_the_profile_does_not_list_is_refused) {

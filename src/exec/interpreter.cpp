@@ -15358,6 +15358,10 @@ KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile
   // allocation unit of 8. CUTLASS's Hopper kernels declare .maxntid 384 and
   // need more than 170 by this measure; hardware launches them, spilling.
   uint32_t arch_max = profile.limits.max_registers_per_thread;
+  // An Xe hardware thread holds one sub-group out of its GRFs, so a lane has the thread's GRF words shared over
+  // the sub-group's width: the figure follows the width the launch runs at, not the profile's default one.
+  if (profile.vendor == "intel" && profile.xe.known() && profile.warp_size)
+    arch_max = profile.xe.grf_per_thread * profile.xe.grf_bytes / 4 / profile.warp_size;
   if (fn.max_nreg && (!arch_max || fn.max_nreg < arch_max)) arch_max = fn.max_nreg;
   const uint64_t bound_threads = uint64_t{fn.max_ntid[0]} * std::max(1u, fn.max_ntid[1]) *
                                  std::max(1u, fn.max_ntid[2]);
@@ -15391,9 +15395,13 @@ KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile
     rules.smem_alloc_unit = profile.cc_major >= 8 ? 128 : 256;
     rules.reserved_smem = profile.reserved_smem_per_block();
   }
+  // Likewise the thread ceiling: an Xe core runs one sub-group per hardware thread, whatever the width.
+  const uint32_t max_threads_per_sm = profile.vendor == "intel" && profile.xe.known()
+                                          ? profile.xe.threads_per_xe_core() * profile.warp_size
+                                          : profile.limits.max_threads_per_sm;
   r.occupancy = ptx::compute_occupancy(
       usage.regs_per_thread, block_threads, fn.static_shared_size, dynamic_shared,
-      profile.limits.registers_per_sm, profile.limits.max_threads_per_sm,
+      profile.limits.registers_per_sm, max_threads_per_sm,
       profile.limits.max_blocks_per_sm, profile.limits.shared_mem_per_sm, profile.warp_size, rules);
   return r;
 }
