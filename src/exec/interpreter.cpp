@@ -9157,6 +9157,18 @@ class Interpreter {
     // and the descriptor kept for the lanes that follow with the same one.
     uint64_t last_handle = 0;
     const TextureDesc* last_desc = nullptr;
+    // The fetch of every lane: what does not change from lane to lane is set once, and what does is set by each lane
+    // (a fresh TexFetch per lane was an 80-byte `rep stos`, with its start-up cost, in front of every fetch).
+    TexFetch f;
+    f.dims = op.dims;
+    f.layered = indexed;
+    f.cube = cube;
+    f.float_coords = op.ctype.is_float();
+    // A half-precision result is the f32 one narrowed.
+    f.float_result = op.dtype.is_float();
+    f.explicit_lod = lod != nullptr;
+    f.gather = op.gather;
+    f.grad = op.grad;
     for (uint32_t lane = 0; lane < W_; ++lane) {
       if (!(m & (Mask{1} << lane))) continue;
       if (!last_desc || obj[lane] != last_handle) {
@@ -9164,22 +9176,12 @@ class Interpreter {
         last_handle = obj[lane];
       }
       const TextureDesc& d = *last_desc;
-      TexFetch f;
-      f.dims = op.dims;
-      f.layered = indexed;
-      f.cube = cube;
       f.layer = indexed ? static_cast<uint32_t>(coord[0][lane]) : 0;
       for (uint32_t i = 0; i < op.dims; ++i) f.coord[i] = static_cast<uint32_t>(coord[first + i][lane]);
-      f.float_coords = op.ctype.is_float();
-      // A half-precision result is the f32 one narrowed.
-      f.float_result = op.dtype.is_float();
-      f.explicit_lod = lod != nullptr;
       if (lod)
         f.lod = op.ctype.is_float() ? static_cast<double>(f32((*lod)[lane]))
                                     : static_cast<double>(static_cast<int32_t>((*lod)[lane]));
-      f.gather = op.gather;
       if (op.grad) {
-        f.grad = true;
         for (uint32_t i = 0; i < op.dims; ++i) {
           f.ddx[i] = static_cast<uint32_t>(ddx[i][lane]);
           f.ddy[i] = static_cast<uint32_t>(ddy[i][lane]);

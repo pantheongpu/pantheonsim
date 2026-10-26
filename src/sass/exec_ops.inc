@@ -4255,16 +4255,25 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned d0 = static_cast<unsigned>(word.field(16, 8)), d1 = static_cast<unsigned>(word.field(64, 8));
   const unsigned mask = static_cast<unsigned>(word.field(72, 4));
   const bool int_coords = ins.op == Op::TLD;
+  // The fetch of every lane: what does not change from lane to lane is set once, and what does is set by each lane (a
+  // fresh TexFetch per lane was an 80-byte `rep stos`, with its start-up cost, in front of every fetch).
+  exec::TexFetch f;
+  // ptxas fetches a 1D texture as a 2D one at y = 0, which is what the
+  // hardware makes of it (a 2D texture of height 1); the sampler's 1D
+  // fetch is that already.
+  f.dims = dims == 2 && !layered && d.height == 0 && d.depth == 0 ? 1 : dims;
+  f.layered = layered;
+  f.cube = cube;
+  f.float_coords = !int_coords;
+  f.float_result = d.kind == exec::ChannelKind::Float || d.read_as_normalized_float;
+  f.grad = txd;
+  if (ins.op == Op::TLD4) f.gather = static_cast<int>(ins.f[2]);
   each_lane(ex, [&](unsigned l) {
     uint32_t comp[7] = {};   // a cube array's layer, x, y, z, then the LOD, offsets and reference
     for (unsigned i = 0; i < total; ++i) comp[i] = i < in0 ? rd(r0 + i, l) : rd(r1 + (i - in0), l);
-    exec::TexFetch f;
-    // ptxas fetches a 1D texture as a 2D one at y = 0, which is what the
-    // hardware makes of it (a 2D texture of height 1); the sampler's 1D
-    // fetch is that already.
-    f.dims = dims == 2 && !layered && d.height == 0 && d.depth == 0 ? 1 : dims;
-    f.layered = layered;
-    f.cube = cube;
+    f.layer = 0;
+    f.explicit_lod = false;
+    f.lod = 0;
     unsigned k = 0;
     if (layered && !txd) f.layer = comp[k++];
     for (unsigned i = 0; i < dims; ++i) f.coord[i] = comp[k++];
@@ -4272,7 +4281,6 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     if (txd) {
       // ddx.x, ddy.x, ddx.y, ddy.y in four registers from the one at 32 (the second pair only for a 2D texture).
       const unsigned gr = static_cast<unsigned>(word.field(32, 8));
-      f.grad = true;
       f.ddx[0] = rd(gr, l);
       f.ddy[0] = rd(gr + 1, l);
       if (dims >= 2) {
@@ -4280,7 +4288,6 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         f.ddy[1] = rd(gr + 3, l);
       }
     }
-    f.float_coords = !int_coords;
     // TEX.NDV on a 3D texture, with no LOD operand: the level comes from the coordinates of the quad this thread is
     // in -- threads 0, 1 and 2 of it are P, P + dPdx and P + dPdy, the way ptxas builds tex.grad (the threads
     // below the fetch's own are helpers, see BMOV.PQUAD MACTIVE).
@@ -4306,9 +4313,8 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       f.explicit_lod = true;
       f.lod = static_cast<double>(exec::tex_grad::lod_q_3d(dq[0], dq[1])) / 256.0;
     }
-    // The result's type is the texture's (its format and read mode), not
-    // the instruction's: SASS has one TEX for every PTX destination type.
-    f.float_result = d.kind == exec::ChannelKind::Float || d.read_as_normalized_float;
+    // (The result's type is the texture's -- its format and read mode -- not the instruction's: SASS has one TEX for
+    // every PTX destination type.)
     if (has_lod) {
       f.explicit_lod = true;
       f.lod = int_coords ? static_cast<double>(static_cast<int32_t>(comp[k])) : static_cast<double>(std::bit_cast<float>(comp[k]));
@@ -4327,7 +4333,6 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     // A depth reference (DC) is in the register after: CUDA gives a texture no
     // depth-compare state, so it changes nothing (see the PTX engine).
     (void)has_dc;
-    if (ins.op == Op::TLD4) f.gather = static_cast<int>(ins.f[2]);
     uint32_t out[4];
     exec::texture_fetch(mem_, d, f, out);
     // The fault predicate (81-83), set when the texel is NOT resident (ptxas's SEL turns it round for
