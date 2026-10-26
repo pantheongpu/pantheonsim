@@ -1735,7 +1735,7 @@ bool MemoryManager::atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, v
 }
 
 bool MemoryManager::rmw_batch_fn(const uint64_t* addrs, size_t count, uint32_t size, RmwLaneFn compute, void* ctx,
-                                 uint64_t* olds, size_t* done, bool lock_free) {
+                                 uint64_t* olds, size_t* done, bool lock_free, bool always_store) {
   *done = 0;
   if (count == 0) return true;
   if (lock_free && size != 4 && size != 8) return false;
@@ -1760,12 +1760,12 @@ bool MemoryManager::rmw_batch_fn(const uint64_t* addrs, size_t count, uint32_t s
     s.chunk = a.chunks[s.chunk_idx].load(std::memory_order_acquire);
     lane.i = i;
     if (lock_free) {
-      atomic_rmw_slot(s, size, trampoline, &lane, &olds[i], /*always_store=*/false);
+      atomic_rmw_slot(s, size, trampoline, &lane, &olds[i], always_store);
     } else {
       const uint64_t old = rmw_load(s, size);
       olds[i] = old;
       const uint64_t now = compute(ctx, i, old);
-      if (now != old) rmw_store(s, size, now);
+      if (now != old || always_store) rmw_store(s, size, now);
     }
     *done = i + 1;
   }

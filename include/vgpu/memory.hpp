@@ -253,14 +253,17 @@ class MemoryManager {
   // wherever any access could differ from the calls these stand for: a fault armed, a host mapping in reach, an address misaligned or
   // outside the one allocation the first is in, a size that is not 1/2/4/8 (4/8 when lock_free).
   using RmwLaneFn = uint64_t (*)(void* ctx, size_t i, uint64_t old);
+  // `always_store`: store the result even where it equals what was loaded, as rmw_scalar does (a store makes an untouched chunk
+  // real, which a store of an unchanged value skips).
   bool rmw_batch_fn(const uint64_t* addrs, size_t count, uint32_t size, RmwLaneFn compute, void* ctx, uint64_t* olds, size_t* done,
-                    bool lock_free);
+                    bool lock_free, bool always_store);
   template <class F>
-  bool rmw_batch(const uint64_t* addrs, size_t count, uint32_t size, F&& compute, uint64_t* olds, size_t* done, bool lock_free) {
+  bool rmw_batch(const uint64_t* addrs, size_t count, uint32_t size, F&& compute, uint64_t* olds, size_t* done, bool lock_free,
+                 bool always_store = false) {
     return rmw_batch_fn(
         addrs, count, size,
         [](void* c, size_t i, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(i, old); },
-        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), olds, done, lock_free);
+        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), olds, done, lock_free, always_store);
   }
 
   // The fields of one record (a texel's channels), `n` of them end to end from `addr`, field i `sizes[i]` bytes

@@ -13584,7 +13584,7 @@ class Interpreter {
                                in_compute = false;
                                return nv;
                              },
-                             olds, &done, /*lock_free=*/false)) {
+                             olds, &done, /*lock_free=*/false, /*always_store=*/true)) {
             stats_.atomics += cnt;
             stats_.atomic_bytes += uint64_t{size} * cnt;
             for (size_t i = 0; i < cnt; ++i) r[lane_of[i]] = olds[i];

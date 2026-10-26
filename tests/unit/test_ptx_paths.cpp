@@ -72,6 +72,7 @@ std::string kernel(const std::string& body) {
 
 Outcome run(const std::string& body, uint32_t blocks, uint32_t threads, uint32_t n, bool fast) {
   setenv("VGPU_FASTPATH", fast ? "1" : "0", 1);
+  setenv("VGPU_THREADS", "1", 1);   // (blocks in a fixed order: a kernel that spins on another block's store would otherwise vary)
   Outcome o;
   MemoryManager mem{1 << 20};
   DeviceProfile prof = load_gpu("nvidia/a10");
@@ -92,6 +93,7 @@ Outcome run(const std::string& body, uint32_t blocks, uint32_t threads, uint32_t
     o.error = e.what();
   }
   unsetenv("VGPU_FASTPATH");
+  unsetenv("VGPU_THREADS");
   o.out.resize(total);
   mem.read(pout, o.out.data(), total * 4);
   uint32_t flag = 0;

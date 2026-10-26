@@ -184,6 +184,7 @@ $LSUM:
 
 Outcome run(const std::string& body, const Shape& s, bool fast, bool uniform_out) {
   setenv("VGPU_FASTPATH", fast ? "1" : "0", 1);
+  setenv("VGPU_THREADS", "1", 1);   // (blocks in a fixed order: a kernel that spins on another block's store would otherwise vary)
   Outcome o;
   MemoryManager mem{1 << 20};
   DeviceProfile prof = load_gpu("nvidia/a10");
@@ -220,6 +221,7 @@ Outcome run(const std::string& body, const Shape& s, bool fast, bool uniform_out
     o.error = e.what();
   }
   unsetenv("VGPU_FASTPATH");
+  unsetenv("VGPU_THREADS");
   o.in.resize(kBuf);
   o.out.resize(kBuf);
   o.regs.resize(kThreads * 64);
