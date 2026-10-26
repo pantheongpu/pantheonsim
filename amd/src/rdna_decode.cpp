@@ -149,10 +149,23 @@ Table make_table4() {
   (void)rows;
   return make_table(all);
 }
+// The table of the generation being decoded, made at its first use (a process runs one generation, and the other three tables are
+// some two thousand map insertions it would pay for).
 const Table& table() {
-  static const Table t2 = make_table(rows_rdna2()), t3 = make_table(rows_rdna3()), t4 = make_table4(),
-                     t5 = make_table(rows_cdna5());
-  return g_cdna5 ? t5 : g_rdna4 ? t4 : g_rdna2 ? t2 : t3;
+  if (g_cdna5) {
+    static const Table t5 = make_table(rows_cdna5());
+    return t5;
+  }
+  if (g_rdna4) {
+    static const Table t4 = make_table4();
+    return t4;
+  }
+  if (g_rdna2) {
+    static const Table t2 = make_table(rows_rdna2());
+    return t2;
+  }
+  static const Table t3 = make_table(rows_rdna3());
+  return t3;
 }
 const Row& row(Enc e, uint8_t segment, uint32_t opcode) {
   const auto& m = table().by_opcode;

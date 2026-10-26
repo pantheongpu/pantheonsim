@@ -501,7 +501,8 @@ class Runner {
     // VGPU_FASTPATH=0 sends every instruction down the general path, as it does for the PTX interpreter: the
     // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
     // block. For checking that the fast paths compute what the general one does.
-    env_ = exec::read_launch_env();   // (one pass over the environment for all of the launch's variables)
+    if (cfg_.env) env_ = *cfg_.env;   // (the runtime's one pass over the environment for all of the launch's variables, or one of our own)
+    else env_ = exec::read_launch_env();
     if (const char* f = env_.fastpath; f && f[0] == '0') fast_ = false;
     vgpu::exec::tc86::refresh_exact(env_.tc_exact);   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
     if (tier::requested()) {

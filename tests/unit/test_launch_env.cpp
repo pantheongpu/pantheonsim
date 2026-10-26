@@ -10,6 +10,8 @@
 #include "vgpu/exec/launch_env.hpp"
 #include "vtest.hpp"
 
+extern "C" char** environ;
+
 namespace {
 
 using vgpu::exec::LaunchEnv;
@@ -33,6 +35,15 @@ struct Names {
   const char* tier_chain = std::getenv("VGPU_TIER_CHAIN");
   const char* threads = std::getenv("VGPU_THREADS");
   const char* lockstep = std::getenv("VGPU_LOCKSTEP");
+  const char* trace = std::getenv("VGPU_TRACE");
+  const char* strict = std::getenv("VGPU_STRICT");
+  const char* race = std::getenv("VGPU_RACE");
+  const char* max_steps = std::getenv("VGPU_MAX_STEPS");
+  const char* scheduler = std::getenv("VGPU_SCHEDULER");
+  const char* scheduler_seed = std::getenv("VGPU_SCHEDULER_SEED");
+  const char* fail_alloc = std::getenv("VGPU_FAIL_ALLOC");
+  const char* fail_launch = std::getenv("VGPU_FAIL_LAUNCH");
+  const char* fail_memcpy = std::getenv("VGPU_FAIL_MEMCPY");
 };
 
 // What the one pass finds and what getenv finds in the same environment: the same pointers.
@@ -46,6 +57,15 @@ void same_as_getenv(const char* what) {
   if (e.tier_chain != n.tier_chain) throw vtest::Failure(std::string(what) + ": VGPU_TIER_CHAIN differs");
   if (e.threads != n.threads) throw vtest::Failure(std::string(what) + ": VGPU_THREADS differs");
   if (e.lockstep != n.lockstep) throw vtest::Failure(std::string(what) + ": VGPU_LOCKSTEP differs");
+  if (e.trace != n.trace) throw vtest::Failure(std::string(what) + ": VGPU_TRACE differs");
+  if (e.strict != n.strict) throw vtest::Failure(std::string(what) + ": VGPU_STRICT differs");
+  if (e.race != n.race) throw vtest::Failure(std::string(what) + ": VGPU_RACE differs");
+  if (e.max_steps != n.max_steps) throw vtest::Failure(std::string(what) + ": VGPU_MAX_STEPS differs");
+  if (e.scheduler != n.scheduler) throw vtest::Failure(std::string(what) + ": VGPU_SCHEDULER differs");
+  if (e.scheduler_seed != n.scheduler_seed) throw vtest::Failure(std::string(what) + ": VGPU_SCHEDULER_SEED differs");
+  if (e.fail_alloc != n.fail_alloc) throw vtest::Failure(std::string(what) + ": VGPU_FAIL_ALLOC differs");
+  if (e.fail_launch != n.fail_launch) throw vtest::Failure(std::string(what) + ": VGPU_FAIL_LAUNCH differs");
+  if (e.fail_memcpy != n.fail_memcpy) throw vtest::Failure(std::string(what) + ": VGPU_FAIL_MEMCPY differs");
 }
 
 }  // namespace
@@ -64,11 +84,30 @@ VTEST(every_variable_the_launch_reads_is_found_with_its_value) {
   same_as_getenv("all set");
 }
 
+VTEST(the_runtime_and_interpreter_variables_are_found_with_their_values) {
+  Replaced env({"VGPU_TRACE=1", "VGPU_STRICT=1", "VGPU_RACE=2", "VGPU_MAX_STEPS=99", "VGPU_SCHEDULER=random", "VGPU_SCHEDULER_SEED=7",
+                "VGPU_FAIL_ALLOC=all", "VGPU_FAIL_LAUNCH=2,3", "VGPU_FAIL_MEMCPY=1", "VGPU_FASTCOUNT=0", "VGPU_FAIL_OTHER=1", "VGPU_SIMD=avx2",
+                "VGPU_TRACEX=1", "VGPU_RACE_X=1", "VGPU_STRICTLY=1", "VGPU_MAX_STEPS2=1", "VGPU_SCHEDULER_SEEDS=1"});
+  const LaunchEnv e = vgpu::exec::read_launch_env();
+  VCHECK(e.trace && std::string(e.trace) == "1");
+  VCHECK(e.strict && std::string(e.strict) == "1");
+  VCHECK(e.race && std::string(e.race) == "2");
+  VCHECK(e.max_steps && std::string(e.max_steps) == "99");
+  VCHECK(e.scheduler && std::string(e.scheduler) == "random");
+  VCHECK(e.scheduler_seed && std::string(e.scheduler_seed) == "7");
+  VCHECK(e.fail_alloc && std::string(e.fail_alloc) == "all");
+  VCHECK(e.fail_launch && std::string(e.fail_launch) == "2,3");
+  VCHECK(e.fail_memcpy && std::string(e.fail_memcpy) == "1");
+  VCHECK(!e.fastpath && !e.threads);
+  same_as_getenv("the runtime's variables");
+}
+
 VTEST(a_variable_that_is_not_there_is_null_and_an_empty_one_is_an_empty_string) {
   {
     Replaced env({"PATH=/usr/bin", "VGPU_QUIET=1"});
     const LaunchEnv e = vgpu::exec::read_launch_env();
     VCHECK(!e.fastpath && !e.tc_exact && !e.sass_trace && !e.tier_stats && !e.tier_chain && !e.threads && !e.lockstep);
+    VCHECK(!e.trace && !e.strict && !e.race && !e.max_steps && !e.scheduler && !e.scheduler_seed && !e.fail_alloc && !e.fail_launch && !e.fail_memcpy);
     same_as_getenv("none set");
   }
   {

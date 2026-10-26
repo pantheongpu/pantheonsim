@@ -65,6 +65,8 @@ std::unique_ptr<Scheduler> make_scheduler(SchedulerKind kind, uint64_t seed = 0)
 // running the default -- a mode nobody selected is worse than an error, since
 // the whole point is knowing which order produced a result.
 bool scheduler_from_env(SchedulerKind* kind, uint64_t* seed);
+// The same from the two values already read (a launch's one pass over the environment): VGPU_SCHEDULER and VGPU_SCHEDULER_SEED.
+bool scheduler_from_env(SchedulerKind* kind, uint64_t* seed, const char* mode, const char* seed_value);
 
 const char* scheduler_name(SchedulerKind kind);
 

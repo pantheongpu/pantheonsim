@@ -14,6 +14,7 @@
 #include <ostream>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -1164,8 +1165,10 @@ struct EntryFn;
 struct LazyByte {
   mutable std::atomic<uint8_t> v{0};
   LazyByte() = default;
-  LazyByte(const LazyByte& o) : v(o.v.load(std::memory_order_relaxed)) {}
-  LazyByte& operator=(const LazyByte& o) {
+  // noexcept (an atomic load and store): without it a vector of Instr or of EntryFn copies its elements when it grows,
+  // for an Instr holds one of these, and the variant and the vector holding it then copy too.
+  LazyByte(const LazyByte& o) noexcept : v(o.v.load(std::memory_order_relaxed)) {}
+  LazyByte& operator=(const LazyByte& o) noexcept {
     v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
     return *this;
   }
@@ -1437,13 +1440,16 @@ struct EntryFn {
   struct PollsFlag {
     mutable std::atomic<int8_t> v{-1};
     PollsFlag() = default;
-    PollsFlag(const PollsFlag& o) : v(o.v.load()) {}
-    PollsFlag& operator=(const PollsFlag& o) {
+    PollsFlag(const PollsFlag& o) noexcept : v(o.v.load()) {}
+    PollsFlag& operator=(const PollsFlag& o) noexcept {
       v.store(o.v.load());
       return *this;
     }
   } polls, polls_reach;   // the body's own loops; and with the functions it calls
 };
+// Growing a vector of these moves them (a copy of each would be a copy of a whole function's tables).
+static_assert(std::is_nothrow_move_constructible_v<Instr>, "an Instr must move without throwing");
+static_assert(std::is_nothrow_move_constructible_v<EntryFn>, "an EntryFn must move without throwing");
 
 // A module-scope .global/.const variable, materialized into device memory at
 // module load.

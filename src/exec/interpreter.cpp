@@ -66,6 +66,7 @@
 #include "vgpu/exec/devrt.hpp"
 #include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/launch_env.hpp"
 #include "vgpu/exec/lockstep.hpp"
 #include "vgpu/ptx/regalloc.hpp"
 #include "vgpu/simd/simd.hpp"
@@ -150,10 +151,18 @@ using Lanes32 = std::array<uint32_t, kMaxWarpSize>;
 
 struct ParamBuffer {
   std::vector<uint8_t> bytes;
-  std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> layout;  // name -> (offset, size)
-  // The same, by position in the kernel's parameter list (Addr::param_index),
-  // for a load that would otherwise hash the parameter's name.
+  // Each parameter's (offset, size), by position in the kernel's parameter list (Addr::param_index),
+  // for a load that would otherwise look the parameter's name up.
   std::vector<std::pair<uint32_t, uint32_t>> by_index;
+  const std::vector<ParamDecl>* decls = nullptr;   // the kernel's parameters, whose names by_index is in the order of
+  // A parameter by name (the later of two of one name, as a map filled in order gave): a lookup that a few accesses make (a
+  // parameter whose address a kernel takes, a load from a device function's slot), so it is a scan, not a table made for
+  // every launch.
+  const std::pair<uint32_t, uint32_t>* find(const std::string& name) const {
+    for (size_t i = by_index.size(); i-- > 0;)
+      if ((*decls)[i].name == name) return &by_index[i];
+    return nullptr;
+  }
 };
 
 // State for bar.red, which needs every warp in the block to arrive before it
@@ -696,21 +705,21 @@ std::atomic<bool> g_race_strict{false};
 // makes it depend on which kernel in a process ran first -- which is how the
 // race detector's own test came to pass a racy kernel: an earlier launch had
 // already frozen the flag to false.
-void refresh_modes() {
-  faults::refresh();
-  const char* strict = std::getenv("VGPU_STRICT");
+void refresh_modes(const LaunchEnv& env) {
+  faults::refresh(env.fail_alloc, env.fail_launch, env.fail_memcpy);
+  const char* strict = env.strict;
   g_strict.store(strict && strict[0] == '1', std::memory_order_relaxed);
-  const char* race = std::getenv("VGPU_RACE");
+  const char* race = env.race;
   g_race.store(race && (race[0] == '1' || race[0] == '2'), std::memory_order_relaxed);
   g_race_strict.store(race && race[0] == '2', std::memory_order_relaxed);
-  const char* fast = std::getenv("VGPU_FASTPATH");
+  const char* fast = env.fastpath;
   g_fast_path.store(!(fast && fast[0] == '0'), std::memory_order_relaxed);
-  vgpu::exec::tc86::refresh_exact();   // VGPU_TC_EXACT=0: the earlier sequential tensor sums (include/vgpu/exec/tc_ampere.hpp)
+  vgpu::exec::tc86::refresh_exact(env.tc_exact);   // VGPU_TC_EXACT=0: the earlier sequential tensor sums (include/vgpu/exec/tc_ampere.hpp)
 }
 
 // IEEE 754 binary16 <-> double, implemented in software so the engine needs no
 // host f16 support. Round-to-nearest-even, with subnormals and inf/NaN.
-double f16_to_double_exact(uint64_t bits) {
+constexpr double f16_to_double_exact(uint64_t bits) {
   // Assembled field by field rather than through ldexp: every binary16 value
   // is exact in a double, so sign, exponent and mantissa carry straight across,
   // and the libm call this replaced was most of an f16 matrix kernel's time.
@@ -737,7 +746,10 @@ double f16_to_double_exact(uint64_t bits) {
 // Every binary16 value's double, computed once by the function above: f16
 // kernels convert every operand of every lane, and a load is cheaper than the
 // field assembly. The same values by construction.
-const std::array<double, 65536> kF16ToDouble = [] {
+//
+// Built by the compiler, into the library's read-only data: filled when the process starts, the two tables cost a quarter of
+// a millisecond of every process that loads the library (some 130 pages written, for a program that never converts a half).
+constexpr std::array<double, 65536> kF16ToDouble = [] {
   std::array<double, 65536> t{};
   for (uint32_t h = 0; h < 65536; ++h) t[h] = f16_to_double_exact(h);
   return t;
@@ -745,11 +757,46 @@ const std::array<double, 65536> kF16ToDouble = [] {
 
 // The same values as floats, for the f16 WMMA fast path: half the table, and
 // every binary16 value is exact in f32.
-const std::array<float, 65536> kF16ToFloat = [] {
+// (A NaN or an infinity is made from its bits: the compiler's own conversion of a NaN is not the host's.)
+constexpr std::array<float, 65536> kF16ToFloat = [] {
   std::array<float, 65536> t{};
-  for (uint32_t h = 0; h < 65536; ++h) t[h] = static_cast<float>(kF16ToDouble[h]);
+  for (uint32_t h = 0; h < 65536; ++h) {
+    const uint32_t sign = (h >> 15) << 31;
+    if (((h >> 10) & 0x1F) == 31) t[h] = std::bit_cast<float>(sign | 0x7F800000u | ((h & 0x3FF) ? 0x7FC00000u : 0u));
+    else t[h] = static_cast<float>(kF16ToDouble[h]);
+  }
   return t;
 }();
+
+// The tables against the format itself, worked out again from the fields in another way (the exponent and the leading bit found by
+// counting, not by the functions above), for every one of the 65536 halves: checked when the library is built.
+constexpr bool f16_tables_match_the_format() {
+  for (uint32_t h = 0; h < 65536; ++h) {
+    const uint32_t s = h >> 15, e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    uint32_t fbits;
+    uint64_t dbits;
+    if (e == 31) {
+      fbits = (s << 31) | 0x7F800000u | (m ? 0x400000u : 0u);
+      dbits = (uint64_t{s} << 63) | 0x7FF0000000000000ull | (m ? 0x8000000000000ull : 0ull);
+    } else if (e != 0 || m != 0) {
+      int exp = static_cast<int>(e) - 15;   // value = 1.frac * 2^exp
+      uint32_t frac = m;
+      if (e == 0) {                         // a subnormal: m * 2^-24, its leading bit at t
+        const int t = 31 - std::countl_zero(m);
+        exp = t - 24;
+        frac = (m << (10 - t)) & 0x3FF;
+      }
+      fbits = (s << 31) | (static_cast<uint32_t>(exp + 127) << 23) | (frac << 13);
+      dbits = (uint64_t{s} << 63) | (uint64_t{static_cast<uint32_t>(exp + 1023)} << 52) | (uint64_t{frac} << 42);
+    } else {
+      fbits = s << 31;
+      dbits = uint64_t{s} << 63;
+    }
+    if (std::bit_cast<uint32_t>(kF16ToFloat[h]) != fbits || std::bit_cast<uint64_t>(kF16ToDouble[h]) != dbits) return false;
+  }
+  return true;
+}
+static_assert(f16_tables_match_the_format(), "kF16ToFloat / kF16ToDouble differ from the binary16 format");
 
 double f16_to_double(uint64_t bits) {
   if (!g_fast_path.load(std::memory_order_relaxed)) return f16_to_double_exact(bits);
@@ -1319,7 +1366,9 @@ __attribute__((target("avx,f16c"))) void f16x16_to_float_f16c(const uint32_t* w8
   _mm256_storeu_ps(out, f16x8_to_float_f16c(lo));
   _mm256_storeu_ps(out + 8, f16x8_to_float_f16c(hi));
 }
-const bool g_f16c = [] {
+// Checked on the first use, not when the library loads (a program that never converts a WMMA fragment of halves skips the
+// four thousand conversions); the answer is the same for every use.
+bool f16c_matches_table() {
   if (!__builtin_cpu_supports("avx") || !__builtin_cpu_supports("f16c")) return false;
   for (uint32_t h = 0; h < 65536; h += 16) {
     uint32_t w8[8];
@@ -1329,7 +1378,11 @@ const bool g_f16c = [] {
     if (std::memcmp(got, &kF16ToFloat[h], sizeof got) != 0) return false;
   }
   return true;
-}();
+}
+bool f16c_usable() {
+  static const bool ok = f16c_matches_table();
+  return ok;
+}
 #endif
 // 8x8 transposes of 32-bit values, for moving WMMA fragments between the
 // register file (one array of lanes per register) and tiles (one row per
@@ -1397,7 +1450,7 @@ void scatter8x8(const void* in, uint32_t* const rows[8], uint32_t first) {
 
 void f16x16_to_float(const uint32_t* w8, float* out) {
 #if defined(__x86_64__) && defined(__GNUC__)
-  if (g_f16c) return f16x16_to_float_f16c(w8, out);
+  if (f16c_usable()) return f16x16_to_float_f16c(w8, out);
 #endif
   f16x16_to_float_table(w8, out);
 }
@@ -3151,9 +3204,73 @@ class Interpreter {
     TensorMemory tmem;
     SharedShadow shadow;
     std::vector<Warp> warps;
+    // The memory of the vectors of the warps a block had, kept for the warps of the next one (see setup_block).
+    struct WarpBuffers {
+      RegFile<Lanes32> regs32;
+      RegFile<Lanes> regs64;
+      std::vector<Mask> preds;
+      std::vector<uint8_t> written32, written64;
+      std::vector<Path> paths;
+    };
+    std::vector<WarpBuffers> spare;
+    // The warps go; the memory of their vectors is kept in `spare`.
+    void keep_buffers() {
+      spare.resize(warps.size());
+      for (size_t w = 0; w < warps.size(); ++w) {
+        Warp& old = warps[w];
+        spare[w] = {std::move(old.regs32), std::move(old.regs64), std::move(old.preds),
+                    std::move(old.written32), std::move(old.written64), std::move(old.paths)};
+      }
+      warps.clear();
+    }
     uint64_t clock = 0;
     bool done = false;
     bool exited = false;   // every warp Done; see BlockCtx::exited
+    // Back to the state of a new block, keeping the memory it grew (shared memory, warps, tables). The rest of what a block starts
+    // from is set by setup_block, as for a new one.
+    void reset() {
+      bar_red = BarrierReduction{};
+      bars = NamedBarriers{};
+      mbar.bars.clear();
+      wgmma.pending.clear();
+      tmem.reset();
+      shadow.words.clear();
+      shadow.epoch = 0;
+      clock = 0;
+      done = false;
+      exited = false;
+    }
+  };
+
+  // A thread keeps a few BlockStates between blocks and launches: a launch of one small block built one (two deques, the
+  // shared memory, a warp's five vectors and paths: a dozen allocations) and threw it away. Taken for the length of a block, so a
+  // block that runs while another of this thread's is open (a launch from a block) takes its own.
+  struct PooledBlock {
+    std::unique_ptr<BlockState> b;
+    PooledBlock() {
+      std::vector<std::unique_ptr<BlockState>>& pool = free_blocks();
+      if (!pool.empty()) {
+        b = std::move(pool.back());
+        pool.pop_back();
+        b->reset();
+      } else {
+        b = std::make_unique<BlockState>();
+      }
+    }
+    ~PooledBlock() {
+      // Not a state that grew large: shared memory of a big kernel, a block of many warps.
+      constexpr size_t kMaxShared = size_t{256} << 10, kMaxWarps = 16;
+      std::vector<std::unique_ptr<BlockState>>& pool = free_blocks();
+      if (!b) return;
+      b->keep_buffers();   // (the warps' local memory and call frames are not kept)
+      if (pool.size() < 4 && b->shared.capacity() <= kMaxShared && b->spare.size() <= kMaxWarps) pool.push_back(std::move(b));
+    }
+    PooledBlock(const PooledBlock&) = delete;
+    PooledBlock& operator=(const PooledBlock&) = delete;
+    static std::vector<std::unique_ptr<BlockState>>& free_blocks() {
+      thread_local std::vector<std::unique_ptr<BlockState>> pool;
+      return pool;
+    }
   };
 
   // The kernel's own shared memory as the hardware allocates it: static
@@ -3204,7 +3321,7 @@ class Interpreter {
     b.ctx.mbar = &b.mbar;
     b.wgmma.pending.clear();
     b.ctx.wgmma = &b.wgmma;
-    b.tmem = TensorMemory{};
+    b.tmem.reset();
     b.ctx.tmem = &b.tmem;
     b.ctx.bars = &b.bars;
     b.ctx.warps = &b.warps;
@@ -3216,11 +3333,22 @@ class Interpreter {
     }
     const uint64_t total = uint64_t{b.ctx.ntid[0]} * b.ctx.ntid[1] * b.ctx.ntid[2];
     const size_t nwarps = static_cast<size_t>((total + W_ - 1) / W_);
-    // resize, not assign: a Warp owns a unique_ptr and so is move-only.
-    b.warps.clear();
+    // resize, not assign: a Warp owns a unique_ptr and so is move-only. The warps start from nothing; the memory of the
+    // vectors they will fill is the old warps'.
+    b.keep_buffers();
     b.warps.resize(nwarps);
     for (size_t w = 0; w < nwarps; ++w) {
       Warp& warp = b.warps[w];
+      if (w < b.spare.size()) {
+        BlockState::WarpBuffers& s = b.spare[w];
+        warp.regs32 = std::move(s.regs32);
+        warp.regs64 = std::move(s.regs64);
+        warp.preds = std::move(s.preds);
+        warp.written32 = std::move(s.written32);
+        warp.written64 = std::move(s.written64);
+        warp.paths = std::move(s.paths);
+        warp.paths.clear();
+      }
       warp.regs32.clear();
       warp.regs32.resize(fn_.num_regs32);
       warp.regs64.clear();
@@ -3345,7 +3473,8 @@ class Interpreter {
   }
 
   void run_block(BlockCtx& ctx, Scheduler& sched) {
-    BlockState b;
+    PooledBlock pooled;
+    BlockState& b = *pooled.b;
     b.ctx = ctx;
     setup_block(b);
     ClusterState solo;   // a block with no explicit cluster is a cluster of one
@@ -3505,6 +3634,12 @@ class Interpreter {
       // through to the paths below.
       if (mu && mu->kind != MicroOp::None && fast_enabled_ && exec_micro(w, *mu, w.paths[idx].mask)) {
         ++w.paths[idx].pc;
+        continue;
+      }
+      // Loads and stores go straight to their handlers too (the chain of tests step() and dispatch() make to find them is a
+      // fifth of a load's cost).
+      if (fast_enabled_ && (ins.op.index() == op_index<OpLd>() || ins.op.index() == op_index<OpSt>())) {
+        step_mem(w, ctx, idx, ins);
         continue;
       }
       // The fast-path kinds go straight to their handler: no trip through
@@ -4713,8 +4848,7 @@ class Interpreter {
     // CUB's segmented sort does "mov.b64 %rd, kernel_param_10" and then loads
     // through the register. Parameters live in their own window so those loads
     // resolve back to the parameter buffer.
-    if (auto it = params_.layout.find(name); it != params_.layout.end())
-      return kParamVaBase + it->second.first;
+    if (const auto* p = params_.find(name)) return kParamVaBase + p->first;
     // Taking the address of a *kernel* means one thing in device code: a
     // device-side launch. Saying so is worth a branch, because "unknown
     // symbol" sends you looking for a typo in a name that is right there in
@@ -5939,6 +6073,37 @@ class Interpreter {
     if (w.retry) {
       w.retry = false;
       return;
+    }
+    ++w.paths[idx].pc;
+  }
+
+  // step() for a load or a store: what it does for one (the guard, the counting, the memory fences, the error's context, the pc)
+  // without the tests for the instructions that are neither.
+  void step_mem(Warp& w, const BlockCtx& ctx, size_t idx, const Instr& ins) {
+    step_idx_ = idx;
+    Mask m = w.paths[idx].mask;
+    if (ins.has_pred) {
+      Mask p = read_pred(w, ins, ins.pred);
+      if (ins.pred_negated) p = ~p;
+      m &= p;
+    }
+    if (m != 0) {
+      try {
+        if (const auto* op = std::get_if<OpLd>(&ins.op)) {
+          count_memory(op->space, op->ty.bytes() * static_cast<uint32_t>(op->dsts.size()), popcount_mask(m), /*is_store=*/false);
+          exec_ld(w, ctx, ins, *op, m);
+          if (op->acquire) std::atomic_thread_fence(std::memory_order_acquire);
+        } else {
+          const auto& st = std::get<OpSt>(ins.op);
+          count_memory(st.space, st.ty.bytes() * static_cast<uint32_t>(st.srcs.size()), popcount_mask(m), /*is_store=*/true);
+          if (st.release) std::atomic_thread_fence(std::memory_order_release);
+          exec_st(w, ctx, ins, st, m);
+        }
+      } catch (const Error& e) {
+        if (std::string(e.what()).find("in kernel") == std::string::npos)
+          rethrow_with_context(e, ins, -1);
+        throw;
+      }
     }
     ++w.paths[idx].pc;
   }
@@ -12364,10 +12529,9 @@ class Interpreter {
       if (fast_enabled_ && cur_ == &fn_ && op.addr.param_index < params_.by_index.size()) {
         slot = params_.by_index[op.addr.param_index];
       } else {
-        auto it = params_.layout.find(op.addr.base);
-        if (it == params_.layout.end())
-          ctx_fail(ins, -1, Err::PtxParse, "ld.param from non-parameter '" + op.addr.base + "'");
-        slot = it->second;
+        const auto* found = params_.find(op.addr.base);
+        if (!found) ctx_fail(ins, -1, Err::PtxParse, "ld.param from non-parameter '" + op.addr.base + "'");
+        slot = *found;
       }
       auto [off, psize] = slot;
       for (size_t e = 0; e < n; ++e) {
@@ -15177,21 +15341,24 @@ class Interpreter {
   const EntryFn* micro_owner_ = nullptr;   // the function micro_ was taken from
   const MicroOp* micro_ = nullptr;         // its pre-decoded instructions, or null
   const uint64_t* micro_consts_ = nullptr;   // and the 64-bit constants they name (EntryFn::micro_consts)
-  std::array<Lanes, 3> immf_lanes_{};      // the constants spread across the lanes, with their values
+  // The scratch lanes below are not cleared (a launch would write 6 KB of zeros for them): each is written, for the lanes
+  // it is read at, before it is read -- the *_valid_ flags say which constants are spread, and the others are filled by the
+  // instruction that uses them. The zero rows stay zero.
+  std::array<Lanes, 3> immf_lanes_;      // the constants spread across the lanes, with their values
   std::array<uint64_t, 3> immf_value_{};
   std::array<bool, 3> immf_valid_{};
   // Immediates spread across the lanes for micro_src, with the value each holds,
   // and the zeros an unwritten register reads as.
-  std::array<Lanes32, 3> imm_lanes_{};
+  std::array<Lanes32, 3> imm_lanes_;
   std::array<uint32_t, 3> imm_value_{};
   std::array<bool, 3> imm_valid_{};
   Lanes32 zero_lanes_{};
-  Lanes32 ftz_a_{}, ftz_b_{}, ftz_c_{};   // operands flushed (or negated) by a micro form that needs it
+  Lanes32 ftz_a_, ftz_b_, ftz_c_;   // operands flushed (or negated) by a micro form that needs it
   // The same for the 64-bit forms (micro_src64): immediates, a narrow register widened, and zeros.
-  std::array<Lanes, 3> imm64_lanes_{};
+  std::array<Lanes, 3> imm64_lanes_;
   std::array<uint32_t, 3> imm64_value_{};
   std::array<bool, 3> imm64_valid_{};
-  std::array<Lanes, 3> wide_lanes_{};
+  std::array<Lanes, 3> wide_lanes_;
   Lanes zero64_lanes_{};
   bool host_directed_ = false;   // this thread was not rounding to nearest at launch
   // %gridid: a serial number distinguishing this launch from every other one in
@@ -15208,6 +15375,8 @@ ParamBuffer build_params(const EntryFn& fn, const std::vector<std::vector<uint8_
     throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "' expects ", fn.params.size(),
                       " parameters, launch supplied ", args.size());
   ParamBuffer pb;
+  pb.decls = &fn.params;
+  pb.by_index.reserve(args.size());
   for (size_t i = 0; i < args.size(); ++i) {
     uint32_t size = fn.params[i].size;
     if (args[i].size() != size)
@@ -15217,7 +15386,6 @@ ParamBuffer build_params(const EntryFn& fn, const std::vector<std::vector<uint8_
     uint32_t off = static_cast<uint32_t>((pb.bytes.size() + align - 1) / align * align);
     pb.bytes.resize(off + size);
     std::memcpy(pb.bytes.data() + off, args[i].data(), size);
-    pb.layout[fn.params[i].name] = {off, size};
     pb.by_index.emplace_back(off, size);
   }
   return pb;
@@ -16400,9 +16568,9 @@ bool allocates_while_running(const ptx::EntryFn& fn, std::set<const ptx::EntryFn
 // strictly serial block order exactly, which is what a kernel with a data race
 // needs to stay reproducible; more threads is faster and is what CUDA's own
 // model already allows, since blocks may run in any order and concurrently.
-unsigned worker_count(uint64_t blocks) {
+unsigned worker_count(uint64_t blocks, const char* threads) {
   unsigned want = 0;
-  if (const char* t = std::getenv("VGPU_THREADS")) {
+  if (const char* t = threads) {
     const int v = std::atoi(t);
     want = v > 0 ? static_cast<unsigned>(v) : 1;
   } else {
@@ -16418,8 +16586,7 @@ unsigned worker_count(uint64_t blocks) {
 // hardware -- trips it too, and the interpreter is slow enough that this is not
 // rare. VGPU_MAX_STEPS raises it without a rebuild; 0 turns the guard off, for
 // when you know the kernel terminates and only need it to finish.
-uint64_t effective_max_steps(uint64_t configured) {
-  const char* e = std::getenv("VGPU_MAX_STEPS");
+uint64_t effective_max_steps(uint64_t configured, const char* e) {
   if (!e || !*e) return configured;
   // strtoull accepts a leading sign and wraps a negative around, so "-5" would
   // parse as an enormous budget and quietly remove the very guard this is
@@ -16461,7 +16628,9 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
   static std::atomic<uint64_t> g_next_grid_id{1};
   const uint64_t grid_id = g_next_grid_id.fetch_add(1, std::memory_order_relaxed);
   LaunchConfig eff = cfg_ref;
-  eff.max_steps = effective_max_steps(cfg_ref.max_steps);
+  LaunchEnv own_env;
+  const LaunchEnv& env = launch_env_of(cfg.env, own_env);   // (the runtime's one pass over the environment, or one made here)
+  eff.max_steps = effective_max_steps(cfg_ref.max_steps, env.max_steps);
   // VGPU_SCHEDULER overrides whatever the caller asked for, so a racy program
   // can be re-run under a different order without touching its source. A
   // caller that set the mode explicitly still loses to the environment, which
@@ -16469,7 +16638,7 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
   {
     SchedulerKind k = eff.scheduler;
     uint64_t seed = eff.scheduler_seed;
-    if (scheduler_from_env(&k, &seed)) {
+    if (scheduler_from_env(&k, &seed, env.scheduler, env.scheduler_seed)) {
       eff.scheduler = k;
       eff.scheduler_seed = seed;
     }
@@ -16512,7 +16681,7 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
     for (int i = 0; i < 3; ++i) csize *= eff.cluster[i] ? eff.cluster[i] : 1;
     const uint64_t sms = profile.limits.multiprocessors;
     const unsigned cap = sms ? static_cast<unsigned>(std::max<uint64_t>(1, sms / csize)) : 1u;
-    return std::min(worker_count(blocks), cap);
+    return std::min(worker_count(blocks, env.threads), cap);
   }();
 
   // Blocks that may wait on one another (vgpu/exec/lockstep.hpp): a kernel with a loop that polls global
@@ -16521,11 +16690,11 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
   // turns), nor in a cooperative launch (which does).
   const bool no_clusters = eff.cluster[0] <= 1 && eff.cluster[1] <= 1 && eff.cluster[2] <= 1;
   if (!eff.cooperative && !ordered && no_clusters) {
-    const LockstepMode mode = lockstep_mode();
+    const LockstepMode mode = lockstep_mode(env.lockstep);
     std::set<const ptx::EntryFn*> seen;
     if (mode == LockstepMode::All || (mode == LockstepMode::Auto && eff.resident_blocks && ptx_kernel_polls(fn))) {
       // A kernel that can allocate while it runs keeps to one host thread (see below).
-      const unsigned threads = allocates_while_running(fn, seen) ? 1u : worker_count(blocks);
+      const unsigned threads = allocates_while_running(fn, seen) ? 1u : worker_count(blocks, env.threads);
       const LockstepShape shape = lockstep_shape(blocks, eff.resident_blocks ? eff.resident_blocks : blocks, threads);
       lockstep_note(fn.name.c_str(), blocks, shape);
       std::vector<LaunchStats> per_thread(shape.workers);
@@ -16650,7 +16819,6 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& in_cfg,
                    const std::vector<std::vector<uint8_t>>& in_args, MemoryManager& mem,
                    const DeviceProfile& in_profile, const SymbolTable* symbols,
                    const ProgressFn& progress) {
-  refresh_modes();
   // The launch's warp width (LaunchConfig::warp_size): the grid runs on a copy of the profile that has it, so the
   // interpreter, the occupancy figures and the child grids all see one width, and the caller's profile is untouched.
   DeviceProfile widened;
@@ -16673,11 +16841,22 @@ LaunchStats launch(const EntryFn& fn, const LaunchConfig& in_cfg,
       break;
     }
   const std::vector<std::vector<uint8_t>>& args = *args_p;
+  // One pass over the environment for the whole launch, its child grids included: the caller's, or one made here.
+  LaunchEnv own_env;
+  LaunchConfig with_env;
+  const LaunchConfig* c = &cfg;
+  if (!cfg.env) {
+    own_env = read_launch_env();
+    with_env = cfg;
+    with_env.env = &own_env;
+    c = &with_env;
+  }
+  refresh_modes(*c->env);
   DeviceLaunches dl;
   dl.mem = &mem;
-  LaunchStats stats = launch_grid(fn, cfg, args, mem, profile, symbols, progress, &dl);
+  LaunchStats stats = launch_grid(fn, *c, args, mem, profile, symbols, progress, &dl);
   if (!dl.queue.empty() || !dl.by_buffer.empty() || dl.extra.blocks) {
-    ChildRunner runner{cfg, mem, profile, progress, &stats};
+    ChildRunner runner{*c, mem, profile, progress, &stats};
     devrt::complete_children(dl, mem, runner);
   }
   return stats;
