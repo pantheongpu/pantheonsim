@@ -1086,6 +1086,24 @@ __attribute__((target("avx2,fma"))) void fma_lanes_f64_avx2(uint64_t* d, const u
   const __m256d sign = _mm256_set1_pd(-0.0);
   const __m256d nega = sub & 1 ? sign : _mm256_setzero_pd(), negc = sub & 2 ? sign : _mm256_setzero_pd();
   const double sa = sub & 1 ? -1.0 : 1.0, sc = sub & 2 ? -1.0 : 1.0;
+  if (width == 32 && (m & 0xFFFFFFFFull) == 0xFFFFFFFFull) {
+    // A full warp: the eight results are made first and checked for a NaN together, and stored (after every operand is
+    // read, so a destination that is also a source is fine) when there is none.
+    __m256d r[8];
+    __m256d nan = _mm256_setzero_pd();
+#pragma GCC unroll 8
+    for (uint32_t i = 0; i < 8; ++i) {
+      r[i] = _mm256_fmadd_pd(_mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(a + 4 * i)), nega),
+                             _mm256_loadu_pd(reinterpret_cast<const double*>(b + 4 * i)),
+                             _mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(c + 4 * i)), negc));
+      nan = _mm256_or_pd(nan, _mm256_cmp_pd(r[i], r[i], _CMP_UNORD_Q));
+    }
+    if (!_mm256_movemask_pd(nan)) {
+#pragma GCC unroll 8
+      for (uint32_t i = 0; i < 8; ++i) _mm256_storeu_pd(reinterpret_cast<double*>(d + 4 * i), r[i]);
+      return;
+    }
+  }
   for (uint32_t l = 0; l < width; l += 4) {
     const unsigned nib = static_cast<unsigned>(m >> l) & 15u;
     if (!nib) continue;
