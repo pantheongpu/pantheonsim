@@ -726,10 +726,9 @@ uint64_t MemoryManager::resident_bytes() const {
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (len == 0) return;
   if (host_maps_ && host_maps_->may_contain(dst)) {
-    std::lock_guard<std::mutex> lock(host_maps_->mu);
-    if (const HostMap* m = find_host_map_locked(dst, len)) {
-      if (m->read_only) throw_read_only_host_write(dst, len);
-      std::memcpy(m->host + (dst - m->base), src, len);
+    if (HostHit h; lookup_host(dst, len, &h)) {
+      if (h.read_only) throw_read_only_host_write(dst, len);
+      std::memcpy(h.host + (dst - h.base), src, len);
       return;
     }
   }
@@ -782,6 +781,35 @@ bool MemoryManager::host_pieces(uint64_t addr, uint64_t len, std::vector<HostPie
   return true;
 }
 
+uint64_t MemoryManager::fresh_generation() {
+  static std::atomic<uint64_t> counter{0};
+  return counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+MemoryManager::HostMaps::HostMaps() : gen(MemoryManager::fresh_generation()) {}
+
+bool MemoryManager::lookup_host(uint64_t addr, uint64_t len, HostHit* out) const {
+  struct Entry {
+    const HostMaps* owner = nullptr;
+    uint64_t gen = 0;
+    HostHit hit{};
+  };
+  thread_local Entry cache[4];
+  thread_local unsigned next = 0;
+  const uint64_t g = host_maps_->gen.load(std::memory_order_acquire);
+  for (const Entry& e : cache)
+    if (e.owner == host_maps_.get() && e.gen == g && addr >= e.hit.base && addr + len <= e.hit.base + e.hit.len) {
+      *out = e.hit;
+      return true;
+    }
+  std::lock_guard<std::mutex> lock(host_maps_->mu);
+  const HostMap* m = find_host_map_locked(addr, len);
+  if (!m) return false;
+  *out = HostHit{m->host, m->base, m->len, m->read_only};
+  cache[next++ % 4] = Entry{host_maps_.get(), host_maps_->gen.load(std::memory_order_relaxed), *out};
+  return true;
+}
+
 const MemoryManager::HostMap* MemoryManager::find_host_map_locked(uint64_t addr,
                                                                    uint64_t len) const {
   if (!host_maps_) return nullptr;
@@ -804,6 +832,7 @@ void MemoryManager::map_host(uint64_t addr, void* host, uint64_t len, bool read_
     host_maps_->hi.store(addr + len, std::memory_order_relaxed);
   if (addr < kDeviceVaEnd && addr + len > kDeviceVaBase)
     host_maps_->in_device_window.store(true, std::memory_order_relaxed);
+  host_maps_->gen.store(fresh_generation(), std::memory_order_release);
 }
 
 void MemoryManager::unmap_host(uint64_t addr) {
@@ -816,6 +845,7 @@ void MemoryManager::unmap_host(uint64_t addr) {
       if (retired.size() >= kRetiredHostMaps) retired.erase(retired.begin());
       retired.push_back(HostMap{v[i].base, v[i].len, nullptr});
       v.erase(v.begin() + static_cast<long>(i));
+      host_maps_->gen.store(fresh_generation(), std::memory_order_release);
       break;
     }
 }
@@ -1276,27 +1306,26 @@ void MemoryManager::drop_shared(std::map<uint64_t, SharedRegion>::iterator it) {
 
 uint8_t* MemoryManager::host_address(uint64_t addr, uint64_t len) const {
   if (!host_maps_->may_contain(addr)) return nullptr;
-  std::lock_guard<std::mutex> lock(host_maps_->mu);
-  const HostMap* m = find_host_map_locked(addr, len);
+  HostHit h;
+  if (!lookup_host(addr, len, &h)) return nullptr;
   // The one caller that gets a pointer to write through is an atomic.
-  if (m && m->read_only) throw_read_only_host_write(addr, len);
-  return m ? m->host + (addr - m->base) : nullptr;
+  if (h.read_only) throw_read_only_host_write(addr, len);
+  return h.host + (addr - h.base);
 }
 
 bool MemoryManager::is_host_mapped(uint64_t addr) const {
   // Nothing mapped near it: no lock, as before any buffer was mapped at all.
   if (!host_maps_->may_contain(addr)) return false;
-  std::lock_guard<std::mutex> lock(host_maps_->mu);
-  return find_host_map_locked(addr, 1) != nullptr;
+  HostHit h;
+  return lookup_host(addr, 1, &h);
 }
 
 void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   if (len == 0) return;
   // Managed memory is the caller's own buffer; there is no chunk table to walk.
   if (host_maps_ && host_maps_->may_contain(src)) {
-    std::lock_guard<std::mutex> lock(host_maps_->mu);
-    if (const HostMap* m = find_host_map_locked(src, len)) {
-      std::memcpy(dst, m->host + (src - m->base), len);
+    if (HostHit h; lookup_host(src, len, &h)) {
+      std::memcpy(dst, h.host + (src - h.base), len);
       return;
     }
   }
@@ -1489,10 +1518,7 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
       // the CPU's atomics -- which is how the engines make a device atomic on
       // such memory (vgpu/exec/host_atomic.hpp) -- and a memcpy racing those
       // is a data race (ThreadSanitizer, e2e_host_atomics).
-      {
-        std::lock_guard<std::mutex> lock(host_maps_->mu);
-        if (const HostMap* m = find_host_map_locked(addr, size)) return load_at(m->host + (addr - m->base), size);
-      }
+      if (HostHit h; lookup_host(addr, size, &h)) return load_at(h.host + (addr - h.base), size);
       read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
       return v;
   }
@@ -1529,10 +1555,9 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
       return;
     case ScalarAt::HostMap: {
       // An atomic store of its width, as load_scalar's load is.
-      std::lock_guard<std::mutex> lock(host_maps_->mu);
-      if (const HostMap* m = find_host_map_locked(addr, size)) {
-        if (m->read_only) throw_read_only_host_write(addr, size);
-        store_at(m->host + (addr - m->base), size, value);
+      if (HostHit h; lookup_host(addr, size, &h)) {
+        if (h.read_only) throw_read_only_host_write(addr, size);
+        store_at(h.host + (addr - h.base), size, value);
         return;
       }
       break;
@@ -1645,8 +1670,7 @@ MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t s
                                                        const uint8_t** where) const {
   const bool create = store != nullptr;
   if (host_maps_ && host_maps_->may_contain(addr)) {
-    std::lock_guard<std::mutex> lock(host_maps_->mu);
-    if (find_host_map_locked(addr, size)) return ScalarAt::HostMap;
+    if (HostHit h; lookup_host(addr, size, &h)) return ScalarAt::HostMap;
   }
   uint64_t base = 0;
   auto& a = const_cast<Allocation&>(resolve_scalar(addr, size, create ? "device memory write" : "device memory read",

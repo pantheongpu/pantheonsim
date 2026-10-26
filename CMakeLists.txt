@@ -1356,6 +1356,8 @@ vgpu_unit_test(test_warp_width)
 vgpu_unit_test(test_launch_inputs)
 # E1: Intel in the profile layer: the profiles, the limits derived from them, and a launch checked against them.
 vgpu_unit_test(test_intel_profile)
+# The per-thread cache of host-mapped buffers (MemoryManager::lookup_host): never serves a mapping that is gone or changed.
+vgpu_unit_test(test_hostmap_cache)
 vgpu_unit_test(test_devrt)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
