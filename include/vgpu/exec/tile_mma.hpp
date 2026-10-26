@@ -41,7 +41,8 @@ bool wgmma_read_i32(const uint8_t* smem, size_t size, const WgmmaDesc& d, bool k
 // kernels work on. `regs` is N / 2 registers of 32 lane words (f16: N / 4, two halves a word), register 4j + 2h + u (f16: 2j + h) holding
 // row g + 8h and column 8j + 2t + u of lane 4g + t. A NaN written back is the canonical one (f32: 0x7fffffff, f16: 0x7fff).
 void wgmma_acc_to_tile(const uint32_t* regs, uint32_t N, bool f16, float* tile);
-void wgmma_tile_to_acc(const float* tile, uint32_t N, bool f16, uint32_t* regs);
+// `canonical`: the tile came from simd::Kernels::tile_f32c, its NaNs already the canonical one (an f32 tile then needs no pass for them).
+void wgmma_tile_to_acc(const float* tile, uint32_t N, bool f16, uint32_t* regs, bool canonical = false);
 void wgmma_acc_to_tile_i32(const uint32_t* regs, uint32_t N, int32_t* tile);
 void wgmma_tile_to_acc_i32(const int32_t* tile, uint32_t N, uint32_t* regs);
 
@@ -56,15 +57,23 @@ void canon_nan_rows(uint32_t* base, uint32_t rows, uint32_t cols, size_t ld);
 // of B (K x 8), column g and the consecutive rows t * p + 4 p r on; of C and D (M x 8), slot s at row g + 8 (s / 2) and column 2 t + s % 2.
 enum class FragType : uint8_t { F16, BF16, TF32, E4M3, E5M2, S8, U8, S4, U4 };
 inline constexpr bool frag_is_int(FragType t) { return t >= FragType::S8; }
+// The fragment type of a warpgroup MMA element type (the first seven are the same).
+inline constexpr FragType frag_type_of(TileElem t) { return static_cast<FragType>(static_cast<uint8_t>(t)); }
 inline constexpr unsigned frag_bits(FragType t) {
   return t == FragType::F16 || t == FragType::BF16 ? 16 : t == FragType::TF32 ? 32 : t == FragType::S4 || t == FragType::U4 ? 4 : 8;
 }
 // The tile of A, M x K row-major, into `f` (floating types) or `i`. `sparse`: the registers hold half of each row, placed by `meta` (the 32 lane
 // words of the metadata register) and the selector `sel`, mma.sp's rule (exec::mma_sparse_column); the elements the metadata does not name are 0.
 // `regs` has M * K / (sparse ? 2 : 1) / (32 * p) registers.
-void mma_frag_a(FragType t, unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* i);
+// `negate` flips the sign of every element the registers supply (a float's sign bit, so a zero stays a zero of the other sign; an integer is negated),
+// not the zeros of a sparse A's other columns: wgmma's imm-scale-a of -1 for A in registers.
+void mma_frag_a(FragType t, unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* i,
+                bool negate = false);
 // The tile of B, K x 8 row-major.
 void mma_frag_b(FragType t, unsigned K, const uint32_t* regs, float* f, int32_t* i);
+// A warp's 16 rows of a sparse wgmma A that is already decoded (32-bit values, 16 rows of K / 2 stored elements, from shared memory): each row spread over its
+// K columns by the metadata as above (`abits`, the element width: 8, 16 or 32), the other columns 0. The bits of the values are moved, not read.
+void wgmma_sparse_expand(unsigned abits, unsigned K, unsigned sel, const uint32_t* meta, const uint32_t* stored, uint32_t* out);
 // C and D of the m8n8 integer forms (two slots a lane, registers 0 and 1) and the m16n8 ones (wgmma_acc_to_tile with N = 8).
 void mma_acc8_to_tile_i32(const uint32_t* regs, int32_t* tile);
 void mma_tile_to_acc8_i32(const int32_t* tile, uint32_t* regs);

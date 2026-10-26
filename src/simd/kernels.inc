@@ -1407,7 +1407,7 @@ typedef int32_t V8i __attribute__((vector_size(32)));
 
 // R rows by V vectors of 8 columns of D = C + A x B in f32, k in order, each product rounded and then added (never fused). A is M x K
 // (row stride K), B is K x N (row stride N), C and D are M x N with row strides ldc and ldd (C null: zeros). N is a multiple of 8.
-template <unsigned R, unsigned V>
+template <unsigned R, unsigned V, bool Canon>
 inline void tile_f32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D,
                            size_t ldd) {
   V8f acc[R][V];
@@ -1428,21 +1428,37 @@ inline void tile_f32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, con
     }
   }
   for (unsigned r = 0; r < R; ++r)
-    for (unsigned v = 0; v < V; ++v) std::memcpy(D + size_t{i0 + r} * ldd + j0 + 8 * v, &acc[r][v], sizeof(V8f));
+    for (unsigned v = 0; v < V; ++v) {
+      if (Canon) {
+        // every NaN the host's additions kept becomes the canonical 0x7fffffff (the float compare is false for a NaN only)
+        const V8u nan = reinterpret_cast<V8u>(acc[r][v] != acc[r][v]);
+        acc[r][v] = reinterpret_cast<V8f>((reinterpret_cast<V8u>(acc[r][v]) & ~nan) | (0x7fffffffu & nan));
+      }
+      std::memcpy(D + size_t{i0 + r} * ldd + j0 + 8 * v, &acc[r][v], sizeof(V8f));
+    }
 }
 
-void tile_f32_k(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
+// `Canon`: a NaN in the result is the canonical 0x7fffffff (tile_f32c); else whichever NaN the host's additions kept.
+template <bool Canon>
+inline void tile_f32_impl(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
   unsigned i0 = 0;
   for (; i0 + 4 <= M; i0 += 4) {
     unsigned j0 = 0;
-    for (; j0 + 16 <= N; j0 += 16) tile_f32_block<4, 2>(i0, j0, N, K, A, B, C, ldc, D, ldd);
-    for (; j0 + 8 <= N; j0 += 8) tile_f32_block<4, 1>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 16 <= N; j0 += 16) tile_f32_block<4, 2, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 8 <= N; j0 += 8) tile_f32_block<4, 1, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
   }
   for (; i0 < M; ++i0) {
     unsigned j0 = 0;
-    for (; j0 + 16 <= N; j0 += 16) tile_f32_block<1, 2>(i0, j0, N, K, A, B, C, ldc, D, ldd);
-    for (; j0 + 8 <= N; j0 += 8) tile_f32_block<1, 1>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 16 <= N; j0 += 16) tile_f32_block<1, 2, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 8 <= N; j0 += 8) tile_f32_block<1, 1, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
   }
+}
+
+void tile_f32_k(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
+  tile_f32_impl<false>(M, N, K, A, B, C, ldc, D, ldd);
+}
+void tile_f32c_k(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
+  tile_f32_impl<true>(M, N, K, A, B, C, ldc, D, ldd);
 }
 
 // The same for 32-bit integers (the operands are small: 8-bit elements or less, so a block's sum of products fits in 32 bits). Without `sat`

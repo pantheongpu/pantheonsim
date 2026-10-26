@@ -4775,3 +4775,56 @@ centre weight 255, contracted-subtract negation swapped, sub computed as add, Na
 * Placement, not work (instructions equal, cycles up): `api` 0.98x (both engines), SASS `mma_ptx` 0.97x, `warp` 0.975x, `wmma` 0.92 to 0.98x between runs (`mma_avx2_chunked_f` moved from 48 to 0 mod 64; IPC 4.03 to 3.70), AMD `smem` mi300x 0.98x (cycles +1 to 2%). Re-check after merging with the other round-3 branches.
 * Not done: hidden visibility or `-Bsymbolic` to cut the 25% of SASS startup that is ld.so symbol hashing (the shims rely on one exported copy of the profiling readers); skipping `kernel_resources` for kernels that do not poll (about 2%); reusing the kernarg segment across AMD launches (changes allocation addresses); the SASS `unsupported()` pre-decode (20% of SASS startup, decides PTX fallback); a full micro form for ld/st beyond `step_mem`; merging the AMD queue's take/complete locks; telemetry's clock read per update (needed for its timestamp). The PTX parser (85% of PTX startup) is a 4000-line string chain: untouched.
 * Run: Release ctest of the PTX/SASS/AMD/cupti/profiling suites (all pass; `lint_curl_retries` fails only for want of `.git` on server3), ASan+UBSan -O0 and TSan -O1 on the touched unit tests (pass).
+## Round sp3: tensor cores, the leftovers (branch `sp3-tensor2`, base 03d92bd0 + sp2-lead)
+
+Measured on server3 (cpu 2 alone, user cycles by `perf_event_open`, `nvidia_tensor_bench`: the cheapest of 5 launches of R and 2R instructions, the difference over R;
+A = a build of the base tree, B = this branch; 5 to 11 alternating runs; A/A noise 1 to 2% in cycles). Counters identical in every bench.py row.
+
+* **Fragment decode** (`tile_mma.cpp`): one instantiation per element type; dense A/B are 16-byte runs copied into a raw tile and decoded in one pass (B transposed), the
+  sparse A places each lane's stored elements from the metadata nibble with every constant known at compile time (no `Lanes` copy); `mma_frag_a` takes `negate` (wgmma's
+  imm-scale-a) and `wgmma_sparse_expand` spreads decoded sparse rows from shared memory. Operand registers are gathered and scattered as whole 32-lane words
+  (`gather_words`/`scatter_words`) instead of widened to 64 bits and back.
+* **tcgen05**: f16 D, layouts F, B, G (`.ws`), A in Tensor Memory, sparse A and the block-scaled kinds (mxf8f6f4, mxf4, mxf4nvf4, UE8M0/UE4M3 factors, one scaled B per lane
+  partition with differing factors) through the tile kernels. **wmma.mma** generic shapes/types (m32n8k16, m8n32k16, s8/u8/s4/u4, f64, f16/f32 accumulators) and **mma m8n8k4 f16**
+  through them too. `tile_f32c` (new kernel entry): the f32 tile with canonical NaNs in the same pass (no separate pass in the wgmma/mma/tcgen05 routes).
+  `wgmma_smem_offset` is inline (a swizzled row is a power of two: shifts for divisions).
+* **AVX-512 level** (`Level::Avx512`, `src/simd/kernels512.inc`, off by default; `VGPU_SIMD=avx512`): tile_f32/f32c, tile_i32 (VNNI `vpdpwssd` from 64 columns, only when every operand is a 16-bit
+  number, else the multiplier form; odd `.sat` blocks too) and tile_f64 (fused, host rounding mode). `level()` still names Base/Avx2 (the JIT reads it); `kernels().level` names the table.
+  Kernel microbenchmark on Zen 4 (cycles/call, AVX2 -> AVX-512): f32 16x256x16 7797 -> 7277, 16x256x64 26539 -> 25867 (-3 to -7%: Zen 4 runs 512-bit as two 256-bit halves);
+  s32 16x256x32 19654 -> 10801, 16x128x32 7578 -> 5396 (VNNI); 16x8x32 507 -> 523 (VNNI packing costs 760 ns below 64 columns, so those stay on the multiplier form);
+  f64 8x8x4 131 -> 69, 16x8x16 821 -> 301. End to end (same binary, `VGPU_SIMD=avx512` against default): tcgen05 s8 0.63x, wgmma s8 0.89x, wgmma f16/tf32 0.94-0.95x, wgmma e4m3 1.02x,
+  tcgen05 sparse 1.04x, the rest 0.97-1.03x. Left off by default (mixed, and on this box only the int8 rows clearly gain); a CPU with native 512-bit units should gain more.
+
+### Results (B/A of median user cycles per warp instruction, `nvidia_tensor_bench`; every p <= 0.01 unless the row says same)
+| row | B/A | row | B/A |
+|---|---|---|---|
+| PTX mma f16/bf16/tf32 m16n8k8/k16, f32 acc, a10 | 0.76 to 0.85 | PTX mma f16/bf16/tf32 (h100) | 0.68 to 0.76 |
+| PTX mma s8 k16/k32/k32 sat | 0.55 / 0.54 / 0.56 | PTX mma s4 k64 / e4m3 k32 | 0.84 / 0.24 |
+| PTX mma f16 sparse k32 / s8 sparse k64 | 0.15 / 0.11 | PTX mma m8n8k4 f16 | 0.86 |
+| PTX wmma m32n8k16, m8n32k16 f16 | 0.24 | PTX wmma s8 m16n16k16 / f64 m8n8k4 | 0.22 / 0.41 |
+| PTX wgmma m64n128k16 f16 / bf16 / tf32 / e4m3 / s8 | 0.57 / 0.59 / 0.56 / 0.68 / 0.65 | wgmma m64n256k16 f16 | 0.61 |
+| tcgen05 m128n256k16 f16 f32 D / f16 D | 0.89 / 0.18 | tcgen05 layout F / layout B (ws) / sparse | 0.55 / 0.61 / 0.54 |
+| tcgen05 mxf8f6f4 m128n128k32 block-scaled | 0.04 (4.79 M -> 0.21 M cycles) | tcgen05 tf32 / e4m3 / s8 | 0.81 / 0.95 / 0.97 (same) |
+| SASS HMMA.SP.16832 | 0.16 | SASS QMMA e4m3 | 0.26 |
+| SASS IMMA.16816 / 16832 s8 | 0.78 / 0.78 | SASS HMMA dense 16816, 1688, IMMA s4 | 0.99 to 1.03 (unchanged code) |
+Canaries (bench.py, 11 runs, sass/ptx, counters identical): mma_ptx ptx 1.16x; wmma 1.04/1.01 (same); int_alu 0.99/0.99; f32_fma 1.00/0.99; f64_fma 1.00/1.01; mem 0.975/1.017;
+shared 1.01/0.99; atomics 0.99/0.975 (p 0.001); local 0.99/1.00; divergent 1.00/1.01; warp 0.99/1.02; launch 1.04/1.02; api 0.97/0.98 (p <= 0.01; api, atomics touch no code of this branch:
+the hot text moved with the size of earlier objects -- see below).
+
+### Tests (CMake-wired) and mutation checks
+`test_frag_decode` (+ `_simd_base`: every type, dense/sparse, selectors 0-3, negate, and `wgmma_sparse_expand`, against the element-at-a-time decode frozen in the test),
+`test_tcgen05_tiles` (240 forms: kinds x layouts x sparse/A in Tensor Memory/scale-d/block scaling against `VGPU_FASTPATH=0`), `test_wmma_generic_fast` (wmma shapes/types and mma.m8n8k4),
+`test_tile_mma` (tile_f32c, wrapping s32 on operands of any size, odd/short `.sat` blocks, 16-bit boundaries), the avx512 twins `test_{mma_fast,mma_tiles,wgmma_fast,tcgen05_tiles,wmma_generic_fast,tile_mma}_simd_avx512`;
+`test_wgmma_fast` now also negates A in registers. Mutants (a one-line edit of the tree, the tests run, killed = a test fails): decode 18/18 killed, tcgen05 route 22/22 killed (test_blackwell's card answers
+kill the scale-table mutants the fast-vs-slow comparison cannot see, both routes share them), gather/scatter + wgmma 5/5, avx512 kernels 14/14 (after adding second-of-a-pair operands outside 16 bits),
+wmma generic/m8n8k4/f32c 15 of 19: the four survivors are equivalent or common to both routes (a NaN in f64 C only, the m8n8k4 A/D layouts which fast and general share; the tf32 mutant sits in code
+removed afterwards: tf32 has no generic shape). A pure dispatch bug (tc86::mma sent AVX-512 to the scalar sum, 7x slower) has no bit-level test; it was found by the bench.
+Run: Release guards (amd same_bits/tier/matrix/mfma/nan_order and their `_simd_base` twins, `lint_*` but `lint_curl_retries` which needs a git checkout), ASan+UBSan -O0 and TSan -O1 (`setarch -R`) of the 11 touched unit tests
+including test_fastpath: clean. Not run: e2e_* (no nvcc on server3), e2e_host_atomics (no atomic or lock code touched).
+
+### Not done, and negative results
+* AVX-512 as default: mixed on Zen 4 (above). VNNI below 64 columns: 4x slower than the multiplier form (packing per call).
+* SASS/PTX `s4` decode is still scalar per nibble (IMMA 16864 unchanged, 4.6 K cycles); fp8 decode is a 256-entry table per element (QMMA 3.1 K cycles).
+* wmma.load/store generic shapes are one `load_routed` per element (not touched: counters and race hooks).
+* Placement: adding code anywhere before the interpreters moved their hot functions by 0x240-0x260 bytes and cost 3 to 10% on unchanged mma rows with identical instructions (misses/branch-misses moved);
+  64-byte alignment of the chunked kernels did not remove it (dropped); keeping the new decode templates and SASS `gmma_fast` in `.text.unlikely` did (f64 mma 1.09 -> 0.97, SASS mem 0.95 -> 0.975).

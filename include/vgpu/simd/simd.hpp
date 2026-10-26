@@ -18,6 +18,13 @@
 // code); VGPU_SIMD=base|avx2 caps the level (default: the best the CPU has); the
 // baseline kernels are always compiled in, so base is the reference the other
 // levels are checked against and the escape hatch if a host misbehaves.
+//
+// A third level, Avx512 (AVX-512 F/BW/DQ/VL and VNNI), is the Avx2 table with the
+// three tile kernels replaced by 512-bit forms (src/simd/kernels512.inc). It is
+// chosen with VGPU_SIMD=avx512, or by default where the host runs it faster than
+// the 256-bit kernels (see kAvx512Default in simd.cpp); level() still names the
+// instruction-set family of the lane kernels (Base or Avx2), and kernels().level
+// the table in use.
 #pragma once
 
 #include <atomic>
@@ -26,8 +33,8 @@
 
 namespace vgpu::simd {
 
-enum class Level : int { Base = 0, Avx2 = 1 };   // Avx2 = AVX2 + FMA + F16C
-inline constexpr int kLevels = 2;
+enum class Level : int { Base = 0, Avx2 = 1, Avx512 = 2 };   // Avx2 = AVX2 + FMA + F16C; Avx512 = that and AVX-512 F/BW/DQ/VL/VNNI
+inline constexpr int kLevels = 3;
 
 
 // The F16C check (the conversions against the scalar ones, every half and a spread of floats; a host that fails it
@@ -46,7 +53,8 @@ int f16c_checks_run();
 const char* level_name(Level l);
 // Whether this host can run `l` (Base always).
 bool supported(Level l);
-// The level the kernels in use run at: the best supported, capped by VGPU_SIMD.
+// The instruction-set family of the lane kernels in use: the best of Base and Avx2 the host supports, capped by VGPU_SIMD (an Avx512 table is built on
+// the Avx2 one, so this stays Avx2 under it; kernels().level says which table runs).
 Level level();
 
 enum class IntCmp : unsigned { Eq, Ne, Lt, Le, Gt, Ge };
@@ -187,6 +195,8 @@ struct Kernels {
   void (*tile_i32)(unsigned M, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, size_t ldc, unsigned block,
                    bool sat, int32_t* D, size_t ldd);
   void (*tile_f64)(unsigned M, unsigned N, unsigned K, const double* A, const double* B, const double* C, double* D);
+  //  tile_f32c: tile_f32 with every NaN in D the canonical 0x7fffffff (what the tensor-core forms write), in the same pass.
+  void (*tile_f32c)(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the

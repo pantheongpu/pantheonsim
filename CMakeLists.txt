@@ -361,6 +361,9 @@ target_include_directories(amd_exec_bench PRIVATE amd/include)
 add_executable(amd_matrix_bench amd/tools/matrix-bench.cpp)
 target_link_libraries(amd_matrix_bench PRIVATE vgpu)
 target_include_directories(amd_matrix_bench PRIVATE amd/include)
+# What one tensor-core instruction costs the simulator, PTX and SASS (nvidia/tools/tensor-bench.cpp).
+add_executable(nvidia_tensor_bench nvidia/tools/tensor-bench.cpp)
+target_link_libraries(nvidia_tensor_bench PRIVATE vgpu)
 # librocprofiler-sdk: rocprofiler-sdk's interface over the HIP shim, so AMD's
 # profiler (rocprofv3) runs unmodified on a simulated GPU. It sits beside
 # libamdhip64 in build/shim, where a tool linked to librocprofiler-sdk.so.1
@@ -1368,11 +1371,26 @@ vgpu_unit_test(test_tile_mma)
 vgpu_unit_test(test_wgmma_fast)
 # tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
 vgpu_unit_test(test_tcgen05_fast)
+# tcgen05.mma through the tile kernels for the forms the whole-operand route leaves to the row loop (f16 D, layouts F, B, G, A in Tensor Memory, sparse A,
+# block scaling), against the row loop (VGPU_FASTPATH=0), bit for bit.
+vgpu_unit_test(test_tcgen05_tiles)
+# wmma.mma on the shapes and types the 16x16x16 f16/bf16 tile does not take, through the tile kernels, against the general form (VGPU_FASTPATH=0), bit for bit.
+vgpu_unit_test(test_wmma_generic_fast)
+# The routes that run the tile kernels, again with the AVX-512 table selected (VGPU_SIMD=avx512; a host without it runs them at AVX2): the engines'
+# results against their general forms must not move a bit with the level.
+foreach(_t test_mma_fast test_mma_tiles test_wgmma_fast test_tcgen05_tiles test_wmma_generic_fast test_tile_mma)
+  add_test(NAME ${_t}_simd_avx512 COMMAND ${_t})
+  set_tests_properties(${_t}_simd_avx512 PROPERTIES ENVIRONMENT "VGPU_SIMD=avx512")
+endforeach()
 # The PTX engine's tile route for the other mma.sync forms against the general form, bit for bit.
 vgpu_unit_test(test_mma_tiles)
 # The SASS executor's tile route for the MMA forms its SIMD HMMA kernel does not take, against its general form (the kernels off in a second run).
 vgpu_unit_test(test_sass_mma_tiles)
 target_compile_definitions(test_sass_mma_tiles PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The mma fragment decode against the element-at-a-time form it replaced (frozen in the test), bit for bit; and again on the baseline kernels.
+vgpu_unit_test(test_frag_decode)
+add_test(NAME test_frag_decode_simd_base COMMAND test_frag_decode)
+set_tests_properties(test_frag_decode_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base")
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
