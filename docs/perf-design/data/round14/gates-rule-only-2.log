@@ -1,0 +1,16 @@
+== bench --check-counters, JIT unset
+PASS: counters of 16 workloads x sass+ptx match tools/bench/expected/cuda-13.0.json (0.3 s)
+== bench --check-counters, JIT forced on every region
+PASS: counters of 16 workloads x sass+ptx match tools/bench/expected/cuda-13.0.json (9.6 s)
+== bench --check-counters, JIT with the share rule (threshold 100000, sample 50000)
+PASS: counters of 16 workloads x sass+ptx match tools/bench/expected/cuda-13.0.json (4.6 s)
+== random kernels, 8 seeds
+ok   sm_86 jit_random seed 1  (16 units (113 regions), 16 ready, 0 cache hits, 16 compiles (52674.2 ms), 0 failures, 0 damaged objects replaced; 16756 region calls ran 372136 warp instructions (346976 computed by generated code), 0 exceptions unwound through them; share rule: 0 declined, 0 accepted)
+ok   sm_86 jit_random seed 2  (16 units (123 regions), 16 ready, 0 cache hits, 16 compiles (51941.9 ms), 0 failures, 0 damaged objects replaced; 18236 region calls ran 354524 warp instructions (328624 computed by generated code), 0 exceptions unwound through them; share rule: 0 declined, 0 accepted)
+ok   sm_86 jit_random seed 3  (16 units (128 regions), 16 ready, 0 cache hits, 16 compiles (51067.3 ms), 0 failures, 0 damaged objects replaced; 18976 region calls ran 360444 warp instructions (333360 computed by generated code), 0 exceptions unwound through them; share rule: 0 declined, 0 accepted)
+ok   sm_86 jit_random seed 4  (16 units (104 regions), 16 ready, 0 cache hits, 16 compiles (50322.1 ms), 0 failures, 0 damaged objects replaced; 15424 region calls ran 351564 warp instructions (324776 computed by generated code), 0 exceptions unwound through them; share rule: 0 declined, 0 accepted)
+ok   sm_86 jit_random seed 5  (16 units (117 regions), 16 ready, 0 cache hits, 16 compiles (54792.6 ms), 0 failures, 0 damaged objects replaced; 17348 region calls ran 380868 warp instructions (354080 computed by generated code), 0 exceptions unwound through them; share rule: 0 declined, 0 accepted)
+ok   sm_86 jit_random seed 6  (16 units (129 regions), 16 ready, 0 cache hits, 16 compiles (53785.9 ms), 0 failures, 0 damaged objects replaced; 19124 region calls ran 373320 warp instructions (346828 computed by generated code), 0 exceptions unwound through them; share rule: 0 declined, 0 accepted)
+ok   sm_86 jit_random seed 7  (16 units (122 regions), 16 ready, 0 cache hits, 16 compiles (52702.4 ms), 0 failures, 0 damaged objects replaced; 18088 region calls ran 372728 warp instructions (346828 computed by generated code), 0 exceptions unwound through them; share rule: 0 declined, 0 accepted)
+ok   sm_86 jit_random seed 8  (16 units (109 regions), 16 ready, 0 cache hits, 16 compiles (46940.6 ms), 0 failures, 0 damaged objects replaced; 16164 region calls ran 319892 warp instructions (294288 computed by generated code), 0 exceptions unwound through them; share rule: 0 declined, 0 accepted)
+PASS

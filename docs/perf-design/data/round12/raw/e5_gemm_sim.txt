@@ -1,0 +1,8 @@
+sgemm n=256 ms 1.810 gflops 18.5 hash 551c211b
+gemmex_f16 n=256 ms 2.037 gflops 16.5 hash 2d0b81e0
+sgemm n=512 ms 5.520 gflops 48.6 hash ec7146ad
+gemmex_f16 n=512 ms 5.252 gflops 51.1 hash 4a53cfc6
+sgemm n=1024 ms 35.681 gflops 60.2 hash c3d4fdf9
+gemmex_f16 n=1024 ms 33.984 gflops 63.2 hash 2a951655
+sgemm n=2048 ms 210.482 gflops 81.6 hash 48ee04ca
+gemmex_f16 n=2048 ms 213.702 gflops 80.4 hash cc7eb0d0

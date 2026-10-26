@@ -222,7 +222,26 @@ struct Region {
 
 // Idle: counting only (a section that runs little never asks the cache or the compiler anything); Looking: the cache is being asked; Counting:
 // the cache had nothing, counting towards the compile; Queued: a compile is queued or running.
-enum class State : int { Idle, Looking, Counting, Queued, Ready, Failed };
+// Failed: nothing to compile, or the compile failed. Declined: the sample found the section's regions too small a share of its work to be worth the
+// hook (the share rule below). Both go back to the plain run loop for good.
+enum class State : int { Idle, Looking, Counting, Queued, Ready, Failed, Declined };
+
+// The share rule (round 14). The hook (tier_run_t<true>, the counting, the cache lookup) costs the instructions of a section that are not in a compiled
+// region something, and a section whose regions are a small part of its work never earns it back (`warp`, `shared`, `f64_fma`, `divergent`, `texture`
+// lost 5% to 19% against the tier on 0.1 to 0.4 s runs). So a section is *sampled*: once it has run `sample_after` warp instructions in passes of the hook
+// loop, the share of them that generated code would compute (the entries of its regions, each worth the region's `gen` ops) is compared with
+// `min_share_permille`, once; below it the section is Declined and runs on the plain loop. Nothing asks the cache or the compiler before the sample is in.
+// A sample is a decision about a rule's inputs only (no timing), so it is the same on every run of the same program.
+struct ShareRule {
+  bool on = false;                    // VGPU_JIT_MIN_SHARE=0, or VGPU_JIT_HOT_PERMILLE=0 ("compile every region", the differential tests): off
+  unsigned min_share_permille = 0;    // generated-code share of the sample, in thousandths, below which the section is declined
+  uint64_t sample_after = 0;          // warp instructions of the section to sample
+};
+// Whether `gen_work` of `total` instructions (both counted the same way) is enough: gen_work * 1000 >= total * min_share_permille. Off, or nothing sampled: true.
+inline bool share_ok(uint64_t gen_work, uint64_t total, const ShareRule& r) {
+  return !r.on || total == 0 || gen_work * 1000 >= total * r.min_share_permille;
+}
+const ShareRule& share_rule();
 
 // One per code section: the regions found in its tier program, and where the JIT stands for it.
 struct Unit : std::enable_shared_from_this<Unit> {
@@ -231,11 +250,19 @@ struct Unit : std::enable_shared_from_this<Unit> {
   std::vector<uint32_t> region_at;     // op index -> region number + 1 (0: no region starts there)
   std::atomic<int> state{static_cast<int>(State::Idle)};
   std::atomic<uint64_t> executed{0};   // warp instructions the tier ran in the regions while counting
+  std::atomic<bool> sampling{false};   // the share rule has not decided yet (set by make_unit when the rule is on)
+  std::atomic<uint64_t> sampled{0};    // warp instructions run in the hook loop while sampling
   std::unique_ptr<std::atomic<uint64_t>[]> counts;   // ... per region: which ones are hot decides which are compiled
   std::shared_ptr<Loaded> lib;         // valid once state is Ready (published with release)
   std::vector<int32_t> fn_index;       // region -> its function in lib, -1 for a region that was not compiled (valid once Ready)
   bool ready() const { return state.load(std::memory_order_acquire) == static_cast<int>(State::Ready); }
   bool counting() const { return state.load(std::memory_order_relaxed) <= static_cast<int>(State::Counting); }
+  // Whether the run loop with the region hook is wanted: not once the section has failed or been declined (the plain loop is then used: step_warp asks).
+  bool hook() const { return state.load(std::memory_order_relaxed) <= static_cast<int>(State::Ready); }
+  // The hook loop ran `instr` warp instructions of this section (the whole pass, regions or not). The one that brings the sample to `sample_after` decides.
+  void sample(uint64_t instr);
+  // The work generated code would do for what the regions ran while counting: sum over regions of entries * gen, entries = counts / k.
+  uint64_t gen_work() const;
   // The tier ran region `region` (k ops) uncompiled: count it, and ask for the compile once the threshold is passed.
   void note(uint32_t region, uint32_t k);
   // The compiled function of a region, null if it is not compiled (yet, or not selected).
@@ -260,6 +287,7 @@ struct Stats {
   std::atomic<uint64_t> cache_hits{0}, compiles{0}, failures{0}, corrupt{0};
   std::atomic<uint64_t> regions_run{0}, instructions_run{0}, generated_run{0}, region_throws{0};   // calls of generated regions, and the warp instructions in them
   std::atomic<uint64_t> compile_us{0}, lookup_us{0}, units_ready{0};
+  std::atomic<uint64_t> declined{0}, accepted{0};   // the share rule's decisions
 };
 Stats& stats();
 // Whether the statistics are being kept (VGPU_JIT_STATS): the executor counts nothing otherwise, an atomic add per region call being a visible cost on small regions.

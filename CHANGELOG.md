@@ -5,7 +5,7 @@ Each release is tagged `vX.Y.Z` and described on the
 [releases page](https://github.com/pantheongpu/pantheonsim/releases). It simulates GPUs functionally, so a
 release says what runs and what it produces, never how fast a real GPU would run it.
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-10-24
 
 ### Getting started
 - `make` installs what is missing (it asks first) and builds; `./run` starts a simulated GPU machine from a
