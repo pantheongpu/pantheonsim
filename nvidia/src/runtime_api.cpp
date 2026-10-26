@@ -61,6 +61,7 @@
 #include "vgpu/sass/exec.hpp"
 #include "vgpu/exec/cluster.hpp"
 #include "vgpu/exec/devrt.hpp"
+#include "vgpu/exec/launch_env.hpp"
 #include "vgpu/exec/tensormap.hpp"
 // cudaDeviceProp is filled in by this shim and read by the application, so
 // both sides must agree on its layout. The original failure was a stale
@@ -108,10 +109,8 @@ bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
   return q && q[0] == '1';
 }
-bool trace() {
-  const char* t = std::getenv("VGPU_TRACE");
-  return t && t[0] == '1';
-}
+bool trace(const char* t) { return t && t[0] == '1'; }
+bool trace() { return trace(std::getenv("VGPU_TRACE")); }
 
 // A fatbin registered by the host boilerplate. PTX is parsed into a runtime
 // module lazily on first use for the active device.
@@ -1494,6 +1493,8 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
                                       dim3 blockDim, void** args, size_t sharedMem,
                                       cudaStream_t stream, bool cooperative,
                                       std::array<uint32_t, 3> cluster = {0, 0, 0}) {
+  // One pass over the environment for everything this launch reads (vgpu/exec/launch_env.hpp), handed on in the LaunchConfig.
+  const vgpu::exec::LaunchEnv env = vgpu::exec::read_launch_env();
   const cudaError_t rc = guard(api, [&](State& s) -> cudaError_t {
     auto it = s.kernels.find(func);
     if (it == s.kernels.end()) {
@@ -1506,7 +1507,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     // relaxed load away when nobody is listening.
     const bool profiling = vgpu::profiling::enabled();
     const uint64_t t0 = profiling ? vgpu::profiling::now_ns() : 0;
-    if (trace())
+    if (trace(env.trace))
       std::fprintf(stderr, "[vgpu][trace] launch %s grid %ux%ux%u block %ux%ux%u shared %zu\n",
                    ki.entry_name.c_str(), gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y,
                    blockDim.z, sharedMem);
@@ -1597,6 +1598,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     cfg.cooperative = cooperative;
     cfg.cluster = cluster;
     cfg.devrt = &runtime_devrt_services();
+    cfg.env = &env;
     {
       // The heap and printf limits stop being settable once a kernel that uses
       // them has launched on this device, which is decided by what the kernel's

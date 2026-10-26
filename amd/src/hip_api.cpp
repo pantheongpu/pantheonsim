@@ -124,6 +124,11 @@ std::atomic<uint64_t> g_next_code_object{1}, g_next_kernel{1}, g_next_dispatch{1
 
 const vgpu::amd::hipprof::Hooks* profiler() { return g_profiler.load(std::memory_order_acquire); }
 
+// The clock for the start of a call a profiler may time: read only when one is attached (a call nobody times pays no clock read).
+// A profiler that attaches during the call is told it started when the call ended (`started` says it was not read).
+uint64_t profile_clock() { return profiler() ? vgpu::amd::hipprof::now_ns() : 0; }
+uint64_t started_at(uint64_t start) { return start ? start : vgpu::amd::hipprof::now_ns(); }
+
 // Work is being queued on `stream` (a launch, a copy or a fill): a card's runtime makes the null stream's
 // queue, and its staging buffers, with the first of it.
 void note_queue_use(hipStream_t stream) {
@@ -377,6 +382,10 @@ void refresh_pool_access(Pool& p) {
 std::map<void*, int> g_pool_imports;   // imported pool pointer -> the device it was mapped on
 
 struct State {
+  // Each device's properties as fill_properties makes them (a profile does not change once the runtime has it), made at the first
+  // question: hipDeviceGetAttribute is asked a dozen times by a program that sizes its launches, and filling the whole structure is
+  // two string copies and a few hundred stores. Indexed by ordinal; guarded by `mutex` like the rest.
+  std::vector<std::unique_ptr<vgpu::amd::abi::DevicePropR0600>> device_props;
   std::mutex mutex;
   std::string hardware_gfx;   // the device's own target where HSA_OVERRIDE_GFX_VERSION makes it report another
   std::unique_ptr<vgpu::runtime::Runtime> rt;
@@ -1602,7 +1611,7 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
   }
   vgpu::MemoryManager *tm = to.mem, *fm = from.mem;
   auto work = [=] {
-    const uint64_t start = vgpu::amd::hipprof::now_ns();
+    const uint64_t start = profile_clock();
     try {
       // (a device-to-device row goes through a buffer; not zeroed first, since all of it is written before it is read)
       const std::unique_ptr<uint8_t[]> buf =
@@ -1635,7 +1644,7 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
                      : to.device             ? Copy::HostToDevice
                      : from.device           ? Copy::DeviceToHost
                                              : Copy::HostToHost;
-      p->copied(k, ordinal, ordinal, dr.bytes(), dst_va, src_va, start, vgpu::amd::hipprof::now_ns());
+      p->copied(k, ordinal, ordinal, dr.bytes(), dst_va, src_va, started_at(start), vgpu::amd::hipprof::now_ns());
     }
     return hipSuccess;
   };
@@ -1706,7 +1715,7 @@ hipError_t fill_region(void* dst, const Region& r, const uint8_t* pattern, uint3
   const int fill_device = side.ordinal;
   const uint64_t base = reinterpret_cast<uint64_t>(dst);
   const auto work = [=] {
-        const uint64_t fill_start = vgpu::amd::hipprof::now_ns();
+        const uint64_t fill_start = profile_clock();
         try {
           for (uint64_t z = 0; z < r.depth; ++z)
             for (uint64_t y = 0; y < r.rows; ++y) {
@@ -1725,7 +1734,7 @@ hipError_t fill_region(void* dst, const Region& r, const uint8_t* pattern, uint3
         // A run of device memory is one fill to a profiler; rows are the runtime's 2D fill, not reported.
         if (on_device && r.rows == 1 && r.depth == 1)
           if (const auto* pr = profiler(); pr && pr->filled)
-            pr->filled(fill_device, base, r.width, fill_start, vgpu::amd::hipprof::now_ns());
+            pr->filled(fill_device, base, r.width, started_at(fill_start), vgpu::amd::hipprof::now_ns());
         return hipSuccess;
       };
   // A graph's launch runs its fill right here, on its stream's thread.
@@ -1835,14 +1844,14 @@ hipError_t hipMalloc(void** ptr, size_t size) {
     *ptr = nullptr;
     return record(s, hipSuccess);
   }
-  const uint64_t start = vgpu::amd::hipprof::now_ns();
+  const uint64_t start = profile_clock();
   try {
     *ptr = reinterpret_cast<void*>(d->memory().alloc(size));
   } catch (const std::exception& e) {
     return record(s, fail(hipErrorOutOfMemory, e.what()));
   }
   if (const auto* p = profiler(); p && p->allocated)
-    p->allocated(s.current, reinterpret_cast<uint64_t>(*ptr), size, false, start, vgpu::amd::hipprof::now_ns());
+    p->allocated(s.current, reinterpret_cast<uint64_t>(*ptr), size, false, started_at(start), vgpu::amd::hipprof::now_ns());
   return record(s, hipSuccess);
 }
 
@@ -1875,7 +1884,7 @@ hipError_t free_now(void* ptr) {
   int owner = s.current;
   for (int i = 0; i < s.rt->device_count(); ++i)
     if (s.rt->device(i).memory().owns(reinterpret_cast<uint64_t>(ptr))) owner = i;
-  const uint64_t start = vgpu::amd::hipprof::now_ns();
+  const uint64_t start = profile_clock();
   // What was never allocated, or was freed already, is the wrong value, as
   // ROCm's HIP has it.
   try {
@@ -1884,7 +1893,7 @@ hipError_t free_now(void* ptr) {
     return (fail(hipErrorInvalidValue, e.what()));
   }
   if (const auto* p = profiler(); p && p->allocated)
-    p->allocated(owner, reinterpret_cast<uint64_t>(ptr), 0, true, start, vgpu::amd::hipprof::now_ns());
+    p->allocated(owner, reinterpret_cast<uint64_t>(ptr), 0, true, started_at(start), vgpu::amd::hipprof::now_ns());
   return hipSuccess;
 }
 
@@ -2951,6 +2960,17 @@ void fill_properties(const vgpu::DeviceProfile& p, int ordinal, vgpu::amd::abi::
   std::memcpy(props->uuid.bytes, uuid, 16);
 }
 
+// The device's properties, made once (State::device_props). The caller holds s.mutex and has made the runtime and checked the ordinal.
+const vgpu::amd::abi::DevicePropR0600& properties_of(State& s, int ordinal) {
+  if (s.device_props.size() <= static_cast<size_t>(ordinal)) s.device_props.resize(static_cast<size_t>(ordinal) + 1);
+  auto& slot = s.device_props[static_cast<size_t>(ordinal)];
+  if (!slot) {
+    slot = std::make_unique<vgpu::amd::abi::DevicePropR0600>();
+    fill_properties(s.rt->device(ordinal).profile(), ordinal, slot.get(), s.rt->device(ordinal).physical());
+  }
+  return *slot;
+}
+
 // The same properties in the older layout: what hipGetDeviceProperties (and
 // hipGetDevicePropertiesR0000) fills, for a program built to that ABI. Each field is the R0600 one of the same name, so the two cannot
 // disagree; R0000's gcnArch, the number a gfx target was before it had a
@@ -3063,8 +3083,7 @@ hipError_t hipDeviceGetAttribute(int* value, int attribute, int ordinal) {
   if (!value) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p, s.rt->device(ordinal).physical());
+  const vgpu::amd::abi::DevicePropR0600& p = properties_of(s, ordinal);
   const auto clamp = [](size_t v) { return v > 0x7fffffff ? 0x7fffffff : static_cast<int>(v); };
   using A = vgpu::amd::abi::DeviceAttribute;
   switch (static_cast<A>(attribute)) {
@@ -3224,11 +3243,11 @@ hipError_t hipHostMalloc(void** ptr, size_t size, unsigned int flags) {
   const ApiCall api("hipHostMalloc", ptr, size, flags);
   // Coherent and non-coherent at once is a contradiction HIP refuses.
   if ((flags & 0x40000000u) && (flags & 0x80000000u)) return record(state(), hipErrorInvalidValue);
-  const uint64_t start = vgpu::amd::hipprof::now_ns();
+  const uint64_t start = profile_clock();
   const hipError_t e = host_alloc(ptr, size, g_host_allocations, flags);
   // A profiler is told of pinned memory as of an allocation on the host (agent -1).
   if (const auto* p = profiler(); e == hipSuccess && ptr && *ptr && size && p && p->allocated)
-    p->allocated(-1, reinterpret_cast<uint64_t>(*ptr), size, false, start, vgpu::amd::hipprof::now_ns());
+    p->allocated(-1, reinterpret_cast<uint64_t>(*ptr), size, false, started_at(start), vgpu::amd::hipprof::now_ns());
   return e;
 }
 
@@ -3249,14 +3268,14 @@ hipError_t hipHostFree(void* ptr) {
     }
     if (s.rt) drain_device(ordinal);
   }
-  const uint64_t start = vgpu::amd::hipprof::now_ns();
+  const uint64_t start = profile_clock();
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (!ptr) return record(s, hipSuccess);
     if (!host_free(s, ptr, g_host_allocations)) return record(s, hipErrorInvalidValue);
   }
   if (const auto* p = profiler(); p && p->allocated)
-    p->allocated(-1, reinterpret_cast<uint64_t>(ptr), 0, true, start, vgpu::amd::hipprof::now_ns());
+    p->allocated(-1, reinterpret_cast<uint64_t>(ptr), 0, true, started_at(start), vgpu::amd::hipprof::now_ns());
   return record(s, hipSuccess);
 }
 
@@ -4903,8 +4922,7 @@ hipError_t hipDeviceGetPCIBusId(char* bus_id, int len, int ordinal) {
   if (!bus_id || len <= 0) return record(s, hipErrorInvalidValue);
   if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
   if (ordinal < 0 || ordinal >= s.rt->device_count()) return record(s, hipErrorInvalidDevice);
-  vgpu::amd::abi::DevicePropR0600 p;
-  fill_properties(s.rt->device(ordinal).profile(), ordinal, &p, s.rt->device(ordinal).physical());
+  const vgpu::amd::abi::DevicePropR0600& p = properties_of(s, ordinal);
   // As snprintf fills it: a buffer too short for the whole string gets what
   // fits, and the call fails.
   const int n = std::snprintf(bus_id, static_cast<size_t>(len), "%04x:%02x:%02x.0", p.pciDomainID, p.pciBusID,
@@ -4920,8 +4938,7 @@ hipError_t hipDeviceGetByPCIBusId(int* ordinal, const char* bus_id) {
   unsigned domain = 0, bus = 0, dev = 0;
   if (std::sscanf(bus_id, "%x:%x:%x", &domain, &bus, &dev) != 3) return record(s, hipErrorInvalidValue);
   for (int i = 0; i < s.rt->device_count(); ++i) {
-    vgpu::amd::abi::DevicePropR0600 p;
-    fill_properties(s.rt->device(i).profile(), i, &p, s.rt->device(i).physical());
+    const vgpu::amd::abi::DevicePropR0600& p = properties_of(s, i);
     if (unsigned(p.pciDomainID) == domain && unsigned(p.pciBusID) == bus && unsigned(p.pciDeviceID) == dev) {
       *ordinal = i;
       return record(s, hipSuccess);

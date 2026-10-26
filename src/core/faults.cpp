@@ -73,15 +73,19 @@ void parse_into(Op op, const char* value) {
 
 }  // namespace
 
-void refresh() {
+void refresh(const char* alloc, const char* launch, const char* memcpy) {
+  const char* const values[static_cast<size_t>(Op::Count)] = {alloc, launch, memcpy};
   std::lock_guard<std::mutex> lock(g_mu);
   bool any = false;
   for (size_t i = 0; i < static_cast<size_t>(Op::Count); ++i) {
-    const Op op = static_cast<Op>(i);
-    parse_into(op, std::getenv(env_name(op)));
+    parse_into(static_cast<Op>(i), values[i]);
     if (g_plans[i].active()) any = true;
   }
   g_any.store(any, std::memory_order_relaxed);
+}
+
+void refresh() {
+  refresh(std::getenv(env_name(Op::Alloc)), std::getenv(env_name(Op::Launch)), std::getenv(env_name(Op::Memcpy)));
 }
 
 bool enabled() {

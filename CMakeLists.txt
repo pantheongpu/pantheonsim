@@ -244,6 +244,7 @@ add_library(vgpu STATIC
   src/simd/simd.cpp
   src/simd/lanes.cpp
   src/exec/scheduler.cpp
+  src/exec/launch_env.cpp
   src/exec/interpreter.cpp
   src/exec/tile_mma.cpp
   src/exec/devrt.cpp
@@ -1297,6 +1298,8 @@ vgpu_unit_test(test_fastpath)
 vgpu_unit_test(test_ptx_mem_runs)
 # The batches of a diverged warp's instructions (one path at a time, while it is the one select_path would pick), against one at a time.
 vgpu_unit_test(test_ptx_paths)
+# The PTX interpreter's pool of block states and the launch's one pass over the environment: a block starts from nothing after any other.
+vgpu_unit_test(test_ptx_block_reuse)
 # The host threads that run a grid's blocks, kept between launches: reuse,
 # nesting, several callers, fork; and the same kernels at 1, 2 and N threads.
 vgpu_unit_test(test_worker_pool)
@@ -1678,6 +1681,12 @@ target_link_libraries(test_amd_hip_async_inline PRIVATE vgpuhip)
 target_include_directories(test_amd_hip_async_inline PRIVATE tests/framework amd/include)
 add_test(NAME test_amd_hip_async_inline COMMAND test_amd_hip_async_inline)
 set_tests_properties(test_amd_hip_async_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# A device's properties are made at the first question and kept: each ordinal answers for itself, as the full structure says.
+add_executable(test_amd_hip_props_cache amd/tests/unit/test_hip_props_cache.cpp)
+target_link_libraries(test_amd_hip_props_cache PRIVATE vgpuhip)
+add_test(NAME test_amd_hip_props_cache COMMAND test_amd_hip_props_cache)
+set_tests_properties(test_amd_hip_props_cache PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
 # A synchronization gives back what the stream-ordered pools keep beyond their release thresholds.
 add_executable(test_amd_hip_pool_sync amd/tests/unit/test_hip_pool_sync.cpp)
