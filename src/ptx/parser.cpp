@@ -3,6 +3,7 @@
 // Anything outside the subset throws Err::UnsupportedPtx naming the exact
 // instruction, source line, and kernel — never a silent wrong answer.
 #include "vgpu/ptx/parser.hpp"
+#include "vgpu/ptx/builder.hpp"
 #include "vgpu/ptx/contract.hpp"
 #include "vgpu/ptx/sync_masks.hpp"
 
@@ -107,19 +108,6 @@ std::string normalize_scope(std::string part) {
   if (part.size() > cta.size() && part.compare(part.size() - cta.size(), cta.size(), cta) == 0)
     part.resize(part.size() - cta.size());
   return part;
-}
-
-// Dynamic shared memory lives above every static allocation, at the
-// alignment its declaration states. Every extern .shared names the same
-// bytes, so they share one offset. Starting it at the unaligned end of the
-// static data put a TMA destination declared .align 16 at offset 8.
-void place_dynamic_shared(EntryFn& fn) {
-  uint32_t align = 1;
-  for (const auto& [name, d] : fn.shared)
-    if (d.dynamic) align = std::max(align, d.align);
-  fn.dynamic_shared_offset = (fn.static_shared_size + align - 1) / align * align;
-  for (auto& [name, d] : fn.shared)
-    if (d.dynamic) d.offset = fn.dynamic_shared_offset;
 }
 
 std::vector<std::string> split_dots(const std::string& s) {
@@ -311,51 +299,10 @@ class Parser {
                        ".address_size .visible .weak .common .extern .global .const .entry .file .loc "
                        ".section)");
     }
-    resolve_calls(m);
     return m;
   }
 
  private:
-  // Point every call at the function it names. Done after the whole module is
-  // parsed because PTX declares prototypes first and a call can precede the
-  // definition -- resolving eagerly would refuse a forward reference that is
-  // perfectly well defined thirty lines later.
-  void resolve_calls(Module& m) {
-    std::unordered_map<std::string, std::shared_ptr<EntryFn>> by_name;
-    for (auto& f : m.funcs) by_name[f->name] = f;
-    // `with_tables` is false for the device functions themselves. Giving every
-    // EntryFn a list of shared_ptrs to all of them makes each function hold a
-    // shared_ptr to itself -- a reference cycle, so no .func is ever freed and
-    // every module leaks its whole body. Nothing needs it there anyway: an
-    // indirect call resolves against the *kernel's* table, which is the one
-    // the interpreter reads.
-    auto fix = [&](EntryFn& fn, bool with_tables) {
-      if (with_tables) {
-        fn.module_funcs.assign(m.funcs.begin(), m.funcs.end());
-        fn.module_entry_names.clear();
-        for (const auto& e : m.entries) fn.module_entry_names.push_back(e.name);
-      }
-      for (Instr& ins : fn.body) {
-        auto* call = std::get_if<OpCall>(&ins.op);
-        if (!call || call->indirect || call->callee.empty()) continue;
-        if (call->callee == "vprintf" || call->callee == "__assertfail" ||
-            call->callee == "malloc" || call->callee == "free")
-          continue;
-        // An unresolved name is left unresolved rather than refused here. A
-        // separately compiled build links in CUDA's device-runtime library,
-        // which declares functions the driver supplies (cnpGetLastError and
-        // friends) and defines them nowhere in the module -- so refusing at
-        // parse time rejected a whole program because a library function
-        // nobody calls had no body. Execution reports it if it is ever
-        // reached, which is the point at which it actually matters.
-        auto it = by_name.find(call->callee);
-        if (it != by_name.end()) call->target = it->second.get();
-      }
-    };
-    for (auto& e : m.entries) fix(e, /*with_tables=*/true);
-    for (auto& f : m.funcs) fix(*f, /*with_tables=*/false);
-  }
-
   [[noreturn]] void fail(size_t line, const std::string& msg) {
     throw Error::make(Err::PtxParse, "line ", line, ": ", msg);
   }
@@ -847,10 +794,9 @@ class Parser {
     }
     expect_punct("{");
     parse_body(fn);
-    contract_mul_add(fn);
-    mark_nan_order(fn);
-    fold_constant_sync_masks(fn);
-    place_dynamic_shared(fn);
+    FinalizeOptions passes;
+    passes.contract_mul_add = true;   // ptxas contracts; no other frontend does (builder.hpp)
+    finalize_function(fn, passes);
     current_kernel_.clear();
     cur_fn_ = nullptr;
     return true;
@@ -4726,7 +4672,7 @@ class Parser {
         expect_word("call prototype name");
       }
       // Whether this names a builtin or a device function defined elsewhere in
-      // the module is settled after parsing, by resolve_calls.
+      // the module is settled after parsing, by link_calls.
       ins.op = op;
     } else if (op0 == "activemask") {
       OpActiveMask op;
@@ -5517,110 +5463,9 @@ Module parse(const std::string& src) {
   // Note: a module with zero kernels is legal (e.g. a translation unit with
   // only host code still registers an empty PTX image).
   Module m = p.parse_module();
-  // Module-scope .shared variables are per-block storage, and a kernel is
-  // given a slot for each one it can reach: named in its own body or in the
-  // body of a device function it calls, directly or through others. That is
-  // what the hardware allocates. Charging every kernel for every one of them
-  // refused real programs: a separately compiled build hoists each device
-  // function's static __shared__ to module scope, and NanoVDB's 37.9 KB of
-  // those plus the device-runtime library's 32.9 KB is more than a T4 holds,
-  // so no kernel could be placed. A kernel that makes an indirect call could
-  // reach any function, so it keeps them all.
-  std::set<std::string> interesting;
-  for (const auto& md : m.module_shared) interesting.insert(md.name);
-  std::unordered_map<std::string, const EntryFn*> funcs_by_name;
-  for (const auto& f : m.funcs) {
-    interesting.insert(f->name);
-    // A prototype and its definition share a name; the definition has the body.
-    auto [it, fresh] = funcs_by_name.emplace(f->name, f.get());
-    if (!fresh && it->second->body.empty()) it->second = f.get();
-  }
-  auto trim = [&](EntryFn& f) {
-    for (auto it = f.words_seen.begin(); it != f.words_seen.end();)
-      it = interesting.count(*it) ? std::next(it) : f.words_seen.erase(it);
-  };
-  for (auto& f : m.funcs) trim(*f);
-  for (auto& e : m.entries) trim(e);
-  auto calls_indirectly = [](const EntryFn& f) {
-    for (const Instr& ins : f.body)
-      if (const auto* c = std::get_if<OpCall>(&ins.op); c && c->indirect) return true;
-    return false;
-  };
-  // The names a kernel can reach, or nothing when it could reach anything.
-  // `called` collects the device functions on the way.
-  auto reachable = [&](const EntryFn& e, std::vector<const EntryFn*>& called)
-      -> std::optional<std::set<std::string>> {
-    if (calls_indirectly(e)) return std::nullopt;
-    std::set<std::string> names = e.words_seen;
-    std::vector<const EntryFn*> todo;
-    std::set<const EntryFn*> done;
-    for (const auto& w : e.words_seen)
-      if (auto it = funcs_by_name.find(w); it != funcs_by_name.end()) todo.push_back(it->second);
-    while (!todo.empty()) {
-      const EntryFn* f = todo.back();
-      todo.pop_back();
-      if (!done.insert(f).second) continue;
-      if (calls_indirectly(*f)) return std::nullopt;
-      called.push_back(f);
-      for (const auto& w : f->words_seen) {
-        names.insert(w);
-        if (auto it = funcs_by_name.find(w); it != funcs_by_name.end()) todo.push_back(it->second);
-      }
-    }
-    return names;
-  };
-  for (auto& fn : m.entries) {
-    std::vector<const EntryFn*> called;
-    const auto reach = reachable(fn, called);
-    // A device function's own .shared (declared inside its body, as a
-    // separately compiled build emits a function's static __shared__) is
-    // resolved in the running kernel's frame, so the kernel needs a slot for
-    // it. It used to have none: the callee's first access was "unknown
-    // symbol". With an indirect call in reach, every function counts.
-    if (!reach) {
-      called.clear();
-      for (const auto& f : m.funcs) called.push_back(f.get());
-    }
-    for (const EntryFn* f : called) {
-      for (const auto& [name, fd] : f->shared) {
-        if (fn.shared.count(name)) continue;
-        SharedDecl d = fd;
-        if (d.dynamic) {
-          fn.uses_dynamic_shared = true;
-          d.offset = fn.static_shared_size;
-        } else {
-          const uint32_t off = (fn.static_shared_size + d.align - 1) / d.align * d.align;
-          d.offset = off;
-          fn.static_shared_size = off + d.size;
-        }
-        fn.shared.emplace(name, d);
-      }
-    }
-    for (const auto& md : m.module_shared) {
-      if (fn.shared.count(md.name)) continue;
-      // Only static .shared costs a kernel anything. A dynamic array
-      // (.extern, no size) is the launch's dynamic allocation under another
-      // name, so every kernel has it, whether or not it names it.
-      if (reach && !reach->count(md.name) && !md.dynamic) continue;
-      SharedDecl d = md;
-      if (d.dynamic) {
-        fn.uses_dynamic_shared = true;
-        d.offset = fn.static_shared_size;
-      } else {
-        uint32_t off = (fn.static_shared_size + d.align - 1) / d.align * d.align;
-        d.offset = off;
-        fn.static_shared_size = off + d.size;
-      }
-      fn.shared.emplace(d.name, d);
-    }
-    place_dynamic_shared(fn);
-  }
-  // Last, once nothing edits an instruction any more (mul/add contraction,
-  // sync-mask folding and call resolution all do): the pre-decoded forms must
-  // describe the body the interpreter will run.
-  intern_call_slots(m);
-  for (auto& fn : m.entries) build_micro(fn);
-  for (auto& fn : m.funcs) build_micro(*fn);
+  // Calls, module-scope .shared, call slots and the pre-decoded forms: the
+  // steps every producer of a Module shares (builder.hpp).
+  finalize_module(m);
   return m;
 }
 

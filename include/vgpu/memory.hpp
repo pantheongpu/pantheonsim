@@ -760,6 +760,14 @@ class MemoryManager {
     // Only ever widened, so a stale read is conservative, never wrong.
     std::atomic<uint64_t> lo{UINT64_MAX};
     std::atomic<uint64_t> hi{0};
+    // Which version of `maps` this is. A kernel's scalar access to mapped host memory used to take `mu` and scan
+    // `maps` every time (a 1M-element vector add over three mapped buffers ran 1.7x slower than over engine memory
+    // on one thread and 3.9x slower on three; PantheonZE's docs/exec-address-model.md has the table); lookup_host() now
+    // keeps each thread's last few hits and trusts them while this has not moved. Every change to `maps` takes a
+    // value no HostMaps has had before (process-wide counter), so an entry cached for a destroyed manager whose
+    // HostMaps lived at the same address can never be taken for a current one.
+    std::atomic<uint64_t> gen;
+    HostMaps();
     // The range alone is not enough: a PIE program's heap (0x55...) and the
     // mmap area (0x7f...) sit either side of the device windows, so a pinned
     // buffer in each -- PyTorch and CUTLASS's tests both make them -- spans
@@ -787,6 +795,20 @@ class MemoryManager {
   // while a launch runs), so it must never change after construction.
   std::unique_ptr<HostMaps> host_maps_ = std::make_unique<HostMaps>();
   const HostMap* find_host_map_locked(uint64_t addr, uint64_t len) const;
+  // The mapping that holds [addr, addr + len), without taking the lock when this thread has just used it (a
+  // small per-thread cache validated by HostMaps::gen). False where nothing is mapped over the whole range.
+  struct HostHit {
+    uint8_t* host;
+    uint64_t base, len;
+    bool read_only;
+  };
+  bool lookup_host(uint64_t addr, uint64_t len, HostHit* out) const;
+  static uint64_t fresh_generation();
+ public:
+  // The cache is on unless VGPU_HOSTMAP_CACHE=0. This switches it for the whole process (a benchmark compares the
+  // two; nothing else needs to).
+  static void set_host_lookup_cache(bool on);
+ private:
   // Host memory mapped over the whole of [addr, addr + len), perhaps as
   // several mappings placed end to end: the pieces, in order, as (host
   // address, offset into the range, length). False where any byte is not.

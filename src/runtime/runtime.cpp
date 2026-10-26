@@ -310,66 +310,77 @@ uint64_t Device::load_module(const std::string& ptx_src) {
                         suffix == 'a' ? std::to_string(want / 10) + "." + std::to_string(want % 10)
                                       : std::to_string(want / 10) + ".x",
                         ", and this device is ", profile_.cc_major, ".", profile_.cc_minor);
-    LoadedModule lm;
-    lm.id = next_module_id_++;
-    // Materialize module .global variables into device memory.
-    for (const auto& g : mod->globals) {
-      uint64_t va = mem_.alloc(g.size);
-      if (!g.init.empty()) mem_.write(va, g.init.data(), g.init.size());
-      lm.symbols[g.name] = va;
-      lm.global_vas.push_back(va);
-    }
-    // Device functions get an address so a function pointer can be stored in a
-    // global, loaded and called. The address encodes the index, which is what
-    // an indirect call decodes to find the function again.
-    for (size_t i = 0; i < mod->funcs.size(); ++i)
-      lm.symbols[mod->funcs[i]->name] = kFuncVaBase + i * kFuncVaStride;
-    if (lazy)  // the same addresses, from the definitions' order in the text
-      for (size_t i = 0; i < lazy->func_order.size(); ++i)
-        lm.symbols[lazy->func_order[i]] = kFuncVaBase + i * kFuncVaStride;
-    // Kernels too, which is what a device-side launch names its child by.
-    // Addresses are never reused, so a stale one cannot name another kernel.
-    for (const auto& e : mod->entries) {
-      const uint64_t va = next_kernel_va_;
-      next_kernel_va_ += kKernelVaStride;
-      lm.symbols[e.name] = va;
-      lm.kernels.emplace_back(va, &e);
-    }
-    if (lazy)
-      for (const std::string& name : lazy->entry_order) {
-        const uint64_t va = next_kernel_va_;
-        next_kernel_va_ += kKernelVaStride;
-        lm.symbols[name] = va;
-        lm.kernels.emplace_back(va, nullptr);
-      }
-    // Second pass: a global initialised with another symbol's address can only
-    // be filled in once every global has one. A kernel's address is its
-    // entry in the kernel window; PTX that only uses it to carry a mangled
-    // name (which is what NVRTC's name expressions compile to) never
-    // dereferences it.
-    for (const auto& g : mod->globals) {
-      if (g.init_symbols.empty()) continue;
-      const uint64_t slot = lm.symbols[g.name];
-      for (const auto& si : g.init_symbols) {
-        auto it = lm.symbols.find(si.name);
-        const uint64_t target = it == lm.symbols.end() ? 0 : it->second;
-        const uint64_t room = g.size > si.offset ? g.size - si.offset : 0;
-        const uint64_t bytes = room < sizeof(uint64_t) ? room : sizeof(uint64_t);
-        if (bytes) mem_.write(slot + si.offset, &target, bytes);
-      }
-    }
-    lm.mod = std::move(mod);
-    lm.lazy = std::move(lazy);
-    uint64_t id = lm.id;
-    modules_.push_back(std::move(lm));
-    module_index_[id] = std::prev(modules_.end());
-    forget_kernel_table();
-    return id;
+    return install_module(std::move(mod), std::move(lazy));
   } catch (const Error& e) {
     if (e.code() == Err::UnsupportedPtx)
       throw Error::make(e.code(), e.message(), "\n  GPU profile: ", profile_.id);
     throw;
   }
+}
+
+// Gives a parsed (or built) module its device memory and addresses and records it: the part of loading that does not
+// depend on where the module came from. `lazy` is a lazily parsed module's bookkeeping, null for the others.
+uint64_t Device::install_module(std::shared_ptr<ptx::Module> mod, std::shared_ptr<LazyModule> lazy) {
+  LoadedModule lm;
+  lm.id = next_module_id_++;
+  // Materialize module .global variables into device memory.
+  for (const auto& g : mod->globals) {
+    uint64_t va = mem_.alloc(g.size);
+    if (!g.init.empty()) mem_.write(va, g.init.data(), g.init.size());
+    lm.symbols[g.name] = va;
+    lm.global_vas.push_back(va);
+  }
+  // Device functions get an address so a function pointer can be stored in a
+  // global, loaded and called. The address encodes the index, which is what
+  // an indirect call decodes to find the function again.
+  for (size_t i = 0; i < mod->funcs.size(); ++i)
+    lm.symbols[mod->funcs[i]->name] = kFuncVaBase + i * kFuncVaStride;
+  if (lazy)  // the same addresses, from the definitions' order in the text
+    for (size_t i = 0; i < lazy->func_order.size(); ++i)
+      lm.symbols[lazy->func_order[i]] = kFuncVaBase + i * kFuncVaStride;
+  // Kernels too, which is what a device-side launch names its child by.
+  // Addresses are never reused, so a stale one cannot name another kernel.
+  for (const auto& e : mod->entries) {
+    const uint64_t va = next_kernel_va_;
+    next_kernel_va_ += kKernelVaStride;
+    lm.symbols[e.name] = va;
+    lm.kernels.emplace_back(va, &e);
+  }
+  if (lazy)
+    for (const std::string& name : lazy->entry_order) {
+      const uint64_t va = next_kernel_va_;
+      next_kernel_va_ += kKernelVaStride;
+      lm.symbols[name] = va;
+      lm.kernels.emplace_back(va, nullptr);
+    }
+  // Second pass: a global initialised with another symbol's address can only
+  // be filled in once every global has one. A kernel's address is its
+  // entry in the kernel window; PTX that only uses it to carry a mangled
+  // name (which is what NVRTC's name expressions compile to) never
+  // dereferences it.
+  for (const auto& g : mod->globals) {
+    if (g.init_symbols.empty()) continue;
+    const uint64_t slot = lm.symbols[g.name];
+    for (const auto& si : g.init_symbols) {
+      auto it = lm.symbols.find(si.name);
+      const uint64_t target = it == lm.symbols.end() ? 0 : it->second;
+      const uint64_t room = g.size > si.offset ? g.size - si.offset : 0;
+      const uint64_t bytes = room < sizeof(uint64_t) ? room : sizeof(uint64_t);
+      if (bytes) mem_.write(slot + si.offset, &target, bytes);
+    }
+  }
+  lm.mod = std::move(mod);
+  lm.lazy = std::move(lazy);
+  uint64_t id = lm.id;
+  modules_.push_back(std::move(lm));
+  module_index_[id] = std::prev(modules_.end());
+  forget_kernel_table();
+  return id;
+}
+
+// A module a frontend built with ptx::ModuleBuilder (no PTX text, so no .target to check against the device).
+uint64_t Device::load_built_module(ptx::Module module) {
+  return install_module(std::make_shared<ptx::Module>(std::move(module)), nullptr);
 }
 
 uint64_t Device::load_cubin(const uint8_t* image, size_t size) {

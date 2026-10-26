@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iterator>
+#include <utility>
 #include <string>
 
 #include "vgpu/embedded_profiles.hpp"
@@ -33,14 +35,24 @@ std::vector<std::string> available_gpus() {
   return out;
 }
 
+std::vector<std::string> available_engine_gpus() {
+  std::vector<std::string> out;
+  for (const auto& p : embedded::kEngineProfiles) out.emplace_back(p.id);
+  return out;
+}
+
 DeviceProfile load_gpu(const std::string& id) {
   std::string want = lower(id);
-  for (const auto& p : embedded::kProfiles) {
-    if (want == p.id) {
-      DeviceProfile prof = DeviceProfile::from_yaml(p.yaml, profile_file(p.id));
-      if (lower(prof.id) != want)
-        throw Error::make(Err::Internal, "profile file for ", p.id, " declares mismatched id ", prof.id);
-      return prof;
+  for (const auto& table : {std::pair<const embedded::EmbeddedProfile*, size_t>{embedded::kProfiles, std::size(embedded::kProfiles)},
+                            {embedded::kEngineProfiles, std::size(embedded::kEngineProfiles)}}) {
+    for (size_t i = 0; i < table.second; ++i) {
+      const auto& p = table.first[i];
+      if (want == p.id) {
+        DeviceProfile prof = DeviceProfile::from_yaml(p.yaml, profile_file(p.id));
+        if (lower(prof.id) != want)
+          throw Error::make(Err::Internal, "profile file for ", p.id, " declares mismatched id ", prof.id);
+        return prof;
+      }
     }
   }
   std::string avail;

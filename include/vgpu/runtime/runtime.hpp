@@ -69,6 +69,14 @@ class Device {
   // Loads a PTX module; returns a module handle valid for this device.
   // PTX errors are augmented with the device's profile id.
   uint64_t load_module(const std::string& ptx_src);
+  // Loads a module a frontend built without PTX text (ptx::KernelBuilder and
+  // ptx::ModuleBuilder, vgpu/ptx/builder.hpp): its globals are given device
+  // memory, its kernels and device functions addresses, and the module a
+  // handle, exactly as for a parsed one. The kernels are then found with
+  // get_function and run with launch. Module::target is not checked against the
+  // device (there is no PTX version to be too new); the module is as portable
+  // as the lowering that made it.
+  uint64_t load_built_module(ptx::Module module);
   // Loads a cubin (the SASS a fatbin carries for this architecture). Its
   // kernels are looked up and launched like a PTX module's.
   uint64_t load_cubin(const uint8_t* image, size_t size);
@@ -158,6 +166,7 @@ class Device {
   // A large module is not parsed whole (see load_module): its kernels are
   // parsed one at a time, the first time each is looked up.
   struct LazyModule;
+  uint64_t install_module(std::shared_ptr<ptx::Module> mod, std::shared_ptr<LazyModule> lazy);
   struct LoadedModule {
     uint64_t id = 0;
     std::shared_ptr<ptx::Module> mod;   // the whole module, or only its declarations when lazy
@@ -230,6 +239,10 @@ class Runtime {
 
   int device_count() const { return static_cast<int>(devices_.size()); }
   Device& device(int ordinal);
+  // Registers a module built without PTX text on a device (Device::load_built_module).
+  uint64_t load_built_module(int ordinal, ptx::Module module) {
+    return device(ordinal).load_built_module(std::move(module));
+  }
 
   // Host memory registered with cudaHostRegister or cuMemHostRegister, by its
   // base. One record for both libraries, as the card keeps one: memory either
