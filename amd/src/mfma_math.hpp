@@ -62,6 +62,18 @@ inline void half4_to_double(__m128i u, __m128d* lo, __m128d* hi) {
 }
 #endif
 
+#if defined(__x86_64__) && defined(__GNUC__)
+// Eight binary16 values (each in the low 16 bits of a 32-bit lane of `u`, the rest zero) as eight doubles, by F16C: the same doubles
+// half_bits_to_double gives (the conversion is exact, makes a signalling NaN quiet and shifts its payload up, whatever MXCSR says).
+__attribute__((target("avx2,f16c"))) inline void half8_to_double(__m256i u, __m256d* lo, __m256d* hi) {
+  // (pack the dwords to words; the two 128-bit halves' values are then in the two ends of the 256-bit result, so bring them together)
+  const __m256i packed = _mm256_permute4x64_epi64(_mm256_packus_epi32(u, u), 0xD8);
+  const __m256 f = _mm256_cvtph_ps(_mm256_castsi256_si128(packed));
+  *lo = _mm256_cvtps_pd(_mm256_castps256_ps128(f));
+  *hi = _mm256_cvtps_pd(_mm256_extractf128_ps(f, 1));
+}
+#endif
+
 // A product and a sum with the NaN rule of the machine spelled out. Where both operands of an x86 SSE multiply or add are
 // NaNs the result is the first one (the destination register's), and which of two commutative operands the compiler puts
 // there is its choice -- one that differs between loops, and between a scalar and a vectorized form of the same loop. The
