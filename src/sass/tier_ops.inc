@@ -135,8 +135,17 @@ inline uint32_t tier_extend(unsigned size, uint32_t v) {   // a sub-word load wi
 [[gnu::always_inline]] inline void tier_store(const TCtx& c, uint16_t dst, Mask ex, const uint32_t* r) {
   if (dst == tier::kNoReg) return;
   uint32_t* d = c.R + dst * 32u;
+  if (r == d) return;   // (tier_out: the kernel wrote the destination itself)
   if (ex == kAll) tier_copy_row(d, r);
   else c.sk->blend_m(d, r, ex);   // the executing lanes only, without a branch per lane
+}
+
+// Where a kernel that works lane by lane (each lane of its result from the same lane of its sources, the sources of a block of lanes all read before
+// the block is written: every kernel of vgpu/simd/simd.hpp that the handlers below name) writes its result: the destination register itself when the whole
+// warp runs the instruction (the row copy of tier_store is then 16 loads and stores less per instruction, and a destination that is also a source
+// is no problem to such a kernel), else the temporary `tmp`, from which tier_store blends the lanes that run.
+[[gnu::always_inline]] inline uint32_t* tier_out(const TCtx& c, uint16_t dst, Mask ex, uint32_t* tmp) {
+  return ex == kAll && dst != tier::kNoReg ? c.R + dst * 32u : tmp;
 }
 
 // ---- handlers ---------------------------------------------------------------------------------
@@ -154,7 +163,8 @@ TIER_HANDLER(h_mov) {
 
 TIER_HANDLER(h_iadd3) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]),
                  *d = tier_src<false>(c, op.s[2], t[2]);
   c.sk->iadd3(r, a, b, d, op.a);
@@ -163,7 +173,8 @@ TIER_HANDLER(h_iadd3) {
 
 TIER_HANDLER(h_imad) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]),
                  *d = tier_src<false>(c, op.s[2], t[2]);
   c.sk->imad(r, a, b, d);
@@ -172,7 +183,8 @@ TIER_HANDLER(h_imad) {
 
 TIER_HANDLER(h_lop3) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]),
                  *d = tier_src<false>(c, op.s[2], t[2]);
   c.sk->lop3(r, a, b, d, op.a);   // (the vector kernel, which has the usual tables as expressions: faster than loops the compiler makes for the baseline x86-64)
@@ -187,42 +199,22 @@ TIER_HANDLER(h_lop3) {
 
 TIER_HANDLER(h_lea) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const bool hi = op.aux & 1, x = op.aux & 2, three = op.aux & 4, bneg = op.aux & 8;
-  const unsigned sh = op.a;
   const Mask cin = x ? tier_pmask(c, op.p) : 0;
   const uint32_t* a = tier_src<false>(c, op.s[0], t[0]);
   const uint32_t* b = tier_src<false>(c, op.s[1], t[1]);
-  const uint32_t* top = three ? tier_src<false>(c, op.s[2], t[2]) : nullptr;
-  Mask carry = 0;
-  if (!hi && !x && !bneg) {   // the usual one, (a << s) + b: two vector operations, and the carry out is a wrap
-    for (unsigned l = 0; l < 32; ++l) r[l] = (sh >= 32 ? 0 : a[l] << sh) + b[l];
-    if (op.dst2 != tier::kNoReg)
-      for (unsigned l = 0; l < 32; ++l) carry |= static_cast<Mask>(r[l] < (sh >= 32 ? 0 : a[l] << sh)) << l;
-    tier_store(c, op.dst, ex, r);
-    if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
-    return;
-  }
-  for (unsigned l = 0; l < 32; ++l) {
-    uint32_t shifted;
-    if (!hi) {
-      shifted = sh >= 32 ? 0 : a[l] << sh;
-    } else {
-      const uint32_t tp = three ? top[l] : static_cast<uint32_t>(static_cast<int32_t>(a[l]) >> 31);
-      shifted = static_cast<uint32_t>(((a[l] | (static_cast<uint64_t>(tp) << 32)) << sh) >> 32);
-    }
-    uint64_t sum = static_cast<uint64_t>(shifted) + b[l] + ((cin >> l) & 1);
-    if (bneg && b[l] == 0) sum += uint64_t{1} << 32;   // -0 is ~0 + 1: it carries out (see the general rule)
-    r[l] = static_cast<uint32_t>(sum);
-    carry |= static_cast<Mask>(sum >> 32 != 0) << l;
-  }
+  const uint32_t* top = three ? tier_src<false>(c, op.s[2], t[2]) : nullptr;   // (none: the high word is a's sign)
+  const Mask carry = exec::sasslea::lea_lanes({hi, bneg, op.a}, r, a, b, top, cin);   // (vgpu/exec/sass_lea.hpp: four lanes to a vector)
   tier_store(c, op.dst, ex, r);
   if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
 }
 
 TIER_HANDLER(h_shf) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t* lo = tier_src<false>(c, op.s[0], t[0]);
   const uint32_t* n = tier_src<false>(c, op.s[1], t[1]);
   const uint32_t* top = tier_src<false>(c, op.s[2], t[2]);
@@ -272,7 +264,8 @@ TIER_HANDLER(h_fsel) {
 
 TIER_HANDLER(h_ffma) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<true>(c, op.s[0], t[0]), *b = tier_src<true>(c, op.s[1], t[1]),
                  *d = tier_src<true>(c, op.s[2], t[2]);
   if (!op.a && !op.b) {
@@ -288,7 +281,8 @@ TIER_HANDLER(h_ffma) {
 
 TIER_HANDLER(h_fadd) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[2][32], r[32];
+  alignas(32) uint32_t t[2][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<true>(c, op.s[0], t[0]), *b = tier_src<true>(c, op.s[1], t[1]);
   if (!op.a && !op.b) {
     c.sk->fadd(r, a, b);
@@ -303,7 +297,8 @@ TIER_HANDLER(h_fadd) {
 
 TIER_HANDLER(h_fmul) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[2][32], r[32];
+  alignas(32) uint32_t t[2][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<true>(c, op.s[0], t[0]), *b = tier_src<true>(c, op.s[1], t[1]);
   if (!op.a && !op.b) {
     c.sk->fmul(r, a, b);
@@ -480,14 +475,16 @@ TIER_HANDLER(h_isetp_ex) {   // the high words of a 64-bit compare; the low word
 
 TIER_HANDLER(h_popc) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[32], r[32];
+  alignas(32) uint32_t t[32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   c.sk->lane_unary(0, r, tier_src<false>(c, op.s[0], t));   // the number of set bits
   tier_store(c, op.dst, ex, r);
 }
 
 TIER_HANDLER(h_i2fp) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[32], r[32];
+  alignas(32) uint32_t t[32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   c.sk->i2f(op.c != 0, r, tier_src<false>(c, op.s[0], t));
   tier_store(c, op.dst, ex, r);
 }
@@ -564,7 +561,8 @@ TIER_HANDLER(h_f2fp) {   // F2FP.PACK_AB: the interpreter's own code (the NaN, .
 
 TIER_HANDLER(h_unary) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[32], r[32];
+  alignas(32) uint32_t t[32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   c.sk->lane_unary(op.a, r, tier_src<false>(c, op.s[0], t));
   tier_store(c, op.dst, ex, r);
 }
@@ -1470,63 +1468,37 @@ TIER_HANDLER(h_ldsm) {
   blk.st.shared_bytes_read += 32u * 4 * nmat;
 }
 
-// IMMA, the dense integer forms (exec_mma): the 8- or 4-bit elements of A (M x K, row-major) and of B (K x 8, kept column by column so that
-// a dot product runs along contiguous elements) read out of the fragment registers as exec_mma lays them out, each product summed with the
-// accumulator in 64 bits and the result cut to 32 -- the same as a wrapping 32-bit sum -- or, under .SAT, clamped to the s32 range after every
-// 128 bits of K. The destination is written for the executing lanes.
+// IMMA, the dense integer forms (exec_mma): the 8- or 4-bit elements of A (M x K, row-major) and of B (K x 8) read out of the fragment registers
+// as exec_mma lays them out (vgpu/exec/tile_mma.hpp), each product summed with the accumulator in 32 bits (a wrapping sum is the 64-bit sum cut to
+// 32) or, under .SAT, clamped to the s32 range after every 128 bits of K, by the tile kernel (vgpu/simd/simd.hpp: tile_i32). The destination is
+// written for the executing lanes.
 TIER_HANDLER(h_imma) {
   TIER_PRELUDE
   if (op.dst == tier::kNoReg) return;   // (an RZ destination: the interpreter computes and throws it away)
   const unsigned M = op.a, K = op.b;
   const bool sa = op.aux & 1, sb = op.aux & 2, sat = op.aux & 4, four = op.aux & 8;
+  const exec::FragType ta = four ? (sa ? exec::FragType::S4 : exec::FragType::U4) : (sa ? exec::FragType::S8 : exec::FragType::U8),
+                       tb = four ? (sb ? exec::FragType::S4 : exec::FragType::U4) : (sb ? exec::FragType::S8 : exec::FragType::U8);
   const unsigned per_reg = four ? 8 : 4, a_regs = M * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = M * 8 / 32;
-  const auto elem = [&](uint32_t v, unsigned e, bool sgn) -> int16_t {
-    if (four) {
-      const unsigned x = (v >> (4 * e)) & 0xfu;
-      return sgn ? static_cast<int16_t>(static_cast<int8_t>(static_cast<uint8_t>(x << 4)) >> 4) : static_cast<int16_t>(x);
-    }
-    const unsigned x = (v >> (8 * e)) & 0xffu;
-    return sgn ? static_cast<int16_t>(static_cast<int8_t>(x)) : static_cast<int16_t>(x);
+  static const uint32_t kZeros[32] = {};
+  alignas(32) uint32_t xa[8 * 32], xb[4 * 32], xc[4 * 32], xd[4 * 32];
+  const auto load = [&](unsigned base, unsigned n, uint32_t* dst) {
+    for (unsigned i = 0; i < n; ++i) std::memcpy(dst + 32 * i, base == kRZ ? kZeros : c.R + (base + i) * 32u, 32 * sizeof(uint32_t));
   };
-  const auto word = [&](uint32_t base, unsigned i, unsigned l) -> uint32_t { return base == kRZ ? 0u : c.R[(base + i) * 32u + l]; };
-  alignas(32) int16_t A[16 * 128], Bt[8 * 128];
-  for (unsigned r = 0; r < a_regs; ++r)
-    for (unsigned l = 0; l < 32; ++l) {
-      const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8, col0 = t * per_reg + (r / 2) * (per_reg * 4);
-      const uint32_t v = word(op.s[0].off, r, l);
-      for (unsigned e = 0; e < per_reg; ++e) A[row * K + col0 + e] = elem(v, e, sa);
-    }
-  for (unsigned r = 0; r < b_regs; ++r)
-    for (unsigned l = 0; l < 32; ++l) {
-      const unsigned g = l / 4, t = l % 4, row0 = t * per_reg + r * (per_reg * 4);
-      const uint32_t v = word(op.s[1].off, r, l);
-      for (unsigned e = 0; e < per_reg; ++e) Bt[g * K + row0 + e] = elem(v, e, sb);
-    }
-  const auto cd = [](unsigned l, unsigned slot) { return (l / 4 + (slot / 2) * 8) * 8 + (l % 4) * 2 + slot % 2; };
-  int32_t C[16 * 8], D[16 * 8];
-  for (unsigned l = 0; l < 32; ++l)
-    for (unsigned s = 0; s < c_regs; ++s) C[cd(l, s)] = static_cast<int32_t>(word(op.s[2].off, s, l));
-  const unsigned block = sat ? (four ? 32u : 16u) : K;   // 128 bits of K under .SAT
-  for (unsigned i = 0; i < M; ++i)
-    for (unsigned j = 0; j < 8; ++j) {
-      const int16_t* a = A + i * K;
-      const int16_t* b = Bt + j * K;
-      if (!sat) {
-        int32_t acc = 0;
-        for (unsigned k = 0; k < K; ++k) acc += static_cast<int32_t>(a[k]) * static_cast<int32_t>(b[k]);   // (|product| < 2^16, K <= 128: no overflow)
-        D[i * 8 + j] = static_cast<int32_t>(static_cast<uint32_t>(C[i * 8 + j]) + static_cast<uint32_t>(acc));
-      } else {
-        int64_t acc = C[i * 8 + j];
-        for (unsigned k0 = 0; k0 < K; k0 += block) {
-          for (unsigned k = k0; k < k0 + block && k < K; ++k) acc += static_cast<int64_t>(a[k]) * static_cast<int64_t>(b[k]);
-          acc = std::clamp<int64_t>(acc, INT32_MIN, INT32_MAX);
-        }
-        D[i * 8 + j] = static_cast<int32_t>(acc);
-      }
-    }
+  load(op.s[0].off, a_regs, xa);
+  load(op.s[1].off, b_regs, xb);
+  load(op.s[2].off, c_regs, xc);
+  alignas(32) int32_t ia[16 * 128], ib[128 * 8], ic[16 * 8], id[16 * 8];
+  exec::mma_frag_a(ta, M, K, false, xa, nullptr, 0, nullptr, ia);
+  exec::mma_frag_b(tb, K, xb, nullptr, ib);
+  if (M == 16) exec::wgmma_acc_to_tile_i32(xc, 8, ic);
+  else exec::mma_acc8_to_tile_i32(xc, ic);
+  c.sk->tile_i32(M, 8, K, ia, ib, ic, 8, sat ? 128 / (four ? 4 : 8) : K, sat, id, 8);   // (.SAT clamps after every 128 bits of K)
+  if (M == 16) exec::wgmma_tile_to_acc_i32(id, 8, xd);
+  else exec::mma_tile_to_acc8_i32(id, xd);
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    for (unsigned s = 0; s < c_regs; ++s) c.R[(op.dst + s) * 32u + l] = static_cast<uint32_t>(D[cd(l, s)]);
+    for (unsigned s = 0; s < c_regs; ++s) c.R[(op.dst + s) * 32u + l] = xd[s * 32 + l];
   }
 }
 
@@ -1859,6 +1831,15 @@ struct JitFrame {
   return rg.k;
 }
 
+// The ops of a stretch (Program::run) one after the other for `group`, with their class counts. A function of its own so that the loop keeps its few
+// values in registers (inside the run loop of step_warp they were on the stack).
+[[gnu::noinline]] void tier_issue(TCtx& c, const tier::MOp* o, unsigned k, Mask group, unsigned glanes, uint64_t* by_class) {
+  for (const tier::MOp* const end = o + k; o != end; ++o) {
+    by_class[o->cls] += glanes;
+    o->fn(&c, *o, group);
+  }
+}
+
 // The share rule's sample (jit.hpp): the warp instructions a call of the hook loop ran, whatever ran them, are added to the unit's sample on the way out
 // (also when a fault leaves). `u` is null once the rule has decided, or for the loop without the hook.
 struct JitSampler {
@@ -1913,6 +1894,24 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
             n += k - 1;
             continue;
           }
+        }
+      }
+      // A stretch of register-only instructions, each for the whole group, issued back to back: what the loop below does for each of them
+      // -- the store gate (none of them is a store), the step count, the guard (none has one) and the counters -- is done for the stretch.
+      // Not in tier 2's loop (its regions would be skipped over), nor while the statistics count each instruction.
+      if constexpr (!Jit) {
+        unsigned k = ops[idx].run;
+        if (k > 256 - n) k = 256 - n;
+        if (k >= 2 && regs_ok && group && !tier_stats_ && w.steps + k <= max_steps_) {
+          w.steps += k;
+          st.instructions += k;
+          st.thread_instructions += uint64_t{k} * glanes;
+          const tier::MOp* const o = ops + idx;
+          tier_issue(c, o, k, group, glanes, st.inst_by_class);
+          cur = o + k - 1;
+          idx += k;
+          n += k - 1;
+          continue;
         }
       }
       // step_warp's store gate: a warp's first store to global memory ends its turn, once, so that the block's other warps
@@ -2113,16 +2112,12 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   if (!tier_chain_ || w.budget == 0 || w.yield || w.slice || w.give_way || w.ws_held || w.mactive_force) return true;
   const Mask run = w.runnable();
   if (!run) return true;
-  uint64_t lo = w.pc[std::countr_zero(run)];
-  Mask at = tier_lanes_at(w, lo);
-  if ((run & ~at) != 0) {   // diverged: the group at the lowest address, which is what step_warp picks when nothing else is asked of it
-    lo = tier_lowest_pc(w, run, lo);
-    at = tier_lanes_at(w, lo);
-  }
+  uint64_t lo;
+  const Mask next = exec::sasslanes::pick_group(w.pc, run, lo);   // the group at the lowest address, which is what step_warp picks when nothing else is asked of it
   if (lo - code.base >= 16 * static_cast<uint64_t>(count) || ((lo - code.base) & 15)) return true;
   --w.budget;
   ++w.extra;
-  group = run & at;
+  group = next;
   pick = lo;
   }
 }

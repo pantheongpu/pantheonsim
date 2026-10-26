@@ -134,6 +134,8 @@ enum class Form : uint8_t {
   Count_,
 };
 const char* form_name(Form f);
+// The forms whose handlers only read and write registers and predicates (and the uniform ones): see Program::run.
+bool pure_register_form(Form f);
 
 // How a form's RESULT is computed, so that the rules of the interpreter cannot drift away from the tier's unnoticed (tests/unit/test_tier.cpp holds
 // this table to a checked-in list and reads tier_ops.inc for what a handler may not contain):
@@ -173,7 +175,12 @@ struct MOp {
   bool never = false;            // @!PT: the guard is false for every lane, so it does nothing but count
   bool straight = false;         // Instr::straight
   uint8_t aux = 0;               // form-specific flags
+  // How many instructions from this one on (at most 255) the run loop can issue back to back for a whole group (Runner::tier_run_t): straight,
+  // unguarded, with a handler, and a pure register form (no memory, no scheduler, nothing that can fault), none of them the section's last. Set
+  // when the section's program is built (the analysis does not know the next instruction); 0 for an instruction that is not in such a stretch.
+  uint8_t run = 0;
 };
+static_assert(sizeof(MOp) == 96, "an op is 96 bytes: a cache line and a half, which the run loop reads one after the other");
 inline constexpr uint16_t kNoReg = 0xffff;
 
 // The tier of one code section: a MOp per instruction, and the constant rows they point at.

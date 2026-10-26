@@ -330,11 +330,14 @@ inline void mfma_tile_f(uint32_t m, uint32_t n, uint32_t k, const double* a, con
 #endif
     mfma_tile_f_sse(m, n, k, a, bk, c, out);
   // A sum that is a NaN was formed with whichever operand order the compiler chose; do it again in the fixed one.
-  for (uint32_t i = 0; i < m; ++i)
-    for (uint32_t j = 0; j < n; ++j) {
-      double& x = out[size_t{i} * n + j];
-      if (x != x) x = mfma_tile_ordered<Order>(a + size_t{i} * k, bk + j, n, k, c[size_t{i} * n + j]);
-    }
+  unsigned any_nan = 0;
+  for (size_t e = 0; e < size_t{m} * n; ++e) any_nan |= out[e] != out[e];
+  if (any_nan)
+    for (uint32_t i = 0; i < m; ++i)
+      for (uint32_t j = 0; j < n; ++j) {
+        double& x = out[size_t{i} * n + j];
+        if (x != x) x = mfma_tile_ordered<Order>(a + size_t{i} * k, bk + j, n, k, c[size_t{i} * n + j]);
+      }
 }
 
 // The fused form (the double-precision instruction): one fma per term, taken in order. The result of a fused multiply-add
@@ -386,15 +389,19 @@ inline void mfma_tile_fma(uint32_t m, uint32_t n, uint32_t k, const double* a, c
         out[size_t{i} * n + j] = sum;
       }
   }
-  for (uint32_t i = 0; i < m; ++i)
-    for (uint32_t j = 0; j < n; ++j) {
-      double& x = out[size_t{i} * n + j];
-      if (x != x) {
-        double sum = c[size_t{i} * n + j];
-        for (uint32_t t = 0; t < k; ++t) sum = mfma_fma(bk[size_t{t} * n + j], a[size_t{i} * k + t], sum);
-        x = sum;
+  // (One pass for "is any a NaN", with no branch to place, then the fix-up pass only if so.)
+  unsigned any_nan = 0;
+  for (size_t e = 0; e < size_t{m} * n; ++e) any_nan |= out[e] != out[e];
+  if (any_nan)
+    for (uint32_t i = 0; i < m; ++i)
+      for (uint32_t j = 0; j < n; ++j) {
+        double& x = out[size_t{i} * n + j];
+        if (x != x) {
+          double sum = c[size_t{i} * n + j];
+          for (uint32_t t = 0; t < k; ++t) sum = mfma_fma(bk[size_t{t} * n + j], a[size_t{i} * k + t], sum);
+          x = sum;
+        }
       }
-    }
 }
 
 // Integer forms: the dot product of int16 values (the inputs are 8-bit or narrower), exact, so any order will do. `ia` is m rows

@@ -4574,3 +4574,158 @@ fails if two are swapped), so there is no loop to be placed: `mfma_f64` 175 agai
 `valu_f64` (mi300x) read 1.8% more cycles in the merged tree than the pieces without launch, from a new pointer in `Group` (`cache`, for
 the destructor that marks the register files) placed in the middle of the struct, before `id`, `nb_members` and the rest: the hot
 loop's offsets into `Group` moved and its code with them. It is the last member now, and the cycles are the base's.
+
+## Round sp2: the AMD ALU, scalar and control paths (branch `sp2-amdalu`)
+
+The compute loops of the AMD tier already ran at IPC 2.5 to 5, so the gain had to come from fewer host instructions for each wave instruction. The profile
+(perf on `valu_int`, `smem`, `divergent`, `lds`, `valu_f64`) found, in order of size: `v_mad_u64_u32` (one 128-bit multiply a lane, 1/3 of `valu_int` and
+`smem`), the per-instruction frame of `run_round` (about 60 host instructions and a dozen dependent loads before the handler is called), handlers whose
+glue (operand rows, EXEC merge, 64-bit pair gathers) ran as baseline x86-64 beside AVX2 lane kernels, `rep movs` row copies (a copy of `n * 4` bytes with a
+variable `n`: GCC's expansion costs 30 cycles on Zen 4, 25% of `valu_f64`), and LDS accesses one lane at a time.
+
+Measured on server3 (Ryzen 7 PRO 8840U, one SMT sibling, cpu 4), Release, GCC 13.3, simulated MI300X and RX 6800, `tools/bench-amd` A/B against a build
+of origin/main 99b013a3, 9 alternating runs, one host thread (the all-threads rows agree), counters identical in every row:
+
+| workload | mi300x | rx6800 |
+| --- | ---: | ---: |
+| `valu_int` | **2.15x** | **2.18x** |
+| `valu_f32` | **1.57x** | **1.84x** |
+| `valu_f64` | **3.74x** | **2.45x** |
+| `smem` | **2.41x** | **1.63x** |
+| `divergent` | **1.62x** | **1.68x** |
+| `wave` | **1.99x** | **1.71x** |
+| `lds` | 1.29x (p 0.16) | 1.21x |
+| `ldsx` | 1.24x | 1.27x |
+| `mfma`, `mfma_f64`, `mfma_f64_4b`, `mfma_bf16` | 1.16, 1.06, 1.07, 1.18 | not on RDNA2 |
+| `mfma_i8`, `smfmac` (the residuals of round 1) | 1.01 (p 0.22), 1.07 | |
+| `launch`, `api` (controls) | 1.01, 1.00 (p > 0.3) | 1.04, 1.04 |
+
+p < 0.001 for every "faster" row not marked. The first A/B of the mfma canaries (before the last change below) read `mfma_f64` 0.96x (p 0.01) with *fewer*
+instructions (8.09 G against 8.25 G) and 3% more cycles: the NaN scan that follows a matrix tile (`for each output: if (x != x)`), a 256-trip loop of six
+instructions in `matrix_multiply_fast`, now sat across a 64-byte code line (0x...1b0 to 0x...1ca) where it had sat inside one. It is one branch-free pass
+now (`any_nan |= out[e] != out[e]`, the fix-up loop only if any), which has no small loop to place; `mfma_f64` reads 1.06x, `smfmac` 1.07x.
+
+### What changed
+
+* **`v_mad_u64_u32`** (`k_mad_u64`, `gcn_tier_kernels.inc`): `vpmuludq` on zero-extended lanes, the sum with the 64-bit addend, the carry out as an unsigned compare
+  (`sum < c`: a 32x32 product fits in 64 bits, so the 128-bit carry is exactly a wrapped sum), the rows split with `vpermd`. A few active lanes (8 or fewer) keep
+  the per-lane loop. `valu_int` 1.44x, `smem` 1.70x from this alone.
+* **Handlers built twice** (`TIER_DUAL`): the body of `h_int`, `h_f32`, `h_f64`, `h_l64`, `h_cmp`, `h_cmp64`, `h_cndmask`, `h_ds` and `h_mad_u64` is
+  `always_inline` into a baseline and a `target("avx2,fma,popcnt")` function, and `Tables::avx2` picks one when the instruction is decoded (the glue helpers are
+  `always_inline`, so the row fills, the EXEC merge and the NaN scans are vectorized too). `valu_f64` 1.67x, `valu_f32` 1.2x, `divergent` 1.17x.
+* **The frame** (`gcn_exec.cpp`): `fetch_next` finds the next instruction through `Inst::next` (the instruction the wave ran after this one last time, checked
+  against the program counter, a relaxed-acquire pointer any thread may set); the tier's `Regs` is made once per round of a wave (`Wave::tier`, cleared by
+  `run_round` and where the vector register file may have moved) instead of 14 stores per instruction; the unit counter is picked by an array of pointers rather
+  than a switch. `valu_int` 1.54 to 1.92x, `smem` 1.7 to 2.35x, `divergent` 1.17 to 1.4x.
+* **Row-wise f64** (`k_f64r`): add, multiply and fused multiply-add on the pairs' low and high rows, eight lanes to a step (`vpunpck`/`vperm2i128` in,
+  `vshufps`/`vpermq` out), scalar and constant operands as broadcasts in the kernel (24 kernels: operation x set of uniform operands), the lanes with a NaN result
+  as a mask; any NaN result in an active lane gives the whole instruction to the general handler (which of two NaN payloads wins stays its business: the
+  `nan_order.hpp` rules apply unchanged). `v_mov_b32`/`v_mov_b64` are row copies or fills straight into the destination; integer handlers whose sources are all
+  vector registers call the kernel on the rows themselves; row copies are fixed-size moves (`copy_row`), not `rep movs`; the 64-bit compares are AVX2.
+* **LDS** (`h_ds`): the lanes that are one run (all on, or a prefix as a reduction leaves them) with consecutive word (or group) addresses are one copy to or from
+  the LDS (wide forms transposed through a small buffer; the two-offset forms only when their two runs are apart, since the lane order decides the bytes
+  otherwise); all-lanes-on `ds_bpermute` and plain accesses are counted loops. New handlers: `ds_write2_b32` (it had none: its data operands are a register
+  each, the classifier asked for a pair), `ds_read_b96`, `ds_write_b96`, `ds_add_u32` (the lane-order loop).
+
+### Tests (CMake-wired) and the mutations that fail them
+
+* `test_amd_gcn_tier_same_bits`: three new flavours of state (18 and 19: an LDS access whose lanes have consecutive addresses, all on or one run of lanes on; 20: the
+  integers' edges, so carries and borrows happen) and, new, its twin under `VGPU_SIMD=base` (`..._simd_base`, the baseline build of every kernel and handler).
+* Mutations, each built and run on server3 (the tier test restricted to the instruction concerned, or the named kernel tests):
+
+| # | mutation | result |
+| --- | --- | --- |
+| M1 | `k_mad_u64` carry compare with the operands swapped | `v_mad_u64_u32` differs (520 runs) |
+| M2 | `h_ds` contiguity test dropped | every `ds_read*`/`ds_write*` differs |
+| M3 | `ds_add_u32` stores the register instead of adding | `ds_add_u32` differs (144) |
+| M4 | `store64` writes the words swapped | `v_lshrrev_b64` differs (425) |
+| M5 | 64-bit compare `<=` done as `<` in the AVX2 kernel | `v_cmp_le_i64` differs |
+| M6 | `k_f64r` fused add takes the wrong addend | `v_fma_f64` differs (1276) |
+| M7 | `fetch_next` takes the hint without the program-counter check | `test_amd_gcn_exec_*` and `test_amd_gcn_lds_*` fail on all targets (the instruction-level guards cannot see it) |
+| M8 | unit counter of a tier instruction swapped | `test_amd_gcn_same_bits`, `test_amd_gcn_counters` fail |
+| M9 | b64 read de-transposed in the wrong order (earlier tree) / write2 overlap guard dropped | `ds_read_b64`, `ds_write2_b32` differ |
+
+  Not shown by a mutation: the clearing of `Wave::tier.ok` at the start of a round (a defensive reset: a wave is made fresh for each group here, so nothing
+  observes it).
+
+### Not done, and negative results
+
+* `s_load_dwordx*` as one load: dropped in round 1 (1.015x). What dominates `smem` is the 21 scalar ALU instructions around two scalar loads: the frame above.
+* A `fetch` hint for two-way branches (one hint per instruction thrashes only on alternating branches; no workload showed a miss rate worth a second slot).
+* Scalar handlers by operand shape (SGPR/constant/pair variants without the `rd`/`wr` switch): written as a design, not measured, not kept.
+
+## The PTX interpreter's memory, atomics, shuffles and diverged warps (branch `sp2-ptxpath`, base origin/main 99b013a3)
+
+* Coalesced global loads and stores of a run of lanes move with `MemoryManager::load_run`/`store_run` (registers' rows straight to and from memory); consecutive shared accesses are one block copy; the lane loops of shared and local gathers have the element size as a template constant; address generation is a counted loop and a coalesced run is counted by `memcount::run_sectors`.
+* A warp's PTX atomics on device memory go through one `rmw_batch` call (new `always_store` flag so resident chunks match `rmw_scalar`), only on a one-thread launch and after `sassatom::batchable`.
+* `micro_shfl32` with one lane/clamp for all lanes of a full warp runs without the per-lane mode switch.
+* A diverged warp's micro instructions run in batches while `select_path` would pick the same path again (merge, lower pc, starvation emulated per instruction; boosted paths not batched).
+* Tests: `test_ptx_mem_runs`, `test_ptx_paths` (fast path against `VGPU_FASTPATH=0`, memory, registers, every counter, errors).
+* Results against origin/main (B/A median, 9 runs, cpu 0, counters identical): mem 1.36x, shared 1.60x, atomics 1.39x, divergent 1.20x, warp 1.06x, launch 1.17x (not a change of this branch's launch path; take as placement), int_alu/f32_fma/f64_fma/local/api same (0.99-1.04, p > 0.25).
+* Not done: a micro form for ld/st (skips step/dispatch; est. 10-20% on mem/shared), the Interpreter constructor's 6.5 KB of zeroed scratch (5% of a PTX launch), `setup_block` reuse, atomics on multi-threaded launches (still per-lane stripe locks). The "unexplained" PTX int_alu/local 0.96-0.97x residuals were not isolated.
+
+## Round sp2: the SASS tier's stretches, the group pick, LEA, the environment pass (branch `sp2-sassrest`, base origin/main 99b013a3)
+
+* **Stretches** (`MOp::run`, `tier_issue`): a run of straight, unguarded, register-only instructions (`tier::pure_register_form`) is issued back to back for the whole group: the store gate, the step count, the guard and the three counters are done once for the stretch (not under tier 2's hook loop, nor with `VGPU_TIER_STATS`). **Direct writes** (`tier_out`): the lane-by-lane kernels write a full warp's result into the destination row; the row copy of `tier_store` is gone (a partial warp still blends from a temporary).
+* **Group pick** (`sasslanes::pick_group`, `src/simd/lanes.cpp`): a converged warp is found as before; a diverged one gets its lowest address and its lanes in one AVX2 pass instead of lanes_at + lowest_pc + lanes_at.
+* **LEA** (`include/vgpu/exec/sass_lea.hpp`): four lanes to a vector, the carry in and out as masks (the 64-bit address pair of every pointer calculation).
+* **Environment**: one pass over `environ` for the seven variables a SASS launch reads (`launch_env.hpp`); read at every launch as before.
+* **Atomics**: `MemoryManager::batch_window/batch_load/batch_store` do the checks of load_batch and store_batch once; `sassatom::batchable` still runs before any stripe lock.
+
+A/B against origin/main (cpu 6, 9 alternating runs, counters identical): int_alu 1.56x, f32_fma 1.56x, warp 1.20x, local 1.15x, launch 1.10x, mem 1.10x, divergent 1.09x, f64_subnormal 1.09x, f64_fma 1.07x, atomics 1.04x; shared, api, texture same; PTX int_alu/f32_fma/mem/atomics/local/launch/api same (0.98-1.02, p > 0.1).
+
+Not done / negative: pc and wait stores in 16-byte blends (halved store-forwarding stalls, `ls_bad_status2.stli_other` 50M to 22M, but +1.3M branch misses; divergent cycles unchanged, dropped); a spin lock for the stripes (the PTX engine and host atomics share the mutexes: not changeable here); `VGPU_TRACE` getenv in launch_kernel_impl (1%) and the runtime's lockstep_mode (0.9%) are still per launch; texture (sampler in interpreter.cpp, ~450 cycles a lane-fetch, spread over fetch_texel/tex_finish/footprint) and local's `sectors_fast` (28% of `local`) not touched; f64 is dominated by the DFMA kernel (47%).
+
+## Tensor cores: float products, tile kernels, wgmma, tcgen05 and the other mma forms (branch `sp2-nvtensor`, base origin/main 99b013a3)
+
+Measured on server3 (Ryzen 7 PRO 8840U, cpu 2 alone, 9 to 15 alternating runs, GCC 13.3), `tools/bench/bench.py --ab` against a build of origin/main; counters
+identical in every row. Profile first: SASS and PTX `wmma`/`mma_ptx` spent 66 to 78% in `tc86::mma_avx2_chunked`, 8 to 11% in `hmma_k`; the kernel itself
+executed 12,683 instructions per m16n8k16 call (about 400 per row-chunk, where about 140 are needed): the lambda took N, K and the arrays through its
+closure, which the may-alias stores re-read after every store, the row loops stayed rolled (arrays in memory) and the colmask was a read-modify-write chain.
+The forms the benchmark does not run were far worse: `wgmma` m64n256k16 111 us a warp, int8 `mma.sync` 7.5 us, `.b1` 41 us, fp8 7.7 us, sparse f16 10.7 us
+(every operand decoded through a `std::vector<double>` and a switch, summed by scalar double loops).
+
+### What changed
+* **sm_86 sum, float products** (`mma_avx2_chunked_f`, include/vgpu/exec/tc_ampere.hpp). A product of two f16, bf16 or tf32 operands is exact in f32 when its exponent
+  is in range, so the aligned term (the product's magnitude shifted right, bits dropped) is `cvttps(a * b * 2^-g)`: two multiplies and a truncating convert
+  instead of an integer multiply, two subtractions, abs, variable shift and sign. Taken when the exponent fields say every product is a normal f32 (smallest sum
+  of nonzero exponent fields >= 128, largest <= 379, no float subnormal with a significand, no infinity or NaN anywhere); else the integer kernel runs, as it does
+  for a chunk whose 2^-g is not a float (a lane finished by the scalar rule). Addresses hoisted into locals, rows unrolled (`VGPU_TC86_UNROLL`), eight rows at a
+  time (`VGPU_TC86_ROWS_F`). A loop of `tc86::mma` m16n8k16 f16: 2,680 -> 2,015 cycles, 12,683 -> 8,630 instructions (B/A 0.75; bf16 0.76, tf32 0.90).
+* **Tile kernels** (`simd::Kernels::tile_f32`, `tile_i32`, `tile_f64`; baseline and AVX2 twins, strided C and D): the tensor-core sums over a tile, k in order, products
+  rounded then added (never fused), s32 with `.sat` clamped per block, f64 fused in the host rounding mode.
+* **Operand code** (include/vgpu/exec/tile_mma.hpp, src/exec/tile_mma.cpp): shared-memory matrices read per 16-byte run into float or int32 tiles, accumulator
+  registers <-> tiles by shuffles, mma fragments of f16, bf16, tf32, e4m3, e5m2, s8, u8, s4, u4 (dense and sparse), f64 and `.b1`.
+* **PTX `wgmma`** (`exec_wgmma_fast`) and **SASS HGMMA/IGMMA/QGMMA** (`Runner::gmma_fast`): the first warp of the group reads A and B into a float/int32 snapshot, each warp
+  makes one kernel call. **PTX `mma.sync`** (`exec_mma_tiles`) and **SASS `exec_mma`** for sparse f16/bf16/tf32, fp8, s8/u8/s4/u4 (also `.sp`, `.sat`), f64 (all
+  shapes, all four rounding modes; a NaN in a tile declines, the payload a fused multiply-add keeps depends on its operand order) and `.b1`; the SASS tier's
+  dense `IMMA` handler through the same code. **`tcgen05.mma`** reads A and B whole from the CTA's shared memory (`Tcgen05Host::smem_direct`) and, for dense f32/s32 D in
+  layouts D and A, makes one tile product of the CTA's rows.
+* The new hot-path functions are in `.text.unlikely`: without that PTX `local` read 0.965 to 0.975x with identical instructions (placement); with it 0.985 to 0.998.
+
+### Results (B/A of medians; microbenchmarks are cycles of the whole program, so startup is included and the ratios understate)
+| row | B/A | p | | row | B/A |
+|---|---|---|---|---|---|
+| wmma sass | 1.19x | <0.001 | | PTX wgmma m64n256k16 f16 | 0.19 (111 -> 15 us a warp) |
+| wmma ptx | 1.27x | <0.001 | | wgmma n128 bf16 / tf32 / e4m3 / s8 | 0.10 / 0.14 / 0.13 / 0.12 |
+| mma_ptx sass | 1.20x | <0.001 | | mma.sync s8 k32 / s4 k64 / b1 k256 | 0.20 / 0.16 / 0.10 |
+| mma_ptx ptx | 1.12x | <0.001 | | f64 m8n8k4 / e4m3 k32 / sparse f16 k32 | 0.38 / 0.60 / 0.89 |
+| tcgen05 m128n256k16 (loop of 100) | f16 280 -> 97 us, tf32 300 -> 90, fp8 440 -> 190, s8 800 -> 110 | | SASS IMMA 16816/16832 s8, .SAT | 1065 -> 670, 1456 -> 1057, 2631 -> 1104 ns |
+
+Canaries (sass / ptx, 11 runs): int_alu 1.00/0.99, f32_fma 1.01/1.00, f64_fma 1.01/1.01, mem 0.96 (p 0.95)/1.01, shared 0.99/1.00, atomics 0.99/1.00, local 0.99/0.985,
+divergent 0.99/1.00, warp 0.99/1.00, launch 0.970 (p 0.008; perf stat: 223.6 vs 224.7 M cycles, instructions equal)/0.99, api 1.01/1.01; A/A noise 1 to 3%.
+
+### Tests (wired in CMake) and mutation checks
+`test_tile_mma` (kernels at both levels against scalar loops incl. strides, saturation, rounding modes; operand reads; layouts), `test_wgmma_fast` (PTX wgmma, every dtype, layouts,
+swizzles, scales, sparse, `.satfinite`, per-lane scale-d, against `VGPU_FASTPATH=0`), `test_mma_tiles` (40 mma.sync forms), `test_tcgen05_fast`, `test_sass_mma_tiles`
+(every HMMA/IMMA/BMMA/DMMA/QMMA/HGMMA/IGMMA/QGMMA word of the sm_80/86/89/90a disassembler corpora in a hand-built cubin, run with and without `VGPU_SIMD=off`),
+`test_tc_ampere_fast` (float-kernel edges: exponent thresholds, subnormal operands, tf32 tails, infinities). 72 one-line mutants (a `MUT(n)` switch compiled into the
+mutated unit, run per id): 72 killed; the first campaign let 7 survive (f64 forms always declined by NaNs in the data, constant sparsity selector, dead special-lane
+code in the float kernel), fixed in the tests or removed. Run: Release guards, `lint_*` (the `lint_curl_retries` failure needs a git checkout), ASan+UBSan -O0 and TSan -O1
+of the six new tests, `VGPU_SIMD=base` runs.
+
+### Not done, and negative results
+* SASS bench rows cannot reach IMMA/HGMMA (no nvcc here): their numbers come from `test_sass_mma_tiles`' cubins (24 blocks, 200 repeats).
+* Fragment decode is still a switch per element (IMMA 670 ns, sparse HMMA 10 us a warp: `mma_sparse_column` copies the metadata into a `Lanes` per element); next step.
+* tcgen05: f16 D, layout F, parts of N (layout B), sparse and block-scaled forms keep the row loop; PTX `wmma` generic shapes, `m8n8k4` f16 untouched; no AVX-512 kernel.
+* `vpmaddwd` for the integer products and a float accumulator decode were not tried (Zen 4 has one-uop `vpmulld`).

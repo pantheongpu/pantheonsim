@@ -2,6 +2,8 @@
 // lane-by-lane definitions they replace:
 //  * lanes_at (the lanes standing at an address) and lowest_pc (the lowest address among some lanes), with addresses that differ only in the
 //    low half, only in the high half, in both, and masks of every kind;
+//  * pick_group (the lowest address among the runnable lanes' and the lanes there: the AVX2 pass of src/simd/lanes.cpp where the host has it) against
+//    the definition, with addresses of every kind -- equal, differing in one half, above 2^63 (compared as unsigned numbers) -- and every mask;
 //  * the wait state of lanes at a barrier: wait, waiting_on and wake, for whole warps and partial masks, other kinds and other arguments
 //    among the lanes (they must stay);
 //  * row_uniform (whether all 32 words of a register row are one value);
@@ -63,6 +65,39 @@ VTEST(lanes_at_and_lowest_pc_agree_with_the_lane_loop) {
     for (unsigned l = 0; l < 32; ++l)
       if ((run >> l) & 1) lo = std::min(lo, w.pc[l]);
     VCHECK_EQ(sl::lowest_pc(w.pc, run, w.pc[__builtin_ctz(run)]), lo);
+  }
+}
+
+VTEST(pick_group_finds_the_lowest_address_and_its_runnable_lanes) {
+  std::mt19937_64 rng(11);
+  for (int round = 0; round < 40000; ++round) {
+    MockWarp w;
+    uint64_t pool[6];
+    const uint64_t base = rng() % 4 == 0 ? (uint64_t{1} << 63) + (rng() & 0xffff) * 16 : 0x7f0000000000ull + (rng() & 0xffff) * 16;   // (some above 2^63)
+    pool[0] = base;
+    pool[1] = base + 16 * (1 + rng() % 4);
+    pool[2] = base ^ (uint64_t{1} << (32 + rng() % 16));   // high half only
+    pool[3] = base - 16 * (1 + rng() % 4);
+    pool[4] = rng() % 8 == 0 ? ~uint64_t{0} : rng();       // (the largest number, which the pass uses for a lane that does not run)
+    pool[5] = rng() % 8 == 0 ? 0 : base + 16;
+    const unsigned kinds = 1 + rng() % 6;                  // how many of them the warp spreads over
+    for (unsigned l = 0; l < 32; ++l) w.pc[l] = pool[rng() % kinds];
+    Mask run = random_mask(rng);
+    if (!run) run = Mask{1} << (rng() % 32);
+    uint64_t want_lo = ~uint64_t{0};
+    for (unsigned l = 0; l < 32; ++l)
+      if ((run >> l) & 1) want_lo = std::min(want_lo, w.pc[l]);
+    Mask want = 0;
+    for (unsigned l = 0; l < 32; ++l) want |= static_cast<Mask>(((run >> l) & 1) && w.pc[l] == want_lo) << l;
+    uint64_t lo = 0;
+    VCHECK_EQ(sl::pick_group(w.pc, run, lo), want);
+    VCHECK_EQ(lo, want_lo);
+    lo = 0;
+    VCHECK_EQ(sl::pick_group_reference(w.pc, run, lo), want);
+    VCHECK_EQ(lo, want_lo);
+    lo = 0;
+    VCHECK_EQ(sl::pick_group_diverged(w.pc, run, lo), want);   // (the pass itself, converged warps included)
+    VCHECK_EQ(lo, want_lo);
   }
 }
 

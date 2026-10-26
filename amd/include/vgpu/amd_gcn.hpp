@@ -311,6 +311,17 @@ struct Inst {
   // The pre-decoded tier's form of the instruction (vgpu/amd_gcn_tier.hpp), worked out by finalize; `fast.run` is null
   // for an instruction the interpreter runs.
   tier::Op fast;
+  // The instruction a wave ran after this one the last time (Machine::fetch_next): a hint the machine checks against the wave's program
+  // counter, set and read by any thread running the code (a copy of an instruction starts without one).
+  struct Next {
+    mutable const Inst* p = nullptr;
+    Next() = default;
+    Next(const Next&) {}
+    Next& operator=(const Next&) {
+      p = nullptr;
+      return *this;
+    }
+  } next;
 };
 
 // The short form's name (Inst::short_name worked out), "" for an instruction that runs under its own.

@@ -502,6 +502,20 @@ struct Wave {
   bool gpr_idx_en = false;
   // VSKIP (s_setvskip): while set, vector instructions are not issued.
   bool vskip = false;
+  // The tier's view of this wave (gcn::tier::Regs: pointers into the wave and its group), made once for a round of the wave rather than for
+  // each instruction (run_round clears `ok`; so does anything that moves the vector register file); a copy of a wave starts without one.
+  struct TierRegs {
+    gcn::tier::Regs r;
+    bool ok = false;
+    TierRegs() = default;
+    TierRegs(const TierRegs&) {}
+    TierRegs& operator=(const TierRegs&) {
+      ok = false;
+      return *this;
+    }
+  } tier;
+  // The instruction this wave ran last in its round (Machine::fetch_next follows its Inst::next to the one it runs now).
+  const Inst* last = nullptr;
 };
 
 // The MODE register's round and denormal modes, applied to the host's own
@@ -619,6 +633,9 @@ struct Machine {
   // (Not while PC sampling is attached: the tier would step past the instructions that are to be sampled.)
   // (Whether the debugger is on is fixed for the process, so step asks once, here, and not through a call on each instruction.)
   const bool debug_on = debug::active();
+  // The counters a tier instruction adds one to by its unit (gcn::tier::Unit): kUnitNone's is a dummy.
+  uint64_t unit_none = 0;
+  uint64_t* const unit_slot[5] = {&unit_none, &stats.counts.valu, &stats.counts.salu, &stats.counts.branch, &stats.counts.lds};
   const bool tier_on = gcn::tier::enabled() && !tracing() && !debug_on && !(d.sampler && d.sampler->interval);
   // A vector load or store of device memory. ROCm runs CDNA with unaligned
   // access enabled (SH_MEM_CONFIG's unaligned mode), so a word may start at
@@ -11616,6 +11633,7 @@ struct Machine {
       if (o.kind != OperandKind::Vgpr) return;
       o.index += msb << 8;
       w.vgpr.grow(o.index + std::max<uint32_t>(o.width, 1));
+      w.tier.ok = false;   // (the file may have moved)
     };
     for (Operand& o : in->dst) bump(o, dst);
     for (size_t k = 0; k < in->src.size(); ++k) bump(in->src[k], k < 3 ? src[k] : 0);
@@ -11900,12 +11918,18 @@ struct Machine {
   // models (no VGPR indexing or MSBs, MODE at its default, no tracing, no debugger). A handler does the whole instruction or
   // nothing; what step() would have counted before running it is counted here.
   // Returns 0 when the interpreter is to run the instruction, 1 when it is done, 2 when it is done and the wave gives up its turn.
+  static void make_tier_regs(Wave& w, Group& g) {
+    w.tier.r = gcn::tier::Regs{reinterpret_cast<uint32_t (*)[64]>(w.vgpr.r.data()), w.sgpr, &w.vcc, &w.exec, &w.pc, &w.scc, w.lanes,
+                               &w.loads_in_flight, &w.soft_yield, static_cast<uint32_t>(g.waves.size()), &w.store_gate, g.lds.data(),
+                               g.lds.size(), 0};
+    w.tier.ok = true;
+  }
   int tier_step(Wave& w, Group& g, const Inst& in) {
     if (w.vgpr_msb || w.gpr_idx || w.vskip || !FloatMode::is_default(w.mode)) return 0;
     if (in.fast.mach) return tier_mach(w, g, in);
-    gcn::tier::Regs r{reinterpret_cast<uint32_t (*)[64]>(w.vgpr.r.data()), w.sgpr, &w.vcc, &w.exec, &w.pc, &w.scc, w.lanes,
-                      &w.loads_in_flight, &w.soft_yield, static_cast<uint32_t>(g.waves.size()), &w.store_gate, g.lds.data(), g.lds.size(),
-                      in.target};
+    if (__builtin_expect(!w.tier.ok, 0)) make_tier_regs(w, g);
+    gcn::tier::Regs& r = w.tier.r;
+    r.target = in.target;
     w.pc += in.size;
     const int done = in.fast.run(in.fast, r);
     if (done == 3) {   // a plain store's first of a round: the other waves go first, and nothing of this instruction has happened
@@ -11922,13 +11946,7 @@ struct Machine {
     ++c.mix[static_cast<int>(in.mix)];
     c.mops[static_cast<int>(in.mops_type)] += in.mops;
     ++stats.instructions;
-    switch (in.fast.unit) {
-      case gcn::tier::kUnitValu: ++c.valu; break;
-      case gcn::tier::kUnitSalu: ++c.salu; break;
-      case gcn::tier::kUnitBranch: ++c.branch; break;
-      case gcn::tier::kUnitLds: ++c.lds; break;
-      default: break;
-    }
+    ++*unit_slot[in.fast.unit];
     return done;
   }
   // A debugger session's check before an instruction (the std::string it builds for the kernel's name kept this frame's stack and its
@@ -11939,9 +11957,31 @@ struct Machine {
   }
   // What runs for every instruction a wave issues is this, kept small (a frame of a few words and no stack protector, for the
   // instructions the tier does whole); the interpreter's own work is step_interp's, out of line.
+  // The instruction at the wave's program counter, found through the one that ran before it when that remembers it (Inst::next, checked against
+  // the program counter: a branch that goes elsewhere this time finds the instruction the long way and leaves a new hint).
+  const Inst& fetch_next(Wave& w) {
+    if (const Inst* last = w.last) {
+      const Inst* c = __atomic_load_n(&last->next.p, __ATOMIC_ACQUIRE);
+      if (c && c->pc == w.pc) {
+        w.last = c;
+        return *c;
+      }
+    }
+    return fetch_slow(w);
+  }
+  [[gnu::noinline]] const Inst& fetch_slow(Wave& w) {
+    const Inst& in = fetch(w.pc);
+    if (&in == scratch_inst.get()) {   // (not an instruction of the code object's: no hint to or from it)
+      w.last = nullptr;
+      return in;
+    }
+    if (w.last) __atomic_store_n(&w.last->next.p, &in, __ATOMIC_RELEASE);
+    w.last = &in;
+    return in;
+  }
   bool step(Wave& w, Group& g) {
     if (__builtin_expect(debug_on, 0)) debug_check(w, g);
-    const Inst& decoded = fetch(w.pc);
+    const Inst& decoded = fetch_next(w);
     if (tier_on) {
       if (decoded.fast.run) {
         if (const int t = tier_step(w, g, decoded)) return t == 1;
@@ -12610,7 +12650,7 @@ bool run_round(Machine& m, Group& group, uint64_t slice = 0) {
   // A wave that waits for a global load gives the others its turn (Wave::soft_yield), as the load's
   // latency does on a card, and has the rest of the round after them; the turn counts across those
   // pauses, so a wave polling memory with loads in its loop still ends its round.
-  for (Wave& w : group.waves) w.round_stopped = false, w.round_steps = 0, w.store_gate = true;
+  for (Wave& w : group.waves) w.round_stopped = false, w.round_steps = 0, w.store_gate = true, w.tier.ok = false, w.last = nullptr;
   bool again;
   do {
     again = false;
@@ -13177,11 +13217,15 @@ struct Rng {
     return z ^ (z >> 31);
   }
 };
-// A 32-bit value of the flavour (16: zero): 0 any bits, 1 small, 2 a float (finite, special or tiny), 4 every byte 0x3C to 0x41: a small
+// A 32-bit value of the flavour (16: zero, 20: the integers' edges): 0 any bits, 1 small, 2 a float (finite, special or tiny), 4 every byte 0x3C to 0x41: a small
 // finite number whether the word is read as a float, a double, two halves, two bfloat16s or four 8-bit floats (no NaNs, no
 // overflow), as a real program's operands are.
 uint32_t draw(Rng& r, uint32_t flavour) {
   if (flavour == 16) return 0;   // (every register zero: a test that needs to know what an instruction's operands are)
+  if (flavour == 20) {   // (the edges of the integers: a carry, a borrow or an overflow happens at these)
+    static constexpr uint32_t kEdge[] = {0u, 1u, 2u, 0x7FFFFFFFu, 0x80000000u, 0x80000001u, 0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFu, 0x10000u};
+    return kEdge[r.next() % (sizeof kEdge / sizeof kEdge[0])];
+  }
   if (flavour == 4) {
     uint32_t v = 0;
     for (int b = 0; b < 4; ++b) v |= (0x3Cu + static_cast<uint32_t>(r.next() % 6)) << (8 * b);
@@ -13280,6 +13324,17 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
         w.vgpr[in.src[0].index + 1][lane] = static_cast<uint32_t>((region + off) >> 32);
       }
     }
+  }
+  if ((flavour == 18 || flavour == 19) && in.enc == gcn::Enc::Ds && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+    // Flavours 18 and 19: an LDS access whose lanes' addresses are consecutive words (or, for the wide forms, consecutive groups of words)
+    // from a random start, inside the LDS, so that the tier's whole-wave copy runs instead of the per-lane loop; 19 has one run of lanes on.
+    if (flavour == 19) {   // (one run of lanes on, from a random lane: how a reduction's last steps leave EXEC)
+      const unsigned first = static_cast<unsigned>(r.next() % w.lanes), cnt = 1 + static_cast<unsigned>(r.next() % (w.lanes - first));
+      w.exec = ((cnt == 64 ? ~uint64_t{0} : (uint64_t{1} << cnt) - 1) << first) & all;
+    }
+    const uint32_t stride = in.fast.sub <= 1 ? 4u * std::max<uint32_t>(in.fast.words, 1) : 4u;
+    const uint32_t start = static_cast<uint32_t>(r.next() & 0x7FFC);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[in.src[0].index][lane] = start + stride * lane;
   }
   if (flavour == 12 || flavour == 13) w.loads_in_flight = 3 + static_cast<uint32_t>(r.next() & 7);   // (loads to wait for)
   w.pc = 0;

@@ -50,13 +50,13 @@ namespace vgpu::exec {
 
 enum class LockstepMode { Auto, Off, All };
 
-inline LockstepMode lockstep_mode() {
-  const char* v = std::getenv("VGPU_LOCKSTEP");
+inline LockstepMode lockstep_mode(const char* v) {
   if (!v || !*v || !std::strcmp(v, "auto")) return LockstepMode::Auto;
   if (!std::strcmp(v, "0") || !std::strcmp(v, "off")) return LockstepMode::Off;
   if (!std::strcmp(v, "all") || !std::strcmp(v, "1")) return LockstepMode::All;
   return LockstepMode::Auto;
 }
+inline LockstepMode lockstep_mode() { return lockstep_mode(std::getenv("VGPU_LOCKSTEP")); }
 
 // Instructions a warp (a wave) runs in its turn. Short enough that every resident block starts before
 // the first has done its first lock or flag, long enough that the switch is not the cost.
