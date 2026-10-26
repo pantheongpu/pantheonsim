@@ -183,6 +183,7 @@ double run_reg(const Reg& f, int reps) {
   mem.write(pin, in.data(), in.size() * 4);
   LaunchConfig cfg;
   cfg.block = {32, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(pin)}, mem, prof);   // (once untimed: whatever the engine builds on first use)
   const auto t0 = Clock::now();
   exec::launch(m.entries[0], cfg, {arg_u64(pin)}, mem, prof);
   return std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
@@ -276,6 +277,7 @@ COPIED:
   const auto desc = [](uint32_t start) { return uint64_t{start >> 4} | (uint64_t{1} << 16) | (uint64_t{64} << 32) | (uint64_t{1} << 62); };
   LaunchConfig cfg;
   cfg.block = {128, 1, 1};
+  exec::launch(m.entries[0], cfg, {arg_u64(pimg), arg_u64(desc(0)), arg_u64(desc(8192))}, mem, prof);
   const auto t0 = Clock::now();
   exec::launch(m.entries[0], cfg, {arg_u64(pimg), arg_u64(desc(0)), arg_u64(desc(8192))}, mem, prof);
   return std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
@@ -417,6 +419,7 @@ WAIT:
   cfg.grid = {1, 1, 1};
   cfg.cluster = {1, 1, 1};
   const uint32_t a_row = Ka * c.eb, b_row = Ke * c.eb;
+  exec::launch(m.entries[0], cfg, {arg_u64(pa), arg_u64(pb), arg_u64(desc(0, a_row)), arg_u64(desc(0, b_row)), arg_u32(id)}, mem, prof);
   const auto t0 = Clock::now();
   exec::launch(m.entries[0], cfg, {arg_u64(pa), arg_u64(pb), arg_u64(desc(0, a_row)), arg_u64(desc(0, b_row)), arg_u32(id)}, mem, prof);
   return std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
@@ -599,6 +602,7 @@ double run_sass(const SassRow& r, const std::string& src_dir, int reps) {
   cfg.block = {32, 1, 1};
   std::vector<uint8_t> arg(8);
   std::memcpy(arg.data(), &buf, 8);
+  sass::launch(*m, "k", cfg, {arg}, mem, prof);   // (the first launch analyses the code; the second is what is timed)
   const auto t0 = Clock::now();
   sass::launch(*m, "k", cfg, {arg}, mem, prof);
   return std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
