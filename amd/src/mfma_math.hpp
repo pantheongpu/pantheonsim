@@ -277,10 +277,12 @@ inline bool mfma_have_avx2() { return mfma_avx2_switch(); }
 // The same sums with four doubles to an instruction (AVX2, chosen when the host has it; no fused multiply-add: a product and a
 // sum are two roundings, as in the 2-wide kernel, so the bits are the same). n is a multiple of 8.
 typedef double mfma_v4d __attribute__((vector_size(32), aligned(8)));
-__attribute__((target("avx2"))) inline void mfma_tile_f_avx2(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk,
+// Returns whether any output is a NaN (the sums' own check, while they are still in registers).
+__attribute__((target("avx2"))) inline bool mfma_tile_f_avx2(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk,
                                                             const double* c, double* out) {
 #define MFMA_LD4(p) (*reinterpret_cast<const mfma_v4d*>(p))
 #define MFMA_ST4(p, v) (*reinterpret_cast<mfma_v4d*>(p) = (v))
+  __m256d nan = _mm256_setzero_pd();
   for (uint32_t i = 0; i < m; i += 4) {
     const double* const a0 = a + size_t{i} * k;
     const double* const a1 = a0 + k;
@@ -303,10 +305,15 @@ __attribute__((target("avx2"))) inline void mfma_tile_f_avx2(uint32_t m, uint32_
       double* const o = out + size_t{i} * n + j;
       MFMA_ST4(o, s00), MFMA_ST4(o + 4, s01), MFMA_ST4(o + n, s10), MFMA_ST4(o + n + 4, s11);
       MFMA_ST4(o + 2 * n, s20), MFMA_ST4(o + 2 * n + 4, s21), MFMA_ST4(o + 3 * n, s30), MFMA_ST4(o + 3 * n + 4, s31);
+      // (a sum is a NaN if it differs from itself: the unordered compare of each with itself, or'd together)
+#define MFMA_NAN4(v) nan = _mm256_or_pd(nan, _mm256_cmp_pd(v, v, _CMP_UNORD_Q))
+      MFMA_NAN4(s00), MFMA_NAN4(s01), MFMA_NAN4(s10), MFMA_NAN4(s11), MFMA_NAN4(s20), MFMA_NAN4(s21), MFMA_NAN4(s30), MFMA_NAN4(s31);
+#undef MFMA_NAN4
     }
   }
 #undef MFMA_LD4
 #undef MFMA_ST4
+  return _mm256_movemask_pd(nan) != 0;
 }
 #endif
 inline void mfma_tile_f_sse(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk, const double* c, double* out) {
@@ -336,14 +343,17 @@ inline void mfma_tile_f_sse(uint32_t m, uint32_t n, uint32_t k, const double* a,
 }
 template <int Order = kMfmaOrder>
 inline void mfma_tile_f(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk, const double* c, double* out) {
-#if defined(__x86_64__) && defined(__GNUC__)
-  if (n % 8 == 0 && m % 4 == 0 && mfma_have_avx2()) mfma_tile_f_avx2(m, n, k, a, bk, c, out);
-  else
-#endif
-    mfma_tile_f_sse(m, n, k, a, bk, c, out);
-  // A sum that is a NaN was formed with whichever operand order the compiler chose; do it again in the fixed one.
   unsigned any_nan = 0;
-  for (size_t e = 0; e < size_t{m} * n; ++e) any_nan |= out[e] != out[e];
+#if defined(__x86_64__) && defined(__GNUC__)
+  if (n % 8 == 0 && m % 4 == 0 && mfma_have_avx2()) {
+    any_nan = mfma_tile_f_avx2(m, n, k, a, bk, c, out);
+  } else
+#endif
+  {
+    mfma_tile_f_sse(m, n, k, a, bk, c, out);
+    for (size_t e = 0; e < size_t{m} * n; ++e) any_nan |= out[e] != out[e];
+  }
+  // A sum that is a NaN was formed with whichever operand order the compiler chose; do it again in the fixed one.
   if (any_nan)
     for (uint32_t i = 0; i < m; ++i)
       for (uint32_t j = 0; j < n; ++j) {
