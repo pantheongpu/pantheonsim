@@ -245,6 +245,7 @@ add_library(vgpu STATIC
   src/simd/simd.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
+  src/exec/libm.cpp
   src/exec/devrt.cpp
   src/exec/worker_pool.cpp
   src/runtime/runtime.cpp
@@ -1336,6 +1337,12 @@ vgpu_unit_test(test_ast_builder)
 # A launch's warp width (8, 16, 32, 64) and the warp-level operations at the narrow ones, against host references; the
 # 128-warp bit sets (E2, E3).
 vgpu_unit_test(test_warp_width)
+# OpLibm: the OpenCL.std host-library math functions at f16/f32/f64 against the host libm, bit for bit (E6).
+vgpu_unit_test(test_libm)
+# OpRedux extended: float and integer-mul reductions, scans and clustered reductions in lane order (E7).
+vgpu_unit_test(test_redux_ext)
+# OpWgCollective: work-group reduce/scan/broadcast on the barrier rendezvous, in linear thread order (E8).
+vgpu_unit_test(test_wg_collective)
 # %warpsize, the global offset and work dim registers, work-group memory arguments and the sub-group count (E4, E5).
 vgpu_unit_test(test_launch_inputs)
 vgpu_unit_test(test_devrt)

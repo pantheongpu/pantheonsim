@@ -46,6 +46,7 @@
 #include <unordered_map>
 
 #include "vgpu/exec/host_atomic.hpp"
+#include "vgpu/exec/libm.hpp"
 #include "vgpu/exec/device_printf.hpp"
 #include "vgpu/exec/ldmatrix.hpp"
 #include "vgpu/exec/local_layout.hpp"
@@ -169,6 +170,21 @@ struct BarrierReduction {
   uint32_t arrived = 0;    // warps that have voted in it
   uint64_t round = 0;      // its number
   uint64_t result = 0;     // the answer of the last round released
+};
+
+// A work-group collective in rounds (OpWgCollective), kept like BarrierReduction: contributions go into the round
+// being gathered, the release (every live warp has arrived) evaluates it in linear thread-id order and sets the
+// per-thread answers aside, and each warp collects the answers of the round it contributed to. A warp released
+// first cannot start the next round's contributions before the others collect, because completing that round needs
+// every warp's arrival.
+struct WgCollect {
+  std::vector<uint64_t> in, sel, out;   // by linear thread id: the operand, the broadcast source, the answer
+  std::vector<uint8_t> have;
+  uint32_t arrived = 0;                 // warps that contributed to the round being gathered
+  uint64_t round = 0;                   // its number
+  WgKind kind = WgKind::Reduce;         // the round's operation (every contribution must agree)
+  ReduxOp op = ReduxOp::Add;
+  Type ty;
 };
 
 // One mbarrier object. Lives in a side table keyed by its shared-memory
@@ -354,6 +370,7 @@ struct BlockCtx {
   // leaves it undefined, VirtualGPU makes it deterministic (documented).
   std::vector<uint8_t>* shared = nullptr;
   BarrierReduction* bar_red = nullptr;
+  WgCollect* wg = nullptr;
   NamedBarriers* bars = nullptr;
   std::vector<Warp>* warps = nullptr;   // the block's, for releasing a named barrier's waiters
   MbarrierTable* mbar = nullptr;
@@ -439,6 +456,9 @@ struct Warp {
   // to collect rather than contribute a second time.
   bool bar_red_waiting = false;
   uint64_t bar_red_round = 0;   // the bar.red round this warp voted in
+  // The same for a work-group collective (OpWgCollective): contributed and waiting for the round to complete.
+  bool wg_waiting = false;
+  uint64_t wg_round = 0;
   // A bar.red with a thread count: the answer its completion handed this warp.
   uint64_t bar_red_result = 0;
   // At a barrier with a thread count, which that barrier's completion
@@ -2674,7 +2694,8 @@ bool ptx_loop_polls(const EntryFn& f, size_t first, size_t last) {
                std::holds_alternative<OpStAsync>(ins.op) || std::holds_alternative<OpCpAsync>(ins.op)) {
       return false;
     } else if (std::holds_alternative<OpShfl>(ins.op) || std::holds_alternative<OpVote>(ins.op) ||
-               std::holds_alternative<OpMatch>(ins.op) || std::holds_alternative<OpRedux>(ins.op)) {
+               std::holds_alternative<OpMatch>(ins.op) || std::holds_alternative<OpRedux>(ins.op) ||
+               std::holds_alternative<OpWgCollective>(ins.op)) {
       generates = true;
     } else if (const auto* mv = std::get_if<OpMov>(&ins.op)) {
       if (const auto* sr = std::get_if<SregOperand>(&mv->src))
@@ -3097,6 +3118,7 @@ class Interpreter {
     BlockCtx ctx;
     std::vector<uint8_t> shared;
     BarrierReduction bar_red;
+    WgCollect wg;
     NamedBarriers bars;
     MbarrierTable mbar;
     WgmmaSnapshots wgmma;
@@ -3153,6 +3175,8 @@ class Interpreter {
       b.shared.assign(std::max(fn_.static_shared_size, fn_.dynamic_shared_offset) + cfg_.shared_bytes, 0);
     b.ctx.shared = &b.shared;
     b.ctx.bar_red = &b.bar_red;
+    b.wg = WgCollect{};
+    b.ctx.wg = &b.wg;
     b.ctx.mbar = &b.mbar;
     b.wgmma.pending.clear();
     b.ctx.wgmma = &b.wgmma;
@@ -3259,6 +3283,7 @@ class Interpreter {
         b.bar_red.arrived = 0;
         ++b.bar_red.round;
       }
+      if (any_waiting && b.wg.arrived) release_wg_collective(b);
       // ...and the barrier they arrived at orders everything before it
       // against everything after, which is what ends the epoch.
       if (any_waiting && b.ctx.shadow) ++b.ctx.shadow->epoch;
@@ -4499,6 +4524,7 @@ class Interpreter {
     if (const auto* o = std::get_if<OpFloatBin>(&ins.op)) return by_width(o->ty);
     if (const auto* o = std::get_if<OpFma>(&ins.op)) return by_width(o->ty);
     if (const auto* o = std::get_if<OpMath>(&ins.op)) return by_width(o->ty);
+    if (const auto* o = std::get_if<OpLibm>(&ins.op)) return by_width(o->ty);
     if (const auto* o = std::get_if<OpCopysign>(&ins.op)) return by_width(o->ty);
     if (std::holds_alternative<OpF16x2Bin>(ins.op) ||
         std::holds_alternative<OpF16x2Fma>(ins.op) ||
@@ -4527,7 +4553,7 @@ class Interpreter {
 
     if (std::holds_alternative<OpBra>(ins.op) || std::holds_alternative<OpBrx>(ins.op) ||
         std::holds_alternative<OpRet>(ins.op) ||
-        std::holds_alternative<OpBar>(ins.op) || std::holds_alternative<OpBarRed>(ins.op) ||
+        std::holds_alternative<OpBar>(ins.op) || std::holds_alternative<OpBarRed>(ins.op) || std::holds_alternative<OpWgCollective>(ins.op) ||
         std::holds_alternative<OpTrap>(ins.op) || std::holds_alternative<OpCall>(ins.op))
       return InstClass::Control;
 
@@ -5495,6 +5521,10 @@ class Interpreter {
       exec_ret(w, ctx, ins, idx, m);
       return;
     }
+    if (const auto* op = std::get_if<OpWgCollective>(&ins.op)) {
+      exec_wg_collective(w, ctx, ins, idx, *op, m, active);
+      return;
+    }
     if (const auto* op = std::get_if<OpBarRed>(&ins.op)) {
       if (ins.has_pred && !w.bar_red_waiting) {
         // As with bar.sync: the barrier is aligned, so a guard must be the
@@ -5796,6 +5826,91 @@ class Interpreter {
 
   // Whether every warp of w's warpgroup has issued the wgmma operations in the
   // groups a wait_group `keep` waits for, and if so forgets those groups.
+  // OpWgCollective: this warp's turn at a work-group collective. It contributes its lanes' operands and waits
+  // (the pc stays put); when every live warp of the block has arrived, step_block's release evaluates the round in
+  // linear thread-id order (release_wg_collective) and this re-executes to collect its lanes' answers.
+  void exec_wg_collective(Warp& w, const BlockCtx& ctx, const Instr& ins, size_t idx, const OpWgCollective& op, Mask m,
+                          Mask active) {
+    if (ins.has_pred && !w.wg_waiting) {
+      // As with bar.red: the collective is aligned, so a guard must be the same for the whole warp.
+      if (m == 0) {
+        ++w.paths[idx].pc;
+        return;
+      }
+      if (m != active)
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "a guarded work-group collective that some lanes of the warp take and others skip; it is aligned, "
+                 "so the warp must agree");
+    }
+    if (!ctx.wg) ctx_fail(ins, -1, Err::UnsupportedPtx, "a work-group collective outside a block context");
+    WgCollect& g = *ctx.wg;
+    const bool arithmetic = op.kind != WgKind::Broadcast;
+    if (arithmetic) redux_check(ins, op.op, op.ty, "work-group collective");
+    else if (op.ty.is_bfloat() || (op.ty.bits != 8 && op.ty.bits != 16 && op.ty.bits != 32 && op.ty.bits != 64))
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "a work-group broadcast of a " + std::to_string(op.ty.bits) + "-bit value");
+    const uint32_t wbits = op.ty.is_float() && op.ty.bits == 16 ? 32u : op.ty.bits;
+    const uint32_t n = ctx.ntid[0] * ctx.ntid[1] * ctx.ntid[2];
+    auto linear = [&](uint32_t lane) {
+      return w.tid_x[lane] + ctx.ntid[0] * (w.tid_y[lane] + ctx.ntid[1] * w.tid_z[lane]);
+    };
+    if (!w.wg_waiting && w.paths.size() > 1) {
+      // Like bar.sync and bar.red: lanes of this warp still on another path have to get here first.
+      if (select_other_runnable(w, idx) != idx) {
+        w.paths[idx].parked = Path::kAtBarrier;
+        return;
+      }
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "a work-group collective cannot be reached by every lane of the warp: some lanes are on a path that "
+               "never arrives at it");
+    }
+    if (!w.wg_waiting && !w.frames.empty()) refuse_barrier_outside_the_call(w, ins, "a work-group collective");
+    if (!w.wg_waiting) {
+      if (g.in.size() != n) {
+        g.in.assign(n, 0);
+        g.sel.assign(n, 0);
+        g.out.assign(n, 0);
+        g.have.assign(n, 0);
+      }
+      if (g.arrived == 0) {
+        g.kind = op.kind;
+        g.op = op.op;
+        g.ty = op.ty;
+      } else if (g.kind != op.kind || (arithmetic && (g.op != op.op || g.ty.kind != op.ty.kind || g.ty.bits != op.ty.bits))) {
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 "the warps of a block reached different work-group collectives (or the same one with different "
+                 "operations or types) in one round");
+      }
+      Lanes _s_a, _s_b;
+      const Lanes& a = read_operand(w, ctx, ins, op.a, _s_a);
+      const Lanes* b = op.kind == WgKind::Broadcast ? &read_operand(w, ctx, ins, op.b, _s_b) : nullptr;
+      const bool fl = op.ty.is_float();
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane)) {
+          const uint32_t t = linear(lane);
+          g.in[t] = fl ? mask_to_bits(a[lane], op.ty.bits) : a[lane];
+          g.sel[t] = b ? static_cast<uint32_t>((*b)[lane]) : 0;
+          g.have[t] = 1;
+        }
+      w.wg_round = g.round;
+      ++g.arrived;
+      ++stats_.barriers;
+      w.wg_waiting = true;
+      w.state = Warp::State::AtBarrier;
+      return;
+    }
+    // Released: collect the answers of the round this warp contributed to.
+    w.wg_waiting = false;
+    if (w.wg_round + 1 != g.round)
+      ctx_fail(ins, -1, Err::UnsupportedPtx,
+               "a work-group collective released a warp whose round has not completed; were some warps at a "
+               "different barrier?");
+    Lanes r;
+    for (uint32_t lane = 0; lane < W_; ++lane)
+      if (m & (Mask{1} << lane)) r[lane] = g.out[linear(lane)];
+    write_reg(w, op.dst, m, r, wbits);
+    ++w.paths[idx].pc;
+  }
+
   bool wgmma_group_caught_up(Warp& w, const BlockCtx& ctx, uint32_t keep) {
     auto& marks = w.wgmma_commits;
     if (marks.size() <= keep || !ctx.warps) return true;
@@ -7203,40 +7318,43 @@ class Interpreter {
     }
     if (const auto* op = std::get_if<OpRedux>(&ins.op)) {
       require_warp_le32(ins, "redux.sync");
+      redux_check(ins, op->op, op->ty, "redux");
       Lanes _s_a;
       const Lanes& a = read_operand(w, ctx, ins, op->src, _s_a);
-      // Every participating lane contributes and every one receives the result.
-      // The active mask is the membership: a lane not executing this
-      // instruction is not in the warp's reduction.
-      bool first = true;
-      uint64_t acc = 0;
-      for (uint32_t lane = 0; lane < W_; ++lane) {
-        if (!(m & (Mask{1} << lane))) continue;
-        const uint64_t v = a[lane];
-        if (first) { acc = v; first = false; continue; }
-        switch (op->op) {
-          case ReduxOp::Add: acc = acc + v; break;
-          case ReduxOp::And: acc = acc & v; break;
-          case ReduxOp::Or: acc = acc | v; break;
-          case ReduxOp::Xor: acc = acc ^ v; break;
-          case ReduxOp::Min:
-            acc = op->ty.is_signed()
-                      ? static_cast<uint64_t>(std::min(narrow_s(acc, op->ty.bits),
-                                                       narrow_s(v, op->ty.bits)))
-                      : std::min(narrow_u(acc, op->ty.bits), narrow_u(v, op->ty.bits));
-            break;
-          case ReduxOp::Max:
-            acc = op->ty.is_signed()
-                      ? static_cast<uint64_t>(std::max(narrow_s(acc, op->ty.bits),
-                                                       narrow_s(v, op->ty.bits)))
-                      : std::max(narrow_u(acc, op->ty.bits), narrow_u(v, op->ty.bits));
-            break;
-        }
-      }
+      // Every participating lane contributes. The active mask is the membership: a lane not executing this
+      // instruction is not in the warp's reduction. The lanes are combined in increasing lane order (the form with a
+      // float type, a scan or a cluster is a frontend's, not PTX's; the order is what makes a float result the same
+      // on every run).
+      uint32_t cs = op->cluster ? op->cluster : W_;
+      if (cs > W_) cs = W_;
+      if (cs & (cs - 1))
+        ctx_fail(ins, -1, Err::InvalidValue, "a clustered reduction's cluster size must be a power of two; got " + std::to_string(cs));
+      const bool fl = op->ty.is_float();
       Lanes r;
-      for (uint32_t lane = 0; lane < W_; ++lane)
-        if (m & (Mask{1} << lane)) r[lane] = acc;
-      write_reg(w, op->dst, m, r, op->ty.bits);
+      for (uint32_t base = 0; base < W_; base += cs) {
+        bool first = true;
+        uint64_t acc = 0;
+        for (uint32_t lane = base; lane < base + cs && lane < W_; ++lane) {
+          if (!(m & (Mask{1} << lane))) continue;
+          const uint64_t v = fl ? mask_to_bits(a[lane], op->ty.bits) : a[lane];
+          switch (op->mode) {
+            case ReduxMode::Reduce: acc = first ? v : redux_combine(op->op, op->ty, acc, v); break;
+            case ReduxMode::Inclusive:
+              acc = first ? v : redux_combine(op->op, op->ty, acc, v);
+              r[lane] = acc;
+              break;
+            case ReduxMode::Exclusive:
+              r[lane] = first ? redux_identity(op->op, op->ty) : acc;
+              acc = first ? v : redux_combine(op->op, op->ty, acc, v);
+              break;
+          }
+          first = false;
+        }
+        if (op->mode == ReduxMode::Reduce)
+          for (uint32_t lane = base; lane < base + cs && lane < W_; ++lane)
+            if (m & (Mask{1} << lane)) r[lane] = acc;
+      }
+      write_reg(w, op->dst, m, r, fl && op->ty.bits == 16 ? 32u : op->ty.bits);
       return;
     }
     if (const auto* op = std::get_if<OpCvtPack>(&ins.op)) {
@@ -7976,6 +8094,20 @@ class Interpreter {
           }
         }
       write_reg(w, op->dst, m, r, op->ty.bits);
+      return;
+    }
+    if (const auto* op = std::get_if<OpLibm>(&ins.op)) {
+      if (!op->ty.is_float() || op->ty.is_bfloat() || (op->ty.bits != 16 && op->ty.bits != 32 && op->ty.bits != 64))
+        ctx_fail(ins, -1, Err::UnsupportedPtx, std::string("OpLibm ") + libm_name(op->fn) + " on a type that is not f16, f32 or f64");
+      Lanes _s_a, _s_b;
+      const Lanes& a = read_operand(w, ctx, ins, op->a, _s_a);
+      const Lanes* b = libm_binary(op->fn) ? &read_operand(w, ctx, ins, op->b, _s_b) : nullptr;
+      Lanes r;  // written for every active lane below
+      for (uint32_t lane = 0; lane < W_; ++lane)
+        if (m & (Mask{1} << lane))
+          r[lane] = libm_eval(op->fn, op->ty.bits, a[lane], b ? (*b)[lane] : 0, op->ftz);
+      const uint32_t wbits = libm_int_result(op->fn) || op->ty.bits == 16 ? 32u : op->ty.bits;
+      write_reg(w, op->dst, m, r, wbits);
       return;
     }
     if (const auto* op = std::get_if<OpMath>(&ins.op)) {
@@ -11304,6 +11436,115 @@ class Interpreter {
   // and CUB emit every day, so neither can be on by default -- and both are
   // worth having when you are looking for a bug rather than running a workload.
   static bool strict() { return g_strict.load(std::memory_order_relaxed); }
+
+  // ---- reductions shared by OpRedux (over a warp's lanes) and OpWgCollective (over a block's threads) ----
+  //
+  // One step of a reduction, `acc` then `v`, in that order: integers wrap at the type's width (the caller cuts the
+  // result), floats use the engine's own float add, mul, min and max (a NaN loses to a number in min and max, any
+  // other NaN result is the canonical one).
+  uint64_t redux_combine(ReduxOp op, Type ty, uint64_t acc, uint64_t v) {
+    if (ty.is_float()) {
+      switch (op) {
+        case ReduxOp::Add: return float_bin(FloatBinOp::Add, ty, acc, v);
+        case ReduxOp::Mul: return float_bin(FloatBinOp::Mul, ty, acc, v);
+        case ReduxOp::Min: return float_bin(FloatBinOp::Min, ty, acc, v);
+        case ReduxOp::Max: return float_bin(FloatBinOp::Max, ty, acc, v);
+        default: return acc;
+      }
+    }
+    switch (op) {
+      case ReduxOp::Add: return acc + v;
+      case ReduxOp::Mul: return acc * v;
+      case ReduxOp::And: return acc & v;
+      case ReduxOp::Or: return acc | v;
+      case ReduxOp::Xor: return acc ^ v;
+      case ReduxOp::Min:
+        return ty.is_signed() ? static_cast<uint64_t>(std::min(narrow_s(acc, ty.bits), narrow_s(v, ty.bits)))
+                              : std::min(narrow_u(acc, ty.bits), narrow_u(v, ty.bits));
+      case ReduxOp::Max:
+        return ty.is_signed() ? static_cast<uint64_t>(std::max(narrow_s(acc, ty.bits), narrow_s(v, ty.bits)))
+                              : std::max(narrow_u(acc, ty.bits), narrow_u(v, ty.bits));
+    }
+    return acc;
+  }
+  // The value that leaves the other operand alone: what the first participant of an exclusive scan gets.
+  static uint64_t redux_identity(ReduxOp op, Type ty) {
+    const uint32_t bits = ty.bits;
+    const uint64_t ones = bits >= 64 ? ~uint64_t{0} : (uint64_t{1} << bits) - 1;
+    if (ty.is_float()) {
+      const uint64_t one = bits == 16 ? 0x3C00u : bits == 32 ? 0x3F800000u : 0x3FF0000000000000ull;
+      const uint64_t inf = bits == 16 ? 0x7C00u : bits == 32 ? 0x7F800000u : 0x7FF0000000000000ull;
+      const uint64_t sign = uint64_t{1} << (bits - 1);
+      switch (op) {
+        case ReduxOp::Mul: return one;
+        case ReduxOp::Min: return inf;
+        case ReduxOp::Max: return inf | sign;
+        default: return 0;
+      }
+    }
+    switch (op) {
+      case ReduxOp::Mul: return 1;
+      case ReduxOp::And: return ones;
+      case ReduxOp::Min: return ty.is_signed() ? ones >> 1 : ones;
+      case ReduxOp::Max: return ty.is_signed() ? (ones >> 1) + 1 : 0;
+      default: return 0;
+    }
+  }
+  // Which (operation, type) pairs a reduction takes; anything else is refused by name.
+  void redux_check(const Instr& ins, ReduxOp op, Type ty, const char* what) {
+    if (ty.is_bfloat())
+      ctx_fail(ins, -1, Err::UnsupportedPtx, std::string(what) + ": no reduction on bf16");
+    if (ty.is_float()) {
+      if ((ty.bits != 16 && ty.bits != 32 && ty.bits != 64) ||
+          op == ReduxOp::And || op == ReduxOp::Or || op == ReduxOp::Xor)
+        ctx_fail(ins, -1, Err::UnsupportedPtx,
+                 std::string(what) + ": a float reduction takes add, mul, min and max on f16, f32 or f64");
+    } else if (ty.bits != 8 && ty.bits != 16 && ty.bits != 32 && ty.bits != 64) {
+      ctx_fail(ins, -1, Err::UnsupportedPtx, std::string(what) + ": an integer reduction on " + std::to_string(ty.bits) + " bits");
+    }
+  }
+
+  // Evaluates the work-group collective round that has just gathered every warp (see WgCollect) and sets the
+  // per-thread answers aside.
+  void release_wg_collective(BlockState& b) {
+    WgCollect& g = b.wg;
+    const size_t n = g.in.size();
+    g.out.assign(n, 0);
+    bool first = true;
+    uint64_t acc = 0;
+    uint64_t bcast = 0;
+    if (g.kind == WgKind::Broadcast) {
+      for (size_t i = 0; i < n; ++i)
+        if (g.have[i]) {
+          const uint64_t src = g.sel[i];
+          bcast = src < n && g.have[src] ? g.in[src] : 0;
+          break;
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+      if (!g.have[i]) continue;
+      const uint64_t v = g.in[i];
+      switch (g.kind) {
+        case WgKind::Broadcast: g.out[i] = bcast; break;
+        case WgKind::Reduce: acc = first ? v : redux_combine(g.op, g.ty, acc, v); break;
+        case WgKind::InclusiveScan:
+          acc = first ? v : redux_combine(g.op, g.ty, acc, v);
+          g.out[i] = acc;
+          break;
+        case WgKind::ExclusiveScan:
+          g.out[i] = first ? redux_identity(g.op, g.ty) : acc;
+          acc = first ? v : redux_combine(g.op, g.ty, acc, v);
+          break;
+      }
+      first = false;
+    }
+    if (g.kind == WgKind::Reduce)
+      for (size_t i = 0; i < n; ++i)
+        if (g.have[i]) g.out[i] = acc;
+    std::fill(g.have.begin(), g.have.end(), uint8_t{0});
+    g.arrived = 0;
+    ++g.round;
+  }
 
   uint64_t int_bin(IntBinOp op, Type ty, uint64_t a, uint64_t b, const Instr& ins) {
     bool sig = ty.is_signed();

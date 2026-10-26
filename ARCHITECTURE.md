@@ -76,6 +76,16 @@ contraction, is not in the builder's. A launch picks its own warp width (`Launch
 global offset and a work dimension count (`%global_offset_*`, `%work_dim`) and work-group memory arguments
 (`ParamDecl::local_mem`): the inputs OpenCL and SPIR-V kernels expect.
 
+Three AST-only operations serve such frontends (the PTX parser never makes them): `OpLibm`, the OpenCL.std host-library
+math functions computed by the host C library at f16, f32 or f64 (`include/vgpu/exec/libm.hpp` states which libm
+calls are made and what is deterministic: libm-accurate, not bit-exact with any GPU's math library); `OpRedux`
+extended with float and integer-multiply reductions, inclusive and exclusive scans and clustered reductions over a
+warp's active lanes in increasing lane order; and `OpWgCollective`, a work-group reduce, scan or broadcast built on
+the same rendezvous as `bar.red` and combined in increasing linear thread id, so its result does not depend on the
+warp width or the schedule. A new `Op` alternative needs an entry in the `Op` variant (`ast.hpp`), a dispatch in
+`Interpreter::dispatch` (or in `step`, for an instruction that waits like a barrier), and the generic member names
+`dst`, `a`, `b`, `c` so that `ptx::collect` in `regalloc.cpp` sees its registers.
+
 C++20, CMake, **zero external dependencies** (hand-rolled restricted-YAML +
 micro test framework) so a bare CI container can build it.
 
