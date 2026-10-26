@@ -259,7 +259,7 @@ COPIED:
   MemoryManager mem{1 << 22};
   DeviceProfile prof = load_gpu("nvidia/h100");
   auto m = ptx::parse(ptx);
-  std::vector<uint8_t> img(32768);
+  std::vector<uint8_t> img(40960);
   for (size_t at = 0; at + 2 <= img.size(); at += 2) {
     uint16_t v = f.int_acc || f.eb == 1 ? static_cast<uint16_t>(rng()) : f16_normal();
     if (f.eb == 4 && at % 4 == 0) {
@@ -533,7 +533,7 @@ const SassRow kSass[] = {
     {"sass IMMA.16816.S8.S8 (sm_80)", 80, "IMMA\\.16816\\.S8\\.S8 R[0-9]+, R[0-9]+\\.ROW, R[0-9]+\\.COL, R[0-9]+", "int", "int"},
     {"sass IMMA.16832.S8.S8 (sm_80)", 80, "IMMA\\.16832\\.S8\\.S8 R[0-9]+, R[0-9]+\\.ROW, R[0-9]+\\.COL, R[0-9]+", "int", "int"},
     {"sass IMMA.16864.S4.S4 (sm_80)", 80, "IMMA\\.16864\\.S4\\.S4 R[0-9]+, R[0-9]+\\.ROW, R[0-9]+\\.COL, R[0-9]+", "int", "int"},
-    {"sass QMMA.16832.F32.E4M3 (sm_89)", 89, "QMMA\\.16832\\.F32\\.E4M3\\.E4M3 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+", "fp8", "f32"},
+    {"sass QMMA.16832.F32.E4M3 (sm_89)", 89, "QMMA\\.16832\\.F32\\.E4M3\\.E4M3 R[0-9]+, R[0-9]+\\.ROW, R[0-9]+\\.COL, R[0-9]+", "fp8", "f32"},
 };
 
 double run_sass(const SassRow& r, const std::string& src_dir, int reps) {
@@ -626,6 +626,7 @@ void report(const char* name, int r, const std::function<double(int)>& run) {
 
 int main(int argc, char** argv) {
   const std::string filter = argc > 1 ? argv[1] : "";
+  ghz();
   const int reps = argc > 2 ? std::atoi(argv[2]) : 400;
   const char* src = std::getenv("VGPU_SOURCE_DIR");
   const auto want = [&](const char* name) { return filter.empty() || std::string(name).find(filter) != std::string::npos; };
