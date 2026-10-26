@@ -138,7 +138,6 @@ const Form kForms[] = {
     {"mma m8n8k4 f32/f32", "nvidia/a10", ".m8n8k4", ".f32.f16.f16.f32", "", Kind::F16, false, false, true, 2, 2, 8, 8},
     {"mma m8n8k4 f16/f16", "nvidia/a10", ".m8n8k4", ".f16.f16.f16.f16", "", Kind::F16, true, false, true, 2, 2, 4, 4},
     {"mma m8n8k4 f32/f16", "nvidia/a100", ".m8n8k4", ".f32.f16.f16.f16", "", Kind::F16, true, false, true, 2, 2, 4, 8},
-    {"mma m8n8k4 f16/f32", "nvidia/a100", ".m8n8k4", ".f16.f16.f16.f32", "", Kind::F16, false, false, true, 2, 2, 8, 4},
 };
 
 ptx::WmmaShape shape_of(const std::string& s) {
