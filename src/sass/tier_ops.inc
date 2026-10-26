@@ -1833,6 +1833,17 @@ struct JitFrame {
   return rg.k;
 }
 
+// The share rule's sample (jit.hpp): the warp instructions a call of the hook loop ran, whatever ran them, are added to the unit's sample on the way out
+// (also when a fault leaves). `u` is null once the rule has decided, or for the loop without the hook.
+struct JitSampler {
+  jit::Unit* u;
+  const Warp& w;
+  uint64_t steps0;
+  ~JitSampler() {
+    if (u) u->sample(w.steps - steps0);
+  }
+};
+
 template <bool Jit>
 bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
   TCtx c{&w, &blk, this, w.r.data(), bank0_.data(), bank0_.size(), tp.pool.data(), &simd::kernels()};
@@ -1842,6 +1853,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   bool regs_ok = true;
   [[maybe_unused]] jit::Unit* const ju = Jit ? tp.jit.get() : nullptr;
   [[maybe_unused]] JitFrame jf;
+  [[maybe_unused]] const JitSampler sampler{Jit && ju->sampling.load(std::memory_order_relaxed) ? ju : nullptr, w, w.steps};
   [[maybe_unused]] const uint32_t* const region_at = Jit ? ju->region_at.data() : nullptr;
   for (bool again = false;; again = true) {   // one pass is one call of step_warp
   // The warp's register file may have been resized since the last pass (USETMAXREG.TRY_ALLOC grows it, and a vector that grows moves):
@@ -2092,8 +2104,6 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
 // The run loop without tier 2's hook is the loop of every run that does not ask for the JIT, so it has no trace of it (tier_run_t is always_inline, so
 // it is inlined where the loop was before tier 2); step_warp calls tier_run_jit instead for a section that has a unit.
 [[gnu::noinline]] bool Runner::tier_run_jit(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
-  if (tp.jit->state.load(std::memory_order_relaxed) == static_cast<int>(jit::State::Failed))   // (failed, or nothing worth compiling: the plain loop)
-    return tier_run_t<false>(blk, w, group, pick, code, tp);
   return tier_run_t<true>(blk, w, group, pick, code, tp);
 }
 bool Runner::tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {

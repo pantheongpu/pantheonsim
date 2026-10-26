@@ -32,6 +32,10 @@
 #   CI_JOBS            force this many jobs (what a person who knows better sets)
 #   CI_JOBS_MAX        same as -m
 #   CI_MEM_CHECK=0     make --check pass without looking
+#   CI_MEM_WAIT_SECS   how long --check waits for the memory to appear before it refuses (default 0:
+#                      refuse at once). A shared runner often has a peak from another job that ends
+#                      within minutes; waiting costs no memory, refusing costs a re-run.
+#   CI_MEM_POLL_SECS   how often --check looks again while it waits (default 30)
 #   CI_MEM_LIMIT_GIB   ceiling on the memory this job may count on
 #   CI_NPROC, CI_MEMINFO, CI_CGROUP_ROOT, CI_PROC_CGROUP
 #                      where the numbers come from (/proc/meminfo and so on);
@@ -208,6 +212,19 @@ if [[ $mode == check ]]; then
   n=$("$0" -p "$profile")
   echo "memory: $(gib "$kib") GiB available (lowest of the limits: $src), $profile needs $pmin GiB; $(cpus) CPUs, $n parallel jobs at $per GiB each"
   need_kib=$(awk -v g="$pmin" 'BEGIN { printf "%d", g * 1048576 }')
+  wait_secs=${CI_MEM_WAIT_SECS:-0}; poll_secs=${CI_MEM_POLL_SECS:-30}
+  is_pos_int "$poll_secs" || poll_secs=30
+  if (( kib < need_kib )) && [[ $wait_secs =~ ^[0-9]+$ ]] && (( wait_secs > 0 )); then
+    echo "memory: waiting up to $wait_secs s for $pmin GiB to be available"
+    waited=0
+    while (( kib < need_kib && waited < wait_secs )); do
+      sleep "$poll_secs"; waited=$(( waited + poll_secs ))
+      av=$(available); [[ -n $av ]] || break
+      kib=${av%% *}; src=${av#* }
+    done
+    if [[ -z $av ]]; then echo "memory: cannot tell how much is available any more; not checking"; exit 0; fi
+    if (( kib >= need_kib )); then echo "memory: $(gib "$kib") GiB available after waiting $waited s"; fi
+  fi
   if (( kib < need_kib )); then
     msg="only $(gib "$kib") GiB of memory is available, and the $profile job needs $pmin GiB (ci/jobs.sh); it would take the machine's other jobs down with it, so it stops here. Re-run it when the runner is quieter, or set CI_MEM_CHECK=0 to start anyway."
     if [[ ${GITHUB_ACTIONS:-} == true ]]; then echo "::error::$msg"; else echo "error: $msg"; fi

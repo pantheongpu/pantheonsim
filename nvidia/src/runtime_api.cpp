@@ -1030,9 +1030,9 @@ template <class Body, class... A>
 cudaError_t traced_call(const char* api, Body body, A... a) {
   // The arguments are kept in this frame for the whole call (the profiler reads them again at its exit), and
   // only when somebody is listening at the call: a program nobody profiles does not copy them.
-  std::optional<vgpu_traced::KeptArgs<A...>> kept;
+  vgpu_traced::LazyKept<A...> kept;
   if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
-    kept.emplace(a...);
+    kept.make(a...);
     note_kept(*kept);
   }
   vgpu::profiling::ApiCall call(api);

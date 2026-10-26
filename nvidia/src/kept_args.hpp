@@ -11,7 +11,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 namespace vgpu_traced {
@@ -56,6 +58,24 @@ class KeptArgs {
   static constexpr std::uint16_t sizes_[sizeof...(A) + 1] = {static_cast<std::uint16_t>(sizeof(A))..., 0};
   std::tuple<ArgSlot<A>...> slots_;
   const void* argv_[sizeof...(A) + 1];
+};
+
+// KeptArgs made, or not, in the frame of the call, by the call's own decision. Not an std::optional: its emplace takes
+// the arguments by reference, which makes every argument of the wrapper an addressable object, and a load of one of those
+// is a load of its enum type, which UBSan's enum check refuses for the value a program passes on purpose that the enum
+// does not declare (the C ABI takes any integer). The arguments are passed on by value only, so the wrapper never loads
+// an enum parameter as its type; the body, which takes it by value too, is what judges it.
+template <class... A>
+class LazyKept {
+ public:
+  void make(A... a) { kept_ = ::new (static_cast<void*>(storage_)) KeptArgs<A...>(a...); }
+  const KeptArgs<A...>& operator*() const { return *kept_; }
+  const KeptArgs<A...>* operator->() const { return kept_; }
+
+ private:
+  static_assert(std::is_trivially_destructible_v<KeptArgs<A...>>, "kept in raw storage, never destroyed");
+  alignas(KeptArgs<A...>) unsigned char storage_[sizeof(KeptArgs<A...>)];
+  KeptArgs<A...>* kept_ = nullptr;
 };
 
 }  // namespace vgpu_traced
