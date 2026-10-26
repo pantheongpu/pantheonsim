@@ -120,6 +120,39 @@ VTEST(tile_f32_matches_the_scalar_loop) {
   VCHECK(compared > 400000);
 }
 
+// tile_f32c is tile_f32 with every NaN of D written as the canonical 0x7fffffff, in the same pass: the other bits are tile_f32's.
+VTEST(tile_f32c_is_the_f32_tile_with_canonical_nans) {
+  std::mt19937 g(0x6c01);
+  long compared = 0, nans = 0;
+  for (simd::Level l : levels()) {
+    const simd::Kernels& k = simd::kernels_for(l);
+    for (const Shape& s : kShapes)
+      for (int mode = 0; mode < 6; ++mode)
+        for (int trial = 0; trial < 12; ++trial) {
+          std::vector<float> A(s.M * s.K), B(s.K * s.N), C(s.M * s.N), want(s.M * s.N), got(s.M * s.N);
+          const auto fill = [&](std::vector<float>& v) {
+            for (float& x : v) x = mode == 0 ? tame_f32(g, 6) : mode == 1 ? special_f32(g) : mode == 2 ? tame_f32(g, 100) : mode == 3 ? bf(g()) : mode == 4 ? (g() % 3 ? 0.0f : special_f32(g)) : tame_f32(g, 30);
+          };
+          fill(A);
+          fill(B);
+          fill(C);
+          const bool null_c = trial % 3 == 0;
+          k.tile_f32(s.M, s.N, s.K, A.data(), B.data(), null_c ? nullptr : C.data(), s.N, want.data(), s.N);
+          k.tile_f32c(s.M, s.N, s.K, A.data(), B.data(), null_c ? nullptr : C.data(), s.N, got.data(), s.N);
+          for (size_t i = 0; i < got.size(); ++i) {
+            ++compared;
+            const bool is_nan = (fb(want[i]) & 0x7fffffffu) > 0x7f800000u;
+            nans += is_nan;
+            if (is_nan ? fb(got[i]) != 0x7fffffffu : fb(got[i]) != fb(want[i]))
+              throw vtest::Failure(std::string(simd::level_name(l)) + " tile_f32c " + std::to_string(s.M) + "x" + std::to_string(s.N) + "x" + std::to_string(s.K) + " mode " + std::to_string(mode) +
+                                   " element " + std::to_string(i) + ": 0x" + std::to_string(fb(got[i])) + " for 0x" + std::to_string(fb(want[i])));
+          }
+        }
+  }
+  VCHECK(compared > 400000);
+  VCHECK(nans > 5000);   // (the special operands do make NaNs, of both signs and payloads)
+}
+
 namespace {
 void ref_i32(const Shape& s, const int32_t* A, const int32_t* B, const int32_t* C, unsigned block, bool sat, int32_t* D) {
   for (unsigned i = 0; i < s.M; ++i)
@@ -487,6 +520,15 @@ VTEST(accumulator_registers_and_tiles_convert_back_and_forth) {
         if (back[i] != want) throw vtest::Failure("round trip of kind " + std::to_string(kind) + ", N " + std::to_string(N) + ", word " + std::to_string(i));
       }
     }
+  }
+  // A tile whose NaNs are already canonical (tile_f32c's) goes the same way without the pass for them.
+  {
+    std::vector<float> c(16 * 8, 1.5f);
+    c[3] = bf(0x7fffffffu);
+    std::vector<uint32_t> a(4 * 32), b(4 * 32);
+    exec::wgmma_tile_to_acc(c.data(), 8, false, a.data(), false);
+    exec::wgmma_tile_to_acc(c.data(), 8, false, b.data(), true);
+    VCHECK(a == b);
   }
   // NaNs written back: canonical in both accumulator formats.
   std::vector<float> t(16 * 8, bf(0x7fc12345u));

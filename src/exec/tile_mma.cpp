@@ -218,9 +218,10 @@ void wgmma_acc_to_tile(const uint32_t* regs, uint32_t N, bool f16, float* tile) 
     }
 }
 
-void wgmma_tile_to_acc(const float* tile, uint32_t N, bool f16, uint32_t* regs) {
+void wgmma_tile_to_acc(const float* tile, uint32_t N, bool f16, uint32_t* regs, bool canonical) {
   if (!f16) {
-    tile_to_words<true>(reinterpret_cast<const uint32_t*>(tile), N, regs);
+    if (canonical) tile_to_words<false>(reinterpret_cast<const uint32_t*>(tile), N, regs);
+    else tile_to_words<true>(reinterpret_cast<const uint32_t*>(tile), N, regs);
     return;
   }
   alignas(32) float t[64];

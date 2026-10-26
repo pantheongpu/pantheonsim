@@ -16,7 +16,7 @@ typedef uint32_t V8u_ __attribute__((vector_size(32)));
 typedef int32_t V8i_ __attribute__((vector_size(32)));
 
 // R rows by V vectors of L columns (VT, L floats) of D = C + A x B in f32; as the AVX2 kernel's block (kernels.inc), at another width.
-template <class VT, unsigned L, unsigned R, unsigned V>
+template <class VT, class VU, unsigned L, unsigned R, unsigned V, bool Canon>
 inline void tile_f32_blockw(unsigned i0, unsigned j0, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
   VT acc[R][V];
   for (unsigned r = 0; r < R; ++r)
@@ -36,23 +36,37 @@ inline void tile_f32_blockw(unsigned i0, unsigned j0, unsigned N, unsigned K, co
     }
   }
   for (unsigned r = 0; r < R; ++r)
-    for (unsigned v = 0; v < V; ++v) std::memcpy(D + size_t{i0 + r} * ldd + j0 + L * v, &acc[r][v], sizeof(VT));
+    for (unsigned v = 0; v < V; ++v) {
+      if (Canon) {
+        const VU nan = reinterpret_cast<VU>(acc[r][v] != acc[r][v]);
+        acc[r][v] = reinterpret_cast<VT>((reinterpret_cast<VU>(acc[r][v]) & ~nan) | (0x7fffffffu & nan));
+      }
+      std::memcpy(D + size_t{i0 + r} * ldd + j0 + L * v, &acc[r][v], sizeof(VT));
+    }
 }
 
-void tile_f32_k(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
+template <bool Canon>
+inline void tile_f32_impl(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
   unsigned i0 = 0;
   for (; i0 + 4 <= M; i0 += 4) {
     unsigned j0 = 0;
-    for (; j0 + 32 <= N; j0 += 32) tile_f32_blockw<V16f, 16, 4, 2>(i0, j0, N, K, A, B, C, ldc, D, ldd);
-    for (; j0 + 16 <= N; j0 += 16) tile_f32_blockw<V16f, 16, 4, 1>(i0, j0, N, K, A, B, C, ldc, D, ldd);
-    for (; j0 + 8 <= N; j0 += 8) tile_f32_blockw<V8f_, 8, 4, 1>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 32 <= N; j0 += 32) tile_f32_blockw<V16f, V16u, 16, 4, 2, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 16 <= N; j0 += 16) tile_f32_blockw<V16f, V16u, 16, 4, 1, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 8 <= N; j0 += 8) tile_f32_blockw<V8f_, V8u_, 8, 4, 1, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
   }
   for (; i0 < M; ++i0) {
     unsigned j0 = 0;
-    for (; j0 + 32 <= N; j0 += 32) tile_f32_blockw<V16f, 16, 1, 2>(i0, j0, N, K, A, B, C, ldc, D, ldd);
-    for (; j0 + 16 <= N; j0 += 16) tile_f32_blockw<V16f, 16, 1, 1>(i0, j0, N, K, A, B, C, ldc, D, ldd);
-    for (; j0 + 8 <= N; j0 += 8) tile_f32_blockw<V8f_, 8, 1, 1>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 32 <= N; j0 += 32) tile_f32_blockw<V16f, V16u, 16, 1, 2, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 16 <= N; j0 += 16) tile_f32_blockw<V16f, V16u, 16, 1, 1, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 8 <= N; j0 += 8) tile_f32_blockw<V8f_, V8u_, 8, 1, 1, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
   }
+}
+
+void tile_f32_k(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
+  tile_f32_impl<false>(M, N, K, A, B, C, ldc, D, ldd);
+}
+void tile_f32c_k(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
+  tile_f32_impl<true>(M, N, K, A, B, C, ldc, D, ldd);
 }
 
 // ---- integers ----------------------------------------------------------------------------------------------------------------

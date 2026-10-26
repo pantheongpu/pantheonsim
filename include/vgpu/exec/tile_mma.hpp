@@ -41,7 +41,8 @@ bool wgmma_read_i32(const uint8_t* smem, size_t size, const WgmmaDesc& d, bool k
 // kernels work on. `regs` is N / 2 registers of 32 lane words (f16: N / 4, two halves a word), register 4j + 2h + u (f16: 2j + h) holding
 // row g + 8h and column 8j + 2t + u of lane 4g + t. A NaN written back is the canonical one (f32: 0x7fffffff, f16: 0x7fff).
 void wgmma_acc_to_tile(const uint32_t* regs, uint32_t N, bool f16, float* tile);
-void wgmma_tile_to_acc(const float* tile, uint32_t N, bool f16, uint32_t* regs);
+// `canonical`: the tile came from simd::Kernels::tile_f32c, its NaNs already the canonical one (an f32 tile then needs no pass for them).
+void wgmma_tile_to_acc(const float* tile, uint32_t N, bool f16, uint32_t* regs, bool canonical = false);
 void wgmma_acc_to_tile_i32(const uint32_t* regs, uint32_t N, int32_t* tile);
 void wgmma_tile_to_acc_i32(const int32_t* tile, uint32_t N, uint32_t* regs);
 

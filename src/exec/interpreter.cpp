@@ -9601,8 +9601,8 @@ class Interpreter {
     mma_frag_a(ta, M, K, op.sparse, ra, meta, sel, Af, nullptr);
     mma_frag_b(tb, K, rb, Bf, nullptr);
     wgmma_acc_to_tile(rc, kN, op.c_f16, Cf);
-    simd::kernels().tile_f32(M, kN, K, Af, Bf, Cf, kN, Df, kN);
-    wgmma_tile_to_acc(Df, kN, op.acc_f16, rd);
+    simd::kernels().tile_f32c(M, kN, K, Af, Bf, Cf, kN, Df, kN);
+    wgmma_tile_to_acc(Df, kN, op.acc_f16, rd, true);
     scatter(rd, op.d.size(), 32, nullptr);
     return true;
   }
@@ -10137,8 +10137,8 @@ class Interpreter {
       Cf.resize(size_t{16} * N);
       Df.resize(size_t{16} * N);
       wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
-      simd::kernels().tile_f32(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
-      wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data());
+      simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
+      wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data(), true);
     }
     for (uint32_t reg = 0; reg < nregs; ++reg) scatter_words(w, op.d[reg], m, &dw[size_t{reg} * 32], !int_form);
     snap.taken |= static_cast<uint8_t>(1u << (warp_index % 4));
@@ -16049,9 +16049,8 @@ __attribute__((section(".text.unlikely"))) void tcgen05_mma(const Tcgen05Mma& op
         std::vector<float> Af_all(size_t{Mloc} * K);
         for (size_t i = 0; i < Af_all.size(); ++i) Af_all[i] = static_cast<float>(As[i]);
         float* const cells = reinterpret_cast<float*>(base);
-        simd::kernels().tile_f32(Mloc, N, K, Af_all.data(), Bf.data(), accumulate ? cells : nullptr, kLd, cells, kLd);
-        // (A NaN in an f32 D is the canonical 0x7fffffff, as in the rows below.)
-        canon_nan_rows(base, Mloc, N, kLd);
+        // (A NaN in an f32 D is the canonical 0x7fffffff, as in the rows below: the kernel writes it so.)
+        simd::kernels().tile_f32c(Mloc, N, K, Af_all.data(), Bf.data(), accumulate ? cells : nullptr, kLd, cells, kLd);
       }
       continue;
     }
@@ -16136,7 +16135,7 @@ __attribute__((section(".text.unlikely"))) void tcgen05_mma(const Tcgen05Mma& op
             simd::kernels().tile_i32(rows, wp, K, &Ai_t[size_t{m0} * K], Bmi, accumulate ? &Ci_t[size_t{m0} * wp] : nullptr, wp, K, sat,
                                      &Di_t[size_t{m0} * wp], wp);
           else
-            simd::kernels().tile_f32(rows, wp, K, &Af_t[size_t{m0} * K], Bm, accumulate ? &Cf_t[size_t{m0} * wp] : nullptr, wp, &Df_t[size_t{m0} * wp], wp);
+            simd::kernels().tile_f32c(rows, wp, K, &Af_t[size_t{m0} * K], Bm, accumulate ? &Cf_t[size_t{m0} * wp] : nullptr, wp, &Df_t[size_t{m0} * wp], wp);
         };
         if (d_int) {
           product(0, Mloc, nullptr, Bpi_t.data());
@@ -16184,8 +16183,7 @@ __attribute__((section(".text.unlikely"))) void tcgen05_mma(const Tcgen05Mma& op
             simd::kernels().f32_to_f16(row, half_t.data(), wp);
             for (uint32_t i = 0; i < wp; ++i) cells[i] = row[i] != row[i] ? static_cast<uint32_t>(kCanonicalNaN16) : half_t[i];
           } else {
-            std::memcpy(cells, row, wp * sizeof(uint32_t));
-            canon_nan_rows(cells, 1, wp, 0);
+            std::memcpy(cells, row, wp * sizeof(uint32_t));   // (a NaN is already the canonical one: tile_f32c)
           }
         }
       }
@@ -17095,27 +17093,6 @@ WgmmaDesc decode_wgmma_desc(uint64_t d) {
                 "a wgmma matrix descriptor with a nonzero base offset (bits 51-49); only swizzle "
                 "patterns that start on their repeat boundary are implemented");
   return out;
-}
-
-uint64_t wgmma_smem_offset(const WgmmaDesc& d, bool k_major, uint32_t eb, uint32_t mn, uint32_t k) {
-  const uint64_t W = d.swizzle;
-  uint64_t off;
-  if (k_major) {
-    const uint64_t kb = uint64_t{k} * eb;
-    // Absolute mode (sm_103a): a row's bytes run to the end of its swizzle
-    // row, then on at the same row of the atom at `lbo` -- how CUTLASS's
-    // SM103 kernels have a K = 96 fp4 block straddle two pipeline buffers.
-    if (d.lbo_abs && W && d.start % W + kb >= W)
-      return swizzle_address(d.lbo + (mn % 8) * W + (mn / 8) * d.sbo + (d.start % W + kb - W),
-                             static_cast<uint32_t>(W), d.atom);
-    off = W ? (mn % 8) * W + (mn / 8) * d.sbo + kb
-            : (mn % 8) * 16 + (mn / 8) * d.sbo + kb % 16 + (kb / 16) * d.lbo;
-  } else {
-    const uint64_t mb = uint64_t{mn} * eb;
-    off = W ? mb % W + (mb / W) * d.lbo + (k % 8) * W + (k / 8) * d.sbo
-            : mb % 16 + (mb / 16) * d.sbo + (k % 8) * 16 + (k / 8) * d.lbo;
-  }
-  return swizzle_address(d.start + off, static_cast<uint32_t>(W), d.atom);
 }
 
 }  // namespace vgpu::exec

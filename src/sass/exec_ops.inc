@@ -4638,8 +4638,8 @@ bool Runner::gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const Gmm
     Cf.resize(size_t{16} * N);
     Df.resize(size_t{16} * N);
     exec::wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
-    simd::kernels().tile_f32(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
-    exec::wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data());
+    simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
+    exec::wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data(), true);
   }
   if (rd != kRZ) {
     if (ex == 0xffffffffu) {
@@ -4890,8 +4890,8 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
         exec::mma_frag_a(ta, M, K, is_sparse, xa, meta, ins.f[7], fa, nullptr);
         exec::mma_frag_b(tb, K, xb, fb, nullptr);
         exec::wgmma_acc_to_tile(xc, kN, acc == AccF16, fc);
-        simd::kernels().tile_f32(M, kN, K, fa, fb, fc, kN, fd, kN);
-        exec::wgmma_tile_to_acc(fd, kN, acc == AccF16, xd);
+        simd::kernels().tile_f32c(M, kN, K, fa, fb, fc, kN, fd, kN);
+        exec::wgmma_tile_to_acc(fd, kN, acc == AccF16, xd, true);
         store(c_n);
         return;
       }

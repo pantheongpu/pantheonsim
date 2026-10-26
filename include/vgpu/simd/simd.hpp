@@ -195,6 +195,8 @@ struct Kernels {
   void (*tile_i32)(unsigned M, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, size_t ldc, unsigned block,
                    bool sat, int32_t* D, size_t ldd);
   void (*tile_f64)(unsigned M, unsigned N, unsigned K, const double* A, const double* B, const double* C, double* D);
+  //  tile_f32c: tile_f32 with every NaN in D the canonical 0x7fffffff (what the tensor-core forms write), in the same pass.
+  void (*tile_f32c)(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the
