@@ -9381,7 +9381,7 @@ class Interpreter {
   // sm_86 sum do not take, the s8, u8, s4 and u4 products (also .sp), f64 and .b1 -- through the tile kernels and fragment code of
   // vgpu/exec/tile_mma.hpp, which give the general form's bits (tests/unit/test_mma_tiles.cpp). Returns false, having changed nothing, for what
   // it does not take: block scaling, sm_120's narrow-float tensor core, the sm_86 chunked sum, the other element types, a NaN in an f64 form.
-  bool exec_mma_tiles(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
+  __attribute__((noinline, section(".text.unlikely"))) bool exec_mma_tiles(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
     if (!fast_enabled_ || W_ != 32 || !simd::enabled() || op.block_scale) return false;
     const uint32_t M = op.m, K = op.k;
     constexpr uint32_t kN = 8;
@@ -9899,7 +9899,7 @@ class Interpreter {
   // loop does, so the bits are the same (tests/unit/test_tile_mma.cpp). Returns false, having changed nothing, for what it does not take
   // (.b1, a scale other than +-1, shared memory it cannot read directly -- another CTA's, out of range, watched by the race detector or
   // by an armed fault); exec_wgmma then runs the general form, which also raises that form's errors.
-  bool exec_wgmma_fast(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWgmma& op, Mask m, uint32_t warp_index) {
+  __attribute__((noinline, section(".text.unlikely"))) bool exec_wgmma_fast(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWgmma& op, Mask m, uint32_t warp_index) {
     const uint32_t N = op.n, K = op.k;
     if (W_ != 32 || (op.scale_a != 1 && op.scale_a != -1) || (op.scale_b != 1 && op.scale_b != -1) || N == 0 || N % 8 || N > 256 || K == 0 ||
         K > 64)
