@@ -1353,6 +1353,12 @@ vgpu_unit_test(test_tcgen05_fast)
 vgpu_unit_test(test_tcgen05_tiles)
 # wmma.mma on the shapes and types the 16x16x16 f16/bf16 tile does not take, through the tile kernels, against the general form (VGPU_FASTPATH=0), bit for bit.
 vgpu_unit_test(test_wmma_generic_fast)
+# The routes that run the tile kernels, again with the AVX-512 table selected (VGPU_SIMD=avx512; a host without it runs them at AVX2): the engines'
+# results against their general forms must not move a bit with the level.
+foreach(_t test_mma_fast test_mma_tiles test_wgmma_fast test_tcgen05_tiles test_wmma_generic_fast test_tile_mma)
+  add_test(NAME ${_t}_simd_avx512 COMMAND ${_t})
+  set_tests_properties(${_t}_simd_avx512 PROPERTIES ENVIRONMENT "VGPU_SIMD=avx512")
+endforeach()
 # The PTX engine's tile route for the other mma.sync forms against the general form, bit for bit.
 vgpu_unit_test(test_mma_tiles)
 # The SASS executor's tile route for the MMA forms its SIMD HMMA kernel does not take, against its general form (the kernels off in a second run).
