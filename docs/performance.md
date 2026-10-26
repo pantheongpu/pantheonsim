@@ -4653,3 +4653,13 @@ now (`any_nan |= out[e] != out[e]`, the fix-up loop only if any), which has no s
 * `s_load_dwordx*` as one load: dropped in round 1 (1.015x). What dominates `smem` is the 21 scalar ALU instructions around two scalar loads: the frame above.
 * A `fetch` hint for two-way branches (one hint per instruction thrashes only on alternating branches; no workload showed a miss rate worth a second slot).
 * Scalar handlers by operand shape (SGPR/constant/pair variants without the `rd`/`wr` switch): written as a design, not measured, not kept.
+
+## The PTX interpreter's memory, atomics, shuffles and diverged warps (branch `sp2-ptxpath`, base origin/main 99b013a3)
+
+* Coalesced global loads and stores of a run of lanes move with `MemoryManager::load_run`/`store_run` (registers' rows straight to and from memory); consecutive shared accesses are one block copy; the lane loops of shared and local gathers have the element size as a template constant; address generation is a counted loop and a coalesced run is counted by `memcount::run_sectors`.
+* A warp's PTX atomics on device memory go through one `rmw_batch` call (new `always_store` flag so resident chunks match `rmw_scalar`), only on a one-thread launch and after `sassatom::batchable`.
+* `micro_shfl32` with one lane/clamp for all lanes of a full warp runs without the per-lane mode switch.
+* A diverged warp's micro instructions run in batches while `select_path` would pick the same path again (merge, lower pc, starvation emulated per instruction; boosted paths not batched).
+* Tests: `test_ptx_mem_runs`, `test_ptx_paths` (fast path against `VGPU_FASTPATH=0`, memory, registers, every counter, errors).
+* Results against origin/main (B/A median, 9 runs, cpu 0, counters identical): mem 1.36x, shared 1.60x, atomics 1.39x, divergent 1.20x, warp 1.06x, launch 1.17x (not a change of this branch's launch path; take as placement), int_alu/f32_fma/f64_fma/local/api same (0.99-1.04, p > 0.25).
+* Not done: a micro form for ld/st (skips step/dispatch; est. 10-20% on mem/shared), the Interpreter constructor's 6.5 KB of zeroed scratch (5% of a PTX launch), `setup_block` reuse, atomics on multi-threaded launches (still per-lane stripe locks). The "unexplained" PTX int_alu/local 0.96-0.97x residuals were not isolated.
