@@ -728,8 +728,8 @@ class MemoryManager {
     std::atomic<uint64_t> lo{UINT64_MAX};
     std::atomic<uint64_t> hi{0};
     // Which version of `maps` this is. A kernel's scalar access to mapped host memory used to take `mu` and scan
-    // `maps` every time (three buffers of a vector add: the 1M-element launch ran 1.7x slower than on device
-    // memory on one thread and 8x slower on three, docs/exec-address-model.md of PantheonZE); lookup_host() now
+    // `maps` every time (a 1M-element vector add over three mapped buffers ran 1.7x slower than over engine memory
+    // on one thread and 3.9x slower on three; PantheonZE's docs/exec-address-model.md has the table); lookup_host() now
     // keeps each thread's last few hits and trusts them while this has not moved. Every change to `maps` takes a
     // value no HostMaps has had before (process-wide counter), so an entry cached for a destroyed manager whose
     // HostMaps lived at the same address can never be taken for a current one.
