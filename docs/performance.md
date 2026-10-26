@@ -4574,3 +4574,82 @@ fails if two are swapped), so there is no loop to be placed: `mfma_f64` 175 agai
 `valu_f64` (mi300x) read 1.8% more cycles in the merged tree than the pieces without launch, from a new pointer in `Group` (`cache`, for
 the destructor that marks the register files) placed in the middle of the struct, before `id`, `nb_members` and the rest: the hot
 loop's offsets into `Group` moved and its code with them. It is the last member now, and the cycles are the base's.
+
+## Round sp2: the AMD ALU, scalar and control paths (branch `sp2-amdalu`)
+
+The compute loops of the AMD tier already ran at IPC 2.5 to 5, so the gain had to come from fewer host instructions for each wave instruction. The profile
+(perf on `valu_int`, `smem`, `divergent`, `lds`, `valu_f64`) found, in order of size: `v_mad_u64_u32` (one 128-bit multiply a lane, 1/3 of `valu_int` and
+`smem`), the per-instruction frame of `run_round` (about 60 host instructions and a dozen dependent loads before the handler is called), handlers whose
+glue (operand rows, EXEC merge, 64-bit pair gathers) ran as baseline x86-64 beside AVX2 lane kernels, `rep movs` row copies (a copy of `n * 4` bytes with a
+variable `n`: GCC's expansion costs 30 cycles on Zen 4, 25% of `valu_f64`), and LDS accesses one lane at a time.
+
+Measured on server3 (Ryzen 7 PRO 8840U, one SMT sibling, cpu 4), Release, GCC 13.3, simulated MI300X and RX 6800, `tools/bench-amd` A/B against a build
+of origin/main 99b013a3, 9 alternating runs, one host thread (the all-threads rows agree), counters identical in every row:
+
+| workload | mi300x | rx6800 |
+| --- | ---: | ---: |
+| `valu_int` | **2.15x** | **2.18x** |
+| `valu_f32` | **1.57x** | **1.84x** |
+| `valu_f64` | **3.74x** | **2.45x** |
+| `smem` | **2.41x** | **1.63x** |
+| `divergent` | **1.62x** | **1.68x** |
+| `wave` | **1.99x** | **1.71x** |
+| `lds` | 1.29x (p 0.16) | 1.21x |
+| `ldsx` | 1.24x | 1.27x |
+| `mfma`, `mfma_f64`, `mfma_f64_4b`, `mfma_bf16` | 1.16, 1.06, 1.07, 1.18 | not on RDNA2 |
+| `mfma_i8`, `smfmac` (the residuals of round 1) | 1.01 (p 0.22), 1.07 | |
+| `launch`, `api` (controls) | 1.01, 1.00 (p > 0.3) | 1.04, 1.04 |
+
+p < 0.001 for every "faster" row not marked. The first A/B of the mfma canaries (before the last change below) read `mfma_f64` 0.96x (p 0.01) with *fewer*
+instructions (8.09 G against 8.25 G) and 3% more cycles: the NaN scan that follows a matrix tile (`for each output: if (x != x)`), a 256-trip loop of six
+instructions in `matrix_multiply_fast`, now sat across a 64-byte code line (0x...1b0 to 0x...1ca) where it had sat inside one. It is one branch-free pass
+now (`any_nan |= out[e] != out[e]`, the fix-up loop only if any), which has no small loop to place; `mfma_f64` reads 1.06x, `smfmac` 1.07x.
+
+### What changed
+
+* **`v_mad_u64_u32`** (`k_mad_u64`, `gcn_tier_kernels.inc`): `vpmuludq` on zero-extended lanes, the sum with the 64-bit addend, the carry out as an unsigned compare
+  (`sum < c`: a 32x32 product fits in 64 bits, so the 128-bit carry is exactly a wrapped sum), the rows split with `vpermd`. A few active lanes (8 or fewer) keep
+  the per-lane loop. `valu_int` 1.44x, `smem` 1.70x from this alone.
+* **Handlers built twice** (`TIER_DUAL`): the body of `h_int`, `h_f32`, `h_f64`, `h_l64`, `h_cmp`, `h_cmp64`, `h_cndmask`, `h_ds` and `h_mad_u64` is
+  `always_inline` into a baseline and a `target("avx2,fma,popcnt")` function, and `Tables::avx2` picks one when the instruction is decoded (the glue helpers are
+  `always_inline`, so the row fills, the EXEC merge and the NaN scans are vectorized too). `valu_f64` 1.67x, `valu_f32` 1.2x, `divergent` 1.17x.
+* **The frame** (`gcn_exec.cpp`): `fetch_next` finds the next instruction through `Inst::next` (the instruction the wave ran after this one last time, checked
+  against the program counter, a relaxed-acquire pointer any thread may set); the tier's `Regs` is made once per round of a wave (`Wave::tier`, cleared by
+  `run_round` and where the vector register file may have moved) instead of 14 stores per instruction; the unit counter is picked by an array of pointers rather
+  than a switch. `valu_int` 1.54 to 1.92x, `smem` 1.7 to 2.35x, `divergent` 1.17 to 1.4x.
+* **Row-wise f64** (`k_f64r`): add, multiply and fused multiply-add on the pairs' low and high rows, eight lanes to a step (`vpunpck`/`vperm2i128` in,
+  `vshufps`/`vpermq` out), scalar and constant operands as broadcasts in the kernel (24 kernels: operation x set of uniform operands), the lanes with a NaN result
+  as a mask; any NaN result in an active lane gives the whole instruction to the general handler (which of two NaN payloads wins stays its business: the
+  `nan_order.hpp` rules apply unchanged). `v_mov_b32`/`v_mov_b64` are row copies or fills straight into the destination; integer handlers whose sources are all
+  vector registers call the kernel on the rows themselves; row copies are fixed-size moves (`copy_row`), not `rep movs`; the 64-bit compares are AVX2.
+* **LDS** (`h_ds`): the lanes that are one run (all on, or a prefix as a reduction leaves them) with consecutive word (or group) addresses are one copy to or from
+  the LDS (wide forms transposed through a small buffer; the two-offset forms only when their two runs are apart, since the lane order decides the bytes
+  otherwise); all-lanes-on `ds_bpermute` and plain accesses are counted loops. New handlers: `ds_write2_b32` (it had none: its data operands are a register
+  each, the classifier asked for a pair), `ds_read_b96`, `ds_write_b96`, `ds_add_u32` (the lane-order loop).
+
+### Tests (CMake-wired) and the mutations that fail them
+
+* `test_amd_gcn_tier_same_bits`: three new flavours of state (18 and 19: an LDS access whose lanes have consecutive addresses, all on or one run of lanes on; 20: the
+  integers' edges, so carries and borrows happen) and, new, its twin under `VGPU_SIMD=base` (`..._simd_base`, the baseline build of every kernel and handler).
+* Mutations, each built and run on server3 (the tier test restricted to the instruction concerned, or the named kernel tests):
+
+| # | mutation | result |
+| --- | --- | --- |
+| M1 | `k_mad_u64` carry compare with the operands swapped | `v_mad_u64_u32` differs (520 runs) |
+| M2 | `h_ds` contiguity test dropped | every `ds_read*`/`ds_write*` differs |
+| M3 | `ds_add_u32` stores the register instead of adding | `ds_add_u32` differs (144) |
+| M4 | `store64` writes the words swapped | `v_lshrrev_b64` differs (425) |
+| M5 | 64-bit compare `<=` done as `<` in the AVX2 kernel | `v_cmp_le_i64` differs |
+| M6 | `k_f64r` fused add takes the wrong addend | `v_fma_f64` differs (1276) |
+| M7 | `fetch_next` takes the hint without the program-counter check | `test_amd_gcn_exec_*` and `test_amd_gcn_lds_*` fail on all targets (the instruction-level guards cannot see it) |
+| M8 | unit counter of a tier instruction swapped | `test_amd_gcn_same_bits`, `test_amd_gcn_counters` fail |
+| M9 | b64 read de-transposed in the wrong order (earlier tree) / write2 overlap guard dropped | `ds_read_b64`, `ds_write2_b32` differ |
+
+  Not shown by a mutation: the clearing of `Wave::tier.ok` at the start of a round (a defensive reset: a wave is made fresh for each group here, so nothing
+  observes it).
+
+### Not done, and negative results
+
+* `s_load_dwordx*` as one load: dropped in round 1 (1.015x). What dominates `smem` is the 21 scalar ALU instructions around two scalar loads: the frame above.
+* A `fetch` hint for two-way branches (one hint per instruction thrashes only on alternating branches; no workload showed a miss rate worth a second slot).
+* Scalar handlers by operand shape (SGPR/constant/pair variants without the `rd`/`wr` switch): written as a design, not measured, not kept.
