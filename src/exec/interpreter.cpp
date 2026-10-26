@@ -4993,6 +4993,33 @@ class Interpreter {
     for_active(m, W_, [&](uint32_t l) { dst[l] = vals[l]; });
   }
 
+  // The 32 lanes of a 32-bit register copied out as they are -- the tensor-core forms take whole registers, and read_operand would widen each to 64
+  // bits and this narrow it again. A register nothing has written reads as zero, as read_operand has it; a 64-bit one takes the general read.
+  void gather_words(Warp& w, const BlockCtx& ctx, const Instr& ins, const Reg& r, uint32_t* dst) {
+    if (!r.wide) {
+      if (r.id < w.regs32.size() && w.written32[r.id]) std::memcpy(dst, w.regs32[r.id].data(), 32 * sizeof(uint32_t));
+      else std::memset(dst, 0, 32 * sizeof(uint32_t));
+      return;
+    }
+    Lanes _s;
+    const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{r}}, _s);
+    for (uint32_t lane = 0; lane < 32; ++lane) dst[lane] = static_cast<uint32_t>(v[lane]);
+  }
+  // 32 words into the lanes of `m` of a 32-bit register (write_reg's result for the same values). `fault`: a result the ALU fault injector may
+  // corrupt (a float one), which takes the general write when one is armed.
+  void scatter_words(Warp& w, const Reg& reg, Mask m, const uint32_t* src, bool fault) {
+    if (reg.wide || (fault && alu_armed())) {
+      Lanes r;
+      for (uint32_t lane = 0; lane < 32; ++lane) r[lane] = src[lane];
+      if (fault) alu_fault(r, m, 32);
+      write_reg(w, reg, m, r, 32);
+      return;
+    }
+    uint32_t* d = dst32(w, reg.id, m);
+    if (m == all_lanes(W_)) std::memcpy(d, src, 32 * sizeof(uint32_t));
+    else for_active(m, W_, [&](uint32_t l) { d[l] = src[l]; });
+  }
+
   void write_reg(Warp& w, const Reg& reg, Mask m, const Lanes& vals, uint32_t bits) {
     if (reg.wide) {
       uint64_t* dst = dst64(w, reg.id, m);
@@ -9442,23 +9469,13 @@ class Interpreter {
     const uint32_t a_regs = 16 * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = op.acc_f16 ? 2u : 4u;
     if (op.a.size() != a_regs || op.b.size() != b_regs || op.c.size() != c_regs || op.d.size() != c_regs) return false;
     alignas(32) uint32_t fa[4 * 32], fb[2 * 32], fc[4 * 32], out[4 * 32];
-    const auto gather = [&](const Reg& r, uint32_t* dst) {
-      Lanes _s;
-      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{r}}, _s);
-      for (uint32_t lane = 0; lane < 32; ++lane) dst[lane] = static_cast<uint32_t>(v[lane]);
-    };
+    const auto gather = [&](const Reg& r, uint32_t* dst) { gather_words(w, ctx, ins, r, dst); };
     for (uint32_t r = 0; r < a_regs; ++r) gather(op.a[r], fa + r * 32);
     for (uint32_t r = 0; r < b_regs; ++r) gather(op.b[r], fb + r * 32);
     for (uint32_t r = 0; r < c_regs; ++r) gather(op.c[r], fc + r * 32);
     // (An sm_86 device sums as an RTX 3060's tensor core does: chunked and truncated, see vgpu/exec/tc_ampere.hpp.)
     simd::kernels().hmma(kind | (vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) ? 16u : 0u), K, op.acc_f16, fa, fb, fc, out);
-    for (uint32_t reg = 0; reg < c_regs; ++reg) {
-      Lanes r;
-      for (uint32_t lane = 0; lane < 32; ++lane)
-        if (m & (Mask{1} << lane)) r[lane] = out[reg * 32 + lane];
-      alu_fault(r, m, 32);
-      write_reg(w, op.d[reg], m, r, 32);
-    }
+    for (uint32_t reg = 0; reg < c_regs; ++reg) scatter_words(w, op.d[reg], m, out + reg * 32, true);
     return true;
   }
 
@@ -9508,11 +9525,7 @@ class Interpreter {
       return false;
     alignas(32) uint32_t ra[8 * 32], rb[8 * 32], rc[4 * 32], rd[4 * 32], meta[32] = {};
     uint32_t sel = 0;
-    const auto gather = [&](const Reg& r, uint32_t* dst) {
-      Lanes _s;
-      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{r}}, _s);
-      for (uint32_t lane = 0; lane < 32; ++lane) dst[lane] = static_cast<uint32_t>(v[lane]);
-    };
+    const auto gather = [&](const Reg& r, uint32_t* dst) { gather_words(w, ctx, ins, r, dst); };
     const auto gather64 = [&](const Reg& r, uint64_t* dst) {
       Lanes _s;
       const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{r}}, _s);
@@ -9520,9 +9533,13 @@ class Interpreter {
     };
     const auto scatter = [&](const uint32_t* src, uint32_t n, uint32_t bitsz, const uint64_t* wide) {
       for (uint32_t reg = 0; reg < n; ++reg) {
+        if (bitsz == 32) {
+          scatter_words(w, op.d[reg], m, src + reg * 32, !op.acc_int);
+          continue;
+        }
         Lanes r;
         for (uint32_t lane = 0; lane < 32; ++lane)
-          if (m & (Mask{1} << lane)) r[lane] = bitsz == 64 ? wide[reg * 32 + lane] : src[reg * 32 + lane];
+          if (m & (Mask{1} << lane)) r[lane] = wide[reg * 32 + lane];
         if (!op.acc_int) alu_fault(r, m, bitsz);
         write_reg(w, op.d[reg], m, r, bitsz);
       }
@@ -10000,7 +10017,6 @@ class Interpreter {
     const uint32_t group = warp_index / 4, row0 = (warp_index % 4) * 16;
     const uint32_t Kp = op.sparse ? K / 2 : K;
     const uint32_t abits = 8 * tile_elem_bytes(ta);
-    const uint32_t stored = abits == 32 ? 1 : 2;
     const std::pair<uint32_t, uint64_t> key{group, w.wgmma_issued};
     auto it = ctx.wgmma->pending.find(key);
     if (it == ctx.wgmma->pending.end()) {
@@ -10040,53 +10056,42 @@ class Interpreter {
     WgmmaSnapshot& snap = it->second;
 
     // Sparse A: half of each row stored, placed by this warp's metadata (as mma.sp does for an m16n8kK).
-    Lanes sp_meta{};
+    uint32_t sp_meta[32] = {};
     uint32_t sp_sel = 0;
     if (op.sparse) {
-      Lanes _s;
-      sp_meta = read_operand(w, ctx, ins, op.sp_meta, _s);
+      Operand mo = op.sp_meta;
+      if (const auto* r = std::get_if<RegOperand>(&mo)) gather_words(w, ctx, ins, r->reg, sp_meta);
+      else {
+        Lanes _s;
+        const Lanes& mv = read_operand(w, ctx, ins, mo, _s);
+        for (uint32_t lane = 0; lane < 32; ++lane) sp_meta[lane] = static_cast<uint32_t>(mv[lane]);
+      }
       sp_sel = static_cast<uint32_t>(std::get<ImmInt>(op.sp_sel).value);
     }
     thread_local std::vector<float> Af;
     thread_local std::vector<int32_t> Ai;
     // A, this warp's 16 x K slice.
-    if (int_form) Ai.assign(size_t{16} * K, 0);
-    else Af.assign(size_t{16} * K, 0.0f);
+    if (int_form) Ai.resize(size_t{16} * K);
+    else Af.resize(size_t{16} * K);
     if (op.a_regs) {
-      const uint32_t per_reg = 32 / abits;
-      const uint32_t cpr = per_reg / stored;   // sparse chunks per register
-      for (uint32_t reg = 0; reg < 4; ++reg) {
-        Lanes _s;
-        const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.a[reg]}}, _s);
-        for (uint32_t lane = 0; lane < W_; ++lane) {
-          const uint32_t g = lane / 4, t = lane % 4;
-          const uint32_t row = g + (reg % 2) * 8;
-          const uint32_t col0 = t * per_reg + (reg / 2) * (per_reg * 4);
-          for (uint32_t e = 0; e < per_reg; ++e) {
-            const uint32_t col =
-                op.sparse ? sparse_column(abits, K, sp_sel, sp_meta, row, t * cpr + (reg / 2) * 4 * cpr + e / stored, e % stored)
-                          : col0 + e;
-            const uint32_t raw = static_cast<uint32_t>(v[lane] >> (abits * e));
-            if (int_form) {
-              const int32_t x = tile_decode_i32(ta, raw);
-              Ai[row * K + col] = neg_a ? -x : x;
-            } else {
-              Af[row * K + col] = std::bit_cast<float>(std::bit_cast<uint32_t>(tile_decode_f32(ta, raw)) ^ (neg_a ? 0x80000000u : 0u));
-            }
-          }
-        }
-      }
+      // mma.m16n8kK's A fragment (mma.sp's, sparse), in the four registers.
+      alignas(32) uint32_t ra[4 * 32];
+      for (uint32_t reg = 0; reg < 4; ++reg) gather_words(w, ctx, ins, op.a[reg], ra + reg * 32);
+      mma_frag_a(frag_type_of(ta), 16, K, op.sparse, ra, sp_meta, sp_sel, int_form ? nullptr : Af.data(), int_form ? Ai.data() : nullptr, neg_a);
     } else {
       if (int_form ? snap.Ai.empty() : snap.Af.empty())
         ctx_fail(ins, -1, Err::UnsupportedPtx,
                  "the warps of a warpgroup disagree on whether this wgmma's A is in registers or "
                  "shared memory");
-      for (uint32_t r = 0; r < 16; ++r)
-        for (uint32_t j = 0; j < Kp; ++j) {
-          const uint32_t col = op.sparse ? sparse_column(abits, K, sp_sel, sp_meta, r, j / stored, j % stored) : j;
-          if (int_form) Ai[r * K + col] = snap.Ai[size_t{row0 + r} * Kp + j];
-          else Af[r * K + col] = snap.Af[size_t{row0 + r} * Kp + j];
-        }
+      if (op.sparse) {
+        // (the stored elements are 32-bit values either way: a float's bits or an int32)
+        if (int_form) wgmma_sparse_expand(abits, K, sp_sel, sp_meta, reinterpret_cast<const uint32_t*>(&snap.Ai[size_t{row0} * Kp]), reinterpret_cast<uint32_t*>(Ai.data()));
+        else wgmma_sparse_expand(abits, K, sp_sel, sp_meta, reinterpret_cast<const uint32_t*>(&snap.Af[size_t{row0} * Kp]), reinterpret_cast<uint32_t*>(Af.data()));
+      } else if (int_form) {
+        std::memcpy(Ai.data(), &snap.Ai[size_t{row0} * K], size_t{16} * K * sizeof(int32_t));
+      } else {
+        std::memcpy(Af.data(), &snap.Af[size_t{row0} * K], size_t{16} * K * sizeof(float));
+      }
     }
     Mask keep_d = all_;
     if (const auto* imm = std::get_if<ImmInt>(&op.scale_d)) {
@@ -10102,9 +10107,11 @@ class Interpreter {
     cw.resize(size_t{nregs} * 32);
     dw.resize(size_t{nregs} * 32);
     for (uint32_t reg = 0; reg < nregs; ++reg) {
-      Lanes _s;
-      const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{op.d[reg]}}, _s);
-      for (uint32_t lane = 0; lane < 32; ++lane) cw[size_t{reg} * 32 + lane] = (keep_d >> lane & 1) ? static_cast<uint32_t>(v[lane]) : 0u;
+      uint32_t* const c = &cw[size_t{reg} * 32];
+      gather_words(w, ctx, ins, op.d[reg], c);
+      if (keep_d != all_)
+        for (uint32_t lane = 0; lane < 32; ++lane)
+          if (!(keep_d >> lane & 1)) c[lane] = 0u;
     }
     if (int_form) {
       thread_local std::vector<int32_t> Ci, Di;
@@ -10122,12 +10129,7 @@ class Interpreter {
       simd::kernels().tile_f32(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
       wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data());
     }
-    for (uint32_t reg = 0; reg < nregs; ++reg) {
-      Lanes r{};
-      for (uint32_t lane = 0; lane < 32; ++lane) r[lane] = dw[size_t{reg} * 32 + lane];
-      if (!int_form) alu_fault(r, m, 32);
-      write_reg(w, op.d[reg], m, r, 32);
-    }
+    for (uint32_t reg = 0; reg < nregs; ++reg) scatter_words(w, op.d[reg], m, &dw[size_t{reg} * 32], !int_form);
     snap.taken |= static_cast<uint8_t>(1u << (warp_index % 4));
     if (snap.taken == 0xF) ctx.wgmma->pending.erase(it);
     return true;

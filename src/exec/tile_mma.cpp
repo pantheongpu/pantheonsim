@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 #include "vgpu/exec/numerics.hpp"
@@ -299,7 +300,12 @@ template <FragType T> VGPU_COLD void decode_bulk(const typename FragOf<T>::Raw* 
 // Bytes of raw tile the dense forms need at most (s4 m16n8k64: 1024 elements; f16 m16n8k16: 256 of 2 bytes; tf32 and fp8 less).
 constexpr size_t kRawBytes = 4096;
 
-template <FragType T> VGPU_COLD void frag_a_dense(unsigned M, unsigned K, const uint32_t* regs, typename FragOf<T>::Out* out) {
+template <class Out> inline Out negated(Out v) {
+  if constexpr (std::is_same_v<Out, float>) return std::bit_cast<float>(std::bit_cast<uint32_t>(v) ^ 0x80000000u);
+  else return -v;
+}
+
+template <FragType T> VGPU_COLD void frag_a_dense(unsigned M, unsigned K, const uint32_t* regs, typename FragOf<T>::Out* out, bool negate) {
   using F = FragOf<T>;
   const unsigned kbytes = K * F::bits / 8, nregs = M * K / (32 * F::p);
   alignas(32) typename F::Raw raw[kRawBytes / sizeof(typename F::Raw)];
@@ -308,6 +314,8 @@ template <FragType T> VGPU_COLD void frag_a_dense(unsigned M, unsigned K, const 
   for (unsigned r = 0; r < nregs; ++r)
     for (unsigned g = 0; g < 8; ++g) std::memcpy(bytes + size_t{g + 8 * (r % 2)} * kbytes + size_t{16} * (r / 2), regs + size_t{r} * 32 + 4 * g, 16);
   decode_bulk<T>(raw, out, size_t{M} * K);
+  if (negate)
+    for (size_t i = 0; i < size_t{M} * K; ++i) out[i] = negated(out[i]);
 }
 
 template <FragType T> VGPU_COLD void frag_b_dense(unsigned K, const uint32_t* regs, typename FragOf<T>::Out* out) {
@@ -325,7 +333,7 @@ template <FragType T> VGPU_COLD void frag_b_dense(unsigned K, const uint32_t* re
     for (unsigned k = 0; k < K; ++k) out[size_t{k} * 8 + g] = col[size_t{g} * K + k];
 }
 
-template <FragType T> VGPU_COLD void frag_a_sparse(unsigned M, unsigned K, const uint32_t* regs, const uint32_t* meta, unsigned sel, typename FragOf<T>::Out* out) {
+template <FragType T> VGPU_COLD void frag_a_sparse(unsigned M, unsigned K, const uint32_t* regs, const uint32_t* meta, unsigned sel, typename FragOf<T>::Out* out, bool negate) {
   using F = FragOf<T>;
   constexpr unsigned bits = F::bits, p = F::p;
   constexpr bool tf32 = T == FragType::TF32, int4 = bits == 4, narrow = bits <= 8;
@@ -351,20 +359,22 @@ template <FragType T> VGPU_COLD void frag_a_sparse(unsigned M, unsigned K, const
           const unsigned col = chunk * chunk_elems + pos;
           if (col >= K) continue;
           const unsigned e = cc * stored + k;
-          out[size_t{row} * K + col] = decode_one<T>(tab, bits == 32 ? v : v >> (bits * e));
+          const auto x = decode_one<T>(tab, bits == 32 ? v : v >> (bits * e));
+          out[size_t{row} * K + col] = negate ? negated(x) : x;
         }
       }
     }
 }
 
-template <FragType T> VGPU_COLD void frag_a_t(unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* iout) {
+template <FragType T> VGPU_COLD void frag_a_t(unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* iout,
+                                              bool negate) {
   using F = FragOf<T>;
   typename F::Out* const out = [&] {
     if constexpr (F::is_int) return iout;
     else return f;
   }();
-  if (sparse) frag_a_sparse<T>(M, K, regs, meta, sel, out);
-  else frag_a_dense<T>(M, K, regs, out);
+  if (sparse) frag_a_sparse<T>(M, K, regs, meta, sel, out, negate);
+  else frag_a_dense<T>(M, K, regs, out, negate);
 }
 
 template <FragType T> VGPU_COLD void frag_b_t(unsigned K, const uint32_t* regs, float* f, int32_t* iout) {
@@ -391,17 +401,18 @@ void canon_nan_rows(uint32_t* base, uint32_t rows, uint32_t cols, size_t ld) {
   }
 }
 
-void mma_frag_a(FragType t, unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* iout) {
+void mma_frag_a(FragType t, unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* iout,
+                bool negate) {
   switch (t) {
-    case FragType::F16: return frag_a_t<FragType::F16>(M, K, sparse, regs, meta, sel, f, iout);
-    case FragType::BF16: return frag_a_t<FragType::BF16>(M, K, sparse, regs, meta, sel, f, iout);
-    case FragType::TF32: return frag_a_t<FragType::TF32>(M, K, sparse, regs, meta, sel, f, iout);
-    case FragType::E4M3: return frag_a_t<FragType::E4M3>(M, K, sparse, regs, meta, sel, f, iout);
-    case FragType::E5M2: return frag_a_t<FragType::E5M2>(M, K, sparse, regs, meta, sel, f, iout);
-    case FragType::S8: return frag_a_t<FragType::S8>(M, K, sparse, regs, meta, sel, f, iout);
-    case FragType::U8: return frag_a_t<FragType::U8>(M, K, sparse, regs, meta, sel, f, iout);
-    case FragType::S4: return frag_a_t<FragType::S4>(M, K, sparse, regs, meta, sel, f, iout);
-    case FragType::U4: return frag_a_t<FragType::U4>(M, K, sparse, regs, meta, sel, f, iout);
+    case FragType::F16: return frag_a_t<FragType::F16>(M, K, sparse, regs, meta, sel, f, iout, negate);
+    case FragType::BF16: return frag_a_t<FragType::BF16>(M, K, sparse, regs, meta, sel, f, iout, negate);
+    case FragType::TF32: return frag_a_t<FragType::TF32>(M, K, sparse, regs, meta, sel, f, iout, negate);
+    case FragType::E4M3: return frag_a_t<FragType::E4M3>(M, K, sparse, regs, meta, sel, f, iout, negate);
+    case FragType::E5M2: return frag_a_t<FragType::E5M2>(M, K, sparse, regs, meta, sel, f, iout, negate);
+    case FragType::S8: return frag_a_t<FragType::S8>(M, K, sparse, regs, meta, sel, f, iout, negate);
+    case FragType::U8: return frag_a_t<FragType::U8>(M, K, sparse, regs, meta, sel, f, iout, negate);
+    case FragType::S4: return frag_a_t<FragType::S4>(M, K, sparse, regs, meta, sel, f, iout, negate);
+    case FragType::U4: return frag_a_t<FragType::U4>(M, K, sparse, regs, meta, sel, f, iout, negate);
   }
 }
 
@@ -416,6 +427,34 @@ void mma_frag_b(FragType t, unsigned K, const uint32_t* regs, float* f, int32_t*
     case FragType::U8: return frag_b_t<FragType::U8>(K, regs, f, iout);
     case FragType::S4: return frag_b_t<FragType::S4>(K, regs, f, iout);
     case FragType::U4: return frag_b_t<FragType::U4>(K, regs, f, iout);
+  }
+}
+
+template <unsigned Bits> VGPU_COLD void sparse_expand_t(unsigned K, unsigned sel, const uint32_t* meta, const uint32_t* stored_vals, uint32_t* out) {
+  constexpr bool tf32 = Bits == 32;
+  constexpr unsigned chunk_elems = tf32 ? 2 : 4, stored = chunk_elems / 2;
+  const unsigned kp = K / 2, holders = 2 * (tf32 ? 2 * K : K) / 32;
+  std::fill(out, out + size_t{16} * K, 0u);
+  for (unsigned r = 0; r < 16; ++r) {
+    const unsigned g = r % 8, half = r / 8;
+    for (unsigned chunk = 0; chunk < kp / stored; ++chunk) {
+      const unsigned src = Bits <= 8 ? 4 * g + 2 * sel + half + 2 * (chunk / 8) : 4 * g + holders * sel + chunk / 4;
+      const unsigned shift = Bits <= 8 ? (chunk % 8) * 4 : half * 16 + (chunk % 4) * 4;
+      const uint32_t nib = (src < 32 ? meta[src] : 0u) >> shift;
+      const unsigned idx0 = nib & 3, idx1 = (nib >> 2) & 3;
+      for (unsigned k = 0; k < stored; ++k) {
+        const unsigned col = chunk * chunk_elems + (tf32 ? idx0 / 2 : (k == 0 ? idx0 : idx1));
+        if (col < K) out[size_t{r} * K + col] = stored_vals[size_t{r} * kp + chunk * stored + k];
+      }
+    }
+  }
+}
+
+void wgmma_sparse_expand(unsigned abits, unsigned K, unsigned sel, const uint32_t* meta, const uint32_t* stored_vals, uint32_t* out) {
+  switch (abits) {
+    case 32: return sparse_expand_t<32>(K, sel, meta, stored_vals, out);
+    case 16: return sparse_expand_t<16>(K, sel, meta, stored_vals, out);
+    default: return sparse_expand_t<8>(K, sel, meta, stored_vals, out);
   }
 }
 
