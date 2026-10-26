@@ -11094,7 +11094,172 @@ class Interpreter {
     }
   }
 
+  // A generic fragment's logical matrix as raw element bits (wmma_gather's loops without the decode): slot (lane, reg, e) holds element
+  // (lane * regs * per_reg + reg * per_reg + e) modulo the matrix's size, the last slot in (reg, lane, e) order to name an element winning, the
+  // elements no slot names 0.
+  void wmma_gather_raw(Warp& w, const BlockCtx& ctx, const Instr& ins, const std::vector<Reg>& regs, const WmmaGeom& g, uint64_t* raw) {
+    const uint32_t per_reg = g.reg_bits / g.bits, size = g.rows * g.cols;
+    const uint64_t mask = g.bits == 64 ? ~0ull : (1ull << g.bits) - 1, per_lane = uint64_t{g.regs} * per_reg;
+    const bool pow2 = (size & (size - 1)) == 0;
+    std::fill(raw, raw + size, uint64_t{0});
+    for (uint32_t reg = 0; reg < g.regs; ++reg) {
+      uint64_t v[32];
+      if (g.reg_bits == 32) {
+        uint32_t words[32];
+        gather_words(w, ctx, ins, regs[reg], words);
+        for (uint32_t lane = 0; lane < 32; ++lane) v[lane] = words[lane];
+      } else {
+        Lanes _s;
+        const Lanes& wide = read_operand(w, ctx, ins, Operand{RegOperand{regs[reg]}}, _s);
+        for (uint32_t lane = 0; lane < 32; ++lane) v[lane] = wide[lane];
+      }
+      for (uint32_t lane = 0; lane < 32; ++lane) {
+        const uint64_t lin = uint64_t{lane} * per_lane + uint64_t{reg} * per_reg;
+        uint32_t idx = static_cast<uint32_t>(pow2 ? (lin & (size - 1)) : lin % size);
+        for (uint32_t e = 0; e < per_reg; ++e) {
+          raw[idx] = (v[lane] >> (e * g.bits)) & mask;
+          if (++idx == size) idx = 0;
+        }
+      }
+    }
+  }
+
+  // The generic wmma.mma forms with f16, bf16 or tf32 operands (f16 or f32 C and D), 8- and 4-bit integers (s32) and f64, through the tile kernels:
+  // the fragments gathered as raw bits (wmma_gather_raw), decoded, summed k in order with every product rounded and then added, and D scattered
+  // by the same slot map -- the arithmetic and the bits of exec_wmma_mma_generic below (tests/unit/test_wmma_generic_fast.cpp). Returns false,
+  // having changed nothing, for what it does not take: .b1, the 16x16x16 f16 and bf16 fragments (their own layout), a NaN in an f64 form, a fault
+  // injector armed.
+  __attribute__((noinline, section(".text.unlikely"))) bool wmma_generic_fast(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
+    if (W_ != 32 || alu_armed()) return false;
+    const uint32_t M = op.shape.m, N = op.shape.n, K = op.shape.k;
+    const WmmaType at = op.atype, bt = op.btype;
+    if (N == 0 || N % 8 || M == 0 || K == 0 || M * K > 1024 || K * N > 1024 || M * N > 1024) return false;
+    if (op.shape == WmmaShape{16, 16, 16} && (at == WmmaType::F16 || at == WmmaType::BF16)) return false;
+    const bool is_float = at == WmmaType::F16 || at == WmmaType::BF16 || at == WmmaType::TF32;
+    const bool is_int = at == WmmaType::S8 || at == WmmaType::U8 || at == WmmaType::S4 || at == WmmaType::U4;
+    const bool is_f64 = at == WmmaType::F64;
+    if (!is_float && !is_int && !is_f64) return false;
+    if (is_float && (bt != at || (op.ctype != WmmaType::F16 && op.ctype != WmmaType::F32) || (op.dtype != WmmaType::F16 && op.dtype != WmmaType::F32))) return false;
+    if (is_int && ((bt != WmmaType::S8 && bt != WmmaType::U8 && bt != WmmaType::S4 && bt != WmmaType::U4) || op.ctype != WmmaType::S32 || op.dtype != WmmaType::S32 ||
+                   (bt == WmmaType::S4 || bt == WmmaType::U4) != (at == WmmaType::S4 || at == WmmaType::U4)))
+      return false;
+    if (is_f64 && (bt != WmmaType::F64 || op.ctype != WmmaType::F64 || op.dtype != WmmaType::F64)) return false;
+    const WmmaGeom ga = wmma_geom('a', op.shape, at), gb = wmma_geom('b', op.shape, bt), gc = wmma_geom('c', op.shape, op.ctype), gd = wmma_geom('d', op.shape, op.dtype);
+    if (op.a.size() != ga.regs || op.b.size() != gb.regs || op.c.size() != gc.regs || op.d.size() != gd.regs) return false;
+    alignas(32) uint64_t rawA[1024], rawB[1024], rawC[1024];
+    wmma_gather_raw(w, ctx, ins, op.a, ga, rawA);
+    wmma_gather_raw(w, ctx, ins, op.b, gb, rawB);
+    wmma_gather_raw(w, ctx, ins, op.c, gc, rawC);
+    alignas(32) uint64_t dbits[1024];   // D as the bits of its elements (before the fragment's mask)
+    if (is_f64) {
+      alignas(32) double A[1024], B[1024], C[1024], D[1024];
+      for (uint32_t i = 0; i < M * K; ++i) A[i] = std::bit_cast<double>(rawA[i]);
+      for (uint32_t i = 0; i < K * N; ++i) B[i] = std::bit_cast<double>(rawB[i]);
+      for (uint32_t i = 0; i < M * N; ++i) C[i] = std::bit_cast<double>(rawC[i]);
+      // (no host NaN: which payload a fused multiply-add keeps depends on its operand order)
+      for (uint32_t i = 0; i < M * K; ++i) if (A[i] != A[i]) return false;
+      for (uint32_t i = 0; i < K * N; ++i) if (B[i] != B[i]) return false;
+      for (uint32_t i = 0; i < M * N; ++i) if (C[i] != C[i]) return false;
+      const int prev = op.rnd == FRound::Nearest ? 0 : std::fegetround();
+      if (op.rnd != FRound::Nearest) g_directed_rounding.fetch_add(1, std::memory_order_relaxed);
+      switch (op.rnd) {
+        case FRound::Zero: std::fesetround(FE_TOWARDZERO); break;
+        case FRound::MinusInf: std::fesetround(FE_DOWNWARD); break;
+        case FRound::PlusInf: std::fesetround(FE_UPWARD); break;
+        case FRound::Nearest: break;
+      }
+      simd::kernels().tile_f64(M, N, K, A, B, C, D);
+      if (op.rnd != FRound::Nearest) {
+        std::fesetround(prev);
+        g_directed_rounding.fetch_sub(1, std::memory_order_relaxed);
+      }
+      for (uint32_t i = 0; i < M * N; ++i) dbits[i] = std::bit_cast<uint64_t>(D[i]);
+    } else if (is_int) {
+      alignas(32) int32_t A[1024], B[1024], C[1024], D[1024];
+      const auto val = [](WmmaType t, uint64_t bits) -> int32_t {
+        switch (t) {
+          case WmmaType::S8: return static_cast<int8_t>(bits);
+          case WmmaType::U8: return static_cast<uint8_t>(bits);
+          case WmmaType::S4: return static_cast<int32_t>((bits & 0xF) << 28) >> 28;
+          default: return static_cast<int32_t>(bits & 0xF);
+        }
+      };
+      for (uint32_t i = 0; i < M * K; ++i) A[i] = val(at, rawA[i]);
+      for (uint32_t i = 0; i < K * N; ++i) B[i] = val(bt, rawB[i]);
+      for (uint32_t i = 0; i < M * N; ++i) C[i] = static_cast<int32_t>(rawC[i]);
+      // (a satfinite clamp once, after the whole K)
+      simd::kernels().tile_i32(M, N, K, A, B, C, N, K, op.satfinite, D, N);
+      for (uint32_t i = 0; i < M * N; ++i) dbits[i] = static_cast<uint32_t>(D[i]);
+    } else {
+      alignas(32) float A[1024], B[1024], C[1024], D[1024];
+      const auto decode_n = [&](WmmaType t, const uint64_t* raw, float* out, uint32_t n) {
+        alignas(32) uint16_t halves[1024];
+        switch (t) {
+          case WmmaType::F16:
+            for (uint32_t i = 0; i < n; ++i) halves[i] = static_cast<uint16_t>(raw[i]);
+            simd::kernels().f16_to_f32(halves, out, n);
+            break;
+          case WmmaType::BF16:
+            for (uint32_t i = 0; i < n; ++i) out[i] = std::bit_cast<float>(static_cast<uint32_t>(raw[i] & 0xFFFF) << 16);
+            break;
+          case WmmaType::TF32:   // (the tensor core reads a tf32 operand's top 19 bits only)
+            for (uint32_t i = 0; i < n; ++i) out[i] = std::bit_cast<float>(static_cast<uint32_t>(raw[i]) & 0xFFFFE000u);
+            break;
+          default:
+            for (uint32_t i = 0; i < n; ++i) out[i] = std::bit_cast<float>(static_cast<uint32_t>(raw[i]));
+        }
+      };
+      decode_n(at, rawA, A, M * K);
+      decode_n(bt, rawB, B, K * N);
+      decode_n(op.ctype, rawC, C, M * N);
+      // On an RTX 3060 (sm_86) the tensor core's chunked truncating sum (include/vgpu/exec/tc_ampere.hpp); elsewhere products and sums in f32, k in
+      // order. An f16 result is that rounded once.
+      const bool tc = vgpu::exec::tc86::applies(profile_.cc_major, profile_.cc_minor) && M <= 32 && N <= 32 && K <= 16 && K % (at == WmmaType::TF32 ? 4 : 8) == 0;
+      if (tc) {
+        const bool acc16 = op.ctype == WmmaType::F16 && op.dtype == WmmaType::F16;
+        vgpu::exec::tc86::mma(M, N, K, at == WmmaType::TF32 ? 4 : 8, at == WmmaType::F16 ? vgpu::exec::tc86::kEminF16 : vgpu::exec::tc86::kEminWide, acc16, A, K, B, N, C, N, D, N);
+      } else {
+        simd::kernels().tile_f32(M, N, K, A, B, C, N, D, N);
+      }
+      if (op.dtype == WmmaType::F16) {
+        alignas(32) uint16_t halves[1024];
+        simd::kernels().f32_to_f16(D, halves, M * N);
+        for (uint32_t i = 0; i < M * N; ++i) dbits[i] = D[i] != D[i] ? kCanonicalNaN16 : halves[i];   // (a NaN is the canonical 0x7fff)
+      } else {
+        for (uint32_t i = 0; i < M * N; ++i) dbits[i] = D[i] != D[i] ? 0x7fffffffu : std::bit_cast<uint32_t>(D[i]);
+      }
+    }
+    // D into its fragment, by the slot map.
+    const uint32_t per_reg = gd.reg_bits / gd.bits, size = M * N;
+    const uint64_t mask = gd.bits == 64 ? ~0ull : (1ull << gd.bits) - 1, per_lane = uint64_t{gd.regs} * per_reg;
+    const bool pow2 = (size & (size - 1)) == 0;
+    for (uint32_t reg = 0; reg < gd.regs; ++reg) {
+      uint64_t packed[32];
+      for (uint32_t lane = 0; lane < 32; ++lane) {
+        const uint64_t lin = uint64_t{lane} * per_lane + uint64_t{reg} * per_reg;
+        uint32_t idx = static_cast<uint32_t>(pow2 ? (lin & (size - 1)) : lin % size);
+        uint64_t p = 0;
+        for (uint32_t e = 0; e < per_reg; ++e) {
+          p |= (dbits[idx] & mask) << (e * gd.bits);
+          if (++idx == size) idx = 0;
+        }
+        packed[lane] = p;
+      }
+      if (gd.reg_bits == 32) {
+        uint32_t words[32];
+        for (uint32_t lane = 0; lane < 32; ++lane) words[lane] = static_cast<uint32_t>(packed[lane]);
+        scatter_words(w, op.d[reg], m, words, false);
+      } else {
+        Lanes r{};
+        for (uint32_t lane = 0; lane < 32; ++lane) r[lane] = packed[lane];
+        write_reg(w, op.d[reg], m, r, gd.reg_bits);
+      }
+    }
+    return true;
+  }
+
   void exec_wmma_mma_generic(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpWmmaMma& op, Mask m) {
+    if (fast_enabled_ && simd::enabled() && wmma_generic_fast(w, ctx, ins, op, m)) return;
     const uint32_t M = op.shape.m, N = op.shape.n, K = op.shape.k;
     std::vector<double> A, B, C;
     const bool legacy_ab = op.shape == WmmaShape{16, 16, 16} &&
