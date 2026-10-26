@@ -610,10 +610,9 @@ __attribute__((target("avx2"))) inline bool mma_avx2_chunked_f(unsigned M, unsig
   constexpr unsigned kMaxM = 32, kMaxN = 32, kMaxK = 16;
   alignas(32) float bf[kMaxK * kMaxN];
   alignas(32) int32_t bterm[kMaxK * kMaxN];
-  uint8_t colmask[4][kMaxN / 8] = {};
+  unsigned any_nonfin = 0;   // an infinity or a NaN anywhere: the integer kernel takes the call
   alignas(32) float af[kMaxM * kMaxK + 8];
   alignas(32) int32_t aterm[kMaxM * kMaxK + 8];
-  uint8_t row_special[kMaxM];
   const __m256i zero = _mm256_setzero_si256(), c255 = _mm256_set1_epi32(255), cff = _mm256_set1_epi32(0xff), c7fffff = _mm256_set1_epi32(0x7fffff),
                 one = _mm256_set1_epi32(1), c25 = _mm256_set1_epi32(25), c127 = _mm256_set1_epi32(127), c150 = _mm256_set1_epi32(150),
                 cnoterm = _mm256_set1_epi32(kNoTerm), cemin = _mm256_set1_epi32(emin), cmask = _mm256_set1_epi32(static_cast<int>(0xffffe000u));
@@ -638,22 +637,16 @@ __attribute__((target("avx2"))) inline bool mma_avx2_chunked_f(unsigned M, unsig
   int sm_x = 0, sm_n = 255;   // the tail's exponent fields, for A
   bool tail_sub = false;
   for (unsigned i = 0; i < M; ++i) {
-    uint8_t bits = 0;
     unsigned k = 0;
     for (; k + 8 <= K; k += 8) {
       const unsigned nf = decode8(A + i * lda + k, 1, &af[i * K + k], &aterm[i * K + k], amx, amn);
-      if constexpr (NC == 8) {
-        if (nf) bits |= static_cast<uint8_t>(1u << (k / 8));
-      } else {   // (NC == 4: the low and the high four lanes are two chunks)
-        if (nf & 0xfu) bits |= static_cast<uint8_t>(1u << (k / 4));
-        if (nf >> 4) bits |= static_cast<uint8_t>(1u << (k / 4 + 1));
-      }
+      any_nonfin |= nf;
     }
     for (; k < K; ++k) {
       const uint32_t b = std::bit_cast<uint32_t>(A[i * lda + k]);
       const uint32_t e = (b >> 23) & 0xffu, mb = b & 0xffffe000u;
       af[i * K + k] = std::bit_cast<float>(mb);
-      if (e == 255) bits |= static_cast<uint8_t>(1u << (k / NC));
+      if (e == 255) any_nonfin = 1;
       const bool dead = e == 0 || e == 255;
       if (e == 0 && (mb & 0x7fffffu)) tail_sub = true;
       aterm[i * K + k] = dead ? kNoTerm : std::max(static_cast<int32_t>(e) - 127, emin) + 1;
@@ -662,13 +655,12 @@ __attribute__((target("avx2"))) inline bool mma_avx2_chunked_f(unsigned M, unsig
         sm_n = std::min(sm_n, static_cast<int>(e));
       }
     }
-    row_special[i] = bits;
   }
   for (unsigned jb = 0; jb < N / 8; ++jb)
     for (unsigned k0 = 0; k0 < K; k0 += NC) {
       unsigned nf = 0;
       for (unsigned k = k0; k < k0 + NC; ++k) nf |= decode8(B + k * ldb + jb * 8, 0, &bf[k * N + jb * 8], &bterm[k * N + jb * 8], bmx, bmn);
-      colmask[(k0 / NC) & 3][jb & 3] = static_cast<uint8_t>(nf);   // (kMaxK / 4 chunks and kMaxN / 8 blocks at most)
+      any_nonfin |= nf;
     }
   // The reductions of the exponent vectors, through memory.
   const auto hmax = [](__m256i v) __attribute__((target("avx2"))) {
@@ -676,7 +668,7 @@ __attribute__((target("avx2"))) inline bool mma_avx2_chunked_f(unsigned M, unsig
     _mm256_store_si256(reinterpret_cast<__m256i*>(t), v);
     return *std::max_element(t, t + 8);
   };
-  if (tail_sub || !_mm256_testz_si256(subn, subn)) return false;
+  if (any_nonfin || tail_sub || !_mm256_testz_si256(subn, subn)) return false;
   const auto hminu = [](__m256i v) __attribute__((target("avx2"))) {
     alignas(32) uint32_t t[8];
     _mm256_store_si256(reinterpret_cast<__m256i*>(t), v);
@@ -703,9 +695,6 @@ __attribute__((target("avx2"))) inline bool mma_avx2_chunked_f(unsigned M, unsig
     const float* const afl = af;
     const float* const bfl = bf;
     const int emin_l = emin;
-    uint8_t rs[R];
-    VGPU_TC86_UNROLL
-    for (unsigned r = 0; r < R; ++r) rs[r] = row_special[i0 + r];
     for (unsigned jb = 0; jb < nb; ++jb) {
       __m256i accb[R];
       VGPU_TC86_UNROLL
@@ -764,8 +753,7 @@ __attribute__((target("avx2"))) inline bool mma_avx2_chunked_f(unsigned M, unsig
         VGPU_TC86_UNROLL
         for (unsigned r = 0; r < R; ++r) {
           const unsigned redo = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_andnot_si256(inrange[r], snz[r]))));
-          const unsigned special = ((rs[r] >> c) & 1 ? 0xffu : 0u) | colmask[c][jb] |
-                                   static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(acc_nonfin[r])));
+          const unsigned special = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(acc_nonfin[r])));
           const unsigned bad = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(badg[r])));
           if (__builtin_expect(redo | special | bad, 0)) {
             const unsigned i = i0 + r;

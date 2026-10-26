@@ -268,6 +268,25 @@ VTEST(float_product_kernel_edges_equal_the_frozen_form) {
       for (size_t e = 0; e < D0.size(); ++e)
         if (bits(D0[e]) != bits(D1[e])) throw vtest::Failure("a float subnormal operand: result differs from the frozen form");
     }
+  // tf32 words with their low 13 bits set (the tensor core ignores them), in the shapes whose K is not a multiple of eight: the tail of the
+  // decode, and an infinity or a NaN among moderate operands (which sends the call to the integer kernel).
+  for (unsigned K : {4u, 12u})
+    for (int special = 0; special < 3; ++special)
+      for (int rep = 0; rep < 6; ++rep) {
+        const unsigned M = 16, N = 8;
+        std::vector<float> A(M * K), B(K * N), C(M * N), D0(M * N), D1(M * N), D2(M * N);
+        for (float& x : A) x = f((g.u() & 0x80000000u) | ((120u + g.u() % 10) << 23) | (g.u() & 0x7fffffu));
+        for (float& x : B) x = f((g.u() & 0x80000000u) | ((120u + g.u() % 10) << 23) | (g.u() & 0x7fffffu));
+        for (float& x : C) x = f((g.u() & 0x80000000u) | ((100u + g.u() % 40) << 23) | (g.u() & 0x7fffffu));
+        if (special == 1) A[g.u() % A.size()] = f(0x7f800000u);
+        if (special == 2) B[g.u() % B.size()] = f(0x7fc00000u);
+        old::mma(M, N, K, 4, now::kEminWide, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
+        now::mma(M, N, K, 4, now::kEminWide, false, A.data(), K, B.data(), N, C.data(), N, D1.data(), N);
+        const bool took = now::mma_avx2_chunked_f<4, false>(M, N, K, now::kEminWide, A.data(), K, B.data(), N, C.data(), N, D2.data(), N);
+        if (took == (special != 0)) throw vtest::Failure("tf32 tail shape: the float kernel " + std::string(took ? "took" : "declined") + " a call with" + (special ? "" : "out") + " an infinity or a NaN");
+        for (size_t e = 0; e < D0.size(); ++e)
+          if (bits(D0[e]) != bits(D1[e]) || (took && bits(D0[e]) != bits(D2[e]))) throw vtest::Failure("tf32 tail shape K " + std::to_string(K) + ": result differs from the frozen form");
+      }
   std::printf("  %ld calls taken by the float kernel, %ld declined, %ld elements compared bit for bit\n", taken, declined, elements);
   VCHECK(taken > 40);
   VCHECK(declined > 40);
