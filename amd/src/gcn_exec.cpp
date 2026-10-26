@@ -11356,6 +11356,22 @@ struct Machine {
       }
     }
   }
+  // The double-precision forms: two registers a value. A's run of K (a lane's own values, consecutive in its row of the tile) and B's
+  // columns (four lanes' consecutive) are put together a row of 64 lanes at a time.
+  void matrix_decode_f64_a(const MatrixFast& f, double* ap) {
+    const MatrixPlan& plan = *f.plan;
+    alignas(32) double t[kLanes];
+    for (uint32_t e = 0; e < plan.per_lane; ++e) {
+      run_words_to_f64(t, f.a.rows[2 * e], f.a.rows[2 * e + 1], kLanes);
+      for (uint32_t lane = 0; lane < kLanes; ++lane) ap[plan.a_dst[lane] + e] = t[lane];
+    }
+  }
+  void matrix_decode_f64_b(const MatrixFast& f, double* bp) {
+    const MatrixPlan& plan = *f.plan;
+    for (uint32_t e = 0; e < plan.per_lane; ++e)
+      for (uint32_t lane = 0; lane < kLanes; lane += 4)
+        run_words_to_f64(bp + plan.b_dst[lane] + size_t{e} * f.s->n, f.b.rows[2 * e] + lane, f.b.rows[2 * e + 1] + lane, 4);
+  }
   // Calls f(tag) with the element type as a template argument.
   template <typename F>
   static bool matrix_by_type(char t, F&& f) {
@@ -11536,10 +11552,14 @@ struct Machine {
     plan.fa.resize(asz), plan.fbk.resize(bsz), plan.fc.resize(tile_c), plan.fo.resize(tile_c);
     const bool a_identity = !in.a_bcast_size;
     bool ok = true;
-    if (sparse || in.scaled || !a_identity ||
+    if (ta == 'd' && !sparse && !in.scaled && a_identity)
+      matrix_decode_f64_a(f, plan.fa.data());
+    else if (sparse || in.scaled || !a_identity ||
         !matrix_wide_type(ta, [&](auto tag) { matrix_decode_wide<decltype(tag)::value>(f.a, plan.a_dst, 1, per_lane, plan.fa.data()); }))
       ok = matrix_by_type(ta, [&](auto tag) { matrix_decode_a<decltype(tag)::value, double>(f, plan.fa.data()); });
-    if (f.b_split || in.scaled || f.b_perm ||
+    if (tb == 'd' && !f.b_split && !in.scaled && !f.b_perm && plan.b_run)
+      matrix_decode_f64_b(f, plan.fbk.data());
+    else if (f.b_split || in.scaled || f.b_perm ||
         !matrix_wide_type(tb, [&](auto tag) {
           if (plan.b_run) matrix_decode_wide<decltype(tag)::value, true>(f.b, plan.b_dst, s.n, per_lane, plan.fbk.data());
           else matrix_decode_wide<decltype(tag)::value>(f.b, plan.b_dst, s.n, per_lane, plan.fbk.data());

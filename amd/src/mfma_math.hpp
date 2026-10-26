@@ -391,6 +391,26 @@ __attribute__((target("fma"))) inline void mfma_tile_fma_hw(uint32_t m, uint32_t
       out[size_t{i} * n + j] = sum;
     }
 }
+// The same, four columns to an instruction (n a multiple of 4): a fused multiply-add is exact, so the width cannot show in the bits.
+__attribute__((target("avx2,fma"))) inline void mfma_tile_fma_avx2(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk,
+                                                                  const double* c, double* out) {
+  for (uint32_t i = 0; i < m; ++i) {
+    const double* const arow = a + size_t{i} * k;
+    for (uint32_t j = 0; j < n; j += 4) {
+      __m256d sum = _mm256_loadu_pd(c + size_t{i} * n + j);
+      const double* b = bk + j;
+      if (k == 4) {   // (the double-precision matrix instructions' K: written out, as above)
+        sum = _mm256_fmadd_pd(_mm256_loadu_pd(b), _mm256_broadcast_sd(arow), sum);
+        sum = _mm256_fmadd_pd(_mm256_loadu_pd(b + n), _mm256_broadcast_sd(arow + 1), sum);
+        sum = _mm256_fmadd_pd(_mm256_loadu_pd(b + 2 * size_t{n}), _mm256_broadcast_sd(arow + 2), sum);
+        sum = _mm256_fmadd_pd(_mm256_loadu_pd(b + 3 * size_t{n}), _mm256_broadcast_sd(arow + 3), sum);
+      } else {
+        for (uint32_t t = 0; t < k; ++t, b += n) sum = _mm256_fmadd_pd(_mm256_loadu_pd(b), _mm256_broadcast_sd(arow + t), sum);
+      }
+      _mm256_storeu_pd(out + size_t{i} * n + j, sum);
+    }
+  }
+}
 inline bool mfma_have_fma() {
   static const bool have = !simd_capped_to_base() && __builtin_cpu_supports("fma");
   return have;
@@ -399,7 +419,8 @@ inline bool mfma_have_fma() {
 inline void mfma_tile_fma(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk, const double* c, double* out) {
 #if defined(__x86_64__) && defined(__GNUC__)
   if (mfma_have_fma()) {
-    mfma_tile_fma_hw(m, n, k, a, bk, c, out);
+    if (n % 4 == 0 && mfma_have_avx2()) mfma_tile_fma_avx2(m, n, k, a, bk, c, out);
+    else mfma_tile_fma_hw(m, n, k, a, bk, c, out);
   } else
 #endif
   {
