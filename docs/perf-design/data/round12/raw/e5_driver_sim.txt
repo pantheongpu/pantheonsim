@@ -1,0 +1,9 @@
+module_load+getfunction_us 291.4
+cuLaunchKernel+sync_us 3.61
+cuLaunchKernel_pipelined_us 3.22
+cuMemAlloc_1MiB_us 0.95
+cuMemFree_1MiB_us 1.22
+cuMemAddressReserve(fixed hint) -> CUDA_ERROR_NOT_SUPPORTED
+copy 4096 B: H2D_us 0.3 D2H_us 0.3
+copy 1048576 B: H2D_us 44.9 D2H_us 28.7
+copy 67108864 B: H2D_us 6564.6 D2H_us 6522.1

@@ -4152,8 +4152,9 @@ are therefore much larger than the cycle counts, which are given beside them.
 * **Profiling core** (`include/vgpu/profiling.hpp`, `src/core/profiling.cpp`). The thread-locals are one struct (`ThreadApi`), constant-initialized
   (otherwise every access asks whether the thread's `__tls_init` has run) and found once per call (`ApiCall` keeps the pointer: its destructor
   and `silenced()` do not look it up again). `ApiCall`'s work for a call somebody listens to, or that has arguments noted, is out of line
-  (`begin`, `end`); for the others the constructor is a dozen instructions. `enabled()` and `hooked()` are inline loads of exported flags
-  (`detail::g_on`, `g_hooked`; the CUPTI shim still shares the runtime's, as it shared its functions). `note_context_made()` reads before it exchanges.
+  (`begin`, `end`); for the others the constructor is a dozen instructions. `ApiCall`'s constructor reads the two flags directly (they are the file's own; `enabled()` and `hooked()` stay exported
+  functions: a flag in the header, inline or hidden, is one object for each library, and the CUPTI shim's markers and the driver's records read one nobody set;
+  `test_cupti_activity_flags`). `note_context_made()` reads before it exchanges.
 * **Runtime and driver** (`nvidia/src/runtime_api.cpp`, `driver_api.cpp`). The arguments of a call are copied into `KeptArgs` only when a recorder
   or subscriber is on (an `optional` in the frame). `capture_unsafe_gate()` (every allocation, copy and launch) reads an atomic that mirrors
   `g_captures` before it takes `g_graph_mu`; the five places that change `g_captures` update it.

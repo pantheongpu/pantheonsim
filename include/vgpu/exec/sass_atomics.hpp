@@ -105,4 +105,14 @@ inline Step step_for(unsigned op, unsigned type, bool cas) {
   }
 }
 
+// Whether a warp's atomics may be batched: none of the distinct addresses can be in memory the host maps (managed, pinned, IPC), whose atomics
+// are the CPU's own and need no stripe lock. Asked before any lock is taken: a batch that locked 26 stripes and then declined cost TSan a
+// multiple of the per-lane path. `mem.host_map_possible` is a range test without a lock.
+template <class Mem>
+inline bool batchable(const Mem& mem, const uint64_t* addrs, unsigned count) {
+  for (unsigned i = 0; i < count; ++i)
+    if (mem.host_map_possible(addrs[i])) return false;
+  return true;
+}
+
 }  // namespace vgpu::exec::sassatom

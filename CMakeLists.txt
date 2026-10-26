@@ -1226,7 +1226,7 @@ else()
 endif()
 
 # CLI
-add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/ncu.cpp
+add_executable(vgpu_cli src/cli/main.cpp src/cli/demo.cpp src/cli/smi.cpp src/cli/serve.cpp src/cli/shell.cpp src/cli/run.cpp src/cli/debug.cpp src/cli/test.cpp src/cli/check.cpp src/cli/ncu.cpp
                src/cli/fault.cpp src/cli/amdsmi.cpp src/cli/regs.cpp src/cli/lspci.cpp
                src/cli/config.cpp src/cli/config_cmd.cpp)
 target_link_libraries(vgpu_cli PRIVATE vgpu)
@@ -1265,6 +1265,8 @@ function(vgpu_unit_test name)
 endfunction()
 
 vgpu_unit_test(test_yamlish)
+vgpu_unit_test(test_check_compare)
+target_include_directories(test_check_compare PRIVATE src/cli)
 vgpu_unit_test(test_profile)
 # What every shim call does around its body: ApiCall's reports, depth and argument hand-over, the inline flags.
 vgpu_unit_test(test_profiling_api)
@@ -1428,6 +1430,9 @@ target_include_directories(test_tier PRIVATE src)
 # Tier 2 (src/sass/jit.hpp), milestone 1: the generator, the cache and its verification, the failure modes, discovery, promotion.
 vgpu_unit_test(test_jit)
 target_include_directories(test_jit PRIVATE src)
+# Tier 2, round 14: the share rule (a section whose regions are a small part of its work is declined and runs on the plain loop).
+vgpu_unit_test(test_jit_share)
+target_include_directories(test_jit_share PRIVATE src)
 # Register residence of the generated code against the register-file code, on random regions (VGPU_JIT_RANDOM_UNITS=<n> for more).
 vgpu_unit_test(test_jit_resid)
 target_include_directories(test_jit_resid PRIVATE src)
@@ -2183,6 +2188,9 @@ set_tests_properties(amd_session PROPERTIES DEPENDS vgpu_cli
 add_test(NAME test_matrix_exit COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_test_matrix.sh)
 set_tests_properties(test_matrix_exit PROPERTIES DEPENDS vgpu_cli
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
+add_test(NAME check_exit COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_check.sh)
+set_tests_properties(check_exit PROPERTIES DEPENDS vgpu_cli
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 300)
 add_test(NAME nvml_api COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_nvml_api.sh)
 set_tests_properties(nvml_api PROPERTIES ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}" TIMEOUT 120)
 # NVML and nvidia-smi as health and diagnostic tools use them: ECC counts,
@@ -2299,6 +2307,26 @@ if(TARGET vgpucudart)
   target_include_directories(test_runtime_capture_gate PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_runtime_capture_gate COMMAND test_runtime_capture_gate)
   set_tests_properties(test_runtime_capture_gate PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
+# Enum parameters that carry values the enum does not declare: answered with an error code, never loaded as the enum.
+if(TARGET vgpucudart AND TARGET vgpucuda)
+  add_executable(test_api_enum_args nvidia/tests/unit/test_api_enum_args.cpp)
+  target_link_libraries(test_api_enum_args PRIVATE vgpucuda vgpucudart)
+  target_link_options(test_api_enum_args PRIVATE -Wl,--no-as-needed)
+  target_include_directories(test_api_enum_args PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_api_enum_args COMMAND test_api_enum_args)
+  set_tests_properties(test_api_enum_args PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
+endif()
+# Activity records with no callback asked for, from the runtime, the driver and the CUPTI shim, loaded together.
+if(TARGET vgpucudart AND TARGET vgpucuda AND TARGET vgpucupti)
+  add_executable(test_cupti_activity_flags nvidia/tests/unit/test_cupti_activity_flags.cpp)
+  target_link_libraries(test_cupti_activity_flags PRIVATE vgpucupti vgpucuda vgpucudart)
+  target_link_options(test_cupti_activity_flags PRIVATE -Wl,--no-as-needed)
+  target_include_directories(test_cupti_activity_flags PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_cupti_activity_flags COMMAND test_cupti_activity_flags)
+  set_tests_properties(test_cupti_activity_flags PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
 # The driver's stream-ordered memory pools (cuMemPool*, cuMemAllocFromPoolAsync).

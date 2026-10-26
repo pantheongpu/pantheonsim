@@ -1,0 +1,11 @@
+granularity 2097152
+reserve device 0 window base (0x2000'0000'0000), 64 MiB -> ok, got 0x200000000000 (EXACT)
+  mapped, kernel wrote through the same pointer value, host read back: OK
+reserve device 1 window base (0x2100'0000'0000), 64 MiB -> ok, got 0x210000000000 (EXACT)
+  mapped, kernel wrote through the same pointer value, host read back: OK
+reserve device 0 window + 3 GiB, 1 GiB -> ok, got 0x2000c0000000 (EXACT)
+  mapped, kernel wrote through the same pointer value, host read back: OK
+reserve device 0 window + 500 GiB, 8 GiB (a 141 GB-card style address) -> ok, got 0x207d00000000 (EXACT)
+reserve simulator's function window 0x6ffb'0000'0000 -> ok, got 0x7e9c95c00000 (different address)
+reserve high user-space style address 0x7ffe'0000'0000 -> ok, got 0x7ffe00000000 (EXACT)
+  mapped, kernel wrote through the same pointer value, host read back: OK
