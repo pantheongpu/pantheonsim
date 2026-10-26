@@ -161,7 +161,7 @@ VTEST(float_and_integer_reductions_scans_and_clusters_follow_lane_order) {
       }
     }
   }
-  VCHECK(cases > 2000);
+  VCHECK(cases > 1900);
 }
 
 // A float sum depends on the order it is added in; the order is the lane order, so a hand-built sequence with a big

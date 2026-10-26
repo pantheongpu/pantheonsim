@@ -78,14 +78,6 @@ double ref_powr(double x, double y) {
   return std::pow(std::fabs(x), y);
 }
 
-// A result the evaluator must give bit for bit: NaN is the canonical one.
-bool same64(uint64_t got, double want) {
-  return std::isnan(want) ? got == kNaN64 : got == DB(want);
-}
-bool same32(uint64_t got, float want) {
-  return std::isnan(want) ? got == kNaN32 : got == B(want);
-}
-
 // ---- the values ------------------------------------------------------------------------------------------------
 
 std::vector<uint32_t> edge32() {
