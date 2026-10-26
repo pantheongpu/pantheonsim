@@ -460,12 +460,8 @@ namespace {
 // table whose F16C entries make the one-time check; see kAvx2Lazy).
 const bool g_init = [] {
 #ifdef VGPU_SIMD_X86
-<<<<<<< HEAD
-  if (level() == Level::Avx2) detail::g_kernels.store(&kAvx2Lazy, std::memory_order_release);
-  testing::use_sector_window_kernel(true);
-=======
   if (level() == Level::Avx2) detail::g_kernels.store(&lazy_table(), std::memory_order_release);
->>>>>>> sp3-tensor2
+  testing::use_sector_window_kernel(true);
 #endif
   const char* v = std::getenv("VGPU_SIMD");
   detail::g_enabled = !(v && std::strcmp(v, "off") == 0);
