@@ -2271,13 +2271,14 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
                                                : (d.layers ? "layered" : "neither layered nor a cubemap")));
   // The descriptor is copied only when this fetch changes something in it -- the offsets, the layer, a cube face, a
   // mip level; copying its 300 bytes was a tenth of the time of a plain fetch. `lp` is what those changes are
-  // made in, and `v` reads whichever applies. (It is copy-constructed in place: a default-constructed descriptor
-  // would be zeroed first, which was a tenth of the time of a plain fetch again.)
+  // made in, and `v` reads whichever applies. (It is copy-constructed in place in raw storage: a default-constructed
+  // descriptor, or the storage of a std::optional, is zeroed first, which was a tenth of the time of a plain fetch.)
   const bool offsets_differ = d.fetch_offset[0] != f.offset[0] || d.fetch_offset[1] != f.offset[1] ||
                               d.fetch_offset[2] != f.offset[2];
   const bool changes = !g_fast_path.load(std::memory_order_relaxed) || offsets_differ || indexed || cube || d.mip_levels;
-  std::optional<TextureDesc> local;
-  TextureDesc* const lp = changes ? &local.emplace(d) : nullptr;
+  static_assert(std::is_trivially_destructible_v<TextureDesc>);
+  alignas(TextureDesc) unsigned char local[sizeof(TextureDesc)];   // (std::optional zeroes its storage first)
+  TextureDesc* const lp = changes ? new (local) TextureDesc(d) : nullptr;
   if (changes)
     for (int i = 0; i < 3; ++i) lp->fetch_offset[i] = f.offset[i];
   const TextureDesc& v = changes ? *lp : d;
