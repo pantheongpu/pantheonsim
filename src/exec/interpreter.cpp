@@ -1074,6 +1074,43 @@ __attribute__((target("fma"))) void fma_lanes_f64_hw(uint64_t* d, const uint64_t
     if (r != r && (x != x || y != y || z != z)) d[l] = (y != y ? b[l] : z != z ? c[l] : a[l]) | 0x0008000000000000ull;
   });
 }
+// The same four lanes at a time (a 32-lane warp: eight steps), on a host with AVX2 at the level in use (VGPU_SIMD=base
+// and off keep the loop above): the fused multiply-add is correctly rounded, so a vector fma gives each lane's bits. A
+// group with a NaN result -- whose operands may be NaNs, which the rule above picks from -- is run lane by lane, and
+// an inactive lane is read (the arrays hold all lanes) but never written.
+__attribute__((target("avx2,fma"))) void fma_lanes_f64_avx2(uint64_t* d, const uint64_t* a, const uint64_t* b,
+                                                            const uint64_t* c, Mask m, uint32_t width) {
+  const __m256i lane_bit = _mm256_set_epi64x(8, 4, 2, 1);
+  for (uint32_t l = 0; l < width; l += 4) {
+    const unsigned nib = static_cast<unsigned>(m >> l) & 15u;
+    if (!nib) continue;
+    const __m256d r = _mm256_fmadd_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(a + l)),
+                                      _mm256_loadu_pd(reinterpret_cast<const double*>(b + l)),
+                                      _mm256_loadu_pd(reinterpret_cast<const double*>(c + l)));
+    if (_mm256_movemask_pd(_mm256_cmp_pd(r, r, _CMP_UNORD_Q))) {
+      for (uint32_t k = l; k < l + 4; ++k) {
+        if (!(m >> k & 1)) continue;
+        double x, y, z;
+        std::memcpy(&x, &a[k], 8);
+        std::memcpy(&y, &b[k], 8);
+        std::memcpy(&z, &c[k], 8);
+        const double v = __builtin_fma(x, y, z);
+        std::memcpy(&d[k], &v, 8);
+        if (v != v && (x != x || y != y || z != z)) d[k] = (y != y ? b[k] : z != z ? c[k] : a[k]) | 0x0008000000000000ull;
+      }
+    } else if (nib == 15u) {
+      _mm256_storeu_pd(reinterpret_cast<double*>(d + l), r);
+    } else {
+      const __m256i on = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_set1_epi64x(nib), lane_bit), lane_bit);
+      _mm256_maskstore_pd(reinterpret_cast<double*>(d + l), on, r);
+    }
+  }
+}
+const bool g_avx2_f64 = simd::level() == simd::Level::Avx2;
+inline void fma_lanes_f64_best(uint64_t* d, const uint64_t* a, const uint64_t* b, const uint64_t* c, Mask m, uint32_t width) {
+  if (g_avx2_f64 && (width & 3) == 0 && simd::enabled()) fma_lanes_f64_avx2(d, a, b, c, m, width);
+  else fma_lanes_f64_hw(d, a, b, c, m, width);
+}
 // fma.f16x2 lanes on the FMA unit, with the decode and the rounding inlined:
 // the same double fma and double_to_f16 as the general path, without two
 // calls per half.
@@ -1823,18 +1860,20 @@ inline int ilogb_exact(double x) {
 
 // One texel's share of a filtered fetch, in 1/256ths: all the terms of a
 // fetch sum to 256. A border term reads the border colour.
+// (No member initializers: a fetch makes up to 16 of these, and the footprint functions set every member of the
+// ones they return -- zeroing 8 of them first was a visible part of a plain linear fetch.)
 struct TexTerm {
-  int w = 0;
-  uint64_t addr = 0;
+  int w;
+  uint64_t addr;
   // The texel's place, and the texture it is a texel of (a mip level of the fetched one): what a
   // block-compressed texel is found by.
-  uint32_t x = 0, y = 0, z = 0;
-  const TextureDesc* src = nullptr;
-  bool border = false;
+  uint32_t x, y, z;
+  const TextureDesc* src;
+  bool border;
   // Which 2x2 footprint the texel belongs to -- a 3D fetch's z-slice, a mip
   // blend's level -- since the float blend aligns each on its own (see
   // tex_finish).
-  int group = 0;
+  int group;
 };
 
 void tex_check_filterable(const TextureDesc& d) {
@@ -1919,7 +1958,7 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
     t.group = off[2];
     t.src = &d;
     t.x = idx[0], t.y = idx[1], t.z = idx[2];
-    if (inside) t.addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
+    t.addr = inside ? d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes : 0;
   }
   return n;
 }
@@ -1940,6 +1979,7 @@ int tex_footprint_point(const TextureDesc& d, uint32_t dims, const float coord[3
   const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
   const uint64_t plane = row * (d.height ? d.height : 1);
   out[0].w = total;
+  out[0].group = 0;
   out[0].border = !inside;
   out[0].src = &d;
   out[0].x = idx[0], out[0].y = idx[1], out[0].z = idx[2];
@@ -1958,14 +1998,40 @@ uint32_t unorm16(uint64_t raw, uint32_t bits) {
   return v;
 }
 
+// A filtered fetch that reads one texel with the whole weight (a linear fetch at a texel's centre, where every other
+// term's weight is 0) of a plain float texture whose channels are all 32 bits: the blend below of one value `t` is exactly
+// t (each 24-bit value is its own truncation to 2^(E-27), the sum of 256 t is exact and its 8-bit shift too), so a finite
+// texel comes out as it is, a subnormal one as zero of its sign (the flush of the load, which a zero then keeps, a negative
+// one by the all-negative-zero rule), an infinity as it is and a NaN as the filter's own, 0x7FFFFFFF. False, with nothing
+// written, for any other format or a texel the memory manager would not hand over in one lookup.
+bool tex_finish_one_f32(const MemoryManager& mem, const TextureDesc& d, const TexTerm& t, uint32_t out[4]) {
+  if (d.kind != ChannelKind::Float || d.block != BlockFormat::None || d.packed_1010102 || t.border) return false;
+  const TextureDesc& at = t.src ? *t.src : d;
+  uint32_t need = 0;
+  for (uint32_t ch = 0; ch < 4; ++ch) {
+    if (d.channel_bits[ch] != 0 && d.channel_bits[ch] != 32) return false;
+    need |= d.channel_bits[ch] ? 1u << ch : 0u;
+  }
+  uint64_t pre[4];
+  if (!texel_channels(mem, at, need, t.addr, pre)) return false;
+  for (uint32_t ch = 0; ch < 4; ++ch) {
+    if (!d.channel_bits[ch]) { out[ch] = 0; continue; }
+    const uint32_t u = static_cast<uint32_t>(pre[ch]);
+    const uint32_t mag = u & 0x7FFFFFFFu;
+    out[ch] = mag > 0x7F800000u ? 0x7FFFFFFFu : mag < 0x00800000u ? (u & 0x80000000u) : u;
+  }
+  return true;
+}
+
 // Sums weight x texel over the terms and rounds, by the format's rules.
 void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint32_t out[4]) {
   const bool fast = g_fast_path.load(std::memory_order_relaxed);
+  if (fast && n == 1 && terms[0].w == 256 && tex_finish_one_f32(mem, d, terms[0], out)) return;
   const bool is_float = d.kind == ChannelKind::Float;
   const bool unorm = d.kind == ChannelKind::Unsigned;
   int64_t isum[4] = {0, 0, 0, 0};
   double fv[4][16];
-  uint32_t codes[4][16] = {};
+  uint32_t codes[4][16];   // (the sRGB channels' codes: set for every term with a weight, the only ones read)
   uint32_t need = 0;
   for (uint32_t ch = 0; ch < 4; ++ch) need |= d.channel_bits[ch] ? 1u << ch : 0u;
   for (int k = 0; k < n; ++k) {
@@ -2204,17 +2270,17 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
                                     (d.cubemap ? (d.layers ? "a layered cubemap" : "a cubemap")
                                                : (d.layers ? "layered" : "neither layered nor a cubemap")));
   // The descriptor is copied only when this fetch changes something in it -- the offsets, the layer, a cube face, a
-  // mip level; copying its 300 bytes was a tenth of the time of a plain fetch. `local` is what those changes are
-  // made in, and `v` reads whichever applies.
+  // mip level; copying its 300 bytes was a tenth of the time of a plain fetch. `lp` is what those changes are
+  // made in, and `v` reads whichever applies. (It is copy-constructed in place: a default-constructed descriptor
+  // would be zeroed first, which was a tenth of the time of a plain fetch again.)
   const bool offsets_differ = d.fetch_offset[0] != f.offset[0] || d.fetch_offset[1] != f.offset[1] ||
                               d.fetch_offset[2] != f.offset[2];
   const bool changes = !g_fast_path.load(std::memory_order_relaxed) || offsets_differ || indexed || cube || d.mip_levels;
-  TextureDesc local;
-  if (changes) {
-    local = d;
-    for (int i = 0; i < 3; ++i) local.fetch_offset[i] = f.offset[i];
-  }
-  const TextureDesc& v = changes ? local : d;
+  std::optional<TextureDesc> local;
+  TextureDesc* const lp = changes ? &local.emplace(d) : nullptr;
+  if (changes)
+    for (int i = 0; i < 3; ++i) lp->fetch_offset[i] = f.offset[i];
+  const TextureDesc& v = changes ? *lp : d;
   uint32_t dims = f.dims;
   bool true_1d = false;
   float cf[3] = {0, 0, 0};
@@ -2225,12 +2291,12 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
   }
   if (indexed) {
     const uint64_t layer = std::min<uint64_t>(f.layer, d.layers - 1);
-    local.base += layer * (cube ? 6 : 1) * tex_slice_bytes(d);
-    local.mip_slice += static_cast<uint32_t>(layer * (cube ? 6 : 1));
-    local.layers = 0;
+    lp->base += layer * (cube ? 6 : 1) * tex_slice_bytes(d);
+    lp->mip_slice += static_cast<uint32_t>(layer * (cube ? 6 : 1));
+    lp->layers = 0;
     if (f.dims == 1 && !cube) {
       true_1d = true;   // a layer of a 1D layered texture filters as 1D
-      local.height = 0;
+      lp->height = 0;
     }
   }
   if (cube) {
@@ -2241,17 +2307,17 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
     if (az >= ax && az >= ay) { face = z >= 0 ? 4 : 5; sc = z >= 0 ? x : -x; tc = -y; ma = az; }
     else if (ay >= ax) { face = y >= 0 ? 2 : 3; sc = x; tc = y >= 0 ? z : -z; ma = ay; }
     else { face = x >= 0 ? 0 : 1; sc = x >= 0 ? -z : z; tc = -y; ma = ax; }
-    local.base += static_cast<uint64_t>(face) * tex_slice_bytes(d);
-    local.mip_slice += static_cast<uint32_t>(face);
-    local.cubemap = false;
-    local.normalized_coords = true;
+    lp->base += static_cast<uint64_t>(face) * tex_slice_bytes(d);
+    lp->mip_slice += static_cast<uint32_t>(face);
+    lp->cubemap = false;
+    lp->normalized_coords = true;
     // Point sampling clamps to the face whatever the address mode -- unless
     // the cubemap is mipmapped, when it applies the mode like linear
     // filtering does; linear filtering applies the mode inside the face --
     // wrap takes the texel from the face's far edge, border blends in the
     // border colour (measured).
     if (v.filter != TexFilter::Linear && !d.mip_levels && f.gather < 0)
-      for (auto& a : local.address) a = TexAddress::Clamp;
+      for (auto& a : lp->address) a = TexAddress::Clamp;
     cf[0] = (sc / ma + 1.0f) * 0.5f;
     cf[1] = (tc / ma + 1.0f) * 0.5f;
     dims = 2;
@@ -2311,9 +2377,9 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
     // without normalizedCoords wrap and mirror still act as clamp (measured:
     // x = 0.25 on an 8-wide level 0 reads texel 2).
     if (!v.normalized_coords) {
-      for (auto& a : local.address)
+      for (auto& a : lp->address)
         if (a == TexAddress::Wrap || a == TexAddress::Mirror) a = TexAddress::Clamp;
-      local.normalized_coords = true;
+      lp->normalized_coords = true;
     }
     const int32_t q = tex_mip_lod(d, f.explicit_lod, f.lod);
     if (d.mip_filter == TexFilter::Linear && (q & 255) != 0) {
@@ -2337,7 +2403,7 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
       tex_finish(mem, d, terms, n, out);
       return;
     }
-    local = tex_level(v, static_cast<uint32_t>(d.mip_filter == TexFilter::Linear ? q >> 8 : (q + 128) >> 8));
+    *lp = tex_level(v, static_cast<uint32_t>(d.mip_filter == TexFilter::Linear ? q >> 8 : (q + 128) >> 8));
   }
   // Integer coordinates name a texel, and the filter mode does not apply: an
   // RTX 3060 point-samples them even from a texture set up for linear
@@ -4191,7 +4257,7 @@ class Interpreter {
     } else {
 #if defined(__x86_64__) && defined(__GNUC__)
       if (g_hw_fma) {
-        fma_lanes_f64_hw(d, a, b, c, fm, W_);
+        fma_lanes_f64_best(d, a, b, c, fm, W_);
         w.written64[u.dst] = 1;
         return true;
       }
@@ -6364,7 +6430,7 @@ class Interpreter {
     uint64_t* d = dst64(w, op.dst.id, m);
 #if defined(__x86_64__) && defined(__GNUC__)
     if (g_hw_fma) {
-      fma_lanes_f64_hw(d, a.data(), b.data(), c.data(), m, W_);
+      fma_lanes_f64_best(d, a.data(), b.data(), c.data(), m, W_);
       w.written64[op.dst.id] = 1;
       return true;
     }

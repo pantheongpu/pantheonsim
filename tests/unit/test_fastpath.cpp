@@ -1342,6 +1342,103 @@ VTEST(linear_texture_fetches_match_the_general_path) {
   }
 }
 
+// Linear fetches at the centre of a texel, where one texel has the whole weight: 32-bit float texels of one to four channels
+// (every kind of value, NaNs of any payload and sign included) and half texels, in clamp, wrap, mirror and border mode,
+// normalized and not, 1D and 2D, with texel offsets, fast path against the general one.
+VTEST(linear_texture_fetches_at_texel_centres_match_the_general_path) {
+  auto set_mode = [&](const char* fp) {
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 16};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(".version 8.3\n.target sm_86\n.address_size 64\n.visible .entry k()\n{\n    ret;\n}\n");
+    LaunchConfig cfg;
+    cfg.block = {1, 1, 1};
+    exec::launch(m.entries[0], cfg, {}, mem, prof);
+  };
+  uint64_t seed = 0x1234567887654321ull;
+  auto rnd = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+  auto texel_f32 = [&]() -> uint32_t {
+    switch (rnd() % 10) {
+      case 0: return 0;
+      case 1: return 0x80000000u;
+      case 2: return static_cast<uint32_t>(rnd()) & 0x807FFFFFu;                   // zero or subnormal of either sign
+      case 3: return 0x7F800000u | (static_cast<uint32_t>(rnd()) & 0x807FFFFFu);   // infinity or a NaN, any payload and sign
+      case 4: return 0x00800000u | (static_cast<uint32_t>(rnd()) & 0x80000000u);   // the smallest normal
+      case 5: return 0x7F7FFFFFu - static_cast<uint32_t>(rnd() % 4);
+      default: return static_cast<uint32_t>(rnd());
+    }
+  };
+  struct Case { uint32_t bits, channels, w, h; exec::TexAddress addr; bool normalized; };
+  const Case cases[] = {{32, 1, 8, 8, exec::TexAddress::Clamp, false}, {32, 2, 8, 8, exec::TexAddress::Clamp, false},
+                        {32, 4, 6, 5, exec::TexAddress::Wrap, true},   {32, 1, 8, 8, exec::TexAddress::Mirror, true},
+                        {32, 1, 8, 8, exec::TexAddress::Border, false}, {32, 4, 8, 1, exec::TexAddress::Clamp, false},
+                        {16, 1, 8, 8, exec::TexAddress::Clamp, false}, {16, 4, 8, 8, exec::TexAddress::Wrap, true}};
+  for (const Case& c : cases) {
+    MemoryManager mem{1 << 20};
+    const uint32_t texel_bytes = c.bits / 8 * c.channels;
+    const uint64_t base = mem.alloc(uint64_t{c.w} * c.h * texel_bytes);
+    std::vector<uint8_t> bytes(uint64_t{c.w} * c.h * texel_bytes);
+    for (size_t i = 0; i < bytes.size(); i += c.bits / 8) {
+      if (c.bits == 32) { const uint32_t t = texel_f32(); std::memcpy(&bytes[i], &t, 4); }
+      else { const uint16_t t = static_cast<uint16_t>(rnd()); std::memcpy(&bytes[i], &t, 2); }
+    }
+    mem.write(base, bytes.data(), bytes.size());
+    exec::TextureDesc d;
+    d.base = base;
+    d.width = c.w;
+    d.height = c.h > 1 ? c.h : 0;
+    d.channels = c.channels;
+    for (uint32_t i = 0; i < 4; ++i) d.channel_bits[i] = i < c.channels ? c.bits : 0;
+    d.texel_bytes = texel_bytes;
+    d.kind = exec::ChannelKind::Float;
+    d.filter = exec::TexFilter::Linear;
+    d.normalized_coords = c.normalized;
+    for (auto& a : d.address) a = c.addr;
+    std::vector<uint32_t> coords;
+    for (int ix = -3; ix < static_cast<int>(c.w) + 3; ++ix)
+      for (int iy = -3; iy < static_cast<int>(c.h > 1 ? c.h : 1) + 3; ++iy) {
+        // The centre of texel (ix, iy): exact in a float, whether divided by the size (a power of two) or not.
+        float x = static_cast<float>(ix) + 0.5f, y = static_cast<float>(iy) + 0.5f;
+        if (c.normalized) { x /= static_cast<float>(c.w); y /= static_cast<float>(c.h); }
+        uint32_t xb, yb;
+        std::memcpy(&xb, &x, 4);
+        std::memcpy(&yb, &y, 4);
+        coords.push_back(xb);
+        coords.push_back(yb);
+      }
+    auto run = [&](const char* fp) {
+      set_mode(fp);
+      uint64_t k = 777;
+      std::vector<uint32_t> out;
+      for (size_t i = 0; i < coords.size(); i += 2) {
+        exec::TexFetch f;
+        f.dims = c.h > 1 ? 2 : 1;
+        f.coord[0] = coords[i];
+        f.coord[1] = coords[i + 1];
+        if ((i / 2) % 4 == 3) {
+          k = k * 6364136223846793005ull + 1442695040888963407ull;
+          f.offset[0] = static_cast<int32_t>((k >> 33) % 16) - 8;
+          f.offset[1] = c.h > 1 ? static_cast<int32_t>((k >> 40) % 16) - 8 : 0;
+        }
+        uint32_t r[4] = {0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu};
+        exec::texture_fetch(mem, d, f, r);
+        out.insert(out.end(), r, r + 4);
+      }
+      return out;
+    };
+    const auto fast = run("1"), slow = run("0");
+    unsetenv("VGPU_FASTPATH");
+    VCHECK_EQ(fast.size(), slow.size());
+    for (size_t i = 0; i < fast.size(); ++i)
+      if (fast[i] != slow[i]) {
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "f%u x%u %ux%u fetch %zu channel %zu: fast 0x%08x, general 0x%08x", c.bits, c.channels,
+                      c.w, c.h, i / 4, i % 4, fast[i], slow[i]);
+        throw vtest::Failure(buf);
+      }
+  }
+}
+
 // Reading the special registers every thread starts with: tid, ntid, ctaid, nctaid and the lane id, in a grid of
 // several blocks of several shapes, against the values the launch geometry gives.
 VTEST(special_registers_read_what_the_launch_geometry_says) {
@@ -2028,6 +2125,38 @@ VTEST(pre_decoded_f64_forms_match_the_general_path) {
   }
   g_guard = 0;
   (void)y2;
+}
+
+// fma.rn.f64 over random bit patterns (every exponent, so NaNs, infinities, subnormals and cancellation come up in every
+// operand position and combination), with all lanes active and under both guards (half the lanes, and the other half), as
+// the four-lanes-at-a-time form of the fast path against the general path.
+VTEST(f64_fma_random_bits_match_the_general_path) {
+  uint64_t seed = 0x9E3779B97F4A7C15ull;
+  auto rnd = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+  auto pick = [&]() -> uint64_t {
+    switch (rnd() % 8) {
+      case 0: return 0x7FF0000000000000ull | (rnd() & 0x800FFFFFFFFFFFFFull);                // inf or a NaN of any payload
+      case 1: return rnd() & 0x800FFFFFFFFFFFFFull;                                          // zero or subnormal
+      case 2: return (rnd() & 0x800FFFFFFFFFFFFFull) | (uint64_t{1022 + rnd() % 3} << 52);    // near one
+      default: return rnd();
+    }
+  };
+  for (int iter = 0; iter < 12; ++iter) {
+    std::vector<uint64_t> x(kThreads), y(kThreads), z(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+      x[i] = pick();
+      y[i] = pick();
+      z[i] = pick();
+      if (iter % 2 && i % 5) {   // mostly finite operands, so most groups of four lanes take the vector path
+        for (uint64_t* v : {&x[i], &y[i], &z[i]}) if ((*v >> 52 & 0x7FF) == 0x7FF) *v = dbits(1.25);
+      }
+    }
+    for (int guard : {1, 2, 0}) {
+      g_guard = guard;
+      same("fma.rn.f64 %D, %A, %B, %C;", true, x, y, z);
+    }
+  }
+  g_guard = 0;
 }
 
 // Which of two NaN operands an f64 add, sub, mul, min, max or fma returns follows the order ptxas gives the operands, not the order of
