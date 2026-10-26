@@ -3719,7 +3719,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       // A warp's atomics on plain global memory taken together. Each lane's is a read-modify-write under the lock of its
       // address' stripe; here the lanes' addresses are grouped (a lane that shares an address with an earlier one finds
       // what that one left, as in the loop below), the stripes involved locked in order, each distinct address loaded
-      // and stored once (MemoryManager::load_batch / store_batch, which decline, having done nothing, whenever the plain
+      // and stored once (MemoryManager::batch_window, which declines, having done nothing, whenever the plain
       // accesses could differ -- host-mapped memory among them) and the lanes applied one after another in lane order. What every
       // lane gets back and what memory holds are what the loop below gives; another host thread sees the warp's atomics as one
       // step. Anything else -- shared or local memory, host-mapped memory, misaligned addresses, vector forms -- takes the loop.
@@ -3788,7 +3788,9 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             StripeLocks locks;
             for (uint64_t sm = stripes; sm; sm &= sm - 1) locks.lock(atomic_stripe_lock(static_cast<unsigned>(std::countr_zero(sm))));
             uint64_t cur[32];
-            if (mem_.load_batch(uaddr, nu, n, cur)) {
+            MemoryManager::BatchWindow window;
+            if (mem_.batch_window(uaddr, nu, n, &window)) {   // (the checks of the load and of the store, made once)
+              mem_.batch_load(window, uaddr, nu, n, cur);
               // The lanes one after another, each finding what the lanes before it left. `step` is the value an atomic stores, given
               // the one it finds, its operand and (a CAS) the exchange value; the common operations get a loop of their own.
               const uint64_t keep = is64 ? ~uint64_t{0} : 0xffffffffull;
@@ -3816,8 +3818,8 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
                 case Step::Exch: with(exec::sassatom::ExchStep{}); break;
                 default: lanes([&](unsigned l, uint64_t old, uint64_t x, uint64_t swap) { return apply(l, old, x, swap); }); break;
               }
-              // (a store the memory declines leaves it as it was, and the loop does the lot: nothing above has an effect)
-              done = mem_.store_batch(uaddr, nu, n, cur);
+              mem_.batch_store(window, uaddr, nu, n, cur);
+              done = true;
             }
           }
           if (done) {

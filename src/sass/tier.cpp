@@ -437,6 +437,20 @@ void shfl_move(const ShflShape& sh, const uint32_t* vp, uint32_t* out) {
 }
 
 
+bool pure_register_form(Form f) {
+  switch (f) {
+    case Form::Mov: case Form::Iadd3: case Form::Iadd3x: case Form::Imad: case Form::Imad32: case Form::ImadWide: case Form::ImadHi:
+    case Form::IsetpEx: case Form::Popc: case Form::I2fp: case Form::Lop3: case Form::Lea: case Form::Shf: case Form::Isetp:
+    case Form::Fsetp: case Form::Fsel: case Form::Ffma: case Form::Fadd: case Form::Fmul: case Form::Dop: case Form::Prmt:
+    case Form::Imnmx: case Form::Fmnmx: case Form::Mufu: case Form::F2i: case Form::I2f: case Form::F2fp: case Form::Dsetp:
+    case Form::Hop2: case Form::Unary: case Form::Iabs: case Form::Umov: case Form::Uldc: case Form::Uiadd3: case Form::Uimad:
+    case Form::Uisetp: case Form::Ulea: case Form::Ulop3: case Form::Ushf: case Form::Uunary: case Form::Usel:
+      return true;
+    default:
+      return false;
+  }
+}
+
 void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
   op = MOp{};
   op.ins = &ins;

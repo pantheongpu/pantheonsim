@@ -4663,3 +4663,15 @@ now (`any_nan |= out[e] != out[e]`, the fix-up loop only if any), which has no s
 * Tests: `test_ptx_mem_runs`, `test_ptx_paths` (fast path against `VGPU_FASTPATH=0`, memory, registers, every counter, errors).
 * Results against origin/main (B/A median, 9 runs, cpu 0, counters identical): mem 1.36x, shared 1.60x, atomics 1.39x, divergent 1.20x, warp 1.06x, launch 1.17x (not a change of this branch's launch path; take as placement), int_alu/f32_fma/f64_fma/local/api same (0.99-1.04, p > 0.25).
 * Not done: a micro form for ld/st (skips step/dispatch; est. 10-20% on mem/shared), the Interpreter constructor's 6.5 KB of zeroed scratch (5% of a PTX launch), `setup_block` reuse, atomics on multi-threaded launches (still per-lane stripe locks). The "unexplained" PTX int_alu/local 0.96-0.97x residuals were not isolated.
+
+## Round sp2: the SASS tier's stretches, the group pick, LEA, the environment pass (branch `sp2-sassrest`, base origin/main 99b013a3)
+
+* **Stretches** (`MOp::run`, `tier_issue`): a run of straight, unguarded, register-only instructions (`tier::pure_register_form`) is issued back to back for the whole group: the store gate, the step count, the guard and the three counters are done once for the stretch (not under tier 2's hook loop, nor with `VGPU_TIER_STATS`). **Direct writes** (`tier_out`): the lane-by-lane kernels write a full warp's result into the destination row; the row copy of `tier_store` is gone (a partial warp still blends from a temporary).
+* **Group pick** (`sasslanes::pick_group`, `src/simd/lanes.cpp`): a converged warp is found as before; a diverged one gets its lowest address and its lanes in one AVX2 pass instead of lanes_at + lowest_pc + lanes_at.
+* **LEA** (`include/vgpu/exec/sass_lea.hpp`): four lanes to a vector, the carry in and out as masks (the 64-bit address pair of every pointer calculation).
+* **Environment**: one pass over `environ` for the seven variables a SASS launch reads (`launch_env.hpp`); read at every launch as before.
+* **Atomics**: `MemoryManager::batch_window/batch_load/batch_store` do the checks of load_batch and store_batch once; `sassatom::batchable` still runs before any stripe lock.
+
+A/B against origin/main (cpu 6, 9 alternating runs, counters identical): int_alu 1.56x, f32_fma 1.56x, warp 1.20x, local 1.15x, launch 1.10x, mem 1.10x, divergent 1.09x, f64_subnormal 1.09x, f64_fma 1.07x, atomics 1.04x; shared, api, texture same; PTX int_alu/f32_fma/mem/atomics/local/launch/api same (0.98-1.02, p > 0.1).
+
+Not done / negative: pc and wait stores in 16-byte blends (halved store-forwarding stalls, `ls_bad_status2.stli_other` 50M to 22M, but +1.3M branch misses; divergent cycles unchanged, dropped); a spin lock for the stripes (the PTX engine and host atomics share the mutexes: not changeable here); `VGPU_TRACE` getenv in launch_kernel_impl (1%) and the runtime's lockstep_mode (0.9%) are still per launch; texture (sampler in interpreter.cpp, ~450 cycles a lane-fetch, spread over fetch_texel/tex_finish/footprint) and local's `sectors_fast` (28% of `local`) not touched; f64 is dominated by the DFMA kernel (47%).

@@ -13,6 +13,7 @@
 // Every instruction completes before the next: the control bits' stall counts
 // and scoreboards are timing, which VirtualGPU does not model.
 #include "vgpu/exec/devrt.hpp"
+#include "vgpu/exec/launch_env.hpp"
 #include "vgpu/exec/lockstep.hpp"
 #include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/sass/exec.hpp"
@@ -52,6 +53,7 @@
 #include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/sass_atomics.hpp"
 #include "vgpu/exec/sass_lanes.hpp"
+#include "vgpu/exec/sass_lea.hpp"
 #include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
@@ -302,9 +304,6 @@ uint64_t sass_max_steps(uint64_t configured) {
   return v == 0 ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(v);
 }
 
-// The lanes whose program counter is `p`.
-inline Mask tier_lanes_at(const Warp& w, uint64_t p) { return exec::sasslanes::lanes_at(w.pc, p); }
-
 // ---- kernels whose blocks wait on one another (vgpu/exec/lockstep.hpp) ----------------------------
 //
 // A kernel polls global memory when it has a loop with an atomic that returns its old value, or a
@@ -408,9 +407,6 @@ bool kernel_polls(const Module& m, const CubinKernel& k) {
   return m.polling.emplace(k.name, found).first->second;
 }
 
-// The lowest address among the runnable lanes' (`first` is the first one's): the same minimum the plain loop finds.
-inline uint64_t tier_lowest_pc(const Warp& w, Mask run, uint64_t first) { return exec::sasslanes::lowest_pc(w.pc, run, first); }
-
 // A kernel's Module::KernelStatics: the module's (made by the first launch of the kernel), or, for a module that load() did not make,
 // one of the launch's own in `own`.
 std::unique_ptr<Module::KernelStatics> compute_statics(const Module& m, const CubinKernel& k) {
@@ -500,14 +496,15 @@ class Runner {
     // VGPU_FASTPATH=0 sends every instruction down the general path, as it does for the PTX interpreter: the
     // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
     // block. For checking that the fast paths compute what the general one does.
-    if (const char* f = std::getenv("VGPU_FASTPATH"); f && f[0] == '0') fast_ = false;
-    vgpu::exec::tc86::refresh_exact();   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
+    env_ = exec::read_launch_env();   // (one pass over the environment for all of the launch's variables)
+    if (const char* f = env_.fastpath; f && f[0] == '0') fast_ = false;
+    vgpu::exec::tc86::refresh_exact(env_.tc_exact);   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
     if (tier::requested()) {
-      const char* tr = std::getenv("VGPU_SASS_TRACE");
+      const char* tr = env_.sass_trace;
       tier_ = fast_ && simd::enabled() && !(tr && *tr);
-      const char* ts = std::getenv("VGPU_TIER_STATS");
+      const char* ts = env_.tier_stats;
       tier_stats_ = tier_ && ts && (ts[0] == '1' || ts[0] == '2');
-      const char* tc = std::getenv("VGPU_TIER_CHAIN");
+      const char* tc = env_.tier_chain;
       tier_chain_ = !(tc && tc[0] == '0');
     }
     ks_ = kernel_statics(m, k, own_statics_);
@@ -661,6 +658,7 @@ class Runner {
   MemoryManager& mem_;
   const DeviceProfile& profile_;
   const uint64_t max_steps_;   // the step budget of a warp (cfg_.max_steps, or VGPU_MAX_STEPS)
+  exec::LaunchEnv env_;   // the launch's environment variables, read once at its start
   bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
   // The pre-decoded tier (src/sass/tier.hpp): on unless VGPU_TIER=0, with the fast paths and the SIMD kernels it is held to on and
   // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
@@ -1209,7 +1207,7 @@ exec::LaunchStats Runner::run() {
   };
   unsigned threads = 1;
   if (!cfg_.cooperative) {
-    if (const char* v = std::getenv("VGPU_THREADS"); v && *v) threads = static_cast<unsigned>(std::max(1, std::atoi(v)));
+    if (const char* v = env_.threads; v && *v) threads = static_cast<unsigned>(std::max(1, std::atoi(v)));
     else {
 #ifdef VGPU_HAVE_HOST_CPUS
       threads = vgpu::host_cpus();
@@ -1237,7 +1235,7 @@ exec::LaunchStats Runner::run() {
   bool lockstep = false;
   uint64_t capacity = 0;
   if (!cfg_.cooperative && !clustered_) {
-    const exec::LockstepMode mode = exec::lockstep_mode();
+    const exec::LockstepMode mode = exec::lockstep_mode(env_.lockstep);
     if (mode == exec::LockstepMode::All || (mode == exec::LockstepMode::Auto && cfg_.resident_blocks && kernel_polls(m_, k_))) {
       lockstep = true;
       capacity = cfg_.resident_blocks ? cfg_.resident_blocks : units;
@@ -1618,12 +1616,7 @@ bool Runner::step_warp(Block& blk, Warp& w) {
   // With the tier on, a warp whose runnable lanes all stand at one address (the usual case) is found by comparing
   // the 32 addresses at once: the same lo and group the pass below finds.
   if (tier_) {
-    if (const Mask at = tier_lanes_at(w, lo); (run & ~at) == 0) {
-      group = run;
-    } else {   // diverged: the lowest address among the runnable lanes, and the lanes there
-      lo = tier_lowest_pc(w, run, lo);
-      group = tier_lanes_at(w, lo) & run;
-    }
+    group = exec::sasslanes::pick_group(w.pc, run, lo);   // (the lowest address among the runnable lanes, and the lanes there)
   } else
   for (Mask m = run; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
@@ -1813,6 +1806,11 @@ const tier::Program* Code::tier_program() const {
       }
     }
     prog->const_index.clear();
+    for (size_t i = count; i-- > 0;) {   // (the last instruction never starts a run: the loop does not take it as a straight one)
+      tier::MOp& op = prog->ops[i];
+      if (i + 1 < count && op.fn && op.straight && op.unguarded && tier::pure_register_form(op.form))
+        op.run = static_cast<uint8_t>(std::min<unsigned>(255u, 1u + prog->ops[i + 1].run));
+    }
     jit::attach(*prog, sm);   // (a unit for tier 2 if VGPU_JIT=1: in jit.cpp, so nothing of it is in this function)
     d.tier_owner = prog;
     d.tier.store(prog.get(), std::memory_order_release);

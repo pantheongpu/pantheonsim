@@ -60,6 +60,21 @@ inline uint64_t lowest_pc(const uint64_t* pc, Mask run, uint64_t first) {
 }
 
 
+// The group the scheduler runs next: the lowest address among the runnable lanes' (`run`, not zero) in `lo`, and the runnable lanes standing there.
+// Runnable lanes that all stand at one address (the usual case) are found by comparing the 32 addresses with the first one's; a diverged
+// warp's lowest address and its lanes come from pick_group_diverged (src/simd/lanes.cpp: one pass of 256-bit compares with AVX2).
+// pick_group_reference is the lanes_at/lowest_pc definition, for the test.
+Mask pick_group_diverged(const uint64_t* pc, Mask run, uint64_t& lo);
+Mask pick_group_reference(const uint64_t* pc, Mask run, uint64_t& lo);
+inline Mask pick_group(const uint64_t* pc, Mask run, uint64_t& lo) {
+  const uint64_t first = pc[std::countr_zero(run)];
+  if ((run & ~lanes_at(pc, first)) == 0) {
+    lo = first;
+    return run;
+  }
+  return pick_group_diverged(pc, run, lo);
+}
+
 // The lanes of `ex` start to wait with `kind` on `arg`.
 template <class W, class K>
 inline void wait(W& w, Mask ex, K kind, unsigned arg) {

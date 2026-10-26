@@ -186,6 +186,19 @@ class MemoryManager {
   bool store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
                    size_t* failed_at = nullptr);
 
+  // load_batch and store_batch for a caller that does both on the same addresses (a warp's atomics: it loads the words, works out
+  // what each lane leaves, stores them): the checks of both -- and the one lookup -- made once. batch_window is true when load_batch
+  // and store_batch would each take these accesses (it is false, having done nothing, where either would decline); batch_load and
+  // batch_store then do what they do, with the window in place of their own checks.
+  struct BatchWindow {
+    const void* alloc = nullptr;
+    uint64_t base = 0;
+  };
+  bool batch_window(const uint64_t* addrs, size_t count, uint32_t size, BatchWindow* window) const;
+  void batch_load(const BatchWindow& window, const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const;
+  void batch_store(const BatchWindow& window, const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
+                   size_t* failed_at = nullptr);
+
   // Fills a range by repeating a 1/2/4-byte pattern, without building a host
   // copy of the range first. Staging a buffer the size of the fill is what
   // made a memset of N bytes cost 2N of host RAM: the staging buffer is live
@@ -656,6 +669,12 @@ class MemoryManager {
   const Allocation* find_ordinary_miss(uint64_t addr, uint64_t len, uint64_t* base_out) const;
   bool batch_ok(const uint64_t* addrs, size_t count, uint32_t size, bool store, const Allocation** alloc,
                 uint64_t* base) const;
+  // The part of batch_ok that is about armed faults, for a load or for a store, and the part that is about the addresses.
+  bool batch_faults_clear(bool store) const;
+  bool batch_addresses_ok(const uint64_t* addrs, size_t count, uint32_t size, const Allocation** alloc, uint64_t* base) const;
+  void load_batch_in(const Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const;
+  void store_batch_in(Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
+                      size_t* failed_at);
   const Allocation& resolve_scalar(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
                                    bool writing, bool page_slack) const;
   // The mapped-memory half of resolve: a hit returns the handle's allocation,

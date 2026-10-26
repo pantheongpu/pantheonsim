@@ -242,6 +242,7 @@ add_library(vgpu STATIC
   src/ptx/contract.cpp
   src/ptx/sync_masks.cpp
   src/simd/simd.cpp
+  src/simd/lanes.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
   src/exec/devrt.cpp
@@ -1326,6 +1327,9 @@ vgpu_unit_test(test_atom_rmw)
 vgpu_unit_test(test_sass_code_at)
 # The SASS executor's block, kept between blocks and launches and set up again each time (Runner::init_block).
 vgpu_unit_test(test_sass_block_reuse)
+vgpu_unit_test(test_sass_alu_runs)
+vgpu_unit_test(test_launch_env)
+vgpu_unit_test(test_sass_lea)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.

@@ -61,10 +61,8 @@ inline std::atomic<bool>& exact_flag() {
   }()};
   return f;
 }
-inline void refresh_exact() {
-  const char* v = std::getenv("VGPU_TC_EXACT");
-  exact_flag().store(!(v && v[0] == '0'), std::memory_order_relaxed);
-}
+inline void refresh_exact(const char* v) { exact_flag().store(!(v && v[0] == '0'), std::memory_order_relaxed); }
+inline void refresh_exact() { refresh_exact(std::getenv("VGPU_TC_EXACT")); }
 inline bool exact_enabled() { return exact_flag().load(std::memory_order_relaxed); }
 
 // Whether a device of this compute capability sums as an RTX 3060 does (only the part that was measured), and the switch is on.

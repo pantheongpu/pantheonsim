@@ -135,8 +135,17 @@ inline uint32_t tier_extend(unsigned size, uint32_t v) {   // a sub-word load wi
 [[gnu::always_inline]] inline void tier_store(const TCtx& c, uint16_t dst, Mask ex, const uint32_t* r) {
   if (dst == tier::kNoReg) return;
   uint32_t* d = c.R + dst * 32u;
+  if (r == d) return;   // (tier_out: the kernel wrote the destination itself)
   if (ex == kAll) tier_copy_row(d, r);
   else c.sk->blend_m(d, r, ex);   // the executing lanes only, without a branch per lane
+}
+
+// Where a kernel that works lane by lane (each lane of its result from the same lane of its sources, the sources of a block of lanes all read before
+// the block is written: every kernel of vgpu/simd/simd.hpp that the handlers below name) writes its result: the destination register itself when the whole
+// warp runs the instruction (the row copy of tier_store is then 16 loads and stores less per instruction, and a destination that is also a source
+// is no problem to such a kernel), else the temporary `tmp`, from which tier_store blends the lanes that run.
+[[gnu::always_inline]] inline uint32_t* tier_out(const TCtx& c, uint16_t dst, Mask ex, uint32_t* tmp) {
+  return ex == kAll && dst != tier::kNoReg ? c.R + dst * 32u : tmp;
 }
 
 // ---- handlers ---------------------------------------------------------------------------------
@@ -154,7 +163,8 @@ TIER_HANDLER(h_mov) {
 
 TIER_HANDLER(h_iadd3) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]),
                  *d = tier_src<false>(c, op.s[2], t[2]);
   c.sk->iadd3(r, a, b, d, op.a);
@@ -163,7 +173,8 @@ TIER_HANDLER(h_iadd3) {
 
 TIER_HANDLER(h_imad) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]),
                  *d = tier_src<false>(c, op.s[2], t[2]);
   c.sk->imad(r, a, b, d);
@@ -172,7 +183,8 @@ TIER_HANDLER(h_imad) {
 
 TIER_HANDLER(h_lop3) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]),
                  *d = tier_src<false>(c, op.s[2], t[2]);
   c.sk->lop3(r, a, b, d, op.a);   // (the vector kernel, which has the usual tables as expressions: faster than loops the compiler makes for the baseline x86-64)
@@ -187,42 +199,22 @@ TIER_HANDLER(h_lop3) {
 
 TIER_HANDLER(h_lea) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const bool hi = op.aux & 1, x = op.aux & 2, three = op.aux & 4, bneg = op.aux & 8;
-  const unsigned sh = op.a;
   const Mask cin = x ? tier_pmask(c, op.p) : 0;
   const uint32_t* a = tier_src<false>(c, op.s[0], t[0]);
   const uint32_t* b = tier_src<false>(c, op.s[1], t[1]);
-  const uint32_t* top = three ? tier_src<false>(c, op.s[2], t[2]) : nullptr;
-  Mask carry = 0;
-  if (!hi && !x && !bneg) {   // the usual one, (a << s) + b: two vector operations, and the carry out is a wrap
-    for (unsigned l = 0; l < 32; ++l) r[l] = (sh >= 32 ? 0 : a[l] << sh) + b[l];
-    if (op.dst2 != tier::kNoReg)
-      for (unsigned l = 0; l < 32; ++l) carry |= static_cast<Mask>(r[l] < (sh >= 32 ? 0 : a[l] << sh)) << l;
-    tier_store(c, op.dst, ex, r);
-    if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
-    return;
-  }
-  for (unsigned l = 0; l < 32; ++l) {
-    uint32_t shifted;
-    if (!hi) {
-      shifted = sh >= 32 ? 0 : a[l] << sh;
-    } else {
-      const uint32_t tp = three ? top[l] : static_cast<uint32_t>(static_cast<int32_t>(a[l]) >> 31);
-      shifted = static_cast<uint32_t>(((a[l] | (static_cast<uint64_t>(tp) << 32)) << sh) >> 32);
-    }
-    uint64_t sum = static_cast<uint64_t>(shifted) + b[l] + ((cin >> l) & 1);
-    if (bneg && b[l] == 0) sum += uint64_t{1} << 32;   // -0 is ~0 + 1: it carries out (see the general rule)
-    r[l] = static_cast<uint32_t>(sum);
-    carry |= static_cast<Mask>(sum >> 32 != 0) << l;
-  }
+  const uint32_t* top = three ? tier_src<false>(c, op.s[2], t[2]) : nullptr;   // (none: the high word is a's sign)
+  const Mask carry = exec::sasslea::lea_lanes({hi, bneg, op.a}, r, a, b, top, cin);   // (vgpu/exec/sass_lea.hpp: four lanes to a vector)
   tier_store(c, op.dst, ex, r);
   if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
 }
 
 TIER_HANDLER(h_shf) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t* lo = tier_src<false>(c, op.s[0], t[0]);
   const uint32_t* n = tier_src<false>(c, op.s[1], t[1]);
   const uint32_t* top = tier_src<false>(c, op.s[2], t[2]);
@@ -272,7 +264,8 @@ TIER_HANDLER(h_fsel) {
 
 TIER_HANDLER(h_ffma) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<true>(c, op.s[0], t[0]), *b = tier_src<true>(c, op.s[1], t[1]),
                  *d = tier_src<true>(c, op.s[2], t[2]);
   if (!op.a && !op.b) {
@@ -288,7 +281,8 @@ TIER_HANDLER(h_ffma) {
 
 TIER_HANDLER(h_fadd) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[2][32], r[32];
+  alignas(32) uint32_t t[2][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<true>(c, op.s[0], t[0]), *b = tier_src<true>(c, op.s[1], t[1]);
   if (!op.a && !op.b) {
     c.sk->fadd(r, a, b);
@@ -303,7 +297,8 @@ TIER_HANDLER(h_fadd) {
 
 TIER_HANDLER(h_fmul) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[2][32], r[32];
+  alignas(32) uint32_t t[2][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const uint32_t *a = tier_src<true>(c, op.s[0], t[0]), *b = tier_src<true>(c, op.s[1], t[1]);
   if (!op.a && !op.b) {
     c.sk->fmul(r, a, b);
@@ -480,14 +475,16 @@ TIER_HANDLER(h_isetp_ex) {   // the high words of a 64-bit compare; the low word
 
 TIER_HANDLER(h_popc) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[32], r[32];
+  alignas(32) uint32_t t[32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   c.sk->lane_unary(0, r, tier_src<false>(c, op.s[0], t));   // the number of set bits
   tier_store(c, op.dst, ex, r);
 }
 
 TIER_HANDLER(h_i2fp) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[32], r[32];
+  alignas(32) uint32_t t[32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   c.sk->i2f(op.c != 0, r, tier_src<false>(c, op.s[0], t));
   tier_store(c, op.dst, ex, r);
 }
@@ -564,7 +561,8 @@ TIER_HANDLER(h_f2fp) {   // F2FP.PACK_AB: the interpreter's own code (the NaN, .
 
 TIER_HANDLER(h_unary) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[32], r[32];
+  alignas(32) uint32_t t[32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   c.sk->lane_unary(op.a, r, tier_src<false>(c, op.s[0], t));
   tier_store(c, op.dst, ex, r);
 }
@@ -1859,6 +1857,15 @@ struct JitFrame {
   return rg.k;
 }
 
+// The ops of a stretch (Program::run) one after the other for `group`, with their class counts. A function of its own so that the loop keeps its few
+// values in registers (inside the run loop of step_warp they were on the stack).
+[[gnu::noinline]] void tier_issue(TCtx& c, const tier::MOp* o, unsigned k, Mask group, unsigned glanes, uint64_t* by_class) {
+  for (const tier::MOp* const end = o + k; o != end; ++o) {
+    by_class[o->cls] += glanes;
+    o->fn(&c, *o, group);
+  }
+}
+
 // The share rule's sample (jit.hpp): the warp instructions a call of the hook loop ran, whatever ran them, are added to the unit's sample on the way out
 // (also when a fault leaves). `u` is null once the rule has decided, or for the loop without the hook.
 struct JitSampler {
@@ -1913,6 +1920,24 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
             n += k - 1;
             continue;
           }
+        }
+      }
+      // A stretch of register-only instructions, each for the whole group, issued back to back: what the loop below does for each of them
+      // -- the store gate (none of them is a store), the step count, the guard (none has one) and the counters -- is done for the stretch.
+      // Not in tier 2's loop (its regions would be skipped over), nor while the statistics count each instruction.
+      if constexpr (!Jit) {
+        unsigned k = ops[idx].run;
+        if (k > 256 - n) k = 256 - n;
+        if (k >= 2 && regs_ok && group && !tier_stats_ && w.steps + k <= max_steps_) {
+          w.steps += k;
+          st.instructions += k;
+          st.thread_instructions += uint64_t{k} * glanes;
+          const tier::MOp* const o = ops + idx;
+          tier_issue(c, o, k, group, glanes, st.inst_by_class);
+          cur = o + k - 1;
+          idx += k;
+          n += k - 1;
+          continue;
         }
       }
       // step_warp's store gate: a warp's first store to global memory ends its turn, once, so that the block's other warps
@@ -2113,16 +2138,12 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   if (!tier_chain_ || w.budget == 0 || w.yield || w.slice || w.give_way || w.ws_held || w.mactive_force) return true;
   const Mask run = w.runnable();
   if (!run) return true;
-  uint64_t lo = w.pc[std::countr_zero(run)];
-  Mask at = tier_lanes_at(w, lo);
-  if ((run & ~at) != 0) {   // diverged: the group at the lowest address, which is what step_warp picks when nothing else is asked of it
-    lo = tier_lowest_pc(w, run, lo);
-    at = tier_lanes_at(w, lo);
-  }
+  uint64_t lo;
+  const Mask next = exec::sasslanes::pick_group(w.pc, run, lo);   // the group at the lowest address, which is what step_warp picks when nothing else is asked of it
   if (lo - code.base >= 16 * static_cast<uint64_t>(count) || ((lo - code.base) & 15)) return true;
   --w.budget;
   ++w.extra;
-  group = run & at;
+  group = next;
   pick = lo;
   }
 }
