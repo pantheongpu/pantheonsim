@@ -234,4 +234,21 @@ inline unsigned popcount32(uint32_t x) {
 }
 const Kernels& kernels_for(Level l);
 
+// The distinct 32-byte sectors of a warp's accesses that all lie within 63 sectors of one another, in any order (the
+// thread-private array a kernel indexes by a value of its own): the AVX2 form of memcount's sectors_window, or null on
+// a host or at a level without AVX2. For 1 to 64 lanes (`m` the active ones, not zero) of `span` bytes (1 to 32) at
+// addrs[lane]; true with the count in `out`, or false (nothing counted) when an address is not below 2^62 or a sector
+// lies outside the 63 that start 24 before the first active lane's (the caller then counts another way). The same
+// count as the scalar window, whatever the level: the level changes the speed only.
+using SectorWindowFn = bool (*)(const uint64_t* addrs, uint64_t m, uint64_t span, uint64_t& out);
+namespace detail {
+extern SectorWindowFn g_sector_window __attribute__((visibility("hidden")));
+}
+inline SectorWindowFn sector_window_kernel() { return detail::g_sector_window; }
+
+namespace testing {
+// Switches the kernel above between the level's own (true) and none (false), for the tests that compare the two.
+void use_sector_window_kernel(bool on);
+}
+
 }  // namespace vgpu::simd

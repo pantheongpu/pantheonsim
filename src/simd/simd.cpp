@@ -44,6 +44,56 @@ namespace vgpu::simd {
 #include "kernels.inc"
 #undef VGPU_SIMD_NS
 #undef VGPU_SIMD_AVX2
+
+// memcount's sectors_window, four lanes to a step: each lane's first and last sector (the access's last byte is at most
+// 31 on, so at most the next sector) become a bit of one 64-bit word, relative to 24 sectors before the first active
+// lane's, and the sectors are the word's set bits. An inactive lane in a group of four takes the first active lane's
+// address (the same sector again). The first lane's address below 2^62 keeps every sum from wrapping; a lane outside
+// the window, or at 2^62 or above, gives the whole warp up.
+namespace avx2_impl {
+__attribute__((target("popcnt"))) bool sector_window_k(const uint64_t* addrs, uint64_t m, uint64_t span, uint64_t& out) {
+  const unsigned lo = static_cast<unsigned>(std::countr_zero(m));
+  const unsigned hi = 64 - static_cast<unsigned>(std::countl_zero(m));
+  const uint64_t a0 = addrs[lo];
+  const __m256i va0 = _mm256_set1_epi64x(static_cast<long long>(a0));
+  const __m256i extra = _mm256_set1_epi64x(static_cast<long long>(span - 1));
+  const __m256i base = _mm256_set1_epi64x(static_cast<long long>((a0 >> 5) - 24));
+  const __m256i c62 = _mm256_set1_epi64x(62);
+  const __m256i one = _mm256_set1_epi64x(1);
+  const __m256i lane_bit = _mm256_set_epi64x(8, 4, 2, 1);
+  const __m256i zero = _mm256_setzero_si256();
+  __m256i bits = zero, bad = zero, big = zero;
+  for (unsigned i = lo & ~3u; i < hi; i += 4) {
+    __m256i a;
+    if (i + 4 <= hi) {
+      a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(addrs + i));
+    } else {   // (the last group reads only the lanes up to the highest active one: the array may end there)
+      uint64_t tail[4] = {a0, a0, a0, a0};
+      for (unsigned j = 0; i + j < hi; ++j) tail[j] = addrs[i + j];
+      a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(tail));
+    }
+    const unsigned nib = static_cast<unsigned>(m >> i) & 15u;
+    if (nib != 15u) {
+      const __m256i on = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_set1_epi64x(nib), lane_bit), lane_bit);
+      a = _mm256_blendv_epi8(va0, a, on);
+    }
+    big = _mm256_or_si256(big, a);
+    const __m256i f = _mm256_srli_epi64(a, 5);
+    const __m256i e = _mm256_srli_epi64(_mm256_add_epi64(a, extra), 5);
+    const __m256i d = _mm256_sub_epi64(f, base);
+    bad = _mm256_or_si256(bad, _mm256_or_si256(_mm256_cmpgt_epi64(d, c62), _mm256_cmpgt_epi64(zero, d)));
+    const __m256i bit = _mm256_sllv_epi64(one, d);
+    bits = _mm256_or_si256(bits, _mm256_or_si256(bit, _mm256_sllv_epi64(bit, _mm256_sub_epi64(e, f))));
+  }
+  if (!_mm256_testz_si256(bad, bad) ||
+      !_mm256_testz_si256(big, _mm256_set1_epi64x(static_cast<long long>(0xC000'0000'0000'0000ull))))
+    return false;
+  const __m128i h = _mm_or_si128(_mm256_castsi256_si128(bits), _mm256_extracti128_si256(bits, 1));
+  const uint64_t w = static_cast<uint64_t>(_mm_cvtsi128_si64(h)) | static_cast<uint64_t>(_mm_extract_epi64(h, 1));
+  out = static_cast<uint64_t>(__builtin_popcountll(w));
+  return true;
+}
+}  // namespace avx2_impl
 #pragma GCC pop_options
 #endif
 
@@ -242,7 +292,18 @@ int f16c_checks_run() { return g_f16c_checks.load(std::memory_order_relaxed); }
 namespace detail {
 std::atomic<const Kernels*> g_kernels __attribute__((visibility("hidden"))){&kBase};
 bool g_enabled __attribute__((visibility("hidden"))) = true;
+SectorWindowFn g_sector_window __attribute__((visibility("hidden"))) = nullptr;
 }  // namespace detail
+
+namespace testing {
+void use_sector_window_kernel(bool on) {
+#ifdef VGPU_SIMD_X86
+  detail::g_sector_window = on && level() == Level::Avx2 ? avx2_impl::sector_window_k : nullptr;
+#else
+  (void)on;
+#endif
+}
+}  // namespace testing
 
 namespace {
 // Runs when the library is loaded: from here on the engines get the level this host has (an AVX2 host starts on the
@@ -250,6 +311,7 @@ namespace {
 const bool g_init = [] {
 #ifdef VGPU_SIMD_X86
   if (level() == Level::Avx2) detail::g_kernels.store(&kAvx2Lazy, std::memory_order_release);
+  testing::use_sector_window_kernel(true);
 #endif
   const char* v = std::getenv("VGPU_SIMD");
   detail::g_enabled = !(v && std::strcmp(v, "off") == 0);
