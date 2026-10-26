@@ -289,7 +289,10 @@ VTEST(tcgen05_tile_route_matches_the_row_loop) {
         const uint32_t ntypes = kind.atypes[1] == ~0u ? 1 : kind.atypes[2] == ~0u ? 2 : 3;
         c.atype = kind.atypes[g() % ntypes];
         c.btype = kind.mx || kind.atypes[1] == ~0u ? (kind.name == std::string("f16") ? c.atype : kind.atypes[g() % ntypes]) : kind.atypes[g() % ntypes];
-        if (std::string(kind.name) == "f16") c.btype = c.atype;
+        if (std::string(kind.name) == "f16") {
+          if (trial == 2 || trial == 4) c.atype = 0;   // (an f16 D takes f16 operands: trials 2 and 4 make one, with a scale-d at 2 and sparse at 4)
+          c.btype = c.atype;
+        }
         if (std::string(kind.name) == "tf32") c.btype = 2;
         if (kind.mx && kind.sv == 1) c.btype = kind.atypes[g() % ntypes];
         // (mxf4 kinds: fp4 only)
