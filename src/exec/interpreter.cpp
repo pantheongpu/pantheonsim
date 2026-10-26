@@ -14863,7 +14863,7 @@ void tcgen05_shift(uint32_t taddr, Tcgen05Host& h) {
 // One thread's tcgen05.mma (9.7.18.10.10.1): D = A*B (+ D), M x N x K, on
 // this CTA's Tensor Memory or the pair's; with .block_scale,
 // (A * scale_A) * (B * scale_B) + D (9.7.18.10.7).
-void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
+__attribute__((section(".text.unlikely"))) void tcgen05_mma(const Tcgen05Mma& op, Tcgen05Host& h) {
   auto refuse = [&](const std::string& why) { h.fail(Err::UnsupportedPtx, "tcgen05.mma: " + why); };
   const uint32_t id = op.idesc;
   auto bad = [&]() {
