@@ -132,6 +132,13 @@ check() {
     local nc
     nc="$(runit "$bin" $arch "${jitenv[@]}" VGPU_TIER_CHAIN=0)"
     [[ "$a" == "$nc" ]] || why="${why:+$why; }the JIT without the tier's chain prints differently from the tier"
+    # The share rule on (the settings above compile everything: HOT_PERMILLE=0 turns it off): a sample of 5000 warp instructions, and the bar at 1%
+    # (nearly every section kept), 60% (the default) and 100% (nearly every section declined and back on the plain loop). The output is the tier's in all.
+    local sh
+    for bar in 1 60 100; do
+      sh="$(runit "$bin" $arch VGPU_TIER=1 VGPU_JIT=1 VGPU_JIT_THRESHOLD=20000 VGPU_JIT_SYNC=1 VGPU_JIT_SAMPLE=5000 VGPU_JIT_MIN_SHARE=$bar VGPU_JIT_MIN_REGION=2 "VGPU_JIT_CACHE=$work/jit-cache-share$bar")"
+      [[ "$a" == "$sh" ]] || why="${why:+$why; }the JIT with the share rule at $bar% prints differently from the tier"
+    done
   fi
   if [[ $p == sass_tier_steps && -z $why ]]; then
     # Faults deep into a run of straight instructions, and the step limit, with the generated code compiled with and without -fexceptions.

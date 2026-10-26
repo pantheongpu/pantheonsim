@@ -1,0 +1,23 @@
+Generated-code share of the sample (per thousand of the section's warp instructions that generated code would compute), as printed by
+VGPU_JIT_STATS=1 at the decision of the share rule; JIT=1, VGPU_JIT_THRESHOLD=10^12 (nothing compiles), one run each, rig 2026-10-25.
+Binary: the rule with the default bar 40% (permille 400 below) and sample 50000, except where the column says S.
+(harness, `full` size; one line per section that reached the sample; sections that never ran S warp instructions print nothing)
+
+workload         S=5000            S=20000           S=50000           S=1000000        decision at bar 40%
+int_alu          913               913               913               913              kept
+f32_fma          992               992               992               992              kept
+f64_fma          46                46                46                46               declined
+f64_subnormal    23                23                23                (none)           declined
+wmma             2                 2                 2                 (none)           declined
+mma_ptx          1                 1                 1                 (none)           declined
+mem (3 sections) 717/726/686       719/731/688       719/733/691       720/692          kept
+shared (3)       284/129/129       279/110/110       278/106/106       277 (1 of 3)     declined
+atomics          178               145               143               (none)           declined
+texture          755               755               755               (none)           kept
+local            819               819               819               819              kept
+divergent        735 (prologue)    184               73                30               declined (kept if S=5000)
+warp             350               350               350               349              declined
+
+pantheon stress workloads (4 s runs, S=50000):
+int_virus 938 kept; compute_virus 666 kept; fp64_virus 121 declined; memory_bank_thrash 507 kept (declined at bar 60%);
+memory_retention_bake 444 and 896 (two sections: both kept at bar 40%, one declined at bar 60%)

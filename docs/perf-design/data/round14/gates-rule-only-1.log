@@ -1,0 +1,37 @@
+== unit tests
+    Start 68: test_tier
+3/6 Test #68: test_tier ........................   Passed    0.03 sec
+    Start 69: test_jit
+4/6 Test #69: test_jit .........................   Passed    3.07 sec
+    Start 70: test_jit_share
+5/6 Test #70: test_jit_share ...................   Passed    0.61 sec
+    Start 71: test_jit_resid
+6/6 Test #71: test_jit_resid ...................   Passed   12.29 sec
+
+100% tests passed, 0 tests failed out of 6
+
+Total Test time (real) =  27.75 sec
+== e2e_sass_jit (PR gate)
+Test project /w/build
+    Start 598: e2e_sass_jit
+1/1 Test #598: e2e_sass_jit .....................   Passed  1037.76 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) = 1037.77 sec
+
+real	17m17.780s
+user	16m20.260s
+sys	0m31.802s
+== e2e_sass_tier
+Test project /w/build
+    Start 597: e2e_sass_tier
+1/1 Test #597: e2e_sass_tier ....................   Passed   79.48 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) =  79.49 sec
+
+real	1m19.495s
+user	2m26.765s
+sys	0m15.767s

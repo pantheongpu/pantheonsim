@@ -118,17 +118,12 @@ struct Event {
 // Off until a front end asks for it, so a program nobody is profiling pays
 // nothing beyond one relaxed load per launch.
 //
-// The two flags a call tests (this and hooked()) are read inline, every API call asks both. They keep default
-// visibility, so the library that sets them and the one that reads them are one state as the
-// functions they replace were (the profiling state is the process's, see the CUPTI shim's link line).
-namespace detail {
-// Inline variables: one weak, default-visibility definition per library that includes this, which the dynamic linker
-// merges into one object. That is the shared state wanted here, and not an ODR violation for AddressSanitizer or
-// tests/lint/check_odr_globals.py, which only fail strong definitions that two libraries both carry.
-inline std::atomic<bool> g_on{false};
-inline std::atomic<bool> g_hooked{false};
-}  // namespace detail
-inline bool enabled() { return detail::g_on.load(std::memory_order_relaxed); }
+// The two flags every API call tests (this and hooked()) are read through these exported functions, not through a
+// variable the callers could see: the profiling state is the process's, the CUPTI shim switches it on by calling the
+// runtime's set_enabled, and the runtime, the driver and the shim all read it through the function the dynamic linker
+// picks for them. A flag defined in the header (inline, weak or hidden) is one object for each library that carries it,
+// and the shim's markers and the driver's records then read one that nobody set.
+bool enabled();
 void set_enabled(bool on);
 
 void record(Event&& e);
@@ -216,7 +211,7 @@ struct Hooks {
   bool wants_symbols = false;
 };
 void set_hooks(const Hooks& h);          // all-null removes
-inline bool hooked() { return detail::g_hooked.load(std::memory_order_acquire); }
+bool hooked();
 void notify_resource(Resource what, uint64_t handle, uint32_t device);
 void notify_resource(const ResourceInfo& info);
 void notify_sync(SyncKind what, uint64_t stream);

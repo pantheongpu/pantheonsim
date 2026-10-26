@@ -3756,6 +3756,8 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           }
           slot[l] = k;
         }
+        // Memory the host maps takes the CPU's atomic in the loop below, before any lock is taken here.
+        if (ok && !exec::sassatom::batchable(mem_, uaddr, nu)) ok = false;
         if (ok) {
           // The operands of the lanes that run: a register's own lanes, or the one value every lane has.
           const auto fetch = [&](const Operand& o, bool wide, uint64_t* out) {
