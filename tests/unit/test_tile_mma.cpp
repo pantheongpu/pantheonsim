@@ -206,7 +206,7 @@ VTEST(tile_i32_matches_the_scalar_loop) {
 VTEST(tile_i32_wraps_exactly_on_operands_of_any_size) {
   std::mt19937 g(0x16b1);
   long compared = 0;
-  const Shape shapes[] = {{16, 8, 16}, {16, 8, 7}, {4, 24, 1}, {16, 16, 33}, {5, 32, 12}, {8, 8, 64}, {1, 8, 2}, {3, 40, 9}};
+  const Shape shapes[] = {{16, 8, 16}, {16, 8, 7}, {4, 24, 1}, {16, 16, 33}, {5, 32, 12}, {8, 8, 64}, {1, 8, 2}, {3, 40, 9}, {16, 64, 33}, {5, 72, 12}, {8, 128, 7}, {4, 64, 1}};
   for (simd::Level l : levels()) {
     const simd::Kernels& k = simd::kernels_for(l);
     for (const Shape& s : shapes)

@@ -139,7 +139,8 @@ struct VnniScratch {
 
 bool tile_i32_vnni(unsigned M, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, size_t ldc, unsigned block, bool sat, int32_t* D,
                    size_t ldd) {
-  if (K == 0 || (sat && (block & 1) && block < K)) return false;
+  // (The packing is a cost per call: below 64 columns of D the multiplier form is faster -- 16 x 8 x 32 took 760 ns against 195 -- so it is left to it.)
+  if (K == 0 || N < 64 || (sat && (block & 1) && block < K)) return false;
   const unsigned KP = (K + 1) / 2;
   thread_local VnniScratch sc;
   sc.a.resize(size_t{M} * KP);
