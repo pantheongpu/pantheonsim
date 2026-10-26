@@ -367,7 +367,8 @@ std::vector<uint32_t> run_form(const Form& f, const std::vector<Line>& corpus, s
             case Shape::Tf32: wd[at] = f32_class(g, wide); break;
             case Shape::Fp8: wd[at] = is_c ? (s.c_f16 ? half_class(g, wide) | uint32_t{half_class(g, wide)} << 16 : f32_class(g, wide)) : g(); break;
             case Shape::F64: {
-              const uint64_t v = f64_class(g, wide);
+              uint64_t v = f64_class(g, wide);
+              if (b % 3 != 0 && (v & 0x7ff0000000000000ull) == 0x7ff0000000000000ull) v = 0x3ff0000000000000ull | (v & 0x800fffffffffffffull);   // (NaNs and infinities send an f64 call to the general form: most blocks have none)
               wd[at] = static_cast<uint32_t>(v);
               wd[++at] = static_cast<uint32_t>(v >> 32);
               ++i;
@@ -504,7 +505,12 @@ std::vector<Form> gforms() {
 }
 
 std::vector<uint32_t> run_gform(const Form& f, const std::vector<Line>& corpus, std::mt19937& g, std::string* why) {
-  sass::Instr ins = sass::decode(f.w, 0, f.sm);
+  Word fw = f.w;
+  sass::Instr ins = sass::decode(fw, 0, f.sm);
+  if (ins.op == sass::Op::HGMMA && ins.f[4]) {   // a sparse 16-bit form: any of its selectors (the corpus has 0 only)
+    fw = with(fw, 48, 2, g() % 2);
+    ins = sass::decode(fw, 0, f.sm);
+  }
   const unsigned N = ins.f[0], K = ins.f[1], tb = ins.f[2], flags = ins.f[5];
   const bool reg_a = ins.f[3], sparse = ins.f[4];
   const bool is_int = ins.op == sass::Op::IGMMA;
@@ -584,7 +590,7 @@ std::vector<uint32_t> run_gform(const Form& f, const std::vector<Line>& corpus, 
   load(rc, nregs);
   if (sparse) load(rmeta, 1);
   emit(find_word(read_corpus("90a"), "WARPGROUP\\.ARRIVE"), "WARPGROUP.ARRIVE");
-  code.push_back(f.w);
+  code.push_back(fw);
   emit(find_word(read_corpus("90a"), "WARPGROUP\\.DEPBAR\\.LE gsb0, 0x0"), "WARPGROUP.DEPBAR.LE gsb0, 0x0");
   for (unsigned i = 0; i < nregs; ++i)
     emit(with(with(with(stg, 24, 8, 244), 32, 8, rd + i), 40, 24, out_base + i * 4), "STG.E " + stg_desc + "[R244.64" + off_text(out_base + i * 4) + "], R" + std::to_string(rd + i));

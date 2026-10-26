@@ -45,12 +45,15 @@ struct Form {
   bool wide = false;      // 64-bit registers
   const char* suffix = "";   // after the operands' types (a rounding mode, .xor.popc)
   bool c_int_limits = false;   // draw C near the s32 limits
+  int sel = 0;                 // the sparsity selector
 };
 
 const Form kForms[] = {
     // floating point, other C and D types than exec_mma_simd takes
     {"bf16 k16 f32<-f32 on h100", "nvidia/h100", "sm_90", "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32", 4, 2, 4, 4, D::BF16},
     {"f16 sparse k32", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32", 4, 4, 4, 4, D::F16, true},
+    {"f16 sparse k32 sel 1", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32", 4, 4, 4, 4, D::F16, true, false, "", false, 1},
+    {"tf32 sparse k16 sel 1", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k16.row.col.f32.tf32.tf32.f32", 4, 4, 4, 4, D::TF32, true, false, "", false, 1},
     {"f16 sparse k16 f16", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16", 2, 2, 2, 2, D::F16, true},
     {"bf16 sparse k32", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32", 4, 4, 4, 4, D::BF16, true},
     {"tf32 sparse k16", "nvidia/a100", "sm_80", "mma.sp.sync.aligned.m16n8k16.row.col.f32.tf32.tf32.f32", 4, 4, 4, 4, D::TF32, true},
@@ -190,7 +193,7 @@ LOOP:
   ptx += "    ld.global.b32 %meta, [%rd4+" + std::to_string(off) + "];\n";
   for (int i = 0; i < f.dregs; ++i) ptx += std::string("    mov.") + rt + " %d" + std::to_string(i) + ", " + (f.wide ? "0xA5A5A5A5A5A5A5A5" : "0xA5A5A5A5") + ";\n";
   ptx += std::string("    @%q ") + f.mnemonic + f.suffix + " " + reglist("d", f.dregs) + ", " + reglist("a", f.a) + ", " + reglist("b", f.b) + ", " +
-         reglist("c", f.c) + (f.sparse ? ", %meta, 0x0" : "") + ";\n";
+         reglist("c", f.c) + (f.sparse ? ", %meta, " + std::to_string(f.sel) : std::string()) + ";\n";
   for (int i = 0; i < f.dregs; ++i)
     ptx += std::string("    st.global.") + rt + " [%rd5+" + std::to_string(i * w) + "], %d" + std::to_string(i) + ";\n";
   ptx += R"(    add.u32 %r3, %r3, 1;
@@ -232,7 +235,8 @@ VTEST(mma_tile_route_matches_the_general_form) {
         const auto fill = [&](int n, bool is_c) {
           for (int i = 0; i < n * w; i += w, at += w) {
             if (f.wide) {
-              const uint64_t v = f64_class(g, wide);
+              uint64_t v = f64_class(g, wide);
+              if (t % 3 != 0 && (v & 0x7ff0000000000000ull) == 0x7ff0000000000000ull) v = 0x3ff0000000000000ull | (v & 0x800fffffffffffffull);   // (a NaN or an infinity in a tile sends the call to the general form: most trials have none)
               std::memcpy(&word[at], &v, 8);
             } else if (is_c && f.data == D::Int && f.c_int_limits) {
               const uint32_t h = g();
