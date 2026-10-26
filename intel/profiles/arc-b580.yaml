@@ -1,0 +1,41 @@
+# VirtualGPU engine profile: Intel Arc B580 (Battlemage G21, Xe2-HPG).
+#
+# SPEC-DERIVED, NOT MEASURED, and not the profile PantheonZE shows an application (that one is
+# pantheonze/profiles/arc-b580.yaml, which this agrees with). This one gives the PantheonSim engine
+# the resource limits a SPIR-V launch is checked against: the work-group's shared local memory (SLM),
+# the Xe core and thread counts, the sub-group widths, the work-group size and the register file.
+# Intel parts are loaded by load_gpu() and listed by available_engine_gpus(), not by available_gpus():
+# the register database, telemetry and monitors have nothing for them.
+#
+# Source key: NEO   = github.com/intel/compute-runtime @ 26.35.39758.10 (MIT), shared/source/xe2_hpg_core/bmg/hw_info_bmg.cpp
+#             PRESS = press coverage / Intel's public product page, not re-read
+#             DPCPP = the DPC++ sycl_ext_intel_grf_size extension document (128 GRFs per thread by default, 256 in large-GRF mode)
+#             STAND = a stand-in the engine needs in order to run; named in `placeholders:`, NOT a claim about the part
+id: intel/arc-b580
+vendor: intel
+model: "Intel(R) Arc(TM) B580 Graphics"
+architecture: xe2-hpg
+warp_size: 16                      # STAND: the default sub-group width; a launch sets its own (LaunchConfig::warp_size)
+vram_bytes: 12884901888
+verified: false
+limits:
+  max_threads_per_block: 1024      # STAND: Level Zero's maxTotalGroupSize for this part is not public
+  max_block_dim: [1024, 1024, 1024]   # STAND
+  max_grid_dim: [4294967295, 4294967295, 4294967295]   # STAND: the 32-bit group count the driver reports (maxGroupCount)
+  shared_mem_per_block_bytes: 131072   # NEO: hw_info_bmg.cpp maxProgrammableSlmSize = 128 (KiB)
+  shared_mem_per_block_optin_bytes: 131072   # the same: SLM has no separate opt-in
+  multiprocessors: 20           # PRESS: 20 Xe cores; an engine multiprocessor is an Xe core
+  shared_mem_per_sm: 131072          # STAND: the Xe core's total SLM is not public; one work-group may take the maximum
+  # registers_per_block, registers_per_sm, max_threads_per_sm, max_blocks_per_sm and max_registers_per_thread are
+  # derived from `xe:` by the loader: the Xe core's register file, threads x widest sub-group, threads, and
+  # GRF words shared over the default sub-group.
+xe:
+  eus_per_xe_core: 8               # PRESS: 8 vector engines per Xe2 core (160 total); unverified
+  threads_per_eu: 8                 # NEO: hw_info_bmg.cpp NumThreadsPerEu = 8
+  grf_per_thread: 128               # DPCPP: the default register budget of a hardware thread
+  grf_bytes: 32                     # STAND: the width of one GRF entry is not sourced here
+  sub_group_sizes: [8, 16, 32]      # STAND: what the engine can execute; the Level Zero answer for this part is not public
+placeholders: [warp_size, limits.max_threads_per_block, limits.max_block_dim, limits.max_grid_dim, limits.shared_mem_per_sm, xe.grf_bytes, xe.sub_group_sizes]
+features:
+  fp16: true
+  fp64: true

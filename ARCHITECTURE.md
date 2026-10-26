@@ -194,6 +194,15 @@ verified today ([docs/status.md](docs/status.md)). The CLI prints the caveat for
 rest, whose values come from public vendor documentation only. The restricted-YAML subset is documented in
 `include/vgpu/yamlish.hpp`.
 
+Intel Xe parts (`intel/profiles/*.yaml`, for PantheonZE's SPIR-V execution backend) are the third vendor. They
+are spec-derived, never verified, and say which of their values are stand-ins the engine needs in order to run
+(`placeholders:`). `load_gpu()` finds them and `available_engine_gpus()` lists them; `available_gpus()` does not,
+because the register database, telemetry and monitors have nothing for them. An engine multiprocessor is an Xe
+core: its shared local memory is the work-group limit (384 KiB on Crescent Island, 128 KiB on the Battlemage
+parts, from the open-source compute runtime), and the register file, thread and block ceilings are derived from
+the profile's `xe:` section (EUs, threads per EU, GRFs per thread, sub-group widths). A launch at a sub-group
+width the profile does not list is refused.
+
 ### D5. Errors: stable codes + rich text, and no silent gaps
 
 One exception type (`vgpu::Error`) with a stable `Err` code (tests and the C

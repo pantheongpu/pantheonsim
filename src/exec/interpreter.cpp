@@ -15415,6 +15415,14 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
     throw Error::make(Err::Unsupported, "profile ", p.id, " has warp size ", p.warp_size,
                       "; only 8, 16, 32 and 64 are implemented");
   }
+  // An Intel part compiles a kernel for a few sub-group widths only; a launch at another is a kernel the part
+  // could not have been given. The profile lists them (DeviceProfile::xe).
+  if (p.vendor == "intel" && !p.xe.has_sub_group_size(warp)) {
+    std::string have;
+    for (uint32_t w : p.xe.sub_group_sizes) have += (have.empty() ? "" : ", ") + std::to_string(w);
+    throw Error::make(Err::LaunchConfig, "kernel '", fn.name, "': sub-group size ", warp, " is not one of the sizes ",
+                      p.id, " runs (", have, ")");
+  }
   // ---- thread-block clusters ----
   const bool wants_cluster =
       cfg.cluster[0] > 1 || cfg.cluster[1] > 1 || cfg.cluster[2] > 1;
