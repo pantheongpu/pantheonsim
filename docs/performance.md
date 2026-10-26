@@ -4758,7 +4758,21 @@ of the six new tests, `VGPU_SIMD=base` runs.
 Whole-process `perf stat` (cycles, instructions) on `mfma`: 1.80 G / 9.5 G to 0.97 G / 4.6 G.
 
 ### Tests and mutations
-`test_amd_matrix_fast` (every matrix instruction of the corpora, tile path against the element-at-a-time reference, shuffled registers, all flavours), `test_amd_mfma_math` (new: every binary16 through `half8_to_double` against `half_bits_to_double`), `test_amd_gcn_tier_same_bits` (covers each new handler: every corpus shape with the tier off and on). Mutations are in the report of the branch.
+`test_amd_matrix_fast` (every matrix instruction of the corpora, tile path against the element-at-a-time reference, shuffled registers, all flavours), `test_amd_mfma_math` (new: every binary16 through `half8_to_double` against `half_bits_to_double`), `test_amd_gcn_tier_same_bits` (covers each new handler: every corpus shape with the tier off and on). Mutations (each built and run on server3, then reverted; all fail the named test):
+| # | mutation | result |
+| --- | --- | --- |
+| M1 | C gather's high pair of a 4-run taken from the low | `test_amd_matrix_fast` fails |
+| M2 | integer B's even/odd pair shuffle swapped | `test_amd_matrix_fast` fails |
+| M3 | `mfma_tile_fma_avx2` K=4 reads A's element 2 for 1 | `test_amd_matrix_fast` fails |
+| M4 | `half8_to_double` lane permute wrong | `test_amd_mfma_math` fails |
+| M5 | the tile kernel never reports a NaN | `test_amd_matrix_fast` fails (dropping only the last accumulator's check survives: another output of the tile is a NaN as well) |
+| M6 | D's high word of a double written to the low row | `test_amd_matrix_fast` fails |
+| M7 | WMMA integer D wraps where CLAMP is set | `test_amd_matrix_fast` fails |
+| M8 | `s_cmp_lt_u32` as `<=` | tier digest (`VGPU_TIER_ONLY=s_cmp_lt_u32`) fails |
+| M9 | the fence does not count a vector memory instruction | tier digest (`buffer_gl0_inv`) fails |
+| M10 | the register-register scalar read off by one | tier digest (`s_add_u32`) fails |
+
+Sanitizers: ASan+UBSan -O0 (`test_amd_mfma_math`, `test_amd_matrix_fast` 2248 s, `test_amd_gcn_same_bits`, `test_amd_gcn_tier_same_bits` 2685 s) and TSan -O1 (`test_amd_mfma_math`, `test_amd_matrix_fast`) pass; the Release guards (`gcn_same_bits`, `gcn_packed_`, `gcn_memory_`, `codeobject_same_bits`, `nan_order`, `mfma_math`, tier digest) pass, and `--check-counters` shows no drift on the 37 pairs.
 
 ### Not done, and negative results
 * A hint slot for two-way branches: no workload shows a hint miss (branch-misses of `divergent`: 1.7 M of 740 M branches).
