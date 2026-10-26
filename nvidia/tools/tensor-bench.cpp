@@ -220,7 +220,7 @@ double run_wg(const Wg& f, int reps) {
     .reg .b32 %r<16>;
     .reg .b32 %d<130>;
     .reg .b64 %rd<12>;
-    .shared .align 1024 .b8 smem[32768];
+    .shared .align 1024 .b8 smem[40960];
     ld.param.u64 %rd1, [pimg];
     ld.param.u64 %rd5, [da];
     ld.param.u64 %rd6, [db];
@@ -228,7 +228,7 @@ double run_wg(const Wg& f, int reps) {
     mov.u32 %r2, smem;
     shl.b32 %r3, %r1, 2;
 COPY:
-    setp.ge.u32 %p1, %r3, 32768;
+    setp.ge.u32 %p1, %r3, 40960;
     @%p1 bra COPIED;
     cvt.u64.u32 %rd7, %r3;
     add.u64 %rd8, %rd1, %rd7;
@@ -307,8 +307,7 @@ const Tc kTcs[] = {
 
 double run_tc(const Tc& c, int reps) {
   const uint32_t K = c.eb == 4 ? 8 : c.eb == 2 ? 16 : 32;
-  const uint32_t Ke = c.sparse ? 2 * K : K;
-  (void)Ke;
+  const uint32_t Ke = c.sparse ? 2 * K : K, Ka = K;
   uint32_t id;
   if (c.mx) id = (1u << 23) | (c.atype << 7) | (c.btype << 10) | (c.N >> 3) << 17 | (c.M >> 7) << 27;
   else id = c.dtype << 4 | c.atype << 7 | c.btype << 10 | (c.N >> 3) << 17 | (c.M >> 4) << 24 | (c.sparse ? 4u : 0u);
@@ -408,13 +407,18 @@ WAIT:
   const uint64_t pa = mem.alloc(8192), pb = mem.alloc(8192);
   mem.write(pa, sa.data(), 8192);
   mem.write(pb, sb.data(), 8192);
-  const auto desc = [](uint32_t start) { return uint64_t{start >> 4} | (uint64_t{1} << 16) | (uint64_t{64} << 32) | (uint64_t{1} << 46) | (uint64_t{2} << 61); };
+  // K-major, the swizzle atom as wide as a row of K elements (32, 64 or 128 bytes), eight rows an atom
+  const auto desc = [](uint32_t start, uint32_t row_bytes) {
+    const uint64_t code = row_bytes == 32 ? 6 : row_bytes == 64 ? 4 : 2;
+    return uint64_t{start >> 4} | (uint64_t{1} << 16) | (uint64_t{8 * row_bytes >> 4} << 32) | (uint64_t{1} << 46) | (code << 61);
+  };
   LaunchConfig cfg;
   cfg.block = {128, 1, 1};
   cfg.grid = {1, 1, 1};
   cfg.cluster = {1, 1, 1};
+  const uint32_t a_row = Ka * c.eb, b_row = Ke * c.eb;
   const auto t0 = Clock::now();
-  exec::launch(m.entries[0], cfg, {arg_u64(pa), arg_u64(pb), arg_u64(desc(0)), arg_u64(desc(0)), arg_u32(id)}, mem, prof);
+  exec::launch(m.entries[0], cfg, {arg_u64(pa), arg_u64(pb), arg_u64(desc(0, a_row)), arg_u64(desc(0, b_row)), arg_u32(id)}, mem, prof);
   return std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
 }
 
@@ -520,16 +524,16 @@ struct SassRow {
 };
 // (the first corpus word of each form whose text matches)
 const SassRow kSass[] = {
-    {"sass HMMA.16816.F32 (sm_86)", 86, "HMMA\\.16816\\.F32 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+;", "f16", "f32"},
-    {"sass HMMA.16816.F32.BF16 (sm_86)", 86, "HMMA\\.16816\\.F32\\.BF16 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+;", "bf16", "f32"},
-    {"sass HMMA.1688.F32.TF32 (sm_86)", 86, "HMMA\\.1688\\.F32\\.TF32 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+;", "f32", "f32"},
-    {"sass HMMA.1688.F32 (sm_86)", 86, "HMMA\\.1688\\.F32 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+;", "f16", "f32"},
-    {"sass HMMA.16816.F32 (sm_80)", 80, "HMMA\\.16816\\.F32 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+;", "f16", "f32"},
-    {"sass HMMA.SP.16832.F32 (sm_80)", 80, "HMMA\\.SP\\.16832\\.F32 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+, 0x[0-9a-f]+;", "f16", "f32"},
-    {"sass IMMA.16816.S8.S8 (sm_80)", 80, "IMMA\\.16816\\.S8\\.S8 R[0-9]+, R[0-9]+\\.ROW, R[0-9]+\\.COL, R[0-9]+;", "int", "int"},
-    {"sass IMMA.16832.S8.S8 (sm_80)", 80, "IMMA\\.16832\\.S8\\.S8 R[0-9]+, R[0-9]+\\.ROW, R[0-9]+\\.COL, R[0-9]+;", "int", "int"},
-    {"sass IMMA.16864.S4.S4 (sm_80)", 80, "IMMA\\.16864\\.S4\\.S4 R[0-9]+, R[0-9]+\\.ROW, R[0-9]+\\.COL, R[0-9]+;", "int", "int"},
-    {"sass QMMA.16832.F32.E4M3 (sm_89)", 89, "QMMA\\.16832\\.F32\\.E4M3\\.E4M3 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+;", "fp8", "f32"},
+    {"sass HMMA.16816.F32 (sm_86)", 86, "HMMA\\.16816\\.F32 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+", "f16", "f32"},
+    {"sass HMMA.16816.F32.BF16 (sm_86)", 86, "HMMA\\.16816\\.F32\\.BF16 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+", "bf16", "f32"},
+    {"sass HMMA.1688.F32.TF32 (sm_86)", 86, "HMMA\\.1688\\.F32\\.TF32 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+", "f32", "f32"},
+    {"sass HMMA.1688.F32 (sm_86)", 86, "HMMA\\.1688\\.F32 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+", "f16", "f32"},
+    {"sass HMMA.16816.F32 (sm_80)", 80, "HMMA\\.16816\\.F32 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+", "f16", "f32"},
+    {"sass HMMA.SP.16832.F32 (sm_80)", 80, "HMMA\\.SP\\.16832\\.F32 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+, 0x[0-9a-f]+", "f16", "f32"},
+    {"sass IMMA.16816.S8.S8 (sm_80)", 80, "IMMA\\.16816\\.S8\\.S8 R[0-9]+, R[0-9]+\\.ROW, R[0-9]+\\.COL, R[0-9]+", "int", "int"},
+    {"sass IMMA.16832.S8.S8 (sm_80)", 80, "IMMA\\.16832\\.S8\\.S8 R[0-9]+, R[0-9]+\\.ROW, R[0-9]+\\.COL, R[0-9]+", "int", "int"},
+    {"sass IMMA.16864.S4.S4 (sm_80)", 80, "IMMA\\.16864\\.S4\\.S4 R[0-9]+, R[0-9]+\\.ROW, R[0-9]+\\.COL, R[0-9]+", "int", "int"},
+    {"sass QMMA.16832.F32.E4M3 (sm_89)", 89, "QMMA\\.16832\\.F32\\.E4M3\\.E4M3 R[0-9]+, R[0-9]+, R[0-9]+, R[0-9]+", "fp8", "f32"},
 };
 
 double run_sass(const SassRow& r, const std::string& src_dir, int reps) {
