@@ -128,6 +128,22 @@ foreach(_p IN LISTS VGPU_PROFILES)
   string(APPEND _content "  {\"${_p}\", R\"VGPUPROFILE(${_yaml})VGPUPROFILE\"},\n")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_file}.yaml")
 endforeach()
+string(APPEND _content "};\n\n")
+# Profiles of parts the engine runs and the rest of the tool (the register database, telemetry, the monitors, the
+# CLI listing) knows nothing about yet: load_gpu() finds them, available_gpus() does not list them. Intel's, for
+# PantheonZE's SPIR-V execution backend (docs/spirv-lowering.md, E1).
+set(VGPU_ENGINE_PROFILES
+  intel/crescent-island
+  intel/arc-b580
+  intel/arc-pro-b60
+)
+string(APPEND _content "inline constexpr EmbeddedProfile kEngineProfiles[] = {\n")
+foreach(_p IN LISTS VGPU_ENGINE_PROFILES)
+  string(REGEX REPLACE "^([^/]+)/" "\\1/profiles/" _file "${_p}")
+  file(READ "${CMAKE_SOURCE_DIR}/${_file}.yaml" _yaml)
+  string(APPEND _content "  {\"${_p}\", R\"VGPUPROFILE(${_yaml})VGPUPROFILE\"},\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_file}.yaml")
+endforeach()
 string(APPEND _content "};\n\n}  // namespace vgpu::embedded\n")
 file(WRITE "${_gen}" "${_content}")
 
@@ -1345,6 +1361,10 @@ vgpu_unit_test(test_redux_ext)
 vgpu_unit_test(test_wg_collective)
 # %warpsize, the global offset and work dim registers, work-group memory arguments and the sub-group count (E4, E5).
 vgpu_unit_test(test_launch_inputs)
+# E1: Intel in the profile layer: the profiles, the limits derived from them, and a launch checked against them.
+vgpu_unit_test(test_intel_profile)
+# The per-thread cache of host-mapped buffers (MemoryManager::lookup_host): never serves a mapping that is gone or changed.
+vgpu_unit_test(test_hostmap_cache)
 vgpu_unit_test(test_devrt)
 vgpu_unit_test(test_telemetry)
 vgpu_unit_test(test_ras)
