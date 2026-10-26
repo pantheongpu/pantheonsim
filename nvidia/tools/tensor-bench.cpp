@@ -52,9 +52,9 @@ double ghz() {
   static const double g = [] {
     uint64_t x = 1;
     const auto t0 = Clock::now();
-    for (uint64_t i = 0; i < 400000000ull; ++i) asm volatile("add $1, %0" : "+r"(x));
+    for (uint64_t i = 0; i < 100000000ull; ++i) asm volatile("add $1, %0" : "+r"(x));
     const double ns = std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
-    return 400000000.0 / ns;
+    return 100000000.0 / ns;
   }();
   return g;
 }
