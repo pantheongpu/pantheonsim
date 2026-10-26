@@ -9894,33 +9894,44 @@ class Interpreter {
       }
     };
     std::vector<Lanes> out(op.d.size(), Lanes{});
+    const bool tile = fast_enabled_ && simd::enabled();
     for (uint32_t q = 0; q < 4; ++q) {
-      double A[8][4] = {}, B[4][8] = {}, C[8][8] = {};
+      // (every element is a half or a float, so the products and sums are in f32 whichever way they are formed)
+      alignas(32) float A[8][4], B[4][8], C[8][8], D[8][8];
       for (uint32_t half = 0; half < 2; ++half)
         for (uint32_t t = 0; t < 4; ++t) {
           const uint32_t lane = half * 16 + q * 4 + t;
           const uint32_t hi = half * 4;
           for (uint32_t i = 0; i < 4; ++i) {
-            const double a = f16_to_double((av[i / 2][lane] >> (16 * (i % 2))) & 0xFFFF);
-            const double b = f16_to_double((bv[i / 2][lane] >> (16 * (i % 2))) & 0xFFFF);
+            const float a = static_cast<float>(f16_to_double((av[i / 2][lane] >> (16 * (i % 2))) & 0xFFFF));
+            const float b = static_cast<float>(f16_to_double((bv[i / 2][lane] >> (16 * (i % 2))) & 0xFFFF));
             if (op.a_row) A[t + hi][i] = a; else A[i + hi][t] = a;
             if (op.b_col) B[i][t + hi] = b; else B[t][i + hi] = b;
           }
           for (uint32_t i = 0; i < 8; ++i) {
             uint32_t r, c;
             cd_pos(lane, i, op.c_f16, &r, &c);
-            C[r][c] = op.c_f16 ? f16_to_double((cv[i / 2][lane] >> (16 * (i % 2))) & 0xFFFF)
-                               : static_cast<double>(f32(cv[i][lane]));
+            C[r][c] = op.c_f16 ? static_cast<float>(f16_to_double((cv[i / 2][lane] >> (16 * (i % 2))) & 0xFFFF)) : f32(cv[i][lane]);
           }
         }
+      // D = C + A x B: each element its four products added in k order, each rounded to f32 first.
+      if (tile) {
+        simd::kernels().tile_f32(8, 8, 4, &A[0][0], &B[0][0], &C[0][0], 8, &D[0][0], 8);
+      } else {
+        for (uint32_t r = 0; r < 8; ++r)
+          for (uint32_t c = 0; c < 8; ++c) {
+            float acc = C[r][c];
+            for (uint32_t k = 0; k < 4; ++k) acc += A[r][k] * B[k][c];
+            D[r][c] = acc;
+          }
+      }
       for (uint32_t half = 0; half < 2; ++half)
         for (uint32_t t = 0; t < 4; ++t) {
           const uint32_t lane = half * 16 + q * 4 + t;
           for (uint32_t i = 0; i < 8; ++i) {
             uint32_t r, c;
             cd_pos(lane, i, op.acc_f16, &r, &c);
-            float acc = static_cast<float>(C[r][c]);
-            for (uint32_t k = 0; k < 4; ++k) acc += static_cast<float>(A[r][k]) * static_cast<float>(B[k][c]);
+            const float acc = D[r][c];
             if (op.acc_f16)
               out[i / 2][lane] |= (double_to_f16(acc) & 0xFFFF) << (16 * (i % 2));
             else

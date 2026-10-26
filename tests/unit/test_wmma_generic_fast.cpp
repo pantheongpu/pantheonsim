@@ -3,7 +3,8 @@
 // in every pairing -- against the general form (VGPU_FASTPATH=0), bit for bit, on an RTX A10 (sm_86: the card-measured chunked sum) and an A100
 // (the plain f32 sum), with fragments of random bits drawn from the classes that break arithmetic (zeros of both signs, subnormals, infinities,
 // NaNs, the extremes, wide and narrow exponents, integers at their limits, accumulators near the s32 limits). Single-bit and 16x16x16 forms are
-// run too: the route leaves them to the general form, and must give the same answer by leaving.
+// run too: the route leaves them to the general form, and must give the same answer by leaving. And mma.sync.m8n8k4 (Volta's f16 form: four 8x8x4
+// products, f16 or f32 C and D in every pairing, all four layouts), whose products go through the same kernel.
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -87,6 +88,8 @@ struct Form {
   Kind kind;
   bool c_f16 = false;   // C draws half-pairs
   bool wide64 = false;  // 64-bit registers
+  bool mma = false;     // mma.sync.aligned.m8n8k4 (Volta's form) rather than wmma.mma
+  uint32_t ra = 0, rb = 0, rc = 0, rd = 0;   // register counts, when the form says them (the mma form)
 };
 
 // (the register counts come from wmma_geom, as the parser takes them)
@@ -132,6 +135,10 @@ const Form kForms[] = {
     {"f64 m8n8k4 rz", "nvidia/a100", ".m8n8k4", ".f64.f64.f64.f64", ".rz", Kind::F64, false, true},
     {"f64 m8n8k4 rm", "nvidia/a100", ".m8n8k4", ".f64.f64.f64.f64", ".rm", Kind::F64, false, true},
     {"f64 m8n8k4 rp", "nvidia/a100", ".m8n8k4", ".f64.f64.f64.f64", ".rp", Kind::F64, false, true},
+    {"mma m8n8k4 f32/f32", "nvidia/a10", ".m8n8k4", ".f32.f16.f16.f32", "", Kind::F16, false, false, true, 2, 2, 8, 8},
+    {"mma m8n8k4 f16/f16", "nvidia/a10", ".m8n8k4", ".f16.f16.f16.f16", "", Kind::F16, true, false, true, 2, 2, 4, 4},
+    {"mma m8n8k4 f32/f16", "nvidia/a100", ".m8n8k4", ".f32.f16.f16.f16", "", Kind::F16, true, false, true, 2, 2, 4, 8},
+    {"mma m8n8k4 f16/f32", "nvidia/a100", ".m8n8k4", ".f16.f16.f16.f32", "", Kind::F16, false, false, true, 2, 2, 8, 4},
 };
 
 ptx::WmmaShape shape_of(const std::string& s) {
@@ -177,8 +184,11 @@ std::vector<uint64_t> run(const Form& f, const std::string& layouts, const std::
   // (.xor.popc / .and.popc follow wmma.mma, a rounding mode follows the shape, .satfinite ends the types)
   const std::string suffix = f.suffix;
   const bool popc = suffix.find("popc") != std::string::npos, sat = suffix == ".satfinite";
-  ptx += std::string("    @%q wmma.mma") + (popc ? suffix : "") + ".sync.aligned." + layouts + f.shape + (!popc && !sat ? suffix : "") + f.types + (sat ? suffix : "") + " " + regs("d", rd) + ", " +
-         regs("a", ra) + ", " + regs("b", rb) + ", " + regs("c", rc) + ";\n";
+  std::string lay_dotless = layouts;
+  lay_dotless.pop_back();
+  ptx += (f.mma ? std::string("    @%q mma.sync.aligned") + f.shape + "." + lay_dotless + f.types
+                : std::string("    @%q wmma.mma") + (popc ? suffix : "") + ".sync.aligned." + layouts + f.shape + (!popc && !sat ? suffix : "") + f.types + (sat ? suffix : "")) +
+         " " + regs("d", rd) + ", " + regs("a", ra) + ", " + regs("b", rb) + ", " + regs("c", rc) + ";\n";
   for (uint32_t i = 0; i < rd; ++i) ptx += std::string("    st.global.") + rt + " [%rd6+" + std::to_string(i * w) + "], %d" + std::to_string(i) + ";\n";
   ptx += "    ret;\n}\n";
   MemoryManager mem{1 << 22};
@@ -223,10 +233,11 @@ VTEST(wmma_generic_tile_route_matches_the_general_form) {
         at = dot == std::string::npos ? t.size() : dot + 1;
       }
     }
-    const bool short_form = types.size() == 2;
+    const bool short_form = types.size() == 2 || f.mma;
     const ptx::WmmaType dt = type_of(types[0]), ct = type_of(types.back()), at = short_form ? ptx::WmmaType::F16 : type_of(types[1]);
     const ptx::WmmaShape sh = shape_of(f.shape);
-    const uint32_t ra = ptx::wmma_geom('a', sh, at).regs, rb = ptx::wmma_geom('b', sh, at).regs, rc = ptx::wmma_geom('c', sh, ct).regs, rd = ptx::wmma_geom('d', sh, dt).regs;
+    const uint32_t ra = f.mma ? f.ra : ptx::wmma_geom('a', sh, at).regs, rb = f.mma ? f.rb : ptx::wmma_geom('b', sh, at).regs, rc = f.mma ? f.rc : ptx::wmma_geom('c', sh, ct).regs,
+                   rd = f.mma ? f.rd : ptx::wmma_geom('d', sh, dt).regs;
     for (const char* layouts : {"row.col.", "col.row.", "row.row.", "col.col."}) {
       if ((f.kind == Kind::Int || f.kind == Kind::Bits) && (at == ptx::WmmaType::S4 || at == ptx::WmmaType::U4 || at == ptx::WmmaType::B1) && std::string(layouts) != "row.col.") continue;
       for (int trial = 0; trial < 8; ++trial) {
