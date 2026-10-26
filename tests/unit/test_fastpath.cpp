@@ -132,15 +132,18 @@ std::vector<uint64_t> run(const std::string& body, bool wide, const std::vector<
     setp.ge.u32 %p2, %r1, 32;
     or.pred %q, %p1, %p2;
 )";
-  // Every instruction of the body runs under the guard.
+  // Every instruction of the body runs under the guard (g_guard 3: none, but a branch round the whole body that the
+  // lanes of %q take, so the warp is diverged while it runs).
+  if (g_guard == 3) ptx += "    @%q bra L_SKIP;\n";
   size_t pos = 0;
   while (pos < body.size()) {
     size_t end = body.find(';', pos);
     std::string one = body.substr(pos, end - pos + 1);
     while (!one.empty() && (one[0] == ' ' || one[0] == '\n')) one.erase(0, 1);
-    if (!one.empty()) ptx += std::string("    ") + (g_guard == 1 ? "" : g_guard == 2 ? "@!%q " : "@%q ") + one + "\n";
+    if (!one.empty()) ptx += std::string("    ") + (g_guard == 1 || g_guard == 3 ? "" : g_guard == 2 ? "@!%q " : "@%q ") + one + "\n";
     pos = end + 1;
   }
+  if (g_guard == 3) ptx += "L_SKIP:\n";
   ptx += wide ? "    mov.b64 %rd8, %D;\n" : "    cvt.u64.u32 %rd8, %d;\n";
   ptx += R"(    add.u64 %rd9, %rd4, %rd5;
     st.global.u64 [%rd9], %rd8;
@@ -2127,10 +2130,10 @@ VTEST(pre_decoded_f64_forms_match_the_general_path) {
   (void)y2;
 }
 
-// fma.rn.f64 over random bit patterns (every exponent, so NaNs, infinities, subnormals and cancellation come up in every
+// fma.rn.f64, its contracted subtracts, and add, sub, mul and div over random bit patterns (every exponent, so NaNs, infinities, subnormals and cancellation come up in every
 // operand position and combination), with all lanes active and under both guards (half the lanes, and the other half), as
 // the four-lanes-at-a-time form of the fast path against the general path.
-VTEST(f64_fma_random_bits_match_the_general_path) {
+VTEST(f64_arithmetic_random_bits_match_the_general_path) {
   uint64_t seed = 0x9E3779B97F4A7C15ull;
   auto rnd = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
   auto pick = [&]() -> uint64_t {
@@ -2151,9 +2154,14 @@ VTEST(f64_fma_random_bits_match_the_general_path) {
         for (uint64_t* v : {&x[i], &y[i], &z[i]}) if ((*v >> 52 & 0x7FF) == 0x7FF) *v = dbits(1.25);
       }
     }
-    for (int guard : {1, 2, 0}) {
+    for (int guard : {1, 2, 0, 3}) {
       g_guard = guard;
       same("fma.rn.f64 %D, %A, %B, %C;", true, x, y, z);
+      // The contracted subtracts (the product or the addend negated) and the plain add, sub, mul and div of a row.
+      same("mul.f64 %rd10, %A, %B; sub.f64 %D, %rd10, %C;", true, x, y, z);
+      same("mul.f64 %rd10, %A, %B; sub.f64 %D, %C, %rd10;", true, x, y, z);
+      same("mul.f64 %rd10, %A, %B; add.f64 %D, %rd10, %C;", true, x, y, z);
+      for (const char* op : {"add.f64", "sub.f64", "mul.f64", "div.rn.f64"}) same(std::string(op) + " %D, %A, %B;", true, x, y, z);
     }
   }
   g_guard = 0;

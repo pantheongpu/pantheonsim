@@ -1079,14 +1079,19 @@ __attribute__((target("fma"))) void fma_lanes_f64_hw(uint64_t* d, const uint64_t
 // group with a NaN result -- whose operands may be NaNs, which the rule above picks from -- is run lane by lane, and
 // an inactive lane is read (the arrays hold all lanes) but never written.
 __attribute__((target("avx2,fma"))) void fma_lanes_f64_avx2(uint64_t* d, const uint64_t* a, const uint64_t* b,
-                                                            const uint64_t* c, Mask m, uint32_t width) {
+                                                            const uint64_t* c, Mask m, uint32_t width, unsigned sub) {
   const __m256i lane_bit = _mm256_set_epi64x(8, 4, 2, 1);
+  // A contracted subtract negates the product (bit 0) or the addend (bit 1): the general path multiplies by -1.0, which
+  // flips the sign bit of any value that is not a NaN, and a NaN lane is run lane by lane below.
+  const __m256d sign = _mm256_set1_pd(-0.0);
+  const __m256d nega = sub & 1 ? sign : _mm256_setzero_pd(), negc = sub & 2 ? sign : _mm256_setzero_pd();
+  const double sa = sub & 1 ? -1.0 : 1.0, sc = sub & 2 ? -1.0 : 1.0;
   for (uint32_t l = 0; l < width; l += 4) {
     const unsigned nib = static_cast<unsigned>(m >> l) & 15u;
     if (!nib) continue;
-    const __m256d r = _mm256_fmadd_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(a + l)),
+    const __m256d r = _mm256_fmadd_pd(_mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(a + l)), nega),
                                       _mm256_loadu_pd(reinterpret_cast<const double*>(b + l)),
-                                      _mm256_loadu_pd(reinterpret_cast<const double*>(c + l)));
+                                      _mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(c + l)), negc));
     if (_mm256_movemask_pd(_mm256_cmp_pd(r, r, _CMP_UNORD_Q))) {
       for (uint32_t k = l; k < l + 4; ++k) {
         if (!(m >> k & 1)) continue;
@@ -1094,7 +1099,7 @@ __attribute__((target("avx2,fma"))) void fma_lanes_f64_avx2(uint64_t* d, const u
         std::memcpy(&x, &a[k], 8);
         std::memcpy(&y, &b[k], 8);
         std::memcpy(&z, &c[k], 8);
-        const double v = __builtin_fma(x, y, z);
+        const double v = __builtin_fma(sa * x, y, sc * z);
         std::memcpy(&d[k], &v, 8);
         if (v != v && (x != x || y != y || z != z)) d[k] = (y != y ? b[k] : z != z ? c[k] : a[k]) | 0x0008000000000000ull;
       }
@@ -1106,9 +1111,25 @@ __attribute__((target("avx2,fma"))) void fma_lanes_f64_avx2(uint64_t* d, const u
     }
   }
 }
+// f64 add (op 0), sub (1), mul (2) or div (3) of every lane, in a row of 32 results, four lanes at a time: the host's
+// operation is correctly rounded either way, so the bits are the scalar loop's. Returns whether any lane's result is a NaN
+// (an inactive lane's too: its operands are whatever the register holds).
+__attribute__((target("avx2"))) bool f64_bin_lanes_avx2(unsigned op, uint64_t* r, const uint64_t* a, const uint64_t* b,
+                                                        uint32_t width) {
+  __m256d nan = _mm256_setzero_pd();
+  for (uint32_t l = 0; l < width; l += 4) {
+    const __m256d x = _mm256_loadu_pd(reinterpret_cast<const double*>(a + l));
+    const __m256d y = _mm256_loadu_pd(reinterpret_cast<const double*>(b + l));
+    const __m256d v = op == 0 ? _mm256_add_pd(x, y) : op == 1 ? _mm256_sub_pd(x, y) : op == 2 ? _mm256_mul_pd(x, y) : _mm256_div_pd(x, y);
+    nan = _mm256_or_pd(nan, _mm256_cmp_pd(v, v, _CMP_UNORD_Q));
+    _mm256_storeu_pd(reinterpret_cast<double*>(r + l), v);
+  }
+  return _mm256_movemask_pd(nan) != 0;
+}
 const bool g_avx2_f64 = simd::level() == simd::Level::Avx2;
+inline bool use_avx2_f64(uint32_t width) { return g_avx2_f64 && (width & 3) == 0 && simd::enabled(); }
 inline void fma_lanes_f64_best(uint64_t* d, const uint64_t* a, const uint64_t* b, const uint64_t* c, Mask m, uint32_t width) {
-  if (g_avx2_f64 && (width & 3) == 0 && simd::enabled()) fma_lanes_f64_avx2(d, a, b, c, m, width);
+  if (use_avx2_f64(width)) fma_lanes_f64_avx2(d, a, b, c, m, width, 0);
   else fma_lanes_f64_hw(d, a, b, c, m, width);
 }
 // fma.f16x2 lanes on the FMA unit, with the decode and the rounding inlined:
@@ -1141,6 +1162,7 @@ __attribute__((target("popcnt"))) void popc32_lanes_hw(uint32_t* r, const uint32
   for_active(m, width, [&](uint32_t l) { r[l] = static_cast<uint32_t>(__builtin_popcount(v[l] & keep)); });
 }
 #else
+inline bool use_avx2_f64(uint32_t) { return false; }
 constexpr bool g_hw_fma = false;
 double fma_hw(double a, double b, double c) { return std::fma(a, b, c); }
 constexpr bool g_hw_popcnt = false;
@@ -4225,12 +4247,22 @@ class Interpreter {
         nan_result |= f64_is_nan(r[l]);
       });
     };
-    switch (static_cast<FloatBinOp>(u.sub)) {
-      case FloatBinOp::Add: run([](double x, double y) { return x + y; }); break;
-      case FloatBinOp::Sub: run([](double x, double y) { return x - y; }); break;
-      case FloatBinOp::Mul: run([](double x, double y) { return x * y; }); break;
-      case FloatBinOp::Div: run([](double x, double y) { return x / y; }); break;
-      default: return false;   // (min and max are never decoded)
+    const FloatBinOp bop = static_cast<FloatBinOp>(u.sub);
+    bool vectored = false;
+#if defined(__x86_64__) && defined(__GNUC__)
+    if (use_avx2_f64(W_) && (bop == FloatBinOp::Add || bop == FloatBinOp::Sub || bop == FloatBinOp::Mul || bop == FloatBinOp::Div)) {
+      nan_result = f64_bin_lanes_avx2(bop == FloatBinOp::Add ? 0 : bop == FloatBinOp::Sub ? 1 : bop == FloatBinOp::Mul ? 2 : 3, r, a, b, W_);
+      vectored = true;
+    }
+#endif
+    if (!vectored) {
+      switch (bop) {
+        case FloatBinOp::Add: run([](double x, double y) { return x + y; }); break;
+        case FloatBinOp::Sub: run([](double x, double y) { return x - y; }); break;
+        case FloatBinOp::Mul: run([](double x, double y) { return x * y; }); break;
+        case FloatBinOp::Div: run([](double x, double y) { return x / y; }); break;
+        default: return false;   // (min and max are never decoded)
+      }
     }
     // Two NaN operands always give a NaN, so only then is there anything to look for.
     if (nan_result) {
@@ -4252,6 +4284,13 @@ class Interpreter {
     const uint64_t* c = micro_srcf(w, u, 2);
     uint64_t* d = dst64(w, u.dst, fm);
     if (u.sub) {
+#if defined(__x86_64__) && defined(__GNUC__)
+      if (g_hw_fma && use_avx2_f64(W_)) {
+        fma_lanes_f64_avx2(d, a, b, c, fm, W_, u.sub);
+        w.written64[u.dst] = 1;
+        return true;
+      }
+#endif
       const double sa = u.sub & 1 ? -1.0 : 1.0, sc = u.sub & 2 ? -1.0 : 1.0;
       for_active(fm, W_, [&](uint32_t l) {
         const double x = f64(a[l]), y = f64(b[l]), z = f64(c[l]);
