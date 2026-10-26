@@ -25,6 +25,8 @@ struct Buf {
   Buf(size_t bytes, uint8_t fill) : p(static_cast<uint8_t*>(std::aligned_alloc(4096, (bytes + 4095) / 4096 * 4096))), n(bytes) {
     std::memset(p, fill, n);
   }
+  Buf(const Buf&) = delete;
+  Buf(Buf&& o) noexcept : p(o.p), n(o.n) { o.p = nullptr; }
   ~Buf() { std::free(p); }
   uint64_t addr() const { return reinterpret_cast<uint64_t>(p); }
 };

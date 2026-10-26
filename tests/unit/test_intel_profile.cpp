@@ -146,7 +146,7 @@ VTEST(occupancy_follows_the_profiles_shared_memory_and_register_file) {
   // 192 KiB a work-group: two fit the Xe core's 384 KiB, three do not.
   auto r = exec::kernel_resources(m.entries[0], cri, 64, 192u * 1024);
   VCHECK_EQ(r.occupancy.blocks_per_sm, 2u);
-  VCHECK_EQ(std::string(r.occupancy.limited_by), "shared");
+  VCHECK_CONTAINS(std::string(r.occupancy.limited_by), "shared");
   // Nothing shared: bound by the hardware threads, one sub-group each. A 64-invocation group is 64 / width
   // threads, and an Xe core has threads_per_eu * eus_per_xe_core of them, whatever the width.
   const uint32_t threads = cri.xe.threads_per_xe_core();

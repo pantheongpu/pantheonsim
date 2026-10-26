@@ -765,6 +765,11 @@ class MemoryManager {
   };
   bool lookup_host(uint64_t addr, uint64_t len, HostHit* out) const;
   static uint64_t fresh_generation();
+ public:
+  // The cache is on unless VGPU_HOSTMAP_CACHE=0. This switches it for the whole process (a benchmark compares the
+  // two; nothing else needs to).
+  static void set_host_lookup_cache(bool on);
+ private:
   // Host memory mapped over the whole of [addr, addr + len), perhaps as
   // several mappings placed end to end: the pieces, in order, as (host
   // address, offset into the range, length). False where any byte is not.

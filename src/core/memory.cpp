@@ -788,7 +788,23 @@ uint64_t MemoryManager::fresh_generation() {
 
 MemoryManager::HostMaps::HostMaps() : gen(MemoryManager::fresh_generation()) {}
 
+namespace {
+std::atomic<bool> g_host_lookup_cache{[] {
+  const char* e = std::getenv("VGPU_HOSTMAP_CACHE");
+  return !(e && e[0] == '0' && e[1] == 0);
+}()};
+}  // namespace
+
+void MemoryManager::set_host_lookup_cache(bool on) { g_host_lookup_cache.store(on, std::memory_order_relaxed); }
+
 bool MemoryManager::lookup_host(uint64_t addr, uint64_t len, HostHit* out) const {
+  if (!g_host_lookup_cache.load(std::memory_order_relaxed)) {   // VGPU_HOSTMAP_CACHE=0: the table, under its mutex, every time
+    std::lock_guard<std::mutex> lock(host_maps_->mu);
+    const HostMap* m = find_host_map_locked(addr, len);
+    if (!m) return false;
+    *out = HostHit{m->host, m->base, m->len, m->read_only};
+    return true;
+  }
   struct Entry {
     const HostMaps* owner = nullptr;
     uint64_t gen = 0;
@@ -1511,6 +1527,8 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
       v = 0;
       break;
     case ScalarAt::Unchanged:  // only answered for a store
+      read(addr, &v, size);    // (never reached for a load; the plain copy is the safe answer)
+      return v;
     case ScalarAt::HostMap:
       // Host memory, mapped: no device ECC covers it, so no fault is taken.
       // Read as an atomic of its width, as a chunk's scalar is: the host, or
@@ -1518,9 +1536,7 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
       // the CPU's atomics -- which is how the engines make a device atomic on
       // such memory (vgpu/exec/host_atomic.hpp) -- and a memcpy racing those
       // is a data race (ThreadSanitizer, e2e_host_atomics).
-      if (HostHit h; lookup_host(addr, size, &h)) return load_at(h.host + (addr - h.base), size);
-      read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
-      return v;
+      return load_at(p, size);
   }
   // What the cells hold, stuck bits included (little-endian, as above), and
   // then whatever fault is armed for the load.
@@ -1553,15 +1569,11 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
       return;
     case ScalarAt::Unchanged:
       return;
-    case ScalarAt::HostMap: {
-      // An atomic store of its width, as load_scalar's load is.
-      if (HostHit h; lookup_host(addr, size, &h)) {
-        if (h.read_only) throw_read_only_host_write(addr, size);
-        store_at(h.host + (addr - h.base), size, value);
-        return;
-      }
-      break;
-    }
+    case ScalarAt::HostMap:
+      // An atomic store of its width, as load_scalar's load is. scalar_location found the bytes (and refused a
+      // read-only mapping), so there is no second lookup.
+      store_at(const_cast<uint8_t*>(p), size, value);
+      return;
     default:
       break;
   }
@@ -1670,7 +1682,11 @@ MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t s
                                                        const uint8_t** where) const {
   const bool create = store != nullptr;
   if (host_maps_ && host_maps_->may_contain(addr)) {
-    if (HostHit h; lookup_host(addr, size, &h)) return ScalarAt::HostMap;
+    if (HostHit h; lookup_host(addr, size, &h)) {
+      if (create && h.read_only) throw_read_only_host_write(addr, size);
+      *where = h.host + (addr - h.base);
+      return ScalarAt::HostMap;
+    }
   }
   uint64_t base = 0;
   auto& a = const_cast<Allocation&>(resolve_scalar(addr, size, create ? "device memory write" : "device memory read",
