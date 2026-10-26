@@ -93,6 +93,77 @@ __attribute__((target("popcnt"))) bool sector_window_k(const uint64_t* addrs, ui
   out = static_cast<uint64_t>(__builtin_popcountll(w));
   return true;
 }
+
+// The same four lanes at a time (a 32-lane warp: eight steps), on a host with AVX2 at the level in use (VGPU_SIMD=base
+// and off keep the loop above): the fused multiply-add is correctly rounded, so a vector fma gives each lane's bits. A
+// group with a NaN result -- whose operands may be NaNs, which the rule above picks from -- is run lane by lane, and
+// an inactive lane is read (the arrays hold all lanes) but never written.
+void fma_lanes_f64_k(uint64_t* d, const uint64_t* a, const uint64_t* b,
+                                                            const uint64_t* c, uint64_t m, uint32_t width, unsigned sub) {
+  const __m256i lane_bit = _mm256_set_epi64x(8, 4, 2, 1);
+  // A contracted subtract negates the product (bit 0) or the addend (bit 1): the general path multiplies by -1.0, which
+  // flips the sign bit of any value that is not a NaN, and a NaN lane is run lane by lane below.
+  const __m256d sign = _mm256_set1_pd(-0.0);
+  const __m256d nega = sub & 1 ? sign : _mm256_setzero_pd(), negc = sub & 2 ? sign : _mm256_setzero_pd();
+  const double sa = sub & 1 ? -1.0 : 1.0, sc = sub & 2 ? -1.0 : 1.0;
+  if (width == 32 && (m & 0xFFFFFFFFull) == 0xFFFFFFFFull) {
+    // A full warp: the eight results are made first and checked for a NaN together, and stored (after every operand is
+    // read, so a destination that is also a source is fine) when there is none.
+    __m256d r[8];
+    __m256d nan = _mm256_setzero_pd();
+#pragma GCC unroll 8
+    for (uint32_t i = 0; i < 8; ++i) {
+      r[i] = _mm256_fmadd_pd(_mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(a + 4 * i)), nega),
+                             _mm256_loadu_pd(reinterpret_cast<const double*>(b + 4 * i)),
+                             _mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(c + 4 * i)), negc));
+      nan = _mm256_or_pd(nan, _mm256_cmp_pd(r[i], r[i], _CMP_UNORD_Q));
+    }
+    if (!_mm256_movemask_pd(nan)) {
+#pragma GCC unroll 8
+      for (uint32_t i = 0; i < 8; ++i) _mm256_storeu_pd(reinterpret_cast<double*>(d + 4 * i), r[i]);
+      return;
+    }
+  }
+  for (uint32_t l = 0; l < width; l += 4) {
+    const unsigned nib = static_cast<unsigned>(m >> l) & 15u;
+    if (!nib) continue;
+    const __m256d r = _mm256_fmadd_pd(_mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(a + l)), nega),
+                                      _mm256_loadu_pd(reinterpret_cast<const double*>(b + l)),
+                                      _mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(c + l)), negc));
+    if (_mm256_movemask_pd(_mm256_cmp_pd(r, r, _CMP_UNORD_Q))) {
+      for (uint32_t k = l; k < l + 4; ++k) {
+        if (!(m >> k & 1)) continue;
+        double x, y, z;
+        std::memcpy(&x, &a[k], 8);
+        std::memcpy(&y, &b[k], 8);
+        std::memcpy(&z, &c[k], 8);
+        const double v = __builtin_fma(sa * x, y, sc * z);
+        std::memcpy(&d[k], &v, 8);
+        if (v != v && (x != x || y != y || z != z)) d[k] = (y != y ? b[k] : z != z ? c[k] : a[k]) | 0x0008000000000000ull;
+      }
+    } else if (nib == 15u) {
+      _mm256_storeu_pd(reinterpret_cast<double*>(d + l), r);
+    } else {
+      const __m256i on = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_set1_epi64x(nib), lane_bit), lane_bit);
+      _mm256_maskstore_pd(reinterpret_cast<double*>(d + l), on, r);
+    }
+  }
+}
+// f64 add (op 0), sub (1), mul (2) or div (3) of every lane, in a row of 32 results, four lanes at a time: the host's
+// operation is correctly rounded either way, so the bits are the scalar loop's. Returns whether any lane's result is a NaN
+// (an inactive lane's too: its operands are whatever the register holds).
+bool f64_bin_lanes_k(unsigned op, uint64_t* r, const uint64_t* a, const uint64_t* b,
+                                                        uint32_t width) {
+  __m256d nan = _mm256_setzero_pd();
+  for (uint32_t l = 0; l < width; l += 4) {
+    const __m256d x = _mm256_loadu_pd(reinterpret_cast<const double*>(a + l));
+    const __m256d y = _mm256_loadu_pd(reinterpret_cast<const double*>(b + l));
+    const __m256d v = op == 0 ? _mm256_add_pd(x, y) : op == 1 ? _mm256_sub_pd(x, y) : op == 2 ? _mm256_mul_pd(x, y) : _mm256_div_pd(x, y);
+    nan = _mm256_or_pd(nan, _mm256_cmp_pd(v, v, _CMP_UNORD_Q));
+    _mm256_storeu_pd(reinterpret_cast<double*>(r + l), v);
+  }
+  return _mm256_movemask_pd(nan) != 0;
+}
 }  // namespace avx2_impl
 #pragma GCC pop_options
 #endif
@@ -294,6 +365,25 @@ std::atomic<const Kernels*> g_kernels __attribute__((visibility("hidden"))){&kBa
 bool g_enabled __attribute__((visibility("hidden"))) = true;
 SectorWindowFn g_sector_window __attribute__((visibility("hidden"))) = nullptr;
 }  // namespace detail
+
+bool avx2_f64_available() {
+#ifdef VGPU_SIMD_X86
+  return level() == Level::Avx2;
+#else
+  return false;
+#endif
+}
+#ifdef VGPU_SIMD_X86
+void fma_lanes_f64_avx2(uint64_t* d, const uint64_t* a, const uint64_t* b, const uint64_t* c, uint64_t m, unsigned sub) {
+  avx2_impl::fma_lanes_f64_k(d, a, b, c, m, 32, sub);
+}
+bool f64_bin_lanes_avx2(unsigned op, uint64_t* r, const uint64_t* a, const uint64_t* b) {
+  return avx2_impl::f64_bin_lanes_k(op, r, a, b, 32);
+}
+#else
+void fma_lanes_f64_avx2(uint64_t*, const uint64_t*, const uint64_t*, const uint64_t*, uint64_t, unsigned) {}
+bool f64_bin_lanes_avx2(unsigned, uint64_t*, const uint64_t*, const uint64_t*) { return false; }
+#endif
 
 namespace testing {
 void use_sector_window_kernel(bool on) {
