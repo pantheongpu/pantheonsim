@@ -78,6 +78,12 @@ class Tcgen05Host {
   virtual TensorMemory& tmem(uint32_t cta) = 0;
   // `bytes` (1 to 8) of CTA `cta`'s shared memory at a CTA-local offset.
   virtual uint64_t smem_load(uint32_t cta, uint64_t off, uint32_t bytes) = 0;
+  // CTA `cta`'s shared memory, for reading a whole operand at once, or null when each load must go through smem_load (the race detector
+  // or a shared-memory fault armed on the engine's side). A read past its end is smem_load's to report.
+  virtual const std::vector<uint8_t>* smem_direct(uint32_t cta) {
+    (void)cta;
+    return nullptr;
+  }
   [[noreturn]] virtual void fail(Err code, const std::string& why) = 0;
 };
 

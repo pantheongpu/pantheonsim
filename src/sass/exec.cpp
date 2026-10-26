@@ -60,6 +60,7 @@
 #include "vgpu/exec/texture_grad.hpp"
 #include "vgpu/exec/tma.hpp"
 #include "vgpu/exec/tcgen05.hpp"
+#include "vgpu/exec/tile_mma.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/simd/fp16.hpp"
 #include "vgpu/simd/simd.hpp"
@@ -160,6 +161,10 @@ struct Warp {
 struct GmmaSnapshot {
   std::vector<double> A, B;
   uint8_t taken = 0;   // the warps that have used it
+  // The SIMD form (Runner::gmma_fast) decodes the operands into float or int32 tiles instead; `fast` says which this snapshot is.
+  bool fast = false;
+  std::vector<float> Af, Bf;
+  std::vector<int32_t> Ai, Bi;
 };
 
 struct Block;
@@ -617,6 +622,12 @@ class Runner {
   bool exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);   // true: it set the pcs
   void exec_mma(Block& blk, Warp& w, const Instr& ins, Mask ex);
   void exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // warpgroup MMA
+  struct GmmaForm {   // what exec_gmma decoded from the instruction, for gmma_fast
+    unsigned N, K, desc_ur, sel;
+    vgpu::exec::TileElem at, bt;
+    bool int_form, acc32, sat, neg_a, neg_b, a_kmajor, b_kmajor, reg_a, sparse;
+  };
+  bool gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const GmmaForm& f);
   void exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex);   // textures and surfaces
   void exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex);   // mbarriers
   uint32_t mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned lane, bool ur_only, Block** owner);

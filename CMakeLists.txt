@@ -245,6 +245,7 @@ add_library(vgpu STATIC
   src/simd/lanes.cpp
   src/exec/scheduler.cpp
   src/exec/interpreter.cpp
+  src/exec/tile_mma.cpp
   src/exec/devrt.cpp
   src/exec/worker_pool.cpp
   src/runtime/runtime.cpp
@@ -1338,6 +1339,17 @@ vgpu_unit_test(test_tc_ampere)
 vgpu_unit_test(test_tc_ampere_fast)
 # The PTX engine's SIMD route for mma.sync against its general path (VGPU_FASTPATH=0), bit for bit.
 vgpu_unit_test(test_mma_fast)
+# The tile-product kernels and the wgmma/mma operand code against the scalar loops they replace, bit for bit.
+vgpu_unit_test(test_tile_mma)
+# The PTX engine's SIMD wgmma route against its general form (VGPU_FASTPATH=0), bit for bit.
+vgpu_unit_test(test_wgmma_fast)
+# tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
+vgpu_unit_test(test_tcgen05_fast)
+# The PTX engine's tile route for the other mma.sync forms against the general form, bit for bit.
+vgpu_unit_test(test_mma_tiles)
+# The SASS executor's tile route for the MMA forms its SIMD HMMA kernel does not take, against its general form (the kernels off in a second run).
+vgpu_unit_test(test_sass_mma_tiles)
+target_compile_definitions(test_sass_mma_tiles PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.

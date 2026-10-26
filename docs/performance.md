@@ -4675,3 +4675,57 @@ now (`any_nan |= out[e] != out[e]`, the fix-up loop only if any), which has no s
 A/B against origin/main (cpu 6, 9 alternating runs, counters identical): int_alu 1.56x, f32_fma 1.56x, warp 1.20x, local 1.15x, launch 1.10x, mem 1.10x, divergent 1.09x, f64_subnormal 1.09x, f64_fma 1.07x, atomics 1.04x; shared, api, texture same; PTX int_alu/f32_fma/mem/atomics/local/launch/api same (0.98-1.02, p > 0.1).
 
 Not done / negative: pc and wait stores in 16-byte blends (halved store-forwarding stalls, `ls_bad_status2.stli_other` 50M to 22M, but +1.3M branch misses; divergent cycles unchanged, dropped); a spin lock for the stripes (the PTX engine and host atomics share the mutexes: not changeable here); `VGPU_TRACE` getenv in launch_kernel_impl (1%) and the runtime's lockstep_mode (0.9%) are still per launch; texture (sampler in interpreter.cpp, ~450 cycles a lane-fetch, spread over fetch_texel/tex_finish/footprint) and local's `sectors_fast` (28% of `local`) not touched; f64 is dominated by the DFMA kernel (47%).
+
+## Tensor cores: float products, tile kernels, wgmma, tcgen05 and the other mma forms (branch `sp2-nvtensor`, base origin/main 99b013a3)
+
+Measured on server3 (Ryzen 7 PRO 8840U, cpu 2 alone, 9 to 15 alternating runs, GCC 13.3), `tools/bench/bench.py --ab` against a build of origin/main; counters
+identical in every row. Profile first: SASS and PTX `wmma`/`mma_ptx` spent 66 to 78% in `tc86::mma_avx2_chunked`, 8 to 11% in `hmma_k`; the kernel itself
+executed 12,683 instructions per m16n8k16 call (about 400 per row-chunk, where about 140 are needed): the lambda took N, K and the arrays through its
+closure, which the may-alias stores re-read after every store, the row loops stayed rolled (arrays in memory) and the colmask was a read-modify-write chain.
+The forms the benchmark does not run were far worse: `wgmma` m64n256k16 111 us a warp, int8 `mma.sync` 7.5 us, `.b1` 41 us, fp8 7.7 us, sparse f16 10.7 us
+(every operand decoded through a `std::vector<double>` and a switch, summed by scalar double loops).
+
+### What changed
+* **sm_86 sum, float products** (`mma_avx2_chunked_f`, include/vgpu/exec/tc_ampere.hpp). A product of two f16, bf16 or tf32 operands is exact in f32 when its exponent
+  is in range, so the aligned term (the product's magnitude shifted right, bits dropped) is `cvttps(a * b * 2^-g)`: two multiplies and a truncating convert
+  instead of an integer multiply, two subtractions, abs, variable shift and sign. Taken when the exponent fields say every product is a normal f32 (smallest sum
+  of nonzero exponent fields >= 128, largest <= 379, no float subnormal with a significand, no infinity or NaN anywhere); else the integer kernel runs, as it does
+  for a chunk whose 2^-g is not a float (a lane finished by the scalar rule). Addresses hoisted into locals, rows unrolled (`VGPU_TC86_UNROLL`), eight rows at a
+  time (`VGPU_TC86_ROWS_F`). A loop of `tc86::mma` m16n8k16 f16: 2,680 -> 2,015 cycles, 12,683 -> 8,630 instructions (B/A 0.75; bf16 0.76, tf32 0.90).
+* **Tile kernels** (`simd::Kernels::tile_f32`, `tile_i32`, `tile_f64`; baseline and AVX2 twins, strided C and D): the tensor-core sums over a tile, k in order, products
+  rounded then added (never fused), s32 with `.sat` clamped per block, f64 fused in the host rounding mode.
+* **Operand code** (include/vgpu/exec/tile_mma.hpp, src/exec/tile_mma.cpp): shared-memory matrices read per 16-byte run into float or int32 tiles, accumulator
+  registers <-> tiles by shuffles, mma fragments of f16, bf16, tf32, e4m3, e5m2, s8, u8, s4, u4 (dense and sparse), f64 and `.b1`.
+* **PTX `wgmma`** (`exec_wgmma_fast`) and **SASS HGMMA/IGMMA/QGMMA** (`Runner::gmma_fast`): the first warp of the group reads A and B into a float/int32 snapshot, each warp
+  makes one kernel call. **PTX `mma.sync`** (`exec_mma_tiles`) and **SASS `exec_mma`** for sparse f16/bf16/tf32, fp8, s8/u8/s4/u4 (also `.sp`, `.sat`), f64 (all
+  shapes, all four rounding modes; a NaN in a tile declines, the payload a fused multiply-add keeps depends on its operand order) and `.b1`; the SASS tier's
+  dense `IMMA` handler through the same code. **`tcgen05.mma`** reads A and B whole from the CTA's shared memory (`Tcgen05Host::smem_direct`) and, for dense f32/s32 D in
+  layouts D and A, makes one tile product of the CTA's rows.
+* The new hot-path functions are in `.text.unlikely`: without that PTX `local` read 0.965 to 0.975x with identical instructions (placement); with it 0.985 to 0.998.
+
+### Results (B/A of medians; microbenchmarks are cycles of the whole program, so startup is included and the ratios understate)
+| row | B/A | p | | row | B/A |
+|---|---|---|---|---|---|
+| wmma sass | 1.19x | <0.001 | | PTX wgmma m64n256k16 f16 | 0.19 (111 -> 15 us a warp) |
+| wmma ptx | 1.27x | <0.001 | | wgmma n128 bf16 / tf32 / e4m3 / s8 | 0.10 / 0.14 / 0.13 / 0.12 |
+| mma_ptx sass | 1.20x | <0.001 | | mma.sync s8 k32 / s4 k64 / b1 k256 | 0.20 / 0.16 / 0.10 |
+| mma_ptx ptx | 1.12x | <0.001 | | f64 m8n8k4 / e4m3 k32 / sparse f16 k32 | 0.38 / 0.60 / 0.89 |
+| tcgen05 m128n256k16 (loop of 100) | f16 280 -> 97 us, tf32 300 -> 90, fp8 440 -> 190, s8 800 -> 110 | | SASS IMMA 16816/16832 s8, .SAT | 1065 -> 670, 1456 -> 1057, 2631 -> 1104 ns |
+
+Canaries (sass / ptx, 11 runs): int_alu 1.00/0.99, f32_fma 1.01/1.00, f64_fma 1.01/1.01, mem 0.96 (p 0.95)/1.01, shared 0.99/1.00, atomics 0.99/1.00, local 0.99/0.985,
+divergent 0.99/1.00, warp 0.99/1.00, launch 0.970 (p 0.008; perf stat: 223.6 vs 224.7 M cycles, instructions equal)/0.99, api 1.01/1.01; A/A noise 1 to 3%.
+
+### Tests (wired in CMake) and mutation checks
+`test_tile_mma` (kernels at both levels against scalar loops incl. strides, saturation, rounding modes; operand reads; layouts), `test_wgmma_fast` (PTX wgmma, every dtype, layouts,
+swizzles, scales, sparse, `.satfinite`, per-lane scale-d, against `VGPU_FASTPATH=0`), `test_mma_tiles` (40 mma.sync forms), `test_tcgen05_fast`, `test_sass_mma_tiles`
+(every HMMA/IMMA/BMMA/DMMA/QMMA/HGMMA/IGMMA/QGMMA word of the sm_80/86/89/90a disassembler corpora in a hand-built cubin, run with and without `VGPU_SIMD=off`),
+`test_tc_ampere_fast` (float-kernel edges: exponent thresholds, subnormal operands, tf32 tails, infinities). 72 one-line mutants (a `MUT(n)` switch compiled into the
+mutated unit, run per id): 72 killed; the first campaign let 7 survive (f64 forms always declined by NaNs in the data, constant sparsity selector, dead special-lane
+code in the float kernel), fixed in the tests or removed. Run: Release guards, `lint_*` (the `lint_curl_retries` failure needs a git checkout), ASan+UBSan -O0 and TSan -O1
+of the six new tests, `VGPU_SIMD=base` runs.
+
+### Not done, and negative results
+* SASS bench rows cannot reach IMMA/HGMMA (no nvcc here): their numbers come from `test_sass_mma_tiles`' cubins (24 blocks, 200 repeats).
+* Fragment decode is still a switch per element (IMMA 670 ns, sparse HMMA 10 us a warp: `mma_sparse_column` copies the metadata into a `Lanes` per element); next step.
+* tcgen05: f16 D, layout F, parts of N (layout B), sparse and block-scaled forms keep the row loop; PTX `wmma` generic shapes, `m8n8k4` f16 untouched; no AVX-512 kernel.
+* `vpmaddwd` for the integer products and a float accumulator decode were not tried (Zen 4 has one-uop `vpmulld`).

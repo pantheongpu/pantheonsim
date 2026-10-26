@@ -1401,5 +1401,119 @@ void hfma2_bf_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint3
   store_masked(d, r, mask, n);
 }
 
+// ---- tile products: the tensor-core instructions' sums over whole tiles ------------------------------------------------------
+
+typedef int32_t V8i __attribute__((vector_size(32)));
+
+// R rows by V vectors of 8 columns of D = C + A x B in f32, k in order, each product rounded and then added (never fused). A is M x K
+// (row stride K), B is K x N (row stride N), C and D are M x N with row strides ldc and ldd (C null: zeros). N is a multiple of 8.
+template <unsigned R, unsigned V>
+inline void tile_f32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D,
+                           size_t ldd) {
+  V8f acc[R][V];
+  for (unsigned r = 0; r < R; ++r)
+    for (unsigned v = 0; v < V; ++v) {
+      if (C) std::memcpy(&acc[r][v], C + size_t{i0 + r} * ldc + j0 + 8 * v, sizeof(V8f));
+      else acc[r][v] = V8f{};
+    }
+  for (unsigned k = 0; k < K; ++k) {
+    V8f b[V];
+    for (unsigned v = 0; v < V; ++v) std::memcpy(&b[v], B + size_t{k} * N + j0 + 8 * v, sizeof(V8f));
+    for (unsigned r = 0; r < R; ++r) {
+      const float a = A[size_t{i0 + r} * K + k];
+      for (unsigned v = 0; v < V; ++v) {
+        const V8f p = a * b[v];
+        acc[r][v] = acc[r][v] + p;
+      }
+    }
+  }
+  for (unsigned r = 0; r < R; ++r)
+    for (unsigned v = 0; v < V; ++v) std::memcpy(D + size_t{i0 + r} * ldd + j0 + 8 * v, &acc[r][v], sizeof(V8f));
+}
+
+void tile_f32_k(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
+  unsigned i0 = 0;
+  for (; i0 + 4 <= M; i0 += 4) {
+    unsigned j0 = 0;
+    for (; j0 + 16 <= N; j0 += 16) tile_f32_block<4, 2>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 8 <= N; j0 += 8) tile_f32_block<4, 1>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+  }
+  for (; i0 < M; ++i0) {
+    unsigned j0 = 0;
+    for (; j0 + 16 <= N; j0 += 16) tile_f32_block<1, 2>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 8 <= N; j0 += 8) tile_f32_block<1, 1>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+  }
+}
+
+// The same for 32-bit integers (the operands are small: 8-bit elements or less, so a block's sum of products fits in 32 bits). Without `sat`
+// one wrapping sum of C and every product; with it the products are summed `block` at a time and C, or the running value, plus a block's
+// sum is clamped to the s32 range after each block (the sum of an int64 accumulator clamped, as the engines' scalar form has it).
+template <unsigned R>
+inline void tile_i32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, size_t ldc,
+                           unsigned block, bool sat, int32_t* D, size_t ldd) {
+  V8u acc[R];
+  for (unsigned r = 0; r < R; ++r) {
+    if (C) std::memcpy(&acc[r], C + size_t{i0 + r} * ldc + j0, sizeof(V8u));
+    else acc[r] = V8u{};
+  }
+  if (!sat) {
+    for (unsigned k = 0; k < K; ++k) {
+      V8u b;
+      std::memcpy(&b, B + size_t{k} * N + j0, sizeof b);
+      for (unsigned r = 0; r < R; ++r) acc[r] = acc[r] + static_cast<uint32_t>(A[size_t{i0 + r} * K + k]) * b;
+    }
+  } else {
+    for (unsigned k0 = 0; k0 < K; k0 += block) {
+      V8u s[R] = {};
+      const unsigned k1 = k0 + block < K ? k0 + block : K;
+      for (unsigned k = k0; k < k1; ++k) {
+        V8u b;
+        std::memcpy(&b, B + size_t{k} * N + j0, sizeof b);
+        for (unsigned r = 0; r < R; ++r) s[r] = s[r] + static_cast<uint32_t>(A[size_t{i0 + r} * K + k]) * b;
+      }
+      for (unsigned r = 0; r < R; ++r) {
+        const V8u sum = acc[r] + s[r];
+        // Signed overflow of acc + s: both operands of one sign and the sum of the other.
+        const V8i ov = reinterpret_cast<V8i>((acc[r] ^ sum) & (s[r] ^ sum)) < 0;
+        // acc negative: INT32_MIN (0x80000000), else INT32_MAX (0x7fffffff)
+        const V8u neg = reinterpret_cast<V8u>(reinterpret_cast<V8i>(acc[r]) >> 31);
+        const V8u lim = (neg & 0x80000000u) | (~neg & 0x7fffffffu);
+        const V8u om = reinterpret_cast<V8u>(ov);
+        acc[r] = (om & lim) | (~om & sum);
+      }
+    }
+  }
+  for (unsigned r = 0; r < R; ++r) std::memcpy(D + size_t{i0 + r} * ldd + j0, &acc[r], sizeof(V8u));
+}
+
+void tile_i32_k(unsigned M, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, size_t ldc, unsigned block, bool sat,
+                int32_t* D, size_t ldd) {
+  unsigned i0 = 0;
+  for (; i0 + 4 <= M; i0 += 4)
+    for (unsigned j0 = 0; j0 + 8 <= N; j0 += 8) tile_i32_block<4>(i0, j0, N, K, A, B, C, ldc, block, sat, D, ldd);
+  for (; i0 < M; ++i0)
+    for (unsigned j0 = 0; j0 + 8 <= N; j0 += 8) tile_i32_block<1>(i0, j0, N, K, A, B, C, ldc, block, sat, D, ldd);
+}
+
+// D = C + A x B in binary64, k in order, each step one fused multiply-add in the host's current rounding mode (the caller sets it).
+void tile_f64_k(unsigned M, unsigned N, unsigned K, const double* A, const double* B, const double* C, double* D) {
+  for (unsigned i = 0; i < M; ++i) {
+    unsigned j = 0;
+#if VGPU_SIMD_AVX2
+    for (; j + 4 <= N; j += 4) {
+      __m256d acc = C ? _mm256_loadu_pd(C + size_t{i} * N + j) : _mm256_setzero_pd();
+      for (unsigned k = 0; k < K; ++k)
+        acc = _mm256_fmadd_pd(_mm256_set1_pd(A[size_t{i} * K + k]), _mm256_loadu_pd(B + size_t{k} * N + j), acc);
+      _mm256_storeu_pd(D + size_t{i} * N + j, acc);
+    }
+#endif
+    for (; j < N; ++j) {
+      double acc = C ? C[size_t{i} * N + j] : 0.0;
+      for (unsigned k = 0; k < K; ++k) acc = __builtin_fma(A[size_t{i} * K + k], B[size_t{k} * N + j], acc);
+      D[size_t{i} * N + j] = acc;
+    }
+  }
+}
+
 #endif  // !VGPU_LANES_ONLY
 }  // namespace VGPU_SIMD_NS
