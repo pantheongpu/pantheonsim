@@ -239,7 +239,7 @@ VTEST(wgmma_simd_route_matches_the_general_form) {
     for (uint32_t N : {8u, 24u, 64u, 256u}) {
       if (is_int(f.a) && (N == 40 || N == 56)) continue;
       for (int trial = 0; trial < 6; ++trial) {
-        Case c{&f, N, trial % 2 == 1, trial >= 4 && !(f.a == T::TF32 && false), trial % 3 == 2, trial % 2 == 0 && f.acc != Acc::S32, trial % 3 == 1 && f.acc != Acc::S32,
+        Case c{&f, N, trial % 2 == 1, trial >= 4 && !(f.a == T::TF32 && false), trial % 3 == 2, (trial % 2 == 0 || trial >= 3) && f.acc != Acc::S32, trial % 3 == 1 && f.acc != Acc::S32,   // (A in registers with a negated A too: trials 3 and 5)
                trial % 4 == 1, trial % 4 == 3};
         const bool sixteen = f.a == T::F16 || f.a == T::BF16;
         if (!sixteen || c.a_regs) c.tr_a = false;

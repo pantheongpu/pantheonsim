@@ -1348,6 +1348,9 @@ vgpu_unit_test(test_tile_mma)
 vgpu_unit_test(test_wgmma_fast)
 # tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
 vgpu_unit_test(test_tcgen05_fast)
+# tcgen05.mma through the tile kernels for the forms the whole-operand route leaves to the row loop (f16 D, layouts F, B, G, A in Tensor Memory, sparse A,
+# block scaling), against the row loop (VGPU_FASTPATH=0), bit for bit.
+vgpu_unit_test(test_tcgen05_tiles)
 # The PTX engine's tile route for the other mma.sync forms against the general form, bit for bit.
 vgpu_unit_test(test_mma_tiles)
 # The SASS executor's tile route for the MMA forms its SIMD HMMA kernel does not take, against its general form (the kernels off in a second run).

@@ -61,7 +61,7 @@ unsigned ref_sparse_column(unsigned bits, unsigned K, unsigned sel, const uint32
   return chunk * chunk_elems + pos;
 }
 
-void ref_frag_a(FragType t, unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* iout) {
+void ref_frag_a(FragType t, unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* iout, bool negate) {
   const bool is_int = exec::frag_is_int(t);
   const unsigned bits = exec::frag_bits(t), p = 32 / bits;
   const unsigned nregs = M * K / (sparse ? 2 : 1) / (32 * p);
@@ -78,8 +78,8 @@ void ref_frag_a(FragType t, unsigned M, unsigned K, bool sparse, const uint32_t*
       for (unsigned e = 0; e < p; ++e) {
         const unsigned col = sparse ? ref_sparse_column(bits, K, sel, meta, row, tt * cpr + (r / 2) * 4 * cpr + e / stored, e % stored) : col0 + e;
         if (col >= K) continue;
-        if (is_int) iout[size_t{row} * K + col] = ref_int(t, v, e);
-        else f[size_t{row} * K + col] = ref_float(t, v, e);
+        if (is_int) iout[size_t{row} * K + col] = negate ? -ref_int(t, v, e) : ref_int(t, v, e);
+        else f[size_t{row} * K + col] = negate ? std::bit_cast<float>(std::bit_cast<uint32_t>(ref_float(t, v, e)) ^ 0x80000000u) : ref_float(t, v, e);
       }
     }
 }
@@ -160,8 +160,10 @@ VTEST(the_a_fragment_decode_matches_the_element_form) {
       const bool is_int = exec::frag_is_int(f.t);
       std::vector<float> gf(size_t{f.M} * f.K, -1.0f), wf(size_t{f.M} * f.K, -1.0f);
       std::vector<int32_t> gi(size_t{f.M} * f.K, -7), wi(size_t{f.M} * f.K, -7);
-      exec::mma_frag_a(f.t, f.M, f.K, f.sparse, regs.data(), meta.data(), sel, gf.data(), gi.data());
-      ref_frag_a(f.t, f.M, f.K, f.sparse, regs.data(), meta.data(), sel, wf.data(), wi.data());
+      // (a quarter of the trials negate: wgmma's imm-scale-a of -1 -- the elements the registers supply, not a sparse A's zeros)
+      const bool negate = trial % 4 == 3;
+      exec::mma_frag_a(f.t, f.M, f.K, f.sparse, regs.data(), meta.data(), sel, gf.data(), gi.data(), negate);
+      ref_frag_a(f.t, f.M, f.K, f.sparse, regs.data(), meta.data(), sel, wf.data(), wi.data(), negate);
       for (size_t i = 0; i < gf.size(); ++i) {
         ++compared;
         if (is_int ? gi[i] != wi[i] : !same(gf[i], wf[i])) {
@@ -197,6 +199,34 @@ VTEST(the_b_fragment_decode_matches_the_element_form) {
     }
   }
   VCHECK(compared > 300000);
+}
+
+// A warp's 16 rows of a decoded sparse A (from shared memory) spread over their columns: element j of a row's stored half goes where the metadata of
+// its chunk says; the other columns are zero.
+VTEST(the_sparse_expansion_of_decoded_rows_matches_the_placement_rule) {
+  std::mt19937 g(0x5e1f);
+  long compared = 0;
+  for (unsigned abits : {8u, 16u, 32u})
+    for (unsigned K : {16u, 32u, 64u}) {
+      if (abits == 32 && K > 32) continue;
+      for (int trial = 0; trial < 60; ++trial) {
+        const unsigned kp = K / 2, sel = trial % 4, stored = abits == 32 ? 1 : 2;
+        std::vector<uint32_t> meta(32), vals(size_t{16} * kp), got(size_t{16} * K, 0xdeadbeefu), want(size_t{16} * K, 0);
+        for (uint32_t& w : meta) w = g();
+        for (uint32_t& w : vals) w = g();
+        for (unsigned r = 0; r < 16; ++r)
+          for (unsigned j = 0; j < kp; ++j) {
+            const unsigned col = ref_sparse_column(abits, K, sel, meta.data(), r, j / stored, j % stored);
+            if (col < K) want[size_t{r} * K + col] = vals[size_t{r} * kp + j];
+          }
+        exec::wgmma_sparse_expand(abits, K, sel, meta.data(), vals.data(), got.data());
+        for (size_t i = 0; i < got.size(); ++i) {
+          ++compared;
+          if (got[i] != want[i]) throw vtest::Failure("abits " + std::to_string(abits) + " K " + std::to_string(K) + " trial " + std::to_string(trial) + ": element " + std::to_string(i));
+        }
+      }
+    }
+  VCHECK(compared > 50000);
 }
 
 VTEST_MAIN

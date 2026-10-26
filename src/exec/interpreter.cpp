@@ -15743,9 +15743,18 @@ __attribute__((section(".text.unlikely"))) void tcgen05_mma(const Tcgen05Mma& op
                "tcgen05.mma reads a scale factor from Tensor Memory lane " + std::to_string(l) +
                    ", column " + std::to_string(col) + ", which no tcgen05.alloc has allocated");
     const uint32_t byte = (t.at(l, col) >> (8 * (b % 4))) & 0xFF;
-    if (ue4m3) return fp8_to_double(byte & 0x7F, kE4M3);
-    if (byte == 0xFF) return std::numeric_limits<double>::quiet_NaN();
-    return std::ldexp(1.0, int(byte) - 127);   // UE8M0
+    // UE4M3 (the byte's low seven bits as an e4m3) or UE8M0 (2^(byte - 127), 0xFF the NaN), from tables built with those expressions.
+    static const std::array<double, 256> ue4m3_tab = [] {
+      std::array<double, 256> a{};
+      for (uint32_t i = 0; i < 256; ++i) a[i] = fp8_to_double(i & 0x7F, kE4M3);
+      return a;
+    }();
+    static const std::array<double, 256> ue8m0_tab = [] {
+      std::array<double, 256> a{};
+      for (uint32_t i = 0; i < 256; ++i) a[i] = i == 0xFF ? std::numeric_limits<double>::quiet_NaN() : std::ldexp(1.0, int(i) - 127);
+      return a;
+    }();
+    return (ue4m3 ? ue4m3_tab : ue8m0_tab)[byte];
   };
 
   // The metadata of the row D lane dl holds: its partition's, at the row
@@ -15867,6 +15876,142 @@ __attribute__((section(".text.unlikely"))) void tcgen05_mma(const Tcgen05Mma& op
         simd::kernels().tile_f32(Mloc, N, K, Af_all.data(), Bf.data(), accumulate ? cells : nullptr, kLd, cells, kLd);
         // (A NaN in an f32 D is the canonical 0x7fffffff, as in the rows below.)
         canon_nan_rows(base, Mloc, N, kLd);
+      }
+      continue;
+    }
+    // The other forms through the same tile kernels: f16 D, the layouts that spread a row of D over several lanes (F, B, E, G), A from Tensor Memory,
+    // sparse A, and block scaling. The rows of A as D lane dl sees them (load_a: decoded, expanded by the lane's metadata, scaled), the cells of D
+    // gathered as they are, one kernel call for the rows a lane partition's scale factors serve, and the cells written back -- each element still the
+    // sum of its products in k order, each product rounded to f32 and then added, as the row loops below sum it.
+    if (simd::enabled() && h.smem_direct(v) && std::all_of(off_mask.begin(), off_mask.end(), [](uint32_t x) { return x == 0; })) {
+      const uint32_t wp = N / n_parts;   // the columns of one part of a row
+      thread_local std::vector<float> Af_t, Cf_t, Df_t, Bp_t;
+      thread_local std::vector<int32_t> Ai_t, Ci_t, Di_t, Bpi_t;
+      thread_local std::vector<uint16_t> half_t;
+      for (uint32_t p = 0; p < n_parts; ++p) {
+        // Which cells hold row m's columns of this part.
+        const auto cells_of = [&](uint32_t m) {
+          uint32_t dl, dc0;
+          d_pos(m, p * wp, d_lane0, &dl, &dc0);
+          return std::pair<uint32_t, uint32_t>(dl, dc0);
+        };
+        // A: row m of the CTA, by the lane its part of D is in.
+        if (d_int) Ai_t.resize(size_t{Mloc} * K);
+        else Af_t.resize(size_t{Mloc} * K);
+        // Block scaling: the scale factors of A's row m and the rows' partition (a block of 32 D lanes), kept to scale B's columns by.
+        std::vector<uint32_t> part_of_row(Mloc);
+        for (uint32_t m = 0; m < Mloc; ++m) {
+          const uint32_t dl = cells_of(m).first;
+          part_of_row[m] = dl / 32;
+          load_a(m, dl);
+          if (d_int) {
+            for (uint32_t k = 0; k < K; ++k) Ai_t[size_t{m} * K + k] = static_cast<int32_t>(A[k]);
+          } else if (!mx) {
+            for (uint32_t k = 0; k < K; ++k) Af_t[size_t{m} * K + k] = static_cast<float>(A[k]);
+          } else {
+            for (uint32_t j = 0; j < sv; ++j) SA[j] = scale_of(t, sfa_addr, m, dl / 32, sfa_id, j, 4, lane128);
+            for (uint32_t k = 0; k < K; ++k) Af_t[size_t{m} * K + k] = static_cast<float>(A[k] * SA[k / blk]);
+          }
+        }
+        // B of this part: K x wp, contiguous. Scaled per column and partition for a block-scaled MMA.
+        const auto part_cols = [&](const float* src, float* dst) {
+          for (uint32_t k = 0; k < K; ++k) std::memcpy(dst + size_t{k} * wp, src + size_t{k} * N + p * wp, wp * sizeof(float));
+        };
+        if (d_int) {
+          Bpi_t.resize(size_t{K} * wp);
+          for (uint32_t k = 0; k < K; ++k)
+            for (uint32_t i = 0; i < wp; ++i) Bpi_t[size_t{k} * wp + i] = static_cast<int32_t>(Bi[size_t{k} * N + p * wp + i]);
+        } else if (!mx) {
+          if (n_parts == 1) {
+            Bp_t.assign(Bf.begin(), Bf.end());
+          } else {
+            Bp_t.resize(size_t{K} * wp);
+            part_cols(Bf.data(), Bp_t.data());
+          }
+        }
+        // C: the cells' current values (zeros when D is not accumulated), as f32 (an f16 cell: its low half) or s32.
+        Cf_t.resize(size_t{Mloc} * wp);
+        Ci_t.resize(size_t{Mloc} * wp);
+        Df_t.resize(size_t{Mloc} * wp);
+        Di_t.resize(size_t{Mloc} * wp);
+        if (accumulate) {
+          for (uint32_t m = 0; m < Mloc; ++m) {
+            const auto [dl, dc0] = cells_of(m);
+            const uint32_t* cells = &t.at(dl, d_col0 + dc0);
+            if (d_int) {
+              std::memcpy(&Ci_t[size_t{m} * wp], cells, wp * sizeof(uint32_t));
+            } else if (d_f16) {
+              half_t.resize(wp);
+              for (uint32_t i = 0; i < wp; ++i) half_t[i] = static_cast<uint16_t>(cells[i] & 0xFFFF);
+              simd::kernels().f16_to_f32(half_t.data(), &Cf_t[size_t{m} * wp], wp);
+              if (d_scale != 1.0)
+                for (uint32_t i = 0; i < wp; ++i) Cf_t[size_t{m} * wp + i] = static_cast<float>(static_cast<double>(Cf_t[size_t{m} * wp + i]) * d_scale);
+            } else if (d_scale == 1.0) {
+              std::memcpy(&Cf_t[size_t{m} * wp], cells, wp * sizeof(uint32_t));
+            } else {
+              for (uint32_t i = 0; i < wp; ++i) Cf_t[size_t{m} * wp + i] = static_cast<float>(static_cast<double>(f32(cells[i])) * d_scale);
+            }
+          }
+        }
+        // The product, a range of rows at a time (all of them, but for block scaling: the rows of one partition share their scaled B).
+        const auto product = [&](uint32_t m0, uint32_t m1, const float* Bm, const int32_t* Bmi) {
+          const uint32_t rows = m1 - m0;
+          if (d_int)
+            simd::kernels().tile_i32(rows, wp, K, &Ai_t[size_t{m0} * K], Bmi, accumulate ? &Ci_t[size_t{m0} * wp] : nullptr, wp, K, sat,
+                                     &Di_t[size_t{m0} * wp], wp);
+          else
+            simd::kernels().tile_f32(rows, wp, K, &Af_t[size_t{m0} * K], Bm, accumulate ? &Cf_t[size_t{m0} * wp] : nullptr, wp, &Df_t[size_t{m0} * wp], wp);
+        };
+        if (d_int) {
+          product(0, Mloc, nullptr, Bpi_t.data());
+        } else if (!mx) {
+          product(0, Mloc, Bp_t.data(), nullptr);
+        } else {
+          // B's columns scaled by the factors of the partition the rows are in; partitions whose factors are the same share one scaled B.
+          std::vector<float> Bq;
+          std::vector<double> SBq(size_t{N} * sv), SBfirst;
+          std::vector<float> Bfirst;
+          bool have_first = false;
+          for (uint32_t m0 = 0; m0 < Mloc;) {
+            uint32_t m1 = m0 + 1;
+            while (m1 < Mloc && part_of_row[m1] == part_of_row[m0]) ++m1;
+            const uint32_t q = part_of_row[m0];
+            for (uint32_t n = 0; n < wp; ++n)
+              for (uint32_t j = 0; j < sv; ++j) SBq[size_t{n} * sv + j] = scale_of(t, sfb_addr, p * wp + n, q, sfb_id, j, sfb_stride);
+            if (have_first && SBq.size() == SBfirst.size() && std::memcmp(SBq.data(), SBfirst.data(), SBq.size() * sizeof(double)) == 0) {
+              product(m0, m1, Bfirst.data(), nullptr);
+            } else {
+              Bq.resize(size_t{K} * wp);
+              for (uint32_t k = 0; k < K; ++k)
+                for (uint32_t n = 0; n < wp; ++n) Bq[size_t{k} * wp + n] = static_cast<float>(B[size_t{k} * N + p * wp + n] * SBq[size_t{n} * sv + k / blk]);
+              product(m0, m1, Bq.data(), nullptr);
+              if (!have_first) {
+                have_first = true;
+                SBfirst = SBq;
+                Bfirst = Bq;
+              }
+            }
+            m0 = m1;
+          }
+        }
+        // D back into the cells: an f32 NaN is the canonical 0x7fffffff (whichever NaN the host's add kept), an f16 one 0x7fff.
+        for (uint32_t m = 0; m < Mloc; ++m) {
+          const auto [dl, dc0] = cells_of(m);
+          uint32_t* cells = &t.at(dl, d_col0 + dc0);
+          if (d_int) {
+            std::memcpy(cells, &Di_t[size_t{m} * wp], wp * sizeof(uint32_t));
+            continue;
+          }
+          const float* row = &Df_t[size_t{m} * wp];
+          if (d_f16) {
+            half_t.resize(wp);
+            simd::kernels().f32_to_f16(row, half_t.data(), wp);
+            for (uint32_t i = 0; i < wp; ++i) cells[i] = row[i] != row[i] ? static_cast<uint32_t>(kCanonicalNaN16) : half_t[i];
+          } else {
+            std::memcpy(cells, row, wp * sizeof(uint32_t));
+            canon_nan_rows(cells, 1, wp, 0);
+          }
+        }
       }
       continue;
     }
