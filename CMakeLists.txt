@@ -1323,6 +1323,7 @@ vgpu_unit_test(test_sass_code_at)
 vgpu_unit_test(test_sass_block_reuse)
 vgpu_unit_test(test_sass_alu_runs)
 vgpu_unit_test(test_launch_env)
+vgpu_unit_test(test_sass_lea)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
 # An RTX 3060's tensor-core sum (include/vgpu/exec/tc_ampere.hpp): card-measured vectors, an independent form, special values.

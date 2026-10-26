@@ -199,35 +199,14 @@ TIER_HANDLER(h_lop3) {
 
 TIER_HANDLER(h_lea) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], r[32];
+  alignas(32) uint32_t t[3][32], rt[32];
+  uint32_t* const r = tier_out(c, op.dst, ex, rt);
   const bool hi = op.aux & 1, x = op.aux & 2, three = op.aux & 4, bneg = op.aux & 8;
-  const unsigned sh = op.a;
   const Mask cin = x ? tier_pmask(c, op.p) : 0;
   const uint32_t* a = tier_src<false>(c, op.s[0], t[0]);
   const uint32_t* b = tier_src<false>(c, op.s[1], t[1]);
-  const uint32_t* top = three ? tier_src<false>(c, op.s[2], t[2]) : nullptr;
-  Mask carry = 0;
-  if (!hi && !x && !bneg) {   // the usual one, (a << s) + b: two vector operations, and the carry out is a wrap
-    for (unsigned l = 0; l < 32; ++l) r[l] = (sh >= 32 ? 0 : a[l] << sh) + b[l];
-    if (op.dst2 != tier::kNoReg)
-      for (unsigned l = 0; l < 32; ++l) carry |= static_cast<Mask>(r[l] < (sh >= 32 ? 0 : a[l] << sh)) << l;
-    tier_store(c, op.dst, ex, r);
-    if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
-    return;
-  }
-  for (unsigned l = 0; l < 32; ++l) {
-    uint32_t shifted;
-    if (!hi) {
-      shifted = sh >= 32 ? 0 : a[l] << sh;
-    } else {
-      const uint32_t tp = three ? top[l] : static_cast<uint32_t>(static_cast<int32_t>(a[l]) >> 31);
-      shifted = static_cast<uint32_t>(((a[l] | (static_cast<uint64_t>(tp) << 32)) << sh) >> 32);
-    }
-    uint64_t sum = static_cast<uint64_t>(shifted) + b[l] + ((cin >> l) & 1);
-    if (bneg && b[l] == 0) sum += uint64_t{1} << 32;   // -0 is ~0 + 1: it carries out (see the general rule)
-    r[l] = static_cast<uint32_t>(sum);
-    carry |= static_cast<Mask>(sum >> 32 != 0) << l;
-  }
+  const uint32_t* top = three ? tier_src<false>(c, op.s[2], t[2]) : nullptr;   // (none: the high word is a's sign)
+  const Mask carry = exec::sasslea::lea_lanes({hi, bneg, op.a}, r, a, b, top, cin);   // (vgpu/exec/sass_lea.hpp: four lanes to a vector)
   tier_store(c, op.dst, ex, r);
   if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
 }
