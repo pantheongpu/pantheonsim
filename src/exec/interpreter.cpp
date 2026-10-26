@@ -1963,7 +1963,7 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
     frac[i] = f;
   }
   int w[8];
-  if (!(frac[0] | frac[1] | frac[2])) {   // at a texel's centre: the whole weight is the first texel's (what tex_weights gives)
+  if (fast && !(frac[0] | frac[1] | frac[2])) {   // at a texel's centre: the whole weight is the first texel's (what tex_weights gives)
     w[0] = total;
     for (int k = 1; k < 8; ++k) w[k] = 0;
   } else {
