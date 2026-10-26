@@ -91,7 +91,7 @@ std::vector<uint64_t> expected(const Shape& sh, WgKind kind, ReduxOp op, const T
     for (uint32_t i = 0; i < n; ++i) {
       const uint64_t v = in[b * n + i];
       switch (kind) {
-        case WgKind::Broadcast: out[b * n + i] = in[b * n + (src < n ? src : 0)]; break;
+        case WgKind::Broadcast: out[b * n + i] = src < n ? in[b * n + src] : 0; break;   // a source nobody is reads as zero
         case WgKind::Reduce: acc = i == 0 ? v : ref_combine(op, t, acc, v); break;
         case WgKind::InclusiveScan:
           acc = i == 0 ? v : ref_combine(op, t, acc, v);
@@ -158,7 +158,7 @@ VTEST(broadcast_takes_the_value_of_the_named_thread) {
     for (const Shape& sh : kShapes) {
       std::vector<uint64_t> in(static_cast<size_t>(sh.n()) * sh.grid);
       for (auto& v : in) v = random_value(rng, t);
-      for (uint32_t src : {0u, 1u, sh.n() / 2, sh.n() - 1}) {
+      for (uint32_t src : {0u, 1u, sh.n() / 2, sh.n() - 1, sh.n(), 5000u}) {
         for (uint32_t W : {8u, 16u, 32u}) {
           const auto got = run_one(sh, W, vgpu::exec::SchedulerKind::Deterministic, 0, WgKind::Broadcast, ReduxOp::Add, t, src, in);
           compare("broadcast", t, got, expected(sh, WgKind::Broadcast, ReduxOp::Add, t, src, in));
