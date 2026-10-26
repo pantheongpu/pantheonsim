@@ -627,7 +627,7 @@ class Runner {
     vgpu::exec::TileElem at, bt;
     bool int_form, acc32, sat, neg_a, neg_b, a_kmajor, b_kmajor, reg_a, sparse;
   };
-  bool gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const GmmaForm& f);
+  __attribute__((noinline, section(".text.unlikely"))) bool gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const GmmaForm& f);
   void exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex);   // textures and surfaces
   void exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex);   // mbarriers
   uint32_t mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned lane, bool ur_only, Block** owner);
