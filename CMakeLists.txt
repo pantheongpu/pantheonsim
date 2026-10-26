@@ -1353,6 +1353,10 @@ vgpu_unit_test(test_mma_tiles)
 # The SASS executor's tile route for the MMA forms its SIMD HMMA kernel does not take, against its general form (the kernels off in a second run).
 vgpu_unit_test(test_sass_mma_tiles)
 target_compile_definitions(test_sass_mma_tiles PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The mma fragment decode against the element-at-a-time form it replaced (frozen in the test), bit for bit; and again on the baseline kernels.
+vgpu_unit_test(test_frag_decode)
+add_test(NAME test_frag_decode_simd_base COMMAND test_frag_decode)
+set_tests_properties(test_frag_decode_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base")
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
