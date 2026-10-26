@@ -4016,6 +4016,25 @@ struct Machine {
   // RDNA3 and RDNA4's v_wmma_*, a whole tile at a time (wmma_reference is the element-at-a-time version). The same layouts, the
   // same widening, every output a double sum of its products in order of k and rounded once (or the exact integer sum, saturated
   // where CLAMP says); the operands are decoded once, by type, instead of by comparing the type's name for every element.
+  // Where each lane's run of K goes in WMMA's tiles (16 rows of K, as the float tiles are laid out), for gfx11 (the first 16 lanes hold
+  // a row (column) each, all of K) and gfx12 (32 lanes, two halves of K): `a` the double of A's run, `b` of B's, `pair` the dword of an
+  // integer B tile (pairs of K) a lane's first pair is.
+  struct WmmaPlace {
+    uint32_t a[32], b[32], pair[32];
+  };
+  static const WmmaPlace& wmma_place(bool g12, uint32_t K) {
+    static const auto tables = [] {
+      std::array<std::array<WmmaPlace, 33>, 2> t{};   // [g12][K]
+      for (uint32_t g = 0; g < 2; ++g)
+        for (uint32_t k = 2; k <= 32; k += 2)
+          for (uint32_t l = 0; l < 32; ++l) {
+            const uint32_t rc = l % 16, k0 = g ? l / 16 * (k / 2) : 0;
+            t[g][k].a[l] = rc * k + k0, t[g][k].b[l] = k0 * 16 + rc, t[g][k].pair[l] = k0 / 2 * 16 + rc;
+          }
+      return t;
+    }();
+    return tables[g12][K];
+  }
   bool wmma_fast(Wave& w, const Inst& in, const OpName& op) {
     constexpr int kWmmaOrder = WMMA_ORDER;
     if (w.lanes != 32 || static_cast<uint32_t>(w.exec) != 0xFFFFFFFFu) return false;
@@ -4084,27 +4103,30 @@ struct Machine {
         *half = half_out && high ? 1 : 0;
       }
     };
+    // Each row of D is 16 consecutive lanes (`lane0` on) of one register (and one half of it): the lanes' columns, in order.
+    struct RowAt {
+      uint32_t lane0, reg, half;
+    } rowat[16];
+    for (uint32_t row = 0; row < 16; ++row) place(row, 0, &rowat[row].lane0, &rowat[row].reg, &rowat[row].half);
     double cd[256];
-    for (uint32_t row = 0; row < 16; ++row)
-      for (uint32_t col = 0; col < 16; ++col) {
-        uint32_t lane, reg, half;
-        place(row, col, &lane, &reg, &half);
-        double c;
-        if (co.kind != OperandKind::Vgpr) {
-          c = co.kind == OperandKind::InlineFloat ? co.fvalue : static_cast<double>(static_cast<int32_t>(scalar(w, co)));
-        } else {
-          const uint32_t v = w.vgpr.r[co.index + reg][lane];
-          if (out_f32) c = static_cast<double>(as_float(v));
-          else if (is_int) c = static_cast<double>(static_cast<int32_t>(v));
-          else if (out_bf16) c = static_cast<double>(as_float((half ? v >> 16 : v & 0xFFFF) << 16));
-          else c = half_bits_to_double(static_cast<uint16_t>(half ? v >> 16 : v));
-        }
-        cd[row * 16 + col] = c;
+    int32_t ci[256];   // (the integer forms' C, as it is)
+    for (uint32_t row = 0; row < 16; ++row) {
+      double* const d = cd + row * 16;
+      if (co.kind != OperandKind::Vgpr) {
+        const double c = co.kind == OperandKind::InlineFloat ? co.fvalue : static_cast<double>(static_cast<int32_t>(scalar(w, co)));
+        if (is_int) std::fill(ci + row * 16, ci + row * 16 + 16, static_cast<int32_t>(static_cast<int64_t>(c)));
+        else std::fill(d, d + 16, c);
+        continue;
       }
-    // (the destination as it is: a 16-bit result leaves the other half of its register alone)
-    std::array<std::array<uint32_t, 8>, 32> result;
-    for (uint32_t lane = 0; lane < 32; ++lane)
-      for (uint32_t r = 0; r < 8; ++r) result[lane][r] = w.vgpr.r[dst.index + r][lane];
+      const uint32_t* const v = w.vgpr.r[co.index + rowat[row].reg].data() + rowat[row].lane0;
+      const uint32_t half = rowat[row].half;
+      if (out_f32) run_f32_to_f64(d, v, 16);
+      else if (is_int) std::memcpy(ci + row * 16, v, 64);
+      else if (out_bf16) for (uint32_t col = 0; col < 16; ++col) d[col] = static_cast<double>(as_float((half ? v[col] >> 16 : v[col] & 0xFFFF) << 16));
+      else for (uint32_t col = 0; col < 16; ++col) d[col] = half_bits_to_double(static_cast<uint16_t>(half ? v[col] >> 16 : v[col]));
+    }
+    // (the destination's registers beyond its width are not written)
+    const uint32_t regs = dst.width;
     // A[row][k] is element k % per_lane of lane row (+ 16 for the second half of k on gfx12); B[k][col] likewise.
     const auto lane_of = [&](uint32_t rc, uint32_t k) { return g12 ? rc + 16 * (k / per_lane) : rc; };
     const auto elem_of = [&](uint32_t k) { return g12 ? k % per_lane : k; };
@@ -4125,42 +4147,46 @@ struct Machine {
             else bi[((k >> 1) * 16 + rc) * 2 + (k & 1)] = static_cast<int16_t>(v);
           }
       };
-      fill(sa, A.kind, true);
-      fill(sb, B.kind, false);
+      const WmmaPlace& place_tab = wmma_place(g12, K);
+      const uint32_t nl = g12 ? 32 : 16;
+      if ((A.kind == 'c' || A.kind == 'u') && per_lane % 4 == 0 && (B.kind == 'c' || B.kind == 'u')) {   // (8-bit inputs: widened in registers)
+        if (A.kind == 'c') matrix_decode_a_i8<true>(sa, place_tab.a, nl, per_lane, ia.data());
+        else matrix_decode_a_i8<false>(sa, place_tab.a, nl, per_lane, ia.data());
+        if (B.kind == 'c') matrix_decode_b_i8<true>(sb, place_tab.pair, nl, per_lane, 16, bi.data());
+        else matrix_decode_b_i8<false>(sb, place_tab.pair, nl, per_lane, 16, bi.data());
+      } else {
+        fill(sa, A.kind, true);
+        fill(sb, B.kind, false);
+      }
       int32_t dots[256];
       mfma_tile_int(16, 16, K, ia.data(), bi.data(), dots);
-      for (uint32_t row = 0; row < 16; ++row)
-        for (uint32_t col = 0; col < 16; ++col) {
-          uint32_t lane, reg, half;
-          place(row, col, &lane, &reg, &half);
-          int64_t isum = static_cast<int64_t>(static_cast<uint64_t>(static_cast<int64_t>(cd[row * 16 + col])) + static_cast<uint64_t>(dots[row * 16 + col]));
-          if (in.clamp) isum = std::clamp<int64_t>(isum, INT32_MIN, INT32_MAX);
-          result[lane][reg] = static_cast<uint32_t>(isum);
+      for (uint32_t row = 0; row < 16; ++row) {
+        if (rowat[row].reg >= regs) continue;
+        uint32_t* const o = w.vgpr.r[dst.index + rowat[row].reg].data() + rowat[row].lane0;
+        if (!in.clamp) {   // (the sum wraps)
+          run_add_words(o, ci + row * 16, dots + row * 16, 16);
+          continue;
         }
+        for (uint32_t col = 0; col < 16; ++col) {
+          const int64_t isum = std::clamp<int64_t>(int64_t{ci[row * 16 + col]} + dots[row * 16 + col], INT32_MIN, INT32_MAX);
+          o[col] = static_cast<uint32_t>(isum);
+        }
+      }
     } else {
       std::array<double, 16 * 32> fa, fb;
       const auto fill = [&](const MatrixSrc& src, char kind, double* dst_tile, bool as_a) {
-#if defined(__SSE2__)
-        if (kind == 'h') {   // binary16: sixteen rows (columns) of one k at a time, in the lanes that hold them
-          for (uint32_t k = 0; k < K; ++k) {
-            const uint32_t* const words = src.rows[elem_of(k) / 2] + lane_of(0, k);
-            const int shift = 16 * static_cast<int>(elem_of(k) % 2);
-            for (uint32_t q = 0; q < 16; q += 4) {
-              __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(words + q));
-              raw = _mm_and_si128(_mm_srli_epi32(raw, shift), _mm_set1_epi32(0xFFFF));
-              __m128d lo, hi;
-              half4_to_double(raw, &lo, &hi);
-              if (as_a) {
-                _mm_storel_pd(dst_tile + (q + 0) * K + k, lo), _mm_storeh_pd(dst_tile + (q + 1) * K + k, lo);
-                _mm_storel_pd(dst_tile + (q + 2) * K + k, hi), _mm_storeh_pd(dst_tile + (q + 3) * K + k, hi);
-              } else {
-                _mm_storeu_pd(dst_tile + k * 16 + q, lo), _mm_storeu_pd(dst_tile + k * 16 + q + 2, hi);
-              }
-            }
+        if (kind == 'h' || kind == 'b') {   // the 16-bit floats, a register at a time: the lanes' runs of K to their places in the tile
+          const WmmaPlace& tab = wmma_place(g12, K);
+          const uint32_t nl = g12 ? 32 : 16;
+          if (kind == 'h') {
+            if (as_a) matrix_decode_wide<'h'>(src, tab.a, 1, per_lane, dst_tile, nl);
+            else matrix_decode_wide<'h', true>(src, tab.b, 16, per_lane, dst_tile, nl);
+          } else {
+            if (as_a) matrix_decode_wide<'b'>(src, tab.a, 1, per_lane, dst_tile, nl);
+            else matrix_decode_wide<'b', true>(src, tab.b, 16, per_lane, dst_tile, nl);
           }
           return;
         }
-#endif
         const auto go = [&](auto tag) {
           constexpr char T = decltype(tag)::value;
           for (uint32_t rc = 0; rc < 16; ++rc)
@@ -4176,32 +4202,31 @@ struct Machine {
       fill(sb, B.kind, fb.data(), false);
       double sums[256];
       mfma_tile_f<kWmmaOrder>(16, 16, K, fa.data(), fb.data(), cd, sums);
-      for (uint32_t row = 0; row < 16; ++row)
-        for (uint32_t col = 0; col < 16; ++col) {
-          uint32_t lane, reg, half;
-          place(row, col, &lane, &reg, &half);
-          const double sum = sums[row * 16 + col];
-          uint32_t& slot = result[lane][reg];
-          if (out_f32) {
-            slot = as_bits(static_cast<float>(sum));
-          } else {
-            uint32_t bits;
-            if (out_bf16) {
-              const uint32_t f = as_bits(static_cast<float>(sum));
-              bits = std::isnan(as_float(f)) ? 0x7FC0 : (f + 0x7FFF + ((f >> 16) & 1)) >> 16;   // to nearest even
-            } else {
-              const _Float16 h = static_cast<_Float16>(sum);
-              uint16_t b16;
-              std::memcpy(&b16, &h, 2);
-              bits = b16;
-            }
-            slot = half ? (slot & 0xFFFF) | bits << 16 : (slot & 0xFFFF0000u) | bits;
-          }
+      for (uint32_t row = 0; row < 16; ++row) {
+        if (rowat[row].reg >= regs) continue;
+        uint32_t* const o = w.vgpr.r[dst.index + rowat[row].reg].data() + rowat[row].lane0;
+        const uint32_t half = rowat[row].half;
+        if (out_f32) {
+          run_f64_to_f32(o, sums + row * 16, 16);
+          continue;
         }
+        for (uint32_t col = 0; col < 16; ++col) {
+          const double sum = sums[row * 16 + col];
+          uint32_t& slot = o[col];
+          uint32_t bits;
+          if (out_bf16) {
+            const uint32_t f = as_bits(static_cast<float>(sum));
+            bits = std::isnan(as_float(f)) ? 0x7FC0 : (f + 0x7FFF + ((f >> 16) & 1)) >> 16;   // to nearest even
+          } else {
+            const _Float16 h = static_cast<_Float16>(sum);
+            uint16_t b16;
+            std::memcpy(&b16, &h, 2);
+            bits = b16;
+          }
+          slot = half ? (slot & 0xFFFF) | bits << 16 : (slot & 0xFFFF0000u) | bits;
+        }
+      }
     }
-    const uint32_t regs = dst.width;
-    for (uint32_t lane = 0; lane < 32; ++lane)
-      for (uint32_t r = 0; r < regs && r < 8; ++r) w.vgpr.r[dst.index + r][lane] = result[lane][r];
     return true;
   }
   void wmma(Wave& w, const Inst& in, const OpName& op) {
@@ -10883,10 +10908,20 @@ struct Machine {
       uint32_t bl, within, g, a_row, b_row;
     } lane[kLanes];
     std::vector<uint32_t> c_off, a_off, b_off;
+    // The outputs as runs: output r of the `n` lanes from lane0 is the `n` consecutive elements of C that start at `off` (the column is
+    // the fastest index of a tile, and a lane group holds consecutive columns). `runs_ok` says every output of the shape is (checked here).
+    struct Run {
+      uint16_t r, lane0, off;
+    };
+    std::vector<Run> runs;
+    bool runs_ok = false;
+    bool b_run = false;   // every four lanes' columns of B are consecutive in a tile (b_dst), so decode_wide stores them whole
     // The fast path's: where a lane's column of B starts in a tile of B by row of k (its block's, and its column), and the tiles.
     uint32_t b_blk[kLanes], b_col[kLanes];
     // where each lane's run of K starts in a tile of A (by row) and of B (by row of k), as floats are stored
     uint32_t a_dst[kLanes], b_dst[kLanes];
+    uint32_t b_pair[kLanes];   // the dword of an integer tile of B (pairs of K) a lane's first pair is
+    uint32_t ident[kLanes];   // 0, 1, ... the lanes' own numbers (A and B read without a broadcast or a permutation)
     // (Staggered in the cache: see TileBuf.)
     TileBuf<2> fa;
     TileBuf<3> fbk;
@@ -10897,6 +10932,63 @@ struct Machine {
     // The operands' values as doubles (A by row, B by column, C as it is), kept per thread between instructions.
     std::vector<double> a, b, c;
   };
+  // ---- Runs of a tile's elements: the lanes of a run, from and to a register row (n is a multiple of 4)
+  static inline void run_f32_to_f64(double* d, const uint32_t* c, uint32_t n) {
+#if defined(__SSE2__)
+    for (uint32_t i = 0; i < n; i += 4) {
+      const __m128 f = _mm_loadu_ps(reinterpret_cast<const float*>(c + i));
+      _mm_storeu_pd(d + i, _mm_cvtps_pd(f));
+      _mm_storeu_pd(d + i + 2, _mm_cvtps_pd(_mm_movehl_ps(f, f)));
+    }
+#else
+    for (uint32_t i = 0; i < n; ++i) d[i] = static_cast<double>(as_float(c[i]));
+#endif
+  }
+  static inline void run_f64_to_f32(uint32_t* d, const double* o, uint32_t n) {
+#if defined(__SSE2__)
+    for (uint32_t i = 0; i < n; i += 4) {
+      const __m128 lo = _mm_cvtpd_ps(_mm_loadu_pd(o + i)), hi = _mm_cvtpd_ps(_mm_loadu_pd(o + i + 2));
+      _mm_storeu_ps(reinterpret_cast<float*>(d + i), _mm_movelh_ps(lo, hi));
+    }
+#else
+    for (uint32_t i = 0; i < n; ++i) d[i] = as_bits(static_cast<float>(o[i]));
+#endif
+  }
+  // Two rows of words (low, high) as the doubles they make, and back.
+  static inline void run_words_to_f64(double* d, const uint32_t* lo, const uint32_t* hi, uint32_t n) {
+#if defined(__SSE2__)
+    for (uint32_t i = 0; i < n; i += 4) {
+      const __m128i l = _mm_loadu_si128(reinterpret_cast<const __m128i*>(lo + i)), h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(hi + i));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i), _mm_unpacklo_epi32(l, h));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i + 2), _mm_unpackhi_epi32(l, h));
+    }
+#else
+    for (uint32_t i = 0; i < n; ++i) d[i] = as_double(static_cast<uint64_t>(lo[i]) | static_cast<uint64_t>(hi[i]) << 32);
+#endif
+  }
+  static inline void run_f64_to_words(uint32_t* lo, uint32_t* hi, const double* o, uint32_t n) {
+#if defined(__SSE2__)
+    for (uint32_t i = 0; i < n; i += 4) {
+      const __m128 a = _mm_loadu_ps(reinterpret_cast<const float*>(o + i)), b = _mm_loadu_ps(reinterpret_cast<const float*>(o + i + 2));
+      _mm_storeu_ps(reinterpret_cast<float*>(lo + i), _mm_shuffle_ps(a, b, 0x88));
+      _mm_storeu_ps(reinterpret_cast<float*>(hi + i), _mm_shuffle_ps(a, b, 0xDD));
+    }
+#else
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint64_t bits = as_bits(o[i]);
+      lo[i] = static_cast<uint32_t>(bits), hi[i] = static_cast<uint32_t>(bits >> 32);
+    }
+#endif
+  }
+  static inline void run_add_words(uint32_t* d, const int32_t* c, const int32_t* x, uint32_t n) {
+#if defined(__SSE2__)
+    for (uint32_t i = 0; i < n; i += 4)
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(d + i),
+                       _mm_add_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c + i)), _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + i))));
+#else
+    for (uint32_t i = 0; i < n; ++i) d[i] = static_cast<uint32_t>(c[i]) + static_cast<uint32_t>(x[i]);
+#endif
+  }
   // The thread's (reached once per machine, not once per instruction: a thread-local costs a call).
   MatrixPlan* mplan = nullptr;
   MatrixPlan& matrix_plan(const MatrixShape& s) {
@@ -10918,6 +11010,8 @@ struct Machine {
       p.b_blk[lane] = bl * s.k * s.n, p.b_col[lane] = within % s.n;
       p.a_dst[lane] = p.lane[lane].a_row + p.lane[lane].g * p.per_lane;
       p.b_dst[lane] = p.b_blk[lane] + p.b_col[lane] + p.lane[lane].g * p.per_lane * s.n;
+      p.ident[lane] = lane;
+      p.b_pair[lane] = p.b_blk[lane] / 2 + p.b_col[lane] + p.lane[lane].g * (p.per_lane / 2) * s.n;
       for (uint32_t r = 0; r < p.outs; ++r) {
         uint32_t ob = 0, row = 0;
         out_place(s, lane, r, &ob, &row);
@@ -10925,6 +11019,17 @@ struct Machine {
         p.c_off[at] = (ob * s.m + row) * s.n + j, p.a_off[at] = (ob * s.m + row) * s.k, p.b_off[at] = (ob * s.n + j) * s.k;
       }
     }
+    p.b_run = true;
+    for (uint32_t l = 0; l < kLanes; l += 4)
+      for (uint32_t i = 1; i < 4; ++i) p.b_run = p.b_run && p.b_dst[l + i] == p.b_dst[l] + i;
+    p.runs.clear();
+    p.runs_ok = kLanes % s.n == 0 && s.n % 4 == 0;
+    for (uint32_t r = 0; r < p.outs && p.runs_ok; ++r)
+      for (uint32_t l0 = 0; l0 < kLanes && p.runs_ok; l0 += s.n) {
+        const uint32_t off = p.c_off[size_t{l0} * p.outs + r];
+        for (uint32_t i = 1; i < s.n; ++i) p.runs_ok = p.runs_ok && p.c_off[size_t{l0 + i} * p.outs + r] == off + i;
+        p.runs.push_back({static_cast<uint16_t>(r), static_cast<uint16_t>(l0), static_cast<uint16_t>(off)});
+      }
     return p;
   }
   // ---- The matrix multiply, a whole tile at a time -------------------------------------------------------------------------
@@ -11035,15 +11140,19 @@ struct Machine {
   // lanes to an instruction: element e of every lane's run, from the register that holds it, to dst[dest[lane] + e * step].
   // `dest` is the lane's run (MatrixPlan::a_dst / b_dst). The doubles are those matrix_elem<T> gives (half4_to_double for
   // binary16, the exhaustive test of mfma_math.hpp; the others are a shift or a mask and the float to double conversion).
-  template <char T>
-  void matrix_decode_wide(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst) {
+  // (`Run`: four consecutive lanes' runs start at consecutive doubles, as B's columns do, so two 16-byte stores a group of four.)
+  template <char T, bool Run = false>
+  void matrix_decode_wide(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst, uint32_t lanes = kLanes) {
+#if defined(__x86_64__) && defined(__GNUC__)
+    if (decode_avx2_f16c()) return matrix_decode_wide_avx2<T, Run>(src, dest, step, per_lane, dst, lanes);
+#endif
 #if defined(__SSE2__)
     for (uint32_t e = 0; e < per_lane; ++e) {
       constexpr bool packed = T == 'h' || T == 'b';   // two to a register
       const uint32_t* const words = src.rows[packed ? e / 2 : e];
       const int shift = packed ? 16 * static_cast<int>(e % 2) : 0;
       const size_t off = size_t{e} * step;
-      for (uint32_t l = 0; l < kLanes; l += 4) {
+      for (uint32_t l = 0; l < lanes; l += 4) {
         const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(words + l));
         __m128d lo, hi;
         if constexpr (T == 'h') {
@@ -11059,17 +11168,95 @@ struct Machine {
           lo = _mm_cvtps_pd(f);
           hi = _mm_cvtps_pd(_mm_movehl_ps(f, f));
         }
-        _mm_storel_pd(dst + dest[l] + off, lo);
-        _mm_storeh_pd(dst + dest[l + 1] + off, lo);
-        _mm_storel_pd(dst + dest[l + 2] + off, hi);
-        _mm_storeh_pd(dst + dest[l + 3] + off, hi);
+        if constexpr (Run) {
+          _mm_storeu_pd(dst + dest[l] + off, lo);
+          _mm_storeu_pd(dst + dest[l] + off + 2, hi);
+        } else {
+          _mm_storel_pd(dst + dest[l] + off, lo);
+          _mm_storeh_pd(dst + dest[l + 1] + off, lo);
+          _mm_storel_pd(dst + dest[l + 2] + off, hi);
+          _mm_storeh_pd(dst + dest[l + 3] + off, hi);
+        }
       }
     }
 #else
     for (uint32_t e = 0; e < per_lane; ++e)
-      for (uint32_t l = 0; l < kLanes; ++l) dst[dest[l] + size_t{e} * step] = matrix_elem<T>(src, e, l);
+      for (uint32_t l = 0; l < lanes; ++l) dst[dest[l] + size_t{e} * step] = matrix_elem<T>(src, e, l);
 #endif
   }
+#if defined(__x86_64__) && defined(__GNUC__)
+  // matrix_decode_wide, eight lanes to an instruction: the binary16 values by F16C (exact, a signalling NaN made quiet as
+  // half_bits_to_double makes it), the others a shift or a mask and the float to double conversion. The same doubles, to the same places.
+  static bool decode_avx2_f16c() {
+    static const bool have = mfma_have_avx2() && __builtin_cpu_supports("f16c");
+    return have;
+  }
+  template <char T, bool Run>
+  __attribute__((target("avx2,f16c"))) void matrix_decode_wide_avx2(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst, uint32_t lanes) {
+    // Element e of lanes l to l + 7, as two vectors of four doubles.
+    const auto convert = [&](uint32_t e, uint32_t l, __m256d* lo, __m256d* hi) __attribute__((target("avx2,f16c"), always_inline)) {
+      constexpr bool packed = T == 'h' || T == 'b';   // two to a register
+      const int shift = packed ? 16 * static_cast<int>(e % 2) : 0;
+      const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src.rows[packed ? e / 2 : e] + l));
+      __m256 f;
+      if constexpr (T == 'h') {
+        half8_to_double(shift ? _mm256_srli_epi32(raw, 16) : _mm256_and_si256(raw, _mm256_set1_epi32(0xFFFF)), lo, hi);
+        return;
+      } else if constexpr (T == 'b') {
+        f = _mm256_castsi256_ps(shift ? _mm256_and_si256(raw, _mm256_set1_epi32(static_cast<int>(0xFFFF0000u))) : _mm256_slli_epi32(raw, 16));
+      } else if constexpr (T == 'F') {   // xf32: the mantissa cut to ten bits, except an infinity or a NaN
+        const __m256i special = _mm256_cmpeq_epi32(_mm256_and_si256(raw, _mm256_set1_epi32(0x7F800000)), _mm256_set1_epi32(0x7F800000));
+        f = _mm256_castsi256_ps(_mm256_blendv_epi8(_mm256_and_si256(raw, _mm256_set1_epi32(~0x1FFF)), raw, special));
+      } else {
+        f = _mm256_castsi256_ps(raw);
+      }
+      *lo = _mm256_cvtps_pd(_mm256_castps256_ps128(f)), *hi = _mm256_cvtps_pd(_mm256_extractf128_ps(f, 1));
+    };
+    if constexpr (!Run) {
+      if (step == 1 && per_lane % 4 == 0) {
+        // A: a lane's run of K is consecutive in its row of the tile, so four elements of four lanes are a 4x4 transpose and a 32-byte
+        // store a lane.
+        for (uint32_t l = 0; l < lanes; l += 8)
+          for (uint32_t e = 0; e < per_lane; e += 4) {
+            __m256d lo[4], hi[4];
+            for (uint32_t q = 0; q < 4; ++q) convert(e + q, l, &lo[q], &hi[q]);
+            const auto transpose = [&](const __m256d* r, uint32_t first) __attribute__((target("avx2,f16c"), always_inline)) {
+              const __m256d t0 = _mm256_unpacklo_pd(r[0], r[1]), t1 = _mm256_unpackhi_pd(r[0], r[1]);
+              const __m256d t2 = _mm256_unpacklo_pd(r[2], r[3]), t3 = _mm256_unpackhi_pd(r[2], r[3]);
+              _mm256_storeu_pd(dst + dest[first] + e, _mm256_permute2f128_pd(t0, t2, 0x20));
+              _mm256_storeu_pd(dst + dest[first + 1] + e, _mm256_permute2f128_pd(t1, t3, 0x20));
+              _mm256_storeu_pd(dst + dest[first + 2] + e, _mm256_permute2f128_pd(t0, t2, 0x31));
+              _mm256_storeu_pd(dst + dest[first + 3] + e, _mm256_permute2f128_pd(t1, t3, 0x31));
+            };
+            transpose(lo, l);
+            transpose(hi, l + 4);
+          }
+        return;
+      }
+    }
+    for (uint32_t e = 0; e < per_lane; ++e) {
+      const size_t off = size_t{e} * step;
+      for (uint32_t l = 0; l < lanes; l += 8) {
+        __m256d lo, hi;
+        convert(e, l, &lo, &hi);
+        if constexpr (Run) {
+          _mm256_storeu_pd(dst + dest[l] + off, lo);
+          _mm256_storeu_pd(dst + dest[l + 4] + off, hi);   // (four lanes' columns are consecutive, not always the next four's)
+        } else {
+          const __m128d d0 = _mm256_castpd256_pd128(lo), d1 = _mm256_extractf128_pd(lo, 1), d2 = _mm256_castpd256_pd128(hi), d3 = _mm256_extractf128_pd(hi, 1);
+          _mm_storel_pd(dst + dest[l] + off, d0);
+          _mm_storeh_pd(dst + dest[l + 1] + off, d0);
+          _mm_storel_pd(dst + dest[l + 2] + off, d1);
+          _mm_storeh_pd(dst + dest[l + 3] + off, d1);
+          _mm_storel_pd(dst + dest[l + 4] + off, d2);
+          _mm_storeh_pd(dst + dest[l + 5] + off, d2);
+          _mm_storel_pd(dst + dest[l + 6] + off, d3);
+          _mm_storeh_pd(dst + dest[l + 7] + off, d3);
+        }
+      }
+    }
+  }
+#endif
   template <typename F>
   static bool matrix_wide_type(char t, F&& f) {
     switch (t) {
@@ -11159,6 +11346,56 @@ struct Machine {
       }
     }
   }
+  // The integer forms' 8-bit inputs as int16 tiles, with the lanes' bytes widened in registers instead of one element at a time
+  // (matrix_decode_a / _b with the type 'c' or 'u', for the ordinary layouts: A not broadcast, B not permuted or split, a lane's
+  // four bytes a register). A lane's run of K is contiguous in A's tile; four lanes' columns are consecutive in B's, where the
+  // pairs of K are dwords: each register's word of four lanes is two such dwords a lane.
+  // (`dest[lane]`: where the lane's run of K starts in A's tile, in int16s; `pair[lane]`: the dword of B's tile that the lane's first pair of K
+  // is, for the first lane of each four.)
+  template <bool Signed>
+  static void matrix_decode_a_i8(const MatrixSrc& src, const uint32_t* dest, uint32_t lanes, uint32_t per_lane, int16_t* ap) {
+    const uint32_t words = per_lane / 4;
+    const __m128i zero = _mm_setzero_si128();
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      int16_t* const d = ap + dest[lane];
+      for (uint32_t w = 0; w < words; ++w) {
+        const __m128i x = _mm_cvtsi32_si128(static_cast<int>(src.rows[w][lane]));
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(d + 4 * w), _mm_unpacklo_epi8(x, Signed ? _mm_cmpgt_epi8(zero, x) : zero));
+      }
+    }
+  }
+  template <bool Signed>
+  static void matrix_decode_b_i8(const MatrixSrc& src, const uint32_t* pair, uint32_t lanes, uint32_t per_lane, uint32_t n, int16_t* bp) {
+    const uint32_t words = per_lane / 4;
+    const __m128i zero = _mm_setzero_si128();
+    int32_t* const pairs = reinterpret_cast<int32_t*>(bp);
+    for (uint32_t lane = 0; lane < lanes; lane += 4) {
+      int32_t* const d = pairs + pair[lane];
+      for (uint32_t w = 0; w < words; ++w) {
+        const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src.rows[w] + lane));
+        const __m128i sg = Signed ? _mm_cmpgt_epi8(zero, x) : zero;
+        const __m128i lo = _mm_unpacklo_epi8(x, sg), hi = _mm_unpackhi_epi8(x, sg);   // (lane, pair of the word) dwords, two lanes each
+        _mm_storeu_ps(reinterpret_cast<float*>(d + size_t{2 * w} * n), _mm_shuffle_ps(_mm_castsi128_ps(lo), _mm_castsi128_ps(hi), 0x88));
+        _mm_storeu_ps(reinterpret_cast<float*>(d + size_t{2 * w + 1} * n), _mm_shuffle_ps(_mm_castsi128_ps(lo), _mm_castsi128_ps(hi), 0xDD));
+      }
+    }
+  }
+  // The double-precision forms: two registers a value. A's run of K (a lane's own values, consecutive in its row of the tile) and B's
+  // columns (four lanes' consecutive) are put together a row of 64 lanes at a time.
+  void matrix_decode_f64_a(const MatrixFast& f, double* ap) {
+    const MatrixPlan& plan = *f.plan;
+    alignas(32) double t[kLanes];
+    for (uint32_t e = 0; e < plan.per_lane; ++e) {
+      run_words_to_f64(t, f.a.rows[2 * e], f.a.rows[2 * e + 1], kLanes);
+      for (uint32_t lane = 0; lane < kLanes; ++lane) ap[plan.a_dst[lane] + e] = t[lane];
+    }
+  }
+  void matrix_decode_f64_b(const MatrixFast& f, double* bp) {
+    const MatrixPlan& plan = *f.plan;
+    for (uint32_t e = 0; e < plan.per_lane; ++e)
+      for (uint32_t lane = 0; lane < kLanes; lane += 4)
+        run_words_to_f64(bp + plan.b_dst[lane] + size_t{e} * f.s->n, f.b.rows[2 * e] + lane, f.b.rows[2 * e + 1] + lane, 4);
+  }
   // Calls f(tag) with the element type as a template argument.
   template <typename F>
   static bool matrix_by_type(char t, F&& f) {
@@ -11230,6 +11467,10 @@ struct Machine {
     const bool f64 = s.out == 'd';
     f.b_perm = in.blgp && !f64 && !f.small;
     const double sign_a = f64 && (in.blgp & 1) ? -1.0 : 1.0, sign_b = f64 && (in.blgp & 2) ? -1.0 : 1.0, sign_c = f64 && (in.blgp & 4) ? -1.0 : 1.0;
+    if (!in.a_bcast_size && !f.b_perm) {
+      std::memcpy(f.a_lane, plan.ident, sizeof f.a_lane);
+      std::memcpy(f.b_lane, plan.ident, sizeof f.b_lane);
+    } else
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const MatrixPlan::Lane& L = plan.lane[lane];
       const uint32_t a_block = in.a_bcast_size ? (L.bl >> in.a_bcast_size << in.a_bcast_size) + in.a_bcast_id : L.bl;
@@ -11289,33 +11530,64 @@ struct Machine {
     if (int_out) {
       if (ta != 'c' || tb != 'c') return false;
       plan.ia.resize(asz), plan.bi.resize(bsz), plan.io.resize(tile_c);
-      matrix_decode_a<'c', int16_t>(f, plan.ia.data());
-      matrix_decode_b<'c', int16_t, true>(f, plan.bi.data());
+      const bool a_same = !in.a_bcast_size;   // (with a broadcast the lanes may happen to be the same: the general decode is right either way)
+#if defined(__SSE2__)
+      const bool wide = !f.sparse && !f.small && !f.scaled && plan.per_lane % 4 == 0 && plan.b_run && !f.b_perm && !f.b_split;
+#else
+      const bool wide = false;
+#endif
+      if (wide && a_same) {
+        matrix_decode_a_i8<true>(f.a, plan.a_dst, kLanes, plan.per_lane, plan.ia.data());
+        matrix_decode_b_i8<true>(f.b, plan.b_pair, kLanes, plan.per_lane, s.n, plan.bi.data());
+      } else {
+        matrix_decode_a<'c', int16_t>(f, plan.ia.data());
+        matrix_decode_b<'c', int16_t, true>(f, plan.bi.data());
+      }
       // C, gathered before anything is written (D may overlap it), then each block's dot products
       plan.ic.resize(tile_c);
-      for (uint32_t lane = 0; lane < kLanes; ++lane) {
-        const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
-        for (uint32_t r = 0; r < outs; ++r) plan.ic[place[r]] = c_reg ? crows[r][lane] : cconst;
+      if (plan.runs_ok) {
+        for (const MatrixPlan::Run& u : plan.runs) {
+          int32_t* const d = plan.ic.data() + u.off;
+          if (c_reg) std::memcpy(d, crows[u.r] + u.lane0, size_t{s.n} * 4);
+          else std::fill(d, d + s.n, static_cast<int32_t>(cconst));
+        }
+      } else {
+        for (uint32_t lane = 0; lane < kLanes; ++lane) {
+          const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
+          for (uint32_t r = 0; r < outs; ++r) plan.ic[place[r]] = c_reg ? crows[r][lane] : cconst;
+        }
       }
       for (uint32_t ob = 0; ob < s.blocks; ++ob)
         mfma_tile_int(s.m, s.n, s.k, plan.ia.data() + size_t{ob} * s.m * s.k, plan.bi.data() + size_t{ob} * s.k * s.n,
                       plan.io.data() + size_t{ob} * s.m * s.n);
       for (uint32_t k = 0; k < cwords; ++k) drows[k] = row_of(dst, k);
-      for (uint32_t lane = 0; lane < kLanes; ++lane) {
-        const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
-        for (uint32_t r = 0; r < outs; ++r) drows[r][lane] = plan.ic[place[r]] + static_cast<uint32_t>(plan.io[place[r]]);
+      if (plan.runs_ok) {
+        for (const MatrixPlan::Run& u : plan.runs) {
+          run_add_words(drows[u.r] + u.lane0, plan.ic.data() + u.off, plan.io.data() + u.off, s.n);
+        }
+      } else {
+        for (uint32_t lane = 0; lane < kLanes; ++lane) {
+          const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
+          for (uint32_t r = 0; r < outs; ++r) drows[r][lane] = plan.ic[place[r]] + static_cast<uint32_t>(plan.io[place[r]]);
+        }
       }
       return true;
     }
     plan.fa.resize(asz), plan.fbk.resize(bsz), plan.fc.resize(tile_c), plan.fo.resize(tile_c);
-    bool a_identity = true;
-    for (uint32_t lane = 0; lane < kLanes; ++lane) a_identity = a_identity && f.a_lane[lane] == lane;
+    const bool a_identity = !in.a_bcast_size;
     bool ok = true;
-    if (sparse || in.scaled || !a_identity ||
+    if (ta == 'd' && !sparse && !in.scaled && a_identity)
+      matrix_decode_f64_a(f, plan.fa.data());
+    else if (sparse || in.scaled || !a_identity ||
         !matrix_wide_type(ta, [&](auto tag) { matrix_decode_wide<decltype(tag)::value>(f.a, plan.a_dst, 1, per_lane, plan.fa.data()); }))
       ok = matrix_by_type(ta, [&](auto tag) { matrix_decode_a<decltype(tag)::value, double>(f, plan.fa.data()); });
-    if (f.b_split || in.scaled || f.b_perm ||
-        !matrix_wide_type(tb, [&](auto tag) { matrix_decode_wide<decltype(tag)::value>(f.b, plan.b_dst, s.n, per_lane, plan.fbk.data()); }))
+    if (tb == 'd' && !f.b_split && !in.scaled && !f.b_perm && plan.b_run)
+      matrix_decode_f64_b(f, plan.fbk.data());
+    else if (f.b_split || in.scaled || f.b_perm ||
+        !matrix_wide_type(tb, [&](auto tag) {
+          if (plan.b_run) matrix_decode_wide<decltype(tag)::value, true>(f.b, plan.b_dst, s.n, per_lane, plan.fbk.data());
+          else matrix_decode_wide<decltype(tag)::value>(f.b, plan.b_dst, s.n, per_lane, plan.fbk.data());
+        }))
       ok = ok && matrix_by_type(tb, [&](auto tag) { matrix_decode_b<decltype(tag)::value, double, false>(f, plan.fbk.data()); });
     if (!ok) return false;
     // The doubles' BLGP negations (a multiply by -1, as the reference's, so a NaN is as it makes it)
@@ -11331,6 +11603,21 @@ struct Machine {
       if (ta == 'f' && std::any_of(plan.fa.begin(), plan.fa.end(), denormal)) return false;
       if (tb == 'f' && std::any_of(plan.fbk.begin(), plan.fbk.end(), denormal)) return false;
     }
+    if (plan.runs_ok) {
+      // (C by runs of consecutive columns: the lanes of a run are one slice of the tile's row)
+      for (const MatrixPlan::Run& u : plan.runs) {
+        double* const d = plan.fc.data() + u.off;
+        if (s.out == 'd') {
+          if (c_reg) run_words_to_f64(d, crows[2 * u.r] + u.lane0, crows[2 * u.r + 1] + u.lane0, s.n);
+          else std::fill(d, d + s.n, c_double_const ? cconst_d : as_double(static_cast<uint64_t>(cconst) | static_cast<uint64_t>(cconst) << 32));
+          if (sign_c != 1.0) for (uint32_t i = 0; i < s.n; ++i) d[i] = d[i] * sign_c;
+        } else if (c_reg) {
+          run_f32_to_f64(d, crows[u.r] + u.lane0, s.n);
+        } else {
+          std::fill(d, d + s.n, static_cast<double>(as_float(cconst)));
+        }
+      }
+    } else
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
       if (s.out == 'd') {
@@ -11351,6 +11638,16 @@ struct Machine {
       else mfma_tile_f(s.m, s.n, s.k, a, b, c, o);
     }
     for (uint32_t k = 0; k < cwords; ++k) drows[k] = row_of(dst, k);
+    if (plan.runs_ok) {
+      for (const MatrixPlan::Run& u : plan.runs) {
+        const double* const o = plan.fo.data() + u.off;
+        if (s.out == 'd') {
+          run_f64_to_words(drows[2 * u.r] + u.lane0, drows[2 * u.r + 1] + u.lane0, o, s.n);
+        } else {
+          run_f64_to_f32(drows[u.r] + u.lane0, o, s.n);
+        }
+      }
+    } else
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       const uint32_t* const place = &plan.c_off[size_t{lane} * outs];
       if (s.out == 'd') {

@@ -4828,3 +4828,53 @@ including test_fastpath: clean. Not run: e2e_* (no nvcc on server3), e2e_host_at
 * wmma.load/store generic shapes are one `load_routed` per element (not touched: counters and race hooks).
 * Placement: adding code anywhere before the interpreters moved their hot functions by 0x240-0x260 bytes and cost 3 to 10% on unchanged mma rows with identical instructions (misses/branch-misses moved);
   64-byte alignment of the chunked kernels did not remove it (dropped); keeping the new decode templates and SASS `gmma_fast` in `.text.unlikely` did (f64 mma 1.09 -> 0.97, SASS mem 0.95 -> 0.975).
+## Round sp3: the AMD matrix path, scalar handlers by shape and the tier's no-ops (branch `sp3-amdscalar`, base 03d92bd0 + sp2-lead 2fd5a519)
+
+**Measured first** (perf `cycles:u`, one host thread, cpu 4 of server3, the bench-amd binaries of every target, `VGPU_THREADS=1`): in every matrix row `matrix_multiply_fast` (and `wmma_fast`) itself was 50 to 85% of the time and the tile kernels 8 to 25%: what dominated was the gather and scatter around the tile, not the arithmetic. `mfma_i8` was 85% decode; the C gather was a scalar store loop whose result the tile kernel then read as 32 bytes (GCC also built `movhps` to the stack and `movaps` back for it: a store-forwarding stall on 55% of one workload's samples). The other targets' binaries (gfx950, gfx1100, gfx1201) were compiled on server2 with the harness's flags and keyed as the harness keys them.
+
+### What changed
+* **C and D as runs** (`MatrixPlan::runs`, `run_*` helpers in `gcn_exec.cpp`): output r of the n lanes of a lane group is n consecutive elements of the tile, so C is read and D written as rows of 4 with SSE2 intrinsics (the compiler's own loops were the stall above); the old per-lane tables stay for any shape whose outputs are not runs (checked when the plan is built).
+* **Decode**: binary16, bfloat16, float and xf32 operands eight lanes at a time under AVX2 (`half8_to_double`: F16C, exact, a signalling NaN made quiet as `half_bits_to_double` does; gate `mfma_have_avx2()` + `f16c`, so `VGPU_SIMD=base` keeps the SSE2 path), A by 4x4 transposes and 32-byte stores, B in 32-byte rows; the 8-bit integer tiles widened in registers (`matrix_decode_a_i8` / `_b_i8`, SSE2); the double-precision tiles by rows (`matrix_decode_f64_*`); no per-instruction 64-lane identity loops.
+* **Tile kernels**: `mfma_tile_f_avx2` returns whether an output is a NaN (compared while the sums are in registers: the separate 256-element scan is gone); `mfma_tile_fma_avx2` (four columns a fused multiply-add; the fused result is exact, the width cannot show).
+* **WMMA** (`wmma_fast`): rows of D and C as runs of 16 lanes, per-architecture place tables (`wmma_place`) feeding the same decoders, integer C and D by rows (the sum wraps; CLAMP keeps its scalar loop).
+* **Tier** (`gcn_tier.cpp`): the scalar handlers of `TIER_S2` are also built for one-word scalar registers and constants (`s2_variants`, picked at decode), `s_cmp` per comparison and shape; `buffer_wbl2/inv/gl0_inv/gl1_inv...` (a fence and a count, `mach` 11), RDNA's `s_waitcnt_vscnt/vmcnt/expcnt/lgkmcnt`, `s_version` and the `s_wait_*` of RDNA4 as no-ops.
+
+### Results (B/A of medians, 9 alternating runs, one host thread, counters identical in every row; A = the sp2-lead build)
+| workload | mi300x | rx6800 | other |
+| --- | ---: | ---: | --- |
+| `mfma` | **1.81x** | | |
+| `mfma_bf16` | **1.71x** | | |
+| `mfma_i8` | **3.46x** | | |
+| `mfma_f64` / `mfma_f64_4b` | **1.98x / 1.94x** | | |
+| `smfmac`, `mfma_fp8` | 1.23x, 1.24x | | |
+| `mfma_f8f6f4`, `mfma_scale` (gfx950) | | | 1.03x, 1.04x |
+| `wmma` / `wmma_iu8` | | | gfx1100 **3.54x / 5.85x**, gfx1201 **3.48x / 7.55x** |
+| canaries `valu_int`, `valu_f32`, `valu_f64` | 0.99, 1.01, 1.03 | 1.02, 1.02, 1.01 | |
+| `wave`, `lds`, `divergent` | 1.03, 1.00, 1.02 | 1.03, 1.12, 1.01 | |
+| `smem` (scalar handlers) | 1.09 (p 0.01) | 1.08 (p < 0.001) | |
+| `launch`, `api` | 1.03, 1.00 | 0.98 (p 0.6), 0.99 | perf stat cycles equal within noise |
+Whole-process `perf stat` (cycles, instructions) on `mfma`: 1.80 G / 9.5 G to 0.97 G / 4.6 G.
+
+### Tests and mutations
+`test_amd_matrix_fast` (every matrix instruction of the corpora, tile path against the element-at-a-time reference, shuffled registers, all flavours), `test_amd_mfma_math` (new: every binary16 through `half8_to_double` against `half_bits_to_double`), `test_amd_gcn_tier_same_bits` (covers each new handler: every corpus shape with the tier off and on). Mutations (each built and run on server3, then reverted; all fail the named test):
+| # | mutation | result |
+| --- | --- | --- |
+| M1 | C gather's high pair of a 4-run taken from the low | `test_amd_matrix_fast` fails |
+| M2 | integer B's even/odd pair shuffle swapped | `test_amd_matrix_fast` fails |
+| M3 | `mfma_tile_fma_avx2` K=4 reads A's element 2 for 1 | `test_amd_matrix_fast` fails |
+| M4 | `half8_to_double` lane permute wrong | `test_amd_mfma_math` fails |
+| M5 | the tile kernel never reports a NaN | `test_amd_matrix_fast` fails (dropping only the last accumulator's check survives: another output of the tile is a NaN as well) |
+| M6 | D's high word of a double written to the low row | `test_amd_matrix_fast` fails |
+| M7 | WMMA integer D wraps where CLAMP is set | `test_amd_matrix_fast` fails |
+| M8 | `s_cmp_lt_u32` as `<=` | tier digest (`VGPU_TIER_ONLY=s_cmp_lt_u32`) fails |
+| M9 | the fence does not count a vector memory instruction | tier digest (`buffer_gl0_inv`) fails |
+| M10 | the register-register scalar read off by one | tier digest (`s_add_u32`) fails |
+
+Sanitizers: ASan+UBSan -O0 (`test_amd_mfma_math`, `test_amd_matrix_fast` 2248 s, `test_amd_gcn_same_bits`, `test_amd_gcn_tier_same_bits` 2685 s) and TSan -O1 (`test_amd_mfma_math`, `test_amd_matrix_fast`) pass; the Release guards (`gcn_same_bits`, `gcn_packed_`, `gcn_memory_`, `codeobject_same_bits`, `nan_order`, `mfma_math`, tier digest) pass, and `--check-counters` shows no drift on the 37 pairs.
+
+### Not done, and negative results
+* A hint slot for two-way branches: no workload shows a hint miss (branch-misses of `divergent`: 1.7 M of 740 M branches).
+* The per-instruction frame (counters, state flags): removing the four counter updates altogether gave 3 to 10% (valu_int 3%, smem 6%, divergent 10%), so batching them cannot give more; left.
+* `flat_*`, `buffer_load/store`, `global_atomic_*` in the tier: `flat` costs the same per instruction as `mem` (48 ns) already, the cost is the memory work, not the frame.
+* fp8/small-float decode by `vgatherdpd`: not tried, a gather costs about what the scalar table lookups do on Zen 4.
+* AVX-512 for the tiles: Zen 4 runs it as two 256-bit halves, nothing to show here.

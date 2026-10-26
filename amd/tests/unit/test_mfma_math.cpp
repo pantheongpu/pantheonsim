@@ -368,4 +368,25 @@ VTEST(every_binary16_converts_to_the_same_double_four_at_a_time) {
 }
 #endif
 
+#if defined(__x86_64__) && defined(__GNUC__)
+// (a function of its own: the intrinsics of the units the host may lack are only legal under their target)
+__attribute__((target("avx2,f16c"))) static uint64_t f16c_conversions_that_differ() {
+  uint64_t wrong = 0;
+  for (uint32_t h = 0; h < 65536; h += 8) {
+    __m256d lo, hi;
+    int in[8];
+    for (uint32_t i = 0; i < 8; ++i) in[i] = static_cast<int>(h + i);
+    vgpu::amd::half8_to_double(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(in)), &lo, &hi);
+    double got[8];
+    _mm256_storeu_pd(got, lo), _mm256_storeu_pd(got + 4, hi);
+    for (uint32_t i = 0; i < 8; ++i) wrong += bits_of(got[i]) != bits_of(vgpu::amd::half_bits_to_double(static_cast<uint16_t>(h + i)));
+  }
+  return wrong;
+}
+VTEST(the_f16c_half_conversion_matches_the_integer_one_for_every_binary16_value) {
+  if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("f16c")) return;   // (nothing to compare on a host without the units)
+  VCHECK_EQ(f16c_conversions_that_differ(), 0u);
+}
+#endif
+
 VTEST_MAIN
