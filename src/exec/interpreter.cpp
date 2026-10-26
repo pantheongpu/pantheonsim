@@ -743,6 +743,36 @@ constexpr std::array<float, 65536> kF16ToFloat = [] {
   return t;
 }();
 
+// The tables against the format itself, worked out again from the fields in another way (the exponent and the leading bit found by
+// counting, not by the functions above), for every one of the 65536 halves: checked when the library is built.
+constexpr bool f16_tables_match_the_format() {
+  for (uint32_t h = 0; h < 65536; ++h) {
+    const uint32_t s = h >> 15, e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    uint32_t fbits;
+    uint64_t dbits;
+    if (e == 31) {
+      fbits = (s << 31) | 0x7F800000u | (m ? 0x400000u : 0u);
+      dbits = (uint64_t{s} << 63) | 0x7FF0000000000000ull | (m ? 0x8000000000000ull : 0ull);
+    } else if (e != 0 || m != 0) {
+      int exp = static_cast<int>(e) - 15;   // value = 1.frac * 2^exp
+      uint32_t frac = m;
+      if (e == 0) {                         // a subnormal: m * 2^-24, its leading bit at t
+        const int t = 31 - std::countl_zero(m);
+        exp = t - 24;
+        frac = (m << (10 - t)) & 0x3FF;
+      }
+      fbits = (s << 31) | (static_cast<uint32_t>(exp + 127) << 23) | (frac << 13);
+      dbits = (uint64_t{s} << 63) | (uint64_t{static_cast<uint32_t>(exp + 1023)} << 52) | (uint64_t{frac} << 42);
+    } else {
+      fbits = s << 31;
+      dbits = uint64_t{s} << 63;
+    }
+    if (std::bit_cast<uint32_t>(kF16ToFloat[h]) != fbits || std::bit_cast<uint64_t>(kF16ToDouble[h]) != dbits) return false;
+  }
+  return true;
+}
+static_assert(f16_tables_match_the_format(), "kF16ToFloat / kF16ToDouble differ from the binary16 format");
+
 double f16_to_double(uint64_t bits) {
   if (!g_fast_path.load(std::memory_order_relaxed)) return f16_to_double_exact(bits);
   return kF16ToDouble[bits & 0xFFFFu];

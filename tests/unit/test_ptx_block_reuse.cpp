@@ -6,6 +6,8 @@
 // left): the shared memory a kernel never wrote reads zero, a named barrier starts with no arrivals, a block's clock starts at zero,
 // blocks of different warp counts follow one another. Memory and every counter must match the reference. The environment half:
 // a launch reads VGPU_MAX_STEPS from the pass it is given, not from the process, and from the process when it is given none.
+// And the launch's parameters, which are looked up by name (a kernel that takes a parameter's address, or the general path's loads) from the
+// kernel's own list and not from a table made for every launch.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -243,6 +245,60 @@ VTEST(a_launch_reads_the_environment_it_is_given_or_the_process_s) {
   // No pass given: the launch reads the process's.
   VCHECK(launch_error(nullptr).find("step budget") != std::string::npos);
   unsetenv("VGPU_MAX_STEPS");
+}
+
+namespace {
+
+// Takes the address of its third parameter by name, and reads it through the register (the window the parameters live in): the value of
+// `third`, not of the first or the second. Each of the others is read by name too (VGPU_FASTPATH=0 loads by name, not by position).
+const std::string kParams = std::string(kHeader) + R"(
+.visible .entry params(.param .u32 first, .param .u64 out, .param .u32 third, .param .u32 fourth)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    ld.param.u64 %rd1, [out];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.b64 %rd3, third;
+    ld.param.u32 %r1, [%rd3];
+    ld.param.u32 %r2, [first];
+    ld.param.u32 %r3, [fourth];
+    st.global.u32 [%rd2], %r1;
+    st.global.u32 [%rd2+4], %r2;
+    st.global.u32 [%rd2+8], %r3;
+    ret;
+}
+)";
+
+uint32_t u32(std::vector<uint8_t> b, MemoryManager& mem, uint64_t at) {
+  (void)b;
+  uint32_t v = 0;
+  mem.read(at, &v, 4);
+  return v;
+}
+
+}  // namespace
+
+VTEST(parameters_are_found_by_name_and_by_position) {
+  static const ptx::Module mod = ptx::parse(kParams);
+  for (const bool fast : {true, false}) {
+    setenv("VGPU_FASTPATH", fast ? "1" : "0", 1);
+    MemoryManager mem{1 << 20};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    const uint64_t pout = mem.alloc(256);
+    auto bytes = [](const void* p, size_t n) {
+      std::vector<uint8_t> b(n);
+      std::memcpy(b.data(), p, n);
+      return b;
+    };
+    const uint32_t first = 111, third = 333, fourth = 444;
+    LaunchConfig cfg;
+    cfg.block = {1, 1, 1};
+    exec::launch(mod.entries[0], cfg, {bytes(&first, 4), bytes(&pout, 8), bytes(&third, 4), bytes(&fourth, 4)}, mem, prof);
+    VCHECK_EQ(u32({}, mem, pout), 333u);       // the third, through its address
+    VCHECK_EQ(u32({}, mem, pout + 4), 111u);   // the first
+    VCHECK_EQ(u32({}, mem, pout + 8), 444u);   // the fourth
+  }
+  unsetenv("VGPU_FASTPATH");
 }
 
 VTEST_MAIN

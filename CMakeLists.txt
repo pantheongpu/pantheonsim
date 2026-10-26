@@ -1682,6 +1682,14 @@ target_include_directories(test_amd_hip_async_inline PRIVATE tests/framework amd
 add_test(NAME test_amd_hip_async_inline COMMAND test_amd_hip_async_inline)
 set_tests_properties(test_amd_hip_async_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# A call a profiler may time reads the clock for its start only when one is attached (counted through a clock_gettime of the test's own).
+add_executable(test_amd_hip_profile_clock amd/tests/unit/test_hip_profile_clock.cpp)
+target_link_libraries(test_amd_hip_profile_clock PRIVATE vgpuhip vgpu)
+target_include_directories(test_amd_hip_profile_clock PRIVATE amd/include)
+set_target_properties(test_amd_hip_profile_clock PROPERTIES ENABLE_EXPORTS ON)
+add_test(NAME test_amd_hip_profile_clock COMMAND test_amd_hip_profile_clock)
+set_tests_properties(test_amd_hip_profile_clock PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
 # A device's properties are made at the first question and kept: each ordinal answers for itself, as the full structure says.
 add_executable(test_amd_hip_props_cache amd/tests/unit/test_hip_props_cache.cpp)
 target_link_libraries(test_amd_hip_props_cache PRIVATE vgpuhip)
