@@ -12,9 +12,12 @@ namespace vgpu::exec {
 LaunchEnv read_launch_env() {
   LaunchEnv e;
 #if defined(__linux__)
-  const auto is = [](const char* name, const char* want) {   // `name` is "NAME=value": the whole name, then '='
-    const size_t n = std::strlen(want);
-    return std::strncmp(name, want, n) == 0 && name[n] == '=' ? name + n + 1 : static_cast<const char*>(nullptr);
+  // `name` is "NAME=value": the whole name, then '='. (The name's length is a constant, so this is a few compares and no call; it stops
+  // at the entry's own end.)
+  const auto is = []<size_t N>(const char* name, const char (&want)[N]) -> const char* {
+    for (size_t i = 0; i + 1 < N; ++i)
+      if (name[i] != want[i]) return nullptr;
+    return name[N - 1] == '=' ? name + N : nullptr;
   };
   const auto take = [](const char*& field, const char* value) {
     if (value && !field) field = value;
