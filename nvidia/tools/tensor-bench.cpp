@@ -610,13 +610,17 @@ double run_sass(const SassRow& r, const std::string& src_dir, int reps) {
   const auto load = [&](unsigned base, unsigned n) {
     for (unsigned i = 0; i < n; ++i, ++word) code.push_back(with(with(with(ldg, 16, 8, base + i), 24, 8, 246), 40, 24, word * 4));
   };
-  load(ra, a);
-  load(rb, b);
-  load(rc, c);
-  if (sp) {
-    const unsigned rm = ins.src[3].reg;
-    load(rm, 1);
-  }
+  // (the loads in the order C, A, B, metadata, each from the lane's words at its own place: a word that names overlapping registers keeps A and B,
+  // the operands whose values matter to the fast routes)
+  const unsigned c_at = 0, a_at = c, b_at = c + a, m_at = c + a + b;
+  const auto load_at = [&](unsigned base, unsigned n, unsigned from) {
+    for (unsigned i = 0; i < n; ++i) code.push_back(with(with(with(ldg, 16, 8, base + i), 24, 8, 246), 40, 24, (from + i) * 4));
+  };
+  load_at(rc, c, c_at);
+  load_at(ra, a, a_at);
+  load_at(rb, b, b_at);
+  if (sp) load_at(ins.src[3].reg, 1, m_at);
+  (void)load;
   for (int i = 0; i < reps; ++i) code.push_back(mma);
   code.push_back(with(with(with(stg, 24, 8, 246), 32, 8, rd), 40, 24, 0));
   code.push_back(find_word(corpus, "EXIT"));
@@ -627,8 +631,8 @@ double run_sass(const SassRow& r, const std::string& src_dir, int reps) {
   std::vector<uint32_t> in(32 * 64);
   for (int l = 0; l < 32; ++l) {
     unsigned at = 0;
-    for (unsigned i = 0; i < a + b; ++i) in[l * 64 + at++] = word_of(r.data);
     for (unsigned i = 0; i < c; ++i) in[l * 64 + at++] = word_of(r.cdata);
+    for (unsigned i = 0; i < a + b; ++i) in[l * 64 + at++] = word_of(r.data);
     in[l * 64 + at++] = rng();
   }
   const uint64_t buf = mem.alloc(in.size() * 4 + 4096);
