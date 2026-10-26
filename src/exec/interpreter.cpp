@@ -52,6 +52,7 @@
 #include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/f32x2.hpp"
 #include "vgpu/exec/numerics.hpp"
+#include "vgpu/exec/sass_atomics.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
 #include "vgpu/exec/wgmma.hpp"
 #include "vgpu/exec/tensormap.hpp"
@@ -13575,7 +13576,7 @@ class Interpreter {
       });
       size_t done = 0;
       bool in_compute = false;
-      if (ok && cnt) {
+      if (ok && cnt && exec::sassatom::batchable(mem_, addrs, static_cast<unsigned>(cnt))) {
         try {
           if (mem_.rmw_batch(addrs, cnt, size,
                              [&](size_t i, uint64_t old) {
