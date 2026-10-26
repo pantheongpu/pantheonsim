@@ -4016,6 +4016,25 @@ struct Machine {
   // RDNA3 and RDNA4's v_wmma_*, a whole tile at a time (wmma_reference is the element-at-a-time version). The same layouts, the
   // same widening, every output a double sum of its products in order of k and rounded once (or the exact integer sum, saturated
   // where CLAMP says); the operands are decoded once, by type, instead of by comparing the type's name for every element.
+  // Where each lane's run of K goes in WMMA's tiles (16 rows of K, as the float tiles are laid out), for gfx11 (the first 16 lanes hold
+  // a row (column) each, all of K) and gfx12 (32 lanes, two halves of K): `a` the double of A's run, `b` of B's, `pair` the dword of an
+  // integer B tile (pairs of K) a lane's first pair is.
+  struct WmmaPlace {
+    uint32_t a[32], b[32], pair[32];
+  };
+  static const WmmaPlace& wmma_place(bool g12, uint32_t K) {
+    static const auto tables = [] {
+      std::array<std::array<WmmaPlace, 33>, 2> t{};   // [g12][K]
+      for (uint32_t g = 0; g < 2; ++g)
+        for (uint32_t k = 2; k <= 32; k += 2)
+          for (uint32_t l = 0; l < 32; ++l) {
+            const uint32_t rc = l % 16, k0 = g ? l / 16 * (k / 2) : 0;
+            t[g][k].a[l] = rc * k + k0, t[g][k].b[l] = k0 * 16 + rc, t[g][k].pair[l] = k0 / 2 * 16 + rc;
+          }
+      return t;
+    }();
+    return tables[g12][K];
+  }
   bool wmma_fast(Wave& w, const Inst& in, const OpName& op) {
     constexpr int kWmmaOrder = WMMA_ORDER;
     if (w.lanes != 32 || static_cast<uint32_t>(w.exec) != 0xFFFFFFFFu) return false;
@@ -4126,8 +4145,17 @@ struct Machine {
             else bi[((k >> 1) * 16 + rc) * 2 + (k & 1)] = static_cast<int16_t>(v);
           }
       };
-      fill(sa, A.kind, true);
-      fill(sb, B.kind, false);
+      const WmmaPlace& place_tab = wmma_place(g12, K);
+      const uint32_t nl = g12 ? 32 : 16;
+      if ((A.kind == 'c' || A.kind == 'u') && per_lane % 4 == 0 && (B.kind == 'c' || B.kind == 'u')) {   // (8-bit inputs: widened in registers)
+        if (A.kind == 'c') matrix_decode_a_i8<true>(sa, place_tab.a, nl, per_lane, ia.data());
+        else matrix_decode_a_i8<false>(sa, place_tab.a, nl, per_lane, ia.data());
+        if (B.kind == 'c') matrix_decode_b_i8<true>(sb, place_tab.pair, nl, per_lane, 16, bi.data());
+        else matrix_decode_b_i8<false>(sb, place_tab.pair, nl, per_lane, 16, bi.data());
+      } else {
+        fill(sa, A.kind, true);
+        fill(sb, B.kind, false);
+      }
       int32_t dots[256];
       mfma_tile_int(16, 16, K, ia.data(), bi.data(), dots);
       for (uint32_t row = 0; row < 16; ++row) {
@@ -4142,27 +4170,18 @@ struct Machine {
     } else {
       std::array<double, 16 * 32> fa, fb;
       const auto fill = [&](const MatrixSrc& src, char kind, double* dst_tile, bool as_a) {
-#if defined(__SSE2__)
-        if (kind == 'h') {   // binary16: sixteen rows (columns) of one k at a time, in the lanes that hold them
-          for (uint32_t k = 0; k < K; ++k) {
-            const uint32_t* const words = src.rows[elem_of(k) / 2] + lane_of(0, k);
-            const int shift = 16 * static_cast<int>(elem_of(k) % 2);
-            for (uint32_t q = 0; q < 16; q += 4) {
-              __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(words + q));
-              raw = _mm_and_si128(_mm_srli_epi32(raw, shift), _mm_set1_epi32(0xFFFF));
-              __m128d lo, hi;
-              half4_to_double(raw, &lo, &hi);
-              if (as_a) {
-                _mm_storel_pd(dst_tile + (q + 0) * K + k, lo), _mm_storeh_pd(dst_tile + (q + 1) * K + k, lo);
-                _mm_storel_pd(dst_tile + (q + 2) * K + k, hi), _mm_storeh_pd(dst_tile + (q + 3) * K + k, hi);
-              } else {
-                _mm_storeu_pd(dst_tile + k * 16 + q, lo), _mm_storeu_pd(dst_tile + k * 16 + q + 2, hi);
-              }
-            }
+        if (kind == 'h' || kind == 'b') {   // the 16-bit floats, a register at a time: the lanes' runs of K to their places in the tile
+          const WmmaPlace& tab = wmma_place(g12, K);
+          const uint32_t nl = g12 ? 32 : 16;
+          if (kind == 'h') {
+            if (as_a) matrix_decode_wide<'h'>(src, tab.a, 1, per_lane, dst_tile, nl);
+            else matrix_decode_wide<'h', true>(src, tab.b, 16, per_lane, dst_tile, nl);
+          } else {
+            if (as_a) matrix_decode_wide<'b'>(src, tab.a, 1, per_lane, dst_tile, nl);
+            else matrix_decode_wide<'b', true>(src, tab.b, 16, per_lane, dst_tile, nl);
           }
           return;
         }
-#endif
         const auto go = [&](auto tag) {
           constexpr char T = decltype(tag)::value;
           for (uint32_t rc = 0; rc < 16; ++rc)
@@ -10896,6 +10915,7 @@ struct Machine {
     uint32_t b_blk[kLanes], b_col[kLanes];
     // where each lane's run of K starts in a tile of A (by row) and of B (by row of k), as floats are stored
     uint32_t a_dst[kLanes], b_dst[kLanes];
+    uint32_t b_pair[kLanes];   // the dword of an integer tile of B (pairs of K) a lane's first pair is
     uint32_t ident[kLanes];   // 0, 1, ... the lanes' own numbers (A and B read without a broadcast or a permutation)
     // (Staggered in the cache: see TileBuf.)
     TileBuf<2> fa;
@@ -10986,6 +11006,7 @@ struct Machine {
       p.a_dst[lane] = p.lane[lane].a_row + p.lane[lane].g * p.per_lane;
       p.b_dst[lane] = p.b_blk[lane] + p.b_col[lane] + p.lane[lane].g * p.per_lane * s.n;
       p.ident[lane] = lane;
+      p.b_pair[lane] = p.b_blk[lane] / 2 + p.b_col[lane] + p.lane[lane].g * (p.per_lane / 2) * s.n;
       for (uint32_t r = 0; r < p.outs; ++r) {
         uint32_t ob = 0, row = 0;
         out_place(s, lane, r, &ob, &row);
@@ -11116,9 +11137,9 @@ struct Machine {
   // binary16, the exhaustive test of mfma_math.hpp; the others are a shift or a mask and the float to double conversion).
   // (`Run`: four consecutive lanes' runs start at consecutive doubles, as B's columns do, so two 16-byte stores a group of four.)
   template <char T, bool Run = false>
-  void matrix_decode_wide(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst) {
+  void matrix_decode_wide(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst, uint32_t lanes = kLanes) {
 #if defined(__x86_64__) && defined(__GNUC__)
-    if (decode_avx2_f16c()) return matrix_decode_wide_avx2<T, Run>(src, dest, step, per_lane, dst);
+    if (decode_avx2_f16c()) return matrix_decode_wide_avx2<T, Run>(src, dest, step, per_lane, dst, lanes);
 #endif
 #if defined(__SSE2__)
     for (uint32_t e = 0; e < per_lane; ++e) {
@@ -11126,7 +11147,7 @@ struct Machine {
       const uint32_t* const words = src.rows[packed ? e / 2 : e];
       const int shift = packed ? 16 * static_cast<int>(e % 2) : 0;
       const size_t off = size_t{e} * step;
-      for (uint32_t l = 0; l < kLanes; l += 4) {
+      for (uint32_t l = 0; l < lanes; l += 4) {
         const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(words + l));
         __m128d lo, hi;
         if constexpr (T == 'h') {
@@ -11155,7 +11176,7 @@ struct Machine {
     }
 #else
     for (uint32_t e = 0; e < per_lane; ++e)
-      for (uint32_t l = 0; l < kLanes; ++l) dst[dest[l] + size_t{e} * step] = matrix_elem<T>(src, e, l);
+      for (uint32_t l = 0; l < lanes; ++l) dst[dest[l] + size_t{e} * step] = matrix_elem<T>(src, e, l);
 #endif
   }
 #if defined(__x86_64__) && defined(__GNUC__)
@@ -11166,7 +11187,7 @@ struct Machine {
     return have;
   }
   template <char T, bool Run>
-  __attribute__((target("avx2,f16c"))) void matrix_decode_wide_avx2(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst) {
+  __attribute__((target("avx2,f16c"))) void matrix_decode_wide_avx2(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst, uint32_t lanes) {
     // Element e of lanes l to l + 7, as two vectors of four doubles.
     const auto convert = [&](uint32_t e, uint32_t l, __m256d* lo, __m256d* hi) __attribute__((target("avx2,f16c"), always_inline)) {
       constexpr bool packed = T == 'h' || T == 'b';   // two to a register
@@ -11190,7 +11211,7 @@ struct Machine {
       if (step == 1 && per_lane % 4 == 0) {
         // A: a lane's run of K is consecutive in its row of the tile, so four elements of four lanes are a 4x4 transpose and a 32-byte
         // store a lane.
-        for (uint32_t l = 0; l < kLanes; l += 8)
+        for (uint32_t l = 0; l < lanes; l += 8)
           for (uint32_t e = 0; e < per_lane; e += 4) {
             __m256d lo[4], hi[4];
             for (uint32_t q = 0; q < 4; ++q) convert(e + q, l, &lo[q], &hi[q]);
@@ -11210,7 +11231,7 @@ struct Machine {
     }
     for (uint32_t e = 0; e < per_lane; ++e) {
       const size_t off = size_t{e} * step;
-      for (uint32_t l = 0; l < kLanes; l += 8) {
+      for (uint32_t l = 0; l < lanes; l += 8) {
         __m256d lo, hi;
         convert(e, l, &lo, &hi);
         if constexpr (Run) {
@@ -11324,35 +11345,33 @@ struct Machine {
   // (matrix_decode_a / _b with the type 'c' or 'u', for the ordinary layouts: A not broadcast, B not permuted or split, a lane's
   // four bytes a register). A lane's run of K is contiguous in A's tile; four lanes' columns are consecutive in B's, where the
   // pairs of K are dwords: each register's word of four lanes is two such dwords a lane.
+  // (`dest[lane]`: where the lane's run of K starts in A's tile, in int16s; `pair[lane]`: the dword of B's tile that the lane's first pair of K
+  // is, for the first lane of each four.)
   template <bool Signed>
-  void matrix_decode_a_i8(const MatrixFast& f, int16_t* ap) {
-    const MatrixPlan& plan = *f.plan;
-    const uint32_t words = plan.per_lane / 4;
+  static void matrix_decode_a_i8(const MatrixSrc& src, const uint32_t* dest, uint32_t lanes, uint32_t per_lane, int16_t* ap) {
+    const uint32_t words = per_lane / 4;
     const __m128i zero = _mm_setzero_si128();
-    for (uint32_t lane = 0; lane < kLanes; ++lane) {
-      int16_t* const d = ap + plan.a_dst[lane];
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      int16_t* const d = ap + dest[lane];
       for (uint32_t w = 0; w < words; ++w) {
-        const __m128i x = _mm_cvtsi32_si128(static_cast<int>(f.a.rows[w][lane]));
+        const __m128i x = _mm_cvtsi32_si128(static_cast<int>(src.rows[w][lane]));
         _mm_storel_epi64(reinterpret_cast<__m128i*>(d + 4 * w), _mm_unpacklo_epi8(x, Signed ? _mm_cmpgt_epi8(zero, x) : zero));
       }
     }
   }
   template <bool Signed>
-  void matrix_decode_b_i8(const MatrixFast& f, int16_t* bp) {
-    const MatrixPlan& plan = *f.plan;
-    const MatrixShape& s = *f.s;
-    const uint32_t words = plan.per_lane / 4;
+  static void matrix_decode_b_i8(const MatrixSrc& src, const uint32_t* pair, uint32_t lanes, uint32_t per_lane, uint32_t n, int16_t* bp) {
+    const uint32_t words = per_lane / 4;
     const __m128i zero = _mm_setzero_si128();
     int32_t* const pairs = reinterpret_cast<int32_t*>(bp);
-    for (uint32_t lane = 0; lane < kLanes; lane += 4) {
-      const MatrixPlan::Lane& L = plan.lane[lane];
-      int32_t* const d = pairs + (plan.b_blk[lane] / 2 + plan.b_col[lane]) + size_t{L.g} * (plan.per_lane / 2) * s.n;
+    for (uint32_t lane = 0; lane < lanes; lane += 4) {
+      int32_t* const d = pairs + pair[lane];
       for (uint32_t w = 0; w < words; ++w) {
-        const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(f.b.rows[w] + lane));
+        const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src.rows[w] + lane));
         const __m128i sg = Signed ? _mm_cmpgt_epi8(zero, x) : zero;
         const __m128i lo = _mm_unpacklo_epi8(x, sg), hi = _mm_unpackhi_epi8(x, sg);   // (lane, pair of the word) dwords, two lanes each
-        _mm_storeu_ps(reinterpret_cast<float*>(d + size_t{2 * w} * s.n), _mm_shuffle_ps(_mm_castsi128_ps(lo), _mm_castsi128_ps(hi), 0x88));
-        _mm_storeu_ps(reinterpret_cast<float*>(d + size_t{2 * w + 1} * s.n), _mm_shuffle_ps(_mm_castsi128_ps(lo), _mm_castsi128_ps(hi), 0xDD));
+        _mm_storeu_ps(reinterpret_cast<float*>(d + size_t{2 * w} * n), _mm_shuffle_ps(_mm_castsi128_ps(lo), _mm_castsi128_ps(hi), 0x88));
+        _mm_storeu_ps(reinterpret_cast<float*>(d + size_t{2 * w + 1} * n), _mm_shuffle_ps(_mm_castsi128_ps(lo), _mm_castsi128_ps(hi), 0xDD));
       }
     }
   }
@@ -11513,8 +11532,8 @@ struct Machine {
       const bool wide = false;
 #endif
       if (wide && a_same) {
-        matrix_decode_a_i8<true>(f, plan.ia.data());
-        matrix_decode_b_i8<true>(f, plan.bi.data());
+        matrix_decode_a_i8<true>(f.a, plan.a_dst, kLanes, plan.per_lane, plan.ia.data());
+        matrix_decode_b_i8<true>(f.b, plan.b_pair, kLanes, plan.per_lane, s.n, plan.bi.data());
       } else {
         matrix_decode_a<'c', int16_t>(f, plan.ia.data());
         matrix_decode_b<'c', int16_t, true>(f, plan.bi.data());
