@@ -11146,7 +11146,8 @@ class Interpreter {
     const WmmaType at = op.atype, bt = op.btype;
     if (N == 0 || N % 8 || M == 0 || K == 0 || M * K > 1024 || K * N > 1024 || M * N > 1024) return false;
     if (op.shape == WmmaShape{16, 16, 16} && (at == WmmaType::F16 || at == WmmaType::BF16)) return false;
-    const bool is_float = at == WmmaType::F16 || at == WmmaType::BF16 || at == WmmaType::TF32;
+    // (tf32 has only m16n16k8, which is not a generic form: its own tile)
+    const bool is_float = at == WmmaType::F16 || at == WmmaType::BF16;
     const bool is_int = at == WmmaType::S8 || at == WmmaType::U8 || at == WmmaType::S4 || at == WmmaType::U4;
     const bool is_f64 = at == WmmaType::F64;
     if (!is_float && !is_int && !is_f64) return false;

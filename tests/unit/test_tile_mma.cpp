@@ -210,7 +210,7 @@ VTEST(tile_i32_wraps_exactly_on_operands_of_any_size) {
   for (simd::Level l : levels()) {
     const simd::Kernels& k = simd::kernels_for(l);
     for (const Shape& s : shapes)
-      for (int mode = 0; mode < 7; ++mode)
+      for (int mode = 0; mode < 8; ++mode)
         for (int trial = 0; trial < 10; ++trial) {
           std::vector<int32_t> A(s.M * s.K), B(s.K * s.N), C(s.M * s.N), want(s.M * s.N), got(s.M * s.N);
           const auto draw = [&]() -> int32_t {
@@ -226,6 +226,13 @@ VTEST(tile_i32_wraps_exactly_on_operands_of_any_size) {
           };
           for (int32_t& x : A) x = draw();
           for (int32_t& x : B) x = draw();
+          if (mode == 7)   // 8-bit operands but for the second of a pair of k: a 16-bit pair holds both or neither (A's, then B's)
+            for (unsigned i = 0; i < s.M; ++i)
+              for (unsigned kk = 0; kk < s.K; ++kk) {
+                if (trial % 2) A[i * s.K + kk] = kk % 2 ? 40000 + int32_t(g() % 1000) : int32_t(g() % 256) - 128;
+                else A[i * s.K + kk] = int32_t(g() % 256) - 128;
+                for (unsigned j = 0; j < s.N; ++j) B[kk * s.N + j] = trial % 2 ? int32_t(g() % 256) - 128 : kk % 2 ? -40000 - int32_t(g() % 1000) : int32_t(g() % 256) - 128;
+              }
           for (int32_t& x : C) x = static_cast<int32_t>(g());
           const bool null_c = trial % 3 == 0;
           // wrapping sums: the 64-bit sum cut to 32 bits
