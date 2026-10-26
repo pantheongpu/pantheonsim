@@ -1339,6 +1339,9 @@ vgpu_unit_test(test_locallayout)
 vgpu_unit_test(test_memrmw_lockfree)
 # The closed forms of the sector and bank-pass counters, against the definition of what they count.
 vgpu_unit_test(test_memcount_forms)
+# (the same on the baseline SIMD level: the AVX2 sector window is then absent and the scalar forms count alone)
+add_test(NAME test_memcount_forms_simd_base COMMAND test_memcount_forms)
+set_tests_properties(test_memcount_forms_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base" TIMEOUT 1500)
 # The single-lookup atomic read-modify-write and the one-lookup texel read, against the per-access code they replace.
 vgpu_unit_test(test_atom_rmw)
 # Module::code_at (a binary search over the code sections) against the scan it replaced.

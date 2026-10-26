@@ -234,4 +234,28 @@ inline unsigned popcount32(uint32_t x) {
 }
 const Kernels& kernels_for(Level l);
 
+// The distinct 32-byte sectors of a warp's accesses that all lie within 63 sectors of one another, in any order (the
+// thread-private array a kernel indexes by a value of its own): the AVX2 form of memcount's sectors_window, or null on
+// a host or at a level without AVX2. For 1 to 64 lanes (`m` the active ones, not zero) of `span` bytes (1 to 32) at
+// addrs[lane]; true with the count in `out`, or false (nothing counted) when an address is not below 2^62 or a sector
+// lies outside the 63 that start 24 before the first active lane's (the caller then counts another way). The same
+// count as the scalar window, whatever the level: the level changes the speed only.
+using SectorWindowFn = bool (*)(const uint64_t* addrs, uint64_t m, uint64_t span, uint64_t& out);
+namespace detail {
+extern SectorWindowFn g_sector_window __attribute__((visibility("hidden")));
+}
+inline SectorWindowFn sector_window_kernel() { return detail::g_sector_window; }
+
+// The AVX2 forms of the PTX engine's f64 lane loops (32 lanes; `m` the active ones; null/absent below AVX2, see
+// avx2_f64_available): fma d = a * b + c with the contracted-subtract negations in `sub` (bit 0 the product, bit 1 the
+// addend), and add (op 0), sub (1), mul (2) or div (3) into a row of 32 results, returning whether any is a NaN.
+bool avx2_f64_available();
+void fma_lanes_f64_avx2(uint64_t* d, const uint64_t* a, const uint64_t* b, const uint64_t* c, uint64_t m, unsigned sub);
+bool f64_bin_lanes_avx2(unsigned op, uint64_t* r, const uint64_t* a, const uint64_t* b);
+
+namespace testing {
+// Switches the kernel above between the level's own (true) and none (false), for the tests that compare the two.
+void use_sector_window_kernel(bool on);
+}
+
 }  // namespace vgpu::simd

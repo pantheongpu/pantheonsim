@@ -44,6 +44,127 @@ namespace vgpu::simd {
 #include "kernels.inc"
 #undef VGPU_SIMD_NS
 #undef VGPU_SIMD_AVX2
+
+// memcount's sectors_window, four lanes to a step: each lane's first and last sector (the access's last byte is at most
+// 31 on, so at most the next sector) become a bit of one 64-bit word, relative to 24 sectors before the first active
+// lane's, and the sectors are the word's set bits. An inactive lane in a group of four takes the first active lane's
+// address (the same sector again). The first lane's address below 2^62 keeps every sum from wrapping; a lane outside
+// the window, or at 2^62 or above, gives the whole warp up.
+namespace avx2_impl {
+__attribute__((target("popcnt"))) bool sector_window_k(const uint64_t* addrs, uint64_t m, uint64_t span, uint64_t& out) {
+  const unsigned lo = static_cast<unsigned>(std::countr_zero(m));
+  const unsigned hi = 64 - static_cast<unsigned>(std::countl_zero(m));
+  const uint64_t a0 = addrs[lo];
+  const __m256i va0 = _mm256_set1_epi64x(static_cast<long long>(a0));
+  const __m256i extra = _mm256_set1_epi64x(static_cast<long long>(span - 1));
+  const __m256i base = _mm256_set1_epi64x(static_cast<long long>((a0 >> 5) - 24));
+  const __m256i c62 = _mm256_set1_epi64x(62);
+  const __m256i one = _mm256_set1_epi64x(1);
+  const __m256i lane_bit = _mm256_set_epi64x(8, 4, 2, 1);
+  const __m256i zero = _mm256_setzero_si256();
+  __m256i bits = zero, bad = zero, big = zero;
+  for (unsigned i = lo & ~3u; i < hi; i += 4) {
+    __m256i a;
+    if (i + 4 <= hi) {
+      a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(addrs + i));
+    } else {   // (the last group reads only the lanes up to the highest active one: the array may end there)
+      uint64_t tail[4] = {a0, a0, a0, a0};
+      for (unsigned j = 0; i + j < hi; ++j) tail[j] = addrs[i + j];
+      a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(tail));
+    }
+    const unsigned nib = static_cast<unsigned>(m >> i) & 15u;
+    if (nib != 15u) {
+      const __m256i on = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_set1_epi64x(nib), lane_bit), lane_bit);
+      a = _mm256_blendv_epi8(va0, a, on);
+    }
+    big = _mm256_or_si256(big, a);
+    const __m256i f = _mm256_srli_epi64(a, 5);
+    const __m256i e = _mm256_srli_epi64(_mm256_add_epi64(a, extra), 5);
+    const __m256i d = _mm256_sub_epi64(f, base);
+    bad = _mm256_or_si256(bad, _mm256_or_si256(_mm256_cmpgt_epi64(d, c62), _mm256_cmpgt_epi64(zero, d)));
+    const __m256i bit = _mm256_sllv_epi64(one, d);
+    bits = _mm256_or_si256(bits, _mm256_or_si256(bit, _mm256_sllv_epi64(bit, _mm256_sub_epi64(e, f))));
+  }
+  if (!_mm256_testz_si256(bad, bad) ||
+      !_mm256_testz_si256(big, _mm256_set1_epi64x(static_cast<long long>(0xC000'0000'0000'0000ull))))
+    return false;
+  const __m128i h = _mm_or_si128(_mm256_castsi256_si128(bits), _mm256_extracti128_si256(bits, 1));
+  const uint64_t w = static_cast<uint64_t>(_mm_cvtsi128_si64(h)) | static_cast<uint64_t>(_mm_extract_epi64(h, 1));
+  out = static_cast<uint64_t>(__builtin_popcountll(w));
+  return true;
+}
+
+// The same four lanes at a time (a 32-lane warp: eight steps), on a host with AVX2 at the level in use (VGPU_SIMD=base
+// and off keep the loop above): the fused multiply-add is correctly rounded, so a vector fma gives each lane's bits. A
+// group with a NaN result -- whose operands may be NaNs, which the rule above picks from -- is run lane by lane, and
+// an inactive lane is read (the arrays hold all lanes) but never written.
+void fma_lanes_f64_k(uint64_t* d, const uint64_t* a, const uint64_t* b,
+                                                            const uint64_t* c, uint64_t m, uint32_t width, unsigned sub) {
+  const __m256i lane_bit = _mm256_set_epi64x(8, 4, 2, 1);
+  // A contracted subtract negates the product (bit 0) or the addend (bit 1): the general path multiplies by -1.0, which
+  // flips the sign bit of any value that is not a NaN, and a NaN lane is run lane by lane below.
+  const __m256d sign = _mm256_set1_pd(-0.0);
+  const __m256d nega = sub & 1 ? sign : _mm256_setzero_pd(), negc = sub & 2 ? sign : _mm256_setzero_pd();
+  const double sa = sub & 1 ? -1.0 : 1.0, sc = sub & 2 ? -1.0 : 1.0;
+  if (width == 32 && (m & 0xFFFFFFFFull) == 0xFFFFFFFFull) {
+    // A full warp: the eight results are made first and checked for a NaN together, and stored (after every operand is
+    // read, so a destination that is also a source is fine) when there is none.
+    __m256d r[8];
+    __m256d nan = _mm256_setzero_pd();
+#pragma GCC unroll 8
+    for (uint32_t i = 0; i < 8; ++i) {
+      r[i] = _mm256_fmadd_pd(_mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(a + 4 * i)), nega),
+                             _mm256_loadu_pd(reinterpret_cast<const double*>(b + 4 * i)),
+                             _mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(c + 4 * i)), negc));
+      nan = _mm256_or_pd(nan, _mm256_cmp_pd(r[i], r[i], _CMP_UNORD_Q));
+    }
+    if (!_mm256_movemask_pd(nan)) {
+#pragma GCC unroll 8
+      for (uint32_t i = 0; i < 8; ++i) _mm256_storeu_pd(reinterpret_cast<double*>(d + 4 * i), r[i]);
+      return;
+    }
+  }
+  for (uint32_t l = 0; l < width; l += 4) {
+    const unsigned nib = static_cast<unsigned>(m >> l) & 15u;
+    if (!nib) continue;
+    const __m256d r = _mm256_fmadd_pd(_mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(a + l)), nega),
+                                      _mm256_loadu_pd(reinterpret_cast<const double*>(b + l)),
+                                      _mm256_xor_pd(_mm256_loadu_pd(reinterpret_cast<const double*>(c + l)), negc));
+    if (_mm256_movemask_pd(_mm256_cmp_pd(r, r, _CMP_UNORD_Q))) {
+      for (uint32_t k = l; k < l + 4; ++k) {
+        if (!(m >> k & 1)) continue;
+        double x, y, z;
+        std::memcpy(&x, &a[k], 8);
+        std::memcpy(&y, &b[k], 8);
+        std::memcpy(&z, &c[k], 8);
+        const double v = __builtin_fma(sa * x, y, sc * z);
+        std::memcpy(&d[k], &v, 8);
+        if (v != v && (x != x || y != y || z != z)) d[k] = (y != y ? b[k] : z != z ? c[k] : a[k]) | 0x0008000000000000ull;
+      }
+    } else if (nib == 15u) {
+      _mm256_storeu_pd(reinterpret_cast<double*>(d + l), r);
+    } else {
+      const __m256i on = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_set1_epi64x(nib), lane_bit), lane_bit);
+      _mm256_maskstore_pd(reinterpret_cast<double*>(d + l), on, r);
+    }
+  }
+}
+// f64 add (op 0), sub (1), mul (2) or div (3) of every lane, in a row of 32 results, four lanes at a time: the host's
+// operation is correctly rounded either way, so the bits are the scalar loop's. Returns whether any lane's result is a NaN
+// (an inactive lane's too: its operands are whatever the register holds).
+bool f64_bin_lanes_k(unsigned op, uint64_t* r, const uint64_t* a, const uint64_t* b,
+                                                        uint32_t width) {
+  __m256d nan = _mm256_setzero_pd();
+  for (uint32_t l = 0; l < width; l += 4) {
+    const __m256d x = _mm256_loadu_pd(reinterpret_cast<const double*>(a + l));
+    const __m256d y = _mm256_loadu_pd(reinterpret_cast<const double*>(b + l));
+    const __m256d v = op == 0 ? _mm256_add_pd(x, y) : op == 1 ? _mm256_sub_pd(x, y) : op == 2 ? _mm256_mul_pd(x, y) : _mm256_div_pd(x, y);
+    nan = _mm256_or_pd(nan, _mm256_cmp_pd(v, v, _CMP_UNORD_Q));
+    _mm256_storeu_pd(reinterpret_cast<double*>(r + l), v);
+  }
+  return _mm256_movemask_pd(nan) != 0;
+}
+}  // namespace avx2_impl
 #pragma GCC pop_options
 #endif
 
@@ -242,7 +363,37 @@ int f16c_checks_run() { return g_f16c_checks.load(std::memory_order_relaxed); }
 namespace detail {
 std::atomic<const Kernels*> g_kernels __attribute__((visibility("hidden"))){&kBase};
 bool g_enabled __attribute__((visibility("hidden"))) = true;
+SectorWindowFn g_sector_window __attribute__((visibility("hidden"))) = nullptr;
 }  // namespace detail
+
+bool avx2_f64_available() {
+#ifdef VGPU_SIMD_X86
+  return level() == Level::Avx2;
+#else
+  return false;
+#endif
+}
+#ifdef VGPU_SIMD_X86
+void fma_lanes_f64_avx2(uint64_t* d, const uint64_t* a, const uint64_t* b, const uint64_t* c, uint64_t m, unsigned sub) {
+  avx2_impl::fma_lanes_f64_k(d, a, b, c, m, 32, sub);
+}
+bool f64_bin_lanes_avx2(unsigned op, uint64_t* r, const uint64_t* a, const uint64_t* b) {
+  return avx2_impl::f64_bin_lanes_k(op, r, a, b, 32);
+}
+#else
+void fma_lanes_f64_avx2(uint64_t*, const uint64_t*, const uint64_t*, const uint64_t*, uint64_t, unsigned) {}
+bool f64_bin_lanes_avx2(unsigned, uint64_t*, const uint64_t*, const uint64_t*) { return false; }
+#endif
+
+namespace testing {
+void use_sector_window_kernel(bool on) {
+#ifdef VGPU_SIMD_X86
+  detail::g_sector_window = on && level() == Level::Avx2 ? avx2_impl::sector_window_k : nullptr;
+#else
+  (void)on;
+#endif
+}
+}  // namespace testing
 
 namespace {
 // Runs when the library is loaded: from here on the engines get the level this host has (an AVX2 host starts on the
@@ -250,6 +401,7 @@ namespace {
 const bool g_init = [] {
 #ifdef VGPU_SIMD_X86
   if (level() == Level::Avx2) detail::g_kernels.store(&kAvx2Lazy, std::memory_order_release);
+  testing::use_sector_window_kernel(true);
 #endif
   const char* v = std::getenv("VGPU_SIMD");
   detail::g_enabled = !(v && std::strcmp(v, "off") == 0);
