@@ -1941,7 +1941,12 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
     frac[i] = f;
   }
   int w[8];
-  tex_weights(fdims, frac, w, total);
+  if (!(frac[0] | frac[1] | frac[2])) {   // at a texel's centre: the whole weight is the first texel's (what tex_weights gives)
+    w[0] = total;
+    for (int k = 1; k < 8; ++k) w[k] = 0;
+  } else {
+    tex_weights(fdims, frac, w, total);
+  }
   const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
   const uint64_t plane = row * (d.height ? d.height : 1);
   int n = 0;
