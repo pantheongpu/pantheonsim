@@ -37,7 +37,7 @@ VTEST(a_mapped_buffer_reads_and_writes_through_the_cache) {
   Buf b(4096, 0x11);
   mem.map_host(b.addr(), b.p, b.n);
   for (int i = 0; i < 100; ++i) {   // the first access fills the cache, the rest are served from it
-    VCHECK_EQ(mem.load_scalar(b.addr() + 8, 4), uint64_t{0x11111111});
+    if (i == 0) VCHECK_EQ(mem.load_scalar(b.addr() + 8, 4), uint64_t{0x11111111});
     mem.store_scalar(b.addr() + 8, 4, 0xA0u + i);
     VCHECK_EQ(mem.load_scalar(b.addr() + 8, 4), uint64_t{0xA0u + i});
   }
