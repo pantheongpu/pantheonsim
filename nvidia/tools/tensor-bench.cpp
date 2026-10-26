@@ -21,6 +21,10 @@
 #include <string>
 #include <vector>
 
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
 #include "vgpu/memory.hpp"
@@ -36,6 +40,50 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// User-mode CPU cycles and retired instructions of the calling thread (perf_event_open; -1 when the host does not allow it): a count of
+// the work that does not move with the clock speed or with what else runs on the machine, which a wall time does.
+struct Counters {
+  int fd_cycles = -1, fd_instr = -1;
+  Counters() {
+    fd_cycles = open_counter(PERF_COUNT_HW_CPU_CYCLES);
+    fd_instr = open_counter(PERF_COUNT_HW_INSTRUCTIONS);
+  }
+  static int open_counter(uint64_t config) {
+    perf_event_attr a{};
+    a.type = PERF_TYPE_HARDWARE;
+    a.size = sizeof a;
+    a.config = config;
+    a.exclude_kernel = 1;
+    a.exclude_hv = 1;
+    return static_cast<int>(syscall(SYS_perf_event_open, &a, 0, -1, -1, 0));
+  }
+  static uint64_t read_one(int fd) {
+    uint64_t v = 0;
+    if (fd < 0 || read(fd, &v, sizeof v) != static_cast<ssize_t>(sizeof v)) return 0;
+    return v;
+  }
+  uint64_t cycles() const { return read_one(fd_cycles); }
+  uint64_t instrs() const { return read_one(fd_instr); }
+};
+Counters g_counters;
+struct Stamp {
+  Clock::time_point t;
+  uint64_t cycles, instrs;
+};
+Stamp stamp() { return {Clock::now(), g_counters.cycles(), g_counters.instrs()}; }
+// What the last timed launch cost.
+struct Last {
+  double ns = 0;
+  uint64_t cycles = 0, instrs = 0;
+} g_last;
+double since(const Stamp& s0) {
+  const Stamp s1 = stamp();
+  g_last.ns = std::chrono::duration<double, std::nano>(s1.t - s0.t).count();
+  g_last.cycles = s1.cycles - s0.cycles;
+  g_last.instrs = s1.instrs - s0.instrs;
+  return g_last.ns;
+}
+
 std::vector<uint8_t> arg_u64(uint64_t v) {
   std::vector<uint8_t> b(8);
   std::memcpy(b.data(), &v, 8);
@@ -45,18 +93,6 @@ std::vector<uint8_t> arg_u32(uint32_t v) {
   std::vector<uint8_t> b(4);
   std::memcpy(b.data(), &v, 4);
   return b;
-}
-
-// CPU cycles a nanosecond, from a calibration loop with a known dependent-add latency (1 cycle each).
-double ghz() {
-  static const double g = [] {
-    uint64_t x = 1;
-    const auto t0 = Clock::now();
-    for (uint64_t i = 0; i < 100000000ull; ++i) asm volatile("add $1, %0" : "+r"(x));
-    const double ns = std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
-    return 100000000.0 / ns;
-  }();
-  return g;
 }
 
 std::mt19937 rng(0x7e5);
@@ -184,9 +220,9 @@ double run_reg(const Reg& f, int reps) {
   LaunchConfig cfg;
   cfg.block = {32, 1, 1};
   exec::launch(m.entries[0], cfg, {arg_u64(pin)}, mem, prof);   // (once untimed: whatever the engine builds on first use)
-  const auto t0 = Clock::now();
+  const Stamp t0 = stamp();
   exec::launch(m.entries[0], cfg, {arg_u64(pin)}, mem, prof);
-  return std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
+  return since(t0);
 }
 
 // ---- PTX: wgmma ---------------------------------------------------------------------------------------------------------------
@@ -278,9 +314,9 @@ COPIED:
   LaunchConfig cfg;
   cfg.block = {128, 1, 1};
   exec::launch(m.entries[0], cfg, {arg_u64(pimg), arg_u64(desc(0)), arg_u64(desc(8192))}, mem, prof);
-  const auto t0 = Clock::now();
+  const Stamp t0 = stamp();
   exec::launch(m.entries[0], cfg, {arg_u64(pimg), arg_u64(desc(0)), arg_u64(desc(8192))}, mem, prof);
-  return std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
+  return since(t0);
 }
 
 // ---- PTX: tcgen05.mma ---------------------------------------------------------------------------------------------------------
@@ -420,9 +456,9 @@ WAIT:
   cfg.cluster = {1, 1, 1};
   const uint32_t a_row = Ka * c.eb, b_row = Ke * c.eb;
   exec::launch(m.entries[0], cfg, {arg_u64(pa), arg_u64(pb), arg_u64(desc(0, a_row)), arg_u64(desc(0, b_row)), arg_u32(id)}, mem, prof);
-  const auto t0 = Clock::now();
+  const Stamp t0 = stamp();
   exec::launch(m.entries[0], cfg, {arg_u64(pa), arg_u64(pb), arg_u64(desc(0, a_row)), arg_u64(desc(0, b_row)), arg_u32(id)}, mem, prof);
-  return std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
+  return since(t0);
 }
 
 // ---- SASS: HMMA, IMMA, QMMA, ... words of the corpora -------------------------------------------------------------------------
@@ -603,23 +639,30 @@ double run_sass(const SassRow& r, const std::string& src_dir, int reps) {
   std::vector<uint8_t> arg(8);
   std::memcpy(arg.data(), &buf, 8);
   sass::launch(*m, "k", cfg, {arg}, mem, prof);   // (the first launch analyses the code; the second is what is timed)
-  const auto t0 = Clock::now();
+  const Stamp t0 = stamp();
   sass::launch(*m, "k", cfg, {arg}, mem, prof);
-  return std::chrono::duration<double, std::nano>(Clock::now() - t0).count();
+  return since(t0);
 }
 
-double best_of(int n, const std::function<double()>& f) {
-  double best = 1e30;
-  for (int i = 0; i < n; ++i) best = std::min(best, f());
+// The cheapest of n launches, by cycles (by time without counters).
+Last best_of(int n, const std::function<double()>& f) {
+  Last best;
+  best.ns = 1e30;
+  best.cycles = ~uint64_t{0};
+  for (int i = 0; i < n; ++i) {
+    f();
+    if (g_counters.fd_cycles >= 0 ? g_last.cycles < best.cycles : g_last.ns < best.ns) best = g_last;
+  }
   return best;
 }
 
 void report(const char* name, int r, const std::function<double(int)>& run) {
   try {
     run(2);   // warm-up (tables, first-use checks)
-    const double t1 = best_of(5, [&] { return run(r); }), t2 = best_of(5, [&] { return run(2 * r); });
-    const double ns = (t2 - t1) / r;
-    std::printf("%-46s %12.1f ns  %12.0f cycles\n", name, ns, ns * ghz());
+    const Last t1 = best_of(5, [&] { return run(r); }), t2 = best_of(5, [&] { return run(2 * r); });
+    const double ns = (t2.ns - t1.ns) / r, cyc = (static_cast<double>(t2.cycles) - static_cast<double>(t1.cycles)) / r,
+                 ins = (static_cast<double>(t2.instrs) - static_cast<double>(t1.instrs)) / r;
+    std::printf("%-46s %12.1f ns  %12.0f cycles  %12.0f instr\n", name, ns, cyc, ins);
   } catch (const std::exception& e) {
     std::printf("%-46s skipped: %s\n", name, e.what());
   }
@@ -630,7 +673,6 @@ void report(const char* name, int r, const std::function<double(int)>& run) {
 
 int main(int argc, char** argv) {
   const std::string filter = argc > 1 ? argv[1] : "";
-  ghz();
   const int reps = argc > 2 ? std::atoi(argv[2]) : 400;
   const char* src = std::getenv("VGPU_SOURCE_DIR");
   const auto want = [&](const char* name) { return filter.empty() || std::string(name).find(filter) != std::string::npos; };
