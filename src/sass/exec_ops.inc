@@ -2961,6 +2961,16 @@ void Runner::exec_float(Block&, Warp& w, const Instr& ins, Mask ex) {
 
 // ---- memory ------------------------------------------------------------------
 
+// A warp's shared-memory access of `n` lanes of `bytes` bytes, taking `passes` passes through the banks.
+inline void count_shared(exec::LaunchStats& st, bool store, uint64_t n, uint32_t bytes, uint64_t passes) {
+  (store ? st.shared_stores : st.shared_loads) += n;
+  (store ? st.shared_bytes_written : st.shared_bytes_read) += n * bytes;
+  ++st.shared_requests;
+  ++(store ? st.shared_requests_st : st.shared_requests_ld);
+  st.shared_bank_conflicts += passes - 1;
+  (store ? st.shared_bank_conflicts_st : st.shared_bank_conflicts_ld) += passes - 1;
+}
+
 // Counts one warp-level access: per-lane operations and bytes, the 32-byte
 // sectors the lanes' addresses touch, and shared-memory bank conflicts.
 void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 local */, bool store,
@@ -2980,15 +2990,9 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
       break;
     }
     case 1: {
-      (store ? st.shared_stores : st.shared_loads) += n;
-      (store ? st.shared_bytes_written : st.shared_bytes_read) += n * bytes;
-      ++st.shared_requests;
-      ++(store ? st.shared_requests_st : st.shared_requests_ld);
       // 32 banks of 4 bytes: lanes on different words of one bank take a
       // pass each; lanes on the same word share one.
-      const uint64_t passes = exec::memcount::sass_bank_passes(addr, lanes, 32, bytes);
-      st.shared_bank_conflicts += passes - 1;
-      (store ? st.shared_bank_conflicts_st : st.shared_bank_conflicts_ld) += passes - 1;
+      count_shared(st, store, n, bytes, exec::memcount::sass_bank_passes(addr, lanes, 32, bytes));
       break;
     }
     default: {
@@ -3638,54 +3642,11 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       // value) writes nothing a spinning peer could be waiting for (see Warp::idle_yields).
       bool changed = false;
       const uint32_t idle0 = w.idle_yields;
-      // The value the atomic stores, given the one it finds (old), the operand (v) and the exchange value (swap) of lane l.
+      // The value the atomic stores, given the one it finds (old), the operand (v) and the exchange value (swap) of lane l
+      // (vgpu/exec/sass_atomics.hpp has the rules).
       const auto apply = [&](unsigned l, const uint64_t old, const uint64_t v, const uint64_t swap) -> uint64_t {
-        uint64_t nw = old;
-        if (cas) {
-          if (old == v) nw = swap;
-        } else {
-          if (type == 4 || type == 7) {   // F16x2, BF16x2 (and their vectors): add, min or max on each half
-            const ptx::AtomOp fop = ins.f[0] == 1 ? ptx::AtomOp::Min : ins.f[0] == 2 ? ptx::AtomOp::Max : ptx::AtomOp::Add;
-            nw = exec::atom_word(fop, type == 7 ? 2 : 1, static_cast<uint32_t>(old), static_cast<uint32_t>(v));
-          } else
-          switch (popc_inc ? 3 : ins.f[0]) {
-            case 0:   // ADD, by the PTX engine's rules (an RTX 3060's)
-              if (type == 3) {
-                // .ftz on inputs and result; a NaN result is the canonical one.
-                const auto fz = [](float x) { return std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0f, x) : x; };
-                const float r = fz(fz(as_f32(static_cast<uint32_t>(old))) + fz(as_f32(static_cast<uint32_t>(v))));
-                nw = r != r ? 0x7fffffffu : f32_bits(r);
-              } else if (type == 6) {
-                // A NaN comes through as it is: the one added, else the one in memory.
-                const double x = as_f64(old), y = as_f64(v);
-                nw = std::isnan(y) ? v : std::isnan(x) ? old : f64_bits(x + y);
-              } else if (type == 4 || type == 7) {   // F16x2, BF16x2: each half added once in double
-                const ptx::Type ht{type == 7 ? ptx::Type::Kind::BF : ptx::Type::Kind::F, 16};
-                const uint64_t lo = exec::reduce_value(ptx::AtomOp::Add, ht, old & 0xffff, v & 0xffff);
-                const uint64_t hi = exec::reduce_value(ptx::AtomOp::Add, ht, (old >> 16) & 0xffff, (v >> 16) & 0xffff);
-                nw = lo | (hi << 16);
-              } else nw = old + v;
-              break;
-            case 1:   // MIN
-              if (type == 1) nw = static_cast<uint32_t>(std::min(static_cast<int32_t>(old), static_cast<int32_t>(v)));
-              else if (type == 5) nw = static_cast<uint64_t>(std::min(static_cast<int64_t>(old), static_cast<int64_t>(v)));
-              else nw = std::min(old, v);
-              break;
-            case 2:   // MAX
-              if (type == 1) nw = static_cast<uint32_t>(std::max(static_cast<int32_t>(old), static_cast<int32_t>(v)));
-              else if (type == 5) nw = static_cast<uint64_t>(std::max(static_cast<int64_t>(old), static_cast<int64_t>(v)));
-              else nw = std::max(old, v);
-              break;
-            case 3: nw = popc_inc ? old + 1 : (static_cast<uint32_t>(old) >= static_cast<uint32_t>(v) ? 0 : old + 1); break;   // INC
-            case 4: nw = (old == 0 || static_cast<uint32_t>(old) > static_cast<uint32_t>(v)) ? v : old - 1; break;             // DEC
-            case 5: nw = old & v; break;
-            case 6: nw = old | v; break;
-            case 7: nw = old ^ v; break;
-            case 8: nw = v; break;   // EXCH
-            default: fault(w, ins, l, "atomic op " + std::to_string(ins.f[0]));
-          }
-        }
-        if (!is64) nw &= 0xffffffff;
+        uint64_t nw;
+        if (!exec::sassatom::apply(ins.f[0], type, cas, popc_inc, old, v, swap, nw)) fault(w, ins, l, "atomic op " + std::to_string(ins.f[0]));
         if (nw != old) changed = true;
         return nw;
       };
@@ -3758,10 +3719,10 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       // A warp's atomics on plain global memory taken together. Each lane's is a read-modify-write under the lock of its
       // address' stripe; here the lanes' addresses are grouped (a lane that shares an address with an earlier one finds
       // what that one left, as in the loop below), the stripes involved locked in order, each distinct address loaded
-      // and stored once (MemoryManager::load_batch / store_batch, which decline, having done nothing, whenever the plain
-      // accesses could differ) and the lanes applied one after another in lane order. What every lane gets back and what
-      // memory holds are what the loop below gives; another host thread sees the warp's atomics as one step. Anything
-      // else -- shared or local memory, host-mapped memory, misaligned addresses, vector forms -- takes the loop.
+      // and stored once (MemoryManager::batch_window, which declines, having done nothing, whenever the plain
+      // accesses could differ -- host-mapped memory among them) and the lanes applied one after another in lane order. What every
+      // lane gets back and what memory holds are what the loop below gives; another host thread sees the warp's atomics as one
+      // step. Anything else -- shared or local memory, host-mapped memory, misaligned addresses, vector forms -- takes the loop.
       if (fast_ && !shared && !popc_inc && ins.f[7] <= 1 && m_.sm >= 80 && ex && (red || ins.dst.back().kind == Kind::Reg)) {
         uint64_t ga[32];
         row_addresses(a, ins.w.bit(72) || ins.w.bit(90), ins.w.bit(91) && !ins.w.bit(72), 64, ex, ga);
@@ -3769,64 +3730,115 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         uint64_t uaddr[32], v[32], swp[32];
         unsigned nu = 0, slot[32];
         uint64_t stripes = 0;
+        // The distinct addresses, in the order the lanes first name them: a small table keyed by the address finds a lane's.
+        uint8_t seen[64];
+        std::memset(seen, 0, sizeof seen);
         for (Mask m = ex; m && ok; m &= m - 1) {
           const unsigned l = static_cast<unsigned>(std::countr_zero(m));
           uint64_t addr = ga[l];
           if (ins.op == Op::ATOM && classify(ga[l], &addr) != Space::Global) ok = false;
-          if (addr % n) ok = false;
+          if (addr & (n - 1)) ok = false;   // (n is 4 or 8)
           if (!ok) break;
-          // The slot of this address among the distinct ones (the last one first: lanes of a warp mostly repeat or step on).
-          unsigned k = nu;
-          if (nu && uaddr[nu - 1] == addr) k = nu - 1;
-          else
-            for (unsigned i = 0; i < nu; ++i)
-              if (uaddr[i] == addr) {
-                k = i;
-                break;
-              }
-          if (k == nu) {
-            uaddr[nu++] = addr;
-            stripes |= uint64_t{1} << ((addr >> 3) % 64);
+          unsigned k;
+          if (nu && uaddr[nu - 1] == addr) {   // (lanes of a warp mostly repeat or step on)
+            k = nu - 1;
+          } else {
+            unsigned h = static_cast<unsigned>(((addr >> (is64 ? 3 : 2)) * 0x9e3779b97f4a7c15ull) >> 58);
+            while (seen[h] && uaddr[seen[h] - 1] != addr) h = (h + 1) & 63;
+            if (seen[h]) {
+              k = seen[h] - 1u;
+            } else {
+              k = nu;
+              uaddr[nu++] = addr;
+              seen[h] = static_cast<uint8_t>(nu);
+              stripes |= uint64_t{1} << atomic_stripe(addr);
+            }
           }
           slot[l] = k;
-          v[l] = is64 ? read64(w, ins.src[1], l) : read32(w, ins.src[1], l);
-          swp[l] = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
         }
-        // Memory the host maps (managed, pinned, shared through CUDA IPC) takes the CPU's atomic in the loop; asking also
-        // finds read-only host memory, which the loop's first lane to reach it reports.
-        for (unsigned i = 0; ok && i < nu; ++i) {
-          try {
-            if (mem_.host_address(uaddr[i], n)) ok = false;
-          } catch (const Error&) {
-            ok = false;
-          }
-        }
+        // Memory the host maps takes the CPU's atomic in the loop below, before any lock is taken here.
+        if (ok && !exec::sassatom::batchable(mem_, uaddr, nu)) ok = false;
         if (ok) {
+          // The operands of the lanes that run: a register's own lanes, or the one value every lane has.
+          const auto fetch = [&](const Operand& o, bool wide, uint64_t* out) {
+            if (o.kind == Kind::Reg && o.reg != kRZ) {
+              const uint32_t* lo = &w.reg(o.reg, 0);
+              if (wide) {
+                const uint32_t* hi = &w.reg(o.reg + 1, 0);
+                for (Mask m = ex; m; m &= m - 1) {
+                  const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                  out[l] = lo[l] | (static_cast<uint64_t>(hi[l]) << 32);
+                }
+              } else {
+                for (Mask m = ex; m; m &= m - 1) {
+                  const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                  out[l] = lo[l];
+                }
+              }
+              return;
+            }
+            const uint64_t x = wide ? read64(w, o, 0) : read32(w, o, 0);
+            for (Mask m = ex; m; m &= m - 1) out[std::countr_zero(m)] = x;
+          };
+          fetch(ins.src[1], is64, v);
+          if (cas) fetch(ins.src[2], is64, swp);
           uint64_t old_of[32];
           bool done = false;
           {   // (the locks are let go before the loop below might take them again)
-            std::unique_lock<std::mutex> locks[32];
-            unsigned held = 0;
-            for (uint64_t sm = stripes; sm; sm &= sm - 1)
-              locks[held++] = std::unique_lock<std::mutex>(atomic_lock(uint64_t{static_cast<unsigned>(std::countr_zero(sm))} << 3));
+            StripeLocks locks;
+            for (uint64_t sm = stripes; sm; sm &= sm - 1) locks.lock(atomic_stripe_lock(static_cast<unsigned>(std::countr_zero(sm))));
             uint64_t cur[32];
-            if (mem_.load_batch(uaddr, nu, n, cur)) {
-              for (Mask m = ex; m; m &= m - 1) {
-                const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-                old_of[l] = cur[slot[l]];
-                cur[slot[l]] = apply(l, old_of[l], v[l], swp[l]);
+            MemoryManager::BatchWindow window;
+            if (mem_.batch_window(uaddr, nu, n, &window)) {   // (the checks of the load and of the store, made once)
+              mem_.batch_load(window, uaddr, nu, n, cur);
+              // The lanes one after another, each finding what the lanes before it left. `step` is the value an atomic stores, given
+              // the one it finds, its operand and (a CAS) the exchange value; the common operations get a loop of their own.
+              const uint64_t keep = is64 ? ~uint64_t{0} : 0xffffffffull;
+              const auto lanes = [&](auto&& step) {
+                for (Mask m = ex; m; m &= m - 1) {
+                  const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                  const uint64_t old = cur[slot[l]];
+                  const uint64_t nw = step(l, old, v[l], swp[l]) & keep;
+                  old_of[l] = old;
+                  changed |= nw != old;
+                  cur[slot[l]] = nw;
+                }
+              };
+              using exec::sassatom::Step;
+              const auto with = [&](auto step) { lanes([&](unsigned, uint64_t old, uint64_t x, uint64_t swap) { return step(old, x, swap); }); };
+              switch (exec::sassatom::step_for(ins.f[0], type, cas)) {
+                case Step::Cas: with(exec::sassatom::CasStep{}); break;
+                case Step::Add: with(exec::sassatom::AddStep{}); break;
+                case Step::AddF32: with(exec::sassatom::AddF32Step{}); break;
+                case Step::Min: with(exec::sassatom::MinStep{}); break;
+                case Step::Max: with(exec::sassatom::MaxStep{}); break;
+                case Step::And: with(exec::sassatom::AndStep{}); break;
+                case Step::Or: with(exec::sassatom::OrStep{}); break;
+                case Step::Xor: with(exec::sassatom::XorStep{}); break;
+                case Step::Exch: with(exec::sassatom::ExchStep{}); break;
+                default: lanes([&](unsigned l, uint64_t old, uint64_t x, uint64_t swap) { return apply(l, old, x, swap); }); break;
               }
-              // (a store the memory declines leaves it as it was, and the loop does the lot: nothing above has an effect)
-              done = mem_.store_batch(uaddr, nu, n, cur);
+              mem_.batch_store(window, uaddr, nu, n, cur);
+              done = true;
             }
           }
           if (done) {
             w.idle_yields = changed ? 0 : idle0;
-            for (Mask m = ex; m; m &= m - 1) {
-              const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-              ++blk.st.atomics;
-              blk.st.atomic_bytes += n;
-              if (!red) emit(l, 0, old_of[l], v[l]);
+            const unsigned count = popc(ex);
+            blk.st.atomics += count;
+            blk.st.atomic_bytes += uint64_t{count} * n;
+            if (!red) {
+              // What each lane gets back: the predicate ATOM and ATOMG set, and the old value in the destination (a CAS.SPIN's flag
+              // instead: whether it stored).
+              const Operand& d = ins.dst[1];
+              const bool flag = cas && ins.f[6] != 0;
+              for (Mask m = ex; m; m &= m - 1) {
+                const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                set_pred(w, ins.dst[0], l, true);
+                const uint64_t x = flag ? (old_of[l] == v[l] ? 1 : 0) : old_of[l];
+                if (is64) write64(w, d, l, x);
+                else write32(w, d, l, static_cast<uint32_t>(x));
+              }
             }
             return;
           }
@@ -4428,6 +4440,21 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     std::memcpy(&v, &blk.shared[at_], eb_);
     return value(t, v);
   };
+  if (simd::enabled() && at != T::B1 && bt != T::B1) {
+    const auto tile_elem = [](T t) {
+      switch (t) {
+        case T::F16: return exec::TileElem::F16;
+        case T::BF16: return exec::TileElem::BF16;
+        case T::TF32: return exec::TileElem::TF32;
+        case T::E4M3: return exec::TileElem::E4M3;
+        case T::E5M2: return exec::TileElem::E5M2;
+        case T::S8: return exec::TileElem::S8;
+        default: return exec::TileElem::U8;
+      }
+    };
+    if (gmma_fast(blk, w, ins, ex, {N, K, desc_ur, sel, tile_elem(at), tile_elem(bt), int_form, acc32, sat, sa < 0, sb < 0, a_kmajor, b_kmajor, reg_a, sparse}))
+      return;
+  }
   const uint32_t row0 = (w.index % 4) * 16;
   // This warp's 16 x K slice of A.
   std::vector<double> A(size_t{16} * K, 0.0);
@@ -4509,6 +4536,130 @@ void Runner::exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   });
   snap.taken |= static_cast<uint8_t>(1u << (w.index % 4));
   if (snap.taken == 0xF) blk.gmma.erase(it);
+}
+
+// exec_gmma through the SIMD tile kernels (vgpu/simd/simd.hpp: tile_f32, tile_i32): the operands decoded once into float (or int32) tiles
+// -- the shared-memory ones by the first warp of the group, into the snapshot, as the general form reads them -- and each warp's 16 rows
+// one kernel call, which sums in k order with every product rounded and then added, as the general form's loop does. The same
+// arithmetic as the PTX engine's Interpreter::exec_wgmma_fast, on this engine's operands. Returns false, having changed nothing, for what
+// it does not take (a shared-memory read out of range, which the general form reports); exec_gmma then runs the general form.
+bool Runner::gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const GmmaForm& f) {
+  const unsigned N = f.N, K = f.K;
+  if (N == 0 || N % 8 || N > 256 || K == 0 || K > 64) return false;
+  if (exec::tile_elem_is_int(f.at) != f.int_form || exec::tile_elem_is_int(f.bt) != f.int_form) return false;
+  const bool f16_acc = !f.acc32 && !f.int_form;
+  const unsigned nregs = f16_acc ? N / 4 : N / 2;   // accumulator registers
+  const unsigned Kp = f.sparse ? K / 2 : K;
+  const unsigned abits = 8 * exec::tile_elem_bytes(f.at);
+  const unsigned stored = abits == 32 ? 1 : 2;
+  const unsigned rd = ins.dst[0].reg, rc = ins.src[f.reg_a ? 2 : 1].reg;
+  const uint32_t row0 = (w.index % 4) * 16;
+  const std::pair<uint32_t, uint64_t> key{w.index / 4, w.gmma_issued};
+  auto it = blk.gmma.find(key);
+  if (it == blk.gmma.end()) {
+    // The first warp of the group reads the shared-memory operands, for all four.
+    GmmaSnapshot snap;
+    snap.fast = true;
+    const auto desc = [&](unsigned u) { return exec::decode_wgmma_desc(w.ur[u] | (static_cast<uint64_t>(w.ur[u + 1]) << 32)); };
+    const uint8_t* const smem = blk.shared.data();
+    const size_t size = blk.shared.size();
+    if (!f.reg_a) {
+      const exec::WgmmaDesc d = desc(f.desc_ur);
+      if (f.int_form) {
+        snap.Ai.resize(size_t{64} * Kp);
+        if (!exec::wgmma_read_i32(smem, size, d, f.a_kmajor, f.at, 64, Kp, f.neg_a, false, 0xffffff, snap.Ai.data())) return false;
+      } else {
+        snap.Af.resize(size_t{64} * Kp);
+        if (!exec::wgmma_read_f32(smem, size, d, f.a_kmajor, f.at, 64, Kp, f.neg_a, false, 0xffffff, snap.Af.data())) return false;
+      }
+    }
+    const exec::WgmmaDesc d = desc(f.desc_ur + 2);
+    if (f.int_form) {
+      snap.Bi.resize(size_t{K} * N);
+      if (!exec::wgmma_read_i32(smem, size, d, f.b_kmajor, f.bt, N, K, f.neg_b, true, 0xffffff, snap.Bi.data())) return false;
+    } else {
+      snap.Bf.resize(size_t{K} * N);
+      if (!exec::wgmma_read_f32(smem, size, d, f.b_kmajor, f.bt, N, K, f.neg_b, true, 0xffffff, snap.Bf.data())) return false;
+    }
+    it = blk.gmma.emplace(key, std::move(snap)).first;
+  } else if (!it->second.fast) {
+    return false;
+  }
+  ++w.gmma_issued;
+  GmmaSnapshot& snap = it->second;
+
+  uint32_t meta[32] = {};
+  if (f.sparse) {
+    const unsigned mr = ins.f[7] & 0xff;
+    for (unsigned l = 0; l < 32; ++l) meta[l] = mr == kRZ ? 0 : w.reg(mr, l);
+  }
+  thread_local std::vector<float> Af;
+  thread_local std::vector<int32_t> Ai;
+  // This warp's 16 x K slice of A.
+  if (f.int_form) Ai.assign(size_t{16} * K, 0);
+  else Af.assign(size_t{16} * K, 0.0f);
+  if (f.reg_a) {
+    // mma.m16n8kK's A fragment (mma.sp's, sparse).
+    const unsigned ra = ins.src[0].reg, per_reg = 32 / abits, cpr = per_reg / stored;
+    for (unsigned r = 0; r < 4; ++r)
+      for (unsigned l = 0; l < 32; ++l) {
+        const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8, col0 = t * per_reg + (r / 2) * (per_reg * 4);
+        const uint32_t v = ra == kRZ ? 0 : w.reg(ra + r, l);
+        for (unsigned e = 0; e < per_reg; ++e) {
+          const unsigned col = f.sparse ? exec::mma_sparse_column(abits, K, f.sel, meta, row, t * cpr + (r / 2) * 4 * cpr + e / stored, e % stored)
+                                        : col0 + e;
+          if (col >= K) continue;
+          const uint32_t raw = v >> (abits * e);
+          if (f.int_form) {
+            const int32_t x = exec::tile_decode_i32(f.at, raw);
+            Ai[row * K + col] = f.neg_a ? -x : x;
+          } else {
+            Af[row * K + col] = std::bit_cast<float>(std::bit_cast<uint32_t>(exec::tile_decode_f32(f.at, raw)) ^ (f.neg_a ? 0x80000000u : 0u));
+          }
+        }
+      }
+  } else {
+    if (f.int_form ? snap.Ai.empty() : snap.Af.empty()) fault(w, ins, 0, "the warps of a warpgroup disagree on where A is", Err::UnsupportedPtx);
+    for (uint32_t r = 0; r < 16; ++r)
+      for (uint32_t j = 0; j < Kp; ++j) {
+        const uint32_t col = f.sparse ? exec::mma_sparse_column(abits, K, f.sel, meta, r, j / stored, j % stored) : j;
+        if (col >= K) continue;
+        if (f.int_form) Ai[r * K + col] = snap.Ai[size_t{row0 + r} * Kp + j];
+        else Af[r * K + col] = snap.Af[size_t{row0 + r} * Kp + j];
+      }
+  }
+  // scale-d: stored as 7 - UPn (and a not); false means D = A*B.
+  const unsigned up = ins.f[6] & 7;
+  const bool keep = (up == 7 ? true : w.up[up]) != ((ins.f[6] & 8) != 0);
+  const bool accumulate = keep && rc != kRZ;
+  // The accumulator registers as words (zeros where there is none to add to), their 16 x N tile, the kernel, and back.
+  thread_local std::vector<uint32_t> cw, dw;
+  cw.assign(size_t{nregs} * 32, 0u);
+  dw.resize(size_t{nregs} * 32);
+  if (accumulate)
+    for (unsigned s = 0; s < nregs; ++s) std::memcpy(&cw[size_t{s} * 32], &w.reg(rc + s, 0), 32 * sizeof(uint32_t));
+  if (f.int_form) {
+    thread_local std::vector<int32_t> Ci, Di;
+    Ci.resize(size_t{16} * N);
+    Di.resize(size_t{16} * N);
+    exec::wgmma_acc_to_tile_i32(cw.data(), N, Ci.data());
+    simd::kernels().tile_i32(16, N, K, Ai.data(), snap.Bi.data(), Ci.data(), N, K, f.sat, Di.data(), N);   // (.SAT clamps once, after the whole K)
+    exec::wgmma_tile_to_acc_i32(Di.data(), N, dw.data());
+  } else {
+    thread_local std::vector<float> Cf, Df;
+    Cf.resize(size_t{16} * N);
+    Df.resize(size_t{16} * N);
+    exec::wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
+    simd::kernels().tile_f32(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
+    exec::wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data());
+  }
+  if (rd != kRZ)
+    each_lane(ex, [&](unsigned l) {
+      for (unsigned s = 0; s < nregs; ++s) w.reg(rd + s, l) = dw[size_t{s} * 32 + l];
+    });
+  snap.taken |= static_cast<uint8_t>(1u << (w.index % 4));
+  if (snap.taken == 0xF) blk.gmma.erase(it);
+  return true;
 }
 
 void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
@@ -4632,6 +4783,125 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
           for (unsigned s = 0; s < c_regs; ++s) w.reg(rd + s, l) = out[s * 32 + l];
         });
       return;
+    }
+  }
+  // The rest of the dense and sparse forms -- the sums of f16, bf16, tf32, e4m3 and e5m2 operands the SIMD kernel above does not take, the
+  // s8, u8, s4 and u4 products, f64 and .b1 -- through the tile kernels and fragment code of vgpu/exec/tile_mma.hpp, which give the general form's
+  // bits (the PTX engine's twin of this route is tested against its general form in tests/unit/test_mma_tiles.cpp). Not the block-scaled forms,
+  // sm_120's narrow-float sum, the sm_86 chunked sum, the other element types, or a NaN in an f64 form.
+  if (simd::enabled() && K > 0 && !(ins.op == Op::QMMA && !ins.mods.empty() && ins.mods[0] == "SF")) {
+    const bool is_sparse = (ins.op == Op::HMMA || ins.op == Op::IMMA) && ins.f[3];
+    const auto frag_of = [](MmaT t, exec::FragType* out) {
+      switch (t) {
+        case MmaT::F16: *out = exec::FragType::F16; return true;
+        case MmaT::BF16: *out = exec::FragType::BF16; return true;
+        case MmaT::TF32: *out = exec::FragType::TF32; return true;
+        case MmaT::E4M3: *out = exec::FragType::E4M3; return true;
+        case MmaT::E5M2: *out = exec::FragType::E5M2; return true;
+        case MmaT::S8: *out = exec::FragType::S8; return true;
+        case MmaT::U8: *out = exec::FragType::U8; return true;
+        case MmaT::S4: *out = exec::FragType::S4; return true;
+        case MmaT::U4: *out = exec::FragType::U4; return true;
+        default: return false;
+      }
+    };
+    const bool f64 = acc == AccF64, b1 = at == MmaT::B1;
+    exec::FragType ta{}, tb{};
+    bool ok = f64 ? at == MmaT::F64 && bt == MmaT::F64 && M == 8 && K == 4 && !is_sparse
+              : b1 ? acc == AccS32 && bt == MmaT::B1 && !is_sparse
+                   : frag_of(at, &ta) && frag_of(bt, &tb) &&
+                         (acc == AccS32 ? exec::frag_is_int(ta) && exec::frag_is_int(tb) && (M == 16 || M == 8)
+                                        : acc != AccF64 && !exec::frag_is_int(ta) && !exec::frag_is_int(tb) && M == 16);
+    if (ok && !f64 && !b1 && acc != AccS32) {
+      const auto sum86 = [](MmaT t) { return t == MmaT::F16 || t == MmaT::BF16 || t == MmaT::TF32; };
+      const auto narrow = [](MmaT t) { return t == MmaT::E4M3 || t == MmaT::E5M2; };
+      if (m_.sm == 86 && vgpu::exec::tc86::exact_enabled() && ins.op == Op::HMMA && !is_sparse && sum86(at) && bt == at && K <= 16 &&
+          K % (at == MmaT::TF32 ? 4 : 8) == 0)
+        ok = false;   // the chunked sum of an RTX 3060
+      if (m_.sm / 10 == 12 && narrow(at) && narrow(bt) && acc == AccF32) ok = false;   // sm_120's narrow-float sum
+    }
+    const unsigned a_n = is_sparse ? a_regs / 2 : a_regs, c_n = acc == AccF16 ? c_elems / 2 : c_elems;
+    const auto in_file = [&](unsigned base, unsigned n) { return base == kRZ || base + n * rw <= w.nregs; };
+    if (ok && a_n <= 8 && b_regs <= 8 && c_n <= 4 && in_file(ra, a_n) && in_file(rb, b_regs) && in_file(rc, c_n) && in_file(rd, c_n)) {
+      static const uint32_t kZeros[32] = {};
+      alignas(32) uint32_t xa[8 * 32], xb[8 * 32], xc[4 * 32], xd[4 * 32], meta[32] = {};
+      const auto load = [&](unsigned base, unsigned n, uint32_t* dst) {
+        for (unsigned i = 0; i < n; ++i) std::memcpy(dst + 32 * i, base == kRZ ? kZeros : &w.reg(base + i, 0), 32 * sizeof(uint32_t));
+      };
+      const auto store = [&](unsigned n) {
+        if (rd != kRZ)
+          each_lane(ex, [&](unsigned l) {
+            for (unsigned i = 0; i < n; ++i) w.reg(rd + i, l) = xd[i * 32 + l];
+          });
+      };
+      if (f64) {
+        // (no host NaN: which payload a fused multiply-add keeps depends on its operand order)
+        alignas(32) double fa[32], fb[32], fc[64], fd[64];
+        alignas(32) uint64_t la[32], lb[32], lc[64], ld[64];
+        const auto wide = [&](unsigned base, unsigned i, unsigned l) -> uint64_t { return reg(base, i, l); };
+        for (unsigned l = 0; l < 32; ++l) {
+          la[l] = wide(ra, 0, l);
+          lb[l] = wide(rb, 0, l);
+          lc[l] = wide(rc, 0, l);
+          lc[32 + l] = wide(rc, 1, l);
+        }
+        exec::mma_f64_a_tile(8, 4, la, fa);
+        exec::mma_f64_b_tile(4, lb, fb);
+        exec::mma_f64_acc_to_tile(8, lc, fc);
+        bool nan = false;
+        for (double x : fa) nan |= x != x;
+        for (double x : fb) nan |= x != x;
+        for (double x : fc) nan |= x != x;
+        if (!nan) {
+          rounded(rnd, [&] {
+            simd::kernels().tile_f64(8, 8, 4, fa, fb, fc, fd);
+            return 0;
+          });
+          exec::mma_f64_tile_to_acc(8, fd, ld);
+          if (rd != kRZ)
+            each_lane(ex, [&](unsigned l) {
+              w.reg(rd, l) = static_cast<uint32_t>(ld[l]);
+              w.reg(rd + 1, l) = static_cast<uint32_t>(ld[l] >> 32);
+              w.reg(rd + 2, l) = static_cast<uint32_t>(ld[32 + l]);
+              w.reg(rd + 3, l) = static_cast<uint32_t>(ld[32 + l] >> 32);
+            });
+          return;
+        }
+      } else {
+        load(ra, a_n, xa);
+        load(rb, b_regs, xb);
+        load(rc, c_n, xc);
+        if (is_sparse) {
+          const Operand& mo = ins.src[3];
+          for (unsigned l = 0; l < 32; ++l) meta[l] = mo.reg == kRZ ? 0 : w.reg(mo.reg, l);
+        }
+        if (b1) {
+          exec::mma_b1(M, K, b1_and, xa, xb, xc, xd);
+          store(c_n);
+          return;
+        }
+        if (acc == AccS32) {
+          alignas(32) int32_t ia[16 * 128], ib[128 * 8], ic[16 * 8], id[16 * 8];
+          exec::mma_frag_a(ta, M, K, is_sparse, xa, meta, ins.f[7], nullptr, ia);
+          exec::mma_frag_b(tb, K, xb, nullptr, ib);
+          if (M == 16) exec::wgmma_acc_to_tile_i32(xc, kN, ic);
+          else exec::mma_acc8_to_tile_i32(xc, ic);
+          // (.SAT clamps after every 128 bits of K, not once at the end.)
+          simd::kernels().tile_i32(M, kN, K, ia, ib, ic, kN, sat ? 128 / bits : K, sat, id, kN);
+          if (M == 16) exec::wgmma_tile_to_acc_i32(id, kN, xd);
+          else exec::mma_tile_to_acc8_i32(id, xd);
+          store(c_n);
+          return;
+        }
+        alignas(32) float fa[16 * 64], fb[64 * 8], fc[16 * 8], fd[16 * 8];
+        exec::mma_frag_a(ta, M, K, is_sparse, xa, meta, ins.f[7], fa, nullptr);
+        exec::mma_frag_b(tb, K, xb, fb, nullptr);
+        exec::wgmma_acc_to_tile(xc, kN, acc == AccF16, fc);
+        simd::kernels().tile_f32(M, kN, K, fa, fb, fc, kN, fd, kN);
+        exec::wgmma_tile_to_acc(fd, kN, acc == AccF16, xd);
+        store(c_n);
+        return;
+      }
     }
   }
   std::vector<double> A(M * K, 0.0), B(K * kN, 0.0);
@@ -5079,8 +5349,12 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
     case Op::EXIT: {
       const Mask go = with_condition(ex);   // EXIT Pn: the lanes where both hold
       each_lane(group, [&](unsigned l) {
-        if ((go >> l) & 1) w.exited |= Mask{1} << l;
-        else w.pc[l] += 16;
+        if ((go >> l) & 1) {
+          if (((w.alive & ~w.exited) >> l) & 1) --blk.live;
+          w.exited |= Mask{1} << l;
+        } else {
+          w.pc[l] += 16;
+        }
       });
       // Lanes that exit no longer hold anything up.
       for (unsigned x = 0; x < 16; ++x) release_bsync(x);
@@ -6448,6 +6722,7 @@ class SassTcHost final : public exec::Tcgen05Host {
     std::memcpy(&v, &sh[off], bytes);
     return v;
   }
+  const std::vector<uint8_t>* smem_direct(uint32_t c) override { return &cs_[c]->shared; }
   [[noreturn]] void fail(Err code, const std::string& why) override { throw Error(code, why); }
 
  private:

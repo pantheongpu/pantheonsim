@@ -7,7 +7,12 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <map>
+#include <type_traits>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 namespace vgpu::sass::tier {
 
@@ -272,7 +277,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "cs2r", "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "iabs", "ldc",
-                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma"};
+                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma", "atom"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -346,10 +351,104 @@ const FormImpl& form_impl(Form f) {
       {Impl::Own, "MATCH: lane-value equality classes of 32- or 64-bit integers, no format"},
       {Impl::Own, "LDSM: 32-bit words of the block's shared memory moved into the fragment registers; faults and the slow cases go to exec_mem"},
       {Impl::Own, "IMMA: integer products summed in 64 bits and cut to 32 (or clamped per 128 bits under .SAT), no number format"},
+      {Impl::Own, "ATOMG, ATOM, ATOMS, RED: the interpreter's exec_mem runs it, so the rules are its own; the tier only skips execute()'s dispatch"},
   };
   static_assert(sizeof table / sizeof table[0] == static_cast<size_t>(Form::Count_), "form_impl: one entry per Form");
   const unsigned i = static_cast<unsigned>(f);
   return table[i < static_cast<unsigned>(Form::Count_) ? i : 0];
+}
+
+bool shfl_shape(unsigned mode, uint32_t b, uint32_t cc, ShflShape& s) {
+  s = ShflShape{};
+  if (b > 31 || ((cc >> 8) & 0x1f) != 0) return false;
+  const uint32_t clamp = cc & 0x1f;   // (with a segment mask of 0, the highest lane a lane may read)
+  s.x = b;
+  switch (mode) {
+    case 0:   // idx: lane b for every lane; in range when it is not past the clamp
+      s.kind = b <= clamp ? ShflShape::Splat : ShflShape::Ident;
+      s.in = b <= clamp ? ~uint32_t{0} : 0;
+      return true;
+    case 1: {   // up: lane l - b, in range when l - b >= clamp
+      const uint32_t t = b + clamp;
+      s.in = t >= 32 ? 0 : ~uint32_t{0} << t;
+      s.kind = s.in ? ShflShape::Up : ShflShape::Ident;
+      return true;
+    }
+    case 2:   // down: lane l + b, in range when l + b <= clamp
+      s.in = clamp < b ? 0 : clamp - b >= 31 ? ~uint32_t{0} : (uint32_t{1} << (clamp - b + 1)) - 1;
+      s.kind = s.in ? ShflShape::Down : ShflShape::Ident;
+      return true;
+    default:   // bfly: lane l ^ b, in range when that is not past the clamp (every lane, for a clamp of 31)
+      if (clamp != 31) return false;
+      s.kind = ShflShape::Butterfly;
+      s.in = ~uint32_t{0};
+      return true;
+  }
+}
+
+// The shuffle `sh` of the 32 words at vp into out, for the whole warp.
+void shfl_move(const ShflShape& sh, const uint32_t* vp, uint32_t* out) {
+  switch (sh.kind) {
+    case ShflShape::None:
+    case ShflShape::Ident:
+    {
+#if defined(__SSE2__)
+      __m128i v[8];   // (all eight read before any is written: a row moved onto itself is fine)
+      for (unsigned i = 0; i < 8; ++i) v[i] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vp) + i);
+      for (unsigned i = 0; i < 8; ++i) _mm_storeu_si128(reinterpret_cast<__m128i*>(out) + i, v[i]);
+#else
+      std::memmove(out, vp, 32 * sizeof(uint32_t));
+#endif
+      return;
+    }
+    case ShflShape::Splat: {
+      const uint32_t v = vp[sh.x];
+      for (unsigned l = 0; l < 32; ++l) out[l] = v;
+      return;
+    }
+    case ShflShape::Butterfly: {
+#if defined(__SSE2__)
+      const unsigned vx = sh.x >> 2;   // (the vector the four lanes come from, then the order within it)
+      const __m128i* in = reinterpret_cast<const __m128i*>(vp);
+      __m128i* o = reinterpret_cast<__m128i*>(out);
+      const auto run = [&](auto imm) {
+        __m128i v[8];
+        for (unsigned i = 0; i < 8; ++i) v[i] = _mm_shuffle_epi32(_mm_loadu_si128(in + (i ^ vx)), decltype(imm)::value);
+        for (unsigned i = 0; i < 8; ++i) _mm_storeu_si128(o + i, v[i]);
+      };
+      switch (sh.x & 3) {
+        case 0: run(std::integral_constant<int, _MM_SHUFFLE(3, 2, 1, 0)>{}); break;
+        case 1: run(std::integral_constant<int, _MM_SHUFFLE(2, 3, 0, 1)>{}); break;
+        case 2: run(std::integral_constant<int, _MM_SHUFFLE(1, 0, 3, 2)>{}); break;
+        default: run(std::integral_constant<int, _MM_SHUFFLE(0, 1, 2, 3)>{}); break;
+      }
+#else
+      for (unsigned l = 0; l < 32; ++l) out[l] = vp[l ^ sh.x];
+#endif
+      return;
+    }
+    case ShflShape::Down:   // lanes 0 .. n-1 read the lane x above, the others their own
+      for (unsigned l = 0; l < 32; ++l) out[l] = ((sh.in >> l) & 1) ? vp[(l + sh.x) & 31] : vp[l];
+      return;
+    default:   // Up
+      for (unsigned l = 0; l < 32; ++l) out[l] = ((sh.in >> l) & 1) ? vp[(l - sh.x) & 31] : vp[l];
+      return;
+  }
+}
+
+
+bool pure_register_form(Form f) {
+  switch (f) {
+    case Form::Mov: case Form::Iadd3: case Form::Iadd3x: case Form::Imad: case Form::Imad32: case Form::ImadWide: case Form::ImadHi:
+    case Form::IsetpEx: case Form::Popc: case Form::I2fp: case Form::Lop3: case Form::Lea: case Form::Shf: case Form::Isetp:
+    case Form::Fsetp: case Form::Fsel: case Form::Ffma: case Form::Fadd: case Form::Fmul: case Form::Dop: case Form::Prmt:
+    case Form::Imnmx: case Form::Fmnmx: case Form::Mufu: case Form::F2i: case Form::I2f: case Form::F2fp: case Form::Dsetp:
+    case Form::Hop2: case Form::Unary: case Form::Iabs: case Form::Umov: case Form::Uldc: case Form::Uiadd3: case Form::Uimad:
+    case Form::Uisetp: case Form::Ulea: case Form::Ulop3: case Form::Ushf: case Form::Uunary: case Form::Usel:
+      return true;
+    default:
+      return false;
+  }
 }
 
 void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
@@ -491,6 +590,14 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       accept(Form::Imma);
       return;
     }
+    case Op::ATOMG: case Op::ATOM: case Op::ATOMS: case Op::RED: {
+      // Run by exec_mem, which has the warp's atomics in one pass (the tier saves execute()'s probe of fast_alu and its dispatch).
+      // ATOMS.ARRIVE.64 (an mbarrier, f[2] == 2) goes to exec_syncs and stays the interpreter's.
+      if (ins.straight || (ins.op == Op::ATOMS && ins.f[2] == 2)) return;
+      m.dst = kNoReg;   // (nothing is written by the handler itself)
+      accept(Form::Atom);
+      return;
+    }
     case Op::MATCH: {   // the lanes' values grouped by equality (exec_warp): ANY gives each lane the mask of the lanes holding its value, ALL whether every lane holds one
       const bool any = ins.f[0], u64 = ins.f[1];
       if (ins.dst.empty() || ins.src.empty() || ins.src[0].kind != Kind::Reg || ins.dst.back().kind != Kind::Reg) return;
@@ -606,6 +713,8 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
         m.s[1].off = static_cast<uint32_t>(prog.pool.size() - 1);   // the table of source lanes
         m.b = in_range;
         m.aux = 1;
+        ShflShape sh;
+        if (shfl_shape(m.a, b, cc, sh)) m.c = static_cast<uint32_t>(sh.kind) | (sh.x << 8);   // (the shape of a full warp's shuffle; in_range is its predicate)
       }
       accept(Form::Shfl);
       return;

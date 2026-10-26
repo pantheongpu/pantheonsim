@@ -10,6 +10,13 @@
 
 #include "vgpu_hip.h"
 
+extern "C" hipError_t hipLaunchHostFunc(hipStream_t stream, void (*fn)(void*), void* data);
+
+namespace {
+int g_ran = 0;
+void count(void*) { ++g_ran; }
+}  // namespace
+
 int main() {
   void* p = nullptr;
   hipStream_t stream = nullptr;
@@ -34,14 +41,17 @@ int main() {
     std::printf("SKIP: this process is allowed to start threads past RLIMIT_NPROC\n");
     return 0;
   }
-  const hipError_t refused = hipMemsetAsync(p, 0, 256, stream);   // (the stream's first item: it would start the thread)
+  // (a host function is the stream's first item that cannot be done on the caller's thread: it starts the thread; a
+  // small fill on a stream with nothing in it is done where it is called, and starts none)
+  const hipError_t refused = hipLaunchHostFunc(stream, count, nullptr);
   setrlimit(RLIMIT_NPROC, &saved);
   if (refused == hipSuccess) {
     std::printf("FAIL the call succeeded without a thread to run it\n");
     return 1;
   }
   // The stream is as it was: the same call now works, and the stream finishes it.
-  if (hipMemsetAsync(p, 0, 256, stream) != hipSuccess || hipStreamSynchronize(stream) != hipSuccess) {
+  if (hipLaunchHostFunc(stream, count, nullptr) != hipSuccess || hipStreamSynchronize(stream) != hipSuccess ||
+      g_ran != 1) {
     std::printf("FAIL the stream is unusable after the refusal\n");
     return 1;
   }

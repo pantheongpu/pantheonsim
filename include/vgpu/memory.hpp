@@ -186,6 +186,19 @@ class MemoryManager {
   bool store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
                    size_t* failed_at = nullptr);
 
+  // load_batch and store_batch for a caller that does both on the same addresses (a warp's atomics: it loads the words, works out
+  // what each lane leaves, stores them): the checks of both -- and the one lookup -- made once. batch_window is true when load_batch
+  // and store_batch would each take these accesses (it is false, having done nothing, where either would decline); batch_load and
+  // batch_store then do what they do, with the window in place of their own checks.
+  struct BatchWindow {
+    const void* alloc = nullptr;
+    uint64_t base = 0;
+  };
+  bool batch_window(const uint64_t* addrs, size_t count, uint32_t size, BatchWindow* window) const;
+  void batch_load(const BatchWindow& window, const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const;
+  void batch_store(const BatchWindow& window, const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
+                   size_t* failed_at = nullptr);
+
   // Fills a range by repeating a 1/2/4-byte pattern, without building a host
   // copy of the range first. Staging a buffer the size of the fill is what
   // made a memset of N bytes cost 2N of host RAM: the staging buffer is live
@@ -214,6 +227,20 @@ class MemoryManager {
         const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out);
   }
 
+  // The load, `compute(old)` and a store of the result where it differs (the executors' atomics on one thread), for a word in a
+  // chunk that is real in the last allocation this thread found: one lookup for the two. Returns false, having done nothing, for
+  // any other word (an untouched or uniform chunk, another allocation, a fault armed, a host mapping in reach, a misaligned
+  // address) and the caller then makes the two calls.
+  bool rmw_if_changed_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out);
+  template <class F>
+  bool rmw_if_changed(uint64_t addr, uint32_t size, F&& compute, uint64_t* old_out) {
+    return rmw_if_changed_fn(
+        addr, size, [](void* c, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(old); },
+        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out);
+  }
+  // Whether `addr` may be in a host mapping (false is a sure no, and the usual answer: nothing is mapped near a device window).
+  bool host_map_possible(uint64_t addr) const { return host_maps_ && host_maps_->may_contain(addr); }
+
   // A lock-free atomic read-modify-write on a 4- or 8-byte naturally aligned word: `compute(old)` is applied with a
   // compare-and-swap loop on the word itself (the value it is called with is the one the swap replaces, so it is
   // called again when another thread got in between, and must be pure). Returns true with `*old_out` the value the
@@ -230,6 +257,26 @@ class MemoryManager {
     return atomic_rmw_fn(
         addr, size, [](void* c, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(old); },
         const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out, always_store);
+  }
+
+  // A wave's read-modify-writes at once: `count` accesses of `size` bytes in order, access i loading the word, `compute(i, old)` and
+  // storing the result where it differs (`lock_free`: as atomic_rmw does, a compare-and-swap on the word, for 4 and 8 bytes; else
+  // the plain load and store of rmw_if_changed), with one lookup for the lot. `olds[i]` is what access i loaded; `*done` is how many
+  // were made (all of them, or those before a store that could not get host memory and threw). Returns false, having done nothing,
+  // wherever any access could differ from the calls these stand for: a fault armed, a host mapping in reach, an address misaligned or
+  // outside the one allocation the first is in, a size that is not 1/2/4/8 (4/8 when lock_free).
+  using RmwLaneFn = uint64_t (*)(void* ctx, size_t i, uint64_t old);
+  // `always_store`: store the result even where it equals what was loaded, as rmw_scalar does (a store makes an untouched chunk
+  // real, which a store of an unchanged value skips).
+  bool rmw_batch_fn(const uint64_t* addrs, size_t count, uint32_t size, RmwLaneFn compute, void* ctx, uint64_t* olds, size_t* done,
+                    bool lock_free, bool always_store);
+  template <class F>
+  bool rmw_batch(const uint64_t* addrs, size_t count, uint32_t size, F&& compute, uint64_t* olds, size_t* done, bool lock_free,
+                 bool always_store = false) {
+    return rmw_batch_fn(
+        addrs, count, size,
+        [](void* c, size_t i, uint64_t old) -> uint64_t { return (*static_cast<std::remove_reference_t<F>*>(c))(i, old); },
+        const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), olds, done, lock_free, always_store);
   }
 
   // The fields of one record (a texel's channels), `n` of them end to end from `addr`, field i `sizes[i]` bytes
@@ -591,6 +638,8 @@ class MemoryManager {
     uint8_t* chunk;     // as read by rmw_locate: null, a uniform tag, or the bytes
   };
   bool rmw_locate(uint64_t addr, uint32_t size, RmwSlot* s) const;
+  // atomic_rmw's swap loop on a located slot.
+  void atomic_rmw_slot(RmwSlot& s, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out, bool always_store);
   uint64_t rmw_load(const RmwSlot& s, uint32_t size) const;
   void rmw_store(RmwSlot& s, uint32_t size, uint64_t value);
   // Whether a fault is armed that load_scalar or store_scalar would apply.
@@ -620,6 +669,12 @@ class MemoryManager {
   const Allocation* find_ordinary_miss(uint64_t addr, uint64_t len, uint64_t* base_out) const;
   bool batch_ok(const uint64_t* addrs, size_t count, uint32_t size, bool store, const Allocation** alloc,
                 uint64_t* base) const;
+  // The part of batch_ok that is about armed faults, for a load or for a store, and the part that is about the addresses.
+  bool batch_faults_clear(bool store) const;
+  bool batch_addresses_ok(const uint64_t* addrs, size_t count, uint32_t size, const Allocation** alloc, uint64_t* base) const;
+  void load_batch_in(const Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const;
+  void store_batch_in(Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
+                      size_t* failed_at);
   const Allocation& resolve_scalar(uint64_t addr, uint64_t len, const char* op, uint64_t* base_out,
                                    bool writing, bool page_slack) const;
   // The mapped-memory half of resolve: a hit returns the handle's allocation,
@@ -727,6 +782,14 @@ class MemoryManager {
     // Only ever widened, so a stale read is conservative, never wrong.
     std::atomic<uint64_t> lo{UINT64_MAX};
     std::atomic<uint64_t> hi{0};
+    // Which version of `maps` this is. A kernel's scalar access to mapped host memory used to take `mu` and scan
+    // `maps` every time (a 1M-element vector add over three mapped buffers ran 1.7x slower than over engine memory
+    // on one thread and 3.9x slower on three; PantheonZE's docs/exec-address-model.md has the table); lookup_host() now
+    // keeps each thread's last few hits and trusts them while this has not moved. Every change to `maps` takes a
+    // value no HostMaps has had before (process-wide counter), so an entry cached for a destroyed manager whose
+    // HostMaps lived at the same address can never be taken for a current one.
+    std::atomic<uint64_t> gen;
+    HostMaps();
     // The range alone is not enough: a PIE program's heap (0x55...) and the
     // mmap area (0x7f...) sit either side of the device windows, so a pinned
     // buffer in each -- PyTorch and CUTLASS's tests both make them -- spans
@@ -736,6 +799,12 @@ class MemoryManager {
     // below the mmap base first; if one is ever mapped there, this is set and
     // device addresses go through the range check again.
     std::atomic<bool> in_device_window{false};
+    // Whether any address from `first` to `last` (inclusive, first <= last) may_contain would not rule out: a range wholly in
+    // the device windows (one interval) is ruled out as one address is.
+    bool may_overlap(uint64_t first, uint64_t last) const {
+      if (is_device_va(first) && is_device_va(last) && !in_device_window.load(std::memory_order_relaxed)) return false;
+      return first < hi.load(std::memory_order_relaxed) && last >= lo.load(std::memory_order_relaxed);
+    }
     bool may_contain(uint64_t addr) const {
       if (is_device_va(addr) && !in_device_window.load(std::memory_order_relaxed)) return false;
       return addr >= lo.load(std::memory_order_relaxed) &&
@@ -748,6 +817,20 @@ class MemoryManager {
   // while a launch runs), so it must never change after construction.
   std::unique_ptr<HostMaps> host_maps_ = std::make_unique<HostMaps>();
   const HostMap* find_host_map_locked(uint64_t addr, uint64_t len) const;
+  // The mapping that holds [addr, addr + len), without taking the lock when this thread has just used it (a
+  // small per-thread cache validated by HostMaps::gen). False where nothing is mapped over the whole range.
+  struct HostHit {
+    uint8_t* host;
+    uint64_t base, len;
+    bool read_only;
+  };
+  bool lookup_host(uint64_t addr, uint64_t len, HostHit* out) const;
+  static uint64_t fresh_generation();
+ public:
+  // The cache is on unless VGPU_HOSTMAP_CACHE=0. This switches it for the whole process (a benchmark compares the
+  // two; nothing else needs to).
+  static void set_host_lookup_cache(bool on);
+ private:
   // Host memory mapped over the whole of [addr, addr + len), perhaps as
   // several mappings placed end to end: the pieces, in order, as (host
   // address, offset into the range, length). False where any byte is not.

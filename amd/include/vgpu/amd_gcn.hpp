@@ -12,6 +12,7 @@
 // answer.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -310,6 +311,17 @@ struct Inst {
   // The pre-decoded tier's form of the instruction (vgpu/amd_gcn_tier.hpp), worked out by finalize; `fast.run` is null
   // for an instruction the interpreter runs.
   tier::Op fast;
+  // The instruction a wave ran after this one the last time (Machine::fetch_next): a hint the machine checks against the wave's program
+  // counter, set and read by any thread running the code (a copy of an instruction starts without one).
+  struct Next {
+    mutable const Inst* p = nullptr;
+    Next() = default;
+    Next(const Next&) {}
+    Next& operator=(const Next&) {
+      p = nullptr;
+      return *this;
+    }
+  } next;
 };
 
 // The short form's name (Inst::short_name worked out), "" for an instruction that runs under its own.
@@ -367,6 +379,17 @@ inline Target target_of_mach(uint32_t mach) {
 // comparison's result, a carry) are register pairs rather than one register.
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target = Target::Gfx942,
             bool wave64 = false);
+
+// How many rows of a wave's vector register file an instruction can write, counted from v0: past the highest vector register any operand
+// names, with room for the widest result an instruction writes (sixteen registers, a 32x32 matrix tile) beyond a base register that is
+// named once. The instructions that index registers at run time (VGPR indexing, v_movrel*, s_set_vgpr_msb) can reach any of them:
+// kVgprsAny, which no file is as big as.
+inline constexpr uint32_t kVgprsAny = 4096;
+uint32_t vgpr_rows_written(const Inst& in);
+// Where this thread's decode() raises the count of rows a decoded instruction can write (to vgpr_rows_written of it, if that is more):
+// the decode cache of the machine that runs here, which tells the next wave to use a register file how much of it to clear. Null:
+// not kept. Returns the one it replaces.
+std::atomic<uint32_t>* set_vgpr_rows_sink(std::atomic<uint32_t>* sink);
 
 // The instruction as the assembler writes it, for tests and for a
 // disassembly listing.

@@ -330,11 +330,14 @@ inline void mfma_tile_f(uint32_t m, uint32_t n, uint32_t k, const double* a, con
 #endif
     mfma_tile_f_sse(m, n, k, a, bk, c, out);
   // A sum that is a NaN was formed with whichever operand order the compiler chose; do it again in the fixed one.
-  for (uint32_t i = 0; i < m; ++i)
-    for (uint32_t j = 0; j < n; ++j) {
-      double& x = out[size_t{i} * n + j];
-      if (x != x) x = mfma_tile_ordered<Order>(a + size_t{i} * k, bk + j, n, k, c[size_t{i} * n + j]);
-    }
+  unsigned any_nan = 0;
+  for (size_t e = 0; e < size_t{m} * n; ++e) any_nan |= out[e] != out[e];
+  if (any_nan)
+    for (uint32_t i = 0; i < m; ++i)
+      for (uint32_t j = 0; j < n; ++j) {
+        double& x = out[size_t{i} * n + j];
+        if (x != x) x = mfma_tile_ordered<Order>(a + size_t{i} * k, bk + j, n, k, c[size_t{i} * n + j]);
+      }
 }
 
 // The fused form (the double-precision instruction): one fma per term, taken in order. The result of a fused multiply-add
@@ -342,6 +345,22 @@ inline void mfma_tile_f(uint32_t m, uint32_t n, uint32_t k, const double* a, con
 #if defined(__x86_64__) && defined(__GNUC__)
 __attribute__((target("fma"))) inline void mfma_tile_fma_hw(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk,
                                                            const double* c, double* out) {
+  if (k == 4) {
+    // The double-precision matrix instructions' K: four terms, the fused multiply-adds one after another on one sum, written out so that
+    // the loop has no trip count to run: its few instructions were three times as slow in some positions of the code as in others.
+    for (uint32_t i = 0; i < m; ++i) {
+      const double* arow = a + size_t{i} * 4;
+      for (uint32_t j = 0; j < n; ++j) {
+        double sum = c[size_t{i} * n + j];
+        sum = __builtin_fma(bk[j], arow[0], sum);
+        sum = __builtin_fma(bk[size_t{n} + j], arow[1], sum);
+        sum = __builtin_fma(bk[size_t{2} * n + j], arow[2], sum);
+        sum = __builtin_fma(bk[size_t{3} * n + j], arow[3], sum);
+        out[size_t{i} * n + j] = sum;
+      }
+    }
+    return;
+  }
   for (uint32_t i = 0; i < m; ++i)
     for (uint32_t j = 0; j < n; ++j) {
       double sum = c[size_t{i} * n + j];
@@ -370,15 +389,19 @@ inline void mfma_tile_fma(uint32_t m, uint32_t n, uint32_t k, const double* a, c
         out[size_t{i} * n + j] = sum;
       }
   }
-  for (uint32_t i = 0; i < m; ++i)
-    for (uint32_t j = 0; j < n; ++j) {
-      double& x = out[size_t{i} * n + j];
-      if (x != x) {
-        double sum = c[size_t{i} * n + j];
-        for (uint32_t t = 0; t < k; ++t) sum = mfma_fma(bk[size_t{t} * n + j], a[size_t{i} * k + t], sum);
-        x = sum;
+  // (One pass for "is any a NaN", with no branch to place, then the fix-up pass only if so.)
+  unsigned any_nan = 0;
+  for (size_t e = 0; e < size_t{m} * n; ++e) any_nan |= out[e] != out[e];
+  if (any_nan)
+    for (uint32_t i = 0; i < m; ++i)
+      for (uint32_t j = 0; j < n; ++j) {
+        double& x = out[size_t{i} * n + j];
+        if (x != x) {
+          double sum = c[size_t{i} * n + j];
+          for (uint32_t t = 0; t < k; ++t) sum = mfma_fma(bk[size_t{t} * n + j], a[size_t{i} * k + t], sum);
+          x = sum;
+        }
       }
-    }
 }
 
 // Integer forms: the dot product of int16 values (the inputs are 8-bit or narrower), exact, so any order will do. `ia` is m rows

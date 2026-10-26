@@ -1,3 +1,4 @@
+#include <cstring>
 #include "vgpu/ptx/regalloc.hpp"
 
 #include <algorithm>
@@ -307,11 +308,47 @@ RegisterUsage analyze_registers(const EntryFn& fn) {
   return out;
 }
 
+static Occupancy compute_occupancy_uncached(uint32_t regs_per_thread, uint32_t threads_per_block,
+                                            uint32_t static_shared_bytes, uint32_t dynamic_shared_bytes,
+                                            uint32_t regs_per_sm, uint32_t max_threads_per_sm,
+                                            uint32_t max_blocks_per_sm, uint32_t shared_per_sm,
+                                            uint32_t warp_size, const OccupancyRules& rules);
+
+// (A launch asks for this each time, with the same numbers as the one before in a loop of launches of one kernel, and the
+// answer takes a handful of 64-bit divisions: the last answer of the thread is kept.)
 Occupancy compute_occupancy(uint32_t regs_per_thread, uint32_t threads_per_block,
                             uint32_t static_shared_bytes, uint32_t dynamic_shared_bytes,
                             uint32_t regs_per_sm, uint32_t max_threads_per_sm,
                             uint32_t max_blocks_per_sm, uint32_t shared_per_sm,
                             uint32_t warp_size, const OccupancyRules& rules) {
+  struct Last {
+    uint32_t in[9] = {};
+    OccupancyRules rules;
+    Occupancy out;
+    bool valid = false;
+  };
+  thread_local Last last;
+  const uint32_t in[9] = {regs_per_thread, threads_per_block, static_shared_bytes, dynamic_shared_bytes,
+                          regs_per_sm, max_threads_per_sm, max_blocks_per_sm, shared_per_sm, warp_size};
+  if (last.valid && std::memcmp(last.in, in, sizeof in) == 0 && last.rules.reg_alloc_unit == rules.reg_alloc_unit &&
+      last.rules.sub_partitions == rules.sub_partitions && last.rules.regs_per_block == rules.regs_per_block &&
+      last.rules.smem_alloc_unit == rules.smem_alloc_unit && last.rules.reserved_smem == rules.reserved_smem)
+    return last.out;
+  const Occupancy o = compute_occupancy_uncached(regs_per_thread, threads_per_block, static_shared_bytes, dynamic_shared_bytes,
+                                                 regs_per_sm, max_threads_per_sm, max_blocks_per_sm, shared_per_sm, warp_size,
+                                                 rules);
+  std::memcpy(last.in, in, sizeof in);
+  last.rules = rules;
+  last.out = o;
+  last.valid = true;
+  return o;
+}
+
+static Occupancy compute_occupancy_uncached(uint32_t regs_per_thread, uint32_t threads_per_block,
+                                            uint32_t static_shared_bytes, uint32_t dynamic_shared_bytes,
+                                            uint32_t regs_per_sm, uint32_t max_threads_per_sm,
+                                            uint32_t max_blocks_per_sm, uint32_t shared_per_sm,
+                                            uint32_t warp_size, const OccupancyRules& rules) {
   Occupancy o;
   if (threads_per_block == 0 || warp_size == 0) return o;
   o.warps_per_block = (threads_per_block + warp_size - 1) / warp_size;

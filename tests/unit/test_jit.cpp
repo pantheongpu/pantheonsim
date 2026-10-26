@@ -546,6 +546,53 @@ VTEST(jit_no_compiler) {
   }
 }
 
+VTEST(jit_the_compilers_identity_is_asked_once_and_remembered_in_the_cache_directory) {
+  if (VJ_SANITIZED) return;
+  TmpDir d;
+  const std::string log = d.str("asked.log");
+  const auto make = [&](const char* id) {
+    return write_script(d.p / "cc", "echo x >> '" + log + "'\nif [ \"$1\" = --version ]; then echo '" + id + "'; exit 0; fi\n" +
+                                       "if [ \"$1\" = -dumpmachine ]; then echo fake-machine; exit 0; fi\nexit 1\n");
+  };
+  const auto asked = [&]() {
+    std::ifstream f(log);
+    size_t n = 0;
+    for (std::string line; std::getline(f, line);) ++n;
+    return n;
+  };
+  jit::Config cfg;
+  cfg.cache_dir = d.str("c");
+  cfg.cxx = make("idcc 1");
+  std::string first;
+  {
+    jit::Engine e(cfg);
+    first = e.compiler_id();
+    VCHECK_CONTAINS(first, "idcc 1");
+    VCHECK_EQ(asked(), size_t{2});   // --version and -dumpmachine
+    VCHECK(e.compiler_id() == first);
+    VCHECK_EQ(asked(), size_t{2});   // (in an engine: once)
+  }
+  {   // another engine (another process, in practice) on the same cache and the same compiler file: no process is started
+    jit::Engine e(cfg);
+    VCHECK(e.compiler_id() == first);
+    VCHECK_EQ(asked(), size_t{2});
+  }
+  {   // the compiler replaced by another file (here: other contents, so another size): asked again, and the answer is the new one
+    cfg.cxx = make("idcc 2, a longer name");
+    jit::Engine e(cfg);
+    const std::string second = e.compiler_id();
+    VCHECK_CONTAINS(second, "idcc 2, a longer name");
+    VCHECK_EQ(asked(), size_t{4});
+  }
+  {   // a damaged note is not believed
+    for (const auto& f : fs::directory_iterator(d.p / "c"))
+      if (f.path().filename().string().rfind("cid-", 0) == 0) std::ofstream(f.path()) << "garbage\n";
+    jit::Engine e(cfg);
+    VCHECK_CONTAINS(e.compiler_id(), "idcc 2, a longer name");
+    VCHECK_EQ(asked(), size_t{6});
+  }
+}
+
 VTEST(jit_a_failing_compile_leaves_nothing_in_the_cache) {
   if (VJ_SANITIZED) return;
   TmpDir d;

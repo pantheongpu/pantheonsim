@@ -146,9 +146,35 @@ struct GpuLayout {
   }
 };
 
+// What an Intel Xe part is made of, where the limits of a launch come from. The engine's "multiprocessor" is
+// an Xe core (the unit that owns a work-group's shared local memory); an Xe core holds EUs, each EU runs
+// hardware threads, and a hardware thread runs one sub-group out of a register file of GRFs. Everything here
+// is read from public sources or named in DeviceProfile::placeholders; a profile's `placeholders:` list says
+// which of its values are stand-ins the engine needs to run and not claims about the part.
+struct XeClass {
+  uint32_t eus_per_xe_core = 0;
+  uint32_t threads_per_eu = 0;       // hardware threads per EU
+  uint32_t grf_per_thread = 0;       // general register file entries a thread has (the default, not the large-GRF mode)
+  uint32_t grf_bytes = 0;            // bytes in one GRF entry
+  std::vector<uint32_t> sub_group_sizes;   // the sub-group widths a kernel may be compiled for; warp_size is one of them
+
+  bool known() const { return eus_per_xe_core && threads_per_eu && grf_per_thread && grf_bytes && !sub_group_sizes.empty(); }
+  // Hardware threads in one Xe core.
+  uint32_t threads_per_xe_core() const { return eus_per_xe_core * threads_per_eu; }
+  // 32-bit register-file words in one Xe core: the engine's registers_per_sm.
+  uint64_t register_words_per_xe_core() const {
+    return uint64_t{threads_per_xe_core()} * grf_per_thread * grf_bytes / 4;
+  }
+  bool has_sub_group_size(uint32_t w) const {
+    for (uint32_t s : sub_group_sizes)
+      if (s == w) return true;
+    return false;
+  }
+};
+
 struct DeviceProfile {
   std::string id;            // registry id, e.g. "nvidia/h100"
-  std::string vendor;        // "nvidia" | "amd"
+  std::string vendor;        // "nvidia" | "amd" | "intel"
   std::string model;         // marketing/device name as APIs report it
   std::string architecture;  // "ampere" | "hopper" | "blackwell" | "cdna3" | ...
   // AMD's equivalent of a compute capability: the gfx target a binary must be
@@ -167,7 +193,17 @@ struct DeviceProfile {
   TelemetryClass telemetry;
   CudaClass cuda;
   GpuLayout layout;
+  XeClass xe;                // Intel only; empty elsewhere
+  // Keys (as "limits.max_threads_per_block" or "xe.sub_group_sizes") whose values are stand-ins the engine
+  // needs in order to run, not figures from a source. Empty on a profile every value of which is sourced.
+  std::vector<std::string> placeholders;
   std::map<std::string, bool> features;
+
+  bool is_placeholder(const std::string& key) const {
+    for (const auto& k : placeholders)
+      if (k == key) return true;
+    return false;
+  }
 
   // Shared memory the driver keeps back in every block, on top of what the
   // kernel asks for: 1 KiB from compute capability 8.0 (an RTX 3060 reports

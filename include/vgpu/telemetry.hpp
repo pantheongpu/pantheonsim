@@ -164,13 +164,15 @@ class Publisher {
     bool primed = false;
   };
 
+  // refresh() with writers_ held (the note_* calls update and refresh under one lock).
+  void refresh_locked(uint32_t ordinal, int64_t now_ns);
   void begin_update();
   // Stamps the segment with `now_ns` (or the clock, if -1) and returns the stamp.
   int64_t end_update(int64_t now_ns = -1);
   // One writer at a time: kernels and copies on different streams finish on
   // different threads, and each updates the segment's counters and the seqlock
-  // around them. Recursive, since the writers refresh as they go.
-  std::recursive_mutex writers_;
+  // around them. Not recursive: the writers refresh as they go, through refresh_locked.
+  std::mutex writers_;
   Shared* shared_ = nullptr;
   int fd_ = -1;
   size_t size_ = 0;

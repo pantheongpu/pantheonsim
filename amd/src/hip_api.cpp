@@ -685,10 +685,14 @@ hipError_t order_for(State& s, hipStream_t stream, Order* o) {
   return hipSuccess;
 }
 
+// The most bytes of copy or fill that in_order does on the calling thread when the stream has nothing in it.
+constexpr uint64_t kInlineMemoryBytes = 256 * 1024;
+
 // Runs `work` in `stream`'s order: queued, and returned from at once -- or,
 // for a synchronous call (wait) and under VGPU_SYNC_LAUNCHES, waited for, and
 // its own result returned. Called without s.mutex held.
-hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std::vector<Queue::Marker> also = {}) {
+hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std::vector<Queue::Marker> also = {},
+                    uint64_t memory_bytes = ~uint64_t{0}) {
   State& s = state();
   Order o;
   {
@@ -702,6 +706,16 @@ hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std
     return fail(hipErrorOutOfMemory, std::string("the host would not start a thread for the stream: ") + e.what());
   };
   if (!wait && !synchronous_launches()) {
+    // A copy or a fill of device or pinned memory that is small, queued on a stream with nothing in it, is done now:
+    // it needs nothing from the program that a later point of the program could give it, it cannot block, and the
+    // stream's thread would be woken (and started) to do in a few microseconds what the hand-off costs more than.
+    // Its failure is the stream's, kept for the next synchronization, as a queued one's is. A kernel, a host
+    // function or a large copy is queued, as before. (A profiler's records carry the id of the thread that did the
+    // work, so with one attached the stream's thread keeps it.)
+    if (memory_bytes <= kInlineMemoryBytes && !profiler()) {
+      hipError_t failed = hipSuccess;
+      if (o.queue->run_inline(work, o.after, &failed)) return hipSuccess;
+    }
     try {
       o.queue->submit(std::move(work), std::move(o.after));
     } catch (const std::system_error& e) {
@@ -709,9 +723,11 @@ hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std
     }
     return hipSuccess;
   }
-  auto result = std::make_shared<hipError_t>(hipSuccess);
-  Queue::Work told = [result, work = std::move(work)] {
-    *result = work();
+  // (the caller waits for the item below, so the work and the result can stay in this frame; two references are
+  // too small for the function to allocate for)
+  hipError_t value = hipSuccess;
+  Queue::Work told = [&value, &work] {
+    value = work();
     return hipSuccess;   // told to the caller, not kept for a later synchronization
   };
   // A call that waits for its own work, on a stream with nothing in it, runs the work here: the stream's thread
@@ -731,9 +747,9 @@ hipError_t in_order(hipStream_t stream, Queue::Work work, bool wait = false, std
   // work left (HIP's "may also return error codes from previous,
   // asynchronous launches"): a copy back after a kernel that failed says so,
   // rather than handing over whatever the buffer held.
-  if (*result == hipSuccess)
+  if (value == hipSuccess)
     if (const hipError_t e = o.queue->take_error(); e != hipSuccess) return e;
-  return *result;
+  return value;
 }
 
 // Every queue of a device -- its null stream's and each of its streams' --
@@ -776,6 +792,14 @@ PerThreadStreams::~PerThreadStreams() {
 // At a synchronization, the stream-ordered pools give back what they keep
 // beyond their release thresholds (see Pool).
 void release_to_thresholds(State& s);
+// Set when the first pool is made (under s.mutex): until then a synchronization has nothing to give back and does not
+// take the lock to find that out.
+std::atomic<bool> g_pools_made{false};
+void release_pools_at_sync(State& s) {
+  if (!g_pools_made.load(std::memory_order_acquire)) return;
+  std::lock_guard<std::mutex> lock(s.mutex);
+  release_to_thresholds(s);
+}
 
 hipError_t drain_device(int device, bool blocking_only = false) {
   State& s = state();
@@ -1627,7 +1651,7 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
     for (const std::shared_ptr<Queue>& q : queues_of(s, from.ordinal, true)) after_source.push_back({q, q->tail()});
   }
   if (!run_here) note_queue_use(stream);
-  return run_here ? work() : in_order(stream, work, wait, std::move(after_source));
+  return run_here ? work() : in_order(stream, work, wait, std::move(after_source), dr.bytes());
 }
 
 // A copy of `bytes`, or of `rows` rows of them `dpitch` and `spitch` apart.
@@ -1707,7 +1731,7 @@ hipError_t fill_region(void* dst, const Region& r, const uint8_t* pattern, uint3
   // A graph's launch runs its fill right here, on its stream's thread.
   if (sink) return work();
   note_queue_use(stream);
-  return in_order(stream, work, !async && !side.device);
+  return in_order(stream, work, !async && !side.device, {}, r.bytes());
 }
 // `bytes` bytes of a pattern.
 hipError_t fill_in_order(void* dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t bytes, hipStream_t stream,
@@ -1775,8 +1799,7 @@ hipError_t hipDeviceSynchronize(void) {
   // any of it had: where an asynchronous error comes out. The pools then
   // keep no more than their release thresholds.
   const hipError_t e = drain_device(ordinal);
-  std::lock_guard<std::mutex> lock(s.mutex);
-  release_to_thresholds(s);
+  release_pools_at_sync(s);
   return record(s, e);
 }
 
@@ -1871,15 +1894,16 @@ hipError_t hipFree(void* ptr) {
   const ApiCall api("hipFree", ptr);
   State& s = state();
   if (!ptr) return record(s, hipSuccess);
-  int ordinal = 0;
+  std::vector<std::shared_ptr<Queue>> qs;
   {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (const hipError_t e = ensure_runtime(s); e != hipSuccess) return record(s, e);
-    ordinal = s.current;
+    int ordinal = s.current;
     for (int i = 0; i < s.rt->device_count(); ++i)
       if (s.rt->device(i).memory().owns(reinterpret_cast<uint64_t>(ptr))) ordinal = i;
+    qs = queues_of(s, ordinal);   // (what drain_device(ordinal) waits for, without taking the lock a second time)
   }
-  drain_device(ordinal);
+  drain(qs);
   return record(s, free_now(ptr));
 }
 
@@ -2413,8 +2437,7 @@ hipError_t hipStreamSynchronize(hipStream_t stream) {
     }
   }
   const hipError_t e = drain(qs);
-  std::lock_guard<std::mutex> lock(s.mutex);
-  release_to_thresholds(s);
+  release_pools_at_sync(s);
   return record(s, e);
 }
 
@@ -2583,14 +2606,23 @@ hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream) {
   // An interprocess event's record counts for every process that has it.
   std::shared_ptr<IpcEventState> ipc = e->ipc;
   const uint64_t made = ipc ? ipc->counters[0].fetch_add(1) + 1 : 0;
-  e->seq = o.queue->submit(
-      [stamp, ipc, made] {
-        stamp->when = std::chrono::steady_clock::now();
-        stamp->taken.store(true, std::memory_order_release);
-        if (ipc) ipc->done(made);
-        return hipSuccess;
-      },
-      std::move(o.after));
+  const auto take = [](Stamp& st, IpcEventState* shared, uint64_t n) {
+    st.when = std::chrono::steady_clock::now();
+    st.taken.store(true, std::memory_order_release);
+    if (shared) shared->done(n);
+    return hipSuccess;
+  };
+  // On a stream with nothing in it the record is taken here: the stream's thread would be woken (and started, with
+  // the stream's first item) to read the clock, and the event is complete when the call returns, as a card's is on
+  // an idle stream. (A profiler attached keeps the stream's thread, as for a waited-for call: see in_order.)
+  hipError_t unused = hipSuccess;
+  uint64_t seq = 0;
+  auto now = [&] { return take(*stamp, ipc.get(), made); };
+  if (!profiler() && o.queue->run_inline(now, o.after, &unused, &seq)) {
+    e->seq = seq;
+  } else {
+    e->seq = o.queue->submit([stamp, ipc, made, take] { return take(*stamp, ipc.get(), made); }, std::move(o.after));
+  }
   return record(s, hipSuccess);
 }
 
@@ -2637,9 +2669,7 @@ hipError_t hipEventSynchronize(hipEvent_t event) {
   bool exists = false;
   if (event_marker(event, &m, nullptr, &exists)) m.queue->wait(m.seq);
   if (!exists) return record(state(), hipErrorInvalidHandle);
-  State& s = state();
-  std::lock_guard<std::mutex> lock(s.mutex);
-  release_to_thresholds(s);
+  release_pools_at_sync(state());
   return hipSuccess;
 }
 
@@ -4053,6 +4083,7 @@ Pool* default_pool(State& s, int ordinal) {
   Pool*& p = s.default_pools[ordinal];
   if (!p) {
     s.pools.push_back(Pool{});
+    g_pools_made.store(true, std::memory_order_release);
     p = &s.pools.back();
     p->device = ordinal;
   }
@@ -4245,6 +4276,7 @@ hipError_t hipMemPoolCreate(void** pool, const vgpu::amd::abi::MemPoolProps* pro
       props->location.id >= s.rt->device_count())
     return record(s, hipErrorInvalidValue);
   s.pools.push_back(Pool{});
+  g_pools_made.store(true, std::memory_order_release);
   s.pools.back().device = props->location.id;
   s.pools.back().max_size = props->maxSize;
   s.pools.back().handle_types = props->handleTypes;
@@ -5927,6 +5959,7 @@ hipError_t hipMemPoolImportFromShareableHandle(void** pool, void* handle, int ty
   const int mine = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
   if (mine < 0) return record(s, fail(hipErrorOutOfMemory, std::string("dup: ") + std::strerror(errno)));
   s.pools.push_back(Pool{});
+  g_pools_made.store(true, std::memory_order_release);
   Pool& p = s.pools.back();
   p.device = share.device >= 0 && share.device < s.rt->device_count() ? share.device : s.current;
   p.handle_types = 1;

@@ -184,6 +184,116 @@ VTEST(vector_kernels_equal_the_frozen_form) {
 }
 
 #ifdef VGPU_TC86_AVX2
+// The float-product kernel (mma_avx2_chunked_f) is taken only when every product of the call is an exact f32 between 2^-126 and 2^127, which
+// the operands' exponent fields say up front: the nonzero ones add to at least 128 (smallest + smallest) and at most 379 (largest + largest), and
+// no operand is a float subnormal with a significand. At the edges of that rule, and past them, it must say yes or no as the rule does, and the
+// result must be the frozen form's whichever kernel ran -- with accumulators from nothing to the largest, and the lanes whose scaling power of two
+// is not a float (a subnormal accumulator beside nothing) finished by the scalar rule.
+VTEST(float_product_kernel_edges_equal_the_frozen_form) {
+  if (!__builtin_cpu_supports("avx2")) {
+    std::printf("  [ SKIP ] this CPU has no AVX2\n");
+    return;
+  }
+  Gen g(0xed9e5);
+  long taken = 0, declined = 0, elements = 0;
+  struct Edge {
+    int ea_lo, ea_hi, eb_lo, eb_hi;   // exponent fields of A's and B's elements (drawn from [lo, hi])
+    bool want;                        // whether the kernel takes it
+  };
+  const Edge edges[] = {
+      {64, 64, 64, 64, true},      {64, 64, 63, 63, false},   {64, 64, 63, 64, false},  {1, 1, 127, 127, true},     {1, 1, 126, 126, false},
+      {190, 190, 189, 189, true},  {190, 190, 190, 190, false}, {127, 127, 127, 127, true}, {100, 140, 110, 150, true}, {120, 130, 1, 254, false},
+      {1, 254, 1, 254, false},     {127, 127, 252, 252, true},  {127, 127, 253, 253, false}, {250, 250, 129, 129, true}, {254, 254, 125, 125, true},
+  };
+  for (const Edge& edge : edges)
+    for (int fmt = 1; fmt <= 2; ++fmt)
+      for (int accmode = 0; accmode < 7; ++accmode) {
+        const unsigned M = 16, N = 8, K = 16, chunk = fmt == 2 ? 4 : 8;
+        std::vector<float> A(M * K), B(K * N), C(M * N), D0(M * N), D1(M * N), D2(M * N);
+        const auto draw = [&](int lo, int hi) {
+          const uint32_t h = g.u();
+          const uint32_t e = static_cast<uint32_t>(lo + static_cast<int>((h >> 8) % static_cast<uint32_t>(hi - lo + 1)));
+          const uint32_t m = fmt == 1 ? ((h >> 20) & 0x7fu) << 16 : ((h >> 20) & 0x3ffu) << 13;
+          return f((h & 0x80000000u) | (e << 23) | m);
+        };
+        for (float& x : A) x = (g.u() % 11 == 0) ? 0.0f : draw(edge.ea_lo, edge.ea_hi);
+        for (float& x : B) x = (g.u() % 11 == 0) ? -0.0f : draw(edge.eb_lo, edge.eb_hi);
+        // (one operand at each end of the range, so that the extremes are present and not merely possible)
+        A[0] = draw(edge.ea_lo, edge.ea_lo);
+        A[K + 1] = draw(edge.ea_hi, edge.ea_hi);
+        B[0] = draw(edge.eb_lo, edge.eb_lo);
+        B[N + 1] = draw(edge.eb_hi, edge.eb_hi);
+        for (float& x : C) {
+          const uint32_t h = g.u();
+          switch (accmode) {
+            case 0: x = 0.0f; break;
+            case 1: x = f(h & 0x807fffffu); break;                                                  // a subnormal
+            case 2: x = f((h & 0x80000000u) | ((1u + (h >> 8) % 20) << 23) | (h & 0x7fffffu)); break;   // tiny normals
+            case 3: x = f((h & 0x80000000u) | ((235u + (h >> 8) % 20) << 23) | (h & 0x7fffffu)); break;  // huge
+            case 4: x = f((h & 0x80000000u) | ((100u + (h >> 8) % 60) << 23) | (h & 0x7fffffu)); break;  // about the products
+            case 5: x = (h & 1) ? -0.0f : 0.0f; break;
+            default: x = f((h & 0x80000000u) | ((1u + (h >> 8) % 254) << 23) | (h & 0x7fffffu));
+          }
+        }
+        const int emin = now::kEminWide;
+        old::mma(M, N, K, chunk, emin, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
+        now::mma(M, N, K, chunk, emin, false, A.data(), K, B.data(), N, C.data(), N, D1.data(), N);
+        const bool took = fmt == 1 ? now::mma_avx2_chunked_f<8, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N)
+                                   : now::mma_avx2_chunked_f<4, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N);
+        took ? ++taken : ++declined;
+        if (took != edge.want)
+          throw vtest::Failure("exponents A " + std::to_string(edge.ea_lo) + ".." + std::to_string(edge.ea_hi) + ", B " + std::to_string(edge.eb_lo) + ".." +
+                               std::to_string(edge.eb_hi) + " fmt " + std::to_string(fmt) + ": the float kernel " + (took ? "took" : "declined") + " the call");
+        for (size_t e = 0; e < D0.size(); ++e) {
+          ++elements;
+          if (bits(D0[e]) != bits(D1[e]) || (took && bits(D0[e]) != bits(D2[e])))
+            throw vtest::Failure("exponents A " + std::to_string(edge.ea_lo) + ".." + std::to_string(edge.ea_hi) + ", B " + std::to_string(edge.eb_lo) + ".." +
+                                 std::to_string(edge.eb_hi) + " fmt " + std::to_string(fmt) + " acc " + std::to_string(accmode) + " element " + std::to_string(e));
+        }
+      }
+  // A bf16 float subnormal with a significand, anywhere, sends the call to the integer kernel.
+  for (int fmt = 1; fmt <= 2; ++fmt)
+    for (int where = 0; where < 4; ++where) {
+      const unsigned M = 16, N = 8, K = 16, chunk = fmt == 2 ? 4 : 8;
+      std::vector<float> A(M * K), B(K * N), C(M * N, 1.0f), D0(M * N), D1(M * N), D2(M * N);
+      for (float& x : A) x = f((127u << 23) | ((g.u() & 0x7fu) << 16));
+      for (float& x : B) x = f((127u << 23) | ((g.u() & 0x7fu) << 16));
+      (where < 2 ? A : B)[where % 2 ? 100 : 3] = f(0x00200000u);   // a subnormal with a bit in the kept ten
+      const int emin = now::kEminWide;
+      old::mma(M, N, K, chunk, emin, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
+      now::mma(M, N, K, chunk, emin, false, A.data(), K, B.data(), N, C.data(), N, D1.data(), N);
+      const bool took = fmt == 1 ? now::mma_avx2_chunked_f<8, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N)
+                                 : now::mma_avx2_chunked_f<4, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N);
+      if (took) throw vtest::Failure("the float kernel took a call with a float subnormal operand");
+      for (size_t e = 0; e < D0.size(); ++e)
+        if (bits(D0[e]) != bits(D1[e])) throw vtest::Failure("a float subnormal operand: result differs from the frozen form");
+    }
+  // tf32 words with their low 13 bits set (the tensor core ignores them), in the shapes whose K is not a multiple of eight: the tail of the
+  // decode, and an infinity or a NaN among moderate operands (which sends the call to the integer kernel).
+  for (unsigned K : {4u, 12u})
+    for (int special = 0; special < 3; ++special)
+      for (int rep = 0; rep < 6; ++rep) {
+        const unsigned M = 16, N = 8;
+        std::vector<float> A(M * K), B(K * N), C(M * N), D0(M * N), D1(M * N), D2(M * N);
+        for (float& x : A) x = f((g.u() & 0x80000000u) | ((120u + g.u() % 10) << 23) | (g.u() & 0x7fffffu));
+        for (float& x : B) x = f((g.u() & 0x80000000u) | ((120u + g.u() % 10) << 23) | (g.u() & 0x7fffffu));
+        for (float& x : C) x = f((g.u() & 0x80000000u) | ((100u + g.u() % 40) << 23) | (g.u() & 0x7fffffu));
+        if (special == 1) A[g.u() % A.size()] = f(0x7f800000u);
+        if (special == 2) B[g.u() % B.size()] = f(0x7fc00000u);
+        old::mma(M, N, K, 4, now::kEminWide, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
+        now::mma(M, N, K, 4, now::kEminWide, false, A.data(), K, B.data(), N, C.data(), N, D1.data(), N);
+        const bool took = now::mma_avx2_chunked_f<4, false>(M, N, K, now::kEminWide, A.data(), K, B.data(), N, C.data(), N, D2.data(), N);
+        if (took == (special != 0)) throw vtest::Failure("tf32 tail shape: the float kernel " + std::string(took ? "took" : "declined") + " a call with" + (special ? "" : "out") + " an infinity or a NaN");
+        for (size_t e = 0; e < D0.size(); ++e)
+          if (bits(D0[e]) != bits(D1[e]) || (took && bits(D0[e]) != bits(D2[e]))) throw vtest::Failure("tf32 tail shape K " + std::to_string(K) + ": result differs from the frozen form");
+      }
+  std::printf("  %ld calls taken by the float kernel, %ld declined, %ld elements compared bit for bit\n", taken, declined, elements);
+  VCHECK(taken > 40);
+  VCHECK(declined > 40);
+}
+#endif
+
+#ifdef VGPU_TC86_AVX2
 // The vector conversion of a sum to f32 against the scalar one (detail::to_f32_rz), on sums just below and above every power of two (the
 // all-ones significands that a nearest-even conversion of the magnitude would round up), and random ones, for all frames g.
 __attribute__((target("avx2"))) static void check_sums(long& checked, long& bad) {
