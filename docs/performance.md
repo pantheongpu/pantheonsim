@@ -4729,3 +4729,38 @@ of the six new tests, `VGPU_SIMD=base` runs.
 * Fragment decode is still a switch per element (IMMA 670 ns, sparse HMMA 10 us a warp: `mma_sparse_column` copies the metadata into a `Lanes` per element); next step.
 * tcgen05: f16 D, layout F, parts of N (layout B), sparse and block-scaled forms keep the row loop; PTX `wmma` generic shapes, `m8n8k4` f16 untouched; no AVX-512 kernel.
 * `vpmaddwd` for the integer products and a float accumulator decode were not tried (Zen 4 has one-uop `vpmulld`).
+
+## Round sp3: texture sampling, local-memory sector counts, PTX f64 (branch `sp3-texlocal`, base 03d92bd0)
+
+### What changed
+* **Texture fetch** (`src/exec/interpreter.cpp`, `src/sass/exec_ops.inc`): the sampler's cost was mostly zeroing. A 280-byte `TextureDesc local` (and, after a first fix, the storage
+  of a `std::optional<TextureDesc>`, which GCC also zeroes) was `rep stos` in front of every fetch; the 8 `TexTerm`s and the sRGB code table of `tex_finish` were zeroed too; and each
+  lane built a fresh 80-byte `TexFetch` (another `rep stos`, whose start-up is tens of cycles on Zen 4). The descriptor is now copy-constructed into raw storage when a fetch changes it,
+  `TexTerm` has no member initializers (every footprint function sets all members), and both engines build one `TexFetch` per instruction and set only what varies per lane. Two
+  fast-path forms: a linear fetch at a texel's centre (all three 8-bit fractions 0) skips the weight split, and a one-texel float fetch with 32-bit channels (`tex_finish_one_f32`)
+  returns the texel as the blend would (finite as is, subnormal as zero of its sign, NaN as 0x7FFFFFFF, infinity as is). Both are skipped under `VGPU_FASTPATH=0`, which is the oracle.
+* **Local-memory sectors**: `memcount::detail::sectors_fast` tries an AVX2 window kernel (`simd::sector_window_kernel`, `src/simd/simd.cpp`) first for warps whose lanes lie within 63 sectors:
+  four lanes a step, each lane's first and last sector as bits of one word, popcount. Hosts and levels without AVX2 (`VGPU_SIMD=base`) keep the scalar forms; the count is the same.
+* **PTX f64**: `fma.f64`, its contracted subtracts, and `add/sub/mul/div.f64` run four lanes a step (kernels in `src/simd/simd.cpp`, level-gated like the other SIMD kernels). A full warp's eight
+  fma results are checked for a NaN together and stored after every operand is read; a group with a NaN result runs lane by lane under the old NaN rule. SASS f64 was already AVX2
+  (`dop_avx2_t`); its remaining cost is the unpack/shuffle of lo/hi planes and the per-step NaN branch, in `src/simd/kernels.inc`, which the JIT embeds: not touched.
+
+### Results (B/A of medians, 11 alternating runs, base /tmp/sp2-lead/build, counters identical; noise from A/A 1 to 3%)
+| row | sass | ptx |
+|---|---|---|
+| texture | 1.59x | 1.56x |
+| local | 1.20x | 1.03x (cycles 1.034, instructions -8.5%) |
+| f64_fma | 0.99x (unchanged) | 1.46x (cycles) |
+| f64_subnormal | 1.01x | 1.40x (cycles) |
+
+### Tests (wired in CMake) and mutations
+`linear_texture_fetches_at_texel_centres_match_the_general_path` and `f64_arithmetic_random_bits_match_the_general_path` (random bit patterns, all lanes, both guards and a diverged warp) in `test_fastpath`;
+`closed_forms_private_arrays_with_and_without_the_simd_window` in `test_memcount_forms` (also run as `test_memcount_forms_simd_base`). Mutants killed: window kernel without the second sector, one-texel flush removed,
+centre weight 255, contracted-subtract negation swapped, sub computed as add, NaN fallback disabled, NaN check of the full-warp path disabled, `TexFetch::layer` not set per lane (`test_exec3` layered fetches).
+
+### Not done, and negative results
+* The SASS `exec_tex` hoist of `TexFetch` has no unit test here (no SASS texture cubin without nvcc); the bench `texture` self-check and the CI e2e texture tests cover it.
+* Sampler left: `MemoryManager::load_fields` 17% and `tex_footprint_linear` 17% of `texture`; the former is the allocation lookup chain (TLS, cache entry, chunk table), shared with every load.
+* `local`: `h_local` and the PTX `exec_ld`/`exec_st` are 32 separate-line loads and stores per access (per-lane layout), no closed form for the data.
+* A vector kernel for AVX-512 was not written (Zen 4 runs it as two halves); the f64 and window kernels are AVX2.
+* Placement: PTX `mma_ptx` (the `tc86::mma_avx2_chunked_f` loop) read 0.94x with equal instructions on this tree; it moves with any change before it in the library, recheck after merging.
