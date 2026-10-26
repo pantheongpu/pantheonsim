@@ -10,6 +10,9 @@
 #include "vgpu/simd/fp16.hpp"
 #include "vgpu/simd/simd.hpp"
 
+// The operand code of the less common tensor forms is kept out of the hot text (the interpreters' own loops are placement-sensitive: round 2).
+#define VGPU_COLD __attribute__((noinline, section(".text.unlikely")))
+
 namespace vgpu::exec {
 
 typedef uint32_t V4u __attribute__((vector_size(16)));
@@ -272,7 +275,7 @@ template <FragType T> inline typename FragOf<T>::Out decode_one(const float* fp8
 }
 
 // n packed elements -> n values, in order.
-template <FragType T> void decode_bulk(const typename FragOf<T>::Raw* raw, typename FragOf<T>::Out* out, size_t n) {
+template <FragType T> VGPU_COLD void decode_bulk(const typename FragOf<T>::Raw* raw, typename FragOf<T>::Out* out, size_t n) {
   using F = FragOf<T>;
   if constexpr (T == FragType::F16) {
     simd::kernels().f16_to_f32(raw, out, n);
@@ -296,7 +299,7 @@ template <FragType T> void decode_bulk(const typename FragOf<T>::Raw* raw, typen
 // Bytes of raw tile the dense forms need at most (s4 m16n8k64: 1024 elements; f16 m16n8k16: 256 of 2 bytes; tf32 and fp8 less).
 constexpr size_t kRawBytes = 4096;
 
-template <FragType T> void frag_a_dense(unsigned M, unsigned K, const uint32_t* regs, typename FragOf<T>::Out* out) {
+template <FragType T> VGPU_COLD void frag_a_dense(unsigned M, unsigned K, const uint32_t* regs, typename FragOf<T>::Out* out) {
   using F = FragOf<T>;
   const unsigned kbytes = K * F::bits / 8, nregs = M * K / (32 * F::p);
   alignas(32) typename F::Raw raw[kRawBytes / sizeof(typename F::Raw)];
@@ -307,7 +310,7 @@ template <FragType T> void frag_a_dense(unsigned M, unsigned K, const uint32_t* 
   decode_bulk<T>(raw, out, size_t{M} * K);
 }
 
-template <FragType T> void frag_b_dense(unsigned K, const uint32_t* regs, typename FragOf<T>::Out* out) {
+template <FragType T> VGPU_COLD void frag_b_dense(unsigned K, const uint32_t* regs, typename FragOf<T>::Out* out) {
   using F = FragOf<T>;
   const unsigned nregs = K * 8 / (32 * F::p);
   alignas(32) typename F::Raw raw[kRawBytes / sizeof(typename F::Raw)];
@@ -322,7 +325,7 @@ template <FragType T> void frag_b_dense(unsigned K, const uint32_t* regs, typena
     for (unsigned k = 0; k < K; ++k) out[size_t{k} * 8 + g] = col[size_t{g} * K + k];
 }
 
-template <FragType T> void frag_a_sparse(unsigned M, unsigned K, const uint32_t* regs, const uint32_t* meta, unsigned sel, typename FragOf<T>::Out* out) {
+template <FragType T> VGPU_COLD void frag_a_sparse(unsigned M, unsigned K, const uint32_t* regs, const uint32_t* meta, unsigned sel, typename FragOf<T>::Out* out) {
   using F = FragOf<T>;
   constexpr unsigned bits = F::bits, p = F::p;
   constexpr bool tf32 = T == FragType::TF32, int4 = bits == 4, narrow = bits <= 8;
@@ -354,7 +357,7 @@ template <FragType T> void frag_a_sparse(unsigned M, unsigned K, const uint32_t*
     }
 }
 
-template <FragType T> void frag_a_t(unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* iout) {
+template <FragType T> VGPU_COLD void frag_a_t(unsigned M, unsigned K, bool sparse, const uint32_t* regs, const uint32_t* meta, unsigned sel, float* f, int32_t* iout) {
   using F = FragOf<T>;
   typename F::Out* const out = [&] {
     if constexpr (F::is_int) return iout;
@@ -364,7 +367,7 @@ template <FragType T> void frag_a_t(unsigned M, unsigned K, bool sparse, const u
   else frag_a_dense<T>(M, K, regs, out);
 }
 
-template <FragType T> void frag_b_t(unsigned K, const uint32_t* regs, float* f, int32_t* iout) {
+template <FragType T> VGPU_COLD void frag_b_t(unsigned K, const uint32_t* regs, float* f, int32_t* iout) {
   using F = FragOf<T>;
   if constexpr (F::is_int) frag_b_dense<T>(K, regs, iout);
   else frag_b_dense<T>(K, regs, f);
