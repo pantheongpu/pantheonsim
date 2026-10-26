@@ -4109,17 +4109,19 @@ struct Machine {
     } rowat[16];
     for (uint32_t row = 0; row < 16; ++row) place(row, 0, &rowat[row].lane0, &rowat[row].reg, &rowat[row].half);
     double cd[256];
+    int32_t ci[256];   // (the integer forms' C, as it is)
     for (uint32_t row = 0; row < 16; ++row) {
       double* const d = cd + row * 16;
       if (co.kind != OperandKind::Vgpr) {
         const double c = co.kind == OperandKind::InlineFloat ? co.fvalue : static_cast<double>(static_cast<int32_t>(scalar(w, co)));
-        for (uint32_t col = 0; col < 16; ++col) d[col] = c;
+        if (is_int) std::fill(ci + row * 16, ci + row * 16 + 16, static_cast<int32_t>(static_cast<int64_t>(c)));
+        else std::fill(d, d + 16, c);
         continue;
       }
       const uint32_t* const v = w.vgpr.r[co.index + rowat[row].reg].data() + rowat[row].lane0;
       const uint32_t half = rowat[row].half;
       if (out_f32) run_f32_to_f64(d, v, 16);
-      else if (is_int) for (uint32_t col = 0; col < 16; ++col) d[col] = static_cast<double>(static_cast<int32_t>(v[col]));
+      else if (is_int) std::memcpy(ci + row * 16, v, 64);
       else if (out_bf16) for (uint32_t col = 0; col < 16; ++col) d[col] = static_cast<double>(as_float((half ? v[col] >> 16 : v[col] & 0xFFFF) << 16));
       else for (uint32_t col = 0; col < 16; ++col) d[col] = half_bits_to_double(static_cast<uint16_t>(half ? v[col] >> 16 : v[col]));
     }
@@ -4161,9 +4163,12 @@ struct Machine {
       for (uint32_t row = 0; row < 16; ++row) {
         if (rowat[row].reg >= regs) continue;
         uint32_t* const o = w.vgpr.r[dst.index + rowat[row].reg].data() + rowat[row].lane0;
+        if (!in.clamp) {   // (the sum wraps)
+          run_add_words(o, ci + row * 16, dots + row * 16, 16);
+          continue;
+        }
         for (uint32_t col = 0; col < 16; ++col) {
-          int64_t isum = static_cast<int64_t>(static_cast<uint64_t>(static_cast<int64_t>(cd[row * 16 + col])) + static_cast<uint64_t>(dots[row * 16 + col]));
-          if (in.clamp) isum = std::clamp<int64_t>(isum, INT32_MIN, INT32_MAX);
+          const int64_t isum = std::clamp<int64_t>(int64_t{ci[row * 16 + col]} + dots[row * 16 + col], INT32_MIN, INT32_MAX);
           o[col] = static_cast<uint32_t>(isum);
         }
       }
