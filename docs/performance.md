@@ -4896,3 +4896,13 @@ Canaries (`valu_*`, `mfma*`, `smfmac`, `wave`, `lds`, `divergent`, `launch`, `ap
 
 ### Tests and mutations
 `test_amd_gcn_tier_same_bits` (and its `simd_base` twin) already runs every carry shape of the corpora with the tier off and on over the carries-and-borrows flavour and half the lanes off. Mutations (built and run with `VGPU_TIER_ONLY=_co_`): carry-in bits read from lane 0 for every group of 8 (`cin & 0xFF`), and the borrow as `x <= y`: both fail it.
+
+### Buffer dwords and whole-wave scalars (same branch)
+`buffer_words` (the whole-wave MUBUF dword path) and `wave_scalars` were instruction-bound (IPC 5): the per-lane loop re-read the resource limits through the `fits` lambda's references (stores to `lanes[]` and `index` forced reloads) and went through `word` / `set_word` for every lane. Now the limits are a small by-value `BufLimits` (`fits(at, bytes, index)` takes the lane's index), the operand rows are taken once (`row_of`), and the loops read and write the rows directly; the slow lane-by-lane loop uses the same `BufLimits::fits`. Host instructions of `buf` on rx6800: 11.76 G to 9.54 G, cycles 2.34 G to 1.89 G.
+
+| workload | mi300x | rx6800 |
+| --- | ---: | ---: |
+| `buf` | **1.40** (p < 0.001) | **1.26** (p < 0.001) |
+| `narrow` (this piece alone, `wave_scalars`) | **1.08** (p < 0.001) | 1.28 with the carry kernels (this piece's share not separable) |
+Canaries `smem`, `lds`, `wave`, `divergent`, `valu_int`, `mem`, `flat`, `atomics`: 0.97 to 1.04, counters identical. Tests: `test_amd_gcn_memory_same_bits` (buffer corpora over valid, invalid, too small and swizzled resources, and the wave-wide paths against lane by lane) fails under: the out-of-range lanes not zeroed, the index read from the wrong lane, the high word of a 64-bit store taken from the low row, the high word of a 64-bit load written from the low. Not covered by it (the corpus never sets RDNA's OOB_SELECT 1 with an index at the record count): the `index <= records` boundary. The same-address memo of `wave_scalars` is unobservable (equal addresses read equal values), a mutation of it survives.
+`atomics` (`wave_atomics`, 37 to 44% of the process) has no single hot spot (the samples are spread over `atomic_data`, `atomic_result` and the batch loop); left.

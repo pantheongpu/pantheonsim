@@ -10127,23 +10127,26 @@ struct Machine {
       addrs[n] = lane_addr[lane], lanes[n++] = lane;
     }
     if (!n) return true;
+    uint32_t* const row0 = row_of(w, data, 0);
+    uint32_t* const row1 = words == 2 ? row_of(w, data, 1) : row0;
     if (store) {
-      for (uint32_t i = 0; i < n; ++i) {
-        const uint32_t lo = word(w, data, 0, lanes[i]);
-        vals[i] = words == 2 ? lo | uint64_t{word(w, data, 1, lanes[i])} << 32 : lo;
+      if (words == 2) {
+        for (uint32_t i = 0; i < n; ++i) vals[i] = row0[lanes[i]] | uint64_t{row1[lanes[i]]} << 32;
+      } else {
+        for (uint32_t i = 0; i < n; ++i) vals[i] = row0[lanes[i]];
       }
       return mem.store_batch(addrs, n, bytes, vals);
     }
     if (!mem.load_batch(addrs, n, bytes, vals)) return false;
     for (uint32_t i = 1; i < n; ++i)
       if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
-    for (uint32_t i = 0; i < n; ++i) {
-      if (narrow_by) {
-        set_word(w, data, 0, lanes[i], widen(vals[i], *narrow_by));
-      } else {
-        set_word(w, data, 0, lanes[i], static_cast<uint32_t>(vals[i]));
-        if (words == 2) set_word(w, data, 1, lanes[i], static_cast<uint32_t>(vals[i] >> 32));
-      }
+    if (narrow_by) {
+      const Narrow nb = *narrow_by;
+      for (uint32_t i = 0; i < n; ++i) row0[lanes[i]] = widen(vals[i], nb);
+    } else if (words == 2) {
+      for (uint32_t i = 0; i < n; ++i) row0[lanes[i]] = static_cast<uint32_t>(vals[i]), row1[lanes[i]] = static_cast<uint32_t>(vals[i] >> 32);
+    } else {
+      for (uint32_t i = 0; i < n; ++i) row0[lanes[i]] = static_cast<uint32_t>(vals[i]);
     }
     return true;
   }
