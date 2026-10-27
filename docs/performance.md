@@ -4878,3 +4878,21 @@ Sanitizers: ASan+UBSan -O0 (`test_amd_mfma_math`, `test_amd_matrix_fast` 2248 s,
 * `flat_*`, `buffer_load/store`, `global_atomic_*` in the tier: `flat` costs the same per instruction as `mem` (48 ns) already, the cost is the memory work, not the frame.
 * fp8/small-float decode by `vgatherdpd`: not tried, a gather costs about what the scalar table lookups do on Zen 4.
 * AVX-512 for the tiles: Zen 4 runs it as two 256-bit halves, nothing to show here.
+
+## Round sp4: the AMD engine's carry instructions (branch `sp4-amdprof`, base 53721cb2)
+
+**Measured first** (perf `cycles:u`, one host thread, the bench-amd binaries of both targets, A = the round 3 build): `h_carry`, the tier's handler for `v_add_co_u32`, `v_addc_co_u32`, `v_sub_co_u32`, `v_subb_co_u32` and the reversed forms, was a scalar loop over the active lanes (a swap, a carry-in shift and a 64-bit sum a lane), twice. RDNA code builds every 64-bit address with that pair, so on rx6800 it took 35% of `mem`, 26% of `flat` and 19% of `narrow` (the same workloads cost about twice as much on rx6800 as on mi300x, whose compiler uses `v_lshl_add_u64`). Ranking of the other rows (share of the process, rx6800 / mi300x): `buf` `buffer_words` 36 / 44% plus the batch memory functions 25%; `atomics` `wave_atomics` 37 / 44%; `ldsx` `h_ds` 42 / 45%; `narrow` `wave_scalars` 17 / 28%; `smem`, `divergent`, `wave` the per-instruction frame (`run_groups` 23 to 40%) with no handler over 11%; `valu_*` handlers 10 to 21% of the process, the rest the bench binary's self-check.
+
+### What changed
+* `k_carry<SUB>` (`gcn_tier_kernels.inc`, table `kCarry`): the eight shapes as lane-row kernels, 8 lanes at a time under AVX2 (carry-in bits expanded to lane masks, unsigned compares by a sign-bit bias, the carry mask by `movemask`), the old per-lane arithmetic at the baseline level; all n lanes are computed and the handler masks the carry by EXEC and merges the sum (`h_carry_body`, `TIER_DUAL`, `Tables::carry`).
+
+### Results (B/A of medians, one host thread, counters identical in every row, `--check-counters` matches)
+| workload | mi300x | rx6800 |
+| --- | ---: | ---: |
+| `mem` | 1.01 | **1.51** (p < 0.001) |
+| `flat` | 1.01 | **1.29** (p < 0.001) |
+| `narrow` | 1.01 | **1.35** (p 0.03; 0.9 to 1.3 in other runs while the server was loaded) |
+Canaries (`valu_*`, `mfma*`, `smfmac`, `wave`, `lds`, `divergent`, `launch`, `api`, `buf`): all within 0.97 to 1.03; single rows that read 0.955 (`smem` mi300x), 0.974 (`atomics` rx6800) and 0.978 (`mfma`) in one run read 1.31, 1.03 and 1.26 (p > 0.6) in the next with the code moved: noise on a shared box, not a change (no code of those paths changed).
+
+### Tests and mutations
+`test_amd_gcn_tier_same_bits` (and its `simd_base` twin) already runs every carry shape of the corpora with the tier off and on over the carries-and-borrows flavour and half the lanes off. Mutations (built and run with `VGPU_TIER_ONLY=_co_`): carry-in bits read from lane 0 for every group of 8 (`cin & 0xFF`), and the borrow as `x <= y`: both fail it.

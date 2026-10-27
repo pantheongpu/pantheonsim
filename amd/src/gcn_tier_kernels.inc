@@ -611,6 +611,11 @@ static uint64_t k_mad_u64(uint32_t* lo, uint32_t* hi, const uint32_t* a, const u
   return carry;
 }
 
+static const K3 kIntTab[] = {TIER_INT_OPS(TIER_PICK)};
+static const K3 kF32Tab[] = {TIER_F32_OPS(TIER_PICK)};
+static const K64 kF64Tab[] = {TIER_F64_OPS(TIER_PICK)};
+static const K64 kL64Tab[] = {TIER_L64_OPS(TIER_PICK)};
+
 // v_add_co_u32, v_addc_co_u32, v_sub_co_u32, v_subb_co_u32 and the reversed ones over n lanes: d receives the sum or difference, and bit l of the
 // result is lane l's carry or borrow. SUB: bit 0 add, bit 1 takes a carry in (bit l of `cin`), bit 2 reversed. Every lane is computed (the caller
 // masks the result and merges d under EXEC); a lane reads its inputs before it writes d, so d may be a or b.
@@ -657,10 +662,5 @@ static uint64_t k_carry(uint32_t* d, const uint32_t* a, const uint32_t* b, [[may
   return out;
 }
 static const CarryFn kCarry[8] = {k_carry<0>, k_carry<1>, k_carry<2>, k_carry<3>, k_carry<4>, k_carry<5>, k_carry<6>, k_carry<7>};
-
-static const K3 kIntTab[] = {TIER_INT_OPS(TIER_PICK)};
-static const K3 kF32Tab[] = {TIER_F32_OPS(TIER_PICK)};
-static const K64 kF64Tab[] = {TIER_F64_OPS(TIER_PICK)};
-static const K64 kL64Tab[] = {TIER_L64_OPS(TIER_PICK)};
 
 }  // namespace TIER_NS
