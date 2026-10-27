@@ -1717,7 +1717,7 @@ void tier_add_total(uint64_t n) { tier_stats().total.fetch_add(n, std::memory_or
 }
 
 // The lanes of `group` get program counter `v` (a whole warp: 32 stores the compiler turns into vector ones).
-inline void tier_set_pcs(Warp& w, Mask group, uint64_t v) {
+[[gnu::aligned(64)]] inline void tier_set_pcs(Warp& w, Mask group, uint64_t v) {
   if (group == kAll) {
     for (unsigned l = 0; l < 32; ++l) w.pc[l] = v;
   } else {
