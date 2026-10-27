@@ -603,7 +603,7 @@ inline float chunk_finite_raw(const float* a, size_t astride, const float* b, si
 // What the float form cannot say stays on the old path: a chunk whose g puts 2^-g outside the float range (a subnormal accumulator and
 // nothing to speak of beside it) is finished by the scalar rule, as are the chunks with an infinity or a NaN.
 template <unsigned NC, bool ACC16>
-__attribute__((target("avx2"))) inline bool mma_avx2_chunked_f(unsigned M, unsigned N, unsigned K, int emin, const float* A, size_t lda, const float* B,
+__attribute__((target("avx2"), aligned(64))) inline bool mma_avx2_chunked_f(unsigned M, unsigned N, unsigned K, int emin, const float* A, size_t lda, const float* B,
                                                               size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
   constexpr unsigned kMaxM = 32, kMaxN = 32, kMaxK = 16;
   alignas(32) float bf[kMaxK * kMaxN];
