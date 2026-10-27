@@ -1,0 +1,10 @@
+1/1 tests passed
+ok   sm_86 sass_tier  (30 units (432 regions), 30 ready, 0 cache hits, 30 compiles (84491.1 ms), 0 failures, 0 damaged objects replaced; 208299 region calls ran 1458445 warp instructions (1172795 computed by generated code), 0 exceptions unwound through them)
+ok   sm_86 sass_tier_steps  (26 units (342 regions), 26 ready, 1 cache hits, 25 compiles (82872.7 ms), 0 failures, 0 damaged objects replaced; 8324569 region calls ran 556933868 warp instructions (556140440 computed by generated code), 0 exceptions unwound through them)  [2 faults thrown inside regions]
+ok   sm_86 jit_random seed 1  (16 units (113 regions), 16 ready, 0 cache hits, 16 compiles (57316.2 ms), 0 failures, 0 damaged objects replaced; 16756 region calls ran 372136 warp instructions (346976 computed by generated code), 0 exceptions unwound through them)
+ok   sm_86 sass_tier (no compiler)  (1 units (3 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions (0 computed by generated code), 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a compiler that fails)  (30 units (209 regions), 0 ready, 0 cache hits, 30 compiles (470.8 ms), 30 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions (0 computed by generated code), 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a cache that cannot be created)  (1 units (3 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions (0 computed by generated code), 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a cache others can write to)  (1 units (3 regions), 0 ready, 0 cache hits, 0 compiles (0.0 ms), 1 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions (0 computed by generated code), 0 exceptions unwound through them)
+ok   sm_86 sass_tier (a compile that times out)  (30 units (209 regions), 0 ready, 0 cache hits, 30 compiles (30063.3 ms), 30 failures, 0 damaged objects replaced; 0 region calls ran 0 warp instructions (0 computed by generated code), 0 exceptions unwound through them)
+PASS

@@ -1,0 +1,10 @@
+m3 mem: files=3 ops=44 escapes=7 strow=32 ldrow=32
+m3 local: files=1 ops=235 escapes=44 strow=165 ldrow=165
+m3 warp: files=1 ops=42 escapes=0 strow=21 ldrow=21
+m3 shared: files=1 ops=21 escapes=3 strow=9 ldrow=9
+m3 f64_fma: files=1 ops=21 escapes=0 strow=17 ldrow=17
+m4 mem: files=3 ops=44 escapes=7 strow=45 ldrow=26
+m4 local: files=1 ops=235 escapes=44 strow=270 ldrow=113
+m4 warp: files=1 ops=42 escapes=0 strow=21 ldrow=21
+m4 shared: files=1 ops=21 escapes=3 strow=11 ldrow=9
+m4 f64_fma: files=1 ops=21 escapes=0 strow=17 ldrow=17
