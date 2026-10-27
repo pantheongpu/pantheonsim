@@ -611,6 +611,53 @@ static uint64_t k_mad_u64(uint32_t* lo, uint32_t* hi, const uint32_t* a, const u
   return carry;
 }
 
+// v_add_co_u32, v_addc_co_u32, v_sub_co_u32, v_subb_co_u32 and the reversed ones over n lanes: d receives the sum or difference, and bit l of the
+// result is lane l's carry or borrow. SUB: bit 0 add, bit 1 takes a carry in (bit l of `cin`), bit 2 reversed. Every lane is computed (the caller
+// masks the result and merges d under EXEC); a lane reads its inputs before it writes d, so d may be a or b.
+using CarryFn = uint64_t (*)(uint32_t* d, const uint32_t* a, const uint32_t* b, uint64_t cin, unsigned n);
+template <unsigned SUB>
+static uint64_t k_carry(uint32_t* d, const uint32_t* a, const uint32_t* b, [[maybe_unused]] uint64_t cin, unsigned n) {
+  constexpr bool add = SUB & 1, takes = SUB & 2, rev = SUB & 4;
+  uint64_t out = 0;
+#if TIER_AVX2
+  const __m256i bias = _mm256_set1_epi32(INT32_MIN), lanebit = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+  for (unsigned i = 0; i < n; i += 8) {
+    __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+    __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+    if (rev) std::swap(x, y);
+    __m256i c1 = _mm256_setzero_si256();   // the carry in, 0 or 1 a lane
+    if (takes) {
+      const __m256i bits = _mm256_set1_epi32(static_cast<int>((cin >> i) & 0xFF));
+      c1 = _mm256_srli_epi32(_mm256_cmpeq_epi32(_mm256_and_si256(bits, lanebit), lanebit), 31);
+    }
+    __m256i r, k;   // k: all ones in a lane that carried
+    if (add) {
+      const __m256i s1 = _mm256_add_epi32(x, y);
+      r = takes ? _mm256_add_epi32(s1, c1) : s1;
+      k = _mm256_cmpgt_epi32(_mm256_xor_si256(x, bias), _mm256_xor_si256(s1, bias));   // the sum wrapped: s1 < x
+      if (takes) k = _mm256_or_si256(k, _mm256_cmpgt_epi32(_mm256_xor_si256(s1, bias), _mm256_xor_si256(r, bias)));
+    } else {
+      r = _mm256_sub_epi32(_mm256_sub_epi32(x, y), c1);
+      k = _mm256_cmpgt_epi32(_mm256_xor_si256(y, bias), _mm256_xor_si256(x, bias));   // x < y
+      if (takes) k = _mm256_or_si256(k, _mm256_and_si256(_mm256_cmpeq_epi32(x, y), _mm256_cmpeq_epi32(c1, _mm256_set1_epi32(1))));
+    }
+    out |= static_cast<uint64_t>(static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(k)))) << i;
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + i), r);
+  }
+#else
+  for (unsigned l = 0; l < n; ++l) {
+    uint64_t x = a[l], y = b[l];
+    if (rev) std::swap(x, y);
+    const uint64_t c = takes ? (cin >> l) & 1 : 0;
+    const uint64_t v = add ? x + y + c : x - y - c;
+    out |= static_cast<uint64_t>(add ? (v >> 32) & 1 : x < y + c) << l;
+    d[l] = static_cast<uint32_t>(v);
+  }
+#endif
+  return out;
+}
+static const CarryFn kCarry[8] = {k_carry<0>, k_carry<1>, k_carry<2>, k_carry<3>, k_carry<4>, k_carry<5>, k_carry<6>, k_carry<7>};
+
 static const K3 kIntTab[] = {TIER_INT_OPS(TIER_PICK)};
 static const K3 kF32Tab[] = {TIER_F32_OPS(TIER_PICK)};
 static const K64 kF64Tab[] = {TIER_F64_OPS(TIER_PICK)};
