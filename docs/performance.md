@@ -4893,7 +4893,7 @@ address array (32 stores) and the second pass that compared it with a run were t
 
 ### Results (min of 7 runs of cycles and the instruction count, `perf stat`, one host thread; base 53721cb2 / this branch; the box ran at load 15 to 50, so the 9 to 15 run A/Bs below are noisy)
 mem 576.1 M / 533.3 M cycles (0.926x), 2410.6 M / 2292.3 M instructions; shared 137.8 / 134.4 (0.976x), 637.3 / 614.6; local 465.8 / 410.5 (0.881x), 2193.9 / 2030.4; atomics, warp, divergent, wmma, mma_ptx, int_alu, f32_fma within 1% (cycles), instruction counts equal.
-`bench.py --ab`, 11 alternating runs, before the two alignment commits: mem 1.096x (p < 0.001), shared 1.036x (p 0.002), local 1.125x (p < 0.001), counters identical in every row. A/A: 0.996x to 1.004x on mem, shared, local.
+`bench.py --ab`, 11 alternating runs, final tree, cpu 4, load 20 to 30: mem 1.097x, local 1.112x, shared 1.024x, warp 1.031x (not changed here: placement), atomics 1.024x (not changed here: placement), divergent 1.004x, wmma 1.002x, all p < 0.001 where "faster"; PTX rows 0.99x to 1.02x (same); counters identical in every row. A/A: 0.996x to 1.004x on mem, shared, local.
 
 ### Tests
 `test_sass_mem_rows` (CMake-wired): `global_run` against the lane loop over runs, runs with one lane a bit off, carries into the high half, lo-only rows, no row, element sizes 1 to 16, masks of any start and length. Mutants killed: the second lane's expected address off by one,
