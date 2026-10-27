@@ -1380,7 +1380,11 @@ TIER_HANDLER(h_vote) {
   const bool r = op.a == 0 ? all : op.a == 1 ? any : eq;
   if (op.dst != tier::kNoReg) {
     uint32_t* d = c.R + op.dst * 32u;
-    for (Mask m = ex; m; m &= m - 1) d[std::countr_zero(m)] = ballot;
+    if (ex == kAll) {
+      for (unsigned l = 0; l < 32; ++l) d[l] = ballot;   // (a full warp: eight vector stores, not a loop over the lanes' bits)
+    } else {
+      for (Mask m = ex; m; m &= m - 1) d[std::countr_zero(m)] = ballot;
+    }
   }
   tier_setp(c, op.dst2, ex, r ? kAll : 0);
 }
@@ -1875,6 +1879,8 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   size_t idx = first;
   const unsigned glanes = popc(group);
   const tier::MOp* cur = &ops[idx];
+  bool all_at = false;   // the run ended by setting every lane of the group to one address, `at` (the chain below then knows where they stand)
+  uint64_t at = 0;
   try {
     for (unsigned n = 0;; ++n) {
       // Tier 2: a region that starts here, compiled, is run in place of its ops (jit_run_region says how, and when not).
@@ -1968,7 +1974,9 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       if (ex && ex != group) ++st.divergent_branches;
       const uint64_t target = code.base + static_cast<uint64_t>(last.imm);
       if (take == group || !take) {
-        tier_set_pcs(w, group, take ? target : here + 16);
+        at = take ? target : here + 16;
+        tier_set_pcs(w, group, at);
+        all_at = true;
       } else {
         exec::sasslanes::select_pcs(w.pc, group, take, target, here + 16);   // (a select without a branch: the lanes that take it are unpredictable)
       }
@@ -1989,7 +1997,9 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       st.inst_by_class[last.cls] += lanes;
       if (last.ins->tensor) ++st.tensor_instructions;
       if (ex) last.fn(&c, last, ex);
-      tier_set_pcs(w, group, here + 16);
+      at = here + 16;
+      tier_set_pcs(w, group, at);
+      all_at = true;
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(last.ins->op)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Bssy || last.form == tier::Form::Nop) {
       // These leave the program counters to execute()'s advance: every lane of the group goes on to the next address.
@@ -2003,7 +2013,9 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
         w.b[last.dst] |= ex;
         w.bssy_stamp[last.dst & 15] = ++blk.bssy_clock;
       }
-      tier_set_pcs(w, group, here + 16);
+      at = here + 16;
+      tier_set_pcs(w, group, at);
+      all_at = true;
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(last.ins->op)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Yield) {
       // exec_control's YIELD: the group that yielded gives way (the lowest address's group is the one that ran), whatever its guard says.
@@ -2109,7 +2121,15 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   const Mask run = w.runnable();
   if (!run) return true;
   uint64_t lo;
-  const Mask next = exec::sasslanes::pick_group(w.pc, run, lo);   // the group at the lowest address, which is what step_warp picks when nothing else is asked of it
+  Mask next;
+  // The group at the lowest address, which is what step_warp picks when nothing else is asked of it. When the run set the group to one address
+  // and no runnable lane stands outside it, that is the runnable lanes at that address, and the 32 addresses need not be read back.
+  if (all_at && (run & ~group) == 0) {
+    next = run;
+    lo = at;
+  } else {
+    next = exec::sasslanes::pick_group(w.pc, run, lo);
+  }
   if (lo - code.base >= 16 * static_cast<uint64_t>(count) || ((lo - code.base) & 15)) return true;
   --w.budget;
   ++w.extra;
