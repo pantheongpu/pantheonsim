@@ -862,26 +862,17 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
   const uint32_t* bhi = (ra != kRZ && (op.aux & 1)) ? c.R + (ra + 1u) * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
   const uint64_t imm = static_cast<uint64_t>(op.imm);
-  uint64_t addrs[32];
   constexpr uint64_t kWinEnd = kConstWindow + (uint64_t{1} << 32);
-  tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    if (addrs[l] >= kConstWindow && addrs[l] < kWinEnd) {   // nothing is done yet: the interpreter runs the whole instruction
-      c.r->tier_exec_mem(blk, w, *op.ins, ex);
-      return;
-    }
-  }
   MemoryManager& mem = c.r->memory();
   uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
   if (ex && ((ex + (ex & -ex)) & ex) == 0) {
     // Consecutive lanes on consecutive 16-byte pieces (a float4 or an int4 array indexed by the thread): one run of memory, made as
-    // 8-byte pieces like the general access, with the lanes' four words shuffled between it and the four register rows.
+    // 8-byte pieces like the general access, with the lanes' four words shuffled between it and the four register rows. Found on the
+    // registers' rows, before the lanes' addresses are made (they are made below for anything that is not this).
     const unsigned first = static_cast<unsigned>(std::countr_zero(ex)), count = popc(ex);
-    const uint64_t g0 = addrs[first];
-    uint64_t differ = 0;
-    for (unsigned i = 0; i < count; ++i) differ |= addrs[first + i] ^ (g0 + uint64_t{i} * 16);
-    if (differ == 0 && (g0 >= kWinEnd || g0 + uint64_t{count} * 16 - 1 < kConstWindow)) {
+    uint64_t g0;
+    if (exec::sassmem::global_run(blo, bhi, urv + imm, first, count, 16, g0) &&
+        (g0 >= kWinEnd || g0 + uint64_t{count} * 16 - 1 < kConstWindow)) {
       uint32_t buf[32 * 4];
       bool done;
       if (Store) {
@@ -898,6 +889,15 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
         count_run(blk.st, Store, g0, first, count, ex, 16);
         return;
       }
+    }
+  }
+  uint64_t addrs[32];
+  tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    if (addrs[l] >= kConstWindow && addrs[l] < kWinEnd) {   // nothing is done yet: the interpreter runs the whole instruction
+      c.r->tier_exec_mem(blk, w, *op.ins, ex);
+      return;
     }
   }
   for (Mask m = ex; m; m &= m - 1) {
@@ -934,8 +934,6 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
   const uint32_t* bhi = (ra != kRZ && (op.aux & 1)) ? c.R + (ra + 1u) * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
   const uint64_t imm = static_cast<uint64_t>(op.imm);
-  uint64_t addrs[32];
-  tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
   constexpr uint64_t kWinEnd = kConstWindow + (uint64_t{1} << 32);
   const uint32_t* dreg = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
   MemoryManager& mem = c.r->memory();
@@ -950,10 +948,10 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
   if (ex && ((ex + (ex & -ex)) & ex) == 0) {
     const unsigned first = static_cast<unsigned>(std::countr_zero(ex));
     const unsigned count = popc(ex);
-    const uint64_t g0 = addrs[first];
-    uint64_t differ = 0;   // (no short circuit: the lanes' addresses against the run, ORed)
-    for (unsigned i = 0; i < count; ++i) differ |= addrs[first + i] ^ (g0 + uint64_t{i} * bytes);
-    const bool run = differ == 0 && !(g0 >= kConstWindow && g0 < kWinEnd);
+    // Whether the lanes are on consecutive elements is asked of the registers' rows, before the lanes' addresses are made (they are made
+    // below, for an access that is not a run or that the memory manager declines).
+    uint64_t g0;
+    const bool run = exec::sassmem::global_run(blo, bhi, urv + imm, first, count, bytes, g0) && !(g0 >= kConstWindow && g0 < kWinEnd);
     if (run && (g0 + uint64_t{count} * bytes - 1 < kConstWindow || g0 >= kWinEnd)) {
       uint8_t buf[32 * 8];
       bool done = false;
@@ -993,6 +991,8 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
       }
     }
   }
+  uint64_t addrs[32];
+  tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
   // The lanes' accesses together (MemoryManager::load_batch / store_batch).
   uint64_t fa[32], fv[32];
   unsigned lane_of[32], cnt = 0;
