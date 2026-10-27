@@ -4933,3 +4933,12 @@ the high rows ignored, the last odd lane skipped, a null base counted as a run. 
 * *Atomics, a warp that names one word keeps it in a register through the lanes* (instead of a store-to-load chain through `cur[slot[l]]`): `atomics` 1.010x (15 runs) against 1.007x without it. Dropped.
 * *Closed form for the sector count of a private array* (`sectors_fast` is 22% of `local` with `sector_window_k` and `distinct_sectors`): `on_stride` already turns a warp that is not on a stride away after four lanes; not changed.
 * PTX engine: not changed (exec_ld/exec_st read, no piece measured); its `mem` row moved 0.91x in cycles with equal instructions, `int_alu` +1.6% cycles, `api` +1.5%: placement, not chased.
+
+### The tensor float kernel's placement residual (branch `sp4-place`, on `sp4-integration`)
+
+`wmma` and `mma_ptx` (SASS) read 0.96x of the base in the integration tree with 1% fewer instructions. `perf stat` showed the cause: the front end. `op_cache_hit_miss.op_cache_miss` 11.7 M -> 43 M and
+`de_src_op_disp.decoder` 110 M -> 449 M ops, all inside `tc86::mma_avx2_chunked_f<8,false>`, whose code was unchanged (same instructions, 64-byte-aligned or not; a sweep of the body's offset by 8 to 56
+bytes with `.nops` moved it by 2%, never back to the base). The function's eight unrolled rows each carried their own copy of the unlikely path (the scalar lanes: infinities, NaNs, out-of-range scales,
+rounding), a third of the function, between the hot vector lines. That path is now `mma_f_fix`, out of line and cold. Op-cache misses 15.5 M, cycles on `wmma` 478 M against 490 M (base) and 515 M (before).
+B/A vs the base (11 runs, cpu 0, counters identical): `wmma` sass 1.065x, ptx 1.044x, `mma_ptx` sass 1.036x, ptx 1.026x; `divergent` 1.12x, `warp` 1.15x, `local` 1.14x, `mem` 1.10x, `shared` 1.03x;
+the other canaries 0.998x to 1.02x. Unit tests: `test_tc_ampere`, `test_tc_ampere_fast`, `test_fastpath` pass.
