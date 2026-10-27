@@ -75,6 +75,12 @@ inline Mask pick_group(const uint64_t* pc, Mask run, uint64_t& lo) {
   return pick_group_diverged(pc, run, lo);
 }
 
+// The lanes of `group` stand at address `v` from now on, and (select_pcs) the lanes of `take` at `target` and the others of `group` at `next`:
+// the addresses a branch sets. With AVX2 four lanes to a store under a mask, not a loop over the lanes (whose length no predictor learns in
+// a diverged warp); src/simd/lanes.cpp. The lanes outside `group` keep theirs.
+void set_pcs_partial(uint64_t* pc, Mask group, uint64_t v);
+void select_pcs(uint64_t* pc, Mask group, Mask take, uint64_t target, uint64_t next);
+
 // The lanes of `ex` start to wait with `kind` on `arg`.
 template <class W, class K>
 inline void wait(W& w, Mask ex, K kind, unsigned arg) {

@@ -1707,7 +1707,7 @@ inline void tier_set_pcs(Warp& w, Mask group, uint64_t v) {
   if (group == kAll) {
     for (unsigned l = 0; l < 32; ++l) w.pc[l] = v;
   } else {
-    for (Mask m = group; m; m &= m - 1) w.pc[std::countr_zero(m)] = v;
+    exec::sasslanes::set_pcs_partial(w.pc, group, v);
   }
 }
 
@@ -1970,11 +1970,7 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       if (take == group || !take) {
         tier_set_pcs(w, group, take ? target : here + 16);
       } else {
-        const uint64_t next = here + 16;   // (a select without a branch: the lanes that take it are unpredictable)
-        for (Mask m = group; m; m &= m - 1) {
-          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-          w.pc[l] = next ^ ((target ^ next) & (uint64_t{0} - ((take >> l) & 1)));
-        }
+        exec::sasslanes::select_pcs(w.pc, group, take, target, here + 16);   // (a select without a branch: the lanes that take it are unpredictable)
       }
       if (take && last.imm <= static_cast<int64_t>(last.ins->pc) && (w.runnable() & ~group)) {
         if (++w.spins >= 64) {

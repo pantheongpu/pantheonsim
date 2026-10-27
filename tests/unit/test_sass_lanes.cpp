@@ -4,6 +4,7 @@
 //    low half, only in the high half, in both, and masks of every kind;
 //  * pick_group (the lowest address among the runnable lanes' and the lanes there: the AVX2 pass of src/simd/lanes.cpp where the host has it) against
 //    the definition, with addresses of every kind -- equal, differing in one half, above 2^63 (compared as unsigned numbers) -- and every mask;
+//  * set_pcs_partial and select_pcs (the addresses a branch gives the lanes of a group), against the lane loop, the lanes outside the group untouched;
 //  * the wait state of lanes at a barrier: wait, waiting_on and wake, for whole warps and partial masks, other kinds and other arguments
 //    among the lanes (they must stay);
 //  * row_uniform (whether all 32 words of a register row are one value);
@@ -98,6 +99,26 @@ VTEST(pick_group_finds_the_lowest_address_and_its_runnable_lanes) {
     lo = 0;
     VCHECK_EQ(sl::pick_group_diverged(w.pc, run, lo), want);   // (the pass itself, converged warps included)
     VCHECK_EQ(lo, want_lo);
+  }
+}
+
+VTEST(set_pcs_and_select_pcs_agree_with_the_lane_loop) {
+  std::mt19937_64 rng(13);
+  for (int round = 0; round < 40000; ++round) {
+    MockWarp w;
+    for (unsigned l = 0; l < 32; ++l) w.pc[l] = 0x1000 + 16 * (rng() % 9);
+    const Mask group = random_mask(rng), take = random_mask(rng) & group;
+    const uint64_t target = rng() % 5 == 0 ? rng() : 0x2000 + 16 * (rng() % 9), next = rng() % 5 == 0 ? (uint64_t{1} << 63) + rng() % 99 : 0x3000 + 16 * (rng() % 9);
+    MockWarp a = w, ref = w;
+    sl::set_pcs_partial(a.pc, group, target);
+    for (unsigned l = 0; l < 32; ++l)
+      if ((group >> l) & 1) ref.pc[l] = target;
+    VCHECK(std::memcmp(&a, &ref, sizeof a) == 0);
+    MockWarp b = w, ref2 = w;
+    sl::select_pcs(b.pc, group, take, target, next);
+    for (unsigned l = 0; l < 32; ++l)
+      if ((group >> l) & 1) ref2.pc[l] = ((take >> l) & 1) ? target : next;
+    VCHECK(std::memcmp(&b, &ref2, sizeof b) == 0);
   }
 }
 
