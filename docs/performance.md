@@ -4960,3 +4960,12 @@ Canaries (`valu_*`, `mfma*`, `smfmac`, `wave`, `lds`, `divergent`, `launch`, `ap
 | `narrow` (this piece alone, `wave_scalars`) | **1.08** (p < 0.001) | 1.28 with the carry kernels (this piece's share not separable) |
 Canaries `smem`, `lds`, `wave`, `divergent`, `valu_int`, `mem`, `flat`, `atomics`: 0.97 to 1.04, counters identical. Tests: `test_amd_gcn_memory_same_bits` (buffer corpora over valid, invalid, too small and swizzled resources, and the wave-wide paths against lane by lane) fails under: the out-of-range lanes not zeroed, the index read from the wrong lane, the high word of a 64-bit store taken from the low row, the high word of a 64-bit load written from the low. Not covered by it (the corpus never sets RDNA's OOB_SELECT 1 with an index at the record count): the `index <= records` boundary. The same-address memo of `wave_scalars` is unobservable (equal addresses read equal values), a mutation of it survives.
 `atomics` (`wave_atomics`, 37 to 44% of the process) has no single hot spot (the samples are spread over `atomic_data`, `atomic_result` and the batch loop); left.
+
+### The tensor float kernel's placement residual (branch `sp4-place`, on `sp4-integration`)
+
+`wmma` and `mma_ptx` (SASS) read 0.96x of the base in the integration tree with 1% fewer instructions. `perf stat` showed the cause: the front end. `op_cache_hit_miss.op_cache_miss` 11.7 M -> 43 M and
+`de_src_op_disp.decoder` 110 M -> 449 M ops, all inside `tc86::mma_avx2_chunked_f<8,false>`, whose code was unchanged (same instructions, 64-byte-aligned or not; a sweep of the body's offset by 8 to 56
+bytes with `.nops` moved it by 2%, never back to the base). The function's eight unrolled rows each carried their own copy of the unlikely path (the scalar lanes: infinities, NaNs, out-of-range scales,
+rounding), a third of the function, between the hot vector lines. That path is now `mma_f_fix`, out of line and cold. Op-cache misses 15.5 M, cycles on `wmma` 478 M against 490 M (base) and 515 M (before).
+B/A vs the base (11 runs, cpu 0, counters identical): `wmma` sass 1.065x, ptx 1.044x, `mma_ptx` sass 1.036x, ptx 1.026x; `divergent` 1.12x, `warp` 1.15x, `local` 1.14x, `mem` 1.10x, `shared` 1.03x;
+the other canaries 0.998x to 1.02x. Unit tests: `test_tc_ampere`, `test_tc_ampere_fast`, `test_fastpath` pass.
