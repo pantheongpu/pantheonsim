@@ -4907,3 +4907,29 @@ Tests (CMake-wired): `test_sass_lanes` `set_pcs_and_select_pcs_agree_with_the_la
 * *BSYNC's arrival mask worked out before the wait stores* (to avoid reading the wait arrays back from byte and word stores in flight): A/B against the tree with it, `divergent` 0.981x without it (p 0.23): not a win, dropped.
 * *`shfl_move` Down and Up as SSE2 vectors* (unaligned loads inside the row, gathers at the edges): `warp` 1.017x (p 0.042, under 2%), dropped.
 * *`vpmaskmovq` for the partial pc stores*: slower than the loop on Zen 4, see above.
+## Round sp4: the SASS tier's memory handlers (branch `sp4-memhot`, base 53721cb2)
+
+Profiled first (base build, one host thread, `cycles:u` and `instructions:u`, RTX 3060 profile): the memory workloads run at an IPC of 3.3 to 4.5, so they are bound by instructions, not by stalls.
+`h_local` is 31% of `local` (a scalar address loop that reloads `w.local_size` and the frame vector's data pointer for every lane, because the stores to the register row may alias them), `h_global` + `tier_global16` 12% of `mem`, whose
+address array (32 stores) and the second pass that compared it with a run were the cost of the coalesced case, which then never used the array.
+
+### What changed
+* **`h_local`**: the full-warp address loop works on 32-bit offsets (the same low 32 bits of base + uniform + immediate), the frame base and size are read once. `local` -7.4% instructions.
+* **`h_global`, `tier_global16`**: a contiguous mask of lanes is tested for being consecutive elements on the registers' rows (`sassmem::global_run`, `include/vgpu/exec/sass_mem_rows.hpp`, SSE2, two lanes a step), and the 64-bit address array is built only
+  for an access that is not a run or that the memory manager declines. `mem` -4.9% instructions, `shared` (its global loads) -3.6%.
+* Two code-placement fixes found by the canaries, with equal instruction counts: `mma_avx2_chunked_f` (`wmma` read 0.973x as its start moved 32 bytes within a line) is aligned to 64 bytes; `tier_set_pcs` (`divergent` read 0.96x) too.
+
+### Results (min of 7 runs of cycles and the instruction count, `perf stat`, one host thread; base 53721cb2 / this branch; the box ran at load 15 to 50, so the 9 to 15 run A/Bs below are noisy)
+mem 576.1 M / 533.3 M cycles (0.926x), 2410.6 M / 2292.3 M instructions; shared 137.8 / 134.4 (0.976x), 637.3 / 614.6; local 465.8 / 410.5 (0.881x), 2193.9 / 2030.4; atomics, warp, divergent, wmma, mma_ptx, int_alu, f32_fma within 1% (cycles), instruction counts equal.
+`bench.py --ab`, 11 alternating runs, final tree, cpu 4, load 20 to 30: mem 1.097x, local 1.112x, shared 1.024x, warp 1.031x (not changed here: placement), atomics 1.024x (not changed here: placement), divergent 1.004x, wmma 1.002x, all p < 0.001 where "faster"; PTX rows 0.99x to 1.02x (same); counters identical in every row. A/A: 0.996x to 1.004x on mem, shared, local.
+
+### Tests
+`test_sass_mem_rows` (CMake-wired): `global_run` against the lane loop over runs, runs with one lane a bit off, carries into the high half, lo-only rows, no row, element sizes 1 to 16, masks of any start and length. Mutants killed: the second lane's expected address off by one,
+the high rows ignored, the last odd lane skipped, a null base counted as a run. `h_local` is covered by the bench `local` self-check (`bench_counters`): a load that reads the lane's frame 4 bytes off fails `thread 0`.
+
+### Not done, and negative results
+* *Bank-0 splat rows* (a per-block cache of the 32-lane row a constant-bank-0 word is spread into by `tier_dyn`, to avoid 128 bytes of 16-byte stores read back as 32-byte vectors): 0 instructions saved (2292.3 M with and without), cycles not separable from noise at load 30; adds a 2.6 KB member to `Block`. Dropped.
+* *`h_shared` on the registers' rows* (the same idea for a warp's 32 consecutive shared words or one word every lane names): 1.5 M of 637 M instructions (0.24%) saved on `shared`. Dropped.
+* *Atomics, a warp that names one word keeps it in a register through the lanes* (instead of a store-to-load chain through `cur[slot[l]]`): `atomics` 1.010x (15 runs) against 1.007x without it. Dropped.
+* *Closed form for the sector count of a private array* (`sectors_fast` is 22% of `local` with `sector_window_k` and `distinct_sectors`): `on_stride` already turns a warp that is not on a stride away after four lanes; not changed.
+* PTX engine: not changed (exec_ld/exec_st read, no piece measured); its `mem` row moved 0.91x in cycles with equal instructions, `int_alu` +1.6% cycles, `api` +1.5%: placement, not chased.
