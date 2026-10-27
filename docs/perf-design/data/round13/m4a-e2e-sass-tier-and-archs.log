@@ -1,0 +1,24 @@
+== e2e_sass_tier
+ok   sm_86 sass_tier (VGPU_TC_EXACT=0)  (tier: 2149563 of 2226404 warp instructions ran in the tier (96.5%); 22089 straight-line ones in the interpreter)
+ok   sm_86 wmma_gemm (VGPU_TC_EXACT=0)  (tier: 123 of 151 warp instructions ran in the tier (81.5%); 24 straight-line ones in the interpreter)
+ok   sm_86 wmma_types (VGPU_TC_EXACT=0)  (tier: 729 of 835 warp instructions ran in the tier (87.3%); 52 straight-line ones in the interpreter)
+ok   sm_86 mma_fragment_layout (VGPU_TC_EXACT=0)  (tier: 40 of 40 warp instructions ran in the tier (100.0%); 0 straight-line ones in the interpreter)
+ok   sm_86 modern_dtypes (VGPU_TC_EXACT=0)  (tier: 42 of 48 warp instructions ran in the tier (87.5%); 4 straight-line ones in the interpreter)
+PASS
+== e2e_sass_archs with the JIT forced
+ok   sm_120 waterfall
+ok   sm_120 mma_forms
+ok   sm_120 mma_fragment_layout
+ok   sm_120 modern_dtypes
+ok   sm_120 vector_atomics
+ok   sm_120 wmma_gemm
+ok   sm_120 wmma_types
+ok   sm_120 dsmem_cluster
+ok   sm_120 cooperative_cluster
+ok   sm_120a mma_blockscale
+ok   sm_120a mma_blockscale_dump
+ok   sm_120a mma_accumulate_probe
+ok   sm_120a ldmatrix_forms
+ok   sm_120a narrow_cvt
+PASS
+ALL-E2E-DONE
