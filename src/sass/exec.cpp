@@ -501,7 +501,8 @@ class Runner {
     // VGPU_FASTPATH=0 sends every instruction down the general path, as it does for the PTX interpreter: the
     // plain-form ALU kernels (fast_alu), coalesced global accesses and shared-memory accesses inside the
     // block. For checking that the fast paths compute what the general one does.
-    env_ = exec::read_launch_env();   // (one pass over the environment for all of the launch's variables)
+    if (cfg_.env) env_ = *cfg_.env;   // (the runtime's one pass over the environment for all of the launch's variables, or one of our own)
+    else env_ = exec::read_launch_env();
     if (const char* f = env_.fastpath; f && f[0] == '0') fast_ = false;
     vgpu::exec::tc86::refresh_exact(env_.tc_exact);   // VGPU_TC_EXACT=0: the earlier sequential tensor sums
     if (tier::requested()) {
@@ -627,7 +628,7 @@ class Runner {
     vgpu::exec::TileElem at, bt;
     bool int_form, acc32, sat, neg_a, neg_b, a_kmajor, b_kmajor, reg_a, sparse;
   };
-  bool gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const GmmaForm& f);
+  __attribute__((noinline, section(".text.unlikely"))) bool gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const GmmaForm& f);
   void exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex);   // textures and surfaces
   void exec_syncs(Block& blk, Warp& w, const Instr& ins, Mask ex);   // mbarriers
   uint32_t mbar_offset(Block& blk, Warp& w, const Instr& ins, unsigned lane, bool ur_only, Block** owner);

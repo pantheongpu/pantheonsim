@@ -43,6 +43,8 @@
 #include <cstdlib>
 #include <vector>
 
+#include "vgpu/simd/simd.hpp"
+
 namespace vgpu::exec::memcount {
 
 // Whether the fast versions are used (not when VGPU_FASTCOUNT=0).
@@ -310,9 +312,14 @@ inline bool sectors_hash(const uint64_t* addrs, uint64_t m, uint64_t span, uint6
 [[gnu::noinline]] inline bool sectors_fast(const uint64_t* addrs, uint64_t m, uint64_t span, uint64_t& out) {
   if (sectors_progression(addrs, m, span, out)) return true;
   if (span > 32) return false;
-  if (sectors_monotone<true>(addrs, m, span, out)) return true;
   const uint64_t f0 = addrs[std::countr_zero(m)] >> 5, f1 = addrs[63 - std::countl_zero(m)] >> 5;
-  if (f1 - f0 + 24 <= 62 && sectors_window(addrs, m, span, out)) return true;
+  const bool near = f1 - f0 + 24 <= 62;
+  // With the AVX2 window the near warps come first: one pass over the lanes four at a time takes them in any order, where
+  // the forward walk below gives up at the first lane that goes back (a thread-private array's index wraps half way).
+  if (near)
+    if (const simd::SectorWindowFn window = simd::sector_window_kernel(); window && window(addrs, m, span, out)) return true;
+  if (sectors_monotone<true>(addrs, m, span, out)) return true;
+  if (near && sectors_window(addrs, m, span, out)) return true;
   // (Only a warp whose second lane is below its first can go backward all the way.)
   const uint64_t m2 = m & (m - 1);
   if (m2 && (addrs[std::countr_zero(m2)] >> 5) < f0 && sectors_monotone<false>(addrs, m, span, out)) return true;

@@ -4729,3 +4729,152 @@ of the six new tests, `VGPU_SIMD=base` runs.
 * Fragment decode is still a switch per element (IMMA 670 ns, sparse HMMA 10 us a warp: `mma_sparse_column` copies the metadata into a `Lanes` per element); next step.
 * tcgen05: f16 D, layout F, parts of N (layout B), sparse and block-scaled forms keep the row loop; PTX `wmma` generic shapes, `m8n8k4` f16 untouched; no AVX-512 kernel.
 * `vpmaddwd` for the integer products and a float accumulator decode were not tried (Zen 4 has one-uop `vpmulld`).
+
+## Round sp3: texture sampling, local-memory sector counts, PTX f64 (branch `sp3-texlocal`, base 03d92bd0)
+
+### What changed
+* **Texture fetch** (`src/exec/interpreter.cpp`, `src/sass/exec_ops.inc`): the sampler's cost was mostly zeroing. A 280-byte `TextureDesc local` (and, after a first fix, the storage
+  of a `std::optional<TextureDesc>`, which GCC also zeroes) was `rep stos` in front of every fetch; the 8 `TexTerm`s and the sRGB code table of `tex_finish` were zeroed too; and each
+  lane built a fresh 80-byte `TexFetch` (another `rep stos`, whose start-up is tens of cycles on Zen 4). The descriptor is now copy-constructed into raw storage when a fetch changes it,
+  `TexTerm` has no member initializers (every footprint function sets all members), and both engines build one `TexFetch` per instruction and set only what varies per lane. Two
+  fast-path forms: a linear fetch at a texel's centre (all three 8-bit fractions 0) skips the weight split, and a one-texel float fetch with 32-bit channels (`tex_finish_one_f32`)
+  returns the texel as the blend would (finite as is, subnormal as zero of its sign, NaN as 0x7FFFFFFF, infinity as is). Both are skipped under `VGPU_FASTPATH=0`, which is the oracle.
+* **Local-memory sectors**: `memcount::detail::sectors_fast` tries an AVX2 window kernel (`simd::sector_window_kernel`, `src/simd/simd.cpp`) first for warps whose lanes lie within 63 sectors:
+  four lanes a step, each lane's first and last sector as bits of one word, popcount. Hosts and levels without AVX2 (`VGPU_SIMD=base`) keep the scalar forms; the count is the same.
+* **PTX f64**: `fma.f64`, its contracted subtracts, and `add/sub/mul/div.f64` run four lanes a step (kernels in `src/simd/simd.cpp`, level-gated like the other SIMD kernels). A full warp's eight
+  fma results are checked for a NaN together and stored after every operand is read; a group with a NaN result runs lane by lane under the old NaN rule. SASS f64 was already AVX2
+  (`dop_avx2_t`); its remaining cost is the unpack/shuffle of lo/hi planes and the per-step NaN branch, in `src/simd/kernels.inc`, which the JIT embeds: not touched.
+
+### Results (B/A of medians, 11 alternating runs, base /tmp/sp2-lead/build, counters identical; noise from A/A 1 to 3%)
+| row | sass | ptx |
+|---|---|---|
+| texture | 1.59x | 1.56x |
+| local | 1.20x | 1.03x (cycles 1.034, instructions -8.5%) |
+| f64_fma | 0.99x (unchanged) | 1.46x (cycles) |
+| f64_subnormal | 1.01x | 1.40x (cycles) |
+
+### Tests (wired in CMake) and mutations
+`linear_texture_fetches_at_texel_centres_match_the_general_path` and `f64_arithmetic_random_bits_match_the_general_path` (random bit patterns, all lanes, both guards and a diverged warp) in `test_fastpath`;
+`closed_forms_private_arrays_with_and_without_the_simd_window` in `test_memcount_forms` (also run as `test_memcount_forms_simd_base`). Mutants killed: window kernel without the second sector, one-texel flush removed,
+centre weight 255, contracted-subtract negation swapped, sub computed as add, NaN fallback disabled, NaN check of the full-warp path disabled, `TexFetch::layer` not set per lane (`test_exec3` layered fetches).
+
+### Not done, and negative results
+* The SASS `exec_tex` hoist of `TexFetch` has no unit test here (no SASS texture cubin without nvcc); the bench `texture` self-check and the CI e2e texture tests cover it.
+* Sampler left: `MemoryManager::load_fields` 17% and `tex_footprint_linear` 17% of `texture`; the former is the allocation lookup chain (TLS, cache entry, chunk table), shared with every load.
+* `local`: `h_local` and the PTX `exec_ld`/`exec_st` are 32 separate-line loads and stores per access (per-lane layout), no closed form for the data.
+* A vector kernel for AVX-512 was not written (Zen 4 runs it as two halves); the f64 and window kernels are AVX2.
+* Placement: PTX `mma_ptx` (the `tc86::mma_avx2_chunked_f` loop) read 0.94x with equal instructions on this tree; it moves with any change before it in the library, recheck after merging.
+## Round sp3: the launch path, the API calls and startup (branch `sp3-launchrt`, base 03d92bd0)
+
+* **One pass over the environment per launch** (`include/vgpu/exec/launch_env.hpp`, `src/exec/launch_env.cpp`): `LaunchEnv` now holds the 16 variables a launch reads (the runtime's `VGPU_TRACE`, `VGPU_LOCKSTEP`, the PTX interpreter's strict/race/fastpath/max-steps/scheduler/threads/fail-injection ones, the SASS ones). `launch_kernel_impl` reads it once and hands it on in `LaunchConfig::env`; `Device::run_kernel`, `exec::launch`, `launch_grid` and the SASS `Runner` use it, and read their own when none was given (tests, other callers). Still read at every launch.
+* **PTX launch**: a thread keeps up to four `BlockState`s (`PooledBlock`; shared memory, barriers, tensor memory, the warps' register vectors) between blocks and launches; `BlockState::reset()` and `setup_block` give a block the state of a new one. The Interpreter's 6 KB of scratch lanes is no longer zeroed (each lane is written before it is read; the zero rows stay zero). `ParamBuffer` has no per-launch name table (a scan on the rare name lookup). Loads and stores skip `step()`/`dispatch()` (`step_mem`, only with the fast paths on). `Device::run_kernel` no longer reads the clock twice for a value nobody used.
+* **Startup**: the two 65536-entry half tables are `constexpr` (checked against the binary16 format by a `static_assert`) and the F16C check is made on first use; `EntryFn`/`Instr` move instead of copy when a vector grows (`noexcept` on `LazyByte`/`PollsFlag` copies, `static_assert`ed); the RDNA decode tables are made per generation at first use, not all four.
+* **AMD**: `hipDeviceGetAttribute` and the PCI bus calls answer from properties made once per device (`State::device_props`); the HIP calls a profiler may time read the clock for their start only when one is attached (`profile_clock`).
+* Tests (CMake-wired): `test_launch_env` (new variables), `test_ptx_block_reuse` (a block starts from nothing after other kernels on the thread; the environment pass given or not; parameters by name and position), `test_amd_hip_props_cache`, `test_amd_hip_profile_clock`; existing `test_amd_gcn`, `test_exec` cover the rest. Mutations that fail them: `case 'M'` dropped (test_launch_env); `bars`, `clock` not reset, shared memory not zeroed, the given pass ignored (test_ptx_block_reuse); a NaN table entry changed and `noexcept` removed (the `static_assert`s, build fails); `step_mem` without the load count (test_exec); `ParamBuffer::find` returning the wrong slot (test_ptx_block_reuse); the cache keyed by device 0 (test_amd_hip_props_cache); the clock read always (test_amd_hip_profile_clock: 160 reads unwatched against 80); RDNA2 given RDNA3's table (test_amd_gcn).
+* Results (B/A of medians, 9 runs, cpu 6, counters identical; A/A 0.99 to 1.01): PTX `launch` 1.35x, SASS `launch` 1.04x, `startup` SASS 1.12x and PTX 1.23x, PTX `mem` 1.05x, `shared` 1.09x, `atomics` 1.08x, `f32_fma` 1.06x, `mma_ptx` 1.07x, `f64_fma` 1.035x; AMD `apicheap` 3.7 to 4.0x, `startup` 1.11 to 1.17x (MI300X) and 1.40x (RX 6800), other AMD rows and canaries same.
+* Placement, not work (instructions equal, cycles up): `api` 0.98x (both engines), SASS `mma_ptx` 0.97x, `warp` 0.975x, `wmma` 0.92 to 0.98x between runs (`mma_avx2_chunked_f` moved from 48 to 0 mod 64; IPC 4.03 to 3.70), AMD `smem` mi300x 0.98x (cycles +1 to 2%). Re-check after merging with the other round-3 branches.
+* Not done: hidden visibility or `-Bsymbolic` to cut the 25% of SASS startup that is ld.so symbol hashing (the shims rely on one exported copy of the profiling readers); skipping `kernel_resources` for kernels that do not poll (about 2%); reusing the kernarg segment across AMD launches (changes allocation addresses); the SASS `unsupported()` pre-decode (20% of SASS startup, decides PTX fallback); a full micro form for ld/st beyond `step_mem`; merging the AMD queue's take/complete locks; telemetry's clock read per update (needed for its timestamp). The PTX parser (85% of PTX startup) is a 4000-line string chain: untouched.
+* Run: Release ctest of the PTX/SASS/AMD/cupti/profiling suites (all pass; `lint_curl_retries` fails only for want of `.git` on server3), ASan+UBSan -O0 and TSan -O1 on the touched unit tests (pass).
+## Round sp3: tensor cores, the leftovers (branch `sp3-tensor2`, base 03d92bd0 + sp2-lead)
+
+Measured on server3 (cpu 2 alone, user cycles by `perf_event_open`, `nvidia_tensor_bench`: the cheapest of 5 launches of R and 2R instructions, the difference over R;
+A = a build of the base tree, B = this branch; 5 to 11 alternating runs; A/A noise 1 to 2% in cycles). Counters identical in every bench.py row.
+
+* **Fragment decode** (`tile_mma.cpp`): one instantiation per element type; dense A/B are 16-byte runs copied into a raw tile and decoded in one pass (B transposed), the
+  sparse A places each lane's stored elements from the metadata nibble with every constant known at compile time (no `Lanes` copy); `mma_frag_a` takes `negate` (wgmma's
+  imm-scale-a) and `wgmma_sparse_expand` spreads decoded sparse rows from shared memory. Operand registers are gathered and scattered as whole 32-lane words
+  (`gather_words`/`scatter_words`) instead of widened to 64 bits and back.
+* **tcgen05**: f16 D, layouts F, B, G (`.ws`), A in Tensor Memory, sparse A and the block-scaled kinds (mxf8f6f4, mxf4, mxf4nvf4, UE8M0/UE4M3 factors, one scaled B per lane
+  partition with differing factors) through the tile kernels. **wmma.mma** generic shapes/types (m32n8k16, m8n32k16, s8/u8/s4/u4, f64, f16/f32 accumulators) and **mma m8n8k4 f16**
+  through them too. `tile_f32c` (new kernel entry): the f32 tile with canonical NaNs in the same pass (no separate pass in the wgmma/mma/tcgen05 routes).
+  `wgmma_smem_offset` is inline (a swizzled row is a power of two: shifts for divisions).
+* **AVX-512 level** (`Level::Avx512`, `src/simd/kernels512.inc`, off by default; `VGPU_SIMD=avx512`): tile_f32/f32c, tile_i32 (VNNI `vpdpwssd` from 64 columns, only when every operand is a 16-bit
+  number, else the multiplier form; odd `.sat` blocks too) and tile_f64 (fused, host rounding mode). `level()` still names Base/Avx2 (the JIT reads it); `kernels().level` names the table.
+  Kernel microbenchmark on Zen 4 (cycles/call, AVX2 -> AVX-512): f32 16x256x16 7797 -> 7277, 16x256x64 26539 -> 25867 (-3 to -7%: Zen 4 runs 512-bit as two 256-bit halves);
+  s32 16x256x32 19654 -> 10801, 16x128x32 7578 -> 5396 (VNNI); 16x8x32 507 -> 523 (VNNI packing costs 760 ns below 64 columns, so those stay on the multiplier form);
+  f64 8x8x4 131 -> 69, 16x8x16 821 -> 301. End to end (same binary, `VGPU_SIMD=avx512` against default): tcgen05 s8 0.63x, wgmma s8 0.89x, wgmma f16/tf32 0.94-0.95x, wgmma e4m3 1.02x,
+  tcgen05 sparse 1.04x, the rest 0.97-1.03x. Left off by default (mixed, and on this box only the int8 rows clearly gain); a CPU with native 512-bit units should gain more.
+
+### Results (B/A of median user cycles per warp instruction, `nvidia_tensor_bench`; every p <= 0.01 unless the row says same)
+| row | B/A | row | B/A |
+|---|---|---|---|
+| PTX mma f16/bf16/tf32 m16n8k8/k16, f32 acc, a10 | 0.76 to 0.85 | PTX mma f16/bf16/tf32 (h100) | 0.68 to 0.76 |
+| PTX mma s8 k16/k32/k32 sat | 0.55 / 0.54 / 0.56 | PTX mma s4 k64 / e4m3 k32 | 0.84 / 0.24 |
+| PTX mma f16 sparse k32 / s8 sparse k64 | 0.15 / 0.11 | PTX mma m8n8k4 f16 | 0.86 |
+| PTX wmma m32n8k16, m8n32k16 f16 | 0.24 | PTX wmma s8 m16n16k16 / f64 m8n8k4 | 0.22 / 0.41 |
+| PTX wgmma m64n128k16 f16 / bf16 / tf32 / e4m3 / s8 | 0.57 / 0.59 / 0.56 / 0.68 / 0.65 | wgmma m64n256k16 f16 | 0.61 |
+| tcgen05 m128n256k16 f16 f32 D / f16 D | 0.89 / 0.18 | tcgen05 layout F / layout B (ws) / sparse | 0.55 / 0.61 / 0.54 |
+| tcgen05 mxf8f6f4 m128n128k32 block-scaled | 0.04 (4.79 M -> 0.21 M cycles) | tcgen05 tf32 / e4m3 / s8 | 0.81 / 0.95 / 0.97 (same) |
+| SASS HMMA.SP.16832 | 0.16 | SASS QMMA e4m3 | 0.26 |
+| SASS IMMA.16816 / 16832 s8 | 0.78 / 0.78 | SASS HMMA dense 16816, 1688, IMMA s4 | 0.99 to 1.03 (unchanged code) |
+Canaries (bench.py, 11 runs, sass/ptx, counters identical): mma_ptx ptx 1.16x; wmma 1.04/1.01 (same); int_alu 0.99/0.99; f32_fma 1.00/0.99; f64_fma 1.00/1.01; mem 0.975/1.017;
+shared 1.01/0.99; atomics 0.99/0.975 (p 0.001); local 0.99/1.00; divergent 1.00/1.01; warp 0.99/1.02; launch 1.04/1.02; api 0.97/0.98 (p <= 0.01; api, atomics touch no code of this branch:
+the hot text moved with the size of earlier objects -- see below).
+
+### Tests (CMake-wired) and mutation checks
+`test_frag_decode` (+ `_simd_base`: every type, dense/sparse, selectors 0-3, negate, and `wgmma_sparse_expand`, against the element-at-a-time decode frozen in the test),
+`test_tcgen05_tiles` (240 forms: kinds x layouts x sparse/A in Tensor Memory/scale-d/block scaling against `VGPU_FASTPATH=0`), `test_wmma_generic_fast` (wmma shapes/types and mma.m8n8k4),
+`test_tile_mma` (tile_f32c, wrapping s32 on operands of any size, odd/short `.sat` blocks, 16-bit boundaries), the avx512 twins `test_{mma_fast,mma_tiles,wgmma_fast,tcgen05_tiles,wmma_generic_fast,tile_mma}_simd_avx512`;
+`test_wgmma_fast` now also negates A in registers. Mutants (a one-line edit of the tree, the tests run, killed = a test fails): decode 18/18 killed, tcgen05 route 22/22 killed (test_blackwell's card answers
+kill the scale-table mutants the fast-vs-slow comparison cannot see, both routes share them), gather/scatter + wgmma 5/5, avx512 kernels 14/14 (after adding second-of-a-pair operands outside 16 bits),
+wmma generic/m8n8k4/f32c 15 of 19: the four survivors are equivalent or common to both routes (a NaN in f64 C only, the m8n8k4 A/D layouts which fast and general share; the tf32 mutant sits in code
+removed afterwards: tf32 has no generic shape). A pure dispatch bug (tc86::mma sent AVX-512 to the scalar sum, 7x slower) has no bit-level test; it was found by the bench.
+Run: Release guards (amd same_bits/tier/matrix/mfma/nan_order and their `_simd_base` twins, `lint_*` but `lint_curl_retries` which needs a git checkout), ASan+UBSan -O0 and TSan -O1 (`setarch -R`) of the 11 touched unit tests
+including test_fastpath: clean. Not run: e2e_* (no nvcc on server3), e2e_host_atomics (no atomic or lock code touched).
+
+### Not done, and negative results
+* AVX-512 as default: mixed on Zen 4 (above). VNNI below 64 columns: 4x slower than the multiplier form (packing per call).
+* SASS/PTX `s4` decode is still scalar per nibble (IMMA 16864 unchanged, 4.6 K cycles); fp8 decode is a 256-entry table per element (QMMA 3.1 K cycles).
+* wmma.load/store generic shapes are one `load_routed` per element (not touched: counters and race hooks).
+* Placement: adding code anywhere before the interpreters moved their hot functions by 0x240-0x260 bytes and cost 3 to 10% on unchanged mma rows with identical instructions (misses/branch-misses moved);
+  64-byte alignment of the chunked kernels did not remove it (dropped); keeping the new decode templates and SASS `gmma_fast` in `.text.unlikely` did (f64 mma 1.09 -> 0.97, SASS mem 0.95 -> 0.975).
+## Round sp3: the AMD matrix path, scalar handlers by shape and the tier's no-ops (branch `sp3-amdscalar`, base 03d92bd0 + sp2-lead 2fd5a519)
+
+**Measured first** (perf `cycles:u`, one host thread, cpu 4 of server3, the bench-amd binaries of every target, `VGPU_THREADS=1`): in every matrix row `matrix_multiply_fast` (and `wmma_fast`) itself was 50 to 85% of the time and the tile kernels 8 to 25%: what dominated was the gather and scatter around the tile, not the arithmetic. `mfma_i8` was 85% decode; the C gather was a scalar store loop whose result the tile kernel then read as 32 bytes (GCC also built `movhps` to the stack and `movaps` back for it: a store-forwarding stall on 55% of one workload's samples). The other targets' binaries (gfx950, gfx1100, gfx1201) were compiled on server2 with the harness's flags and keyed as the harness keys them.
+
+### What changed
+* **C and D as runs** (`MatrixPlan::runs`, `run_*` helpers in `gcn_exec.cpp`): output r of the n lanes of a lane group is n consecutive elements of the tile, so C is read and D written as rows of 4 with SSE2 intrinsics (the compiler's own loops were the stall above); the old per-lane tables stay for any shape whose outputs are not runs (checked when the plan is built).
+* **Decode**: binary16, bfloat16, float and xf32 operands eight lanes at a time under AVX2 (`half8_to_double`: F16C, exact, a signalling NaN made quiet as `half_bits_to_double` does; gate `mfma_have_avx2()` + `f16c`, so `VGPU_SIMD=base` keeps the SSE2 path), A by 4x4 transposes and 32-byte stores, B in 32-byte rows; the 8-bit integer tiles widened in registers (`matrix_decode_a_i8` / `_b_i8`, SSE2); the double-precision tiles by rows (`matrix_decode_f64_*`); no per-instruction 64-lane identity loops.
+* **Tile kernels**: `mfma_tile_f_avx2` returns whether an output is a NaN (compared while the sums are in registers: the separate 256-element scan is gone); `mfma_tile_fma_avx2` (four columns a fused multiply-add; the fused result is exact, the width cannot show).
+* **WMMA** (`wmma_fast`): rows of D and C as runs of 16 lanes, per-architecture place tables (`wmma_place`) feeding the same decoders, integer C and D by rows (the sum wraps; CLAMP keeps its scalar loop).
+* **Tier** (`gcn_tier.cpp`): the scalar handlers of `TIER_S2` are also built for one-word scalar registers and constants (`s2_variants`, picked at decode), `s_cmp` per comparison and shape; `buffer_wbl2/inv/gl0_inv/gl1_inv...` (a fence and a count, `mach` 11), RDNA's `s_waitcnt_vscnt/vmcnt/expcnt/lgkmcnt`, `s_version` and the `s_wait_*` of RDNA4 as no-ops.
+
+### Results (B/A of medians, 9 alternating runs, one host thread, counters identical in every row; A = the sp2-lead build)
+| workload | mi300x | rx6800 | other |
+| --- | ---: | ---: | --- |
+| `mfma` | **1.81x** | | |
+| `mfma_bf16` | **1.71x** | | |
+| `mfma_i8` | **3.46x** | | |
+| `mfma_f64` / `mfma_f64_4b` | **1.98x / 1.94x** | | |
+| `smfmac`, `mfma_fp8` | 1.23x, 1.24x | | |
+| `mfma_f8f6f4`, `mfma_scale` (gfx950) | | | 1.03x, 1.04x |
+| `wmma` / `wmma_iu8` | | | gfx1100 **3.54x / 5.85x**, gfx1201 **3.48x / 7.55x** |
+| canaries `valu_int`, `valu_f32`, `valu_f64` | 0.99, 1.01, 1.03 | 1.02, 1.02, 1.01 | |
+| `wave`, `lds`, `divergent` | 1.03, 1.00, 1.02 | 1.03, 1.12, 1.01 | |
+| `smem` (scalar handlers) | 1.09 (p 0.01) | 1.08 (p < 0.001) | |
+| `launch`, `api` | 1.03, 1.00 | 0.98 (p 0.6), 0.99 | perf stat cycles equal within noise |
+Whole-process `perf stat` (cycles, instructions) on `mfma`: 1.80 G / 9.5 G to 0.97 G / 4.6 G.
+
+### Tests and mutations
+`test_amd_matrix_fast` (every matrix instruction of the corpora, tile path against the element-at-a-time reference, shuffled registers, all flavours), `test_amd_mfma_math` (new: every binary16 through `half8_to_double` against `half_bits_to_double`), `test_amd_gcn_tier_same_bits` (covers each new handler: every corpus shape with the tier off and on). Mutations (each built and run on server3, then reverted; all fail the named test):
+| # | mutation | result |
+| --- | --- | --- |
+| M1 | C gather's high pair of a 4-run taken from the low | `test_amd_matrix_fast` fails |
+| M2 | integer B's even/odd pair shuffle swapped | `test_amd_matrix_fast` fails |
+| M3 | `mfma_tile_fma_avx2` K=4 reads A's element 2 for 1 | `test_amd_matrix_fast` fails |
+| M4 | `half8_to_double` lane permute wrong | `test_amd_mfma_math` fails |
+| M5 | the tile kernel never reports a NaN | `test_amd_matrix_fast` fails (dropping only the last accumulator's check survives: another output of the tile is a NaN as well) |
+| M6 | D's high word of a double written to the low row | `test_amd_matrix_fast` fails |
+| M7 | WMMA integer D wraps where CLAMP is set | `test_amd_matrix_fast` fails |
+| M8 | `s_cmp_lt_u32` as `<=` | tier digest (`VGPU_TIER_ONLY=s_cmp_lt_u32`) fails |
+| M9 | the fence does not count a vector memory instruction | tier digest (`buffer_gl0_inv`) fails |
+| M10 | the register-register scalar read off by one | tier digest (`s_add_u32`) fails |
+
+Sanitizers: ASan+UBSan -O0 (`test_amd_mfma_math`, `test_amd_matrix_fast` 2248 s, `test_amd_gcn_same_bits`, `test_amd_gcn_tier_same_bits` 2685 s) and TSan -O1 (`test_amd_mfma_math`, `test_amd_matrix_fast`) pass; the Release guards (`gcn_same_bits`, `gcn_packed_`, `gcn_memory_`, `codeobject_same_bits`, `nan_order`, `mfma_math`, tier digest) pass, and `--check-counters` shows no drift on the 37 pairs.
+
+### Not done, and negative results
+* A hint slot for two-way branches: no workload shows a hint miss (branch-misses of `divergent`: 1.7 M of 740 M branches).
+* The per-instruction frame (counters, state flags): removing the four counter updates altogether gave 3 to 10% (valu_int 3%, smem 6%, divergent 10%), so batching them cannot give more; left.
+* `flat_*`, `buffer_load/store`, `global_atomic_*` in the tier: `flat` costs the same per instruction as `mem` (48 ns) already, the cost is the memory work, not the frame.
+* fp8/small-float decode by `vgatherdpd`: not tried, a gather costs about what the scalar table lookups do on Zen 4.
+* AVX-512 for the tiles: Zen 4 runs it as two 256-bit halves, nothing to show here.

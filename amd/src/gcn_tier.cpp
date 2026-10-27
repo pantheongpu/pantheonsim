@@ -1258,15 +1258,40 @@ int h_writelane(const Op& o, Regs& R) {
 
 // ---- Scalar handlers
 
-// Two sources, one destination, SCC from the result (where the instruction sets it).
-#define TIER_S2(name, ...)                                 \
-  int name(const Op& o, Regs& R) {                         \
-    [[maybe_unused]] const uint64_t a = rd(R, o.src[0]), b = rd(R, o.src[1]); \
-    uint64_t v = 0;                                        \
-    __VA_ARGS__;                                           \
-    wr(R, o.dst, v);                                       \
-    return true;                                           \
-  }
+// Two sources, one destination, SCC from the result (where the instruction sets it). Each is also built for the shapes of operands the
+// compilers' scalar code is nearly all made of -- 32-bit scalar registers and constants, no pair, no VCC or EXEC -- with the operand reads
+// and the write fixed at compile time (`s2_variants`, picked when the instruction is decoded): the general handler's switches on the
+// operand's kind cost about as much as the operation.
+// (Shapes: 1 a scalar register, one word; 2 a constant.)
+template <int K>
+[[gnu::always_inline]] inline uint64_t rd_k(const Regs& R, const Src& s) {
+  if constexpr (K == 1) return R.sgpr[s.index];
+  else if constexpr (K == 2) return s.value64;
+  else return rd(R, s);
+}
+template <int K>
+[[gnu::always_inline]] inline void wr_k(Regs& R, const Src& s, uint64_t v) {
+  if constexpr (K == 1) R.sgpr[s.index] = static_cast<uint32_t>(v);
+  else wr(R, s, v);
+}
+struct S2Variants {
+  Fn ss, sc, cc;   // (A a register, B a register), (A a register, B a constant), (both constants; a one-source handler's constant)
+};
+std::unordered_map<Fn, S2Variants>& s2_variants() {
+  static std::unordered_map<Fn, S2Variants> m;
+  return m;
+}
+#define TIER_S2_BODY(name, ka, kb, ...)                                                                                      \
+  [[maybe_unused]] const uint64_t a = rd_k<ka>(R, o.src[0]), b = rd_k<kb>(R, o.src[1]);                                       \
+  uint64_t v = 0;                                                                                                            \
+  __VA_ARGS__;                                                                                                               \
+  wr_k<(ka != 0 && kb != 0) ? 1 : 0>(R, o.dst, v);                                                                           \
+  return true;
+#define TIER_S2(name, ...)                                                                                                   \
+  int name(const Op& o, Regs& R) { TIER_S2_BODY(name, 0, 0, __VA_ARGS__) }                                                   \
+  template <int KA, int KB>                                                                                                  \
+  int name##_k(const Op& o, Regs& R) { TIER_S2_BODY(name, KA, KB, __VA_ARGS__) }                                             \
+  [[maybe_unused]] const bool name##_registered = (s2_variants()[name] = {name##_k<1, 1>, name##_k<1, 2>, name##_k<2, 2>}, true);
 #define TIER_SCC(v) (*R.scc = (v))
 TIER_S2(s_mov, v = a)
 TIER_S2(s_add_u32, {
@@ -1470,12 +1495,14 @@ int s_bitcmp(const Op& o, Regs& R) {
 enum ScalarCmp : uint32_t {
   kEqU32, kLgU32, kLtU32, kLeU32, kGtU32, kGeU32, kEqI32, kLgI32, kLtI32, kLeI32, kGtI32, kGeI32, kEqU64, kLgU64
 };
-int s_cmp(const Op& o, Regs& R) {
-  const uint64_t a = rd(R, o.src[0]), b = rd(R, o.src[1]);
+// (The comparison fixed at compile time, with the operand shapes of the S2 handlers: `s_cmp_pick`, when the instruction is decoded.)
+template <uint32_t Cmp, int KA, int KB>
+int s_cmp_k(const Op& o, Regs& R) {
+  const uint64_t a = rd_k<KA>(R, o.src[0]), b = rd_k<KB>(R, o.src[1]);
   const uint32_t x = static_cast<uint32_t>(a), y = static_cast<uint32_t>(b);
   const int32_t sx = static_cast<int32_t>(a), sy = static_cast<int32_t>(b);
   bool r = false;
-  switch (o.sub) {
+  switch (Cmp) {
     case kEqU32: r = x == y; break;
     case kLgU32: r = x != y; break;
     case kLtU32: r = x < y; break;
@@ -1493,6 +1520,29 @@ int s_cmp(const Op& o, Regs& R) {
   }
   *R.scc = r;
   return true;
+}
+int s_cmp(const Op& o, Regs& R) {
+  switch (o.sub) {
+#define TIER_CMP_CASE(c) case c: return s_cmp_k<c, 0, 0>(o, R);
+    TIER_CMP_CASE(kEqU32) TIER_CMP_CASE(kLgU32) TIER_CMP_CASE(kLtU32) TIER_CMP_CASE(kLeU32) TIER_CMP_CASE(kGtU32) TIER_CMP_CASE(kGeU32)
+    TIER_CMP_CASE(kEqI32) TIER_CMP_CASE(kLgI32) TIER_CMP_CASE(kLtI32) TIER_CMP_CASE(kLeI32) TIER_CMP_CASE(kGtI32) TIER_CMP_CASE(kGeI32)
+    TIER_CMP_CASE(kEqU64)
+#undef TIER_CMP_CASE
+    default: return s_cmp_k<kLgU64, 0, 0>(o, R);
+  }
+}
+// The handler for comparison `sub` over one-word scalar registers or constants (null where the shapes are not those).
+Fn s_cmp_pick(uint32_t sub, const Src& a, const Src& b) {
+  const auto reg = [](const Src& x) { return x.kind == kSgpr && !x.wide; };
+  const auto con = [](const Src& x) { return x.kind == kConst; };
+  if (sub > kGeI32) return nullptr;   // (the 64-bit ones read pairs)
+  static const Fn ss[12] = {s_cmp_k<kEqU32, 1, 1>, s_cmp_k<kLgU32, 1, 1>, s_cmp_k<kLtU32, 1, 1>, s_cmp_k<kLeU32, 1, 1>, s_cmp_k<kGtU32, 1, 1>, s_cmp_k<kGeU32, 1, 1>,
+                            s_cmp_k<kEqI32, 1, 1>, s_cmp_k<kLgI32, 1, 1>, s_cmp_k<kLtI32, 1, 1>, s_cmp_k<kLeI32, 1, 1>, s_cmp_k<kGtI32, 1, 1>, s_cmp_k<kGeI32, 1, 1>};
+  static const Fn sc[12] = {s_cmp_k<kEqU32, 1, 2>, s_cmp_k<kLgU32, 1, 2>, s_cmp_k<kLtU32, 1, 2>, s_cmp_k<kLeU32, 1, 2>, s_cmp_k<kGtU32, 1, 2>, s_cmp_k<kGeU32, 1, 2>,
+                            s_cmp_k<kEqI32, 1, 2>, s_cmp_k<kLgI32, 1, 2>, s_cmp_k<kLtI32, 1, 2>, s_cmp_k<kLeI32, 1, 2>, s_cmp_k<kGtI32, 1, 2>, s_cmp_k<kGeI32, 1, 2>};
+  if (reg(a) && reg(b)) return ss[sub];
+  if (reg(a) && con(b)) return sc[sub];
+  return nullptr;
 }
 
 // Divergence: keep EXEC, narrow it. sub 0: and, 1: or, 2: andn2.
@@ -2133,6 +2183,24 @@ void tier_classify(Inst& in) {
     f.run = h_never;
     return;
   }
+  // The caches' write-backs and invalidates (what a fence compiles to): every access here reaches memory directly, so the instruction is a fence of the
+  // host's order and a count.
+  if (in.enc == Enc::Mubuf) {
+    const std::string& nm = in.name;
+    if (nm == "buffer_wbl2" || nm == "buffer_inv" || nm == "buffer_wbinvl1" || nm == "buffer_wbinvl1_vol" || nm == "buffer_invl2" || nm == "buffer_gl0_inv" ||
+        nm == "buffer_gl1_inv") {
+      f.mach = 11;
+      f.run = h_never;
+    }
+    return;
+  }
+  // RDNA's separate wait counters in their SOPK form, and the ISA marker: nothing is outstanding to wait for (the scalar unit's count, as scalar_alu).
+  if (in.enc == Enc::Sopk && (in.name == "s_waitcnt_vscnt" || in.name == "s_waitcnt_vmcnt" || in.name == "s_waitcnt_expcnt" || in.name == "s_waitcnt_lgkmcnt" ||
+                              in.name == "s_version")) {
+    f.run = b_nop;
+    f.unit = kUnitSalu;
+    return;
+  }
   static const Entry kCarry = {Cat::Carry, 0, 0, 0, nullptr, 0};
   const Entry* ep = nullptr;
   if (vector_enc && in.name.find("_co_u32") != std::string::npos) {   // (carry_alu takes these first, under their own names)
@@ -2144,7 +2212,11 @@ void tier_classify(Inst& in) {
     if ((in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && eff == "v_lshl_add_u64") eff += "_g";
     const auto& tab = table();
     const auto it = tab.find(eff);
-    if (it == tab.end()) return;
+    if (it == tab.end()) {
+      // RDNA4's waits (s_wait_alu, s_wait_kmcnt, ...): no counter is ever outstanding (s_wait_loadcnt is in the table).
+      if (in.enc == Enc::Sopp && (in.flags & kInstSWait)) f.run = b_nop;
+      return;
+    }
     ep = &it->second;
   }
   const Entry& e = *ep;
@@ -2411,6 +2483,15 @@ void tier_classify(Inst& in) {
       for (size_t k = 0; k < in.src.size() && k < 3; ++k)
         if (!scalar_src(in.src[k], f.src[k])) return fail();
       f.run = e.fn;
+      // (the shapes the compilers' scalar code is made of: one-word registers and constants, no modifiers to look at)
+      const auto v = s2_variants().find(e.fn);
+      if (v != s2_variants().end() && f.dst.kind == kSgpr && !f.dst.wide) {
+        const auto reg = [](const Src& x) { return x.kind == kSgpr && !x.wide; };
+        const auto con = [](const Src& x) { return x.kind == kConst; };
+        if (e.arity == 1) f.run = reg(f.src[0]) ? v->second.ss : con(f.src[0]) ? v->second.cc : e.fn;
+        else if (e.arity == 2) f.run = reg(f.src[0]) && reg(f.src[1]) ? v->second.ss : reg(f.src[0]) && con(f.src[1]) ? v->second.sc
+                                       : con(f.src[0]) && con(f.src[1]) ? v->second.cc : e.fn;
+      }
       f.unit = kUnitSalu;
       return;
     }
@@ -2420,6 +2501,7 @@ void tier_classify(Inst& in) {
         if (!scalar_src(in.src[k], f.src[k])) return fail();
       f.sub = static_cast<uint32_t>(e.k);
       f.run = s_cmp;
+      if (const Fn pick = s_cmp_pick(f.sub, f.src[0], f.src[1])) f.run = pick;
       f.unit = kUnitSalu;
       return;
     }

@@ -19,6 +19,7 @@
 
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "vgpu/exec/launch_env.hpp"
 #include "vgpu/exec/lockstep.hpp"
 
 #include <map>
@@ -1144,7 +1145,13 @@ void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg
   // another needs to know (vgpu/exec/lockstep.hpp). The same figure cudaOccupancyMaxActiveBlocksPerMultiprocessor
   // gives, times the SMs.
   exec::LaunchConfig cfg = in_cfg;
-  if (!cfg.resident_blocks && exec::lockstep_mode() != exec::LockstepMode::Off) {
+  // The environment is read in one pass for the whole launch: the caller's (the runtime's), or one made here.
+  exec::LaunchEnv own_env;
+  if (!cfg.env) {
+    own_env = exec::read_launch_env();
+    cfg.env = &own_env;
+  }
+  if (!cfg.resident_blocks && exec::lockstep_mode(cfg.env->lockstep) != exec::LockstepMode::Off) {
     const uint64_t threads = uint64_t{cfg.block[0]} * cfg.block[1] * cfg.block[2];
     if (threads && threads <= profile_.limits.max_threads_per_block) {
       try {
@@ -1175,13 +1182,10 @@ void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg
   // live telemetry rather than freezing until it returns.
   uint32_t ord = static_cast<uint32_t>(physical_);
   telemetry::Publisher* pub = telemetry_;
-  auto start = std::chrono::steady_clock::now();
   const exec::LaunchStats st = exec::launch(fn, cfg, args, mem_, profile_, syms,
                [pub, ord](double dt) { pub->note_kernel(ord, dt); });
   report_counters(ordinal_, fn.name, cfg, st);
-  double busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   pub->note_kernel(ord, 0.0);
-  (void)busy;
 }
 
 void Runtime::publish_identity(const DeviceProfile& p, int ordinal) {

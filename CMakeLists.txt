@@ -261,6 +261,7 @@ add_library(vgpu STATIC
   src/simd/simd.cpp
   src/simd/lanes.cpp
   src/exec/scheduler.cpp
+  src/exec/launch_env.cpp
   src/exec/interpreter.cpp
   src/exec/libm.cpp
   src/exec/tile_mma.cpp
@@ -361,6 +362,9 @@ target_include_directories(amd_exec_bench PRIVATE amd/include)
 add_executable(amd_matrix_bench amd/tools/matrix-bench.cpp)
 target_link_libraries(amd_matrix_bench PRIVATE vgpu)
 target_include_directories(amd_matrix_bench PRIVATE amd/include)
+# What one tensor-core instruction costs the simulator, PTX and SASS (nvidia/tools/tensor-bench.cpp).
+add_executable(nvidia_tensor_bench nvidia/tools/tensor-bench.cpp)
+target_link_libraries(nvidia_tensor_bench PRIVATE vgpu)
 # librocprofiler-sdk: rocprofiler-sdk's interface over the HIP shim, so AMD's
 # profiler (rocprofv3) runs unmodified on a simulated GPU. It sits beside
 # libamdhip64 in build/shim, where a tool linked to librocprofiler-sdk.so.1
@@ -1315,6 +1319,8 @@ vgpu_unit_test(test_fastpath)
 vgpu_unit_test(test_ptx_mem_runs)
 # The batches of a diverged warp's instructions (one path at a time, while it is the one select_path would pick), against one at a time.
 vgpu_unit_test(test_ptx_paths)
+# The PTX interpreter's pool of block states and the launch's one pass over the environment: a block starts from nothing after any other.
+vgpu_unit_test(test_ptx_block_reuse)
 # The host threads that run a grid's blocks, kept between launches: reuse,
 # nesting, several callers, fork; and the same kernels at 1, 2 and N threads.
 vgpu_unit_test(test_worker_pool)
@@ -1340,6 +1346,9 @@ vgpu_unit_test(test_locallayout)
 vgpu_unit_test(test_memrmw_lockfree)
 # The closed forms of the sector and bank-pass counters, against the definition of what they count.
 vgpu_unit_test(test_memcount_forms)
+# (the same on the baseline SIMD level: the AVX2 sector window is then absent and the scalar forms count alone)
+add_test(NAME test_memcount_forms_simd_base COMMAND test_memcount_forms)
+set_tests_properties(test_memcount_forms_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base" TIMEOUT 1500)
 # The single-lookup atomic read-modify-write and the one-lookup texel read, against the per-access code they replace.
 vgpu_unit_test(test_atom_rmw)
 # Module::code_at (a binary search over the code sections) against the scan it replaced.
@@ -1363,11 +1372,26 @@ vgpu_unit_test(test_tile_mma)
 vgpu_unit_test(test_wgmma_fast)
 # tcgen05.mma reading its operands whole from shared memory against the element reads, bit for bit.
 vgpu_unit_test(test_tcgen05_fast)
+# tcgen05.mma through the tile kernels for the forms the whole-operand route leaves to the row loop (f16 D, layouts F, B, G, A in Tensor Memory, sparse A,
+# block scaling), against the row loop (VGPU_FASTPATH=0), bit for bit.
+vgpu_unit_test(test_tcgen05_tiles)
+# wmma.mma on the shapes and types the 16x16x16 f16/bf16 tile does not take, through the tile kernels, against the general form (VGPU_FASTPATH=0), bit for bit.
+vgpu_unit_test(test_wmma_generic_fast)
+# The routes that run the tile kernels, again with the AVX-512 table selected (VGPU_SIMD=avx512; a host without it runs them at AVX2): the engines'
+# results against their general forms must not move a bit with the level.
+foreach(_t test_mma_fast test_mma_tiles test_wgmma_fast test_tcgen05_tiles test_wmma_generic_fast test_tile_mma)
+  add_test(NAME ${_t}_simd_avx512 COMMAND ${_t})
+  set_tests_properties(${_t}_simd_avx512 PROPERTIES ENVIRONMENT "VGPU_SIMD=avx512")
+endforeach()
 # The PTX engine's tile route for the other mma.sync forms against the general form, bit for bit.
 vgpu_unit_test(test_mma_tiles)
 # The SASS executor's tile route for the MMA forms its SIMD HMMA kernel does not take, against its general form (the kernels off in a second run).
 vgpu_unit_test(test_sass_mma_tiles)
 target_compile_definitions(test_sass_mma_tiles PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The mma fragment decode against the element-at-a-time form it replaced (frozen in the test), bit for bit; and again on the baseline kernels.
+vgpu_unit_test(test_frag_decode)
+add_test(NAME test_frag_decode_simd_base COMMAND test_frag_decode)
+set_tests_properties(test_frag_decode_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base")
 # Distributed shared memory: blocks of a cluster reaching each other's.
 vgpu_unit_test(test_dsmem)
 # The CTA's sixteen barriers: counts, bar.arrive, and a barrier that cannot complete.
@@ -1714,6 +1738,20 @@ target_link_libraries(test_amd_hip_async_inline PRIVATE vgpuhip)
 target_include_directories(test_amd_hip_async_inline PRIVATE tests/framework amd/include)
 add_test(NAME test_amd_hip_async_inline COMMAND test_amd_hip_async_inline)
 set_tests_properties(test_amd_hip_async_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# A call a profiler may time reads the clock for its start only when one is attached (counted through a clock_gettime of the test's own).
+add_executable(test_amd_hip_profile_clock amd/tests/unit/test_hip_profile_clock.cpp)
+target_link_libraries(test_amd_hip_profile_clock PRIVATE vgpuhip vgpu)
+target_include_directories(test_amd_hip_profile_clock PRIVATE amd/include)
+set_target_properties(test_amd_hip_profile_clock PROPERTIES ENABLE_EXPORTS ON)
+add_test(NAME test_amd_hip_profile_clock COMMAND test_amd_hip_profile_clock)
+set_tests_properties(test_amd_hip_profile_clock PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# A device's properties are made at the first question and kept: each ordinal answers for itself, as the full structure says.
+add_executable(test_amd_hip_props_cache amd/tests/unit/test_hip_props_cache.cpp)
+target_link_libraries(test_amd_hip_props_cache PRIVATE vgpuhip)
+add_test(NAME test_amd_hip_props_cache COMMAND test_amd_hip_props_cache)
+set_tests_properties(test_amd_hip_props_cache PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
 # A synchronization gives back what the stream-ordered pools keep beyond their release thresholds.
 add_executable(test_amd_hip_pool_sync amd/tests/unit/test_hip_pool_sync.cpp)

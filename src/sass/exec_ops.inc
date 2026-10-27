@@ -4255,16 +4255,25 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const unsigned d0 = static_cast<unsigned>(word.field(16, 8)), d1 = static_cast<unsigned>(word.field(64, 8));
   const unsigned mask = static_cast<unsigned>(word.field(72, 4));
   const bool int_coords = ins.op == Op::TLD;
+  // The fetch of every lane: what does not change from lane to lane is set once, and what does is set by each lane (a
+  // fresh TexFetch per lane was an 80-byte `rep stos`, with its start-up cost, in front of every fetch).
+  exec::TexFetch f;
+  // ptxas fetches a 1D texture as a 2D one at y = 0, which is what the
+  // hardware makes of it (a 2D texture of height 1); the sampler's 1D
+  // fetch is that already.
+  f.dims = dims == 2 && !layered && d.height == 0 && d.depth == 0 ? 1 : dims;
+  f.layered = layered;
+  f.cube = cube;
+  f.float_coords = !int_coords;
+  f.float_result = d.kind == exec::ChannelKind::Float || d.read_as_normalized_float;
+  f.grad = txd;
+  if (ins.op == Op::TLD4) f.gather = static_cast<int>(ins.f[2]);
   each_lane(ex, [&](unsigned l) {
     uint32_t comp[7] = {};   // a cube array's layer, x, y, z, then the LOD, offsets and reference
     for (unsigned i = 0; i < total; ++i) comp[i] = i < in0 ? rd(r0 + i, l) : rd(r1 + (i - in0), l);
-    exec::TexFetch f;
-    // ptxas fetches a 1D texture as a 2D one at y = 0, which is what the
-    // hardware makes of it (a 2D texture of height 1); the sampler's 1D
-    // fetch is that already.
-    f.dims = dims == 2 && !layered && d.height == 0 && d.depth == 0 ? 1 : dims;
-    f.layered = layered;
-    f.cube = cube;
+    f.layer = 0;
+    f.explicit_lod = false;
+    f.lod = 0;
     unsigned k = 0;
     if (layered && !txd) f.layer = comp[k++];
     for (unsigned i = 0; i < dims; ++i) f.coord[i] = comp[k++];
@@ -4272,7 +4281,6 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     if (txd) {
       // ddx.x, ddy.x, ddx.y, ddy.y in four registers from the one at 32 (the second pair only for a 2D texture).
       const unsigned gr = static_cast<unsigned>(word.field(32, 8));
-      f.grad = true;
       f.ddx[0] = rd(gr, l);
       f.ddy[0] = rd(gr + 1, l);
       if (dims >= 2) {
@@ -4280,7 +4288,6 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         f.ddy[1] = rd(gr + 3, l);
       }
     }
-    f.float_coords = !int_coords;
     // TEX.NDV on a 3D texture, with no LOD operand: the level comes from the coordinates of the quad this thread is
     // in -- threads 0, 1 and 2 of it are P, P + dPdx and P + dPdy, the way ptxas builds tex.grad (the threads
     // below the fetch's own are helpers, see BMOV.PQUAD MACTIVE).
@@ -4306,9 +4313,8 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
       f.explicit_lod = true;
       f.lod = static_cast<double>(exec::tex_grad::lod_q_3d(dq[0], dq[1])) / 256.0;
     }
-    // The result's type is the texture's (its format and read mode), not
-    // the instruction's: SASS has one TEX for every PTX destination type.
-    f.float_result = d.kind == exec::ChannelKind::Float || d.read_as_normalized_float;
+    // (The result's type is the texture's -- its format and read mode -- not the instruction's: SASS has one TEX for
+    // every PTX destination type.)
     if (has_lod) {
       f.explicit_lod = true;
       f.lod = int_coords ? static_cast<double>(static_cast<int32_t>(comp[k])) : static_cast<double>(std::bit_cast<float>(comp[k]));
@@ -4327,7 +4333,6 @@ void Runner::exec_tex(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     // A depth reference (DC) is in the register after: CUDA gives a texture no
     // depth-compare state, so it changes nothing (see the PTX engine).
     (void)has_dc;
-    if (ins.op == Op::TLD4) f.gather = static_cast<int>(ins.f[2]);
     uint32_t out[4];
     exec::texture_fetch(mem_, d, f, out);
     // The fault predicate (81-83), set when the texel is NOT resident (ptxas's SEL turns it round for
@@ -4551,7 +4556,6 @@ bool Runner::gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const Gmm
   const unsigned nregs = f16_acc ? N / 4 : N / 2;   // accumulator registers
   const unsigned Kp = f.sparse ? K / 2 : K;
   const unsigned abits = 8 * exec::tile_elem_bytes(f.at);
-  const unsigned stored = abits == 32 ? 1 : 2;
   const unsigned rd = ins.dst[0].reg, rc = ins.src[f.reg_a ? 2 : 1].reg;
   const uint32_t row0 = (w.index % 4) * 16;
   const std::pair<uint32_t, uint64_t> key{w.index / 4, w.gmma_issued};
@@ -4591,42 +4595,31 @@ bool Runner::gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const Gmm
   uint32_t meta[32] = {};
   if (f.sparse) {
     const unsigned mr = ins.f[7] & 0xff;
-    for (unsigned l = 0; l < 32; ++l) meta[l] = mr == kRZ ? 0 : w.reg(mr, l);
+    if (mr != kRZ) std::memcpy(meta, &w.reg(mr, 0), 32 * sizeof(uint32_t));
   }
   thread_local std::vector<float> Af;
   thread_local std::vector<int32_t> Ai;
   // This warp's 16 x K slice of A.
-  if (f.int_form) Ai.assign(size_t{16} * K, 0);
-  else Af.assign(size_t{16} * K, 0.0f);
+  if (f.int_form) Ai.resize(size_t{16} * K);
+  else Af.resize(size_t{16} * K);
   if (f.reg_a) {
-    // mma.m16n8kK's A fragment (mma.sp's, sparse).
-    const unsigned ra = ins.src[0].reg, per_reg = 32 / abits, cpr = per_reg / stored;
-    for (unsigned r = 0; r < 4; ++r)
-      for (unsigned l = 0; l < 32; ++l) {
-        const unsigned g = l / 4, t = l % 4, row = g + (r % 2) * 8, col0 = t * per_reg + (r / 2) * (per_reg * 4);
-        const uint32_t v = ra == kRZ ? 0 : w.reg(ra + r, l);
-        for (unsigned e = 0; e < per_reg; ++e) {
-          const unsigned col = f.sparse ? exec::mma_sparse_column(abits, K, f.sel, meta, row, t * cpr + (r / 2) * 4 * cpr + e / stored, e % stored)
-                                        : col0 + e;
-          if (col >= K) continue;
-          const uint32_t raw = v >> (abits * e);
-          if (f.int_form) {
-            const int32_t x = exec::tile_decode_i32(f.at, raw);
-            Ai[row * K + col] = f.neg_a ? -x : x;
-          } else {
-            Af[row * K + col] = std::bit_cast<float>(std::bit_cast<uint32_t>(exec::tile_decode_f32(f.at, raw)) ^ (f.neg_a ? 0x80000000u : 0u));
-          }
-        }
-      }
+    // mma.m16n8kK's A fragment (mma.sp's, sparse): the four registers from Ra (an RZ base reads as zeros).
+    const unsigned ra = ins.src[0].reg;
+    alignas(32) uint32_t xa[4 * 32] = {};
+    if (ra != kRZ)
+      for (unsigned r = 0; r < 4; ++r) std::memcpy(xa + r * 32, &w.reg(ra + r, 0), 32 * sizeof(uint32_t));
+    exec::mma_frag_a(exec::frag_type_of(f.at), 16, K, f.sparse, xa, meta, f.sel, f.int_form ? nullptr : Af.data(), f.int_form ? Ai.data() : nullptr, f.neg_a);
   } else {
     if (f.int_form ? snap.Ai.empty() : snap.Af.empty()) fault(w, ins, 0, "the warps of a warpgroup disagree on where A is", Err::UnsupportedPtx);
-    for (uint32_t r = 0; r < 16; ++r)
-      for (uint32_t j = 0; j < Kp; ++j) {
-        const uint32_t col = f.sparse ? exec::mma_sparse_column(abits, K, f.sel, meta, r, j / stored, j % stored) : j;
-        if (col >= K) continue;
-        if (f.int_form) Ai[r * K + col] = snap.Ai[size_t{row0 + r} * Kp + j];
-        else Af[r * K + col] = snap.Af[size_t{row0 + r} * Kp + j];
-      }
+    if (f.sparse) {
+      // (the stored elements are 32-bit values either way: a float's bits or an int32)
+      if (f.int_form) exec::wgmma_sparse_expand(abits, K, f.sel, meta, reinterpret_cast<const uint32_t*>(&snap.Ai[size_t{row0} * Kp]), reinterpret_cast<uint32_t*>(Ai.data()));
+      else exec::wgmma_sparse_expand(abits, K, f.sel, meta, reinterpret_cast<const uint32_t*>(&snap.Af[size_t{row0} * Kp]), reinterpret_cast<uint32_t*>(Af.data()));
+    } else if (f.int_form) {
+      std::memcpy(Ai.data(), &snap.Ai[size_t{row0} * K], size_t{16} * K * sizeof(int32_t));
+    } else {
+      std::memcpy(Af.data(), &snap.Af[size_t{row0} * K], size_t{16} * K * sizeof(float));
+    }
   }
   // scale-d: stored as 7 - UPn (and a not); false means D = A*B.
   const unsigned up = ins.f[6] & 7;
@@ -4650,13 +4643,18 @@ bool Runner::gmma_fast(Block& blk, Warp& w, const Instr& ins, Mask ex, const Gmm
     Cf.resize(size_t{16} * N);
     Df.resize(size_t{16} * N);
     exec::wgmma_acc_to_tile(cw.data(), N, f16_acc, Cf.data());
-    simd::kernels().tile_f32(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
-    exec::wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data());
+    simd::kernels().tile_f32c(16, N, K, Af.data(), snap.Bf.data(), Cf.data(), N, Df.data(), N);
+    exec::wgmma_tile_to_acc(Df.data(), N, f16_acc, dw.data(), true);
   }
-  if (rd != kRZ)
-    each_lane(ex, [&](unsigned l) {
-      for (unsigned s = 0; s < nregs; ++s) w.reg(rd + s, l) = dw[size_t{s} * 32 + l];
-    });
+  if (rd != kRZ) {
+    if (ex == 0xffffffffu) {
+      for (unsigned s = 0; s < nregs; ++s) std::memcpy(&w.reg(rd + s, 0), &dw[size_t{s} * 32], 32 * sizeof(uint32_t));
+    } else {
+      each_lane(ex, [&](unsigned l) {
+        for (unsigned s = 0; s < nregs; ++s) w.reg(rd + s, l) = dw[size_t{s} * 32 + l];
+      });
+    }
+  }
   snap.taken |= static_cast<uint8_t>(1u << (w.index % 4));
   if (snap.taken == 0xF) blk.gmma.erase(it);
   return true;
@@ -4897,8 +4895,8 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
         exec::mma_frag_a(ta, M, K, is_sparse, xa, meta, ins.f[7], fa, nullptr);
         exec::mma_frag_b(tb, K, xb, fb, nullptr);
         exec::wgmma_acc_to_tile(xc, kN, acc == AccF16, fc);
-        simd::kernels().tile_f32(M, kN, K, fa, fb, fc, kN, fd, kN);
-        exec::wgmma_tile_to_acc(fd, kN, acc == AccF16, xd);
+        simd::kernels().tile_f32c(M, kN, K, fa, fb, fc, kN, fd, kN);
+        exec::wgmma_tile_to_acc(fd, kN, acc == AccF16, xd, true);
         store(c_n);
         return;
       }

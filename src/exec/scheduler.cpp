@@ -139,6 +139,10 @@ const char* scheduler_name(SchedulerKind kind) {
 
 bool scheduler_from_env(SchedulerKind* kind, uint64_t* seed) {
   const char* mode = std::getenv("VGPU_SCHEDULER");
+  return scheduler_from_env(kind, seed, mode, mode && mode[0] ? std::getenv("VGPU_SCHEDULER_SEED") : nullptr);
+}
+
+bool scheduler_from_env(SchedulerKind* kind, uint64_t* seed, const char* mode, const char* seed_value) {
   if (!mode || !mode[0]) return false;
   const std::string m(mode);
   if (m == "deterministic") *kind = SchedulerKind::Deterministic;
@@ -149,8 +153,7 @@ bool scheduler_from_env(SchedulerKind* kind, uint64_t* seed) {
                       "' is not a scheduler; expected deterministic, random or adversarial. "
                       "Running the default instead would mean a result nobody could attribute "
                       "to an execution order");
-  if (const char* s = std::getenv("VGPU_SCHEDULER_SEED"); s && s[0])
-    *seed = std::strtoull(s, nullptr, 10);
+  if (seed_value && seed_value[0]) *seed = std::strtoull(seed_value, nullptr, 10);
   return true;
 }
 

@@ -806,7 +806,7 @@ __attribute__((target("avx2"))) inline void mma_avx2(unsigned M, unsigned N, uns
 inline void mma(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, bool acc_f16, const float* A, size_t lda, const float* B,
                 size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
 #ifdef VGPU_TC86_AVX2
-  if (N % 8 == 0 && simd::enabled() && simd::kernels().level == simd::Level::Avx2) {
+  if (N % 8 == 0 && simd::enabled() && simd::kernels().level != simd::Level::Base) {
     if (!acc_f16) {
       mma_avx2(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);
       return;

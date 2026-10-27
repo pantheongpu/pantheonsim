@@ -149,7 +149,19 @@ int tier_acc(Wave& w, const Inst& in) {
   return 1;
 }
 
-// The instructions the tier hands to the Machine, by Op::mach: 3 s_barrier, 6 s_endpgm, 7 scalar memory, 8 packed halves, 10 the accumulation register moves, else a global access.
+// A write-back or an invalidate of the caches (buffer_wbl2, buffer_inv, buffer_gl0_inv, ...): a fence, counted as a vector memory instruction, as step_interp has it.
+int tier_fence(Wave& w, const Inst& in) {
+  InstructionCounts& n = stats.counts;
+  ++n.mix[static_cast<int>(in.mix)];
+  n.mops[static_cast<int>(in.mops_type)] += in.mops;
+  w.pc += in.size;
+  ++stats.instructions;
+  ++n.vmem;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  return 1;
+}
+
+// The instructions the tier hands to the Machine, by Op::mach: 3 s_barrier, 6 s_endpgm, 7 scalar memory, 8 packed halves, 10 the accumulation register moves, 11 a cache fence, else a global access.
 int tier_mach(Wave& w, Group& g, const Inst& in) {
   switch (in.fast.mach) {
     case 3: return tier_barrier(w, in);
@@ -157,6 +169,7 @@ int tier_mach(Wave& w, Group& g, const Inst& in) {
     case 7: return tier_smem(w, in);
     case 8: return tier_pkf16(w, in);
     case 10: return tier_acc(w, in);
+    case 11: return tier_fence(w, in);
     default: return tier_global(w, g, in);
   }
 }
