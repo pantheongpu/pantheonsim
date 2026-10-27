@@ -271,8 +271,21 @@ struct OpVote { VoteMode mode = VoteMode::All; bool ballot = false; Reg dst; Reg
                 bool has_members = false; Operand members; };  // vote.sync's membermask
 // redux.sync.<op>.<type> d, a, membermask -- reduce a across the participating
 // lanes of the warp and give every one of them the result.
-enum class ReduxOp { Add, Min, Max, And, Or, Xor };
-struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; Operand members; };
+//
+// Extension (patch E7, for a frontend that does not read PTX; the PTX parser still makes only the integer reduce forms):
+//  - ReduxOp::Mul, and float types (f16, f32, f64) for Add, Mul, Min and Max (And/Or/Xor stay integer-only). A float
+//    step is the engine's own float add/mul/min/max (NaN in one operand loses to the other for min/max, the canonical
+//    NaN otherwise), applied in increasing lane order, so a float result does not depend on how the host schedules it.
+//  - `mode`: Reduce (every participating lane gets the reduction of all of them), Inclusive (lane L gets the
+//    reduction of the participating lanes <= L) or Exclusive (the participating lanes < L; the first participating
+//    lane gets the operation's identity).
+//  - `cluster` (Reduce only; 0 = the whole warp): the reduction is over each aligned run of `cluster` lanes
+//    separately (a power of two, at most the warp width).
+// Participation is the executing lanes (the active mask), as for the integer form.
+enum class ReduxOp { Add, Min, Max, And, Or, Xor, Mul };
+enum class ReduxMode { Reduce, Inclusive, Exclusive };
+struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; Operand members;
+                 ReduxMode mode = ReduxMode::Reduce; uint32_t cluster = 0; };
 // cvt.rn.f16x2.f32 d, a, b -- convert two f32 and pack them into one register,
 // a in the high half and b in the low half.
 // cvt.{rn,rz}[.relu][.satfinite].{f16x2,bf16x2}.f32 d, a, b.
@@ -1234,10 +1247,34 @@ struct OpSpDecompress {
   std::vector<Operand> mdata, cdata;
 };
 
+// Host-library math (patch E6): the OpenCL.std functions computed by the C library. `ty` is the floating-point type
+// of `a` (and `b` where the function takes a second floating-point operand) and of the result, f16, f32 or f64;
+// Ilogb's result is a 32-bit integer; the integer operand of Ldexp and Pown is a 32-bit signed integer in `b`.
+// Semantics and the determinism statement: include/vgpu/exec/libm.hpp. `ftz` (f32): subnormal operands and results
+// to signed zero.
+enum class LibmFn : uint8_t {
+  Acos, Acosh, Asin, Asinh, Atan, Atan2, Atanh, Cbrt, Cos, Cosh, Erf, Erfc, Exp, Exp2, Exp10, Expm1, Fdim, Fmod, Hypot,
+  Ilogb, Ldexp, Lgamma, Log, Log2, Log10, Log1p, Logb, Nextafter, Pow, Pown, Powr, Remainder, Sin, Sinh, Tan, Tanh,
+  Tgamma,
+  Round,   // halfway cases away from zero (OpenCL round); exact, so no libm accuracy is involved
+};
+inline constexpr unsigned kLibmFnCount = static_cast<unsigned>(LibmFn::Round) + 1;
+struct OpLibm { LibmFn fn = LibmFn::Exp; Type ty; bool ftz = false; Reg dst; Operand a; Operand b; };
+
+// Work-group collective (patch E8): every thread of the block contributes `a` and every thread gets the answer. It
+// is a rendezvous like bar.red's: it completes when every live warp of the block has arrived, so it is a barrier too,
+// and all the warps of the block must reach it. The combine is a sequential walk in increasing linear thread id
+// (x fastest) over the threads that contribute, so a float result is the same on every run. Reduce: the reduction
+// of all; InclusiveScan / ExclusiveScan: of the threads <= / < this one (the first thread's exclusive result is the
+// identity of the operation); Broadcast: the value `a` of the thread whose linear id is `b` (the same for all
+// threads; a value no thread contributed reads as zero). `op` and `ty` follow OpRedux (integers and f16/f32/f64).
+enum class WgKind { Reduce, InclusiveScan, ExclusiveScan, Broadcast };
+struct OpWgCollective { WgKind kind = WgKind::Reduce; ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand a; Operand b; };
+
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpTxq, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpIsTypep, OpStBulk, OpStack,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBrx, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy, OpSpCompress, OpSpDecompress, OpPackedInt, OpF8x4Arith>;
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy, OpSpCompress, OpSpDecompress, OpPackedInt, OpF8x4Arith, OpLibm, OpWgCollective>;
 
 // An instruction of the commonest, simplest forms, decoded once at parse time
 // for the interpreter's inner loop. The general Instr is ~1 KB of variant and
