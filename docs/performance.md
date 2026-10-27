@@ -4878,3 +4878,32 @@ Sanitizers: ASan+UBSan -O0 (`test_amd_mfma_math`, `test_amd_matrix_fast` 2248 s,
 * `flat_*`, `buffer_load/store`, `global_atomic_*` in the tier: `flat` costs the same per instruction as `mem` (48 ns) already, the cost is the memory work, not the frame.
 * fp8/small-float decode by `vgatherdpd`: not tried, a gather costs about what the scalar table lookups do on Zen 4.
 * AVX-512 for the tiles: Zen 4 runs it as two 256-bit halves, nothing to show here.
+
+## Round sp4: the SASS tier's run ends and diverged warps (branch `sp4-sassctl`, base 53721cb2)
+
+Profiled first (A build, one host thread, `cycles:u`): `divergent` is 3.59 M runs of 2.8 warp instructions, about 100 cycles a warp instruction at IPC 3.5, branch misses 1% of
+branches, no L1i misses: bound by instructions per run, not by stalls. `Runner::step_warp` (the tier's run loop inlined) was 50% of it, `pick_group_avx2` 13%, `blend_m_k` 8%.
+`warp` is 1.28 M runs of 4 instructions, `step_warp` 33%, `shfl_move` 9%, `h_vote` 7.5%.
+
+* **Known address** (`tier_run_t`, the chain): a run that ends by giving every lane of its group one address (a branch all the group takes or none, a handler-ended
+  instruction such as SHFL or VOTE, BSSY, NOP) knows it; when no runnable lane stands outside the group the next group is the runnable lanes at that address and the 32 addresses
+  are not read back. `warp` about 1.12x of its own.
+* **VOTE** with a full warp writes the ballot as vector stores, not a loop over the lanes' bits: `warp` about 1.06x.
+* **A branch's addresses for a partial group** (`sasslanes::set_pcs_partial`, `select_pcs`, `src/simd/lanes.cpp`): AVX2 load, blend, store of four lanes at a time, from a table of
+  the sixteen nibble masks; the per-lane loops they replace had a trip count no predictor learns. `divergent` 1.12x. NOTE: the first version used `vpmaskmovq` stores and was
+  slower than the loop (10% of `divergent` in the two functions, `divergent` 1.00x): masked stores are slow on Zen 4.
+
+Result (B/A of medians, 11 alternating runs, cpu 0, counters identical, noise from A/A 0.98x to 1.04x): `warp` sass 1.184x, `divergent` sass 1.130x (both p < 0.001); every canary row
+(sass and ptx) within the A/A noise except `wmma` sass 0.962x and `mma_ptx` sass 0.955x (15 runs, p 0.000 and 0.016). Those two run in `mma_avx2_chunked_f` (70% of the cycles, code this branch
+does not touch) with 1% fewer instructions and 3 to 5% more cycles: a code-placement effect (the build without the blend piece has the same cycles as A (perf stat); a 16-byte frame pad in `step_warp`, whose
+frame shrank by 16 bytes, and 64-byte alignment of the two new functions did not remove it). Not understood further.
+
+Tests (CMake-wired): `test_sass_lanes` `set_pcs_and_select_pcs_agree_with_the_lane_loop`; `test_sass_block_reuse` (hand-encoded SASS, decode checked) `a_full_warp_vote_gives_every_lane_the_ballot` and
+`a_diverged_warp_votes_among_the_lanes_that_run_it` (a split warp, a partial vote). Mutations, each caught: the known address `here + 32` (5 of 6 tests of `test_sass_block_reuse` fail), the vote fill
+`ballot ^ (l == 5)`, `select_pcs` with target and next swapped, the nibble mask `& 7` in `set_pcs_avx2`.
+
+### Not done, and negative results (this branch)
+
+* *BSYNC's arrival mask worked out before the wait stores* (to avoid reading the wait arrays back from byte and word stores in flight): A/B against the tree with it, `divergent` 0.981x without it (p 0.23): not a win, dropped.
+* *`shfl_move` Down and Up as SSE2 vectors* (unaligned loads inside the row, gathers at the edges): `warp` 1.017x (p 0.042, under 2%), dropped.
+* *`vpmaskmovq` for the partial pc stores*: slower than the loop on Zen 4, see above.
