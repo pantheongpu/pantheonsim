@@ -2405,6 +2405,15 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_capture_gate PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# A device-to-device copy through a buffer that is not zero-filled, and the context fault read without the API lock.
+if(TARGET vgpucudart)
+  add_executable(test_runtime_d2d_scratch nvidia/tests/unit/test_runtime_d2d_scratch.cpp)
+  target_link_libraries(test_runtime_d2d_scratch PRIVATE vgpucudart)
+  target_include_directories(test_runtime_d2d_scratch PRIVATE tests/framework include ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_runtime_d2d_scratch COMMAND test_runtime_d2d_scratch)
+  set_tests_properties(test_runtime_d2d_scratch PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
 # Enum parameters that carry values the enum does not declare: answered with an error code, never loaded as the enum.
 if(TARGET vgpucudart AND TARGET vgpucuda)
   add_executable(test_api_enum_args nvidia/tests/unit/test_api_enum_args.cpp)
