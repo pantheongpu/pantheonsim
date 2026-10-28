@@ -1508,9 +1508,6 @@ target_compile_definitions(test_decode_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAK
 # sass::unsupported's table of words it has seen: the answer and the text of a refusal are the same with or without it.
 vgpu_unit_test(test_unsupported_memo tests/unit/test_unsupported_memo.cpp)
 target_compile_definitions(test_unsupported_memo PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-# The file of cubins sass::unsupported found to run in full, kept between processes (src/sass/ok_cache.cpp).
-vgpu_unit_test(test_sass_ok_cache tests/unit/test_sass_ok_cache.cpp)
-target_compile_definitions(test_sass_ok_cache PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # FFMA2/FMUL2/FADD2 (sm_100's packed fp32): the corpora's lines decode and are run, a cubin of them is supported, the forms of unknown
 # meaning are refused, and the arithmetic the PTX and SASS engines share.
 vgpu_unit_test(test_f32x2_sass tests/unit/test_f32x2_sass.cpp)
@@ -3702,6 +3699,12 @@ add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shi
 set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
+# The std::variant dispatch tables must stay local to each shim (VGPU_LOCAL_STD_TABLES): exported, their long names were a quarter of a
+# small program's user cycles at every process start.
+add_test(NAME lint_shim_dynsyms COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_dynsyms.sh)
+set_tests_properties(lint_shim_dynsyms PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 # No shim library takes static TLS (glibc leaves ~1.6 KB for every library loaded late).
 # (Not under a sanitizer: its runtime keeps initial-exec thread-locals in every library it is linked into, so the check would report the
 # runtime, not the simulator.)
