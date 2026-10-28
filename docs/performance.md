@@ -5016,3 +5016,8 @@ Mutations (a one-line change on server3, the restricted test named failed, rever
 | M13 | the `_e64` to `_e32` mapping of the three 16-bit integer instructions off | `test_amd_gcn_probe_forms` fails |
 | M14 | DPP `bound_ctrl` ignored | tier digest (`bound_ctrl`) fails |
 | M15 | `s_add_nc_u64` off by one | tier digest (`s_add_nc_u64`) fails |
+
+Sanitizers: ASan+UBSan at -O0 (`ASAN_OPTIONS=detect_leaks=1`, `UBSAN_OPTIONS=halt_on_error=1`) of `test_amd_gcn_probe_forms` and of `test_amd_gcn_tier_same_bits` restricted (`VGPU_TIER_ONLY`) to the
+new handlers' instructions (DPP, swizzle, permute, packed integers, permlane, min/max/ldexp/frexp/cvt, ffbh, `s_add_nc_u64`, a VOPD pair) pass; the whole corpus under ASan (three to five times the
+2700 s of before) and a TSan build (no new threaded code) were not run here. Release: the guards (`gcn_same_bits`, `gcn_packed_same_bits`, `gcn_memory_same_bits`, `codeobject_same_bits`, `matrix_fast`,
+`mfma_math`, `nan_order`, the other `test_amd_gcn_*`) and the whole tier digest, AVX2 and `VGPU_SIMD=base`, pass.
