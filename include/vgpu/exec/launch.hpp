@@ -58,6 +58,8 @@ struct DeviceGraphLauncher {
   ~DeviceGraphLauncher() = default;
 };
 
+struct LaunchEnv;   // vgpu/exec/launch_env.hpp
+
 struct LaunchConfig {
   std::array<uint32_t, 3> grid{1, 1, 1};
   std::array<uint32_t, 3> block{1, 1, 1};
@@ -143,6 +145,9 @@ struct LaunchConfig {
   // with (cudaDeviceGetAttribute, cudaDeviceGetLimit, error strings...). Null
   // outside the CUDA shims: those queries then return cudaErrorNotSupported.
   const devrt::Services* devrt = nullptr;
+  // The environment variables a launch reads, found in one pass by the caller (vgpu/exec/launch_env.hpp) and good for this launch
+  // alone; null: the launch reads them itself.
+  const LaunchEnv* env = nullptr;
 };
 
 // Invoked periodically during a launch so long-running kernels can still

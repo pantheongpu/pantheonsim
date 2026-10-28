@@ -1,0 +1,5 @@
+pass 3 m4nosets done
+workload (Mi/s)                             m3                      m4                m4nosets   ratios vs m3
+pantheon:int_virus        152.58 (+- 1.1%)         149.19 (+- 0.6%)         149.58 (+- 1.1%)       m4=0.978 m4nosets=0.980
+pantheon:compute_virus     46.90 (+- 2.9%)          46.53 (+- 1.5%)          46.36 (+- 3.2%)       m4=0.992 m4nosets=0.989
+pantheon:memory_retention_bake    129.43 (+- 1.3%)         128.12 (+- 1.4%)         128.17 (+- 1.6%)       m4=0.990 m4nosets=0.990

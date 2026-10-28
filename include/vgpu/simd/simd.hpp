@@ -18,6 +18,13 @@
 // code); VGPU_SIMD=base|avx2 caps the level (default: the best the CPU has); the
 // baseline kernels are always compiled in, so base is the reference the other
 // levels are checked against and the escape hatch if a host misbehaves.
+//
+// A third level, Avx512 (AVX-512 F/BW/DQ/VL and VNNI), is the Avx2 table with the
+// three tile kernels replaced by 512-bit forms (src/simd/kernels512.inc). It is
+// chosen with VGPU_SIMD=avx512, or by default where the host runs it faster than
+// the 256-bit kernels (see kAvx512Default in simd.cpp); level() still names the
+// instruction-set family of the lane kernels (Base or Avx2), and kernels().level
+// the table in use.
 #pragma once
 
 #include <atomic>
@@ -26,8 +33,8 @@
 
 namespace vgpu::simd {
 
-enum class Level : int { Base = 0, Avx2 = 1 };   // Avx2 = AVX2 + FMA + F16C
-inline constexpr int kLevels = 2;
+enum class Level : int { Base = 0, Avx2 = 1, Avx512 = 2 };   // Avx2 = AVX2 + FMA + F16C; Avx512 = that and AVX-512 F/BW/DQ/VL/VNNI
+inline constexpr int kLevels = 3;
 
 
 // The F16C check (the conversions against the scalar ones, every half and a spread of floats; a host that fails it
@@ -46,7 +53,8 @@ int f16c_checks_run();
 const char* level_name(Level l);
 // Whether this host can run `l` (Base always).
 bool supported(Level l);
-// The level the kernels in use run at: the best supported, capped by VGPU_SIMD.
+// The instruction-set family of the lane kernels in use: the best of Base and Avx2 the host supports, capped by VGPU_SIMD (an Avx512 table is built on
+// the Avx2 one, so this stays Avx2 under it; kernels().level says which table runs).
 Level level();
 
 enum class IntCmp : unsigned { Eq, Ne, Lt, Le, Gt, Ge };
@@ -174,6 +182,21 @@ struct Kernels {
   //    the exact a * b + c of the lanes' bf16 halves in binary64, rounded to binary32 and then to bfloat16 (each to nearest even,
   //    as the SASS executor's general form does), a NaN the canonical 0x7fff. Writes only the lanes of `mask`.
   void (*hfma2_bf_m)(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t mask, unsigned n);
+
+  // Tile products, the tensor-core instructions' sums over a whole tile (A is M x K with row stride K, B is K x N with row stride N, all
+  // row-major; N a multiple of 8; C and D are M x N with row strides ldc and ldd, C null for zeros; D may be C, not A or B).
+  //  tile_f32: D = C + A x B in f32, each element summed in k order, each product rounded and then added (never fused). A NaN
+  //    result is whichever one the host's additions kept: callers write the canonical one themselves.
+  //  tile_i32: the same for 32-bit integers (8-bit elements or fewer, so a block's sum of products fits 32 bits). Without `sat`
+  //    one wrapping sum; with it the products are added `block` at a time and C, or the running value, plus a block's sum is
+  //    clamped to the s32 range after each block.
+  //  tile_f64: D = C + A x B in binary64, k in order, each step a fused multiply-add in the host's current rounding mode.
+  void (*tile_f32)(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd);
+  void (*tile_i32)(unsigned M, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, size_t ldc, unsigned block,
+                   bool sat, int32_t* D, size_t ldd);
+  void (*tile_f64)(unsigned M, unsigned N, unsigned K, const double* A, const double* B, const double* C, double* D);
+  //  tile_f32c: tile_f32 with every NaN in D the canonical 0x7fffffff (what the tensor-core forms write), in the same pass.
+  void (*tile_f32c)(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the
@@ -220,5 +243,29 @@ inline unsigned popcount32(uint32_t x) {
   return (x * 0x01010101u) >> 24;
 }
 const Kernels& kernels_for(Level l);
+
+// The distinct 32-byte sectors of a warp's accesses that all lie within 63 sectors of one another, in any order (the
+// thread-private array a kernel indexes by a value of its own): the AVX2 form of memcount's sectors_window, or null on
+// a host or at a level without AVX2. For 1 to 64 lanes (`m` the active ones, not zero) of `span` bytes (1 to 32) at
+// addrs[lane]; true with the count in `out`, or false (nothing counted) when an address is not below 2^62 or a sector
+// lies outside the 63 that start 24 before the first active lane's (the caller then counts another way). The same
+// count as the scalar window, whatever the level: the level changes the speed only.
+using SectorWindowFn = bool (*)(const uint64_t* addrs, uint64_t m, uint64_t span, uint64_t& out);
+namespace detail {
+extern SectorWindowFn g_sector_window __attribute__((visibility("hidden")));
+}
+inline SectorWindowFn sector_window_kernel() { return detail::g_sector_window; }
+
+// The AVX2 forms of the PTX engine's f64 lane loops (32 lanes; `m` the active ones; null/absent below AVX2, see
+// avx2_f64_available): fma d = a * b + c with the contracted-subtract negations in `sub` (bit 0 the product, bit 1 the
+// addend), and add (op 0), sub (1), mul (2) or div (3) into a row of 32 results, returning whether any is a NaN.
+bool avx2_f64_available();
+void fma_lanes_f64_avx2(uint64_t* d, const uint64_t* a, const uint64_t* b, const uint64_t* c, uint64_t m, unsigned sub);
+bool f64_bin_lanes_avx2(unsigned op, uint64_t* r, const uint64_t* a, const uint64_t* b);
+
+namespace testing {
+// Switches the kernel above between the level's own (true) and none (false), for the tests that compare the two.
+void use_sector_window_kernel(bool on);
+}
 
 }  // namespace vgpu::simd

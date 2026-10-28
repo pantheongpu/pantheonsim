@@ -31,6 +31,8 @@ int tier_global(Wave& w, Group& g, const Inst& in) {
   const uint32_t* const lo = w.vgpr[in.src[0].index].data();
   const uint32_t* const hi = in.has_saddr ? lo : w.vgpr[in.src[0].index + 1].data();
   bool try_runs = !sub_dword && (words == 1 || words == 2 || words == 4) && d.peers.empty() && runs_on;
+  // Lanes whose addresses make no run go to memory together (wave_scalars), once: a byte, a short, a word or a pair a lane.
+  bool try_batch = (sub_dword || words <= 2) && d.peers.empty() && runs_on;
   uint64_t memo_addr = 0;
   bool memo = false;
   uint32_t memo_words[kMaxWords];
@@ -47,6 +49,17 @@ int tier_global(Wave& w, Group& g, const Inst& in) {
         continue;
       }
       try_runs = false;
+    }
+    if (try_batch && (is_store || !memo)) {
+      try_batch = false;
+      uint64_t lane_addr[kLanes];
+      for (uint64_t m = w.exec >> lane << lane; m; m &= m - 1) {
+        const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
+        lane_addr[l] = (in.has_saddr ? saddr_base + lo[l] : static_cast<uint64_t>(hi[l]) << 32 | lo[l]) + offset;
+      }
+      const Narrow nr{words, in.fast.sub != 0};
+      if (wave_scalars(w, is_store, lane, lane_addr, is_store ? in.src[1] : in.dst[0], sub_dword ? 1 : words, sub_dword ? &nr : nullptr))
+        return 1;
     }
     if (sub_dword) {
       if (is_store) {
@@ -136,7 +149,19 @@ int tier_acc(Wave& w, const Inst& in) {
   return 1;
 }
 
-// The instructions the tier hands to the Machine, by Op::mach: 3 s_barrier, 6 s_endpgm, 7 scalar memory, 8 packed halves, 10 the accumulation register moves, else a global access.
+// A write-back or an invalidate of the caches (buffer_wbl2, buffer_inv, buffer_gl0_inv, ...): a fence, counted as a vector memory instruction, as step_interp has it.
+int tier_fence(Wave& w, const Inst& in) {
+  InstructionCounts& n = stats.counts;
+  ++n.mix[static_cast<int>(in.mix)];
+  n.mops[static_cast<int>(in.mops_type)] += in.mops;
+  w.pc += in.size;
+  ++stats.instructions;
+  ++n.vmem;
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  return 1;
+}
+
+// The instructions the tier hands to the Machine, by Op::mach: 3 s_barrier, 6 s_endpgm, 7 scalar memory, 8 packed halves, 10 the accumulation register moves, 11 a cache fence, else a global access.
 int tier_mach(Wave& w, Group& g, const Inst& in) {
   switch (in.fast.mach) {
     case 3: return tier_barrier(w, in);
@@ -144,6 +169,7 @@ int tier_mach(Wave& w, Group& g, const Inst& in) {
     case 7: return tier_smem(w, in);
     case 8: return tier_pkf16(w, in);
     case 10: return tier_acc(w, in);
+    case 11: return tier_fence(w, in);
     default: return tier_global(w, g, in);
   }
 }

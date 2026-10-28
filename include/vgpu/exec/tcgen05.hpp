@@ -43,6 +43,15 @@ struct TensorMemory {
     uint32_t b_fields = 0;
   };
   std::array<Collector, 4> collector_b{};
+  // Back to a fresh Tensor Memory's state, without building one (two deques take four allocations to make).
+  void reset() {
+    if (!cells.empty()) std::vector<uint32_t>().swap(cells);
+    live.clear();
+    exclusive = relinquished = false;
+    peer_alloc.clear();
+    peer_dealloc.clear();
+    collector_b = {};
+  }
   uint32_t& at(uint32_t lane, uint32_t col) { return cells[size_t{lane} * kCols + col]; }
   bool allocated(uint32_t col) const {
     auto it = live.upper_bound(col);
@@ -69,6 +78,12 @@ class Tcgen05Host {
   virtual TensorMemory& tmem(uint32_t cta) = 0;
   // `bytes` (1 to 8) of CTA `cta`'s shared memory at a CTA-local offset.
   virtual uint64_t smem_load(uint32_t cta, uint64_t off, uint32_t bytes) = 0;
+  // CTA `cta`'s shared memory, for reading a whole operand at once, or null when each load must go through smem_load (the race detector
+  // or a shared-memory fault armed on the engine's side). A read past its end is smem_load's to report.
+  virtual const std::vector<uint8_t>* smem_direct(uint32_t cta) {
+    (void)cta;
+    return nullptr;
+  }
   [[noreturn]] virtual void fail(Err code, const std::string& why) = 0;
 };
 

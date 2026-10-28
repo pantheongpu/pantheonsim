@@ -61,6 +61,7 @@
 #include "vgpu/sass/exec.hpp"
 #include "vgpu/exec/cluster.hpp"
 #include "vgpu/exec/devrt.hpp"
+#include "vgpu/exec/launch_env.hpp"
 #include "vgpu/exec/tensormap.hpp"
 // cudaDeviceProp is filled in by this shim and read by the application, so
 // both sides must agree on its layout. The original failure was a stale
@@ -108,10 +109,8 @@ bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
   return q && q[0] == '1';
 }
-bool trace() {
-  const char* t = std::getenv("VGPU_TRACE");
-  return t && t[0] == '1';
-}
+bool trace(const char* t) { return t && t[0] == '1'; }
+bool trace() { return trace(std::getenv("VGPU_TRACE")); }
 
 // A fatbin registered by the host boilerplate. PTX is parsed into a runtime
 // module lazily on first use for the active device.
@@ -881,7 +880,7 @@ void bind_driver_context() {
 // check, and errors thrown inside turned into codes. `needs_context` is false
 // for the calls an RTX 3060 still answers after a kernel has killed the
 // context -- which device is current, how many there are, what one is.
-static void announce_context();
+static void announce_context(bool silenced);
 template <class F>
 cudaError_t guard_impl(const char* api, bool needs_context, F&& body) {
   State& s = st();
@@ -900,10 +899,11 @@ cudaError_t guard_impl(const char* api, bool needs_context, F&& body) {
       }
       // A profiler's own question (vgpu::profiling::Silence) is not the
       // program using the runtime: it binds no context and creates none.
-      if (!vgpu::profiling::silenced()) bind_driver_context();
+      const bool silent = call.silenced();
+      if (!silent) bind_driver_context();
       // cudaSetDevice makes the context of the device it selects, which is not
       // the one that was current when it was called (see its body).
-      if (std::strcmp(api, "cudaSetDevice") != 0) announce_context();
+      if (std::strcmp(api, "cudaSetDevice") != 0) announce_context(silent);
       if (needs_context) {
         if (const cudaError_t sticky = static_cast<cudaError_t>(s.rt->context_fault())) {
           g_last_error = sticky;
@@ -963,9 +963,9 @@ struct SyncScope : vgpu::profiling::SyncScope {
 static std::atomic<uint32_t> g_announced_contexts{0};
 static std::atomic<uint32_t> g_context_generation[32];
 
-static void announce_context() {
+static void announce_context(bool silenced) {
   // A profiler asking what a device is has not made a context.
-  if (vgpu::profiling::silenced()) return;
+  if (silenced) return;
   vgpu::profiling::note_context_made();
   if (!vgpu::profiling::enabled() && !vgpu::profiling::hooked()) return;
   const uint32_t bit = 1u << (static_cast<unsigned>(t_current_device) & 31u);
@@ -1027,8 +1027,13 @@ void note_kept(const vgpu_traced::KeptArgs<A...>& kept) {
 
 template <class Body, class... A>
 cudaError_t traced_call(const char* api, Body body, A... a) {
-  const vgpu_traced::KeptArgs<A...> kept(a...);
-  note_kept(kept);
+  // The arguments are kept in this frame for the whole call (the profiler reads them again at its exit), and
+  // only when somebody is listening at the call: a program nobody profiles does not copy them.
+  vgpu_traced::LazyKept<A...> kept;
+  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
+    kept.make(a...);
+    note_kept(*kept);
+  }
   vgpu::profiling::ApiCall call(api);
   const cudaError_t rc = body(a...);
   call.set_result(rc);
@@ -1488,6 +1493,8 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
                                       dim3 blockDim, void** args, size_t sharedMem,
                                       cudaStream_t stream, bool cooperative,
                                       std::array<uint32_t, 3> cluster = {0, 0, 0}) {
+  // One pass over the environment for everything this launch reads (vgpu/exec/launch_env.hpp), handed on in the LaunchConfig.
+  const vgpu::exec::LaunchEnv env = vgpu::exec::read_launch_env();
   const cudaError_t rc = guard(api, [&](State& s) -> cudaError_t {
     auto it = s.kernels.find(func);
     if (it == s.kernels.end()) {
@@ -1500,7 +1507,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     // relaxed load away when nobody is listening.
     const bool profiling = vgpu::profiling::enabled();
     const uint64_t t0 = profiling ? vgpu::profiling::now_ns() : 0;
-    if (trace())
+    if (trace(env.trace))
       std::fprintf(stderr, "[vgpu][trace] launch %s grid %ux%ux%u block %ux%ux%u shared %zu\n",
                    ki.entry_name.c_str(), gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y,
                    blockDim.z, sharedMem);
@@ -1591,6 +1598,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     cfg.cooperative = cooperative;
     cfg.cluster = cluster;
     cfg.devrt = &runtime_devrt_services();
+    cfg.env = &env;
     {
       // The heap and printf limits stop being settable once a kernel that uses
       // them has launched on this device, which is decided by what the kernel's
@@ -1776,7 +1784,7 @@ static cudaError_t cudaSetDevice_body(int device) {
     // The real runtime makes the device's context here (measured: its streams
     // and the context record are told within cudaSetDevice), not at the next
     // call that needs it.
-    announce_context();
+    announce_context(vgpu::profiling::silenced());
     return cudaSuccess;
   });
 }
@@ -7156,6 +7164,11 @@ struct StreamCapture {
   std::vector<GraphEdgeABI> edges_out;   // what cudaStreamGetCaptureInfo hands out
 };
 std::unordered_map<void*, std::unique_ptr<Capture>> g_captures;   // by the stream that began each
+// Whether g_captures has anything in it, kept beside it (set under g_graph_mu after each change) so that the
+// gate every allocation, copy and launch passes through (capture_unsafe_gate) asks without the lock when no
+// capture is going on, which is nearly always.
+std::atomic<bool> g_captures_active{false};
+void note_captures_changed() { g_captures_active.store(!g_captures.empty(), std::memory_order_release); }
 std::unordered_map<void*, StreamCapture> g_stream_capture;        // every stream taking part
 
 // The capture state of `stream`, or nullptr. Caller holds g_graph_mu.
@@ -7397,6 +7410,7 @@ void vgpu_drop_capture(cudaStream_t stream) {
   if (cap->owned) g_borrowed_graphs.erase(cap->graph);   // the stream that began it takes it along
   leave_capture(cap);
   g_captures.erase(reinterpret_cast<void*>(stream));
+  note_captures_changed();
 }
 
 // Marks any in-flight capture as unusable. Called by the operations that this
@@ -7463,6 +7477,7 @@ static cudaError_t cudaStreamBeginCapture_body(cudaStream_t stream, cudaStreamCa
   g_borrowed_graphs[cap->graph] = cap->graph;
   g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap.get(), {}, {}, {}, {}};
   g_captures[reinterpret_cast<void*>(stream)] = std::move(cap);
+  note_captures_changed();
   return cudaSuccess;
 }
 
@@ -7485,6 +7500,7 @@ static cudaError_t cudaStreamEndCapture_body(cudaStream_t stream, cudaGraph_t* p
     GraphRec* const wrong = cap->graph;
     leave_capture(cap);
     g_captures.erase(reinterpret_cast<void*>(stream));
+    note_captures_changed();
     if (dropped) g_borrowed_graphs.erase(wrong);
     if (pGraph) *pGraph = nullptr;
     return cudaErrorStreamCaptureWrongThread;
@@ -7512,6 +7528,7 @@ static cudaError_t cudaStreamEndCapture_body(cudaStream_t stream, cudaGraph_t* p
   std::unique_ptr<GraphRec> owned = std::move(cap->owned);
   leave_capture(cap);
   g_captures.erase(reinterpret_cast<void*>(stream));
+  note_captures_changed();
   if (owned) g_borrowed_graphs.erase(graph);   // no longer lent: returned, or dropped below
   const bool invalidated = graph->invalidated;
   const char* const invalidated_by = graph->invalidated_by;
@@ -7598,6 +7615,7 @@ static cudaError_t cudaStreamBeginCaptureToGraph_traced(cudaStream_t stream, cud
   cap->mode = mode_value;
   g_stream_capture[reinterpret_cast<void*>(stream)] = StreamCapture{cap.get(), std::move(deps), {}, std::move(edges), {}};
   g_captures[reinterpret_cast<void*>(stream)] = std::move(cap);
+  note_captures_changed();
   return cudaSuccess;
 }
 
@@ -10423,6 +10441,7 @@ bool capture_refuse(cudaStream_t stream, const char* what) {
 // destruction, cudaDeviceSetLimit and cudaDeviceSetCacheConfig, texture and surface objects,
 // cudaProfilerStart and Stop, and a synchronization or query on a stream or event.
 cudaError_t capture_unsafe_gate(const char* api) {
+  if (!g_captures_active.load(std::memory_order_acquire)) return cudaSuccess;
   std::lock_guard<std::mutex> lock(g_graph_mu);
   if (g_captures.empty()) return cudaSuccess;
   const int mode = t_capture_mode;

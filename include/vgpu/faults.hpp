@@ -41,6 +41,8 @@ bool enabled();
 // flags; exposed so tests can change a variable and have it take effect
 // without a new process.
 void refresh();
+// The same from values already read (a launch's one pass over the environment, vgpu/exec/launch_env.hpp): VGPU_FAIL_ALLOC, _LAUNCH, _MEMCPY.
+void refresh(const char* alloc, const char* launch, const char* memcpy);
 
 const char* op_name(Op op);
 
