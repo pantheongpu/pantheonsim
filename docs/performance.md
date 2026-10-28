@@ -4959,7 +4959,7 @@ noise; counters identical in every row):
 | `buf` (its descriptor is an `s_load_dwordx4`) | **1.11** | **1.20** |
 | `flat`, `launch`, `api` | 1.02, 0.99, 1.00 | 1.01, 1.00, 0.98 |
 
-`flat` on mi300x against the pre-round-1 build (/tmp/base0, d8ec6128's parent): **1.980x** for this tree and 1.958x for a6e80555 (B/A 1.01, p 0.19): the 0.978x of the
+`flat` on mi300x against the pre-round-1 build (/tmp/base0, d8ec6128's parent): **1.980x** for this tree and 1.958x for a6e80555 (B/A 1.02, p 0.19 in the later run; 1.03 in the first): the 0.978x of the
 earlier A/B does not reproduce; the three builds read the same within 2% once the box is quiet.
 
 ### Placement (the lesson of round 1, again)
