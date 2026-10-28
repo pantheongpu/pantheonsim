@@ -281,10 +281,12 @@ bool cpu_has_avx512() {
 #endif
 }
 
-// Whether the Avx512 table is the one in use: asked for with VGPU_SIMD=avx512, or by default where the 512-bit tile kernels are the faster ones
-// (measured per host class; left off until a host is shown to gain: Zen 4 runs 512-bit operations as two 256-bit halves). Never when the lane kernels
-// are capped to base or avx2.
-constexpr bool kAvx512Default = false;
+// Whether the Avx512 table is the one in use: by default on every host that has AVX-512 F/BW/DQ/VL and VNNI (cpu_has_avx512), unless VGPU_SIMD names
+// another level (avx2 selects the 256-bit tile kernels, base the baseline ones, off no kernels). Measured per host class on the tile-kernel routes
+// (wgmma, tcgen05, the integer mma forms): Zen 4 (512-bit operations run as two 256-bit halves) 0.63x to 1.03x of the AVX2 time, Zen 5 0.59x to 1.0x,
+// Sapphire Rapids 0.46x to 1.2x with a geometric mean of 0.92 over 43 forms, and 1.00x on the workloads that do not use the tile kernels; the bits do
+// not move with the level (the _simd_avx512, _simd_avx2 and _simd_base twins of the tile-route tests).
+constexpr bool kAvx512Default = true;
 bool use_avx512() {
   static const bool use = [] {
     if (level() != Level::Avx2 || !cpu_has_avx512()) return false;

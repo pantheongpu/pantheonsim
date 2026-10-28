@@ -1393,9 +1393,19 @@ vgpu_unit_test(test_tcgen05_tiles)
 vgpu_unit_test(test_wmma_generic_fast)
 # The routes that run the tile kernels, again with the AVX-512 table selected (VGPU_SIMD=avx512; a host without it runs them at AVX2): the engines'
 # results against their general forms must not move a bit with the level.
+# The AVX-512 table is the default on a host that has it, so the 256-bit tile kernels are pinned with VGPU_SIMD=avx2 in a third run (a host without
+# AVX-512 runs the default as AVX2 and these as the same code).
 foreach(_t test_mma_fast test_mma_tiles test_wgmma_fast test_tcgen05_tiles test_wmma_generic_fast test_tile_mma)
   add_test(NAME ${_t}_simd_avx512 COMMAND ${_t})
   set_tests_properties(${_t}_simd_avx512 PROPERTIES ENVIRONMENT "VGPU_SIMD=avx512")
+  add_test(NAME ${_t}_simd_avx2 COMMAND ${_t})
+  set_tests_properties(${_t}_simd_avx2 PROPERTIES ENVIRONMENT "VGPU_SIMD=avx2")
+endforeach()
+# Which table each setting of VGPU_SIMD gives on this host (the default is the AVX-512 one where the CPU has it).
+vgpu_unit_test(test_simd_dispatch)
+foreach(_lvl avx2 avx512 base off)
+  add_test(NAME test_simd_dispatch_simd_${_lvl} COMMAND test_simd_dispatch)
+  set_tests_properties(test_simd_dispatch_simd_${_lvl} PROPERTIES ENVIRONMENT "VGPU_SIMD=${_lvl}")
 endforeach()
 # The PTX engine's tile route for the other mma.sync forms against the general form, bit for bit.
 vgpu_unit_test(test_mma_tiles)
