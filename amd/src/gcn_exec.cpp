@@ -2753,12 +2753,22 @@ struct Machine {
   // The plain dword loads (s_load_dword .. dwordx16) are the case that matters; the rest (counters, stores, atomics, buffer forms,
   // sub-dword loads) is out of line, so this one stays small (the general function's frame and spills cost an RX 6800 scalar-load
   // kernel 5 %).
+  // A run of 2 to 16 words wholly inside one allocation is one lookup and one copy: load_run is what the words one at a time do, or declines (false).
+  // (Out of line: a 64-byte array in scalar_load's frame moved the frames below it, and with them the stack buffers of the matrix tiles, by 64 bytes,
+  // which cost mfma_f64 3.8%: the tile kernel's loads and its store to D alias in the low 12 bits of their addresses where they did not.)
+  [[gnu::noinline]] bool scalar_load_run(Wave& w, const Inst& in, uint64_t base, uint32_t words) {
+    uint32_t run[16];
+    if (!at(base).load_run(base, run, 4ull * words, 4)) return false;
+    for (uint32_t i = 0; i < words; ++i) set_sgpr(w, in.dst[0].index + i, run[i]);
+    return true;
+  }
   void scalar_load(Wave& w, const Inst& in) {
     gcn::MemFacts mem_scratch;
     const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);   // (what the name says, worked out when decoded)
     if (mf.smem == gcn::SmemKind::Load) {
       const uint64_t base = scalar_load_base(w, in);
       const uint32_t words = in.dst[0].width;
+      if (words >= 2 && words <= 16 && scalar_load_run(w, in, base, words)) return;
       for (uint32_t i = 0; i < words; ++i)
         set_sgpr(w, in.dst[0].index + i, static_cast<uint32_t>(at(base + 4 * i).load_scalar(base + 4 * i, 4)));
       return;

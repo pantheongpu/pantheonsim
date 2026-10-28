@@ -125,10 +125,13 @@ constexpr uint32_t kVgprs = 256;
   X(MAX_I, k_max_i) X(BFI, k_bfi) X(ALIGNBIT, k_alignbit) X(ALIGNBYTE, k_alignbyte) X(ADD3, k_add3) X(OR3, k_or3)  \
   X(AND_OR, k_and_or) X(XAD, k_xad) X(LSHL_OR, k_lshl_or) X(LSHL_ADD, k_lshl_add) X(ADD_LSHL, k_add_lshl)          \
   X(BCNT, k_bcnt) X(BFE_U, k_bfe_u) X(MED3_U, k_med3_u) X(MED3_I, k_med3_i) X(MIN3_U, k_min3_u)                     \
-  X(MAX3_U, k_max3_u) X(XOR3, k_xor3) X(MBCNT_LO, k_mbcnt_lo) X(MBCNT_HI, k_mbcnt_hi) X(CVT_I32_F32, k_cvt_i32_f32) X(CVT_U32_F32, k_cvt_u32_f32) X(CVT_F32_U, k_cvt_f32_u) X(CVT_F32_I, k_cvt_f32_i) X(CVT_F32_UBYTE0, k_cvt_f32_ubyte0) X(ADD_U16, k_add_u16) X(SUB_U16, k_sub_u16) X(SUBREV_U16, k_subrev_u16) X(LSHLREV_B16, k_lshlrev_b16) X(LSHRREV_B16, k_lshrrev_b16) X(ASHRREV_I16, k_ashrrev_i16) X(MUL_LO_U16, k_mul_lo_u16) X(MIN_U16, k_min_u16) X(MAX_U16, k_max_u16) X(MIN_I16, k_min_i16) X(MAX_I16, k_max_i16) X(PACK_B32_F16, k_pack_b32_f16) X(BFE_I, k_bfe_i) X(PERM, k_perm) X(CVT_F16_F32, k_cvt_f16_f32)
+  X(MAX3_U, k_max3_u) X(XOR3, k_xor3) X(MBCNT_LO, k_mbcnt_lo) X(MBCNT_HI, k_mbcnt_hi) X(CVT_I32_F32, k_cvt_i32_f32) X(CVT_U32_F32, k_cvt_u32_f32) X(CVT_F32_U, k_cvt_f32_u) X(CVT_F32_I, k_cvt_f32_i) X(CVT_F32_UBYTE0, k_cvt_f32_ubyte0) X(ADD_U16, k_add_u16) X(SUB_U16, k_sub_u16) X(SUBREV_U16, k_subrev_u16) X(LSHLREV_B16, k_lshlrev_b16) X(LSHRREV_B16, k_lshrrev_b16) X(ASHRREV_I16, k_ashrrev_i16) X(MUL_LO_U16, k_mul_lo_u16) X(MIN_U16, k_min_u16) X(MAX_U16, k_max_u16) X(MIN_I16, k_min_i16) X(MAX_I16, k_max_i16) X(PACK_B32_F16, k_pack_b32_f16) X(BFE_I, k_bfe_i) X(PERM, k_perm) X(CVT_F16_F32, k_cvt_f16_f32) X(FFBH_U, k_ffbh_u) X(FFBL, k_ffbl) X(FFBH_I, k_ffbh_i) \
+  X(PK_MULLO, k_pk_mullo) X(PK_ADDU, k_pk_addu) X(PK_ADDI, k_pk_addi) X(PK_SUBU, k_pk_subu) X(PK_SUBI, k_pk_subi) X(PK_SHL, k_pk_shl) X(PK_SHR, k_pk_shr) \
+  X(PK_ASHR, k_pk_ashr) X(PK_MAXI, k_pk_maxi) X(PK_MINI, k_pk_mini) X(PK_MAXU, k_pk_maxu) X(PK_MINU, k_pk_minu) X(PK_MADU, k_pk_madu) X(PK_MADI, k_pk_madi) \
+  X(PK_ADDU_C, k_pk_addu_c) X(PK_ADDI_C, k_pk_addi_c) X(PK_SUBU_C, k_pk_subu_c) X(PK_SUBI_C, k_pk_subi_c) X(PK_MADU_C, k_pk_madu_c) X(PK_MADI_C, k_pk_madi_c)
 #define TIER_F32_OPS(X) X(FADD, k_fadd) X(FSUB, k_fsub) X(FSUBREV, k_fsubrev) X(FMUL, k_fmul) X(FMA, k_ffma) X(FMIN, k_fmin) X(FMAX, k_fmax) X(FRCP, k_frcp) X(FSQRT, k_fsqrt) X(FRSQ, k_frsq) X(FEXP, k_fexp) X(FLOG, k_flog) X(FFLOOR, k_ffloor) X(FCEIL, k_fceil) X(FTRUNC, k_ftrunc) X(FRNDNE, k_frndne) X(FFRACT, k_ffract) X(FSIN_R, k_fsin_r) X(FSIN_T, k_fsin_t) X(FCOS_R, k_fcos_r) X(FCOS_T, k_fcos_t) X(FLDEXP, k_fldexp) X(FCVT_F32_F16, k_fcvt_f32_f16)
-#define TIER_F64_OPS(X) X(DADD, k_dadd) X(DMUL, k_dmul) X(DFMA, k_dfma) X(DRCP, k_drcp) X(DSQRT, k_dsqrt) X(DFLOOR, k_dfloor) X(DCEIL, k_dceil) X(DTRUNC, k_dtrunc) X(DRNDNE, k_drndne)
-#define TIER_L64_OPS(X) X(MOV, l_mov) X(LSHLREV, l_lshlrev) X(LSHRREV, l_lshrrev) X(ASHRREV, l_ashrrev) X(LSHL_ADD, l_lshl_add) X(LSHL_ADD_G, l_lshl_add_g) X(CVT_F64_U, l_cvt_f64_u) X(CVT_F64_I, l_cvt_f64_i)
+#define TIER_F64_OPS(X) X(DADD, k_dadd) X(DMUL, k_dmul) X(DFMA, k_dfma) X(DRCP, k_drcp) X(DSQRT, k_dsqrt) X(DFLOOR, k_dfloor) X(DCEIL, k_dceil) X(DTRUNC, k_dtrunc) X(DRNDNE, k_drndne) X(DMIN, k_dmin) X(DMAX, k_dmax)
+#define TIER_L64_OPS(X) X(MOV, l_mov) X(LSHLREV, l_lshlrev) X(LSHRREV, l_lshrrev) X(ASHRREV, l_ashrrev) X(LSHL_ADD, l_lshl_add) X(LSHL_ADD_G, l_lshl_add_g) X(CVT_F64_U, l_cvt_f64_u) X(CVT_F64_I, l_cvt_f64_i) X(LDEXP, l_ldexp) X(FREXP_MANT, l_frexp_mant) X(FREXP_EXP, l_frexp_exp) X(CVT_F64_F32, l_cvt_f64_f32) X(CVT_F32_F64, l_cvt_f32_f64) X(CVT_I32_F64, l_cvt_i32_f64) X(CVT_U32_F64, l_cvt_u32_f64)
 
 #define TIER_ENUM(id, fn) id,
 enum IntId { TIER_INT_OPS(TIER_ENUM) kIntCount };
@@ -568,6 +571,117 @@ int h_int_sdwa(const Op& o, Regs& R) {
   return true;
 }
 
+
+// ---- DPP (an integer operation whose first source is another lane's)
+// The lane a DPP control makes a lane read (Machine::dpp_source: the same table, kept in step by the tier test). 1: that lane; 0: none; -1: a control
+// the interpreter does not model (it raises an error there, so such an instruction is not classified).
+inline int dpp_from(uint32_t ctrl, uint32_t lane, uint32_t* from) {
+  const uint32_t row = lane & ~15u, in_row = lane & 15u;
+  if (ctrl <= 0xFF) {
+    *from = (lane & ~3u) + ((ctrl >> (2 * (lane & 3))) & 3);
+    return 1;
+  }
+  if (ctrl >= 0x101 && ctrl <= 0x10F) {
+    const uint32_t n = ctrl - 0x100;
+    if (in_row + n > 15) return 0;
+    *from = row + in_row + n;
+    return 1;
+  }
+  if (ctrl >= 0x111 && ctrl <= 0x11F) {
+    const uint32_t n = ctrl - 0x110;
+    if (n > in_row) return 0;
+    *from = row + in_row - n;
+    return 1;
+  }
+  if (ctrl >= 0x121 && ctrl <= 0x12F) {
+    *from = row + ((in_row + 16 - (ctrl - 0x120)) & 15);
+    return 1;
+  }
+  if (ctrl == 0x130) {
+    if (lane == 63) return 0;
+    *from = lane + 1;
+    return 1;
+  }
+  if (ctrl == 0x134) {
+    *from = (lane + 1) % 64;
+    return 1;
+  }
+  if (ctrl == 0x138) {
+    if (lane == 0) return 0;
+    *from = lane - 1;
+    return 1;
+  }
+  if (ctrl == 0x13C) {
+    *from = (lane + 63) % 64;
+    return 1;
+  }
+  if (ctrl == 0x140) {
+    *from = row + (15 - in_row);
+    return 1;
+  }
+  if (ctrl == 0x141) {
+    *from = (lane & ~7u) + (7 - (lane & 7));
+    return 1;
+  }
+  if (ctrl == 0x142) {
+    if (lane < 16) return 0;
+    *from = row - 1;
+    return 1;
+  }
+  if (ctrl == 0x143) {
+    if (lane < 32) return 0;
+    *from = (lane & ~31u) - 1;
+    return 1;
+  }
+  if (ctrl >= 0x150 && ctrl <= 0x15F) {
+    *from = row + (ctrl - 0x150);
+    return 1;
+  }
+  if (ctrl >= 0x160 && ctrl <= 0x16F) {
+    *from = row + (in_row ^ (ctrl - 0x160));
+    return 1;
+  }
+  return -1;
+}
+// Op::off0 of a DPP instruction: row mask (bits 0-3), bank mask (4-7), bound_ctrl (8), FI (9), DPP8 (10).
+// The first source as each lane sees it, and the lanes the instruction writes (Machine::dpp_shuffle): `values` is zero where nothing is read.
+inline uint64_t dpp_gather(const Op& o, const Regs& R, uint64_t ex, uint32_t* values) {
+  const uint32_t flags = static_cast<uint32_t>(o.off0), ctrl = o.sub;
+  const bool dpp8 = flags >> 10 & 1, fi = flags >> 9 & 1, bound = flags >> 8 & 1;
+  const uint32_t row_mask = flags & 15, bank_mask = flags >> 4 & 15;
+  const uint32_t* src = R.vgpr[o.src[0].index];
+  uint64_t writes = 0;
+  for (uint64_t m = ex; m; m &= m - 1) {
+    const unsigned lane = static_cast<unsigned>(__builtin_ctzll(m));
+    if (dpp8) {
+      const uint32_t from8 = (lane & ~7u) + ((ctrl >> (3 * (lane & 7))) & 7);
+      values[lane] = fi || ((ex >> from8) & 1) ? src[from8] : 0u;
+      writes |= uint64_t{1} << lane;
+      continue;
+    }
+    if (!((row_mask >> (lane >> 4)) & 1) || !((bank_mask >> ((lane >> 2) & 3)) & 1)) continue;
+    uint32_t from = 0;
+    const bool there = dpp_from(ctrl, lane, &from) > 0 && (fi || ((ex >> from) & 1));
+    if (!there && !bound) continue;
+    values[lane] = there ? src[from] : 0u;
+    writes |= uint64_t{1} << lane;
+  }
+  return writes;
+}
+int h_int_dpp(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t t0[64] = {}, t1[64], t2[64], r[64];
+  const uint64_t writes = dpp_gather(o, R, ex, t0);
+  if (!writes) return true;
+  const uint32_t* b = o.src[1].kind ? load32(o.src[1], R, t1, n) : t0;
+  const uint32_t* c = o.src[2].kind ? load32(o.src[2], R, t2, n) : t0;
+  reinterpret_cast<K3>(o.kern)(r, t0, b, c, n);
+  merge(R.vgpr[o.dst.index], r, writes, n);
+  return true;
+}
+
 // A binary32 operation: the result is thrown away if any active lane is a NaN.
 [[gnu::always_inline]] inline int h_f32_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
@@ -607,6 +721,14 @@ TIER_DUAL(h_f32)
   load64(o.src[0], R, a, n);
   if (o.src[1].kind) load64(o.src[1], R, b, n);
   if (o.src[2].kind) load64(o.src[2], R, c, n);
+  if (o.sub == 1) {   // minimum and maximum: which zero wins when one is -0 and the other +0 is the interpreter's
+    uint32_t any = 0;
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+      any |= ((a[l] | b[l]) << 1) == 0 && a[l] != b[l];
+    }
+    if (any) return false;
+  }
   reinterpret_cast<K64>(o.kern)(r, a, b, c, n);
   if (nan64(r, ex, n)) {
     if (o.nan == kNanHandBack) return false;
@@ -695,6 +817,30 @@ int h_f64r_base(const Op& o, Regs& R) { return h_f64r_t<false>(o, R); }
 }
 TIER_DUAL(h_l64)
 
+// A 64-bit lane function whose result is one 32-bit word (the conversions of a double to a float or an integer, frexp's exponent): the low word of
+// the kernel's result, written to the destination register for the lanes of EXEC.
+[[gnu::always_inline]] inline int h_l64n_body(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint64_t a[64], b[64], c[64], r[64];
+  alignas(32) uint32_t w[64];
+  const Src* s[3] = {&o.src[0], &o.src[1], &o.src[2]};
+  uint64_t* t[3] = {a, b, c};
+  for (int k = 0; k < 3; ++k) {
+    if (!s[k]->kind) continue;
+    if (o.sub >> k & 1) load64(*s[k], R, t[k], n);
+    else load32_to64(*s[k], R, t[k], n);
+  }
+  reinterpret_cast<K64>(o.kern)(r, a, b, c, n);
+  for (unsigned i = 0; i < n; ++i) w[i] = static_cast<uint32_t>(r[i]);
+  uint32_t* d = R.vgpr[o.dst.index];
+  if (full(ex, n)) copy_row(d, w, n);
+  else merge(d, w, ex, n);
+  return true;
+}
+TIER_DUAL(h_l64n)
+
 // v_mov_b64 of a register pair (as two row copies), a scalar pair or a constant (spread into the destination's rows), or the general path.
 [[gnu::always_inline]] inline int h_mov64_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
@@ -774,6 +920,42 @@ int h_pk(const Op& o, Regs& R) {
   return true;
 }
 
+// The packed 16-bit integer instructions (v_pk_add_u16 ...): each result half is the kernel over the halves the sources supply (Op::sub holds,
+// for source k, the half result 0 reads at bit k and the half result 1 reads at bit 3 + k; a constant's two halves are in Src::value and value64).
+// The kernels give the half in the low 16 bits; the two make a lane's word.
+int h_pk16(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const unsigned n = lanes_of(ex);
+  alignas(32) uint32_t t[2][3][64], r[2][64], d[64];
+  const uint32_t* p[2][3];
+  for (int h = 0; h < 2; ++h)
+    for (int k = 0; k < 3; ++k) {
+      p[h][k] = t[h][0];
+      const Src& s = o.src[k];
+      if (!s.kind) continue;
+      const unsigned shift = 16 * (o.sub >> (h * 3 + k) & 1);
+      uint32_t* dst = t[h][k];
+      p[h][k] = dst;
+      if (s.kind == kVgpr) {
+        const uint32_t* row = R.vgpr[s.index];
+        for (unsigned i = 0; i < n; ++i) dst[i] = (row[i] >> shift) & 0xFFFFu;
+      } else if (s.kind == kSgpr) {
+        fill(dst, (R.sgpr[s.index] >> shift) & 0xFFFFu, n);
+      } else {
+        fill(dst, static_cast<uint32_t>(h ? s.value64 : s.value) & 0xFFFFu, n);
+      }
+    }
+  const K3 kern = reinterpret_cast<K3>(o.kern);
+  kern(r[0], p[0][0], p[0][1], p[0][2], n);
+  kern(r[1], p[1][0], p[1][1], p[1][2], n);
+  for (unsigned i = 0; i < n; ++i) d[i] = (r[0][i] & 0xFFFFu) | r[1][i] << 16;
+  uint32_t* dd = R.vgpr[o.dst.index];
+  if (full(ex, n)) copy_row(dd, d, n);
+  else merge(dd, d, ex, n);
+  return true;
+}
+
 // v_pk_mov_b32: the low register of the destination pair from the first source, the high from the second, each the register of its pair
 // op_sel names (`sub` bits 0 and 1). Both are read before either is written.
 int h_pkmov(const Op& o, Regs& R) {
@@ -799,6 +981,27 @@ int h_pkmov(const Op& o, Regs& R) {
   } else {
     merge(d0, w[0], ex, n);
     merge(d1, w[1], ex, n);
+  }
+  return true;
+}
+
+// v_permlane16_b32 and v_permlanex16_b32 (RDNA): each lane of a row of 16 reads the lane of its row (of the other row of its pair, for the x form) that its
+// four bits of the 64-bit selector name; a source lane that is off is read where FI (Op::sub bit 0) says so, else the lane gets zero where BOUND_CTRL
+// (bit 1) says so and keeps its value where neither does. Op::off0 is 1 for the x form.
+int h_permlane(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (!ex) return true;
+  const uint64_t sel = (rd(R, o.src[1]) & 0xFFFFFFFFu) | (rd(R, o.src[2]) & 0xFFFFFFFFu) << 32;
+  const bool fi = o.sub & 1, bound = o.sub >> 1 & 1;
+  const unsigned cross = o.off0 ? 1 : 0;
+  alignas(32) uint32_t from[64];
+  std::memcpy(from, R.vgpr[o.src[0].index], sizeof from);
+  uint32_t* const out = R.vgpr[o.dst.index];
+  for (uint64_t m = ex; m; m &= m - 1) {
+    const unsigned lane = static_cast<unsigned>(__builtin_ctzll(m));
+    const unsigned s = ((lane / 16) ^ cross) * 16 + static_cast<unsigned>((sel >> (4 * (lane % 16))) & 0xF);
+    if (fi || (ex >> s & 1)) out[lane] = from[s];
+    else if (bound) out[lane] = 0;
   }
   return true;
 }
@@ -1033,7 +1236,7 @@ TIER_DUAL(h_cmp)
 int h_never(const Op&, Regs&) { return 0; }
 
 // ---- LDS
-enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAdd };
+enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAdd, kDsSwizzle, kDsPerm };
 [[gnu::always_inline]] inline int h_ds_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   if (o.store && *R.store_gate && ex && R.nwaves > 1) {
@@ -1058,6 +1261,46 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAd
       const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
       const uint32_t from = ((addr[l] + x) >> 2) & (lanes - 1);
       out[l] = ex >> from & 1 ? before[from] : 0;
+    }
+    return 1;
+  }
+  if (o.sub == kDsSwizzle) {
+    // ds_swizzle_b32: a lane reads another lane of its group of 32 as the offset's pattern says (a lane that is off gives zero); the data is read
+    // across the wave before any lane is written (the interpreter's swizzle_source).
+    alignas(32) uint32_t before[64];
+    std::memcpy(before, R.vgpr[o.src[0].index], sizeof before);
+    const uint32_t pattern = static_cast<uint32_t>(o.off0);
+    uint32_t* const out = R.vgpr[o.dst.index];
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
+      uint32_t from;
+      if ((pattern & 0xFF00) == 0x8000) {
+        from = (l & ~3u) + ((pattern >> (2 * (l & 3))) & 3);
+      } else if ((pattern & 0xE000) == 0xC000) {
+        const uint32_t by = (pattern >> 5) & 0x1F, right = (pattern >> 10) & 1;
+        from = (l & ~31u) | ((right ? l - by : l + by) & 31u);
+      } else {
+        from = (l & ~31u) | ((((l & 31u) & (pattern & 0x1F)) | ((pattern >> 5) & 0x1F)) ^ ((pattern >> 10) & 0x1F));
+      }
+      out[l] = ex >> from & 1 ? before[from] : 0;
+    }
+    return 1;
+  }
+  if (o.sub == kDsPerm) {
+    // ds_permute_b32: each lane that is on sends its value to the lane its address names (the higher-numbered sender's lands last), and a lane no
+    // one sent to gets zero.
+    uint32_t sent[64] = {};
+    const uint32_t* const data = R.vgpr[o.src[1].index];
+    const uint32_t x = static_cast<uint32_t>(o.off0);
+    const unsigned lanes = R.lanes;
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+      sent[((addr[l] + x) >> 2) & (lanes - 1)] = data[l];
+    }
+    uint32_t* const out = R.vgpr[o.dst.index];
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+      out[l] = sent[l];
     }
     return 1;
   }
@@ -1358,6 +1601,10 @@ TIER_S2(s_and_b32, { v = static_cast<uint32_t>(a) & static_cast<uint32_t>(b); TI
 TIER_S2(s_or_b32, { v = static_cast<uint32_t>(a) | static_cast<uint32_t>(b); TIER_SCC(v != 0); })
 TIER_S2(s_xor_b32, { v = static_cast<uint32_t>(a) ^ static_cast<uint32_t>(b); TIER_SCC(v != 0); })
 TIER_S2(s_andn2_b32, { v = static_cast<uint32_t>(a & ~b); TIER_SCC(v != 0); })
+// (RDNA4's 64-bit scalar arithmetic: SCC untouched.)
+TIER_S2(s_add_nc_u64, v = a + b)
+TIER_S2(s_sub_nc_u64, v = a - b)
+TIER_S2(s_mul_u64, v = a * b)
 TIER_S2(s_and_b64, { v = a & b; TIER_SCC(v != 0); })
 TIER_S2(s_or_b64, { v = a | b; TIER_SCC(v != 0); })
 TIER_S2(s_xor_b64, { v = a ^ b; TIER_SCC(v != 0); })
@@ -1622,7 +1869,7 @@ int b_vccnz(const Op&, Regs& R) { if (R.lanes == 32 ? static_cast<uint32_t>(*R.v
 
 // ---- Classification
 
-enum class Cat { None, Carry, Lane, Global, Ds, Pk, Int, F32, F64, L64, Mad64, Cmp, Cndmask, Readfirstlane, S2, ScalarCmp, Saveexec, Branch, Sopk, Cmpk, Bitcmp, Endpgm, PkF16, PkMov, Div, FmaMix, Acc };
+enum class Cat { None, Carry, Lane, Global, Ds, Pk, Pk16, L64N, Permlane, Int, F32, F64, L64, Mad64, Cmp, Cndmask, Readfirstlane, S2, ScalarCmp, Saveexec, Branch, Sopk, Cmpk, Bitcmp, Endpgm, PkF16, PkMov, Div, FmaMix, Acc };
 
 struct Entry {
   Cat cat = Cat::None;
@@ -1688,6 +1935,9 @@ const std::unordered_map<std::string_view, Entry>& table() {
     I("v_lshl_add_u32", LSHL_ADD, 3);
     I("v_add_lshl_u32", ADD_LSHL, 3);
     I("v_bcnt_u32_b32", BCNT, 2);
+    I("v_ffbh_u32_e32", FFBH_U, 1);
+    I("v_ffbl_b32_e32", FFBL, 1);
+    I("v_ffbh_i32_e32", FFBH_I, 1);
     I("v_bfe_u32", BFE_U, 3);
     I("v_med3_u32", MED3_U, 3);
     I("v_med3_i32", MED3_I, 3);
@@ -1779,10 +2029,13 @@ const std::unordered_map<std::string_view, Entry>& table() {
     D("v_rcp_f64_e32", DRCP, 1);
     D("v_sqrt_f64_e32", DSQRT, 1);
     D("v_floor_f64_e32", DFLOOR, 1);
+    D("v_min_f64", DMIN, 2);
+    D("v_max_f64", DMAX, 2);
     D("v_ceil_f64_e32", DCEIL, 1);
     D("v_trunc_f64_e32", DTRUNC, 1);
     D("v_rndne_f64_e32", DRNDNE, 1);
-    const auto L = [&](std::string_view n, int k, int arity, uint32_t sub) { m[n] = {Cat::L64, k, arity, 0, nullptr, sub}; };
+    const auto L = [&](std::string_view n, int k, int arity, uint32_t sub, uint32_t fl = 0) { m[n] = {Cat::L64, k, arity, fl, nullptr, sub}; };
+    const auto LN = [&](std::string_view n, int k, int arity, uint32_t sub, uint32_t fl = 0) { m[n] = {Cat::L64N, k, arity, fl, nullptr, sub}; };
     L("v_mov_b64_e32", L_MOV, 1, 1);
     L("v_lshlrev_b64", L_LSHLREV, 2, 2);
     L("v_lshrrev_b64", L_LSHRREV, 2, 2);
@@ -1791,6 +2044,14 @@ const std::unordered_map<std::string_view, Entry>& table() {
     L("v_lshl_add_u64_g", L_LSHL_ADD_G, 3, 1 | 4);
     L("v_cvt_f64_u32_e32", L_CVT_F64_U, 1, 0);
     L("v_cvt_f64_i32_e32", L_CVT_F64_I, 1, 0);
+    // (float operands and results: a source modifier, the output modifier or the clamp leaves the instruction to the interpreter)
+    L("v_ldexp_f64", L_LDEXP, 2, 1, kFloatSrc | kFloatOut);
+    L("v_frexp_mant_f64_e32", L_FREXP_MANT, 1, 1, kFloatSrc | kFloatOut);
+    L("v_cvt_f64_f32_e32", L_CVT_F64_F32, 1, 0, kFloatSrc | kFloatOut);
+    LN("v_frexp_exp_i32_f64_e32", L_FREXP_EXP, 1, 1, kFloatSrc);
+    LN("v_cvt_f32_f64_e32", L_CVT_F32_F64, 1, 1, kFloatSrc | kFloatOut);
+    LN("v_cvt_i32_f64_e32", L_CVT_I32_F64, 1, 1, kFloatSrc);
+    LN("v_cvt_u32_f64_e32", L_CVT_U32_F64, 1, 1, kFloatSrc);
     m["v_mad_u64_u32"] = {Cat::Mad64, 0, 3};
     m["global_load_dword"] = {Cat::Global, 1, 1, 0, nullptr, 1};
     m["global_load_dwordx2"] = {Cat::Global, 1, 1, 0, nullptr, 2};
@@ -1815,12 +2076,31 @@ const std::unordered_map<std::string_view, Entry>& table() {
     m["ds_write_b96"] = {Cat::Ds, kDsWrite, 1, 0, nullptr, 3};
     m["ds_write_b128"] = {Cat::Ds, kDsWrite, 1, 0, nullptr, 4};
     m["ds_bpermute_b32"] = {Cat::Ds, kDsBperm, 1, 0, nullptr, 1};
+    m["ds_permute_b32"] = {Cat::Ds, kDsPerm, 1, 0, nullptr, 1};
+    m["ds_swizzle_b32"] = {Cat::Ds, kDsSwizzle, 1, 0, nullptr, 1};
     m["ds_add_u32"] = {Cat::Ds, kDsAdd, 1, 0, nullptr, 1};
     m["ds_read2st64_b32"] = {Cat::Ds, kDsRead2, 1, 1, nullptr, 2};
     m["ds_write2st64_b32"] = {Cat::Ds, kDsWrite2, 1, 1, nullptr, 2};
     m["ds_read2_b32"] = {Cat::Ds, kDsRead2, 1, 0, nullptr, 2};
     m["ds_write2_b32"] = {Cat::Ds, kDsWrite2, 1, 0, nullptr, 2};
     m["v_pk_add_f32"] = {Cat::Pk, FADD, 2};
+    m["v_permlane16_b32"] = {Cat::Permlane, 0, 3};
+    m["v_permlanex16_b32"] = {Cat::Permlane, 1, 3};
+    // (the packed 16-bit integers: Entry::k is the kernel of the plain form, Entry::sub the clamped one, or 0 where a clamp changes nothing)
+    m["v_pk_mul_lo_u16"] = {Cat::Pk16, PK_MULLO, 2};
+    m["v_pk_add_u16"] = {Cat::Pk16, PK_ADDU, 2, 0, nullptr, PK_ADDU_C + 1};
+    m["v_pk_add_i16"] = {Cat::Pk16, PK_ADDI, 2, 0, nullptr, PK_ADDI_C + 1};
+    m["v_pk_sub_u16"] = {Cat::Pk16, PK_SUBU, 2, 0, nullptr, PK_SUBU_C + 1};
+    m["v_pk_sub_i16"] = {Cat::Pk16, PK_SUBI, 2, 0, nullptr, PK_SUBI_C + 1};
+    m["v_pk_lshlrev_b16"] = {Cat::Pk16, PK_SHL, 2};
+    m["v_pk_lshrrev_b16"] = {Cat::Pk16, PK_SHR, 2};
+    m["v_pk_ashrrev_i16"] = {Cat::Pk16, PK_ASHR, 2};
+    m["v_pk_max_i16"] = {Cat::Pk16, PK_MAXI, 2};
+    m["v_pk_min_i16"] = {Cat::Pk16, PK_MINI, 2};
+    m["v_pk_max_u16"] = {Cat::Pk16, PK_MAXU, 2};
+    m["v_pk_min_u16"] = {Cat::Pk16, PK_MINU, 2};
+    m["v_pk_mad_u16"] = {Cat::Pk16, PK_MADU, 3, 0, nullptr, PK_MADU_C + 1};
+    m["v_pk_mad_i16"] = {Cat::Pk16, PK_MADI, 3, 0, nullptr, PK_MADI_C + 1};
     m["v_pk_mul_f32"] = {Cat::Pk, FMUL, 2};
     m["v_pk_fma_f32"] = {Cat::Pk, FMA, 3};
     m["v_cndmask_b32_e32"] = {Cat::Cndmask, 0, 3};
@@ -1842,6 +2122,9 @@ const std::unordered_map<std::string_view, Entry>& table() {
     S("s_or_b32", s_or_b32, 2);
     S("s_xor_b32", s_xor_b32, 2);
     S("s_andn2_b32", s_andn2_b32, 2);
+    S("s_add_nc_u64", s_add_nc_u64, 2);
+    S("s_sub_nc_u64", s_sub_nc_u64, 2);
+    S("s_mul_u64", s_mul_u64, 2);
     S("s_and_b64", s_and_b64, 2);
     S("s_or_b64", s_or_b64, 2);
     S("s_xor_b64", s_xor_b64, 2);
@@ -2191,17 +2474,71 @@ bool classify_sdwa(Inst& in) {
   return true;
 }
 
+
+// A DPP integer instruction (v_mov_b32_dpp, v_add_u32_dpp, v_and_b32_dpp ... in their VOP1/VOP2 forms): the first source is read through the
+// control, the others as usual.
+bool classify_dpp(Inst& in) {
+  if (in.arch == Target::Gfx1250 || !in.dual.empty() || in.sdwa || !(in.dpp || in.dpp8) || in.bitop3 || in.scaled) return false;
+  if ((in.enc != Enc::Vop1 && in.enc != Enc::Vop2) || in.dst.size() != 1 || in.short_name.empty() || in.clamp || in.omod || in.op_sel) return false;
+  uint32_t probe = 0;
+  if (!in.dpp8 && dpp_from(in.dpp_ctrl, 0, &probe) < 0) return false;   // (a control the interpreter does not model)
+  const auto& tab = table();
+  const auto it = tab.find(in.short_name);
+  if (it == tab.end() || it->second.cat != Cat::Int) return false;
+  const Entry& e = it->second;
+  if ((e.flags & (kFloatSrc | kRawSrc)) || in.src.size() < static_cast<size_t>(e.arity)) return false;
+  if ((e.flags & kCdnaOnly) && in.arch != Target::Gfx90a && in.arch != Target::Gfx942 && in.arch != Target::Gfx950) return false;
+  Op& f = in.fast;
+  if (!vgpr_dst(in.dst[0], f.dst, 1)) return false;
+  for (int k = 0; k < e.arity; ++k)
+    if (!lane_src32(in.src[k], f.src[k], false) || f.src[k].neg || f.src[k].abs) return f = Op(), false;
+  if (f.src[0].kind != kVgpr) return f = Op(), false;
+  f.sub = in.dpp_ctrl;
+  f.off0 = static_cast<int32_t>((in.row_mask & 15) | (in.bank_mask & 15) << 4 | (in.bound_ctrl ? 1u << 8 : 0) | (in.fi ? 1u << 9 : 0) |
+                                (in.dpp8 ? 1u << 10 : 0));
+  f.kern = reinterpret_cast<AnyFn>(tables().ints[e.k]);
+  f.run = h_int_dpp;
+  f.unit = kUnitValu;
+  return true;
+}
+
+
+// A VOPD pair: both halves have handlers of their own (classified when the halves were finalized), and X's result is one a handler writes whole.
+void classify_vopd(Inst& in) {
+  if (in.arch == Target::Gfx1250 || in.dual.size() != 2) return;
+  const Inst& x = in.dual[0];
+  const Inst& y = in.dual[1];
+  for (const Inst* h : {&x, &y})
+    if (!h->fast.run || h->fast.mach || h->dst.size() != 1 || h->dst[0].kind != OperandKind::Vgpr) return;
+  const uint32_t xd = x.dst[0].index, xw = std::max(1u, static_cast<uint32_t>(x.dst[0].width));   // (a 64-bit result is two registers)
+  if (xw > 2 || xd + xw > kVgprs) return;
+  bool y_reads_x = false;
+  for (const Operand& o : y.src)
+    y_reads_x = y_reads_x || (o.kind == OperandKind::Vgpr && o.index < xd + xw && xd < o.index + std::max<uint32_t>(o.width, 1));
+  Op& f = in.fast;
+  f.mach = 12;
+  f.run = h_never;
+  f.off0 = static_cast<int32_t>(xd);
+  f.words = static_cast<uint8_t>(xw);
+  f.sub = y_reads_x ? 1 : 0;
+}
+
 }  // namespace
 
 void tier_classify(Inst& in) {
   in.fast = Op();
   if (in.sdwa && classify_sdwa(in)) return;
-  // Not modelled: gfx1250 (it has its own instruction interceptions), VOPD, sub-dword and cross-lane forms, 16-bit halves,
+  if ((in.dpp || in.dpp8) && classify_dpp(in)) return;
+  if (!in.dual.empty()) {   // (VOPD: the Machine's tier_vopd runs the two halves' own handlers)
+    classify_vopd(in);
+    return;
+  }
+  // Not modelled: gfx1250 (it has its own instruction interceptions), sub-dword and cross-lane forms, 16-bit halves,
   // per-source op_sel.
-  if (in.arch == Target::Gfx1250 || !in.dual.empty() || in.sdwa || in.dpp || in.dpp8 || (in.op_sel != 0 && in.enc != Enc::Vop3p) || in.bitop3 || in.scaled) return;
+  if (in.arch == Target::Gfx1250 || in.sdwa || in.dpp || in.dpp8 || (in.op_sel != 0 && in.enc != Enc::Vop3p && in.name.rfind("v_permlane", 0) != 0) || in.bitop3 || in.scaled) return;
   const Tables& T = tables();
   Op& f = in.fast;
-  const bool vector_enc = in.enc == Enc::Vop1 || in.enc == Enc::Vop2 || in.enc == Enc::Vop3 || in.enc == Enc::Vopc;
+  const bool vector_enc = in.enc == Enc::Vop1 || in.enc == Enc::Vop2 || in.enc == Enc::Vop3 || in.enc == Enc::Vopc || in.enc == Enc::Vopd;
   if (in.flags & kInstCmp) {
     if (in.enc == Enc::Vopc || in.enc == Enc::Vop3) classify_cmp(in, T);
     return;
@@ -2265,6 +2602,14 @@ void tier_classify(Inst& in) {
       // (gfx942 and gfx950 apply or ignore an output modifier by MODE and flush what it makes denormal, CDNA3 and CDNA4 guides, 6.5: the interpreter's.)
       if (in.omod && (in.arch == gcn::Target::Gfx942 || in.arch == gcn::Target::Gfx950) && !(e.flags & kIgnoreMods)) return fail();
       for (int k = 0; k < e.arity; ++k) {
+        if ((e.k == ALIGNBIT || e.k == ALIGNBYTE) && !is_f && k == 2 && in.src[2].bits16 && !in.src[2].hi && !in.src[2].sext && (in.src[2].sel == 6 || in.src[2].sel == 4)) {
+          // (RDNA3 and RDNA4 name the shift count a 16-bit operand; the low half of a register, whose low bits are all the kernel reads of it)
+          Operand shift = in.src[2];
+          shift.bits16 = shift.half = false;
+          shift.sel = 6;
+          if (!lane_src32(shift, f.src[2], false)) return fail();
+          continue;
+        }
         if (e.flags & kRawSrc) {   // (a half: its inline float constants too)
           if (!lane_src32_half(in.src[k], f.src[k])) return fail();
         } else if (!lane_src32(in.src[k], f.src[k], (is_f && !((e.flags & kIntSrc1) && k == 1)) || (e.flags & kFloatSrc))) {
@@ -2319,7 +2664,7 @@ void tier_classify(Inst& in) {
       if (e.k == DADD) f.nan = kNanAdd;
       else if (e.k == DMUL) f.nan = kNanMul;
       else if (e.k == DFMA && !(e.flags & kFmac)) f.nan = kNanFma;   // (v_fmac_f64 is a plain std::fma: the interpreter's)
-      else if (e.k != DFMA && e.k != DRNDNE) f.nan = kNanPass;      // (a one-input function of the host's: no second payload to choose; nearbyint's quieting is the compiler's)
+      else if (e.k != DFMA && e.k != DRNDNE && e.k != DMIN && e.k != DMAX) f.nan = kNanPass;      // (a one-input function of the host's: no second payload to choose; nearbyint's quieting is the compiler's)
       if ((e.k == DADD || e.k == DMUL || e.k == DFMA) && !f.omod && !f.clamp) {   // (the pairs' rows, no 64-bit arrays)
         const uint32_t op = e.k == DADD ? 0 : e.k == DMUL ? 1 : 2;
         uint32_t uniform = 0;   // (the operands that are one value in every lane)
@@ -2329,20 +2674,25 @@ void tier_classify(Inst& in) {
         f.kern = reinterpret_cast<AnyFn>(T.f64_rows[op * 8 + uniform]);
         f.run = TIER_RUN(h_f64r);
       } else {
+        if (e.k == DMIN || e.k == DMAX) f.sub = 1;   // (opposite zeros go to the interpreter)
         f.kern = reinterpret_cast<AnyFn>(T.f64[e.k]);
         f.run = TIER_RUN(h_f64);
       }
       f.unit = kUnitValu;
       return;
     }
-    case Cat::L64: {
+    case Cat::L64:
+    case Cat::L64N: {
       if (!vector_enc || in.dst.size() != 1 || in.src.size() < static_cast<size_t>(e.arity)) return;
-      if (!vgpr_dst(in.dst[0], f.dst, 2)) return fail();
+      if (!vgpr_dst(in.dst[0], f.dst, e.cat == Cat::L64 ? 2 : 1)) return fail();
+      if (((e.flags & kFloatOut) && (in.omod || in.clamp)) || ((e.flags & kFloatSrc) && (in.omod || in.clamp))) return fail();
+      for (int k = 0; k < e.arity; ++k)
+        if ((e.flags & kFloatSrc) && (in.src[k].neg || in.src[k].abs)) return fail();
       for (int k = 0; k < e.arity; ++k)
         if (!((e.sub >> k & 1) ? lane_src64(in.src[k], f.src[k], false) : lane_src32(in.src[k], f.src[k], false))) return fail();
       f.sub = e.sub;
       f.kern = reinterpret_cast<AnyFn>(T.l64[e.k]);
-      f.run = e.k == L_MOV && (e.sub & 1) ? TIER_RUN(h_mov64) : TIER_RUN(h_l64);
+      f.run = e.cat == Cat::L64N ? TIER_RUN(h_l64n) : e.k == L_MOV && (e.sub & 1) ? TIER_RUN(h_mov64) : TIER_RUN(h_l64);
       f.unit = kUnitValu;
       return;
     }
@@ -2407,7 +2757,14 @@ void tier_classify(Inst& in) {
       f.sub = static_cast<uint32_t>(e.k);
       f.words = static_cast<uint8_t>(e.sub);
       f.off0 = in.offset, f.off1 = in.offset1;
-      if (e.k == kDsBperm) {
+      if (e.k == kDsSwizzle) {   // (the data register is the one operand; the offset is the pattern)
+        if (in.dst.size() != 1 || in.dst[0].kind != OperandKind::Vgpr || in.dst[0].index >= kVgprs || in.dst[0].width != 1) return;
+        f.dst.kind = kVgpr, f.dst.index = in.dst[0].index;
+        f.run = TIER_RUN(h_ds);
+        f.unit = kUnitLds;
+        return;
+      }
+      if (e.k == kDsBperm || e.k == kDsPerm) {
         if (in.dst.size() != 1 || in.src.size() < 2) return;
         if (in.dst[0].kind != OperandKind::Vgpr || in.dst[0].index >= kVgprs || in.dst[0].width != 1) return;
         if (in.src[1].kind != OperandKind::Vgpr || in.src[1].index >= kVgprs) return;
@@ -2477,6 +2834,53 @@ void tier_classify(Inst& in) {
       f.nan = e.k == FADD ? kNanAdd : e.k == FMUL ? kNanMul : kNanPkFma;
       f.kern = reinterpret_cast<AnyFn>(T.f32[e.k]);
       f.run = h_pk;
+      f.unit = kUnitValu;
+      return;
+    }
+    case Cat::Pk16: {
+      if (in.enc != Enc::Vop3p || in.dst.size() != 1 || in.src.size() < static_cast<size_t>(e.arity)) return;
+      if (!vgpr_dst(in.dst[0], f.dst, 1)) return fail();
+      const bool clamps = in.clamp && e.sub;
+      uint32_t sub = 0;
+      for (int k = 0; k < e.arity; ++k) {
+        const Operand& o = in.src[k];
+        Src& s = f.src[k];
+        s = Src();
+        if (o.sel != 6 || o.half || o.bits16) return fail();
+        const unsigned top[2] = {static_cast<unsigned>(in.op_sel >> k & 1), static_cast<unsigned>(in.op_sel_hi >> k & 1)};
+        if (o.kind == OperandKind::Vgpr) {
+          if (o.index >= kVgprs) return fail();
+          s.kind = kVgpr, s.index = o.index;
+        } else if (o.kind == OperandKind::Sgpr) {
+          if (o.index >= kSgprs || o.width >= 2) return fail();
+          s.kind = kSgpr, s.index = o.index;
+        } else if (o.kind == OperandKind::Inline || o.kind == OperandKind::InlineFloat || o.kind == OperandKind::Literal) {
+          // (the interpreter's constant_half: a float constant is a half in the low 16 bits, zero above; any other is its 32 bits cut by the half)
+          const auto half = [&](unsigned t) -> uint32_t {
+            if (o.kind == OperandKind::InlineFloat) return t ? 0u : static_cast<uint32_t>([&] { const _Float16 h = static_cast<_Float16>(o.fvalue); uint16_t b; std::memcpy(&b, &h, 2); return b; }());
+            return static_cast<uint16_t>(static_cast<uint32_t>(o.value) >> (16 * t));
+          };
+          s.kind = kConst, s.value = half(top[0]), s.value64 = half(top[1]);
+        } else {
+          return fail();
+        }
+        sub |= top[0] << k | top[1] << (3 + k);
+      }
+      f.sub = sub;
+      f.kern = reinterpret_cast<AnyFn>(T.ints[clamps ? e.sub - 1 : e.k]);
+      f.run = h_pk16;
+      f.unit = kUnitValu;
+      return;
+    }
+    case Cat::Permlane: {
+      if (in.enc != Enc::Vop3 || in.dst.size() != 1 || in.src.size() < 3) return;
+      if (!vgpr_dst(in.dst[0], f.dst, 1)) return fail();
+      if (in.src[0].kind != OperandKind::Vgpr || in.src[0].sel != 6 || in.src[0].half || in.src[0].bits16 || in.src[0].index >= kVgprs) return fail();
+      f.src[0].kind = kVgpr, f.src[0].index = in.src[0].index;
+      if (!scalar_src(in.src[1], f.src[1]) || !scalar_src(in.src[2], f.src[2])) return fail();
+      f.sub = in.op_sel & 3;
+      f.off0 = e.k;
+      f.run = h_permlane;
       f.unit = kUnitValu;
       return;
     }
