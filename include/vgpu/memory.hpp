@@ -76,6 +76,10 @@ inline constexpr uint64_t kDeviceVaEnd = kDeviceVaBase + kDeviceVaWindows * kDev
 // Whether an address is in some device's window. "At or above the base" alone
 // claimed every higher address -- the stack included -- for the devices.
 inline constexpr bool is_device_va(uint64_t addr) { return addr >= kDeviceVaBase && addr < kDeviceVaEnd; }
+// Spike instrumentation (docs/perf-design/09-host-gpu-spike.md, step A): when a hook is set, every allocation ('A' base size), free ('F' base size) and
+// host-side copy into ('W'), out of ('R') or fill ('Z') of device memory ('W'/'R'/'Z' addr len) is reported. Null: one relaxed load per such call.
+using MemTraceHook = void (*)(char op, uint64_t a, uint64_t b);
+void set_mem_trace(MemTraceHook hook);
 inline constexpr uint64_t kAllocAlign = 256;  // matches CUDA's documented minimum alignment
 inline constexpr uint64_t kChunkSize = 64 * 1024;
 // How many freed allocations stay individually diagnosable. Bounded so that

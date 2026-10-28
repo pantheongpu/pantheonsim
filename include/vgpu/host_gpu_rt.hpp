@@ -31,7 +31,8 @@ class Runtime {
   bool try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args,
                   MemoryManager& mem);
   // `mem`, when the mode is verifying, is the simulator's memory after the launch it just ran.
-  void note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, double sim_seconds, const MemoryManager* mem = nullptr);
+  void note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, double sim_seconds, const MemoryManager* mem = nullptr,
+                      const std::vector<std::vector<uint8_t>>* args = nullptr);
 
   struct Impl;
   ~Runtime();

@@ -92,6 +92,34 @@ struct Api {
   }
 };
 
+// VGPU_HOST_GPU_TRACE=<file> (spike, step A): the stream of allocations, frees, host copies and launches, for an offline model of the transfers
+// a persistent card copy would still need (docs/perf-design/data/round13/residency_model.py). Events the mode itself causes are not recorded.
+thread_local bool t_internal = false;
+FILE* g_trace_file = nullptr;
+std::mutex g_trace_mu;
+void trace_hook(char op, uint64_t a, uint64_t b) {
+  if (t_internal || !g_trace_file) return;
+  std::lock_guard<std::mutex> g(g_trace_mu);
+  std::fprintf(g_trace_file, "%c %llx %llx\n", op, static_cast<unsigned long long>(a), static_cast<unsigned long long>(b));
+}
+// Installed when the library loads, so the allocations and copies before the first launch are in the trace.
+struct TraceInit {
+  TraceInit() {
+    const char* tf = std::getenv("VGPU_HOST_GPU_TRACE");
+    if (!tf || !*tf) return;
+    g_trace_file = std::fopen(tf, "w");
+    if (!g_trace_file) return;
+    std::setvbuf(g_trace_file, nullptr, _IOFBF, 1 << 20);
+    set_mem_trace(trace_hook);
+    std::atexit([] { std::lock_guard<std::mutex> g(g_trace_mu); std::fflush(g_trace_file); });
+  }
+} g_trace_init;
+struct InternalScope {
+  bool prev;
+  InternalScope() : prev(t_internal) { t_internal = true; }
+  ~InternalScope() { t_internal = prev; }
+};
+
 bool quiet() {
   const char* q = std::getenv("VGPU_QUIET");
   return q && *q && *q != '0';
@@ -127,6 +155,10 @@ struct Runtime::Impl {
   std::mutex mu;
   uint64_t max_bytes = 2ull << 30;
   bool dead = false;
+  struct Last {
+    bool in_set = false;
+    double card_s = -1;
+  } last;
   // VGPU_HOST_GPU_VERIFY=1 runs the launches the mode would offload on the card and then in the simulator, and compares the memory
   // (the simulator's result is the one the program gets); =all does it for every kernel the card can run, in or out of the exact set.
   int verify = 0;
@@ -334,8 +366,27 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
   return ordinal == 0 ? rt : nullptr;
 }
 
-void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, double sim_seconds, const MemoryManager* mem) {
+void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, double sim_seconds, const MemoryManager* mem,
+                             const std::vector<std::vector<uint8_t>>* args) {
   std::lock_guard<std::mutex> g(impl_->mu);
+  InternalScope internal;
+  if (g_trace_file) {
+    std::string bases;
+    if (mem && args)
+      for (const auto& a : *args)
+        for (size_t i = 0; i + 8 <= a.size(); i += 8) {
+          uint64_t v, b, sz;
+          std::memcpy(&v, &a[i], 8);
+          if (v && mem->find_allocation(v, &b, &sz)) {
+            char t[24];
+            std::snprintf(t, sizeof t, " %llx", static_cast<unsigned long long>(b));
+            bases += t;
+          }
+        }
+    std::lock_guard<std::mutex> tg(g_trace_mu);
+    std::fprintf(g_trace_file, "L %s %llu %.9f %d %.9f |%s\n", fn.name.c_str(), static_cast<unsigned long long>(uint64_t{cfg.grid[0]} * cfg.grid[1] * cfg.grid[2]),
+                 sim_seconds, impl_->last.in_set ? 1 : 0, impl_->last.card_s, bases.c_str());
+  }
   Impl::Pending& p = impl_->pending;
   if (p.active && mem && p.kernel == fn.name) {
     bool same = true;
@@ -364,12 +415,15 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
                          MemoryManager& mem) {
   Impl& im = *impl_;
   std::lock_guard<std::mutex> g(im.mu);   // one offloaded launch at a time: the card path shares the reserved window
+  InternalScope internal;
+  im.last = {};
   if (im.dead) return false;
   im.pending = {};
   const char* why = "";
   uint64_t static_instrs = 0;
   bool runnable = false;
   const bool in_exact_set = im.kernel_eligible(fn, cfg, args, mem, &why, &static_instrs, &runnable);
+  im.last.in_set = in_exact_set;
   if (!in_exact_set && !(im.verify == 2 && runnable)) {
     ++(std::string(why).find("exact set") != std::string::npos ? im.stats.refused_kernel : im.stats.refused_launch);
     ++im.stats.simulated;
@@ -380,6 +434,7 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
   // What the simulator took before for this kernel, else a lower bound from the code and the grid.
   std::optional<double> sim_s = im.sim_times.predict(fn.name, blocks);
   if (!sim_s && im.static_estimate) sim_s = static_sim_seconds(blocks, cfg.block[0] * cfg.block[1] * cfg.block[2], static_instrs, im.costs);
+  if (!sim_s && im.verify) sim_s = 0;   // verifying: every launch runs on both, whatever the rule would say
   if (!sim_s) {   // the first launch of every kernel is the simulator's: it teaches the estimate (VGPU_HOST_GPU_STATIC=1 is the exception, and is not sound)
     ++im.stats.simulated;
     return false;
@@ -449,6 +504,7 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
     if (!quiet()) std::fprintf(stderr, "host_gpu: %s failed on the card (error %d); mode off, the simulator runs it\n", fn.name.c_str(), r);
     return false;
   }
+  im.last.card_s = kernel_s;
   if (im.verify) {   // keep the card's bytes; the simulator runs the launch next and note_simulated compares
     im.pending = {};
     im.pending.active = true;

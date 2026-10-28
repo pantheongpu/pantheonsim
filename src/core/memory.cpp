@@ -126,6 +126,11 @@ std::ostream& operator<<(std::ostream& os, Hex h) {
 
 }  // namespace
 
+static std::atomic<MemTraceHook> g_mem_trace{nullptr};
+void set_mem_trace(MemTraceHook hook) { g_mem_trace.store(hook, std::memory_order_relaxed); }
+#define VGPU_MEM_TRACE(op, a, b) \
+  do { if (MemTraceHook h_ = g_mem_trace.load(std::memory_order_relaxed)) h_(op, a, b); } while (0)
+
 uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
   // A new entry in the table makes no answer a thread remembered wrong, so readers' memories stay.
   ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
@@ -151,6 +156,7 @@ uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
     live_.insert(live_.end(), std::move(node));   // the newest address is the highest
   }
   notify_usage();
+  VGPU_MEM_TRACE('A', base, size);
   return base;
 }
 
@@ -197,6 +203,7 @@ void MemoryManager::free(uint64_t ptr) {
   }
   auto it = live_.find(ptr);
   if (it != live_.end()) {
+    VGPU_MEM_TRACE('F', ptr, it->second.size);
     used_ -= it->second.size;
     // Quarantine the freed range so use-after-free stays diagnosable, evicting
     // the oldest entry once the bound is reached.
@@ -712,6 +719,7 @@ uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
 
 void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t len) {
   if (len == 0) return;
+  VGPU_MEM_TRACE('Z', dst, len);
   // Host memory mapped here is filled where it is, the pattern's phase
   // running on across pieces.
   if (std::vector<HostPiece> pieces; host_pieces(dst, len, &pieces, true)) {
@@ -782,6 +790,7 @@ uint64_t MemoryManager::resident_bytes() const {
 
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (len == 0) return;
+  VGPU_MEM_TRACE('W', dst, len);
   if (host_maps_ && host_maps_->may_contain(dst)) {
     if (HostHit h; lookup_host(dst, len, &h)) {
       if (h.read_only) throw_read_only_host_write(dst, len);
@@ -1395,6 +1404,7 @@ bool MemoryManager::is_host_mapped(uint64_t addr) const {
 
 void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   if (len == 0) return;
+  VGPU_MEM_TRACE('R', src, len);
   // Managed memory is the caller's own buffer; there is no chunk table to walk.
   if (host_maps_ && host_maps_->may_contain(src)) {
     if (HostHit h; lookup_host(src, len, &h)) {

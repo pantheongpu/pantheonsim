@@ -35,9 +35,11 @@ static std::vector<std::vector<uint8_t>> fatbins(const std::string& prog) {
   }
   return out;
 }
-struct Run { std::vector<Alloc> res; double kernel_s = 0, push_s = 0, pull_s = 0; bool ok = false; };
+struct Run { std::vector<Alloc> res; double loop_sync_s = 0, loop_queued_s = 0; double kernel_s = 0, push_s = 0, pull_s = 0; bool ok = false; };
 static std::vector<std::vector<uint8_t>> g_fbs;
 static CUmodule g_mod;
+struct Run;
+static Run* g_loop_run = nullptr;
 static bool replay(const std::string& kname, const unsigned grid[3], const unsigned block[3], unsigned shared, const std::vector<std::vector<uint8_t>>& args, const std::vector<Alloc>& pre, Run* run, CUcontext ctx) {
   // granule-aligned union of the allocations, grouped into runs of touching granules
   std::map<uint64_t, uint64_t> gr;  // start -> end (granule aligned)
@@ -72,6 +74,13 @@ static bool replay(const std::string& kname, const unsigned grid[3], const unsig
       cuCtxSynchronize(); double t1 = now();
       CUresult r = cuLaunchKernel(fn, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, 0, kp.data(), nullptr);
       CUresult s = r ? r : cuCtxSynchronize(); run->kernel_s = now() - t1;
+      if (!s && getenv("M2_LOOP") && run == g_loop_run) {   // data already resident: launch + sync, back to back, and launches queued then one sync
+        int n = atoi(getenv("M2_LOOP")); double ta = now();
+        for (int i = 0; i < n; ++i) { cuLaunchKernel(fn, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, 0, kp.data(), nullptr); cuCtxSynchronize(); }
+        run->loop_sync_s = (now() - ta) / n; ta = now();
+        for (int i = 0; i < n; ++i) cuLaunchKernel(fn, grid[0], grid[1], grid[2], block[0], block[1], block[2], shared, 0, kp.data(), nullptr);
+        cuCtxSynchronize(); run->loop_queued_s = (now() - ta) / n;
+      }
       if (s) { const char* n = "?"; cuGetErrorName(s, &n); fprintf(stderr, "launch failed: %s\n", n); good = false; }
     }
     if (mod) {
@@ -104,7 +113,7 @@ int main(int argc, char** argv) {
     std::vector<Alloc> pre, post; { auto r = slurp(std::string(base) + ".pre", &ok); if (!ok || !parse_mem(r, &pre)) { printf("%06d %s: no .pre (over the capture size cap)\n", seq, kname); ++fail; continue; } auto q = slurp(std::string(base) + ".post", &ok); if (!ok || !parse_mem(q, &post)) { ++fail; continue; } }
     double sim_s = 0; { auto t = slurp(std::string(base) + ".time", &ok); if (ok) sim_s = atof(std::string(t.begin(), t.end()).c_str()); }
     uint64_t bytes = 0; for (auto& a : pre) bytes += a.size;
-    Run r1, r2; bool g1 = replay(kname, grid, block, shared, args, pre, &r1, ctx); bool g2 = g1 && replay(kname, grid, block, shared, args, pre, &r2, ctx);
+    Run r1, r2; g_loop_run = &r1; bool g1 = replay(kname, grid, block, shared, args, pre, &r1, ctx); bool g2 = g1 && replay(kname, grid, block, shared, args, pre, &r2, ctx);
     if (!g1 || !g2) { printf("%06d %s: replay failed\n", seq, kname); ++fail; continue; }
     // compare card run 1 against the simulator's post, chunk by chunk; card run 1 against card run 2 for determinism
     uint64_t nchunks = 0, bad = 0, badw = 0, nd_chunks = 0, changed_bytes = 0; float maxulp = 0; std::string first;
@@ -118,6 +127,7 @@ int main(int argc, char** argv) {
     const char* verdict = bad == 0 ? "AGREE" : nd_chunks ? "DIFFER (card nondeterministic)" : "DIFFER";
     (bad == 0 ? agree : (nd_chunks ? nondet : differ))++;
     printf("%06d %-40.40s grid %ux%ux%u block %ux%ux%u mem %6.1f MiB changed %6.1f MiB chunks %llu bad %llu words %llu maxulp %.0f | card kernel %9.1f us push %7.2f ms pull %7.2f ms | sim %9.3f ms | %s %s\n", seq, kname, grid[0], grid[1], grid[2], block[0], block[1], block[2], bytes / 1048576.0, changed_bytes / 1048576.0, (unsigned long long)nchunks, (unsigned long long)bad, (unsigned long long)badw, maxulp, r1.kernel_s * 1e6, r1.push_s * 1e3, r1.pull_s * 1e3, sim_s * 1e3, verdict, first.c_str());
+    if (r1.loop_sync_s > 0) printf("       resident: launch+sync %.1f us, queued launches %.1f us each (data already on the card; sim %.3f ms -> %.0fx)\n", r1.loop_sync_s * 1e6, r1.loop_queued_s * 1e6, sim_s * 1e3, sim_s / r1.loop_sync_s);
   }
   printf("SUMMARY %s: agree %d differ %d card-nondeterministic %d failed/skipped %d\n", prog.c_str(), agree, differ, nondet, fail);
   return 0;
