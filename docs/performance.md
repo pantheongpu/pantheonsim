@@ -4986,3 +4986,9 @@ the other canaries 0.998x to 1.02x. Unit tests: `test_tc_ampere`, `test_tc_amper
 
 ### Tests and mutations
 `test_amd_gcn_tier_same_bits` (and its `simd_base` twin; run with `VGPU_TIER_ONLY=ds_`): fails under a swapped pair of stores in `lds_to_rows<4>`, a swapped pair in `rows_to_lds<2>`, a reversed word order in `ds_write_lanes` (`ds_write_b96`), and a skipped last group of the all-lanes loop.
+
+### A layout regression and its fix (same branch)
+With the wide LDS code inside `gcn_tier.cpp` the flat and global handlers read 2 to 12% slower (flat mi300x 0.905x, rx6800 0.876x on a quiet box; `perf stat` on server3: equal instruction counts, more cycles, `find_ordinary_miss` and `run_allocation` suddenly in the profile): the larger unit moved the link-time inlining and the layout of code that does not touch the LDS. Moving the code into its own unit, `gcn_tier_ds.cpp`, compiled with `-fno-lto` (the functions are plain calls taking row pointers), returned them: user cycles A/B flat 1.02 (mi300x) and 1.04 (rx6800), mem 0.99 and 1.01, lds 1.00, with `ldsx` 1.17 and 1.13; the tier digest tests (both levels), `gcn_same_bits` and `gcn_memory_same_bits` pass, and the same mutations fail `test_amd_gcn_tier_same_bits`.
+
+### Not done, and negative results (this branch)
+* AMD atomics: giving each 4-byte integer operation its own lane function in `wave_atomics` cut host instructions by 9% (mi300x) and 7% (rx6800) but user cycles by only 1.7% (p 0.005) and -1.6% (rx6800 slower, p 0.001), and the flat rows moved 0.975 to 1.056 with the change in `gcn_exec.cpp`: dropped.
