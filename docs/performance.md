@@ -4878,3 +4878,172 @@ Sanitizers: ASan+UBSan -O0 (`test_amd_mfma_math`, `test_amd_matrix_fast` 2248 s,
 * `flat_*`, `buffer_load/store`, `global_atomic_*` in the tier: `flat` costs the same per instruction as `mem` (48 ns) already, the cost is the memory work, not the frame.
 * fp8/small-float decode by `vgatherdpd`: not tried, a gather costs about what the scalar table lookups do on Zen 4.
 * AVX-512 for the tiles: Zen 4 runs it as two 256-bit halves, nothing to show here.
+
+## Round sp4: the SASS tier's run ends and diverged warps (branch `sp4-sassctl`, base 53721cb2)
+
+Profiled first (A build, one host thread, `cycles:u`): `divergent` is 3.59 M runs of 2.8 warp instructions, about 100 cycles a warp instruction at IPC 3.5, branch misses 1% of
+branches, no L1i misses: bound by instructions per run, not by stalls. `Runner::step_warp` (the tier's run loop inlined) was 50% of it, `pick_group_avx2` 13%, `blend_m_k` 8%.
+`warp` is 1.28 M runs of 4 instructions, `step_warp` 33%, `shfl_move` 9%, `h_vote` 7.5%.
+
+* **Known address** (`tier_run_t`, the chain): a run that ends by giving every lane of its group one address (a branch all the group takes or none, a handler-ended
+  instruction such as SHFL or VOTE, BSSY, NOP) knows it; when no runnable lane stands outside the group the next group is the runnable lanes at that address and the 32 addresses
+  are not read back. `warp` about 1.12x of its own.
+* **VOTE** with a full warp writes the ballot as vector stores, not a loop over the lanes' bits: `warp` about 1.06x.
+* **A branch's addresses for a partial group** (`sasslanes::set_pcs_partial`, `select_pcs`, `src/simd/lanes.cpp`): AVX2 load, blend, store of four lanes at a time, from a table of
+  the sixteen nibble masks; the per-lane loops they replace had a trip count no predictor learns. `divergent` 1.12x. NOTE: the first version used `vpmaskmovq` stores and was
+  slower than the loop (10% of `divergent` in the two functions, `divergent` 1.00x): masked stores are slow on Zen 4.
+
+Result (B/A of medians, 11 alternating runs, cpu 0, counters identical, noise from A/A 0.98x to 1.04x): `warp` sass 1.184x, `divergent` sass 1.130x (both p < 0.001); every canary row
+(sass and ptx) within the A/A noise except `wmma` sass 0.962x and `mma_ptx` sass 0.955x (15 runs, p 0.000 and 0.016). Those two run in `mma_avx2_chunked_f` (70% of the cycles, code this branch
+does not touch) with 1% fewer instructions and 3 to 5% more cycles: a code-placement effect (the build without the blend piece has the same cycles as A (perf stat); a 16-byte frame pad in `step_warp`, whose
+frame shrank by 16 bytes, and 64-byte alignment of the two new functions did not remove it). Not understood further.
+
+Tests (CMake-wired): `test_sass_lanes` `set_pcs_and_select_pcs_agree_with_the_lane_loop`; `test_sass_block_reuse` (hand-encoded SASS, decode checked) `a_full_warp_vote_gives_every_lane_the_ballot` and
+`a_diverged_warp_votes_among_the_lanes_that_run_it` (a split warp, a partial vote). Mutations, each caught: the known address `here + 32` (5 of 6 tests of `test_sass_block_reuse` fail), the vote fill
+`ballot ^ (l == 5)`, `select_pcs` with target and next swapped, the nibble mask `& 7` in `set_pcs_avx2`.
+
+### Not done, and negative results (this branch)
+
+* *BSYNC's arrival mask worked out before the wait stores* (to avoid reading the wait arrays back from byte and word stores in flight): A/B against the tree with it, `divergent` 0.981x without it (p 0.23): not a win, dropped.
+* *`shfl_move` Down and Up as SSE2 vectors* (unaligned loads inside the row, gathers at the edges): `warp` 1.017x (p 0.042, under 2%), dropped.
+* *`vpmaskmovq` for the partial pc stores*: slower than the loop on Zen 4, see above.
+## Round sp4: the SASS tier's memory handlers (branch `sp4-memhot`, base 53721cb2)
+
+Profiled first (base build, one host thread, `cycles:u` and `instructions:u`, RTX 3060 profile): the memory workloads run at an IPC of 3.3 to 4.5, so they are bound by instructions, not by stalls.
+`h_local` is 31% of `local` (a scalar address loop that reloads `w.local_size` and the frame vector's data pointer for every lane, because the stores to the register row may alias them), `h_global` + `tier_global16` 12% of `mem`, whose
+address array (32 stores) and the second pass that compared it with a run were the cost of the coalesced case, which then never used the array.
+
+### What changed
+* **`h_local`**: the full-warp address loop works on 32-bit offsets (the same low 32 bits of base + uniform + immediate), the frame base and size are read once. `local` -7.4% instructions.
+* **`h_global`, `tier_global16`**: a contiguous mask of lanes is tested for being consecutive elements on the registers' rows (`sassmem::global_run`, `include/vgpu/exec/sass_mem_rows.hpp`, SSE2, two lanes a step), and the 64-bit address array is built only
+  for an access that is not a run or that the memory manager declines. `mem` -4.9% instructions, `shared` (its global loads) -3.6%.
+* Two code-placement fixes found by the canaries, with equal instruction counts: `mma_avx2_chunked_f` (`wmma` read 0.973x as its start moved 32 bytes within a line) is aligned to 64 bytes; `tier_set_pcs` (`divergent` read 0.96x) too.
+
+### Results (min of 7 runs of cycles and the instruction count, `perf stat`, one host thread; base 53721cb2 / this branch; the box ran at load 15 to 50, so the 9 to 15 run A/Bs below are noisy)
+mem 576.1 M / 533.3 M cycles (0.926x), 2410.6 M / 2292.3 M instructions; shared 137.8 / 134.4 (0.976x), 637.3 / 614.6; local 465.8 / 410.5 (0.881x), 2193.9 / 2030.4; atomics, warp, divergent, wmma, mma_ptx, int_alu, f32_fma within 1% (cycles), instruction counts equal.
+`bench.py --ab`, 11 alternating runs, final tree, cpu 4, load 20 to 30: mem 1.097x, local 1.112x, shared 1.024x, warp 1.031x (not changed here: placement), atomics 1.024x (not changed here: placement), divergent 1.004x, wmma 1.002x, all p < 0.001 where "faster"; PTX rows 0.99x to 1.02x (same); counters identical in every row. A/A: 0.996x to 1.004x on mem, shared, local.
+
+### Tests
+`test_sass_mem_rows` (CMake-wired): `global_run` against the lane loop over runs, runs with one lane a bit off, carries into the high half, lo-only rows, no row, element sizes 1 to 16, masks of any start and length. Mutants killed: the second lane's expected address off by one,
+the high rows ignored, the last odd lane skipped, a null base counted as a run. `h_local` is covered by the bench `local` self-check (`bench_counters`): a load that reads the lane's frame 4 bytes off fails `thread 0`.
+
+### Not done, and negative results
+* *Bank-0 splat rows* (a per-block cache of the 32-lane row a constant-bank-0 word is spread into by `tier_dyn`, to avoid 128 bytes of 16-byte stores read back as 32-byte vectors): 0 instructions saved (2292.3 M with and without), cycles not separable from noise at load 30; adds a 2.6 KB member to `Block`. Dropped.
+* *`h_shared` on the registers' rows* (the same idea for a warp's 32 consecutive shared words or one word every lane names): 1.5 M of 637 M instructions (0.24%) saved on `shared`. Dropped.
+* *Atomics, a warp that names one word keeps it in a register through the lanes* (instead of a store-to-load chain through `cur[slot[l]]`): `atomics` 1.010x (15 runs) against 1.007x without it. Dropped.
+* *Closed form for the sector count of a private array* (`sectors_fast` is 22% of `local` with `sector_window_k` and `distinct_sectors`): `on_stride` already turns a warp that is not on a stride away after four lanes; not changed.
+* PTX engine: not changed (exec_ld/exec_st read, no piece measured); its `mem` row moved 0.91x in cycles with equal instructions, `int_alu` +1.6% cycles, `api` +1.5%: placement, not chased.
+## Round sp4: the AMD engine's carry instructions (branch `sp4-amdprof`, base 53721cb2)
+
+**Measured first** (perf `cycles:u`, one host thread, the bench-amd binaries of both targets, A = the round 3 build): `h_carry`, the tier's handler for `v_add_co_u32`, `v_addc_co_u32`, `v_sub_co_u32`, `v_subb_co_u32` and the reversed forms, was a scalar loop over the active lanes (a swap, a carry-in shift and a 64-bit sum a lane), twice. RDNA code builds every 64-bit address with that pair, so on rx6800 it took 35% of `mem`, 26% of `flat` and 19% of `narrow` (the same workloads cost about twice as much on rx6800 as on mi300x, whose compiler uses `v_lshl_add_u64`). Ranking of the other rows (share of the process, rx6800 / mi300x): `buf` `buffer_words` 36 / 44% plus the batch memory functions 25%; `atomics` `wave_atomics` 37 / 44%; `ldsx` `h_ds` 42 / 45%; `narrow` `wave_scalars` 17 / 28%; `smem`, `divergent`, `wave` the per-instruction frame (`run_groups` 23 to 40%) with no handler over 11%; `valu_*` handlers 10 to 21% of the process, the rest the bench binary's self-check.
+
+### What changed
+* `k_carry<SUB>` (`gcn_tier_kernels.inc`, table `kCarry`): the eight shapes as lane-row kernels, 8 lanes at a time under AVX2 (carry-in bits expanded to lane masks, unsigned compares by a sign-bit bias, the carry mask by `movemask`), the old per-lane arithmetic at the baseline level; all n lanes are computed and the handler masks the carry by EXEC and merges the sum (`h_carry_body`, `TIER_DUAL`, `Tables::carry`).
+
+### Results (B/A of medians, one host thread, counters identical in every row, `--check-counters` matches)
+| workload | mi300x | rx6800 |
+| --- | ---: | ---: |
+| `mem` | 1.01 | **1.51** (p < 0.001) |
+| `flat` | 1.01 | **1.29** (p < 0.001) |
+| `narrow` | 1.01 | **1.35** (p 0.03; 0.9 to 1.3 in other runs while the server was loaded) |
+Canaries (`valu_*`, `mfma*`, `smfmac`, `wave`, `lds`, `divergent`, `launch`, `api`, `buf`): all within 0.97 to 1.03; single rows that read 0.955 (`smem` mi300x), 0.974 (`atomics` rx6800) and 0.978 (`mfma`) in one run read 1.31, 1.03 and 1.26 (p > 0.6) in the next with the code moved: noise on a shared box, not a change (no code of those paths changed).
+
+### Tests and mutations
+`test_amd_gcn_tier_same_bits` (and its `simd_base` twin) already runs every carry shape of the corpora with the tier off and on over the carries-and-borrows flavour and half the lanes off. Mutations (built and run with `VGPU_TIER_ONLY=_co_`): carry-in bits read from lane 0 for every group of 8 (`cin & 0xFF`), and the borrow as `x <= y`: both fail it.
+
+### Buffer dwords and whole-wave scalars (same branch)
+`buffer_words` (the whole-wave MUBUF dword path) and `wave_scalars` were instruction-bound (IPC 5): the per-lane loop re-read the resource limits through the `fits` lambda's references (stores to `lanes[]` and `index` forced reloads) and went through `word` / `set_word` for every lane. Now the limits are a small by-value `BufLimits` (`fits(at, bytes, index)` takes the lane's index), the operand rows are taken once (`row_of`), and the loops read and write the rows directly; the slow lane-by-lane loop uses the same `BufLimits::fits`. Host instructions of `buf` on rx6800: 11.76 G to 9.54 G, cycles 2.34 G to 1.89 G.
+
+| workload | mi300x | rx6800 |
+| --- | ---: | ---: |
+| `buf` | **1.40** (p < 0.001) | **1.26** (p < 0.001) |
+| `narrow` (this piece alone, `wave_scalars`) | **1.08** (p < 0.001) | 1.28 with the carry kernels (this piece's share not separable) |
+Canaries `smem`, `lds`, `wave`, `divergent`, `valu_int`, `mem`, `flat`, `atomics`: 0.97 to 1.04, counters identical. Tests: `test_amd_gcn_memory_same_bits` (buffer corpora over valid, invalid, too small and swizzled resources, and the wave-wide paths against lane by lane) fails under: the out-of-range lanes not zeroed, the index read from the wrong lane, the high word of a 64-bit store taken from the low row, the high word of a 64-bit load written from the low. Not covered by it (the corpus never sets RDNA's OOB_SELECT 1 with an index at the record count): the `index <= records` boundary. The same-address memo of `wave_scalars` is unobservable (equal addresses read equal values), a mutation of it survives.
+`atomics` (`wave_atomics`, 37 to 44% of the process) has no single hot spot (the samples are spread over `atomic_data`, `atomic_result` and the batch loop); left.
+
+### The tensor float kernel's placement residual (branch `sp4-place`, on `sp4-integration`)
+
+`wmma` and `mma_ptx` (SASS) read 0.96x of the base in the integration tree with 1% fewer instructions. `perf stat` showed the cause: the front end. `op_cache_hit_miss.op_cache_miss` 11.7 M -> 43 M and
+`de_src_op_disp.decoder` 110 M -> 449 M ops, all inside `tc86::mma_avx2_chunked_f<8,false>`, whose code was unchanged (same instructions, 64-byte-aligned or not; a sweep of the body's offset by 8 to 56
+bytes with `.nops` moved it by 2%, never back to the base). The function's eight unrolled rows each carried their own copy of the unlikely path (the scalar lanes: infinities, NaNs, out-of-range scales,
+rounding), a third of the function, between the hot vector lines. That path is now `mma_f_fix`, out of line and cold. Op-cache misses 15.5 M, cycles on `wmma` 478 M against 490 M (base) and 515 M (before).
+B/A vs the base (11 runs, cpu 0, counters identical): `wmma` sass 1.065x, ptx 1.044x, `mma_ptx` sass 1.036x, ptx 1.026x; `divergent` 1.12x, `warp` 1.15x, `local` 1.14x, `mem` 1.10x, `shared` 1.03x;
+the other canaries 0.998x to 1.02x. Unit tests: `test_tc_ampere`, `test_tc_ampere_fast`, `test_fastpath` pass.
+
+## Round sp5: the LDS wide accesses (branch `sp5-amdprof`, base d28fe2ba)
+
+**Measured first** (`ldsx`, mi300x, one host thread): `h_ds` was 48% of the process; perf annotate put the samples in two scalar loops, the transposition of a `ds_write_b128` run into the lane-major LDS layout (`tmp[w*l+k] = in[l]`, one word at a time) and the per-lane `for k < w` loop of the general `ds_read_b96/b128`, which re-read the operand's register number from memory on every word. IPC was 4.2 (instruction-bound, 7.4 G instructions, 128 M L1 misses that this change does not touch).
+
+### What changed
+`gcn_tier.cpp`: `lds_to_rows` / `rows_to_lds` move four lanes at a time with a 4x4 transpose (two words a lane: unpack and shuffle) for 2 and 4 words, for the consecutive-lane runs and, with every lane on, for any addresses (the lanes stored in lane order, so overlapping words end as they do one at a time); a partly-off wave and the 3-word forms use `ds_read_lanes<W>` / `ds_write_lanes<W>`, cold noinline functions with the width known and the rows in registers.
+
+### Results (`perf stat` user cycles, 11 alternating runs of A = d28fe2ba and B; the box was loaded (load 27 to 35), so the bench harness's p values were not usable; counters identical)
+| workload | cycles A/B | instructions A to B | p |
+| --- | ---: | ---: | ---: |
+| `ldsx` mi300x | **1.22** | 7.41 G to 5.77 G | < 0.001 |
+| `ldsx` rx6800 | **1.14** | 9.97 G to 8.34 G | < 0.001 |
+| `lds`, `wave`, `smem` (mi300x), `wave` (rx6800) | 1.015, 1.000, 1.000, 0.998 | equal | > 0.4 |
+
+### Tests and mutations
+`test_amd_gcn_tier_same_bits` (and its `simd_base` twin; run with `VGPU_TIER_ONLY=ds_`): fails under a swapped pair of stores in `lds_to_rows<4>`, a swapped pair in `rows_to_lds<2>`, a reversed word order in `ds_write_lanes` (`ds_write_b96`), and a skipped last group of the all-lanes loop.
+## Round sp5: the NVIDIA API calls once more (branch `sp5-apilite`, base d28fe2ba)
+
+`api` is 15 calls a round at about 140 ns each; perf (user cycles, call graphs) put 25% of it in `cudaMemcpy` (three copies a round), 13% in `cudaFree`, 6% each in `cudaMalloc` and stream create/destroy, and the rest flat: clock reads 6%, `__tls_get_addr` 4.5%, mutexes 6%, `ApiCall` 4%.
+
+* **Device-to-device `cudaMemcpy`** went through a `std::vector<uint8_t> tmp(count)` (a malloc, a zero-fill, a free per copy; 2.6% of `api` in the vector's constructor alone, and the libc `rep stos` was the top symbol). The buffer is now the call's frame for up to 16 KiB (`kD2dFrameBytes`) and an uninitialised allocation beyond that. The source is read into it in full before the destination is written, as before (overlapping copies keep `memmove` semantics); every byte is written by the read, so nothing needs clearing.
+* **`sticky_error()`** (asked by stream/event create, query, synchronize, destroy: the calls that check the context is alive) took the API lock to ask an atomic. `State::initialized` is now an atomic set with release after `rt`; once true the fault is read without the lock. Before the machine exists the locked path runs as before.
+
+Results (`perf stat`, user, 3 x 15 runs on cpu 6, the whole process including start-up; the server's load was 25 to 60, so wall-clock A/B spread was 5 to 30%): `api` instructions 982.5 M -> 930.0 M (-5.3%), cycles 409 M -> 389 M (-4.8%, three runs: 409/389, 410/391, 503/395 in a noisy first); `launch` instructions equal (+0.04%). Bench A/B (`bench.py --ab`, SASS): `api` 1.043x (11 runs, p < 0.001) and 1.079x (15 runs, p 0.056); PTX 1.05x and 1.04x (p 0.15 and 0.32, spread 12 to 15%); A/A of the same two builds: 1.014x and 1.009x. `launch`, `startup`, `mem`: same (one PTX `launch` row read 0.976x with p < 0.001 in the first run and 0.987x, p 0.32, in the second; its instructions are equal).
+
+Test (CMake-wired): `test_runtime_d2d_scratch` (every size around the 16 KiB frame and beyond, a copy from untouched memory over stale data, overlapping copies forwards and backwards, a refused copy leaves the destination alone, a context fault seen on every thread and cleared, readers racing a thread that sets and clears it). Mutations that fail it: the copy made in 4 KiB pieces (overlap corrupts: `an_overlapping_device_to_device_copy_reads_the_whole_source_first`), the lock-free path answering success (`a_context_fault_is_seen_by_calls_on_every_thread_and_cleared_again` and the racing test).
+
+### Not done, and negative results
+
+* **AMD `occupancy()`'s five `std::string::rfind` prefix searches per launch** (3% of AMD `launch` self time) replaced by compares of the first bytes: `launch` mi300x 0.949x (p 0.33), rx6800 1.008x (p 0.85), `api`, `stream`, `memcpy`, `graph` all `same` with spreads of 20 to 76% under load 25 to 60. Dropped: not measurable here.
+* **Reusing `kernel_resources`' answer within a launch**: the lockstep pre-pass and `validate` each call it (3.3% of NVIDIA `launch` for both, `compute_occupancy`'s per-thread memo is itself 2.4%); one call saved is about 1.6%, under the bar. A memo on `EntryFn` would need the answer to survive concurrent launches of one kernel.
+* **`Runner::init_block`** (8% of `launch`, two `rep stos` of 3 KiB each for the warp and its registers), `Runner::Runner` + `build_bank0` (6% + 3%, a vector allocation per launch), `read_launch_env` (2.8%, already one pass): not changed; each is a few percent and the launch rows were too noisy to see them.
+* **AMD `launch`**: the AQL packet and kernarg allocate/free per launch (`MemoryManager::free` 7.7%, the exclusive table lock and the quarantine map) cannot be reused without changing allocation addresses; `getenv("VGPU_THREADS")` per dispatch is 1.5%.
+* **The clock reads of `cudaMemcpy`** (two per copy, 6% of `api`) feed the telemetry's busy time and timestamp: kept.
+## Round sp5: the SASS tier's control bound, measured (branch `sp5-sassctl`, base d28fe2ba)
+
+Profiled the base (one host thread, `cycles:u`, `perf stat -M PipelineL1/L2`): `divergent` runs at IPC 4.2 to 4.3, **retiring 69%**, front end 8.5% (bandwidth 3.2%, op-cache misses 11 M),
+bad speculation 3%, back end 19%; `step_warp` 44%, `pick_group_avx2` 15%, `blend_m_k` 7%. The line profile (`-g1`) is flat: no source line over 5%. The software popcount (`simd.hpp`) is
+5.6% of the samples, `lanes_at` in `pick_group` 8.5%, `sass_lanes.hpp:100` (BSYNC release's `wait_arg` compare) 3.4%. `ls_bad_status2.stli_other` is 46 M (4.6 per warp instruction):
+store-to-load forwarding failures, 15% of them in the BSYNC wait state (byte and word stores read back as 16-byte vectors), the rest spread over the run loop's counters and stack.
+
+### Not done, and negative results (this branch)
+
+* *Hardware POPCNT for `popcount32` (flag read once, `popcnt` through inline asm, software count otherwise) and a mask-table `pick_group_avx2` (one table load for the broadcast, and, compare of each
+  vector) and `pick_group_diverged` called directly from the chain when the run did not leave the whole group at one address (skips the converged test `lanes_at`)*: 87 M fewer instructions of 3443 M
+  (-2.5%) on `divergent`, cycles 804 M -> 800 M (-0.5%, inside the 0.3% to 1% run-to-run spread), B/A `divergent` 1.004x (p 0.13), `warp` 1.045x (p 0.15), `int_alu` 1.009x (p 0.065), `local` 1.008x:
+  not a win, dropped. The bound is not the instruction count: the core already retires 69% of its slots; what is left is the dependency and forwarding chains.
+* *PTX `divergent`/`warp` (`VGPU_SASS=0`)*: IPC 4.4, `run_warp_until_yield` 38%, `step` 16%, `exec_micro` 19%; the `-g1` line attribution points into `std::__fill_a`/`_Construct` (20% of
+  the samples) but the inline chain could not be resolved to a source statement with the available tools, so nothing was changed.
+* Not tried (no data pointing at them): `blend_m_k` without the old-row load, vector `tier_wait`/`wake` for partial groups (an earlier arrival-mask reordering that removed one read-back of the wait
+  arrays measured 0.98x to 1.02x in sp4).
+
+### The PTX interpreter's diverging branch (branch `sp5-sassctl`, measured, not kept)
+
+The `-g1` line profile of PTX `divergent` listed 20% in `std::__fill_a`, `_Construct` and `vector::size`; those are inlined container accessors of the hottest functions, not fills. A `-g -fno-omit-frame-pointer`
+build and `perf annotate -l` resolved them:
+
+* `exec_micro`: `micro_src` spreads an immediate across 32 lanes whenever the one-entry-per-slot cache holds another constant: 30% of `exec_micro`'s samples (2.5% of the run). A 16-entry hash cache per slot
+  (`SplatCache`) removed the fills and measured `divergent` ptx 1.011x (p 0.17), `warp` ptx 0.935x, `local` ptx 0.946x: nothing to gain, layout losses; dropped.
+* `step`, `exec_bra`'s diverging case: `Path fall{fall_pc, fallthrough}; fall.issued_at = ...; w.paths.push_back(fall);` builds the temporary with two 8-byte stores and the copy into the vector reads it
+  back as one 16-byte load, which store forwarding cannot serve: 53% of `step`'s samples sit on that one instruction (about 3.5% of the run). Building the path in place
+  (`emplace_back` and three field stores) gives `divergent` ptx 1.027x to 1.029x (p < 0.001, counters identical) but moves the hot interpreter code: `int_alu` ptx 0.970x, `local` ptx 0.982x
+  (p <= 0.001; same instructions, L1i misses 2.9 M -> 3.6 M, branch misses 0.7 M -> 1.0 M, op-cache misses +14%); the same change as a cold `noinline` helper: `divergent` 1.017x, `int_alu` 0.989x,
+  `local` 0.958x. A rebuild of the unmodified source reads 0.994x to 1.005x of the base (so these are the change's layout, not the build). Not kept: a 3% gain on divergent PTX for a 2% to 4% loss on straight-line PTX.
+  The interpreter's hot code (`run_warp_until_yield`, `exec_micro`, `step`) is larger than the L1i and any edit near it is a layout lottery.
+
+### A layout regression and its fix (same branch)
+With the wide LDS code inside `gcn_tier.cpp` the flat and global handlers read 2 to 12% slower (flat mi300x 0.905x, rx6800 0.876x on a quiet box; `perf stat` on server3: equal instruction counts, more cycles, `find_ordinary_miss` and `run_allocation` suddenly in the profile): the larger unit moved the link-time inlining and the layout of code that does not touch the LDS. Moving the code into its own unit, `gcn_tier_ds.cpp`, compiled with `-fno-lto` (the functions are plain calls taking row pointers), returned them: user cycles A/B flat 1.02 (mi300x) and 1.04 (rx6800), mem 0.99 and 1.01, lds 1.00, with `ldsx` 1.17 and 1.13; the tier digest tests (both levels), `gcn_same_bits` and `gcn_memory_same_bits` pass, and the same mutations fail `test_amd_gcn_tier_same_bits`.
+
+### Not done, and negative results (this branch)
+* AMD atomics: giving each 4-byte integer operation its own lane function in `wave_atomics` cut host instructions by 9% (mi300x) and 7% (rx6800) but user cycles by only 1.7% (p 0.005) and -1.6% (rx6800 slower, p 0.001), and the flat rows moved 0.975 to 1.056 with the change in `gcn_exec.cpp`: dropped.
+### Round sp5: the PTX interpreter's .local words, and what bounds SASS atomics (branch `sp5-memhot`, base d28fe2ba)
+
+* **PTX `ld.local` / `st.local` of a full warp of 4-byte words** (`exec_ld`, `exec_st`; `local_words_inside`, `local_gather_words`, `local_scatter_words`): the alignment and frame test is two reductions over the lanes' addresses (it was a lane loop that also built an offsets array, then a `LaneSet`, then `write_loaded`), and the words go between the warp's array and the 32-bit register's row directly; a store reads the register row, not a widened copy. PTX `local`: 6237 M to 4882 M instructions (-22%), cycles 1201 M to 1041 M (min of 7), `bench.py --ab` (11 runs, cpu 2) 1.159x, p < 0.001, counters identical. Test: `a_warp_of_local_words_matches_the_lane_loop` in `test_ptx_paths` (fast path against `VGPU_FASTPATH=0`: memory, counters, errors; per-lane index, uniform index, past the frame, the last word and the first word past it, a misaligned lane and every lane misaligned, 8-, 20-, 32-, 64-lane blocks). Mutants: a store scatter with the lane index xor 1 fails it (memory differs at word 0); the frame bound off by 4 bytes aborts it (heap overflow, `free(): invalid next size`); dropping the alignment test is NOT caught (the unit test passes; why the misaligned lanes still raise the same error is not understood, the guard is read, not proven).
+* **Code placement, not chased**: PTX `atomics` read 0.944x with equal instructions (min cycles 178 M to 197 M): `load_at` (memory.cpp, an `lto_priv` clone) went from 5% to 13% of the cycles; PTX `int_alu` 0.961x (+1% cycles). Both move with any change in the library; memory.cpp is not edited in this round.
+* **SASS atomics, what bounds it** (instruction profile with line numbers, `atomics` workload): no single bound. The lane-address/dedup loop of `exec_mem` (exec_ops.inc 3736 to 3757) is about 12% of the instructions, the operand `fetch` about 4%, the lane loop about 8%, `pthread_mutex_lock` 5%, `batch_addresses_ok` 5%, `load_batch_in`/`store_batch_in` 8%, the rest is spread over the tier and the launch. A register chain for one-word warps measured nothing in round 4; a pre-test for "every lane names one address" would save at most the dedup loop's per-lane compare (est. 4% of the instructions); not done.
+* **PTX `mem`**: `int_bin64_lanes`/`micro_int64` (the 64-bit address arithmetic, 10% + 7%) are plain lane loops of the ALU path; not changed.

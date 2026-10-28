@@ -234,6 +234,7 @@ add_library(vgpu STATIC
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
   amd/src/gcn_tier.cpp
+  amd/src/gcn_tier_ds.cpp
   amd/src/image.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
@@ -292,14 +293,25 @@ target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_ge
 # same code as before, while a test (marked at the end of this file) links the
 # machine code and takes seconds.
 option(VGPU_TEST_FAST_LINK "Link unit tests without LTO (the vgpu archive carries machine code for them)" ON)
+# The wide LDS accesses of the AMD tier (see the header) are compiled outside link-time optimization: inside the tier's unit they moved the
+# inlining and the layout of the unrelated memory handlers.
+set_source_files_properties(amd/src/gcn_tier_ds.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set_target_properties(vgpu PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
   target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
 endif()
 
+# The std::variant dispatch tables the PTX parser's and the SASS decoder's visits instantiate (weak, with names thousands of
+# characters long): left exported, each is a relocation the loader looks up by name at every process start (hashing the name
+# alone was a quarter of a small program's user cycles), and nothing outside the library refers to them. Local, they cost none.
+set(VGPU_LOCAL_STD_TABLES "_ZNSt8__detail9__variant*")
+
 # libvgpucuda: the CUDA Driver API shim external programs link against.
 add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/driver_graph.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(vgpucuda PRIVATE vgpu ${CMAKE_DL_LIBS})
+# Unversioned, as before; only the std::variant tables (VGPU_LOCAL_STD_TABLES) are made local.
+file(WRITE "${CMAKE_BINARY_DIR}/maps/libcuda.so.1.map" "{\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n")
+target_link_options(vgpucuda PRIVATE "-Wl,--version-script=${CMAKE_BINARY_DIR}/maps/libcuda.so.1.map")
 # Present the real driver's identity: apps linked with -lcuda record SONAME
 # "libcuda.so.1" and resolve to this library through LD_LIBRARY_PATH at run time.
 set_target_properties(vgpucuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 VERSION 1.1)
@@ -492,7 +504,7 @@ endfunction()
 # version information on every call.
 function(vgpu_version_script _libname _soversion _out)
   set(_path "${CMAKE_BINARY_DIR}/maps/lib${_libname}.so.${_soversion}.map")
-  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n};\n")
+  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n")
   set(${_out} "${_path}" PARENT_SCOPE)
 endfunction()
 
@@ -1330,6 +1342,8 @@ vgpu_unit_test(test_sched)
 vgpu_unit_test(test_sass_atomics)
 vgpu_unit_test(test_sass_lanes)
 target_include_directories(test_sass_lanes PRIVATE src)
+# The address-row questions of the tier's global and shared memory handlers (vgpu/exec/sass_mem_rows.hpp), against the address array they replaced.
+vgpu_unit_test(test_sass_mem_rows)
 # The SASS executor's memory-access counting, against the straightforward version it replaced
 # (vgpu/exec/mem_counters.hpp, which both engines count with).
 vgpu_unit_test(test_sass_access_count)
@@ -2403,6 +2417,15 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_capture_gate PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# A device-to-device copy through a buffer that is not zero-filled, and the context fault read without the API lock.
+if(TARGET vgpucudart)
+  add_executable(test_runtime_d2d_scratch nvidia/tests/unit/test_runtime_d2d_scratch.cpp)
+  target_link_libraries(test_runtime_d2d_scratch PRIVATE vgpucudart)
+  target_include_directories(test_runtime_d2d_scratch PRIVATE tests/framework include ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_runtime_d2d_scratch COMMAND test_runtime_d2d_scratch)
+  set_tests_properties(test_runtime_d2d_scratch PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
 # Enum parameters that carry values the enum does not declare: answered with an error code, never loaded as the enum.
 if(TARGET vgpucudart AND TARGET vgpucuda)
   add_executable(test_api_enum_args nvidia/tests/unit/test_api_enum_args.cpp)
@@ -3011,10 +3034,14 @@ if(TARGET vgpucublas)
 
   add_test(NAME e2e_host_atomics
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_atomics.sh)
+  # Under ThreadSanitizer the SASS run alone takes 200 to 370 s on 4 cores (the PTX run 5 s): 262144 device atomics on
+  # host-mapped words, each through the host-atomic path while one thread spins on a flag. Measured on origin/main and on the
+  # speed branch, same host, same image: 202 s and 208 s on main, 230 s, 223 s and 370 s on the branch, so the time is the
+  # sanitizer's and not a hang, and 300 s left no room when the job also runs other tests beside it.
   set_tests_properties(e2e_host_atomics PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 300)
+    TIMEOUT 600)
 
   add_test(NAME e2e_uldc_narrow
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_uldc_narrow.sh)
@@ -3691,6 +3718,12 @@ add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shi
 set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
+# The std::variant dispatch tables must stay local to each shim (VGPU_LOCAL_STD_TABLES): exported, their long names were a quarter of a
+# small program's user cycles at every process start.
+add_test(NAME lint_shim_dynsyms COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_dynsyms.sh)
+set_tests_properties(lint_shim_dynsyms PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 # No shim library takes static TLS (glibc leaves ~1.6 KB for every library loaded late).
 # (Not under a sanitizer: its runtime keeps initial-exec thread-locals in every library it is linked into, so the check would report the
 # runtime, not the simulator.)
@@ -4214,6 +4247,12 @@ set_tests_properties(e2e_jit_frameworks PROPERTIES
 # diagnostic actually working, which is where every serious bug here showed up
 # first. Skips cleanly when no pantheon checkout is present, so a contributor
 # without one still gets a green run.
+# How the runner below judges a finished workload (pass, skip, fail); needs no GPU and no pantheon.
+add_test(NAME pantheon_workload_verdicts
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/verdict_test.sh)
+# And the PATH it starts vgpu shell with, which must not hold the Action's drop-in nvcc.
+add_test(NAME pantheon_workload_path
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/path_test.sh)
 add_test(NAME pantheon_workloads
          COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/run_pantheon_workloads.sh)
 set_tests_properties(pantheon_workloads PROPERTIES

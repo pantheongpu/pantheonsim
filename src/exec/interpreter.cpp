@@ -12916,6 +12916,31 @@ class Interpreter {
     });
   }
 
+  // A full warp's 4-byte .local accesses, from the lanes' addresses `at`: whether every lane is aligned and inside the current function's
+  // frame (and below the alloca stack), the conditions local_lanes_inside makes for a 4-byte element, as two reductions over the
+  // lanes instead of a lane loop that also builds the offsets. An address below the window wraps to an offset past any frame.
+  bool local_words_inside(const Lanes& at) {
+    const uint64_t lim = std::min<uint64_t>(local_top(), kStackOffset);
+    if (lim < 4) return false;
+    const uint64_t last = lim - 4;
+    uint64_t bad = 0;
+    for (uint32_t l = 0; l < W_; ++l) bad |= (at[l] & 3) | (at[l] - kLocalVaBase > last ? 1u : 0u);
+    return bad == 0;
+  }
+  // The words of those accesses (the interleaved layout: word k of lane l is at (k * W_ + l) * 4 of the warp's array).
+  void local_gather_words(const uint8_t* buf, const Lanes& at, uint32_t* d) const {
+    for (uint32_t l = 0; l < W_; ++l) {
+      const uint64_t k = (at[l] - kLocalVaBase) >> 2;
+      std::memcpy(&d[l], buf + (k * W_ + l) * 4, 4);
+    }
+  }
+  void local_scatter_words(uint8_t* buf, const Lanes& at, const uint32_t* v) const {
+    for (uint32_t l = 0; l < W_; ++l) {
+      const uint64_t k = (at[l] - kLocalVaBase) >> 2;
+      std::memcpy(buf + (k * W_ + l) * 4, &v[l], 4);
+    }
+  }
+
   void exec_ld(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpLd& op, Mask m) {
     uint32_t size = op.ty.bytes();
     size_t n = op.dsts.size();
@@ -13062,6 +13087,13 @@ class Interpreter {
       }
     }
     // A .local access inside the frame is a read of the lane's own buffer.
+    if (op.space == Space::Local && fast_enabled_ && n == 1 && size == 4 && op.ty.bits == 32 && !op.dsts[0].wide &&
+        m == all_lanes(W_) && local_words_inside(at)) {
+      // A whole warp of words into a 32-bit register: from the array straight into its row.
+      const uint8_t* buf = local_array(w);
+      local_gather_words(buf, at, dst32(w, op.dsts[0].id, m));
+      return;
+    }
     if (op.space == Space::Local && fast_enabled_ && !(op.ordered && n > 1)) {
       uint64_t offs[kMaxWarpSize];
       if (local_lanes_inside(base, op.addr.offset, m, va, va_pow2, size * static_cast<uint32_t>(n), offs)) {
@@ -13264,6 +13296,14 @@ class Interpreter {
                 store_bytes(sh + offs[lane] + e * size, size, mask_to_bits(vals[e][lane], op.ty.bits));
             });
         }
+        return;
+      }
+    }
+    if (op.space == Space::Local && fast_enabled_ && pending && size == 4 && op.ty.bits == 32 && m == all_lanes(W_)) {
+      // A whole warp of words from a 32-bit register's row into the array, with no widened copy of the row in between.
+      const Reg& r = std::get<RegOperand>(op.srcs[0]).reg;
+      if (!r.wide && r.id < w.regs32.size() && w.written32[r.id] && local_words_inside(at)) {
+        local_scatter_words(local_array(w), at, w.regs32[r.id].data());
         return;
       }
     }

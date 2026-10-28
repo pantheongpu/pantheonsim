@@ -593,6 +593,29 @@ inline float chunk_finite_raw(const float* a, size_t astride, const float* b, si
 }
 
 #ifdef VGPU_TC86_AVX2
+// The chunks of eight lanes that mma_avx2_chunked_f does not finish in vector form: the lanes with an infinity or a NaN (`special`), those whose scale
+// 2^-g is out of range (`bad`) and those whose sum needs the rounding of the scalar form (`redo`); the other lanes of `res` stay. Out of line and cold,
+// so that the hot loop is only its vector code (the eight rows' copies of this were a third of the function, between the hot lines).
+template <unsigned NC, bool ACC16>
+__attribute__((target("avx2"), noinline, cold)) __m256i mma_f_fix(__m256i S, __m256i g, __m256i accb, __m256i res, unsigned redo, unsigned special, unsigned bad,
+                                                                  const float* a, const float* b, size_t ldb, int emin) {
+  alignas(32) int32_t Sv[8], gv[8];
+  alignas(32) uint32_t accv[8], out[8];
+  _mm256_store_si256(reinterpret_cast<__m256i*>(Sv), S);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(gv), g);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(accv), accb);
+  _mm256_store_si256(reinterpret_cast<__m256i*>(out), res);
+  for (unsigned l = 0; l < 8; ++l) {
+    if (special >> l & 1)
+      out[l] = std::bit_cast<uint32_t>(chunk_special(a, 1, b + l, ldb, NC, std::bit_cast<float>(accv[l])));
+    else if (bad >> l & 1)
+      out[l] = std::bit_cast<uint32_t>(chunk_finite_raw(a, 1, b + l, ldb, NC, std::bit_cast<float>(accv[l]), ACC16, emin));
+    else if (redo >> l & 1)
+      out[l] = std::bit_cast<uint32_t>(ACC16 ? detail::to_f16_rn(Sv[l], gv[l]) : detail::to_f32_rz(Sv[l], gv[l]));
+  }
+  return _mm256_load_si256(reinterpret_cast<const __m256i*>(out));
+}
+
 // mma_avx2_chunked with the products formed in floating point. A tf32, bf16 or f16 operand has at most 11 significant bits, so the product of
 // two is exact in an f32 -- as long as it neither overflows nor falls below the normal range, which the exponents of the operands say up front
 // (the function returns false, having written nothing, when they do not promise it, or an operand is a float subnormal; the integer kernel then
@@ -603,7 +626,7 @@ inline float chunk_finite_raw(const float* a, size_t astride, const float* b, si
 // What the float form cannot say stays on the old path: a chunk whose g puts 2^-g outside the float range (a subnormal accumulator and
 // nothing to speak of beside it) is finished by the scalar rule, as are the chunks with an infinity or a NaN.
 template <unsigned NC, bool ACC16>
-__attribute__((target("avx2"))) inline bool mma_avx2_chunked_f(unsigned M, unsigned N, unsigned K, int emin, const float* A, size_t lda, const float* B,
+__attribute__((target("avx2"), aligned(64))) inline bool mma_avx2_chunked_f(unsigned M, unsigned N, unsigned K, int emin, const float* A, size_t lda, const float* B,
                                                               size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
   constexpr unsigned kMaxM = 32, kMaxN = 32, kMaxK = 16;
   alignas(32) float bf[kMaxK * kMaxN];
@@ -753,24 +776,8 @@ __attribute__((target("avx2"))) inline bool mma_avx2_chunked_f(unsigned M, unsig
           const unsigned redo = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_andnot_si256(inrange[r], snz[r]))));
           const unsigned special = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(acc_nonfin[r])));
           const unsigned bad = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(badg[r])));
-          if (__builtin_expect(redo | special | bad, 0)) {
-            const unsigned i = i0 + r;
-            alignas(32) int32_t Sv[8], gv[8];
-            alignas(32) uint32_t accv[8], out[8];
-            _mm256_store_si256(reinterpret_cast<__m256i*>(Sv), S[r]);
-            _mm256_store_si256(reinterpret_cast<__m256i*>(gv), g[r]);
-            _mm256_store_si256(reinterpret_cast<__m256i*>(accv), accb[r]);
-            _mm256_store_si256(reinterpret_cast<__m256i*>(out), res[r]);
-            for (unsigned l = 0; l < 8; ++l) {
-              if (special >> l & 1)
-                out[l] = std::bit_cast<uint32_t>(chunk_special(&Al[i * lda + k0], 1, &Bl[k0 * ldbl + jb * 8 + l], ldbl, NC, std::bit_cast<float>(accv[l])));
-              else if (bad >> l & 1)
-                out[l] = std::bit_cast<uint32_t>(chunk_finite_raw(&Al[i * lda + k0], 1, &Bl[k0 * ldbl + jb * 8 + l], ldbl, NC, std::bit_cast<float>(accv[l]), ACC16, emin_l));
-              else if (redo >> l & 1)
-                out[l] = std::bit_cast<uint32_t>(ACC16 ? detail::to_f16_rn(Sv[l], gv[l]) : detail::to_f32_rz(Sv[l], gv[l]));
-            }
-            res[r] = _mm256_load_si256(reinterpret_cast<const __m256i*>(out));
-          }
+          if (__builtin_expect(redo | special | bad, 0))
+            res[r] = mma_f_fix<NC, ACC16>(S[r], g[r], accb[r], res[r], redo, special, bad, &Al[(i0 + r) * lda + k0], &Bl[k0 * ldbl + jb * 8], ldbl, emin_l);
           accb[r] = res[r];
         }
       }

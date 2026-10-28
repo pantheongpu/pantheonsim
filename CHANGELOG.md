@@ -5,6 +5,14 @@ Each release is tagged `vX.Y.Z` and described on the
 [releases page](https://github.com/pantheongpu/pantheonsim/releases). It simulates GPUs functionally, so a
 release says what runs and what it produces, never how fast a real GPU would run it.
 
+## Unreleased
+
+- The GitHub Action has a `source-dir` output, the simulator's source tree. A project that has the pantheon
+  workloads can run `tests/workloads/run_pantheon_workloads.sh` from its own CI with one `uses:` and no second
+  checkout (`docs/pantheon-workloads.md`).
+- The pantheon workload runner reports a workload that printed `Skipping: <reason>` as skipped, with the reason,
+  not as passed.
+
 ## [0.2.0] - 2026-10-24
 
 ### Getting started

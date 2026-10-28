@@ -21,11 +21,15 @@ on:
         required: false
         default: false
 
-# A push that lands while an earlier run is still going supersedes it; there is
-# no value in finishing a build of code nobody will look at again.
+# A push to a pull request that lands while an earlier run is still going
+# supersedes it; there is no value in finishing a build of code nobody will look
+# at again. main is different: its sanitizer jobs take over an hour and merges
+# land faster than that, so cancelling meant no run on main ever finished and
+# the repository page showed a failed CI. A run on main finishes; a newer push
+# waits behind it (and a still newer one replaces the waiting one).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # nvcc 12.0 rejects this image's default GCC 13 headers (it fails inside

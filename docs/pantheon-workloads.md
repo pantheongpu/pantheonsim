@@ -111,12 +111,19 @@ relies on. The output is a real H.264 or HEVC stream (ffmpeg decodes it). The CI
 
 ## In CI
 
-Two workflows run the workloads, at two depths:
+The workloads run at three depths:
 
 | When | What | Where |
 | --- | --- | --- |
-| Every pull request | `compute_virus`, `int_virus`, `cache_latency` on one A10 | `ci.yml`, job *pantheon workloads* |
+| Every pull request to this repository | `compute_virus`, `int_virus`, `cache_latency` on one A10 | `ci.yml`, job *pantheon workloads* |
 | Every merge to main, and daily at 06:23 UTC | every workload, on every machine of the matrix in `workloads.yml` (37) | `workloads.yml` |
+| Every pull request to pantheon | every workload, on two A10s | pantheon's `ci.yml`, job *Workloads on pantheonsim* |
+
+The third row is how a change to a pantheon workload gets an answer before it merges,
+not on the next daily run. It uses the Action (`pantheongpu/pantheonsim@<commit>`) and
+the runner the Action's `source-dir` output points at, so it is the same script as the
+other two. The Action caches the simulator build under its source, so after the first
+run the job is the workloads' own build and run, a few minutes.
 
 Each NVIDIA profile gets a machine, alternating CUDA 12.0 and 13.0 within each
 architecture and with GPU counts above one for the multi-GPU paths (for example
@@ -129,6 +136,16 @@ A *coverage* job fails the pull request that adds a profile without adding it
 to the matrix. Each machine builds the workloads with pantheon's own Makefile
 inside `vgpu shell`, which reads the architecture off the simulated
 `nvidia-smi` exactly as it would on the card.
+
+A workload that exits 0 after printing `Skipping: <reason>` (too few GPUs, the NCCL
+library missing, a pantheon-started group that the runner does not form) is reported as
+skipped with that reason, not as passed: it did not run, and a pass would say it had.
+`tests/workloads/verdict.sh` decides, and `verdict_test.sh` checks it without a GPU.
+
+The runner takes the Action's drop-in directory (`<build>/bin`, with its own `nvcc`) off `PATH`
+before it starts `vgpu shell`, which supplies its own. With both there, the two `nvcc` scripts
+each take the other for the real compiler and call each other for ever; `path.sh` does the
+removal and `path_test.sh` checks it.
 
 The run's summary page has one table, a row per workload and a column per
 machine, with failures first and the reason for each. While main is failing,
