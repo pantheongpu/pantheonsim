@@ -322,6 +322,13 @@ class MemoryManager {
   // caller then reads the fields one at a time and meets any error where it would have. One lookup serves the lot.
   bool load_fields(uint64_t addr, const uint8_t* sizes, unsigned n, uint64_t* out) const;
 
+  // The texels of one filtered fetch: `n` (1 to 16) records of `channels` (1 to 4) fields of `size` bytes (1, 2, 4 or 8) end
+  // to end, record i at addrs[i]; out[i * channels + c] is field c of record i, as load_fields would give it. One lookup of
+  // the allocation serves them all, which is the point: a bilinear fetch has four texels, a trilinear one eight. Returns
+  // false, having done nothing, in every case load_fields would for any one of the records, and when the records do not
+  // lie in one ordinary allocation together (the caller then reads them one at a time).
+  bool load_texels(const uint64_t* addrs, unsigned n, uint32_t size, unsigned channels, uint64_t* out) const;
+
   // Sixteen naturally aligned bytes as one access, as a GPU moves a wide load
   // or store (global_load_dwordx4): a kernel on another host thread sees them
   // all old or all new, never half of each. rocPRIM's decoupled look-back

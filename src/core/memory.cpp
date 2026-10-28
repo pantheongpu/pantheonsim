@@ -2006,4 +2006,36 @@ bool MemoryManager::load_fields(uint64_t addr, const uint8_t* sizes, unsigned n,
   return true;
 }
 
+bool MemoryManager::load_texels(const uint64_t* addrs, unsigned n, uint32_t size, unsigned channels, uint64_t* out) const {
+  const uint64_t total = uint64_t{size} * channels;
+  uint64_t lo = addrs[0], hi = addrs[0];
+  uint64_t misaligned = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint64_t a = addrs[i];
+    misaligned |= a;
+    lo = a < lo ? a : lo;
+    hi = a > hi ? a : hi;
+  }
+  if (misaligned & (size - 1)) return false;
+  // (One range test where load_fields tests each field's start: it refuses whenever one of those would, and so is the
+  // same answer by the slower road in the rare case it refuses more.)
+  if (host_maps_ && host_maps_->may_overlap(lo, hi + total - 1)) return false;
+  if (access_faults_armed()) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(lo, hi - lo + total, &base);
+  if (!a) return false;
+  for (unsigned i = 0; i < n; ++i) {
+    uint64_t off = addrs[i] - base;
+    for (unsigned c = 0; c < channels; ++c, off += size) {
+      const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+      uint64_t v;
+      if (!chunk) v = 0;
+      else if (is_uniform(chunk)) v = repeated(uniform_byte(chunk), size);
+      else v = load_at(chunk + off % kChunkSize, size);
+      out[i * channels + c] = v;
+    }
+  }
+  return true;
+}
+
 }  // namespace vgpu
