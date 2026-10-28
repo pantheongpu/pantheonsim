@@ -78,6 +78,40 @@ int main() {
     std::printf("pass %d scramble %016llx expf %016llx tiny %016llx\n", pass, (unsigned long long)fnv(hi.data(), n * 4),
                 (unsigned long long)fnv(out.data(), n * 4), (unsigned long long)fnv(small, sizeof small));
   }
+  // The card copy outlives a launch: every way the host can touch memory between two launches on the card has to be seen. The checksum
+  // lines are the same with the mode on and off only if each one is (a stale card copy or a lost card write changes them).
+  auto sum_of = [&](const void* dev, size_t bytes) {
+    std::vector<unsigned char> h(bytes);
+    cudaMemcpy(h.data(), dev, bytes, cudaMemcpyDeviceToHost);
+    return (unsigned long long)fnv(h.data(), bytes);
+  };
+  for (int round = 0; round < 3; ++round) {
+    scramble<<<n / 256, 256>>>(di, n, 64);                                   // on the card
+    std::printf("round %d  after scramble       %016llx\n", round, sum_of(di + 1000, 4096));   // a partial read: only those chunks come back
+    uint32_t patch[100];
+    for (int i = 0; i < 100; ++i) patch[i] = 0x1000u * (round + 1) + i;
+    cudaMemcpy(di + 70000, patch, sizeof patch, cudaMemcpyHostToDevice);    // a partial write into a chunk the card holds
+    scramble<<<n / 256, 256>>>(di, n, 64);                                   // must see the patch
+    std::printf("round %d  after patch+scramble %016llx\n", round, sum_of(di + 69000, 8192));
+    cudaMemset(di + 300000, 0x5a, 1 << 18);                                  // a fill over whole chunks
+    scramble<<<n / 256, 256>>>(di, n, 64);
+    std::printf("round %d  after memset+scramble %016llx\n", round, sum_of(di + 299000, 1 << 19));
+    uint32_t* dtmp;
+    cudaMalloc(&dtmp, n * 4);
+    cudaMemcpy(dtmp, di, n * 4, cudaMemcpyDeviceToDevice);                   // a copy out of memory the card holds
+    scramble<<<n / 256, 256>>>(dtmp, n, 64);
+    std::printf("round %d  tmp copy+scramble     %016llx  source untouched %016llx\n", round, sum_of(dtmp + 5000, 1 << 16), sum_of(di + 5000, 1 << 16));
+    cudaFree(dtmp);                                                          // freed while the card holds it, then another allocation
+    float* dnew;
+    cudaMalloc(&dnew, n * 4);
+    cudaMemcpy(dnew, hf.data(), n * 4, cudaMemcpyHostToDevice);
+    fma_chain<<<n / 256, 256>>>(dnew, db, n, 64);
+    use_expf<<<n / 256, 256>>>(dnew, db, n);                                 // the simulator's, between two launches on the card (writes db)
+    fma_chain<<<n / 256, 256>>>(da, dnew, n, 64);                            // the card again, on what the simulator just wrote
+    std::printf("round %d  fma after simulator  %016llx  %016llx\n", round, sum_of(db + 1000, 1 << 16), sum_of(dnew + 1000, 1 << 16));
+    cudaFree(dnew);
+  }
+  std::printf("final di %016llx\n", sum_of(di, (size_t)n * 4));
   // fma_chain's result, read before use_expf overwrote it, is checked through a second buffer.
   fma_chain<<<n / 256, 256>>>(da, db, n, 64);
   cudaMemcpy(out.data(), db, n * 4, cudaMemcpyDeviceToHost);

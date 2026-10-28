@@ -1196,6 +1196,7 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
       if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);
       return;
     }
+    if (hg) hg->before_simulated(mem_);
     const auto sim_t0 = std::chrono::steady_clock::now();   // after the card path: a verify run does both, and the simulator's time is this alone
     run_kernel(fn, cfg, args, syms);
     if (hg) hg->note_simulated(fn, cfg, std::chrono::duration<double>(std::chrono::steady_clock::now() - sim_t0).count(), &mem_, &args);

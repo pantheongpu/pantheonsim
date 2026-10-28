@@ -5,7 +5,10 @@
 # an expf kernel (MUFU: stays in the simulator), a tiny launch (too small), a kernel with a module variable (refused).
 #   1. mode off and mode exact print the same lines;
 #   2. the exact run reports launches on the card, and a kernel outside the set, a launch too small and a refused launch;
-#   3. VGPU_HOST_GPU_VERIFY=1 (every launch the mode would offload also runs in the simulator, and the memory is compared) finds every
+#   3. the card copy outlives a launch (the default; VGPU_HOST_GPU_WRITE_THROUGH=1 is the older mode): the program touches memory between launches in every
+#      way the host can (partial write, memset, device copy, free and reallocate, a launch of the simulator's in between) and the lines it prints have to be
+#      the same with the mode on, in either form, and off; and the persistent run has to move less than the write-through one;
+#   4. VGPU_HOST_GPU_VERIFY=1 (every launch the mode would offload also runs in the simulator, and the memory is compared) finds every
 #      kernel of the exact set identical and ran at least two on the card.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -49,10 +52,17 @@ onc="$(echo "$sum" | sed -n 's/^host_gpu: \([0-9]*\) launches ran.*/\1/p')"
 notset="$(echo "$sum" | sed -n 's/.* (\([0-9]*\) kernels not in the exact set.*/\1/p')"
 small="$(echo "$sum" | sed -n 's/.*set, \([0-9]*\) too small.*/\1/p')"
 shape="$(echo "$sum" | sed -n 's/.*small, \([0-9]*\) unsupported.*/\1/p')"
-(( ${onc:-0} >= 2 )) || { echo "FAIL: fewer than 2 launches ran on the card: $sum"; fails=1; }
+(( ${onc:-0} >= 8 )) || { echo "FAIL: fewer than 8 launches ran on the card: $sum"; fails=1; }
 (( ${notset:-0} >= 1 )) || { echo "FAIL: the expf kernel was not refused as outside the exact set: $sum"; fails=1; }
 (( ${small:-0} >= 1 )) || { echo "FAIL: the one-warp launch was not refused as too small: $sum"; fails=1; }
 (( ${shape:-0} >= 1 )) || { echo "FAIL: the module-variable kernel was not refused: $sum"; fails=1; }
+run "$work/wt.out" "$work/wt.err" VGPU_HOST_GPU=exact VGPU_HOST_GPU_WRITE_THROUGH=1 || { echo "FAIL: the write-through run failed"; tail -5 "$work/wt.err"; fails=1; }
+diff -u "$work/off.out" "$work/wt.out" > "$work/d.txt" || { echo "FAIL: write-through changes the program's output:"; head -20 "$work/d.txt"; fails=1; }
+moved() { sed -n 's/^host_gpu: \([0-9.]*\) MiB went to the card, \([0-9.]*\) MiB came back.*/\1 \2/p' "$1" | tail -1; }
+read -r p_in p_out <<< "$(moved "$work/exact.err")"
+read -r w_in w_out <<< "$(moved "$work/wt.err")"
+awk -v a="${p_in:-0}" -v b="${p_out:-0}" -v c="${w_in:-1}" -v d="${w_out:-1}" 'BEGIN { exit !(a + b < 0.5 * (c + d)) }' \
+  || { echo "FAIL: the persistent run moved ${p_in:-?}+${p_out:-?} MiB, not under half of write-through's ${w_in:-?}+${w_out:-?}"; fails=1; }
 # Verification: the simulator and the card run the same launches; the memory has to be identical for every kernel in the exact set.
 run "$work/v.out" "$work/v.err" VGPU_HOST_GPU=exact VGPU_HOST_GPU_VERIFY=1 || { echo "FAIL: the verify run failed"; tail -5 "$work/v.err"; fails=1; }
 vline="$(grep '^host_gpu: verify: kernels in the exact set' "$work/v.err" | tail -1)"

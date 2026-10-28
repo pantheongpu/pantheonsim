@@ -187,6 +187,8 @@ void MemoryManager::remember_freed(uint64_t ptr, uint64_t size) {
 }
 
 void MemoryManager::free(uint64_t ptr) {
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_free(ptr);
   // Quiet: a free says which allocation it takes (note_free) and leaves every other answer a thread
   // remembered as it was.
   ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
@@ -332,6 +334,10 @@ const MemoryManager::Allocation* MemoryManager::resolve_mapped(uint64_t addr, ui
 
 const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t len, const char* op,
                                                         uint64_t* base_out, bool writing, bool page_slack) const {
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire))
+      // A kernel-style scalar store asks for "device memory write" without the writing flag (which would also change the read-only checks).
+      gate->before_access(addr, len, writing || (op && std::strcmp(op, "device memory write") == 0));
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up != live_.begin()) {
@@ -501,6 +507,7 @@ bool MemoryManager::lookup_cache_default() {
   const Allocation& a = prev->second;
   const uint64_t off = addr - prev->first;
   if (!(off < a.size && len <= a.size - off)) return nullptr;
+  if (a.card_valid.load(std::memory_order_relaxed) != 0) return nullptr;   // a card copy: every access takes resolve(), which asks the gate
   if (&mem == &g_ended_lookups) {
     if (base_out) *base_out = prev->first;
     return &a;
@@ -933,6 +940,8 @@ void MemoryManager::unmap_host(uint64_t addr) {
 }
 
 void MemoryManager::free_all() {
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_free(UINT64_MAX);
   // The heap's blocks go in the sweep below with every other allocation; its
   // record of them, and the budget they held, go here.
   std::lock_guard<std::mutex> heap_guard(heap_->mu);
@@ -1294,6 +1303,9 @@ bool MemoryManager::access_at(uint64_t va, bool* readable, bool* writable) const
 // ---- memory another process can map -------------------------------------------
 
 uint64_t MemoryManager::share(uint64_t ptr, const std::string& path) {
+  // The exported file is the allocation from here on: whatever only the card holds comes back first.
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_access(ptr, UINT64_MAX / 2, false);
   ExclusiveGuard table_guard(table_lock_.get());
   if (const auto it = shared_.find(ptr); it != shared_.end()) return it->second.size;
   const auto live = live_.find(ptr);
@@ -1484,6 +1496,7 @@ const MemoryManager::Allocation* MemoryManager::run_allocation(uint64_t addr, ui
   auto prev = std::prev(up);
   *base = prev->first;
   if (addr - *base >= prev->second.size || len > prev->second.size - (addr - *base)) return nullptr;
+  if (prev->second.card_valid.load(std::memory_order_relaxed) != 0) return nullptr;
   return &prev->second;
 }
 
@@ -1545,6 +1558,17 @@ void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, u
     off += n;
     len -= n;
   }
+}
+
+std::atomic<uint32_t>* MemoryManager::card_slot(uint64_t base) const {
+  SharedGuard table_guard(table_lock_.get());
+  const auto it = live_.find(base);
+  return it == live_.end() ? nullptr : const_cast<std::atomic<uint32_t>*>(&it->second.card_valid);
+}
+
+void MemoryManager::card_void_lookups(const std::vector<uint64_t>& bases) {
+  ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
+  for (uint64_t b : bases) table_lock_->note_free(b);
 }
 
 std::vector<std::pair<uint64_t, uint64_t>> MemoryManager::live_ranges() const {

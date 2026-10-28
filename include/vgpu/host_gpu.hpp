@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -131,10 +132,61 @@ class Residency {
     for (uint64_t c = first; c <= last && c < state_.size(); ++c) state_[c] = Where::Card;
   }
   uint64_t count(Where w) const { return static_cast<uint64_t>(std::count(state_.begin(), state_.end(), w)); }
+  // Chunks whose card copy is valid (Card or Both): an allocation with any is kept out of the memory manager's lookup memories.
+  uint64_t card_valid() const { return count(Where::Card) + count(Where::Both); }
+  // The chunks a launch on the card has to push (the simulator's bytes are the truth for them).
+  std::vector<uint64_t> host_chunks() const {
+    std::vector<uint64_t> out;
+    for (uint64_t c = 0; c < state_.size(); ++c)
+      if (state_[c] == Where::Host) out.push_back(c);
+    return out;
+  }
+  // A launch the simulator runs: it may read or write anything, so the Card chunks come back first and every chunk is then Host.
+  std::vector<uint64_t> sim_launch() {
+    std::vector<uint64_t> pull;
+    for (uint64_t c = 0; c < state_.size(); ++c) {
+      if (state_[c] == Where::Card) pull.push_back(c);
+      state_[c] = Where::Host;
+    }
+    return pull;
+  }
+  // The same, for the chunks a simulator launch is known not to write (not used by the runtime: pointers inside memory cannot be followed).
+  void set(uint64_t c, Where w) { state_[c] = w; }
 
  private:
   std::vector<Where> state_;
 };
+
+// Chunk indices to [first, count) runs, for one copy call per run of adjacent chunks.
+inline std::vector<std::pair<uint64_t, uint64_t>> chunk_runs(const std::vector<uint64_t>& idx) {
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  for (uint64_t c : idx) {
+    if (!out.empty() && out.back().first + out.back().second == c) ++out.back().second;
+    else out.emplace_back(c, 1);
+  }
+  return out;
+}
+
+// The chunks a host access of [addr, addr + len) touches in the allocation [base, base + size), clamped to the allocation, and
+// whether the access covers its first and its last chunk completely (a write that does not needs the chunk's old bytes first).
+struct ChunkSpan {
+  bool any = false;
+  uint64_t first = 0, last = 0;
+  bool first_whole = false, last_whole = false;
+};
+inline ChunkSpan chunk_span(uint64_t base, uint64_t size, uint64_t addr, uint64_t len, uint64_t chunk_bytes = 64 * 1024) {
+  ChunkSpan s;
+  if (!len || !size || addr >= base + size || addr + len <= base) return s;
+  const uint64_t lo = addr < base ? 0 : addr - base;
+  const uint64_t hi = std::min<uint64_t>(addr + len - base, size);   // exclusive
+  s.any = true;
+  s.first = lo / chunk_bytes;
+  s.last = (hi - 1) / chunk_bytes;
+  const auto chunk_end = [&](uint64_t c) { return std::min<uint64_t>((c + 1) * chunk_bytes, size); };
+  s.first_whole = lo <= s.first * chunk_bytes && hi >= chunk_end(s.first);
+  s.last_whole = lo <= s.last * chunk_bytes && hi >= chunk_end(s.last);
+  return s;
+}
 
 // ---- the size rule ---------------------------------------------------------------------------------------------------------
 

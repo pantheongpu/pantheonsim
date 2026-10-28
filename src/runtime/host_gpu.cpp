@@ -135,7 +135,7 @@ const char* const kIncompatible[] = {"VGPU_COUNTERS", "VGPU_SASS_TRACE", "VGPU_K
 
 }  // namespace
 
-struct Runtime::Impl {
+struct Runtime::Impl : CardGate {
   Api api;
   CUcontext ctx = nullptr;
   uint64_t window_base = 0;
@@ -155,6 +155,16 @@ struct Runtime::Impl {
   std::mutex mu;
   uint64_t max_bytes = 2ull << 30;
   bool dead = false;
+  // The card copy outlives a launch (docs/perf-design/09-host-gpu-spike.md section 4) unless VGPU_HOST_GPU_WRITE_THROUGH=1.
+  bool resident = true;
+  MemoryManager* gate_mem = nullptr;
+  struct Res {
+    uint64_t base = 0, size = 0;
+    Residency r;
+    std::atomic<uint32_t>* slot = nullptr;
+  };
+  std::map<uint64_t, Res> res;
+  bool verify_card_ran = false;   // verify + resident: this launch ran on the card and the simulator runs it next, on memory that is the truth
   struct Last {
     bool in_set = false;
     double card_s = -1;
@@ -171,6 +181,100 @@ struct Runtime::Impl {
     std::vector<std::pair<uint64_t, uint64_t>> ranges;
     std::vector<std::vector<uint8_t>> card;
   } pending;
+
+
+  // ---- the gate (vgpu::CardGate): called by the memory manager on the slow path of any access to an allocation with a valid card copy ----
+  static uint64_t chunk_len(const Res& a, uint64_t c) { return std::min<uint64_t>(kChunkSize, a.size - c * kChunkSize); }
+
+  void update_slot(Res& a) {
+    const uint32_t v = static_cast<uint32_t>(a.r.card_valid());
+    const uint32_t old = a.slot->exchange(v, std::memory_order_relaxed);
+    if (old == 0 && v > 0) gate_mem->card_resident_count().fetch_add(1, std::memory_order_relaxed);
+    if (old > 0 && v == 0) gate_mem->card_resident_count().fetch_sub(1, std::memory_order_relaxed);
+  }
+
+  // Copies chunks the card alone holds into the simulator's memory (not in a verify run, where the simulator's memory is the truth already).
+  void pull_chunks(Res& a, const std::vector<uint64_t>& idx) {
+    if (idx.empty() || verify) return;
+    api.cuCtxSetCurrent(ctx);
+    std::vector<uint8_t> buf;
+    for (const auto& [first, count] : chunk_runs(idx)) {
+      for (uint64_t c = first; c < first + count;) {
+        const uint64_t n_chunks = std::min<uint64_t>(first + count - c, (32ull << 20) / kChunkSize);
+        const uint64_t off = c * kChunkSize, bytes = std::min<uint64_t>(n_chunks * kChunkSize, a.size - off);
+        buf.resize(bytes);
+        if (api.cuMemcpyDtoH(buf.data(), a.base + off, bytes)) {
+          dead = true;
+          throw Error(Err::Internal, "host_gpu: reading the card's memory back failed: data only the card held is lost");
+        }
+        gate_mem->write(a.base + off, buf.data(), bytes);
+        stats.pulled_bytes += bytes;
+        c += n_chunks;
+      }
+    }
+  }
+
+  void before_access(uint64_t addr, uint64_t len, bool write) override {
+    if (t_internal) return;   // the mode's own copies
+    std::lock_guard<std::mutex> g(mu);
+    auto it = res.upper_bound(addr);
+    if (it == res.begin()) return;
+    Res& a = std::prev(it)->second;
+    if (a.slot->load(std::memory_order_relaxed) == 0) return;
+    const ChunkSpan sp = chunk_span(a.base, a.size, addr, len);
+    if (!sp.any) return;
+    InternalScope internal;
+    if (!write) {
+      pull_chunks(a, a.r.sim_read(sp.first, sp.last));
+    } else {
+      for (uint64_t c = sp.first; c <= sp.last; ++c) {
+        const bool whole = c == sp.first ? sp.first_whole : c == sp.last ? sp.last_whole : true;
+        pull_chunks(a, a.r.sim_write(c, c, whole));
+      }
+    }
+    update_slot(a);
+  }
+
+  void before_free(uint64_t base) override {
+    if (t_internal) return;
+    std::lock_guard<std::mutex> g(mu);
+    for (auto it = base == UINT64_MAX ? res.begin() : res.find(base); it != res.end();) {
+      Res& a = it->second;
+      a.r = Residency(a.r.chunks());   // dropped: nothing of it is valid on the card any more
+      update_slot(a);
+      if (base == UINT64_MAX) it = res.erase(it);
+      else { res.erase(it); break; }
+    }
+  }
+
+  // The simulator is about to run a launch of its own (mu held by the caller).
+  void reset_for_simulator() {
+    InternalScope internal;
+    for (auto& [b, a] : res) {
+      if (a.slot->load(std::memory_order_relaxed) == 0) continue;
+      pull_chunks(a, a.r.sim_launch());
+      update_slot(a);
+    }
+  }
+
+  // The tracked allocations are the live ones: new ones start Host (nothing of them is on the card).
+  void sync_tracking(MemoryManager& mem, const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+    if (gate_mem != &mem) {
+      gate_mem = &mem;
+      mem.set_card_gate(this);
+    }
+    for (const auto& [b, s] : ranges) {
+      const auto it = res.find(b);
+      if (it != res.end() && it->second.size == s) continue;
+      Res a;
+      a.base = b;
+      a.size = s;
+      a.r = Residency((s + kChunkSize - 1) / kChunkSize);
+      a.slot = mem.card_slot(b);
+      if (!a.slot) continue;
+      res[b] = std::move(a);
+    }
+  }
 
   bool start(const DeviceProfile& profile, uint64_t base) {
     const char* path = std::getenv("VGPU_HOST_GPU_LIBCUDA");
@@ -329,6 +433,7 @@ void print_summary(Runtime::Impl* im) {
                "host_gpu: %llu launches ran on the card, %llu in the simulator (%llu kernels not in the exact set, %llu too small, %llu unsupported launch shapes, %llu failed on the card)\n",
                static_cast<unsigned long long>(s.offloaded), static_cast<unsigned long long>(s.simulated), static_cast<unsigned long long>(s.refused_kernel),
                static_cast<unsigned long long>(s.refused_size), static_cast<unsigned long long>(s.refused_launch), static_cast<unsigned long long>(s.failed));
+  std::fprintf(stderr, "host_gpu: %.1f MiB went to the card, %.1f MiB came back\n", s.pushed_bytes / 1048576.0, s.pulled_bytes / 1048576.0);
   if (im->verify)
     std::fprintf(stderr, "host_gpu: verify: kernels in the exact set: %llu identical, %llu different; other kernels: %llu identical, %llu different\n",
                  static_cast<unsigned long long>(s.same_exact_set), static_cast<unsigned long long>(s.differ_exact_set), static_cast<unsigned long long>(s.same_other),
@@ -357,6 +462,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
       return;
     }
     if (const char* v = std::getenv("VGPU_HOST_GPU_VERIFY"); v && *v && *v != '0') r->impl_->verify = std::string(v) == "all" ? 2 : 1;
+    if (const char* v = std::getenv("VGPU_HOST_GPU_WRITE_THROUGH"); v && *v && *v != '0') r->impl_->resident = false;
     if (const char* v = std::getenv("VGPU_HOST_GPU_STATIC"); v && *v && *v != '0') r->impl_->static_estimate = true;
     if (const char* mb = std::getenv("VGPU_HOST_GPU_MAX_MIB")) r->impl_->max_bytes = std::strtoull(mb, nullptr, 10) << 20;
     g_summary_impl = r->impl_;
@@ -364,6 +470,19 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
     rt = r;
   });
   return ordinal == 0 ? rt : nullptr;
+}
+
+void Runtime::before_simulated(MemoryManager& mem) {
+  if (mem.card_resident_count().load(std::memory_order_relaxed) <= 0) {
+    impl_->verify_card_ran = false;
+    return;
+  }
+  std::lock_guard<std::mutex> g(impl_->mu);
+  if (impl_->verify_card_ran) {   // verifying: this launch already ran on the card and the simulator runs it too; the card's copy stays valid
+    impl_->verify_card_ran = false;
+    return;
+  }
+  impl_->reset_for_simulator();
 }
 
 void Runtime::note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, double sim_seconds, const MemoryManager* mem,
@@ -445,10 +564,17 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
     total += r.second;
     hi = std::max(hi, r.first + r.second);
   }
+  uint64_t push_bytes = total;
+  if (im.resident) {   // only the chunks the simulator wrote since the card last had them; what the host reads later is paid when it reads
+    im.sync_tracking(mem, ranges);
+    push_bytes = 0;
+    for (const auto& [b, a] : im.res)
+      for (uint64_t c : a.r.host_chunks()) push_bytes += Impl::chunk_len(a, c);
+  }
   Estimate e;
   e.sim_s = *sim_s;
-  e.push_bytes = total;
-  e.pull_bytes = total;   // an upper bound: only what changed is written back, but the card's copy has to be read in full
+  e.push_bytes = push_bytes;
+  e.pull_bytes = im.resident ? 0 : total;   // write-through: an upper bound, only what changed is written back, but the card's copy is read in full
   if (const auto it = im.card_kernel_s.find(fn.name); it != im.card_kernel_s.end()) e.card_kernel_s = it->second;
   if (!im.verify && im.banned.count(fn.name)) {
     ++im.stats.refused_size;
@@ -480,14 +606,40 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
     return false;
   }
   std::vector<uint8_t> buf;
-  for (const auto& [rb, rs] : ranges)
-    for (uint64_t at = 0; at < rs;) {
-      const uint64_t n = std::min<uint64_t>(rs - at, 32ull << 20);
-      buf.resize(n);
-      mem.read(rb + at, buf.data(), n);
-      if (im.api.cuMemcpyHtoD(rb + at, buf.data(), n)) { im.dead = true; ++im.stats.failed; ++im.stats.simulated; return false; }
-      at += n;
+  bool card_only_data = false;   // chunks only the card holds, from earlier launches: lost if the card fails now
+  if (im.resident) {
+    for (auto& [b, a] : im.res) {
+      card_only_data = card_only_data || a.r.count(Where::Card) > 0;
+      for (const auto& [first, count] : chunk_runs(a.r.host_chunks()))
+        for (uint64_t c = first; c < first + count;) {
+          const uint64_t n_chunks = std::min<uint64_t>(first + count - c, (32ull << 20) / kChunkSize);
+          const uint64_t off = c * kChunkSize, bytes = std::min<uint64_t>(n_chunks * kChunkSize, a.size - off);
+          buf.resize(bytes);
+          mem.read(a.base + off, buf.data(), bytes);
+          if (im.api.cuMemcpyHtoD(a.base + off, buf.data(), bytes)) {
+            im.dead = true;
+            ++im.stats.failed;
+            ++im.stats.simulated;
+            if (card_only_data) throw Error(Err::Internal, "host_gpu: copying to the card failed while it holds data the simulator does not");
+            im.reset_for_simulator();
+            return false;
+          }
+          im.stats.pushed_bytes += bytes;
+          c += n_chunks;
+        }
+      a.r.card_prepare();   // the pushed chunks are Both now
     }
+  } else {
+    for (const auto& [rb, rs] : ranges)
+      for (uint64_t at = 0; at < rs;) {
+        const uint64_t n = std::min<uint64_t>(rs - at, 32ull << 20);
+        buf.resize(n);
+        mem.read(rb + at, buf.data(), n);
+        if (im.api.cuMemcpyHtoD(rb + at, buf.data(), n)) { im.dead = true; ++im.stats.failed; ++im.stats.simulated; return false; }
+        im.stats.pushed_bytes += n;
+        at += n;
+      }
+  }
   if (cfg.shared_bytes > 48 * 1024) im.api.cuFuncSetAttribute(f, kFuncAttrMaxDynamicShared, static_cast<int>(cfg.shared_bytes));
   std::vector<void*> params;
   std::vector<std::vector<uint8_t>> keep = args;
@@ -501,10 +653,24 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
     im.dead = true;
     ++im.stats.failed;
     ++im.stats.simulated;
+    if (im.resident) {
+      if (card_only_data) throw Error(Err::Internal, "host_gpu: " + fn.name + " failed on the card, which holds data from earlier launches that the simulator does not");
+      im.reset_for_simulator();
+    }
     if (!quiet()) std::fprintf(stderr, "host_gpu: %s failed on the card (error %d); mode off, the simulator runs it\n", fn.name.c_str(), r);
     return false;
   }
   im.last.card_s = kernel_s;
+  if (im.resident) {   // the kernel may have written any live chunk: every one is the card's now
+    std::vector<uint64_t> newly;
+    for (auto& [b, a] : im.res) {
+      const bool was = a.slot->load(std::memory_order_relaxed) > 0;
+      a.r.card_launched();
+      im.update_slot(a);
+      if (!was) newly.push_back(a.base);
+    }
+    mem.card_void_lookups(newly);
+  }
   if (im.verify) {   // keep the card's bytes; the simulator runs the launch next and note_simulated compares
     im.pending = {};
     im.pending.active = true;
@@ -516,8 +682,22 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
       for (uint64_t at = 0; at < rs; at += (32ull << 20))
         if (im.api.cuMemcpyDtoH(im.pending.card.back().data() + at, rb + at, std::min<uint64_t>(rs - at, 32ull << 20))) { im.pending = {}; return false; }
     }
+    im.verify_card_ran = true;
     ++im.stats.simulated;
     return false;
+  }
+  if (im.resident) {   // nothing comes back now: the simulator's memory is stale where the card wrote, and the gate pulls it when it is read
+    const double total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (im.card_kernel_s.count(fn.name) && !offload_paid_off(total_s, e.sim_s)) {
+      im.banned.insert(fn.name);
+      if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, e.sim_s * 1e3);
+    }
+    im.card_kernel_s[fn.name] = kernel_s;
+    ++im.stats.offloaded;
+    if (logging())
+      std::fprintf(stderr, "host_gpu: %s on the card (resident): kernel %.3f ms, total %.3f ms (sim estimate %.3f ms), %.2f MiB pushed\n", fn.name.c_str(), kernel_s * 1e3,
+                   total_s * 1e3, e.sim_s * 1e3, push_bytes / 1048576.0);
+    return true;
   }
   // Back into the simulator: only the 64 KiB chunks whose bytes differ.
   std::vector<uint8_t> sim_bytes;
@@ -531,6 +711,7 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
         im.dead = true;
         throw Error(Err::Internal, "host_gpu: reading the card's memory back failed after the kernel ran");
       }
+      im.stats.pulled_bytes += n;
       mem.read(rb + at, sim_bytes.data(), n);
       for (uint64_t c = 0; c < n; c += kChunkSize) {
         const uint64_t m = std::min<uint64_t>(kChunkSize, n - c);

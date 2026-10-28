@@ -17,6 +17,7 @@ struct Stats {
   uint64_t offloaded = 0, simulated = 0;
   uint64_t refused_kernel = 0, refused_size = 0, refused_launch = 0, failed = 0;
   // VGPU_HOST_GPU_VERIFY: launches run on both, by whether the kernel passed the exact scan and whether the bytes were equal.
+  uint64_t pushed_bytes = 0, pulled_bytes = 0;   // moved to and from the card
   uint64_t same_exact_set = 0, differ_exact_set = 0, same_other = 0, differ_other = 0;
 };
 
@@ -31,6 +32,8 @@ class Runtime {
   bool try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args,
                   MemoryManager& mem);
   // `mem`, when the mode is verifying, is the simulator's memory after the launch it just ran.
+  // Called before the simulator runs a launch: whatever only the card holds comes back, and the card's copy is no longer valid (the launch may write anything).
+  void before_simulated(MemoryManager& mem);
   void note_simulated(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, double sim_seconds, const MemoryManager* mem = nullptr,
                       const std::vector<std::vector<uint8_t>>* args = nullptr);
 

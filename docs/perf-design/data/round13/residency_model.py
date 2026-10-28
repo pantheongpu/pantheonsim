@@ -155,7 +155,7 @@ if __name__ == '__main__':
 
         launches, in_set, sim_total, in_set_sim, chained = summary(p)
         r = {pol: run(p, pol, zskip) for pol in ('off', 'wt', 'persist', 'argsonly')}
-        name = p.split('/')[-1].replace('.trace', '')
+        name = p.split('/')[-1].replace('.gz', '').replace('.trace', '')
         print('%-26s L=%6d inset=%6d chained=%6d | off %8.3f wt %8.3f persist %8.3f args %8.3f s | offloaded wt %5d persist %5d | MiB moved wt %9.1f persist %8.1f | persist/wt %6.2fx' % (
             name, launches, in_set, chained, r['off'].t, r['wt'].t, r['persist'].t, r['argsonly'].t, r['wt'].n_off, r['persist'].n_off,
             (r['wt'].pushed + r['wt'].pulled) / 1048576.0, (r['persist'].pushed + r['persist'].pulled) / 1048576.0, r['wt'].t / max(r['persist'].t, 1e-9)))

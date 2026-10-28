@@ -79,8 +79,18 @@ struct World {
     for (uint64_t p : res.sim_read(c, c)) host[p] = card[p];
     VCHECK_EQ(host[c], truth[c]);
   }
+  void sim_launch(std::mt19937& rng) {   // the simulator runs a launch: Card chunks come back first, then it may write any chunk
+    for (uint64_t p : res.sim_launch()) host[p] = card[p];
+    for (uint64_t c = 0; c < n; ++c) VCHECK_EQ(host[c], truth[c]);
+    for (uint64_t c = 0; c < n; ++c)
+      if (rng() % 3 == 0) host[c] = truth[c] = next++;
+    VCHECK_EQ(res.card_valid(), uint64_t{0});   // nothing of the card's copy is valid any more
+  }
   void card_launch(std::mt19937& rng) {
+    const std::vector<uint64_t> to_push = res.host_chunks();
     for (uint64_t p : res.card_prepare()) card[p] = host[p];
+    VCHECK(res.host_chunks().empty());
+    (void)to_push;
     for (uint64_t c = 0; c < n; ++c) VCHECK_EQ(card[c], truth[c]);     // the card sees every chunk as the simulator last left it
     for (uint64_t c = 0; c < n; ++c)
       if (rng() % 3 == 0) card[c] = truth[c] = next++;                 // the kernel writes some chunks
@@ -95,15 +105,45 @@ VTEST(residency_keeps_both_sides_coherent) {
     World w(1 + seed % 13);
     for (int step = 0; step < 400; ++step) {
       const uint64_t c = rng() % w.n;
-      switch (rng() % 5) {
+      switch (rng() % 7) {
         case 0: w.sim_write(c, true); break;
         case 1: w.sim_write(c, false); break;
         case 2:
         case 3: w.sim_read(c); break;
+        case 4: w.sim_launch(rng); break;
         default: w.card_launch(rng); break;
       }
     }
   }
+}
+
+VTEST(chunk_runs_group_adjacent_chunks) {
+  VCHECK(chunk_runs({}).empty());
+  const auto r = chunk_runs({0, 1, 2, 5, 7, 8});
+  VCHECK_EQ(r.size(), size_t{3});
+  VCHECK(r[0] == std::make_pair(uint64_t{0}, uint64_t{3}));
+  VCHECK(r[1] == std::make_pair(uint64_t{5}, uint64_t{1}));
+  VCHECK(r[2] == std::make_pair(uint64_t{7}, uint64_t{2}));
+}
+
+VTEST(chunk_span_knows_what_a_write_covers) {
+  const uint64_t K = 64 * 1024, base = 0x2000'0000'0000ull;
+  ChunkSpan s = chunk_span(base, 4 * K, base, 4 * K, K);   // the whole allocation
+  VCHECK(s.any && s.first == 0 && s.last == 3 && s.first_whole && s.last_whole);
+  s = chunk_span(base, 4 * K, base + 10, 100, K);          // a few bytes inside chunk 0
+  VCHECK(s.any && s.first == 0 && s.last == 0 && !s.first_whole && !s.last_whole);
+  s = chunk_span(base, 4 * K, base + K, K, K);             // exactly chunk 1
+  VCHECK(s.first == 1 && s.last == 1 && s.first_whole && s.last_whole);
+  s = chunk_span(base, 4 * K, base + K + 1, 2 * K, K);     // runs from inside chunk 1 into chunk 3
+  VCHECK(s.first == 1 && s.last == 3 && !s.first_whole && !s.last_whole);
+  s = chunk_span(base, 3 * K + 100, base + 3 * K, 100, K); // the short last chunk, covered in full
+  VCHECK(s.first == 3 && s.last == 3 && s.first_whole && s.last_whole);
+  s = chunk_span(base, 4 * K, base + 5 * K, 10, K);        // outside the allocation
+  VCHECK(!s.any);
+  s = chunk_span(base, 4 * K, base - 100, 200, K);         // starts below it: clamped
+  VCHECK(s.any && s.first == 0 && s.last == 0 && !s.first_whole);
+  s = chunk_span(base, 4 * K, base, 0, K);                 // empty
+  VCHECK(!s.any);
 }
 
 VTEST(residency_moves_only_what_it_must) {
