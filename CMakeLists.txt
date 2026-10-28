@@ -1407,6 +1407,9 @@ foreach(_lvl avx2 avx512 base off)
   add_test(NAME test_simd_dispatch_simd_${_lvl} COMMAND test_simd_dispatch)
   set_tests_properties(test_simd_dispatch_simd_${_lvl} PROPERTIES ENVIRONMENT "VGPU_SIMD=${_lvl}")
 endforeach()
+# An empty VGPU_SIMD is no setting at all: the default table.
+add_test(NAME test_simd_dispatch_simd_empty COMMAND test_simd_dispatch)
+set_tests_properties(test_simd_dispatch_simd_empty PROPERTIES ENVIRONMENT "VGPU_SIMD=")
 # The PTX engine's tile route for the other mma.sync forms against the general form, bit for bit.
 vgpu_unit_test(test_mma_tiles)
 # The SASS executor's tile route for the MMA forms its SIMD HMMA kernel does not take, against its general form (the kernels off in a second run).

@@ -291,7 +291,7 @@ bool use_avx512() {
   static const bool use = [] {
     if (level() != Level::Avx2 || !cpu_has_avx512()) return false;
     const char* v = std::getenv("VGPU_SIMD");
-    if (v) return std::strcmp(v, "avx512") == 0;
+    if (v && *v) return std::strcmp(v, "avx512") == 0;   // an empty value is no value (choose() reads it so, and the config's "auto" is one)
     return kAvx512Default;
   }();
   return use;
