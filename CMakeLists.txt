@@ -1542,6 +1542,9 @@ target_compile_definitions(test_amd_gcn_memory_same_bits PRIVATE VGPU_SOURCE_DIR
 # The pre-decoded tier against the interpreter over the same corpora (amd/tests/unit/test_gcn_tier_same_bits.cpp).
 vgpu_unit_test(test_amd_gcn_tier_same_bits amd/tests/unit/test_gcn_tier_same_bits.cpp)
 target_compile_definitions(test_amd_gcn_tier_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The forms the AMD probe workloads found missing (RDNA2's VOP3 16-bit integer spellings), against the interpreter.
+vgpu_unit_test(test_amd_gcn_probe_forms amd/tests/unit/test_gcn_probe_forms.cpp)
+target_compile_definitions(test_amd_gcn_probe_forms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Scratch, LDS atomics, a cross-lane read, and flat pointers.
 vgpu_unit_test(test_amd_gcn_memory amd/tests/unit/test_gcn_memory.cpp)
 target_compile_definitions(test_amd_gcn_memory PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

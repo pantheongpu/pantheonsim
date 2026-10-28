@@ -2756,6 +2756,12 @@ struct Machine {
     if (mf.smem == gcn::SmemKind::Load) {
       const uint64_t base = scalar_load_base(w, in);
       const uint32_t words = in.dst[0].width;
+      // (A run of 2 to 16 words wholly inside one allocation is one lookup and one copy: load_run is what the words one at a time do, or declines.)
+      uint32_t run[16];
+      if (words >= 2 && words <= 16 && at(base).load_run(base, run, 4ull * words, 4)) {
+        for (uint32_t i = 0; i < words; ++i) set_sgpr(w, in.dst[0].index + i, run[i]);
+        return;
+      }
       for (uint32_t i = 0; i < words; ++i)
         set_sgpr(w, in.dst[0].index + i, static_cast<uint32_t>(at(base + 4 * i).load_scalar(base + 4 * i, 4)));
       return;
