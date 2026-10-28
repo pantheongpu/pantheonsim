@@ -1598,6 +1598,24 @@ D70C0001 00000702	v_min_i16 v1, v2, s3
 D70C0001 00000702	v_min_i16 v1, v2, s3
 D70C00C8 0003FFFE	v_min_i16 v200, v254, v255
 D70C00C8 0003FFFE	v_min_i16 v200, v254, v255
+A9820604	s_add_nc_u64 s[2:3], s[4:5], s[6:7]
+A9828504	s_add_nc_u64 s[2:3], s[4:5], 5
+A98206FF 12345678	s_add_nc_u64 s[2:3], 0x12345678, s[6:7]
+A982066A	s_add_nc_u64 s[2:3], vcc, s[6:7]
+A982C104	s_add_nc_u64 s[2:3], s[4:5], -1
+A9E46866	s_add_nc_u64 s[100:101], s[102:103], s[104:105]
+AA020604	s_sub_nc_u64 s[2:3], s[4:5], s[6:7]
+AA028504	s_sub_nc_u64 s[2:3], s[4:5], 5
+AA0206FF 12345678	s_sub_nc_u64 s[2:3], 0x12345678, s[6:7]
+AA02066A	s_sub_nc_u64 s[2:3], vcc, s[6:7]
+AA02C104	s_sub_nc_u64 s[2:3], s[4:5], -1
+AA646866	s_sub_nc_u64 s[100:101], s[102:103], s[104:105]
+AA820604	s_mul_u64 s[2:3], s[4:5], s[6:7]
+AA828504	s_mul_u64 s[2:3], s[4:5], 5
+AA8206FF 12345678	s_mul_u64 s[2:3], 0x12345678, s[6:7]
+AA82066A	s_mul_u64 s[2:3], vcc, s[6:7]
+AA82C104	s_mul_u64 s[2:3], s[4:5], -1
+AAE46866	s_mul_u64 s[100:101], s[102:103], s[104:105]
 C8000D04 02020F05	v_dual_fmac_f32 v2, v4, v6 :: v_dual_fmac_f32 v3, v5, v7
 C8000D04 02020F02	v_dual_fmac_f32 v2, v4, v6 :: v_dual_fmac_f32 v3, v2, v7
 C8000D02 02040F05	v_dual_fmac_f32 v2, v2, v6 :: v_dual_fmac_f32 v5, v5, v7

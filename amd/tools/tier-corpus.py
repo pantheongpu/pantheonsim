@@ -293,6 +293,11 @@ for op in ['v_ashrrev_i16', 'v_max_i16', 'v_min_i16']:
         add('%s_e64 %s' % (op, ops))
         add('%s %s' % (op, ops))
 
+# ---- RDNA4's 64-bit scalar arithmetic
+for op in ['s_add_nc_u64', 's_sub_nc_u64', 's_mul_u64']:
+    for ops in ['s[2:3], s[4:5], s[6:7]', 's[2:3], s[4:5], 5', 's[2:3], 0x12345678, s[6:7]', 's[2:3], vcc, s[6:7]', 's[2:3], s[4:5], -1', 's[100:101], s[102:103], s[104:105]']:
+        add('%s %s' % (op, ops))
+
 # ---- VOPD (RDNA3 and RDNA4): X and Y by every pair of the instructions, with Y reading X's result, constants and literals
 VX = ['v_dual_fmac_f32', 'v_dual_mul_f32', 'v_dual_add_f32', 'v_dual_sub_f32', 'v_dual_subrev_f32', 'v_dual_mov_b32', 'v_dual_cndmask_b32',
       'v_dual_fmaak_f32', 'v_dual_fmamk_f32', 'v_dual_max_f32', 'v_dual_min_f32', 'v_dual_dot2acc_f32_f16', 'v_dual_lshlrev_b32', 'v_dual_add_nc_u32',

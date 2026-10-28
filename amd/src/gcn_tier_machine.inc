@@ -165,7 +165,9 @@ int tier_fence(Wave& w, const Inst& in) {
 // with X's destination as it was where Y reads it (both read their sources before either writes). A half that hands back (a NaN where the rule is the
 // interpreter's) hands the whole instruction back, with the registers as they were. Op::off0 and ::words are X's destination and its width in
 // registers; Op::sub says that Y reads it.
-int tier_vopd(Wave& w, Group& g, const Inst& in) {
+// (Out of line: its 1 KB of saved rows, in the frame of step() (tier_mach is inlined there), moved the frames below it -- step_interp's, and the stack buffers
+// of the matrix tiles under it -- and cost mfma_f64 3.5%: the tile kernel's loads and its stores alias in the low 12 bits of their addresses.)
+[[gnu::noinline]] int tier_vopd(Wave& w, Group& g, const Inst& in) {
   if (__builtin_expect(!w.tier.ok, 0)) make_tier_regs(w, g);
   gcn::tier::Regs& r = w.tier.r;
   const Inst& x = in.dual[0];

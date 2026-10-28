@@ -1572,6 +1572,10 @@ TIER_S2(s_and_b32, { v = static_cast<uint32_t>(a) & static_cast<uint32_t>(b); TI
 TIER_S2(s_or_b32, { v = static_cast<uint32_t>(a) | static_cast<uint32_t>(b); TIER_SCC(v != 0); })
 TIER_S2(s_xor_b32, { v = static_cast<uint32_t>(a) ^ static_cast<uint32_t>(b); TIER_SCC(v != 0); })
 TIER_S2(s_andn2_b32, { v = static_cast<uint32_t>(a & ~b); TIER_SCC(v != 0); })
+// (RDNA4's 64-bit scalar arithmetic: SCC untouched.)
+TIER_S2(s_add_nc_u64, v = a + b)
+TIER_S2(s_sub_nc_u64, v = a - b)
+TIER_S2(s_mul_u64, v = a * b)
 TIER_S2(s_and_b64, { v = a & b; TIER_SCC(v != 0); })
 TIER_S2(s_or_b64, { v = a | b; TIER_SCC(v != 0); })
 TIER_S2(s_xor_b64, { v = a ^ b; TIER_SCC(v != 0); })
@@ -2089,6 +2093,9 @@ const std::unordered_map<std::string_view, Entry>& table() {
     S("s_or_b32", s_or_b32, 2);
     S("s_xor_b32", s_xor_b32, 2);
     S("s_andn2_b32", s_andn2_b32, 2);
+    S("s_add_nc_u64", s_add_nc_u64, 2);
+    S("s_sub_nc_u64", s_sub_nc_u64, 2);
+    S("s_mul_u64", s_mul_u64, 2);
     S("s_and_b64", s_and_b64, 2);
     S("s_or_b64", s_or_b64, 2);
     S("s_xor_b64", s_xor_b64, 2);
