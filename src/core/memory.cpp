@@ -1473,7 +1473,8 @@ const MemoryManager::Allocation* MemoryManager::run_allocation(uint64_t addr, ui
   if (access_fault_ && (armed(access_fault_->stuck_pending) || armed(access_fault_->load_pending) ||
                         armed(access_fault_->store_pending)))
     return nullptr;
-  if (addr % unit || len % unit || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
+  // (`unit` is a power of two here: a mask where it was two divisions.)
+  if (((addr | len) & (unit - 1)) || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
   if (const Allocation* a = find_ordinary(addr, len, base)) return a;
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
