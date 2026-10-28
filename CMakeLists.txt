@@ -4243,6 +4243,9 @@ set_tests_properties(e2e_jit_frameworks PROPERTIES
 # diagnostic actually working, which is where every serious bug here showed up
 # first. Skips cleanly when no pantheon checkout is present, so a contributor
 # without one still gets a green run.
+# How the runner below judges a finished workload (pass, skip, fail); needs no GPU and no pantheon.
+add_test(NAME pantheon_workload_verdicts
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/verdict_test.sh)
 add_test(NAME pantheon_workloads
          COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/run_pantheon_workloads.sh)
 set_tests_properties(pantheon_workloads PROPERTIES

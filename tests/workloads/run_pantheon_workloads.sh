@@ -104,6 +104,7 @@ echo "workloads: $(wc -w <<<"$WORKLOADS")"
 # is what the Makefile reads to pick the architecture to build for.
 inner=$(cat <<'INNER'
 set -u
+. "$VGPU_WL_VERDICT"
 cd "$VGPU_WL_PANTHEON"
 # Targets are named by their output path: a bare name hits make's builtin
 # rule and compiles the .cpp with g++, which cannot take CUDA flags.
@@ -136,19 +137,17 @@ for w in $VGPU_WL_NAMES; do
   fi
   status=$?
   secs=$(( $(date +%s) - start ))
-  why=$(grep -iE "PANTHEON ERROR|CUDA error|integrity|VirtualGPU error|unsupported PTX|Verification: FAIL" "$log" | head -1 | cut -c1-100)
   if [ "$status" -eq 124 ]; then
     record "$w" TIMEOUT "$secs" "still running after ${VGPU_WL_TIMEOUT}s"; rc=1
-  elif [ "$status" -ne 0 ]; then
-    record "$w" FAIL "$secs" "exit $status${why:+: $why}"; rc=1
-  elif [ -n "$why" ]; then
-    record "$w" FAIL "$secs" "$why"; rc=1
-  # A workload that ran must say something about what it measured. A silent
-  # success is the failure this project cares about most.
-  elif ! grep -qiE "throughput|bandwidth|latency|ops/s|GB/s|PANTHEON|Verification: PASS" "$log"; then
-    record "$w" FAIL "$secs" "exited 0 but reported no measurement"; rc=1
   else
-    record "$w" PASS "$secs" "$(grep -iE 'throughput|ops/s|GB/s|Verification' "$log" | head -1 | tr -s ' ' | cut -c1-80)"
+    # tests/workloads/verdict.sh: a failure, a skip (the workload printed "Skipping:",
+    # so it did not run and is not counted as having passed), or a pass. A workload
+    # that ran must say something about what it measured: a silent success is the
+    # failure this project cares about most.
+    verdict=$(workload_verdict "$status" "$log")
+    result=$(printf '%s' "$verdict" | cut -f1)
+    record "$w" "$result" "$secs" "$(printf '%s' "$verdict" | cut -f2-)"
+    [ "$result" = FAIL ] && rc=1
   fi
 done
 exit $rc
@@ -168,6 +167,7 @@ if ! unshare --user --map-root-user true >/dev/null 2>&1; then
 fi
 
 VGPU_WL_PANTHEON="$pantheon" VGPU_WL_NAMES="$WORKLOADS" VGPU_WL_SKIP="$OUT_OF_SCOPE" \
+VGPU_WL_VERDICT="$root/tests/workloads/verdict.sh" \
 VGPU_WL_LOGS="$logs" VGPU_WL_DURATION="$DURATION" VGPU_WL_MEMPCT="$MEM_PCT" \
 VGPU_WL_ARGS="$ARGS" VGPU_WL_TIMEOUT="$TIMEOUT" VGPU_WL_GEMM="$GEMM_SIZE" VGPU_WL_JOBS="$("$root/ci/jobs.sh" -g 2)" \
   "$build/vgpu" shell --gpu "$GPU" --count "$COUNT" --vram-mb "$VRAM_MB" "${isolate[@]}" -y -c "$inner"
