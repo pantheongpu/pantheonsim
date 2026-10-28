@@ -1456,6 +1456,7 @@ struct RandomTex {
   exec::TexFilter filter;
   bool int_coords;
   uint64_t digest;   // of the results of the 400 fetches (FNV-1a over their words), as the code before these fast paths gave them
+  bool zeros = false;   // a float texture of zeros, mostly negative ones (a blend of negative zeros is a negative zero)
 };
 void run_random_tex(const RandomTex& c, uint64_t seed) {
   auto set_mode = [&](const char* fp) {
@@ -1514,7 +1515,7 @@ void run_random_tex(const RandomTex& c, uint64_t seed) {
   std::vector<uint8_t> bytes(uint64_t{c.w} * height * depth * texel_bytes);
   const uint64_t base = mem.alloc(bytes.size());
   for (size_t i = 0; i < bytes.size(); i += c.bits / 8) {
-    if (c.bits == 32 && c.kind == exec::ChannelKind::Float) { const uint32_t t = texel_f32(); std::memcpy(&bytes[i], &t, 4); }
+    if (c.bits == 32 && c.kind == exec::ChannelKind::Float) { const uint32_t t = c.zeros ? (rnd() % 8 ? 0x80000000u : 0u) : texel_f32(); std::memcpy(&bytes[i], &t, 4); }
     else if (c.bits == 16 && c.kind == exec::ChannelKind::Float) {
       const uint16_t t = static_cast<uint16_t>(rnd() % 8 == 0 ? rnd() : (rnd() % 2 ? 0x3C00u + rnd() % 0x400 : 0xB000u + rnd() % 0x800));
       std::memcpy(&bytes[i], &t, 2);
@@ -1611,6 +1612,8 @@ VTEST(linear_texture_fetches_at_random_coordinates_match_the_general_path_and_th
       {8, 4, 16, 16, 0, K::Unsigned, true, A::Clamp, false, exec::TexFilter::Linear, false, 0xc43aebd8eefec605ull},
       {8, 1, 16, 16, 0, K::Signed, true, A::Wrap, true, exec::TexFilter::Linear, false, 0x65f1b45f0f9400e1ull},
       {16, 2, 16, 16, 0, K::Unsigned, true, A::Border, false, exec::TexFilter::Linear, false, 0xb2e0b45b37c28520ull},
+      {32, 1, 16, 16, 0, K::Float, false, A::Clamp, false, exec::TexFilter::Linear, false, 0x7a45de671d350e83ull, true},
+      {32, 4, 16, 16, 0, K::Float, false, A::Wrap, true, exec::TexFilter::Linear, false, 0x0cde31491d350e83ull, true},
   };
   uint64_t seed = 1;
   for (const RandomTex& c : cases) run_random_tex(c, seed++);
@@ -1641,6 +1644,7 @@ VTEST(point_and_integer_texture_fetches_match_the_general_path_and_the_digests) 
       {8, 1, 16, 16, 0, K::Signed, false, A::Border, true, P, false, 0xde4c6c47ff447254ull},
       {16, 1, 16, 16, 0, K::Float, false, A::Clamp, false, P, false, 0xafbb84d796400e83ull},
       {64, 2, 8, 8, 0, K::Unsigned, false, A::Clamp, false, P, true, 0xe8278471b341825bull},
+      {32, 2, 16, 16, 0, K::Float, false, A::Clamp, false, P, false, 0xb6c1bc341d350e83ull, true},
   };
   uint64_t seed = 101;
   for (const RandomTex& c : cases) run_random_tex(c, seed++);
