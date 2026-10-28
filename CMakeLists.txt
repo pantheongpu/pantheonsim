@@ -1340,6 +1340,8 @@ vgpu_unit_test(test_memfast)
 vgpu_unit_test(test_memalloc)
 # The one-lookup read-modify-write and multi-field read, against the load_scalar / store_scalar calls they replace.
 vgpu_unit_test(test_memrmw)
+# The sp8 hot paths (load_fields in one chunk, the batch address scan, the host-map span test) at their boundaries.
+vgpu_unit_test(test_memhot_sp8)
 # The warp's local memory, interleaved by words, against the per-lane layout it replaced.
 vgpu_unit_test(test_locallayout)
 # The lock-free read-modify-write (atomic_rmw) against load_scalar / the operation / store_scalar, and from threads.
