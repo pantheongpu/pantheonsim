@@ -21,8 +21,9 @@
 //
 // A third level, Avx512 (AVX-512 F/BW/DQ/VL and VNNI), is the Avx2 table with the
 // three tile kernels replaced by 512-bit forms (src/simd/kernels512.inc). It is
-// chosen with VGPU_SIMD=avx512, or by default where the host runs it faster than
-// the 256-bit kernels (see kAvx512Default in simd.cpp); level() still names the
+// chosen by default on a host that has them, and with VGPU_SIMD=avx512 (VGPU_SIMD=avx2
+// or base keeps the 256-bit or the baseline kernels; see kAvx512Default in
+// simd.cpp); level() still names the
 // instruction-set family of the lane kernels (Base or Avx2), and kernels().level
 // the table in use.
 #pragma once
