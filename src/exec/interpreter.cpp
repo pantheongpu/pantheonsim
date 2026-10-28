@@ -2167,7 +2167,7 @@ bool tex_finish_one_f32(const MemoryManager& mem, const TextureDesc& d, const Te
 // nothing read, for a format texel_channels would hand to the one-at-a-time road, for terms whose texels are not of one
 // layout, and whenever the memory manager declines the lot; the caller then reads term by term, and meets any error where
 // it would have.
-bool texel_terms(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint64_t (*out)[4]) {
+[[gnu::noinline]] bool texel_terms(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint64_t (*out)[4]) {
   uint32_t width, nch;
   if (!texel_layout(d, &width, &nch)) return false;
   uint64_t addrs[16];
@@ -2195,7 +2195,7 @@ bool texel_terms(const MemoryManager& mem, const TextureDesc& d, const TexTerm* 
 // loops over groups and terms have one group to find. The same arithmetic in the same order -- the footprint's largest
 // exponent E, each value truncated to 2^(E - 27), the weighted sum floored to 2^(E - 28), one rounding -- so the same bits.
 // False, with nothing written, for any other case (the general code then runs), a non-finite texel included.
-bool tex_finish_f32_one_group(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint32_t out[4]) {
+[[gnu::noinline]] bool tex_finish_f32_one_group(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint32_t out[4]) {
   if (d.kind != ChannelKind::Float) return false;
   uint32_t width, nch;
   if (!texel_layout(d, &width, &nch) || width != 4) return false;
