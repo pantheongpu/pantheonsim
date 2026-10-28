@@ -4986,3 +4986,21 @@ the other canaries 0.998x to 1.02x. Unit tests: `test_tc_ampere`, `test_tc_amper
 
 ### Tests and mutations
 `test_amd_gcn_tier_same_bits` (and its `simd_base` twin; run with `VGPU_TIER_ONLY=ds_`): fails under a swapped pair of stores in `lds_to_rows<4>`, a swapped pair in `rows_to_lds<2>`, a reversed word order in `ds_write_lanes` (`ds_write_b96`), and a skipped last group of the all-lanes loop.
+## Round sp5: the NVIDIA API calls once more (branch `sp5-apilite`, base d28fe2ba)
+
+`api` is 15 calls a round at about 140 ns each; perf (user cycles, call graphs) put 25% of it in `cudaMemcpy` (three copies a round), 13% in `cudaFree`, 6% each in `cudaMalloc` and stream create/destroy, and the rest flat: clock reads 6%, `__tls_get_addr` 4.5%, mutexes 6%, `ApiCall` 4%.
+
+* **Device-to-device `cudaMemcpy`** went through a `std::vector<uint8_t> tmp(count)` (a malloc, a zero-fill, a free per copy; 2.6% of `api` in the vector's constructor alone, and the libc `rep stos` was the top symbol). The buffer is now the call's frame for up to 16 KiB (`kD2dFrameBytes`) and an uninitialised allocation beyond that. The source is read into it in full before the destination is written, as before (overlapping copies keep `memmove` semantics); every byte is written by the read, so nothing needs clearing.
+* **`sticky_error()`** (asked by stream/event create, query, synchronize, destroy: the calls that check the context is alive) took the API lock to ask an atomic. `State::initialized` is now an atomic set with release after `rt`; once true the fault is read without the lock. Before the machine exists the locked path runs as before.
+
+Results (`perf stat`, user, 3 x 15 runs on cpu 6, the whole process including start-up; the server's load was 25 to 60, so wall-clock A/B spread was 5 to 30%): `api` instructions 982.5 M -> 930.0 M (-5.3%), cycles 409 M -> 389 M (-4.8%, three runs: 409/389, 410/391, 503/395 in a noisy first); `launch` instructions equal (+0.04%). Bench A/B (`bench.py --ab`, SASS): `api` 1.043x (11 runs, p < 0.001) and 1.079x (15 runs, p 0.056); PTX 1.05x and 1.04x (p 0.15 and 0.32, spread 12 to 15%); A/A of the same two builds: 1.014x and 1.009x. `launch`, `startup`, `mem`: same (one PTX `launch` row read 0.976x with p < 0.001 in the first run and 0.987x, p 0.32, in the second; its instructions are equal).
+
+Test (CMake-wired): `test_runtime_d2d_scratch` (every size around the 16 KiB frame and beyond, a copy from untouched memory over stale data, overlapping copies forwards and backwards, a refused copy leaves the destination alone, a context fault seen on every thread and cleared, readers racing a thread that sets and clears it). Mutations that fail it: the copy made in 4 KiB pieces (overlap corrupts: `an_overlapping_device_to_device_copy_reads_the_whole_source_first`), the lock-free path answering success (`a_context_fault_is_seen_by_calls_on_every_thread_and_cleared_again` and the racing test).
+
+### Not done, and negative results
+
+* **AMD `occupancy()`'s five `std::string::rfind` prefix searches per launch** (3% of AMD `launch` self time) replaced by compares of the first bytes: `launch` mi300x 0.949x (p 0.33), rx6800 1.008x (p 0.85), `api`, `stream`, `memcpy`, `graph` all `same` with spreads of 20 to 76% under load 25 to 60. Dropped: not measurable here.
+* **Reusing `kernel_resources`' answer within a launch**: the lockstep pre-pass and `validate` each call it (3.3% of NVIDIA `launch` for both, `compute_occupancy`'s per-thread memo is itself 2.4%); one call saved is about 1.6%, under the bar. A memo on `EntryFn` would need the answer to survive concurrent launches of one kernel.
+* **`Runner::init_block`** (8% of `launch`, two `rep stos` of 3 KiB each for the warp and its registers), `Runner::Runner` + `build_bank0` (6% + 3%, a vector allocation per launch), `read_launch_env` (2.8%, already one pass): not changed; each is a few percent and the launch rows were too noisy to see them.
+* **AMD `launch`**: the AQL packet and kernarg allocate/free per launch (`MemoryManager::free` 7.7%, the exclusive table lock and the quarantine map) cannot be reused without changing allocation addresses; `getenv("VGPU_THREADS")` per dispatch is 1.5%.
+* **The clock reads of `cudaMemcpy`** (two per copy, 6% of `api`) feed the telemetry's busy time and timestamp: kept.
