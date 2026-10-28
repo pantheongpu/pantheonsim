@@ -297,9 +297,17 @@ if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMP
   target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
 endif()
 
+# The std::variant dispatch tables the PTX parser's and the SASS decoder's visits instantiate (weak, with names thousands of
+# characters long): left exported, each is a relocation the loader looks up by name at every process start (hashing the name
+# alone was a quarter of a small program's user cycles), and nothing outside the library refers to them. Local, they cost none.
+set(VGPU_LOCAL_STD_TABLES "_ZNSt8__detail9__variant*")
+
 # libvgpucuda: the CUDA Driver API shim external programs link against.
 add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/driver_graph.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(vgpucuda PRIVATE vgpu ${CMAKE_DL_LIBS})
+# Unversioned, as before; only the std::variant tables (VGPU_LOCAL_STD_TABLES) are made local.
+file(WRITE "${CMAKE_BINARY_DIR}/maps/libcuda.so.1.map" "{\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n")
+target_link_options(vgpucuda PRIVATE "-Wl,--version-script=${CMAKE_BINARY_DIR}/maps/libcuda.so.1.map")
 # Present the real driver's identity: apps linked with -lcuda record SONAME
 # "libcuda.so.1" and resolve to this library through LD_LIBRARY_PATH at run time.
 set_target_properties(vgpucuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 VERSION 1.1)
@@ -492,7 +500,7 @@ endfunction()
 # version information on every call.
 function(vgpu_version_script _libname _soversion _out)
   set(_path "${CMAKE_BINARY_DIR}/maps/lib${_libname}.so.${_soversion}.map")
-  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n};\n")
+  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n")
   set(${_out} "${_path}" PARENT_SCOPE)
 endfunction()
 
@@ -3691,6 +3699,12 @@ add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shi
 set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
+# The std::variant dispatch tables must stay local to each shim (VGPU_LOCAL_STD_TABLES): exported, their long names were a quarter of a
+# small program's user cycles at every process start.
+add_test(NAME lint_shim_dynsyms COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_dynsyms.sh)
+set_tests_properties(lint_shim_dynsyms PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 # No shim library takes static TLS (glibc leaves ~1.6 KB for every library loaded late).
 # (Not under a sanitizer: its runtime keeps initial-exec thread-locals in every library it is linked into, so the check would report the
 # runtime, not the simulator.)
