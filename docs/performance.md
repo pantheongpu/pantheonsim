@@ -4878,3 +4878,54 @@ Sanitizers: ASan+UBSan -O0 (`test_amd_mfma_math`, `test_amd_matrix_fast` 2248 s,
 * `flat_*`, `buffer_load/store`, `global_atomic_*` in the tier: `flat` costs the same per instruction as `mem` (48 ns) already, the cost is the memory work, not the frame.
 * fp8/small-float decode by `vgatherdpd`: not tried, a gather costs about what the scalar table lookups do on Zen 4.
 * AVX-512 for the tiles: Zen 4 runs it as two 256-bit halves, nothing to show here.
+
+## Round sp8: the memory manager's hot paths (branch `sp8-memmgr`, base a6e80555)
+
+Profiles of the memory workloads (Zen 4 box, one thread, `cycles:u`) put the manager's own functions at 5 to 26% of a row: the PTX atomics spent 26% in `rmw_locate` and its callers, `batch_ok` was 10% of PTX `mem` and 6% of SASS `atomics`, `load_fields` 9 to 11% of `texture`. What bounded each, from `perf annotate`:
+
+* The batch scan (`batch_addresses_ok`) made a min / max / or pass over the 32 addresses (about 11 instructions an address: two conditional moves for the extremes, the range tests) and then asked `HostMaps::may_overlap`, an out-of-line call, on every batch; `sassatom::batchable` and every scalar path called `may_contain` out of line per address.
+* `rmw_batch_fn` called `rmw_load` and `rmw_store` (out of line) per lane with the access width a runtime value: each lane went through a `load_at` switch, the alignment test and a call.
+* A miss in the thread's lookup memory (a kernel that reads one allocation and writes another alternates between two, so every second access missed) hashed the thread pointer a second time and scanned the eight ways from zero; the callers also kept an address-taken `base` local (a stack protector frame in `rmw_locate`).
+* `load_at` and `store_at` were out-of-line clones (5% of PTX `mem`) carrying their byte-wise fallback.
+
+What changed (`src/core/memory.cpp`, `include/vgpu/memory.hpp`):
+
+* `batch_addresses_ok`: an `or` of the addresses and one `(address - base) >= limit` flag each; a host mapping is ruled out for the whole allocation by one range test (`host_map_free_span`: the allocation lies in the device windows and no host buffer was ever mapped inside one), and only otherwise is each address asked. Same answers: an address inside the allocation is a device address, so `may_contain` cannot say yes for it unless a host buffer sits in a device window.
+* `HostMaps::may_contain` / `may_overlap` are `always_inline` (no lock is added anywhere: the host-map rule stands, the checks are the same relaxed loads).
+* `load_at` / `store_at`: the aligned access inline, the byte-wise path a cold noinline function.
+* `rmw_batch_fn`: the plain (not lock-free) loop runs with the width a constant (1, 2, 4, 8) and `rmw_load` / `rmw_store` inline.
+* `find_ordinary_miss` takes the caller's lookup memory, tries the way that answered before the last one first (`LookupMemory::prev`), and returns the allocation and base in registers.
+* `run_allocation` tests alignment with a mask (`unit` is a power of two there), not two divisions.
+
+### Results (Zen 4 box, cpu 2, 1 thread; B/A, 11 alternating runs; A is the base commit built the same way)
+
+| row | bench.py B/A (p) | perf stat cycles B/A | instructions B/A |
+| --- | --- | --- | --- |
+| PTX `atomics` | **1.36x** (< 0.001) | 0.73 | 0.81 |
+| SASS `mem` | 1.045x (< 0.001) | 0.95 to 0.98 | 0.98 |
+| PTX `mem` | 1.005x | 0.96 to 1.01 | 0.98 |
+| SASS `atomics` | 1.02x | 0.97 to 0.99 | 0.99 |
+| SASS `shared` | 1.02x | 0.98 | 1.00 |
+| PTX `texture` | 1.02x | 0.97 to 0.98 | 0.98 |
+| SASS `texture` | 1.02x | 0.98 | 0.98 |
+| AMD `atomics` (mi300x / rx6800) | **1.13x / 1.08x** | | counters identical |
+| AMD `buf` (mi300x / rx6800) | **1.07x / 1.06x** | | |
+| AMD `flat` (mi300x / rx6800) | 1.03x / 1.06x | | |
+| AMD `launch` mi300x | 1.05x | | |
+
+The A/A control (the same build under two paths) moves `mem` by up to 4 to 5% in the median ratio and the other rows by 1 to 2%: only PTX `atomics`, the AMD `atomics`/`buf`/`flat` rows and the instruction counts are beyond it. Canaries (SASS and PTX `int_alu f32_fma f64_fma wmma mma_ptx divergent warp local launch api`; AMD `valu_int valu_f32 mfma wave divergent smem lds ldsx api` on mi300x and rx6800) are within 0.98 to 1.02 with equal instructions; one AMD `lds` rx6800 run read 0.93 and the repeat 0.99 (A/A 1.00). Counters are identical in every row.
+
+Tests: `test_memhot_sp8` (new; `load_fields` against one `load_scalar` per field over real, uniform and untouched chunks and across chunk boundaries; the batch and window accepted or declined exactly at the allocation's last element, one past it, below it, misaligned; a host buffer mapped inside the allocation declining the batch that reaches it and not the one beside it; two allocations used alternately across frees of another and of either), plus the existing `test_memfast`, `test_memrmw`, `test_memrmw_lockfree`, `test_memalloc`, `test_memory`, `test_fastpath`, `test_sass_atomics`.
+
+| mutation | result |
+| --- | --- |
+| scan limit `size - 1` short (`a->size - size`) | `test_memhot_sp8` fails |
+| `host_map_free_span` always answers yes in the batch scan | `test_memhot_sp8` and `test_memfast` fail |
+| a stale lookup-memory way answered without revalidation | `test_memhot_sp8` fails |
+| the plain rmw loop does not store an unchanged result when `always_store` is set | `test_memrmw` fails |
+
+### Not done, and negative results
+* `load_fields` in one chunk (one chunk-table read for the record, one range test for the host maps): 0.8% more instructions on `texture`, cycles equal. The function is latency-bound: 24% of its samples sit on the texel load itself and 12% on the chunk-pointer load, both cache misses of a strided texture, not on the checks. Dropped.
+* `LookupMemory` cache-line aligned with the cursors first: SASS `texture` **1.20x more cycles** at 0.98x the instructions (frontend stalls 9 M to 27 M, L1 misses equal). The hot lines of the lookup path collide with the texture's strided stream; the layout the allocator gives by luck is better. Dropped; note that two builds of the same source also differed on SASS `texture` (0.996 and 1.05 in cycles), so a layout of the hot globals (`g_lookup_slots`, the lock epoch, the thread's memory) is worth re-checking after any change near it.
+* `MemoryManager::free` / `remember_freed` / `backing::release`: already reuse the freed node and the chunk array; no cost left to take in the allocation-per-launch path beyond the exclusive lock.
+* `run_allocation`'s mask (two divisions less) is not separable from noise on its own; kept with the rest because it is the same theme and costs nothing.
