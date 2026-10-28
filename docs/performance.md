@@ -5004,3 +5004,34 @@ Test (CMake-wired): `test_runtime_d2d_scratch` (every size around the 16 KiB fra
 * **`Runner::init_block`** (8% of `launch`, two `rep stos` of 3 KiB each for the warp and its registers), `Runner::Runner` + `build_bank0` (6% + 3%, a vector allocation per launch), `read_launch_env` (2.8%, already one pass): not changed; each is a few percent and the launch rows were too noisy to see them.
 * **AMD `launch`**: the AQL packet and kernarg allocate/free per launch (`MemoryManager::free` 7.7%, the exclusive table lock and the quarantine map) cannot be reused without changing allocation addresses; `getenv("VGPU_THREADS")` per dispatch is 1.5%.
 * **The clock reads of `cudaMemcpy`** (two per copy, 6% of `api`) feed the telemetry's busy time and timestamp: kept.
+## Round sp5: the SASS tier's control bound, measured (branch `sp5-sassctl`, base d28fe2ba)
+
+Profiled the base (one host thread, `cycles:u`, `perf stat -M PipelineL1/L2`): `divergent` runs at IPC 4.2 to 4.3, **retiring 69%**, front end 8.5% (bandwidth 3.2%, op-cache misses 11 M),
+bad speculation 3%, back end 19%; `step_warp` 44%, `pick_group_avx2` 15%, `blend_m_k` 7%. The line profile (`-g1`) is flat: no source line over 5%. The software popcount (`simd.hpp`) is
+5.6% of the samples, `lanes_at` in `pick_group` 8.5%, `sass_lanes.hpp:100` (BSYNC release's `wait_arg` compare) 3.4%. `ls_bad_status2.stli_other` is 46 M (4.6 per warp instruction):
+store-to-load forwarding failures, 15% of them in the BSYNC wait state (byte and word stores read back as 16-byte vectors), the rest spread over the run loop's counters and stack.
+
+### Not done, and negative results (this branch)
+
+* *Hardware POPCNT for `popcount32` (flag read once, `popcnt` through inline asm, software count otherwise) and a mask-table `pick_group_avx2` (one table load for the broadcast, and, compare of each
+  vector) and `pick_group_diverged` called directly from the chain when the run did not leave the whole group at one address (skips the converged test `lanes_at`)*: 87 M fewer instructions of 3443 M
+  (-2.5%) on `divergent`, cycles 804 M -> 800 M (-0.5%, inside the 0.3% to 1% run-to-run spread), B/A `divergent` 1.004x (p 0.13), `warp` 1.045x (p 0.15), `int_alu` 1.009x (p 0.065), `local` 1.008x:
+  not a win, dropped. The bound is not the instruction count: the core already retires 69% of its slots; what is left is the dependency and forwarding chains.
+* *PTX `divergent`/`warp` (`VGPU_SASS=0`)*: IPC 4.4, `run_warp_until_yield` 38%, `step` 16%, `exec_micro` 19%; the `-g1` line attribution points into `std::__fill_a`/`_Construct` (20% of
+  the samples) but the inline chain could not be resolved to a source statement with the available tools, so nothing was changed.
+* Not tried (no data pointing at them): `blend_m_k` without the old-row load, vector `tier_wait`/`wake` for partial groups (an earlier arrival-mask reordering that removed one read-back of the wait
+  arrays measured 0.98x to 1.02x in sp4).
+
+### The PTX interpreter's diverging branch (branch `sp5-sassctl`, measured, not kept)
+
+The `-g1` line profile of PTX `divergent` listed 20% in `std::__fill_a`, `_Construct` and `vector::size`; those are inlined container accessors of the hottest functions, not fills. A `-g -fno-omit-frame-pointer`
+build and `perf annotate -l` resolved them:
+
+* `exec_micro`: `micro_src` spreads an immediate across 32 lanes whenever the one-entry-per-slot cache holds another constant: 30% of `exec_micro`'s samples (2.5% of the run). A 16-entry hash cache per slot
+  (`SplatCache`) removed the fills and measured `divergent` ptx 1.011x (p 0.17), `warp` ptx 0.935x, `local` ptx 0.946x: nothing to gain, layout losses; dropped.
+* `step`, `exec_bra`'s diverging case: `Path fall{fall_pc, fallthrough}; fall.issued_at = ...; w.paths.push_back(fall);` builds the temporary with two 8-byte stores and the copy into the vector reads it
+  back as one 16-byte load, which store forwarding cannot serve: 53% of `step`'s samples sit on that one instruction (about 3.5% of the run). Building the path in place
+  (`emplace_back` and three field stores) gives `divergent` ptx 1.027x to 1.029x (p < 0.001, counters identical) but moves the hot interpreter code: `int_alu` ptx 0.970x, `local` ptx 0.982x
+  (p <= 0.001; same instructions, L1i misses 2.9 M -> 3.6 M, branch misses 0.7 M -> 1.0 M, op-cache misses +14%); the same change as a cold `noinline` helper: `divergent` 1.017x, `int_alu` 0.989x,
+  `local` 0.958x. A rebuild of the unmodified source reads 0.994x to 1.005x of the base (so these are the change's layout, not the build). Not kept: a 3% gain on divergent PTX for a 2% to 4% loss on straight-line PTX.
+  The interpreter's hot code (`run_warp_until_yield`, `exec_micro`, `step`) is larger than the L1i and any edit near it is a layout lottery.
