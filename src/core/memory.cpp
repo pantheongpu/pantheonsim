@@ -1537,6 +1537,14 @@ void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, u
   }
 }
 
+std::vector<std::pair<uint64_t, uint64_t>> MemoryManager::live_ranges() const {
+  SharedGuard table_guard(table_lock_.get());
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  out.reserve(live_.size());
+  for (const auto& [base, a] : live_) out.emplace_back(base, a.size);
+  return out;
+}
+
 bool MemoryManager::find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const {
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);

@@ -75,6 +75,9 @@ struct Code {
 
 struct Module {
   Cubin cubin;
+  // The cubin as it was loaded, kept only when host-GPU mode is on (VGPU_HOST_GPU, vgpu/host_gpu_rt.hpp): the real driver loads
+  // it for a launch on the card. `cubin` is patched with this device's addresses as it loads.
+  std::vector<uint8_t> image;
   int sm = 0;
   std::vector<Code> code;                     // one per .text section
   std::map<std::string, size_t> code_index;   // section name -> code

@@ -510,6 +510,8 @@ class MemoryManager {
   uint64_t used() const { return used_; }
   uint64_t capacity() const { return capacity_; }
   size_t live_allocations() const { return live_.size(); }
+  // Every live allocation's (base, size), in address order: what a host-GPU launch has to make resident.
+  std::vector<std::pair<uint64_t, uint64_t>> live_ranges() const;
 
  private:
   AccessFault* access_fault_ = nullptr;

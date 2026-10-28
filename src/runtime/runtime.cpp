@@ -19,6 +19,7 @@
 
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "vgpu/host_gpu_rt.hpp"
 #include "vgpu/exec/launch_env.hpp"
 #include "vgpu/exec/lockstep.hpp"
 
@@ -217,6 +218,45 @@ void digest_launch(const MemoryManager& mem, const std::string& name, const std:
     std::fprintf(f, "%llu %s%s\n", static_cast<unsigned long long>(seq++), name.c_str(), line.c_str());
     std::fclose(f);
   }
+}
+
+
+// VGPU_HOSTGPU_CAPTURE=<dir> (host-gpu spike, M2): for the first VGPU_HOSTGPU_CAPTURE_MAX launches of each kernel (default 2),
+// write what a replay on a real card needs into <dir>/<seq>.*: the launch (kernel name, grid, block, shared bytes, argument
+// bytes) in .meta, the whole device memory before the launch in .pre (records of base, size, bytes) and after it in .post. The
+// card replay tool (docs/perf-design/data/round13/m2_replay.cu) loads the program's own cubin, pushes .pre to the same
+// virtual addresses, runs the kernel and compares the result with .post. Throwaway instrumentation, never on by default.
+struct HostGpuCapture {
+  const char* dir = std::getenv("VGPU_HOSTGPU_CAPTURE");
+  uint64_t per_kernel = [] { const char* e = std::getenv("VGPU_HOSTGPU_CAPTURE_MAX"); return e ? std::strtoull(e, nullptr, 10) : 2ull; }();
+  uint64_t max_bytes = [] { const char* e = std::getenv("VGPU_HOSTGPU_CAPTURE_MAXBYTES"); return e ? std::strtoull(e, nullptr, 10) : (768ull << 20); }();
+  std::mutex mu;
+  std::map<std::string, uint64_t> seen;
+  uint64_t seq = 0;
+};
+HostGpuCapture& hostgpu_capture() { static HostGpuCapture c; return c; }
+
+bool dump_memory(const MemoryManager& mem, const char* path, uint64_t max_bytes) {
+  const auto ranges = mem.live_ranges();
+  uint64_t total = 0;
+  for (const auto& r : ranges) total += r.second;
+  if (total > max_bytes) return false;
+  FILE* f = std::fopen(path, "wb");
+  if (!f) return false;
+  std::vector<uint8_t> buf;
+  for (const auto& [base, size] : ranges) {
+    const uint64_t hdr[2] = {base, size};
+    std::fwrite(hdr, 8, 2, f);
+    for (uint64_t at = 0; at < size;) {
+      const uint64_t n = std::min<uint64_t>(size - at, uint64_t{1} << 24);
+      buf.resize(n);
+      mem.read(base + at, buf.data(), n);
+      std::fwrite(buf.data(), 1, n, f);
+      at += n;
+    }
+  }
+  std::fclose(f);
+  return true;
 }
 
 }  // namespace
@@ -1125,7 +1165,50 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
     fault_->maybe_hang(fn.name, telemetry_, static_cast<uint32_t>(physical_));
   }
   try {
+    HostGpuCapture& cap = hostgpu_capture();
+    uint64_t cap_seq = ~0ull;
+    if (cap.dir && *cap.dir) {
+      std::lock_guard<std::mutex> g(cap.mu);
+      if (cap.seen[fn.name]++ < cap.per_kernel) {
+        cap_seq = cap.seq++;
+        char p[600];
+        std::snprintf(p, sizeof p, "%s/%06llu.pre", cap.dir, static_cast<unsigned long long>(cap_seq));
+        if (!dump_memory(mem_, p, cap.max_bytes)) cap_seq = ~0ull;
+        else {
+          std::snprintf(p, sizeof p, "%s/%06llu.meta", cap.dir, static_cast<unsigned long long>(cap_seq));
+          if (FILE* m = std::fopen(p, "w")) {
+            std::fprintf(m, "kernel %s\ngrid %u %u %u\nblock %u %u %u\nshared %u\nnargs %zu\n", fn.name.c_str(), cfg.grid[0], cfg.grid[1],
+                         cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], cfg.shared_bytes, args.size());
+            for (const auto& a : args) {
+              std::fprintf(m, "arg %zu ", a.size());
+              for (uint8_t b : a) std::fprintf(m, "%02x", b);
+              std::fprintf(m, "\n");
+            }
+            std::fclose(m);
+          }
+        }
+      }
+    }
+    const auto cap_t0 = std::chrono::steady_clock::now();
+    // VGPU_HOST_GPU=exact: the launch may run on the machine's real GPU (vgpu/host_gpu_rt.hpp); null when the mode is off.
+    hostgpu::Runtime* const hg = hostgpu::Runtime::for_device(profile_, ordinal_);
+    if (hg && hg->try_launch(fn, cfg, args, mem_)) {
+      if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);
+      return;
+    }
     run_kernel(fn, cfg, args, syms);
+    if (hg) hg->note_simulated(fn, cfg, std::chrono::duration<double>(std::chrono::steady_clock::now() - cap_t0).count(), &mem_);
+    if (cap_seq != ~0ull) {
+      char p[600];
+      const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - cap_t0).count();
+      std::snprintf(p, sizeof p, "%s/%06llu.time", cap.dir, static_cast<unsigned long long>(cap_seq));
+      if (FILE* t = std::fopen(p, "w")) { std::fprintf(t, "%.9f\n", secs); std::fclose(t); }
+      std::snprintf(p, sizeof p, "%s/%06llu.post", cap.dir, static_cast<unsigned long long>(cap_seq));
+      dump_memory(mem_, p, cap.max_bytes);
+      // VGPU_HOSTGPU_CAPTURE_STOP=<n>: the capture is the point; end the program once n launches are on disk.
+      static const uint64_t stop = [] { const char* e = std::getenv("VGPU_HOSTGPU_CAPTURE_STOP"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+      if (stop && cap_seq + 1 >= stop) std::_Exit(0);
+    }
     digest_launch(mem_, fn.name, args);
   } catch (const Error& e) {
     if (fault_) {

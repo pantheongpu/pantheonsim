@@ -189,6 +189,7 @@ static void patch_code(CubinSection& s, const CubinReloc& r, uint64_t value) {
 std::shared_ptr<Module> load(const uint8_t* image, size_t size, MemoryManager& mem, const DeviceProfile& profile) {
   auto m = std::make_shared<Module>();
   m->cubin = parse_cubin(image, size);
+  if (const char* hg = std::getenv("VGPU_HOST_GPU"); hg && *hg) m->image.assign(image, image + size);
   const Cubin& c = m->cubin;
   m->sm = c.sm;
   const int device_sm = profile.cc_major * 10 + profile.cc_minor;
