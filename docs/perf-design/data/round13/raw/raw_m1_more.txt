@@ -1,0 +1,33 @@
+window  0 0x200000000000 1 TiB reserve: EXACT wall 0.234
+window  1 0x210000000000 1 TiB reserve: EXACT wall 0.228
+window  2 0x220000000000 1 TiB reserve: EXACT wall 0.224
+window  3 0x230000000000 1 TiB reserve: EXACT wall 0.238
+window  4 0x240000000000 1 TiB reserve: EXACT wall 0.226
+window  5 0x250000000000 1 TiB reserve: EXACT wall 0.220
+window  6 0x260000000000 1 TiB reserve: EXACT wall 0.224
+window  7 0x270000000000 1 TiB reserve: EXACT wall 0.237
+window  8 0x280000000000 1 TiB reserve: EXACT wall 0.228
+window  9 0x290000000000 1 TiB reserve: EXACT wall 0.232
+window 10 0x2a0000000000 1 TiB reserve: EXACT wall 0.226
+window 11 0x2b0000000000 1 TiB reserve: EXACT wall 0.232
+window 12 0x2c0000000000 1 TiB reserve: EXACT wall 0.226
+window 13 0x2d0000000000 1 TiB reserve: EXACT wall 0.222
+window 14 0x2e0000000000 1 TiB reserve: EXACT wall 0.228
+window 15 0x2f0000000000 1 TiB reserve: EXACT wall 0.220
+all 16 at once: ok -> EXACT
+cuMemAddressReserve size 64 KiB (not a granule): 1
+cuMemAddressReserve hint not 2MiB-aligned (0x200000010000, 2 MiB): 1 got 0x5957967db5d0
+cuMemCreate 64 KiB: 1
+cuMemCreate 3 MiB: 1
+reserve 8 MiB at window base: 0
+cuMemCreate 2 MiB: 0
+cuMemMap 2 MiB at +0: 0
+cuMemMap same handle at +4 MiB (two views of one physical granule): 0
+cuMemMap again at +0 (overlap): 1
+SetAccess on the unmapped +2 MiB hole: 1
+cuMemUnmap of half a granule: 1
+-> EXACT
+map 0x200000000000 4096 MiB: EXACT wall 0.483
+map 0x200000000000 20000 MiB: EXACT wall 0.514
+conc 4 processes x 20 reserve+map+kernel at 0x200000000000: all EXACT and verified, wall 5.91 s
+conc 1 processes x 20 reserve+map+kernel at 0x200000000000: all EXACT and verified, wall 4.32 s

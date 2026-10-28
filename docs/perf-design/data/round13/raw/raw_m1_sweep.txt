@@ -1,0 +1,28 @@
+granularity min 2097152 recommended 2097152
+memory free 22331 total 22589 MiB
+hint 0x000100000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.282 s
+got=0x302000000 hint 0x000200000000 64MiB reserve+map+kernel+readback: other-address wall 0.238 s
+hint 0x000400000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.284 s
+hint 0x000800000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.282 s
+hint 0x001000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.286 s
+hint 0x002000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.280 s
+hint 0x004000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.284 s
+hint 0x008000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.278 s
+got=0x10004000000 hint 0x010000000000 64MiB reserve+map+kernel+readback: other-address wall 0.220 s
+hint 0x020000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.280 s
+hint 0x040000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.281 s
+hint 0x080000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.270 s
+hint 0x100000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.276 s
+hint 0x200000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.278 s
+hint 0x400000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.280 s
+err=CUDA_ERROR_OUT_OF_MEMORYhint 0x800000000000 64MiB reserve+map+kernel+readback: error         wall 0.237 s
+err=CUDA_ERROR_OUT_OF_MEMORYhint 0x1000000000000 64MiB reserve+map+kernel+readback: error         wall 0.228 s
+hint 0x200000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.278 s
+hint 0x210000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.280 s
+hint 0x2f0000000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.284 s
+hint 0x2fff00000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.282 s
+hint 0x6ffb00000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.280 s
+hint 0x7ffe00000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.278 s
+hint 0x7fff00000000 64MiB reserve+map+kernel+readback: EXACT         wall 0.276 s
+err=CUDA_ERROR_OUT_OF_MEMORYhint 0x800000000000 64MiB reserve+map+kernel+readback: error         wall 0.242 s
+err=CUDA_ERROR_OUT_OF_MEMORYhint 0xffff00000000 64MiB reserve+map+kernel+readback: error         wall 0.234 s
