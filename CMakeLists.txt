@@ -297,9 +297,17 @@ if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMP
   target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
 endif()
 
+# The std::variant dispatch tables the PTX parser's and the SASS decoder's visits instantiate (weak, with names thousands of
+# characters long): left exported, each is a relocation the loader looks up by name at every process start (hashing the name
+# alone was a quarter of a small program's user cycles), and nothing outside the library refers to them. Local, they cost none.
+set(VGPU_LOCAL_STD_TABLES "_ZNSt8__detail9__variant*")
+
 # libvgpucuda: the CUDA Driver API shim external programs link against.
 add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/driver_graph.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(vgpucuda PRIVATE vgpu ${CMAKE_DL_LIBS})
+# Unversioned, as before; only the std::variant tables (VGPU_LOCAL_STD_TABLES) are made local.
+file(WRITE "${CMAKE_BINARY_DIR}/maps/libcuda.so.1.map" "{\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n")
+target_link_options(vgpucuda PRIVATE "-Wl,--version-script=${CMAKE_BINARY_DIR}/maps/libcuda.so.1.map")
 # Present the real driver's identity: apps linked with -lcuda record SONAME
 # "libcuda.so.1" and resolve to this library through LD_LIBRARY_PATH at run time.
 set_target_properties(vgpucuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 VERSION 1.1)
@@ -492,7 +500,7 @@ endfunction()
 # version information on every call.
 function(vgpu_version_script _libname _soversion _out)
   set(_path "${CMAKE_BINARY_DIR}/maps/lib${_libname}.so.${_soversion}.map")
-  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n};\n")
+  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n")
   set(${_out} "${_path}" PARENT_SCOPE)
 endfunction()
 
@@ -1500,6 +1508,9 @@ target_compile_definitions(test_decode_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAK
 # sass::unsupported's table of words it has seen: the answer and the text of a refusal are the same with or without it.
 vgpu_unit_test(test_unsupported_memo tests/unit/test_unsupported_memo.cpp)
 target_compile_definitions(test_unsupported_memo PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The file of cubins sass::unsupported found to run in full, kept between processes (src/sass/ok_cache.cpp).
+vgpu_unit_test(test_sass_ok_cache tests/unit/test_sass_ok_cache.cpp)
+target_compile_definitions(test_sass_ok_cache PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # FFMA2/FMUL2/FADD2 (sm_100's packed fp32): the corpora's lines decode and are run, a cubin of them is supported, the forms of unknown
 # meaning are refused, and the arithmetic the PTX and SASS engines share.
 vgpu_unit_test(test_f32x2_sass tests/unit/test_f32x2_sass.cpp)
