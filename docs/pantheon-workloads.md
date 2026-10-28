@@ -142,6 +142,11 @@ library missing, a pantheon-started group that the runner does not form) is repo
 skipped with that reason, not as passed: it did not run, and a pass would say it had.
 `tests/workloads/verdict.sh` decides, and `verdict_test.sh` checks it without a GPU.
 
+The runner takes the Action's drop-in directory (`<build>/bin`, with its own `nvcc`) off `PATH`
+before it starts `vgpu shell`, which supplies its own. With both there, the two `nvcc` scripts
+each take the other for the real compiler and call each other for ever; `path.sh` does the
+removal and `path_test.sh` checks it.
+
 The run's summary page has one table, a row per workload and a column per
 machine, with failures first and the reason for each. While main is failing,
 an issue labelled `workloads-failing` stays open and each run comments on it;

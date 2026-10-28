@@ -4246,6 +4246,9 @@ set_tests_properties(e2e_jit_frameworks PROPERTIES
 # How the runner below judges a finished workload (pass, skip, fail); needs no GPU and no pantheon.
 add_test(NAME pantheon_workload_verdicts
          COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/verdict_test.sh)
+# And the PATH it starts vgpu shell with, which must not hold the Action's drop-in nvcc.
+add_test(NAME pantheon_workload_path
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/path_test.sh)
 add_test(NAME pantheon_workloads
          COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/run_pantheon_workloads.sh)
 set_tests_properties(pantheon_workloads PROPERTIES

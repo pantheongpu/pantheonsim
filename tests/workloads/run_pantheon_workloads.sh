@@ -26,6 +26,13 @@ set -uo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 build="${VGPU_BUILD_DIR:-$root/build}"
 
+# `vgpu shell` supplies the nvcc and nvidia-smi it runs the workloads with. The GitHub
+# Action's copies of them (<build>/bin) must not be on PATH when it starts, or its nvcc
+# and the Action's call each other for ever: see tests/workloads/path.sh.
+. "$root/tests/workloads/path.sh"
+PATH="$(path_without "$build/bin" "$PATH")"
+export PATH
+
 pantheon=""
 for cand in "${VGPU_PANTHEON_DIR:-}" "$root/../pantheon" "$HOME/pantheon"; do
   [[ -n "$cand" && -f "$cand/Makefile" && -d "$cand/kernels" ]] && { pantheon="$(cd "$cand" && pwd)"; break; }
