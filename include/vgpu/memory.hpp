@@ -666,7 +666,19 @@ class MemoryManager {
   // recent lookups or the table; null if there is none or the memory is off.
   const Allocation* find_ordinary(uint64_t addr, uint64_t len, uint64_t* base_out) const;
   uint8_t* hot_location(uint64_t addr, uint32_t size) const;
-  const Allocation* find_ordinary_miss(uint64_t addr, uint64_t len, uint64_t* base_out) const;
+  // True when no address in [base, base + size) can be in a host mapping, by the one range test that covers them all: the span is
+  // wholly in the device windows and no host buffer has ever been mapped inside one. (False says nothing: ask each address.)
+  [[gnu::always_inline]] bool host_map_free_span(uint64_t base, uint64_t size) const {
+    return !host_maps_ || (is_device_va(base) && is_device_va(base + size - 1) &&
+                           !host_maps_->in_device_window.load(std::memory_order_relaxed));
+  }
+  // What a lookup found: the allocation (null for none) and its base, returned in registers so the callers keep no address-taken local.
+  struct Found {
+    const Allocation* a;
+    uint64_t base;
+  };
+  // `memory` is the calling thread's lookup memory (found by the caller, which has just looked in it).
+  Found find_ordinary_miss(uint64_t addr, uint64_t len, void* memory) const;
   bool batch_ok(const uint64_t* addrs, size_t count, uint32_t size, bool store, const Allocation** alloc,
                 uint64_t* base) const;
   // The part of batch_ok that is about armed faults, for a load or for a store, and the part that is about the addresses.
@@ -801,11 +813,11 @@ class MemoryManager {
     std::atomic<bool> in_device_window{false};
     // Whether any address from `first` to `last` (inclusive, first <= last) may_contain would not rule out: a range wholly in
     // the device windows (one interval) is ruled out as one address is.
-    bool may_overlap(uint64_t first, uint64_t last) const {
+    [[gnu::always_inline]] bool may_overlap(uint64_t first, uint64_t last) const {
       if (is_device_va(first) && is_device_va(last) && !in_device_window.load(std::memory_order_relaxed)) return false;
       return first < hi.load(std::memory_order_relaxed) && last >= lo.load(std::memory_order_relaxed);
     }
-    bool may_contain(uint64_t addr) const {
+    [[gnu::always_inline]] bool may_contain(uint64_t addr) const {
       if (is_device_va(addr) && !in_device_window.load(std::memory_order_relaxed)) return false;
       return addr >= lo.load(std::memory_order_relaxed) &&
              addr < hi.load(std::memory_order_relaxed);
