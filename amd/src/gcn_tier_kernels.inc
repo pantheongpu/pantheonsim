@@ -115,6 +115,34 @@ TIER_K(k_lshlrev_b16, d[i] = static_cast<uint16_t>(b[i] << (a[i] & 15)))
 TIER_K(k_lshrrev_b16, d[i] = static_cast<uint16_t>(b[i]) >> (a[i] & 15))
 TIER_K(k_ashrrev_i16, d[i] = static_cast<uint16_t>(static_cast<int16_t>(b[i]) >> (a[i] & 15)))
 TIER_K(k_mul_lo_u16, d[i] = static_cast<uint16_t>(a[i] * b[i]))
+// Leading and trailing zero counts (-1 for no set bit): v_ffbh_u32, v_ffbl_b32, v_ffbh_i32.
+TIER_K(k_ffbh_u, d[i] = a[i] ? static_cast<uint32_t>(__builtin_clz(a[i])) : 0xFFFFFFFFu)
+TIER_K(k_ffbl, d[i] = a[i] ? static_cast<uint32_t>(__builtin_ctz(a[i])) : 0xFFFFFFFFu)
+TIER_K(k_ffbh_i, d[i] = (a[i] >> 31 ? ~a[i] : a[i]) ? static_cast<uint32_t>(__builtin_clz(a[i] >> 31 ? ~a[i] : a[i])) : 0xFFFFFFFFu)
+// Packed 16-bit integers (v_pk_*_u16, _i16, _b16): a, b and c are one half of each lane's sources (zero-extended), d the half's result in the low
+// 16 bits. The clamped forms hold an add, a subtract or a multiply-add to what 16 bits hold.
+#define PK_S(x) static_cast<int32_t>(static_cast<int16_t>(x))
+TIER_K(k_pk_mullo, d[i] = (a[i] * b[i]) & 0xFFFFu)
+TIER_K(k_pk_addu, d[i] = (a[i] + b[i]) & 0xFFFFu)
+TIER_K(k_pk_addi, d[i] = static_cast<uint32_t>(PK_S(a[i]) + PK_S(b[i])) & 0xFFFFu)
+TIER_K(k_pk_subu, d[i] = (a[i] - b[i]) & 0xFFFFu)
+TIER_K(k_pk_subi, d[i] = static_cast<uint32_t>(PK_S(a[i]) - PK_S(b[i])) & 0xFFFFu)
+TIER_K(k_pk_shl, d[i] = (b[i] << (a[i] & 15)) & 0xFFFFu)
+TIER_K(k_pk_shr, d[i] = b[i] >> (a[i] & 15))
+TIER_K(k_pk_ashr, d[i] = static_cast<uint32_t>(PK_S(b[i]) >> (a[i] & 15)) & 0xFFFFu)
+TIER_K(k_pk_maxi, d[i] = static_cast<uint32_t>(PK_S(a[i]) > PK_S(b[i]) ? PK_S(a[i]) : PK_S(b[i])) & 0xFFFFu)
+TIER_K(k_pk_mini, d[i] = static_cast<uint32_t>(PK_S(a[i]) < PK_S(b[i]) ? PK_S(a[i]) : PK_S(b[i])) & 0xFFFFu)
+TIER_K(k_pk_maxu, d[i] = a[i] > b[i] ? a[i] : b[i])
+TIER_K(k_pk_minu, d[i] = a[i] < b[i] ? a[i] : b[i])
+TIER_K(k_pk_madu, d[i] = (a[i] * b[i] + c[i]) & 0xFFFFu)
+TIER_K(k_pk_madi, d[i] = static_cast<uint32_t>(PK_S(a[i]) * PK_S(b[i]) + PK_S(c[i])) & 0xFFFFu)
+TIER_K(k_pk_addu_c, d[i] = a[i] + b[i] > 0xFFFFu ? 0xFFFFu : a[i] + b[i])
+TIER_K(k_pk_addi_c, d[i] = static_cast<uint32_t>(PK_S(a[i]) + PK_S(b[i]) < -32768 ? -32768 : PK_S(a[i]) + PK_S(b[i]) > 32767 ? 32767 : PK_S(a[i]) + PK_S(b[i])) & 0xFFFFu)
+TIER_K(k_pk_subu_c, d[i] = a[i] < b[i] ? 0u : a[i] - b[i])
+TIER_K(k_pk_subi_c, d[i] = static_cast<uint32_t>(PK_S(a[i]) - PK_S(b[i]) < -32768 ? -32768 : PK_S(a[i]) - PK_S(b[i]) > 32767 ? 32767 : PK_S(a[i]) - PK_S(b[i])) & 0xFFFFu)
+TIER_K(k_pk_madu_c, d[i] = a[i] * b[i] + c[i] > 0xFFFFu ? 0xFFFFu : a[i] * b[i] + c[i])
+TIER_K(k_pk_madi_c, d[i] = static_cast<uint32_t>(PK_S(a[i]) * PK_S(b[i]) + PK_S(c[i]) < -32768 ? -32768 : PK_S(a[i]) * PK_S(b[i]) + PK_S(c[i]) > 32767 ? 32767 : PK_S(a[i]) * PK_S(b[i]) + PK_S(c[i])) & 0xFFFFu)
+#undef PK_S
 TIER_K(k_min_u16, d[i] = std::min(static_cast<uint16_t>(a[i]), static_cast<uint16_t>(b[i])))
 TIER_K(k_max_u16, d[i] = std::max(static_cast<uint16_t>(a[i]), static_cast<uint16_t>(b[i])))
 TIER_K(k_min_i16, d[i] = static_cast<uint16_t>(std::min(static_cast<int16_t>(a[i]), static_cast<int16_t>(b[i]))))
@@ -221,6 +249,9 @@ TIER_D(k_dfloor, r[i] = __builtin_fabs(a[i]) < 4503599627370496.0 ? __builtin_fl
 TIER_D(k_dceil, r[i] = __builtin_fabs(a[i]) < 4503599627370496.0 ? __builtin_ceil(a[i]) : a[i])
 TIER_D(k_dtrunc, r[i] = __builtin_fabs(a[i]) < 4503599627370496.0 ? __builtin_trunc(a[i]) : a[i])
 TIER_D(k_drndne, r[i] = __builtin_nearbyint(a[i]))
+// (minimum and maximum: a NaN result, and the two zeros of opposite sign, go to the interpreter as the float forms'.)
+TIER_D(k_dmin, r[i] = __builtin_fmin(a[i], b[i]))
+TIER_D(k_dmax, r[i] = __builtin_fmax(a[i], b[i]))
 
 // The same three operations (add, multiply, fused multiply-add) straight on register pairs: the low and high words of each operand in their rows,
 // the result's the same, and the lanes whose result is a NaN as the bits of the return value. Lane by lane the arithmetic is the one above.
@@ -303,6 +334,15 @@ TIER_L(l_lshl_add, d[i] = (a[i] << (b[i] & 63)) + c[i])
 TIER_L(l_lshl_add_g, d[i] = (a[i] << ((b[i] & 7) > 4 ? 0 : (b[i] & 7))) + c[i])
 TIER_L(l_cvt_f64_u, reinterpret_cast<F64*>(d)[i] = static_cast<double>(static_cast<uint32_t>(a[i])))
 TIER_L(l_cvt_f64_i, reinterpret_cast<F64*>(d)[i] = static_cast<double>(static_cast<int32_t>(a[i])))
+// The double-precision functions of one source and the conversions between the widths (the interpreter's own expressions, libm's ldexp and frexp
+// included, so a NaN or a denormal is what it makes of it). The 64 -> 32 conversions give the 32-bit result in the low word.
+TIER_L(l_ldexp, { double x, y; std::memcpy(&x, &a[i], 8); y = std::ldexp(x, static_cast<int32_t>(static_cast<uint32_t>(b[i]))); std::memcpy(&d[i], &y, 8); })
+TIER_L(l_frexp_mant, { double x, m; std::memcpy(&x, &a[i], 8); int e = 0; m = std::isfinite(x) ? std::frexp(x, &e) : x; std::memcpy(&d[i], &m, 8); })
+TIER_L(l_frexp_exp, { double x; std::memcpy(&x, &a[i], 8); int e = 0; if (std::isfinite(x)) std::frexp(x, &e); d[i] = static_cast<uint32_t>(e); })
+TIER_L(l_cvt_f64_f32, { float x; const uint32_t lo = static_cast<uint32_t>(a[i]); std::memcpy(&x, &lo, 4); const double y = static_cast<double>(x); std::memcpy(&d[i], &y, 8); })
+TIER_L(l_cvt_f32_f64, { double x; std::memcpy(&x, &a[i], 8); const float y = static_cast<float>(x); uint32_t b32; std::memcpy(&b32, &y, 4); d[i] = b32; })
+TIER_L(l_cvt_i32_f64, { double x; std::memcpy(&x, &a[i], 8); d[i] = std::isnan(x) ? 0u : x >= 2147483647.0 ? 0x7FFFFFFFu : x <= -2147483648.0 ? 0x80000000u : static_cast<uint32_t>(static_cast<int32_t>(x)); })
+TIER_L(l_cvt_u32_f64, { double x; std::memcpy(&x, &a[i], 8); d[i] = !(x > 0) ? 0u : x >= 4294967295.0 ? 0xFFFFFFFFu : static_cast<uint32_t>(x); })
 
 // ---- comparisons: bit l of the result is `a[l] test b[l]`, for the first n lanes
 // The integer tests, in the ISA's order after F (0): LT, EQ, LE, GT, NE, GE, T (7).

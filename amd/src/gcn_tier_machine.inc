@@ -161,7 +161,41 @@ int tier_fence(Wave& w, const Inst& in) {
   return 1;
 }
 
-// The instructions the tier hands to the Machine, by Op::mach: 3 s_barrier, 6 s_endpgm, 7 scalar memory, 8 packed halves, 10 the accumulation register moves, 11 a cache fence, else a global access.
+// VOPD (RDNA3 and RDNA4's two instructions issued as one): each half by its own tier handler, as step_interp's Vopd case runs them -- X first, then Y
+// with X's destination as it was where Y reads it (both read their sources before either writes). A half that hands back (a NaN where the rule is the
+// interpreter's) hands the whole instruction back, with the registers as they were. Op::off0 and ::words are X's destination and its width in
+// registers; Op::sub says that Y reads it.
+int tier_vopd(Wave& w, Group& g, const Inst& in) {
+  if (__builtin_expect(!w.tier.ok, 0)) make_tier_regs(w, g);
+  gcn::tier::Regs& r = w.tier.r;
+  const Inst& x = in.dual[0];
+  const Inst& y = in.dual[1];
+  const uint32_t xd = static_cast<uint32_t>(in.fast.off0), xw = in.fast.words;
+  alignas(32) uint32_t before[2][64], after[2][64];
+  for (uint32_t k = 0; k < xw; ++k) std::memcpy(before[k], w.vgpr[xd + k].data(), sizeof before[k]);
+  r.target = 0;
+  if (!x.fast.run(x.fast, r)) return 0;
+  const bool y_reads_x = in.fast.sub != 0;
+  if (y_reads_x)
+    for (uint32_t k = 0; k < xw; ++k) {
+      std::memcpy(after[k], w.vgpr[xd + k].data(), sizeof after[k]);
+      std::memcpy(w.vgpr[xd + k].data(), before[k], sizeof before[k]);
+    }
+  if (!y.fast.run(y.fast, r)) {
+    for (uint32_t k = 0; k < xw; ++k) std::memcpy(w.vgpr[xd + k].data(), before[k], sizeof before[k]);
+    return 0;
+  }
+  if (y_reads_x)
+    for (uint32_t k = 0; k < xw; ++k) std::memcpy(w.vgpr[xd + k].data(), after[k], sizeof after[k]);
+  InstructionCounts& n = stats.counts;
+  for (const Inst& half : in.dual) ++n.mix[static_cast<int>(half.mix)];
+  w.pc += in.size;
+  ++stats.instructions;
+  ++n.valu;
+  return 1;
+}
+
+// The instructions the tier hands to the Machine, by Op::mach: 3 s_barrier, 6 s_endpgm, 7 scalar memory, 8 packed halves, 10 the accumulation register moves, 11 a cache fence, 12 a VOPD pair, else a global access.
 int tier_mach(Wave& w, Group& g, const Inst& in) {
   switch (in.fast.mach) {
     case 3: return tier_barrier(w, in);
@@ -170,6 +204,7 @@ int tier_mach(Wave& w, Group& g, const Inst& in) {
     case 8: return tier_pkf16(w, in);
     case 10: return tier_acc(w, in);
     case 11: return tier_fence(w, in);
+    case 12: return tier_vopd(w, g, in);
     default: return tier_global(w, g, in);
   }
 }
