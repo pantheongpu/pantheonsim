@@ -1603,6 +1603,33 @@ uint64_t texel_raw(const MemoryManager& mem, const TextureDesc& d, uint64_t addr
   return texel_channel_bits(mem, d, addr, ch);
 }
 
+// `v` as a scalar load. A loop over the four results of a call that stored them one at a time, which the compiler makes one
+// wide load of the array, waits for those stores to retire (a store-forwarding stall: 20 or more cycles, a quarter of a
+// fetch); the empty asm wants the value in a register, so each is loaded alone.
+inline uint64_t scalar_read(const uint64_t& v) {
+  uint64_t x = v;
+  asm("" : "+r"(x));
+  return x;
+}
+
+// Whether the texel of `d` is `nch` (1 to 4) channels of `width` bytes (1, 2, 4 or 8) each, end to end from its address -- a
+// plain format, no block compression and no packing -- with the channels that exist the first ones.
+inline bool texel_layout(const TextureDesc& d, uint32_t* width, uint32_t* nch) {
+  if (d.block != BlockFormat::None || d.packed_1010102) return false;
+  uint32_t w = 0, n = 0;
+  for (uint32_t ch = 0; ch < 4; ++ch) {
+    const uint32_t b = d.channel_bits[ch] / 8;
+    if (b == 0) continue;
+    if (ch != n || (w && b != w)) return false;
+    w = b;
+    ++n;
+  }
+  if (w != 1 && w != 2 && w != 4 && w != 8) return false;
+  *width = w;
+  *nch = n;
+  return true;
+}
+
 // The channels of the texel at `addr` that `need` (a mask of channels) asks for, read together -- texel_raw for each of
 // them, with one lookup of the address (MemoryManager::load_fields) instead of one per channel. True with out[ch] set for
 // each channel in `need`; false, having read nothing, whenever reading them one at a time could differ -- a block-compressed
@@ -1619,6 +1646,13 @@ uint64_t texel_raw(const MemoryManager& mem, const TextureDesc& d, uint64_t addr
     static constexpr uint32_t kShift[4] = {0, 10, 20, 30}, kBits[4] = {10, 10, 10, 2};
     for (uint32_t ch = 0; ch < 4; ++ch)
       if (need & (1u << ch)) out[ch] = (w >> kShift[ch]) & ((1u << kBits[ch]) - 1);
+    return true;
+  }
+  // The usual texel: the channels one width, the first few of the four (load_texels' form, with its cheaper lookup).
+  uint32_t width = 0, nch = 0;
+  if (texel_layout(d, &width, &nch) && (need & ((1u << nch) - 1)) == (1u << nch) - 1) {
+    if (!mem.load_texels(&addr, 1, width, nch, out)) return false;
+    for (uint32_t ch = nch; ch < 4; ++ch) out[ch] = 0;   // (the channels the format does not have, which `need` may name)
     return true;
   }
   uint8_t sizes[4];
@@ -1800,8 +1834,10 @@ int tex_round_half_up(int64_t num, int64_t den) {   // floor(num/den + 1/2)
 // along x, y, z; w[] is indexed x + 2y + 4z.
 void tex_weights(uint32_t dims, const int f[3], int w[8], int total = 256) {
   auto split = [](int total, int frac, bool round_upper, int* lo, int* hi) {
-    if (round_upper) { *hi = tex_round_half_up(int64_t{total} * frac, 256); *lo = total - *hi; }
-    else { *lo = tex_round_half_up(int64_t{total} * (256 - frac), 256); *hi = total - *lo; }
+    // (floor(n / 256 + 1/2), tex_round_half_up(n, 256): a shift, not its divide)
+    // (In 64 bits as tex_round_half_up does: a coordinate of infinity makes the fraction an arbitrary int, and the product must not wrap.)
+    if (round_upper) { *hi = static_cast<int>((int64_t{total} * frac + 128) >> 8); *lo = total - *hi; }
+    else { *lo = static_cast<int>((int64_t{total} * (256 - frac) + 128) >> 8); *hi = total - *lo; }
   };
   for (int i = 0; i < 8; ++i) w[i] = 0;
   if (dims == 1) {
@@ -1982,16 +2018,26 @@ int64_t floor_index(double v) {
   return static_cast<int64_t>(f);
 }
 
+// floor_index without the libm call, for the usual magnitudes (the same integer: truncate, and step down when that rounded up).
+inline int64_t floor_index_fast(double v) {
+  if (!(std::fabs(v) < 4503599627370496.0)) return floor_index(v);
+  const int64_t t = static_cast<int64_t>(v);
+  return t - (v < static_cast<double>(t) ? 1 : 0);
+}
+
 // The texels a linear filter reads and their weights, which sum to `total`.
 int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[3], bool true_1d, int total,
-                         TexTerm* out) {
+                         TexTerm* out, const int32_t* offset = nullptr) {
+  if (!offset) offset = d.fetch_offset;   // (a fetch that carries its own offsets gives them here, rather than in a copy of d)
   // A 1D texture filters as 2D, height 1, at y = 0 -- all but a layer of a
   // 1D layered texture, which filters as 1D.
   const uint32_t fdims = dims == 1 && !true_1d ? 2 : dims;
   const uint32_t size[3] = {d.width, dims == 1 ? 1u : d.height, d.depth};
   const bool fast = g_fast_path.load(std::memory_order_relaxed);
   int base[3] = {0, 0, 0}, frac[3] = {0, 0, 0};
+  TexAddress mode[3] = {TexAddress::Clamp, TexAddress::Clamp, TexAddress::Clamp};
   for (uint32_t i = 0; i < fdims; ++i) {
+    mode[i] = effective_address(d, i);
     float x = i < dims ? coord[i] : 0.0f;
     if (std::isnan(x)) x = 0.0f;   // a NaN coordinate reads as 0 (measured on an RTX 3060, clamp mode, all filters)
     double xd = static_cast<double>(x);
@@ -1999,8 +2045,8 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
     // The offset moves the coordinate by whole texels before the clamp mode
     // limits it (measured on an RTX 3060: clamp and linear filtering with
     // offsets, where the weights show the difference).
-    double v = xd + d.fetch_offset[i];
-    if (effective_address(d, i) == TexAddress::Clamp) v = std::clamp(v, 0.5, size[i] - 0.5);
+    double v = xd + offset[i];
+    if (mode[i] == TexAddress::Clamp) v = std::clamp(v, 0.5, size[i] - 0.5);
     const double xb = v - 0.5;
     double fl = fast ? floor_exact(xb) : std::floor(xb);
     int f = static_cast<int>(fast ? floor_exact((xb - fl) * 256 + 0.5) : std::floor((xb - fl) * 256 + 0.5));
@@ -2008,30 +2054,50 @@ int tex_footprint_linear(const TextureDesc& d, uint32_t dims, const float coord[
     base[i] = static_cast<int>(fl);
     frac[i] = f;
   }
-  int w[8];
-  if (fast && !(frac[0] | frac[1] | frac[2])) {   // at a texel's centre: the whole weight is the first texel's (what tex_weights gives)
-    w[0] = total;
-    for (int k = 1; k < 8; ++k) w[k] = 0;
-  } else {
-    tex_weights(fdims, frac, w, total);
-  }
   const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
   const uint64_t plane = row * (d.height ? d.height : 1);
+  if (fast && !(frac[0] | frac[1] | frac[2])) {
+    // At a texel's centre the whole weight is the first texel's (what tex_weights gives), and it is the only term.
+    // (Three scalars, not an array: the compiler read two of an array's words back as one 8-byte load, a store-forwarding stall.)
+    uint32_t x = 0, y = 0, z = 0;
+    bool inside = wrap_coord(mode[0], int64_t{base[0]}, size[0], &x);
+    if (fdims > 1) inside &= wrap_coord(mode[1], int64_t{base[1]}, size[1], &y);
+    if (fdims > 2) inside &= wrap_coord(mode[2], int64_t{base[2]}, size[2], &z);
+    TexTerm& t = out[0];
+    t.w = total;
+    t.border = !inside;
+    t.group = 0;
+    t.src = &d;
+    t.x = x, t.y = y, t.z = z;
+    t.addr = inside ? d.base + z * plane + y * row + uint64_t{x} * d.texel_bytes : 0;
+    return 1;
+  }
+  int w[8];
+  tex_weights(fdims, frac, w, total);
+  const int count = fdims == 3 ? 8 : fdims == 2 ? 4 : 2;
+  // An axis's two candidate texels (base and base + 1), found once each rather than once per term that uses them, and the
+  // second only when some term with weight has it.
+  unsigned second = 0;
+  for (int k = 0; k < count; ++k)
+    if (w[k] != 0) second |= static_cast<unsigned>(k);
+  uint32_t idx[3][2] = {{0, 0}, {0, 0}, {0, 0}};
+  bool ok[3][2] = {{true, true}, {true, true}, {true, true}};
+  for (uint32_t i = 0; i < fdims; ++i) {
+    ok[i][0] = wrap_coord(mode[i], int64_t{base[i]}, size[i], &idx[i][0]);
+    if (second & (1u << i)) ok[i][1] = wrap_coord(mode[i], int64_t{base[i]} + 1, size[i], &idx[i][1]);
+  }
   int n = 0;
-  for (int k = 0; k < (fdims == 3 ? 8 : fdims == 2 ? 4 : 2); ++k) {
+  for (int k = 0; k < count; ++k) {
     if (w[k] == 0) continue;
-    uint32_t idx[3] = {0, 0, 0};
-    bool inside = true;
-    const int off[3] = {k & 1, (k >> 1) & 1, (k >> 2) & 1};
-    for (uint32_t i = 0; i < fdims; ++i)
-      if (!wrap_coord(effective_address(d, i), int64_t{base[i]} + off[i], size[i], &idx[i])) inside = false;
+    const int ox = k & 1, oy = (k >> 1) & 1, oz = (k >> 2) & 1;
+    const bool inside = ok[0][ox] && (fdims < 2 || ok[1][oy]) && (fdims < 3 || ok[2][oz]);
     TexTerm& t = out[n++];
     t.w = w[k];
     t.border = !inside;
-    t.group = off[2];
+    t.group = oz;
     t.src = &d;
-    t.x = idx[0], t.y = idx[1], t.z = idx[2];
-    t.addr = inside ? d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes : 0;
+    t.x = idx[0][ox], t.y = idx[1][oy], t.z = idx[2][oz];
+    t.addr = inside ? d.base + idx[2][oz] * plane + idx[1][oy] * row + uint64_t{idx[0][ox]} * d.texel_bytes : 0;
   }
   return n;
 }
@@ -2089,10 +2155,83 @@ bool tex_finish_one_f32(const MemoryManager& mem, const TextureDesc& d, const Te
   if (!texel_channels(mem, at, need, t.addr, pre)) return false;
   for (uint32_t ch = 0; ch < 4; ++ch) {
     if (!d.channel_bits[ch]) { out[ch] = 0; continue; }
-    const uint32_t u = static_cast<uint32_t>(pre[ch]);
+    const uint32_t u = static_cast<uint32_t>(scalar_read(pre[ch]));
     const uint32_t mag = u & 0x7FFFFFFFu;
     out[ch] = mag > 0x7F800000u ? 0x7FFFFFFFu : mag < 0x00800000u ? (u & 0x80000000u) : u;
   }
+  return true;
+}
+
+// The texels of a filtered fetch that carry weight and are not border, read with one lookup of the memory manager
+// (load_texels) instead of one each: out[k] holds the channels of term k, as texel_channels gives them. False, with
+// nothing read, for a format texel_channels would hand to the one-at-a-time road, for terms whose texels are not of one
+// layout, and whenever the memory manager declines the lot; the caller then reads term by term, and meets any error where
+// it would have.
+bool texel_terms(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint64_t (*out)[4]) {
+  uint32_t width, nch;
+  if (!texel_layout(d, &width, &nch)) return false;
+  uint64_t addrs[16];
+  int index[16];
+  int m = 0;
+  for (int k = 0; k < n; ++k) {
+    if (terms[k].w == 0 || terms[k].border) continue;
+    if (terms[k].src && terms[k].src != &d) {   // (a mip level: the same format, or the batch does not apply)
+      uint32_t w2, n2;
+      if (!texel_layout(*terms[k].src, &w2, &n2) || w2 != width || n2 != nch) return false;
+    }
+    addrs[m] = terms[k].addr;
+    index[m++] = k;
+  }
+  if (m == 0) return true;
+  uint64_t v[16 * 4];
+  if (!mem.load_texels(addrs, static_cast<unsigned>(m), width, nch, v)) return false;
+  for (int i = 0; i < m; ++i)
+    for (uint32_t c = 0; c < nch; ++c) out[index[i]][c] = v[i * nch + c];
+  return true;
+}
+
+// The blend of a float texture of 32-bit channels over one 2x2 footprint (every term in group 0: a 1D or 2D fetch of one
+// level, no border term with weight) when every texel is finite: the float branch of tex_finish below, for the case where its
+// loops over groups and terms have one group to find. The same arithmetic in the same order -- the footprint's largest
+// exponent E, each value truncated to 2^(E - 27), the weighted sum floored to 2^(E - 28), one rounding -- so the same bits.
+// False, with nothing written, for any other case (the general code then runs), a non-finite texel included.
+bool tex_finish_f32_one_group(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint32_t out[4]) {
+  if (d.kind != ChannelKind::Float) return false;
+  uint32_t width, nch;
+  if (!texel_layout(d, &width, &nch) || width != 4) return false;
+  for (int k = 0; k < n; ++k)
+    if (terms[k].group != 0 || (terms[k].w != 0 && terms[k].border)) return false;
+  uint64_t batch[16][4];
+  if (!texel_terms(mem, d, terms, n, batch)) return false;
+  uint32_t res[4] = {0, 0, 0, 0};
+  for (uint32_t ch = 0; ch < nch; ++ch) {
+    double fv[16];
+    int emax = INT_MIN;
+    bool finite = true, all_neg_zero = true;
+    for (int k = 0; k < n; ++k) {
+      if (terms[k].w == 0) continue;
+      double t = static_cast<double>(f32(batch[k][ch]));
+      if (std::fabs(t) < std::ldexp(1.0, -126)) t = std::copysign(0.0, t);   // flushed
+      fv[k] = t;
+      if (!std::isfinite(t)) finite = false;
+      else if (t != 0) emax = std::max(emax, ilogb_exact(t));
+      if (!(t == 0 && std::signbit(t))) all_neg_zero = false;
+    }
+    if (!finite) return false;
+    float r = 0.0f;   // (no texel but zeros: the general code's empty sum, +0)
+    if (emax != INT_MIN) {
+      const double q = pow2_exact(emax - 27), q_inv = pow2_exact(-(emax - 27));
+      const double q2 = pow2_exact(emax - 28), q2_inv = pow2_exact(-(emax - 28));
+      double sg = 0;
+      for (int k = 0; k < n; ++k)
+        if (terms[k].w) sg += terms[k].w * (trunc_exact(fv[k] * q_inv) * q);
+      r = tex_round_one(floor_exact(sg * q2_inv) * q2 * 0.00390625, false);
+    }
+    if (r == 0 && all_neg_zero) r = -0.0f;
+    if (std::fabs(r) < std::ldexp(1.0f, -126)) r = std::copysign(0.0f, r);
+    res[ch] = std::isnan(r) ? 0x7FFFFFFFu : static_cast<uint32_t>(f32bits(r));
+  }
+  for (uint32_t ch = 0; ch < 4; ++ch) out[ch] = res[ch];
   return true;
 }
 
@@ -2100,6 +2239,7 @@ bool tex_finish_one_f32(const MemoryManager& mem, const TextureDesc& d, const Te
 void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* terms, int n, uint32_t out[4]) {
   const bool fast = g_fast_path.load(std::memory_order_relaxed);
   if (fast && n == 1 && terms[0].w == 256 && tex_finish_one_f32(mem, d, terms[0], out)) return;
+  if (fast && tex_finish_f32_one_group(mem, d, terms, n, out)) return;
   const bool is_float = d.kind == ChannelKind::Float;
   const bool unorm = d.kind == ChannelKind::Unsigned;
   int64_t isum[4] = {0, 0, 0, 0};
@@ -2107,10 +2247,13 @@ void tex_finish(const MemoryManager& mem, const TextureDesc& d, const TexTerm* t
   uint32_t codes[4][16];   // (the sRGB channels' codes: set for every term with a weight, the only ones read)
   uint32_t need = 0;
   for (uint32_t ch = 0; ch < 4; ++ch) need |= d.channel_bits[ch] ? 1u << ch : 0u;
+  uint64_t batch[16][4];
+  const bool batched = fast && n > 1 && texel_terms(mem, d, terms, n, batch);
   for (int k = 0; k < n; ++k) {
-    uint64_t pre[4];
+    uint64_t one[4];
+    uint64_t* pre = batched ? batch[k] : one;
     const bool have = fast && terms[k].w != 0 && !terms[k].border &&
-                      texel_channels(mem, terms[k].src ? *terms[k].src : d, need, terms[k].addr, pre);
+                      (batched || texel_channels(mem, terms[k].src ? *terms[k].src : d, need, terms[k].addr, one));
     for (uint32_t ch = 0; ch < 4; ++ch) {
       if (!d.channel_bits[ch]) continue;
       if (terms[k].w == 0) { fv[ch][k] = 0; continue; }
@@ -2535,6 +2678,63 @@ void fetch_texel(const MemoryManager& mem, const TextureDesc& d, const TexFetch&
   const bool have = g_fast_path.load(std::memory_order_relaxed) && texel_channels(mem, v, 0xF, addr, pre);
   for (uint32_t ch = 0; ch < 4; ++ch)
     out[ch] = convert_channel(v, ch, have ? pre[ch] : texel_raw(mem, v, addr, idx[0], idx[1], idx[2], ch), f.float_result);
+}
+
+// A fetch of a plain texture -- not layered, not a cube, not a gather, one mip level -- taken to the end in the one place, with
+// fetch_texel's rules for the same case (a linear one through tex_linear's three calls; a point one, or one by integer
+// coordinates, below its "Integer coordinates name a texel" comment, for a format of whole channels of one width) and none of its
+// set-up for the others. False, having read and written nothing, for anything else, or when the memory manager declines the
+// texel; the caller then runs fetch_texel. Only with the fast paths on: the general path is what they are checked against.
+[[gnu::noinline]] bool fetch_plain(const MemoryManager& mem, const TextureDesc& d, const TexFetch& f, uint32_t out[4]) {
+  if (!g_fast_path.load(std::memory_order_relaxed) || f.layered || f.cube || f.gather >= 0 || d.layers != 0 ||
+      d.cubemap || d.mip_levels != 0 || f.dims == 0 || f.dims > 3)
+    return false;
+  if (d.filter == TexFilter::Linear && f.float_coords) {
+    float cf[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < f.dims; ++i) cf[i] = std::bit_cast<float>(f.coord[i]);
+    tex_check_filterable(d);
+    TexTerm terms[8];
+    const int n = tex_footprint_linear(d, f.dims, cf, false, 256, terms, f.offset);
+    tex_finish(mem, d, terms, n, out);
+    return true;
+  }
+  uint32_t width, nch;
+  if (!texel_layout(d, &width, &nch)) return false;
+  const uint32_t dims = f.dims;
+  const uint32_t size[3] = {d.width, d.height, d.depth};
+  uint32_t idx[3] = {0, 0, 0};
+  bool inside = true;
+  for (uint32_t i = 0; i < dims; ++i) {
+    int64_t c;
+    if (f.float_coords) {
+      const float xi = std::bit_cast<float>(f.coord[i]);
+      double xd = std::isnan(xi) ? 0.0 : static_cast<double>(xi);
+      if (d.normalized_coords) xd = texel_coordinate(std::isnan(xi) ? 0.0f : xi, size[i]);
+      c = floor_index_fast(xd) + f.offset[i];
+    } else {
+      c = int64_t{static_cast<int32_t>(f.coord[i])} + f.offset[i];
+      if (c < 0 || c >= static_cast<int64_t>(size[i])) {   // outside the extent reads zero: neither the address mode nor the border colour
+        out[0] = out[1] = out[2] = out[3] = 0;
+        return true;
+      }
+      idx[i] = static_cast<uint32_t>(c);
+      continue;
+    }
+    if (!wrap_coord(effective_address(d, i), c, size[i], &idx[i])) { inside = false; break; }
+  }
+  if (inside && dims == 1 && f.offset[1] != 0 && effective_address(d, 1) == TexAddress::Border) inside = false;
+  if (!inside) {
+    for (uint32_t ch = 0; ch < 4; ++ch) out[ch] = convert_channel(d, ch, tex_border_raw(d, ch), f.float_result);
+    return true;
+  }
+  const uint64_t row = d.pitch_bytes ? d.pitch_bytes : uint64_t{d.width} * d.texel_bytes;
+  const uint64_t plane = row * (d.height ? d.height : 1);
+  const uint64_t addr = d.base + idx[2] * plane + idx[1] * row + uint64_t{idx[0]} * d.texel_bytes;
+  uint64_t v[4] = {0, 0, 0, 0};
+  if (!mem.load_texels(&addr, 1, width, nch, v)) return false;
+  for (uint32_t ch = 0; ch < nch; ++ch) out[ch] = convert_channel(d, ch, v[ch], f.float_result);
+  for (uint32_t ch = nch; ch < 4; ++ch) out[ch] = 0;   // (a channel the format does not have reads 0, convert_channel's answer for it)
+  return true;
 }
 
 // suld/sust address a surface in *bytes* along x and in whole rows along y
@@ -17490,6 +17690,7 @@ const TextureDesc& texture_lookup(const TextureTable* table, uint64_t handle, Te
 void texture_fetch(const MemoryManager& mem, const TextureDesc& d, const TexFetch& f, uint32_t out[4]) {
   t_bc.valid = false;   // the memory a block was decoded from may have changed since the last fetch
   if (!f.grad) {
+    if (fetch_plain(mem, d, f, out)) return;
     fetch_texel(mem, d, f, out);
     return;
   }
