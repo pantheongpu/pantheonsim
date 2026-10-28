@@ -22,6 +22,7 @@
 #include <unordered_map>
 
 #include "gcn_divide.hpp"
+#include "gcn_tier_ds.hpp"
 #include "nan_order.hpp"
 #include "packed_math.hpp"
 #include "vgpu/amd_gcn.hpp"
@@ -110,6 +111,7 @@ void tier_classify(Inst&) {}   // (the lane kernels are x86's: elsewhere the int
 namespace {
 
 using namespace tier;
+using namespace tier_ds;
 
 constexpr uint32_t kSgprs = 106;   // gcn_exec.cpp's kSgprs: s0 through s105
 constexpr uint32_t kVgprs = 256;
@@ -160,6 +162,7 @@ using K64 = void (*)(uint64_t*, const uint64_t*, const uint64_t*, const uint64_t
 using CmpFn = uint64_t (*)(const uint32_t*, const uint32_t*, unsigned);
 using Cmp64Fn = uint64_t (*)(const uint64_t*, const uint64_t*, unsigned);
 using Mad64Fn = uint64_t (*)(uint32_t*, uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, unsigned);
+using CarryFn = uint64_t (*)(uint32_t*, const uint32_t*, const uint32_t*, uint64_t, unsigned);
 using F64RowsFn = uint64_t (*)(uint32_t*, uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint32_t*, const uint64_t*, unsigned);
 
 struct Tables {
@@ -181,6 +184,7 @@ struct Tables {
   CmpFn cmp_class16_neg;
   Mad64Fn mad_u64;
   const F64RowsFn* f64_rows;   // add, multiply, fused multiply-add, each for the 8 sets of uniform operands
+  const CarryFn* carry;   // v_add_co_u32 and its kin, by Op::sub
   bool avx2;   // the handlers built for AVX2 (TIER_DUAL) are the ones to use
 };
 const Tables& tables() {
@@ -188,12 +192,12 @@ const Tables& tables() {
                               base_impl::base_impl_ns::kL64Tab, base_impl::base_impl_ns::kCmpU32, base_impl::base_impl_ns::kCmpI32,
                               base_impl::base_impl_ns::kCmpF32, base_impl::base_impl_ns::kCmpU64, base_impl::base_impl_ns::kCmpI64, base_impl::base_impl_ns::kCmpF64,
                               base_impl::base_impl_ns::kCmpI16, base_impl::base_impl_ns::kCmpU16, base_impl::base_impl_ns::kCmpF16, base_impl::base_impl_ns::cmp_class_f32, base_impl::base_impl_ns::cmp_class_f16<false>,
-                              base_impl::base_impl_ns::cmp_class_f16<true>, base_impl::base_impl_ns::k_mad_u64, base_impl::base_impl_ns::kF64Rows, false};
+                              base_impl::base_impl_ns::cmp_class_f16<true>, base_impl::base_impl_ns::k_mad_u64, base_impl::base_impl_ns::kF64Rows, base_impl::base_impl_ns::kCarry, false};
   static const Tables avx2 = {avx2_impl::avx2_impl_ns::kIntTab, avx2_impl::avx2_impl_ns::kF32Tab, avx2_impl::avx2_impl_ns::kF64Tab,
                               avx2_impl::avx2_impl_ns::kL64Tab, avx2_impl::avx2_impl_ns::kCmpU32, avx2_impl::avx2_impl_ns::kCmpI32,
                               avx2_impl::avx2_impl_ns::kCmpF32, avx2_impl::avx2_impl_ns::kCmpU64, avx2_impl::avx2_impl_ns::kCmpI64, avx2_impl::avx2_impl_ns::kCmpF64,
                               avx2_impl::avx2_impl_ns::kCmpI16, avx2_impl::avx2_impl_ns::kCmpU16, avx2_impl::avx2_impl_ns::kCmpF16, avx2_impl::avx2_impl_ns::cmp_class_f32, avx2_impl::avx2_impl_ns::cmp_class_f16<false>,
-                              avx2_impl::avx2_impl_ns::cmp_class_f16<true>, avx2_impl::avx2_impl_ns::k_mad_u64, avx2_impl::avx2_impl_ns::kF64Rows, true};
+                              avx2_impl::avx2_impl_ns::cmp_class_f16<true>, avx2_impl::avx2_impl_ns::k_mad_u64, avx2_impl::avx2_impl_ns::kF64Rows, avx2_impl::avx2_impl_ns::kCarry, true};
   return simd::enabled() && simd::level() == simd::Level::Avx2 ? avx2 : base;
 }
 
@@ -952,34 +956,28 @@ TIER_DUAL(h_mad_u64)
 
 // v_add_co_u32, v_addc_co_u32, v_sub_co_u32, v_subb_co_u32 and the reversed ones (carry_alu): the carry or borrow of each lane into a
 // scalar mask, written whatever EXEC is. `sub`: bit 0 add, bit 1 takes a carry in (source 2, a mask), bit 2 reversed.
-int h_carry(const Op& o, Regs& R) {
+[[gnu::always_inline]] inline int h_carry_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
-  const bool add = o.sub & 1, takes = o.sub & 2, rev = o.sub & 4;
-  const uint64_t carried_in = takes ? rd(R, o.src[2]) : 0;
+  const uint64_t carried_in = (o.sub & 2) ? rd(R, o.src[2]) : 0;
   uint64_t out = 0;
   if (ex) {
     const unsigned n = lanes_of(ex);
     alignas(32) uint32_t t0[64], t1[64], r[64];
-    const uint32_t* a0 = load32(o.src[0], R, t0, n);
-    const uint32_t* b0 = load32(o.src[1], R, t1, n);
-    for (uint64_t m = ex; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-      uint64_t a = a0[l], b = b0[l];
-      if (rev) std::swap(a, b);
-      const uint64_t c = takes ? (carried_in >> l) & 1 : 0;
-      const uint64_t v = add ? a + b + c : a - b - c;
-      if (add ? (v >> 32) & 1 : a < b + c) out |= uint64_t{1} << l;
-      r[l] = static_cast<uint32_t>(v);
-    }
+    const uint32_t* a = load32(o.src[0], R, t0, n);
+    const uint32_t* b = load32(o.src[1], R, t1, n);
     uint32_t* d = R.vgpr[o.dst.index];
-    for (uint64_t m = ex; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-      d[l] = r[l];
+    const CarryFn k = reinterpret_cast<CarryFn>(o.kern);
+    if (full(ex, n)) {
+      out = k(d, a, b, carried_in, n);
+    } else {
+      out = k(r, a, b, carried_in, n) & ex;
+      merge(d, r, ex, n);
     }
   }
   wr(R, o.dst2, out);
   return 1;
 }
+TIER_DUAL(h_carry)
 
 // v_cndmask_b32: lane l takes source 1 where bit l of the scalar mask is set, else source 0 (modifiers on either).
 [[gnu::always_inline]] inline int h_cndmask_body(const Op& o, Regs& R) {
@@ -1094,6 +1092,10 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAd
         case kDsRead:
           if (w == 1) {
             copy_bytes(R.vgpr[o.dst.index] + first, lds + base, 4u * cnt);
+          } else if (w == 2 || w == 4) {
+            uint32_t* rows[4];
+            for (unsigned k = 0; k < w; ++k) rows[k] = R.vgpr[o.dst.index + k] + first;
+            ds_run_read(rows, lds + base, cnt, w);
           } else {
             alignas(32) uint32_t tmp[256];
             copy_bytes(tmp, lds + base, 4u * w * cnt);
@@ -1106,6 +1108,10 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAd
         case kDsWrite:
           if (w == 1) {
             copy_bytes(lds + base, R.vgpr[o.src[1].index] + first, 4u * cnt);
+          } else if (w == 2 || w == 4) {
+            uint32_t* rows[4];
+            for (unsigned k = 0; k < w; ++k) rows[k] = R.vgpr[o.src[1].index + k] + first;
+            ds_run_write(rows, lds + base, cnt, w);
           } else {
             alignas(32) uint32_t tmp[256];
             for (unsigned k = 0; k < w; ++k) {
@@ -1170,6 +1176,13 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAd
     }
     return 1;
   }
+  if (all_on && (w == 4 || w == 2) && (o.sub == kDsRead || o.sub == kDsWrite)) {   // (every lane on, any addresses: four lanes at a time, stored in lane order)
+    uint32_t* rows[4];
+    for (unsigned k = 0; k < w; ++k) rows[k] = R.vgpr[(o.sub == kDsRead ? o.dst.index : o.src[1].index) + k];
+    if (o.sub == kDsRead) ds_all_read(rows, lds, addr, x0, w, n);
+    else ds_all_write(rows, lds, addr, x0, w, n);
+    return 1;
+  }
   switch (o.sub) {
     case kDsRead:
       if (w == 1) {   // (the common one: a word a lane)
@@ -1180,14 +1193,22 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAd
         }
         return 1;
       }
-      for (uint64_t m = ex; m; m &= m - 1) {
-        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-        const uint8_t* p = lds + static_cast<uint32_t>(addr[l] + x0);
-        for (unsigned k = 0; k < w; ++k) {
-          uint32_t v;
-          std::memcpy(&v, p + 4 * k, 4);
-          R.vgpr[o.dst.index + k][l] = v;
-        }
+      {
+        uint32_t* rows[4];
+        for (unsigned k = 0; k < w && k < 4; ++k) rows[k] = R.vgpr[o.dst.index + k];
+        if (w == 2) ds_lanes_read(rows, lds, addr, x0, ex, 2);
+        else if (w == 3) ds_lanes_read(rows, lds, addr, x0, ex, 3);
+        else if (w == 4) ds_lanes_read(rows, lds, addr, x0, ex, 4);
+        else
+          for (uint64_t m = ex; m; m &= m - 1) {
+            const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+            const uint8_t* p = lds + static_cast<uint32_t>(addr[l] + x0);
+            for (unsigned k = 0; k < w; ++k) {
+              uint32_t v;
+              std::memcpy(&v, p + 4 * k, 4);
+              R.vgpr[o.dst.index + k][l] = v;
+            }
+          }
       }
       return 1;
     case kDsWrite:
@@ -1199,10 +1220,18 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAd
         }
         return 1;
       }
-      for (uint64_t m = ex; m; m &= m - 1) {
-        const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-        uint8_t* p = lds + static_cast<uint32_t>(addr[l] + x0);
-        for (unsigned k = 0; k < w; ++k) std::memcpy(p + 4 * k, &R.vgpr[o.src[1].index + k][l], 4);
+      {
+        uint32_t* rows[4];
+        for (unsigned k = 0; k < w && k < 4; ++k) rows[k] = R.vgpr[o.src[1].index + k];
+        if (w == 2) ds_lanes_write(rows, lds, addr, x0, ex, 2);
+        else if (w == 3) ds_lanes_write(rows, lds, addr, x0, ex, 3);
+        else if (w == 4) ds_lanes_write(rows, lds, addr, x0, ex, 4);
+        else
+          for (uint64_t m = ex; m; m &= m - 1) {
+            const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+            uint8_t* p = lds + static_cast<uint32_t>(addr[l] + x0);
+            for (unsigned k = 0; k < w; ++k) std::memcpy(p + 4 * k, &R.vgpr[o.src[1].index + k][l], 4);
+          }
       }
       return 1;
     case kDsRead2:
@@ -2327,7 +2356,8 @@ void tier_classify(Inst& in) {
       if (takes && !scalar_src(in.src[2], f.src[2])) return fail();
       f.sub = (nm.rfind("v_add", 0) == 0 ? 1u : 0u) | (takes ? 2u : 0u) |
               (nm.find("subbrev") != std::string::npos || nm.find("subrev") != std::string::npos ? 4u : 0u);
-      f.run = h_carry;
+      f.kern = reinterpret_cast<AnyFn>(T.carry[f.sub]);
+      f.run = TIER_RUN(h_carry);
       f.unit = kUnitValu;
       return;
     }

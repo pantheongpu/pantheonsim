@@ -48,9 +48,57 @@ Mask pick_group_plain(const uint64_t* pc, Mask run, uint64_t& lo) {
   lo = static_cast<uint64_t>(low) ^ (uint64_t{1} << 63);
   return group & run;
 }
+
+// The four lanes of a nibble of a lane mask, as a 64-bit-lane select mask.
+struct NibbleMasks {
+  alignas(32) int64_t v[16][4];
+  constexpr NibbleMasks() : v{} {
+    for (unsigned n = 0; n < 16; ++n)
+      for (unsigned j = 0; j < 4; ++j) v[n][j] = ((n >> j) & 1) ? -1 : 0;
+  }
+};
+constexpr NibbleMasks kNibble;
+
+[[gnu::target("avx2")]] void set_pcs_avx2(uint64_t* pc, Mask group, uint64_t v) {
+  const __m256i vv = _mm256_set1_epi64x(static_cast<long long>(v));
+  for (unsigned i = 0; i < 8; ++i)
+  {
+    __m256i* const at = reinterpret_cast<__m256i*>(pc + 4 * i);
+    _mm256_storeu_si256(at, _mm256_blendv_epi8(_mm256_loadu_si256(at), vv, _mm256_load_si256(reinterpret_cast<const __m256i*>(kNibble.v[(group >> (4 * i)) & 15]))));
+  }
+}
+
+[[gnu::target("avx2")]] void select_pcs_avx2(uint64_t* pc, Mask group, Mask take, uint64_t target, uint64_t next) {
+  const __m256i t = _mm256_set1_epi64x(static_cast<long long>(target)), n = _mm256_set1_epi64x(static_cast<long long>(next));
+  for (unsigned i = 0; i < 8; ++i) {
+    const __m256i mt = _mm256_load_si256(reinterpret_cast<const __m256i*>(kNibble.v[(take >> (4 * i)) & 15]));
+    const __m256i mg = _mm256_load_si256(reinterpret_cast<const __m256i*>(kNibble.v[(group >> (4 * i)) & 15]));
+    __m256i* const at = reinterpret_cast<__m256i*>(pc + 4 * i);
+    _mm256_storeu_si256(at, _mm256_blendv_epi8(_mm256_loadu_si256(at), _mm256_blendv_epi8(n, t, mt), mg));
+  }
+}
 #endif
 
 }  // namespace
+
+void set_pcs_partial(uint64_t* pc, Mask group, uint64_t v) {
+#ifdef VGPU_LANES_AVX2
+  static const bool avx2 = simd::level() == simd::Level::Avx2;
+  if (avx2) return set_pcs_avx2(pc, group, v);
+#endif
+  for (Mask m = group; m; m &= m - 1) pc[std::countr_zero(m)] = v;
+}
+
+void select_pcs(uint64_t* pc, Mask group, Mask take, uint64_t target, uint64_t next) {
+#ifdef VGPU_LANES_AVX2
+  static const bool avx2 = simd::level() == simd::Level::Avx2;
+  if (avx2) return select_pcs_avx2(pc, group, take, target, next);
+#endif
+  for (Mask m = group; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    pc[l] = ((take >> l) & 1) ? target : next;
+  }
+}
 
 Mask pick_group_diverged(const uint64_t* pc, Mask run, uint64_t& lo) {
 #ifdef VGPU_LANES_AVX2

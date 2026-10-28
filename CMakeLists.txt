@@ -234,6 +234,7 @@ add_library(vgpu STATIC
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
   amd/src/gcn_tier.cpp
+  amd/src/gcn_tier_ds.cpp
   amd/src/image.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
@@ -292,6 +293,9 @@ target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_ge
 # same code as before, while a test (marked at the end of this file) links the
 # machine code and takes seconds.
 option(VGPU_TEST_FAST_LINK "Link unit tests without LTO (the vgpu archive carries machine code for them)" ON)
+# The wide LDS accesses of the AMD tier (see the header) are compiled outside link-time optimization: inside the tier's unit they moved the
+# inlining and the layout of the unrelated memory handlers.
+set_source_files_properties(amd/src/gcn_tier_ds.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set_target_properties(vgpu PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
   target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
@@ -1338,6 +1342,8 @@ vgpu_unit_test(test_sched)
 vgpu_unit_test(test_sass_atomics)
 vgpu_unit_test(test_sass_lanes)
 target_include_directories(test_sass_lanes PRIVATE src)
+# The address-row questions of the tier's global and shared memory handlers (vgpu/exec/sass_mem_rows.hpp), against the address array they replaced.
+vgpu_unit_test(test_sass_mem_rows)
 # The SASS executor's memory-access counting, against the straightforward version it replaced
 # (vgpu/exec/mem_counters.hpp, which both engines count with).
 vgpu_unit_test(test_sass_access_count)
@@ -2409,6 +2415,15 @@ if(TARGET vgpucudart)
   target_include_directories(test_runtime_capture_gate PRIVATE tests/framework ${CUDA_ABI_INCLUDE})
   add_test(NAME test_runtime_capture_gate COMMAND test_runtime_capture_gate)
   set_tests_properties(test_runtime_capture_gate PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
+# A device-to-device copy through a buffer that is not zero-filled, and the context fault read without the API lock.
+if(TARGET vgpucudart)
+  add_executable(test_runtime_d2d_scratch nvidia/tests/unit/test_runtime_d2d_scratch.cpp)
+  target_link_libraries(test_runtime_d2d_scratch PRIVATE vgpucudart)
+  target_include_directories(test_runtime_d2d_scratch PRIVATE tests/framework include ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_runtime_d2d_scratch COMMAND test_runtime_d2d_scratch)
+  set_tests_properties(test_runtime_d2d_scratch PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
 # Enum parameters that carry values the enum does not declare: answered with an error code, never loaded as the enum.
