@@ -492,7 +492,8 @@ jobs:
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
     # this job's toolchain built in, so the install step runs only on GitHub's.
     runs-on: ${{ fromJSON(vars.SIM_RUNS_ON || '"ubuntu-24.04"') }}
-    timeout-minutes: 20
+    timeout-minutes: 35
+    # The tests take 12-16 minutes on a hosted runner; 20 was cancelling one run in three.
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image
