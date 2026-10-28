@@ -261,6 +261,29 @@ $RELEASE:
 $FIN:
 )";
 
+// A thread-private array in .local, a word at a time: the index is per lane (tid * 7 + k), the same for every lane (k), or reaches past
+// the 256-byte frame / is off a word for some lanes (the error must be the same, and nothing may have been written by the failing access).
+std::string local_words_body(const char* index, const char* addr_fix) {
+  return std::string(R"(    .local .align 4 .b8 buf[256];
+    mov.u64 %rd5, buf;
+    mov.u32 %r10, 0;
+    mov.u32 %r14, 0;
+$LW:
+)") + index + R"(
+    mul.wide.u32 %rd6, %r11, 4;
+    add.u64 %rd7, %rd5, %rd6;
+)" + addr_fix + R"(
+    mad.lo.u32 %r12, %r2, 3, %r10;
+    st.local.u32 [%rd7], %r12;
+    ld.local.u32 %r13, [%rd7];
+    add.u32 %r14, %r14, %r13;
+    add.u32 %r10, %r10, 1;
+    setp.lt.u32 %p1, %r10, 20;
+    @%p1 bra $LW;
+    st.global.u32 [%rd4], %r14;
+)";
+}
+
 }  // namespace
 
 VTEST(collatz_walks_of_different_lengths_match_one_instruction_at_a_time) {
@@ -305,6 +328,30 @@ VTEST(lanes_that_leave_a_loop_one_by_one_and_return_at_different_pcs) {
 VTEST(a_warp_spinning_on_the_store_of_another_warp) {
   same("spin across warps", kSpinBlock, 1, 64, 0);
   same("spin across warps", kSpinBlock, 2, 96, 0);
+}
+
+VTEST(a_warp_of_local_words_matches_the_lane_loop) {
+  const char* per_lane = "    mad.lo.u32 %r11, %r2, 7, %r10;\n    and.b32 %r11, %r11, 63;";
+  const char* uniform = "    and.b32 %r11, %r10, 63;";
+  const char* past_frame = "    mad.lo.u32 %r11, %r2, 3, %r10;\n    and.b32 %r11, %r11, 127;";
+  const char* none = "";
+  const char* misaligned = "    setp.eq.u32 %p2, %r1, 17;\n    @%p2 add.u64 %rd7, %rd7, 2;";
+  for (uint32_t threads : {32u, 64u, 20u, 8u}) {
+    same("local per lane", local_words_body(per_lane, none), 1, threads, 0);
+    same("local uniform", local_words_body(uniform, none), 1, threads, 0);
+    same("local past the frame", local_words_body(past_frame, none), 1, threads, 0);
+    same("local misaligned", local_words_body(per_lane, misaligned), 1, threads, 0);
+  }
+  // The last word of the frame, the word just past it (every lane), and every lane two bytes off a word.
+  const char* last_word = "    mov.u32 %r11, 63;";
+  const char* first_past = "    mov.u32 %r11, 64;";
+  const char* all_misaligned = "    add.u64 %rd7, %rd7, 2;";
+  for (uint32_t threads : {32u, 8u}) {
+    same("local last word", local_words_body(last_word, none), 1, threads, 0);
+    same("local first word past the frame", local_words_body(first_past, none), 1, threads, 0);
+    same("local every lane misaligned", local_words_body(per_lane, all_misaligned), 1, threads, 0);
+  }
+  same("local per lane, blocks", local_words_body(per_lane, none), 3, 96, 0);
 }
 
 VTEST_MAIN
