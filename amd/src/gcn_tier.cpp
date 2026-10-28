@@ -410,7 +410,7 @@ inline T nan_rule(uint8_t rule, T x, T y, T z) {
   }
 }
 // The lanes of a binary32 result that are NaNs (among EXEC's), done again by the interpreter's rule from the operands the kernel had.
-inline void fix_nan32(uint8_t rule, uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex) {
+[[gnu::noinline]] void fix_nan32(uint8_t rule, uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex) {
   for (uint64_t m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
     if ((r[l] & 0x7FFFFFFFu) <= 0x7F800000u) continue;
@@ -420,7 +420,7 @@ inline void fix_nan32(uint8_t rule, uint32_t* r, const uint32_t* a, const uint32
     std::memcpy(&r[l], &v, 4);
   }
 }
-inline void fix_nan64(uint8_t rule, uint64_t* r, const uint64_t* a, const uint64_t* b, const uint64_t* c, uint64_t ex) {
+[[gnu::noinline]] void fix_nan64(uint8_t rule, uint64_t* r, const uint64_t* a, const uint64_t* b, const uint64_t* c, uint64_t ex) {
   for (uint64_t m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
     if ((r[l] & 0x7FFFFFFFFFFFFFFFull) <= 0x7FF0000000000000ull) continue;
@@ -431,7 +431,7 @@ inline void fix_nan64(uint8_t rule, uint64_t* r, const uint64_t* a, const uint64
   }
 }
 // A float result as write_float / write_double leave it: the output multiplier, then the clamp.
-inline void post32(uint32_t* r, uint64_t ex, unsigned omod, bool clamp) {
+[[gnu::noinline]] void post32(uint32_t* r, uint64_t ex, unsigned omod, bool clamp) {
   for (uint64_t m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
     float v;
@@ -441,7 +441,7 @@ inline void post32(uint32_t* r, uint64_t ex, unsigned omod, bool clamp) {
     std::memcpy(&r[l], &v, 4);
   }
 }
-inline void post64(uint64_t* r, uint64_t ex, unsigned omod, bool clamp) {
+[[gnu::noinline]] void post64(uint64_t* r, uint64_t ex, unsigned omod, bool clamp) {
   for (uint64_t m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
     double v;
