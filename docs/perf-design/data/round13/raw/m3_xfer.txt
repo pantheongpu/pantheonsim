@@ -1,0 +1,15 @@
+empty kernel launch + sync: 7.0 us
+empty kernel launch (async submit only): 2.4 us
+4-byte HtoD: 5.9 us
+4-byte DtoH: 7.9 us
+64 KiB pageable HtoD (one chunk): 16.2 us
+64 KiB pageable DtoH (one chunk): 21.6 us
+   MiB | pgbl H2D pgbl D2H |  pin H2D  pin D2H |  chunk H2D  chunk D2H | gather+pin pin+scatter | register+H2D
+     1 |   8.0 GB/s   5.6 |  12.3  12.2 |   4.89   3.84 GB/s |   8.39   7.31 |   0.31 GB/s (3.4 ms)
+     4 |  11.4 GB/s   8.4 |  13.1  12.9 |   4.73   3.76 GB/s |   8.66   7.54 |   0.32 GB/s (13.2 ms)
+    16 |  12.5 GB/s   9.6 |  13.4  13.1 |   4.52   4.01 GB/s |   5.82   5.70 |   0.31 GB/s (54.2 ms)
+    64 |  12.9 GB/s  10.0 |  13.4  13.2 |   4.42   4.01 GB/s |   5.79   5.77 |   0.31 GB/s (217.5 ms)
+   256 |  13.1 GB/s  10.1 |  13.5  13.2 |   4.43   4.00 GB/s |   5.79   5.76 |   0.30 GB/s (886.8 ms)
+  1024 |  13.1 GB/s  10.1 |  13.5  13.2 |   4.46   4.01 GB/s |   5.79   5.76 |   0.30 GB/s (3565.8 ms)
+per 64 KiB pageable chunk HtoD: 14.8 us (4.44 GB/s)
+per chunk cuMemHostRegister+Unregister: 200.1 us

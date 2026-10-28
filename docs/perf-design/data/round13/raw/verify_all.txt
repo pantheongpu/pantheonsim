@@ -1,0 +1,83 @@
+poly/2DCONV | in-set identical 1 different 0 | outside-set identical 0 different 0
+poly/2MM | in-set identical 1 different 0 | outside-set identical 0 different 0
+poly/3DCONV | in-set identical 254 different 0 | outside-set identical 0 different 0
+poly/3MM | in-set identical 3 different 0 | outside-set identical 0 different 0
+poly/ADI | in-set identical 0 different 0 | outside-set identical 2049 different 0
+poly/ATAX | in-set identical 2 different 0 | outside-set identical 0 different 0
+poly/BICG | in-set identical 2 different 0 | outside-set identical 0 different 0
+poly/CORR | in-set identical 1 different 0 | outside-set identical 3 different 0
+poly/COVAR | in-set identical 2 different 0 | outside-set identical 1 different 0
+poly/FDTD-2D | in-set identical 346 different 0 | outside-set identical 0 different 0
+poly/GEMM | in-set identical 1 different 0 | outside-set identical 0 different 0
+poly/GEMVER | in-set identical 3 different 0 | outside-set identical 0 different 0
+poly/GESUMMV | in-set identical 1 different 0 | outside-set identical 0 different 0
+poly/GRAMSCHM | in-set identical 266 different 0 | outside-set identical 534 different 0
+poly/JACOBI1D | in-set identical 20000 different 0 | outside-set identical 0 different 0
+poly/JACOBI2D | in-set identical 40 different 0 | outside-set identical 0 different 0
+poly/LU | in-set identical 452 different 0 | outside-set identical 453 different 0
+poly/MVT | in-set identical 2 different 0 | outside-set identical 0 different 0
+poly/SYR2K | in-set identical 1 different 0 | outside-set identical 0 different 0
+poly/SYRK | in-set identical 1 different 0 | outside-set identical 0 different 0
+rod/backprop | in-set identical 1 different 0 | outside-set identical 1 different 0
+rod/gaussian | in-set identical 63 different 0 | outside-set identical 63 different 0
+rod/lud | in-set identical 15 different 0 | outside-set identical 31 different 0
+rod/needle | in-set identical 31 different 0 | outside-set identical 0 different 0
+rod/pathfinder | in-set identical 3 different 0 | outside-set identical 0 different 0
+rod/srad_v2 | in-set identical 0 different 0 | outside-set identical 0 different 0
+rod/pf | in-set identical 0 different 0 | outside-set identical 0 different 0
+rod/sc | in-set identical 1432 different 0 | outside-set identical 0 different 0
+rod/hotspot | in-set identical 0 different 0 | outside-set identical 10 different 0
+rod/bfs | in-set identical 26 different 0 | outside-set identical 0 different 0
+rod/lavaMD | in-set identical 0 different 0 | outside-set identical 1 different 0
+hec/adam-cuda | in-set identical 0 different 0 | outside-set identical 1 different 0
+hec/aidw-cuda | in-set identical 0 different 0 | outside-set identical 0 different 0
+hec/aligned-types-cuda | in-set identical 68 different 0 | outside-set identical 0 different 0
+hec/aobench-cuda | in-set identical 0 different 0 | outside-set identical 0 different 1
+      1     host_gpu: verify _Z13render_kernelPhPK7_Sphere6_Planeiii (outside the exact set): DIFFERENT, 64 KiB chunks: 2
+hec/aop-cuda | in-set identical 0 different 0 | outside-set identical 103 different 198
+      1     host_gpu: verify _Z18prepare_svd_kernelILi256E9PayoffPutEviiT0_PKdPiPd (outside the exact set): DIFFERENT, 64 KiB chunks: 1
+     97     host_gpu: verify _Z25compute_final_beta_kernelILi128EEvPKiPd (outside the exact set): DIFFERENT, 64 KiB chunks: 1
+     99     host_gpu: verify _Z27compute_partial_beta_kernelILi128E9PayoffPutEviT0_PKdS3_S3_PKiPd (outside the exact set): DIFFERENT, 64 KiB chunks: 1
+hec/asmooth-cuda | in-set identical 0 different 0 | outside-set identical 3 different 0
+hec/asyncAllocation-cuda | in-set identical 0 different 0 | outside-set identical 0 different 0
+hec/atan2-cuda | in-set identical 0 different 0 | outside-set identical 3 different 0
+hec/atomicAggregate-cuda | in-set identical 0 different 0 | outside-set identical 6 different 0
+/tmp/verifyall.sh: line 6: 29776 Killed                  timeout $T "$@" > /dev/null 2> $d/err.txt
+hec/atomicCost-cuda | in-set identical 0 different 0 | outside-set identical 0 different 0
+hec/atomicIntrinsics-cuda | in-set identical 0 different 0 | outside-set identical 4 different 0
+hec/atomicPerf-cuda | in-set identical 9 different 0 | outside-set identical 9 different 0
+hec/atomicReduction-cuda | in-set identical 0 different 0 | outside-set identical 110 different 0
+hec/attention-cuda | in-set identical 0 different 0 | outside-set identical 0 different 0
+hec/axpby-cuda | in-set identical 35 different 0 | outside-set identical 0 different 0
+hec/babelstream-cuda | in-set identical 64 different 0 | outside-set identical 0 different 0
+hec/background-subtract-cuda | in-set identical 0 different 0 | outside-set identical 0 different 0
+hec/backprop-cuda | in-set identical 2 different 0 | outside-set identical 0 different 0
+hec/base64e-cuda | in-set identical 93 different 0 | outside-set identical 0 different 0
+hec/bgmv-cuda | in-set identical 0 different 0 | outside-set identical 0 different 0
+hec/bh-cuda | in-set identical 1 different 0 | outside-set identical 4 different 1
+      1     host_gpu: verify _Z18TreeBuildingKerneliiPViPK6float4PKfPi (outside the exact set): DIFFERENT, 64 KiB chunks: 2
+hec/bilateral-cuda | in-set identical 0 different 0 | outside-set identical 0 different 3
+      1     host_gpu: verify _Z15bilateralFilterILi3EEvPKfPfiifff (outside the exact set): DIFFERENT, 64 KiB chunks: 2
+      1     host_gpu: verify _Z15bilateralFilterILi6EEvPKfPfiifff (outside the exact set): DIFFERENT, 64 KiB chunks: 2
+      1     host_gpu: verify _Z15bilateralFilterILi9EEvPKfPfiifff (outside the exact set): DIFFERENT, 64 KiB chunks: 2
+hec/binomial-cuda | in-set identical 0 different 0 | outside-set identical 0 different 20
+     20     host_gpu: verify _Z21binomialOptionsKernelPK13__TOptionDataPf (outside the exact set): DIFFERENT, 64 KiB chunks: 1
+hec/bitonic-sort-cuda | in-set identical 0 different 0 | outside-set identical 136 different 0
+hec/black-scholes-cuda | in-set identical 0 different 0 | outside-set identical 0 different 1
+      1     host_gpu: verify _Z15getOutValOptionPK17optionInputStructPfi (outside the exact set): DIFFERENT, 64 KiB chunks: 3052
+hec/blockAccess-cuda | in-set identical 4 different 0 | outside-set identical 0 different 0
+hec/perplexity-cuda | in-set identical 0 different 0 | outside-set identical 0 different 1
+      1     host_gpu: verify _Z13sigmas_kernelIifEvPKT0_PS0_ffifT_i (outside the exact set): DIFFERENT, 64 KiB chunks: 13
+hec/radixsort2-cuda | in-set identical 0 different 0 | outside-set identical 0 different 0
+hec/s3d-cuda | in-set identical 22 different 0 | outside-set identical 27 different 5
+      1     host_gpu: verify _Z11ratt_kernelIfEvPKT_PS0_S0_ (outside the exact set): DIFFERENT, 64 KiB chunks: 56
+      1     host_gpu: verify _Z11ratx_kernelIfEvPKT_S2_PS0_S3_S2_S0_ (outside the exact set): DIFFERENT, 64 KiB chunks: 14
+      1     host_gpu: verify _Z12ratxb_kernelIfEvPKT_S2_PS0_S3_S2_S0_ (outside the exact set): DIFFERENT, 64 KiB chunks: 14
+hec/shmembench-cuda | in-set identical 0 different 0 | outside-set identical 1 different 0
+hec/silu-cuda | in-set identical 0 different 0 | outside-set identical 0 different 50
+     10     host_gpu: verify _Z19silu_forward_kernelPKfPfm (outside the exact set): DIFFERENT, 64 KiB chunks: 16
+     10     host_gpu: verify _Z20silu_backward_kernelPKfS0_Pfm (outside the exact set): DIFFERENT, 64 KiB chunks: 16
+     10     host_gpu: verify _Z20silu_forward_kernel2PKfPfm (outside the exact set): DIFFERENT, 64 KiB chunks: 16
+hec/sortKV-cuda | in-set identical 0 different 0 | outside-set identical 0 different 0
+hec/zerocopy-cuda | in-set identical 0 different 0 | outside-set identical 0 different 0
+FINISHED

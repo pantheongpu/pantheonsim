@@ -1,0 +1,38 @@
+launches captured: 265  agree: 236
+sum of simulator time over these launches: 198.6 s
+cold   chunk-at-a-time : offload wins (margin 2x) on 205 of 265 launches, saves 192.4 s of 198.6 s (96.9%); offloading ALL would lose 0.3 s on the others
+cold   pinned bulk     : offload wins (margin 2x) on 223 of 265 launches, saves 194.2 s of 198.6 s (97.8%); offloading ALL would lose 0.1 s on the others
+dirty  chunk-at-a-time : offload wins (margin 2x) on 255 of 265 launches, saves 194.1 s of 198.6 s (97.7%); offloading ALL would lose 0.0 s on the others
+dirty  pinned bulk     : offload wins (margin 2x) on 257 of 265 launches, saves 194.8 s of 198.6 s (98.1%); offloading ALL would lose 0.0 s on the others
+chain  chunk-at-a-time : offload wins (margin 2x) on 261 of 265 launches, saves 195.1 s of 198.6 s (98.2%); offloading ALL would lose 0.0 s on the others
+
+by simulator time of the launch (cold scenario, chunk-at-a-time, margin 2x):
+  sim       0-1       ms:  71 launches, offload wins cold  34, dirty  62, chain  67
+  sim       1-10      ms:  62 launches, offload wins cold  43, dirty  61, chain  62
+  sim      10-100     ms:  63 launches, offload wins cold  59, dirty  63, chain  63
+  sim     100-1000    ms:  58 launches, offload wins cold  58, dirty  58, chain  58
+  sim    1000-1e+09   ms:  11 launches, offload wins cold  11, dirty  11, chain  11
+
+by grid size (threads total) -- median sim ms and median card ms (chain), launches:
+          0-1024        threads: n= 25 median sim     0.343 ms, median card (launch+sync+kernel)    0.027 ms, wins chain  21
+       1024-16384       threads: n=108 median sim     1.113 ms, median card (launch+sync+kernel)    0.027 ms, wins chain 108
+      16384-262144      threads: n= 53 median sim    13.622 ms, median card (launch+sync+kernel)    0.030 ms, wins chain  53
+     262144-1099511627776 threads: n= 79 median sim   106.208 ms, median card (launch+sync+kernel)    0.159 ms, wins chain  79
+
+break-even simulator time by bytes moved (card kernel ~0.1 ms, margin 2x):
+  move   0.062 MiB each way, chunk : card path 0.14 ms -> offload only if the simulator needs > 0.3 ms
+  move   0.062 MiB each way, pinned: card path 0.12 ms -> offload only if the simulator needs > 0.2 ms
+  move   0.500 MiB each way, chunk : card path 0.36 ms -> offload only if the simulator needs > 0.7 ms
+  move   0.500 MiB each way, pinned: card path 0.19 ms -> offload only if the simulator needs > 0.4 ms
+  move   1.000 MiB each way, chunk : card path 0.61 ms -> offload only if the simulator needs > 1.2 ms
+  move   1.000 MiB each way, pinned: card path 0.26 ms -> offload only if the simulator needs > 0.5 ms
+  move   4.000 MiB each way, chunk : card path 2.11 ms -> offload only if the simulator needs > 4.2 ms
+  move   4.000 MiB each way, pinned: card path 0.74 ms -> offload only if the simulator needs > 1.5 ms
+  move  16.000 MiB each way, chunk : card path 8.11 ms -> offload only if the simulator needs > 16.2 ms
+  move  16.000 MiB each way, pinned: card path 2.63 ms -> offload only if the simulator needs > 5.3 ms
+  move  64.000 MiB each way, chunk : card path 32.14 ms -> offload only if the simulator needs > 64.3 ms
+  move  64.000 MiB each way, pinned: card path 10.20 ms -> offload only if the simulator needs > 20.4 ms
+  move 256.000 MiB each way, chunk : card path 128.22 ms -> offload only if the simulator needs > 256.4 ms
+  move 256.000 MiB each way, pinned: card path 40.48 ms -> offload only if the simulator needs > 81.0 ms
+  move 1024.000 MiB each way, chunk : card path 512.57 ms -> offload only if the simulator needs > 1025.1 ms
+  move 1024.000 MiB each way, pinned: card path 161.58 ms -> offload only if the simulator needs > 323.2 ms

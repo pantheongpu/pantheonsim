@@ -1,0 +1,19 @@
+GEMM | off s on s | gpu-phase off 0.904770 on 0.153034 | output same | 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+SYRK | off s on s | gpu-phase off 9.262727 on 0.163672 | output same | 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+SYR2K | off s on s | gpu-phase off 17.938811 on 0.179860 | output same | 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+3MM | off s on s | gpu-phase off 2.581165 on 0.167114 | output same | 3 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+MVT | off s on s | gpu-phase off 2.005741 on 2.156154 | output same | 0 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 2 too small, 0 unsupported launch shapes, 0 failed on the card)
+ATAX | off s on s | gpu-phase off 2.005577 on 2.152716 | output same | 0 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 2 too small, 0 unsupported launch shapes, 0 failed on the card)
+BICG | off s on s | gpu-phase off 0.258472 on 0.405042 | output same | 0 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 2 too small, 0 unsupported launch shapes, 0 failed on the card)
+GESUMMV | off s on s | gpu-phase off 0.357186 on 0.485194 | output same | 0 launches ran on the card, 1 in the simulator (0 kernels not in the exact set, 1 too small, 0 unsupported launch shapes, 0 failed on the card)
+GEMVER | off s on s | gpu-phase off 0.780817 on 0.489609 | output same | 1 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 2 too small, 0 unsupported launch shapes, 0 failed on the card)
+2DCONV | off s on s | gpu-phase off 0.579503 on 0.273549 | output same | 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+3DCONV | off s on s | gpu-phase off 0.683789 on 25.762004 | output same | 253 launches ran on the card, 1 in the simulator (0 kernels not in the exact set, 1 too small, 0 unsupported launch shapes, 0 failed on the card)
+FDTD-2D | off s on s | gpu-phase off 156.401559 on 63.496450 | output same | 1500 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+CORR | off s on s | gpu-phase off 36.178467 on 35.881255 | output same | 0 launches ran on the card, 4 in the simulator (3 kernels not in the exact set, 1 too small, 0 unsupported launch shapes, 0 failed on the card)
+COVAR | off s on s | gpu-phase off 35.905765 on 36.350205 | output same | 0 launches ran on the card, 3 in the simulator (1 kernels not in the exact set, 2 too small, 0 unsupported launch shapes, 0 failed on the card)
+LU | off s on s | gpu-phase off 112.759386 on  | output DIFF | 
+GRAMSCHM | off s on s | gpu-phase off  on  | output same | 
+JACOBI2D | off s on s | gpu-phase off  on  | output same | 
+ADI | off s on s | gpu-phase off  on  | output same | 
+FINISHED
