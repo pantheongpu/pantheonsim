@@ -824,6 +824,18 @@
    "dispatches": 1,
    "wave_instructions": 141568
   },
+  "rx6800/p_pk16": {
+   "SQ_INSTS_FLAT": 256,
+   "SQ_INSTS_LDS": 0,
+   "SQ_INSTS_SALU": 103424,
+   "SQ_INSTS_SMEM": 768,
+   "SQ_INSTS_VALU": 541440,
+   "SQ_WAVE32_INSTS": 674560,
+   "SQ_WAVE64_INSTS": 0,
+   "SQ_WAVES": 256,
+   "dispatches": 1,
+   "wave_instructions": 674560
+  },
   "rx6800/p_pkf16": {
    "SQ_INSTS_FLAT": 256,
    "SQ_INSTS_LDS": 0,
