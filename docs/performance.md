@@ -4969,3 +4969,20 @@ bytes with `.nops` moved it by 2%, never back to the base). The function's eight
 rounding), a third of the function, between the hot vector lines. That path is now `mma_f_fix`, out of line and cold. Op-cache misses 15.5 M, cycles on `wmma` 478 M against 490 M (base) and 515 M (before).
 B/A vs the base (11 runs, cpu 0, counters identical): `wmma` sass 1.065x, ptx 1.044x, `mma_ptx` sass 1.036x, ptx 1.026x; `divergent` 1.12x, `warp` 1.15x, `local` 1.14x, `mem` 1.10x, `shared` 1.03x;
 the other canaries 0.998x to 1.02x. Unit tests: `test_tc_ampere`, `test_tc_ampere_fast`, `test_fastpath` pass.
+
+## Round sp5: the LDS wide accesses (branch `sp5-amdprof`, base d28fe2ba)
+
+**Measured first** (`ldsx`, mi300x, one host thread): `h_ds` was 48% of the process; perf annotate put the samples in two scalar loops, the transposition of a `ds_write_b128` run into the lane-major LDS layout (`tmp[w*l+k] = in[l]`, one word at a time) and the per-lane `for k < w` loop of the general `ds_read_b96/b128`, which re-read the operand's register number from memory on every word. IPC was 4.2 (instruction-bound, 7.4 G instructions, 128 M L1 misses that this change does not touch).
+
+### What changed
+`gcn_tier.cpp`: `lds_to_rows` / `rows_to_lds` move four lanes at a time with a 4x4 transpose (two words a lane: unpack and shuffle) for 2 and 4 words, for the consecutive-lane runs and, with every lane on, for any addresses (the lanes stored in lane order, so overlapping words end as they do one at a time); a partly-off wave and the 3-word forms use `ds_read_lanes<W>` / `ds_write_lanes<W>`, cold noinline functions with the width known and the rows in registers.
+
+### Results (`perf stat` user cycles, 11 alternating runs of A = d28fe2ba and B; the box was loaded (load 27 to 35), so the bench harness's p values were not usable; counters identical)
+| workload | cycles A/B | instructions A to B | p |
+| --- | ---: | ---: | ---: |
+| `ldsx` mi300x | **1.22** | 7.41 G to 5.77 G | < 0.001 |
+| `ldsx` rx6800 | **1.14** | 9.97 G to 8.34 G | < 0.001 |
+| `lds`, `wave`, `smem` (mi300x), `wave` (rx6800) | 1.015, 1.000, 1.000, 0.998 | equal | > 0.4 |
+
+### Tests and mutations
+`test_amd_gcn_tier_same_bits` (and its `simd_base` twin; run with `VGPU_TIER_ONLY=ds_`): fails under a swapped pair of stores in `lds_to_rows<4>`, a swapped pair in `rows_to_lds<2>`, a reversed word order in `ds_write_lanes` (`ds_write_b96`), and a skipped last group of the all-lanes loop.
