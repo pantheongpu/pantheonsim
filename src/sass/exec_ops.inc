@@ -5080,6 +5080,61 @@ void Runner::exec_mma(Block&, Warp& w, const Instr& ins, Mask ex) {
 
 // ---- control -------------------------------------------------------------------
 
+// Every lane waiting at a WARPSYNC is released once every lane its mask names has arrived at one or exited (WARPSYNC in exec_control, and
+// the tier's own WARPSYNC, which ends a run: tier_ops.inc).
+void Runner::release_warpsync(Warp& w) {
+  // Every lane waiting at a WARPSYNC is released once every lane its mask
+  // names has arrived at one or exited.
+  Mask waiting_ws = 0;
+  for (Mask m = w.waiting; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    if (w.wait_kind[l] == Wait::WarpSync) waiting_ws |= Mask{1} << l;
+  }
+  if (!waiting_ws) return;
+  Mask release = 0;
+  each_lane(waiting_ws, [&](unsigned l) {
+    const Mask need = w.wait_arg[l] & w.alive & ~w.exited;
+    if ((need & ~waiting_ws) == 0 || ((w.ws_held >> l) & 1)) release |= Mask{1} << l;
+  });
+  // Lanes that named different masks do not come out of it together: ptxas's
+  // code for a *.sync instruction whose lanes name different masks runs the
+  // instruction after each distinct mask's WARPSYNC, over the lanes that
+  // named it (an RTX 3060: __ballot_sync(1u << lane, p) is each lane's own
+  // bit of p; Runner::step_warp releases the next set when this one has
+  // run as far as it can).
+  if (release) {
+    const uint32_t first_arg = w.wait_arg[std::countr_zero(release)];
+    Mask now = 0;
+    each_lane(release, [&](unsigned l) {
+      if (w.wait_arg[l] == first_arg) now |= Mask{1} << l;
+    });
+    w.ws_held = release & ~now;
+    release = now;
+  }
+  // A .COLLECTIVE warpsync runs what follows it (up to ENDCOLLECTIVE) once
+  // for all its lanes. Lanes that reach it from different places in the
+  // code would each run their own copy here, so that is refused rather
+  // than answered per path.
+  if (release) {
+    const uint64_t at = w.pc[std::countr_zero(release)];
+    bool collective = false, apart = false;
+    bool have = false;
+    uint64_t seen = 0;   // (the instruction at an address is looked up once, not once for each lane that stands there)
+    each_lane(release, [&](unsigned l) {
+      if (!have || w.pc[l] != seen) {
+        have = true;
+        const Instr& at_ins = fetch(w.pc[l]);
+        collective = collective || (at_ins.op == Op::WARPSYNC && at_ins.f[1]);
+        seen = w.pc[l];
+      }
+      apart = apart || w.pc[l] != at;
+    });
+    if (collective && apart)
+      throw Fault("WARPSYNC.COLLECTIVE reached from different code paths of one warp is not implemented");
+  }
+  exec::sasslanes::wake(w, release);
+}
+
 bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group) {
   const auto base_of = [&](unsigned l) { return w.pc[l] - ins.pc; };   // the section's code address
   // A condition predicate beside the guard (sm_90's BRA Pn and EXIT Pn,
@@ -5111,53 +5166,6 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       });
       w.b[x] &= ~arrived;   // they have converged: the barrier is free for its next BSSY
     }
-  };
-  const auto release_warpsync = [&] {
-    // Every lane waiting at a WARPSYNC is released once every lane its mask
-    // names has arrived at one or exited.
-    Mask waiting_ws = 0;
-    for (unsigned l = 0; l < 32; ++l)
-      if (((w.waiting >> l) & 1) && w.wait_kind[l] == Wait::WarpSync) waiting_ws |= Mask{1} << l;
-    Mask release = 0;
-    each_lane(waiting_ws, [&](unsigned l) {
-      const Mask need = w.wait_arg[l] & w.alive & ~w.exited;
-      if ((need & ~waiting_ws) == 0 || ((w.ws_held >> l) & 1)) release |= Mask{1} << l;
-    });
-    // Lanes that named different masks do not come out of it together: ptxas's
-    // code for a *.sync instruction whose lanes name different masks runs the
-    // instruction after each distinct mask's WARPSYNC, over the lanes that
-    // named it (an RTX 3060: __ballot_sync(1u << lane, p) is each lane's own
-    // bit of p; Runner::step_warp releases the next set when this one has
-    // run as far as it can).
-    if (release) {
-      const uint32_t first_arg = w.wait_arg[std::countr_zero(release)];
-      Mask now = 0;
-      each_lane(release, [&](unsigned l) {
-        if (w.wait_arg[l] == first_arg) now |= Mask{1} << l;
-      });
-      w.ws_held = release & ~now;
-      release = now;
-    }
-    // A .COLLECTIVE warpsync runs what follows it (up to ENDCOLLECTIVE) once
-    // for all its lanes. Lanes that reach it from different places in the
-    // code would each run their own copy here, so that is refused rather
-    // than answered per path.
-    if (release) {
-      const uint64_t at = w.pc[std::countr_zero(release)];
-      bool collective = false, apart = false;
-      each_lane(release, [&](unsigned l) {
-        const Instr& at_ins = fetch(w.pc[l]);
-        collective = collective || (at_ins.op == Op::WARPSYNC && at_ins.f[1]);
-        apart = apart || w.pc[l] != at;
-      });
-      if (collective && apart)
-        throw Fault("WARPSYNC.COLLECTIVE reached from different code paths of one warp is not implemented");
-    }
-    each_lane(release, [&](unsigned l) {
-      w.waiting &= ~(Mask{1} << l);
-      w.wait_kind[l] = Wait::None;
-      w.pc[l] += 16;
-    });
   };
   const auto release_bar = [&](unsigned id) {
     Block::Barrier& b = blk.bars[id];
@@ -5369,7 +5377,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
       });
       // Lanes that exit no longer hold anything up.
       for (unsigned x = 0; x < 16; ++x) release_bsync(x);
-      release_warpsync();
+      release_warpsync(w);
       for (unsigned id = 0; id < 16; ++id)
         if (blk.bars[id].arrived) release_bar(id);
       cluster_barrier_check(blk);
@@ -5444,7 +5452,7 @@ bool Runner::exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask g
           w.pc[l] += 16;
         }
       });
-      release_warpsync();
+      release_warpsync(w);
       return true;
     }
     case Op::BAR: {

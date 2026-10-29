@@ -624,6 +624,7 @@ class Runner {
   void exec_float(Block& blk, Warp& w, const Instr& ins, Mask ex);
   void exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex);
   void exec_warp(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);
+  void release_warpsync(Warp& w);   // exec_ops.inc
   bool exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);   // true: it set the pcs
   void exec_mma(Block& blk, Warp& w, const Instr& ins, Mask ex);
   void exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // warpgroup MMA
