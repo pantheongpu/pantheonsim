@@ -106,14 +106,22 @@ def run_one(build, cwd, argv, copy_cwd, cpu, threads, timeout):
     if scratch:
         for f in sorted(x for x in os.listdir(scratch) if x != "filelist"):
             fp = os.path.join(scratch, f)
-            if os.path.isfile(fp):
+            # (backprop's output.dat is left out: bpnn_save writes 4x too many floats, the tail is uninitialised)
+            if os.path.isfile(fp) and f != "output.dat":
                 extra += f.encode() + open(fp, "rb").read()
         shutil.rmtree(scratch, ignore_errors=True)
     return wall, p.returncode, to, text, extra
 
 
 def normalise(text, extra):
-    keep = [l for l in text.splitlines() if not NOISE.search(l)]
+    keep = []
+    prev_noise = False
+    for l in text.splitlines():
+        n = bool(NOISE.search(l)) or bool(re.search(r"\bs,\s.*%", l))
+        # PolyBench prints a time label and the number on the next line
+        if not n and not (prev_noise and re.fullmatch(r"\s*[0-9.eE+-]+\s*(s|ms|sec)?\s*", l)):
+            keep.append(l)
+        prev_noise = n
     h = hashlib.sha256(("\n".join(keep)).encode() + extra).hexdigest()[:12]
     checks = sorted(set(m.group(0).strip() for m in CHECK.finditer(text)))
     return h, checks
@@ -128,7 +136,7 @@ def main():
     ap.add_argument("--before", required=True)
     ap.add_argument("--after", required=True)
     ap.add_argument("--corp", required=True)
-    ap.add_argument("--cpu", type=int, default=0)
+    ap.add_argument("--cpu", default="0")
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--threads", default="1", help="VGPU_THREADS value, or 'default' to leave it unset")
     ap.add_argument("--corpora", default="polybench,rodinia,hecbench,samples")
@@ -176,12 +184,21 @@ def main():
                 break
             if i == 0 and max(r[s]["wall"][0] for s in sides) > a.long_secs:
                 nruns = min(nruns, a.long_runs)
+        if any(r[s]["timeout"] for s in sides):
+            # a timeout on one side: both sides are reported as TIMEOUT, with the limit as their time
+            for s in sides:
+                r[s]["timeout"] = True
+                if not r[s]["wall"]:
+                    r[s]["wall"].append(a.timeout); r[s]["user"].append(a.timeout); r[s]["rc"].append(-9)
         res[key] = r
         line = key.ljust(40)
         for s in sides:
             d = r[s]
             line += " %s %.2fs" % (s[:1].upper(), statistics.median(d["wall"]))
         print(line, "rc", {s: sorted(set(r[s]["rc"])) for s in sides}, flush=True)
+        if a.json:
+            json.dump({k: {s: dict(d, hash=sorted(d["hash"]), checks=sorted(d["checks"])) for s, d in v.items()}
+                       for k, v in res.items()}, open(a.json, "w"), indent=1)
     # table
     ser = {}
     print()
@@ -189,7 +206,7 @@ def main():
         rows = [(k, v) for k, v in res.items() if k.startswith(corpus + "/")]
         if not rows:
             continue
-        print("### %s (threads=%s, cpu %d, %d runs, median)\n" % (corpus, a.threads, a.cpu, a.runs))
+        print("### %s (threads=%s, cpu %s, %d runs, median)\n" % (corpus, a.threads, a.cpu, a.runs))
         if a.only:
             continue
         print("| program | n | BEFORE s | AFTER s | ratio | BEFORE user s | AFTER user s | rc | outputs | checks |")
@@ -207,15 +224,12 @@ def main():
             if ok and same:
                 rs.append(ratio)
             chk = "; ".join(sorted(f["checks"]))[:60]
+            if b["checks"] != f["checks"]:
+                chk = "B: " + "; ".join(sorted(b["checks"]))[:40] + " | A: " + chk
             print("| %s | %d | %.2f | %.2f | %.2fx | %.2f | %.2f | %s | %s | %s |" % (
                 k.split("/", 1)[1], len(b["wall"]), mb, mf, ratio, statistics.median(b["user"]),
                 statistics.median(f["user"]), rc, "same" if same else "DIFFER", chk))
         print("\ngeometric mean (programs with identical outputs): %.3fx over %d programs\n" % (geomean(rs), len(rs)))
-    if a.json:
-        for v in res.values():
-            for d in v.values():
-                d["hash"] = sorted(d["hash"]); d["checks"] = sorted(d["checks"])
-        json.dump(res, open(a.json, "w"), indent=1)
 
 
 if __name__ == "__main__":
