@@ -5250,3 +5250,47 @@ Measured with `nvidia_tensor_bench` (ns per warp instruction, same binary, `VGPU
 * Sapphire Rapids (Xeon 8488C): geometric mean 0.916 over 43 forms; tcgen05 s8 0.46x, wgmma s8 0.68x, tcgen05 f32 0.76x, layout B / e4m3 0.81 to 0.86x, mma f64 0.76x; a few small forms 1.02 to 1.21x (noise at 5 repeats).
 * int_alu, f32_fma, f64_fma, wmma, mma_ptx, mem, shared, local, divergent (SASS and PTX): 1.00x on Sapphire Rapids, within noise on the others.
 Tests: `test_simd_dispatch` (which table each `VGPU_SIMD` setting gives on the host; run for the default and for `avx2`, `avx512`, `base`, `off`), and the tile-route tests (`test_mma_fast`, `test_mma_tiles`, `test_wgmma_fast`, `test_tcgen05_tiles`, `test_wmma_generic_fast`, `test_tile_mma`) now run three more times, with `VGPU_SIMD=avx2`, `avx512` and (for the ones that had it) `base`, so every level stays tested on a host that picks AVX-512 by default.
+## Round sp5: process start (branch `sp5-startup`, base a6e80555)
+
+Measured on server3 (cpu 2 alone, `perf stat -e instructions:u,cycles:u,task-clock`, 25 alternating runs of A and B per row, medians; the box was never quiet, load 12 to 60, so the
+instruction counts are the figure to trust and the cycle and time ratios are given as measured). A = a build of the base tree, B = this branch.
+
+* **Where a small program's start went.** `perf record` over 60 runs of the `startup` workload (SASS): 47% of user cycles in `ld.so`, and a single loop of it, the GNU symbol hash
+  (`h = h * 33 + c`), was 25% of the process. The loader hashes the name of every symbol it looks up, and `libcudart` (and `libcuda`, `libcublas`, ... every shim that links the core) exported the
+  `std::variant` dispatch tables the PTX parser's and the SASS decoder's `std::visit`s instantiate: weak symbols whose mangled names are 1,000 to 2,000 characters long (317 relocations, 669 of the
+  754 thousand name characters the library's relocations carry; `readelf -r`). Nothing outside the library refers to them. `vgpu_version_script` now lists `_ZNSt8__detail9__variant*` as `local:`
+  (GNU ld takes the more specific `local:` pattern over `global: *`; checked on a small library), and `libvgpucuda`, which had no version script, gets an unversioned one with the same line.
+  Only these tables are hidden: the rest of the core's symbols stay exported on purpose, because the shims share one copy of the core's singletons by symbol interposition
+  (`-Bsymbolic` or `-fvisibility=hidden` would give each shim its own). Relocation name characters in `libcudart`: 754,000 -> 85,000; `libcuda`: 733,000 -> 70,000.
+* **`sass::unsupported` leaves its verdict in a file** (`src/sass/ok_cache.{hpp,cpp}`). The answer is a function of the cubin's bytes and of this build's decoder and executor, so a process that finds a
+  cubin runs in full appends the 128-bit hash of the image (a four-lane multiply-rotate hash, one pass over the bytes) to `$XDG_CACHE_HOME/pantheonsim/sass-ok-v1-<GNU build id of the library>` (else
+  `$HOME/.cache/...`), and a later process of the same build answers "runs in full" from it without parsing or decoding (a PyTorch sweep starts a dozen processes that load the same fatbins). Only passes are
+  recorded, so a refusal keeps its text; it is opt-in (`VGPU_SASS_CACHE=1`); `VGPU_SASS_REFUSE` and `VGPU_SASS_CACHE=0` bypass the file; the file is used only if it is a regular file of this user's that no one else can write, in a directory of
+  the same kind, and a torn tail is read around and never appended to; a build with no GNU build id has no file; at most 65,536 keys. A word table (`OkWords`) still serves the cubins that miss, but a process
+  that answered from the file did not fill it for them.
+* Results (SASS `startup`, `perf stat`, B/A of medians over 25 runs; instructions retired, user cycles, task clock):
+
+| row | instructions | cycles | task-clock |
+|---|---:|---:|---:|
+| `startup` sass, variant tables hidden only (the cache off) | 0.69 | 0.80 | 0.93 |
+| `startup` sass, file warm (second and later process) | 0.34 | 0.58 to 0.60 | 0.80 |
+| `startup` ptx (tables hidden; the file is not used) | 0.95 | 0.975 | 0.95 |
+| libcuda + libcudart preloaded into `/bin/true` (load only) | 0.27 | 0.36 | 0.74 |
+| A/A control of the `startup` sass row | 1.000 | 0.998 | 0.984 |
+
+  `bench.py --ab` `startup` wall (15 runs): sass 0.006 -> 0.005 s (1.29x, p < 0.001, the A/A run that followed read 0.003 s for the same build on both sides: wall at 3 to 6 ms is noise-bound), ptx 1.04x (p = 0.004); every
+  other canary row (`api`, `int_alu`, `f32_fma`, `f64_fma`, `wmma`, `mma_ptx`, `mem`, `shared`, `atomics`, `local`, `divergent`, `warp`, `launch`, both engines) within 2.3% with counters identical (A/A
+  of the same window: 0.95x to 1.02x, p > 0.1 on every row; `mma_ptx` read 1.04 to 1.05x, p <= 0.002, and `wmma` sass 1.016x p 0.03: the library's code layout moved, no claim). The PyTorch sweep (torch 2.10, `VGPU_THREADS=1`, 8 alternating rounds, instructions retired, B/B control 1.0000) shows what
+  the file is worth: the symbol change alone moves a group by 0.05% to 0.25%, but a warm file takes 12% (`sdpa`), 28% (`nn`) and 36% (`ops`) off the instructions (minimum wall 10%, 13% and 27% lower, results identical), and a process that finds the file empty pays 0.6% to 2.2% more. One group leaves 21 to 88 entries (336 to 1,408 bytes).
+* Tests: `test_sass_ok_cache` (new, CMake-wired): an image that ran is answered from the file and any other (one more word, another architecture byte) is a miss; a refusal is never recorded and keeps its text;
+  `VGPU_SASS_REFUSE` and `VGPU_SASS_CACHE=0` bypass the file (a recorded image is refused when the instruction it holds is named); a torn tail is read around and not appended to; a file or directory others can write
+  is not trusted and not appended to; the key covers every bit and the length. `test_unsupported_memo` sets `VGPU_SASS_CACHE=0` (it watches the word table; the default is off anyway). `lint_shim_dynsyms` (new, `tests/lint/check_shim_dynsyms.sh`): no shared library of the build
+  exports or relocates a `std::variant` dispatch table symbol (it fails on the base build's `libcudart` and `libcuda`: 317 of each).
+
+### Not done, and negative results
+* AMD startup (`startup` mi300x, 4.4 M cycles, perf over 60 runs): `ld.so` 33%, libc 26% (malloc), `libamdhip64` 21%. `libamdhip64` already has its version script, so there is no long-name hash cost to remove; what is left
+  is spread out: the decode tables are built at first use as `std::map`s (`add_comparisons`, `_Rb_tree` inserts, and `table_gfx90a` copies the whole map again, together about 5% by symbol, more with their `malloc`), the code object's msgpack parse
+  (1.7%). A constexpr sorted array for the decode tables is the larger refactor this points at; not done here.
+* Hiding more than the variant tables (`-fvisibility-inlines-hidden`, `-Bsymbolic-functions`): the remaining 860 relocations against `vgpu::` names (67 thousand characters) are the core's own functions called across
+  translation units; the shims share singletons through them, so they stay exported.
+* The remaining `ld.so` time of the SASS `startup` row (55% of what is left) is the loader's relocation and mapping work for libstdc++, libc and the shim, and the lazy binding of the PLT.
