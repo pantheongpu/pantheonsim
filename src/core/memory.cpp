@@ -1,3 +1,4 @@
+#define VGPU_MEMORY_UNIT 1
 #include "vgpu/memory.hpp"
 
 #include <algorithm>
