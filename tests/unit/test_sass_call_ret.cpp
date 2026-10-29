@@ -8,6 +8,7 @@
 // callee and the code after the call both run, for different lanes), with a RET some lanes do not run (they fall through to an EXIT), and
 // WARPSYNC with the full mask and with a mask of the lane's own half warp (register), in warps of 32 lanes and in partial warps.
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -19,7 +20,9 @@
 #include "vgpu/registry.hpp"
 #include "vgpu/sass/exec.hpp"
 #include "vgpu/sass/sass.hpp"
+#ifndef SASS_CALL_RET_NO_TIER_FORMS
 #include "sass/tier.hpp"
+#endif
 #include "vtest.hpp"
 
 using namespace vgpu;
@@ -309,6 +312,73 @@ void expect_same(const Result& tier, const Result& ref, const std::string& what)
   }
 }
 
+// The answer of each run as one number (FNV-1a over the words in memory and the counters). The numbers in kGolden were taken from the tree before the
+// tier ran these instructions (the interpreter only: main of 2026-10-29, 9c1d6ffd); the tier and the interpreter both share Runner::release_warpsync,
+// so comparing the two cannot show a mistake in what they share. VGPU_PRINT_DIGESTS=1 prints the table instead of checking it.
+uint64_t digest(const Result& r) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  const auto mix = [&](uint64_t v) {
+    for (unsigned i = 0; i < 8; ++i) h = (h ^ ((v >> (8 * i)) & 0xff)) * 0x100000001b3ull;
+  };
+  for (uint32_t w : r.out) mix(w);
+  const uint64_t* c = reinterpret_cast<const uint64_t*>(&r.stats);
+  for (size_t i = 0; i < exec::kCounterWords; ++i) mix(c[i]);
+  return h;
+}
+
+struct Golden {
+  const char* key;
+  uint64_t digest;
+};
+const Golden kGolden[] = {
+    {"unguarded call, 32 threads", 0xc974d6cfb4b779aaull},
+    {"unguarded call, 64 threads", 0xa947db22e3a5c769ull},
+    {"unguarded call, 100 threads", 0x27e26a457563a759ull},
+    {"guarded call, 32 threads", 0xd2b4464d6894e9daull},
+    {"guarded call, 33 threads", 0xa997419dad72bd12ull},
+    {"guarded call, 64 threads", 0x5a544518d86d407bull},
+    {"guarded call, 100 threads", 0x36c5d26613798537ull},
+    {"guarded call, 5 threads", 0xa0faddb9077e649aull},
+    {"guarded call, 31 threads", 0x21a5f020ca4c2eccull},
+    {"guarded return, 32 threads", 0x277fcbbf0959abbeull},
+    {"guarded return, 64 threads", 0x78841b5c427475a5ull},
+    {"guarded return, 100 threads", 0x6ee4492186bb0ba7ull},
+    {"guarded return, 20 threads", 0xb40aa9d244a6d7b4ull},
+    {"unguarded call, guarded return, 32 threads", 0x392824ba49120b57ull},
+    {"unguarded call, guarded return, 96 threads", 0x86716ae689d4ada8ull},
+    {"WARPSYNC full mask, 32 threads", 0x33939f5472259133ull},
+    {"WARPSYNC full mask, 64 threads", 0xe8bfb078b0859678ull},
+    {"WARPSYNC full mask, 33 threads", 0x10a2704712e58d5aull},
+    {"WARPSYNC full mask, 5 threads", 0xcb920cbd5b7a6e2aull},
+    {"WARPSYNC half-warp mask, 32 threads", 0x7fff4459318b592cull},
+    {"WARPSYNC half-warp mask, 64 threads", 0x5ce884bf08d7f00dull},
+    {"WARPSYNC half-warp mask, 33 threads", 0x566bd00f768bb842ull},
+    {"WARPSYNC half-warp mask, 100 threads", 0x568bb8bfd8998663ull},
+    {"WARPSYNC half-warp mask, unguarded call, 32 threads", 0x55a4f8ef91aa6d68ull},
+    {"WARPSYNC half-warp mask, unguarded call, 96 threads", 0x629e3e426dee440cull},
+    {"WARPSYNC after exits, full mask, 32 threads", 0xb823e7f0ac61ce89ull},
+    {"WARPSYNC after exits, full mask, 64 threads", 0x5afee81ac3037582ull},
+    {"WARPSYNC after exits, full mask, 100 threads", 0x7321745416921a54ull},
+    {"WARPSYNC after exits, half-warp mask, 32 threads", 0x0bccd1903c8a151eull},
+    {"WARPSYNC after exits, half-warp mask, 96 threads", 0xf7e1d7e6266f46c0ull},
+};
+
+void check_golden(const Result& r, const std::string& key) {
+  const uint64_t d = digest(r);
+  if (std::getenv("VGPU_PRINT_DIGESTS")) {
+    std::printf("    {\"%s\", 0x%016llxull},\n", key.c_str(), static_cast<unsigned long long>(d));
+    return;
+  }
+  for (const Golden& g : kGolden)
+    if (key == g.key) {
+      if (g.digest != d)
+        throw vtest::Failure(key + ": the answer is " + hex(static_cast<uint32_t>(d)) + "... where the tree before the tier ran these instructions gave " +
+                             hex(static_cast<uint32_t>(g.digest)) + "...");
+      return;
+    }
+  throw vtest::Failure(key + ": no recorded answer");
+}
+
 // The kernel run by the tier and by the interpreter, over the block sizes given.
 void compare(const std::vector<Insn>& code, std::initializer_list<uint32_t> sizes, const std::string& name) {
   Scoped scoped;
@@ -320,6 +390,7 @@ void compare(const std::vector<Insn>& code, std::initializer_list<uint32_t> size
     const Result ref = e.run(*m, 3, threads);
     ::unsetenv("VGPU_FASTPATH");
     expect_same(tier, ref, name + ", " + std::to_string(threads) + " threads");
+    check_golden(tier, name + ", " + std::to_string(threads) + " threads");
   }
 }
 
@@ -344,6 +415,13 @@ VTEST(warpsync_with_the_full_mask_and_with_a_register_mask) {
   compare(kernel(2, false, RetKind::Plain, 2), {32, 96}, "WARPSYNC half-warp mask, unguarded call");
 }
 
+VTEST(warpsync_does_not_wait_for_lanes_that_have_exited) {
+  // The lanes 16 to 23 leave in the callee (a RET they do not run is followed by an EXIT); a mask that names them is met by the lanes that remain.
+  compare(kernel(2, true, RetKind::Guarded, 1), {32, 64, 100}, "WARPSYNC after exits, full mask");
+  compare(kernel(2, true, RetKind::Guarded, 2), {32, 96}, "WARPSYNC after exits, half-warp mask");
+}
+
+#ifndef SASS_CALL_RET_NO_TIER_FORMS   // (not in the tree the answers were taken from)
 VTEST(the_tier_runs_these_instructions_itself) {
   // Not vacuous: the tier's analysis takes each of the four forms (so the comparisons above compare the tier's code with the interpreter's).
   const std::vector<Insn> code = kernel(2, true, RetKind::Guarded, 2);
@@ -361,5 +439,7 @@ VTEST(the_tier_runs_these_instructions_itself) {
   }
   VCHECK(call && ret && fchk && wsync);
 }
+
+#endif
 
 VTEST_MAIN

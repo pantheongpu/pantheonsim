@@ -5132,8 +5132,7 @@ void Runner::release_warpsync(Warp& w) {
     each_lane(release, [&](unsigned l) {
       if (!have || w.pc[l] != seen) {
         have = true;
-        const Code* const h = w.code_hint;   // (the section the warp runs in, most often: no lookup of the section)
-        const Instr& at_ins = h && w.pc[l] - h->base < 16 * h->count ? h->instr((w.pc[l] - h->base) / 16) : fetch(w.pc[l]);
+        const Instr& at_ins = fetch(w.pc[l]);
         collective = collective || (at_ins.op == Op::WARPSYNC && at_ins.f[1]);
         seen = w.pc[l];
       }
