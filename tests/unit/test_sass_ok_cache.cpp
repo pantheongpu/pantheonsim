@@ -267,7 +267,8 @@ VTEST(refuse_and_cache_off_bypass_the_file) {
   VCHECK_EQ(sass::unsupported_cache_hits(), h0 + 1);
   // VGPU_SASS_CACHE=0, or unset (the default): neither read nor written.
   const std::string b = make_cubin(86, good_words(40, 2));
-  for (const char* off : {"0", nullptr}) {
+  const char* const offs[] = {"0", nullptr};
+  for (const char* off : offs) {
     if (off) setenv("VGPU_SASS_CACHE", off, 1);
     else unsetenv("VGPU_SASS_CACHE");
     VCHECK(run(a).empty());
