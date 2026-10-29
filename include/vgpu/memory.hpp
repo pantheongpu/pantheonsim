@@ -197,6 +197,14 @@ class MemoryManager {
   // Bulk copies (the H2D/D2H/D2D building blocks).
   void write(uint64_t dst, const void* src, uint64_t len);
   void read(uint64_t src, void* dst, uint64_t len) const;
+  // A device-to-device copy made chunk to chunk, with no staging buffer: what read(src, tmp, len) followed by
+  // dst_mm.write(dst, tmp, len) leaves in the destination, chunk for chunk (a destination chunk that already holds
+  // the bytes being written as one repeated byte stays unmaterialized, as write() leaves it). Returns true having done
+  // the copy, or false having done nothing -- whenever the pair could differ or fail: a fault armed (copies included),
+  // a host mapping in reach of either range, a range not wholly inside one ordinary allocation (freed, mapped,
+  // exported, out of range), or two ranges of one allocation that overlap. The caller then makes the pair of calls,
+  // and meets any error where it would have.
+  bool copy_to(MemoryManager& dst_mm, uint64_t dst, uint64_t src, uint64_t len) const;
   // A kernel's run of `unit`-byte loads or stores (TMA's box rows), done at
   // once: exactly what load_scalar / store_scalar would do element by
   // element, each element still one relaxed atomic access, for a run wholly

@@ -1614,14 +1614,16 @@ hipError_t copy_region(void* dst, const Region& dr, const void* src, const Regio
     const uint64_t start = profile_clock();
     try {
       // (a device-to-device row goes through a buffer; not zeroed first, since all of it is written before it is read)
-      const std::unique_ptr<uint8_t[]> buf =
-          to_device && from_device ? std::make_unique_for_overwrite<uint8_t[]>(w) : nullptr;
+      // (a large row between ordinary allocations goes chunk to chunk instead, with no buffer: MemoryManager::copy_to)
+      std::unique_ptr<uint8_t[]> buf;
       for (uint64_t z = 0; z < depth; ++z)
         for (uint64_t y = 0; y < rows; ++y) {
           const uint64_t dva = dst_va + z * dr.slice + y * dr.pitch, sva = src_va + z * sr.slice + y * sr.pitch;
           const void* source = staged ? static_cast<const void*>(staged->data() + (z * rows + y) * w)
                                       : reinterpret_cast<const void*>(sva);
           if (to_device && from_device) {
+            if (w > 16384 && fm->copy_to(*tm, dva, sva, w)) continue;
+            if (!buf) buf = std::make_unique_for_overwrite<uint8_t[]>(w);
             fm->read(sva, buf.get(), w);
             tm->write(dva, buf.get(), w);
           } else if (to_device) {
