@@ -5250,3 +5250,85 @@ Measured with `nvidia_tensor_bench` (ns per warp instruction, same binary, `VGPU
 * Sapphire Rapids (Xeon 8488C): geometric mean 0.916 over 43 forms; tcgen05 s8 0.46x, wgmma s8 0.68x, tcgen05 f32 0.76x, layout B / e4m3 0.81 to 0.86x, mma f64 0.76x; a few small forms 1.02 to 1.21x (noise at 5 repeats).
 * int_alu, f32_fma, f64_fma, wmma, mma_ptx, mem, shared, local, divergent (SASS and PTX): 1.00x on Sapphire Rapids, within noise on the others.
 Tests: `test_simd_dispatch` (which table each `VGPU_SIMD` setting gives on the host; run for the default and for `avx2`, `avx512`, `base`, `off`), and the tile-route tests (`test_mma_fast`, `test_mma_tiles`, `test_wgmma_fast`, `test_tcgen05_tiles`, `test_wmma_generic_fast`, `test_tile_mma`) now run three more times, with `VGPU_SIMD=avx2`, `avx512` and (for the ones that had it) `base`, so every level stays tested on a host that picks AVX-512 by default.
+
+
+## Round sp9: shared-memory bank passes by warp shape (branch `sp9-bank`, base 873dbc69)
+
+Where the time went (perf `cycles:u`, one host thread, A = 873dbc69; shares of the program's samples): `memcount::sass_bank_passes` was 40% of Samples
+convolutionSeparable, 34% sortingNetworks, 31% histogram, 19% mergeSort, 21% Rodinia lud, 14% dct8x8, 11% hotspot, with `h_shared` another 7 to 25%. The closed
+forms (`bank_passes_progression`) already take every warp on one stride; what is left is warps that are on no stride. Dumping one call in 211 of the real programs
+(2.4 M calls sampled) showed that the left-over warps are mostly few shapes seen over and over: convolutionSeparable's row stage is two rows of 16 words 160 words apart
+(2 passes, 600 000 samples, 2 distinct shapes), dct8x8 four shapes (groups of 8 lanes on one word, a row of 8 words four times), mergeSort / sortingNetworks pairs of
+words every four and bitonic index patterns (about half of them repeat), segmentationTreeThrust 8-byte rows; only histogram's byte gathers are random.
+
+### What changed
+
+* `memcount::BankMemo` / `sass_bank_passes_memo` (include/vgpu/exec/mem_counters.hpp): the passes of a warp depend on which of its lanes' words are the same and which banks they are in,
+  and moving every address by a whole number of words rotates the banks together and keeps equal words equal. So after the closed forms give up, the warp's shape (the width, and each
+  lane's address less the first active lane's word; a lane that does not run is taken at that word, which adds none) is looked up in a 32-entry table, one per host thread
+  (`count_shared_access` in src/sass/exec_ops.inc, a `thread_local`, so no lock). A hit compares 256 bytes of offsets; a miss counts as before and stores. Addresses of 2^62 and over go to the counting (a
+  move could wrap them). When fewer than a third of the last 64 lookups hit (a gather, histogram) the table is left alone for 1024 calls, so a kernel with no repeating shapes only pays
+  for a 64-lookup probe in 1088 calls. All the shared-memory counting sites of the SASS executor use it (`h_shared`, `exec_mem`'s LDS/STS, the generic-address path, LDGSTS).
+* `sass_bank_passes_table`: the counting behind the closed forms, for 1 to 4 byte accesses, walks the active lanes with a counted loop (the run of consecutive lanes, as the sector code does) and the table's counts are bytes. Same sets
+  of words, same answer (a 0-byte access keeps its old meaning: a word only at an unaligned address).
+* `lane_progression<true>` (bank passes only) tests the last lane before walking the lanes, so a warp of rows is turned away at once (it was 16 lane pairs of work for convolutionSeparable's shape). The sector counting
+  calls `lane_progression<false>`: its warps nearly always are on the stride, and the extra comparison cost `mem` / `local` 3.5% (SASS) in the first version.
+* The PTX interpreter's `ptx_bank_passes` shares `BankTable` (byte counts) and `lane_progression`; it has no table of shapes.
+
+### Results (Zen 4 box, `taskset` cpu 2, one thread, A = 873dbc69 built the same way, `real.py` whole programs, median wall, 9 alternating runs (5 for the programs of 20 s and more), Mann-Whitney p)
+
+| program | A s | B s | A/B | p | A/A control (same builds) |
+|---|---:|---:|---:|---:|---|
+| Samples convolutionSeparable | 25.13 | 17.39 | 1.445x | 0.008 | 1.008x (p 0.42) |
+| Rodinia lud (1024) | 4.63 | 3.86 | 1.199x | 0.0004 | 1.000x |
+| Samples sortingNetworks | 21.93 | 20.25 | 1.083x | 0.008 | |
+| Rodinia hotspot | 1.68 | 1.62 | 1.038x | 0.0004 | 0.998x |
+| Samples histogram | 28.03 | 27.06 | 1.036x | 0.008 | |
+| HeCBench shmembench | 12.04 | 11.72 | 1.027x | 0.0004 | 0.993x |
+| Samples mergeSort | 10.25 | 10.20 | 1.005x | 0.03 | 1.003x |
+| Samples segmentationTreeThrust | 31.36 (user 21.9) | 33.07 (user 21.0) | wall 0.948x, user 1.046x | 0.84 | not run (the wall time carries host work and a launch of the Thrust build) |
+| Samples dct8x8 | 2.02 | 1.89 | 1.066x | 0.25 | 0.894x (p 0.43): under 2.2 s of which most is host code, not measurable |
+
+`perf stat` of convolutionSeparable on a quiet box: 115.6 G cycles -> 79.7 G (-31%), 526.6 G -> 368.4 G instructions. Counters: `VGPU_COUNTERS=1` of all of convolutionSeparable, sortingNetworks, histogram,
+mergeSort, dct8x8, segmentationTreeThrust and shmembench, A against B, every launch's block of counters is byte-identical (139 M, 100 M, 81 M, 15 M, 0, 160 M and 504 M bank conflicts).
+The `bench.py` canaries (sass and ptx, 15 alternating runs, equal instruction counters): int_alu, f32_fma, f64_fma, wmma, mma_ptx, mem, shared, atomics, local, divergent, warp, launch, api all 0.986x to 1.029x (nothing under 0.98;
+A/A of mem, local, wmma, mma_ptx sass 0.999 to 1.002x).
+
+### Placement (the lesson of round 1, again)
+
+The first version kept the table in the `Block` (8.7 KB at the end of the struct). `wmma` and `mma_ptx` (SASS) lost 3.5 to 5% with equal instruction counts and no extra misses: the
+tile kernel `tc86::mma_avx2_chunked_f<8,false>` (a 10 KB function with a 4 KB frame) went from 64.8% to 70.7% of the samples. Moving the table out of `Block` (a `thread_local`, which leaves `sizeof(Block)` as it was)
+brought both back (0.995x and 0.993x cycles, B faster). Aligning `step_warp` to 64 bytes, a `section` attribute for the new functions (a section type conflict with the comdat for an inline function) and `noinline` on the
+counting wrapper changed nothing or made it worse: the kernel's speed follows the heap layout, not the code layout. Any later change to the size of `Block` or `Warp` should re-run `wmma` and `mma_ptx`.
+
+### Not done, and negative results
+
+* A branch-free "passes by levels" count (each level takes one word of every bank that still has words; the number of levels is the answer), in 32- and 64-bit words: 0.84x to 1.1x of the byte-count table on
+  the sampled warps (convolutionSeparable 77 vs 64 ns, sortingNetworks 49 vs 50, histogram 95 vs 98, mergeSort 88 vs 88); not kept. A pre-test that every lane is in a bank of its own (the bank mask, one pass if it is full): 87 to 99 ns against
+  60 to 80, slower, because a walk of 32 lanes costs about 80 cycles by itself (the tzcnt chain). A table of 8-byte keys instead of 32: no change.
+* The hit rate of mergeSort and sortingNetworks is about a third to a half (patterns repeat but data-dependent masks and gathers do not), so their gain (0.5 to 8%) is small; histogram (bytes, random words) only sees the leaner
+  table. A memo in the PTX interpreter was not written (the programs here run on SASS).
+* `h_shared` itself (15 to 25% of these programs after the change: address generation and the lane-by-lane data move) was not touched.
+
+### Tests (wired in CMake) and the mutations that fail them
+
+`test_bank_memo` (new, `vgpu_unit_test`): every answer of `sass_bank_passes_memo` against a from-scratch definition (sorted vectors of the words of each bank) with ONE table kept across 400 000 calls of
+400 shapes (tile rows, groups on one word, pairs of words, windows, byte gathers, permutations, bitonic indices) at every alignment, widths 1 to 64 bytes, full / partial / sparse masks, idle lanes holding zero or anything,
+rank bits in the high bits, the edge of 2^62 and the top of the address space; the same shape in every position of the banks and byte of the word; shapes that differ in one lane; that a shape is found again wherever it sits and
+whatever the idle lanes hold (`hits`); that stride shapes never reach the table; the back-off; and `sass_bank_passes_table` / `sass_bank_passes` against `sass_bank_passes_reference` (the earlier counting, which `test_memfast` holds against the
+original code) for widths 0 to 64 over 300 000 random warps. `test_memfast`, `test_memcount_forms` (also `VGPU_SIMD=base`) and `test_sass_access_count` pass unchanged.
+
+| mutation | result |
+|---|---|
+| key ignores the width | `test_bank_memo` fails |
+| the last two lanes left out of the comparison | fails |
+| base not rounded down to a word (byte offsets shared) | fails |
+| no 2^62 / top-of-space check | fails |
+| the second word of an unaligned 4-byte access not counted | fails |
+| 0-byte accesses counted like 1 to 4 bytes | fails |
+| idle lanes taken at address 0 (or not replaced) | fails (a shape is not found again) |
+| last-lane test off by one (nothing reaches the closed forms) | fails (stride shapes reach the table) |
+| (key ignores the lane mask) | survives, by design: an idle lane is taken at the first word, which adds no word, so the mask cannot change the passes; the mask was dropped from the key |
+
+Sanitizers on server3: `test_bank_memo`, `test_memcount_forms`, `test_sass_access_count` under ASan+UBSan at -O0 (leaks on, halt on error) pass; `test_bank_memo` under TSan -O1 passes (it is single-threaded; the table is a `thread_local`, no run with
+threads was made beyond the programs above at one thread). The e2e guards that need `nvcc` (`e2e_sass_tier`, `e2e_sass_archs`) cannot run on server3 (stub compiler); the whole-program counter comparison above stands in for them.

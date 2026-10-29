@@ -3006,11 +3006,15 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
   }
 }
 
-// count_access of a shared-memory access, with the block's table of bank passes by shape.
-void count_shared_access(Block& blk, bool store, const uint64_t* addr, Mask lanes, uint32_t bytes) {
+// count_access of a shared-memory access, with the host thread's table of bank passes by shape (a table in the Block would
+// be the same thing, but it moves the heap blocks that follow it, and the tensor-core tile kernels are sensitive to where
+// their buffers sit; made by the thread's first shared access).
+void count_shared_access(exec::LaunchStats& st, bool store, const uint64_t* addr, Mask lanes, uint32_t bytes) {
   const uint64_t n = popc(lanes);
   if (!n) return;
-  count_shared(blk.st, store, n, bytes, exec::memcount::sass_bank_passes_memo(blk.bank_memo, addr, lanes, 32, bytes));
+  thread_local std::unique_ptr<exec::memcount::BankMemo> memo;
+  if (!memo) memo = std::make_unique<exec::memcount::BankMemo>();
+  count_shared(st, store, n, bytes, exec::memcount::sass_bank_passes_memo(*memo, addr, lanes, 32, bytes));
 }
 
 // count_access for a coalesced run: the lanes of `ex`, which are the `count` consecutive ones from `first`, made their
@@ -3344,7 +3348,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           }
         }
       });
-      if (space == 1) count_shared_access(blk, store, addrs, ex, bytes);
+      if (space == 1) count_shared_access(blk.st, store, addrs, ex, bytes);
       else count_access(blk.st, space, store, addrs, ex, bytes);
       return;
     }
@@ -3414,7 +3418,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
               });
             }
           }
-          count_shared_access(blk, store, addrs, ex, bytes);
+          count_shared_access(blk.st, store, addrs, ex, bytes);
           return;
         }
       }
@@ -3487,7 +3491,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
             for (unsigned i = 0; i < bytes / 4; ++i) w.reg(d.reg + i, l) = v[i];
         }
       });
-      if (shared) count_shared_access(blk, store, addrs, ex, bytes);
+      if (shared) count_shared_access(blk.st, store, addrs, ex, bytes);
       else count_access(blk.st, 2, store, addrs, ex, bytes);
       return;
     }
@@ -3517,7 +3521,7 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         mem_write(blk, w, l, Space::Shared, sh, buf, bytes);
       });
       count_access(blk.st, 0, false, gaddr, ex, bytes);
-      count_shared_access(blk, true, saddr, ex, bytes);
+      count_shared_access(blk.st, true, saddr, ex, bytes);
       return;
     }
     case Op::LDSM: {

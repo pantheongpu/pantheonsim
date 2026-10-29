@@ -160,6 +160,7 @@ inline bool on_stride(const uint64_t* addrs, unsigned lo, unsigned n, uint64_t s
 // bytes (a signed number; zero for a single lane), the lowest lane and the count. With the endpoints in range and
 // the stride small, no lane in between has wrapped either, so an address and its word or sector follow the same
 // arithmetic as the lanes do.
+template <bool LastFirst = false>
 inline bool lane_progression(const uint64_t* addrs, uint64_t m, uint64_t margin, int64_t& stride, unsigned& lo,
                              unsigned& n) {
   lo = static_cast<unsigned>(std::countr_zero(m));
@@ -175,8 +176,10 @@ inline bool lane_progression(const uint64_t* addrs, uint64_t m, uint64_t margin,
   }
   const int64_t s = static_cast<int64_t>(addrs[lo + 1] - a0);
   if (s > (int64_t{1} << 32) || s < -(int64_t{1} << 32)) return false;
-  // (the last lane first: a warp of rows -- a run on one stride, then a jump -- is turned away without walking its lanes)
-  if (addrs[lo + n - 1] != a0 + uint64_t{n - 1} * static_cast<uint64_t>(s)) return false;
+  // (LastFirst: the last lane first, so that a warp of rows -- a run on one stride, then a jump -- is turned away without
+  // walking its lanes; one more comparison for the warps that are on the stride, which the bank counting takes for the
+  // warps it can remember and the sector counting, whose warps nearly always are, does without)
+  if (LastFirst && addrs[lo + n - 1] != a0 + uint64_t{n - 1} * static_cast<uint64_t>(s)) return false;
   if (!on_stride(addrs, lo, n, static_cast<uint64_t>(s))) return false;
   const uint64_t last = addrs[lo + n - 1];
   if (last > top || (s >= 0 ? last < a0 : last > a0)) return false;
@@ -433,7 +436,7 @@ template <bool Sass>
 inline bool bank_passes_progression(const uint64_t* addrs, uint64_t m, uint32_t arg, uint32_t& out) {
   int64_t stride;
   unsigned lo, n;
-  if (!lane_progression(addrs, m, 256, stride, lo, n)) return false;
+  if (!lane_progression<true>(addrs, m, 256, stride, lo, n)) return false;
   const uint64_t first = addrs[lo], last = addrs[lo + n - 1];
   // A lane's words, as the number from its address's word on (the SASS rule depends on the byte in the word).
   const auto words_at = [&](uint64_t addr) -> uint32_t {
