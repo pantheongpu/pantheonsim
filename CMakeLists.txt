@@ -226,6 +226,7 @@ add_library(vgpu STATIC
   src/sass/decode.cpp
   src/sass/cubin.cpp
   src/sass/module.cpp
+  src/sass/ok_cache.cpp
   src/sass/exec.cpp
   src/sass/tier.cpp
   src/sass/jit.cpp
@@ -1534,6 +1535,9 @@ target_compile_definitions(test_decode_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAK
 # sass::unsupported's table of words it has seen: the answer and the text of a refusal are the same with or without it.
 vgpu_unit_test(test_unsupported_memo tests/unit/test_unsupported_memo.cpp)
 target_compile_definitions(test_unsupported_memo PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The file of cubins sass::unsupported found to run in full, kept between processes when VGPU_SASS_CACHE=1 (src/sass/ok_cache.cpp).
+vgpu_unit_test(test_sass_ok_cache tests/unit/test_sass_ok_cache.cpp)
+target_compile_definitions(test_sass_ok_cache PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # FFMA2/FMUL2/FADD2 (sm_100's packed fp32): the corpora's lines decode and are run, a cubin of them is supported, the forms of unknown
 # meaning are refused, and the arithmetic the PTX and SASS engines share.
 vgpu_unit_test(test_f32x2_sass tests/unit/test_f32x2_sass.cpp)
