@@ -387,7 +387,7 @@ Verification and tests:
 | 3DCONV, ADI, GEMM, SYRK, gaussian, needle | 0.02 to 10 s | same or +0.2 s | same | 1.0x | 0.9x to 1.0x | 0 (the rule keeps them in the simulator) |
 
 * The profile's prediction held for the big winners (FDTD-2D 32x predicted, 14x measured on the whole program because the first two launches of each kernel and the host phase remain; aligned-types, babelstream, base64e within 1.5x of the model).
-* **LU and GRAMSCHM do not benefit.** Their launches alternate between kernels in the exact set and kernels that are not, so every simulator launch gives the card copy up and the next offloaded launch pushes it again: 22 GB moved either way. Persistent is 18% **slower** than write-through on LU (the gate's lock and the two-way bookkeeping on top of the same traffic).
+* **LU and GRAMSCHM do not benefit.** Their launches alternate between kernels in the exact set and kernels that are not, so every simulator launch gives the card copy up and the next offloaded launch pushes it again: 22 GB moved either way. Persistent is 18% **slower** than write-through on LU (cause not isolated: the traffic is the same, so the gate, the chunk bookkeeping and the extra pulls are the suspects).
   An upper bound from the model for a finer reach (only the allocations a launch's arguments name, unsound as pointers inside memory are not followed): the same numbers as `persist`, so even that would not help these two: the alternating kernels share their buffers.
 * Fixed cost of the mode when nothing is offloaded stays 0.15 to 0.35 s per process (3DCONV 1.04 to 1.28 s, GEMM 1.32 to 1.54 s).
 
