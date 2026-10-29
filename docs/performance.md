@@ -5250,3 +5250,24 @@ Measured with `nvidia_tensor_bench` (ns per warp instruction, same binary, `VGPU
 * Sapphire Rapids (Xeon 8488C): geometric mean 0.916 over 43 forms; tcgen05 s8 0.46x, wgmma s8 0.68x, tcgen05 f32 0.76x, layout B / e4m3 0.81 to 0.86x, mma f64 0.76x; a few small forms 1.02 to 1.21x (noise at 5 repeats).
 * int_alu, f32_fma, f64_fma, wmma, mma_ptx, mem, shared, local, divergent (SASS and PTX): 1.00x on Sapphire Rapids, within noise on the others.
 Tests: `test_simd_dispatch` (which table each `VGPU_SIMD` setting gives on the host; run for the default and for `avx2`, `avx512`, `base`, `off`), and the tile-route tests (`test_mma_fast`, `test_mma_tiles`, `test_wgmma_fast`, `test_tcgen05_tiles`, `test_wmma_generic_fast`, `test_tile_mma`) now run three more times, with `VGPU_SIMD=avx2`, `avx512` and (for the ones that had it) `base`, so every level stays tested on a host that picks AVX-512 by default.
+
+
+## Round sp9: S2R special-register reads (branch `sp9-s2r`, base 873dbc69)
+
+`Runner::sreg` computed SR_TID.X/Y with two integer divides per lane, out of line, and `h_s2r` called it once per lane. Two changes (src/sass/exec.cpp, src/sass/tier_ops.inc):
+* `Runner::build_tid_tab` fills a table of SR_TID.X/Y/Z for every thread of the block at launch, by counters (no divide; the lanes past the block's last thread continue the count, as the division gives it). `sreg` reads the table. The table is a plain member (3 x 1056 words, no initializer, so a launch does not zero it).
+* `Runner::tier_sreg_fill` gives `h_s2r` a one-pass fill for SR_TID.X/Y/Z, LANEID, CTAID.X/Y/Z and NTID (a memcpy of the warp's table row for a full mask, the active lanes only otherwise); any other register takes the old per-lane loop. `CS2R`, `init_block` and the PTX interpreter (which already reads precomputed `tid_x/y/z`) are unchanged.
+
+### Results (A = 873dbc69, B = branch; real programs from tools/bench/real, one host thread, cpu 0 of server3, outputs identical)
+| program | A s | B s | A/B | runs |
+|---|---:|---:|---:|---:|
+| samples/transpose | 15.97 | 10.33 | 1.55x | 9 (final build; the build before `noinline`: 15.84 to 11.58, 1.37x) |
+| rodinia/gaussian | 6.05 | 4.59 | 1.32x | 9 (final build; before `noinline`: 5.59 to 4.85, 1.15x) |
+| polybench/LU | 70.40 | 44.16 | 1.59x | 3 (long program, not enough runs for a p) |
+| polybench/FDTD-2D | 185.51 | 130.80 | 1.42x | 3 (same) |
+A/A (A against A, 9 runs, quiet box): gaussian 1.01x, transpose 0.99x. An A/A taken while another build ran on the box gave transpose 0.93x and an A/B in that window gave 1.37x on a base of 18.2 s: only the quiet-box rows above are quoted. HeCBench babelstream and aligned-types exceed the 600 s timeout on both sides (no number); the corpus has no HeCBench transpose.
+bench.py canaries (13 workloads, SASS and PTX, 9 runs, counters identical in all 26 rows): all within 0.98 to 1.02 except `shared` PTX 0.975x (p=0.001, reproduced with 21 runs at 0.974x; the A/A of the same rows was 0.995x). The PTX engine is not touched; `perf stat` showed equal instructions and cycles +2 to 4%, L1i misses +30% (small), and a different LTO inlining of `run_warp_until_yield`/`exec_ld`, so it is a placement effect of the relink. Marking the two new functions `[[gnu::noinline]]` restored it to 0.990x (21 runs, p=0.004, inside the 0.98 bound); this is layout, not a measured cause. (LU and FDTD-2D were measured on the build before `noinline`.) `mma_ptx` PTX moved 1.04x in the first link and 1.01x in the last, again layout.
+
+### Tests
+`test_sass_s2r_fill` (CMake, Release and ASan+UBSan -O0): hand-assembled SASS stores each thread's TID.X/Y/Z, LANEID, CTAID.X/Y/Z, NTID and three guarded S2Rs, checked against host formulas on the tier and with VGPU_FASTPATH=0, for 1D/2D/3D blocks, odd and partial-warp sizes and 1024 threads. Mutations that fail it: Z filled from the Y table (1 of 3 pass), `sreg` Y read at `tid ^ 1` (2 of 3), the partial-mask fill writing inactive lanes (0 of 3).
+Guards: `ctest -R 'sass|s2r|tier'` (25 tests: the SASS unit tests and `test_sass_s2r_fill`) passes in Release; all 26 canary rows show identical counters. The e2e programs (`e2e_sass_tier`, `e2e_sass_archs`, `bench_counters_tier`, ...) skip on server3 (no real nvcc), so they are left to CI. The sanitizer run covered `test_sass_s2r_fill` only (ASan+UBSan -O0); no TSan (no threaded code).

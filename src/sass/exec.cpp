@@ -949,7 +949,7 @@ void Runner::set_pred(Warp& w, const Operand& o, unsigned lane, bool v) {
 
 // tid % bx, (tid / bx) % by and tid / (bx * by) for each tid, by counters (the lanes past the block's last thread continue the
 // count: z keeps growing, as the division gives it).
-void Runner::build_tid_tab() {
+[[gnu::noinline]] void Runner::build_tid_tab() {
   const uint32_t n = (block_threads_ + 31) & ~31u;
   const uint32_t bx = cfg_.block[0], by = cfg_.block[1];
   uint32_t x = 0, y = 0, z = 0;
@@ -967,7 +967,7 @@ void Runner::build_tid_tab() {
   }
 }
 
-bool Runner::tier_sreg_fill(const Block& blk, const Warp& w, unsigned idx, uint32_t* d, Mask ex) const {
+[[gnu::noinline]] bool Runner::tier_sreg_fill(const Block& blk, const Warp& w, unsigned idx, uint32_t* d, Mask ex) const {
   const uint32_t* src = nullptr;
   uint32_t v = 0;
   switch (idx) {
