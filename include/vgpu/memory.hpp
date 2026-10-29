@@ -107,6 +107,17 @@ inline constexpr uint64_t kChunkSize = 64 * 1024;
 // long-running alloc/free loops do not grow memory forever.
 inline constexpr size_t kQuarantineEntries = 4096;
 
+// An atomic that a moved MemoryManager carries over by value (std::atomic is neither copyable nor movable).
+template <class T>
+struct MovableAtomic : std::atomic<T> {
+  using std::atomic<T>::atomic;
+  MovableAtomic(MovableAtomic&& o) noexcept : std::atomic<T>(o.load(std::memory_order_relaxed)) {}
+  MovableAtomic& operator=(MovableAtomic&& o) noexcept {
+    this->store(o.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    return *this;
+  }
+};
+
 class MemoryManager {
  public:
   explicit MemoryManager(uint64_t capacity_bytes, uint32_t device_ordinal = 0)
@@ -549,8 +560,8 @@ class MemoryManager {
 
  private:
   AccessFault* access_fault_ = nullptr;
-  std::atomic<CardGate*> card_gate_{nullptr};
-  std::atomic<int32_t> card_resident_{0};
+  MovableAtomic<CardGate*> card_gate_{nullptr};
+  MovableAtomic<int32_t> card_resident_{0};
   bool any_stuck() const {
     return access_fault_ && access_fault_->stuck_pending &&
            __atomic_load_n(access_fault_->stuck_pending, __ATOMIC_RELAXED);
