@@ -4847,7 +4847,7 @@ class Interpreter {
         std::holds_alternative<OpLdSlot>(ins.op) || std::holds_alternative<OpStSlot>(ins.op))
       return InstClass::Memory;
 
-    if (std::holds_alternative<OpMma>(ins.op) || std::holds_alternative<OpWmmaMma>(ins.op) ||
+    if (std::holds_alternative<OpMma>(ins.op) || std::holds_alternative<OpWmmaMma>(ins.op) || std::holds_alternative<OpCoopMma>(ins.op) ||
         std::holds_alternative<OpWgmma>(ins.op) || std::holds_alternative<OpTcgen05>(ins.op) ||
         std::holds_alternative<OpMovMatrix>(ins.op))
       return InstClass::Tensor;
@@ -7657,6 +7657,10 @@ class Interpreter {
       exec_mma(w, ctx, ins, *op, m);
       return;
     }
+    if (const auto* op = std::get_if<OpCoopMma>(&ins.op)) {
+      exec_coop_mma(w, ctx, ins, *op, m);
+      return;
+    }
     if (const auto* op = std::get_if<OpRedux>(&ins.op)) {
       require_warp_le32(ins, "redux.sync");
       redux_check(ins, op->op, op->ty, "redux");
@@ -10012,6 +10016,110 @@ class Interpreter {
     wgmma_tile_to_acc(Df, kN, op.acc_f16, rd, true);
     scatter(rd, op.d.size(), 32, nullptr);
     return true;
+  }
+
+
+  // OpCoopMma: a cooperative-matrix multiply-add over the warp (include/vgpu/ptx/ast.hpp). Gather A, B and C out of the lanes' registers by
+  // the layout rules, fold the products in increasing k, scatter D.
+  static bool coop_is_float(CoopElem t) { return t == CoopElem::F16 || t == CoopElem::BF16 || t == CoopElem::F32; }
+  static uint32_t coop_bits(CoopElem t) {
+    switch (t) {
+      case CoopElem::S8: case CoopElem::U8: return 8;
+      case CoopElem::F16: case CoopElem::BF16: case CoopElem::S16: case CoopElem::U16: return 16;
+      default: return 32;
+    }
+  }
+  static float coop_to_float(CoopElem t, uint64_t v) {
+    switch (t) {
+      case CoopElem::F16: return simd::f16_to_f32(static_cast<uint16_t>(v));
+      case CoopElem::BF16: return simd::bf16_to_f32(static_cast<uint16_t>(v));
+      default: return std::bit_cast<float>(static_cast<uint32_t>(v));
+    }
+  }
+  static int32_t coop_to_int(CoopElem t, uint64_t v) {
+    switch (t) {
+      case CoopElem::S8: return static_cast<int8_t>(v);
+      case CoopElem::U8: return static_cast<uint8_t>(v);
+      case CoopElem::S16: return static_cast<int16_t>(v);
+      case CoopElem::U16: return static_cast<uint16_t>(v);
+      default: return static_cast<int32_t>(static_cast<uint32_t>(v));
+    }
+  }
+
+  void exec_coop_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpCoopMma& op, Mask m) {
+    const uint32_t Wd = W_, M = op.m, N = op.n, K = op.k;
+    if (m != all_lanes(Wd))
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "a cooperative-matrix multiply-add with only some lanes of the warp active (it is convergent)");
+    const bool fl = coop_is_float(op.a_type);
+    const bool c_ok = fl ? (op.c_type == CoopElem::F16 || op.c_type == CoopElem::F32) : (op.c_type == CoopElem::S32 || op.c_type == CoopElem::U32);
+    if (!M || !N || !K || N % Wd || (M * K) % Wd || coop_is_float(op.b_type) != fl || !c_ok)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "a cooperative-matrix multiply-add with a shape or element types the layout rules do not take");
+    const bool a_col = K % Wd == 0;
+    const uint32_t a_regs = M * K / Wd, b_regs = K * N / Wd, c_regs = M * N / Wd;
+    if (op.a.size() != a_regs || op.b.size() != b_regs || op.c.size() != c_regs || op.d.size() != c_regs)
+      ctx_fail(ins, -1, Err::UnsupportedPtx, "cooperative-matrix multiply-add register counts do not match the shape (a " + std::to_string(a_regs) + ", b " +
+                                                 std::to_string(b_regs) + ", c and d " + std::to_string(c_regs) + ")");
+    // element (r, c) of register slot s on lane l
+    auto a_pos = [&](uint32_t s, uint32_t l, uint32_t* r, uint32_t* c) {
+      if (a_col) { const uint32_t per = K / Wd; *r = s / per; *c = l + (s % per) * Wd; }
+      else { const uint32_t e = s * Wd + l; *r = e / K; *c = e % K; }
+    };
+    auto col_pos = [&](uint32_t cols, uint32_t s, uint32_t l, uint32_t* r, uint32_t* c) {
+      const uint32_t per = cols / Wd;
+      *r = s / per;
+      *c = l + (s % per) * Wd;
+    };
+    std::vector<float> Af, Bf, Cf;
+    std::vector<int32_t> Ai, Bi, Ci;
+    if (fl) { Af.resize(size_t{M} * K); Bf.resize(size_t{K} * N); Cf.resize(size_t{M} * N); }
+    else { Ai.resize(size_t{M} * K); Bi.resize(size_t{K} * N); Ci.resize(size_t{M} * N); }
+    auto gather = [&](const std::vector<Reg>& regs, uint32_t cols, bool colrule, CoopElem t, auto&& put) {
+      for (uint32_t s = 0; s < regs.size(); ++s) {
+        Lanes sc;
+        const Lanes& v = read_operand(w, ctx, ins, Operand{RegOperand{regs[s]}}, sc);
+        for (uint32_t l = 0; l < Wd; ++l) {
+          uint32_t r, c;
+          if (colrule) col_pos(cols, s, l, &r, &c);
+          else a_pos(s, l, &r, &c);
+          put(r, c, t, v[l]);
+        }
+      }
+    };
+    if (fl) {
+      gather(op.a, K, a_col, op.a_type, [&](uint32_t r, uint32_t c, CoopElem t, uint64_t v) { Af[size_t{r} * K + c] = coop_to_float(t, v); });
+      gather(op.b, N, true, op.b_type, [&](uint32_t r, uint32_t c, CoopElem t, uint64_t v) { Bf[size_t{r} * N + c] = coop_to_float(t, v); });
+      gather(op.c, N, true, op.c_type, [&](uint32_t r, uint32_t c, CoopElem t, uint64_t v) { Cf[size_t{r} * N + c] = coop_to_float(t, v); });
+    } else {
+      gather(op.a, K, a_col, op.a_type, [&](uint32_t r, uint32_t c, CoopElem t, uint64_t v) { Ai[size_t{r} * K + c] = coop_to_int(t, v); });
+      gather(op.b, N, true, op.b_type, [&](uint32_t r, uint32_t c, CoopElem t, uint64_t v) { Bi[size_t{r} * N + c] = coop_to_int(t, v); });
+      gather(op.c, N, true, op.c_type, [&](uint32_t r, uint32_t c, CoopElem t, uint64_t v) { Ci[size_t{r} * N + c] = coop_to_int(t, v); });
+    }
+    // D = C + A * B, products folded in increasing k
+    if (fl) {
+      for (uint32_t r = 0; r < M; ++r)
+        for (uint32_t c = 0; c < N; ++c) {
+          float acc = Cf[size_t{r} * N + c];
+          for (uint32_t k = 0; k < K; ++k) acc = __builtin_fmaf(Af[size_t{r} * K + k], Bf[size_t{k} * N + c], acc);
+          Cf[size_t{r} * N + c] = acc;
+        }
+    } else {
+      for (uint32_t r = 0; r < M; ++r)
+        for (uint32_t c = 0; c < N; ++c) {
+          uint32_t acc = static_cast<uint32_t>(Ci[size_t{r} * N + c]);
+          for (uint32_t k = 0; k < K; ++k) acc += static_cast<uint32_t>(Ai[size_t{r} * K + k]) * static_cast<uint32_t>(Bi[size_t{k} * N + c]);
+          Ci[size_t{r} * N + c] = static_cast<int32_t>(acc);
+        }
+    }
+    for (uint32_t s = 0; s < op.d.size(); ++s) {
+      Lanes out;
+      for (uint32_t l = 0; l < Wd; ++l) {
+        uint32_t r, c;
+        col_pos(N, s, l, &r, &c);
+        if (fl) out[l] = op.c_type == CoopElem::F16 ? uint64_t{simd::f32_to_f16_bits(Cf[size_t{r} * N + c])} : uint64_t{std::bit_cast<uint32_t>(Cf[size_t{r} * N + c])};
+        else out[l] = static_cast<uint32_t>(Ci[size_t{r} * N + c]);
+      }
+      write_reg(w, op.d[s], m, out, coop_bits(op.c_type));
+    }
   }
 
   void exec_mma(Warp& w, const BlockCtx& ctx, const Instr& ins, const OpMma& op, Mask m) {
