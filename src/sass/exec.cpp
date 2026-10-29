@@ -212,6 +212,7 @@ struct Block {
   std::unordered_map<uint32_t, MbarSide> mbar;
   exec::TensorMemory tmem;      // sm_100's Tensor Memory (tcgen05)
   exec::LaunchStats st;   // this block's counts, folded into the launch's
+  exec::memcount::BankMemo bank_memo;   // the bank passes of the shapes this thread's warps have made (memcount::sass_bank_passes_memo)
 };
 
 // A block's state, kept by the host thread between launches: the warps' register files and local memory, the shared memory and the
