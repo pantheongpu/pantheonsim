@@ -1259,6 +1259,7 @@ TIER_HANDLER(h_s2r) {
   TIER_PRELUDE
   if (op.dst == tier::kNoReg) return;
   uint32_t* d = c.R + op.dst * 32u;
+  if (c.r->tier_sreg_fill(*c.blk, *c.w, op.a, d, ex)) return;
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     d[l] = c.r->tier_sreg(*c.blk, *c.w, op.a, l);
