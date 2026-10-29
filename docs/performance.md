@@ -5047,6 +5047,199 @@ With the wide LDS code inside `gcn_tier.cpp` the flat and global handlers read 2
 * **Code placement, not chased**: PTX `atomics` read 0.944x with equal instructions (min cycles 178 M to 197 M): `load_at` (memory.cpp, an `lto_priv` clone) went from 5% to 13% of the cycles; PTX `int_alu` 0.961x (+1% cycles). Both move with any change in the library; memory.cpp is not edited in this round.
 * **SASS atomics, what bounds it** (instruction profile with line numbers, `atomics` workload): no single bound. The lane-address/dedup loop of `exec_mem` (exec_ops.inc 3736 to 3757) is about 12% of the instructions, the operand `fetch` about 4%, the lane loop about 8%, `pthread_mutex_lock` 5%, `batch_addresses_ok` 5%, `load_batch_in`/`store_batch_in` 8%, the rest is spread over the tier and the launch. A register chain for one-word warps measured nothing in round 4; a pre-test for "every lane names one address" would save at most the dedup loop's per-lane compare (est. 4% of the instructions); not done.
 * **PTX `mem`**: `int_bin64_lanes`/`micro_int64` (the 64-bit address arithmetic, 10% + 7%) are plain lane loops of the ALU path; not changed.
+## Round sp8: the memory manager's hot paths (branch `sp8-memmgr`, base a6e80555)
+
+Profiles of the memory workloads (Zen 4 box, one thread, `cycles:u`) put the manager's own functions at 5 to 26% of a row: the PTX atomics spent 26% in `rmw_locate` and its callers, `batch_ok` was 10% of PTX `mem` and 6% of SASS `atomics`, `load_fields` 9 to 11% of `texture`. What bounded each, from `perf annotate`:
+
+* The batch scan (`batch_addresses_ok`) made a min / max / or pass over the 32 addresses (about 11 instructions an address: two conditional moves for the extremes, the range tests) and then asked `HostMaps::may_overlap`, an out-of-line call, on every batch; `sassatom::batchable` and every scalar path called `may_contain` out of line per address.
+* `rmw_batch_fn` called `rmw_load` and `rmw_store` (out of line) per lane with the access width a runtime value: each lane went through a `load_at` switch, the alignment test and a call.
+* A miss in the thread's lookup memory (a kernel that reads one allocation and writes another alternates between two, so every second access missed) hashed the thread pointer a second time and scanned the eight ways from zero; the callers also kept an address-taken `base` local (a stack protector frame in `rmw_locate`).
+* `load_at` and `store_at` were out-of-line clones (5% of PTX `mem`) carrying their byte-wise fallback.
+
+What changed (`src/core/memory.cpp`, `include/vgpu/memory.hpp`):
+
+* `batch_addresses_ok`: an `or` of the addresses and one `(address - base) >= limit` flag each; a host mapping is ruled out for the whole allocation by one range test (`host_map_free_span`: the allocation lies in the device windows and no host buffer was ever mapped inside one), and only otherwise is each address asked. Same answers: an address inside the allocation is a device address, so `may_contain` cannot say yes for it unless a host buffer sits in a device window.
+* `HostMaps::may_contain` / `may_overlap` are `always_inline` (no lock is added anywhere: the host-map rule stands, the checks are the same relaxed loads).
+* `load_at` / `store_at`: the aligned access inline, the byte-wise path a cold noinline function.
+* `rmw_batch_fn`: the plain (not lock-free) loop runs with the width a constant (1, 2, 4, 8) and `rmw_load` / `rmw_store` inline.
+* `find_ordinary_miss` takes the caller's lookup memory, tries the way that answered before the last one first (`LookupMemory::prev`), and returns the allocation and base in registers.
+* `run_allocation` tests alignment with a mask (`unit` is a power of two there), not two divisions.
+
+### Results (Zen 4 box, cpu 2, 1 thread; B/A, 11 alternating runs; A is the base commit built the same way)
+
+| row | bench.py B/A (p) | perf stat cycles B/A | instructions B/A |
+| --- | --- | --- | --- |
+| PTX `atomics` | **1.36x** (< 0.001) | 0.73 | 0.81 |
+| SASS `mem` | 1.045x (< 0.001) | 0.95 to 0.98 | 0.98 |
+| PTX `mem` | 1.005x | 0.96 to 1.01 | 0.98 |
+| SASS `atomics` | 1.02x | 0.97 to 0.99 | 0.99 |
+| SASS `shared` | 1.02x | 0.98 | 1.00 |
+| PTX `texture` | 1.02x | 0.97 to 0.98 | 0.98 |
+| SASS `texture` | 1.02x | 0.98 | 0.98 |
+| AMD `atomics` (mi300x / rx6800) | **1.13x / 1.08x** | | counters identical |
+| AMD `buf` (mi300x / rx6800) | **1.07x / 1.06x** | | |
+| AMD `flat` (mi300x / rx6800) | 1.03x / 1.06x | | |
+| AMD `launch` mi300x | 1.05x | | |
+
+The A/A control (the same build under two paths) moves `mem` by up to 4 to 5% in the median ratio and the other rows by 1 to 2%: only PTX `atomics`, the AMD `atomics`/`buf`/`flat` rows and the instruction counts are beyond it. Canaries (SASS and PTX `int_alu f32_fma f64_fma wmma mma_ptx divergent warp local launch api`; AMD `valu_int valu_f32 mfma wave divergent smem lds ldsx api` on mi300x and rx6800) are within 0.98 to 1.02 with equal instructions; one AMD `lds` rx6800 run read 0.93 and the repeat 0.99 (A/A 1.00). Counters are identical in every row.
+
+Tests: `test_memhot_sp8` (new; `load_fields` against one `load_scalar` per field over real, uniform and untouched chunks and across chunk boundaries; the batch and window accepted or declined exactly at the allocation's last element, one past it, below it, misaligned; a host buffer mapped inside the allocation declining the batch that reaches it and not the one beside it; two allocations used alternately across frees of another and of either), plus the existing `test_memfast`, `test_memrmw`, `test_memrmw_lockfree`, `test_memalloc`, `test_memory`, `test_fastpath`, `test_sass_atomics`.
+
+| mutation | result |
+| --- | --- |
+| scan limit `size - 1` short (`a->size - size`) | `test_memhot_sp8` fails |
+| `host_map_free_span` always answers yes in the batch scan | `test_memhot_sp8` and `test_memfast` fail |
+| a stale lookup-memory way answered without revalidation | `test_memhot_sp8` fails |
+| the plain rmw loop does not store an unchanged result when `always_store` is set | `test_memrmw` fails |
+
+### Not done, and negative results
+* `load_fields` in one chunk (one chunk-table read for the record, one range test for the host maps): 0.8% more instructions on `texture`, cycles equal. The function is latency-bound: 24% of its samples sit on the texel load itself and 12% on the chunk-pointer load, both cache misses of a strided texture, not on the checks. Dropped.
+* `LookupMemory` cache-line aligned with the cursors first: SASS `texture` **1.20x more cycles** at 0.98x the instructions (frontend stalls 9 M to 27 M, L1 misses equal). The hot lines of the lookup path collide with the texture's strided stream; the layout the allocator gives by luck is better. Dropped; note that two builds of the same source also differed on SASS `texture` (0.996 and 1.05 in cycles), so a layout of the hot globals (`g_lookup_slots`, the lock epoch, the thread's memory) is worth re-checking after any change near it.
+* `MemoryManager::free` / `remember_freed` / `backing::release`: already reuse the freed node and the chunk array; no cost left to take in the allocation-per-launch path beyond the exclusive lock.
+* `run_allocation`'s mask (two divisions less) is not separable from noise on its own; kept with the rest because it is the same theme and costs nothing.
+## Round sp8: the AMD instruction classes no benchmark exercised (branch `sp8-amdprobe`, base a6e80555)
+
+`bench_amd.hip` has no kernel for DPP, `ds_swizzle`/`ds_permute`, `v_permlane16`, packed 16-bit integers, VOPD, the double-precision functions
+(`ldexp`, `frexp`, conversions, `min`/`max`) or scalar loads of more than four words, so the rounds before this one could not say what they cost.
+This round adds them as a second program (`tools/bench-amd/kernels/bench_amd_probe.hip`, workloads `p_*`: own cache key, so the cached
+`bench_amd` binaries stay valid; `bench.py` runs them on mi300x, rx6800, rx7900xtx and rx9070xt), profiles them, and gives the ones that ran in the
+interpreter a tier handler. Each kernel is self-checking against a host reference bit for bit, and every one of them was also run on a **real
+RX 6800 (gfx1030, server2)** with every result matching: so the references (DPP row and wave directions, the swizzle and permute address rules,
+`v_permlane16`'s selector, the 16-bit wraps) are the hardware's, not the interpreter's own opinion. The binaries (gfx942, gfx1030, gfx1100, gfx1201) are built
+on server2 with the harness's flags and keyed as the harness keys them (server3 has no hipcc).
+
+### Where the time went (perf `cycles:u`, one host thread, A = a6e80555, tier on)
+
+Every instruction of these classes was a tier "no handler" case (none was handed back after a handler started): the interpreter's name ladders and
+per-lane loops ran them.
+
+| workload | where | share |
+| --- | --- | ---: |
+| `p_dpp`, `p_dpp_scan` (mi300x) | `Machine::cross_lane_alu` (the shuffle into a 64-entry array) and `vector_alu` behind it | 55% |
+| `p_perm` | `OpName::operator==` (the string compares of the `ds_*` ladder) 36%, `lds_access` 27%, `write_lane` 13% | 76% |
+| `p_pk16` (mi300x) | `more_alu` (`v_pk_*_u16`, a lambda per lane, `packed_bits` per half) | 72% |
+| `p_f64x` | `vector_alu` lambdas for `v_ldexp_f64` (libm), `v_min/max_f64`, the conversions, `frexp` | 36% |
+| `p_vopd` (rx7900xtx) | `vector_alu` of both halves, the frame of `step_interp` | 55% |
+| `p_smem_wide` | `MemoryManager::load_scalar`, one lookup per word of an `s_load_dwordx16` | 30% |
+| `p_i64` | `v_ffbh_u32` (and, on RDNA, `v_clz_i32_u32`, `v_alignbit_b32` with a 16-bit count) | 13 to 25% |
+| `p_lane`, `p_cmp`, `p_sdwa`, `p_sbuf`, `p_pkf16` (CDNA) | already tier handlers; the host reference of the program dominates | |
+
+### What changed
+
+* **DPP** (`h_int_dpp`, `classify_dpp`): the VOP1/VOP2 integer forms (`v_mov_b32_dpp`, `v_add_u32_dpp`, `v_and_b32_dpp` ...): the first source gathered
+  as `Machine::dpp_shuffle` does (`dpp_from` is its `dpp_source`, row and bank masks, bound_ctrl, FI, DPP8; a control the interpreter refuses is not
+  classified), the operation by the integer lane kernels, written for the lanes the shuffle writes. Float DPP forms and the VOP3 DPP forms stay the interpreter's.
+* **LDS cross-lane**: `ds_swizzle_b32` (bit-mask, quad-perm and rotate patterns) and `ds_permute_b32` in `h_ds` beside `ds_bpermute_b32`.
+* **`v_permlane16_b32`, `v_permlanex16_b32`** with FI and BOUND_CTRL (`h_permlane`).
+* **Packed 16-bit integers** (`v_pk_add/sub/mul_lo/mad/max/min/lshlrev/lshrrev/ashrrev` in `_u16`, `_i16`, `_b16`; `h_pk16`): the two halves as rows through 20
+  lane kernels (the clamped forms of add, sub and mad are their own), `op_sel` and `op_sel_hi` choosing the half each source gives, constants per half as
+  `constant_half` has them. Also `v_ffbh_u32`, `v_ffbl_b32`, `v_ffbh_i32`, and `v_alignbit_b32`/`v_alignbyte_b32` on RDNA3 and RDNA4, whose shift count is a 16-bit operand.
+* **VOPD** (`Machine::tier_vopd`, `classify_vopd`): each half is classified when it is finalized (`decode_one` now finalizes the halves before the pair), and the
+  pair runs X's handler, then Y's with X's destination as it was where Y reads it (both read before either writes), exactly as the interpreter's `Enc::Vopd`
+  case does; a half that hands back (a NaN where the rule is the interpreter's) hands back the pair with the registers as they were.
+* **Double precision**: `v_ldexp_f64`, `v_frexp_mant_f64`, `v_frexp_exp_i32_f64`, `v_cvt_f32_f64`, `v_cvt_i32_f64`, `v_cvt_u32_f64`, `v_cvt_f64_f32` (the interpreter's own
+  expressions as 64-bit lane kernels; `h_l64n` for the 32-bit results) and `v_min_f64`/`v_max_f64` (the float forms' rule: opposite zeros and NaN results go to the interpreter).
+* **Scalar loads**: a `s_load_dwordx2` to `x16` wholly inside one allocation is one `MemoryManager::load_run` (it declines wherever the words one at a time could differ).
+* **A bug the probes found**: RDNA2 decodes the VOP3 `v_ashrrev_i16`, `v_max_i16`, `v_min_i16` as `_e64`, which the `_e64` to `_e32` mapping of the 16-bit forms did not cover:
+  the interpreter stopped with "decoded but not implemented" on any program using them (a real RX 6800 runs them). Fixed in `short_name_of`.
+
+* **RDNA4's 64-bit scalar arithmetic**: `s_add_nc_u64`, `s_sub_nc_u64`, `s_mul_u64` as scalar handlers (every pointer the compiler computes on gfx12 goes through them).
+
+### Results (B/A of medians, 9 alternating runs, one host thread, cpu 4 of server3, counters identical in every row; A = a6e80555)
+
+| workload | mi300x | rx6800 | rx7900xtx | rx9070xt |
+| --- | ---: | ---: | ---: | ---: |
+| `p_dpp` (quad_perm, row_shl/shr/ror, mirror, half-mirror) | **2.18x** | **2.21x** | **2.19x** | **1.84x** |
+| `p_dpp_arch` (wave_shl/rol/shr/ror, row_bcast; row_share, row_xmask) | **2.03x** | **2.18x** | | |
+| `p_dpp_scan` (DPP folded into add, max, and) | **2.34x** | **2.32x** | | |
+| `p_perm` (ds_swizzle, ds_permute, ds_bpermute) | **6.07x** | **6.01x** | **6.25x** | **6.06x** |
+| `p_permlane` | | | **4.36x** | **4.29x** |
+| `p_pk16` (packed 16-bit integers) | **10.2x** | (A cannot run it) | | |
+| `p_vopd` | 0.995 (no pairs on CDNA3) | 1.065 (no pairs) | **11.7x** | **9.4x** |
+| `p_i64` (64-bit integers, ffbh/clz, alignbit) | **1.55x** | **1.35x** | **2.19x** | **2.13x** |
+| `p_f64x` (ldexp, frexp, conversions, min/max) | **2.39x** | **2.24x** | | |
+| `p_smem_wide` (s_load_dwordx2/x8/x16) | **1.62x** | **1.64x** | **1.67x** | **1.45x** |
+| `p_cmp`, `p_sdwa` (VOPD cndmask, alignbit on RDNA3/4) | 0.98, 1.01 | 1.06 (noise), 1.01 | 1.59x, 1.29x | 1.49x, 1.79x |
+| controls `p_lane`, `p_pkf16`, `p_sbuf` (already handlers) | 1.015, 1.07, 1.00 | 1.00, 1.01, 0.99 | | |
+
+(p < 0.001 for every "faster" row except where the ratio is within 2% of 1; the rx9070xt rows were taken before `s_add_nc_u64` was added.)
+
+Canaries (the main program's workloads, B/A of medians, 9 to 21 alternating runs in windows where the box carried load 5 to 40 from the other agents: a row inside 3% is
+noise; counters identical in every row):
+
+| workload | mi300x | rx6800 |
+| --- | ---: | ---: |
+| `valu_int`, `valu_f32`, `valu_f64` | 0.99, 1.00, 1.02 | 0.99, 0.97 to 1.03, 1.04 (noise) |
+| `mfma`, `mfma_bf16`, `mfma_i8`, `smfmac` | 1.02, 1.02, 1.03 to 1.04, 1.01 to 1.07 | |
+| `mfma_f64`, `mfma_f64_4b` | **0.93 to 0.97**, 0.97 to 1.02 (a placement effect, below) | |
+| `wave`, `lds`, `divergent` | 0.99, 1.00, 1.01 | 1.03, 1.02, 1.01 |
+| `smem` (the scalar loads of x1 and x4 now one lookup too) | 1.05 | 1.02 |
+| `buf` (its descriptor is an `s_load_dwordx4`) | **1.11** | **1.20** |
+| `flat`, `launch`, `api` | 1.02, 0.99, 1.00 | 1.01, 1.00, 0.98 |
+
+`flat` on mi300x against the pre-round-1 build (/tmp/base0, d8ec6128's parent): **1.980x** for this tree and 1.958x for a6e80555 (B/A 1.02, p 0.19 in the later run; 1.03 in the first): the 0.978x of the
+earlier A/B does not reproduce; the three builds read the same within 2% once the box is quiet.
+
+### Placement (the lesson of round 1, again)
+
+The first full build read `mfma_f64` 0.944x (p 0.006) with the same instruction count, and `perf stat` (ASLR off, 8 alternating runs each) gave +3.8% cycles. Two causes,
+both frames and not code: a 1 KB array in `tier_vopd` and a 64-byte one in `scalar_load` sat in the frame of `step()` (`tier_mach` is inlined there), which moved every frame
+below it -- `step_interp`, `matrix_multiply_fast` and the stack buffers of the matrix tiles -- so the tile kernel's loads and its store to D alias in the low 12 bits where
+they had not. Both are out of line now (`tier_vopd`, `scalar_load_run` are `noinline`): the frames of `run_groups`, `step_interp` and `matrix_multiply_fast` are the same sizes as in A (0x128, 0x6b8,
+0xfe0) and the cost came down to +1.8% (best of 8: +2.5%). The rest is a 64-byte code line: `matrix_multiply_fast` starts at 0x...690 where A's was at 0x...860, so its hot
+inner loop (+0x2b4c to +0x2b86, 58 bytes) straddles a line one boundary 0x24 bytes into the loop where A's did at 0x14; the loop is unchanged. Not fixed here (it moves with
+every change of the library's layout and cannot be told from the other agents' pieces on this tree); the other matrix rows read 0.99 to 1.03.
+
+### Not done, and negative results
+
+* **Float DPP and the VOP3 DPP forms** (`v_add_f32_dpp`, gfx11's `v_add3_u32_e64_dpp`, `v_mad_co_u64_u32_e64_dpp`): the compiler emits them only where it fuses a `v_mov_b32_dpp` into
+  an arithmetic instruction; the probes show them at 1/12 of the DPP instructions. Left to the interpreter.
+* **True16 forms** (RDNA3/4 `v_mov_b16`, `v_cvt_f16_f32`, `v_pack_b32_f16`): their halves of registers (`.l`/`.h`, op_sel) are not modelled by any handler; `p_sdwa` on rx7900xtx is
+  `v_mov_b16` for 100% of what the interpreter still runs there. A design question (the half-register write), not done here.
+* **`s_atomic_*`**: no target of the harness has them (CDNA3 and RDNA2 to 4 have no scalar atomics), so there is nothing to measure; the interpreter's are untested by a program.
+* **`s_buffer_load` on RDNA3 and RDNA4**: `p_sbuf` has no descriptor layout verified against hardware for them (gfx1100 and gfx1201 are skipped by the probe); on gfx9 and gfx10 the handler
+  already existed (scalar memory is the Machine's `tier_smem`) and the probe reads 1.00x.
+* **`s_load` as one lookup** was dropped in an earlier round for `x1` and `x4` (1.015x); for `x8` and `x16` it is 1.45 to 1.67x (`p_smem_wide`).
+* `p_lane` (readlane, writelane, readfirstlane), `p_cmp`, `p_sdwa` and `p_pkf16` on CDNA3 were already tier handlers: the time of those workloads is the host reference in the program
+  (a libgcc half-float conversion for `p_pkf16`), and no change is made for them.
+
+### Tests (wired in CMake) and the mutations that fail them
+
+* `test_amd_gcn_tier_same_bits` (every instruction of every corpus, tier off against tier on, 21 flavours of state, three seeds, plus its `VGPU_SIMD=base` twin) now also runs the
+  forms `amd/tools/tier-corpus.py` writes for the new handlers: DPP and DPP8 (every control, masks, bound_ctrl, FI), `ds_swizzle` and `ds_permute` offsets, packed 16-bit integers with
+  `op_sel`/`op_sel_hi`/clamp and every operand kind, VOPD pairs of every instruction pair (independent, Y reading X's result, constants and literals, high registers),
+  `v_permlane16/x16`, the double-precision functions with modifiers, and `s_add_nc_u64`. New corpora: `isa_corpus_tier_gfx1030/1100/1201.txt` (only what the new handlers
+  take; the CDNA files only gained lines, none was removed). 33 142 shapes, 786 564 runs each way, 0 differing (Release; AVX2 and base).
+* `test_amd_gcn_probe_forms` (new): RDNA2's VOP3 `v_ashrrev_i16`, `v_max_i16`, `v_min_i16` run, tier on and off, in every state flavour.
+* `test_amd_gcn_same_bits`: 16 806 of 16 809 recorded digests unchanged; three (the gfx1030 VOP3 16-bit instructions above) were the text of "decoded but not implemented" and are
+  recorded from this tree (noted in the test), the instructions being checked against a real RX 6800 by `p_pk16`.
+* `bench_amd_counters`: the 29 new workload/target pairs of the probe program, 66 pairs in all, identical with the tier on and off (VGPU_AMD_TIER=0), and the 37 old ones unchanged.
+
+Mutations (a one-line change on server3, the restricted test named failed, reverted; all 15 failed their test):
+
+| # | mutation | result |
+| --- | --- | --- |
+| M1 | DPP `row_shr` reads `row + ((in_row + n) & 15)` | tier digest (`row_shr`) fails |
+| M2 | `ds_swizzle` xor mask taken from the or field | tier digest (`ds_swizzle`) fails |
+| M3 | `ds_permute` address shifted by 3 instead of 2 | tier digest (`ds_permute`) fails |
+| M4 | packed integers: the high result's `op_sel_hi` bit ignored | tier digest (`v_pk_add_u16`) fails |
+| M5 | packed integers: the clamped kernels never taken | tier digest (`v_pk_sub_i16`) fails |
+| M6 | VOPD: Y never sees X's destination as it was | tier digest (`v_dual`) fails |
+| M7 | `v_permlanex16` reads its own row | tier digest (`v_permlanex16`) fails |
+| M8 | `v_min_f64`: opposite zeros not handed back | tier digest (`v_min_f64`) fails |
+| M9 | `v_cvt_u32_f64` of a negative: `x < 0` for `!(x > 0)` (a NaN) | tier digest (`v_cvt_u32_f64`) fails |
+| M10 | `v_ldexp_f64`'s exponent masked to 16 bits | tier digest (`v_ldexp_f64`) fails |
+| M11 | `v_ffbh_u32` of zero is 0, not -1 | tier digest (`v_ffbh_u32`) fails |
+| M12 | `s_load_dwordx2..x16` words stored in reverse | `test_amd_gcn_same_bits` fails (160 instructions) |
+| M13 | the `_e64` to `_e32` mapping of the three 16-bit integer instructions off | `test_amd_gcn_probe_forms` fails |
+| M14 | DPP `bound_ctrl` ignored | tier digest (`bound_ctrl`) fails |
+| M15 | `s_add_nc_u64` off by one | tier digest (`s_add_nc_u64`) fails |
+
+Sanitizers: ASan+UBSan at -O0 (`ASAN_OPTIONS=detect_leaks=1`, `UBSAN_OPTIONS=halt_on_error=1`) of `test_amd_gcn_probe_forms` and of `test_amd_gcn_tier_same_bits` restricted (`VGPU_TIER_ONLY`) to the
+new handlers' instructions (DPP, swizzle, permute, packed integers, permlane, min/max/ldexp/frexp/cvt, ffbh, `s_add_nc_u64`, a VOPD pair) pass; the whole corpus under ASan (three to five times the
+2700 s of before) and a TSan build (no new threaded code) were not run here. Release: the guards (`gcn_same_bits`, `gcn_packed_same_bits`, `gcn_memory_same_bits`, `codeobject_same_bits`, `matrix_fast`,
+`mfma_math`, `nan_order`, the other `test_amd_gcn_*`) and the whole tier digest, AVX2 and `VGPU_SIMD=base`, pass.
+
 
 ### Round sp8: the AVX-512 tile kernels are the default where the CPU has them
 

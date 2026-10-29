@@ -296,6 +296,8 @@ option(VGPU_TEST_FAST_LINK "Link unit tests without LTO (the vgpu archive carrie
 # The wide LDS accesses of the AMD tier (see the header) are compiled outside link-time optimization: inside the tier's unit they moved the
 # inlining and the layout of the unrelated memory handlers.
 set_source_files_properties(amd/src/gcn_tier_ds.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+# The memory manager's hot paths: outside link-time optimization too, so the executors' code is laid out as it was without them.
+set_source_files_properties(src/core/memory.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set_target_properties(vgpu PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
   target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
@@ -1354,6 +1356,8 @@ vgpu_unit_test(test_memfast)
 vgpu_unit_test(test_memalloc)
 # The one-lookup read-modify-write and multi-field read, against the load_scalar / store_scalar calls they replace.
 vgpu_unit_test(test_memrmw)
+# The sp8 hot paths (load_fields in one chunk, the batch address scan, the host-map span test) at their boundaries.
+vgpu_unit_test(test_memhot_sp8)
 # The warp's local memory, interleaved by words, against the per-lane layout it replaced.
 vgpu_unit_test(test_locallayout)
 # The lock-free read-modify-write (atomic_rmw) against load_scalar / the operation / store_scalar, and from threads.
@@ -1569,6 +1573,9 @@ target_compile_definitions(test_amd_gcn_memory_same_bits PRIVATE VGPU_SOURCE_DIR
 # The pre-decoded tier against the interpreter over the same corpora (amd/tests/unit/test_gcn_tier_same_bits.cpp).
 vgpu_unit_test(test_amd_gcn_tier_same_bits amd/tests/unit/test_gcn_tier_same_bits.cpp)
 target_compile_definitions(test_amd_gcn_tier_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The forms the AMD probe workloads found missing (RDNA2's VOP3 16-bit integer spellings), against the interpreter.
+vgpu_unit_test(test_amd_gcn_probe_forms amd/tests/unit/test_gcn_probe_forms.cpp)
+target_compile_definitions(test_amd_gcn_probe_forms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Scratch, LDS atomics, a cross-lane read, and flat pointers.
 vgpu_unit_test(test_amd_gcn_memory amd/tests/unit/test_gcn_memory.cpp)
 target_compile_definitions(test_amd_gcn_memory PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
