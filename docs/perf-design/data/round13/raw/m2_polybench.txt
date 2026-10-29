@@ -1,0 +1,114 @@
+=== 2DCONV
+000000 _Z20convolution2D_kerneliiPfS_           grid 128x512x1 block 32x8x1 mem  128.0 MiB changed   64.0 MiB chunks 2048 bad 0 words 0 maxulp 0 | card kernel     291.2 us push   10.61 ms pull   76.18 ms | sim   566.993 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/2DCONV: agree 1 differ 0 card-nondeterministic 0 failed/skipped 0
+=== 2MM
+000000 _Z11mm2_kernel1iiiiffPfS_S_              grid 64x256x1 block 32x8x1 mem   80.0 MiB changed   16.0 MiB chunks 1280 bad 0 words 0 maxulp 0 | card kernel   25975.2 us push    6.89 ms pull   47.94 ms | sim 57683.954 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/2MM: agree 1 differ 0 card-nondeterministic 0 failed/skipped 1
+=== 3DCONV
+000000 _Z20convolution3D_kerneliiiPfS_i         grid 8x32x1 block 32x8x1 mem  128.0 MiB changed    0.2 MiB chunks 2048 bad 0 words 0 maxulp 0 | card kernel      27.9 us push   10.65 ms pull   74.03 ms | sim     3.271 ms | AGREE 
+000001 _Z20convolution3D_kerneliiiPfS_i         grid 8x32x1 block 32x8x1 mem  128.0 MiB changed    0.2 MiB chunks 2048 bad 0 words 0 maxulp 0 | card kernel      22.4 us push   10.61 ms pull   76.11 ms | sim     2.732 ms | AGREE 
+000002 _Z20convolution3D_kerneliiiPfS_i         grid 8x32x1 block 32x8x1 mem  128.0 MiB changed    0.2 MiB chunks 2048 bad 0 words 0 maxulp 0 | card kernel      23.5 us push   10.64 ms pull   76.25 ms | sim     2.817 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/3DCONV: agree 3 differ 0 card-nondeterministic 0 failed/skipped 0
+=== 3MM
+000000 _Z11mm3_kernel1iiiiiPfS_S_               grid 16x64x1 block 32x8x1 mem    7.0 MiB changed    1.0 MiB chunks 112 bad 0 words 0 maxulp 0 | card kernel     426.6 us push    1.08 ms pull    4.53 ms | sim   861.646 ms | AGREE 
+000001 _Z11mm3_kernel2iiiiiPfS_S_               grid 16x64x1 block 32x8x1 mem    7.0 MiB changed    1.0 MiB chunks 112 bad 0 words 0 maxulp 0 | card kernel     374.1 us push    1.07 ms pull    1.56 ms | sim   840.461 ms | AGREE 
+000002 _Z11mm3_kernel3iiiiiPfS_S_               grid 16x64x1 block 32x8x1 mem    7.0 MiB changed    0.0 MiB chunks 112 bad 0 words 0 maxulp 0 | card kernel     384.2 us push    1.10 ms pull    1.57 ms | sim   862.897 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/3MM: agree 3 differ 0 card-nondeterministic 0 failed/skipped 0
+=== ADI
+000000 _Z11adi_kernel1iPfS_S_                   grid 4x1x1 block 256x1x1 mem   12.0 MiB changed    8.0 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel    1493.0 us push    1.16 ms pull    7.15 ms | sim    83.751 ms | AGREE 
+000001 _Z11adi_kernel2iPfS_S_                   grid 4x1x1 block 256x1x1 mem   12.0 MiB changed    4.0 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel      17.1 us push    1.17 ms pull    2.00 ms | sim     0.418 ms | AGREE 
+000002 _Z11adi_kernel3iPfS_S_                   grid 4x1x1 block 256x1x1 mem   12.0 MiB changed    4.0 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel     792.4 us push    1.16 ms pull    1.98 ms | sim    42.514 ms | AGREE 
+000003 _Z11adi_kernel4iPfS_S_i                  grid 4x1x1 block 256x1x1 mem   12.0 MiB changed    0.1 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel      16.6 us push    1.14 ms pull    1.97 ms | sim     0.351 ms | AGREE 
+000004 _Z11adi_kernel4iPfS_S_i                  grid 4x1x1 block 256x1x1 mem   12.0 MiB changed    0.1 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel      16.1 us push    1.16 ms pull    1.98 ms | sim     0.193 ms | AGREE 
+000005 _Z11adi_kernel4iPfS_S_i                  grid 4x1x1 block 256x1x1 mem   12.0 MiB changed    0.1 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel      17.1 us push    1.23 ms pull    1.97 ms | sim     0.197 ms | AGREE 
+000006 _Z11adi_kernel5iPfS_S_                   grid 4x1x1 block 256x1x1 mem   12.0 MiB changed    0.1 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel      17.0 us push    1.18 ms pull    2.01 ms | sim     0.319 ms | AGREE 
+000007 _Z11adi_kernel6iPfS_S_i                  grid 4x1x1 block 256x1x1 mem   12.0 MiB changed    0.1 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel      17.5 us push    1.15 ms pull    1.97 ms | sim     0.296 ms | AGREE 
+000008 _Z11adi_kernel6iPfS_S_i                  grid 4x1x1 block 256x1x1 mem   12.0 MiB changed    0.1 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel      17.4 us push    1.16 ms pull    1.96 ms | sim     0.183 ms | AGREE 
+000009 _Z11adi_kernel6iPfS_S_i                  grid 4x1x1 block 256x1x1 mem   12.0 MiB changed    0.1 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel      16.6 us push    1.13 ms pull    1.97 ms | sim     0.167 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/ADI: agree 10 differ 0 card-nondeterministic 0 failed/skipped 0
+=== ATAX
+000000 _Z12atax_kernel1iiPfS_S_                 grid 128x1x1 block 32x8x1 mem   64.0 MiB changed    0.0 MiB chunks 1027 bad 0 words 0 maxulp 0 | card kernel    1389.2 us push    5.38 ms pull   37.86 ms | sim  1150.723 ms | AGREE 
+000001 _Z12atax_kernel2iiPfS_S_                 grid 128x1x1 block 32x8x1 mem   64.0 MiB changed    0.0 MiB chunks 1027 bad 0 words 0 maxulp 0 | card kernel    1531.7 us push    5.39 ms pull   36.72 ms | sim   849.738 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/ATAX: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== BICG
+000000 _Z12bicg_kernel1iiPfS_S_                 grid 16x1x1 block 256x1x1 mem   64.1 MiB changed    0.0 MiB chunks 1028 bad 0 words 0 maxulp 0 | card kernel    1507.2 us push    5.42 ms pull   37.33 ms | sim   113.447 ms | AGREE 
+000001 _Z12bicg_kernel2iiPfS_S_                 grid 16x1x1 block 256x1x1 mem   64.1 MiB changed    0.0 MiB chunks 1028 bad 0 words 0 maxulp 0 | card kernel     753.9 us push    5.43 ms pull   37.21 ms | sim   142.111 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/BICG: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== CORR
+000000 _Z11mean_kerneliiPfS_                    grid 8x1x1 block 256x1x1 mem   32.0 MiB changed    0.0 MiB chunks 514 bad 0 words 0 maxulp 0 | card kernel     803.8 us push    2.83 ms pull   19.70 ms | sim    15.954 ms | AGREE 
+000001 _Z10std_kerneliiPfS_S_                   grid 8x1x1 block 256x1x1 mem   32.0 MiB changed    0.0 MiB chunks 514 bad 0 words 0 maxulp 0 | card kernel     771.7 us push    2.80 ms pull   18.45 ms | sim    21.887 ms | AGREE 
+000002 _Z13reduce_kerneliiPfS_S_                grid 64x256x1 block 32x8x1 mem   32.0 MiB changed   16.0 MiB chunks 514 bad 0 words 0 maxulp 0 | card kernel      85.2 us push    2.80 ms pull   11.90 ms | sim   193.727 ms | AGREE 
+000003 _Z11corr_kerneliiPfS_                    grid 8x1x1 block 256x1x1 mem   32.0 MiB changed   16.0 MiB chunks 514 bad 0 words 0 maxulp 0 | card kernel 1670832.3 us push    2.81 ms pull    4.89 ms | sim 36110.686 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/CORR: agree 4 differ 0 card-nondeterministic 0 failed/skipped 0
+=== COVAR
+000000 _Z11mean_kerneliiPfS_                    grid 8x1x1 block 256x1x1 mem   32.0 MiB changed    0.0 MiB chunks 513 bad 0 words 0 maxulp 0 | card kernel     772.6 us push    2.82 ms pull   19.74 ms | sim    15.565 ms | AGREE 
+000001 _Z13reduce_kerneliiPfS_                  grid 64x64x1 block 32x8x1 mem   32.0 MiB changed    4.0 MiB chunks 513 bad 0 words 0 maxulp 0 | card kernel      33.3 us push    2.81 ms pull   18.36 ms | sim    21.002 ms | AGREE 
+000002 _Z12covar_kerneliiPfS_                   grid 8x1x1 block 256x1x1 mem   32.0 MiB changed   16.0 MiB chunks 513 bad 0 words 0 maxulp 0 | card kernel 1670671.0 us push    2.80 ms pull   11.62 ms | sim 35386.401 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/COVAR: agree 3 differ 0 card-nondeterministic 0 failed/skipped 0
+=== FDTD-2D
+000000 _Z17fdtd_step1_kerneliiPfS_S_S_i         grid 64x256x1 block 32x8x1 mem   48.0 MiB changed   16.0 MiB chunks 769 bad 0 words 0 maxulp 0 | card kernel     127.5 us push    4.14 ms pull   29.25 ms | sim    98.101 ms | AGREE 
+000001 _Z17fdtd_step2_kerneliiPfS_S_i           grid 64x256x1 block 32x8x1 mem   48.0 MiB changed   16.0 MiB chunks 769 bad 0 words 0 maxulp 0 | card kernel     119.8 us push    4.14 ms pull   27.53 ms | sim    97.612 ms | AGREE 
+000002 _Z17fdtd_step3_kerneliiPfS_S_i           grid 64x256x1 block 32x8x1 mem   48.0 MiB changed   16.0 MiB chunks 769 bad 0 words 0 maxulp 0 | card kernel     152.2 us push    4.10 ms pull    7.34 ms | sim   114.406 ms | AGREE 
+000003 _Z17fdtd_step1_kerneliiPfS_S_S_i         grid 64x256x1 block 32x8x1 mem   48.0 MiB changed   16.0 MiB chunks 769 bad 0 words 0 maxulp 0 | card kernel     120.5 us push    4.10 ms pull   27.82 ms | sim    97.877 ms | AGREE 
+000004 _Z17fdtd_step2_kerneliiPfS_S_i           grid 64x256x1 block 32x8x1 mem   48.0 MiB changed   16.0 MiB chunks 769 bad 0 words 0 maxulp 0 | card kernel     120.3 us push    4.09 ms pull   27.88 ms | sim    97.072 ms | AGREE 
+000005 _Z17fdtd_step3_kerneliiPfS_S_i           grid 64x256x1 block 32x8x1 mem   48.0 MiB changed   16.0 MiB chunks 769 bad 0 words 0 maxulp 0 | card kernel     180.5 us push    4.08 ms pull   27.85 ms | sim   114.653 ms | AGREE 
+000006 _Z17fdtd_step1_kerneliiPfS_S_S_i         grid 64x256x1 block 32x8x1 mem   48.0 MiB changed   16.0 MiB chunks 769 bad 0 words 0 maxulp 0 | card kernel     140.5 us push    4.09 ms pull   27.47 ms | sim    98.245 ms | AGREE 
+000007 _Z17fdtd_step2_kerneliiPfS_S_i           grid 64x256x1 block 32x8x1 mem   48.0 MiB changed   16.0 MiB chunks 769 bad 0 words 0 maxulp 0 | card kernel     121.1 us push    4.09 ms pull   27.97 ms | sim    97.546 ms | AGREE 
+000008 _Z17fdtd_step3_kerneliiPfS_S_i           grid 64x256x1 block 32x8x1 mem   48.0 MiB changed   16.0 MiB chunks 769 bad 0 words 0 maxulp 0 | card kernel     152.0 us push    4.11 ms pull   27.66 ms | sim   114.128 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/FDTD-2D: agree 9 differ 0 card-nondeterministic 0 failed/skipped 0
+=== GEMM
+000000 _Z11gemm_kerneliiiffPfS_S_               grid 16x64x1 block 32x8x1 mem    3.0 MiB changed    1.0 MiB chunks 48 bad 0 words 0 maxulp 0 | card kernel     377.9 us push    0.47 ms pull    1.93 ms | sim   900.803 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/GEMM: agree 1 differ 0 card-nondeterministic 0 failed/skipped 0
+=== GEMVER
+000000 _Z14gemver_kernel1iffPfS_S_S_S_          grid 128x512x1 block 32x8x1 mem   64.1 MiB changed   64.0 MiB chunks 1032 bad 0 words 0 maxulp 0 | card kernel     294.3 us push    5.51 ms pull   38.17 ms | sim   516.456 ms | AGREE 
+000001 _Z14gemver_kernel2iffPfS_S_S_            grid 16x1x1 block 256x1x1 mem   64.1 MiB changed    0.0 MiB chunks 1032 bad 0 words 0 maxulp 0 | card kernel    1509.6 us push    5.44 ms pull   36.92 ms | sim   113.614 ms | AGREE 
+000002 _Z14gemver_kernel3iffPfS_S_              grid 16x1x1 block 256x1x1 mem   64.1 MiB changed    0.0 MiB chunks 1032 bad 0 words 0 maxulp 0 | card kernel     784.2 us push    5.40 ms pull   37.35 ms | sim   145.578 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/GEMVER: agree 3 differ 0 card-nondeterministic 0 failed/skipped 0
+=== GESUMMV
+000000 _Z14gesummv_kerneliffPfS_S_S_S_          grid 16x1x1 block 256x1x1 mem  128.0 MiB changed    0.0 MiB chunks 2051 bad 0 words 0 maxulp 0 | card kernel    1607.3 us push   10.76 ms pull   74.73 ms | sim   343.192 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/GESUMMV: agree 1 differ 0 card-nondeterministic 0 failed/skipped 0
+=== GRAMSCHM
+000000 _Z19gramschmidt_kernel1iiPfS_S_i         grid 1x1x1 block 256x1x1 mem   48.0 MiB changed    0.0 MiB chunks 768 bad 0 words 0 maxulp 0 | card kernel     210.1 us push    4.12 ms pull   29.51 ms | sim     0.729 ms | AGREE 
+000001 _Z19gramschmidt_kernel2iiPfS_S_i         grid 8x1x1 block 256x1x1 mem   48.0 MiB changed   16.0 MiB chunks 768 bad 0 words 0 maxulp 0 | card kernel      20.8 us push    4.08 ms pull   27.58 ms | sim     4.515 ms | AGREE 
+000002 _Z19gramschmidt_kernel3iiPfS_S_i         grid 8x1x1 block 256x1x1 mem   48.0 MiB changed   16.1 MiB chunks 768 bad 0 words 0 maxulp 0 | card kernel    1476.9 us push    4.09 ms pull   27.73 ms | sim    66.431 ms | AGREE 
+000003 _Z19gramschmidt_kernel1iiPfS_S_i         grid 1x1x1 block 256x1x1 mem   48.0 MiB changed    0.1 MiB chunks 768 bad 0 words 0 maxulp 0 | card kernel     205.7 us push    4.09 ms pull   27.56 ms | sim     0.343 ms | AGREE 
+000004 _Z19gramschmidt_kernel2iiPfS_S_i         grid 8x1x1 block 256x1x1 mem   48.0 MiB changed   16.0 MiB chunks 768 bad 0 words 0 maxulp 0 | card kernel      22.4 us push    4.09 ms pull   28.28 ms | sim     0.253 ms | AGREE 
+000005 _Z19gramschmidt_kernel3iiPfS_S_i         grid 8x1x1 block 256x1x1 mem   48.0 MiB changed    0.1 MiB chunks 768 bad 0 words 0 maxulp 0 | card kernel    1488.3 us push    4.10 ms pull   27.56 ms | sim    66.735 ms | AGREE 
+000006 _Z19gramschmidt_kernel1iiPfS_S_i         grid 1x1x1 block 256x1x1 mem   48.0 MiB changed    0.1 MiB chunks 768 bad 0 words 0 maxulp 0 | card kernel     207.6 us push    4.09 ms pull   27.63 ms | sim     0.356 ms | AGREE 
+000007 _Z19gramschmidt_kernel2iiPfS_S_i         grid 8x1x1 block 256x1x1 mem   48.0 MiB changed   16.0 MiB chunks 768 bad 0 words 0 maxulp 0 | card kernel      22.3 us push    4.11 ms pull   27.89 ms | sim     0.260 ms | AGREE 
+000008 _Z19gramschmidt_kernel3iiPfS_S_i         grid 8x1x1 block 256x1x1 mem   48.0 MiB changed    0.1 MiB chunks 768 bad 0 words 0 maxulp 0 | card kernel    1479.0 us push    4.11 ms pull   28.45 ms | sim    66.188 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/GRAMSCHM: agree 9 differ 0 card-nondeterministic 0 failed/skipped 0
+=== JACOBI1D
+000000 _Z21runJacobiCUDA_kernel1iPfS_           grid 16x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel      18.0 us push    0.03 ms pull    0.05 ms | sim     0.627 ms | AGREE 
+000001 _Z21runJacobiCUDA_kernel2iPfS_           grid 16x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel       9.8 us push    0.03 ms pull    0.03 ms | sim     0.157 ms | AGREE 
+000002 _Z21runJacobiCUDA_kernel1iPfS_           grid 16x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel       9.7 us push    0.03 ms pull    0.03 ms | sim     0.167 ms | AGREE 
+000003 _Z21runJacobiCUDA_kernel2iPfS_           grid 16x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel      25.9 us push    0.03 ms pull    0.03 ms | sim     0.145 ms | AGREE 
+000004 _Z21runJacobiCUDA_kernel1iPfS_           grid 16x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel      10.6 us push    0.03 ms pull    0.03 ms | sim     0.167 ms | AGREE 
+000005 _Z21runJacobiCUDA_kernel2iPfS_           grid 16x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel       9.6 us push    0.03 ms pull    0.03 ms | sim     0.128 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/JACOBI1D: agree 6 differ 0 card-nondeterministic 0 failed/skipped 0
+=== JACOBI2D
+000000 _Z21runJacobiCUDA_kernel1iPfS_           grid 32x125x1 block 32x8x1 mem    7.6 MiB changed    3.8 MiB chunks 124 bad 0 words 0 maxulp 0 | card kernel      30.9 us push    0.76 ms pull    4.44 ms | sim    26.607 ms | AGREE 
+000001 _Z21runJacobiCUDA_kernel2iPfS_           grid 32x125x1 block 32x8x1 mem    7.6 MiB changed    3.8 MiB chunks 124 bad 0 words 0 maxulp 0 | card kernel      24.5 us push    0.73 ms pull    1.22 ms | sim    20.316 ms | AGREE 
+000002 _Z21runJacobiCUDA_kernel1iPfS_           grid 32x125x1 block 32x8x1 mem    7.6 MiB changed    3.8 MiB chunks 124 bad 0 words 0 maxulp 0 | card kernel      25.9 us push    0.74 ms pull    1.25 ms | sim    26.098 ms | AGREE 
+000003 _Z21runJacobiCUDA_kernel2iPfS_           grid 32x125x1 block 32x8x1 mem    7.6 MiB changed    3.8 MiB chunks 124 bad 0 words 0 maxulp 0 | card kernel      24.1 us push    0.74 ms pull    1.23 ms | sim    20.259 ms | AGREE 
+000004 _Z21runJacobiCUDA_kernel1iPfS_           grid 32x125x1 block 32x8x1 mem    7.6 MiB changed    3.8 MiB chunks 124 bad 0 words 0 maxulp 0 | card kernel      25.4 us push    0.75 ms pull    1.23 ms | sim    26.371 ms | AGREE 
+000005 _Z21runJacobiCUDA_kernel2iPfS_           grid 32x125x1 block 32x8x1 mem    7.6 MiB changed    3.8 MiB chunks 124 bad 0 words 0 maxulp 0 | card kernel      23.1 us push    0.73 ms pull    1.23 ms | sim    20.170 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/JACOBI2D: agree 6 differ 0 card-nondeterministic 0 failed/skipped 0
+=== LU
+000000 _Z10lu_kernel1iPfi                       grid 8x1x1 block 256x1x1 mem   16.0 MiB changed    0.1 MiB chunks 256 bad 0 words 0 maxulp 0 | card kernel      24.5 us push    1.33 ms pull    9.46 ms | sim     0.818 ms | AGREE 
+000001 _Z10lu_kernel2iPfi                       grid 64x256x1 block 32x8x1 mem   16.0 MiB changed   16.0 MiB chunks 256 bad 0 words 0 maxulp 0 | card kernel      84.4 us push    1.57 ms pull    2.47 ms | sim   106.139 ms | AGREE 
+000002 _Z10lu_kernel1iPfi                       grid 8x1x1 block 256x1x1 mem   16.0 MiB changed    0.1 MiB chunks 256 bad 0 words 0 maxulp 0 | card kernel      18.0 us push    1.30 ms pull    2.45 ms | sim     0.213 ms | AGREE 
+000003 _Z10lu_kernel2iPfi                       grid 64x256x1 block 32x8x1 mem   16.0 MiB changed   16.0 MiB chunks 256 bad 0 words 0 maxulp 0 | card kernel      84.6 us push    1.35 ms pull    2.45 ms | sim   106.558 ms | AGREE 
+000004 _Z10lu_kernel1iPfi                       grid 8x1x1 block 256x1x1 mem   16.0 MiB changed    0.1 MiB chunks 256 bad 0 words 0 maxulp 0 | card kernel      19.3 us push    1.31 ms pull    2.45 ms | sim     0.227 ms | AGREE 
+000005 _Z10lu_kernel2iPfi                       grid 64x256x1 block 32x8x1 mem   16.0 MiB changed   16.0 MiB chunks 256 bad 0 words 0 maxulp 0 | card kernel      82.4 us push    1.30 ms pull    2.48 ms | sim   106.208 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/LU: agree 6 differ 0 card-nondeterministic 0 failed/skipped 0
+=== MVT
+000000 _Z11mvt_kernel1iPfS_S_                   grid 128x1x1 block 32x8x1 mem   64.1 MiB changed    0.0 MiB chunks 1028 bad 0 words 0 maxulp 0 | card kernel    1388.4 us push    5.45 ms pull   38.17 ms | sim  1162.357 ms | AGREE 
+000001 _Z11mvt_kernel2iPfS_S_                   grid 128x1x1 block 32x8x1 mem   64.1 MiB changed    0.0 MiB chunks 1028 bad 0 words 0 maxulp 0 | card kernel    1530.3 us push    5.41 ms pull   37.05 ms | sim   839.354 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/MVT: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== SYR2K
+000000 _Z12syr2k_kerneliiffPfS_S_               grid 32x128x1 block 32x8x1 mem   12.0 MiB changed    4.0 MiB chunks 192 bad 0 words 0 maxulp 0 | card kernel   17376.7 us push    1.16 ms pull    7.07 ms | sim 17597.376 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/SYR2K: agree 1 differ 0 card-nondeterministic 0 failed/skipped 0
+=== SYRK
+000000 _Z11syrk_kerneliiffPfS_                  grid 32x128x1 block 32x8x1 mem    8.0 MiB changed    4.0 MiB chunks 128 bad 0 words 0 maxulp 0 | card kernel    8929.4 us push    0.76 ms pull    4.72 ms | sim  9131.390 ms | AGREE 
+SUMMARY /home/ubuntu/corp/poly/SYRK: agree 1 differ 0 card-nondeterministic 0 failed/skipped 0

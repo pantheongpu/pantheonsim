@@ -1,0 +1,13 @@
+programs 64 with launches 58
+launches 34236.0 in the exact set 25722.0 consecutive in-set with no host copy between 21087.0 offloaded: write-through 4499.0 persistent 4869.0
+sum of device time over all programs: off 629.1 s, write-through 439.4 s, persistent 357.7 s, per-allocation reach 357.7 s
+programs with >3 s of simulation that write-through already offloads: 6
+  hec_aligned-types-cuda     off   64.0  wt    8.9  persistent    1.5  gain 5.93x
+  hec_babelstream-cuda       off   31.3  wt   26.0  persistent    5.6  gain 4.64x
+  hec_base64e-cuda           off   58.0  wt   11.7  persistent    1.7  gain 6.93x
+  poly_FDTD-2D               off   57.8  wt   24.2  persistent    0.8  gain 32.16x
+  poly_GRAMSCHM              off   52.4  wt   39.4  persistent   25.4  gain 1.55x
+  poly_LU                    off   55.7  wt   20.0  persistent   14.2  gain 1.41x
+programs with persistent/write-through >= 1.5x: 8 ['hec_aligned-types-cuda', 'hec_axpby-cuda', 'hec_babelstream-cuda', 'hec_base64e-cuda', 'poly_FDTD-2D', 'poly_GRAMSCHM', 'poly_JACOBI2D', 'rod_needle']
+their launches 3571, offloaded by persistent 1773; device time off 264.8 wt 111.0 persistent 35.1
+programs where persistent offloads something: 15 ; write-through: 15

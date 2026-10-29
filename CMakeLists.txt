@@ -270,6 +270,7 @@ add_library(vgpu STATIC
   src/exec/devrt.cpp
   src/exec/worker_pool.cpp
   src/runtime/runtime.cpp
+  src/runtime/host_gpu.cpp
   src/runtime/shared_runtime.cpp
   src/runtime/visible_devices.cpp
   nvidia/src/device_attributes.cpp
@@ -286,6 +287,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set_source_files_properties(amd/src/gcn_exec.cpp PROPERTIES COMPILE_OPTIONS "-fno-fp-int-builtin-inexact")
 endif()
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
+target_link_libraries(vgpu PUBLIC ${CMAKE_DL_LIBS})
 
 # With LTO on, every executable that links this archive re-optimises all of it
 # at link time. The ~90 unit tests did that on CI: 11 of the 16 minutes of a
@@ -1305,6 +1307,8 @@ endfunction()
 
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_check_compare)
+vgpu_unit_test(test_host_gpu_logic)
+vgpu_unit_test(test_card_gate)
 target_include_directories(test_check_compare PRIVATE src/cli)
 vgpu_unit_test(test_profile)
 # What every shim call does around its body: ApiCall's reports, depth and argument hand-over, the inline flags.
@@ -3538,6 +3542,16 @@ set_tests_properties(e2e_sass_tier PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 3600)
+
+# Host-GPU mode (include/vgpu/host_gpu.hpp, docs/perf-design/09-host-gpu-spike.md): VGPU_HOST_GPU=exact runs eligible launches on the machine's
+# real GPU. Skips (as on every hosted runner) when the machine has no card of a model the simulator knows.
+add_test(NAME e2e_host_gpu
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_gpu.sh)
+set_tests_properties(e2e_host_gpu PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 900)
 
 # Tier 2 (src/sass/jit.hpp, VGPU_JIT=1) against the tier, on the same programs: results and every counter, with the JIT forced on at once, one
 # and four host threads, a warm cache, the faults of sass_tier_steps, and every way the JIT can fail (the output must not change).

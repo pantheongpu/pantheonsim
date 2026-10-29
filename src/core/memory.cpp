@@ -134,6 +134,11 @@ std::ostream& operator<<(std::ostream& os, Hex h) {
 
 }  // namespace
 
+static std::atomic<MemTraceHook> g_mem_trace{nullptr};
+void set_mem_trace(MemTraceHook hook) { g_mem_trace.store(hook, std::memory_order_relaxed); }
+#define VGPU_MEM_TRACE(op, a, b) \
+  do { if (MemTraceHook h_ = g_mem_trace.load(std::memory_order_relaxed)) h_(op, a, b); } while (0)
+
 uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
   // A new entry in the table makes no answer a thread remembered wrong, so readers' memories stay.
   ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
@@ -159,6 +164,7 @@ uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
     live_.insert(live_.end(), std::move(node));   // the newest address is the highest
   }
   notify_usage();
+  VGPU_MEM_TRACE('A', base, size);
   return base;
 }
 
@@ -189,6 +195,8 @@ void MemoryManager::remember_freed(uint64_t ptr, uint64_t size) {
 }
 
 void MemoryManager::free(uint64_t ptr) {
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_free(ptr);
   // Quiet: a free says which allocation it takes (note_free) and leaves every other answer a thread
   // remembered as it was.
   ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
@@ -205,6 +213,7 @@ void MemoryManager::free(uint64_t ptr) {
   }
   auto it = live_.find(ptr);
   if (it != live_.end()) {
+    VGPU_MEM_TRACE('F', ptr, it->second.size);
     used_ -= it->second.size;
     // Quarantine the freed range so use-after-free stays diagnosable, evicting
     // the oldest entry once the bound is reached.
@@ -333,6 +342,10 @@ const MemoryManager::Allocation* MemoryManager::resolve_mapped(uint64_t addr, ui
 
 const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t len, const char* op,
                                                         uint64_t* base_out, bool writing, bool page_slack) const {
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire))
+      // A kernel-style scalar store asks for "device memory write" without the writing flag (which would also change the read-only checks).
+      gate->before_access(addr, len, writing || (op && std::strcmp(op, "device memory write") == 0));
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up != live_.begin()) {
@@ -505,6 +518,7 @@ bool MemoryManager::lookup_cache_default() {
   const Allocation& a = prev->second;
   const uint64_t off = addr - prev->first;
   if (!(off < a.size && len <= a.size - off)) return {nullptr, 0};
+  if (a.card_valid.load(std::memory_order_relaxed) != 0) return {nullptr, 0};   // a card copy: every access takes resolve(), which asks the gate
   if (&mem == &g_ended_lookups) return {&a, prev->first};
   // The epoch read under the shared lock cannot move while it is held.
   uint32_t v = mem.victim;
@@ -720,6 +734,7 @@ uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
 
 void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t len) {
   if (len == 0) return;
+  VGPU_MEM_TRACE('Z', dst, len);
   // Host memory mapped here is filled where it is, the pattern's phase
   // running on across pieces.
   if (std::vector<HostPiece> pieces; host_pieces(dst, len, &pieces, true)) {
@@ -790,6 +805,7 @@ uint64_t MemoryManager::resident_bytes() const {
 
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (len == 0) return;
+  VGPU_MEM_TRACE('W', dst, len);
   if (host_maps_ && host_maps_->may_contain(dst)) {
     if (HostHit h; lookup_host(dst, len, &h)) {
       if (h.read_only) throw_read_only_host_write(dst, len);
@@ -932,6 +948,8 @@ void MemoryManager::unmap_host(uint64_t addr) {
 }
 
 void MemoryManager::free_all() {
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_free(UINT64_MAX);
   // The heap's blocks go in the sweep below with every other allocation; its
   // record of them, and the budget they held, go here.
   std::lock_guard<std::mutex> heap_guard(heap_->mu);
@@ -1293,6 +1311,9 @@ bool MemoryManager::access_at(uint64_t va, bool* readable, bool* writable) const
 // ---- memory another process can map -------------------------------------------
 
 uint64_t MemoryManager::share(uint64_t ptr, const std::string& path) {
+  // The exported file is the allocation from here on: whatever only the card holds comes back first.
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_access(ptr, UINT64_MAX / 2, false);
   ExclusiveGuard table_guard(table_lock_.get());
   if (const auto it = shared_.find(ptr); it != shared_.end()) return it->second.size;
   const auto live = live_.find(ptr);
@@ -1403,6 +1424,7 @@ bool MemoryManager::is_host_mapped(uint64_t addr) const {
 
 void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   if (len == 0) return;
+  VGPU_MEM_TRACE('R', src, len);
   // Managed memory is the caller's own buffer; there is no chunk table to walk.
   if (host_maps_ && host_maps_->may_contain(src)) {
     if (HostHit h; lookup_host(src, len, &h)) {
@@ -1483,6 +1505,7 @@ const MemoryManager::Allocation* MemoryManager::run_allocation(uint64_t addr, ui
   auto prev = std::prev(up);
   *base = prev->first;
   if (addr - *base >= prev->second.size || len > prev->second.size - (addr - *base)) return nullptr;
+  if (prev->second.card_valid.load(std::memory_order_relaxed) != 0) return nullptr;
   return &prev->second;
 }
 
@@ -1544,6 +1567,25 @@ void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, u
     off += n;
     len -= n;
   }
+}
+
+std::atomic<uint32_t>* MemoryManager::card_slot(uint64_t base) const {
+  SharedGuard table_guard(table_lock_.get());
+  const auto it = live_.find(base);
+  return it == live_.end() ? nullptr : const_cast<std::atomic<uint32_t>*>(&it->second.card_valid);
+}
+
+void MemoryManager::card_void_lookups(const std::vector<uint64_t>& bases) {
+  ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
+  for (uint64_t b : bases) table_lock_->note_free(b);
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> MemoryManager::live_ranges() const {
+  SharedGuard table_guard(table_lock_.get());
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  out.reserve(live_.size());
+  for (const auto& [base, a] : live_) out.emplace_back(base, a.size);
+  return out;
 }
 
 bool MemoryManager::find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const {
