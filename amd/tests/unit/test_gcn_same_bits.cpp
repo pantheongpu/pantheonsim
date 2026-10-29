@@ -11,6 +11,10 @@
 // depend on the host's libm for the transcendental instructions; if a different libm makes them differ
 // on the instructions whose names say sin, cos, exp, log, rcp, rsq or sqrt, record them again from the
 // commit before the change under test, never from the one being tested.
+//
+// Three digests were recorded after a fix, from the tree that has it (gfx1030's VOP3 v_ashrrev_i16, v_max_i16 and v_min_i16, lines 14927, 15810 and
+// 15838): the baseline's digest of them was the text of "decoded but not implemented", and a real RX 6800 runs the instructions (the bench-amd probe
+// workload p_pk16 uses all three and matches its host reference there). Every other digest is the baseline's.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

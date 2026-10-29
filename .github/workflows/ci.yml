@@ -21,11 +21,15 @@ on:
         required: false
         default: false
 
-# A push that lands while an earlier run is still going supersedes it; there is
-# no value in finishing a build of code nobody will look at again.
+# A push to a pull request that lands while an earlier run is still going
+# supersedes it; there is no value in finishing a build of code nobody will look
+# at again. main is different: its sanitizer jobs take over an hour and merges
+# land faster than that, so cancelling meant no run on main ever finished and
+# the repository page showed a failed CI. A run on main finishes; a newer push
+# waits behind it (and a still newer one replaces the waiting one).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # nvcc 12.0 rejects this image's default GCC 13 headers (it fails inside
@@ -492,7 +496,8 @@ jobs:
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
     # this job's toolchain built in, so the install step runs only on GitHub's.
     runs-on: ${{ fromJSON(vars.SIM_RUNS_ON || '"ubuntu-24.04"') }}
-    timeout-minutes: 20
+    timeout-minutes: 35
+    # The tests take 12-16 minutes on a hosted runner; 20 was cancelling one run in three.
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image

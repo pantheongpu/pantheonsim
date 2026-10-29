@@ -39,6 +39,10 @@ directory is created `0700`, must belong to you and be writable by no one else, 
 instruction words match; but the objects are native code that runs with your permissions, so do not point `VGPU_JIT_CACHE` at a directory
 other users can write to.
 
+With `VGPU_SASS_CACHE=1` the SASS engine keeps a small file of the cubins it found to run in full (`$XDG_CACHE_HOME/pantheonsim/sass-ok-v1-<build id>`, 16-byte hashes, created `0700`/`0600`) so that
+the next process does not decode them again. It is read only if it is a regular file of yours that no one else can write, in a directory of the same kind; it holds no code, and
+a wrong entry could only send a cubin the executor cannot run to the executor instead of to the fatbin's PTX. It is off unless you set `VGPU_SASS_CACHE=1`.
+
 ## Supported versions
 
 Fixes land on `main`. The `pantheongpu/setup-pantheonsim` action pins a commit

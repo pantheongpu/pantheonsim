@@ -7,6 +7,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/devrt.hpp"
+#include "ok_cache.hpp"
 #include "vgpu/sass/exec.hpp"
 
 namespace vgpu::sass {
@@ -478,7 +479,18 @@ class OkWords {
 
 }  // namespace
 
+uint64_t unsupported_cache_hits() { return okcache::hits(); }
+
 std::string unsupported(const uint8_t* image, size_t size) {
+  // VGPU_SASS_REFUSE changes the answer, so neither the file of images found to run in full nor the table of words
+  // is used while it is set.
+  const char* refuse = std::getenv("VGPU_SASS_REFUSE");
+  const bool memo = !(refuse && *refuse);
+  okcache::Key ok_key;
+  if (memo) {
+    ok_key = okcache::key_of(image, size);
+    if (okcache::known(ok_key)) return {};
+  }
   const Cubin c = parse_cubin(image, size);
   // Relocations the loader applies (see load), against symbols it can
   // resolve: the module's own, or a function VirtualGPU provides (the device
@@ -506,9 +518,7 @@ std::string unsupported(const uint8_t* image, size_t size) {
   }
   // VGPU_SASS_REFUSE=<op>: treat that op as unsupported, for testing the
   // fallback to PTX.
-  const char* refuse = std::getenv("VGPU_SASS_REFUSE");
   static thread_local OkWords seen;
-  const bool memo = !(refuse && *refuse);
   for (const CubinSection& s : c.sections) {
     if (s.name.rfind(".text.", 0) != 0) continue;
     for (size_t i = 0; i + 16 <= s.bytes.size(); i += 16) {
@@ -540,6 +550,7 @@ std::string unsupported(const uint8_t* image, size_t size) {
       if (memo) seen.insert(c.sm, w);
     }
   }
+  if (memo) okcache::remember(ok_key);
   return {};
 }
 

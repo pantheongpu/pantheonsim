@@ -226,6 +226,7 @@ add_library(vgpu STATIC
   src/sass/decode.cpp
   src/sass/cubin.cpp
   src/sass/module.cpp
+  src/sass/ok_cache.cpp
   src/sass/exec.cpp
   src/sass/tier.cpp
   src/sass/jit.cpp
@@ -234,6 +235,7 @@ add_library(vgpu STATIC
   amd/src/debugger.cpp
   amd/src/gcn_exec.cpp
   amd/src/gcn_tier.cpp
+  amd/src/gcn_tier_ds.cpp
   amd/src/image.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
@@ -294,14 +296,27 @@ target_link_libraries(vgpu PUBLIC ${CMAKE_DL_LIBS})
 # same code as before, while a test (marked at the end of this file) links the
 # machine code and takes seconds.
 option(VGPU_TEST_FAST_LINK "Link unit tests without LTO (the vgpu archive carries machine code for them)" ON)
+# The wide LDS accesses of the AMD tier (see the header) are compiled outside link-time optimization: inside the tier's unit they moved the
+# inlining and the layout of the unrelated memory handlers.
+set_source_files_properties(amd/src/gcn_tier_ds.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+# The memory manager's hot paths: outside link-time optimization too, so the executors' code is laid out as it was without them.
+set_source_files_properties(src/core/memory.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set_target_properties(vgpu PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
   target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
 endif()
 
+# The std::variant dispatch tables the PTX parser's and the SASS decoder's visits instantiate (weak, with names thousands of
+# characters long): left exported, each is a relocation the loader looks up by name at every process start (hashing the name
+# alone was a quarter of a small program's user cycles), and nothing outside the library refers to them. Local, they cost none.
+set(VGPU_LOCAL_STD_TABLES "_ZNSt8__detail9__variant*")
+
 # libvgpucuda: the CUDA Driver API shim external programs link against.
 add_library(vgpucuda SHARED nvidia/src/driver_api.cpp nvidia/src/driver_graph.cpp nvidia/src/fatbin.cpp nvidia/src/fatbin_sass.cpp)
 target_link_libraries(vgpucuda PRIVATE vgpu ${CMAKE_DL_LIBS})
+# Unversioned, as before; only the std::variant tables (VGPU_LOCAL_STD_TABLES) are made local.
+file(WRITE "${CMAKE_BINARY_DIR}/maps/libcuda.so.1.map" "{\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n")
+target_link_options(vgpucuda PRIVATE "-Wl,--version-script=${CMAKE_BINARY_DIR}/maps/libcuda.so.1.map")
 # Present the real driver's identity: apps linked with -lcuda record SONAME
 # "libcuda.so.1" and resolve to this library through LD_LIBRARY_PATH at run time.
 set_target_properties(vgpucuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 VERSION 1.1)
@@ -494,7 +509,7 @@ endfunction()
 # version information on every call.
 function(vgpu_version_script _libname _soversion _out)
   set(_path "${CMAKE_BINARY_DIR}/maps/lib${_libname}.so.${_soversion}.map")
-  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n};\n")
+  file(WRITE "${_path}" "lib${_libname}.so.${_soversion} {\n  global: *;\n  local: ${VGPU_LOCAL_STD_TABLES};\n};\n")
   set(${_out} "${_path}" PARENT_SCOPE)
 endfunction()
 
@@ -1334,6 +1349,8 @@ vgpu_unit_test(test_sched)
 vgpu_unit_test(test_sass_atomics)
 vgpu_unit_test(test_sass_lanes)
 target_include_directories(test_sass_lanes PRIVATE src)
+# The address-row questions of the tier's global and shared memory handlers (vgpu/exec/sass_mem_rows.hpp), against the address array they replaced.
+vgpu_unit_test(test_sass_mem_rows)
 # The SASS executor's memory-access counting, against the straightforward version it replaced
 # (vgpu/exec/mem_counters.hpp, which both engines count with).
 vgpu_unit_test(test_sass_access_count)
@@ -1344,6 +1361,8 @@ vgpu_unit_test(test_memfast)
 vgpu_unit_test(test_memalloc)
 # The one-lookup read-modify-write and multi-field read, against the load_scalar / store_scalar calls they replace.
 vgpu_unit_test(test_memrmw)
+# The sp8 hot paths (load_fields in one chunk, the batch address scan, the host-map span test) at their boundaries.
+vgpu_unit_test(test_memhot_sp8)
 # The warp's local memory, interleaved by words, against the per-lane layout it replaced.
 vgpu_unit_test(test_locallayout)
 # The lock-free read-modify-write (atomic_rmw) against load_scalar / the operation / store_scalar, and from threads.
@@ -1383,10 +1402,23 @@ vgpu_unit_test(test_tcgen05_tiles)
 vgpu_unit_test(test_wmma_generic_fast)
 # The routes that run the tile kernels, again with the AVX-512 table selected (VGPU_SIMD=avx512; a host without it runs them at AVX2): the engines'
 # results against their general forms must not move a bit with the level.
+# The AVX-512 table is the default on a host that has it, so the 256-bit tile kernels are pinned with VGPU_SIMD=avx2 in a third run (a host without
+# AVX-512 runs the default as AVX2 and these as the same code).
 foreach(_t test_mma_fast test_mma_tiles test_wgmma_fast test_tcgen05_tiles test_wmma_generic_fast test_tile_mma)
   add_test(NAME ${_t}_simd_avx512 COMMAND ${_t})
   set_tests_properties(${_t}_simd_avx512 PROPERTIES ENVIRONMENT "VGPU_SIMD=avx512")
+  add_test(NAME ${_t}_simd_avx2 COMMAND ${_t})
+  set_tests_properties(${_t}_simd_avx2 PROPERTIES ENVIRONMENT "VGPU_SIMD=avx2")
 endforeach()
+# Which table each setting of VGPU_SIMD gives on this host (the default is the AVX-512 one where the CPU has it).
+vgpu_unit_test(test_simd_dispatch)
+foreach(_lvl avx2 avx512 base off)
+  add_test(NAME test_simd_dispatch_simd_${_lvl} COMMAND test_simd_dispatch)
+  set_tests_properties(test_simd_dispatch_simd_${_lvl} PROPERTIES ENVIRONMENT "VGPU_SIMD=${_lvl}")
+endforeach()
+# An empty VGPU_SIMD is no setting at all: the default table.
+add_test(NAME test_simd_dispatch_simd_empty COMMAND test_simd_dispatch)
+set_tests_properties(test_simd_dispatch_simd_empty PROPERTIES ENVIRONMENT "VGPU_SIMD=")
 # The PTX engine's tile route for the other mma.sync forms against the general form, bit for bit.
 vgpu_unit_test(test_mma_tiles)
 # The SASS executor's tile route for the MMA forms its SIMD HMMA kernel does not take, against its general form (the kernels off in a second run).
@@ -1504,6 +1536,9 @@ target_compile_definitions(test_decode_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAK
 # sass::unsupported's table of words it has seen: the answer and the text of a refusal are the same with or without it.
 vgpu_unit_test(test_unsupported_memo tests/unit/test_unsupported_memo.cpp)
 target_compile_definitions(test_unsupported_memo PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The file of cubins sass::unsupported found to run in full, kept between processes when VGPU_SASS_CACHE=1 (src/sass/ok_cache.cpp).
+vgpu_unit_test(test_sass_ok_cache tests/unit/test_sass_ok_cache.cpp)
+target_compile_definitions(test_sass_ok_cache PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # FFMA2/FMUL2/FADD2 (sm_100's packed fp32): the corpora's lines decode and are run, a cubin of them is supported, the forms of unknown
 # meaning are refused, and the arithmetic the PTX and SASS engines share.
 vgpu_unit_test(test_f32x2_sass tests/unit/test_f32x2_sass.cpp)
@@ -1546,6 +1581,9 @@ target_compile_definitions(test_amd_gcn_memory_same_bits PRIVATE VGPU_SOURCE_DIR
 # The pre-decoded tier against the interpreter over the same corpora (amd/tests/unit/test_gcn_tier_same_bits.cpp).
 vgpu_unit_test(test_amd_gcn_tier_same_bits amd/tests/unit/test_gcn_tier_same_bits.cpp)
 target_compile_definitions(test_amd_gcn_tier_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# The forms the AMD probe workloads found missing (RDNA2's VOP3 16-bit integer spellings), against the interpreter.
+vgpu_unit_test(test_amd_gcn_probe_forms amd/tests/unit/test_gcn_probe_forms.cpp)
+target_compile_definitions(test_amd_gcn_probe_forms PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # Scratch, LDS atomics, a cross-lane read, and flat pointers.
 vgpu_unit_test(test_amd_gcn_memory amd/tests/unit/test_gcn_memory.cpp)
 target_compile_definitions(test_amd_gcn_memory PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -2407,6 +2445,15 @@ if(TARGET vgpucudart)
   set_tests_properties(test_runtime_capture_gate PROPERTIES
     ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
 endif()
+# A device-to-device copy through a buffer that is not zero-filled, and the context fault read without the API lock.
+if(TARGET vgpucudart)
+  add_executable(test_runtime_d2d_scratch nvidia/tests/unit/test_runtime_d2d_scratch.cpp)
+  target_link_libraries(test_runtime_d2d_scratch PRIVATE vgpucudart)
+  target_include_directories(test_runtime_d2d_scratch PRIVATE tests/framework include ${CUDA_ABI_INCLUDE})
+  add_test(NAME test_runtime_d2d_scratch COMMAND test_runtime_d2d_scratch)
+  set_tests_properties(test_runtime_d2d_scratch PROPERTIES
+    ENVIRONMENT "VGPU_GPU=nvidia/rtx3060;VGPU_QUIET=1;ASAN_OPTIONS=detect_leaks=1:detect_odr_violation=0")
+endif()
 # Enum parameters that carry values the enum does not declare: answered with an error code, never loaded as the enum.
 if(TARGET vgpucudart AND TARGET vgpucuda)
   add_executable(test_api_enum_args nvidia/tests/unit/test_api_enum_args.cpp)
@@ -3015,10 +3062,14 @@ if(TARGET vgpucublas)
 
   add_test(NAME e2e_host_atomics
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_atomics.sh)
+  # Under ThreadSanitizer the SASS run alone takes 200 to 370 s on 4 cores (the PTX run 5 s): 262144 device atomics on
+  # host-mapped words, each through the host-atomic path while one thread spins on a flag. Measured on origin/main and on the
+  # speed branch, same host, same image: 202 s and 208 s on main, 230 s, 223 s and 370 s on the branch, so the time is the
+  # sanitizer's and not a hang, and 300 s left no room when the job also runs other tests beside it.
   set_tests_properties(e2e_host_atomics PROPERTIES
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    TIMEOUT 300)
+    TIMEOUT 600)
 
   add_test(NAME e2e_uldc_narrow
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_uldc_narrow.sh)
@@ -3705,6 +3756,12 @@ add_test(NAME lint_shim_symbols COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shi
 set_tests_properties(lint_shim_symbols PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 300)
+# The std::variant dispatch tables must stay local to each shim (VGPU_LOCAL_STD_TABLES): exported, their long names were a quarter of a
+# small program's user cycles at every process start.
+add_test(NAME lint_shim_dynsyms COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_shim_dynsyms.sh)
+set_tests_properties(lint_shim_dynsyms PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:" TIMEOUT 300)
 # No shim library takes static TLS (glibc leaves ~1.6 KB for every library loaded late).
 # (Not under a sanitizer: its runtime keeps initial-exec thread-locals in every library it is linked into, so the check would report the
 # runtime, not the simulator.)
@@ -4228,6 +4285,12 @@ set_tests_properties(e2e_jit_frameworks PROPERTIES
 # diagnostic actually working, which is where every serious bug here showed up
 # first. Skips cleanly when no pantheon checkout is present, so a contributor
 # without one still gets a green run.
+# How the runner below judges a finished workload (pass, skip, fail); needs no GPU and no pantheon.
+add_test(NAME pantheon_workload_verdicts
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/verdict_test.sh)
+# And the PATH it starts vgpu shell with, which must not hold the Action's drop-in nvcc.
+add_test(NAME pantheon_workload_path
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/path_test.sh)
 add_test(NAME pantheon_workloads
          COMMAND ${CMAKE_SOURCE_DIR}/tests/workloads/run_pantheon_workloads.sh)
 set_tests_properties(pantheon_workloads PROPERTIES

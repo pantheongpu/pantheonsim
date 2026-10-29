@@ -137,7 +137,7 @@ VTEST(wrong_types_and_ranges_say_what_is_allowed) {
   VCHECK_CONTAINS(problem("scheduler: randon\n"), "did you mean 'random'?");
   VCHECK_CONTAINS(problem("race: sometimes\n"), "one of: off, on, all");
   VCHECK_CONTAINS(problem("sass: yes\n"), "one of: auto, off, only");
-  VCHECK_CONTAINS(problem("simd: avx512\n"), "one of: auto, base, avx2, off");
+  VCHECK_CONTAINS(problem("simd: avx1024\n"), "one of: auto, base, avx2, avx512, off");
   VCHECK_CONTAINS(problem("cuda_version: 13\n"), "major.minor");
   VCHECK_CONTAINS(problem("cuda_version: 13.0.1\n"), "major.minor");
   VCHECK_CONTAINS(problem("rocm_version: six\n"), "a dotted version");

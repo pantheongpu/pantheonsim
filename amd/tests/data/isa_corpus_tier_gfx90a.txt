@@ -2642,3 +2642,1164 @@ D3D94001 18000002	v_accvgpr_write_b32 a1, s2
 D3D94001 18000087	v_accvgpr_write_b32 a1, 7
 D3D94001 180000F2	v_accvgpr_write_b32 a1, 1.0
 D3D94001 1800007E	v_accvgpr_write_b32 a1, exec_lo
+7E0202FA FF00B102	v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+7E0202FA A500B102	v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5
+7E0202FA 3F08B102	v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F608B102	v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF000002	v_mov_b32_dpp v1, v2 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf
+7E0202FA A5000002	v_mov_b32_dpp v1, v2 quad_perm:[0,0,0,0] row_mask:0xa bank_mask:0x5
+7E0202FA 3F080002	v_mov_b32_dpp v1, v2 quad_perm:[0,0,0,0] row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6080002	v_mov_b32_dpp v1, v2 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF001B02	v_mov_b32_dpp v1, v2 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+7E0202FA A5001B02	v_mov_b32_dpp v1, v2 quad_perm:[3,2,1,0] row_mask:0xa bank_mask:0x5
+7E0202FA 3F081B02	v_mov_b32_dpp v1, v2 quad_perm:[3,2,1,0] row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6081B02	v_mov_b32_dpp v1, v2 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF010102	v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0xf
+7E0202FA A5010102	v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0xa bank_mask:0x5
+7E0202FA 3F090102	v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6090102	v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF010702	v_mov_b32_dpp v1, v2 row_shl:7 row_mask:0xf bank_mask:0xf
+7E0202FA A5010702	v_mov_b32_dpp v1, v2 row_shl:7 row_mask:0xa bank_mask:0x5
+7E0202FA 3F090702	v_mov_b32_dpp v1, v2 row_shl:7 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6090702	v_mov_b32_dpp v1, v2 row_shl:7 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF010F02	v_mov_b32_dpp v1, v2 row_shl:15 row_mask:0xf bank_mask:0xf
+7E0202FA A5010F02	v_mov_b32_dpp v1, v2 row_shl:15 row_mask:0xa bank_mask:0x5
+7E0202FA 3F090F02	v_mov_b32_dpp v1, v2 row_shl:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6090F02	v_mov_b32_dpp v1, v2 row_shl:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF011102	v_mov_b32_dpp v1, v2 row_shr:1 row_mask:0xf bank_mask:0xf
+7E0202FA A5011102	v_mov_b32_dpp v1, v2 row_shr:1 row_mask:0xa bank_mask:0x5
+7E0202FA 3F091102	v_mov_b32_dpp v1, v2 row_shr:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6091102	v_mov_b32_dpp v1, v2 row_shr:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF011302	v_mov_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0xf
+7E0202FA A5011302	v_mov_b32_dpp v1, v2 row_shr:3 row_mask:0xa bank_mask:0x5
+7E0202FA 3F091302	v_mov_b32_dpp v1, v2 row_shr:3 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6091302	v_mov_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF011F02	v_mov_b32_dpp v1, v2 row_shr:15 row_mask:0xf bank_mask:0xf
+7E0202FA A5011F02	v_mov_b32_dpp v1, v2 row_shr:15 row_mask:0xa bank_mask:0x5
+7E0202FA 3F091F02	v_mov_b32_dpp v1, v2 row_shr:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6091F02	v_mov_b32_dpp v1, v2 row_shr:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF012102	v_mov_b32_dpp v1, v2 row_ror:1 row_mask:0xf bank_mask:0xf
+7E0202FA A5012102	v_mov_b32_dpp v1, v2 row_ror:1 row_mask:0xa bank_mask:0x5
+7E0202FA 3F092102	v_mov_b32_dpp v1, v2 row_ror:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6092102	v_mov_b32_dpp v1, v2 row_ror:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF012702	v_mov_b32_dpp v1, v2 row_ror:7 row_mask:0xf bank_mask:0xf
+7E0202FA A5012702	v_mov_b32_dpp v1, v2 row_ror:7 row_mask:0xa bank_mask:0x5
+7E0202FA 3F092702	v_mov_b32_dpp v1, v2 row_ror:7 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6092702	v_mov_b32_dpp v1, v2 row_ror:7 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF012F02	v_mov_b32_dpp v1, v2 row_ror:15 row_mask:0xf bank_mask:0xf
+7E0202FA A5012F02	v_mov_b32_dpp v1, v2 row_ror:15 row_mask:0xa bank_mask:0x5
+7E0202FA 3F092F02	v_mov_b32_dpp v1, v2 row_ror:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6092F02	v_mov_b32_dpp v1, v2 row_ror:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF014002	v_mov_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf
+7E0202FA A5014002	v_mov_b32_dpp v1, v2 row_mirror row_mask:0xa bank_mask:0x5
+7E0202FA 3F094002	v_mov_b32_dpp v1, v2 row_mirror row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6094002	v_mov_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF014102	v_mov_b32_dpp v1, v2 row_half_mirror row_mask:0xf bank_mask:0xf
+7E0202FA A5014102	v_mov_b32_dpp v1, v2 row_half_mirror row_mask:0xa bank_mask:0x5
+7E0202FA 3F094102	v_mov_b32_dpp v1, v2 row_half_mirror row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6094102	v_mov_b32_dpp v1, v2 row_half_mirror row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF013002	v_mov_b32_dpp v1, v2 wave_shl:1 row_mask:0xf bank_mask:0xf
+7E0202FA A5013002	v_mov_b32_dpp v1, v2 wave_shl:1 row_mask:0xa bank_mask:0x5
+7E0202FA 3F093002	v_mov_b32_dpp v1, v2 wave_shl:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6093002	v_mov_b32_dpp v1, v2 wave_shl:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF013402	v_mov_b32_dpp v1, v2 wave_rol:1 row_mask:0xf bank_mask:0xf
+7E0202FA A5013402	v_mov_b32_dpp v1, v2 wave_rol:1 row_mask:0xa bank_mask:0x5
+7E0202FA 3F093402	v_mov_b32_dpp v1, v2 wave_rol:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6093402	v_mov_b32_dpp v1, v2 wave_rol:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF013802	v_mov_b32_dpp v1, v2 wave_shr:1 row_mask:0xf bank_mask:0xf
+7E0202FA A5013802	v_mov_b32_dpp v1, v2 wave_shr:1 row_mask:0xa bank_mask:0x5
+7E0202FA 3F093802	v_mov_b32_dpp v1, v2 wave_shr:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6093802	v_mov_b32_dpp v1, v2 wave_shr:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF013C02	v_mov_b32_dpp v1, v2 wave_ror:1 row_mask:0xf bank_mask:0xf
+7E0202FA A5013C02	v_mov_b32_dpp v1, v2 wave_ror:1 row_mask:0xa bank_mask:0x5
+7E0202FA 3F093C02	v_mov_b32_dpp v1, v2 wave_ror:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6093C02	v_mov_b32_dpp v1, v2 wave_ror:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF014202	v_mov_b32_dpp v1, v2 row_bcast:15 row_mask:0xf bank_mask:0xf
+7E0202FA A5014202	v_mov_b32_dpp v1, v2 row_bcast:15 row_mask:0xa bank_mask:0x5
+7E0202FA 3F094202	v_mov_b32_dpp v1, v2 row_bcast:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6094202	v_mov_b32_dpp v1, v2 row_bcast:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7E0202FA FF014302	v_mov_b32_dpp v1, v2 row_bcast:31 row_mask:0xf bank_mask:0xf
+7E0202FA A5014302	v_mov_b32_dpp v1, v2 row_bcast:31 row_mask:0xa bank_mask:0x5
+7E0202FA 3F094302	v_mov_b32_dpp v1, v2 row_bcast:31 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+7E0202FA F6094302	v_mov_b32_dpp v1, v2 row_bcast:31 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+7F9002FA FF001BFF	v_mov_b32_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+7E0256FA FF00B102	v_not_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+7E0256FA A508B102	v_not_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0256FA FF011302	v_not_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0xf
+7E0256FA A5091302	v_not_b32_dpp v1, v2 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0256FA FF012702	v_not_b32_dpp v1, v2 row_ror:7 row_mask:0xf bank_mask:0xf
+7E0256FA A5092702	v_not_b32_dpp v1, v2 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0256FA FF014002	v_not_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf
+7E0256FA A5094002	v_not_b32_dpp v1, v2 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0256FA FF013002	v_not_b32_dpp v1, v2 wave_shl:1 row_mask:0xf bank_mask:0xf
+7E0256FA A5093002	v_not_b32_dpp v1, v2 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0256FA FF014202	v_not_b32_dpp v1, v2 row_bcast:15 row_mask:0xf bank_mask:0xf
+7E0256FA A5094202	v_not_b32_dpp v1, v2 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7F9056FA FF001BFF	v_not_b32_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+680206FA FF00B102	v_add_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+680206FA A500B102	v_add_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5
+680206FA 3F08B102	v_add_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F608B102	v_add_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF000002	v_add_u32_dpp v1, v2, v3 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf
+680206FA A5000002	v_add_u32_dpp v1, v2, v3 quad_perm:[0,0,0,0] row_mask:0xa bank_mask:0x5
+680206FA 3F080002	v_add_u32_dpp v1, v2, v3 quad_perm:[0,0,0,0] row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6080002	v_add_u32_dpp v1, v2, v3 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF001B02	v_add_u32_dpp v1, v2, v3 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+680206FA A5001B02	v_add_u32_dpp v1, v2, v3 quad_perm:[3,2,1,0] row_mask:0xa bank_mask:0x5
+680206FA 3F081B02	v_add_u32_dpp v1, v2, v3 quad_perm:[3,2,1,0] row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6081B02	v_add_u32_dpp v1, v2, v3 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF010102	v_add_u32_dpp v1, v2, v3 row_shl:1 row_mask:0xf bank_mask:0xf
+680206FA A5010102	v_add_u32_dpp v1, v2, v3 row_shl:1 row_mask:0xa bank_mask:0x5
+680206FA 3F090102	v_add_u32_dpp v1, v2, v3 row_shl:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6090102	v_add_u32_dpp v1, v2, v3 row_shl:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF010702	v_add_u32_dpp v1, v2, v3 row_shl:7 row_mask:0xf bank_mask:0xf
+680206FA A5010702	v_add_u32_dpp v1, v2, v3 row_shl:7 row_mask:0xa bank_mask:0x5
+680206FA 3F090702	v_add_u32_dpp v1, v2, v3 row_shl:7 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6090702	v_add_u32_dpp v1, v2, v3 row_shl:7 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF010F02	v_add_u32_dpp v1, v2, v3 row_shl:15 row_mask:0xf bank_mask:0xf
+680206FA A5010F02	v_add_u32_dpp v1, v2, v3 row_shl:15 row_mask:0xa bank_mask:0x5
+680206FA 3F090F02	v_add_u32_dpp v1, v2, v3 row_shl:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6090F02	v_add_u32_dpp v1, v2, v3 row_shl:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF011102	v_add_u32_dpp v1, v2, v3 row_shr:1 row_mask:0xf bank_mask:0xf
+680206FA A5011102	v_add_u32_dpp v1, v2, v3 row_shr:1 row_mask:0xa bank_mask:0x5
+680206FA 3F091102	v_add_u32_dpp v1, v2, v3 row_shr:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6091102	v_add_u32_dpp v1, v2, v3 row_shr:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF011302	v_add_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+680206FA A5011302	v_add_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5
+680206FA 3F091302	v_add_u32_dpp v1, v2, v3 row_shr:3 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6091302	v_add_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF011F02	v_add_u32_dpp v1, v2, v3 row_shr:15 row_mask:0xf bank_mask:0xf
+680206FA A5011F02	v_add_u32_dpp v1, v2, v3 row_shr:15 row_mask:0xa bank_mask:0x5
+680206FA 3F091F02	v_add_u32_dpp v1, v2, v3 row_shr:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6091F02	v_add_u32_dpp v1, v2, v3 row_shr:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF012102	v_add_u32_dpp v1, v2, v3 row_ror:1 row_mask:0xf bank_mask:0xf
+680206FA A5012102	v_add_u32_dpp v1, v2, v3 row_ror:1 row_mask:0xa bank_mask:0x5
+680206FA 3F092102	v_add_u32_dpp v1, v2, v3 row_ror:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6092102	v_add_u32_dpp v1, v2, v3 row_ror:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF012702	v_add_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+680206FA A5012702	v_add_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5
+680206FA 3F092702	v_add_u32_dpp v1, v2, v3 row_ror:7 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6092702	v_add_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF012F02	v_add_u32_dpp v1, v2, v3 row_ror:15 row_mask:0xf bank_mask:0xf
+680206FA A5012F02	v_add_u32_dpp v1, v2, v3 row_ror:15 row_mask:0xa bank_mask:0x5
+680206FA 3F092F02	v_add_u32_dpp v1, v2, v3 row_ror:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6092F02	v_add_u32_dpp v1, v2, v3 row_ror:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF014002	v_add_u32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+680206FA A5014002	v_add_u32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5
+680206FA 3F094002	v_add_u32_dpp v1, v2, v3 row_mirror row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6094002	v_add_u32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF014102	v_add_u32_dpp v1, v2, v3 row_half_mirror row_mask:0xf bank_mask:0xf
+680206FA A5014102	v_add_u32_dpp v1, v2, v3 row_half_mirror row_mask:0xa bank_mask:0x5
+680206FA 3F094102	v_add_u32_dpp v1, v2, v3 row_half_mirror row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6094102	v_add_u32_dpp v1, v2, v3 row_half_mirror row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF013002	v_add_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+680206FA A5013002	v_add_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5
+680206FA 3F093002	v_add_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6093002	v_add_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF013402	v_add_u32_dpp v1, v2, v3 wave_rol:1 row_mask:0xf bank_mask:0xf
+680206FA A5013402	v_add_u32_dpp v1, v2, v3 wave_rol:1 row_mask:0xa bank_mask:0x5
+680206FA 3F093402	v_add_u32_dpp v1, v2, v3 wave_rol:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6093402	v_add_u32_dpp v1, v2, v3 wave_rol:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF013802	v_add_u32_dpp v1, v2, v3 wave_shr:1 row_mask:0xf bank_mask:0xf
+680206FA A5013802	v_add_u32_dpp v1, v2, v3 wave_shr:1 row_mask:0xa bank_mask:0x5
+680206FA 3F093802	v_add_u32_dpp v1, v2, v3 wave_shr:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6093802	v_add_u32_dpp v1, v2, v3 wave_shr:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF013C02	v_add_u32_dpp v1, v2, v3 wave_ror:1 row_mask:0xf bank_mask:0xf
+680206FA A5013C02	v_add_u32_dpp v1, v2, v3 wave_ror:1 row_mask:0xa bank_mask:0x5
+680206FA 3F093C02	v_add_u32_dpp v1, v2, v3 wave_ror:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6093C02	v_add_u32_dpp v1, v2, v3 wave_ror:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF014202	v_add_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+680206FA A5014202	v_add_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5
+680206FA 3F094202	v_add_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6094202	v_add_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+680206FA FF014302	v_add_u32_dpp v1, v2, v3 row_bcast:31 row_mask:0xf bank_mask:0xf
+680206FA A5014302	v_add_u32_dpp v1, v2, v3 row_bcast:31 row_mask:0xa bank_mask:0x5
+680206FA 3F094302	v_add_u32_dpp v1, v2, v3 row_bcast:31 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+680206FA F6094302	v_add_u32_dpp v1, v2, v3 row_bcast:31 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+69900EFA FF001BFF	v_add_u32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+6A0206FA FF00B102	v_sub_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+6A0206FA A508B102	v_sub_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6A0206FA FF011302	v_sub_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+6A0206FA A5091302	v_sub_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6A0206FA FF012702	v_sub_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+6A0206FA A5092702	v_sub_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6A0206FA FF014002	v_sub_u32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+6A0206FA A5094002	v_sub_u32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6A0206FA FF013002	v_sub_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+6A0206FA A5093002	v_sub_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6A0206FA FF014202	v_sub_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+6A0206FA A5094202	v_sub_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6B900EFA FF001BFF	v_sub_u32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+6C0206FA FF00B102	v_subrev_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+6C0206FA A508B102	v_subrev_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6C0206FA FF011302	v_subrev_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+6C0206FA A5091302	v_subrev_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6C0206FA FF012702	v_subrev_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+6C0206FA A5092702	v_subrev_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6C0206FA FF014002	v_subrev_u32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+6C0206FA A5094002	v_subrev_u32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6C0206FA FF013002	v_subrev_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+6C0206FA A5093002	v_subrev_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6C0206FA FF014202	v_subrev_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+6C0206FA A5094202	v_subrev_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+6D900EFA FF001BFF	v_subrev_u32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+260206FA FF00B102	v_and_b32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+260206FA A508B102	v_and_b32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+260206FA FF011302	v_and_b32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+260206FA A5091302	v_and_b32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+260206FA FF012702	v_and_b32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+260206FA A5092702	v_and_b32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+260206FA FF014002	v_and_b32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+260206FA A5094002	v_and_b32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+260206FA FF013002	v_and_b32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+260206FA A5093002	v_and_b32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+260206FA FF014202	v_and_b32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+260206FA A5094202	v_and_b32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+27900EFA FF001BFF	v_and_b32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+280206FA FF00B102	v_or_b32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+280206FA A508B102	v_or_b32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+280206FA FF011302	v_or_b32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+280206FA A5091302	v_or_b32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+280206FA FF012702	v_or_b32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+280206FA A5092702	v_or_b32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+280206FA FF014002	v_or_b32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+280206FA A5094002	v_or_b32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+280206FA FF013002	v_or_b32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+280206FA A5093002	v_or_b32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+280206FA FF014202	v_or_b32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+280206FA A5094202	v_or_b32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+29900EFA FF001BFF	v_or_b32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+2A0206FA FF00B102	v_xor_b32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+2A0206FA A508B102	v_xor_b32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+2A0206FA FF011302	v_xor_b32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+2A0206FA A5091302	v_xor_b32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+2A0206FA FF012702	v_xor_b32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+2A0206FA A5092702	v_xor_b32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+2A0206FA FF014002	v_xor_b32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+2A0206FA A5094002	v_xor_b32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+2A0206FA FF013002	v_xor_b32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+2A0206FA A5093002	v_xor_b32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+2A0206FA FF014202	v_xor_b32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+2A0206FA A5094202	v_xor_b32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+2B900EFA FF001BFF	v_xor_b32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+240206FA FF00B102	v_lshlrev_b32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+240206FA A508B102	v_lshlrev_b32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+240206FA FF011302	v_lshlrev_b32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+240206FA A5091302	v_lshlrev_b32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+240206FA FF012702	v_lshlrev_b32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+240206FA A5092702	v_lshlrev_b32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+240206FA FF014002	v_lshlrev_b32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+240206FA A5094002	v_lshlrev_b32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+240206FA FF013002	v_lshlrev_b32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+240206FA A5093002	v_lshlrev_b32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+240206FA FF014202	v_lshlrev_b32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+240206FA A5094202	v_lshlrev_b32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+25900EFA FF001BFF	v_lshlrev_b32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+200206FA FF00B102	v_lshrrev_b32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+200206FA A508B102	v_lshrrev_b32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+200206FA FF011302	v_lshrrev_b32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+200206FA A5091302	v_lshrrev_b32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+200206FA FF012702	v_lshrrev_b32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+200206FA A5092702	v_lshrrev_b32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+200206FA FF014002	v_lshrrev_b32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+200206FA A5094002	v_lshrrev_b32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+200206FA FF013002	v_lshrrev_b32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+200206FA A5093002	v_lshrrev_b32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+200206FA FF014202	v_lshrrev_b32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+200206FA A5094202	v_lshrrev_b32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+21900EFA FF001BFF	v_lshrrev_b32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+220206FA FF00B102	v_ashrrev_i32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+220206FA A508B102	v_ashrrev_i32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+220206FA FF011302	v_ashrrev_i32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+220206FA A5091302	v_ashrrev_i32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+220206FA FF012702	v_ashrrev_i32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+220206FA A5092702	v_ashrrev_i32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+220206FA FF014002	v_ashrrev_i32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+220206FA A5094002	v_ashrrev_i32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+220206FA FF013002	v_ashrrev_i32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+220206FA A5093002	v_ashrrev_i32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+220206FA FF014202	v_ashrrev_i32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+220206FA A5094202	v_ashrrev_i32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+23900EFA FF001BFF	v_ashrrev_i32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+1C0206FA FF00B102	v_min_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+1C0206FA A508B102	v_min_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1C0206FA FF011302	v_min_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+1C0206FA A5091302	v_min_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1C0206FA FF012702	v_min_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+1C0206FA A5092702	v_min_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1C0206FA FF014002	v_min_u32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+1C0206FA A5094002	v_min_u32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1C0206FA FF013002	v_min_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+1C0206FA A5093002	v_min_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1C0206FA FF014202	v_min_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+1C0206FA A5094202	v_min_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1D900EFA FF001BFF	v_min_u32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+1E0206FA FF00B102	v_max_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+1E0206FA A508B102	v_max_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1E0206FA FF011302	v_max_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+1E0206FA A5091302	v_max_u32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1E0206FA FF012702	v_max_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+1E0206FA A5092702	v_max_u32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1E0206FA FF014002	v_max_u32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+1E0206FA A5094002	v_max_u32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1E0206FA FF013002	v_max_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+1E0206FA A5093002	v_max_u32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1E0206FA FF014202	v_max_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+1E0206FA A5094202	v_max_u32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+1F900EFA FF001BFF	v_max_u32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+180206FA FF00B102	v_min_i32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+180206FA A508B102	v_min_i32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+180206FA FF011302	v_min_i32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+180206FA A5091302	v_min_i32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+180206FA FF012702	v_min_i32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+180206FA A5092702	v_min_i32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+180206FA FF014002	v_min_i32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+180206FA A5094002	v_min_i32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+180206FA FF013002	v_min_i32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+180206FA A5093002	v_min_i32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+180206FA FF014202	v_min_i32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+180206FA A5094202	v_min_i32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+19900EFA FF001BFF	v_min_i32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+1A0206FA FF00B102	v_max_i32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+1A0206FA A500B102	v_max_i32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5
+1A0206FA 3F08B102	v_max_i32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F608B102	v_max_i32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF000002	v_max_i32_dpp v1, v2, v3 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf
+1A0206FA A5000002	v_max_i32_dpp v1, v2, v3 quad_perm:[0,0,0,0] row_mask:0xa bank_mask:0x5
+1A0206FA 3F080002	v_max_i32_dpp v1, v2, v3 quad_perm:[0,0,0,0] row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6080002	v_max_i32_dpp v1, v2, v3 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF001B02	v_max_i32_dpp v1, v2, v3 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+1A0206FA A5001B02	v_max_i32_dpp v1, v2, v3 quad_perm:[3,2,1,0] row_mask:0xa bank_mask:0x5
+1A0206FA 3F081B02	v_max_i32_dpp v1, v2, v3 quad_perm:[3,2,1,0] row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6081B02	v_max_i32_dpp v1, v2, v3 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF010102	v_max_i32_dpp v1, v2, v3 row_shl:1 row_mask:0xf bank_mask:0xf
+1A0206FA A5010102	v_max_i32_dpp v1, v2, v3 row_shl:1 row_mask:0xa bank_mask:0x5
+1A0206FA 3F090102	v_max_i32_dpp v1, v2, v3 row_shl:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6090102	v_max_i32_dpp v1, v2, v3 row_shl:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF010702	v_max_i32_dpp v1, v2, v3 row_shl:7 row_mask:0xf bank_mask:0xf
+1A0206FA A5010702	v_max_i32_dpp v1, v2, v3 row_shl:7 row_mask:0xa bank_mask:0x5
+1A0206FA 3F090702	v_max_i32_dpp v1, v2, v3 row_shl:7 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6090702	v_max_i32_dpp v1, v2, v3 row_shl:7 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF010F02	v_max_i32_dpp v1, v2, v3 row_shl:15 row_mask:0xf bank_mask:0xf
+1A0206FA A5010F02	v_max_i32_dpp v1, v2, v3 row_shl:15 row_mask:0xa bank_mask:0x5
+1A0206FA 3F090F02	v_max_i32_dpp v1, v2, v3 row_shl:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6090F02	v_max_i32_dpp v1, v2, v3 row_shl:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF011102	v_max_i32_dpp v1, v2, v3 row_shr:1 row_mask:0xf bank_mask:0xf
+1A0206FA A5011102	v_max_i32_dpp v1, v2, v3 row_shr:1 row_mask:0xa bank_mask:0x5
+1A0206FA 3F091102	v_max_i32_dpp v1, v2, v3 row_shr:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6091102	v_max_i32_dpp v1, v2, v3 row_shr:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF011302	v_max_i32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+1A0206FA A5011302	v_max_i32_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5
+1A0206FA 3F091302	v_max_i32_dpp v1, v2, v3 row_shr:3 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6091302	v_max_i32_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF011F02	v_max_i32_dpp v1, v2, v3 row_shr:15 row_mask:0xf bank_mask:0xf
+1A0206FA A5011F02	v_max_i32_dpp v1, v2, v3 row_shr:15 row_mask:0xa bank_mask:0x5
+1A0206FA 3F091F02	v_max_i32_dpp v1, v2, v3 row_shr:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6091F02	v_max_i32_dpp v1, v2, v3 row_shr:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF012102	v_max_i32_dpp v1, v2, v3 row_ror:1 row_mask:0xf bank_mask:0xf
+1A0206FA A5012102	v_max_i32_dpp v1, v2, v3 row_ror:1 row_mask:0xa bank_mask:0x5
+1A0206FA 3F092102	v_max_i32_dpp v1, v2, v3 row_ror:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6092102	v_max_i32_dpp v1, v2, v3 row_ror:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF012702	v_max_i32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+1A0206FA A5012702	v_max_i32_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5
+1A0206FA 3F092702	v_max_i32_dpp v1, v2, v3 row_ror:7 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6092702	v_max_i32_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF012F02	v_max_i32_dpp v1, v2, v3 row_ror:15 row_mask:0xf bank_mask:0xf
+1A0206FA A5012F02	v_max_i32_dpp v1, v2, v3 row_ror:15 row_mask:0xa bank_mask:0x5
+1A0206FA 3F092F02	v_max_i32_dpp v1, v2, v3 row_ror:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6092F02	v_max_i32_dpp v1, v2, v3 row_ror:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF014002	v_max_i32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+1A0206FA A5014002	v_max_i32_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5
+1A0206FA 3F094002	v_max_i32_dpp v1, v2, v3 row_mirror row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6094002	v_max_i32_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF014102	v_max_i32_dpp v1, v2, v3 row_half_mirror row_mask:0xf bank_mask:0xf
+1A0206FA A5014102	v_max_i32_dpp v1, v2, v3 row_half_mirror row_mask:0xa bank_mask:0x5
+1A0206FA 3F094102	v_max_i32_dpp v1, v2, v3 row_half_mirror row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6094102	v_max_i32_dpp v1, v2, v3 row_half_mirror row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF013002	v_max_i32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+1A0206FA A5013002	v_max_i32_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5
+1A0206FA 3F093002	v_max_i32_dpp v1, v2, v3 wave_shl:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6093002	v_max_i32_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF013402	v_max_i32_dpp v1, v2, v3 wave_rol:1 row_mask:0xf bank_mask:0xf
+1A0206FA A5013402	v_max_i32_dpp v1, v2, v3 wave_rol:1 row_mask:0xa bank_mask:0x5
+1A0206FA 3F093402	v_max_i32_dpp v1, v2, v3 wave_rol:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6093402	v_max_i32_dpp v1, v2, v3 wave_rol:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF013802	v_max_i32_dpp v1, v2, v3 wave_shr:1 row_mask:0xf bank_mask:0xf
+1A0206FA A5013802	v_max_i32_dpp v1, v2, v3 wave_shr:1 row_mask:0xa bank_mask:0x5
+1A0206FA 3F093802	v_max_i32_dpp v1, v2, v3 wave_shr:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6093802	v_max_i32_dpp v1, v2, v3 wave_shr:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF013C02	v_max_i32_dpp v1, v2, v3 wave_ror:1 row_mask:0xf bank_mask:0xf
+1A0206FA A5013C02	v_max_i32_dpp v1, v2, v3 wave_ror:1 row_mask:0xa bank_mask:0x5
+1A0206FA 3F093C02	v_max_i32_dpp v1, v2, v3 wave_ror:1 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6093C02	v_max_i32_dpp v1, v2, v3 wave_ror:1 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF014202	v_max_i32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+1A0206FA A5014202	v_max_i32_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5
+1A0206FA 3F094202	v_max_i32_dpp v1, v2, v3 row_bcast:15 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6094202	v_max_i32_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1A0206FA FF014302	v_max_i32_dpp v1, v2, v3 row_bcast:31 row_mask:0xf bank_mask:0xf
+1A0206FA A5014302	v_max_i32_dpp v1, v2, v3 row_bcast:31 row_mask:0xa bank_mask:0x5
+1A0206FA 3F094302	v_max_i32_dpp v1, v2, v3 row_bcast:31 row_mask:0x3 bank_mask:0xf bound_ctrl:1
+1A0206FA F6094302	v_max_i32_dpp v1, v2, v3 row_bcast:31 row_mask:0xf bank_mask:0x6 bound_ctrl:1
+1B900EFA FF001BFF	v_max_i32_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+100206FA FF00B102	v_mul_u32_u24_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+100206FA A508B102	v_mul_u32_u24_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+100206FA FF011302	v_mul_u32_u24_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+100206FA A5091302	v_mul_u32_u24_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+100206FA FF012702	v_mul_u32_u24_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+100206FA A5092702	v_mul_u32_u24_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+100206FA FF014002	v_mul_u32_u24_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+100206FA A5094002	v_mul_u32_u24_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+100206FA FF013002	v_mul_u32_u24_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+100206FA A5093002	v_mul_u32_u24_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+100206FA FF014202	v_mul_u32_u24_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+100206FA A5094202	v_mul_u32_u24_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+11900EFA FF001BFF	v_mul_u32_u24_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+0C0206FA FF00B102	v_mul_i32_i24_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+0C0206FA A508B102	v_mul_i32_i24_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+0C0206FA FF011302	v_mul_i32_i24_dpp v1, v2, v3 row_shr:3 row_mask:0xf bank_mask:0xf
+0C0206FA A5091302	v_mul_i32_i24_dpp v1, v2, v3 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+0C0206FA FF012702	v_mul_i32_i24_dpp v1, v2, v3 row_ror:7 row_mask:0xf bank_mask:0xf
+0C0206FA A5092702	v_mul_i32_i24_dpp v1, v2, v3 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+0C0206FA FF014002	v_mul_i32_i24_dpp v1, v2, v3 row_mirror row_mask:0xf bank_mask:0xf
+0C0206FA A5094002	v_mul_i32_i24_dpp v1, v2, v3 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+0C0206FA FF013002	v_mul_i32_i24_dpp v1, v2, v3 wave_shl:1 row_mask:0xf bank_mask:0xf
+0C0206FA A5093002	v_mul_i32_i24_dpp v1, v2, v3 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+0C0206FA FF014202	v_mul_i32_i24_dpp v1, v2, v3 row_bcast:15 row_mask:0xf bank_mask:0xf
+0C0206FA A5094202	v_mul_i32_i24_dpp v1, v2, v3 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+0D900EFA FF001BFF	v_mul_i32_i24_dpp v200, v255, v7 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+D87A0C1F 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(REVERSE,4)
+D87A205C 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(BITMASK_PERM,"pip10")
+D87A001F 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(BITMASK_PERM,"ppppp")
+D87A041F 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(SWAP,1)
+D87A7C1F 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(REVERSE,32)
+D87A8000 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(QUAD_PERM,0,0,0,0)
+D87A801B 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(QUAD_PERM,3,2,1,0)
+D87A80E4 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(QUAD_PERM,0,1,2,3)
+D87A8039 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(QUAD_PERM,1,2,3,0)
+D87AC040 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(ROTATE,0,2)
+D87AC420 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(ROTATE,1,1)
+D87AC0A1 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(ROTATE,0,5)
+D87A0000 01000002	ds_swizzle_b32 v1, v2
+D87A3E1F 01000002	ds_swizzle_b32 v1, v2 offset:swizzle(BITMASK_PERM,"1iiii")
+D87C0000 01000302	ds_permute_b32 v1, v2, v3
+D87E0000 01000302	ds_bpermute_b32 v1, v2, v3
+D87C0004 01000302	ds_permute_b32 v1, v2, v3 offset:4
+D87E0004 01000302	ds_bpermute_b32 v1, v2, v3 offset:4
+D87C0080 01000302	ds_permute_b32 v1, v2, v3 offset:128
+D87E0080 01000302	ds_bpermute_b32 v1, v2, v3 offset:128
+D87CFFFC 01000302	ds_permute_b32 v1, v2, v3 offset:65532
+D87EFFFC 01000302	ds_bpermute_b32 v1, v2, v3 offset:65532
+D87C0000 C800C9FF	ds_permute_b32 v200, v255, v201
+D87A101A C80000FF	ds_swizzle_b32 v200, v255 offset:swizzle(BITMASK_PERM,"pp1p0")
+D3814001 18020702	v_pk_mul_lo_u16 v1, v2, v3
+D3814801 18020702	v_pk_mul_lo_u16 v1, v2, v3 op_sel:[1,0]
+D3814001 10020702	v_pk_mul_lo_u16 v1, v2, v3 op_sel_hi:[0,1]
+D3815801 00020702	v_pk_mul_lo_u16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D381C001 18020702	v_pk_mul_lo_u16 v1, v2, v3 clamp
+D381C801 18020702	v_pk_mul_lo_u16 v1, v2, v3 op_sel:[1,0] clamp
+D3814001 18020602	v_pk_mul_lo_u16 v1, s2, v3
+D3814801 18020602	v_pk_mul_lo_u16 v1, s2, v3 op_sel:[1,0]
+D3814001 10020602	v_pk_mul_lo_u16 v1, s2, v3 op_sel_hi:[0,1]
+D3815801 00020602	v_pk_mul_lo_u16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D381C001 18020602	v_pk_mul_lo_u16 v1, s2, v3 clamp
+D381C801 18020602	v_pk_mul_lo_u16 v1, s2, v3 op_sel:[1,0] clamp
+D3814001 18000702	v_pk_mul_lo_u16 v1, v2, s3
+D3814801 18000702	v_pk_mul_lo_u16 v1, v2, s3 op_sel:[1,0]
+D3814001 10000702	v_pk_mul_lo_u16 v1, v2, s3 op_sel_hi:[0,1]
+D3815801 00000702	v_pk_mul_lo_u16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D381C001 18000702	v_pk_mul_lo_u16 v1, v2, s3 clamp
+D381C801 18000702	v_pk_mul_lo_u16 v1, v2, s3 op_sel:[1,0] clamp
+D3814001 18020687	v_pk_mul_lo_u16 v1, 7, v3
+D3814801 18020687	v_pk_mul_lo_u16 v1, 7, v3 op_sel:[1,0]
+D3814001 10020687	v_pk_mul_lo_u16 v1, 7, v3 op_sel_hi:[0,1]
+D3815801 00020687	v_pk_mul_lo_u16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D381C001 18020687	v_pk_mul_lo_u16 v1, 7, v3 clamp
+D381C801 18020687	v_pk_mul_lo_u16 v1, 7, v3 op_sel:[1,0] clamp
+D3814001 18018702	v_pk_mul_lo_u16 v1, v2, -3
+D3814801 18018702	v_pk_mul_lo_u16 v1, v2, -3 op_sel:[1,0]
+D3814001 10018702	v_pk_mul_lo_u16 v1, v2, -3 op_sel_hi:[0,1]
+D3815801 00018702	v_pk_mul_lo_u16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D381C001 18018702	v_pk_mul_lo_u16 v1, v2, -3 clamp
+D381C801 18018702	v_pk_mul_lo_u16 v1, v2, -3 op_sel:[1,0] clamp
+D38140C8 1803FFFE	v_pk_mul_lo_u16 v200, v254, v255
+D38148C8 1803FFFE	v_pk_mul_lo_u16 v200, v254, v255 op_sel:[1,0]
+D38140C8 1003FFFE	v_pk_mul_lo_u16 v200, v254, v255 op_sel_hi:[0,1]
+D38158C8 0003FFFE	v_pk_mul_lo_u16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D381C0C8 1803FFFE	v_pk_mul_lo_u16 v200, v254, v255 clamp
+D381C8C8 1803FFFE	v_pk_mul_lo_u16 v200, v254, v255 op_sel:[1,0] clamp
+D3814001 180206F2	v_pk_mul_lo_u16 v1, 1.0, v3
+D3814801 180206F2	v_pk_mul_lo_u16 v1, 1.0, v3 op_sel:[1,0]
+D3814001 100206F2	v_pk_mul_lo_u16 v1, 1.0, v3 op_sel_hi:[0,1]
+D3815801 000206F2	v_pk_mul_lo_u16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D381C001 180206F2	v_pk_mul_lo_u16 v1, 1.0, v3 clamp
+D381C801 180206F2	v_pk_mul_lo_u16 v1, 1.0, v3 op_sel:[1,0] clamp
+D38A4001 18020702	v_pk_add_u16 v1, v2, v3
+D38A4801 18020702	v_pk_add_u16 v1, v2, v3 op_sel:[1,0]
+D38A4001 10020702	v_pk_add_u16 v1, v2, v3 op_sel_hi:[0,1]
+D38A5801 00020702	v_pk_add_u16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38AC001 18020702	v_pk_add_u16 v1, v2, v3 clamp
+D38AC801 18020702	v_pk_add_u16 v1, v2, v3 op_sel:[1,0] clamp
+D38A4001 18020602	v_pk_add_u16 v1, s2, v3
+D38A4801 18020602	v_pk_add_u16 v1, s2, v3 op_sel:[1,0]
+D38A4001 10020602	v_pk_add_u16 v1, s2, v3 op_sel_hi:[0,1]
+D38A5801 00020602	v_pk_add_u16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38AC001 18020602	v_pk_add_u16 v1, s2, v3 clamp
+D38AC801 18020602	v_pk_add_u16 v1, s2, v3 op_sel:[1,0] clamp
+D38A4001 18000702	v_pk_add_u16 v1, v2, s3
+D38A4801 18000702	v_pk_add_u16 v1, v2, s3 op_sel:[1,0]
+D38A4001 10000702	v_pk_add_u16 v1, v2, s3 op_sel_hi:[0,1]
+D38A5801 00000702	v_pk_add_u16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D38AC001 18000702	v_pk_add_u16 v1, v2, s3 clamp
+D38AC801 18000702	v_pk_add_u16 v1, v2, s3 op_sel:[1,0] clamp
+D38A4001 18020687	v_pk_add_u16 v1, 7, v3
+D38A4801 18020687	v_pk_add_u16 v1, 7, v3 op_sel:[1,0]
+D38A4001 10020687	v_pk_add_u16 v1, 7, v3 op_sel_hi:[0,1]
+D38A5801 00020687	v_pk_add_u16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38AC001 18020687	v_pk_add_u16 v1, 7, v3 clamp
+D38AC801 18020687	v_pk_add_u16 v1, 7, v3 op_sel:[1,0] clamp
+D38A4001 18018702	v_pk_add_u16 v1, v2, -3
+D38A4801 18018702	v_pk_add_u16 v1, v2, -3 op_sel:[1,0]
+D38A4001 10018702	v_pk_add_u16 v1, v2, -3 op_sel_hi:[0,1]
+D38A5801 00018702	v_pk_add_u16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D38AC001 18018702	v_pk_add_u16 v1, v2, -3 clamp
+D38AC801 18018702	v_pk_add_u16 v1, v2, -3 op_sel:[1,0] clamp
+D38A40C8 1803FFFE	v_pk_add_u16 v200, v254, v255
+D38A48C8 1803FFFE	v_pk_add_u16 v200, v254, v255 op_sel:[1,0]
+D38A40C8 1003FFFE	v_pk_add_u16 v200, v254, v255 op_sel_hi:[0,1]
+D38A58C8 0003FFFE	v_pk_add_u16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D38AC0C8 1803FFFE	v_pk_add_u16 v200, v254, v255 clamp
+D38AC8C8 1803FFFE	v_pk_add_u16 v200, v254, v255 op_sel:[1,0] clamp
+D38A4001 180206F2	v_pk_add_u16 v1, 1.0, v3
+D38A4801 180206F2	v_pk_add_u16 v1, 1.0, v3 op_sel:[1,0]
+D38A4001 100206F2	v_pk_add_u16 v1, 1.0, v3 op_sel_hi:[0,1]
+D38A5801 000206F2	v_pk_add_u16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38AC001 180206F2	v_pk_add_u16 v1, 1.0, v3 clamp
+D38AC801 180206F2	v_pk_add_u16 v1, 1.0, v3 op_sel:[1,0] clamp
+D3824001 18020702	v_pk_add_i16 v1, v2, v3
+D3824801 18020702	v_pk_add_i16 v1, v2, v3 op_sel:[1,0]
+D3824001 10020702	v_pk_add_i16 v1, v2, v3 op_sel_hi:[0,1]
+D3825801 00020702	v_pk_add_i16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D382C001 18020702	v_pk_add_i16 v1, v2, v3 clamp
+D382C801 18020702	v_pk_add_i16 v1, v2, v3 op_sel:[1,0] clamp
+D3824001 18020602	v_pk_add_i16 v1, s2, v3
+D3824801 18020602	v_pk_add_i16 v1, s2, v3 op_sel:[1,0]
+D3824001 10020602	v_pk_add_i16 v1, s2, v3 op_sel_hi:[0,1]
+D3825801 00020602	v_pk_add_i16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D382C001 18020602	v_pk_add_i16 v1, s2, v3 clamp
+D382C801 18020602	v_pk_add_i16 v1, s2, v3 op_sel:[1,0] clamp
+D3824001 18000702	v_pk_add_i16 v1, v2, s3
+D3824801 18000702	v_pk_add_i16 v1, v2, s3 op_sel:[1,0]
+D3824001 10000702	v_pk_add_i16 v1, v2, s3 op_sel_hi:[0,1]
+D3825801 00000702	v_pk_add_i16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D382C001 18000702	v_pk_add_i16 v1, v2, s3 clamp
+D382C801 18000702	v_pk_add_i16 v1, v2, s3 op_sel:[1,0] clamp
+D3824001 18020687	v_pk_add_i16 v1, 7, v3
+D3824801 18020687	v_pk_add_i16 v1, 7, v3 op_sel:[1,0]
+D3824001 10020687	v_pk_add_i16 v1, 7, v3 op_sel_hi:[0,1]
+D3825801 00020687	v_pk_add_i16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D382C001 18020687	v_pk_add_i16 v1, 7, v3 clamp
+D382C801 18020687	v_pk_add_i16 v1, 7, v3 op_sel:[1,0] clamp
+D3824001 18018702	v_pk_add_i16 v1, v2, -3
+D3824801 18018702	v_pk_add_i16 v1, v2, -3 op_sel:[1,0]
+D3824001 10018702	v_pk_add_i16 v1, v2, -3 op_sel_hi:[0,1]
+D3825801 00018702	v_pk_add_i16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D382C001 18018702	v_pk_add_i16 v1, v2, -3 clamp
+D382C801 18018702	v_pk_add_i16 v1, v2, -3 op_sel:[1,0] clamp
+D38240C8 1803FFFE	v_pk_add_i16 v200, v254, v255
+D38248C8 1803FFFE	v_pk_add_i16 v200, v254, v255 op_sel:[1,0]
+D38240C8 1003FFFE	v_pk_add_i16 v200, v254, v255 op_sel_hi:[0,1]
+D38258C8 0003FFFE	v_pk_add_i16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D382C0C8 1803FFFE	v_pk_add_i16 v200, v254, v255 clamp
+D382C8C8 1803FFFE	v_pk_add_i16 v200, v254, v255 op_sel:[1,0] clamp
+D3824001 180206F2	v_pk_add_i16 v1, 1.0, v3
+D3824801 180206F2	v_pk_add_i16 v1, 1.0, v3 op_sel:[1,0]
+D3824001 100206F2	v_pk_add_i16 v1, 1.0, v3 op_sel_hi:[0,1]
+D3825801 000206F2	v_pk_add_i16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D382C001 180206F2	v_pk_add_i16 v1, 1.0, v3 clamp
+D382C801 180206F2	v_pk_add_i16 v1, 1.0, v3 op_sel:[1,0] clamp
+D38B4001 18020702	v_pk_sub_u16 v1, v2, v3
+D38B4801 18020702	v_pk_sub_u16 v1, v2, v3 op_sel:[1,0]
+D38B4001 10020702	v_pk_sub_u16 v1, v2, v3 op_sel_hi:[0,1]
+D38B5801 00020702	v_pk_sub_u16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38BC001 18020702	v_pk_sub_u16 v1, v2, v3 clamp
+D38BC801 18020702	v_pk_sub_u16 v1, v2, v3 op_sel:[1,0] clamp
+D38B4001 18020602	v_pk_sub_u16 v1, s2, v3
+D38B4801 18020602	v_pk_sub_u16 v1, s2, v3 op_sel:[1,0]
+D38B4001 10020602	v_pk_sub_u16 v1, s2, v3 op_sel_hi:[0,1]
+D38B5801 00020602	v_pk_sub_u16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38BC001 18020602	v_pk_sub_u16 v1, s2, v3 clamp
+D38BC801 18020602	v_pk_sub_u16 v1, s2, v3 op_sel:[1,0] clamp
+D38B4001 18000702	v_pk_sub_u16 v1, v2, s3
+D38B4801 18000702	v_pk_sub_u16 v1, v2, s3 op_sel:[1,0]
+D38B4001 10000702	v_pk_sub_u16 v1, v2, s3 op_sel_hi:[0,1]
+D38B5801 00000702	v_pk_sub_u16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D38BC001 18000702	v_pk_sub_u16 v1, v2, s3 clamp
+D38BC801 18000702	v_pk_sub_u16 v1, v2, s3 op_sel:[1,0] clamp
+D38B4001 18020687	v_pk_sub_u16 v1, 7, v3
+D38B4801 18020687	v_pk_sub_u16 v1, 7, v3 op_sel:[1,0]
+D38B4001 10020687	v_pk_sub_u16 v1, 7, v3 op_sel_hi:[0,1]
+D38B5801 00020687	v_pk_sub_u16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38BC001 18020687	v_pk_sub_u16 v1, 7, v3 clamp
+D38BC801 18020687	v_pk_sub_u16 v1, 7, v3 op_sel:[1,0] clamp
+D38B4001 18018702	v_pk_sub_u16 v1, v2, -3
+D38B4801 18018702	v_pk_sub_u16 v1, v2, -3 op_sel:[1,0]
+D38B4001 10018702	v_pk_sub_u16 v1, v2, -3 op_sel_hi:[0,1]
+D38B5801 00018702	v_pk_sub_u16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D38BC001 18018702	v_pk_sub_u16 v1, v2, -3 clamp
+D38BC801 18018702	v_pk_sub_u16 v1, v2, -3 op_sel:[1,0] clamp
+D38B40C8 1803FFFE	v_pk_sub_u16 v200, v254, v255
+D38B48C8 1803FFFE	v_pk_sub_u16 v200, v254, v255 op_sel:[1,0]
+D38B40C8 1003FFFE	v_pk_sub_u16 v200, v254, v255 op_sel_hi:[0,1]
+D38B58C8 0003FFFE	v_pk_sub_u16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D38BC0C8 1803FFFE	v_pk_sub_u16 v200, v254, v255 clamp
+D38BC8C8 1803FFFE	v_pk_sub_u16 v200, v254, v255 op_sel:[1,0] clamp
+D38B4001 180206F2	v_pk_sub_u16 v1, 1.0, v3
+D38B4801 180206F2	v_pk_sub_u16 v1, 1.0, v3 op_sel:[1,0]
+D38B4001 100206F2	v_pk_sub_u16 v1, 1.0, v3 op_sel_hi:[0,1]
+D38B5801 000206F2	v_pk_sub_u16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38BC001 180206F2	v_pk_sub_u16 v1, 1.0, v3 clamp
+D38BC801 180206F2	v_pk_sub_u16 v1, 1.0, v3 op_sel:[1,0] clamp
+D3834001 18020702	v_pk_sub_i16 v1, v2, v3
+D3834801 18020702	v_pk_sub_i16 v1, v2, v3 op_sel:[1,0]
+D3834001 10020702	v_pk_sub_i16 v1, v2, v3 op_sel_hi:[0,1]
+D3835801 00020702	v_pk_sub_i16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D383C001 18020702	v_pk_sub_i16 v1, v2, v3 clamp
+D383C801 18020702	v_pk_sub_i16 v1, v2, v3 op_sel:[1,0] clamp
+D3834001 18020602	v_pk_sub_i16 v1, s2, v3
+D3834801 18020602	v_pk_sub_i16 v1, s2, v3 op_sel:[1,0]
+D3834001 10020602	v_pk_sub_i16 v1, s2, v3 op_sel_hi:[0,1]
+D3835801 00020602	v_pk_sub_i16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D383C001 18020602	v_pk_sub_i16 v1, s2, v3 clamp
+D383C801 18020602	v_pk_sub_i16 v1, s2, v3 op_sel:[1,0] clamp
+D3834001 18000702	v_pk_sub_i16 v1, v2, s3
+D3834801 18000702	v_pk_sub_i16 v1, v2, s3 op_sel:[1,0]
+D3834001 10000702	v_pk_sub_i16 v1, v2, s3 op_sel_hi:[0,1]
+D3835801 00000702	v_pk_sub_i16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D383C001 18000702	v_pk_sub_i16 v1, v2, s3 clamp
+D383C801 18000702	v_pk_sub_i16 v1, v2, s3 op_sel:[1,0] clamp
+D3834001 18020687	v_pk_sub_i16 v1, 7, v3
+D3834801 18020687	v_pk_sub_i16 v1, 7, v3 op_sel:[1,0]
+D3834001 10020687	v_pk_sub_i16 v1, 7, v3 op_sel_hi:[0,1]
+D3835801 00020687	v_pk_sub_i16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D383C001 18020687	v_pk_sub_i16 v1, 7, v3 clamp
+D383C801 18020687	v_pk_sub_i16 v1, 7, v3 op_sel:[1,0] clamp
+D3834001 18018702	v_pk_sub_i16 v1, v2, -3
+D3834801 18018702	v_pk_sub_i16 v1, v2, -3 op_sel:[1,0]
+D3834001 10018702	v_pk_sub_i16 v1, v2, -3 op_sel_hi:[0,1]
+D3835801 00018702	v_pk_sub_i16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D383C001 18018702	v_pk_sub_i16 v1, v2, -3 clamp
+D383C801 18018702	v_pk_sub_i16 v1, v2, -3 op_sel:[1,0] clamp
+D38340C8 1803FFFE	v_pk_sub_i16 v200, v254, v255
+D38348C8 1803FFFE	v_pk_sub_i16 v200, v254, v255 op_sel:[1,0]
+D38340C8 1003FFFE	v_pk_sub_i16 v200, v254, v255 op_sel_hi:[0,1]
+D38358C8 0003FFFE	v_pk_sub_i16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D383C0C8 1803FFFE	v_pk_sub_i16 v200, v254, v255 clamp
+D383C8C8 1803FFFE	v_pk_sub_i16 v200, v254, v255 op_sel:[1,0] clamp
+D3834001 180206F2	v_pk_sub_i16 v1, 1.0, v3
+D3834801 180206F2	v_pk_sub_i16 v1, 1.0, v3 op_sel:[1,0]
+D3834001 100206F2	v_pk_sub_i16 v1, 1.0, v3 op_sel_hi:[0,1]
+D3835801 000206F2	v_pk_sub_i16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D383C001 180206F2	v_pk_sub_i16 v1, 1.0, v3 clamp
+D383C801 180206F2	v_pk_sub_i16 v1, 1.0, v3 op_sel:[1,0] clamp
+D3844001 18020702	v_pk_lshlrev_b16 v1, v2, v3
+D3844801 18020702	v_pk_lshlrev_b16 v1, v2, v3 op_sel:[1,0]
+D3844001 10020702	v_pk_lshlrev_b16 v1, v2, v3 op_sel_hi:[0,1]
+D3845801 00020702	v_pk_lshlrev_b16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D384C001 18020702	v_pk_lshlrev_b16 v1, v2, v3 clamp
+D384C801 18020702	v_pk_lshlrev_b16 v1, v2, v3 op_sel:[1,0] clamp
+D3844001 18020602	v_pk_lshlrev_b16 v1, s2, v3
+D3844801 18020602	v_pk_lshlrev_b16 v1, s2, v3 op_sel:[1,0]
+D3844001 10020602	v_pk_lshlrev_b16 v1, s2, v3 op_sel_hi:[0,1]
+D3845801 00020602	v_pk_lshlrev_b16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D384C001 18020602	v_pk_lshlrev_b16 v1, s2, v3 clamp
+D384C801 18020602	v_pk_lshlrev_b16 v1, s2, v3 op_sel:[1,0] clamp
+D3844001 18000702	v_pk_lshlrev_b16 v1, v2, s3
+D3844801 18000702	v_pk_lshlrev_b16 v1, v2, s3 op_sel:[1,0]
+D3844001 10000702	v_pk_lshlrev_b16 v1, v2, s3 op_sel_hi:[0,1]
+D3845801 00000702	v_pk_lshlrev_b16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D384C001 18000702	v_pk_lshlrev_b16 v1, v2, s3 clamp
+D384C801 18000702	v_pk_lshlrev_b16 v1, v2, s3 op_sel:[1,0] clamp
+D3844001 18020687	v_pk_lshlrev_b16 v1, 7, v3
+D3844801 18020687	v_pk_lshlrev_b16 v1, 7, v3 op_sel:[1,0]
+D3844001 10020687	v_pk_lshlrev_b16 v1, 7, v3 op_sel_hi:[0,1]
+D3845801 00020687	v_pk_lshlrev_b16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D384C001 18020687	v_pk_lshlrev_b16 v1, 7, v3 clamp
+D384C801 18020687	v_pk_lshlrev_b16 v1, 7, v3 op_sel:[1,0] clamp
+D3844001 18018702	v_pk_lshlrev_b16 v1, v2, -3
+D3844801 18018702	v_pk_lshlrev_b16 v1, v2, -3 op_sel:[1,0]
+D3844001 10018702	v_pk_lshlrev_b16 v1, v2, -3 op_sel_hi:[0,1]
+D3845801 00018702	v_pk_lshlrev_b16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D384C001 18018702	v_pk_lshlrev_b16 v1, v2, -3 clamp
+D384C801 18018702	v_pk_lshlrev_b16 v1, v2, -3 op_sel:[1,0] clamp
+D38440C8 1803FFFE	v_pk_lshlrev_b16 v200, v254, v255
+D38448C8 1803FFFE	v_pk_lshlrev_b16 v200, v254, v255 op_sel:[1,0]
+D38440C8 1003FFFE	v_pk_lshlrev_b16 v200, v254, v255 op_sel_hi:[0,1]
+D38458C8 0003FFFE	v_pk_lshlrev_b16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D384C0C8 1803FFFE	v_pk_lshlrev_b16 v200, v254, v255 clamp
+D384C8C8 1803FFFE	v_pk_lshlrev_b16 v200, v254, v255 op_sel:[1,0] clamp
+D3844001 180206F2	v_pk_lshlrev_b16 v1, 1.0, v3
+D3844801 180206F2	v_pk_lshlrev_b16 v1, 1.0, v3 op_sel:[1,0]
+D3844001 100206F2	v_pk_lshlrev_b16 v1, 1.0, v3 op_sel_hi:[0,1]
+D3845801 000206F2	v_pk_lshlrev_b16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D384C001 180206F2	v_pk_lshlrev_b16 v1, 1.0, v3 clamp
+D384C801 180206F2	v_pk_lshlrev_b16 v1, 1.0, v3 op_sel:[1,0] clamp
+D3854001 18020702	v_pk_lshrrev_b16 v1, v2, v3
+D3854801 18020702	v_pk_lshrrev_b16 v1, v2, v3 op_sel:[1,0]
+D3854001 10020702	v_pk_lshrrev_b16 v1, v2, v3 op_sel_hi:[0,1]
+D3855801 00020702	v_pk_lshrrev_b16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D385C001 18020702	v_pk_lshrrev_b16 v1, v2, v3 clamp
+D385C801 18020702	v_pk_lshrrev_b16 v1, v2, v3 op_sel:[1,0] clamp
+D3854001 18020602	v_pk_lshrrev_b16 v1, s2, v3
+D3854801 18020602	v_pk_lshrrev_b16 v1, s2, v3 op_sel:[1,0]
+D3854001 10020602	v_pk_lshrrev_b16 v1, s2, v3 op_sel_hi:[0,1]
+D3855801 00020602	v_pk_lshrrev_b16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D385C001 18020602	v_pk_lshrrev_b16 v1, s2, v3 clamp
+D385C801 18020602	v_pk_lshrrev_b16 v1, s2, v3 op_sel:[1,0] clamp
+D3854001 18000702	v_pk_lshrrev_b16 v1, v2, s3
+D3854801 18000702	v_pk_lshrrev_b16 v1, v2, s3 op_sel:[1,0]
+D3854001 10000702	v_pk_lshrrev_b16 v1, v2, s3 op_sel_hi:[0,1]
+D3855801 00000702	v_pk_lshrrev_b16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D385C001 18000702	v_pk_lshrrev_b16 v1, v2, s3 clamp
+D385C801 18000702	v_pk_lshrrev_b16 v1, v2, s3 op_sel:[1,0] clamp
+D3854001 18020687	v_pk_lshrrev_b16 v1, 7, v3
+D3854801 18020687	v_pk_lshrrev_b16 v1, 7, v3 op_sel:[1,0]
+D3854001 10020687	v_pk_lshrrev_b16 v1, 7, v3 op_sel_hi:[0,1]
+D3855801 00020687	v_pk_lshrrev_b16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D385C001 18020687	v_pk_lshrrev_b16 v1, 7, v3 clamp
+D385C801 18020687	v_pk_lshrrev_b16 v1, 7, v3 op_sel:[1,0] clamp
+D3854001 18018702	v_pk_lshrrev_b16 v1, v2, -3
+D3854801 18018702	v_pk_lshrrev_b16 v1, v2, -3 op_sel:[1,0]
+D3854001 10018702	v_pk_lshrrev_b16 v1, v2, -3 op_sel_hi:[0,1]
+D3855801 00018702	v_pk_lshrrev_b16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D385C001 18018702	v_pk_lshrrev_b16 v1, v2, -3 clamp
+D385C801 18018702	v_pk_lshrrev_b16 v1, v2, -3 op_sel:[1,0] clamp
+D38540C8 1803FFFE	v_pk_lshrrev_b16 v200, v254, v255
+D38548C8 1803FFFE	v_pk_lshrrev_b16 v200, v254, v255 op_sel:[1,0]
+D38540C8 1003FFFE	v_pk_lshrrev_b16 v200, v254, v255 op_sel_hi:[0,1]
+D38558C8 0003FFFE	v_pk_lshrrev_b16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D385C0C8 1803FFFE	v_pk_lshrrev_b16 v200, v254, v255 clamp
+D385C8C8 1803FFFE	v_pk_lshrrev_b16 v200, v254, v255 op_sel:[1,0] clamp
+D3854001 180206F2	v_pk_lshrrev_b16 v1, 1.0, v3
+D3854801 180206F2	v_pk_lshrrev_b16 v1, 1.0, v3 op_sel:[1,0]
+D3854001 100206F2	v_pk_lshrrev_b16 v1, 1.0, v3 op_sel_hi:[0,1]
+D3855801 000206F2	v_pk_lshrrev_b16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D385C001 180206F2	v_pk_lshrrev_b16 v1, 1.0, v3 clamp
+D385C801 180206F2	v_pk_lshrrev_b16 v1, 1.0, v3 op_sel:[1,0] clamp
+D3864001 18020702	v_pk_ashrrev_i16 v1, v2, v3
+D3864801 18020702	v_pk_ashrrev_i16 v1, v2, v3 op_sel:[1,0]
+D3864001 10020702	v_pk_ashrrev_i16 v1, v2, v3 op_sel_hi:[0,1]
+D3865801 00020702	v_pk_ashrrev_i16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D386C001 18020702	v_pk_ashrrev_i16 v1, v2, v3 clamp
+D386C801 18020702	v_pk_ashrrev_i16 v1, v2, v3 op_sel:[1,0] clamp
+D3864001 18020602	v_pk_ashrrev_i16 v1, s2, v3
+D3864801 18020602	v_pk_ashrrev_i16 v1, s2, v3 op_sel:[1,0]
+D3864001 10020602	v_pk_ashrrev_i16 v1, s2, v3 op_sel_hi:[0,1]
+D3865801 00020602	v_pk_ashrrev_i16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D386C001 18020602	v_pk_ashrrev_i16 v1, s2, v3 clamp
+D386C801 18020602	v_pk_ashrrev_i16 v1, s2, v3 op_sel:[1,0] clamp
+D3864001 18000702	v_pk_ashrrev_i16 v1, v2, s3
+D3864801 18000702	v_pk_ashrrev_i16 v1, v2, s3 op_sel:[1,0]
+D3864001 10000702	v_pk_ashrrev_i16 v1, v2, s3 op_sel_hi:[0,1]
+D3865801 00000702	v_pk_ashrrev_i16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D386C001 18000702	v_pk_ashrrev_i16 v1, v2, s3 clamp
+D386C801 18000702	v_pk_ashrrev_i16 v1, v2, s3 op_sel:[1,0] clamp
+D3864001 18020687	v_pk_ashrrev_i16 v1, 7, v3
+D3864801 18020687	v_pk_ashrrev_i16 v1, 7, v3 op_sel:[1,0]
+D3864001 10020687	v_pk_ashrrev_i16 v1, 7, v3 op_sel_hi:[0,1]
+D3865801 00020687	v_pk_ashrrev_i16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D386C001 18020687	v_pk_ashrrev_i16 v1, 7, v3 clamp
+D386C801 18020687	v_pk_ashrrev_i16 v1, 7, v3 op_sel:[1,0] clamp
+D3864001 18018702	v_pk_ashrrev_i16 v1, v2, -3
+D3864801 18018702	v_pk_ashrrev_i16 v1, v2, -3 op_sel:[1,0]
+D3864001 10018702	v_pk_ashrrev_i16 v1, v2, -3 op_sel_hi:[0,1]
+D3865801 00018702	v_pk_ashrrev_i16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D386C001 18018702	v_pk_ashrrev_i16 v1, v2, -3 clamp
+D386C801 18018702	v_pk_ashrrev_i16 v1, v2, -3 op_sel:[1,0] clamp
+D38640C8 1803FFFE	v_pk_ashrrev_i16 v200, v254, v255
+D38648C8 1803FFFE	v_pk_ashrrev_i16 v200, v254, v255 op_sel:[1,0]
+D38640C8 1003FFFE	v_pk_ashrrev_i16 v200, v254, v255 op_sel_hi:[0,1]
+D38658C8 0003FFFE	v_pk_ashrrev_i16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D386C0C8 1803FFFE	v_pk_ashrrev_i16 v200, v254, v255 clamp
+D386C8C8 1803FFFE	v_pk_ashrrev_i16 v200, v254, v255 op_sel:[1,0] clamp
+D3864001 180206F2	v_pk_ashrrev_i16 v1, 1.0, v3
+D3864801 180206F2	v_pk_ashrrev_i16 v1, 1.0, v3 op_sel:[1,0]
+D3864001 100206F2	v_pk_ashrrev_i16 v1, 1.0, v3 op_sel_hi:[0,1]
+D3865801 000206F2	v_pk_ashrrev_i16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D386C001 180206F2	v_pk_ashrrev_i16 v1, 1.0, v3 clamp
+D386C801 180206F2	v_pk_ashrrev_i16 v1, 1.0, v3 op_sel:[1,0] clamp
+D3874001 18020702	v_pk_max_i16 v1, v2, v3
+D3874801 18020702	v_pk_max_i16 v1, v2, v3 op_sel:[1,0]
+D3874001 10020702	v_pk_max_i16 v1, v2, v3 op_sel_hi:[0,1]
+D3875801 00020702	v_pk_max_i16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D387C001 18020702	v_pk_max_i16 v1, v2, v3 clamp
+D387C801 18020702	v_pk_max_i16 v1, v2, v3 op_sel:[1,0] clamp
+D3874001 18020602	v_pk_max_i16 v1, s2, v3
+D3874801 18020602	v_pk_max_i16 v1, s2, v3 op_sel:[1,0]
+D3874001 10020602	v_pk_max_i16 v1, s2, v3 op_sel_hi:[0,1]
+D3875801 00020602	v_pk_max_i16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D387C001 18020602	v_pk_max_i16 v1, s2, v3 clamp
+D387C801 18020602	v_pk_max_i16 v1, s2, v3 op_sel:[1,0] clamp
+D3874001 18000702	v_pk_max_i16 v1, v2, s3
+D3874801 18000702	v_pk_max_i16 v1, v2, s3 op_sel:[1,0]
+D3874001 10000702	v_pk_max_i16 v1, v2, s3 op_sel_hi:[0,1]
+D3875801 00000702	v_pk_max_i16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D387C001 18000702	v_pk_max_i16 v1, v2, s3 clamp
+D387C801 18000702	v_pk_max_i16 v1, v2, s3 op_sel:[1,0] clamp
+D3874001 18020687	v_pk_max_i16 v1, 7, v3
+D3874801 18020687	v_pk_max_i16 v1, 7, v3 op_sel:[1,0]
+D3874001 10020687	v_pk_max_i16 v1, 7, v3 op_sel_hi:[0,1]
+D3875801 00020687	v_pk_max_i16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D387C001 18020687	v_pk_max_i16 v1, 7, v3 clamp
+D387C801 18020687	v_pk_max_i16 v1, 7, v3 op_sel:[1,0] clamp
+D3874001 18018702	v_pk_max_i16 v1, v2, -3
+D3874801 18018702	v_pk_max_i16 v1, v2, -3 op_sel:[1,0]
+D3874001 10018702	v_pk_max_i16 v1, v2, -3 op_sel_hi:[0,1]
+D3875801 00018702	v_pk_max_i16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D387C001 18018702	v_pk_max_i16 v1, v2, -3 clamp
+D387C801 18018702	v_pk_max_i16 v1, v2, -3 op_sel:[1,0] clamp
+D38740C8 1803FFFE	v_pk_max_i16 v200, v254, v255
+D38748C8 1803FFFE	v_pk_max_i16 v200, v254, v255 op_sel:[1,0]
+D38740C8 1003FFFE	v_pk_max_i16 v200, v254, v255 op_sel_hi:[0,1]
+D38758C8 0003FFFE	v_pk_max_i16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D387C0C8 1803FFFE	v_pk_max_i16 v200, v254, v255 clamp
+D387C8C8 1803FFFE	v_pk_max_i16 v200, v254, v255 op_sel:[1,0] clamp
+D3874001 180206F2	v_pk_max_i16 v1, 1.0, v3
+D3874801 180206F2	v_pk_max_i16 v1, 1.0, v3 op_sel:[1,0]
+D3874001 100206F2	v_pk_max_i16 v1, 1.0, v3 op_sel_hi:[0,1]
+D3875801 000206F2	v_pk_max_i16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D387C001 180206F2	v_pk_max_i16 v1, 1.0, v3 clamp
+D387C801 180206F2	v_pk_max_i16 v1, 1.0, v3 op_sel:[1,0] clamp
+D3884001 18020702	v_pk_min_i16 v1, v2, v3
+D3884801 18020702	v_pk_min_i16 v1, v2, v3 op_sel:[1,0]
+D3884001 10020702	v_pk_min_i16 v1, v2, v3 op_sel_hi:[0,1]
+D3885801 00020702	v_pk_min_i16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D388C001 18020702	v_pk_min_i16 v1, v2, v3 clamp
+D388C801 18020702	v_pk_min_i16 v1, v2, v3 op_sel:[1,0] clamp
+D3884001 18020602	v_pk_min_i16 v1, s2, v3
+D3884801 18020602	v_pk_min_i16 v1, s2, v3 op_sel:[1,0]
+D3884001 10020602	v_pk_min_i16 v1, s2, v3 op_sel_hi:[0,1]
+D3885801 00020602	v_pk_min_i16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D388C001 18020602	v_pk_min_i16 v1, s2, v3 clamp
+D388C801 18020602	v_pk_min_i16 v1, s2, v3 op_sel:[1,0] clamp
+D3884001 18000702	v_pk_min_i16 v1, v2, s3
+D3884801 18000702	v_pk_min_i16 v1, v2, s3 op_sel:[1,0]
+D3884001 10000702	v_pk_min_i16 v1, v2, s3 op_sel_hi:[0,1]
+D3885801 00000702	v_pk_min_i16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D388C001 18000702	v_pk_min_i16 v1, v2, s3 clamp
+D388C801 18000702	v_pk_min_i16 v1, v2, s3 op_sel:[1,0] clamp
+D3884001 18020687	v_pk_min_i16 v1, 7, v3
+D3884801 18020687	v_pk_min_i16 v1, 7, v3 op_sel:[1,0]
+D3884001 10020687	v_pk_min_i16 v1, 7, v3 op_sel_hi:[0,1]
+D3885801 00020687	v_pk_min_i16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D388C001 18020687	v_pk_min_i16 v1, 7, v3 clamp
+D388C801 18020687	v_pk_min_i16 v1, 7, v3 op_sel:[1,0] clamp
+D3884001 18018702	v_pk_min_i16 v1, v2, -3
+D3884801 18018702	v_pk_min_i16 v1, v2, -3 op_sel:[1,0]
+D3884001 10018702	v_pk_min_i16 v1, v2, -3 op_sel_hi:[0,1]
+D3885801 00018702	v_pk_min_i16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D388C001 18018702	v_pk_min_i16 v1, v2, -3 clamp
+D388C801 18018702	v_pk_min_i16 v1, v2, -3 op_sel:[1,0] clamp
+D38840C8 1803FFFE	v_pk_min_i16 v200, v254, v255
+D38848C8 1803FFFE	v_pk_min_i16 v200, v254, v255 op_sel:[1,0]
+D38840C8 1003FFFE	v_pk_min_i16 v200, v254, v255 op_sel_hi:[0,1]
+D38858C8 0003FFFE	v_pk_min_i16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D388C0C8 1803FFFE	v_pk_min_i16 v200, v254, v255 clamp
+D388C8C8 1803FFFE	v_pk_min_i16 v200, v254, v255 op_sel:[1,0] clamp
+D3884001 180206F2	v_pk_min_i16 v1, 1.0, v3
+D3884801 180206F2	v_pk_min_i16 v1, 1.0, v3 op_sel:[1,0]
+D3884001 100206F2	v_pk_min_i16 v1, 1.0, v3 op_sel_hi:[0,1]
+D3885801 000206F2	v_pk_min_i16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D388C001 180206F2	v_pk_min_i16 v1, 1.0, v3 clamp
+D388C801 180206F2	v_pk_min_i16 v1, 1.0, v3 op_sel:[1,0] clamp
+D38C4001 18020702	v_pk_max_u16 v1, v2, v3
+D38C4801 18020702	v_pk_max_u16 v1, v2, v3 op_sel:[1,0]
+D38C4001 10020702	v_pk_max_u16 v1, v2, v3 op_sel_hi:[0,1]
+D38C5801 00020702	v_pk_max_u16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38CC001 18020702	v_pk_max_u16 v1, v2, v3 clamp
+D38CC801 18020702	v_pk_max_u16 v1, v2, v3 op_sel:[1,0] clamp
+D38C4001 18020602	v_pk_max_u16 v1, s2, v3
+D38C4801 18020602	v_pk_max_u16 v1, s2, v3 op_sel:[1,0]
+D38C4001 10020602	v_pk_max_u16 v1, s2, v3 op_sel_hi:[0,1]
+D38C5801 00020602	v_pk_max_u16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38CC001 18020602	v_pk_max_u16 v1, s2, v3 clamp
+D38CC801 18020602	v_pk_max_u16 v1, s2, v3 op_sel:[1,0] clamp
+D38C4001 18000702	v_pk_max_u16 v1, v2, s3
+D38C4801 18000702	v_pk_max_u16 v1, v2, s3 op_sel:[1,0]
+D38C4001 10000702	v_pk_max_u16 v1, v2, s3 op_sel_hi:[0,1]
+D38C5801 00000702	v_pk_max_u16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D38CC001 18000702	v_pk_max_u16 v1, v2, s3 clamp
+D38CC801 18000702	v_pk_max_u16 v1, v2, s3 op_sel:[1,0] clamp
+D38C4001 18020687	v_pk_max_u16 v1, 7, v3
+D38C4801 18020687	v_pk_max_u16 v1, 7, v3 op_sel:[1,0]
+D38C4001 10020687	v_pk_max_u16 v1, 7, v3 op_sel_hi:[0,1]
+D38C5801 00020687	v_pk_max_u16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38CC001 18020687	v_pk_max_u16 v1, 7, v3 clamp
+D38CC801 18020687	v_pk_max_u16 v1, 7, v3 op_sel:[1,0] clamp
+D38C4001 18018702	v_pk_max_u16 v1, v2, -3
+D38C4801 18018702	v_pk_max_u16 v1, v2, -3 op_sel:[1,0]
+D38C4001 10018702	v_pk_max_u16 v1, v2, -3 op_sel_hi:[0,1]
+D38C5801 00018702	v_pk_max_u16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D38CC001 18018702	v_pk_max_u16 v1, v2, -3 clamp
+D38CC801 18018702	v_pk_max_u16 v1, v2, -3 op_sel:[1,0] clamp
+D38C40C8 1803FFFE	v_pk_max_u16 v200, v254, v255
+D38C48C8 1803FFFE	v_pk_max_u16 v200, v254, v255 op_sel:[1,0]
+D38C40C8 1003FFFE	v_pk_max_u16 v200, v254, v255 op_sel_hi:[0,1]
+D38C58C8 0003FFFE	v_pk_max_u16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D38CC0C8 1803FFFE	v_pk_max_u16 v200, v254, v255 clamp
+D38CC8C8 1803FFFE	v_pk_max_u16 v200, v254, v255 op_sel:[1,0] clamp
+D38C4001 180206F2	v_pk_max_u16 v1, 1.0, v3
+D38C4801 180206F2	v_pk_max_u16 v1, 1.0, v3 op_sel:[1,0]
+D38C4001 100206F2	v_pk_max_u16 v1, 1.0, v3 op_sel_hi:[0,1]
+D38C5801 000206F2	v_pk_max_u16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38CC001 180206F2	v_pk_max_u16 v1, 1.0, v3 clamp
+D38CC801 180206F2	v_pk_max_u16 v1, 1.0, v3 op_sel:[1,0] clamp
+D38D4001 18020702	v_pk_min_u16 v1, v2, v3
+D38D4801 18020702	v_pk_min_u16 v1, v2, v3 op_sel:[1,0]
+D38D4001 10020702	v_pk_min_u16 v1, v2, v3 op_sel_hi:[0,1]
+D38D5801 00020702	v_pk_min_u16 v1, v2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38DC001 18020702	v_pk_min_u16 v1, v2, v3 clamp
+D38DC801 18020702	v_pk_min_u16 v1, v2, v3 op_sel:[1,0] clamp
+D38D4001 18020602	v_pk_min_u16 v1, s2, v3
+D38D4801 18020602	v_pk_min_u16 v1, s2, v3 op_sel:[1,0]
+D38D4001 10020602	v_pk_min_u16 v1, s2, v3 op_sel_hi:[0,1]
+D38D5801 00020602	v_pk_min_u16 v1, s2, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38DC001 18020602	v_pk_min_u16 v1, s2, v3 clamp
+D38DC801 18020602	v_pk_min_u16 v1, s2, v3 op_sel:[1,0] clamp
+D38D4001 18000702	v_pk_min_u16 v1, v2, s3
+D38D4801 18000702	v_pk_min_u16 v1, v2, s3 op_sel:[1,0]
+D38D4001 10000702	v_pk_min_u16 v1, v2, s3 op_sel_hi:[0,1]
+D38D5801 00000702	v_pk_min_u16 v1, v2, s3 op_sel:[1,1] op_sel_hi:[0,0]
+D38DC001 18000702	v_pk_min_u16 v1, v2, s3 clamp
+D38DC801 18000702	v_pk_min_u16 v1, v2, s3 op_sel:[1,0] clamp
+D38D4001 18020687	v_pk_min_u16 v1, 7, v3
+D38D4801 18020687	v_pk_min_u16 v1, 7, v3 op_sel:[1,0]
+D38D4001 10020687	v_pk_min_u16 v1, 7, v3 op_sel_hi:[0,1]
+D38D5801 00020687	v_pk_min_u16 v1, 7, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38DC001 18020687	v_pk_min_u16 v1, 7, v3 clamp
+D38DC801 18020687	v_pk_min_u16 v1, 7, v3 op_sel:[1,0] clamp
+D38D4001 18018702	v_pk_min_u16 v1, v2, -3
+D38D4801 18018702	v_pk_min_u16 v1, v2, -3 op_sel:[1,0]
+D38D4001 10018702	v_pk_min_u16 v1, v2, -3 op_sel_hi:[0,1]
+D38D5801 00018702	v_pk_min_u16 v1, v2, -3 op_sel:[1,1] op_sel_hi:[0,0]
+D38DC001 18018702	v_pk_min_u16 v1, v2, -3 clamp
+D38DC801 18018702	v_pk_min_u16 v1, v2, -3 op_sel:[1,0] clamp
+D38D40C8 1803FFFE	v_pk_min_u16 v200, v254, v255
+D38D48C8 1803FFFE	v_pk_min_u16 v200, v254, v255 op_sel:[1,0]
+D38D40C8 1003FFFE	v_pk_min_u16 v200, v254, v255 op_sel_hi:[0,1]
+D38D58C8 0003FFFE	v_pk_min_u16 v200, v254, v255 op_sel:[1,1] op_sel_hi:[0,0]
+D38DC0C8 1803FFFE	v_pk_min_u16 v200, v254, v255 clamp
+D38DC8C8 1803FFFE	v_pk_min_u16 v200, v254, v255 op_sel:[1,0] clamp
+D38D4001 180206F2	v_pk_min_u16 v1, 1.0, v3
+D38D4801 180206F2	v_pk_min_u16 v1, 1.0, v3 op_sel:[1,0]
+D38D4001 100206F2	v_pk_min_u16 v1, 1.0, v3 op_sel_hi:[0,1]
+D38D5801 000206F2	v_pk_min_u16 v1, 1.0, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D38DC001 180206F2	v_pk_min_u16 v1, 1.0, v3 clamp
+D38DC801 180206F2	v_pk_min_u16 v1, 1.0, v3 op_sel:[1,0] clamp
+D3894001 1C120702	v_pk_mad_u16 v1, v2, v3, v4
+D3896801 1C120702	v_pk_mad_u16 v1, v2, v3, v4 op_sel:[1,0,1]
+D3890001 14120702	v_pk_mad_u16 v1, v2, v3, v4 op_sel_hi:[0,1,0]
+D3893801 04120702	v_pk_mad_u16 v1, v2, v3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D389C001 1C120702	v_pk_mad_u16 v1, v2, v3, v4 clamp
+D389E801 1C120702	v_pk_mad_u16 v1, v2, v3, v4 op_sel:[1,0,1] clamp
+D3894001 1C120602	v_pk_mad_u16 v1, s2, v3, v4
+D3896801 1C120602	v_pk_mad_u16 v1, s2, v3, v4 op_sel:[1,0,1]
+D3890001 14120602	v_pk_mad_u16 v1, s2, v3, v4 op_sel_hi:[0,1,0]
+D3893801 04120602	v_pk_mad_u16 v1, s2, v3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D389C001 1C120602	v_pk_mad_u16 v1, s2, v3, v4 clamp
+D389E801 1C120602	v_pk_mad_u16 v1, s2, v3, v4 op_sel:[1,0,1] clamp
+D3894001 1C100702	v_pk_mad_u16 v1, v2, s3, v4
+D3896801 1C100702	v_pk_mad_u16 v1, v2, s3, v4 op_sel:[1,0,1]
+D3890001 14100702	v_pk_mad_u16 v1, v2, s3, v4 op_sel_hi:[0,1,0]
+D3893801 04100702	v_pk_mad_u16 v1, v2, s3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D389C001 1C100702	v_pk_mad_u16 v1, v2, s3, v4 clamp
+D389E801 1C100702	v_pk_mad_u16 v1, v2, s3, v4 op_sel:[1,0,1] clamp
+D3894001 1C120687	v_pk_mad_u16 v1, 7, v3, v4
+D3896801 1C120687	v_pk_mad_u16 v1, 7, v3, v4 op_sel:[1,0,1]
+D3890001 14120687	v_pk_mad_u16 v1, 7, v3, v4 op_sel_hi:[0,1,0]
+D3893801 04120687	v_pk_mad_u16 v1, 7, v3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D389C001 1C120687	v_pk_mad_u16 v1, 7, v3, v4 clamp
+D389E801 1C120687	v_pk_mad_u16 v1, 7, v3, v4 op_sel:[1,0,1] clamp
+D3894001 1C118702	v_pk_mad_u16 v1, v2, -3, v4
+D3896801 1C118702	v_pk_mad_u16 v1, v2, -3, v4 op_sel:[1,0,1]
+D3890001 14118702	v_pk_mad_u16 v1, v2, -3, v4 op_sel_hi:[0,1,0]
+D3893801 04118702	v_pk_mad_u16 v1, v2, -3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D389C001 1C118702	v_pk_mad_u16 v1, v2, -3, v4 clamp
+D389E801 1C118702	v_pk_mad_u16 v1, v2, -3, v4 op_sel:[1,0,1] clamp
+D38940C8 1C13FFFE	v_pk_mad_u16 v200, v254, v255, v4
+D38968C8 1C13FFFE	v_pk_mad_u16 v200, v254, v255, v4 op_sel:[1,0,1]
+D38900C8 1413FFFE	v_pk_mad_u16 v200, v254, v255, v4 op_sel_hi:[0,1,0]
+D38938C8 0413FFFE	v_pk_mad_u16 v200, v254, v255, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D389C0C8 1C13FFFE	v_pk_mad_u16 v200, v254, v255, v4 clamp
+D389E8C8 1C13FFFE	v_pk_mad_u16 v200, v254, v255, v4 op_sel:[1,0,1] clamp
+D3894001 1C1206F2	v_pk_mad_u16 v1, 1.0, v3, v4
+D3896801 1C1206F2	v_pk_mad_u16 v1, 1.0, v3, v4 op_sel:[1,0,1]
+D3890001 141206F2	v_pk_mad_u16 v1, 1.0, v3, v4 op_sel_hi:[0,1,0]
+D3893801 041206F2	v_pk_mad_u16 v1, 1.0, v3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D389C001 1C1206F2	v_pk_mad_u16 v1, 1.0, v3, v4 clamp
+D389E801 1C1206F2	v_pk_mad_u16 v1, 1.0, v3, v4 op_sel:[1,0,1] clamp
+D3804001 1C120702	v_pk_mad_i16 v1, v2, v3, v4
+D3806801 1C120702	v_pk_mad_i16 v1, v2, v3, v4 op_sel:[1,0,1]
+D3800001 14120702	v_pk_mad_i16 v1, v2, v3, v4 op_sel_hi:[0,1,0]
+D3803801 04120702	v_pk_mad_i16 v1, v2, v3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D380C001 1C120702	v_pk_mad_i16 v1, v2, v3, v4 clamp
+D380E801 1C120702	v_pk_mad_i16 v1, v2, v3, v4 op_sel:[1,0,1] clamp
+D3804001 1C120602	v_pk_mad_i16 v1, s2, v3, v4
+D3806801 1C120602	v_pk_mad_i16 v1, s2, v3, v4 op_sel:[1,0,1]
+D3800001 14120602	v_pk_mad_i16 v1, s2, v3, v4 op_sel_hi:[0,1,0]
+D3803801 04120602	v_pk_mad_i16 v1, s2, v3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D380C001 1C120602	v_pk_mad_i16 v1, s2, v3, v4 clamp
+D380E801 1C120602	v_pk_mad_i16 v1, s2, v3, v4 op_sel:[1,0,1] clamp
+D3804001 1C100702	v_pk_mad_i16 v1, v2, s3, v4
+D3806801 1C100702	v_pk_mad_i16 v1, v2, s3, v4 op_sel:[1,0,1]
+D3800001 14100702	v_pk_mad_i16 v1, v2, s3, v4 op_sel_hi:[0,1,0]
+D3803801 04100702	v_pk_mad_i16 v1, v2, s3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D380C001 1C100702	v_pk_mad_i16 v1, v2, s3, v4 clamp
+D380E801 1C100702	v_pk_mad_i16 v1, v2, s3, v4 op_sel:[1,0,1] clamp
+D3804001 1C120687	v_pk_mad_i16 v1, 7, v3, v4
+D3806801 1C120687	v_pk_mad_i16 v1, 7, v3, v4 op_sel:[1,0,1]
+D3800001 14120687	v_pk_mad_i16 v1, 7, v3, v4 op_sel_hi:[0,1,0]
+D3803801 04120687	v_pk_mad_i16 v1, 7, v3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D380C001 1C120687	v_pk_mad_i16 v1, 7, v3, v4 clamp
+D380E801 1C120687	v_pk_mad_i16 v1, 7, v3, v4 op_sel:[1,0,1] clamp
+D3804001 1C118702	v_pk_mad_i16 v1, v2, -3, v4
+D3806801 1C118702	v_pk_mad_i16 v1, v2, -3, v4 op_sel:[1,0,1]
+D3800001 14118702	v_pk_mad_i16 v1, v2, -3, v4 op_sel_hi:[0,1,0]
+D3803801 04118702	v_pk_mad_i16 v1, v2, -3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D380C001 1C118702	v_pk_mad_i16 v1, v2, -3, v4 clamp
+D380E801 1C118702	v_pk_mad_i16 v1, v2, -3, v4 op_sel:[1,0,1] clamp
+D38040C8 1C13FFFE	v_pk_mad_i16 v200, v254, v255, v4
+D38068C8 1C13FFFE	v_pk_mad_i16 v200, v254, v255, v4 op_sel:[1,0,1]
+D38000C8 1413FFFE	v_pk_mad_i16 v200, v254, v255, v4 op_sel_hi:[0,1,0]
+D38038C8 0413FFFE	v_pk_mad_i16 v200, v254, v255, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D380C0C8 1C13FFFE	v_pk_mad_i16 v200, v254, v255, v4 clamp
+D380E8C8 1C13FFFE	v_pk_mad_i16 v200, v254, v255, v4 op_sel:[1,0,1] clamp
+D3804001 1C1206F2	v_pk_mad_i16 v1, 1.0, v3, v4
+D3806801 1C1206F2	v_pk_mad_i16 v1, 1.0, v3, v4 op_sel:[1,0,1]
+D3800001 141206F2	v_pk_mad_i16 v1, 1.0, v3, v4 op_sel_hi:[0,1,0]
+D3803801 041206F2	v_pk_mad_i16 v1, 1.0, v3, v4 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D380C001 1C1206F2	v_pk_mad_i16 v1, 1.0, v3, v4 clamp
+D380E801 1C1206F2	v_pk_mad_i16 v1, 1.0, v3, v4 op_sel:[1,0,1] clamp
+7E025B02	v_ffbh_u32_e32 v1, v2
+7F905BFF	v_ffbh_u32_e32 v200, v255
+7E025A03	v_ffbh_u32_e32 v1, s3
+7E025A80	v_ffbh_u32_e32 v1, 0
+7E025AC1	v_ffbh_u32_e32 v1, -1
+7E025AFF 80000000	v_ffbh_u32_e32 v1, 0x80000000
+7E025A87	v_ffbh_u32_e32 v1, 7
+D16D0001 00000102	v_ffbh_u32_e64 v1, v2
+D16D0001 00000002	v_ffbh_u32_e64 v1, s2
+D16D0001 00000085	v_ffbh_u32_e64 v1, 5
+7E025D02	v_ffbl_b32_e32 v1, v2
+7F905DFF	v_ffbl_b32_e32 v200, v255
+7E025C03	v_ffbl_b32_e32 v1, s3
+7E025C80	v_ffbl_b32_e32 v1, 0
+7E025CC1	v_ffbl_b32_e32 v1, -1
+7E025CFF 80000000	v_ffbl_b32_e32 v1, 0x80000000
+7E025C87	v_ffbl_b32_e32 v1, 7
+D16E0001 00000102	v_ffbl_b32_e64 v1, v2
+D16E0001 00000002	v_ffbl_b32_e64 v1, s2
+D16E0001 00000085	v_ffbl_b32_e64 v1, 5
+7E025F02	v_ffbh_i32_e32 v1, v2
+7F905FFF	v_ffbh_i32_e32 v200, v255
+7E025E03	v_ffbh_i32_e32 v1, s3
+7E025E80	v_ffbh_i32_e32 v1, 0
+7E025EC1	v_ffbh_i32_e32 v1, -1
+7E025EFF 80000000	v_ffbh_i32_e32 v1, 0x80000000
+7E025E87	v_ffbh_i32_e32 v1, 7
+D16F0001 00000102	v_ffbh_i32_e64 v1, v2
+D16F0001 00000002	v_ffbh_i32_e64 v1, s2
+D16F0001 00000085	v_ffbh_i32_e64 v1, 5
+7E006302	v_frexp_mant_f64_e32 v[0:1], v[2:3]
+7E006202	v_frexp_mant_f64_e32 v[0:1], s[2:3]
+7E0062FF 3FF80000	v_frexp_mant_f64_e32 v[0:1], 0x3ff80000
+D1710000 00000102	v_frexp_mant_f64_e64 v[0:1], v[2:3]
+D1710000 20000102	v_frexp_mant_f64_e64 v[0:1], -v[2:3]
+D1718000 00000102	v_frexp_mant_f64_e64 v[0:1], v[2:3] clamp
+7E026102	v_frexp_exp_i32_f64_e32 v1, v[2:3]
+7E026002	v_frexp_exp_i32_f64_e32 v1, s[2:3]
+7E0260FF 3FF80000	v_frexp_exp_i32_f64_e32 v1, 0x3ff80000
+7E0260FF 41F00000	v_frexp_exp_i32_f64_e32 v1, 0x41f00000
+D1700001 00000102	v_frexp_exp_i32_f64_e64 v1, v[2:3]
+D1700001 20000102	v_frexp_exp_i32_f64_e64 v1, -v[2:3]
+D1700101 00000102	v_frexp_exp_i32_f64_e64 v1, |v[2:3]|
+D1708001 00000102	v_frexp_exp_i32_f64_e64 v1, v[2:3] clamp
+D1700001 08000102	v_frexp_exp_i32_f64_e64 v1, v[2:3] mul:2
+7E021F02	v_cvt_f32_f64_e32 v1, v[2:3]
+7E021E02	v_cvt_f32_f64_e32 v1, s[2:3]
+7E021EFF 3FF80000	v_cvt_f32_f64_e32 v1, 0x3ff80000
+7E021EFF 41F00000	v_cvt_f32_f64_e32 v1, 0x41f00000
+D14F0001 00000102	v_cvt_f32_f64_e64 v1, v[2:3]
+D14F0001 20000102	v_cvt_f32_f64_e64 v1, -v[2:3]
+D14F0101 00000102	v_cvt_f32_f64_e64 v1, |v[2:3]|
+D14F8001 00000102	v_cvt_f32_f64_e64 v1, v[2:3] clamp
+D14F0001 08000102	v_cvt_f32_f64_e64 v1, v[2:3] mul:2
+7E020702	v_cvt_i32_f64_e32 v1, v[2:3]
+7E020602	v_cvt_i32_f64_e32 v1, s[2:3]
+7E0206FF 3FF80000	v_cvt_i32_f64_e32 v1, 0x3ff80000
+7E0206FF 41F00000	v_cvt_i32_f64_e32 v1, 0x41f00000
+D1430001 00000102	v_cvt_i32_f64_e64 v1, v[2:3]
+D1430001 20000102	v_cvt_i32_f64_e64 v1, -v[2:3]
+D1430101 00000102	v_cvt_i32_f64_e64 v1, |v[2:3]|
+D1438001 00000102	v_cvt_i32_f64_e64 v1, v[2:3] clamp
+D1430001 08000102	v_cvt_i32_f64_e64 v1, v[2:3] mul:2
+7E022B02	v_cvt_u32_f64_e32 v1, v[2:3]
+7E022A02	v_cvt_u32_f64_e32 v1, s[2:3]
+7E022AFF 3FF80000	v_cvt_u32_f64_e32 v1, 0x3ff80000
+7E022AFF 41F00000	v_cvt_u32_f64_e32 v1, 0x41f00000
+D1550001 00000102	v_cvt_u32_f64_e64 v1, v[2:3]
+D1550001 20000102	v_cvt_u32_f64_e64 v1, -v[2:3]
+D1550101 00000102	v_cvt_u32_f64_e64 v1, |v[2:3]|
+D1558001 00000102	v_cvt_u32_f64_e64 v1, v[2:3] clamp
+D1550001 08000102	v_cvt_u32_f64_e64 v1, v[2:3] mul:2
+7E002101	v_cvt_f64_f32_e32 v[0:1], v1
+7E002001	v_cvt_f64_f32_e32 v[0:1], s1
+7E0020FF 3FC00000	v_cvt_f64_f32_e32 v[0:1], 0x3fc00000
+7E0020FF 3FC00000	v_cvt_f64_f32_e32 v[0:1], 0x3fc00000
+D1500000 00000101	v_cvt_f64_f32_e64 v[0:1], v1
+D1500000 20000101	v_cvt_f64_f32_e64 v[0:1], -v1
+D1500100 00000101	v_cvt_f64_f32_e64 v[0:1], |v1|
+D1508000 00000101	v_cvt_f64_f32_e64 v[0:1], v1 clamp
+D1500000 08000101	v_cvt_f64_f32_e64 v[0:1], v1 mul:2
+D2840000 00020902	v_ldexp_f64 v[0:1], v[2:3], v4
+D2840000 00000902	v_ldexp_f64 v[0:1], v[2:3], s4
+D2840000 00010B02	v_ldexp_f64 v[0:1], v[2:3], 5
+D2840000 20020902	v_ldexp_f64 v[0:1], -v[2:3], v4
+D2848000 00020902	v_ldexp_f64 v[0:1], v[2:3], v4 clamp
+D2840000 08020902	v_ldexp_f64 v[0:1], v[2:3], v4 mul:2
+D2840000 00020802	v_ldexp_f64 v[0:1], s[2:3], v4
+D2820000 00020902	v_min_f64 v[0:1], v[2:3], v[4:5]
+D2820200 20020902	v_min_f64 v[0:1], -v[2:3], |v[4:5]|
+D2820000 00020802	v_min_f64 v[0:1], s[2:3], v[4:5]
+D2820000 000208F2	v_min_f64 v[0:1], 1.0, v[4:5]
+D2828000 00020902	v_min_f64 v[0:1], v[2:3], v[4:5] clamp
+D2820000 08020902	v_min_f64 v[0:1], v[2:3], v[4:5] mul:2
+D2830000 00020902	v_max_f64 v[0:1], v[2:3], v[4:5]
+D2830200 20020902	v_max_f64 v[0:1], -v[2:3], |v[4:5]|
+D2830000 00020802	v_max_f64 v[0:1], s[2:3], v[4:5]
+D2830000 000208F2	v_max_f64 v[0:1], 1.0, v[4:5]
+D2838000 00020902	v_max_f64 v[0:1], v[2:3], v[4:5] clamp
+D2830000 08020902	v_max_f64 v[0:1], v[2:3], v[4:5] mul:2
+D12C0001 00020702	v_ashrrev_i16_e64 v1, v2, v3
+58020702	v_ashrrev_i16_e32 v1, v2, v3
+D12C0001 00020683	v_ashrrev_i16_e64 v1, 3, v3
+58020683	v_ashrrev_i16_e32 v1, 3, v3
+D12C0001 00000702	v_ashrrev_i16_e64 v1, v2, s3
+D12C0001 00000702	v_ashrrev_i16_e64 v1, v2, s3
+D12C00C8 0003FFFE	v_ashrrev_i16_e64 v200, v254, v255
+5991FFFE	v_ashrrev_i16_e32 v200, v254, v255
+D1300001 00020702	v_max_i16_e64 v1, v2, v3
+60020702	v_max_i16_e32 v1, v2, v3
+D1300001 00020683	v_max_i16_e64 v1, 3, v3
+60020683	v_max_i16_e32 v1, 3, v3
+D1300001 00000702	v_max_i16_e64 v1, v2, s3
+D1300001 00000702	v_max_i16_e64 v1, v2, s3
+D13000C8 0003FFFE	v_max_i16_e64 v200, v254, v255
+6191FFFE	v_max_i16_e32 v200, v254, v255
+D1320001 00020702	v_min_i16_e64 v1, v2, v3
+64020702	v_min_i16_e32 v1, v2, v3
+D1320001 00020683	v_min_i16_e64 v1, 3, v3
+64020683	v_min_i16_e32 v1, 3, v3
+D1320001 00000702	v_min_i16_e64 v1, v2, s3
+D1320001 00000702	v_min_i16_e64 v1, v2, s3
+D13200C8 0003FFFE	v_min_i16_e64 v200, v254, v255
+6591FFFE	v_min_i16_e32 v200, v254, v255

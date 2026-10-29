@@ -129,6 +129,22 @@ struct Env {
   }
 };
 
+// One block of `threads`, each thread storing to out[threadIdx.x]; returns out.
+std::vector<uint32_t> run_words(Env& e, sass::Module& m, uint32_t threads) {
+  const uint64_t out = e.mem.alloc(threads * 4);
+  const std::vector<uint32_t> poison(threads, 0x5A5A5A5Au);
+  e.mem.write(out, poison.data(), threads * 4);
+  exec::LaunchConfig cfg;
+  cfg.grid = {1, 1, 1};
+  cfg.block = {threads, 1, 1};
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &out, 8);
+  sass::launch(m, "k", cfg, {arg}, e.mem, e.prof);
+  std::vector<uint32_t> got(threads);
+  e.mem.read(out, got.data(), threads * 4);
+  return got;
+}
+
 struct OneThread {
   OneThread() { ::setenv("VGPU_THREADS", "1", 1); }
   ~OneThread() { ::unsetenv("VGPU_THREADS"); }
@@ -175,6 +191,36 @@ VTEST(each_kernel_of_a_module_starts_at_its_own_code_and_keeps_its_constant_bank
     const std::vector<uint32_t> got = e.run(*m, 4, 32, "k");
     for (uint32_t b = 0; b < 4; ++b) VCHECK_EQ(got[b], b);
   }
+}
+
+// The tier's run loop ends a run of instructions at a VOTE, a branch or a BSSY and goes on into the next group itself. These kernels write the
+// lane (S2R SR_TID.X) to the address R10 = out + 4 * tid, so every lane's word is checked. tid >= 8 is P0.
+const Insn kTid = {0x000e220000002100ull, 0x0000000000007919ull, "S2R R0, SR_TID.X"};
+const Insn kSetR9One = {0x000fc60000000f00ull, 0x0000000100097802ull, "MOV R9, 0x1"};
+const Insn kP0TidGe8 = {0x000fe40003f06070ull, 0x000000080000780cull, "ISETP.GE.U32.AND P0, PT, R0, 0x8, PT"};
+const Insn kVoteAnyP0 = {0x000fe400000e0100ull, 0x0000000000097806ull, "VOTE.ANY R9, PT, P0"};
+const Insn kVoteAnyNotP0 = {0x000fc800040e0100ull, 0x0000000000097806ull, "VOTE.ANY R9, PT, !P0"};
+const Insn kBraP0Skip1 = {0x000fea0003800000ull, 0x0000001000000947ull, "@P0 BRA 0x80"};
+
+// A full warp votes: every lane gets the ballot of the 24 lanes with tid >= 8 (a converged run that ends at the VOTE).
+VTEST(a_full_warp_vote_gives_every_lane_the_ballot) {
+  OneThread one;
+  Env e;
+  const auto m = e.load({kTid, kPtrLo, kPtrHi, kAddr, kP0TidGe8, kVoteAnyP0, kStoreR9, kExit});
+  for (const uint32_t v : run_words(e, *m, 32)) VCHECK_EQ(v, 0xffffff00u);
+}
+
+// Lanes below 8 take no branch and vote among themselves (a partial warp: the ballot is over the 8 lanes, its register written for those lanes only);
+// the others branch over the vote and keep R9 = 1. The branch splits the warp, and the lowest address runs first.
+VTEST(a_diverged_warp_votes_among_the_lanes_that_run_it) {
+  OneThread one;
+  Env e;
+  const auto m = e.load({kTid, kPtrLo, kPtrHi, kAddr, kSetR9One, kP0TidGe8, kBraP0Skip1, kVoteAnyNotP0, kStoreR9, kExit});
+  const std::vector<uint32_t> got = run_words(e, *m, 32);
+  for (uint32_t l = 0; l < 32; ++l) VCHECK_EQ(got[l], l < 8 ? 0xffu : 1u);
+  // (a block of 20 threads: the lanes past the block never exist)
+  const std::vector<uint32_t> few = run_words(e, *m, 20);
+  for (uint32_t l = 0; l < 20; ++l) VCHECK_EQ(few[l], l < 8 ? 0xffu : 1u);
 }
 
 VTEST_MAIN

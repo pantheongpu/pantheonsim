@@ -53,6 +53,7 @@
 #include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/sass_atomics.hpp"
 #include "vgpu/exec/sass_lanes.hpp"
+#include "vgpu/exec/sass_mem_rows.hpp"
 #include "vgpu/exec/sass_lea.hpp"
 #include "vgpu/exec/window_check.hpp"
 #include "vgpu/exec/numerics.hpp"
