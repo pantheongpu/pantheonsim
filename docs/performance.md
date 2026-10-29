@@ -5257,7 +5257,7 @@ Tests: `test_simd_dispatch` (which table each `VGPU_SIMD` setting gives on the h
 Where the time went (perf `cycles:u`, one host thread, A = 873dbc69; shares of the program's samples): `memcount::sass_bank_passes` was 40% of Samples
 convolutionSeparable, 34% sortingNetworks, 31% histogram, 19% mergeSort, 21% Rodinia lud, 14% dct8x8, 11% hotspot, with `h_shared` another 7 to 25%. The closed
 forms (`bank_passes_progression`) already take every warp on one stride; what is left is warps that are on no stride. Dumping one call in 211 of the real programs
-(2.4 M calls sampled) showed that the left-over warps are mostly few shapes seen over and over: convolutionSeparable's row stage is two rows of 16 words 160 words apart
+(2.5 M records) showed that the left-over warps are mostly few shapes seen over and over: convolutionSeparable's row stage is two rows of 16 words 160 words apart
 (2 passes, 600 000 samples, 2 distinct shapes), dct8x8 four shapes (groups of 8 lanes on one word, a row of 8 words four times), mergeSort / sortingNetworks pairs of
 words every four and bitonic index patterns (about half of them repeat), segmentationTreeThrust 8-byte rows; only histogram's byte gathers are random.
 
@@ -5306,7 +5306,7 @@ counting wrapper changed nothing or made it worse: the kernel's speed follows th
 * A branch-free "passes by levels" count (each level takes one word of every bank that still has words; the number of levels is the answer), in 32- and 64-bit words: 0.84x to 1.1x of the byte-count table on
   the sampled warps (convolutionSeparable 77 vs 64 ns, sortingNetworks 49 vs 50, histogram 95 vs 98, mergeSort 88 vs 88); not kept. A pre-test that every lane is in a bank of its own (the bank mask, one pass if it is full): 87 to 99 ns against
   60 to 80, slower, because a walk of 32 lanes costs about 80 cycles by itself (the tzcnt chain). A table of 8-byte keys instead of 32: no change.
-* The hit rate of mergeSort and sortingNetworks is about a third to a half (patterns repeat but data-dependent masks and gathers do not), so their gain (0.5 to 8%) is small; histogram (bytes, random words) only sees the leaner
+* mergeSort and sortingNetworks repeat only some of their shapes (data-dependent masks and gathers do not; about half of the sampled sortingNetworks warps had a shape seen before in the sample, which was not measured as a hit rate in the run), so their gain (0.5 to 8%) is small; histogram (bytes, random words) only sees the leaner
   table. A memo in the PTX interpreter was not written (the programs here run on SASS).
 * `h_shared` itself (15 to 25% of these programs after the change: address generation and the lane-by-lane data move) was not touched.
 
