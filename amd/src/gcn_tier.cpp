@@ -410,7 +410,7 @@ inline T nan_rule(uint8_t rule, T x, T y, T z) {
   }
 }
 // The lanes of a binary32 result that are NaNs (among EXEC's), done again by the interpreter's rule from the operands the kernel had.
-inline void fix_nan32(uint8_t rule, uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex) {
+[[gnu::noinline]] void fix_nan32(uint8_t rule, uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex) {
   for (uint64_t m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
     if ((r[l] & 0x7FFFFFFFu) <= 0x7F800000u) continue;
@@ -420,7 +420,7 @@ inline void fix_nan32(uint8_t rule, uint32_t* r, const uint32_t* a, const uint32
     std::memcpy(&r[l], &v, 4);
   }
 }
-inline void fix_nan64(uint8_t rule, uint64_t* r, const uint64_t* a, const uint64_t* b, const uint64_t* c, uint64_t ex) {
+[[gnu::noinline]] void fix_nan64(uint8_t rule, uint64_t* r, const uint64_t* a, const uint64_t* b, const uint64_t* c, uint64_t ex) {
   for (uint64_t m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
     if ((r[l] & 0x7FFFFFFFFFFFFFFFull) <= 0x7FF0000000000000ull) continue;
@@ -431,7 +431,7 @@ inline void fix_nan64(uint8_t rule, uint64_t* r, const uint64_t* a, const uint64
   }
 }
 // A float result as write_float / write_double leave it: the output multiplier, then the clamp.
-inline void post32(uint32_t* r, uint64_t ex, unsigned omod, bool clamp) {
+[[gnu::noinline]] void post32(uint32_t* r, uint64_t ex, unsigned omod, bool clamp) {
   for (uint64_t m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
     float v;
@@ -441,7 +441,7 @@ inline void post32(uint32_t* r, uint64_t ex, unsigned omod, bool clamp) {
     std::memcpy(&r[l], &v, 4);
   }
 }
-inline void post64(uint64_t* r, uint64_t ex, unsigned omod, bool clamp) {
+[[gnu::noinline]] void post64(uint64_t* r, uint64_t ex, unsigned omod, bool clamp) {
   for (uint64_t m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
     double v;
@@ -1237,6 +1237,48 @@ int h_never(const Op&, Regs&) { return 0; }
 
 // ---- LDS
 enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAdd, kDsSwizzle, kDsPerm };
+// (Out of line: their 256-byte rows in h_ds's frame cost the LDS handlers' common paths a larger prologue.)
+[[gnu::noinline]] int ds_swizzle_run(const Op& o, Regs& R, uint64_t ex) {
+    // ds_swizzle_b32: a lane reads another lane of its group of 32 as the offset's pattern says (a lane that is off gives zero); the data is read
+    // across the wave before any lane is written (the interpreter's swizzle_source).
+    alignas(32) uint32_t before[64];
+    std::memcpy(before, R.vgpr[o.src[0].index], sizeof before);
+    const uint32_t pattern = static_cast<uint32_t>(o.off0);
+    uint32_t* const out = R.vgpr[o.dst.index];
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
+      uint32_t from;
+      if ((pattern & 0xFF00) == 0x8000) {
+        from = (l & ~3u) + ((pattern >> (2 * (l & 3))) & 3);
+      } else if ((pattern & 0xE000) == 0xC000) {
+        const uint32_t by = (pattern >> 5) & 0x1F, right = (pattern >> 10) & 1;
+        from = (l & ~31u) | ((right ? l - by : l + by) & 31u);
+      } else {
+        from = (l & ~31u) | ((((l & 31u) & (pattern & 0x1F)) | ((pattern >> 5) & 0x1F)) ^ ((pattern >> 10) & 0x1F));
+      }
+      out[l] = ex >> from & 1 ? before[from] : 0;
+    }
+    return 1;
+}
+[[gnu::noinline]] int ds_permute_run(const Op& o, Regs& R, uint64_t ex) {
+    // ds_permute_b32: each lane that is on sends its value to the lane its address names (the higher-numbered sender's lands last), and a lane no
+    // one sent to gets zero.
+    uint32_t sent[64] = {};
+    const uint32_t* const addr = R.vgpr[o.src[0].index];
+    const uint32_t* const data = R.vgpr[o.src[1].index];
+    const uint32_t x = static_cast<uint32_t>(o.off0);
+    const unsigned lanes = R.lanes;
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+      sent[((addr[l] + x) >> 2) & (lanes - 1)] = data[l];
+    }
+    uint32_t* const out = R.vgpr[o.dst.index];
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+      out[l] = sent[l];
+    }
+    return 1;
+}
 [[gnu::always_inline]] inline int h_ds_body(const Op& o, Regs& R) {
   const uint64_t ex = *R.exec;
   if (o.store && *R.store_gate && ex && R.nwaves > 1) {
@@ -1264,46 +1306,8 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAd
     }
     return 1;
   }
-  if (o.sub == kDsSwizzle) {
-    // ds_swizzle_b32: a lane reads another lane of its group of 32 as the offset's pattern says (a lane that is off gives zero); the data is read
-    // across the wave before any lane is written (the interpreter's swizzle_source).
-    alignas(32) uint32_t before[64];
-    std::memcpy(before, R.vgpr[o.src[0].index], sizeof before);
-    const uint32_t pattern = static_cast<uint32_t>(o.off0);
-    uint32_t* const out = R.vgpr[o.dst.index];
-    for (uint64_t m = ex; m; m &= m - 1) {
-      const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
-      uint32_t from;
-      if ((pattern & 0xFF00) == 0x8000) {
-        from = (l & ~3u) + ((pattern >> (2 * (l & 3))) & 3);
-      } else if ((pattern & 0xE000) == 0xC000) {
-        const uint32_t by = (pattern >> 5) & 0x1F, right = (pattern >> 10) & 1;
-        from = (l & ~31u) | ((right ? l - by : l + by) & 31u);
-      } else {
-        from = (l & ~31u) | ((((l & 31u) & (pattern & 0x1F)) | ((pattern >> 5) & 0x1F)) ^ ((pattern >> 10) & 0x1F));
-      }
-      out[l] = ex >> from & 1 ? before[from] : 0;
-    }
-    return 1;
-  }
-  if (o.sub == kDsPerm) {
-    // ds_permute_b32: each lane that is on sends its value to the lane its address names (the higher-numbered sender's lands last), and a lane no
-    // one sent to gets zero.
-    uint32_t sent[64] = {};
-    const uint32_t* const data = R.vgpr[o.src[1].index];
-    const uint32_t x = static_cast<uint32_t>(o.off0);
-    const unsigned lanes = R.lanes;
-    for (uint64_t m = ex; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-      sent[((addr[l] + x) >> 2) & (lanes - 1)] = data[l];
-    }
-    uint32_t* const out = R.vgpr[o.dst.index];
-    for (uint64_t m = ex; m; m &= m - 1) {
-      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
-      out[l] = sent[l];
-    }
-    return 1;
-  }
+  if (o.sub == kDsSwizzle) return ds_swizzle_run(o, R, ex);
+  if (o.sub == kDsPerm) return ds_permute_run(o, R, ex);
   const uint32_t x0 = static_cast<uint32_t>(o.off0), x1 = static_cast<uint32_t>(o.off1);
   const unsigned w = o.words;
   const uint64_t size = R.lds_size;
