@@ -5239,3 +5239,14 @@ Sanitizers: ASan+UBSan at -O0 (`ASAN_OPTIONS=detect_leaks=1`, `UBSAN_OPTIONS=hal
 new handlers' instructions (DPP, swizzle, permute, packed integers, permlane, min/max/ldexp/frexp/cvt, ffbh, `s_add_nc_u64`, a VOPD pair) pass; the whole corpus under ASan (three to five times the
 2700 s of before) and a TSan build (no new threaded code) were not run here. Release: the guards (`gcn_same_bits`, `gcn_packed_same_bits`, `gcn_memory_same_bits`, `codeobject_same_bits`, `matrix_fast`,
 `mfma_math`, `nan_order`, the other `test_amd_gcn_*`) and the whole tier digest, AVX2 and `VGPU_SIMD=base`, pass.
+
+
+### Round sp8: the AVX-512 tile kernels are the default where the CPU has them
+
+`kAvx512Default` (src/simd/simd.cpp) is now `true`: on a host with AVX-512 F/BW/DQ/VL and VNNI the tile kernels of the tensor-core routes (wgmma, tcgen05, the integer and f64 mma forms; `tile_f32`, `tile_f32c`, `tile_i32`, `tile_f64`) run as 512-bit code. `VGPU_SIMD=avx2` (config key `simd: avx2`) keeps the 256-bit kernels, `base` the baseline, `off` no kernels; `simd: avx512` is now an accepted config value. The lane kernels, `level()` and the JIT's ISA detection are unchanged.
+Measured with `nvidia_tensor_bench` (ns per warp instruction, same binary, `VGPU_SIMD=avx512` over `avx2`, one pinned core, 5 repeats) and with the benchmark workloads (9 runs):
+* Zen 4 (8840U, 512-bit operations as two 256-bit halves): tcgen05 s8 0.63x, wgmma s8 0.89x, wgmma f16/tf32 0.94 to 0.95x, the rest 0.97 to 1.03x.
+* Zen 5 (9950X, full width): tcgen05 s8 0.59x, wgmma s8 0.78x, tcgen05 f32 accumulate 0.89 to 0.90x, wgmma f16/bf16/tf32/e4m3 0.92 to 0.94x.
+* Sapphire Rapids (Xeon 8488C): geometric mean 0.916 over 43 forms; tcgen05 s8 0.46x, wgmma s8 0.68x, tcgen05 f32 0.76x, layout B / e4m3 0.81 to 0.86x, mma f64 0.76x; a few small forms 1.02 to 1.21x (noise at 5 repeats).
+* int_alu, f32_fma, f64_fma, wmma, mma_ptx, mem, shared, local, divergent (SASS and PTX): 1.00x on Sapphire Rapids, within noise on the others.
+Tests: `test_simd_dispatch` (which table each `VGPU_SIMD` setting gives on the host; run for the default and for `avx2`, `avx512`, `base`, `off`), and the tile-route tests (`test_mma_fast`, `test_mma_tiles`, `test_wgmma_fast`, `test_tcgen05_tiles`, `test_wmma_generic_fast`, `test_tile_mma`) now run three more times, with `VGPU_SIMD=avx2`, `avx512` and (for the ones that had it) `base`, so every level stays tested on a host that picks AVX-512 by default.

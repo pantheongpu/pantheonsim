@@ -122,9 +122,9 @@ std::vector<Key> build_keys() {
                       "Per-thread instruction budget against a kernel that never ends; 0 removes it."));
   t.push_back(enumerated("sass", "VGPU_SASS", {{"auto", ""}, {"off", "0"}, {"only", "1"}}, "auto", "auto",
                          "Engine for NVIDIA kernels: auto uses SASS when the binary has it, off forces PTX, only insists on SASS."));
-  t.push_back(enumerated("simd", "VGPU_SIMD", {{"auto", ""}, {"base", "base"}, {"avx2", "avx2"}, {"off", "off"}},
+  t.push_back(enumerated("simd", "VGPU_SIMD", {{"auto", ""}, {"base", "base"}, {"avx2", "avx2"}, {"avx512", "avx512"}, {"off", "off"}},
                          "auto", "auto",
-                         "Caps the vector instruction set the engines use; off uses scalar code. For ruling them out."));
+                         "The vector instruction set the engines use: auto is the best the CPU has (the AVX-512 tile kernels where it has AVX-512 and VNNI); base and avx2 cap it; off uses scalar code. For ruling them out."));
   t.push_back(enumerated("scheduler", "VGPU_SCHEDULER",
                          {{"deterministic", "deterministic"}, {"random", "random"}, {"adversarial", "adversarial"}},
                          "deterministic", "random",
