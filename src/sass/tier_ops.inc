@@ -2182,12 +2182,16 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       st.inst_by_class[last.cls] += lanes;
       if (idx != first) tier_set_pcs(w, group, here);
       const Instr& wi = *last.ins;
+      // The mask is the same for every lane unless it is a register (a constant, a constant-bank word or a uniform register is read once).
+      const bool per_lane = !last.aux && wi.src[last.a].kind == Kind::Reg;
+      uint32_t mask_all = ~Mask{0};
+      if (ex && !last.aux && !per_lane) mask_all = read32(w, wi.src[last.a], static_cast<unsigned>(std::countr_zero(ex)));
       for (Mask m = group; m; m &= m - 1) {
         const unsigned l = static_cast<unsigned>(std::countr_zero(m));
         if ((ex >> l) & 1) {
           w.waiting |= Mask{1} << l;
           w.wait_kind[l] = Wait::WarpSync;
-          w.wait_arg[l] = last.aux ? ~Mask{0} : read32(w, wi.src[last.a], l);
+          w.wait_arg[l] = per_lane ? read32(w, wi.src[last.a], l) : mask_all;
           if (!((w.wait_arg[l] >> l) & 1u))
             throw Error(Err::IllegalInstruction, "SASS kernel " + k_.name + ": WARPSYNC run by lane " + std::to_string(l) +
                                                      ", which its mask " + std::to_string(w.wait_arg[l]) + " leaves out");

@@ -5092,17 +5092,26 @@ void Runner::release_warpsync(Warp& w) {
   }
   if (!waiting_ws) return;
   Mask release = 0;
-  each_lane(waiting_ws, [&](unsigned l) {
-    const Mask need = w.wait_arg[l] & w.alive & ~w.exited;
-    if ((need & ~waiting_ws) == 0 || ((w.ws_held >> l) & 1)) release |= Mask{1} << l;
-  });
+  // The common case: no lanes held back from an earlier release, and every waiting lane names one mask. Then they are all released, or none is.
+  uint32_t same_arg = w.wait_arg[std::countr_zero(waiting_ws)], differ = 0;
+  if (!w.ws_held)
+    for (Mask m = waiting_ws; m; m &= m - 1) differ |= w.wait_arg[std::countr_zero(m)] ^ same_arg;
+  const bool one_mask = !w.ws_held && !differ;
+  if (one_mask) {
+    if (((same_arg & w.alive & ~w.exited) & ~waiting_ws) == 0) release = waiting_ws;
+  } else {
+    each_lane(waiting_ws, [&](unsigned l) {
+      const Mask need = w.wait_arg[l] & w.alive & ~w.exited;
+      if ((need & ~waiting_ws) == 0 || ((w.ws_held >> l) & 1)) release |= Mask{1} << l;
+    });
+  }
   // Lanes that named different masks do not come out of it together: ptxas's
   // code for a *.sync instruction whose lanes name different masks runs the
   // instruction after each distinct mask's WARPSYNC, over the lanes that
   // named it (an RTX 3060: __ballot_sync(1u << lane, p) is each lane's own
   // bit of p; Runner::step_warp releases the next set when this one has
   // run as far as it can).
-  if (release) {
+  if (release && !one_mask) {
     const uint32_t first_arg = w.wait_arg[std::countr_zero(release)];
     Mask now = 0;
     each_lane(release, [&](unsigned l) {
@@ -5123,7 +5132,8 @@ void Runner::release_warpsync(Warp& w) {
     each_lane(release, [&](unsigned l) {
       if (!have || w.pc[l] != seen) {
         have = true;
-        const Instr& at_ins = fetch(w.pc[l]);
+        const Code* const h = w.code_hint;   // (the section the warp runs in, most often: no lookup of the section)
+        const Instr& at_ins = h && w.pc[l] - h->base < 16 * h->count ? h->instr((w.pc[l] - h->base) / 16) : fetch(w.pc[l]);
         collective = collective || (at_ins.op == Op::WARPSYNC && at_ins.f[1]);
         seen = w.pc[l];
       }
