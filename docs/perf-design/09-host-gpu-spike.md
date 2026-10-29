@@ -311,3 +311,88 @@ the CI image build, the hosted CI.
 **Costs and cautions to keep in view**: 0.15 to 0.35 s of fixed cost per process when the mode is on and nothing is offloaded; no counters or diagnostics for card launches; the card is a shared machine resource (another process on the same GPU slows the launches and could exhaust its memory: the mode backs only the memory in use and refuses with
 less than 256 MiB spare); a faulting launch ends the mode for the process; AMD is not covered (no card to measure on).
 
+## 7. Step A and the persistent card copy (2026-10-28/29, a second A10G rig)
+
+The question: does a card copy that outlives a launch (section 4) pay? Rule set beforehand: stop if the gain over write-through is under about 1.5x on programs that matter (more than a few seconds of simulation that
+write-through already offloads) or only FDTD-2D-like cases benefit; otherwise build it.
+
+### 7.1 Profile, before any code
+
+Method: every corpus program (64 runs, 100 s at most each) ran with `VGPU_HOST_GPU_VERIFY=1` and `VGPU_HOST_GPU_TRACE`, which records every allocation, free, host copy in, out or fill of device memory (`MemoryManager` hook) and every launch
+(kernel, grid, the simulator's own time, whether it is in the exact set, its time on the card, the allocations its arguments name): [raw/traces](data/round13/raw/traces) (gzip). [residency_model.py](data/round13/residency_model.py) replays them under four
+policies with the rule of the runtime (two simulator launches per kernel first, margin 2, the ban) and the measured costs: *off*, *write-through* (0.85 ns per live byte, measured on FDTD-2D), *persist* (sound: a launch the simulator runs first pulls everything
+and leaves everything Host; an offloaded launch pushes the Host chunks and leaves every live chunk Card) and *argsonly* (unsound upper bound: only the allocations the arguments name). Output: [raw/residency_model.txt](data/round13/raw/residency_model.txt),
+[raw/residency_summary.txt](data/round13/raw/residency_summary.txt). The simulator times in it are the simulator's alone (a first version of the trace also timed the card path in verify runs and made 3DCONV look 40x slower than it is; found and fixed).
+
+* 64 programs, 58 with launches, **34,236 launches**; 25,722 are in the exact set; 21,087 follow another in-set launch with no host copy between (the "chained" case); write-through offloads 4,499 of them, a persistent copy 4,869.
+* Device-phase time over all programs: off 629 s, write-through 439 s, **persistent 358 s** (1.23x over write-through in total: most of the corpus's simulation time is in programs neither mode offloads: CORR and COVAR 36 s each (SFU), SYRK and SYR2K (one launch each)).
+* Programs with more than 3 s of simulation that write-through already offloads: **6**.
+
+| program | off | write-through | persistent | gain |
+|---|---:|---:|---:|---:|
+| FDTD-2D (552 launches seen) | 57.8 s | 24.2 s | 0.8 s | 32x |
+| aligned-types (HeCBench) | 64.0 s | 8.9 s | 1.5 s | 5.9x |
+| babelstream | 31.3 s | 26.0 s | 5.6 s | 4.6x |
+| base64e | 58.0 s | 11.7 s | 1.7 s | 6.9x |
+| GRAMSCHM | 52.4 s | 39.4 s | 25.4 s | 1.55x |
+| LU | 55.7 s | 20.0 s | 14.2 s | 1.41x |
+
+Eight programs gain 1.5x or more over write-through (those five, axpby 9.4x, JACOBI2D 3.4x, needle 1.5x): **3,571 of the 34,236 launches (10%) are in them, 1,773 launches (5%) are ones persistence newly lets the card take or makes cheaper**, and their device time goes from 111 s
+(write-through) to 35 s. In the other 50 programs persistence changes nothing (single-launch programs, SFU kernels, kernels too small). Four of the six large programs gain 4.6x to 32x, so it is not only FDTD-2D; two (the LU and GRAMSCHM shapes, where
+in-set and out-of-set kernels alternate and every simulator launch gives the card copy up) gain 1.4x to 1.55x in the model.
+
+**Cost with data already on the card**, measured ([raw/resident_launch_cost.txt](data/round13/raw/resident_launch_cost.txt), `M2_LOOP`): a launch plus synchronisation 7.9 to 8.2 us for tiny kernels; the real kernels of FDTD-2D 111 us (step 1, 2) and 143 us (step 3) against 98 to 116 ms
+in the simulator: **~900x**; 2DCONV 279 us against 575 ms (2,060x); GEMM 365 us against 902 ms; JACOBI2D 23 us against 20 to 27 ms (~1,000x); bfs and gaussian kernels 8 us against 0.15 to 0.7 ms (20 to 88x). So the "~500x" for FDTD-2D holds for the launch itself (queued launches without a sync each
+2.6 us for tiny kernels, 105 us for FDTD-2D); on the whole program it is lower (section 7.3).
+
+Decision: the rule is not triggered (four large programs gain 4.6x to 32x, and the corpus's chained launches are 21,087 of 34,236), so **it was built**.
+
+### 7.2 What was built
+
+* **State**: `Residency` (include/vgpu/host_gpu.hpp), one byte per 64 KiB chunk: Host, Card, Both, as in section 4, per tracked allocation (`Impl::res` in src/runtime/host_gpu.cpp).
+* **The gate** (`vgpu::CardGate`, include/vgpu/memory.hpp; src/core/memory.cpp). `Allocation::card_valid` counts chunks whose card copy is valid (Card or Both). While it is above zero the allocation is **out of every thread's lookup memory**
+  (`find_ordinary_miss` and `run_allocation` decline it; `card_void_lookups` voids what threads remember, with `note_free` under a quiet write lock), so each access to it takes `resolve()`, which asks the gate first (`before_access(addr, len, write)`; a kernel-style scalar store is told apart by its op text, because it passes `writing=false`).
+  `free`, `free_all` and `share` tell the gate before they take their locks. **Nothing was added to `hot_location`, `find_ordinary`'s hit path or any per-access path of an allocation that is not card-resident**; the cost elsewhere is one relaxed load of a counter in `resolve`, `free`, `free_all`, `share`.
+* **Gate actions**: a read pulls the Card chunks it covers (they become Both); a write pulls a Card chunk it covers only partly, then makes the chunks Host. A launch the simulator runs gives everything back first (`before_simulated`; this is a speed measure: the gate alone is also correct, because every simulator access to a card-valid allocation takes the slow path and marks it, but a kernel's accesses would then each pay a lock).
+* **Launch** (`try_launch`): push the Host chunks (merged into runs of up to 32 MiB), run, mark every live chunk Card; nothing comes back. The size rule charges the push only (a later pull is paid when the host reads); the ban still ends a kernel whose launch took longer than the simulator was expected to.
+  `VGPU_HOST_GPU_WRITE_THROUGH=1` keeps the previous mode for comparison.
+* **Failure**: a kernel that fails on the card while the card holds data the simulator does not raises an internal error (the data cannot be recovered); before, such a failure fell back to the simulator. A faulting in-set kernel is therefore fatal once data is resident.
+* **Not supported** (state, single device, synchronous launches, no `approx`, as before) plus: another host thread running simulator launches at the same moment as an offloaded launch's end is not protected (the gate and the lookup voiding assume the launching thread is the only one touching device memory then).
+
+Verification and tests:
+* `VGPU_HOST_GPU_VERIFY=1` now exercises the persistent bookkeeping: the card runs the launch on its resident copy, the simulator runs it too on its own memory (which stays the truth), and after each launch the card's whole memory is compared with the simulator's. A missed sync point leaves the card with stale input and shows as a difference.
+  **Corpus: 64 programs, 21,804 launches of kernels in the exact set compared, 21,804 identical, 0 different** ([raw/verify_resident.txt](data/round13/raw/verify_resident.txt), 26 programs launched an in-set kernel in the 100 s each ran).
+* Unit tests (no card): `test_host_gpu_logic` (14: the state machine against a ground-truth model over random histories including simulator launches, `chunk_span`, `chunk_runs`, the rule) passes plain, under ASan+UBSan (leaks on, halt) and under TSan; `test_card_gate` (7: the memory manager's side with a fake gate:
+  a remembered allocation is voided, run accesses decline, copies ask with range and direction, free and reset tell the gate, export pulls first, zero cost with no resident allocation, an allocation is ordinary again at zero) passes plain, ASan+UBSan and TSan (built from memory.cpp, memory_backing.cpp, error.cpp).
+* `e2e_host_gpu` extended: between launches on the card the program does a partial write into a resident chunk, a memset over whole chunks, a device-to-device copy, a free and a reallocation, a partial read, and a simulator launch; the printed checksums must equal the mode-off and write-through runs, the persistent run must move under half of write-through's bytes (109 + 95 MiB against 312 + 312), and verify must find 31 in-set launches identical.
+* **Mutation checks** (each applied to the rig copy, rebuilt, reverted): write sync dropped (`e2e_host_gpu` fails: "a kernel of the exact set gave other bits"); read sync dropped (fails: checksums differ); free not told to the gate, either in the memory manager or in the gate (fails); lookup exclusion in `find_ordinary_miss` removed (`test_card_gate` 4 of 6); exclusion in `run_allocation` removed (5 of 6);
+  `card_void_lookups` emptied (4 of 6); scalar store not treated as a write (5 of 6); export not pulling (6 of 7, after adding that test); the earlier `MUFU`-allowed and write-back-removed mutations still fail. **One is not caught, by design**: dropping `before_simulated`'s reset leaves output and bits unchanged, because the gate alone keeps it correct; it only costs speed.
+  (Two of the guards, the lookup memory and the run accesses, are only reachable by simulator kernels and library code, which the end-to-end program does not run between launches on resident data; that is why `test_card_gate` exists.)
+
+### 7.3 Wall times, same programs, A10G rig (4 vCPU), output compared with timing lines dropped
+
+[raw/bench_resident.txt](data/round13/raw/bench_resident.txt); the "out DIFF" rows differ only in lines that print a measured rate or overlap percentage (checked by hand for base64e and babelstream: the program's own PASS lines and every result line are identical).
+
+| program | off | write-through | persistent | persistent vs write-through | vs off | moved (in / out, MiB) wt -> persistent |
+|---|---:|---:|---:|---:|---:|---|
+| FDTD-2D | 161.9 s | 68.5 s | **4.9 s** | 14x | 33x | 71,715 / 71,715 -> 48 / 16 |
+| aligned-types | 2,682.6 s | 1,091.8 s | **10.6 s** | 103x | 253x | 1,047,322 / 1,047,322 -> 1,240 / 1,192 |
+| babelstream | 561.1 s | 380.6 s | **15.9 s** | 24x | 35x | 571,010 / 571,010 -> 1,152 / 0.3 |
+| base64e | 376.5 s | 53.0 s | **12.0 s** | 4.4x | 31x | 49,344 / 49,344 -> 6,619 / 8,745 |
+| JACOBI2D | 1.01 s | 0.50 s | 0.40 s | 1.25x | 2.5x | 275 / 275 -> 7.6 / 7.6 |
+| rod/sc | 0.44 s | 0.51 s | 0.37 s | 1.4x | 1.2x | 141 / 141 -> 101 / 51 |
+| axpby | 0.47 s | 0.58 s | 0.41 s | 1.4x | 1.15x | 272 / 272 -> 12 / 47 |
+| LU | 56.9 s | **16.6 s** | 20.3 s | **0.82x (slower)** | 2.8x | 23,008 / 23,008 -> 22,496 / 22,496 |
+| GRAMSCHM | 299.9 s | 314.6 s | 279.6 s | 1.13x | 1.07x | 98,208 / 98,208 -> 98,208 / 98,176 |
+| 3DCONV, ADI, GEMM, SYRK, gaussian, needle | 0.02 to 10 s | same or +0.2 s | same | 1.0x | 0.9x to 1.0x | 0 (the rule keeps them in the simulator) |
+
+* The profile's prediction held for the big winners (FDTD-2D 32x predicted, 14x measured on the whole program because the first two launches of each kernel and the host phase remain; aligned-types, babelstream, base64e within 1.5x of the model).
+* **LU and GRAMSCHM do not benefit.** Their launches alternate between kernels in the exact set and kernels that are not, so every simulator launch gives the card copy up and the next offloaded launch pushes it again: 22 GB moved either way. Persistent is 18% **slower** than write-through on LU (the gate's lock and the two-way bookkeeping on top of the same traffic).
+  An upper bound from the model for a finer reach (only the allocations a launch's arguments name, unsound as pointers inside memory are not followed): the same numbers as `persist`, so even that would not help these two: the alternating kernels share their buffers.
+* Fixed cost of the mode when nothing is offloaded stays 0.15 to 0.35 s per process (3DCONV 1.04 to 1.28 s, GEMM 1.32 to 1.54 s).
+
+### 7.4 What this adds up to
+
+**Worth it**, for runs of repeated launches on the same buffers; the gain is 14x to 103x over write-through, 31x to 253x over the simulator on four programs of 6 to 45 minutes of simulation (FDTD-2D, aligned-types, babelstream, base64e), no effect on 50 of the 64 corpus programs, a loss on LU (-18% against write-through)
+and nothing on GRAMSCHM. Share of the corpus: 10% of launches are in programs that gain 1.5x or more, 5% of launches change. The profile's weak side stands: single-launch programs (GEMM, SYRK, SYR2K, 3MM) and SFU kernels are untouched by persistence; they need the first-launch decision (section 6, step 2) and a grown exact set.
+Suggested defaults: persistent on (it is), with a ban that also looks at the traffic: a kernel whose offloaded launches move more than a fixed share of the live memory each time (LU's) should go back to the simulator after two launches.
