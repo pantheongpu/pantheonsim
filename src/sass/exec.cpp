@@ -525,6 +525,9 @@ class Runner {
   // instructions for the cases a handler leaves to it.
   MemoryManager& memory() { return mem_; }
   uint32_t tier_sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const { return sreg(blk, w, idx, lane); }
+  // The special registers a handler fills a warp's lanes with in one pass (S2R of TID.X/Y/Z, LANEID, CTAID, NTID): the lanes of
+  // `ex` of d, exactly the values sreg() gives them one by one; false for any other register.
+  bool tier_sreg_fill(const Block& blk, const Warp& w, unsigned idx, uint32_t* d, Mask ex) const;
   void tier_exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_mem(blk, w, ins, ex); }
   uint32_t tier_cbank32(unsigned bank, uint64_t offset) const { return cbank32(bank, offset); }
   void tier_exec_float(Block& blk, Warp& w, const Instr& ins, Mask ex) { exec_float(blk, w, ins, ex); }
@@ -697,6 +700,10 @@ class Runner {
   void seed_alloc_handshake(Block& blk);   // by the block's rank in its pair
   uint64_t smemsz_ = 0;          // SR_SMEMSZ: the whole allocation, in allocation units
   uint32_t block_threads_ = 0;
+  // SR_TID.X/Y/Z of every thread of the block, by thread number (a warp's rows are 32-aligned): one divide-free pass at launch
+  // instead of two divides per lane per S2R. Valid for the warps of the block (block_threads_ rounded up to 32).
+  uint32_t tid_tab_[3][1024 + 32];
+  void build_tid_tab();
   // Thread-block clusters: the shape (1x1x1 without one), its size, and
   // whether the launch has clusters at all (any dimension over 1, as the PTX
   // engine counts %is_explicit_cluster).
@@ -940,14 +947,66 @@ void Runner::set_pred(Warp& w, const Operand& o, unsigned lane, bool v) {
   else w.p[o.reg] &= ~(Mask{1} << lane);
 }
 
+// tid % bx, (tid / bx) % by and tid / (bx * by) for each tid, by counters (the lanes past the block's last thread continue the
+// count: z keeps growing, as the division gives it).
+[[gnu::noinline]] void Runner::build_tid_tab() {
+  const uint32_t n = (block_threads_ + 31) & ~31u;
+  const uint32_t bx = cfg_.block[0], by = cfg_.block[1];
+  uint32_t x = 0, y = 0, z = 0;
+  for (uint32_t t = 0; t < n; ++t) {
+    tid_tab_[0][t] = x;
+    tid_tab_[1][t] = y;
+    tid_tab_[2][t] = z;
+    if (++x == bx) {
+      x = 0;
+      if (++y == by) {
+        y = 0;
+        ++z;
+      }
+    }
+  }
+}
+
+[[gnu::noinline]] bool Runner::tier_sreg_fill(const Block& blk, const Warp& w, unsigned idx, uint32_t* d, Mask ex) const {
+  const uint32_t* src = nullptr;
+  uint32_t v = 0;
+  switch (idx) {
+    case 0x21: src = &tid_tab_[0][w.index * 32]; break;
+    case 0x22: src = &tid_tab_[1][w.index * 32]; break;
+    case 0x23: src = &tid_tab_[2][w.index * 32]; break;
+    case 0x00: {
+      for (Mask m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+        d[l] = l;
+      }
+      return true;
+    }
+    case 0x25: v = blk.ctaid[0]; break;
+    case 0x26: v = blk.ctaid[1]; break;
+    case 0x27: v = blk.ctaid[2]; break;
+    case 0x28: v = block_threads_; break;
+    default: return false;
+  }
+  if (src) {
+    if (ex == kAll) std::memcpy(d, src, 32 * sizeof(uint32_t));
+    else
+      for (Mask m = ex; m; m &= m - 1) {
+        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+        d[l] = src[l];
+      }
+  } else {
+    for (Mask m = ex; m; m &= m - 1) d[static_cast<unsigned>(std::countr_zero(m))] = v;
+  }
+  return true;
+}
+
 uint32_t Runner::sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const {
   const uint32_t tid = w.index * 32 + lane;
-  const uint32_t bx = cfg_.block[0], by = cfg_.block[1];
   switch (idx) {
     case 0x00: return lane;                                             // SR_LANEID
-    case 0x21: return tid % bx;                                         // SR_TID.X
-    case 0x22: return (tid / bx) % by;                                  // SR_TID.Y
-    case 0x23: return tid / (bx * by);                                  // SR_TID.Z
+    case 0x21: return tid_tab_[0][tid];                                 // SR_TID.X
+    case 0x22: return tid_tab_[1][tid];                                 // SR_TID.Y
+    case 0x23: return tid_tab_[2][tid];                                 // SR_TID.Z
     case 0x25: return blk.ctaid[0];
     case 0x26: return blk.ctaid[1];
     case 0x27: return blk.ctaid[2];
@@ -1176,6 +1235,7 @@ exec::LaunchStats Runner::run() {
   block_threads_ = cfg_.block[0] * cfg_.block[1] * cfg_.block[2];
   if (block_threads_ == 0 || block_threads_ > 1024)
     throw Error(Err::LaunchConfig, "block of " + std::to_string(block_threads_) + " threads");
+  build_tid_tab();
   const uint64_t blocks = static_cast<uint64_t>(cfg_.grid[0]) * cfg_.grid[1] * cfg_.grid[2];
   // The unit of work: a block, or with clusters a cluster, whose blocks must
   // be resident together.

@@ -1368,6 +1368,8 @@ vgpu_unit_test(test_memcount_forms)
 # (the same on the baseline SIMD level: the AVX2 sector window is then absent and the scalar forms count alone)
 add_test(NAME test_memcount_forms_simd_base COMMAND test_memcount_forms)
 set_tests_properties(test_memcount_forms_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base" TIMEOUT 1500)
+# The table of bank passes by warp shape (sass_bank_passes_memo), against the definition of the passes.
+vgpu_unit_test(test_bank_memo)
 # The single-lookup atomic read-modify-write and the one-lookup texel read, against the per-access code they replace.
 vgpu_unit_test(test_atom_rmw)
 # Module::code_at (a binary search over the code sections) against the scan it replaced.
@@ -1375,6 +1377,7 @@ vgpu_unit_test(test_sass_code_at)
 # The SASS executor's block, kept between blocks and launches and set up again each time (Runner::init_block).
 vgpu_unit_test(test_sass_block_reuse)
 vgpu_unit_test(test_sass_alu_runs)
+vgpu_unit_test(test_sass_s2r_fill)
 vgpu_unit_test(test_launch_env)
 vgpu_unit_test(test_sass_lea)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
