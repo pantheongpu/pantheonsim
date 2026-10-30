@@ -5353,6 +5353,63 @@ original code) for widths 0 to 64 over 300 000 random warps. `test_memfast`, `te
 Sanitizers on server3: `test_bank_memo`, `test_memcount_forms`, `test_sass_access_count` under ASan+UBSan at -O0 (leaks on, halt on error) pass; `test_bank_memo` under TSan -O1 passes (it is single-threaded; the table is a `thread_local`, no run with
 threads was made beyond the programs above at one thread). The e2e guards that need `nvcc` (`e2e_sass_tier`, `e2e_sass_archs`) cannot run on server3 (stub compiler); the whole-program counter comparison above stands in for them.
 
+## Round sp10: control dispatch of the tier (branch `sp10-dispatch`, base 9c1d6ffd = sp9-combined)
+
+Where the time went (perf `cycles:u`, one host thread, A = 9c1d6ffd; shares of the program's samples): HeCBench bh 54% `step_warp`/`exec_control`/`fetch`/`code_at`/`Code::instr`, black-scholes
+28% and bilateral 33% in `step_warp` + `exec_control`, and in the shared-memory programs `h_shared` 16 to 27%. `VGPU_TIER_STATS=1` showed why: of the instructions that end a tier run, the
+interpreter was running `CALL.REL.NOINC` and `RET.REL.NODEC` (nvcc's float division slow path: black-scholes 17 M of 1.2 G warp instructions, bilateral 1.2 M of 84 M) and `FCHK` (always
+"yes", see exec_float), and in bh the spin loop of its tree build (a block barrier, a load, a YIELD, then `CALL` and `WARPSYNC` round again, 546 000 turns at 600 bodies) ran `WARPSYNC` through
+`exec_control`, whose `release_warpsync` called `Runner::fetch` (a section lookup and a decode check) once per released lane.
+
+### What changed
+
+* Tier forms `Fchk`, `Call`, `Ret`, `Warpsync` (src/sass/tier.hpp, tier.cpp, tier_ops.inc). `FCHK` is a straight-line form with a handler (the predicate set on the executing lanes). `CALL.REL` to a fixed
+  address, `RET` and `WARPSYNC` end a run and are done by `Runner::tier_ctl`, a function of its own (the same counters as `execute()`: instruction, thread instructions, class; the lanes that run a call
+  or return get the new address, the others the next instruction; `WARPSYNC` makes the lanes wait, then calls the interpreter's `release_warpsync`). A call whose target is one of the module's builtins
+  (vprintf, malloc, ...) is left to `exec_control`. A uniform call or return keeps the warp's addresses as one address, so the chain goes on without a call of the scheduler.
+* `Runner::release_warpsync` (src/sass/exec_ops.inc) is now a member (it was a lambda of `exec_control`) used by both engines. It looks at the waiting lanes only, takes one test when no lanes are
+  held back and all waiting lanes name one mask (then they are all released or none is), looks the instruction at an address up once instead of once per lane, and wakes the lanes with
+  `sasslanes::wake`. `WARPSYNC` reads a mask that is not a register (an immediate: `__syncwarp()`) once, not once per lane.
+* `h_shared` (whole warp): the 32 offsets are worked out as 32-bit words in plain loops (`base << log2(stride) + add`, the sum of the low halves, which is the low half of the sum) and the window
+  check is one reduction over them (`SharedWindowCheck::add_warp`, include/vgpu/exec/window_check.hpp), not 32 dependent `add()` calls (`xor` after `imul` carried 45% of the function's samples).
+
+### Results (A = 9c1d6ffd, B = branch; `real.py`, one host thread, cpu 4 of server3, outputs identical; the box load was 20 to 40 for the whole round: only large effects are quoted)
+| program | A s | B s | A/B | runs |
+|---|---:|---:|---:|---|
+| HeCBench bh (600 bodies, 1 step; the default 5000 x 2 runs for more than 300 s) | 109.5 / 106.5 / 98.2 | 70.7 / 71.1 / 64.3 | 1.55x | 3 pairs (an earlier build: 1.39x, then 1.63x with the WARPSYNC release) |
+| HeCBench bilateral | 2.65 | 1.91 | 1.39x | 5 (A/A of the same box: 1.02x); an earlier build 2.31 to 1.91 (7 runs) |
+| HeCBench black-scholes | 37.80 | 35.16 | 1.08x | 3 (an earlier build 31.52 to 28.32, 1.11x, 3 runs) |
+| HeCBench shmembench | 17.25 | 14.71 | 1.17x | 5 (A/A 0.95x: noise of this program here is 5%) |
+| Rodinia hotspot | 2.50 | 2.24 | 1.12x | 5 (A/A 0.99x) |
+| Samples convolutionSeparable | `perf stat` instructions 364.8 G to 333.6 G (-8.5%), cycles 79.8 / 82.7 G to 75.1 / 75.1 G | | 1.06 to 1.10x | 2 pairs (wall time of the run: 26.97 to 27.26 s, 0.99x: the loaded box hides it; instructions are the reliable number) |
+| Rodinia lud, Samples sortingNetworks, histogram | 1.00x, 0.98x, 1.00x | | | no change expected (lud and sortingNetworks keep their time in bank counting and non-full warps; histogram in atomics) |
+
+bench.py canaries (12 workloads, SASS and PTX, 15 runs, counters identical in all 24 rows): all within noise (p > 0.05) except `mma_ptx` PTX 1.025x. One real placement effect on the way: the first
+version (the three branches written into the run loop `tier_run_t`) cost `atomics` SASS 0.956x (p=0.001, 0.960x with 21 runs; A/A 1.001x) at equal instructions; moving them to `tier_ctl`, a `noinline`
+function, gave 0.992x (15 runs, p=0.05) and 0.995x (21 runs, p=0.35). The load of the box for the canary runs was 20 to 40 (spreads of 5 to 20%): rows between 0.96 and 1.0 with p above 0.1 (`mem` SASS 0.958x,
+`wmma` PTX 0.968x, `api` PTX 0.969x) could not be told from noise here and are not explained by anything the change touches (the PTX engine is not touched).
+
+### Tests (wired in CMake) and the mutations that fail them
+* `test_sass_dispatch` (new): hand-assembled sm_86 kernels. A loop calls a function whose return address is in a register pair (every lane; the upper half warp only, so the callee and the code
+  after the call both run for different lanes; a RET some lanes do not run, which then fall into an EXIT), with `FCHK`, and `WARPSYNC` with the full mask and with a register mask of the lane's half warp
+  (also after lanes have exited); eight shapes of whole-warp shared-memory access (in order, every other word, scrambled, bytes, one address, `.X4`, `.X8`, 64-bit) in warps of 32, 64, 33 and 5 threads. Each
+  run is compared tier against the interpreter (`VGPU_FASTPATH=0`) in registers and every counter, **and** against a digest recorded from the tree before the tier ran these instructions (the
+  interpreter and the tier share `release_warpsync` and the window check, so comparing them with each other cannot show a mistake in what they share; `VGPU_PRINT_DIGESTS=1` prints the table, taken from the
+  9c1d6ffd build with `-DSASS_CALL_RET_NO_TIER_FORMS`). A last test requires the analysis to take all four new forms.
+* `test_tier`: the form table and the corpus rules know the four forms. `test_memcount_forms`: `add_warp` against the per-lane window test (400 000 random warps).
+* Mutations that fail them (each applied alone, test rebuilt): CALL target + 16; RET target + 16; FCHK false; WARPSYNC mask ignored (every lane names the full mask); RET counting one thread instruction;
+  release without the "every named lane has arrived" test; the one-mask path ignoring held-back lanes; the release counting exited lanes as missing; shift of the shared offsets one too many;
+  the offset's add term dropped; `add_warp` keeping the last maximum / last other-window bit only. All fail `test_sass_dispatch` or `test_memcount_forms` (1 of 6, 1 of 7 or 1 of 9 tests, with 4 failing checks for the first three).
+  One mutation was not caught at first (the release counting exited lanes) and led to the test "WARPSYNC after exits"; a section lookup shortcut in the release was not covered by any sm_86 test (a `.COLLECTIVE` WARPSYNC exists from sm_90) and was removed.
+* The e2e programs (`e2e_sass_tier`, `e2e_sass_archs`, ...) skip on server3 (no real nvcc) and are left to CI.
+
+### Not done, and negative results
+* bh's spin loop is the program's own algorithm (a block barrier inside a wait loop); the remaining time is in `step_warp` (the tier loop) and `release_warpsync` (15% after this round, 8 to 10% of the loop).
+* `BRA.CONV` / `BRA.DIV` (6.9 K and 3.9 K of 590 K warp instructions of bh at 500 bodies) and `P2R` stay with the interpreter; not worth a form.
+* convolutionSeparable keeps `h_shared` 19% (the per-lane copies), `load_scalar` 7% (one call per `FFMA` that reads a `__constant__` word through `c[0x3][..]`: not cached, because the memory manager's fault
+  injection must see every load) and the bank-pass table 10%; sortingNetworks / lud are the same shape. Nothing was changed there.
+* Not run: TSan (no threaded or atomic code was touched), the AVX-512 versus AVX2 tensor-core re-check (TensorCoreGemm samples; the box was not quiet enough for a 5% question).
+
 ## Round sp5: process start (branch `sp5-startup`, base a6e80555)
 
 Measured on server3 (cpu 2 alone, `perf stat -e instructions:u,cycles:u,task-clock`, 25 alternating runs of A and B per row, medians; the box was never quiet, load 12 to 60, so the
