@@ -391,6 +391,23 @@ inline uint32_t distinct_sectors(const uint64_t* addrs, uint64_t mask, unsigned 
   return static_cast<uint32_t>(std::min(n, cap));
 }
 
+// distinct_sectors for the SASS executor (every sector counted: no cap), with the closed forms in a function of their own: the list
+// that distinct_sectors falls back on is 8 KB on the stack, and a function that inlines it probes every page of that frame on entry
+// (two probes, the stack check) -- which every warp that a closed form counts paid, 30% of the counting for a strided gather. The
+// warps the closed forms give up on go to `distinct_sectors_listed`, which is distinct_sectors in a function that owns the frame.
+[[gnu::noinline]] inline uint32_t distinct_sectors_listed(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint64_t span) {
+  return distinct_sectors(addrs, mask, lanes, span, SIZE_MAX);
+}
+inline uint32_t distinct_sectors_uncapped(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint64_t span) {
+  if (fast() && span >= 1 && lanes <= 64) {
+    const uint64_t m = mask & detail::lane_mask(lanes);
+    if (!m) return 0;
+    uint64_t n;
+    if (detail::sectors_fast(addrs, m, span, n)) return static_cast<uint32_t>(n);   // (min(n, SIZE_MAX))
+  }
+  return distinct_sectors_listed(addrs, mask, lanes, span);
+}
+
 namespace detail {
 // Distinct words per bank. At most 64 lanes each put at most one word in a bank
 // (PTX: up to 32 consecutive words) or two (SASS, 17 words) -- the callers keep
