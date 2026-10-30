@@ -5404,7 +5404,7 @@ function, gave 0.992x (15 runs, p=0.05) and 0.995x (21 runs, p=0.35). The load o
 * The e2e programs (`e2e_sass_tier`, `e2e_sass_archs`, ...) skip on server3 (no real nvcc) and are left to CI.
 
 ### Not done, and negative results
-* bh's spin loop is the program's own algorithm (a block barrier inside a wait loop); the remaining time is in `step_warp` (the tier loop) and `release_warpsync` (15% after this round, 8 to 10% of the loop).
+* bh's spin loop is the program's own algorithm (a block barrier inside a wait loop); the remaining time (600 bodies, perf `cycles:u`) is 45% `step_warp` (the tier loop), 9% `tier_ctl`, 7% `release_warpsync` (it was 15% in the first version of the release), 5% `tier_release_bar`.
 * `BRA.CONV` / `BRA.DIV` (6.9 K and 3.9 K of 590 K warp instructions of bh at 500 bodies) and `P2R` stay with the interpreter; not worth a form.
 * convolutionSeparable keeps `h_shared` 19% (the per-lane copies), `load_scalar` 7% (one call per `FFMA` that reads a `__constant__` word through `c[0x3][..]`: not cached, because the memory manager's fault
   injection must see every load) and the bank-pass table 10%; sortingNetworks / lud are the same shape. Nothing was changed there.
