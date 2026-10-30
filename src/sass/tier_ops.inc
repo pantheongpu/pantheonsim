@@ -992,6 +992,44 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
     }
   }
   uint64_t addrs[32];
+  if (ex == kAll) {
+    // A full warp: the addresses are the batch as they stand (no lane to skip, none to find again when the values go back to the
+    // registers).
+    uint64_t fv[32];
+    const uint64_t nearest = exec::sassmem::full_warp_addresses(blo, bhi, urv + imm, kConstWindow, addrs);
+    if (nearest >= kWinEnd - kConstWindow) {   // (no lane in the constant window)
+      bool done;
+      if (Store) {
+        for (unsigned l = 0; l < 32; ++l) {
+          uint32_t v[2];
+          data(l, v);
+          fv[l] = bytes == 8 ? (static_cast<uint64_t>(v[1]) << 32 | v[0]) : bytes == 4 ? v[0] : (v[0] & ((1u << (8 * bytes)) - 1));
+        }
+        done = mem.store_batch(addrs, 32, bytes, fv);
+      } else {
+        done = mem.load_batch(addrs, 32, bytes, fv);
+        if (done && dreg) {
+          uint32_t* d = c.R + op.dst * 32u;
+          if (bytes == 4) {
+            for (unsigned l = 0; l < 32; ++l) d[l] = static_cast<uint32_t>(fv[l]);
+          } else if (bytes < 4) {
+            for (unsigned l = 0; l < 32; ++l) d[l] = tier_extend(op.b, static_cast<uint32_t>(fv[l]));
+          } else {
+            for (unsigned l = 0; l < 32; ++l) {
+              d[l] = static_cast<uint32_t>(fv[l]);
+              d[32 + l] = static_cast<uint32_t>(fv[l] >> 32);
+            }
+          }
+        }
+      }
+      if (done) {
+        count_access(blk.st, 0, Store, addrs, ex, bytes);
+        return;
+      }
+    }
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
   tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
   // The lanes' accesses together (MemoryManager::load_batch / store_batch).
   uint64_t fa[32], fv[32];
