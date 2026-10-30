@@ -184,7 +184,7 @@ class MemoryManager {
   // The accesses of one warp-wide load or store, made together, for the ordinary
   // case: `count` accesses of `size` bytes, in order. They return true having
   // done every one exactly as load_scalar / store_scalar would, in that order,
-  // or false having done nothing -- whenever any access could differ (a fault
+  // or false having done nothing to memory (load_batch may have written its `out`) -- whenever any access could differ (a fault
   // armed, a host mapping in range, a misaligned access or one outside the
   // allocation the first is in, an address that is no allocation's), in which
   // case the caller makes them one at a time and meets any error where it
