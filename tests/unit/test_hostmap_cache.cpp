@@ -152,4 +152,96 @@ VTEST(threads_access_their_buffers_while_another_maps_and_unmaps) {
   VCHECK_EQ(bad.load(), 0);
 }
 
+// host_load_batch / host_store_batch (a warp's accesses to one host-mapped buffer, made together) against load_scalar / store_scalar
+// lane by lane: the same values and bytes at every width, scattered and repeated addresses, partial counts; and the cases they decline
+// (an address outside the buffer or in none, misaligned, a read-only buffer, two buffers in one warp) with nothing done.
+VTEST(a_warps_accesses_to_a_mapped_buffer_are_the_lane_by_lane_ones) {
+  MemoryManager mem{1 << 20};
+  Buf b(8192, 0), other(4096, 0x77);
+  mem.map_host(b.addr(), b.p, b.n);
+  mem.map_host(other.addr(), other.p, other.n);
+  uint32_t seed = 12345;
+  const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+  const auto word = [&](uint32_t size) {
+    return (uint64_t{rnd()} << 32 | rnd()) & (size == 8 ? ~uint64_t{0} : (uint64_t{1} << (8 * size)) - 1);
+  };
+  for (size_t i = 0; i < b.n; ++i) b.p[i] = static_cast<uint8_t>(rnd());
+  for (uint32_t size : {1u, 2u, 4u, 8u})
+    for (int iter = 0; iter < 200; ++iter) {
+      const size_t count = 1 + rnd() % 32;
+      uint64_t addrs[32], got[32];
+      for (size_t i = 0; i < count; ++i)
+        addrs[i] = iter % 4 == 0 ? b.addr() + 64 + i * size : b.addr() + (rnd() % (b.n / size)) * size;
+      VCHECK(mem.host_load_batch(addrs, count, size, got));
+      for (size_t i = 0; i < count; ++i) VCHECK_EQ(got[i], mem.load_scalar(addrs[i], size));
+    }
+  // stores: a buffer written by the batch against its twin written lane by lane (few words, so lanes repeat and the later one wins)
+  Buf c(8192, 0), d(8192, 0);
+  mem.map_host(c.addr(), c.p, c.n);
+  mem.map_host(d.addr(), d.p, d.n);
+  for (uint32_t size : {1u, 2u, 4u, 8u})
+    for (int iter = 0; iter < 100; ++iter) {
+      const size_t count = 1 + rnd() % 32;
+      uint64_t ca[32], da[32], vals[32];
+      for (size_t i = 0; i < count; ++i) {
+        const uint64_t off = (rnd() % 64) * size;
+        ca[i] = c.addr() + off;
+        da[i] = d.addr() + off;
+        vals[i] = word(size);
+      }
+      VCHECK(mem.host_store_batch(ca, count, size, vals));
+      for (size_t i = 0; i < count; ++i) mem.store_scalar(da[i], size, vals[i]);
+      VCHECK(std::memcmp(c.p, d.p, c.n) == 0);
+    }
+  // the declines
+  uint64_t a2[2], v2[2] = {1, 2}, o2[2];
+  a2[0] = b.addr() + 8, a2[1] = b.addr() + b.n;                       // the second one past the end
+  VCHECK(!mem.host_load_batch(a2, 2, 4, o2));
+  VCHECK(!mem.host_store_batch(a2, 2, 4, v2));
+  a2[1] = b.addr() + 2;                                              // misaligned for 4 bytes
+  VCHECK(!mem.host_load_batch(a2, 2, 4, o2));
+  a2[1] = other.addr();                                              // another buffer
+  VCHECK(!mem.host_load_batch(a2, 2, 4, o2));
+  a2[0] = b.addr() - 4, a2[1] = b.addr();                            // the first below the buffer
+  VCHECK(!mem.host_load_batch(a2, 2, 4, o2));
+  VCHECK(!mem.host_load_batch(a2, 0, 4, o2));
+  VCHECK(!mem.host_load_batch(a2 + 1, 1, 3, o2));                    // not a width
+  Buf ro(4096, 0x5a);
+  mem.map_host(ro.addr(), ro.p, ro.n, /*read_only=*/true);
+  a2[0] = ro.addr(), a2[1] = ro.addr() + 4;
+  VCHECK(mem.host_load_batch(a2, 2, 4, o2));
+  VCHECK_EQ(o2[0], uint64_t{0x5a5a5a5a});
+  VCHECK(!mem.host_store_batch(a2, 2, 4, v2));                       // the lane-by-lane store reports the read-only write
+  VCHECK_EQ(ro.p[0], uint8_t{0x5a});
+}
+
+// The host's own atomics race the batch (a kernel polling or filling zero-copy memory while the program works on the same words): the batch's
+// accesses are the relaxed atomic ones load_scalar and store_scalar make, so ThreadSanitizer sees no race and no value is torn.
+VTEST(a_warps_batch_on_a_mapped_buffer_races_the_hosts_atomics_cleanly) {
+  MemoryManager mem{1 << 20};
+  Buf b(4096, 0);
+  mem.map_host(b.addr(), b.p, b.n);
+  std::atomic<bool> stop{false};
+  std::atomic<int> torn{0};
+  std::thread host([&] {
+    uint32_t* w = reinterpret_cast<uint32_t*>(b.p);
+    for (uint32_t i = 1; !stop.load(); ++i)
+      for (int k = 0; k < 32; ++k) __atomic_store_n(&w[k], i * 0x01010101u, __ATOMIC_RELAXED);
+  });
+  for (int iter = 0; iter < 2000; ++iter) {
+    uint64_t addrs[32], vals[32], got[32];
+    for (int k = 0; k < 32; ++k) addrs[k] = b.addr() + 4 * k;
+    VCHECK(mem.host_load_batch(addrs, 32, 4, got));
+    for (int k = 0; k < 32; ++k) {
+      const uint32_t x = static_cast<uint32_t>(got[k]);
+      if ((x & 0xff) != ((x >> 8) & 0xff) || (x & 0xff) != ((x >> 24) & 0xff)) ++torn;
+    }
+    for (int k = 0; k < 32; ++k) vals[k] = 0x02020202u * (iter % 100 + 1);
+    VCHECK(mem.host_store_batch(addrs, 32, 4, vals));
+  }
+  stop = true;
+  host.join();
+  VCHECK_EQ(torn.load(), 0);
+}
+
 VTEST_MAIN

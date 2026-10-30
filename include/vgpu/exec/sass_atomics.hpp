@@ -81,6 +81,20 @@ struct AddF32Step {
     return uint64_t{sum != sum ? 0x7fffffffu : fz(f32_bits(sum))};
   }
 };
+struct AddF64Step {
+  uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const {
+    // A NaN comes through as it is: the one added, else the one in memory (the general rule).
+    const double a = as_f64(old), b = as_f64(x);
+    return b != b ? x : a != a ? old : f64_bits(a + b);
+  }
+};
+struct MinS32Step { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return static_cast<uint32_t>(std::min(static_cast<int32_t>(old), static_cast<int32_t>(x))); } };
+struct MaxS32Step { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return static_cast<uint32_t>(std::max(static_cast<int32_t>(old), static_cast<int32_t>(x))); } };
+struct MinS64Step { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return static_cast<uint64_t>(std::min(static_cast<int64_t>(old), static_cast<int64_t>(x))); } };
+struct MaxS64Step { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return static_cast<uint64_t>(std::max(static_cast<int64_t>(old), static_cast<int64_t>(x))); } };
+// INC and DEC compare the low 32 bits whatever the type is (the general rule).
+struct IncStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return static_cast<uint32_t>(old) >= static_cast<uint32_t>(x) ? 0 : old + 1; } };
+struct DecStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return (old == 0 || static_cast<uint32_t>(old) > static_cast<uint32_t>(x)) ? x : old - 1; } };
 struct MinStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return std::min(old, x); } };
 struct MaxStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return std::max(old, x); } };
 struct AndStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const { return old & x; } };
@@ -89,20 +103,132 @@ struct XorStep { uint64_t operator()(uint64_t old, uint64_t x, uint64_t) const {
 struct ExchStep { uint64_t operator()(uint64_t, uint64_t x, uint64_t) const { return x; } };
 
 // Which step stands for (op, type, cas); General when none does (the halves, the signed min and max, INC, DEC, F64 and the rest: `apply`).
-enum class Step : uint8_t { General, Cas, Add, AddF32, Min, Max, And, Or, Xor, Exch };
+enum class Step : uint8_t { General, Cas, Add, AddF32, AddF64, Min, Max, MinS32, MaxS32, MinS64, MaxS64, Inc, Dec, And, Or, Xor, Exch };
 inline Step step_for(unsigned op, unsigned type, bool cas) {
   if (cas) return Step::Cas;
   if (type == 4 || type == 7) return Step::General;   // (every operation on the halves works on each half)
   switch (op) {
-    case 0: return type == 3 ? Step::AddF32 : (type == 0 || type == 1 || type == 2 || type == 5) ? Step::Add : Step::General;
-    case 1: return (type == 0 || type == 2) ? Step::Min : Step::General;
-    case 2: return (type == 0 || type == 2) ? Step::Max : Step::General;
+    case 0: return type == 3 ? Step::AddF32 : type == 6 ? Step::AddF64 : (type == 0 || type == 1 || type == 2 || type == 5) ? Step::Add : Step::General;
+    case 1: return (type == 0 || type == 2) ? Step::Min : type == 1 ? Step::MinS32 : type == 5 ? Step::MinS64 : Step::General;
+    case 2: return (type == 0 || type == 2) ? Step::Max : type == 1 ? Step::MaxS32 : type == 5 ? Step::MaxS64 : Step::General;
+    case 3: return Step::Inc;
+    case 4: return Step::Dec;
     case 5: return Step::And;
     case 6: return Step::Or;
     case 7: return Step::Xor;
     case 8: return Step::Exch;
     default: return Step::General;
   }
+}
+
+// A warp's atomics on words already loaded: `cur[slot[l]]` is lane l's word (lanes that share an address share a slot), and each lane of `ex`,
+// in lane order, finds in it what the lanes before left. old_of[l] is what lane l found; cur takes the new values (cut to `keep`). Returns
+// whether any lane changed a word, or -1 (nothing touched) for the operations without a step. `nslots` is the number of distinct words
+// (one: every lane on the same word). One call per warp, a loop per step.
+namespace detail {
+template <class StepFn>
+[[gnu::noinline]] inline int global_lanes(uint32_t ex, unsigned nslots, const unsigned* __restrict slot, uint64_t* __restrict cur,
+                                          const uint64_t* __restrict v, const uint64_t* __restrict swp, uint64_t keep,
+                                          uint64_t* __restrict old_of, StepFn step) {
+  uint64_t changed = 0;
+  if (nslots == 1) {   // every lane on one word (a counter, a maximum): the word stays in a register from lane to lane
+    uint64_t c = cur[0];
+    for (uint32_t m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctz(m));
+      const uint64_t nw = step(c, v[l], swp ? swp[l] : 0) & keep;
+      old_of[l] = c;
+      changed |= nw ^ c;
+      c = nw;
+    }
+    cur[0] = c;
+    return changed != 0;
+  }
+  for (uint32_t m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(__builtin_ctz(m));
+    const uint64_t old = cur[slot[l]];
+    const uint64_t nw = step(old, v[l], swp ? swp[l] : 0) & keep;
+    old_of[l] = old;
+    changed |= nw ^ old;
+    cur[slot[l]] = nw;
+  }
+  return changed != 0;
+}
+}  // namespace detail
+
+inline int global_batch(unsigned op, unsigned type, bool cas, uint32_t ex, unsigned nslots, const unsigned* slot, uint64_t* cur,
+                        const uint64_t* v, const uint64_t* swp, uint64_t* old_of) {
+  const uint64_t keep = is64(type) ? ~uint64_t{0} : 0xffffffffull;
+  const auto go = [&](auto step) { return detail::global_lanes(ex, nslots, slot, cur, v, swp, keep, old_of, step); };
+  switch (step_for(op, type, cas)) {
+    case Step::Cas: return go(CasStep{});
+    case Step::Add: return go(AddStep{});
+    case Step::AddF32: return go(AddF32Step{});
+    case Step::AddF64: return go(AddF64Step{});
+    case Step::Min: return go(MinStep{});
+    case Step::Max: return go(MaxStep{});
+    case Step::MinS32: return go(MinS32Step{});
+    case Step::MaxS32: return go(MaxS32Step{});
+    case Step::MinS64: return go(MinS64Step{});
+    case Step::MaxS64: return go(MaxS64Step{});
+    case Step::Inc: return go(IncStep{});
+    case Step::Dec: return go(DecStep{});
+    case Step::And: return go(AndStep{});
+    case Step::Or: return go(OrStep{});
+    case Step::Xor: return go(XorStep{});
+    case Step::Exch: return go(ExchStep{});
+    default: return -1;
+  }
+}
+
+// A warp's atomics on one block's shared bytes: for each lane of `ex` in lane order, the word (4 or 8 bytes, by `type`) at sh + soff[l]
+// is read into old_of[l] and replaced by the step's value (a lane finds what the lanes before it left, also when two share a word or
+// overlap). The common operations (step_for) run as a loop of their own with the word width and the step known when it is compiled;
+// false, nothing touched, for the rest (the caller's lane-by-lane path has them, and the fault for an operation that is none).
+// The caller has checked that every lane's word lies inside the shared bytes.
+namespace detail {
+template <class W, class StepFn>
+[[gnu::noinline]] inline void shared_lanes(uint8_t* __restrict sh, const uint32_t* __restrict soff, uint32_t ex, const uint64_t* __restrict v,
+                                           const uint64_t* __restrict swp, uint64_t* __restrict old_of, StepFn step) {
+  for (uint32_t m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(__builtin_ctz(m));
+    W cur;
+    std::memcpy(&cur, sh + soff[l], sizeof cur);
+    old_of[l] = cur;
+    const W nw = static_cast<W>(step(uint64_t{cur}, v[l], swp ? swp[l] : 0));   // (no exchange value but a compare-and-swap's)
+    std::memcpy(sh + soff[l], &nw, sizeof nw);
+  }
+}
+}  // namespace detail
+
+inline bool shared_batch(unsigned op, unsigned type, bool cas, uint8_t* sh, const uint32_t* soff, uint32_t ex, const uint64_t* v,
+                         const uint64_t* swp, uint64_t* old_of) {
+  const Step s = step_for(op, type, cas);
+  if (s == Step::General) return false;
+  const bool wide = is64(type);
+  const auto go = [&](auto step) {
+    if (wide) detail::shared_lanes<uint64_t>(sh, soff, ex, v, swp, old_of, step);
+    else detail::shared_lanes<uint32_t>(sh, soff, ex, v, swp, old_of, step);
+  };
+  switch (s) {
+    case Step::Cas: go(CasStep{}); break;
+    case Step::Add: go(AddStep{}); break;
+    case Step::AddF32: go(AddF32Step{}); break;
+    case Step::AddF64: go(AddF64Step{}); break;
+    case Step::Min: go(MinStep{}); break;
+    case Step::Max: go(MaxStep{}); break;
+    case Step::MinS32: go(MinS32Step{}); break;
+    case Step::MaxS32: go(MaxS32Step{}); break;
+    case Step::MinS64: go(MinS64Step{}); break;
+    case Step::MaxS64: go(MaxS64Step{}); break;
+    case Step::Inc: go(IncStep{}); break;
+    case Step::Dec: go(DecStep{}); break;
+    case Step::And: go(AndStep{}); break;
+    case Step::Or: go(OrStep{}); break;
+    case Step::Xor: go(XorStep{}); break;
+    case Step::Exch: go(ExchStep{}); break;
+    default: return false;
+  }
+  return true;
 }
 
 // Whether a warp's atomics may be batched: none of the distinct addresses can be in memory the host maps (managed, pinned, IPC), whose atomics

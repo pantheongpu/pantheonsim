@@ -678,6 +678,53 @@ bool MemoryManager::store_batch(const uint64_t* addrs, size_t count, uint32_t si
   return true;
 }
 
+// The mapping of the first address, and whether every access is aligned and inside it (an address below its base wraps to an offset far
+// above its length).
+bool MemoryManager::host_batch_hit(const uint64_t* addrs, size_t count, uint32_t size, bool store, HostHit* h) const {
+  if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
+  if (!host_maps_ || !host_maps_->may_contain(addrs[0]) || !lookup_host(addrs[0], size, h)) return false;
+  if (store && h->read_only) return false;
+  const uint64_t limit = h->len - size + 1;   // (the first access is inside, so size <= len)
+  uint64_t bits = 0, outside = 0;
+  for (size_t i = 0; i < count; ++i) {
+    bits |= addrs[i];
+    outside |= static_cast<uint64_t>(addrs[i] - h->base >= limit);
+  }
+  return !((bits & (size - 1)) || outside);
+}
+
+bool MemoryManager::host_load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
+  HostHit h;
+  if (!host_batch_hit(addrs, count, size, /*store=*/false, &h)) return false;
+  const auto each = [&](auto width) {
+    constexpr uint32_t kSize = decltype(width)::value;
+    for (size_t i = 0; i < count; ++i) out[i] = load_at(h.host + (addrs[i] - h.base), kSize);
+  };
+  switch (size) {
+    case 1: each(std::integral_constant<uint32_t, 1>()); break;
+    case 2: each(std::integral_constant<uint32_t, 2>()); break;
+    case 4: each(std::integral_constant<uint32_t, 4>()); break;
+    default: each(std::integral_constant<uint32_t, 8>()); break;
+  }
+  return true;
+}
+
+bool MemoryManager::host_store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals) {
+  HostHit h;
+  if (!host_batch_hit(addrs, count, size, /*store=*/true, &h)) return false;
+  const auto each = [&](auto width) {
+    constexpr uint32_t kSize = decltype(width)::value;
+    for (size_t i = 0; i < count; ++i) store_at(h.host + (addrs[i] - h.base), kSize, vals[i]);
+  };
+  switch (size) {
+    case 1: each(std::integral_constant<uint32_t, 1>()); break;
+    case 2: each(std::integral_constant<uint32_t, 2>()); break;
+    case 4: each(std::integral_constant<uint32_t, 4>()); break;
+    default: each(std::integral_constant<uint32_t, 8>()); break;
+  }
+  return true;
+}
+
 void MemoryManager::batch_load(const BatchWindow& window, const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
   load_batch_in(*static_cast<const Allocation*>(window.alloc), window.base, addrs, count, size, out);
 }
