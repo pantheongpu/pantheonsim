@@ -130,6 +130,9 @@ void check(const std::vector<uint64_t>& a, uint64_t mask, unsigned lanes, uint64
     if (mc::distinct_sectors(a.data(), m32, 32, bytes, SIZE_MAX) != ss)
       throw vtest::Failure("sass sectors " + std::to_string(mc::distinct_sectors(a.data(), m32, 32, bytes, SIZE_MAX)) + " vs " +
                            std::to_string(ss) + ": " + where);
+    if (mc::distinct_sectors_uncapped(a.data(), m32, 32, bytes) != ss)   // (the SASS executor's own entry: the closed forms, then the list)
+      throw vtest::Failure("sass sectors (uncapped) " + std::to_string(mc::distinct_sectors_uncapped(a.data(), m32, 32, bytes)) + " vs " +
+                           std::to_string(ss) + ": " + where);
     bool sane = true;
     for (unsigned l = 0; l < 32; ++l) sane = sane && (!(m32 >> l & 1) || a[l] <= ~uint64_t{0} - 256);
     if (sane && m32) {

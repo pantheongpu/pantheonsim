@@ -2995,7 +2995,7 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
   if (!n) return;
   switch (space) {
     case 0: {
-      const uint64_t distinct = exec::memcount::distinct_sectors(addr, lanes, 32, bytes, SIZE_MAX);
+      const uint64_t distinct = exec::memcount::distinct_sectors_uncapped(addr, lanes, 32, bytes);
       (store ? st.global_stores : st.global_loads) += n;
       (store ? st.global_bytes_written : st.global_bytes_read) += n * bytes;
       st.global_sectors += distinct;
@@ -3012,7 +3012,7 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
       break;
     }
     default: {
-      const uint64_t distinct = exec::memcount::distinct_sectors(addr, lanes, 32, bytes, SIZE_MAX);
+      const uint64_t distinct = exec::memcount::distinct_sectors_uncapped(addr, lanes, 32, bytes);
       (store ? st.local_stores : st.local_loads) += n;
       (store ? st.local_bytes_written : st.local_bytes_read) += n * bytes;
       st.local_sectors += distinct;

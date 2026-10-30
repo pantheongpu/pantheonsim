@@ -5,6 +5,7 @@
 // (tests/unit/test_sass_mem_rows.cpp).
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 
 #if defined(__SSE2__)
@@ -43,6 +44,25 @@ inline bool global_run(const uint32_t* lo, const uint32_t* hi, uint64_t add, uns
     differ |= a ^ (g0 + uint64_t{i} * bytes);
   }
   return differ == 0;
+}
+
+// The addresses of a full warp's global access (a base that is a pair of rows, a single row or none, plus `add`), and in the same pass
+// the smallest of their distances above `window` (wrapping: an address below it is far): below 2^32 says some lane is in the 4 GiB from
+// `window`, the constant window. (A pass over the stored addresses that asked this alone waited for the stores.)
+inline uint64_t full_warp_addresses(const uint32_t* lo, const uint32_t* hi, uint64_t add, uint64_t window, uint64_t* addrs) {
+  uint64_t nearest = ~uint64_t{0};
+  const auto lane = [&](unsigned l, uint64_t a) {
+    addrs[l] = a;
+    nearest = std::min(nearest, a - window);
+  };
+  if (lo && hi) {
+    for (unsigned l = 0; l < 32; ++l) lane(l, (lo[l] | (static_cast<uint64_t>(hi[l]) << 32)) + add);
+  } else if (lo) {
+    for (unsigned l = 0; l < 32; ++l) lane(l, uint64_t{lo[l]} + add);
+  } else {
+    for (unsigned l = 0; l < 32; ++l) lane(l, add);
+  }
+  return nearest;
 }
 
 }  // namespace vgpu::exec::sassmem

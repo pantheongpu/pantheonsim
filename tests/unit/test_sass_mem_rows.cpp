@@ -61,4 +61,43 @@ VTEST(global_run_agrees_with_the_lane_loop) {
   VCHECK(runs > 20000 && nonruns > 20000);
 }
 
+VTEST(full_warp_addresses_are_the_lane_loops_and_find_a_lane_in_the_window) {
+  std::mt19937_64 rng(11);
+  constexpr uint64_t kWindow = 0x6ff9'0000'0000ull, kSpan = uint64_t{1} << 32;
+  unsigned inside = 0, outside = 0, edges = 0;
+  for (int round = 0; round < 100000; ++round) {
+    uint32_t lo[32], hi[32];
+    const unsigned kind = rng() % 3;   // a pair of rows, a row, none
+    const uint64_t add = rng() % 2 ? rng() % 4096 : rng();
+    // Most warps far from the window; some with a lane (or all) in it, at its first byte, its last, and one before and after.
+    const unsigned where = rng() % 6;   // 0..2 far, 3 in, 4 on the edges, 5 near the edges
+    for (unsigned l = 0; l < 32; ++l) {
+      uint64_t a = rng();
+      if (kind == 1) a = static_cast<uint32_t>(a);
+      if (where == 3 && (l == 0 || rng() % 4 == 0)) a = kWindow + rng() % kSpan - add;
+      if (where >= 4 && l == rng() % 32) {
+        static const int64_t d[] = {0, -1, 1, static_cast<int64_t>(kSpan) - 1, static_cast<int64_t>(kSpan), static_cast<int64_t>(kSpan) + 1};
+        a = kWindow + static_cast<uint64_t>(d[rng() % 6]) - add;
+      }
+      if (kind == 1 && where == 3) a = static_cast<uint32_t>(a);
+      lo[l] = static_cast<uint32_t>(a);
+      hi[l] = static_cast<uint32_t>(a >> 32);
+    }
+    const uint32_t* plo = kind == 2 ? nullptr : lo;
+    const uint32_t* phi = kind == 0 ? hi : nullptr;
+    uint64_t got[32];
+    const uint64_t nearest = sm::full_warp_addresses(plo, phi, add, kWindow, got);
+    bool any_in = false;
+    for (unsigned l = 0; l < 32; ++l) {
+      const uint64_t want = lane_address(plo, phi, add, l);
+      VCHECK_EQ(got[l], want);
+      any_in |= want >= kWindow && want < kWindow + kSpan;
+      edges += want == kWindow || want == kWindow + kSpan - 1 || want == kWindow - 1 || want == kWindow + kSpan;
+    }
+    VCHECK_EQ(nearest < kSpan, any_in);
+    (any_in ? inside : outside) += 1;
+  }
+  VCHECK(inside > 5000 && outside > 10000 && edges > 1000);
+}
+
 VTEST_MAIN
