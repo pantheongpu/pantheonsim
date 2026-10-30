@@ -1592,6 +1592,155 @@ TIER_HANDLER(h_hmma) {   // exec_mma's kernel call: the same kernel, and the sam
     for (unsigned s = 0; s < c_regs; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, out + s * 32);
 }
 
+// LDGSTS (cp.async without .ZFILL): each executing lane reads `bytes` (4, 8 or 16) of global memory and writes them at its shared address; a lane
+// whose predicate operand is false writes zeros. exec_mem's lane loop does a mem_read and a mem_write (each a switch and a bounds check, out of line)
+// per lane; here the global reads are one batch (load_batch, in the 8-byte pieces a 16-byte read is) and the shared writes are lane copies, in lane order
+// (the last of lanes on one address wins, as there), once every shared access is known to lie inside the block's own array. A batch the memory
+// manager declines (a fault, a misaligned or host-mapped access) and a shared access outside the array are exec_mem's, which has not been started.
+TIER_HANDLER(h_ldgsts) {
+  const TCtx& c = *static_cast<const TCtx*>(vc);
+  Warp& w = *c.w;
+  Block& blk = *c.blk;
+  const unsigned bytes = op.a;
+  const unsigned rs = op.s[0].off, rg = op.s[1].off;
+  const uint32_t* sreg = rs != kRZ ? c.R + rs * 32u : nullptr;
+  const uint32_t* glo = rg != kRZ ? c.R + rg * 32u : nullptr;
+  const uint32_t* ghi = rg != kRZ ? c.R + (rg + 1u) * 32u : nullptr;
+  const uint32_t sadd = op.b;
+  uint64_t saddr[32], gaddr[32];
+  exec::SharedWindowCheck window;
+  for (unsigned l = 0; l < 32; ++l) saddr[l] = 0;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    const uint64_t off = static_cast<uint32_t>((sreg ? sreg[l] : 0u) + sadd);
+    saddr[l] = off;
+    window.add(off, blk.rank);
+  }
+  if (!window.inside(blk.shared.size(), bytes, ex != 0)) {
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
+  tier_global_addresses(glo, ghi, static_cast<uint64_t>(op.imm), ex, gaddr);
+  const Mask reads = (op.aux & 1) ? (ex & tier_pmask(c, op.p)) : ex;
+  uint64_t fa[32], lo[32], hi[32];
+  unsigned n = 0;
+  for (Mask m = reads; m; m &= m - 1) fa[n++] = gaddr[std::countr_zero(m)];
+  MemoryManager& mem = c.r->memory();
+  if (n) {
+    bool ok;
+    if (bytes == 16) {
+      uint64_t fb[32];
+      for (unsigned i = 0; i < n; ++i) fb[i] = fa[i] + 8;
+      ok = mem.load_batch(fa, n, 8, lo) && mem.load_batch(fb, n, 8, hi);
+    } else {
+      ok = mem.load_batch(fa, n, bytes, lo);
+    }
+    if (!ok) {
+      c.r->tier_exec_mem(blk, w, *op.ins, ex);
+      return;
+    }
+  }
+  w.idle_yields = 0;   // a store is progress (Runner::mem_write)
+  uint8_t* const sh = blk.shared.data();
+  unsigned i = 0;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    uint8_t* const at = sh + (saddr[l] & 0xffffff);
+    const bool read = (reads >> l) & 1;
+    const uint64_t a = read ? lo[i] : 0, b = read ? (bytes == 16 ? hi[i] : 0) : 0;
+    i += read;
+    if (bytes == 4) {
+      const uint32_t v = static_cast<uint32_t>(a);
+      std::memcpy(at, &v, 4);
+    } else if (bytes == 8) {
+      std::memcpy(at, &a, 8);
+    } else {
+      std::memcpy(at, &a, 8);
+      std::memcpy(at + 8, &b, 8);
+    }
+  }
+  count_access(blk.st, 0, false, gaddr, ex, bytes);
+  count_shared_access(blk.st, true, saddr, ex, bytes);
+}
+
+// LD and ST, whose 64-bit addresses name a window of the executor's address space as well as global memory (Runner::classify). The interpreter classifies
+// each lane, moves it by its window's rule and counts the warp as the LAST lane's window says; the cases the tier takes are the ones where that is one
+// rule: every active lane in the shared window (the lanes move as LDS/STS do, and are counted as shared accesses of the offsets), or no lane in
+// any window (plain global memory, which h_global makes as LDG/STG: the interpreter's per-lane mem_read/mem_write and the batch give the same bytes
+// and the same counters). A mix, a local, parameter or constant address, an offset outside the block's array and a 32-byte access are exec_mem's.
+constexpr uint64_t kWindowsEnd = 7ull << 32;   // the windows are the 2^32-byte ranges at kConstWindow + 0 .. 6 << 32 (const, 3 unused, param, shared, local)
+template <bool Store>
+static void h_generic(void* vc, const tier::MOp& op, Mask ex) {
+  const TCtx& c = *static_cast<const TCtx*>(vc);
+  Warp& w = *c.w;
+  Block& blk = *c.blk;
+  const unsigned bytes = op.a;
+  const unsigned ra = op.s[0].off;
+  const uint32_t* blo = ra != kRZ ? c.R + ra * 32u : nullptr;
+  const uint32_t* bhi = (ra != kRZ && (op.aux & 1)) ? c.R + (ra + 1u) * 32u : nullptr;
+  const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
+  uint64_t addrs[32];
+  tier_global_addresses(blo, bhi, urv + static_cast<uint64_t>(op.imm), ex, addrs);
+  unsigned in_shared = 0, in_window = 0;
+  for (Mask m = ex; m; m &= m - 1) {
+    const uint64_t g = addrs[std::countr_zero(m)];
+    in_shared += (g - kSharedWindow) < (uint64_t{1} << 32);
+    in_window += (g - kConstWindow) < kWindowsEnd;
+  }
+  if (ex && in_window == 0) {
+    h_global<Store>(vc, op, ex);
+    return;
+  }
+  if (!ex || in_shared != static_cast<unsigned>(popc(ex)) || !(bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16)) {
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
+  exec::SharedWindowCheck window;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    addrs[l] -= kSharedWindow;   // the offset in the window (< 2^32), as classify gives it
+    window.add(addrs[l], blk.rank);
+  }
+  if (!window.inside(blk.shared.size(), bytes, true)) {
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
+  if constexpr (Store) w.idle_yields = 0;   // a store is progress (Runner::mem_write)
+  uint8_t* const sh = blk.shared.data();
+  uint32_t* const d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
+  const unsigned words = std::max(1u, bytes / 4);
+  const bool moved = with_lane_width(bytes, [&](auto width) {
+    constexpr unsigned B = decltype(width)::value;
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      uint8_t* const at = sh + (addrs[l] & 0xffffff);
+      if (Store) {
+        store_lane_bytes<B>(at, [&](unsigned i) -> uint32_t { return d ? d[32 * i + l] : 0u; });
+      } else if (d) {
+        if constexpr (B == 4) d[l] = load_lane_word<B>(at);
+        else if constexpr (B < 4) d[l] = tier_extend(op.b, load_lane_word<B>(at));
+        else
+          for (unsigned i = 0; i < B / 4; ++i) d[32 * i + l] = load_lane_word<B>(at, i);
+      }
+    }
+  });
+  if (!moved) {   // (unreachable: the widths are those of with_lane_width)
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      uint8_t* const at = sh + (addrs[l] & 0xffffff);
+      uint32_t v[4] = {};
+      if (Store) {
+        for (unsigned i = 0; i < words; ++i) v[i] = d ? d[32 * i + l] : 0;
+        std::memcpy(at, v, bytes);
+      } else if (d) {
+        std::memcpy(v, at, bytes);
+        for (unsigned i = 0; i < words; ++i) d[32 * i + l] = v[i];
+      }
+    }
+  }
+  count_shared_access(blk.st, Store, addrs, ex, bytes);
+}
+
 tier::MOp::Fn tier_handler_for(tier::Form f) {
   using F = tier::Form;
   switch (f) {
@@ -1634,6 +1783,9 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Shfl: return &h_shfl;
     case F::Vote: return &h_vote;
     case F::Hmma: return &h_hmma;
+    case F::Ldgsts: return &h_ldgsts;
+    case F::Ld: return &h_generic<false>;
+    case F::St: return &h_generic<true>;
     case F::Match: return &h_match;
     case F::Imma: return &h_imma;
     case F::Atom: return &h_atom;
