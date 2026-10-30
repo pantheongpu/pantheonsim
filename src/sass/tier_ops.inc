@@ -1928,15 +1928,17 @@ struct JitSampler {
   }
 };
 
-// CALL, RET and WARPSYNC as they end a run (tier_run_t calls this; false: not taken here, the interpreter runs it -- a call of a function VirtualGPU provides).
+// CALL, RET and WARPSYNC as they end a run (tier_run_t calls this; res 0: not taken here, the interpreter runs it -- a call of a function VirtualGPU provides).
 // `moved`: the run was longer than one instruction, so the lanes' program counters are still those of its start.
-[[gnu::noinline]] bool Runner::tier_ctl(Block& blk, Warp& w, const tier::MOp& last, Mask group, unsigned glanes, uint64_t here, bool moved,
-                                        const Code& code, uint64_t& at, bool& all_at) {
+[[gnu::noinline]] Runner::CtlOut Runner::tier_ctl(Block& blk, Warp& w, const tier::MOp& last, Mask group, unsigned glanes, uint64_t here, bool moved,
+                                                 const Code& code) {
+  uint64_t at = 0;
+  bool all_at = false;
   exec::LaunchStats& st = blk.st;
   if (last.form == tier::Form::Call) {
     // exec_control's CALL.REL for a fixed target: a function VirtualGPU provides (a builtin at its magic address) is the interpreter's.
     const uint64_t target = code.base + static_cast<uint64_t>(last.imm);
-    if (!(m_.builtins.empty() || target < m_.builtins.begin()->first || m_.builtins.find(target) == m_.builtins.end())) return false;
+    if (!(m_.builtins.empty() || target < m_.builtins.begin()->first || m_.builtins.find(target) == m_.builtins.end())) return {0, 0};
     // The lanes that run it go to the target, the others on to the next instruction.
     const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
     const unsigned lanes = ex == group ? glanes : popc(ex);
@@ -1951,7 +1953,7 @@ struct JitSampler {
       exec::sasslanes::select_pcs(w.pc, group, ex, target, here + 16);
     }
     if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::CALL)].fetch_add(1, std::memory_order_relaxed);
-    return true;
+    return {at, all_at ? 2u : 1u};
   }
   if (last.form == tier::Form::Ret) {
     // exec_control's RET: the lanes that run it go to the address in the register pair (a section-relative offset, or an absolute code
@@ -1980,7 +1982,7 @@ struct JitSampler {
       all_at = true;
     }
     if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::RET)].fetch_add(1, std::memory_order_relaxed);
-    return true;
+    return {at, all_at ? 2u : 1u};
   }
   // exec_control's WARPSYNC: the lanes that run it wait there for the lanes their mask names (a thread its own mask leaves out may not
   // run it), the others go on; then the release (release_warpsync).
@@ -2010,7 +2012,7 @@ struct JitSampler {
   }
   release_warpsync(w);
   if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::WARPSYNC)].fetch_add(1, std::memory_order_relaxed);
-  return true;
+  return {at, all_at ? 2u : 1u};
 }
 
 template <bool Jit>
@@ -2261,9 +2263,18 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       for (Mask m = group & ~ex; m; m &= m - 1) w.pc[std::countr_zero(m)] += 16;
       tier_release_bsync(w, x);
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::BSYNC)].fetch_add(1, std::memory_order_relaxed);
-    } else if ((last.form == tier::Form::Call || last.form == tier::Form::Ret || last.form == tier::Form::Warpsync) &&
-               tier_ctl(blk, w, last, group, glanes, here, idx != first, code, at, all_at)) {
-      // CALL, RET and WARPSYNC (a function of their own: they are rare beside the straight-line work, and the loop is placement-sensitive)
+    } else if (last.form == tier::Form::Call || last.form == tier::Form::Ret || last.form == tier::Form::Warpsync) {
+      // CALL, RET and WARPSYNC (a function of their own: they are rare beside the straight-line work, and the loop is placement-sensitive;
+      // what it hands back is two registers, so `at` and `all_at` stay where the loop keeps them)
+      const CtlOut ctl = tier_ctl(blk, w, last, group, glanes, here, idx != first, code);
+      if (ctl.res == 2) {
+        at = ctl.at;
+        all_at = true;
+      } else if (!ctl.res) {
+        if (tier_stats_) [[unlikely]] tier_note_fallback(*last.ins, true);
+        if (idx != first) tier_set_pcs(w, group, here);
+        execute(blk, w, *ops[idx].ins, group);
+      }
     } else {
       if (tier_stats_) [[unlikely]] tier_note_fallback(*last.ins, true);
       if (idx != first) tier_set_pcs(w, group, here);

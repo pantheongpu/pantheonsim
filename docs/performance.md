@@ -5545,3 +5545,12 @@ instruction counts are the figure to trust and the cycle and time ratios are giv
 * Hiding more than the variant tables (`-fvisibility-inlines-hidden`, `-Bsymbolic-functions`): the remaining 860 relocations against `vgpu::` names (67 thousand characters) are the core's own functions called across
   translation units; the shims share singletons through them, so they stay exported.
 * The remaining `ld.so` time of the SASS `startup` row (55% of what is left) is the loader's relocation and mapping work for libstdc++, libc and the shim, and the lazy binding of the PLT.
+
+### Round sp11: warpfix
+
+After the round 10 merge the `warp` workload (SASS) ran 0.91x of main at equal instruction counts. The kernel is 100% tier (no CALL, RET or
+WARPSYNC), and the profile put the extra cycles in `step_warp` (the run loop) and `shfl_move`, which is unchanged code. The cause was the
+signature of `tier_ctl` (the noinline CALL/RET/WARPSYNC function of sp10-dispatch): it took the run loop's `at` and `all_at` by reference,
+so the compiler kept both in memory for the whole loop. `tier_ctl` now returns them (`CtlOut`, two registers). `perf stat` of `warp`
+(cycles:u, 1 thread): main 241M, merged round 10 261M, fixed 243M. bh, zerocopy: cycles equal to the merged tree within 1% (bh 506/509 G vs
+509/504 G, zerocopy 113.2 vs 112.2 G); bh runs 0.6% fewer instructions.

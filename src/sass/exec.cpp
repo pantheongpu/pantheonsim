@@ -577,7 +577,10 @@ class Runner {
     }
   }
   bool tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc
-  bool tier_ctl(Block& blk, Warp& w, const tier::MOp& last, Mask group, unsigned glanes, uint64_t here, bool moved, const Code& code, uint64_t& at, bool& all_at);   // tier_ops.inc
+  // What tier_ctl hands back (two registers: the run loop's `at` and `all_at` stay out of memory): res 0 = not taken (the interpreter runs it),
+  // 1 = taken, 2 = taken and every lane of the group now stands at `at`.
+  struct CtlOut { uint64_t at; uint32_t res; };
+  CtlOut tier_ctl(Block& blk, Warp& w, const tier::MOp& last, Mask group, unsigned glanes, uint64_t here, bool moved, const Code& code);   // tier_ops.inc
   template <bool Jit>
   [[gnu::always_inline]] inline bool tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc: the run loop; Jit adds the hook of tier 2
   bool tier_run_jit(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc: tier_run_t<true>, not inlined
