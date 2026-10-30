@@ -21,6 +21,17 @@ struct SharedWindowCheck {
     other |= (address >> 24) ^ rank;
     highest = std::max<uint64_t>(highest, address & 0xffffff);
   }
+  // The 32 addresses of a whole warp (32-bit, as the shared window's are): add() of each, written as two reductions over a plain array so that
+  // the compiler vectors them (the loop of add() calls has a chain of 32 dependent maxima).
+  void add_warp(const uint32_t* a, uint32_t rank) {
+    uint32_t o = 0, h = 0;
+    for (unsigned l = 0; l < 32; ++l) {
+      o |= (a[l] >> 24) ^ rank;
+      h = std::max<uint32_t>(h, a[l] & 0xffffffu);
+    }
+    other |= o;
+    highest = std::max<uint64_t>(highest, h);
+  }
   // `any_lane`: whether the mask had a lane (no lane at all is trivially inside).
   bool inside(uint64_t array_size, uint32_t bytes, bool any_lane) const {
     return !any_lane || (other == 0 && highest + bytes <= array_size);

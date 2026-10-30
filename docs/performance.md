@@ -5353,6 +5353,154 @@ original code) for widths 0 to 64 over 300 000 random warps. `test_memfast`, `te
 Sanitizers on server3: `test_bank_memo`, `test_memcount_forms`, `test_sass_access_count` under ASan+UBSan at -O0 (leaks on, halt on error) pass; `test_bank_memo` under TSan -O1 passes (it is single-threaded; the table is a `thread_local`, no run with
 threads was made beyond the programs above at one thread). The e2e guards that need `nvcc` (`e2e_sass_tier`, `e2e_sass_archs`) cannot run on server3 (stub compiler); the whole-program counter comparison above stands in for them.
 
+## Round sp10: control dispatch of the tier (branch `sp10-dispatch`, base 9c1d6ffd = sp9-combined)
+
+Where the time went (perf `cycles:u`, one host thread, A = 9c1d6ffd; shares of the program's samples): HeCBench bh 54% `step_warp`/`exec_control`/`fetch`/`code_at`/`Code::instr`, black-scholes
+28% and bilateral 33% in `step_warp` + `exec_control`, and in the shared-memory programs `h_shared` 16 to 27%. `VGPU_TIER_STATS=1` showed why: of the instructions that end a tier run, the
+interpreter was running `CALL.REL.NOINC` and `RET.REL.NODEC` (nvcc's float division slow path: black-scholes 17 M of 1.2 G warp instructions, bilateral 1.2 M of 84 M) and `FCHK` (always
+"yes", see exec_float), and in bh the spin loop of its tree build (a block barrier, a load, a YIELD, then `CALL` and `WARPSYNC` round again, 546 000 turns at 600 bodies) ran `WARPSYNC` through
+`exec_control`, whose `release_warpsync` called `Runner::fetch` (a section lookup and a decode check) once per released lane.
+
+### What changed
+
+* Tier forms `Fchk`, `Call`, `Ret`, `Warpsync` (src/sass/tier.hpp, tier.cpp, tier_ops.inc). `FCHK` is a straight-line form with a handler (the predicate set on the executing lanes). `CALL.REL` to a fixed
+  address, `RET` and `WARPSYNC` end a run and are done by `Runner::tier_ctl`, a function of its own (the same counters as `execute()`: instruction, thread instructions, class; the lanes that run a call
+  or return get the new address, the others the next instruction; `WARPSYNC` makes the lanes wait, then calls the interpreter's `release_warpsync`). A call whose target is one of the module's builtins
+  (vprintf, malloc, ...) is left to `exec_control`. A uniform call or return keeps the warp's addresses as one address, so the chain goes on without a call of the scheduler.
+* `Runner::release_warpsync` (src/sass/exec_ops.inc) is now a member (it was a lambda of `exec_control`) used by both engines. It looks at the waiting lanes only, takes one test when no lanes are
+  held back and all waiting lanes name one mask (then they are all released or none is), looks the instruction at an address up once instead of once per lane, and wakes the lanes with
+  `sasslanes::wake`. `WARPSYNC` reads a mask that is not a register (an immediate: `__syncwarp()`) once, not once per lane.
+* `h_shared` (whole warp): the 32 offsets are worked out as 32-bit words in plain loops (`base << log2(stride) + add`, the sum of the low halves, which is the low half of the sum) and the window
+  check is one reduction over them (`SharedWindowCheck::add_warp`, include/vgpu/exec/window_check.hpp), not 32 dependent `add()` calls (`xor` after `imul` carried 45% of the function's samples).
+
+### Results (A = 9c1d6ffd, B = branch; `real.py`, one host thread, cpu 4 of server3, outputs identical; the box load was 20 to 40 for the whole round: only large effects are quoted)
+| program | A s | B s | A/B | runs |
+|---|---:|---:|---:|---|
+| HeCBench bh (600 bodies, 1 step; the default 5000 x 2 runs for more than 300 s) | 109.5 / 106.5 / 98.2 | 70.7 / 71.1 / 64.3 | 1.55x | 3 pairs (an earlier build: 1.39x, then 1.63x with the WARPSYNC release) |
+| HeCBench bilateral | 2.65 | 1.91 | 1.39x | 5 (A/A of the same box: 1.02x); an earlier build 2.31 to 1.91 (7 runs) |
+| HeCBench black-scholes | 37.80 | 35.16 | 1.08x | 3 (an earlier build 31.52 to 28.32, 1.11x, 3 runs) |
+| HeCBench shmembench | 17.25 | 14.71 | 1.17x | 5 (A/A 0.95x: noise of this program here is 5%) |
+| Rodinia hotspot | 2.50 | 2.24 | 1.12x | 5 (A/A 0.99x) |
+| Samples convolutionSeparable | `perf stat` instructions 364.8 G to 333.6 G (-8.5%), cycles 79.8 / 82.7 G to 75.1 / 75.1 G | | 1.06 to 1.10x | 2 pairs (wall time of the run: 26.97 to 27.26 s, 0.99x: the loaded box hides it; instructions are the reliable number) |
+| Rodinia lud, Samples sortingNetworks, histogram | 1.00x, 0.98x, 1.00x | | | no change expected (lud and sortingNetworks keep their time in bank counting and non-full warps; histogram in atomics) |
+
+bench.py canaries (12 workloads, SASS and PTX, 15 runs, counters identical in all 24 rows): all within noise (p > 0.05) except `mma_ptx` PTX 1.025x. One real placement effect on the way: the first
+version (the three branches written into the run loop `tier_run_t`) cost `atomics` SASS 0.956x (p=0.001, 0.960x with 21 runs; A/A 1.001x) at equal instructions; moving them to `tier_ctl`, a `noinline`
+function, gave 0.992x (15 runs, p=0.05) and 0.995x (21 runs, p=0.35). The load of the box for the canary runs was 20 to 40 (spreads of 5 to 20%): rows between 0.96 and 1.0 with p above 0.1 (`mem` SASS 0.958x,
+`wmma` PTX 0.968x, `api` PTX 0.969x) could not be told from noise here and are not explained by anything the change touches (the PTX engine is not touched).
+
+### Tests (wired in CMake) and the mutations that fail them
+* `test_sass_dispatch` (new): hand-assembled sm_86 kernels. A loop calls a function whose return address is in a register pair (every lane; the upper half warp only, so the callee and the code
+  after the call both run for different lanes; a RET some lanes do not run, which then fall into an EXIT), with `FCHK`, and `WARPSYNC` with the full mask and with a register mask of the lane's half warp
+  (also after lanes have exited); eight shapes of whole-warp shared-memory access (in order, every other word, scrambled, bytes, one address, `.X4`, `.X8`, 64-bit) in warps of 32, 64, 33 and 5 threads. Each
+  run is compared tier against the interpreter (`VGPU_FASTPATH=0`) in registers and every counter, **and** against a digest recorded from the tree before the tier ran these instructions (the
+  interpreter and the tier share `release_warpsync` and the window check, so comparing them with each other cannot show a mistake in what they share; `VGPU_PRINT_DIGESTS=1` prints the table, taken from the
+  9c1d6ffd build with `-DSASS_CALL_RET_NO_TIER_FORMS`). A last test requires the analysis to take all four new forms.
+* `test_tier`: the form table and the corpus rules know the four forms. `test_memcount_forms`: `add_warp` against the per-lane window test (400 000 random warps).
+* Mutations that fail them (each applied alone, test rebuilt): CALL target + 16; RET target + 16; FCHK false; WARPSYNC mask ignored (every lane names the full mask); RET counting one thread instruction;
+  release without the "every named lane has arrived" test; the one-mask path ignoring held-back lanes; the release counting exited lanes as missing; shift of the shared offsets one too many;
+  the offset's add term dropped; `add_warp` keeping the last maximum / last other-window bit only. All fail `test_sass_dispatch` or `test_memcount_forms` (1 of 6, 1 of 7 or 1 of 9 tests, with 4 failing checks for the first three).
+  One mutation was not caught at first (the release counting exited lanes) and led to the test "WARPSYNC after exits"; a section lookup shortcut in the release was not covered by any sm_86 test (a `.COLLECTIVE` WARPSYNC exists from sm_90) and was removed.
+* The e2e programs (`e2e_sass_tier`, `e2e_sass_archs`, ...) skip on server3 (no real nvcc) and are left to CI.
+
+### Not done, and negative results
+* bh's spin loop is the program's own algorithm (a block barrier inside a wait loop); the remaining time (600 bodies, perf `cycles:u`) is 45% `step_warp` (the tier loop), 9% `tier_ctl`, 7% `release_warpsync` (it was 15% in the first version of the release), 5% `tier_release_bar`.
+* `BRA.CONV` / `BRA.DIV` (6.9 K and 3.9 K of 590 K warp instructions of bh at 500 bodies) and `P2R` stay with the interpreter; not worth a form.
+* convolutionSeparable keeps `h_shared` 19% (the per-lane copies), `load_scalar` 7% (one call per `FFMA` that reads a `__constant__` word through `c[0x3][..]`: not cached, because the memory manager's fault
+  injection must see every load) and the bank-pass table 10%; sortingNetworks / lud are the same shape. Nothing was changed there.
+* Not run: TSan (no threaded or atomic code was touched), the AVX-512 versus AVX2 tensor-core re-check (TensorCoreGemm samples; the box was not quiet enough for a 5% question).
+
+## Round sp10: atomics, zero-copy accesses and directed rounding (branch `sp10-atomics`, base 9c1d6ffd = `sp9-combined`)
+
+Where the time went (perf `cycles:u`, one host thread, A = 9c1d6ffd; shares of the program's samples): `Runner::exec_mem` was 23% of HeCBench aop (binomial options, shared-memory atomics), 29% of
+Samples histogram with its clones, 22% of radixsort2, 16% of atomicCost (global `RED` of float, double and int), and 24% of zerocopy plus `lookup_host`/`scalar_location`/`load_scalar`/`store_scalar`
+(a kernel whose buffers are `cudaHostAlloc`-mapped: every lane's access went through the scalar loop); `fesetround` + `fegetround` were 23% of Samples interval (directed-rounding `DADD`/`DMUL`/`DFMA`).
+`perf annotate` of aop's `exec_mem` put 20% of its samples on one instruction after a `__memcpy_chk` call: the shared-atomics fast path read each lane's word with a `memcpy` of a run-time size into a zeroed
+`uint64_t` (a 4-byte copy into a word zeroed by an 8-byte store, then an 8-byte load: a store-forwarding stall per lane) and called `apply` out of line for every lane.
+
+### What changed
+
+* `sassatom::shared_batch` (include/vgpu/exec/sass_atomics.hpp): a warp's `ATOMS` on the block's shared bytes in a loop with the word width (4 or 8) and the step (add, f32 add, f64 add, min, max, signed min/max, inc, dec, and, or, xor, exchange,
+  compare-and-swap) known when it is compiled, one out-of-line function per step, operands fetched for all lanes first and the old values written afterwards. `ATOMS.POPC.INC` (an `atomicAdd` of the constant 1) takes the add loop. Operations
+  without a step (the f16x2/bf16x2 halves, min/max of the float types, an operation that is none) take the lane-by-lane code as before, so its faults are unchanged.
+* New steps (`AddF64Step`, `MinS32/MaxS32/MinS64/MaxS64Step`, `IncStep`, `DecStep`) for `step_for`: the global batch's `lanes(apply)` general path had run all of these, `atomicAdd(double)` among them (atomicCost's third).
+* `sassatom::global_batch`: the global batch's lane loop, a function per step with `__restrict` operands, and a one-word case (every lane on one address: a counter, a maximum) that keeps the word in a register from lane to lane
+  instead of loading and storing it through `cur[slot[l]]`. (The first version inlined all sixteen steps into `exec_mem`; GCC then stopped inlining them and the bench `atomics` row fell to 0.91x: see below.)
+* The global batch's address grouping (`exec_mem`, RED and ATOMG): three shapes are told apart in one pass over `ga[]` (no stores) before the 64-entry hash table is touched: all lanes on one address (the table is skipped, and the batch
+  needs no `slot`), addresses rising from lane to lane (the lanes' addresses are the distinct ones, in order, no table), anything else (the table, as before). `ATOM` (generic addresses, classified lane by lane) keeps its old single loop.
+* `MemoryManager::host_load_batch` / `host_store_batch` (src/core/memory.cpp) and their use in `exec_mem`'s LDG/STG batch: when the lanes' accesses all lie in ONE host-mapped buffer (one `lookup_host` for the warp) each is the relaxed atomic
+  access `load_scalar`/`store_scalar` make on a host mapping (no device fault applies there); an access outside the buffer, misaligned, a store to a read-only mapping, or two buffers in a warp declines with nothing done and the scalar loop reports it. No lock
+  (the host-map rule). A store resets `idle_yields` as `mem_write` does.
+* `RoundingScope` (the directed-rounding scope around the SIMD kernels of FFMA/FADD/FMUL, DADD/DMUL/DFMA, I2F, F2F and the conversions) reads and writes the rounding field of MXCSR (bits 13 and 14, which are SASS's 0 RN, 1 RM, 2 RP, 3 RZ)
+  directly on x86-64 instead of `fegetround` + `fesetround`, which also reload the x87 control word and cost four times as much (99 ns against 26 ns for a get, a set and a restore, measured). The sticky flags are untouched. Other hosts keep the libc calls.
+  The scalar `rounded()` helper keeps `fesetround` (its arithmetic is inline, and the compiler is only kept from moving it across an opaque call).
+
+### Results (Zen 4 box, server3, `taskset` cpu 2, one thread, A = 9c1d6ffd built the same way; outputs identical)
+
+`real.py`, median wall of 9 alternating runs (5 for the programs over 30 s), and `perf stat` of one run each (instructions are deterministic; cycles are the better time under the load of a shared box):
+
+| program | wall A s | wall B s | A/B wall | instructions A/B | cycles A/B |
+|---|---:|---:|---:|---:|---:|
+| HeCBench zerocopy | 90.99 | 44.45 | 2.05x | 2.35x | 2.19x |
+| Samples histogram | 39.41 | 31.46 | 1.25x | 1.38x | 1.36x |
+| HeCBench atomicPerf | 2.21 | 1.71 | 1.29x | 1.33x | 1.35x |
+| HeCBench radixsort2 | 4.58 | 3.95 | 1.16x | 1.19x | 1.17x |
+| Samples interval | 27.54 | 23.60 | 1.17x | 1.02x | 1.16x |
+| HeCBench aop | 3.43 | 3.09 | 1.11x | 1.22x | 1.16x |
+| HeCBench atomicCost | 44.10 | 36.63 | 1.20x | 1.15x | 1.14x |
+| HeCBench atomicAggregate | 7.83 | 7.19 | 1.09x | 1.01x | 1.03x |
+
+A/A (A against A, 9 runs, the same window, the box at load 12 to 30 from another session): aop 0.96x, atomicPerf 0.94x, radixsort2 1.04x, interval 0.99x. Wall ratios under about 1.06x are inside that noise; the cycle and instruction columns are the claim for those rows
+(atomicAggregate is match/popc-bound, its atomics are one word: no claim). Not claimed: lavaMD, particlefilter, binomial (the fp64 `dop_avx2_t` is already an 8-lane AVX2 kernel; see below).
+`bench.py` canaries (13 workloads, sass and ptx, 15 alternating runs, counters identical in all 26 rows): every row `same` (no verdict slower; `mem` sass 1.000x, `atomics` sass 1.024x, `shared` sass 1.010x, `warp` 0.990x, `int_alu` ptx 0.910x median with best-of ratio 0.985x and p 0.34,
+an engine this round does not touch). The first version of the global batch showed `atomics` sass 0.907x (p 0.001, equal counters): instructions +2.5%, cycles +5% in `perf stat`, from the sixteen inlined step loops (GCC then called them out of line through a lambda) and a word kept in memory from lane to lane; the one-word register loop and the per-step functions
+bring it to +0.6% instructions and 1.02x in the harness.
+
+### Tests
+* `test_sass_atomics` (unit, CMake): every new step against the frozen rule; `shared_batch` against the lane-by-lane `memcpy` + frozen rule over offsets that repeat, step by 4 and overlap by half a word, full and partial masks, all operations and types, and the declines leave the bytes alone; `global_batch` against the frozen rule over shared slots, the single-slot loop included.
+* `test_hostmap_cache` (unit, CMake): `host_load_batch`/`host_store_batch` against `load_scalar`/`store_scalar` lane by lane at every width, consecutive, scattered and repeated addresses (the later lane wins); the declines (outside, misaligned, below the base, a width that is none, two buffers, read-only) change nothing; and the host's own relaxed atomics race the batch (clean under TSan).
+* `sass_fastpath.cu` (e2e `e2e_sass_fastpath`, fast paths against `VGPU_FASTPATH=0`: answers and every counter): `atomic_more` on global and on shared memory over the four address patterns (signed 64-bit min/max, constant-one add with its old value, i.e. `ATOMS.POPC.INC`, `RED` of the same, signed 32-bit max, f64 add) with a host reference for the final memory; `hostmap_forms`: 1, 2, 4 and 8 byte loads and stores on `cudaHostAlloc` mapped buffers, whole and partial warps, identity, strided, reversed and broadcast lanes, host-checked. The program was built on server2 (CUDA 13.0) and run on server3 against both builds: A, B, and B with `VGPU_FASTPATH=0` print the same 4,247 lines (`wrong: 0`).
+* Mutation evidence (each fails the test named): `MinS32Step` taking an unsigned compare, the single-slot loop without the width mask, `shared_lanes` taking the lanes in another order, `IncStep` with `>`, `DecStep` with `old - 2`, `AddF64Step` with the NaN operands tested in the other order, `changed` always set, `shared_batch` not storing: `test_sass_atomics` 2/5 to 4/5 pass; `host_store_batch` accepting a read-only mapping, no alignment check, no bounds check, stores in reverse: `test_hostmap_cache` 6/7 pass. Wiring, one build with five mutations of `exec_mem`/`RoundingScope`: the POPC.INC add of 2 (`atomic_more space=1`, WRONG in all four patterns), the rising path giving every lane slot 0 (`atomic_forms` and `atomic_more` pattern 2), `host_store_batch` skipping the last lane (`hostmap_forms`, WRONG in all four patterns), `RoundingScope` setting the next mode (`float_forms`, `half_forms`, `conv_forms`: 15 hash lines differ), shared CAS given no exchange value (`shared_atomic_forms`, WRONG in all four patterns).
+* Sanitizers on server3: `test_sass_atomics` and `test_hostmap_cache` under ASan + UBSan (-O0, `detect_leaks=1`, `halt_on_error=1`): clean. TSan -O1 (`setarch -R`, g++ 13 with `VGPU_WERROR=OFF`: it rejects `atomic_thread_fence` under `-Werror=tsan`) `test_hostmap_cache` (the batch racing a host thread's relaxed atomics included) and `test_sass_atomics`: no report. `e2e_host_atomics` under TSan was not run here (needs a TSan build of the shim and nvcc from server2); the new host-mapped batch takes no lock and uses the same relaxed atomics as `load_scalar`/`store_scalar`, so it is left to CI.
+* Guards: Release `ctest -R 'sass|tier|mem|hostmap|atomic|lanes|cache|simd'` (the 107 matching tests that were built) passes except `memory_totals`, which needs the `vgpu` CLI that was not built; the e2e programs need a real nvcc and run in CI; `sass_fastpath` was run by hand as above.
+
+### Not done, and negative results
+* fp64 `dop_avx2_t`/`dop_m_k` (lavaMD, particlefilter, binomial; 25 to 27% of those programs): already an 8-lane AVX2 kernel doing the arithmetic and one NaN test per 8 lanes; what is left is the arithmetic. A 512-bit form would run as two 256-bit halves on this Zen 4 box, so it cannot be measured here.
+* Batching `fesetround` across consecutive instructions (interval alternates RM and RP, so the mode changes every instruction; only the restore could be saved, and every other piece of host arithmetic assumes round-to-nearest). Replaced by the cheaper MXCSR read-modify-write above.
+* `RoundingScope`-style MXCSR access for the scalar `rounded()` helper: its arithmetic is inline, and an `ldmxcsr` intrinsic is not an optimisation barrier for it as the opaque call is.
+* A host-mapped run form (`load_run`/`store_run` for consecutive lanes): `host_load_batch` already takes the whole warp with one lookup; zerocopy's remaining time is the simulator's own 3 loads and a store per element.
+
+## Round sp10: the global gather (branch `sp10-gather`, base 9c1d6ffd = `sp9-combined`)
+
+A warp whose lanes are not on consecutive words (a column walk: PolyBench SYRK/SYR2K/2MM/GRAMSCHM/3MM, the cuRAND state loads of the Samples MC_*) goes through `h_global`, `MemoryManager::load_batch`, `batch_addresses_ok`, `load_batch_in` and `memcount::distinct_sectors`: 50 to 60% of SYRK before this round (perf, one thread). Three changes, none of which moves a result or a counter:
+* `MemoryManager::load_batch` (src/core/memory.cpp) makes the tests of `batch_addresses_ok` (aligned, inside the allocation, by one comparison with `size - width + 1`) in the same pass as the loads: per lane the chunk is looked up and the word read, `gather_loads`; a lane in an untouched or uniform chunk takes the old per-lane code; a lane past the end reads the allocation's first byte, whose result is dropped when the batch declines. Batches of more than 32 accesses and allocations that a host mapping may be in take the old two steps. `store_batch`, `batch_window`/`batch_load` (the atomics' pair) are unchanged. `load_batch`'s `out` is now of no use after a decline (it used to be left as it was; every caller reads it only after a success): a copy through a buffer, to keep the old guarantee, cost 4% of SYRK, so `test_memfast` no longer asks for it.
+* `h_global` (src/sass/tier_ops.inc) handles a full warp (`ex == kAll`) without the lane compaction: the addresses are the batch as they stand, the constant-window test is made in the pass that builds them (`sassmem::full_warp_addresses`, include/vgpu/exec/sass_mem_rows.hpp: the smallest distance above the window, below 2^32 means a lane is in it; the separate pass over the stored addresses waited for the stores), and the loaded words go back to the registers by row. Partial warps keep the compaction.
+* `memcount::distinct_sectors_uncapped` (include/vgpu/exec/mem_counters.hpp), the SASS executor's `count_access` entry: the closed forms in a small function, the list fallback (an 8 KB array, so a stack frame that probes two pages on entry, 30% of `distinct_sectors` for a strided gather) in a `noinline` function of its own. The PTX interpreter keeps the original `distinct_sectors`.
+
+### Results (A = 9c1d6ffd, B = branch; cpu 0 of server3, one host thread, `perf stat` user cycles, 9 alternating runs; outputs and counters identical)
+| program | A cycles (G) | B cycles (G) | B/A | instructions B/A | p |
+|---|---:|---:|---:|---:|---:|
+| polybench/SYRK | 51.65 | 41.25 | 0.799 (1.25x faster) | 0.815 | <0.001 |
+| polybench/SYR2K | 103.94 | 81.53 | 0.784 (1.27x) | 0.809 | <0.001 |
+| polybench/3MM | 16.04 | 14.43 | 0.900 (1.11x) | 0.875 | 0.005 |
+| samples/MC_SingleAsianOptionP | 11.08 | 10.22 | 0.922 (1.08x) | 0.921 | <0.001 |
+| samples/MC_EstimatePiInlineP | 9.19 | 8.41 | 0.915 (1.09x) | 0.911 | <0.001 |
+A/A (A against A, same script): SYRK 1.001, 3MM 1.000. 2MM and GRAMSCHM run past 150 s on the box and were profiled only (the same functions, 50 to 60% of their time); CORR and COVAR are 99% the program's own host code (CORR 0.993x, p=0.57). `bench.py` `mem` SASS 1.04x (p=0.3, not a claim). A server3 window with the other session's builds running gave the same ordering with more spread; the quoted rows are from the quiet window.
+Where SYRK's time went (`perf record`, one thread): before, `h_global` 25% + `load_batch_in` 24% + `batch_addresses_ok` 9% + `load_batch` 3% = 61%; after the gather change, `load_batch` 31% + `h_global` 25% (the first is now the cache and TLB misses of the loads), `sectors_fast` + `distinct_sectors` + `count_access` 12%. The window fusion and the `distinct_sectors` prologue were taken after that profile.
+bench.py canaries (13 workloads, SASS and PTX; 24 rows, counters identical in all): the A/A of the same rows spreads from 0.976x to 1.027x. B against A is inside that spread for every SASS row (`mma_ptx` SASS 1.037x p=0.004 is a gain, not a goal) and for PTX except `launch` PTX 0.960x (17 runs, p<0.001; `perf stat`: equal instructions, cycles +4.4%, branch misses +25%) and `local` PTX 0.97x (15 runs of `perf stat`: cycles +2.1%; bench.py gave 0.915x with p=0.02 in a loaded window). Neither runs any code this round touches; the functions of the PTX interpreter (`run_warp_until_yield`, `setup_block`, `launch_grid`) have identical sizes in A and B and sit at addresses that differ by 0x20 to 0x30 modulo 64, so this is the relink's placement again (the sp9 lesson), not a measured cause. `wmma` PTX: 0.99x here, and 0.962x in the build that had split `distinct_sectors` for both engines.
+
+### Not done, and negative results
+* Two passes (chunk pointers first, then all the loads in a tight loop, with and without a prefetch): 1.128x and 1.134x cycles on SYRK with 1.5% fewer instructions; the stalls move to the loads, and the single pass is 0.875x of the original in the same window (modes of one binary, quiet box). A column walk at 4 KB stride puts the 32 lanes in one L1 set and in 32 pages, so what is left of `load_batch` (31% of SYRK) is the cache and TLB misses of the loads themselves.
+* Copying the words through a local buffer so that a declined `load_batch` leaves `out` alone: SYRK 0.838x and SYR2K 0.835x instead of 0.80x and 0.79x.
+* Splitting `distinct_sectors` itself (as the PTX interpreter also uses it): the SASS gains were the same, and PTX `wmma` went to 0.962x (p<0.001, equal instructions; the hot `mma_avx2_chunked_f` moved from 0x164100 to 0x165d40, a placement effect). The split is now only the SASS entry; `wmma` PTX 0.99x, `mma_ptx` PTX 1.01x on the final build.
+* Not started: an AVX2 gather for 4-byte lanes (the loads are miss-bound, not instruction-bound), and a sector count fused into `full_warp_addresses` (`sectors_fast` is 4 to 5% of SYRK).
+
+### Tests (wired in CMake) and the mutations that fail them
+* `test_gather_sp10` (new): `load_batch` against `load_scalar` per lane over real, uniform (two bytes) and untouched chunks, widths 1/2/4/8, 1 to 32 lanes and more than a warp, lanes spread over the allocation, one lane past the end, below the base or misaligned (the batch declines), and the window form. Mutations: uniform chunk read as zero (fails: "lane 4 of 9 at width 8 differs"), the bounds test dropped (fails: `VCHECK(!done)`), the alignment test dropped (fails the same way).
+* `test_sass_mem_rows`: `full_warp_addresses` against the lane loop and the window test, with lanes on the window's first and last byte and one either side. Mutations: distance off by one (fails at `nearest < kSpan`), the distance biased for high addresses (fails the same way).
+* `test_memcount_forms`: `distinct_sectors_uncapped` against the definition, on the SASS rows of its random warps (it passes through the closed forms and the list fallback). Mutation: the closed-form count `n` returned as `n + (n > 3)` fails 7 of 9 tests ("sass sectors (uncapped) 65 vs 64").
+Guards run and passing (Release): `test_memory test_memfast test_memhot_sp8 test_memalloc test_memrmw test_memrmw_lockfree test_memcount_forms test_ptx_mem_runs test_ptx_paths test_ptx_block_reuse test_sass_*` (atomics, lanes, mem_rows, access_count, code_at, block_reuse, alu_runs, lea, mma_tiles, decode, ok_cache), `test_tier`, `test_amd_gcn_same_bits`, `_memory`, `_packed`, `test_amd_mfma_math`, `test_amd_matrix_fast`, `test_amd_nan_order`, `test_amd_codeobject_same_bits`; bench.py counters identical in all 24 canary rows. The e2e programs skip on server3 (no real nvcc) and are left to CI.
+
 ## Round sp5: process start (branch `sp5-startup`, base a6e80555)
 
 Measured on server3 (cpu 2 alone, `perf stat -e instructions:u,cycles:u,task-clock`, 25 alternating runs of A and B per row, medians; the box was never quiet, load 12 to 60, so the
@@ -5397,6 +5545,15 @@ instruction counts are the figure to trust and the cycle and time ratios are giv
 * Hiding more than the variant tables (`-fvisibility-inlines-hidden`, `-Bsymbolic-functions`): the remaining 860 relocations against `vgpu::` names (67 thousand characters) are the core's own functions called across
   translation units; the shims share singletons through them, so they stay exported.
 * The remaining `ld.so` time of the SASS `startup` row (55% of what is left) is the loader's relocation and mapping work for libstdc++, libc and the shim, and the lazy binding of the PLT.
+
+### Round sp11: warpfix
+
+After the round 10 merge the `warp` workload (SASS) ran 0.91x of main at equal instruction counts. The kernel is 100% tier (no CALL, RET or
+WARPSYNC), and the profile put the extra cycles in `step_warp` (the run loop) and `shfl_move`, which is unchanged code. The cause was the
+signature of `tier_ctl` (the noinline CALL/RET/WARPSYNC function of sp10-dispatch): it took the run loop's `at` and `all_at` by reference,
+so the compiler kept both in memory for the whole loop. `tier_ctl` now returns them (`CtlOut`, two registers). `perf stat` of `warp`
+(cycles:u, 1 thread): main 241M, merged round 10 261M, fixed 243M. bh, zerocopy: cycles equal to the merged tree within 1% (bh 506/509 G vs
+509/504 G, zerocopy 113.2 vs 112.2 G); bh runs 0.6% fewer instructions.
 
 ## Round sp10: large device-to-device copies chunk to chunk (branch `sp10-new`, base 9c1d6ffd)
 

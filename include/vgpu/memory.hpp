@@ -219,7 +219,7 @@ class MemoryManager {
   // The accesses of one warp-wide load or store, made together, for the ordinary
   // case: `count` accesses of `size` bytes, in order. They return true having
   // done every one exactly as load_scalar / store_scalar would, in that order,
-  // or false having done nothing -- whenever any access could differ (a fault
+  // or false having done nothing to memory (load_batch may have written its `out`) -- whenever any access could differ (a fault
   // armed, a host mapping in range, a misaligned access or one outside the
   // allocation the first is in, an address that is no allocation's), in which
   // case the caller makes them one at a time and meets any error where it
@@ -229,6 +229,13 @@ class MemoryManager {
   // would, with `*failed_at` the index of the access that did.
   bool store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
                    size_t* failed_at = nullptr);
+
+  // The same for accesses that all lie in ONE host-mapped buffer (cudaHostAlloc mapped memory, managed memory, IPC): each is the
+  // relaxed atomic access of its width that load_scalar / store_scalar make there (no device fault applies to host memory), one lookup
+  // for the lot. False, having done nothing, for anything else -- no mapping at the first address, an access outside that mapping
+  // or misaligned, a store to a read-only one -- and the caller makes the accesses one at a time.
+  bool host_load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const;
+  bool host_store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals);
 
   // load_batch and store_batch for a caller that does both on the same addresses (a warp's atomics: it loads the words, works out
   // what each lane leaves, stores them): the checks of both -- and the one lookup -- made once. batch_window is true when load_batch
@@ -905,6 +912,7 @@ class MemoryManager {
     bool read_only;
   };
   bool lookup_host(uint64_t addr, uint64_t len, HostHit* out) const;
+  bool host_batch_hit(const uint64_t* addrs, size_t count, uint32_t size, bool store, HostHit* h) const;
   static uint64_t fresh_generation();
  public:
   // The cache is on unless VGPU_HOSTMAP_CACHE=0. This switches it for the whole process (a benchmark compares the

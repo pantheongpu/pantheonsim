@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <type_traits>
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -652,10 +653,57 @@ void MemoryManager::load_batch_in(const Allocation& a, uint64_t base, const uint
   }
 }
 
+namespace {
+// A warp's loads (1 to 32 accesses of kSize bytes) with the tests of MemoryManager::batch_addresses_ok made in the same pass: for
+// each lane, its offset into the allocation (an address below the base wraps to far above any size, so one comparison with `limit`,
+// size - kSize + 1, finds both ends), the chunk it is in, and the load itself. Alignment and the bounds are known when the pass has
+// ended, and a lane past the end reads the allocation's first byte instead, so the pass reads nothing it should not; false then says
+// some lane failed (`out` is then of no use: a copy through a buffer, to leave it as it was, cost 4% of a gather-bound kernel). A lane in a chunk that is untouched or uniform is `slow(chunk, offset)`, the
+// whole of one lane's load. One pass rather than the tests and then the loads, or the chunk lookups and then the loads: a gather's
+// cache misses are what this waits on, and each of those splits ended up holding the loads back (measured: 13% slower).
+template <uint32_t kSize, class Slow>
+[[gnu::always_inline]] inline bool gather_loads(const std::atomic<uint8_t*>* chunks, uint64_t base, uint64_t limit, const uint64_t* addrs,
+                                                size_t n, uint64_t* out, Slow&& slow) {
+  using Word = std::conditional_t<kSize == 1, uint8_t, std::conditional_t<kSize == 2, uint16_t, std::conditional_t<kSize == 4, uint32_t, uint64_t>>>;
+  uint64_t bits = 0, outside = 0;
+  for (size_t i = 0; i < n; ++i) {
+    uint64_t off = addrs[i] - base;
+    bits |= addrs[i];
+    const bool past = off >= limit;
+    outside |= past;
+    off = past ? 0 : off;
+    const uint8_t* chunk = chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (__builtin_expect(chunk != nullptr && !(reinterpret_cast<uintptr_t>(chunk) & 1), 1)) out[i] = relaxed_load<Word>(chunk + (off & ~uint64_t{kSize - 1}) % kChunkSize);   // (a misaligned lane's result is not used)
+    else out[i] = slow(chunk, off);
+  }
+  return !((bits & (kSize - 1)) || outside);
+}
+}  // namespace
+
 bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
+  if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
+  if (!batch_faults_clear(/*store=*/false)) return false;
   const Allocation* a = nullptr;
   uint64_t base = 0;
-  if (!batch_ok(addrs, count, size, /*store=*/false, &a, &base)) return false;
+  // A warp's loads where no host mapping is in reach: the tests of batch_addresses_ok and the loads of load_batch_in in one pass.
+  // Anything else (more than a warp, a host mapping that may be in the allocation) takes the two steps.
+  if (count <= 32 && (a = find_ordinary(addrs[0], size, &base)) && host_map_free_span(base, a->size)) {
+    const uint64_t limit = a->size - size + 1;   // (the first access is inside, so size <= a->size)
+    const std::atomic<uint8_t*>* chunks = a->chunks.get();
+    const auto each = [&](auto width) {
+      constexpr uint32_t kSize = decltype(width)::value;
+      return gather_loads<kSize>(chunks, base, limit, addrs, count, out, [&](const uint8_t* chunk, uint64_t) -> uint64_t {
+        return chunk ? repeated(uniform_byte(chunk), kSize) : 0;   // (untouched, or uniform: the real chunks were read in the pass)
+      });
+    };
+    switch (size) {
+      case 1: return each(std::integral_constant<uint32_t, 1>());
+      case 2: return each(std::integral_constant<uint32_t, 2>());
+      case 4: return each(std::integral_constant<uint32_t, 4>());
+      default: return each(std::integral_constant<uint32_t, 8>());
+    }
+  }
+  if (!batch_addresses_ok(addrs, count, size, &a, &base)) return false;
   load_batch_in(*a, base, addrs, count, size, out);
   return true;
 }
@@ -689,6 +737,53 @@ bool MemoryManager::store_batch(const uint64_t* addrs, size_t count, uint32_t si
   uint64_t base = 0;
   if (!batch_ok(addrs, count, size, /*store=*/true, &ca, &base)) return false;
   store_batch_in(const_cast<Allocation&>(*ca), base, addrs, count, size, vals, failed_at);
+  return true;
+}
+
+// The mapping of the first address, and whether every access is aligned and inside it (an address below its base wraps to an offset far
+// above its length).
+bool MemoryManager::host_batch_hit(const uint64_t* addrs, size_t count, uint32_t size, bool store, HostHit* h) const {
+  if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
+  if (!host_maps_ || !host_maps_->may_contain(addrs[0]) || !lookup_host(addrs[0], size, h)) return false;
+  if (store && h->read_only) return false;
+  const uint64_t limit = h->len - size + 1;   // (the first access is inside, so size <= len)
+  uint64_t bits = 0, outside = 0;
+  for (size_t i = 0; i < count; ++i) {
+    bits |= addrs[i];
+    outside |= static_cast<uint64_t>(addrs[i] - h->base >= limit);
+  }
+  return !((bits & (size - 1)) || outside);
+}
+
+bool MemoryManager::host_load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
+  HostHit h;
+  if (!host_batch_hit(addrs, count, size, /*store=*/false, &h)) return false;
+  const auto each = [&](auto width) {
+    constexpr uint32_t kSize = decltype(width)::value;
+    for (size_t i = 0; i < count; ++i) out[i] = load_at(h.host + (addrs[i] - h.base), kSize);
+  };
+  switch (size) {
+    case 1: each(std::integral_constant<uint32_t, 1>()); break;
+    case 2: each(std::integral_constant<uint32_t, 2>()); break;
+    case 4: each(std::integral_constant<uint32_t, 4>()); break;
+    default: each(std::integral_constant<uint32_t, 8>()); break;
+  }
+  return true;
+}
+
+bool MemoryManager::host_store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals) {
+  HostHit h;
+  if (!host_batch_hit(addrs, count, size, /*store=*/true, &h)) return false;
+  const auto each = [&](auto width) {
+    constexpr uint32_t kSize = decltype(width)::value;
+    for (size_t i = 0; i < count; ++i) store_at(h.host + (addrs[i] - h.base), kSize, vals[i]);
+  };
+  switch (size) {
+    case 1: each(std::integral_constant<uint32_t, 1>()); break;
+    case 2: each(std::integral_constant<uint32_t, 2>()); break;
+    case 4: each(std::integral_constant<uint32_t, 4>()); break;
+    default: each(std::integral_constant<uint32_t, 8>()); break;
+  }
   return true;
 }
 
