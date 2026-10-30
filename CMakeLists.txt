@@ -1462,6 +1462,8 @@ vgpu_unit_test(test_libm)
 vgpu_unit_test(test_redux_ext)
 # OpWgCollective: work-group reduce/scan/broadcast on the barrier rendezvous, in linear thread order (E8).
 vgpu_unit_test(test_wg_collective)
+# OpCoopMma: the cooperative-matrix multiply-add over one warp, in the lanes' registers, against a host fold in increasing k (PantheonZE's joint_matrix fast path).
+vgpu_unit_test(test_coop_mma)
 # %warpsize, the global offset and work dim registers, work-group memory arguments and the sub-group count (E4, E5).
 vgpu_unit_test(test_launch_inputs)
 # E1: Intel in the profile layer: the profiles, the limits derived from them, and a launch checked against them.
