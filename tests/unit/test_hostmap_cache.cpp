@@ -226,7 +226,7 @@ VTEST(a_warps_batch_on_a_mapped_buffer_races_the_hosts_atomics_cleanly) {
   std::thread host([&] {
     uint32_t* w = reinterpret_cast<uint32_t*>(b.p);
     for (uint32_t i = 1; !stop.load(); ++i)
-      for (int k = 0; k < 32; ++k) __atomic_store_n(&w[k], i * 0x01010101u, __ATOMIC_RELAXED);
+      for (int k = 0; k < 32; ++k) __atomic_store_n(&w[k], (i & 0xffu) * 0x01010101u, __ATOMIC_RELAXED);
   });
   for (int iter = 0; iter < 2000; ++iter) {
     uint64_t addrs[32], vals[32], got[32];
