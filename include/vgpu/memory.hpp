@@ -197,6 +197,14 @@ class MemoryManager {
   // Bulk copies (the H2D/D2H/D2D building blocks).
   void write(uint64_t dst, const void* src, uint64_t len);
   void read(uint64_t src, void* dst, uint64_t len) const;
+  // A device-to-device copy made chunk to chunk, with no staging buffer: what read(src, tmp, len) followed by
+  // dst_mm.write(dst, tmp, len) leaves in the destination, chunk for chunk (a destination chunk that already holds
+  // the bytes being written as one repeated byte stays unmaterialized, as write() leaves it). Returns true having done
+  // the copy, or false having done nothing -- whenever the pair could differ or fail: a fault armed (copies included),
+  // a host mapping in reach of either range, a range not wholly inside one ordinary allocation (freed, mapped,
+  // exported, out of range), or two ranges of one allocation that overlap. The caller then makes the pair of calls,
+  // and meets any error where it would have.
+  bool copy_to(MemoryManager& dst_mm, uint64_t dst, uint64_t src, uint64_t len) const;
   // A kernel's run of `unit`-byte loads or stores (TMA's box rows), done at
   // once: exactly what load_scalar / store_scalar would do element by
   // element, each element still one relaxed atomic access, for a run wholly
@@ -328,6 +336,13 @@ class MemoryManager {
   // a field not naturally aligned or not wholly inside the one ordinary allocation the record lies in -- and the
   // caller then reads the fields one at a time and meets any error where it would have. One lookup serves the lot.
   bool load_fields(uint64_t addr, const uint8_t* sizes, unsigned n, uint64_t* out) const;
+
+  // The texels of one filtered fetch: `n` (1 to 16) records of `channels` (1 to 4) fields of `size` bytes (1, 2, 4 or 8) end
+  // to end, record i at addrs[i]; out[i * channels + c] is field c of record i, as load_fields would give it. One lookup of
+  // the allocation serves them all, which is the point: a bilinear fetch has four texels, a trilinear one eight. Returns
+  // false, having done nothing, in every case load_fields would for any one of the records, and when the records do not
+  // lie in one ordinary allocation together (the caller then reads them one at a time).
+  bool load_texels(const uint64_t* addrs, unsigned n, uint32_t size, unsigned channels, uint64_t* out) const;
 
   // Sixteen naturally aligned bytes as one access, as a GPU moves a wide load
   // or store (global_load_dwordx4): a kernel on another host thread sees them

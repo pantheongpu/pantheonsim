@@ -1646,6 +1646,56 @@ bool MemoryManager::store_run(uint64_t addr, const void* src, uint64_t len, uint
   return true;
 }
 
+// (cold and out of line: a large copy is rare beside the kernels' accesses, and its code stays out of the hot text, whose layout moves the
+// interpreters' rows by a few percent at equal instructions)
+[[gnu::cold, gnu::noinline]] bool MemoryManager::copy_to(MemoryManager& dst_mm, uint64_t dst, uint64_t src, uint64_t len) const {
+  if (len == 0) return true;
+  // read() takes a fault armed on copies and write() none; run_allocation declines the others (loads, stores, stuck cells).
+  const auto armed = [](const uint64_t* pending) { return pending && __atomic_load_n(pending, __ATOMIC_RELAXED); };
+  const auto copy_armed = [&](const MemoryManager& m) { return m.access_fault_ && armed(m.access_fault_->copy_pending); };
+  if (copy_armed(*this) || copy_armed(dst_mm)) return false;
+  // A managed or pinned buffer in a device window is host memory behind a lock; both ends are asked, as a range can start
+  // outside the mapping and run into it.
+  const auto host_in_reach = [len](const MemoryManager& m, uint64_t addr) {
+    return m.host_maps_ && (m.host_maps_->may_contain(addr) || m.host_maps_->may_contain(addr + len - 1));
+  };
+  if (host_in_reach(*this, src) || host_in_reach(dst_mm, dst)) return false;
+  uint64_t sbase = 0, dbase = 0;
+  const Allocation* sa = run_allocation(src, len, 1, &sbase);
+  Allocation* da = const_cast<Allocation*>(dst_mm.run_allocation(dst, len, 1, &dbase));
+  if (!sa || !da || sa->external || da->external) return false;
+  // Ranges of one allocation that overlap need the whole source read before the first byte is written.
+  if (sa == da && src < dst + len && dst < src + len) return false;
+  // What a chunk that reads as one byte (untouched: zero) is copied from. Per thread, and out of line from the stack: a
+  // call whose chunks are all real never touches it.
+  static thread_local uint8_t fill[kChunkSize];
+  int filled = -1;
+  uint64_t soff = src - sbase, doff = dst - dbase;
+  while (len > 0) {
+    const uint64_t n = std::min({len, kChunkSize - soff % kChunkSize, kChunkSize - doff % kChunkSize});
+    const uint8_t* sc = sa->chunks[soff / kChunkSize].load(std::memory_order_acquire);
+    const uint8_t* s;
+    if (sc && !is_uniform(sc)) {
+      s = sc + soff % kChunkSize;
+    } else {
+      const int byte = sc ? uniform_byte(sc) : 0;   // (untouched memory reads as zero)
+      if (filled != byte) std::memset(fill, byte, kChunkSize), filled = byte;
+      s = fill;
+    }
+    const uint64_t didx = doff / kChunkSize;
+    uint8_t* dc = da->chunks[didx].load(std::memory_order_acquire);
+    // As write(): a uniform chunk is not made real to be given its own byte again.
+    if (!(is_uniform(dc) && all_bytes(s, n, uniform_byte(dc)))) {
+      if (!dc || is_uniform(dc)) dc = dst_mm.materialize(*da, didx);
+      std::memcpy(dc + doff % kChunkSize, s, n);
+    }
+    soff += n;
+    doff += n;
+    len -= n;
+  }
+  return true;
+}
+
 void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, uint64_t len) const {
   while (len > 0) {
     uint64_t chunk_idx = off / kChunkSize;
@@ -2097,6 +2147,38 @@ bool MemoryManager::load_fields(uint64_t addr, const uint8_t* sizes, unsigned n,
     else if (is_uniform(chunk)) out[i] = repeated(uniform_byte(chunk), sz);
     else out[i] = load_at(chunk + off % kChunkSize, sz);
     off += sz;
+  }
+  return true;
+}
+
+bool MemoryManager::load_texels(const uint64_t* addrs, unsigned n, uint32_t size, unsigned channels, uint64_t* out) const {
+  const uint64_t total = uint64_t{size} * channels;
+  uint64_t lo = addrs[0], hi = addrs[0];
+  uint64_t misaligned = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint64_t a = addrs[i];
+    misaligned |= a;
+    lo = a < lo ? a : lo;
+    hi = a > hi ? a : hi;
+  }
+  if (misaligned & (size - 1)) return false;
+  // (One range test where load_fields tests each field's start: it refuses whenever one of those would, and so is the
+  // same answer by the slower road in the rare case it refuses more.)
+  if (host_maps_ && host_maps_->may_overlap(lo, hi + total - 1)) return false;
+  if (access_faults_armed()) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(lo, hi - lo + total, &base);
+  if (!a) return false;
+  for (unsigned i = 0; i < n; ++i) {
+    uint64_t off = addrs[i] - base;
+    for (unsigned c = 0; c < channels; ++c, off += size) {
+      const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+      uint64_t v;
+      if (!chunk) v = 0;
+      else if (is_uniform(chunk)) v = repeated(uniform_byte(chunk), size);
+      else v = load_at(chunk + off % kChunkSize, size);
+      out[i * channels + c] = v;
+    }
   }
   return true;
 }

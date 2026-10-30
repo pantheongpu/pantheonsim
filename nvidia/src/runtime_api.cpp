@@ -2662,9 +2662,12 @@ static cudaError_t cudaMemcpyPeer_body(void* dst, int dstDevice, const void* src
       return cudaErrorInvalidDevice;
     if (count == 0) return cudaSuccess;
     const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
-    std::vector<uint8_t> tmp(count);
-    s.rt->device(srcDevice).memory().read(reinterpret_cast<uint64_t>(src), tmp.data(), count);
-    s.rt->device(dstDevice).memory().write(reinterpret_cast<uint64_t>(dst), tmp.data(), count);
+    if (!s.rt->device(srcDevice).memory().copy_to(s.rt->device(dstDevice).memory(), reinterpret_cast<uint64_t>(dst),
+                                                  reinterpret_cast<uint64_t>(src), count)) {
+      std::vector<uint8_t> tmp(count);
+      s.rt->device(srcDevice).memory().read(reinterpret_cast<uint64_t>(src), tmp.data(), count);
+      s.rt->device(dstDevice).memory().write(reinterpret_cast<uint64_t>(dst), tmp.data(), count);
+    }
     if (vgpu::profiling::enabled()) {
       if (srcDevice != dstDevice)
         profile_cross_device_copy(s, count, srcDevice, dstDevice, t_stream_ctx.async, t_stream_ctx.stream, t0,
@@ -2885,8 +2888,12 @@ static cudaError_t cudaMemcpy_body(void* dst, const void* src, size_t count, cud
         smm.read(reinterpret_cast<uint64_t>(src), dst, count);
         break;
       case cudaMemcpyDeviceToDevice: {
-        // Through a buffer, so an overlapping copy reads all of the source first. Small copies use the frame
+        // A large copy between ordinary allocations goes chunk to chunk (MemoryManager::copy_to), with no buffer.
+        // Otherwise through a buffer, so an overlapping copy reads all of the source first. Small copies use the frame
         // (no allocation, no zero-fill: the read fills every byte); a large one allocates uninitialised.
+        if (count > kD2dFrameBytes &&
+            smm.copy_to(dmm, reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(src), count))
+          break;
         uint8_t small[kD2dFrameBytes];
         std::unique_ptr<uint8_t[]> big;
         uint8_t* tmp = small;

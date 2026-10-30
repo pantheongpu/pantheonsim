@@ -1365,6 +1365,8 @@ vgpu_unit_test(test_memrmw)
 vgpu_unit_test(test_memhot_sp8)
 # A warp's gather load (load_batch's fused tests and two-pass loads) against load_scalar, over every kind of chunk and every way to decline.
 vgpu_unit_test(test_gather_sp10)
+# A device-to-device copy made chunk to chunk (MemoryManager::copy_to) against the read-into-a-buffer-then-write pair it replaces: bytes, chunk state, declines.
+vgpu_unit_test(test_memcopy_direct)
 # The warp's local memory, interleaved by words, against the per-lane layout it replaced.
 vgpu_unit_test(test_locallayout)
 # The lock-free read-modify-write (atomic_rmw) against load_scalar / the operation / store_scalar, and from threads.
@@ -1781,6 +1783,13 @@ target_link_libraries(test_amd_hip_event_inline PRIVATE vgpuhip)
 target_include_directories(test_amd_hip_event_inline PRIVATE tests/framework amd/include)
 add_test(NAME test_amd_hip_event_inline COMMAND test_amd_hip_event_inline)
 set_tests_properties(test_amd_hip_event_inline PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
+  PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
+# A large hipMemcpy between device buffers goes chunk to chunk, with no buffer for the row; every byte arrives, overlaps stay memmoves.
+add_executable(test_amd_hip_d2d_direct amd/tests/unit/test_hip_d2d_direct.cpp)
+target_link_libraries(test_amd_hip_d2d_direct PRIVATE vgpuhip)
+target_include_directories(test_amd_hip_d2d_direct PRIVATE tests/framework amd/include)
+add_test(NAME test_amd_hip_d2d_direct COMMAND test_amd_hip_d2d_direct)
+set_tests_properties(test_amd_hip_d2d_direct PROPERTIES ENVIRONMENT "VGPU_GPU=amd/mi300x;VGPU_QUIET=1"
   PASS_REGULAR_EXPRESSION "^ok" FAIL_REGULAR_EXPRESSION "FAIL|terminate")
 # A small asynchronous copy or fill on a stream with nothing in it is done on the calling thread.
 add_executable(test_amd_hip_async_inline amd/tests/unit/test_hip_async_inline.cpp)

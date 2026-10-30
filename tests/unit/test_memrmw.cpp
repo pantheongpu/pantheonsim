@@ -176,6 +176,26 @@ Outcome fields_old(const MemoryManager& mm, uint64_t addr, const uint8_t* sizes,
   });
 }
 
+// Texels: n records of nch fields of `size` bytes, record i at addrs[i]; new (load_texels, else one load_scalar each) and old
+// (one load_scalar each).
+Outcome texels_new(const MemoryManager& mm, const uint64_t* addrs, unsigned n, uint32_t size, unsigned nch) {
+  return attempt([&](Outcome& o) {
+    uint64_t v[16 * 4] = {};
+    if (!mm.load_texels(addrs, n, size, nch, v))
+      for (unsigned i = 0; i < n; ++i)
+        for (unsigned c = 0; c < nch; ++c) v[i * nch + c] = mm.load_scalar(addrs[i] + uint64_t{c} * size, size);
+    for (unsigned i = 0; i < n * nch; ++i) o.v0 = o.v0 * 1000003 + v[i], o.v1 ^= v[i] << (i % 8 * 8);
+  });
+}
+Outcome texels_old(const MemoryManager& mm, const uint64_t* addrs, unsigned n, uint32_t size, unsigned nch) {
+  return attempt([&](Outcome& o) {
+    uint64_t v[16 * 4] = {};
+    for (unsigned i = 0; i < n; ++i)
+      for (unsigned c = 0; c < nch; ++c) v[i * nch + c] = mm.load_scalar(addrs[i] + uint64_t{c} * size, size);
+    for (unsigned i = 0; i < n * nch; ++i) o.v0 = o.v0 * 1000003 + v[i], o.v1 ^= v[i] << (i % 8 * 8);
+  });
+}
+
 struct Stats {
   uint64_t ops = 0, failed = 0, fast = 0;
 };
@@ -260,6 +280,18 @@ Stats run_random(uint64_t seed, int rounds, int fault) {
       const uint64_t b = rng.next();
       if (pick == 0) same("atomic", r, rmw_new(p.a, addr, size, code, b), rmw_old(p.b, addr, size, code, b));
       else same("atomic, stored if changed", r, changed_new(p.a, addr, size, code, b), changed_old(p.b, addr, size, code, b));
+    } else if (rng.below(2) == 0) {
+      // The texels of one filtered fetch: up to 16 records of up to 4 channels, in one row, in two (a pitch apart, either
+      // way round), or anywhere (the odd one that is not even in the same allocation).
+      const unsigned n = 1 + static_cast<unsigned>(rng.below(rng.below(4) ? 4 : 16));
+      const unsigned nch = 1 + static_cast<unsigned>(rng.below(4));
+      const uint64_t stride = uint64_t{size} * nch, pitch = stride * (1 + rng.below(rng.below(4) ? 40 : 40000));
+      uint64_t addrs[16];
+      for (unsigned i = 0; i < n; ++i) {
+        addrs[i] = addr + (i & 1) * stride + (i >> 1 & 1) * (rng.below(8) ? pitch : 0 - pitch);
+        if (rng.below(40) == 0) addrs[i] = rng.below(2) ? rng.next() : addrs[i] + 1;
+      }
+      same("texels", r, texels_new(p.a, addrs, n, size, nch), texels_old(p.b, addrs, n, size, nch));
     } else {
       // A texel's channels: end to end, sizes from {0, 1, 2, 4, 8} (a 3 sometimes, which has no load).
       uint8_t fs[4];
@@ -336,6 +368,16 @@ VTEST(read_modify_write_declines_without_doing_anything) {
   VCHECK(!mm.load_fields(q, sizes, 2, v));
   mm.set_lookup_cache(true);
   VCHECK(mm.load_fields(q, sizes, 2, v));
+  mm.set_lookup_cache(false);
+  const uint64_t at[2] = {q, q + 8};
+  uint64_t tv[8];
+  VCHECK(!mm.load_texels(at, 2, 4, 2, tv));      // no lookup memory
+  mm.set_lookup_cache(true);
+  VCHECK(mm.load_texels(at, 2, 4, 2, tv));
+  const uint64_t past[2] = {q, q + 60};
+  VCHECK(!mm.load_texels(past, 2, 4, 2, tv));    // the second record runs past the end of the allocation
+  const uint64_t odd[2] = {q, q + 2};
+  VCHECK(!mm.load_texels(odd, 2, 4, 1, tv));     // a record not naturally aligned
 }
 
 VTEST(a_single_thread_atomic_stores_only_a_changed_word_and_only_in_a_real_chunk) {
