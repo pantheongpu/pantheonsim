@@ -1057,8 +1057,21 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
     addrs[l] = off;
     window.add(off, blk.rank);
   };
-  if (ex == kAll) {   // a full warp: a counted loop
-    for (unsigned l = 0; l < 32; ++l) lane_address(l);
+  if (ex == kAll) {   // a full warp: the offsets as 32-bit words (an offset is the low 32 bits of the sum, so of the parts' low halves), then the window check
+    alignas(32) uint32_t offs[32];
+    const uint32_t add32 = static_cast<uint32_t>(urv + imm);
+    if (!base) {
+      for (unsigned l = 0; l < 32; ++l) offs[l] = add32;
+    } else if (!stride) {
+      for (unsigned l = 0; l < 32; ++l) offs[l] = base[l] + add32;
+    } else if (std::has_single_bit(stride)) {
+      const unsigned sh = static_cast<unsigned>(std::countr_zero(stride));
+      for (unsigned l = 0; l < 32; ++l) offs[l] = (base[l] << sh) + add32;
+    } else {
+      for (unsigned l = 0; l < 32; ++l) offs[l] = base[l] * stride + add32;
+    }
+    window.add_warp(offs, blk.rank);
+    for (unsigned l = 0; l < 32; ++l) addrs[l] = offs[l];
   } else {
     for (unsigned l = 0; l < 32; ++l) addrs[l] = 0;   // (the lanes that do not run read as zero, as the counting functions find them)
     for (Mask m = ex; m; m &= m - 1) lane_address(static_cast<unsigned>(std::countr_zero(m)));

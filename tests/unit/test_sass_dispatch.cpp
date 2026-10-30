@@ -7,6 +7,9 @@
 // of nvcc's code is such a call: FCHK, @P CALL.REL.NOINC, ..., RET.REL.NODEC), by every lane, by the lanes a predicate names (a diverged warp: the
 // callee and the code after the call both run, for different lanes), with a RET some lanes do not run (they fall through to an EXIT), and
 // WARPSYNC with the full mask and with a mask of the lane's own half warp (register), in warps of 32 lanes and in partial warps.
+//
+// The tier's shared-memory loads and stores of a whole warp work their 32 offsets out as 32-bit words and check the window once (h_shared): shared-memory kernels
+// with sequential, strided (.X4, .X8, .X16), scrambled, byte-wise and broadcast addresses run the same way.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -271,6 +274,7 @@ struct Env {
     exec::LaunchConfig cfg;
     cfg.grid = {blocks, 1, 1};
     cfg.block = {threads, 1, 1};
+    cfg.shared_bytes = 4096;
     std::vector<uint8_t> arg(8);
     // (each block's threads write from the start of the array: the block number is not in the address, so blocks overwrite one another
     // with the same values; one block is the check, the others are more launches of the same warps)
@@ -361,6 +365,38 @@ const Golden kGolden[] = {
     {"WARPSYNC after exits, full mask, 100 threads", 0x7321745416921a54ull},
     {"WARPSYNC after exits, half-warp mask, 32 threads", 0x0bccd1903c8a151eull},
     {"WARPSYNC after exits, half-warp mask, 96 threads", 0xf7e1d7e6266f46c0ull},
+    {"shared memory, shape 0, 32 threads", 0x1a1f5dfab5295203ull},
+    {"shared memory, shape 0, 64 threads", 0x24198969672b0398ull},
+    {"shared memory, shape 0, 33 threads", 0x2590358d79e5114bull},
+    {"shared memory, shape 0, 5 threads", 0x887ef99b85aae74bull},
+    {"shared memory, shape 1, 32 threads", 0xf635038ec4987730ull},
+    {"shared memory, shape 1, 64 threads", 0x90a3997bf9f042ffull},
+    {"shared memory, shape 1, 33 threads", 0x08e63502fb9600c0ull},
+    {"shared memory, shape 1, 5 threads", 0x887ef99b85aae74bull},
+    {"shared memory, shape 2, 32 threads", 0xa158064b9dca6fa9ull},
+    {"shared memory, shape 2, 64 threads", 0x0aa2fd695d6385b6ull},
+    {"shared memory, shape 2, 33 threads", 0x6725121f15907aeeull},
+    {"shared memory, shape 2, 5 threads", 0xe3b4547ef8d5b534ull},
+    {"shared memory, shape 3, 32 threads", 0x2f882ba37c2d0aa4ull},
+    {"shared memory, shape 3, 64 threads", 0x6687d2747814016bull},
+    {"shared memory, shape 3, 33 threads", 0x7a75fbf86e78b47cull},
+    {"shared memory, shape 3, 5 threads", 0x1f28f1c0843eedabull},
+    {"shared memory, shape 4, 32 threads", 0x8d097048aeac3b8cull},
+    {"shared memory, shape 4, 64 threads", 0x7992755b447595c8ull},
+    {"shared memory, shape 4, 33 threads", 0x11a8c7c9aafa749cull},
+    {"shared memory, shape 4, 5 threads", 0xb77bf1a554969413ull},
+    {"shared memory, shape 5, 32 threads", 0x1a1f5dfab5295203ull},
+    {"shared memory, shape 5, 64 threads", 0x24198969672b0398ull},
+    {"shared memory, shape 5, 33 threads", 0x2590358d79e5114bull},
+    {"shared memory, shape 5, 5 threads", 0x887ef99b85aae74bull},
+    {"shared memory, shape 6, 32 threads", 0x56e99df2334e29b4ull},
+    {"shared memory, shape 6, 64 threads", 0x24d5c6c5b8c69167ull},
+    {"shared memory, shape 6, 33 threads", 0x7ba3aaa61f9866ccull},
+    {"shared memory, shape 6, 5 threads", 0x887ef99b85aae74bull},
+    {"shared memory, shape 7, 32 threads", 0x9ed479c126ac61bfull},
+    {"shared memory, shape 7, 64 threads", 0xb977417df6dc1a75ull},
+    {"shared memory, shape 7, 33 threads", 0x7063b0a32e7ae2bbull},
+    {"shared memory, shape 7, 5 threads", 0xa20592b2cdd29353ull},
 };
 
 void check_golden(const Result& r, const std::string& key) {
@@ -394,6 +430,53 @@ void compare(const std::vector<Insn>& code, std::initializer_list<uint32_t> size
   }
 }
 
+
+// LDS / STS: Rd (or the data register) with the address Ra + imm, `size` the width code (0 U8, 4 32 bits, 5 64 bits), `stride` 0..3 for none, .X4, .X8, .X16.
+Insn lds(unsigned d, unsigned a, uint32_t imm, unsigned size, unsigned stride) {
+  Insn i = make(0x000fe20000000800ull | uint64_t{size} << 9 | uint64_t{stride} << 14, 0x7984 | uint64_t{d} << 16 | uint64_t{a} << 24 | uint64_t{imm & 0xffffffu} << 40, "");
+  i.op = sass::Op::LDS;
+  return i;
+}
+Insn sts(unsigned a, unsigned b, uint32_t imm, unsigned size, unsigned stride) {
+  Insn i = make(0x000fe20000000800ull | uint64_t{size} << 9 | uint64_t{stride} << 14, 0x7388 | uint64_t{a} << 24 | uint64_t{b} << 32 | uint64_t{imm & 0xffffffu} << 40, "");
+  i.op = sass::Op::STS;
+  return i;
+}
+
+// Shared-memory accesses of a whole warp in every shape the tier tells apart: R7 is each lane's address, worked out from the thread number.
+std::vector<Insn> shared_kernel(unsigned shape) {
+  std::vector<Insn> code;
+  code.push_back(s2r_tid(0));
+  code.push_back(make(0x000fc60000000f00ull, 0x0000580000007a02ull | uint64_t{12} << 16, "MOV R12, c[0x0][0x160]"));
+  code.push_back(make(0x000fc60000000f00ull, 0x0000590000007a02ull | uint64_t{13} << 16, "MOV R13, c[0x0][0x164]"));
+  code.push_back(imad_wide_i(14, 0, kStride, 12));
+  for (unsigned r = 1; r < kRegs; ++r) {
+    code.push_back(imadi(r, 0, (0x9e3779b1u * r + 17) & 0x7fffffffu, kRZ));
+    code.push_back(iadd3i(r, r, 0x1234567u * r, 0));
+  }
+  code.push_back(movi(8, 0x3fc));
+  switch (shape) {
+    case 0: code.push_back(imadi(7, 0, 4, kRZ)); break;                                   // a word to a lane, in order
+    case 1: code.push_back(imadi(7, 0, 8, kRZ)); break;                                   // every other word
+    case 2: code.push_back(imadi(7, 0, 37, kRZ)); code.push_back(lop3(7, 7, 8, kRZ, 0xc0)); break;   // scrambled, word-aligned
+    case 3: code.push_back(imadi(7, 0, 3, kRZ)); break;                                   // bytes, three apart
+    case 4: code.push_back(movi(7, 0)); break;                                            // one address for every lane
+    case 5: code.push_back(iadd3i(7, 0, 0, kRZ)); break;                                  // the index; the .X4 forms scale it
+    case 6: code.push_back(imadi(7, 0, 2, kRZ)); break;                                   // (.X8 scales to 16 bytes a lane)
+    default: code.push_back(imadi(7, 0, 4, kRZ)); break;
+  }
+  const unsigned size = shape == 3 ? 0 : shape == 7 ? 5 : 4;   // U8, 64 bits, 32 bits
+  const unsigned stride = shape == 5 ? 1 : shape == 6 ? 2 : 0;
+  code.push_back(sts(7, 1, shape == 7 ? 8 : 0x20, size, stride));
+  code.push_back(lds(2, 7, shape == 7 ? 8 : 0x20, size, stride));
+  code.push_back(lds(3, 7, 0x44, 4, stride));   // (a word past it, or the one the lane's neighbour stored)
+  code.push_back(iadd3(4, 2, 3, kRZ));
+  for (unsigned r = 1; r < kRegs; ++r) code.push_back(stg(14, r, 4 * r));
+  code.push_back(stg(14, 0, 0));
+  code.push_back(exit_());
+  return code;
+}
+
 }  // namespace
 
 VTEST(a_call_by_every_lane_and_its_return_give_the_interpreters_registers_and_counters) {
@@ -419,6 +502,10 @@ VTEST(warpsync_does_not_wait_for_lanes_that_have_exited) {
   // The lanes 16 to 23 leave in the callee (a RET they do not run is followed by an EXIT); a mask that names them is met by the lanes that remain.
   compare(kernel(2, true, RetKind::Guarded, 1), {32, 64, 100}, "WARPSYNC after exits, full mask");
   compare(kernel(2, true, RetKind::Guarded, 2), {32, 96}, "WARPSYNC after exits, half-warp mask");
+}
+
+VTEST(shared_memory_of_a_whole_warp_gives_the_interpreters_registers_and_counters) {
+  for (unsigned shape = 0; shape < 8; ++shape) compare(shared_kernel(shape), {32, 64, 33, 5}, "shared memory, shape " + std::to_string(shape));
 }
 
 #ifndef SASS_CALL_RET_NO_TIER_FORMS   // (not in the tree the answers were taken from)
