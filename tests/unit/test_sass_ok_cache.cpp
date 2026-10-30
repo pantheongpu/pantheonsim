@@ -188,9 +188,17 @@ long size_of(const std::string& path) {
 }
 
 // The directory and file name a build with an id would use, found by making the cache write one.
+// (Asked with VGPU_SASS_CACHE=1, so that a default of "off" is not mistaken for a build with no id: the tests that need
+// a cache must not skip themselves when the cache is off.)
 bool has_cache(const std::string& root) {
   const std::string probe = make_cubin(86, good_words(6, 200));
-  VCHECK(run(probe).empty());
+  const char* was = std::getenv("VGPU_SASS_CACHE");
+  const std::string saved = was ? was : "";
+  setenv("VGPU_SASS_CACHE", "1", 1);
+  const bool ran = run(probe).empty();
+  if (was) setenv("VGPU_SASS_CACHE", saved.c_str(), 1);
+  else unsetenv("VGPU_SASS_CACHE");
+  VCHECK(ran);
   return !cache_file(root).empty();
 }
 
