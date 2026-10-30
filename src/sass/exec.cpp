@@ -577,6 +577,7 @@ class Runner {
     }
   }
   bool tier_run(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc
+  bool tier_ctl(Block& blk, Warp& w, const tier::MOp& last, Mask group, unsigned glanes, uint64_t here, bool moved, const Code& code, uint64_t& at, bool& all_at);   // tier_ops.inc
   template <bool Jit>
   [[gnu::always_inline]] inline bool tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc: the run loop; Jit adds the hook of tier 2
   bool tier_run_jit(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp);   // tier_ops.inc: tier_run_t<true>, not inlined
@@ -624,6 +625,7 @@ class Runner {
   void exec_float(Block& blk, Warp& w, const Instr& ins, Mask ex);
   void exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex);
   void exec_warp(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);
+  void release_warpsync(Warp& w);   // exec_ops.inc
   bool exec_control(Block& blk, Warp& w, const Instr& ins, Mask ex, Mask group);   // true: it set the pcs
   void exec_mma(Block& blk, Warp& w, const Instr& ins, Mask ex);
   void exec_gmma(Block& blk, Warp& w, const Instr& ins, Mask ex);   // warpgroup MMA

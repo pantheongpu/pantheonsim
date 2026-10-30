@@ -412,6 +412,13 @@ VTEST(window_checks_equal_the_per_lane_tests) {
     for (unsigned l = 0; l < 32; ++l)
       if (mask >> l & 1) sc.add(offs[l], rank);
     if (sc.inside(size, bytes, mask != 0) != want) throw vtest::Failure("shared window check differs from the per-lane test at iteration " + std::to_string(iter));
+    if (mask == 0xFFFFFFFFu) {   // a whole warp: the vectored form of the same test
+      uint32_t w32[32];
+      for (unsigned l = 0; l < 32; ++l) w32[l] = static_cast<uint32_t>(offs[l]);
+      vgpu::exec::SharedWindowCheck wc;
+      wc.add_warp(w32, static_cast<uint32_t>(rank));
+      if (wc.inside(size, bytes, true) != want) throw vtest::Failure("whole-warp shared window check differs from the per-lane test at iteration " + std::to_string(iter));
+    }
     // Local: the earlier loop, over frame offsets.
     bool want_local = true;
     uint64_t loc[32];

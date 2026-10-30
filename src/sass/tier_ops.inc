@@ -1057,8 +1057,21 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
     addrs[l] = off;
     window.add(off, blk.rank);
   };
-  if (ex == kAll) {   // a full warp: a counted loop
-    for (unsigned l = 0; l < 32; ++l) lane_address(l);
+  if (ex == kAll) {   // a full warp: the offsets as 32-bit words (an offset is the low 32 bits of the sum, so of the parts' low halves), then the window check
+    alignas(32) uint32_t offs[32];
+    const uint32_t add32 = static_cast<uint32_t>(urv + imm);
+    if (!base) {
+      for (unsigned l = 0; l < 32; ++l) offs[l] = add32;
+    } else if (!stride) {
+      for (unsigned l = 0; l < 32; ++l) offs[l] = base[l] + add32;
+    } else if (std::has_single_bit(stride)) {
+      const unsigned sh = static_cast<unsigned>(std::countr_zero(stride));
+      for (unsigned l = 0; l < 32; ++l) offs[l] = (base[l] << sh) + add32;
+    } else {
+      for (unsigned l = 0; l < 32; ++l) offs[l] = base[l] * stride + add32;
+    }
+    window.add_warp(offs, blk.rank);
+    for (unsigned l = 0; l < 32; ++l) addrs[l] = offs[l];
   } else {
     for (unsigned l = 0; l < 32; ++l) addrs[l] = 0;   // (the lanes that do not run read as zero, as the counting functions find them)
     for (Mask m = ex; m; m &= m - 1) lane_address(static_cast<unsigned>(std::countr_zero(m)));
@@ -1253,6 +1266,12 @@ TIER_HANDLER(h_plop3) {
   }
   tier_setp(c, op.dst, ex, r0);
   tier_setp(c, op.dst2, ex, r1);
+}
+
+// FCHK: whether a / b needs the division's slow path. Always: the slow path is exact for every input (exec_float's rule).
+TIER_HANDLER(h_fchk) {
+  TIER_PRELUDE
+  tier_setp(c, op.dst, ex, kAll);
 }
 
 TIER_HANDLER(h_s2r) {
@@ -1580,6 +1599,7 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Match: return &h_match;
     case F::Imma: return &h_imma;
     case F::Atom: return &h_atom;
+    case F::Fchk: return &h_fchk;
     case F::Ldsm: return &h_ldsm;
     case F::Umov: return &h_umov;
     case F::Uldc: return &h_uldc;
@@ -1870,6 +1890,91 @@ struct JitSampler {
   }
 };
 
+// CALL, RET and WARPSYNC as they end a run (tier_run_t calls this; false: not taken here, the interpreter runs it -- a call of a function VirtualGPU provides).
+// `moved`: the run was longer than one instruction, so the lanes' program counters are still those of its start.
+[[gnu::noinline]] bool Runner::tier_ctl(Block& blk, Warp& w, const tier::MOp& last, Mask group, unsigned glanes, uint64_t here, bool moved,
+                                        const Code& code, uint64_t& at, bool& all_at) {
+  exec::LaunchStats& st = blk.st;
+  if (last.form == tier::Form::Call) {
+    // exec_control's CALL.REL for a fixed target: a function VirtualGPU provides (a builtin at its magic address) is the interpreter's.
+    const uint64_t target = code.base + static_cast<uint64_t>(last.imm);
+    if (!(m_.builtins.empty() || target < m_.builtins.begin()->first || m_.builtins.find(target) == m_.builtins.end())) return false;
+    // The lanes that run it go to the target, the others on to the next instruction.
+    const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
+    const unsigned lanes = ex == group ? glanes : popc(ex);
+    ++st.instructions;
+    st.thread_instructions += lanes;
+    st.inst_by_class[last.cls] += lanes;
+    if (ex == group || !ex) {
+      at = ex ? target : here + 16;
+      tier_set_pcs(w, group, at);
+      all_at = true;
+    } else {
+      exec::sasslanes::select_pcs(w.pc, group, ex, target, here + 16);
+    }
+    if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::CALL)].fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  if (last.form == tier::Form::Ret) {
+    // exec_control's RET: the lanes that run it go to the address in the register pair (a section-relative offset, or an absolute code
+    // address a relocation wrote), the others on to the next instruction.
+    const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
+    const unsigned lanes = ex == group ? glanes : popc(ex);
+    ++st.instructions;
+    st.thread_instructions += lanes;
+    st.inst_by_class[last.cls] += lanes;
+    const unsigned r = last.dst;
+    uint64_t first_at = 0;
+    bool same = ex == group;
+    for (Mask m = group; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      uint64_t t = here + 16;
+      if ((ex >> l) & 1) {
+        const uint32_t lo = w.reg(r, l), hi = r + 1 < w.nregs ? w.reg(r + 1, l) : 0;
+        t = hi == static_cast<uint32_t>(kCodeBase >> 32) ? (uint64_t{hi} << 32 | lo) : code.base + lo;
+      }
+      if (m == group) first_at = t;
+      same = same && t == first_at;
+      w.pc[l] = t;
+    }
+    if (same) {
+      at = first_at;
+      all_at = true;
+    }
+    if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::RET)].fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  // exec_control's WARPSYNC: the lanes that run it wait there for the lanes their mask names (a thread its own mask leaves out may not
+  // run it), the others go on; then the release (release_warpsync).
+  const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
+  const unsigned lanes = ex == group ? glanes : popc(ex);
+  ++st.instructions;
+  st.thread_instructions += lanes;
+  st.inst_by_class[last.cls] += lanes;
+  if (moved) tier_set_pcs(w, group, here);
+  const Instr& wi = *last.ins;
+  // The mask is the same for every lane unless it is a register (a constant, a constant-bank word or a uniform register is read once).
+  const bool per_lane = !last.aux && wi.src[last.a].kind == Kind::Reg;
+  uint32_t mask_all = ~Mask{0};
+  if (ex && !last.aux && !per_lane) mask_all = read32(w, wi.src[last.a], static_cast<unsigned>(std::countr_zero(ex)));
+  for (Mask m = group; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    if ((ex >> l) & 1) {
+      w.waiting |= Mask{1} << l;
+      w.wait_kind[l] = Wait::WarpSync;
+      w.wait_arg[l] = per_lane ? read32(w, wi.src[last.a], l) : mask_all;
+      if (!((w.wait_arg[l] >> l) & 1u))
+        throw Error(Err::IllegalInstruction, "SASS kernel " + k_.name + ": WARPSYNC run by lane " + std::to_string(l) +
+                                                 ", which its mask " + std::to_string(w.wait_arg[l]) + " leaves out");
+    } else {
+      w.pc[l] += 16;
+    }
+  }
+  release_warpsync(w);
+  if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::WARPSYNC)].fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 template <bool Jit>
 bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
   TCtx c{&w, &blk, this, w.r.data(), bank0_.data(), bank0_.size(), tp.pool.data(), &simd::kernels()};
@@ -2118,6 +2223,9 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       for (Mask m = group & ~ex; m; m &= m - 1) w.pc[std::countr_zero(m)] += 16;
       tier_release_bsync(w, x);
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::BSYNC)].fetch_add(1, std::memory_order_relaxed);
+    } else if ((last.form == tier::Form::Call || last.form == tier::Form::Ret || last.form == tier::Form::Warpsync) &&
+               tier_ctl(blk, w, last, group, glanes, here, idx != first, code, at, all_at)) {
+      // CALL, RET and WARPSYNC (a function of their own: they are rare beside the straight-line work, and the loop is placement-sensitive)
     } else {
       if (tier_stats_) [[unlikely]] tier_note_fallback(*last.ins, true);
       if (idx != first) tier_set_pcs(w, group, here);
