@@ -1,6 +1,6 @@
 // sass::unsupported leaves a file of the cubins it found to run in full (src/sass/ok_cache.cpp), so the next process
 // that loads the same fatbins does not decode every word of them again. The file must change nothing a caller can see:
-// a refusal is never recorded and keeps its text, VGPU_SASS_REFUSE and VGPU_SASS_CACHE=0 or unset (the default) leave it alone, a different
+// a refusal is never recorded and keeps its text, VGPU_SASS_REFUSE and VGPU_SASS_CACHE=0 leave it alone (unset is on: the default), a different
 // image is a miss (every bit of the image is in the key), and a file that is not this user's alone, or has a torn
 // tail, is not trusted or not appended to. Each test below fails if the cache answered for an image it was not given,
 // recorded a refusal, read a file anyone could have written, or appended behind a torn key.
@@ -166,7 +166,7 @@ std::string fresh_root() {
   g_roots.made.push_back(tmpl);
   setenv("XDG_CACHE_HOME", tmpl.c_str(), 1);
   unsetenv("VGPU_SASS_REFUSE");
-  setenv("VGPU_SASS_CACHE", "1", 1);
+  unsetenv("VGPU_SASS_CACHE");   // the default is on
   return tmpl;
 }
 
@@ -297,18 +297,46 @@ VTEST(refuse_and_cache_off_bypass_the_file) {
   unsetenv("VGPU_SASS_REFUSE");
   VCHECK(run(a).empty());
   VCHECK_EQ(sass::unsupported_cache_hits(), h0 + 1);
-  // VGPU_SASS_CACHE=0, or unset (the default): neither read nor written.
+  // VGPU_SASS_CACHE=0 (and "0..."): neither read nor written.
   const std::string b = make_cubin(86, good_words(40, 2));
-  const char* const offs[] = {"0", nullptr};
+  const char* const offs[] = {"0", "0x"};
   for (const char* off : offs) {
-    if (off) setenv("VGPU_SASS_CACHE", off, 1);
-    else unsetenv("VGPU_SASS_CACHE");
+    setenv("VGPU_SASS_CACHE", off, 1);
     VCHECK(run(a).empty());
     VCHECK_EQ(sass::unsupported_cache_hits(), h0 + 1);
     VCHECK(run(b).empty());
     VCHECK_EQ(size_of(file), 16L);
   }
-  setenv("VGPU_SASS_CACHE", "1", 1);
+  // Anything else, or unset, is on: the cache is the default.
+  const char* const ons[] = {nullptr, "", "1", "yes"};
+  uint64_t expect = h0 + 1;
+  for (const char* on : ons) {
+    if (on) setenv("VGPU_SASS_CACHE", on, 1);
+    else unsetenv("VGPU_SASS_CACHE");
+    VCHECK(run(a).empty());
+    VCHECK_EQ(sass::unsupported_cache_hits(), ++expect);   // each answered from the file
+  }
+  unsetenv("VGPU_SASS_CACHE");
+}
+
+VTEST(the_cache_is_on_by_default_and_off_with_zero) {
+  const std::string root = fresh_root();   // VGPU_SASS_CACHE unset
+  if (!has_cache(root)) return;
+  const std::string root2 = fresh_root();
+  const std::string a = make_cubin(86, good_words(40, 0));
+  const uint64_t h0 = sass::unsupported_cache_hits();
+  VCHECK(run(a).empty());
+  VCHECK_EQ(size_of(cache_file(root2)), 16L);   // written with nothing set
+  VCHECK(run(a).empty());
+  VCHECK_EQ(sass::unsupported_cache_hits(), h0 + 1);
+  // Off: no file is made, none is read.
+  const std::string root3 = fresh_root();
+  setenv("VGPU_SASS_CACHE", "0", 1);
+  VCHECK(run(a).empty());
+  VCHECK(run(a).empty());
+  VCHECK(cache_file(root3).empty());
+  VCHECK_EQ(sass::unsupported_cache_hits(), h0 + 1);
+  unsetenv("VGPU_SASS_CACHE");
 }
 
 VTEST(a_torn_tail_is_ignored_and_never_appended_to) {

@@ -6,7 +6,7 @@
 // has no cache). Only passes are recorded: a refusal is found by the ordinary path, text and all.
 //
 // The file is trusted only if it is a regular file of this user's that nobody else can write, in a directory of the
-// same kind; a short tail (a torn append) is ignored and never appended to. It is opt-in: `VGPU_SASS_CACHE=1` turns it on.
+// same kind; a short tail (a torn append) is ignored and never appended to. It is on by default; `VGPU_SASS_CACHE=0` turns it off.
 #include "ok_cache.hpp"
 
 #include <fcntl.h>
@@ -128,9 +128,9 @@ std::string cache_root() {
   return {};
 }
 
-// "" when the cache is off: it is opt-in, `VGPU_SASS_CACHE=1`.
+// "" when the cache is off: it is on unless `VGPU_SASS_CACHE=0`, and has nowhere to live without a build id or a home.
 std::string cache_path() {
-  if (const char* v = std::getenv("VGPU_SASS_CACHE"); !v || v[0] != '1') return {};
+  if (const char* v = std::getenv("VGPU_SASS_CACHE"); v && v[0] == '0') return {};
   const std::string& id = build_id();
   const std::string root = cache_root();
   if (id.empty() || root.empty()) return {};
