@@ -136,6 +136,8 @@ enum class Form : uint8_t {
   Ret,       // RET.REL: ends a run, run by tier_run itself
   Warpsync,  // WARPSYNC: ends a run, run by tier_run itself (the release is the interpreter's: Runner::release_warpsync)
   Ldgsts,    // LDGSTS (cp.async) of 4, 8 or 16 bytes without .ZFILL: ends a run, has a handler
+  Ld,        // LD (generic address) of 1 to 16 bytes: the lanes all in the shared window, or none in any window; anything else is the interpreter's
+  St,        // ST (generic address): as Ld
   Count_,
 };
 const char* form_name(Form f);

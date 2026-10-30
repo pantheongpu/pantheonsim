@@ -247,7 +247,28 @@ void sweep(const std::vector<std::array<uint32_t, 2>>& sd, std::initializer_list
           }
 }
 
+std::string fault_of(Env& e, const Case& k, const std::vector<uint8_t>& input, bool interp) {
+  try {
+    run(e, kernel(k.size, k.S, k.D, k.soff, k.goff, k.pred, k.zfill, k.guard), k.threads, input, interp);
+  } catch (const std::exception& x) {
+    return x.what();
+  }
+  return "";
+}
+
 }  // namespace
+
+VTEST(copy_past_the_shared_array_faults_as_the_interpreter_does) {
+  Scoped scoped;
+  Env e;
+  const std::vector<uint8_t> input = random_input();
+  for (unsigned size = 4; size <= 6; ++size) {
+    const Case k{size, size == 4 ? 4u : size == 5 ? 8u : 16u, 16, 300, 0x40, 0x20, -1, false, 7, 32};   // 31 * 300 is past the 4096 bytes
+    const std::string tier = fault_of(e, k, input, false), ref = fault_of(e, k, input, true);
+    VCHECK(!ref.empty());
+    VCHECK(tier == ref);
+  }
+}
 
 VTEST(copies_on_a_run_or_a_stride_one_warp) { sweep({{16, 16}, {32, 16}, {64, 24}, {16, 20}}, {32, 20}, false); }
 

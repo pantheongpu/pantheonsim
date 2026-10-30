@@ -277,7 +277,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "cs2r", "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "iabs", "ldc",
-                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma", "atom", "fchk", "call", "ret", "warpsync", "ldgsts"};
+                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma", "atom", "fchk", "call", "ret", "warpsync", "ldgsts", "ld", "st"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -357,6 +357,8 @@ const FormImpl& form_impl(Form f) {
       {Impl::Own, "RET: control flow"},
       {Impl::Own, "WARPSYNC: control flow (the release is Runner::release_warpsync, the interpreter's)"},
       {Impl::Own, "LDGSTS: a copy of bytes, no number format; the addresses, faults and the slow cases are exec_mem's, the counters mem_counters'"},
+      {Impl::Own, "LD: generic addresses told apart by window; shared moves as LDS, global as LDG; the rest is exec_mem's"},
+      {Impl::Own, "ST: as LD"},
   };
   static_assert(sizeof table / sizeof table[0] == static_cast<size_t>(Form::Count_), "form_impl: one entry per Form");
   const unsigned i = static_cast<unsigned>(f);
@@ -479,9 +481,10 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
 
   // Memory instructions: stores have no destination, so these come before the check below.
   switch (ins.op) {
-    case Op::LDG: case Op::STG: {
-      // Global loads and stores of 1, 2, 4 or 8 bytes on Ampere and later (Turing's address form is the interpreter's).
-      const bool store = ins.op == Op::STG;
+    case Op::LDG: case Op::STG: case Op::LD: case Op::ST: {
+      // Global loads and stores of 1, 2, 4 or 8 bytes on Ampere and later (Turing's address form is the interpreter's); LD and ST,
+      // whose addresses may be in the shared, local, parameter or constant window, are told apart at run time (h_generic).
+      const bool store = ins.op == Op::STG || ins.op == Op::ST, generic = ins.op == Op::LD || ins.op == Op::ST;
       const unsigned bytes = mem_bytes(ins.f[0]);
       if (sm < 80 || !(bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16) || ins.src.size() < (store ? 2u : 1u)) return;
       const Operand& d = store ? ins.src[1] : ins.dst.empty() ? ins.src[0] : ins.dst[0];
@@ -503,7 +506,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.imm = ins.src[0].imm;
       m.aux = wide ? 1 : 0;
       m.dst = d.reg == kRZ ? kNoReg : static_cast<uint16_t>(d.reg);
-      accept(store ? Form::Stg : Form::Ldg);
+      accept(generic ? (store ? Form::St : Form::Ld) : (store ? Form::Stg : Form::Ldg));
       return;
     }
     case Op::LDS: case Op::STS: case Op::LDL: case Op::STL: {
