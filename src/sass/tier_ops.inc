@@ -1592,6 +1592,77 @@ TIER_HANDLER(h_hmma) {   // exec_mma's kernel call: the same kernel, and the sam
     for (unsigned s = 0; s < c_regs; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, out + s * 32);
 }
 
+// LDGSTS (cp.async without .ZFILL): each executing lane reads `bytes` (4, 8 or 16) of global memory and writes them at its shared address; a lane
+// whose predicate operand is false writes zeros. exec_mem's lane loop does a mem_read and a mem_write (each a switch and a bounds check, out of line)
+// per lane; here the global reads are one batch (load_batch, in the 8-byte pieces a 16-byte read is) and the shared writes are lane copies, in lane order
+// (the last of lanes on one address wins, as there), once every shared access is known to lie inside the block's own array. A batch the memory
+// manager declines (a fault, a misaligned or host-mapped access) and a shared access outside the array are exec_mem's, which has not been started.
+TIER_HANDLER(h_ldgsts) {
+  const TCtx& c = *static_cast<const TCtx*>(vc);
+  Warp& w = *c.w;
+  Block& blk = *c.blk;
+  const unsigned bytes = op.a;
+  const unsigned rs = op.s[0].off, rg = op.s[1].off;
+  const uint32_t* sreg = rs != kRZ ? c.R + rs * 32u : nullptr;
+  const uint32_t* glo = rg != kRZ ? c.R + rg * 32u : nullptr;
+  const uint32_t* ghi = rg != kRZ ? c.R + (rg + 1u) * 32u : nullptr;
+  const uint32_t sadd = op.b;
+  uint64_t saddr[32], gaddr[32];
+  exec::SharedWindowCheck window;
+  for (unsigned l = 0; l < 32; ++l) saddr[l] = 0;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    const uint64_t off = static_cast<uint32_t>((sreg ? sreg[l] : 0u) + sadd);
+    saddr[l] = off;
+    window.add(off, blk.rank);
+  }
+  if (!window.inside(blk.shared.size(), bytes, ex != 0)) {
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
+  tier_global_addresses(glo, ghi, static_cast<uint64_t>(op.imm), ex, gaddr);
+  const Mask reads = (op.aux & 1) ? (ex & tier_pmask(c, op.p)) : ex;
+  uint64_t fa[32], lo[32], hi[32];
+  unsigned n = 0;
+  for (Mask m = reads; m; m &= m - 1) fa[n++] = gaddr[std::countr_zero(m)];
+  MemoryManager& mem = c.r->memory();
+  if (n) {
+    bool ok;
+    if (bytes == 16) {
+      uint64_t fb[32];
+      for (unsigned i = 0; i < n; ++i) fb[i] = fa[i] + 8;
+      ok = mem.load_batch(fa, n, 8, lo) && mem.load_batch(fb, n, 8, hi);
+    } else {
+      ok = mem.load_batch(fa, n, bytes, lo);
+    }
+    if (!ok) {
+      c.r->tier_exec_mem(blk, w, *op.ins, ex);
+      return;
+    }
+  }
+  w.idle_yields = 0;   // a store is progress (Runner::mem_write)
+  uint8_t* const sh = blk.shared.data();
+  unsigned i = 0;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    uint8_t* const at = sh + (saddr[l] & 0xffffff);
+    const bool read = (reads >> l) & 1;
+    const uint64_t a = read ? lo[i] : 0, b = read ? (bytes == 16 ? hi[i] : 0) : 0;
+    i += read;
+    if (bytes == 4) {
+      const uint32_t v = static_cast<uint32_t>(a);
+      std::memcpy(at, &v, 4);
+    } else if (bytes == 8) {
+      std::memcpy(at, &a, 8);
+    } else {
+      std::memcpy(at, &a, 8);
+      std::memcpy(at + 8, &b, 8);
+    }
+  }
+  count_access(blk.st, 0, false, gaddr, ex, bytes);
+  count_shared_access(blk.st, true, saddr, ex, bytes);
+}
+
 tier::MOp::Fn tier_handler_for(tier::Form f) {
   using F = tier::Form;
   switch (f) {
@@ -1634,6 +1705,7 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Shfl: return &h_shfl;
     case F::Vote: return &h_vote;
     case F::Hmma: return &h_hmma;
+    case F::Ldgsts: return &h_ldgsts;
     case F::Match: return &h_match;
     case F::Imma: return &h_imma;
     case F::Atom: return &h_atom;

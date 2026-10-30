@@ -277,7 +277,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "cs2r", "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "iabs", "ldc",
-                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma", "atom", "fchk", "call", "ret", "warpsync"};
+                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma", "atom", "fchk", "call", "ret", "warpsync", "ldgsts"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -356,6 +356,7 @@ const FormImpl& form_impl(Form f) {
       {Impl::Own, "CALL: control flow"},
       {Impl::Own, "RET: control flow"},
       {Impl::Own, "WARPSYNC: control flow (the release is Runner::release_warpsync, the interpreter's)"},
+      {Impl::Own, "LDGSTS: a copy of bytes, no number format; the addresses, faults and the slow cases are exec_mem's, the counters mem_counters'"},
   };
   static_assert(sizeof table / sizeof table[0] == static_cast<size_t>(Form::Count_), "form_impl: one entry per Form");
   const unsigned i = static_cast<unsigned>(f);
@@ -592,6 +593,29 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.b = K;
       m.aux = static_cast<uint8_t>((ins.f[1] ? 1 : 0) | (ins.f[2] ? 2 : 0) | (ins.f[6] ? 4 : 0) | (ins.f[4] ? 8 : 0));
       accept(Form::Imma);
+      return;
+    }
+    case Op::LDGSTS: {   // cp.async: a global read of 4, 8 or 16 bytes a lane into the lane's shared address (.ZFILL, which shifts the read, is exec_mem's)
+      const unsigned bytes = mem_bytes(ins.f[0]);
+      if (sm < 80 || ins.f[1] || !(bytes == 4 || bytes == 8 || bytes == 16) || ins.straight || ins.src.size() < 2 || ins.src.size() > 3) return;
+      if (ins.src.size() == 3 && ins.src[2].kind != Kind::Pred) return;
+      const unsigned rs = static_cast<unsigned>(ins.w.field(16, 8)), rg = static_cast<unsigned>(ins.w.field(24, 8));
+      if (rs != kRZ) maxreg = static_cast<uint16_t>(rs + 1);
+      if (rg != kRZ) {
+        if (rg + 1 >= kRZ) return;
+        maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(rg + 2));
+      }
+      m.a = bytes;
+      m.b = static_cast<uint32_t>(ins.src[0].imm);   // the shared offset (the sum is taken in 32 bits)
+      m.imm = ins.src[1].imm;                        // the global offset
+      m.s[0].off = rs;
+      m.s[1].off = rg;
+      if (ins.src.size() == 3) {
+        m.p = pred_src(ins.src[2]);
+        m.aux = 1;
+      }
+      m.dst = kNoReg;
+      accept(Form::Ldgsts);
       return;
     }
     case Op::ATOMG: case Op::ATOM: case Op::ATOMS: case Op::RED: {

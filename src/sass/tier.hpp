@@ -135,6 +135,7 @@ enum class Form : uint8_t {
   Call,      // CALL.REL (a fixed target in this section, not a function VirtualGPU provides): ends a run, run by tier_run itself
   Ret,       // RET.REL: ends a run, run by tier_run itself
   Warpsync,  // WARPSYNC: ends a run, run by tier_run itself (the release is the interpreter's: Runner::release_warpsync)
+  Ldgsts,    // LDGSTS (cp.async) of 4, 8 or 16 bytes without .ZFILL: ends a run, has a handler
   Count_,
 };
 const char* form_name(Form f);
