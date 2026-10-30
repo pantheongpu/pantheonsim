@@ -1458,6 +1458,12 @@ static CUresult memcpy_dtoh(void* dst, CUdeviceptr src, size_t n, CUstream strea
 static CUresult memcpy_dtod(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream stream, bool async) {
   return api("cuMemcpyDtoD", true, false, [&](ShimState& s) {
     const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
+    // A large copy between ordinary device allocations goes chunk to chunk, with no buffer (managed memory takes dev_read / dev_write).
+    if (n > 16384 && !managed_range(s, src, n) && !managed_range(s, dst, n) &&
+        owner_memory(s, src).copy_to(owner_memory(s, dst), dst, src, n)) {
+      record_copy(s, 3, reinterpret_cast<const void*>(dst), reinterpret_cast<const void*>(src), n, t0, stream, async);
+      return CUDA_SUCCESS;
+    }
     std::vector<uint8_t> tmp(n);
     dev_read(s, tmp.data(), src, n);
     dev_write(s, dst, tmp.data(), n);

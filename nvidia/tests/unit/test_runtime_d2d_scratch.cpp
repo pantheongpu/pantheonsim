@@ -86,6 +86,29 @@ VTEST(an_overlapping_device_to_device_copy_reads_the_whole_source_first) {
   }
 }
 
+// A large copy goes chunk to chunk (no buffer) whatever the alignment of either end to the 64 KiB chunks, and cudaMemcpyPeer
+// on one device is the same copy: every byte arrives, and the bytes around the range are not touched.
+VTEST(a_large_device_to_device_copy_at_unaligned_ends_moves_exactly_its_range) {
+  const size_t total = 700000, n = 400000, so = 65537, dO = 130000;
+  for (int peer = 0; peer < 2; ++peer) {
+    uint8_t *a = nullptr, *b = nullptr;
+    VCHECK_EQ(cudaMalloc(reinterpret_cast<void**>(&a), total), cudaSuccess);
+    VCHECK_EQ(cudaMalloc(reinterpret_cast<void**>(&b), total), cudaSuccess);
+    const auto in = pattern(total, 3), bg = pattern(total, 200);
+    VCHECK_EQ(cudaMemcpy(a, in.data(), total, cudaMemcpyHostToDevice), cudaSuccess);
+    VCHECK_EQ(cudaMemcpy(b, bg.data(), total, cudaMemcpyHostToDevice), cudaSuccess);
+    if (peer) VCHECK_EQ(cudaMemcpyPeer(b + dO, 0, a + so, 0, n), cudaSuccess);
+    else VCHECK_EQ(cudaMemcpy(b + dO, a + so, n, cudaMemcpyDeviceToDevice), cudaSuccess);
+    std::vector<uint8_t> want = bg;
+    std::memcpy(want.data() + dO, in.data() + so, n);
+    std::vector<uint8_t> out(total);
+    VCHECK_EQ(cudaMemcpy(out.data(), b, total, cudaMemcpyDeviceToHost), cudaSuccess);
+    VCHECK(out == want);
+    VCHECK_EQ(cudaFree(a), cudaSuccess);
+    VCHECK_EQ(cudaFree(b), cudaSuccess);
+  }
+}
+
 // A copy that cannot be made fails as before and leaves the destination alone.
 VTEST(a_device_to_device_copy_past_the_end_is_refused_and_changes_nothing) {
   uint8_t *a = nullptr, *b = nullptr;
