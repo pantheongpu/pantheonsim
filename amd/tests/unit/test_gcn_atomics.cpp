@@ -14,10 +14,13 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "vgpu/amd_codeobject.hpp"
+#include "vgpu/amd_decode_cache.hpp"
 #include "vgpu/amd_exec.hpp"
 #include "vtest.hpp"
 
@@ -220,6 +223,50 @@ VTEST(the_atomics_a_work_group_shares_in_lds) {
       throw vtest::Failure("shared[" + std::to_string(i) + "] is " + std::to_string(out[i]) + ", not " +
                            std::to_string(want));
   }
+}
+
+// Kernels on different queues run side by side, each dispatch of one work-group on one thread, and they share device
+// memory. An atomic they both make on a word must not lose an update: before the process counted its running
+// dispatches, a lone-thread dispatch did its read-modify-write unlocked (the hip-tests atomics that failed on one card
+// a night: Multi_Kernel and Peer_GPUs). Four threads, each launching one-group dispatches that add to the same 64-bit
+// word and the same float, and the total has to be every add.
+VTEST(dispatches_on_different_threads_do_not_lose_each_others_atomic_adds) {
+  const amd::CodeObject o = object();
+  const amd::Kernel* k = amd::find_kernel(o, "wide");
+  if (!k) throw vtest::Failure("no kernel named wide");
+  MemoryManager mem(64ull << 20);
+  std::vector<int32_t> in(kN);
+  for (int i = 0; i < kN; ++i) in[i] = i % 5 + 1;
+  const uint64_t pin = upload(mem, in), pf = upload(mem, std::vector<float>{0.0f}),
+                 pq = upload(mem, std::vector<uint64_t>{0});
+  const uint64_t kernarg = kernargs(mem, *k, {pf, pq, pin, static_cast<uint64_t>(kN)});
+  amd::DecodeCache cache(o.text.size());
+  constexpr int kThreads = 4, kLaunches = 4000;
+  std::atomic<int> failed{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t)
+    threads.emplace_back([&] {
+      try {
+        for (int i = 0; i < kLaunches; ++i) {
+          amd::Dispatch d;
+          d.object = &o;
+          d.kernel = k;
+          d.kernarg = kernarg;
+          d.decoded = &cache;
+          d.groups[0] = 1;
+          d.group_size[0] = 64;
+          amd::execute(d, mem);
+        }
+      } catch (...) {
+        ++failed;
+      }
+    });
+  for (std::thread& th : threads) th.join();
+  VCHECK_EQ(failed.load(), 0);
+  uint64_t per_launch = 0;
+  for (int i = 0; i < kN; ++i) per_launch += static_cast<uint64_t>(in[i]);
+  VCHECK_EQ(download<uint64_t>(mem, pq, 1)[0], per_launch * kThreads * kLaunches);
+  VCHECK_EQ(download<float>(mem, pf, 1)[0], static_cast<float>(per_launch * kThreads * kLaunches));
 }
 
 VTEST_MAIN
