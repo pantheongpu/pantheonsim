@@ -397,6 +397,14 @@ const Golden kGolden[] = {
     {"shared memory, shape 7, 64 threads", 0xb977417df6dc1a75ull},
     {"shared memory, shape 7, 33 threads", 0x7063b0a32e7ae2bbull},
     {"shared memory, shape 7, 5 threads", 0xa20592b2cdd29353ull},
+    {"shared memory, shape 0, 19 threads", 0xd860fdd4d9538013ull},
+    {"shared memory, shape 1, 19 threads", 0x61a9ac19f2f8ecf9ull},
+    {"shared memory, shape 2, 19 threads", 0xd733da38f81da565ull},
+    {"shared memory, shape 3, 19 threads", 0x5ca66febd9786ac9ull},
+    {"shared memory, shape 4, 19 threads", 0x6bf3344a2f8d750eull},
+    {"shared memory, shape 5, 19 threads", 0xd860fdd4d9538013ull},
+    {"shared memory, shape 6, 19 threads", 0xe52f4f65a25cdc7dull},
+    {"shared memory, shape 7, 19 threads", 0xa3def45ff5165dcbull},
 };
 
 void check_golden(const Result& r, const std::string& key) {
@@ -505,7 +513,7 @@ VTEST(warpsync_does_not_wait_for_lanes_that_have_exited) {
 }
 
 VTEST(shared_memory_of_a_whole_warp_gives_the_interpreters_registers_and_counters) {
-  for (unsigned shape = 0; shape < 8; ++shape) compare(shared_kernel(shape), {32, 64, 33, 5}, "shared memory, shape " + std::to_string(shape));
+  for (unsigned shape = 0; shape < 8; ++shape) compare(shared_kernel(shape), {32, 64, 33, 5, 19}, "shared memory, shape " + std::to_string(shape));
 }
 
 #ifndef SASS_CALL_RET_NO_TIER_FORMS   // (not in the tree the answers were taken from)
