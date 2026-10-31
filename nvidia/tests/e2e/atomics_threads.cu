@@ -39,6 +39,25 @@ __global__ void wrap(unsigned* v, int n) {
   if (blockIdx.x * blockDim.x + threadIdx.x < n) atomicInc(v, 99u);   // (counts 0..99 and rolls over: n % 100 at the end)
 }
 
+// Two-byte and four-byte atomics on the same words: even threads count up the low half with a 16-bit compare-and-swap, odd ones
+// add 0x10000 to the whole word. A 16-bit update that is not atomic against the 4-byte add loses one of them.
+__global__ void mixed(unsigned* w, int n, int words) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int k = (i / 2) % words;
+  if (i & 1) {
+    atomicAdd(&w[k], 0x10000u);
+  } else {
+    unsigned short* h = reinterpret_cast<unsigned short*>(&w[k]);
+    unsigned short old = *(volatile unsigned short*)h;
+    for (;;) {
+      const unsigned short got = atomicCAS(h, old, (unsigned short)(old + 1));
+      if (got == old) break;
+      old = got;
+    }
+  }
+}
+
 int main() {
   const int n = 1 << 17, B = 256, words = 61;
   int bad = 0;
@@ -97,6 +116,18 @@ int main() {
   const unsigned long long m = n / 8;
   chk(hcs == m * (m + 1) / 2, "compare-and-swap sum");
   chk(hwr == (unsigned)(n % 100), "atomicInc wraps");
+  {
+    const int mw = 7, mn = 1 << 16;   // (about 4700 of each per word: the low half does not wrap)
+    unsigned* mx; CK(cudaMalloc(&mx, 4 * mw)); CK(cudaMemset(mx, 0, 4 * mw));
+    mixed<<<mn / B, B>>>(mx, mn, mw);
+    CK(cudaDeviceSynchronize());
+    std::vector<unsigned> hm(mw), em(mw, 0);
+    CK(cudaMemcpy(hm.data(), mx, 4 * mw, cudaMemcpyDeviceToHost));
+    for (int i = 0; i < mn; ++i) em[(i / 2) % mw] += (i & 1) ? 0x10000u : 1u;
+    int diff = 0;
+    for (int k = 0; k < mw; ++k) diff += hm[k] != em[k];
+    chk(diff == 0, "2-byte compare-and-swap beside 4-byte add on one word");
+  }
   if (bad) return 1;
   printf("PASS\n");
   return 0;

@@ -6639,7 +6639,8 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
     uint64_t b = 0;
     std::memcpy(&b, src, es);
     uint64_t found = 0;
-    if (atomics_lock_free(env_.threads) && mem_.atomic_rmw(a, es, [&](uint64_t o) { return exec::reduce_value(op, ty, o, b); }, &found, true)) {   // (as the warp's atomics: the CPU's swap)
+    const auto step = [&](uint64_t o) { return exec::reduce_value(op, ty, o, b); };
+    if (atomics_lock_free(env_.threads) && (es == 2 ? exec::atomic_rmw16(mem_, a, step, &found) : mem_.atomic_rmw(a, es, step, &found, true))) {   // (as the warp's atomics: the CPU's swap)
       ++blk.st.atomics;
       blk.st.atomic_bytes += es;
       return;

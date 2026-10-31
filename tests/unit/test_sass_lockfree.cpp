@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "vgpu/exec/host_atomic.hpp"
 #include "vgpu/exec/sass_atomics.hpp"
 #include "vgpu/memory.hpp"
 #include "vtest.hpp"
@@ -251,6 +252,31 @@ VTEST(the_commutative_operations_from_many_threads_leave_the_serial_result) {
             }
         for (unsigned k = 0; k < nwords; ++k) VCHECK_EQ(mm.load_scalar(p + n * k, n), want[k]);
       }
+}
+
+VTEST(two_byte_atomics_are_atomic_against_four_byte_ones_on_the_same_word) {
+  // Threads add 1 to the low half of each word with atomic_rmw16 (the 2-byte road) and others add 0x10000 to the whole word with a
+  // 4-byte swap: both counts must come out exact, which a plain 16-bit store beside a 4-byte swap cannot do. Also the high half by
+  // atomic_rmw16, and a word in an untouched chunk.
+  MemoryManager mm(1ull << 28);
+  const uint64_t p = mm.alloc(4096);
+  const unsigned kWords = 8, kIters = 20000, kLo = 3, kHi = 3, kWide = 3;
+  run_threads(kLo + kHi + kWide, [&](unsigned t) {
+    for (unsigned i = 0; i < kIters; ++i)
+      for (unsigned k = 0; k < kWords; ++k) {
+        uint64_t old = 0;
+        bool ok;
+        if (t < kLo) ok = vgpu::exec::atomic_rmw16(mm, p + 4 * k, [](uint64_t v) { return (v + 1) & 0xffff; }, &old);
+        else if (t < kLo + kHi) ok = vgpu::exec::atomic_rmw16(mm, p + 4 * k + 2, [](uint64_t v) { return (v + 1) & 0xffff; }, &old);
+        else ok = mm.atomic_rmw(p + 4 * k, 4, [](uint64_t v) { return (v + 0x10000) & 0xffffffffull; }, &old, true);
+        if (!ok) throw std::runtime_error("declined");
+      }
+  });
+  const uint64_t lo = uint64_t{kLo} * kIters & 0xffff, hi = (uint64_t{kHi} * kIters + uint64_t{kWide} * kIters) & 0xffff;
+  for (unsigned k = 0; k < kWords; ++k) VCHECK_EQ(mm.load_scalar(p + 4 * k, 4), (hi << 16) | lo);
+  uint64_t old = 7;
+  VCHECK(!vgpu::exec::atomic_rmw16(mm, p + 1, [](uint64_t v) { return v; }, &old));   // misaligned: declined
+  VCHECK_EQ(old, 7u);
 }
 
 VTEST_MAIN

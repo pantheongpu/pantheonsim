@@ -13926,10 +13926,11 @@ class Interpreter {
       std::memcpy(&b, src + off, es);
       // Where blocks run on several threads, plain device memory takes the CPU's compare-and-swap (MemoryManager::atomic_rmw), as the
       // warp's atomics do; it declines wherever the locked form could differ, and that form goes on as before.
-      if (concurrent_ && lock_free_atomics_.load(std::memory_order_relaxed) && (es == 4 || es == 8)) {
+      if (concurrent_ && lock_free_atomics_.load(std::memory_order_relaxed) && (es == 2 || es == 4 || es == 8)) {
         uint64_t found = 0;
         try {
-          if (mem_.atomic_rmw(addr + off, es, [&](uint64_t o) { return reduce_value(op, ty, o, b); }, &found, true)) continue;
+          const auto step = [&](uint64_t o) { return reduce_value(op, ty, o, b); };
+          if (es == 2 ? atomic_rmw16(mem_, addr + off, step, &found) : mem_.atomic_rmw(addr + off, es, step, &found, true)) continue;
         } catch (const Error& e) {
           rethrow_with_context(e, ins, lane);
         }
@@ -14938,6 +14939,8 @@ class Interpreter {
     // treats differently (an address that is shared, local or host memory, a misaligned one, a fault armed), and the loop runs.
     // (Where blocks run on several threads the batch is the CPU's compare-and-swap on each word, for 4 and 8 bytes: no lock.)
     const bool lock_free = lock_needed && (size == 4 || size == 8) && lock_free_atomics_.load(std::memory_order_relaxed);
+    // (A 2-byte atomic is a swap on its 32-bit word, so it excludes the 4-byte atomics on that word: exec::atomic_rmw16.)
+    const bool sub_free = lock_needed && size == 2 && lock_free_atomics_.load(std::memory_order_relaxed);
     if (fast_enabled_ && (!lock_needed || lock_free) && (op.space == Space::Global || op.space == Space::Generic)) {
       uint64_t addrs[kMaxWarpSize], olds[kMaxWarpSize];
       uint32_t lane_of[kMaxWarpSize];
@@ -14977,12 +14980,12 @@ class Interpreter {
       if (m & (Mask{1} << lane)) {
         uint64_t addr = sbase + base[lane] + static_cast<uint64_t>(op.addr.offset);
         auto compute = [&](const uint64_t old) -> uint64_t { return compute_lane(lane, old); };
-        if (lock_free) {   // (as the batch above: one word's swap, declining wherever the locked form could differ)
+        if (lock_free || sub_free) {   // (as the batch above: one word's swap, declining wherever the locked form could differ)
           uint64_t found = 0;
           bool in_compute = false;
+          const auto timed = [&](uint64_t old) { in_compute = true; const uint64_t nv = compute(old); in_compute = false; return nv; };
           try {
-            if (mem_.atomic_rmw(addr, size, [&](uint64_t old) { in_compute = true; const uint64_t nv = compute(old); in_compute = false; return nv; },
-                                &found, true)) {
+            if (sub_free ? exec::atomic_rmw16(mem_, addr, timed, &found) : mem_.atomic_rmw(addr, size, timed, &found, true)) {
               ++stats_.atomics;
               stats_.atomic_bytes += size;
               r[lane] = found;
