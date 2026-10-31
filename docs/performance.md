@@ -5625,3 +5625,59 @@ The verdict file of #438 (`src/sass/ok_cache.{hpp,cpp}`) shipped opt-in. Before 
   65,536 keys: a full file is read and not appended to, 65,535 takes one more, a longer file is read up to the cap only.
 * The default: `VGPU_SASS_CACHE=0` turns it off, anything else or unset is on (a build without a GNU build id, or with no absolute `XDG_CACHE_HOME` / `HOME`, has no file as before). Files of old builds stay in `~/.cache/pantheonsim` (at most 1 MB each, a few KB in practice) and can be deleted any time.
 * Not testable on hosted CI: a real `ENOSPC` (the test uses `RLIMIT_FSIZE`, which gives the same short write and then `EFBIG`) and a file owned by another user (the test interposes `geteuid`).
+
+## Round sp12: shared-memory loads and stores of the tier (branch `sp12-shared`, base 2c68075d = `sp11-tensor-pr`)
+
+Where the time went (perf `cycles:u`, one host thread, server3 Zen 4, A = 2c68075d; shares of the program's samples): `h_shared` is 24% of Samples convolutionSeparable (28% of that on one
+instruction: the per-lane 4-byte load loop), 25% of sortingNetworks (`rep stos` 5 to 10% of those: the 256-byte `addrs[]` zeroing of every partial-warp access), 13% of Rodinia lud, 8.6% of
+transpose. `step_warp` is 17% of transpose, 8% of convolutionSeparable, but spread over the dispatch of the tier loop (the largest single instruction is 6%): nothing to fix there.
+
+### What changed
+* `h_shared` works out the 32 offsets as 32-bit words for every lane mask (a lane that does not run reads its register and is left out of the checks) and never zeroes the 64-bit address array: it
+  is filled only where it is used, after the contiguous and one-word cases have returned (`tier_widen_offsets`: the active lanes' offsets, zero elsewhere, as before).
+* The window check is `exec::shared_window_inside_warp` (include/vgpu/exec/window_check.hpp): rank bits and `size - bytes - offset` negative-or-not, ORed over the active lanes, in one SSE2 pass.
+  SSE2 has no unsigned 32-bit maximum, so the earlier `add_warp` maximum was emulated with ten instructions a vector. Same answer as `SharedWindowCheck` (compared in test_memcount_forms).
+* The contiguous / one-word test of a full warp of words is 32-bit (it vectors) instead of 64-bit scalar.
+* A full warp of 4-byte accesses that is neither one run of 32 words nor one word (`tier_shared_words`): each group of eight lanes whose offsets are eight consecutive words moves as 32 bytes
+  (two vector copies), the other groups lane by lane. Tile rows of 8, 16 and 32 words, two rows in one warp. The groups run in order, so two lanes on one word still end with the later lane's value.
+
+### Results (A = 2c68075d, B = branch; same bits: outputs identical, counters identical in every canary row)
+Zen 5 (server2, Ryzen 9 9950X, cpu 16, `real.py`, 7 runs, median wall s; A/A of the same window 0.97x to 1.06x, the 1.06x being convolutionSeparable, the other rows 0.99x to 1.01x):
+| program | A s | B s | A/B |
+|---|---:|---:|---:|
+| Samples convolutionSeparable | 11.70 | 10.06 | 1.16x |
+| Samples sortingNetworks | 17.23 | 14.77 | 1.17x |
+| Samples transpose | 7.77 | 6.79 | 1.14x |
+| Rodinia lud | 1.87 | 1.70 | 1.10x |
+| Samples mergeSort | 7.84 | 7.25 | 1.08x |
+| Samples dct8x8 | 0.86 | 0.80 | 1.08x |
+| Rodinia hotspot | 1.15 | 1.09 | 1.05x |
+| Samples histogram, reduction | 15.36 / 8.10 | 15.43 / 8.14 | 1.00x, 1.00x |
+(The first commit alone, before the group copy: convolutionSeparable 1.07x, sortingNetworks 1.12x, lud 1.07x, transpose 1.04x, mergeSort 1.08x.)
+
+Zen 4 (server3, cpu 2, `perf stat` user cycles and instructions of the whole program, 3 runs each, the box at load 14 to 35; instructions are exact):
+| program | A cycles | B cycles | B/A | A instructions | B instructions |
+|---|---:|---:|---:|---:|---:|
+| convolutionSeparable | 74.9 / 71.8 / 72.7 G | 65.6 / 65.0 / 64.9 G | 0.90 | 322.8 G | 295.0 G |
+| sortingNetworks | 93.5 / 92.5 / 92.7 G | 83.9 / 83.3 / 84.9 G | 0.905 | 320.0 G | 312.0 G |
+| lud | 16.7 / 16.8 / 16.6 G | 15.7 / 15.7 / 15.7 G | 0.94 | 39.84 G | 36.91 G |
+| transpose | 47.3 / 46.0 / 46.4 G | 44.1 / 44.4 / 44.4 G | 0.955 | 190.5 G | 184.5 G |
+
+bench.py canaries (12 workloads, SASS and PTX, 15 runs, Zen 5; counters identical in all 24 rows; A/A in the same window all within 0.99x to 1.01x): `shared` SASS 1.08x, `mem` SASS 1.03x to 1.06x,
+others 0.99x to 1.02x, except `api` 0.98x (both engines; the api path does not touch the changed code, so this is code placement after the relink; it did not move with the next variant, and
+`launch` is 0.99x to 1.01x). Placement lesson again: the first version, with the group copy inlined into `h_shared`, cost `atomics` SASS 0.914x (p<0.001) and `mem` PTX 0.959x, `mma_ptx` SASS 0.966x
+at equal instructions; making the group copy a `noinline` function brought them to 1.00x. Making `tier_widen_offsets` `noinline` too halved the `shared` gain (1.08x to 1.04x) and was dropped.
+
+### Tests (CMake-wired) and the mutations that fail them
+* `test_memcount_forms`: `shared_window_inside_warp` against the per-lane window test over 400 000 random warps and masks, and at its edges (last byte in and out, sizes under the access and over the
+  clamp, rank bits, one lane, all but one lane). Mutations: limit one too high; the active mask ignored. Both fail `window_checks_equal_the_per_lane_tests`.
+* `test_sass_dispatch`: the whole-warp shared shapes now run in warps of 32, 64, 33, 5 and 19 threads (a partial warp), with four more shapes (rows of eight words with a gap; the same two bytes into
+  a word; runs of four words only; four rows on the same eight words), and every kernel reads the words back in order (a store and a load that agree on a wrong place hid a wrong group copy). All
+  60 shared-memory digests were recorded from the base tree (2c68075d) with only the test changed. Mutations: only the first half of a group checked; the second half of a group loaded from the wrong
+  place; the second half stored wrong; the widened addresses taken from the high halves. Each fails `shared_memory_of_a_whole_warp_...`.
+* Not done: ASan/UBSan of the touched tests is recorded under the branch commit message if it finished on server3 (see the report); TSan: no threaded or atomic code was touched.
+
+### Not done, and negative results
+* An AVX2 gather for the strided 4-byte loads: the per-lane loop is 2 loads and 1 store per lane (about 32 cycles a warp) and a Zen 4 `vpgatherdd` is about 9 cycles per eight lanes: no gain expected, not tried.
+* `step_warp` / `fetch`: flat (largest instruction 6% of the function); nothing structural. `sass_bank_passes_memo` (12 to 22% of convolutionSeparable and sortingNetworks) is the next cost there.
+* 8- and 16-byte whole-warp accesses still go lane by lane (`LDS.64/.128` are rare in these programs).
