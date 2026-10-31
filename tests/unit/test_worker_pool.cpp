@@ -246,4 +246,34 @@ VTEST(a_fork_child_gets_a_working_pool_of_its_own) {
 }
 #endif
 
+VTEST(the_cap_keeps_small_launches_on_few_threads) {
+  using vgpu::exec::cap_threads;
+  const uint64_t kMin = 100'000;   // 100 us of work per thread
+  // Nothing known, a request of one, or the cap off: the request stands.
+  VCHECK_EQ(cap_threads(8, 64, 0, kMin), 8u);
+  VCHECK_EQ(cap_threads(1, 64, 5000, kMin), 1u);
+  VCHECK_EQ(cap_threads(8, 64, 5000, 0), 8u);
+  // 64 blocks of 234 ns (a 15 us launch): one thread.
+  VCHECK_EQ(cap_threads(8, 64, 234, kMin), 1u);
+  VCHECK_EQ(cap_threads(16, 64, 234, kMin), 1u);
+  // Just under, at and over two threads' worth, and four.
+  VCHECK_EQ(cap_threads(8, 100, 1999, kMin), 1u);
+  VCHECK_EQ(cap_threads(8, 100, 2000, kMin), 2u);
+  VCHECK_EQ(cap_threads(8, 100, 4000, kMin), 4u);
+  // Never above the request, however large the grid.
+  VCHECK_EQ(cap_threads(4, 1u << 20, 100000, kMin), 4u);
+  VCHECK_EQ(cap_threads(8, UINT64_MAX, UINT64_MAX, kMin), 8u);
+  VCHECK_EQ(cap_threads(2, 1, 1000000, kMin), 2u);
+}
+
+VTEST(the_unit_cost_is_exact_on_one_thread_and_averaged_otherwise) {
+  using vgpu::exec::blend_unit_cost;
+  VCHECK_EQ(blend_unit_cost(0, 64, 1, 15000), uint64_t{234});
+  VCHECK_EQ(blend_unit_cost(999999, 64, 1, 6400), uint64_t{100});      // one thread replaces
+  VCHECK_EQ(blend_unit_cost(0, 64, 8, 53000), uint64_t{6625});         // nothing known: the sample
+  VCHECK_EQ(blend_unit_cost(1000, 100, 4, 50000), uint64_t{1500});     // (1000 + 2000) / 2
+  VCHECK_EQ(blend_unit_cost(77, 0, 4, 50000), uint64_t{77});           // no blocks: unchanged
+  VCHECK(blend_unit_cost(0, 1u << 30, 1, 1) >= 1);                      // never zero (zero means unknown)
+}
+
 VTEST_MAIN

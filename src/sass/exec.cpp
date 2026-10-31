@@ -721,6 +721,11 @@ class Runner {
   std::atomic<uint64_t> next_unit_{0};
   uint64_t units_ = 0;
   exec::LaunchStats stats_;
+  // Adds one thread's counters to the launch's (out of line: the one-thread path never calls it).
+  [[gnu::noinline]] void merge_stats(const exec::LaunchStats& mine) {
+    std::lock_guard<std::mutex> g(stats_mu_);
+    stats_.add(mine);
+  }
   std::mutex stats_mu_;
   Launches* dl_ = nullptr;   // where device-side launches go (dynamic parallelism)
   std::map<uint64_t, size_t> kernel_by_code_;
@@ -1384,8 +1389,49 @@ exec::LaunchStats Runner::run() {
     solo = true;
     worker(0);
   } else {
-    // The host threads are the pool's (vgpu/exec/worker_pool.hpp), parked between launches.
-    exec::run_parallel(threads, worker);
+    // A small grid keeps to few threads (vgpu/exec/worker_pool.hpp, LaunchWidth); blocks run the same on any.
+    exec::LaunchWidth width(&k_, units, threads);
+    if (threads <= 1) {
+      solo = true;
+      worker(0);
+    } else {
+      // The same loop as `worker` for several threads, apart from it so that the one-thread loop stays as it was. A lock
+      // per block (the failure check, the counters) costs more than a small block does, so each thread keeps its own sum of
+      // its blocks' counters and adds it to the launch's once, when it leaves (integer sums: their order changes nothing),
+      // and a failure is announced by a flag that is read without the lock.
+      std::atomic<bool> failed{false};
+      const auto worker_mt = [&](unsigned t) __attribute__((noinline)) {
+        PooledBlock held;
+        Block& blk = *held.block;
+        exec::LaunchStats mine;
+        struct Merge {
+          Runner& r;
+          exec::LaunchStats& mine;
+          ~Merge() { r.merge_stats(mine); }
+        } merge{*this, mine};
+        for (;;) {
+          const uint64_t i = next.fetch_add(1);
+          if (i >= units || failed.load(std::memory_order_relaxed)) return;
+          try {
+            if (clustered_) {
+              run_cluster(i, t);
+              continue;
+            }
+            init_block(blk, i);
+            blk.worker = t;
+            run_block(blk);
+            mine.add(blk.st);
+          } catch (...) {
+            std::lock_guard<std::mutex> g(fail_mu);
+            if (!failure) failure = std::current_exception();
+            failed.store(true, std::memory_order_relaxed);
+            return;
+          }
+        }
+      };
+      // The host threads are the pool's (vgpu/exec/worker_pool.hpp), parked between launches.
+      exec::run_parallel(threads, worker_mt);
+    }
   }
   if (failure) std::rethrow_exception(failure);
   stats_.blocks = blocks;
