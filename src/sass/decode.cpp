@@ -1794,14 +1794,15 @@ void dec_viadd(Instr& ins, const Word& w) {
   const unsigned mode = static_cast<unsigned>(w.field(73, 3));
   static const char* const kModes[] = {"", "16x2", "S32", "S16x2", "U8x4", "S8x4", "(6)", "(7)"};
   if (ins.sm >= 120 && *kModes[mode]) ins.mods.push_back(kModes[mode]);
-  else if (ins.sm < 120) {   // before sm_120: S32 and the byte forms only
+  else if (ins.sm < 120) {   // before sm_120: S32, the byte forms and (add.u16x2 / add.s16x2) .16x2
     if (lanes == 1) ins.mods.push_back("S32");
     if (lanes == 2) ins.mods.push_back(w.bit(73) ? "S8x4" : "U8x4");
+    if (lanes == 0 && w.bit(73)) ins.mods.push_back("16x2");
   }
   if (w.bit(80)) ins.mods.push_back("ISAT");
   ins.f[0] = lanes;
   ins.f[1] = w.bit(80);
-  ins.f[2] = ins.sm >= 120 ? mode : (lanes == 1 ? 2 : lanes == 2 ? 4 + w.bit(73) : 0);
+  ins.f[2] = ins.sm >= 120 ? mode : (lanes == 1 ? 2 : lanes == 2 ? 4 + w.bit(73) : lanes == 0 && w.bit(73) ? 1 : 0);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   alu2(ins, w, kUnsigned);
   int_neg(ins.src[1], w);
@@ -1811,7 +1812,9 @@ void dec_viadd(Instr& ins, const Word& w) {
 void dec_vimnmx(Instr& ins, const Word& w, int nsrc, bool add) {
   ins.op = add ? Op::VIADDMNMX : nsrc == 3 ? Op::VIMNMX3 : Op::VIMNMX;
   ins.mnemonic = add ? "VIADDMNMX" : nsrc == 3 ? "VIMNMX3" : "VIMNMX";
-  const bool s16x2 = !add && w.bit(73);   // per 16-bit half
+  // Per 16-bit half: VIMNMX, VIMNMX3 and, with the add first, VIADDMNMX (__viaddmax_s16x2,
+  // __viaddmin_u16x2 ...; nvdisasm prints VIADDMNMX.S16x2[.RELU] and VIADDMNMX.U16x2).
+  const bool s16x2 = w.bit(73);
   const bool u8x4 = !add && w.bit(74);    // per byte (sm_120)
   if (s16x2) ins.mods.push_back(w.bit(72) ? "S16x2" : "U16x2");
   else if (u8x4) ins.mods.push_back(w.bit(72) ? "S8x4" : "U8x4");
@@ -1823,6 +1826,13 @@ void dec_vimnmx(Instr& ins, const Word& w, int nsrc, bool add) {
   ins.f[2] = w.bit(76);
   ins.dst.push_back(dst_reg(w, false, ins.sm));
   if (ins.sm >= 100 && ins.sm < 120 && !add && nsrc == 2) {   // sm_100 prints two predicate results (PT so far)
+    ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
+    ins.dst.push_back(P(static_cast<unsigned>(w.field(84, 3))));
+  } else if (ins.sm >= 90 && ins.sm < 100 && s16x2 && !add && nsrc == 2 &&
+             (w.field(81, 3) != 7 || w.field(84, 3) != 7)) {
+    // sm_90: the packed min/max also says, per half, which operand it chose -- true for the low half in the
+    // first predicate, the high half in the second: a >= b for a maximum, a <= b for a minimum. This is what
+    // __vibmax_s16x2 and __vibmin_u16x2 return through their pred_lo and pred_hi. PT discards one.
     ins.dst.push_back(P(static_cast<unsigned>(w.field(81, 3))));
     ins.dst.push_back(P(static_cast<unsigned>(w.field(84, 3))));
   }

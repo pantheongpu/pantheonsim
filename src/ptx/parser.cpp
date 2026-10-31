@@ -4313,7 +4313,7 @@ class Parser {
       const std::string base_op = carry_in ? op0.substr(0, 3) : op0;
       bool carry_out = false;
       bool nan_propagate = false;
-      bool sat = false, xorsign_abs = false, ftz = false;
+      bool sat = false, xorsign_abs = false, ftz = false, relu = false;
       bool wide = false, lo = false, hi = false;
       FRound frnd = FRound::Nearest;
       bool frnd_explicit = false;
@@ -4348,12 +4348,41 @@ class Parser {
         else if (p == "xorsign" || p == "abs") xorsign_abs = true;
         // .sat clamps: floats into [0,1], add/sub.s32 into the s32 range.
         else if (p == "sat") sat = true;
+        // min/max{.relu}.s32 (PTX ISA 8.0, sm_90): the result, or 0 when it is negative.
+        // Either order of the type and .relu is accepted, as ptxas does (NVIDIA's own
+        // __vimax_s32_relu writes max.s32.relu).
+        else if (p == "relu") relu = true;
         else if (auto t2 = parse_type_token(p)) {
           ty = *t2;
           have_ty = true;
         } else return unsupported("unrecognized modifier '." + p + "'");
       }
       if (!have_ty) fail(ins.line, opcode + " missing type");
+      if (relu) {
+        if ((base_op != "min" && base_op != "max") || ty.is_float() || !ty.is_signed() || ty.bits != 32)
+          return unsupported(".relu is for min and max on .s32 and the packed .s16x2");
+        int sm = 0;
+        std::sscanf(target_.c_str(), "sm_%d", &sm);
+        if (sm < 90)
+          fail(ins.line, opcode + " requires an sm_90 or later target; this module targets " +
+                             (target_.empty() ? std::string("nothing") : target_));
+        // A one-lane packed minimum or maximum: the executor's packed integer path.
+        OpPackedInt op;
+        op.kind = base_op == "min" ? PackedIntOp::Min : PackedIntOp::Max;
+        op.lane_bits = 32;
+        op.is_signed = true;
+        op.relu = true;
+        op.dst = expect_reg_operand("destination");
+        expect_punct(",");
+        op.a = parse_operand();
+        expect_punct(",");
+        op.b = parse_operand();
+        ins.op = std::move(op);
+        expect_punct(";");
+        ins.text = reconstruct_from(start_tok);
+        ins.opcode_id = intern_opcode(parts[0]);
+        return ins;
+      }
       if (xorsign_abs && (!ty.is_float() || (base_op != "min" && base_op != "max")))
         return unsupported(".xorsign.abs is a modifier of float min and max");
       if (sat && ty.is_float() ? (ty.bits != 32 || (base_op != "add" && base_op != "sub" && base_op != "mul"))

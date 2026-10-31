@@ -277,7 +277,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "cs2r", "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "iabs", "ldc",
-                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma", "atom", "fchk", "call", "ret", "warpsync", "ldgsts", "ld", "st"};
+                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma", "atom", "fchk", "call", "ret", "warpsync", "ldgsts", "ld", "st", "cvt64", "fltinterp"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -359,6 +359,8 @@ const FormImpl& form_impl(Form f) {
       {Impl::Own, "LDGSTS: a copy of bytes, no number format; the addresses, faults and the slow cases are exec_mem's, the counters mem_counters'"},
       {Impl::Own, "LD: generic addresses told apart by window; shared moves as LDS, global as LDG; the rest is exec_mem's"},
       {Impl::Own, "ST: as LD"},
+      {Impl::Kernel, "f2f_widen, f2f_narrow, i2d (the kernels Runner::fast_float calls; a directed rounding mode is the host's around f2f_narrow)"},
+      {Impl::Interp, "F2F, I2F and MUFU.RCP64H/RSQ64H that cvt64 and the f32 forms leave: fast_float, then exec_float (Interp)"},
   };
   static_assert(sizeof table / sizeof table[0] == static_cast<size_t>(Form::Count_), "form_impl: one entry per Form");
   const unsigned i = static_cast<unsigned>(f);
@@ -448,7 +450,7 @@ bool pure_register_form(Form f) {
   switch (f) {
     case Form::Mov: case Form::Iadd3: case Form::Iadd3x: case Form::Imad: case Form::Imad32: case Form::ImadWide: case Form::ImadHi:
     case Form::IsetpEx: case Form::Popc: case Form::I2fp: case Form::Lop3: case Form::Lea: case Form::Shf: case Form::Isetp:
-    case Form::Fsetp: case Form::Fsel: case Form::Ffma: case Form::Fadd: case Form::Fmul: case Form::Dop: case Form::Prmt:
+    case Form::Fsetp: case Form::Fsel: case Form::Ffma: case Form::Fadd: case Form::Fmul: case Form::Dop: case Form::Prmt: case Form::Cvt64: case Form::FltInterp:
     case Form::Imnmx: case Form::Fmnmx: case Form::Mufu: case Form::F2i: case Form::I2f: case Form::F2fp: case Form::Dsetp:
     case Form::Hop2: case Form::Unary: case Form::Iabs: case Form::Umov: case Form::Uldc: case Form::Uiadd3: case Form::Uimad:
     case Form::Uisetp: case Form::Ulea: case Form::Ulop3: case Form::Ushf: case Form::Uunary: case Form::Usel:
@@ -477,6 +479,25 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
     m.form = f;
     m.maxreg = maxreg;
     op = m;
+  };
+  // FltInterp: the interpreter runs the instruction, so the op only claims the registers its operands name (the warp's file must hold them).
+  const auto interp_regs = [&]() {
+    const auto claim = [&](const Operand& o, unsigned width) {
+      if (o.kind == Kind::Reg && o.reg != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(std::min<unsigned>(o.reg + width, kRZ)));
+    };
+    claim(ins.dst[0], std::max<unsigned>(ins.dst[0].width, 1u));
+    if (!ins.src.empty()) claim(ins.src[0], std::max<unsigned>(ins.src[0].width, 1u));
+    m.dst = ins.dst[0].reg == kRZ ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+  };
+  // A destination register pair (a double): the row of the low word, or kNoReg for RZ; R254's partner is RZ.
+  const auto pair_dst = [&](const Operand& d) {
+    if (d.reg == kRZ) {
+      m.dst = kNoReg;
+      return true;
+    }
+    m.dst = static_cast<uint16_t>(d.reg);
+    maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(d.reg + 1 == kRZ ? d.reg + 1 : d.reg + 2));
+    return true;
   };
 
   // Memory instructions: stores have no destination, so these come before the check below.
@@ -1318,7 +1339,14 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
     }
     case Op::MUFU: {   // RCP, RSQ, SQRT as SIMD kernels; the others in libm, as fast_float does them
       const unsigned fn = ins.f[0];
-      if (ins.guard_uniform || fn == 6 || fn == 7 || fn > 9 || ins.src.empty() || !plain_kind(ins.src[0]) || ins.src[0].bnot) return;
+      if (ins.guard_uniform || fn > 9 || ins.src.empty() || !plain_kind(ins.src[0]) || ins.src[0].bnot || ins.dst.empty() ||
+          ins.dst[0].kind != Kind::Reg)
+        return;
+      if (fn == 6 || fn == 7) {   // RCP64H, RSQ64H: the high word of a double's reciprocal (root): the interpreter's own code
+        interp_regs();
+        accept(Form::FltInterp);
+        return;
+      }
       const Operand& o = ins.src[0];
       const bool simd_fn = fn == 4 || fn == 5 || fn == 8;
       // The SIMD kernels take |x| and -x applied; the libm ones flush first, so the source keeps its raw bits.
@@ -1338,15 +1366,50 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       accept(Form::F2i);
       return;
     }
-    case Op::I2F: {   // 8, 16 or 32 bits to f32, to nearest even
+    case Op::I2F: {   // 8, 16 or 32 bits to f32, to nearest even; a 32-bit integer to f64 (cvt64); the rest is the interpreter's
       const unsigned dsize = ins.f[0], ssize = ins.f[1];
-      if (ins.guard_uniform || dsize != 2 || ssize > 2 || ins.src.empty() || !plain_kind(ins.src[0])) return;
+      if (ins.guard_uniform || ins.src.empty() || ins.dst.empty() || ins.dst[0].kind != Kind::Reg) return;
+      if (dsize == 3 && ssize == 2 && plain_kind(ins.src[0])) {
+        if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg) || !pair_dst(ins.dst[0])) return;
+        m.a = ins.f[2] != 0 ? 3 : 2;   // signed or unsigned: i2d
+        accept(Form::Cvt64);
+        return;
+      }
+      if (dsize != 2 || ssize > 2 || !plain_kind(ins.src[0])) {
+        interp_regs();
+        accept(Form::FltInterp);
+        return;
+      }
       if (!src32(b, ins.src[0], Dom::Plain, m.s[0], maxreg) || !reg_dst(ins.dst[0], m.dst, maxreg)) return;
       m.a = ssize;
       m.c = ins.f[2] != 0;   // signed
       m.b = ssize == 2 ? 0u : (ssize == 1 ? 16u : 8u) * ins.f[4];   // the byte or half moved down
       m.aux = static_cast<uint8_t>(ins.f[3]);   // a directed rounding mode: the general rule's scalar conversion under the host's
       accept(Form::I2f);
+      return;
+    }
+    case Op::F2F: {   // f32 to f64 and f64 to f32 as SIMD kernels; the 16-bit floats and the rest are the interpreter's
+      const unsigned dsize = ins.f[0], ssize = ins.f[1];
+      if (ins.guard_uniform || ins.src.empty() || ins.dst.empty() || ins.dst[0].kind != Kind::Reg) return;
+      const Operand& o = ins.src[0];
+      if (dsize == 3 && ssize == 2 && plain_kind(o)) {
+        if (!src32(b, o, Dom::Plain, m.s[0], maxreg) || !pair_dst(ins.dst[0])) return;
+        m.a = 0;
+        m.b = (o.abs ? 1u : 0u) | (o.neg ? 2u : 0u);   // |x| and -x are the kernel's: a NaN keeps the register's sign and payload
+        accept(Form::Cvt64);
+        return;
+      }
+      if (dsize == 2 && ssize == 3 && ((o.kind == Kind::Reg && o.reg != kRZ) || o.kind == Kind::CBank || o.kind == Kind::UReg)) {
+        uint32_t mods = 0;
+        if (!src64(b, o, 0, m.s[0], mods, maxreg, /*kernel_mods=*/true) || !reg_dst(ins.dst[0], m.dst, maxreg)) return;
+        m.a = 1;
+        m.b = mods & 3u;
+        m.c = ins.f[3];   // the rounding mode: the host's, around the kernel
+        accept(Form::Cvt64);
+        return;
+      }
+      interp_regs();
+      accept(Form::FltInterp);
       return;
     }
     case Op::F2FP: {   // two f32 into f16 or bf16 halves
