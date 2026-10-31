@@ -54,9 +54,11 @@ std::string pick_cubin(const void* fatbin, uint32_t cc) {
       why = e.message();
     }
     if (!why.empty()) {
+      // PTX this device can JIT, that is: a fatbin whose only PTX is for a newer architecture (an sm_80 build
+      // that also embeds compute_90) has nothing to fall back on here, and the SASS runs.
       bool has_ptx = false;
       try {
-        has_ptx = !extract_ptx(fatbin).empty();
+        for (const FatbinPtx& p : extract_ptx(fatbin)) has_ptx = has_ptx || ptx_runs_on(p, cc);
       } catch (const Error&) {
       }
       if (has_ptx) {
