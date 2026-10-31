@@ -322,8 +322,8 @@ void shape(std::vector<Insn>& c, unsigned r, uint32_t and_m, uint32_t or_m, int 
 }
 // A word that differs from lane to lane and from register to register without much structure.
 void scramble(std::vector<Insn>& c, unsigned r, uint32_t k) {
-  c.push_back(imadi(r, 0, (k * 0x9e3779b1u) | 1u, kRZ));
-  c.push_back(iadd3i(r, r, k * 0x85ebca6bu + 7, 0));
+  c.push_back(imadi(r, 0, ((k * 0x9e3779b1u) | 1u) & 0x7fffffffu, kRZ));
+  c.push_back(iadd3i(r, r, (k * 0x85ebca6bu + 7) & 0x7fffffffu, 0));
   c.push_back(imad(r, r, r, 0));
   c.push_back(shf_li(10, r, 13));
   c.push_back(lop3(r, r, 10, kRZ, 0x96));

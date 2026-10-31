@@ -480,6 +480,15 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
     m.maxreg = maxreg;
     op = m;
   };
+  // FltInterp: the interpreter runs the instruction, so the op only claims the registers its operands name (the warp's file must hold them).
+  const auto interp_regs = [&]() {
+    const auto claim = [&](const Operand& o, unsigned width) {
+      if (o.kind == Kind::Reg && o.reg != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(std::min<unsigned>(o.reg + width, kRZ)));
+    };
+    claim(ins.dst[0], std::max<unsigned>(ins.dst[0].width, 1u));
+    if (!ins.src.empty()) claim(ins.src[0], std::max<unsigned>(ins.src[0].width, 1u));
+    m.dst = ins.dst[0].reg == kRZ ? kNoReg : static_cast<uint16_t>(ins.dst[0].reg);
+  };
   // A destination register pair (a double): the row of the low word, or kNoReg for RZ; R254's partner is RZ.
   const auto pair_dst = [&](const Operand& d) {
     if (d.reg == kRZ) {
@@ -1334,6 +1343,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
           ins.dst[0].kind != Kind::Reg)
         return;
       if (fn == 6 || fn == 7) {   // RCP64H, RSQ64H: the high word of a double's reciprocal (root): the interpreter's own code
+        interp_regs();
         accept(Form::FltInterp);
         return;
       }
@@ -1366,6 +1376,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
         return;
       }
       if (dsize != 2 || ssize > 2 || !plain_kind(ins.src[0])) {
+        interp_regs();
         accept(Form::FltInterp);
         return;
       }
@@ -1397,6 +1408,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
         accept(Form::Cvt64);
         return;
       }
+      interp_regs();
       accept(Form::FltInterp);
       return;
     }
