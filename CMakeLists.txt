@@ -284,7 +284,10 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   # The AMD interpreter's floor, ceil, trunc and rint are libm's: GCC expands them in line (and so leaves a signaling NaN
   # as it is, where roundss and libm quiet it) in the places its heuristics call hot, which moved when the instruction
   # ladders became switches (s_trunc_f32 of a signaling NaN, amd/tests/unit/test_gcn_same_bits.cpp).
-  set_source_files_properties(amd/src/gcn_exec.cpp PROPERTIES COMPILE_OPTIONS "-fno-fp-int-builtin-inexact")
+  # -falign-loops=32: the matrix tile kernels' loops (mfma_math.hpp) were 4 to 11 % slower on a Zen 5 host (bf16 and f16 mfma) in the layout
+  # that came with unrelated code ahead of them in the library, at equal instruction counts; with their loops on a fixed alignment the layout stops
+  # mattering (docs/performance.md, Round sp12 AMD).
+  set_source_files_properties(amd/src/gcn_exec.cpp PROPERTIES COMPILE_OPTIONS "-fno-fp-int-builtin-inexact;-falign-loops=32")
 endif()
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 target_link_libraries(vgpu PUBLIC ${CMAKE_DL_LIBS})

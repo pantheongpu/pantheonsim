@@ -11223,7 +11223,7 @@ struct Machine {
     return have;
   }
   template <char T, bool Run>
-  __attribute__((target("avx2,f16c"))) void matrix_decode_wide_avx2(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst, uint32_t lanes) {
+  __attribute__((target("avx2,f16c"), optimize("align-loops=64"))) void matrix_decode_wide_avx2(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst, uint32_t lanes) {
     // Element e of lanes l to l + 7, as two vectors of four doubles.
     const auto convert = [&](uint32_t e, uint32_t l, __m256d* lo, __m256d* hi) __attribute__((target("avx2,f16c"), always_inline)) {
       constexpr bool packed = T == 'h' || T == 'b';   // two to a register

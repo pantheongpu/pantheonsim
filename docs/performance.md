@@ -5625,3 +5625,47 @@ The verdict file of #438 (`src/sass/ok_cache.{hpp,cpp}`) shipped opt-in. Before 
   65,536 keys: a full file is read and not appended to, 65,535 takes one more, a longer file is read up to the cap only.
 * The default: `VGPU_SASS_CACHE=0` turns it off, anything else or unset is on (a build without a GNU build id, or with no absolute `XDG_CACHE_HOME` / `HOME`, has no file as before). Files of old builds stay in `~/.cache/pantheonsim` (at most 1 MB each, a few KB in practice) and can be deleted any time.
 * Not testable on hosted CI: a real `ENOSPC` (the test uses `RLIMIT_FSIZE`, which gives the same short write and then `EFBIG`) and a file owned by another user (the test interposes `geteuid`).
+
+## Round sp12: AMD matrix instructions after #439 (branch `sp12-amd`, base `sp11-tensor-pr`)
+
+The question: did the AMD engine slow down after #439, and is it real or layout. Builds: A0 = a6e80555 (before #439), C = 873dbc69 (#439), B = `sp11-tensor-pr`
+(2c68075d), E = B plus this change. `tools/bench-amd/bench.py`, one host thread, device-phase wave-instructions per CPU second, counters identical in every row.
+
+### What was measured
+
+* **Zen 4 (server3, cpu 4, 11 alternating runs, A0 against B)**: no regression. Every canary within 0.987 to 1.057 (`mfma_i8` 1.057, `mfma_f64_4b` 1.026 faster; `wave`
+  0.987, `lds` 0.993 the lowest). `perf stat` user cycles of the whole process, best of 5: `mfma` A0 932 M, B 947 M, E 921 M; `mfma_bf16` 854, 863, 846 M.
+* **Zen 5 (server2, Ryzen 9 9950X, cpu 24, 15 alternating runs, A0 against B)**: reproduces, so it is not a Zen 4 front-end effect. `mfma_bf16` 0.889 to 0.912, `mfma`
+  0.961 to 0.975, `smfmac` 0.977 to 0.987 (p < 0.01), `flat` 0.97; `valu_*`, `lds`, `divergent`, `mfma_f64`, `mfma_f64_4b`, `mfma_i8` within 3 %. The step A0 to C
+  (#439 alone) is about 3 % of that on `mfma_bf16`; C to B is the rest.
+* It is placement, not work: instructions retired are equal (B has 0.3 % fewer), cycles are higher, and every function of the matrix path got slower with identical
+  code (the tile kernel `mfma_tile_f_avx2` +7 %, the bf16 decode +40 % of its small share). Stack position (environment padding 0 to 4096 in 128-byte steps) and heap position
+  (an `LD_PRELOAD` allocation of 0 to 4096 bytes before start) were swept on Zen 5: B is 5 to 10 % behind A0 in every position, so the cause is the code, not the aliasing of the
+  tiles. (The heap sweep also found a cliff: with 2112 to 3136 bytes allocated first, `mfma_bf16` takes 1.8x as long for A0 and B alike, 0.25 s against 0.14 s. The tiles' stagger
+  (`TileBuf`) does not cover whatever aliases there; not investigated.)
+* The hot inner loops sit at different offsets in a 64-byte line in A0 and in B (the tile kernel's 116-byte loop at +0x20 and +0x30), because everything before them in the
+  library moved.
+
+### What changed
+
+`-falign-loops=32` for `amd/src/gcn_exec.cpp`, and `optimize("align-loops=64")` on `mfma_tile_f_avx2` and `matrix_decode_wide_avx2`. The loops of the matrix path now start at the same offset
+in a line whatever is linked ahead of them.
+
+| Zen 5, 15 runs, mi300x | E / A0 | E / B |
+| --- | ---: | ---: |
+| `mfma` | 0.996 (p 0.53) | 1.026 |
+| `mfma_bf16` | 0.988 (p 0.18) | 1.061 |
+| `mfma_f64`, `smfmac`, `valu_*`, `lds`, `divergent`, `launch`, `api` | 0.985 to 1.023, all within the A/A spread | |
+| `mfma_f64_4b` | 0.971 (p 0.02) | 0.959 |
+| `mfma_i8` | 0.965 (p < 0.001) | 0.938 |
+
+Zen 4 A0 against E (11 runs, load 5 from other sessions): every canary within 0.947 to 1.056, no row slower at p < 0.05 (`smem` 1.051 and `lds` 0.986 are the only two below 0.05); best-of-5 cycles lower than A0 and B on all four matrix rows.
+
+### Not done, and negative results
+
+* `mfma_i8` (-4 to -6 % against A0 and B on Zen 5, +5 % on Zen 4) and `mfma_f64_4b` (-3 %) stay behind on Zen 5. Aligning every loop to 64 bytes (`-falign-loops=64`) was no better than 32;
+  moving the `std::vector<int>::resize` calls of the integer path behind a size test (`fit_size`) took the bf16 and `mfma` gains away again (0.937, 0.961): the layout changes with
+  any edit, which is why this is a compile flag and not another function. A deterministic fix is to put the tile kernels in their own `-fno-lto` unit, as `gcn_tier_ds.cpp` is; not done.
+* The effect is a property of one host (Zen 5) and of the library's layout at one commit: re-run `mfma`, `mfma_bf16`, `mfma_i8` on a Zen 5 host after any large AMD change.
+* No test can fail for an alignment change (the arithmetic is unchanged): the guards `test_amd_mfma_math`, `test_amd_matrix_fast`, `test_amd_nan_order`, `test_amd_gcn_same_bits`,
+  `test_amd_gcn_packed_same_bits`, `test_amd_gcn_memory_same_bits` and `test_amd_codeobject_same_bits` pass.
