@@ -13,6 +13,9 @@
 #include <string>
 #include <vector>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "tc86_v0.hpp"
 #include "vgpu/exec/tc_ampere.hpp"
 #include "vtest.hpp"
@@ -91,9 +94,39 @@ const Shape kShapes[] = {{16, 8, 16, 8}, {16, 8, 8, 8}, {16, 8, 8, 4}, {16, 8, 4
 struct Totals {
   long elements = 0, mismatches = 0;
   long k512 = 0, k512_taken = 0;   // calls the 512-bit float-product kernel was held to the 256-bit one on, and how many it took
+  long k512_edge = 0;              // ... and calls repeated with the operands at the end of a mapped page, rows padded with infinities
 };
 
 #ifdef VGPU_TC86_AVX2
+
+// An operand placed so that its last float is the last one of a mapped page, the next page unmapped: a read past the operand faults (the
+// 512-bit kernel's masked loads must not touch a lane past it), and the padding between rows holds infinities, which the kernel would
+// decline on if it read them.
+struct PageEdge {
+  char* base = nullptr;
+  size_t len = 0;
+  PageEdge() {
+    const size_t pg = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    len = 2 * pg;
+    void* m = mmap(nullptr, len + pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) throw vtest::Failure("mmap failed");
+    base = static_cast<char*>(m);
+    if (mprotect(base + len, pg, PROT_NONE) != 0) throw vtest::Failure("mprotect failed");
+  }
+  PageEdge(const PageEdge&) = delete;
+  PageEdge& operator=(const PageEdge&) = delete;
+  ~PageEdge() { munmap(base, len + static_cast<size_t>(sysconf(_SC_PAGESIZE))); }
+  // rows x cols floats of `src` (dense, cols a row) at row stride ld, ending at the page's end.
+  const float* place(const std::vector<float>& src, unsigned rows, unsigned cols, unsigned ld) {
+    const size_t n = size_t{rows - 1} * ld + cols;
+    float* p = reinterpret_cast<float*>(base + len) - n;
+    for (size_t i = 0; i < n; ++i) p[i] = f(0x7f800000u);
+    for (unsigned r = 0; r < rows; ++r)
+      for (unsigned c = 0; c < cols; ++c) p[size_t{r} * ld + c] = src[size_t{r} * cols + c];
+    return p;
+  }
+};
+
 // The 512-bit float-product kernel (mma_avx512_chunked_f) against the 256-bit one (mma_avx2_chunked_f) and the frozen form, called directly (the
 // dispatch picks it only at the AVX-512 level): the same answer to "taken or not", nothing written when not taken, and when taken the frozen
 // form's bits in every element. Skipped on a CPU without AVX-512 (and for the shapes the 512-bit kernel leaves to the 256-bit one).
@@ -107,6 +140,20 @@ void check_512(int round, const Shape& sh, int fmt, int mode, int emin, const st
   ++tot.k512;
   tot.k512_taken += t5;
   bool bad = t2 != t5;
+  // The same call with A and B at the end of a mapped page: dense, and with padded rows (strides past the operands' widths, infinities between
+  // the rows). The padding is never read, nor anything past the last float, and the answer is that of the dense call.
+  {
+    static PageEdge edge_a, edge_b;
+    const unsigned lda_pad[2] = {sh.K, sh.K + 3 + static_cast<unsigned>(round % 3)}, ldb_pad[2] = {sh.N, sh.N + 5 + static_cast<unsigned>(round % 2) * 8};
+    for (int v = 0; v < 2; ++v) {
+      const float* const pa = edge_a.place(A, sh.M, sh.K, lda_pad[v]);
+      const float* const pb = edge_b.place(B, sh.K, sh.N, ldb_pad[v]);
+      std::vector<float> D5(C.size(), f(sentinel));
+      const bool t6 = now::mma_avx512_chunked_f<NC, ACC16>(sh.M, sh.N, sh.K, emin, pa, lda_pad[v], pb, ldb_pad[v], C.data(), sh.N, D5.data(), sh.N);
+      ++tot.k512_edge;
+      if (t6 != t5 || std::memcmp(D5.data(), D4.data(), D5.size() * sizeof(float)) != 0) bad = true;
+    }
+  }
   for (size_t e = 0; e < D0.size(); ++e) {
     if (t5 && bits(D4[e]) != bits(D0[e])) bad = true;
     if (!t5 && bits(D4[e]) != sentinel) bad = true;   // (a declined call writes nothing)
@@ -229,6 +276,7 @@ VTEST(vector_kernels_equal_the_frozen_form) {
   VCHECK(tot.elements > 1000000);
   if (vgpu::simd::supported(vgpu::simd::Level::Avx512)) {
     VCHECK(tot.k512 > 20000);
+    VCHECK(tot.k512_edge >= 2 * tot.k512);
     VCHECK(tot.k512_taken > 5000);
   }
 }
@@ -489,6 +537,45 @@ __attribute__((target("avx2,avx512f,avx512bw,avx512dq,avx512vl"))) static void c
         if (!ok && ++bad <= 5) std::fprintf(stderr, "512-bit f%d: S %d g %d: vector 0x%08x (nz %d in %d), scalar 0x%08x\n", f16 ? 16 : 32, S[l], g[l], r[l], nz, in, want);
       }
     }
+}
+
+// An infinity or a NaN in one operand, small numbers everywhere else (the exponent fields then pass the range rule, so only the check for the
+// field 255 can send the call to the integer kernel): the 512-bit kernel declines as the 256-bit one does, and writes nothing.
+VTEST(float_product_kernel_declines_on_infinities_and_nans_beside_small_numbers) {
+#ifdef VGPU_TC86_AVX2
+  if (!vgpu::simd::supported(vgpu::simd::Level::Avx512)) {
+    std::printf("  [ SKIP ] this CPU has no AVX-512\n");
+    return;
+  }
+  Gen g(0x5bec1a1);
+  Totals tot;
+  long declined = 0;
+  static const uint32_t kSpecial[] = {0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00123u, 0x7f800001u, 0x7fffe000u};
+  for (int round = 0; round < 6000; ++round) {
+    const Shape& sh = kShapes[round % (sizeof kShapes / sizeof kShapes[0])];
+    if (sh.K % sh.chunk != 0 || !now::mma_avx512_f_shape(sh.M, sh.N)) continue;
+    const int fmt = (round / 7) % 3;
+    const float scale = std::ldexp(1.0f, fmt == 0 ? -8 : -16);
+    std::vector<float> A(sh.M * sh.K), B(sh.K * sh.N), C(sh.M * sh.N), D0(sh.M * sh.N);
+    for (float& x : A) x = g.operand(fmt, 0, false) * scale;
+    for (float& x : B) x = g.operand(fmt, 0, false) * scale;
+    for (float& x : C) x = g.operand(fmt, 0, false) * scale;
+    std::vector<float>& side = (round / 3) % 2 ? A : B;
+    side[g.u() % side.size()] = f(kSpecial[(round / 6) % 6]);
+    const int emin = fmt == 0 ? now::kEminF16 : now::kEminWide;
+    old::mma(sh.M, sh.N, sh.K, sh.chunk, emin, false, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D0.data(), sh.N);
+    const long before = tot.k512_taken;
+    if (sh.chunk == 8) check_512<8, false>(round, sh, fmt, 0, emin, A, B, C, D0, tot);
+    else check_512<4, false>(round, sh, fmt, 0, emin, A, B, C, D0, tot);
+    declined += tot.k512_taken == before;
+  }
+  std::printf("  %ld calls, %ld declined\n", tot.k512, declined);
+  VCHECK_EQ(tot.mismatches, 0L);
+  VCHECK(tot.k512 > 3000);
+  VCHECK_EQ(declined, tot.k512);
+#else
+  std::printf("  [ SKIP ] no x86 vector kernels\n");
+#endif
 }
 
 VTEST(sum_to_f16_f32_512_equal_the_scalar_conversion) {
