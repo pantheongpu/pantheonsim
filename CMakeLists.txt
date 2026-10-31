@@ -1350,6 +1350,9 @@ vgpu_unit_test(test_sched)
 # The SASS executor's atomics (vgpu/exec/sass_atomics.hpp), and its lane-state helpers and shuffle shapes (vgpu/exec/sass_lanes.hpp,
 # src/sass/tier.hpp), against the lane-by-lane code they replaced.
 vgpu_unit_test(test_sass_atomics)
+# A warp's atomics on device memory without a lock (sassatom::global_lockfree over MemoryManager::rmw_batch): against the lane-by-lane rule,
+# declines, and from several threads (every old value handed out once; commutative operations leave the serial result).
+vgpu_unit_test(test_sass_lockfree)
 vgpu_unit_test(test_sass_lanes)
 target_include_directories(test_sass_lanes PRIVATE src)
 # The address-row questions of the tier's global and shared memory handlers (vgpu/exec/sass_mem_rows.hpp), against the address array they replaced.
@@ -3027,6 +3030,14 @@ if(TARGET vgpucublas)
     DEPENDS vgpucudart
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
+
+  # Device atomics from many blocks on the lock road (fewer than four host threads) and the lock-free one, SASS and PTX.
+  add_test(NAME e2e_atomics_threads
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_atomics_threads.sh)
+  set_tests_properties(e2e_atomics_threads PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
 
   # Shared and local memory moved 1 to 16 bytes at a time, on the SASS interpreter, the SASS tier and the PTX interpreter.
   add_test(NAME e2e_sass_vector_memory

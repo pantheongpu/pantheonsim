@@ -310,6 +310,13 @@ class MemoryManager {
         const_cast<std::remove_const_t<std::remove_reference_t<F>>*>(&compute), old_out, always_store);
   }
 
+  // The bytes of a warp's 4- or 8-byte words for the CPU's own atomics (the executors' lock-free atomics, which then run the compare-and-swap
+  // loops inline): out[i] is the word at addrs[i] inside its chunk, or null where the chunk is untouched or uniform (nothing real to swap on:
+  // atomic_rmw does that word, making the chunk real only where the result differs, or at all with always_store). False, having done
+  // nothing, wherever rmw_batch(lock_free) would decline: a fault armed, a host mapping in reach, a misaligned address or one outside the
+  // one allocation the first is in. The pointers are good until the allocation is freed.
+  bool atomic_word_ptrs(const uint64_t* addrs, size_t count, uint32_t size, uint8_t** out) const;
+
   // A wave's read-modify-writes at once: `count` accesses of `size` bytes in order, access i loading the word, `compute(i, old)` and
   // storing the result where it differs (`lock_free`: as atomic_rmw does, a compare-and-swap on the word, for 4 and 8 bytes; else
   // the plain load and store of rmw_if_changed), with one lookup for the lot. `olds[i]` is what access i loaded; `*done` is how many

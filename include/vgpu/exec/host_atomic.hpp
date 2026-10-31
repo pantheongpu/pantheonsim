@@ -14,6 +14,15 @@
 
 namespace vgpu::exec {
 
+// The engines' device-memory atomics (SASS and PTX) take the CPU's compare-and-swap on each word, with no lock, when the process
+// runs its grids on at least this many host threads, and the striped locks below that. Measured (Ryzen 9 9950X, a warp's 32 atomics on 14
+// cache lines): a lock pair per line costs about 1.8 ns, a locked instruction per word about 4 ns, so on one thread the locks are 1.25x
+// faster; two threads are no contention yet (locks still faster); from four the stripe lines bounce between the threads and the
+// swaps scale (0.77x -> 1.8x at 4 threads, 2.6x at 8) where the locks do not. The choice is the process's, made from the configured
+// thread count (VGPU_THREADS, else the CPUs), not the launch's: two launches that overlap must not meet on one word under different
+// roads.
+inline constexpr unsigned kLockFreeAtomicsFromThreads = 4;
+
 // Replaces the `size`-byte value at p (2, 4 or 8 bytes, naturally aligned)
 // with compute(old), atomically; returns old.
 template <class F>
