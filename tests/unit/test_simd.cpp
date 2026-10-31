@@ -1586,8 +1586,12 @@ VTEST(double_lanes_in_place_at_every_level) {
 namespace {
 
 uint64_t ref_widen(uint32_t x, unsigned mods) {
-  if ((x & 0x7fffffffu) > 0x7f800000u) return (uint64_t{x >> 31} << 63) | 0x7ff8000000000000ull | (uint64_t{x & 0x7fffffu} << 29);
   volatile float f = std::bit_cast<float>(x);
+  if ((x & 0x7fffffffu) > 0x7f800000u) {   // (the executor's scalar form converts before it looks: a signalling NaN raises "invalid" there too)
+    volatile double unused = static_cast<double>(f);
+    (void)unused;
+    return (uint64_t{x >> 31} << 63) | 0x7ff8000000000000ull | (uint64_t{x & 0x7fffffu} << 29);
+  }
   float v = f;
   if (mods & 1) v = std::fabs(v);
   if (mods & 2) v = -v;
@@ -1596,9 +1600,12 @@ uint64_t ref_widen(uint32_t x, unsigned mods) {
 }
 
 uint32_t ref_narrow(uint64_t x, unsigned mods) {   // (in the rounding mode set by the caller)
-  if ((x & 0x7fffffffffffffffull) > 0x7ff0000000000000ull)
-    return (static_cast<uint32_t>(x >> 63) << 31) | 0x7fc00000u | static_cast<uint32_t>((x >> 29) & 0x3fffffu);
   volatile double d = std::bit_cast<double>(x);
+  if ((x & 0x7fffffffffffffffull) > 0x7ff0000000000000ull) {
+    volatile float unused = static_cast<float>(d);   // (as above)
+    (void)unused;
+    return (static_cast<uint32_t>(x >> 63) << 31) | 0x7fc00000u | static_cast<uint32_t>((x >> 29) & 0x3fffffu);
+  }
   double v = d;
   if (mods & 1) v = std::fabs(v);
   if (mods & 2) v = -v;
