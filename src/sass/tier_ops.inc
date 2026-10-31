@@ -1093,7 +1093,7 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
 // order, so where two lanes name one word the later lane's value is the one stored, as in the lane loop (the words of one group are all
 // different).
 template <bool Store>
-[[gnu::always_inline]] inline void tier_shared_words(uint8_t* sh, uint32_t* d, const uint32_t* offs) {
+[[gnu::noinline]] inline void tier_shared_words(uint8_t* sh, uint32_t* d, const uint32_t* offs) {
   for (unsigned g = 0; g < 4; ++g) {
     const uint32_t* o = offs + 8 * g;
     uint32_t* dg = d ? d + 8 * g : nullptr;
