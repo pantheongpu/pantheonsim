@@ -1366,6 +1366,12 @@ vgpu_unit_test(test_sass_mem_rows)
 vgpu_unit_test(test_sass_access_count)
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
+# Fixed-size copies on the memory paths (memory manager runs, SASS tier stores, PTX stores, the AMD tier's v_cndmask) are not calls to glibc's fortified __memcpy_chk.
+# The test defines __memcpy_chk to count them, which a sanitizer runtime would meet with its own interceptors: not built under one.
+if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize")
+  vgpu_unit_test(test_memcpy_chk)
+  target_compile_definitions(test_memcpy_chk PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+endif()
 # The allocation table's bookkeeping (alloc, free, quarantine, recycled chunks, the lock and its epoch) against a model
 # and against the digest of the implementation before the speed work.
 vgpu_unit_test(test_memalloc)
@@ -3821,6 +3827,13 @@ if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize")
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 endif()
+
+# The PTX interpreter's gather_words / scatter_words start on a 64-byte boundary (a page-crossing placement cost the mma_ptx workload 2 to 6%).
+add_test(NAME lint_ptx_word_moves_aligned COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_ptx_word_moves_aligned.sh)
+set_tests_properties(lint_ptx_word_moves_aligned PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 120)
 
 # No file under NVIDIA's proprietary terms in the tree, and the fetch that
 # stands in for the cuDNN headers that used to be vendored.

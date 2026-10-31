@@ -843,22 +843,24 @@ TIER_HANDLER(h_uunary) {
 
 // `bytes` (1, 2, 4, 8 or 16) between a lane's register words and memory, with sizes the compiler can see: a memcpy of a size known
 // only at run time was a call into libc for every lane (10 to 15% of the memory workloads).
+// (__builtin_memcpy: with glibc's fortification a std::memcpy to a computed address in a local buffer, as h_global's run buffer, is a call
+// to __memcpy_chk even at a fixed size.)
 inline void tier_put(uint8_t* at, const uint32_t* v, unsigned bytes) {
   switch (bytes) {
     case 1: *at = static_cast<uint8_t>(v[0]); break;
-    case 2: { const uint16_t x = static_cast<uint16_t>(v[0]); std::memcpy(at, &x, 2); break; }
-    case 4: std::memcpy(at, v, 4); break;
-    case 8: std::memcpy(at, v, 8); break;
-    default: std::memcpy(at, v, 16); break;
+    case 2: { const uint16_t x = static_cast<uint16_t>(v[0]); __builtin_memcpy(at, &x, 2); break; }
+    case 4: __builtin_memcpy(at, v, 4); break;
+    case 8: __builtin_memcpy(at, v, 8); break;
+    default: __builtin_memcpy(at, v, 16); break;
   }
 }
 inline void tier_get(uint32_t* v, const uint8_t* at, unsigned bytes) {   // v is zero already
   switch (bytes) {
     case 1: v[0] = *at; break;
-    case 2: { uint16_t x; std::memcpy(&x, at, 2); v[0] = x; break; }
-    case 4: std::memcpy(v, at, 4); break;
-    case 8: std::memcpy(v, at, 8); break;
-    default: std::memcpy(v, at, 16); break;
+    case 2: { uint16_t x; __builtin_memcpy(&x, at, 2); v[0] = x; break; }
+    case 4: __builtin_memcpy(v, at, 4); break;
+    case 8: __builtin_memcpy(v, at, 8); break;
+    default: __builtin_memcpy(v, at, 16); break;
   }
 }
 
@@ -1633,7 +1635,7 @@ TIER_HANDLER(h_imma) {
   static const uint32_t kZeros[32] = {};
   alignas(32) uint32_t xa[8 * 32], xb[4 * 32], xc[4 * 32], xd[4 * 32];
   const auto load = [&](unsigned base, unsigned n, uint32_t* dst) {
-    for (unsigned i = 0; i < n; ++i) std::memcpy(dst + 32 * i, base == kRZ ? kZeros : c.R + (base + i) * 32u, 32 * sizeof(uint32_t));
+    for (unsigned i = 0; i < n; ++i) __builtin_memcpy(dst + 32 * i, base == kRZ ? kZeros : c.R + (base + i) * 32u, 32 * sizeof(uint32_t));
   };
   load(op.s[0].off, a_regs, xa);
   load(op.s[1].off, b_regs, xb);
