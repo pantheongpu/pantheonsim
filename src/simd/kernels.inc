@@ -1554,7 +1554,7 @@ void f2f_widen_k(const uint32_t* a, unsigned mods, uint32_t* lo, uint32_t* hi) {
     // keeps its sign, which is the value the card writes.
     const __m256i nan = _mm256_cmpgt_epi32(_mm256_and_si256(x, mag), inf);
     const __m256i y = _mm256_blendv_epi8(_mm256_xor_si256(_mm256_and_si256(x, va), vn), x, nan);
-    split_pd8(_mm256_cvtps_pd(_mm256_castsi256_si128(y)), _mm256_cvtps_pd(_mm256_extracti128_si256(y, 1)), lo + i, hi + i);
+    split_pd8(_mm256_cvtps_pd(_mm_castsi128_ps(_mm256_castsi256_si128(y))), _mm256_cvtps_pd(_mm_castsi128_ps(_mm256_extracti128_si256(y, 1))), lo + i, hi + i);
   }
 #else
   for (unsigned l = 0; l < 32; ++l) {
