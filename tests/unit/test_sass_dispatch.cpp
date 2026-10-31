@@ -365,38 +365,66 @@ const Golden kGolden[] = {
     {"WARPSYNC after exits, full mask, 100 threads", 0x7321745416921a54ull},
     {"WARPSYNC after exits, half-warp mask, 32 threads", 0x0bccd1903c8a151eull},
     {"WARPSYNC after exits, half-warp mask, 96 threads", 0xf7e1d7e6266f46c0ull},
-    {"shared memory, shape 0, 32 threads", 0x1a1f5dfab5295203ull},
-    {"shared memory, shape 0, 64 threads", 0x24198969672b0398ull},
-    {"shared memory, shape 0, 33 threads", 0x2590358d79e5114bull},
-    {"shared memory, shape 0, 5 threads", 0x887ef99b85aae74bull},
-    {"shared memory, shape 1, 32 threads", 0xf635038ec4987730ull},
-    {"shared memory, shape 1, 64 threads", 0x90a3997bf9f042ffull},
-    {"shared memory, shape 1, 33 threads", 0x08e63502fb9600c0ull},
-    {"shared memory, shape 1, 5 threads", 0x887ef99b85aae74bull},
-    {"shared memory, shape 2, 32 threads", 0xa158064b9dca6fa9ull},
-    {"shared memory, shape 2, 64 threads", 0x0aa2fd695d6385b6ull},
-    {"shared memory, shape 2, 33 threads", 0x6725121f15907aeeull},
-    {"shared memory, shape 2, 5 threads", 0xe3b4547ef8d5b534ull},
-    {"shared memory, shape 3, 32 threads", 0x2f882ba37c2d0aa4ull},
-    {"shared memory, shape 3, 64 threads", 0x6687d2747814016bull},
-    {"shared memory, shape 3, 33 threads", 0x7a75fbf86e78b47cull},
-    {"shared memory, shape 3, 5 threads", 0x1f28f1c0843eedabull},
-    {"shared memory, shape 4, 32 threads", 0x8d097048aeac3b8cull},
-    {"shared memory, shape 4, 64 threads", 0x7992755b447595c8ull},
-    {"shared memory, shape 4, 33 threads", 0x11a8c7c9aafa749cull},
-    {"shared memory, shape 4, 5 threads", 0xb77bf1a554969413ull},
-    {"shared memory, shape 5, 32 threads", 0x1a1f5dfab5295203ull},
-    {"shared memory, shape 5, 64 threads", 0x24198969672b0398ull},
-    {"shared memory, shape 5, 33 threads", 0x2590358d79e5114bull},
-    {"shared memory, shape 5, 5 threads", 0x887ef99b85aae74bull},
-    {"shared memory, shape 6, 32 threads", 0x56e99df2334e29b4ull},
-    {"shared memory, shape 6, 64 threads", 0x24d5c6c5b8c69167ull},
-    {"shared memory, shape 6, 33 threads", 0x7ba3aaa61f9866ccull},
-    {"shared memory, shape 6, 5 threads", 0x887ef99b85aae74bull},
-    {"shared memory, shape 7, 32 threads", 0x9ed479c126ac61bfull},
-    {"shared memory, shape 7, 64 threads", 0xb977417df6dc1a75ull},
-    {"shared memory, shape 7, 33 threads", 0x7063b0a32e7ae2bbull},
-    {"shared memory, shape 7, 5 threads", 0xa20592b2cdd29353ull},
+    {"shared memory, shape 0, 32 threads", 0x318f560b2f96f501ull},
+    {"shared memory, shape 0, 64 threads", 0x51bf71258ab808e9ull},
+    {"shared memory, shape 0, 33 threads", 0xe766196c4d2c6c72ull},
+    {"shared memory, shape 0, 5 threads", 0x95391eed8d5e18b7ull},
+    {"shared memory, shape 0, 19 threads", 0x3affdb289d2492a1ull},
+    {"shared memory, shape 1, 32 threads", 0x8b1bc614ee594f26ull},
+    {"shared memory, shape 1, 64 threads", 0x7e228aa6f9b6581aull},
+    {"shared memory, shape 1, 33 threads", 0x34f940dd1095dd29ull},
+    {"shared memory, shape 1, 5 threads", 0x53f53a43e1271e39ull},
+    {"shared memory, shape 1, 19 threads", 0x73d58d77a22e8382ull},
+    {"shared memory, shape 2, 32 threads", 0x49354374d166adfbull},
+    {"shared memory, shape 2, 64 threads", 0x2cdca3a4ea22a290ull},
+    {"shared memory, shape 2, 33 threads", 0xcfe224058d081507ull},
+    {"shared memory, shape 2, 5 threads", 0xbbafce50e8cb9a10ull},
+    {"shared memory, shape 2, 19 threads", 0x767389f6da628d13ull},
+    {"shared memory, shape 3, 32 threads", 0xb16714b0a71464a7ull},
+    {"shared memory, shape 3, 64 threads", 0x8867c4c13c88cb8full},
+    {"shared memory, shape 3, 33 threads", 0x99f995e3a1545be2ull},
+    {"shared memory, shape 3, 5 threads", 0x601919b590ab584full},
+    {"shared memory, shape 3, 19 threads", 0xb4d05aebc224a474ull},
+    {"shared memory, shape 4, 32 threads", 0x7307cee53ea95f68ull},
+    {"shared memory, shape 4, 64 threads", 0xcad3147a430bb438ull},
+    {"shared memory, shape 4, 33 threads", 0x1bd52d33b35f568full},
+    {"shared memory, shape 4, 5 threads", 0x4d88de7ae0ebb9b3ull},
+    {"shared memory, shape 4, 19 threads", 0x2719fe590fda2480ull},
+    {"shared memory, shape 5, 32 threads", 0x318f560b2f96f501ull},
+    {"shared memory, shape 5, 64 threads", 0x51bf71258ab808e9ull},
+    {"shared memory, shape 5, 33 threads", 0xe766196c4d2c6c72ull},
+    {"shared memory, shape 5, 5 threads", 0x95391eed8d5e18b7ull},
+    {"shared memory, shape 5, 19 threads", 0x3affdb289d2492a1ull},
+    {"shared memory, shape 6, 32 threads", 0x6c1cf7c5dcfc1c2dull},
+    {"shared memory, shape 6, 64 threads", 0x235656b0d2d6f0f6ull},
+    {"shared memory, shape 6, 33 threads", 0x63a42e138ad494b7ull},
+    {"shared memory, shape 6, 5 threads", 0xf82390066bff6451ull},
+    {"shared memory, shape 6, 19 threads", 0xd49ab0418090f0a7ull},
+    {"shared memory, shape 7, 32 threads", 0x50bd2589d566c7daull},
+    {"shared memory, shape 7, 64 threads", 0x44dc43c16229321cull},
+    {"shared memory, shape 7, 33 threads", 0x75b7429c6af42c9bull},
+    {"shared memory, shape 7, 5 threads", 0xf686b948bc956795ull},
+    {"shared memory, shape 7, 19 threads", 0xc011a2f229c740b2ull},
+    {"shared memory, shape 8, 32 threads", 0xd78850e87964a44bull},
+    {"shared memory, shape 8, 64 threads", 0x3cb182e00391971aull},
+    {"shared memory, shape 8, 33 threads", 0xcb388d7774c15823ull},
+    {"shared memory, shape 8, 5 threads", 0x01cad6db1508988cull},
+    {"shared memory, shape 8, 19 threads", 0x47845e300956ba1aull},
+    {"shared memory, shape 9, 32 threads", 0x8b7033574fcd833dull},
+    {"shared memory, shape 9, 64 threads", 0x5b1e9254b573c3efull},
+    {"shared memory, shape 9, 33 threads", 0x88f53d51d0efcddeull},
+    {"shared memory, shape 9, 5 threads", 0xdee5b4e3393f5368ull},
+    {"shared memory, shape 9, 19 threads", 0xf2205c545b88e010ull},
+    {"shared memory, shape 10, 32 threads", 0xca67102f180ad703ull},
+    {"shared memory, shape 10, 64 threads", 0xde009c0217eb8f9eull},
+    {"shared memory, shape 10, 33 threads", 0xdea00bb839b1a696ull},
+    {"shared memory, shape 10, 5 threads", 0x29ce1abf40625708ull},
+    {"shared memory, shape 10, 19 threads", 0xa8187fd6233eddefull},
+    {"shared memory, shape 11, 32 threads", 0x4ada5a229045abd0ull},
+    {"shared memory, shape 11, 64 threads", 0x480388cc9438ede1ull},
+    {"shared memory, shape 11, 33 threads", 0x760095857e61571aull},
+    {"shared memory, shape 11, 5 threads", 0xe22829018291dd17ull},
+    {"shared memory, shape 11, 19 threads", 0x3199a5486e5401dcull},
 };
 
 void check_golden(const Result& r, const std::string& key) {
@@ -463,6 +491,19 @@ std::vector<Insn> shared_kernel(unsigned shape) {
     case 4: code.push_back(movi(7, 0)); break;                                            // one address for every lane
     case 5: code.push_back(iadd3i(7, 0, 0, kRZ)); break;                                  // the index; the .X4 forms scale it
     case 6: code.push_back(imadi(7, 0, 2, kRZ)); break;                                   // (.X8 scales to 16 bytes a lane)
+    case 8:   // rows of eight words, a gap between the rows
+      code.push_back(movi(8, 0x18)), code.push_back(lop3(9, 0, 8, kRZ, 0xc0)), code.push_back(imadi(7, 0, 4, kRZ)), code.push_back(imadi(7, 9, 24, 7));
+      break;
+    case 9:   // the same, each row starting two bytes into a word
+      code.push_back(movi(8, 0x18)), code.push_back(lop3(9, 0, 8, kRZ, 0xc0)), code.push_back(imadi(7, 0, 4, kRZ)), code.push_back(imadi(7, 9, 24, 7));
+      code.push_back(iadd3i(7, 7, 2, kRZ));
+      break;
+    case 10:  // runs of four words only: no group of eight is one run
+      code.push_back(movi(8, 4)), code.push_back(lop3(9, 0, 8, kRZ, 0xc0)), code.push_back(imadi(7, 0, 4, kRZ)), code.push_back(imadi(7, 9, 20, 7));
+      break;
+    case 11:  // four rows on the same eight words (the later lane's value is the one stored)
+      code.push_back(movi(8, 7)), code.push_back(lop3(9, 0, 8, kRZ, 0xc0)), code.push_back(imadi(7, 9, 4, kRZ));
+      break;
     default: code.push_back(imadi(7, 0, 4, kRZ)); break;
   }
   const unsigned size = shape == 3 ? 0 : shape == 7 ? 5 : 4;   // U8, 64 bits, 32 bits
@@ -470,6 +511,8 @@ std::vector<Insn> shared_kernel(unsigned shape) {
   code.push_back(sts(7, 1, shape == 7 ? 8 : 0x20, size, stride));
   code.push_back(lds(2, 7, shape == 7 ? 8 : 0x20, size, stride));
   code.push_back(lds(3, 7, 0x44, 4, stride));   // (a word past it, or the one the lane's neighbour stored)
+  code.push_back(imadi(5, 0, 4, kRZ));
+  code.push_back(lds(5, 5, 0x20, 4, 0));   // (the words in order: where the stores put each lane's value, which a store and a load that agree on a wrong place would hide)
   code.push_back(iadd3(4, 2, 3, kRZ));
   for (unsigned r = 1; r < kRegs; ++r) code.push_back(stg(14, r, 4 * r));
   code.push_back(stg(14, 0, 0));
@@ -505,7 +548,7 @@ VTEST(warpsync_does_not_wait_for_lanes_that_have_exited) {
 }
 
 VTEST(shared_memory_of_a_whole_warp_gives_the_interpreters_registers_and_counters) {
-  for (unsigned shape = 0; shape < 8; ++shape) compare(shared_kernel(shape), {32, 64, 33, 5}, "shared memory, shape " + std::to_string(shape));
+  for (unsigned shape = 0; shape < 12; ++shape) compare(shared_kernel(shape), {32, 64, 33, 5, 19}, "shared memory, shape " + std::to_string(shape));
 }
 
 #ifndef SASS_CALL_RET_NO_TIER_FORMS   // (not in the tree the answers were taken from)

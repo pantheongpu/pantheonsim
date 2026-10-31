@@ -156,6 +156,48 @@ VTEST(many_small_launches_reuse_the_pools_threads) {
   VCHECK_EQ(exec::worker_pool_stats().created, grown);
 }
 
+// A loop of small launches (the launch64 shape: few blocks, a few microseconds of
+// work each) must give the same bytes and the same counters at every thread
+// count, and once the cost of the kernel is known must stay off the pool: a
+// worker's hand-off costs more than the blocks do (docs/performance.md, Round sp12).
+VTEST(small_launches_in_a_loop_stay_off_the_pool_and_give_the_same_results) {
+  const auto m = ptx::parse(std::string(kHeader) + kFill);
+  const DeviceProfile prof = load_gpu("nvidia/h100");
+  // Any launch this small is below the 1 s of work a thread would need.
+  ::setenv("VGPU_POOL_MIN_WORK_US", "1000000", 1);
+  const Result ref = run_fill(m, prof, "1", 8, 32);
+  for (const char* t : {"2", "8", "16"}) {
+    run_fill(m, prof, t, 8, 32);   // the first launch of a kernel has no cost to go by
+    run_fill(m, prof, t, 8, 32);
+    const uint64_t calls = exec::worker_pool_stats().calls;
+    LaunchStats total;
+    for (int i = 0; i < 200; ++i) {
+      const Result r = run_fill(m, prof, t, 8, 32);
+      VCHECK(r.out == ref.out);
+      VCHECK_EQ(r.sum, ref.sum);
+      VCHECK_EQ(r.sum2, ref.sum2);
+      VCHECK(same_counters(r.st, ref.st));
+    }
+    VCHECK_EQ(exec::worker_pool_stats().calls, calls);   // none went to the pool
+  }
+  // With the cap off the same loop does use the pool, so the check above is not vacuous.
+  ::setenv("VGPU_POOL_MIN_WORK_US", "0", 1);
+  const uint64_t calls = exec::worker_pool_stats().calls;
+  for (int i = 0; i < 5; ++i) {
+    const Result r = run_fill(m, prof, "4", 8, 32);
+    VCHECK(r.out == ref.out);
+    VCHECK(same_counters(r.st, ref.st));
+  }
+  VCHECK(exec::worker_pool_stats().calls >= calls + 5);
+  // A grid with plenty of work is not capped: a 1 us threshold lets 8 blocks have 4 threads.
+  ::setenv("VGPU_POOL_MIN_WORK_US", "1", 1);
+  run_fill(m, prof, "4", 8, 32);
+  const uint64_t before = exec::worker_pool_stats().calls;
+  for (int i = 0; i < 5; ++i) run_fill(m, prof, "4", 8, 32);
+  VCHECK(exec::worker_pool_stats().calls >= before + 5);
+  ::unsetenv("VGPU_POOL_MIN_WORK_US");
+}
+
 VTEST(one_thread_runs_inline_and_makes_no_pool_thread) {
   const auto m = ptx::parse(std::string(kHeader) + kFill);
   const DeviceProfile prof = load_gpu("nvidia/h100");

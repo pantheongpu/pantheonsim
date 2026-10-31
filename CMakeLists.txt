@@ -284,7 +284,10 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   # The AMD interpreter's floor, ceil, trunc and rint are libm's: GCC expands them in line (and so leaves a signaling NaN
   # as it is, where roundss and libm quiet it) in the places its heuristics call hot, which moved when the instruction
   # ladders became switches (s_trunc_f32 of a signaling NaN, amd/tests/unit/test_gcn_same_bits.cpp).
-  set_source_files_properties(amd/src/gcn_exec.cpp PROPERTIES COMPILE_OPTIONS "-fno-fp-int-builtin-inexact")
+  # -falign-loops=32: the matrix tile kernels' loops (mfma_math.hpp) were 4 to 11 % slower on a Zen 5 host (bf16 and f16 mfma) in the layout
+  # that came with unrelated code ahead of them in the library, at equal instruction counts; with their loops on a fixed alignment the layout stops
+  # mattering (docs/performance.md, Round sp12 AMD).
+  set_source_files_properties(amd/src/gcn_exec.cpp PROPERTIES COMPILE_OPTIONS "-fno-fp-int-builtin-inexact;-falign-loops=32")
 endif()
 target_include_directories(vgpu PUBLIC include nvidia/include amd/include "${_gen_dir}")
 target_link_libraries(vgpu PUBLIC ${CMAKE_DL_LIBS})
@@ -1423,7 +1426,7 @@ vgpu_unit_test(test_wmma_generic_fast)
 # results against their general forms must not move a bit with the level.
 # The AVX-512 table is the default on a host that has it, so the 256-bit tile kernels are pinned with VGPU_SIMD=avx2 in a third run (a host without
 # AVX-512 runs the default as AVX2 and these as the same code).
-foreach(_t test_mma_fast test_mma_tiles test_wgmma_fast test_tcgen05_tiles test_wmma_generic_fast test_tile_mma)
+foreach(_t test_mma_fast test_mma_tiles test_wgmma_fast test_tcgen05_tiles test_wmma_generic_fast test_tile_mma test_tc_ampere_fast)
   add_test(NAME ${_t}_simd_avx512 COMMAND ${_t})
   set_tests_properties(${_t}_simd_avx512 PROPERTIES ENVIRONMENT "VGPU_SIMD=avx512")
   add_test(NAME ${_t}_simd_avx2 COMMAND ${_t})
@@ -4247,6 +4250,14 @@ if(TARGET vgpucudart)
   # results and errors with and without it, across loads, unloads and resets.
   add_test(NAME e2e_launch_cache COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_launch_cache.sh)
   set_tests_properties(e2e_launch_cache PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
+  # A small launch is kept to few host threads; no result or counter shows how
+  # many (pool_cap.cu at several VGPU_THREADS, the cap on and off, both engines).
+  add_test(NAME e2e_pool_cap COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pool_cap.sh)
+  set_tests_properties(e2e_pool_cap PROPERTIES
     DEPENDS "vgpucudart;vgpucuda"
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"

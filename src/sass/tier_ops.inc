@@ -1110,6 +1110,69 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
   c.r->tier_exec_mem(blk, w, *op.ins, ex);
 }
 
+// The 64-bit addresses the counting functions take, from a warp's 32-bit offsets: the active lanes' as they are, the others' zero (the
+// lanes that do not run read as zero, as the counting functions find them).
+[[gnu::always_inline]] inline void tier_widen_offsets(uint64_t* addrs, const uint32_t* offs, Mask ex) {
+#if defined(__SSE2__)
+  const __m128i zero = _mm_setzero_si128(), bit = _mm_set_epi32(8, 4, 2, 1);
+  for (unsigned g = 0; g < 8; ++g) {
+    __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(offs) + g);
+    if (ex != kAll) v = _mm_and_si128(v, _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(static_cast<int>(ex >> (4 * g))), bit), bit));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(addrs) + 2 * g, _mm_unpacklo_epi32(v, zero));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(addrs) + 2 * g + 1, _mm_unpackhi_epi32(v, zero));
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) addrs[l] = (ex >> l & 1) ? offs[l] : 0;
+#endif
+}
+
+// A whole warp's 4-byte shared accesses that are not one run of 32 words: each group of eight lanes is moved as 32 bytes when its
+// offsets are eight consecutive words (a tile row of 8, 16 or 32 words, or two rows in one warp), else lane by lane. The groups run in
+// order, so where two lanes name one word the later lane's value is the one stored, as in the lane loop (the words of one group are all
+// different).
+template <bool Store>
+[[gnu::noinline]] inline void tier_shared_words(uint8_t* sh, uint32_t* d, const uint32_t* offs) {
+  for (unsigned g = 0; g < 4; ++g) {
+    const uint32_t* o = offs + 8 * g;
+    uint32_t* dg = d ? d + 8 * g : nullptr;
+#if defined(__SSE2__)
+    const __m128i low24 = _mm_set1_epi32(0xffffff);
+    const __m128i first = _mm_add_epi32(_mm_set1_epi32(static_cast<int>(o[0] & 0xffffff)), _mm_set_epi32(12, 8, 4, 0));
+    const __m128i same0 = _mm_cmpeq_epi32(_mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(o)), low24), first);
+    const __m128i same1 = _mm_cmpeq_epi32(_mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(o) + 1), low24),
+                                          _mm_add_epi32(first, _mm_set1_epi32(16)));
+    if (_mm_movemask_epi8(_mm_and_si128(same0, same1)) == 0xffff) {
+      uint8_t* at = sh + (o[0] & 0xffffff);
+      if (Store) {
+        if (dg) {
+          const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dg)), b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dg) + 1);
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(at), a);
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(at) + 1, b);
+        } else {
+          std::memset(at, 0, 32);
+        }
+      } else if (dg) {
+        const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(at)), b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(at) + 1);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dg), a);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dg) + 1, b);
+      }
+      continue;
+    }
+#endif
+    for (unsigned i = 0; i < 8; ++i) {
+      uint8_t* at = sh + (o[i] & 0xffffff);
+      if (Store) {
+        const uint32_t v = dg ? dg[i] : 0u;
+        std::memcpy(at, &v, 4);
+      } else if (dg) {
+        uint32_t v;
+        std::memcpy(&v, at, 4);
+        dg[i] = v;
+      }
+    }
+  }
+}
+
 // Shared memory: the interpreter's fast case -- every active lane inside the block's own shared memory -- moved
 // straight between the register file and the block's array; anything else is exec_mem's.
 template <bool Store>
@@ -1123,18 +1186,11 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
   const uint32_t* base = ra != kRZ ? c.R + ra * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
   const uint64_t imm = static_cast<uint64_t>(op.imm);
-  uint64_t addrs[32];
   const uint64_t ssize = blk.shared.size();
-  exec::SharedWindowCheck window;   // (as exec_mem: see window_check.hpp)
-  const auto lane_address = [&](unsigned l) {
-    uint64_t v = base ? base[l] : 0;
-    if (stride) v *= stride;
-    const uint64_t off = static_cast<uint32_t>(v + urv + imm);
-    addrs[l] = off;
-    window.add(off, blk.rank);
-  };
-  if (ex == kAll) {   // a full warp: the offsets as 32-bit words (an offset is the low 32 bits of the sum, so of the parts' low halves), then the window check
-    alignas(32) uint32_t offs[32];
+  // The offsets of all 32 lanes as 32-bit words, whether they run or not (an offset is the low 32 bits of the sum, so of the parts'
+  // low halves; a lane that does not run reads whatever its register holds, and is left out of the window check and of the counting).
+  alignas(32) uint32_t offs[32];
+  {
     const uint32_t add32 = static_cast<uint32_t>(urv + imm);
     if (!base) {
       for (unsigned l = 0; l < 32; ++l) offs[l] = add32;
@@ -1146,14 +1202,8 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
     } else {
       for (unsigned l = 0; l < 32; ++l) offs[l] = base[l] * stride + add32;
     }
-    window.add_warp(offs, blk.rank);
-    for (unsigned l = 0; l < 32; ++l) addrs[l] = offs[l];
-  } else {
-    for (unsigned l = 0; l < 32; ++l) addrs[l] = 0;   // (the lanes that do not run read as zero, as the counting functions find them)
-    for (Mask m = ex; m; m &= m - 1) lane_address(static_cast<unsigned>(std::countr_zero(m)));
   }
-  const bool inside = window.inside(ssize, bytes, ex != 0);
-  if (!inside) {
+  if (!exec::shared_window_inside_warp(offs, ex, static_cast<uint32_t>(blk.rank), ssize, bytes)) {   // (as exec_mem: see window_check.hpp)
     c.r->tier_exec_mem(blk, w, *op.ins, ex);
     return;
   }
@@ -1163,10 +1213,10 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
     // A whole warp's words: the 32 consecutive words of an array indexed by the thread (the commonest shared access), or one word
     // every lane names. The same bytes move as lane by lane (a word every lane stores is the last lane's); the lanes are on one pass
     // through the banks, as the general count finds (a word that is not aligned spreads over one more bank).
-    const uint64_t o0 = addrs[0] & 0xffffff;
-    uint64_t seq = 0, same = 0;
+    const uint32_t o0 = offs[0] & 0xffffff;
+    uint32_t seq = 0, same = 0;
     for (unsigned l = 0; l < 32; ++l) {
-      const uint64_t o = addrs[l] & 0xffffff;
+      const uint32_t o = offs[l] & 0xffffff;
       seq |= o ^ (o0 + 4 * l);
       same |= o ^ o0;
     }
@@ -1200,12 +1250,16 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
       return;
     }
   }
+  uint64_t addrs[32];
+  tier_widen_offsets(addrs, offs, ex);
   const unsigned words = std::max(1u, bytes / 4);
+  const bool by_groups = bytes == 4 && ex == kAll;
+  if (by_groups) tier_shared_words<Store>(sh, d, offs);
   // (The widths the instruction can have move with copies of a size known at compile time: see store_lane_bytes.)
-  const bool moved = with_lane_width(bytes, [&](auto width) {
+  const bool moved = by_groups || with_lane_width(bytes, [&](auto width) {
     constexpr unsigned B = decltype(width)::value;
     const auto lane = [&](unsigned l) {
-      uint8_t* at = sh + (addrs[l] & 0xffffff);
+      uint8_t* at = sh + (offs[l] & 0xffffff);
       if (Store) {
         store_lane_bytes<B>(at, [&](unsigned i) -> uint32_t { return d ? d[32 * i + l] : 0u; });
       } else if (d) {
@@ -1224,7 +1278,7 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
   if (!moved) {
     for (Mask m = ex; m; m &= m - 1) {
       const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-      uint8_t* at = sh + (addrs[l] & 0xffffff);
+      uint8_t* at = sh + (offs[l] & 0xffffff);
       if (Store) {
         uint32_t v[4] = {};
         for (unsigned i = 0; i < words; ++i) v[i] = d ? d[32 * i + l] : 0;

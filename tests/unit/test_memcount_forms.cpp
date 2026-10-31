@@ -422,6 +422,12 @@ VTEST(window_checks_equal_the_per_lane_tests) {
       wc.add_warp(w32, static_cast<uint32_t>(rank));
       if (wc.inside(size, bytes, true) != want) throw vtest::Failure("whole-warp shared window check differs from the per-lane test at iteration " + std::to_string(iter));
     }
+    {   // any subset of a warp, in one pass without a maximum (shared_window_inside_warp): the same answer
+      uint32_t w32[32];
+      for (unsigned l = 0; l < 32; ++l) w32[l] = static_cast<uint32_t>(offs[l]);
+      if (vgpu::exec::shared_window_inside_warp(w32, mask, static_cast<uint32_t>(rank), size, bytes) != want)
+        throw vtest::Failure("shared_window_inside_warp differs from the per-lane test at iteration " + std::to_string(iter));
+    }
     // Local: the earlier loop, over frame offsets.
     bool want_local = true;
     uint64_t loc[32];
@@ -436,6 +442,33 @@ VTEST(window_checks_equal_the_per_lane_tests) {
     (want ? inside_count : outside_count) += 1;
   }
   VCHECK(inside_count > 20000 && outside_count > 20000);   // both answers were exercised
+}
+
+VTEST(shared_window_inside_warp_at_its_edges) {
+  // The last byte of the array: inside; one more: outside. Sizes smaller than the access, past the clamp, and the rank bits.
+  uint32_t a[32];
+  for (const uint64_t size : {uint64_t{1}, uint64_t{3}, uint64_t{4}, uint64_t{4096}, uint64_t{1} << 24, (uint64_t{1} << 25) + 5, uint64_t{1} << 40}) {
+    for (const uint32_t bytes : {1u, 4u, 16u}) {
+      for (unsigned lane : {0u, 17u, 31u}) {
+        for (unsigned rank : {0u, 3u}) {
+          const uint64_t top = std::min<uint64_t>(size, uint64_t{1} << 24);   // (an offset has 24 bits)
+          for (const uint64_t off : {top >= bytes ? top - bytes : 0, top >= bytes ? top - bytes + 1 : 0, top}) {
+            for (unsigned l = 0; l < 32; ++l) a[l] = static_cast<uint32_t>(rank << 24);
+            a[lane] = static_cast<uint32_t>((rank << 24) | (off & 0xffffff));
+            const bool want = bytes <= size && (off & 0xffffff) + bytes <= size;
+            const uint32_t all = 0xffffffffu, only = 1u << lane, others = ~only;
+            VCHECK(vgpu::exec::shared_window_inside_warp(a, all, rank, size, bytes) == want);
+            VCHECK(vgpu::exec::shared_window_inside_warp(a, only, rank, size, bytes) == want);
+            VCHECK(vgpu::exec::shared_window_inside_warp(a, others, rank, size, bytes) == (bytes <= size));
+            VCHECK(vgpu::exec::shared_window_inside_warp(a, 0, rank, size, bytes));
+          }
+          a[lane] = static_cast<uint32_t>(((rank ^ 1) << 24));   // another block's window
+          VCHECK(!vgpu::exec::shared_window_inside_warp(a, 1u << lane, rank, size, bytes));
+          VCHECK(vgpu::exec::shared_window_inside_warp(a, ~(1u << lane), rank, size, bytes) == (bytes <= size));
+        }
+      }
+    }
+  }
 }
 
 VTEST_MAIN

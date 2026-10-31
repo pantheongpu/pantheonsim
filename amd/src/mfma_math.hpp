@@ -278,7 +278,7 @@ inline bool mfma_have_avx2() { return mfma_avx2_switch(); }
 // sum are two roundings, as in the 2-wide kernel, so the bits are the same). n is a multiple of 8.
 typedef double mfma_v4d __attribute__((vector_size(32), aligned(8)));
 // Returns whether any output is a NaN (the sums' own check, while they are still in registers).
-__attribute__((target("avx2"))) inline bool mfma_tile_f_avx2(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk,
+__attribute__((target("avx2"), optimize("align-loops=64"))) inline bool mfma_tile_f_avx2(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk,
                                                             const double* c, double* out) {
 #define MFMA_LD4(p) (*reinterpret_cast<const mfma_v4d*>(p))
 #define MFMA_ST4(p, v) (*reinterpret_cast<mfma_v4d*>(p) = (v))

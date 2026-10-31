@@ -792,14 +792,329 @@ __attribute__((target("avx2"), aligned(64))) inline bool mma_avx2_chunked_f(unsi
 }
 #endif
 
+// ---- the 512-bit form of mma_avx2_chunked_f ------------------------------------------------------------------------------------------
+// The same arithmetic on sixteen lanes (mask registers in place of compare vectors), for the AVX-512 level. A unit of sixteen lanes is
+//   * one row and 16 columns, when N is a multiple of 16: the A side is a broadcast of one number, the B side a vector of 16 columns;
+//   * two rows and 8 columns, when N == 8 (mma.sync m16n8, wmma m32n8): lane 2j + r holds row r of the pair and column j. The A side is then a
+//     broadcast of a 64-bit pair (row 2p and 2p+1 at the same k), the B side the 8 columns with each doubled; the accumulators are
+//     interleaved on the way in and out of the registers.
+// Any other N (and an odd M with N == 8) stays with the 256-bit form. The checks that send a call to the integer kernel, and the bits of every
+// lane, are those of mma_avx2_chunked_f (tests/unit/test_tc_ampere_fast.cpp holds both to the scalar rule).
+#define VGPU_TC86_T512 target("avx2,avx512f,avx512bw,avx512dq,avx512vl")
+#ifndef VGPU_TC86_ROWS_Z
+#define VGPU_TC86_ROWS_Z 4
+#endif
+
+// shift_term_avx2 on sixteen lanes. (A count past 31, and a negative count read as unsigned, give 0: the other direction's shift is the
+// answer; for s == 0 both are |sig|.)
+__attribute__((VGPU_TC86_T512)) inline __m512i shift_term_avx512(__m512i sig, __m512i s) {
+  const __m512i zero = _mm512_setzero_si512();
+  const __m512i mag = _mm512_abs_epi32(sig);
+  const __m512i v = _mm512_or_si512(_mm512_sllv_epi32(mag, s), _mm512_srlv_epi32(mag, _mm512_sub_epi32(zero, s)));
+  return _mm512_mask_sub_epi32(v, _mm512_movepi32_mask(sig), zero, v);
+}
+
+// sum_to_f32_avx2 on sixteen lanes; `snz` and `inrange` are lane masks.
+__attribute__((VGPU_TC86_T512)) inline void sum_to_f32_avx512(__m512i S, __m512i g, __m512i& res, __mmask16& snz, __mmask16& inrange) {
+  const __m512i zero = _mm512_setzero_si512(), cff = _mm512_set1_epi32(0xff);
+  const __m512i mag = _mm512_abs_epi32(S);
+  const __m512i hi = _mm512_castps_si512(_mm512_cvtepi32_ps(_mm512_and_si512(mag, _mm512_set1_epi32(~127))));
+  const __m512i sh = _mm512_max_epi32(_mm512_sub_epi32(_mm512_srli_epi32(hi, 23), _mm512_set1_epi32(150)), zero);
+  const __m512i magt = _mm512_sllv_epi32(_mm512_srlv_epi32(mag, sh), sh);
+  const __m512i fb = _mm512_castps_si512(_mm512_cvtepi32_ps(magt));
+  const __m512i newexp = _mm512_add_epi32(_mm512_and_si512(_mm512_srli_epi32(fb, 23), cff), g);
+  snz = _mm512_cmpneq_epi32_mask(S, zero);
+  inrange = _mm512_mask_cmplt_epi32_mask(_mm512_cmpgt_epi32_mask(newexp, zero), newexp, _mm512_set1_epi32(255));
+  const __m512i r = _mm512_or_si512(_mm512_or_si512(_mm512_and_si512(fb, _mm512_set1_epi32(0x7fffff)), _mm512_slli_epi32(newexp, 23)),
+                                    _mm512_and_si512(S, _mm512_set1_epi32(static_cast<int>(0x80000000u))));
+  res = _mm512_maskz_mov_epi32(static_cast<__mmask16>(snz & inrange), r);
+}
+
+// sum_to_f16_avx2 on sixteen lanes.
+__attribute__((VGPU_TC86_T512)) inline void sum_to_f16_avx512(__m512i S, __m512i g, __m512i& res, __mmask16& snz, __mmask16& inrange) {
+  const __m512i zero = _mm512_setzero_si512(), one = _mm512_set1_epi32(1), sb = _mm512_set1_epi32(static_cast<int>(0x80000000u));
+  const __m512i mag = _mm512_abs_epi32(S);
+  const __m512i hi = _mm512_and_si512(mag, _mm512_set1_epi32(~127));
+  const __m512i x = _mm512_mask_blend_epi32(_mm512_cmpgt_epi32_mask(hi, zero), mag, hi);
+  const __m512i lg = _mm512_sub_epi32(_mm512_srli_epi32(_mm512_castps_si512(_mm512_cvtepi32_ps(x)), 23), _mm512_set1_epi32(127));
+  const __m512i E = _mm512_add_epi32(lg, g);
+  const __m512i Eq = _mm512_sub_epi32(_mm512_max_epi32(E, _mm512_set1_epi32(-14)), _mm512_set1_epi32(10));
+  const __m512i r = _mm512_sub_epi32(Eq, g);
+  const __m512i rp = _mm512_min_epi32(_mm512_max_epi32(r, zero), _mm512_set1_epi32(32));
+  const __m512i l = _mm512_max_epi32(_mm512_sub_epi32(zero, r), zero);
+  snz = _mm512_cmpneq_epi32_mask(S, zero);
+  inrange = _mm512_cmpgt_epi32_mask(r, _mm512_set1_epi32(-32));
+  const __m512i q = _mm512_srlv_epi32(mag, rp);
+  const __m512i rem = _mm512_and_si512(mag, _mm512_sub_epi32(_mm512_sllv_epi32(one, rp), one));
+  const __m512i half = _mm512_sllv_epi32(one, _mm512_sub_epi32(rp, one));
+  const __mmask16 gt = _mm512_cmpgt_epu32_mask(rem, half);
+  const __mmask16 tie = _mm512_mask_cmpneq_epi32_mask(_mm512_mask_cmpeq_epi32_mask(_mm512_test_epi32_mask(q, one), rem, half), half, zero);
+  const __m512i R = _mm512_sllv_epi32(_mm512_mask_add_epi32(q, static_cast<__mmask16>(gt | tie), q, one), l);
+  const __m512i fR = _mm512_castps_si512(_mm512_cvtepi32_ps(R));
+  const __mmask16 Rnz = _mm512_cmpneq_epi32_mask(R, zero);
+  const __m512i eres = _mm512_add_epi32(_mm512_sub_epi32(_mm512_srli_epi32(fR, 23), _mm512_set1_epi32(127)), Eq);
+  const __mmask16 ovf = _mm512_cmpgt_epi32_mask(eres, _mm512_set1_epi32(15));
+  __m512i val = _mm512_maskz_add_epi32(Rnz, fR, _mm512_slli_epi32(Eq, 23));
+  val = _mm512_mask_blend_epi32(ovf, val, _mm512_set1_epi32(0x7f800000));
+  res = _mm512_maskz_mov_epi32(snz, _mm512_or_si512(val, _mm512_and_si512(S, sb)));
+}
+
+// mma_f_fix on sixteen lanes (a unit as described above): the lanes the vector form does not finish.
+template <unsigned NC, bool ACC16, bool PAIR>
+__attribute__((VGPU_TC86_T512, noinline, cold)) __m512i mma_f_fix512(__m512i S, __m512i g, __m512i accb, __m512i res, unsigned redo, unsigned special, unsigned bad,
+                                                                     const float* a, size_t lda, const float* b, size_t ldb, int emin) {
+  alignas(64) int32_t Sv[16], gv[16];
+  alignas(64) uint32_t accv[16], out[16];
+  _mm512_store_si512(Sv, S);
+  _mm512_store_si512(gv, g);
+  _mm512_store_si512(accv, accb);
+  _mm512_store_si512(out, res);
+  for (unsigned l = 0; l < 16; ++l) {
+    const float* const al = PAIR ? a + (l & 1) * lda : a;   // (the row of the lane, at the chunk's first k)
+    const float* const bl = b + (PAIR ? l >> 1 : l);        // (the column of the lane, at the chunk's first k)
+    if (special >> l & 1)
+      out[l] = std::bit_cast<uint32_t>(chunk_special(al, 1, bl, ldb, NC, std::bit_cast<float>(accv[l])));
+    else if (bad >> l & 1)
+      out[l] = std::bit_cast<uint32_t>(chunk_finite_raw(al, 1, bl, ldb, NC, std::bit_cast<float>(accv[l]), ACC16, emin));
+    else if (redo >> l & 1)
+      out[l] = std::bit_cast<uint32_t>(ACC16 ? detail::to_f16_rn(Sv[l], gv[l]) : detail::to_f32_rz(Sv[l], gv[l]));
+  }
+  return _mm512_load_si512(out);
+}
+
+// mma_avx2_chunked_f on sixteen-lane units. Returns false, having written nothing, in the cases it does (and for a shape it does not take:
+// the caller checks mma_avx512_f_shape first).
+inline bool mma_avx512_f_shape(unsigned M, unsigned N) { return N % 16 == 0 || (N == 8 && M % 2 == 0); }
+
+template <unsigned NC, bool ACC16>
+__attribute__((VGPU_TC86_T512, aligned(64), noinline)) inline bool mma_avx512_chunked_f(unsigned M, unsigned N, unsigned K, int emin, const float* A, size_t lda, const float* B,
+                                                                              size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
+  constexpr unsigned kMaxM = 32, kMaxN = 32, kMaxK = 16;
+  alignas(64) float bf[kMaxK * kMaxN];
+  alignas(64) int32_t bterm[kMaxK * kMaxN];
+  alignas(64) float af[kMaxM * kMaxK + 8];
+  alignas(64) int32_t aterm[kMaxM * kMaxK + 8];
+  alignas(64) int64_t apf[kMaxM / 2 * kMaxK + 4];   // N == 8: the pairs of rows (2p, 2p+1) at each k, as one 64-bit element of floats
+  alignas(64) int64_t apt[kMaxM / 2 * kMaxK + 4];   //  ... and of terms
+  alignas(64) float bf2[kMaxK * 16];                //  ... and the columns, each doubled
+  alignas(64) int32_t bt2[kMaxK * 16];
+  unsigned any_nonfin = 0;
+  const __m256i zero = _mm256_setzero_si256(), c255 = _mm256_set1_epi32(255), cff = _mm256_set1_epi32(0xff), c7fffff = _mm256_set1_epi32(0x7fffff),
+                one = _mm256_set1_epi32(1), c127 = _mm256_set1_epi32(127), cnoterm = _mm256_set1_epi32(kNoTerm), cemin = _mm256_set1_epi32(emin),
+                cmask = _mm256_set1_epi32(static_cast<int>(0xffffe000u));
+  // (the decoding and the range checks are those of mma_avx2_chunked_f)
+  __m256i amx = zero, amn = _mm256_set1_epi32(-1), bmx = zero, bmn = _mm256_set1_epi32(-1), subn = zero;
+  const auto decode8 = [&](const float* p, int bias, float* fout, int32_t* tout, __m256i& mx, __m256i& mn) __attribute__((target("avx2"))) {
+    const __m256i bits = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    const __m256i masked = _mm256_and_si256(bits, cmask);
+    const __m256i e = _mm256_and_si256(_mm256_srli_epi32(bits, 23), cff);
+    const __m256i nonfin = _mm256_cmpeq_epi32(e, c255), ez = _mm256_cmpeq_epi32(e, zero);
+    subn = _mm256_or_si256(subn, _mm256_and_si256(_mm256_and_si256(ez, masked), c7fffff));
+    const __m256i term = _mm256_add_epi32(_mm256_max_epi32(_mm256_sub_epi32(e, c127), cemin), _mm256_set1_epi32(bias));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tout), _mm256_blendv_epi8(term, cnoterm, _mm256_or_si256(nonfin, ez)));
+    _mm256_storeu_ps(fout, _mm256_castsi256_ps(masked));
+    mx = _mm256_max_epi32(mx, e);
+    mn = _mm256_min_epu32(mn, _mm256_sub_epi32(e, one));
+    return static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(nonfin)));
+  };
+  int sm_x = 0, sm_n = 255;
+  bool tail_sub = false;
+  for (unsigned i = 0; i < M; ++i) {
+    unsigned k = 0;
+    for (; k + 8 <= K; k += 8) any_nonfin |= decode8(A + i * lda + k, 1, &af[i * K + k], &aterm[i * K + k], amx, amn);
+    for (; k < K; ++k) {
+      const uint32_t b = std::bit_cast<uint32_t>(A[i * lda + k]);
+      const uint32_t e = (b >> 23) & 0xffu, mb = b & 0xffffe000u;
+      af[i * K + k] = std::bit_cast<float>(mb);
+      if (e == 255) any_nonfin = 1;
+      const bool dead = e == 0 || e == 255;
+      if (e == 0 && (mb & 0x7fffffu)) tail_sub = true;
+      aterm[i * K + k] = dead ? kNoTerm : std::max(static_cast<int32_t>(e) - 127, emin) + 1;
+      if (!dead) {
+        sm_x = std::max(sm_x, static_cast<int>(e));
+        sm_n = std::min(sm_n, static_cast<int>(e));
+      }
+    }
+  }
+  for (unsigned jb = 0; jb < N / 8; ++jb)
+    for (unsigned k0 = 0; k0 < K; k0 += NC) {
+      unsigned nf = 0;
+      for (unsigned k = k0; k < k0 + NC; ++k) nf |= decode8(B + k * ldb + jb * 8, 0, &bf[k * N + jb * 8], &bterm[k * N + jb * 8], bmx, bmn);
+      any_nonfin |= nf;
+    }
+  const auto hmax = [](__m256i v) __attribute__((target("avx2"))) {
+    alignas(32) int32_t t[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(t), v);
+    return *std::max_element(t, t + 8);
+  };
+  if (any_nonfin || tail_sub || !_mm256_testz_si256(subn, subn)) return false;
+  const auto hminu = [](__m256i v) __attribute__((target("avx2"))) {
+    alignas(32) uint32_t t[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(t), v);
+    return *std::min_element(t, t + 8);
+  };
+  const auto field_min = [](uint32_t m) { return m >= 254 ? 255 : static_cast<int>(m) + 1; };
+  const int a_max = std::max(hmax(amx), sm_x), a_min = std::min(field_min(hminu(amn)), sm_n), b_max = hmax(bmx), b_min = field_min(hminu(bmn));
+  if (a_min <= 254 && b_min <= 254 && a_min + b_min < 128) return false;
+  if (a_max + b_max > 379) return false;
+
+  const bool pair = N == 8;
+  if (pair) {
+    // the A side as 64-bit elements (row 2p, row 2p+1), the B side with each column doubled
+    for (unsigned p = 0; p < M / 2; ++p) {
+      unsigned k = 0;
+      for (; k + 8 <= K; k += 8)
+        for (int w = 0; w < 2; ++w) {
+          const int32_t* const src = w ? aterm : reinterpret_cast<const int32_t*>(af);
+          int64_t* const dst = w ? apt : apf;
+          const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 2 * p * K + k));
+          const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + (2 * p + 1) * K + k));
+          const __m256i lo = _mm256_unpacklo_epi32(x, y), hi = _mm256_unpackhi_epi32(x, y);
+          _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + p * K + k), _mm256_permute2x128_si256(lo, hi, 0x20));
+          _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + p * K + k + 4), _mm256_permute2x128_si256(lo, hi, 0x31));
+        }
+      for (; k < K; ++k) {
+        apt[p * K + k] = static_cast<int64_t>(static_cast<uint64_t>(static_cast<uint32_t>(aterm[2 * p * K + k])) | static_cast<uint64_t>(static_cast<uint32_t>(aterm[(2 * p + 1) * K + k])) << 32);
+        apf[p * K + k] = static_cast<int64_t>(static_cast<uint64_t>(std::bit_cast<uint32_t>(af[2 * p * K + k])) | static_cast<uint64_t>(std::bit_cast<uint32_t>(af[(2 * p + 1) * K + k])) << 32);
+      }
+    }
+    const __m512i dup = _mm512_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7);
+    for (unsigned k = 0; k < K; ++k) {
+      _mm512_store_si512(&bf2[k * 16], _mm512_permutexvar_epi32(dup, _mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(&bf[k * 8])))));
+      _mm512_store_si512(&bt2[k * 16], _mm512_permutexvar_epi32(dup, _mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(&bterm[k * 8])))));
+    }
+  }
+
+  const auto rows = [&]<bool PAIR, unsigned R>(std::bool_constant<PAIR>, std::integral_constant<unsigned, R>, unsigned u0) __attribute__((VGPU_TC86_T512)) {
+    const unsigned Nl = N, Kl = K, nb = PAIR ? 1 : N / 16;
+    const size_t ldcl = ldc, lddl = ldd, ldbl = ldb, ldal = lda;
+    const float* const Cl = C;
+    float* const Dl = D;
+    const float* const Al = A;
+    const float* const Bl = B;
+    const int32_t* const atl = aterm;
+    const float* const afl = af;
+    const int64_t* const aptl = apt;
+    const int64_t* const apfl = apf;
+    const int32_t* const btl = PAIR ? bt2 : bterm;
+    const float* const bfl = PAIR ? bf2 : bf;
+    const size_t bstride = PAIR ? 16 : Nl;
+    const int emin_l = emin;
+    const __m512i cff = _mm512_set1_epi32(0xff), c7fffff = _mm512_set1_epi32(0x7fffff), c255 = _mm512_set1_epi32(255), c150 = _mm512_set1_epi32(150),
+                  c127 = _mm512_set1_epi32(127), c25 = _mm512_set1_epi32(25), one = _mm512_set1_epi32(1), zero = _mm512_setzero_si512(),
+                  idx_in = _mm512_setr_epi32(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15),     // lane 2j + r <- r * 8 + j
+                  idx_out = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);    // r * 8 + j <- lane 2j + r
+    // (the A side of unit u at k: a broadcast of one number, or of a pair)
+    const auto bcast_t = [&](unsigned u, unsigned k) __attribute__((VGPU_TC86_T512)) {
+      if constexpr (PAIR) return _mm512_set1_epi64(aptl[size_t{u} * Kl + k]);
+      else return _mm512_set1_epi32(atl[size_t{u} * Kl + k]);
+    };
+    const auto bcast_f = [&](unsigned u, unsigned k) __attribute__((VGPU_TC86_T512)) {
+      if constexpr (PAIR) return _mm512_castsi512_ps(_mm512_set1_epi64(apfl[size_t{u} * Kl + k]));
+      else return _mm512_set1_ps(afl[size_t{u} * Kl + k]);
+    };
+    for (unsigned jb = 0; jb < nb; ++jb) {
+      __m512i accb[R];
+      VGPU_TC86_UNROLL
+      for (unsigned r = 0; r < R; ++r) {
+        if constexpr (PAIR) {
+          const size_t i = 2 * size_t{u0 + r};
+          const __m512i v = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(Cl + i * ldcl))),
+                                               _mm256_loadu_si256(reinterpret_cast<const __m256i*>(Cl + (i + 1) * ldcl)), 1);
+          accb[r] = _mm512_permutexvar_epi32(idx_in, v);
+        } else
+          accb[r] = _mm512_loadu_si512(Cl + (u0 + r) * ldcl + jb * 16);
+      }
+      for (unsigned k0 = 0; k0 < Kl; k0 += NC) {
+        __m512i top[R], g[R], S[R];
+        __m512 scale[R];
+        __mmask16 acc_nonfin[R], badg[R];
+        const int32_t* const bt = btl + size_t{k0} * bstride + (PAIR ? 0 : jb * 16);
+        const float* const bp = bfl + size_t{k0} * bstride + (PAIR ? 0 : jb * 16);
+        VGPU_TC86_UNROLL
+        for (unsigned r = 0; r < R; ++r) {
+          top[r] = _mm512_set1_epi32(kNoTerm);
+          VGPU_TC86_UNROLL
+          for (unsigned t = 0; t < NC; ++t)
+            top[r] = _mm512_max_epi32(top[r], _mm512_add_epi32(bcast_t(u0 + r, k0 + t), _mm512_load_si512(bt + size_t{t} * bstride)));
+        }
+        VGPU_TC86_UNROLL
+        for (unsigned r = 0; r < R; ++r) {
+          const __m512i ae = _mm512_and_si512(_mm512_srli_epi32(accb[r], 23), cff), am = _mm512_and_si512(accb[r], c7fffff);
+          const __mmask16 aenz = _mm512_cmpneq_epi32_mask(ae, zero);
+          acc_nonfin[r] = _mm512_cmpeq_epi32_mask(ae, c255);
+          __m512i asig = _mm512_mask_or_epi32(am, aenz, am, _mm512_set1_epi32(0x800000));
+          const __m512i alsb = _mm512_mask_blend_epi32(aenz, _mm512_set1_epi32(-149), _mm512_sub_epi32(ae, c150));
+          const __m512i lead = _mm512_sub_epi32(_mm512_srli_epi32(_mm512_castps_si512(_mm512_cvtepi32_ps(asig)), 23), c127);
+          top[r] = _mm512_max_epi32(top[r], _mm512_add_epi32(_mm512_add_epi32(lead, alsb), one));
+          asig = _mm512_mask_sub_epi32(asig, _mm512_movepi32_mask(accb[r]), zero, asig);
+          g[r] = _mm512_sub_epi32(top[r], c25);
+          S[r] = shift_term_avx512(asig, _mm512_sub_epi32(alsb, g[r]));
+          const __mmask16 live = _mm512_cmpgt_epi32_mask(top[r], _mm512_set1_epi32(-200));
+          const __m512i sexp = _mm512_maskz_sub_epi32(live, c127, g[r]);
+          badg[r] = static_cast<__mmask16>(_mm512_mask_cmplt_epi32_mask(live, sexp, one) | _mm512_mask_cmpgt_epi32_mask(live, sexp, _mm512_set1_epi32(254)));
+          scale[r] = _mm512_castsi512_ps(_mm512_slli_epi32(sexp, 23));
+        }
+        VGPU_TC86_UNROLL
+        for (unsigned r = 0; r < R; ++r) {
+          VGPU_TC86_UNROLL
+          for (unsigned t = 0; t < NC; ++t) {
+            const __m512 x = _mm512_mul_ps(bcast_f(u0 + r, k0 + t), _mm512_load_ps(bp + size_t{t} * bstride));
+            S[r] = _mm512_add_epi32(S[r], _mm512_cvttps_epi32(_mm512_mul_ps(x, scale[r])));
+          }
+        }
+        VGPU_TC86_UNROLL
+        for (unsigned r = 0; r < R; ++r) {
+          __m512i res;
+          __mmask16 snz, inrange;
+          if constexpr (ACC16)
+            sum_to_f16_avx512(S[r], g[r], res, snz, inrange);
+          else
+            sum_to_f32_avx512(S[r], g[r], res, snz, inrange);
+          const unsigned redo = static_cast<unsigned>(snz & ~inrange & 0xffffu), special = acc_nonfin[r], bad = badg[r];
+          if (__builtin_expect(redo | special | bad, 0)) {
+            const size_t row = PAIR ? 2 * size_t{u0 + r} : size_t{u0 + r};
+            res = mma_f_fix512<NC, ACC16, PAIR>(S[r], g[r], accb[r], res, redo, special, bad, &Al[row * ldal + k0], ldal, &Bl[size_t{k0} * ldbl + (PAIR ? 0 : jb * 16)], ldbl, emin_l);
+          }
+          accb[r] = res;
+        }
+      }
+      VGPU_TC86_UNROLL
+      for (unsigned r = 0; r < R; ++r) {
+        if constexpr (PAIR) {
+          const size_t i = 2 * size_t{u0 + r};
+          const __m512i v = _mm512_permutexvar_epi32(idx_out, accb[r]);
+          _mm256_storeu_si256(reinterpret_cast<__m256i*>(Dl + i * lddl), _mm512_castsi512_si256(v));
+          _mm256_storeu_si256(reinterpret_cast<__m256i*>(Dl + (i + 1) * lddl), _mm512_extracti64x4_epi64(v, 1));
+        } else
+          _mm512_storeu_si512(Dl + (u0 + r) * lddl + jb * 16, accb[r]);
+      }
+    }
+  };
+  const unsigned units = pair ? M / 2 : M;
+  unsigned u = 0;
+  if (pair) {
+    for (; u + VGPU_TC86_ROWS_Z <= units; u += VGPU_TC86_ROWS_Z) rows(std::true_type{}, std::integral_constant<unsigned, VGPU_TC86_ROWS_Z>{}, u);
+    for (; u < units; ++u) rows(std::true_type{}, std::integral_constant<unsigned, 1>{}, u);
+  } else {
+    for (; u + VGPU_TC86_ROWS_Z <= units; u += VGPU_TC86_ROWS_Z) rows(std::false_type{}, std::integral_constant<unsigned, VGPU_TC86_ROWS_Z>{}, u);
+    for (; u < units; ++u) rows(std::false_type{}, std::integral_constant<unsigned, 1>{}, u);
+  }
+  return true;
+}
+
 // The vector form for an N that is a multiple of 8 (an f32 accumulator, or with acc_f16 an f16 one).
 template <bool ACC16>
 __attribute__((target("avx2"))) inline void mma_avx2_acc(unsigned M, unsigned N, unsigned K, unsigned chunk, int emin, const float* A, size_t lda, const float* B,
                                                          size_t ldb, const float* C, size_t ldc, float* D, size_t ldd) {
   if (chunk == 8 && K % 8 == 0) {
-    if (!mma_avx2_chunked_f<8, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd)) mma_avx2_chunked<8, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd);
+    if (!(simd::kernels().level == simd::Level::Avx512 && mma_avx512_f_shape(M, N) ? mma_avx512_chunked_f<8, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd)
+                                                                                  : mma_avx2_chunked_f<8, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd)))
+      mma_avx2_chunked<8, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd);
   } else if (chunk == 4 && K % 4 == 0) {
-    if (!mma_avx2_chunked_f<4, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd)) mma_avx2_chunked<4, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd);
+    if (!(simd::kernels().level == simd::Level::Avx512 && mma_avx512_f_shape(M, N) ? mma_avx512_chunked_f<4, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd)
+                                                                                  : mma_avx2_chunked_f<4, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd)))
+      mma_avx2_chunked<4, ACC16>(M, N, K, emin, A, lda, B, ldb, C, ldc, D, ldd);
   } else
     mma_avx2_generic(M, N, K, chunk, emin, A, lda, B, ldb, C, ldc, D, ldd);   // (f32 accumulator only: mma() sends no other)
 }
