@@ -469,6 +469,19 @@ static void ptx_target(const FatbinPtx& p, uint32_t* arch, char* suffix) {
   if (i < p.text.size() && (p.text[i] == 'a' || p.text[i] == 'f')) *suffix = p.text[i];
 }
 
+static bool ptx_runs(uint32_t arch, char suffix, uint32_t cc) {
+  return suffix == 'a'   ? arch == cc
+         : suffix == 'f' ? (arch / 10 == cc / 10 && arch <= cc)
+                         : arch <= cc;
+}
+
+bool ptx_runs_on(const FatbinPtx& ptx, uint32_t cc) {
+  uint32_t arch;
+  char suffix;
+  ptx_target(ptx, &arch, &suffix);
+  return ptx_runs(arch, suffix, cc);
+}
+
 size_t pick_ptx(const std::vector<FatbinPtx>& ptxs, uint32_t cc) {
   if (ptxs.empty()) return 0;
   auto specificity = [](char s) { return s == 'a' ? 2 : s == 'f' ? 1 : 0; };
@@ -479,9 +492,7 @@ size_t pick_ptx(const std::vector<FatbinPtx>& ptxs, uint32_t cc) {
     uint32_t arch;
     char suffix;
     ptx_target(ptxs[i], &arch, &suffix);
-    const bool runs = suffix == 'a'   ? arch == cc
-                      : suffix == 'f' ? (arch / 10 == cc / 10 && arch <= cc)
-                                      : arch <= cc;
+    const bool runs = ptx_runs(arch, suffix, cc);
     if (!runs) continue;
     if (best == ptxs.size() || arch > best_arch ||
         (arch == best_arch && specificity(suffix) > specificity(best_suffix))) {
