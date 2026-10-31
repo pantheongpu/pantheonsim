@@ -3025,12 +3025,25 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
 // count_access of a shared-memory access, with the host thread's table of bank passes by shape (a table in the Block would
 // be the same thing, but it moves the heap blocks that follow it, and the tensor-core tile kernels are sensitive to where
 // their buffers sit; made by the thread's first shared access).
+exec::memcount::BankMemo& thread_bank_memo() {
+  thread_local std::unique_ptr<exec::memcount::BankMemo> memo;
+  if (!memo) memo = std::make_unique<exec::memcount::BankMemo>();
+  return *memo;
+}
+
 void count_shared_access(exec::LaunchStats& st, bool store, const uint64_t* addr, Mask lanes, uint32_t bytes) {
   const uint64_t n = popc(lanes);
   if (!n) return;
-  thread_local std::unique_ptr<exec::memcount::BankMemo> memo;
-  if (!memo) memo = std::make_unique<exec::memcount::BankMemo>();
+  exec::memcount::BankMemo* const memo = &thread_bank_memo();
   count_shared(st, store, n, bytes, exec::memcount::sass_bank_passes_memo(*memo, addr, lanes, 32, bytes));
+}
+
+// count_shared_access for a warp given as 32-bit offsets (the tier's shared-memory handler): the same counts, without widening them.
+void count_shared_offsets(exec::LaunchStats& st, bool store, const uint32_t* offs, Mask lanes, uint32_t bytes) {
+  const uint64_t n = popc(lanes);
+  if (!n) return;
+  exec::memcount::BankMemo* const memo = &thread_bank_memo();
+  count_shared(st, store, n, bytes, exec::memcount::sass_bank_passes_offsets(*memo, offs, lanes, bytes));
 }
 
 // count_access for a coalesced run: the lanes of `ex`, which are the `count` consecutive ones from `first`, made their

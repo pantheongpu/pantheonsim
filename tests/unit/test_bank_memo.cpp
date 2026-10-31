@@ -321,3 +321,184 @@ VTEST(a_shape_remembered_low_is_not_answered_for_addresses_at_the_top_of_the_spa
 }
 
 VTEST_MAIN
+
+// ---- sass_bank_passes_offsets: the same table keyed by a warp's 32-bit offsets (what the tier's shared-memory handler has)
+
+namespace {
+
+// The definition on the offsets as the handler widens them: an active lane's offset as it is.
+uint32_t offsets_def(const uint32_t* o, uint32_t mask, uint32_t bytes) {
+  uint64_t a[32];
+  for (unsigned l = 0; l < 32; ++l) a[l] = o[l];
+  return passes_def(a, mask, bytes);
+}
+
+}  // namespace
+
+VTEST(offsets_are_counted_as_the_definition_counts_them) {
+  Rng r(20261031);
+  mc::BankMemo memo;   // (one table throughout: hits, collisions, the most recent entry, the back-off)
+  const uint32_t widths[] = {1, 2, 3, 4, 4, 4, 4, 6, 8, 8, 12, 16, 16, 24, 32, 64};
+  std::vector<Shape> pool;
+  for (int i = 0; i < 400; ++i) pool.push_back(make_shape(r, static_cast<unsigned>(r.below(7))));
+  uint64_t hits_expected = 0;
+  for (int i = 0; i < 600000; ++i) {
+    const Shape& sh = pool[r.below(r.below(8) == 0 ? pool.size() : 40)];
+    const uint32_t bytes = widths[r.below(16)];
+    uint32_t mask = 0xFFFFFFFFu;
+    switch (r.below(6)) {
+      case 0: mask = static_cast<uint32_t>(r.next() | r.next()); break;
+      case 1: mask = static_cast<uint32_t>(r.next()); break;
+      case 2: mask = 0xFFFFu << r.below(16); break;
+      case 3: mask = 1u << r.below(32); break;
+      default: break;
+    }
+    if (!mask) mask = 1;
+    uint64_t base;
+    switch (r.below(8)) {
+      case 0: base = r.below(1 << 14); break;
+      case 1: base = (r.below(1 << 12)) * 4 + (r.below(4) == 0 ? r.below(4) : 0); break;
+      case 2: base = (uint64_t{r.below(16)} << 24) + r.below(1 << 20) * 4; break;   // a cluster rank above the offset
+      case 3: base = (uint64_t{1} << 31) - 600 + r.below(1200); break;             // across bit 31: counted, not remembered
+      case 4: base = (uint64_t{1} << 32) - 300 + r.below(300); break;             // lanes that run past 2^32 wrap in 32 bits
+      default: base = r.below(1 << 16) * 4; break;
+    }
+    uint32_t o[32];
+    for (unsigned l = 0; l < 32; ++l) o[l] = static_cast<uint32_t>(base + sh.off[l]);
+    if (r.below(5) == 0) {   // the lanes that do not run hold whatever the register had
+      for (unsigned l = 0; l < 32; ++l)
+        if (!(mask >> l & 1)) o[l] = static_cast<uint32_t>(r.next());
+    }
+    if (r.below(7) == 0) o[r.below(32)] += 4 * (1 + r.below(70)) + (r.below(3) == 0 ? 1 : 0);
+    // (a lane that runs and wrapped past 2^32 is not a shape the handler can have -- its window test sends it to the general path --
+    // but the function still has to give the definition's answer for the 32-bit numbers it was given)
+    VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, mask, bytes), offsets_def(o, mask, bytes));
+    ++hits_expected;
+  }
+  VCHECK(hits_expected == 600000);
+}
+
+VTEST(offsets_that_differ_in_one_lane_one_byte_or_the_mask_are_counted_for_what_they_are) {
+  mc::BankMemo memo;
+  uint32_t o[32];
+  const auto rows = [&](uint32_t base) {
+    for (unsigned l = 0; l < 32; ++l) o[l] = base + 4 * (l % 16) + 4 * 160 * (l / 16);
+  };
+  rows(4096);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), 2u);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), 2u);   // (the most recent entry)
+  VCHECK_EQ(memo.hits32, 1u);
+  // The same offsets read as 8 bytes: another shape (the width is part of the key).
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 8), offsets_def(o, 0xFFFFFFFFu, 8));
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), 2u);
+  // Moved by whole words and far (a cluster rank): a hit each time.
+  rows(4096 + 4 * 37);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), 2u);
+  rows((5u << 24) + 4 * 1000);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), 2u);
+  // The second row moved onto the other half of the banks: no conflict now, not the remembered 2 (the most recent entry is
+  // asked first, and must not answer for it).
+  rows(4096);
+  for (unsigned l = 16; l < 32; ++l) o[l] += 4 * 16;
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), offsets_def(o, 0xFFFFFFFFu, 4));
+  // One lane on the other row's word; and with only that pair running.
+  rows(4096);
+  o[31] = o[15];
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), 2u);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0x80008000u, 4), 1u);
+  rows(4096);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0x00018000u, 4), 1u);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0x00010001u, 4), 2u);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), 2u);
+  // A byte in the word: an unaligned 4-byte access covers two words.
+  for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 1 + 4 * (l % 16) + 4 * 160 * (l / 16);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), offsets_def(o, 0xFFFFFFFFu, 4));
+  // Offsets with bit 31 set are counted, never answered from the table: two lanes 2^32 apart in the 32-bit key's wrap, here
+  // lanes one word apart and the same two lanes with one of them across bit 31.
+  rows(0x7fffff00u);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), offsets_def(o, 0xFFFFFFFFu, 4));
+  rows(0x7ffffff0u);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), offsets_def(o, 0xFFFFFFFFu, 4));
+  for (unsigned l = 0; l < 32; ++l) o[l] = 4 * l;
+  o[7] = 0xfffffffeu;   // (lane 7 at -2: a lane that runs, 4 GB away in true terms)
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), offsets_def(o, 0xFFFFFFFFu, 4));
+  for (unsigned l = 0; l < 32; ++l) o[l] = 4 * l;
+  o[7] = 2;   // the shape the wrapped key above would equal if the wrap were not refused
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), offsets_def(o, 0xFFFFFFFFu, 4));
+}
+
+VTEST(offsets_on_a_stride_and_ones_that_never_repeat_stay_right) {
+  Rng r(31);
+  mc::BankMemo memo;
+  uint32_t o[32];
+  for (uint32_t stride : {4u, 8u, 16u, 128u, 132u, 36u, 1u, 2u, 3u, 64u, 0u}) {
+    for (uint32_t bytes : {1u, 4u, 8u, 16u}) {
+      for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + stride * l;
+      VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, bytes), offsets_def(o, 0xFFFFFFFFu, bytes));
+      VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0x0FF0FF00u, bytes), offsets_def(o, 0x0FF0FF00u, bytes));
+    }
+  }
+  bool skipped = false;
+  for (int i = 0; i < 6000; ++i) {   // a gather that never repeats: the table is left alone for a while
+    for (unsigned l = 0; l < 32; ++l) o[l] = 4 * static_cast<uint32_t>(r.below(1 << 12));
+    VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), offsets_def(o, 0xFFFFFFFFu, 4));
+    skipped = skipped || memo.skip32 > 0;
+  }
+  VCHECK(skipped);
+  for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 4 * (l % 16) + 4 * 160 * (l / 16);
+  for (int i = 0; i < 2000; ++i) VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0xFFFFFFFFu, 4), 2u);
+  VCHECK(memo.skip32 == 0);
+}
+
+VTEST(offsets_every_pair_of_lanes_and_every_lane_left_out_are_counted_by_the_lanes_that_run) {
+  // The lanes that do not run hold real offsets here, so a key that took a lane for running (or not) when it did not (or did) would
+  // answer one mask with another's passes: every pair of lanes (two rows of 16 words, 160 words apart: lanes l and l + 16 conflict)
+  // and every mask of all lanes but one, twice each with one table, so that the second time is a hit.
+  mc::BankMemo memo;
+  uint32_t o[32];
+  for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 4 * (l % 16) + 4 * 160 * (l / 16);
+  for (int round = 0; round < 2; ++round) {
+    for (unsigned a = 0; a < 32; ++a) {
+      for (unsigned b = a + 1; b < 32; ++b) {
+        const uint32_t mask = (1u << a) | (1u << b);
+        VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, mask, 4), offsets_def(o, mask, 4));
+      }
+      const uint32_t left_out = ~(1u << a);
+      VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, left_out, 4), offsets_def(o, left_out, 4));
+    }
+  }
+}
+
+VTEST(offsets_a_lane_that_joins_the_mask_changes_the_answer_though_its_offset_was_in_the_warp_all_along) {
+  // Lanes c and a + 16 run, then lane a joins them (it conflicts with a + 16: 2 passes, not 1), then it leaves again, with one table:
+  // the idle lane's offset must not make the first and the second the same shape.
+  mc::BankMemo memo;
+  uint32_t o[32];
+  for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 4 * (l % 16) + 4 * 160 * (l / 16);
+  for (unsigned c = 0; c < 32; ++c) {
+    for (unsigned a = 0; a < 16; ++a) {
+      if (c == a || c == a + 16) continue;
+      const uint32_t without = (1u << c) | (1u << (a + 16)), with = without | (1u << a);
+      VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, without, 4), 1u);
+      VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, with, 4), 2u);
+      VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, without, 4), 1u);
+    }
+  }
+}
+
+VTEST(offsets_across_bit_31_are_not_taken_for_the_same_shape_in_low_memory) {
+  // Two lanes: one a word below the other's word in the first warp (offsets 4096 and 4094), the second warp has the same differences
+  // modulo 2^32 (0 and 0xfffffffe) but its second lane is 4 GB above in truth. The first has its two words in the banks of 4096's,
+  // 1 pass; the second has lane 0's word and a word of the same bank 2^30 words away, 2 passes. Equal 32-bit keys must not answer
+  // for both.
+  mc::BankMemo memo;
+  uint32_t o[32] = {};
+  o[0] = 4096;
+  o[7] = 4094;
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0x81u, 4), offsets_def(o, 0x81u, 4));
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0x81u, 4), 1u);
+  o[0] = 0;
+  o[7] = 0xfffffffeu;
+  VCHECK_EQ(offsets_def(o, 0x81u, 4), 2u);
+  VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0x81u, 4), 2u);
+}

@@ -1072,22 +1072,6 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
   c.r->tier_exec_mem(blk, w, *op.ins, ex);
 }
 
-// The 64-bit addresses the counting functions take, from a warp's 32-bit offsets: the active lanes' as they are, the others' zero (the
-// lanes that do not run read as zero, as the counting functions find them).
-[[gnu::always_inline]] inline void tier_widen_offsets(uint64_t* addrs, const uint32_t* offs, Mask ex) {
-#if defined(__SSE2__)
-  const __m128i zero = _mm_setzero_si128(), bit = _mm_set_epi32(8, 4, 2, 1);
-  for (unsigned g = 0; g < 8; ++g) {
-    __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(offs) + g);
-    if (ex != kAll) v = _mm_and_si128(v, _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(static_cast<int>(ex >> (4 * g))), bit), bit));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(addrs) + 2 * g, _mm_unpacklo_epi32(v, zero));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(addrs) + 2 * g + 1, _mm_unpackhi_epi32(v, zero));
-  }
-#else
-  for (unsigned l = 0; l < 32; ++l) addrs[l] = (ex >> l & 1) ? offs[l] : 0;
-#endif
-}
-
 // A whole warp's 4-byte shared accesses that are not one run of 32 words: each group of eight lanes is moved as 32 bytes when its
 // offsets are eight consecutive words (a tile row of 8, 16 or 32 words, or two rows in one warp), else lane by lane. The groups run in
 // order, so where two lanes name one word the later lane's value is the one stored, as in the lane loop (the words of one group are all
@@ -1212,8 +1196,6 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
       return;
     }
   }
-  uint64_t addrs[32];
-  tier_widen_offsets(addrs, offs, ex);
   const unsigned words = std::max(1u, bytes / 4);
   const bool by_groups = bytes == 4 && ex == kAll;
   if (by_groups) tier_shared_words<Store>(sh, d, offs);
@@ -1256,7 +1238,7 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
       }
     }
   }
-  count_shared_access(blk.st, Store, addrs, ex, bytes);
+  count_shared_offsets(blk.st, Store, offs, ex, bytes);
 }
 
 // Local memory: each lane's window of the warp's array, when every active lane's access is inside the thread's frame.
