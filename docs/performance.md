@@ -5768,3 +5768,74 @@ The 12-workload canary (`bench.py --ab`, `--threads 1 --cpus 7`, 9 runs, sass + 
 ### Not done
 * Running body 0 on the caller (see above) and a per-launch thread count that follows the grid's size as well as the cost: the cap already gives the right order of magnitude, and a threshold of 100 us of work per thread was chosen, not tuned (50 us would give 2 threads to a 100 us launch).
 * The PTX engine's multi-thread loop keeps its own per-thread statistics and a chunked counter, and has no lock per block.
+
+## Round sp13: the AMD matrix kernels in a unit of their own (branch `sp13-amd-lto`, base `sp12-combined`)
+
+The sp12 fix for the AMD matrix path was a pair of compile flags (`-falign-loops=32` on `gcn_exec.cpp`, an `align-loops=64` attribute on two functions): the layout of a
+few-instruction loop still depended on what the linker put ahead of it, and `mfma_i8` and `mfma_f64_4b` stayed behind. The question: take the matrix kernels out of the
+library's link-time optimization and the layout is theirs alone.
+
+### What changed
+
+`amd/src/gcn_matrix_kernels.cpp` (new) holds `mfma_tile_f_avx2`, `mfma_tile_fma_hw`, `mfma_tile_fma_avx2`, `mfma_tile_int_avx2` (moved out of `mfma_math.hpp`, which
+declares them) and `matrix_decode_wide_avx2<T, Run>` (moved out of `gcn_exec.cpp`, eight instances, `gcn_matrix_kernels.hpp`). The unit is built `-fno-lto -falign-functions=64
+-falign-loops=32` (CMakeLists.txt), as `gcn_tier_ds.cpp` is. Two things the move needed: the decoder's AVX2 target has to come from a `#pragma GCC target` region (on a function
+template's definition the target did not reach the explicit instantiations and the always-inline lambdas in them), and the K = 4 fused kernel got its own pair of loops (out of line,
+with the K test inside the column loop, it ran 5 % slower than when it was inlined into a caller that knew K). Same arithmetic, same bits.
+
+### Layout stability (server2, Zen 5, cpu 24, `tools/bench-amd/bench.py`, one host thread, 21 alternating runs a row, cpu seconds)
+
+The test: add 1 (P1) or 4 (P4) unrelated `noinline` functions to `src/core/error.cpp`, which is linked ahead of everything, and compare each build with the same tree before the edit.
+Medians of with-the-edit / without, noise (A/A, same code, two copies of the build) 0.97 to 1.01. (The branch columns were timed with the unit at `-falign-loops=64`, one step before the final 32; for the final build the check is the identical machine code below.)
+
+| row | sp12 tree, +1 function | sp12 tree, +4 | this branch, +1 | this branch, +4 |
+| --- | ---: | ---: | ---: | ---: |
+| `mfma` | 0.982 | 0.953 | 0.999 | 0.997 |
+| `mfma_bf16` | 0.981 | 0.977 | 1.008 | 1.010 |
+| `mfma_i8` | 0.969 | 0.973 | 1.019 | 1.000 |
+| `mfma_f64` | 0.985 | 1.001 | 0.998 | 1.003 |
+| `mfma_f64_4b` | 1.021 | 1.005 | 0.981 | 0.983 |
+| `smfmac` | 0.985 | 0.981 | 1.004 | 1.002 |
+
+With the integer kernel still inline the same edit cost `mfma_i8` 7 % (0.929), which is why `mfma_tile_int_avx2` moved too. The machine code and the offset modulo 64 of all twelve
+functions of the unit are identical with and without the edit (with the edit the library's text moved by some hundred bytes; `nm` + `objdump -s` of each symbol): the layout cannot move
+any more, short of an edit of the unit itself.
+
+### Speed against sp12-combined (same bench, median of three 21-run A/Bs, same host, load 7 to 12 from other sessions; A/A over 21 runs: 0.97 to 1.01)
+
+| row | B / A |
+| --- | ---: |
+| `mfma_i8` | 1.103, 1.060, 1.060 |
+| `mfma` | 0.988, 0.986, 0.957 |
+| `mfma_bf16` | 0.977, 0.970, 0.959 |
+| `smfmac` | 0.980, 0.981, 0.981 |
+| `mfma_f64` | 1.008, 0.972, 0.979 |
+| `mfma_f64_4b` | 1.062, 0.994, 0.997 |
+| `valu_int`, `valu_f32`, `lds`, `divergent`, `wave` | 0.99 to 1.03 |
+| `launch` | 1.054, 1.043, 1.042 |
+
+So the integer rows gain 6 to 10 %, and `mfma`, `mfma_bf16`, `smfmac` are 1 to 4 % below the sp12 tree, whose layout was a good one for them: the same sp12 tree with one unrelated function
+added is 2 to 5 % below itself on those rows (table above). Counters are identical (`--check-counters`).
+
+### Zen 4 (server3, Ryzen 7 PRO 8840U, cpu 3, load 14 to 67 from other sessions, 15 alternating runs, two A/Bs and one A/A)
+
+The box was too loaded for anything under about 5 % (the A/A over 15 runs spreads 0.91 to 1.11 on the noisiest rows, 0.99 to 1.04 on the matrix rows). B / A: `mfma_f64` 1.064, 1.059
+(p 0.02, 0.005), `mfma_f64_4b` 1.137, 1.068 (p 0.001, 0.000), `smfmac` 1.041, 1.085, `mfma` 1.096 (p 0.48), 0.984, `mfma_bf16` 0.985, 0.971 (p 0.09, 0.34), `mfma_i8` 0.974, 1.017 (p 0.03, 0.5);
+the other canary rows 0.95 to 1.04, none slower at p < 0.05.
+
+### Side finding: the heap position cliff of `mfma_bf16` does not reproduce
+
+An `LD_PRELOAD` library that allocates N bytes before `main` (N = 64 to 4096 in steps of 64), each point timed 5 times between two pad-0 references: the largest ratio of a point to its
+neighbouring references is 1.04 on this branch and 1.02 on the sp12 tree, no cliff. What did move was the box: the same pad measured 0.149 s and 0.216 s a few minutes apart while other
+sessions ran jobs on the sibling thread, which is what a contiguous "cliff" at one pad in an unpaired sweep looks like (the sp12 sweep was unpaired). If it comes back, pair every point with
+a reference.
+
+### Test
+
+`test_amd_matrix_kernels_layout`: each of the four kernels and the eight decoder instances is a function of its own that starts a 64-byte line. Mutant: the unit compiled with
+`-falign-functions=1` fails both tests (`mfma_tile_f_avx2` at 16 modulo 64, the decoder likewise). The arithmetic is held by `test_amd_mfma_math`, `test_amd_matrix_fast`,
+`test_amd_nan_order`, `test_amd_gcn_same_bits`, `test_amd_gcn_packed_same_bits`, `test_amd_gcn_memory_same_bits`, `test_amd_codeobject_same_bits` (all pass).
+
+### Not done
+
+* `perf` does not run on server2, so the 1 to 4 % left on `mfma`/`mfma_bf16` is not attributed (the call into the unit and the lost constant propagation into the decoders are the suspects).
