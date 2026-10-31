@@ -2025,6 +2025,20 @@ bool MemoryManager::atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, v
   return true;
 }
 
+bool MemoryManager::atomic_word_ptrs(const uint64_t* addrs, size_t count, uint32_t size, uint8_t** out) const {
+  if (count == 0 || (size != 4 && size != 8)) return false;
+  if (access_faults_armed()) return false;
+  const Allocation* a = nullptr;
+  uint64_t base = 0;
+  if (!batch_ok(addrs, count, size, /*store=*/true, &a, &base)) return false;
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addrs[i] - base;
+    uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+    out[i] = chunk && !is_uniform(chunk) ? chunk + off % kChunkSize : nullptr;
+  }
+  return true;
+}
+
 bool MemoryManager::rmw_batch_fn(const uint64_t* addrs, size_t count, uint32_t size, RmwLaneFn compute, void* ctx,
                                  uint64_t* olds, size_t* done, bool lock_free, bool always_store) {
   *done = 0;

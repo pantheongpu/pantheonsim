@@ -3905,7 +3905,29 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
           if (cas) fetch(ins.src[2], is64, swp);
           uint64_t old_of[32];
           bool done = false;
-          {   // (the locks are let go before the loop below might take them again)
+          // Plain device memory takes the CPU's compare-and-swap on each distinct word (MemoryManager::rmw_batch, as the AMD engine's
+          // atomics do): no lock, so threads that atomically update words of one cache line, or the same word, wait on nothing but
+          // the line. Each word's lanes still apply one after another in lane order, in one swap (a retry runs them again from the
+          // new value), so the old values and the final word are what the locked form gives. It declines, having done nothing, wherever
+          // the locked form below could differ (a fault armed, an unaligned or out-of-allocation word).
+          if (ins.f[0] <= 8 && atomics_lock_free(env_.threads)) {
+            uint32_t lane_mask[32];
+            if (nu == 1) {
+              lane_mask[0] = ex;
+            } else {
+              std::memset(lane_mask, 0, nu * sizeof(uint32_t));
+              for (Mask m = ex; m; m &= m - 1) {
+                const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+                lane_mask[slot[l]] |= uint32_t{1} << l;
+              }
+            }
+            const int ch = exec::sassatom::global_lockfree(mem_, ins.f[0], type, cas, nu, uaddr, lane_mask, v, cas ? swp : nullptr, old_of);
+            if (ch >= 0) {
+              changed |= ch != 0;
+              done = true;
+            }
+          }
+          if (!done) {   // (the locks are let go before the loop below might take them again)
             StripeLocks locks;
             for (uint64_t sm = stripes; sm; sm &= sm - 1) locks.lock(atomic_stripe_lock(static_cast<unsigned>(std::countr_zero(sm))));
             uint64_t cur[32];
@@ -3977,8 +3999,6 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         const uint64_t addr0 = addr;
         for (unsigned word = 0; word < nwords; ++word) {
         addr = addr0 + 4ull * word;
-        std::unique_lock<std::mutex> lock;
-        if (sp == Space::Global) lock = std::unique_lock<std::mutex>(atomic_lock(addr));
         Operand vtmp;
         const Operand* vp = &ins.src[1];
         if (word) { vtmp = *vp; if (vtmp.reg != kRZ) vtmp.reg += word; vp = &vtmp; }
@@ -3986,6 +4006,27 @@ void Runner::exec_mem(Block& blk, Warp& w, const Instr& ins, Mask ex) {
         const uint64_t v = popc_inc ? 1 : (is64 ? read64(w, vop, l) : read32(w, vop, l));
         const uint64_t swap = cas ? (is64 ? read64(w, ins.src[2], l) : read32(w, ins.src[2], l)) : 0;
         const auto compute = [&](const uint64_t old) -> uint64_t { return apply(l, old, v, swap); };
+        // The same compare-and-swap on the word as the warp's batch above makes, so a lane here and a warp there never meet on one
+        // word under different locks; it declines (nothing done) wherever the locked form below could differ.
+        if (sp == Space::Global && atomics_lock_free(env_.threads)) {
+          uint64_t found = 0;
+          bool changed_here = false;
+          if (mem_.atomic_rmw(addr, n, [&](uint64_t old) -> uint64_t {
+                uint64_t nw;
+                if (!exec::sassatom::apply(ins.f[0], type, cas, popc_inc, old, v, swap, nw)) fault(w, ins, l, "atomic op " + std::to_string(ins.f[0]));
+                changed_here = nw != old;
+                return nw;
+              }, &found, true)) {
+            if (changed_here) changed = true;
+            w.idle_yields = changed ? 0 : idle0;
+            ++blk.st.atomics;
+            blk.st.atomic_bytes += n;
+            if (!red) emit(l, word, found, v);
+            continue;
+          }
+        }
+        std::unique_lock<std::mutex> lock;
+        if (sp == Space::Global) lock = std::unique_lock<std::mutex>(atomic_lock(addr));
         // Memory the host maps -- managed, pinned, or shared with another
         // process through CUDA IPC -- takes the CPU's own atomic, which host
         // code and other processes' kernels respect; the stripe lock is this
@@ -6610,6 +6651,13 @@ void Runner::exec_tma(Block& blk, Warp& w, const Instr& ins, Mask ex) {
   const auto greduce = [&](uint64_t a, const uint8_t* src, uint32_t es, const ptx::Type& ty, ptx::AtomOp op) {
     uint64_t b = 0;
     std::memcpy(&b, src, es);
+    uint64_t found = 0;
+    const auto step = [&](uint64_t o) { return exec::reduce_value(op, ty, o, b); };
+    if (atomics_lock_free(env_.threads) && (es == 2 ? exec::atomic_rmw16(mem_, a, step, &found) : mem_.atomic_rmw(a, es, step, &found, true))) {   // (as the warp's atomics: the CPU's swap)
+      ++blk.st.atomics;
+      blk.st.atomic_bytes += es;
+      return;
+    }
     std::lock_guard<std::mutex> g(atomic_lock(a));
     const uint64_t old = mem_.load_scalar(a, es);
     mem_.store_scalar(a, es, exec::reduce_value(op, ty, old, b));
