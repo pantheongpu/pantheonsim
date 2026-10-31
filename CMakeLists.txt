@@ -1386,6 +1386,10 @@ vgpu_unit_test(test_sass_code_at)
 vgpu_unit_test(test_sass_block_reuse)
 vgpu_unit_test(test_sass_alu_runs)
 vgpu_unit_test(test_sass_s2r_fill)
+# LDGSTS (cp.async): the tier's own handler against the rule and the interpreter, registers, shared memory and counters.
+vgpu_unit_test(test_sass_ldgsts)
+# LD and ST of generic addresses: the tier's window rule against the interpreter and the rule written out.
+vgpu_unit_test(test_sass_generic_mem)
 # CALL.REL, RET, WARPSYNC and FCHK run by the tier's own code, and a whole warp's shared-memory offsets, against the interpreter's: registers and counters.
 vgpu_unit_test(test_sass_dispatch)
 target_include_directories(test_sass_dispatch PRIVATE src)
