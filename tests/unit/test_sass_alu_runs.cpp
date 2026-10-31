@@ -283,6 +283,156 @@ void compare(const std::vector<Insn>& code, std::initializer_list<uint32_t> size
   }
 }
 
+
+// ---- the conversions between f32 and f64 (cvt64 and fltinterp forms of the tier, fast_float's kernels) ------------------------------------------------
+// F2F.F64.F32 Rd, [|-]Rb ; F2F.F32.F64[.rnd] Rd, [|-]Rb ; I2F.F64.U32 / I2F.F64 (S32) Rd, Rb ; MUFU.RCP64H / RSQ64H Rd, Rb.
+// guard: 7 none, 0 @P0, 8 @!P0.
+std::string guard_text(unsigned guard) { return guard == 7 ? "" : guard == 8 ? "@!P0 " : "@P0 "; }
+uint64_t gop(uint64_t op, unsigned guard) { return (op & 0x0fff) | (guard == 7 ? 0x7000 : uint64_t{guard} << 12); }
+std::string src_text(unsigned b, bool ab, bool ng) { return std::string(ng ? "-" : "") + (ab ? "|" : "") + reg(b) + (ab ? "|" : ""); }
+Insn f2f_wide(unsigned d, unsigned b, bool ab = false, bool ng = false, unsigned guard = 7) {
+  return make(0x000fe40000201800ull, lo_of(gop(0x7310, guard), d, 0, b) | (ab ? 1ull << 62 : 0) | (ng ? 1ull << 63 : 0),
+              guard_text(guard) + "F2F.F64.F32 " + reg(d) + ", " + src_text(b, ab, ng));
+}
+Insn f2f_narrow(unsigned d, unsigned b, unsigned rnd = 0, bool ab = false, bool ng = false, unsigned guard = 7) {
+  static const char* const rn[] = {"", ".RM", ".RP", ".RZ"};
+  return make(0x000fe40000301000ull | uint64_t{rnd} << 14, lo_of(gop(0x7310, guard), d, 0, b) | (ab ? 1ull << 62 : 0) | (ng ? 1ull << 63 : 0),
+              guard_text(guard) + "F2F.F32.F64" + rn[rnd] + " " + reg(d) + ", " + src_text(b, ab, ng));
+}
+Insn i2f_d(unsigned d, unsigned b, bool sgn, unsigned guard = 7) {
+  return make(0x000fe40000201800ull | (sgn ? 0x400ull : 0), lo_of(gop(0x7312, guard), d, 0, b),
+              guard_text(guard) + (sgn ? "I2F.F64 " : "I2F.F64.U32 ") + reg(d) + ", " + reg(b));
+}
+Insn mufu64h(unsigned d, unsigned b, bool rsq) {
+  return make(0x000fe40000001800ull | (rsq ? 0x400ull : 0), lo_of(0x7308, d, 0, b), std::string(rsq ? "MUFU.RSQ64H " : "MUFU.RCP64H ") + reg(d) + ", " + reg(b));
+}
+
+// R `r` shaped to a class of values: (r & and_m) | or_m, with the thread number added at bit `tid_shift` (an exponent that grows with the lane), if >= 0.
+// (The scratch registers are R5 and R6; a kernel here has R0 .. R15 only.)
+void shape(std::vector<Insn>& c, unsigned r, uint32_t and_m, uint32_t or_m, int tid_shift) {
+  c.push_back(movi(5, and_m));
+  c.push_back(lop3(r, r, 5, kRZ, 0xc0));
+  c.push_back(movi(5, or_m));
+  c.push_back(lop3(r, r, 5, kRZ, 0xfc));
+  if (tid_shift >= 0) {
+    c.push_back(shf_li(6, 0, static_cast<unsigned>(tid_shift)));
+    c.push_back(iadd3(r, r, 6, kRZ));
+  }
+}
+// A word that differs from lane to lane and from register to register without much structure.
+void scramble(std::vector<Insn>& c, unsigned r, uint32_t k) {
+  c.push_back(imadi(r, 0, ((k * 0x9e3779b1u) | 1u) & 0x7fffffffu, kRZ));
+  c.push_back(iadd3i(r, r, (k * 0x85ebca6bu + 7) & 0x7fffffffu, 0));
+  c.push_back(imad(r, r, r, 0));
+  c.push_back(shf_li(6, r, 13));
+  c.push_back(lop3(r, r, 6, kRZ, 0x96));
+  c.push_back(imadi(r, r, 0x2545f491u, 0));
+}
+
+// One kernel: R1 an f32, R2:R3 an f64, R4 an integer, each shaped to a class of values chosen by the seed (zeros, subnormals, infinities and NaNs with
+// every payload, exponents around the f32 edges, rounding ties), then the conversions of the family chosen by `part` (0 to 7) into R6 .. R11: with |x|, -x
+// and the four rounding modes, results used as sources, a destination that is a source, a guarded form for half the warp, and MUFU.RCP64H / RSQ64H.
+std::vector<Insn> cvt_kernel(uint64_t seed, unsigned part) {
+  Rng rng;
+  rng.s ^= seed * 0xff51afd7ed558ccdull;
+  std::vector<Insn> c;
+  c.push_back(s2r_tid(0));
+  c.push_back(make(0x000fc60000000f00ull, 0x0000580000007a02ull | uint64_t{12} << 16, "MOV R12, c[0x0][0x160]"));
+  c.push_back(make(0x000fc60000000f00ull, 0x0000590000007a02ull | uint64_t{13} << 16, "MOV R13, c[0x0][0x164]"));
+  c.push_back(imad_wide_i(14, 0, kStride, 12));
+  for (unsigned r = 1; r <= 4; ++r) scramble(c, r, static_cast<uint32_t>(seed) * 8 + r);
+  // R1, the f32
+  switch (rng.next(7)) {
+    case 0: break;                                                     // any bits
+    case 1: shape(c, 1, 0x807fffffu, 0, -1); break;                    // zero and subnormals
+    case 2: shape(c, 1, 0x807fffffu, 0x7f800000u, -1); break;          // infinities and NaNs of every payload (signalling too)
+    case 3: shape(c, 1, 0x807fffffu, 0x7fc00000u, -1); break;          // quiet NaNs
+    case 4: shape(c, 1, 0x807fffffu, (0x70u + rng.next(16)) << 23, 23); break;   // exponents around 1 and growing with the lane
+    case 5: shape(c, 1, 0x80000000u | (0xffffu << 7), (0xfeu - rng.next(4)) << 23, -1); break;   // large
+    default: shape(c, 1, 0xff800000u, 0, -1); break;                   // exact powers of two and zero
+  }
+  // R2:R3, the f64
+  switch (rng.next(5)) {
+    case 0: break;
+    case 1: shape(c, 2, 0xe0000000u, 0, -1); break;                    // few low bits: exactly representable, or ties
+    case 2: shape(c, 2, 0, 0x10000000u, -1); break;                    // the half-way bit alone in the low word
+    case 3: shape(c, 2, 0x1fffffffu, 0, -1); break;                    // below the half-way bit
+    default: shape(c, 2, 0xffffffffu, 0x10000000u, -1); break;
+  }
+  switch (rng.next(8)) {
+    case 0: break;
+    case 1: shape(c, 3, 0x800fffffu, 0, -1); break;                    // zero and subnormals
+    case 2: shape(c, 3, 0x800fffffu, 0x7ff00000u, -1); break;          // infinities and NaNs
+    case 3: shape(c, 3, 0x800fffffu, 0x7ff80000u, -1); break;
+    case 4: shape(c, 3, 0x800fffffu, (0x37cu + rng.next(16)) << 20, 20); break;   // the f32 subnormal edge, growing with the lane
+    case 5: shape(c, 3, 0x800fffffu, (0x47cu + rng.next(8)) << 20, 20); break;    // the f32 overflow edge
+    case 6: shape(c, 3, 0x800fffffu, (0x3f0u + rng.next(32)) << 20, 20); break;   // around 1
+    default: shape(c, 3, 0xfff00000u, 0x00000000u, -1); break;         // exact powers of two
+  }
+  switch (rng.next(4)) {
+    case 0: break;
+    case 1: shape(c, 4, 0xffu, 0, -1); break;
+    case 2: shape(c, 4, 0xffffffffu, 0x80000000u, -1); break;
+    default: shape(c, 4, 0x0000ffffu, 0, 16); break;
+  }
+  switch (part) {
+    case 0:
+      c.push_back(f2f_wide(6, 1));
+      c.push_back(f2f_wide(8, 1, true));
+      c.push_back(f2f_wide(10, 1, false, true));
+      break;
+    case 1:
+      c.push_back(f2f_wide(6, 1, true, true));
+      c.push_back(f2f_wide(8, 4));            // an integer's bits as an f32
+      c.push_back(f2f_narrow(10, 2, 0, false, true));
+      break;
+    case 2:
+      for (unsigned m = 0; m < 4; ++m) c.push_back(f2f_narrow(6 + m, 2, m));
+      c.push_back(f2f_narrow(10, 2, 0, true));
+      c.push_back(f2f_narrow(11, 2, 3, false, true));
+      break;
+    case 3:
+      c.push_back(f2f_narrow(6, 2, 1, true));
+      c.push_back(f2f_narrow(7, 2, 2, true, true));
+      c.push_back(f2f_narrow(8, 2, 0, true, true));
+      c.push_back(f2f_narrow(9, 2, 3, true, true));
+      c.push_back(i2f_d(10, 4, false));
+      break;
+    case 4:
+      c.push_back(i2f_d(6, 4, false));
+      c.push_back(i2f_d(8, 4, true));
+      c.push_back(f2f_narrow(10, 6, 3));      // a result as the source
+      break;
+    case 5:
+      c.push_back(f2f_wide(6, 1));
+      c.push_back(f2f_narrow(8, 6, 2));       // a chain: f32 to f64 to f32 to f64
+      c.push_back(f2f_wide(10, 8));
+      break;
+    case 6:
+      c.push_back(f2f_wide(6, 4));            // the destination is also the source, the low word and the high one
+      c.push_back(f2f_narrow(6, 6, 1));
+      c.push_back(iadd3(8, 4, kRZ, kRZ));
+      c.push_back(i2f_d(8, 8, rng.next(2) != 0));
+      c.push_back(iadd3(10, 3, kRZ, kRZ));
+      c.push_back(iadd3(11, 2, kRZ, kRZ));
+      c.push_back(f2f_narrow(11, 10, 2, true));
+      break;
+    default:
+      c.push_back(mufu64h(6, 3, false));
+      c.push_back(mufu64h(7, 3, true));
+      c.push_back(isetp_ge(0, 16));                   // P0: the upper lanes of a full warp
+      c.push_back(f2f_wide(8, 1, false, false, 0));   // guarded: only those lanes write
+      c.push_back(i2f_d(8, 4, true, 8));              // the other lanes, over it
+      c.push_back(f2f_narrow(10, 2, 3, false, true, 8));
+      c.push_back(f2f_narrow(11, 2, 1, true, false, 0));
+      break;
+  }
+  for (unsigned r = 1; r < 12; ++r) c.push_back(stg(14, r, 4 * r));
+  c.push_back(stg(14, 0, 0));
+  c.push_back(exit_());
+  return c;
+}
+
 }  // namespace
 
 VTEST(a_stretch_of_register_instructions_gives_the_interpreters_registers_and_counters) {
@@ -302,6 +452,14 @@ VTEST(a_warp_of_part_of_its_lanes_writes_only_those_lanes) {
 VTEST(a_guarded_instruction_ends_a_stretch_and_runs_for_its_lanes_only) {
   compare(kernel(200, true, 4), {32, 33, 64}, "guarded instructions");
   compare(kernel(200, true, 5), {31, 96}, "guarded instructions, another mix");
+}
+
+
+VTEST(the_conversions_between_f32_and_f64_give_the_general_rules_registers_and_counters) {
+  // Whole warps, a warp and a lane, and part of a warp, over many mixes of special values.
+  for (uint64_t seed = 1; seed <= 40; ++seed)
+    for (unsigned part = 0; part < 8; ++part)
+      compare(cvt_kernel(seed, part), {32, 100, 33, 5}, "conversions, seed " + std::to_string(seed) + ", part " + std::to_string(part));
 }
 
 VTEST_MAIN

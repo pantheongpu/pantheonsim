@@ -2273,6 +2273,12 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
         if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
         return true;
       }
+      if (dsize == 3 && ssize == 2) {   // a 32-bit integer to f64: exact, the SIMD kernel
+        alignas(32) uint32_t lo[32], hi[32];
+        sk->i2d(sgn, lanes(0, ins.src[0], false), lo, hi);
+        store64(ins.dst[0], lo, hi);
+        return true;
+      }
       // The other sizes, lane by lane over the rows: a 64-bit source, or a result that is not an f32.
       alignas(32) uint64_t v64[32];
       const uint32_t* row = nullptr;
@@ -2320,6 +2326,28 @@ bool Runner::fast_float(Warp& w, const Instr& ins, Mask ex) {
       // rounding mode of a narrowing, a NaN as an RTX 3060 writes it.
       const unsigned dsize = ins.f[0], ssize = ins.f[1], rnd = ins.f[3];
       if (ins.src.empty() || ins.dst[0].kind != Kind::Reg || !(ssize == 3 ? wide_ok(ins.src[0]) : plain(ins.src[0]))) return false;
+      const unsigned mods = (ins.src[0].abs ? 1u : 0u) | (ins.src[0].neg ? 2u : 0u);
+      if (dsize == 3 && ssize == 2) {   // f32 to f64: the SIMD kernel (|x| and -x applied to everything but a NaN, as cv_f2f does)
+        alignas(32) uint32_t lo[32], hi[32];
+        sk->f2f_widen(lanes(0, ins.src[0], false), mods, lo, hi);
+        store64(ins.dst[0], lo, hi);
+        return true;
+      }
+      if (dsize == 2 && ssize == 3) {   // f64 to f32, in the rounding mode of the instruction
+        alignas(32) uint32_t slo[32], shi[32];
+        const Operand& so = ins.src[0];
+        if (so.kind == Kind::Reg && so.reg != kRZ && so.reg + 1 != kRZ) {
+          std::memcpy(slo, &w.reg(so.reg, 0), sizeof slo);
+          std::memcpy(shi, &w.reg(so.reg + 1, 0), sizeof shi);
+        } else {
+          alignas(32) uint64_t v64[32];
+          pair64(so, false, v64);
+          for (unsigned l = 0; l < 32; ++l) slo[l] = static_cast<uint32_t>(v64[l]), shi[l] = static_cast<uint32_t>(v64[l] >> 32);
+        }
+        in_mode(rnd, [&] { sk->f2f_narrow(slo, shi, mods, r); });
+        if (ins.dst[0].reg != kRZ) store_row(ins.dst[0].reg, r);
+        return true;
+      }
       alignas(32) uint64_t raw64[32];
       load_cvt_raw(ins.src[0], ssize, ins.f[5], raw64);
       alignas(32) uint32_t lo[32], hi[32];
