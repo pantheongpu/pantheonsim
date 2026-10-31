@@ -7,6 +7,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -97,6 +99,7 @@ struct Pool {
   std::vector<Worker*> idle;
   std::vector<std::unique_ptr<Worker>> all;
   size_t created = 0;
+  std::atomic<uint64_t> calls{0};
 
   bool quiescent() {
     std::lock_guard<std::mutex> g(mu);
@@ -228,6 +231,7 @@ Pool& pool() {
 void run_parallel_raw(unsigned n, void (*fn)(void*, unsigned), void* ctx) {
   if (n == 0) return;
   Pool& p = pool();
+  p.calls.fetch_add(1, std::memory_order_relaxed);
   Job job;
   job.fn = fn;
   job.ctx = ctx;
@@ -298,10 +302,80 @@ void run_parallel_raw(unsigned n, void (*fn)(void*, unsigned), void* ctx) {
   if (first_error) std::rethrow_exception(first_error);
 }
 
+unsigned cap_threads(unsigned requested, uint64_t units, uint64_t ns_per_unit, uint64_t min_work_ns) {
+  if (requested <= 1 || ns_per_unit == 0 || min_work_ns == 0) return requested;
+  // Saturating: a huge grid of costly blocks is far above any request.
+  const uint64_t total = ns_per_unit > UINT64_MAX / (units ? units : 1) ? UINT64_MAX : ns_per_unit * units;
+  const uint64_t useful = total / min_work_ns;
+  if (useful <= 1) return 1;
+  return useful >= requested ? requested : static_cast<unsigned>(useful);
+}
+
+uint64_t blend_unit_cost(uint64_t old_ns_per_unit, uint64_t units, unsigned threads, uint64_t wall_ns) {
+  if (units == 0) return old_ns_per_unit;
+  const uint64_t work = wall_ns * (threads ? threads : 1);
+  const uint64_t sample = work / units ? work / units : 1;
+  if (threads <= 1 || old_ns_per_unit == 0) return sample;
+  return (old_ns_per_unit + sample) / 2;
+}
+
+namespace {
+
+// The cost of a block of the kernels launched lately, by kernel address. A
+// collision or a torn pair only gives a wrong estimate for one launch.
+struct CostSlot {
+  std::atomic<uintptr_t> key{0};
+  std::atomic<uint64_t> ns_per_unit{0};
+};
+constexpr size_t kCostSlots = 256;
+CostSlot g_cost[kCostSlots];
+
+CostSlot& cost_slot(const void* key) {
+  const uintptr_t k = reinterpret_cast<uintptr_t>(key);
+  return g_cost[((k >> 4) * 0x9E3779B97F4A7C15ull >> 40) % kCostSlots];
+}
+
+// Least work, in nanoseconds, worth a thread of its own. VGPU_POOL_MIN_WORK_US
+// overrides it; 0 turns the cap off.
+uint64_t min_work_ns() {
+  if (const char* e = std::getenv("VGPU_POOL_MIN_WORK_US"); e && *e) {
+    char* end = nullptr;
+    const unsigned long long us = std::strtoull(e, &end, 10);
+    if (end != e) return static_cast<uint64_t>(us) * 1000;
+  }
+  return uint64_t{100} * 1000;
+}
+
+uint64_t now_ns() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
+}
+
+}  // namespace
+
+LaunchWidth::LaunchWidth(const void* key, uint64_t units, unsigned& threads)
+    : key_(key), units_(units), used_(threads), begin_ns_(0) {
+  if (threads <= 1 || units <= 1 || min_work_ns() == 0) return;
+  CostSlot& s = cost_slot(key);
+  const uint64_t known = s.key.load(std::memory_order_relaxed) == reinterpret_cast<uintptr_t>(key)
+                             ? s.ns_per_unit.load(std::memory_order_relaxed) : 0;
+  threads = cap_threads(threads, units, known, min_work_ns());
+  used_ = threads;
+  begin_ns_ = now_ns();
+}
+
+LaunchWidth::~LaunchWidth() {
+  if (!begin_ns_) return;
+  CostSlot& s = cost_slot(key_);
+  const uintptr_t k = reinterpret_cast<uintptr_t>(key_);
+  const uint64_t old = s.key.load(std::memory_order_relaxed) == k ? s.ns_per_unit.load(std::memory_order_relaxed) : 0;
+  s.ns_per_unit.store(blend_unit_cost(old, units_, used_, now_ns() - begin_ns_), std::memory_order_relaxed);
+  s.key.store(k, std::memory_order_relaxed);
+}
+
 WorkerPoolStats worker_pool_stats() {
   Pool& p = pool();
   std::lock_guard<std::mutex> g(p.mu);
-  return {p.created, p.idle.size()};
+  return {p.created, p.idle.size(), p.calls.load(std::memory_order_relaxed)};
 }
 
 }  // namespace vgpu::exec

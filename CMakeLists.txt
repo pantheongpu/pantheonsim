@@ -4246,6 +4246,14 @@ if(TARGET vgpucudart)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 600)
+  # A small launch is kept to few host threads; no result or counter shows how
+  # many (pool_cap.cu at several VGPU_THREADS, the cap on and off, both engines).
+  add_test(NAME e2e_pool_cap COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_pool_cap.sh)
+  set_tests_properties(e2e_pool_cap PROPERTIES
+    DEPENDS "vgpucudart;vgpucuda"
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 600)
   # A kernel's fault reported by the calls after its launch, not by the
   # launch, from the runtime and the driver, as an RTX 3060 reports it.
   add_test(NAME e2e_deferred_errors COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_deferred_errors.sh)
