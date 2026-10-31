@@ -60,3 +60,7 @@ jobs:
           ctest --test-dir build --output-on-failure -R "${TESTS:-^e2e_pytorch_(sweep_full|dist_full)$}" 2>&1 | tee sweep.log
           # A skip is the runner's image losing PyTorch: here that is a failure.
           if grep -E '\*\*\*Skipped|Not Run' sweep.log; then echo "::error::a sweep test skipped"; exit 1; fi
+
+      - name: Clean the runner
+        if: always() && hashFiles('.github/actions/clean-runner/action.yml') != ''
+        uses: ./.github/actions/clean-runner

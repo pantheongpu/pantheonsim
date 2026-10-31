@@ -101,6 +101,10 @@ jobs:
           path: sim-build.tgz
           retention-days: 3
 
+      - name: Clean the runner
+        if: always() && hashFiles('.github/actions/clean-runner/action.yml') != ''
+        uses: ./.github/actions/clean-runner
+
   # --- NVIDIA ------------------------------------------------------------
   nvidia:
     name: ${{ matrix.suite }} on ${{ matrix.gpu }}
@@ -215,6 +219,10 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+      - name: Clean the runner
+        if: always() && hashFiles('.github/actions/clean-runner/action.yml') != ''
+        uses: ./.github/actions/clean-runner
+
   # --- AMD hip-tests -----------------------------------------------------
   hip-tests-build:
     name: build hip-tests for ${{ needs.sim.outputs.amd_gpu }}
@@ -279,6 +287,10 @@ jobs:
         with:
           path: hip-tests
           key: ${{ steps.arch.outputs.key }}
+
+      - name: Clean the runner
+        if: always() && hashFiles('.github/actions/clean-runner/action.yml') != ''
+        uses: ./.github/actions/clean-runner
 
   hip-tests:
     name: hip-tests ${{ matrix.shard }} on ${{ needs.sim.outputs.amd_gpu }}
@@ -362,6 +374,10 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+      - name: Clean the runner
+        if: always() && hashFiles('.github/actions/clean-runner/action.yml') != ''
+        uses: ./.github/actions/clean-runner
+
   # --- AMD BabelStream ---------------------------------------------------
   # A memory-bandwidth benchmark that checks its arrays after every run; it
   # builds in a minute, so it is built here, not cached.
@@ -413,3 +429,7 @@ jobs:
           path: report
           retention-days: 14
           if-no-files-found: ignore
+
+      - name: Clean the runner
+        if: always() && hashFiles('.github/actions/clean-runner/action.yml') != ''
+        uses: ./.github/actions/clean-runner
