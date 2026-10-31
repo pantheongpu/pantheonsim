@@ -86,11 +86,49 @@ struct Shape {
 };
 // The shapes of the engines: mma.sync m16n8k16 / m16n8k8 / m16n8k4 (tf32), wmma 16x16x16 and 16x16x8, and the largest the PTX path takes.
 const Shape kShapes[] = {{16, 8, 16, 8}, {16, 8, 8, 8}, {16, 8, 8, 4}, {16, 8, 4, 4}, {16, 16, 16, 8}, {16, 16, 8, 8},
-                         {16, 16, 8, 4}, {8, 32, 16, 8}, {32, 8, 16, 8}, {32, 32, 16, 8}, {16, 24, 16, 8}, {4, 8, 12, 4}, {16, 8, 12, 8}, {7, 8, 16, 8}, {5, 16, 8, 4}, {1, 8, 8, 8}};
+                         {16, 16, 8, 4}, {8, 32, 16, 8}, {32, 8, 16, 8}, {32, 32, 16, 8}, {16, 24, 16, 8}, {4, 8, 12, 4}, {16, 8, 12, 8}, {7, 8, 16, 8}, {5, 16, 8, 4}, {1, 8, 8, 8}, {6, 8, 12, 4}, {3, 16, 16, 8}, {12, 16, 12, 4}};
 
 struct Totals {
   long elements = 0, mismatches = 0;
+  long k512 = 0, k512_taken = 0;   // calls the 512-bit float-product kernel was held to the 256-bit one on, and how many it took
 };
+
+#ifdef VGPU_TC86_AVX2
+// The 512-bit float-product kernel (mma_avx512_chunked_f) against the 256-bit one (mma_avx2_chunked_f) and the frozen form, called directly (the
+// dispatch picks it only at the AVX-512 level): the same answer to "taken or not", nothing written when not taken, and when taken the frozen
+// form's bits in every element. Skipped on a CPU without AVX-512 (and for the shapes the 512-bit kernel leaves to the 256-bit one).
+template <unsigned NC, bool ACC16>
+void check_512(int round, const Shape& sh, int fmt, int mode, int emin, const std::vector<float>& A, const std::vector<float>& B, const std::vector<float>& C,
+               const std::vector<float>& D0, Totals& tot) {
+  const uint32_t sentinel = 0xdeadbeefu;
+  std::vector<float> D3(C.size(), f(sentinel)), D4(C.size(), f(sentinel));
+  const bool t2 = now::mma_avx2_chunked_f<NC, ACC16>(sh.M, sh.N, sh.K, emin, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D3.data(), sh.N);
+  const bool t5 = now::mma_avx512_chunked_f<NC, ACC16>(sh.M, sh.N, sh.K, emin, A.data(), sh.K, B.data(), sh.N, C.data(), sh.N, D4.data(), sh.N);
+  ++tot.k512;
+  tot.k512_taken += t5;
+  bool bad = t2 != t5;
+  for (size_t e = 0; e < D0.size(); ++e) {
+    if (t5 && bits(D4[e]) != bits(D0[e])) bad = true;
+    if (!t5 && bits(D4[e]) != sentinel) bad = true;   // (a declined call writes nothing)
+    if (t2 && bits(D3[e]) != bits(D4[e])) bad = true;
+  }
+  if (bad && ++tot.mismatches <= 5)
+    std::fprintf(stderr, "round %d shape %ux%ux%u chunk %u fmt %d acc16 %d mode %d: avx2 kernel %s, avx512 kernel %s, or their bits differ\n", round, sh.M, sh.N, sh.K, NC, fmt, ACC16, mode,
+                 t2 ? "took" : "declined", t5 ? "took" : "declined");
+}
+
+// The edge tests' extra check: the 512-bit kernel says what the 256-bit one said and, taken, gives the frozen form's bits.
+void edge_512(bool took, unsigned chunk, unsigned M, unsigned N, unsigned K, int emin, const std::vector<float>& A, const std::vector<float>& B, const std::vector<float>& C,
+              const std::vector<float>& D0, const char* what) {
+  if (!vgpu::simd::supported(vgpu::simd::Level::Avx512) || !now::mma_avx512_f_shape(M, N)) return;
+  std::vector<float> D5(D0.size(), f(0xdeadbeefu));
+  const bool t5 = chunk == 8 ? now::mma_avx512_chunked_f<8, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D5.data(), N)
+                             : now::mma_avx512_chunked_f<4, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D5.data(), N);
+  if (t5 != took) throw vtest::Failure(std::string(what) + ": the 512-bit float kernel " + (t5 ? "took" : "declined") + " a call the 256-bit one " + (took ? "took" : "declined"));
+  for (size_t e = 0; e < D0.size(); ++e)
+    if (t5 ? bits(D5[e]) != bits(D0[e]) : bits(D5[e]) != 0xdeadbeefu) throw vtest::Failure(std::string(what) + ": the 512-bit float kernel's element " + std::to_string(e) + " differs");
+}
+#endif
 
 // Draw a problem (a "mode" picks how adversarial), run old and new, compare every element's bits.
 void one_round(Gen& g, int round, const Shape& sh, int fmt, bool f16acc, Totals& tot) {
@@ -148,6 +186,14 @@ void one_round(Gen& g, int round, const Shape& sh, int fmt, bool f16acc, Totals&
 #else
   D2 = D1;
 #endif
+#ifdef VGPU_TC86_AVX2
+  if (vgpu::simd::supported(vgpu::simd::Level::Avx512) && now::mma_avx512_f_shape(sh.M, sh.N) && sh.K % sh.chunk == 0 && sh.K <= 16 && sh.M <= 32 && sh.N <= 32) {
+    if (sh.chunk == 8)
+      f16acc ? check_512<8, true>(round, sh, fmt, mode, emin, A, B, C, D0, tot) : check_512<8, false>(round, sh, fmt, mode, emin, A, B, C, D0, tot);
+    else if (sh.chunk == 4)
+      f16acc ? check_512<4, true>(round, sh, fmt, mode, emin, A, B, C, D0, tot) : check_512<4, false>(round, sh, fmt, mode, emin, A, B, C, D0, tot);
+  }
+#endif
   for (size_t e = 0; e < D0.size(); ++e) {
     ++tot.elements;
     if (bits(D0[e]) != bits(D1[e]) || bits(D0[e]) != bits(D2[e])) {
@@ -178,9 +224,13 @@ VTEST(vector_kernels_equal_the_frozen_form) {
     // (a K that is not a multiple of the chunk takes the generic vector form; both are held to the frozen form)
     one_round(g, static_cast<int>(round), sh, fmt, (round / 39) % 4 == 3, tot);
   }
-  std::printf("  %ld rounds, %ld elements compared bit for bit\n", rounds, tot.elements);
+  std::printf("  %ld rounds, %ld elements compared bit for bit; the 512-bit float kernel on %ld of them (%ld taken)\n", rounds, tot.elements, tot.k512, tot.k512_taken);
   VCHECK_EQ(tot.mismatches, 0L);
   VCHECK(tot.elements > 1000000);
+  if (vgpu::simd::supported(vgpu::simd::Level::Avx512)) {
+    VCHECK(tot.k512 > 20000);
+    VCHECK(tot.k512_taken > 5000);
+  }
 }
 
 #ifdef VGPU_TC86_AVX2
@@ -241,6 +291,7 @@ VTEST(float_product_kernel_edges_equal_the_frozen_form) {
         const bool took = fmt == 1 ? now::mma_avx2_chunked_f<8, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N)
                                    : now::mma_avx2_chunked_f<4, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N);
         took ? ++taken : ++declined;
+        edge_512(took, chunk, M, N, K, emin, A, B, C, D0, "edge exponents");
         if (took != edge.want)
           throw vtest::Failure("exponents A " + std::to_string(edge.ea_lo) + ".." + std::to_string(edge.ea_hi) + ", B " + std::to_string(edge.eb_lo) + ".." +
                                std::to_string(edge.eb_hi) + " fmt " + std::to_string(fmt) + ": the float kernel " + (took ? "took" : "declined") + " the call");
@@ -265,6 +316,7 @@ VTEST(float_product_kernel_edges_equal_the_frozen_form) {
       const bool took = fmt == 1 ? now::mma_avx2_chunked_f<8, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N)
                                  : now::mma_avx2_chunked_f<4, false>(M, N, K, emin, A.data(), K, B.data(), N, C.data(), N, D2.data(), N);
       if (took) throw vtest::Failure("the float kernel took a call with a float subnormal operand");
+      edge_512(took, chunk, M, N, K, emin, A, B, C, D0, "float subnormal");
       for (size_t e = 0; e < D0.size(); ++e)
         if (bits(D0[e]) != bits(D1[e])) throw vtest::Failure("a float subnormal operand: result differs from the frozen form");
     }
@@ -283,6 +335,7 @@ VTEST(float_product_kernel_edges_equal_the_frozen_form) {
         old::mma(M, N, K, 4, now::kEminWide, false, A.data(), K, B.data(), N, C.data(), N, D0.data(), N);
         now::mma(M, N, K, 4, now::kEminWide, false, A.data(), K, B.data(), N, C.data(), N, D1.data(), N);
         const bool took = now::mma_avx2_chunked_f<4, false>(M, N, K, now::kEminWide, A.data(), K, B.data(), N, C.data(), N, D2.data(), N);
+        edge_512(took, 4, M, N, K, now::kEminWide, A, B, C, D0, "tf32 tail shape");
         if (took == (special != 0)) throw vtest::Failure("tf32 tail shape: the float kernel " + std::string(took ? "took" : "declined") + " a call with" + (special ? "" : "out") + " an infinity or a NaN");
         for (size_t e = 0; e < D0.size(); ++e)
           if (bits(D0[e]) != bits(D1[e]) || (took && bits(D0[e]) != bits(D2[e]))) throw vtest::Failure("tf32 tail shape K " + std::to_string(K) + ": result differs from the frozen form");
@@ -296,8 +349,7 @@ VTEST(float_product_kernel_edges_equal_the_frozen_form) {
 #ifdef VGPU_TC86_AVX2
 // The vector conversion of a sum to f32 against the scalar one (detail::to_f32_rz), on sums just below and above every power of two (the
 // all-ones significands that a nearest-even conversion of the magnitude would round up), and random ones, for all frames g.
-__attribute__((target("avx2"))) static void check_sums(long& checked, long& bad) {
-  Gen gen(0x5ca1e);
+static std::vector<int32_t> sums_for_f32(Gen& gen) {
   std::vector<int32_t> sums;
   for (int n = 0; n <= 30; ++n)
     for (int d = -40; d <= 40; ++d) {
@@ -314,6 +366,12 @@ __attribute__((target("avx2"))) static void check_sums(long& checked, long& bad)
       sums.push_back(static_cast<int32_t>(-v));
     }
   for (int i = 0; i < 200000; ++i) sums.push_back(static_cast<int32_t>(gen.u()) >> (gen.u() % 31));
+  return sums;
+}
+
+__attribute__((target("avx2"))) static void check_sums(long& checked, long& bad) {
+  Gen gen(0x5ca1e);
+  std::vector<int32_t> sums = sums_for_f32(gen);
   while (sums.size() % 8) sums.push_back(0);
   for (int pass = 0; pass < 12; ++pass)
     for (size_t x = 0; x < sums.size(); x += 8) {
@@ -342,8 +400,7 @@ __attribute__((target("avx2"))) static void check_sums(long& checked, long& bad)
     }
 }
 
-__attribute__((target("avx2"))) static void check_sums16(long& checked, long& bad, long& answered) {
-  Gen gen(0xf16);
+static std::vector<int32_t> sums_for_f16(Gen& gen) {
   std::vector<int32_t> sums;
   for (int n = 0; n <= 30; ++n)
     for (int d = -40; d <= 40; ++d) {
@@ -364,6 +421,12 @@ __attribute__((target("avx2"))) static void check_sums16(long& checked, long& ba
         }
       }
   for (int i = 0; i < 200000; ++i) sums.push_back(static_cast<int32_t>(gen.u()) >> (gen.u() % 31));
+  return sums;
+}
+
+__attribute__((target("avx2"))) static void check_sums16(long& checked, long& bad, long& answered) {
+  Gen gen(0xf16);
+  std::vector<int32_t> sums = sums_for_f16(gen);
   while (sums.size() % 8) sums.push_back(0);
   for (int pass = 0; pass < 14; ++pass)
     for (size_t x = 0; x < sums.size(); x += 8) {
@@ -387,6 +450,59 @@ __attribute__((target("avx2"))) static void check_sums16(long& checked, long& ba
         if (!ok && ++bad <= 5) std::fprintf(stderr, "S %d g %d: vector 0x%08x (nz %u in %u), scalar 0x%08x\n", S[l], g[l], r[l], nz[l], in[l], want);
       }
     }
+}
+
+// The same two checks on the sixteen-lane conversions (sum_to_f32_avx512, sum_to_f16_avx512), over the same sums and frames.
+__attribute__((target("avx2,avx512f,avx512bw,avx512dq,avx512vl"))) static void check_sums512(long& checked, long& bad, long& answered, bool f16) {
+  Gen gen(f16 ? 0xf16 : 0x5ca1e);
+  std::vector<int32_t> sums = f16 ? sums_for_f16(gen) : sums_for_f32(gen);
+  while (sums.size() % 16) sums.push_back(0);
+  for (int pass = 0; pass < (f16 ? 14 : 12); ++pass)
+    for (size_t x = 0; x < sums.size(); x += 16) {
+      alignas(64) int32_t S[16], g[16];
+      for (int l = 0; l < 16; ++l) {
+        S[l] = sums[x + l];
+        g[l] = f16 ? (pass < 10 ? -50 + pass * 8 + static_cast<int>(gen.u() % 16) - 8 : static_cast<int>(gen.u() % 400) - 200)
+                   : (pass < 6 ? -30 + pass * 40 + static_cast<int>(gen.u() % 40) - 20 : static_cast<int>(gen.u() % 400) - 200);
+      }
+      __m512i res;
+      __mmask16 snz, inr;
+      if (f16)
+        now::sum_to_f16_avx512(_mm512_load_si512(S), _mm512_load_si512(g), res, snz, inr);
+      else
+        now::sum_to_f32_avx512(_mm512_load_si512(S), _mm512_load_si512(g), res, snz, inr);
+      alignas(64) uint32_t r[16];
+      _mm512_store_si512(r, res);
+      for (int l = 0; l < 16; ++l) {
+        ++checked;
+        const uint32_t want = bits(f16 ? now::detail::to_f16_rn(S[l], g[l]) : now::detail::to_f32_rz(S[l], g[l]));
+        const bool nz = snz >> l & 1, in = inr >> l & 1;
+        const bool ans = S[l] != 0 && in;
+        if (ans) ++answered;
+        bool ok;
+        if (f16) {
+          ok = nz == (S[l] != 0) && (S[l] == 0 ? r[l] == 0 : (!ans || r[l] == want));
+        } else {
+          const uint32_t e = want >> 23 & 0xff;
+          ok = nz == (S[l] != 0) && (!ans || (r[l] == want && e >= 1 && e <= 254)) && (ans || r[l] == 0);
+        }
+        if (!ok && ++bad <= 5) std::fprintf(stderr, "512-bit f%d: S %d g %d: vector 0x%08x (nz %d in %d), scalar 0x%08x\n", f16 ? 16 : 32, S[l], g[l], r[l], nz, in, want);
+      }
+    }
+}
+
+VTEST(sum_to_f16_f32_512_equal_the_scalar_conversion) {
+  if (!vgpu::simd::supported(vgpu::simd::Level::Avx512)) {
+    std::printf("  [ SKIP ] this CPU has no AVX-512\n");
+    return;
+  }
+  for (const bool f16 : {true, false}) {
+    long checked = 0, bad = 0, answered = 0;
+    check_sums512(checked, bad, answered, f16);
+    std::printf("  f%d: %ld sums converted, %ld answered by the vector code\n", f16 ? 16 : 32, checked, answered);
+    VCHECK_EQ(bad, 0L);
+    VCHECK(answered > checked / 2);
+  }
 }
 
 VTEST(sum_to_f16_equals_the_scalar_conversion) {

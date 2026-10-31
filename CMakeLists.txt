@@ -1418,7 +1418,7 @@ vgpu_unit_test(test_wmma_generic_fast)
 # results against their general forms must not move a bit with the level.
 # The AVX-512 table is the default on a host that has it, so the 256-bit tile kernels are pinned with VGPU_SIMD=avx2 in a third run (a host without
 # AVX-512 runs the default as AVX2 and these as the same code).
-foreach(_t test_mma_fast test_mma_tiles test_wgmma_fast test_tcgen05_tiles test_wmma_generic_fast test_tile_mma)
+foreach(_t test_mma_fast test_mma_tiles test_wgmma_fast test_tcgen05_tiles test_wmma_generic_fast test_tile_mma test_tc_ampere_fast)
   add_test(NAME ${_t}_simd_avx512 COMMAND ${_t})
   set_tests_properties(${_t}_simd_avx512 PROPERTIES ENVIRONMENT "VGPU_SIMD=avx512")
   add_test(NAME ${_t}_simd_avx2 COMMAND ${_t})
