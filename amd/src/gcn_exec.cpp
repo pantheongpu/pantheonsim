@@ -608,6 +608,12 @@ struct Group {
   const DecodeCache* cache = nullptr;
 };
 
+// The dispatches running at this moment, in the whole process. Each HSA queue has a thread of its own, so kernels on
+// different streams or devices run side by side, and a dispatch with one work-group (or VGPU_THREADS=1) runs on one
+// thread: it still shares device memory with the other dispatch. The unlocked read-modify-write of a lone thread is
+// right only while no other dispatch is running (Machine::conc below).
+std::atomic<int> g_dispatches_in_flight{0};
+
 struct Machine {
   Machine(const Dispatch& dispatch, MemoryManager& memory, DecodeCache& cache)
       : d(dispatch), mem(memory), decoded(&cache), sampler(dispatch.sampler && dispatch.sampler->interval ? dispatch.sampler : nullptr),
@@ -625,6 +631,8 @@ struct Machine {
   // a set of locks striped by address. On one thread there is no need: a
   // wave's lanes take their turns in order, which is atomic already.
   bool concurrent = false;
+  // Whether a read-modify-write has to be atomic against another thread: this dispatch uses several, or another dispatch is running.
+  bool conc() const { return concurrent || g_dispatches_in_flight.load(std::memory_order_relaxed) > 1; }
   // Whether the matrix instructions take the tile path (set_matrix_fast_path); read once, as the machine is made.
   bool matrix_fast = matrix_fast_path();
   // Across threads, an atomic on an ordinary word of device memory is a compare-and-swap on the word, not a lock.
@@ -748,7 +756,7 @@ struct Machine {
     return window < d.peers.size() && d.peers[window] ? *d.peers[window] : mem;
   }
   std::unique_lock<std::mutex> atomic_guard(uint64_t addr) {
-    return concurrent ? std::unique_lock<std::mutex>(memory_atomic_lock(addr)) : std::unique_lock<std::mutex>();
+    return conc() ? std::unique_lock<std::mutex>(memory_atomic_lock(addr)) : std::unique_lock<std::mutex>();
   }
   // Each instruction decoded once, the first time any wave reaches it: every
   // wave of every launch of a module runs the same code, and decoding it again
@@ -2863,7 +2871,7 @@ struct Machine {
       };
       uint64_t old = 0;
       if (inside) {   // (a buffer atomic past the end of its resource reads zero and writes nothing)
-        if (!(concurrent && lock_free && at(base_at).atomic_rmw(base_at, bytes, result, &old, true))) {
+        if (!(conc() && lock_free && at(base_at).atomic_rmw(base_at, bytes, result, &old, true))) {
           const auto guard = atomic_guard(base_at);
           old = at(base_at).load_scalar(base_at, bytes);
           at(base_at).store_scalar(base_at, bytes, result(old));
@@ -9961,7 +9969,7 @@ struct Machine {
     if (!m.host_map_possible(addr)) {
       // Device memory, not mapped host memory: one lookup serves the load and the store where the memory manager takes it.
       uint64_t found = 0;
-      if (concurrent ? lock_free && m.atomic_rmw(addr, a.bytes, [&](uint64_t old) { return atomic_result(a, old, v, expected); }, &found)
+      if (conc() ? lock_free && m.atomic_rmw(addr, a.bytes, [&](uint64_t old) { return atomic_result(a, old, v, expected); }, &found)
                      : runs_on && m.rmw_if_changed(addr, a.bytes, [&](uint64_t old) { return atomic_result(a, old, v, expected); }, &found))
         return found;
     }
@@ -9981,7 +9989,7 @@ struct Machine {
     }
     // Work-groups on other threads: a compare-and-swap on the word itself, where it is an ordinary one in device memory;
     // anything else (a fault armed, a word on the end of an allocation, an address that is no allocation's) under the lock.
-    if (concurrent && lock_free) {
+    if (conc() && lock_free) {
       uint64_t found = 0;
       if (m.atomic_rmw(addr, a.bytes, [&](uint64_t old) { return atomic_result(a, old, v, expected); }, &found)) return found;
     }
@@ -10187,7 +10195,7 @@ struct Machine {
     bool made = false;
     try {
       made = mem.rmw_batch(addrs, n, a.bytes, [&](size_t i, uint64_t old) { return atomic_result(a, old, v[i], expected[i]); }, olds,
-                           &done, concurrent);
+                           &done, conc());
     } catch (...) {
       give_back(done);
       throw;
@@ -10294,7 +10302,7 @@ struct Machine {
                                                              : in.dst[0].kind == OperandKind::Vgpr && !narrow_dst)
                                              : false);
     // An atomic's lanes go to memory together (wave_atomics), once, where the lanes can take turns without a lock.
-    bool try_atomics = kind == Kind::Atomic && d.peers.empty() && runs_on && (!concurrent || lock_free);
+    bool try_atomics = kind == Kind::Atomic && d.peers.empty() && runs_on && (!conc() || lock_free);
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
       // The address is a 64-bit one in a register pair, or a scalar base with
@@ -13262,6 +13270,10 @@ void abandon_dispatches() { g_abandoned.store(true); }
 bool dispatches_abandoned() { return g_abandoned.load(); }
 
 DispatchStats execute(const Dispatch& d, MemoryManager& mem) {
+  struct InFlight {
+    InFlight() { g_dispatches_in_flight.fetch_add(1, std::memory_order_relaxed); }
+    ~InFlight() { g_dispatches_in_flight.fetch_sub(1, std::memory_order_relaxed); }
+  } in_flight;
   if (g_abandoned.load(std::memory_order_relaxed)) abandon();
   if (!d.object || !d.kernel) throw Error::make(Err::InvalidValue, "a dispatch needs a kernel");
   const Kernel& k = *d.kernel;

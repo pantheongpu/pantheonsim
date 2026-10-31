@@ -559,6 +559,44 @@ TIER_HANDLER(h_f2fp) {   // F2FP.PACK_AB: the interpreter's own code (the NaN, .
   c.r->tier_float_op(*c.blk, *c.w, *op.ins, ex);
 }
 
+// F2F between f32 and f64 and I2F from a 32-bit integer to f64: the SIMD kernels Runner::fast_float calls (f2f_widen, f2f_narrow, i2d). op.a: 0 f32 to
+// f64, 1 f64 to f32 (op.c the rounding mode), 2 and 3 an unsigned or signed integer to f64; op.b the source's |x| (bit 0) and -x (bit 1), which the kernels apply.
+TIER_HANDLER(h_cvt64) {
+  TIER_PRELUDE
+  if (op.dst == tier::kNoReg) return;   // nothing is written to RZ
+  if (op.a == 1) {
+    alignas(32) uint32_t tlo[32], thi[32], rt[32];
+    const uint32_t *lo, *hi;
+    tier_src64(c, op.s[0], tlo, thi, lo, hi);
+    uint32_t* const r = tier_out(c, op.dst, ex, rt);
+    if (op.c) {   // a directed rounding mode: the host's, around the kernel
+      RoundingScope scope(op.c);
+      c.sk->f2f_narrow(lo, hi, op.b, r);
+    } else {
+      c.sk->f2f_narrow(lo, hi, op.b, r);
+    }
+    tier_store(c, op.dst, ex, r);
+    return;
+  }
+  alignas(32) uint32_t t[32], rlo[32], rhi[32], sink[32];
+  const uint32_t* const a = tier_src<false>(c, op.s[0], t);
+  const bool full = ex == kAll;
+  uint32_t* const dlo = full ? c.R + op.dst * 32u : rlo;
+  uint32_t* const dhi = op.dst + 1u == kRZ ? sink : full ? c.R + (op.dst + 1u) * 32u : rhi;   // (R254's partner is RZ: its half goes nowhere)
+  if (op.a == 0) c.sk->f2f_widen(a, op.b, dlo, dhi);
+  else c.sk->i2d(op.a == 3, a, dlo, dhi);
+  if (!full) {
+    c.sk->blend_m(c.R + op.dst * 32u, rlo, ex);
+    if (op.dst + 1u != kRZ) c.sk->blend_m(c.R + (op.dst + 1u) * 32u, rhi, ex);
+  }
+}
+
+// What cvt64 and the f32 forms leave of F2F, I2F and MUFU: Runner::fast_float's code, then exec_float's.
+TIER_HANDLER(h_fltinterp) {
+  TIER_PRELUDE
+  c.r->tier_float_op(*c.blk, *c.w, *op.ins, ex);
+}
+
 TIER_HANDLER(h_unary) {
   TIER_PRELUDE
   alignas(32) uint32_t t[32], rt[32];
@@ -1829,6 +1867,8 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::F2i: return &h_f2i;
     case F::I2f: return &h_i2f;
     case F::F2fp: return &h_f2fp;
+    case F::Cvt64: return &h_cvt64;
+    case F::FltInterp: return &h_fltinterp;
     case F::Dsetp: return &h_dsetp;
     case F::Hop2: return &h_hop2;
     case F::Unary: return &h_unary;
