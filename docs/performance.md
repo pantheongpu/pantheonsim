@@ -5805,3 +5805,64 @@ Also run and passing at default, avx2 and avx512: `test_simd`, `test_sass_mma_ti
 ### Not done
 * The rows of the kernel (about three quarters of it): fewer vector operations per chunk would help both CPUs, but every one of them is part of the bit-exact chunk rule. The N = 16 B decode (16 vectors) could be fused with the load as A's now is; it is 6% of the 16x16x16 call.
 * The `__memcpy_chk` pattern is not limited to `kernels.inc`: 111 call sites remain in the shim (`h_imma` has six, `h_global` seven, the PTX `exec_*` functions more). Their cost per instruction was not measured.
+## Round sp13: shared-memory bank counting keyed by 32-bit offsets (branch `sp13-bank`, base `sp12-combined` b6545db2)
+
+Where the time went (perf `cycles:u`, one host thread, server3 Zen 4, base b6545db2): `sass_bank_passes_memo` 12% of Samples convolutionSeparable and 21% of sortingNetworks, with
+`count_shared_access` (thread_local table, 2.7 to 3.2%), `bank_passes_progression` (1.5 to 2%) and, for sortingNetworks, `sass_bank_passes_table` (5%) after it: 16% and 31% of those programs
+for the counters of one kind of instruction. The memo itself is flat (no instruction over 8%): it builds a 64-bit key from 32 widened addresses (the tier handler had just widened them from its
+32-bit offsets, 16 stores), subtracts the base, hashes eight of them and compares 256 bytes.
+
+### What changed
+* `h_shared` no longer widens its offsets. `count_shared_offsets` -> `memcount::sass_bank_passes_offsets` (include/vgpu/exec/mem_counters.hpp) keys a warp by its 32-bit offsets less the first
+  active lane's word (a lane that does not run is taken at that word, as in the 64-bit key): 128 bytes to build and compare, in SSE2 vectors.
+* Every shape goes through the table, the ones on a stride too (a hit is cheaper than finding the stride), and the entry that answered last is compared first, without the hash (a loop asks for
+  one shape two or three times running: load, store, load of the same indices). A miss is counted as before (`sass_bank_passes` on the widened offsets: closed forms, then the table of words) and stored.
+* Validity of the 32-bit key: no active offset may have bit 31 set (else the call is counted, never remembered). Then every true difference between two lanes is under 2^31, so two warps with
+  equal keys differ by a move of whole words, and the passes (distinct words per bank) cannot differ. Without the test two lanes 4 GB apart in truth and one word apart modulo 2^32 are equal keys
+  (test below).
+* Same window and back-off as the 64-bit table (under a third hits in 64 lookups: 1024 calls uncounted by the table). `BankMemo` grows by a second table of 32 x 136 bytes, the same thread_local object.
+* Tried and dropped: counting runs of lanes (`mask = 2^n - 1`, which a sorting network asks for by the thousand, 1.1 M distinct masks in sortingNetworks) the old way, before the table: 2% to 3%
+  slower than putting everything through the table (instructions 290.4 G against 282.9 G, cycles 71.9 G against 68.8 G). A table of 128 entries: hit rate 86.4% -> 87.4% only (the misses are
+  masks that never repeat, not capacity), dropped. `sass_bank_passes_widened` inline: worse (mem 0.954x on both CPUs).
+
+### Results (A = b6545db2, B = branch; outputs and bank-conflict counters identical per kernel in the programs below, checked with VGPU_COUNTERS=1)
+Zen 4 (server3, Ryzen 7 PRO 8840U, cpu 3, `perf stat` user cycles / instructions of the whole program, box load 1 to 2, 3 to 4 runs; A/A of the same runs 0.997 to 1.003):
+| program | A cycles | B cycles | B/A | A instructions | B instructions |
+|---|---:|---:|---:|---:|---:|
+| convolutionSeparable | 64.8 / 64.9 / 64.9 G | 59.4 / 59.6 / 59.9 G | 0.918 | 295.0 G | 268.2 G |
+| sortingNetworks | 84.6 / 84.5 / 84.6 G | 69.0 / 69.9 / 69.1 G | 0.817 | 311.95 G | 284.7 G |
+| transpose | 44.2 / 44.1 / 44.6 / 44.2 G | 44.5 / 44.2 / 44.2 / 44.3 G | 1.00 | 184.5 G | 182.5 G |
+
+Zen 5 (server2, Ryzen 9 9950X, cpu 30, wall s, 5 alternating runs, box load 7 to 9 from other sessions):
+| program | A s | B s | A/B |
+|---|---:|---:|---:|
+| sortingNetworks | 15.16 to 15.27 | 11.19 to 11.47 | 1.35x |
+| convolutionSeparable | 10.33 to 10.43 | 9.16 to 9.75 | 1.13x |
+| transpose | 6.93 to 7.04 | 7.14 to 7.26 | 0.97x |
+(transpose: its shared accesses are contiguous or one stride, which the base counted in closed form; on Zen 4 it is level at 1.00x cycles with 1.1% fewer instructions, so the 0.97x on Zen 5 is a
+cost of the table path on that core or placement; not separated.) `real.py` on server3 (5 runs, cpu 3, load 1 to 20, wall): sortingNetworks 1.23x, convolutionSeparable 1.10x, dct8x8 1.05x,
+hotspot 1.08x, lud 0.99x, mergeSort 1.00x, transpose 1.01x (outputs identical); bh timed out at 150 s on both sides.
+
+bench.py canaries (12 workloads, SASS and PTX, 15 runs, counters identical in all 24 rows on both CPUs). Final tree: A/A on Zen 4 all within 0.985x to 1.007x. A/B on Zen 4: `divergent` SASS
+1.067x, `wmma` SASS 1.017x, `mma_ptx` 1.011x/1.016x (placement gains, not goals), `mem` SASS 0.976x (p<0.001; 0.985x and 0.981x in two other windows) and `warp` PTX 0.967x (p<0.001) are the
+rows below 0.98x. A/A on Zen 5 within 0.96x to 1.02x (0.98x to 1.01x apart from `launch` PTX 0.962x, p 0.77); A/B on Zen 5: `wmma` PTX 0.945x (0.935x to 0.941x in two other runs, p<0.001),
+`warp` PTX 0.977x/0.975x, `api` 0.980x to 0.987x, `mem` SASS 0.982x, `atomics` SASS 0.984x. None of these runs any code this round touches (the PTX interpreter, the API path), instructions are equal,
+and they moved from variant to variant of the same change (see below): the placement effect of earlier rounds (sp9, sp12 shared), not a measured cause. The variants measured (same source, only
+`noinline`): plain inline `sass_bank_passes_offsets`: Zen 4 `mem` PTX 0.978x, `divergent` PTX 0.974x, `launch` SASS 0.969x (all reproduced with 21 runs); `noinline` on it (kept): those three at 0.998x,
+0.996x, 1.000x, the losses move to the rows above; also `noinline`-less `sass_bank_passes_widened`: `mem` 0.954x to 0.977x on both CPUs, dropped. Zen 5 `wmma` PTX read 0.92x to 0.94x in all three
+variants, 1.00x on Zen 4 (it is the 16-lane tensor kernel's host, which sp12 measured as layout-sensitive on Zen 5), so it is reported, not fixed.
+
+### Tests (CMake-wired, `test_bank_memo`) and the mutations that fail them
+* `offsets_are_counted_as_the_definition_counts_them`: 600 000 random warps (7 kinds of shape, widths 1 to 64, full, partial and sparse masks, bases at every byte, a cluster rank above the offset,
+  across bit 31 and past 2^32, idle lanes holding anything) against the definition (sorted vectors of the words of each bank), with one table throughout (hits, collisions, the last-entry compare, the back-off).
+* `offsets_that_differ_in_one_lane_one_byte_or_the_mask...`, `offsets_on_a_stride_and_ones_that_never_repeat...`, `offsets_every_pair_of_lanes_and_every_lane_left_out...` (all 496 pairs and 32
+  masks of all lanes but one, twice, idle lanes holding real offsets), `offsets_a_lane_that_joins_the_mask_changes_the_answer...` (lanes c and a+16, then a joins: 1 then 2 passes, for all c, a), `offsets_across_bit_31_are_not_taken_for_the_same_shape_in_low_memory` (offsets 4096/4094 then 0/0xfffffffe, 1 then 2 passes).
+* Mutations (header mutated, test rebuilt; all killed): no blend of idle lanes, bit-31 test removed, width left out of the key, base not rounded to a word, last-entry hit without the
+  key compare, hash-entry hit without the key compare, lane-select vector with lanes 0 and 1 swapped, mask ignored in the key. The first version of the suite let the bit-31 and the swapped-lane mutants
+  survive; the last two tests above were written for them.
+* Also run and passing (Release, server3): test_memcount_forms, test_sass_dispatch, test_tier, test_memfast, test_sass_access_count, test_sass_mem_rows.
+
+### Not done
+* The remaining bank cost in sortingNetworks is `sass_bank_passes_table` (7% of the program) on the masks that never repeat (merge steps); a closed form for two runs of consecutive words, or a per-shape
+  word-group table counted for any mask, would take it. `thread_local` access (`__tls_get_addr`, 0.8%) not changed (initial-exec TLS in a shim library loaded by dlopen is a risk, a pointer in `Block` moves heap blocks).
+* The PTX interpreter's shared-memory banks (`ptx_bank_passes`), the exec path (`count_shared_access`) and the other tier handlers keep the 64-bit table.
