@@ -226,6 +226,94 @@ VTEST(a_launch_that_lost_to_the_estimate_ends_offloading) {
   VCHECK(!offload_paid_off(0.100, 0.003));   // 3DCONV: 100 ms of copies for a 3 ms simulation
 }
 
+constexpr uint64_t kMiB = 1ull << 20;
+
+VTEST(traffic_ban_constants_are_the_replayed_ones) {   // chosen on the 64 saved traces (docs/performance.md, Round sp14); changing one needs a new replay
+  VCHECK(kTrafficLaunches == 2 && kTrafficSharePercent == 25 && kTrafficMinBytes == 12 * kMiB && kTrafficSlowShare == 0.5);
+}
+
+VTEST(traffic_ban_fires_on_the_second_heavy_launch_in_a_row) {   // LU's shape: the whole 16 MiB buffer pushed again every launch
+  TrafficTable t;
+  VCHECK(!t.record("lu", 16 * kMiB, 16 * kMiB, 0.004, 0.006));   // one heavy launch: not yet
+  VCHECK(t.record("lu", 16 * kMiB, 16 * kMiB, 0.004, 0.006));    // two in a row: banned
+  VCHECK(t.record("lu", 16 * kMiB, 16 * kMiB, 0.004, 0.006));    // and it stays so while it keeps pushing
+}
+
+VTEST(traffic_ban_needs_the_launches_in_a_row) {
+  TrafficTable t;
+  VCHECK(!t.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(!t.record("k", 0, 16 * kMiB, 0.0001, 0.006));            // a launch that pushed nothing resets the count
+  VCHECK(!t.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(t.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+}
+
+VTEST(traffic_ban_ignores_a_chain_without_pushes_and_the_first_upload) {
+  TrafficTable t;
+  VCHECK(!t.record("fdtd", 48 * kMiB, 48 * kMiB, 0.1, 0.1));      // the initial upload: heavy once (FDTD-2D)
+  for (int i = 0; i < 100; ++i) VCHECK(!t.record("fdtd", 0, 48 * kMiB, 0.0002, 0.1));   // then nothing moves
+  TrafficTable u;
+  for (int i = 0; i < 100; ++i) VCHECK(!u.record("chain", 0, 48 * kMiB, 0.0002, 0.1));
+}
+
+VTEST(traffic_ban_spares_a_big_push_that_is_a_small_share) {   // base64e: 8 MiB of hundreds, and aligned-types: big buffers pushed in pieces
+  TrafficTable t;
+  for (int i = 0; i < 10; ++i) VCHECK(!t.record("b64", 100 * kMiB, 1000 * kMiB, 0.5, 0.6));   // 10% of live: under the share
+  for (int i = 0; i < 10; ++i) VCHECK(!t.record("b64b", 249 * kMiB, 1000 * kMiB, 0.5, 0.6));  // 24.9%
+  TrafficTable v;
+  VCHECK(!v.record("exact", 250 * kMiB, 1000 * kMiB, 0.5, 0.6));   // exactly the share: not above it
+  VCHECK(!v.record("exact", 250 * kMiB, 1000 * kMiB, 0.5, 0.6));
+  VCHECK(!v.record("over", 251 * kMiB, 1000 * kMiB, 0.5, 0.6));
+  VCHECK(v.record("over", 251 * kMiB, 1000 * kMiB, 0.5, 0.6));     // one MiB over: the same pair bans
+}
+
+VTEST(traffic_ban_spares_a_small_push) {   // a share of a small heap is not traffic worth a ban
+  TrafficTable t;
+  for (int i = 0; i < 10; ++i) VCHECK(!t.record("small", 4 * kMiB, 4 * kMiB, 0.004, 0.006));
+  TrafficTable e;
+  VCHECK(!e.record("edge", 12 * kMiB, 12 * kMiB, 0.004, 0.006));   // exactly the floor: not above it
+  VCHECK(!e.record("edge", 12 * kMiB, 12 * kMiB, 0.004, 0.006));
+  VCHECK(!e.record("above", 12 * kMiB + 1, 12 * kMiB + 1, 0.004, 0.006));
+  VCHECK(e.record("above", 12 * kMiB + 1, 12 * kMiB + 1, 0.004, 0.006));
+}
+
+VTEST(traffic_ban_spares_a_launch_the_card_path_wins_by_far) {   // GRAMSCHM's shape: huge pushes, but the simulator would take 3x longer
+  TrafficTable t;
+  for (int i = 0; i < 10; ++i) VCHECK(!t.record("gs", 48 * kMiB, 48 * kMiB, 0.040, 0.120));   // 0.33 of the estimate
+  TrafficTable u;
+  VCHECK(!u.record("edge", 48 * kMiB, 48 * kMiB, 0.05, 0.10));   // exactly half the estimate: not past it
+  VCHECK(!u.record("edge", 48 * kMiB, 48 * kMiB, 0.05, 0.10));
+  VCHECK(!u.record("past", 48 * kMiB, 48 * kMiB, 0.0501, 0.10));
+  VCHECK(u.record("past", 48 * kMiB, 48 * kMiB, 0.0501, 0.10));
+}
+
+VTEST(traffic_ban_is_per_kernel) {
+  TrafficTable t;
+  VCHECK(!t.record("a", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(!t.record("b", 16 * kMiB, 16 * kMiB, 0.004, 0.006));   // another kernel's first heavy launch is not a's second
+  VCHECK(!t.record("c", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(t.record("a", 16 * kMiB, 16 * kMiB, 0.004, 0.006));    // a's second
+  VCHECK(t.record("b", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  TrafficTable u;
+  VCHECK(!u.record("a", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(!u.record("b", 0, 16 * kMiB, 0.0, 0.006));             // b's quiet launch does not reset a
+  VCHECK(u.record("a", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+}
+
+VTEST(traffic_ban_first_card_launch_counts_traffic_only) {   // its path includes the module load: no time verdict from it
+  TrafficTable t;
+  VCHECK(!t.record("k", 16 * kMiB, 16 * kMiB, 0.0001, 0.006, false));   // timing not valid: traffic alone makes it heavy
+  VCHECK(t.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006, true));
+  TrafficTable u;
+  VCHECK(!u.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(!u.record("k", 16 * kMiB, 16 * kMiB, 0.0001, 0.006, true));    // a valid, fast launch resets
+  VCHECK(!u.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+}
+
+VTEST(traffic_ban_with_no_live_bytes_never_fires) {
+  TrafficTable t;
+  for (int i = 0; i < 5; ++i) VCHECK(!t.record("k", 16 * kMiB, 0, 0.004, 0.006));
+}
+
 VTEST(static_estimate_scales_with_the_grid) {   // an estimate, not a bound: see host_gpu.hpp
   Costs c;
   // PolyBench gemm_kernel: 1,024 blocks of 256 threads, about 60 static instructions: 5 ms of simulation by this count (it took 900 ms).

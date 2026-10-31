@@ -258,4 +258,33 @@ class SimTimeTable {
 // than the simulator was expected to need ends the offloading of that kernel. One bad launch is the most it can cost.
 inline bool offload_paid_off(double card_total_s, double sim_estimate_s) { return card_total_s <= sim_estimate_s; }
 
+// A second safety net, by traffic (docs/perf-design/09-host-gpu-spike.md 7.3; docs/performance.md "Round sp14"). With a persistent card copy, a kernel that
+// alternates with simulator launches on the same buffers gives the copy up and gets it pushed again every time. A kernel is banned when kTrafficLaunches
+// offloaded launches IN A ROW each pushed more than kTrafficSharePercent percent of the live bytes AND more than kTrafficMinBytes, and each one's card path
+// took more than kTrafficSlowShare of the simulator's estimate. All three conditions are needed: replayed over the 64 saved traces (residency_model.py), the share
+// and the size alone also catch GRAMSCHM, whose offloaded launches are worth 3x their traffic (banning it loses 29%), and the share keeps base64e (8.4% of live bytes
+// per push, 8.06 MiB) out. The kernel stays in the simulator for the rest of the process; a ban only moves a launch back, so results do not change.
+// Measured on the traces the ban fires on LU only, and late: it is a net, not the fix for LU's 18% against write-through.
+inline constexpr unsigned kTrafficLaunches = 2;
+inline constexpr unsigned kTrafficSharePercent = 25;
+inline constexpr uint64_t kTrafficMinBytes = 12ull << 20;
+inline constexpr double kTrafficSlowShare = 0.5;
+
+class TrafficTable {
+ public:
+  // One offloaded launch of `kernel`: it pushed `push_bytes` of `live_bytes`, its card path took `card_total_s`, the simulator was expected to need
+  // `sim_estimate_s`. `timing_valid` is false for a kernel's first card launch, whose path includes the module load: then only the traffic counts.
+  // Returns true when the kernel must go back to the simulator for good.
+  bool record(const std::string& kernel, uint64_t push_bytes, uint64_t live_bytes, double card_total_s, double sim_estimate_s, bool timing_valid = true) {
+    unsigned& heavy = heavy_[kernel];
+    const bool big = push_bytes > kTrafficMinBytes && live_bytes > 0 && push_bytes * 100 > live_bytes * kTrafficSharePercent;
+    const bool slow = !timing_valid || card_total_s > kTrafficSlowShare * sim_estimate_s;
+    heavy = (big && slow) ? heavy + 1 : 0;
+    return heavy >= kTrafficLaunches;
+  }
+
+ private:
+  std::map<std::string, unsigned> heavy_;   // per kernel: offloaded launches in a row that were heavy
+};
+
 }  // namespace vgpu::hostgpu

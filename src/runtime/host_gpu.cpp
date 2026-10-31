@@ -144,6 +144,7 @@ struct Runtime::Impl : CardGate {
   Costs costs;
   SimTimeTable sim_times;
   std::map<std::string, double> card_kernel_s;
+  TrafficTable traffic;
   std::set<std::string> banned;   // kernels whose offloaded launch took longer than the simulator was expected to
   std::map<const sass::Module*, CUmodule> modules;
   struct Verdict {
@@ -688,10 +689,14 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
   }
   if (im.resident) {   // nothing comes back now: the simulator's memory is stale where the card wrote, and the gate pulls it when it is read
     const double total_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    if (im.card_kernel_s.count(fn.name) && !offload_paid_off(total_s, e.sim_s)) {
+    const bool first_card_launch = im.card_kernel_s.count(fn.name) == 0;
+    if (!first_card_launch && !offload_paid_off(total_s, e.sim_s)) {
       im.banned.insert(fn.name);
       if (logging()) std::fprintf(stderr, "host_gpu: %s took %.3f ms on the card path against an estimate of %.3f ms in the simulator: offloading it ends\n", fn.name.c_str(), total_s * 1e3, e.sim_s * 1e3);
     }
+    if (im.traffic.record(fn.name, push_bytes, total, total_s, e.sim_s, !first_card_launch) && im.banned.insert(fn.name).second && logging())
+      std::fprintf(stderr, "host_gpu: %s pushed %.1f MiB of %.1f MiB live on each of its last %u launches: offloading it ends (traffic)\n", fn.name.c_str(),
+                   push_bytes / 1048576.0, total / 1048576.0, kTrafficLaunches);
     im.card_kernel_s[fn.name] = kernel_s;
     ++im.stats.offloaded;
     if (logging())

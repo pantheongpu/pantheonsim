@@ -25,6 +25,18 @@ LAUNCH, PUSH, PULL, CALL = 7e-6, 12e9, 10e9, 10e-6          # the link (M3): wha
 WT_NS_PER_LIVE_BYTE = 0.854e-9
 PUSH_EFF, PULL_EFF = 1.0 / (1 / 12e9 + 1 / 8e9), 1.0 / (1 / 10e9 + 1 / 8e9 + 1 / 10e9)
 MARGIN, MIN_SIM = 2.0, 200e-6
+# Round sp14 calibration. The costs above reproduce the winners but not the measured LU loss (persistent 0.82x of write-through, 20.3 s against 16.6 s on an
+# A10G): a persistent copy that alternates with the simulator pays more per byte than the constants say. PSCALE multiplies what persistent actually pays
+# for pushes and pulls (the size rule keeps believing the unscaled constants, as the runtime does); WSCALE does the same for write-through.
+# Fitted on LU alone (see FIT below); GRAMSCHM and the winners are then checks.
+PSCALE, WSCALE = 1.5, 0.75
+# Write-through's cost per live byte is 0.854 ns measured at 48 MiB live (FDTD-2D, so WSCALE_BIG stays 1.0); LU's 16 MiB buffer is cheaper per byte
+# (fits the host cache: fitted 0.75). Two programs cannot pin a size law; this is a calibration, not a finding.
+WSCALE_BIG, BIG_LIVE = 1.0, 32 << 20
+# The traffic ban (policy 'ban' = persist + ban): a kernel whose BAN_N consecutive offloaded launches each pushed more than BAN_PCT percent of the live
+# bytes and more than BAN_MIB MiB, and whose card path exceeded BAN_SLOW times the simulator's time, goes back to the simulator for good.
+BAN_PCT, BAN_MIB, BAN_N, BAN_SLOW = 25.0, 12.0, 2, 0.5
+BAN_PULLS = False   # charge the kernel with the time the simulator launches since its last launch spent pulling the card copy
 
 class Alloc:
     __slots__ = ('base', 'size', 'st')
@@ -49,6 +61,9 @@ class Sim:
         self.kcount = collections.Counter()
         self.calls = 0
         self.banned = set()
+        self.heavy = collections.Counter()
+        self.pull_t = 0.0   # seconds spent giving the card copy up (simulator launches, host reads) since the last offloaded launch
+        self.ban_at = {}
     def find(self, addr):
         # linear scan is fine: few live allocations
         for a in self.allocs.values():
@@ -67,13 +82,13 @@ class Sim:
         if not a: return
         lo = (addr - a.base) // K; hi = min((addr + ln - 1 - a.base) // K, len(a.st) - 1)
         if op == 'R':
-            b, r = self.pull_chunks(a, lo, hi); self.pulled += b; self.t += b / PULL_EFF + r * CALL
+            b, r = self.pull_chunks(a, lo, hi); self.pulled += b; self.t += PSCALE * b / PULL_EFF + r * CALL; self.pull_t += PSCALE * b / PULL_EFF + r * CALL
         else:
             # W / Z: a partly covered Card chunk is pulled first; then the chunk is the host's
             for i in range(lo, hi + 1):
                 whole = addr <= a.base + i * K and addr + ln >= a.base + i * K + chunk_bytes(a, i)
                 if a.st[i] == 1 and not whole:
-                    b = chunk_bytes(a, i); self.pulled += b; self.t += b / PULL_EFF + CALL
+                    b = chunk_bytes(a, i); self.pulled += b; self.t += PSCALE * b / PULL_EFF + CALL; self.pull_t += PSCALE * b / PULL_EFF + CALL
                 a.st[i] = 0
     def launch(self, name, sim_s, in_set, card_s, bases):
         self.kcount[name] += 1
@@ -85,7 +100,7 @@ class Sim:
             self.sim_launch(sim_s, bases); return
         if pol == 'wt':
             tot = self.live_bytes(); believed = LAUNCH + card_s + tot / PUSH + tot / PULL + 2 * CALL
-            actual = LAUNCH + card_s + tot * WT_NS_PER_LIVE_BYTE
+            actual = LAUNCH + card_s + tot * WT_NS_PER_LIVE_BYTE * (WSCALE if tot <= BIG_LIVE else WSCALE_BIG)
             if sim_s > MARGIN * believed:
                 self.t += actual; self.pushed += tot; self.pulled += tot; self.n_off += 1; self.calls += 2
                 if self.kcount[name] > 3 and actual > sim_s: self.banned.add(name)   # the runtime's ban: one launch slower than the simulator ends it
@@ -99,11 +114,19 @@ class Sim:
                 if s == 0 or (s == 3 and not self.zskip): idx.append(i); push += chunk_bytes(a, i)
             pidx += runs(idx)
         path = LAUNCH + card_s + push / PUSH_EFF + pidx * CALL
+        actual = LAUNCH + card_s + PSCALE * push / PUSH_EFF + pidx * CALL
         if sim_s > MARGIN * path:
             for a in reach:
                 for i, s in enumerate(a.st): a.st[i] = 1
-            self.t += path; self.pushed += push; self.n_off += 1; self.calls += pidx
-            if self.kcount[name] > 3 and path > sim_s: self.banned.add(name)
+            live = self.live_bytes()
+            self.t += actual; self.pushed += push; self.n_off += 1; self.calls += pidx
+            if self.kcount[name] > 3 and actual > sim_s: self.banned.add(name)
+            if pol == 'ban':
+                if push * 100 > BAN_PCT * live and push > BAN_MIB * 1048576 and actual + (self.pull_t if BAN_PULLS else 0.0) > BAN_SLOW * sim_s: self.heavy[name] += 1
+                else: self.heavy[name] = 0
+                self.pull_t = 0.0
+                if self.heavy[name] >= BAN_N and name not in self.banned:
+                    self.banned.add(name); self.ban_at[name] = self.kcount[name]
         else: self.sim_launch(sim_s, bases)
     def sim_launch(self, sim_s, bases):
         self.n_sim += 1; self.t += sim_s
@@ -112,7 +135,7 @@ class Sim:
         reach = [a for a in self.allocs.values() if a.base in bases] if pol == 'argsonly' else list(self.allocs.values())
         for a in reach:
             b, r = self.pull_chunks(a, 0, len(a.st) - 1)
-            self.pulled += b; self.t += b / PULL_EFF + r * CALL
+            self.pulled += b; self.t += PSCALE * b / PULL_EFF + r * CALL; self.pull_t += PSCALE * b / PULL_EFF + r * CALL
             for i in range(len(a.st)): a.st[i] = 0
 
 import gzip
@@ -149,9 +172,32 @@ def summary(path):
             prev_off = ins; touched = False
     return launches, in_set, sim_total, in_set_sim, chained
 
+def table(paths, zskip=False):
+    """Round sp14 replay table: write-through, persistent and persistent + traffic ban per program (device-side seconds of the trace)."""
+    print('%-26s %9s %9s %9s %9s | %-6s %8s | %s' % ('program', 'off', 'wt', 'persist', 'ban', 'banned', 'ban/pers', 'banned kernels (launch of the ban)'))
+    rows = []
+    for p in paths:
+        r = {pol: run(p, pol, zskip) for pol in ('off', 'wt', 'persist', 'ban')}
+        name = p.split('/')[-1].replace('.gz', '').replace('.trace', '')
+        rows.append((name, r))
+        b = r['ban']
+        print('%-26s %9.3f %9.3f %9.3f %9.3f | %-6s %7.3fx | %s' % (name, r['off'].t, r['wt'].t, r['persist'].t, b.t, 'YES' if b.ban_at else '-',
+              r['persist'].t / max(b.t, 1e-9), ', '.join('%s@%d' % (k[:30], v) for k, v in b.ban_at.items())))
+    return rows
+
 if __name__ == '__main__':
-    zskip = '--zskip' in sys.argv
-    for p in [a for a in sys.argv[1:] if not a.startswith('--')]:
+    args = sys.argv[1:]
+    zskip = '--zskip' in args
+    for a in args:
+        for key in ('pscale', 'wscale', 'wbig', 'pct', 'mib', 'n', 'slow'):
+            if a.startswith('--%s=' % key):
+                v = float(a.split('=')[1])
+                g = globals()
+                g[{'pscale': 'PSCALE', 'wscale': 'WSCALE', 'wbig': 'WSCALE_BIG', 'pct': 'BAN_PCT', 'mib': 'BAN_MIB', 'n': 'BAN_N', 'slow': 'BAN_SLOW'}[key]] = int(v) if key == 'n' else v
+    paths = [a for a in args if not a.startswith('--')]
+    if '--table' in args:
+        table(paths, zskip); sys.exit(0)
+    for p in paths:
 
         launches, in_set, sim_total, in_set_sim, chained = summary(p)
         r = {pol: run(p, pol, zskip) for pol in ('off', 'wt', 'persist', 'argsonly')}
