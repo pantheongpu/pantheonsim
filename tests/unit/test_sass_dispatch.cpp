@@ -405,6 +405,26 @@ const Golden kGolden[] = {
     {"shared memory, shape 5, 19 threads", 0xd860fdd4d9538013ull},
     {"shared memory, shape 6, 19 threads", 0xe52f4f65a25cdc7dull},
     {"shared memory, shape 7, 19 threads", 0xa3def45ff5165dcbull},
+    {"shared memory, shape 8, 32 threads", 0x48a5bb23b9cb8bfdull},
+    {"shared memory, shape 8, 64 threads", 0xeb407203a5d11bbeull},
+    {"shared memory, shape 8, 33 threads", 0xf925604d5ead50d2ull},
+    {"shared memory, shape 8, 5 threads", 0x0e7e333dcf8cd996ull},
+    {"shared memory, shape 8, 19 threads", 0x3d2699e1bcf46a08ull},
+    {"shared memory, shape 9, 32 threads", 0x36198d68e7fdf740ull},
+    {"shared memory, shape 9, 64 threads", 0x07d802f31e203214ull},
+    {"shared memory, shape 9, 33 threads", 0x7042c8f3d1df421bull},
+    {"shared memory, shape 9, 5 threads", 0x529305d9b1c26b54ull},
+    {"shared memory, shape 9, 19 threads", 0x9e108fcfef8cfdb8ull},
+    {"shared memory, shape 10, 32 threads", 0x779c0a7665bf1289ull},
+    {"shared memory, shape 10, 64 threads", 0x4ebf3b50623fc471ull},
+    {"shared memory, shape 10, 33 threads", 0x65cd2825b66e85d3ull},
+    {"shared memory, shape 10, 5 threads", 0x0e7e333dcf8cd996ull},
+    {"shared memory, shape 10, 19 threads", 0xb2fa9fed99fa5700ull},
+    {"shared memory, shape 11, 32 threads", 0xe5be27e905429c52ull},
+    {"shared memory, shape 11, 64 threads", 0x1d3827b5687b9b6cull},
+    {"shared memory, shape 11, 33 threads", 0xd2f33be8d6706a88ull},
+    {"shared memory, shape 11, 5 threads", 0xabab60b846e93465ull},
+    {"shared memory, shape 11, 19 threads", 0x2e21406a65d59257ull},
 };
 
 void check_golden(const Result& r, const std::string& key) {
@@ -471,6 +491,19 @@ std::vector<Insn> shared_kernel(unsigned shape) {
     case 4: code.push_back(movi(7, 0)); break;                                            // one address for every lane
     case 5: code.push_back(iadd3i(7, 0, 0, kRZ)); break;                                  // the index; the .X4 forms scale it
     case 6: code.push_back(imadi(7, 0, 2, kRZ)); break;                                   // (.X8 scales to 16 bytes a lane)
+    case 8:   // rows of eight words, a gap between the rows
+      code.push_back(movi(8, 0x18)), code.push_back(lop3(9, 0, 8, kRZ, 0xc0)), code.push_back(imadi(7, 0, 4, kRZ)), code.push_back(imadi(7, 9, 24, 7));
+      break;
+    case 9:   // the same, each row starting two bytes into a word
+      code.push_back(movi(8, 0x18)), code.push_back(lop3(9, 0, 8, kRZ, 0xc0)), code.push_back(imadi(7, 0, 4, kRZ)), code.push_back(imadi(7, 9, 24, 7));
+      code.push_back(iadd3i(7, 7, 2, kRZ));
+      break;
+    case 10:  // runs of four words only: no group of eight is one run
+      code.push_back(movi(8, 4)), code.push_back(lop3(9, 0, 8, kRZ, 0xc0)), code.push_back(imadi(7, 0, 4, kRZ)), code.push_back(imadi(7, 9, 20, 7));
+      break;
+    case 11:  // four rows on the same eight words (the later lane's value is the one stored)
+      code.push_back(movi(8, 7)), code.push_back(lop3(9, 0, 8, kRZ, 0xc0)), code.push_back(imadi(7, 9, 4, kRZ));
+      break;
     default: code.push_back(imadi(7, 0, 4, kRZ)); break;
   }
   const unsigned size = shape == 3 ? 0 : shape == 7 ? 5 : 4;   // U8, 64 bits, 32 bits
@@ -513,7 +546,7 @@ VTEST(warpsync_does_not_wait_for_lanes_that_have_exited) {
 }
 
 VTEST(shared_memory_of_a_whole_warp_gives_the_interpreters_registers_and_counters) {
-  for (unsigned shape = 0; shape < 8; ++shape) compare(shared_kernel(shape), {32, 64, 33, 5, 19}, "shared memory, shape " + std::to_string(shape));
+  for (unsigned shape = 0; shape < 12; ++shape) compare(shared_kernel(shape), {32, 64, 33, 5, 19}, "shared memory, shape " + std::to_string(shape));
 }
 
 #ifndef SASS_CALL_RET_NO_TIER_FORMS   // (not in the tree the answers were taken from)

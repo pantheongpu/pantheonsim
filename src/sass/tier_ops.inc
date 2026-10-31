@@ -1088,6 +1088,53 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
 #endif
 }
 
+// A whole warp's 4-byte shared accesses that are not one run of 32 words: each group of eight lanes is moved as 32 bytes when its
+// offsets are eight consecutive words (a tile row of 8, 16 or 32 words, or two rows in one warp), else lane by lane. The groups run in
+// order, so where two lanes name one word the later lane's value is the one stored, as in the lane loop (the words of one group are all
+// different).
+template <bool Store>
+[[gnu::always_inline]] inline void tier_shared_words(uint8_t* sh, uint32_t* d, const uint32_t* offs) {
+  for (unsigned g = 0; g < 4; ++g) {
+    const uint32_t* o = offs + 8 * g;
+    uint32_t* dg = d ? d + 8 * g : nullptr;
+#if defined(__SSE2__)
+    const __m128i low24 = _mm_set1_epi32(0xffffff);
+    const __m128i first = _mm_add_epi32(_mm_set1_epi32(static_cast<int>(o[0] & 0xffffff)), _mm_set_epi32(12, 8, 4, 0));
+    const __m128i same0 = _mm_cmpeq_epi32(_mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(o)), low24), first);
+    const __m128i same1 = _mm_cmpeq_epi32(_mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(o) + 1), low24),
+                                          _mm_add_epi32(first, _mm_set1_epi32(16)));
+    if (_mm_movemask_epi8(_mm_and_si128(same0, same1)) == 0xffff) {
+      uint8_t* at = sh + (o[0] & 0xffffff);
+      if (Store) {
+        if (dg) {
+          const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dg)), b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dg) + 1);
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(at), a);
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(at) + 1, b);
+        } else {
+          std::memset(at, 0, 32);
+        }
+      } else if (dg) {
+        const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(at)), b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(at) + 1);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dg), a);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dg) + 1, b);
+      }
+      continue;
+    }
+#endif
+    for (unsigned i = 0; i < 8; ++i) {
+      uint8_t* at = sh + (o[i] & 0xffffff);
+      if (Store) {
+        const uint32_t v = dg ? dg[i] : 0u;
+        std::memcpy(at, &v, 4);
+      } else if (dg) {
+        uint32_t v;
+        std::memcpy(&v, at, 4);
+        dg[i] = v;
+      }
+    }
+  }
+}
+
 // Shared memory: the interpreter's fast case -- every active lane inside the block's own shared memory -- moved
 // straight between the register file and the block's array; anything else is exec_mem's.
 template <bool Store>
@@ -1168,8 +1215,10 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
   uint64_t addrs[32];
   tier_widen_offsets(addrs, offs, ex);
   const unsigned words = std::max(1u, bytes / 4);
+  const bool by_groups = bytes == 4 && ex == kAll;
+  if (by_groups) tier_shared_words<Store>(sh, d, offs);
   // (The widths the instruction can have move with copies of a size known at compile time: see store_lane_bytes.)
-  const bool moved = with_lane_width(bytes, [&](auto width) {
+  const bool moved = by_groups || with_lane_width(bytes, [&](auto width) {
     constexpr unsigned B = decltype(width)::value;
     const auto lane = [&](unsigned l) {
       uint8_t* at = sh + (offs[l] & 0xffffff);
