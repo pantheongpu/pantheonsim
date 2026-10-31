@@ -198,6 +198,18 @@ struct Kernels {
   void (*tile_f64)(unsigned M, unsigned N, unsigned K, const double* A, const double* B, const double* C, double* D);
   //  tile_f32c: tile_f32 with every NaN in D the canonical 0x7fffffff (what the tensor-core forms write), in the same pass.
   void (*tile_f32c)(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd);
+
+  // The conversions between f32 and f64 and from a 32-bit integer to f64 (SASS's F2F.F64.F32, F2F.F32.F64, I2F.F64.U32/.S32), 32 lanes each. binary64
+  // lanes are held as a register pair: the low words in lo/alo, the high words in hi/ahi. Within each block of eight lanes every source word is read
+  // before any result is written, so a result row may be a source row (the same lane only).
+  //  f2f_widen: f32 -> f64, exact. `mods` bit 0 is |x| and bit 1 -x (the absolute value first), applied to every value but a NaN, which keeps its
+  //    sign and payload as the register holds them (SNaN quieted, the payload shifted up 29 bits): what an RTX 3060 writes.
+  //  f2f_narrow: f64 -> f32 in the host's current rounding mode (the caller sets SASS's, as dop_m's), `mods` as above; a NaN is the double's sign and
+  //    top 22 payload bits with the quiet bit set (the conversion instruction's own), taken from the register as it is, before |x| and -x.
+  //  i2d: a 32-bit integer (signed if `sgn`) to f64; exact, +0 for 0 in every rounding mode.
+  void (*f2f_widen)(const uint32_t* a, unsigned mods, uint32_t* lo, uint32_t* hi);
+  void (*f2f_narrow)(const uint32_t* alo, const uint32_t* ahi, unsigned mods, uint32_t* r);
+  void (*i2d)(bool sgn, const uint32_t* a, uint32_t* lo, uint32_t* hi);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the

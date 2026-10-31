@@ -1395,6 +1395,11 @@ vgpu_unit_test(test_sass_code_at)
 # The SASS executor's block, kept between blocks and launches and set up again each time (Runner::init_block).
 vgpu_unit_test(test_sass_block_reuse)
 vgpu_unit_test(test_sass_alu_runs)
+# The same kernels with the interpreter's fast path alone (no tier) and with the baseline SIMD kernels.
+add_test(NAME test_sass_alu_runs_tier0 COMMAND test_sass_alu_runs)
+set_tests_properties(test_sass_alu_runs_tier0 PROPERTIES ENVIRONMENT "VGPU_TIER=0")
+add_test(NAME test_sass_alu_runs_simd_base COMMAND test_sass_alu_runs)
+set_tests_properties(test_sass_alu_runs_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base")
 vgpu_unit_test(test_sass_s2r_fill)
 # LDGSTS (cp.async): the tier's own handler against the rule and the interpreter, registers, shared memory and counters.
 vgpu_unit_test(test_sass_ldgsts)
