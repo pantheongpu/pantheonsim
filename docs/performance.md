@@ -5675,7 +5675,7 @@ at equal instructions; making the group copy a `noinline` function brought them 
   a word; runs of four words only; four rows on the same eight words), and every kernel reads the words back in order (a store and a load that agree on a wrong place hid a wrong group copy). All
   60 shared-memory digests were recorded from the base tree (2c68075d) with only the test changed. Mutations: only the first half of a group checked; the second half of a group loaded from the wrong
   place; the second half stored wrong; the widened addresses taken from the high halves. Each fails `shared_memory_of_a_whole_warp_...`.
-* Not done: ASan/UBSan of the touched tests is recorded under the branch commit message if it finished on server3 (see the report); TSan: no threaded or atomic code was touched.
+* ASan+UBSan (-O0, detect_leaks=1, halt_on_error=1) of test_sass_dispatch, test_memcount_forms and test_bank_memo: clean. TSan not run: no threaded or atomic code was touched.
 
 ### Not done, and negative results
 * An AVX2 gather for the strided 4-byte loads: the per-lane loop is 2 loads and 1 store per lane (about 32 cycles a warp) and a Zen 4 `vpgatherdd` is about 9 cycles per eight lanes: no gain expected, not tried.
