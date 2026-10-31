@@ -280,8 +280,13 @@ add_library(vgpu STATIC
 # between a function of one target and a function of the other goes in a register on one side and in memory on the other, so the
 # callee reads what happens to be on the stack. Optimised builds inline the helpers and do not notice; an -O0 (sanitizer) build does,
 # and it passed on one CPU and failed on another (round 8's canonical NaN). GCC says so with -Wpsabi: make it an error here.
+# The hot translation units (the SASS engine, the PTX interpreter, the memory manager, the SIMD kernels) are built outside link-time optimization,
+# with functions on 64-byte and loops on 32-byte boundaries: inside the LTO library any unrelated edit re-ordered the code and re-rolled the
+# inlining of their hot paths, which moved rows that run unchanged code by 3 to 14 % on a Zen 5 host at equal instruction counts, and outside it
+# a unit's layout depends on its own source only (docs/performance.md, Round sp14; tests/lint/check_hot_unit_layout.py holds the flags).
+set(VGPU_HOT_UNIT_FLAGS "-fno-lto;-falign-functions=64;-falign-loops=32")
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "-Werror=psabi")
+  set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "-Werror=psabi;${VGPU_HOT_UNIT_FLAGS}")
   # The AMD interpreter's floor, ceil, trunc and rint are libm's: GCC expands them in line (and so leaves a signaling NaN
   # as it is, where roundss and libm quiet it) in the places its heuristics call hot, which moved when the instruction
   # ladders became switches (s_trunc_f32 of a signaling NaN, amd/tests/unit/test_gcn_same_bits.cpp).
@@ -307,7 +312,11 @@ set_source_files_properties(amd/src/gcn_tier_ds.cpp PROPERTIES COMPILE_OPTIONS "
 # depended on where their few-instruction loops landed in a code line, which every unrelated edit of the library changed (docs/performance.md, Round sp13).
 set_source_files_properties(amd/src/gcn_matrix_kernels.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto;-falign-functions=64;-falign-loops=32")
 # The memory manager's hot paths: outside link-time optimization too, so the executors' code is laid out as it was without them.
-set_source_files_properties(src/core/memory.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+# The SASS engine and the SIMD kernels with it (the PTX interpreter's options are set with its -Werror=psabi above, for GNU).
+set_source_files_properties(src/core/memory.cpp src/sass/exec.cpp src/simd/simd.cpp src/simd/lanes.cpp PROPERTIES COMPILE_OPTIONS "${VGPU_HOT_UNIT_FLAGS}")
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "${VGPU_HOT_UNIT_FLAGS}")
+endif()
 if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set_target_properties(vgpu PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
   target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
@@ -3771,6 +3780,9 @@ if(Python3_Interpreter_FOUND)
   # brings an if-ladder back (or a `break` that makes the converter skip a chain) costs a hash comparison per rung per instruction.
   add_test(NAME lint_amd_ladders
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_ladders.py)
+  # The hot translation units are plain machine code on 64-byte function boundaries (VGPU_HOT_UNIT_FLAGS): read from their object files.
+  add_test(NAME lint_hot_unit_layout
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_hot_unit_layout.py ${CMAKE_BINARY_DIR}/CMakeFiles/vgpu.dir)
   # Every exported runtime and driver function is a call a profiler is told of,
   # and the driver shim takes the argument sizes the toolkit declares (CUPTI
   # reads them by those sizes).
