@@ -1563,7 +1563,7 @@ void f2f_widen_k(const uint32_t* a, unsigned mods, uint32_t* lo, uint32_t* hi) {
     const uint32_t y = nan ? x : ((x & absm) ^ negm);
     double d = static_cast<double>(std::bit_cast<float>(y));
 #if defined(__x86_64__)
-    asm("" : "+x"(d));   // (the conversion of a NaN lane stays: the scalar form raises "invalid" for a signalling NaN too)
+    asm volatile("" : "+x"(d));   // (the conversion of a NaN lane stays: the scalar form raises "invalid" for a signalling NaN too)
 #endif
     const uint64_t conv = std::bit_cast<uint64_t>(d);
     const uint64_t b = nan ? ((uint64_t{x >> 31} << 63) | 0x7ff8000000000000ull | (uint64_t{x & 0x7fffffu} << 29)) : conv;
@@ -1598,7 +1598,7 @@ void f2f_narrow_k(const uint32_t* alo, const uint32_t* ahi, unsigned mods, uint3
     const uint64_t y = nan ? x : ((x & absm) ^ negm);
     float f = static_cast<float>(std::bit_cast<double>(y));
 #if defined(__x86_64__)
-    asm("" : "+x"(f));
+    asm volatile("" : "+x"(f));
 #endif
     r[l] = std::bit_cast<uint32_t>(f);
   }
