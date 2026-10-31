@@ -15,6 +15,7 @@
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <atomic>
@@ -22,6 +23,10 @@
 #include <thread>
 #include <string>
 #include <vector>
+
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/simd/fp16.hpp"
@@ -1568,6 +1573,256 @@ VTEST(double_lanes_in_place_at_every_level) {
                                std::to_string(rb) + " c" + std::to_string(rc) + " d" + std::to_string(rd) + " lane " + std::to_string(i));
         }
     }
+  }
+}
+
+// ---- f32 <-> f64 and 32-bit integer -> f64 (f2f_widen, f2f_narrow, i2d): SASS's F2F.F64.F32, F2F.F32.F64 and I2F.F64.{U32,S32} --------------------
+//
+// The references are written from the rules an RTX 3060 shows (sass_fastpath.cu / float_half_forms.cu), independently of the kernels and of the executor's
+// scalar cv_f2f: a NaN to f64 keeps its sign and payload (shifted up 29 bits, quiet bit set) and is not touched by |x| or -x; a NaN to f32 keeps the
+// double's sign and top 22 payload bits with the quiet bit set; everything else is the host's conversion of the value after |x| then -x, in the rounding
+// mode in force. Every input set is run at every level, with each of the four |x|/-x combinations and (narrowing) each of the four rounding modes, and
+// the sticky exception flags the kernel leaves in MXCSR must be the ones the scalar reference leaves for the same 32 lanes.
+namespace {
+
+uint64_t ref_widen(uint32_t x, unsigned mods) {
+  if ((x & 0x7fffffffu) > 0x7f800000u) return (uint64_t{x >> 31} << 63) | 0x7ff8000000000000ull | (uint64_t{x & 0x7fffffu} << 29);
+  volatile float f = std::bit_cast<float>(x);
+  float v = f;
+  if (mods & 1) v = std::fabs(v);
+  if (mods & 2) v = -v;
+  volatile double d = static_cast<double>(v);
+  return db(d);
+}
+
+uint32_t ref_narrow(uint64_t x, unsigned mods) {   // (in the rounding mode set by the caller)
+  if ((x & 0x7fffffffffffffffull) > 0x7ff0000000000000ull)
+    return (static_cast<uint32_t>(x >> 63) << 31) | 0x7fc00000u | static_cast<uint32_t>((x >> 29) & 0x3fffffu);
+  volatile double d = std::bit_cast<double>(x);
+  double v = d;
+  if (mods & 1) v = std::fabs(v);
+  if (mods & 2) v = -v;
+  volatile float f = static_cast<float>(v);
+  return fb(f);
+}
+
+uint64_t ref_i2d(bool sgn, uint32_t x) {
+  volatile double d = sgn ? static_cast<double>(static_cast<int32_t>(x)) : static_cast<double>(x);
+  return db(d);
+}
+
+#if defined(__SSE2__)
+constexpr unsigned kFlagBits = 0x3fu;   // MXCSR: IE DE ZE OE UE PE
+unsigned flags_now() { return _mm_getcsr() & kFlagBits; }
+void flags_clear() { _mm_setcsr(_mm_getcsr() & ~kFlagBits); }
+#else
+unsigned flags_now() { return 0; }
+void flags_clear() {}
+#endif
+
+struct ModeGuard {   // the host's rounding mode (and its sticky flags as they were) around a block
+  int saved = std::fegetround();
+  explicit ModeGuard(int mode) { std::fesetround(mode); }
+  ~ModeGuard() { std::fesetround(saved); }
+};
+
+// f32 inputs: every sign and exponent with the mantissas that matter (zero, one bit, the quiet bit, all ones, a spread of random ones), then random words.
+std::vector<uint32_t> f32_inputs(unsigned randoms, unsigned seed) {
+  std::vector<uint32_t> v;
+  std::mt19937 rng(seed);
+  static const uint32_t mant[] = {0, 1, 2, 3, 0x3fffff, 0x400000, 0x400001, 0x7fffff, 0x7ffffe, 0x155555, 0x2aaaaa, 0x000100, 0x200000, 0x7fffff & 0x5a5a5a};
+  for (uint32_t sx = 0; sx < 512; ++sx) {
+    for (uint32_t m : mant) v.push_back(sx << 23 | m);
+    for (int i = 0; i < 16; ++i) v.push_back(sx << 23 | (static_cast<uint32_t>(rng()) & 0x7fffff));
+  }
+  for (unsigned i = 0; i < randoms; ++i) v.push_back(static_cast<uint32_t>(rng()));
+  return v;
+}
+
+// f64 inputs: every sign and exponent with mantissas on the rounding boundaries of an f32 (the half-way bit 28, the bits under it, the f32 mantissa's
+// top and bottom), then values built around the f32 overflow and underflow edges, then random words.
+std::vector<uint64_t> f64_inputs(unsigned randoms, unsigned seed) {
+  std::vector<uint64_t> v;
+  std::mt19937_64 rng(seed);
+  static const uint64_t mant[] = {0,           1,           2,           0xfffffffffffffull, 0x8000000000000ull, 0x8000000000001ull,
+                                  0x7ffffffffffffull, 0x10000000ull, 0x0fffffffull, 0x18000000ull, 0x1fffffffull, 0x20000000ull, 0x30000000ull,
+                                  0x3fffffffull, 0x10000001ull, 0xfffffe0000000ull, 0xfffffffe0000000ull & 0xfffffffffffffull, 0xffffff0000000ull,
+                                  0xfffffefffffffull, 0x0000000100000ull};
+  for (uint64_t sx = 0; sx < 4096; ++sx) {
+    for (uint64_t m : mant) v.push_back(sx << 52 | m);
+    for (int i = 0; i < 12; ++i) v.push_back(sx << 52 | (rng() & 0xfffffffffffffull));
+  }
+  for (uint64_t e = 0x360; e < 0x3a0; ++e)   // the f32 subnormals and their edge
+    for (int i = 0; i < 64; ++i) v.push_back((rng() & 1) << 63 | e << 52 | (rng() & 0xfffffffffffffull) >> (rng() % 40));
+  for (uint64_t e = 0x47d; e < 0x484; ++e)   // the f32 overflow edge
+    for (int i = 0; i < 64; ++i) v.push_back((rng() & 1) << 63 | e << 52 | ((rng() & 0xfffffffffffffull) | (0xffffffull << 28)) >> (rng() % 8));
+  for (unsigned i = 0; i < randoms; ++i) v.push_back(rng());
+  return v;
+}
+
+void check_flags(const std::string& what, unsigned got, unsigned want) {
+  if (got != want)
+    throw vtest::Failure(what + ": exception flags 0x" + hex(got) + " but the scalar reference leaves 0x" + hex(want));
+}
+
+}  // namespace
+
+VTEST(f2f_widen_matches_the_rules_at_every_level) {
+  const std::vector<uint32_t> in = f32_inputs(200000, 5);
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (unsigned mods = 0; mods < 4; ++mods) {
+      for (size_t base = 0; base + 32 <= in.size(); base += 32) {
+        uint32_t lo[32], hi[32];
+        uint64_t want[32];
+        flags_clear();
+        for (int i = 0; i < 32; ++i) want[i] = ref_widen(in[base + i], mods);
+        const unsigned wf = flags_now();
+        flags_clear();
+        k.f2f_widen(&in[base], mods, lo, hi);
+        const unsigned gf = flags_now();
+        for (int i = 0; i < 32; ++i) {
+          const uint64_t got = lo[i] | (uint64_t{hi[i]} << 32);
+          if (got != want[i])
+            throw vtest::Failure(lv + " f2f_widen mods " + std::to_string(mods) + " a=0x" + hex(in[base + i]) + " got 0x" + hex(got) + " want 0x" + hex(want[i]));
+        }
+        check_flags(lv + " f2f_widen mods " + std::to_string(mods) + " block at 0x" + hex(in[base]), gf, wf);
+      }
+    }
+  }
+}
+
+VTEST(f2f_narrow_matches_the_rules_in_every_mode_at_every_level) {
+  const std::vector<uint64_t> in = f64_inputs(300000, 6);
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+      ModeGuard guard(mode);
+      for (unsigned mods = 0; mods < 4; ++mods) {
+        for (size_t base = 0; base + 32 <= in.size(); base += 32) {
+          uint32_t lo[32], hi[32], r[32], want[32];
+          for (int i = 0; i < 32; ++i) lo[i] = static_cast<uint32_t>(in[base + i]), hi[i] = static_cast<uint32_t>(in[base + i] >> 32);
+          flags_clear();
+          for (int i = 0; i < 32; ++i) want[i] = ref_narrow(in[base + i], mods);
+          const unsigned wf = flags_now();
+          flags_clear();
+          k.f2f_narrow(lo, hi, mods, r);
+          const unsigned gf = flags_now();
+          for (int i = 0; i < 32; ++i)
+            if (r[i] != want[i])
+              throw vtest::Failure(lv + " f2f_narrow mode " + std::to_string(mode) + " mods " + std::to_string(mods) + " a=0x" + hex(in[base + i]) +
+                                   " got 0x" + hex(r[i]) + " want 0x" + hex(want[i]));
+          check_flags(lv + " f2f_narrow mode " + std::to_string(mode) + " mods " + std::to_string(mods) + " block at 0x" + hex(in[base]), gf, wf);
+        }
+      }
+    }
+  }
+}
+
+VTEST(i2d_matches_the_conversion_in_every_mode_at_every_level) {
+  std::mt19937 rng(8);
+  std::vector<uint32_t> in = {0u, 1u, 2u, 0x7fffffffu, 0x80000000u, 0x80000001u, 0xffffffffu, 0xfffffffeu, 0x00ffffffu, 0x01000001u, 0xff000001u, 0x40000000u};
+  for (unsigned i = 0; i < 400000; ++i) in.push_back(i % 5 == 0 ? static_cast<uint32_t>(rng() >> (rng() % 32)) : static_cast<uint32_t>(rng()));
+  while (in.size() % 32) in.push_back(static_cast<uint32_t>(rng()));
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+      ModeGuard guard(mode);
+      for (bool sgn : {false, true}) {
+        for (size_t base = 0; base < in.size(); base += 32) {
+          uint32_t lo[32], hi[32];
+          uint64_t want[32];
+          flags_clear();
+          for (int i = 0; i < 32; ++i) want[i] = ref_i2d(sgn, in[base + i]);
+          const unsigned wf = flags_now();
+          flags_clear();
+          k.i2d(sgn, &in[base], lo, hi);
+          const unsigned gf = flags_now();
+          for (int i = 0; i < 32; ++i) {
+            const uint64_t got = lo[i] | (uint64_t{hi[i]} << 32);
+            if (got != want[i])
+              throw vtest::Failure(lv + " i2d mode " + std::to_string(mode) + (sgn ? " signed" : " unsigned") + " a=0x" + hex(in[base + i]) + " got 0x" +
+                                   hex(got) + " want 0x" + hex(want[i]));
+          }
+          check_flags(lv + " i2d mode " + std::to_string(mode), gf, wf);
+        }
+      }
+    }
+  }
+}
+
+// A result row may be a source row (a register the instruction overwrites): the same lanes only, each block of eight read before it is written.
+VTEST(f2f_and_i2d_may_write_over_their_sources) {
+  const std::vector<uint32_t> w = f32_inputs(2000, 9);
+  const std::vector<uint64_t> d = f64_inputs(2000, 10);
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (size_t base = 0; base + 32 <= w.size() && base < 32 * 400; base += 32) {
+      uint32_t ref_lo[32], ref_hi[32];
+      k.f2f_widen(&w[base], 3, ref_lo, ref_hi);
+      uint32_t row[32], other[32];
+      std::memcpy(row, &w[base], sizeof row);
+      k.f2f_widen(row, 3, row, other);   // low word over the source
+      VCHECK(std::memcmp(row, ref_lo, sizeof row) == 0 && std::memcmp(other, ref_hi, sizeof row) == 0);
+      std::memcpy(row, &w[base], sizeof row);
+      k.f2f_widen(row, 3, other, row);   // high word over the source
+      VCHECK(std::memcmp(row, ref_hi, sizeof row) == 0 && std::memcmp(other, ref_lo, sizeof row) == 0);
+      for (bool sgn : {false, true}) {
+        k.i2d(sgn, &w[base], ref_lo, ref_hi);
+        std::memcpy(row, &w[base], sizeof row);
+        k.i2d(sgn, row, row, other);
+        VCHECK(std::memcmp(row, ref_lo, sizeof row) == 0 && std::memcmp(other, ref_hi, sizeof row) == 0);
+        std::memcpy(row, &w[base], sizeof row);
+        k.i2d(sgn, row, other, row);
+        VCHECK(std::memcmp(row, ref_hi, sizeof row) == 0 && std::memcmp(other, ref_lo, sizeof row) == 0);
+      }
+    }
+    for (size_t base = 0; base + 32 <= d.size() && base < 32 * 400; base += 32) {
+      uint32_t lo[32], hi[32], want[32];
+      for (int i = 0; i < 32; ++i) lo[i] = static_cast<uint32_t>(d[base + i]), hi[i] = static_cast<uint32_t>(d[base + i] >> 32);
+      k.f2f_narrow(lo, hi, 1, want);
+      uint32_t a[32], b[32];
+      std::memcpy(a, lo, sizeof a), std::memcpy(b, hi, sizeof b);
+      k.f2f_narrow(a, b, 1, a);   // over the low words
+      VCHECK(std::memcmp(a, want, sizeof a) == 0);
+      std::memcpy(a, lo, sizeof a);
+      k.f2f_narrow(a, b, 1, b);   // over the high words
+      VCHECK(std::memcmp(b, want, sizeof b) == 0);
+    }
+    (void)lv;
+  }
+}
+
+// Every f32 bit pattern, one |x|/-x combination each (chosen by the pattern), against the reference: VGPU_TEST_EXHAUSTIVE=1 (a few minutes; not in CI).
+VTEST(f2f_widen_every_f32_when_asked) {
+  const char* e = std::getenv("VGPU_TEST_EXHAUSTIVE");
+  if (!e || e[0] != '1') return;
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    std::atomic<uint64_t> bad{~uint64_t{0}};
+    auto work = [&](uint32_t t, uint32_t nt) {
+      for (uint64_t base = uint64_t{t} * 32; base < (uint64_t{1} << 32); base += uint64_t{nt} * 32) {
+        uint32_t a[32], lo[32], hi[32];
+        const unsigned mods = static_cast<unsigned>((base >> 5) * 0x9e3779b1u >> 30) & 3u;
+        for (int i = 0; i < 32; ++i) a[i] = static_cast<uint32_t>(base + i);
+        k.f2f_widen(a, mods, lo, hi);
+        for (int i = 0; i < 32; ++i)
+          if ((lo[i] | (uint64_t{hi[i]} << 32)) != ref_widen(a[i], mods)) {
+            uint64_t none = ~uint64_t{0};
+            bad.compare_exchange_strong(none, a[i]);
+            return;
+          }
+      }
+    };
+    std::vector<std::thread> th;
+    const uint32_t nt = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    for (uint32_t t = 0; t < nt; ++t) th.emplace_back(work, t, nt);
+    for (auto& x : th) x.join();
+    if (bad.load() != ~uint64_t{0}) throw vtest::Failure(std::string(simd::level_name(l)) + " f2f_widen differs at f32 pattern 0x" + hex(bad.load()));
   }
 }
 

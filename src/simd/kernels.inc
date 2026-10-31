@@ -1531,5 +1531,99 @@ void tile_f64_k(unsigned M, unsigned N, unsigned K, const double* A, const doubl
   }
 }
 
+// ---- f32 <-> f64 and 32-bit integer -> f64 (SASS F2F.F64.F32, F2F.F32.F64, I2F.F64.U32/.S32), 32 lanes: see Kernels::f2f_widen ----------------------
+#if VGPU_SIMD_AVX2
+// Eight binary64 lanes held as two vectors (lanes 0-3 and 4-7) to the low words and the high words of the eight lanes, in lane order.
+inline void split_pd8(__m256d d0, __m256d d1, uint32_t* lo, uint32_t* hi) {
+  const __m256 p0 = _mm256_castpd_ps(d0), p1 = _mm256_castpd_ps(d1);
+  // (per 128 bits: lanes 0 1 4 5 | 2 3 6 7, as 64-bit pieces 0 2 1 3 of the result)
+  const __m256i l = _mm256_castps_si256(_mm256_shuffle_ps(p0, p1, 0x88)), h = _mm256_castps_si256(_mm256_shuffle_ps(p0, p1, 0xDD));
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(lo), _mm256_permute4x64_epi64(l, 0xD8));
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(hi), _mm256_permute4x64_epi64(h, 0xD8));
+}
+#endif
+
+void f2f_widen_k(const uint32_t* a, unsigned mods, uint32_t* lo, uint32_t* hi) {
+  const uint32_t absm = (mods & 1) ? 0x7fffffffu : ~0u, negm = (mods & 2) ? 0x80000000u : 0u;
+#if VGPU_SIMD_AVX2
+  const __m256i va = _mm256_set1_epi32(static_cast<int>(absm)), vn = _mm256_set1_epi32(static_cast<int>(negm));
+  const __m256i mag = _mm256_set1_epi32(0x7fffffff), inf = _mm256_set1_epi32(0x7f800000);
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+    // A NaN goes through as the register holds it (its |x| and -x are not applied): the conversion shifts its payload up, quiets it and
+    // keeps its sign, which is the value the card writes.
+    const __m256i nan = _mm256_cmpgt_epi32(_mm256_and_si256(x, mag), inf);
+    const __m256i y = _mm256_blendv_epi8(_mm256_xor_si256(_mm256_and_si256(x, va), vn), x, nan);
+    split_pd8(_mm256_cvtps_pd(_mm256_castsi256_si128(y)), _mm256_cvtps_pd(_mm256_extracti128_si256(y, 1)), lo + i, hi + i);
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) {
+    const uint32_t x = a[l];
+    const bool nan = (x & 0x7fffffffu) > 0x7f800000u;
+    const uint32_t y = nan ? x : ((x & absm) ^ negm);
+    const uint64_t conv = std::bit_cast<uint64_t>(static_cast<double>(std::bit_cast<float>(y)));
+    const uint64_t b = nan ? ((uint64_t{x >> 31} << 63) | 0x7ff8000000000000ull | (uint64_t{x & 0x7fffffu} << 29)) : conv;
+    lo[l] = static_cast<uint32_t>(b);
+    hi[l] = static_cast<uint32_t>(b >> 32);
+  }
+#endif
+}
+
+void f2f_narrow_k(const uint32_t* alo, const uint32_t* ahi, unsigned mods, uint32_t* r) {
+  const uint64_t absm = (mods & 1) ? 0x7fffffffffffffffull : ~uint64_t{0}, negm = (mods & 2) ? 0x8000000000000000ull : 0;
+#if VGPU_SIMD_AVX2
+  const __m256i va = _mm256_set1_epi64x(static_cast<long long>(absm)), vn = _mm256_set1_epi64x(static_cast<long long>(negm));
+  const __m256i mag = _mm256_set1_epi64x(0x7fffffffffffffffll), inf = _mm256_set1_epi64x(0x7ff0000000000000ll);
+  // Four doubles to four floats, in the host's rounding mode; a NaN is the register's own (not |x| or -x of it), converted as it is.
+  const auto narrow4 = [&](__m256i x) {
+    const __m256i nan = _mm256_cmpgt_epi64(_mm256_and_si256(x, mag), inf);
+    const __m256i y = _mm256_blendv_epi8(_mm256_xor_si256(_mm256_and_si256(x, va), vn), x, nan);
+    return _mm256_cvtpd_ps(_mm256_castsi256_pd(y));
+  };
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256i l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(alo + i));
+    const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ahi + i));
+    const __m256i u = _mm256_unpacklo_epi32(l, h), v = _mm256_unpackhi_epi32(l, h);   // doubles 0 1 4 5 and 2 3 6 7
+    const __m128 f0 = narrow4(_mm256_permute2x128_si256(u, v, 0x20)), f1 = narrow4(_mm256_permute2x128_si256(u, v, 0x31));
+    _mm256_storeu_ps(reinterpret_cast<float*>(r + i), _mm256_set_m128(f1, f0));
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) {
+    const uint64_t x = alo[l] | (uint64_t{ahi[l]} << 32);
+    const bool nan = (x & 0x7fffffffffffffffull) > 0x7ff0000000000000ull;
+    const uint64_t y = nan ? x : ((x & absm) ^ negm);
+    r[l] = std::bit_cast<uint32_t>(static_cast<float>(std::bit_cast<double>(y)));
+  }
+#endif
+}
+
+void i2d_k(bool sgn, const uint32_t* a, uint32_t* lo, uint32_t* hi) {
+#if VGPU_SIMD_AVX2
+  const __m256i low31 = _mm256_set1_epi32(0x7fffffff);
+  const __m256d two31 = _mm256_set1_pd(2147483648.0);
+  for (unsigned i = 0; i < 32; i += 8) {
+    const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+    __m256d d0, d1;
+    if (sgn) {
+      d0 = _mm256_cvtepi32_pd(_mm256_castsi256_si128(x));
+      d1 = _mm256_cvtepi32_pd(_mm256_extracti128_si256(x, 1));
+    } else {
+      // The low 31 bits plus 2^31 where the top bit is set: both parts are never negative, so the sum is exact and a zero is +0 in every
+      // rounding mode (flipping the sign bit and adding 2^31 back would give -0 when the host rounds down).
+      const __m256i m = _mm256_and_si256(x, low31), t = _mm256_srli_epi32(x, 31);
+      d0 = _mm256_add_pd(_mm256_cvtepi32_pd(_mm256_castsi256_si128(m)), _mm256_mul_pd(_mm256_cvtepi32_pd(_mm256_castsi256_si128(t)), two31));
+      d1 = _mm256_add_pd(_mm256_cvtepi32_pd(_mm256_extracti128_si256(m, 1)), _mm256_mul_pd(_mm256_cvtepi32_pd(_mm256_extracti128_si256(t, 1)), two31));
+    }
+    split_pd8(d0, d1, lo + i, hi + i);
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) {
+    const uint64_t b = std::bit_cast<uint64_t>(sgn ? static_cast<double>(static_cast<int32_t>(a[l])) : static_cast<double>(a[l]));
+    lo[l] = static_cast<uint32_t>(b);
+    hi[l] = static_cast<uint32_t>(b >> 32);
+  }
+#endif
+}
+
 #endif  // !VGPU_LANES_ONLY
 }  // namespace VGPU_SIMD_NS

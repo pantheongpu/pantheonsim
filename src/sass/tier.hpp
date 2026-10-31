@@ -138,6 +138,8 @@ enum class Form : uint8_t {
   Ldgsts,    // LDGSTS (cp.async) of 4, 8 or 16 bytes without .ZFILL: ends a run, has a handler
   Ld,        // LD (generic address) of 1 to 16 bytes: the lanes all in the shared window, or none in any window; anything else is the interpreter's
   St,        // ST (generic address): as Ld
+  Cvt64,     // F2F between f32 and f64, I2F from a 32-bit integer to f64: the SIMD kernels of fast_float (a pair of rows on one side)
+  FltInterp, // F2F, I2F and MUFU.RCP64H/RSQ64H that Cvt64 and the f32 forms leave: fast_float, then exec_float, as the interpreter runs them
   Count_,
 };
 const char* form_name(Form f);
