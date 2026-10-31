@@ -194,9 +194,12 @@ jobs:
           export VGPU_PANTHEON_DIR="$GITHUB_WORKSPACE/pantheon" VGPU_BUILD_DIR="$GITHUB_WORKSPACE/pantheonsim/build"
           ./tests/workloads/run_pantheon_workloads.sh
 
+      # This job checks out into pantheonsim/, so the action and the build trees are there.
       - name: Clean the runner
         if: always()
-        uses: ./.github/actions/clean-runner
+        uses: ./pantheonsim/.github/actions/clean-runner
+        with:
+          directory: pantheonsim
 
   sass:
     name: SASS on every architecture
