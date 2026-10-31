@@ -129,8 +129,15 @@ VTEST(the_specialised_steps_are_the_frozen_rule) {
             case sa::Step::Cas: got = sa::CasStep{}(old, v, swap); break;
             case sa::Step::Add: got = sa::AddStep{}(old, v, swap); break;
             case sa::Step::AddF32: got = sa::AddF32Step{}(old, v, swap); break;
+            case sa::Step::AddF64: got = sa::AddF64Step{}(old, v, swap); break;
             case sa::Step::Min: got = sa::MinStep{}(old, v, swap); break;
             case sa::Step::Max: got = sa::MaxStep{}(old, v, swap); break;
+            case sa::Step::MinS32: got = sa::MinS32Step{}(old, v, swap); break;
+            case sa::Step::MaxS32: got = sa::MaxS32Step{}(old, v, swap); break;
+            case sa::Step::MinS64: got = sa::MinS64Step{}(old, v, swap); break;
+            case sa::Step::MaxS64: got = sa::MaxS64Step{}(old, v, swap); break;
+            case sa::Step::Inc: got = sa::IncStep{}(old, v, swap); break;
+            case sa::Step::Dec: got = sa::DecStep{}(old, v, swap); break;
             case sa::Step::And: got = sa::AndStep{}(old, v, swap); break;
             case sa::Step::Or: got = sa::OrStep{}(old, v, swap); break;
             case sa::Step::Xor: got = sa::XorStep{}(old, v, swap); break;
@@ -142,8 +149,111 @@ VTEST(the_specialised_steps_are_the_frozen_rule) {
           VCHECK_EQ(got & keep, want);
         }
       }
-  VCHECK(specialised >= 20);   // (the add, min, max, bitwise, exchange and compare-and-swap forms have steps)
-  VCHECK(specialised < total);   // (the halves and the signed min and max have none)
+  VCHECK(specialised >= 50);   // (the add, min, max, inc, dec, bitwise, exchange and compare-and-swap forms have steps)
+  VCHECK(specialised < total);   // (the halves, and min and max of the float types, have none)
+}
+
+// A warp's atomics on shared bytes (shared_batch), against the lane-by-lane read-modify-write the executor made before: memcpy of the
+// word out of the bytes, the frozen rule, memcpy back. Offsets repeat, step by 4 and overlap by half a word (a lane finds what an earlier
+// lane left, also in part of its word), masks are full and partial; the operations without a step are declined with the bytes untouched.
+VTEST(a_warps_shared_atomics_are_the_lane_by_lane_ones) {
+  std::mt19937_64 rng(3);
+  size_t batched = 0, declined = 0;
+  for (unsigned type = 0; type < 8; ++type)
+    for (unsigned op = 0; op < 9; ++op)
+      for (int cas = 0; cas < 2; ++cas)
+        for (int i = 0; i < 300; ++i) {
+          const bool wide = type == 2 || type == 5 || type == 6;
+          const unsigned n = wide ? 8 : 4;
+          uint8_t a[160], b[160];
+          for (auto& x : a) x = static_cast<uint8_t>(rng());
+          std::memcpy(b, a, sizeof a);
+          uint32_t soff[32];
+          uint64_t v[32], swp[32], old_of[32], want_old[32];
+          const unsigned mode = static_cast<unsigned>(rng() % 4);
+          for (unsigned l = 0; l < 32; ++l) {
+            soff[l] = mode == 0 ? 4 * l : mode == 1 ? static_cast<uint32_t>(rng() % 3) * 4 : mode == 2 ? 4 * (l / 2) : static_cast<uint32_t>(rng() % 100);
+            v[l] = operand(rng, type);
+            swp[l] = operand(rng, type);
+            // (a compare that can win: the word's own value now and then)
+            if (cas && rng() % 3 == 0) { uint64_t cur = 0; std::memcpy(&cur, a + soff[l], n); v[l] = cur; }
+          }
+          const uint32_t ex = i % 3 == 0 ? 0xffffffffu : static_cast<uint32_t>(rng());
+          if (!sa::shared_batch(op, type, cas, a, soff, ex, v, swp, old_of)) {
+            VCHECK(sa::step_for(op, type, cas) == sa::Step::General);
+            VCHECK(std::memcmp(a, b, sizeof a) == 0);   // (declined: nothing touched)
+            ++declined;
+            continue;
+          }
+          ++batched;
+          for (unsigned l = 0; l < 32; ++l) {
+            if (!((ex >> l) & 1)) continue;
+            uint64_t old = 0;
+            std::memcpy(&old, b + soff[l], n);
+            uint64_t nw = 0;
+            VCHECK(frozen_apply(op, type, cas, false, old, v[l], swp[l], nw));
+            std::memcpy(b + soff[l], &nw, n);
+            want_old[l] = old;
+          }
+          VCHECK(std::memcmp(a, b, sizeof a) == 0);
+          for (unsigned l = 0; l < 32; ++l)
+            if ((ex >> l) & 1) VCHECK_EQ(old_of[l], want_old[l]);
+        }
+  VCHECK(batched > 10000);
+  VCHECK(declined > 1000);
+}
+
+// A warp's atomics on words already loaded (global_batch), against the lane-by-lane rule: lanes that share a slot find what the one
+// before left, the old values, the new words and whether anything changed are the frozen rule's, for every operation and type; the
+// operations without a step are declined with nothing touched.
+VTEST(a_warps_atomics_on_loaded_words_are_the_lane_by_lane_ones) {
+  std::mt19937_64 rng(4);
+  size_t batched = 0, declined = 0;
+  for (unsigned type = 0; type < 8; ++type)
+    for (unsigned op = 0; op < 9; ++op)
+      for (int cas = 0; cas < 2; ++cas)
+        for (int i = 0; i < 300; ++i) {
+          const bool wide = type == 2 || type == 5 || type == 6;
+          const uint64_t keep = wide ? ~uint64_t{0} : 0xffffffffull;
+          unsigned slot[32];
+          uint64_t v[32], swp[32], cur[32], want[32], old_of[32], want_old[32];
+          const unsigned nslots = 1 + static_cast<unsigned>(rng() % 32);
+          for (unsigned l = 0; l < 32; ++l) {
+            slot[l] = static_cast<unsigned>(rng() % nslots);
+            v[l] = operand(rng, type);
+            swp[l] = operand(rng, type);
+          }
+          for (unsigned k = 0; k < 32; ++k) want[k] = cur[k] = operand(rng, type);
+          if (cas)
+            for (unsigned l = 0; l < 32; ++l)
+              if (rng() % 3 == 0) v[l] = cur[slot[l]];
+          const uint32_t ex = i % 3 == 0 ? 0xffffffffu : static_cast<uint32_t>(rng()) | 1u;
+          uint64_t before[32];
+          std::memcpy(before, cur, sizeof cur);
+          const int got = sa::global_batch(op, type, cas, ex, nslots, slot, cur, v, cas ? swp : nullptr, old_of);
+          if (got < 0) {
+            VCHECK(sa::step_for(op, type, cas) == sa::Step::General);
+            VCHECK(std::memcmp(cur, before, sizeof cur) == 0);
+            ++declined;
+            continue;
+          }
+          ++batched;
+          bool changed = false;
+          for (unsigned l = 0; l < 32; ++l) {
+            if (!((ex >> l) & 1)) continue;
+            uint64_t nw = 0;
+            VCHECK(frozen_apply(op, type, cas, false, want[slot[l]], v[l], swp[l], nw));
+            want_old[l] = want[slot[l]];
+            changed |= nw != want[slot[l]];
+            want[slot[l]] = nw;
+          }
+          VCHECK_EQ(got, changed ? 1 : 0);
+          for (unsigned k = 0; k < 32; ++k) VCHECK_EQ(cur[k] & keep, want[k] & keep);
+          for (unsigned l = 0; l < 32; ++l)
+            if ((ex >> l) & 1) VCHECK_EQ(old_of[l], want_old[l]);
+        }
+  VCHECK(batched > 10000);
+  VCHECK(declined > 1000);
 }
 
 VTEST(a_warp_with_an_address_in_host_mapped_memory_is_not_batched) {

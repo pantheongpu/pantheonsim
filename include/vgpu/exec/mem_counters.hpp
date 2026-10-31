@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "vgpu/simd/simd.hpp"
@@ -159,6 +160,7 @@ inline bool on_stride(const uint64_t* addrs, unsigned lo, unsigned n, uint64_t s
 // bytes (a signed number; zero for a single lane), the lowest lane and the count. With the endpoints in range and
 // the stride small, no lane in between has wrapped either, so an address and its word or sector follow the same
 // arithmetic as the lanes do.
+template <bool LastFirst = false>
 inline bool lane_progression(const uint64_t* addrs, uint64_t m, uint64_t margin, int64_t& stride, unsigned& lo,
                              unsigned& n) {
   lo = static_cast<unsigned>(std::countr_zero(m));
@@ -174,6 +176,10 @@ inline bool lane_progression(const uint64_t* addrs, uint64_t m, uint64_t margin,
   }
   const int64_t s = static_cast<int64_t>(addrs[lo + 1] - a0);
   if (s > (int64_t{1} << 32) || s < -(int64_t{1} << 32)) return false;
+  // (LastFirst: the last lane first, so that a warp of rows -- a run on one stride, then a jump -- is turned away without
+  // walking its lanes; one more comparison for the warps that are on the stride, which the bank counting takes for the
+  // warps it can remember and the sector counting, whose warps nearly always are, does without)
+  if (LastFirst && addrs[lo + n - 1] != a0 + uint64_t{n - 1} * static_cast<uint64_t>(s)) return false;
   if (!on_stride(addrs, lo, n, static_cast<uint64_t>(s))) return false;
   const uint64_t last = addrs[lo + n - 1];
   if (last > top || (s >= 0 ? last < a0 : last > a0)) return false;
@@ -385,18 +391,37 @@ inline uint32_t distinct_sectors(const uint64_t* addrs, uint64_t mask, unsigned 
   return static_cast<uint32_t>(std::min(n, cap));
 }
 
+// distinct_sectors for the SASS executor (every sector counted: no cap), with the closed forms in a function of their own: the list
+// that distinct_sectors falls back on is 8 KB on the stack, and a function that inlines it probes every page of that frame on entry
+// (two probes, the stack check) -- which every warp that a closed form counts paid, 30% of the counting for a strided gather. The
+// warps the closed forms give up on go to `distinct_sectors_listed`, which is distinct_sectors in a function that owns the frame.
+[[gnu::noinline]] inline uint32_t distinct_sectors_listed(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint64_t span) {
+  return distinct_sectors(addrs, mask, lanes, span, SIZE_MAX);
+}
+inline uint32_t distinct_sectors_uncapped(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint64_t span) {
+  if (fast() && span >= 1 && lanes <= 64) {
+    const uint64_t m = mask & detail::lane_mask(lanes);
+    if (!m) return 0;
+    uint64_t n;
+    if (detail::sectors_fast(addrs, m, span, n)) return static_cast<uint32_t>(n);   // (min(n, SIZE_MAX))
+  }
+  return distinct_sectors_listed(addrs, mask, lanes, span);
+}
+
 namespace detail {
 // Distinct words per bank. At most 64 lanes each put at most one word in a bank
 // (PTX: up to 32 consecutive words) or two (SASS, 17 words) -- the callers keep
 // to shapes where a bank cannot hold more than 64.
 struct BankTable {
-  uint32_t count[32] = {};
+  uint8_t count[32] = {};   // (a bank holds at most 64 words)
   uint64_t word[32][64];
   void add(uint64_t w) {
     const unsigned b = static_cast<unsigned>(w % 32);
-    for (uint32_t i = 0; i < count[b]; ++i)
+    const uint32_t c = count[b];
+    for (uint32_t i = 0; i < c; ++i)
       if (word[b][i] == w) return;
-    word[b][count[b]++] = w;
+    word[b][c] = w;
+    count[b] = static_cast<uint8_t>(c + 1);
   }
   uint32_t worst() const {
     uint32_t m = 1;
@@ -428,7 +453,7 @@ template <bool Sass>
 inline bool bank_passes_progression(const uint64_t* addrs, uint64_t m, uint32_t arg, uint32_t& out) {
   int64_t stride;
   unsigned lo, n;
-  if (!lane_progression(addrs, m, 256, stride, lo, n)) return false;
+  if (!lane_progression<true>(addrs, m, 256, stride, lo, n)) return false;
   const uint64_t first = addrs[lo], last = addrs[lo + n - 1];
   // A lane's words, as the number from its address's word on (the SASS rule depends on the byte in the word).
   const auto words_at = [&](uint64_t addr) -> uint32_t {
@@ -520,14 +545,24 @@ inline uint32_t sass_bank_passes_reference(const uint64_t* addrs, uint64_t mask,
   return static_cast<uint32_t>(passes);
 }
 
-inline uint32_t sass_bank_passes(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint32_t bytes) {
-  if (!fast() || bytes > 64 || lanes > 32) return sass_bank_passes_reference(addrs, mask, lanes, bytes);
-  if (bytes) {
-    const uint64_t m = mask & detail::lane_mask(lanes);
-    uint32_t out;
-    if (m && detail::bank_passes_progression<true>(addrs, m, bytes, out)) return out;
-  }
+// The counting that is left once the closed forms have given up: the words of every active lane, by bank.
+inline uint32_t sass_bank_passes_table(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint32_t bytes) {
   detail::BankTable t;
+  if (bytes - 1 < 4 && lanes <= 32) {   // (1 to 4 bytes: a 0-byte access covers no word of an aligned address)
+    // Up to a word's worth of bytes a lane covers its address's word, and the next one when it does not end in it: a
+    // counted walk of the active lanes, a lane at a time.
+    const uint64_t m = mask & detail::lane_mask(lanes);
+    if (m) {
+      const bool ok = detail::for_each_address(addrs, m, [&](uint64_t a) {
+        if (a > UINT64_MAX - 256) return false;   // (as below)
+        t.add(a >> 2);
+        if ((a & 3) + bytes > 4) t.add((a >> 2) + 1);
+        return true;
+      });
+      if (!ok) return sass_bank_passes_reference(addrs, mask, lanes, bytes);
+    }
+    return t.worst();
+  }
   for (unsigned l = 0; l < lanes; ++l) {
     if (!(mask & (uint64_t{1} << l))) continue;
     // A range that runs off the top of the address space makes the loop below
@@ -537,6 +572,97 @@ inline uint32_t sass_bank_passes(const uint64_t* addrs, uint64_t mask, unsigned 
     for (uint64_t a = addrs[l] & ~3ull; a < addrs[l] + bytes; a += 4) t.add(a / 4);
   }
   return t.worst();
+}
+
+inline uint32_t sass_bank_passes(const uint64_t* addrs, uint64_t mask, unsigned lanes, uint32_t bytes) {
+  if (!fast() || bytes > 64 || lanes > 32) return sass_bank_passes_reference(addrs, mask, lanes, bytes);
+  if (bytes) {
+    const uint64_t m = mask & detail::lane_mask(lanes);
+    uint32_t out;
+    if (m && detail::bank_passes_progression<true>(addrs, m, bytes, out)) return out;
+  }
+  return sass_bank_passes_table(addrs, mask, lanes, bytes);
+}
+
+// ---- bank passes remembered by shape
+
+// The passes of a warp that is on no stride (two rows of a tile, a pair of words every four, a group of lanes on one
+// word) are the same for every warp of that shape wherever it sits: the passes depend on which of the lanes' words are
+// the same and which banks they are in, and moving every address by a whole number of words moves the banks round
+// together and keeps the same words the same. So a warp's shape -- the width and each lane's address less the first
+// active lane's word, a lane that does not run being taken at that word, which adds none -- is the key of a small table
+// of the passes already counted. A hit is one comparison of the 256 bytes of offsets; a miss counts as before
+// (sass_bank_passes_table) and stores. The table is the host thread's (one per Block, which the thread keeps), so it
+// needs no lock. A kernel whose shapes do not repeat (a gather, a data-dependent sort) only pays for the keys it
+// builds, so when under a third of the last kWindow lookups hit the table is left alone for kSkip calls.
+struct BankMemo {
+  static constexpr unsigned kEntries = 32;
+  static constexpr uint32_t kWindow = 64;
+  static constexpr uint32_t kSkip = 1024;
+  struct Entry {
+    uint32_t bytes = 0;    // (zero: empty)
+    uint32_t passes = 0;
+    uint64_t rel[32] = {};
+  };
+  Entry e[kEntries];
+  uint32_t lookups = 0, hits = 0;   // in this window
+  uint32_t skip = 0;                // calls still to go without the table
+};
+
+// sass_bank_passes, with the table in front of the counting (everything the closed forms count is still counted by them).
+inline uint32_t sass_bank_passes_memo(BankMemo& memo, const uint64_t* addrs, uint64_t mask, unsigned lanes, uint32_t bytes) {
+  if (!fast() || bytes == 0 || bytes > 64 || lanes != 32) return sass_bank_passes(addrs, mask, lanes, bytes);
+  const uint64_t m = mask & 0xFFFFFFFFull;
+  if (!m) return sass_bank_passes(addrs, mask, lanes, bytes);
+  uint32_t out;
+  if (detail::bank_passes_progression<true>(addrs, m, bytes, out)) return out;
+  if (memo.skip) {
+    --memo.skip;
+    return sass_bank_passes_table(addrs, mask, lanes, bytes);
+  }
+  // The key: each active lane's address less the first active lane's word, as the 64-bit number it is (a lane that does
+  // not run is taken at that word). Moving every address by a multiple of four bytes changes no lane's words but their
+  // numbers, so keys that are equal are shapes that differ by such a move -- as long as neither warp has an address
+  // near the top of the space, where the move would wrap (those are counted, not remembered).
+  const uint64_t base = addrs[std::countr_zero(m)] & ~3ull;
+  uint64_t held[32];
+  const uint64_t* src = addrs;
+  if (m != 0xFFFFFFFFull) {
+    for (unsigned l = 0; l < 32; ++l) held[l] = (m >> l & 1) ? addrs[l] : base;
+    src = held;
+  }
+  uint32_t h = bytes * 0x01000193u;
+  h ^= static_cast<uint32_t>(src[1] - base) * 0x9E3779B1u ^ static_cast<uint32_t>(src[3] - base) * 0x85EBCA77u ^
+       static_cast<uint32_t>(src[6] - base) * 0xC2B2AE3Du ^ static_cast<uint32_t>(src[10] - base) * 0x27D4EB2Fu ^
+       static_cast<uint32_t>(src[15] - base) * 0x165667B1u ^ static_cast<uint32_t>(src[21] - base) * 0x9E3779B1u ^
+       static_cast<uint32_t>(src[26] - base) * 0x85EBCA77u ^ static_cast<uint32_t>(src[31] - base) * 0xC2B2AE3Du;
+  h ^= h >> 15;
+  BankMemo::Entry& e = memo.e[h % BankMemo::kEntries];
+  const detail::V2 basev = {base, base};
+  detail::V2 diff = {static_cast<uint64_t>(e.bytes ^ bytes), 0};
+  detail::V2 high = basev;
+  for (unsigned i = 0; i < 16; ++i) {
+    const detail::V2 a = detail::load_v2(src + 2 * i);
+    high |= a;
+    diff |= (a - basev) ^ detail::load_v2(e.rel + 2 * i);
+  }
+  if ((high[0] | high[1]) >> 62) return sass_bank_passes_table(addrs, mask, lanes, bytes);
+  const bool hit = (diff[0] | diff[1]) == 0;
+  uint32_t passes;
+  if (hit) {
+    passes = e.passes;
+  } else {
+    passes = sass_bank_passes_table(addrs, mask, lanes, bytes);
+    e.bytes = bytes;
+    e.passes = passes;
+    for (unsigned l = 0; l < 32; ++l) e.rel[l] = src[l] - base;
+  }
+  memo.hits += hit;
+  if (++memo.lookups == BankMemo::kWindow) {
+    if (memo.hits * 3 < BankMemo::kWindow) memo.skip = BankMemo::kSkip;
+    memo.lookups = memo.hits = 0;
+  }
+  return passes;
 }
 
 }  // namespace vgpu::exec::memcount

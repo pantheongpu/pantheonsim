@@ -281,6 +281,65 @@ __global__ void shared_atomic_forms(const AtomMem* init, AtomMem* fin, uint32_t*
 }
 
 
+// More atomics: signed 64-bit min and max, a constant-one add with its old value (ATOMS.POPC.INC on shared memory), the same without
+// (RED), on global and on shared memory, over the address patterns above. The results are order-independent, so the host checks them.
+struct AtomMore {
+  long long smin[kAtomSlots], smax[kAtomSlots];
+  uint32_t one[kAtomSlots], two[kAtomSlots];
+  int32_t smax32[kAtomSlots];
+  double dmin_bits[kAtomSlots];   // (a double target for the F64 add of a negative and a positive: the NaN-free rule)
+};
+__device__ __forceinline__ void atomic_more_body(AtomMore& m, uint32_t* o, int i, unsigned idx) {
+  o[0] = static_cast<uint32_t>(atomicMin(&m.smin[idx], static_cast<long long>(i) * 31 - 500));
+  o[1] = static_cast<uint32_t>(atomicMax(&m.smax[idx], 1000 - static_cast<long long>(i) * 40503) >> 16);
+  o[2] = atomicAdd(&m.one[idx], 1u);
+  atomicAdd(&m.two[idx], 1u);
+  o[3] = static_cast<uint32_t>(atomicMax(&m.smax32[idx], 77 - i * 5));
+  atomicAdd(&m.dmin_bits[idx], (i & 1) ? -0.5 * i : 0.125 * i);
+}
+__global__ void atomic_more(AtomMore* m, uint32_t* out, int count, int pattern) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const unsigned idx = pattern == 0 ? 0u : pattern == 1 ? i % 4u : pattern == 2 ? static_cast<unsigned>(i) % kAtomSlots : (i * 7u) % 33u;
+  const bool take = pattern == 1 ? (i % 5) != 0 : pattern == 3 ? (i & 8) == 0 : true;
+  uint32_t o[4] = {};
+  if (take) atomic_more_body(*m, o, i, idx);
+  for (int k = 0; k < 4; ++k) out[static_cast<size_t>(i) * 4 + k] = o[k];
+}
+__global__ void shared_atomic_more(const AtomMore* init, AtomMore* fin, uint32_t* out, int count, int pattern) {
+  __shared__ AtomMore sm;
+  const uint32_t* src = reinterpret_cast<const uint32_t*>(init);
+  uint32_t* dst = reinterpret_cast<uint32_t*>(&sm);
+  for (unsigned k = threadIdx.x; k < sizeof(AtomMore) / 4; k += blockDim.x) dst[k] = src[k];
+  __syncthreads();
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t o[4] = {};
+  if (i < count) {
+    const unsigned idx = pattern == 0 ? 0u : pattern == 1 ? i % 4u : pattern == 2 ? static_cast<unsigned>(i) % kAtomSlots : (i * 7u) % 33u;
+    const bool take = pattern == 1 ? (i % 5) != 0 : pattern == 3 ? (i & 8) == 0 : true;
+    if (take) atomic_more_body(sm, o, i, idx);
+    for (int k = 0; k < 4; ++k) out[static_cast<size_t>(i) * 4 + k] = o[k];
+  }
+  __syncthreads();
+  const uint32_t* from = reinterpret_cast<const uint32_t*>(&sm);
+  uint32_t* to = reinterpret_cast<uint32_t*>(&fin[blockIdx.x]);
+  for (unsigned k = threadIdx.x; k < sizeof(AtomMore) / 4; k += blockDim.x) to[k] = from[k];
+}
+
+// Loads and stores of 1, 2, 4 and 8 bytes on host-mapped memory (cudaHostAlloc, mapped: zero-copy), whole and partial warps, consecutive,
+// strided and reversed lanes, and a broadcast. The host checks what the kernel wrote into its own bytes.
+__global__ void hostmap_forms(const uint8_t* a8, uint8_t* b8, const uint16_t* a16, uint16_t* b16, const uint32_t* a32, uint32_t* b32,
+                              const uint64_t* a64, uint64_t* b64, int n, int pattern) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  if (pattern == 3 && (i % 5) == 0) return;
+  const int j = pattern == 1 ? (i * 7) % n : pattern == 2 ? n - 1 - i : i;
+  b8[j] = static_cast<uint8_t>(a8[j] + 1);
+  b16[j] = static_cast<uint16_t>(a16[j] ^ 0x5a5a);
+  b32[j] = a32[j] * 3u + 1u + a32[0];
+  b64[j] = a64[j] + a32[i] + (static_cast<uint64_t>(a32[0]) << 32);
+}
+
 // Accesses that fault, one lane of the warp outside what it may reach. A fast path takes an access only when every active lane is
 // inside; with one outside it must hand the instruction to the general path, which reports the fault as it always did. Each
 // runs in a process of its own (a fault ends the context): `sass_fastpath <name>`.
@@ -1349,6 +1408,112 @@ int main(int argc, char** argv) {
       std::printf("half_forms shape=%d bits %016llx\n", shape, static_cast<unsigned long long>(hh));
     }
     CK(cudaFree(din)); CK(cudaFree(dout)); CK(cudaFree(ddin)); CK(cudaFree(ddout));
+  }
+
+  {
+    // atomic_more on global and on shared memory: the final memory has a host reference (sums, extremes), and the old values are hashed.
+    const int n = 32 * 5 + 11;
+    const int blocks = 3, threads = 64;
+    for (int space = 0; space < 2; ++space)
+      for (int pattern = 0; pattern < 4; ++pattern) {
+        AtomMore init = {};
+        for (int k = 0; k < kAtomSlots; ++k) {
+          init.smin[k] = 1000;
+          init.smax[k] = -(1ll << 40);
+          init.smax32[k] = -100;
+          init.dmin_bits[k] = 1.0;
+        }
+        AtomMore *dinit, *dfin;
+        uint32_t* dout;
+        CK(cudaMalloc(&dinit, sizeof init)); CK(cudaMalloc(&dfin, sizeof init * blocks));
+        CK(cudaMalloc(&dout, static_cast<size_t>(blocks) * threads * 4 * 4));
+        CK(cudaMemcpy(dinit, &init, sizeof init, cudaMemcpyHostToDevice));
+        CK(cudaMemset(dout, 0, static_cast<size_t>(blocks) * threads * 4 * 4));
+        if (space == 0) atomic_more<<<blocks, threads>>>(dinit, dout, n, pattern);
+        else shared_atomic_more<<<blocks, threads>>>(dinit, dfin, dout, n, pattern);
+        CK(cudaDeviceSynchronize());
+        std::vector<AtomMore> got(space == 0 ? 1 : blocks);
+        std::vector<uint32_t> gout(static_cast<size_t>(blocks) * threads * 4);
+        CK(cudaMemcpy(got.data(), space == 0 ? dinit : dfin, got.size() * sizeof(AtomMore), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(gout.data(), dout, gout.size() * 4, cudaMemcpyDeviceToHost));
+        // The reference: for each memory (the global one; each block's shared one) the threads that took part.
+        int bad = 0;
+        for (size_t m = 0; m < got.size(); ++m) {
+          AtomMore want = init;
+          const int lo = space == 0 ? 0 : static_cast<int>(m) * threads, hi = space == 0 ? n : std::min(n, lo + threads);
+          for (int i = lo; i < hi; ++i) {
+            const unsigned idx = pattern == 0 ? 0u : pattern == 1 ? i % 4u : pattern == 2 ? static_cast<unsigned>(i) % kAtomSlots : (i * 7u) % 33u;
+            const bool take = pattern == 1 ? (i % 5) != 0 : pattern == 3 ? (i & 8) == 0 : true;
+            if (!take) continue;
+            want.smin[idx] = std::min<long long>(want.smin[idx], static_cast<long long>(i) * 31 - 500);
+            want.smax[idx] = std::max<long long>(want.smax[idx], 1000 - static_cast<long long>(i) * 40503);
+            want.one[idx] += 1; want.two[idx] += 1;
+            want.smax32[idx] = std::max<int32_t>(want.smax32[idx], 77 - i * 5);
+          }
+          for (int k = 0; k < kAtomSlots; ++k)
+            if (got[m].smin[k] != want.smin[k] || got[m].smax[k] != want.smax[k] || got[m].one[k] != want.one[k] ||
+                got[m].two[k] != want.two[k] || got[m].smax32[k] != want.smax32[k])
+              ++bad;
+        }
+        if (bad) { std::printf("WRONG atomic_more space=%d pattern=%d: %d slots\n", space, pattern, bad); ++wrong; }
+        uint64_t hh = 1469598103934665603ull;
+        for (uint32_t v : gout) hh = (hh ^ v) * 1099511628211ull;
+        for (const AtomMore& g : got) {
+          const uint32_t* mw = reinterpret_cast<const uint32_t*>(&g);
+          for (size_t k = 0; k < sizeof g / 4; ++k) hh = (hh ^ mw[k]) * 1099511628211ull;
+        }
+        std::printf("atomic_more space=%d pattern=%d bits %016llx\n", space, pattern, static_cast<unsigned long long>(hh));
+        CK(cudaFree(dinit)); CK(cudaFree(dfin)); CK(cudaFree(dout));
+      }
+  }
+
+  {
+    // hostmap_forms: zero-copy buffers read and written by a kernel, checked on the host.
+    const int n = 32 * 5 + 13;
+    uint8_t *h8, *hb8, *d8, *db8; uint16_t *h16, *hb16, *d16, *db16; uint32_t *h32, *hb32, *d32, *db32; uint64_t *h64, *hb64, *d64, *db64;
+    CK(cudaHostAlloc(&h8, n, cudaHostAllocMapped)); CK(cudaHostAlloc(&hb8, n, cudaHostAllocMapped));
+    CK(cudaHostAlloc(&h16, n * 2, cudaHostAllocMapped)); CK(cudaHostAlloc(&hb16, n * 2, cudaHostAllocMapped));
+    CK(cudaHostAlloc(&h32, n * 4, cudaHostAllocMapped)); CK(cudaHostAlloc(&hb32, n * 4, cudaHostAllocMapped));
+    CK(cudaHostAlloc(&h64, n * 8, cudaHostAllocMapped)); CK(cudaHostAlloc(&hb64, n * 8, cudaHostAllocMapped));
+    CK(cudaHostGetDevicePointer(&d8, h8, 0)); CK(cudaHostGetDevicePointer(&db8, hb8, 0));
+    CK(cudaHostGetDevicePointer(&d16, h16, 0)); CK(cudaHostGetDevicePointer(&db16, hb16, 0));
+    CK(cudaHostGetDevicePointer(&d32, h32, 0)); CK(cudaHostGetDevicePointer(&db32, hb32, 0));
+    CK(cudaHostGetDevicePointer(&d64, h64, 0)); CK(cudaHostGetDevicePointer(&db64, hb64, 0));
+    uint64_t s = 0x9E3779B97F4A7C15ull;
+    for (int pattern = 0; pattern < 4; ++pattern) {
+      for (int i = 0; i < n; ++i) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        h8[i] = static_cast<uint8_t>(s); h16[i] = static_cast<uint16_t>(s >> 8); h32[i] = static_cast<uint32_t>(s >> 16); h64[i] = s * 0x2545F4914F6CDD1Dull;
+        hb8[i] = 0xee; hb16[i] = 0xeeee; hb32[i] = 0xeeeeeeeeu; hb64[i] = 0xeeeeeeeeeeeeeeeeull;
+      }
+      hostmap_forms<<<(n + 63) / 64, 64>>>(d8, db8, d16, db16, d32, db32, d64, db64, n, pattern);
+      CK(cudaDeviceSynchronize());
+      int bad = 0;
+      uint64_t hh = 1469598103934665603ull;
+      std::vector<char> written(n, 0);
+      for (int i = 0; i < n; ++i) {
+        if (pattern == 3 && (i % 5) == 0) continue;
+        written[pattern == 1 ? (i * 7) % n : pattern == 2 ? n - 1 - i : i] = 1;
+      }
+      for (int j = 0; j < n; ++j) {
+        // (the lane that wrote slot j read a32[i] for its own i: the slot's writer is found again)
+        int i = j;
+        if (pattern == 1) { for (i = 0; i < n && (i * 7) % n != j; ++i) {} }
+        else if (pattern == 2) i = n - 1 - j;
+        uint8_t w8 = 0xee; uint16_t w16 = 0xeeee; uint32_t w32 = 0xeeeeeeeeu; uint64_t w64 = 0xeeeeeeeeeeeeeeeeull;
+        if (written[j]) {
+          w8 = static_cast<uint8_t>(h8[j] + 1); w16 = static_cast<uint16_t>(h16[j] ^ 0x5a5a); w32 = h32[j] * 3u + 1u + h32[0];
+          w64 = h64[j] + h32[i] + (static_cast<uint64_t>(h32[0]) << 32);
+        }
+        if (hb8[j] != w8 || hb16[j] != w16 || hb32[j] != w32 || hb64[j] != w64) ++bad;
+        hh = (hh ^ hb8[j]) * 1099511628211ull; hh = (hh ^ hb16[j]) * 1099511628211ull;
+        hh = (hh ^ hb32[j]) * 1099511628211ull; hh = (hh ^ hb64[j]) * 1099511628211ull;
+      }
+      if (bad) { std::printf("WRONG hostmap_forms pattern=%d: %d slots\n", pattern, bad); ++wrong; }
+      std::printf("hostmap_forms pattern=%d bits %016llx\n", pattern, static_cast<unsigned long long>(hh));
+    }
+    CK(cudaFreeHost(h8)); CK(cudaFreeHost(hb8)); CK(cudaFreeHost(h16)); CK(cudaFreeHost(hb16));
+    CK(cudaFreeHost(h32)); CK(cudaFreeHost(hb32)); CK(cudaFreeHost(h64)); CK(cudaFreeHost(hb64));
   }
   if (run_conv_forms()) return 1;
   std::printf("wrong: %d\n", wrong);

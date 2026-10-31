@@ -37,6 +37,9 @@ const Corpus kCorpora[] = {
     // The forms of the handlers written by hand (amd/tools/tier-corpus.py): every operand kind, the VOP3 modifiers, SDWA selectors, constants.
     {"isa_corpus_tier_gfx942.txt", amd::gcn::Target::Gfx942}, {"isa_corpus_tier_gfx90a.txt", amd::gcn::Target::Gfx90a},
     {"isa_corpus_tier_gfx950.txt", amd::gcn::Target::Gfx950},
+    // The same script for RDNA (DPP and DPP8, the packed 16-bit integers, swizzles and permutes, and VOPD pairs of every instruction).
+    {"isa_corpus_tier_gfx1030.txt", amd::gcn::Target::Gfx1030}, {"isa_corpus_tier_gfx1100.txt", amd::gcn::Target::Gfx1100},
+    {"isa_corpus_tier_gfx1201.txt", amd::gcn::Target::Gfx1200},
 };
 
 std::vector<std::string> lines_of(const std::string& path) {

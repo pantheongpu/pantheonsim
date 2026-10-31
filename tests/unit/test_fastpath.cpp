@@ -1442,6 +1442,214 @@ VTEST(linear_texture_fetches_at_texel_centres_match_the_general_path) {
   }
 }
 
+// Fetches at random coordinates -- fractional ones for the linear filter, the odd value (NaN, infinity, huge, tiny) among them,
+// and integer ones for the point filter, out of range now and then -- from random textures of several formats, address modes,
+// dimensions and offsets, with the fast paths (VGPU_FASTPATH=1: the plain-texture fetch, the lean footprint, the one-group
+// float blend, the batched texel read) against the general code (VGPU_FASTPATH=0), bit for bit.
+namespace {
+struct RandomTex {
+  uint32_t bits, channels, w, h, depth;
+  exec::ChannelKind kind;
+  bool read_normalized;
+  exec::TexAddress addr;
+  bool normalized;
+  exec::TexFilter filter;
+  bool int_coords;
+  uint64_t digest;   // of the results of the 400 fetches (FNV-1a over their words), as the code before these fast paths gave them
+  bool zeros = false;   // a float texture of zeros, mostly negative ones (a blend of negative zeros is a negative zero)
+};
+void run_random_tex(const RandomTex& c, uint64_t seed) {
+  auto set_mode = [&](const char* fp) {
+    setenv("VGPU_FASTPATH", fp, 1);
+    MemoryManager mem{1 << 16};
+    DeviceProfile prof = load_gpu("nvidia/a10");
+    auto m = ptx::parse(".version 8.3\n.target sm_86\n.address_size 64\n.visible .entry k()\n{\n    ret;\n}\n");
+    LaunchConfig cfg;
+    cfg.block = {1, 1, 1};
+    exec::launch(m.entries[0], cfg, {}, mem, prof);
+  };
+  uint64_t st = seed * 0x9E3779B97F4A7C15ull + 1;
+  auto rnd = [&] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+  auto texel_f32 = [&]() -> uint32_t {
+    switch (rnd() % 12) {
+      case 0: return 0;
+      case 1: return 0x80000000u;
+      case 2: return static_cast<uint32_t>(rnd()) & 0x807FFFFFu;                   // zero or subnormal of either sign
+      case 3: return 0x7F800000u | (static_cast<uint32_t>(rnd()) & 0x807FFFFFu);   // infinity or a NaN
+      case 4: return 0x00800000u | (static_cast<uint32_t>(rnd()) & 0x80000000u);   // the smallest normal
+      case 5: return 0x7F7FFFFFu - static_cast<uint32_t>(rnd() % 4);
+      case 6: case 7: {   // small whole numbers: the blends of equal magnitudes
+        const float v = static_cast<float>(static_cast<int>(rnd() % 9) - 4);
+        uint32_t b;
+        std::memcpy(&b, &v, 4);
+        return b;
+      }
+      default: {          // moderate magnitudes, so that most blends are finite
+        const float v = (static_cast<float>(rnd() % 2000001) - 1000000.0f) / static_cast<float>(1 + rnd() % 977);
+        uint32_t b;
+        std::memcpy(&b, &v, 4);
+        return b;
+      }
+    }
+  };
+  auto coord_f32 = [&](uint32_t size) -> uint32_t {
+    float x;
+    switch (rnd() % 20) {
+      case 0: x = std::numeric_limits<float>::quiet_NaN(); break;
+      case 1: x = rnd() % 2 ? 1.0e9f : -1.0e9f; break;   // far outside (an infinity's int conversion is undefined, so none here)
+      case 2: x = rnd() % 2 ? 2.0e6f : -2.0e6f; break;
+      case 3: x = 3.0e-39f; break;
+      case 4: x = -0.0f; break;
+      case 5: case 6: x = static_cast<float>(static_cast<int>(rnd() % (2 * size + 8)) - 4) + 0.5f; break;   // a texel's centre
+      case 7: x = static_cast<float>(static_cast<int>(rnd() % (2 * size + 8)) - 4); break;                  // an edge
+      default: x = (static_cast<float>(rnd() % 4000001) / 4000000.0f) * static_cast<float>(3 * size + 6) - static_cast<float>(size + 3);
+    }
+    if (c.normalized) x /= static_cast<float>(size);
+    uint32_t b;
+    std::memcpy(&b, &x, 4);
+    return b;
+  };
+  MemoryManager mem{1 << 22};
+  const uint32_t texel_bytes = c.bits / 8 * c.channels;
+  const uint32_t depth = c.depth ? c.depth : 1, height = c.h ? c.h : 1;
+  std::vector<uint8_t> bytes(uint64_t{c.w} * height * depth * texel_bytes);
+  const uint64_t base = mem.alloc(bytes.size());
+  for (size_t i = 0; i < bytes.size(); i += c.bits / 8) {
+    if (c.bits == 32 && c.kind == exec::ChannelKind::Float) { const uint32_t t = c.zeros ? (rnd() % 8 ? 0x80000000u : 0u) : texel_f32(); std::memcpy(&bytes[i], &t, 4); }
+    else if (c.bits == 16 && c.kind == exec::ChannelKind::Float) {
+      const uint16_t t = static_cast<uint16_t>(rnd() % 8 == 0 ? rnd() : (rnd() % 2 ? 0x3C00u + rnd() % 0x400 : 0xB000u + rnd() % 0x800));
+      std::memcpy(&bytes[i], &t, 2);
+    } else for (uint32_t k = 0; k < c.bits / 8; ++k) bytes[i + k] = static_cast<uint8_t>(rnd());
+  }
+  mem.write(base, bytes.data(), bytes.size());
+  exec::TextureDesc d;
+  d.base = base;
+  d.width = c.w;
+  d.height = c.h;
+  d.depth = c.depth;
+  d.channels = c.channels;
+  for (uint32_t i = 0; i < 4; ++i) d.channel_bits[i] = i < c.channels ? c.bits : 0;
+  d.texel_bytes = texel_bytes;
+  d.kind = c.kind;
+  d.read_as_normalized_float = c.read_normalized;
+  d.filter = c.filter;
+  d.normalized_coords = c.normalized;
+  for (auto& a : d.address) a = c.addr;
+  for (uint32_t i = 0; i < 3; ++i) d.border_bits[i] = static_cast<uint32_t>(0x3F000000u + i);
+  const uint32_t dims = c.depth ? 3 : c.h ? 2 : 1;
+  const uint32_t sizes[3] = {c.w, c.h, c.depth};
+  struct Case { exec::TexFetch f; };
+  std::vector<Case> cases;
+  for (int i = 0; i < 400; ++i) {
+    exec::TexFetch f;
+    f.dims = dims;
+    f.float_coords = !c.int_coords;
+    f.float_result = c.kind == exec::ChannelKind::Float || c.read_normalized;
+    for (uint32_t a = 0; a < dims; ++a) {
+      if (c.int_coords) f.coord[a] = static_cast<uint32_t>(static_cast<int32_t>(rnd() % (sizes[a] + 6)) - 3);
+      else f.coord[a] = coord_f32(sizes[a]);
+    }
+    if (rnd() % 3 == 0)
+      for (uint32_t a = 0; a < dims; ++a) f.offset[a] = static_cast<int32_t>(rnd() % 16) - 8;
+    if (dims == 1 && rnd() % 7 == 0) f.offset[1] = static_cast<int32_t>(rnd() % 3) - 1;   // (a 1D offset's higher nibbles)
+    cases.push_back({f});
+  }
+  auto run = [&](const char* fp) {
+    set_mode(fp);
+    std::vector<uint32_t> out;
+    for (const Case& k : cases) {
+      uint32_t r[4] = {0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu};
+      exec::texture_fetch(mem, d, k.f, r);
+      out.insert(out.end(), r, r + 4);
+    }
+    return out;
+  };
+  const auto fast = run("1"), slow = run("0");
+  unsetenv("VGPU_FASTPATH");
+  VCHECK_EQ(fast.size(), slow.size());
+  auto digest = [](const std::vector<uint32_t>& v) {
+    uint64_t x = 1469598103934665603ull;
+    for (uint32_t w : v) x = (x ^ w) * 1099511628211ull;
+    return x;
+  };
+  for (size_t i = 0; i < fast.size(); ++i)
+    if (fast[i] != slow[i]) {
+      char buf[260];
+      std::snprintf(buf, sizeof buf, "%s f%u x%u %ux%ux%u addr %d norm %d read-normalized %d, fetch %zu channel %zu: coords %08x %08x: fast 0x%08x, general 0x%08x",
+                    c.filter == exec::TexFilter::Linear ? "linear" : "point", c.bits, c.channels, c.w, c.h, c.depth, static_cast<int>(c.addr),
+                    c.normalized, c.read_normalized, i / 4, i % 4, cases[i / 4].f.coord[0], cases[i / 4].f.coord[1], fast[i], slow[i]);
+      throw vtest::Failure(buf);
+    }
+  // Both are also what the code before the fast paths and the leaner footprint gave (digests taken from that code, not this).
+  if (digest(fast) != c.digest || digest(slow) != c.digest) {
+    char buf[200];
+    std::snprintf(buf, sizeof buf, "%s f%u x%u %ux%ux%u addr %d norm %d (case %llu): digest fast %016llx general %016llx, expected %016llx",
+                  c.filter == exec::TexFilter::Linear ? "linear" : "point", c.bits, c.channels, c.w, c.h, c.depth, static_cast<int>(c.addr),
+                  c.normalized, static_cast<unsigned long long>(seed), static_cast<unsigned long long>(digest(fast)),
+                  static_cast<unsigned long long>(digest(slow)), static_cast<unsigned long long>(c.digest));
+    throw vtest::Failure(buf);
+  }
+}
+}  // namespace
+
+VTEST(linear_texture_fetches_at_random_coordinates_match_the_general_path_and_the_digests) {
+  using A = exec::TexAddress;
+  using K = exec::ChannelKind;
+  const RandomTex cases[] = {
+      {32, 1, 16, 16, 0, K::Float, false, A::Clamp, false, exec::TexFilter::Linear, false, 0x4f88756a43a02a1full},
+      {32, 1, 16, 16, 0, K::Float, false, A::Clamp, true, exec::TexFilter::Linear, false, 0x73c63b7070b6a0efull},
+      {32, 2, 16, 8, 0, K::Float, false, A::Wrap, true, exec::TexFilter::Linear, false, 0x1c59f8777481e749ull},
+      {32, 4, 13, 9, 0, K::Float, false, A::Wrap, true, exec::TexFilter::Linear, false, 0xcaf218d39d281e3full},
+      {32, 1, 16, 16, 0, K::Float, false, A::Mirror, true, exec::TexFilter::Linear, false, 0x0986e6313e95d2cdull},
+      {32, 1, 16, 16, 0, K::Float, false, A::Border, false, exec::TexFilter::Linear, false, 0x535d9f9fef995eddull},
+      {32, 4, 16, 16, 0, K::Float, false, A::Border, true, exec::TexFilter::Linear, false, 0xe4a35ee843912481ull},
+      {32, 1, 64, 0, 0, K::Float, false, A::Clamp, false, exec::TexFilter::Linear, false, 0x49d53bb8090476d1ull},
+      {32, 1, 64, 0, 0, K::Float, false, A::Border, true, exec::TexFilter::Linear, false, 0x4cfa0d25542f7319ull},
+      {32, 1, 8, 8, 8, K::Float, false, A::Clamp, false, exec::TexFilter::Linear, false, 0xeacd2b3d82edde54ull},
+      {32, 2, 8, 6, 5, K::Float, false, A::Wrap, true, exec::TexFilter::Linear, false, 0x89e68e924ad0c65cull},
+      {16, 1, 16, 16, 0, K::Float, false, A::Clamp, false, exec::TexFilter::Linear, false, 0x69a54988fe1b2e83ull},
+      {16, 4, 16, 16, 0, K::Float, false, A::Wrap, true, exec::TexFilter::Linear, false, 0x32a039f317938e83ull},
+      {8, 4, 16, 16, 0, K::Unsigned, true, A::Clamp, false, exec::TexFilter::Linear, false, 0xc43aebd8eefec605ull},
+      {8, 1, 16, 16, 0, K::Signed, true, A::Wrap, true, exec::TexFilter::Linear, false, 0x65f1b45f0f9400e1ull},
+      {16, 2, 16, 16, 0, K::Unsigned, true, A::Border, false, exec::TexFilter::Linear, false, 0xb2e0b45b37c28520ull},
+      {32, 1, 16, 16, 0, K::Float, false, A::Clamp, false, exec::TexFilter::Linear, false, 0x7a45de671d350e83ull, true},
+      {32, 4, 16, 16, 0, K::Float, false, A::Wrap, true, exec::TexFilter::Linear, false, 0x0cde31491d350e83ull, true},
+  };
+  uint64_t seed = 1;
+  for (const RandomTex& c : cases) run_random_tex(c, seed++);
+}
+
+VTEST(point_and_integer_texture_fetches_match_the_general_path_and_the_digests) {
+  using A = exec::TexAddress;
+  using K = exec::ChannelKind;
+  const exec::TexFilter P = exec::TexFilter::Point, L = exec::TexFilter::Linear;
+  const RandomTex cases[] = {
+      {32, 1, 16, 16, 0, K::Float, false, A::Clamp, false, P, false, 0xd1b122827c52320eull},
+      {32, 1, 16, 16, 0, K::Float, false, A::Wrap, true, P, false, 0x19539a08f8260dc3ull},
+      {32, 4, 13, 9, 0, K::Float, false, A::Mirror, true, P, false, 0x149f33de02f866edull},
+      {32, 2, 16, 16, 0, K::Float, false, A::Border, false, P, false, 0xe58f43173471fec5ull},
+      {32, 1, 16, 16, 0, K::Float, false, A::Border, true, P, false, 0xd2bdc19bdfacf9e7ull},
+      {32, 1, 64, 0, 0, K::Float, false, A::Border, false, P, false, 0x0938edc1d3e30e4bull},
+      {32, 1, 8, 8, 8, K::Float, false, A::Clamp, false, P, false, 0x1544ea28d17aa38cull},
+      {32, 1, 8, 6, 5, K::Float, false, A::Wrap, true, P, false, 0xb9e849c763bc3b26ull},
+      {32, 1, 16, 16, 0, K::Float, false, A::Clamp, false, P, true, 0x2acbae4e71d5a3cbull},   // integer coordinates, any filter
+      {32, 1, 16, 16, 0, K::Float, false, A::Clamp, false, L, true, 0x721715adea679864ull},
+      {32, 4, 64, 0, 0, K::Float, false, A::Border, false, P, true, 0xd7f93a9e6ed2993full},
+      {32, 1, 8, 6, 5, K::Float, false, A::Clamp, false, P, true, 0xa1427fa3885db99eull},
+      {32, 1, 16, 16, 0, K::Signed, false, A::Clamp, false, P, false, 0xae19fa617fbcf3efull},
+      {32, 1, 16, 16, 0, K::Unsigned, false, A::Clamp, false, P, true, 0xfc59439a01e45babull},
+      {16, 2, 16, 16, 0, K::Unsigned, false, A::Wrap, true, P, false, 0x7d75320d5e88600aull},
+      {16, 4, 16, 16, 0, K::Signed, false, A::Clamp, false, P, true, 0x0652e3e97a6b955aull},
+      {8, 4, 16, 16, 0, K::Unsigned, true, A::Clamp, false, P, false, 0xfec53c1451933932ull},
+      {8, 1, 16, 16, 0, K::Signed, false, A::Border, true, P, false, 0xde4c6c47ff447254ull},
+      {16, 1, 16, 16, 0, K::Float, false, A::Clamp, false, P, false, 0xafbb84d796400e83ull},
+      {64, 2, 8, 8, 0, K::Unsigned, false, A::Clamp, false, P, true, 0xe8278471b341825bull},
+      {32, 2, 16, 16, 0, K::Float, false, A::Clamp, false, P, false, 0xb6c1bc341d350e83ull, true},
+  };
+  uint64_t seed = 101;
+  for (const RandomTex& c : cases) run_random_tex(c, seed++);
+}
+
 // Reading the special registers every thread starts with: tid, ntid, ctaid, nctaid and the lane id, in a grid of
 // several blocks of several shapes, against the values the launch geometry gives.
 VTEST(special_registers_read_what_the_launch_geometry_says) {

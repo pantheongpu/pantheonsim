@@ -1574,7 +1574,13 @@ VTEST(double_lanes_in_place_at_every_level) {
 VTEST(level_choice) {
   VCHECK(simd::supported(simd::Level::Base));
   VCHECK(simd::supported(simd::level()));
-  VCHECK_EQ(static_cast<int>(simd::kernels().level), static_cast<int>(simd::level()));
+  // The table in use is the one level() names, or the AVX-512 table (the default where the host has it) built on the AVX2 one.
+  if (simd::kernels().level == simd::Level::Avx512) {
+    VCHECK(simd::supported(simd::Level::Avx512));
+    VCHECK_EQ(static_cast<int>(simd::level()), static_cast<int>(simd::Level::Avx2));
+  } else {
+    VCHECK_EQ(static_cast<int>(simd::kernels().level), static_cast<int>(simd::level()));
+  }
 }
 
 VTEST_MAIN

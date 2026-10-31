@@ -29,6 +29,9 @@ bool runs_instr(const Instr& ins);   // src/sass/exec.cpp
 
 namespace {
 
+// The table of words is under test here, not the file of images (a hit there would skip the decoding these tests watch).
+[[maybe_unused]] const int kNoFile = setenv("VGPU_SASS_CACHE", "0", 1);
+
 template <class T>
 void put(std::string& s, T v) {
   s.append(reinterpret_cast<const char*>(&v), sizeof v);

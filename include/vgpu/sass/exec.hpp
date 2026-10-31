@@ -75,6 +75,9 @@ struct Code {
 
 struct Module {
   Cubin cubin;
+  // The cubin as it was loaded, kept only when host-GPU mode is on (VGPU_HOST_GPU, vgpu/host_gpu_rt.hpp): the real driver loads
+  // it for a launch on the card. `cubin` is patched with this device's addresses as it loads.
+  std::vector<uint8_t> image;
   int sm = 0;
   std::vector<Code> code;                     // one per .text section
   std::map<std::string, size_t> code_index;   // section name -> code
@@ -150,6 +153,10 @@ std::vector<std::string> reachable(const Module& m, const std::string& kernel);
 // (one it does not decode, or an op or form it does not implement yet),
 // described; empty when it runs all of it. Decodes only: no device needed.
 std::string unsupported(const uint8_t* image, size_t size);
+
+// How many calls of unsupported() were answered "runs in full" from the file of images an earlier call (of this or
+// another process, by this build) had found to run in full, without decoding (src/sass/ok_cache.cpp; for tests).
+uint64_t unsupported_cache_hits();
 
 // Runs one kernel of a loaded module over the grid.
 exec::LaunchStats launch(const Module& m, const std::string& kernel, const exec::LaunchConfig& cfg,

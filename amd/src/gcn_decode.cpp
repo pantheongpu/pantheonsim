@@ -1760,11 +1760,14 @@ void classify(Inst& in) {
 }  // namespace
 
 std::string short_name_of(const Inst& in) {
+  // (RDNA2's VOP3 spellings of three 16-bit integer instructions: gfx11 and gfx12 name them without the suffix and the interpreter reads their halves.)
+  const bool rdna2_i16 = in.arch == Target::Gfx1030 && (in.name.rfind("v_ashrrev_i16", 0) == 0 || in.name.rfind("v_max_i16", 0) == 0 ||
+                                                        in.name.rfind("v_min_i16", 0) == 0);
   return in.sdwa   ? in.name.substr(0, in.name.size() - 5) + "_e32"
          : (in.dpp || in.dpp8) ? (in.name.ends_with("_dpp") ? in.name.substr(0, in.name.size() - 4) + "_e32" : std::string())
          : in.promoted ? in.name.substr(0, in.name.size() - 4) + "_e32"
          : in.name.size() > 4 && in.name.compare(in.name.size() - 4, 4, "_e64") == 0 &&
-                 (in.name.find("_u16") != std::string::npos || in.name.find("_b16") != std::string::npos)
+                 (in.name.find("_u16") != std::string::npos || in.name.find("_b16") != std::string::npos || rdna2_i16)
              ? in.name.substr(0, in.name.size() - 4) + "_e32"
              : std::string();
 }
@@ -1954,8 +1957,8 @@ static Inst decode_one(const std::vector<uint8_t>& code, uint64_t at, uint64_t p
     Inst in = rdna::decode(code, at, pc, target, wave64);
     classify(in);
     for (Inst& half : in.dual) classify(half);
+    for (Inst& half : in.dual) finalize(half);   // (before the pair: its tier handler runs the halves' own)
     finalize(in);
-    for (Inst& half : in.dual) finalize(half);
     return in;
   }
   struct Using {

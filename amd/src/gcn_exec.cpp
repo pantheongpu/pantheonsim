@@ -1457,6 +1457,9 @@ struct Machine {
   static uint32_t word(Wave& w, const Operand& o, uint32_t k, uint32_t lane) {
     return o.kind == OperandKind::Agpr ? acc(w, o.index + k)[lane] : w.vgpr[o.index + k][lane];
   }
+  static uint32_t* row_of(Wave& w, const Operand& o, uint32_t k) {
+    return o.kind == OperandKind::Agpr ? acc(w, o.index + k).data() : &w.vgpr[o.index + k][0];
+  }
   static void set_word(Wave& w, const Operand& o, uint32_t k, uint32_t lane, uint32_t v) {
     if (o.kind == OperandKind::Agpr) acc(w, o.index + k)[lane] = v;
     else w.vgpr[o.index + k][lane] = v;
@@ -2750,12 +2753,22 @@ struct Machine {
   // The plain dword loads (s_load_dword .. dwordx16) are the case that matters; the rest (counters, stores, atomics, buffer forms,
   // sub-dword loads) is out of line, so this one stays small (the general function's frame and spills cost an RX 6800 scalar-load
   // kernel 5 %).
+  // A run of 2 to 16 words wholly inside one allocation is one lookup and one copy: load_run is what the words one at a time do, or declines (false).
+  // (Out of line: a 64-byte array in scalar_load's frame moved the frames below it, and with them the stack buffers of the matrix tiles, by 64 bytes,
+  // which cost mfma_f64 3.8%: the tile kernel's loads and its store to D alias in the low 12 bits of their addresses where they did not.)
+  [[gnu::noinline]] bool scalar_load_run(Wave& w, const Inst& in, uint64_t base, uint32_t words) {
+    uint32_t run[16];
+    if (!at(base).load_run(base, run, 4ull * words, 4)) return false;
+    for (uint32_t i = 0; i < words; ++i) set_sgpr(w, in.dst[0].index + i, run[i]);
+    return true;
+  }
   void scalar_load(Wave& w, const Inst& in) {
     gcn::MemFacts mem_scratch;
     const gcn::MemFacts& mf = gcn::mem_facts(in, mem_scratch);   // (what the name says, worked out when decoded)
     if (mf.smem == gcn::SmemKind::Load) {
       const uint64_t base = scalar_load_base(w, in);
       const uint32_t words = in.dst[0].width;
+      if (words >= 2 && words <= 16 && scalar_load_run(w, in, base, words)) return;
       for (uint32_t i = 0; i < words; ++i)
         set_sgpr(w, in.dst[0].index + i, static_cast<uint32_t>(at(base + 4 * i).load_scalar(base + 4 * i, 4)));
       return;
@@ -9563,27 +9576,51 @@ struct Machine {
   // A buffer load or store of one word a lane, for the whole wave: each lane's address and whether it is inside the resource
   // (`fits`, which reads `index`, the lane's), then the lanes that are inside made together (wave_scalars's way, one lookup for
   // the lot); the others read zero or write nothing. False, having done nothing, where the memory manager declines.
-  template <class Fits>
+  // What a buffer access is checked against, kept in one small value so the loops over the lanes hold it in registers.
+  struct BufLimits {
+    uint64_t soffset;
+    uint32_t stride, records, oob_select;
+    bool valid_format, rdna;
+    bool fits(uint64_t at, uint64_t bytes, uint32_t index) const {
+      if (!valid_format) return false;
+      if (rdna) switch (oob_select) {
+          case 0:   // structured: the index within the records, the offset within an element
+            return stride ? index < records && at + bytes <= stride : soffset + at + bytes <= records;
+          case 1: return index < records;              // the index alone
+          case 2: return records != 0;                 // only an empty buffer is out of range
+          default: return soffset + at + bytes <= records;   // raw: bytes, from the offset
+        }
+      return stride ? index < records : soffset + at + bytes <= records;
+    }
+  };
+
+  // A buffer load or store of one word a lane, for the whole wave: each lane's address and whether it is inside the resource
+  // (`lim.fits`, the lane's index in hand), then the lanes that are inside made together (wave_scalars's way, one lookup for
+  // the lot); the others read zero or write nothing. False, having done nothing, where the memory manager declines.
   [[gnu::noinline]] bool buffer_words(Wave& w, const Inst& in, bool store, const Operand& data, const Operand& vaddr, uint64_t origin,
-                                      uint32_t stride, Fits& fits, uint32_t& index) {
+                                      BufLimits lim) {
     uint64_t addrs[kLanes], vals[kLanes];
     uint32_t lanes[kLanes];
     uint32_t n = 0;
     uint64_t outside = 0;   // (lanes that read zero)
+    const uint32_t* const index_row = in.idxen ? row_of(w, vaddr, 0) : nullptr;
+    const uint32_t* const offset_row = in.offen ? row_of(w, vaddr, in.idxen ? 1 : 0) : nullptr;
+    const uint64_t constant = static_cast<uint32_t>(in.offset);
     for (uint64_t m = w.exec; m; m &= m - 1) {
       const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
-      index = in.idxen ? word(w, vaddr, 0, lane) : 0;
-      const uint64_t offset = uint64_t{in.offen ? word(w, vaddr, in.idxen ? 1 : 0, lane) : 0} + static_cast<uint32_t>(in.offset);
-      if (fits(offset, 4)) addrs[n] = origin + offset + uint64_t{index} * stride, lanes[n++] = lane;
+      const uint32_t index = index_row ? index_row[lane] : 0;
+      const uint64_t offset = uint64_t{offset_row ? offset_row[lane] : 0} + constant;
+      if (lim.fits(offset, 4, index)) addrs[n] = origin + offset + uint64_t{index} * lim.stride, lanes[n++] = lane;
       else outside |= uint64_t{1} << lane;
     }
+    uint32_t* const data_row = row_of(w, data, 0);
     if (store) {
-      for (uint32_t i = 0; i < n; ++i) vals[i] = word(w, data, 0, lanes[i]);
+      for (uint32_t i = 0; i < n; ++i) vals[i] = data_row[lanes[i]];
       return n == 0 || mem.store_batch(addrs, n, 4, vals);
     }
     if (n && !mem.load_batch(addrs, n, 4, vals)) return false;
-    for (uint32_t i = 0; i < n; ++i) set_word(w, data, 0, lanes[i], static_cast<uint32_t>(vals[i]));
-    for (; outside; outside &= outside - 1) set_word(w, data, 0, static_cast<uint32_t>(__builtin_ctzll(outside)), 0);
+    for (uint32_t i = 0; i < n; ++i) data_row[lanes[i]] = static_cast<uint32_t>(vals[i]);
+    for (; outside; outside &= outside - 1) data_row[__builtin_ctzll(outside)] = 0;
     return true;
   }
 
@@ -9679,20 +9716,11 @@ struct Machine {
     // nothing: every access is out of range, which MIOpen's hand-written
     // kernels use to switch a store off.
     uint32_t index = 0;   // (the lane's, set by whichever loop is running)
-    const auto fits = [&](uint64_t at, uint64_t bytes) {
-      if (!valid_format) return false;
-      if (rdna) switch (oob_select) {
-          case 0:   // structured: the index within the records, the offset within an element
-            return stride ? index < records && at + bytes <= stride : soffset + at + bytes <= records;
-          case 1: return index < records;              // the index alone
-          case 2: return records != 0;                 // only an empty buffer is out of range
-          default: return soffset + at + bytes <= records;   // raw: bytes, from the offset
-        }
-      return stride ? index < records : soffset + at + bytes <= records;
-    };
+    const BufLimits lim{soffset, stride, records, oob_select, valid_format, rdna};
+    const auto fits = [&](uint64_t at, uint64_t bytes) { return lim.fits(at, bytes, index); };
     // Plain dword loads and stores, one word a lane: the whole wave at once where the memory manager takes it (buffer_words).
     if (!lds_dma && !formatted && !is_half && !part && (mf.load_dword || mf.store_dword) && data.width == 1 && d.peers.empty() &&
-        runs_on && buffer_words(w, in, mf.store_dword, data, vaddr, base + soffset, stride, fits, index))
+        runs_on && buffer_words(w, in, mf.store_dword, data, vaddr, base + soffset, lim))
       return;
     for (uint32_t lane = 0; lane < kLanes; ++lane) {
       if (!(w.exec >> lane & 1)) continue;
@@ -10109,23 +10137,26 @@ struct Machine {
       addrs[n] = lane_addr[lane], lanes[n++] = lane;
     }
     if (!n) return true;
+    uint32_t* const row0 = row_of(w, data, 0);
+    uint32_t* const row1 = words == 2 ? row_of(w, data, 1) : row0;
     if (store) {
-      for (uint32_t i = 0; i < n; ++i) {
-        const uint32_t lo = word(w, data, 0, lanes[i]);
-        vals[i] = words == 2 ? lo | uint64_t{word(w, data, 1, lanes[i])} << 32 : lo;
+      if (words == 2) {
+        for (uint32_t i = 0; i < n; ++i) vals[i] = row0[lanes[i]] | uint64_t{row1[lanes[i]]} << 32;
+      } else {
+        for (uint32_t i = 0; i < n; ++i) vals[i] = row0[lanes[i]];
       }
       return mem.store_batch(addrs, n, bytes, vals);
     }
     if (!mem.load_batch(addrs, n, bytes, vals)) return false;
     for (uint32_t i = 1; i < n; ++i)
       if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
-    for (uint32_t i = 0; i < n; ++i) {
-      if (narrow_by) {
-        set_word(w, data, 0, lanes[i], widen(vals[i], *narrow_by));
-      } else {
-        set_word(w, data, 0, lanes[i], static_cast<uint32_t>(vals[i]));
-        if (words == 2) set_word(w, data, 1, lanes[i], static_cast<uint32_t>(vals[i] >> 32));
-      }
+    if (narrow_by) {
+      const Narrow nb = *narrow_by;
+      for (uint32_t i = 0; i < n; ++i) row0[lanes[i]] = widen(vals[i], nb);
+    } else if (words == 2) {
+      for (uint32_t i = 0; i < n; ++i) row0[lanes[i]] = static_cast<uint32_t>(vals[i]), row1[lanes[i]] = static_cast<uint32_t>(vals[i] >> 32);
+    } else {
+      for (uint32_t i = 0; i < n; ++i) row0[lanes[i]] = static_cast<uint32_t>(vals[i]);
     }
     return true;
   }

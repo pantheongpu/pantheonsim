@@ -1,0 +1,207 @@
+=== adam-cuda
+000000 _Z4adamIffEvPT_S1_S1_PKT0_fffffim10adamM grid 40x1x1 block 256x1x1 mem    0.2 MiB changed    0.1 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      24.2 us push    0.05 ms pull    0.06 ms | sim    24.944 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/adam-cuda/main: agree 1 differ 0 card-nondeterministic 0 failed/skipped 0
+=== aidw-cuda
+SUMMARY /home/ubuntu/corp/hec/aidw-cuda/main: agree 0 differ 0 card-nondeterministic 0 failed/skipped 1
+=== aligned-types-cuda
+000000 _Z10testKernelIhEvPT_PKS0_i              grid 195312x1x1 block 256x1x1 mem   95.4 MiB changed   47.7 MiB chunks 1526 bad 0 words 0 maxulp 0 | card kernel     294.1 us push    7.98 ms pull   57.44 ms | sim   716.697 ms | AGREE 
+000001 _Z10testKernelIhEvPT_PKS0_i              grid 195312x1x1 block 256x1x1 mem   95.4 MiB changed    0.0 MiB chunks 1526 bad 0 words 0 maxulp 0 | card kernel     288.3 us push    7.93 ms pull   55.83 ms | sim   705.242 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/aligned-types-cuda/main: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== aobench-cuda
+000000 _Z13render_kernelPhPK7_Sphere6_Planeiii  grid 16x16x1 block 16x16x1 mem    0.2 MiB changed    0.1 MiB chunks 4 bad 2 words 4 maxulp 16777216 | card kernel     152.2 us push    0.05 ms pull    0.06 ms | sim   522.609 ms | DIFFER first diff at 0x20000001ffe0: sim dfe4e4e4 card dfe5e5e5
+SUMMARY /home/ubuntu/corp/hec/aobench-cuda/main: agree 0 differ 1 card-nondeterministic 0 failed/skipped 0
+=== aop-cuda
+000000 _Z21generate_paths_kernelILi256E9PayoffP grid 128x1x1 block 256x1x1 mem   50.1 MiB changed   25.0 MiB chunks 809 bad 0 words 0 maxulp 0 | card kernel     327.0 us push    4.36 ms pull   29.25 ms | sim    85.462 ms | AGREE 
+000001 _Z18prepare_svd_kernelILi256E9PayoffPutE grid 99x1x1 block 256x1x1 mem   50.1 MiB changed    0.0 MiB chunks 809 bad 1 words 1054 maxulp 38959404 | card kernel     441.6 us push    4.40 ms pull   28.72 ms | sim   335.171 ms | DIFFER (card nondeterministic) first diff at 0x200003200008: sim 06fb5c82 card 06fb5c81
+000002 _Z27compute_partial_beta_kernelILi128E9P grid 128x1x1 block 128x1x1 mem   50.1 MiB changed    0.1 MiB chunks 809 bad 1 words 314 maxulp 672 | card kernel      42.7 us push    4.35 ms pull   28.35 ms | sim    14.007 ms | DIFFER (card nondeterministic) first diff at 0x200003203408: sim 02bc0bbc card 02bc0bb8
+000003 _Z25compute_final_beta_kernelILi128EEvPK grid 1x1x1 block 128x1x1 mem   50.1 MiB changed    0.1 MiB chunks 809 bad 1 words 2 maxulp 2 | card kernel      36.7 us push    4.31 ms pull   28.12 ms | sim     0.394 ms | DIFFER first diff at 0x200003203408: sim 8fc2c7f6 card 8fc2c7f5
+000004 _Z22update_cashflow_kernelILi128E9Payoff grid 224x1x1 block 128x1x1 mem   50.1 MiB changed    0.2 MiB chunks 809 bad 0 words 0 maxulp 0 | card kernel      21.1 us push    4.36 ms pull   27.87 ms | sim     1.995 ms | AGREE 
+000005 _Z27compute_partial_beta_kernelILi128E9P grid 128x1x1 block 128x1x1 mem   50.1 MiB changed    0.1 MiB chunks 809 bad 1 words 315 maxulp 3824 | card kernel      41.4 us push    4.34 ms pull   28.27 ms | sim    13.622 ms | DIFFER (card nondeterministic) first diff at 0x200003203400: sim 2cdd1ca9 card 2cdd1ca4
+000006 _Z25compute_final_beta_kernelILi128EEvPK grid 1x1x1 block 128x1x1 mem   50.1 MiB changed    0.1 MiB chunks 809 bad 1 words 3 maxulp 8 | card kernel      36.3 us push    4.37 ms pull   28.36 ms | sim     0.326 ms | DIFFER (card nondeterministic) first diff at 0x200003203400: sim 3ddf6466 card 3ddf6465
+000007 _Z22update_cashflow_kernelILi128E9Payoff grid 224x1x1 block 128x1x1 mem   50.1 MiB changed    0.2 MiB chunks 809 bad 0 words 0 maxulp 0 | card kernel      22.2 us push    4.36 ms pull   28.02 ms | sim     1.846 ms | AGREE 
+000008 _Z27compute_partial_sums_kernelILi128EEv grid 256x1x1 block 128x1x1 mem   50.1 MiB changed    0.1 MiB chunks 809 bad 1 words 208 maxulp 7 | card kernel      32.9 us push    4.35 ms pull   28.39 ms | sim     7.568 ms | DIFFER (card nondeterministic) first diff at 0x200003203400: sim 7f45fb1b card 7f45fb1d
+000009 _Z24compute_final_sum_kernelILi128EEviid grid 1x1x1 block 128x1x1 mem   50.1 MiB changed    0.1 MiB chunks 809 bad 0 words 0 maxulp 0 | card kernel      30.9 us push    4.40 ms pull   28.51 ms | sim     0.373 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/aop-cuda/main: agree 4 differ 1 card-nondeterministic 5 failed/skipped 0
+=== asmooth-cuda
+000000 _Z15smoothingFilteriiiiPKfPiPf           grid 32x32x1 block 16x16x1 mem    4.0 MiB changed    2.0 MiB chunks 64 bad 0 words 0 maxulp 0 | card kernel      95.9 us push    0.59 ms pull    2.56 ms | sim   156.585 ms | AGREE 
+000001 _Z15normalizeFilteriiPfPKf               grid 32x32x1 block 16x16x1 mem    4.0 MiB changed    1.0 MiB chunks 64 bad 0 words 0 maxulp 0 | card kernel      14.4 us push    0.57 ms pull    0.87 ms | sim     8.889 ms | AGREE 
+000002 _Z9outFilteriiPKfPKiPf                   grid 32x32x1 block 16x16x1 mem    4.0 MiB changed    1.0 MiB chunks 64 bad 0 words 0 maxulp 0 | card kernel      30.7 us push    0.57 ms pull    0.76 ms | sim    56.035 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/asmooth-cuda/main: agree 3 differ 0 card-nondeterministic 0 failed/skipped 0
+=== asyncAllocation-cuda
+000000 _Z7processPKfPfii                        grid 396x1x1 block 256x1x1 mem    0.8 MiB changed    0.4 MiB chunks 17 bad 0 words 0 maxulp 0 | card kernel      19.5 us push    0.16 ms pull    0.20 ms | sim     6.298 ms | AGREE 
+000001 _Z7processPKfPfii                        grid 402x1x1 block 256x1x1 mem    1.6 MiB changed    0.4 MiB chunks 31 bad 0 words 0 maxulp 0 | card kernel      12.4 us push    0.25 ms pull    0.38 ms | sim     6.307 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/asyncAllocation-cuda/main: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== atan2-cuda
+000000 _Z9compute_fiPKfS0_Pf                    grid 391x1x1 block 256x1x1 mem    1.7 MiB changed    0.4 MiB chunks 32 bad 0 words 0 maxulp 0 | card kernel      18.4 us push    0.27 ms pull    0.38 ms | sim     6.656 ms | AGREE 
+000001 _Z9compute_iiPKfS0_Pi                    grid 391x1x1 block 256x1x1 mem    1.7 MiB changed    0.4 MiB chunks 32 bad 0 words 0 maxulp 0 | card kernel      12.2 us push    0.28 ms pull    0.36 ms | sim     5.875 ms | AGREE 
+000002 _Z9compute_siPKfS0_Ps                    grid 391x1x1 block 256x1x1 mem    1.7 MiB changed    0.2 MiB chunks 32 bad 0 words 0 maxulp 0 | card kernel      12.4 us push    0.29 ms pull    0.35 ms | sim     5.281 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/atan2-cuda/main: agree 3 differ 0 card-nondeterministic 0 failed/skipped 0
+=== atomicAggregate-cuda
+000000 _Z1kPii                                  grid 65536x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel    1635.6 us push    0.01 ms pull    0.03 ms | sim  1247.138 ms | AGREE 
+000001 _Z1kPii                                  grid 65536x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel     980.7 us push    0.01 ms pull    0.01 ms | sim   901.176 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/atomicAggregate-cuda/main: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== atomicCost-cuda
+/tmp/m2_run.sh: line 7: 12569 Killed                  VGPU_QUIET=1 VGPU_GPU=nvidia/a10g VGPU_THREADS=4 VGPU_HOSTGPU_CAPTURE=$cap VGPU_HOSTGPU_CAPTURE_MAX=${CAPMAX:-2} VGPU_HOSTGPU_CAPTURE_STOP=${CAPSTOP:-0} LD_LIBRARY_PATH=$HOME/sim/build/shim timeout ${SIMTIMEOUT:-900} $prog "$@" > $cap/stdout.txt 2>&1
+SUMMARY /home/ubuntu/corp/hec/atomicCost-cuda/main: agree 0 differ 0 card-nondeterministic 0 failed/skipped 0
+=== atomicIntrinsics-cuda
+000000 _Z10testKernelIiEvPT_m                   grid 4096x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel    3042.7 us push    0.45 ms pull    0.02 ms | sim   197.799 ms | AGREE 
+000001 _Z10testKernelIiEvPT_m                   grid 4096x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel    1730.5 us push    0.01 ms pull    0.01 ms | sim   191.449 ms | AGREE 
+000002 _Z10testKernelIjEvPT_m                   grid 4096x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel    1730.4 us push    0.01 ms pull    0.01 ms | sim   190.457 ms | AGREE 
+000003 _Z10testKernelIjEvPT_m                   grid 4096x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel    1730.2 us push    0.01 ms pull    0.01 ms | sim   188.048 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/atomicIntrinsics-cuda/main: agree 4 differ 0 card-nondeterministic 0 failed/skipped 0
+=== atomicPerf-cuda
+000000 _Z27BlockRangeAtomicOnGlobalMemIdEvPT_i  grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel     256.0 us push    0.01 ms pull    0.02 ms | sim    32.441 ms | AGREE 
+000001 _Z26WarpRangeAtomicOnGlobalMemIdEvPT_i   grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel     964.7 us push    0.02 ms pull    0.02 ms | sim    98.897 ms | AGREE 
+000002 _Z28SingleRangeAtomicOnGlobalMemIdEvPT_i grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel    2876.7 us push    0.01 ms pull    0.02 ms | sim    53.192 ms | AGREE 
+000003 _Z27BlockRangeAtomicOnSharedMemIdEvPT_i  grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel      17.2 us push    0.01 ms pull    0.02 ms | sim    35.564 ms | AGREE 
+000004 _Z26WarpRangeAtomicOnSharedMemIdEvPT_i   grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel      38.6 us push    0.01 ms pull    0.01 ms | sim    38.403 ms | AGREE 
+000005 _Z28SingleRangeAtomicOnSharedMemIdEvPT_i grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel     766.1 us push    0.01 ms pull    0.01 ms | sim   440.227 ms | AGREE 
+000006 _Z27BlockRangeAtomicOnGlobalMemIiEvPT_i  grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel      83.9 us push    0.01 ms pull    0.01 ms | sim    28.715 ms | AGREE 
+000007 _Z26WarpRangeAtomicOnGlobalMemIiEvPT_i   grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel     158.6 us push    0.01 ms pull    0.01 ms | sim    67.971 ms | AGREE 
+000008 _Z28SingleRangeAtomicOnGlobalMemIiEvPT_i grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel      46.9 us push    0.01 ms pull    0.01 ms | sim    28.891 ms | AGREE 
+000009 _Z27BlockRangeAtomicOnSharedMemIiEvPT_i  grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel      14.0 us push    0.01 ms pull    0.01 ms | sim    26.371 ms | AGREE 
+000010 _Z26WarpRangeAtomicOnSharedMemIiEvPT_i   grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel      13.7 us push    0.01 ms pull    0.01 ms | sim    27.699 ms | AGREE 
+000011 _Z28SingleRangeAtomicOnSharedMemIiEvPT_i grid 6048x1x1 block 256x1x1 mem    0.0 MiB changed    0.0 MiB chunks 1 bad 0 words 0 maxulp 0 | card kernel      14.3 us push    0.01 ms pull    0.01 ms | sim    26.823 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/atomicPerf-cuda/main: agree 12 differ 0 card-nondeterministic 0 failed/skipped 0
+=== atomicReduction-cuda
+000000 _Z16atomic_reductionPiS_i                grid 2048x1x1 block 256x1x1 mem  200.0 MiB changed    0.0 MiB chunks 3201 bad 0 words 0 maxulp 0 | card kernel     452.5 us push   16.90 ms pull  118.27 ms | sim   192.508 ms | AGREE 
+000001 _Z16atomic_reductionPiS_i                grid 2048x1x1 block 256x1x1 mem  200.0 MiB changed    0.0 MiB chunks 3201 bad 0 words 0 maxulp 0 | card kernel     446.1 us push   16.52 ms pull  114.34 ms | sim   193.000 ms | AGREE 
+000002 _Z19atomic_reduction_v2PiS_i             grid 1024x1x1 block 128x1x1 mem  200.0 MiB changed    0.0 MiB chunks 3201 bad 0 words 0 maxulp 0 | card kernel     466.6 us push   16.59 ms pull  116.56 ms | sim   231.929 ms | AGREE 
+000003 _Z19atomic_reduction_v2PiS_i             grid 1024x1x1 block 128x1x1 mem  200.0 MiB changed    0.0 MiB chunks 3201 bad 0 words 0 maxulp 0 | card kernel     468.2 us push   16.57 ms pull  116.47 ms | sim   232.665 ms | AGREE 
+000004 _Z19atomic_reduction_v4PiS_i             grid 512x1x1 block 128x1x1 mem  200.0 MiB changed    0.0 MiB chunks 3201 bad 0 words 0 maxulp 0 | card kernel     423.0 us push   16.54 ms pull  116.03 ms | sim   196.630 ms | AGREE 
+000005 _Z19atomic_reduction_v4PiS_i             grid 512x1x1 block 128x1x1 mem  200.0 MiB changed    0.0 MiB chunks 3201 bad 0 words 0 maxulp 0 | card kernel     439.4 us push   16.57 ms pull  114.99 ms | sim   196.796 ms | AGREE 
+000006 _Z19atomic_reduction_v8PiS_i             grid 256x1x1 block 128x1x1 mem  200.0 MiB changed    0.0 MiB chunks 3201 bad 0 words 0 maxulp 0 | card kernel     421.0 us push   16.62 ms pull  116.16 ms | sim   177.506 ms | AGREE 
+000007 _Z19atomic_reduction_v8PiS_i             grid 256x1x1 block 128x1x1 mem  200.0 MiB changed    0.0 MiB chunks 3201 bad 0 words 0 maxulp 0 | card kernel     421.9 us push   16.74 ms pull  117.70 ms | sim   177.153 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/atomicReduction-cuda/main: agree 8 differ 0 card-nondeterministic 0 failed/skipped 0
+=== attention-cuda
+000000 _Z17attention_kernel1PKfS0_PfS1_ii       grid 16x1x1 block 256x1x1 mem    8.0 MiB changed    0.0 MiB chunks 135 bad 1 words 1 maxulp 1 | card kernel      67.0 us push    0.92 ms pull    4.83 ms | sim     8.427 ms | DIFFER (card nondeterministic) first diff at 0x200000804400: sim 457fffa9 card 457fffaa
+000001 _Z17attention_kernel2PKfS0_Pfi           grid 16x1x1 block 256x1x1 mem    8.0 MiB changed    0.0 MiB chunks 135 bad 1 words 1068 maxulp 1 | card kernel      15.2 us push    0.94 ms pull    1.40 ms | sim     1.073 ms | DIFFER first diff at 0x200000804a00: sim 397fe2ac card 397fe2ab
+000002 _Z17attention_kernel3PKfS0_Pfii          grid 1x1x1 block 256x1x1 mem    8.0 MiB changed    0.0 MiB chunks 135 bad 0 words 0 maxulp 0 | card kernel     169.3 us push    1.00 ms pull    1.40 ms | sim    14.491 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/attention-cuda/main: agree 1 differ 1 card-nondeterministic 1 failed/skipped 0
+=== axpby-cuda
+000000 _Z25multi_tensor_apply_kernelI18TensorLi grid 320x1x1 block 512x1x1 mem   11.8 MiB changed    0.3 MiB chunks 194 bad 0 words 0 maxulp 0 | card kernel      25.1 us push    1.26 ms pull    6.91 ms | sim    10.276 ms | AGREE 
+000001 _Z25multi_tensor_apply_kernelI18TensorLi grid 320x1x1 block 512x1x1 mem   11.8 MiB changed    0.3 MiB chunks 194 bad 0 words 0 maxulp 0 | card kernel      20.1 us push    1.25 ms pull    1.96 ms | sim     9.489 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/axpby-cuda/main: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== babelstream-cuda
+000000 _Z11init_kernelIfEvPT_S1_S1_S0_S0_S0_    grid 131072x1x1 block 256x1x1 mem  384.0 MiB changed  256.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     843.6 us push   32.02 ms pull  225.25 ms | sim   543.454 ms | AGREE 
+000001 _Z11copy_kernelIfEvPKT_PS0_              grid 131072x1x1 block 256x1x1 mem  384.0 MiB changed  128.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     564.1 us push   31.88 ms pull  221.16 ms | sim   384.449 ms | AGREE 
+000002 _Z10mul_kernelIfEvPT_PKS0_               grid 131072x1x1 block 256x1x1 mem  384.0 MiB changed  128.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     564.5 us push   31.84 ms pull  223.00 ms | sim   399.109 ms | AGREE 
+000003 _Z10add_kernelIfEvPKT_S2_PS0_            grid 131072x1x1 block 256x1x1 mem  384.0 MiB changed  128.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     831.5 us push   31.81 ms pull  221.57 ms | sim   467.246 ms | AGREE 
+000004 _Z12triad_kernelIfEvPT_PKS0_S3_          grid 131072x1x1 block 256x1x1 mem  384.0 MiB changed  128.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     831.8 us push   31.85 ms pull  224.93 ms | sim   467.581 ms | AGREE 
+000005 _Z10dot_kernelIfEvPKT_S2_PS0_i           grid 256x1x1 block 256x1x1 mem  384.0 MiB changed    0.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     572.0 us push   31.83 ms pull  225.96 ms | sim   196.364 ms | AGREE 
+000006 _Z14nstream_kernelIfEvPT_PKS0_S3_        grid 131072x1x1 block 256x1x1 mem  384.0 MiB changed  128.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel    1075.3 us push   31.95 ms pull  223.13 ms | sim   520.504 ms | AGREE 
+000007 _Z11copy_kernelIfEvPKT_PS0_              grid 131072x1x1 block 256x1x1 mem  384.0 MiB changed  128.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     582.6 us push   31.85 ms pull  220.72 ms | sim   386.587 ms | AGREE 
+000008 _Z10mul_kernelIfEvPT_PKS0_               grid 131072x1x1 block 256x1x1 mem  384.0 MiB changed  128.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     560.5 us push   31.88 ms pull  222.92 ms | sim   398.555 ms | AGREE 
+000009 _Z10add_kernelIfEvPKT_S2_PS0_            grid 131072x1x1 block 256x1x1 mem  384.0 MiB changed  128.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     817.2 us push   31.85 ms pull  225.94 ms | sim   463.663 ms | AGREE 
+000010 _Z12triad_kernelIfEvPT_PKS0_S3_          grid 131072x1x1 block 256x1x1 mem  384.0 MiB changed  128.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     833.8 us push   31.83 ms pull  220.49 ms | sim   467.649 ms | AGREE 
+000011 _Z10dot_kernelIfEvPKT_S2_PS0_i           grid 256x1x1 block 256x1x1 mem  384.0 MiB changed    0.0 MiB chunks 6148 bad 0 words 0 maxulp 0 | card kernel     570.5 us push   31.87 ms pull  222.58 ms | sim   195.608 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/babelstream-cuda/main: agree 12 differ 0 card-nondeterministic 0 failed/skipped 0
+=== background-subtract-cuda
+SUMMARY /home/ubuntu/corp/hec/background-subtract-cuda/main: agree 0 differ 0 card-nondeterministic 0 failed/skipped 0
+=== backprop-cuda
+000000 _Z19kernel_layerforwardPKfPfS1_i         grid 1x256x1 block 16x16x1 mem    0.3 MiB changed    0.3 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      18.3 us push    0.07 ms pull    0.08 ms | sim     4.396 ms | AGREE 
+000001 _Z21kernel_adjust_weightsPKfPfS0_S1_i    grid 1x256x1 block 16x16x1 mem    0.6 MiB changed    0.0 MiB chunks 13 bad 0 words 0 maxulp 0 | card kernel      10.4 us push    0.09 ms pull    0.14 ms | sim     2.861 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/backprop-cuda/main: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== base64e-cuda
+000000 _Z10base64_encPKhPhcmj                   grid 10923x1x1 block 256x1x1 mem   96.0 MiB changed   10.7 MiB chunks 1538 bad 0 words 0 maxulp 0 | card kernel     606.7 us push    8.04 ms pull   57.43 ms | sim   472.552 ms | AGREE 
+000001 _Z10base64_encPKhPhcmj                   grid 10923x1x1 block 256x1x1 mem   96.0 MiB changed   10.8 MiB chunks 1538 bad 0 words 0 maxulp 0 | card kernel     611.0 us push    8.05 ms pull   56.15 ms | sim   470.797 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/base64e-cuda/main: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== bgmv-cuda
+000000 _Z18bgmv_shrink_kernelILi32EEvPfPK6__hal grid 1x16x1 block 32x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      20.3 us push    0.06 ms pull    0.14 ms | sim     1.428 ms | AGREE 
+000001 _Z18bgmv_shrink_kernelILi64EEvPfPK6__hal grid 1x16x1 block 64x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      12.0 us push    0.06 ms pull    0.08 ms | sim     0.555 ms | AGREE 
+000002 _Z18bgmv_shrink_kernelILi128EEvPfPK6__ha grid 1x16x1 block 128x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      11.8 us push    0.08 ms pull    0.08 ms | sim     0.609 ms | AGREE 
+000003 _Z18bgmv_shrink_kernelILi256EEvPfPK6__ha grid 1x16x1 block 256x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      12.0 us push    0.06 ms pull    0.08 ms | sim     1.154 ms | AGREE 
+000004 _Z18bgmv_shrink_kernelILi512EEvPfPK6__ha grid 1x16x1 block 512x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      12.5 us push    0.09 ms pull    0.08 ms | sim     1.020 ms | AGREE 
+000005 _Z18bgmv_shrink_kernelILi1024EEvPfPK6__h grid 1x16x1 block 1024x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      12.3 us push    0.06 ms pull    0.07 ms | sim     1.809 ms | AGREE 
+000006 _Z18bgmv_shrink_kernelILi32EEvPfPK6__hal grid 1x16x1 block 32x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      12.8 us push    0.06 ms pull    0.08 ms | sim     0.241 ms | AGREE 
+000007 _Z18bgmv_shrink_kernelILi64EEvPfPK6__hal grid 1x16x1 block 64x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      12.2 us push    0.08 ms pull    0.08 ms | sim     0.277 ms | AGREE 
+000008 _Z18bgmv_shrink_kernelILi128EEvPfPK6__ha grid 1x16x1 block 128x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      11.6 us push    0.07 ms pull    0.09 ms | sim     0.327 ms | AGREE 
+000009 _Z18bgmv_shrink_kernelILi256EEvPfPK6__ha grid 1x16x1 block 256x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      12.4 us push    0.08 ms pull    0.08 ms | sim     0.466 ms | AGREE 
+000010 _Z18bgmv_shrink_kernelILi512EEvPfPK6__ha grid 1x16x1 block 512x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      11.9 us push    0.06 ms pull    0.08 ms | sim     0.747 ms | AGREE 
+000011 _Z18bgmv_shrink_kernelILi1024EEvPfPK6__h grid 1x16x1 block 1024x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      12.8 us push    0.06 ms pull    0.07 ms | sim     1.193 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/bgmv-cuda/main: agree 12 differ 0 card-nondeterministic 0 failed/skipped 0
+=== bh-cuda
+000000 _Z20InitializationKernelPiPj             grid 1x1x1 block 1x1x1 mem    2.0 MiB changed    0.0 MiB chunks 39 bad 0 words 0 maxulp 0 | card kernel      16.7 us push    0.41 ms pull    0.49 ms | sim     0.148 ms | AGREE 
+000001 _Z17BoundingBoxKerneliiPiS_P6float4P6flo grid 48x1x1 block 256x1x1 mem    2.0 MiB changed    0.1 MiB chunks 39 bad 0 words 0 maxulp 0 | card kernel      14.9 us push    0.37 ms pull    0.45 ms | sim     1.997 ms | AGREE 
+000002 _Z12ClearKernel1iiPi                     grid 24x1x1 block 256x1x1 mem    2.0 MiB changed    0.6 MiB chunks 39 bad 0 words 0 maxulp 0 | card kernel      10.4 us push    0.36 ms pull    0.48 ms | sim     0.858 ms | AGREE 
+000003 _Z18TreeBuildingKerneliiPViPK6float4PKfP grid 48x1x1 block 256x1x1 mem    2.0 MiB changed    0.1 MiB chunks 39 bad 2 words 11627 maxulp 2147508224 | card kernel      38.0 us push    0.36 ms pull    0.50 ms | sim     3.875 ms | DIFFER (card nondeterministic) first diff at 0x2000000ad1e0: sim 000012ad card ffffffff
+000004 _Z12ClearKernel2iPiP6float4S_            grid 24x1x1 block 256x1x1 mem    2.0 MiB changed    0.1 MiB chunks 39 bad 0 words 0 maxulp 0 | card kernel      11.4 us push    0.39 ms pull    0.50 ms | sim     0.334 ms | AGREE 
+000005 _Z19SummarizationKerneliiPViPKiPV6float4 grid 24x1x1 block 256x1x1 mem    2.0 MiB changed    0.1 MiB chunks 39 bad 0 words 0 maxulp 0 | card kernel      50.1 us push    0.37 ms pull    0.53 ms | sim     2.921 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/bh-cuda/main: agree 5 differ 0 card-nondeterministic 1 failed/skipped 1
+=== bilateral-cuda
+000000 _Z15bilateralFilterILi3EEvPKfPfiifff     grid 16x8x1 block 16x16x1 mem    0.2 MiB changed    0.1 MiB chunks 4 bad 2 words 210 maxulp 3 | card kernel      27.8 us push    0.06 ms pull    0.06 ms | sim   112.617 ms | DIFFER first diff at 0x200000000164: sim 42ebfff6 card 42ebfff8
+000001 _Z15bilateralFilterILi6EEvPKfPfiifff     grid 16x8x1 block 16x16x1 mem    0.2 MiB changed    0.1 MiB chunks 4 bad 2 words 215 maxulp 2 | card kernel      48.2 us push    0.05 ms pull    0.07 ms | sim   389.717 ms | DIFFER first diff at 0x200000000164: sim 42ebfff6 card 42ebfff8
+000002 _Z15bilateralFilterILi9EEvPKfPfiifff     grid 16x8x1 block 16x16x1 mem    0.2 MiB changed    0.1 MiB chunks 4 bad 2 words 217 maxulp 2 | card kernel      88.8 us push    0.05 ms pull    0.06 ms | sim   823.644 ms | DIFFER first diff at 0x200000000164: sim 42ebfff6 card 42ebfff8
+SUMMARY /home/ubuntu/corp/hec/bilateral-cuda/main: agree 0 differ 3 card-nondeterministic 0 failed/skipped 0
+=== binomial-cuda
+000000 _Z21binomialOptionsKernelPK13__TOptionDa grid 1024x1x1 block 128x1x1 mem    0.0 MiB changed    0.0 MiB chunks 2 bad 1 words 648 maxulp 171 | card kernel     763.3 us push    0.02 ms pull    0.04 ms | sim  2857.845 ms | DIFFER first diff at 0x200000005004: sim 2a1a48e1 card 2a1a4904
+000001 _Z21binomialOptionsKernelPK13__TOptionDa grid 1024x1x1 block 128x1x1 mem    0.0 MiB changed    0.0 MiB chunks 2 bad 1 words 648 maxulp 171 | card kernel     755.5 us push    0.02 ms pull    0.02 ms | sim  2889.616 ms | DIFFER first diff at 0x200000005004: sim 2a1a48e1 card 2a1a4904
+SUMMARY /home/ubuntu/corp/hec/binomial-cuda/main: agree 0 differ 2 card-nondeterministic 0 failed/skipped 0
+=== bitonic-sort-cuda
+000000 _Z12bitonic_sortiiPi                     grid 256x1x1 block 256x1x1 mem    0.2 MiB changed    0.2 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      17.4 us push    0.03 ms pull    0.05 ms | sim     3.873 ms | AGREE 
+000001 _Z12bitonic_sortiiPi                     grid 256x1x1 block 256x1x1 mem    0.2 MiB changed    0.2 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      10.2 us push    0.02 ms pull    0.05 ms | sim     3.206 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/bitonic-sort-cuda/main: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== black-scholes-cuda
+SUMMARY /home/ubuntu/corp/hec/black-scholes-cuda/main: agree 0 differ 0 card-nondeterministic 0 failed/skipped 0
+=== blockAccess-cuda
+000000 _Z9referencePKfPhm                       grid 1280x1x1 block 256x1x1 mem    1.5 MiB changed    0.2 MiB chunks 24 bad 0 words 0 maxulp 0 | card kernel      17.6 us push    0.24 ms pull    0.30 ms | sim     4.793 ms | AGREE 
+000001 _Z6kernelILi256ELi4EEvPKfPhm             grid 1280x1x1 block 256x1x1 mem    1.5 MiB changed    0.2 MiB chunks 24 bad 0 words 0 maxulp 0 | card kernel      10.8 us push    0.20 ms pull    0.29 ms | sim     5.015 ms | AGREE 
+000002 _Z9referencePKfPhm                       grid 1280x1x1 block 256x1x1 mem    1.5 MiB changed    0.0 MiB chunks 24 bad 0 words 0 maxulp 0 | card kernel      10.8 us push    0.20 ms pull    0.28 ms | sim     3.972 ms | AGREE 
+000003 _Z6kernelILi256ELi4EEvPKfPhm             grid 1280x1x1 block 256x1x1 mem    1.5 MiB changed    0.0 MiB chunks 24 bad 0 words 0 maxulp 0 | card kernel      11.3 us push    0.22 ms pull    0.29 ms | sim     5.647 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/blockAccess-cuda/main: agree 4 differ 0 card-nondeterministic 0 failed/skipped 0
+=== perplexity-cuda
+000000 _Z13sigmas_kernelIifEvPKT0_PS0_ffifT_i   grid 4x1x1 block 256x1x1 mem    1.5 MiB changed    0.8 MiB chunks 26 bad 13 words 164972 maxulp 125 | card kernel    5145.3 us push    0.18 ms pull    0.29 ms | sim   375.677 ms | DIFFER first diff at 0x200000000004: sim 3684e836 card 3684e847
+SUMMARY /home/ubuntu/corp/hec/perplexity-cuda/main: agree 0 differ 1 card-nondeterministic 0 failed/skipped 0
+=== radixsort2-cuda
+000000 _ZN3cub17CUB_300001_SM_8606detail10radix grid 960x1x1 block 128x1x1 mem    0.5 MiB changed    0.0 MiB chunks 11 bad 0 words 0 maxulp 0 | card kernel      42.3 us push    0.08 ms pull    0.39 ms | sim    16.501 ms | AGREE 
+000001 _ZN3cub17CUB_300001_SM_8606detail10radix grid 4x1x1 block 256x1x1 mem    0.5 MiB changed    0.0 MiB chunks 11 bad 0 words 0 maxulp 0 | card kernel      11.3 us push    0.08 ms pull    0.12 ms | sim     0.379 ms | AGREE 
+000002 _ZN3cub17CUB_300001_SM_8606detail10radix grid 9x1x1 block 384x1x1 mem    0.5 MiB changed    0.3 MiB chunks 11 bad 0 words 0 maxulp 0 | card kernel      20.7 us push    0.08 ms pull    0.12 ms | sim    16.497 ms | AGREE 
+000003 _ZN3cub17CUB_300001_SM_8606detail10radix grid 9x1x1 block 384x1x1 mem    0.5 MiB changed    0.3 MiB chunks 11 bad 0 words 0 maxulp 0 | card kernel      20.7 us push    0.08 ms pull    0.12 ms | sim    12.653 ms | AGREE 
+000004 _ZN3cub17CUB_300001_SM_8606detail10radix grid 960x1x1 block 128x1x1 mem    0.5 MiB changed    0.0 MiB chunks 11 bad 0 words 0 maxulp 0 | card kernel      14.1 us push    0.08 ms pull    0.14 ms | sim    15.826 ms | AGREE 
+000005 _ZN3cub17CUB_300001_SM_8606detail10radix grid 4x1x1 block 256x1x1 mem    0.5 MiB changed    0.0 MiB chunks 11 bad 0 words 0 maxulp 0 | card kernel      11.0 us push    0.08 ms pull    0.12 ms | sim     0.170 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/radixsort2-cuda/main: agree 6 differ 0 card-nondeterministic 0 failed/skipped 0
+=== s3d-cuda
+000000 _Z11ratt_kernelIfEvPKT_PS0_S0_           grid 108x1x1 block 128x1x1 mem   34.5 MiB changed   10.9 MiB chunks 570 bad 56 words 483840 maxulp 1 | card kernel      44.6 us push    3.55 ms pull   21.20 ms | sim    23.614 ms | DIFFER first diff at 0x20000026d000: sim 515af523 card 515af522
+000001 _Z12rdsmh_kernelIfEvPKT_PS0_S0_          grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.7 MiB chunks 570 bad 14 words 138240 maxulp 1 | card kernel      19.5 us push    3.51 ms pull   20.22 ms | sim     6.468 ms | DIFFER first diff at 0x2000020f5800: sim 52a079fb card 52a079fc
+000002 _Z7gr_baseIfEvPKT_S2_S2_PS0_S0_S0_       grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.2 MiB chunks 570 bad 0 words 0 maxulp 0 | card kernel      44.4 us push    3.52 ms pull   20.05 ms | sim     3.205 ms | AGREE 
+000003 _Z12ratt2_kernelIfEvPKT_S2_PS0_S2_S0_    grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.4 MiB chunks 570 bad 0 words 0 maxulp 0 | card kernel      27.6 us push    3.53 ms pull   20.31 ms | sim     4.162 ms | AGREE 
+000004 _Z12ratt3_kernelIfEvPKT_S2_PS0_S2_S0_    grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.4 MiB chunks 570 bad 0 words 0 maxulp 0 | card kernel      29.4 us push    3.50 ms pull   20.35 ms | sim     5.131 ms | AGREE 
+000005 _Z12ratt4_kernelIfEvPKT_S2_PS0_S2_S0_    grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.4 MiB chunks 570 bad 0 words 0 maxulp 0 | card kernel      31.4 us push    3.51 ms pull   20.22 ms | sim     4.967 ms | AGREE 
+000006 _Z12ratt5_kernelIfEvPKT_S2_PS0_S2_S0_    grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.3 MiB chunks 570 bad 0 words 0 maxulp 0 | card kernel      28.1 us push    3.51 ms pull   20.43 ms | sim     5.224 ms | AGREE 
+000007 _Z12ratt6_kernelIfEvPKT_S2_PS0_S2_S0_    grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.4 MiB chunks 570 bad 0 words 0 maxulp 0 | card kernel      28.6 us push    3.55 ms pull   20.14 ms | sim     5.191 ms | AGREE 
+000008 _Z12ratt7_kernelIfEvPKT_S2_PS0_S2_S0_    grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.4 MiB chunks 570 bad 0 words 0 maxulp 0 | card kernel      32.5 us push    3.53 ms pull   20.17 ms | sim     5.356 ms | AGREE 
+000009 _Z12ratt8_kernelIfEvPKT_S2_PS0_S2_S0_    grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.4 MiB chunks 570 bad 0 words 0 maxulp 0 | card kernel      31.0 us push    3.52 ms pull   20.90 ms | sim     5.542 ms | AGREE 
+000010 _Z12ratt9_kernelIfEvPKT_S2_PS0_S2_S0_    grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.7 MiB chunks 570 bad 0 words 0 maxulp 0 | card kernel      34.5 us push    3.54 ms pull   20.25 ms | sim     6.682 ms | AGREE 
+000011 _Z13ratt10_kernelIfEvPKT_PS0_S0_         grid 108x1x1 block 128x1x1 mem   34.5 MiB changed    1.1 MiB chunks 570 bad 11 words 96768 maxulp 1 | card kernel      19.0 us push    3.51 ms pull   20.31 ms | sim     3.913 ms | DIFFER first diff at 0x200001827000: sim 5a196ac7 card 5a196ac6
+SUMMARY /home/ubuntu/corp/hec/s3d-cuda/main: agree 9 differ 3 card-nondeterministic 0 failed/skipped 0
+=== shmembench-cuda
+000000 _Z15benchmark_shmemP6float4              grid 1024x1x1 block 256x1x1 mem    8.0 MiB changed    4.0 MiB chunks 128 bad 0 words 0 maxulp 0 | card kernel    5176.4 us push    0.69 ms pull    4.59 ms | sim  8820.908 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/shmembench-cuda/main: agree 1 differ 0 card-nondeterministic 0 failed/skipped 0
+=== silu-cuda
+000000 _Z19silu_forward_kernelPKfPfm            grid 4096x1x1 block 64x1x1 mem    4.0 MiB changed    1.0 MiB chunks 64 bad 16 words 32889 maxulp 2 | card kernel      20.4 us push    0.58 ms pull    2.61 ms | sim    14.974 ms | DIFFER first diff at 0x200000100008: sim be5acace card be5acacf
+000001 _Z19silu_forward_kernelPKfPfm            grid 2048x1x1 block 128x1x1 mem    4.0 MiB changed    0.0 MiB chunks 64 bad 16 words 32889 maxulp 2 | card kernel      14.6 us push    0.56 ms pull    0.84 ms | sim    12.783 ms | DIFFER first diff at 0x200000100008: sim be5acace card be5acacf
+000002 _Z20silu_forward_kernel2PKfPfm           grid 1024x1x1 block 64x1x1 mem    4.0 MiB changed    0.0 MiB chunks 64 bad 16 words 32889 maxulp 2 | card kernel      14.3 us push    0.60 ms pull    0.87 ms | sim    10.171 ms | DIFFER first diff at 0x200000100008: sim be5acace card be5acacf
+000003 _Z20silu_forward_kernel2PKfPfm           grid 512x1x1 block 128x1x1 mem    4.0 MiB changed    0.0 MiB chunks 64 bad 16 words 32889 maxulp 2 | card kernel      13.9 us push    0.60 ms pull    0.77 ms | sim     9.770 ms | DIFFER first diff at 0x200000100008: sim be5acace card be5acacf
+000004 _Z20silu_backward_kernelPKfS0_Pfm        grid 4096x1x1 block 64x1x1 mem    4.0 MiB changed    1.0 MiB chunks 64 bad 16 words 35453 maxulp 6 | card kernel      15.4 us push    0.56 ms pull    0.94 ms | sim    20.466 ms | DIFFER first diff at 0x200000300004: sim 3dd688de card 3dd688dc
+000005 _Z20silu_backward_kernelPKfS0_Pfm        grid 2048x1x1 block 128x1x1 mem    4.0 MiB changed    0.0 MiB chunks 64 bad 16 words 35453 maxulp 6 | card kernel      14.4 us push    0.60 ms pull    0.80 ms | sim    19.879 ms | DIFFER first diff at 0x200000300004: sim 3dd688de card 3dd688dc
+000006 _Z21silu_backward_kernel2PKfS0_Pfm       grid 4096x1x1 block 64x1x1 mem    4.0 MiB changed    1.0 MiB chunks 64 bad 16 words 26013 maxulp 6 | card kernel      14.7 us push    0.55 ms pull    0.87 ms | sim     9.076 ms | DIFFER first diff at 0x200000300008: sim 3e32c115 card 3e32c117
+000007 _Z21silu_backward_kernel2PKfS0_Pfm       grid 2048x1x1 block 128x1x1 mem    4.0 MiB changed    0.0 MiB chunks 64 bad 16 words 26013 maxulp 6 | card kernel      14.2 us push    0.57 ms pull    0.85 ms | sim     8.655 ms | DIFFER first diff at 0x200000300008: sim 3e32c115 card 3e32c117
+000008 _Z21silu_backward_kernel3PKfS0_Pfm       grid 1024x1x1 block 64x1x1 mem    4.0 MiB changed    0.0 MiB chunks 64 bad 16 words 26013 maxulp 6 | card kernel      13.5 us push    0.56 ms pull    0.84 ms | sim     5.404 ms | DIFFER first diff at 0x200000300008: sim 3e32c115 card 3e32c117
+000009 _Z21silu_backward_kernel3PKfS0_Pfm       grid 512x1x1 block 128x1x1 mem    4.0 MiB changed    0.0 MiB chunks 64 bad 16 words 26013 maxulp 6 | card kernel      13.0 us push    0.58 ms pull    0.89 ms | sim     5.103 ms | DIFFER first diff at 0x200000300008: sim 3e32c115 card 3e32c117
+SUMMARY /home/ubuntu/corp/hec/silu-cuda/main: agree 0 differ 10 card-nondeterministic 0 failed/skipped 0
+=== sortKV-cuda
+000000 _ZN3cub17CUB_300001_SM_8606detail10radix grid 960x1x1 block 128x1x1 mem    0.6 MiB changed    0.0 MiB chunks 13 bad 0 words 0 maxulp 0 | card kernel      21.1 us push    0.10 ms pull    0.35 ms | sim    16.800 ms | AGREE 
+000001 _ZN3cub17CUB_300001_SM_8606detail10radix grid 4x1x1 block 256x1x1 mem    0.6 MiB changed    0.0 MiB chunks 13 bad 0 words 0 maxulp 0 | card kernel      11.5 us push    0.10 ms pull    0.15 ms | sim     0.343 ms | AGREE 
+000002 _ZN3cub17CUB_300001_SM_8606detail10radix grid 11x1x1 block 384x1x1 mem    0.6 MiB changed    0.3 MiB chunks 13 bad 0 words 0 maxulp 0 | card kernel      21.5 us push    0.10 ms pull    0.16 ms | sim    19.172 ms | AGREE 
+000003 _ZN3cub17CUB_300001_SM_8606detail10radix grid 11x1x1 block 384x1x1 mem    0.6 MiB changed    0.3 MiB chunks 13 bad 0 words 0 maxulp 0 | card kernel      20.9 us push    0.10 ms pull    0.15 ms | sim    15.273 ms | AGREE 
+000004 _ZN3cub17CUB_300001_SM_8606detail10radix grid 960x1x1 block 128x1x1 mem    0.8 MiB changed    0.0 MiB chunks 15 bad 0 words 0 maxulp 0 | card kernel      14.9 us push    0.11 ms pull    0.17 ms | sim    16.218 ms | AGREE 
+000005 _ZN3cub17CUB_300001_SM_8606detail10radix grid 4x1x1 block 256x1x1 mem    0.8 MiB changed    0.0 MiB chunks 15 bad 0 words 0 maxulp 0 | card kernel      11.1 us push    0.10 ms pull    0.17 ms | sim     0.281 ms | AGREE 
+000006 _ZN3cub17CUB_300001_SM_8606detail10radix grid 11x1x1 block 384x1x1 mem    0.8 MiB changed    0.4 MiB chunks 15 bad 0 words 0 maxulp 0 | card kernel      21.1 us push    0.10 ms pull    0.17 ms | sim    19.067 ms | AGREE 
+000007 _ZN3cub17CUB_300001_SM_8606detail10radix grid 11x1x1 block 384x1x1 mem    0.8 MiB changed    0.4 MiB chunks 15 bad 0 words 0 maxulp 0 | card kernel      20.5 us push    0.11 ms pull    0.19 ms | sim    15.707 ms | AGREE 
+000008 _ZN3cub17CUB_300001_SM_8606detail10radix grid 960x1x1 block 128x1x1 mem    1.0 MiB changed    0.0 MiB chunks 19 bad 0 words 0 maxulp 0 | card kernel      14.1 us push    0.13 ms pull    0.22 ms | sim    16.170 ms | AGREE 
+000009 _ZN3cub17CUB_300001_SM_8606detail10radix grid 4x1x1 block 256x1x1 mem    1.0 MiB changed    0.0 MiB chunks 19 bad 0 words 0 maxulp 0 | card kernel      10.5 us push    0.13 ms pull    0.21 ms | sim     0.262 ms | AGREE 
+000010 _ZN3cub17CUB_300001_SM_8606detail10radix grid 11x1x1 block 384x1x1 mem    1.0 MiB changed    0.5 MiB chunks 19 bad 0 words 0 maxulp 0 | card kernel      21.0 us push    0.13 ms pull    0.21 ms | sim    18.701 ms | AGREE 
+000011 _ZN3cub17CUB_300001_SM_8606detail10radix grid 11x1x1 block 384x1x1 mem    1.0 MiB changed    0.5 MiB chunks 19 bad 0 words 0 maxulp 0 | card kernel      20.9 us push    0.13 ms pull    0.21 ms | sim    15.287 ms | AGREE 
+SUMMARY /home/ubuntu/corp/hec/sortKV-cuda/main: agree 12 differ 0 card-nondeterministic 0 failed/skipped 0
+=== zerocopy-cuda
+/tmp/m2_run.sh: line 8: 13364 Segmentation fault      (core dumped) /tmp/m2_replay $prog $cap

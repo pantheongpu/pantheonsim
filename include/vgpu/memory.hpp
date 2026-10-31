@@ -23,6 +23,15 @@
 //    (these diagnostics are a product feature for CI, not just debug aids).
 #pragma once
 
+// The memory manager's own unit (src/core/memory.cpp, compiled outside link-time optimization) inlines the host-map range tests into its
+// hot paths; every other unit keeps the compiler's own choice, so the code of the executors around it is what it was.
+#ifdef VGPU_MEMORY_UNIT
+#define VGPU_MEMORY_UNIT_INLINE [[gnu::always_inline]]
+#else
+#define VGPU_MEMORY_UNIT_INLINE
+#endif
+
+
 #include <type_traits>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -76,11 +85,38 @@ inline constexpr uint64_t kDeviceVaEnd = kDeviceVaBase + kDeviceVaWindows * kDev
 // Whether an address is in some device's window. "At or above the base" alone
 // claimed every higher address -- the stack included -- for the devices.
 inline constexpr bool is_device_va(uint64_t addr) { return addr >= kDeviceVaBase && addr < kDeviceVaEnd; }
+// Spike instrumentation (docs/perf-design/09-host-gpu-spike.md, step A): when a hook is set, every allocation ('A' base size), free ('F' base size) and
+// host-side copy into ('W'), out of ('R') or fill ('Z') of device memory ('W'/'R'/'Z' addr len) is reported. Null: one relaxed load per such call.
+using MemTraceHook = void (*)(char op, uint64_t a, uint64_t b);
+void set_mem_trace(MemTraceHook hook);
+
+// Host-GPU mode with a card copy that outlives a launch (vgpu/host_gpu_rt.hpp, docs/perf-design/09-host-gpu-spike.md section 4): an allocation
+// whose card copy is valid is kept out of the threads' lookup memories, so every access to it takes resolve(), which asks the gate first. The gate
+// brings back what the access needs (a read: the chunks only the card holds) and records what it makes stale (a write). Null gate: nothing here runs.
+class CardGate {
+ public:
+  virtual ~CardGate() = default;
+  // An access of [addr, addr + len) is about to look an allocation up (any access path that is not a thread's remembered allocation).
+  virtual void before_access(uint64_t addr, uint64_t len, bool write) = 0;
+  // The allocation at `base` is about to be freed; UINT64_MAX: all of them.
+  virtual void before_free(uint64_t base) = 0;
+};
 inline constexpr uint64_t kAllocAlign = 256;  // matches CUDA's documented minimum alignment
 inline constexpr uint64_t kChunkSize = 64 * 1024;
 // How many freed allocations stay individually diagnosable. Bounded so that
 // long-running alloc/free loops do not grow memory forever.
 inline constexpr size_t kQuarantineEntries = 4096;
+
+// An atomic that a moved MemoryManager carries over by value (std::atomic is neither copyable nor movable).
+template <class T>
+struct MovableAtomic : std::atomic<T> {
+  using std::atomic<T>::atomic;
+  MovableAtomic(MovableAtomic&& o) noexcept : std::atomic<T>(o.load(std::memory_order_relaxed)) {}
+  MovableAtomic& operator=(MovableAtomic&& o) noexcept {
+    this->store(o.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    return *this;
+  }
+};
 
 class MemoryManager {
  public:
@@ -161,6 +197,14 @@ class MemoryManager {
   // Bulk copies (the H2D/D2H/D2D building blocks).
   void write(uint64_t dst, const void* src, uint64_t len);
   void read(uint64_t src, void* dst, uint64_t len) const;
+  // A device-to-device copy made chunk to chunk, with no staging buffer: what read(src, tmp, len) followed by
+  // dst_mm.write(dst, tmp, len) leaves in the destination, chunk for chunk (a destination chunk that already holds
+  // the bytes being written as one repeated byte stays unmaterialized, as write() leaves it). Returns true having done
+  // the copy, or false having done nothing -- whenever the pair could differ or fail: a fault armed (copies included),
+  // a host mapping in reach of either range, a range not wholly inside one ordinary allocation (freed, mapped,
+  // exported, out of range), or two ranges of one allocation that overlap. The caller then makes the pair of calls,
+  // and meets any error where it would have.
+  bool copy_to(MemoryManager& dst_mm, uint64_t dst, uint64_t src, uint64_t len) const;
   // A kernel's run of `unit`-byte loads or stores (TMA's box rows), done at
   // once: exactly what load_scalar / store_scalar would do element by
   // element, each element still one relaxed atomic access, for a run wholly
@@ -175,7 +219,7 @@ class MemoryManager {
   // The accesses of one warp-wide load or store, made together, for the ordinary
   // case: `count` accesses of `size` bytes, in order. They return true having
   // done every one exactly as load_scalar / store_scalar would, in that order,
-  // or false having done nothing -- whenever any access could differ (a fault
+  // or false having done nothing to memory (load_batch may have written its `out`) -- whenever any access could differ (a fault
   // armed, a host mapping in range, a misaligned access or one outside the
   // allocation the first is in, an address that is no allocation's), in which
   // case the caller makes them one at a time and meets any error where it
@@ -185,6 +229,13 @@ class MemoryManager {
   // would, with `*failed_at` the index of the access that did.
   bool store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
                    size_t* failed_at = nullptr);
+
+  // The same for accesses that all lie in ONE host-mapped buffer (cudaHostAlloc mapped memory, managed memory, IPC): each is the
+  // relaxed atomic access of its width that load_scalar / store_scalar make there (no device fault applies to host memory), one lookup
+  // for the lot. False, having done nothing, for anything else -- no mapping at the first address, an access outside that mapping
+  // or misaligned, a store to a read-only one -- and the caller makes the accesses one at a time.
+  bool host_load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const;
+  bool host_store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals);
 
   // load_batch and store_batch for a caller that does both on the same addresses (a warp's atomics: it loads the words, works out
   // what each lane leaves, stores them): the checks of both -- and the one lookup -- made once. batch_window is true when load_batch
@@ -285,6 +336,13 @@ class MemoryManager {
   // a field not naturally aligned or not wholly inside the one ordinary allocation the record lies in -- and the
   // caller then reads the fields one at a time and meets any error where it would have. One lookup serves the lot.
   bool load_fields(uint64_t addr, const uint8_t* sizes, unsigned n, uint64_t* out) const;
+
+  // The texels of one filtered fetch: `n` (1 to 16) records of `channels` (1 to 4) fields of `size` bytes (1, 2, 4 or 8) end
+  // to end, record i at addrs[i]; out[i * channels + c] is field c of record i, as load_fields would give it. One lookup of
+  // the allocation serves them all, which is the point: a bilinear fetch has four texels, a trilinear one eight. Returns
+  // false, having done nothing, in every case load_fields would for any one of the records, and when the records do not
+  // lie in one ordinary allocation together (the caller then reads them one at a time).
+  bool load_texels(const uint64_t* addrs, unsigned n, uint32_t size, unsigned channels, uint64_t* out) const;
 
   // Sixteen naturally aligned bytes as one access, as a GPU moves a wide load
   // or store (global_load_dwordx4): a kernel on another host thread sees them
@@ -510,9 +568,22 @@ class MemoryManager {
   uint64_t used() const { return used_; }
   uint64_t capacity() const { return capacity_; }
   size_t live_allocations() const { return live_.size(); }
+  // --- card residency (CardGate above) ---
+  void set_card_gate(CardGate* g) { card_gate_.store(g, std::memory_order_release); }
+  // The count of chunks of the allocation at `base` whose card copy is valid, or null if there is no such allocation. Zero keeps the allocation
+  // in the threads' lookup memories; above zero it is out of them. The pointer lives until the allocation is freed (before_free comes first).
+  std::atomic<uint32_t>* card_slot(uint64_t base) const;
+  // How many allocations have a valid card copy: the one load the access paths make before they ask the gate.
+  std::atomic<int32_t>& card_resident_count() { return card_resident_; }
+  // Voids what threads remember of these allocations (call after their slots went above zero).
+  void card_void_lookups(const std::vector<uint64_t>& bases);
+  // Every live allocation's (base, size), in address order: what a host-GPU launch has to make resident.
+  std::vector<std::pair<uint64_t, uint64_t>> live_ranges() const;
 
  private:
   AccessFault* access_fault_ = nullptr;
+  MovableAtomic<CardGate*> card_gate_{nullptr};
+  MovableAtomic<int32_t> card_resident_{0};
   bool any_stuck() const {
     return access_fault_ && access_fault_->stuck_pending &&
            __atomic_load_n(access_fault_->stuck_pending, __ATOMIC_RELAXED);
@@ -530,11 +601,13 @@ class MemoryManager {
     std::unique_ptr<std::atomic<uint8_t*>[]> chunks;
     uint8_t* external = nullptr;
     size_t external_len = 0;
+    std::atomic<uint32_t> card_valid{0};   // chunks whose card copy is valid (host-GPU mode)
 
     Allocation() = default;
     Allocation(Allocation&& o) noexcept
         : size(o.size), chunk_count(o.chunk_count), chunk_capacity(o.chunk_capacity), chunks(std::move(o.chunks)),
           external(o.external), external_len(o.external_len) {
+      card_valid.store(o.card_valid.load(std::memory_order_relaxed), std::memory_order_relaxed);
       o.size = 0;
       o.chunk_count = 0;
       o.chunk_capacity = 0;
@@ -549,6 +622,7 @@ class MemoryManager {
         chunks = std::move(o.chunks);
         external = o.external;
         external_len = o.external_len;
+        card_valid.store(o.card_valid.load(std::memory_order_relaxed), std::memory_order_relaxed);
         o.size = 0;
         o.chunk_count = 0;
         o.chunk_capacity = 0;
@@ -578,6 +652,7 @@ class MemoryManager {
     // A fresh allocation of `bytes`: every chunk untouched.
     void set_up(uint64_t bytes) {
       size = bytes;
+      card_valid.store(0, std::memory_order_relaxed);
       chunk_count = static_cast<size_t>((bytes + kChunkSize - 1) / kChunkSize);
       if (!chunks || chunk_capacity < chunk_count) {
         chunks = std::make_unique<std::atomic<uint8_t*>[]>(chunk_count);
@@ -666,7 +741,19 @@ class MemoryManager {
   // recent lookups or the table; null if there is none or the memory is off.
   const Allocation* find_ordinary(uint64_t addr, uint64_t len, uint64_t* base_out) const;
   uint8_t* hot_location(uint64_t addr, uint32_t size) const;
-  const Allocation* find_ordinary_miss(uint64_t addr, uint64_t len, uint64_t* base_out) const;
+  // True when no address in [base, base + size) can be in a host mapping, by the one range test that covers them all: the span is
+  // wholly in the device windows and no host buffer has ever been mapped inside one. (False says nothing: ask each address.)
+  VGPU_MEMORY_UNIT_INLINE bool host_map_free_span(uint64_t base, uint64_t size) const {
+    return !host_maps_ || (is_device_va(base) && is_device_va(base + size - 1) &&
+                           !host_maps_->in_device_window.load(std::memory_order_relaxed));
+  }
+  // What a lookup found: the allocation (null for none) and its base, returned in registers so the callers keep no address-taken local.
+  struct Found {
+    const Allocation* a;
+    uint64_t base;
+  };
+  // `memory` is the calling thread's lookup memory (found by the caller, which has just looked in it).
+  Found find_ordinary_miss(uint64_t addr, uint64_t len, void* memory) const;
   bool batch_ok(const uint64_t* addrs, size_t count, uint32_t size, bool store, const Allocation** alloc,
                 uint64_t* base) const;
   // The part of batch_ok that is about armed faults, for a load or for a store, and the part that is about the addresses.
@@ -801,11 +888,11 @@ class MemoryManager {
     std::atomic<bool> in_device_window{false};
     // Whether any address from `first` to `last` (inclusive, first <= last) may_contain would not rule out: a range wholly in
     // the device windows (one interval) is ruled out as one address is.
-    bool may_overlap(uint64_t first, uint64_t last) const {
+    VGPU_MEMORY_UNIT_INLINE bool may_overlap(uint64_t first, uint64_t last) const {
       if (is_device_va(first) && is_device_va(last) && !in_device_window.load(std::memory_order_relaxed)) return false;
       return first < hi.load(std::memory_order_relaxed) && last >= lo.load(std::memory_order_relaxed);
     }
-    bool may_contain(uint64_t addr) const {
+    VGPU_MEMORY_UNIT_INLINE bool may_contain(uint64_t addr) const {
       if (is_device_va(addr) && !in_device_window.load(std::memory_order_relaxed)) return false;
       return addr >= lo.load(std::memory_order_relaxed) &&
              addr < hi.load(std::memory_order_relaxed);
@@ -825,6 +912,7 @@ class MemoryManager {
     bool read_only;
   };
   bool lookup_host(uint64_t addr, uint64_t len, HostHit* out) const;
+  bool host_batch_hit(const uint64_t* addrs, size_t count, uint32_t size, bool store, HostHit* h) const;
   static uint64_t fresh_generation();
  public:
   // The cache is on unless VGPU_HOSTMAP_CACHE=0. This switches it for the whole process (a benchmark compares the

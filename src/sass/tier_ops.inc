@@ -862,26 +862,17 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
   const uint32_t* bhi = (ra != kRZ && (op.aux & 1)) ? c.R + (ra + 1u) * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
   const uint64_t imm = static_cast<uint64_t>(op.imm);
-  uint64_t addrs[32];
   constexpr uint64_t kWinEnd = kConstWindow + (uint64_t{1} << 32);
-  tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
-  for (Mask m = ex; m; m &= m - 1) {
-    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-    if (addrs[l] >= kConstWindow && addrs[l] < kWinEnd) {   // nothing is done yet: the interpreter runs the whole instruction
-      c.r->tier_exec_mem(blk, w, *op.ins, ex);
-      return;
-    }
-  }
   MemoryManager& mem = c.r->memory();
   uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
   if (ex && ((ex + (ex & -ex)) & ex) == 0) {
     // Consecutive lanes on consecutive 16-byte pieces (a float4 or an int4 array indexed by the thread): one run of memory, made as
-    // 8-byte pieces like the general access, with the lanes' four words shuffled between it and the four register rows.
+    // 8-byte pieces like the general access, with the lanes' four words shuffled between it and the four register rows. Found on the
+    // registers' rows, before the lanes' addresses are made (they are made below for anything that is not this).
     const unsigned first = static_cast<unsigned>(std::countr_zero(ex)), count = popc(ex);
-    const uint64_t g0 = addrs[first];
-    uint64_t differ = 0;
-    for (unsigned i = 0; i < count; ++i) differ |= addrs[first + i] ^ (g0 + uint64_t{i} * 16);
-    if (differ == 0 && (g0 >= kWinEnd || g0 + uint64_t{count} * 16 - 1 < kConstWindow)) {
+    uint64_t g0;
+    if (exec::sassmem::global_run(blo, bhi, urv + imm, first, count, 16, g0) &&
+        (g0 >= kWinEnd || g0 + uint64_t{count} * 16 - 1 < kConstWindow)) {
       uint32_t buf[32 * 4];
       bool done;
       if (Store) {
@@ -898,6 +889,15 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
         count_run(blk.st, Store, g0, first, count, ex, 16);
         return;
       }
+    }
+  }
+  uint64_t addrs[32];
+  tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    if (addrs[l] >= kConstWindow && addrs[l] < kWinEnd) {   // nothing is done yet: the interpreter runs the whole instruction
+      c.r->tier_exec_mem(blk, w, *op.ins, ex);
+      return;
     }
   }
   for (Mask m = ex; m; m &= m - 1) {
@@ -934,8 +934,6 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
   const uint32_t* bhi = (ra != kRZ && (op.aux & 1)) ? c.R + (ra + 1u) * 32u : nullptr;
   const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
   const uint64_t imm = static_cast<uint64_t>(op.imm);
-  uint64_t addrs[32];
-  tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
   constexpr uint64_t kWinEnd = kConstWindow + (uint64_t{1} << 32);
   const uint32_t* dreg = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
   MemoryManager& mem = c.r->memory();
@@ -950,10 +948,10 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
   if (ex && ((ex + (ex & -ex)) & ex) == 0) {
     const unsigned first = static_cast<unsigned>(std::countr_zero(ex));
     const unsigned count = popc(ex);
-    const uint64_t g0 = addrs[first];
-    uint64_t differ = 0;   // (no short circuit: the lanes' addresses against the run, ORed)
-    for (unsigned i = 0; i < count; ++i) differ |= addrs[first + i] ^ (g0 + uint64_t{i} * bytes);
-    const bool run = differ == 0 && !(g0 >= kConstWindow && g0 < kWinEnd);
+    // Whether the lanes are on consecutive elements is asked of the registers' rows, before the lanes' addresses are made (they are made
+    // below, for an access that is not a run or that the memory manager declines).
+    uint64_t g0;
+    const bool run = exec::sassmem::global_run(blo, bhi, urv + imm, first, count, bytes, g0) && !(g0 >= kConstWindow && g0 < kWinEnd);
     if (run && (g0 + uint64_t{count} * bytes - 1 < kConstWindow || g0 >= kWinEnd)) {
       uint8_t buf[32 * 8];
       bool done = false;
@@ -993,6 +991,46 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
       }
     }
   }
+  uint64_t addrs[32];
+  if (ex == kAll) {
+    // A full warp: the addresses are the batch as they stand (no lane to skip, none to find again when the values go back to the
+    // registers).
+    uint64_t fv[32];
+    const uint64_t nearest = exec::sassmem::full_warp_addresses(blo, bhi, urv + imm, kConstWindow, addrs);
+    if (nearest >= kWinEnd - kConstWindow) {   // (no lane in the constant window)
+      bool done;
+      if (Store) {
+        for (unsigned l = 0; l < 32; ++l) {
+          uint32_t v[2];
+          data(l, v);
+          fv[l] = bytes == 8 ? (static_cast<uint64_t>(v[1]) << 32 | v[0]) : bytes == 4 ? v[0] : (v[0] & ((1u << (8 * bytes)) - 1));
+        }
+        done = mem.store_batch(addrs, 32, bytes, fv);
+      } else {
+        done = mem.load_batch(addrs, 32, bytes, fv);
+        if (done && dreg) {
+          uint32_t* d = c.R + op.dst * 32u;
+          if (bytes == 4) {
+            for (unsigned l = 0; l < 32; ++l) d[l] = static_cast<uint32_t>(fv[l]);
+          } else if (bytes < 4) {
+            for (unsigned l = 0; l < 32; ++l) d[l] = tier_extend(op.b, static_cast<uint32_t>(fv[l]));
+          } else {
+            for (unsigned l = 0; l < 32; ++l) {
+              d[l] = static_cast<uint32_t>(fv[l]);
+              d[32 + l] = static_cast<uint32_t>(fv[l] >> 32);
+            }
+          }
+        }
+      }
+      if (done) {
+        count_access(blk.st, 0, Store, addrs, ex, bytes);
+        return;
+      }
+    }
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
+  tier_global_addresses(blo, bhi, urv + imm, ex, addrs);
   // The lanes' accesses together (MemoryManager::load_batch / store_batch).
   uint64_t fa[32], fv[32];
   unsigned lane_of[32], cnt = 0;
@@ -1057,8 +1095,21 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
     addrs[l] = off;
     window.add(off, blk.rank);
   };
-  if (ex == kAll) {   // a full warp: a counted loop
-    for (unsigned l = 0; l < 32; ++l) lane_address(l);
+  if (ex == kAll) {   // a full warp: the offsets as 32-bit words (an offset is the low 32 bits of the sum, so of the parts' low halves), then the window check
+    alignas(32) uint32_t offs[32];
+    const uint32_t add32 = static_cast<uint32_t>(urv + imm);
+    if (!base) {
+      for (unsigned l = 0; l < 32; ++l) offs[l] = add32;
+    } else if (!stride) {
+      for (unsigned l = 0; l < 32; ++l) offs[l] = base[l] + add32;
+    } else if (std::has_single_bit(stride)) {
+      const unsigned sh = static_cast<unsigned>(std::countr_zero(stride));
+      for (unsigned l = 0; l < 32; ++l) offs[l] = (base[l] << sh) + add32;
+    } else {
+      for (unsigned l = 0; l < 32; ++l) offs[l] = base[l] * stride + add32;
+    }
+    window.add_warp(offs, blk.rank);
+    for (unsigned l = 0; l < 32; ++l) addrs[l] = offs[l];
   } else {
     for (unsigned l = 0; l < 32; ++l) addrs[l] = 0;   // (the lanes that do not run read as zero, as the counting functions find them)
     for (Mask m = ex; m; m &= m - 1) lane_address(static_cast<unsigned>(std::countr_zero(m)));
@@ -1151,7 +1202,7 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
       }
     }
   }
-  count_access(blk.st, 1, Store, addrs, ex, bytes);
+  count_shared_access(blk.st, Store, addrs, ex, bytes);
 }
 
 // Local memory: each lane's window of the warp's array, when every active lane's access is inside the thread's frame.
@@ -1167,16 +1218,28 @@ static void h_local(void* vc, const tier::MOp& op, Mask ex) {
   const uint64_t imm = static_cast<uint64_t>(op.imm);
   uint64_t addrs[32];
   exec::LocalWindowCheck window;
-  const auto lane_address = [&](unsigned l) {
-    const uint64_t off = static_cast<uint32_t>((base ? base[l] : 0) + urv + imm);
-    addrs[l] = off;
-    window.add(off);
-  };
-  if (ex == kAll) {   // a full warp: a counted loop
-    for (unsigned l = 0; l < 32; ++l) lane_address(l);
+  const uint32_t add32 = static_cast<uint32_t>(urv + imm);   // (an offset is the low 32 bits of the sum, so of the parts' low halves)
+  if (ex == kAll) {   // a full warp: a counted loop on 32-bit offsets
+    uint32_t highest = 0;
+    if (base) {
+      for (unsigned l = 0; l < 32; ++l) {
+        const uint32_t off = base[l] + add32;
+        addrs[l] = off;
+        highest = std::max(highest, off);
+      }
+    } else {
+      for (unsigned l = 0; l < 32; ++l) addrs[l] = add32;
+      highest = add32;
+    }
+    window.highest = highest;
   } else {
     for (unsigned l = 0; l < 32; ++l) addrs[l] = 0;   // (the lanes that do not run read as zero, as the counting functions find them)
-    for (Mask m = ex; m; m &= m - 1) lane_address(static_cast<unsigned>(std::countr_zero(m)));
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      const uint32_t off = (base ? base[l] : 0u) + add32;
+      addrs[l] = off;
+      window.add(off);
+    }
   }
   const bool inside = window.inside(w.local_size, bytes, ex != 0);
   if (!inside) {
@@ -1186,10 +1249,12 @@ static void h_local(void* vc, const tier::MOp& op, Mask ex) {
   if (w.local.empty()) w.local.assign(size_t{w.local_size} * 32, 0);
   uint32_t* d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
   const unsigned words = std::max(1u, bytes / 4);
+  uint8_t* const frames = w.local.data();   // (read once: the stores to the registers could change what the compiler thinks they are)
+  const size_t frame = w.local_size;
   const bool moved = with_lane_width(bytes, [&](auto width) {
     constexpr unsigned B = decltype(width)::value;
     const auto lane = [&](unsigned l) {
-      uint8_t* at = &w.local[size_t{l} * w.local_size + addrs[l]];
+      uint8_t* at = frames + size_t{l} * frame + addrs[l];
       if (Store) {
         store_lane_bytes<B>(at, [&](unsigned i) -> uint32_t { return d ? d[32 * i + l] : 0u; });
       } else if (d) {
@@ -1241,10 +1306,17 @@ TIER_HANDLER(h_plop3) {
   tier_setp(c, op.dst2, ex, r1);
 }
 
+// FCHK: whether a / b needs the division's slow path. Always: the slow path is exact for every input (exec_float's rule).
+TIER_HANDLER(h_fchk) {
+  TIER_PRELUDE
+  tier_setp(c, op.dst, ex, kAll);
+}
+
 TIER_HANDLER(h_s2r) {
   TIER_PRELUDE
   if (op.dst == tier::kNoReg) return;
   uint32_t* d = c.R + op.dst * 32u;
+  if (c.r->tier_sreg_fill(*c.blk, *c.w, op.a, d, ex)) return;
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
     d[l] = c.r->tier_sreg(*c.blk, *c.w, op.a, l);
@@ -1380,7 +1452,11 @@ TIER_HANDLER(h_vote) {
   const bool r = op.a == 0 ? all : op.a == 1 ? any : eq;
   if (op.dst != tier::kNoReg) {
     uint32_t* d = c.R + op.dst * 32u;
-    for (Mask m = ex; m; m &= m - 1) d[std::countr_zero(m)] = ballot;
+    if (ex == kAll) {
+      for (unsigned l = 0; l < 32; ++l) d[l] = ballot;   // (a full warp: eight vector stores, not a loop over the lanes' bits)
+    } else {
+      for (Mask m = ex; m; m &= m - 1) d[std::countr_zero(m)] = ballot;
+    }
   }
   tier_setp(c, op.dst2, ex, r ? kAll : 0);
 }
@@ -1516,6 +1592,155 @@ TIER_HANDLER(h_hmma) {   // exec_mma's kernel call: the same kernel, and the sam
     for (unsigned s = 0; s < c_regs; ++s) tier_store(c, static_cast<uint16_t>(op.dst + s), ex, out + s * 32);
 }
 
+// LDGSTS (cp.async without .ZFILL): each executing lane reads `bytes` (4, 8 or 16) of global memory and writes them at its shared address; a lane
+// whose predicate operand is false writes zeros. exec_mem's lane loop does a mem_read and a mem_write (each a switch and a bounds check, out of line)
+// per lane; here the global reads are one batch (load_batch, in the 8-byte pieces a 16-byte read is) and the shared writes are lane copies, in lane order
+// (the last of lanes on one address wins, as there), once every shared access is known to lie inside the block's own array. A batch the memory
+// manager declines (a fault, a misaligned or host-mapped access) and a shared access outside the array are exec_mem's, which has not been started.
+TIER_HANDLER(h_ldgsts) {
+  const TCtx& c = *static_cast<const TCtx*>(vc);
+  Warp& w = *c.w;
+  Block& blk = *c.blk;
+  const unsigned bytes = op.a;
+  const unsigned rs = op.s[0].off, rg = op.s[1].off;
+  const uint32_t* sreg = rs != kRZ ? c.R + rs * 32u : nullptr;
+  const uint32_t* glo = rg != kRZ ? c.R + rg * 32u : nullptr;
+  const uint32_t* ghi = rg != kRZ ? c.R + (rg + 1u) * 32u : nullptr;
+  const uint32_t sadd = op.b;
+  uint64_t saddr[32], gaddr[32];
+  exec::SharedWindowCheck window;
+  for (unsigned l = 0; l < 32; ++l) saddr[l] = 0;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    const uint64_t off = static_cast<uint32_t>((sreg ? sreg[l] : 0u) + sadd);
+    saddr[l] = off;
+    window.add(off, blk.rank);
+  }
+  if (!window.inside(blk.shared.size(), bytes, ex != 0)) {
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
+  tier_global_addresses(glo, ghi, static_cast<uint64_t>(op.imm), ex, gaddr);
+  const Mask reads = (op.aux & 1) ? (ex & tier_pmask(c, op.p)) : ex;
+  uint64_t fa[32], lo[32], hi[32];
+  unsigned n = 0;
+  for (Mask m = reads; m; m &= m - 1) fa[n++] = gaddr[std::countr_zero(m)];
+  MemoryManager& mem = c.r->memory();
+  if (n) {
+    bool ok;
+    if (bytes == 16) {
+      uint64_t fb[32];
+      for (unsigned i = 0; i < n; ++i) fb[i] = fa[i] + 8;
+      ok = mem.load_batch(fa, n, 8, lo) && mem.load_batch(fb, n, 8, hi);
+    } else {
+      ok = mem.load_batch(fa, n, bytes, lo);
+    }
+    if (!ok) {
+      c.r->tier_exec_mem(blk, w, *op.ins, ex);
+      return;
+    }
+  }
+  w.idle_yields = 0;   // a store is progress (Runner::mem_write)
+  uint8_t* const sh = blk.shared.data();
+  unsigned i = 0;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    uint8_t* const at = sh + (saddr[l] & 0xffffff);
+    const bool read = (reads >> l) & 1;
+    const uint64_t a = read ? lo[i] : 0, b = read ? (bytes == 16 ? hi[i] : 0) : 0;
+    i += read;
+    if (bytes == 4) {
+      const uint32_t v = static_cast<uint32_t>(a);
+      std::memcpy(at, &v, 4);
+    } else if (bytes == 8) {
+      std::memcpy(at, &a, 8);
+    } else {
+      std::memcpy(at, &a, 8);
+      std::memcpy(at + 8, &b, 8);
+    }
+  }
+  count_access(blk.st, 0, false, gaddr, ex, bytes);
+  count_shared_access(blk.st, true, saddr, ex, bytes);
+}
+
+// LD and ST, whose 64-bit addresses name a window of the executor's address space as well as global memory (Runner::classify). The interpreter classifies
+// each lane, moves it by its window's rule and counts the warp as the LAST lane's window says; the cases the tier takes are the ones where that is one
+// rule: every active lane in the shared window (the lanes move as LDS/STS do, and are counted as shared accesses of the offsets), or no lane in
+// any window (plain global memory, which h_global makes as LDG/STG: the interpreter's per-lane mem_read/mem_write and the batch give the same bytes
+// and the same counters). A mix, a local, parameter or constant address, an offset outside the block's array and a 32-byte access are exec_mem's.
+constexpr uint64_t kWindowsEnd = 7ull << 32;   // the windows are the 2^32-byte ranges at kConstWindow + 0 .. 6 << 32 (const, 3 unused, param, shared, local)
+template <bool Store>
+static void h_generic(void* vc, const tier::MOp& op, Mask ex) {
+  const TCtx& c = *static_cast<const TCtx*>(vc);
+  Warp& w = *c.w;
+  Block& blk = *c.blk;
+  const unsigned bytes = op.a;
+  const unsigned ra = op.s[0].off;
+  const uint32_t* blo = ra != kRZ ? c.R + ra * 32u : nullptr;
+  const uint32_t* bhi = (ra != kRZ && (op.aux & 1)) ? c.R + (ra + 1u) * 32u : nullptr;
+  const uint64_t urv = op.s[1].off != ~0u ? w.ur[op.s[1].off] : 0;
+  uint64_t addrs[32];
+  tier_global_addresses(blo, bhi, urv + static_cast<uint64_t>(op.imm), ex, addrs);
+  unsigned in_shared = 0, in_window = 0;
+  for (Mask m = ex; m; m &= m - 1) {
+    const uint64_t g = addrs[std::countr_zero(m)];
+    in_shared += (g - kSharedWindow) < (uint64_t{1} << 32);
+    in_window += (g - kConstWindow) < kWindowsEnd;
+  }
+  if (ex && in_window == 0) {
+    h_global<Store>(vc, op, ex);
+    return;
+  }
+  if (!ex || in_shared != static_cast<unsigned>(popc(ex)) || !(bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16)) {
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
+  exec::SharedWindowCheck window;
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    addrs[l] -= kSharedWindow;   // the offset in the window (< 2^32), as classify gives it
+    window.add(addrs[l], blk.rank);
+  }
+  if (!window.inside(blk.shared.size(), bytes, true)) {
+    c.r->tier_exec_mem(blk, w, *op.ins, ex);
+    return;
+  }
+  if constexpr (Store) w.idle_yields = 0;   // a store is progress (Runner::mem_write)
+  uint8_t* const sh = blk.shared.data();
+  uint32_t* const d = op.dst == tier::kNoReg ? nullptr : c.R + op.dst * 32u;
+  const unsigned words = std::max(1u, bytes / 4);
+  const bool moved = with_lane_width(bytes, [&](auto width) {
+    constexpr unsigned B = decltype(width)::value;
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      uint8_t* const at = sh + (addrs[l] & 0xffffff);
+      if (Store) {
+        store_lane_bytes<B>(at, [&](unsigned i) -> uint32_t { return d ? d[32 * i + l] : 0u; });
+      } else if (d) {
+        if constexpr (B == 4) d[l] = load_lane_word<B>(at);
+        else if constexpr (B < 4) d[l] = tier_extend(op.b, load_lane_word<B>(at));
+        else
+          for (unsigned i = 0; i < B / 4; ++i) d[32 * i + l] = load_lane_word<B>(at, i);
+      }
+    }
+  });
+  if (!moved) {   // (unreachable: the widths are those of with_lane_width)
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      uint8_t* const at = sh + (addrs[l] & 0xffffff);
+      uint32_t v[4] = {};
+      if (Store) {
+        for (unsigned i = 0; i < words; ++i) v[i] = d ? d[32 * i + l] : 0;
+        std::memcpy(at, v, bytes);
+      } else if (d) {
+        std::memcpy(v, at, bytes);
+        for (unsigned i = 0; i < words; ++i) d[32 * i + l] = v[i];
+      }
+    }
+  }
+  count_shared_access(blk.st, Store, addrs, ex, bytes);
+}
+
 tier::MOp::Fn tier_handler_for(tier::Form f) {
   using F = tier::Form;
   switch (f) {
@@ -1558,9 +1783,13 @@ tier::MOp::Fn tier_handler_for(tier::Form f) {
     case F::Shfl: return &h_shfl;
     case F::Vote: return &h_vote;
     case F::Hmma: return &h_hmma;
+    case F::Ldgsts: return &h_ldgsts;
+    case F::Ld: return &h_generic<false>;
+    case F::St: return &h_generic<true>;
     case F::Match: return &h_match;
     case F::Imma: return &h_imma;
     case F::Atom: return &h_atom;
+    case F::Fchk: return &h_fchk;
     case F::Ldsm: return &h_ldsm;
     case F::Umov: return &h_umov;
     case F::Uldc: return &h_uldc;
@@ -1703,11 +1932,11 @@ void tier_add_total(uint64_t n) { tier_stats().total.fetch_add(n, std::memory_or
 }
 
 // The lanes of `group` get program counter `v` (a whole warp: 32 stores the compiler turns into vector ones).
-inline void tier_set_pcs(Warp& w, Mask group, uint64_t v) {
+[[gnu::aligned(64)]] inline void tier_set_pcs(Warp& w, Mask group, uint64_t v) {
   if (group == kAll) {
     for (unsigned l = 0; l < 32; ++l) w.pc[l] = v;
   } else {
-    for (Mask m = group; m; m &= m - 1) w.pc[std::countr_zero(m)] = v;
+    exec::sasslanes::set_pcs_partial(w.pc, group, v);
   }
 }
 
@@ -1851,6 +2080,93 @@ struct JitSampler {
   }
 };
 
+// CALL, RET and WARPSYNC as they end a run (tier_run_t calls this; res 0: not taken here, the interpreter runs it -- a call of a function VirtualGPU provides).
+// `moved`: the run was longer than one instruction, so the lanes' program counters are still those of its start.
+[[gnu::noinline]] Runner::CtlOut Runner::tier_ctl(Block& blk, Warp& w, const tier::MOp& last, Mask group, unsigned glanes, uint64_t here, bool moved,
+                                                 const Code& code) {
+  uint64_t at = 0;
+  bool all_at = false;
+  exec::LaunchStats& st = blk.st;
+  if (last.form == tier::Form::Call) {
+    // exec_control's CALL.REL for a fixed target: a function VirtualGPU provides (a builtin at its magic address) is the interpreter's.
+    const uint64_t target = code.base + static_cast<uint64_t>(last.imm);
+    if (!(m_.builtins.empty() || target < m_.builtins.begin()->first || m_.builtins.find(target) == m_.builtins.end())) return {0, 0};
+    // The lanes that run it go to the target, the others on to the next instruction.
+    const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
+    const unsigned lanes = ex == group ? glanes : popc(ex);
+    ++st.instructions;
+    st.thread_instructions += lanes;
+    st.inst_by_class[last.cls] += lanes;
+    if (ex == group || !ex) {
+      at = ex ? target : here + 16;
+      tier_set_pcs(w, group, at);
+      all_at = true;
+    } else {
+      exec::sasslanes::select_pcs(w.pc, group, ex, target, here + 16);
+    }
+    if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::CALL)].fetch_add(1, std::memory_order_relaxed);
+    return {at, all_at ? 2u : 1u};
+  }
+  if (last.form == tier::Form::Ret) {
+    // exec_control's RET: the lanes that run it go to the address in the register pair (a section-relative offset, or an absolute code
+    // address a relocation wrote), the others on to the next instruction.
+    const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
+    const unsigned lanes = ex == group ? glanes : popc(ex);
+    ++st.instructions;
+    st.thread_instructions += lanes;
+    st.inst_by_class[last.cls] += lanes;
+    const unsigned r = last.dst;
+    uint64_t first_at = 0;
+    bool same = ex == group;
+    for (Mask m = group; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+      uint64_t t = here + 16;
+      if ((ex >> l) & 1) {
+        const uint32_t lo = w.reg(r, l), hi = r + 1 < w.nregs ? w.reg(r + 1, l) : 0;
+        t = hi == static_cast<uint32_t>(kCodeBase >> 32) ? (uint64_t{hi} << 32 | lo) : code.base + lo;
+      }
+      if (m == group) first_at = t;
+      same = same && t == first_at;
+      w.pc[l] = t;
+    }
+    if (same) {
+      at = first_at;
+      all_at = true;
+    }
+    if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::RET)].fetch_add(1, std::memory_order_relaxed);
+    return {at, all_at ? 2u : 1u};
+  }
+  // exec_control's WARPSYNC: the lanes that run it wait there for the lanes their mask names (a thread its own mask leaves out may not
+  // run it), the others go on; then the release (release_warpsync).
+  const Mask ex = last.unguarded ? group : tier_guard(w, *last.ins, group);
+  const unsigned lanes = ex == group ? glanes : popc(ex);
+  ++st.instructions;
+  st.thread_instructions += lanes;
+  st.inst_by_class[last.cls] += lanes;
+  if (moved) tier_set_pcs(w, group, here);
+  const Instr& wi = *last.ins;
+  // The mask is the same for every lane unless it is a register (a constant, a constant-bank word or a uniform register is read once).
+  const bool per_lane = !last.aux && wi.src[last.a].kind == Kind::Reg;
+  uint32_t mask_all = ~Mask{0};
+  if (ex && !last.aux && !per_lane) mask_all = read32(w, wi.src[last.a], static_cast<unsigned>(std::countr_zero(ex)));
+  for (Mask m = group; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    if ((ex >> l) & 1) {
+      w.waiting |= Mask{1} << l;
+      w.wait_kind[l] = Wait::WarpSync;
+      w.wait_arg[l] = per_lane ? read32(w, wi.src[last.a], l) : mask_all;
+      if (!((w.wait_arg[l] >> l) & 1u))
+        throw Error(Err::IllegalInstruction, "SASS kernel " + k_.name + ": WARPSYNC run by lane " + std::to_string(l) +
+                                                 ", which its mask " + std::to_string(w.wait_arg[l]) + " leaves out");
+    } else {
+      w.pc[l] += 16;
+    }
+  }
+  release_warpsync(w);
+  if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::WARPSYNC)].fetch_add(1, std::memory_order_relaxed);
+  return {at, all_at ? 2u : 1u};
+}
+
 template <bool Jit>
 bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Code& code, const tier::Program& tp) {
   TCtx c{&w, &blk, this, w.r.data(), bank0_.data(), bank0_.size(), tp.pool.data(), &simd::kernels()};
@@ -1875,6 +2191,8 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   size_t idx = first;
   const unsigned glanes = popc(group);
   const tier::MOp* cur = &ops[idx];
+  bool all_at = false;   // the run ended by setting every lane of the group to one address, `at` (the chain below then knows where they stand)
+  uint64_t at = 0;
   try {
     for (unsigned n = 0;; ++n) {
       // Tier 2: a region that starts here, compiled, is run in place of its ops (jit_run_region says how, and when not).
@@ -1968,13 +2286,11 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       if (ex && ex != group) ++st.divergent_branches;
       const uint64_t target = code.base + static_cast<uint64_t>(last.imm);
       if (take == group || !take) {
-        tier_set_pcs(w, group, take ? target : here + 16);
+        at = take ? target : here + 16;
+        tier_set_pcs(w, group, at);
+        all_at = true;
       } else {
-        const uint64_t next = here + 16;   // (a select without a branch: the lanes that take it are unpredictable)
-        for (Mask m = group; m; m &= m - 1) {
-          const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-          w.pc[l] = next ^ ((target ^ next) & (uint64_t{0} - ((take >> l) & 1)));
-        }
+        exec::sasslanes::select_pcs(w.pc, group, take, target, here + 16);   // (a select without a branch: the lanes that take it are unpredictable)
       }
       if (take && last.imm <= static_cast<int64_t>(last.ins->pc) && (w.runnable() & ~group)) {
         if (++w.spins >= 64) {
@@ -1993,7 +2309,9 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       st.inst_by_class[last.cls] += lanes;
       if (last.ins->tensor) ++st.tensor_instructions;
       if (ex) last.fn(&c, last, ex);
-      tier_set_pcs(w, group, here + 16);
+      at = here + 16;
+      tier_set_pcs(w, group, at);
+      all_at = true;
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(last.ins->op)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Bssy || last.form == tier::Form::Nop) {
       // These leave the program counters to execute()'s advance: every lane of the group goes on to the next address.
@@ -2007,7 +2325,9 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
         w.b[last.dst] |= ex;
         w.bssy_stamp[last.dst & 15] = ++blk.bssy_clock;
       }
-      tier_set_pcs(w, group, here + 16);
+      at = here + 16;
+      tier_set_pcs(w, group, at);
+      all_at = true;
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(last.ins->op)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Yield) {
       // exec_control's YIELD: the group that yielded gives way (the lowest address's group is the one that ran), whatever its guard says.
@@ -2095,6 +2415,18 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       for (Mask m = group & ~ex; m; m &= m - 1) w.pc[std::countr_zero(m)] += 16;
       tier_release_bsync(w, x);
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::BSYNC)].fetch_add(1, std::memory_order_relaxed);
+    } else if (last.form == tier::Form::Call || last.form == tier::Form::Ret || last.form == tier::Form::Warpsync) {
+      // CALL, RET and WARPSYNC (a function of their own: they are rare beside the straight-line work, and the loop is placement-sensitive;
+      // what it hands back is two registers, so `at` and `all_at` stay where the loop keeps them)
+      const CtlOut ctl = tier_ctl(blk, w, last, group, glanes, here, idx != first, code);
+      if (ctl.res == 2) {
+        at = ctl.at;
+        all_at = true;
+      } else if (!ctl.res) {
+        if (tier_stats_) [[unlikely]] tier_note_fallback(*last.ins, true);
+        if (idx != first) tier_set_pcs(w, group, here);
+        execute(blk, w, *ops[idx].ins, group);
+      }
     } else {
       if (tier_stats_) [[unlikely]] tier_note_fallback(*last.ins, true);
       if (idx != first) tier_set_pcs(w, group, here);
@@ -2113,7 +2445,15 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   const Mask run = w.runnable();
   if (!run) return true;
   uint64_t lo;
-  const Mask next = exec::sasslanes::pick_group(w.pc, run, lo);   // the group at the lowest address, which is what step_warp picks when nothing else is asked of it
+  Mask next;
+  // The group at the lowest address, which is what step_warp picks when nothing else is asked of it. When the run set the group to one address
+  // and no runnable lane stands outside it, that is the runnable lanes at that address, and the 32 addresses need not be read back.
+  if (all_at && (run & ~group) == 0) {
+    next = run;
+    lo = at;
+  } else {
+    next = exec::sasslanes::pick_group(w.pc, run, lo);
+  }
   if (lo - code.base >= 16 * static_cast<uint64_t>(count) || ((lo - code.base) & 15)) return true;
   --w.budget;
   ++w.extra;

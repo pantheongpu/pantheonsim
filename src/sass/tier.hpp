@@ -131,6 +131,13 @@ enum class Form : uint8_t {
   Ldsm,      // LDSM, the 16-bit forms (ldmatrix .M88, .MT88): ends a run, has a handler
   Imma,      // IMMA (dense, 8- or 4-bit elements into s32, plain or .SAT): ends a run, has a handler
   Atom,      // ATOMG, ATOM, ATOMS, RED: ends a run; the handler is exec_mem, which batches a warp's atomics
+  Fchk,      // FCHK into a predicate: the division's slow path is always taken (exec_float), so the predicate is true on every executing lane
+  Call,      // CALL.REL (a fixed target in this section, not a function VirtualGPU provides): ends a run, run by tier_run itself
+  Ret,       // RET.REL: ends a run, run by tier_run itself
+  Warpsync,  // WARPSYNC: ends a run, run by tier_run itself (the release is the interpreter's: Runner::release_warpsync)
+  Ldgsts,    // LDGSTS (cp.async) of 4, 8 or 16 bytes without .ZFILL: ends a run, has a handler
+  Ld,        // LD (generic address) of 1 to 16 bytes: the lanes all in the shared window, or none in any window; anything else is the interpreter's
+  St,        // ST (generic address): as Ld
   Count_,
 };
 const char* form_name(Form f);

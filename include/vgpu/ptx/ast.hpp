@@ -1274,10 +1274,35 @@ struct OpLibm { LibmFn fn = LibmFn::Exp; Type ty; bool ftz = false; Reg dst; Ope
 enum class WgKind { Reduce, InclusiveScan, ExclusiveScan, Broadcast };
 struct OpWgCollective { WgKind kind = WgKind::Reduce; ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand a; Operand b; };
 
+// A cooperative-matrix multiply-add over one warp, for a frontend whose matrices live in the lanes' registers (PantheonZE's
+// SPV_KHR_cooperative_matrix lowering; PantheonSim's own PTX frontends do not make it). D = C + A * B on an M x K, K x N, M x N tile in one
+// instruction instead of M * K sub-group shuffles and M * K * N / W multiply-adds.
+//
+// Where element (r, c) of a rows x cols matrix lives, for a warp of W lanes:
+//   column rule   (cols % W == 0)        lane c % W, register r * (cols / W) + c / W
+//   element rule  (otherwise, rows * cols % W == 0)   lane e % W, register e / W, with e = r * cols + c
+// B, C and D must follow the column rule (N a multiple of W); A follows whichever applies to K. `a`, `b`, `c` and `d` are the registers
+// of those layouts, in register order, one element in the low bits of each (halves and 8-bit integers in the low 16 / 8 bits of a 32-bit
+// register). Every lane of the warp must be active (the instruction is convergent; a partial mask is a fault).
+//
+// The arithmetic is fixed, so the result does not depend on the host: every D element starts from its C element and takes the products in
+// increasing k, one correctly rounded fused multiply-add each in f32 (float inputs: F16 and BF16 widen exactly; an F16 accumulator
+// widens first and is rounded to nearest even once at the end) or one wrapping 32-bit multiply-add (integer inputs). NaN payloads and
+// infinities follow the host's fma, not a card's. A card's tensor unit orders and rounds differently; this is the order of PantheonZE's
+// per-instruction lowering, which this instruction replaces bit for bit.
+enum class CoopElem : uint8_t { F16, BF16, F32, S8, U8, S16, U16, S32, U32 };
+struct OpCoopMma {
+  uint32_t m = 8, n = 16, k = 16;
+  CoopElem a_type = CoopElem::F16, b_type = CoopElem::F16;   // F16, BF16 (the bits of a bfloat16), F32 or an integer type
+  CoopElem c_type = CoopElem::F32;                           // the accumulator and result: F16 or F32 with float inputs, S32 or U32 with integers
+  std::vector<Reg> d, a, b, c;
+};
+#define VGPU_PTX_HAS_COOP_MMA 1
+
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpTxq, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpIsTypep, OpStBulk, OpStack,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBrx, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy, OpSpCompress, OpSpDecompress, OpPackedInt, OpF8x4Arith, OpLibm, OpWgCollective>;
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy, OpSpCompress, OpSpDecompress, OpPackedInt, OpF8x4Arith, OpLibm, OpWgCollective, OpCoopMma>;
 
 // An instruction of the commonest, simplest forms, decoded once at parse time
 // for the interpreter's inner loop. The general Instr is ~1 KB of variant and

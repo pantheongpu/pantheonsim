@@ -351,7 +351,8 @@ struct State {
   std::map<int, std::set<uintptr_t>> pool_unsynced;
   std::map<int, MemPool*> default_pool;   // by device
   std::map<int, MemPool*> current_pool;
-  bool initialized = false;
+  // Set after `rt` is made, with release: sticky_error() reads the machine's fault without the lock once it is true.
+  std::atomic<bool> initialized{false};
 };
 
 State& st() {
@@ -436,7 +437,7 @@ void ensure_init(State& s) {
   if (s.initialized) return;
   // One machine for both CUDA libraries (shared_runtime.cpp).
   s.rt = vgpu::runtime::shared_runtime();
-  s.initialized = true;
+  s.initialized.store(true, std::memory_order_release);
   init_driver_shim_if_loaded();
   // A program that only uses the runtime API never reaches cuInit, and a
   // profiler attached to it would otherwise never be invited in.
@@ -473,6 +474,8 @@ thread_local cudaError_t g_async_error = cudaSuccess;
 // kernel dead.
 cudaError_t sticky_error() {
   State& s = st();
+  // Once the machine exists its fault is an atomic: no lock to ask.
+  if (s.initialized.load(std::memory_order_acquire)) return static_cast<cudaError_t>(s.rt->context_fault());
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   try {
     ensure_init(s);
@@ -2659,9 +2662,12 @@ static cudaError_t cudaMemcpyPeer_body(void* dst, int dstDevice, const void* src
       return cudaErrorInvalidDevice;
     if (count == 0) return cudaSuccess;
     const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
-    std::vector<uint8_t> tmp(count);
-    s.rt->device(srcDevice).memory().read(reinterpret_cast<uint64_t>(src), tmp.data(), count);
-    s.rt->device(dstDevice).memory().write(reinterpret_cast<uint64_t>(dst), tmp.data(), count);
+    if (!s.rt->device(srcDevice).memory().copy_to(s.rt->device(dstDevice).memory(), reinterpret_cast<uint64_t>(dst),
+                                                  reinterpret_cast<uint64_t>(src), count)) {
+      std::vector<uint8_t> tmp(count);
+      s.rt->device(srcDevice).memory().read(reinterpret_cast<uint64_t>(src), tmp.data(), count);
+      s.rt->device(dstDevice).memory().write(reinterpret_cast<uint64_t>(dst), tmp.data(), count);
+    }
     if (vgpu::profiling::enabled()) {
       if (srcDevice != dstDevice)
         profile_cross_device_copy(s, count, srcDevice, dstDevice, t_stream_ctx.async, t_stream_ctx.stream, t0,
@@ -2823,6 +2829,8 @@ static vgpu::profiling::MemKind profiled_memory_kind(State& s, const void* p, bo
   return MemKind::Pageable;
 }
 
+constexpr size_t kD2dFrameBytes = 16384;
+
 static cudaError_t cudaMemcpy_body(void* dst, const void* src, size_t count, cudaMemcpyKind kind) {
   return guard("cudaMemcpy", [&](State& s) {
     if (vgpu::faults::should_fail(vgpu::faults::Op::Memcpy)) {
@@ -2880,9 +2888,21 @@ static cudaError_t cudaMemcpy_body(void* dst, const void* src, size_t count, cud
         smm.read(reinterpret_cast<uint64_t>(src), dst, count);
         break;
       case cudaMemcpyDeviceToDevice: {
-        std::vector<uint8_t> tmp(count);
-        smm.read(reinterpret_cast<uint64_t>(src), tmp.data(), count);
-        dmm.write(reinterpret_cast<uint64_t>(dst), tmp.data(), count);
+        // A large copy between ordinary allocations goes chunk to chunk (MemoryManager::copy_to), with no buffer.
+        // Otherwise through a buffer, so an overlapping copy reads all of the source first. Small copies use the frame
+        // (no allocation, no zero-fill: the read fills every byte); a large one allocates uninitialised.
+        if (count > kD2dFrameBytes &&
+            smm.copy_to(dmm, reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(src), count))
+          break;
+        uint8_t small[kD2dFrameBytes];
+        std::unique_ptr<uint8_t[]> big;
+        uint8_t* tmp = small;
+        if (count > sizeof small) {
+          big.reset(new uint8_t[count]);
+          tmp = big.get();
+        }
+        smm.read(reinterpret_cast<uint64_t>(src), tmp, count);
+        dmm.write(reinterpret_cast<uint64_t>(dst), tmp, count);
         break;
       }
       case cudaMemcpyHostToHost:

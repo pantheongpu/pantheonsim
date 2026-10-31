@@ -47,6 +47,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 KERNEL_SRC = os.path.join(HERE, "kernels", "bench_amd.hip")
+# The probe workloads (instruction classes the main program leaves out: DPP, permutes, 16-bit, VOPD, 64-bit ...) are a
+# second program with its own cache key, so a change to one program never invalidates the other's cached binaries.
+PROBE_SRC = os.path.join(HERE, "kernels", "bench_amd_probe.hip")
 EXPECTED_DIR = os.path.join(HERE, "expected")
 
 
@@ -106,6 +109,27 @@ WORKLOADS = {
     "graph": ("api", "a captured graph of four kernel nodes, launched in a loop", BOTH),
     "startup": ("api", "one launch of a trivial kernel; read the whole-process wall time", BOTH),
 }
+# The probe workloads (program bench_amd_probe, argument without the p_): name -> (what it measures, targets)
+PROBE_T = ("mi300x", "rx6800", "rx7900xtx", "rx9070xt")
+PROBES = {
+    "p_dpp": ("quad_perm, row_shl/shr/ror, row_mirror, row_half_mirror DPP moves with row and bank masks and bound_ctrl", PROBE_T),
+    "p_dpp_arch": ("the DPP forms of one family: wave_shl/rol/shr/ror and row_bcast (CDNA), row_share and row_xmask (RDNA)", PROBE_T),
+    "p_dpp_scan": ("DPP folded into v_add/v_max/v_and (row_shr scan, mirror), the compiler's combined forms", PROBE_T),
+    "p_perm": ("ds_swizzle_b32 (bit-mask and quad-perm modes), ds_bpermute_b32, ds_permute_b32", PROBE_T),
+    "p_permlane": ("v_permlane16_b32 / v_permlanex16_b32 (RDNA)", ("rx6800", "rx7900xtx", "rx9070xt")),
+    "p_lane": ("v_readfirstlane_b32, v_readlane_b32, v_writelane_b32", PROBE_T),
+    "p_pk16": ("packed 16-bit integer (v_pk_mad_u16, v_pk_add_u16, v_pk_max/min_u16, shifts) and scalar 16-bit (v_add_u16, v_mul_lo_u16, v_max_i16)", PROBE_T),
+    "p_pkf16": ("packed half precision: v_pk_add_f16, v_pk_mul_f16, v_pk_fma_f16, v_pk_max_f16", PROBE_T),
+    "p_sdwa": ("sub-dword operand selects (SDWA on GCN/RDNA2) and byte/word extraction", PROBE_T),
+    "p_vopd": ("eight independent f32 chains (dual-issue VOPD pairs on RDNA3/4, v_pk_*_f32 on CDNA3)", PROBE_T),
+    "p_cmp": ("v_cmp_* to SGPR pairs, v_cndmask_b32, v_cmp_class_f32, f64 compares", PROBE_T),
+    "p_i64": ("64-bit integers: v_lshlrev_b64 / v_lshrrev_b64 / v_ashrrev_i64, v_mad_u64_u32, 64-bit compare and select, popcount, clz", PROBE_T),
+    "p_f64x": ("doubles beyond fma: ldexp, frexp, floor, trunc, rndne, conversions, min, max", PROBE_T),
+    "p_smem_wide": ("scalar loads of 2, 8 and 16 words: s_load_dwordx2 / x8 / x16", PROBE_T),
+    "p_sbuf": ("s_buffer_load_dword / dwordx4", ("mi300x", "rx6800")),
+}
+for _n, (_what, _t) in PROBES.items():
+    WORKLOADS[_n] = ("probe", _what, _t)
 # What an A/B verdict and the rate columns use. Default: wave-instructions per CPU second.
 _NEW_API = ("apicheap", "launch_mid", "launch_wide", "launch_sync", "memcpy", "stream", "graph")
 PRIMARY = {"launch": "units_per_s", "api": "units_per_s", "startup": "wall_s", **{w: "units_per_s" for w in _NEW_API}}
@@ -158,14 +182,19 @@ def hipcc_version(hipcc):
     return m.group(1) if m else (r.stdout.splitlines() or ["?"])[0]
 
 
-def ensure_binary(arch, cache, hipcc, verbose):
-    with open(KERNEL_SRC, "rb") as f:
+def run_name(wl):
+    """The argument the program takes: the probe workloads drop their p_."""
+    return wl[2:] if wl in PROBES else wl
+
+
+def ensure_binary(arch, cache, hipcc, verbose, source=KERNEL_SRC):
+    with open(source, "rb") as f:
         src = f.read()
     key = hashlib.sha256(src + arch.encode() + hipcc_version(hipcc).encode()).hexdigest()[:12]
     os.makedirs(cache, exist_ok=True)
-    out = os.path.join(cache, "bench_amd.%s.%s" % (arch, key))
+    out = os.path.join(cache, "%s.%s.%s" % (os.path.splitext(os.path.basename(source))[0], arch, key))
     if not os.path.exists(out):
-        cmd = [hipcc, "-O2", "-std=c++17", "--offload-arch=" + arch, "-ffp-contract=off", KERNEL_SRC, "-o", out + ".tmp"]
+        cmd = [hipcc, "-O2", "-std=c++17", "--offload-arch=" + arch, "-ffp-contract=off", source, "-o", out + ".tmp"]
         if verbose:
             print("+ " + " ".join(cmd), file=sys.stderr)
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -213,7 +242,7 @@ def timed_run(binary, wl, size, build, gpu, threads, tmp, args):
     three times: it is reported at the end, never silently dropped, because a result that comes out wrong
     sometimes is a finding, not noise."""
     for attempt in range(3):
-        res = C.run_argv(pin([binary, wl, size], args.cpus), clean_env(build, gpu, threads, tmp, args.env), args.timeout)
+        res = C.run_argv(pin([binary, run_name(wl), size], args.cpus), clean_env(build, gpu, threads, tmp, args.env), args.timeout)
         ok = res["rc"] == 0 and not res["timeout"] and res["stdout"].rstrip().endswith("PASS")
         if ok:
             b = parse_bench_line(res["stdout"])
@@ -242,7 +271,7 @@ def counting_run(binary, wl, size, build, gpu, tmp, args):
                                                   (os.environ.get("ROCM_PATH") or "", "/opt/rocm")):
         return None, "no rocprofv3 in PATH or in ROCM_PATH or /opt/rocm"
     cmds = "rocprofv3 --pmc %s --output-format csv -d %s -- %s %s %s" % (
-        " ".join(RDNA_INSTS if rdna else INSTS + EXTRA), out, binary, wl, size)
+        " ".join(RDNA_INSTS if rdna else INSTS + EXTRA), out, binary, run_name(wl), size)
     argv = pin([os.path.join(build, "vgpu"), "shell", "-y", "--gpu", gpu, "--count", "1", "--no-isolate", "-c", cmds],
                args.cpus)
     res = C.run_argv(argv, clean_env(build, gpu, 1, tmp, args.env), max(args.timeout, 600))
@@ -277,7 +306,7 @@ def probe_counting_run(binary, wl, size, build, gpu, tmp, args):
     launch. The same DispatchStats numbers rocprofv3's counters are made of, without rocprofv3 (which needs ROCm's
     profiler tool, a user namespace-free `vgpu shell` and a CSV that has gone missing on some hosts)."""
     path = os.path.join(tmp, "dispatch-stats.%d.txt" % time.monotonic_ns())
-    res = C.run_argv(pin([binary, wl, size], args.cpus), clean_env(build, gpu, 1, tmp, list(args.env) + ["VGPU_DISPATCH_STATS=" + path]),
+    res = C.run_argv(pin([binary, run_name(wl), size], args.cpus), clean_env(build, gpu, 1, tmp, list(args.env) + ["VGPU_DISPATCH_STATS=" + path]),
                      max(args.timeout, 600))
     if res["rc"] != 0 or not res["stdout"].rstrip().endswith("PASS"):
         tail = (res["stderr"] + res["stdout"]).strip().splitlines()[-8:]
@@ -354,10 +383,10 @@ def timing_flow(names, targets, builds, thread_list, counts, bins, args, tmp):
             LOADS.append(os.getloadavg()[0])
             runs = {c: [] for c in configs}
             for c in configs:  # one warm-up per configuration (page cache, CPU frequency)
-                timed_run(bins[arch], wl, args.size, c[0], gpu, c[1], tmp, args)
+                timed_run(bins[(arch, wl in PROBES)], wl, args.size, c[0], gpu, c[1], tmp, args)
             for i in range(args.runs):
                 for c in configs:
-                    runs[c].append(timed_run(bins[arch], wl, args.size, c[0], gpu, c[1], tmp, args))
+                    runs[c].append(timed_run(bins[(arch, wl in PROBES)], wl, args.size, c[0], gpu, c[1], tmp, args))
             results[(wl, tg)] = runs
             if not args.quiet:
                 sys.stderr.write("  timed %s/%s\n" % (wl, tg))
@@ -496,7 +525,11 @@ def main():
     thread_list = [int(t) if t != "all" else "all" for t in args.threads.split(",")]
     tmp = tempfile.mkdtemp(prefix="bench-amd.")
     try:
-        bins = {TARGETS[t][0]: ensure_binary(TARGETS[t][0], args.cache, hipcc, not args.quiet) for t in targets}
+        bins = {}
+        for t in targets:   # (arch, is a probe workload): only the programs the selected workloads need
+            for is_probe, source in ((False, KERNEL_SRC), (True, PROBE_SRC)):
+                if any((w in PROBES) == is_probe and t in WORKLOADS[w][2] for w in names):
+                    bins[(TARGETS[t][0], is_probe)] = ensure_binary(TARGETS[t][0], args.cache, hipcc, not args.quiet, source)
         counts = {}
         notes = {}
         crosschecked = 0
@@ -508,7 +541,7 @@ def main():
                     if tg not in WORKLOADS[wl][2]:
                         continue
                     for b in builds:
-                        binary, gpu = bins[TARGETS[tg][0]], TARGETS[tg][1]
+                        binary, gpu = bins[(TARGETS[tg][0], wl in PROBES)], TARGETS[tg][1]
                         cnt = None
                         if args.counts_via in ("probe", "both"):
                             cnt, err = probe_counting_run(binary, wl, args.size, b, gpu, tmp, args)
@@ -542,6 +575,12 @@ def main():
                                                             if k[2] == builds[0]}}
             if args.update_expected:
                 os.makedirs(EXPECTED_DIR, exist_ok=True)
+                if os.path.exists(path) and args.workloads:   # (a run of some workloads adds to the file; it does not drop the others')
+                    with open(path) as f:
+                        old = json.load(f)
+                    if old.get("hipcc") == hv:
+                        old["counts"].update(new["counts"])
+                        new = old
                 with open(path, "w") as f:
                     json.dump(new, f, indent=1, sort_keys=True)
                     f.write("\n")
