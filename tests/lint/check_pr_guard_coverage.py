@@ -15,7 +15,8 @@ more (or an expression, which can be longer), or it has no timeout and is on a
 shared runner. Jobs that only call a reusable workflow, and light jobs on
 GitHub's runners (a summary, the image finder), are not checked.
 
-The guard also has to work: it comes after nothing but checkouts, and its job
+The guard also has to work: it comes after nothing but checkouts (and the one step that takes a runner's workspace back from a
+cancelled container job, which has to run before the checkout can), and its job
 has `actions: write` (to cancel the run) and `pull-requests: read` (to read the
 PR), in the job's own `permissions:` or the workflow's.
 
@@ -45,6 +46,9 @@ EXEMPT = {
 SHARED = re.compile(r"BURST_RUNS_ON|CONTAINER_RUNS_ON|ML_RUNS_ON|SIM_RUNS_ON|pantheonsim-burst|self-hosted")
 GUARD = re.compile(r"^\s*-?\s*uses:\s*\./(?:[\w.\-/]+/)?\.github/actions/pr-guard\s*(?:#.*)?$")
 CHECKOUT = re.compile(r"^\s*-?\s*uses:\s*actions/checkout@")
+# The workspace of a self-hosted runner can hold root-owned files from a cancelled container job, which the checkout cannot remove;
+# this step takes it back and so has to come before the checkout, and therefore before the guard.
+TAKE_BACK = re.compile(r"^\s*-\s*name:\s*Take back a workspace a container job left\s*$")
 
 
 def indent(line):
@@ -146,7 +150,7 @@ def check(path):
             if key in EXEMPT:
                 problems.append(f"{path.name}: job '{name}' has the guard but is in EXEMPT ({EXEMPT[key]}); remove the entry")
             before = facts["steps"][:guard_at]
-            if any(not CHECKOUT.match(step[0]) for step in before):
+            if any(not (CHECKOUT.match(step[0]) or TAKE_BACK.match(step[0])) for step in before):
                 problems.append(f"{path.name}: job '{name}': the guard must come right after the checkout, before any other step")
             perms = facts["perms"] if facts["perms"] is not None else wf_perms
             if perms is None or not re.search(r"actions:\s*write", perms) or not re.search(r"pull-requests:\s*(read|write)", perms):

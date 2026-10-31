@@ -1,0 +1,102 @@
+sources 238 warp instr 64520589040 in tier 97.8%
+fallback (interpreter) instructions listed: 1427399260 = 2.21% of all warp instr; all-interpreter = 2.22%
+| rank | mnemonic | kind | warp instr | % of all | % of interpreter share | main sources |
+|---:|---|---|---:|---:|---:|---|
+| 1 | F2F.F64.F32 | straight | 140,366,953 | 0.22 | 9.8 | cuda-samples:reductionMultiBlockCG 75%, cuda-samples:jacobiCudaGraphs 17%, cuda-samples:simpleCudaGraphs 4% |
+| 2 | RET.REL.NODEC | ends a run | 128,615,662 | 0.20 | 9.0 | cuda-samples:simplePitchLinearTexture 41%, cuda-samples:HSOpticalFlow 15%, cuda-samples:NV12toBGRandResize 9% |
+| 3 | FCHK | straight | 104,376,122 | 0.16 | 7.3 | cuda-samples:simplePitchLinearTexture 50%, cuda-samples:HSOpticalFlow 19%, cuda-samples:NV12toBGRandResize 11% |
+| 4 | CALL.ABS.NOINC | ends a run | 102,569,791 | 0.16 | 7.2 | cuda-samples:simplePitchLinearTexture 51%, cuda-samples:HSOpticalFlow 19%, cuda-samples:NV12toBGRandResize 11% |
+| 5 | TEX.SCR.LL | ends a run | 99,253,572 | 0.15 | 6.9 | cuda-samples:convolutionTexture 51%, cuda-samples:simplePitchLinearTexture 26%, cuda-samples:NV12toBGRandResize 20% |
+| 6 | LD.E.64 | straight | 91,566,658 | 0.14 | 6.4 | hecbench:fresnel-cuda 100%, cuda-samples:newdelete 0%, cutlass:tma_load 0% |
+| 7 | ATOMS.POPC.INC.32 | ends a run | 66,824,100 | 0.10 | 4.7 | cuda-samples:histogram 53%, cuda-samples:radixSortThrust 39%, hecbench:radixsort2-cuda 3% |
+| 8 | P2R | ends a run | 65,420,152 | 0.10 | 4.6 | cuda-samples:MonteCarloMultiGPU 77%, cuda-samples:mergeSort 5%, cuda-samples:jacobiCudaGraphs 5% |
+| 9 | CALL.REL.NOINC | ends a run | 55,883,395 | 0.09 | 3.9 | cuda-samples:MonteCarloMultiGPU 31%, pantheon:sfu_stress 15%, hecbench:hellinger-cuda 12% |
+| 10 | BRA.DIV | ends a run | 46,108,479 | 0.07 | 3.2 | cuda-samples:jacobiCudaGraphs 55%, cuda-samples:radixSortThrust 38%, cuda-samples:warpAggregatedAtomicsCG 3% |
+| 11 | BRA.CONV | ends a run | 44,108,037 | 0.07 | 3.1 | cuda-samples:FDTD3d 39%, cuda-samples:binomialOptions 19%, cuda-samples:mergeSort 10% |
+| 12 | IMMA.16816.U8.U8 | ends a run | 33,554,432 | 0.05 | 2.3 | cuda-samples:immaTensorCoreGemm 100% |
+| 13 | S2UR | ends a run | 28,019,562 | 0.04 | 2.0 | cuda-samples:NV12toBGRandResize 50%, cuda-samples:warpAggregatedAtomicsCG 7%, cuda-samples:transpose 6% |
+| 14 | VIADD | ends a run | 27,973,129 | 0.04 | 2.0 | cutlass:sm90_sparse_f16 26%, cutlass:sm90_pingpong 26%, cutlass:sm90_group_gemm 25% |
+| 15 | BMOV.32 | ends a run | 23,786,274 | 0.04 | 1.7 | hecbench:fresnel-cuda 91%, cutlass:sm90_sparse_f16 9%, torch:graphs 0% |
+| 16 | BMOV.32.CLEAR | ends a run | 22,675,654 | 0.04 | 1.6 | hecbench:fresnel-cuda 95%, cutlass:sm90_sparse_f16 5%, torch:graphs 0% |
+| 17 | MUFU.RCP64H | straight | 19,837,007 | 0.03 | 1.4 | hecbench:fresnel-cuda 43%, cuda-samples:interval 23%, hecbench:goulash-cuda 21% |
+| 18 | RED.E.ADD.STRONG.GPU | ends a run | 18,070,100 | 0.03 | 1.3 | pantheon:atomic_virus 93%, hecbench:histogram-cuda 5%, hecbench:atomicIntrinsics-cuda 1% |
+| 19 | R2UR | ends a run | 17,652,771 | 0.03 | 1.2 | cutlass:sm100_f16 46%, cutlass:sm90_pingpong 15%, cutlass:sm90_group_gemm 13% |
+| 20 | ATOMS.ADD | ends a run | 16,416,882 | 0.03 | 1.1 | cuda-samples:radixSortThrust 80%, hecbench:hybridsort-cuda 10%, hecbench:radixsort2-cuda 6% |
+| 21 | LDSM.16.M88.4 | ends a run | 14,466,528 | 0.02 | 1.0 | cuda-samples:cudaTensorCoreGemm 87%, cutlass:gemm_sm80_sparse_f16 10%, cutlass:sm120_bs_mxf4 1% |
+| 22 | R2P | ends a run | 13,576,356 | 0.02 | 0.9 | cuda-samples:radixSortThrust 57%, hecbench:fresnel-cuda 17%, cuda-samples:quasirandomGenerator 15% |
+| 23 | LDSM.16.M88.2 | ends a run | 12,667,628 | 0.02 | 0.9 | cuda-samples:immaTensorCoreGemm 99%, cutlass:gemm_sm80_sparse_f16 1%, cutlass:sm120_bs_mxf4 0% |
+| 24 | ATOMS.CAST.SPIN.64 | ends a run | 12,099,584 | 0.02 | 0.8 | cuda-samples:jacobiCudaGraphs 100% |
+| 25 | SYNCS.PHASECHK.TRANS64.TRYWAIT | ends a run | 10,114,294 | 0.02 | 0.7 | cutlass:sm100_f16 32%, cutlass:sm90_group_gemm 30%, cutlass:sm90_pingpong 20% |
+| 26 | ATOMG.E.ADD.F32.FTZ.RN.STRONG.GPU | ends a run | 9,809,920 | 0.02 | 0.7 | cutlass:sm100_f16 100% |
+| 27 | WARPGROUP.DEPBAR.LE | ends a run | 9,016,752 | 0.01 | 0.6 | cutlass:sm90_group_gemm 48%, cutlass:sm90_pingpong 44%, cutlass:sm90_sparse_f16 8% |
+| 28 | WARPGROUP.ARRIVE | ends a run | 9,000,212 | 0.01 | 0.6 | cutlass:sm90_group_gemm 48%, cutlass:sm90_pingpong 44%, cutlass:sm90_sparse_f16 8% |
+| 29 | LDCU | ends a run | 8,461,769 | 0.01 | 0.6 | cutlass:sm100_f16 76%, torch:sdpa 7%, cutlass:sm100_f8 4% |
+| 30 | HGMMA.64x128x16.F32 | ends a run | 8,253,184 | 0.01 | 0.6 | cutlass:sm90_group_gemm 52%, cutlass:sm90_pingpong 48% |
+| 31 | WARPSYNC | ends a run | 7,864,335 | 0.01 | 0.5 | cuda-samples:radixSortThrust 51%, hecbench:marchingCubes-cuda 25%, hecbench:blockScan-cuda 10% |
+| 32 | I2F.F64 | straight | 7,468,077 | 0.01 | 0.5 | hecbench:fresnel-cuda 58%, cuda-samples:interval 36%, hecbench:fft-cuda 4% |
+| 33 | FRND | straight | 7,107,895 | 0.01 | 0.5 | cuda-samples:dxtc 100%, hecbench:lif-cuda 0%, torch:linalg 0% |
+| 34 | IDP.4A.U8.U8 | straight | 6,619,136 | 0.01 | 0.5 | hecbench:dp4a-cuda 100% |
+| 35 | IDP.4A.S8.S8 | straight | 6,619,136 | 0.01 | 0.5 | hecbench:dp4a-cuda 100% |
+| 36 | F2F.F16.F32 | straight | 6,575,872 | 0.01 | 0.5 | pantheon:tensor_virus 96%, pantheon:mma_virus 4% |
+| 37 | VOTEU.ANY | ends a run | 6,111,995 | 0.01 | 0.4 | hecbench:linearprobing-cuda 34%, cuda-samples:jacobiCudaGraphs 19%, cuda-samples:dxtc 17% |
+| 38 | ATOMG.E.CAS.STRONG.GPU | ends a run | 5,038,596 | 0.01 | 0.4 | hecbench:linearprobing-cuda 100%, cuda-samples:simpleAtomicIntrinsics 0%, hecbench:f16atomic-cuda 0% |
+| 39 | SYNCS.ARRIVE.TRANS64.RED.A1T0 | ends a run | 4,819,218 | 0.01 | 0.3 | cutlass:sm90_group_gemm 34%, cutlass:sm100_f16 28%, cutlass:sm90_pingpong 20% |
+| 40 | ATOMG.E.ADD.STRONG.GPU | ends a run | 4,654,162 | 0.01 | 0.3 | hecbench:linearprobing-cuda 45%, cuda-samples:cdpAdvancedQuicksort 29%, cuda-samples:warpAggregatedAtomicsCG 13% |
+
+by base opcode:
+CALL 158,453,186 0.25%
+F2F 148,980,499 0.23%
+RET 128,615,662 0.20%
+FCHK 104,376,122 0.16%
+TEX 99,253,572 0.15%
+LD 95,497,454 0.15%
+ATOMS 95,351,989 0.15%
+BRA 90,223,718 0.14%
+P2R 65,420,152 0.10%
+BMOV 46,461,928 0.07%
+IMMA 33,554,432 0.05%
+LDSM 28,441,964 0.04%
+S2UR 28,019,562 0.04%
+VIADD 27,973,129 0.04%
+RED 25,701,528 0.04%
+ATOMG 22,238,445 0.03%
+SYNCS 19,939,496 0.03%
+MUFU 19,904,077 0.03%
+R2P 19,774,200 0.03%
+WARPGROUP 18,016,964 0.03%
+R2UR 17,658,636 0.03%
+IDP 13,238,272 0.02%
+LDCU 12,398,647 0.02%
+WARPSYNC 10,667,344 0.02%
+REDUX 9,573,096 0.01%
+
+macro-averaged (each of 238 sources counts equally):
+| rank | mnemonic | mean % of a source's warp instr | sources where it is >0.1% |
+|---:|---|---:|---:|
+| 1 | IMMA.16816.U8.U8 | 0.260 | 1 |
+| 2 | S2UR | 0.199 | 37 |
+| 3 | BRA.CONV | 0.195 | 21 |
+| 4 | LDCU | 0.151 | 17 |
+| 5 | RET.REL.NODEC | 0.143 | 40 |
+| 6 | LDCU.64 | 0.140 | 17 |
+| 7 | F2F.F64.F32 | 0.138 | 8 |
+| 8 | LDSM.16.M88.4 | 0.137 | 6 |
+| 9 | CALL.ABS.NOINC | 0.130 | 21 |
+| 10 | TEX.SCR.LL | 0.121 | 11 |
+| 11 | FCHK | 0.117 | 33 |
+| 12 | CALL.REL.NOINC | 0.111 | 39 |
+| 13 | IADD.64 | 0.103 | 12 |
+| 14 | LDSM.16.M88.2 | 0.100 | 3 |
+| 15 | RED.E.ADD.STRONG.GPU | 0.095 | 5 |
+| 16 | ATOMS.POPC.INC.32 | 0.084 | 7 |
+| 17 | VOTEU.ANY | 0.075 | 14 |
+| 18 | R2UR | 0.074 | 15 |
+| 19 | MUFU.RCP64H | 0.070 | 12 |
+| 20 | BRA.DIV | 0.063 | 10 |
+| 21 | P2R | 0.062 | 23 |
+| 22 | ATOMG.E.ADD.STRONG.GPU | 0.060 | 8 |
+| 23 | VIADD | 0.059 | 7 |
+| 24 | LD.E.64 | 0.056 | 2 |
+| 25 | REDUX.OR | 0.053 | 8 |
+max list lengths 24 24
+listed 1427399260 of 1430134870 interpreter instrs (99.8%)

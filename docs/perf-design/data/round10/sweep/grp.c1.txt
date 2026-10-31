@@ -1,0 +1,110 @@
+fft 0 2.543685414
+bash: line 1:    23 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+fft 134 39.569573694
+fft 0 2.023721219
+fft 0 2.030594335
+fft 0 2.132355281
+fft 0 1.986774404
+fft 0 2.098680719
+fft 0 2.050175576
+fft 0 2.066624386
+fft 0 2.068079843
+fft 0 2.034156797
+fft 0 2.057878059
+fft 0 2.087309765
+fft 0 2.010037170
+fft 0 2.005746496
+fft 0 2.073368728
+fft 0 2.018930915
+fft 0 2.008440331
+fft 0 2.076825445
+fft 0 2.055031010
+fft 0 2.168423121
+fft 0 2.046311037
+fft 0 2.074562202
+fft 0 2.097482265
+fft 0 2.030473183
+fft 0 2.018410637
+fft 0 2.071884469
+fft 0 2.032139288
+fft 0 2.058417747
+fft 0 2.076652378
+bash: line 1:   431 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+losses 134 41.702941262
+losses 0 2.858277559
+losses 0 2.759406589
+losses 0 2.781612967
+losses 0 2.766557906
+losses 0 2.861485805
+losses 0 2.806571261
+losses 0 2.772027860
+losses 0 2.753980443
+losses 0 2.813212708
+losses 0 2.797149258
+losses 0 2.814551634
+losses 0 2.826711931
+losses 0 2.779502265
+losses 0 2.865260752
+losses 0 2.751072086
+losses 0 2.883617661
+losses 0 2.739996398
+losses 0 2.881487429
+losses 0 2.733115499
+losses 0 2.789790966
+bash: line 1:   705 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+losses 134 3.606418251
+losses 0 2.743911509
+losses 0 2.722573470
+losses 0 2.754115371
+losses 0 2.686984310
+bash: line 1:   771 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+losses 134 3.589145017
+losses 0 2.662957902
+losses 0 2.751849626
+losses 0 2.750058560
+bash: line 1:   825 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 5.412573684
+bash: line 1:   914 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 6.240422880
+bash: line 1:  1003 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 11.685131377
+nn 0 4.301787425
+nn 0 4.323255305
+bash: line 1:  1268 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 5.942444546
+bash: line 1:  1357 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 10.537291032
+nn 0 4.441932663
+bash: line 1:  1534 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 8.298576943
+nn 0 4.230674539
+nn 0 4.243494346
+nn 0 4.306476715
+nn 0 4.283438353
+bash: line 1:  1975 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 5.568865965
+bash: line 1:  2064 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 5.459643748
+nn 0 4.315810471
+nn 0 4.308808570
+nn 0 4.343764314
+bash: line 1:  2417 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 5.717619404
+nn 0 4.537317626
+nn 0 4.427020226
+bash: line 1:  2682 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 5.643206305
+nn 0 4.278495947
+nn 0 4.453236283
+bash: line 1:  2947 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 5.689965361
+bash: line 1:  3036 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 6.767121707
+bash: line 1:  3125 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 11.001033024
+bash: line 1:  3214 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 11.731155298
+nn 0 4.243116660
+bash: line 1:  3391 Aborted                 (core dumped) VGPU_SWEEP_GROUPS=$g VGPU_SWEEP_TIER=quick OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /w/build/vgpu run --gpu nvidia/rtx5090 --preload /root/.local/share/torch-cu130/bin/python /w/nvidia/tests/pytorch/sweep.py > /tmp/o.$g.$i 2>&1
+nn 134 8.619405931
+DONE

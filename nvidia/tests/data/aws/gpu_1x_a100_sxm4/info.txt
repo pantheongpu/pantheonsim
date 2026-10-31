@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA A100-SXM4-40GB, 8.0, 40960 MiB, 570.148.08, GPU-6a38535a-029d-bd45-39da-d46066c201c2
+Cuda compilation tools, release 12.8, V12.8.93
+Build cuda_12.8.r12.8/compiler.35583870_0
+ngpu=1 arch=sm_80 libs=/usr/lib/x86_64-linux-gnu inc=/usr/include

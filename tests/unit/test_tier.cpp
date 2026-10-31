@@ -90,16 +90,17 @@ void check_corpus(const std::string& file, int sm) {
     ++accepted;
     // Only instructions step_warp runs as straight-line ones can have a handler (a plain BRA, BSSY or NOP ends a run, and tier_run runs it).
     const bool ends = op.form == sass::tier::Form::Bra || op.form == sass::tier::Form::Bssy || op.form == sass::tier::Form::Nop ||
-                      op.form == sass::tier::Form::Bsync || op.form == sass::tier::Form::Yield || op.form == sass::tier::Form::Bar || op.form == sass::tier::Form::Exit;
+                      op.form == sass::tier::Form::Bsync || op.form == sass::tier::Form::Yield || op.form == sass::tier::Form::Bar || op.form == sass::tier::Form::Exit ||
+                      op.form == sass::tier::Form::Call || op.form == sass::tier::Form::Ret || op.form == sass::tier::Form::Warpsync;
     const bool terminal = op.form == sass::tier::Form::Plop3 || op.form == sass::tier::Form::S2r || op.form == sass::tier::Form::Sel ||
                           op.form == sass::tier::Form::Shfl || op.form == sass::tier::Form::Vote || op.form == sass::tier::Form::Hmma ||
                           op.form == sass::tier::Form::Umov || op.form == sass::tier::Form::Uldc || op.form == sass::tier::Form::Usel ||
-                          op.form == sass::tier::Form::Cs2r;   // end a run, and have handlers
+                          op.form == sass::tier::Form::Cs2r || op.form == sass::tier::Form::Match || op.form == sass::tier::Form::Imma || op.form == sass::tier::Form::Ldsm || op.form == sass::tier::Form::Atom || op.form == sass::tier::Form::Ldgsts;   // end a run, and have handlers
     VCHECK(ins.straight != (ends || terminal));
     VCHECK(op.maxreg <= 256);   // 0 is possible: constants into RZ
     const std::string what = std::string(sass::tier::form_name(op.form)) + " " + sass::to_text(ins);
     const bool uniform = op.form >= sass::tier::Form::Umov && op.form <= sass::tier::Form::Usel;   // dst is a UR, not a row
-    const bool mem = (op.form >= sass::tier::Form::Ldg && op.form <= sass::tier::Form::Stl) || op.form == sass::tier::Form::Hmma;   // s[] holds raw register numbers there
+    const bool mem = (op.form >= sass::tier::Form::Ldg && op.form <= sass::tier::Form::Stl) || op.form == sass::tier::Form::Hmma || op.form == sass::tier::Form::Imma || op.form == sass::tier::Form::Ldsm || op.form == sass::tier::Form::Ldgsts || op.form == sass::tier::Form::Ld || op.form == sass::tier::Form::St;   // s[] holds raw register numbers there
     // A double operand, and IMAD.WIDE's and IMAD.HI's addend, are pairs of rows.
     for (int i = 0; i < 3 && !mem; ++i) {
       const bool pair = op.form == sass::tier::Form::Dop || op.form == sass::tier::Form::Dsetp || (i == 2 && (op.form == sass::tier::Form::ImadWide ||
@@ -108,7 +109,7 @@ void check_corpus(const std::string& file, int sm) {
     }
     // A destination register the handler writes lies inside the file the op claims to need.
     if (op.dst != sass::tier::kNoReg && op.form != sass::tier::Form::Isetp && op.form != sass::tier::Form::Fsetp &&
-        op.form != sass::tier::Form::IsetpEx && op.form != sass::tier::Form::Plop3 && op.form != sass::tier::Form::Dsetp && op.form != sass::tier::Form::Vote && !uniform && !ends)
+        op.form != sass::tier::Form::IsetpEx && op.form != sass::tier::Form::Plop3 && op.form != sass::tier::Form::Dsetp && op.form != sass::tier::Form::Vote && op.form != sass::tier::Form::Fchk && !uniform && !ends)
       VCHECK(op.dst < op.maxreg);
     if (ends) VCHECK(op.fn == nullptr);
   }
@@ -138,7 +139,7 @@ void check_corpus(const std::string& file, int sm) {
                  prog.pool.size(), sizeof(sass::tier::Row));
   }
   // The forms the tier exists for must be taken somewhere in every corpus that has them.
-  for (const char* must : {"IMAD", "IADD3", "LOP3", "ISETP", "SHF", "FFMA", "LDG", "STG"})
+  for (const char* must : {"IMAD", "IADD3", "LOP3", "ISETP", "SHF", "FFMA", "LDG", "STG", "MATCH"})
     VCHECK(by_op[must].accepted > 0);
 }
 
@@ -192,7 +193,7 @@ VTEST(tier_leaves_turing_global_memory_to_the_interpreter) {
 // reads tier_ops.inc: a handler of a K form must call a kernel, one of an I form the interpreter, and no handler may contain the scalar
 // float arithmetic a rule would be written in (the interpreter's functions for it are called, not copied).
 const char* const kExpectedImpl =
-    "none:O mov:O iadd3:K iadd3x:O imad:K imad32:O imadwide:O imadhi:O isetpex:O popc:K i2fp:K ldg:O stg:O lds:O sts:O ldl:O stl:O lop3:K lea:O shf:O isetp:K fsetp:K fsel:K ffma:K fadd:K fmul:K dop:K bra:O bssy:O nop:O plop3:O s2r:O cs2r:O sel:O prmt:K imnmx:K fmnmx:K mufu:K f2i:K i2f:K f2fp:I dsetp:K hop2:K unary:K iabs:O ldc:O bsync:O yield:O bar:O exit:O shfl:O vote:O umov:O uldc:O uiadd3:O uimad:O uisetp:O ulea:O ulop3:O ushf:O uunary:O usel:O hmma:K";
+    "none:O mov:O iadd3:K iadd3x:O imad:K imad32:O imadwide:O imadhi:O isetpex:O popc:K i2fp:K ldg:O stg:O lds:O sts:O ldl:O stl:O lop3:K lea:O shf:O isetp:K fsetp:K fsel:K ffma:K fadd:K fmul:K dop:K bra:O bssy:O nop:O plop3:O s2r:O cs2r:O sel:O prmt:K imnmx:K fmnmx:K mufu:K f2i:K i2f:K f2fp:I dsetp:K hop2:K unary:K iabs:O ldc:O bsync:O yield:O bar:O exit:O shfl:O vote:O umov:O uldc:O uiadd3:O uimad:O uisetp:O ulea:O ulop3:O ushf:O uunary:O usel:O hmma:K match:O ldsm:O imma:O atom:O fchk:O call:O ret:O warpsync:O ldgsts:O ld:O st:O";
 
 std::string read_file(const std::string& path) {
   std::ifstream in(path);
@@ -289,6 +290,55 @@ VTEST(tier_handlers_call_what_the_interpreter_calls) {
     if (name == "hmma" && body.find("hmma_kernel_kind(") == std::string::npos)
       throw vtest::Failure("the HMMA handler does not choose its sum with Runner::hmma_kernel_kind, as exec_mma does");
   }
+}
+
+// The shapes of a shuffle with the same lane and clamp in all 32 lanes (sass::tier::shfl_shape) against the per-lane rule exec_warp and the
+// tier's general handler use: for every mode, lanes 0 to 40 and clamp words with every clamp and segment mask, the shape moves every lane's
+// word where the rule says and its in-range predicate is the rule's -- or the shape says it knows none.
+VTEST(tier_shuffle_shapes_move_what_the_per_lane_rule_moves) {
+  using sass::tier::ShflShape;
+  size_t shaped = 0, total = 0;
+  for (unsigned mode = 0; mode < 4; ++mode)
+    for (uint32_t b = 0; b < 41; ++b)
+      for (uint32_t clamp = 0; clamp < 32; ++clamp)
+        for (uint32_t seg = 0; seg < 32; ++seg) {
+          const uint32_t cc = clamp | (seg << 8) | (seg == 7 ? 0xdead0000u : 0);   // (bits that are neither field are ignored)
+          ShflShape sh;
+          ++total;
+          if (!sass::tier::shfl_shape(mode, b, cc, sh)) {
+            VCHECK(sh.kind == ShflShape::None);
+            continue;
+          }
+          ++shaped;
+          uint32_t src[32], in_mask = 0;
+          for (uint32_t l = 0; l < 32; ++l) {
+            const uint32_t maxl = (l & seg) | (clamp & ~seg), minl = l & seg;
+            uint32_t j;
+            bool in;
+            switch (mode) {
+              case 0: j = minl | (b & ~seg & 0x1f); in = j <= maxl; break;
+              case 1: j = l - b; in = static_cast<int32_t>(j) >= static_cast<int32_t>(maxl); break;
+              case 2: j = l + b; in = j <= maxl; break;
+              default: j = l ^ b; in = j <= maxl; break;
+            }
+            if (!in) j = l;
+            src[l] = j & 31;
+            in_mask |= static_cast<uint32_t>(in) << l;
+          }
+          VCHECK(sh.in == in_mask);
+          for (uint32_t l = 0; l < 32; ++l) {
+            uint32_t got = l;   // (a lane out of range keeps its own word)
+            switch (sh.kind) {
+              case ShflShape::Splat: got = sh.x; break;
+              case ShflShape::Butterfly: got = l ^ sh.x; break;
+              case ShflShape::Down: got = ((sh.in >> l) & 1) ? (l + sh.x) & 31 : l; break;
+              case ShflShape::Up: got = ((sh.in >> l) & 1) ? (l - sh.x) & 31 : l; break;
+              default: break;
+            }
+            VCHECK(got == src[l]);
+          }
+        }
+  VCHECK(shaped > total / 100);   // (not vacuous: the full-width shuffles are shaped)
 }
 
 VTEST_MAIN

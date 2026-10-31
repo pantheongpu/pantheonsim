@@ -1,0 +1,10 @@
+GEMM      process off   1.27 s on   1.56 s | GPU phase off 0.901774 on 1.046896 | output same | 0 launches ran on the card, 1 in the simulator
+SYRK      process off  10.17 s on  10.39 s | GPU phase off 9.130091 on 9.263553 | output same | 0 launches ran on the card, 1 in the simulator
+SYR2K     process off  19.51 s on  19.78 s | GPU phase off 17.454325 on 17.637057 | output same | 0 launches ran on the card, 1 in the simulator
+3MM       process off   3.75 s on   3.81 s | GPU phase off 2.514356 on 2.662253 | output same | 0 launches ran on the card, 3 in the simulator
+2DCONV    process off   1.18 s on   1.40 s | GPU phase off 0.574404 on 0.717621 | output same | 0 launches ran on the card, 1 in the simulator
+3DCONV    process off   1.00 s on   1.24 s | GPU phase off 0.679875 on 0.824763 | output same | 0 launches ran on the card, 254 in the simulator
+GEMVER    process off   1.14 s on   1.27 s | GPU phase off 0.770532 on 0.915612 | output same | 0 launches ran on the card, 3 in the simulator
+MVT       process off   2.23 s on   2.59 s | GPU phase off 1.960504 on 2.093504 | output same | 0 launches ran on the card, 2 in the simulator
+FDTD-2D   process off 158.94 s on  68.52 s | GPU phase off 154.841786 on 64.551671 | output same | 1494 launches ran on the card, 6 in the simulator
+FINISHED

@@ -1,0 +1,10 @@
+  3528  FADD2 R#, R#.F32x2.HI_LO, R#.F32x2.HI_LO
+  2647  FFMA2 R#, R#.F32x2.HI_LO, UR#.F32, R#.reuse.F32
+  2304  @P# FMUL2 R#, R#.reuse.F32, R#.F32x2.HI_LO
+  1636  FMUL2 R#, R#.F32, R#.F32x2.HI_LO
+  1436  FMUL2 R#, R#.reuse.F32, R#.F32x2.HI_LO
+   937  FFMA2 R#, R#.F32x2.HI_LO, UR#.F32, R#.F32
+   768  @P# FMUL2 R#, R#.F32, R#.F32x2.HI_LO
+   168  FADD2 R#, R#.F32x2.HI_LO, RZ.F32
+    56  FADD2 R#, R#.F32, R#.F32x2.HI_LO
+13480 instructions, 9 shapes

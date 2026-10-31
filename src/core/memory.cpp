@@ -1,3 +1,4 @@
+#define VGPU_MEMORY_UNIT 1
 #include "vgpu/memory.hpp"
 
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <type_traits>
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -34,10 +36,19 @@ void relaxed_store(uint8_t* p, uint64_t v) {
 
 // A scalar in place, as an atomic of its own width -- or byte by byte when the
 // chunk's storage is not aligned for that width, so no path copies the bytes a
-// concurrent store is writing.
-uint64_t load_at(const uint8_t* p, uint32_t size) {
+// concurrent store is writing. The aligned access is the whole of the hot path
+// and is inlined; the byte-by-byte one is a cold call of its own.
+[[gnu::cold, gnu::noinline]] uint64_t load_unaligned(const uint8_t* p, uint32_t size) {
+  uint64_t v = 0;
+  for (uint32_t i = 0; i < size; ++i) v |= relaxed_load<uint8_t>(p + i) << (8 * i);
+  return v;
+}
+[[gnu::cold, gnu::noinline]] void store_unaligned(uint8_t* p, uint32_t size, uint64_t v) {
+  for (uint32_t i = 0; i < size; ++i) relaxed_store<uint8_t>(p + i, (v >> (8 * i)) & 0xff);
+}
+[[gnu::always_inline]] inline uint64_t load_at(const uint8_t* p, uint32_t size) {
   // `size` is 1, 2, 4 or 8 in every caller: a mask, not a division.
-  if ((reinterpret_cast<uintptr_t>(p) & (size - 1)) == 0) {
+  if (__builtin_expect((reinterpret_cast<uintptr_t>(p) & (size - 1)) == 0, 1)) {
     switch (size) {
       case 1: return relaxed_load<uint8_t>(p);
       case 2: return relaxed_load<uint16_t>(p);
@@ -45,12 +56,10 @@ uint64_t load_at(const uint8_t* p, uint32_t size) {
       default: return relaxed_load<uint64_t>(p);
     }
   }
-  uint64_t v = 0;
-  for (uint32_t i = 0; i < size; ++i) v |= relaxed_load<uint8_t>(p + i) << (8 * i);
-  return v;
+  return load_unaligned(p, size);
 }
-void store_at(uint8_t* p, uint32_t size, uint64_t v) {
-  if ((reinterpret_cast<uintptr_t>(p) & (size - 1)) == 0) {
+[[gnu::always_inline]] inline void store_at(uint8_t* p, uint32_t size, uint64_t v) {
+  if (__builtin_expect((reinterpret_cast<uintptr_t>(p) & (size - 1)) == 0, 1)) {
     switch (size) {
       case 1: relaxed_store<uint8_t>(p, v); return;
       case 2: relaxed_store<uint16_t>(p, v); return;
@@ -58,7 +67,7 @@ void store_at(uint8_t* p, uint32_t size, uint64_t v) {
       default: relaxed_store<uint64_t>(p, v); return;
     }
   }
-  for (uint32_t i = 0; i < size; ++i) relaxed_store<uint8_t>(p + i, (v >> (8 * i)) & 0xff);
+  store_unaligned(p, size, v);
 }
 
 // Sixteen aligned bytes in place, as one access (MemoryManager::load_quad).
@@ -126,8 +135,14 @@ std::ostream& operator<<(std::ostream& os, Hex h) {
 
 }  // namespace
 
+static std::atomic<MemTraceHook> g_mem_trace{nullptr};
+void set_mem_trace(MemTraceHook hook) { g_mem_trace.store(hook, std::memory_order_relaxed); }
+#define VGPU_MEM_TRACE(op, a, b) \
+  do { if (MemTraceHook h_ = g_mem_trace.load(std::memory_order_relaxed)) h_(op, a, b); } while (0)
+
 uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
-  ExclusiveGuard table_guard(table_lock_.get());
+  // A new entry in the table makes no answer a thread remembered wrong, so readers' memories stay.
+  ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
   if (size == 0) throw Error::make(Err::InvalidValue, "cudaMalloc-style allocation of 0 bytes is invalid");
   if (used_ + size > capacity_ || used_ + size < used_)
     throw Error::make(Err::OutOfMemory, "device out of memory: requested ", size, " bytes, ", used_,
@@ -138,43 +153,76 @@ uint64_t MemoryManager::alloc(uint64_t size, uint64_t request) {
   next_va_ = base + padded;
   high_water_va_ = next_va_;
   used_ += size;
-  Allocation a;
-  a.size = size;
-  a.chunk_count = static_cast<size_t>((size + kChunkSize - 1) / kChunkSize);
-  a.chunks = std::make_unique<std::atomic<uint8_t*>[]>(a.chunk_count);
-  live_.emplace(base, std::move(a));
+  // The node of the last freed allocation, with its array of chunk slots, when there is one.
+  auto node = std::move(spare_live_);
+  if (node.empty()) {
+    Allocation a;
+    a.set_up(size);
+    live_.emplace_hint(live_.end(), base, std::move(a));
+  } else {
+    node.key() = base;
+    node.mapped().set_up(size);
+    live_.insert(live_.end(), std::move(node));   // the newest address is the highest
+  }
   notify_usage();
+  VGPU_MEM_TRACE('A', base, size);
   return base;
 }
 
+void MemoryManager::remember_freed(uint64_t ptr, uint64_t size) {
+  const FreedRecord record{size, freed_front_seq_ + freed_order_.size()};
+  // Frees mostly come in the order of allocation, which is the order of address: the end is the place.
+  auto at = freed_.empty() || ptr > freed_.rbegin()->first ? freed_.end() : freed_.lower_bound(ptr);
+  std::map<uint64_t, FreedRecord>::iterator entry;
+  if (at != freed_.end() && at->first == ptr) {
+    at->second = record;
+    entry = at;
+  } else if (!spare_freed_.empty()) {
+    spare_freed_.key() = ptr;
+    spare_freed_.mapped() = record;
+    entry = freed_.insert(at, std::move(spare_freed_));
+  } else {
+    entry = freed_.emplace_hint(at, ptr, record);
+  }
+  freed_order_.push_back(entry);
+  // Evict the oldest entries once the bound is reached; the node of the last goes to the next free.
+  while (freed_order_.size() > kQuarantineEntries) {
+    const auto stale = freed_order_.front();
+    // Only drop it if this record is the one that entry refers to.
+    if (stale->second.seq == freed_front_seq_) spare_freed_ = freed_.extract(stale);
+    freed_order_.pop_front();
+    ++freed_front_seq_;
+  }
+}
+
 void MemoryManager::free(uint64_t ptr) {
-  ExclusiveGuard table_guard(table_lock_.get());
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_free(ptr);
+  // Quiet: a free says which allocation it takes (note_free) and leaves every other answer a thread
+  // remembered as it was.
+  ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
   // An allocation that was exported for another process lives in a file now,
   // not in chunks. Freeing it takes the mapping and the file with it, which is
   // what the exporting process owns.
   if (const auto sh = shared_.find(ptr); sh != shared_.end() && sh->second.owner) {
     used_ -= sh->second.size;
-    freed_[ptr] = FreedRecord{sh->second.size, freed_seq_};
-    freed_order_[freed_seq_++] = ptr;
+    remember_freed(ptr, sh->second.size);
+    table_lock_->note_free(ptr);
     drop_shared(sh);
     notify_usage();
     return;
   }
   auto it = live_.find(ptr);
   if (it != live_.end()) {
+    VGPU_MEM_TRACE('F', ptr, it->second.size);
     used_ -= it->second.size;
     // Quarantine the freed range so use-after-free stays diagnosable, evicting
     // the oldest entry once the bound is reached.
-    freed_[ptr] = FreedRecord{it->second.size, freed_seq_};
-    freed_order_[freed_seq_++] = ptr;
-    while (freed_order_.size() > kQuarantineEntries) {
-      auto oldest = freed_order_.begin();
-      auto stale = freed_.find(oldest->second);
-      // Only drop it if this record is the one that entry refers to.
-      if (stale != freed_.end() && stale->second.seq == oldest->first) freed_.erase(stale);
-      freed_order_.erase(oldest);
-    }
-    live_.erase(it);
+    remember_freed(ptr, it->second.size);
+    table_lock_->note_free(ptr);
+    auto node = live_.extract(it);
+    node.mapped().recycle();
+    spare_live_ = std::move(node);
     notify_usage();
     return;
   }
@@ -295,6 +343,10 @@ const MemoryManager::Allocation* MemoryManager::resolve_mapped(uint64_t addr, ui
 
 const MemoryManager::Allocation& MemoryManager::resolve(uint64_t addr, uint64_t len, const char* op,
                                                         uint64_t* base_out, bool writing, bool page_slack) const {
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire))
+      // A kernel-style scalar store asks for "device memory write" without the writing flag (which would also change the read-only checks).
+      gate->before_access(addr, len, writing || (op && std::strcmp(op, "device memory write") == 0));
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up != live_.begin()) {
@@ -370,11 +422,66 @@ struct LookupMemory {
   };
   Entry way[kWays];
   unsigned last = 0;     // the way that answered last: the next lookup tries it first
+  unsigned prev = 0;     // the way that answered before it: the miss path tries it second (a kernel that reads one allocation and
+                         // writes another alternates between two)
   uint32_t victim = 1;   // which way a new entry replaces: pseudo-random (xorshift), so a
                          // kernel cycling through more allocations than there are ways
                          // still hits some of the time instead of never
 };
-thread_local LookupMemory t_lookups;
+// A thread's memory is made on its first lookup and given back when it ends. It is found by the
+// thread pointer in a table of slots, with no thread-local on the way: this code is linked into every
+// shim library, a thread-local that is not general-dynamic would take static TLS from each (glibc has
+// about 1.6 KB for all libraries loaded late) and a general-dynamic one is a call on every access.
+// A slot belongs to the thread whose pointer it holds: only that thread writes its memory or takes
+// the slot away, so the others' compare-and-swaps into other slots are all it can see. A thread that
+// finds no room (all probes taken), or that is ending, reads an empty memory that is never written
+// (`g_ended_lookups`), and so finds nothing and takes the table: slower, not wrong.
+LookupMemory g_ended_lookups;
+constexpr size_t kLookupSlots = 1024, kLookupProbes = 8;
+struct LookupSlot {
+  std::atomic<uintptr_t> thread{0};
+  LookupMemory* memory = nullptr;
+};
+LookupSlot g_lookup_slots[kLookupSlots];
+inline uintptr_t this_thread() { return reinterpret_cast<uintptr_t>(__builtin_thread_pointer()); }
+inline size_t first_slot(uintptr_t t) { return static_cast<size_t>((t >> 6) ^ (t >> 16)) % 1024; }   // control blocks are 64-byte aligned
+struct LookupOwner {   // gives the slot and the memory back when the thread ends
+  uintptr_t thread = 0;
+  LookupMemory* memory = nullptr;
+  size_t slot = 0;
+  bool ended = false;
+  ~LookupOwner() {
+    ended = true;
+    if (!memory) return;
+    g_lookup_slots[slot].thread.store(0, std::memory_order_release);
+    delete memory;
+  }
+};
+[[gnu::noinline]] LookupMemory* make_lookups() {
+  thread_local LookupOwner owner;
+  if (owner.ended || owner.memory) return &g_ended_lookups;
+  const uintptr_t t = this_thread();
+  for (size_t p = 0; p < kLookupProbes; ++p) {
+    const size_t i = (first_slot(t) + p) % kLookupSlots;
+    uintptr_t free_slot = 0;
+    if (g_lookup_slots[i].thread.compare_exchange_strong(free_slot, t, std::memory_order_acq_rel)) {
+      owner.memory = g_lookup_slots[i].memory = new LookupMemory;
+      owner.thread = t;
+      owner.slot = i;
+      return owner.memory;
+    }
+  }
+  return &g_ended_lookups;
+}
+inline LookupMemory& lookups() {
+  const uintptr_t t = this_thread();
+  const size_t h = first_slot(t);
+  for (size_t p = 0; p < kLookupProbes; ++p) {
+    const LookupSlot& s = g_lookup_slots[(h + p) % kLookupSlots];
+    if (s.thread.load(std::memory_order_relaxed) == t) return *s.memory;
+  }
+  return *make_lookups();
+}
 }  // namespace
 
 bool MemoryManager::lookup_cache_default() {
@@ -383,46 +490,56 @@ bool MemoryManager::lookup_cache_default() {
 }
 
 // The table lookup behind a miss in the memory of recent lookups.
-[[gnu::noinline]] const MemoryManager::Allocation* MemoryManager::find_ordinary_miss(uint64_t addr, uint64_t len,
-                                                                                       uint64_t* base_out) const {
+[[gnu::noinline]] MemoryManager::Found MemoryManager::find_ordinary_miss(uint64_t addr, uint64_t len, void* memory) const {
   BigReaderLock* lock = table_lock_.get();
-  LookupMemory& mem = t_lookups;
+  LookupMemory& mem = *static_cast<LookupMemory*>(memory);
   const uint64_t epoch = lock->epoch();
-  for (unsigned i = 0; i < LookupMemory::kWays; ++i) {
-    const LookupMemory::Entry& e = mem.way[i];
+  // The way before the last one first, then all of them in order (a way already tried fails the same test again).
+  for (unsigned n = 0; n <= LookupMemory::kWays; ++n) {
+    const unsigned i = n == 0 ? mem.prev : n - 1;
+    LookupMemory::Entry& e = mem.way[i];
     const uint64_t off = addr - e.base;
-    if (e.epoch != epoch || off >= e.size || len > e.size - off) continue;
+    if (off >= e.size || len > e.size - off) continue;
+    if (e.epoch != epoch) {
+      // Stale, but perhaps only by the frees of other allocations (a launch frees its argument block
+      // every time): then it is still right, and is remembered under the new epoch.
+      uint64_t now = 0;
+      if (&mem == &g_ended_lookups || e.epoch == 0 || !lock->still_valid(e.epoch, e.base, &now)) continue;
+      e.epoch = now;
+    }
+    if (i != mem.last) mem.prev = mem.last;
     mem.last = i;
-    if (base_out) *base_out = e.base;
-    return static_cast<const Allocation*>(e.allocation);
+    return {static_cast<const Allocation*>(e.allocation), e.base};
   }
-  if (lock->written_by_me()) return nullptr;
+  if (lock->written_by_me()) return {nullptr, 0};
   SharedGuard table_guard(lock);
   auto up = live_.upper_bound(addr);
-  if (up == live_.begin()) return nullptr;
+  if (up == live_.begin()) return {nullptr, 0};
   auto prev = std::prev(up);
   const Allocation& a = prev->second;
   const uint64_t off = addr - prev->first;
-  if (!(off < a.size && len <= a.size - off)) return nullptr;
+  if (!(off < a.size && len <= a.size - off)) return {nullptr, 0};
+  if (a.card_valid.load(std::memory_order_relaxed) != 0) return {nullptr, 0};   // a card copy: every access takes resolve(), which asks the gate
+  if (&mem == &g_ended_lookups) return {&a, prev->first};
   // The epoch read under the shared lock cannot move while it is held.
   uint32_t v = mem.victim;
   v ^= v << 13, v ^= v >> 17, v ^= v << 5;
   mem.victim = v;
+  mem.prev = mem.last;
   mem.last = v % LookupMemory::kWays;
   LookupMemory::Entry& e = mem.way[mem.last];
   e.epoch = lock->epoch();
   e.base = prev->first;
   e.size = a.size;
   e.allocation = &a;
-  if (base_out) *base_out = prev->first;
-  return &a;
+  return {&a, prev->first};
 }
 
 [[gnu::always_inline]] inline const MemoryManager::Allocation* MemoryManager::find_ordinary(
     uint64_t addr, uint64_t len, uint64_t* base_out) const {
   BigReaderLock* lock = table_lock_.get();
   if (!lock || !lookup_cache_) return nullptr;
-  LookupMemory& mem = t_lookups;
+  LookupMemory& mem = lookups();
   const uint64_t epoch = lock->epoch();
   const LookupMemory::Entry& e = mem.way[mem.last];
   const uint64_t off = addr - e.base;
@@ -431,7 +548,26 @@ bool MemoryManager::lookup_cache_default() {
     if (base_out) *base_out = e.base;
     return static_cast<const Allocation*>(e.allocation);
   }
-  return find_ordinary_miss(addr, len, base_out);
+  const Found f = find_ordinary_miss(addr, len, &mem);
+  if (f.a && base_out) *base_out = f.base;
+  return f.a;
+}
+
+// The bytes of a naturally aligned scalar in a chunk that is real, when the last allocation this
+// thread found holds it and nothing else needs a say (no host mapping in reach): the answer the
+// general path gives for such an access, without its calls. Null for anything else -- another
+// allocation, an untouched or uniform chunk, a miss -- and the caller takes the general path.
+[[gnu::always_inline]] inline uint8_t* MemoryManager::hot_location(uint64_t addr, uint32_t size) const {
+  BigReaderLock* lock = table_lock_.get();
+  if (!lock || !lookup_cache_ || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
+  const LookupMemory& mem = lookups();
+  const LookupMemory::Entry& e = mem.way[mem.last];
+  const uint64_t off = addr - e.base;
+  if (e.epoch != lock->epoch() || off >= e.size || size > e.size - off) return nullptr;
+  const Allocation* a = static_cast<const Allocation*>(e.allocation);
+  uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+  if (!chunk || is_uniform(chunk)) return nullptr;
+  return chunk + off % kChunkSize;
 }
 
 const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, uint64_t len, const char* op,
@@ -439,6 +575,40 @@ const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, ui
                                                                bool page_slack) const {
   if (const Allocation* a = find_ordinary(addr, len, base_out)) return *a;
   return resolve(addr, len, op, base_out, writing, page_slack);
+}
+
+bool MemoryManager::batch_faults_clear(bool store) const {
+  if (store) {
+    if (access_fault_ && access_fault_->store_pending &&
+        __atomic_load_n(access_fault_->store_pending, __ATOMIC_RELAXED))
+      return false;
+  } else if (access_fault_ &&
+             (any_stuck() || (access_fault_->load_pending &&
+                              __atomic_load_n(access_fault_->load_pending, __ATOMIC_RELAXED)))) {
+    return false;
+  }
+  return true;
+}
+
+bool MemoryManager::batch_addresses_ok(const uint64_t* addrs, size_t count, uint32_t size, const Allocation** alloc,
+                                       uint64_t* base) const {
+  const Allocation* a = find_ordinary(addrs[0], size, base);
+  if (!a) return false;
+  // One pass for the two tests every address must pass: aligned, and inside the allocation (an address below its base wraps to
+  // an offset far above any size). Not in reach of a host mapping, the third test, follows from them where the whole allocation
+  // lies in the device windows and nothing is mapped in one; otherwise each address is asked.
+  const uint64_t limit = a->size - size + 1;   // (the first access is inside, so size <= a->size)
+  uint64_t bits = 0, outside = 0;
+  for (size_t i = 0; i < count; ++i) {
+    bits |= addrs[i];
+    outside |= static_cast<uint64_t>(addrs[i] - *base >= limit);
+  }
+  if ((bits & (size - 1)) || outside) return false;
+  if (!host_map_free_span(*base, a->size))
+    for (size_t i = 0; i < count; ++i)
+      if (host_maps_->may_contain(addrs[i])) return false;
+  *alloc = a;
+  return true;
 }
 
 // A warp's accesses at once -- the lanes of one load or store instruction -- for
@@ -449,46 +619,97 @@ const MemoryManager::Allocation& MemoryManager::resolve_scalar(uint64_t addr, ui
 bool MemoryManager::batch_ok(const uint64_t* addrs, size_t count, uint32_t size, bool store,
                              const Allocation** alloc, uint64_t* base) const {
   if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
-  if (store) {
-    if (access_fault_ && access_fault_->store_pending &&
-        __atomic_load_n(access_fault_->store_pending, __ATOMIC_RELAXED))
-      return false;
-  } else if (access_fault_ &&
-             (any_stuck() || (access_fault_->load_pending &&
-                              __atomic_load_n(access_fault_->load_pending, __ATOMIC_RELAXED)))) {
-    return false;
-  }
-  const Allocation* a = find_ordinary(addrs[0], size, base);
-  if (!a) return false;
-  for (size_t i = 0; i < count; ++i) {
-    const uint64_t off = addrs[i] - *base;
-    if ((addrs[i] & (size - 1)) || off >= a->size || size > a->size - off) return false;
-    if (host_maps_ && host_maps_->may_contain(addrs[i])) return false;
-  }
-  *alloc = a;
+  if (!batch_faults_clear(store)) return false;
+  return batch_addresses_ok(addrs, count, size, alloc, base);
+}
+
+bool MemoryManager::batch_window(const uint64_t* addrs, size_t count, uint32_t size, BatchWindow* window) const {
+  if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
+  if (!batch_faults_clear(false) || !batch_faults_clear(true)) return false;
+  const Allocation* a = nullptr;
+  if (!batch_addresses_ok(addrs, count, size, &a, &window->base)) return false;
+  window->alloc = a;
   return true;
 }
+
+void MemoryManager::load_batch_in(const Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size,
+                                  uint64_t* out) const {
+  // (The width a constant, so each load is the one instruction.)
+  const auto each = [&](auto width) {
+    constexpr uint32_t kSize = decltype(width)::value;
+    for (size_t i = 0; i < count; ++i) {
+      const uint64_t off = addrs[i] - base;
+      const uint8_t* chunk = a.chunks[off / kChunkSize].load(std::memory_order_acquire);
+      if (!chunk) out[i] = 0;
+      else if (is_uniform(chunk)) out[i] = repeated(uniform_byte(chunk), kSize);
+      else out[i] = load_at(chunk + off % kChunkSize, kSize);
+    }
+  };
+  switch (size) {
+    case 1: each(std::integral_constant<uint32_t, 1>()); break;
+    case 2: each(std::integral_constant<uint32_t, 2>()); break;
+    case 4: each(std::integral_constant<uint32_t, 4>()); break;
+    default: each(std::integral_constant<uint32_t, 8>()); break;
+  }
+}
+
+namespace {
+// A warp's loads (1 to 32 accesses of kSize bytes) with the tests of MemoryManager::batch_addresses_ok made in the same pass: for
+// each lane, its offset into the allocation (an address below the base wraps to far above any size, so one comparison with `limit`,
+// size - kSize + 1, finds both ends), the chunk it is in, and the load itself. Alignment and the bounds are known when the pass has
+// ended, and a lane past the end reads the allocation's first byte instead, so the pass reads nothing it should not; false then says
+// some lane failed (`out` is then of no use: a copy through a buffer, to leave it as it was, cost 4% of a gather-bound kernel). A lane in a chunk that is untouched or uniform is `slow(chunk, offset)`, the
+// whole of one lane's load. One pass rather than the tests and then the loads, or the chunk lookups and then the loads: a gather's
+// cache misses are what this waits on, and each of those splits ended up holding the loads back (measured: 13% slower).
+template <uint32_t kSize, class Slow>
+[[gnu::always_inline]] inline bool gather_loads(const std::atomic<uint8_t*>* chunks, uint64_t base, uint64_t limit, const uint64_t* addrs,
+                                                size_t n, uint64_t* out, Slow&& slow) {
+  using Word = std::conditional_t<kSize == 1, uint8_t, std::conditional_t<kSize == 2, uint16_t, std::conditional_t<kSize == 4, uint32_t, uint64_t>>>;
+  uint64_t bits = 0, outside = 0;
+  for (size_t i = 0; i < n; ++i) {
+    uint64_t off = addrs[i] - base;
+    bits |= addrs[i];
+    const bool past = off >= limit;
+    outside |= past;
+    off = past ? 0 : off;
+    const uint8_t* chunk = chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (__builtin_expect(chunk != nullptr && !(reinterpret_cast<uintptr_t>(chunk) & 1), 1)) out[i] = relaxed_load<Word>(chunk + (off & ~uint64_t{kSize - 1}) % kChunkSize);   // (a misaligned lane's result is not used)
+    else out[i] = slow(chunk, off);
+  }
+  return !((bits & (kSize - 1)) || outside);
+}
+}  // namespace
 
 bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
+  if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
+  if (!batch_faults_clear(/*store=*/false)) return false;
   const Allocation* a = nullptr;
   uint64_t base = 0;
-  if (!batch_ok(addrs, count, size, /*store=*/false, &a, &base)) return false;
-  for (size_t i = 0; i < count; ++i) {
-    const uint64_t off = addrs[i] - base;
-    const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
-    if (!chunk) out[i] = 0;
-    else if (is_uniform(chunk)) out[i] = repeated(uniform_byte(chunk), size);
-    else out[i] = load_at(chunk + off % kChunkSize, size);
+  // A warp's loads where no host mapping is in reach: the tests of batch_addresses_ok and the loads of load_batch_in in one pass.
+  // Anything else (more than a warp, a host mapping that may be in the allocation) takes the two steps.
+  if (count <= 32 && (a = find_ordinary(addrs[0], size, &base)) && host_map_free_span(base, a->size)) {
+    const uint64_t limit = a->size - size + 1;   // (the first access is inside, so size <= a->size)
+    const std::atomic<uint8_t*>* chunks = a->chunks.get();
+    const auto each = [&](auto width) {
+      constexpr uint32_t kSize = decltype(width)::value;
+      return gather_loads<kSize>(chunks, base, limit, addrs, count, out, [&](const uint8_t* chunk, uint64_t) -> uint64_t {
+        return chunk ? repeated(uniform_byte(chunk), kSize) : 0;   // (untouched, or uniform: the real chunks were read in the pass)
+      });
+    };
+    switch (size) {
+      case 1: return each(std::integral_constant<uint32_t, 1>());
+      case 2: return each(std::integral_constant<uint32_t, 2>());
+      case 4: return each(std::integral_constant<uint32_t, 4>());
+      default: return each(std::integral_constant<uint32_t, 8>());
+    }
   }
+  if (!batch_addresses_ok(addrs, count, size, &a, &base)) return false;
+  load_batch_in(*a, base, addrs, count, size, out);
   return true;
 }
 
-bool MemoryManager::store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
-                                size_t* failed_at) {
-  const Allocation* ca = nullptr;
-  uint64_t base = 0;
-  if (!batch_ok(addrs, count, size, /*store=*/true, &ca, &base)) return false;
-  Allocation& a = const_cast<Allocation&>(*ca);
+void MemoryManager::store_batch_in(Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size,
+                                   const uint64_t* vals, size_t* failed_at) {
   for (size_t i = 0; i < count; ++i) {
     const uint64_t off = addrs[i] - base;
     const uint64_t idx = off / kChunkSize;
@@ -508,7 +729,71 @@ bool MemoryManager::store_batch(const uint64_t* addrs, size_t count, uint32_t si
     }
     store_at(chunk + off % kChunkSize, size, vals[i]);
   }
+}
+
+bool MemoryManager::store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
+                                size_t* failed_at) {
+  const Allocation* ca = nullptr;
+  uint64_t base = 0;
+  if (!batch_ok(addrs, count, size, /*store=*/true, &ca, &base)) return false;
+  store_batch_in(const_cast<Allocation&>(*ca), base, addrs, count, size, vals, failed_at);
   return true;
+}
+
+// The mapping of the first address, and whether every access is aligned and inside it (an address below its base wraps to an offset far
+// above its length).
+bool MemoryManager::host_batch_hit(const uint64_t* addrs, size_t count, uint32_t size, bool store, HostHit* h) const {
+  if (count == 0 || (size != 1 && size != 2 && size != 4 && size != 8)) return false;
+  if (!host_maps_ || !host_maps_->may_contain(addrs[0]) || !lookup_host(addrs[0], size, h)) return false;
+  if (store && h->read_only) return false;
+  const uint64_t limit = h->len - size + 1;   // (the first access is inside, so size <= len)
+  uint64_t bits = 0, outside = 0;
+  for (size_t i = 0; i < count; ++i) {
+    bits |= addrs[i];
+    outside |= static_cast<uint64_t>(addrs[i] - h->base >= limit);
+  }
+  return !((bits & (size - 1)) || outside);
+}
+
+bool MemoryManager::host_load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
+  HostHit h;
+  if (!host_batch_hit(addrs, count, size, /*store=*/false, &h)) return false;
+  const auto each = [&](auto width) {
+    constexpr uint32_t kSize = decltype(width)::value;
+    for (size_t i = 0; i < count; ++i) out[i] = load_at(h.host + (addrs[i] - h.base), kSize);
+  };
+  switch (size) {
+    case 1: each(std::integral_constant<uint32_t, 1>()); break;
+    case 2: each(std::integral_constant<uint32_t, 2>()); break;
+    case 4: each(std::integral_constant<uint32_t, 4>()); break;
+    default: each(std::integral_constant<uint32_t, 8>()); break;
+  }
+  return true;
+}
+
+bool MemoryManager::host_store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals) {
+  HostHit h;
+  if (!host_batch_hit(addrs, count, size, /*store=*/true, &h)) return false;
+  const auto each = [&](auto width) {
+    constexpr uint32_t kSize = decltype(width)::value;
+    for (size_t i = 0; i < count; ++i) store_at(h.host + (addrs[i] - h.base), kSize, vals[i]);
+  };
+  switch (size) {
+    case 1: each(std::integral_constant<uint32_t, 1>()); break;
+    case 2: each(std::integral_constant<uint32_t, 2>()); break;
+    case 4: each(std::integral_constant<uint32_t, 4>()); break;
+    default: each(std::integral_constant<uint32_t, 8>()); break;
+  }
+  return true;
+}
+
+void MemoryManager::batch_load(const BatchWindow& window, const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const {
+  load_batch_in(*static_cast<const Allocation*>(window.alloc), window.base, addrs, count, size, out);
+}
+
+void MemoryManager::batch_store(const BatchWindow& window, const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
+                                size_t* failed_at) {
+  store_batch_in(const_cast<Allocation&>(*static_cast<const Allocation*>(window.alloc)), window.base, addrs, count, size, vals, failed_at);
 }
 
 MemoryManager::Allocation& MemoryManager::resolve_mut(uint64_t addr, uint64_t len, const char* op,
@@ -526,10 +811,11 @@ uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
   uint8_t* expected = a.chunks[chunk_idx].load(std::memory_order_acquire);
   while (!expected || is_uniform(expected)) {
     uint8_t* fresh = backing::acquire();
-    if (expected && uniform_byte(expected)) std::memset(fresh, uniform_byte(expected), kChunkSize);
+    const bool wide = expected && uniform_byte(expected);
+    if (wide) std::memset(fresh, uniform_byte(expected), kChunkSize);
     if (a.chunks[chunk_idx].compare_exchange_strong(expected, fresh, std::memory_order_acq_rel))
       return fresh;
-    backing::release(fresh);
+    backing::release(fresh, wide ? backing::kAllBytesDirty : 0);
   }
   return expected;
 }
@@ -543,6 +829,7 @@ uint8_t* MemoryManager::materialize(Allocation& a, uint64_t chunk_idx) {
 
 void MemoryManager::fill(uint64_t dst, const uint8_t* pattern, uint32_t pattern_len, uint64_t len) {
   if (len == 0) return;
+  VGPU_MEM_TRACE('Z', dst, len);
   // Host memory mapped here is filled where it is, the pattern's phase
   // running on across pieces.
   if (std::vector<HostPiece> pieces; host_pieces(dst, len, &pieces, true)) {
@@ -613,11 +900,11 @@ uint64_t MemoryManager::resident_bytes() const {
 
 void MemoryManager::write(uint64_t dst, const void* src, uint64_t len) {
   if (len == 0) return;
+  VGPU_MEM_TRACE('W', dst, len);
   if (host_maps_ && host_maps_->may_contain(dst)) {
-    std::lock_guard<std::mutex> lock(host_maps_->mu);
-    if (const HostMap* m = find_host_map_locked(dst, len)) {
-      if (m->read_only) throw_read_only_host_write(dst, len);
-      std::memcpy(m->host + (dst - m->base), src, len);
+    if (HostHit h; lookup_host(dst, len, &h)) {
+      if (h.read_only) throw_read_only_host_write(dst, len);
+      std::memcpy(h.host + (dst - h.base), src, len);
       return;
     }
   }
@@ -670,6 +957,51 @@ bool MemoryManager::host_pieces(uint64_t addr, uint64_t len, std::vector<HostPie
   return true;
 }
 
+uint64_t MemoryManager::fresh_generation() {
+  static std::atomic<uint64_t> counter{0};
+  return counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+MemoryManager::HostMaps::HostMaps() : gen(MemoryManager::fresh_generation()) {}
+
+namespace {
+std::atomic<bool> g_host_lookup_cache{[] {
+  const char* e = std::getenv("VGPU_HOSTMAP_CACHE");
+  return !(e && e[0] == '0' && e[1] == 0);
+}()};
+}  // namespace
+
+void MemoryManager::set_host_lookup_cache(bool on) { g_host_lookup_cache.store(on, std::memory_order_relaxed); }
+
+bool MemoryManager::lookup_host(uint64_t addr, uint64_t len, HostHit* out) const {
+  if (!g_host_lookup_cache.load(std::memory_order_relaxed)) {   // VGPU_HOSTMAP_CACHE=0: the table, under its mutex, every time
+    std::lock_guard<std::mutex> lock(host_maps_->mu);
+    const HostMap* m = find_host_map_locked(addr, len);
+    if (!m) return false;
+    *out = HostHit{m->host, m->base, m->len, m->read_only};
+    return true;
+  }
+  struct Entry {
+    const HostMaps* owner = nullptr;
+    uint64_t gen = 0;
+    HostHit hit{};
+  };
+  thread_local Entry cache[4];
+  thread_local unsigned next = 0;
+  const uint64_t g = host_maps_->gen.load(std::memory_order_acquire);
+  for (const Entry& e : cache)
+    if (e.owner == host_maps_.get() && e.gen == g && addr >= e.hit.base && addr + len <= e.hit.base + e.hit.len) {
+      *out = e.hit;
+      return true;
+    }
+  std::lock_guard<std::mutex> lock(host_maps_->mu);
+  const HostMap* m = find_host_map_locked(addr, len);
+  if (!m) return false;
+  *out = HostHit{m->host, m->base, m->len, m->read_only};
+  cache[next++ % 4] = Entry{host_maps_.get(), host_maps_->gen.load(std::memory_order_relaxed), *out};
+  return true;
+}
+
 const MemoryManager::HostMap* MemoryManager::find_host_map_locked(uint64_t addr,
                                                                    uint64_t len) const {
   if (!host_maps_) return nullptr;
@@ -692,6 +1024,7 @@ void MemoryManager::map_host(uint64_t addr, void* host, uint64_t len, bool read_
     host_maps_->hi.store(addr + len, std::memory_order_relaxed);
   if (addr < kDeviceVaEnd && addr + len > kDeviceVaBase)
     host_maps_->in_device_window.store(true, std::memory_order_relaxed);
+  host_maps_->gen.store(fresh_generation(), std::memory_order_release);
 }
 
 void MemoryManager::unmap_host(uint64_t addr) {
@@ -704,11 +1037,14 @@ void MemoryManager::unmap_host(uint64_t addr) {
       if (retired.size() >= kRetiredHostMaps) retired.erase(retired.begin());
       retired.push_back(HostMap{v[i].base, v[i].len, nullptr});
       v.erase(v.begin() + static_cast<long>(i));
+      host_maps_->gen.store(fresh_generation(), std::memory_order_release);
       break;
     }
 }
 
 void MemoryManager::free_all() {
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_free(UINT64_MAX);
   // The heap's blocks go in the sweep below with every other allocation; its
   // record of them, and the budget they held, go here.
   std::lock_guard<std::mutex> heap_guard(heap_->mu);
@@ -1070,6 +1406,9 @@ bool MemoryManager::access_at(uint64_t va, bool* readable, bool* writable) const
 // ---- memory another process can map -------------------------------------------
 
 uint64_t MemoryManager::share(uint64_t ptr, const std::string& path) {
+  // The exported file is the allocation from here on: whatever only the card holds comes back first.
+  if (card_resident_.load(std::memory_order_relaxed) > 0)
+    if (CardGate* gate = card_gate_.load(std::memory_order_acquire)) gate->before_access(ptr, UINT64_MAX / 2, false);
   ExclusiveGuard table_guard(table_lock_.get());
   if (const auto it = shared_.find(ptr); it != shared_.end()) return it->second.size;
   const auto live = live_.find(ptr);
@@ -1164,27 +1503,27 @@ void MemoryManager::drop_shared(std::map<uint64_t, SharedRegion>::iterator it) {
 
 uint8_t* MemoryManager::host_address(uint64_t addr, uint64_t len) const {
   if (!host_maps_->may_contain(addr)) return nullptr;
-  std::lock_guard<std::mutex> lock(host_maps_->mu);
-  const HostMap* m = find_host_map_locked(addr, len);
+  HostHit h;
+  if (!lookup_host(addr, len, &h)) return nullptr;
   // The one caller that gets a pointer to write through is an atomic.
-  if (m && m->read_only) throw_read_only_host_write(addr, len);
-  return m ? m->host + (addr - m->base) : nullptr;
+  if (h.read_only) throw_read_only_host_write(addr, len);
+  return h.host + (addr - h.base);
 }
 
 bool MemoryManager::is_host_mapped(uint64_t addr) const {
   // Nothing mapped near it: no lock, as before any buffer was mapped at all.
   if (!host_maps_->may_contain(addr)) return false;
-  std::lock_guard<std::mutex> lock(host_maps_->mu);
-  return find_host_map_locked(addr, 1) != nullptr;
+  HostHit h;
+  return lookup_host(addr, 1, &h);
 }
 
 void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
   if (len == 0) return;
+  VGPU_MEM_TRACE('R', src, len);
   // Managed memory is the caller's own buffer; there is no chunk table to walk.
   if (host_maps_ && host_maps_->may_contain(src)) {
-    std::lock_guard<std::mutex> lock(host_maps_->mu);
-    if (const HostMap* m = find_host_map_locked(src, len)) {
-      std::memcpy(dst, m->host + (src - m->base), len);
+    if (HostHit h; lookup_host(src, len, &h)) {
+      std::memcpy(dst, h.host + (src - h.base), len);
       return;
     }
   }
@@ -1252,13 +1591,16 @@ const MemoryManager::Allocation* MemoryManager::run_allocation(uint64_t addr, ui
   if (access_fault_ && (armed(access_fault_->stuck_pending) || armed(access_fault_->load_pending) ||
                         armed(access_fault_->store_pending)))
     return nullptr;
-  if (addr % unit || len % unit || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
+  // (`unit` is a power of two here: a mask where it was two divisions.)
+  if (((addr | len) & (unit - 1)) || (host_maps_ && host_maps_->may_contain(addr))) return nullptr;
+  if (const Allocation* a = find_ordinary(addr, len, base)) return a;
   SharedGuard table_guard(table_lock_.get());
   auto up = live_.upper_bound(addr);
   if (up == live_.begin()) return nullptr;
   auto prev = std::prev(up);
   *base = prev->first;
   if (addr - *base >= prev->second.size || len > prev->second.size - (addr - *base)) return nullptr;
+  if (prev->second.card_valid.load(std::memory_order_relaxed) != 0) return nullptr;
   return &prev->second;
 }
 
@@ -1304,6 +1646,56 @@ bool MemoryManager::store_run(uint64_t addr, const void* src, uint64_t len, uint
   return true;
 }
 
+// (cold and out of line: a large copy is rare beside the kernels' accesses, and its code stays out of the hot text, whose layout moves the
+// interpreters' rows by a few percent at equal instructions)
+[[gnu::cold, gnu::noinline]] bool MemoryManager::copy_to(MemoryManager& dst_mm, uint64_t dst, uint64_t src, uint64_t len) const {
+  if (len == 0) return true;
+  // read() takes a fault armed on copies and write() none; run_allocation declines the others (loads, stores, stuck cells).
+  const auto armed = [](const uint64_t* pending) { return pending && __atomic_load_n(pending, __ATOMIC_RELAXED); };
+  const auto copy_armed = [&](const MemoryManager& m) { return m.access_fault_ && armed(m.access_fault_->copy_pending); };
+  if (copy_armed(*this) || copy_armed(dst_mm)) return false;
+  // A managed or pinned buffer in a device window is host memory behind a lock; both ends are asked, as a range can start
+  // outside the mapping and run into it.
+  const auto host_in_reach = [len](const MemoryManager& m, uint64_t addr) {
+    return m.host_maps_ && (m.host_maps_->may_contain(addr) || m.host_maps_->may_contain(addr + len - 1));
+  };
+  if (host_in_reach(*this, src) || host_in_reach(dst_mm, dst)) return false;
+  uint64_t sbase = 0, dbase = 0;
+  const Allocation* sa = run_allocation(src, len, 1, &sbase);
+  Allocation* da = const_cast<Allocation*>(dst_mm.run_allocation(dst, len, 1, &dbase));
+  if (!sa || !da || sa->external || da->external) return false;
+  // Ranges of one allocation that overlap need the whole source read before the first byte is written.
+  if (sa == da && src < dst + len && dst < src + len) return false;
+  // What a chunk that reads as one byte (untouched: zero) is copied from. Per thread, and out of line from the stack: a
+  // call whose chunks are all real never touches it.
+  static thread_local uint8_t fill[kChunkSize];
+  int filled = -1;
+  uint64_t soff = src - sbase, doff = dst - dbase;
+  while (len > 0) {
+    const uint64_t n = std::min({len, kChunkSize - soff % kChunkSize, kChunkSize - doff % kChunkSize});
+    const uint8_t* sc = sa->chunks[soff / kChunkSize].load(std::memory_order_acquire);
+    const uint8_t* s;
+    if (sc && !is_uniform(sc)) {
+      s = sc + soff % kChunkSize;
+    } else {
+      const int byte = sc ? uniform_byte(sc) : 0;   // (untouched memory reads as zero)
+      if (filled != byte) std::memset(fill, byte, kChunkSize), filled = byte;
+      s = fill;
+    }
+    const uint64_t didx = doff / kChunkSize;
+    uint8_t* dc = da->chunks[didx].load(std::memory_order_acquire);
+    // As write(): a uniform chunk is not made real to be given its own byte again.
+    if (!(is_uniform(dc) && all_bytes(s, n, uniform_byte(dc)))) {
+      if (!dc || is_uniform(dc)) dc = dst_mm.materialize(*da, didx);
+      std::memcpy(dc + doff % kChunkSize, s, n);
+    }
+    soff += n;
+    doff += n;
+    len -= n;
+  }
+  return true;
+}
+
 void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, uint64_t len) const {
   while (len > 0) {
     uint64_t chunk_idx = off / kChunkSize;
@@ -1320,6 +1712,25 @@ void MemoryManager::read_chunks(const Allocation& a, uint64_t off, uint8_t* d, u
     off += n;
     len -= n;
   }
+}
+
+std::atomic<uint32_t>* MemoryManager::card_slot(uint64_t base) const {
+  SharedGuard table_guard(table_lock_.get());
+  const auto it = live_.find(base);
+  return it == live_.end() ? nullptr : const_cast<std::atomic<uint32_t>*>(&it->second.card_valid);
+}
+
+void MemoryManager::card_void_lookups(const std::vector<uint64_t>& bases) {
+  ExclusiveGuard table_guard(table_lock_.get(), /*quiet=*/true);
+  for (uint64_t b : bases) table_lock_->note_free(b);
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> MemoryManager::live_ranges() const {
+  SharedGuard table_guard(table_lock_.get());
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  out.reserve(live_.size());
+  for (const auto& [base, a] : live_) out.emplace_back(base, a.size);
+  return out;
 }
 
 bool MemoryManager::find_allocation(uint64_t addr, uint64_t* base, uint64_t* size) const {
@@ -1352,7 +1763,9 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
                       " is not naturally aligned (real GPUs fault on this)");
   const uint8_t* p = nullptr;
   uint64_t v = 0;
-  switch (scalar_location(addr, size, /*store=*/nullptr, &p)) {
+  if ((p = hot_location(addr, size)) != nullptr) {
+    v = load_at(p, size);
+  } else switch (scalar_location(addr, size, /*store=*/nullptr, &p)) {
     case ScalarAt::Chunk:
       v = load_at(p, size);
       break;
@@ -1367,6 +1780,8 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
       v = 0;
       break;
     case ScalarAt::Unchanged:  // only answered for a store
+      read(addr, &v, size);    // (never reached for a load; the plain copy is the safe answer)
+      return v;
     case ScalarAt::HostMap:
       // Host memory, mapped: no device ECC covers it, so no fault is taken.
       // Read as an atomic of its width, as a chunk's scalar is: the host, or
@@ -1374,12 +1789,7 @@ uint64_t MemoryManager::load_scalar(uint64_t addr, uint32_t size) const {
       // the CPU's atomics -- which is how the engines make a device atomic on
       // such memory (vgpu/exec/host_atomic.hpp) -- and a memcpy racing those
       // is a data race (ThreadSanitizer, e2e_host_atomics).
-      {
-        std::lock_guard<std::mutex> lock(host_maps_->mu);
-        if (const HostMap* m = find_host_map_locked(addr, size)) return load_at(m->host + (addr - m->base), size);
-      }
-      read(addr, &v, size);  // little-endian host assumption, documented in ARCHITECTURE.md
-      return v;
+      return load_at(p, size);
   }
   // What the cells hold, stuck bits included (little-endian, as above), and
   // then whatever fault is armed for the load.
@@ -1401,6 +1811,10 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
   if (access_fault_ && access_fault_->store_pending &&
       __atomic_load_n(access_fault_->store_pending, __ATOMIC_RELAXED) && !is_host_mapped(addr))
     value = access_fault_->on_store(addr, size, value);
+  if (uint8_t* hot = hot_location(addr, size)) {
+    store_at(hot, size, value);
+    return;
+  }
   const uint8_t* p = nullptr;
   switch (scalar_location(addr, size, &value, &p)) {
     case ScalarAt::Chunk:
@@ -1408,16 +1822,11 @@ void MemoryManager::store_scalar(uint64_t addr, uint32_t size, uint64_t value) {
       return;
     case ScalarAt::Unchanged:
       return;
-    case ScalarAt::HostMap: {
-      // An atomic store of its width, as load_scalar's load is.
-      std::lock_guard<std::mutex> lock(host_maps_->mu);
-      if (const HostMap* m = find_host_map_locked(addr, size)) {
-        if (m->read_only) throw_read_only_host_write(addr, size);
-        store_at(m->host + (addr - m->base), size, value);
-        return;
-      }
-      break;
-    }
+    case ScalarAt::HostMap:
+      // An atomic store of its width, as load_scalar's load is. scalar_location found the bytes (and refused a
+      // read-only mapping), so there is no second lookup.
+      store_at(const_cast<uint8_t*>(p), size, value);
+      return;
     default:
       break;
   }
@@ -1467,6 +1876,41 @@ void MemoryManager::store_quad(uint64_t addr, const uint64_t in[2]) {
   store16(chunk + off % kChunkSize, in);
 }
 
+bool MemoryManager::load_quad_run(uint64_t addr, size_t count, uint64_t* out) const {
+  if (!count || addr % 16 || (host_maps_ && host_maps_->may_contain(addr + 16 * (count - 1)))) return false;
+  uint64_t base = 0;
+  const Allocation* a = run_allocation(addr, 16 * count, 8, &base);   // (also declines while a fault is armed)
+  if (!a || (host_maps_ && host_maps_->may_contain(addr))) return false;
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addr + 16 * i - base;
+    const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (!chunk) {
+      out[2 * i] = out[2 * i + 1] = 0;
+    } else if (is_uniform(chunk)) {
+      out[2 * i] = out[2 * i + 1] = repeated(uniform_byte(chunk), 8);
+    } else {
+      load16(chunk + off % kChunkSize, out + 2 * i);
+    }
+  }
+  return true;
+}
+
+bool MemoryManager::store_quad_run(uint64_t addr, size_t count, const uint64_t* in) {
+  if (!count || addr % 16 || (host_maps_ && host_maps_->may_contain(addr + 16 * (count - 1)))) return false;
+  uint64_t base = 0;
+  Allocation* a = const_cast<Allocation*>(run_allocation(addr, 16 * count, 8, &base));
+  if (!a || (host_maps_ && host_maps_->may_contain(addr))) return false;
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addr + 16 * i - base;
+    const uint64_t chunk_idx = off / kChunkSize;
+    uint8_t* chunk = a->chunks[chunk_idx].load(std::memory_order_acquire);
+    if (is_uniform(chunk) && in[2 * i] == in[2 * i + 1] && in[2 * i] == repeated(uniform_byte(chunk), 8)) continue;
+    if (!chunk || is_uniform(chunk)) chunk = materialize(*a, chunk_idx);
+    store16(chunk + off % kChunkSize, in + 2 * i);
+  }
+  return true;
+}
+
 // Where a kernel's scalar load or store lives: bytes in a chunk (materialized
 // first when this is a store), memory nothing has written (only ever answered
 // for a load), or managed memory -- the caller's own buffer, which takes the
@@ -1491,8 +1935,11 @@ MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t s
                                                        const uint8_t** where) const {
   const bool create = store != nullptr;
   if (host_maps_ && host_maps_->may_contain(addr)) {
-    std::lock_guard<std::mutex> lock(host_maps_->mu);
-    if (find_host_map_locked(addr, size)) return ScalarAt::HostMap;
+    if (HostHit h; lookup_host(addr, size, &h)) {
+      if (create && h.read_only) throw_read_only_host_write(addr, size);
+      *where = h.host + (addr - h.base);
+      return ScalarAt::HostMap;
+    }
   }
   uint64_t base = 0;
   auto& a = const_cast<Allocation&>(resolve_scalar(addr, size, create ? "device memory write" : "device memory read",
@@ -1510,6 +1957,230 @@ MemoryManager::ScalarAt MemoryManager::scalar_location(uint64_t addr, uint32_t s
   }
   *where = chunk + off % kChunkSize;
   return ScalarAt::Chunk;
+}
+
+// ---- read-modify-write and multi-field reads: load_scalar / store_scalar with one lookup ----
+
+bool MemoryManager::rmw_locate(uint64_t addr, uint32_t size, RmwSlot* s) const {
+  if ((size != 1 && size != 2 && size != 4 && size != 8) || (addr & (size - 1))) return false;
+  if (access_faults_armed()) return false;
+  if (host_maps_ && host_maps_->may_contain(addr)) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(addr, size, &base);
+  if (!a) return false;
+  const uint64_t off = addr - base;
+  s->a = const_cast<Allocation*>(a);
+  s->chunk_idx = off / kChunkSize;
+  s->coff = off % kChunkSize;
+  s->chunk = a->chunks[s->chunk_idx].load(std::memory_order_acquire);
+  return true;
+}
+
+[[gnu::always_inline]] inline uint64_t MemoryManager::rmw_load(const RmwSlot& s, uint32_t size) const {
+  if (!s.chunk) return 0;
+  if (is_uniform(s.chunk)) return repeated(uniform_byte(s.chunk), size);
+  return load_at(s.chunk + s.coff, size);
+}
+
+[[gnu::always_inline]] inline void MemoryManager::rmw_store(RmwSlot& s, uint32_t size, uint64_t value) {
+  uint8_t* chunk = s.chunk;
+  // A chunk that was real stays so; one that was not may have been made real since.
+  if (!chunk || is_uniform(chunk)) chunk = s.a->chunks[s.chunk_idx].load(std::memory_order_acquire);
+  if (is_uniform(chunk)) {
+    // As store_scalar: a uniform chunk is left alone by a store of its own byte.
+    if (value == repeated(uniform_byte(chunk), size)) return;
+  }
+  if (!chunk || is_uniform(chunk)) chunk = materialize(*s.a, s.chunk_idx);
+  store_at(chunk + s.coff, size, value);
+}
+
+bool MemoryManager::rmw_scalar_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out) {
+  RmwSlot s;
+  if (!rmw_locate(addr, size, &s)) return false;
+  const uint64_t old = rmw_load(s, size);
+  *old_out = old;
+  rmw_store(s, size, compute(ctx, old));
+  return true;
+}
+
+bool MemoryManager::rmw_if_changed_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out) {
+  if ((size != 1 && size != 2 && size != 4 && size != 8) || (addr & (size - 1)) || access_faults_armed()) return false;
+  // The word in a chunk that is real and the last allocation found holds it (as load_scalar and store_scalar take it first);
+  // anything else -- an untouched or uniform chunk, another allocation -- is the general path's.
+  uint8_t* p = hot_location(addr, size);
+  if (!p) return false;
+  const uint64_t old = load_at(p, size);
+  *old_out = old;
+  const uint64_t now = compute(ctx, old);
+  if (now != old) store_at(p, size, now);
+  return true;
+}
+
+bool MemoryManager::atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out,
+                                  bool always_store) {
+  if (size != 4 && size != 8) return false;
+  RmwSlot s;
+  if (!rmw_locate(addr, size, &s)) return false;
+  atomic_rmw_slot(s, size, compute, ctx, old_out, always_store);
+  return true;
+}
+
+bool MemoryManager::rmw_batch_fn(const uint64_t* addrs, size_t count, uint32_t size, RmwLaneFn compute, void* ctx,
+                                 uint64_t* olds, size_t* done, bool lock_free, bool always_store) {
+  *done = 0;
+  if (count == 0) return true;
+  if (lock_free && size != 4 && size != 8) return false;
+  if (access_faults_armed()) return false;
+  const Allocation* ca = nullptr;
+  uint64_t base = 0;
+  if (!batch_ok(addrs, count, size, /*store=*/true, &ca, &base)) return false;
+  Allocation& a = const_cast<Allocation&>(*ca);
+  struct Lane {
+    RmwLaneFn fn;
+    void* ctx;
+    size_t i;
+  } lane{compute, ctx, 0};
+  const auto trampoline = [](void* c, uint64_t old) -> uint64_t {
+    const Lane* l = static_cast<const Lane*>(c);
+    return l->fn(l->ctx, l->i, old);
+  };
+  // (The width a constant in the plain loop, so each access is the one instruction.)
+  const auto plain = [&](auto width) {
+    constexpr uint32_t kSize = decltype(width)::value;
+    for (size_t i = 0; i < count; ++i) {
+      const uint64_t off = addrs[i] - base;
+      // (The chunk is read for each lane: an earlier lane's store may have made it real.)
+      RmwSlot s{&a, off / kChunkSize, off % kChunkSize, nullptr};
+      s.chunk = a.chunks[s.chunk_idx].load(std::memory_order_acquire);
+      const uint64_t old = rmw_load(s, kSize);
+      olds[i] = old;
+      const uint64_t now = compute(ctx, i, old);
+      if (now != old || always_store) rmw_store(s, kSize, now);
+      *done = i + 1;
+    }
+  };
+  if (!lock_free) {
+    switch (size) {
+      case 1: plain(std::integral_constant<uint32_t, 1>()); break;
+      case 2: plain(std::integral_constant<uint32_t, 2>()); break;
+      case 4: plain(std::integral_constant<uint32_t, 4>()); break;
+      default: plain(std::integral_constant<uint32_t, 8>()); break;
+    }
+    return true;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addrs[i] - base;
+    RmwSlot s{&a, off / kChunkSize, off % kChunkSize, nullptr};
+    s.chunk = a.chunks[s.chunk_idx].load(std::memory_order_acquire);
+    lane.i = i;
+    atomic_rmw_slot(s, size, trampoline, &lane, &olds[i], always_store);
+    *done = i + 1;
+  }
+  return true;
+}
+
+void MemoryManager::atomic_rmw_slot(RmwSlot& s, uint32_t size, RmwFn compute, void* ctx, uint64_t* old_out,
+                                    bool always_store) {
+  for (;;) {
+    if (s.chunk && !is_uniform(s.chunk)) {
+      uint8_t* p = s.chunk + s.coff;
+      if (size == 4) {
+        uint32_t* w = reinterpret_cast<uint32_t*>(p);
+        uint32_t old = __atomic_load_n(w, __ATOMIC_RELAXED);
+        for (;;) {
+          const uint32_t now = static_cast<uint32_t>(compute(ctx, old));
+          if (now == old) break;   // nothing to change: the load was the whole operation
+          if (__atomic_compare_exchange_n(w, &old, now, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break;
+        }
+        *old_out = old;
+      } else {
+        uint64_t* w = reinterpret_cast<uint64_t*>(p);
+        uint64_t old = __atomic_load_n(w, __ATOMIC_RELAXED);
+        for (;;) {
+          const uint64_t now = compute(ctx, old);
+          if (now == old) break;
+          if (__atomic_compare_exchange_n(w, &old, now, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break;
+        }
+        *old_out = old;
+      }
+      return;
+    }
+    // Nothing real to swap on: what the chunk reads as, and whether the result would change it.
+    const uint64_t old = rmw_load(s, size);
+    const uint64_t now = compute(ctx, old);
+    const bool uniform = s.chunk != nullptr;
+    if (uniform ? now == old : (now == old && !always_store)) {
+      *old_out = old;
+      return;
+    }
+    // The store makes the chunk real; the swap then runs on it, from whatever it holds by then.
+    s.chunk = materialize(*s.a, s.chunk_idx);
+  }
+}
+
+bool MemoryManager::load_fields(uint64_t addr, const uint8_t* sizes, unsigned n, uint64_t* out) const {
+  uint64_t total = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t sz = sizes[i];
+    if (sz == 0) continue;
+    if ((sz != 1 && sz != 2 && sz != 4 && sz != 8) || ((addr + total) & (sz - 1))) return false;
+    if (host_maps_ && host_maps_->may_contain(addr + total)) return false;
+    total += sz;
+  }
+  if (total == 0) {
+    for (unsigned i = 0; i < n; ++i) out[i] = 0;
+    return true;
+  }
+  if (access_faults_armed()) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(addr, total, &base);
+  if (!a) return false;
+  uint64_t off = addr - base;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint32_t sz = sizes[i];
+    if (sz == 0) {
+      out[i] = 0;
+      continue;
+    }
+    const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+    if (!chunk) out[i] = 0;
+    else if (is_uniform(chunk)) out[i] = repeated(uniform_byte(chunk), sz);
+    else out[i] = load_at(chunk + off % kChunkSize, sz);
+    off += sz;
+  }
+  return true;
+}
+
+bool MemoryManager::load_texels(const uint64_t* addrs, unsigned n, uint32_t size, unsigned channels, uint64_t* out) const {
+  const uint64_t total = uint64_t{size} * channels;
+  uint64_t lo = addrs[0], hi = addrs[0];
+  uint64_t misaligned = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    const uint64_t a = addrs[i];
+    misaligned |= a;
+    lo = a < lo ? a : lo;
+    hi = a > hi ? a : hi;
+  }
+  if (misaligned & (size - 1)) return false;
+  // (One range test where load_fields tests each field's start: it refuses whenever one of those would, and so is the
+  // same answer by the slower road in the rare case it refuses more.)
+  if (host_maps_ && host_maps_->may_overlap(lo, hi + total - 1)) return false;
+  if (access_faults_armed()) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(lo, hi - lo + total, &base);
+  if (!a) return false;
+  for (unsigned i = 0; i < n; ++i) {
+    uint64_t off = addrs[i] - base;
+    for (unsigned c = 0; c < channels; ++c, off += size) {
+      const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+      uint64_t v;
+      if (!chunk) v = 0;
+      else if (is_uniform(chunk)) v = repeated(uniform_byte(chunk), size);
+      else v = load_at(chunk + off % kChunkSize, size);
+      out[i * channels + c] = v;
+    }
+  }
+  return true;
 }
 
 }  // namespace vgpu

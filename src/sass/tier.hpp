@@ -14,7 +14,7 @@
 // mask forced by BMOV.PQUAD MACTIVE, a register past the warp's file) -- goes to Runner::execute, which is the
 // existing code. Divergent warps work: a handler takes the executing lane mask like the interpreter's does.
 //
-// Off by default: VGPU_TIER=1 turns it on (docs/cli.md). Every handler is held to the bits of the interpreter's path
+// On by default: VGPU_TIER=0 turns it off (docs/cli.md). Every handler is held to the bits of the interpreter's path
 // for the same form (tests: nvidia/tests/e2e/run_sass_tier.sh, tests/unit/test_tier.cpp).
 //
 // This header is the data the analysis (tier.cpp: Instr -> MOp, no execution) and the handlers (tier_ops.inc,
@@ -27,6 +27,10 @@
 #include <vector>
 
 #include "vgpu/sass/sass.hpp"
+
+namespace vgpu::sass::jit {
+struct Unit;
+}
 
 namespace vgpu::sass::tier {
 
@@ -123,9 +127,22 @@ enum class Form : uint8_t {
   Uunary,    // UFLO, UPOPC
   Usel,
   Hmma,      // HMMA (dense f16, bf16, tf32 with an f32 or f16 accumulator): the SIMD kernel; ends a run, has a handler
+  Match,     // MATCH.ANY / MATCH.ALL on 32 or 64 bits: ends a run, has a handler
+  Ldsm,      // LDSM, the 16-bit forms (ldmatrix .M88, .MT88): ends a run, has a handler
+  Imma,      // IMMA (dense, 8- or 4-bit elements into s32, plain or .SAT): ends a run, has a handler
+  Atom,      // ATOMG, ATOM, ATOMS, RED: ends a run; the handler is exec_mem, which batches a warp's atomics
+  Fchk,      // FCHK into a predicate: the division's slow path is always taken (exec_float), so the predicate is true on every executing lane
+  Call,      // CALL.REL (a fixed target in this section, not a function VirtualGPU provides): ends a run, run by tier_run itself
+  Ret,       // RET.REL: ends a run, run by tier_run itself
+  Warpsync,  // WARPSYNC: ends a run, run by tier_run itself (the release is the interpreter's: Runner::release_warpsync)
+  Ldgsts,    // LDGSTS (cp.async) of 4, 8 or 16 bytes without .ZFILL: ends a run, has a handler
+  Ld,        // LD (generic address) of 1 to 16 bytes: the lanes all in the shared window, or none in any window; anything else is the interpreter's
+  St,        // ST (generic address): as Ld
   Count_,
 };
 const char* form_name(Form f);
+// The forms whose handlers only read and write registers and predicates (and the uniform ones): see Program::run.
+bool pure_register_form(Form f);
 
 // How a form's RESULT is computed, so that the rules of the interpreter cannot drift away from the tier's unnoticed (tests/unit/test_tier.cpp holds
 // this table to a checked-in list and reads tier_ops.inc for what a handler may not contain):
@@ -165,7 +182,12 @@ struct MOp {
   bool never = false;            // @!PT: the guard is false for every lane, so it does nothing but count
   bool straight = false;         // Instr::straight
   uint8_t aux = 0;               // form-specific flags
+  // How many instructions from this one on (at most 255) the run loop can issue back to back for a whole group (Runner::tier_run_t): straight,
+  // unguarded, with a handler, and a pure register form (no memory, no scheduler, nothing that can fault), none of them the section's last. Set
+  // when the section's program is built (the analysis does not know the next instruction); 0 for an instruction that is not in such a stretch.
+  uint8_t run = 0;
 };
+static_assert(sizeof(MOp) == 96, "an op is 96 bytes: a cache line and a half, which the run loop reads one after the other");
 inline constexpr uint16_t kNoReg = 0xffff;
 
 // The tier of one code section: a MOp per instruction, and the constant rows they point at.
@@ -175,13 +197,29 @@ struct Program {
   std::map<uint32_t, uint32_t> const_index;   // value -> pool row, while the program is built
   uint16_t max_reg = 0;          // the largest MOp::maxreg: a warp whose file holds this needs no per-op check
   size_t native = 0;             // instructions with a handler
+  std::shared_ptr<jit::Unit> jit;   // tier 2 (VGPU_JIT=1, src/sass/jit.hpp): the regions of this section, null when there are none or the JIT is off
 };
+
+// A shuffle whose lane and clamp are the same for all 32 lanes, with a full width (a segment mask of 0) and a lane under 32 -- every
+// __shfl_xor_sync/__shfl_down_sync/__shfl_up_sync/__shfl_sync with a constant or a loop's variable lane -- moves the words in one of a few
+// shapes that need no per-lane work. `in` is the in-range predicate (the same arithmetic as exec_warp's per-lane code, worked out for the
+// whole warp). None: no such shape, the per-lane code runs.
+struct ShflShape {
+  enum Kind : uint8_t { None, Ident, Splat, Butterfly, Down, Up };
+  Kind kind = None;
+  uint32_t x = 0;    // the lane (Splat), the xor mask (Butterfly) or the distance (Down, Up)
+  uint32_t in = 0;
+};
+// The shape of mode `mode` (0 idx, 1 up, 2 down, 3 bfly) with lane `b` and clamp word `cc`; kind None for any other.
+bool shfl_shape(unsigned mode, uint32_t b, uint32_t cc, ShflShape& out);
+// The shuffle `sh` of the 32 words at `src` into `out` (a full warp).
+void shfl_move(const ShflShape& sh, const uint32_t* src, uint32_t* out);
 
 // The analysis half. Fills in everything of `op` but `fn` (the executor binds handlers by `form`).
 // `sm` is the architecture the code was decoded for. Never throws on an instruction it does not take: Form::None.
 void analyze(const Instr& ins, int sm, Program& prog, MOp& op);
 
-// Whether VGPU_TIER asks for the tier (read once per process). The executor also requires its fast paths
+// Whether the tier is on: it is, unless VGPU_TIER=0 (read once per process). The executor also requires its fast paths
 // (VGPU_FASTPATH) and the SIMD kernels (VGPU_SIMD) on, and no per-instruction trace.
 bool requested();
 

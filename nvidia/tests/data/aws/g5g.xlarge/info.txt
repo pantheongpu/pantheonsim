@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA T4G, 7.5, 15360 MiB, 595.91.07, GPU-8e230bb5-dbec-5744-8e6f-fdc391bd2470
+Cuda compilation tools, release 13.2, V13.2.51
+Build cuda_13.2.r13.2/compiler.37434383_0
+ngpu=1 arch=sm_75 libs=/usr/local/cuda-13.2/extras/CUPTI/lib64 inc=/usr/local/cuda-13.2/extras/CUPTI/include

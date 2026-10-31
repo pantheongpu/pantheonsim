@@ -24,6 +24,7 @@ Settings you use every time can live in a file (`pantheonsim.yaml`, written by
 | `vgpu config show\|init\|keys` | The settings file: what is in effect, a commented starter file, the list of keys. See [config.md](config.md). |
 | `vgpu shell` | An interactive simulated machine: `nvidia-smi`, `rocm-smi`, `lspci` and `dmesg` all answer for the GPUs you picked. [Options](#vgpu-shell). |
 | `vgpu test --matrix <program> [args...]` | Run a program on every device profile and compare the results. [Options](#vgpu-test---matrix). |
+| `vgpu check [options] <program> [args...]` | Run a program on this machine's real NVIDIA card and on the simulator, and compare. [Options](#vgpu-check). |
 | `vgpu ncu [options] <program> [args...]` | Nsight Compute's command line, answered from the simulator's exact counters. [Options](#vgpu-ncu). |
 | `vgpu counters` | What performance counters are reported, and which cannot be and why. |
 | `vgpu debug [-x FILE] -- <program>` | Run an AMD program under the kernel debugger. [Commands](#vgpu-debug). |
@@ -116,6 +117,42 @@ Exit status: `0` every profile matched the baseline; `1` `vgpu` itself failed
 program did not run on the baseline profile, so there is nothing to compare
 against.
 
+## `vgpu check`
+
+```
+vgpu check [options] <program> [args...]
+```
+
+Runs the program on the real GPU of this machine (NVIDIA's own libraries) and on the simulator, with the profile of that same card,
+and compares what it printed. It audits the simulator: nothing in the launch path changes. Build the program with the shared runtime
+(`nvcc -cudart shared`) so `vgpu run` can put the simulator's `libcudart` in front of the real one on the simulated side.
+
+The card is run twice first. Lines that differ between those two runs are the card's own noise (a time-seeded random number, an
+uninitialised value) and are left out of the comparison, and the report says how many. Timing lines are dropped; lines that name the
+machine (device banner, driver and runtime versions) are compared apart, so a `Driver Version` difference is reported as an identity
+difference and not as a different answer. A line that states an outcome (`PASSED`, `FAILED`, `error`) is never dropped as a timing line;
+its numbers are masked instead. `--show-ignored` lists every dropped and set-aside line.
+
+| Option | Meaning |
+| --- | --- |
+| `--gpu <vendor/model>` | The profile to simulate. Default: the one whose model is the card's name. |
+| `--allow-cross` | Compare even when the profile is not the card. The two are then different machines, and the report says so. |
+| `--card <name>` | The card's name, when `nvidia-smi` cannot be used. |
+| `--native-runs <n>` | Runs on the card. Default 2; 1 skips the noise check. |
+| `--sim-runs <n>` | Runs on the simulator. Default 1; 2 also checks that it repeats. |
+| `--timeout <s>` | Per run. Default 600. |
+| `--tolerance <rel>` | Accept numbers within this relative difference. Default 0: any different digit is a difference. |
+| `--file <path>` | Also compare a file the program writes, byte for byte. Repeatable. |
+| `--show-diff` | Print the first differing pair of lines. |
+| `--show-ignored` | List the lines dropped as timing and the lines compared apart as identity. |
+
+Exit status: `0` the simulator agrees with the card; `1` `vgpu` itself failed; `2` usage error; `3` the outputs, exit codes or files differ;
+`4` the program did not run on the card (so there is nothing to compare); `5` inconclusive, the card's two runs cannot be lined up;
+`6` no usable card, or the profile is not that card.
+
+What it cannot tell: a data race or an uninitialised read gives one valid answer on the card and another in the simulator, and a
+program that prints only `Test passed` hides every number behind it. A match means "printed the same", not "computed the same bits".
+
 ## `vgpu shell`
 
 ```bash
@@ -127,7 +164,7 @@ vgpu shell -y --gpu amd/mi300x --count 8 --rocm 6.2.0 --driver 6.3.6 \
 | Option | Meaning |
 | --- | --- |
 | `--gpu`, `--count 1..16`, `--vram-mb` | The rack. |
-| `--cuda`, `--rocm`, `--driver` | Reported toolkit and driver versions. The defaults are the ones this build's runtime carries. |
+| `--cuda`, `--rocm`, `--driver` | Reported toolkit and driver versions. The CUDA and driver defaults are the ones this build's runtime carries; the ROCm default is `6.2.0`. |
 | `--os ubuntu:22.04\|ubuntu:24.04\|rocky\|debian`, `--kernel`, `--hostname` | Machine identity. |
 | `--load 0..1` | Background load, so the telemetry columns move. |
 | `-c`, `--command <cmd>` | Run one command in the machine instead of an interactive shell. |
@@ -223,7 +260,7 @@ variable is unset by default.
 | `VGPU_DEVICE_COUNT` | Number of identical virtual devices. | `1` |
 | `VGPU_VRAM_MB` | Virtual VRAM size, overriding the profile. | profile |
 | `VGPU_CUDA_VERSION`, `VGPU_DRIVER_VERSION` | CUDA and driver version strings that `nvidia-smi` and NVML report. | this build's |
-| `VGPU_ROCM_VERSION` | ROCm version string that the AMD tools report. | this build's |
+| `VGPU_ROCM_VERSION` | ROCm version string that `amd-smi version` reports. | `6.2.0` in `vgpu shell`, else `N/A` |
 
 **Memory**
 
@@ -239,9 +276,9 @@ variable is unset by default.
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `VGPU_THREADS` | Host threads used to run blocks. | one per core (`make run` and `./run` set half the cores unless this or `threads:` is set) |
-| `VGPU_LOCKSTEP` | `0` runs a grid's blocks one after another on each host thread, as before; `all` runs every launch with the blocks the device holds resident together taking turns; the default runs kernels with a loop that polls global memory that way (see the README). | polling kernels |
+| `VGPU_LOCKSTEP` | `0` runs a grid's blocks one after another on each host thread, as before; `all` runs every launch with the blocks the device holds resident together taking turns; the default runs kernels with a loop that polls global memory that way (see [cooperative.md](cooperative.md)). | polling kernels |
 | `VGPU_LOCKSTEP_LOG` | `1` prints a line on stderr for each launch that runs its blocks together; any other value is a file the lines are appended to (the tests count the kernels that do). | off |
-| `VGPU_MAX_STEPS` | Raises (or lowers) the runaway-kernel step budget; `0` removes it. The PTX engine reads it at each launch; the SASS engine, which used not to read it (its budget was the built-in one whatever this said), once per process. | built-in |
+| `VGPU_MAX_STEPS` | Raises (or lowers) the runaway-kernel step budget; `0` removes it. The PTX engine reads it at each launch; the SASS engine reads it once per process. | built-in |
 | `VGPU_SASS` | `0` forces the PTX engine; `1` insists on SASS and does not fall back. | SASS when the binary carries it, else PTX |
 | `VGPU_SASS_LOG` | `1` says when a fatbin falls back from SASS to PTX. | off |
 | `VGPU_SCHEDULER` | Warp scheduling order: `deterministic`, `random` or `adversarial`. Random and adversarial orders find bugs that depend on which warp runs first, and they run blocks one at a time so an order can be replayed. **PTX engine only:** kernels that run from SASS (the default whenever the binary carries it) use one fixed warp order, so set `VGPU_SASS=0` to use this. | deterministic |
@@ -250,8 +287,12 @@ variable is unset by default.
 | `VGPU_FASTPATH` | `0` sends every instruction down the interpreter's general path, for ruling out its fast paths when a result looks wrong (they are tested to give the same bits). | on |
 | `VGPU_LOOKUP_CACHE` | `0` makes every kernel memory access look its address up in the allocation table, for ruling out the per-thread memory of recent lookups when an access looks wrong (tested to give the same values and errors) | unset (on) |
 | `VGPU_LAUNCH_CACHE` | `0` makes every launch work out again what it can remember (the table of every loaded kernel that a device-side launch looks its child up in, and which function a kernel handle names), for ruling the remembering out when a result looks wrong; the answers are tested to be the same either way | unset (on) |
-| `VGPU_SIMD` | `base` or `avx2` caps the vector instruction set the lane arithmetic, half-precision conversions and tensor-core kernels use (the default is the best the CPU has); `off` sends the engines back to their scalar code, for ruling the vector kernels out when a result looks wrong (they are tested to give the same bits) | best available |
-| `VGPU_TIER` | `1` runs the SASS engine's straight-line instructions through a pre-decoded tier: each instruction's form and operands are worked out once per code section instead of at every execution (about 1.2 to 2.7 times faster on the benchmark workloads, [performance](performance.md)). Results, counters, errors and the warp scheduling are those of the interpreter, which also runs everything the tier has no handler for; `VGPU_FASTPATH=0`, `VGPU_SIMD=off` and `VGPU_SASS_TRACE` turn it off. `VGPU_TIER_STATS=1` prints how many warp instructions it ran and which ones it left to the interpreter when the process exits (`2` adds a few disassembled examples of each; `VGPU_TIER_STATS_FILE=<path>` appends it to that file instead of stderr). `VGPU_TIER_OFF=iadd3,bsync,...` leaves the forms it names (`tier::form_name`) to the interpreter, to find which form a difference comes from. `VGPU_TIER_CHAIN=0` makes it return to the scheduler after every run of straight instructions, as the interpreter does (by default it goes on by itself while the next call would pick the same lanes again: the same instructions run in the same order, and a warp's turn is counted in the same units). | off |
+| `VGPU_SIMD` | `base` or `avx2` caps the vector instruction set the lane arithmetic, half-precision conversions and tensor-core kernels use (the default is the best the CPU has: the 512-bit tile kernels of the tensor-core routes where it has AVX-512 F/BW/DQ/VL and VNNI, about 8% faster over the forms measured and up to 2x on the integer ones, the same bits; `avx512` asks for them explicitly); `off` sends the engines back to their scalar code, for ruling the vector kernels out when a result looks wrong (they are tested to give the same bits) | best available |
+| `VGPU_SASS_CACHE` | `0` turns off the file in which the SASS engine keeps, between processes, which cubins it found to run in full (the check that decides between SASS and the fatbin's PTX decodes every instruction of a cubin; a process that finds one passes appends a 128-bit hash of it to `$XDG_CACHE_HOME/pantheonsim/sass-ok-v1-<build id>`, else `~/.cache/pantheonsim/...`, a file per build of the simulator, and a later process answers from it). Refusals are never kept, `VGPU_SASS_REFUSE` bypasses the file, and a file or directory that is not yours alone (another owner, group- or world-writable, a symlink, not a regular file) is ignored. There is no file, and nothing is written, when neither `XDG_CACHE_HOME` nor `HOME` is an absolute path, when the directory cannot be made or written, or when the build has no GNU build id; a full disk or a cut file only stops it growing (at most 65,536 hashes, 1 MB). The answers are tested to be the same either way; a PyTorch sweep group that finds the file warm runs 12% to 36% fewer instructions. Old builds' files stay in the directory and can be deleted any time | on |
+| `VGPU_TIER` | the SASS engine runs its straight-line instructions through a pre-decoded tier unless this is `0`: each instruction's form and operands are worked out once per code section instead of at every execution (about 1.2 to 2.7 times faster on the benchmark workloads, [performance](performance.md)). Results, counters, errors and the warp scheduling are those of the interpreter, which also runs everything the tier has no handler for; `VGPU_TIER=0` (the interpreter alone, for ruling the tier out when a result looks wrong), `VGPU_FASTPATH=0`, `VGPU_SIMD=off` and `VGPU_SASS_TRACE` turn it off. `VGPU_TIER_STATS=1` prints how many warp instructions it ran and which ones it left to the interpreter when the process exits (`2` adds a few disassembled examples of each; `VGPU_TIER_STATS_FILE=<path>` appends it to that file instead of stderr). `VGPU_TIER_OFF=iadd3,bsync,...` leaves the forms it names (`tier::form_name`) to the interpreter, to find which form a difference comes from. `VGPU_TIER_CHAIN=0` makes it return to the scheduler after every run of straight instructions, as the interpreter does (by default it goes on by itself while the next call would pick the same lanes again: the same instructions run in the same order, and a warp's turn is counted in the same units). | on |
+| `VGPU_HOST_GPU` | `exact` (experimental, [spike](perf-design/09-host-gpu-spike.md)): launches whose kernel is in the exact set (integer and IEEE arithmetic, no SFU, no float or compare-and-swap atomics) and that the size rule says are worth it run on the machine's real NVIDIA GPU, which must be the simulated model; the simulator's memory is copied there at the same addresses and back, so the results are the simulator's bits (checked with `VGPU_HOST_GPU_VERIFY=1`, which also runs every such launch in the simulator and compares; `all` includes kernels outside the set). Refused with a message when a diagnostic that needs the simulator is on. `VGPU_HOST_GPU_LOG=1` prints each decision; the exit summary says how many launches ran on the card. Counters, faults and the simulator's checks do not apply to those launches. | off |
+| `VGPU_JIT` | `1` turns on tier 2 (off by default; also off with `VGPU_TIER=0`, `VGPU_FASTPATH=0`, `VGPU_SIMD=off`, `VGPU_SASS_TRACE` and in sanitizer builds): the straight-line stretches of a code section that has run `VGPU_JIT_THRESHOLD` warp instructions (default 100000000) are turned into C++, compiled in the background with the host's compiler (`VGPU_JIT_CXX`, else `c++`, `g++`, `clang++` on `PATH`) into a shared object, kept in `VGPU_JIT_CACHE` (else `$XDG_CACHE_HOME/pantheonsim/jit/...`, created `0700`, every object checked against its checksum and its instruction words before it is loaded) and run in place of the tier for those stretches. Regions are compiled to C++ that includes the simulator's own lane kernels (src/simd/kernels.inc, embedded in the binary and written into the cache directory), so the arithmetic of MOV, IADD3, IMAD (plain, WIDE, HI, carries), LOP3, LEA, SHF, ISETP, FSETP, FSEL, FFMA, FADD, FMUL, PRMT, IMNMX and I2FP is computed in the generated code and every other op is a call of the tier's handler; results, counters, faults and errors are the tier's. Only regions that are hot (`VGPU_JIT_HOT_PERMILLE`, default 1: at least this many thousandths of the section's counted instructions; `VGPU_JIT_MAX_OPS`, default 1500 ops) and at least half generated are compiled; regions shorter than `VGPU_JIT_MIN_REGION` (4) ops stay on the tier. The cache is asked after `VGPU_JIT_LOOKUP_AFTER` (1000000) region instructions, and only for a section the share rule has kept: a section is sampled once over `VGPU_JIT_SAMPLE` (50000) of its warp instructions, and if the generated code would compute less than `VGPU_JIT_MIN_SHARE` percent of them (default 40; `0` turns the rule off, as does `VGPU_JIT_HOT_PERMILLE=0`) it goes back to the plain loop for good and asks neither the cache nor the compiler (`VGPU_JIT_STATS=1` prints each decision; [measurements](perf-design/round14-jit.md)). The compiler's identity (its version and target) is asked once and kept in the cache directory (`cid-*.txt`). No compiler, a failed or too slow compile (`VGPU_JIT_TIMEOUT` seconds, default 120; `VGPU_JIT_MEM_MB` address space for the compiler, default 4096), or a cache that cannot be written or mapped (a `noexec` mount) leaves the tier running, with one notice on stderr (silenced by `VGPU_QUIET`). `VGPU_JIT_FLAGS` adds compiler flags (part of the cache key), `VGPU_JIT_MAX_REGION` caps a stretch (default 96 ops), `VGPU_JIT_SYNC=1` compiles on the thread that reaches the threshold (for tests), `VGPU_JIT_STATS=1` prints what it did at exit (`VGPU_JIT_STATS_FILE=<path>` appends it to a file). [Design](perf-design/06-tier2-jit.md), [measurements](perf-design/round11-jit.md). | off |
+| `VGPU_AMD_TIER` | the AMD (CDNA and RDNA) interpreter runs its hottest instruction forms through a pre-decoded tier (`amd/src/gcn_tier.cpp`): each instruction's handler and operand classes are worked out when it is decoded, and a handler works on whole register rows (AVX2 kernels where the host has them) instead of lane by lane. Results, counters, errors and the order of effects are the interpreter's, which also runs every form the tier has no handler for and every instruction whose result would be a NaN (the payload a NaN takes depends on the order the compiler gave the operands, so the tier does not decide it). `VGPU_AMD_TIER=0` turns it off (for ruling it out when a result looks wrong), `=1` on. `VGPU_AMD_TIER_STATS=1` prints, when the process exits, which instructions the interpreter ran anyway and how often. | on |
 | `VGPU_FASTCOUNT` | `0` counts memory sectors and bank passes with the earlier reference code instead of the allocation-free version, for ruling the new counting out when a counter looks wrong (tested to give the same numbers) | unset (on) |
 | `VGPU_TC_EXACT` | `0` turns the RTX 3060 (sm_86) tensor-core sum model off: wmma, `mma.sync` and SASS `HMMA` in f16, bf16 and tf32 then add the products one at a time in f32, as earlier releases did. The model (chunks of 8 products, truncating, measured on a card, `include/vgpu/exec/tc_ampere.hpp`) is what makes random-data results equal the card's, and costs 3.5 to 4.5 times the time of those instructions in the SASS and PTX engines (the bench workloads `wmma` and `mma_ptx`; a program that does little else spends that much more, one that mostly does other work little), except `mma.sync` on the PTX engine, where it is the faster of the two. Only sm_86 devices and cubins are affected; counters never change. Read at every launch, so it can be set between launches. `vgpu run` passes it through. | unset (on) |
 

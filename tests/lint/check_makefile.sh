@@ -153,17 +153,17 @@ out=$(doctor "$p"); rc=$?
 expect "doctor: nothing installed is a failure" "1" "$rc"
 contains "doctor: names cmake" "cmake not found" "$out"
 contains "doctor: says what to install" "apt-get install cmake" "$out"
-contains "doctor: names the compiler" "needs g++ 13+ or clang++ 17+" "$out"
+contains "doctor: names the compiler" "needs g++ 12+ or clang++ 17+" "$out"
 
 p="$tmp/oldcmake"; fake "$p" cmake "cmake version 3.19.8"; fake "$p" g++ "13.2.0"
 out=$(doctor "$p"); rc=$?
 expect "doctor: cmake 3.19 is too old" "1" "$rc"
 contains "doctor: says so" "cmake 3.19 is too old" "$out"
 
-p="$tmp/oldgcc"; fake "$p" cmake "cmake version 3.28.3"; fake "$p" g++ "12.3.0"
+p="$tmp/oldgcc"; fake "$p" cmake "cmake version 3.28.3"; fake "$p" g++ "11.4.0"
 out=$(doctor "$p"); rc=$?
-expect "doctor: g++ 12 is too old" "1" "$rc"
-contains "doctor: says what it found" "g++ 12, needs 13 or newer" "$out"
+expect "doctor: g++ 11 is too old" "1" "$rc"
+contains "doctor: says what it found" "g++ 11, needs 12 or newer" "$out"
 
 p="$tmp/clang"; fake "$p" cmake "cmake version 3.20.0"; fake "$p" clang++ "Ubuntu clang version 17.0.6 (1ubuntu1)"
 out=$(doctor "$p"); rc=$?
@@ -209,6 +209,7 @@ APT
 }
 ubuntu24="$tmp/os-ubuntu24"; printf 'ID=ubuntu\nID_LIKE=debian\nVERSION_ID="24.04"\n' > "$ubuntu24"
 ubuntu22="$tmp/os-ubuntu22"; printf 'ID=ubuntu\nID_LIKE=debian\nVERSION_ID="22.04"\n' > "$ubuntu22"
+ubuntu20="$tmp/os-ubuntu20"; printf 'ID=ubuntu\nID_LIKE=debian\nVERSION_ID="20.04"\n' > "$ubuntu20"
 fedora="$tmp/os-fedora"; printf 'ID=fedora\nVERSION_ID="41"\n' > "$fedora"
 installed() { grep -c '^apt-get install' "$tmp/apt.log" 2>/dev/null || true; }
 : > "$tmp/apt.log"
@@ -222,8 +223,8 @@ expect "deps --cxx: nothing to say when the default compiler is fine" "" "$(env 
 out=$(env -i PATH="$p" /bin/bash scripts/deps.sh --check </dev/null); rc=$?
 expect "deps --check passes when nothing is missing" "0" "$rc"
 
-p=$(depsbin oldcc); fake "$p" cmake "cmake version 3.28.3"; fake "$p" c++ "12.3.0"; fake "$p" g++-13 "13.2.0"
-expect "deps --cxx: names a newer compiler when the default is too old" "g++-13" "$(env -i PATH="$p" /bin/bash scripts/deps.sh --cxx)"
+p=$(depsbin oldcc); fake "$p" cmake "cmake version 3.28.3"; fake "$p" c++ "11.4.0"; fake "$p" g++-12 "12.3.0"
+expect "deps --cxx: names a newer compiler when the default is too old" "g++-12" "$(env -i PATH="$p" /bin/bash scripts/deps.sh --cxx)"
 
 # missing, no terminal, no YES: nothing is installed, the command is printed, and it does not wait
 p=$(depsbin noyes); : > "$tmp/apt.log"
@@ -245,20 +246,27 @@ contains "deps: installs cmake and the compiler" "apt-get install -y cmake g++-1
 if [[ $EUID -ne 0 ]]; then contains "deps: not root: through sudo" "sudo apt-get install" "$(cat "$tmp/apt.log")"; fi
 lacks "deps: no PPA on 24.04" "add-apt-repository" "$(cat "$tmp/apt.log")"
 
-# Ubuntu 22.04: no g++ 13 in the archive, so a PPA is needed, which only YES=1 PPA=1 adds
-p=$(depsbin jammy "cmake"); : > "$tmp/apt.log"
+# Ubuntu 22.04 has g++ 12 in its main archive: installed with no PPA
+p=$(depsbin jammy12 "cmake g++-12"); : > "$tmp/apt.log"
 out=$(depsenv "$p" "$ubuntu22" YES=1 </dev/null); rc=$?
-expect "deps: 22.04 with YES=1 alone does not add a PPA" "1" "$rc"
+expect "deps: 22.04 installs g++-12 from the archive" "0" "$rc"
+contains "deps: g++-12 was installed" "apt-get install -y cmake g++-12" "$(cat "$tmp/apt.log")"
+lacks "deps: no PPA on 22.04" "add-apt-repository" "$(cat "$tmp/apt.log")"
+
+# Ubuntu 20.04 and older: no g++ 12 in the archive, so a PPA is needed, which only YES=1 PPA=1 adds
+p=$(depsbin focal "cmake"); : > "$tmp/apt.log"
+out=$(depsenv "$p" "$ubuntu20" YES=1 </dev/null); rc=$?
+expect "deps: 20.04 with YES=1 alone does not add a PPA" "1" "$rc"
 contains "deps: it prints the PPA instructions" "ppa:ubuntu-toolchain-r/test" "$out"
-contains "deps: and the export" "export CXX=g++-13" "$out"
+contains "deps: and the export" "export CXX=g++-12" "$out"
 lacks "deps: and ran nothing" "apt-get" "$(cat "$tmp/apt.log")"
 lacks "deps: no PPA was added" "add-apt-repository" "$(cat "$tmp/apt.log")"
-out=$(depsenv "$p" "$ubuntu22" YES=1 PPA=1 </dev/null); rc=$?
+out=$(depsenv "$p" "$ubuntu20" YES=1 PPA=1 </dev/null); rc=$?
 expect "deps: YES=1 PPA=1 does it" "0" "$rc"
 contains "deps: the PPA was added" "add-apt-repository -y ppa:ubuntu-toolchain-r/test" "$(cat "$tmp/apt.log")"
-contains "deps: g++-13 was installed" "apt-get install -y cmake g++-13" "$(cat "$tmp/apt.log")"
-p=$(depsbin jammy2 "cmake"); : > "$tmp/apt.log"
-out=$(depsenv "$p" "$ubuntu22" PPA=1 </dev/null); rc=$?
+contains "deps: g++-12 was installed" "apt-get install -y cmake g++-12" "$(cat "$tmp/apt.log")"
+p=$(depsbin focal2 "cmake"); : > "$tmp/apt.log"
+out=$(depsenv "$p" "$ubuntu20" PPA=1 </dev/null); rc=$?
 expect "deps: PPA=1 without YES=1 still adds nothing" "1" "$rc"
 lacks "deps: and runs nothing" "add-apt-repository" "$(cat "$tmp/apt.log")"
 

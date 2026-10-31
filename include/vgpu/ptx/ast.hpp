@@ -14,6 +14,7 @@
 #include <ostream>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -105,6 +106,16 @@ enum class Sreg : uint8_t {
   // The executable graph the kernel runs in, if that graph was instantiated
   // for device launch (cudaGetCurrentGraphExec), and 0 otherwise.
   CurrentGraphExec,
+  // The registers a non-PTX frontend reads (the PTX parser has no names for
+  // them, so no PTX text can reach these). They were added after every PTX
+  // register so that no existing value moves.
+  //   WarpSize       the lanes per warp this launch runs at (LaunchConfig::warp_size
+  //                  or the profile's); what OpenCL's get_max_sub_group_size reads
+  //   GlobalOffsetX/Y/Z  LaunchConfig::global_offset, the NDRange origin (zero by default)
+  //   WorkDim        LaunchConfig::work_dim, 1..3 (3 by default)
+  WarpSize,
+  GlobalOffsetX, GlobalOffsetY, GlobalOffsetZ,
+  WorkDim,
 };
 
 // A virtual register reference. `id` is a dense per-kernel index assigned at
@@ -261,8 +272,21 @@ struct OpVote { VoteMode mode = VoteMode::All; bool ballot = false; Reg dst; Reg
                 bool has_members = false; Operand members; };  // vote.sync's membermask
 // redux.sync.<op>.<type> d, a, membermask -- reduce a across the participating
 // lanes of the warp and give every one of them the result.
-enum class ReduxOp { Add, Min, Max, And, Or, Xor };
-struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; Operand members; };
+//
+// Extension (patch E7, for a frontend that does not read PTX; the PTX parser still makes only the integer reduce forms):
+//  - ReduxOp::Mul, and float types (f16, f32, f64) for Add, Mul, Min and Max (And/Or/Xor stay integer-only). A float
+//    step is the engine's own float add/mul/min/max (NaN in one operand loses to the other for min/max, the canonical
+//    NaN otherwise), applied in increasing lane order, so a float result does not depend on how the host schedules it.
+//  - `mode`: Reduce (every participating lane gets the reduction of all of them), Inclusive (lane L gets the
+//    reduction of the participating lanes <= L) or Exclusive (the participating lanes < L; the first participating
+//    lane gets the operation's identity).
+//  - `cluster` (Reduce only; 0 = the whole warp): the reduction is over each aligned run of `cluster` lanes
+//    separately (a power of two, at most the warp width).
+// Participation is the executing lanes (the active mask), as for the integer form.
+enum class ReduxOp { Add, Min, Max, And, Or, Xor, Mul };
+enum class ReduxMode { Reduce, Inclusive, Exclusive };
+struct OpRedux { ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand src; Operand members;
+                 ReduxMode mode = ReduxMode::Reduce; uint32_t cluster = 0; };
 // cvt.rn.f16x2.f32 d, a, b -- convert two f32 and pack them into one register,
 // a in the high half and b in the low half.
 // cvt.{rn,rz}[.relu][.satfinite].{f16x2,bf16x2}.f32 d, a, b.
@@ -1154,8 +1178,10 @@ struct EntryFn;
 struct LazyByte {
   mutable std::atomic<uint8_t> v{0};
   LazyByte() = default;
-  LazyByte(const LazyByte& o) : v(o.v.load(std::memory_order_relaxed)) {}
-  LazyByte& operator=(const LazyByte& o) {
+  // noexcept (an atomic load and store): without it a vector of Instr or of EntryFn copies its elements when it grows,
+  // for an Instr holds one of these, and the variant and the vector holding it then copy too.
+  LazyByte(const LazyByte& o) noexcept : v(o.v.load(std::memory_order_relaxed)) {}
+  LazyByte& operator=(const LazyByte& o) noexcept {
     v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
     return *this;
   }
@@ -1224,10 +1250,59 @@ struct OpSpDecompress {
   std::vector<Operand> mdata, cdata;
 };
 
+// Host-library math (patch E6): the OpenCL.std functions computed by the C library. `ty` is the floating-point type
+// of `a` (and `b` where the function takes a second floating-point operand) and of the result, f16, f32 or f64;
+// Ilogb's result is a 32-bit integer; the integer operand of Ldexp and Pown is a 32-bit signed integer in `b`.
+// Semantics and the determinism statement: include/vgpu/exec/libm.hpp. `ftz` (f32): subnormal operands and results
+// to signed zero.
+enum class LibmFn : uint8_t {
+  Acos, Acosh, Asin, Asinh, Atan, Atan2, Atanh, Cbrt, Cos, Cosh, Erf, Erfc, Exp, Exp2, Exp10, Expm1, Fdim, Fmod, Hypot,
+  Ilogb, Ldexp, Lgamma, Log, Log2, Log10, Log1p, Logb, Nextafter, Pow, Pown, Powr, Remainder, Sin, Sinh, Tan, Tanh,
+  Tgamma,
+  Round,   // halfway cases away from zero (OpenCL round); exact, so no libm accuracy is involved
+};
+inline constexpr unsigned kLibmFnCount = static_cast<unsigned>(LibmFn::Round) + 1;
+struct OpLibm { LibmFn fn = LibmFn::Exp; Type ty; bool ftz = false; Reg dst; Operand a; Operand b; };
+
+// Work-group collective (patch E8): every thread of the block contributes `a` and every thread gets the answer. It
+// is a rendezvous like bar.red's: it completes when every live warp of the block has arrived, so it is a barrier too,
+// and all the warps of the block must reach it. The combine is a sequential walk in increasing linear thread id
+// (x fastest) over the threads that contribute, so a float result is the same on every run. Reduce: the reduction
+// of all; InclusiveScan / ExclusiveScan: of the threads <= / < this one (the first thread's exclusive result is the
+// identity of the operation); Broadcast: the value `a` of the thread whose linear id is `b` (the same for all
+// threads; a value no thread contributed reads as zero). `op` and `ty` follow OpRedux (integers and f16/f32/f64).
+enum class WgKind { Reduce, InclusiveScan, ExclusiveScan, Broadcast };
+struct OpWgCollective { WgKind kind = WgKind::Reduce; ReduxOp op = ReduxOp::Add; Type ty; Reg dst; Operand a; Operand b; };
+
+// A cooperative-matrix multiply-add over one warp, for a frontend whose matrices live in the lanes' registers (PantheonZE's
+// SPV_KHR_cooperative_matrix lowering; PantheonSim's own PTX frontends do not make it). D = C + A * B on an M x K, K x N, M x N tile in one
+// instruction instead of M * K sub-group shuffles and M * K * N / W multiply-adds.
+//
+// Where element (r, c) of a rows x cols matrix lives, for a warp of W lanes:
+//   column rule   (cols % W == 0)        lane c % W, register r * (cols / W) + c / W
+//   element rule  (otherwise, rows * cols % W == 0)   lane e % W, register e / W, with e = r * cols + c
+// B, C and D must follow the column rule (N a multiple of W); A follows whichever applies to K. `a`, `b`, `c` and `d` are the registers
+// of those layouts, in register order, one element in the low bits of each (halves and 8-bit integers in the low 16 / 8 bits of a 32-bit
+// register). Every lane of the warp must be active (the instruction is convergent; a partial mask is a fault).
+//
+// The arithmetic is fixed, so the result does not depend on the host: every D element starts from its C element and takes the products in
+// increasing k, one correctly rounded fused multiply-add each in f32 (float inputs: F16 and BF16 widen exactly; an F16 accumulator
+// widens first and is rounded to nearest even once at the end) or one wrapping 32-bit multiply-add (integer inputs). NaN payloads and
+// infinities follow the host's fma, not a card's. A card's tensor unit orders and rounds differently; this is the order of PantheonZE's
+// per-instruction lowering, which this instruction replaces bit for bit.
+enum class CoopElem : uint8_t { F16, BF16, F32, S8, U8, S16, U16, S32, U32 };
+struct OpCoopMma {
+  uint32_t m = 8, n = 16, k = 16;
+  CoopElem a_type = CoopElem::F16, b_type = CoopElem::F16;   // F16, BF16 (the bits of a bfloat16), F32 or an integer type
+  CoopElem c_type = CoopElem::F32;                           // the accumulator and result: F16 or F32 with float inputs, S32 or U32 with integers
+  std::vector<Reg> d, a, b, c;
+};
+#define VGPU_PTX_HAS_COOP_MMA 1
+
 using Op = std::variant<OpLd, OpSt, OpMov, OpMovPack, OpMovUnpack, OpCvta, OpCvt, OpNot, OpNeg, OpAbs, OpMath, OpBfe, OpBfi,
                         OpBrev, OpPopcClz, OpShfl, OpVote, OpPrmt, OpLop3, OpSlct, OpTestp, OpSad, OpMatch, OpMul24, OpSzext, OpFns, OpMbarrier, OpBfind, OpElect, OpIsSpacep, OpCvtFp8, OpVideo, OpCopysign, OpDp4a, OpBmsk, OpTrap, OpTex, OpTxq, OpSuld, OpSust, OpBarRed, OpMovPred, OpRedux, OpCvtF16x2, OpCvtTf32, OpCvtPack, OpLdMatrix, OpStMatrix, OpMma, OpWgmma, OpTcgen05, OpClc, OpClusterBarrier, OpBulkCopy, OpBulkGroup, OpIntBin, OpMadLo, OpMulWide, OpMadWide, OpMulHi, OpMadHi, OpShf, OpIsTypep, OpStBulk, OpStack,
                         OpFloatBin, OpFma, OpF16x2Bin, OpF16x2Fma, OpF16x2Neg, OpF32x2, OpWmmaMma, OpWmmaLoad, OpWmmaStore, OpSetp, OpSet, OpSelp, OpPredBin, OpNotPred, OpAtom, OpBra, OpBrx, OpBar,
-                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy, OpSpCompress, OpSpDecompress, OpPackedInt, OpF8x4Arith>;
+                        OpRet, OpDeclSlot, OpStSlot, OpLdSlot, OpCall, OpCpAsync, OpCpAsyncGroup, OpMovMatrix, OpNop, OpFence, OpActiveMask, OpMapa, OpGetCtaRank, OpStAsync, OpTensormapReplace, OpTensormapCopy, OpSpCompress, OpSpDecompress, OpPackedInt, OpF8x4Arith, OpLibm, OpWgCollective, OpCoopMma>;
 
 // An instruction of the commonest, simplest forms, decoded once at parse time
 // for the interpreter's inner loop. The general Instr is ~1 KB of variant and
@@ -1318,6 +1393,14 @@ struct ParamDecl {
   Type ty;
   uint32_t size = 0;   // bytes; scalars: ty.bytes(), aggregates: array size
   uint32_t align = 0;  // 0 = natural (size for scalars)
+  // A pointer to work-group memory whose size the launch chooses (a SPIR-V
+  // Workgroup pointer kernel argument, OpenCL's __local). The launch supplies
+  // the argument as the number of bytes wanted, a little-endian integer filling
+  // `size` bytes; before the kernel runs the engine reserves that much shared
+  // memory after the block's static and dynamic bytes (16-byte aligned) and
+  // replaces the argument with the reservation's offset in the block's shared
+  // window, which is what a `.shared` address is. `size` is 4 or 8.
+  bool local_mem = false;
 };
 
 // A function-local .local depot (per-thread stack memory).
@@ -1382,6 +1465,10 @@ struct EntryFn {
   // is a launch failure on hardware, so both are enforced.
   std::array<uint32_t, 3> max_ntid{0, 0, 0};
   std::array<uint32_t, 3> req_ntid{0, 0, 0};
+  // The number of warps (sub-groups) the block must have, ceil(threads / warp
+  // width): SPIR-V's SubgroupsPerWorkgroup execution mode. Zero: not required.
+  // A launch whose block makes another count is refused, as a .reqntid one is.
+  uint32_t req_subgroups = 0;
   uint32_t min_ctas_per_sm = 0;
   uint32_t max_nreg = 0;   // .maxnreg: a register ceiling ptxas must meet
   // .reqnctapercluster: the cluster shape in CTAs the kernel was compiled for
@@ -1415,13 +1502,16 @@ struct EntryFn {
   struct PollsFlag {
     mutable std::atomic<int8_t> v{-1};
     PollsFlag() = default;
-    PollsFlag(const PollsFlag& o) : v(o.v.load()) {}
-    PollsFlag& operator=(const PollsFlag& o) {
+    PollsFlag(const PollsFlag& o) noexcept : v(o.v.load()) {}
+    PollsFlag& operator=(const PollsFlag& o) noexcept {
       v.store(o.v.load());
       return *this;
     }
   } polls, polls_reach;   // the body's own loops; and with the functions it calls
 };
+// Growing a vector of these moves them (a copy of each would be a copy of a whole function's tables).
+static_assert(std::is_nothrow_move_constructible_v<Instr>, "an Instr must move without throwing");
+static_assert(std::is_nothrow_move_constructible_v<EntryFn>, "an EntryFn must move without throwing");
 
 // A module-scope .global/.const variable, materialized into device memory at
 // module load.

@@ -115,6 +115,7 @@ jobs:
           - { key: rtx-pro-6000-x1-cuda13.0, gpu: nvidia/rtx-pro-6000, count: 1, cuda: '13.0' }  # Blackwell 12.0, workstation
           - { key: rtx-pro-6000-max-q-x1-cuda13.0, gpu: nvidia/rtx-pro-6000-max-q, count: 1, cuda: '13.0' }  # Blackwell 12.0, Max-Q
           - { key: rtx-pro-6000-server-x1-cuda13.0, gpu: nvidia/rtx-pro-6000-server, count: 1, cuda: '13.0' }  # Blackwell 12.0, server
+          - { key: rtx-pro-4500-x1-cuda13.0, gpu: nvidia/rtx-pro-4500, count: 1, cuda: '13.0' }  # Blackwell 12.0, server, read from a card
           # not-run nvidia/vr200: Rubin is compute capability 10.7, which needs CUDA 13.4 (the
           # profile cites its release notes); the CUDA 13.0 toolchain image cannot compile
           # for sm_107, so every workload fails to build. Give it a row, on a 13.4 image,
@@ -226,7 +227,7 @@ jobs:
           missing=$(comm -13 <(printf '%s\n' "$have" "$skip" | sort -u) <(printf '%s\n' "$want") | tr '\n' ' ')
           stale=$(comm -23 <(printf '%s\n' "$have" "$skip" | sort -u) <(printf '%s\n' "$want") | tr '\n' ' ')
           echo "matrix: $(printf '%s\n' "$have" | wc -l) profiles; not run: $(printf '%s\n' "$skip" | grep -c .); nvidia/profiles: $(printf '%s\n' "$want" | wc -l)"
-          [ -z "${missing// }" ] || { echo "::error::not in the workloads matrix: $missing"; exit 1; }
+          [ -z "${missing// }" ] || { echo "::error::nvidia/profiles has a profile with no row in .github/workflows/workloads.yml: $missing. Add a matrix row ({ key: <name>-x1-cuda13.0, gpu: nvidia/<name>, count: 1, cuda: '13.0' }) or a line '# not-run nvidia/<name>: <reason>'."; exit 1; }
           [ -z "${stale// }" ] || { echo "::error::in the matrix but not a profile: $stale"; exit 1; }
           [ -z "${both// }" ] || { echo "::error::both in the matrix and marked not-run: $both"; exit 1; }
 

@@ -19,6 +19,8 @@
 
 #include "vgpu/ptx/parser.hpp"
 #include "vgpu/sass/exec.hpp"
+#include "vgpu/host_gpu_rt.hpp"
+#include "vgpu/exec/launch_env.hpp"
 #include "vgpu/exec/lockstep.hpp"
 
 #include <map>
@@ -218,6 +220,45 @@ void digest_launch(const MemoryManager& mem, const std::string& name, const std:
   }
 }
 
+
+// VGPU_HOSTGPU_CAPTURE=<dir> (host-gpu spike, M2): for the first VGPU_HOSTGPU_CAPTURE_MAX launches of each kernel (default 2),
+// write what a replay on a real card needs into <dir>/<seq>.*: the launch (kernel name, grid, block, shared bytes, argument
+// bytes) in .meta, the whole device memory before the launch in .pre (records of base, size, bytes) and after it in .post. The
+// card replay tool (docs/perf-design/data/round13/m2_replay.cu) loads the program's own cubin, pushes .pre to the same
+// virtual addresses, runs the kernel and compares the result with .post. Throwaway instrumentation, never on by default.
+struct HostGpuCapture {
+  const char* dir = std::getenv("VGPU_HOSTGPU_CAPTURE");
+  uint64_t per_kernel = [] { const char* e = std::getenv("VGPU_HOSTGPU_CAPTURE_MAX"); return e ? std::strtoull(e, nullptr, 10) : 2ull; }();
+  uint64_t max_bytes = [] { const char* e = std::getenv("VGPU_HOSTGPU_CAPTURE_MAXBYTES"); return e ? std::strtoull(e, nullptr, 10) : (768ull << 20); }();
+  std::mutex mu;
+  std::map<std::string, uint64_t> seen;
+  uint64_t seq = 0;
+};
+HostGpuCapture& hostgpu_capture() { static HostGpuCapture c; return c; }
+
+bool dump_memory(const MemoryManager& mem, const char* path, uint64_t max_bytes) {
+  const auto ranges = mem.live_ranges();
+  uint64_t total = 0;
+  for (const auto& r : ranges) total += r.second;
+  if (total > max_bytes) return false;
+  FILE* f = std::fopen(path, "wb");
+  if (!f) return false;
+  std::vector<uint8_t> buf;
+  for (const auto& [base, size] : ranges) {
+    const uint64_t hdr[2] = {base, size};
+    std::fwrite(hdr, 8, 2, f);
+    for (uint64_t at = 0; at < size;) {
+      const uint64_t n = std::min<uint64_t>(size - at, uint64_t{1} << 24);
+      buf.resize(n);
+      mem.read(base + at, buf.data(), n);
+      std::fwrite(buf.data(), 1, n, f);
+      at += n;
+    }
+  }
+  std::fclose(f);
+  return true;
+}
+
 }  // namespace
 
 struct Device::LazyModule {
@@ -310,66 +351,77 @@ uint64_t Device::load_module(const std::string& ptx_src) {
                         suffix == 'a' ? std::to_string(want / 10) + "." + std::to_string(want % 10)
                                       : std::to_string(want / 10) + ".x",
                         ", and this device is ", profile_.cc_major, ".", profile_.cc_minor);
-    LoadedModule lm;
-    lm.id = next_module_id_++;
-    // Materialize module .global variables into device memory.
-    for (const auto& g : mod->globals) {
-      uint64_t va = mem_.alloc(g.size);
-      if (!g.init.empty()) mem_.write(va, g.init.data(), g.init.size());
-      lm.symbols[g.name] = va;
-      lm.global_vas.push_back(va);
-    }
-    // Device functions get an address so a function pointer can be stored in a
-    // global, loaded and called. The address encodes the index, which is what
-    // an indirect call decodes to find the function again.
-    for (size_t i = 0; i < mod->funcs.size(); ++i)
-      lm.symbols[mod->funcs[i]->name] = kFuncVaBase + i * kFuncVaStride;
-    if (lazy)  // the same addresses, from the definitions' order in the text
-      for (size_t i = 0; i < lazy->func_order.size(); ++i)
-        lm.symbols[lazy->func_order[i]] = kFuncVaBase + i * kFuncVaStride;
-    // Kernels too, which is what a device-side launch names its child by.
-    // Addresses are never reused, so a stale one cannot name another kernel.
-    for (const auto& e : mod->entries) {
-      const uint64_t va = next_kernel_va_;
-      next_kernel_va_ += kKernelVaStride;
-      lm.symbols[e.name] = va;
-      lm.kernels.emplace_back(va, &e);
-    }
-    if (lazy)
-      for (const std::string& name : lazy->entry_order) {
-        const uint64_t va = next_kernel_va_;
-        next_kernel_va_ += kKernelVaStride;
-        lm.symbols[name] = va;
-        lm.kernels.emplace_back(va, nullptr);
-      }
-    // Second pass: a global initialised with another symbol's address can only
-    // be filled in once every global has one. A kernel's address is its
-    // entry in the kernel window; PTX that only uses it to carry a mangled
-    // name (which is what NVRTC's name expressions compile to) never
-    // dereferences it.
-    for (const auto& g : mod->globals) {
-      if (g.init_symbols.empty()) continue;
-      const uint64_t slot = lm.symbols[g.name];
-      for (const auto& si : g.init_symbols) {
-        auto it = lm.symbols.find(si.name);
-        const uint64_t target = it == lm.symbols.end() ? 0 : it->second;
-        const uint64_t room = g.size > si.offset ? g.size - si.offset : 0;
-        const uint64_t bytes = room < sizeof(uint64_t) ? room : sizeof(uint64_t);
-        if (bytes) mem_.write(slot + si.offset, &target, bytes);
-      }
-    }
-    lm.mod = std::move(mod);
-    lm.lazy = std::move(lazy);
-    uint64_t id = lm.id;
-    modules_.push_back(std::move(lm));
-    module_index_[id] = std::prev(modules_.end());
-    forget_kernel_table();
-    return id;
+    return install_module(std::move(mod), std::move(lazy));
   } catch (const Error& e) {
     if (e.code() == Err::UnsupportedPtx)
       throw Error::make(e.code(), e.message(), "\n  GPU profile: ", profile_.id);
     throw;
   }
+}
+
+// Gives a parsed (or built) module its device memory and addresses and records it: the part of loading that does not
+// depend on where the module came from. `lazy` is a lazily parsed module's bookkeeping, null for the others.
+uint64_t Device::install_module(std::shared_ptr<ptx::Module> mod, std::shared_ptr<LazyModule> lazy) {
+  LoadedModule lm;
+  lm.id = next_module_id_++;
+  // Materialize module .global variables into device memory.
+  for (const auto& g : mod->globals) {
+    uint64_t va = mem_.alloc(g.size);
+    if (!g.init.empty()) mem_.write(va, g.init.data(), g.init.size());
+    lm.symbols[g.name] = va;
+    lm.global_vas.push_back(va);
+  }
+  // Device functions get an address so a function pointer can be stored in a
+  // global, loaded and called. The address encodes the index, which is what
+  // an indirect call decodes to find the function again.
+  for (size_t i = 0; i < mod->funcs.size(); ++i)
+    lm.symbols[mod->funcs[i]->name] = kFuncVaBase + i * kFuncVaStride;
+  if (lazy)  // the same addresses, from the definitions' order in the text
+    for (size_t i = 0; i < lazy->func_order.size(); ++i)
+      lm.symbols[lazy->func_order[i]] = kFuncVaBase + i * kFuncVaStride;
+  // Kernels too, which is what a device-side launch names its child by.
+  // Addresses are never reused, so a stale one cannot name another kernel.
+  for (const auto& e : mod->entries) {
+    const uint64_t va = next_kernel_va_;
+    next_kernel_va_ += kKernelVaStride;
+    lm.symbols[e.name] = va;
+    lm.kernels.emplace_back(va, &e);
+  }
+  if (lazy)
+    for (const std::string& name : lazy->entry_order) {
+      const uint64_t va = next_kernel_va_;
+      next_kernel_va_ += kKernelVaStride;
+      lm.symbols[name] = va;
+      lm.kernels.emplace_back(va, nullptr);
+    }
+  // Second pass: a global initialised with another symbol's address can only
+  // be filled in once every global has one. A kernel's address is its
+  // entry in the kernel window; PTX that only uses it to carry a mangled
+  // name (which is what NVRTC's name expressions compile to) never
+  // dereferences it.
+  for (const auto& g : mod->globals) {
+    if (g.init_symbols.empty()) continue;
+    const uint64_t slot = lm.symbols[g.name];
+    for (const auto& si : g.init_symbols) {
+      auto it = lm.symbols.find(si.name);
+      const uint64_t target = it == lm.symbols.end() ? 0 : it->second;
+      const uint64_t room = g.size > si.offset ? g.size - si.offset : 0;
+      const uint64_t bytes = room < sizeof(uint64_t) ? room : sizeof(uint64_t);
+      if (bytes) mem_.write(slot + si.offset, &target, bytes);
+    }
+  }
+  lm.mod = std::move(mod);
+  lm.lazy = std::move(lazy);
+  uint64_t id = lm.id;
+  modules_.push_back(std::move(lm));
+  module_index_[id] = std::prev(modules_.end());
+  forget_kernel_table();
+  return id;
+}
+
+// A module a frontend built with ptx::ModuleBuilder (no PTX text, so no .target to check against the device).
+uint64_t Device::load_built_module(ptx::Module module) {
+  return install_module(std::make_shared<ptx::Module>(std::move(module)), nullptr);
 }
 
 uint64_t Device::load_cubin(const uint8_t* image, size_t size) {
@@ -1113,7 +1165,52 @@ void Device::launch(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg,
     fault_->maybe_hang(fn.name, telemetry_, static_cast<uint32_t>(physical_));
   }
   try {
+    HostGpuCapture& cap = hostgpu_capture();
+    uint64_t cap_seq = ~0ull;
+    if (cap.dir && *cap.dir) {
+      std::lock_guard<std::mutex> g(cap.mu);
+      if (cap.seen[fn.name]++ < cap.per_kernel) {
+        cap_seq = cap.seq++;
+        char p[600];
+        std::snprintf(p, sizeof p, "%s/%06llu.pre", cap.dir, static_cast<unsigned long long>(cap_seq));
+        if (!dump_memory(mem_, p, cap.max_bytes)) cap_seq = ~0ull;
+        else {
+          std::snprintf(p, sizeof p, "%s/%06llu.meta", cap.dir, static_cast<unsigned long long>(cap_seq));
+          if (FILE* m = std::fopen(p, "w")) {
+            std::fprintf(m, "kernel %s\ngrid %u %u %u\nblock %u %u %u\nshared %u\nnargs %zu\n", fn.name.c_str(), cfg.grid[0], cfg.grid[1],
+                         cfg.grid[2], cfg.block[0], cfg.block[1], cfg.block[2], cfg.shared_bytes, args.size());
+            for (const auto& a : args) {
+              std::fprintf(m, "arg %zu ", a.size());
+              for (uint8_t b : a) std::fprintf(m, "%02x", b);
+              std::fprintf(m, "\n");
+            }
+            std::fclose(m);
+          }
+        }
+      }
+    }
+    const auto cap_t0 = std::chrono::steady_clock::now();
+    // VGPU_HOST_GPU=exact: the launch may run on the machine's real GPU (vgpu/host_gpu_rt.hpp); null when the mode is off.
+    hostgpu::Runtime* const hg = hostgpu::Runtime::for_device(profile_, ordinal_);
+    if (hg && hg->try_launch(fn, cfg, args, mem_)) {
+      if (telemetry_) telemetry_->note_kernel(static_cast<uint32_t>(physical_), 0.0);
+      return;
+    }
+    if (hg) hg->before_simulated(mem_);
+    const auto sim_t0 = std::chrono::steady_clock::now();   // after the card path: a verify run does both, and the simulator's time is this alone
     run_kernel(fn, cfg, args, syms);
+    if (hg) hg->note_simulated(fn, cfg, std::chrono::duration<double>(std::chrono::steady_clock::now() - sim_t0).count(), &mem_, &args);
+    if (cap_seq != ~0ull) {
+      char p[600];
+      const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - cap_t0).count();
+      std::snprintf(p, sizeof p, "%s/%06llu.time", cap.dir, static_cast<unsigned long long>(cap_seq));
+      if (FILE* t = std::fopen(p, "w")) { std::fprintf(t, "%.9f\n", secs); std::fclose(t); }
+      std::snprintf(p, sizeof p, "%s/%06llu.post", cap.dir, static_cast<unsigned long long>(cap_seq));
+      dump_memory(mem_, p, cap.max_bytes);
+      // VGPU_HOSTGPU_CAPTURE_STOP=<n>: the capture is the point; end the program once n launches are on disk.
+      static const uint64_t stop = [] { const char* e = std::getenv("VGPU_HOSTGPU_CAPTURE_STOP"); return e ? std::strtoull(e, nullptr, 10) : 0ull; }();
+      if (stop && cap_seq + 1 >= stop) std::_Exit(0);
+    }
     digest_launch(mem_, fn.name, args);
   } catch (const Error& e) {
     if (fault_) {
@@ -1133,7 +1230,13 @@ void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg
   // another needs to know (vgpu/exec/lockstep.hpp). The same figure cudaOccupancyMaxActiveBlocksPerMultiprocessor
   // gives, times the SMs.
   exec::LaunchConfig cfg = in_cfg;
-  if (!cfg.resident_blocks && exec::lockstep_mode() != exec::LockstepMode::Off) {
+  // The environment is read in one pass for the whole launch: the caller's (the runtime's), or one made here.
+  exec::LaunchEnv own_env;
+  if (!cfg.env) {
+    own_env = exec::read_launch_env();
+    cfg.env = &own_env;
+  }
+  if (!cfg.resident_blocks && exec::lockstep_mode(cfg.env->lockstep) != exec::LockstepMode::Off) {
     const uint64_t threads = uint64_t{cfg.block[0]} * cfg.block[1] * cfg.block[2];
     if (threads && threads <= profile_.limits.max_threads_per_block) {
       try {
@@ -1164,13 +1267,10 @@ void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg
   // live telemetry rather than freezing until it returns.
   uint32_t ord = static_cast<uint32_t>(physical_);
   telemetry::Publisher* pub = telemetry_;
-  auto start = std::chrono::steady_clock::now();
   const exec::LaunchStats st = exec::launch(fn, cfg, args, mem_, profile_, syms,
                [pub, ord](double dt) { pub->note_kernel(ord, dt); });
   report_counters(ordinal_, fn.name, cfg, st);
-  double busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   pub->note_kernel(ord, 0.0);
-  (void)busy;
 }
 
 void Runtime::publish_identity(const DeviceProfile& p, int ordinal) {

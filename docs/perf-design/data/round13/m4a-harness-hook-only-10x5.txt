@@ -1,0 +1,36 @@
+pass 0 tier done
+pass 0 m4hook done
+pass 0 m4 done
+pass 1 m4hook done
+pass 1 m4 done
+pass 1 tier done
+pass 2 m4 done
+pass 2 tier done
+pass 2 m4hook done
+pass 3 tier done
+pass 3 m4hook done
+pass 3 m4 done
+pass 4 m4hook done
+pass 4 m4 done
+pass 4 tier done
+pass 5 m4 done
+pass 5 tier done
+pass 5 m4hook done
+pass 6 tier done
+pass 6 m4hook done
+pass 6 m4 done
+pass 7 m4hook done
+pass 7 m4 done
+pass 7 tier done
+pass 8 m4 done
+pass 8 tier done
+pass 8 m4hook done
+pass 9 tier done
+pass 9 m4hook done
+pass 9 m4 done
+COUNTERS: identical in every config for 4 workloads; no differences
+workload                        tier                m4hook                    m4   ratios vs tier
+shared           0.0774 (+- 6.6%)       0.0825 (+- 2.2%)       0.0904 (+-13.4%)      m4hook=1.067 m4=1.168
+warp             0.0924 (+- 6.3%)       0.1096 (+-15.1%)       0.1049 (+-11.4%)      m4hook=1.186 m4=1.135
+f64_fma          0.0760 (+-11.8%)       0.0895 (+-17.2%)       0.0849 (+-14.1%)      m4hook=1.177 m4=1.118
+divergent        0.3604 (+- 2.7%)       0.3709 (+- 2.4%)       0.3782 (+- 5.9%)      m4hook=1.029 m4=1.049

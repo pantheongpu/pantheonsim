@@ -1,0 +1,2145 @@
+# gfx942 packed 16-bit float, dot product, half conversion, comparison, sine/cosine and packed integer instructions in
+# every modifier combination: the encoding (little-endian 32-bit words) and the text. Written by amd/tools/packed-corpus.py.
+7C280405	v_cmp_class_f16_e32 vcc, s5, v2
+7C280501	v_cmp_class_f16_e32 vcc, v1, v2
+D0140000 20020405	v_cmp_class_f16_e64 s[0:1], -s5, v2
+D0140000 20020501	v_cmp_class_f16_e64 s[0:1], -v1, v2
+7C4404F2	v_cmp_eq_f16_e32 vcc, 1.0, v2
+7C440405	v_cmp_eq_f16_e32 vcc, s5, v2
+7C440501	v_cmp_eq_f16_e32 vcc, v1, v2
+D0220100 20020501	v_cmp_eq_f16_e64 s[0:1], -|v1|, v2
+D0220002 00000B01	v_cmp_eq_f16_e64 s[2:3], v1, s5
+D0220102 40020501	v_cmp_eq_f16_e64 s[2:3], |v1|, -v2
+7C4004F2	v_cmp_f_f16_e32 vcc, 1.0, v2
+7C400405	v_cmp_f_f16_e32 vcc, s5, v2
+7C400501	v_cmp_f_f16_e32 vcc, v1, v2
+D0200100 20020501	v_cmp_f_f16_e64 s[0:1], -|v1|, v2
+D0200002 00000B01	v_cmp_f_f16_e64 s[2:3], v1, s5
+D0200102 40020501	v_cmp_f_f16_e64 s[2:3], |v1|, -v2
+7C4C04F2	v_cmp_ge_f16_e32 vcc, 1.0, v2
+7C4C0405	v_cmp_ge_f16_e32 vcc, s5, v2
+7C4C0501	v_cmp_ge_f16_e32 vcc, v1, v2
+D0260100 20020501	v_cmp_ge_f16_e64 s[0:1], -|v1|, v2
+D0260002 00000B01	v_cmp_ge_f16_e64 s[2:3], v1, s5
+D0260102 40020501	v_cmp_ge_f16_e64 s[2:3], |v1|, -v2
+7C4804F2	v_cmp_gt_f16_e32 vcc, 1.0, v2
+7C480405	v_cmp_gt_f16_e32 vcc, s5, v2
+7C480501	v_cmp_gt_f16_e32 vcc, v1, v2
+D0240100 20020501	v_cmp_gt_f16_e64 s[0:1], -|v1|, v2
+D0240002 00000B01	v_cmp_gt_f16_e64 s[2:3], v1, s5
+D0240102 40020501	v_cmp_gt_f16_e64 s[2:3], |v1|, -v2
+7C4604F2	v_cmp_le_f16_e32 vcc, 1.0, v2
+7C460405	v_cmp_le_f16_e32 vcc, s5, v2
+7C460501	v_cmp_le_f16_e32 vcc, v1, v2
+D0230100 20020501	v_cmp_le_f16_e64 s[0:1], -|v1|, v2
+D0230002 00000B01	v_cmp_le_f16_e64 s[2:3], v1, s5
+D0230102 40020501	v_cmp_le_f16_e64 s[2:3], |v1|, -v2
+7C4A04F2	v_cmp_lg_f16_e32 vcc, 1.0, v2
+7C4A0405	v_cmp_lg_f16_e32 vcc, s5, v2
+7C4A0501	v_cmp_lg_f16_e32 vcc, v1, v2
+D0250100 20020501	v_cmp_lg_f16_e64 s[0:1], -|v1|, v2
+D0250002 00000B01	v_cmp_lg_f16_e64 s[2:3], v1, s5
+D0250102 40020501	v_cmp_lg_f16_e64 s[2:3], |v1|, -v2
+7C4204F2	v_cmp_lt_f16_e32 vcc, 1.0, v2
+7C420405	v_cmp_lt_f16_e32 vcc, s5, v2
+7C420501	v_cmp_lt_f16_e32 vcc, v1, v2
+D0210100 20020501	v_cmp_lt_f16_e64 s[0:1], -|v1|, v2
+D0210002 00000B01	v_cmp_lt_f16_e64 s[2:3], v1, s5
+D0210102 40020501	v_cmp_lt_f16_e64 s[2:3], |v1|, -v2
+7C5A04F2	v_cmp_neq_f16_e32 vcc, 1.0, v2
+7C5A0405	v_cmp_neq_f16_e32 vcc, s5, v2
+7C5A0501	v_cmp_neq_f16_e32 vcc, v1, v2
+D02D0100 20020501	v_cmp_neq_f16_e64 s[0:1], -|v1|, v2
+D02D0002 00000B01	v_cmp_neq_f16_e64 s[2:3], v1, s5
+D02D0102 40020501	v_cmp_neq_f16_e64 s[2:3], |v1|, -v2
+7C5204F2	v_cmp_nge_f16_e32 vcc, 1.0, v2
+7C520405	v_cmp_nge_f16_e32 vcc, s5, v2
+7C520501	v_cmp_nge_f16_e32 vcc, v1, v2
+D0290100 20020501	v_cmp_nge_f16_e64 s[0:1], -|v1|, v2
+D0290002 00000B01	v_cmp_nge_f16_e64 s[2:3], v1, s5
+D0290102 40020501	v_cmp_nge_f16_e64 s[2:3], |v1|, -v2
+7C5604F2	v_cmp_ngt_f16_e32 vcc, 1.0, v2
+7C560405	v_cmp_ngt_f16_e32 vcc, s5, v2
+7C560501	v_cmp_ngt_f16_e32 vcc, v1, v2
+D02B0100 20020501	v_cmp_ngt_f16_e64 s[0:1], -|v1|, v2
+D02B0002 00000B01	v_cmp_ngt_f16_e64 s[2:3], v1, s5
+D02B0102 40020501	v_cmp_ngt_f16_e64 s[2:3], |v1|, -v2
+7C5804F2	v_cmp_nle_f16_e32 vcc, 1.0, v2
+7C580405	v_cmp_nle_f16_e32 vcc, s5, v2
+7C580501	v_cmp_nle_f16_e32 vcc, v1, v2
+D02C0100 20020501	v_cmp_nle_f16_e64 s[0:1], -|v1|, v2
+D02C0002 00000B01	v_cmp_nle_f16_e64 s[2:3], v1, s5
+D02C0102 40020501	v_cmp_nle_f16_e64 s[2:3], |v1|, -v2
+7C5404F2	v_cmp_nlg_f16_e32 vcc, 1.0, v2
+7C540405	v_cmp_nlg_f16_e32 vcc, s5, v2
+7C540501	v_cmp_nlg_f16_e32 vcc, v1, v2
+D02A0100 20020501	v_cmp_nlg_f16_e64 s[0:1], -|v1|, v2
+D02A0002 00000B01	v_cmp_nlg_f16_e64 s[2:3], v1, s5
+D02A0102 40020501	v_cmp_nlg_f16_e64 s[2:3], |v1|, -v2
+7C5C04F2	v_cmp_nlt_f16_e32 vcc, 1.0, v2
+7C5C0405	v_cmp_nlt_f16_e32 vcc, s5, v2
+7C5C0501	v_cmp_nlt_f16_e32 vcc, v1, v2
+D02E0100 20020501	v_cmp_nlt_f16_e64 s[0:1], -|v1|, v2
+D02E0002 00000B01	v_cmp_nlt_f16_e64 s[2:3], v1, s5
+D02E0102 40020501	v_cmp_nlt_f16_e64 s[2:3], |v1|, -v2
+7C4E04F2	v_cmp_o_f16_e32 vcc, 1.0, v2
+7C4E0405	v_cmp_o_f16_e32 vcc, s5, v2
+7C4E0501	v_cmp_o_f16_e32 vcc, v1, v2
+D0270100 20020501	v_cmp_o_f16_e64 s[0:1], -|v1|, v2
+D0270002 00000B01	v_cmp_o_f16_e64 s[2:3], v1, s5
+D0270102 40020501	v_cmp_o_f16_e64 s[2:3], |v1|, -v2
+7C5E04F2	v_cmp_tru_f16_e32 vcc, 1.0, v2
+7C5E0405	v_cmp_tru_f16_e32 vcc, s5, v2
+7C5E0501	v_cmp_tru_f16_e32 vcc, v1, v2
+D02F0100 20020501	v_cmp_tru_f16_e64 s[0:1], -|v1|, v2
+D02F0002 00000B01	v_cmp_tru_f16_e64 s[2:3], v1, s5
+D02F0102 40020501	v_cmp_tru_f16_e64 s[2:3], |v1|, -v2
+7C5004F2	v_cmp_u_f16_e32 vcc, 1.0, v2
+7C500405	v_cmp_u_f16_e32 vcc, s5, v2
+7C500501	v_cmp_u_f16_e32 vcc, v1, v2
+D0280100 20020501	v_cmp_u_f16_e64 s[0:1], -|v1|, v2
+D0280002 00000B01	v_cmp_u_f16_e64 s[2:3], v1, s5
+D0280102 40020501	v_cmp_u_f16_e64 s[2:3], |v1|, -v2
+7C640501	v_cmpx_eq_f16_e32 vcc, v1, v2
+D0320204 20020501	v_cmpx_eq_f16_e64 s[4:5], -v1, |v2|
+7C600501	v_cmpx_f_f16_e32 vcc, v1, v2
+D0300204 20020501	v_cmpx_f_f16_e64 s[4:5], -v1, |v2|
+7C6C0501	v_cmpx_ge_f16_e32 vcc, v1, v2
+D0360204 20020501	v_cmpx_ge_f16_e64 s[4:5], -v1, |v2|
+7C680501	v_cmpx_gt_f16_e32 vcc, v1, v2
+D0340204 20020501	v_cmpx_gt_f16_e64 s[4:5], -v1, |v2|
+7C660501	v_cmpx_le_f16_e32 vcc, v1, v2
+D0330204 20020501	v_cmpx_le_f16_e64 s[4:5], -v1, |v2|
+7C6A0501	v_cmpx_lg_f16_e32 vcc, v1, v2
+D0350204 20020501	v_cmpx_lg_f16_e64 s[4:5], -v1, |v2|
+7C620501	v_cmpx_lt_f16_e32 vcc, v1, v2
+D0310204 20020501	v_cmpx_lt_f16_e64 s[4:5], -v1, |v2|
+7C7A0501	v_cmpx_neq_f16_e32 vcc, v1, v2
+D03D0204 20020501	v_cmpx_neq_f16_e64 s[4:5], -v1, |v2|
+7C720501	v_cmpx_nge_f16_e32 vcc, v1, v2
+D0390204 20020501	v_cmpx_nge_f16_e64 s[4:5], -v1, |v2|
+7C760501	v_cmpx_ngt_f16_e32 vcc, v1, v2
+D03B0204 20020501	v_cmpx_ngt_f16_e64 s[4:5], -v1, |v2|
+7C780501	v_cmpx_nle_f16_e32 vcc, v1, v2
+D03C0204 20020501	v_cmpx_nle_f16_e64 s[4:5], -v1, |v2|
+7C740501	v_cmpx_nlg_f16_e32 vcc, v1, v2
+D03A0204 20020501	v_cmpx_nlg_f16_e64 s[4:5], -v1, |v2|
+7C7C0501	v_cmpx_nlt_f16_e32 vcc, v1, v2
+D03E0204 20020501	v_cmpx_nlt_f16_e64 s[4:5], -v1, |v2|
+7C6E0501	v_cmpx_o_f16_e32 vcc, v1, v2
+D0370204 20020501	v_cmpx_o_f16_e64 s[4:5], -v1, |v2|
+7C7E0501	v_cmpx_tru_f16_e32 vcc, v1, v2
+D03F0204 20020501	v_cmpx_tru_f16_e64 s[4:5], -v1, |v2|
+7C700501	v_cmpx_u_f16_e32 vcc, v1, v2
+D0380204 20020501	v_cmpx_u_f16_e64 s[4:5], -v1, |v2|
+7E0054FF BE800000	v_cos_f32 v0, -0.25
+7E005480	v_cos_f32 v0, 0
+7E0054F0	v_cos_f32 v0, 0.5
+7E0054FF 3E800000	v_cos_f32 v0, 0x3e800000
+7E0054F2	v_cos_f32 v0, 1.0
+7E005405	v_cos_f32 v0, s5
+7E005501	v_cos_f32 v0, v1
+D16A0000 20000101	v_cos_f32_e64 v0, -v1
+D16A8000 20000101	v_cos_f32_e64 v0, -v1 clamp
+D16A8000 28000101	v_cos_f32_e64 v0, -v1 clamp mul:2
+D16A0000 38000101	v_cos_f32_e64 v0, -v1 div:2
+D16A0000 28000101	v_cos_f32_e64 v0, -v1 mul:2
+D16A0000 30000101	v_cos_f32_e64 v0, -v1 mul:4
+D16A0100 20000101	v_cos_f32_e64 v0, -|v1|
+D16A8100 20000101	v_cos_f32_e64 v0, -|v1| clamp
+D16A8100 28000101	v_cos_f32_e64 v0, -|v1| clamp mul:2
+D16A0100 38000101	v_cos_f32_e64 v0, -|v1| div:2
+D16A0100 28000101	v_cos_f32_e64 v0, -|v1| mul:2
+D16A0100 30000101	v_cos_f32_e64 v0, -|v1| mul:4
+D16A0000 00000005	v_cos_f32_e64 v0, s5
+D16A8000 00000005	v_cos_f32_e64 v0, s5 clamp
+D16A8000 08000005	v_cos_f32_e64 v0, s5 clamp mul:2
+D16A0000 18000005	v_cos_f32_e64 v0, s5 div:2
+D16A0000 08000005	v_cos_f32_e64 v0, s5 mul:2
+D16A0000 10000005	v_cos_f32_e64 v0, s5 mul:4
+D16A0000 00000101	v_cos_f32_e64 v0, v1
+D16A8000 00000101	v_cos_f32_e64 v0, v1 clamp
+D16A8000 08000101	v_cos_f32_e64 v0, v1 clamp mul:2
+D16A0000 18000101	v_cos_f32_e64 v0, v1 div:2
+D16A0000 08000101	v_cos_f32_e64 v0, v1 mul:2
+D16A0000 10000101	v_cos_f32_e64 v0, v1 mul:4
+D16A0100 00000101	v_cos_f32_e64 v0, |v1|
+D16A8100 00000101	v_cos_f32_e64 v0, |v1| clamp
+D16A8100 08000101	v_cos_f32_e64 v0, |v1| clamp mul:2
+D16A0100 18000101	v_cos_f32_e64 v0, |v1| div:2
+D16A0100 08000101	v_cos_f32_e64 v0, |v1| mul:2
+D16A0100 10000101	v_cos_f32_e64 v0, |v1| mul:4
+7E0014F5	v_cvt_f16_f32 v0, -2.0
+7E001480	v_cvt_f16_f32 v0, 0
+7E0014FF 477FF000	v_cvt_f16_f32 v0, 0x477ff000
+7E0014FF 7FC00001	v_cvt_f16_f32 v0, 0x7fc00001
+7E0014F2	v_cvt_f16_f32 v0, 1.0
+7E001405	v_cvt_f16_f32 v0, s5
+7E001501	v_cvt_f16_f32 v0, v1
+D14A0000 20000101	v_cvt_f16_f32_e64 v0, -v1
+D14A8000 20000101	v_cvt_f16_f32_e64 v0, -v1 clamp
+D14A8000 28000101	v_cvt_f16_f32_e64 v0, -v1 clamp mul:2
+D14A0000 38000101	v_cvt_f16_f32_e64 v0, -v1 div:2
+D14A0000 28000101	v_cvt_f16_f32_e64 v0, -v1 mul:2
+D14A0000 30000101	v_cvt_f16_f32_e64 v0, -v1 mul:4
+D14A0100 20000101	v_cvt_f16_f32_e64 v0, -|v1|
+D14A8100 20000101	v_cvt_f16_f32_e64 v0, -|v1| clamp
+D14A8100 28000101	v_cvt_f16_f32_e64 v0, -|v1| clamp mul:2
+D14A0100 38000101	v_cvt_f16_f32_e64 v0, -|v1| div:2
+D14A0100 28000101	v_cvt_f16_f32_e64 v0, -|v1| mul:2
+D14A0100 30000101	v_cvt_f16_f32_e64 v0, -|v1| mul:4
+D14A0000 000000F2	v_cvt_f16_f32_e64 v0, 1.0
+D14A8000 000000F2	v_cvt_f16_f32_e64 v0, 1.0 clamp
+D14A8000 080000F2	v_cvt_f16_f32_e64 v0, 1.0 clamp mul:2
+D14A0000 180000F2	v_cvt_f16_f32_e64 v0, 1.0 div:2
+D14A0000 080000F2	v_cvt_f16_f32_e64 v0, 1.0 mul:2
+D14A0000 100000F2	v_cvt_f16_f32_e64 v0, 1.0 mul:4
+D14A0000 00000005	v_cvt_f16_f32_e64 v0, s5
+D14A8000 00000005	v_cvt_f16_f32_e64 v0, s5 clamp
+D14A8000 08000005	v_cvt_f16_f32_e64 v0, s5 clamp mul:2
+D14A0000 18000005	v_cvt_f16_f32_e64 v0, s5 div:2
+D14A0000 08000005	v_cvt_f16_f32_e64 v0, s5 mul:2
+D14A0000 10000005	v_cvt_f16_f32_e64 v0, s5 mul:4
+D14A0000 00000101	v_cvt_f16_f32_e64 v0, v1
+D14A8000 00000101	v_cvt_f16_f32_e64 v0, v1 clamp
+D14A8000 08000101	v_cvt_f16_f32_e64 v0, v1 clamp mul:2
+D14A0000 18000101	v_cvt_f16_f32_e64 v0, v1 div:2
+D14A0000 08000101	v_cvt_f16_f32_e64 v0, v1 mul:2
+D14A0000 10000101	v_cvt_f16_f32_e64 v0, v1 mul:4
+D14A0100 00000101	v_cvt_f16_f32_e64 v0, |v1|
+D14A8100 00000101	v_cvt_f16_f32_e64 v0, |v1| clamp
+D14A8100 08000101	v_cvt_f16_f32_e64 v0, |v1| clamp mul:2
+D14A0100 18000101	v_cvt_f16_f32_e64 v0, |v1| div:2
+D14A0100 08000101	v_cvt_f16_f32_e64 v0, |v1| mul:2
+D14A0100 10000101	v_cvt_f16_f32_e64 v0, |v1| mul:4
+7E0016F5	v_cvt_f32_f16 v0, -2.0
+7E001680	v_cvt_f32_f16 v0, 0
+7E0016F2	v_cvt_f32_f16 v0, 1.0
+7E001605	v_cvt_f32_f16 v0, s5
+7E001701	v_cvt_f32_f16 v0, v1
+D14B0000 20000101	v_cvt_f32_f16_e64 v0, -v1
+D14B8000 20000101	v_cvt_f32_f16_e64 v0, -v1 clamp
+D14B8000 28000101	v_cvt_f32_f16_e64 v0, -v1 clamp mul:2
+D14B0000 38000101	v_cvt_f32_f16_e64 v0, -v1 div:2
+D14B0000 28000101	v_cvt_f32_f16_e64 v0, -v1 mul:2
+D14B0000 30000101	v_cvt_f32_f16_e64 v0, -v1 mul:4
+D14B0100 20000101	v_cvt_f32_f16_e64 v0, -|v1|
+D14B8100 20000101	v_cvt_f32_f16_e64 v0, -|v1| clamp
+D14B8100 28000101	v_cvt_f32_f16_e64 v0, -|v1| clamp mul:2
+D14B0100 38000101	v_cvt_f32_f16_e64 v0, -|v1| div:2
+D14B0100 28000101	v_cvt_f32_f16_e64 v0, -|v1| mul:2
+D14B0100 30000101	v_cvt_f32_f16_e64 v0, -|v1| mul:4
+D14B0000 000000F2	v_cvt_f32_f16_e64 v0, 1.0
+D14B8000 000000F2	v_cvt_f32_f16_e64 v0, 1.0 clamp
+D14B8000 080000F2	v_cvt_f32_f16_e64 v0, 1.0 clamp mul:2
+D14B0000 180000F2	v_cvt_f32_f16_e64 v0, 1.0 div:2
+D14B0000 080000F2	v_cvt_f32_f16_e64 v0, 1.0 mul:2
+D14B0000 100000F2	v_cvt_f32_f16_e64 v0, 1.0 mul:4
+D14B0000 00000005	v_cvt_f32_f16_e64 v0, s5
+D14B8000 00000005	v_cvt_f32_f16_e64 v0, s5 clamp
+D14B8000 08000005	v_cvt_f32_f16_e64 v0, s5 clamp mul:2
+D14B0000 18000005	v_cvt_f32_f16_e64 v0, s5 div:2
+D14B0000 08000005	v_cvt_f32_f16_e64 v0, s5 mul:2
+D14B0000 10000005	v_cvt_f32_f16_e64 v0, s5 mul:4
+D14B0000 00000101	v_cvt_f32_f16_e64 v0, v1
+D14B8000 00000101	v_cvt_f32_f16_e64 v0, v1 clamp
+D14B8000 08000101	v_cvt_f32_f16_e64 v0, v1 clamp mul:2
+D14B0000 18000101	v_cvt_f32_f16_e64 v0, v1 div:2
+D14B0000 08000101	v_cvt_f32_f16_e64 v0, v1 mul:2
+D14B0000 10000101	v_cvt_f32_f16_e64 v0, v1 mul:4
+D14B0100 00000101	v_cvt_f32_f16_e64 v0, |v1|
+D14B8100 00000101	v_cvt_f32_f16_e64 v0, |v1| clamp
+D14B8100 08000101	v_cvt_f32_f16_e64 v0, |v1| clamp mul:2
+D14B0100 18000101	v_cvt_f32_f16_e64 v0, |v1| div:2
+D14B0100 08000101	v_cvt_f32_f16_e64 v0, |v1| mul:2
+D14B0100 10000101	v_cvt_f32_f16_e64 v0, |v1| mul:4
+D3A30D00 63C9EAF5	v_dot2_f32_f16 v0, -2.0, -2.0, 1.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D3A3F300 6019EAF5	v_dot2_f32_f16 v0, -2.0, -2.0, s6 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0] clamp
+D3A32A00 9BD5EEF5	v_dot2_f32_f16 v0, -2.0, -4.0, -2.0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0]
+D3A36500 4019EEF5	v_dot2_f32_f16 v0, -2.0, -4.0, s6 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D3A31000 03D500F5	v_dot2_f32_f16 v0, -2.0, 0, -2.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D3A30400 DC1100F5	v_dot2_f32_f16 v0, -2.0, 0, v4 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1]
+D3A38E00 03DDE0F5	v_dot2_f32_f16 v0, -2.0, 0.5, -4.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1] clamp
+D3A35800 B3C1E0F5	v_dot2_f32_f16 v0, -2.0, 0.5, 0.5 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D3A35F00 2BC9E0F5	v_dot2_f32_f16 v0, -2.0, 0.5, 1.0 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1]
+D3A3AE00 B409E0F5	v_dot2_f32_f16 v0, -2.0, 0.5, v2 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1] clamp
+D3A37300 4BC1E4F5	v_dot2_f32_f16 v0, -2.0, 1.0, 0.5 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0]
+D3A31C00 38140AF5	v_dot2_f32_f16 v0, -2.0, s5, s5 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D3A30400 BA000CF5	v_dot2_f32_f16 v0, -2.0, s6, 0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D3A36D00 9A000CF5	v_dot2_f32_f16 v0, -2.0, s6, 0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D3A32600 C3C00CF5	v_dot2_f32_f16 v0, -2.0, s6, 0.5 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D3A34500 FA0C0CF5	v_dot2_f32_f16 v0, -2.0, s6, 3 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D3A34B00 AC080CF5	v_dot2_f32_f16 v0, -2.0, s6, v2 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D3A31500 8C100CF5	v_dot2_f32_f16 v0, -2.0, s6, v4 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D3A30B00 83D602F5	v_dot2_f32_f16 v0, -2.0, v1, -2.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D3A3DD00 F20202F5	v_dot2_f32_f16 v0, -2.0, v1, 0 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1] clamp
+D3A34000 1C0E04F5	v_dot2_f32_f16 v0, -2.0, v2, v3
+D3A3C000 1C0E04F5	v_dot2_f32_f16 v0, -2.0, v2, v3 clamp
+D3A33200 EBCA06F5	v_dot2_f32_f16 v0, -2.0, v3, 1.0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0]
+D3A3B200 240606F5	v_dot2_f32_f16 v0, -2.0, v3, v1 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0] clamp
+D3A37100 A41206F5	v_dot2_f32_f16 v0, -2.0, v3, v4 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0]
+D3A34D00 CBDE08F5	v_dot2_f32_f16 v0, -2.0, v4, -4.0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D3A30C00 3019EAF7	v_dot2_f32_f16 v0, -4.0, -2.0, s6 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D3A3F900 F405EAF7	v_dot2_f32_f16 v0, -4.0, -2.0, v1 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0] clamp
+D3A30400 3C09EAF7	v_dot2_f32_f16 v0, -4.0, -2.0, v2 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D3A3DD00 E3C9EEF7	v_dot2_f32_f16 v0, -4.0, -4.0, 1.0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1] clamp
+D3A34500 4A0DEEF7	v_dot2_f32_f16 v0, -4.0, -4.0, 3 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D3A37900 1A0DEEF7	v_dot2_f32_f16 v0, -4.0, -4.0, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0]
+D3A30200 1015EEF7	v_dot2_f32_f16 v0, -4.0, -4.0, s5 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0]
+D3A35000 3019EEF7	v_dot2_f32_f16 v0, -4.0, -4.0, s6 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D3A31000 1BC900F7	v_dot2_f32_f16 v0, -4.0, 0, 1.0 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D3A30300 C01900F7	v_dot2_f32_f16 v0, -4.0, 0, s6 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D3A38400 440D00F7	v_dot2_f32_f16 v0, -4.0, 0, v3 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1] clamp
+D3A3DC00 8A01E0F7	v_dot2_f32_f16 v0, -4.0, 0.5, 0 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1] clamp
+D3A37300 0815E0F7	v_dot2_f32_f16 v0, -4.0, 0.5, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D3A39400 2C05E0F7	v_dot2_f32_f16 v0, -4.0, 0.5, v1 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1] clamp
+D3A34D00 03D5E4F7	v_dot2_f32_f16 v0, -4.0, 1.0, -2.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D3A37C00 EA0DE4F7	v_dot2_f32_f16 v0, -4.0, 1.0, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D3A33900 2A0D06F7	v_dot2_f32_f16 v0, -4.0, 3, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0]
+D3A37200 7C0906F7	v_dot2_f32_f16 v0, -4.0, 3, v2 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D3A32700 F3C202F7	v_dot2_f32_f16 v0, -4.0, v1, 0.5 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D3A31100 A01A02F7	v_dot2_f32_f16 v0, -4.0, v1, s6 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0]
+D3A36C00 F40A02F7	v_dot2_f32_f16 v0, -4.0, v1, v2 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D3A39200 8BC204F7	v_dot2_f32_f16 v0, -4.0, v2, 0.5 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0] clamp
+D3A31400 83DE06F7	v_dot2_f32_f16 v0, -4.0, v3, -4.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D3A34200 681606F7	v_dot2_f32_f16 v0, -4.0, v3, s5 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D3A39400 9C0A06F7	v_dot2_f32_f16 v0, -4.0, v3, v2 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1] clamp
+D3A37400 23D608F7	v_dot2_f32_f16 v0, -4.0, v4, -2.0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D3A35500 8BC208F7	v_dot2_f32_f16 v0, -4.0, v4, 0.5 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D3A32D00 140DEA80	v_dot2_f32_f16 v0, 0, -2.0, v3 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D3A31300 A3C1EE80	v_dot2_f32_f16 v0, 0, -4.0, 0.5 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D3A35700 63C9EE80	v_dot2_f32_f16 v0, 0, -4.0, 1.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1]
+D3A30100 420D0080	v_dot2_f32_f16 v0, 0, 0, 3 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D3A30F00 C8150080	v_dot2_f32_f16 v0, 0, 0, s5 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1]
+D3A3C700 7019E080	v_dot2_f32_f16 v0, 0, 0.5, s6 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1] clamp
+D3A38200 A405E080	v_dot2_f32_f16 v0, 0, 0.5, v1 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0] clamp
+D3A35900 4BD5E480	v_dot2_f32_f16 v0, 0, 1.0, -2.0 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D3A3C900 F3C1E480	v_dot2_f32_f16 v0, 0, 1.0, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0] clamp
+D3A33700 4A0DE480	v_dot2_f32_f16 v0, 0, 1.0, 3 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1]
+D3A35C00 3019E480	v_dot2_f32_f16 v0, 0, 1.0, s6 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D3A34C00 43DC0A80	v_dot2_f32_f16 v0, 0, s5, -4.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D3A37500 2A0C0C80	v_dot2_f32_f16 v0, 0, s6, 3 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D3A33900 6A0C0C80	v_dot2_f32_f16 v0, 0, s6, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0]
+D3A31C00 E4100C80	v_dot2_f32_f16 v0, 0, s6, v4 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D3A34200 4BCA0280	v_dot2_f32_f16 v0, 0, v1, 1.0 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D3A34000 1C0E0480	v_dot2_f32_f16 v0, 0, v2, v3
+D3A3C000 1C0E0480	v_dot2_f32_f16 v0, 0, v2, v3 clamp
+D3A36500 BC060680	v_dot2_f32_f16 v0, 0, v3, v1 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D3A3F300 64120680	v_dot2_f32_f16 v0, 0, v3, v4 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0] clamp
+D3A30500 D81A0880	v_dot2_f32_f16 v0, 0, v4, s6 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D3A36100 DBDDEAF0	v_dot2_f32_f16 v0, 0.5, -2.0, -4.0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D3A33600 E20DEEF0	v_dot2_f32_f16 v0, 0.5, -4.0, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D3A35D00 43DD00F0	v_dot2_f32_f16 v0, 0.5, 0, -4.0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D3A34B00 ABDDE0F0	v_dot2_f32_f16 v0, 0.5, 0.5, -4.0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D3A37300 C815E0F0	v_dot2_f32_f16 v0, 0.5, 0.5, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D3A36E00 8819E0F0	v_dot2_f32_f16 v0, 0.5, 0.5, s6 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3A37600 B3DDE4F0	v_dot2_f32_f16 v0, 0.5, 1.0, -4.0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1]
+D3A32500 13C106F0	v_dot2_f32_f16 v0, 0.5, 3, 0.5 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D3A30900 93C106F0	v_dot2_f32_f16 v0, 0.5, 3, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0]
+D3A33400 801506F0	v_dot2_f32_f16 v0, 0.5, 3, s5 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D3A35C00 1C0906F0	v_dot2_f32_f16 v0, 0.5, 3, v2 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D3A3D900 EA000AF0	v_dot2_f32_f16 v0, 0.5, s5, 0 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0] clamp
+D3A36E00 03C80AF0	v_dot2_f32_f16 v0, 0.5, s5, 1.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D3A33000 3C100AF0	v_dot2_f32_f16 v0, 0.5, s5, v4 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D3A39700 60180CF0	v_dot2_f32_f16 v0, 0.5, s6, s6 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1] clamp
+D3A37200 440C0CF0	v_dot2_f32_f16 v0, 0.5, s6, v3 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D3A34500 BC1202F0	v_dot2_f32_f16 v0, 0.5, v1, v4 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D3A3D200 6BC204F0	v_dot2_f32_f16 v0, 0.5, v2, 0.5 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0] clamp
+D3A37D00 43C204F0	v_dot2_f32_f16 v0, 0.5, v2, 0.5 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D3A32300 6BCA04F0	v_dot2_f32_f16 v0, 0.5, v2, 1.0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0]
+D3A38600 740E06F0	v_dot2_f32_f16 v0, 0.5, v3, v3 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D3A3C600 93C208F0	v_dot2_f32_f16 v0, 0.5, v4, 0.5 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1] clamp
+D3A3E800 ABD5EAF2	v_dot2_f32_f16 v0, 1.0, -2.0, -2.0 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0] clamp
+D3A30600 2BC1EAF2	v_dot2_f32_f16 v0, 1.0, -2.0, 0.5 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 1]
+D3A35200 0405EAF2	v_dot2_f32_f16 v0, 1.0, -2.0, v1 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0]
+D3A31F00 7409EAF2	v_dot2_f32_f16 v0, 1.0, -2.0, v2 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1]
+D3A33600 C40DEAF2	v_dot2_f32_f16 v0, 1.0, -2.0, v3 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D3A39C00 040DEAF2	v_dot2_f32_f16 v0, 1.0, -2.0, v3 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1] clamp
+D3A33100 FA01EEF2	v_dot2_f32_f16 v0, 1.0, -4.0, 0 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0]
+D3A3B000 8C09EEF2	v_dot2_f32_f16 v0, 1.0, -4.0, v2 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0] clamp
+D3A37E00 8C11EEF2	v_dot2_f32_f16 v0, 1.0, -4.0, v4 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3A3E500 EC0500F2	v_dot2_f32_f16 v0, 1.0, 0, v1 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1] clamp
+D3A3AB00 03D40AF2	v_dot2_f32_f16 v0, 1.0, s5, -2.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0] clamp
+D3A32900 23DC0AF2	v_dot2_f32_f16 v0, 1.0, s5, -4.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0]
+D3A39000 D3DC0CF2	v_dot2_f32_f16 v0, 1.0, s6, -4.0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0] clamp
+D3A3F300 43C204F2	v_dot2_f32_f16 v0, 1.0, v2, 0.5 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0] clamp
+D3A32000 E01606F2	v_dot2_f32_f16 v0, 1.0, v3, s5 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D3A37900 5C0606F2	v_dot2_f32_f16 v0, 1.0, v3, v1 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D3A30000 4201EA83	v_dot2_f32_f16 v0, 3, -2.0, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D3A3AF00 D3C9EA83	v_dot2_f32_f16 v0, 3, -2.0, 1.0 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1] clamp
+D3A37200 C411EA83	v_dot2_f32_f16 v0, 3, -2.0, v4 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D3A38000 3BC1EE83	v_dot2_f32_f16 v0, 3, -4.0, 0.5 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0] clamp
+D3A35500 4409EE83	v_dot2_f32_f16 v0, 3, -4.0, v2 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D3A37600 C0190083	v_dot2_f32_f16 v0, 3, 0, s6 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D3A32500 94090083	v_dot2_f32_f16 v0, 3, 0, v2 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D3A3B000 F4090083	v_dot2_f32_f16 v0, 3, 0, v2 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0] clamp
+D3A31500 8819E083	v_dot2_f32_f16 v0, 3, 0.5, s6 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D3A34700 FBD5E483	v_dot2_f32_f16 v0, 3, 1.0, -2.0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D3A33000 CBD5E483	v_dot2_f32_f16 v0, 3, 1.0, -2.0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D3A39500 9BD50683	v_dot2_f32_f16 v0, 3, 3, -2.0 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1] clamp
+D3A32B00 0BC90683	v_dot2_f32_f16 v0, 3, 3, 1.0 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D3A37C00 AC080A83	v_dot2_f32_f16 v0, 3, s5, v2 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D3A34200 83C80C83	v_dot2_f32_f16 v0, 3, s6, 1.0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0]
+D3A38600 18160283	v_dot2_f32_f16 v0, 3, v1, s5 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1] clamp
+D3A33E00 B3DE0483	v_dot2_f32_f16 v0, 3, v2, -4.0 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1]
+D3A34500 D3C20483	v_dot2_f32_f16 v0, 3, v2, 0.5 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D3A3B300 F81A0483	v_dot2_f32_f16 v0, 3, v2, s6 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0] clamp
+D3A33400 34060683	v_dot2_f32_f16 v0, 3, v3, v1 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D3A3E500 2BDE0883	v_dot2_f32_f16 v0, 3, v4, -4.0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D3A33700 92020883	v_dot2_f32_f16 v0, 3, v4, 0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1]
+D3A35600 63CA0883	v_dot2_f32_f16 v0, 3, v4, 1.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D3A36100 EBD5EA05	v_dot2_f32_f16 v0, s5, -2.0, -2.0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0]
+D3A31600 1019EE05	v_dot2_f32_f16 v0, s5, -4.0, s6 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D3A38700 C8150005	v_dot2_f32_f16 v0, s5, 0, s5 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1] clamp
+D3A3CC00 A40D0005	v_dot2_f32_f16 v0, s5, 0, v3 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1] clamp
+D3A33000 1BC1E405	v_dot2_f32_f16 v0, s5, 1.0, 0.5 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D3A37F00 0C0DE405	v_dot2_f32_f16 v0, s5, 1.0, v3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D3A36400 E3D40A05	v_dot2_f32_f16 v0, s5, s5, -2.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D3A3E400 9A0C0A05	v_dot2_f32_f16 v0, s5, s5, 3 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1] clamp
+D3A3FF00 E4040A05	v_dot2_f32_f16 v0, s5, s5, v1 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1] clamp
+D3A31800 E2000C05	v_dot2_f32_f16 v0, s5, s6, 0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D3A36500 AA0C0C05	v_dot2_f32_f16 v0, s5, s6, 3 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D3A3AE00 940C0C05	v_dot2_f32_f16 v0, s5, s6, v3 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1] clamp
+D3A33500 64100C05	v_dot2_f32_f16 v0, s5, s6, v4 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D3A35200 13C20205	v_dot2_f32_f16 v0, s5, v1, 0.5 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0]
+D3A31100 940A0205	v_dot2_f32_f16 v0, s5, v1, v2 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0]
+D3A32A00 63DE0605	v_dot2_f32_f16 v0, s5, v3, -4.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D3A3CA00 63C20605	v_dot2_f32_f16 v0, s5, v3, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0] clamp
+D3A30600 5C060605	v_dot2_f32_f16 v0, s5, v3, v1 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1]
+D3A3BC00 63CA0805	v_dot2_f32_f16 v0, s5, v4, 1.0 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1] clamp
+D3A32400 F40A0805	v_dot2_f32_f16 v0, s5, v4, v2 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D3A3BD00 DBC1EA06	v_dot2_f32_f16 v0, s6, -2.0, 0.5 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1] clamp
+D3A35B00 C015EA06	v_dot2_f32_f16 v0, s6, -2.0, s5 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D3A38800 ABD5EE06	v_dot2_f32_f16 v0, s6, -4.0, -2.0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0] clamp
+D3A34100 4BC1EE06	v_dot2_f32_f16 v0, s6, -4.0, 0.5 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D3A34700 43D50006	v_dot2_f32_f16 v0, s6, 0, -2.0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1]
+D3A3C100 6201E006	v_dot2_f32_f16 v0, s6, 0.5, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0] clamp
+D3A34100 3201E006	v_dot2_f32_f16 v0, s6, 0.5, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0]
+D3A32400 33C9E006	v_dot2_f32_f16 v0, s6, 0.5, 1.0 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D3A38500 C019E006	v_dot2_f32_f16 v0, s6, 0.5, s6 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1] clamp
+D3A32200 DC11E006	v_dot2_f32_f16 v0, s6, 0.5, v4 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D3A35800 FBC9E406	v_dot2_f32_f16 v0, s6, 1.0, 1.0 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D3A39E00 F411E406	v_dot2_f32_f16 v0, s6, 1.0, v4 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1] clamp
+D3A36600 640C0A06	v_dot2_f32_f16 v0, s6, s5, v3 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D3A31400 B8160206	v_dot2_f32_f16 v0, s6, v1, s5 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D3A30B00 201A0206	v_dot2_f32_f16 v0, s6, v1, s6 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0]
+D3A3AB00 34060206	v_dot2_f32_f16 v0, s6, v1, v1 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0] clamp
+D3A38E00 53C20406	v_dot2_f32_f16 v0, s6, v2, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1] clamp
+D3A31700 E81A0406	v_dot2_f32_f16 v0, s6, v2, s6 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D3A34000 1C0E0406	v_dot2_f32_f16 v0, s6, v2, v3
+D3A3C000 1C0E0406	v_dot2_f32_f16 v0, s6, v2, v3 clamp
+D3A3C000 5A020606	v_dot2_f32_f16 v0, s6, v3, 0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0] clamp
+D3A3B500 5A020806	v_dot2_f32_f16 v0, s6, v4, 0 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1] clamp
+D3A34100 D019EB01	v_dot2_f32_f16 v0, v1, -2.0, s6 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D3A36300 C20DEF01	v_dot2_f32_f16 v0, v1, -4.0, 3 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D3A37100 F019EF01	v_dot2_f32_f16 v0, v1, -4.0, s6 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0]
+D3A3F900 540DEF01	v_dot2_f32_f16 v0, v1, -4.0, v3 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0] clamp
+D3A31300 03D50101	v_dot2_f32_f16 v0, v1, 0, -2.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D3A36500 3BC9E101	v_dot2_f32_f16 v0, v1, 0.5, 1.0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D3A39000 9815E101	v_dot2_f32_f16 v0, v1, 0.5, s5 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0] clamp
+D3A31F00 93D5E501	v_dot2_f32_f16 v0, v1, 1.0, -2.0 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1]
+D3A34000 1C0DE501	v_dot2_f32_f16 v0, v1, 1.0, v3
+D3A3C000 1C0DE501	v_dot2_f32_f16 v0, v1, 1.0, v3 clamp
+D3A38A00 E3D50701	v_dot2_f32_f16 v0, v1, 3, -2.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0] clamp
+D3A3F300 58150701	v_dot2_f32_f16 v0, v1, 3, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0] clamp
+D3A39B00 50150701	v_dot2_f32_f16 v0, v1, 3, s5 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0] clamp
+D3A34000 1C0D0701	v_dot2_f32_f16 v0, v1, 3, v3
+D3A3C000 1C0D0701	v_dot2_f32_f16 v0, v1, 3, v3 clamp
+D3A30000 4C0D0701	v_dot2_f32_f16 v0, v1, 3, v3 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D3A3E700 D3C80B01	v_dot2_f32_f16 v0, v1, s5, 1.0 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1] clamp
+D3A37200 D0180B01	v_dot2_f32_f16 v0, v1, s5, s6 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D3A34000 1C0C0B01	v_dot2_f32_f16 v0, v1, s5, v3
+D3A3C000 1C0C0B01	v_dot2_f32_f16 v0, v1, s5, v3 clamp
+D3A3B500 13C00D01	v_dot2_f32_f16 v0, v1, s6, 0.5 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1] clamp
+D3A34500 28180D01	v_dot2_f32_f16 v0, v1, s6, s6 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D3A37500 1C040D01	v_dot2_f32_f16 v0, v1, s6, v1 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D3A32800 FA020301	v_dot2_f32_f16 v0, v1, v1, 0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D3A34000 1C060301	v_dot2_f32_f16 v0, v1, v1, v1
+D3A3C000 1C060301	v_dot2_f32_f16 v0, v1, v1, v1 clamp
+D3A34000 1BDE0501	v_dot2_f32_f16 v0, v1, v2, -4.0
+D3A3C000 1BDE0501	v_dot2_f32_f16 v0, v1, v2, -4.0 clamp
+D3A34000 1BC20501	v_dot2_f32_f16 v0, v1, v2, 0.5
+D3A3C000 1BC20501	v_dot2_f32_f16 v0, v1, v2, 0.5 clamp
+D3A34400 BBC20501	v_dot2_f32_f16 v0, v1, v2, 0.5 neg_lo:[1,0,1] neg_hi:[0,0,1]
+D3A34000 181E0501	v_dot2_f32_f16 v0, v1, v2, s7
+D3A3C000 181E0501	v_dot2_f32_f16 v0, v1, v2, s7 clamp
+D3A30500 AC060501	v_dot2_f32_f16 v0, v1, v2, v1 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D3A30400 AC0A0501	v_dot2_f32_f16 v0, v1, v2, v2 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D3A34000 1C0E0501	v_dot2_f32_f16 v0, v1, v2, v3
+D3A3C000 1C0E0501	v_dot2_f32_f16 v0, v1, v2, v3 clamp
+D3A34700 DC0E0501	v_dot2_f32_f16 v0, v1, v2, v3 neg_lo:[0,1,1] neg_hi:[1,1,1]
+D3A36E00 F3DE0901	v_dot2_f32_f16 v0, v1, v4, -4.0 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D3A30F00 82020901	v_dot2_f32_f16 v0, v1, v4, 0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1]
+D3A33F00 2815EB02	v_dot2_f32_f16 v0, v2, -2.0, s5 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1]
+D3A32000 BC09EF02	v_dot2_f32_f16 v0, v2, -4.0, v2 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D3A32400 3C0DEF02	v_dot2_f32_f16 v0, v2, -4.0, v3 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D3A34C00 F819E102	v_dot2_f32_f16 v0, v2, 0.5, s6 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D3A36A00 1C09E102	v_dot2_f32_f16 v0, v2, 0.5, v2 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0]
+D3A31500 3405E502	v_dot2_f32_f16 v0, v2, 1.0, v1 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D3A36C00 0C09E502	v_dot2_f32_f16 v0, v2, 1.0, v2 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D3A3C300 4411E502	v_dot2_f32_f16 v0, v2, 1.0, v4 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0] clamp
+D3A35A00 2411E502	v_dot2_f32_f16 v0, v2, 1.0, v4 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D3A37500 93D50702	v_dot2_f32_f16 v0, v2, 3, -2.0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D3A3A800 23D50702	v_dot2_f32_f16 v0, v2, 3, -2.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0] clamp
+D3A34800 A4050702	v_dot2_f32_f16 v0, v2, 3, v1 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D3A3F900 F4090702	v_dot2_f32_f16 v0, v2, 3, v2 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0] clamp
+D3A3B100 6BD40B02	v_dot2_f32_f16 v0, v2, s5, -2.0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0] clamp
+D3A33500 920C0D02	v_dot2_f32_f16 v0, v2, s6, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D3A35C00 7C0C0D02	v_dot2_f32_f16 v0, v2, s6, v3 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1]
+D3A30300 D2020302	v_dot2_f32_f16 v0, v2, v1, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D3A39200 0BC20302	v_dot2_f32_f16 v0, v2, v1, 0.5 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0] clamp
+D3A3AA00 FBCA0302	v_dot2_f32_f16 v0, v2, v1, 1.0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0] clamp
+D3A3B000 DC0A0302	v_dot2_f32_f16 v0, v2, v1, v2 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0] clamp
+D3A37E00 92020502	v_dot2_f32_f16 v0, v2, v2, 0 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3A32E00 18160502	v_dot2_f32_f16 v0, v2, v2, s5 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D3A3DF00 1C0A0502	v_dot2_f32_f16 v0, v2, v2, v2 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1] clamp
+D3A36300 C3DE0702	v_dot2_f32_f16 v0, v2, v3, -4.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D3A37300 101A0702	v_dot2_f32_f16 v0, v2, v3, s6 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D3A36B00 9A0E0902	v_dot2_f32_f16 v0, v2, v4, 3 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D3A30300 FC0DEB03	v_dot2_f32_f16 v0, v3, -2.0, v3 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D3A32500 54050103	v_dot2_f32_f16 v0, v3, 0, v1 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D3A30500 EC05E103	v_dot2_f32_f16 v0, v3, 0.5, v1 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D3A35D00 9A01E503	v_dot2_f32_f16 v0, v3, 1.0, 0 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D3A39600 63D50703	v_dot2_f32_f16 v0, v3, 3, -2.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D3A30A00 F20D0703	v_dot2_f32_f16 v0, v3, 3, 3 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0]
+D3A33900 43C80B03	v_dot2_f32_f16 v0, v3, s5, 1.0 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D3A37300 120C0B03	v_dot2_f32_f16 v0, v3, s5, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D3A32100 4C0C0B03	v_dot2_f32_f16 v0, v3, s5, v3 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D3A3AA00 E40C0B03	v_dot2_f32_f16 v0, v3, s5, v3 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0] clamp
+D3A35900 C3C00D03	v_dot2_f32_f16 v0, v3, s6, 0.5 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D3A30800 3C0C0D03	v_dot2_f32_f16 v0, v3, s6, v3 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D3A35900 52020303	v_dot2_f32_f16 v0, v3, v1, 0 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D3A3FF00 6A0E0303	v_dot2_f32_f16 v0, v3, v1, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1] clamp
+D3A37D00 43D60503	v_dot2_f32_f16 v0, v3, v2, -2.0 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D3A34600 9A020503	v_dot2_f32_f16 v0, v3, v2, 0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3A37600 0A0E0503	v_dot2_f32_f16 v0, v3, v2, 3 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D3A37E00 8A0E0503	v_dot2_f32_f16 v0, v3, v2, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3A3A900 DC0A0503	v_dot2_f32_f16 v0, v3, v2, v2 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0] clamp
+D3A31500 BC0A0703	v_dot2_f32_f16 v0, v3, v3, v2 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D3A32000 A3D60903	v_dot2_f32_f16 v0, v3, v4, -2.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D3A35500 93D60903	v_dot2_f32_f16 v0, v3, v4, -2.0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D3A37900 00160903	v_dot2_f32_f16 v0, v3, v4, s5 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0]
+D3A30300 CBD5EF04	v_dot2_f32_f16 v0, v4, -4.0, -2.0 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D3A30A00 B3C9EF04	v_dot2_f32_f16 v0, v4, -4.0, 1.0 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0]
+D3A3A000 94090104	v_dot2_f32_f16 v0, v4, 0, v2 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0] clamp
+D3A30A00 B3C1E104	v_dot2_f32_f16 v0, v4, 0.5, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0]
+D3A3E400 0BD5E504	v_dot2_f32_f16 v0, v4, 1.0, -2.0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1] clamp
+D3A35600 43C9E504	v_dot2_f32_f16 v0, v4, 1.0, 1.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1]
+D3A36E00 2C05E504	v_dot2_f32_f16 v0, v4, 1.0, v1 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 1]
+D3A32E00 A3C90704	v_dot2_f32_f16 v0, v4, 3, 1.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1]
+D3A39F00 FBC80B04	v_dot2_f32_f16 v0, v4, s5, 1.0 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1] clamp
+D3A30500 F3D40D04	v_dot2_f32_f16 v0, v4, s6, -2.0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D3A34C00 63DC0D04	v_dot2_f32_f16 v0, v4, s6, -4.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1]
+D3A31600 7BC20304	v_dot2_f32_f16 v0, v4, v1, 0.5 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D3A38700 7C120304	v_dot2_f32_f16 v0, v4, v1, v4 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1] clamp
+D3A37600 C3CA0504	v_dot2_f32_f16 v0, v4, v2, 1.0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D3A36600 081A0504	v_dot2_f32_f16 v0, v4, v2, s6 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D3A3BD00 B4120504	v_dot2_f32_f16 v0, v4, v2, v4 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1] clamp
+D3A38700 3BCA0704	v_dot2_f32_f16 v0, v4, v3, 1.0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1] clamp
+D3A39700 44060904	v_dot2_f32_f16 v0, v4, v4, v1 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1] clamp
+D3A34000 1C120904	v_dot2_f32_f16 v0, v4, v4, v4
+D3A3C000 1C120904	v_dot2_f32_f16 v0, v4, v4, v4 clamp
+6E0004F5	v_dot2c_f32_f16 v0, -2.0, v2
+6E000480	v_dot2c_f32_f16 v0, 0, v2
+6E0004F2	v_dot2c_f32_f16 v0, 1.0, v2
+6E000487	v_dot2c_f32_f16 v0, 7, v2
+6E000405	v_dot2c_f32_f16 v0, s5, v2
+6E000501	v_dot2c_f32_f16 v0, v1, v2
+6E0202F5	v_dot2c_f32_f16_e32 v1, -2.0, v1
+6E020280	v_dot2c_f32_f16_e32 v1, 0, v1
+6E0202F2	v_dot2c_f32_f16_e32 v1, 1.0, v1
+6E020287	v_dot2c_f32_f16_e32 v1, 7, v1
+6E020205	v_dot2c_f32_f16_e32 v1, s5, v1
+6E020301	v_dot2c_f32_f16_e32 v1, v1, v1
+D38FC900 2A0DEAF5	v_pk_add_f16 v0, -2.0, -2.0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0] clamp
+D38F8A00 A3DDEEF5	v_pk_add_f16 v0, -2.0, -4.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0] clamp
+D38FE900 83DDEEF5	v_pk_add_f16 v0, -2.0, -4.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0] clamp
+D38F4400 5019E0F5	v_pk_add_f16 v0, -2.0, 0.5 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38F0F00 1405E4F5	v_pk_add_f16 v0, -2.0, 1.0 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D38F6C00 BA0D06F5	v_pk_add_f16 v0, -2.0, 3 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D38F5C00 481506F5	v_pk_add_f16 v0, -2.0, 3 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38FBD00 23DD06F5	v_pk_add_f16 v0, -2.0, 3 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D38F6900 04080AF5	v_pk_add_f16 v0, -2.0, s5 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0]
+D38FEC00 C4100AF5	v_pk_add_f16 v0, -2.0, s5 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1] clamp
+D38FD300 E40602F5	v_pk_add_f16 v0, -2.0, v1 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0] clamp
+D38F7500 EC0602F5	v_pk_add_f16 v0, -2.0, v1 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D38F4B00 A81A02F5	v_pk_add_f16 v0, -2.0, v1 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D38F4000 180204F5	v_pk_add_f16 v0, -2.0, v2
+D38FC000 180204F5	v_pk_add_f16 v0, -2.0, v2 clamp
+D38FE200 CA0204F5	v_pk_add_f16 v0, -2.0, v2 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0] clamp
+D38F4800 180204F5	v_pk_add_f16 v0, -2.0, v2 op_sel:[1,0]
+D38F4B00 000204F5	v_pk_add_f16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,0] neg_hi:[1,1]
+D38F4900 700204F5	v_pk_add_f16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,1] neg_hi:[1,0]
+D38F4900 480204F5	v_pk_add_f16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[1,0]
+D38F4800 280204F5	v_pk_add_f16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[1,0] neg_lo:[1,0]
+D38F5A00 680204F5	v_pk_add_f16 v0, -2.0, v2 op_sel:[1,1] op_sel_hi:[1,0] neg_lo:[1,1] neg_hi:[0,1]
+D38F4000 500204F5	v_pk_add_f16 v0, -2.0, v2 op_sel_hi:[0,1] neg_lo:[0,1]
+D38F8300 F3C208F5	v_pk_add_f16 v0, -2.0, v4 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0] clamp
+D38F6500 1BDE08F5	v_pk_add_f16 v0, -2.0, v4 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D38F4A00 241208F5	v_pk_add_f16 v0, -2.0, v4 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D38F3800 AC0E08F5	v_pk_add_f16 v0, -2.0, v4 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D38F7800 D019EAF7	v_pk_add_f16 v0, -4.0, -2.0 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D38F2000 9BC9EEF7	v_pk_add_f16 v0, -4.0, -4.0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0]
+D38F4500 241100F7	v_pk_add_f16 v0, -4.0, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D38F9700 340500F7	v_pk_add_f16 v0, -4.0, 0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1] clamp
+D38F7100 B3D500F7	v_pk_add_f16 v0, -4.0, 0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0]
+D38F6200 4411E4F7	v_pk_add_f16 v0, -4.0, 1.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D38F7B00 E411E4F7	v_pk_add_f16 v0, -4.0, 1.0 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D38FF300 5C0C0AF7	v_pk_add_f16 v0, -4.0, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0] clamp
+D38F4E00 70140AF7	v_pk_add_f16 v0, -4.0, s5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D38F0B00 2A0C0AF7	v_pk_add_f16 v0, -4.0, s5 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0]
+D38F1900 64080AF7	v_pk_add_f16 v0, -4.0, s5 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0]
+D38F6200 5A000CF7	v_pk_add_f16 v0, -4.0, s6 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D38F1100 EBD40CF7	v_pk_add_f16 v0, -4.0, s6 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0]
+D38F3C00 D40E02F7	v_pk_add_f16 v0, -4.0, v1 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1]
+D38F2000 F40604F7	v_pk_add_f16 v0, -4.0, v2 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D38F5400 520208F7	v_pk_add_f16 v0, -4.0, v4 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38FC900 8C11EA80	v_pk_add_f16 v0, 0, -2.0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0] clamp
+D38F0A00 FC09EE80	v_pk_add_f16 v0, 0, -4.0 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0]
+D38F1D00 D8150080	v_pk_add_f16 v0, 0, 0 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D38F2C00 83D5E480	v_pk_add_f16 v0, 0, 1.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D38F6800 A3DDE480	v_pk_add_f16 v0, 0, 1.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D38F0000 520D0680	v_pk_add_f16 v0, 0, 3 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D38F6700 DA0C0A80	v_pk_add_f16 v0, 0, s5 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1]
+D38F9A00 4C100A80	v_pk_add_f16 v0, 0, s5 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0] clamp
+D38FFF00 8C040A80	v_pk_add_f16 v0, 0, s5 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1] clamp
+D38F8000 60140C80	v_pk_add_f16 v0, 0, s6 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 0, 0] clamp
+D38F2600 A0180C80	v_pk_add_f16 v0, 0, s6 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1]
+D38F7400 F8140C80	v_pk_add_f16 v0, 0, s6 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D38F5A00 2C0C0C80	v_pk_add_f16 v0, 0, s6 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D38F7500 2C0E0280	v_pk_add_f16 v0, 0, v1 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D38F6E00 5BCA0280	v_pk_add_f16 v0, 0, v1 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1]
+D38F8F00 78160480	v_pk_add_f16 v0, 0, v2 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1] clamp
+D38FC300 34060880	v_pk_add_f16 v0, 0, v4 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0] clamp
+D38F2000 6405EEF0	v_pk_add_f16 v0, 0.5, -4.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 0, 0]
+D38FDB00 1C11EEF0	v_pk_add_f16 v0, 0.5, -4.0 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0] clamp
+D38F7C00 9C05EEF0	v_pk_add_f16 v0, 0.5, -4.0 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D38F7A00 7C09EEF0	v_pk_add_f16 v0, 0.5, -4.0 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D38FF300 2C0D00F0	v_pk_add_f16 v0, 0.5, 0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0] clamp
+D38F6C00 4BC900F0	v_pk_add_f16 v0, 0.5, 0 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38F8000 43D5E0F0	v_pk_add_f16 v0, 0.5, 0.5 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0] clamp
+D38F2D00 6019E4F0	v_pk_add_f16 v0, 0.5, 1.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D38F3800 4C09E4F0	v_pk_add_f16 v0, 0.5, 1.0 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D38FA700 B3DD06F0	v_pk_add_f16 v0, 0.5, 3 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1] clamp
+D38F5400 D3D506F0	v_pk_add_f16 v0, 0.5, 3 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1]
+D38F4800 301506F0	v_pk_add_f16 v0, 0.5, 3 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D38F1B00 4C1106F0	v_pk_add_f16 v0, 0.5, 3 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0]
+D38F1400 4BDC0AF0	v_pk_add_f16 v0, 0.5, s5 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38FF200 04080CF0	v_pk_add_f16 v0, 0.5, s6 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0] clamp
+D38F3000 4A000CF0	v_pk_add_f16 v0, 0.5, s6 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D38F3300 E3D602F0	v_pk_add_f16 v0, 0.5, v1 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D38FFA00 801602F0	v_pk_add_f16 v0, 0.5, v1 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0] clamp
+D38FB100 93C204F0	v_pk_add_f16 v0, 0.5, v2 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0] clamp
+D38F4000 180206F0	v_pk_add_f16 v0, 0.5, v3
+D38FC000 180206F0	v_pk_add_f16 v0, 0.5, v3 clamp
+D38F4300 380206F0	v_pk_add_f16 v0, 0.5, v3 neg_lo:[1,0] neg_hi:[1,1]
+D38F8700 F40A06F0	v_pk_add_f16 v0, 0.5, v3 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1] clamp
+D38F9100 D81606F0	v_pk_add_f16 v0, 0.5, v3 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0] clamp
+D38F4C00 F41206F0	v_pk_add_f16 v0, 0.5, v3 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D38F1C00 4C0606F0	v_pk_add_f16 v0, 0.5, v3 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38F4A00 600206F0	v_pk_add_f16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[0,0] neg_lo:[1,1] neg_hi:[0,1]
+D38F4A00 500206F0	v_pk_add_f16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[0,1] neg_hi:[0,1]
+D38F4B00 080206F0	v_pk_add_f16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[1,0] neg_hi:[1,1]
+D38FD800 080206F0	v_pk_add_f16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[1,0] clamp
+D38F5900 680206F0	v_pk_add_f16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[1,0] neg_lo:[1,1] neg_hi:[1,0]
+D38F4300 080206F0	v_pk_add_f16 v0, 0.5, v3 op_sel_hi:[1,0] neg_hi:[1,1]
+D38FFD00 720E08F0	v_pk_add_f16 v0, 0.5, v4 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1] clamp
+D38F7600 13DDEAF2	v_pk_add_f16 v0, 1.0, -2.0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D38FF100 6C05EAF2	v_pk_add_f16 v0, 1.0, -2.0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0] clamp
+D38FA700 C411EEF2	v_pk_add_f16 v0, 1.0, -4.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1] clamp
+D38F6500 C20DEEF2	v_pk_add_f16 v0, 1.0, -4.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D38F6600 4BC900F2	v_pk_add_f16 v0, 1.0, 0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1]
+D38FA600 3C0DE0F2	v_pk_add_f16 v0, 1.0, 0.5 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 1] clamp
+D38F3300 CBD5E0F2	v_pk_add_f16 v0, 1.0, 0.5 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D38F2A00 4BD5E0F2	v_pk_add_f16 v0, 1.0, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D38F8000 6A01E4F2	v_pk_add_f16 v0, 1.0, 1.0 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 0, 0] clamp
+D38F6700 A405E4F2	v_pk_add_f16 v0, 1.0, 1.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1]
+D38F3E00 6019E4F2	v_pk_add_f16 v0, 1.0, 1.0 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D38F3A00 EBDDE4F2	v_pk_add_f16 v0, 1.0, 1.0 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0]
+D38F5500 1A0D06F2	v_pk_add_f16 v0, 1.0, 3 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D38FFF00 A01506F2	v_pk_add_f16 v0, 1.0, 3 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1] clamp
+D38FB900 1BDD06F2	v_pk_add_f16 v0, 1.0, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0] clamp
+D38F1700 04040AF2	v_pk_add_f16 v0, 1.0, s5 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D38F3300 20140AF2	v_pk_add_f16 v0, 1.0, s5 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0]
+D38F7500 70180AF2	v_pk_add_f16 v0, 1.0, s5 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D38FAA00 6C080AF2	v_pk_add_f16 v0, 1.0, s5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0] clamp
+D38F1300 7BC80CF2	v_pk_add_f16 v0, 1.0, s6 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0]
+D38FD200 9A000CF2	v_pk_add_f16 v0, 1.0, s6 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0] clamp
+D38F1C00 28180CF2	v_pk_add_f16 v0, 1.0, s6 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D38F3A00 64080CF2	v_pk_add_f16 v0, 1.0, s6 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D38FA700 5BCA06F2	v_pk_add_f16 v0, 1.0, v3 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1] clamp
+D38F6200 981A08F2	v_pk_add_f16 v0, 1.0, v4 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0]
+D38F4A00 681A08F2	v_pk_add_f16 v0, 1.0, v4 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D38F1400 43D5EA83	v_pk_add_f16 v0, 3, -2.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38F2900 5409EE83	v_pk_add_f16 v0, 3, -4.0 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D38FC000 98190083	v_pk_add_f16 v0, 3, 0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0] clamp
+D38F2A00 24110083	v_pk_add_f16 v0, 3, 0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D38F4000 F20DE083	v_pk_add_f16 v0, 3, 0.5 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D38F8500 B819E083	v_pk_add_f16 v0, 3, 0.5 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1] clamp
+D38F5500 B405E483	v_pk_add_f16 v0, 3, 1.0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D38FA300 CBC10683	v_pk_add_f16 v0, 3, 3 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0] clamp
+D38FD500 73DC0A83	v_pk_add_f16 v0, 3, s5 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1] clamp
+D38F4100 3C060483	v_pk_add_f16 v0, 3, v2 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0]
+D38F9400 44060483	v_pk_add_f16 v0, 3, v2 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1] clamp
+D38F3500 D3DE0483	v_pk_add_f16 v0, 3, v2 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D38FCE00 6C120483	v_pk_add_f16 v0, 3, v2 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D38F4900 3BD60483	v_pk_add_f16 v0, 3, v2 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0]
+D38F3000 901A0683	v_pk_add_f16 v0, 3, v3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0]
+D38F7000 940E0683	v_pk_add_f16 v0, 3, v3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0]
+D38F5800 0BD60683	v_pk_add_f16 v0, 3, v3 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D38F0300 32020883	v_pk_add_f16 v0, 3, v4 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0]
+D38F2200 640E0883	v_pk_add_f16 v0, 3, v4 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D38F2000 C81A0883	v_pk_add_f16 v0, 3, v4 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D38F5300 9BDE0883	v_pk_add_f16 v0, 3, v4 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D38FEB00 081A0883	v_pk_add_f16 v0, 3, v4 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0] clamp
+D38F7C00 3C120883	v_pk_add_f16 v0, 3, v4 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D38F7500 3201EA05	v_pk_add_f16 v0, s5, -2.0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D38FA800 3BC1EA05	v_pk_add_f16 v0, s5, -2.0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0] clamp
+D38F6100 DBC1EE05	v_pk_add_f16 v0, s5, -4.0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D38F5000 6815EE05	v_pk_add_f16 v0, s5, -4.0 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 0]
+D38F1900 03D5EE05	v_pk_add_f16 v0, s5, -4.0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0]
+D38F1A00 C819EE05	v_pk_add_f16 v0, s5, -4.0 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D38F2300 1C050005	v_pk_add_f16 v0, s5, 0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D38F7100 44110005	v_pk_add_f16 v0, s5, 0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D38F5F00 C4090005	v_pk_add_f16 v0, s5, 0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1]
+D38F4600 6A0DE005	v_pk_add_f16 v0, s5, 0.5 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D38F0900 5015E005	v_pk_add_f16 v0, s5, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D38F7C00 3201E005	v_pk_add_f16 v0, s5, 0.5 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D38FBE00 7C0DE405	v_pk_add_f16 v0, s5, 1.0 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D38F6500 6BD50605	v_pk_add_f16 v0, s5, 3 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D38F3600 13DD0605	v_pk_add_f16 v0, s5, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D38F2A00 CBD40A05	v_pk_add_f16 v0, s5, s5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D38F2D00 62000C05	v_pk_add_f16 v0, s5, s6 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D38FE700 9C0E0205	v_pk_add_f16 v0, s5, v1 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1] clamp
+D38F3300 340A0205	v_pk_add_f16 v0, s5, v1 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0]
+D38F6800 A40A0205	v_pk_add_f16 v0, s5, v1 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D38F6B00 2BD60205	v_pk_add_f16 v0, s5, v1 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0]
+D38F9E00 54120205	v_pk_add_f16 v0, s5, v1 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1] clamp
+D38F6200 2A0E0405	v_pk_add_f16 v0, s5, v2 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D38F0D00 D3CA0405	v_pk_add_f16 v0, s5, v2 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D38F2A00 3C0E0405	v_pk_add_f16 v0, s5, v2 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D38F9C00 5C120405	v_pk_add_f16 v0, s5, v2 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1] clamp
+D38F3100 CC060805	v_pk_add_f16 v0, s5, v4 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D38F2500 23C1EA06	v_pk_add_f16 v0, s6, -2.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D38F6400 50190006	v_pk_add_f16 v0, s6, 0 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38F3300 70150006	v_pk_add_f16 v0, s6, 0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0]
+D38FB400 CC050006	v_pk_add_f16 v0, s6, 0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1] clamp
+D38F0000 B815E006	v_pk_add_f16 v0, s6, 0.5 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D38F5800 9C0D0606	v_pk_add_f16 v0, s6, 3 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0]
+D38F1500 BA0C0C06	v_pk_add_f16 v0, s6, s6 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D38F4000 FA0E0206	v_pk_add_f16 v0, s6, v1 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D38FD500 440E0206	v_pk_add_f16 v0, s6, v1 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1] clamp
+D38F4000 18020406	v_pk_add_f16 v0, s6, v2
+D38FC000 18020406	v_pk_add_f16 v0, s6, v2 clamp
+D38F4400 02020406	v_pk_add_f16 v0, s6, v2 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D38F9600 6C060406	v_pk_add_f16 v0, s6, v2 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D38FD000 ABD60406	v_pk_add_f16 v0, s6, v2 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0] clamp
+D38F5200 50020406	v_pk_add_f16 v0, s6, v2 op_sel:[0,1] op_sel_hi:[0,1] neg_lo:[0,1] neg_hi:[0,1]
+D38FC900 C3C20406	v_pk_add_f16 v0, s6, v2 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0] clamp
+D38F6900 001A0406	v_pk_add_f16 v0, s6, v2 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0]
+D38F5E00 04120406	v_pk_add_f16 v0, s6, v2 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D38F4A00 78020406	v_pk_add_f16 v0, s6, v2 op_sel:[1,0] neg_lo:[1,1] neg_hi:[0,1]
+D38F4900 50020406	v_pk_add_f16 v0, s6, v2 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[0,1] neg_hi:[1,0]
+D38F5A00 38020406	v_pk_add_f16 v0, s6, v2 op_sel:[1,1] neg_lo:[1,0] neg_hi:[0,1]
+D38F5800 00020406	v_pk_add_f16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,0]
+D38F5A00 20020406	v_pk_add_f16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,0] neg_lo:[1,0] neg_hi:[0,1]
+D38F5A00 10020406	v_pk_add_f16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,1] neg_hi:[0,1]
+D38F4000 08020406	v_pk_add_f16 v0, s6, v2 op_sel_hi:[1,0]
+D38F2600 FC0A0606	v_pk_add_f16 v0, s6, v3 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D38F5400 34060606	v_pk_add_f16 v0, s6, v3 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D38F6A00 6A0E0606	v_pk_add_f16 v0, s6, v3 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D38F6E00 901A0806	v_pk_add_f16 v0, s6, v4 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D38F2100 DBC9EF01	v_pk_add_f16 v0, v1, -4.0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D38FA200 7A0DEF01	v_pk_add_f16 v0, v1, -4.0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0] clamp
+D38FD400 73C1EF01	v_pk_add_f16 v0, v1, -4.0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1] clamp
+D38F0B00 B4050101	v_pk_add_f16 v0, v1, 0 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D38F0D00 9BDDE101	v_pk_add_f16 v0, v1, 0.5 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D38F4000 1801E501	v_pk_add_f16 v0, v1, 1.0
+D38FC000 1801E501	v_pk_add_f16 v0, v1, 1.0 clamp
+D38F7600 E3D5E501	v_pk_add_f16 v0, v1, 1.0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D38F7500 BA01E501	v_pk_add_f16 v0, v1, 1.0 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D38FD300 0001E501	v_pk_add_f16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[0,0] neg_hi:[1,1] clamp
+D38F5300 5001E501	v_pk_add_f16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[0,1] neg_lo:[0,1] neg_hi:[1,1]
+D38F5200 2801E501	v_pk_add_f16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[1,0] neg_lo:[1,0] neg_hi:[0,1]
+D38F4B00 2001E501	v_pk_add_f16 v0, v1, 1.0 op_sel:[1,0] op_sel_hi:[0,0] neg_lo:[1,0] neg_hi:[1,1]
+D38F4900 2801E501	v_pk_add_f16 v0, v1, 1.0 op_sel:[1,0] op_sel_hi:[1,0] neg_lo:[1,0] neg_hi:[1,0]
+D38F5A00 1801E501	v_pk_add_f16 v0, v1, 1.0 op_sel:[1,1] neg_hi:[0,1]
+D38FDB00 4001E501	v_pk_add_f16 v0, v1, 1.0 op_sel:[1,1] op_sel_hi:[0,0] neg_lo:[0,1] neg_hi:[1,1] clamp
+D38F4100 0001E501	v_pk_add_f16 v0, v1, 1.0 op_sel_hi:[0,0] neg_hi:[1,0]
+D38F0E00 EC110701	v_pk_add_f16 v0, v1, 3 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D38F4000 18010F01	v_pk_add_f16 v0, v1, 7
+D38FC000 18010F01	v_pk_add_f16 v0, v1, 7 clamp
+D38F5300 20010F01	v_pk_add_f16 v0, v1, 7 op_sel:[0,1] op_sel_hi:[0,0] neg_lo:[1,0] neg_hi:[1,1]
+D38F5000 30010F01	v_pk_add_f16 v0, v1, 7 op_sel:[0,1] op_sel_hi:[0,1] neg_lo:[1,0]
+D38F4B00 78010F01	v_pk_add_f16 v0, v1, 7 op_sel:[1,0] neg_lo:[1,1] neg_hi:[1,1]
+D38F4900 00010F01	v_pk_add_f16 v0, v1, 7 op_sel:[1,0] op_sel_hi:[0,0] neg_hi:[1,0]
+D38FDA00 48010F01	v_pk_add_f16 v0, v1, 7 op_sel:[1,1] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1] clamp
+D38F4100 60010F01	v_pk_add_f16 v0, v1, 7 op_sel_hi:[0,0] neg_lo:[1,1] neg_hi:[1,0]
+D38F4300 30010F01	v_pk_add_f16 v0, v1, 7 op_sel_hi:[0,1] neg_lo:[1,0] neg_hi:[1,1]
+D38F4000 18000B01	v_pk_add_f16 v0, v1, s5
+D38FC000 18000B01	v_pk_add_f16 v0, v1, s5 clamp
+D38F2400 B20C0B01	v_pk_add_f16 v0, v1, s5 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D38F5200 20000B01	v_pk_add_f16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[0,0] neg_lo:[1,0] neg_hi:[0,1]
+D38F5200 48000B01	v_pk_add_f16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+D38F3E00 0C100B01	v_pk_add_f16 v0, v1, s5 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D38F4900 78000B01	v_pk_add_f16 v0, v1, s5 op_sel:[1,0] neg_lo:[1,1] neg_hi:[1,0]
+D38F4800 60000B01	v_pk_add_f16 v0, v1, s5 op_sel:[1,0] op_sel_hi:[0,0] neg_lo:[1,1]
+D38F5B00 38000B01	v_pk_add_f16 v0, v1, s5 op_sel:[1,1] neg_lo:[1,0] neg_hi:[1,1]
+D38F5A00 28000B01	v_pk_add_f16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[1,0] neg_lo:[1,0] neg_hi:[0,1]
+D38F4300 00000B01	v_pk_add_f16 v0, v1, s5 op_sel_hi:[0,0] neg_hi:[1,1]
+D38F4300 40000B01	v_pk_add_f16 v0, v1, s5 op_sel_hi:[0,0] neg_lo:[0,1] neg_hi:[1,1]
+D38F4900 B40C0D01	v_pk_add_f16 v0, v1, s6 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0]
+D38F2400 E20E0301	v_pk_add_f16 v0, v1, v1 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D38F1100 720E0301	v_pk_add_f16 v0, v1, v1 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0]
+D38F3B00 601A0301	v_pk_add_f16 v0, v1, v1 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0]
+D38F3800 140E0301	v_pk_add_f16 v0, v1, v1 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D38F4000 18020501	v_pk_add_f16 v0, v1, v2
+D38FC000 18020501	v_pk_add_f16 v0, v1, v2 clamp
+D38F4200 58020501	v_pk_add_f16 v0, v1, v2 neg_lo:[0,1] neg_hi:[0,1]
+D38F4300 58020501	v_pk_add_f16 v0, v1, v2 neg_lo:[0,1] neg_hi:[1,1]
+D38F0500 42020501	v_pk_add_f16 v0, v1, v2 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D38FD200 10020501	v_pk_add_f16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[0,1] neg_hi:[0,1] clamp
+D38F5100 08020501	v_pk_add_f16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[1,0] neg_hi:[1,0]
+D38F5000 68020501	v_pk_add_f16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[1,0] neg_lo:[1,1]
+D38F4A00 48020501	v_pk_add_f16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+D38F5A00 58020501	v_pk_add_f16 v0, v1, v2 op_sel:[1,1] neg_lo:[0,1] neg_hi:[0,1]
+D38F5800 60020501	v_pk_add_f16 v0, v1, v2 op_sel:[1,1] op_sel_hi:[0,0] neg_lo:[1,1]
+D38F6500 7A020701	v_pk_add_f16 v0, v1, v3 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D38F5200 6BCA0701	v_pk_add_f16 v0, v1, v3 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D38F3E00 E3C20701	v_pk_add_f16 v0, v1, v3 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D38F0F00 320E0901	v_pk_add_f16 v0, v1, v4 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1]
+D38F7F00 53CA0901	v_pk_add_f16 v0, v1, v4 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1]
+D38F0C00 2BC1EB02	v_pk_add_f16 v0, v2, -2.0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D38F5500 3C11EF02	v_pk_add_f16 v0, v2, -4.0 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D38F6800 3019EF02	v_pk_add_f16 v0, v2, -4.0 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D38F2600 1C0D0102	v_pk_add_f16 v0, v2, 0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D38F0800 B2010102	v_pk_add_f16 v0, v2, 0 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D38F4E00 BBDDE502	v_pk_add_f16 v0, v2, 1.0 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1]
+D38F0300 83C10702	v_pk_add_f16 v0, v2, 3 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D38FA200 6C0D0702	v_pk_add_f16 v0, v2, 3 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0] clamp
+D38F8B00 9C0D0702	v_pk_add_f16 v0, v2, 3 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0] clamp
+D38F1F00 33C10702	v_pk_add_f16 v0, v2, 3 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1]
+D38F3D00 04050702	v_pk_add_f16 v0, v2, 3 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D38F0400 9BC80B02	v_pk_add_f16 v0, v2, s5 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D38FB500 8BC00B02	v_pk_add_f16 v0, v2, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1] clamp
+D38F7000 DBC00B02	v_pk_add_f16 v0, v2, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D38FFA00 03D40D02	v_pk_add_f16 v0, v2, s6 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0] clamp
+D38F5500 A40A0302	v_pk_add_f16 v0, v2, v1 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D38FF300 9BD60302	v_pk_add_f16 v0, v2, v1 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0] clamp
+D38FED00 73CA0302	v_pk_add_f16 v0, v2, v1 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1] clamp
+D38F9600 640E0502	v_pk_add_f16 v0, v2, v2 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D38F5400 E0160502	v_pk_add_f16 v0, v2, v2 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D38F3300 C3D60502	v_pk_add_f16 v0, v2, v2 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D38F6C00 CC0E0502	v_pk_add_f16 v0, v2, v2 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1]
+D38FFD00 C01A0502	v_pk_add_f16 v0, v2, v2 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1] clamp
+D38F0A00 A20DEB03	v_pk_add_f16 v0, v3, -2.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0]
+D38F5C00 5015EB03	v_pk_add_f16 v0, v3, -2.0 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38F4C00 AC0DEF03	v_pk_add_f16 v0, v3, -4.0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D38F2B00 0BC9EF03	v_pk_add_f16 v0, v3, -4.0 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D38F6100 8019E103	v_pk_add_f16 v0, v3, 0.5 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0]
+D38F8B00 7C05E503	v_pk_add_f16 v0, v3, 1.0 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0] clamp
+D38FF200 A3DD0703	v_pk_add_f16 v0, v3, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0] clamp
+D38F3A00 0BDD0703	v_pk_add_f16 v0, v3, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0]
+D38FE600 BA000B03	v_pk_add_f16 v0, v3, s5 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1] clamp
+D38FB200 43C00B03	v_pk_add_f16 v0, v3, s5 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0] clamp
+D38F5800 73C00B03	v_pk_add_f16 v0, v3, s5 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 0]
+D38F1000 0C040D03	v_pk_add_f16 v0, v3, s6 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D38F4C00 E8140D03	v_pk_add_f16 v0, v3, s6 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D38F0D00 E40E0303	v_pk_add_f16 v0, v3, v1 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D38F8100 C20E0503	v_pk_add_f16 v0, v3, v2 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0] clamp
+D38FD100 93D60703	v_pk_add_f16 v0, v3, v3 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0] clamp
+D38FEC00 7C060903	v_pk_add_f16 v0, v3, v4 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1] clamp
+D38F9C00 83DE0903	v_pk_add_f16 v0, v3, v4 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1] clamp
+D38FEC00 0A01EB04	v_pk_add_f16 v0, v4, -2.0 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1] clamp
+D38F6800 3BDDEF04	v_pk_add_f16 v0, v4, -4.0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D38F0300 64110104	v_pk_add_f16 v0, v4, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0]
+D38F3000 C0190104	v_pk_add_f16 v0, v4, 0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D38FB200 0C0D0104	v_pk_add_f16 v0, v4, 0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0] clamp
+D38F0D00 1019E104	v_pk_add_f16 v0, v4, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D38FDD00 3015E104	v_pk_add_f16 v0, v4, 0.5 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D38FB200 DC11E504	v_pk_add_f16 v0, v4, 1.0 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0] clamp
+D38FDC00 03C9E504	v_pk_add_f16 v0, v4, 1.0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1] clamp
+D38F3B00 03DDE504	v_pk_add_f16 v0, v4, 1.0 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D38FEA00 64110704	v_pk_add_f16 v0, v4, 3 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0] clamp
+D38FC200 28140B04	v_pk_add_f16 v0, v4, s5 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0] clamp
+D38F5100 FC100B04	v_pk_add_f16 v0, v4, s5 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0]
+D38F3300 CC040B04	v_pk_add_f16 v0, v4, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D38F8B00 64100B04	v_pk_add_f16 v0, v4, s5 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0] clamp
+D38F8A00 6BC00B04	v_pk_add_f16 v0, v4, s5 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0] clamp
+D38F1400 620C0D04	v_pk_add_f16 v0, v4, s6 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1]
+D38F2700 881A0304	v_pk_add_f16 v0, v4, v1 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1]
+D38F8A00 DC120304	v_pk_add_f16 v0, v4, v1 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0] clamp
+D38F2F00 E3D60304	v_pk_add_f16 v0, v4, v1 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38F6B00 9C060304	v_pk_add_f16 v0, v4, v1 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D38F9B00 201A0304	v_pk_add_f16 v0, v4, v1 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0] clamp
+D38F2B00 740E0504	v_pk_add_f16 v0, v4, v2 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0]
+D38F9900 E4060504	v_pk_add_f16 v0, v4, v2 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0] clamp
+D38FA100 E4060704	v_pk_add_f16 v0, v4, v3 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0] clamp
+D38F2F00 CBDE0704	v_pk_add_f16 v0, v4, v3 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1]
+D38F4000 18020904	v_pk_add_f16 v0, v4, v4
+D38FC000 18020904	v_pk_add_f16 v0, v4, v4 clamp
+D38F4000 58020904	v_pk_add_f16 v0, v4, v4 neg_lo:[0,1]
+D38F4100 78020904	v_pk_add_f16 v0, v4, v4 neg_lo:[1,1] neg_hi:[1,0]
+D38F9300 620E0904	v_pk_add_f16 v0, v4, v4 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0] clamp
+D38F5000 60020904	v_pk_add_f16 v0, v4, v4 op_sel:[0,1] op_sel_hi:[0,0] neg_lo:[1,1]
+D38F5300 68020904	v_pk_add_f16 v0, v4, v4 op_sel:[0,1] op_sel_hi:[1,0] neg_lo:[1,1] neg_hi:[1,1]
+D38F6E00 DA020904	v_pk_add_f16 v0, v4, v4 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D38F5900 78020904	v_pk_add_f16 v0, v4, v4 op_sel:[1,1] neg_lo:[1,1] neg_hi:[1,0]
+D38FD800 28020904	v_pk_add_f16 v0, v4, v4 op_sel:[1,1] op_sel_hi:[1,0] neg_lo:[1,0] clamp
+D38F4300 20020904	v_pk_add_f16 v0, v4, v4 op_sel_hi:[0,0] neg_lo:[1,0] neg_hi:[1,1]
+D3824000 180204F5	v_pk_add_i16 v0, -2.0, v2
+D382C000 180204F5	v_pk_add_i16 v0, -2.0, v2 clamp
+D3825000 100204F5	v_pk_add_i16 v0, -2.0, v2 op_sel:[0,1] op_sel_hi:[0,1]
+D3825000 080204F5	v_pk_add_i16 v0, -2.0, v2 op_sel:[0,1] op_sel_hi:[1,0]
+D3824800 000204F5	v_pk_add_i16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,0]
+D3824000 180206F0	v_pk_add_i16 v0, 0.5, v3
+D382C000 180206F0	v_pk_add_i16 v0, 0.5, v3 clamp
+D3825000 180206F0	v_pk_add_i16 v0, 0.5, v3 op_sel:[0,1]
+D3824800 080206F0	v_pk_add_i16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[1,0]
+D3824000 080206F0	v_pk_add_i16 v0, 0.5, v3 op_sel_hi:[1,0]
+D3824000 18020406	v_pk_add_i16 v0, s6, v2
+D382C000 18020406	v_pk_add_i16 v0, s6, v2 clamp
+D3825800 08020406	v_pk_add_i16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[1,0]
+D3824000 10020406	v_pk_add_i16 v0, s6, v2 op_sel_hi:[0,1]
+D3824000 1801E501	v_pk_add_i16 v0, v1, 1.0
+D382C000 1801E501	v_pk_add_i16 v0, v1, 1.0 clamp
+D3825000 0001E501	v_pk_add_i16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[0,0]
+D3824000 0801E501	v_pk_add_i16 v0, v1, 1.0 op_sel_hi:[1,0]
+D3824000 18010F01	v_pk_add_i16 v0, v1, 7
+D382C000 18010F01	v_pk_add_i16 v0, v1, 7 clamp
+D382D000 10010F01	v_pk_add_i16 v0, v1, 7 op_sel:[0,1] op_sel_hi:[0,1] clamp
+D382D800 18010F01	v_pk_add_i16 v0, v1, 7 op_sel:[1,1] clamp
+D3824000 10010F01	v_pk_add_i16 v0, v1, 7 op_sel_hi:[0,1]
+D3824000 18000B01	v_pk_add_i16 v0, v1, s5
+D382C000 18000B01	v_pk_add_i16 v0, v1, s5 clamp
+D3825800 18000B01	v_pk_add_i16 v0, v1, s5 op_sel:[1,1]
+D382D800 10000B01	v_pk_add_i16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[0,1] clamp
+D3824000 08000B01	v_pk_add_i16 v0, v1, s5 op_sel_hi:[1,0]
+D3824000 18020501	v_pk_add_i16 v0, v1, v2
+D382C000 18020501	v_pk_add_i16 v0, v1, v2 clamp
+D3825000 10020501	v_pk_add_i16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[0,1]
+D382C000 00020501	v_pk_add_i16 v0, v1, v2 op_sel_hi:[0,0] clamp
+D3824000 18020904	v_pk_add_i16 v0, v4, v4
+D382C000 18020904	v_pk_add_i16 v0, v4, v4 clamp
+D382C800 08020904	v_pk_add_i16 v0, v4, v4 op_sel:[1,0] op_sel_hi:[1,0] clamp
+D382D800 10020904	v_pk_add_i16 v0, v4, v4 op_sel:[1,1] op_sel_hi:[0,1] clamp
+D382D800 08020904	v_pk_add_i16 v0, v4, v4 op_sel:[1,1] op_sel_hi:[1,0] clamp
+D38A4000 180204F5	v_pk_add_u16 v0, -2.0, v2
+D38AC000 180204F5	v_pk_add_u16 v0, -2.0, v2 clamp
+D38A5000 180204F5	v_pk_add_u16 v0, -2.0, v2 op_sel:[0,1]
+D38A4800 000204F5	v_pk_add_u16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,0]
+D38A5800 080204F5	v_pk_add_u16 v0, -2.0, v2 op_sel:[1,1] op_sel_hi:[1,0]
+D38A4000 180206F0	v_pk_add_u16 v0, 0.5, v3
+D38AC000 180206F0	v_pk_add_u16 v0, 0.5, v3 clamp
+D38A4800 100206F0	v_pk_add_u16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[0,1]
+D38AC800 080206F0	v_pk_add_u16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[1,0] clamp
+D38A5800 100206F0	v_pk_add_u16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[0,1]
+D38A4000 18020406	v_pk_add_u16 v0, s6, v2
+D38AC000 18020406	v_pk_add_u16 v0, s6, v2 clamp
+D38A4800 18020406	v_pk_add_u16 v0, s6, v2 op_sel:[1,0]
+D38A5800 00020406	v_pk_add_u16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,0]
+D38A5800 10020406	v_pk_add_u16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,1]
+D38A4000 1801E501	v_pk_add_u16 v0, v1, 1.0
+D38AC000 1801E501	v_pk_add_u16 v0, v1, 1.0 clamp
+D38AD000 0001E501	v_pk_add_u16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[0,0] clamp
+D38A5800 1001E501	v_pk_add_u16 v0, v1, 1.0 op_sel:[1,1] op_sel_hi:[0,1]
+D38A4000 18010F01	v_pk_add_u16 v0, v1, 7
+D38AC000 18010F01	v_pk_add_u16 v0, v1, 7 clamp
+D38AC800 18010F01	v_pk_add_u16 v0, v1, 7 op_sel:[1,0] clamp
+D38A5800 00010F01	v_pk_add_u16 v0, v1, 7 op_sel:[1,1] op_sel_hi:[0,0]
+D38A4000 00010F01	v_pk_add_u16 v0, v1, 7 op_sel_hi:[0,0]
+D38A4000 18000B01	v_pk_add_u16 v0, v1, s5
+D38AC000 18000B01	v_pk_add_u16 v0, v1, s5 clamp
+D38A5000 10000B01	v_pk_add_u16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[0,1]
+D38A4800 10000B01	v_pk_add_u16 v0, v1, s5 op_sel:[1,0] op_sel_hi:[0,1]
+D38A5800 08000B01	v_pk_add_u16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[1,0]
+D38A4000 18020501	v_pk_add_u16 v0, v1, v2
+D38AC000 18020501	v_pk_add_u16 v0, v1, v2 clamp
+D38A4800 08020501	v_pk_add_u16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[1,0]
+D38A5800 18020501	v_pk_add_u16 v0, v1, v2 op_sel:[1,1]
+D38A4000 08020501	v_pk_add_u16 v0, v1, v2 op_sel_hi:[1,0]
+D38A4000 18020904	v_pk_add_u16 v0, v4, v4
+D38AC000 18020904	v_pk_add_u16 v0, v4, v4 clamp
+D38A4800 10020904	v_pk_add_u16 v0, v4, v4 op_sel:[1,0] op_sel_hi:[0,1]
+D38A5800 00020904	v_pk_add_u16 v0, v4, v4 op_sel:[1,1] op_sel_hi:[0,0]
+D38AC000 00020904	v_pk_add_u16 v0, v4, v4 op_sel_hi:[0,0] clamp
+D3864000 180204F5	v_pk_ashrrev_i16 v0, -2.0, v2
+D386C000 180204F5	v_pk_ashrrev_i16 v0, -2.0, v2 clamp
+D3865800 180204F5	v_pk_ashrrev_i16 v0, -2.0, v2 op_sel:[1,1]
+D386D800 000204F5	v_pk_ashrrev_i16 v0, -2.0, v2 op_sel:[1,1] op_sel_hi:[0,0] clamp
+D3864000 100204F5	v_pk_ashrrev_i16 v0, -2.0, v2 op_sel_hi:[0,1]
+D3864000 180206F0	v_pk_ashrrev_i16 v0, 0.5, v3
+D386C000 180206F0	v_pk_ashrrev_i16 v0, 0.5, v3 clamp
+D3865000 000206F0	v_pk_ashrrev_i16 v0, 0.5, v3 op_sel:[0,1] op_sel_hi:[0,0]
+D386D000 000206F0	v_pk_ashrrev_i16 v0, 0.5, v3 op_sel:[0,1] op_sel_hi:[0,0] clamp
+D3865800 000206F0	v_pk_ashrrev_i16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D3864000 18020406	v_pk_ashrrev_i16 v0, s6, v2
+D386C000 18020406	v_pk_ashrrev_i16 v0, s6, v2 clamp
+D3864800 10020406	v_pk_ashrrev_i16 v0, s6, v2 op_sel:[1,0] op_sel_hi:[0,1]
+D3865800 10020406	v_pk_ashrrev_i16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,1]
+D3864000 1801E501	v_pk_ashrrev_i16 v0, v1, 1.0
+D386C000 1801E501	v_pk_ashrrev_i16 v0, v1, 1.0 clamp
+D3865000 1801E501	v_pk_ashrrev_i16 v0, v1, 1.0 op_sel:[0,1]
+D3865800 0801E501	v_pk_ashrrev_i16 v0, v1, 1.0 op_sel:[1,1] op_sel_hi:[1,0]
+D3864000 18010F01	v_pk_ashrrev_i16 v0, v1, 7
+D386C000 18010F01	v_pk_ashrrev_i16 v0, v1, 7 clamp
+D3865000 00010F01	v_pk_ashrrev_i16 v0, v1, 7 op_sel:[0,1] op_sel_hi:[0,0]
+D3864800 08010F01	v_pk_ashrrev_i16 v0, v1, 7 op_sel:[1,0] op_sel_hi:[1,0]
+D3864000 08010F01	v_pk_ashrrev_i16 v0, v1, 7 op_sel_hi:[1,0]
+D3864000 18000B01	v_pk_ashrrev_i16 v0, v1, s5
+D386C000 18000B01	v_pk_ashrrev_i16 v0, v1, s5 clamp
+D3864800 10000B01	v_pk_ashrrev_i16 v0, v1, s5 op_sel:[1,0] op_sel_hi:[0,1]
+D3864800 08000B01	v_pk_ashrrev_i16 v0, v1, s5 op_sel:[1,0] op_sel_hi:[1,0]
+D386C000 08000B01	v_pk_ashrrev_i16 v0, v1, s5 op_sel_hi:[1,0] clamp
+D3864000 18020501	v_pk_ashrrev_i16 v0, v1, v2
+D386C000 18020501	v_pk_ashrrev_i16 v0, v1, v2 clamp
+D386D000 10020501	v_pk_ashrrev_i16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[0,1] clamp
+D3864800 00020501	v_pk_ashrrev_i16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,0]
+D3865800 08020501	v_pk_ashrrev_i16 v0, v1, v2 op_sel:[1,1] op_sel_hi:[1,0]
+D3864000 18020904	v_pk_ashrrev_i16 v0, v4, v4
+D386C000 18020904	v_pk_ashrrev_i16 v0, v4, v4 clamp
+D3864800 10020904	v_pk_ashrrev_i16 v0, v4, v4 op_sel:[1,0] op_sel_hi:[0,1]
+D386C800 08020904	v_pk_ashrrev_i16 v0, v4, v4 op_sel:[1,0] op_sel_hi:[1,0] clamp
+D386C000 10020904	v_pk_ashrrev_i16 v0, v4, v4 op_sel_hi:[0,1] clamp
+D38E5200 ABDDEAF5	v_pk_fma_f16 v0, -2.0, -2.0, -4.0 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0]
+D38E6900 1C05EEF5	v_pk_fma_f16 v0, -2.0, -4.0, v1 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0]
+D38E4B00 501900F5	v_pk_fma_f16 v0, -2.0, 0, s6 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0]
+D38EDE00 681900F5	v_pk_fma_f16 v0, -2.0, 0, s6 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D38E2D00 D405E0F5	v_pk_fma_f16 v0, -2.0, 0.5, v1 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D38EE100 3BC1E4F5	v_pk_fma_f16 v0, -2.0, 1.0, 0.5 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0] clamp
+D38E4D00 7015E4F5	v_pk_fma_f16 v0, -2.0, 1.0, s5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D38E1900 4C0DE4F5	v_pk_fma_f16 v0, -2.0, 1.0, v3 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D38E2F00 5411E4F5	v_pk_fma_f16 v0, -2.0, 1.0, v4 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1]
+D38E2900 53DD06F5	v_pk_fma_f16 v0, -2.0, 3, -4.0 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D38E5900 B20D06F5	v_pk_fma_f16 v0, -2.0, 3, 3 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0]
+D38E2E00 040D06F5	v_pk_fma_f16 v0, -2.0, 3, v3 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D38E4300 23DC0AF5	v_pk_fma_f16 v0, -2.0, s5, -4.0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0]
+D38E3500 F8140AF5	v_pk_fma_f16 v0, -2.0, s5, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D38E3A00 6C0C0CF5	v_pk_fma_f16 v0, -2.0, s6, v3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D38E0300 820202F5	v_pk_fma_f16 v0, -2.0, v1, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D38E5A00 AC0602F5	v_pk_fma_f16 v0, -2.0, v1, v1 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0]
+D38E6600 B3DE04F5	v_pk_fma_f16 v0, -2.0, v2, -4.0 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1]
+D38E1000 A3DE04F5	v_pk_fma_f16 v0, -2.0, v2, -4.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D38E7300 AA0E04F5	v_pk_fma_f16 v0, -2.0, v2, 3 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D38E4000 1C0E04F5	v_pk_fma_f16 v0, -2.0, v2, v3
+D38EC000 1C0E04F5	v_pk_fma_f16 v0, -2.0, v2, v3 clamp
+D38EC100 3C0E04F5	v_pk_fma_f16 v0, -2.0, v2, v3 neg_lo:[1,0,0] neg_hi:[1,0,0] clamp
+D38E0E00 EC0E04F5	v_pk_fma_f16 v0, -2.0, v2, v3 op_sel:[1,0,0] op_sel_hi:[1,0,0] neg_lo:[1,1,1] neg_hi:[0,1,1]
+D38E1C00 E40E04F5	v_pk_fma_f16 v0, -2.0, v2, v3 op_sel:[1,1,0] op_sel_hi:[0,0,0] neg_lo:[1,1,1] neg_hi:[0,0,1]
+D38E5F00 440E04F5	v_pk_fma_f16 v0, -2.0, v2, v3 op_sel:[1,1,0] op_sel_hi:[0,0,1] neg_lo:[0,1,0] neg_hi:[1,1,1]
+D38E0600 9C0E04F5	v_pk_fma_f16 v0, -2.0, v2, v3 op_sel_hi:[1,1,0] neg_lo:[0,0,1] neg_hi:[0,1,1]
+D38E2A00 7BDE06F5	v_pk_fma_f16 v0, -2.0, v3, -4.0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D38EB400 F81606F5	v_pk_fma_f16 v0, -2.0, v3, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1] clamp
+D38EEF00 B01608F5	v_pk_fma_f16 v0, -2.0, v4, s5 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1] clamp
+D38EBA00 03DDEAF7	v_pk_fma_f16 v0, -4.0, -2.0, -4.0 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0] clamp
+D38E7C00 4C09EAF7	v_pk_fma_f16 v0, -4.0, -2.0, v2 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38E4400 0A0DEEF7	v_pk_fma_f16 v0, -4.0, -4.0, 3 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D38E0600 1A0DEEF7	v_pk_fma_f16 v0, -4.0, -4.0, 3 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D38E5F00 FC0DEEF7	v_pk_fma_f16 v0, -4.0, -4.0, v3 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38EEB00 701900F7	v_pk_fma_f16 v0, -4.0, 0, s6 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0] clamp
+D38E8E00 A015E0F7	v_pk_fma_f16 v0, -4.0, 0.5, s5 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1] clamp
+D38E9600 3C0DE0F7	v_pk_fma_f16 v0, -4.0, 0.5, v3 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 1] clamp
+D38E8000 B405E4F7	v_pk_fma_f16 v0, -4.0, 1.0, v1 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0] clamp
+D38E3E00 281506F7	v_pk_fma_f16 v0, -4.0, 3, s5 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 1]
+D38E7700 32000AF7	v_pk_fma_f16 v0, -4.0, s5, 0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1]
+D38EE200 5BC00AF7	v_pk_fma_f16 v0, -4.0, s5, 0.5 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0] clamp
+D38E0F00 0C0C0AF7	v_pk_fma_f16 v0, -4.0, s5, v3 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D38E3000 03DC0CF7	v_pk_fma_f16 v0, -4.0, s6, -4.0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D38E9600 1BD602F7	v_pk_fma_f16 v0, -4.0, v1, -2.0 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1] clamp
+D38E8600 040A04F7	v_pk_fma_f16 v0, -4.0, v2, v2 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1] clamp
+D38EDB00 9C0E04F7	v_pk_fma_f16 v0, -4.0, v2, v3 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0] clamp
+D38E1F00 9BD606F7	v_pk_fma_f16 v0, -4.0, v3, -2.0 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1]
+D38E8E00 C3CA06F7	v_pk_fma_f16 v0, -4.0, v3, 1.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1] clamp
+D38E4600 D01A06F7	v_pk_fma_f16 v0, -4.0, v3, s6 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D38E6600 9C1206F7	v_pk_fma_f16 v0, -4.0, v3, v4 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D38EAA00 0BC208F7	v_pk_fma_f16 v0, -4.0, v4, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0] clamp
+D38E6000 0BC1EA80	v_pk_fma_f16 v0, 0, -2.0, 0.5 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D38E2B00 620DEA80	v_pk_fma_f16 v0, 0, -2.0, 3 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0]
+D38E7D00 D015EA80	v_pk_fma_f16 v0, 0, -2.0, s5 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D38E3B00 D3C10080	v_pk_fma_f16 v0, 0, 0, 0.5 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D38EDE00 8C09E080	v_pk_fma_f16 v0, 0, 0.5, v2 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1] clamp
+D38E5E00 7A0DE480	v_pk_fma_f16 v0, 0, 1.0, 3 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D38E9300 3BC00C80	v_pk_fma_f16 v0, 0, s6, 0.5 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0] clamp
+D38E1200 E20C0C80	v_pk_fma_f16 v0, 0, s6, 3 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0]
+D38E3600 1C040C80	v_pk_fma_f16 v0, 0, s6, v1 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D38E3400 7BC20280	v_pk_fma_f16 v0, 0, v1, 0.5 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1]
+D38E3800 2C0A0280	v_pk_fma_f16 v0, 0, v1, v2 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D38EFD00 140E0280	v_pk_fma_f16 v0, 0, v1, v3 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1] clamp
+D38E2000 AA020480	v_pk_fma_f16 v0, 0, v2, 0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D38E0C00 281A0480	v_pk_fma_f16 v0, 0, v2, s6 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D38ED000 640A0480	v_pk_fma_f16 v0, 0, v2, v2 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 0] clamp
+D38EDF00 440A0480	v_pk_fma_f16 v0, 0, v2, v2 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1] clamp
+D38E4000 1C0E0480	v_pk_fma_f16 v0, 0, v2, v3
+D38EC000 1C0E0480	v_pk_fma_f16 v0, 0, v2, v3 clamp
+D38EE100 E40E0480	v_pk_fma_f16 v0, 0, v2, v3 op_sel:[0,0,1] op_sel_hi:[0,0,1] neg_lo:[1,1,1] neg_hi:[1,0,0] clamp
+D38E0A00 0C0E0480	v_pk_fma_f16 v0, 0, v2, v3 op_sel:[1,0,0] op_sel_hi:[1,0,0] neg_hi:[0,1,0]
+D38E4900 CC0E0480	v_pk_fma_f16 v0, 0, v2, v3 op_sel:[1,0,0] op_sel_hi:[1,0,1] neg_lo:[0,1,1] neg_hi:[1,0,0]
+D38EDD00 1C0E0480	v_pk_fma_f16 v0, 0, v2, v3 op_sel:[1,1,0] neg_hi:[1,0,1] clamp
+D38E4700 AC0E0480	v_pk_fma_f16 v0, 0, v2, v3 op_sel_hi:[1,0,1] neg_lo:[1,0,1] neg_hi:[1,1,1]
+D38EA300 0A020680	v_pk_fma_f16 v0, 0, v3, 0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0] clamp
+D38E0700 120E0880	v_pk_fma_f16 v0, 0, v4, 3 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D38E7F00 04060880	v_pk_fma_f16 v0, 0, v4, v1 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D38E4B00 7BC9EAF0	v_pk_fma_f16 v0, 0.5, -2.0, 1.0 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0]
+D38E4D00 43DDEEF0	v_pk_fma_f16 v0, 0.5, -4.0, -4.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D38E3400 F20DEEF0	v_pk_fma_f16 v0, 0.5, -4.0, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D38E2000 FA0100F0	v_pk_fma_f16 v0, 0.5, 0, 0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D38E4E00 681900F0	v_pk_fma_f16 v0, 0.5, 0, s6 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D38E7400 740D00F0	v_pk_fma_f16 v0, 0.5, 0, v3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1]
+D38E6400 6C1100F0	v_pk_fma_f16 v0, 0.5, 0, v4 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1]
+D38E2F00 FA01E0F0	v_pk_fma_f16 v0, 0.5, 0.5, 0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38E0F00 43C9E0F0	v_pk_fma_f16 v0, 0.5, 0.5, 1.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1]
+D38E9000 4C0DE4F0	v_pk_fma_f16 v0, 0.5, 1.0, v3 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0] clamp
+D38E1A00 8C11E4F0	v_pk_fma_f16 v0, 0.5, 1.0, v4 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0]
+D38E4200 781506F0	v_pk_fma_f16 v0, 0.5, 3, s5 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D38E3000 8C1106F0	v_pk_fma_f16 v0, 0.5, 3, v4 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0]
+D38E0700 13DC0AF0	v_pk_fma_f16 v0, 0.5, s5, -4.0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D38EAE00 ABC00CF0	v_pk_fma_f16 v0, 0.5, s6, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1] clamp
+D38E9E00 43C00CF0	v_pk_fma_f16 v0, 0.5, s6, 0.5 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1] clamp
+D38E2900 9BC202F0	v_pk_fma_f16 v0, 0.5, v1, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0]
+D38E0A00 4A0E02F0	v_pk_fma_f16 v0, 0.5, v1, 3 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D38EC000 73D604F0	v_pk_fma_f16 v0, 0.5, v2, -2.0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 0] clamp
+D38E5400 C3CA04F0	v_pk_fma_f16 v0, 0.5, v2, 1.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1]
+D38E6A00 501A04F0	v_pk_fma_f16 v0, 0.5, v2, s6 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D38E7800 320206F0	v_pk_fma_f16 v0, 0.5, v3, 0 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D38E2C00 4C0E06F0	v_pk_fma_f16 v0, 0.5, v3, v3 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38E9D00 3019EAF2	v_pk_fma_f16 v0, 1.0, -2.0, s6 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D38E5B00 B411EAF2	v_pk_fma_f16 v0, 1.0, -2.0, v4 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D38ECA00 23C1EEF2	v_pk_fma_f16 v0, 1.0, -4.0, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0] clamp
+D38E2400 A40DEEF2	v_pk_fma_f16 v0, 1.0, -4.0, v3 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D38E4400 9411EEF2	v_pk_fma_f16 v0, 1.0, -4.0, v4 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D38EE000 83C100F2	v_pk_fma_f16 v0, 1.0, 0, 0.5 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0] clamp
+D38E4D00 1C0900F2	v_pk_fma_f16 v0, 1.0, 0, v2 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D38EA500 141100F2	v_pk_fma_f16 v0, 1.0, 0, v4 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1] clamp
+D38EDD00 D3D5E0F2	v_pk_fma_f16 v0, 1.0, 0.5, -2.0 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1] clamp
+D38EAC00 A405E0F2	v_pk_fma_f16 v0, 1.0, 0.5, v1 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1] clamp
+D38E5E00 EC11E4F2	v_pk_fma_f16 v0, 1.0, 1.0, v4 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D38E3000 73C106F2	v_pk_fma_f16 v0, 1.0, 3, 0.5 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 0] neg_hi:[0, 0, 0]
+D38EFA00 140906F2	v_pk_fma_f16 v0, 1.0, 3, v2 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0] clamp
+D38E6B00 5C0D06F2	v_pk_fma_f16 v0, 1.0, 3, v3 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0]
+D38E3100 23D40AF2	v_pk_fma_f16 v0, 1.0, s5, -2.0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0]
+D38E1C00 83C80AF2	v_pk_fma_f16 v0, 1.0, s5, 1.0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D38E4600 DC080AF2	v_pk_fma_f16 v0, 1.0, s5, v2 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D38E4D00 43C00CF2	v_pk_fma_f16 v0, 1.0, s6, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D38EC300 13C80CF2	v_pk_fma_f16 v0, 1.0, s6, 1.0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0] clamp
+D38E9200 840C0CF2	v_pk_fma_f16 v0, 1.0, s6, v3 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0] clamp
+D38E6D00 E40602F2	v_pk_fma_f16 v0, 1.0, v1, v1 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D38EE400 EC0A02F2	v_pk_fma_f16 v0, 1.0, v1, v2 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1] clamp
+D38E5100 B41204F2	v_pk_fma_f16 v0, 1.0, v2, v4 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0]
+D38E5E00 4A0208F2	v_pk_fma_f16 v0, 1.0, v4, 0 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1]
+D38E5800 520E08F2	v_pk_fma_f16 v0, 1.0, v4, 3 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D38E7600 FBC1EE83	v_pk_fma_f16 v0, 3, -4.0, 0.5 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D38E4E00 A405EE83	v_pk_fma_f16 v0, 3, -4.0, v1 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1]
+D38E1800 EC09EE83	v_pk_fma_f16 v0, 3, -4.0, v2 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D38E2A00 23C10083	v_pk_fma_f16 v0, 3, 0, 0.5 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D38E6C00 F3C10083	v_pk_fma_f16 v0, 3, 0, 0.5 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D38E7B00 0C0DE083	v_pk_fma_f16 v0, 3, 0.5, v3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D38E8E00 2A0DE483	v_pk_fma_f16 v0, 3, 1.0, 3 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 1] clamp
+D38E3100 43D50683	v_pk_fma_f16 v0, 3, 3, -2.0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D38EC900 60190683	v_pk_fma_f16 v0, 3, 3, s6 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0] clamp
+D38E2E00 440D0683	v_pk_fma_f16 v0, 3, 3, v3 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1]
+D38EAD00 C0140A83	v_pk_fma_f16 v0, 3, s5, s5 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1] clamp
+D38E1F00 EA020283	v_pk_fma_f16 v0, 3, v1, 0 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38E6300 83C20283	v_pk_fma_f16 v0, 3, v1, 0.5 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D38E5000 23C20283	v_pk_fma_f16 v0, 3, v1, 0.5 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D38E1B00 B8160283	v_pk_fma_f16 v0, 3, v1, s5 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D38E5E00 5C060283	v_pk_fma_f16 v0, 3, v1, v1 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1]
+D38E3700 C3DE0683	v_pk_fma_f16 v0, 3, v3, -4.0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1]
+D38ED300 C20E0683	v_pk_fma_f16 v0, 3, v3, 3 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0] clamp
+D38E3700 320E0683	v_pk_fma_f16 v0, 3, v3, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1]
+D38E6B00 781A0683	v_pk_fma_f16 v0, 3, v3, s6 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0]
+D38EF600 6A01EA05	v_pk_fma_f16 v0, s5, -2.0, 0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D38EEB00 4A01EA05	v_pk_fma_f16 v0, s5, -2.0, 0 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0] clamp
+D38E8D00 23C9EA05	v_pk_fma_f16 v0, s5, -2.0, 1.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D38E0C00 040DEA05	v_pk_fma_f16 v0, s5, -2.0, v3 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D38E3500 83C1EE05	v_pk_fma_f16 v0, s5, -4.0, 0.5 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D38E6E00 EBC1EE05	v_pk_fma_f16 v0, s5, -4.0, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D38E2400 120D0005	v_pk_fma_f16 v0, s5, 0, 3 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D38E5B00 E3D5E005	v_pk_fma_f16 v0, s5, 0.5, -2.0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D38EEB00 4411E005	v_pk_fma_f16 v0, s5, 0.5, v4 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0] clamp
+D38E8100 5201E405	v_pk_fma_f16 v0, s5, 1.0, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0] clamp
+D38E3400 0A01E405	v_pk_fma_f16 v0, s5, 1.0, 0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D38E4E00 D405E405	v_pk_fma_f16 v0, s5, 1.0, v1 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D38E2D00 50150605	v_pk_fma_f16 v0, s5, 3, s5 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D38E6400 6BD40A05	v_pk_fma_f16 v0, s5, s5, -2.0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1]
+D38E5900 3BD40A05	v_pk_fma_f16 v0, s5, s5, -2.0 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0]
+D38E2300 FA0C0A05	v_pk_fma_f16 v0, s5, s5, 3 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D38E0100 3BDC0C05	v_pk_fma_f16 v0, s5, s6, -4.0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0]
+D38E1800 F3C00C05	v_pk_fma_f16 v0, s5, s6, 0.5 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D38E5900 A20C0C05	v_pk_fma_f16 v0, s5, s6, 3 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0]
+D38E9800 B40E0205	v_pk_fma_f16 v0, s5, v1, v3 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0] clamp
+D38E1100 DC0E0405	v_pk_fma_f16 v0, s5, v2, v3 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D38EF000 9C0E0405	v_pk_fma_f16 v0, s5, v2, v3 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0] clamp
+D38E1C00 8BD60805	v_pk_fma_f16 v0, s5, v4, -2.0 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D38E8C00 83DE0805	v_pk_fma_f16 v0, s5, v4, -4.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1] clamp
+D38E9B00 1C0A0805	v_pk_fma_f16 v0, s5, v4, v2 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0] clamp
+D38E4F00 AC05EA06	v_pk_fma_f16 v0, s6, -2.0, v1 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1]
+D38E6500 BC11EA06	v_pk_fma_f16 v0, s6, -2.0, v4 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D38E2600 4BD50006	v_pk_fma_f16 v0, s6, 0, -2.0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1]
+D38E4000 52010006	v_pk_fma_f16 v0, s6, 0, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D38E2E00 6BC90006	v_pk_fma_f16 v0, s6, 0, 1.0 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D38E7D00 90150006	v_pk_fma_f16 v0, s6, 0, s5 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D38E9100 A815E006	v_pk_fma_f16 v0, s6, 0.5, s5 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0] clamp
+D38E2800 5819E006	v_pk_fma_f16 v0, s6, 0.5, s6 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D38E6200 F409E406	v_pk_fma_f16 v0, s6, 1.0, v2 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0]
+D38E4500 ABC10606	v_pk_fma_f16 v0, s6, 3, 0.5 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D38EAD00 0BC10606	v_pk_fma_f16 v0, s6, 3, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1] clamp
+D38E0E00 DA0D0606	v_pk_fma_f16 v0, s6, 3, 3 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D38E8E00 6C0D0606	v_pk_fma_f16 v0, s6, 3, v3 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D38E0700 8C0C0A06	v_pk_fma_f16 v0, s6, s5, v3 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1]
+D38E1500 D2000C06	v_pk_fma_f16 v0, s6, s6, 0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D38E6800 2BC00C06	v_pk_fma_f16 v0, s6, s6, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D38E2500 54040C06	v_pk_fma_f16 v0, s6, s6, v1 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D38E7300 E4040C06	v_pk_fma_f16 v0, s6, s6, v1 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D38E4900 E20E0206	v_pk_fma_f16 v0, s6, v1, 3 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0]
+D38E1F00 4C0A0206	v_pk_fma_f16 v0, s6, v1, v2 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1]
+D38E6100 5C0E0206	v_pk_fma_f16 v0, s6, v1, v3 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D38E2500 DBD60406	v_pk_fma_f16 v0, s6, v2, -2.0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D38E0D00 0BD60406	v_pk_fma_f16 v0, s6, v2, -2.0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D38E4000 1C0E0406	v_pk_fma_f16 v0, s6, v2, v3
+D38EC000 1C0E0406	v_pk_fma_f16 v0, s6, v2, v3 clamp
+D38E0F00 640E0406	v_pk_fma_f16 v0, s6, v2, v3 op_sel:[1,0,0] op_sel_hi:[0,0,0] neg_lo:[1,1,0] neg_hi:[1,1,1]
+D38EAA00 AC0E0406	v_pk_fma_f16 v0, s6, v2, v3 op_sel:[1,0,1] op_sel_hi:[1,0,0] neg_lo:[1,0,1] neg_hi:[0,1,0] clamp
+D38E1E00 4C0E0406	v_pk_fma_f16 v0, s6, v2, v3 op_sel:[1,1,0] op_sel_hi:[1,0,0] neg_lo:[0,1,0] neg_hi:[0,1,1]
+D38E5900 6C0E0406	v_pk_fma_f16 v0, s6, v2, v3 op_sel:[1,1,0] op_sel_hi:[1,0,1] neg_lo:[1,1,0] neg_hi:[1,0,0]
+D38EBB00 FC0E0406	v_pk_fma_f16 v0, s6, v2, v3 op_sel:[1,1,1] op_sel_hi:[1,1,0] neg_lo:[1,1,1] neg_hi:[1,1,0] clamp
+D38E5F00 181A0606	v_pk_fma_f16 v0, s6, v3, s6 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D38E5100 4C0E0806	v_pk_fma_f16 v0, s6, v4, v3 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D38ED900 5BDDEB01	v_pk_fma_f16 v0, v1, -2.0, -4.0 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0] clamp
+D38E6F00 EBC1EB01	v_pk_fma_f16 v0, v1, -2.0, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38E3F00 EC11EB01	v_pk_fma_f16 v0, v1, -2.0, v4 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38E6200 33C1EF01	v_pk_fma_f16 v0, v1, -4.0, 0.5 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D38E2400 9BD50101	v_pk_fma_f16 v0, v1, 0, -2.0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D38E7300 920D0101	v_pk_fma_f16 v0, v1, 0, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D38E4F00 E3D5E101	v_pk_fma_f16 v0, v1, 0.5, -2.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38E2B00 D201E101	v_pk_fma_f16 v0, v1, 0.5, 0 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D38E7400 A3C9E101	v_pk_fma_f16 v0, v1, 0.5, 1.0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D38E5C00 C405E101	v_pk_fma_f16 v0, v1, 0.5, v1 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1]
+D38E1800 3405E101	v_pk_fma_f16 v0, v1, 0.5, v1 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D38E3600 DBD5E501	v_pk_fma_f16 v0, v1, 1.0, -2.0 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D38E8900 A409E501	v_pk_fma_f16 v0, v1, 1.0, v2 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0] clamp
+D38E4000 1C0DE501	v_pk_fma_f16 v0, v1, 1.0, v3
+D38EC000 1C0DE501	v_pk_fma_f16 v0, v1, 1.0, v3 clamp
+D38EA600 B40DE501	v_pk_fma_f16 v0, v1, 1.0, v3 op_sel:[0,0,1] op_sel_hi:[0,1,0] neg_lo:[1,0,1] neg_hi:[0,1,1] clamp
+D38E1400 2C0DE501	v_pk_fma_f16 v0, v1, 1.0, v3 op_sel:[0,1,0] op_sel_hi:[1,0,0] neg_lo:[1,0,0] neg_hi:[0,0,1]
+D38E5700 EC0DE501	v_pk_fma_f16 v0, v1, 1.0, v3 op_sel:[0,1,0] op_sel_hi:[1,0,1] neg_lo:[1,1,1] neg_hi:[1,1,1]
+D38E4800 9C0DE501	v_pk_fma_f16 v0, v1, 1.0, v3 op_sel:[1,0,0] neg_lo:[0,0,1]
+D38E7E00 0C0DE501	v_pk_fma_f16 v0, v1, 1.0, v3 op_sel:[1,1,1] op_sel_hi:[1,0,1] neg_hi:[0,1,1]
+D38E2D00 4411E501	v_pk_fma_f16 v0, v1, 1.0, v4 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D38E4000 1C0D0701	v_pk_fma_f16 v0, v1, 3, v3
+D38EC000 1C0D0701	v_pk_fma_f16 v0, v1, 3, v3 clamp
+D38E1400 E40D0701	v_pk_fma_f16 v0, v1, 3, v3 op_sel:[0,1,0] op_sel_hi:[0,0,0] neg_lo:[1,1,1] neg_hi:[0,0,1]
+D38E9400 9C0D0701	v_pk_fma_f16 v0, v1, 3, v3 op_sel:[0,1,0] op_sel_hi:[1,1,0] neg_lo:[0,0,1] neg_hi:[0,0,1] clamp
+D38E8800 740D0701	v_pk_fma_f16 v0, v1, 3, v3 op_sel:[1,0,0] op_sel_hi:[0,1,0] neg_lo:[1,1,0] clamp
+D38E2C00 A40D0701	v_pk_fma_f16 v0, v1, 3, v3 op_sel:[1,0,1] op_sel_hi:[0,0,0] neg_lo:[1,0,1] neg_hi:[0,0,1]
+D38E8500 DC0D0701	v_pk_fma_f16 v0, v1, 3, v3 op_sel_hi:[1,1,0] neg_lo:[0,1,1] neg_hi:[1,0,1] clamp
+D38E4000 1C0C0B01	v_pk_fma_f16 v0, v1, s5, v3
+D38EC000 1C0C0B01	v_pk_fma_f16 v0, v1, s5, v3 clamp
+D38E9700 540C0B01	v_pk_fma_f16 v0, v1, s5, v3 op_sel:[0,1,0] op_sel_hi:[0,1,0] neg_lo:[0,1,0] neg_hi:[1,1,1] clamp
+D38EF000 F40C0B01	v_pk_fma_f16 v0, v1, s5, v3 op_sel:[0,1,1] op_sel_hi:[0,1,1] neg_lo:[1,1,1] clamp
+D38E7700 6C0C0B01	v_pk_fma_f16 v0, v1, s5, v3 op_sel:[0,1,1] op_sel_hi:[1,0,1] neg_lo:[1,1,0] neg_hi:[1,1,1]
+D38EAA00 740C0B01	v_pk_fma_f16 v0, v1, s5, v3 op_sel:[1,0,1] op_sel_hi:[0,1,0] neg_lo:[1,1,0] neg_hi:[0,1,0] clamp
+D38E3B00 CC0C0B01	v_pk_fma_f16 v0, v1, s5, v3 op_sel:[1,1,1] op_sel_hi:[1,0,0] neg_lo:[0,1,1] neg_hi:[1,1,0]
+D38E9600 A20C0D01	v_pk_fma_f16 v0, v1, s6, 3 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1] clamp
+D38E7900 B0180D01	v_pk_fma_f16 v0, v1, s6, s6 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0]
+D38EA700 A2020301	v_pk_fma_f16 v0, v1, v1, 0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1] clamp
+D38E4000 1C060301	v_pk_fma_f16 v0, v1, v1, v1
+D38EC000 1C060301	v_pk_fma_f16 v0, v1, v1, v1 clamp
+D38E2600 14060301	v_pk_fma_f16 v0, v1, v1, v1 op_sel:[0,0,1] op_sel_hi:[0,1,0] neg_hi:[0,1,1]
+D38E1900 94060301	v_pk_fma_f16 v0, v1, v1, v1 op_sel:[1,1,0] op_sel_hi:[0,1,0] neg_lo:[0,0,1] neg_hi:[1,0,0]
+D38EDD00 AC060301	v_pk_fma_f16 v0, v1, v1, v1 op_sel:[1,1,0] op_sel_hi:[1,0,1] neg_lo:[1,0,1] neg_hi:[1,0,1] clamp
+D38E7900 74060301	v_pk_fma_f16 v0, v1, v1, v1 op_sel:[1,1,1] op_sel_hi:[0,1,1] neg_lo:[1,1,0] neg_hi:[1,0,0]
+D38E7F00 74060301	v_pk_fma_f16 v0, v1, v1, v1 op_sel:[1,1,1] op_sel_hi:[0,1,1] neg_lo:[1,1,0] neg_hi:[1,1,1]
+D38E4000 1BDE0501	v_pk_fma_f16 v0, v1, v2, -4.0
+D38EC000 1BDE0501	v_pk_fma_f16 v0, v1, v2, -4.0 clamp
+D38E2700 8BDE0501	v_pk_fma_f16 v0, v1, v2, -4.0 op_sel:[0,0,1] op_sel_hi:[1,0,0] neg_lo:[0,0,1] neg_hi:[1,1,1]
+D38E1700 A3DE0501	v_pk_fma_f16 v0, v1, v2, -4.0 op_sel:[0,1,0] op_sel_hi:[0,0,0] neg_lo:[1,0,1] neg_hi:[1,1,1]
+D38E7500 4BDE0501	v_pk_fma_f16 v0, v1, v2, -4.0 op_sel:[0,1,1] op_sel_hi:[1,0,1] neg_lo:[0,1,0] neg_hi:[1,0,1]
+D38E3200 DBDE0501	v_pk_fma_f16 v0, v1, v2, -4.0 op_sel:[0,1,1] op_sel_hi:[1,1,0] neg_lo:[0,1,1] neg_hi:[0,1,0]
+D38EBB00 5BDE0501	v_pk_fma_f16 v0, v1, v2, -4.0 op_sel:[1,1,1] op_sel_hi:[1,1,0] neg_lo:[0,1,0] neg_hi:[1,1,0] clamp
+D38E4000 1BC20501	v_pk_fma_f16 v0, v1, v2, 0.5
+D38EC000 1BC20501	v_pk_fma_f16 v0, v1, v2, 0.5 clamp
+D38E5C00 5BC20501	v_pk_fma_f16 v0, v1, v2, 0.5 op_sel:[1,1,0] neg_lo:[0,1,0] neg_hi:[0,0,1]
+D38E5900 E3C20501	v_pk_fma_f16 v0, v1, v2, 0.5 op_sel:[1,1,0] op_sel_hi:[0,0,1] neg_lo:[1,1,1] neg_hi:[1,0,0]
+D38EDA00 2BC20501	v_pk_fma_f16 v0, v1, v2, 0.5 op_sel:[1,1,0] op_sel_hi:[1,0,1] neg_lo:[1,0,0] neg_hi:[0,1,0] clamp
+D38E7A00 83C20501	v_pk_fma_f16 v0, v1, v2, 0.5 op_sel:[1,1,1] op_sel_hi:[0,0,1] neg_lo:[0,0,1] neg_hi:[0,1,0]
+D38EFF00 2BC20501	v_pk_fma_f16 v0, v1, v2, 0.5 op_sel:[1,1,1] op_sel_hi:[1,0,1] neg_lo:[1,0,0] neg_hi:[1,1,1] clamp
+D38E4000 181E0501	v_pk_fma_f16 v0, v1, v2, s7
+D38EC000 181E0501	v_pk_fma_f16 v0, v1, v2, s7 clamp
+D38EC400 F81E0501	v_pk_fma_f16 v0, v1, v2, s7 neg_lo:[1,1,1] neg_hi:[0,0,1] clamp
+D38EA300 081E0501	v_pk_fma_f16 v0, v1, v2, s7 op_sel:[0,0,1] op_sel_hi:[1,0,0] neg_hi:[1,1,0] clamp
+D38ED600 381E0501	v_pk_fma_f16 v0, v1, v2, s7 op_sel:[0,1,0] neg_lo:[1,0,0] neg_hi:[0,1,1] clamp
+D38E1000 D81E0501	v_pk_fma_f16 v0, v1, v2, s7 op_sel:[0,1,0] op_sel_hi:[1,1,0] neg_lo:[0,1,1]
+D38E0400 A81E0501	v_pk_fma_f16 v0, v1, v2, s7 op_sel_hi:[1,0,0] neg_lo:[1,0,1] neg_hi:[0,0,1]
+D38E4000 1C0E0501	v_pk_fma_f16 v0, v1, v2, v3
+D38EC000 1C0E0501	v_pk_fma_f16 v0, v1, v2, v3 clamp
+D38E6B00 3C0E0501	v_pk_fma_f16 v0, v1, v2, v3 op_sel:[1,0,1] neg_lo:[1,0,0] neg_hi:[1,1,0]
+D38E2A00 040E0501	v_pk_fma_f16 v0, v1, v2, v3 op_sel:[1,0,1] op_sel_hi:[0,0,0] neg_hi:[0,1,0]
+D38EFE00 B40E0501	v_pk_fma_f16 v0, v1, v2, v3 op_sel:[1,1,1] op_sel_hi:[0,1,1] neg_lo:[1,0,1] neg_hi:[0,1,1] clamp
+D38E8500 E40E0501	v_pk_fma_f16 v0, v1, v2, v3 op_sel_hi:[0,0,0] neg_lo:[1,1,1] neg_hi:[1,0,1] clamp
+D38EC400 4C0E0501	v_pk_fma_f16 v0, v1, v2, v3 op_sel_hi:[1,0,1] neg_lo:[0,1,0] neg_hi:[0,0,1] clamp
+D38E4500 1C120501	v_pk_fma_f16 v0, v1, v2, v4 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D38E2100 04120501	v_pk_fma_f16 v0, v1, v2, v4 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0]
+D38E7A00 DA020701	v_pk_fma_f16 v0, v1, v3, 0 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D38E5600 201A0701	v_pk_fma_f16 v0, v1, v3, s6 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 1]
+D38E5000 E01A0701	v_pk_fma_f16 v0, v1, v3, s6 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D38EB500 7C05EB02	v_pk_fma_f16 v0, v2, -2.0, v1 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1] clamp
+D38E5800 2C0DEF02	v_pk_fma_f16 v0, v2, -4.0, v3 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D38E5300 F8190102	v_pk_fma_f16 v0, v2, 0, s6 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D38E0F00 F819E102	v_pk_fma_f16 v0, v2, 0.5, s6 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38E1C00 43D5E502	v_pk_fma_f16 v0, v2, 1.0, -2.0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D38E3700 B20DE502	v_pk_fma_f16 v0, v2, 1.0, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1]
+D38E3700 F405E502	v_pk_fma_f16 v0, v2, 1.0, v1 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38E0D00 23D40D02	v_pk_fma_f16 v0, v2, s6, -2.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D38E9E00 24080D02	v_pk_fma_f16 v0, v2, s6, v2 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 1] clamp
+D38E8300 840A0502	v_pk_fma_f16 v0, v2, v2, v2 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0] clamp
+D38EBF00 F8160702	v_pk_fma_f16 v0, v2, v3, s5 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1] clamp
+D38E4400 CBDE0902	v_pk_fma_f16 v0, v2, v4, -4.0 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1]
+D38E7F00 EBDE0902	v_pk_fma_f16 v0, v2, v4, -4.0 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38E0500 E2020902	v_pk_fma_f16 v0, v2, v4, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D38E0300 EBC20902	v_pk_fma_f16 v0, v2, v4, 0.5 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D38EA100 FA0DEB03	v_pk_fma_f16 v0, v3, -2.0, 3 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0] clamp
+D38E4D00 3819EB03	v_pk_fma_f16 v0, v3, -2.0, s6 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D38EFD00 4C09EF03	v_pk_fma_f16 v0, v3, -4.0, v2 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1] clamp
+D38E7700 7C0DEF03	v_pk_fma_f16 v0, v3, -4.0, v3 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1]
+D38ED500 23D50103	v_pk_fma_f16 v0, v3, 0, -2.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D38EE100 B0190103	v_pk_fma_f16 v0, v3, 0, s6 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0] clamp
+D38E5000 DBD5E103	v_pk_fma_f16 v0, v3, 0.5, -2.0 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D38E2000 1BDDE103	v_pk_fma_f16 v0, v3, 0.5, -4.0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D38E5300 E3DDE103	v_pk_fma_f16 v0, v3, 0.5, -4.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D38E5F00 A409E103	v_pk_fma_f16 v0, v3, 0.5, v2 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1]
+D38E2B00 ABC9E503	v_pk_fma_f16 v0, v3, 1.0, 1.0 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D38E3300 8C11E503	v_pk_fma_f16 v0, v3, 1.0, v4 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D38EEB00 BBDC0B03	v_pk_fma_f16 v0, v3, s5, -4.0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0] clamp
+D38EA100 8C100B03	v_pk_fma_f16 v0, v3, s5, v4 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0] clamp
+D38E2200 C3D40D03	v_pk_fma_f16 v0, v3, s6, -2.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D38E7300 4C100D03	v_pk_fma_f16 v0, v3, s6, v4 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0]
+D38E5700 B2020303	v_pk_fma_f16 v0, v3, v1, 0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1]
+D38E7200 E2020303	v_pk_fma_f16 v0, v3, v1, 0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0]
+D38E3F00 1A0E0303	v_pk_fma_f16 v0, v3, v1, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D38E6B00 90160303	v_pk_fma_f16 v0, v3, v1, s5 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D38E6D00 040A0503	v_pk_fma_f16 v0, v3, v2, v2 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D38E6E00 43DE0703	v_pk_fma_f16 v0, v3, v3, -4.0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1]
+D38E1600 BBC1EB04	v_pk_fma_f16 v0, v4, -2.0, 0.5 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1]
+D38E3F00 EBC9EB04	v_pk_fma_f16 v0, v4, -2.0, 1.0 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38E3000 C3D5EF04	v_pk_fma_f16 v0, v4, -4.0, -2.0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D38E4200 A8190104	v_pk_fma_f16 v0, v4, 0, s6 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0]
+D38E6400 24090104	v_pk_fma_f16 v0, v4, 0, v2 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D38EB500 2C0DE504	v_pk_fma_f16 v0, v4, 1.0, v3 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D38E1300 D3D40D04	v_pk_fma_f16 v0, v4, s6, -2.0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D38E4500 E4100D04	v_pk_fma_f16 v0, v4, s6, v4 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D38E1900 C3D60304	v_pk_fma_f16 v0, v4, v1, -2.0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D38E9700 9A020304	v_pk_fma_f16 v0, v4, v1, 0 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1] clamp
+D38E6700 F3C20304	v_pk_fma_f16 v0, v4, v1, 0.5 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D38E8500 A0160304	v_pk_fma_f16 v0, v4, v1, s5 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1] clamp
+D38EB700 3A020504	v_pk_fma_f16 v0, v4, v2, 0 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1] clamp
+D38EEE00 82020704	v_pk_fma_f16 v0, v4, v3, 0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1] clamp
+D38E4C00 940A0704	v_pk_fma_f16 v0, v4, v3, v2 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D38E6600 73C20904	v_pk_fma_f16 v0, v4, v4, 0.5 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D38E8200 73CA0904	v_pk_fma_f16 v0, v4, v4, 1.0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0] clamp
+D38E4C00 70160904	v_pk_fma_f16 v0, v4, v4, s5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1]
+D38E4300 CC060904	v_pk_fma_f16 v0, v4, v4, v1 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D38E4000 1C120904	v_pk_fma_f16 v0, v4, v4, v4
+D38EC000 1C120904	v_pk_fma_f16 v0, v4, v4, v4 clamp
+D38E4200 DC120904	v_pk_fma_f16 v0, v4, v4, v4 neg_lo:[0,1,1] neg_hi:[0,1,0]
+D38E6300 DC120904	v_pk_fma_f16 v0, v4, v4, v4 op_sel:[0,0,1] neg_lo:[0,1,1] neg_hi:[1,1,0]
+D38E2500 CC120904	v_pk_fma_f16 v0, v4, v4, v4 op_sel:[0,0,1] op_sel_hi:[1,0,0] neg_lo:[0,1,1] neg_hi:[1,0,1]
+D38E4A00 5C120904	v_pk_fma_f16 v0, v4, v4, v4 op_sel:[1,0,0] neg_lo:[0,1,0] neg_hi:[0,1,0]
+D38E5B00 84120904	v_pk_fma_f16 v0, v4, v4, v4 op_sel:[1,1,0] op_sel_hi:[0,0,1] neg_lo:[0,0,1] neg_hi:[1,1,0]
+D3844000 180204F5	v_pk_lshlrev_b16 v0, -2.0, v2
+D384C000 180204F5	v_pk_lshlrev_b16 v0, -2.0, v2 clamp
+D3844800 080204F5	v_pk_lshlrev_b16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[1,0]
+D3845800 180204F5	v_pk_lshlrev_b16 v0, -2.0, v2 op_sel:[1,1]
+D3844000 080204F5	v_pk_lshlrev_b16 v0, -2.0, v2 op_sel_hi:[1,0]
+D3844000 180206F0	v_pk_lshlrev_b16 v0, 0.5, v3
+D384C000 180206F0	v_pk_lshlrev_b16 v0, 0.5, v3 clamp
+D3845800 000206F0	v_pk_lshlrev_b16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[0,0]
+D3845800 100206F0	v_pk_lshlrev_b16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[0,1]
+D3845800 080206F0	v_pk_lshlrev_b16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[1,0]
+D3844000 18020406	v_pk_lshlrev_b16 v0, s6, v2
+D384C000 18020406	v_pk_lshlrev_b16 v0, s6, v2 clamp
+D3845000 00020406	v_pk_lshlrev_b16 v0, s6, v2 op_sel:[0,1] op_sel_hi:[0,0]
+D3844800 10020406	v_pk_lshlrev_b16 v0, s6, v2 op_sel:[1,0] op_sel_hi:[0,1]
+D3844800 08020406	v_pk_lshlrev_b16 v0, s6, v2 op_sel:[1,0] op_sel_hi:[1,0]
+D3844000 1801E501	v_pk_lshlrev_b16 v0, v1, 1.0
+D384C000 1801E501	v_pk_lshlrev_b16 v0, v1, 1.0 clamp
+D384D000 1001E501	v_pk_lshlrev_b16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[0,1] clamp
+D3844800 1001E501	v_pk_lshlrev_b16 v0, v1, 1.0 op_sel:[1,0] op_sel_hi:[0,1]
+D3845800 0801E501	v_pk_lshlrev_b16 v0, v1, 1.0 op_sel:[1,1] op_sel_hi:[1,0]
+D3844000 18010F01	v_pk_lshlrev_b16 v0, v1, 7
+D384C000 18010F01	v_pk_lshlrev_b16 v0, v1, 7 clamp
+D384D000 18010F01	v_pk_lshlrev_b16 v0, v1, 7 op_sel:[0,1] clamp
+D384C800 18010F01	v_pk_lshlrev_b16 v0, v1, 7 op_sel:[1,0] clamp
+D3844000 18000B01	v_pk_lshlrev_b16 v0, v1, s5
+D384C000 18000B01	v_pk_lshlrev_b16 v0, v1, s5 clamp
+D3845000 08000B01	v_pk_lshlrev_b16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[1,0]
+D384C800 00000B01	v_pk_lshlrev_b16 v0, v1, s5 op_sel:[1,0] op_sel_hi:[0,0] clamp
+D3844000 18020501	v_pk_lshlrev_b16 v0, v1, v2
+D384C000 18020501	v_pk_lshlrev_b16 v0, v1, v2 clamp
+D384D000 18020501	v_pk_lshlrev_b16 v0, v1, v2 op_sel:[0,1] clamp
+D384C000 08020501	v_pk_lshlrev_b16 v0, v1, v2 op_sel_hi:[1,0] clamp
+D3844000 18020904	v_pk_lshlrev_b16 v0, v4, v4
+D384C000 18020904	v_pk_lshlrev_b16 v0, v4, v4 clamp
+D384D000 18020904	v_pk_lshlrev_b16 v0, v4, v4 op_sel:[0,1] clamp
+D3845800 10020904	v_pk_lshlrev_b16 v0, v4, v4 op_sel:[1,1] op_sel_hi:[0,1]
+D3844000 00020904	v_pk_lshlrev_b16 v0, v4, v4 op_sel_hi:[0,0]
+D3854000 180204F5	v_pk_lshrrev_b16 v0, -2.0, v2
+D385C000 180204F5	v_pk_lshrrev_b16 v0, -2.0, v2 clamp
+D3854800 000204F5	v_pk_lshrrev_b16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,0]
+D385C800 100204F5	v_pk_lshrrev_b16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,1] clamp
+D3855800 100204F5	v_pk_lshrrev_b16 v0, -2.0, v2 op_sel:[1,1] op_sel_hi:[0,1]
+D3854000 180206F0	v_pk_lshrrev_b16 v0, 0.5, v3
+D385C000 180206F0	v_pk_lshrrev_b16 v0, 0.5, v3 clamp
+D3855000 180206F0	v_pk_lshrrev_b16 v0, 0.5, v3 op_sel:[0,1]
+D3854800 100206F0	v_pk_lshrrev_b16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[0,1]
+D3854000 18020406	v_pk_lshrrev_b16 v0, s6, v2
+D385C000 18020406	v_pk_lshrrev_b16 v0, s6, v2 clamp
+D3855000 10020406	v_pk_lshrrev_b16 v0, s6, v2 op_sel:[0,1] op_sel_hi:[0,1]
+D3855800 18020406	v_pk_lshrrev_b16 v0, s6, v2 op_sel:[1,1]
+D385D800 10020406	v_pk_lshrrev_b16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,1] clamp
+D3854000 1801E501	v_pk_lshrrev_b16 v0, v1, 1.0
+D385C000 1801E501	v_pk_lshrrev_b16 v0, v1, 1.0 clamp
+D3854800 0801E501	v_pk_lshrrev_b16 v0, v1, 1.0 op_sel:[1,0] op_sel_hi:[1,0]
+D3855800 1801E501	v_pk_lshrrev_b16 v0, v1, 1.0 op_sel:[1,1]
+D385C000 0801E501	v_pk_lshrrev_b16 v0, v1, 1.0 op_sel_hi:[1,0] clamp
+D3854000 18010F01	v_pk_lshrrev_b16 v0, v1, 7
+D385C000 18010F01	v_pk_lshrrev_b16 v0, v1, 7 clamp
+D3855000 08010F01	v_pk_lshrrev_b16 v0, v1, 7 op_sel:[0,1] op_sel_hi:[1,0]
+D3854000 18000B01	v_pk_lshrrev_b16 v0, v1, s5
+D385C000 18000B01	v_pk_lshrrev_b16 v0, v1, s5 clamp
+D3855800 00000B01	v_pk_lshrrev_b16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[0,0]
+D3855800 10000B01	v_pk_lshrrev_b16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[0,1]
+D3855800 08000B01	v_pk_lshrrev_b16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[1,0]
+D3854000 18020501	v_pk_lshrrev_b16 v0, v1, v2
+D385C000 18020501	v_pk_lshrrev_b16 v0, v1, v2 clamp
+D3855000 00020501	v_pk_lshrrev_b16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[0,0]
+D385D000 08020501	v_pk_lshrrev_b16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[1,0] clamp
+D385C800 08020501	v_pk_lshrrev_b16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[1,0] clamp
+D3854000 18020904	v_pk_lshrrev_b16 v0, v4, v4
+D385C000 18020904	v_pk_lshrrev_b16 v0, v4, v4 clamp
+D3855000 08020904	v_pk_lshrrev_b16 v0, v4, v4 op_sel:[0,1] op_sel_hi:[1,0]
+D3855800 18020904	v_pk_lshrrev_b16 v0, v4, v4 op_sel:[1,1]
+D3854000 08020904	v_pk_lshrrev_b16 v0, v4, v4 op_sel_hi:[1,0]
+D3804000 1C0E04F5	v_pk_mad_i16 v0, -2.0, v2, v3
+D380C000 1C0E04F5	v_pk_mad_i16 v0, -2.0, v2, v3 clamp
+D3809000 1C0E04F5	v_pk_mad_i16 v0, -2.0, v2, v3 op_sel:[0,1,0] op_sel_hi:[1,1,0] clamp
+D3802800 1C0E04F5	v_pk_mad_i16 v0, -2.0, v2, v3 op_sel:[1,0,1] op_sel_hi:[1,1,0]
+D3804000 1C0E0480	v_pk_mad_i16 v0, 0, v2, v3
+D380C000 1C0E0480	v_pk_mad_i16 v0, 0, v2, v3 clamp
+D3804800 140E0480	v_pk_mad_i16 v0, 0, v2, v3 op_sel:[1,0,0] op_sel_hi:[0,1,1]
+D3803800 040E0480	v_pk_mad_i16 v0, 0, v2, v3 op_sel:[1,1,1] op_sel_hi:[0,0,0]
+D3804000 1C0E0406	v_pk_mad_i16 v0, s6, v2, v3
+D380C000 1C0E0406	v_pk_mad_i16 v0, s6, v2, v3 clamp
+D380F000 040E0406	v_pk_mad_i16 v0, s6, v2, v3 op_sel:[0,1,1] op_sel_hi:[0,0,1] clamp
+D3804000 040E0406	v_pk_mad_i16 v0, s6, v2, v3 op_sel_hi:[0,0,1]
+D3804000 1C0DE501	v_pk_mad_i16 v0, v1, 1.0, v3
+D380C000 1C0DE501	v_pk_mad_i16 v0, v1, 1.0, v3 clamp
+D3804800 040DE501	v_pk_mad_i16 v0, v1, 1.0, v3 op_sel:[1,0,0] op_sel_hi:[0,0,1]
+D3805800 040DE501	v_pk_mad_i16 v0, v1, 1.0, v3 op_sel:[1,1,0] op_sel_hi:[0,0,1]
+D3804000 1C0D0701	v_pk_mad_i16 v0, v1, 3, v3
+D380C000 1C0D0701	v_pk_mad_i16 v0, v1, 3, v3 clamp
+D3801800 1C0D0701	v_pk_mad_i16 v0, v1, 3, v3 op_sel:[1,1,0] op_sel_hi:[1,1,0]
+D3807800 1C0D0701	v_pk_mad_i16 v0, v1, 3, v3 op_sel:[1,1,1]
+D3804000 1C0C0B01	v_pk_mad_i16 v0, v1, s5, v3
+D380C000 1C0C0B01	v_pk_mad_i16 v0, v1, s5, v3 clamp
+D3806800 140C0B01	v_pk_mad_i16 v0, v1, s5, v3 op_sel:[1,0,1] op_sel_hi:[0,1,1]
+D3808000 040C0B01	v_pk_mad_i16 v0, v1, s5, v3 op_sel_hi:[0,0,0] clamp
+D3804000 1C060301	v_pk_mad_i16 v0, v1, v1, v1
+D380C000 1C060301	v_pk_mad_i16 v0, v1, v1, v1 clamp
+D3802800 14060301	v_pk_mad_i16 v0, v1, v1, v1 op_sel:[1,0,1] op_sel_hi:[0,1,0]
+D3801800 04060301	v_pk_mad_i16 v0, v1, v1, v1 op_sel:[1,1,0] op_sel_hi:[0,0,0]
+D3804000 1BDE0501	v_pk_mad_i16 v0, v1, v2, -4.0
+D380C000 1BDE0501	v_pk_mad_i16 v0, v1, v2, -4.0 clamp
+D3807000 0BDE0501	v_pk_mad_i16 v0, v1, v2, -4.0 op_sel:[0,1,1] op_sel_hi:[1,0,1]
+D3803800 0BDE0501	v_pk_mad_i16 v0, v1, v2, -4.0 op_sel:[1,1,1] op_sel_hi:[1,0,0]
+D3804000 1BC20501	v_pk_mad_i16 v0, v1, v2, 0.5
+D380C000 1BC20501	v_pk_mad_i16 v0, v1, v2, 0.5 clamp
+D3807000 0BC20501	v_pk_mad_i16 v0, v1, v2, 0.5 op_sel:[0,1,1] op_sel_hi:[1,0,1]
+D3802800 13C20501	v_pk_mad_i16 v0, v1, v2, 0.5 op_sel:[1,0,1] op_sel_hi:[0,1,0]
+D3804000 181E0501	v_pk_mad_i16 v0, v1, v2, s7
+D380C000 181E0501	v_pk_mad_i16 v0, v1, v2, s7 clamp
+D3801000 181E0501	v_pk_mad_i16 v0, v1, v2, s7 op_sel:[0,1,0] op_sel_hi:[1,1,0]
+D3807000 081E0501	v_pk_mad_i16 v0, v1, v2, s7 op_sel:[0,1,1] op_sel_hi:[1,0,1]
+D3804000 1C0E0501	v_pk_mad_i16 v0, v1, v2, v3
+D380C000 1C0E0501	v_pk_mad_i16 v0, v1, v2, v3 clamp
+D380F000 040E0501	v_pk_mad_i16 v0, v1, v2, v3 op_sel:[0,1,1] op_sel_hi:[0,0,1] clamp
+D3807000 140E0501	v_pk_mad_i16 v0, v1, v2, v3 op_sel:[0,1,1] op_sel_hi:[0,1,1]
+D3804000 1C120904	v_pk_mad_i16 v0, v4, v4, v4
+D380C000 1C120904	v_pk_mad_i16 v0, v4, v4, v4 clamp
+D3804800 0C120904	v_pk_mad_i16 v0, v4, v4, v4 op_sel:[1,0,0] op_sel_hi:[1,0,1]
+D3803800 0C120904	v_pk_mad_i16 v0, v4, v4, v4 op_sel:[1,1,1] op_sel_hi:[1,0,0]
+D3894000 1C0E04F5	v_pk_mad_u16 v0, -2.0, v2, v3
+D389C000 1C0E04F5	v_pk_mad_u16 v0, -2.0, v2, v3 clamp
+D3897000 140E04F5	v_pk_mad_u16 v0, -2.0, v2, v3 op_sel:[0,1,1] op_sel_hi:[0,1,1]
+D3892800 040E04F5	v_pk_mad_u16 v0, -2.0, v2, v3 op_sel:[1,0,1] op_sel_hi:[0,0,0]
+D3894000 1C0E0480	v_pk_mad_u16 v0, 0, v2, v3
+D389C000 1C0E0480	v_pk_mad_u16 v0, 0, v2, v3 clamp
+D3899000 140E0480	v_pk_mad_u16 v0, 0, v2, v3 op_sel:[0,1,0] op_sel_hi:[0,1,0] clamp
+D3898800 140E0480	v_pk_mad_u16 v0, 0, v2, v3 op_sel:[1,0,0] op_sel_hi:[0,1,0] clamp
+D3894000 1C0E0406	v_pk_mad_u16 v0, s6, v2, v3
+D389C000 1C0E0406	v_pk_mad_u16 v0, s6, v2, v3 clamp
+D3897000 040E0406	v_pk_mad_u16 v0, s6, v2, v3 op_sel:[0,1,1] op_sel_hi:[0,0,1]
+D3893000 1C0E0406	v_pk_mad_u16 v0, s6, v2, v3 op_sel:[0,1,1] op_sel_hi:[1,1,0]
+D3894000 1C0DE501	v_pk_mad_u16 v0, v1, 1.0, v3
+D389C000 1C0DE501	v_pk_mad_u16 v0, v1, 1.0, v3 clamp
+D3890000 040DE501	v_pk_mad_u16 v0, v1, 1.0, v3 op_sel_hi:[0,0,0]
+D3894000 140DE501	v_pk_mad_u16 v0, v1, 1.0, v3 op_sel_hi:[0,1,1]
+D3894000 1C0D0701	v_pk_mad_u16 v0, v1, 3, v3
+D389C000 1C0D0701	v_pk_mad_u16 v0, v1, 3, v3 clamp
+D389D800 040D0701	v_pk_mad_u16 v0, v1, 3, v3 op_sel:[1,1,0] op_sel_hi:[0,0,1] clamp
+D389B800 040D0701	v_pk_mad_u16 v0, v1, 3, v3 op_sel:[1,1,1] op_sel_hi:[0,0,0] clamp
+D3894000 1C0C0B01	v_pk_mad_u16 v0, v1, s5, v3
+D389C000 1C0C0B01	v_pk_mad_u16 v0, v1, s5, v3 clamp
+D3890800 040C0B01	v_pk_mad_u16 v0, v1, s5, v3 op_sel:[1,0,0] op_sel_hi:[0,0,0]
+D3892800 040C0B01	v_pk_mad_u16 v0, v1, s5, v3 op_sel:[1,0,1] op_sel_hi:[0,0,0]
+D3894000 1C060301	v_pk_mad_u16 v0, v1, v1, v1
+D389C000 1C060301	v_pk_mad_u16 v0, v1, v1, v1 clamp
+D3896000 1C060301	v_pk_mad_u16 v0, v1, v1, v1 op_sel:[0,0,1]
+D3893000 04060301	v_pk_mad_u16 v0, v1, v1, v1 op_sel:[0,1,1] op_sel_hi:[0,0,0]
+D3894000 1BDE0501	v_pk_mad_u16 v0, v1, v2, -4.0
+D389C000 1BDE0501	v_pk_mad_u16 v0, v1, v2, -4.0 clamp
+D389F000 1BDE0501	v_pk_mad_u16 v0, v1, v2, -4.0 op_sel:[0,1,1] clamp
+D3897000 0BDE0501	v_pk_mad_u16 v0, v1, v2, -4.0 op_sel:[0,1,1] op_sel_hi:[1,0,1]
+D3894000 1BC20501	v_pk_mad_u16 v0, v1, v2, 0.5
+D389C000 1BC20501	v_pk_mad_u16 v0, v1, v2, 0.5 clamp
+D389E000 0BC20501	v_pk_mad_u16 v0, v1, v2, 0.5 op_sel:[0,0,1] op_sel_hi:[1,0,1] clamp
+D3890000 13C20501	v_pk_mad_u16 v0, v1, v2, 0.5 op_sel_hi:[0,1,0]
+D3894000 181E0501	v_pk_mad_u16 v0, v1, v2, s7
+D389C000 181E0501	v_pk_mad_u16 v0, v1, v2, s7 clamp
+D3890800 001E0501	v_pk_mad_u16 v0, v1, v2, s7 op_sel:[1,0,0] op_sel_hi:[0,0,0]
+D3897800 001E0501	v_pk_mad_u16 v0, v1, v2, s7 op_sel:[1,1,1] op_sel_hi:[0,0,1]
+D3894000 1C0E0501	v_pk_mad_u16 v0, v1, v2, v3
+D389C000 1C0E0501	v_pk_mad_u16 v0, v1, v2, v3 clamp
+D3895800 040E0501	v_pk_mad_u16 v0, v1, v2, v3 op_sel:[1,1,0] op_sel_hi:[0,0,1]
+D3897800 140E0501	v_pk_mad_u16 v0, v1, v2, v3 op_sel:[1,1,1] op_sel_hi:[0,1,1]
+D3894000 1C120904	v_pk_mad_u16 v0, v4, v4, v4
+D389C000 1C120904	v_pk_mad_u16 v0, v4, v4, v4 clamp
+D3891800 0C120904	v_pk_mad_u16 v0, v4, v4, v4 op_sel:[1,1,0] op_sel_hi:[1,0,0]
+D3897800 04120904	v_pk_mad_u16 v0, v4, v4, v4 op_sel:[1,1,1] op_sel_hi:[0,0,1]
+D3874000 180204F5	v_pk_max_i16 v0, -2.0, v2
+D387C000 180204F5	v_pk_max_i16 v0, -2.0, v2 clamp
+D3874800 180204F5	v_pk_max_i16 v0, -2.0, v2 op_sel:[1,0]
+D3874800 100204F5	v_pk_max_i16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,1]
+D3874000 100204F5	v_pk_max_i16 v0, -2.0, v2 op_sel_hi:[0,1]
+D3874000 180206F0	v_pk_max_i16 v0, 0.5, v3
+D387C000 180206F0	v_pk_max_i16 v0, 0.5, v3 clamp
+D3875000 180206F0	v_pk_max_i16 v0, 0.5, v3 op_sel:[0,1]
+D3875800 100206F0	v_pk_max_i16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[0,1]
+D3874000 18020406	v_pk_max_i16 v0, s6, v2
+D387C000 18020406	v_pk_max_i16 v0, s6, v2 clamp
+D3874800 00020406	v_pk_max_i16 v0, s6, v2 op_sel:[1,0] op_sel_hi:[0,0]
+D387C000 08020406	v_pk_max_i16 v0, s6, v2 op_sel_hi:[1,0] clamp
+D3874000 1801E501	v_pk_max_i16 v0, v1, 1.0
+D387C000 1801E501	v_pk_max_i16 v0, v1, 1.0 clamp
+D3875000 1801E501	v_pk_max_i16 v0, v1, 1.0 op_sel:[0,1]
+D3874800 1001E501	v_pk_max_i16 v0, v1, 1.0 op_sel:[1,0] op_sel_hi:[0,1]
+D3875800 0801E501	v_pk_max_i16 v0, v1, 1.0 op_sel:[1,1] op_sel_hi:[1,0]
+D3874000 18010F01	v_pk_max_i16 v0, v1, 7
+D387C000 18010F01	v_pk_max_i16 v0, v1, 7 clamp
+D3875000 00010F01	v_pk_max_i16 v0, v1, 7 op_sel:[0,1] op_sel_hi:[0,0]
+D387C800 10010F01	v_pk_max_i16 v0, v1, 7 op_sel:[1,0] op_sel_hi:[0,1] clamp
+D387C000 00010F01	v_pk_max_i16 v0, v1, 7 op_sel_hi:[0,0] clamp
+D3874000 18000B01	v_pk_max_i16 v0, v1, s5
+D387C000 18000B01	v_pk_max_i16 v0, v1, s5 clamp
+D387D000 08000B01	v_pk_max_i16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[1,0] clamp
+D3875800 18000B01	v_pk_max_i16 v0, v1, s5 op_sel:[1,1]
+D3874000 18020501	v_pk_max_i16 v0, v1, v2
+D387C000 18020501	v_pk_max_i16 v0, v1, v2 clamp
+D387D000 08020501	v_pk_max_i16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[1,0] clamp
+D3874800 18020501	v_pk_max_i16 v0, v1, v2 op_sel:[1,0]
+D387D800 18020501	v_pk_max_i16 v0, v1, v2 op_sel:[1,1] clamp
+D3874000 18020904	v_pk_max_i16 v0, v4, v4
+D387C000 18020904	v_pk_max_i16 v0, v4, v4 clamp
+D387D800 18020904	v_pk_max_i16 v0, v4, v4 op_sel:[1,1] clamp
+D3874000 08020904	v_pk_max_i16 v0, v4, v4 op_sel_hi:[1,0]
+D38C4000 180204F5	v_pk_max_u16 v0, -2.0, v2
+D38CC000 180204F5	v_pk_max_u16 v0, -2.0, v2 clamp
+D38C5000 180204F5	v_pk_max_u16 v0, -2.0, v2 op_sel:[0,1]
+D38C4800 080204F5	v_pk_max_u16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[1,0]
+D38C4000 180206F0	v_pk_max_u16 v0, 0.5, v3
+D38CC000 180206F0	v_pk_max_u16 v0, 0.5, v3 clamp
+D38C5000 180206F0	v_pk_max_u16 v0, 0.5, v3 op_sel:[0,1]
+D38C5000 100206F0	v_pk_max_u16 v0, 0.5, v3 op_sel:[0,1] op_sel_hi:[0,1]
+D38CC000 080206F0	v_pk_max_u16 v0, 0.5, v3 op_sel_hi:[1,0] clamp
+D38C4000 18020406	v_pk_max_u16 v0, s6, v2
+D38CC000 18020406	v_pk_max_u16 v0, s6, v2 clamp
+D38CC800 18020406	v_pk_max_u16 v0, s6, v2 op_sel:[1,0] clamp
+D38C4000 08020406	v_pk_max_u16 v0, s6, v2 op_sel_hi:[1,0]
+D38CC000 08020406	v_pk_max_u16 v0, s6, v2 op_sel_hi:[1,0] clamp
+D38C4000 1801E501	v_pk_max_u16 v0, v1, 1.0
+D38CC000 1801E501	v_pk_max_u16 v0, v1, 1.0 clamp
+D38C4800 1801E501	v_pk_max_u16 v0, v1, 1.0 op_sel:[1,0]
+D38C4800 1001E501	v_pk_max_u16 v0, v1, 1.0 op_sel:[1,0] op_sel_hi:[0,1]
+D38C5800 1001E501	v_pk_max_u16 v0, v1, 1.0 op_sel:[1,1] op_sel_hi:[0,1]
+D38C4000 18010F01	v_pk_max_u16 v0, v1, 7
+D38CC000 18010F01	v_pk_max_u16 v0, v1, 7 clamp
+D38C4800 10010F01	v_pk_max_u16 v0, v1, 7 op_sel:[1,0] op_sel_hi:[0,1]
+D38C4000 08010F01	v_pk_max_u16 v0, v1, 7 op_sel_hi:[1,0]
+D38CC000 08010F01	v_pk_max_u16 v0, v1, 7 op_sel_hi:[1,0] clamp
+D38C4000 18000B01	v_pk_max_u16 v0, v1, s5
+D38CC000 18000B01	v_pk_max_u16 v0, v1, s5 clamp
+D38C5800 10000B01	v_pk_max_u16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[0,1]
+D38C4000 08000B01	v_pk_max_u16 v0, v1, s5 op_sel_hi:[1,0]
+D38C4000 18020501	v_pk_max_u16 v0, v1, v2
+D38CC000 18020501	v_pk_max_u16 v0, v1, v2 clamp
+D38C5000 00020501	v_pk_max_u16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[0,0]
+D38CD800 00020501	v_pk_max_u16 v0, v1, v2 op_sel:[1,1] op_sel_hi:[0,0] clamp
+D38C4000 00020501	v_pk_max_u16 v0, v1, v2 op_sel_hi:[0,0]
+D38C4000 18020904	v_pk_max_u16 v0, v4, v4
+D38CC000 18020904	v_pk_max_u16 v0, v4, v4 clamp
+D38C5000 00020904	v_pk_max_u16 v0, v4, v4 op_sel:[0,1] op_sel_hi:[0,0]
+D38C5800 18020904	v_pk_max_u16 v0, v4, v4 op_sel:[1,1]
+D3884000 180204F5	v_pk_min_i16 v0, -2.0, v2
+D388C000 180204F5	v_pk_min_i16 v0, -2.0, v2 clamp
+D3885000 000204F5	v_pk_min_i16 v0, -2.0, v2 op_sel:[0,1] op_sel_hi:[0,0]
+D3885000 100204F5	v_pk_min_i16 v0, -2.0, v2 op_sel:[0,1] op_sel_hi:[0,1]
+D3884800 100204F5	v_pk_min_i16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,1]
+D3884000 180206F0	v_pk_min_i16 v0, 0.5, v3
+D388C000 180206F0	v_pk_min_i16 v0, 0.5, v3 clamp
+D3884800 000206F0	v_pk_min_i16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[0,0]
+D3884800 080206F0	v_pk_min_i16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[1,0]
+D3884000 080206F0	v_pk_min_i16 v0, 0.5, v3 op_sel_hi:[1,0]
+D3884000 18020406	v_pk_min_i16 v0, s6, v2
+D388C000 18020406	v_pk_min_i16 v0, s6, v2 clamp
+D3885800 18020406	v_pk_min_i16 v0, s6, v2 op_sel:[1,1]
+D3885800 10020406	v_pk_min_i16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,1]
+D3885800 08020406	v_pk_min_i16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[1,0]
+D3884000 1801E501	v_pk_min_i16 v0, v1, 1.0
+D388C000 1801E501	v_pk_min_i16 v0, v1, 1.0 clamp
+D388D000 0001E501	v_pk_min_i16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[0,0] clamp
+D3884800 0001E501	v_pk_min_i16 v0, v1, 1.0 op_sel:[1,0] op_sel_hi:[0,0]
+D3884000 18010F01	v_pk_min_i16 v0, v1, 7
+D388C000 18010F01	v_pk_min_i16 v0, v1, 7 clamp
+D3885000 18010F01	v_pk_min_i16 v0, v1, 7 op_sel:[0,1]
+D3885000 00010F01	v_pk_min_i16 v0, v1, 7 op_sel:[0,1] op_sel_hi:[0,0]
+D3885800 08010F01	v_pk_min_i16 v0, v1, 7 op_sel:[1,1] op_sel_hi:[1,0]
+D3884000 18000B01	v_pk_min_i16 v0, v1, s5
+D388C000 18000B01	v_pk_min_i16 v0, v1, s5 clamp
+D388D000 08000B01	v_pk_min_i16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[1,0] clamp
+D3885800 00000B01	v_pk_min_i16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[0,0]
+D3884000 10000B01	v_pk_min_i16 v0, v1, s5 op_sel_hi:[0,1]
+D3884000 18020501	v_pk_min_i16 v0, v1, v2
+D388C000 18020501	v_pk_min_i16 v0, v1, v2 clamp
+D3885800 08020501	v_pk_min_i16 v0, v1, v2 op_sel:[1,1] op_sel_hi:[1,0]
+D3884000 10020501	v_pk_min_i16 v0, v1, v2 op_sel_hi:[0,1]
+D3884000 18020904	v_pk_min_i16 v0, v4, v4
+D388C000 18020904	v_pk_min_i16 v0, v4, v4 clamp
+D388D000 10020904	v_pk_min_i16 v0, v4, v4 op_sel:[0,1] op_sel_hi:[0,1] clamp
+D388C800 18020904	v_pk_min_i16 v0, v4, v4 op_sel:[1,0] clamp
+D38D4000 180204F5	v_pk_min_u16 v0, -2.0, v2
+D38DC000 180204F5	v_pk_min_u16 v0, -2.0, v2 clamp
+D38D5000 000204F5	v_pk_min_u16 v0, -2.0, v2 op_sel:[0,1] op_sel_hi:[0,0]
+D38D5000 080204F5	v_pk_min_u16 v0, -2.0, v2 op_sel:[0,1] op_sel_hi:[1,0]
+D38D5800 080204F5	v_pk_min_u16 v0, -2.0, v2 op_sel:[1,1] op_sel_hi:[1,0]
+D38D4000 180206F0	v_pk_min_u16 v0, 0.5, v3
+D38DC000 180206F0	v_pk_min_u16 v0, 0.5, v3 clamp
+D38D4800 000206F0	v_pk_min_u16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[0,0]
+D38DD800 000206F0	v_pk_min_u16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[0,0] clamp
+D38D4000 000206F0	v_pk_min_u16 v0, 0.5, v3 op_sel_hi:[0,0]
+D38D4000 18020406	v_pk_min_u16 v0, s6, v2
+D38DC000 18020406	v_pk_min_u16 v0, s6, v2 clamp
+D38DC000 08020406	v_pk_min_u16 v0, s6, v2 op_sel_hi:[1,0] clamp
+D38D4000 1801E501	v_pk_min_u16 v0, v1, 1.0
+D38DC000 1801E501	v_pk_min_u16 v0, v1, 1.0 clamp
+D38D4800 0001E501	v_pk_min_u16 v0, v1, 1.0 op_sel:[1,0] op_sel_hi:[0,0]
+D38D4000 0801E501	v_pk_min_u16 v0, v1, 1.0 op_sel_hi:[1,0]
+D38D4000 18010F01	v_pk_min_u16 v0, v1, 7
+D38DC000 18010F01	v_pk_min_u16 v0, v1, 7 clamp
+D38D4800 10010F01	v_pk_min_u16 v0, v1, 7 op_sel:[1,0] op_sel_hi:[0,1]
+D38DC800 08010F01	v_pk_min_u16 v0, v1, 7 op_sel:[1,0] op_sel_hi:[1,0] clamp
+D38D5800 10010F01	v_pk_min_u16 v0, v1, 7 op_sel:[1,1] op_sel_hi:[0,1]
+D38D4000 18000B01	v_pk_min_u16 v0, v1, s5
+D38DC000 18000B01	v_pk_min_u16 v0, v1, s5 clamp
+D38D4800 18000B01	v_pk_min_u16 v0, v1, s5 op_sel:[1,0]
+D38DC800 18000B01	v_pk_min_u16 v0, v1, s5 op_sel:[1,0] clamp
+D38D5800 10000B01	v_pk_min_u16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[0,1]
+D38D4000 18020501	v_pk_min_u16 v0, v1, v2
+D38DC000 18020501	v_pk_min_u16 v0, v1, v2 clamp
+D38D4800 00020501	v_pk_min_u16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,0]
+D38D5800 18020501	v_pk_min_u16 v0, v1, v2 op_sel:[1,1]
+D38D4000 18020904	v_pk_min_u16 v0, v4, v4
+D38DC000 18020904	v_pk_min_u16 v0, v4, v4 clamp
+D38D4800 00020904	v_pk_min_u16 v0, v4, v4 op_sel:[1,0] op_sel_hi:[0,0]
+D38D4000 08020904	v_pk_min_u16 v0, v4, v4 op_sel_hi:[1,0]
+D3908200 0815EAF5	v_pk_mul_f16 v0, -2.0, -2.0 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0] clamp
+D390F600 DBC1EAF5	v_pk_mul_f16 v0, -2.0, -2.0 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1] clamp
+D390BE00 C40900F5	v_pk_mul_f16 v0, -2.0, 0 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1] clamp
+D390D200 7201E0F5	v_pk_mul_f16 v0, -2.0, 0.5 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0] clamp
+D3903400 4C05E0F5	v_pk_mul_f16 v0, -2.0, 0.5 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D3900800 5BDDE4F5	v_pk_mul_f16 v0, -2.0, 1.0 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D3907400 A3DD06F5	v_pk_mul_f16 v0, -2.0, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D3904C00 DBC906F5	v_pk_mul_f16 v0, -2.0, 3 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1]
+D3904000 A0180AF5	v_pk_mul_f16 v0, -2.0, s5 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D3900300 50180AF5	v_pk_mul_f16 v0, -2.0, s5 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0]
+D3900C00 6BDC0AF5	v_pk_mul_f16 v0, -2.0, s5 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1]
+D3901A00 0A0202F5	v_pk_mul_f16 v0, -2.0, v1 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0]
+D3904000 180204F5	v_pk_mul_f16 v0, -2.0, v2
+D390C000 180204F5	v_pk_mul_f16 v0, -2.0, v2 clamp
+D3902100 C40604F5	v_pk_mul_f16 v0, -2.0, v2 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D3905000 380204F5	v_pk_mul_f16 v0, -2.0, v2 op_sel:[0,1] neg_lo:[1,0]
+D3905100 280204F5	v_pk_mul_f16 v0, -2.0, v2 op_sel:[0,1] op_sel_hi:[1,0] neg_lo:[1,0] neg_hi:[1,0]
+D3904F00 F41204F5	v_pk_mul_f16 v0, -2.0, v2 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D3904B00 780204F5	v_pk_mul_f16 v0, -2.0, v2 op_sel:[1,0] neg_lo:[1,1] neg_hi:[1,1]
+D3904B00 300204F5	v_pk_mul_f16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0] neg_hi:[1,1]
+D3904A00 680204F5	v_pk_mul_f16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[1,0] neg_lo:[1,1] neg_hi:[0,1]
+D3905B00 000204F5	v_pk_mul_f16 v0, -2.0, v2 op_sel:[1,1] op_sel_hi:[0,0] neg_hi:[1,1]
+D3905B00 480204F5	v_pk_mul_f16 v0, -2.0, v2 op_sel:[1,1] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[1,1]
+D3900600 E40A06F5	v_pk_mul_f16 v0, -2.0, v3 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D3904700 CA0208F5	v_pk_mul_f16 v0, -2.0, v4 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1]
+D3904300 03DDEAF7	v_pk_mul_f16 v0, -4.0, -2.0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D3900700 1015EAF7	v_pk_mul_f16 v0, -4.0, -2.0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D3908000 EBC1EAF7	v_pk_mul_f16 v0, -4.0, -2.0 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0] clamp
+D3901400 1C09EAF7	v_pk_mul_f16 v0, -4.0, -2.0 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D3903400 4BD5EAF7	v_pk_mul_f16 v0, -4.0, -2.0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D3908D00 33D5EEF7	v_pk_mul_f16 v0, -4.0, -4.0 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D3904B00 2C09EEF7	v_pk_mul_f16 v0, -4.0, -4.0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0]
+D3902900 4C0DEEF7	v_pk_mul_f16 v0, -4.0, -4.0 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D390BE00 BC09EEF7	v_pk_mul_f16 v0, -4.0, -4.0 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1] clamp
+D3904700 93D500F7	v_pk_mul_f16 v0, -4.0, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1]
+D3906700 4A0100F7	v_pk_mul_f16 v0, -4.0, 0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1]
+D3905100 081900F7	v_pk_mul_f16 v0, -4.0, 0 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0]
+D3900D00 6A0100F7	v_pk_mul_f16 v0, -4.0, 0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D3903E00 9A01E0F7	v_pk_mul_f16 v0, -4.0, 0.5 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3908700 2BC1E4F7	v_pk_mul_f16 v0, -4.0, 1.0 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1] clamp
+D390D000 FA01E4F7	v_pk_mul_f16 v0, -4.0, 1.0 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0] clamp
+D3906C00 1819E4F7	v_pk_mul_f16 v0, -4.0, 1.0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D390A900 93DD06F7	v_pk_mul_f16 v0, -4.0, 3 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0] clamp
+D3909900 FA0106F7	v_pk_mul_f16 v0, -4.0, 3 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0] clamp
+D3907800 2BDD06F7	v_pk_mul_f16 v0, -4.0, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D390A400 220C0AF7	v_pk_mul_f16 v0, -4.0, s5 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1] clamp
+D3906400 FA000AF7	v_pk_mul_f16 v0, -4.0, s5 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D3901800 53C00CF7	v_pk_mul_f16 v0, -4.0, s6 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D3904600 FA0E02F7	v_pk_mul_f16 v0, -4.0, v1 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D3906100 D81A02F7	v_pk_mul_f16 v0, -4.0, v1 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D3909700 940602F7	v_pk_mul_f16 v0, -4.0, v1 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 1] clamp
+D3908D00 2C0602F7	v_pk_mul_f16 v0, -4.0, v1 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D390BC00 341202F7	v_pk_mul_f16 v0, -4.0, v1 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1] clamp
+D3900E00 2A0E06F7	v_pk_mul_f16 v0, -4.0, v3 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 1]
+D3904900 ABCA06F7	v_pk_mul_f16 v0, -4.0, v3 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0]
+D3906300 C3DE08F7	v_pk_mul_f16 v0, -4.0, v4 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D3900A00 920E08F7	v_pk_mul_f16 v0, -4.0, v4 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0]
+D3901800 301608F7	v_pk_mul_f16 v0, -4.0, v4 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D3903600 1405EE80	v_pk_mul_f16 v0, 0, -4.0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D3907600 93DDEE80	v_pk_mul_f16 v0, 0, -4.0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3907400 B201EE80	v_pk_mul_f16 v0, 0, -4.0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D390DF00 D409EE80	v_pk_mul_f16 v0, 0, -4.0 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1] clamp
+D3905F00 7019EE80	v_pk_mul_f16 v0, 0, -4.0 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1]
+D390C500 6019E080	v_pk_mul_f16 v0, 0, 0.5 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1] clamp
+D390D400 FC05E080	v_pk_mul_f16 v0, 0, 0.5 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1] clamp
+D3907600 23D5E080	v_pk_mul_f16 v0, 0, 0.5 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 1]
+D3908800 D411E080	v_pk_mul_f16 v0, 0, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0] clamp
+D3904500 7BD5E480	v_pk_mul_f16 v0, 0, 1.0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D3900200 A4050680	v_pk_mul_f16 v0, 0, 3 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0]
+D3900600 D3C80A80	v_pk_mul_f16 v0, 0, s5 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D3907000 D8180A80	v_pk_mul_f16 v0, 0, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D3905200 98140C80	v_pk_mul_f16 v0, 0, s6 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0]
+D3909C00 3C100C80	v_pk_mul_f16 v0, 0, s6 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1] clamp
+D3909F00 3BC80C80	v_pk_mul_f16 v0, 0, s6 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1] clamp
+D3906200 901A0280	v_pk_mul_f16 v0, 0, v1 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0]
+D3902900 20160280	v_pk_mul_f16 v0, 0, v1 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0]
+D3906D00 ABCA0280	v_pk_mul_f16 v0, 0, v1 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D3907B00 12020480	v_pk_mul_f16 v0, 0, v2 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D3902800 82020680	v_pk_mul_f16 v0, 0, v3 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 0, 0]
+D3901D00 CBCA0680	v_pk_mul_f16 v0, 0, v3 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D390C000 03DE0880	v_pk_mul_f16 v0, 0, v4 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0] clamp
+D3904100 040E0880	v_pk_mul_f16 v0, 0, v4 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0]
+D3902300 EA020880	v_pk_mul_f16 v0, 0, v4 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D3905500 6BCA0880	v_pk_mul_f16 v0, 0, v4 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D3902500 B3C9EAF0	v_pk_mul_f16 v0, 0.5, -2.0 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1]
+D3908D00 CC09EAF0	v_pk_mul_f16 v0, 0.5, -2.0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1] clamp
+D3904A00 3A0DEAF0	v_pk_mul_f16 v0, 0.5, -2.0 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D3909F00 B015EAF0	v_pk_mul_f16 v0, 0.5, -2.0 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1] clamp
+D3900400 1C11EEF0	v_pk_mul_f16 v0, 0.5, -4.0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D3908300 C3C900F0	v_pk_mul_f16 v0, 0.5, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0] clamp
+D390C100 7A01E0F0	v_pk_mul_f16 v0, 0.5, 0.5 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0] clamp
+D3900D00 7BC9E0F0	v_pk_mul_f16 v0, 0.5, 0.5 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1]
+D3906F00 0BDDE0F0	v_pk_mul_f16 v0, 0.5, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D390DE00 DC05E0F0	v_pk_mul_f16 v0, 0.5, 0.5 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1] clamp
+D3905C00 2409E4F0	v_pk_mul_f16 v0, 0.5, 1.0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D3900A00 D40906F0	v_pk_mul_f16 v0, 0.5, 3 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D3900F00 B40906F0	v_pk_mul_f16 v0, 0.5, 3 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1]
+D3908D00 22000AF0	v_pk_mul_f16 v0, 0.5, s5 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D3906300 14040CF0	v_pk_mul_f16 v0, 0.5, s6 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D3902800 58140CF0	v_pk_mul_f16 v0, 0.5, s6 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D3901C00 C0180CF0	v_pk_mul_f16 v0, 0.5, s6 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1]
+D3902B00 B3C202F0	v_pk_mul_f16 v0, 0.5, v1 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D3905E00 6C0E04F0	v_pk_mul_f16 v0, 0.5, v2 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D3904000 180206F0	v_pk_mul_f16 v0, 0.5, v3
+D390C000 180206F0	v_pk_mul_f16 v0, 0.5, v3 clamp
+D3908500 23DE06F0	v_pk_mul_f16 v0, 0.5, v3 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D390D200 380206F0	v_pk_mul_f16 v0, 0.5, v3 op_sel:[0,1] neg_lo:[1,0] neg_hi:[0,1] clamp
+D3905300 100206F0	v_pk_mul_f16 v0, 0.5, v3 op_sel:[0,1] op_sel_hi:[0,1] neg_hi:[1,1]
+D3903B00 EC0606F0	v_pk_mul_f16 v0, 0.5, v3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D390C900 580206F0	v_pk_mul_f16 v0, 0.5, v3 op_sel:[1,0] neg_lo:[0,1] neg_hi:[1,0] clamp
+D3905B00 200206F0	v_pk_mul_f16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[0,0] neg_lo:[1,0] neg_hi:[1,1]
+D3905800 600206F0	v_pk_mul_f16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[0,0] neg_lo:[1,1]
+D3904300 000206F0	v_pk_mul_f16 v0, 0.5, v3 op_sel_hi:[0,0] neg_hi:[1,1]
+D3904200 100206F0	v_pk_mul_f16 v0, 0.5, v3 op_sel_hi:[0,1] neg_hi:[0,1]
+D3906600 B20E08F0	v_pk_mul_f16 v0, 0.5, v4 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1]
+D3901600 83CA08F0	v_pk_mul_f16 v0, 0.5, v4 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3900C00 5C0E08F0	v_pk_mul_f16 v0, 0.5, v4 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D390A300 63C1EAF2	v_pk_mul_f16 v0, 1.0, -2.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0] clamp
+D3900C00 2405EAF2	v_pk_mul_f16 v0, 1.0, -2.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 1]
+D390CE00 6201EAF2	v_pk_mul_f16 v0, 1.0, -2.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D390CD00 63C1EEF2	v_pk_mul_f16 v0, 1.0, -4.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1] clamp
+D3902F00 DC05EEF2	v_pk_mul_f16 v0, 1.0, -4.0 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 1]
+D3903100 481900F2	v_pk_mul_f16 v0, 1.0, 0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D390FD00 201500F2	v_pk_mul_f16 v0, 1.0, 0 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1] clamp
+D390F500 7C0DE0F2	v_pk_mul_f16 v0, 1.0, 0.5 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1] clamp
+D3901500 93C9E4F2	v_pk_mul_f16 v0, 1.0, 1.0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1]
+D3903000 B819E4F2	v_pk_mul_f16 v0, 1.0, 1.0 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D3905A00 6C09E4F2	v_pk_mul_f16 v0, 1.0, 1.0 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D390B500 EBDC0AF2	v_pk_mul_f16 v0, 1.0, s5 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1] clamp
+D3901A00 63DC0CF2	v_pk_mul_f16 v0, 1.0, s6 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D3901200 0BDE02F2	v_pk_mul_f16 v0, 1.0, v1 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 1, 0]
+D3904800 501A04F2	v_pk_mul_f16 v0, 1.0, v2 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D3909C00 C81A06F2	v_pk_mul_f16 v0, 1.0, v3 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1] clamp
+D3905C00 4C0608F2	v_pk_mul_f16 v0, 1.0, v4 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D3901300 63C9EA83	v_pk_mul_f16 v0, 3, -2.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 0]
+D3908700 7C11EE83	v_pk_mul_f16 v0, 3, -4.0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1] clamp
+D3902B00 9015EE83	v_pk_mul_f16 v0, 3, -4.0 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[1, 1, 0]
+D390FD00 BBC1EE83	v_pk_mul_f16 v0, 3, -4.0 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 1] clamp
+D3906200 5A0DE083	v_pk_mul_f16 v0, 3, 0.5 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D3900900 7405E083	v_pk_mul_f16 v0, 3, 0.5 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0]
+D3900800 2A0DE083	v_pk_mul_f16 v0, 3, 0.5 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D3904C00 A20DE483	v_pk_mul_f16 v0, 3, 1.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D3900100 8BDD0683	v_pk_mul_f16 v0, 3, 3 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0]
+D3902500 F3C10683	v_pk_mul_f16 v0, 3, 3 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D390DD00 D20C0C83	v_pk_mul_f16 v0, 3, s6 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1] clamp
+D3903F00 EC060283	v_pk_mul_f16 v0, 3, v1 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 1, 1]
+D3909300 AC0E0683	v_pk_mul_f16 v0, 3, v3 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0] clamp
+D3906E00 9A020683	v_pk_mul_f16 v0, 3, v3 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D390D200 28160883	v_pk_mul_f16 v0, 3, v4 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0] clamp
+D390EE00 6A020883	v_pk_mul_f16 v0, 3, v4 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D390EA00 B3D5EA05	v_pk_mul_f16 v0, s5, -2.0 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0] clamp
+D3904100 EA0DEE05	v_pk_mul_f16 v0, s5, -4.0 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0]
+D390BF00 3A0DEE05	v_pk_mul_f16 v0, s5, -4.0 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1] clamp
+D3908100 E3D50005	v_pk_mul_f16 v0, s5, 0 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0] clamp
+D3901200 F0150005	v_pk_mul_f16 v0, s5, 0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0]
+D3900F00 34050005	v_pk_mul_f16 v0, s5, 0 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1]
+D390AB00 00190005	v_pk_mul_f16 v0, s5, 0 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0] clamp
+D390AF00 50190005	v_pk_mul_f16 v0, s5, 0 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1] clamp
+D390C100 3BD5E405	v_pk_mul_f16 v0, s5, 1.0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 0] clamp
+D3905A00 D015E405	v_pk_mul_f16 v0, s5, 1.0 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D3901E00 6BC1E405	v_pk_mul_f16 v0, s5, 1.0 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1]
+D3900B00 3C050605	v_pk_mul_f16 v0, s5, 3 op_sel:[1, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0]
+D3906E00 1BC90605	v_pk_mul_f16 v0, s5, 3 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[0, 1, 1]
+D3902400 03C80A05	v_pk_mul_f16 v0, s5, s5 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1]
+D3906200 3C0C0A05	v_pk_mul_f16 v0, s5, s5 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D3905400 F4080A05	v_pk_mul_f16 v0, s5, s5 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D3909000 18140A05	v_pk_mul_f16 v0, s5, s5 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0] clamp
+D390DE00 54100A05	v_pk_mul_f16 v0, s5, s5 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1] clamp
+D390B900 54080A05	v_pk_mul_f16 v0, s5, s5 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0] clamp
+D3905800 C8160205	v_pk_mul_f16 v0, s5, v1 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D3909600 78160605	v_pk_mul_f16 v0, s5, v3 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D3907100 540A0605	v_pk_mul_f16 v0, s5, v3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D3907100 9A0E0605	v_pk_mul_f16 v0, s5, v3 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0]
+D390D800 C4120605	v_pk_mul_f16 v0, s5, v3 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0] clamp
+D3905C00 981A0605	v_pk_mul_f16 v0, s5, v3 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D3906700 301A0805	v_pk_mul_f16 v0, s5, v4 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1]
+D3905200 C01A0805	v_pk_mul_f16 v0, s5, v4 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D3903500 03C20805	v_pk_mul_f16 v0, s5, v4 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D390AC00 0A0DEA06	v_pk_mul_f16 v0, s6, -2.0 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 1] clamp
+D390EF00 1201EE06	v_pk_mul_f16 v0, s6, -4.0 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1] clamp
+D3902500 CA010006	v_pk_mul_f16 v0, s6, 0 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D3904100 A405E006	v_pk_mul_f16 v0, s6, 0.5 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0]
+D3905A00 5409E006	v_pk_mul_f16 v0, s6, 0.5 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D3902200 43C9E406	v_pk_mul_f16 v0, s6, 1.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D390D500 9C11E406	v_pk_mul_f16 v0, s6, 1.0 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[1, 0, 1] clamp
+D390F600 F20D0606	v_pk_mul_f16 v0, s6, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1] clamp
+D390FE00 6C110606	v_pk_mul_f16 v0, s6, 3 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 1] clamp
+D390FF00 A40C0A06	v_pk_mul_f16 v0, s6, s5 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1] clamp
+D3907600 DBD40C06	v_pk_mul_f16 v0, s6, s6 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 1]
+D390D300 E01A0206	v_pk_mul_f16 v0, s6, v1 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0] clamp
+D3904000 18020406	v_pk_mul_f16 v0, s6, v2
+D390C000 18020406	v_pk_mul_f16 v0, s6, v2 clamp
+D3904100 58020406	v_pk_mul_f16 v0, s6, v2 neg_lo:[0,1] neg_hi:[1,0]
+D3903600 EBCA0406	v_pk_mul_f16 v0, s6, v2 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D3905200 18020406	v_pk_mul_f16 v0, s6, v2 op_sel:[0,1] neg_hi:[0,1]
+D3905300 40020406	v_pk_mul_f16 v0, s6, v2 op_sel:[0,1] op_sel_hi:[0,0] neg_lo:[0,1] neg_hi:[1,1]
+D3905000 68020406	v_pk_mul_f16 v0, s6, v2 op_sel:[0,1] op_sel_hi:[1,0] neg_lo:[1,1]
+D390CA00 20020406	v_pk_mul_f16 v0, s6, v2 op_sel:[1,0] op_sel_hi:[0,0] neg_lo:[1,0] neg_hi:[0,1] clamp
+D3904800 70020406	v_pk_mul_f16 v0, s6, v2 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,1]
+D3904900 28020406	v_pk_mul_f16 v0, s6, v2 op_sel:[1,0] op_sel_hi:[1,0] neg_lo:[1,0] neg_hi:[1,0]
+D3905B00 60020406	v_pk_mul_f16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,0] neg_lo:[1,1] neg_hi:[1,1]
+D3903300 DA0E0806	v_pk_mul_f16 v0, s6, v4 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[1, 1, 0]
+D390C100 6A0DEB01	v_pk_mul_f16 v0, v1, -2.0 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0] clamp
+D3901300 5411EB01	v_pk_mul_f16 v0, v1, -2.0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0]
+D3901600 8A0DEB01	v_pk_mul_f16 v0, v1, -2.0 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3907B00 220DEB01	v_pk_mul_f16 v0, v1, -2.0 op_sel:[1, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 0] neg_hi:[1, 1, 0]
+D3901C00 E3DDEF01	v_pk_mul_f16 v0, v1, -4.0 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D3901700 540DE101	v_pk_mul_f16 v0, v1, 0.5 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1]
+D3907400 8405E101	v_pk_mul_f16 v0, v1, 0.5 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 0, 1]
+D3903B00 0BD5E101	v_pk_mul_f16 v0, v1, 0.5 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 0] neg_hi:[1, 1, 0]
+D3904000 1801E501	v_pk_mul_f16 v0, v1, 1.0
+D390C000 1801E501	v_pk_mul_f16 v0, v1, 1.0 clamp
+D3905700 6201E501	v_pk_mul_f16 v0, v1, 1.0 op_sel:[0, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 0] neg_hi:[1, 1, 1]
+D390B500 6BD5E501	v_pk_mul_f16 v0, v1, 1.0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1] clamp
+D3905300 6001E501	v_pk_mul_f16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[0,0] neg_lo:[1,1] neg_hi:[1,1]
+D3905000 5001E501	v_pk_mul_f16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[0,1] neg_lo:[0,1]
+D390D200 7001E501	v_pk_mul_f16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[0,1] neg_lo:[1,1] neg_hi:[0,1] clamp
+D3907C00 ABC1E501	v_pk_mul_f16 v0, v1, 1.0 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D390C900 0001E501	v_pk_mul_f16 v0, v1, 1.0 op_sel:[1,0] op_sel_hi:[0,0] neg_hi:[1,0] clamp
+D3904A00 4801E501	v_pk_mul_f16 v0, v1, 1.0 op_sel:[1,0] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+D3905B00 1801E501	v_pk_mul_f16 v0, v1, 1.0 op_sel:[1,1] neg_hi:[1,1]
+D3905A00 3801E501	v_pk_mul_f16 v0, v1, 1.0 op_sel:[1,1] neg_lo:[1,0] neg_hi:[0,1]
+D3904100 5001E501	v_pk_mul_f16 v0, v1, 1.0 op_sel_hi:[0,1] neg_lo:[0,1] neg_hi:[1,0]
+D3904D00 13C90701	v_pk_mul_f16 v0, v1, 3 op_sel:[1, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 1]
+D3904000 18010F01	v_pk_mul_f16 v0, v1, 7
+D390C000 18010F01	v_pk_mul_f16 v0, v1, 7 clamp
+D390D200 20010F01	v_pk_mul_f16 v0, v1, 7 op_sel:[0,1] op_sel_hi:[0,0] neg_lo:[1,0] neg_hi:[0,1] clamp
+D3905000 08010F01	v_pk_mul_f16 v0, v1, 7 op_sel:[0,1] op_sel_hi:[1,0]
+D3905900 38010F01	v_pk_mul_f16 v0, v1, 7 op_sel:[1,1] neg_lo:[1,0] neg_hi:[1,0]
+D3905B00 30010F01	v_pk_mul_f16 v0, v1, 7 op_sel:[1,1] op_sel_hi:[0,1] neg_lo:[1,0] neg_hi:[1,1]
+D3905A00 68010F01	v_pk_mul_f16 v0, v1, 7 op_sel:[1,1] op_sel_hi:[1,0] neg_lo:[1,1] neg_hi:[0,1]
+D3904100 28010F01	v_pk_mul_f16 v0, v1, 7 op_sel_hi:[1,0] neg_lo:[1,0] neg_hi:[1,0]
+D3904000 18000B01	v_pk_mul_f16 v0, v1, s5
+D390C000 18000B01	v_pk_mul_f16 v0, v1, s5 clamp
+D3903100 83C00B01	v_pk_mul_f16 v0, v1, s5 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[1, 0, 0]
+D3905100 00000B01	v_pk_mul_f16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[0,0] neg_hi:[1,0]
+D390D300 00000B01	v_pk_mul_f16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[0,0] neg_hi:[1,1] clamp
+D3905100 50000B01	v_pk_mul_f16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[0,1] neg_lo:[0,1] neg_hi:[1,0]
+D3905900 40000B01	v_pk_mul_f16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[0,0] neg_lo:[0,1] neg_hi:[1,0]
+D390DA00 50000B01	v_pk_mul_f16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[0,1] neg_lo:[0,1] neg_hi:[0,1] clamp
+D3904000 20000B01	v_pk_mul_f16 v0, v1, s5 op_sel_hi:[0,0] neg_lo:[1,0]
+D390C100 60000B01	v_pk_mul_f16 v0, v1, s5 op_sel_hi:[0,0] neg_lo:[1,1] neg_hi:[1,0] clamp
+D3904100 08000B01	v_pk_mul_f16 v0, v1, s5 op_sel_hi:[1,0] neg_hi:[1,0]
+D3907100 D8180D01	v_pk_mul_f16 v0, v1, s6 op_sel:[0, 1, 1] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D3903600 8C0E0301	v_pk_mul_f16 v0, v1, v1 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3904000 18020501	v_pk_mul_f16 v0, v1, v2
+D390C000 18020501	v_pk_mul_f16 v0, v1, v2 clamp
+D3904200 78020501	v_pk_mul_f16 v0, v1, v2 neg_lo:[1,1] neg_hi:[0,1]
+D3905500 33DE0501	v_pk_mul_f16 v0, v1, v2 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 0, 1]
+D3905000 58020501	v_pk_mul_f16 v0, v1, v2 op_sel:[0,1] neg_lo:[0,1]
+D3905300 28020501	v_pk_mul_f16 v0, v1, v2 op_sel:[0,1] op_sel_hi:[1,0] neg_lo:[1,0] neg_hi:[1,1]
+D3904B00 58020501	v_pk_mul_f16 v0, v1, v2 op_sel:[1,0] neg_lo:[0,1] neg_hi:[1,1]
+D390CA00 40020501	v_pk_mul_f16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,0] neg_lo:[0,1] neg_hi:[0,1] clamp
+D3905A00 08020501	v_pk_mul_f16 v0, v1, v2 op_sel:[1,1] op_sel_hi:[1,0] neg_hi:[0,1]
+D3904000 70020501	v_pk_mul_f16 v0, v1, v2 op_sel_hi:[0,1] neg_lo:[1,1]
+D3904000 08020501	v_pk_mul_f16 v0, v1, v2 op_sel_hi:[1,0]
+D3909100 6C120701	v_pk_mul_f16 v0, v1, v3 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0] clamp
+D3901500 CA020901	v_pk_mul_f16 v0, v1, v4 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1]
+D3905600 8BC20901	v_pk_mul_f16 v0, v1, v4 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D390C100 D015EB02	v_pk_mul_f16 v0, v2, -2.0 op_sel:[0, 0, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0] clamp
+D3905000 1C05EF02	v_pk_mul_f16 v0, v2, -4.0 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D3907100 73DDEF02	v_pk_mul_f16 v0, v2, -4.0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0]
+D3902400 B20D0102	v_pk_mul_f16 v0, v2, 0 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D3900800 AA0DE102	v_pk_mul_f16 v0, v2, 0.5 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D3905A00 9BC1E102	v_pk_mul_f16 v0, v2, 0.5 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0]
+D3903800 6BC9E502	v_pk_mul_f16 v0, v2, 1.0 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[0, 0, 0]
+D3900700 4BC90702	v_pk_mul_f16 v0, v2, 3 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 1, 1]
+D390FF00 33C90702	v_pk_mul_f16 v0, v2, 3 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 0] neg_hi:[1, 1, 1] clamp
+D390E300 E3C80B02	v_pk_mul_f16 v0, v2, s5 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0] clamp
+D3905800 C2000B02	v_pk_mul_f16 v0, v2, s5 op_sel:[1, 1, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D3905400 DC080D02	v_pk_mul_f16 v0, v2, s6 op_sel:[0, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1]
+D3903600 8C040D02	v_pk_mul_f16 v0, v2, s6 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 1]
+D3906F00 A0140D02	v_pk_mul_f16 v0, v2, s6 op_sel:[1, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1]
+D3907800 ABD40D02	v_pk_mul_f16 v0, v2, s6 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0]
+D3903000 02020502	v_pk_mul_f16 v0, v2, v2 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0]
+D390C000 EA0E0702	v_pk_mul_f16 v0, v2, v3 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0] clamp
+D3905200 740A0702	v_pk_mul_f16 v0, v2, v3 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[1, 1, 0] neg_hi:[0, 1, 0]
+D3905200 4A020702	v_pk_mul_f16 v0, v2, v3 op_sel:[0, 1, 0] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D3902000 340A0902	v_pk_mul_f16 v0, v2, v4 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0]
+D3909400 F20E0902	v_pk_mul_f16 v0, v2, v4 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1] clamp
+D3900D00 43D60902	v_pk_mul_f16 v0, v2, v4 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D390CC00 C3CA0902	v_pk_mul_f16 v0, v2, v4 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 1] clamp
+D3903C00 7819EB03	v_pk_mul_f16 v0, v3, -2.0 op_sel:[1, 1, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 1, 0] neg_hi:[0, 0, 1]
+D3900400 EC0DEF03	v_pk_mul_f16 v0, v3, -4.0 op_sel:[0, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D3907500 4BC9EF03	v_pk_mul_f16 v0, v3, -4.0 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D390A100 1BD50103	v_pk_mul_f16 v0, v3, 0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0] clamp
+D3903500 43DD0103	v_pk_mul_f16 v0, v3, 0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D3907300 50190103	v_pk_mul_f16 v0, v3, 0 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 1, 0]
+D3900F00 A8190103	v_pk_mul_f16 v0, v3, 0 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1]
+D3906A00 B3C1E103	v_pk_mul_f16 v0, v3, 0.5 op_sel:[1, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0]
+D3906A00 C819E103	v_pk_mul_f16 v0, v3, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D3900200 DC09E503	v_pk_mul_f16 v0, v3, 1.0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 1] neg_hi:[0, 1, 0]
+D3906100 D20DE503	v_pk_mul_f16 v0, v3, 1.0 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 0]
+D3902200 5BDDE503	v_pk_mul_f16 v0, v3, 1.0 op_sel:[0, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D3904C00 4405E503	v_pk_mul_f16 v0, v3, 1.0 op_sel:[1, 0, 0] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1]
+D3907400 A40D0703	v_pk_mul_f16 v0, v3, 3 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[0, 0, 1]
+D3907200 53D40D03	v_pk_mul_f16 v0, v3, s6 op_sel:[0, 1, 1] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 0]
+D3903300 A8180D03	v_pk_mul_f16 v0, v3, s6 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[1, 1, 0]
+D390B500 6C060303	v_pk_mul_f16 v0, v3, v1 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 1] clamp
+D3907300 E81A0303	v_pk_mul_f16 v0, v3, v1 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 1, 1] neg_hi:[1, 1, 0]
+D3909800 ABDE0503	v_pk_mul_f16 v0, v3, v2 op_sel:[1, 1, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 1] neg_hi:[0, 0, 0] clamp
+D3905E00 BA0E0503	v_pk_mul_f16 v0, v3, v2 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[1, 0, 1] neg_hi:[0, 1, 1]
+D3900200 83CA0703	v_pk_mul_f16 v0, v3, v3 op_sel:[0, 0, 0] op_sel_hi:[0, 0, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0]
+D3906100 040E0703	v_pk_mul_f16 v0, v3, v3 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 0, 0]
+D390A900 E81A0703	v_pk_mul_f16 v0, v3, v3 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 0] clamp
+D3902800 4BDE0903	v_pk_mul_f16 v0, v3, v4 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[0, 0, 0]
+D390E700 A40DEB04	v_pk_mul_f16 v0, v4, -2.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 0, 1] neg_hi:[1, 1, 1] clamp
+D3906600 E3C1EB04	v_pk_mul_f16 v0, v4, -2.0 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 1] neg_lo:[1, 1, 1] neg_hi:[0, 1, 1]
+D3905600 53C9EB04	v_pk_mul_f16 v0, v4, -2.0 op_sel:[0, 1, 0] op_sel_hi:[0, 1, 1] neg_lo:[0, 1, 0] neg_hi:[0, 1, 1]
+D3907000 C20DEB04	v_pk_mul_f16 v0, v4, -2.0 op_sel:[0, 1, 1] op_sel_hi:[0, 0, 1] neg_lo:[0, 1, 1] neg_hi:[0, 0, 0]
+D390E800 2C05E104	v_pk_mul_f16 v0, v4, 0.5 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[1, 0, 0] neg_hi:[0, 0, 0] clamp
+D3907F00 0A0DE104	v_pk_mul_f16 v0, v4, 0.5 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 0, 0] neg_hi:[1, 1, 1]
+D3904500 5C0DE504	v_pk_mul_f16 v0, v4, 1.0 op_sel:[0, 0, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 1, 0] neg_hi:[1, 0, 1]
+D3902200 94050704	v_pk_mul_f16 v0, v4, 3 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[0, 0, 1] neg_hi:[0, 1, 0]
+D390AA00 BA0C0B04	v_pk_mul_f16 v0, v4, s5 op_sel:[1, 0, 1] op_sel_hi:[1, 1, 0] neg_lo:[1, 0, 1] neg_hi:[0, 1, 0] clamp
+D3901800 F3DC0B04	v_pk_mul_f16 v0, v4, s5 op_sel:[1, 1, 0] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 0]
+D3902400 E20C0D04	v_pk_mul_f16 v0, v4, s6 op_sel:[0, 0, 1] op_sel_hi:[0, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 0, 1]
+D390EC00 4C100D04	v_pk_mul_f16 v0, v4, s6 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 0] neg_hi:[0, 0, 1] clamp
+D3902500 E81A0304	v_pk_mul_f16 v0, v4, v1 op_sel:[0, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[1, 0, 1]
+D3903900 740E0304	v_pk_mul_f16 v0, v4, v1 op_sel:[1, 1, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 1, 0] neg_hi:[1, 0, 0]
+D390F500 CC060704	v_pk_mul_f16 v0, v4, v3 op_sel:[0, 1, 1] op_sel_hi:[1, 0, 1] neg_lo:[0, 1, 1] neg_hi:[1, 0, 1] clamp
+D3900A00 EA020704	v_pk_mul_f16 v0, v4, v3 op_sel:[1, 0, 0] op_sel_hi:[1, 0, 0] neg_lo:[1, 1, 1] neg_hi:[0, 1, 0]
+D3902A00 2BDE0704	v_pk_mul_f16 v0, v4, v3 op_sel:[1, 0, 1] op_sel_hi:[1, 0, 0] neg_lo:[1, 0, 0] neg_hi:[0, 1, 0]
+D3904000 18020904	v_pk_mul_f16 v0, v4, v4
+D390C000 18020904	v_pk_mul_f16 v0, v4, v4 clamp
+D390A100 B20E0904	v_pk_mul_f16 v0, v4, v4 op_sel:[0, 0, 1] op_sel_hi:[0, 1, 0] neg_lo:[1, 0, 1] neg_hi:[1, 0, 0] clamp
+D390D300 68020904	v_pk_mul_f16 v0, v4, v4 op_sel:[0,1] op_sel_hi:[1,0] neg_lo:[1,1] neg_hi:[1,1] clamp
+D390D800 1BCA0904	v_pk_mul_f16 v0, v4, v4 op_sel:[1, 1, 0] op_sel_hi:[1, 1, 1] neg_lo:[0, 0, 0] neg_hi:[0, 0, 0] clamp
+D3903900 4C120904	v_pk_mul_f16 v0, v4, v4 op_sel:[1, 1, 1] op_sel_hi:[1, 0, 0] neg_lo:[0, 1, 0] neg_hi:[1, 0, 0]
+D390C900 78020904	v_pk_mul_f16 v0, v4, v4 op_sel:[1,0] neg_lo:[1,1] neg_hi:[1,0] clamp
+D3904900 40020904	v_pk_mul_f16 v0, v4, v4 op_sel:[1,0] op_sel_hi:[0,0] neg_lo:[0,1] neg_hi:[1,0]
+D3904B00 08020904	v_pk_mul_f16 v0, v4, v4 op_sel:[1,0] op_sel_hi:[1,0] neg_hi:[1,1]
+D3904B00 68020904	v_pk_mul_f16 v0, v4, v4 op_sel:[1,0] op_sel_hi:[1,0] neg_lo:[1,1] neg_hi:[1,1]
+D3905A00 00020904	v_pk_mul_f16 v0, v4, v4 op_sel:[1,1] op_sel_hi:[0,0] neg_hi:[0,1]
+D3905800 40020904	v_pk_mul_f16 v0, v4, v4 op_sel:[1,1] op_sel_hi:[0,0] neg_lo:[0,1]
+D3814000 180204F5	v_pk_mul_lo_u16 v0, -2.0, v2
+D381C000 180204F5	v_pk_mul_lo_u16 v0, -2.0, v2 clamp
+D381D000 080204F5	v_pk_mul_lo_u16 v0, -2.0, v2 op_sel:[0,1] op_sel_hi:[1,0] clamp
+D3814800 000204F5	v_pk_mul_lo_u16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,0]
+D3815800 000204F5	v_pk_mul_lo_u16 v0, -2.0, v2 op_sel:[1,1] op_sel_hi:[0,0]
+D3814000 180206F0	v_pk_mul_lo_u16 v0, 0.5, v3
+D381C000 180206F0	v_pk_mul_lo_u16 v0, 0.5, v3 clamp
+D381D000 100206F0	v_pk_mul_lo_u16 v0, 0.5, v3 op_sel:[0,1] op_sel_hi:[0,1] clamp
+D3814000 000206F0	v_pk_mul_lo_u16 v0, 0.5, v3 op_sel_hi:[0,0]
+D3814000 18020406	v_pk_mul_lo_u16 v0, s6, v2
+D381C000 18020406	v_pk_mul_lo_u16 v0, s6, v2 clamp
+D3815000 18020406	v_pk_mul_lo_u16 v0, s6, v2 op_sel:[0,1]
+D3815800 10020406	v_pk_mul_lo_u16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,1]
+D381C000 00020406	v_pk_mul_lo_u16 v0, s6, v2 op_sel_hi:[0,0] clamp
+D3814000 1801E501	v_pk_mul_lo_u16 v0, v1, 1.0
+D381C000 1801E501	v_pk_mul_lo_u16 v0, v1, 1.0 clamp
+D381D000 0801E501	v_pk_mul_lo_u16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[1,0] clamp
+D381C000 0801E501	v_pk_mul_lo_u16 v0, v1, 1.0 op_sel_hi:[1,0] clamp
+D3814000 18010F01	v_pk_mul_lo_u16 v0, v1, 7
+D381C000 18010F01	v_pk_mul_lo_u16 v0, v1, 7 clamp
+D3815800 18010F01	v_pk_mul_lo_u16 v0, v1, 7 op_sel:[1,1]
+D3814000 00010F01	v_pk_mul_lo_u16 v0, v1, 7 op_sel_hi:[0,0]
+D3814000 08010F01	v_pk_mul_lo_u16 v0, v1, 7 op_sel_hi:[1,0]
+D3814000 18000B01	v_pk_mul_lo_u16 v0, v1, s5
+D381C000 18000B01	v_pk_mul_lo_u16 v0, v1, s5 clamp
+D381C800 00000B01	v_pk_mul_lo_u16 v0, v1, s5 op_sel:[1,0] op_sel_hi:[0,0] clamp
+D3815800 10000B01	v_pk_mul_lo_u16 v0, v1, s5 op_sel:[1,1] op_sel_hi:[0,1]
+D3814000 10000B01	v_pk_mul_lo_u16 v0, v1, s5 op_sel_hi:[0,1]
+D3814000 18020501	v_pk_mul_lo_u16 v0, v1, v2
+D381C000 18020501	v_pk_mul_lo_u16 v0, v1, v2 clamp
+D3815000 18020501	v_pk_mul_lo_u16 v0, v1, v2 op_sel:[0,1]
+D3814800 00020501	v_pk_mul_lo_u16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,0]
+D3814000 18020904	v_pk_mul_lo_u16 v0, v4, v4
+D381C000 18020904	v_pk_mul_lo_u16 v0, v4, v4 clamp
+D381D000 18020904	v_pk_mul_lo_u16 v0, v4, v4 op_sel:[0,1] clamp
+D3814800 08020904	v_pk_mul_lo_u16 v0, v4, v4 op_sel:[1,0] op_sel_hi:[1,0]
+D3815800 00020904	v_pk_mul_lo_u16 v0, v4, v4 op_sel:[1,1] op_sel_hi:[0,0]
+D3834000 180204F5	v_pk_sub_i16 v0, -2.0, v2
+D383C000 180204F5	v_pk_sub_i16 v0, -2.0, v2 clamp
+D3835000 000204F5	v_pk_sub_i16 v0, -2.0, v2 op_sel:[0,1] op_sel_hi:[0,0]
+D3835000 080204F5	v_pk_sub_i16 v0, -2.0, v2 op_sel:[0,1] op_sel_hi:[1,0]
+D3834800 180204F5	v_pk_sub_i16 v0, -2.0, v2 op_sel:[1,0]
+D3834000 180206F0	v_pk_sub_i16 v0, 0.5, v3
+D383C000 180206F0	v_pk_sub_i16 v0, 0.5, v3 clamp
+D3835000 100206F0	v_pk_sub_i16 v0, 0.5, v3 op_sel:[0,1] op_sel_hi:[0,1]
+D3835800 080206F0	v_pk_sub_i16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[1,0]
+D3834000 000206F0	v_pk_sub_i16 v0, 0.5, v3 op_sel_hi:[0,0]
+D3834000 18020406	v_pk_sub_i16 v0, s6, v2
+D383C000 18020406	v_pk_sub_i16 v0, s6, v2 clamp
+D3835000 18020406	v_pk_sub_i16 v0, s6, v2 op_sel:[0,1]
+D3834800 00020406	v_pk_sub_i16 v0, s6, v2 op_sel:[1,0] op_sel_hi:[0,0]
+D3834000 1801E501	v_pk_sub_i16 v0, v1, 1.0
+D383C000 1801E501	v_pk_sub_i16 v0, v1, 1.0 clamp
+D3835000 0001E501	v_pk_sub_i16 v0, v1, 1.0 op_sel:[0,1] op_sel_hi:[0,0]
+D3834800 1801E501	v_pk_sub_i16 v0, v1, 1.0 op_sel:[1,0]
+D3834000 18010F01	v_pk_sub_i16 v0, v1, 7
+D383C000 18010F01	v_pk_sub_i16 v0, v1, 7 clamp
+D3834800 18010F01	v_pk_sub_i16 v0, v1, 7 op_sel:[1,0]
+D3834000 00010F01	v_pk_sub_i16 v0, v1, 7 op_sel_hi:[0,0]
+D3834000 18000B01	v_pk_sub_i16 v0, v1, s5
+D383C000 18000B01	v_pk_sub_i16 v0, v1, s5 clamp
+D383D000 18000B01	v_pk_sub_i16 v0, v1, s5 op_sel:[0,1] clamp
+D3835000 08000B01	v_pk_sub_i16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[1,0]
+D383C800 08000B01	v_pk_sub_i16 v0, v1, s5 op_sel:[1,0] op_sel_hi:[1,0] clamp
+D3834000 18020501	v_pk_sub_i16 v0, v1, v2
+D383C000 18020501	v_pk_sub_i16 v0, v1, v2 clamp
+D383C800 18020501	v_pk_sub_i16 v0, v1, v2 op_sel:[1,0] clamp
+D3835800 08020501	v_pk_sub_i16 v0, v1, v2 op_sel:[1,1] op_sel_hi:[1,0]
+D3834000 18020904	v_pk_sub_i16 v0, v4, v4
+D383C000 18020904	v_pk_sub_i16 v0, v4, v4 clamp
+D3835000 00020904	v_pk_sub_i16 v0, v4, v4 op_sel:[0,1] op_sel_hi:[0,0]
+D3834000 00020904	v_pk_sub_i16 v0, v4, v4 op_sel_hi:[0,0]
+D3834000 10020904	v_pk_sub_i16 v0, v4, v4 op_sel_hi:[0,1]
+D38B4000 180204F5	v_pk_sub_u16 v0, -2.0, v2
+D38BC000 180204F5	v_pk_sub_u16 v0, -2.0, v2 clamp
+D38B5000 180204F5	v_pk_sub_u16 v0, -2.0, v2 op_sel:[0,1]
+D38B4800 180204F5	v_pk_sub_u16 v0, -2.0, v2 op_sel:[1,0]
+D38B4800 000204F5	v_pk_sub_u16 v0, -2.0, v2 op_sel:[1,0] op_sel_hi:[0,0]
+D38B4000 180206F0	v_pk_sub_u16 v0, 0.5, v3
+D38BC000 180206F0	v_pk_sub_u16 v0, 0.5, v3 clamp
+D38B5000 100206F0	v_pk_sub_u16 v0, 0.5, v3 op_sel:[0,1] op_sel_hi:[0,1]
+D38BC800 000206F0	v_pk_sub_u16 v0, 0.5, v3 op_sel:[1,0] op_sel_hi:[0,0] clamp
+D38B5800 100206F0	v_pk_sub_u16 v0, 0.5, v3 op_sel:[1,1] op_sel_hi:[0,1]
+D38B4000 18020406	v_pk_sub_u16 v0, s6, v2
+D38BC000 18020406	v_pk_sub_u16 v0, s6, v2 clamp
+D38BD800 00020406	v_pk_sub_u16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,0] clamp
+D38B5800 10020406	v_pk_sub_u16 v0, s6, v2 op_sel:[1,1] op_sel_hi:[0,1]
+D38B4000 00020406	v_pk_sub_u16 v0, s6, v2 op_sel_hi:[0,0]
+D38B4000 1801E501	v_pk_sub_u16 v0, v1, 1.0
+D38BC000 1801E501	v_pk_sub_u16 v0, v1, 1.0 clamp
+D38B5000 1801E501	v_pk_sub_u16 v0, v1, 1.0 op_sel:[0,1]
+D38B5800 1001E501	v_pk_sub_u16 v0, v1, 1.0 op_sel:[1,1] op_sel_hi:[0,1]
+D38B5800 0801E501	v_pk_sub_u16 v0, v1, 1.0 op_sel:[1,1] op_sel_hi:[1,0]
+D38B4000 18010F01	v_pk_sub_u16 v0, v1, 7
+D38BC000 18010F01	v_pk_sub_u16 v0, v1, 7 clamp
+D38B5000 18010F01	v_pk_sub_u16 v0, v1, 7 op_sel:[0,1]
+D38B5000 00010F01	v_pk_sub_u16 v0, v1, 7 op_sel:[0,1] op_sel_hi:[0,0]
+D38B4800 18010F01	v_pk_sub_u16 v0, v1, 7 op_sel:[1,0]
+D38B4000 18000B01	v_pk_sub_u16 v0, v1, s5
+D38BC000 18000B01	v_pk_sub_u16 v0, v1, s5 clamp
+D38B5000 10000B01	v_pk_sub_u16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[0,1]
+D38BD000 10000B01	v_pk_sub_u16 v0, v1, s5 op_sel:[0,1] op_sel_hi:[0,1] clamp
+D38BC800 00000B01	v_pk_sub_u16 v0, v1, s5 op_sel:[1,0] op_sel_hi:[0,0] clamp
+D38B4000 18020501	v_pk_sub_u16 v0, v1, v2
+D38BC000 18020501	v_pk_sub_u16 v0, v1, v2 clamp
+D38B5800 08020501	v_pk_sub_u16 v0, v1, v2 op_sel:[1,1] op_sel_hi:[1,0]
+D38B4000 18020904	v_pk_sub_u16 v0, v4, v4
+D38BC000 18020904	v_pk_sub_u16 v0, v4, v4 clamp
+D38B5000 18020904	v_pk_sub_u16 v0, v4, v4 op_sel:[0,1]
+D38BD000 18020904	v_pk_sub_u16 v0, v4, v4 op_sel:[0,1] clamp
+D38B4800 10020904	v_pk_sub_u16 v0, v4, v4 op_sel:[1,0] op_sel_hi:[0,1]
+7E0052FF BE800000	v_sin_f32 v0, -0.25
+7E005280	v_sin_f32 v0, 0
+7E0052F0	v_sin_f32 v0, 0.5
+7E0052FF 3E800000	v_sin_f32 v0, 0x3e800000
+7E0052F2	v_sin_f32 v0, 1.0
+7E005205	v_sin_f32 v0, s5
+7E005301	v_sin_f32 v0, v1
+D1690000 20000101	v_sin_f32_e64 v0, -v1
+D1698000 20000101	v_sin_f32_e64 v0, -v1 clamp
+D1698000 28000101	v_sin_f32_e64 v0, -v1 clamp mul:2
+D1690000 38000101	v_sin_f32_e64 v0, -v1 div:2
+D1690000 28000101	v_sin_f32_e64 v0, -v1 mul:2
+D1690000 30000101	v_sin_f32_e64 v0, -v1 mul:4
+D1690100 20000101	v_sin_f32_e64 v0, -|v1|
+D1698100 20000101	v_sin_f32_e64 v0, -|v1| clamp
+D1698100 28000101	v_sin_f32_e64 v0, -|v1| clamp mul:2
+D1690100 38000101	v_sin_f32_e64 v0, -|v1| div:2
+D1690100 28000101	v_sin_f32_e64 v0, -|v1| mul:2
+D1690100 30000101	v_sin_f32_e64 v0, -|v1| mul:4
+D1690000 00000005	v_sin_f32_e64 v0, s5
+D1698000 00000005	v_sin_f32_e64 v0, s5 clamp
+D1698000 08000005	v_sin_f32_e64 v0, s5 clamp mul:2
+D1690000 18000005	v_sin_f32_e64 v0, s5 div:2
+D1690000 08000005	v_sin_f32_e64 v0, s5 mul:2
+D1690000 10000005	v_sin_f32_e64 v0, s5 mul:4
+D1690000 00000101	v_sin_f32_e64 v0, v1
+D1698000 00000101	v_sin_f32_e64 v0, v1 clamp
+D1698000 08000101	v_sin_f32_e64 v0, v1 clamp mul:2
+D1690000 18000101	v_sin_f32_e64 v0, v1 div:2
+D1690000 08000101	v_sin_f32_e64 v0, v1 mul:2
+D1690000 10000101	v_sin_f32_e64 v0, v1 mul:4
+D1690100 00000101	v_sin_f32_e64 v0, |v1|
+D1698100 00000101	v_sin_f32_e64 v0, |v1| clamp
+D1698100 08000101	v_sin_f32_e64 v0, |v1| clamp mul:2
+D1690100 18000101	v_sin_f32_e64 v0, |v1| div:2
+D1690100 08000101	v_sin_f32_e64 v0, |v1| mul:2
+D1690100 10000101	v_sin_f32_e64 v0, |v1| mul:4

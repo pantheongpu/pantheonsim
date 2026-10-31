@@ -39,6 +39,9 @@ struct State {
   // Slices a forked child inherited from its parent: still mapped, never
   // released or handed out again here.
   std::map<uint8_t*, uint64_t> inherited;
+  // Heap chunks given back nearly untouched, all zero, ready to hand out. They count as released in
+  // `ram`; acquire() counts them again.
+  std::vector<uint8_t*> pool;
 
   // The host-memory guard. since_check counts heap chunks since the last look
   // at the host; zero means the next heap chunk looks. low is what the last
@@ -370,6 +373,11 @@ uint8_t* acquire() {
   }
   if (!spill) {
     s.ram += kChunkSize;
+    if (!s.pool.empty()) {
+      uint8_t* chunk = s.pool.back();
+      s.pool.pop_back();
+      return chunk;
+    }
     lock.unlock();
     // Value-initialized: the chunk arrives zeroed, as untouched memory reads.
     return new uint8_t[kChunkSize]();
@@ -387,7 +395,10 @@ uint8_t* acquire() {
   return chunk;
 }
 
-void release(uint8_t* chunk) {
+// How many chunks are kept. (What may be cleared under the lock to keep one is kPoolMaxDirty, in the header.)
+constexpr size_t kPoolMax = 64;
+
+void release(uint8_t* chunk, uint64_t dirty_bytes) {
   if (!chunk) return;
   State& s = state();
   std::lock_guard<std::mutex> lock(s.mu);
@@ -405,7 +416,18 @@ void release(uint8_t* chunk) {
     return;
   }
   s.ram -= kChunkSize;
+  if (dirty_bytes <= kPoolMaxDirty && s.pool.size() < kPoolMax) {
+    std::memset(chunk, 0, static_cast<size_t>(dirty_bytes));
+    s.pool.push_back(chunk);
+    return;
+  }
   delete[] chunk;
+}
+
+uint64_t pooled_chunks() {
+  State& s = state();
+  std::lock_guard<std::mutex> lock(s.mu);
+  return s.pool.size();
 }
 
 uint64_t ram_bytes() {

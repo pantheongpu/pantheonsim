@@ -28,7 +28,7 @@ have is in that vendor's directory:
 | --- | --- | --- | --- |
 | Register databases | `registers/pci-config.yaml` | `amd/registers/mmio.yaml` | `nvidia/registers/mmio.yaml` |
 | Each GPU model's registers | | `amd/registers/gpus/` | `nvidia/registers/gpus/` |
-| Captured from real cards | | | `nvidia/registers/measurements/` |
+| Captured from real cards | | `amd/registers/measurements/` | `nvidia/registers/measurements/` |
 | Code | `src/core/regs.cpp`: the databases' semantics, configuration space and its capability chains, BAR sizing, AER status, the shared state and log, the model files | `amd/src/regs.cpp`: BARs, identity, engine status, the SMU mailbox, NBIO, amdgpu's sysfs files; `metrics.cpp`, `cper.cpp` | `nvidia/src/regs.cpp`: BARs, identity, the replayed configuration space, BAR0's undeclared answer, the GeForce idle link |
 
 The engine reaches a vendor's part through one table of hooks
@@ -276,7 +276,7 @@ python3 tools/regprobe/regprobe.py capture out/                 # config space, 
 sudo python3 tools/regprobe/regprobe.py mmio out/ --bdf 0000:0a:00.0 --range 0x0-0x1000
 sudo python3 tools/regprobe/regprobe.py correlate out/ --bdf 0000:0a:00.0 \
     --range 0x0-0x1000 --seconds 120 --load "./a-gpu-burn"       # what follows temperature, clocks, power
-python3 tools/regprobe/regprobe.py compare out/ --profile nvidia/rtx3060 --vgpu build/vgpu
+python3 tools/regprobe/regprobe.py compare out/ --profile nvidia/rtx3060 --vgpu build/bin/vgpu
 ```
 
 `capture` reads all 4096 bytes of configuration space as root, and the 64-byte

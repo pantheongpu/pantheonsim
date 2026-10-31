@@ -59,11 +59,11 @@ jobs=$(cutlass_compile_jobs ${#tests[@]})
 # CUTLASS's own CMake defines CUTLASS_TARGET_NAME, which the conv testbed uses.
 compile() {
   local name="${1##*/}"
-  nvcc -std=c++17 -O1 -cudart shared -arch=compute_90a -code="$(cutlass_code compute_90a)" --expt-relaxed-constexpr \
+  cutlass_nvcc "$work/$name" -std=c++17 -O1 -cudart shared -arch=compute_90a -code="$(cutlass_code compute_90a)" --expt-relaxed-constexpr \
        -DCUTLASS_TARGET_NAME="\"$name\"" \
        -I "$cutlass/include" -I "$cutlass/tools/util/include" -I "$u/common" -I "$u" -I "$cutlass/test" \
        -I "$gtest/googletest/include" "$u/$1.cu" "$u/test_unit.cpp" \
-       "$u/common/filter_architecture.cpp" "$gtest/libgtest.a" -o "$work/$name" >"$work/$name.log" 2>&1
+       "$u/common/filter_architecture.cpp" "$gtest/libgtest.a" >"$work/$name.log" 2>&1
 }
 for ((first = 0; first < ${#tests[@]}; first += jobs)); do
   pids=()
@@ -75,6 +75,7 @@ for ((first = 0; first < ${#tests[@]}; first += jobs)); do
     fi
   done
 done
+echo "compiled: $(( ${#tests[@]} - $(ls "$work"/*.cached 2>/dev/null | wc -l) )) of ${#tests[@]}; the rest came from the build cache"
 fail=0
 for path in "${tests[@]}"; do
   t="${path##*/}"

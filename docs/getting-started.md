@@ -146,9 +146,9 @@ Makefile variables are in [docs/config.md](config.md).
 ## When something goes wrong
 
 - **`make doctor` says cmake or the compiler is too old.** You need CMake 3.20
-  or newer and g++ 13 or newer (or clang++ 17). `doctor` prints the install
-  command for your system. On Ubuntu 22.04 that means g++ 13 from a PPA; then
-  run `export CXX=g++-13`, `make clean` and `make build`.
+  or newer and g++ 12 or newer (or clang++ 17). `doctor` prints the install
+  command for your system. On Ubuntu 22.04 that means `sudo apt-get install g++-12`; then
+  run `export CXX=g++-12`, `make clean` and `make build`.
 - **Your CUDA program fails with a message about the static runtime.** It was
   built without `-cudart shared`. Rebuild with it. Programs that link the CUDA
   runtime statically, such as CuPy, cannot be simulated yet
@@ -160,10 +160,10 @@ Makefile variables are in [docs/config.md](config.md).
   The simulator will not let your computer run out of memory, so it refuses an
   allocation instead of letting the system kill programs. Ask for less memory
   (`vram_mb`), let the rest spill to disk (`ram_mb` and `memory_dir`), or lower
-  the memory it keeps free (`host_reserve_mb`, which is the variable
+  the memory it keeps free (`host_reserve_mb`, which sets
   `VGPU_MEMORY_HOST_RESERVE_MB`). See
   [the memory settings](config.md#a-small-machine-that-spills-to-disk).
-- **`nvidia-smi` shows a CUDA, driver or ROCm version you do not want.** The
+- **`nvidia-smi` or `amd-smi` shows a CUDA, driver or ROCm version you do not want.** The
   versions are settings: `cuda_version`, `driver_version` and `rocm_version`.
   They change what the tools report, not your compiler.
 - **A result looks wrong and you want to know why.** Run with `STRICT=1`,
@@ -187,9 +187,11 @@ each `vgpu` command before it runs, so you can copy it.
 ## Help, contributing and security
 
 Questions and ideas go in [Discussions](https://github.com/pantheongpu/pantheonsim/discussions),
-bugs in [issues](https://github.com/pantheongpu/pantheonsim/issues). How changes
-are decided is in [GOVERNANCE.md](../GOVERNANCE.md), and security problems should be
-reported privately as [SECURITY.md](../SECURITY.md) describes.
+bugs in [issues](https://github.com/pantheongpu/pantheonsim/issues). How to send a
+change is in [CONTRIBUTING.md](../CONTRIBUTING.md), the rules for taking part in
+[CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md), how changes are decided in
+[GOVERNANCE.md](../GOVERNANCE.md), and security problems should be reported privately
+as [SECURITY.md](../SECURITY.md) describes.
 
 ## License
 

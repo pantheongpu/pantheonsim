@@ -21,11 +21,15 @@ on:
         required: false
         default: false
 
-# A push that lands while an earlier run is still going supersedes it; there is
-# no value in finishing a build of code nobody will look at again.
+# A push to a pull request that lands while an earlier run is still going
+# supersedes it; there is no value in finishing a build of code nobody will look
+# at again. main is different: its sanitizer jobs take over an hour and merges
+# land faster than that, so cancelling meant no run on main ever finished and
+# the repository page showed a failed CI. A run on main finishes; a newer push
+# waits behind it (and a still newer one replaces the waiting one).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # nvcc 12.0 rejects this image's default GCC 13 headers (it fails inside
@@ -83,11 +87,34 @@ jobs:
         # this one. Print it so a broken detection is visible in the log.
         run: ls build/shim/
 
+      - name: Which nvcc builds the CUTLASS tests
+        # Part of the cache key below, so a toolchain update starts a new directory
+        # instead of leaving the old key to hit forever with binaries nobody can use.
+        id: nvcc_version
+        run: echo "v=$(nvcc --version | sed -n 's/.*release \([0-9.]*\).*V\([0-9.]*\)/\1-\2/p')-$(g++ -dumpversion)" >> "$GITHUB_OUTPUT"
+
+      - name: CUTLASS test binaries, from the cache
+        # e2e_cutlass_hopper and e2e_cutlass_gemm are nvcc compiles (about
+        # 2000 s of their 2200 s, an estimate) of programs that do not depend
+        # on the simulator; the tests still run every binary against it. Each
+        # binary's file name carries a hash of all its inputs (cutlass_nvcc in
+        # nvidia/tests/e2e/cutlass_fetch.sh), so a restored directory never
+        # supplies a binary built from other inputs: it is only not found.
+        # The key below just decides when a new directory is worth saving.
+        id: cutlass_bin
+        uses: actions/cache/restore@v4
+        with:
+          path: cutlass-bin-cache
+          key: cutlass-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.nvcc_version.outputs.v }}-${{ hashFiles('nvidia/tests/e2e/cutlass_fetch.sh', 'nvidia/tests/e2e/run_cutlass_hopper.sh', 'nvidia/tests/e2e/run_cutlass_gemm.sh') }}
+
       - name: Unit and end-to-end tests
+        env:
+          VGPU_CUTLASS_BIN_CACHE: ${{ github.workspace }}/cutlass-bin-cache
         # The ML tests are the ml job's: on the runner whose image has PyTorch
         # and rocBLAS they would run here too, and take an hour.
         # -j2 (fewer on a machine with under 12 GiB free, ci/jobs.sh): the two
-        # CUTLASS tests are 2200 s of this step's 3200 s (run 38424481981) and
+        # CUTLASS tests were 2200 s of this step's 3200 s (run 38424481981,
+        # before the binary cache above) and
         # use one core for their nvcc compiles, so the other tests run beside
         # them. The CUTLASS, CuTe and heavy nvcc tests take the nvcc_memory lock
         # (CMakeLists.txt), so only one of them sizes its compiles from the free
@@ -95,6 +122,15 @@ jobs:
         # so the lock chain overlaps the rest. The ml job below runs the other
         # tests at -j2 already.
         run: ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E '^(pantheon_workloads|amd_pytorch.*|amd_rocblas|amd_hipsparselt.*)$'
+
+      - name: Keep the CUTLASS test binaries
+        # Only after every test passed, so the directory holds both tests'
+        # binaries, and only when the restore missed (a key cannot be rewritten).
+        if: success() && steps.cutlass_bin.outputs.cache-hit != 'true' && hashFiles('cutlass-bin-cache/*') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: cutlass-bin-cache
+          key: ${{ steps.cutlass_bin.outputs.cache-primary-key }}
 
   workloads:
     name: pantheon workloads
@@ -193,9 +229,12 @@ jobs:
       - uses: ./.github/actions/pr-guard
 
       # This job needs a lot of memory, and on a shared runner another job may
-      # hold most of it. Fail here, alone, if this one cannot fit, rather than
+      # hold most of it. Wait up to 30 minutes for the memory (CI_MEM_WAIT_SECS: a peak
+      # from another job usually passes), then fail here, alone, if this one cannot fit, rather than
       # take the machine down part-way (the minimums are in ci/jobs.sh).
       - name: Check the memory
+        env:
+          CI_MEM_WAIT_SECS: '1800'
         run: ci/jobs.sh --check sass
 
       - name: Install CUDA 13
@@ -277,9 +316,12 @@ jobs:
       - uses: ./.github/actions/pr-guard
 
       # This job needs a lot of memory, and on a shared runner another job may
-      # hold most of it. Fail here, alone, if this one cannot fit, rather than
+      # hold most of it. Wait up to 30 minutes for the memory (CI_MEM_WAIT_SECS: a peak
+      # from another job usually passes), then fail here, alone, if this one cannot fit, rather than
       # take the machine down part-way (the minimums are in ci/jobs.sh).
       - name: Check the memory
+        env:
+          CI_MEM_WAIT_SECS: '1800'
         run: ci/jobs.sh --check ollama
 
       - name: Install CUDA 13
@@ -370,13 +412,34 @@ jobs:
       VGPU_OLLAMA_MODEL: smollm2:135m
     permissions: { contents: read, packages: read, actions: write, pull-requests: read }  # pr-guard cancels a run whose PR conflicts
     steps:
+      # The container jobs (ASan, TSan, SASS) run as root in a workspace that belongs to the
+      # runner's user, and when one is cancelled mid-build its own hand-back step is skipped,
+      # leaving root-owned build directories. The checkout below cannot clean those ("EACCES:
+      # unlink build-san/.ninja_deps"), so every ollama job queued behind it failed in seconds.
+      # This job runs on the host, so take the workspace back before the checkout touches it.
+      - name: Take back a workspace a container job left
+        run: |
+          ws="$GITHUB_WORKSPACE"
+          if [[ -d "$ws" ]] && [[ -n "$(find "$ws" -maxdepth 3 ! -user "$(id -un)" -print -quit 2>/dev/null)" ]]; then
+            # sudo when the runner user has it without a password; otherwise docker, which the
+            # runner user always has on these hosts, as root in a throwaway container.
+            if ! sudo -n chown -R "$(id -u):$(id -g)" "$ws" 2>/dev/null; then
+              docker run --rm --entrypoint /bin/sh -v "$(dirname "$ws"):/w" alpine \
+                -c "chown -R $(id -u):$(id -g) /w/$(basename "$ws")" \
+                || echo "::warning::could not take back $ws; the checkout may fail"
+            fi
+          fi
+
       - uses: actions/checkout@v4
       - uses: ./.github/actions/pr-guard
 
       # This job needs a lot of memory, and on a shared runner another job may
-      # hold most of it. Fail here, alone, if this one cannot fit, rather than
+      # hold most of it. Wait up to 30 minutes for the memory (CI_MEM_WAIT_SECS: a peak
+      # from another job usually passes), then fail here, alone, if this one cannot fit, rather than
       # take the machine down part-way (the minimums are in ci/jobs.sh).
       - name: Check the memory
+        env:
+          CI_MEM_WAIT_SECS: '1800'
         run: ci/jobs.sh --check ollama-amd
 
       - name: Install ollama and its ROCm backend
@@ -433,7 +496,8 @@ jobs:
     # pantheonsim.com host (pantheonsim-web/deploy/gh-runner). Its image has
     # this job's toolchain built in, so the install step runs only on GitHub's.
     runs-on: ${{ fromJSON(vars.SIM_RUNS_ON || '"ubuntu-24.04"') }}
-    timeout-minutes: 20
+    timeout-minutes: 35
+    # The tests take 12-16 minutes on a hosted runner; 20 was cancelling one run in three.
     # The toolchain image (.github/ci-image), or, when there is none, the
     # runner itself with the install step below.
     needs: image
@@ -547,6 +611,8 @@ jobs:
         # A skip fails the job too, unless the test is named in RUNNER_SKIPS_OK
         # with the reason it cannot run on this machine: a skip that nobody
         # chose is a test that silently stopped running. Allowed now:
+        #   e2e_sass_jit_full    the full tier 2 (JIT) matrix is an hour of work and runs only in the
+        #                        nightly (VGPU_NIGHTLY=1, sass-ptx.yml); e2e_sass_jit is the PR gate.
         #   e2e_nvprof           nvprof ships only up to CUDA 12; this shim is 13.
         #   amd_rocprofiler_abi, amd_rocprofv3, amd_rocprofiler_pcsampling
         #                        the image's ROCm has no rocprofiler-sdk (yet).
@@ -566,8 +632,6 @@ jobs:
         #                        machine code) is nowhere on the image: not beside nvcc, not
         #                        in a pip wheel. Installing libnvjitlink-13-0 (or
         #                        nvidia-nvjitlink-cu13) turns it on.
-        #   e2e_lowprec_ptx120   no sm_120 card transcript on this branch (it has one on
-        #                        r4): "no expected files for ptx120".
         #   e2e_packed_int_forms the image's nvcc ptxas does not assemble PTX ISA 9.2's
         #                        packed integer forms for sm_120f.
         #   e2e_runtime_132      it needs a runtime shim built with the CUDA 13.2 headers
@@ -579,11 +643,13 @@ jobs:
         #                        image's nvcc makes none for the test's kernels and the test says
         #                        so and skips (the cuobjdump count in run_rdc_clones.sh). It runs
         #                        on a toolchain whose link clones them.
+        #   e2e_host_gpu         it runs kernels on a real NVIDIA card (VGPU_HOST_GPU=exact) and skips
+        #                        where there is none, as on this runner.
         # The last four above, and these three, are the image's or the branch's to fix; drop
         # them here when they are.
         if: inputs.ml_tests == ''
         env:
-          RUNNER_SKIPS_OK: '^(e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_lowprec_ptx120|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|amd_rocprofiler_pcsampling|amd_rvs)$'
+          RUNNER_SKIPS_OK: '^(e2e_sass_jit_full|bench_amd_counters|e2e_nvprof|amd_rocprofiler_abi|amd_rocprofv3|e2e_jit_frameworks|e2e_nvshmem_device|e2e_nvshmem_bootstrap|e2e_cupti_compat12|amd_opencl|e2e_fft_lto_callbacks|e2e_packed_int_forms|e2e_runtime_132|e2e_rdc_clones|e2e_host_gpu|amd_rocprofiler_pcsampling|amd_rvs)$'
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure -j"$(ci/jobs.sh -g 4 -m 2)" \
@@ -628,9 +694,12 @@ jobs:
       - uses: ./.github/actions/pr-guard
 
       # This job needs a lot of memory, and on a shared runner another job may
-      # hold most of it. Fail here, alone, if this one cannot fit, rather than
+      # hold most of it. Wait up to 30 minutes for the memory (CI_MEM_WAIT_SECS: a peak
+      # from another job usually passes), then fail here, alone, if this one cannot fit, rather than
       # take the machine down part-way (the minimums are in ci/jobs.sh).
       - name: Check the memory
+        env:
+          CI_MEM_WAIT_SECS: '1800'
         run: ci/jobs.sh --check asan
 
       # The checkout belongs to the runner's user and the job runs as root in
@@ -659,6 +728,12 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          # The tier test builds and runs sass_tier for seven architectures and some forty other programs, every one twice or
+          # more; under a sanitizer that is about 2000 s. Two architectures and the one program that checks the interpreter
+          # steps keep the sanitizer on the tier's code; the other programs run under it, tier on and off, in e2e_sass_archs,
+          # and the plain builds run the full matrix.
+          VGPU_TIER_ARCHS: "sm_80 sm_90"
+          VGPU_TIER_PROGRAMS: "sass_tier_steps:75"
         # -j2 (fewer when under 12 GiB are free, ci/jobs.sh): 534 tests, 1840 s
         # one at a time in run 38424481981 (2031 s in 38612576048), the
         # longest 173 s, on a 24-core machine that otherwise idles through them;
@@ -700,9 +775,12 @@ jobs:
       - uses: ./.github/actions/pr-guard
 
       # This job needs a lot of memory, and on a shared runner another job may
-      # hold most of it. Fail here, alone, if this one cannot fit, rather than
+      # hold most of it. Wait up to 30 minutes for the memory (CI_MEM_WAIT_SECS: a peak
+      # from another job usually passes), then fail here, alone, if this one cannot fit, rather than
       # take the machine down part-way (the minimums are in ci/jobs.sh).
       - name: Check the memory
+        env:
+          CI_MEM_WAIT_SECS: '1800'
         run: ci/jobs.sh --check tsan
 
       # The checkout belongs to the runner's user and the job runs as root in
@@ -736,7 +814,16 @@ jobs:
         # one at a time in run 38424481981 (1586 s in 38612576048), the longest
         # 150 s, on a 24-core machine that otherwise idles through them. See the
         # ASan job above for why it is safe.
-        run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E pantheon_workloads
+        #
+        # Left out: the golden-digest tests of the AMD executor and the video codecs. They run on one thread (nothing in their
+        # sources starts one), and ThreadSanitizer only reports races between threads, so they took about 1500 s of this job
+        # (it runs one test at a time) and could find nothing. ASan and UBSan run them, and so do the plain builds.
+        env:
+          VGPU_TIER_ARCHS: "sm_80 sm_90"
+          VGPU_TIER_PROGRAMS: "sass_tier_steps:75"
+        run: |
+          single_thread='test_amd_gcn_same_bits|test_amd_gcn_tier_same_bits|test_amd_gcn_memory_same_bits|test_amd_gcn_packed_same_bits|test_amd_matrix_fast|test_decode_same_bits|test_hevc_decode|test_h264_decode|test_mpeg2_decode|test_nvenc_.*'
+          setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E "^(pantheon_workloads|$single_thread)$"
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what they leave there is root's, and the

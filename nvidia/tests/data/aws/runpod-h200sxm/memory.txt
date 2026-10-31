@@ -1,0 +1,86 @@
+# plain
+REC memory2 op=alloc kind=device bytes=4096 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c0
+REC runtime cudaMalloc_v3020 corr=c0
+REC memory1 kind=device bytes=4096
+REC memory2 op=release kind=device bytes=4096 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c1
+REC runtime cudaFree_v3020 corr=c1
+REC memory2 op=alloc kind=pinned bytes=4096 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c2
+REC runtime cudaHostAlloc_v3020 corr=c2
+REC memory1 kind=pinned bytes=4096
+REC memory2 op=release kind=pinned bytes=4096 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c3
+REC runtime cudaFreeHost_v3020 corr=c3
+# default pool, one wait
+REC runtime cudaStreamCreate_v3020 corr=c4
+REC runtime cudaStreamCreate_v3020 corr=c5
+REC pool op=created type=local size=33554432 threshold=0 utilized=0 minkeep=0 corr=c6
+REC memory2 op=alloc kind=device bytes=1048576 async=1 stream=set pool=local poolsize=33554432 threshold=0 utilized=1048576 corr=c6
+REC runtime cudaMallocAsync_v11020 corr=c6
+REC memory2 op=alloc kind=device bytes=2097152 async=1 stream=set pool=local poolsize=33554432 threshold=0 utilized=3145728 corr=c7
+REC runtime cudaMallocAsync_v11020 corr=c7
+REC memory1 kind=device bytes=1048576
+REC memory2 op=release kind=device bytes=1048576 async=1 stream=set pool=local poolsize=33554432 threshold=0 utilized=3145728 corr=c8
+REC runtime cudaFreeAsync_v11020 corr=c8
+REC memory1 kind=device bytes=2097152
+REC memory2 op=release kind=device bytes=2097152 async=1 stream=set pool=local poolsize=33554432 threshold=0 utilized=2097152 corr=c9
+REC runtime cudaFreeAsync_v11020 corr=c9
+REC pool op=trimmed type=local size=0 threshold=0 utilized=0 minkeep=0 corr=c10
+REC runtime cudaStreamSynchronize_v3020 corr=c10
+# growing
+REC memory2 op=alloc kind=device bytes=34603008 async=1 stream=set pool=local poolsize=67108864 threshold=0 utilized=34603008 corr=c11
+REC runtime cudaMallocAsync_v11020 corr=c11
+REC memory2 op=alloc kind=device bytes=104857600 async=1 stream=set pool=local poolsize=167772160 threshold=0 utilized=139460608 corr=c12
+REC runtime cudaMallocAsync_v11020 corr=c12
+REC memory1 kind=device bytes=34603008
+REC memory2 op=release kind=device bytes=34603008 async=1 stream=set pool=local poolsize=167772160 threshold=0 utilized=139460608 corr=c13
+REC runtime cudaFreeAsync_v11020 corr=c13
+REC memory1 kind=device bytes=104857600
+REC memory2 op=release kind=device bytes=104857600 async=1 stream=set pool=local poolsize=167772160 threshold=0 utilized=104857600 corr=c14
+REC runtime cudaFreeAsync_v11020 corr=c14
+REC pool op=trimmed type=local size=0 threshold=0 utilized=0 minkeep=0 corr=c15
+REC runtime cudaStreamSynchronize_v3020 corr=c15
+# wait on another stream
+REC runtime cudaDeviceGetDefaultMemPool_v11020 corr=c16
+REC runtime cudaMemPoolSetAttribute_v11020 corr=c17
+REC memory2 op=alloc kind=device bytes=104857600 async=1 stream=set pool=local poolsize=134217728 threshold=67108864 utilized=104857600 corr=c18
+REC runtime cudaMallocAsync_v11020 corr=c18
+REC memory1 kind=device bytes=104857600
+REC memory2 op=release kind=device bytes=104857600 async=1 stream=set pool=local poolsize=134217728 threshold=67108864 utilized=104857600 corr=c19
+REC runtime cudaFreeAsync_v11020 corr=c19
+REC runtime cudaStreamSynchronize_v3020 corr=c20
+REC pool op=trimmed type=local size=134217728 threshold=67108864 utilized=0 minkeep=0 corr=c21
+REC runtime cudaMemPoolTrimTo_v11020 corr=c21
+# trims
+REC pool op=trimmed type=local size=67108864 threshold=67108864 utilized=0 minkeep=0 corr=c22
+REC runtime cudaStreamSynchronize_v3020 corr=c22
+REC pool op=trimmed type=local size=33554432 threshold=67108864 utilized=0 minkeep=1 corr=c23
+REC runtime cudaMemPoolTrimTo_v11020 corr=c23
+REC pool op=trimmed type=local size=0 threshold=67108864 utilized=0 minkeep=1 corr=c24
+REC runtime cudaMemPoolTrimTo_v11020 corr=c24
+REC pool op=trimmed type=local size=0 threshold=67108864 utilized=0 minkeep=0 corr=c25
+REC runtime cudaMemPoolTrimTo_v11020 corr=c25
+# own pool
+REC runtime cudaMemPoolSetAttribute_v11020 corr=c26
+REC pool op=created type=local size=33554432 threshold=0 utilized=0 minkeep=0 corr=c27
+REC runtime cudaMemPoolCreate_v11020 corr=c27
+REC runtime cudaMemPoolSetAttribute_v11020 corr=c28
+REC memory2 op=alloc kind=device bytes=1048576 async=1 stream=set pool=local poolsize=33554432 threshold=1073741824 utilized=1048576 corr=c29
+REC runtime cudaMallocFromPoolAsync_v11020 corr=c29
+REC memory1 kind=device bytes=1048576
+REC memory2 op=release kind=device bytes=1048576 async=1 stream=set pool=local poolsize=33554432 threshold=1073741824 utilized=1048576 corr=c30
+REC runtime cudaFreeAsync_v11020 corr=c30
+REC pool op=trimmed type=local size=0 threshold=0 utilized=0 minkeep=0 corr=c31
+REC pool op=trimmed type=local size=33554432 threshold=1073741824 utilized=0 minkeep=0 corr=c31
+REC runtime cudaStreamSynchronize_v3020 corr=c31
+REC pool op=trimmed type=local size=0 threshold=1073741824 utilized=0 minkeep=1 corr=c32
+REC runtime cudaMemPoolTrimTo_v11020 corr=c32
+REC pool op=destroyed type=local size=0 threshold=1073741824 utilized=0 minkeep=0 corr=c33
+REC runtime cudaMemPoolDestroy_v11020 corr=c33
+# left allocated
+REC memory2 op=alloc kind=device bytes=8192 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c34
+REC runtime cudaMalloc_v3020 corr=c34
+REC memory1 kind=device bytes=8192
+REC memory2 op=release kind=device bytes=8192 async=0 stream=none pool=none poolsize=0 threshold=0 utilized=0 corr=c35
+REC runtime cudaFree_v3020 corr=c35
+REC runtime cudaStreamDestroy_v5050 corr=c36
+REC runtime cudaStreamDestroy_v5050 corr=c37
+# end

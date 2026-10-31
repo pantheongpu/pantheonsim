@@ -42,7 +42,7 @@ progs=(${VGPU_SASS_PROGRAMS:-sass_archs:75 vector_add:75 device_functions:75 dev
        bsync_recursive_abi:75 sync_masks:86:86 dynamic_parallelism:75 cdp_device_api:75 cdp1_device_sync:75:89 rdc_device_api:75 large_params:75 shared_atomics64:75 waterfall:90 mma_forms:80
        mma_fragment_layout:80 modern_dtypes:80 vector_atomics:90 wmma_gemm:80 wmma_types:80 dsmem_cluster:90 cooperative_cluster:90
        wgmma_cute:90a tma_gemm_cute:90a tma_reduce_cute:90a tma_im2col:90a tensormap_replace_cute:90a
-       stmatrix:90a setmaxnreg:90a setmaxnreg:100a bulk_copy:90a tcgen05_gemm:100a tmem_alloc_pair:100a mma_blockscale:120a mma_blockscale_dump:120a mma_accumulate_probe:120a ldmatrix_forms:100a ldmatrix_forms:120a narrow_cvt:100a narrow_cvt:120a})
+       stmatrix:90a setmaxnreg:90a setmaxnreg:100a bulk_copy:90a tcgen05_gemm:100a tmem_alloc_pair:100a mma_blockscale:120a mma_blockscale_dump:120a mma_accumulate_probe:120a ldmatrix_forms:100a ldmatrix_forms:120a narrow_cvt:100a narrow_cvt:120a packed_f32x2:100:100 packed_f32x2:100a})
 cute=" wgmma_cute tma_gemm_cute tma_reduce_cute tensormap_replace_cute "
 # Built the way a program that uses dynamic parallelism is (-rdc=true, linked
 # with cudadevrt): the linked cubin carries the device runtime library and the
@@ -147,9 +147,9 @@ check() {
   local env=(VGPU_QUIET=1 VGPU_GPU=${gpu[$arch]} LD_LIBRARY_PATH="$shim" $(both_shims_env "$shim"))
   [[ $p == runtime_conformance ]] && env+=(VGPU_DEVICE_COUNT=2)   # as run_runtime_conformance.sh runs it
   [[ $p == managed_vars ]] && env+=(VGPU_DEVICE_COUNT=2)          # as its own test runs it: two devices
-  sass="$(cd "$work" && env "${env[@]}" VGPU_SASS_LOG=1 timeout 600 "$bin" 2>&1)"; rs=$?
+  sass="$(cd "$work" && env "${env[@]}" VGPU_SASS_LOG=1 VGPU_TIER=0 timeout 600 "$bin" 2>&1)"; rs=$?
   ptx="$(cd "$work" && env "${env[@]}" VGPU_SASS=0 timeout 600 "$bin" 2>&1)"; rp=$?
-  # The pre-decoded tier (VGPU_TIER=1, src/sass/tier.hpp) is opt-in until it has been soaked; this is its soak on every
+  # The pre-decoded tier (VGPU_TIER=1, src/sass/tier.hpp) is on by default; this holds it to the interpreter (VGPU_TIER=0) on every
   # program and architecture this job builds, Hopper's and Blackwell's own programs among them: it must print what the
   # interpreter did. (nvidia/tests/e2e/run_sass_tier.sh also holds the counters to the interpreter's.) VGPU_SASS_TIER=0 skips it.
   local tier="" rt=0

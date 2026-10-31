@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -96,6 +97,10 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
     if (p.gcn_arch_full.compare(0, p.gcn_arch.size(), p.gcn_arch) != 0 ||
         (p.gcn_arch_full.size() > p.gcn_arch.size() && p.gcn_arch_full[p.gcn_arch.size()] != ':'))
       fail(origin, "gcn_arch_full must be gcn_arch with its features after it, e.g. \"gfx942:sramecc+:xnack-\"");
+  } else if (p.vendor == "intel") {
+    // An Xe part has neither a compute capability nor a gfx target; what identifies it is its architecture
+    // name (required above) and the Xe-core layout below. A cc_major of 0 keeps every NVIDIA-only rule off.
+    if (p.architecture.empty()) fail(origin, "an Intel profile needs architecture (e.g. \"xe2-hpg\")");
   } else {
     const std::string cc = get_str(doc, "compute_capability", origin);
     const size_t dot = cc.find('.');
@@ -111,6 +116,34 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
   int64_t ws = get_int(doc, "warp_size", origin);
   if (ws <= 0) fail(origin, "warp_size must be positive");
   p.warp_size = static_cast<uint32_t>(ws);
+
+  // Intel: the Xe core's make-up, from which the residency ceilings below are derived.
+  if (p.vendor == "intel") {
+    const Value& xe = require(doc, "xe", origin);
+    if (xe.kind != Value::Kind::Map) fail(origin, "'xe' must be a map");
+    p.xe.eus_per_xe_core = static_cast<uint32_t>(get_int(xe, "eus_per_xe_core", origin));
+    p.xe.threads_per_eu = static_cast<uint32_t>(get_int(xe, "threads_per_eu", origin));
+    p.xe.grf_per_thread = static_cast<uint32_t>(get_int(xe, "grf_per_thread", origin));
+    p.xe.grf_bytes = static_cast<uint32_t>(get_int(xe, "grf_bytes", origin));
+    const Value& sg = require(xe, "sub_group_sizes", origin);
+    if (sg.kind != Value::Kind::List || sg.list.empty())
+      fail(origin, "xe.sub_group_sizes must be a non-empty list such as [16, 32]");
+    for (const Value& e : sg.list) {
+      if (e.kind != Value::Kind::Int || (e.i != 8 && e.i != 16 && e.i != 32))
+        fail(origin, "xe.sub_group_sizes may contain only 8, 16 and 32");
+      p.xe.sub_group_sizes.push_back(static_cast<uint32_t>(e.i));
+    }
+    if (!p.xe.known()) fail(origin, "xe: every count must be positive");
+    if (!p.xe.has_sub_group_size(static_cast<uint32_t>(ws)))
+      fail(origin, "warp_size " + std::to_string(ws) + " is not one of xe.sub_group_sizes");
+  }
+  if (auto it = doc.map.find("placeholders"); it != doc.map.end()) {
+    if (it->second.kind != Value::Kind::List) fail(origin, "'placeholders' must be a list of keys");
+    for (const Value& e : it->second.list) {
+      if (e.kind != Value::Kind::Str) fail(origin, "'placeholders' must be a list of keys");
+      p.placeholders.push_back(e.str);
+    }
+  }
 
   int64_t vram = get_int(doc, "vram_bytes", origin);
   if (vram <= 0) fail(origin, "vram_bytes must be positive");
@@ -130,7 +163,7 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
   // therefore cannot drive occupancy yet, which is true and visible rather
   // than plausible and wrong.
   p.limits.registers_per_block =
-      p.vendor == "amd"
+      p.vendor == "amd" || p.vendor == "intel"
           ? static_cast<uint32_t>(opt_int(lim, "registers_per_block", origin, 0))
           : static_cast<uint32_t>(get_int(lim, "registers_per_block", origin));
   p.limits.multiprocessors = static_cast<uint32_t>(get_int(lim, "multiprocessors", origin));
@@ -141,10 +174,21 @@ DeviceProfile DeviceProfile::from_yaml(const std::string& src, const std::string
     if (it == lim.map.end() || it->second.kind != Value::Kind::Int) return fallback;
     return static_cast<uint32_t>(it->second.i);
   };
+  // An Xe core's ceilings follow from what it is made of unless the profile says otherwise: a work-group lives
+  // in one Xe core, so its register budget is the core's register file; a hardware thread holds one sub-group;
+  // and a thread's registers are its GRFs shared out over the lanes of the profile's default sub-group.
+  uint32_t d_threads = 2048, d_blocks = 16, d_regs = 255;
+  if (p.vendor == "intel") {
+    const uint64_t words = p.xe.register_words_per_xe_core();
+    if (!p.limits.registers_per_block) p.limits.registers_per_block = static_cast<uint32_t>(words);
+    d_threads = p.xe.threads_per_xe_core() * p.warp_size;                       // one sub-group a hardware thread, at the default width
+    d_blocks = p.xe.threads_per_xe_core();                                  // a work-group takes at least one thread
+    d_regs = p.xe.grf_per_thread * p.xe.grf_bytes / 4 / p.warp_size;
+  }
   p.limits.registers_per_sm = opt("registers_per_sm", p.limits.registers_per_block);
-  p.limits.max_threads_per_sm = opt("max_threads_per_sm", 2048);
-  p.limits.max_blocks_per_sm = opt("max_blocks_per_sm", 16);
-  p.limits.max_registers_per_thread = opt("max_registers_per_thread", 255);
+  p.limits.max_threads_per_sm = opt("max_threads_per_sm", d_threads);
+  p.limits.max_blocks_per_sm = opt("max_blocks_per_sm", d_blocks);
+  p.limits.max_registers_per_thread = opt("max_registers_per_thread", d_regs);
   p.limits.shared_mem_per_sm = opt("shared_mem_per_sm", p.limits.shared_mem_per_block_optin);
   if (auto it = lim.map.find("l2_cache_bytes"); it != lim.map.end() && it->second.kind == Value::Kind::Int)
     p.limits.l2_cache_bytes = static_cast<uint64_t>(it->second.i);

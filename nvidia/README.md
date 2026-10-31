@@ -6,7 +6,7 @@ command line -- is vendor-neutral and lives at the top of the repository.
 
 | Folder | What |
 | --- | --- |
-| `src/` | The CUDA driver and runtime, NVML, CUPTI, NVENC, NVDEC (Motion JPEG) and the vendor libraries (cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP, nvJPEG, cuStateVec, cuDSS, nvJitLink, nvFatbin, cuFile, nvCOMP, NVSHMEM), each built under its real soname |
+| `src/` | The CUDA driver and runtime, NVML, CUPTI, NVENC, NVDEC (Motion JPEG, H.264, HEVC and MPEG-2) and the vendor libraries (cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSPARSELt, cuSOLVER, cuSOLVERMg, NCCL, NVRTC, NPP, nvJPEG, cuStateVec, cuTENSOR, cuTensorNet, cuDSS, nvJitLink, nvFatbin, cuFile, nvCOMP, NVSHMEM), each built under its real soname |
 | `include/` | `vgpu_cuda.h`, the driver ABI a C program links against |
 | `profiles/` | Device profiles, one per GPU. Verified profiles were measured on a physical card; each file's header says where its values came from |
 | `third_party/` | Public NCCL, NVENC and NVDEC (cuviddec.h, nvcuvid.h) headers the libraries are built against; cuDNN's are NVIDIA's and are fetched at configure time (`scripts/fetch-cudnn-headers.py`) |

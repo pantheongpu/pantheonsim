@@ -78,6 +78,27 @@ VTEST(memory_usage_is_real_and_live) {
   rt.device(0).memory().free(q);
 }
 
+// The segment's sequence number is the seqlock a reader retries on: two steps for each update, even when none is in
+// progress, so a snapshot taken between updates is whole whatever order the writers' threads ran in.
+VTEST(each_update_steps_the_sequence_number_by_two_and_leaves_it_even) {
+  TempSegment seg("seq");
+  runtime::Runtime rt(load_gpu("nvidia/a10"), 1);
+  telemetry::Shared before{};
+  VCHECK(telemetry::read_snapshot(&before, seg.path));
+  VCHECK_EQ(before.update_seq % 2, uint64_t{0});
+  constexpr int kPairs = 50;
+  for (int i = 0; i < kPairs; ++i) {
+    const uint64_t p = rt.device(0).memory().alloc(1 << 20);
+    rt.device(0).memory().free(p);
+  }
+  telemetry::Shared after{};
+  VCHECK(telemetry::read_snapshot(&after, seg.path));
+  VCHECK_EQ(after.update_seq % 2, uint64_t{0});
+  // (a window of half a second passing adds a pair for the derived columns; a test of this length does not reach it)
+  VCHECK_EQ(after.update_seq - before.update_seq, uint64_t{4} * kPairs);
+  VCHECK_EQ(after.devices[0].vram_used_bytes, 0ull);
+}
+
 VTEST(idle_device_reports_idle_not_zero) {
   // A device that has done no work must look idle (ambient temperature, a
   // small idle draw), not powered off.

@@ -87,7 +87,19 @@ void configure(const Config& config);
 uint8_t* acquire();
 
 // Gives a chunk back. A file chunk has its disk blocks released at once.
-void release(uint8_t* chunk);
+//
+// `dirty_bytes` is a promise from the caller: every byte of the chunk from that offset on is still
+// zero. A heap chunk with only a few bytes written (a kernel's argument block, a flag) then goes to
+// a short list of chunks to hand out again, cleared below the offset, and not back to the heap to be
+// zeroed whole by the next acquire(). The default promises nothing.
+inline constexpr uint64_t kAllBytesDirty = ~uint64_t{0};
+// The most that is cleared (under the lock) to keep a chunk: a buffer of a few KiB, allocated, written and freed
+// over and over, then costs the clearing of what it wrote and not a heap allocation and the zeroing of all 64 KiB
+// on every allocation. Past it the chunk goes back to the heap.
+inline constexpr uint64_t kPoolMaxDirty = 32 * 1024;
+void release(uint8_t* chunk, uint64_t dirty_bytes = kAllBytesDirty);
+// Chunks kept for hand-out (cleared, not counted in ram_bytes()).
+uint64_t pooled_chunks();
 
 // Bytes of chunks currently on the heap and in the spill file.
 uint64_t ram_bytes();

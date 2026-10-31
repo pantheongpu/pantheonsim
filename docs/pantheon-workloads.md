@@ -45,11 +45,13 @@ requested duration.
 
 The runner additionally accepts `VGPU_WL_GPU`, `VGPU_WL_VRAM_MB`,
 `VGPU_WL_DURATION`, `VGPU_WL_LOOPS`, `VGPU_WL_GRID`, `VGPU_WL_MEMPCT`,
-`VGPU_WL_TIMEOUT`.
+`VGPU_WL_TIMEOUT` (90 s) and `VGPU_WL_DEVICES` (2). The CI runner,
+`tests/workloads/run_pantheon_workloads.sh`, takes the `VGPU_WORKLOAD_*`
+variables described under [In CI](#in-ci) instead.
 
 ## Status
 
-**44 of 46 workloads pass; 0 fail.** Each runs for its full requested duration
+**44 of 46 workloads pass; 0 fail** (with `scripts/run-pantheon-workloads.sh`, which skips `rt_virus` and `media_enc_virus`; the CI runner also runs `media_enc_virus`, see below). Each runs for its full requested duration
 (5 s here; 7-8 s for the ones that also allocate a gigabyte or set up peer
 access). The runner provisions 2 virtual devices so the multi-GPU workloads
 take their real peer-DMA paths. Verified run:
@@ -87,7 +89,7 @@ runner gives those a larger virtual device. Configurable virtual VRAM and
 device count are product features, not workarounds: `VGPU_VRAM_MB` and
 `VGPU_DEVICE_COUNT` let one laptop present whatever rack the test expects.
 
-One workload is **not CUDA** and is out of scope:
+One workload is **not CUDA** and is out of scope for both runners:
 
 | Workload | Needs | Why it is out of scope |
 | --- | --- | --- |
@@ -103,35 +105,47 @@ applications load it by its bare soname, so `libvgpunvenc` stands in as
 `libnvidia-encode.so.1`: the documented encode API with a deterministic,
 content-derived bitstream. Identical frames encode identically and any changed
 pixel changes the output, which is what the workload's golden-bitstream check
-relies on. The output is a real H.264 or HEVC stream (ffmpeg decodes it). The runner skips the
-workload only when the shim was not built.
+relies on. The output is a real H.264 or HEVC stream (ffmpeg decodes it). The CI runner
+(`tests/workloads/run_pantheon_workloads.sh`) skips the workload only when the shim was not built;
+`scripts/run-pantheon-workloads.sh` still skips it.
 
 ## In CI
 
-Two workflows run the workloads, at two depths:
+The workloads run at three depths:
 
 | When | What | Where |
 | --- | --- | --- |
-| Every pull request | `compute_virus`, `int_virus`, `cache_latency` on one A10 | `ci.yml`, job *pantheon workloads* |
-| Every merge to main, and daily at 06:23 UTC | every workload, on every NVIDIA profile (14 machines) | `workloads.yml` |
+| Every pull request to this repository | `compute_virus`, `int_virus`, `cache_latency` on one A10 | `ci.yml`, job *pantheon workloads* |
+| Every merge to main, and daily at 06:23 UTC | every workload, on every machine of the matrix in `workloads.yml` (37) | `workloads.yml` |
+| Every pull request to pantheon | every workload, on two A10s | pantheon's `ci.yml`, job *Workloads on pantheonsim* |
+
+The third row is how a change to a pantheon workload gets an answer before it merges,
+not on the next daily run. It uses the Action (`pantheongpu/pantheonsim@<commit>`) and
+the runner the Action's `source-dir` output points at, so it is the same script as the
+other two. The Action caches the simulator build under its source, so after the first
+run the job is the workloads' own build and run, a few minutes.
 
 Each NVIDIA profile gets a machine, alternating CUDA 12.0 and 13.0 within each
-architecture and with GPU counts above one for the multi-GPU paths:
-
-| CUDA 12.0 | CUDA 13.0 |
-| --- | --- |
-| 1 x T4 (Turing 7.5) | 1 x L4 (Ada 8.9) |
-| 1 x A100 (Ampere 8.0) | 2 x A100 SXM4 40GB (Ampere 8.0) |
-| 2 x A10 (Ampere 8.6) | 1 x A10G (Ampere 8.6) |
-| 1 x RTX 3060 (Ampere 8.6) | 8 x H100 (Hopper 9.0) |
-| 1 x L40S (Ada 8.9) | 4 x H200 (Hopper 9.0) |
-| 1 x H100 PCIe (Hopper 9.0) | 1 x GH200 (Grace Hopper 9.0) |
-| | 2 x B200 (Blackwell 10.0, needs CUDA 12.8+) |
+architecture and with GPU counts above one for the multi-GPU paths (for example
+1 x T4 and 2 x A10 on CUDA 12.0; 8 x H100, 4 x H200 and 2 x B200 on CUDA 13.0).
+The matrix, with each machine's profile, count and CUDA version, is the `matrix`
+list in `.github/workflows/workloads.yml`. A profile the toolchain image cannot
+build for (`nvidia/vr200`, compute capability 10.7) is marked there as `not-run`.
 
 A *coverage* job fails the pull request that adds a profile without adding it
 to the matrix. Each machine builds the workloads with pantheon's own Makefile
 inside `vgpu shell`, which reads the architecture off the simulated
 `nvidia-smi` exactly as it would on the card.
+
+A workload that exits 0 after printing `Skipping: <reason>` (too few GPUs, the NCCL
+library missing, a pantheon-started group that the runner does not form) is reported as
+skipped with that reason, not as passed: it did not run, and a pass would say it had.
+`tests/workloads/verdict.sh` decides, and `verdict_test.sh` checks it without a GPU.
+
+The runner takes the Action's drop-in directory (`<build>/bin`, with its own `nvcc`) off `PATH`
+before it starts `vgpu shell`, which supplies its own. With both there, the two `nvcc` scripts
+each take the other for the real compiler and call each other for ever; `path.sh` does the
+removal and `path_test.sh` checks it.
 
 The run's summary page has one table, a row per workload and a column per
 machine, with failures first and the reason for each. While main is failing,

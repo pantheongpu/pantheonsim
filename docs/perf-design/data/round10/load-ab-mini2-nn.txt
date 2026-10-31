@@ -1,0 +1,23 @@
+uptime:  05:40:57 up  1:54,  9 users,  load average: 11.29, 17.55, 23.55
+== mini2 first-launch table
+RUN loadbase 0.149s 0.002s 0.094s 0.127s 0.219s 0.170s 0.001s 0.001s 0.077s 0.024s 
+RUN load 0.027s 0.002s 0.016s 0.022s 0.040s 0.068s 0.001s 0.001s 0.043s 0.024s 
+RUN loadbase 0.149s 0.002s 0.093s 0.126s 0.219s 0.170s 0.001s 0.001s 0.076s 0.024s 
+RUN load 0.028s 0.002s 0.016s 0.022s 0.040s 0.067s 0.001s 0.001s 0.043s 0.024s 
+RUN loadbase 0.148s 0.002s 0.092s 0.125s 0.220s 0.169s 0.001s 0.001s 0.076s 0.024s 
+RUN load 0.027s 0.002s 0.016s 0.022s 0.041s 0.067s 0.001s 0.001s 0.043s 0.024s 
+RUN loadbase 0.148s 0.002s 0.093s 0.126s 0.219s 0.169s 0.001s 0.001s 0.076s 0.024s 
+RUN load 0.028s 0.002s 0.016s 0.022s 0.041s 0.068s 0.001s 0.001s 0.043s 0.024s 
+RUN loadbase 0.148s 0.002s 0.092s 0.127s 0.222s 0.173s 0.001s 0.001s 0.078s 0.024s 
+RUN load 0.027s 0.002s 0.016s 0.022s 0.040s 0.068s 0.001s 0.001s 0.043s 0.024s 
+== nn group wall
+build nn wall 8.798435420 s  ok=79 fail=0 md5=1521e019
+build nn wall 4.271542127 s  ok=79 fail=0 md5=1521e019
+build nn wall 8.786122913 s  ok=79 fail=0 md5=1521e019
+build nn wall 3.514774896 s  ok=79 fail=0 md5=1521e019
+build nn wall 8.808270442 s  ok=79 fail=0 md5=1521e019
+build nn wall 3.487110420 s  ok=79 fail=0 md5=1521e019
+build nn wall 8.763548197 s  ok=79 fail=0 md5=1521e019
+build nn wall 4.257175240 s  ok=79 fail=0 md5=1521e019
+build nn wall 9.530550398 s  ok=79 fail=0 md5=1521e019
+build nn wall 4.256005470 s  ok=79 fail=0 md5=1521e019

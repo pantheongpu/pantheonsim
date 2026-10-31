@@ -30,6 +30,7 @@
 #include <sstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -39,6 +40,7 @@
 #include <set>
 #include <stdexcept>
 
+#include "platform.hpp"
 #include "driver_graph.hpp"
 #include "func_attrs.hpp"
 #include "vgpu_cuda_graph.h"
@@ -784,9 +786,11 @@ uintptr_t kernel_to_function(ShimState& s, uintptr_t kernel_handle) {
 // the call's exit too.
 template <class Body, class... A>
 CUresult traced(const char* name, Body body, A... a) {
-  const vgpu_traced::KeptArgs<A...> kept(a...);
-  if (vgpu::profiling::enabled() || vgpu::profiling::hooked())
-    vgpu::profiling::note_args(kept.argv(), kept.count(), kept.sizes());
+  vgpu_traced::LazyKept<A...> kept;   // (made only when somebody listens: a program nobody profiles does not copy them)
+  if (vgpu::profiling::enabled() || vgpu::profiling::hooked()) {
+    kept.make(a...);
+    vgpu::profiling::note_args(kept->argv(), kept->count(), kept->sizes());
+  }
   vgpu::profiling::ApiCall call(name, vgpu::profiling::Domain::Driver);
   const CUresult rc = body(a...);
   call.set_result(static_cast<int32_t>(rc));
@@ -1477,6 +1481,12 @@ static CUresult memcpy_dtoh(void* dst, CUdeviceptr src, size_t n, CUstream strea
 static CUresult memcpy_dtod(CUdeviceptr dst, CUdeviceptr src, size_t n, CUstream stream, bool async) {
   return api("cuMemcpyDtoD", true, false, [&](ShimState& s) {
     const uint64_t t0 = vgpu::profiling::enabled() ? vgpu::profiling::now_ns() : 0;
+    // A large copy between ordinary device allocations goes chunk to chunk, with no buffer (managed memory takes dev_read / dev_write).
+    if (n > 16384 && !managed_range(s, src, n) && !managed_range(s, dst, n) &&
+        owner_memory(s, src).copy_to(owner_memory(s, dst), dst, src, n)) {
+      record_copy(s, 3, reinterpret_cast<const void*>(dst), reinterpret_cast<const void*>(src), n, t0, stream, async);
+      return CUDA_SUCCESS;
+    }
     std::vector<uint8_t> tmp(n);
     dev_read(s, tmp.data(), src, n);
     dev_write(s, dst, tmp.data(), n);
@@ -5227,7 +5237,9 @@ VGPU_EXPORT CUresult cuMemPoolImportFromShareableHandle(void** pool, void* handl
 static CUresult cuMemPoolImportFromShareableHandle_impl(void** pool, void* handle, int type, unsigned long long flags) {
   return api("cuMemPoolImportFromShareableHandle", true, false, [&](ShimState&) {
     if (!pool || !handle || flags != 0) return CUDA_ERROR_INVALID_VALUE;
-    return type == 1 || type == 2 || type == 8 ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
+    if (type == 1 || type == 2 || type == 8)
+      return vgpu::platform::native_linux() ? CUDA_ERROR_UNKNOWN : CUDA_ERROR_NOT_SUPPORTED;
+    return CUDA_ERROR_INVALID_VALUE;
   });
 }
 static CUresult cuMemPoolExportPointer_impl(void*, CUdeviceptr);

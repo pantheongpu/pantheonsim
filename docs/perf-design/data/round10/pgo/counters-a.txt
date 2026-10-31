@@ -1,0 +1,2 @@
+PASS: counters of 16 workloads x sass+ptx match tools/bench/expected/cuda-13.0.json (0.4 s)
+PASS: counters of 16 workloads x sass+ptx match tools/bench/expected/cuda-13.0.json (0.4 s)

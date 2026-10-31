@@ -1,0 +1,116 @@
+=== FFMA2_BREAK=0
+-- test_f32x2_sass
+7/7 tests passed
+-- test_sass_decode
+13/13 tests passed
+-- e2e program
+sass rc=0 0 fallbacks
+ptx rc=0
+lines differing SASS vs PTX: 0
+host reference mismatches: 0, known-answer mismatches: 0
+=== FFMA2_BREAK=1
+-- test_f32x2_sass
+7/7 tests passed
+-- test_sass_decode
+13/13 tests passed
+-- e2e program
+sass rc=1 0 fallbacks
+ptx rc=0
+lines differing SASS vs PTX: 169
+host reference mismatches: 221500, known-answer mismatches: 0
+=== FFMA2_BREAK=2
+-- test_f32x2_sass
+7/7 tests passed
+-- test_sass_decode
+13/13 tests passed
+-- e2e program
+sass rc=1 0 fallbacks
+ptx rc=0
+lines differing SASS vs PTX: 203
+host reference mismatches: 327170, known-answer mismatches: 0
+=== FFMA2_BREAK=3
+-- test_f32x2_sass
+7/7 tests passed
+-- test_sass_decode
+13/13 tests passed
+-- e2e program
+sass rc=1 0 fallbacks
+ptx rc=0
+lines differing SASS vs PTX: 148
+host reference mismatches: 88312, known-answer mismatches: 10
+=== FFMA2_BREAK=4
+-- test_f32x2_sass
+7/7 tests passed
+-- test_sass_decode
+13/13 tests passed
+-- e2e program
+sass rc=1 0 fallbacks
+ptx rc=0
+lines differing SASS vs PTX: 95
+host reference mismatches: 33790, known-answer mismatches: 3
+=== FFMA2_BREAK=5
+-- test_f32x2_sass
+[ FAIL ] every_packed_line_decodes_prints_as_nvdisasm_did_and_is_run
+[ FAIL ] forms_of_unknown_meaning_are_refused_by_name
+5/7 tests passed
+-- test_sass_decode
+[ FAIL ] sm_100_decodes_as_nvdisasm_prints_it
+[ FAIL ] sm_100a_decodes_as_nvdisasm_prints_it
+[ FAIL ] sm_103a_decodes_as_nvdisasm_prints_it
+10/13 tests passed
+-- e2e program
+sass rc=0 1 fallbacks
+ptx rc=0
+lines differing SASS vs PTX: 0
+host reference mismatches: 0, known-answer mismatches: 0
+=== FFMA2_BREAK=6
+-- test_f32x2_sass
+[ FAIL ] every_packed_line_decodes_prints_as_nvdisasm_did_and_is_run
+[ FAIL ] a_cubin_of_the_packed_instructions_has_nothing_unsupported
+[ FAIL ] forms_of_unknown_meaning_are_refused_by_name
+[ FAIL ] an_immediate_that_is_not_one_float_for_both_lanes_is_refused
+3/7 tests passed
+-- test_sass_decode
+[ FAIL ] sm_100_decodes_as_nvdisasm_prints_it
+[ FAIL ] sm_100a_decodes_as_nvdisasm_prints_it
+[ FAIL ] sm_103a_decodes_as_nvdisasm_prints_it
+10/13 tests passed
+-- e2e program
+sass rc=0 1 fallbacks
+ptx rc=0
+lines differing SASS vs PTX: 0
+host reference mismatches: 0, known-answer mismatches: 0
+=== FFMA2_BREAK=7
+-- test_f32x2_sass
+[ FAIL ] the_shared_arithmetic_rounds_each_lane_as_ieee_says
+6/7 tests passed
+-- test_sass_decode
+13/13 tests passed
+-- e2e program
+sass rc=0 0 fallbacks
+ptx rc=0
+lines differing SASS vs PTX: 452
+host reference mismatches: 0, known-answer mismatches: 0
+=== FFMA2_BREAK=8
+-- test_f32x2_sass
+7/7 tests passed
+-- test_sass_decode
+13/13 tests passed
+-- e2e program
+sass rc=1 0 fallbacks
+ptx rc=0
+lines differing SASS vs PTX: 77
+host reference mismatches: 102392, known-answer mismatches: 0
+=== FFMA2_BREAK=9
+-- test_f32x2_sass
+[ FAIL ] sm_120_keeps_its_uvimnmx_at_the_same_low_opcode
+6/7 tests passed
+-- test_sass_decode
+[ FAIL ] sm_120_decodes_as_nvdisasm_prints_it
+[ FAIL ] sm_120a_decodes_as_nvdisasm_prints_it
+11/13 tests passed
+-- e2e program
+sass rc=0 0 fallbacks
+ptx rc=0
+lines differing SASS vs PTX: 0
+host reference mismatches: 0, known-answer mismatches: 0

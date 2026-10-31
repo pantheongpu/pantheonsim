@@ -1,0 +1,49 @@
+== sim nvidia/a10g
+name=NVIDIA A10G cc=8.6 sms=80 smem_block=49152 smem_optin=101376 smem_sm=102400 max_thr_sm=1536 max_blk_sm=16 regs_sm=65536 l2=6291456 mem_gib=22.1 bus=384 cluster=0 coop=1 async=2
+set_attr(101376 B) -> cudaSuccess
+launch dyn_smem=101376 -> cudaSuccess
+occupancy blocks/SM @1024 thr = 1 -> persistent grid 80 blocks
+clusterLaunch attr 0
+== sim nvidia/t4
+name=Tesla T4 cc=7.5 sms=40 smem_block=49152 smem_optin=65536 smem_sm=65536 max_thr_sm=1024 max_blk_sm=16 regs_sm=65536 l2=4194304 mem_gib=14.6 bus=256 cluster=0 coop=1 async=3
+set_attr(65536 B) -> cudaErrorInvalidPtx
+launch dyn_smem=65536 -> cudaErrorInvalidPtx
+occupancy blocks/SM @1024 thr = 0 -> persistent grid 0 blocks
+clusterLaunch attr 0
+== sim nvidia/a100
+name=NVIDIA A100-SXM4-80GB cc=8.0 sms=108 smem_block=49152 smem_optin=166912 smem_sm=167936 max_thr_sm=2048 max_blk_sm=32 regs_sm=65536 l2=41943040 mem_gib=79.3 bus=5120 cluster=0 coop=1 async=2
+set_attr(166912 B) -> cudaErrorInvalidPtx
+launch dyn_smem=166912 -> cudaErrorInvalidPtx
+occupancy blocks/SM @1024 thr = 0 -> persistent grid 0 blocks
+clusterLaunch attr 0
+== sim nvidia/l4
+name=NVIDIA L4 cc=8.9 sms=58 smem_block=49152 smem_optin=101376 smem_sm=102400 max_thr_sm=1536 max_blk_sm=24 regs_sm=65536 l2=50331648 mem_gib=22.0 bus=192 cluster=0 coop=1 async=2
+set_attr(101376 B) -> cudaSuccess
+launch dyn_smem=101376 -> cudaSuccess
+occupancy blocks/SM @1024 thr = 1 -> persistent grid 58 blocks
+clusterLaunch attr 0
+== sim nvidia/l40s
+name=NVIDIA L40S cc=8.9 sms=142 smem_block=49152 smem_optin=101376 smem_sm=102400 max_thr_sm=1536 max_blk_sm=24 regs_sm=65536 l2=100663296 mem_gib=44.4 bus=384 cluster=0 coop=1 async=2
+set_attr(101376 B) -> cudaSuccess
+launch dyn_smem=101376 -> cudaSuccess
+occupancy blocks/SM @1024 thr = 1 -> persistent grid 142 blocks
+clusterLaunch attr 0
+== sim nvidia/h100
+name=NVIDIA H100 80GB HBM3 cc=9.0 sms=132 smem_block=49152 smem_optin=232448 smem_sm=233472 max_thr_sm=2048 max_blk_sm=32 regs_sm=65536 l2=52428800 mem_gib=79.2 bus=5120 cluster=1 coop=1 async=2
+set_attr(232448 B) -> cudaSuccess
+launch dyn_smem=232448 -> cudaSuccess
+occupancy blocks/SM @1024 thr = 2 -> persistent grid 264 blocks
+clusterLaunch attr 1
+== sim nvidia/rtx5090
+name=NVIDIA GeForce RTX 5090 cc=12.0 sms=170 smem_block=49152 smem_optin=101376 smem_sm=102400 max_thr_sm=1536 max_blk_sm=24 regs_sm=65536 l2=100663296 mem_gib=31.8 bus=512 cluster=1 coop=1 async=2
+set_attr(101376 B) -> cudaSuccess
+launch dyn_smem=101376 -> cudaSuccess
+occupancy blocks/SM @1024 thr = 1 -> persistent grid 170 blocks
+clusterLaunch attr 1
+== native A10G, launch sized as an H100 profile asks (232448 B)
+name=NVIDIA A10G cc=8.6 sms=80 smem_block=49152 smem_optin=101376 smem_sm=102400 max_thr_sm=1536 max_blk_sm=16 regs_sm=65536 l2=6291456 mem_gib=22.1 bus=384 cluster=0 coop=1 async=2
+(override: pretend the simulated profile reported opt-in smem=232448)
+set_attr(232448 B) -> cudaErrorInvalidValue
+launch dyn_smem=232448 -> cudaErrorInvalidValue
+occupancy blocks/SM @1024 thr = 1 -> persistent grid 80 blocks
+clusterLaunch attr 0

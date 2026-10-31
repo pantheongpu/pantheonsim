@@ -22,6 +22,7 @@
 
 #include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/window_check.hpp"
+#include "vgpu/simd/simd.hpp"
 #include "vtest.hpp"
 
 namespace mc = vgpu::exec::memcount;
@@ -128,6 +129,9 @@ void check(const std::vector<uint64_t>& a, uint64_t mask, unsigned lanes, uint64
     const uint64_t ss = sectors_def(a, m32, 32, span, SIZE_MAX);
     if (mc::distinct_sectors(a.data(), m32, 32, bytes, SIZE_MAX) != ss)
       throw vtest::Failure("sass sectors " + std::to_string(mc::distinct_sectors(a.data(), m32, 32, bytes, SIZE_MAX)) + " vs " +
+                           std::to_string(ss) + ": " + where);
+    if (mc::distinct_sectors_uncapped(a.data(), m32, 32, bytes) != ss)   // (the SASS executor's own entry: the closed forms, then the list)
+      throw vtest::Failure("sass sectors (uncapped) " + std::to_string(mc::distinct_sectors_uncapped(a.data(), m32, 32, bytes)) + " vs " +
                            std::to_string(ss) + ": " + where);
     bool sane = true;
     for (unsigned l = 0; l < 32; ++l) sane = sane && (!(m32 >> l & 1) || a[l] <= ~uint64_t{0} - 256);
@@ -282,6 +286,47 @@ VTEST(closed_forms_few_lanes_scattered) {
   }
 }
 
+// The thread-private array a kernel indexes by a value of its own -- words (or wider accesses) in a few sectors in no
+// order, partial masks, a window that starts below the first lane's, and one that runs out of it -- counted with the AVX2
+// window kernel and without it (a host without AVX2, VGPU_SIMD=base: the kernel is then absent and both runs are the
+// scalar forms), each against the definition.
+VTEST(closed_forms_private_arrays_with_and_without_the_simd_window) {
+  for (int pass = 0; pass < 2; ++pass) {
+    vgpu::simd::testing::use_sector_window_kernel(pass == 0);
+    Rng rng(11);
+    for (int iter = 0; iter < 80000; ++iter) {
+      const unsigned lanes = rng.below(5) == 0 ? 64 : 32;
+      const uint64_t all = lanes == 64 ? ~uint64_t{0} : 0xFFFFFFFFull;
+      std::vector<uint64_t> a(64, 0);
+      const uint64_t bases[] = {0, 4, 28, 31, 60, 1000, 0x7f0000001000ull + 28, (uint64_t{1} << 62) - 300, (uint64_t{1} << 62) - 40,
+                                (uint64_t{1} << 62), ~uint64_t{0} - 200, rng.below(1ull << 20)};
+      const uint64_t base = bases[rng.below(sizeof bases / sizeof bases[0])];
+      const unsigned words = 1 + static_cast<unsigned>(rng.below(rng.below(2) ? 64 : 520));   // the window, in words
+      const uint64_t first_back = rng.below(3) ? 0 : 4 * rng.below(words);                    // the first lane sits above the window's start
+      const unsigned wrap = 1 + static_cast<unsigned>(rng.below(64));
+      const unsigned how = static_cast<unsigned>(rng.below(3));
+      for (unsigned l = 0; l < 64; ++l) {
+        const uint64_t w = how == 0 ? rng.below(words) : how == 1 ? (l * 5 + 3) % wrap : (rng.below(wrap) + l) % words;
+        a[l] = base + 4 * w;
+      }
+      a[0] = a[0] + first_back;
+      if (rng.below(3) == 0) for (unsigned l = 0; l < 64; ++l) a[l] += rng.below(4);   // unaligned
+      uint64_t mask = all;
+      switch (rng.below(5)) {
+        case 0: break;
+        case 1: mask = rng.next() & all; break;
+        case 2: mask = (all >> rng.below(lanes)) << rng.below(lanes / 2); mask &= all; break;
+        case 3: mask = all >> rng.below(lanes); break;
+        default: mask = (uint64_t{1} << rng.below(lanes)) | (uint64_t{1} << rng.below(lanes)); break;
+      }
+      if (mask == 0) mask = 1;
+      const uint64_t spans[] = {1, 2, 4, 4, 4, 8, 16, 12, 24, 31, 32};
+      check(a, mask, lanes, spans[rng.below(sizeof spans / sizeof spans[0])]);
+    }
+  }
+  vgpu::simd::testing::use_sector_window_kernel(true);   // (as the library left it)
+}
+
 // 64 lanes of 8 bytes, each straddling two sectors of its own, in no order: 128 sectors, which a 128-slot table could not
 // hold (the hash count is only for up to 32 lanes), and wide accesses that the closed forms are not made for (their
 // answers are the general counting's, and agree with the definition).
@@ -370,6 +415,13 @@ VTEST(window_checks_equal_the_per_lane_tests) {
     for (unsigned l = 0; l < 32; ++l)
       if (mask >> l & 1) sc.add(offs[l], rank);
     if (sc.inside(size, bytes, mask != 0) != want) throw vtest::Failure("shared window check differs from the per-lane test at iteration " + std::to_string(iter));
+    if (mask == 0xFFFFFFFFu) {   // a whole warp: the vectored form of the same test
+      uint32_t w32[32];
+      for (unsigned l = 0; l < 32; ++l) w32[l] = static_cast<uint32_t>(offs[l]);
+      vgpu::exec::SharedWindowCheck wc;
+      wc.add_warp(w32, static_cast<uint32_t>(rank));
+      if (wc.inside(size, bytes, true) != want) throw vtest::Failure("whole-warp shared window check differs from the per-lane test at iteration " + std::to_string(iter));
+    }
     // Local: the earlier loop, over frame offsets.
     bool want_local = true;
     uint64_t loc[32];

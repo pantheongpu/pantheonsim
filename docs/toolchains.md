@@ -27,5 +27,7 @@ Inside `./run` they are the same programs. `build/vgpu info --gpu amd/mi300x` sh
 the `gfx` name of a simulated AMD GPU. `make doctor` reports which compiler it finds.
 
 Without a compiler, `./run` still works: `nvidia-smi`, Python, PyTorch and any program
-built elsewhere run; `nvcc` and `hipcc` are simply not there to call. Binaries from CUDA 12 and 13
-and ROCm 6.4 and 7.x work ([status.md](status.md)).
+built elsewhere run; `nvcc` and `hipcc` are simply not there to call. Programs built with CUDA 12 or 13
+run on a simulator built for the same CUDA major (the default build is 13; the
+[container images](docker.md) come in both), and ROCm 6.4 and 7.x programs work
+([status.md](status.md)).

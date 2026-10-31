@@ -43,7 +43,8 @@ workflow).
 - A conflict can also appear on a PR whose run is complete. Nothing is
   cancelled then; the label is the signal.
 - Jobs on a bare image with neither `gh` nor `curl` cannot ask the API. The
-  `container` job in `action.yml` is one, and is exempt.
+  `container` job in `action.yml` and the `ci-setup` job in `ci-setup-script.yml`
+  are such jobs, and are exempt.
 - On a PR from a fork the token is read-only, so the guard cannot cancel the
   run; it fails its job instead.
 

@@ -33,6 +33,21 @@ jobs:
       cuda12_0: ${{ steps.find.outputs.cuda12_0 }}
       cuda13_0: ${{ steps.find.outputs.cuda13_0 }}
     steps:
+      # A cancelled container job (ASan, TSan, SASS: they run as root) can leave root-owned files
+      # in this runner's workspace, and the checkout below cannot remove them. Take it back first.
+      - name: Take back a workspace a container job left
+        run: |
+          ws="$GITHUB_WORKSPACE"
+          if [[ -d "$ws" ]] && [[ -n "$(find "$ws" -maxdepth 3 ! -user "$(id -un)" -print -quit 2>/dev/null)" ]]; then
+            # sudo when the runner user has it without a password; otherwise docker, which the
+            # runner user always has on these hosts, as root in a throwaway container.
+            if ! sudo -n chown -R "$(id -u):$(id -g)" "$ws" 2>/dev/null; then
+              docker run --rm --entrypoint /bin/sh -v "$(dirname "$ws"):/w" alpine \
+                -c "chown -R $(id -u):$(id -g) /w/$(basename "$ws")" \
+                || echo "::warning::could not take back $ws; the checkout may fail"
+            fi
+          fi
+
       - uses: actions/checkout@v4
         with:
           sparse-checkout: .github/ci-image

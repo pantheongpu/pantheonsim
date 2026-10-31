@@ -76,6 +76,7 @@ struct Operand {
   uint32_t fbits = 0;       // FImm: the float's bits
   uint8_t fwidth = 32;      // FImm: 16, 32 or 64
   uint8_t slot = 0;         // ALU sources: the encoding field it came from
+  bool bars_after = false;  // |.| closes after the suffix, as |UR8.F32x2.HI_LO| (the packed fp32 ops' uniform operands)
 };
 
 // Every instruction VirtualGPU decodes. The executor switches on this.

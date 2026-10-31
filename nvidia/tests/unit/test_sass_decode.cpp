@@ -27,8 +27,8 @@ bool runs_instr(const Instr& ins);   // src/sass/exec.cpp
 namespace {
 
 // What the executor refuses on purpose, leaving a kernel to its PTX
-// (nvidia/docs/sass.md): multimem's LDGMC, TMA's im2col::w modes, and the
-// texture forms it does not implement. Anything else refused is a
+// (nvidia/docs/sass.md): multimem's LDGMC, TMA's im2col::w modes, the
+// texture forms it does not implement, and the packed fp32 forms nothing here knows the meaning of. Anything else refused is a
 // mistake -- twice a case inserted into executes() fell through and turned
 // away most instructions, which only showed as kernels quietly running on
 // PTX.
@@ -38,6 +38,8 @@ bool refused_on_purpose(const sass::Instr& ins) {
       if (x == m) return true;
     return false;
   };
+  // The packed fp32 forms whose meaning is unknown (.FMZ, both swizzle bits, an immediate without .F32; dec_f32x2): left to PTX.
+  if ((ins.mnemonic == "FFMA2" || ins.mnemonic == "FMUL2" || ins.mnemonic == "FADD2") && ins.f[4]) return true;
   return ins.mnemonic == "LDGMC" || (ins.mnemonic == "UTMALDG" && (has("W") || has("W128"))) ||
          ins.mnemonic == "TEX" || ins.mnemonic == "TLD" || ins.mnemonic == "TLD4";
 }

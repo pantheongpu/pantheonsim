@@ -1,0 +1,20 @@
+--- /w/col/g5.xlarge//driver_params.txt	2026-10-18 03:32:21.000000000 +0000
++++ /w/col/g5.xlarge//driver_params.sim	2026-10-18 03:55:38.974003004 +0000
+@@ -201,7 +201,7 @@
+ CB cuMemPoolExportToShareableHandle ENTER handle_out=set pool=set handleType=1 flags=0
+ CB cuMemPoolExportToShareableHandle EXIT ret=1
+ CB cuMemPoolImportFromShareableHandle ENTER pool_out=set handle=set handleType=1 flags=0
+-CB cuMemPoolImportFromShareableHandle EXIT ret=999
++CB cuMemPoolImportFromShareableHandle EXIT ret=801
+ CB cuMemPoolExportPointer ENTER shareData_out=set ptr=big
+ CB cuMemPoolExportPointer EXIT ret=1
+ CB cuMemPoolImportPointer ENTER ptr_out=set pool=set shareData=set
+@@ -456,7 +456,7 @@
+ REC driver cuMemPoolGetAccess ret=0
+ REC driver cuMemAllocFromPoolAsync ret=0
+ REC driver cuMemPoolExportToShareableHandle ret=1
+-REC driver cuMemPoolImportFromShareableHandle ret=999
++REC driver cuMemPoolImportFromShareableHandle ret=801
+ REC driver cuMemPoolExportPointer ret=1
+ REC driver cuMemPoolImportPointer ret=1
+ REC driver cuMemFreeAsync ret=0

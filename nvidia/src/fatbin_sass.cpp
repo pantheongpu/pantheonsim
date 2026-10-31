@@ -16,7 +16,7 @@ std::string pick_cubin(const void* fatbin, uint32_t cc) {
   if (const char* v = std::getenv("VGPU_SASS"); v && v[0] == '0') return {};
   std::vector<FatbinPtx> elfs;
   try {
-    elfs = extract_elf(fatbin);
+    elfs = extract_elf_for(fatbin, cc);
   } catch (const Error&) {
     return {};
   }

@@ -44,6 +44,13 @@ outputs:
   build-dir:
     description: Where the simulator was built.
     value: ${{ steps.paths.outputs.build }}
+  source-dir:
+    description: >
+      The simulator's source tree. It holds tests/workloads/run_pantheon_workloads.sh, which
+      builds and runs the pantheon workloads (VGPU_PANTHEON_DIR names a pantheon checkout,
+      VGPU_BUILD_DIR the build-dir above), so a project that has the pantheon workloads can
+      run them without a second checkout of the simulator.
+    value: ${{ steps.paths.outputs.source }}
   shim-dir:
     description: The simulator's CUDA libraries, for LD_LIBRARY_PATH when not using `vgpu run`.
     value: ${{ steps.paths.outputs.shim }}
@@ -193,6 +200,7 @@ runs:
         nvcc_version=$( { nvcc --version 2>/dev/null || true; } | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)
         {
           echo "build=$build"
+          echo "source=$SRC"
           echo "shim=$build/shim"
           # The OS release too: a build from 24.04 does not load on 22.04.
           . /etc/os-release
@@ -201,7 +209,7 @@ runs:
 
     - name: Restore a previous build
       id: cache
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ steps.paths.outputs.build }}
         key: ${{ steps.paths.outputs.key }}

@@ -7,7 +7,12 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <map>
+#include <type_traits>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 namespace vgpu::sass::tier {
 
@@ -272,7 +277,7 @@ const char* form_name(Form f) {
                                       "stl",   "lop3",  "lea",    "shf",    "isetp", "fsetp",  "fsel",     "ffma",
                                       "fadd",  "fmul",  "dop",    "bra",   "bssy",  "nop",    "plop3", "s2r",   "cs2r", "sel",   "prmt",  "imnmx",
                                       "fmnmx", "mufu",  "f2i",   "i2f",    "f2fp",  "dsetp", "hop2",    "unary", "iabs", "ldc",
-                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma"};
+                                      "bsync", "yield", "bar", "exit", "shfl",  "vote",  "umov",  "uldc", "uiadd3", "uimad", "uisetp", "ulea", "ulop3", "ushf", "uunary", "usel", "hmma", "match", "ldsm", "imma", "atom", "fchk", "call", "ret", "warpsync", "ldgsts", "ld", "st"};
   const unsigned i = static_cast<unsigned>(f);
   return i < sizeof names / sizeof names[0] ? names[i] : "?";
 }
@@ -343,10 +348,114 @@ const FormImpl& form_impl(Form f) {
       {Impl::Own, "UFLO, UPOPC: uniform datapath, bit counts"},
       {Impl::Own, "USEL: uniform datapath, a select"},
       {Impl::Kernel, "hmma, with the kind from Runner::hmma_kernel_kind (VGPU_TC_EXACT and the sm_86 tensor-core model), as exec_mma calls it"},
+      {Impl::Own, "MATCH: lane-value equality classes of 32- or 64-bit integers, no format"},
+      {Impl::Own, "LDSM: 32-bit words of the block's shared memory moved into the fragment registers; faults and the slow cases go to exec_mem"},
+      {Impl::Own, "IMMA: integer products summed in 64 bits and cut to 32 (or clamped per 128 bits under .SAT), no number format"},
+      {Impl::Own, "ATOMG, ATOM, ATOMS, RED: the interpreter's exec_mem runs it, so the rules are its own; the tier only skips execute()'s dispatch"},
+      {Impl::Own, "FCHK: a predicate that is true on every executing lane (the interpreter's rule: the slow path is exact)"},
+      {Impl::Own, "CALL: control flow"},
+      {Impl::Own, "RET: control flow"},
+      {Impl::Own, "WARPSYNC: control flow (the release is Runner::release_warpsync, the interpreter's)"},
+      {Impl::Own, "LDGSTS: a copy of bytes, no number format; the addresses, faults and the slow cases are exec_mem's, the counters mem_counters'"},
+      {Impl::Own, "LD: generic addresses told apart by window; shared moves as LDS, global as LDG; the rest is exec_mem's"},
+      {Impl::Own, "ST: as LD"},
   };
   static_assert(sizeof table / sizeof table[0] == static_cast<size_t>(Form::Count_), "form_impl: one entry per Form");
   const unsigned i = static_cast<unsigned>(f);
   return table[i < static_cast<unsigned>(Form::Count_) ? i : 0];
+}
+
+bool shfl_shape(unsigned mode, uint32_t b, uint32_t cc, ShflShape& s) {
+  s = ShflShape{};
+  if (b > 31 || ((cc >> 8) & 0x1f) != 0) return false;
+  const uint32_t clamp = cc & 0x1f;   // (with a segment mask of 0, the highest lane a lane may read)
+  s.x = b;
+  switch (mode) {
+    case 0:   // idx: lane b for every lane; in range when it is not past the clamp
+      s.kind = b <= clamp ? ShflShape::Splat : ShflShape::Ident;
+      s.in = b <= clamp ? ~uint32_t{0} : 0;
+      return true;
+    case 1: {   // up: lane l - b, in range when l - b >= clamp
+      const uint32_t t = b + clamp;
+      s.in = t >= 32 ? 0 : ~uint32_t{0} << t;
+      s.kind = s.in ? ShflShape::Up : ShflShape::Ident;
+      return true;
+    }
+    case 2:   // down: lane l + b, in range when l + b <= clamp
+      s.in = clamp < b ? 0 : clamp - b >= 31 ? ~uint32_t{0} : (uint32_t{1} << (clamp - b + 1)) - 1;
+      s.kind = s.in ? ShflShape::Down : ShflShape::Ident;
+      return true;
+    default:   // bfly: lane l ^ b, in range when that is not past the clamp (every lane, for a clamp of 31)
+      if (clamp != 31) return false;
+      s.kind = ShflShape::Butterfly;
+      s.in = ~uint32_t{0};
+      return true;
+  }
+}
+
+// The shuffle `sh` of the 32 words at vp into out, for the whole warp.
+void shfl_move(const ShflShape& sh, const uint32_t* vp, uint32_t* out) {
+  switch (sh.kind) {
+    case ShflShape::None:
+    case ShflShape::Ident:
+    {
+#if defined(__SSE2__)
+      __m128i v[8];   // (all eight read before any is written: a row moved onto itself is fine)
+      for (unsigned i = 0; i < 8; ++i) v[i] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vp) + i);
+      for (unsigned i = 0; i < 8; ++i) _mm_storeu_si128(reinterpret_cast<__m128i*>(out) + i, v[i]);
+#else
+      std::memmove(out, vp, 32 * sizeof(uint32_t));
+#endif
+      return;
+    }
+    case ShflShape::Splat: {
+      const uint32_t v = vp[sh.x];
+      for (unsigned l = 0; l < 32; ++l) out[l] = v;
+      return;
+    }
+    case ShflShape::Butterfly: {
+#if defined(__SSE2__)
+      const unsigned vx = sh.x >> 2;   // (the vector the four lanes come from, then the order within it)
+      const __m128i* in = reinterpret_cast<const __m128i*>(vp);
+      __m128i* o = reinterpret_cast<__m128i*>(out);
+      const auto run = [&](auto imm) {
+        __m128i v[8];
+        for (unsigned i = 0; i < 8; ++i) v[i] = _mm_shuffle_epi32(_mm_loadu_si128(in + (i ^ vx)), decltype(imm)::value);
+        for (unsigned i = 0; i < 8; ++i) _mm_storeu_si128(o + i, v[i]);
+      };
+      switch (sh.x & 3) {
+        case 0: run(std::integral_constant<int, _MM_SHUFFLE(3, 2, 1, 0)>{}); break;
+        case 1: run(std::integral_constant<int, _MM_SHUFFLE(2, 3, 0, 1)>{}); break;
+        case 2: run(std::integral_constant<int, _MM_SHUFFLE(1, 0, 3, 2)>{}); break;
+        default: run(std::integral_constant<int, _MM_SHUFFLE(0, 1, 2, 3)>{}); break;
+      }
+#else
+      for (unsigned l = 0; l < 32; ++l) out[l] = vp[l ^ sh.x];
+#endif
+      return;
+    }
+    case ShflShape::Down:   // lanes 0 .. n-1 read the lane x above, the others their own
+      for (unsigned l = 0; l < 32; ++l) out[l] = ((sh.in >> l) & 1) ? vp[(l + sh.x) & 31] : vp[l];
+      return;
+    default:   // Up
+      for (unsigned l = 0; l < 32; ++l) out[l] = ((sh.in >> l) & 1) ? vp[(l - sh.x) & 31] : vp[l];
+      return;
+  }
+}
+
+
+bool pure_register_form(Form f) {
+  switch (f) {
+    case Form::Mov: case Form::Iadd3: case Form::Iadd3x: case Form::Imad: case Form::Imad32: case Form::ImadWide: case Form::ImadHi:
+    case Form::IsetpEx: case Form::Popc: case Form::I2fp: case Form::Lop3: case Form::Lea: case Form::Shf: case Form::Isetp:
+    case Form::Fsetp: case Form::Fsel: case Form::Ffma: case Form::Fadd: case Form::Fmul: case Form::Dop: case Form::Prmt:
+    case Form::Imnmx: case Form::Fmnmx: case Form::Mufu: case Form::F2i: case Form::I2f: case Form::F2fp: case Form::Dsetp:
+    case Form::Hop2: case Form::Unary: case Form::Iabs: case Form::Umov: case Form::Uldc: case Form::Uiadd3: case Form::Uimad:
+    case Form::Uisetp: case Form::Ulea: case Form::Ulop3: case Form::Ushf: case Form::Uunary: case Form::Usel:
+      return true;
+    default:
+      return false;
+  }
 }
 
 void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
@@ -372,9 +481,10 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
 
   // Memory instructions: stores have no destination, so these come before the check below.
   switch (ins.op) {
-    case Op::LDG: case Op::STG: {
-      // Global loads and stores of 1, 2, 4 or 8 bytes on Ampere and later (Turing's address form is the interpreter's).
-      const bool store = ins.op == Op::STG;
+    case Op::LDG: case Op::STG: case Op::LD: case Op::ST: {
+      // Global loads and stores of 1, 2, 4 or 8 bytes on Ampere and later (Turing's address form is the interpreter's); LD and ST,
+      // whose addresses may be in the shared, local, parameter or constant window, are told apart at run time (h_generic).
+      const bool store = ins.op == Op::STG || ins.op == Op::ST, generic = ins.op == Op::LD || ins.op == Op::ST;
       const unsigned bytes = mem_bytes(ins.f[0]);
       if (sm < 80 || !(bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8 || bytes == 16) || ins.src.size() < (store ? 2u : 1u)) return;
       const Operand& d = store ? ins.src[1] : ins.dst.empty() ? ins.src[0] : ins.dst[0];
@@ -396,7 +506,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       m.imm = ins.src[0].imm;
       m.aux = wide ? 1 : 0;
       m.dst = d.reg == kRZ ? kNoReg : static_cast<uint16_t>(d.reg);
-      accept(store ? Form::Stg : Form::Ldg);
+      accept(generic ? (store ? Form::St : Form::Ld) : (store ? Form::Stg : Form::Ldg));
       return;
     }
     case Op::LDS: case Op::STS: case Op::LDL: case Op::STL: {
@@ -441,6 +551,102 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
       accept(Form::Ldc);
       return;
     }
+    case Op::LDSM: {   // ldmatrix of 16-bit elements (the packed 4-, 6- and 8-bit forms are the interpreter's): matrix i's rows are at the addresses of lanes 8i..8i+7
+      if (ins.f[3] != 0 && ins.f[3] != 2) return;
+      if (ins.f[2] != 0 || ins.f[0] < 1 || ins.f[0] > 4 || ins.dst.empty() || ins.dst[0].kind != Kind::Reg || ins.src.empty()) return;
+      const bool ur = ins.w.bit(91);
+      const unsigned ra = static_cast<unsigned>(ins.w.field(24, 8));
+      unsigned u = ~0u;
+      if (ur) {
+        u = static_cast<unsigned>(ins.w.field(32, sm >= 100 ? 8 : 6));
+        if (u == (sm >= 100 ? 255u : 63u)) u = ~0u;
+      }
+      const unsigned d = ins.dst[0].reg;
+      if (ra != kRZ) maxreg = static_cast<uint16_t>(ra + 1);
+      if (d != kRZ) maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(d + ins.f[0]));
+      m.a = ins.f[0];
+      m.b = ins.f[1] ? 1 : 0;
+      m.s[0].off = ra;
+      m.s[1].off = u;
+      m.imm = ins.src[0].imm;
+      m.dst = d == kRZ ? kNoReg : static_cast<uint16_t>(d);
+      accept(Form::Ldsm);
+      return;
+    }
+    case Op::IMMA: {   // exec_mma's integer path: dense, 8- or 4-bit elements of both operands, s32 accumulator
+      if (ins.f[3] || ins.dst.empty() || ins.dst[0].kind != Kind::Reg || ins.src.size() < 3) return;
+      for (int i = 0; i < 3; ++i)
+        if (ins.src[i].kind != Kind::Reg) return;
+      static const unsigned ks[] = {16, 0, 32, 0, 16, 32, 64, 128};
+      const unsigned shape = ins.f[0];
+      if (shape >= 8 || !ks[shape] || ins.f[4] != ins.f[5]) return;
+      const unsigned M = shape < 4 ? 8 : 16, K = ks[shape], per_reg = ins.f[4] ? 8 : 4;
+      const unsigned a_regs = M * K / (32 * per_reg), b_regs = K * 8 / (32 * per_reg), c_regs = M * 8 / 32;
+      const unsigned ra = ins.src[0].reg, rb = ins.src[1].reg, rc = ins.src[2].reg, rd = ins.dst[0].reg;
+      if (rd != kRZ) maxreg = std::max<unsigned>(maxreg, rd + c_regs);
+      if (ra != kRZ) maxreg = std::max<unsigned>(maxreg, ra + a_regs);
+      if (rb != kRZ) maxreg = std::max<unsigned>(maxreg, rb + b_regs);
+      if (rc != kRZ) maxreg = std::max<unsigned>(maxreg, rc + c_regs);
+      if (maxreg > 255) return;
+      m.s[0].off = ra;   // raw register numbers (kRZ: zeros)
+      m.s[1].off = rb;
+      m.s[2].off = rc;
+      m.dst = rd == kRZ ? kNoReg : static_cast<uint16_t>(rd);
+      m.a = M;
+      m.b = K;
+      m.aux = static_cast<uint8_t>((ins.f[1] ? 1 : 0) | (ins.f[2] ? 2 : 0) | (ins.f[6] ? 4 : 0) | (ins.f[4] ? 8 : 0));
+      accept(Form::Imma);
+      return;
+    }
+    case Op::LDGSTS: {   // cp.async: a global read of 4, 8 or 16 bytes a lane into the lane's shared address (.ZFILL, which shifts the read, is exec_mem's)
+      const unsigned bytes = mem_bytes(ins.f[0]);
+      if (sm < 80 || ins.f[1] || !(bytes == 4 || bytes == 8 || bytes == 16) || ins.straight || ins.src.size() < 2 || ins.src.size() > 3) return;
+      if (ins.src.size() == 3 && ins.src[2].kind != Kind::Pred) return;
+      const unsigned rs = static_cast<unsigned>(ins.w.field(16, 8)), rg = static_cast<unsigned>(ins.w.field(24, 8));
+      if (rs != kRZ) maxreg = static_cast<uint16_t>(rs + 1);
+      if (rg != kRZ) {
+        if (rg + 1 >= kRZ) return;
+        maxreg = std::max<uint16_t>(maxreg, static_cast<uint16_t>(rg + 2));
+      }
+      m.a = bytes;
+      m.b = static_cast<uint32_t>(ins.src[0].imm);   // the shared offset (the sum is taken in 32 bits)
+      m.imm = ins.src[1].imm;                        // the global offset
+      m.s[0].off = rs;
+      m.s[1].off = rg;
+      if (ins.src.size() == 3) {
+        m.p = pred_src(ins.src[2]);
+        m.aux = 1;
+      }
+      m.dst = kNoReg;
+      accept(Form::Ldgsts);
+      return;
+    }
+    case Op::ATOMG: case Op::ATOM: case Op::ATOMS: case Op::RED: {
+      // Run by exec_mem, which has the warp's atomics in one pass (the tier saves execute()'s probe of fast_alu and its dispatch).
+      // ATOMS.ARRIVE.64 (an mbarrier, f[2] == 2) goes to exec_syncs and stays the interpreter's.
+      if (ins.straight || (ins.op == Op::ATOMS && ins.f[2] == 2)) return;
+      m.dst = kNoReg;   // (nothing is written by the handler itself)
+      accept(Form::Atom);
+      return;
+    }
+    case Op::MATCH: {   // the lanes' values grouped by equality (exec_warp): ANY gives each lane the mask of the lanes holding its value, ALL whether every lane holds one
+      const bool any = ins.f[0], u64 = ins.f[1];
+      if (ins.dst.empty() || ins.src.empty() || ins.src[0].kind != Kind::Reg || ins.dst.back().kind != Kind::Reg) return;
+      if (ins.dst.size() > 1 && (any || ins.dst[0].kind != Kind::Pred)) return;
+      const unsigned ra = ins.src[0].reg;
+      if (ra != kRZ) {
+        if (u64 && ra + 1 >= kRZ) return;
+        maxreg = static_cast<uint16_t>(ra + (u64 ? 2 : 1));
+        m.s[0].kind = SrcKind::Row;
+        m.s[0].off = ra * 32u;
+        if (u64) { m.s[1].kind = SrcKind::Row; m.s[1].off = (ra + 1) * 32u; }
+      }
+      if (!reg_dst(ins.dst.back(), m.dst, maxreg)) return;
+      m.dst2 = ins.dst.size() > 1 ? static_cast<uint16_t>(ins.dst[0].reg) : static_cast<uint16_t>(kPT);
+      m.aux = static_cast<uint8_t>((any ? 1 : 0) | (u64 ? 2 : 0));
+      accept(Form::Match);
+      return;
+    }
     case Op::BRA: {
       // A branch to a fixed address, taken by the lanes the guard leaves (exec_control): no .DIV/.CONV, no .U.ANY, no
       // condition predicate beside the guard.
@@ -469,6 +675,32 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
     case Op::YIELD:       // the other lanes, and the other warps, go first
       accept(Form::Yield);
       return;
+    case Op::FCHK:        // whether a / b needs the division's slow path: always (exec_float), so the predicate is set on the executing lanes
+      if (ins.guard_uniform || ins.dst.empty() || ins.dst[0].kind != Kind::Pred) return;
+      m.dst = static_cast<uint16_t>(ins.dst[0].reg);
+      accept(Form::Fchk);
+      return;
+    case Op::CALL:        // a call to a fixed address in this section (exec_control; the run loop leaves the functions VirtualGPU provides to it)
+      if (ins.f[0] || ins.f[1] || ins.f[2] || ins.src.empty() || ins.src[0].kind != Kind::Label) return;
+      m.imm = ins.src[0].imm;
+      accept(Form::Call);
+      return;
+    case Op::RET:         // back to the address a register pair holds
+      if (ins.src.empty() || ins.src[0].reg >= kRZ - 1) return;
+      m.dst = static_cast<uint16_t>(ins.src[0].reg);
+      accept(Form::Ret);
+      return;
+    case Op::WARPSYNC: {  // the lanes that run it wait for the lanes their mask names (exec_control)
+      const Operand* mo = nullptr;
+      unsigned at = 0;
+      for (const Operand& o : ins.src) {
+        if (!mo && (o.kind == Kind::Reg || o.kind == Kind::UReg || o.kind == Kind::Imm || o.kind == Kind::CBank)) mo = &o, m.a = at;
+        ++at;
+      }
+      m.aux = (ins.f[0] || !mo) ? 1 : 0;   // .ALL, or no mask operand: every lane
+      accept(Form::Warpsync);
+      return;
+    }
     case Op::BSYNC:   // the lanes wait at convergence barrier Bx (exec_control); tier_run does the rest
       if (ins.src.empty() || ins.src[0].reg >= 16) return;
       m.c = ins.src[0].reg;
@@ -538,6 +770,8 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
         m.s[1].off = static_cast<uint32_t>(prog.pool.size() - 1);   // the table of source lanes
         m.b = in_range;
         m.aux = 1;
+        ShflShape sh;
+        if (shfl_shape(m.a, b, cc, sh)) m.c = static_cast<uint32_t>(sh.kind) | (sh.x << 8);   // (the shape of a full warp's shuffle; in_range is its predicate)
       }
       accept(Form::Shfl);
       return;
@@ -1202,7 +1436,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
 namespace {
 bool read_request() {
   const char* v = std::getenv("VGPU_TIER");
-  return v && v[0] == '1' && v[1] == 0;
+  return !(v && v[0] == '0' && v[1] == 0);   // on unless VGPU_TIER=0
 }
 }  // namespace
 

@@ -240,6 +240,85 @@ VTEST(a_matrix_instruction_broadcasts_a_blocks_a_to_its_group) {
   VCHECK(changed > 0);   // the two broadcasts took different blocks' A
 }
 
+VTEST(matrix_instructions_sum_their_products_in_order_from_the_accumulator) {
+  // v_mfma_f32_4x4x4_16b_f16, v_mfma_f32_16x16x16_f16 and v_mfma_f32_32x32x8_f16 on binary16 values spread over most of
+  // the exponent range, with a non-zero accumulator, so that the order the products are added in (K ascending, in
+  // double, from the accumulator) and every place a value comes from and goes to shows in the bits. Checked against
+  // the same arithmetic written out from the layouts, a lane at a time.
+  const amd::CodeObject o = object("asm_mfma_order");
+  uint64_t seed = 88172645463325252ull;
+  const auto rnd = [&]() { return seed ^= seed << 13, seed ^= seed >> 7, seed ^= seed << 17; };
+  const auto half_bits = [&]() -> uint16_t {
+    const uint64_t r = rnd();
+    uint32_t e = 1 + static_cast<uint32_t>(r % 30);
+    if ((r >> 8) % 40 == 0) e = 0;                   // zeros and subnormals
+    if ((r >> 16) % 150 == 0) e = 31;                // and now and then an infinity
+    const uint32_t m = (e == 31) ? 0 : static_cast<uint32_t>((r >> 24) & 0x3FF);
+    return static_cast<uint16_t>(((r >> 40) & 1) << 15 | e << 10 | m);
+  };
+  const auto half_value = [](uint16_t b) {
+    _Float16 h;
+    std::memcpy(&h, &b, 2);
+    return static_cast<double>(h);
+  };
+  const auto acc_bits = [&]() -> uint32_t {
+    const uint64_t r = rnd();
+    const uint32_t e = 100 + static_cast<uint32_t>(r % 50);   // float exponents around 2^-27 .. 2^22
+    return static_cast<uint32_t>(((r >> 40) & 1) << 31 | e << 23 | ((r >> 8) & 0x7FFFFF));
+  };
+  struct Form { const char* kernel; uint32_t regs; };
+  for (const Form form : {Form{"mfma4", 4}, Form{"mfma16", 4}, Form{"mfma32", 16}})
+    for (int round = 0; round < 24; ++round) {
+      MemoryManager mem(16ull << 20);
+      std::vector<uint16_t> a(64 * 4), b(64 * 4);   // four halves a lane
+      for (auto& x : a) x = half_bits();
+      for (auto& x : b) x = half_bits();
+      if (round % 2) {
+        // Powers of two, an exponent for each K that every row and column shares: products of 2^-28, 2^1 and 2^30 that
+        // cancel exactly or are swallowed (past a double's 53 bits) according to the order they are added in.
+        int ea[16], eb[16];
+        for (int k = 0; k < 16; ++k) ea[k] = rnd() % 2 ? -14 : 15, eb[k] = rnd() % 2 ? -14 : 0;
+        const auto pow2 = [&](int e) { return static_cast<uint16_t>(((rnd() >> 20) & 1) << 15 | static_cast<uint32_t>(e + 15) << 10); };
+        const bool k4 = std::strcmp(form.kernel, "mfma4") == 0, k16 = std::strcmp(form.kernel, "mfma16") == 0;
+        for (uint32_t lane = 0; lane < 64; ++lane)
+          for (uint32_t e = 0; e < 4; ++e) {
+            const uint32_t k = k4 ? e : k16 ? 4 * (lane / 16) + e : 4 * (lane / 32) + e;
+            a[lane * 4 + e] = pow2(ea[k]), b[lane * 4 + e] = pow2(eb[k]);
+          }
+      }
+      std::vector<uint32_t> c(64 * form.regs);
+      for (auto& x : c) x = acc_bits();
+      const uint64_t pa = mem.alloc(a.size() * 2), pb = mem.alloc(b.size() * 2), pc = mem.alloc(c.size() * 4),
+                     out = mem.alloc(c.size() * 4);
+      mem.write(pa, a.data(), a.size() * 2), mem.write(pb, b.data(), b.size() * 2), mem.write(pc, c.data(), c.size() * 4);
+      const std::vector<uint32_t> r = run(o, form.kernel, mem, out, c.size(), {pa, pb, pc, out});
+      const bool is4 = std::strcmp(form.kernel, "mfma4") == 0, is16 = std::strcmp(form.kernel, "mfma16") == 0;
+      const uint32_t n = is4 ? 4 : is16 ? 16 : 32;       // the block's size
+      const uint32_t kk = is4 ? 4 : is16 ? 16 : 8;      // K
+      const uint32_t group_lanes = is4 ? 4 : n;          // lanes holding one K-run's rows: row i is in lane (block, i)
+      int wrong = 0;
+      for (uint32_t lane = 0; lane < 64; ++lane)
+        for (uint32_t reg = 0; reg < form.regs; ++reg) {
+          uint32_t block = 0, row = 0;
+          const uint32_t col = lane % n;
+          if (is4) block = lane / 4, row = reg;
+          else if (is16) row = 4 * (lane / 16) + reg % 4;
+          else row = 8 * (reg % 16 / 4) + 4 * (lane / 32) + reg % 4;
+          double sum = static_cast<double>(*reinterpret_cast<const float*>(&c[lane * form.regs + reg]));
+          for (uint32_t k = 0; k < kk; ++k) {
+            const uint32_t a_lane = is4 ? block * 4 + row : row + group_lanes * (k / 4);
+            const uint32_t b_lane = is4 ? block * 4 + col : col + group_lanes * (k / 4);
+            sum += half_value(a[a_lane * 4 + k % 4]) * half_value(b[b_lane * 4 + k % 4]);
+          }
+          const float want = static_cast<float>(sum);
+          uint32_t want_bits;
+          std::memcpy(&want_bits, &want, 4);
+          wrong += r[lane * form.regs + reg] != want_bits;
+        }
+      VCHECK_EQ(wrong, 0);
+    }
+}
+
 VTEST(a_permute_or_swizzle_that_reads_a_switched_off_lane_gets_zero) {
   // The MI300 ISA guide: DS_BPERMUTE_B32 returns zero when src_lane is disabled, and DS_SWIZZLE_B32
   // reads "thread_valid[j] ? thread_in[j] : 0". Lanes that are off keep what they held. rocPRIM's

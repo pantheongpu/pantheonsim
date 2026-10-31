@@ -267,7 +267,7 @@ std::vector<FatbinPtx> extract_ptx(const void* data, size_t bytes) {
 }
 
 std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* consumed,
-                                       uint16_t kinds) {
+                                       uint16_t kinds, uint32_t elf_for_cc) {
   if (!data) throw Error::make(Err::InvalidValue, "NULL fatbin image");
   const uint8_t* p = static_cast<const uint8_t*>(data);
 
@@ -359,6 +359,12 @@ std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* 
       e = next;
       continue;
     }
+    // With elf_for_cc set, a cubin the device of that capability cannot run is skipped the same way (a
+    // cubin that did not decompress was dropped by the caller anyway, so no result changes).
+    if (elf_for_cc && eh.kind == kFatbinElf && !(eh.arch / 10 == elf_for_cc / 10 && eh.arch <= elf_for_cc)) {
+      e = next;
+      continue;
+    }
     uint64_t size = eh.payload_size ? eh.payload_size : eh.padded_payload_size;
     if (size > eh.padded_payload_size)
       throw Error::make(Err::InvalidValue, "fatbin entry payload_size (", size,
@@ -425,6 +431,13 @@ std::vector<FatbinImage> extract_images(const void* data, size_t bytes, size_t* 
 std::vector<FatbinPtx> extract_elf(const void* data, size_t bytes) {
   std::vector<FatbinPtx> out;
   for (FatbinImage& im : extract_images(data, bytes, nullptr, kFatbinElf))
+    if (!im.stored) out.push_back({im.arch, std::move(im.data)});
+  return out;
+}
+
+std::vector<FatbinPtx> extract_elf_for(const void* data, uint32_t cc) {
+  std::vector<FatbinPtx> out;
+  for (FatbinImage& im : extract_images(data, std::numeric_limits<size_t>::max(), nullptr, kFatbinElf, cc ? cc : 1))
     if (!im.stored) out.push_back({im.arch, std::move(im.data)});
   return out;
 }

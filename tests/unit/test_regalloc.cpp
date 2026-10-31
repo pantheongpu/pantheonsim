@@ -11,6 +11,7 @@
 #include "vgpu/ptx/regalloc.hpp"
 
 #include <string>
+#include <vector>
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
@@ -190,6 +191,61 @@ VTEST(occupancy_follows_nvidias_allocation_rules) {
   sm75.smem_alloc_unit = 256;
   sm75.reserved_smem = 0;
   VCHECK_EQ(blocks(8, 64, 12000, 0, sm75, 65536), 5u);
+}
+
+// compute_occupancy keeps the thread's last answer for a loop of launches of one kernel. An answer for other numbers must come out
+// as it does with nothing kept: each input changed alone, straight after the base call and after a call that is neither.
+VTEST(occupancy_answers_do_not_carry_over_from_the_call_before) {
+  struct In {
+    uint32_t v[9] = {41, 256, 2000, 0, 65536, 1536, 16, 102400, 32};   // regs, threads, static, dynamic, regs/SM, threads/SM, blocks/SM, smem/SM, warp
+    ptx::OccupancyRules rules;
+  };
+  const auto run = [](const In& in) {
+    const auto& v = in.v;
+    return ptx::compute_occupancy(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], in.rules);
+  };
+  const auto same = [](const ptx::Occupancy& a, const ptx::Occupancy& b) {
+    return a.warps_per_block == b.warps_per_block && a.blocks_per_sm == b.blocks_per_sm && a.warps_per_sm == b.warps_per_sm &&
+           std::string(a.limited_by) == b.limited_by;
+  };
+  In base;
+  base.rules.reg_alloc_unit = 256;
+  base.rules.sub_partitions = 4;
+  base.rules.regs_per_block = 65536;
+  base.rules.smem_alloc_unit = 128;
+  base.rules.reserved_smem = 1024;
+  std::vector<In> changed;
+  const uint32_t to[9] = {255, 64, 40000, 30000, 32768, 512, 2, 8000, 64};
+  for (int i = 0; i < 9; ++i) {
+    In c = base;
+    c.v[i] = to[i];
+    changed.push_back(c);
+  }
+  for (int i = 0; i < 5; ++i) {
+    In c = base;
+    (i == 0 ? c.rules.reg_alloc_unit : i == 1 ? c.rules.sub_partitions : i == 2 ? c.rules.regs_per_block : i == 3 ? c.rules.smem_alloc_unit
+                                                                                                         : c.rules.reserved_smem) =
+        i == 0 ? 1 : i == 1 ? 1 : i == 2 ? 1024 : i == 3 ? 1 : 0;
+    changed.push_back(c);
+  }
+  In other = base;
+  other.v[0] = 90, other.v[1] = 96;
+  size_t differ = 0;
+  for (size_t i = 0; i < changed.size(); ++i) {
+    run(other);   // evicts what was kept
+    const ptx::Occupancy fresh_changed = run(changed[i]);
+    const ptx::Occupancy base_after_changed = run(base);
+    run(other);
+    const ptx::Occupancy fresh_base = run(base);
+    const ptx::Occupancy changed_after_base = run(changed[i]);
+    if (!same(base_after_changed, fresh_base))
+      throw vtest::Failure("input " + std::to_string(i) + ": the base answer right after the changed one is not the one it has on its own");
+    if (!same(changed_after_base, fresh_changed))
+      throw vtest::Failure("input " + std::to_string(i) + ": the changed answer right after the base one is not the one it has on its own");
+    differ += !same(fresh_base, fresh_changed);
+  }
+  // (The test means something where a change changes the answer: the nine numbers and the rules that bind for these.)
+  VCHECK(differ >= 10);
 }
 
 VTEST(launch_bounds_are_enforced) {

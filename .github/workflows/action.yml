@@ -66,7 +66,10 @@ jobs:
           grep -q ' 0 different' matrix.txt
 
       - name: The outputs name the build
-        run: test -x "${{ steps.sim.outputs.build-dir }}/vgpu" && test -e "${{ steps.sim.outputs.shim-dir }}/libcudart.so"
+        run: |
+          test -x "${{ steps.sim.outputs.build-dir }}/vgpu" && test -e "${{ steps.sim.outputs.shim-dir }}/libcudart.so"
+          # The pantheon workload runner, for a project that runs the workloads from its own CI.
+          test -x "${{ steps.sim.outputs.source-dir }}/tests/workloads/run_pantheon_workloads.sh"
 
   amd:
     name: compile and run HIP on simulated AMD GPUs

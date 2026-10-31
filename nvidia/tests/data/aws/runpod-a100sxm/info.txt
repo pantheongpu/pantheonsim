@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA A100-SXM4-80GB, 8.0, 81920 MiB, 595.91.07, GPU-4463a58c-3d00-18a3-0391-890a198ca804
+Cuda compilation tools, release 13.0, V13.0.88
+Build cuda_13.0.r13.0/compiler.36424714_0
+ngpu=1 arch=sm_80 libs=/usr/local/cuda-13.0/lib64 inc=/usr/local/cuda-13.0/include

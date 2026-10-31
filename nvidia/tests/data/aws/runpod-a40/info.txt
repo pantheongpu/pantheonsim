@@ -1,0 +1,5 @@
+name, compute_cap, memory.total [MiB], driver_version, uuid
+NVIDIA A40, 8.6, 46068 MiB, 580.178.04, GPU-1ef55312-0bcf-692c-362e-80a0d599b1b5
+Cuda compilation tools, release 13.0, V13.0.88
+Build cuda_13.0.r13.0/compiler.36424714_0
+ngpu=1 arch=sm_86 libs=/usr/local/cuda-13.0/lib64 inc=/usr/local/cuda-13.0/include

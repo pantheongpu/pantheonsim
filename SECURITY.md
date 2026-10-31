@@ -33,6 +33,17 @@ a kernel affect the rest of the process.
 Treat running an untrusted binary through PantheonSim exactly like running it
 directly: do it in a container or a virtual machine.
 
+The opt-in JIT (`VGPU_JIT=1`, off by default) runs your C++ compiler on text it generates from the kernel's instruction words, and loads the
+result into the process. The text holds only numbers and fixed templates, never a string taken from the program being simulated. The cache
+directory is created `0700`, must belong to you and be writable by no one else, and an object is loaded only after its checksum and its
+instruction words match; but the objects are native code that runs with your permissions, so do not point `VGPU_JIT_CACHE` at a directory
+other users can write to.
+
+By default the SASS engine keeps a small file of the cubins it found to run in full (`$XDG_CACHE_HOME/pantheonsim/sass-ok-v1-<build id>`, else `~/.cache/pantheonsim/...`; 16-byte hashes, directory created `0700`, file `0600`) so that
+the next process does not decode them again. It is read or appended to only if it is a regular file of yours that no one else can write (not a symlink, not a FIFO), in a directory of the same kind;
+a relative `XDG_CACHE_HOME` or `HOME` is ignored, and nothing is written when no cache directory can be had. It holds no code, and
+a wrong entry could only send a cubin the executor cannot run to the executor instead of to the fatbin's PTX. It is capped at 65,536 hashes (1 MB). `VGPU_SASS_CACHE=0` turns it off.
+
 ## Supported versions
 
 Fixes land on `main`. The `pantheongpu/setup-pantheonsim` action pins a commit

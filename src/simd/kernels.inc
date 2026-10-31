@@ -9,6 +9,8 @@
 //
 // Contraction is off for the whole file: a product that the card rounds
 // before the sum must never be fused into an FMA by a build that has one.
+// VGPU_LANES_ONLY (1 in the JIT's generated code, src/sass/jit.cpp, which includes this same text): leaves out the kernels the
+// SASS ALU forms do not use (the half conversions, HMMA, binary64, the half-precision fused forms), which need the simulator's headers.
 
 namespace VGPU_SIMD_NS {
 
@@ -16,6 +18,7 @@ typedef float V8f __attribute__((vector_size(32)));
 // (A half array read through the 32-bit words that hold it.)
 typedef uint16_t __attribute__((may_alias)) U16A;
 
+#if !VGPU_LANES_ONLY
 // n a multiple of 8.
 inline void f16_to_f32_blocks(const U16A* in, float* out, size_t n) {
 #if VGPU_SIMD_AVX2
@@ -47,6 +50,7 @@ void f32_to_f16_k(const float* in, uint16_t* out, size_t n) {
   for (size_t i = whole; i < n; ++i) out[i] = f32_to_f16_bits(in[i]);
 }
 
+#endif  // !VGPU_LANES_ONLY
 typedef float V4f __attribute__((vector_size(16)));
 typedef int32_t V4i __attribute__((vector_size(16)));
 typedef uint32_t V4u __attribute__((vector_size(16)));
@@ -55,6 +59,7 @@ typedef uint16_t V8h __attribute__((vector_size(16)));
 
 static_assert(std::endian::native == std::endian::little, "the fragment kernels read a register's halves in memory order");
 
+#if !VGPU_LANES_ONLY
 // n 32-bit words of 16-bit (kind 0, 1) or tf32 (kind 2) operands, as floats, in memory order: word w's low half is
 // out[2w], its high half out[2w + 1]. n_words is a multiple of 4.
 inline void operands_to_f32(unsigned kind, const uint32_t* w, float* out, size_t n_words) {
@@ -198,6 +203,7 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
   }
 }
 
+#endif  // !VGPU_LANES_ONLY
 // ---- 32-lane ALU kernels (the SASS executor's fast_alu) ----------------------------------------------------------
 
 // A float result as the register holds it: a NaN is the canonical 0x7fffffff, whatever its payload or sign.
@@ -205,7 +211,7 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
 #define VGPU_CANON_NAN(v) \
   ({ const V8f f_ = (v); const V8u m_ = reinterpret_cast<V8u>(f_ != f_); (reinterpret_cast<V8u>(f_) & ~m_) | (0x7fffffffu & m_); })
 
-void iadd3_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t add) {
+VGPU_KN void iadd3_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t add) {
   for (unsigned i = 0; i < 32; i += 8) {
     V8u x, y, z;
     std::memcpy(&x, a + i, sizeof x);
@@ -216,7 +222,7 @@ void iadd3_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* 
   }
 }
 
-void imad_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c) {
+VGPU_KN void imad_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c) {
   for (unsigned i = 0; i < 32; i += 8) {
     V8u x, y, z;
     std::memcpy(&x, a + i, sizeof x);
@@ -241,7 +247,7 @@ void imad_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c
     return;                                           \
   } while (0)
 
-void lop3_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t lut) {
+VGPU_KN void lop3_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t lut) {
   // The tables compilers use most -- and, xor, or of two or three, a pass-through, a complement, and the few two-level ones --
   // by the expression itself (bit 4a + 2b + c of the table is the answer for those a, b, c); tests/unit/test_simd.cpp checks
   // every table.
@@ -287,7 +293,7 @@ void lop3_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c
   }
 }
 
-void ffma_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c) {
+VGPU_KN void ffma_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c) {
   for (unsigned i = 0; i < 32; i += 8) {
     V8f x, y, z;
     std::memcpy(&x, a + i, sizeof x);
@@ -308,7 +314,7 @@ void ffma_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c
   }
 }
 
-void fadd_k(uint32_t* r, const uint32_t* a, const uint32_t* b) {
+VGPU_KN void fadd_k(uint32_t* r, const uint32_t* a, const uint32_t* b) {
   for (unsigned i = 0; i < 32; i += 8) {
     V8f x, y;
     std::memcpy(&x, a + i, sizeof x);
@@ -318,7 +324,7 @@ void fadd_k(uint32_t* r, const uint32_t* a, const uint32_t* b) {
   }
 }
 
-void fmul_k(uint32_t* r, const uint32_t* a, const uint32_t* b) {
+VGPU_KN void fmul_k(uint32_t* r, const uint32_t* a, const uint32_t* b) {
   for (unsigned i = 0; i < 32; i += 8) {
     V8f x, y;
     std::memcpy(&x, a + i, sizeof x);
@@ -332,7 +338,7 @@ void fmul_k(uint32_t* r, const uint32_t* a, const uint32_t* b) {
 
 // d[l] = r[l] for the lanes of `mask` (bit l), l < n (n a multiple of 8, at most 64); the other lanes of d keep their
 // value. r is computed in full first, so d may be one of the sources.
-inline void store_masked(uint32_t* d, const uint32_t* r, uint64_t mask, unsigned n) {
+VGPU_KA inline void store_masked(uint32_t* d, const uint32_t* r, uint64_t mask, unsigned n) {
   const uint64_t all = n >= 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
   if ((mask & all) == all) {
     for (unsigned i = 0; i < n; i += 8) {   // (not memcpy(d, r, n * 4): a call into libc for a size not known here)
@@ -387,7 +393,7 @@ typedef int32_t V8i __attribute__((vector_size(32)));
 #endif
 
 template <unsigned Cmp, bool Sgn>
-inline uint64_t icmp_t(const uint32_t* a, const uint32_t* b, unsigned n) {
+VGPU_KA inline uint64_t icmp_t(const uint32_t* a, const uint32_t* b, unsigned n) {
   uint64_t out = 0;
 #if !VGPU_SIMD_AVX2
   // The baseline has no 256-bit compare: the compiler would split these vectors into scalar code anyway.
@@ -425,7 +431,7 @@ inline uint64_t icmp_t(const uint32_t* a, const uint32_t* b, unsigned n) {
   return out;
 }
 
-uint64_t icmp_mask_k(unsigned cmp, bool sgn, const uint32_t* a, const uint32_t* b, unsigned n) {
+VGPU_KN uint64_t icmp_mask_k(unsigned cmp, bool sgn, const uint32_t* a, const uint32_t* b, unsigned n) {
   switch (cmp * 2 + (sgn ? 1 : 0)) {
     case 0: return icmp_t<0, false>(a, b, n);
     case 1: return icmp_t<0, true>(a, b, n);
@@ -505,6 +511,7 @@ void imad_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint32_t*
   if (r != d) store_masked(d, r, mask, n);
 }
 
+#if !VGPU_LANES_ONLY
 // ---- binary64 lanes held as register pairs (the SASS executor: the low words of a register, the high words of the next)
 
 // kind 0: a + b, 1: a * b, 2: fma(a, b, c); `mods` has bit 2i for |source i| and bit 2i + 1 for -source i (the
@@ -642,27 +649,28 @@ void dop_m_k(unsigned kind, unsigned mods, uint32_t* dlo, uint32_t* dhi, const u
 #endif
 }
 
+#endif  // !VGPU_LANES_ONLY
 // ---- wider integer forms of the SASS executor's fast_alu (32 lanes) ---------------------------------------------------
 
-void blend_m_k(uint32_t* d, const uint32_t* r, uint32_t mask) { store_masked(d, r, mask, 32); }
+VGPU_KN void blend_m_k(uint32_t* d, const uint32_t* r, uint32_t mask) { store_masked(d, r, mask, 32); }
 
 #if VGPU_SIMD_AVX2
 // Eight lanes of a 32-bit vector widened to 64-bit lanes, in the order the AVX2 unpacks give: `p` holds lanes 0 1 4 5
 // and `q` lanes 2 3 6 7 (the high dword of each is `hi`, or zero). pair_pack_lo/hi put 64-bit results back in lane order.
-inline __m256i pair_pack_lo(__m256i p, __m256i q) {
+VGPU_KA inline __m256i pair_pack_lo(__m256i p, __m256i q) {
   return _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castsi256_ps(p), _mm256_castsi256_ps(q), 0x88));
 }
-inline __m256i pair_pack_hi(__m256i p, __m256i q) {
+VGPU_KA inline __m256i pair_pack_hi(__m256i p, __m256i q) {
   return _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castsi256_ps(p), _mm256_castsi256_ps(q), 0xDD));
 }
 // Bit k of the low 8 bits of `bits` as an all-ones dword in lane k.
-inline __m256i lane_mask_dwords(uint32_t bits) {
+VGPU_KA inline __m256i lane_mask_dwords(uint32_t bits) {
   const __m256i pick = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
   return _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(static_cast<int>(bits & 0xffu)), pick), pick);
 }
 #endif
 
-void iadd3x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t add, uint32_t cin_a,
+VGPU_KN void iadd3x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t add, uint32_t cin_a,
               uint32_t cin_b, uint32_t* ge1, uint32_t* ge2) {
   uint32_t o1 = 0, o2 = 0;
 #if VGPU_SIMD_AVX2
@@ -697,7 +705,7 @@ void iadd3x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t*
 
 #if VGPU_SIMD_AVX2
 template <bool Sgn>
-inline void imad_wide_avx2(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const uint32_t* b, const uint32_t* clo,
+VGPU_KA inline void imad_wide_avx2(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const uint32_t* b, const uint32_t* clo,
                            const uint32_t* chi, uint32_t cin, uint32_t* carry_out) {
   const __m256i zero = _mm256_setzero_si256();
   const __m256i sign = _mm256_set1_epi64x(static_cast<long long>(0x8000000000000000ull));
@@ -733,7 +741,7 @@ inline void imad_wide_avx2(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, cons
 }
 #endif
 
-void imad_wide_k(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const uint32_t* b, const uint32_t* clo,
+VGPU_KN void imad_wide_k(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const uint32_t* b, const uint32_t* clo,
                  const uint32_t* chi, bool sgn, uint32_t cin, uint32_t* carry_out) {
 #if VGPU_SIMD_AVX2
   if (sgn) imad_wide_avx2<true>(rlo, rhi, a, b, clo, chi, cin, carry_out);
@@ -755,7 +763,7 @@ void imad_wide_k(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const uint32_t
 
 #if VGPU_SIMD_AVX2
 template <bool Right, bool Sgn, bool Hi>
-inline void shf_avx2(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* top, bool wrap, unsigned width) {
+VGPU_KA inline void shf_avx2(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* top, bool wrap, unsigned width) {
   const __m256i zero = _mm256_setzero_si256();
   const __m256i wmask = _mm256_set1_epi32(static_cast<int>(width - 1)), wmax = _mm256_set1_epi32(static_cast<int>(width));
   const __m256i k63 = _mm256_set1_epi64x(63);
@@ -782,7 +790,7 @@ inline void shf_avx2(uint32_t* r, const uint32_t* lo, const uint32_t* n, const u
 }
 #endif
 
-void shf_k(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* top, unsigned type, bool wrap,
+VGPU_KN void shf_k(uint32_t* r, const uint32_t* lo, const uint32_t* n, const uint32_t* top, unsigned type, bool wrap,
            bool right, bool hi) {
   const bool is64 = type < 2, sgn = type == 0 || type == 2;
   const unsigned width = is64 ? 64 : 32;
@@ -863,11 +871,11 @@ inline uint32_t sc_finish(float f, unsigned flags) {
 inline float sc_in(uint32_t x, unsigned flags) { return std::bit_cast<float>((flags & 1) ? sc_ftz(x) : x); }
 
 #if VGPU_SIMD_AVX2
-inline __m256i fx_flush(__m256i x) {
+VGPU_KA inline __m256i fx_flush(__m256i x) {
   const __m256i m = _mm256_cmpeq_epi32(_mm256_and_si256(x, _mm256_set1_epi32(0x7f800000)), _mm256_setzero_si256());
   return _mm256_blendv_epi8(x, _mm256_and_si256(x, _mm256_set1_epi32(static_cast<int>(0x80000000u))), m);
 }
-inline __m256i fx_finish(__m256 v, unsigned flags) {
+VGPU_KA inline __m256i fx_finish(__m256 v, unsigned flags) {
   __m256i u = _mm256_castps_si256(v);
   if (flags & 1) u = fx_flush(u);
   if (flags & 2) {
@@ -879,13 +887,13 @@ inline __m256i fx_finish(__m256 v, unsigned flags) {
   const __m256 f = _mm256_castsi256_ps(u);
   return _mm256_blendv_epi8(u, _mm256_set1_epi32(0x7fffffff), _mm256_castps_si256(_mm256_cmp_ps(f, f, _CMP_UNORD_Q)));
 }
-inline __m256i fx_load(const uint32_t* p, unsigned flags) {
+VGPU_KA inline __m256i fx_load(const uint32_t* p, unsigned flags) {
   const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
   return (flags & 1) ? fx_flush(x) : x;
 }
 #endif
 
-void ffma_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, unsigned flags) {
+VGPU_KN void ffma_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, unsigned flags) {
 #if VGPU_SIMD_AVX2
   for (unsigned i = 0; i < 32; i += 8) {
     const __m256 v = _mm256_fmadd_ps(_mm256_castsi256_ps(fx_load(a + i, flags)), _mm256_castsi256_ps(fx_load(b + i, flags)),
@@ -897,7 +905,7 @@ void ffma_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t*
 #endif
 }
 
-void fadd_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned flags) {
+VGPU_KN void fadd_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned flags) {
 #if VGPU_SIMD_AVX2
   for (unsigned i = 0; i < 32; i += 8) {
     const __m256 v = _mm256_add_ps(_mm256_castsi256_ps(fx_load(a + i, flags)), _mm256_castsi256_ps(fx_load(b + i, flags)));
@@ -908,7 +916,7 @@ void fadd_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned flags)
 #endif
 }
 
-void fmul_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned flags) {
+VGPU_KN void fmul_x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned flags) {
 #if VGPU_SIMD_AVX2
   for (unsigned i = 0; i < 32; i += 8) {
     const __m256 v = _mm256_mul_ps(_mm256_castsi256_ps(fx_load(a + i, flags)), _mm256_castsi256_ps(fx_load(b + i, flags)));
@@ -944,7 +952,7 @@ inline bool sc_fcmp(unsigned cmp, float a, float b) {
 
 #if VGPU_SIMD_AVX2
 template <int Pred>
-inline uint32_t fcmp_avx2(const uint32_t* a, const uint32_t* b, unsigned flags) {
+VGPU_KA inline uint32_t fcmp_avx2(const uint32_t* a, const uint32_t* b, unsigned flags) {
   uint32_t out = 0;
   for (unsigned i = 0; i < 32; i += 8)
     out |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(_mm256_castsi256_ps(fx_load(a + i, flags)),
@@ -954,7 +962,7 @@ inline uint32_t fcmp_avx2(const uint32_t* a, const uint32_t* b, unsigned flags) 
 }
 #endif
 
-uint32_t fcmp_mask_k(unsigned cmp, bool ftz, const uint32_t* a, const uint32_t* b) {
+VGPU_KN uint32_t fcmp_mask_k(unsigned cmp, bool ftz, const uint32_t* a, const uint32_t* b) {
 #if VGPU_SIMD_AVX2
   const unsigned fl = ftz ? 1u : 0u;
   switch (cmp) {
@@ -1009,7 +1017,7 @@ void mufu_k(unsigned kind, uint32_t* r, const uint32_t* a) {
 }
 
 // I2F: an s32 or u32 to f32, to nearest even.
-void i2f_k(bool sgn, uint32_t* r, const uint32_t* a) {
+VGPU_KN void i2f_k(bool sgn, uint32_t* r, const uint32_t* a) {
 #if VGPU_SIMD_AVX2
   for (unsigned i = 0; i < 32; i += 8) {
     const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
@@ -1151,7 +1159,7 @@ inline uint32_t sc_prmt0(uint32_t a, uint32_t b, uint32_t sel) {
   return r;
 }
 
-void prmt0_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* sel) {
+VGPU_KN void prmt0_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* sel) {
 #if VGPU_SIMD_AVX2
   // Per 128-bit half, four lanes' words. The nibbles of each selector spread to four bytes; each byte then picks from its own lane's
   // word of a or of b (pshufb stays within a 128-bit half, and a lane's words are the same dword in both), and the sign
@@ -1177,6 +1185,7 @@ void prmt0_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* 
 #endif
 }
 
+#if !VGPU_LANES_ONLY
 // DSETP's comparison of two doubles held as register pairs (the low words of 32 lanes and the high words), after |x| and -x as
 // dop_m's `mods` say (bit 2i |source i|, bit 2i + 1 -source i; sources a, b are 0, 1). For the codes of float compares (1 to 14 --
 // as fcmp_mask) bit l of *r is the comparison. Code 0 is MIN and 15 MAX: bit l of *r is whether a is the answer (a NaN loses; of two
@@ -1392,4 +1401,135 @@ void hfma2_bf_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint3
   store_masked(d, r, mask, n);
 }
 
+// ---- tile products: the tensor-core instructions' sums over whole tiles ------------------------------------------------------
+
+typedef int32_t V8i __attribute__((vector_size(32)));
+
+// R rows by V vectors of 8 columns of D = C + A x B in f32, k in order, each product rounded and then added (never fused). A is M x K
+// (row stride K), B is K x N (row stride N), C and D are M x N with row strides ldc and ldd (C null: zeros). N is a multiple of 8.
+template <unsigned R, unsigned V, bool Canon>
+inline void tile_f32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D,
+                           size_t ldd) {
+  V8f acc[R][V];
+  for (unsigned r = 0; r < R; ++r)
+    for (unsigned v = 0; v < V; ++v) {
+      if (C) std::memcpy(&acc[r][v], C + size_t{i0 + r} * ldc + j0 + 8 * v, sizeof(V8f));
+      else acc[r][v] = V8f{};
+    }
+  for (unsigned k = 0; k < K; ++k) {
+    V8f b[V];
+    for (unsigned v = 0; v < V; ++v) std::memcpy(&b[v], B + size_t{k} * N + j0 + 8 * v, sizeof(V8f));
+    for (unsigned r = 0; r < R; ++r) {
+      const float a = A[size_t{i0 + r} * K + k];
+      for (unsigned v = 0; v < V; ++v) {
+        const V8f p = a * b[v];
+        acc[r][v] = acc[r][v] + p;
+      }
+    }
+  }
+  for (unsigned r = 0; r < R; ++r)
+    for (unsigned v = 0; v < V; ++v) {
+      if (Canon) {
+        // every NaN the host's additions kept becomes the canonical 0x7fffffff (the float compare is false for a NaN only)
+        const V8u nan = reinterpret_cast<V8u>(acc[r][v] != acc[r][v]);
+        acc[r][v] = reinterpret_cast<V8f>((reinterpret_cast<V8u>(acc[r][v]) & ~nan) | (0x7fffffffu & nan));
+      }
+      std::memcpy(D + size_t{i0 + r} * ldd + j0 + 8 * v, &acc[r][v], sizeof(V8f));
+    }
+}
+
+// `Canon`: a NaN in the result is the canonical 0x7fffffff (tile_f32c); else whichever NaN the host's additions kept.
+template <bool Canon>
+inline void tile_f32_impl(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
+  unsigned i0 = 0;
+  for (; i0 + 4 <= M; i0 += 4) {
+    unsigned j0 = 0;
+    for (; j0 + 16 <= N; j0 += 16) tile_f32_block<4, 2, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 8 <= N; j0 += 8) tile_f32_block<4, 1, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+  }
+  for (; i0 < M; ++i0) {
+    unsigned j0 = 0;
+    for (; j0 + 16 <= N; j0 += 16) tile_f32_block<1, 2, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+    for (; j0 + 8 <= N; j0 += 8) tile_f32_block<1, 1, Canon>(i0, j0, N, K, A, B, C, ldc, D, ldd);
+  }
+}
+
+void tile_f32_k(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
+  tile_f32_impl<false>(M, N, K, A, B, C, ldc, D, ldd);
+}
+void tile_f32c_k(unsigned M, unsigned N, unsigned K, const float* A, const float* B, const float* C, size_t ldc, float* D, size_t ldd) {
+  tile_f32_impl<true>(M, N, K, A, B, C, ldc, D, ldd);
+}
+
+// The same for 32-bit integers (the operands are small: 8-bit elements or less, so a block's sum of products fits in 32 bits). Without `sat`
+// one wrapping sum of C and every product; with it the products are summed `block` at a time and C, or the running value, plus a block's
+// sum is clamped to the s32 range after each block (the sum of an int64 accumulator clamped, as the engines' scalar form has it).
+template <unsigned R>
+inline void tile_i32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, size_t ldc,
+                           unsigned block, bool sat, int32_t* D, size_t ldd) {
+  V8u acc[R];
+  for (unsigned r = 0; r < R; ++r) {
+    if (C) std::memcpy(&acc[r], C + size_t{i0 + r} * ldc + j0, sizeof(V8u));
+    else acc[r] = V8u{};
+  }
+  if (!sat) {
+    for (unsigned k = 0; k < K; ++k) {
+      V8u b;
+      std::memcpy(&b, B + size_t{k} * N + j0, sizeof b);
+      for (unsigned r = 0; r < R; ++r) acc[r] = acc[r] + static_cast<uint32_t>(A[size_t{i0 + r} * K + k]) * b;
+    }
+  } else {
+    for (unsigned k0 = 0; k0 < K; k0 += block) {
+      V8u s[R] = {};
+      const unsigned k1 = k0 + block < K ? k0 + block : K;
+      for (unsigned k = k0; k < k1; ++k) {
+        V8u b;
+        std::memcpy(&b, B + size_t{k} * N + j0, sizeof b);
+        for (unsigned r = 0; r < R; ++r) s[r] = s[r] + static_cast<uint32_t>(A[size_t{i0 + r} * K + k]) * b;
+      }
+      for (unsigned r = 0; r < R; ++r) {
+        const V8u sum = acc[r] + s[r];
+        // Signed overflow of acc + s: both operands of one sign and the sum of the other.
+        const V8i ov = reinterpret_cast<V8i>((acc[r] ^ sum) & (s[r] ^ sum)) < 0;
+        // acc negative: INT32_MIN (0x80000000), else INT32_MAX (0x7fffffff)
+        const V8u neg = reinterpret_cast<V8u>(reinterpret_cast<V8i>(acc[r]) >> 31);
+        const V8u lim = (neg & 0x80000000u) | (~neg & 0x7fffffffu);
+        const V8u om = reinterpret_cast<V8u>(ov);
+        acc[r] = (om & lim) | (~om & sum);
+      }
+    }
+  }
+  for (unsigned r = 0; r < R; ++r) std::memcpy(D + size_t{i0 + r} * ldd + j0, &acc[r], sizeof(V8u));
+}
+
+void tile_i32_k(unsigned M, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, size_t ldc, unsigned block, bool sat,
+                int32_t* D, size_t ldd) {
+  unsigned i0 = 0;
+  for (; i0 + 4 <= M; i0 += 4)
+    for (unsigned j0 = 0; j0 + 8 <= N; j0 += 8) tile_i32_block<4>(i0, j0, N, K, A, B, C, ldc, block, sat, D, ldd);
+  for (; i0 < M; ++i0)
+    for (unsigned j0 = 0; j0 + 8 <= N; j0 += 8) tile_i32_block<1>(i0, j0, N, K, A, B, C, ldc, block, sat, D, ldd);
+}
+
+// D = C + A x B in binary64, k in order, each step one fused multiply-add in the host's current rounding mode (the caller sets it).
+void tile_f64_k(unsigned M, unsigned N, unsigned K, const double* A, const double* B, const double* C, double* D) {
+  for (unsigned i = 0; i < M; ++i) {
+    unsigned j = 0;
+#if VGPU_SIMD_AVX2
+    for (; j + 4 <= N; j += 4) {
+      __m256d acc = C ? _mm256_loadu_pd(C + size_t{i} * N + j) : _mm256_setzero_pd();
+      for (unsigned k = 0; k < K; ++k)
+        acc = _mm256_fmadd_pd(_mm256_set1_pd(A[size_t{i} * K + k]), _mm256_loadu_pd(B + size_t{k} * N + j), acc);
+      _mm256_storeu_pd(D + size_t{i} * N + j, acc);
+    }
+#endif
+    for (; j < N; ++j) {
+      double acc = C ? C[size_t{i} * N + j] : 0.0;
+      for (unsigned k = 0; k < K; ++k) acc = __builtin_fma(A[size_t{i} * K + k], B[size_t{k} * N + j], acc);
+      D[size_t{i} * N + j] = acc;
+    }
+  }
+}
+
+#endif  // !VGPU_LANES_ONLY
 }  // namespace VGPU_SIMD_NS

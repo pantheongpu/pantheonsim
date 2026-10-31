@@ -21,13 +21,15 @@ VGPU_GPU=nvidia/a10 LD_LIBRARY_PATH=/path/to/build/shim python your_program.py
 
 Numba talks to `libcuda` directly and loads no CUDA runtime at all, so it
 touches none of the fatbin or host-registration machinery the rest of the shim
-exists for. Two things had to be true for it to work:
+exists for. Three things had to be true for it to work:
 
 - **Every `cuIpc*` symbol must exist.** Numba resolves the IPC family during
   `cuInit` and fails at import if a symbol is missing — before it will report a
-  device, let alone launch anything. VirtualGPU's per-process virtual VRAM makes
-  a cross-process memory handle meaningless, so each of these refuses with
-  `CUDA_ERROR_NOT_SUPPORTED`; they exist to be found, not to be called.
+  device, let alone launch anything. The family is implemented: a memory handle
+  names the shared file that backs the allocation, so a second process can open
+  it (`cuIpcGetMemHandle`, `cuIpcOpenMemHandle`, `cuIpcCloseMemHandle`); an event
+  handle carries its origin only, since every operation has finished by the time
+  the call that started it returns.
 - **The JIT link API must produce something loadable.** Numba compiles Python to
   PTX itself and then calls `cuLinkCreate` / `cuLinkAddData` / `cuLinkComplete`
   to turn it into a module image. On hardware that image is a cubin. Here the

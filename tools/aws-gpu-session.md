@@ -186,7 +186,7 @@ scp -r $SSHO ubuntu@$IP:'~/out/sim-*' /tmp/h100-out/out/
 ```
 
 What the session produces beyond the L40S one: `cluster-occupancy` (cudaOccupancyMaxActiveClusters / MaxPotentialClusterSize on
-the H100 -> `cluster_occupancy.h100.expected`, to compare with `docs/clusters.md`'s derived answers and the GPC layout of
+the H100 -> `cluster_occupancy.h100.expected`, to compare with `nvidia/docs/clusters.md`'s derived answers and the GPC layout of
 `nvidia/profiles/h100.yaml`), `cudnn-dnn_hopper_engines` (which of the RoPE, MoE-backward and band-matrix graphs have an engine
 on Hopper, with the card's outputs; if they do, turn the probe into `dnn_frontend_ops`-style checks), and the cuDNN frontend tests
 (`dnn_frontend_ops`, `dnn_attention`, `dnn_sdpa_mask`) run against NVIDIA's cuDNN on sm_90.

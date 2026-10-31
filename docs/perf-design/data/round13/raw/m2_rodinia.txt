@@ -1,0 +1,75 @@
+=== backprop
+000000 _Z22bpnn_layerforward_CUDAPfS_S_S_ii     grid 1x1024x1 block 16x16x1 mem    1.2 MiB changed    1.1 MiB chunks 23 bad 0 words 0 maxulp 0 | card kernel      20.7 us push    0.21 ms pull    0.25 ms | sim    21.754 ms | AGREE 
+000001 _Z24bpnn_adjust_weights_cudaPfiS_iS_S_   grid 1x1024x1 block 16x16x1 mem    2.3 MiB changed    0.0 MiB chunks 42 bad 0 words 0 maxulp 0 | card kernel      29.3 us push    0.30 ms pull    0.55 ms | sim    19.872 ms | AGREE 
+SUMMARY /home/ubuntu/corp/rod/backprop: agree 2 differ 0 card-nondeterministic 0 failed/skipped 0
+=== gaussian
+000000 _Z4Fan1PfS_ii                            grid 1x1x1 block 512x1x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel      16.9 us push    0.03 ms pull    0.05 ms | sim     0.325 ms | AGREE 
+000001 _Z4Fan2PfS_S_iii                         grid 16x16x1 block 4x4x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel       9.8 us push    0.03 ms pull    0.05 ms | sim     0.758 ms | AGREE 
+000002 _Z4Fan1PfS_ii                            grid 1x1x1 block 512x1x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel       9.8 us push    0.03 ms pull    0.03 ms | sim     0.030 ms | AGREE 
+000003 _Z4Fan2PfS_S_iii                         grid 16x16x1 block 4x4x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel       9.9 us push    0.03 ms pull    0.03 ms | sim     0.374 ms | AGREE 
+000004 _Z4Fan1PfS_ii                            grid 1x1x1 block 512x1x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel      11.6 us push    0.03 ms pull    0.04 ms | sim     0.029 ms | AGREE 
+000005 _Z4Fan2PfS_S_iii                         grid 16x16x1 block 4x4x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel       9.5 us push    0.03 ms pull    0.03 ms | sim     0.363 ms | AGREE 
+SUMMARY /home/ubuntu/corp/rod/gaussian: agree 6 differ 0 card-nondeterministic 0 failed/skipped 0
+=== lud
+000000 _Z12lud_diagonalPfii                     grid 1x1x1 block 16x1x1 mem    0.2 MiB changed    0.1 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      28.2 us push    0.05 ms pull    0.05 ms | sim     0.908 ms | AGREE 
+000001 _Z13lud_perimeterPfii                    grid 15x1x1 block 32x1x1 mem    0.2 MiB changed    0.2 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      21.7 us push    0.02 ms pull    0.05 ms | sim     2.339 ms | AGREE 
+000002 _Z12lud_internalPfii                     grid 15x15x1 block 16x16x1 mem    0.2 MiB changed    0.2 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      11.1 us push    0.02 ms pull    0.05 ms | sim     6.251 ms | AGREE 
+000003 _Z12lud_diagonalPfii                     grid 1x1x1 block 16x1x1 mem    0.2 MiB changed    0.1 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      19.9 us push    0.02 ms pull    0.05 ms | sim     0.164 ms | AGREE 
+000004 _Z13lud_perimeterPfii                    grid 14x1x1 block 32x1x1 mem    0.2 MiB changed    0.2 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      21.5 us push    0.02 ms pull    0.05 ms | sim     1.220 ms | AGREE 
+000005 _Z12lud_internalPfii                     grid 14x14x1 block 16x16x1 mem    0.2 MiB changed    0.2 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      10.5 us push    0.02 ms pull    0.05 ms | sim     5.635 ms | AGREE 
+000006 _Z12lud_diagonalPfii                     grid 1x1x1 block 16x1x1 mem    0.2 MiB changed    0.1 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      20.4 us push    0.02 ms pull    0.05 ms | sim     0.159 ms | AGREE 
+000007 _Z13lud_perimeterPfii                    grid 13x1x1 block 32x1x1 mem    0.2 MiB changed    0.2 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      21.8 us push    0.02 ms pull    0.05 ms | sim     1.093 ms | AGREE 
+000008 _Z12lud_internalPfii                     grid 13x13x1 block 16x16x1 mem    0.2 MiB changed    0.2 MiB chunks 4 bad 0 words 0 maxulp 0 | card kernel      11.0 us push    0.05 ms pull    0.05 ms | sim     4.807 ms | AGREE 
+SUMMARY /home/ubuntu/corp/rod/lud: agree 9 differ 0 card-nondeterministic 0 failed/skipped 0
+=== needle
+000000 _Z20needle_cuda_shared_1PiS_iiii         grid 1x1x1 block 16x1x1 mem    0.5 MiB changed    0.1 MiB chunks 10 bad 0 words 0 maxulp 0 | card kernel      19.7 us push    0.07 ms pull    0.11 ms | sim     0.814 ms | AGREE 
+000001 _Z20needle_cuda_shared_1PiS_iiii         grid 2x1x1 block 16x1x1 mem    0.5 MiB changed    0.1 MiB chunks 10 bad 0 words 0 maxulp 0 | card kernel      13.1 us push    0.06 ms pull    0.10 ms | sim     0.295 ms | AGREE 
+000002 _Z20needle_cuda_shared_1PiS_iiii         grid 3x1x1 block 16x1x1 mem    0.5 MiB changed    0.1 MiB chunks 10 bad 0 words 0 maxulp 0 | card kernel      13.0 us push    0.06 ms pull    0.10 ms | sim     0.203 ms | AGREE 
+000003 _Z20needle_cuda_shared_2PiS_iiii         grid 15x1x1 block 16x1x1 mem    0.5 MiB changed    0.3 MiB chunks 10 bad 0 words 0 maxulp 0 | card kernel      12.7 us push    0.06 ms pull    0.12 ms | sim     0.856 ms | AGREE 
+000004 _Z20needle_cuda_shared_2PiS_iiii         grid 14x1x1 block 16x1x1 mem    0.5 MiB changed    0.3 MiB chunks 10 bad 0 words 0 maxulp 0 | card kernel      13.2 us push    0.06 ms pull    0.10 ms | sim     0.329 ms | AGREE 
+000005 _Z20needle_cuda_shared_2PiS_iiii         grid 13x1x1 block 16x1x1 mem    0.5 MiB changed    0.3 MiB chunks 10 bad 0 words 0 maxulp 0 | card kernel      12.7 us push    0.06 ms pull    0.10 ms | sim     0.324 ms | AGREE 
+SUMMARY /home/ubuntu/corp/rod/needle: agree 6 differ 0 card-nondeterministic 0 failed/skipped 0
+=== pathfinder
+000000 _Z14dynproc_kerneliPiS_S_iiii            grid 5x1x1 block 256x1x1 mem    0.2 MiB changed    0.0 MiB chunks 5 bad 0 words 0 maxulp 0 | card kernel      24.4 us push    0.04 ms pull    0.07 ms | sim     1.251 ms | AGREE 
+000001 _Z14dynproc_kerneliPiS_S_iiii            grid 5x1x1 block 256x1x1 mem    0.2 MiB changed    0.0 MiB chunks 5 bad 0 words 0 maxulp 0 | card kernel      16.1 us push    0.03 ms pull    0.06 ms | sim     0.677 ms | AGREE 
+000002 _Z14dynproc_kerneliPiS_S_iiii            grid 5x1x1 block 256x1x1 mem    0.2 MiB changed    0.0 MiB chunks 5 bad 0 words 0 maxulp 0 | card kernel      12.4 us push    0.03 ms pull    0.06 ms | sim     0.339 ms | AGREE 
+SUMMARY /home/ubuntu/corp/rod/pathfinder: agree 3 differ 0 card-nondeterministic 0 failed/skipped 0
+=== srad_v2
+SUMMARY /home/ubuntu/corp/rod/srad_v2: agree 0 differ 0 card-nondeterministic 0 failed/skipped 1
+=== particlefilter_float
+000000 _Z17likelihood_kernelPdS_S_S_S_PiS0_S_Ph grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.3 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel    2305.8 us push    0.16 ms pull    0.24 ms | sim    25.503 ms | AGREE 
+000001 _Z10sum_kernelPdi                        grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.0 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel      10.9 us push    0.16 ms pull    0.20 ms | sim     0.251 ms | AGREE 
+000002 _Z24normalize_weights_kernelPdiS_S_S_Pi  grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.0 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel      84.4 us push    0.16 ms pull    0.20 ms | sim     0.832 ms | AGREE 
+000003 _Z17find_index_kernelPdS_S_S_S_S_S_i     grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.0 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel     165.6 us push    0.16 ms pull    0.21 ms | sim     6.848 ms | AGREE 
+000004 _Z17likelihood_kernelPdS_S_S_S_PiS0_S_Ph grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.3 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel    2298.0 us push    0.19 ms pull    0.20 ms | sim    23.523 ms | AGREE 
+000005 _Z10sum_kernelPdi                        grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.0 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel      10.7 us push    0.16 ms pull    0.22 ms | sim     0.056 ms | AGREE 
+000006 _Z24normalize_weights_kernelPdiS_S_S_Pi  grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.0 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel      86.2 us push    0.16 ms pull    0.20 ms | sim     0.338 ms | AGREE 
+000007 _Z17find_index_kernelPdS_S_S_S_S_S_i     grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.0 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel     100.8 us push    0.18 ms pull    0.20 ms | sim     4.245 ms | AGREE 
+000008 _Z17likelihood_kernelPdS_S_S_S_PiS0_S_Ph grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.3 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel    2298.7 us push    0.16 ms pull    0.21 ms | sim    23.070 ms | AGREE 
+000009 _Z10sum_kernelPdi                        grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.0 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel      10.7 us push    0.16 ms pull    0.20 ms | sim     0.051 ms | AGREE 
+000010 _Z24normalize_weights_kernelPdiS_S_S_Pi  grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.0 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel      84.7 us push    0.16 ms pull    0.20 ms | sim     0.354 ms | AGREE 
+000011 _Z17find_index_kernelPdS_S_S_S_S_S_i     grid 2x1x1 block 512x1x1 mem    0.4 MiB changed    0.0 MiB chunks 21 bad 0 words 0 maxulp 0 | card kernel     152.2 us push    0.17 ms pull    0.20 ms | sim     6.385 ms | AGREE 
+SUMMARY /home/ubuntu/corp/rod/particlefilter_float: agree 12 differ 0 card-nondeterministic 0 failed/skipped 0
+=== sc_gpu
+000000 _Z19kernel_compute_costiilP5PointiiPfS1_ grid 2x1x1 block 512x1x1 mem    0.2 MiB changed    0.1 MiB chunks 5 bad 0 words 0 maxulp 0 | card kernel      19.3 us push    0.05 ms pull    0.07 ms | sim     1.023 ms | AGREE 
+000001 _Z19kernel_compute_costiilP5PointiiPfS1_ grid 2x1x1 block 512x1x1 mem    0.1 MiB changed    0.0 MiB chunks 5 bad 0 words 0 maxulp 0 | card kernel      11.8 us push    0.05 ms pull    0.06 ms | sim     0.401 ms | AGREE 
+000002 _Z19kernel_compute_costiilP5PointiiPfS1_ grid 2x1x1 block 512x1x1 mem    0.1 MiB changed    0.0 MiB chunks 5 bad 0 words 0 maxulp 0 | card kernel      11.7 us push    0.05 ms pull    0.07 ms | sim     0.433 ms | AGREE 
+SUMMARY /home/ubuntu/corp/rod/sc_gpu: agree 3 differ 0 card-nondeterministic 0 failed/skipped 0
+=== hotspot
+000000 _Z14calculate_tempiPfS_S_iiiiffffff      grid 6x6x1 block 16x16x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel      19.8 us push    0.03 ms pull    0.06 ms | sim     2.413 ms | AGREE 
+000001 _Z14calculate_tempiPfS_S_iiiiffffff      grid 6x6x1 block 16x16x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel      12.7 us push    0.03 ms pull    0.04 ms | sim     1.514 ms | AGREE 
+000002 _Z14calculate_tempiPfS_S_iiiiffffff      grid 6x6x1 block 16x16x1 mem    0.0 MiB changed    0.0 MiB chunks 3 bad 0 words 0 maxulp 0 | card kernel      12.3 us push    0.03 ms pull    0.04 ms | sim     1.525 ms | AGREE 
+SUMMARY /home/ubuntu/corp/rod/hotspot: agree 3 differ 0 card-nondeterministic 0 failed/skipped 0
+=== bfs
+000000 _Z6KernelP4NodePiPbS2_S2_S1_i            grid 8x1x1 block 512x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      17.3 us push    0.07 ms pull    0.09 ms | sim     0.598 ms | AGREE 
+000001 _Z7Kernel2PbS_S_S_i                      grid 8x1x1 block 512x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      12.5 us push    0.06 ms pull    0.09 ms | sim     0.209 ms | AGREE 
+000002 _Z6KernelP4NodePiPbS2_S2_S1_i            grid 8x1x1 block 512x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      11.8 us push    0.09 ms pull    0.08 ms | sim     0.123 ms | AGREE 
+000003 _Z7Kernel2PbS_S_S_i                      grid 8x1x1 block 512x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      10.1 us push    0.06 ms pull    0.08 ms | sim     0.136 ms | AGREE 
+000004 _Z6KernelP4NodePiPbS2_S2_S1_i            grid 8x1x1 block 512x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      11.5 us push    0.06 ms pull    0.08 ms | sim     0.131 ms | AGREE 
+000005 _Z7Kernel2PbS_S_S_i                      grid 8x1x1 block 512x1x1 mem    0.1 MiB changed    0.0 MiB chunks 7 bad 0 words 0 maxulp 0 | card kernel      10.9 us push    0.07 ms pull    0.08 ms | sim     0.113 ms | AGREE 
+SUMMARY /home/ubuntu/corp/rod/bfs: agree 6 differ 0 card-nondeterministic 0 failed/skipped 0
+=== nn
+SUMMARY /home/ubuntu/corp/rod/nn: agree 0 differ 0 card-nondeterministic 0 failed/skipped 0
+=== lavaMD
+000000 _Z15kernel_gpu_cuda7par_str7dim_strP7box grid 64x1x1 block 128x1x1 mem    0.5 MiB changed    0.2 MiB chunks 11 bad 0 words 0 maxulp 0 | card kernel    3888.7 us push    0.11 ms pull    0.14 ms | sim   394.440 ms | AGREE 
+SUMMARY /home/ubuntu/corp/rod/lavaMD: agree 1 differ 0 card-nondeterministic 0 failed/skipped 0

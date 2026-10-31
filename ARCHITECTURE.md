@@ -6,30 +6,33 @@ The non-negotiable structural rule: **no per-SKU emulators.** One shared
 engine, parameterized by data.
 
 ```
-vendor frontend            libvgpucuda (CUDA driver API)      [future: HIP/ROCm]
+vendor frontend            libvgpucuda, libvgpucudart (CUDA driver and runtime APIs),
+        |                  libamdhip64 (HIP) and the HSA runtime
+architecture semantics     PTX -> AST, SASS decoder (NVIDIA); GCN/CDNA/RDNA decoder (AMD)
         |
-architecture semantics     PTX subset -> AST                  [future: sm_xx feature gates,
-        |                                                      AMD GCN/CDNA IR]
 common CPU engine          SIMT warp interpreter + virtual memory + scheduler
         |
-device profile             nvidia/profiles/*.yaml  (data, not code)
+device profile             nvidia/profiles/*.yaml, amd/profiles/*.yaml  (data, not code)
 ```
 
 An H100 and an H200 differ only in their profile data. Hopper and Blackwell
-will differ in feature gates over the same interpreter. NVIDIA and AMD differ
+differ in feature gates over the same interpreter. NVIDIA and AMD differ
 in frontend + ISA, but share the execution engine and memory model (wavefront
-width 64 is a parameter, not a rewrite — enforced today by an explicit
-`warp_size == 32` check that names the gap).
+width 64 is a parameter, not a rewrite: the interpreter takes a warp size of
+8, 16, 32 or 64 and refuses any other; a launch may pick its own width with
+`LaunchConfig::warp_size`).
 
 ## Fidelity levels
 
 - **L1 Discovery** — devices exist, enumerate, report properties. (Working)
-- **L2 Runtime behavior** — contexts, memory, copies, errors; streams/events
-  next. (Core working)
-- **L3 Compute** — PTX kernels execute functionally on CPU. (Working subset)
+- **L2 Runtime behavior** — contexts, memory, copies, streams, events, graphs,
+  errors. (Working)
+- **L3 Compute** — PTX and SASS kernels (NVIDIA) and GCN/CDNA/RDNA code (AMD)
+  execute functionally on CPU. (Working; every gap fails loudly)
 - **L4 Ecosystem** — cuBLAS/cuBLASLt/cuDNN/cuFFT/cuRAND/cuSPARSE/cuSOLVER/NCCL/NVRTC/NPP/nvJPEG
-  are implemented and verified against hardware (nvidia/docs/libraries.md);
-  PyTorch itself is not.
+  and the other vendor libraries are implemented and verified against hardware
+  (nvidia/docs/libraries.md); PyTorch runs on top (nvidia/docs/pytorch.md,
+  amd/README.md). [docs/status.md](docs/status.md) has the current state.
 
 ## Repository map
 
@@ -39,28 +42,49 @@ own folder.
 ```
 include/vgpu/…, src/          the engine, shared by every vendor
   core/      profiles, registry, restricted-YAML, device memory, errors
-  ptx/       lexer, parser, AST
+  ptx/       lexer, parser, AST, and the AST builder (builder.hpp) that other frontends make kernels with
   exec/      SIMT interpreter, scheduler              (common CPU engine)
   runtime/   Device/Runtime facade (primary-context model)
-  cli/       vgpu binary (shell, smi, run, test)
-tests/       unit/ framework/ kernels/ workloads/      engine tests and the pantheon workloads
-scripts/     build, test, run
-tools/       bench.sh (interpreter throughput)
+  sass/      SASS decoder and engine, and its pre-decoded tier
+  simd/      vector kernels for lane arithmetic
+  capi/      C API (vgpu_regs.h)
+  cli/       vgpu binary (shell, smi, run, test, config, ncu, ...)
+tests/       unit/ framework/ kernels/ workloads/ e2e/ ...   engine tests and the pantheon workloads
+scripts/     build, test, run, doctor, deps
+tools/       bench.sh (interpreter throughput), bench/, verify/, probes
 
 nvidia/                       NVIDIA GPUs and CUDA
   src/       libvgpucuda (driver API), libcudart, NVML, CUPTI, NVENC, vendor libraries
   include/   vgpu_cuda.h — clean-room driver-API subset header (public ABI)
   profiles/  one YAML per GPU; id nvidia/<name>
-  third_party/  public NCCL and NVENC headers (cuDNN's are fetched at configure time)
-  tools/     nvidia-smi, nvcc, profile characterization and verification
-  tests/     e2e/ conformance/ c_harness/
-  docs/      cuBLAS, CUPTI, dark API, JIT, libraries, textures
+  third_party/  public NCCL, NVENC and NVDEC headers (cuDNN's are fetched at configure time)
+  tools/     nvidia-smi, nvcc, vgpu-ptxas, profile characterization and verification
+  tests/     e2e/ conformance/ c_harness/ unit/ pytorch/
+  docs/      cuBLAS, CUPTI, dark API, JIT, libraries, SASS, textures, ...
 
-amd/                          AMD GPUs and ROCm (discovery today)
-  profiles/  MI300X, MI325X, MI350X; id amd/<name>
-  tools/     rocm-smi, rocm_agent_enumerator, characterization
-  src/       the HIP runtime and ROCm libraries, once written
+amd/                          AMD GPUs and ROCm
+  profiles/  one YAML per GPU (Instinct and Radeon); id amd/<name>
+  tools/     rocm-smi, amd-smi, rocm_agent_enumerator, characterization
+  src/       the HIP runtime, HSA, ROCm SMI and AMD SMI libraries, the GCN/CDNA/RDNA engine
 ```
+
+A frontend that does not read PTX text (a SPIR-V lowering, a test) builds its kernels with
+`ptx::KernelBuilder` and `ptx::ModuleBuilder` (`include/vgpu/ptx/builder.hpp`), hands the module to
+`Device::load_built_module`, and launches through the same `Device::launch` as everything else. The builder and the
+PTX parser share one finalisation path (`finalize_function`, `finalize_module`); the one PTX-only rewrite, mul/add
+contraction, is not in the builder's. A launch picks its own warp width (`LaunchConfig::warp_size`), and may carry a
+global offset and a work dimension count (`%global_offset_*`, `%work_dim`) and work-group memory arguments
+(`ParamDecl::local_mem`): the inputs OpenCL and SPIR-V kernels expect.
+
+Three AST-only operations serve such frontends (the PTX parser never makes them): `OpLibm`, the OpenCL.std host-library
+math functions computed by the host C library at f16, f32 or f64 (`include/vgpu/exec/libm.hpp` states which libm
+calls are made and what is deterministic: libm-accurate, not bit-exact with any GPU's math library); `OpRedux`
+extended with float and integer-multiply reductions, inclusive and exclusive scans and clustered reductions over a
+warp's active lanes in increasing lane order; and `OpWgCollective`, a work-group reduce, scan or broadcast built on
+the same rendezvous as `bar.red` and combined in increasing linear thread id, so its result does not depend on the
+warp width or the schedule. A new `Op` alternative needs an entry in the `Op` variant (`ast.hpp`), a dispatch in
+`Interpreter::dispatch` (or in `step`, for an instruction that waits like a barrier), and the generic member names
+`dst`, `a`, `b`, `c` so that `ptx::collect` in `regalloc.cpp` sees its registers.
 
 C++20, CMake, **zero external dependencies** (hand-rolled restricted-YAML +
 micro test framework) so a bare CI container can build it.
@@ -84,10 +108,10 @@ scheduler loop on one CPU thread.
 
 Divergence: a branch that splits the active mask pushes the not-taken
 `(pc, mask)` onto a per-warp stack and follows the taken side; when a path
-retires (`ret`), the next parked path pops. Paths reconverge at `ret`.
-Consequence: `bar.sync` under divergence is rejected with a precise error
-(IPDOM reconvergence is the planned fix, not a redesign — the stack becomes
-reconvergence-point-keyed).
+retires (`ret`), the next parked path pops. Reconvergence is min-PC: paths at
+the same pc merge and the lowest pc runs next, so `bar.sync` after a divergent
+region works. Full IPDOM reconvergence and irreducible control flow remain open
+(TODO.md, "Partially implemented").
 
 The interpreter favours plain, checkable code over speed. Correctness,
 determinism, and diagnosability outrank speed, and the project keeps zero
@@ -95,18 +119,19 @@ external dependencies, so faster execution comes from inside the tree: decoded
 forms, lane kernels and fast paths that give the same bits as the general path.
 Translating whole kernels to a faster tier, still behind the same
 `exec::launch()` boundary and still dependency-free, is studied in
-`docs/perf-design/`. Its first step is built for the SASS engine and off by default: `VGPU_TIER=1` runs the straight-line
+`docs/perf-design/`. Its first step is built for the SASS engine and on by default (`VGPU_TIER=0` turns it off): it runs the straight-line
 instructions of a warp through micro-ops decided once per code section (`src/sass/tier*`), inside the interpreter's own scheduling
 loop and with the interpreter as the fallback for anything it has no handler for. The rest of the study is not built.
 
 ### D2. Scheduling is an abstraction, and always will be
 
 `exec::Scheduler::pick(runnable_warps)` chooses which warp advances at each
-yield point (barrier or retirement). Today: deterministic round-robin, so
-every run is bit-for-bit reproducible. The interface exists *now* so that
-`--scheduler random` (seeded) and `--scheduler adversarial` (searching legal
-orders to break missing-synchronization assumptions) drop in without touching
-the interpreter. This is the foundation of the "TSan for GPUs" ambition;
+yield point (barrier or retirement). The default is deterministic round-robin,
+so every run is bit-for-bit reproducible. `VGPU_SCHEDULER=random` (seeded by
+`VGPU_SCHEDULER_SEED`) and `VGPU_SCHEDULER=adversarial` (searching legal
+orders to break missing-synchronization assumptions) plug into the same
+interface without touching the interpreter. This is the foundation of the
+"TSan for GPUs" ambition;
 nothing in the engine may assume a fixed warp order beyond what a scheduler
 provides.
 
@@ -154,8 +179,8 @@ The threads CI job runs the whole suite under ThreadSanitizer to hold this.
   configuration does not use, takes a remainder from it, and discards the
   answer -- so trapping made those kernels unrunnable over arithmetic that was
   never going to matter. It now follows the hardware, deterministically: an
-  all-ones quotient and a remainder of the dividend. `VGPU_TRAP_DIV_BY_ZERO=1`
-  restores the trap for a debugging run.
+  all-ones quotient and a remainder of the dividend. `VGPU_STRICT=1` (or
+  `--strict`) restores the error for a debugging run.
 
   The general lesson is the one the register analysis taught earlier: a
   divergence that catches bugs is only worth having while it does not also
@@ -172,11 +197,21 @@ memcpy semantics).
 ### D4. Profiles are data; unverified data is labeled
 
 Profiles hold only functionally visible properties (limits, capabilities,
-sizes) — no clocks, no bandwidths. Every profile carries `verified: false`
-until a future hardware-characterization suite (physical GPUs as oracles)
-confirms each value; the CLI prints that caveat. Placeholder values come from
-public vendor documentation only. The restricted-YAML subset is documented in
+sizes) — no timing-model inputs such as bandwidths or cache sizes. A profile
+carries `verified: false` until the hardware-characterization suite (physical
+GPUs as oracles) confirms each value; 14 NVIDIA and 3 AMD profiles are
+verified today ([docs/status.md](docs/status.md)). The CLI prints the caveat for the
+rest, whose values come from public vendor documentation only. The restricted-YAML subset is documented in
 `include/vgpu/yamlish.hpp`.
+
+Intel Xe parts (`intel/profiles/*.yaml`, for PantheonZE's SPIR-V execution backend) are the third vendor. They
+are spec-derived, never verified, and say which of their values are stand-ins the engine needs in order to run
+(`placeholders:`). `load_gpu()` finds them and `available_engine_gpus()` lists them; `available_gpus()` does not,
+because the register database, telemetry and monitors have nothing for them. An engine multiprocessor is an Xe
+core: its shared local memory is the work-group limit (384 KiB on Crescent Island, 128 KiB on the Battlemage
+parts, from the open-source compute runtime), and the register file, thread and block ceilings are derived from
+the profile's `xe:` section (EUs, threads per EU, GRFs per thread, sub-group widths). A launch at a sub-group
+width the profile does not list is refused.
 
 ### D5. Errors: stable codes + rich text, and no silent gaps
 
@@ -207,12 +242,11 @@ our `libcuda` — means implementing `cuGetExportTable`, a set of **undocumented
 version-specific, integrity-checked** vtables ("the dark API"). We implemented
 enough to watch cudart bootstrap, but chose the documented runtime API as the
 primary interface: it is stable, legible, and clean-room. Static-cudart hosting
-stays behind an env flag as future work. The rule this encodes: prefer a
+was investigated and is blocked (nvidia/docs/dark-api.md); it stays future work. The rule this encodes: prefer a
 documented interface we can maintain over an undocumented one we must chase.
 
 The same rule decides where each JIT framework meets us. All three compile to
-PTX, and PTX is what the interpreter consumes, so the question is only whether
-a framework will hand it over:
+PTX, so the question is only whether a framework will hand it over:
 
 - **Numba** assembles its PTX through `cuLinkCreate`/`cuLinkAddData`/
   `cuLinkComplete`. We implement that family by merging the PTX inputs and
@@ -221,9 +255,11 @@ a framework will hand it over:
   `cuModuleLoadData` loads. Nothing is faked -- `cuLinkComplete` really does
   yield something the loader accepts.
 - **Triton** goes one step further and runs `ptxas` itself, so what arrives is
-  a cubin. We decline it rather than pretend, and `nvidia/tools/vgpu_triton.py` ends
-  Triton's pipeline at PTX through its own documented stage hook. A SASS
-  decoder would be the alternative, and SASS is undocumented.
+  a cubin. `vgpu run` and `vgpu shell` point Triton at `nvidia/tools/vgpu-ptxas`,
+  which writes the PTX where the cubin would go, so Triton's pipeline ends at
+  PTX (`nvidia/tools/vgpu_triton.py` does the same through Triton's documented
+  stage hook). The SASS engine runs real cubins too, but Triton's kernels are
+  checked on the PTX path (nvidia/docs/jit.md).
 - **CuPy** links the runtime statically, so it never reaches either path; it
   needs the dark API above.
 
@@ -271,20 +307,23 @@ characterization suite is where any real divergence would be caught.
 `vgpu_cuda.h` is written from NVIDIA's public driver-API documentation;
 numeric values (error codes, attribute ids) follow the documented ABI so real
 headers/binaries agree, but no proprietary header text or code is copied.
-The same policy will apply to NVML, HIP, and ROCm-SMI surfaces later.
+The same policy applies to the NVML, HIP, and ROCm-SMI surfaces.
 
-## Differential testing (designed-for, not built)
+## Differential testing
 
-The characterization suite will run identical micro-tests on physical GPUs
-and their virtual profiles, diff observable results, and turn every
-divergence into a regression test + a profile fix:
+The characterization suite runs identical micro-tests on physical GPUs
+and their virtual profiles, diffs observable results, and turns every
+divergence into a regression test + a profile fix (`nvidia/tests/conformance/`,
+`nvidia/tools/`). Its reach is still partial: the verified profiles and the
+vendor libraries are covered, the rest of the profiles and a conformance
+database are open (docs/status.md, Roadmap):
 
 ```
 generated CUDA/PTX micro-test -> real H100 ---+
                               -> vgpu H100 ---+--> diff -> conformance DB
 ```
 
-Architectural accommodations already in place: deterministic execution
+Architectural accommodations that make it work: deterministic execution
 (diffs are meaningful), profile-driven behavior (fixes are data edits),
 stable error codes (comparable outcomes), stats from every launch.
 

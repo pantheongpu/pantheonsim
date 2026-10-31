@@ -58,7 +58,7 @@ struct Code {
   int sm = 0;
   const std::vector<uint8_t>* bytes = nullptr;   // the section's, in the module's cubin
   const Instr& instr(size_t i) const;
-  // The section's execution tier (VGPU_TIER=1, src/sass/tier.hpp), built the first time it is asked for; null for
+  // The section's execution tier (on unless VGPU_TIER=0, src/sass/tier.hpp), built the first time it is asked for; null for
   // a section with no code. Defined in exec.cpp.
   const tier::Program* tier_program() const;
  private:
@@ -75,6 +75,9 @@ struct Code {
 
 struct Module {
   Cubin cubin;
+  // The cubin as it was loaded, kept only when host-GPU mode is on (VGPU_HOST_GPU, vgpu/host_gpu_rt.hpp): the real driver loads
+  // it for a launch on the card. `cubin` is patched with this device's addresses as it loads.
+  std::vector<uint8_t> image;
   int sm = 0;
   std::vector<Code> code;                     // one per .text section
   std::map<std::string, size_t> code_index;   // section name -> code
@@ -94,6 +97,19 @@ struct Module {
   // launches, from its code and the functions it calls.
   mutable std::mutex polling_mu;
   mutable std::map<std::string, bool> polling;
+
+  // What a launch of a kernel finds out about it from the module, the same every time: which constant banks are backed by device
+  // memory, where and how big (a bank is named by 5 bits of an instruction), the kernel's own bank 0 template and where its code
+  // starts. Worked out by the first launch (sass::launch, exec.cpp) and kept, by position in cubin.kernels, in slots load() makes.
+  struct KernelStatics {
+    uint64_t bank_va[32] = {}, bank_size[32] = {};
+    uint32_t bank_bound = 0;                  // bit b: bank b is backed by device memory
+    const CubinSection* bank0_template = nullptr;
+    uint64_t entry = 0;
+  };
+  mutable std::unique_ptr<std::atomic<const KernelStatics*>[]> statics_slots;
+  mutable std::mutex statics_mu;
+  mutable std::vector<std::unique_ptr<const KernelStatics>> statics_owner;
 
   // The section holding a code address, or null for an address in no section (before the first, past the last, or
   // in the padding between two). load() places the sections in ascending order, never overlapping, each on a 256-byte
@@ -137,6 +153,10 @@ std::vector<std::string> reachable(const Module& m, const std::string& kernel);
 // (one it does not decode, or an op or form it does not implement yet),
 // described; empty when it runs all of it. Decodes only: no device needed.
 std::string unsupported(const uint8_t* image, size_t size);
+
+// How many calls of unsupported() were answered "runs in full" from the file of images an earlier call (of this or
+// another process, by this build) had found to run in full, without decoding (src/sass/ok_cache.cpp; for tests).
+uint64_t unsupported_cache_hits();
 
 // Runs one kernel of a loaded module over the grid.
 exec::LaunchStats launch(const Module& m, const std::string& kernel, const exec::LaunchConfig& cfg,

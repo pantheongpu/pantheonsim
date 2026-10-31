@@ -12,11 +12,86 @@
 // answer.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "vgpu/amd_gcn_tier.hpp"
+
 namespace vgpu::amd::gcn {
+
+// An instruction's name as the interpreter tells instructions apart: a 64-bit FNV-1a hash of its text. A literal
+// written "v_add_f32_e32"_op in gcn_exec.cpp has its hash taken by the compiler.
+constexpr uint64_t name_hash(std::string_view s) {
+  uint64_t h = 1469598103934665603ull;
+  for (char c : s) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
+  return h;
+}
+
+// What the executor asks of an instruction's name text, answered once, when it is decoded (finalize).
+enum InstFlag : uint32_t {
+  kInstFinal = 1u << 0,         // the flags and hashes below have been worked out
+  kInstMfma = 1u << 1,          // v_mfma* or v_smfmac*
+  kInstCmp = 1u << 2,           // v_cmp*
+  kInstF64 = 1u << 3,           // the name has "f64" in it
+  kInstStore = 1u << 4,         // "_store"
+  kInstAtomic = 1u << 5,        // "_atomic"
+  kInstLoadLds = 1u << 6,       // "_load_lds_"
+  kInstAsyncLds = 1u << 7,      // "_async_to_lds_" or "_async_from_lds_"
+  kInstGws = 1u << 8,           // ds_gws_*
+  kInstDsWrite = 1u << 9,       // ds_write* or ds_store*
+  kInstBranchCount = 1u << 10,  // s_branch, or s_cbranch_*: counted as a branch
+  kInstSWait = 1u << 11,        // s_wait_*, but s_wait_event
+  kInstTensor = 1u << 12,       // tensor_*
+  kInstBarrierSop1 = 1u << 13,  // s_barrier_*, s_get_barrier_state, s_wakeup_barrier
+};
+
+// The memory instructions' share of what the executor asks of the name text: what a load or store moves and how
+// (a byte, a short, a half register, whole words), which atomic operation it is, how scalar memory takes it. Worked
+// out once, when the instruction is decoded (finalize), by the same parsers the executor falls back on for an
+// instruction nobody finalized (mem_facts_of).
+enum class Rmw : uint8_t { Add, Sub, And, Or, Xor, Swap, AddF32, SMin, UMin, SMax, UMax, PkAddF16, PkAddBf16, Inc, Dec,
+                           AddF64, MinF64, MaxF64, MinF32, MaxF32, CmpSwap, CondSub, SubClamp, Invalid };
+// How a global or flat access (global_access) takes the instruction. Unknown: none this implements.
+enum class MemKind : uint8_t { Unknown, Narrow, HalfReg, Prefetch, Load, Store, StoreHi16, Atomic, Block, Transpose, AddTid };
+// What a scalar memory instruction (scalar_load) is.
+enum class SmemKind : uint8_t { Load, Prefetch, Time, Nop, Store, Atomic, SubDword, BufferLoad, BufferStore };
+// The LDS accesses the executor runs without going through its ladder (lds_fast): the ones kernels use all the time.
+enum class LdsOp : uint8_t { None, ReadB32, WriteB32, ReadWide, ReadB96, WriteWide, AddU32, Read2B32, Write2B32, ReadU8, ReadI8,
+                             ReadU16, WriteB8, WriteB16 };
+struct MemFacts {
+  MemKind kind = MemKind::Unknown;
+  SmemKind smem = SmemKind::Load;
+  LdsOp lds_op = LdsOp::None;
+  Rmw rmw = Rmw::Invalid;       // the atomic operation of a global, flat or image atomic (parse_atomic)
+  Rmw buf_rmw = Rmw::Invalid;   // a buffer atomic's, which has its own list of names
+  Rmw s_rmw = Rmw::Invalid;     // a scalar atomic's
+  bool s_buffer = false;        // a scalar atomic or store through a buffer resource (s_buffer_atomic_*, s_buffer_store_*)
+  uint8_t narrow_bytes = 0;     // a byte or short load or store: its size, else 0
+  uint8_t half_bytes = 0;       // a _d16 access: its size, else 0
+  uint8_t atomic_bytes = 0;     // an atomic: its size, else 0
+  uint8_t transpose_bits = 0;   // a transposing load: its element size in bits, else 0
+  uint8_t smem_bytes = 0;       // s_load_u8 / i8 / u16 / i16: 1 or 2
+  bool narrow_sign : 1 = false;
+  bool half_sign : 1 = false;
+  bool half_hi : 1 = false;
+  bool half_store : 1 = false;
+  bool body_store : 1 = false;      // the name past its segment begins "store"
+  bool body_atomic : 1 = false;     // ... begins "atomic_"
+  bool load_dword : 1 = false;
+  bool store_dword : 1 = false;
+  bool load_monitor : 1 = false;   // ... begins "load_dword", "store_dword", "load_monitor_b"
+  bool formatted : 1 = false;       // ... begins "load_format_" or "store_format_"
+  bool buf_wide : 1 = false;        // a buffer atomic on 64 bits (atomic_cmpswap_x2)
+  bool s_wide : 1 = false;          // a scalar atomic on 64 bits
+  bool smem_sign : 1 = false;       // s_load_i8 / i16
+  bool smem_realtime : 1 = false;   // s_memrealtime (s_memtime is the other of the Time kind)
+  bool ds_name : 1 = false;         // the name begins "ds_" (then past-"ds_" is the part this calls the body)
+  bool scratch_store : 1 = false;
+  bool scratch_load : 1 = false;   // the name begins "scratch_store" / "scratch_load"
+};
 
 // The encodings, by the ISA's names for them.
 // Mtbuf and Vopd are RDNA's: a typed buffer access, and VOPD, two vector
@@ -226,7 +301,57 @@ struct Inst {
   // say how far a write is published. Every access here is already visible to
   // every wave, so they change nothing and are kept for the listing.
   uint32_t cache = 0;
+  // Worked out once, when the instruction is decoded (finalize): the hash of `name`; the name of the short form the
+  // instruction runs as when it is a sub-dword, cross-lane, promoted or 16-bit long form (vector_alu), empty for the
+  // rest, and its hash; and InstFlag bits. flags == 0 says none of it has been done, and the executor does it itself.
+  uint64_t name_hash = 0, short_hash = 0;
+  std::string short_name;
+  uint32_t flags = 0;
+  MemFacts mem;   // (valid when flags has kInstFinal; mem_facts() says it for any instruction)
+  // The pre-decoded tier's form of the instruction (vgpu/amd_gcn_tier.hpp), worked out by finalize; `fast.run` is null
+  // for an instruction the interpreter runs.
+  tier::Op fast;
+  // The instruction a wave ran after this one the last time (Machine::fetch_next): a hint the machine checks against the wave's program
+  // counter, set and read by any thread running the code (a copy of an instruction starts without one).
+  struct Next {
+    mutable const Inst* p = nullptr;
+    Next() = default;
+    Next(const Next&) {}
+    Next& operator=(const Next&) {
+      p = nullptr;
+      return *this;
+    }
+  } next;
 };
+
+// The short form's name (Inst::short_name worked out), "" for an instruction that runs under its own.
+std::string short_name_of(const Inst& in);
+// Fills in Inst::name_hash, short_name, short_hash and flags.
+void finalize(Inst& in);
+// What the name of a memory instruction says (MemFacts), from the text.
+MemFacts mem_facts_of(const Inst& in);
+// The same parsers the executor uses on a name past its segment.
+bool parse_narrow(std::string_view name, uint32_t* bytes, bool* sign);
+bool parse_half(std::string_view body, uint32_t* bytes, bool* sign, bool* hi, bool* store);
+bool parse_atomic_body(std::string_view body, Rmw* rmw, uint32_t* bytes);
+uint32_t transpose_bits_of(std::string_view body);
+// An instruction's memory facts: filled in when decoded, worked out into `scratch` otherwise.
+inline const MemFacts& mem_facts(const Inst& in, MemFacts& scratch) {
+  if (in.flags & kInstFinal) return in.mem;
+  scratch = mem_facts_of(in);
+  return scratch;
+}
+// Fills in Inst::fast (amd/src/gcn_tier.cpp); finalize calls it.
+void tier_classify(Inst& in);
+// The flags of an instruction, finalized or not.
+inline uint32_t inst_flags(const Inst& in) {
+  if (in.flags & kInstFinal) return in.flags;
+  Inst copy;
+  copy.name = in.name;
+  copy.sdwa = in.sdwa, copy.dpp = in.dpp, copy.dpp8 = in.dpp8, copy.promoted = in.promoted, copy.enc = in.enc;
+  finalize(copy);
+  return copy.flags;
+}
 
 // The target a code object's e_flags machine field (EF_AMDGPU_MACH) names.
 inline Target target_of_mach(uint32_t mach) {
@@ -254,6 +379,17 @@ inline Target target_of_mach(uint32_t mach) {
 // comparison's result, a carry) are register pairs rather than one register.
 Inst decode(const std::vector<uint8_t>& code, uint64_t at, uint64_t pc, Target target = Target::Gfx942,
             bool wave64 = false);
+
+// How many rows of a wave's vector register file an instruction can write, counted from v0: past the highest vector register any operand
+// names, with room for the widest result an instruction writes (sixteen registers, a 32x32 matrix tile) beyond a base register that is
+// named once. The instructions that index registers at run time (VGPR indexing, v_movrel*, s_set_vgpr_msb) can reach any of them:
+// kVgprsAny, which no file is as big as.
+inline constexpr uint32_t kVgprsAny = 4096;
+uint32_t vgpr_rows_written(const Inst& in);
+// Where this thread's decode() raises the count of rows a decoded instruction can write (to vgpr_rows_written of it, if that is more):
+// the decode cache of the machine that runs here, which tells the next wave to use a register file how much of it to clear. Null:
+// not kept. Returns the one it replaces.
+std::atomic<uint32_t>* set_vgpr_rows_sink(std::atomic<uint32_t>* sink);
 
 // The instruction as the assembler writes it, for tests and for a
 // disassembly listing.
