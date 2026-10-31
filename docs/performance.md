@@ -6036,3 +6036,52 @@ Zen 4 (server3, cpu 3, load 2 to 4, `bench.py --ab`, 15 runs; A/A 0.98x to 1.01x
 ### Not done
 * The 4 to 5 % of PTX `wmma` on Zen 4, and the 2 % of SASS `mem` and PTX `launch` on Zen 5 (rows that still sit 2 % under sp12-combined, though level with sp13-combined in the same windows). `perf` does not run on server2, so the Zen 5 rows are read by wall time and by instructions on Zen 4 only.
 * Per-function hot/cold ordering (`.text.hot`) inside the engines' units; the layout of `interpreter.cpp` and `exec.cpp` still depends on their own source (any edit inside them re-rolls it, as an edit inside `gcn_matrix_kernels.cpp` does).
+## Round sp14: fixed-size copies that were calls to `__memcpy_chk` (branch `sp14-memcpy-chk`, base `sp13-combined` 870a8903)
+
+Round sp13 found that glibc's fortification (`_FORTIFY_SOURCE=3` is Ubuntu's compiler default; the CMake files set nothing) turns a `std::memcpy` to a computed address in a local object into a call to `__memcpy_chk` even at a fixed 4 to 32 bytes, and fixed `src/simd/kernels.inc`. This round counts which of the sites left are executed.
+
+### Measuring it
+A preloaded `__memcpy_chk` that counts calls by return address (two builds of the shim, one with the fix; the tool is a 60-line C file, not kept) on the 14 `bench.py` workloads on both engines, 51 real programs (PolyBench, Rodinia and part of HeCBench and Samples, `tools/bench/real`, runs cut at 15 to 45 s), `nvidia_tensor_bench` (43 rows) and the AMD bench (gfx942). The cost of one call, a micro-benchmark of a 4-byte store into a local array at a run-time offset: 1.4 to 2.8 ns more than the inline store on Zen 4 (about 10 cycles).
+* **Executed and hot** (calls on the base): `exec_st`'s run buffer in the PTX interpreter (`pack_run`): 4,194,304 calls in the `mem` workload (6 to 10% of its cycles); `h_global<Store>` in the SASS tier (`tier_put` into the run buffer): 6.6 M in HeCBench aop (1.5 to 2% of it), 3.8 M in PolyBench 2MM, 1.1 M in Rodinia particlefilter, 1.5 M in GRAMSCHM; `MemoryManager::store_run` (`run_in`, a copy of `unit` bytes with `unit` a run-time 1, 2, 4 or 8): 8.2 M in HeCBench base64e, 2.0 M in GRAMSCHM, 0.5 M in LU; `micro_ld_param` (every PTX launch reads its parameters: 40,000 calls in the `launch` workload); `h_cndmask_body` in the AMD tier (3.3 M calls, about 7% of the AMD `flat` workload).
+* **Executed, not worth a change:** the SASS rows of `bench.py` make none but `f64_fma` (8,192 calls, 0.09%); `nvidia_tensor_bench` makes 15,922 calls over all 43 rows; `h_imma`'s six sites and the PTX `frag_*_dense` ones are not reached by any row.
+* **Not executed anywhere in these runs:** most of the rest. Static call sites in the shim: 92 -> 69 (`libcudart`), 20 -> 16 (`libamdhip64`).
+
+### What changed
+* `pack_run` (`src/exec/interpreter.cpp`): `__builtin_memcpy` (a fixed `Size`), and `[[gnu::noinline]]`. Inline, its loops grew `exec_st` and moved the inlining of its callees: PTX `shared` and `warp` read 0.97 to 0.98 at equal instructions in three builds; out of line they are 0.996 to 1.002.
+* `micro_ld_param`: `load_bytes` (its switch on 1, 2, 4, 8) in place of `memcpy(&v, p, size)`. The two `ld.param` paths in `exec_ld` keep the `memcpy` (not executed by any row; touching `exec_ld` moved the placement of the PTX loop).
+* `MemoryManager::run_in` / `run_out` (`src/core/memory.cpp`): `word_to` / `word_from`, a switch on the unit with a constant size in each case.
+* `tier_put` / `tier_get` and `h_imma`'s operand loads (`src/sass/tier_ops.inc`): `__builtin_memcpy`.
+* `h_cndmask_body` (`amd/src/gcn_tier.cpp`): the store into the local row `r` is `__builtin_memcpy`.
+* `Interpreter::gather_words` / `scatter_words`: `[[gnu::aligned(64)]]`. Not part of the copy work: with the changes above the linker put `scatter_words` 96 bytes before a 4 KB page boundary (so it crossed the page) in the build examined, and the `mma_ptx` workload on the PTX engine, which calls it after each mma, read 0.977 on Zen 4 and 0.935 to 0.953 on Zen 5 with the same instructions; `perf` showed the extra cycles in `scatter_words` (6.7 -> 10.5% of the row) and L1i misses +6%. With both on a 64-byte boundary Zen 4 reads 1.003 and Zen 5 0.969.
+
+### Results (cycles:u of a pinned process on Zen 4 (server3, cpu 4, `perf stat`, median of 9 alternating runs), CPU time (user+sys) on Zen 5 (server2, cpu 26, median of 15; no perf there). A = `sp13-combined`, B = this branch; counters and instruction counts equal in every row (Zen 4: `perf stat` instructions equal to within 0.01% except where the fix removes the calls: `mem` ptx -5.7%, `launch` ptx -0.1%).)
+| row | Zen 4 B/A | Zen 5 B/A |
+|---|---:|---:|
+| `mem` ptx (4.2 M calls) | 1.061 | 1.052 |
+| `launch` ptx | 1.012 | 1.009 |
+| AMD `flat` (mi300x) | 1.050 | 1.016 |
+| HeCBench aop | 1.017 | 1.020 |
+| PolyBench 3MM (2MM and GRAMSCHM run past the timeout) | 1.003 | 1.011 |
+| Rodinia needle | 1.013 | 1.002 |
+| PolyBench 3DCONV | 1.002 | 1.023 |
+Earlier builds of the same change gave `mem` ptx 1.056 to 1.106 on Zen 4 and 1.044 to 1.088 on Zen 5 (the placement of the rest of the library moves it by that much). The gain on a real program is the share of the calls: 1 to 3%. Rows that make no call also moved with the layout: `mem` sass 1.027 / 1.057 (Zen 4 / Zen 5) and `wmma` / `mma_ptx` sass 1.006 / 1.024 and 1.006 / 1.035 are placement, not this change.
+
+The 12-workload canary (`int_alu f32_fma f64_fma wmma mma_ptx mem shared atomics local divergent warp launch api`, both engines) and `startup`, B/A of the medians; A/A (the base twice) is 0.990 to 1.006 on Zen 4 (`startup` sass 0.951, a 5 ms row; AMD `mfma` 1.030) and 0.991 to 1.011 on Zen 5 (AMD `launch` 0.985):
+* Zen 4: 0.982 (`wmma` ptx: the same instructions; 0.988 to 0.998 in other builds) to 1.018, with `mem` sass 1.027 and `mem` ptx 1.061 above; `startup` sass 0.955 (its A/A is 0.951).
+* Zen 5: 0.969 (`mma_ptx` ptx), 0.974 (`local` sass), 0.982 (`shared` sass) to 1.035, with `mem` sass / ptx 1.057 / 1.052 above (placement; `mma_ptx` ptx was 0.935 to 0.953 before the alignment).
+* AMD (mi300x, nine workloads): 0.957 to 1.050 except `atomics` on Zen 4, 0.969 at equal instructions in four builds (`MemoryManager::rmw_batch_fn` 10.6 -> 13.1% of the row: placement in `memory.cpp`).
+The round 12 and 13 gains are intact on the rows they were measured on: `wmma` sass 1.006 / 1.024 and `mma_ptx` sass 1.006 / 1.035 (Zen 4 / Zen 5), `shared` 1.000 / 0.982 (sass), `atomics` sass 1.016 / 1.026; `wmma` and `mma_ptx` on the PTX engine are the 0.982 / 0.989 and 1.003 / 0.969 above. The 16-thread scaling was not re-measured (no code of the scaling paths changed).
+
+### Project-wide `-U_FORTIFY_SOURCE`
+Built (the branch with `-DCMAKE_CXX_FLAGS=-U_FORTIFY_SOURCE`, so every call in the shim is plain) and measured on the same rows: C over A, geometric mean of the 25 rows that make no call in the base: 0.9995 (Zen 4) and 1.0012 (Zen 5), against 0.9985 and 0.9986 for the targeted change; every row it moved by more than 2% is also a row where the targeted change differs by the same amount (placement). So the targeted fixes take what a global switch would. Not adopted: it removes glibc's checks (`memcpy`, `strcpy`, `sprintf`, `read`, `__printf_chk` abort with "buffer overflow detected" instead of corrupting memory) from a library that is loaded into other people's processes, only where the compiler adds them by default (Ubuntu, Fedora; conda-forge passes `-D_FORTIFY_SOURCE=2` in its flags, which a CMake `-U` would override), and a sanitizer build is a `-O0`/`-O1` build, where glibc's fortification is off or the sanitizer's checks cover the same overflows. If it is wanted anyway: `option(VGPU_FORTIFY ... ON)` and `add_compile_options(-U_FORTIFY_SOURCE)`; the JIT's generated code (`src/sass/jit_rt.h`, seven fixed-size `std::memcpy`) is compiled at run time with the user's compiler flags and is not changed by it.
+
+### Tests (CMake-wired)
+* `test_memcpy_chk` (tests/unit): defines `__memcpy_chk` in the test, so the statically linked library's calls land in it, counts the calls of up to 256 bytes, and requires none where the compiler fortifies (an optimised build, `_FORTIFY_SOURCE` set; not built under a sanitizer). It runs: `store_run` / `load_run` at units 1, 2, 4, 8 against a model (400 random runs each, every phase against the 8-byte boundary); a SASS kernel storing 1, 2, 4 and 8 bytes from 32 consecutive lanes (`STG`, hand-assembled as in `test_sass_dispatch`), the bytes checked; a PTX kernel storing u8, u16, u32, u64 the same way (this one also reads its parameter, `micro_ld_param`); and the AMD tier's `v_cndmask_b32` over the corpus shapes with the tier on and off (equal digests).
+  Mutation check: the test built against the unchanged base library fails all four cases (`store_run / load_run, unit 4: 429 calls`; `SASS STG of 2 bytes: 32 calls`; `PTX st.global.u8: 33 calls` (32 from `pack_run`, one from `micro_ld_param`); `v_cndmask_b32 in the tier: 224 calls`) and passes on the branch, also at `VGPU_SIMD=base`, `avx2` and `avx512`.
+* `lint_ptx_word_moves_aligned` (tests/lint/check_ptx_word_moves_aligned.sh): reads `nm` of the built `libcudart` and requires `gather_words` and `scatter_words` on a 64-byte boundary. The base fails it (`scatter_words` at 0x2361b0, 48 bytes into a line) and the branch passes.
+* Also run, passing: `test_memfast`, `test_memalloc`, `test_sass_dispatch`, `test_tier`, `test_sass_access_count`, `test_sass_mem_rows`, `test_memcount_forms`, `test_sass_lanes`, `test_amd_gcn_tier_same_bits` (default and `VGPU_SIMD=base`). Compiled with g++-12 `-Wall -Wextra -Werror` (and `-fsanitize=address,undefined`, compile only): the test, `memory.cpp`, `gcn_tier.cpp`, `interpreter.cpp`, `sass/exec.cpp`. Not run: ASan / UBSan / TSan executions (no threaded code touched; the test is not built under a sanitizer).
+
+### Not done
+* The 69 remaining call sites in `libcudart` are not executed by any row measured here; a program that reaches `exec_ld`'s variable-size paths, `Runner::exec_mem` or the TMA copies would need the same measurement.
+* `src/sass/jit_rt.h` (the generated code's seven copies) belongs to the JIT and was not touched.
+* `mma_ptx` ptx on Zen 5 is 0.969: the remaining loss is placement of the PTX tensor path (no further alignment was tried; the `sp14-placement` work is the place for it).

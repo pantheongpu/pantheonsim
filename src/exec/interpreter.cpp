@@ -4794,8 +4794,7 @@ class Interpreter {
     const int64_t at = int64_t{off} + static_cast<int32_t>(u.src[1]);
     const uint32_t size = u.sub;
     if (at < 0 || static_cast<uint64_t>(at) + size > uint64_t{off} + psize) return false;
-    uint64_t v = 0;
-    std::memcpy(&v, params_.bytes.data() + at, size);
+    uint64_t v = load_bytes(params_.bytes.data() + at, size);
     const uint32_t bits = size * 8;
     const bool wide = u.flags & MicroOp::kDstWide;
     const uint32_t dst_bits = wide ? 64u : 32u;
@@ -5460,7 +5459,7 @@ class Interpreter {
 
   // The 32 lanes of a 32-bit register copied out as they are -- the tensor-core forms take whole registers, and read_operand would widen each to 64
   // bits and this narrow it again. A register nothing has written reads as zero, as read_operand has it; a 64-bit one takes the general read.
-  void gather_words(Warp& w, const BlockCtx& ctx, const Instr& ins, const Reg& r, uint32_t* dst) {
+  [[gnu::aligned(64)]] void gather_words(Warp& w, const BlockCtx& ctx, const Instr& ins, const Reg& r, uint32_t* dst) {
     if (!r.wide) {
       if (r.id < w.regs32.size() && w.written32[r.id]) std::memcpy(dst, w.regs32[r.id].data(), 32 * sizeof(uint32_t));
       else std::memset(dst, 0, 32 * sizeof(uint32_t));
@@ -5472,7 +5471,7 @@ class Interpreter {
   }
   // 32 words into the lanes of `m` of a 32-bit register (write_reg's result for the same values). `fault`: a result the ALU fault injector may
   // corrupt (a float one), which takes the general write when one is armed.
-  void scatter_words(Warp& w, const Reg& reg, Mask m, const uint32_t* src, bool fault) {
+  [[gnu::aligned(64)]] void scatter_words(Warp& w, const Reg& reg, Mask m, const uint32_t* src, bool fault) {
     if (reg.wide || (fault && alu_armed())) {
       Lanes r;
       for (uint32_t lane = 0; lane < 32; ++lane) r[lane] = src[lane];
@@ -13183,10 +13182,12 @@ class Interpreter {
     }
   }
   template <uint32_t Size>
-  static void pack_run(uint8_t* buf, uint32_t lo, uint32_t cnt, size_t n, size_t e, const Lanes& vals, uint32_t bits) {
+  [[gnu::noinline]] static void pack_run(uint8_t* buf, uint32_t lo, uint32_t cnt, size_t n, size_t e, const Lanes& vals, uint32_t bits) {
     for (uint32_t i = 0; i < cnt; ++i) {
       const uint64_t v = mask_to_bits(vals[lo + i], bits);
-      std::memcpy(buf + (i * n + e) * Size, &v, Size);
+      // (__builtin_memcpy: exec_st's run buffer is a local array, and with glibc's fortification a std::memcpy to a computed address in
+      // one is a call to __memcpy_chk even at a fixed size. Out of line: inlined into exec_st the loops cost PTX shared / warp 2-3%)
+      __builtin_memcpy(buf + (i * n + e) * Size, &v, Size);
     }
   }
 
