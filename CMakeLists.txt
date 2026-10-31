@@ -236,6 +236,7 @@ add_library(vgpu STATIC
   amd/src/gcn_exec.cpp
   amd/src/gcn_tier.cpp
   amd/src/gcn_tier_ds.cpp
+  amd/src/gcn_matrix_kernels.cpp
   amd/src/image.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
@@ -302,6 +303,9 @@ option(VGPU_TEST_FAST_LINK "Link unit tests without LTO (the vgpu archive carrie
 # The wide LDS accesses of the AMD tier (see the header) are compiled outside link-time optimization: inside the tier's unit they moved the
 # inlining and the layout of the unrelated memory handlers.
 set_source_files_properties(amd/src/gcn_tier_ds.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+# The AMD matrix tile kernels and wide decoders, outside link-time optimization, with functions on 64-byte and loops on 32-byte boundaries: their speed
+# depended on where their few-instruction loops landed in a code line, which every unrelated edit of the library changed (docs/performance.md, Round sp13).
+set_source_files_properties(amd/src/gcn_matrix_kernels.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto;-falign-functions=64;-falign-loops=32")
 # The memory manager's hot paths: outside link-time optimization too, so the executors' code is laid out as it was without them.
 set_source_files_properties(src/core/memory.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -1691,6 +1695,8 @@ target_compile_definitions(test_amd_matrix_fast PRIVATE VGPU_SOURCE_DIR="${CMAKE
 vgpu_unit_test(test_amd_packed_math amd/tests/unit/test_packed_math.cpp)
 # The NaN-order helpers (amd/src/nan_order.hpp) that make the float instructions give the same bits at every optimization level.
 vgpu_unit_test(test_amd_nan_order amd/tests/unit/test_nan_order.cpp)
+# The AMD matrix tile kernels and wide decoders are functions of their own that start on a 64-byte boundary (amd/src/gcn_matrix_kernels.cpp).
+vgpu_unit_test(test_amd_matrix_kernels_layout amd/tests/unit/test_matrix_kernels_layout.cpp)
 
 # The packed half, dot product, conversion, comparison, sine/cosine and integer instructions against digests recorded before they were made faster.
 vgpu_unit_test(test_amd_gcn_packed_same_bits amd/tests/unit/test_gcn_packed_same_bits.cpp)

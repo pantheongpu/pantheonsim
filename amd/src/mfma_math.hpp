@@ -278,43 +278,9 @@ inline bool mfma_have_avx2() { return mfma_avx2_switch(); }
 // sum are two roundings, as in the 2-wide kernel, so the bits are the same). n is a multiple of 8.
 typedef double mfma_v4d __attribute__((vector_size(32), aligned(8)));
 // Returns whether any output is a NaN (the sums' own check, while they are still in registers).
-__attribute__((target("avx2"), optimize("align-loops=64"))) inline bool mfma_tile_f_avx2(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk,
-                                                            const double* c, double* out) {
-#define MFMA_LD4(p) (*reinterpret_cast<const mfma_v4d*>(p))
-#define MFMA_ST4(p, v) (*reinterpret_cast<mfma_v4d*>(p) = (v))
-  __m256d nan = _mm256_setzero_pd();
-  for (uint32_t i = 0; i < m; i += 4) {
-    const double* const a0 = a + size_t{i} * k;
-    const double* const a1 = a0 + k;
-    const double* const a2 = a1 + k;
-    const double* const a3 = a2 + k;
-    for (uint32_t j = 0; j < n; j += 8) {
-      const double* const cr = c + size_t{i} * n + j;
-      mfma_v4d s00 = MFMA_LD4(cr), s01 = MFMA_LD4(cr + 4), s10 = MFMA_LD4(cr + n), s11 = MFMA_LD4(cr + n + 4),
-               s20 = MFMA_LD4(cr + 2 * n), s21 = MFMA_LD4(cr + 2 * n + 4), s30 = MFMA_LD4(cr + 3 * n), s31 = MFMA_LD4(cr + 3 * n + 4);
-      const double* b = bk + j;
-      for (uint32_t t = 0; t < k; ++t, b += n) {
-        const mfma_v4d b0 = MFMA_LD4(b), b1 = MFMA_LD4(b + 4);
-        const mfma_v4d x0 = {a0[t], a0[t], a0[t], a0[t]}, x1 = {a1[t], a1[t], a1[t], a1[t]}, x2 = {a2[t], a2[t], a2[t], a2[t]},
-                       x3 = {a3[t], a3[t], a3[t], a3[t]};
-        s00 += x0 * b0, s01 += x0 * b1;
-        s10 += x1 * b0, s11 += x1 * b1;
-        s20 += x2 * b0, s21 += x2 * b1;
-        s30 += x3 * b0, s31 += x3 * b1;
-      }
-      double* const o = out + size_t{i} * n + j;
-      MFMA_ST4(o, s00), MFMA_ST4(o + 4, s01), MFMA_ST4(o + n, s10), MFMA_ST4(o + n + 4, s11);
-      MFMA_ST4(o + 2 * n, s20), MFMA_ST4(o + 2 * n + 4, s21), MFMA_ST4(o + 3 * n, s30), MFMA_ST4(o + 3 * n + 4, s31);
-      // (a sum is a NaN if it differs from itself: the unordered compare of each with itself, or'd together)
-#define MFMA_NAN4(v) nan = _mm256_or_pd(nan, _mm256_cmp_pd(v, v, _CMP_UNORD_Q))
-      MFMA_NAN4(s00), MFMA_NAN4(s01), MFMA_NAN4(s10), MFMA_NAN4(s11), MFMA_NAN4(s20), MFMA_NAN4(s21), MFMA_NAN4(s30), MFMA_NAN4(s31);
-#undef MFMA_NAN4
-    }
-  }
-#undef MFMA_LD4
-#undef MFMA_ST4
-  return _mm256_movemask_pd(nan) != 0;
-}
+// Out of line, in gcn_matrix_kernels.cpp (a translation unit of its own, compiled without link-time optimization, with the loops on a fixed
+// alignment): the layout of the tile kernels then does not depend on what is linked ahead of them (docs/performance.md, Round sp13).
+bool mfma_tile_f_avx2(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk, const double* c, double* out);
 #endif
 inline void mfma_tile_f_sse(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk, const double* c, double* out) {
   for (uint32_t i = 0; i < m; i += 4) {
@@ -365,52 +331,9 @@ inline void mfma_tile_f(uint32_t m, uint32_t n, uint32_t k, const double* a, con
 // The fused form (the double-precision instruction): one fma per term, taken in order. The result of a fused multiply-add
 // is defined to the bit except for which NaN a NaN operand passes on, so a NaN result is again done the way it always was.
 #if defined(__x86_64__) && defined(__GNUC__)
-__attribute__((target("fma"))) inline void mfma_tile_fma_hw(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk,
-                                                           const double* c, double* out) {
-  if (k == 4) {
-    // The double-precision matrix instructions' K: four terms, the fused multiply-adds one after another on one sum, written out so that
-    // the loop has no trip count to run: its few instructions were three times as slow in some positions of the code as in others.
-    for (uint32_t i = 0; i < m; ++i) {
-      const double* arow = a + size_t{i} * 4;
-      for (uint32_t j = 0; j < n; ++j) {
-        double sum = c[size_t{i} * n + j];
-        sum = __builtin_fma(bk[j], arow[0], sum);
-        sum = __builtin_fma(bk[size_t{n} + j], arow[1], sum);
-        sum = __builtin_fma(bk[size_t{2} * n + j], arow[2], sum);
-        sum = __builtin_fma(bk[size_t{3} * n + j], arow[3], sum);
-        out[size_t{i} * n + j] = sum;
-      }
-    }
-    return;
-  }
-  for (uint32_t i = 0; i < m; ++i)
-    for (uint32_t j = 0; j < n; ++j) {
-      double sum = c[size_t{i} * n + j];
-      const double* arow = a + size_t{i} * k;
-      for (uint32_t t = 0; t < k; ++t) sum = __builtin_fma(bk[size_t{t} * n + j], arow[t], sum);
-      out[size_t{i} * n + j] = sum;
-    }
-}
-// The same, four columns to an instruction (n a multiple of 4): a fused multiply-add is exact, so the width cannot show in the bits.
-__attribute__((target("avx2,fma"))) inline void mfma_tile_fma_avx2(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk,
-                                                                  const double* c, double* out) {
-  for (uint32_t i = 0; i < m; ++i) {
-    const double* const arow = a + size_t{i} * k;
-    for (uint32_t j = 0; j < n; j += 4) {
-      __m256d sum = _mm256_loadu_pd(c + size_t{i} * n + j);
-      const double* b = bk + j;
-      if (k == 4) {   // (the double-precision matrix instructions' K: written out, as above)
-        sum = _mm256_fmadd_pd(_mm256_loadu_pd(b), _mm256_broadcast_sd(arow), sum);
-        sum = _mm256_fmadd_pd(_mm256_loadu_pd(b + n), _mm256_broadcast_sd(arow + 1), sum);
-        sum = _mm256_fmadd_pd(_mm256_loadu_pd(b + 2 * size_t{n}), _mm256_broadcast_sd(arow + 2), sum);
-        sum = _mm256_fmadd_pd(_mm256_loadu_pd(b + 3 * size_t{n}), _mm256_broadcast_sd(arow + 3), sum);
-      } else {
-        for (uint32_t t = 0; t < k; ++t, b += n) sum = _mm256_fmadd_pd(_mm256_loadu_pd(b), _mm256_broadcast_sd(arow + t), sum);
-      }
-      _mm256_storeu_pd(out + size_t{i} * n + j, sum);
-    }
-  }
-}
+// (Out of line as well, see mfma_tile_f_avx2.)
+void mfma_tile_fma_hw(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk, const double* c, double* out);
+void mfma_tile_fma_avx2(uint32_t m, uint32_t n, uint32_t k, const double* a, const double* bk, const double* c, double* out);
 inline bool mfma_have_fma() {
   static const bool have = !simd_capped_to_base() && __builtin_cpu_supports("fma");
   return have;
@@ -466,30 +389,7 @@ inline void mfma_tile_int_scalar(uint32_t m, uint32_t n, uint32_t k, const int16
 }
 #if defined(__x86_64__) && defined(__GNUC__)
 // (AVX2: eight columns to an instruction; n is a multiple of 8)
-__attribute__((target("avx2"))) inline void mfma_tile_int_avx2(uint32_t m, uint32_t n, uint32_t k, const int16_t* ia, const int16_t* bi,
-                                                              int32_t* out) {
-  for (uint32_t i = 0; i < m; i += 4) {
-    const int16_t* const a0 = ia + size_t{i} * k;
-    for (uint32_t j = 0; j < n; j += 8) {
-      __m256i s0 = _mm256_setzero_si256(), s1 = s0, s2 = s0, s3 = s0;
-      const int16_t* b = bi + size_t{j} * 2;
-      for (uint32_t t = 0; t < k; t += 2, b += size_t{n} * 2) {
-        const __m256i bv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b));
-        int32_t p0, p1, p2, p3;
-        std::memcpy(&p0, a0 + t, 4), std::memcpy(&p1, a0 + k + t, 4), std::memcpy(&p2, a0 + 2 * size_t{k} + t, 4), std::memcpy(&p3, a0 + 3 * size_t{k} + t, 4);
-        s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(_mm256_set1_epi32(p0), bv));
-        s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(_mm256_set1_epi32(p1), bv));
-        s2 = _mm256_add_epi32(s2, _mm256_madd_epi16(_mm256_set1_epi32(p2), bv));
-        s3 = _mm256_add_epi32(s3, _mm256_madd_epi16(_mm256_set1_epi32(p3), bv));
-      }
-      int32_t* const o = out + size_t{i} * n + j;
-      _mm256_storeu_si256(reinterpret_cast<__m256i*>(o), s0);
-      _mm256_storeu_si256(reinterpret_cast<__m256i*>(o + n), s1);
-      _mm256_storeu_si256(reinterpret_cast<__m256i*>(o + 2 * size_t{n}), s2);
-      _mm256_storeu_si256(reinterpret_cast<__m256i*>(o + 3 * size_t{n}), s3);
-    }
-  }
-}
+void mfma_tile_int_avx2(uint32_t m, uint32_t n, uint32_t k, const int16_t* ia, const int16_t* bi, int32_t* out);   // (out of line, as the others)
 #endif
 inline void mfma_tile_int(uint32_t m, uint32_t n, uint32_t k, const int16_t* ia, const int16_t* bi, int32_t* out) {
 #if defined(__x86_64__) && defined(__GNUC__)
