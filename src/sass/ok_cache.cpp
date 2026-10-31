@@ -6,7 +6,7 @@
 // has no cache). Only passes are recorded: a refusal is found by the ordinary path, text and all.
 //
 // The file is trusted only if it is a regular file of this user's that nobody else can write, in a directory of the
-// same kind; a short tail (a torn append) is ignored and never appended to. It is opt-in: `VGPU_SASS_CACHE=1` turns it on.
+// same kind; a short tail (a torn append) is ignored and never appended to. It is on by default; `VGPU_SASS_CACHE=0` turns it off.
 #include "ok_cache.hpp"
 
 #include <fcntl.h>
@@ -121,15 +121,16 @@ const std::string& build_id() {
   return id;
 }
 
+// A relative XDG_CACHE_HOME or HOME is ignored (the XDG rule): the cache would land wherever the process happens to run.
 std::string cache_root() {
-  if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x) return x;
-  if (const char* h = std::getenv("HOME"); h && *h) return std::string(h) + "/.cache";
+  if (const char* x = std::getenv("XDG_CACHE_HOME"); x && x[0] == '/') return x;
+  if (const char* h = std::getenv("HOME"); h && h[0] == '/') return std::string(h) + "/.cache";
   return {};
 }
 
-// "" when the cache is off: it is opt-in, `VGPU_SASS_CACHE=1`.
+// "" when the cache is off: it is on unless `VGPU_SASS_CACHE=0`, and has nowhere to live without a build id or a home.
 std::string cache_path() {
-  if (const char* v = std::getenv("VGPU_SASS_CACHE"); !v || v[0] != '1') return {};
+  if (const char* v = std::getenv("VGPU_SASS_CACHE"); v && v[0] == '0') return {};
   const std::string& id = build_id();
   const std::string root = cache_root();
   if (id.empty() || root.empty()) return {};
@@ -160,7 +161,7 @@ void load(State& s, const std::string& path) {
   s.appendable = false;
   s.keys.clear();
   if (path.empty() || !dir_ok(path, false)) return;
-  const int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  const int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
   if (fd < 0) return;
   struct stat st;
   if (fstat(fd, &st) == 0 && ours_alone(st, S_IFREG)) {
@@ -236,18 +237,36 @@ void remember(const Key& k) {
   if (s.trusted ? !s.appendable : false) return;
   if (!s.trusted) {
     struct stat st;
-    if (lstat(path.c_str(), &st) == 0) return;   // there, and load() did not trust it
-    if (!dir_ok(path, true)) return;
+    if (lstat(path.c_str(), &st) == 0) {
+      // There now. Another process may have made it since this one looked (concurrent first runs): read it again, and go
+      // on only if it is one to trust.
+      load(s, path);
+      if (!s.trusted || !s.appendable || s.keys.count(k) != 0) return;
+    } else if (!dir_ok(path, true)) {
+      return;
+    }
   }
-  const int fd = open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+  // O_NONBLOCK: a FIFO put at the path must fail to open, not hang the process.
+  const int fd = open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
   if (fd < 0) return;
   struct stat st;
   const bool fine = fstat(fd, &st) == 0 && ours_alone(st, S_IFREG) && st.st_size % 16 == 0 &&
                     static_cast<size_t>(st.st_size) / 16 < kMaxKeys;
-  if (fine && write(fd, &k, sizeof k) == static_cast<ssize_t>(sizeof k)) {
-    s.keys.insert(k);
-    s.trusted = true;
-    s.appendable = true;
+  if (fine) {
+    const ssize_t w = write(fd, &k, sizeof k);
+    if (w == static_cast<ssize_t>(sizeof k)) {
+      s.keys.insert(k);
+      s.trusted = true;
+      s.appendable = true;
+    } else if (w > 0) {
+      // A short write (the disk is full, or a size limit): do not leave half a key that shuts the file for every later
+      // process. Cut it off only if nothing else was appended meanwhile.
+      struct stat now;
+      if (fstat(fd, &now) == 0 && now.st_size == st.st_size + w) {
+        const int cut = ftruncate(fd, st.st_size);
+        (void)cut;
+      }
+    }
   }
   close(fd);
 }

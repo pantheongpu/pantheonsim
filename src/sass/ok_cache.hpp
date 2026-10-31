@@ -14,7 +14,7 @@ struct Key {
 Key key_of(const uint8_t* image, size_t size);
 
 // True when an earlier process (or this one) recorded that the image with this key ran in full, by this very build of
-// the simulator. False when there is no file, the file cannot be trusted, or the cache is off (it is opt-in: VGPU_SASS_CACHE=1).
+// the simulator. False when there is no file, the file cannot be trusted, or the cache is off (VGPU_SASS_CACHE=0; it is on by default).
 bool known(const Key& k);
 
 // Records that the image with this key ran in full. Does nothing when the cache is off, unwritable, or full.
