@@ -240,6 +240,13 @@ void lockstep_worker(std::atomic<uint64_t>& ticket, std::atomic<uint64_t>& beat,
     if (same >= 2) {
       nap_us = nap_us ? std::min(nap_us * 2, 500u) : 5u;
       std::this_thread::sleep_for(std::chrono::microseconds(nap_us));
+    } else {
+      // A pass that stored nothing and finished nothing: these blocks wait for something. Give the host core up for a
+      // moment, so that when the block waited for is on a thread the host has not scheduled (a loaded machine, more
+      // threads than cores) that thread gets to run, instead of this one spending its whole time slice on polls (a
+      // wait that counts its polls gives up after so many, and the launch fails if they run out before the other
+      // thread has had a turn).
+      std::this_thread::yield();
     }
     // And whether to hold more blocks: not while any thread's blocks store or finish (they may be the
     // ones these wait for), but when none have for a while, the block waited for may not be here yet.
