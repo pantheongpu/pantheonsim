@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The simulator's hot translation units are plain machine code on 64-byte function boundaries.
 
-The SASS engine (src/sass/exec.cpp), the PTX interpreter (src/exec/interpreter.cpp), the memory manager (src/core/memory.cpp) and the SIMD
-kernels (src/simd/simd.cpp, lanes.cpp) are built outside link-time optimization with -falign-functions=64 -falign-loops=32 (CMakeLists.txt,
+The SASS engine (src/sass/exec.cpp), the PTX interpreter (src/exec/interpreter.cpp), the memory manager (src/core/memory.cpp), the SIMD
+kernels (src/simd/simd.cpp, lanes.cpp) and the AMD pre-decoded tier (amd/src/gcn_tier.cpp) are built outside link-time optimization with -falign-functions=64 -falign-loops=32 (CMakeLists.txt,
 VGPU_HOT_UNIT_FLAGS). Inside the link-time-optimized library every unrelated edit re-ordered the code and re-rolled the inlining of the engines'
 hot paths, and with it the speed of rows that run unchanged code at equal instruction counts, by up to 14 % on a Zen 5 host (the tensor kernels)
 and 3 to 5 % on the memory, launch and atomics rows (docs/performance.md, Round sp14). Outside LTO a unit's code depends on its own source only,
@@ -19,7 +19,8 @@ import os
 import struct
 import sys
 
-UNITS = ("src/sass/exec.cpp.o", "src/exec/interpreter.cpp.o", "src/core/memory.cpp.o", "src/simd/simd.cpp.o", "src/simd/lanes.cpp.o")
+UNITS = ("src/sass/exec.cpp.o", "src/exec/interpreter.cpp.o", "src/core/memory.cpp.o", "src/simd/simd.cpp.o", "src/simd/lanes.cpp.o",
+         "amd/src/gcn_tier.cpp.o")
 SHF_EXECINSTR = 0x4
 SKIP = (".text.unlikely", ".text.startup", ".text.exit")   # GCC aligns the cold halves of functions to 1 and the static initializers to 16
 ALIGN = 64
