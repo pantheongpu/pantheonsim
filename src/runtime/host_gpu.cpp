@@ -424,7 +424,9 @@ struct Runtime::Impl : CardGate {
     for (size_t i = 0; i < code.count; ++i) {
       const sass::Instr& ins = code.instr(i);
       CodeInsn c;
-      c.kind = classify_for_idiom(ins.mnemonic, ins.mods);
+      const bool nan_const = ins.mnemonic == "MUFU" && !ins.src.empty() && ins.src[0].kind == sass::Kind::FImm && ins.src[0].fwidth == 32 &&
+                             (ins.src[0].fbits & 0x7f800000u) == 0x7f800000u && (ins.src[0].fbits & 0x7fffffu) != 0;
+      c.kind = classify_for_idiom(ins.mnemonic, ins.mods, nan_const);
       c.pc = ins.pc;
       const auto reg_of = [&](size_t k) { return ins.src.size() > k && ins.src[k].kind == sass::Kind::Reg && !ins.src[k].neg && !ins.src[k].abs ? static_cast<int>(ins.src[k].reg) : -1; };
       if (c.kind == CodeInsn::Kind::Call && !ins.src.empty() && ins.src[0].kind == sass::Kind::Label) c.target = ins.src[0].imm;
@@ -479,7 +481,13 @@ struct Runtime::Impl : CardGate {
           if (div_idiom && (ins.op == sass::Op::MUFU || ins.op == sass::Op::CALL || ins.op == sass::Op::RET)) {
             if (!idiom_checked) {
               idiom_checked = true;
-              idiom_ok = division_idiom_only(idiom_summary(code));
+              const char* idiom_why = "";
+              idiom_ok = division_idiom_only(idiom_summary(code), &idiom_why);
+              if (!idiom_ok && logging()) {
+                std::fprintf(stderr, "host_gpu: %s: not the division idiom: %s\n", fn.name.c_str(), idiom_why);
+                for (const CodeInsn& c : idiom_summary(code))
+                  if (c.kind != CodeInsn::Kind::Other) std::fprintf(stderr, "host_gpu:   pc 0x%llx kind %d src0 %d src1 %d target %lld\n", static_cast<unsigned long long>(c.pc), static_cast<int>(c.kind), c.src0, c.src1, static_cast<long long>(c.target));
+              }
             }
             if (idiom_ok) continue;
           }

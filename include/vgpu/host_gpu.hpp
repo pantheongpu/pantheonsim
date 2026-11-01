@@ -88,19 +88,23 @@ inline bool exact_opcode_allowed(const std::string& mnemonic, const std::vector<
 // What the recognizer accepts (division_idiom_only): every MUFU is a plain RCP; each one outside a subroutine has an FCHK of the same divisor register within
 // kIdiomMufuToFchk instructions after it; every CALL goes to a subroutine (from its target to the first RET at or after it) and has an FCHK within
 // kIdiomFchkToCall instructions before it; a subroutine holds arithmetic only (no memory, barrier or warp operation, no call); every RET is in a subroutine.
+// The slow path makes the NaN of 0/0 and inf/inf with `MUFU.RSQ R, -QNAN` (the reciprocal square root of an immediate NaN: the canonical NaN 0x7fffffff, which
+// the simulator gives and the card run checks with dividends 0, inf and NaN): that one form (NanGen) is accepted inside a subroutine and nowhere else.
 // A kernel with a bare rcp.approx (no FCHK), a device function that is not the slow path, or any other MUFU fails the check and stays refused.
 struct CodeInsn {
-  enum class Kind : uint8_t { Other, MufuRcp, MufuOther, Fchk, Call, Ret, Memory };
+  enum class Kind : uint8_t { Other, MufuRcp, MufuOther, Fchk, Call, Ret, Memory, NanGen };
   Kind kind = Kind::Other;
   uint64_t pc = 0;
   int64_t target = -1;    // CALL: the address of the subroutine
   int src0 = -1;          // MUFU: the register read; FCHK: the dividend's
   int src1 = -1;          // FCHK: the divisor's register
 };
-inline constexpr unsigned kIdiomMufuToFchk = 6;
+inline constexpr unsigned kIdiomMufuToFchk = 32;   // (the scheduler interleaves other work: 9 instructions apart in a kernel that also has an expf)
 inline constexpr unsigned kIdiomFchkToCall = 12;
 
-inline bool division_idiom_only(const std::vector<CodeInsn>& code) {
+inline bool division_idiom_only(const std::vector<CodeInsn>& code, const char** why = nullptr) {
+  const char* sink = "";
+  if (!why) why = &sink;
   using K = CodeInsn::Kind;
   struct Region { uint64_t lo, hi; };
   std::vector<Region> regions;
@@ -112,16 +116,16 @@ inline bool division_idiom_only(const std::vector<CodeInsn>& code) {
     size_t t = code.size();
     for (size_t j = 0; j < code.size(); ++j)
       if (static_cast<int64_t>(code[j].pc) == code[i].target) { t = j; break; }
-    if (t == code.size() || t <= i) return false;   // no such address, or a call backwards (a loop of calls is not the idiom)
+    if (t == code.size() || t <= i) { *why = "a call to an address that is not later in the code"; return false; }   // no such address, or a call backwards (a loop of calls is not the idiom)
     size_t r = t;
     while (r < code.size() && code[r].kind != K::Ret) {
-      if (code[r].kind == K::Call || code[r].kind == K::Memory) return false;
+      if (code[r].kind == K::Call || code[r].kind == K::Memory) { *why = "the subroutine calls or touches memory or other threads"; return false; }
       ++r;
     }
-    if (r == code.size()) return false;
+    if (r == code.size()) { *why = "a subroutine with no RET"; return false; }
     bool fchk_before = false;
     for (size_t j = i > kIdiomFchkToCall ? i - kIdiomFchkToCall : 0; j < i; ++j) fchk_before = fchk_before || code[j].kind == K::Fchk;
-    if (!fchk_before) return false;
+    if (!fchk_before) { *why = "a CALL with no FCHK before it"; return false; }
     regions.push_back({code[t].pc, code[r].pc});
   }
   const auto in_region = [&](uint64_t pc) {
@@ -131,16 +135,19 @@ inline bool division_idiom_only(const std::vector<CodeInsn>& code) {
   };
   for (size_t i = 0; i < code.size(); ++i) {
     switch (code[i].kind) {
-      case K::MufuOther: return false;
+      case K::MufuOther: *why = "an SFU instruction other than RCP"; return false;
+      case K::NanGen:
+        if (!in_region(code[i].pc)) { *why = "a NaN generator outside a division subroutine"; return false; }
+        break;
       case K::Ret:
-        if (!in_region(code[i].pc)) return false;
+        if (!in_region(code[i].pc)) { *why = "a RET outside a division subroutine"; return false; }
         break;
       case K::MufuRcp: {
         if (in_region(code[i].pc)) break;
         bool checked = false;
         for (size_t j = i + 1; j < code.size() && j <= i + kIdiomMufuToFchk && !checked; ++j)
           checked = code[j].kind == K::Fchk && code[j].src1 >= 0 && code[j].src1 == code[i].src0;
-        if (!checked) return false;
+        if (!checked) { *why = "a MUFU.RCP with no FCHK of its divisor right after"; return false; }
         break;
       }
       default: break;
@@ -152,12 +159,13 @@ inline bool division_idiom_only(const std::vector<CodeInsn>& code) {
 
 // The kind of an instruction for the check above, from its mnemonic and modifiers. Anything that touches memory, a barrier or other threads is Memory
 // (not allowed inside the slow path); an instruction that is not in the exact set at all is Memory too, so a subroutine holding one fails.
-inline CodeInsn::Kind classify_for_idiom(const std::string& mnemonic, const std::vector<std::string>& mods) {
+inline CodeInsn::Kind classify_for_idiom(const std::string& mnemonic, const std::vector<std::string>& mods, bool source_is_nan_constant = false) {
   using K = CodeInsn::Kind;
   if (mnemonic == "MUFU") {
-    bool rcp = false, other = false;
-    for (const std::string& m : mods) (m == "RCP" ? rcp : other) = true;
-    return rcp && !other ? K::MufuRcp : K::MufuOther;
+    bool rcp = false, rsq = false, other = false;
+    for (const std::string& m : mods) (m == "RCP" ? rcp : m == "RSQ" ? rsq : other) = true;
+    if (rsq && !rcp && !other && source_is_nan_constant) return K::NanGen;
+    return rcp && !rsq && !other ? K::MufuRcp : K::MufuOther;
   }
   if (mnemonic == "FCHK") return K::Fchk;
   if (mnemonic == "CALL") return K::Call;

@@ -4,7 +4,7 @@
 //
 //   usage: hostgpu_sfu_exhaustive <op> [stride]
 //   op:  rcp rsq sqrt ex2 lg2   the .approx.ftz.f32 instruction against the simulator's MUFU          (expected to differ: they are NOT in the set)
-//        div                    IEEE a / b (div.rn.f32) for 8 dividends and every divisor           (the division idiom: must be 0 different)
+//        div                    IEEE a / b (div.rn.f32) for 12 dividends (8 finite, 0, +-inf, NaN) and every divisor           (the division idiom: must be 0 different)
 //   stride: test every stride-th pattern (default 1 = all 2^32; a smoke run uses 4099)
 //
 // Output, one line per op and dividend: "RESULT op=<op> [a=0x...] tested=N differ=N max_ulp=N first=0x<in>:card=0x<bits>:sim=0x<bits>"; the exit status is 0 when
@@ -60,8 +60,9 @@ int main(int argc, char** argv) {
   const uint64_t stride = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 1;
   const bool mutate = std::getenv("HOSTGPU_SFU_MUTATE") != nullptr;
   const uint64_t total = ((1ull << 32) + stride - 1) / stride;
-  const uint32_t dividends[] = {0x3f800000u, 0x40400000u, 0x3dcccccdu, 0xc0200000u, 0x7bf00000u, 0x0a000000u, 0x3f9e3779u, 0x7f7fffffu};
-  const int n_div = op == 5 ? 8 : 1;
+  // (0, +-inf and a NaN as dividends reach the slow path's NaN generator, MUFU.RSQ of an immediate NaN, for 0/0, inf/inf and NaN operands.)
+  const uint32_t dividends[] = {0x3f800000u, 0x40400000u, 0x3dcccccdu, 0xc0200000u, 0x7bf00000u, 0x0a000000u, 0x3f9e3779u, 0x7f7fffffu, 0x00000000u, 0x7f800000u, 0xff800000u, 0x7fc00000u};
+  const int n_div = op == 5 ? 12 : 1;
   const uint64_t chunk = 1ull << 26;
   uint32_t* d = nullptr;
   CK(cudaMalloc(&d, chunk * 4));

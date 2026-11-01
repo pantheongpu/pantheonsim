@@ -544,6 +544,29 @@ VTEST(division_idiom_refuses_other_sfu_and_calls) {
   VCHECK(!division_idiom_only(c));
 }
 
+VTEST(division_idiom_refuses_a_device_function_call) {
+  // a __noinline__ function: a CALL to a subroutine and a RET, with no division and no FCHK anywhere -- not the slow path, so not the idiom
+  VCHECK(!division_idiom_only({ci(K::Other, 0), ci(K::Call, 16, 64), ci(K::Other, 32), ci(K::Other, 48), ci(K::Other, 64), ci(K::Ret, 80)}));
+  // with an FCHK far before the call (outside kIdiomFchkToCall instructions) it is still not
+  std::vector<CodeInsn> c = {ci(K::Fchk, 0, -1, 0, 1)};
+  for (unsigned k = 1; k <= kIdiomFchkToCall + 1; ++k) c.push_back(ci(K::Other, 16 * k));
+  const uint64_t call_pc = 16 * (kIdiomFchkToCall + 2);
+  c.push_back(ci(K::Call, call_pc, static_cast<int64_t>(call_pc + 32)));
+  c.push_back(ci(K::Other, call_pc + 16));
+  c.push_back(ci(K::Other, call_pc + 32));
+  c.push_back(ci(K::Ret, call_pc + 48));
+  VCHECK(!division_idiom_only(c));
+}
+
+VTEST(division_idiom_takes_the_nan_generator_only_in_the_slow_path) {
+  auto c = division_kernel();
+  c[c.size() - 2].kind = K::NanGen;                 // inside the subroutine: the slow path's 0/0 case
+  VCHECK(division_idiom_only(c));
+  c = division_kernel();
+  c[0].kind = K::NanGen;                            // in the kernel's own code: a bare NaN constant through an SFU instruction
+  VCHECK(!division_idiom_only(c));
+}
+
 VTEST(division_idiom_takes_two_divisions_sharing_a_slow_path) {
   auto one = division_kernel();
   // a second MUFU.RCP/FCHK/CALL group before the slow path, calling the same subroutine
@@ -567,6 +590,10 @@ VTEST(idiom_classification_by_mnemonic) {
   VCHECK(classify_for_idiom("MUFU", {"RCP64H"}) == K::MufuOther);
   VCHECK(classify_for_idiom("MUFU", {"EX2"}) == K::MufuOther);
   VCHECK(classify_for_idiom("MUFU", {"RCP", "F16"}) == K::MufuOther);
+  VCHECK(classify_for_idiom("MUFU", {"RSQ"}) == K::MufuOther);                  // an RSQ of a register is an SFU result
+  VCHECK(classify_for_idiom("MUFU", {"RSQ"}, true) == K::NanGen);                // of an immediate NaN it is the division's NaN generator
+  VCHECK(classify_for_idiom("MUFU", {"EX2"}, true) == K::MufuOther);
+  VCHECK(classify_for_idiom("MUFU", {"RCP"}, true) == K::MufuRcp);
   VCHECK(classify_for_idiom("FCHK", {}) == K::Fchk);
   VCHECK(classify_for_idiom("CALL", {"REL", "NOINC"}) == K::Call);
   VCHECK(classify_for_idiom("RET", {"REL", "NODEC"}) == K::Ret);

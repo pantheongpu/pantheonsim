@@ -5,7 +5,9 @@
 #   2. a launch of a kernel in the exact set on a grid worth a card starts the driver, and the simulator does not wait for it: the first launch takes far
 #      less than the driver's start (the stub sleeps STUB_INIT_MS in cuInit, as the real driver's context creation takes ~150 ms);
 #   3. the card path is reached later (the stub's module load is called), and the program's output is the one it prints with the mode off;
-#   4. a driver that cannot start says "mode off" once, the program's output is unchanged and no later launch calls the driver again.
+#   4. the division idiom (include/vgpu/host_gpu.hpp division_idiom_only, on the SASS nvcc really emits for a / b): with VGPU_HOST_GPU_DIV=1 a kernel that is
+#      a division reaches the card path; without it, or with a bare rcp.approx or an EX2 beside the division, it never does (not even the driver's start);
+#   5. a driver that cannot start says "mode off" once, the program's output is unchanged and no later launch calls the driver again.
 set -uo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -60,7 +62,20 @@ grep -q '^cuModuleLoadData$' "$work/on_big.log" || { echo "FAIL: no launch reach
 first="$(sed -n 's/^first_launch_ms=\([0-9]*\).*/\1/p' "$work/on_big.err" | head -1)"
 [[ -n "$first" ]] || { echo "FAIL: the program printed no first_launch_ms"; fails=1; first=0; }
 (( first < init_ms / 2 )) || { echo "FAIL: the first launch took $first ms: it waited for a driver start of $init_ms ms"; fails=1; }
-# 4. a driver that cannot start.
+# 4. the division idiom.
+for arg in div rcp divexp; do
+  env VGPU_GPU="$profile" VGPU_THREADS=4 LD_LIBRARY_PATH="$shim" "$work/prog" "$arg" > "$work/off_$arg.out" 2> "$work/off_$arg.err" || { echo "FAIL: the $arg run with the mode off failed"; exit 1; }
+  run "div0_$arg" "$arg" VGPU_HOST_GPU=exact VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 || { echo "FAIL: the $arg run failed"; fails=1; }
+  [[ ! -s "$work/div0_$arg.log" ]] || { echo "FAIL: $arg reached the driver without VGPU_HOST_GPU_DIV: $(calls "div0_$arg")"; fails=1; }
+  run "div1_$arg" "$arg" VGPU_HOST_GPU=exact VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 VGPU_HOST_GPU_DIV=1 || { echo "FAIL: the $arg run with the idiom on failed"; fails=1; }
+  diff -q "$work/off_$arg.out" "$work/div1_$arg.out" > /dev/null || { echo "FAIL: the idiom changes the output of $arg"; fails=1; }
+  if [[ $arg == div ]]; then
+    grep -q '^cuModuleLoadData$' "$work/div1_div.log" || { echo "FAIL: a plain division did not reach the card path with VGPU_HOST_GPU_DIV=1: $(calls div1_div)"; fails=1; }
+  else
+    [[ ! -s "$work/div1_$arg.log" ]] || { echo "FAIL: $arg (not only a division) reached the driver with VGPU_HOST_GPU_DIV=1: $(calls "div1_$arg")"; fails=1; }
+  fi
+done
+# 5. a driver that cannot start.
 run on_bad big VGPU_HOST_GPU=exact VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 STUB_FAIL_INIT=1 || { echo "FAIL: the run with a failing driver failed"; tail -5 "$work/on_bad.err"; fails=1; }
 diff -q "$work/off_big.out" "$work/on_bad.out" > /dev/null || { echo "FAIL: a driver that cannot start changes the output"; fails=1; }
 n="$(grep -c 'cuInit failed; mode off' "$work/on_bad.err")"
