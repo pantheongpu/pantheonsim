@@ -6179,3 +6179,63 @@ Result: `mem` and `flat` are recovered and then some (`flat` +15 % over `sp14-co
 * The interpreter (`gcn_exec.cpp`) outside LTO, in three flag sets, and the same with the tier: ALU rows 5 to 10 % under (above). Not kept.
 * A hot/cold split inside the tier: its cold paths (`fix_nan32`, `fix_nan64`, `post32`, `post64`, the int/f64 general paths) are already `noinline`, and the loss that remains (`valu_f32`) is inlining, not cold code in the way. Forcing the inlining decisions of `sp13-combined` in the interpreter (`always_inline` on `scalar_load`, `at`) was not tried; the interpreter's thousands of other differing decisions make it a whole-file exercise.
 * The `p_sbuf` / `p_lane` floor needs a different method (pinned physical pages, or many more copies); a single A/B of two files is not a measurement on these rows.
+## Round sp15: fewer instructions in the memory handlers (branch `sp15-fewer-instrs`, base `sp14-combined` d9e63ab3)
+
+The question: compute loops already run at IPC 4 to 5 on Zen 4, so which instructions can the SASS engine stop executing, without changing a result or a counter?
+
+### Where the instructions were (server3, Zen 4, `perf record -e instructions:u -c 100000`, one thread, SASS, base build)
+* The 12 canary workloads: `Runner::step_warp` (the tier's run loop is inlined in it) is 16 % of all instructions (47 % of `divergent`, 25 % of `warp`), then the tensor kernel, `dop`, `tier_issue`, the SIMD kernels. A straight-line integer or float instruction costs 4.3 to 4.4 instructions of host code per warp instruction, so nothing is left there; the dearer kinds per warp instruction are `texture` 90, `atomics` 36, `divergent` 22, `shared` 19, `mem` 13.
+* A set of real programs (PolyBench/GPU, the Rodinia apps of `tools/bench/real`, seven CUDA Samples; `perf stat` complete runs, 35 to 2,200 G instructions each): `step_warp` 12 %, `h_global<false>` 11.6 %, `MemoryManager::load_batch` 7.8 %, `load_run` 5.5 %, `h_global<true>` 4 %, `sass_bank_passes_table` 3.9 % (histogram 34 %), `sectors_fast` 3.5 %, `S2R` fill (`tier_sreg_fill`) 5 to 7 % of FDTD-2D and LU. In SYRK, SYR2K, CORR and COVAR (the programs that read or write a column) a quarter of `h_global`'s own instructions were two loops over the 32 lanes: the global-address pass (`full_warp_addresses`: load, shift, or, add, store, and a compare plus conditional move for the constant-window test, about 10 instructions a lane) and the store-data widening.
+* `__popcountdi2` in `int_alu` is the benchmark program's own host-side `__popc`, not the simulator.
+
+### What changed (the sources are in `include/vgpu/exec/` so that each has a unit test that needs no GPU)
+1. `sass_mem_rows.hpp` `full_warp_addresses`: two lanes to a vector (SSE2): the low and high words interleaved, `add` added, the pair stored; the constant-window question ("is some lane in the 4 GiB from `kConstWindow`") is a compare of the high word with the window's, because the window starts on a multiple of 4 GiB (any other window keeps the scalar loop), ORed over the warp and looked at once. About 4.5 instructions a lane instead of 10. `tier_global_addresses` (the full-warp case) uses it too. The return value is now 0 when a lane is in the window and all ones when none is; the callers only compare it with 2^32, as before.
+2. `sass_mem_rows.hpp` `full_warp_store_values`: a full warp's store data (1, 2, 4 or 8 bytes) widened to the 32 64-bit values the batch store takes, four lanes to a vector (it was a lane loop that decoded the width for every lane).
+3. `sass_lanes.hpp` `fill_lanes` / `lane_ids`, used by `Runner::tier_sreg_fill`: S2R of a value the same for every lane (`ctaid`, `ntid`) or of `SR_LANEID` was a lane search and a store a lane (5 instructions a lane) even for the whole warp; the whole warp is now a broadcast / a constant row.
+4. `sass_lea.hpp`: LEA without a carry in (the low word of every 64-bit address calculation) skips the carry-in operations (eight of about twenty-five per vector); `lea_t<Hi, Cin>`.
+
+### Results (instructions retired and cycles from `perf stat`, user mode, pinned cpu 5, A = `sp14-combined`, B = this branch; results and every counter identical)
+Real programs, Zen 4 (server3), instructions B/A, and cycles B/A as the median of three alternating runs (load 1 to 3 from other sessions) where three were made, one run otherwise (marked *):
+| program | instr B/A | cycles B/A |
+|---|---:|---:|
+| SYR2K | 0.914 | 0.919* |
+| SYRK | 0.917 | 0.933 |
+| LU | 0.938 | 0.941 |
+| 3MM | 0.948 | 0.965* |
+| COVAR | 0.951 | 0.974* |
+| CORR | 0.952 | 0.959 |
+| FDTD-2D | 0.968 | 0.950 |
+| transpose | 0.970 | 0.986 |
+| lud | 0.973 | 0.988* |
+| particlefilter | 0.964 | 0.977* |
+| convolutionSeparable | 0.976 | 0.969* |
+| mergeSort | 0.998 | 0.981* |
+| sortingNetworks | 0.997 | 0.996* |
+| histogram, reduction | 1.000 | 0.992*, 1.005 |
+Geometric mean of the 15: 0.964 in instructions. The programs that read a column (a gather: every lane its own address) gain most; programs whose loads are coalesced or shared-memory bound are unchanged.
+
+Canary workloads, SASS, Zen 4 instructions B/A: `mem` 0.985, `shared` 0.999, `atomics` 0.998, `int_alu` 1.003 (not understood: the code it runs is unchanged; layout of `step_warp`), every other row 1.000 to within 0.01 %. `bench.py --ab`, counters identical in all 32 rows:
+| row (SASS) | Zen 5, 15 runs (A/A 0.99x to 1.02x) | Zen 4, 9 runs (A/A 0.99x to 1.02x; the PTX `wmma` 1.08x reads the same between two copies of A) |
+|---|---:|---:|
+| `mem` | 1.067 (p 0.000) | 1.020 (p 0.004) |
+| `atomics` | 1.018 | 1.030 (p 0.006) |
+| `shared` | 1.018 | 1.005 |
+| `divergent` | 1.009 | 1.004 |
+| `warp`, `launch` | 1.013, 1.015 | 1.001, 0.992 |
+| `f32_fma` | **0.982** (p 0.000; 0.992 and 0.985 in two earlier windows) | 0.961 (p 0.11) |
+| `local` PTX | 0.985 (0.986, 0.989 earlier) | 0.997 |
+Every other row 0.99x to 1.01x on both CPUs. The two rows that lose, SASS `f32_fma` and PTX `local` on Zen 5, run unchanged code at equal instruction counts: they are the layout lottery of Round sp14 (an edit inside `exec.cpp` re-rolls the engine's unit, which is pinned to 4096 but not to a particular offset of its hot loops); `lint_hot_unit_layout` passes.
+
+### Tests (CMake-wired, no GPU) and mutations
+* `test_sass_mem_rows`: the vector pass against the lane loops for pairs of rows, one row and none, carries from the low word into the high one, a lane in the window at every lane number, on the window's edges and one byte short of it, found by its high word alone, and a window not on a 4 GiB boundary (the scalar path); `full_warp_store_values` against the lane rule for 1, 2, 4, 8 bytes and RZ. `test_sass_lanes`: `fill_lanes` / `lane_ids` for random masks and the whole warp, the other lanes untouched. `test_sass_lea` (existing: carry in all ones, none, random) holds the new specialization.
+* Mutants, each built and run (server2), all killed: window high word + 1; the low dwords tested instead of the high ones; `add` not applied; the high row ignored; the 4 GiB test dropped (vector pass for any window); 2-byte store mask 0xff; the high half stored at +1; the 8-byte high row read from +31; RZ stores one lane short; whole-warp fill one lane short; lane ids off by one; whole-warp fill for a partial mask; LEA with the carry-in specialization never taken.
+* ASan + UBSan builds of the three unit tests (server3): clean. Release `ctest` on server2: `lint_hot_unit_layout`, `lint_ptx_word_moves_aligned`, `test_sass_*`, `test_tier`, `test_mem*`, `test_memcpy_chk`, `test_ptx_mem_runs`, `test_fastpath`, `test_simd*`, `test_tc_ampere*`, `test_jit*`, `test_exec*`, `test_launch*`, `test_amd_gcn_tier_same_bits` (and `_simd_base`): all passing. Not run: TSan (no threaded code touched), the e2e programs (CI).
+
+### Tried and not kept
+* `run_out` / `run_in` (`MemoryManager::load_run` / `store_run`, `src/core/memory.cpp`) four words an iteration: it removes 2 % to 5 % of the instructions of the programs that load coalesced rows (CORR 0.938 against 0.952 without it, `mem` 0.970 against 0.985, `texture` 0.981) and was verified by `test_memcpy_chk` with four mutants, but the cycles do not follow: against the rest of the branch CORR +1.2 %, FDTD-2D +1.8 %, `reduction` +6.9 % (0.5 % fewer instructions), LU -1.7 %, SYRK -0.6 %, transpose -2.1 %, three runs each. The eight-byte stores into the register row land closer together, ahead of the AVX2 kernels' 32-byte loads of the same row (store-to-load forwarding does not work across the pieces), which is the likeliest reason. Kept on the local branch `sp15-fewer-instrs-memrun` (commit a64865f0), not in this branch.
+* `tier_dyn` (a constant-bank or uniform source broadcast to 32 lanes, a call of about 37 instructions): inlining its Bank0 case would save half of 0.7 % of the real programs' instructions; not worth the code size.
+* `h_local`'s address pass is already vectorized by the compiler (the hot spot there is the lane gather); `iadd3x_k`, `BankTable::worst`, `load_batch`'s lane loop and `batch_addresses_ok` (6 to 8 % of CORR: 9 instructions a lane, no 64-bit compare below SSE4.2) were looked at and left.
+
+### Not done
+* `step_warp` is the biggest line item (12 % of the real programs, 47 % of `divergent`) but is spread over the pass bookkeeping (the 32 program counters written at every branch, `popc(group)`, the counters); `divergent` also loses cycles to a store-forwarding stall in `wait()` (byte stores to `wait_kind` read back by a 16-byte load in `waiting_on` at the next BSYNC: the cycle profile puts 12 to 15 % of its samples on those few instructions; not measured further): that belongs with the divwarp work.
+* Zen 5 has no `perf` (paranoid level 4, no sudo), so its numbers are wall time only.
