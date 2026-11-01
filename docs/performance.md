@@ -5768,6 +5768,209 @@ The 12-workload canary (`bench.py --ab`, `--threads 1 --cpus 7`, 9 runs, sass + 
 ### Not done
 * Running body 0 on the caller (see above) and a per-launch thread count that follows the grid's size as well as the cost: the cap already gives the right order of magnitude, and a threshold of 100 us of work per thread was chosen, not tuned (50 us would give 2 threads to a 100 us launch).
 * The PTX engine's multi-thread loop keeps its own per-thread statistics and a chunked counter, and has no lock per block.
+
+## Round sp13: why the AVX-512 float-product kernel gained little on Zen 4, and what was not the multiply (branch `sp13-zen4-wmma`, base `sp12-combined`)
+
+The question: after sp12 the `wmma` / `mma_ptx` rows gained 1.36-1.7x on a Zen 5 but only 1.03-1.20x on a Zen 4 (Ryzen 7 PRO 8840U). Is the 512-bit kernel selected there, and where does the time go besides the product?
+
+### Findings (server3, Zen 4, `bench.sh profile` and `perf`, before any change)
+* **It is selected.** `kAvx512Default` is true on a CPU with AVX-512 F/BW/DQ/VL and VNNI, which Zen 4 has; the profile of `wmma` and `mma_ptx` is 61-70% in `mma_avx512_chunked_f<8, false>`. Run as two 256-bit halves, the kernel is 0.77-0.92 of the 256-bit one's time on Zen 4 as sp12 left it (Zen 5: 0.67), so about 1.1x is all the width can give there.
+* **The product is not all of it.** For `wmma` (SASS) the kernel was 69.5%, `hmma_k` 12.5%, libc 12% (all `__memcpy_chk`), `step_warp` 3.5%. Two host-side costs sat outside the multiply:
+  1. **`__memcpy_chk`.** glibc's fortification (Ubuntu's default) turns a `std::memcpy` to a computed address of a local array into a call to `__memcpy_chk` even at a fixed 16 or 32 bytes (the compiler cannot prove the object size). `hmma_k` made nine such calls per warp instruction (fragment gather of A, the C interleave), about 25 cycles each. The copies in `src/simd/kernels.inc` are now `__builtin_memcpy` (same bytes; the file's comment says why).
+  2. **The kernel's own operand pass.** `perf` on a loop of calls (16x8x16 f16): 37% of the kernel's time was the code before the first row (decode of A and B with 8-lane vectors, the store-and-scalar `max_element` reductions, the row-pair interleave from a separate buffer, the doubling of B's columns), at 5,950 instructions per call (4,510 after the first form of the change below, before the pair fusion). It is now 16 lanes at a time (`decode_v` / `decode16`: a dense A as 16-float runs across rows, a dense B (N = 8) as two rows a run, anything else a row or a 16-column block, lanes past the operand read as zero through a masked load and are counted by no check), the largest and smallest exponent fields reduce with `_mm512_reduce_*`, an infinity or NaN shows as a largest field of 255 (one test in place of two compares and a mask), and for N == 8 with a dense A of 8 or 16 columns the two rows of a pair are interleaved as they are read and the pairs are what is decoded and stored (`a_paired`: no row-wise copy and no second pass). A full-vector store when all 16 lanes are live (a masked store does not forward to the next pass's load). The calls the kernel takes and declines are the same as before, and the arrays it fills are the same bytes (the test checks the answers against the 256-bit kernel and the frozen form).
+* **What is left on Zen 4:** the rows (chunk loops, `top`, the accumulator frame, `sum_to_f32_avx512`) are about three quarters of the kernel (staged returns on Zen 5 before the pair fusion, 16x8x16: A decode 18 ns, B decode 9, checks 2, pair and doubling 15, rows 123 of 168). 512-bit operations are two half-width ones on Zen 4, so the operation count is the cost, and there is no host-side copy left to remove. `wmma` on the PTX engine (N = 16: the non-pair path, whose B decode costs 16 vectors) gains only 2% on Zen 4 and nothing on Zen 5; the kernel is 65-68% of its time and the rest is spread over `fast_wmma_mma`, `gather_words`, `f16x16_to_float`, each under 3%.
+
+### Results (`bench.sh --ab`, 9 runs alternating, counters identical in every row; B/A of the median, A = `sp12-combined`)
+| row | Zen 4 (server3, cpu 6) | Zen 5 (server2, cpu 12) |
+|---|---|---|
+| wmma sass | 1.286 | 1.471 |
+| wmma ptx | 1.024 | 0.987 (p 0.019; A/A 0.995 to 1.002) |
+| mma_ptx sass | 1.286 | 1.446 |
+| mma_ptx ptx | 1.219 | 1.217 |
+
+A/A (same build twice) on the 24 rows: 0.993 to 1.013 on Zen 4, 0.994 to 1.005 on Zen 5 (one median 1.028 on Zen 5 `mma_ptx` sass with best-of 0.999). The other ten canary workloads (int_alu f32_fma mem shared atomics local divergent warp launch api, both engines) read 0.931 to 1.046 on Zen 4 and 0.978 to 1.019 on Zen 5. The ones under 0.985 are placement: Zen 4 `mem` sass 0.971 (best-of 0.984), `mem` ptx 0.931 (p 0.16; best-of 0.975), `atomics` sass 0.983, `local` sass 0.984, `launch` 0.98 / 0.981, `int_alu` 0.988 / 0.986, `f32_fma` sass 0.983; Zen 5 `atomics` sass 0.978, `mem` sass 0.987. `divergent` sass reads 1.046 on Zen 4. None of them runs the changed code (`kernels.inc` only changes `hmma_k` and the other copies' call form).
+
+Kernel alone, min ns per call over 8 alternating runs, `mma_avx512_chunked_f` before -> after (the 256-bit kernel is unchanged: Zen 4 410 / 250 / 771 ns on 16x8x16 / 16x8x8 / 16x16x16):
+* Zen 5: f16 16x8x16 202.6 -> 154.4, 16x8x8 118.8 -> 86.4, 32x8x16 369.7 -> 283.7, 16x16x16 313.3 -> 295.0, 8x32x16 316.7 -> 302.2, bf16 16x8x16 203.2 -> 154.2, tf32 16x8x8 147.2 -> 114.8, 16x8x4 151.1 -> 85.3.
+* Zen 4: f16 16x8x16 369.3 -> 337.1, 16x8x8 222.6 -> 183.1, 32x8x16 722.6 -> 618.0, 16x16x16 654.0 -> 644.6, 8x32x16 641.6 -> 641.6, bf16 16x8x16 387.4 -> 334.1, tf32 16x8x8 280.4 -> 240.9, 16x8x4 235.6 -> 159.7. The 256-bit kernel takes 1.2-1.4x the 512-bit one's time on the pair shapes now.
+* 512-bit over 256-bit on Zen 4, whole rows (B at `VGPU_SIMD=avx512` over `avx2`, same build): wmma sass 1.19, ptx 1.26; mma_ptx sass 1.19, ptx 1.16.
+
+### Tests
+`test_tc_ampere_fast` (CMake-wired, runs at the default, `VGPU_SIMD=avx512` and `avx2`) gained:
+* the 512-bit kernel repeated on every call with A and B at the end of a mapped page (the next page unmapped), dense and with padded rows (strides past the widths, infinities between the rows): the answer is the dense call's, nothing is read past the last float or from the padding (`k512_edge` is held to twice the call count);
+* `float_product_kernel_declines_on_infinities_and_nans_beside_small_numbers`: six special values placed at random in A or B with every other element small (exponent fields that pass the range rule), 6000 rounds over the shape list; both kernels decline and write nothing.
+Mutants (run against the rebuilt test; killed unless listed): the live mask, the bias of each of the seven decode call sites, `lo` / `hi` / `in8` / `dup0` / `dup1` permutes, the term shift and `emin` offset, `subn` dropped, the largest-field-255 test of A and of B dropped (the second test above killed these two; the first test did not), the masked load turned into a plain one (page-edge test), the dense-A and dense-B conditions, the B-doubling store offset, the fallback pair interleave, the largest-field tracking, the pair count. Survivors, all equivalent: `dead` bound 254 -> 255 (an `e == 255` lane is then live in the arrays, but the call is declined for it), `field_min` bound 254 -> 255 (the same 255), the smallest-field accumulator's start value (all-zero operands read 255 either way), and the full-width store for a partial run (it writes zero lanes inside the same array).
+Also run and passing at default, avx2 and avx512: `test_simd`, `test_sass_mma_tiles`, `test_tier`, `test_fastpath`, `test_tc_ampere`, `test_wmma_generic_fast`, `test_wgmma_fast`, `test_tcgen05_tiles`, `test_simd_dispatch`, `test_mma_tiles`, `test_mma_fast`, `test_tile_mma`. Not run: ASan / UBSan / TSan (no threaded code was touched), an Intel CPU.
+
+### Not done
+* The rows of the kernel (about three quarters of it): fewer vector operations per chunk would help both CPUs, but every one of them is part of the bit-exact chunk rule. The N = 16 B decode (16 vectors) could be fused with the load as A's now is; it is 6% of the 16x16x16 call.
+* The `__memcpy_chk` pattern is not limited to `kernels.inc`: 111 call sites remain in the shim (`h_imma` has six, `h_global` seven, the PTX `exec_*` functions more). Their cost per instruction was not measured.
+## Round sp13: shared-memory bank counting keyed by 32-bit offsets (branch `sp13-bank`, base `sp12-combined` b6545db2)
+
+Where the time went (perf `cycles:u`, one host thread, server3 Zen 4, base b6545db2): `sass_bank_passes_memo` 12% of Samples convolutionSeparable and 21% of sortingNetworks, with
+`count_shared_access` (thread_local table, 2.7 to 3.2%), `bank_passes_progression` (1.5 to 2%) and, for sortingNetworks, `sass_bank_passes_table` (5%) after it: 16% and 31% of those programs
+for the counters of one kind of instruction. The memo itself is flat (no instruction over 8%): it builds a 64-bit key from 32 widened addresses (the tier handler had just widened them from its
+32-bit offsets, 16 stores), subtracts the base, hashes eight of them and compares 256 bytes.
+
+### What changed
+* `h_shared` no longer widens its offsets. `count_shared_offsets` -> `memcount::sass_bank_passes_offsets` (include/vgpu/exec/mem_counters.hpp) keys a warp by its 32-bit offsets less the first
+  active lane's word (a lane that does not run is taken at that word, as in the 64-bit key): 128 bytes to build and compare, in SSE2 vectors.
+* Every shape goes through the table, the ones on a stride too (a hit is cheaper than finding the stride), and the entry that answered last is compared first, without the hash (a loop asks for
+  one shape two or three times running: load, store, load of the same indices). A miss is counted as before (`sass_bank_passes` on the widened offsets: closed forms, then the table of words) and stored.
+* Validity of the 32-bit key: no active offset may have bit 31 set (else the call is counted, never remembered). Then every true difference between two lanes is under 2^31, so two warps with
+  equal keys differ by a move of whole words, and the passes (distinct words per bank) cannot differ. Without the test two lanes 4 GB apart in truth and one word apart modulo 2^32 are equal keys
+  (test below).
+* Same window and back-off as the 64-bit table (under a third hits in 64 lookups: 1024 calls uncounted by the table). `BankMemo` grows by a second table of 32 x 136 bytes, the same thread_local object.
+* Tried and dropped: counting runs of lanes (`mask = 2^n - 1`, which a sorting network asks for by the thousand, 1.1 M distinct masks in sortingNetworks) the old way, before the table: 2% to 3%
+  slower than putting everything through the table (instructions 290.4 G against 282.9 G, cycles 71.9 G against 68.8 G). A table of 128 entries: hit rate 86.4% -> 87.4% only (the misses are
+  masks that never repeat, not capacity), dropped. `sass_bank_passes_widened` inline: worse (mem 0.954x on both CPUs).
+
+### Results (A = b6545db2, B = branch; outputs and bank-conflict counters identical per kernel in the programs below, checked with VGPU_COUNTERS=1)
+Zen 4 (server3, Ryzen 7 PRO 8840U, cpu 3, `perf stat` user cycles / instructions of the whole program, box load 1 to 2, 3 to 4 runs; A/A of the same runs 0.997 to 1.003):
+| program | A cycles | B cycles | B/A | A instructions | B instructions |
+|---|---:|---:|---:|---:|---:|
+| convolutionSeparable | 64.8 / 64.9 / 64.9 G | 59.4 / 59.6 / 59.9 G | 0.918 | 295.0 G | 268.2 G |
+| sortingNetworks | 84.6 / 84.5 / 84.6 G | 69.0 / 69.9 / 69.1 G | 0.817 | 311.95 G | 284.7 G |
+| transpose | 44.2 / 44.1 / 44.6 / 44.2 G | 44.5 / 44.2 / 44.2 / 44.3 G | 1.00 | 184.5 G | 182.5 G |
+
+Zen 5 (server2, Ryzen 9 9950X, cpu 30, wall s, 5 alternating runs, box load 7 to 9 from other sessions):
+| program | A s | B s | A/B |
+|---|---:|---:|---:|
+| sortingNetworks | 15.16 to 15.27 | 11.19 to 11.47 | 1.35x |
+| convolutionSeparable | 10.33 to 10.43 | 9.16 to 9.75 | 1.13x |
+| transpose | 6.93 to 7.04 | 7.14 to 7.26 | 0.97x |
+(transpose: its shared accesses are contiguous or one stride, which the base counted in closed form; on Zen 4 it is level at 1.00x cycles with 1.1% fewer instructions, so the 0.97x on Zen 5 is a
+cost of the table path on that core or placement; not separated.) `real.py` on server3 (5 runs, cpu 3, load 1 to 20, wall): sortingNetworks 1.23x, convolutionSeparable 1.10x, dct8x8 1.05x,
+hotspot 1.08x, lud 0.99x, mergeSort 1.00x, transpose 1.01x (outputs identical); bh timed out at 150 s on both sides.
+
+bench.py canaries (12 workloads, SASS and PTX, 15 runs, counters identical in all 24 rows on both CPUs). Final tree: A/A on Zen 4 all within 0.985x to 1.007x. A/B on Zen 4: `divergent` SASS
+1.067x, `wmma` SASS 1.017x, `mma_ptx` 1.011x/1.016x (placement gains, not goals), `mem` SASS 0.976x (p<0.001; 0.985x and 0.981x in two other windows) and `warp` PTX 0.967x (p<0.001) are the
+rows below 0.98x. A/A on Zen 5 within 0.96x to 1.02x (0.98x to 1.01x apart from `launch` PTX 0.962x, p 0.77); A/B on Zen 5: `wmma` PTX 0.945x (0.935x to 0.941x in two other runs, p<0.001),
+`warp` PTX 0.977x/0.975x, `api` 0.980x to 0.987x, `mem` SASS 0.982x, `atomics` SASS 0.984x. None of these runs any code this round touches (the PTX interpreter, the API path), instructions are equal,
+and they moved from variant to variant of the same change (see below): the placement effect of earlier rounds (sp9, sp12 shared), not a measured cause. The variants measured (same source, only
+`noinline`): plain inline `sass_bank_passes_offsets`: Zen 4 `mem` PTX 0.978x, `divergent` PTX 0.974x, `launch` SASS 0.969x (all reproduced with 21 runs); `noinline` on it (kept): those three at 0.998x,
+0.996x, 1.000x, the losses move to the rows above; also `noinline`-less `sass_bank_passes_widened`: `mem` 0.954x to 0.977x on both CPUs, dropped. Zen 5 `wmma` PTX read 0.92x to 0.94x in all three
+variants, 1.00x on Zen 4 (it is the 16-lane tensor kernel's host, which sp12 measured as layout-sensitive on Zen 5), so it is reported, not fixed.
+
+### Tests (CMake-wired, `test_bank_memo`) and the mutations that fail them
+* `offsets_are_counted_as_the_definition_counts_them`: 600 000 random warps (7 kinds of shape, widths 1 to 64, full, partial and sparse masks, bases at every byte, a cluster rank above the offset,
+  across bit 31 and past 2^32, idle lanes holding anything) against the definition (sorted vectors of the words of each bank), with one table throughout (hits, collisions, the last-entry compare, the back-off).
+* `offsets_that_differ_in_one_lane_one_byte_or_the_mask...`, `offsets_on_a_stride_and_ones_that_never_repeat...`, `offsets_every_pair_of_lanes_and_every_lane_left_out...` (all 496 pairs and 32
+  masks of all lanes but one, twice, idle lanes holding real offsets), `offsets_a_lane_that_joins_the_mask_changes_the_answer...` (lanes c and a+16, then a joins: 1 then 2 passes, for all c, a), `offsets_across_bit_31_are_not_taken_for_the_same_shape_in_low_memory` (offsets 4096/4094 then 0/0xfffffffe, 1 then 2 passes).
+* Mutations (header mutated, test rebuilt; all killed): no blend of idle lanes, bit-31 test removed, width left out of the key, base not rounded to a word, last-entry hit without the
+  key compare, hash-entry hit without the key compare, lane-select vector with lanes 0 and 1 swapped, mask ignored in the key. The first version of the suite let the bit-31 and the swapped-lane mutants
+  survive; the last two tests above were written for them.
+* Also run and passing (Release, server3): test_memcount_forms, test_sass_dispatch, test_tier, test_memfast, test_sass_access_count, test_sass_mem_rows.
+
+### Not done
+* The remaining bank cost in sortingNetworks is `sass_bank_passes_table` (7% of the program) on the masks that never repeat (merge steps); a closed form for two runs of consecutive words, or a per-shape
+  word-group table counted for any mask, would take it. `thread_local` access (`__tls_get_addr`, 0.8%) not changed (initial-exec TLS in a shim library loaded by dlopen is a risk, a pointer in `Block` moves heap blocks).
+* The PTX interpreter's shared-memory banks (`ptx_bank_passes`), the exec path (`count_shared_access`) and the other tier handlers keep the 64-bit table.
+## Round sp13: the AMD matrix kernels in a unit of their own (branch `sp13-amd-lto`, base `sp12-combined`)
+
+The sp12 fix for the AMD matrix path was a pair of compile flags (`-falign-loops=32` on `gcn_exec.cpp`, an `align-loops=64` attribute on two functions): the layout of a
+few-instruction loop still depended on what the linker put ahead of it, and `mfma_i8` and `mfma_f64_4b` stayed behind. The question: take the matrix kernels out of the
+library's link-time optimization and the layout is theirs alone.
+
+### What changed
+
+`amd/src/gcn_matrix_kernels.cpp` (new) holds `mfma_tile_f_avx2`, `mfma_tile_fma_hw`, `mfma_tile_fma_avx2`, `mfma_tile_int_avx2` (moved out of `mfma_math.hpp`, which
+declares them) and `matrix_decode_wide_avx2<T, Run>` (moved out of `gcn_exec.cpp`, eight instances, `gcn_matrix_kernels.hpp`). The unit is built `-fno-lto -falign-functions=64
+-falign-loops=32` (CMakeLists.txt), as `gcn_tier_ds.cpp` is. Two things the move needed: the decoder's AVX2 target has to come from a `#pragma GCC target` region (on a function
+template's definition the target did not reach the explicit instantiations and the always-inline lambdas in them), and the K = 4 fused kernel got its own pair of loops (out of line,
+with the K test inside the column loop, it ran 5 % slower than when it was inlined into a caller that knew K). Same arithmetic, same bits.
+
+### Layout stability (server2, Zen 5, cpu 24, `tools/bench-amd/bench.py`, one host thread, 21 alternating runs a row, cpu seconds)
+
+The test: add 1 (P1) or 4 (P4) unrelated `noinline` functions to `src/core/error.cpp`, which is linked ahead of everything, and compare each build with the same tree before the edit.
+Medians of with-the-edit / without, noise (A/A, same code, two copies of the build) 0.97 to 1.01. (The branch columns were timed with the unit at `-falign-loops=64`, one step before the final 32; for the final build the check is the identical machine code below.)
+
+| row | sp12 tree, +1 function | sp12 tree, +4 | this branch, +1 | this branch, +4 |
+| --- | ---: | ---: | ---: | ---: |
+| `mfma` | 0.982 | 0.953 | 0.999 | 0.997 |
+| `mfma_bf16` | 0.981 | 0.977 | 1.008 | 1.010 |
+| `mfma_i8` | 0.969 | 0.973 | 1.019 | 1.000 |
+| `mfma_f64` | 0.985 | 1.001 | 0.998 | 1.003 |
+| `mfma_f64_4b` | 1.021 | 1.005 | 0.981 | 0.983 |
+| `smfmac` | 0.985 | 0.981 | 1.004 | 1.002 |
+
+With the integer kernel still inline the same edit cost `mfma_i8` 7 % (0.929), which is why `mfma_tile_int_avx2` moved too. The machine code and the offset modulo 64 of all twelve
+functions of the unit are identical with and without the edit (with the edit the library's text moved by some hundred bytes; `nm` + `objdump -s` of each symbol): the layout cannot move
+any more, short of an edit of the unit itself.
+
+### Speed against sp12-combined (same bench, median of three 21-run A/Bs, same host, load 7 to 12 from other sessions; A/A over 21 runs: 0.97 to 1.01)
+
+| row | B / A |
+| --- | ---: |
+| `mfma_i8` | 1.103, 1.060, 1.060 |
+| `mfma` | 0.988, 0.986, 0.957 |
+| `mfma_bf16` | 0.977, 0.970, 0.959 |
+| `smfmac` | 0.980, 0.981, 0.981 |
+| `mfma_f64` | 1.008, 0.972, 0.979 |
+| `mfma_f64_4b` | 1.062, 0.994, 0.997 |
+| `valu_int`, `valu_f32`, `lds`, `divergent`, `wave` | 0.99 to 1.03 |
+| `launch` | 1.054, 1.043, 1.042 |
+
+So the integer rows gain 6 to 10 %, and `mfma`, `mfma_bf16`, `smfmac` are 1 to 4 % below the sp12 tree, whose layout was a good one for them: the same sp12 tree with one unrelated function
+added is 2 to 5 % below itself on those rows (table above). Counters are identical (`--check-counters`).
+
+### Zen 4 (server3, Ryzen 7 PRO 8840U, cpu 3, load 14 to 67 from other sessions, 15 alternating runs, two A/Bs and one A/A)
+
+The box was too loaded for anything under about 5 % (the A/A over 15 runs spreads 0.91 to 1.11 on the noisiest rows, 0.99 to 1.04 on the matrix rows). B / A: `mfma_f64` 1.064, 1.059
+(p 0.02, 0.005), `mfma_f64_4b` 1.137, 1.068 (p 0.001, 0.000), `smfmac` 1.041, 1.085, `mfma` 1.096 (p 0.48), 0.984, `mfma_bf16` 0.985, 0.971 (p 0.09, 0.34), `mfma_i8` 0.974, 1.017 (p 0.03, 0.5);
+the other canary rows 0.95 to 1.04, none slower at p < 0.05.
+
+### Side finding: the heap position cliff of `mfma_bf16` does not reproduce
+
+An `LD_PRELOAD` library that allocates N bytes before `main` (N = 64 to 4096 in steps of 64), each point timed 5 times between two pad-0 references: the largest ratio of a point to its
+neighbouring references is 1.04 on this branch and 1.02 on the sp12 tree, no cliff. What did move was the box: the same pad measured 0.149 s and 0.216 s a few minutes apart while other
+sessions ran jobs on the sibling thread, which is what a contiguous "cliff" at one pad in an unpaired sweep looks like (the sp12 sweep was unpaired). If it comes back, pair every point with
+a reference.
+
+### Test
+
+`test_amd_matrix_kernels_layout`: each of the four kernels and the eight decoder instances is a function of its own that starts a 64-byte line. Mutant: the unit compiled with
+`-falign-functions=1` fails both tests (`mfma_tile_f_avx2` at 16 modulo 64, the decoder likewise). The arithmetic is held by `test_amd_mfma_math`, `test_amd_matrix_fast`,
+`test_amd_nan_order`, `test_amd_gcn_same_bits`, `test_amd_gcn_packed_same_bits`, `test_amd_gcn_memory_same_bits`, `test_amd_codeobject_same_bits` (all pass).
+
+### Not done
+
+* `perf` does not run on server2, so the 1 to 4 % left on `mfma`/`mfma_bf16` is not attributed (the call into the unit and the lost constant propagation into the decoders are the suspects).
+## Round sp13: device atomics without the stripe locks (branch `sp13-atomics`, base `sp12-combined`)
+The scaling study (round sp12, `scale.cu`) found atomics going backwards: 0.77x at 16 threads, 1.04x at 4. Cause: every global atomic of the SASS engine (and the PTX engine, with its own 251-lock array) took a `std::mutex` out of a striped array (64 stripes keyed by cache line in `atomic_lock`, `src/sass/exec.cpp`); a warp's atomics took up to ~25 of them in turn, so every thread reached for the same few mutex lines.
+### What changed
+* **The CPU's own compare-and-swap on each word instead of the locks** (`sassatom::global_lockfree`, `include/vgpu/exec/sass_atomics.hpp`; `MemoryManager::atomic_word_ptrs`, which gives the bytes of a warp's 4/8-byte words and declines, having done nothing, wherever the locked form could differ: a fault armed, a host mapping in reach, an unaligned word, a word outside the one allocation). Each distinct word of the warp gets one swap loop whose step runs that word's lanes in lane order from the value the swap replaces (a retry runs them again from the new value), so a lane finds what the lanes before it left and the old values are the ones the locked form gave. An integer add is one `fetch_add` of the word's lanes' sum (lane l's old value is the word's plus what the lanes before it added): no retry loop, which is why a contended counter scales. An untouched or uniform chunk goes through `atomic_rmw` (the chunk is made real only where the locked form made it). Used by the SASS warp batch, the SASS lane-by-lane path (vector forms, the shapes the batch declines), TMA reductions, and in the PTX engine by the warp batch (`rmw_batch` with `lock_free`), the lane loop, the vector atomics and `cp.reduce`.
+* **Only from four host threads** (`kLockFreeAtomicsFromThreads`, `vgpu/exec/host_atomic.hpp`). Measured on Zen 5, a lock pair on a cache line costs about 1.8 ns and a locked instruction per word about 4 ns, and a warp's 32 words lie on about 14 lines: with one or two threads the locks are 1.25x / 1.3x faster than the swaps (the first version of this change used the swaps at every thread count: `atomics` 3.5 -> 4.7 s at one thread). From four threads the stripe lines bounce and the swaps win. The choice is the process's, from the configured thread count (`VGPU_THREADS`, else the CPUs it may use), made once, not per launch, so two overlapping launches never meet on one word under different roads. At one or two threads the code is the stripe-lock code it was.
+* **What is guaranteed.** Each word's update is atomic. Integer add, and, or, xor, min, max leave the serial value and give each lane an old value consistent with some order at any thread count; the old values of a fetch-add are a permutation (`e2e_atomics_threads`). Exchange, compare-and-swap, inc, dec and float add take the order in which the threads reach the word (a float sum varies with that order, as on the card, and as it did before: the locks never fixed an order across blocks). At one thread (and in every single-thread run) the results are bit-identical to before. A warp's atomics are no longer one step to another host thread (the locked batch held every stripe of the warp at once); CUDA promises no such step. Words the lock road kept: `atom.b128`, misaligned words and host-mapped words (the CPU's atomic). A 2-byte atomic (PTX scalar f16/b16, `cp.reduce`, TMA reductions) on the swap road swaps the aligned 32-bit word that holds it (`exec::atomic_rmw16`, `vgpu/exec/host_atomic.hpp`), so it is atomic against the 4-byte atomics on that word; it costs one 32-bit swap, the same as a 4-byte atomic, and 1 or 2 threads still use the locks (which key a 2-byte and a 4-byte atomic on the same word to one lock).
+### Results (server2, Ryzen 9 9950X, `scale.cu` as in the sp12 scaling study, A = `sp12-combined`, B = this branch, median wall of 5 alternating runs, cpus 12-15 / 7,9-15 / 0-15, outputs identical (the sums are self-checked))
+| SASS engine, wall seconds (`atomics`: 536 M atomics spread over 4096 words; `atomics1`: 50 M on one counter) | A | B | A/B |
+|---|---:|---:|---:|
+| `atomics` t = 1 | 3.50 | 3.56 | 0.98 (locks both: layout) |
+| `atomics` t = 2 | 2.22 | 2.17 | 1.02 (locks both) |
+| `atomics` t = 4 | 2.75 | 1.15 | 2.4x |
+| `atomics` t = 8 | 3.32 | 1.75 (0.99 to 2.30: other jobs on the box) | 1.9x |
+| `atomics` t = 16 | 3.79 | 0.73 | 5.2x |
+| `atomics1` t = 1 | 3.27 | 3.41 | 0.96 (locks both) |
+| `atomics1` t = 2 | 1.94 | 2.09 | 0.93 (locks both) |
+| `atomics1` t = 4 | 2.00 | 0.91 | 2.2x |
+| `atomics1` t = 8 | 2.22 | 1.00 | 2.2x |
+| `atomics1` t = 16 | 4.59 | 0.60 | 7.6x |
+
+Scaling against the same build at one thread: A is 0.92x at 16 threads in this run (0.77x in the study), B is 4.9x (`atomics`) and 5.7x (`atomics1`). The PTX engine (`VGPU_SASS=0`), same probes: `atomics` t = 1 2.89 -> 2.96, t = 4 3.05 -> 0.94 (3.2x), t = 8 4.50 -> 1.22 (3.7x, noisy), t = 16 3.03 -> 0.68 (4.5x); `atomics1` t = 1 4.31 -> 4.54, t = 4 33.1 -> 2.43 (13.6x: the PTX lane loop took a lock per lane on one word), t = 8 56.7 -> 3.24 (17x), t = 16 72.6 -> 3.0 to 20 (the box was shared). The sums are checked in every run (`out=` of `scale`): no run of B lost an update. Rows at t = 1 and 2 run the same code as A, so their differences (0.93x to 1.02x) are the noise of two builds (the A/A of the canary below is 0.99x to 1.01x per row, the layout of two builds is a few percent more).
+Zen 4 (server3, Ryzen 7 PRO 8840U, 8 cores, shared box, load 6 to 28 during the t = 1 and 2 rows, about 6 for t = 4 and 8; medians of 3, sums checked): `atomics` t = 1 5.82 -> 5.66, t = 2 4.75 -> 4.73 (locks both), t = 4 6.64 -> 2.56 (2.6x), t = 8 6.97 -> 1.66 (4.2x); `atomics1` t = 1 5.46 -> 5.59, t = 2 4.52 -> 4.95 (the t = 2 row ran at load 8 to 10), t = 4 5.67 -> 2.51 (2.3x), t = 8 6.05 -> 1.58 (3.8x).
+The 12-workload canary (`bench.py --ab`, `--threads 1`, 9 runs, sass + ptx, **counters identical in all 24 rows** on both hosts). Zen 5 (`--cpus 13`, load about 6; A/A of the base against itself 0.99x to 1.01x in every row, on a loaded box): int_alu, f32_fma, mem ptx, atomics, local, divergent, warp, launch, api 0.98x to 1.02x; **SASS wmma 0.952x, PTX wmma 0.966x, SASS mma_ptx 0.964x, PTX mma_ptx 0.968x, SASS mem 0.967x, SASS shared 0.975x, PTX shared 0.975x** (p < 0.01). Zen 4 (`--cpus 6`, A/A 0.94x to 1.01x, the one low row a load swing): every row 0.98x to 1.05x except **PTX mem 0.947x**; SASS wmma 1.022x and mma_ptx 1.013x. These are the placement losses of the earlier rounds moving again, not work: the one-thread path runs the same atomics code as before behind one branch on a process-wide flag, the instruction counts are identical, and the same rows swung between 0.92x and 1.11x across builds in round sp12. A first build of this change, with `global_lockfree` inlined into `exec_mem` once per step, read SASS wmma 0.935x, PTX wmma 0.925x, SASS mma_ptx 0.924x and SASS atomics 0.975x on Zen 5; making it `noinline` took the atomics row and half of the rest back. Nothing structural is left to change here without a layout tool (the `-fno-lto` unit of the `amd-lto` idea would apply to these as well).
+### Tests (CMake-wired) and mutation checks
+* `test_sass_lockfree` (new, unit): a warp's lock-free atomics against the lane-by-lane rule (`sassatom::apply`, held against the frozen executor lambda by `test_sass_atomics`) over every operation and type, compare-and-swap, partial masks, lanes sharing a word, words in a never-written, a uniform and a real chunk: old values, the words left, the changed flag; declines with nothing touched (misaligned, past the end, before the start, freed); from six threads, a fetch-add hands out each old value once (u32, u64, f32) and add / and / or / xor / min / max, spread and contended, leave the serial result.
+* `two_byte_atomics_are_atomic_against_four_byte_ones_on_the_same_word` (in `test_sass_lockfree`): three threads count the low half and three the high half with `atomic_rmw16` while three add 0x10000 to the whole word; both counts exact. Mutant (a plain 16-bit load and store): killed. `e2e_atomics_threads` has the same mix as a kernel (a 16-bit `atomicCAS` beside `atomicAdd` on one word); the mutant fails it on the PTX engine at 4 and 8 threads (the SASS engine compiles the 16-bit CAS to 32-bit operations, so it passes either way).
+* `e2e_atomics_threads` (new, `nvidia/tests/e2e/atomics_threads.cu`): contended and spread atomics, tickets (every one handed out once), a CAS-built sum and `atomicInc` wrapping, at `VGPU_THREADS` 1, 2, 4 and 8 on the SASS and PTX engines (so the lock road and the swap road).
+* Mutants (server2, run): the swap loop's step reporting nothing changed (killed: `a_warps_lock_free_atomics_are_the_lane_by_lane_ones`); each lane given the value after its own step as its old value (killed: lane-by-lane test, and the fetch-add test); the result not cut to the type's width (killed: lane-by-lane); the fetch-add prefix dropped (killed: lane-by-lane and fetch-add tests) and its changed flag dropped (killed: lane-by-lane); plain load and store instead of the swap (`lock_free = false`: killed, 2 of 4 tests, lost updates); in the engines, the SASS fetch-add replaced by load, add, store, and the PTX batch run with `lock_free = false` plus the PTX lane path off (killed by `e2e_atomics_threads` at 4 and 8 threads on both engines, passing at 1 and 2, where the lock road runs, as it must).
+* Also run and passing on server2: `test_sass_atomics`, `test_memrmw_lockfree`.
+### Sanitizers
+Final tree (server3, Zen 4): TSan (`-O1`, `setarch -R`) clean on `test_sass_atomics`, `test_hostmap_cache`, `test_memrmw_lockfree`, `test_sass_lockfree`, `e2e_host_atomics` and `e2e_atomics_threads` (SASS and PTX, 1, 2, 4, 8 threads); ASan+UBSan `-O0` clean on `test_sass_lockfree` and `test_sass_atomics`. One-thread canary of the final tree on Zen 5 (load about 8): SASS wmma 0.939x, SASS mma_ptx 0.940x, PTX wmma 0.978x, PTX mma_ptx 0.965x, SASS mem 0.972x, SASS atomics 1.038x, every other row 0.98x to 1.02x, counters identical.
+### Not done
+* A single `fetch_or`/`fetch_and`/`fetch_xor` for the bitwise steps (they use the swap loop; a contended counter was the case that needed `fetch_add`) and a closed form for min / max.
+* `atom.b128`, misaligned words and host-mapped words keep the lock (or the CPU's atomic, for host-mapped).
+* The AMD engine already used `atomic_rmw` (its own lock-free flag); not touched.
 ## Round sp12: f32 <-> f64 conversions as SIMD kernels (branch `sp12-f2f`, base 4cc7247d)
 `F2F.F64.F32`, `F2F.F32.F64`, `I2F.F64.U32/.S32`, `FCHK` and `MUFU.RCP64H` are 0.76% of the SASS instructions but sit in hotspot, JACOBI1D, backprop, atomicCost, jacobiCudaGraphs and simpleCudaGraphs; the per-lane `cv_f2f` of `fast_float` was 12% of hotspot's samples and 8% of JACOBI1D's. An earlier tier form that only routed them through `tier_float_op` cut instructions 1-4% and made cycles worse, because the per-lane conversion stayed.
 * Three kernels in the `simd::Kernels` table (`f2f_widen`, `f2f_narrow`, `i2d`; `src/simd/kernels.inc`, one baseline and one AVX2 form, the AVX-512 table inherits the AVX2 ones). f32 to f64 and u32/s32 to f64 are exact (the unsigned form adds two non-negative parts, so a zero is +0 in every rounding mode); f64 to f32 runs in the host's rounding mode, which the callers set as `dop_m` does (`RoundingScope`). `|x|` then `-x` are applied to everything but a NaN, which keeps its sign and payload as the register holds it (the conversion shifts the payload and quiets it), as `cv_f2f` does. The baseline forms keep the conversion of a NaN lane (an `asm volatile` empty statement), so the sticky exception flags are the scalar code's too (the test holds them equal).
@@ -5789,6 +5992,118 @@ The 12-workload canary (`bench.py --ab`, `--threads 1 --cpus 7`, 9 runs, sass + 
 * Mutations that fail them (each rebuilt and run): a NaN with `|x|` applied in widen (AVX2) and in narrow (test_simd); unsigned i2d by sign flip, which gives -0 when the host rounds down (test_simd); `|x|` and `-x` swapped in the tier's analysis, the tier handler without the rounding scope, the tier handler's high-word row off by one (test_sass_alu_runs); `fast_float` without the rounding scope (only `VGPU_TIER=0` run fails: the reason for that ctest entry).
 * ASan+UBSan (-O0) of test_simd, test_tier and test_sass_alu_runs: pass. Not run here: TSan (no threads in the change), `e2e_sass_tier` / `e2e_sass_archs` / the AMD guards (no nvcc on server3; CI).
 
+## Round sp14: the engines outside link-time optimization, on fixed alignment (branch `sp14-placement`, base `sp13-combined`)
+
+Rounds 12 and 13 left one-thread differences at equal counters on rows that run unchanged code (Zen 5: SASS `mem` 0.96x, PTX `wmma` 0.98x, `launch64` 6 % slower; faster on Zen 4). The question: structural, or the lottery of where the code lands?
+
+### What was measured (server2 Zen 5 9950X, pinned cpu, alternating runs of the benchmark program, one thread; server3 Zen 4 8840U, `perf stat`)
+
+* Same source, one unrelated edit (two `noinline` functions added to `src/core/error.cpp`, or three to `src/runtime/runtime.cpp`): the library's text moves by some hundred bytes, instructions retired are equal to the instruction, and on Zen 5 the rows move: sp12-combined (A) and its two edited copies, medians of 40 runs, A = 1.00: SASS `mem` 1.000 / 1.002 / 1.041, PTX `wmma` 1.000 / 0.956 / 0.973, PTX `mma_ptx` 1.000 / 1.067 / 1.078, PTX `launch` 1.000 / 0.978 / 0.994, SASS `atomics` 1.000 / 0.998 / 1.015. sp13-combined (B) and its two copies: SASS `mem` 0.986 / 1.016 / 1.014, PTX `wmma` 1.035 / 1.031 / 0.991, SASS `atomics` 0.960 / 0.982 / 0.991 (Zen 4 retires 0.5 % more instructions there, so part of that is real), SASS `wmma` 1.47 / 1.48 / 1.49. The same copies on Zen 4: cycles within 1 to 2 % (equal instructions): the lottery is a Zen 5 front-end affair. So the three rows were not a property of round 13's code. A build of sp12-combined in another directory ran `launch64` at 5.0 s where round 12 had measured 4.67 s: 8 % between two builds of one source.
+* Not a matter of function alignment alone: every function start was already on 16 bytes; the tensor kernel `mma_avx512_chunked_f` is `aligned(64)`. A whole-library `-falign-functions=64` build gave SASS `wmma` 1.34x in one copy and 1.52x in the same copy after the unrelated edit (the kernel is 17.6 KB: its position modulo 4096 and what neighbours it move).
+* The link-time optimizer re-rolls the inlining of the engines' hot paths as well: in one build `run_micro_batch` of the PTX interpreter was a function of its own instead of inlined (`launch` PTX 0.945x, 2.8 % more instructions on Zen 4), and `setup_block`, `step_block` changed size, with `interpreter.cpp` itself unchanged, only the units around it in the LTO partition.
+
+### What changed
+
+`CMakeLists.txt`: `VGPU_HOT_UNIT_FLAGS` = `-fno-lto -falign-functions=64 -falign-loops=32`, on `src/sass/exec.cpp` (the SASS engine and its tier handlers), `src/exec/interpreter.cpp` (the PTX interpreter; keeps `-Werror=psabi`), `src/core/memory.cpp` (already outside LTO, now aligned) and `src/simd/simd.cpp`, `src/simd/lanes.cpp` (the SIMD kernels both engines call, `hmma_k` and the others). As for `gcn_tier_ds.cpp` and `gcn_matrix_kernels.cpp`, a unit outside LTO is compiled once from its own source, so an edit elsewhere no longer re-orders it or changes what is inlined in it. Text grows 3 % (6.78 -> 6.97 MB).
+
+Why all five and not fewer (builds of the same base, Zen 5, medians of 60 to 100 interleaved runs, A = 1.00; "edits" = the two unrelated edits above):
+| configuration | what happened |
+|---|---|
+| exec.cpp + memory.cpp only (PTX interpreter left in LTO) | the PTX side re-rolled: `run_micro_batch` split off, `launch` PTX 0.945x |
+| + interpreter.cpp, SIMD kernels left in LTO | SASS tensor rows 1.52x and stable under edits, but `mem` SASS 0.988 to 1.018 and `launch` PTX 0.949 to 0.975 across edits |
+| + simd.cpp, lanes.cpp (kept) | for the five-unit tree (built without `-Werror=psabi`, a diagnostic), a copy of it and the two edits: SASS `wmma` 1.526 / 1.521 / 1.522 / 1.517, `mma_ptx` 1.484 / 1.488 / 1.487 / 1.478, `shared` 1.027 / 1.027 / 1.026 / 1.027; `mem` 0.978 / 0.979 / 0.976 / 0.974; `launch` SASS 1.019 / 1.022 / 1.020 / 1.011 |
+| functions only on 64 (no `-falign-loops=32`) on the three big units | PTX `wmma` 0.936x and 0.953x (the tensor kernel's loops) |
+| same, but `simd.cpp` and `lanes.cpp` on functions only | SASS `wmma` 1.35x (1.52x with the loops), PTX `mma_ptx` 1.28x (1.42x): the loops of the SIMD kernels matter too |
+
+The spread of one row over the edits (max - min, in points of A): before, A: `mem` SASS 4.0, PTX `mma_ptx` 7.8, PTX `wmma` 4.4; B: `mem` 3.0, `atomics` 3.1, PTX `wmma` 4.4; after, the kept flags: `mem` SASS 0.5, PTX `mma_ptx` 0.9, PTX `wmma` 0.8, `atomics` SASS 1.0, `launch` SASS 1.1, `shared` 0.1, tensor SASS rows 0.9 to 1.0.
+
+### Results (A = sp12-combined, W = this branch, counters identical in all 26 rows on both CPUs)
+
+`bench.py --ab`, 13 workloads x SASS and PTX, 15 runs, one thread. Zen 5 (cpu 30, load 8 to 9 from other sessions): A/A 0.99x to 1.01x in every row; A -> W: SASS `wmma` 1.726x, PTX `wmma` 1.041x, SASS `mma_ptx` 1.534x, PTX `mma_ptx` 1.442x, `shared` SASS 1.034x, `atomics` SASS 1.022x (p 0.87), `launch` SASS 1.023x, `f32_fma` SASS 1.024x; `mem` SASS 0.975x (0.962x best-of), `f32_fma` PTX 0.984x, `launch` PTX 0.989x; every other row 0.99x to 1.02x. Repeated with the builds swapped in another window (load 6 to 19, W over A): `wmma` SASS 1.60x, `mma_ptx` 1.44x / 1.46x, `mem` SASS 0.976x, `atomics` SASS 0.976x, `launch` PTX 0.979x, `shared` 1.02x, the rest 0.97x to 1.05x. W against B (interleaved medians, below): the tensor rows 1.52x / 1.49x against 1.48x / 1.43x of A, everything else within 2 %.
+Interleaved medians of 60 to 120 runs (one pinned core, builds alternating; the kept flags built without `-Werror=psabi`): SASS `mem` A 1.000 / B 0.995 / W 0.979 in two windows and 1.001 in a third, `atomics` SASS A 1.000 / B 0.966 / W 0.980, PTX `launch` A 1.000 / B 1.005 / W 0.981: this is the part of the three named rows that stays: SASS `mem` about 2 %, PTX `launch` about 2 % and SASS `atomics` 2 % (the last one was 3.4 % in B).
+`launch64` (scale.cu, 300 k launches of 64 blocks): 1 thread A 5.01 s, B 4.75, W 4.78; 4 threads A 5.07, B 4.80, W 4.83. (A built here is the slow end of the lottery; round 12's own A build ran 4.67.) 16 threads, `scale atomics` (wall, 5 runs): A 3.2 to 4.2 s, B 0.68, W 0.60. `sortingNetworks` (CUDA sample, 3 runs): 1 thread A 14.1 s, B 11.2, W 11.3; 16 threads A 1.6 to 2.2, B 1.35 to 1.64, W 1.61 to 1.65.
+Zen 4 (server3, cpu 3, load 2 to 4, `bench.py --ab`, 15 runs; A/A 0.98x to 1.01x in all rows but PTX `local`, 0.84x at p 0.84 in one window and 1.00x in the other): A -> W, two windows: SASS `wmma` 1.278x / 1.281x, `mma_ptx` SASS 1.266x / 1.271x, PTX 1.233x / 1.247x, `shared` 1.028x / 1.018x, `divergent` PTX 1.039x / 1.052x; **PTX `wmma` 0.959x / 0.952x** (p < 0.01 both), `f64_fma` SASS 0.971x / 0.962x (p 0.016 and 0.000; not explained), `atomics` 0.99x, `mem` 0.99x to 1.00x, `launch` PTX 0.983x; the rest 0.98x to 1.03x. B against A in the same window: PTX `wmma` 1.035x.
+
+### Tests (CMake-wired) and mutations
+* `lint_hot_unit_layout` (`tests/lint/check_hot_unit_layout.py`, reads the five objects under `CMakeFiles/vgpu.dir`): none carries LTO bytecode, every executable section but the cold and startup ones is aligned to 64, and each holds code. Mutations, each rebuilt: `VGPU_HOT_UNIT_FLAGS` with `-falign-functions=16` fails (exec.cpp.o `.text` at 32, the comdat sections at 16); without `-fno-lto` fails (`.gnu.lto_.odr_types` in exec.cpp.o, interpreter.cpp.o, memory.cpp.o ...); the sp13-combined objects fail (LTO bytecode, 16). The `-falign-loops=32` half is not read back by the test (loop alignment leaves no trace in the object's headers); it is held by the flag list in the same line and measured above.
+* Passing on server2 (Release): `test_bank_memo`, `test_exec*`, `test_jit*`, `test_launch_*`, `test_mem*`, `test_mma_*` and their `_simd_` twins, `test_ptx*`, `test_sass_*` (46 incl. `test_sass_lockfree`, `test_sass_atomics`, `test_sass_ok_cache`), `test_sched`, `test_simd*`, `test_tc_ampere*`, `test_tcgen05_*`, `test_tier`, `test_wmma_generic_fast*`, `test_worker_pool`: 73 of 73. Not run here: the e2e programs (CI), sanitizer legs (the change adds no code; `-fno-lto` and alignment flags only).
+
+### Tried and not kept
+* A dedicated unit for the chunked tensor kernels (`extern template` in `tc_ampere.hpp`, explicit instantiation in `simd.cpp`, then in a `tc86_kernels.cpp` of its own) with the lambdas of `mma_avx512_chunked_f` `always_inline`: it makes the kernel one copy (as inline templates each unit carries one and the linker keeps the first; outside LTO that copy has its lambdas as functions of their own, 3.6 % more instructions in PTX `wmma`, which is the Zen 4 loss above) and Zen 4 PTX `wmma` was at A, SASS tensor rows 1.44x to 1.51x. But the PTX interpreter, with the copies gone from its object, landed elsewhere: PTX `mem` 0.95x to 0.97x, `local` 0.925x to 0.93x, `divergent` 0.96x, SASS `launch` 0.956x in one window. The loss moved from one place to another; dropped, no flag list would hold it.
+* `always_inline` lambdas alone (copies kept): PTX `mma_ptx` 1.25x against 1.40x. `--param=inline-unit-growth=400 --param=large-unit-insns=1000000` on the hot units (the big translation units inline less than an LTO partition does): text +13 %, SASS `atomics` 1.08x and `launch` 1.04x on Zen 5, instructions -3 % on those rows on Zen 4, PTX `shared` 0.987x and PTX `wmma` 1.00x; not kept (not run through the canary, and the size), but the best single lead left.
+* Whole-library alignment, the PTX interpreter left in LTO: above.
+
+### Not done
+* The 4 to 5 % of PTX `wmma` on Zen 4, and the 2 % of SASS `mem` and PTX `launch` on Zen 5 (rows that still sit 2 % under sp12-combined, though level with sp13-combined in the same windows). `perf` does not run on server2, so the Zen 5 rows are read by wall time and by instructions on Zen 4 only.
+* Per-function hot/cold ordering (`.text.hot`) inside the engines' units; the layout of `interpreter.cpp` and `exec.cpp` still depends on their own source (any edit inside them re-rolls it, as an edit inside `gcn_matrix_kernels.cpp` does).
+## Round sp14: fixed-size copies that were calls to `__memcpy_chk` (branch `sp14-memcpy-chk`, base `sp13-combined` 870a8903)
+
+Round sp13 found that glibc's fortification (`_FORTIFY_SOURCE=3` is Ubuntu's compiler default; the CMake files set nothing) turns a `std::memcpy` to a computed address in a local object into a call to `__memcpy_chk` even at a fixed 4 to 32 bytes, and fixed `src/simd/kernels.inc`. This round counts which of the sites left are executed.
+
+### Measuring it
+A preloaded `__memcpy_chk` that counts calls by return address (two builds of the shim, one with the fix; the tool is a 60-line C file, not kept) on the 14 `bench.py` workloads on both engines, 51 real programs (PolyBench, Rodinia and part of HeCBench and Samples, `tools/bench/real`, runs cut at 15 to 45 s), `nvidia_tensor_bench` (43 rows) and the AMD bench (gfx942). The cost of one call, a micro-benchmark of a 4-byte store into a local array at a run-time offset: 1.4 to 2.8 ns more than the inline store on Zen 4 (about 10 cycles).
+* **Executed and hot** (calls on the base): `exec_st`'s run buffer in the PTX interpreter (`pack_run`): 4,194,304 calls in the `mem` workload (6 to 10% of its cycles); `h_global<Store>` in the SASS tier (`tier_put` into the run buffer): 6.6 M in HeCBench aop (1.5 to 2% of it), 3.8 M in PolyBench 2MM, 1.1 M in Rodinia particlefilter, 1.5 M in GRAMSCHM; `MemoryManager::store_run` (`run_in`, a copy of `unit` bytes with `unit` a run-time 1, 2, 4 or 8): 8.2 M in HeCBench base64e, 2.0 M in GRAMSCHM, 0.5 M in LU; `micro_ld_param` (every PTX launch reads its parameters: 40,000 calls in the `launch` workload); `h_cndmask_body` in the AMD tier (3.3 M calls, about 7% of the AMD `flat` workload).
+* **Executed, not worth a change:** the SASS rows of `bench.py` make none but `f64_fma` (8,192 calls, 0.09%); `nvidia_tensor_bench` makes 15,922 calls over all 43 rows; `h_imma`'s six sites and the PTX `frag_*_dense` ones are not reached by any row.
+* **Not executed anywhere in these runs:** most of the rest. Static call sites in the shim: 92 -> 69 (`libcudart`), 20 -> 16 (`libamdhip64`).
+
+### What changed
+* `pack_run` (`src/exec/interpreter.cpp`): `__builtin_memcpy` (a fixed `Size`), and `[[gnu::noinline]]`. Inline, its loops grew `exec_st` and moved the inlining of its callees: PTX `shared` and `warp` read 0.97 to 0.98 at equal instructions in three builds; out of line they are 0.996 to 1.002.
+* `micro_ld_param`: `load_bytes` (its switch on 1, 2, 4, 8) in place of `memcpy(&v, p, size)`. The two `ld.param` paths in `exec_ld` keep the `memcpy` (not executed by any row; touching `exec_ld` moved the placement of the PTX loop).
+* `MemoryManager::run_in` / `run_out` (`src/core/memory.cpp`): `word_to` / `word_from`, a switch on the unit with a constant size in each case.
+* `tier_put` / `tier_get` and `h_imma`'s operand loads (`src/sass/tier_ops.inc`): `__builtin_memcpy`.
+* `h_cndmask_body` (`amd/src/gcn_tier.cpp`): the store into the local row `r` is `__builtin_memcpy`.
+* `Interpreter::gather_words` / `scatter_words`: `[[gnu::aligned(64)]]`. Not part of the copy work: with the changes above the linker put `scatter_words` 96 bytes before a 4 KB page boundary (so it crossed the page) in the build examined, and the `mma_ptx` workload on the PTX engine, which calls it after each mma, read 0.977 on Zen 4 and 0.935 to 0.953 on Zen 5 with the same instructions; `perf` showed the extra cycles in `scatter_words` (6.7 -> 10.5% of the row) and L1i misses +6%. With both on a 64-byte boundary Zen 4 reads 1.003 and Zen 5 0.969.
+
+### Results (cycles:u of a pinned process on Zen 4 (server3, cpu 4, `perf stat`, median of 9 alternating runs), CPU time (user+sys) on Zen 5 (server2, cpu 26, median of 15; no perf there). A = `sp13-combined`, B = this branch; counters and instruction counts equal in every row (Zen 4: `perf stat` instructions equal to within 0.01% except where the fix removes the calls: `mem` ptx -5.7%, `launch` ptx -0.1%).)
+| row | Zen 4 B/A | Zen 5 B/A |
+|---|---:|---:|
+| `mem` ptx (4.2 M calls) | 1.061 | 1.052 |
+| `launch` ptx | 1.012 | 1.009 |
+| AMD `flat` (mi300x) | 1.050 | 1.016 |
+| HeCBench aop | 1.017 | 1.020 |
+| PolyBench 3MM (2MM and GRAMSCHM run past the timeout) | 1.003 | 1.011 |
+| Rodinia needle | 1.013 | 1.002 |
+| PolyBench 3DCONV | 1.002 | 1.023 |
+Earlier builds of the same change gave `mem` ptx 1.056 to 1.106 on Zen 4 and 1.044 to 1.088 on Zen 5 (the placement of the rest of the library moves it by that much). The gain on a real program is the share of the calls: 1 to 3%. Rows that make no call also moved with the layout: `mem` sass 1.027 / 1.057 (Zen 4 / Zen 5) and `wmma` / `mma_ptx` sass 1.006 / 1.024 and 1.006 / 1.035 are placement, not this change.
+
+The 12-workload canary (`int_alu f32_fma f64_fma wmma mma_ptx mem shared atomics local divergent warp launch api`, both engines) and `startup`, B/A of the medians; A/A (the base twice) is 0.990 to 1.006 on Zen 4 (`startup` sass 0.951, a 5 ms row; AMD `mfma` 1.030) and 0.991 to 1.011 on Zen 5 (AMD `launch` 0.985):
+* Zen 4: 0.982 (`wmma` ptx: the same instructions; 0.988 to 0.998 in other builds) to 1.018, with `mem` sass 1.027 and `mem` ptx 1.061 above; `startup` sass 0.955 (its A/A is 0.951).
+* Zen 5: 0.969 (`mma_ptx` ptx), 0.974 (`local` sass), 0.982 (`shared` sass) to 1.035, with `mem` sass / ptx 1.057 / 1.052 above (placement; `mma_ptx` ptx was 0.935 to 0.953 before the alignment).
+* AMD (mi300x, nine workloads): 0.957 to 1.050 except `atomics` on Zen 4, 0.969 at equal instructions in four builds (`MemoryManager::rmw_batch_fn` 10.6 -> 13.1% of the row: placement in `memory.cpp`).
+The round 12 and 13 gains are intact on the rows they were measured on: `wmma` sass 1.006 / 1.024 and `mma_ptx` sass 1.006 / 1.035 (Zen 4 / Zen 5), `shared` 1.000 / 0.982 (sass), `atomics` sass 1.016 / 1.026; `wmma` and `mma_ptx` on the PTX engine are the 0.982 / 0.989 and 1.003 / 0.969 above. The 16-thread scaling was not re-measured (no code of the scaling paths changed).
+
+### Project-wide `-U_FORTIFY_SOURCE`
+Built (the branch with `-DCMAKE_CXX_FLAGS=-U_FORTIFY_SOURCE`, so every call in the shim is plain) and measured on the same rows: C over A, geometric mean of the 25 rows that make no call in the base: 0.9995 (Zen 4) and 1.0012 (Zen 5), against 0.9985 and 0.9986 for the targeted change; every row it moved by more than 2% is also a row where the targeted change differs by the same amount (placement). So the targeted fixes take what a global switch would. Not adopted: it removes glibc's checks (`memcpy`, `strcpy`, `sprintf`, `read`, `__printf_chk` abort with "buffer overflow detected" instead of corrupting memory) from a library that is loaded into other people's processes, only where the compiler adds them by default (Ubuntu, Fedora; conda-forge passes `-D_FORTIFY_SOURCE=2` in its flags, which a CMake `-U` would override), and a sanitizer build is a `-O0`/`-O1` build, where glibc's fortification is off or the sanitizer's checks cover the same overflows. If it is wanted anyway: `option(VGPU_FORTIFY ... ON)` and `add_compile_options(-U_FORTIFY_SOURCE)`; the JIT's generated code (`src/sass/jit_rt.h`, seven fixed-size `std::memcpy`) is compiled at run time with the user's compiler flags and is not changed by it.
+
+### Tests (CMake-wired)
+* `test_memcpy_chk` (tests/unit): defines `__memcpy_chk` in the test, so the statically linked library's calls land in it, counts the calls of up to 256 bytes, and requires none where the compiler fortifies (an optimised build, `_FORTIFY_SOURCE` set; not built under a sanitizer). It runs: `store_run` / `load_run` at units 1, 2, 4, 8 against a model (400 random runs each, every phase against the 8-byte boundary); a SASS kernel storing 1, 2, 4 and 8 bytes from 32 consecutive lanes (`STG`, hand-assembled as in `test_sass_dispatch`), the bytes checked; a PTX kernel storing u8, u16, u32, u64 the same way (this one also reads its parameter, `micro_ld_param`); and the AMD tier's `v_cndmask_b32` over the corpus shapes with the tier on and off (equal digests).
+  Mutation check: the test built against the unchanged base library fails all four cases (`store_run / load_run, unit 4: 429 calls`; `SASS STG of 2 bytes: 32 calls`; `PTX st.global.u8: 33 calls` (32 from `pack_run`, one from `micro_ld_param`); `v_cndmask_b32 in the tier: 224 calls`) and passes on the branch, also at `VGPU_SIMD=base`, `avx2` and `avx512`.
+* `lint_ptx_word_moves_aligned` (tests/lint/check_ptx_word_moves_aligned.sh): reads `nm` of the built `libcudart` and requires `gather_words` and `scatter_words` on a 64-byte boundary. The base fails it (`scatter_words` at 0x2361b0, 48 bytes into a line) and the branch passes.
+* Also run, passing: `test_memfast`, `test_memalloc`, `test_sass_dispatch`, `test_tier`, `test_sass_access_count`, `test_sass_mem_rows`, `test_memcount_forms`, `test_sass_lanes`, `test_amd_gcn_tier_same_bits` (default and `VGPU_SIMD=base`). Compiled with g++-12 `-Wall -Wextra -Werror` (and `-fsanitize=address,undefined`, compile only): the test, `memory.cpp`, `gcn_tier.cpp`, `interpreter.cpp`, `sass/exec.cpp`. Not run: ASan / UBSan / TSan executions (no threaded code touched; the test is not built under a sanitizer).
+
+### Not done
+* The 69 remaining call sites in `libcudart` are not executed by any row measured here; a program that reaches `exec_ld`'s variable-size paths, `Runner::exec_mem` or the TMA copies would need the same measurement.
+* `src/sass/jit_rt.h` (the generated code's seven copies) belongs to the JIT and was not touched.
+* `mma_ptx` ptx on Zen 5 is 0.969: the remaining loss is placement of the PTX tensor path (no further alignment was tried; the `sp14-placement` work is the place for it).
+
+## Round sp14: the two changes together (branch `sp14-combined` = `sp13-combined` + `sp14-placement` + `sp14-memcpy-chk`)
+
+Merged as they were, the two changes interacted: the PTX interpreter's `exec_st` shrank (`pack_run` out of line) inside a unit that is now built outside LTO, which moved the rest of the unit and the units linked after it, and at equal counters PTX `int_alu` read 0.903x to 0.910x (Zen 5, 15 runs, A/A 0.997x; each branch alone 0.996x and 1.002x), PTX `wmma` 0.948x on Zen 5 and 0.919x to 0.948x on Zen 4 (alone 0.996x and 1.002x). Which of these rows loses moves with the offset of the interpreter modulo a page (a sweep of 24 offsets from 0 to 3840 bytes: PTX `wmma` 0.84x to 1.007x, `mma_ptx` 0.915x to 1.09x, `launch` 0.95x to 0.99x), so the fix is to pin it: the five hot units begin with an `asm` line that raises their `.text` alignment to 4096 (where each starts modulo a page no longer depends on what is linked ahead of it), and the interpreter's starts 2816 bytes in, the offset at which no PTX row of the sweep lost more than 2 % (0.989x to 1.07x). `lint_hot_unit_layout` also requires the 4096 alignment (mutation: the `sp14-placement` and `sp14-combined` objects without the line fail it). Counters are identical in every row on both CPUs; this is a layout choice measured on these two machines, and an edit inside `interpreter.cpp` re-rolls it as before.
+
+Results, `bench.py --ab`, 13 workloads x SASS and PTX, one thread, pinned cpu, load 4 to 16 from other sessions; Zen 5 (server2, 15 runs), Zen 4 (server3, 9 runs). W = this branch; A/A (`sp13-combined` against a copy of its libraries) on Zen 5: 0.99x to 1.01x in every row except SASS `atomics` 0.955x (p 0.000; a row that reads 0.96x to 1.03x between identical builds), on Zen 4 0.99x to 1.04x.
+| row | Zen 5 W/sp13 | Zen 5 W/sp12 | Zen 4 W/sp13 | Zen 4 W/sp12 |
+|---|---:|---:|---:|---:|
+| `mem` SASS / PTX | 0.995 / 1.036 | 0.992 / 1.172 (1.04 best-of) | 0.976 / 1.045 | 0.999 / 1.064 |
+| `atomics` SASS / PTX | 1.014 / 1.006 | 0.987 / 1.023 | 1.030 / 0.971 | 1.001 / 1.010 |
+| `launch` SASS / PTX | 1.023 / 0.979 | 1.036 / 0.967 | 1.028 / 0.994 | 1.014 / 0.983 |
+| `wmma` SASS / PTX | 1.020 / 0.996 | 1.505 / 1.035 | 1.013 / 0.999 | 1.471 / 1.024 |
+| `mma_ptx` SASS / PTX | 1.026 / 1.083 | 1.468 / 1.437 | 1.018 / 1.017 | 1.486 / 1.347 |
+| `shared` SASS / PTX | 1.014 / 1.004 | 1.050 / 1.036 | 1.010 / 0.995 | 1.022 / 1.036 |
+| `local` SASS / PTX | 1.005 / 1.000 | 1.009 / 0.995 | 1.008 / 1.030 | 1.023 / 1.027 |
+| `f64_fma` SASS / PTX | 1.007 / 1.015 | 1.014 / 1.011 | 0.998 / 1.010 | 0.998 / 0.994 |
+Every other row 0.97x to 1.02x on both CPUs (Zen 4 W/sp13 `warp` PTX 0.970, `api` SASS 0.978). AMD (`bench-amd`, mi300x, one thread, 15 runs, Zen 5; A/A 0.96x to 1.00x): W/sp13 `atomics` 0.988, `valu_int` 1.015, `mfma` 1.007, `divergent` 1.013, but `mem` 0.946 to 0.958, `flat` 0.926 to 0.929, `mfma_i8` 0.96 and `p_sbuf` 0.93 (W/sp12: `mem` 0.945, `flat` 0.898, `mfma_i8` 1.074, `launch` 0.951), at equal counters; `p_cmp` 1.19 is the `h_cndmask_body` fix. `sp14-placement` alone already read `flat` 0.882 and `mem` 0.990, so these AMD rows are moved by the engines leaving the LTO partition (the AMD code stays inside it). Zen 4 AMD: 0.98x to 1.03x in every row (A/A 0.90x to 1.00x). Not fixed: taking `gcn_tier.cpp` out of LTO on the same flags and anchors (a tree that was not kept) gave `mem` 1.015, `flat` 1.10, `atomics` 1.026, `p_sbuf` 0.997 but `mfma` 0.965, `mfma_i8` 0.94, `valu_f32` 0.975, at every one of eight offsets of `gcn_matrix_kernels.cpp`; one set of losses for another.
+`launch64` (scale.cu, 300 k launches of 64 blocks, medians of 5): Zen 5 1 thread sp12 5.17 s, sp13 4.86, W 4.54; 4 threads 5.07 / 4.85 / 4.58 (Zen 4: 15.5 s for all three at 1 thread, bimodal 8 or 15 s at 4 threads, no difference). `scale atomics` at 16 threads: Zen 5 sp12 3.46 s, sp13 0.72, W 0.61; Zen 4 8.08 / 1.28 / 1.36. `sortingNetworks` (3 runs): 1 thread Zen 5 sp12 15.7 s, sp13 11.3, W 11.5; 16 threads 2.24 / 1.59 / 1.87 (the 16-thread rows spread 1.45 to 2.28 s within one build); Zen 4 1 thread 35.1 / 30.2 / 28.1, 16 threads 5.16 / 4.28 / 4.25.
+Unit tests, Release, passing: `test_memcpy_chk`, `lint_hot_unit_layout`, `lint_ptx_word_moves_aligned`, `test_sass_*` (21), `test_ptx*` (5), `test_tc_ampere*` (4), `test_tier`, `test_memfast`, `test_amd_gcn_tier_same_bits` (and `_simd_base`): 34 of 34.
 ## Round sp14: gather-bound memory ops and the SASS run loop
 Two changes in one round, measured separately on b4a51d7f (the sections below) and together on main a28b4972 (the last section). Part 1 is the address-row kernel for full-warp global accesses; part 2 is the run loop that no longer ends a call at the register-only ops and a convergent BRA.
 ### Part 1: a full warp's global address rows in one AVX2 pass (branch `sp14-addr`)

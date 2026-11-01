@@ -623,6 +623,15 @@ struct BankMemo {
   Entry e[kEntries];
   uint32_t lookups = 0, hits = 0;   // in this window
   uint32_t skip = 0;                // calls still to go without the table
+  // The table of sass_bank_passes_offsets, which keys a warp by its 32-bit offsets (half the bytes to build and compare).
+  struct Entry32 {
+    uint32_t bytes = 0;    // (zero: empty)
+    uint32_t passes = 0;
+    uint32_t rel[32] = {};
+  };
+  Entry32 e32[kEntries];
+  uint32_t last32 = 0;              // the entry that answered last (a loop asks for one shape a few times running)
+  uint32_t lookups32 = 0, hits32 = 0, skip32 = 0;
 };
 
 // sass_bank_passes, with the table in front of the counting (everything the closed forms count is still counted by them).
@@ -677,6 +686,93 @@ inline uint32_t sass_bank_passes_memo(BankMemo& memo, const uint64_t* addrs, uin
   if (++memo.lookups == BankMemo::kWindow) {
     if (memo.hits * 3 < BankMemo::kWindow) memo.skip = BankMemo::kSkip;
     memo.lookups = memo.hits = 0;
+  }
+  return passes;
+}
+
+// ---- bank passes of a warp given as 32-bit offsets
+
+// The tier's shared-memory handler has a warp's offsets as 32-bit words already. sass_bank_passes_offsets counts them as
+// sass_bank_passes counts the same addresses widened (an active lane's offset as it is, a lane that does not run zero), with
+// BankMemo's second table in front. The key is the active lanes' offsets less the first active lane's word (a lane that does not
+// run is taken at that word, which adds none: its words are among the first lane's), 32 numbers of 32 bits. As long as no active
+// offset has bit 31 set the true differences are under 2^31 either way, so keys that are equal are shapes that differ by a move
+// of whole words (the argument of the 64-bit key, which sass_bank_passes_memo has). Every shape goes through the table, the
+// ones on a stride too (a hit costs less than finding the stride); a warp that is not remembered is counted by sass_bank_passes.
+// The entry that answered last is asked first, without the hash.
+namespace detail {
+typedef uint32_t V4 __attribute__((vector_size(16)));
+typedef uint32_t V4u __attribute__((vector_size(16), aligned(4), may_alias));
+inline V4 load_v4(const uint32_t* p) { return *reinterpret_cast<const V4u*>(p); }
+inline void store_v4(uint32_t* p, V4 v) { *reinterpret_cast<V4u*>(p) = v; }
+}  // namespace detail
+
+// The offsets widened (an active lane's as it is, the others' zero) and counted as sass_bank_passes does.
+[[gnu::noinline]] inline uint32_t sass_bank_passes_widened(const uint32_t* offs, uint32_t mask, uint32_t bytes) {
+  uint64_t a[32];
+  for (unsigned l = 0; l < 32; ++l) a[l] = (mask >> l & 1) ? offs[l] : 0;
+  return sass_bank_passes(a, mask, 32, bytes);
+}
+
+[[gnu::noinline]] inline uint32_t sass_bank_passes_offsets(BankMemo& memo, const uint32_t* offs, uint64_t lanes, uint32_t bytes) {
+  const uint32_t m = static_cast<uint32_t>(lanes);
+  if (!fast() || bytes == 0 || bytes > 64 || !m) return sass_bank_passes_widened(offs, m, bytes);
+  if (memo.skip32) {
+    --memo.skip32;
+    return sass_bank_passes_widened(offs, m, bytes);
+  }
+  const uint32_t base = offs[std::countr_zero(m)] & ~3u;
+  const detail::V4 bv = {base, base, base, base};
+  alignas(16) uint32_t key[32];
+  detail::V4 high = {0, 0, 0, 0};
+  if (m == 0xFFFFFFFFu) {
+    for (unsigned i = 0; i < 8; ++i) {
+      const detail::V4 v = detail::load_v4(offs + 4 * i);
+      high |= v;
+      detail::store_v4(key + 4 * i, v - bv);
+    }
+  } else {
+    const detail::V4 bit = {1, 2, 4, 8};
+    for (unsigned i = 0; i < 8; ++i) {
+      const uint32_t nib = (m >> (4 * i)) & 15u;
+      const detail::V4 sel = (detail::V4{nib, nib, nib, nib} & bit) == bit;   // (all ones where the lane runs)
+      const detail::V4 v = (detail::load_v4(offs + 4 * i) & sel) | (bv & ~sel);
+      high |= v;
+      detail::store_v4(key + 4 * i, v - bv);
+    }
+  }
+  if ((high[0] | high[1] | high[2] | high[3]) >> 31) return sass_bank_passes_widened(offs, m, bytes);
+  const auto same = [&](const BankMemo::Entry32& e) {
+    detail::V4 diff = {e.bytes ^ bytes, 0, 0, 0};
+    for (unsigned i = 0; i < 8; ++i) diff |= detail::load_v4(key + 4 * i) ^ detail::load_v4(e.rel + 4 * i);
+    return (diff[0] | diff[1] | diff[2] | diff[3]) == 0;
+  };
+  uint32_t passes;
+  bool hit = same(memo.e32[memo.last32]);
+  if (hit) {
+    passes = memo.e32[memo.last32].passes;
+  } else {
+    uint32_t h = bytes * 0x01000193u;
+    h ^= key[1] * 0x9E3779B1u ^ key[3] * 0x85EBCA77u ^ key[6] * 0xC2B2AE3Du ^ key[10] * 0x27D4EB2Fu ^ key[15] * 0x165667B1u ^
+         key[21] * 0x9E3779B1u ^ key[26] * 0x85EBCA77u ^ key[31] * 0xC2B2AE3Du;
+    h ^= h >> 15;
+    const uint32_t idx = h % BankMemo::kEntries;
+    BankMemo::Entry32& e = memo.e32[idx];
+    hit = idx != memo.last32 && same(e);
+    memo.last32 = idx;
+    if (hit) {
+      passes = e.passes;
+    } else {
+      passes = sass_bank_passes_widened(offs, m, bytes);
+      e.bytes = bytes;
+      e.passes = passes;
+      for (unsigned i = 0; i < 8; ++i) detail::store_v4(e.rel + 4 * i, detail::load_v4(key + 4 * i));
+    }
+  }
+  memo.hits32 += hit;
+  if (++memo.lookups32 == BankMemo::kWindow) {
+    if (memo.hits32 * 3 < BankMemo::kWindow) memo.skip32 = BankMemo::kSkip;
+    memo.lookups32 = memo.hits32 = 0;
   }
   return passes;
 }

@@ -236,6 +236,7 @@ add_library(vgpu STATIC
   amd/src/gcn_exec.cpp
   amd/src/gcn_tier.cpp
   amd/src/gcn_tier_ds.cpp
+  amd/src/gcn_matrix_kernels.cpp
   amd/src/image.cpp
   amd/src/hostcall.cpp
   src/core/machine.cpp
@@ -279,8 +280,13 @@ add_library(vgpu STATIC
 # between a function of one target and a function of the other goes in a register on one side and in memory on the other, so the
 # callee reads what happens to be on the stack. Optimised builds inline the helpers and do not notice; an -O0 (sanitizer) build does,
 # and it passed on one CPU and failed on another (round 8's canonical NaN). GCC says so with -Wpsabi: make it an error here.
+# The hot translation units (the SASS engine, the PTX interpreter, the memory manager, the SIMD kernels) are built outside link-time optimization,
+# with functions on 64-byte and loops on 32-byte boundaries: inside the LTO library any unrelated edit re-ordered the code and re-rolled the
+# inlining of their hot paths, which moved rows that run unchanged code by 3 to 14 % on a Zen 5 host at equal instruction counts, and outside it
+# a unit's layout depends on its own source only (docs/performance.md, Round sp14; tests/lint/check_hot_unit_layout.py holds the flags).
+set(VGPU_HOT_UNIT_FLAGS "-fno-lto;-falign-functions=64;-falign-loops=32")
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "-Werror=psabi")
+  set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "-Werror=psabi;${VGPU_HOT_UNIT_FLAGS}")
   # The AMD interpreter's floor, ceil, trunc and rint are libm's: GCC expands them in line (and so leaves a signaling NaN
   # as it is, where roundss and libm quiet it) in the places its heuristics call hot, which moved when the instruction
   # ladders became switches (s_trunc_f32 of a signaling NaN, amd/tests/unit/test_gcn_same_bits.cpp).
@@ -302,8 +308,15 @@ option(VGPU_TEST_FAST_LINK "Link unit tests without LTO (the vgpu archive carrie
 # The wide LDS accesses of the AMD tier (see the header) are compiled outside link-time optimization: inside the tier's unit they moved the
 # inlining and the layout of the unrelated memory handlers.
 set_source_files_properties(amd/src/gcn_tier_ds.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+# The AMD matrix tile kernels and wide decoders, outside link-time optimization, with functions on 64-byte and loops on 32-byte boundaries: their speed
+# depended on where their few-instruction loops landed in a code line, which every unrelated edit of the library changed (docs/performance.md, Round sp13).
+set_source_files_properties(amd/src/gcn_matrix_kernels.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto;-falign-functions=64;-falign-loops=32")
 # The memory manager's hot paths: outside link-time optimization too, so the executors' code is laid out as it was without them.
-set_source_files_properties(src/core/memory.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+# The SASS engine and the SIMD kernels with it (the PTX interpreter's options are set with its -Werror=psabi above, for GNU).
+set_source_files_properties(src/core/memory.cpp src/sass/exec.cpp src/simd/simd.cpp src/simd/lanes.cpp PROPERTIES COMPILE_OPTIONS "${VGPU_HOT_UNIT_FLAGS}")
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set_source_files_properties(src/exec/interpreter.cpp PROPERTIES COMPILE_OPTIONS "${VGPU_HOT_UNIT_FLAGS}")
+endif()
 if(CMAKE_INTERPROCEDURAL_OPTIMIZATION AND VGPU_TEST_FAST_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set_target_properties(vgpu PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
   target_compile_options(vgpu PRIVATE -flto=auto -ffat-lto-objects)
@@ -1350,6 +1363,9 @@ vgpu_unit_test(test_sched)
 # The SASS executor's atomics (vgpu/exec/sass_atomics.hpp), and its lane-state helpers and shuffle shapes (vgpu/exec/sass_lanes.hpp,
 # src/sass/tier.hpp), against the lane-by-lane code they replaced.
 vgpu_unit_test(test_sass_atomics)
+# A warp's atomics on device memory without a lock (sassatom::global_lockfree over MemoryManager::rmw_batch): against the lane-by-lane rule,
+# declines, and from several threads (every old value handed out once; commutative operations leave the serial result).
+vgpu_unit_test(test_sass_lockfree)
 vgpu_unit_test(test_sass_lanes)
 target_include_directories(test_sass_lanes PRIVATE src)
 # The address-row questions of the tier's global and shared memory handlers (vgpu/exec/sass_mem_rows.hpp), against the address array they replaced.
@@ -1361,6 +1377,12 @@ set_tests_properties(test_sass_mem_rows_simd_base PROPERTIES ENVIRONMENT "VGPU_S
 vgpu_unit_test(test_sass_access_count)
 # The memory manager's per-thread lookup cache, against its general path.
 vgpu_unit_test(test_memfast)
+# Fixed-size copies on the memory paths (memory manager runs, SASS tier stores, PTX stores, the AMD tier's v_cndmask) are not calls to glibc's fortified __memcpy_chk.
+# The test defines __memcpy_chk to count them, which a sanitizer runtime would meet with its own interceptors: not built under one.
+if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize")
+  vgpu_unit_test(test_memcpy_chk)
+  target_compile_definitions(test_memcpy_chk PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+endif()
 # The allocation table's bookkeeping (alloc, free, quarantine, recycled chunks, the lock and its epoch) against a model
 # and against the digest of the implementation before the speed work.
 vgpu_unit_test(test_memalloc)
@@ -1706,6 +1728,8 @@ target_compile_definitions(test_amd_matrix_fast PRIVATE VGPU_SOURCE_DIR="${CMAKE
 vgpu_unit_test(test_amd_packed_math amd/tests/unit/test_packed_math.cpp)
 # The NaN-order helpers (amd/src/nan_order.hpp) that make the float instructions give the same bits at every optimization level.
 vgpu_unit_test(test_amd_nan_order amd/tests/unit/test_nan_order.cpp)
+# The AMD matrix tile kernels and wide decoders are functions of their own that start on a 64-byte boundary (amd/src/gcn_matrix_kernels.cpp).
+vgpu_unit_test(test_amd_matrix_kernels_layout amd/tests/unit/test_matrix_kernels_layout.cpp)
 
 # The packed half, dot product, conversion, comparison, sine/cosine and integer instructions against digests recorded before they were made faster.
 vgpu_unit_test(test_amd_gcn_packed_same_bits amd/tests/unit/test_gcn_packed_same_bits.cpp)
@@ -3043,6 +3067,14 @@ if(TARGET vgpucublas)
     ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
     TIMEOUT 300)
 
+  # Device atomics from many blocks on the lock road (fewer than four host threads) and the lock-free one, SASS and PTX.
+  add_test(NAME e2e_atomics_threads
+           COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_atomics_threads.sh)
+  set_tests_properties(e2e_atomics_threads PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+    TIMEOUT 600)
+
   # Shared and local memory moved 1 to 16 bytes at a time, on the SASS interpreter, the SASS tier and the PTX interpreter.
   add_test(NAME e2e_sass_vector_memory
            COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_vector_memory.sh)
@@ -3798,6 +3830,12 @@ if(Python3_Interpreter_FOUND)
   # brings an if-ladder back (or a `break` that makes the converter skip a chain) costs a hash comparison per rung per instruction.
   add_test(NAME lint_amd_ladders
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_ladders.py)
+  # The hot translation units are plain machine code on 64-byte function boundaries (VGPU_HOT_UNIT_FLAGS): read from their object files.
+  # (Not under a sanitizer or in a Debug build: GCC applies -falign-functions only when optimizing, so an -O0 object has template instances on 1-byte boundaries.)
+  if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize" AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_test(NAME lint_hot_unit_layout
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_hot_unit_layout.py ${CMAKE_BINARY_DIR}/CMakeFiles/vgpu.dir)
+  endif()
   # Every exported runtime and driver function is a call a profiler is told of,
   # and the driver shim takes the argument sizes the toolkit declares (CUPTI
   # reads them by those sizes).
@@ -3848,6 +3886,13 @@ if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize")
     SKIP_REGULAR_EXPRESSION "^SKIP:"
     TIMEOUT 300)
 endif()
+
+# The PTX interpreter's gather_words / scatter_words start on a 64-byte boundary (a page-crossing placement cost the mma_ptx workload 2 to 6%).
+add_test(NAME lint_ptx_word_moves_aligned COMMAND ${CMAKE_SOURCE_DIR}/tests/lint/check_ptx_word_moves_aligned.sh)
+set_tests_properties(lint_ptx_word_moves_aligned PROPERTIES
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 120)
 
 # No file under NVIDIA's proprietary terms in the tree, and the fetch that
 # stands in for the cuDNN headers that used to be vendored.

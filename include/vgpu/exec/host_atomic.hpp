@@ -14,6 +14,15 @@
 
 namespace vgpu::exec {
 
+// The engines' device-memory atomics (SASS and PTX) take the CPU's compare-and-swap on each word, with no lock, when the process
+// runs its grids on at least this many host threads, and the striped locks below that. Measured (Ryzen 9 9950X, a warp's 32 atomics on 14
+// cache lines): a lock pair per line costs about 1.8 ns, a locked instruction per word about 4 ns, so on one thread the locks are 1.25x
+// faster; two threads are no contention yet (locks still faster); from four the stripe lines bounce between the threads and the
+// swaps scale (0.77x -> 1.8x at 4 threads, 2.6x at 8) where the locks do not. The choice is the process's, made from the configured
+// thread count (VGPU_THREADS, else the CPUs), not the launch's: two launches that overlap must not meet on one word under different
+// roads.
+inline constexpr unsigned kLockFreeAtomicsFromThreads = 4;
+
 // Replaces the `size`-byte value at p (2, 4 or 8 bytes, naturally aligned)
 // with compute(old), atomically; returns old.
 template <class F>
@@ -44,6 +53,23 @@ uint64_t host_atomic_rmw(uint8_t* p, uint32_t size, F&& compute) {
       }
     }
   }
+}
+
+// A 2-byte atomic on the swap road: a compare-and-swap on the aligned 32-bit word that holds it, so it is atomic against the 4-byte
+// atomics on that word (a plain 16-bit store beside a 4-byte swap would lose one of them). `compute(old16)` gives the new 16 bits.
+// False, having done nothing, where Mem::atomic_rmw declines (the caller then takes its lock).
+template <class Mem, class F>
+bool atomic_rmw16(Mem& mem, uint64_t addr, F&& compute, uint64_t* old_out) {
+  if (addr & 1) return false;
+  const unsigned sh = static_cast<unsigned>(addr & 2) * 8;
+  uint64_t found = 0;
+  if (!mem.atomic_rmw(addr & ~uint64_t{3}, 4, [&](uint64_t w) -> uint64_t {
+        const uint64_t nv = compute((w >> sh) & 0xffff);
+        return (w & ~(uint64_t{0xffff} << sh)) | ((nv & 0xffff) << sh);
+      }, &found, true))
+    return false;
+  *old_out = (found >> sh) & 0xffff;
+  return true;
 }
 
 }  // namespace vgpu::exec

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #include "vgpu/exec/numerics.hpp"
 #include "vgpu/ptx/ast.hpp"
@@ -177,6 +178,120 @@ inline int global_batch(unsigned op, unsigned type, bool cas, uint32_t ex, unsig
     case Step::Xor: return go(XorStep{});
     case Step::Exch: return go(ExchStep{});
     default: return -1;
+  }
+}
+
+// Any operation of the general rule (`apply`), as a step: the halves, and whatever else has no loop of its own.
+struct GeneralStep {
+  unsigned op, type;
+  bool cas;
+  uint64_t operator()(uint64_t old, uint64_t x, uint64_t swap) const {
+    uint64_t out = old;
+    apply(op, type, cas, false, old, x, swap, out);
+    return out;
+  }
+};
+
+// A warp's atomics on plain device memory without a lock: the distinct words `uaddr[0..nu)` each get one compare-and-swap loop
+// (MemoryManager::rmw_batch with lock_free) whose step runs the lanes of that word, `lane_mask[k]`, one after another in lane order from
+// the value the swap replaces -- so a lane finds what the lanes before it left, and the word ends as the locked form leaves it; a retry
+// (another thread got in between) runs them again from the new value, and old_of[l] is what the last run gave. What threads see: each
+// word's update is atomic; the warp's words are not one step (CUDA promises none). Integer operations give the same old values and
+// final words at any thread count only when the order does not matter (add, and, or, xor, min, max); an exchange, compare-and-swap, inc
+// or dec, or a float add (rounding), take the order the threads reach the word in -- as on the card. Returns whether any lane changed a
+// word (0 or 1), or -1 having done nothing (an operation not in the table, or the memory declined: a fault armed, an unaligned or out of
+// allocation word, host-mapped memory) and the caller takes the locked form. `nu` is 1 to 32; the caller has checked op <= 8.
+template <class Mem>
+[[gnu::noinline]] inline int global_lockfree(Mem& mem, unsigned op, unsigned type, bool cas, unsigned nu, const uint64_t* uaddr, const uint32_t* lane_mask,
+                           const uint64_t* v, const uint64_t* swp, uint64_t* old_of) {
+  const uint64_t keep = is64(type) ? ~uint64_t{0} : 0xffffffffull;
+  const uint32_t size = is64(type) ? 8 : 4;
+  uint8_t* ptr[32];
+  if (!mem.atomic_word_ptrs(uaddr, nu, size, ptr)) return -1;
+  const auto go = [&](auto step) -> int {
+    uint64_t any = 0;
+    for (unsigned k = 0; k < nu; ++k) {
+      uint64_t acc = 0;
+      const auto compute = [&](uint64_t old) -> uint64_t {
+        uint64_t c = old;
+        acc = 0;
+        for (uint32_t m = lane_mask[k]; m; m &= m - 1) {
+          const unsigned l = static_cast<unsigned>(__builtin_ctz(m));
+          const uint64_t nw = step(c, v[l], swp ? swp[l] : 0) & keep;
+          old_of[l] = c;
+          acc |= nw ^ c;
+          c = nw;
+        }
+        return c;
+      };
+      if (uint8_t* p = ptr[k]) {   // (a word in a real chunk: the swap loop of MemoryManager::atomic_rmw_slot, inline)
+        if constexpr (std::is_same_v<decltype(step), AddStep>) {
+          // An integer add needs no loop: the word's lanes add up to one fetch-and-add, and lane l finds the word's old value plus what the
+          // lanes before it added (the same values the chain gives, with no retry when other threads add to the word).
+          uint64_t total = 0, any_add = 0;
+          uint64_t before[32];
+          for (uint32_t m = lane_mask[k]; m; m &= m - 1) {
+            const unsigned l = static_cast<unsigned>(__builtin_ctz(m));
+            before[l] = total;
+            total += v[l] & keep;
+            any_add |= v[l] & keep;
+          }
+          const uint64_t base = size == 4 ? uint64_t{__atomic_fetch_add(reinterpret_cast<uint32_t*>(p), static_cast<uint32_t>(total), __ATOMIC_SEQ_CST)}
+                                          : __atomic_fetch_add(reinterpret_cast<uint64_t*>(p), total, __ATOMIC_SEQ_CST);
+          for (uint32_t m = lane_mask[k]; m; m &= m - 1) {
+            const unsigned l = static_cast<unsigned>(__builtin_ctz(m));
+            old_of[l] = (base + before[l]) & keep;
+          }
+          acc = any_add;
+          any |= acc;
+          continue;
+        } else if (size == 4) {
+          uint32_t* w = reinterpret_cast<uint32_t*>(p);
+          uint32_t old = __atomic_load_n(w, __ATOMIC_RELAXED);
+          for (;;) {
+            const uint32_t now = static_cast<uint32_t>(compute(old));
+            if (now == old) break;   // nothing to change: the load was the whole operation
+            if (__atomic_compare_exchange_n(w, &old, now, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break;
+          }
+        } else {
+          uint64_t* w = reinterpret_cast<uint64_t*>(p);
+          uint64_t old = __atomic_load_n(w, __ATOMIC_RELAXED);
+          for (;;) {
+            const uint64_t now = compute(old);
+            if (now == old) break;
+            if (__atomic_compare_exchange_n(w, &old, now, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break;
+          }
+        }
+      } else {   // (an untouched or uniform chunk: made real only where the result differs, and always for a store that changes nothing)
+        uint64_t found = 0;
+        if (!mem.atomic_rmw(uaddr[k], size, compute, &found, /*always_store=*/true)) {
+          // (declined after the pointers were taken -- a fault armed in between: the plain pair, which is all that is left)
+          found = mem.load_scalar(uaddr[k], size);
+          mem.store_scalar(uaddr[k], size, compute(found));
+        }
+      }
+      any |= acc;
+    }
+    return any != 0;
+  };
+  switch (step_for(op, type, cas)) {
+    case Step::Cas: return go(CasStep{});
+    case Step::Add: return go(AddStep{});
+    case Step::AddF32: return go(AddF32Step{});
+    case Step::AddF64: return go(AddF64Step{});
+    case Step::Min: return go(MinStep{});
+    case Step::Max: return go(MaxStep{});
+    case Step::MinS32: return go(MinS32Step{});
+    case Step::MaxS32: return go(MaxS32Step{});
+    case Step::MinS64: return go(MinS64Step{});
+    case Step::MaxS64: return go(MaxS64Step{});
+    case Step::Inc: return go(IncStep{});
+    case Step::Dec: return go(DecStep{});
+    case Step::And: return go(AndStep{});
+    case Step::Or: return go(OrStep{});
+    case Step::Xor: return go(XorStep{});
+    case Step::Exch: return go(ExchStep{});
+    default: return go(GeneralStep{op, type, cas});
   }
 }
 

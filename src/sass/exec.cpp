@@ -1,3 +1,5 @@
+asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
+// (The line above puts this unit's code on a 4096-byte boundary: where it starts modulo a page no longer depends on the units linked ahead of it. docs/performance.md, Round sp14, combined.)
 // The SASS executor: runs a kernel's machine code over a grid on the CPU.
 //
 // A warp is 32 lanes with the architectural state of sm_70-and-later GPUs:
@@ -279,6 +281,25 @@ std::mutex& atomic_stripe_lock(unsigned stripe) {
   return locks[stripe];
 }
 std::mutex& atomic_lock(uint64_t addr) { return atomic_stripe_lock(atomic_stripe(addr)); }
+
+// Whether this process's atomics on plain device memory are the CPU's compare-and-swap rather than the stripe locks
+// (vgpu/exec/host_atomic.hpp: the thread count it starts from). Decided once, from the first launch's thread setting.
+bool atomics_lock_free(const char* threads_env) {
+  static const bool lock_free = [&] {
+    unsigned threads;
+    if (threads_env && *threads_env) {
+      threads = static_cast<unsigned>(std::max(1, std::atoi(threads_env)));
+    } else {
+#ifdef VGPU_HAVE_HOST_CPUS
+      threads = vgpu::host_cpus();
+#else
+      threads = std::max(1u, std::thread::hardware_concurrency());
+#endif
+    }
+    return threads >= exec::kLockFreeAtomicsFromThreads;
+  }();
+  return lock_free;
+}
 
 // The stripe locks of a warp's atomics, held in the order they were taken and let go together (also when a lane's atomic throws).
 struct StripeLocks {
