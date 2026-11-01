@@ -202,12 +202,7 @@ constexpr uint64_t kSectorTop = ~uint64_t{0} - 31;
 //  - a stride that is a multiple of 32 and at least as many sectors as one access touches: every lane touches the same
 //    number c of sectors (the same offset into the sector) and no two lanes share one, so n * c.
 // Anything else (false) goes to the counts that walk the lanes.
-inline bool sectors_progression(const uint64_t* addrs, uint64_t m, uint64_t span, uint64_t& out) {
-  if (span > 4096) return false;
-  int64_t s;
-  unsigned lo, n;
-  if (!lane_progression(addrs, m, span, s, lo, n)) return false;
-  const uint64_t a0 = addrs[lo], last = addrs[lo + n - 1];
+inline bool progression_sectors(uint64_t a0, uint64_t last, int64_t s, unsigned n, uint64_t span, uint64_t& out) {
   const uint64_t us = s < 0 ? 0 - static_cast<uint64_t>(s) : static_cast<uint64_t>(s);
   if (us <= span + 31) {
     const uint64_t low = s >= 0 ? a0 : last, high = s >= 0 ? last : a0;
@@ -222,6 +217,27 @@ inline bool sectors_progression(const uint64_t* addrs, uint64_t m, uint64_t span
     }
   }
   return false;
+}
+
+inline bool sectors_progression(const uint64_t* addrs, uint64_t m, uint64_t span, uint64_t& out) {
+  if (span > 4096) return false;
+  int64_t s;
+  unsigned lo, n;
+  if (!lane_progression(addrs, m, span, s, lo, n)) return false;
+  return progression_sectors(addrs[lo], addrs[lo + n - 1], s, n, span, out);
+}
+
+// sectors_progression for a full warp that the caller has found to be on a stride already (addrs[l] == a0 + l * stride, modulo 2^64, for the 32 lanes): the
+// same conditions lane_progression makes of the endpoints and the stride, and the same closed forms, without a pass over the lanes.
+inline bool full_warp_progression_sectors(uint64_t a0, uint64_t stride, uint64_t span, uint64_t& out) {
+  if (span > 4096) return false;
+  const uint64_t top = ~uint64_t{0} - span;
+  if (a0 > top) return false;
+  const int64_t s = static_cast<int64_t>(stride);
+  if (s > (int64_t{1} << 32) || s < -(int64_t{1} << 32)) return false;
+  const uint64_t last = a0 + uint64_t{31} * stride;
+  if (last > top || (s >= 0 ? last < a0 : last > a0)) return false;
+  return progression_sectors(a0, last, s, 32, span, out);
 }
 
 // Distinct sectors of accesses of 1 to 32 bytes (so each lane covers its sector and at most the next), when the

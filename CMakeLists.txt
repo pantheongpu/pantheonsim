@@ -1354,6 +1354,8 @@ vgpu_unit_test(test_sass_lanes)
 target_include_directories(test_sass_lanes PRIVATE src)
 # The address-row questions of the tier's global and shared memory handlers (vgpu/exec/sass_mem_rows.hpp), against the address array they replaced.
 vgpu_unit_test(test_sass_mem_rows)
+add_test(NAME test_sass_mem_rows_simd_base COMMAND test_sass_mem_rows)
+set_tests_properties(test_sass_mem_rows_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base")
 # The SASS executor's memory-access counting, against the straightforward version it replaced
 # (vgpu/exec/mem_counters.hpp, which both engines count with).
 vgpu_unit_test(test_sass_access_count)

@@ -5788,3 +5788,31 @@ The 12-workload canary (`bench.py --ab`, `--threads 1 --cpus 7`, 9 runs, sass + 
 * `test_tier`: the form table lists `cvt64:K fltinterp:I`; the handler guard reads both handlers (no scalar float code in them).
 * Mutations that fail them (each rebuilt and run): a NaN with `|x|` applied in widen (AVX2) and in narrow (test_simd); unsigned i2d by sign flip, which gives -0 when the host rounds down (test_simd); `|x|` and `-x` swapped in the tier's analysis, the tier handler without the rounding scope, the tier handler's high-word row off by one (test_sass_alu_runs); `fast_float` without the rounding scope (only `VGPU_TIER=0` run fails: the reason for that ctest entry).
 * ASan+UBSan (-O0) of test_simd, test_tier and test_sass_alu_runs: pass. Not run here: TSan (no threads in the change), `e2e_sass_tier` / `e2e_sass_archs` / the AMD guards (no nvcc on server3; CI).
+
+## Round sp14: a full warp's global address rows in one AVX2 pass (branch `sp14-addr`, base b4a51d7f)
+Profile of the gather-bound PolyBench programs on main (`perf record` cycles:u, one thread): `h_global<false>` is 17-25% of ATAX, GEMM and SYR2K outside `load_batch`, and in ATAX's annotation about half of it is the loop that builds the 32 addresses from the registers' lo/hi rows and takes the running minimum of `address - window` (the compare/`cmova` chain), a quarter the SSE2 consecutive-element test (`global_run`); `count_access` + `sectors_fast` are 8% of ATAX and 12% of SYR2K, almost all of it the entry of `sectors_fast` and its stride scan (`on_stride`) for warps that are plain strided gathers (ATAX, BICG, MVT, SYR2K lanes are a fixed multiple of 32 bytes apart).
+* `simd::warp_rows_kernel()` (`src/simd/simd.cpp` `warp_rows_k`, AVX2; null at `VGPU_SIMD=base|off` or without AVX2, where the old scalar code runs unchanged): one pass, four lanes to a step, builds the 32 addresses and in the same pass finds a lane in the constant window (high half of `address - window` zero), and whether every lane is on the stride of the first two (xor against the expected address). `h_global` takes it for a full warp: a run is "on a stride of `bytes`" (so the separate `global_run` pass is gone for full warps), the batch uses the addresses as built, and a warp that is on a stride is counted from its ends by `count_global_progression` -> `memcount::detail::full_warp_progression_sectors`, which is `lane_progression`'s conditions and `sectors_progression`'s two closed forms (now the shared `progression_sectors`) without the scan; a warp it does not answer goes to `count_access` as before. Partial masks, 16-byte accesses and the PTX engine are untouched.
+* Same bits: counters and stdout identical on all 12 programs below (`VGPU_COUNTERS=1`, 1-3 kernels each, 255 and 1000 for needle and hotspot), bench.py counters `identical` in all 26 canary rows.
+### Results (server3, one thread, cpu 2, `perf stat` instructions:u and cycles:u, 15 alternating runs, A = b4a51d7f, B = branch; Mann-Whitney p on cycles)
+| program | instructions B/A | cycles B/A | p |
+|---|---:|---:|---:|
+| ATAX | 0.792 | 0.797 | <0.001 |
+| BICG | 0.798 | 0.861 | <0.001 |
+| MVT | 0.791 | 0.824 | <0.001 |
+| GESUMMV | 0.798 | 0.853 | <0.001 |
+| SYR2K | 0.763 | 0.796 | <0.001 |
+| GEMVER | 0.865 | 0.904 | 0.001 |
+| GEMM | 0.848 | 0.870 | 0.004 |
+| 3MM | 0.840 | 0.879 | <0.001 |
+| 2DCONV (no change expected) | 0.981 | 1.018 (p 0.23); 25 runs 1.010 (p <0.001) | A/A 25 runs 1.008 (p 0.14) |
+| hotspot | 0.993 | 1.010 (p 0.25); 25 runs 1.014 (p 0.014) | A/A 1.001 |
+| needle | 1.001 | 0.991; 25 runs 1.000 | |
+| gaussian | 1.000 | 1.001 (25 runs; a first 15-run set read 1.35 while another job ran) | A/A 1.000 |
+A/A (15 runs): GEMM 0.995, SYR2K 0.997, hotspot 1.001; ATAX read 1.083 (p 1.0) in a window with another job on the box. bench.py canaries (13 workloads x SASS and PTX, 15 runs, cpu 2): all within 0.98-1.03; the two below 0.99 are `wmma` PTX 0.983 and `warp` SASS 0.987 (equal instructions, code unchanged: layout), against an A/A of 0.995-1.004 on mem, shared, int_alu and warp.
+### Tests (CMake)
+* `test_sass_mem_rows` (and `test_sass_mem_rows_simd_base`, the same under `VGPU_SIMD=base`): `warp_rows_kernel_shapes` runs the kernel over every lane the same, strides from 0 to 2^32 either way, carries out of the low half, wraps of the 64-bit sum, rows as a pair / a single row / none, a lane moved into the window alone and a lane off the stride by one bit, against the lane definitions; and the closed form's sectors for each progression against `distinct_sectors_uncapped` of its addresses.
+* `test_sass_generic_mem`: `global_accesses_on_a_stride_or_not` runs LDG/STG of 1 to 16 bytes (sign and zero extension, guards) at strides 0 to 200 bytes (runs, broadcast, misaligned, sector-wide) for 32 lanes, 20 lanes and the halves a guard leaves, tier against the interpreter (`VGPU_FASTPATH=0`) and the written-out rule: bytes, registers and every counter.
+* Mutations that fail them (each rebuilt and run): the run test `stride == bytes` -> `<=` (generic_mem); the counted lanes 32 -> 31 in `count_global_progression` (generic_mem); the kernel's expected-address step +8 (mem_rows); the window shift 32 -> 33 (both); the hi-row shift 32 -> 31 (mem_rows); the `last > top` wrap guard removed from `full_warp_progression_sectors` (mem_rows).
+* Not run: `e2e_sass_tier` / `e2e_sass_archs` / the AMD guards (no nvcc on server3; CI), ASan/UBSan/TSan builds (no float, atomic or threaded code in the change; CI).
+### Not done
+* The kernel stores the 32 addresses even for a run (where the batch path never reads them); keeping them in registers and storing only for a non-run would remove 8 stores per run warp (hotspot +1.4% and 2DCONV +1.0% cycles at 0.7-1.9% fewer instructions may be that); not tried.

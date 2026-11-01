@@ -983,13 +983,31 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
       v[1] = dreg ? dreg[32 + l] : 0;
     }
   };
+  uint64_t addrs[32];
+  // A full warp where the host has the AVX2 kernel: the addresses, whether a lane is in the constant window and whether the lanes are on a stride,
+  // all from one pass over the registers' rows (made here, and used by the paths below).
+  simd::WarpRowsInfo ri{};
+  bool rows = false;
+  if (ex == kAll) {
+    if (const simd::WarpRowsFn kernel = simd::warp_rows_kernel()) {
+      kernel(blo, bhi, urv + imm, kConstWindow, addrs, ri);
+      rows = true;
+    }
+  }
   if (ex && ((ex + (ex & -ex)) & ex) == 0) {
     const unsigned first = static_cast<unsigned>(std::countr_zero(ex));
     const unsigned count = popc(ex);
     // Whether the lanes are on consecutive elements is asked of the registers' rows, before the lanes' addresses are made (they are made
     // below, for an access that is not a run or that the memory manager declines).
     uint64_t g0;
-    const bool run = exec::sassmem::global_run(blo, bhi, urv + imm, first, count, bytes, g0) && !(g0 >= kConstWindow && g0 < kWinEnd);
+    bool run;
+    if (rows) {   // (a run is the lanes on a stride of one element)
+      g0 = ri.a0;
+      run = ri.progression && ri.stride == bytes;
+    } else {
+      run = exec::sassmem::global_run(blo, bhi, urv + imm, first, count, bytes, g0);
+    }
+    run = run && !(g0 >= kConstWindow && g0 < kWinEnd);
     if (run && (g0 + uint64_t{count} * bytes - 1 < kConstWindow || g0 >= kWinEnd)) {
       uint8_t buf[32 * 8];
       bool done = false;
@@ -1029,13 +1047,12 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
       }
     }
   }
-  uint64_t addrs[32];
   if (ex == kAll) {
     // A full warp: the addresses are the batch as they stand (no lane to skip, none to find again when the values go back to the
     // registers).
     uint64_t fv[32];
-    const uint64_t nearest = exec::sassmem::full_warp_addresses(blo, bhi, urv + imm, kConstWindow, addrs);
-    if (nearest >= kWinEnd - kConstWindow) {   // (no lane in the constant window)
+    if (!rows) ri.in_window = exec::sassmem::full_warp_addresses(blo, bhi, urv + imm, kConstWindow, addrs) < (uint64_t{1} << 32);
+    if (!ri.in_window) {   // (no lane in the constant window)
       bool done;
       if (Store) {
         for (unsigned l = 0; l < 32; ++l) {
@@ -1061,7 +1078,8 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
         }
       }
       if (done) {
-        count_access(blk.st, 0, Store, addrs, ex, bytes);
+        if (!(rows && ri.progression && count_global_progression(blk.st, Store, ri.a0, ri.stride, bytes)))
+          count_access(blk.st, 0, Store, addrs, ex, bytes);
         return;
       }
     }
