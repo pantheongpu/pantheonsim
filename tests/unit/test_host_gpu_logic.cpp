@@ -207,17 +207,17 @@ VTEST(size_rule_margin_is_applied_to_the_whole_path) {
 VTEST(sim_time_table_needs_two_samples_and_keeps_the_smallest) {
   SimTimeTable t;
   VCHECK(!t.predict("k", 10).has_value());   // never seen: the first launch is the simulator's
-  t.record("k", 10, 5.0);                    // a cold first launch (decode, set-up): 0.5 s per block
+  t.record("k", 10, 0.2);                    // a cold first launch (decode, set-up): 20 ms per block, under kOneSampleMinSeconds
   VCHECK(!t.predict("k", 10).has_value());   // one sample is not enough: it is the cold one
-  t.record("k", 10, 0.5);                    // the warm launch: 50 ms per block
+  t.record("k", 10, 0.05);                   // the warm launch: 5 ms per block
   VCHECK(t.predict("k", 10).has_value());
-  VCHECK(*t.predict("k", 10) > 0.49 && *t.predict("k", 10) < 0.51);       // the smaller of the two
-  VCHECK(*t.predict("k", 20) > 0.99 && *t.predict("k", 20) < 1.01);       // twice the blocks, twice the time
+  VCHECK(*t.predict("k", 10) > 0.049 && *t.predict("k", 10) < 0.051);     // the smaller of the two
+  VCHECK(*t.predict("k", 20) > 0.099 && *t.predict("k", 20) < 0.101);     // twice the blocks, twice the time
   VCHECK(!t.predict("other", 10).has_value());
   t.record("k", 10, 9.0);                    // a slower launch never raises the estimate: it errs towards the simulator
-  VCHECK(*t.predict("k", 10) < 0.51);
-  t.record("k", 10, 0.1);                    // a faster one lowers it
-  VCHECK(*t.predict("k", 10) < 0.11);
+  VCHECK(*t.predict("k", 10) < 0.051);
+  t.record("k", 10, 0.01);                   // a faster one lowers it
+  VCHECK(*t.predict("k", 10) < 0.011);
 }
 
 VTEST(a_launch_that_lost_to_the_estimate_ends_offloading) {
@@ -404,6 +404,57 @@ VTEST(sim_time_table_counts_samples) {
   t.record("k", 4, 0.1);
   VCHECK(t.samples("k") == 2 && t.predict("k", 4));
   VCHECK(t.samples("other") == 0);
+}
+
+// ---- the one-sample rule: a first launch that took 0.25 s or more is estimate enough, for two offloaded launches ----
+VTEST(one_sample_is_enough_for_a_long_first_launch) {
+  SimTimeTable t;
+  t.record("k", 100, kOneSampleMinSeconds);                 // exactly at the threshold: counts
+  VCHECK(t.predict("k", 100).has_value());
+  VCHECK(*t.predict("k", 100) > 0.249 && *t.predict("k", 100) < 0.251);
+  VCHECK(*t.predict("k", 200) > 0.499 && *t.predict("k", 200) < 0.501);   // scaled by the grid
+  SimTimeTable s;
+  s.record("short", 100, kOneSampleMinSeconds * 0.99);      // just under: not a long launch
+  VCHECK(!s.predict("short", 100).has_value());
+}
+
+VTEST(one_sample_allowance_ends_after_two_offloaded_launches) {
+  SimTimeTable t;
+  t.record("k", 10, 1.0);
+  for (unsigned i = 0; i < kOneSampleOffloads; ++i) {
+    VCHECK(t.predict("k", 10).has_value());                 // still within the allowance
+    t.note_offload("k");
+  }
+  VCHECK(!t.predict("k", 10).has_value());                  // spent: the next launch is the simulator's, for the second sample
+  t.record("k", 10, 0.4);                                   // the warm sample
+  VCHECK(t.predict("k", 10).has_value());                   // two samples now: the usual rule, no allowance needed
+  VCHECK(*t.predict("k", 10) > 0.39 && *t.predict("k", 10) < 0.41);
+  t.note_offload("k");                                      // (offloads on two samples do not count against anything)
+  VCHECK(t.predict("k", 10).has_value());
+}
+
+VTEST(one_sample_allowance_is_per_kernel) {
+  SimTimeTable t;
+  t.record("a", 10, 1.0);
+  t.record("b", 10, 1.0);
+  for (unsigned i = 0; i < kOneSampleOffloads; ++i) t.note_offload("a");
+  VCHECK(!t.predict("a", 10).has_value());
+  VCHECK(t.predict("b", 10).has_value());
+  t.note_offload("never_seen");                             // no entry is made by an offload alone
+  VCHECK(!t.predict("never_seen", 10).has_value());
+  VCHECK(t.samples("never_seen") == 0);
+}
+
+VTEST(driver_start_waits_for_a_launch_of_enough_warps) {
+  VCHECK(!start_worthwhile(1, 32));                         // one warp
+  VCHECK(!start_worthwhile(2, 256));                        // 16 warps
+  VCHECK(!start_worthwhile(31, 32));
+  VCHECK(start_worthwhile(32, 32));                         // exactly kStartMinWarps
+  VCHECK(start_worthwhile(4, 256));                         // 32 warps
+  VCHECK(start_worthwhile(1, 1024));                        // one block of 32 warps
+  VCHECK(start_worthwhile(1, 1000));                     // 1000 threads round up to 32 warps
+  VCHECK(!start_worthwhile(0, 256));                        // an empty grid
+  VCHECK(start_worthwhile(1ull << 40, 33));                 // a huge grid does not overflow
 }
 
 VTEST_MAIN

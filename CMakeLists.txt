@@ -3650,6 +3650,15 @@ set_tests_properties(e2e_host_gpu PROPERTIES
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 900)
 
+# The same mode's start-up on any machine, with a stand-in driver (nvidia/tests/e2e/host_gpu_stub_driver.c): lazy, off the launch path, failing cleanly.
+add_test(NAME e2e_host_gpu_stub
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_gpu_stub.sh)
+set_tests_properties(e2e_host_gpu_stub PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 600)
+
 # Tier 2 (src/sass/jit.hpp, VGPU_JIT=1) against the tier, on the same programs: results and every counter, with the JIT forced on at once, one
 # and four host threads, a warm cache, the faults of sass_tier_steps, and every way the JIT can fail (the output must not change).
 add_test(NAME e2e_sass_jit

@@ -218,6 +218,16 @@ inline bool should_offload(const Estimate& e, const Costs& c) {
   return e.sim_s >= c.min_sim_s && e.sim_s > c.margin * card_path_seconds(e, c);
 }
 
+// ---- start-up of the real driver ---------------------------------------------------------------------------------------------------
+// Loading the driver and making its context costs 0.15 to 0.35 s (09 doc, section 5). It starts, on a thread, at the first launch of a kernel in the exact set
+// that is big enough to be a candidate; a program with no such launch never loads the driver. A launch of fewer than kStartMinWarps warps in all runs in well
+// under a millisecond in the simulator and cannot repay a start by itself; a kernel whose small grid runs long gets its start when the card path is first needed.
+inline constexpr uint64_t kStartMinWarps = 32;
+inline bool start_worthwhile(uint64_t blocks, uint32_t threads_per_block) {
+  const uint64_t warps_per_block = (static_cast<uint64_t>(threads_per_block) + 31) / 32;
+  return blocks * warps_per_block >= kStartMinWarps;
+}
+
 // An estimate for a launch the simulator has not run yet: every warp of the grid executes the kernel's static instruction count, at the
 // simulator's rate. It is NOT a lower bound: a thread that leaves at a bounds check runs a few instructions (PolyBench 3DCONV, a stencil
 // whose grid covers the array and whose threads mostly exit, simulated in 3 ms and estimated at 60 ms), and a loop adds to the count.
@@ -227,22 +237,39 @@ inline double static_sim_seconds(uint64_t blocks, uint32_t threads_per_block, ui
   return static_cast<double>(blocks * warps_per_block * static_instrs) / c.sim_warp_instr_per_s;
 }
 
-// What the simulator took for a kernel before, by kernel, per block of the grid. The first two launches of a kernel always run in the
-// simulator: the first one pays decoding and set-up that the later ones do not (PolyBench 3DCONV's first launch took far longer than the
-// 252 after it, and an estimate from it sent 253 launches of 3 ms to a card path of 100 ms: 38x slower), so the estimate is the
-// smallest per-block time seen, which errs towards the simulator, as the rule should. It is available after two samples.
+// What the simulator took for a kernel before, by kernel, per block of the grid. The first two launches of a kernel run in the simulator: the first one
+// pays decoding and set-up that the later ones do not (PolyBench 3DCONV's first launch took far longer than the 252 after it, and an estimate from it sent
+// 253 launches of 3 ms to a card path of 100 ms: 38x slower), so the estimate is the smallest per-block time seen, which errs towards the simulator, as the
+// rule should. It is available after two samples.
+//
+// One exception, for the launches that cost the most (sp15): a first sample that took kOneSampleMinSeconds or more is a launch whose simulator time is far above any
+// decode or set-up cost, and running the kernel a second time in the simulator just to learn what it already showed would cost as much again. Such a kernel
+// has an estimate after ONE sample, for at most kOneSampleOffloads offloaded launches (the estimate may still hold set-up time, which would blind the
+// offload_paid_off check below): after that it needs a second, simulated sample like any other kernel, and the ban rules judge the card path against that.
+inline constexpr double kOneSampleMinSeconds = 0.25;
+inline constexpr unsigned kOneSampleOffloads = 2;
+
 class SimTimeTable {
  public:
   void record(const std::string& kernel, uint64_t blocks, double seconds) {
     Entry& e = table_[kernel];
     const double per_block = blocks ? seconds / static_cast<double>(blocks) : seconds;
+    if (!e.samples) e.first_total_s = seconds;
     e.per_block_s = e.samples ? std::min(e.per_block_s, per_block) : per_block;
     ++e.samples;
   }
   std::optional<double> predict(const std::string& kernel, uint64_t blocks) const {
     const auto it = table_.find(kernel);
-    if (it == table_.end() || it->second.samples < kSamplesNeeded) return std::nullopt;
-    return it->second.per_block_s * static_cast<double>(std::max<uint64_t>(blocks, 1));
+    if (it == table_.end()) return std::nullopt;
+    const Entry& e = it->second;
+    const bool one_sample_ok = e.samples == 1 && e.first_total_s >= kOneSampleMinSeconds && e.one_sample_offloads < kOneSampleOffloads;
+    if (e.samples < kSamplesNeeded && !one_sample_ok) return std::nullopt;
+    return e.per_block_s * static_cast<double>(std::max<uint64_t>(blocks, 1));
+  }
+  // An offloaded launch used an estimate from `kernel`'s samples: counts against the one-sample allowance.
+  void note_offload(const std::string& kernel) {
+    const auto it = table_.find(kernel);
+    if (it != table_.end() && it->second.samples < kSamplesNeeded) ++it->second.one_sample_offloads;
   }
   unsigned samples(const std::string& kernel) const {
     const auto it = table_.find(kernel);
@@ -253,7 +280,9 @@ class SimTimeTable {
  private:
   struct Entry {
     double per_block_s = 0;
+    double first_total_s = 0;
     unsigned samples = 0;
+    unsigned one_sample_offloads = 0;
   };
   std::map<std::string, Entry> table_;
 };
