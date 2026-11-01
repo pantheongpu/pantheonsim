@@ -132,6 +132,10 @@ jobs:
           path: cutlass-bin-cache
           key: ${{ steps.cutlass_bin.outputs.cache-primary-key }}
 
+      - name: Clean the runner
+        if: always()
+        uses: ./.github/actions/clean-runner
+
   workloads:
     name: pantheon workloads
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
@@ -189,6 +193,13 @@ jobs:
         run: |
           export VGPU_PANTHEON_DIR="$GITHUB_WORKSPACE/pantheon" VGPU_BUILD_DIR="$GITHUB_WORKSPACE/pantheonsim/build"
           ./tests/workloads/run_pantheon_workloads.sh
+
+      # This job checks out into pantheonsim/, so the action and the build trees are there.
+      - name: Clean the runner
+        if: always()
+        uses: ./pantheonsim/.github/actions/clean-runner
+        with:
+          directory: pantheonsim
 
   sass:
     name: SASS on every architecture
@@ -283,6 +294,10 @@ jobs:
       - name: Return the workspace to the runner's user
         if: always() && job.container.id
         run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
+
+      - name: Clean the runner
+        if: always()
+        uses: ./.github/actions/clean-runner
 
   ollama:
     name: ollama on every GPU
@@ -396,6 +411,10 @@ jobs:
         if: always() && job.container.id
         run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
 
+      - name: Clean the runner
+        if: always()
+        uses: ./.github/actions/clean-runner
+
   ollama-amd:
     name: ollama on ${{ matrix.gpu }}
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
@@ -500,6 +519,10 @@ jobs:
         if: always()
         run: rm -rf "$RUNNER_TEMP"/ollama.* || true
 
+      - name: Clean the runner
+        if: always()
+        uses: ./.github/actions/clean-runner
+
   amd-code-objects:
     name: AMD code objects and CDNA decoding
     # A dispatch with nvidia_only skips this job; pushes and pull requests always run it.
@@ -569,6 +592,10 @@ jobs:
           grep -q "amd_gcn_disasm .* Passed" out
           grep -q "amd_hip .* Passed" out
           grep -q "amd_hipcc .* Passed" out
+
+      - name: Clean the runner
+        if: always()
+        uses: ./.github/actions/clean-runner
 
   ml:
     name: PyTorch, ROCm and the rest of the suite on the pantheonsim.com runner
@@ -682,6 +709,10 @@ jobs:
             exit 1
           fi
 
+      - name: Clean the runner
+        if: always()
+        uses: ./.github/actions/clean-runner
+
   sanitizers:
     name: ASan + UBSan
     # GitHub's hosted runner unless the repository variable BURST_RUNS_ON names
@@ -762,6 +793,10 @@ jobs:
       - name: Return the workspace to the runner's user
         if: always() && job.container.id
         run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
+
+      - name: Clean the runner
+        if: always()
+        uses: ./.github/actions/clean-runner
 
   threads:
     name: ThreadSanitizer
@@ -844,4 +879,8 @@ jobs:
       - name: Return the workspace to the runner's user
         if: always() && job.container.id
         run: chown -R "$(stat -c %u:%g "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE" || true
+
+      - name: Clean the runner
+        if: always()
+        uses: ./.github/actions/clean-runner
 
