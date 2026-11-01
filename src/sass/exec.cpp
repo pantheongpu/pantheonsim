@@ -1005,13 +1005,9 @@ void Runner::set_pred(Warp& w, const Operand& o, unsigned lane, bool v) {
     case 0x21: src = &tid_tab_[0][w.index * 32]; break;
     case 0x22: src = &tid_tab_[1][w.index * 32]; break;
     case 0x23: src = &tid_tab_[2][w.index * 32]; break;
-    case 0x00: {
-      for (Mask m = ex; m; m &= m - 1) {
-        const unsigned l = static_cast<unsigned>(std::countr_zero(m));
-        d[l] = l;
-      }
+    case 0x00:
+      exec::sasslanes::lane_ids(d, ex);
       return true;
-    }
     case 0x25: v = blk.ctaid[0]; break;
     case 0x26: v = blk.ctaid[1]; break;
     case 0x27: v = blk.ctaid[2]; break;
@@ -1026,7 +1022,7 @@ void Runner::set_pred(Warp& w, const Operand& o, unsigned lane, bool v) {
         d[l] = src[l];
       }
   } else {
-    for (Mask m = ex; m; m &= m - 1) d[static_cast<unsigned>(std::countr_zero(m))] = v;
+    exec::sasslanes::fill_lanes(d, ex, v);
   }
   return true;
 }
