@@ -1424,6 +1424,8 @@ vgpu_unit_test(test_sass_generic_mem)
 vgpu_unit_test(test_sass_dispatch)
 target_include_directories(test_sass_dispatch PRIVATE src)
 vgpu_unit_test(test_launch_env)
+# Blocks that wait on one another, on fewer host cores than threads: a waiting thread gives its turn up (the CI flake of lockstep.gfx942).
+vgpu_unit_test(test_lockstep_yield)
 vgpu_unit_test(test_sass_lea)
 # The SIMD lane kernels, bit for bit against scalar code at every level the CPU has.
 vgpu_unit_test(test_simd)
@@ -3584,6 +3586,40 @@ set_tests_properties(e2e_sass_path PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   TIMEOUT 600)
 
+# A template kernel registered by two translation units built for different architectures (StringZilla's
+# CUDA libraries are laid out so): the module the GPU has code for runs it, cudaGetFuncBySymbol agrees, and a
+# kernel only the newer unit holds is cudaErrorNoKernelImageForDevice on an older GPU.
+add_test(NAME e2e_multiarch_modules
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_multiarch_modules.sh)
+set_tests_properties(e2e_multiarch_modules PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 600)
+
+# The driver API called after the thread's thread_local destructors have run (a static destructor at exit(), as
+# StringZilla's device scope does): the context stack must outlive them. It was a destroyed std::vector, whose freed
+# storage the next calls wrote -- a glibc "malloc_consolidate(): unaligned fastbin chunk detected" at exit.
+add_test(NAME e2e_exit_teardown
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_exit_teardown.sh)
+set_tests_properties(e2e_exit_teardown PROPERTIES
+  DEPENDS "vgpucuda;vgpucudart"
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 600)
+
+# Hopper's DPX intrinsics (__vimax3, __viaddmax, __vibmin ... in s32/u32/s16x2/u16x2 and _relu), and the PTX
+# min/max .relu forms, on sm_80, sm_89 and sm_90 (SASS and PTX) and sm_120 against NVIDIA's host implementations.
+# e2e_sass_archs runs the same program on every architecture.
+if(TARGET vgpucudart)
+  add_test(NAME e2e_dpx_intrinsics COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_archs.sh)
+  set_tests_properties(e2e_dpx_intrinsics PROPERTIES
+    DEPENDS vgpucudart
+    ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR};VGPU_SASS_PROGRAMS=dpx_intrinsics:75;VGPU_SASS_ARCHS=sm_80 sm_89 sm_90 sm_120"
+    SKIP_REGULAR_EXPRESSION "^SKIP:"
+    TIMEOUT 1800)
+endif()
+
 # The SASS executor's fast paths against its general path (VGPU_FASTPATH=0): answers and counters.
 add_test(NAME e2e_sass_fastpath
          COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_sass_fastpath.sh)
@@ -4432,7 +4468,7 @@ endif()
 foreach(_t e2e_cutlass_gemm e2e_cutlass_sm120 e2e_cutlass_sm100 e2e_cutlass_hopper e2e_cutlass_sm103
            e2e_cutlass_sm100_conv e2e_cutlass_fmha e2e_tma_gemm_cute e2e_wgmma_cute
            e2e_tma_reduce_cute e2e_tensormap_replace_cute e2e_sass_archs e2e_device_runtime
-           e2e_sync_masks e2e_packed_f32x2)
+           e2e_sync_masks e2e_dpx_intrinsics e2e_packed_f32x2)
   if(TEST ${_t})
     set_property(TEST ${_t} APPEND PROPERTY RESOURCE_LOCK nvcc_memory)
   endif()

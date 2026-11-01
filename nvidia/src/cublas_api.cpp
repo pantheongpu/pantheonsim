@@ -733,12 +733,19 @@ VGPU_EXPORT const char* cublasGetStatusString(cublasStatus_t s) { return cublasG
    atomics mode, strategy or mantissa control, an SM target below 0 or above
    the device's SM count, or a negative max mantissa bit count is
    INVALID_VALUE, as is a NULL pointer to a getter. */
-#if CUBLAS_VER_MAJOR >= 13
+// CUDA 12.9 declares the two strategy functions (with cublasEmulationStrategy_t)
+// and nothing else of the family; 13 declares all of it; 12.8 and older none.
+// A function the header declares must be defined with the header's own type,
+// or the compiler reports a conflicting declaration of a C function.
+#if CUBLAS_VER_MAJOR >= 13 || (CUBLAS_VER_MAJOR == 12 && CUBLAS_VER_MINOR >= 9)
 using vgpu_emu_strategy = cublasEmulationStrategy_t;
+#else
+using vgpu_emu_strategy = int;
+#endif
+#if CUBLAS_VER_MAJOR >= 13
 using vgpu_emu_special = cudaEmulationSpecialValuesSupport;
 using vgpu_emu_mantissa = cudaEmulationMantissaControl;
-#else   // the CUDA 12 headers declare none of these
-using vgpu_emu_strategy = int;
+#else
 using vgpu_emu_special = int;
 using vgpu_emu_mantissa = int;
 #endif

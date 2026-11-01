@@ -381,6 +381,13 @@ jobs:
           VGPU_OLLAMA_PULL: '1'
         run: ctest --test-dir build --output-on-failure -R '^e2e_ollama$'
 
+      # The Ollama install above goes in the runner's temp directory, and a runner that lasts (the
+      # burst pool) keeps it: several GB a run, 140 GB of it before anyone looked. Remove it, whatever
+      # the outcome. (The job runs as root in the container, so it can remove what root made.)
+      - name: Remove the Ollama install from the runner's temp directory
+        if: always()
+        run: rm -rf "$RUNNER_TEMP"/ollama.* || true
+
       # The job runs as root in the container, in a workspace that belongs to the runner's
       # user. On a runner that lasts (the burst pool) what it leaves there is root's, and a job
       # that is not in a container (the AMD ollama jobs, the image finder) then cannot clean
@@ -486,6 +493,12 @@ jobs:
           VGPU_OLLAMA_PULL: '1'
           VGPU_OLLAMA_PROFILES: ${{ matrix.gpu }}
         run: ctest --test-dir build --output-on-failure -R '^amd_ollama$'
+
+      # The Ollama install above goes in the runner's temp directory, and a runner that lasts (the
+      # burst pool) keeps it: several GB a run. Remove it, whatever the outcome.
+      - name: Remove the Ollama install from the runner's temp directory
+        if: always()
+        run: rm -rf "$RUNNER_TEMP"/ollama.* || true
 
   amd-code-objects:
     name: AMD code objects and CDNA decoding

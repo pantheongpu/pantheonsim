@@ -125,12 +125,17 @@ struct RegisteredModule {
   bool has_ptx = false;           // whether it holds code this device can use (SASS or PTX)
   std::string ptx;                // the PTX, while it is being loaded
   std::string cubin;              // the SASS this device runs, when the fatbin has it
+  std::string unusable;           // when it has nothing this device runs: what it holds instead
   std::unordered_map<int, uint64_t> module_per_device;  // device -> runtime module id
   std::unordered_map<int, uint32_t> prof_id;            // device -> the id a profiler knows it by
 };
 
 struct KernelInfo {
   RegisteredModule* mod = nullptr;
+  // Modules registered earlier for the same host stub (a template kernel instantiated in several translation
+  // units, each built for its own architectures, registers once per unit). mod is the newest; which one a
+  // device uses is decided at the first lookup (find_kernel), when the module this device can run is known.
+  std::vector<RegisteredModule*> alts;
   std::string entry_name;
   bool load_told = false;             // a profiler has been told what loading this kernel cost
   // What the program has set with cudaFuncSetAttribute, per device (func_attrs.hpp): a second device starts
@@ -662,9 +667,13 @@ std::string extract_registered_ptx(State& s, const void* fatCubin) {
   // rule. (Every device of a simulated machine has one profile.)
   const vgpu::DeviceProfile& dev = s.rt->device(0).profile();
   const uint32_t cc = static_cast<uint32_t>(dev.cc_major * 10 + dev.cc_minor);
+  // Only PTX this device can JIT: PTX is forward-compatible, so a fatbin whose PTX is for a newer architecture
+  // has no code for this device, as on the real driver (cudaErrorNoKernelImageForDevice).
   auto pick_best = [cc](std::vector<vgpu::cuda::FatbinPtx>& v) -> std::string {
     if (v.empty()) return {};
-    return std::move(v[vgpu::cuda::pick_ptx(v, cc)].text);
+    auto& best = v[vgpu::cuda::pick_ptx(v, cc)];
+    if (!vgpu::cuda::ptx_runs_on(best, cc)) return {};
+    return std::move(best.text);
   };
   auto ptxs = vgpu::cuda::extract_ptx(fatCubin);
   out = pick_best(ptxs);
@@ -726,13 +735,32 @@ std::string extract_registered_ptx(State& s, const void* fatCubin) {
     if (trace() && pieces)
       std::fprintf(stderr, "[vgpu][trace] linked %zu relocatable PTX pieces (-rdc build)\n",
                    pieces);
-    if (out.empty() && !quiet())
-      std::fprintf(stderr,
-                   "[vgpu] __cudaRegisterFatBinary: no PTX in fatbin (SASS-only build); rebuild "
-                   "with an -arch that embeds PTX\n");
-    // Return a handle anyway; the failure surfaces at launch with context.
+    // Nothing is said here when there is no code for this device: a fatbin built for other architectures
+    // (one translation unit of a library, say) is a normal thing to hold and never launch from, and
+    // registered_ptx records what it holds for the launch that does need it to say.
   }
   return out;
+}
+
+// What a fatbin that has nothing for a device of compute capability `cc` does hold, for the error that says so:
+// "SASS for sm_90, PTX for sm_90; this device is sm_80".
+static std::string describe_fatbin_code(const void* fatbin, uint32_t cc) {
+  std::string out;
+  const auto add = [&](const char* what, std::vector<vgpu::cuda::FatbinPtx>& v) {
+    std::vector<uint32_t> archs;
+    for (const auto& e : v)
+      if (std::find(archs.begin(), archs.end(), e.arch) == archs.end()) archs.push_back(e.arch);
+    std::sort(archs.begin(), archs.end());
+    for (uint32_t a : archs) out += (out.empty() ? "" : ", ") + std::string(what) + " sm_" + std::to_string(a);
+  };
+  try {
+    auto elfs = vgpu::cuda::extract_elf(fatbin);
+    add("SASS for", elfs);
+    auto ptxs = vgpu::cuda::extract_ptx(fatbin);
+    add("PTX for", ptxs);
+  } catch (const std::exception&) {
+  }
+  return (out.empty() ? std::string("no device code") : out) + "; this device is sm_" + std::to_string(cc);
 }
 
 // Whether a registered fatbin has PTX to run, looking the first time asked.
@@ -749,8 +777,32 @@ bool registered_ptx(State& s, RegisteredModule& m) {
     if (m.cubin.empty()) m.ptx = extract_registered_ptx(s, m.fatbin);
     m.has_ptx = !m.cubin.empty() || !m.ptx.empty();
     m.resolved = true;
+    if (!m.has_ptx) m.unusable = describe_fatbin_code(m.fatbin, cc);
   }
   return m.has_ptx;
+}
+
+// The registered kernel for a host stub, with its module settled. When translation units built for different
+// architectures each registered the stub (the same template kernel instantiated in a unit for sm_80 and another
+// for sm_90 only), the module this device has code for is used: the newest registration that does, else the
+// newest. On the real runtime a launch loads whichever of them has an image for the device. Decided once.
+auto find_kernel(State& s, const void* stub) {
+  auto it = s.kernels.find(stub);
+  if (it == s.kernels.end() || it->second.alts.empty()) return it;
+  KernelInfo& ki = it->second;
+  if (!registered_ptx(s, *ki.mod)) {
+    for (auto a = ki.alts.rbegin(); a != ki.alts.rend(); ++a) {
+      if (registered_ptx(s, **a)) {
+        if (trace())
+          std::fprintf(stderr, "[vgpu][trace] stub %p: module %p has no code for this device, using %p\n",
+                       stub, static_cast<void*>(ki.mod), static_cast<void*>(*a));
+        ki.mod = *a;
+        break;
+      }
+    }
+  }
+  ki.alts.clear();
+  return it;
 }
 
 // A module's __managed__ variables, moved onto the one copy every device and
@@ -992,7 +1044,7 @@ static void announce_context(bool silenced) {
 static const char* launch_symbol(const void* func) {
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
-  const auto it = s.kernels.find(func);
+  const auto it = find_kernel(s, func);
   return it == s.kernels.end() ? nullptr : it->second.entry_name.c_str();
 }
 
@@ -1136,7 +1188,13 @@ VGPU_EXPORT void __cudaRegisterFunction(void** fatCubinHandle, const char* hostF
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   auto* mod = reinterpret_cast<RegisteredModule*>(fatCubinHandle);
-  s.kernels[reinterpret_cast<const void*>(hostFun)] = {mod, deviceName};
+  KernelInfo& slot = s.kernels[reinterpret_cast<const void*>(hostFun)];
+  if (slot.mod && slot.mod != mod) {
+    // The same stub registered by a second translation unit: keep the first as a candidate (see KernelInfo::alts).
+    slot.alts.push_back(slot.mod);
+  }
+  slot.mod = mod;
+  slot.entry_name = deviceName;
   if (trace())
     std::fprintf(stderr, "[vgpu][trace] __cudaRegisterFunction: stub %p -> '%s'\n", (void*)hostFun,
                  deviceName);
@@ -1499,7 +1557,7 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
   // One pass over the environment for everything this launch reads (vgpu/exec/launch_env.hpp), handed on in the LaunchConfig.
   const vgpu::exec::LaunchEnv env = vgpu::exec::read_launch_env();
   const cudaError_t rc = guard(api, [&](State& s) -> cudaError_t {
-    auto it = s.kernels.find(func);
+    auto it = find_kernel(s, func);
     if (it == s.kernels.end()) {
       if (!quiet())
         std::fprintf(stderr, "[vgpu] cudaLaunchKernel: unregistered kernel stub %p\n", func);
@@ -1517,8 +1575,8 @@ static cudaError_t launch_kernel_impl(const char* api, const void* func, dim3 gr
     if (!ki.mod || !registered_ptx(s, *ki.mod)) {
       // What the real runtime says for a binary built only for other GPUs.
       if (!quiet())
-        std::fprintf(stderr, "[vgpu] cudaLaunchKernel: kernel '%s' has neither SASS this GPU runs nor PTX\n",
-                     ki.entry_name.c_str());
+        std::fprintf(stderr, "[vgpu] cudaLaunchKernel: kernel '%s' has neither SASS this GPU runs nor PTX it can JIT (%s)\n",
+                     ki.entry_name.c_str(), ki.mod ? ki.mod->unusable.c_str() : "no module");
       return cudaErrorNoKernelImageForDevice;
     }
     const uint64_t load_start = profiling ? vgpu::profiling::host_ns() : 0;
@@ -2252,7 +2310,7 @@ static cudaError_t cudaFuncGetAttributes_body(cudaFuncAttributes* attr, const vo
     // Saying nothing made this very hard to place: CUB asks about its own kernels before it launches any, so
     // the failure surfaced as "invalid device function" from a sort, with nothing said about which kernel
     // could not be described.
-    auto it = s.kernels.find(func);
+    auto it = find_kernel(s, func);
     if (it == s.kernels.end()) {
       if (!quiet())
         std::fprintf(stderr, "[vgpu] cudaFuncGetAttributes: unregistered kernel stub %p\n", func);
@@ -2309,7 +2367,7 @@ VGPU_EXPORT cudaError_t cudaFuncGetAttributes(cudaFuncAttributes* attr, const vo
 static cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor_traced(int* numBlocks, const void* func, int blockSize, size_t dynamicSMemSize) {
   return guard("cudaOccupancyMaxActiveBlocksPerMultiprocessor", [&](State& s) -> cudaError_t {
     if (!numBlocks || blockSize <= 0) return cudaErrorInvalidValue;
-    auto it = s.kernels.find(func);
+    auto it = find_kernel(s, func);
     if (it == s.kernels.end()) {
       if (!quiet())
         std::fprintf(stderr,
@@ -2386,7 +2444,7 @@ static cudaError_t cluster_occupancy_query(const char* api, bool active, int* ou
   using S = vgpu::exec::ClusterAnswer::Status;
   if (!out || !config) return cudaErrorInvalidValue;   // a null configuration crashes the card's runtime
   return guard(api, [&](State& s) -> cudaError_t {
-    auto it = s.kernels.find(func);
+    auto it = find_kernel(s, func);
     if (it == s.kernels.end()) {
       if (!quiet() && func) std::fprintf(stderr, "[vgpu] %s: unregistered kernel stub %p\n", api, func);
       return cudaErrorInvalidDeviceFunction;
@@ -2451,7 +2509,7 @@ VGPU_EXPORT cudaError_t cudaOccupancyMaxPotentialClusterSize(int* clusterSize, c
 #if CUDART_VERSION >= 12040
 namespace {
 cudaError_t kernel_function(State& s, const void* func, const char* api, const vgpu::ptx::EntryFn** fn) {
-  auto it = s.kernels.find(func);
+  auto it = find_kernel(s, func);
   if (it == s.kernels.end()) {
     if (!quiet()) std::fprintf(stderr, "[vgpu] %s: unregistered kernel stub %p\n", api, func);
     return cudaErrorInvalidDeviceFunction;
@@ -2470,7 +2528,7 @@ cudaError_t kernel_function(State& s, const void* func, const char* api, const v
 static cudaError_t cudaFuncGetName_traced(const char** name, const void* func) {
   return guard("cudaFuncGetName", [&](State& s) -> cudaError_t {
     if (!name) return cudaErrorInvalidValue;
-    auto it = s.kernels.find(func);
+    auto it = find_kernel(s, func);
     if (it == s.kernels.end()) return cudaErrorInvalidDeviceFunction;
     *name = it->second.entry_name.c_str();   // the registry's string, which outlives the call
     return cudaSuccess;
@@ -4502,7 +4560,7 @@ static cudaError_t cudaFuncSetAttribute_traced(const void* func, int attr, int v
   if (const cudaError_t dead = dead_context()) return dead;
   if (attr < 0 || attr > 15) return cudaErrorInvalidValue;
   return guard("cudaFuncSetAttribute", [&](State& s) -> cudaError_t {
-    auto it = s.kernels.find(func);
+    auto it = find_kernel(s, func);
     if (it == s.kernels.end()) return func ? cudaErrorInvalidResourceHandle : cudaErrorInvalidDeviceFunction;
     KernelInfo& ki = it->second;
     // The limits depend on the kernel's static shared memory and the part: its code has to be there.
@@ -7696,7 +7754,7 @@ bool kernel_launches_kernels(const void* func) {
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   if (!s.rt) return false;
-  auto it = s.kernels.find(func);
+  auto it = find_kernel(s, func);
   if (it == s.kernels.end() || !it->second.mod || !registered_ptx(s, *it->second.mod)) return false;
   const uint64_t mid = module_on_current(s, *it->second.mod);
   const vgpu::ptx::EntryFn* fn = current(s).get_function(mid, it->second.entry_name);
@@ -8513,7 +8571,7 @@ bool kernel_param_sizes(const void* func, std::vector<uint32_t>* out) {
   State& s = st();
   std::lock_guard<std::recursive_mutex> lock(s.mu);
   if (!s.rt) return false;
-  auto it = s.kernels.find(func);
+  auto it = find_kernel(s, func);
   if (it == s.kernels.end() || !it->second.mod || !registered_ptx(s, *it->second.mod)) return false;
   const uint64_t mid = module_on_current(s, *it->second.mod);
   const vgpu::ptx::EntryFn* fn = current(s).get_function(mid, it->second.entry_name);
