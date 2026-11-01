@@ -5,6 +5,10 @@
 // The kernels are SASS written out word by word (sm_86; nvdisasm's text for each word is checked, so a mistaken encoding fails here
 // and not as a strange result): each stores one register to out[blockIdx.x] from every thread. One stores a register it never wrote,
 // one a register it set to a number first; run one after the other on this thread (VGPU_THREADS=1), the second gets the first's block.
+#include <sched.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -12,6 +16,7 @@
 
 #include "vgpu/error.hpp"
 #include "vgpu/exec/launch.hpp"
+#include "vgpu/exec/worker_pool.hpp"
 #include "vgpu/memory.hpp"
 #include "vgpu/registry.hpp"
 #include "vgpu/sass/exec.hpp"
@@ -222,5 +227,55 @@ VTEST(a_diverged_warp_votes_among_the_lanes_that_run_it) {
   const std::vector<uint32_t> few = run_words(e, *m, 20);
   for (uint32_t l = 0; l < 20; ++l) VCHECK_EQ(few[l], l < 8 ? 0xffu : 1u);
 }
+
+#if defined(__SANITIZE_THREAD__)
+#define VGPU_SASS_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define VGPU_SASS_TSAN 1
+#endif
+#endif
+
+#ifndef VGPU_SASS_TSAN
+// The SASS twin of test_sched's a_pool_slowed_by_a_crowded_cpu_...: four threads on one CPU make every hand-off wait for a time
+// slice, and a launch that was slow for that reason must not be costed as one with much work (the cost is the time the threads
+// spent running the launch's bodies, run_parallel's tally), or the kernel stays on the pool and stays slow for good. Eight blocks of a few
+// instructions are far below the work that pays for a second thread. A child, so the pool's threads are born on the one CPU.
+VTEST(a_crowded_cpu_does_not_keep_a_small_sass_launch_on_the_pool) {
+  const pid_t pid = fork();
+  VCHECK(pid >= 0);
+  if (pid == 0) {
+    alarm(120);
+    int bad = 0;
+    cpu_set_t all, one;
+    CPU_ZERO(&all);
+    CPU_ZERO(&one);
+    if (sched_getaffinity(0, sizeof all, &all) != 0) _exit(2);
+    for (int c = 0; c < CPU_SETSIZE; ++c)
+      if (CPU_ISSET(c, &all)) { CPU_SET(c, &one); break; }
+    if (sched_setaffinity(0, sizeof one, &one) != 0) _exit(2);
+    ::unsetenv("VGPU_POOL_MIN_WORK_US");
+    ::setenv("VGPU_THREADS", "4", 1);
+    try {
+      Env e;
+      const auto m = e.load({kCtaid, kPtrLo, kPtrHi, kAddr, kStoreR0, kExit});
+      for (int i = 0; i < 2; ++i) e.run(*m, 8, 32);   // the first launch of a kernel has no cost to go by
+      const uint64_t calls = exec::worker_pool_stats().calls;
+      for (int i = 0; i < 400; ++i) {
+        const std::vector<uint32_t> got = e.run(*m, 8, 32);
+        for (uint32_t b = 0; b < 8; ++b) bad += got[b] != b;
+      }
+      bad += exec::worker_pool_stats().calls - calls > 40;   // a few may read a cost taken while preempted; not most
+    } catch (...) {
+      bad = 1;
+    }
+    _exit(bad ? 1 : 0);
+  }
+  int status = 0;
+  VCHECK_EQ(waitpid(pid, &status, 0), pid);
+  VCHECK(WIFEXITED(status));
+  VCHECK_EQ(WEXITSTATUS(status), 0);
+}
+#endif
 
 VTEST_MAIN
