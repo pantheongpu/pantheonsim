@@ -1,3 +1,5 @@
+asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.skip 2816\n.popsection");
+// (The line above puts this unit's code on a 4096-byte boundary, then 2816 bytes in (the offset that measured best for the PTX interpreter's rows): where it starts modulo a page no longer depends on the units linked ahead of it. docs/performance.md, Round sp14, combined.)
 // The SIMT warp interpreter — VirtualGPU's CPU execution engine.
 //
 // Execution model (see ARCHITECTURE.md):

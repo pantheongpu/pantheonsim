@@ -1,3 +1,5 @@
+asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
+// (The line above puts this unit's code on a 4096-byte boundary: where it starts modulo a page no longer depends on the units linked ahead of it. docs/performance.md, Round sp14, combined.)
 // The SASS executor: runs a kernel's machine code over a grid on the CPU.
 //
 // A warp is 32 lanes with the architectural state of sm_70-and-later GPUs:

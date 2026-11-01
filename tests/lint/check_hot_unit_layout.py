@@ -10,7 +10,9 @@ and on a fixed alignment its layout does not move when something linked ahead of
 
 This reads the unit's object file (ELF section headers; the standard library only) and fails when
   * it carries LTO bytecode (.gnu.lto_*): the unit went through the link-time optimizer after all, or
-  * an executable section of it other than the cold/startup ones is aligned to less than 64 bytes: the flag did not reach it.
+  * an executable section of it other than the cold/startup ones is aligned to less than 64 bytes: the flag did not reach it, or
+  * its .text is aligned to less than 4096 bytes: the first line of the source (an `asm` that raises the section's alignment to a page, so that
+    where the unit starts modulo a page does not depend on the units linked ahead of it) is gone.
 usage: check_hot_unit_layout.py OBJECT_DIR   (CMakeFiles/vgpu.dir of the build: the units' objects lie under it at their source paths)
 """
 import os
@@ -21,6 +23,7 @@ UNITS = ("src/sass/exec.cpp.o", "src/exec/interpreter.cpp.o", "src/core/memory.c
 SHF_EXECINSTR = 0x4
 SKIP = (".text.unlikely", ".text.startup", ".text.exit")   # GCC aligns the cold halves of functions to 1 and the static initializers to 16
 ALIGN = 64
+PAGE = 4096
 
 
 def sections(path):
@@ -52,6 +55,8 @@ def check(path):
         if not flags & SHF_EXECINSTR or size == 0 or name.startswith(SKIP):
             continue
         text += size
+        if name == ".text" and align < PAGE:
+            problems.append("%s: section .text is aligned to %d bytes, not %d: the page-alignment line at the top of the source is missing" % (path, align, PAGE))
         if align < ALIGN:
             problems.append("%s: section %s is aligned to %d bytes, not %d: -falign-functions=%d did not reach it" % (path, name, align, ALIGN, ALIGN))
     if text < 256:
