@@ -2295,33 +2295,42 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
   // the row pointer and the check that a program's registers are inside the file are worked out again for every pass.
   c.R = w.r.data();
   regs_ok = tp.max_reg <= w.nregs;
+  // Whether the loop may go on past an op that is not straight, as the chain below would start another call at once (the 'cont' ops); worked out
+  // at the first of them in a pass (0: not yet, 1: yes, 2: no).
+  uint8_t cstate = 0;
   if (tier_stats_) [[unlikely]] {
     tier_stats().passes.fetch_add(1, std::memory_order_relaxed);
     if (again) tier_stats().chained.fetch_add(1, std::memory_order_relaxed);
   }
   const size_t first = static_cast<size_t>((pick - code.base) / 16);
-  size_t idx = first;
+  // The loop below keeps its place as a pointer, `o`, and not as an index: the loop carries one value from op to op, and it was a stack
+  // slot (the loop has more live values than the registers a call leaves). The ops this pass has taken are o - o0, never more than 256, and
+  // a straight one is not the section's last: both are the one test o < olim.
+  const tier::MOp* const o0 = ops + first;
+  const tier::MOp* const ops_last = ops + (count - 1);   // (the section's last op never runs as a straight one)
+  const tier::MOp* olim = ops + std::min(count - 1, first + 256);
+  const tier::MOp* o = o0;
   const unsigned glanes = popc(group);
-  const tier::MOp* cur = &ops[idx];
+  const tier::MOp* cur = o;
   bool all_at = false;   // the run ended by setting every lane of the group to one address, `at` (the chain below then knows where they stand)
   uint64_t at = 0;
   try {
-    for (unsigned n = 0;; ++n) {
+    for (;;) {
       // Tier 2: a region that starts here, compiled, is run in place of its ops (jit_run_region says how, and when not).
       if constexpr (Jit) {
+        const size_t idx = static_cast<size_t>(o - ops);
         if (const uint32_t ri = region_at[idx]) {
           const tier::MOp* faulting = nullptr;   // (not `cur`: its address would keep it out of a register in the loop below)
           uint32_t k;
           try {
-            k = jit_run_region(jf, *ju, ri, c, w, st, ops, idx, n, group, glanes, max_steps_, tier_stats_, faulting);
+            k = jit_run_region(jf, *ju, ri, c, w, st, ops, idx, static_cast<unsigned>(o - o0), group, glanes, max_steps_, tier_stats_, faulting);
           } catch (...) {
             if (faulting) cur = faulting;
             throw;
           }
           if (k) {
-            cur = &ops[idx + k - 1];
-            idx += k;
-            n += k - 1;
+            cur = o + k - 1;
+            o += k;
             continue;
           }
         }
@@ -2330,27 +2339,25 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       // -- the store gate (none of them is a store), the step count, the guard (none has one) and the counters -- is done for the stretch.
       // Not in tier 2's loop (its regions would be skipped over), nor while the statistics count each instruction.
       if constexpr (!Jit) {
-        unsigned k = ops[idx].run;
-        if (k > 256 - n) k = 256 - n;
+        unsigned k = o->run;
+        if (k >= 2 && o + k > olim) k = static_cast<unsigned>(olim - o);   // (a stretch never reaches the section's last op: only the 256 can cut it)
         if (k >= 2 && regs_ok && group && !tier_stats_ && w.steps + k <= max_steps_) {
           w.steps += k;
           st.instructions += k;
           st.thread_instructions += uint64_t{k} * glanes;
-          const tier::MOp* const o = ops + idx;
           tier_issue(c, o, k, group, glanes, st.inst_by_class);
           cur = o + k - 1;
-          idx += k;
-          n += k - 1;
+          o += k;
           continue;
         }
       }
       // step_warp's store gate: a warp's first store to global memory ends its turn, once, so that the block's other warps
       // issue the loads their prologues make before it lands (the comment there says why). The tier must stop where
       // the interpreter does, or a block's warps see each other's stores in another order.
-      if (w.store_gate && (ops[idx].ins->op == Op::STG || ops[idx].ins->op == Op::ST)) {
+      if (w.store_gate && o->store) {
         w.store_gate = false;
         if (blk.warps.size() > 1) {
-          if (idx != first) tier_set_pcs(w, group, code.base + 16 * static_cast<uint64_t>(idx));
+          if (o != o0) tier_set_pcs(w, group, code.base + 16 * static_cast<uint64_t>(o - ops));
           w.yield = true;
           return true;
         }
@@ -2358,9 +2365,9 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       if (++w.steps > max_steps_)
         throw Error(Err::ExecLimit, "SASS kernel " + k_.name + ": a warp ran " + std::to_string(max_steps_) +
                                       " instructions (an infinite loop?)");
-      const tier::MOp& op = ops[idx];
-      cur = &op;
-      if (n < 256 && idx + 1 < count && op.straight) {
+      const tier::MOp& op = *o;
+      cur = o;
+      if (o < olim && op.straight) {
         if ((op.fn && (regs_ok || op.maxreg <= w.nregs)) || op.never) {
           const Mask ex = op.unguarded ? group : tier_guard(w, *op.ins, group);
           const unsigned lanes = ex == group ? glanes : popc(ex);
@@ -2373,13 +2380,38 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
           execute(blk, w, *op.ins, group, /*advance=*/false);
           if (tier_stats_) [[unlikely]] tier_note_fallback(*op.ins);
         }
-        ++idx;
+        ++o;
         continue;
+      }
+      // An op that is not straight only for the scheduler's sake (S2R, ULDC, UMOV, USEL, PLOP3, SEL: a handler that touches registers and
+      // nothing else) ends the call, and the chain below starts the next one where it left off -- when the warp has not diverged, nothing waits
+      // or has yielded, and the turn has calls left. All that is known before the op runs and the op changes none of it, so the loop does
+      // what the chain would do (the call counted, the 256-op bound given afresh) without leaving: the lanes' addresses are set where
+      // the loop does stop, as they are after any run that has moved on.
+      if constexpr (!Jit) {
+        if (op.cont && o < ops_last) {
+          if (cstate == 0) cstate = (regs_ok && !tier_stats_ && tier_chain_ && !w.yield && !w.slice && !w.give_way && !w.ws_held && !w.mactive_force && group &&
+                                     w.runnable() == group) ? 1 : 2;
+          if (cstate == 1 && w.budget) {
+            const Mask ex = op.unguarded ? group : tier_guard(w, *op.ins, group);
+            const unsigned lanes = ex == group ? glanes : popc(ex);
+            ++st.instructions;
+            st.thread_instructions += lanes;
+            st.inst_by_class[op.cls] += lanes;
+            if (ex) op.fn(&c, op, ex);
+            --w.budget;
+            ++w.extra;
+            ++o;
+            olim = (reinterpret_cast<const char*>(ops_last) - reinterpret_cast<const char*>(o) > static_cast<ptrdiff_t>(256 * sizeof(tier::MOp))) ? o + 256 : ops_last;
+            continue;
+          }
+        }
       }
       break;
     }
     // The instruction that ends the run (cur is it).
-    const tier::MOp& last = ops[idx];
+    const size_t idx = static_cast<size_t>(o - ops);
+    const tier::MOp& last = *o;
     const uint64_t here = code.base + 16 * static_cast<uint64_t>(idx);
     if (last.form == tier::Form::Bra) {
       // exec_control's BRA for a fixed target: the lanes that take it go there, the others on to the next instruction; a condition

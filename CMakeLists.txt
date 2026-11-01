@@ -1395,6 +1395,12 @@ add_test(NAME test_sass_alu_runs_tier0 COMMAND test_sass_alu_runs)
 set_tests_properties(test_sass_alu_runs_tier0 PROPERTIES ENVIRONMENT "VGPU_TIER=0")
 add_test(NAME test_sass_alu_runs_simd_base COMMAND test_sass_alu_runs)
 set_tests_properties(test_sass_alu_runs_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base")
+# The store gate: every warp of a block loads before the first store lands, in the tier's run loop and in the interpreter's.
+vgpu_unit_test(test_sass_store_gate)
+add_test(NAME test_sass_store_gate_tier0 COMMAND test_sass_store_gate)
+set_tests_properties(test_sass_store_gate_tier0 PROPERTIES ENVIRONMENT "VGPU_TIER=0")
+# The run loop going on past S2R, ULDC, UMOV, USEL, PLOP3 and SEL where the chain would have started the next call there: same words, counters and clocks as the interpreter.
+vgpu_unit_test(test_sass_chain_cont)
 vgpu_unit_test(test_sass_s2r_fill)
 # LDGSTS (cp.async): the tier's own handler against the rule and the interpreter, registers, shared memory and counters.
 vgpu_unit_test(test_sass_ldgsts)

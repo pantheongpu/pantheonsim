@@ -465,6 +465,7 @@ void analyze(const Instr& ins, int sm, Program& prog, MOp& op) {
   op.ins = &ins;
   op.cls = ins.cls;
   op.straight = ins.straight;
+  op.store = ins.op == Op::STG || ins.op == Op::ST;
   op.guard = ins.guard;
   op.guard_not = ins.guard_not;
   op.guard_uniform = ins.guard_uniform;

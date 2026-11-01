@@ -60,7 +60,7 @@ void check_corpus(const std::string& file, int sm) {
   sass::tier::Program prog;
   prog.ops.resize(instrs.size());
   std::map<std::string, Tally> by_op;
-  size_t accepted = 0;
+  size_t accepted = 0, stores = 0;
   {   // (the cost of the analysis, for VGPU_SASS_REPORT: the whole corpus built again into a scratch program)
     const auto t0 = std::chrono::steady_clock::now();
     sass::tier::Program scratch;
@@ -82,6 +82,8 @@ void check_corpus(const std::string& file, int sm) {
     VCHECK(op.cls == ins.cls);
     VCHECK(op.never == (ins.guard == sass::kPT && ins.guard_not));
     VCHECK(op.unguarded == (ins.guard == sass::kPT && !ins.guard_not));
+    VCHECK(op.store == (ins.op == sass::Op::STG || ins.op == sass::Op::ST));   // (the store gate looks for these)
+    stores += op.store;
     if (op.form == sass::tier::Form::None) {
       VCHECK(op.maxreg == 0);
       continue;
@@ -129,6 +131,7 @@ void check_corpus(const std::string& file, int sm) {
       for (unsigned l = 1; l < 32; ++l) VCHECK(prog.pool[i].v[l] == prog.pool[i].v[0]);
   // Not vacuous: a corpus of an architecture with this many integer and float instructions gives the tier many.
   VCHECK(accepted > 200);
+  VCHECK(stores > 0);   // (and some are stores)
   const bool report = std::getenv("VGPU_SASS_REPORT") != nullptr;
   if (report) {
     for (const auto& [op, t] : by_op)
