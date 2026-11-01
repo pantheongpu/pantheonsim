@@ -3823,8 +3823,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME lint_amd_ladders
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_ladders.py)
   # The hot translation units are plain machine code on 64-byte function boundaries (VGPU_HOT_UNIT_FLAGS): read from their object files.
-  add_test(NAME lint_hot_unit_layout
-           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_hot_unit_layout.py ${CMAKE_BINARY_DIR}/CMakeFiles/vgpu.dir)
+  # (Not under a sanitizer or in a Debug build: GCC applies -falign-functions only when optimizing, so an -O0 object has template instances on 1-byte boundaries.)
+  if(NOT CMAKE_CXX_FLAGS MATCHES "fsanitize" AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_test(NAME lint_hot_unit_layout
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/lint/check_hot_unit_layout.py ${CMAKE_BINARY_DIR}/CMakeFiles/vgpu.dir)
+  endif()
   # Every exported runtime and driver function is a call a profiler is told of,
   # and the driver shim takes the argument sizes the toolkit declares (CUPTI
   # reads them by those sizes).
