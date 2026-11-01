@@ -1,0 +1,42 @@
+#!/bin/bash
+# pantheonsim card CI: one ephemeral GitHub Actions runner with the label pantheonsim-card on a GPU instance (card-runner.sh start). It takes ONE job and the
+# instance then shuts down (it terminates on shutdown); a lifetime cap shuts it down whatever happens, so a stuck job or a failed registration cannot run up a bill.
+set -uxo pipefail
+exec > >(tee /var/log/card-setup.log | logger -t card-setup -s 2>/dev/console) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+REPO=pantheongpu/pantheonsim
+TOKEN='__TOKEN__'
+RUNNER_VERSION=2.337.0
+TTL_MINUTES=__TTL__
+
+# The lifetime cap first: nothing below can keep the instance alive past it.
+systemd-run --on-active="${TTL_MINUTES}m" --unit=card-ttl /sbin/shutdown -h now
+
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends cmake ninja-build g++ g++-12 python3 git curl jq ca-certificates tar xz-utils pkg-config libssl-dev
+nvidia-smi -L || { logger -t card-setup "no GPU visible: shutting down"; shutdown -h now; }
+
+useradd -m -s /bin/bash runner
+echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner
+TOKEN_IMDS=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN_IMDS" http://169.254.169.254/latest/meta-data/instance-id)
+d=/home/runner/r1
+mkdir -p "$d"
+curl -sL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" | tar xz -C "$d"
+chown -R runner:runner /home/runner
+# --ephemeral: the runner takes one job and unregisters itself.
+sudo -u runner bash -c "cd $d && ./config.sh --unattended --ephemeral --url https://github.com/$REPO --token '$TOKEN' --name card-$IID \
+  --no-default-labels --labels pantheonsim-card --work _work" || { logger -t card-setup "runner registration failed: shutting down"; shutdown -h now; }
+# Run it in the foreground of a unit; when it exits (the job is done, or it was removed) the instance goes away a minute later.
+cat > /etc/systemd/system/card-runner.service <<UNIT
+[Unit]
+Description=pantheonsim card CI runner (one job)
+[Service]
+User=runner
+WorkingDirectory=$d
+ExecStart=$d/run.sh
+ExecStopPost=+/sbin/shutdown -h +1
+UNIT
+systemctl daemon-reload
+systemctl start card-runner.service
+echo "card setup done: $(date -u)"

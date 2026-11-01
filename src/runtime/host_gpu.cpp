@@ -525,6 +525,9 @@ void print_summary(Runtime::Impl* im) {
                static_cast<unsigned long long>(s.offloaded), static_cast<unsigned long long>(s.simulated), static_cast<unsigned long long>(s.refused_kernel),
                static_cast<unsigned long long>(s.refused_size), static_cast<unsigned long long>(s.refused_launch), static_cast<unsigned long long>(s.failed));
   std::fprintf(stderr, "host_gpu: %.1f MiB went to the card, %.1f MiB came back\n", s.pushed_bytes / 1048576.0, s.pulled_bytes / 1048576.0);
+  if (im->verify)   // (the second line is for scripts: the card CI parses it, not the prose above)
+    std::fprintf(stderr, "host_gpu_verify: in_set_identical=%llu in_set_different=%llu other_identical=%llu other_different=%llu\n", static_cast<unsigned long long>(s.same_exact_set),
+                 static_cast<unsigned long long>(s.differ_exact_set), static_cast<unsigned long long>(s.same_other), static_cast<unsigned long long>(s.differ_other));
   if (im->verify)
     std::fprintf(stderr, "host_gpu: verify: kernels in the exact set: %llu identical, %llu different; other kernels: %llu identical, %llu different\n",
                  static_cast<unsigned long long>(s.same_exact_set), static_cast<unsigned long long>(s.differ_exact_set), static_cast<unsigned long long>(s.same_other),

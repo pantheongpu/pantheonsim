@@ -51,7 +51,9 @@ for arg in small mufu; do
   grep -q "mode off" "$work/on_$arg.err" && { echo "FAIL: $arg: the mode said it was off: $(grep 'mode off' "$work/on_$arg.err" | head -1)"; fails=1; }
 done
 # 2 and 3. a launch worth a card: the driver starts, and the simulator does not wait for it.
-run on_big big VGPU_HOST_GPU=exact || { echo "FAIL: the big run with the mode on failed"; tail -5 "$work/on_big.err"; fails=1; }
+# (VGPU_HOST_GPU_NO_FIRST_LAUNCH=1: the first-launch rule would send the very first launch of this looping kernel to the card, which has to wait for the driver by
+# definition; the overlap this test pins is the simulated launches before the history rule sends one.)
+run on_big big VGPU_HOST_GPU=exact VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 || { echo "FAIL: the big run with the mode on failed"; tail -5 "$work/on_big.err"; fails=1; }
 diff -q "$work/off_big.out" "$work/on_big.out" > /dev/null || { echo "FAIL: the mode changes the output of the big program"; fails=1; }
 grep -q '^cuInit$' "$work/on_big.log" || { echo "FAIL: a launch worth a card did not start the driver: $(calls on_big)"; fails=1; }
 grep -q '^cuModuleLoadData$' "$work/on_big.log" || { echo "FAIL: no launch reached the card path (the stand-in's module load): $(calls on_big)"; fails=1; }
@@ -59,7 +61,7 @@ first="$(sed -n 's/^first_launch_ms=\([0-9]*\).*/\1/p' "$work/on_big.err" | head
 [[ -n "$first" ]] || { echo "FAIL: the program printed no first_launch_ms"; fails=1; first=0; }
 (( first < init_ms / 2 )) || { echo "FAIL: the first launch took $first ms: it waited for a driver start of $init_ms ms"; fails=1; }
 # 4. a driver that cannot start.
-run on_bad big VGPU_HOST_GPU=exact STUB_FAIL_INIT=1 || { echo "FAIL: the run with a failing driver failed"; tail -5 "$work/on_bad.err"; fails=1; }
+run on_bad big VGPU_HOST_GPU=exact VGPU_HOST_GPU_NO_FIRST_LAUNCH=1 STUB_FAIL_INIT=1 || { echo "FAIL: the run with a failing driver failed"; tail -5 "$work/on_bad.err"; fails=1; }
 diff -q "$work/off_big.out" "$work/on_bad.out" > /dev/null || { echo "FAIL: a driver that cannot start changes the output"; fails=1; }
 n="$(grep -c 'cuInit failed; mode off' "$work/on_bad.err")"
 (( n == 1 )) || { echo "FAIL: expected exactly one 'cuInit failed; mode off' line, got $n"; fails=1; }

@@ -39,7 +39,7 @@ __device__ uint32_t card_op(int op, uint32_t in, uint32_t a, bool mutate) {
     default: r = __fdiv_rn(__uint_as_float(a), x); break;   // div.rn.f32: the idiom (MUFU.RCP, FFMA refinement, FCHK, slow path)
   }
   uint32_t b = __float_as_uint(r);
-  if (mutate && op == 5 && (b & 0x7f800000u) != 0x7f800000u && (in & 0xffffu) == 0x1234u) b += 1;   // a nudge the harness has to notice
+  if (mutate && op == 5 && (b & 0x7f800000u) != 0x7f800000u && (in & 0x3ffu) == 0 && in) b += 1;   // a nudge the harness has to notice
   return b;
 }
 __global__ void run(int op, uint32_t a, uint64_t first, uint64_t count, uint64_t stride, bool mutate, uint32_t* out) {
