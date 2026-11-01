@@ -244,6 +244,10 @@ class SimTimeTable {
     if (it == table_.end() || it->second.samples < kSamplesNeeded) return std::nullopt;
     return it->second.per_block_s * static_cast<double>(std::max<uint64_t>(blocks, 1));
   }
+  unsigned samples(const std::string& kernel) const {
+    const auto it = table_.find(kernel);
+    return it == table_.end() ? 0 : it->second.samples;
+  }
   static constexpr unsigned kSamplesNeeded = 2;
 
  private:
@@ -253,6 +257,43 @@ class SimTimeTable {
   };
   std::map<std::string, Entry> table_;
 };
+
+// ---- the first launch of a kernel (docs/perf-design/09-host-gpu-spike.md 6, step 2) --------------------------------------------------
+// The history rule needs two simulator launches of a kernel, so a program that launches each kernel once (PolyBench GEMM, SYRK, SYR2K, 3MM) was never
+// offloaded. A static count of the code cannot say how long threads run (3DCONV, a stencil with no loop whose threads mostly leave at a bounds check, was
+// 38x slower with VGPU_HOST_GPU_STATIC=1), so the first launch of a kernel goes to the card only when ALL of these hold:
+//  * the kernel has a loop (a branch back to an earlier instruction): threads cannot all leave at a bounds check, they have work that grows with the code's loop;
+//  * the grid covers at least kFirstLaunchBlocksPerSm blocks per multiprocessor: a grid that does not fill the machine is small however long a thread runs;
+//  * the live bytes (the most the launch can move each way) are at most kFirstLaunchMaxBytes: a mistaken first launch is bounded;
+//  * the static estimate beats the card path by the usual margin, with the pushes and pulls of the whole live memory.
+// Only the kernel's first launch is decided this way: the next ones are the simulator's until its history exists, as before.
+inline constexpr uint64_t kFirstLaunchBlocksPerSm = 8;
+inline constexpr uint64_t kFirstLaunchMaxBytes = 256ull << 20;
+
+// Whether a branch goes back to its own instruction or an earlier one. `branches` holds (pc, target) of every branch of the kernel's code.
+inline bool has_back_edge(const std::vector<std::pair<uint64_t, uint64_t>>& branches) {
+  for (const auto& [pc, target] : branches)
+    if (target <= pc) return true;
+  return false;
+}
+
+struct FirstLaunch {
+  uint64_t blocks = 0;
+  uint32_t threads_per_block = 0;
+  uint64_t static_instrs = 0;
+  bool back_edge = false;
+  uint32_t multiprocessors = 0;
+  uint64_t live_bytes = 0;
+};
+
+inline bool first_launch_offload(const FirstLaunch& f, const Costs& c) {
+  if (!f.back_edge || f.multiprocessors == 0 || f.blocks < kFirstLaunchBlocksPerSm * f.multiprocessors || f.live_bytes > kFirstLaunchMaxBytes) return false;
+  Estimate e;
+  e.sim_s = static_sim_seconds(f.blocks, f.threads_per_block, f.static_instrs, c);
+  e.push_bytes = f.live_bytes;
+  e.pull_bytes = f.live_bytes;
+  return should_offload(e, c);
+}
 
 // A safety net for any estimate that turns out wrong: an offloaded launch that took longer on the card path (copies, launch, copy back)
 // than the simulator was expected to need ends the offloading of that kernel. One bad launch is the most it can cost.

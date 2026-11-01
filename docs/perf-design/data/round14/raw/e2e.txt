@@ -1,0 +1,2 @@
+PASS: host_gpu: 23 launches ran on the card, 19 in the simulator (10 kernels not in the exact set, 2 too small, 1 unsupported launch shapes, 0 failed on the card)
+rc=0

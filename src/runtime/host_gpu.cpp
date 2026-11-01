@@ -151,11 +151,13 @@ struct Runtime::Impl : CardGate {
     bool ok = false;
     uint64_t instrs = 0;
     bool runnable = false;   // everything but the instruction scan passed: the card could run it
+    bool back_edge = false;  // the code has a loop (a branch to itself or an earlier instruction)
   };
   std::map<std::pair<const sass::Module*, std::string>, Verdict> eligible;
   std::mutex mu;
   uint64_t max_bytes = 2ull << 30;
   bool dead = false;
+  uint32_t multiprocessors = 0;   // of the simulated profile (and the card: start() checks they agree)
   // The card copy outlives a launch (docs/perf-design/09-host-gpu-spike.md section 4) unless VGPU_HOST_GPU_WRITE_THROUGH=1.
   bool resident = true;
   MemoryManager* gate_mem = nullptr;
@@ -165,6 +167,9 @@ struct Runtime::Impl : CardGate {
     std::atomic<uint32_t>* slot = nullptr;
   };
   std::map<uint64_t, Res> res;
+  // Scratch for the copies between the card and the simulator, kept across launches: a fresh 16 to 32 MiB vector per launch is an mmap, a zero fill and a
+  // page fault per page each time (4.7 s of system time in 1,400 launches of PolyBench LU, against 0.6 s with the write-through path).
+  std::vector<uint8_t> pull_buf, push_buf, sim_buf;
   bool verify_card_ran = false;   // verify + resident: this launch ran on the card and the simulator runs it next, on memory that is the truth
   struct Last {
     bool in_set = false;
@@ -176,6 +181,8 @@ struct Runtime::Impl : CardGate {
   // VGPU_HOST_GPU_STATIC=1: a kernel the simulator has not run is estimated from its code and grid. NOT a lower bound (threads that leave early
   // execute less: PolyBench 3DCONV was 38x slower with it), so it is an experiment switch, off by default.
   bool static_estimate = false;
+  // VGPU_HOST_GPU_NO_FIRST_LAUNCH=1: the first launch of a kernel is always the simulator's (the behaviour before the first-launch rule; for A/B runs).
+  bool first_launch_off = false;
   struct Pending {
     bool active = false, in_exact_set = false;
     std::string kernel;
@@ -198,7 +205,7 @@ struct Runtime::Impl : CardGate {
   void pull_chunks(Res& a, const std::vector<uint64_t>& idx) {
     if (idx.empty() || verify) return;
     api.cuCtxSetCurrent(ctx);
-    std::vector<uint8_t> buf;
+    std::vector<uint8_t>& buf = pull_buf;
     for (const auto& [first, count] : chunk_runs(idx)) {
       for (uint64_t c = first; c < first + count;) {
         const uint64_t n_chunks = std::min<uint64_t>(first + count - c, (32ull << 20) / kChunkSize);
@@ -292,6 +299,7 @@ struct Runtime::Impl : CardGate {
     const std::string lib = path;
     const int want_sm = profile.cc_major * 10 + profile.cc_minor;
     const uint32_t want_mp = profile.limits.multiprocessors;
+    multiprocessors = want_mp;
     std::thread([sh, self, lib, want_sm, want_mp, base] {
       bool ok = false;
       std::string why;
@@ -361,8 +369,9 @@ struct Runtime::Impl : CardGate {
   }
 
   bool kernel_eligible(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args,
-                       MemoryManager& mem, const char** why, uint64_t* instrs, bool* runnable) {
+                       MemoryManager& mem, const char** why, uint64_t* instrs, bool* runnable, bool* back_edge) {
     *runnable = false;
+    *back_edge = false;
     if (!fn.sass || fn.sass->image.empty()) { *why = "not a SASS module"; return false; }
     if (cfg.cooperative || cfg.cluster != std::array<uint32_t, 3>{0, 0, 0} || fn.req_cluster != std::array<uint32_t, 3>{0, 0, 0}) { *why = "cooperative or cluster launch"; return false; }
     if (cfg.textures) { *why = "texture objects"; return false; }
@@ -380,10 +389,12 @@ struct Runtime::Impl : CardGate {
       if (!it->second.ok) *why = "kernel code not in the exact set (cached)";
       *instrs = it->second.instrs;
       *runnable = it->second.runnable;
+      *back_edge = it->second.back_edge;
       return it->second.ok;
     }
     bool ok = true;
     uint64_t n_instrs = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> branches;
     if (!m.symbol_va.empty() || !m.cubin.externs.empty() || m.device_launches) { ok = false; *why = "module variables, device calls or device-side launches"; }
     const auto ci = m.code_index.find(".text." + fn.name);
     if (ok && ci == m.code_index.end()) { ok = false; *why = "no code section"; }
@@ -393,6 +404,9 @@ struct Runtime::Impl : CardGate {
       n_instrs = code.count;
       for (size_t i = 0; i < code.count && ok; ++i) {
         const sass::Instr& ins = code.instr(i);
+        if (ins.op == sass::Op::BRA)
+          for (const auto& o : ins.src)
+            if (o.kind == sass::Kind::Label) branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
         if (!exact_opcode_allowed(ins.mnemonic, ins.mods)) {
           ok = false;
           *why = "instruction outside the exact set";
@@ -400,9 +414,10 @@ struct Runtime::Impl : CardGate {
         }
       }
     }
-    eligible[key] = {ok, n_instrs, runnable_here};
+    eligible[key] = {ok, n_instrs, runnable_here, has_back_edge(branches)};
     *instrs = n_instrs;
     *runnable = runnable_here;
+    *back_edge = eligible[key].back_edge;
     return ok;
   }
 
@@ -464,6 +479,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
     }
     if (const char* v = std::getenv("VGPU_HOST_GPU_VERIFY"); v && *v && *v != '0') r->impl_->verify = std::string(v) == "all" ? 2 : 1;
     if (const char* v = std::getenv("VGPU_HOST_GPU_WRITE_THROUGH"); v && *v && *v != '0') r->impl_->resident = false;
+    if (const char* v = std::getenv("VGPU_HOST_GPU_NO_FIRST_LAUNCH"); v && *v && *v != '0') r->impl_->first_launch_off = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_STATIC"); v && *v && *v != '0') r->impl_->static_estimate = true;
     if (const char* mb = std::getenv("VGPU_HOST_GPU_MAX_MIB")) r->impl_->max_bytes = std::strtoull(mb, nullptr, 10) << 20;
     g_summary_impl = r->impl_;
@@ -541,8 +557,8 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
   im.pending = {};
   const char* why = "";
   uint64_t static_instrs = 0;
-  bool runnable = false;
-  const bool in_exact_set = im.kernel_eligible(fn, cfg, args, mem, &why, &static_instrs, &runnable);
+  bool runnable = false, back_edge = false;
+  const bool in_exact_set = im.kernel_eligible(fn, cfg, args, mem, &why, &static_instrs, &runnable, &back_edge);
   im.last.in_set = in_exact_set;
   if (!in_exact_set && !(im.verify == 2 && runnable)) {
     ++(std::string(why).find("exact set") != std::string::npos ? im.stats.refused_kernel : im.stats.refused_launch);
@@ -555,7 +571,18 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
   std::optional<double> sim_s = im.sim_times.predict(fn.name, blocks);
   if (!sim_s && im.static_estimate) sim_s = static_sim_seconds(blocks, cfg.block[0] * cfg.block[1] * cfg.block[2], static_instrs, im.costs);
   if (!sim_s && im.verify) sim_s = 0;   // verifying: every launch runs on both, whatever the rule would say
-  if (!sim_s) {   // the first launch of every kernel is the simulator's: it teaches the estimate (VGPU_HOST_GPU_STATIC=1 is the exception, and is not sound)
+  bool first_launch_rule = false;
+  if (!sim_s && !im.verify && im.sim_times.samples(fn.name) == 0 && im.card_kernel_s.count(fn.name) == 0 && !im.first_launch_off) {
+    // Nothing is known of this kernel: the conservative first-launch rule (host_gpu.hpp) may send this one launch to the card.
+    uint64_t live = 0;
+    for (const auto& r : mem.live_ranges()) live += r.second;
+    const FirstLaunch fl{blocks, cfg.block[0] * cfg.block[1] * cfg.block[2], static_instrs, back_edge, im.multiprocessors, live};
+    if (first_launch_offload(fl, im.costs)) {
+      sim_s = static_sim_seconds(blocks, fl.threads_per_block, static_instrs, im.costs);
+      first_launch_rule = true;
+    }
+  }
+  if (!sim_s) {   // the first launches of a kernel are the simulator's: they teach the estimate (VGPU_HOST_GPU_STATIC=1 is the exception, and is not sound)
     ++im.stats.simulated;
     return false;
   }
@@ -606,7 +633,7 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
     ++im.stats.simulated;
     return false;
   }
-  std::vector<uint8_t> buf;
+  std::vector<uint8_t>& buf = im.push_buf;
   bool card_only_data = false;   // chunks only the card holds, from earlier launches: lost if the card fails now
   if (im.resident) {
     for (auto& [b, a] : im.res) {
@@ -699,13 +726,14 @@ bool Runtime::try_launch(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, 
                    push_bytes / 1048576.0, total / 1048576.0, kTrafficLaunches);
     im.card_kernel_s[fn.name] = kernel_s;
     ++im.stats.offloaded;
+    if (first_launch_rule && logging()) std::fprintf(stderr, "host_gpu: %s: first launch decided by the static rule (loop, %llu blocks)\n", fn.name.c_str(), static_cast<unsigned long long>(blocks));
     if (logging())
       std::fprintf(stderr, "host_gpu: %s on the card (resident): kernel %.3f ms, total %.3f ms (sim estimate %.3f ms), %.2f MiB pushed\n", fn.name.c_str(), kernel_s * 1e3,
                    total_s * 1e3, e.sim_s * 1e3, push_bytes / 1048576.0);
     return true;
   }
   // Back into the simulator: only the 64 KiB chunks whose bytes differ.
-  std::vector<uint8_t> sim_bytes;
+  std::vector<uint8_t>& sim_bytes = im.sim_buf;
   for (const auto& [rb, rs] : ranges)
     for (uint64_t at = 0; at < rs;) {
       const uint64_t n = std::min<uint64_t>(rs - at, 32ull << 20);

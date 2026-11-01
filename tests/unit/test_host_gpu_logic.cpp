@@ -329,4 +329,81 @@ VTEST(static_estimate_scales_with_the_grid) {   // an estimate, not a bound: see
   VCHECK(!should_offload(e, c));
 }
 
+VTEST(back_edge_scan) {   // (pc, target) of every branch of a kernel
+  VCHECK(!has_back_edge({}));
+  VCHECK(!has_back_edge({{0x20, 0x80}, {0x40, 0x60}}));   // forward branches only: a bounds check
+  VCHECK(has_back_edge({{0x20, 0x80}, {0x90, 0x30}}));    // a loop's closing branch
+  VCHECK(has_back_edge({{0x40, 0x40}}));                  // a branch to itself: a spin
+  VCHECK(has_back_edge({{0x40, 0x0}}));
+}
+
+// A PolyBench gemm_kernel launch on an A10G (80 multiprocessors): a loop, 1,024 blocks of 256 threads, about 60 static instructions, three 4 MiB matrices.
+static FirstLaunch gemm_shape() {
+  FirstLaunch f;
+  f.blocks = 1024;
+  f.threads_per_block = 256;
+  f.static_instrs = 60;
+  f.back_edge = true;
+  f.multiprocessors = 80;
+  f.live_bytes = 12ull << 20;
+  return f;
+}
+
+VTEST(first_launch_takes_a_looping_kernel_on_a_full_grid) {
+  Costs c;
+  VCHECK(first_launch_offload(gemm_shape(), c));
+}
+
+VTEST(first_launch_refuses_a_kernel_without_a_loop) {   // 3DCONV: a stencil, threads leave at a bounds check; the static count was 38x off
+  Costs c;
+  FirstLaunch f = gemm_shape();
+  f.back_edge = false;
+  VCHECK(!first_launch_offload(f, c));
+}
+
+VTEST(first_launch_refuses_a_grid_that_does_not_fill_the_machine) {   // MVT: 16 blocks
+  Costs c;
+  FirstLaunch f = gemm_shape();
+  f.static_instrs = 4000;   // so large that the margin is never what refuses: only the grid is under test
+  VCHECK(first_launch_offload(f, c));
+  f.blocks = 16;
+  VCHECK(!first_launch_offload(f, c));
+  f.blocks = 8 * f.multiprocessors - 1;
+  VCHECK(!first_launch_offload(f, c));
+  f.blocks = 8 * f.multiprocessors;   // exactly 8 per multiprocessor is enough
+  VCHECK(first_launch_offload(f, c));
+  f.multiprocessors = 0;              // a profile that does not say
+  VCHECK(!first_launch_offload(f, c));
+}
+
+VTEST(first_launch_caps_what_a_mistaken_launch_may_move) {   // 3DCONV pushed 128 MiB per launch; the cap is 256 MiB of live memory
+  Costs c;
+  FirstLaunch f = gemm_shape();
+  f.static_instrs = 100000;               // so large that the margin is no obstacle
+  f.live_bytes = 256ull << 20;
+  VCHECK(first_launch_offload(f, c));
+  f.live_bytes = (256ull << 20) + 1;
+  VCHECK(!first_launch_offload(f, c));
+}
+
+VTEST(first_launch_needs_the_estimate_to_beat_the_card_path) {
+  Costs c;
+  FirstLaunch f = gemm_shape();
+  f.static_instrs = 2;                    // a few instructions per thread: the copies cost more than the simulator would
+  VCHECK(!first_launch_offload(f, c));
+  f.static_instrs = 60;
+  f.live_bytes = 200ull << 20;            // the same kernel on 200 MiB: 33 ms of copies against 5 ms of simulation
+  VCHECK(!first_launch_offload(f, c));
+}
+
+VTEST(sim_time_table_counts_samples) {
+  SimTimeTable t;
+  VCHECK(t.samples("k") == 0);
+  t.record("k", 4, 0.1);
+  VCHECK(t.samples("k") == 1 && !t.predict("k", 4));
+  t.record("k", 4, 0.1);
+  VCHECK(t.samples("k") == 2 && t.predict("k", 4));
+  VCHECK(t.samples("other") == 0);
+}
+
 VTEST_MAIN

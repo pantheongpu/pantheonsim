@@ -6133,4 +6133,37 @@ What the replay says about LU, which the plan did not expect: the ban is a net, 
 
 Tests (`tests/unit/test_host_gpu_logic.cpp`, CI-wired, 24/24 pass): `traffic_ban_constants_are_the_replayed_ones`, `..._fires_on_the_second_heavy_launch_in_a_row`, `..._needs_the_launches_in_a_row`, `..._ignores_a_chain_without_pushes_and_the_first_upload`, `..._spares_a_big_push_that_is_a_small_share`, `..._spares_a_small_push`, `..._spares_a_launch_the_card_path_wins_by_far`, `..._is_per_kernel`, `..._first_card_launch_counts_traffic_only`, `..._with_no_live_bytes_never_fires`. Mutants, each killed (cases failing): size floor `>=` (1), share `>=` (1), slow `>=` (1), share 26 (2), ban never fires (7), single launch (9), three launches (8), share ignored (1), size ignored (1), slow ignored (2), state not per kernel (1), no reset on a quiet launch (2), timing validity ignored (1) or inverted (2).
 
-Needs the card (not run here, no GPU): rerun `bench_resident.sh` on LU, GRAMSCHM, FDTD-2D, babelstream, base64e, JACOBI2D (reuse the 2026-10-29 off numbers); expect LU about 19.5 s (the ban fires late), GRAMSCHM unchanged, winners unchanged. Diagnose the unexplained 18% on LU with `VGPU_HOST_GPU_LOG=1` and `perf`: is it `card_void_lookups` taking a write lock per launch, the `BigReaderLock` epoch bump in `try_launch`, or the pull in `before_simulated`? The model fits the loss with a 1.5x per-byte factor on persistent transfers; the card should confirm where that factor lives. Also check on the card that the ban log line (`offloading it ends (traffic)`) appears for LU only.
+### Card results (AWS g5.xlarge, A10G, driver 595.112, 4 vCPU, `RelWithDebInfo`, `VGPU_THREADS=4`, 2026-11-01; raw: `docs/perf-design/data/round14/raw/`)
+
+The traffic ban alone did not fix LU, as the replay predicted (LU persistent 18.84 s, with the ban 17.81 s, write-through 13.59 s, off 37.74 s). The 18% was not the traffic: `perf` of the persistent run showed 4.7 s of SYSTEM time (0.4 s in write-through) and `pull_chunks` at 24% of the samples. `pull_chunks` and the push in `try_launch` each made a fresh `std::vector<uint8_t>` of up to 32 MiB per call: an mmap, a zero fill and a page fault per page, 1,400 times. The persistent path made one more of them per simulator launch than write-through did. They are now members of `Runtime::Impl` (`pull_buf`, `push_buf`, `sim_buf`) that keep their capacity. Bits cannot change (the same bytes are copied). Not the cause: `card_void_lookups`, the epoch bump (not visible in the profile).
+Tried and dropped: writing back only the pulled chunks that differ (as the write-through path does): LU 31 to 40 s, the read of an allocation that still has card chunks takes the slow path of `MemoryManager`. The hybrid write-through for alternating kernels was therefore not needed and not built.
+
+Wall seconds of the whole process (`bench_ban.sh`; A = the tree before this round, B = traffic ban + scratch buffers; off and write-through measured in the same session on A, two runs of each A and B where listed):
+| program | off | write-through | persistent A | persistent B |
+|---|---:|---:|---:|---:|
+| LU | 37.7 | 13.6 | 18.8, 18.9, 18.9, 17.7 | 11.5, 11.5, 11.5 (traffic ban fires once, at about launch 1,400 of 2,047) |
+| GRAMSCHM | 287.4 | 301.9 | 276.7, 277.6 | 278.3 |
+| FDTD-2D | 121.2 | 67.3 | 4.99, 4.95 | 4.74, 4.70 |
+| JACOBI2D | 0.71 | 0.48 | 0.37, 0.36 | 0.37, 0.36 |
+| babelstream | 465.1 | 367.6 | 13.66, 13.62 | 13.65 |
+| base64e | 346.7 | 52.6 | 11.90, 11.80, 11.78 | 8.67, 8.66 |
+LU is now 1.18x faster than write-through (it was 0.72x), 3.3x faster than the simulator. LU and GRAMSCHM are not worse than min(off, write-through) (GRAMSCHM is only 1.03x faster than off: the simulator launches dominate it, which neither mode changes), and the winners keep their gain (FDTD-2D 14x over write-through, babelstream 27x, base64e 6.1x, of which 1.36x is new). LU system time 4.73 s to 0.39 s. Write-through itself also gained (LU 15.05 s to 13.03 s with the new scratch buffers, one run each).
+Same bits: `verify_ban.sh` (`VGPU_HOST_GPU_VERIFY=1`, 150 s cap per program, so only the first launches are covered: LU 9, GRAMSCHM 9, FDTD-2D 8, JACOBI2D 40, base64e 6, GEMM 1 in the exact set; babelstream and SYRK reach none in the cap): `in_set_different=0` everywhere, nothing outside the set differed either. The output lines of every program that finishes in `bench_ban.sh` equal the mode-off ones, except the two HeCBench programs that print a bandwidth table (the filter does not drop its numbers; both print PASS). `e2e_host_gpu` on the card: PASS (23 launches on the card, 19 in the simulator).
+
+### The first-launch rule (`first_launch_offload`, `has_back_edge` in `include/vgpu/host_gpu.hpp`, used by `Runtime::try_launch`)
+A kernel with no history (no simulator sample, never on the card) goes to the card on its FIRST launch only when: it has a loop (a BRA to its own or an earlier instruction), the grid has at least 8 blocks per multiprocessor, the live bytes are at most 256 MiB, and the static estimate (`static_sim_seconds`) beats 2x the card path with the live bytes pushed and pulled. The safety nets stay (a later launch is the simulator's until its history exists, `offload_paid_off`, the traffic ban). `VGPU_HOST_GPU_NO_FIRST_LAUNCH=1` switches it off for A/B runs; `VGPU_HOST_GPU_STATIC=1` is untouched.
+`bench_first.sh`, median of 3 whole-process runs, the mode off, on without the rule, on with it:
+| program | off | no rule | rule | launches on the card with the rule |
+|---|---:|---:|---:|---|
+| GEMM | 1.15 | 1.44 | 0.66 | 1 of 1 |
+| SYRK | 8.30 | 8.71 | 1.29 | 1 of 1 |
+| SYR2K | 16.34 | 16.55 | 2.31 | 1 of 1 |
+| 3MM | 3.50 | 3.68 | 1.47 | 3 of 3 |
+| 2DCONV | 1.05 | 1.27 | 0.94 | 1 of 1 |
+| GEMVER | 0.92 | 1.20 | 0.84 | 1 of 3 |
+| 3DCONV | 0.86 | 1.11 | 1.11 | 0 of 254 (no loop) |
+| MVT | 2.13 | 2.21 | 2.21 | 0 of 2 (16 blocks) |
+| FDTD-2D | 122.7 | 4.86 | 4.77 | unchanged |
+SYRK keeps the whole static-switch gain (10.2 s to 1.3 s in the spike); all outputs equal the mode-off ones. 3DCONV is exactly as before the rule (1.11 against 1.11, 1.00x), but both are 1.29x of the mode off: that is the mode's fixed start-up cost (0.15 to 0.35 s per process when nothing is offloaded), which is a separate item and not a result of the rule. The rule only offloads kernels with loops on filled grids; a kernel whose loop exits early on most threads (data-dependent) is the case it cannot see, bounded by the 256 MiB cap and the later launches being the simulator's. `verify` runs skip the rule (every launch runs on both anyway), so the rule's own launches are checked by the output comparison only.
+Tests (`tests/unit/test_host_gpu_logic.cpp`, 31/31 pass on the rig): `back_edge_scan`, `first_launch_takes_a_looping_kernel_on_a_full_grid`, `..._refuses_a_kernel_without_a_loop`, `..._refuses_a_grid_that_does_not_fill_the_machine`, `..._caps_what_a_mistaken_launch_may_move`, `..._needs_the_estimate_to_beat_the_card_path`, `sim_time_table_counts_samples`. Mutants, each rebuilt and killed: back-edge requirement dropped (1 case fails), push cap dropped (1), cap 128 MiB (1), grid compare `<=` (1), 8 blocks per multiprocessor to 1 (1) or 16 (3), back edge `target < pc` (1), the estimate check dropped (1). The scratch buffers have no unit test (a performance change with the same bytes): `e2e_host_gpu` (card) and `verify_ban.sh` hold the bits.
+Cost: about 2.4 hours of one g5.xlarge on demand. Not done: `VERIFY=all` over the 64 programs, the MUFU.RCP check, card CI (items 3 and 4 of the plan).
