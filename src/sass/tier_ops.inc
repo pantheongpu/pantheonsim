@@ -867,13 +867,7 @@ inline void tier_get(uint32_t* v, const uint8_t* at, unsigned bytes) {   // v is
 // The lanes' global addresses: a register (a pair if `bhi`) and a uniform register plus an offset. A full warp is a counted loop.
 inline void tier_global_addresses(const uint32_t* blo, const uint32_t* bhi, uint64_t add, Mask ex, uint64_t* addrs) {
   if (ex == kAll) {
-    if (blo && bhi) {
-      for (unsigned l = 0; l < 32; ++l) addrs[l] = (blo[l] | (static_cast<uint64_t>(bhi[l]) << 32)) + add;
-    } else if (blo) {
-      for (unsigned l = 0; l < 32; ++l) addrs[l] = uint64_t{blo[l]} + add;
-    } else {
-      for (unsigned l = 0; l < 32; ++l) addrs[l] = add;
-    }
+    (void)exec::sassmem::full_warp_addresses(blo, bhi, add, kConstWindow, addrs);   // (two lanes to a vector; the window answer is not asked here)
     return;
   }
   for (unsigned l = 0; l < 32; ++l) addrs[l] = 0;   // (the lanes that do not run read as zero, as the counting functions find them)
@@ -1040,11 +1034,7 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
     if (nearest >= kWinEnd - kConstWindow) {   // (no lane in the constant window)
       bool done;
       if (Store) {
-        for (unsigned l = 0; l < 32; ++l) {
-          uint32_t v[2];
-          data(l, v);
-          fv[l] = bytes == 8 ? (static_cast<uint64_t>(v[1]) << 32 | v[0]) : bytes == 4 ? v[0] : (v[0] & ((1u << (8 * bytes)) - 1));
-        }
+        exec::sassmem::full_warp_store_values(dreg, bytes, fv);   // (the registers' rows widened four lanes to a vector)
         done = mem.store_batch(addrs, 32, bytes, fv);
       } else {
         done = mem.load_batch(addrs, 32, bytes, fv);
