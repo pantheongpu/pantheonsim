@@ -1198,7 +1198,9 @@ TIER_DUAL(h_carry)
     std::memcpy(&x, a + i, 32);
     std::memcpy(&y, b + i, 32);
     x = (y & m) | (x & ~m);
-    std::memcpy(r + i, &x, 32);
+    // (__builtin_memcpy: r is a local array, and with glibc's fortification a std::memcpy into it at a computed offset is a call to
+    // __memcpy_chk even at 32 bytes; this was 7% of the flat workload)
+    __builtin_memcpy(r + i, &x, 32);
   }
   uint32_t* d = R.vgpr[o.dst.index];
   if (full(ex, n)) copy_row(d, r, n);

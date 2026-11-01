@@ -1,3 +1,5 @@
+asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
+// (The line above puts this unit's code on a 4096-byte boundary: where it starts modulo a page no longer depends on the units linked ahead of it. docs/performance.md, Round sp14, combined.)
 #define VGPU_MEMORY_UNIT 1
 #include "vgpu/memory.hpp"
 
@@ -1548,30 +1550,40 @@ void MemoryManager::read(uint64_t src, void* dst, uint64_t len) const {
 }
 
 namespace {
+// The first `size` (1, 2, 4 or 8) bytes of a word, with the size a constant in each case: a memcpy of a size known only at run time
+// is a call into libc, and into the fortified __memcpy_chk when the other end is a local object (a call costs more than the copy).
+inline void word_to(uint8_t* d, uint64_t v, uint32_t size) {
+  switch (size) {
+    case 1: __builtin_memcpy(d, &v, 1); break;
+    case 2: __builtin_memcpy(d, &v, 2); break;
+    case 4: __builtin_memcpy(d, &v, 4); break;
+    default: __builtin_memcpy(d, &v, 8); break;
+  }
+}
+inline uint64_t word_from(const uint8_t* s, uint32_t size) {
+  uint64_t v = 0;
+  switch (size) {
+    case 1: __builtin_memcpy(&v, s, 1); break;
+    case 2: __builtin_memcpy(&v, s, 2); break;
+    case 4: __builtin_memcpy(&v, s, 4); break;
+    default: __builtin_memcpy(&v, s, 8); break;
+  }
+  return v;
+}
 // A run's bytes between chunk memory and a buffer, as relaxed atomics: an
 // element (`unit` bytes, aligned) at a time up to an 8-byte boundary, whole
 // words -- which never split an aligned element -- and elements again.
 void run_out(const uint8_t* c, uint8_t* d, uint64_t n, uint32_t unit) {
   uint64_t i = 0;
-  for (; i < n && reinterpret_cast<uintptr_t>(c + i) % 8; i += unit) {
-    const uint64_t v = load_at(c + i, unit);
-    std::memcpy(d + i, &v, unit);
-  }
+  for (; i < n && reinterpret_cast<uintptr_t>(c + i) % 8; i += unit) word_to(d + i, load_at(c + i, unit), unit);
   for (; i + 8 <= n; i += 8) {
     const uint64_t v = relaxed_load<uint64_t>(c + i);
-    std::memcpy(d + i, &v, 8);
+    __builtin_memcpy(d + i, &v, 8);
   }
-  for (; i < n; i += unit) {
-    const uint64_t v = load_at(c + i, unit);
-    std::memcpy(d + i, &v, unit);
-  }
+  for (; i < n; i += unit) word_to(d + i, load_at(c + i, unit), unit);
 }
 void run_in(uint8_t* c, const uint8_t* s, uint64_t n, uint32_t unit) {
-  auto one = [&](uint64_t i, uint32_t size) {
-    uint64_t v = 0;
-    std::memcpy(&v, s + i, size);
-    store_at(c + i, size, v);
-  };
+  auto one = [&](uint64_t i, uint32_t size) { store_at(c + i, size, word_from(s + i, size)); };
   uint64_t i = 0;
   for (; i < n && reinterpret_cast<uintptr_t>(c + i) % 8; i += unit) one(i, unit);
   for (; i + 8 <= n; i += 8) one(i, 8);
@@ -2022,6 +2034,20 @@ bool MemoryManager::atomic_rmw_fn(uint64_t addr, uint32_t size, RmwFn compute, v
   RmwSlot s;
   if (!rmw_locate(addr, size, &s)) return false;
   atomic_rmw_slot(s, size, compute, ctx, old_out, always_store);
+  return true;
+}
+
+bool MemoryManager::atomic_word_ptrs(const uint64_t* addrs, size_t count, uint32_t size, uint8_t** out) const {
+  if (count == 0 || (size != 4 && size != 8)) return false;
+  if (access_faults_armed()) return false;
+  const Allocation* a = nullptr;
+  uint64_t base = 0;
+  if (!batch_ok(addrs, count, size, /*store=*/true, &a, &base)) return false;
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t off = addrs[i] - base;
+    uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+    out[i] = chunk && !is_uniform(chunk) ? chunk + off % kChunkSize : nullptr;
+  }
   return true;
 }
 

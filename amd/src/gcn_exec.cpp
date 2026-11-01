@@ -35,6 +35,7 @@
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
 #include "mfma_math.hpp"
+#include "gcn_matrix_kernels.hpp"
 #include "tile_buf.hpp"
 #include "nan_order.hpp"
 #ifndef SPARSE_ORDER
@@ -11183,7 +11184,7 @@ struct Machine {
   template <char T, bool Run = false>
   void matrix_decode_wide(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst, uint32_t lanes = kLanes) {
 #if defined(__x86_64__) && defined(__GNUC__)
-    if (decode_avx2_f16c()) return matrix_decode_wide_avx2<T, Run>(src, dest, step, per_lane, dst, lanes);
+    if (decode_avx2_f16c()) return matrix_decode_wide_avx2<T, Run>(src.rows, dest, step, per_lane, dst, lanes);
 #endif
 #if defined(__SSE2__)
     for (uint32_t e = 0; e < per_lane; ++e) {
@@ -11224,76 +11225,10 @@ struct Machine {
 #endif
   }
 #if defined(__x86_64__) && defined(__GNUC__)
-  // matrix_decode_wide, eight lanes to an instruction: the binary16 values by F16C (exact, a signalling NaN made quiet as
-  // half_bits_to_double makes it), the others a shift or a mask and the float to double conversion. The same doubles, to the same places.
+  // matrix_decode_wide, eight lanes to an instruction (matrix_decode_wide_avx2, gcn_matrix_kernels.cpp).
   static bool decode_avx2_f16c() {
     static const bool have = mfma_have_avx2() && __builtin_cpu_supports("f16c");
     return have;
-  }
-  template <char T, bool Run>
-  __attribute__((target("avx2,f16c"), optimize("align-loops=64"))) void matrix_decode_wide_avx2(const MatrixSrc& src, const uint32_t* dest, uint32_t step, uint32_t per_lane, double* dst, uint32_t lanes) {
-    // Element e of lanes l to l + 7, as two vectors of four doubles.
-    const auto convert = [&](uint32_t e, uint32_t l, __m256d* lo, __m256d* hi) __attribute__((target("avx2,f16c"), always_inline)) {
-      constexpr bool packed = T == 'h' || T == 'b';   // two to a register
-      const int shift = packed ? 16 * static_cast<int>(e % 2) : 0;
-      const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src.rows[packed ? e / 2 : e] + l));
-      __m256 f;
-      if constexpr (T == 'h') {
-        half8_to_double(shift ? _mm256_srli_epi32(raw, 16) : _mm256_and_si256(raw, _mm256_set1_epi32(0xFFFF)), lo, hi);
-        return;
-      } else if constexpr (T == 'b') {
-        f = _mm256_castsi256_ps(shift ? _mm256_and_si256(raw, _mm256_set1_epi32(static_cast<int>(0xFFFF0000u))) : _mm256_slli_epi32(raw, 16));
-      } else if constexpr (T == 'F') {   // xf32: the mantissa cut to ten bits, except an infinity or a NaN
-        const __m256i special = _mm256_cmpeq_epi32(_mm256_and_si256(raw, _mm256_set1_epi32(0x7F800000)), _mm256_set1_epi32(0x7F800000));
-        f = _mm256_castsi256_ps(_mm256_blendv_epi8(_mm256_and_si256(raw, _mm256_set1_epi32(~0x1FFF)), raw, special));
-      } else {
-        f = _mm256_castsi256_ps(raw);
-      }
-      *lo = _mm256_cvtps_pd(_mm256_castps256_ps128(f)), *hi = _mm256_cvtps_pd(_mm256_extractf128_ps(f, 1));
-    };
-    if constexpr (!Run) {
-      if (step == 1 && per_lane % 4 == 0) {
-        // A: a lane's run of K is consecutive in its row of the tile, so four elements of four lanes are a 4x4 transpose and a 32-byte
-        // store a lane.
-        for (uint32_t l = 0; l < lanes; l += 8)
-          for (uint32_t e = 0; e < per_lane; e += 4) {
-            __m256d lo[4], hi[4];
-            for (uint32_t q = 0; q < 4; ++q) convert(e + q, l, &lo[q], &hi[q]);
-            const auto transpose = [&](const __m256d* r, uint32_t first) __attribute__((target("avx2,f16c"), always_inline)) {
-              const __m256d t0 = _mm256_unpacklo_pd(r[0], r[1]), t1 = _mm256_unpackhi_pd(r[0], r[1]);
-              const __m256d t2 = _mm256_unpacklo_pd(r[2], r[3]), t3 = _mm256_unpackhi_pd(r[2], r[3]);
-              _mm256_storeu_pd(dst + dest[first] + e, _mm256_permute2f128_pd(t0, t2, 0x20));
-              _mm256_storeu_pd(dst + dest[first + 1] + e, _mm256_permute2f128_pd(t1, t3, 0x20));
-              _mm256_storeu_pd(dst + dest[first + 2] + e, _mm256_permute2f128_pd(t0, t2, 0x31));
-              _mm256_storeu_pd(dst + dest[first + 3] + e, _mm256_permute2f128_pd(t1, t3, 0x31));
-            };
-            transpose(lo, l);
-            transpose(hi, l + 4);
-          }
-        return;
-      }
-    }
-    for (uint32_t e = 0; e < per_lane; ++e) {
-      const size_t off = size_t{e} * step;
-      for (uint32_t l = 0; l < lanes; l += 8) {
-        __m256d lo, hi;
-        convert(e, l, &lo, &hi);
-        if constexpr (Run) {
-          _mm256_storeu_pd(dst + dest[l] + off, lo);
-          _mm256_storeu_pd(dst + dest[l + 4] + off, hi);   // (four lanes' columns are consecutive, not always the next four's)
-        } else {
-          const __m128d d0 = _mm256_castpd256_pd128(lo), d1 = _mm256_extractf128_pd(lo, 1), d2 = _mm256_castpd256_pd128(hi), d3 = _mm256_extractf128_pd(hi, 1);
-          _mm_storel_pd(dst + dest[l] + off, d0);
-          _mm_storeh_pd(dst + dest[l + 1] + off, d0);
-          _mm_storel_pd(dst + dest[l + 2] + off, d1);
-          _mm_storeh_pd(dst + dest[l + 3] + off, d1);
-          _mm_storel_pd(dst + dest[l + 4] + off, d2);
-          _mm_storeh_pd(dst + dest[l + 5] + off, d2);
-          _mm_storel_pd(dst + dest[l + 6] + off, d3);
-          _mm_storeh_pd(dst + dest[l + 7] + off, d3);
-        }
-      }
-    }
   }
 #endif
   template <typename F>

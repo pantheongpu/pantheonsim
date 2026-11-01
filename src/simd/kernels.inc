@@ -12,6 +12,8 @@
 // VGPU_LANES_ONLY (1 in the JIT's generated code, src/sass/jit.cpp, which includes this same text): leaves out the kernels the
 // SASS ALU forms do not use (the half conversions, HMMA, binary64, the half-precision fused forms), which need the simulator's headers.
 
+// Copies here are __builtin_memcpy, not std::memcpy: with glibc's fortification (Ubuntu's default) a copy to a computed address of a local array
+// becomes a call to __memcpy_chk even at a fixed size of 16 or 32 bytes (about 25 cycles a call; hmma_k made 9 of them per warp instruction).
 namespace VGPU_SIMD_NS {
 
 typedef float V8f __attribute__((vector_size(32)));
@@ -68,17 +70,17 @@ inline void operands_to_f32(unsigned kind, const uint32_t* w, float* out, size_t
   } else if (kind == 1) {
     for (size_t i = 0; i < 2 * n_words; i += 8) {
       V8h h;
-      std::memcpy(&h, reinterpret_cast<const char*>(w) + 2 * i, sizeof h);
+      __builtin_memcpy(&h, reinterpret_cast<const char*>(w) + 2 * i, sizeof h);
       const V8u u = __builtin_convertvector(h, V8u) << 16;
-      std::memcpy(out + i, &u, sizeof u);
+      __builtin_memcpy(out + i, &u, sizeof u);
     }
   } else {
     // tf32: the top 19 bits of an f32; the rest are ignored.
     for (size_t i = 0; i < n_words; i += 4) {
       V4u u;
-      std::memcpy(&u, w + i, sizeof u);
+      __builtin_memcpy(&u, w + i, sizeof u);
       u &= 0xffffe000u;
-      std::memcpy(out + i, &u, sizeof u);
+      __builtin_memcpy(out + i, &u, sizeof u);
     }
   }
 }
@@ -127,12 +129,12 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
   if (L == 8) {
     for (unsigned r = 0; r < a_regs; ++r)
       for (unsigned g = 0; g < 8; ++g)
-        std::memcpy(&A[(g + 8 * (r & 1)) * K + (r >> 1) * 8], &FA[r * 64 + g * 8], 8 * sizeof(float));
+        __builtin_memcpy(&A[(g + 8 * (r & 1)) * K + (r >> 1) * 8], &FA[r * 64 + g * 8], 8 * sizeof(float));
     for (unsigned r = 0; r < b_regs; ++r) transpose8x8(&Bm[r * 64], &FB[r * 64]);
   } else {
     for (unsigned r = 0; r < a_regs; ++r)
       for (unsigned g = 0; g < 8; ++g)
-        std::memcpy(&A[(g + 8 * (r & 1)) * K + (r >> 1) * L], &FA[r * 32 + g * L], L * sizeof(float));
+        __builtin_memcpy(&A[(g + 8 * (r & 1)) * K + (r >> 1) * L], &FA[r * 32 + g * L], L * sizeof(float));
     for (unsigned r = 0; r < b_regs; ++r)
       for (unsigned g = 0; g < 8; ++g)
         for (unsigned j = 0; j < L; ++j) Bm[(r * L + j) * 8 + g] = FB[r * 32 + g * L + j];
@@ -147,11 +149,11 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
     for (unsigned h = 0; h < 2; ++h)
       for (unsigned g = 0; g < 8; ++g) {
         V4u x, y;
-        std::memcpy(&x, c + (2 * h) * 32 + 4 * g, sizeof x);
-        std::memcpy(&y, c + (2 * h + 1) * 32 + 4 * g, sizeof y);
+        __builtin_memcpy(&x, c + (2 * h) * 32 + 4 * g, sizeof x);
+        __builtin_memcpy(&y, c + (2 * h + 1) * 32 + 4 * g, sizeof y);
         const V4u lo = __builtin_shuffle(x, y, (V4i){0, 4, 1, 5}), hi = __builtin_shuffle(x, y, (V4i){2, 6, 3, 7});
-        std::memcpy(&Cm[(g + 8 * h) * 8], &lo, sizeof lo);
-        std::memcpy(&Cm[(g + 8 * h) * 8 + 4], &hi, sizeof hi);
+        __builtin_memcpy(&Cm[(g + 8 * h) * 8], &lo, sizeof lo);
+        __builtin_memcpy(&Cm[(g + 8 * h) * 8 + 4], &hi, sizeof hi);
       }
   }
   if (ampere) {
@@ -160,13 +162,13 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
   } else
   for (unsigned i0 = 0; i0 < 16; i0 += 4) {
     V8f acc0, acc1, acc2, acc3;
-    std::memcpy(&acc0, &Cm[(i0 + 0) * 8], sizeof acc0);
-    std::memcpy(&acc1, &Cm[(i0 + 1) * 8], sizeof acc1);
-    std::memcpy(&acc2, &Cm[(i0 + 2) * 8], sizeof acc2);
-    std::memcpy(&acc3, &Cm[(i0 + 3) * 8], sizeof acc3);
+    __builtin_memcpy(&acc0, &Cm[(i0 + 0) * 8], sizeof acc0);
+    __builtin_memcpy(&acc1, &Cm[(i0 + 1) * 8], sizeof acc1);
+    __builtin_memcpy(&acc2, &Cm[(i0 + 2) * 8], sizeof acc2);
+    __builtin_memcpy(&acc3, &Cm[(i0 + 3) * 8], sizeof acc3);
     for (unsigned k = 0; k < K; ++k) {
       V8f bv;
-      std::memcpy(&bv, &Bm[k * 8], sizeof bv);
+      __builtin_memcpy(&bv, &Bm[k * 8], sizeof bv);
       const V8f p0 = A[(i0 + 0) * K + k] * bv, p1 = A[(i0 + 1) * K + k] * bv, p2 = A[(i0 + 2) * K + k] * bv,
                 p3 = A[(i0 + 3) * K + k] * bv;
       acc0 = acc0 + p0;
@@ -174,32 +176,32 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
       acc2 = acc2 + p2;
       acc3 = acc3 + p3;
     }
-    std::memcpy(&Dm[(i0 + 0) * 8], &acc0, sizeof acc0);
-    std::memcpy(&Dm[(i0 + 1) * 8], &acc1, sizeof acc1);
-    std::memcpy(&Dm[(i0 + 2) * 8], &acc2, sizeof acc2);
-    std::memcpy(&Dm[(i0 + 3) * 8], &acc3, sizeof acc3);
+    __builtin_memcpy(&Dm[(i0 + 0) * 8], &acc0, sizeof acc0);
+    __builtin_memcpy(&Dm[(i0 + 1) * 8], &acc1, sizeof acc1);
+    __builtin_memcpy(&Dm[(i0 + 2) * 8], &acc2, sizeof acc2);
+    __builtin_memcpy(&Dm[(i0 + 3) * 8], &acc3, sizeof acc3);
   }
   if (!acc_f16) {
     for (unsigned h = 0; h < 2; ++h)
       for (unsigned g = 0; g < 8; ++g) {
         V4f lo, hi;
-        std::memcpy(&lo, &Dm[(g + 8 * h) * 8], sizeof lo);
-        std::memcpy(&hi, &Dm[(g + 8 * h) * 8 + 4], sizeof hi);
+        __builtin_memcpy(&lo, &Dm[(g + 8 * h) * 8], sizeof lo);
+        __builtin_memcpy(&hi, &Dm[(g + 8 * h) * 8 + 4], sizeof hi);
         const V4f e = __builtin_shuffle(lo, hi, (V4i){0, 2, 4, 6}), o = __builtin_shuffle(lo, hi, (V4i){1, 3, 5, 7});
         // A NaN result is the canonical 0x7fffffff.
         const V4u me = e != e, mo = o != o;
         V4u ue = reinterpret_cast<V4u>(e), uo = reinterpret_cast<V4u>(o);
         ue = (ue & ~me) | (0x7fffffffu & me);
         uo = (uo & ~mo) | (0x7fffffffu & mo);
-        std::memcpy(out + (2 * h) * 32 + 4 * g, &ue, sizeof ue);
-        std::memcpy(out + (2 * h + 1) * 32 + 4 * g, &uo, sizeof uo);
+        __builtin_memcpy(out + (2 * h) * 32 + 4 * g, &ue, sizeof ue);
+        __builtin_memcpy(out + (2 * h + 1) * 32 + 4 * g, &uo, sizeof uo);
       }
   } else {
     uint16_t hh[128];   // in memory order, as C was
     f32_to_f16_blocks(Dm, hh, 128);
     for (unsigned i = 0; i < 128; ++i)
       if (Dm[i] != Dm[i]) hh[i] = 0x7fff;   // the canonical NaN, whatever the payload
-    std::memcpy(out, hh, sizeof hh);
+    __builtin_memcpy(out, hh, sizeof hh);
   }
 }
 
@@ -214,22 +216,22 @@ void hmma_k(unsigned kind, unsigned K, bool acc_f16, const uint32_t* a, const ui
 VGPU_KN void iadd3_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint32_t add) {
   for (unsigned i = 0; i < 32; i += 8) {
     V8u x, y, z;
-    std::memcpy(&x, a + i, sizeof x);
-    std::memcpy(&y, b + i, sizeof y);
-    std::memcpy(&z, c + i, sizeof z);
+    __builtin_memcpy(&x, a + i, sizeof x);
+    __builtin_memcpy(&y, b + i, sizeof y);
+    __builtin_memcpy(&z, c + i, sizeof z);
     const V8u v = x + y + z + add;
-    std::memcpy(r + i, &v, sizeof v);
+    __builtin_memcpy(r + i, &v, sizeof v);
   }
 }
 
 VGPU_KN void imad_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c) {
   for (unsigned i = 0; i < 32; i += 8) {
     V8u x, y, z;
-    std::memcpy(&x, a + i, sizeof x);
-    std::memcpy(&y, b + i, sizeof y);
-    std::memcpy(&z, c + i, sizeof z);
+    __builtin_memcpy(&x, a + i, sizeof x);
+    __builtin_memcpy(&y, b + i, sizeof y);
+    __builtin_memcpy(&z, c + i, sizeof z);
     const V8u v = x * y + z;
-    std::memcpy(r + i, &v, sizeof v);
+    __builtin_memcpy(r + i, &v, sizeof v);
   }
 }
 
@@ -238,11 +240,11 @@ VGPU_KN void imad_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uin
   do {                                                \
     for (unsigned i = 0; i < 32; i += 8) {            \
       V8u x, y, z;                                    \
-      std::memcpy(&x, a + i, sizeof x);               \
-      std::memcpy(&y, b + i, sizeof y);               \
-      std::memcpy(&z, c + i, sizeof z);               \
+      __builtin_memcpy(&x, a + i, sizeof x);               \
+      __builtin_memcpy(&y, b + i, sizeof y);               \
+      __builtin_memcpy(&z, c + i, sizeof z);               \
       const V8u v = (EXPR);                           \
-      std::memcpy(r + i, &v, sizeof v);               \
+      __builtin_memcpy(r + i, &v, sizeof v);               \
     }                                                 \
     return;                                           \
   } while (0)
@@ -285,25 +287,25 @@ VGPU_KN void lop3_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uin
     }
   for (unsigned i = 0; i < 32; i += 8) {
     V8u x, y, z, v = {};
-    std::memcpy(&x, a + i, sizeof x);
-    std::memcpy(&y, b + i, sizeof y);
-    std::memcpy(&z, c + i, sizeof z);
+    __builtin_memcpy(&x, a + i, sizeof x);
+    __builtin_memcpy(&y, b + i, sizeof y);
+    __builtin_memcpy(&z, c + i, sizeof z);
     for (unsigned m = 0; m < n; ++m) v |= (x ^ ma[m]) & (y ^ mb[m]) & (z ^ mc[m]);
-    std::memcpy(r + i, &v, sizeof v);
+    __builtin_memcpy(r + i, &v, sizeof v);
   }
 }
 
 VGPU_KN void ffma_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c) {
   for (unsigned i = 0; i < 32; i += 8) {
     V8f x, y, z;
-    std::memcpy(&x, a + i, sizeof x);
-    std::memcpy(&y, b + i, sizeof y);
-    std::memcpy(&z, c + i, sizeof z);
+    __builtin_memcpy(&x, a + i, sizeof x);
+    __builtin_memcpy(&y, b + i, sizeof y);
+    __builtin_memcpy(&z, c + i, sizeof z);
 #if VGPU_SIMD_AVX2
     const V8f v = reinterpret_cast<V8f>(_mm256_fmadd_ps(reinterpret_cast<__m256>(x), reinterpret_cast<__m256>(y),
                                                          reinterpret_cast<__m256>(z)));
     const V8u u = VGPU_CANON_NAN(v);
-    std::memcpy(r + i, &u, sizeof u);
+    __builtin_memcpy(r + i, &u, sizeof u);
 #else
     // No FMA unit to ask for: the correctly rounded fused multiply-add, one libm call a lane.
     for (unsigned l = 0; l < 8; ++l) {
@@ -317,20 +319,20 @@ VGPU_KN void ffma_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const uin
 VGPU_KN void fadd_k(uint32_t* r, const uint32_t* a, const uint32_t* b) {
   for (unsigned i = 0; i < 32; i += 8) {
     V8f x, y;
-    std::memcpy(&x, a + i, sizeof x);
-    std::memcpy(&y, b + i, sizeof y);
+    __builtin_memcpy(&x, a + i, sizeof x);
+    __builtin_memcpy(&y, b + i, sizeof y);
     const V8u u = VGPU_CANON_NAN(x + y);
-    std::memcpy(r + i, &u, sizeof u);
+    __builtin_memcpy(r + i, &u, sizeof u);
   }
 }
 
 VGPU_KN void fmul_k(uint32_t* r, const uint32_t* a, const uint32_t* b) {
   for (unsigned i = 0; i < 32; i += 8) {
     V8f x, y;
-    std::memcpy(&x, a + i, sizeof x);
-    std::memcpy(&y, b + i, sizeof y);
+    __builtin_memcpy(&x, a + i, sizeof x);
+    __builtin_memcpy(&y, b + i, sizeof y);
     const V8u u = VGPU_CANON_NAN(x * y);
-    std::memcpy(r + i, &u, sizeof u);
+    __builtin_memcpy(r + i, &u, sizeof u);
   }
 }
 
@@ -343,8 +345,8 @@ VGPU_KA inline void store_masked(uint32_t* d, const uint32_t* r, uint64_t mask, 
   if ((mask & all) == all) {
     for (unsigned i = 0; i < n; i += 8) {   // (not memcpy(d, r, n * 4): a call into libc for a size not known here)
       V8u v;
-      std::memcpy(&v, r + i, sizeof v);
-      std::memcpy(d + i, &v, sizeof v);
+      __builtin_memcpy(&v, r + i, sizeof v);
+      __builtin_memcpy(d + i, &v, sizeof v);
     }
     return;
   }
@@ -354,10 +356,10 @@ VGPU_KA inline void store_masked(uint32_t* d, const uint32_t* r, uint64_t mask, 
     const V8u pick = {1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u};
     const V8u sel = reinterpret_cast<V8u>((pick & bits) != 0);
     V8u old, v;
-    std::memcpy(&old, d + i, sizeof old);
-    std::memcpy(&v, r + i, sizeof v);
+    __builtin_memcpy(&old, d + i, sizeof old);
+    __builtin_memcpy(&v, r + i, sizeof v);
     old = (old & ~sel) | (v & sel);
-    std::memcpy(d + i, &old, sizeof old);
+    __builtin_memcpy(d + i, &old, sizeof old);
   }
 }
 
@@ -384,8 +386,8 @@ typedef int32_t V8i __attribute__((vector_size(32)));
 #if defined(__SSE2__)
 #define VGPU_MASK_BITS(m)                                                                                  \
   ({ __m128i lo_, hi_;                                                                                       \
-     std::memcpy(&lo_, reinterpret_cast<const char*>(&(m)), 16);                                             \
-     std::memcpy(&hi_, reinterpret_cast<const char*>(&(m)) + 16, 16);                                        \
+     __builtin_memcpy(&lo_, reinterpret_cast<const char*>(&(m)), 16);                                             \
+     __builtin_memcpy(&hi_, reinterpret_cast<const char*>(&(m)) + 16, 16);                                        \
      static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(lo_)) | (_mm_movemask_ps(_mm_castsi128_ps(hi_)) << 4)); })
 #else
 #define VGPU_MASK_BITS(m)                                                           \
@@ -409,8 +411,8 @@ VGPU_KA inline uint64_t icmp_t(const uint32_t* a, const uint32_t* b, unsigned n)
 #endif
   for (unsigned i = 0; i < n; i += 8) {
     V8u x, y;
-    std::memcpy(&x, a + i, sizeof x);
-    std::memcpy(&y, b + i, sizeof y);
+    __builtin_memcpy(&x, a + i, sizeof x);
+    __builtin_memcpy(&y, b + i, sizeof y);
     V8u m;
     if constexpr (Sgn) {
       const V8i xs = reinterpret_cast<V8i>(x), ys = reinterpret_cast<V8i>(y);
@@ -452,8 +454,8 @@ template <unsigned Op, bool Sgn>
 inline void ibin_t(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned n) {
   for (unsigned i = 0; i < n; i += 8) {
     V8u x, y;
-    std::memcpy(&x, a + i, sizeof x);
-    std::memcpy(&y, b + i, sizeof y);
+    __builtin_memcpy(&x, a + i, sizeof x);
+    __builtin_memcpy(&y, b + i, sizeof y);
     V8u v;
     const V8i xs = reinterpret_cast<V8i>(x), ys = reinterpret_cast<V8i>(y);
     if constexpr (Op == 0) v = x + y;
@@ -479,7 +481,7 @@ inline void ibin_t(uint32_t* r, const uint32_t* a, const uint32_t* b, unsigned n
         v = (x >> (y & 31u)) & reinterpret_cast<V8u>(y < 32u);
       }
     }
-    std::memcpy(r + i, &v, sizeof v);
+    __builtin_memcpy(r + i, &v, sizeof v);
   }
 }
 
@@ -825,23 +827,23 @@ void lane_unary_k(unsigned kind, uint32_t* r, const uint32_t* a) {
   if (kind == 0) {
     for (unsigned i = 0; i < 32; i += 8) {
       V8u x;
-      std::memcpy(&x, a + i, sizeof x);
+      __builtin_memcpy(&x, a + i, sizeof x);
       x = x - ((x >> 1) & 0x55555555u);
       x = (x & 0x33333333u) + ((x >> 2) & 0x33333333u);
       x = (x + (x >> 4)) & 0x0f0f0f0fu;
       x = (x * 0x01010101u) >> 24;
-      std::memcpy(r + i, &x, sizeof x);
+      __builtin_memcpy(r + i, &x, sizeof x);
     }
   } else if (kind == 1) {
     for (unsigned i = 0; i < 32; i += 8) {
       V8u x;
-      std::memcpy(&x, a + i, sizeof x);
+      __builtin_memcpy(&x, a + i, sizeof x);
       x = ((x >> 1) & 0x55555555u) | ((x & 0x55555555u) << 1);
       x = ((x >> 2) & 0x33333333u) | ((x & 0x33333333u) << 2);
       x = ((x >> 4) & 0x0f0f0f0fu) | ((x & 0x0f0f0f0fu) << 4);
       x = ((x >> 8) & 0x00ff00ffu) | ((x & 0x00ff00ffu) << 8);
       x = (x >> 16) | (x << 16);
-      std::memcpy(r + i, &x, sizeof x);
+      __builtin_memcpy(r + i, &x, sizeof x);
     }
   } else {
     const bool sgn = ((kind - 2) & 1) != 0, sh = ((kind - 2) & 2) != 0;
@@ -1322,7 +1324,7 @@ void f64_to_f16_canon_k(const double* in, uint16_t* out, size_t n) {
   for (; i + 4 <= n; i += 4) {
     const __m128i h = f64x4_to_f16x4(_mm256_loadu_pd(in + i));
     const uint64_t w = static_cast<uint64_t>(_mm_cvtsi128_si64(h));
-    std::memcpy(out + i, &w, sizeof w);
+    __builtin_memcpy(out + i, &w, sizeof w);
   }
 #endif
   for (; i < n; ++i) out[i] = in[i] != in[i] ? uint16_t{0x7fff} : f64_to_f16_bits(in[i]);
@@ -1381,12 +1383,12 @@ void hfma2_bf_m_k(uint32_t* d, const uint32_t* a, const uint32_t* b, const uint3
       // changes the ABI (GCC's -Wpsabi, an error under -Werror).
       const auto wide = [&](const uint32_t* p, double* out) {
         V8h h;
-        std::memcpy(&h, p + i, sizeof h);
+        __builtin_memcpy(&h, p + i, sizeof h);
         const V8u u = __builtin_convertvector(h, V8u) << 16;
         V4u q;
-        std::memcpy(&q, reinterpret_cast<const char*>(&u) + 16 * part, sizeof q);
+        __builtin_memcpy(&q, reinterpret_cast<const char*>(&u) + 16 * part, sizeof q);
         const V4d v = __builtin_convertvector(reinterpret_cast<V4f>(q), V4d);
-        std::memcpy(out, &v, sizeof v);
+        __builtin_memcpy(out, &v, sizeof v);
       };
       alignas(32) double x[4], y[4], z[4];
       wide(a, x);
@@ -1413,12 +1415,12 @@ inline void tile_f32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, con
   V8f acc[R][V];
   for (unsigned r = 0; r < R; ++r)
     for (unsigned v = 0; v < V; ++v) {
-      if (C) std::memcpy(&acc[r][v], C + size_t{i0 + r} * ldc + j0 + 8 * v, sizeof(V8f));
+      if (C) __builtin_memcpy(&acc[r][v], C + size_t{i0 + r} * ldc + j0 + 8 * v, sizeof(V8f));
       else acc[r][v] = V8f{};
     }
   for (unsigned k = 0; k < K; ++k) {
     V8f b[V];
-    for (unsigned v = 0; v < V; ++v) std::memcpy(&b[v], B + size_t{k} * N + j0 + 8 * v, sizeof(V8f));
+    for (unsigned v = 0; v < V; ++v) __builtin_memcpy(&b[v], B + size_t{k} * N + j0 + 8 * v, sizeof(V8f));
     for (unsigned r = 0; r < R; ++r) {
       const float a = A[size_t{i0 + r} * K + k];
       for (unsigned v = 0; v < V; ++v) {
@@ -1434,7 +1436,7 @@ inline void tile_f32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, con
         const V8u nan = reinterpret_cast<V8u>(acc[r][v] != acc[r][v]);
         acc[r][v] = reinterpret_cast<V8f>((reinterpret_cast<V8u>(acc[r][v]) & ~nan) | (0x7fffffffu & nan));
       }
-      std::memcpy(D + size_t{i0 + r} * ldd + j0 + 8 * v, &acc[r][v], sizeof(V8f));
+      __builtin_memcpy(D + size_t{i0 + r} * ldd + j0 + 8 * v, &acc[r][v], sizeof(V8f));
     }
 }
 
@@ -1469,13 +1471,13 @@ inline void tile_i32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, con
                            unsigned block, bool sat, int32_t* D, size_t ldd) {
   V8u acc[R];
   for (unsigned r = 0; r < R; ++r) {
-    if (C) std::memcpy(&acc[r], C + size_t{i0 + r} * ldc + j0, sizeof(V8u));
+    if (C) __builtin_memcpy(&acc[r], C + size_t{i0 + r} * ldc + j0, sizeof(V8u));
     else acc[r] = V8u{};
   }
   if (!sat) {
     for (unsigned k = 0; k < K; ++k) {
       V8u b;
-      std::memcpy(&b, B + size_t{k} * N + j0, sizeof b);
+      __builtin_memcpy(&b, B + size_t{k} * N + j0, sizeof b);
       for (unsigned r = 0; r < R; ++r) acc[r] = acc[r] + static_cast<uint32_t>(A[size_t{i0 + r} * K + k]) * b;
     }
   } else {
@@ -1484,7 +1486,7 @@ inline void tile_i32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, con
       const unsigned k1 = k0 + block < K ? k0 + block : K;
       for (unsigned k = k0; k < k1; ++k) {
         V8u b;
-        std::memcpy(&b, B + size_t{k} * N + j0, sizeof b);
+        __builtin_memcpy(&b, B + size_t{k} * N + j0, sizeof b);
         for (unsigned r = 0; r < R; ++r) s[r] = s[r] + static_cast<uint32_t>(A[size_t{i0 + r} * K + k]) * b;
       }
       for (unsigned r = 0; r < R; ++r) {
@@ -1499,7 +1501,7 @@ inline void tile_i32_block(unsigned i0, unsigned j0, unsigned N, unsigned K, con
       }
     }
   }
-  for (unsigned r = 0; r < R; ++r) std::memcpy(D + size_t{i0 + r} * ldd + j0, &acc[r], sizeof(V8u));
+  for (unsigned r = 0; r < R; ++r) __builtin_memcpy(D + size_t{i0 + r} * ldd + j0, &acc[r], sizeof(V8u));
 }
 
 void tile_i32_k(unsigned M, unsigned N, unsigned K, const int32_t* A, const int32_t* B, const int32_t* C, size_t ldc, unsigned block, bool sat,

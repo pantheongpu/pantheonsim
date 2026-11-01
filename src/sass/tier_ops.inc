@@ -843,22 +843,24 @@ TIER_HANDLER(h_uunary) {
 
 // `bytes` (1, 2, 4, 8 or 16) between a lane's register words and memory, with sizes the compiler can see: a memcpy of a size known
 // only at run time was a call into libc for every lane (10 to 15% of the memory workloads).
+// (__builtin_memcpy: with glibc's fortification a std::memcpy to a computed address in a local buffer, as h_global's run buffer, is a call
+// to __memcpy_chk even at a fixed size.)
 inline void tier_put(uint8_t* at, const uint32_t* v, unsigned bytes) {
   switch (bytes) {
     case 1: *at = static_cast<uint8_t>(v[0]); break;
-    case 2: { const uint16_t x = static_cast<uint16_t>(v[0]); std::memcpy(at, &x, 2); break; }
-    case 4: std::memcpy(at, v, 4); break;
-    case 8: std::memcpy(at, v, 8); break;
-    default: std::memcpy(at, v, 16); break;
+    case 2: { const uint16_t x = static_cast<uint16_t>(v[0]); __builtin_memcpy(at, &x, 2); break; }
+    case 4: __builtin_memcpy(at, v, 4); break;
+    case 8: __builtin_memcpy(at, v, 8); break;
+    default: __builtin_memcpy(at, v, 16); break;
   }
 }
 inline void tier_get(uint32_t* v, const uint8_t* at, unsigned bytes) {   // v is zero already
   switch (bytes) {
     case 1: v[0] = *at; break;
-    case 2: { uint16_t x; std::memcpy(&x, at, 2); v[0] = x; break; }
-    case 4: std::memcpy(v, at, 4); break;
-    case 8: std::memcpy(v, at, 8); break;
-    default: std::memcpy(v, at, 16); break;
+    case 2: { uint16_t x; __builtin_memcpy(&x, at, 2); v[0] = x; break; }
+    case 4: __builtin_memcpy(v, at, 4); break;
+    case 8: __builtin_memcpy(v, at, 8); break;
+    default: __builtin_memcpy(v, at, 16); break;
   }
 }
 
@@ -1110,22 +1112,6 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
   c.r->tier_exec_mem(blk, w, *op.ins, ex);
 }
 
-// The 64-bit addresses the counting functions take, from a warp's 32-bit offsets: the active lanes' as they are, the others' zero (the
-// lanes that do not run read as zero, as the counting functions find them).
-[[gnu::always_inline]] inline void tier_widen_offsets(uint64_t* addrs, const uint32_t* offs, Mask ex) {
-#if defined(__SSE2__)
-  const __m128i zero = _mm_setzero_si128(), bit = _mm_set_epi32(8, 4, 2, 1);
-  for (unsigned g = 0; g < 8; ++g) {
-    __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(offs) + g);
-    if (ex != kAll) v = _mm_and_si128(v, _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(static_cast<int>(ex >> (4 * g))), bit), bit));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(addrs) + 2 * g, _mm_unpacklo_epi32(v, zero));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(addrs) + 2 * g + 1, _mm_unpackhi_epi32(v, zero));
-  }
-#else
-  for (unsigned l = 0; l < 32; ++l) addrs[l] = (ex >> l & 1) ? offs[l] : 0;
-#endif
-}
-
 // A whole warp's 4-byte shared accesses that are not one run of 32 words: each group of eight lanes is moved as 32 bytes when its
 // offsets are eight consecutive words (a tile row of 8, 16 or 32 words, or two rows in one warp), else lane by lane. The groups run in
 // order, so where two lanes name one word the later lane's value is the one stored, as in the lane loop (the words of one group are all
@@ -1250,8 +1236,6 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
       return;
     }
   }
-  uint64_t addrs[32];
-  tier_widen_offsets(addrs, offs, ex);
   const unsigned words = std::max(1u, bytes / 4);
   const bool by_groups = bytes == 4 && ex == kAll;
   if (by_groups) tier_shared_words<Store>(sh, d, offs);
@@ -1294,7 +1278,7 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
       }
     }
   }
-  count_shared_access(blk.st, Store, addrs, ex, bytes);
+  count_shared_offsets(blk.st, Store, offs, ex, bytes);
 }
 
 // Local memory: each lane's window of the warp's array, when every active lane's access is inside the thread's frame.
@@ -1651,7 +1635,7 @@ TIER_HANDLER(h_imma) {
   static const uint32_t kZeros[32] = {};
   alignas(32) uint32_t xa[8 * 32], xb[4 * 32], xc[4 * 32], xd[4 * 32];
   const auto load = [&](unsigned base, unsigned n, uint32_t* dst) {
-    for (unsigned i = 0; i < n; ++i) std::memcpy(dst + 32 * i, base == kRZ ? kZeros : c.R + (base + i) * 32u, 32 * sizeof(uint32_t));
+    for (unsigned i = 0; i < n; ++i) __builtin_memcpy(dst + 32 * i, base == kRZ ? kZeros : c.R + (base + i) * 32u, 32 * sizeof(uint32_t));
   };
   load(op.s[0].off, a_regs, xa);
   load(op.s[1].off, b_regs, xb);

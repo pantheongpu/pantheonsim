@@ -1,3 +1,5 @@
+asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.popsection");
+// (The line above puts this unit's code on a 4096-byte boundary: where it starts modulo a page no longer depends on the units linked ahead of it. docs/performance.md, Round sp14, combined.)
 // Which lanes the SASS scheduler runs next (include/vgpu/exec/sass_lanes.hpp, pick_group): the lowest address among the runnable lanes' and the lanes there,
 // in one pass of 256-bit compares where the host has AVX2 and the plain functions of the header where it has not.
 #include "vgpu/exec/sass_lanes.hpp"
