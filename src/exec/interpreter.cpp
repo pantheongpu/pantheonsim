@@ -17644,12 +17644,23 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
     interp.run_grid();
     return stats;
   }
+  // A small grid keeps to few threads (vgpu/exec/worker_pool.hpp, LaunchWidth); blocks run the same on any.
+  unsigned width_threads = nthreads;
+  LaunchWidth width(&fn, blocks, width_threads);
+  if (width_threads <= 1) {
+    LaunchStats stats;
+    Interpreter interp(fn, eff, pb, mem, profile, symbols, stats, progress);
+    interp.set_grid_id(grid_id);
+    interp.set_device_launches(dl);
+    interp.run_grid();
+    return stats;
+  }
 
   // Each worker gets its own interpreter and its own statistics; the only thing
   // they share is device memory, whose chunk table is lock-free for exactly
   // this. Progress reporting stays on one worker so the callback is never
   // re-entered.
-  std::vector<LaunchStats> per_thread(nthreads);
+  std::vector<LaunchStats> per_thread(width_threads);
   std::mutex err_mu;
   std::exception_ptr first_error;
   // Divided by clusters when the launch has them, since a cluster's blocks
@@ -17666,10 +17677,10 @@ LaunchStats launch_grid(const EntryFn& fn, const LaunchConfig& cfg,
   // slow ones finished theirs. Blocks are independent, so which thread runs
   // one changes nothing it computes.
   std::atomic<uint64_t> next_unit{0};
-  const uint64_t chunk = std::max<uint64_t>(1, units / (uint64_t{nthreads} * 8));
+  const uint64_t chunk = std::max<uint64_t>(1, units / (uint64_t{width_threads} * 8));
   // The host threads are the pool's (vgpu/exec/worker_pool.hpp): made once and
   // parked between launches, where each launch used to create and join its own.
-  run_parallel(nthreads, [&](unsigned t) {
+  run_parallel(width_threads, [&](unsigned t) {
     try {
       Interpreter interp(fn, eff, pb, mem, profile, symbols, per_thread[t],
                          t == 0 ? progress : ProgressFn{});

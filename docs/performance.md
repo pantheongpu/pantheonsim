@@ -5626,6 +5626,148 @@ The verdict file of #438 (`src/sass/ok_cache.{hpp,cpp}`) shipped opt-in. Before 
 * The default: `VGPU_SASS_CACHE=0` turns it off, anything else or unset is on (a build without a GNU build id, or with no absolute `XDG_CACHE_HOME` / `HOME`, has no file as before). Files of old builds stay in `~/.cache/pantheonsim` (at most 1 MB each, a few KB in practice) and can be deleted any time.
 * Not testable on hosted CI: a real `ENOSPC` (the test uses `RLIMIT_FSIZE`, which gives the same short write and then `EFBIG`) and a file owned by another user (the test interposes `geteuid`).
 
+## Round sp12: shared-memory loads and stores of the tier (branch `sp12-shared`, base 2c68075d = `sp11-tensor-pr`)
+
+Where the time went (perf `cycles:u`, one host thread, server3 Zen 4, A = 2c68075d; shares of the program's samples): `h_shared` is 24% of Samples convolutionSeparable (28% of that on one
+instruction: the per-lane 4-byte load loop), 25% of sortingNetworks (`rep stos` 5 to 10% of those: the 256-byte `addrs[]` zeroing of every partial-warp access), 13% of Rodinia lud, 8.6% of
+transpose. `step_warp` is 17% of transpose, 8% of convolutionSeparable, but spread over the dispatch of the tier loop (the largest single instruction is 6%): nothing to fix there.
+
+### What changed
+* `h_shared` works out the 32 offsets as 32-bit words for every lane mask (a lane that does not run reads its register and is left out of the checks) and never zeroes the 64-bit address array: it
+  is filled only where it is used, after the contiguous and one-word cases have returned (`tier_widen_offsets`: the active lanes' offsets, zero elsewhere, as before).
+* The window check is `exec::shared_window_inside_warp` (include/vgpu/exec/window_check.hpp): rank bits and `size - bytes - offset` negative-or-not, ORed over the active lanes, in one SSE2 pass.
+  SSE2 has no unsigned 32-bit maximum, so the earlier `add_warp` maximum was emulated with ten instructions a vector. Same answer as `SharedWindowCheck` (compared in test_memcount_forms).
+* The contiguous / one-word test of a full warp of words is 32-bit (it vectors) instead of 64-bit scalar.
+* A full warp of 4-byte accesses that is neither one run of 32 words nor one word (`tier_shared_words`): each group of eight lanes whose offsets are eight consecutive words moves as 32 bytes
+  (two vector copies), the other groups lane by lane. Tile rows of 8, 16 and 32 words, two rows in one warp. The groups run in order, so two lanes on one word still end with the later lane's value.
+
+### Results (A = 2c68075d, B = branch; same bits: outputs identical, counters identical in every canary row)
+Zen 5 (server2, Ryzen 9 9950X, cpu 16, `real.py`, 7 runs, median wall s; A/A of the same window 0.97x to 1.06x, the 1.06x being convolutionSeparable, the other rows 0.99x to 1.01x):
+| program | A s | B s | A/B |
+|---|---:|---:|---:|
+| Samples convolutionSeparable | 11.70 | 10.06 | 1.16x |
+| Samples sortingNetworks | 17.23 | 14.77 | 1.17x |
+| Samples transpose | 7.77 | 6.79 | 1.14x |
+| Rodinia lud | 1.87 | 1.70 | 1.10x |
+| Samples mergeSort | 7.84 | 7.25 | 1.08x |
+| Samples dct8x8 | 0.86 | 0.80 | 1.08x |
+| Rodinia hotspot | 1.15 | 1.09 | 1.05x |
+| Samples histogram, reduction | 15.36 / 8.10 | 15.43 / 8.14 | 1.00x, 1.00x |
+(The first commit alone, before the group copy: convolutionSeparable 1.07x, sortingNetworks 1.12x, lud 1.07x, transpose 1.04x, mergeSort 1.08x.)
+
+Zen 4 (server3, cpu 2, `perf stat` user cycles and instructions of the whole program, 3 runs each, the box at load 14 to 35; instructions are exact):
+| program | A cycles | B cycles | B/A | A instructions | B instructions |
+|---|---:|---:|---:|---:|---:|
+| convolutionSeparable | 74.9 / 71.8 / 72.7 G | 65.6 / 65.0 / 64.9 G | 0.90 | 322.8 G | 295.0 G |
+| sortingNetworks | 93.5 / 92.5 / 92.7 G | 83.9 / 83.3 / 84.9 G | 0.905 | 320.0 G | 312.0 G |
+| lud | 16.7 / 16.8 / 16.6 G | 15.7 / 15.7 / 15.7 G | 0.94 | 39.84 G | 36.91 G |
+| transpose | 47.3 / 46.0 / 46.4 G | 44.1 / 44.4 / 44.4 G | 0.955 | 190.5 G | 184.5 G |
+
+bench.py canaries (12 workloads, SASS and PTX, 15 runs, Zen 5; counters identical in all 24 rows; A/A in the same window all within 0.99x to 1.01x): `shared` SASS 1.08x, `mem` SASS 1.03x to 1.06x,
+others 0.99x to 1.02x, except `api` 0.98x (both engines; the api path does not touch the changed code, so this is code placement after the relink; it did not move with the next variant, and
+`launch` is 0.99x to 1.01x). Placement lesson again: the first version, with the group copy inlined into `h_shared`, cost `atomics` SASS 0.914x (p<0.001) and `mem` PTX 0.959x, `mma_ptx` SASS 0.966x
+at equal instructions; making the group copy a `noinline` function brought them to 1.00x. Making `tier_widen_offsets` `noinline` too halved the `shared` gain (1.08x to 1.04x) and was dropped.
+
+### Tests (CMake-wired) and the mutations that fail them
+* `test_memcount_forms`: `shared_window_inside_warp` against the per-lane window test over 400 000 random warps and masks, and at its edges (last byte in and out, sizes under the access and over the
+  clamp, rank bits, one lane, all but one lane). Mutations: limit one too high; the active mask ignored. Both fail `window_checks_equal_the_per_lane_tests`.
+* `test_sass_dispatch`: the whole-warp shared shapes now run in warps of 32, 64, 33, 5 and 19 threads (a partial warp), with four more shapes (rows of eight words with a gap; the same two bytes into
+  a word; runs of four words only; four rows on the same eight words), and every kernel reads the words back in order (a store and a load that agree on a wrong place hid a wrong group copy). All
+  60 shared-memory digests were recorded from the base tree (2c68075d) with only the test changed. Mutations: only the first half of a group checked; the second half of a group loaded from the wrong
+  place; the second half stored wrong; the widened addresses taken from the high halves. Each fails `shared_memory_of_a_whole_warp_...`.
+* ASan+UBSan (-O0, detect_leaks=1, halt_on_error=1) of test_sass_dispatch, test_memcount_forms and test_bank_memo: clean. TSan not run: no threaded or atomic code was touched.
+
+### Not done, and negative results
+* An AVX2 gather for the strided 4-byte loads: the per-lane loop is 2 loads and 1 store per lane (about 32 cycles a warp) and a Zen 4 `vpgatherdd` is about 9 cycles per eight lanes: no gain expected, not tried.
+* `step_warp` / `fetch`: flat (largest instruction 6% of the function); nothing structural. `sass_bank_passes_memo` (12 to 22% of convolutionSeparable and sortingNetworks) is the next cost there.
+* 8- and 16-byte whole-warp accesses still go lane by lane (`LDS.64/.128` are rare in these programs).
+## Round sp12: the AVX-512 float-product tensor kernel (branch `sp12-avx512`, base `sp11-tensor-pr`)
+
+### What was missing
+`mma_avx2_chunked_f` (the f32-product kernel behind `mma.sync`, HMMA and `wmma` on the sm_86 sum for f16, bf16 and tf32) had no 512-bit form, so the AVX-512 default of sp8 did not touch it (sp11 measured the two TensorCoreGemm samples as equal at both levels on a Zen 4, where 512-bit operations run as two halves). Measured on a Zen 5 (Ryzen 9 9950X, full-width 512-bit), the kernel itself is the cost of those samples, so it got a 16-lane form.
+
+### The kernel (`mma_avx512_chunked_f`, include/vgpu/exec/tc_ampere.hpp)
+Same arithmetic, sixteen lanes, mask registers in place of compare vectors (`shift_term_avx512`, `sum_to_f32_avx512`, `sum_to_f16_avx512`, the cold `mma_f_fix512`). A 16-lane unit is one row and 16 columns when N is a multiple of 16 (A broadcast as one number), or two rows and 8 columns when N == 8 (lane 2j + r = row r of the pair, column j: the A side is a 64-bit broadcast of the pair (row 2p, row 2p+1) at the same k, built once per call with unpack/permute; the B side has each column doubled; the accumulators are interleaved on the way in and out). Other shapes (N = 24, odd M with N == 8) stay with the 256-bit kernel. The decode and the range checks that send a call to the integer kernel are copies of the 256-bit ones, so both kernels take and decline the same calls (the test checks it, and that a declined call writes nothing). Used only at `Level::Avx512` (`mma_avx2_acc`); `VGPU_SIMD=avx2` keeps the old path. Four units at a time (`VGPU_TC86_ROWS_Z`; 2, 6 and 8 measured slower or equal on a loop of calls: 0.79, 0.80, 0.69 against 0.67 on f16 16x8x16).
+
+### Results (server2, Zen 5, cpu 9 alone, same binary pair A = `sp11-tensor-pr`, B = this branch, `VGPU_THREADS=1`)
+Kernel alone, ns per call of `mma_avx512_chunked_f` over `mma_avx2_chunked_f` (inputs random normal, best of 5 x 20000 calls): f16 16x8x16 300 -> 206 (0.68), 16x8x8 171 -> 122 (0.72), bf16 0.66 / 0.72, tf32 16x8x8 0.61, 16x8x4 0.85, 16x16x16 557 -> 322 (0.58), 32x8x16 0.63, 8x32x16 0.61; values 0/1/2 as in the samples 0.55 to 0.72.
+`bench.py` (9 runs, sass and ptx, counters identical): wmma 1.36x / 1.67x, mma_ptx 1.33x / 1.31x (p < 0.001). Canaries int_alu f32_fma mem shared atomics local divergent warp launch api: 0.97 to 1.02, counters identical in all rows; the ones below 0.98 (ptx warp 0.975 / 0.986 in two runs, api 0.975 to 0.985, sass launch 0.965 in one of two runs) do not touch the new code and moved with a noinline on the kernel; A/A of the same build gave 0.99 to 1.01. (This is the code-placement effect of earlier rounds; two to three per cent on api / launch.)
+CUDA Samples on the simulator (wall seconds, one thread, outputs identical): cudaTensorCoreGemm 22.9 -> 18.6 (0.81), tf32TensorCoreGemm 231 -> 207 (0.90), bf16TensorCoreGemm 197 / 200 -> 153 / 158 (0.78; a first pair measured while the box was busy read 210 / 216 and is not used), immaTensorCoreGemm 10.8 -> 10.4 (IMMA does not use the kernel: the noise of the box).
+`nvidia_tensor_bench` rows for these instructions (ns per warp instruction, SASS and PTX) are dominated by the interpreter for a few dozen calls, and the bf16 m16n8k16 PTX row declines the kernel in about half its calls (operands outside the range rule); it is not a good meter for this change.
+Defaults: unchanged. The kernel is faster at AVX-512 on the only full-width host measured; the Zen 4 check below found no regression (the rows that use the kernel are faster there too); no Intel host was measured.
+Zen 4 check (server3, Ryzen 7 PRO 8840U, 512-bit operations as two halves, cpu 2, box load 12 to 38 from other sessions; A = `sp11-tensor-pr`, B = this branch, `VGPU_THREADS=1`): `bench.py` 21 runs, B/A of the median Minst/s, sass / ptx: wmma 1.030 / 1.203, mma_ptx 1.028 / 1.029 (counters identical; A/A of the same build 0.998 to 1.002, p > 0.48 in all four rows). `nvidia_tensor_bench` (5 repeats of the whole table, 3 alternating A / B rounds, median cycles per warp instruction, B/A at `VGPU_SIMD=avx512`): mma f16 m16n8k8 0.83, wmma f16 m16n16k16 0.87, wmma tf32 0.86, SASS HMMA.1688.F32 0.88, wmma m32n8k16 / m8n32k16 0.95 / 0.93, SASS HMMA bf16 0.93; bf16 rows (a first pass read 1.07 to 1.12 on bf16 m16n8k16 and wmma bf16, a second pass of 7 rounds of 20 repeats on the bf16 rows read mma bf16 m16n8k8 0.85, m16n8k16 0.72, wmma bf16 0.76: the first was noise from the loaded box). Rows that do not use the kernel (wgmma, tcgen05, IMMA, f64, s8) sit at 0.97 to 1.04 with B2/A2 (both at `VGPU_SIMD=avx2`) at 0.93 to 1.09, so the box noise is about 5 per cent; wgmma / tcgen05 / QMMA e4m3 read 1.04 to 1.085 at both SIMD levels (code placement, not the kernel). B at avx512 over B at avx2: the same rows 0.79 to 0.95. No shape is slower than A on Zen 4 beyond noise, so no CPU-family guard is needed.
+
+### Tests (CMake-wired)
+`test_tc_ampere_fast` now also (a) calls `mma_avx512_chunked_f` and `mma_avx2_chunked_f` directly on every random and adversarial round of the existing test (94,737 calls, 24,159 taken, shapes 16x8, 16x16, 32x8, 8x32, 12x16, 6x8, 3x16, tails K = 4 and 12, f32 and f16 accumulators, chunks 8 and 4) and requires the same taken/declined answer, nothing written when declined, and the frozen form's bits; (b) repeats the edge-exponent, float-subnormal and tf32-tail checks on the 512-bit kernel; (c) checks `sum_to_f32_avx512` and `sum_to_f16_avx512` against the scalar conversions over the sums of the 256-bit checks (4.5 M and 2.5 M sums, 16 lanes). It runs three times (default, `VGPU_SIMD=avx512`, `VGPU_SIMD=avx2`; skipped parts on a CPU without AVX-512). Mutation checks (header copy mutated, test rebuilt; all killed): fix-up lane row / column, B column doubling, both interleave permutes, pair order (unpack, permute2x128, tail), unsigned compare in the f16 rounding, the tie condition, the f32 range bound, shift sign, accumulator sign, `live` threshold, `badg` removed, fix-up cases removed, `redo` removed, round-up removed, C load / D store offsets, row remainders, fix-up row. One survivor is equivalent: the `badg` bound 254 -> 253 only sends more lanes to the exact scalar rule, which gives the same bits.
+Also run: test_tc_ampere, test_mma_fast (both levels), test_tile_mma, test_simd, test_sass_mma_tiles, test_tier, test_fastpath. Not run: ASan / TSan (no box with the memory; no threaded code was touched), an Intel check of the new kernel.
+## Round sp12: AMD matrix instructions after #439 (branch `sp12-amd`, base `sp11-tensor-pr`)
+
+The question: did the AMD engine slow down after #439, and is it real or layout. Builds: A0 = a6e80555 (before #439), C = 873dbc69 (#439), B = `sp11-tensor-pr`
+(2c68075d), E = B plus this change. `tools/bench-amd/bench.py`, one host thread, device-phase wave-instructions per CPU second, counters identical in every row.
+
+### What was measured
+
+* **Zen 4 (server3, cpu 4, 11 alternating runs, A0 against B)**: no regression. Every canary within 0.987 to 1.057 (`mfma_i8` 1.057, `mfma_f64_4b` 1.026 faster; `wave`
+  0.987, `lds` 0.993 the lowest). `perf stat` user cycles of the whole process, best of 5: `mfma` A0 932 M, B 947 M, E 921 M; `mfma_bf16` 854, 863, 846 M.
+* **Zen 5 (server2, Ryzen 9 9950X, cpu 24, 15 alternating runs, A0 against B)**: reproduces, so it is not a Zen 4 front-end effect. `mfma_bf16` 0.889 to 0.912, `mfma`
+  0.961 to 0.975, `smfmac` 0.977 to 0.987 (p < 0.01), `flat` 0.97; `valu_*`, `lds`, `divergent`, `mfma_f64`, `mfma_f64_4b`, `mfma_i8` within 3 %. The step A0 to C
+  (#439 alone) is about 3 % of that on `mfma_bf16`; C to B is the rest.
+* It is placement, not work: instructions retired are equal (B has 0.3 % fewer), cycles are higher, and every function of the matrix path got slower with identical
+  code (the tile kernel `mfma_tile_f_avx2` +7 %, the bf16 decode +40 % of its small share). Stack position (environment padding 0 to 4096 in 128-byte steps) and heap position
+  (an `LD_PRELOAD` allocation of 0 to 4096 bytes before start) were swept on Zen 5: B is 5 to 10 % behind A0 in every position, so the cause is the code, not the aliasing of the
+  tiles. (The heap sweep also found a cliff: with 2112 to 3136 bytes allocated first, `mfma_bf16` takes 1.8x as long for A0 and B alike, 0.25 s against 0.14 s. The tiles' stagger
+  (`TileBuf`) does not cover whatever aliases there; not investigated.)
+* The hot inner loops sit at different offsets in a 64-byte line in A0 and in B (the tile kernel's 116-byte loop at +0x20 and +0x30), because everything before them in the
+  library moved.
+
+### What changed
+
+`-falign-loops=32` for `amd/src/gcn_exec.cpp`, and `optimize("align-loops=64")` on `mfma_tile_f_avx2` and `matrix_decode_wide_avx2`. The loops of the matrix path now start at the same offset
+in a line whatever is linked ahead of them.
+
+| Zen 5, 15 runs, mi300x | E / A0 | E / B |
+| --- | ---: | ---: |
+| `mfma` | 0.996 (p 0.53) | 1.026 |
+| `mfma_bf16` | 0.988 (p 0.18) | 1.061 |
+| `mfma_f64`, `smfmac`, `valu_*`, `lds`, `divergent`, `launch`, `api` | 0.985 to 1.023, all within the A/A spread | |
+| `mfma_f64_4b` | 0.971 (p 0.02) | 0.959 |
+| `mfma_i8` | 0.965 (p < 0.001) | 0.938 |
+
+Zen 4 A0 against E (11 runs, load 5 from other sessions): every canary within 0.947 to 1.056, no row slower at p < 0.05 (`smem` 1.051 and `lds` 0.986 are the only two below 0.05); best-of-5 cycles lower than A0 and B on all four matrix rows.
+
+### Not done, and negative results
+
+* `mfma_i8` (-4 to -6 % against A0 and B on Zen 5, +5 % on Zen 4) and `mfma_f64_4b` (-3 %) stay behind on Zen 5. Aligning every loop to 64 bytes (`-falign-loops=64`) was no better than 32;
+  moving the `std::vector<int>::resize` calls of the integer path behind a size test (`fit_size`) took the bf16 and `mfma` gains away again (0.937, 0.961): the layout changes with
+  any edit, which is why this is a compile flag and not another function. A deterministic fix is to put the tile kernels in their own `-fno-lto` unit, as `gcn_tier_ds.cpp` is; not done.
+* The effect is a property of one host (Zen 5) and of the library's layout at one commit: re-run `mfma`, `mfma_bf16`, `mfma_i8` on a Zen 5 host after any large AMD change.
+* No test can fail for an alignment change (the arithmetic is unchanged): the guards `test_amd_mfma_math`, `test_amd_matrix_fast`, `test_amd_nan_order`, `test_amd_gcn_same_bits`,
+  `test_amd_gcn_packed_same_bits`, `test_amd_gcn_memory_same_bits` and `test_amd_codeobject_same_bits` pass.
+## Round sp12: small launches stay off the worker pool (branch `sp12-pool`, base 2c68075d = `sp11-tensor-pr`)
+The scaling study (multi-core, never measured before this round) found a launch loop that gets slower with every thread added. `launch64` (a 64-block, one-warp kernel launched 300 k times) took 4.48 s at 1 thread, and 18 s (0.24x) at 2 threads and 20 s (0.22x) at 16. Cause, in `src/exec/worker_pool.cpp`: a worker polls for `kSpin` (40 us) only while its jobs keep coming less than `kSpin` after it finished the one before ("hot"). A 64-block launch is about 15 us of work; on 8 threads the launch period (post, wake, run, wait) is about 53 us, so the workers fall out of the hot state and sleep, and every later launch pays a futex wake per worker (about 13 voluntary context switches per launch). The state keeps itself: the workers are cold because the launches are slow, and the launches are slow because the workers are cold.
+### The fix, in two parts
+* **A launch is kept to the threads its work can pay for** (`LaunchWidth`, `cap_threads`, `blend_unit_cost` in `vgpu/exec/worker_pool.hpp`). Each kernel (the address of its `CubinKernel` / `EntryFn`) remembers what one block cost, in nanoseconds, from its last launches: the wall time of the block-running section times the threads it ran on, divided by the blocks, replacing the old value when the launch ran on one thread (exact) and averaged into it otherwise (an over-estimate, which errs towards more threads). A launch of `n` blocks then gets at most `n * cost / 100 us` threads (at least 1, never more than asked: `VGPU_POOL_MIN_WORK_US`, 100 by default, 0 turns the cap off). The first launch of a kernel has no cost and runs as before; a request of one thread, or of one block, is not timed at all and takes the path it always took. A launch capped to one thread runs the engine's own one-thread path on the calling thread (no pool, no hand-off). The per-block cost is kept per kernel, so a grid of another size is judged by what its blocks cost, and a kernel whose blocks get dearer is found out by its next launch (at one thread the figure is exact). The 256-slot table is racy by design: a collision or a torn pair gives one wrong estimate, which moves time only. Which thread runs a block changes nothing it computes, so results, outputs and counters are the same at every thread count (the SM number a block reads, `SR_VIRTUALSMID`, is the thread's index, as it already was at any thread count).
+* **No lock per block** (SASS engine, `Runner::run`, the multi-thread loop). The scaling run on 16384 one-warp blocks per launch also showed no speed-up at 8 threads (1.61 s against 1.44 s on one): each block took `fail_mu` to look for a failure and `stats_mu_` to add its counters. Each thread now sums its blocks' counters (integers: their order changes nothing) and adds them to the launch's once when it leaves, and a failure is announced by an atomic flag read without the lock. The one-thread loop is untouched (it needs no lock and its code is exactly what it was). Not done: running body 0 on the calling thread. The pool's contract says the caller only waits (the thread that holds the API lock and owns the CUDA call's `thread_local` state is never a worker), and with the cap the small launches no longer go through the pool, so it would buy one hand-off in the middle-sized launches only.
+### Results (server2, Ryzen 9 9950X, A = `sp11-tensor-pr`, B = this branch, `scale.cu`/`sz.cu` probes in the sp12-scaling logs, median wall of 5 to 7 alternating runs, pinned to free cpus of 0-15, `VGPU_THREADS` = t; outputs identical in every row)
+| launch64, 90 k launches of 64 blocks | A | B | B/A |
+|---|---:|---:|---:|
+| t = 1 | 1.33 s | 1.32 s | 1.01x |
+| t = 2 | 5.38 s (10.4 s cpu) | 1.35 s (1.35 s cpu) | 3.99x |
+| t = 4 | 5.34 s | 1.34 s | 3.99x |
+| t = 8 | 4.53 s | 1.39 s | 3.26x |
+| t = 16 | 6.06 s (26.0 s cpu) | 1.36 s (1.37 s cpu) | 4.46x |
+`launch` (one block per launch, 600 k launches) was on one thread already and is 1.00x to 1.02x at every t. Launches of other sizes (one-warp blocks, 8 threads, wall including 0.05 s of process start; at 1 thread the two builds agree within 0.93x to 1.00x): 16 blocks 0.90 s -> 0.09 s (10x), 64 blocks 0.50 -> 0.15 (3.3x), 256 blocks 0.26 -> 0.24 (1.08x), 1024 blocks 0.27 -> 0.19 (1.4x), 4096 blocks 0.34 -> 0.10 (3.4x), 16384 blocks 1.61 -> 0.33 (4.9x, the lock per block).
+Large grids, a regression check (compute, mem, divergent, atomics, tensor of the scaling probe, 5 to 7 runs, t = 1, 4 and 16; A/A of the two build trees, 7 runs: 0.96x to 1.09x, so the noise is about 4 percent): compute 1.01 / 1.00 / 1.03, mem 1.00 / 1.00 / 1.00, divergent 1.01 / 1.02 / 1.02, atomics 0.98 / 0.99 / 1.00, tensor 0.98 / 0.96 / 0.95 (t = 1 / 4 / 16 in each row; the tensor row is the wmma kernel and follows the placement loss below).
+The 12-workload canary (`bench.py --ab`, `--threads 1 --cpus 7`, 9 runs, sass + ptx, counters identical in all 24 rows): int_alu, f32_fma, shared, divergent, launch, api, mem sass, atomics sass, local sass, warp ptx, mma_ptx ptx 0.985x to 1.015x; **SASS wmma 0.948x, SASS mma_ptx 0.962x, SASS warp 0.941x, PTX mem 0.968x, PTX atomics 0.962x, PTX local 0.954x** (p < 0.001). These six rows are the placement effect of earlier rounds and not this change: the one-thread path executes the same source as before (the SASS one-thread loop is the unchanged lambda, `LaunchWidth` is only constructed with more than one thread, and the instruction counts are identical), and the same rows swing in both directions between builds that differ only in where the new code sits. Over six builds of this tree the SASS wmma row read 0.93x, 1.11x, 0.995x, 0.945x, 0.96x and 0.948x, SASS mma_ptx 0.944x, 1.106x, 0.991x, 0.945x, 0.955x and 0.962x, PTX local 0.926x, 1.003x, 0.998x, 0.939x, 0.967x and 0.954x. Moving the new members out of line (`noinline`), `cold`, and constructing `LaunchWidth` only for more than one thread removed the one real one-thread cost found (SASS `launch` 0.965x to 0.978x while the call was made at one thread; 1.00x since) and left the lottery. Nothing structural remains to change in these rows without a layout tool (the A side is one lucky layout of those six rows).
+### Tests (CMake-wired) and mutation checks
+* `test_worker_pool`: `the_cap_keeps_small_launches_on_few_threads` (the policy table: unknown cost, request of one, cap off, a 15 us launch, the one, two and four thread boundaries, saturation) and `the_unit_cost_is_exact_on_one_thread_and_averaged_otherwise`.
+* `test_sched`: `small_launches_in_a_loop_stay_off_the_pool_and_give_the_same_results` (a small kernel launched 200 times at each of 2, 8 and 16 threads: bytes and counters equal to the one-thread launch, and `worker_pool_stats().calls` does not move once the kernel's cost is known; with the cap off, or a 1 us threshold, the same loop does call the pool, so the check is not vacuous). `WorkerPoolStats` has a new `calls` field for it.
+* `e2e_pool_cap` (`nvidia/tests/e2e/pool_cap.cu`, `run_pool_cap.sh`): 1500 launches of a 64-block kernel, other grid sizes of the same kernels, atomics, a heavy 256-block grid and small ones again, with the performance counters on, at VGPU_THREADS 1, 2, 8 and 16, the cap on and off (`VGPU_POOL_MIN_WORK_US=0`), SASS and PTX: every run passes and prints the same bytes and the same per-launch counters.
+* Mutants (server2, tests run): `cap_threads` returning the request (killed: the policy test and the stay-off-the-pool test fail); the per-thread counters never added to the launch's (killed: `e2e_pool_cap` fails at every thread count above one, 6 of 8 SASS runs). The unit-cost blend ignoring the thread count is killed by its table (`6625` for 8 threads), by reading, not run.
+* Also run and passing: `test_exec`, `test_exec3`, `test_launch_env`, `test_ptx_block_reuse`, `test_sass_block_reuse`, `test_config`, `test_ptx_paths`, `test_sass_ldgsts`, `test_sass_s2r_fill`, `e2e_lockstep_blocks`, and `e2e_sass_tier` on sm_86 with `block_semaphore`, `cooperative_grid`, `smid`, `dsmem_cluster`, `cooperative_cluster`, `vector_add`. Sanitizers were not run (server2 has 10 GB free): the new shared state is relaxed atomics, a mutex-guarded merge and a lock-free table; the CI TSan leg covers `test_worker_pool` and `test_sched`.
+### Not done
+* Running body 0 on the caller (see above) and a per-launch thread count that follows the grid's size as well as the cost: the cap already gives the right order of magnitude, and a threshold of 100 us of work per thread was chosen, not tuned (50 us would give 2 threads to a 100 us launch).
+* The PTX engine's multi-thread loop keeps its own per-thread statistics and a chunked counter, and has no lock per block.
 ## Round sp12: f32 <-> f64 conversions as SIMD kernels (branch `sp12-f2f`, base 4cc7247d)
 `F2F.F64.F32`, `F2F.F32.F64`, `I2F.F64.U32/.S32`, `FCHK` and `MUFU.RCP64H` are 0.76% of the SASS instructions but sit in hotspot, JACOBI1D, backprop, atomicCost, jacobiCudaGraphs and simpleCudaGraphs; the per-lane `cv_f2f` of `fast_float` was 12% of hotspot's samples and 8% of JACOBI1D's. An earlier tier form that only routed them through `tier_float_op` cut instructions 1-4% and made cycles worse, because the per-lane conversion stayed.
 * Three kernels in the `simd::Kernels` table (`f2f_widen`, `f2f_narrow`, `i2d`; `src/simd/kernels.inc`, one baseline and one AVX2 form, the AVX-512 table inherits the AVX2 ones). f32 to f64 and u32/s32 to f64 are exact (the unsigned form adds two non-negative parts, so a zero is +0 in every rounding mode); f64 to f32 runs in the host's rounding mode, which the callers set as `dop_m` does (`RoundingScope`). `|x|` then `-x` are applied to everything but a NaN, which keeps its sign and payload as the register holds it (the conversion shifts the payload and quiets it), as `cv_f2f` does. The baseline forms keep the conversion of a NaN lane (an `asm volatile` empty statement), so the sticky exception flags are the scalar code's too (the test holds them equal).

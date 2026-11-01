@@ -33,6 +33,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <type_traits>
 
 namespace vgpu::exec {
@@ -48,11 +49,55 @@ void run_parallel(unsigned n, Body&& body) {
 }
 
 // What the pool holds, for tests: threads created since the process (or the
-// fork) began, and how many of them are parked right now.
+// fork) began, how many of them are parked right now, and how many calls were made.
 struct WorkerPoolStats {
   size_t created = 0;
   size_t idle = 0;
+  uint64_t calls = 0;   // run_parallel calls made (a launch kept to one thread makes none)
 };
 WorkerPoolStats worker_pool_stats();
+
+// How many of the requested host threads a launch should use.
+//
+// A thread costs a hand-off per launch (a futex wake when it has gone cold,
+// several microseconds even when it has not), so a launch whose blocks take
+// 15 us in all is slower on 8 threads than on one: its period rises, the
+// workers stop polling and sleep, and every later launch pays the wake again.
+// The cap keeps small launches on few threads, from what the last launches of
+// the same kernel cost. Which thread runs a block changes nothing it computes,
+// so this moves time only, never a result or a counter.
+//
+// cap_threads is the policy: with `ns_per_unit` (the measured cost of one
+// block, 0 when not known) a launch of `units` blocks gets at most
+// units * ns_per_unit / min_work_ns threads, at least 1, and never more than
+// `requested`. An unknown cost, min_work_ns == 0 and a request of 1 leave the
+// request as it was.
+unsigned cap_threads(unsigned requested, uint64_t units, uint64_t ns_per_unit, uint64_t min_work_ns);
+
+// The cost of one block after a launch that took `wall_ns` on `threads` threads
+// (their summed time is at most wall_ns * threads, an over-estimate when they
+// waited, which errs towards more threads). One thread measures it exactly and
+// replaces `old`; more are averaged into it.
+uint64_t blend_unit_cost(uint64_t old_ns_per_unit, uint64_t units, unsigned threads, uint64_t wall_ns);
+
+// Per-kernel use of the two above, for an engine's grid launch. Construct it
+// after the thread count is known and before the blocks run; it lowers
+// `threads` by the cap and, when it ends, records what the launch cost. `key`
+// names the kernel (any address that is stable for it). A request of one
+// thread, or one block, is left alone and not timed.
+class LaunchWidth {
+ public:
+  // Out of line on purpose: a launch on one thread, which is most of them, runs the code it always did.
+  [[gnu::noinline]] LaunchWidth(const void* key, uint64_t units, unsigned& threads);
+  [[gnu::noinline]] ~LaunchWidth();
+  LaunchWidth(const LaunchWidth&) = delete;
+  LaunchWidth& operator=(const LaunchWidth&) = delete;
+
+ private:
+  const void* key_;
+  uint64_t units_;
+  unsigned used_;
+  uint64_t begin_ns_;   // 0: not timed
+};
 
 }  // namespace vgpu::exec
