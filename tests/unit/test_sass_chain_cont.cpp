@@ -1,5 +1,5 @@
 // The run loop of the SASS tier goes on past an instruction that is not straight only for the scheduler's sake (S2R, ULDC, UMOV, USEL,
-// PLOP3, SEL: they write registers and nothing else), where it used to end the call and let the chain start the next one at once
+// PLOP3, SEL: they write registers and nothing else), and past a BRA that does not split the group,, where it used to end the call and let the chain start the next one at once
 // (Runner::tier_run_t in src/sass/tier_ops.inc, "cont"). It may do so only when that chain would have started exactly there: the warp has not
 // diverged, nothing waits or has yielded, and the caller's turn has calls left; the call it saved is still counted against the turn. Run
 // with the tier and with VGPU_FASTPATH=0 (the interpreter, one call per instruction group), the kernels here must leave the same words,
@@ -7,6 +7,7 @@
 //
 //   * a diverged warp whose two halves meet at an S2R: the lanes that arrive first must wait one instruction for the others and run it
 //     once together (one instruction counted, one clock tick), not run it alone and again for the others;
+//   * a branch that the whole group takes, or none of it, and one that a guard lets only some lanes run;
 //   * two warps that each load, add and store one word in a loop of S2Rs, 3000 times: where the 4096-call turns end decides which updates
 //     are lost, so the final word and the clocks agree only if the saved calls are counted as the interpreter's are.
 #include <cstdint>
@@ -124,7 +125,39 @@ Insn bra_p0(int from, int to) {
   return make(hi, 0x0947ull | (static_cast<uint64_t>(off) & 0xffffffffull) << 32, buf);
 }
 
+// @P0 BRA P1, to the instruction at index `to`: taken by the lanes the guard P0 lets run and P1 holds for
+Insn bra_p0_p1(int from, int to) {
+  const int64_t off = int64_t{16} * (to - from - 1);
+  const uint64_t hi = 0x000fea0000800000ull | (off < 0 ? 0x3ffffull : 0ull);
+  char buf[40];
+  std::snprintf(buf, sizeof buf, "@P0 BRA P1, 0x%llx", static_cast<unsigned long long>(16 * to));
+  return make(hi, 0x0947ull | (static_cast<uint64_t>(off) & 0xffffffffull) << 32, buf);
+}
+
 constexpr uint32_t kStride = 0x10;   // bytes a thread's results take
+
+// One branch over two S2Rs: P0 = (tid >= `ge`). With `cond`, the branch also needs P1, which nothing sets, so no lane takes it: the guard lets
+// the lanes of tid >= `ge` run it (a branch the group does not split, but one that only some of its lanes ran: counted as divergent).
+std::vector<Insn> branch_kernel(unsigned ge, bool cond) {
+  std::vector<Insn> c;
+  c.push_back(s2r_tid(0));
+  c.push_back(make(0x000fc60000000f00ull, 0x0000580000007a02ull | uint64_t{12} << 16, "MOV R12, c[0x0][0x160]"));
+  c.push_back(make(0x000fc60000000f00ull, 0x0000590000007a02ull | uint64_t{13} << 16, "MOV R13, c[0x0][0x164]"));
+  c.push_back(imad_wide_i(14, 0, kStride, 12));
+  c.push_back(isetp_ge(0, ge));
+  const int from = static_cast<int>(c.size());
+  c.push_back(cond ? bra_p0_p1(from, from + 3) : bra_p0(from, from + 3));
+  c.push_back(s2r_lane(1));
+  c.push_back(s2r_lane(1));
+  c.push_back(s2r_lane(2));
+  c.push_back(cs2r_clock(3));
+  c.push_back(stg(14, 1, 0));
+  c.push_back(stg(14, 2, 4));
+  c.push_back(stg(14, 3, 8));
+  c.push_back(stg(14, 0, 12));
+  c.push_back(exit_());
+  return c;
+}
 
 // A diverged warp: lanes 0..15 fall through S2Rs, lanes 16..31 jump to the last of them, so the halves meet there.
 std::vector<Insn> meeting_kernel(unsigned lead, unsigned tail) {
@@ -256,6 +289,15 @@ VTEST(the_calls_saved_by_going_on_past_an_s2r_count_against_the_warps_turn) {
   // Two warps update one word 3000 times each, with S2Rs in the loop: which updates are lost depends on where the 4096-call turns end.
   for (unsigned s2rs : {1u, 2u, 3u, 5u}) compare(loop_kernel(3000, s2rs), 64, std::to_string(s2rs) + " S2Rs per iteration");
   compare(loop_kernel(1500, 2), 128, "four warps");
+}
+
+VTEST(a_branch_the_whole_group_takes_or_none_of_it_lands_where_the_chain_would_start) {
+  compare(branch_kernel(0, false), 32, "taken by every lane");      // (P0 holds for all: a forward jump over two S2Rs)
+  compare(branch_kernel(99, false), 32, "taken by none");
+  compare(branch_kernel(16, false), 32, "taken by half");           // (diverges: the general path)
+  compare(branch_kernel(16, true), 32, "guard on half, condition false");
+  compare(branch_kernel(0, true), 32, "guard on all, condition false");
+  compare(branch_kernel(0, false), 40, "a warp and a part of one");
 }
 
 VTEST(one_warp_alone_gives_the_same_words_and_counters) { compare(loop_kernel(2000, 3), 32, "one warp"); }

@@ -2026,6 +2026,11 @@ void tier_add_total(uint64_t n) { tier_stats().total.fetch_add(n, std::memory_or
 //  10. Not done here, because the interpreter's path is used instead: BMOV.PQUAD MACTIVE's forced mask (step_warp does not
 //      enter the tier then), the instruction trace (VGPU_SASS_TRACE turns the tier off), a register past the file.
 //
+//  11. Past an op that is not straight only for the scheduler's sake (S2R, ULDC, UMOV, USEL, PLOP3, SEL), and past a BRA that the whole group takes
+//      or none of it, the loop goes on without ending the call when the chain would have started the next one where this loop is (see the
+//      cont ops in the loop): the call is counted against the turn all the same (Warp::budget, Warp::extra). Tested by test_sass_chain_cont,
+//      which compares words, counters and clock readings with the interpreter's.
+//
 // Chaining. step_warp's work between two calls is: release the lanes of a WARPSYNC set that wait their turn (ws_held), pick the
 // group at the lowest address, honour a slice a YIELD gave and a give-way, find the code section. When none of the first and the last
 // applies (no ws_held, no slice, no give-way, no forced mask) and every runnable lane stands at one address inside this section,
@@ -2387,23 +2392,47 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       // nothing else) ends the call, and the chain below starts the next one where it left off -- when the warp has not diverged, nothing waits
       // or has yielded, and the turn has calls left. All that is known before the op runs and the op changes none of it, so the loop does
       // what the chain would do (the call counted, the 256-op bound given afresh) without leaving: the lanes' addresses are set where
-      // the loop does stop, as they are after any run that has moved on.
+      // the loop does stop, as they are after any run that has moved on. A BRA that the whole group takes, or none of it, to a place in this
+      // section is the same: the chain would pick the group that stands at the target.
       if constexpr (!Jit) {
-        if (op.cont && o < ops_last) {
+        if (op.cont || op.form == tier::Form::Bra) {
           if (cstate == 0) cstate = (regs_ok && !tier_stats_ && tier_chain_ && !w.yield && !w.slice && !w.give_way && !w.ws_held && !w.mactive_force && group &&
                                      w.runnable() == group) ? 1 : 2;
           if (cstate == 1 && w.budget) {
+            const tier::MOp* next = nullptr;
             const Mask ex = op.unguarded ? group : tier_guard(w, *op.ins, group);
-            const unsigned lanes = ex == group ? glanes : popc(ex);
-            ++st.instructions;
-            st.thread_instructions += lanes;
-            st.inst_by_class[op.cls] += lanes;
-            if (ex) op.fn(&c, op, ex);
-            --w.budget;
-            ++w.extra;
-            ++o;
-            olim = (reinterpret_cast<const char*>(ops_last) - reinterpret_cast<const char*>(o) > static_cast<ptrdiff_t>(256 * sizeof(tier::MOp))) ? o + 256 : ops_last;
-            continue;
+            if (op.cont) {
+              if (o < ops_last) next = o + 1;
+            } else {
+              Mask take = ex;
+              if (op.aux) {
+                take &= tier_pmask(c, op.p);
+                if (op.aux > 1) take &= tier_pmask(c, op.p2);
+              }
+              if (take == group || !take) {   // (a group that splits is the general path's; its spin rule needs lanes outside the group, none here)
+                if (take) {
+                  if (static_cast<uint64_t>(op.imm) < 16 * static_cast<uint64_t>(count) && !(op.imm & 15)) next = ops + (op.imm >> 4);
+                } else if (o < ops_last) {
+                  next = o + 1;
+                }
+              }
+            }
+            if (next) {
+              const unsigned lanes = ex == group ? glanes : popc(ex);
+              ++st.instructions;
+              st.thread_instructions += lanes;
+              st.inst_by_class[op.cls] += lanes;
+              if (op.cont) {
+                if (ex) op.fn(&c, op, ex);
+              } else if (ex && ex != group) {
+                ++st.divergent_branches;
+              }
+              --w.budget;
+              ++w.extra;
+              o = next;
+              olim = (reinterpret_cast<const char*>(ops_last) - reinterpret_cast<const char*>(o) > static_cast<ptrdiff_t>(256 * sizeof(tier::MOp))) ? o + 256 : ops_last;
+              continue;
+            }
           }
         }
       }
