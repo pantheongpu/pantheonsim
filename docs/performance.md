@@ -6142,3 +6142,40 @@ The 13-workload canary (`bench.py --ab`, one thread, sass + ptx, 15 runs, cpu 8,
 * Zen 4 numbers (server3 load 60 to 110 all round). The `launch64` 8 s / 15 s on Zen 4 is explained by the mechanism above but was not reproduced there; if the pool really is faster than one thread for 64 blocks of 0.8 us on that core (the 8 s mode), the 100 us threshold is too high for it, and the new estimate will keep that kernel on one thread every time.
 * The wake-up latency itself (135 us on average, up to 1 ms for the last of 16 workers in a 1.2 ms launch). It costs nothing while the first workers finish the grid, and a loaded host decides most of it.
 * `e2e_pool_cap` could not run here (no nvcc on server2); it is unchanged and runs in CI.
+## Round sp15: the AMD tier outside link-time optimization (branch `sp15-amd-layout`, base `sp14-combined` d9e63ab3)
+
+PR #458 left four AMD rows under `sp13-combined` at equal counters (Zen 5, mi300x, one thread): `mem` 0.95x, `flat` 0.93 to 0.96x, `mfma_i8` 0.96x, `p_sbuf` 0.915x. The question: can the AMD code be made independent of the layout lottery as the engines were in round 14?
+
+### What was found
+
+* The loss is inlining and placement inside the link-time-optimized library, not the source (the AMD sources are unchanged between the two bases). Comparing the two libraries symbol by symbol: `Machine::scalar_load` is inlined in `sp13-combined` and a function of its own in `sp14-combined`, `Machine::at` is a call inside `memory_run` in one and inlined in the other (`memory_run` is 3.8 KB against 2.4 KB), and a hundred more interpreter functions (the ALU lambdas of `vector_alu`, `more_alu`, `cdna5_alu`; `matrix_by_type`; `divide_step`) differ in size by 5 to 40 %. `tier_global` and `global_access` call the same functions in both, so those two rows are placement.
+* Taking the interpreter out of link-time optimization (`gcn_exec.cpp` with `VGPU_HOT_UNIT_FLAGS`, or with `-fno-lto` alone, or together with the tier) is not an answer: the ALU rows fall 5 to 10 % (`valu_int` 0.93x, `valu_f32` 0.94x, `p_pkf16` 0.88x, `p_lane` 0.90x, `smem` 0.93x) while `mem`, `flat`, `p_sbuf` stay where they are. The unit is 14 k lines whose code the optimizer lays out better with the rest of the library in sight.
+* Taking only `gcn_tier.cpp` out (the unit the previous attempt moved) recovers `mem`, `flat`, `p_sbuf` and `mfma_i8`; what then moves is the rows that run through the interpreter (`mfma`, `mfma_bf16`, `p_lane`), by where the link-time-optimized code lands relative to a page: sweeping the unit's start offset (`.skip N` after the page alignment) at 0 / 1024 / 1536 / 2048 / 2560 / 3072 bytes, `mfma` read 0.958 / 0.965 / 0.999 / 1.012 / 0.996 / within 0.98 to 1.03 of `sp13-combined` and `p_lane` 0.96 / 0.91 / 0.996 / 0.97 / 0.93 / 0.92 (single windows, core 9). The `-fno-lto`-only variant (no 64-byte alignment) read the same `valu_f32` loss, so the loss is the unit's code inlined differently outside LTO, not alignment.
+
+### What changed
+
+`gcn_tier.cpp` joins the hot units: `VGPU_HOT_UNIT_FLAGS` (`-fno-lto`, functions on 64, loops on 32) and the page-alignment line, followed by a 1536-byte skip: the offset at which, in the sweep above, no row of the 18-row AMD set was more than 3 % under `sp13-combined` except `valu_f32` (0.972 to 0.976 at every offset). `lint_hot_unit_layout` reads the sixth object. An edit inside `gcn_exec.cpp` still re-rolls everything the interpreter does (the offset is a measurement of this tree, as the interpreter's 2816 is for the PTX side).
+
+### Results (`bench-amd`, mi300x, one thread, counters identical in all 44 rows in every run; W = this branch, A = `sp14-combined`, S = `sp13-combined`)
+
+The measurement floor is high and file-dependent: identical copies of one library (`cp`) differ by up to 7 % on the scalar-memory rows (`smem` 0.928, `p_smem_wide` 0.962 between two copies of W in one window) and by 8 to 24 % on single ALU rows in other windows (`valu_f32` 0.76 and `valu_int` 1.09 between two copies of W in one window; the same pair read 1.00 in the next). The same pair read `p_sbuf` 0.87 in three windows in a row and 0.98 to 0.995 in earlier ones. So the table below is the median-of-three pairs of different copies (A_i against W_i, S_i against W_i), 15 runs, one window, core 9, and a row is called only when the three pairs agree.
+| row | Zen 5 W/A (3 pairs) | Zen 5 W/S (3 pairs) | Zen 4 W/A, W/S |
+|---|---|---|---|
+| `mem` | 1.044 / 1.054 / 1.051 | 1.001 / 1.006 / 1.003 | 1.037, 1.030 (A/A 0.98) |
+| `flat` | 1.152 / 1.161 / 1.148 | 1.092 / 1.094 / 1.094 | 1.073, 1.076 (A/A 0.99) |
+| `mfma_i8` | 1.004 / 1.004 / 1.005 | 1.018 / 0.971 / 0.967 | 1.006, 1.007 |
+| `valu_f32` | 0.992 / 0.998 / 0.995 | 0.975 / 0.977 / 0.974 | 0.986, 1.002 |
+| `valu_int` | 1.030 / 1.012 / 1.011 | 1.022 / 1.020 / 1.029 | 1.058, 1.046 |
+| `mfma_bf16` | 1.055 / 1.027 / 1.024 | 0.996 / 0.987 / 1.010 | 1.016, 0.985 |
+| `mfma` | 1.004 / 0.978 / 0.970 | 0.991 / 0.977 / 1.002 | 1.028, 1.009 |
+| `p_sbuf`, `p_lane` | 0.98 / 1.13 / 1.02 and 0.98 / 1.03 / 0.94 | 0.92 / 1.04 / 1.03 and 0.92 / 0.97 / 0.92 | within the A/A floor |
+Result: `mem` and `flat` are recovered and then some (`flat` +15 % over `sp14-combined`, +9 % over `sp13-combined`; `mem` +4.5 % over `sp14-combined`, level with `sp13-combined`), on both CPUs. `mfma_i8` is level with `sp14-combined` and with `sp13-combined` within the noise (0.97 to 1.02). `p_sbuf` and `p_lane` swing by ±10 % between copies and windows, with the sign of the change not reproducible: not recovered, not shown lost. `valu_f32` stays 2.5 % under `sp13-combined` (it is level with `sp14-combined`), which is the cost of this unit's code inlined differently outside LTO. The full 44-row run, W against A on Zen 5 (15 runs, one window): every row 0.94x to 1.19x; the ones outside 0.98x to 1.02x were `launch_wide` 1.19, `divergent` 1.14, `flat` 1.15, `launch_mid` 1.14, `mem` 1.06, `lds` 1.06, `ldsx` 1.05, `p_perm` 1.06, `mfma_bf16` 1.03, `mfma_fp8` 1.03 against `valu_int` 0.955, `p_lane` 0.94 (both windows later contradicted), `mfma_f64_4b` 0.977, `api` 0.978. Zen 4 (15 runs, cpu 3, A/A 0.97x to 1.05x): `valu_int` 1.06, `atomics` 1.05, `wave` 1.08, `divergent` 1.06, `smem` 1.11, `launch_mid` 1.11, `p_cmp` 1.07, `p_i64` 1.11, `p_sdwa` 1.09; `p_dpp` 0.951 and `p_dpp_arch` 0.927 (p 0.000) are the losses there.
+
+### Tests (CMake-wired) and mutations
+* `lint_hot_unit_layout` now includes `amd/src/gcn_tier.cpp.o`. Mutations, each compiled from the unit's own command line: without `-fno-lto` fails (LTO bytecode); `-falign-functions=16` fails (the comdat sections at 16 and 32); without the anchor line fails (`.text` at 64, not 4096).
+* Passing on server2 (Release): `test_amd_gcn_tier_same_bits`, `test_amd_gcn_same_bits`, `test_amd_matrix_fast`, `test_amd_matrix_kernels_layout`, `test_amd_mfma_math`, their `_simd_base` twins, `lint_hot_unit_layout`: 10 of 10. The counters of the benchmark's 44 rows are identical to `sp14-combined`'s in every run.
+
+### Not done / not kept
+* The interpreter (`gcn_exec.cpp`) outside LTO, in three flag sets, and the same with the tier: ALU rows 5 to 10 % under (above). Not kept.
+* A hot/cold split inside the tier: its cold paths (`fix_nan32`, `fix_nan64`, `post32`, `post64`, the int/f64 general paths) are already `noinline`, and the loss that remains (`valu_f32`) is inlining, not cold code in the way. Forcing the inlining decisions of `sp13-combined` in the interpreter (`always_inline` on `scalar_load`, `at`) was not tried; the interpreter's thousands of other differing decisions make it a whole-file exercise.
+* The `p_sbuf` / `p_lane` floor needs a different method (pinned physical pages, or many more copies); a single A/B of two files is not a measurement on these rows.
