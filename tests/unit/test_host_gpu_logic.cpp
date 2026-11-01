@@ -457,4 +457,128 @@ VTEST(driver_start_waits_for_a_launch_of_enough_warps) {
   VCHECK(start_worthwhile(1ull << 40, 33));                 // a huge grid does not overflow
 }
 
+// ---- the division idiom (host_gpu.hpp division_idiom_only), on the shape ptxas 13.0 gave `a / b` for sm_86 (cuobjdump of an own kernel) ----
+using K = CodeInsn::Kind;
+static CodeInsn ci(K kind, uint64_t pc, int64_t target = -1, int src0 = -1, int src1 = -1) {
+  CodeInsn c;
+  c.kind = kind;
+  c.pc = pc;
+  c.target = target;
+  c.src0 = src0;
+  c.src1 = src1;
+  return c;
+}
+// main line: ... MUFU.RCP R8, R3 ; FCHK P0, R0, R3 ; FFMA x5 ; @!P0 BRA ; MOV ; CALL -> slow ; ... EXIT ; slow: ALU..., MUFU.RCP R8, R3, ALU..., RET
+static std::vector<CodeInsn> division_kernel() {
+  std::vector<CodeInsn> c;
+  uint64_t pc = 0;
+  const auto add = [&](K k, int64_t target = -1, int s0 = -1, int s1 = -1) { c.push_back(ci(k, pc, target, s0, s1)); pc += 16; };
+  add(K::Other);                    // LDG is Memory only inside a subroutine: here it is the kernel's own load
+  add(K::Other);
+  add(K::MufuRcp, -1, 3);           // MUFU.RCP R8, R3
+  add(K::Fchk, -1, 0, 3);           // FCHK P0, R0, R3
+  for (int i = 0; i < 5; ++i) add(K::Other);   // FFMAs
+  add(K::Other);                    // @!P0 BRA
+  add(K::Other);                    // MOV R4, return
+  add(K::Call, 0);                  // target patched below
+  add(K::Other);
+  add(K::Other);                    // STG
+  add(K::Other);                    // EXIT
+  const size_t slow_at = c.size();
+  const uint64_t slow_pc = pc;
+  add(K::Other);
+  add(K::Other);
+  add(K::MufuRcp, -1, 3);           // the slow path's own MUFU.RCP, no FCHK
+  add(K::Other);
+  add(K::Ret);
+  for (CodeInsn& x : c)
+    if (x.kind == K::Call) x.target = static_cast<int64_t>(slow_pc);
+  (void)slow_at;
+  return c;
+}
+
+VTEST(division_idiom_is_recognized) {
+  VCHECK(division_idiom_only(division_kernel()));
+}
+
+VTEST(division_idiom_refuses_a_bare_reciprocal) {
+  // rcp.approx.ftz.f32: one MUFU.RCP and nothing that makes the result independent of its last bit
+  VCHECK(!division_idiom_only({ci(K::Other, 0), ci(K::MufuRcp, 16, -1, 3), ci(K::Other, 32), ci(K::Other, 48)}));
+  // an FCHK of another register is not the divisor's
+  auto c = division_kernel();
+  for (CodeInsn& x : c)
+    if (x.kind == K::Fchk) x.src1 = 4;
+  VCHECK(!division_idiom_only(c));
+  // an FCHK too far after the MUFU
+  c = division_kernel();
+  for (size_t i = 0; i < c.size(); ++i)
+    if (c[i].kind == K::MufuRcp) {
+      std::vector<CodeInsn> d(c.begin(), c.begin() + static_cast<std::ptrdiff_t>(i + 1));
+      for (unsigned k = 0; k < kIdiomMufuToFchk; ++k) d.push_back(ci(K::Other, 1000 + k));
+      d.push_back(ci(K::Fchk, 2000, -1, 0, 3));
+      VCHECK(!division_idiom_only(d));
+      break;
+    }
+}
+
+VTEST(division_idiom_refuses_other_sfu_and_calls) {
+  auto c = division_kernel();
+  c[0].kind = K::MufuOther;                        // an EX2 anywhere
+  VCHECK(!division_idiom_only(c));
+  c = division_kernel();
+  for (CodeInsn& x : c)
+    if (x.kind == K::Fchk) x.kind = K::Other;       // no FCHK: the CALL is not a division's slow path
+  VCHECK(!division_idiom_only(c));
+  c = division_kernel();
+  c.back() = ci(K::Other, c.back().pc);             // a subroutine that never returns
+  VCHECK(!division_idiom_only(c));
+  c = division_kernel();
+  c[c.size() - 2].kind = K::Memory;                 // a subroutine that touches memory is not the slow path
+  VCHECK(!division_idiom_only(c));
+  c = division_kernel();
+  c.insert(c.begin() + 1, ci(K::Ret, 8));           // a RET outside any subroutine
+  VCHECK(!division_idiom_only(c));
+  c = division_kernel();
+  for (CodeInsn& x : c)
+    if (x.kind == K::Call) x.target = 9999;         // a call to an address that is not an instruction
+  VCHECK(!division_idiom_only(c));
+}
+
+VTEST(division_idiom_takes_two_divisions_sharing_a_slow_path) {
+  auto one = division_kernel();
+  // a second MUFU.RCP/FCHK/CALL group before the slow path, calling the same subroutine
+  std::vector<CodeInsn> c;
+  uint64_t slow_pc = 0;
+  for (const CodeInsn& x : one)
+    if (x.kind == K::Call) slow_pc = static_cast<uint64_t>(x.target);
+  for (const CodeInsn& x : one) {
+    if (x.pc == slow_pc) {
+      c.push_back(ci(K::MufuRcp, slow_pc - 1000, -1, 6));
+      c.push_back(ci(K::Fchk, slow_pc - 999, -1, 5, 6));
+      c.push_back(ci(K::Call, slow_pc - 998, static_cast<int64_t>(slow_pc)));
+    }
+    c.push_back(x);
+  }
+  VCHECK(division_idiom_only(c));
+}
+
+VTEST(idiom_classification_by_mnemonic) {
+  VCHECK(classify_for_idiom("MUFU", {"RCP"}) == K::MufuRcp);
+  VCHECK(classify_for_idiom("MUFU", {"RCP64H"}) == K::MufuOther);
+  VCHECK(classify_for_idiom("MUFU", {"EX2"}) == K::MufuOther);
+  VCHECK(classify_for_idiom("MUFU", {"RCP", "F16"}) == K::MufuOther);
+  VCHECK(classify_for_idiom("FCHK", {}) == K::Fchk);
+  VCHECK(classify_for_idiom("CALL", {"REL", "NOINC"}) == K::Call);
+  VCHECK(classify_for_idiom("RET", {"REL", "NODEC"}) == K::Ret);
+  VCHECK(classify_for_idiom("LDG", {"E"}) == K::Memory);
+  VCHECK(classify_for_idiom("SHFL", {}) == K::Memory);
+  VCHECK(classify_for_idiom("HMMA", {}) == K::Memory);        // not in the exact set: not arithmetic of the slow path
+  VCHECK(classify_for_idiom("FFMA", {"RM"}) == K::Other);
+  VCHECK(classify_for_idiom("SHF", {"R", "U32", "HI"}) == K::Other);
+  // the default exact set itself is unchanged by all of this
+  VCHECK(!exact_opcode_allowed("MUFU", {"RCP"}));
+  VCHECK(!exact_opcode_allowed("CALL", {"REL", "NOINC"}));
+  VCHECK(!exact_opcode_allowed("RET", {"REL", "NODEC"}));
+}
+
 VTEST_MAIN

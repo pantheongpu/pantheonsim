@@ -75,6 +75,100 @@ inline bool exact_opcode_allowed(const std::string& mnemonic, const std::vector<
   return exact_mnemonic_allowed(mnemonic) && exact_mods_allowed(mnemonic, mods);
 }
 
+// ---- the IEEE division idiom (MUFU.RCP + FCHK + a call to the slow path) --------------------------------------------------------------
+// MUFU.RCP alone is NOT in the exact set: the card's reciprocal differs from the simulator's correctly rounded one by one ulp on about 13% of the mantissas
+// (tools/probes/mufu_rcp_probe.cu, round 5), and 09 doc section 2 saw 1 to 171 ulp results downstream of an SFU instruction. But ptxas builds the IEEE
+// quotient a / b (div.rn.f32, also `/` in CUDA C++) from MUFU.RCP, a few FFMAs that refine it, an FCHK that sends the rare operands to a slow path
+// (CALL.REL.NOINC to a subroutine that also uses MUFU.RCP, ending in RET), and the result is the correctly rounded quotient whatever the last bit of the
+// approximation: the PTX ISA requires div.rn.f32 to be IEEE-compliant, so the card and the simulator both give the one correctly rounded answer.
+// Tested here without a card: the refinement over every mantissa of the divisor with the simulator's reciprocal and with it one ulp off either way
+// (tests/unit/test_host_gpu_ref.cpp); on a card, by tools/probes/hostgpu_sfu_exhaustive.cu div (all 2^32 divisors), which is PENDING. Until that run is
+// clean the recognizer is behind VGPU_HOST_GPU_DIV=1 and the default exact set is unchanged.
+//
+// What the recognizer accepts (division_idiom_only): every MUFU is a plain RCP; each one outside a subroutine has an FCHK of the same divisor register within
+// kIdiomMufuToFchk instructions after it; every CALL goes to a subroutine (from its target to the first RET at or after it) and has an FCHK within
+// kIdiomFchkToCall instructions before it; a subroutine holds arithmetic only (no memory, barrier or warp operation, no call); every RET is in a subroutine.
+// A kernel with a bare rcp.approx (no FCHK), a device function that is not the slow path, or any other MUFU fails the check and stays refused.
+struct CodeInsn {
+  enum class Kind : uint8_t { Other, MufuRcp, MufuOther, Fchk, Call, Ret, Memory };
+  Kind kind = Kind::Other;
+  uint64_t pc = 0;
+  int64_t target = -1;    // CALL: the address of the subroutine
+  int src0 = -1;          // MUFU: the register read; FCHK: the dividend's
+  int src1 = -1;          // FCHK: the divisor's register
+};
+inline constexpr unsigned kIdiomMufuToFchk = 6;
+inline constexpr unsigned kIdiomFchkToCall = 12;
+
+inline bool division_idiom_only(const std::vector<CodeInsn>& code) {
+  using K = CodeInsn::Kind;
+  struct Region { uint64_t lo, hi; };
+  std::vector<Region> regions;
+  bool any = false;
+  for (size_t i = 0; i < code.size(); ++i) {
+    if (code[i].kind != K::Call) continue;
+    any = true;
+    // the subroutine: from the target to the first RET at or after it
+    size_t t = code.size();
+    for (size_t j = 0; j < code.size(); ++j)
+      if (static_cast<int64_t>(code[j].pc) == code[i].target) { t = j; break; }
+    if (t == code.size() || t <= i) return false;   // no such address, or a call backwards (a loop of calls is not the idiom)
+    size_t r = t;
+    while (r < code.size() && code[r].kind != K::Ret) {
+      if (code[r].kind == K::Call || code[r].kind == K::Memory) return false;
+      ++r;
+    }
+    if (r == code.size()) return false;
+    bool fchk_before = false;
+    for (size_t j = i > kIdiomFchkToCall ? i - kIdiomFchkToCall : 0; j < i; ++j) fchk_before = fchk_before || code[j].kind == K::Fchk;
+    if (!fchk_before) return false;
+    regions.push_back({code[t].pc, code[r].pc});
+  }
+  const auto in_region = [&](uint64_t pc) {
+    for (const Region& g : regions)
+      if (pc >= g.lo && pc <= g.hi) return true;
+    return false;
+  };
+  for (size_t i = 0; i < code.size(); ++i) {
+    switch (code[i].kind) {
+      case K::MufuOther: return false;
+      case K::Ret:
+        if (!in_region(code[i].pc)) return false;
+        break;
+      case K::MufuRcp: {
+        if (in_region(code[i].pc)) break;
+        bool checked = false;
+        for (size_t j = i + 1; j < code.size() && j <= i + kIdiomMufuToFchk && !checked; ++j)
+          checked = code[j].kind == K::Fchk && code[j].src1 >= 0 && code[j].src1 == code[i].src0;
+        if (!checked) return false;
+        break;
+      }
+      default: break;
+    }
+  }
+  (void)any;
+  return true;
+}
+
+// The kind of an instruction for the check above, from its mnemonic and modifiers. Anything that touches memory, a barrier or other threads is Memory
+// (not allowed inside the slow path); an instruction that is not in the exact set at all is Memory too, so a subroutine holding one fails.
+inline CodeInsn::Kind classify_for_idiom(const std::string& mnemonic, const std::vector<std::string>& mods) {
+  using K = CodeInsn::Kind;
+  if (mnemonic == "MUFU") {
+    bool rcp = false, other = false;
+    for (const std::string& m : mods) (m == "RCP" ? rcp : other) = true;
+    return rcp && !other ? K::MufuRcp : K::MufuOther;
+  }
+  if (mnemonic == "FCHK") return K::Fchk;
+  if (mnemonic == "CALL") return K::Call;
+  if (mnemonic == "RET") return K::Ret;
+  static const char* const kTouchesOthers[] = {"LDG", "STG", "LDS", "STS", "LDL", "STL", "LD", "ST", "BAR", "MEMBAR", "ERRBAR", "DEPBAR", "CCTL", "SHFL",
+                                               "VOTE", "MATCH", "RED", "WARPSYNC", "VOTEU"};
+  for (const char* t : kTouchesOthers)
+    if (mnemonic == t) return K::Memory;
+  return exact_mnemonic_allowed(mnemonic) ? K::Other : K::Memory;
+}
+
 // ---- residency (the design for a card copy that outlives a launch) ---------------------------------------------------------
 
 enum class Where : uint8_t {

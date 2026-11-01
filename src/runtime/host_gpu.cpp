@@ -414,6 +414,27 @@ struct Runtime::Impl : CardGate {
     return true;
   }
 
+  // VGPU_HOST_GPU_DIV=1: kernels whose only outside-the-set instructions are the IEEE division idiom (host_gpu.hpp division_idiom_only) are in the set. Off until
+  // the card's exhaustive division check (tools/probes/hostgpu_sfu_exhaustive.cu div) has run clean.
+  bool div_idiom = false;
+
+  static std::vector<CodeInsn> idiom_summary(const sass::Code& code) {
+    std::vector<CodeInsn> out;
+    out.reserve(code.count);
+    for (size_t i = 0; i < code.count; ++i) {
+      const sass::Instr& ins = code.instr(i);
+      CodeInsn c;
+      c.kind = classify_for_idiom(ins.mnemonic, ins.mods);
+      c.pc = ins.pc;
+      const auto reg_of = [&](size_t k) { return ins.src.size() > k && ins.src[k].kind == sass::Kind::Reg && !ins.src[k].neg && !ins.src[k].abs ? static_cast<int>(ins.src[k].reg) : -1; };
+      if (c.kind == CodeInsn::Kind::Call && !ins.src.empty() && ins.src[0].kind == sass::Kind::Label) c.target = ins.src[0].imm;
+      if (c.kind == CodeInsn::Kind::MufuRcp) c.src0 = reg_of(0);
+      if (c.kind == CodeInsn::Kind::Fchk) { c.src0 = reg_of(0); c.src1 = reg_of(1); }
+      out.push_back(c);
+    }
+    return out;
+  }
+
   bool kernel_eligible(const ptx::EntryFn& fn, const exec::LaunchConfig& cfg, const std::vector<std::vector<uint8_t>>& args,
                        MemoryManager& mem, const char** why, uint64_t* instrs, bool* runnable, bool* back_edge) {
     *runnable = false;
@@ -448,12 +469,20 @@ struct Runtime::Impl : CardGate {
     if (ok) {
       const sass::Code& code = m.code[ci->second];
       n_instrs = code.count;
+      bool idiom_checked = false, idiom_ok = false;
       for (size_t i = 0; i < code.count && ok; ++i) {
         const sass::Instr& ins = code.instr(i);
         if (ins.op == sass::Op::BRA)
           for (const auto& o : ins.src)
             if (o.kind == sass::Kind::Label) branches.emplace_back(ins.pc, static_cast<uint64_t>(o.imm));
         if (!exact_opcode_allowed(ins.mnemonic, ins.mods)) {
+          if (div_idiom && (ins.op == sass::Op::MUFU || ins.op == sass::Op::CALL || ins.op == sass::Op::RET)) {
+            if (!idiom_checked) {
+              idiom_checked = true;
+              idiom_ok = division_idiom_only(idiom_summary(code));
+            }
+            if (idiom_ok) continue;
+          }
           ok = false;
           *why = "instruction outside the exact set";
           if (logging()) std::fprintf(stderr, "host_gpu: %s refused: %s\n", fn.name.c_str(), sass::to_text(ins).c_str());
@@ -524,6 +553,7 @@ Runtime* Runtime::for_device(const DeviceProfile& profile, int ordinal) {
     if (const char* v = std::getenv("VGPU_HOST_GPU_VERIFY"); v && *v && *v != '0') r->impl_->verify = std::string(v) == "all" ? 2 : 1;
     if (const char* v = std::getenv("VGPU_HOST_GPU_WRITE_THROUGH"); v && *v && *v != '0') r->impl_->resident = false;
     if (const char* v = std::getenv("VGPU_HOST_GPU_NO_FIRST_LAUNCH"); v && *v && *v != '0') r->impl_->first_launch_off = true;
+    if (const char* v = std::getenv("VGPU_HOST_GPU_DIV"); v && *v && *v != '0') r->impl_->div_idiom = true;
     if (const char* v = std::getenv("VGPU_HOST_GPU_STATIC"); v && *v && *v != '0') r->impl_->static_estimate = true;
     if (const char* mb = std::getenv("VGPU_HOST_GPU_MAX_MIB")) r->impl_->max_bytes = std::strtoull(mb, nullptr, 10) << 20;
     g_summary_impl = r->impl_;
