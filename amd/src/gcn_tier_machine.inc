@@ -32,7 +32,7 @@ int tier_global(Wave& w, Group& g, const Inst& in) {
   const uint32_t* const hi = in.has_saddr ? lo : w.vgpr[in.src[0].index + 1].data();
   bool try_runs = !sub_dword && (words == 1 || words == 2 || words == 4) && d.peers.empty() && runs_on;
   // Lanes whose addresses make no run go to memory together (wave_scalars), once: a byte, a short, a word or a pair a lane.
-  bool try_batch = (sub_dword || words <= 2) && d.peers.empty() && runs_on;
+  bool try_batch = (sub_dword || words <= 2 || (words == 3 && !is_store)) && d.peers.empty() && runs_on;
   uint64_t memo_addr = 0;
   bool memo = false;
   uint32_t memo_words[kMaxWords];
@@ -41,6 +41,10 @@ int tier_global(Wave& w, Group& g, const Inst& in) {
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
     if (!(w.exec >> lane & 1)) continue;
     const uint64_t addr = (in.has_saddr ? saddr_base + lo[lane] : static_cast<uint64_t>(hi[lane]) << 32 | lo[lane]) + offset;
+    // (A run needs the next lane active with the next address: where it is not, memory_run would count one lane and hand back 0 -- asked here, without the call.)
+    if (try_runs && (lane + 1 >= kLanes || !(w.exec >> (lane + 1) & 1) ||
+                     (in.has_saddr ? saddr_base + lo[lane + 1] : static_cast<uint64_t>(hi[lane + 1]) << 32 | lo[lane + 1]) + offset != addr + 4 * words))
+      try_runs = false;
     if (try_runs) {
       const uint32_t made = memory_run(w, in, !is_store, lane, addr, words, access_bytes, !is_store && memo && memo_addr == addr, memo_words);
       if (made) {
@@ -53,12 +57,24 @@ int tier_global(Wave& w, Group& g, const Inst& in) {
     if (try_batch && (is_store || !memo)) {
       try_batch = false;
       uint64_t lane_addr[kLanes];
-      for (uint64_t m = w.exec >> lane << lane; m; m &= m - 1) {
-        const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
-        lane_addr[l] = (in.has_saddr ? saddr_base + lo[l] : static_cast<uint64_t>(hi[l]) << 32 | lo[l]) + offset;
+      const uint64_t live = w.exec >> lane << lane;
+      if (live == (w.lanes >= kLanes ? ~uint64_t{0} : (uint64_t{1} << w.lanes) - 1) >> lane << lane) {
+        // Every lane from this one to the wave's last: a counted loop over the rows, not a walk over the bits of EXEC.
+        const uint32_t last = w.lanes;
+        if (in.has_saddr) {
+          for (uint32_t l = lane; l < last; ++l) lane_addr[l] = saddr_base + lo[l] + offset;
+        } else {
+          for (uint32_t l = lane; l < last; ++l) lane_addr[l] = (static_cast<uint64_t>(hi[l]) << 32 | lo[l]) + offset;
+        }
+      } else {
+        for (uint64_t m = live; m; m &= m - 1) {
+          const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
+          lane_addr[l] = (in.has_saddr ? saddr_base + lo[l] : static_cast<uint64_t>(hi[l]) << 32 | lo[l]) + offset;
+        }
       }
       const Narrow nr{words, in.fast.sub != 0};
-      if (wave_scalars(w, is_store, lane, lane_addr, is_store ? in.src[1] : in.dst[0], sub_dword ? 1 : words, sub_dword ? &nr : nullptr))
+      if (words == 3 && !sub_dword ? wave_load3(w, lane, lane_addr, in.dst[0])
+                                   : wave_scalars(w, is_store, lane, lane_addr, is_store ? in.src[1] : in.dst[0], sub_dword ? 1 : words, sub_dword ? &nr : nullptr))
         return 1;
     }
     if (sub_dword) {

@@ -1637,6 +1637,9 @@ vgpu_unit_test(test_amd_gcn_mem_facts amd/tests/unit/test_gcn_mem_facts.cpp)
 target_compile_definitions(test_amd_gcn_mem_facts PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 vgpu_unit_test(test_amd_gcn_memory_same_bits amd/tests/unit/test_gcn_memory_same_bits.cpp)
 target_compile_definitions(test_amd_gcn_memory_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Gathers, and runs followed by a gather, against the lane-by-lane definition (tier and whole-wave memory calls on and off).
+vgpu_unit_test(test_amd_gcn_gather_same_bits amd/tests/unit/test_gcn_gather_same_bits.cpp)
+target_compile_definitions(test_amd_gcn_gather_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 # The pre-decoded tier against the interpreter over the same corpora (amd/tests/unit/test_gcn_tier_same_bits.cpp).
 vgpu_unit_test(test_amd_gcn_tier_same_bits amd/tests/unit/test_gcn_tier_same_bits.cpp)
 target_compile_definitions(test_amd_gcn_tier_same_bits PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
