@@ -207,23 +207,111 @@ VTEST(size_rule_margin_is_applied_to_the_whole_path) {
 VTEST(sim_time_table_needs_two_samples_and_keeps_the_smallest) {
   SimTimeTable t;
   VCHECK(!t.predict("k", 10).has_value());   // never seen: the first launch is the simulator's
-  t.record("k", 10, 5.0);                    // a cold first launch (decode, set-up): 0.5 s per block
+  t.record("k", 10, 0.2);                    // a cold first launch (decode, set-up): 20 ms per block, under kOneSampleMinSeconds
   VCHECK(!t.predict("k", 10).has_value());   // one sample is not enough: it is the cold one
-  t.record("k", 10, 0.5);                    // the warm launch: 50 ms per block
+  t.record("k", 10, 0.05);                   // the warm launch: 5 ms per block
   VCHECK(t.predict("k", 10).has_value());
-  VCHECK(*t.predict("k", 10) > 0.49 && *t.predict("k", 10) < 0.51);       // the smaller of the two
-  VCHECK(*t.predict("k", 20) > 0.99 && *t.predict("k", 20) < 1.01);       // twice the blocks, twice the time
+  VCHECK(*t.predict("k", 10) > 0.049 && *t.predict("k", 10) < 0.051);     // the smaller of the two
+  VCHECK(*t.predict("k", 20) > 0.099 && *t.predict("k", 20) < 0.101);     // twice the blocks, twice the time
   VCHECK(!t.predict("other", 10).has_value());
   t.record("k", 10, 9.0);                    // a slower launch never raises the estimate: it errs towards the simulator
-  VCHECK(*t.predict("k", 10) < 0.51);
-  t.record("k", 10, 0.1);                    // a faster one lowers it
-  VCHECK(*t.predict("k", 10) < 0.11);
+  VCHECK(*t.predict("k", 10) < 0.051);
+  t.record("k", 10, 0.01);                   // a faster one lowers it
+  VCHECK(*t.predict("k", 10) < 0.011);
 }
 
 VTEST(a_launch_that_lost_to_the_estimate_ends_offloading) {
   VCHECK(offload_paid_off(0.010, 0.050));
   VCHECK(offload_paid_off(0.050, 0.050));
   VCHECK(!offload_paid_off(0.100, 0.003));   // 3DCONV: 100 ms of copies for a 3 ms simulation
+}
+
+constexpr uint64_t kMiB = 1ull << 20;
+
+VTEST(traffic_ban_constants_are_the_replayed_ones) {   // chosen on the 64 saved traces (docs/performance.md, Round sp14); changing one needs a new replay
+  VCHECK(kTrafficLaunches == 2 && kTrafficSharePercent == 25 && kTrafficMinBytes == 12 * kMiB && kTrafficSlowShare == 0.5);
+}
+
+VTEST(traffic_ban_fires_on_the_second_heavy_launch_in_a_row) {   // LU's shape: the whole 16 MiB buffer pushed again every launch
+  TrafficTable t;
+  VCHECK(!t.record("lu", 16 * kMiB, 16 * kMiB, 0.004, 0.006));   // one heavy launch: not yet
+  VCHECK(t.record("lu", 16 * kMiB, 16 * kMiB, 0.004, 0.006));    // two in a row: banned
+  VCHECK(t.record("lu", 16 * kMiB, 16 * kMiB, 0.004, 0.006));    // and it stays so while it keeps pushing
+}
+
+VTEST(traffic_ban_needs_the_launches_in_a_row) {
+  TrafficTable t;
+  VCHECK(!t.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(!t.record("k", 0, 16 * kMiB, 0.0001, 0.006));            // a launch that pushed nothing resets the count
+  VCHECK(!t.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(t.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+}
+
+VTEST(traffic_ban_ignores_a_chain_without_pushes_and_the_first_upload) {
+  TrafficTable t;
+  VCHECK(!t.record("fdtd", 48 * kMiB, 48 * kMiB, 0.1, 0.1));      // the initial upload: heavy once (FDTD-2D)
+  for (int i = 0; i < 100; ++i) VCHECK(!t.record("fdtd", 0, 48 * kMiB, 0.0002, 0.1));   // then nothing moves
+  TrafficTable u;
+  for (int i = 0; i < 100; ++i) VCHECK(!u.record("chain", 0, 48 * kMiB, 0.0002, 0.1));
+}
+
+VTEST(traffic_ban_spares_a_big_push_that_is_a_small_share) {   // base64e: 8 MiB of hundreds, and aligned-types: big buffers pushed in pieces
+  TrafficTable t;
+  for (int i = 0; i < 10; ++i) VCHECK(!t.record("b64", 100 * kMiB, 1000 * kMiB, 0.5, 0.6));   // 10% of live: under the share
+  for (int i = 0; i < 10; ++i) VCHECK(!t.record("b64b", 249 * kMiB, 1000 * kMiB, 0.5, 0.6));  // 24.9%
+  TrafficTable v;
+  VCHECK(!v.record("exact", 250 * kMiB, 1000 * kMiB, 0.5, 0.6));   // exactly the share: not above it
+  VCHECK(!v.record("exact", 250 * kMiB, 1000 * kMiB, 0.5, 0.6));
+  VCHECK(!v.record("over", 251 * kMiB, 1000 * kMiB, 0.5, 0.6));
+  VCHECK(v.record("over", 251 * kMiB, 1000 * kMiB, 0.5, 0.6));     // one MiB over: the same pair bans
+}
+
+VTEST(traffic_ban_spares_a_small_push) {   // a share of a small heap is not traffic worth a ban
+  TrafficTable t;
+  for (int i = 0; i < 10; ++i) VCHECK(!t.record("small", 4 * kMiB, 4 * kMiB, 0.004, 0.006));
+  TrafficTable e;
+  VCHECK(!e.record("edge", 12 * kMiB, 12 * kMiB, 0.004, 0.006));   // exactly the floor: not above it
+  VCHECK(!e.record("edge", 12 * kMiB, 12 * kMiB, 0.004, 0.006));
+  VCHECK(!e.record("above", 12 * kMiB + 1, 12 * kMiB + 1, 0.004, 0.006));
+  VCHECK(e.record("above", 12 * kMiB + 1, 12 * kMiB + 1, 0.004, 0.006));
+}
+
+VTEST(traffic_ban_spares_a_launch_the_card_path_wins_by_far) {   // GRAMSCHM's shape: huge pushes, but the simulator would take 3x longer
+  TrafficTable t;
+  for (int i = 0; i < 10; ++i) VCHECK(!t.record("gs", 48 * kMiB, 48 * kMiB, 0.040, 0.120));   // 0.33 of the estimate
+  TrafficTable u;
+  VCHECK(!u.record("edge", 48 * kMiB, 48 * kMiB, 0.05, 0.10));   // exactly half the estimate: not past it
+  VCHECK(!u.record("edge", 48 * kMiB, 48 * kMiB, 0.05, 0.10));
+  VCHECK(!u.record("past", 48 * kMiB, 48 * kMiB, 0.0501, 0.10));
+  VCHECK(u.record("past", 48 * kMiB, 48 * kMiB, 0.0501, 0.10));
+}
+
+VTEST(traffic_ban_is_per_kernel) {
+  TrafficTable t;
+  VCHECK(!t.record("a", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(!t.record("b", 16 * kMiB, 16 * kMiB, 0.004, 0.006));   // another kernel's first heavy launch is not a's second
+  VCHECK(!t.record("c", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(t.record("a", 16 * kMiB, 16 * kMiB, 0.004, 0.006));    // a's second
+  VCHECK(t.record("b", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  TrafficTable u;
+  VCHECK(!u.record("a", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(!u.record("b", 0, 16 * kMiB, 0.0, 0.006));             // b's quiet launch does not reset a
+  VCHECK(u.record("a", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+}
+
+VTEST(traffic_ban_first_card_launch_counts_traffic_only) {   // its path includes the module load: no time verdict from it
+  TrafficTable t;
+  VCHECK(!t.record("k", 16 * kMiB, 16 * kMiB, 0.0001, 0.006, false));   // timing not valid: traffic alone makes it heavy
+  VCHECK(t.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006, true));
+  TrafficTable u;
+  VCHECK(!u.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+  VCHECK(!u.record("k", 16 * kMiB, 16 * kMiB, 0.0001, 0.006, true));    // a valid, fast launch resets
+  VCHECK(!u.record("k", 16 * kMiB, 16 * kMiB, 0.004, 0.006));
+}
+
+VTEST(traffic_ban_with_no_live_bytes_never_fires) {
+  TrafficTable t;
+  for (int i = 0; i < 5; ++i) VCHECK(!t.record("k", 16 * kMiB, 0, 0.004, 0.006));
 }
 
 VTEST(static_estimate_scales_with_the_grid) {   // an estimate, not a bound: see host_gpu.hpp
@@ -239,6 +327,285 @@ VTEST(static_estimate_scales_with_the_grid) {   // an estimate, not a bound: see
   VCHECK(should_offload(e, c));       // a 5 ms lower bound already pays for 3 MiB each way
   e.sim_s = static_sim_seconds(2, 32, 60, c);   // a two-block launch: far below the floor
   VCHECK(!should_offload(e, c));
+}
+
+VTEST(back_edge_scan) {   // (pc, target) of every branch of a kernel
+  VCHECK(!has_back_edge({}));
+  VCHECK(!has_back_edge({{0x20, 0x80}, {0x40, 0x60}}));   // forward branches only: a bounds check
+  VCHECK(has_back_edge({{0x20, 0x80}, {0x90, 0x30}}));    // a loop's closing branch
+  VCHECK(has_back_edge({{0x40, 0x40}}));                  // a branch to itself: a spin
+  VCHECK(has_back_edge({{0x40, 0x0}}));
+}
+
+// A PolyBench gemm_kernel launch on an A10G (80 multiprocessors): a loop, 1,024 blocks of 256 threads, about 60 static instructions, three 4 MiB matrices.
+static FirstLaunch gemm_shape() {
+  FirstLaunch f;
+  f.blocks = 1024;
+  f.threads_per_block = 256;
+  f.static_instrs = 60;
+  f.back_edge = true;
+  f.multiprocessors = 80;
+  f.live_bytes = 12ull << 20;
+  return f;
+}
+
+VTEST(first_launch_takes_a_looping_kernel_on_a_full_grid) {
+  Costs c;
+  VCHECK(first_launch_offload(gemm_shape(), c));
+}
+
+VTEST(first_launch_refuses_a_kernel_without_a_loop) {   // 3DCONV: a stencil, threads leave at a bounds check; the static count was 38x off
+  Costs c;
+  FirstLaunch f = gemm_shape();
+  f.back_edge = false;
+  VCHECK(!first_launch_offload(f, c));
+}
+
+VTEST(first_launch_refuses_a_grid_that_does_not_fill_the_machine) {   // MVT: 16 blocks
+  Costs c;
+  FirstLaunch f = gemm_shape();
+  f.static_instrs = 4000;   // so large that the margin is never what refuses: only the grid is under test
+  VCHECK(first_launch_offload(f, c));
+  f.blocks = 16;
+  VCHECK(!first_launch_offload(f, c));
+  f.blocks = 8 * f.multiprocessors - 1;
+  VCHECK(!first_launch_offload(f, c));
+  f.blocks = 8 * f.multiprocessors;   // exactly 8 per multiprocessor is enough
+  VCHECK(first_launch_offload(f, c));
+  f.multiprocessors = 0;              // a profile that does not say
+  VCHECK(!first_launch_offload(f, c));
+}
+
+VTEST(first_launch_caps_what_a_mistaken_launch_may_move) {   // 3DCONV pushed 128 MiB per launch; the cap is 256 MiB of live memory
+  Costs c;
+  FirstLaunch f = gemm_shape();
+  f.static_instrs = 100000;               // so large that the margin is no obstacle
+  f.live_bytes = 256ull << 20;
+  VCHECK(first_launch_offload(f, c));
+  f.live_bytes = (256ull << 20) + 1;
+  VCHECK(!first_launch_offload(f, c));
+}
+
+VTEST(first_launch_needs_the_estimate_to_beat_the_card_path) {
+  Costs c;
+  FirstLaunch f = gemm_shape();
+  f.static_instrs = 2;                    // a few instructions per thread: the copies cost more than the simulator would
+  VCHECK(!first_launch_offload(f, c));
+  f.static_instrs = 60;
+  f.live_bytes = 200ull << 20;            // the same kernel on 200 MiB: 33 ms of copies against 5 ms of simulation
+  VCHECK(!first_launch_offload(f, c));
+}
+
+VTEST(sim_time_table_counts_samples) {
+  SimTimeTable t;
+  VCHECK(t.samples("k") == 0);
+  t.record("k", 4, 0.1);
+  VCHECK(t.samples("k") == 1 && !t.predict("k", 4));
+  t.record("k", 4, 0.1);
+  VCHECK(t.samples("k") == 2 && t.predict("k", 4));
+  VCHECK(t.samples("other") == 0);
+}
+
+// ---- the one-sample rule: a first launch that took 0.25 s or more is estimate enough, for two offloaded launches ----
+VTEST(one_sample_is_enough_for_a_long_first_launch) {
+  SimTimeTable t;
+  t.record("k", 100, kOneSampleMinSeconds);                 // exactly at the threshold: counts
+  VCHECK(t.predict("k", 100).has_value());
+  VCHECK(*t.predict("k", 100) > 0.249 && *t.predict("k", 100) < 0.251);
+  VCHECK(*t.predict("k", 200) > 0.499 && *t.predict("k", 200) < 0.501);   // scaled by the grid
+  SimTimeTable s;
+  s.record("short", 100, kOneSampleMinSeconds * 0.99);      // just under: not a long launch
+  VCHECK(!s.predict("short", 100).has_value());
+}
+
+VTEST(one_sample_allowance_ends_after_two_offloaded_launches) {
+  SimTimeTable t;
+  t.record("k", 10, 1.0);
+  for (unsigned i = 0; i < kOneSampleOffloads; ++i) {
+    VCHECK(t.predict("k", 10).has_value());                 // still within the allowance
+    t.note_offload("k");
+  }
+  VCHECK(!t.predict("k", 10).has_value());                  // spent: the next launch is the simulator's, for the second sample
+  t.record("k", 10, 0.4);                                   // the warm sample
+  VCHECK(t.predict("k", 10).has_value());                   // two samples now: the usual rule, no allowance needed
+  VCHECK(*t.predict("k", 10) > 0.39 && *t.predict("k", 10) < 0.41);
+  t.note_offload("k");                                      // (offloads on two samples do not count against anything)
+  VCHECK(t.predict("k", 10).has_value());
+}
+
+VTEST(one_sample_allowance_is_per_kernel) {
+  SimTimeTable t;
+  t.record("a", 10, 1.0);
+  t.record("b", 10, 1.0);
+  for (unsigned i = 0; i < kOneSampleOffloads; ++i) t.note_offload("a");
+  VCHECK(!t.predict("a", 10).has_value());
+  VCHECK(t.predict("b", 10).has_value());
+  t.note_offload("never_seen");                             // no entry is made by an offload alone
+  VCHECK(!t.predict("never_seen", 10).has_value());
+  VCHECK(t.samples("never_seen") == 0);
+}
+
+VTEST(driver_start_waits_for_a_launch_of_enough_warps) {
+  VCHECK(!start_worthwhile(1, 32));                         // one warp
+  VCHECK(!start_worthwhile(2, 256));                        // 16 warps
+  VCHECK(!start_worthwhile(31, 32));
+  VCHECK(start_worthwhile(32, 32));                         // exactly kStartMinWarps
+  VCHECK(start_worthwhile(4, 256));                         // 32 warps
+  VCHECK(start_worthwhile(1, 1024));                        // one block of 32 warps
+  VCHECK(start_worthwhile(1, 1000));                     // 1000 threads round up to 32 warps
+  VCHECK(!start_worthwhile(0, 256));                        // an empty grid
+  VCHECK(start_worthwhile(1ull << 40, 33));                 // a huge grid does not overflow
+}
+
+// ---- the division idiom (host_gpu.hpp division_idiom_only), on the shape ptxas 13.0 gave `a / b` for sm_86 (cuobjdump of an own kernel) ----
+using K = CodeInsn::Kind;
+static CodeInsn ci(K kind, uint64_t pc, int64_t target = -1, int src0 = -1, int src1 = -1) {
+  CodeInsn c;
+  c.kind = kind;
+  c.pc = pc;
+  c.target = target;
+  c.src0 = src0;
+  c.src1 = src1;
+  return c;
+}
+// main line: ... MUFU.RCP R8, R3 ; FCHK P0, R0, R3 ; FFMA x5 ; @!P0 BRA ; MOV ; CALL -> slow ; ... EXIT ; slow: ALU..., MUFU.RCP R8, R3, ALU..., RET
+static std::vector<CodeInsn> division_kernel() {
+  std::vector<CodeInsn> c;
+  uint64_t pc = 0;
+  const auto add = [&](K k, int64_t target = -1, int s0 = -1, int s1 = -1) { c.push_back(ci(k, pc, target, s0, s1)); pc += 16; };
+  add(K::Other);                    // LDG is Memory only inside a subroutine: here it is the kernel's own load
+  add(K::Other);
+  add(K::MufuRcp, -1, 3);           // MUFU.RCP R8, R3
+  add(K::Fchk, -1, 0, 3);           // FCHK P0, R0, R3
+  for (int i = 0; i < 5; ++i) add(K::Other);   // FFMAs
+  add(K::Other);                    // @!P0 BRA
+  add(K::Other);                    // MOV R4, return
+  add(K::Call, 0);                  // target patched below
+  add(K::Other);
+  add(K::Other);                    // STG
+  add(K::Other);                    // EXIT
+  const size_t slow_at = c.size();
+  const uint64_t slow_pc = pc;
+  add(K::Other);
+  add(K::Other);
+  add(K::MufuRcp, -1, 3);           // the slow path's own MUFU.RCP, no FCHK
+  add(K::Other);
+  add(K::Ret);
+  for (CodeInsn& x : c)
+    if (x.kind == K::Call) x.target = static_cast<int64_t>(slow_pc);
+  (void)slow_at;
+  return c;
+}
+
+VTEST(division_idiom_is_recognized) {
+  VCHECK(division_idiom_only(division_kernel()));
+}
+
+VTEST(division_idiom_refuses_a_bare_reciprocal) {
+  // rcp.approx.ftz.f32: one MUFU.RCP and nothing that makes the result independent of its last bit
+  VCHECK(!division_idiom_only({ci(K::Other, 0), ci(K::MufuRcp, 16, -1, 3), ci(K::Other, 32), ci(K::Other, 48)}));
+  // an FCHK of another register is not the divisor's
+  auto c = division_kernel();
+  for (CodeInsn& x : c)
+    if (x.kind == K::Fchk) x.src1 = 4;
+  VCHECK(!division_idiom_only(c));
+  // an FCHK too far after the MUFU
+  c = division_kernel();
+  for (size_t i = 0; i < c.size(); ++i)
+    if (c[i].kind == K::MufuRcp) {
+      std::vector<CodeInsn> d(c.begin(), c.begin() + static_cast<std::ptrdiff_t>(i + 1));
+      for (unsigned k = 0; k < kIdiomMufuToFchk; ++k) d.push_back(ci(K::Other, 1000 + k));
+      d.push_back(ci(K::Fchk, 2000, -1, 0, 3));
+      VCHECK(!division_idiom_only(d));
+      break;
+    }
+}
+
+VTEST(division_idiom_refuses_other_sfu_and_calls) {
+  auto c = division_kernel();
+  c[0].kind = K::MufuOther;                        // an EX2 anywhere
+  VCHECK(!division_idiom_only(c));
+  c = division_kernel();
+  for (CodeInsn& x : c)
+    if (x.kind == K::Fchk) x.kind = K::Other;       // no FCHK: the CALL is not a division's slow path
+  VCHECK(!division_idiom_only(c));
+  c = division_kernel();
+  c.back() = ci(K::Other, c.back().pc);             // a subroutine that never returns
+  VCHECK(!division_idiom_only(c));
+  c = division_kernel();
+  c[c.size() - 2].kind = K::Memory;                 // a subroutine that touches memory is not the slow path
+  VCHECK(!division_idiom_only(c));
+  c = division_kernel();
+  c.insert(c.begin() + 1, ci(K::Ret, 8));           // a RET outside any subroutine
+  VCHECK(!division_idiom_only(c));
+  c = division_kernel();
+  for (CodeInsn& x : c)
+    if (x.kind == K::Call) x.target = 9999;         // a call to an address that is not an instruction
+  VCHECK(!division_idiom_only(c));
+}
+
+VTEST(division_idiom_refuses_a_device_function_call) {
+  // a __noinline__ function: a CALL to a subroutine and a RET, with no division and no FCHK anywhere -- not the slow path, so not the idiom
+  VCHECK(!division_idiom_only({ci(K::Other, 0), ci(K::Call, 16, 64), ci(K::Other, 32), ci(K::Other, 48), ci(K::Other, 64), ci(K::Ret, 80)}));
+  // with an FCHK far before the call (outside kIdiomFchkToCall instructions) it is still not
+  std::vector<CodeInsn> c = {ci(K::Fchk, 0, -1, 0, 1)};
+  for (unsigned k = 1; k <= kIdiomFchkToCall + 1; ++k) c.push_back(ci(K::Other, 16 * k));
+  const uint64_t call_pc = 16 * (kIdiomFchkToCall + 2);
+  c.push_back(ci(K::Call, call_pc, static_cast<int64_t>(call_pc + 32)));
+  c.push_back(ci(K::Other, call_pc + 16));
+  c.push_back(ci(K::Other, call_pc + 32));
+  c.push_back(ci(K::Ret, call_pc + 48));
+  VCHECK(!division_idiom_only(c));
+}
+
+VTEST(division_idiom_takes_the_nan_generator_only_in_the_slow_path) {
+  auto c = division_kernel();
+  c[c.size() - 2].kind = K::NanGen;                 // inside the subroutine: the slow path's 0/0 case
+  VCHECK(division_idiom_only(c));
+  c = division_kernel();
+  c[0].kind = K::NanGen;                            // in the kernel's own code: a bare NaN constant through an SFU instruction
+  VCHECK(!division_idiom_only(c));
+}
+
+VTEST(division_idiom_takes_two_divisions_sharing_a_slow_path) {
+  auto one = division_kernel();
+  // a second MUFU.RCP/FCHK/CALL group before the slow path, calling the same subroutine
+  std::vector<CodeInsn> c;
+  uint64_t slow_pc = 0;
+  for (const CodeInsn& x : one)
+    if (x.kind == K::Call) slow_pc = static_cast<uint64_t>(x.target);
+  for (const CodeInsn& x : one) {
+    if (x.pc == slow_pc) {
+      c.push_back(ci(K::MufuRcp, slow_pc - 1000, -1, 6));
+      c.push_back(ci(K::Fchk, slow_pc - 999, -1, 5, 6));
+      c.push_back(ci(K::Call, slow_pc - 998, static_cast<int64_t>(slow_pc)));
+    }
+    c.push_back(x);
+  }
+  VCHECK(division_idiom_only(c));
+}
+
+VTEST(idiom_classification_by_mnemonic) {
+  VCHECK(classify_for_idiom("MUFU", {"RCP"}) == K::MufuRcp);
+  VCHECK(classify_for_idiom("MUFU", {"RCP64H"}) == K::MufuOther);
+  VCHECK(classify_for_idiom("MUFU", {"EX2"}) == K::MufuOther);
+  VCHECK(classify_for_idiom("MUFU", {"RCP", "F16"}) == K::MufuOther);
+  VCHECK(classify_for_idiom("MUFU", {"RSQ"}) == K::MufuOther);                  // an RSQ of a register is an SFU result
+  VCHECK(classify_for_idiom("MUFU", {"RSQ"}, true) == K::NanGen);                // of an immediate NaN it is the division's NaN generator
+  VCHECK(classify_for_idiom("MUFU", {"EX2"}, true) == K::MufuOther);
+  VCHECK(classify_for_idiom("MUFU", {"RCP"}, true) == K::MufuRcp);
+  VCHECK(classify_for_idiom("FCHK", {}) == K::Fchk);
+  VCHECK(classify_for_idiom("CALL", {"REL", "NOINC"}) == K::Call);
+  VCHECK(classify_for_idiom("RET", {"REL", "NODEC"}) == K::Ret);
+  VCHECK(classify_for_idiom("LDG", {"E"}) == K::Memory);
+  VCHECK(classify_for_idiom("SHFL", {}) == K::Memory);
+  VCHECK(classify_for_idiom("HMMA", {}) == K::Memory);        // not in the exact set: not arithmetic of the slow path
+  VCHECK(classify_for_idiom("FFMA", {"RM"}) == K::Other);
+  VCHECK(classify_for_idiom("SHF", {"R", "U32", "HI"}) == K::Other);
+  // the default exact set itself is unchanged by all of this
+  VCHECK(!exact_opcode_allowed("MUFU", {"RCP"}));
+  VCHECK(!exact_opcode_allowed("CALL", {"REL", "NOINC"}));
+  VCHECK(!exact_opcode_allowed("RET", {"REL", "NODEC"}));
 }
 
 VTEST_MAIN

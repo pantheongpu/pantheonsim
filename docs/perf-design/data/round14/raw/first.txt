@@ -1,0 +1,10 @@
+GEMM     off    1.15 | no rule    1.44 (0 launches ran on the card, 1 in the simulator) | rule    0.66 (1 launches ran on the card, 0 in the simulator) first-launch-offloads=1 out same
+SYRK     off    8.30 | no rule    8.71 (0 launches ran on the card, 1 in the simulator) | rule    1.29 (1 launches ran on the card, 0 in the simulator) first-launch-offloads=1 out same
+SYR2K    off   16.34 | no rule   16.55 (0 launches ran on the card, 1 in the simulator) | rule    2.31 (1 launches ran on the card, 0 in the simulator) first-launch-offloads=1 out same
+3MM      off    3.50 | no rule    3.68 (0 launches ran on the card, 3 in the simulator) | rule    1.47 (3 launches ran on the card, 0 in the simulator) first-launch-offloads=3 out same
+2DCONV   off    1.05 | no rule    1.27 (0 launches ran on the card, 1 in the simulator) | rule    0.94 (1 launches ran on the card, 0 in the simulator) first-launch-offloads=1 out same
+3DCONV   off    0.86 | no rule    1.11 (0 launches ran on the card, 254 in the simulator) | rule    1.11 (0 launches ran on the card, 254 in the simulator) first-launch-offloads=0 out same
+GEMVER   off    0.92 | no rule    1.20 (0 launches ran on the card, 3 in the simulator) | rule    0.84 (1 launches ran on the card, 2 in the simulator) first-launch-offloads=1 out same
+MVT      off    2.13 | no rule    2.21 (0 launches ran on the card, 2 in the simulator) | rule    2.21 (0 launches ran on the card, 2 in the simulator) first-launch-offloads=0 out same
+FDTD-2D  off  122.70 | no rule    4.86 (1494 launches ran on the card, 6 in the simulator) | rule    4.77 (1494 launches ran on the card, 6 in the simulator) first-launch-offloads=3 out same
+FINISHED

@@ -1,0 +1,9 @@
+LU | in-set identical 9 different 0 | outside-set identical 0 different 0 | traffic-bans 0
+GRAMSCHM | in-set identical 9 different 0 | outside-set identical 0 different 0 | traffic-bans 0
+FDTD-2D | in-set identical 8 different 0 | outside-set identical 0 different 0 | traffic-bans 0
+JACOBI2D | in-set identical 40 different 0 | outside-set identical 0 different 0 | traffic-bans 0
+babelstream-cuda | in-set identical 0 different 0 | outside-set identical 0 different 0 | traffic-bans 0
+base64e-cuda | in-set identical 6 different 0 | outside-set identical 0 different 0 | traffic-bans 0
+GEMM | in-set identical 1 different 0 | outside-set identical 0 different 0 | traffic-bans 0
+SYRK | in-set identical 0 different 0 | outside-set identical 0 different 0 | traffic-bans 0
+FINISHED

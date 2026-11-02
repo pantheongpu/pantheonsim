@@ -1,0 +1,74 @@
+# Host-GPU mode on a real card (docs/performance.md "Round sp15"; plan in docs/perf-design/09-host-gpu-spike.md section 6). Hosted CI has no GPU, so
+# e2e_host_gpu skips there; this workflow gives the mode a card: it launches ONE ephemeral g5.xlarge (NVIDIA A10G) with tools/card-ci/card-runner.sh, runs
+# tools/card-ci/run-card-ci.sh on it, and terminates it whatever happened. About 35 to 50 minutes, about $0.70 a run.
+#
+# NOT SCHEDULED, on purpose: it launches AWS instances, which the maintainer approves. To turn it on:
+#   1. repository secrets  CARD_CI_AWS_ACCESS_KEY_ID / CARD_CI_AWS_SECRET_ACCESS_KEY  (an IAM user limited to ec2 run/terminate/describe, see card-runner.sh) and
+#      CARD_CI_GH_TOKEN (administration on this repository: it makes the runner's registration token);
+#   2. run it by hand first (Actions > card-host-gpu > Run workflow) and read the log;
+#   3. then uncomment the `schedule` below (weekly is about $3 a month) and, if wanted, the pull_request paths filter for host_gpu changes by maintainers.
+# Never on pull_request from forks: the job runs repository code on a machine with cloud credentials nearby.
+name: card-host-gpu
+on:
+  workflow_dispatch:
+    inputs:
+      stride:
+        description: 'Every Nth float pattern in the SFU/division checks (1 = all 2^32, about 10 minutes more)'
+        default: '257'
+      mutation:
+        description: 'Negative control: only the division check, with the card side nudged; the job passes only if the check notices'
+        type: boolean
+        default: false
+# schedule:
+#   - cron: '17 5 * * 0'
+permissions:
+  contents: read
+concurrency:
+  group: card-host-gpu
+  cancel-in-progress: false
+jobs:
+  launch:
+    runs-on: ${{ vars.CARD_LAUNCHER_RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    outputs:
+      instance: ${{ steps.start.outputs.instance }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: start
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CARD_CI_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CARD_CI_AWS_SECRET_ACCESS_KEY }}
+          GH_TOKEN: ${{ secrets.CARD_CI_GH_TOKEN }}
+        run: |
+          out="$(tools/card-ci/card-runner.sh start)"
+          echo "$out"
+          echo "instance=$(echo "$out" | sed -n 's/^instance=//p')" >> "$GITHUB_OUTPUT"
+  card:
+    needs: launch
+    runs-on: [pantheonsim-card]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Card CI
+        if: ${{ !inputs.mutation }}
+        env:
+          CARD_CI_STRIDE: ${{ inputs.stride || '257' }}
+        run: tools/card-ci/run-card-ci.sh "$RUNNER_TEMP/build"
+      - name: Negative control (the division check must notice a nudged card result)
+        if: ${{ inputs.mutation }}
+        env:
+          HOSTGPU_SFU_MUTATE: '1'
+          CARD_CI_STRIDE: ${{ inputs.stride || '257' }}
+        run: tools/card-ci/run-card-ci.sh "$RUNNER_TEMP/build"
+  stop:
+    needs: [launch, card]
+    if: ${{ always() && needs.launch.outputs.instance != '' }}
+    runs-on: ${{ vars.CARD_LAUNCHER_RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CARD_CI_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CARD_CI_AWS_SECRET_ACCESS_KEY }}
+          GH_TOKEN: ${{ secrets.CARD_CI_GH_TOKEN }}
+        run: tools/card-ci/card-runner.sh stop "${{ needs.launch.outputs.instance }}"

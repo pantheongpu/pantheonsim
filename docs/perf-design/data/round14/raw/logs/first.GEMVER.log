@@ -1,0 +1,5 @@
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+host_gpu: _Z14gemver_kernel1iffPfS_S_S_S_: first launch decided by the static rule (loop, 65536 blocks)
+host_gpu: _Z14gemver_kernel1iffPfS_S_S_S_ on the card (resident): kernel 0.307 ms, total 28.319 ms (sim estimate 209.715 ms), 64.12 MiB pushed
+host_gpu: 1 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 64.1 MiB went to the card, 64.1 MiB came back
