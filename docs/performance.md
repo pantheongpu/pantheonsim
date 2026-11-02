@@ -6418,3 +6418,53 @@ bench.py canaries (13 workloads x SASS and PTX, 15 alternating runs, cpu 10, cou
 | rodinia hotspot | 0.941 | 0.959 | <0.001 |
 | rodinia gaussian | 0.880 | 0.898 | <0.001 |
 The gains add: the gather-bound rows keep part 1's gain (ATAX 0.797 alone), the short-kernel rows keep part 2's (gaussian 0.917 alone, hotspot 0.967 alone). Part 2 moves six bench.py canary rows more than 2% the wrong way (`wmma` PTX 0.978, `shared` PTX 0.975, `atomics` SASS 0.981, `atomics` PTX 0.975, `api` SASS 0.971, `api` PTX 0.973; 25 runs beside an A/A of 1.000-1.003) on workloads whose executed code it does not touch; read as code placement in the single LTO unit, not fixed (see the layout notes of rounds sp4 to sp10).
+
+## Round sp17: the AMD memory path on real programs (branch `sp17-amd`, base `sp15-speed-pr` 4a5185a3)
+
+The question: the sp16 profile of the real programs put a quarter of the AMD cycles in the memory path (`wave_scalars`, `tier_global`, `memory_run`, `load_batch_in`, `batch_addresses_ok`; 78 % of SYR2K) and 12 % in the `run_groups` loop. Measured first, with `perf record -e cycles:u` on the 20 PolyBench/GPU programs hipified and built for gfx942 (`hipcc -O2`, one thread, `amd/mi300x`), then changed in the order the profile gave.
+
+### What was found
+* `MemoryManager::load_batch` has a one-pass path (tests and loads together, Round sp10) that is taken for at most **32** lanes: a CDNA wave is 64, so every gathering load of every wave64 program took the two-step path (`batch_addresses_ok`, then `load_batch_in`): 28 + 8 % of SYR2K.
+* `wave_scalars` copied the active lanes' addresses into a list lane by lane (`ctz` walk), gathered the store data and scattered the loaded values through a lane-index list, for a wave that is almost always whole. `tier_global` built its address row the same way.
+* The 8-byte loads of a stencil (the compiler merges `A[j-1]` and `A[j]` into one `global_load_dwordx2`, and three neighbours into a `dwordx3`) are on a 4-byte boundary in every other lane: the batch declines on the first misaligned address and **every lane went through `load_words` and `MemoryManager::load_scalar` one at a time** (2DCONV 45 % of its cycles, JACOBI1D 37 %).
+* `memory_run` asked every gathering instruction's first lane whether a run starts there, with a call; and its run length was a lane-by-lane loop of about 11 instructions a lane (70 % of the function's cycles).
+
+### What changed
+1. `load_batch`: the one-pass path for up to 64 lanes (one constant).
+2. `Machine::wave_scalars`: a wave whose lanes from `from` to the last are all active (the usual case) uses the caller's address row and the register rows directly, with counted loops; `tier_global` fills its address row the same way (`amd/src/gcn_exec.cpp`, `amd/src/gcn_tier_machine.inc`).
+3. `Machine::load_wave`, `Machine::wave_load3`: the lane-by-lane rule of `load_words` (a pair on an 8-byte boundary is one 8-byte access, a pair on a 4-byte boundary is two word accesses, a three-word load is an aligned pair and a word) done as two batches, one of 8-byte loads and one of 4-byte loads, when the whole-wave batch declines for alignment. Loads only: stores keep their lane order.
+4. `tier_global` does not call `memory_run` for a lane whose next lane is off or has the wrong address (the call would count one lane and hand back 0).
+5. `include/vgpu/exec/amd_run_scan.hpp`: the run length of the lanes' addresses four lanes to a vector (SSE2) where the low words cannot wrap round 2^32 over the lanes asked about, the lane loop (`run_scan_reference`) otherwise; `memory_run` uses it.
+
+### Results (counters, registers and memory identical in every run)
+Zen 5 (server2, `taskset` on one core, `VGPU_THREADS=1`, user-time median of 9 runs (SYRK, SYR2K, LU: 3), A = `sp15-speed-pr`, W = this branch, A2 = a copy of A made at the same time; the box also runs a CI runner, so load was 2 to 13):
+| program | W/A | A2/A | | program | W/A | A2/A |
+|---|---:|---:|---|---|---:|---:|
+| 2DCONV | 0.626 | 0.981 | | GEMM | 0.775 | 1.020 |
+| JACOBI1D | 0.673 | 1.000 | | 3MM | 0.767 | 0.977 |
+| JACOBI2D | 0.762 | 1.000 | | GEMVER | 0.791 | 1.030 |
+| GESUMMV | 0.694 | 1.028 | | ATAX | 0.805 | 1.039 |
+| SYRK | 0.675 | 0.960 | | MVT | 0.817 | 1.012 |
+| SYR2K | 0.684 | 0.995 | | LU | 0.898 | 1.013 |
+| BICG | 0.759 | 1.034 | | 3DCONV | 0.951 | 1.000 |
+Zen 4 (server3, `perf stat -e instructions:u,cycles:u`, one run each, pinned): instructions W/A and cycles W/A: 2DCONV 0.515 / 0.59, JACOBI1D 0.557 / 0.63, JACOBI2D 0.678 / 0.73, GESUMMV 0.652 / 0.71, BICG 0.676 / 0.69, ATAX 0.754 / 0.75, MVT 0.755 / 0.78, GEMVER 0.760 / 0.78, GEMM 0.767 / 0.84, 3MM 0.759 / 0.77, SYRK 0.684 / 0.64, SYR2K 0.654 / 0.62, CORR 0.772 / 0.86, LU 0.890 / 0.89, 3DCONV 0.944 / 0.95.
+Instructions retired fell 5 to 49 % on all fifteen.
+
+`bench-amd` canary (mi300x, 44 rows, one thread, 9 runs, Zen 5; counters identical in all 44): `mem` 1.295, `narrow` 1.612, `lds` 1.141, `ldsx` 1.070, `flat` 1.051, `buf` 1.045, `launch_wide` 1.048, `launch_mid` 1.043 against an A/A (a copy of A, same window) of 1.012, 1.012, 1.016, 1.007, 0.998, 0.998, 1.000, 1.001. The rows that lose at equal counters, from three windows (the first two with a copy pair): `mfma` 0.971 / 0.969 / 0.965 (the copy pair 0.960; A/A 1.002), `smfmac` 0.970 / 0.981 / 0.977 (A/A 1.001), `divergent` 0.968 / 0.979 / 0.964 (A/A 0.997), `p_sbuf` 0.943 / 0.942 / 0.943 (the copy pair 1.038: it depends on the file, as in Round sp15). Rows that swing between copies of one library whatever the change (`valu_int` 1.06, `mfma_f64` 1.08, `mfma_f64_4b` 1.13, `wave` 1.07 on A/A as well) are not claimed.
+
+### The layout lottery, again
+The interpreter is the one AMD unit that is still link-time optimized, so every edit of `gcn_exec.cpp` re-rolls the placement of everything in it. Variants tried on the same rows (all at equal counters): `load_wave` out of line with the run check in `tier_global`: `mfma` 1.00 to 1.01, `smfmac` 0.99 to 1.00, `divergent` **0.92 to 0.93**, `p_sbuf` 0.94; `load_wave` out of line without the run check: `mfma` 0.98, `smfmac` 0.986, `divergent` 0.98 to 0.996, `p_sbuf` 0.926. The run check is worth about 3 % of the instructions and cycles on the gather programs (ATAX 14.01 G -> 13.67 G instructions, SYR2K 316.4 G -> 307.3 G), and the swings of the rows above are the size of the lottery, so the version with both is kept. `lint_hot_unit_layout` passes; the hot units' machine code is unchanged (compared with `objdump -d`), `memory.cpp` differs in one immediate (64 for 32).
+
+### Tests (CMake-wired) and mutations
+* `test_amd_gcn_gather_same_bits` (`amd/tests/unit/test_gcn_gather_same_bits.cpp`; new flavours 21 to 24 of `amd::digest_instruction`): every flat / global instruction of the ISA corpora (gfx942, gfx950, gfx90a, gfx1100 and gfx1030, wave32 and wave64) on a wave whose addresses are consecutive, scattered, a run and then a gather (every lane the gather can start at), a word apart for 2 and 3 words (overlap), with lanes on one address and lanes off, run four ways (tier and the whole-wave memory calls on and off, `amd::set_fast_paths`) and held to the lane-by-lane run (tier off, whole-wave calls off). No recorded digest. Mutants killed: gather count one short, the saddr address loop without the offset (or one lane late), the non-saddr address plus 4, a gapped wave taken for a whole one (in `wave_scalars`), store data from the wrong lane, a pair's high word dropped, pair halves swapped (in `load_wave`), the second word of a split pair at +8, the three-word order and the word address of `wave_load3`, three-word stores batched as loads (segfault). Not killable, so equivalent: the one-read-per-address copy (no other thread writes in the test), a wrong high shift in the address row (the batch declines and the lanes go one at a time, correctly), the whole-row loop accepting a gap (it only computes addresses nothing uses), the alignment test of `wave_load3` (a misaligned pair makes the batch decline), the last aligned pair copied in `load_wave` (the declined batch had already left the aligned lanes' values).
+* `test_gather_sp10` (existing): counts 1 to 64 for the one-pass path, 65 to 104 for the two-step one, the wrong lane anywhere in the wave. Mutant killed: the bounds test skipped for lanes past 32.
+* `test_amd_run_scan` (`tests/unit/test_amd_run_scan.cpp`): 200,000 random rows against `run_scan_reference` (pair and base forms, strides 4, 8, 16, runs broken at any lane, a high word that differs, a wrapping low word, every reach). Mutants killed: the tail off by one, the high word expected zero, the wrap check dropped, the step wrong, the first mismatching lane off by one; the base form's redundant range test removed as equivalent.
+* The existing `test_amd_gcn_memory_same_bits`, `test_amd_gcn_tier_same_bits` (and `_simd_base`), `test_amd_gcn_same_bits`, `test_amd_matrix_fast`, `test_amd_gcn_memruns` (five targets), `bench_amd_counters`, `lint_hot_unit_layout` and all 284 `amd` tests (4 fail on `sp15-speed-pr` too: they need targets this configuration does not build) pass.
+
+### Card oracle (server2: RX 6800 = HIP device 0 gfx1030, RX 6700 XT = device 1 with `HSA_OVERRIDE_GFX_VERSION=10.3.0`)
+`gather_oracle.hip` (kept out of the repo): 12 integer-only kernels (overlapping `dwordx2/x3/x4` loads at word alignment, gathers, a pair gather, a run then a gather, scatters, pair stores, byte and short accesses, lanes on one address, partial waves) with one FNV hash per output buffer. The hashes on the sim equal the card's on both cards (`amd/rx6800` and `amd/rx6700xt`), A and W identical on `amd/rx6800`, `amd/rx6700xt` and `amd/mi300x` (and the gfx942 hashes equal the gfx1030 card's), and the same with the default thread count.
+
+### Not done
+* `dwordx4` loads on a 4-byte boundary (a quad on a 16-byte boundary is one atomic access, the others pairs and words) and the stores of the same shapes still go lane by lane when they are not runs.
+* The `run_groups` loop (12 % of the AMD cycles): about 45 instructions of bookkeeping around each handler call (four read-modify-write counters, the state checks of `tier_step`, the `Inst::next` chain), spread out; nothing small and bit-safe stood out, and the `divergent` row says what an edit near it costs in layout.
+* `fix_nan32` (25 % of GRAMSCHM, 13 % of LU, programs that compute with NaNs): `std::fma` is called for lanes whose operands are NaN already.
