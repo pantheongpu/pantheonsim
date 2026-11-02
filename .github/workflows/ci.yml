@@ -870,7 +870,7 @@ jobs:
           VGPU_TIER_ARCHS: "sm_80 sm_90"
           VGPU_TIER_PROGRAMS: "sass_tier_steps:75"
         run: |
-          single_thread='test_amd_gcn_same_bits|test_amd_gcn_tier_same_bits|test_amd_gcn_memory_same_bits|test_amd_gcn_packed_same_bits|test_amd_matrix_fast|test_decode_same_bits|test_hevc_decode|test_h264_decode|test_mpeg2_decode|test_nvenc_.*'
+          single_thread='test_amd_gcn_same_bits|test_amd_gcn_gather_same_bits|test_amd_gcn_tier_same_bits|test_amd_gcn_memory_same_bits|test_amd_gcn_packed_same_bits|test_amd_matrix_fast|test_decode_same_bits|test_hevc_decode|test_h264_decode|test_mpeg2_decode|test_nvenc_.*'
           setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -j"$(ci/jobs.sh -g 6 -m 2)" -E "^(pantheon_workloads|$single_thread)$"
 
       # The jobs run as root in the container, in a workspace that belongs to the runner's

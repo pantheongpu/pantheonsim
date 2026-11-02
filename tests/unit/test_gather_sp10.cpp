@@ -1,5 +1,5 @@
 // A warp's gather load (MemoryManager::load_batch, whose tests and loads share their passes) against the definition: each lane a
-// load_scalar of its width, over every kind of chunk (untouched, uniform, real), warps of every size up to a warp and past it,
+// load_scalar of its width, over every kind of chunk (untouched, uniform, real), waves of every size up to 64 lanes and past it,
 // every width, addresses scattered over the whole allocation. Where any lane is out of the allocation or misaligned the batch
 // declines (its output is then of no use); a load_batch_in-based window load (batch_window / batch_load) gives the same values.
 #include <cstdint>
@@ -45,17 +45,18 @@ VTEST(a_gather_load_gives_each_lane_what_load_scalar_gives_over_every_kind_of_ch
   for (int it = 0; it < 30000; ++it) {
     static const uint32_t widths[] = {1, 2, 4, 8};
     const uint32_t w = widths[rng.below(4)];
-    size_t count = 1 + rng.below(32);
-    if (it % 50 == 0) count = 33 + rng.below(40);   // more than a warp: the two-step path
+    size_t count = 1 + rng.below(64);   // (up to a CDNA wave, 64 lanes: the one-pass path)
+    if (it % 50 == 0) count = 65 + rng.below(40);   // more than a wave: the two-step path
     std::vector<uint64_t> addrs(count), out(count), want(count);
     const bool allreal = it % 3 == 0;   // a warp wholly on real chunks (the straight loop), or anywhere
     bool bad = false;
     unsigned kinds = 0;
+    const size_t bad_lane = rng.below(count);   // (where the wrong lane is, in the ones that have one: any lane of the wave)
     for (size_t i = 0; i < count; ++i) {
       const uint64_t span = allreal ? kChunkSize : total;
       uint64_t off = rng.below(span / w) * w;
       if (allreal) off += (rng.below(2) ? 3 : 6) * kChunkSize % (total - kChunkSize + 1);
-      if (it % 7 == 0 && i == count / 2) {   // one lane that is wrong: past the end, below the base or misaligned
+      if (it % 7 == 0 && i == bad_lane) {   // one lane that is wrong: past the end, below the base or misaligned
         const unsigned how = static_cast<unsigned>(rng.below(3));
         if (how == 0) off = total - w + w * (1 + rng.below(3));
         else if (how == 1) off = 0 - w * (1 + rng.below(3));

@@ -689,7 +689,7 @@ bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t siz
   uint64_t base = 0;
   // A warp's loads where no host mapping is in reach: the tests of batch_addresses_ok and the loads of load_batch_in in one pass.
   // Anything else (more than a warp, a host mapping that may be in the allocation) takes the two steps.
-  if (count <= 32 && (a = find_ordinary(addrs[0], size, &base)) && host_map_free_span(base, a->size)) {
+  if (count <= 64 && (a = find_ordinary(addrs[0], size, &base)) && host_map_free_span(base, a->size)) {
     const uint64_t limit = a->size - size + 1;   // (the first access is inside, so size <= a->size)
     const std::atomic<uint8_t*>* chunks = a->chunks.get();
     const auto each = [&](auto width) {

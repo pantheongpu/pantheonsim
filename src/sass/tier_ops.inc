@@ -2040,14 +2040,13 @@ inline void tier_wake(Warp& w, Mask m) { exec::sasslanes::wake(w, m); }
 
 // BSYNC's release (exec_control's release_bsync): once every lane of barrier Bx that is still a thread of the block waits at a
 // BSYNC on it, they all go on past it and the barrier is free for its next BSSY. Lanes that wait at a BSYNC on Bx but are not
-// named by the barrier (a callee that shares Bx with its caller) stay.
-inline void tier_release_bsync(Warp& w, unsigned x) {
+// named by the barrier (a callee that shares Bx with its caller) stay. Here the lanes of `ex` run BSYNC Bx: they start to wait, then the
+// barrier is released if all its lanes have arrived (without reading back what the wait has just stored: exec::sasslanes::bsync_arrive).
+inline void tier_bsync(Warp& w, Mask ex, unsigned x) {
   const Mask members = w.b[x] & w.alive & ~w.exited;
-  Mask arrived = tier_waiting_on(w, Wait::BSync, x);   // (the lanes that wait at a BSYNC on Bx)
-  if (members) arrived &= members;
-  if ((members & ~arrived) == 0 && arrived) {
-    tier_wake(w, arrived);
-    w.b[x] &= ~arrived;   // they have converged: the barrier is free for its next BSSY
+  if (const Mask release = exec::sasslanes::bsync_arrive(w, ex, Wait::BSync, x, members)) {
+    tier_wake(w, release);
+    w.b[x] &= ~release;
   }
 }
 
@@ -2561,9 +2560,8 @@ bool Runner::tier_run_t(Block& blk, Warp& w, Mask group, uint64_t pick, const Co
       st.inst_by_class[last.cls] += lanes;
       if (idx != first) tier_set_pcs(w, group, here);
       const unsigned x = last.c;
-      tier_wait(w, ex, Wait::BSync, x);
+      tier_bsync(w, ex, x);
       for (Mask m = group & ~ex; m; m &= m - 1) w.pc[std::countr_zero(m)] += 16;
-      tier_release_bsync(w, x);
       if (tier_stats_) [[unlikely]] tier_stats().native[static_cast<size_t>(Op::BSYNC)].fetch_add(1, std::memory_order_relaxed);
     } else if (last.form == tier::Form::Call || last.form == tier::Form::Ret || last.form == tier::Form::Warpsync) {
       // CALL, RET and WARPSYNC (a function of their own: they are rare beside the straight-line work, and the loop is placement-sensitive;

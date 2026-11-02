@@ -282,4 +282,8 @@ class Runtime {
   int visibility_error_ = 0;
 };
 
+// The "by opcode" line of the VGPU_COUNTERS report for per-opcode issue counts
+// indexed by opcode id (ptx::opcode_names()): empty when nothing was issued.
+std::string opcode_summary(const std::vector<uint64_t>& issues, const std::vector<std::string>& names);
+
 }  // namespace vgpu::runtime

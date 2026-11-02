@@ -122,6 +122,53 @@ VTEST(set_pcs_and_select_pcs_agree_with_the_lane_loop) {
   }
 }
 
+// bsync_arrive is `wait`, then the lanes that wait at the barrier (limited to its members), released when every member has arrived: the
+// reference below is exactly that, written lane by lane.
+VTEST(bsync_arrive_agrees_with_wait_then_release) {
+  std::mt19937_64 rng(23);
+  unsigned released = 0, held = 0, nomember = 0;
+  for (int round = 0; round < 60000; ++round) {
+    MockWarp a;
+    for (unsigned l = 0; l < 32; ++l) a.pc[l] = 0x1000 + 16 * (rng() % 9);
+    a.waiting = random_mask(rng);
+    for (unsigned l = 0; l < 32; ++l) {
+      // mostly BSYNC (kind 1) on barrier 0 or 1, some other kinds and arguments, so that both a match and a near miss occur
+      a.wait_kind[l] = ((a.waiting >> l) & 1) ? static_cast<uint8_t>(rng() % 8 ? 1 : 1 + rng() % 4) : 0;
+      a.wait_arg[l] = static_cast<uint32_t>(rng() % 8 ? 0 : rng() % 3);
+    }
+    const Mask ex = random_mask(rng) & ~a.waiting;   // (lanes that run the BSYNC are not waiting)
+    // The barrier's members: lanes that wait or arrive now (the likely release), or random lanes, or none.
+    Mask members;
+    switch (rng() % 4) {
+      case 0: members = 0; break;
+      case 1: members = random_mask(rng); break;
+      default: members = (a.waiting | ex) & ~(rng() % 3 == 0 ? Mask{1} << (rng() % 32) : 0); break;
+    }
+    const uint8_t kind = 1;
+    const uint32_t arg = static_cast<uint32_t>(rng() % 3);
+    MockWarp ref = a;
+    for (Mask m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctz(m));
+      ref.wait_kind[l] = kind;
+      ref.wait_arg[l] = arg;
+    }
+    ref.waiting |= ex;
+    Mask arrived = 0;
+    for (unsigned l = 0; l < 32; ++l)
+      if (((ref.waiting >> l) & 1) && ref.wait_kind[l] == kind && ref.wait_arg[l] == arg) arrived |= Mask{1} << l;
+    if (members) arrived &= members;
+    const Mask expect = ((members & ~arrived) == 0 && arrived) ? arrived : 0;
+    VCHECK_EQ(sl::bsync_arrive(a, ex, kind, arg, members), expect);
+    VCHECK(std::memcmp(&a, &ref, sizeof a) == 0);
+    released += expect != 0;
+    held += expect == 0 && ex != 0;
+    nomember += members == 0;
+  }
+  VCHECK(released > 2000);   // (the cases the test exists for all occur)
+  VCHECK(held > 2000);
+  VCHECK(nomember > 2000);
+}
+
 VTEST(wait_state_helpers_agree_with_the_lane_loop) {
   std::mt19937_64 rng(11);
   for (int round = 0; round < 20000; ++round) {

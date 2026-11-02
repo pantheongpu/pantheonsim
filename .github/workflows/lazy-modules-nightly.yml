@@ -1,9 +1,9 @@
 name: Lazy modules nightly
 
-# The end-to-end suite with every module parsed lazily. A module of 2 MiB or
+# The end-to-end suite with every module parsed lazily. A module of 16 KiB or
 # more is split into pieces and each function parsed when it is first used
-# (src/runtime/runtime.cpp); the e2e programs' modules are all smaller, so the
-# regular run parses them whole and only PyTorch-sized modules take the lazy
+# (src/runtime/runtime.cpp); most of the e2e programs' modules are smaller, so
+# the regular run parses them whole and only larger modules take the lazy
 # path. VGPU_LAZY_MODULE_BYTES=0 sends every module down it, so each e2e test
 # also checks that lazily parsed kernels, globals, textures and cross-function
 # calls behave exactly as eagerly parsed ones.

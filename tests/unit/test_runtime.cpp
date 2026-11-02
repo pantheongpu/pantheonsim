@@ -176,4 +176,86 @@ VTEST(large_modules_parse_kernels_when_first_used) {
   VCHECK(err.code() == Err::UnsupportedPtx);
 }
 
+// The default threshold: a module of 16 KiB or more is parsed a kernel at a
+// time (an 80 KB module spent 14 ms parsing every kernel to launch one), and a
+// smaller one whole, where a kernel the simulator cannot parse is refused when
+// the module loads, as the driver refuses bad PTX.
+static std::string module_with_unsupported_kernel(size_t padding) {
+  return R"(.version 8.7
+.target sm_100a
+.address_size 64
+.visible .entry ok(.param .u64 out)
+{
+  .reg .b64 %p;
+  .reg .b32 %v;
+  ld.param.u64 %p, [out];
+  mov.u32 %v, 7;
+  st.global.u32 [%p], %v;
+  ret;
+}
+.visible .entry unused()
+{
+  .reg .b32 %r<2>;
+  tcgen05.mma.cta_group::1.kind::f16.ashift [%r0], [%r1], %r0, %r0, %r0;
+  ret;
+}
+// )" + std::string(padding, 'x') + "\n";
+}
+
+VTEST(modules_from_16_KiB_up_parse_kernels_when_first_used) {
+  unsetenv("VGPU_LAZY_MODULE_BYTES");
+  unsetenv("VGPU_PARSE_WHOLE");
+  runtime::Runtime rt(load_gpu("nvidia/b200"));
+  auto& dev = rt.device(0);
+  const std::string big = module_with_unsupported_kernel(20 << 10);
+  VCHECK(big.size() >= (16u << 10));
+  const uint64_t mod = dev.load_module(big);   // loads: the kernel nothing launches is not parsed
+  const uint64_t out = dev.memory().alloc(16);
+  std::vector<uint8_t> arg(8);
+  std::memcpy(arg.data(), &out, 8);
+  dev.launch(*dev.get_function(mod, "ok"), exec::LaunchConfig{}, {arg}, dev.symbols(mod));
+  VCHECK_EQ(dev.memory().load_scalar(out, 4), 7ull);
+  auto err = VCAPTURE(Error, dev.get_function(mod, "unused"));
+  VCHECK(err.code() == Err::UnsupportedPtx);
+}
+
+VTEST(modules_under_16_KiB_are_parsed_whole) {
+  unsetenv("VGPU_LAZY_MODULE_BYTES");
+  unsetenv("VGPU_PARSE_WHOLE");
+  runtime::Runtime rt(load_gpu("nvidia/b200"));
+  auto& dev = rt.device(0);
+  const std::string small = module_with_unsupported_kernel(4 << 10);
+  VCHECK(small.size() < (16u << 10));
+  auto err = VCAPTURE(Error, dev.load_module(small));   // refused at load, as a whole parse does
+  VCHECK(err.code() == Err::UnsupportedPtx);
+}
+
+// The by-opcode line of the counters report does not depend on the order the
+// parser met the mnemonics in, which a lazily parsed module changes: equal
+// counts are ordered by name.
+VTEST(opcode_summary_orders_equal_counts_by_name) {
+  const std::vector<std::string> a = {"<none>", "mov", "mul", "add", "cvta"};
+  const std::vector<std::string> b = {"<none>", "cvta", "add", "mul", "mov"};
+  const std::vector<uint64_t> ia = {0, 1, 1, 2, 1};   // mov=1 mul=1 add=2 cvta=1
+  const std::vector<uint64_t> ib = {0, 1, 2, 1, 1};   // cvta=1 add=2 mul=1 mov=1
+  const std::string want = "    by opcode add=2 cvta=1 mov=1 mul=1";
+  VCHECK_EQ(runtime::opcode_summary(ia, a), want);
+  VCHECK_EQ(runtime::opcode_summary(ib, b), want);
+}
+
+VTEST(opcode_summary_keeps_ten_and_counts_the_rest) {
+  std::vector<std::string> names = {"<none>"};
+  std::vector<uint64_t> issues = {0};
+  for (int i = 0; i < 12; ++i) {
+    names.push_back("op" + std::string(i < 10 ? "0" : "") + std::to_string(i));
+    issues.push_back(100 - i);
+  }
+  const std::string line = runtime::opcode_summary(issues, names);
+  VCHECK(line.find("op00=100") != std::string::npos);
+  VCHECK(line.find("op09=91") != std::string::npos);
+  VCHECK(line.find("op10") == std::string::npos);
+  VCHECK(line.find("(+2 more)") != std::string::npos);
+  VCHECK(runtime::opcode_summary({0, 0}, {"<none>", "mov"}).empty());   // nothing issued: no line
+}
+
 VTEST_MAIN

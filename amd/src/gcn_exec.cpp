@@ -31,6 +31,7 @@
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
 #include "gcn_divide.hpp"
+#include "vgpu/exec/amd_run_scan.hpp"
 #include "vgpu/exec/lockstep.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
@@ -10062,14 +10063,13 @@ struct Machine {
     const uint32_t reach = std::min<uint32_t>(off_mask ? static_cast<uint32_t>(__builtin_ctzll(off_mask)) : kLanes, kLanes - lane);
     if (direct && !in.scale_offset) {
       // The address registers as rows, and each lane's address compared with the one the run would give it.
-      const uint32_t* const lo = w.vgpr[a0.index].data();
+      // (exec::amdrun::run_scan: the same lanes compared with the same sums, four to a vector where the low words cannot wrap round.)
+      const uint32_t* const lo = w.vgpr[a0.index].data() + lane;
       if (in.has_saddr) {
-        for (; count < reach && sbase + lo[lane + count] + imm == (next += stride); ++count) {
-        }
+        count = exec::amdrun::run_scan(lo, nullptr, reach, lo[0], stride);
       } else {
-        const uint32_t* const hi = w.vgpr[a0.index + 1].data();
-        for (; count < reach && ((static_cast<uint64_t>(hi[lane + count]) << 32 | lo[lane + count]) + imm) == (next += stride); ++count) {
-        }
+        const uint32_t* const hi = w.vgpr[a0.index + 1].data() + lane;
+        count = exec::amdrun::run_scan(lo, hi, reach, addr - imm, stride);
       }
     } else {
       const auto address = [&](uint32_t l) -> uint64_t {
@@ -10179,6 +10179,70 @@ struct Machine {
     return m.store_run(addr, buf, uint64_t{bytes} * count, bytes) ? count : 0;
   }
 
+  // `n` loads of `bytes` each (a warp's lanes), made together by MemoryManager::load_batch. Pairs (`bytes` 8) with an address on a 4-byte
+  // boundary but not an 8-byte one -- the lanes of a stencil's load of two neighbouring floats, which the compiler makes one
+  // global_load_dwordx2 -- are two word accesses where lane by lane (Machine::load_words) makes them, an aligned pair one 8-byte
+  // access: so the aligned pairs go as one batch of 8-byte loads and the others as a batch of 4-byte loads, two words each. Nothing is
+  // written to `vals` that the caller can see unless it all succeeded: false, as load_batch says it, having changed no register.
+  bool load_wave(const uint64_t* addrs, uint32_t n, uint32_t bytes, uint64_t* vals) const {
+    if (mem.load_batch(addrs, n, bytes, vals)) return true;
+    if (bytes != 8) return false;
+    uint64_t bits = 0, odd = 0;
+    for (uint32_t i = 0; i < n; ++i) bits |= addrs[i], odd |= addrs[i] & 4;
+    if ((bits & 3) || !odd) return false;   // (declined for another reason, a wild address or a fault: the lanes one at a time say which)
+    uint64_t a8[kLanes], v8[kLanes], a4[2 * kLanes], v4[2 * kLanes];
+    uint32_t i8[kLanes], i4[kLanes], n8 = 0, n4 = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (!(addrs[i] & 7)) {
+        a8[n8] = addrs[i], i8[n8++] = i;
+      } else {
+        a4[2 * n4] = addrs[i], a4[2 * n4 + 1] = addrs[i] + 4, i4[n4++] = i;
+      }
+    }
+    if (n8 && !mem.load_batch(a8, n8, 8, v8)) return false;
+    for (uint32_t c = 0; c < 2 * n4; c += kLanes)
+      if (!mem.load_batch(a4 + c, std::min<uint32_t>(kLanes, 2 * n4 - c), 4, v4 + c)) return false;
+    for (uint32_t k = 0; k < n8; ++k) vals[i8[k]] = v8[k];
+    for (uint32_t k = 0; k < n4; ++k) vals[i4[k]] = v4[2 * k] | v4[2 * k + 1] << 32;
+    return true;
+  }
+
+  // A load of three words a lane (global_load_dwordx3: a stencil's three neighbours) for the active lanes from `from` on, made together:
+  // lane by lane (Machine::load_words) makes each lane's three words an aligned pair and a word -- the pair first when the lane's address
+  // is on an 8-byte boundary, the word first otherwise -- so every lane is one 8-byte access and one 4-byte access, and they go as two
+  // batches. False, having changed no register, where the memory manager declines or an address is not on a word.
+  [[gnu::noinline]] bool wave_load3(Wave& w, uint32_t from, const uint64_t* lane_addr, const Operand& dst) {
+    uint64_t a8[kLanes], a4[kLanes], v8[kLanes], v4[kLanes], at[kLanes];
+    uint32_t lanes[kLanes];
+    uint32_t n = 0;
+    uint64_t bits = 0;
+    for (uint64_t m = w.exec >> from << from; m; m &= m - 1) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+      const uint64_t a = lane_addr[lane];
+      bits |= a;
+      at[n] = a, lanes[n++] = lane;
+      const bool pair_first = !(a & 7);
+      a8[n - 1] = pair_first ? a : a + 4;
+      a4[n - 1] = pair_first ? a + 8 : a;
+    }
+    if (!n) return true;
+    if ((bits & 3) || !mem.load_batch(a8, n, 8, v8) || !mem.load_batch(a4, n, 4, v4)) return false;
+    uint32_t* const r0 = row_of(w, dst, 0);
+    uint32_t* const r1 = row_of(w, dst, 1);
+    uint32_t* const r2 = row_of(w, dst, 2);
+    uint32_t prev[3] = {};
+    for (uint32_t i = 0; i < n; ++i) {
+      uint32_t got[3];
+      if (!(at[i] & 7)) got[0] = static_cast<uint32_t>(v8[i]), got[1] = static_cast<uint32_t>(v8[i] >> 32), got[2] = static_cast<uint32_t>(v4[i]);
+      else got[0] = static_cast<uint32_t>(v4[i]), got[1] = static_cast<uint32_t>(v8[i]), got[2] = static_cast<uint32_t>(v8[i] >> 32);
+      // (Lanes of a load that follow a lane with the same address take the value that lane got, as the memo does one at a time.)
+      if (i && at[i] == at[i - 1]) got[0] = prev[0], got[1] = prev[1], got[2] = prev[2];
+      r0[lanes[i]] = got[0], r1[lanes[i]] = got[1], r2[lanes[i]] = got[2];
+      prev[0] = got[0], prev[1] = got[1], prev[2] = got[2];
+    }
+    return true;
+  }
+
   // The active lanes from `from` on, each moving one scalar (a byte, a short, a word or a pair; `lane_addr[lane]` its address),
   // made together by the memory manager (MemoryManager::load_batch / store_batch): what lane by lane would do, one lookup for
   // the allocation instead of one a lane. A load puts each lane's value in `data` (`words` registers, or the one a byte or a short is
@@ -10189,14 +10253,45 @@ struct Machine {
   [[gnu::noinline]] bool wave_scalars(Wave& w, bool store, uint32_t from, const uint64_t* lane_addr, const Operand& data,
                                       uint32_t words, const Narrow* narrow_by) {
     const uint32_t bytes = narrow_by ? narrow_by->bytes : 4 * words;
-    uint64_t addrs[kLanes], vals[kLanes];
+    uint64_t addrs_buf[kLanes], vals[kLanes];
     uint32_t lanes[kLanes];
     uint32_t n = 0;
-    for (uint64_t m = w.exec >> from << from; m; m &= m - 1) {
-      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
-      addrs[n] = lane_addr[lane], lanes[n++] = lane;
+    const uint64_t live = w.exec >> from << from;
+    if (!live) return true;
+    // Every lane from `from` to the last is active (a whole wave, the usual case): the addresses are the caller's row from `from` on,
+    // and the lane of the i-th is from + i, so nothing needs gathering into a list first. The same lanes in the same order as below.
+    const uint64_t whole = w.lanes >= kLanes ? ~uint64_t{0} : (uint64_t{1} << w.lanes) - 1;
+    if (live == whole >> from << from) {
+      const uint32_t count = w.lanes - from;
+      const uint64_t* const addrs = lane_addr + from;
+      uint32_t* const row0 = row_of(w, data, 0) + from;
+      uint32_t* const row1 = words == 2 ? row_of(w, data, 1) + from : row0;
+      if (store) {
+        if (words == 2) {
+          for (uint32_t i = 0; i < count; ++i) vals[i] = row0[i] | uint64_t{row1[i]} << 32;
+        } else {
+          for (uint32_t i = 0; i < count; ++i) vals[i] = row0[i];
+        }
+        return mem.store_batch(addrs, count, bytes, vals);
+      }
+      if (!load_wave(addrs, count, bytes, vals)) return false;
+      for (uint32_t i = 1; i < count; ++i)
+        if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
+      if (narrow_by) {
+        const Narrow nb = *narrow_by;
+        for (uint32_t i = 0; i < count; ++i) row0[i] = widen(vals[i], nb);
+      } else if (words == 2) {
+        for (uint32_t i = 0; i < count; ++i) row0[i] = static_cast<uint32_t>(vals[i]), row1[i] = static_cast<uint32_t>(vals[i] >> 32);
+      } else {
+        for (uint32_t i = 0; i < count; ++i) row0[i] = static_cast<uint32_t>(vals[i]);
+      }
+      return true;
     }
-    if (!n) return true;
+    for (uint64_t m = live; m; m &= m - 1) {
+      const uint32_t lane = static_cast<uint32_t>(__builtin_ctzll(m));
+      addrs_buf[n] = lane_addr[lane], lanes[n++] = lane;
+    }
+    const uint64_t* const addrs = addrs_buf;
     uint32_t* const row0 = row_of(w, data, 0);
     uint32_t* const row1 = words == 2 ? row_of(w, data, 1) : row0;
     if (store) {
@@ -10207,7 +10302,7 @@ struct Machine {
       }
       return mem.store_batch(addrs, n, bytes, vals);
     }
-    if (!mem.load_batch(addrs, n, bytes, vals)) return false;
+    if (!load_wave(addrs, n, bytes, vals)) return false;
     for (uint32_t i = 1; i < n; ++i)
       if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
     if (narrow_by) {
@@ -13668,6 +13763,45 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
         w.vgpr[in.src[0].index + 1][lane] = static_cast<uint32_t>((region + off) >> 32);
       }
     }
+  }
+  if ((flavour == 21 || flavour == 22) && in.enc == gcn::Enc::Flat && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+    // Flavours 21 and 22: a global access whose first lanes make a run of consecutive words (or pairs, or quads) and whose later lanes go to
+    // a few places (so that some read the same address twice), the wave's every lane on (21) or one of the later lanes off (22): a run
+    // and then a gather from the lane the run ended at, the way a column access follows a row's.
+    if (in.has_saddr && in.saddr + 1 < kSgprs) w.sgpr[in.saddr] = static_cast<uint32_t>(region), w.sgpr[in.saddr + 1] = static_cast<uint32_t>(region >> 32);
+    const uint32_t stride = 4 * std::max<uint32_t>(in.fast.words, 1);
+    const uint32_t run = static_cast<uint32_t>(r.next() % (w.lanes + 1));
+    uint64_t pool[6];
+    for (uint64_t& p : pool) p = r.next() & 0x7FF0;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      const uint64_t off = lane < run ? 64 + uint64_t{lane} * stride : pool[r.next() % 6];
+      if (in.has_saddr) {
+        w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(off);
+      } else {
+        w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(region + off);
+        w.vgpr[in.src[0].index + 1][lane] = static_cast<uint32_t>((region + off) >> 32);
+      }
+    }
+    if (flavour == 22 && run < w.lanes) w.exec &= ~(uint64_t{1} << (run + r.next() % (w.lanes - run)));
+  }
+  if ((flavour == 23 || flavour == 24) && in.enc == gcn::Enc::Flat && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+    // Flavours 23 and 24: a global access whose lanes are a word apart however many words each moves, so that neighbouring lanes' words
+    // overlap (a stencil's dwordx2 and dwordx3 loads): from a random word, so that the pairs are on an 8-byte boundary in some lanes and
+    // not in others; 24 has the same address in a few neighbouring lanes (the one-read-per-address rule) and one lane off.
+    if (in.has_saddr && in.saddr + 1 < kSgprs) w.sgpr[in.saddr] = static_cast<uint32_t>(region), w.sgpr[in.saddr + 1] = static_cast<uint32_t>(region >> 32);
+    const uint64_t start = 4 * (r.next() % 64);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      uint32_t at = lane;
+      if (flavour == 24 && lane % 7 == 3) at = lane - 1;
+      const uint64_t off = start + 4 * uint64_t{at};
+      if (in.has_saddr) {
+        w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(off);
+      } else {
+        w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(region + off);
+        w.vgpr[in.src[0].index + 1][lane] = static_cast<uint32_t>((region + off) >> 32);
+      }
+    }
+    if (flavour == 24) w.exec &= ~(uint64_t{1} << (r.next() % w.lanes));
   }
   if ((flavour == 18 || flavour == 19) && in.enc == gcn::Enc::Ds && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
     // Flavours 18 and 19: an LDS access whose lanes' addresses are consecutive words (or, for the wide forms, consecutive groups of words)

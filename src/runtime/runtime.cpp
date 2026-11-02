@@ -52,7 +52,16 @@ int target_arch(const std::string& target) {
 // parsed, with the device functions it can reach, the first time it is
 // looked up. The module's declarations (globals, .shared, prototypes) are
 // parsed once, so its globals exist once, whichever kernels run.
-constexpr size_t kLazyModuleBytes = 2u << 20;   // below this, parse whole
+//
+// The threshold is not only about the giants. Parsing costs about 0.9 k host
+// instructions a byte, so a program whose module is 80 KB spends 14 ms of its
+// start parsing every kernel (77 M instructions on the PTX engine, 6.4 M lazily,
+// measured with the benchmark program's startup workload) to launch one or two
+// of them. Below 16 KiB the whole parse is under 3 ms and a module keeps the
+// stricter behaviour of the whole parse: a kernel the simulator cannot parse is
+// refused when the module loads, as the driver refuses bad PTX, instead of when
+// the kernel is first looked up.
+constexpr size_t kLazyModuleBytes = 16u << 10;   // below this, parse whole
 
 struct Piece {
   enum Kind { Header, Decl, Entry, Func } kind;
@@ -735,6 +744,28 @@ bool Device::has_kernel(uint64_t module_id, const std::string& name) const {
   }
 }
 
+// The "by opcode" line of the counters report: the ten most-issued opcodes,
+// most-used first, and how many more there were. Opcode ids are handed out in
+// the order the parser first meets a mnemonic, which depends on which kernels
+// were parsed first (a lazily parsed module meets them as kernels are looked
+// up), so equal counts are ordered by name: the line is the same whichever way
+// a module was parsed.
+std::string opcode_summary(const std::vector<uint64_t>& issues, const std::vector<std::string>& names) {
+  std::vector<std::pair<uint64_t, std::string>> ops;
+  for (size_t i = 1; i < issues.size() && i < names.size(); ++i)
+    if (issues[i]) ops.emplace_back(issues[i], names[i]);
+  if (ops.empty()) return {};
+  std::sort(ops.begin(), ops.end(), [](const auto& a, const auto& b) {
+    return a.first != b.first ? a.first > b.first : a.second < b.second;
+  });
+  std::string line = "    by opcode";
+  const size_t show = std::min<size_t>(ops.size(), 10);
+  for (size_t i = 0; i < show; ++i)
+    line += " " + ops[i].second + "=" + std::to_string(ops[i].first);
+  if (ops.size() > show) line += "  (+" + std::to_string(ops.size() - show) + " more)";
+  return line;
+}
+
 namespace {
 
 // VGPU_COUNTERS=1 prints the per-launch counters. These are exact counts of
@@ -858,19 +889,8 @@ void report_counters(int device, const std::string& kernel, const exec::LaunchCo
   // memory-heavy; this says it is memory-heavy because of ld.global.nc, which
   // is the difference between a number and a lead. Truncated because a long
   // tail of ones is noise, and the total says what was left out.
-  const auto& names = ptx::opcode_names();
-  std::vector<std::pair<uint64_t, std::string>> ops;
-  for (size_t i = 1; i < st.inst_by_opcode.size() && i < names.size(); ++i)
-    if (st.inst_by_opcode[i]) ops.emplace_back(st.inst_by_opcode[i], names[i]);
-  if (!ops.empty()) {
-    std::sort(ops.begin(), ops.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    std::string line = "    by opcode";
-    const size_t show = std::min<size_t>(ops.size(), 10);
-    for (size_t i = 0; i < show; ++i)
-      line += " " + ops[i].second + "=" + std::to_string(ops[i].first);
-    if (ops.size() > show) line += "  (+" + std::to_string(ops.size() - show) + " more)";
-    std::fprintf(stderr, "%s\n", line.c_str());
-  }
+  const std::string line = opcode_summary(st.inst_by_opcode, ptx::opcode_names());
+  if (!line.empty()) std::fprintf(stderr, "%s\n", line.c_str());
 }
 
 }  // namespace

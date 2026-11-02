@@ -43,7 +43,7 @@ paths tested here do not call them.
 ## What PyTorch uses, and where it is
 
 - **Its own kernels:** their SASS, each kernel's code decoded when it first
-  runs. On the PTX path, a large module (2 MB or more of PTX) is parsed one
+  runs. On the PTX path, a module of 16 KiB or more of PTX is parsed one
   kernel at a time, as each is first launched (`VGPU_LAZY_MODULE_BYTES` sets
   the threshold, `VGPU_PARSE_WHOLE=1` turns it off), and a registered
   fatbin's PTX is only extracted when first needed. Without the lazy steps, a
