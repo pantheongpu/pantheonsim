@@ -6479,8 +6479,6 @@ placement results of the library in both directions, as the sp13 and sp14 rounds
 * `run_groups` (the wave stepping loop, 10 to 27% of the memory and control rows) is where the per-instruction overhead of the interpreter sits, as `step_warp` is for SASS; the sp14 round's work on the SASS run loop has no AMD twin yet.
 * ASan, UBSan and TSan were not run on this change; it touches no threaded or atomic code, and the buffers are fixed-size stack arrays of twice the wave size.
 
-## Round sp16 (SASS): a warp's load of one address and a warp's store on a stride (branch `sp16-sass`, base 705ed36f = main with #460)
-
 ## Round sp17: the AMD memory path on real programs (branch `sp17-amd`, base `sp15-speed-pr` 4a5185a3)
 
 The question: the sp16 profile of the real programs put a quarter of the AMD cycles in the memory path (`wave_scalars`, `tier_global`, `memory_run`, `load_batch_in`, `batch_addresses_ok`; 78 % of SYR2K) and 12 % in the `run_groups` loop. Measured first, with `perf record -e cycles:u` on the 20 PolyBench/GPU programs hipified and built for gfx942 (`hipcc -O2`, one thread, `amd/mi300x`), then changed in the order the profile gave.
