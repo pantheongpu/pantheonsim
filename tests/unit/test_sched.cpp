@@ -4,6 +4,10 @@
 // from several host threads at once, a kernel that launches a child grid, and
 // a cooperative launch each come out right. (The pool itself is in
 // test_worker_pool.cpp.)
+#include <sched.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -197,6 +201,57 @@ VTEST(small_launches_in_a_loop_stay_off_the_pool_and_give_the_same_results) {
   VCHECK(exec::worker_pool_stats().calls >= before + 5);
   ::unsetenv("VGPU_POOL_MIN_WORK_US");
 }
+
+// ThreadSanitizer refuses to start threads in a fork child of a process that had them (the pool has some by now).
+// AddressSanitizer makes a block cost more than the pool's break-even (100 us), so the launches below are genuinely worth the pool there.
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define VGPU_SCHED_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define VGPU_SCHED_TSAN 1
+#endif
+#endif
+
+#ifndef VGPU_SCHED_TSAN
+// The pool can be slow for a reason that is not the kernel: here four threads on one CPU, so each hand-off waits for a
+// time slice. A launch that took long because of that must not be taken for one with much work, or it stays on the pool
+// and stays slow for good (the launch64 loop at VGPU_THREADS=4 took 10 times as long as at 1, every launch on the pool).
+// The cost is taken from the time threads spent on blocks. A child process, so the pool's threads are born on the one CPU.
+VTEST(a_pool_slowed_by_a_crowded_cpu_does_not_keep_small_launches_on_it) {
+  const pid_t pid = fork();
+  VCHECK(pid >= 0);
+  if (pid == 0) {
+    alarm(120);
+    int bad = 0;
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    if (sched_getaffinity(0, sizeof all, &all) != 0) _exit(2);
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    for (int c = 0; c < CPU_SETSIZE; ++c)
+      if (CPU_ISSET(c, &all)) { CPU_SET(c, &one); break; }
+    if (sched_setaffinity(0, sizeof one, &one) != 0) _exit(2);
+    ::unsetenv("VGPU_POOL_MIN_WORK_US");
+    const auto m = ptx::parse(std::string(kHeader) + kFill);
+    const DeviceProfile prof = load_gpu("nvidia/h100");
+    const Result ref = run_fill(m, prof, "1", 8, 32);
+    run_fill(m, prof, "4", 8, 32);   // the first launch of a kernel has no cost to go by
+    run_fill(m, prof, "4", 8, 32);
+    const uint64_t calls = exec::worker_pool_stats().calls;
+    for (int i = 0; i < 400; ++i) {
+      const Result r = run_fill(m, prof, "4", 8, 32);
+      bad += r.out != ref.out || !same_counters(r.st, ref.st);
+    }
+    // Some launches may still go to the pool (a cost read while the process was preempted); not most of them.
+    bad += exec::worker_pool_stats().calls - calls > 40;
+    _exit(bad ? 1 : 0);
+  }
+  int status = 0;
+  VCHECK_EQ(waitpid(pid, &status, 0), pid);
+  VCHECK(WIFEXITED(status));
+  VCHECK_EQ(WEXITSTATUS(status), 0);
+}
+#endif
 
 VTEST(one_thread_runs_inline_and_makes_no_pool_thread) {
   const auto m = ptx::parse(std::string(kHeader) + kFill);

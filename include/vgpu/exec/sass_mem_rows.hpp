@@ -47,9 +47,30 @@ inline bool global_run(const uint32_t* lo, const uint32_t* hi, uint64_t add, uns
 }
 
 // The addresses of a full warp's global access (a base that is a pair of rows, a single row or none, plus `add`), and in the same pass
-// the smallest of their distances above `window` (wrapping: an address below it is far): below 2^32 says some lane is in the 4 GiB from
-// `window`, the constant window. (A pass over the stored addresses that asked this alone waited for the stores.)
+// whether some lane is in the 4 GiB from `window`, the constant window: the result is below 2^32 when one is (it is 0), else all ones.
+// (A pass over the stored addresses that asked this alone waited for the stores. The scalar form kept the smallest distance above the
+// window, a compare and a conditional move per lane; the callers only ask whether it is below 2^32.)
+// With a window that starts on a multiple of 4 GiB (the constant window does) a lane is in it exactly when its high word is the window's,
+// so the pass is two lanes to a vector: the low and high words interleaved, `add` added, the pair stored, and its high words compared
+// with the window's; the compares are ORed and looked at once at the end. Any other window takes the scalar loop.
 inline uint64_t full_warp_addresses(const uint32_t* lo, const uint32_t* hi, uint64_t add, uint64_t window, uint64_t* addrs) {
+#if defined(__SSE2__) && defined(__x86_64__)
+  if (lo && (window & 0xffffffffu) == 0) {
+    const __m128i vadd = _mm_set1_epi64x(static_cast<long long>(add));
+    const __m128i want = _mm_set1_epi32(static_cast<int>(static_cast<uint32_t>(window >> 32)));
+    const __m128i zero = _mm_setzero_si128();
+    __m128i in = zero;
+    for (unsigned l = 0; l < 32; l += 2) {
+      const __m128i a = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(lo + l));
+      const __m128i b = hi ? _mm_loadl_epi64(reinterpret_cast<const __m128i*>(hi + l)) : zero;
+      const __m128i v = _mm_add_epi64(_mm_unpacklo_epi32(a, b), vadd);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(addrs + l), v);
+      in = _mm_or_si128(in, _mm_cmpeq_epi32(v, want));
+    }
+    // (the high words of the two lanes are dwords 1 and 3)
+    return (_mm_movemask_ps(_mm_castsi128_ps(in)) & 0xA) ? 0 : ~uint64_t{0};
+  }
+#endif
   uint64_t nearest = ~uint64_t{0};
   const auto lane = [&](unsigned l, uint64_t a) {
     addrs[l] = a;
@@ -63,6 +84,33 @@ inline uint64_t full_warp_addresses(const uint32_t* lo, const uint32_t* hi, uint
     for (unsigned l = 0; l < 32; ++l) lane(l, add);
   }
   return nearest;
+}
+
+
+// The data of a full warp's global store of 1, 2, 4 or 8 bytes as 32 values for the memory manager's batch store: lane l's word of the
+// register (the low `bytes` bytes of it for 1 and 2) and, for 8, the next register's word above it; `d` null (RZ) stores zeros. The
+// registers are rows of 32 words (`d` the first register's, the second 32 words on). Four lanes to a vector with SSE2: the words of the
+// two rows interleaved into 64-bit values.
+inline void full_warp_store_values(const uint32_t* d, unsigned bytes, uint64_t* fv) {
+  if (!d) {
+    for (unsigned l = 0; l < 32; ++l) fv[l] = 0;
+    return;
+  }
+#if defined(__SSE2__) && defined(__x86_64__)
+  const __m128i keep = _mm_set1_epi32(bytes == 1 ? 0xff : bytes == 2 ? 0xffff : -1);
+  const __m128i zero = _mm_setzero_si128();
+  for (unsigned l = 0; l < 32; l += 4) {
+    const __m128i a = _mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(d + l)), keep);
+    const __m128i b = bytes == 8 ? _mm_loadu_si128(reinterpret_cast<const __m128i*>(d + 32 + l)) : zero;
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(fv + l), _mm_unpacklo_epi32(a, b));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(fv + l + 2), _mm_unpackhi_epi32(a, b));
+  }
+#else
+  for (unsigned l = 0; l < 32; ++l) {
+    const uint32_t v0 = d[l], v1 = bytes == 8 ? d[32 + l] : 0u;
+    fv[l] = bytes == 8 ? (static_cast<uint64_t>(v1) << 32 | v0) : bytes == 4 ? v0 : (v0 & ((1u << (8 * bytes)) - 1));
+  }
+#endif
 }
 
 }  // namespace vgpu::exec::sassmem

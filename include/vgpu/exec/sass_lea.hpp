@@ -54,10 +54,10 @@ inline __m128i ult(__m128i x, __m128i y) {
   return _mm_cmpgt_epi32(_mm_xor_si128(y, bias), _mm_xor_si128(x, bias));
 }
 
-template <bool Hi>
-inline Mask lea_t(const Form& f, uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* top, Mask cin) {
+template <bool Hi, bool Cin>
+inline Mask lea_t(const Form& f, uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* top, [[maybe_unused]] Mask cin) {
   const __m128i shl = _mm_cvtsi32_si128(static_cast<int>(f.sh)), shr = _mm_cvtsi32_si128(static_cast<int>(32 - f.sh));   // (a count of 32 gives zero)
-  const __m128i lane_bit = _mm_set_epi32(8, 4, 2, 1);
+  [[maybe_unused]] const __m128i lane_bit = _mm_set_epi32(8, 4, 2, 1);
   Mask carry = 0;
   for (unsigned i = 0; i < 32; i += 4) {
     const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i));
@@ -71,9 +71,12 @@ inline Mask lea_t(const Form& f, uint32_t* r, const uint32_t* a, const uint32_t*
     }
     const __m128i s1 = _mm_add_epi32(shifted, y);
     __m128i out = ult(s1, shifted);   // the carry of shifted + b
-    const __m128i cin_mask = _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(static_cast<int>((cin >> i) & 0xfu)), lane_bit), lane_bit);
-    const __m128i s2 = _mm_sub_epi32(s1, cin_mask);   // + the carry in (the mask is -1 where it is set)
-    out = _mm_or_si128(out, ult(s2, s1));              // (the carry in made the sum wrap: s1 was all ones)
+    __m128i s2 = s1;
+    if constexpr (Cin) {   // (no carry in -- LEA's low word, most of them -- is eight operations a vector fewer)
+      const __m128i cin_mask = _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(static_cast<int>((cin >> i) & 0xfu)), lane_bit), lane_bit);
+      s2 = _mm_sub_epi32(s1, cin_mask);   // + the carry in (the mask is -1 where it is set)
+      out = _mm_or_si128(out, ult(s2, s1));   // (the carry in made the sum wrap: s1 was all ones)
+    }
     if (f.bneg) out = _mm_or_si128(out, _mm_cmpeq_epi32(y, _mm_setzero_si128()));
     _mm_storeu_si128(reinterpret_cast<__m128i*>(r + i), s2);
     carry |= static_cast<Mask>(_mm_movemask_ps(_mm_castsi128_ps(out))) << i;
@@ -87,7 +90,10 @@ inline Mask lea_t(const Form& f, uint32_t* r, const uint32_t* a, const uint32_t*
 // The same as lea_reference. r may be a, b or top (each lane is read before it is written).
 inline Mask lea_lanes(const Form& f, uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* top, Mask cin) {
 #if defined(__SSE2__)
-  if (f.sh < 32) return f.hi ? detail::lea_t<true>(f, r, a, b, top, cin) : detail::lea_t<false>(f, r, a, b, top, cin);
+  if (f.sh < 32) {
+    if (cin) return f.hi ? detail::lea_t<true, true>(f, r, a, b, top, cin) : detail::lea_t<false, true>(f, r, a, b, top, cin);
+    return f.hi ? detail::lea_t<true, false>(f, r, a, b, top, 0) : detail::lea_t<false, false>(f, r, a, b, top, 0);
+  }
 #endif
   return lea_reference(f, r, a, b, top, cin);
 }

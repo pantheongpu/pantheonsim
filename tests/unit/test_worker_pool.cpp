@@ -276,4 +276,53 @@ VTEST(the_unit_cost_is_exact_on_one_thread_and_averaged_otherwise) {
   VCHECK(blend_unit_cost(0, 1u << 30, 1, 1) >= 1);                      // never zero (zero means unknown)
 }
 
+VTEST(the_cost_from_busy_time_is_per_block_and_never_zero) {
+  using vgpu::exec::unit_cost_from_busy;
+  VCHECK_EQ(unit_cost_from_busy(64, 15000), uint64_t{234});
+  VCHECK_EQ(unit_cost_from_busy(100, 400000), uint64_t{4000});
+  VCHECK_EQ(unit_cost_from_busy(0, 5000), uint64_t{0});   // no blocks: unknown
+  VCHECK_EQ(unit_cost_from_busy(1u << 30, 5), uint64_t{1});
+}
+
+// A launch that is slow on several threads for a reason that is not its work (here a 300 us wake-up, as a
+// futex wake on a busy or slow host costs) must not be taken for an expensive one. Taken from the wall time
+// it was: 4 threads x 300 us / 64 blocks = 18 us a block, so the next launch of the same 64 blocks (15 us of
+// work in all) got 4 threads again and was slow again, for as long as the program ran. Taken from the time
+// the threads spent on blocks, the second launch is already on one thread and stays there.
+VTEST(a_slow_wake_up_does_not_keep_a_small_launch_on_the_pool) {
+  using vgpu::exec::LaunchWidth;
+  static int key;   // any stable address names the kernel
+  const uint64_t kBlocks = 64, kBlockNs = 234;
+  unsigned requested = 4;
+  std::vector<unsigned> used;
+  for (int launch = 0; launch < 12; ++launch) {
+    unsigned threads = requested;
+    {
+      LaunchWidth width(&key, kBlocks, threads);
+      used.push_back(threads);
+      if (threads > 1) {
+        std::this_thread::sleep_for(std::chrono::microseconds(300));   // the wake-up and the join
+        for (unsigned t = 0; t < threads; ++t) vgpu::exec::note_busy_ns(kBlocks * kBlockNs / threads);
+      } else {
+        std::this_thread::sleep_for(std::chrono::microseconds(15));
+      }
+    }
+  }
+  VCHECK_EQ(used[0], 4u);   // the first launch of a kernel has no cost to go by
+  for (size_t i = 1; i < used.size(); ++i) VCHECK_EQ(used[i], 1u);
+}
+
+// And a launch that really is heavy keeps its threads: busy time is the work, whatever the wall time.
+VTEST(heavy_blocks_keep_their_threads) {
+  using vgpu::exec::LaunchWidth;
+  static int key;
+  const uint64_t kBlocks = 512, kBlockNs = 40000;   // 20 ms of work
+  for (int launch = 0; launch < 4; ++launch) {
+    unsigned threads = 8;
+    LaunchWidth width(&key, kBlocks, threads);
+    VCHECK_EQ(threads, 8u);
+    for (unsigned t = 0; t < threads; ++t) vgpu::exec::note_busy_ns(kBlocks * kBlockNs / threads);
+  }
+}
+
 VTEST_MAIN

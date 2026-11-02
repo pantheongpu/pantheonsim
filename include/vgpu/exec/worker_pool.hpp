@@ -80,6 +80,23 @@ unsigned cap_threads(unsigned requested, uint64_t units, uint64_t ns_per_unit, u
 // replaces `old`; more are averaged into it.
 uint64_t blend_unit_cost(uint64_t old_ns_per_unit, uint64_t units, unsigned threads, uint64_t wall_ns);
 
+// The cost of one block from the time the threads spent running the launch's
+// bodies (their summed `busy_ns`), which leaves out what a wall-clock figure
+// holds: the wait for workers to wake, the wait for the slowest to finish.
+// Those waits are what a launch on several threads costs on top of its work,
+// and measuring them as work makes a launch look dear because it was slow,
+// which keeps it on the pool, which keeps it slow. Never zero (zero means
+// unknown).
+uint64_t unit_cost_from_busy(uint64_t units, uint64_t busy_ns);
+
+// run_parallel adds, to the calling thread's tally, the time its bodies ran
+// (each body's own start to end, on whichever thread ran it). A LaunchWidth
+// that was timed clears the tally when it is made and, when it ends, takes the
+// cost of a block from it if the launch used more than one thread; with an
+// empty tally (the bodies were not run through run_parallel) it uses the wall
+// time as before. Exposed for tests, which stand in for the pool.
+void note_busy_ns(uint64_t ns);
+
 // Per-kernel use of the two above, for an engine's grid launch. Construct it
 // after the thread count is known and before the blocks run; it lowers
 // `threads` by the cap and, when it ends, records what the launch cost. `key`

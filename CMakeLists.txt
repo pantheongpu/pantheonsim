@@ -308,6 +308,7 @@ option(VGPU_TEST_FAST_LINK "Link unit tests without LTO (the vgpu archive carrie
 # The wide LDS accesses of the AMD tier (see the header) are compiled outside link-time optimization: inside the tier's unit they moved the
 # inlining and the layout of the unrelated memory handlers.
 set_source_files_properties(amd/src/gcn_tier_ds.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+set_source_files_properties(amd/src/gcn_tier.cpp PROPERTIES COMPILE_OPTIONS "${VGPU_HOT_UNIT_FLAGS}")
 # The AMD matrix tile kernels and wide decoders, outside link-time optimization, with functions on 64-byte and loops on 32-byte boundaries: their speed
 # depended on where their few-instruction loops landed in a code line, which every unrelated edit of the library changed (docs/performance.md, Round sp13).
 set_source_files_properties(amd/src/gcn_matrix_kernels.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto;-falign-functions=64;-falign-loops=32")
