@@ -228,10 +228,11 @@ VTEST(a_diverged_warp_votes_among_the_lanes_that_run_it) {
   for (uint32_t l = 0; l < 20; ++l) VCHECK_EQ(few[l], l < 8 ? 0xffu : 1u);
 }
 
-#if defined(__SANITIZE_THREAD__)
+// AddressSanitizer makes a block cost more than the pool's break-even (100 us), so the launches below are genuinely worth the pool there.
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
 #define VGPU_SASS_TSAN 1
 #elif defined(__has_feature)
-#if __has_feature(thread_sanitizer)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
 #define VGPU_SASS_TSAN 1
 #endif
 #endif

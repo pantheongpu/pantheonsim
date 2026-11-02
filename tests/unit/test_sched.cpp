@@ -203,10 +203,11 @@ VTEST(small_launches_in_a_loop_stay_off_the_pool_and_give_the_same_results) {
 }
 
 // ThreadSanitizer refuses to start threads in a fork child of a process that had them (the pool has some by now).
-#if defined(__SANITIZE_THREAD__)
+// AddressSanitizer makes a block cost more than the pool's break-even (100 us), so the launches below are genuinely worth the pool there.
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
 #define VGPU_SCHED_TSAN 1
 #elif defined(__has_feature)
-#if __has_feature(thread_sanitizer)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
 #define VGPU_SCHED_TSAN 1
 #endif
 #endif
