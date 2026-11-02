@@ -1394,6 +1394,8 @@ vgpu_unit_test(test_memrmw)
 vgpu_unit_test(test_memhot_sp8)
 # A warp's gather load (load_batch's fused tests and two-pass loads) against load_scalar, over every kind of chunk and every way to decline.
 vgpu_unit_test(test_gather_sp10)
+# A warp's load of one address (load_broadcast) and store on a stride (store_strided) against load_scalar / store_scalar, over every kind of chunk, the edges of chunks and of the allocation, and every decline.
+vgpu_unit_test(test_warp_stride_access)
 # A device-to-device copy made chunk to chunk (MemoryManager::copy_to) against the read-into-a-buffer-then-write pair it replaces: bytes, chunk state, declines.
 vgpu_unit_test(test_memcopy_direct)
 # The warp's local memory, interleaved by words, against the per-lane layout it replaced.

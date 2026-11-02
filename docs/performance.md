@@ -6504,3 +6504,51 @@ Two builds with byte-identical `libcudart.so` can differ by 5 to 100 % on a row 
 * `step_warp`'s remaining bookkeeping (the pc writes at a branch, `popc(group)`, the counters) is spread flat over the function in the divergent profile; no single edit worth the layout re-roll was found. `wake()` of a partial set is still a store a lane (it is rare: a barrier releases whole warps once its groups have met).
 * `pick_group_avx2` (11 to 16 % of `divergent`) reads the 32 program counters as sixteen 16-byte halves with `vinserti128`; not looked at further.
 * AMD rows were not re-run: `libvgpuhip` does not include the changed header.
+
+## Round sp16: a warp's load of one address and a warp's store on a stride (branch `sp16-sass`, base 705ed36f = main with #460)
+
+Where the time goes now (server3, `perf record` cycles:u, one thread, A = main at 705ed36f, the 66 corpus programs of tools/bench/real: PolyBench, Rodinia, HeCBench). Mean share over all programs: `step_warp` 12.0% (sp15-step's), `MemoryManager::load_batch` 5.3% (up to 38% in SYR2K, 36% in SYRK, 27% in ATAX), `warp_rows_k` 5.0% (24% in GRAMSCHM), `h_global<false>` 2.6%, `load_run` 2.3%, `exec_mem` 1.8% (the atomics rows), `h_shared<false>` 1.6%, `init_block` 1.5% (12% in rodinia gaussian, 17% in HeCBench blockAccess), `imad_wide` 1.4%. By instructions retired the gather-bound PolyBench rows are `load_batch` 35% + `count_global_progression` 13% + `warp_rows_k` 12% + `h_global` 11% (SYR2K). IPC there is 4.5 to 5.2, so only fewer instructions help, except that the gathers themselves wait on L1 misses (`ex_no_retire.load_not_complete` is 27% of the cycles of SYRK).
+
+### Part 1: a load of one address is one load (`MemoryManager::load_broadcast`)
+Every lane of the warp loads the same address (a loop-invariant, `A[i][k]` of a matrix product, a kernel argument read through a pointer): `warp_rows_k` already reports "on a stride" and the stride (0). `h_global` now asks `load_broadcast(a0, 32, bytes, fv)`: the checks of `load_batch` (no fault armed, no host mapping in reach, aligned, inside the allocation the first lane is in), one chunk lookup, one load (an untouched chunk reads 0, a uniform chunk its byte repeated, as `load_scalar` does), the word copied to the 32 entries of `fv`. The counters are counted as before (`count_global_progression`, stride 0). A word that another host thread stores to between the lanes' loads could be seen differently by two lanes before; now all lanes see one value, which is a value the one-by-one loads could have given.
+
+### Part 2: a store on a stride, a chunk at a time (`MemoryManager::store_strided`)
+A full warp's store on a stride of up to half a chunk either way (`warp_rows_k`: `ri.progression`, `ri.stride`): the lanes in one real chunk are plain stores after one lookup; a lane in an untouched or uniform chunk is `store_batch`'s (a uniform chunk is left alone by a store of its own byte, any other is materialized; a failure to get memory is thrown with `*failed_at` the lane, as there). Checked at the two end lanes (the lanes between are between them). Everything else, and every decline, is `store_batch` unchanged.
+
+### Results (server3, one thread, cpu 10, `perf stat` instructions:u and cycles:u, alternating A B, A = 705ed36f built here and frozen, B = the branch; Mann-Whitney p on cycles; counters and stdout identical in every row)
+| program | runs | instructions B/A | cycles B/A | p |
+|---|---:|---:|---:|---:|
+| polybench ATAX | 15 | 0.812 | 0.851 | <0.001 |
+| polybench BICG | 15 | 0.818 | 0.890 | <0.001 |
+| polybench GESUMMV | 15 | 0.863 | 0.917 | <0.001 |
+| polybench MVT | 15 | 0.810 | 0.862 | <0.001 |
+| polybench GEMM | 15 | 0.818 | 0.893 | <0.001 |
+| polybench SYRK | 7 | 0.833 | 0.887 | 0.002 |
+| polybench 2MM | 7 | 0.811 | 0.929 | 0.002 |
+| polybench 3MM | 7 | 0.806 | 0.891 | 0.002 |
+| polybench CORR | 7 | 0.891 | 0.943 | 0.002 |
+| polybench COVAR | 7 | 0.891 | 0.941 | 0.002 |
+| polybench GRAMSCHM | 7 | 0.838 | 0.959 | 0.025 |
+| rodinia hotspot (no change expected) | 15 | 1.000 | 0.998 | 0.44 |
+| rodinia gaussian | 15 | 1.002 | 0.998 | 0.19 |
+| polybench 2DCONV | 15 | 1.001 | 1.004 | 0.15 |
+| rodinia needle | 15 | 1.000 | 0.987 | <0.001 |
+| rodinia backprop | 15 | 1.000 | 0.994 | 0.011 |
+
+A/A (A against itself, 15 runs): ATAX 0.998, GEMM 0.999, hotspot 0.999, gaussian 1.000. The broadcast alone (the store path switched off) gives ATAX 0.848, GEMM 0.887, CORR 0.999; the store path alone is what moves CORR and COVAR (0.94). bench.py canaries (13 workloads x SASS and PTX, 15 runs, cpu 10, load 5 to 7 from other jobs, so wide spreads): counters `identical` in all 30 rows, every row between 0.97 and 1.03 and inside its own spread, except `texture` (SASS 1.032x, PTX 1.028x, p 0.001; 1.036x and 1.028x in an earlier run: the code is not on that path, so placement), `divergent` SASS 0.988x (p<0.001, spread 8%).
+
+### Tests (CMake)
+* `test_warp_stride_access` (new): `load_broadcast` against `load_scalar` for 1 to 32 lanes at widths 1/2/4/8, over untouched, uniform and real chunks, at chunk edges, the last word of the allocation, one past it, below the base, misaligned, and its declines (more than a warp, no lanes, a width that is none, no allocation); `store_strided` against 32 `store_scalar` calls on an identical world (the bytes of the whole allocation and `resident_bytes()`, so that a uniform chunk left alone and a chunk made real are told apart), strides of either sign from 0 to half a chunk and one element past it (declined), values that are a uniform chunk's own byte; and the edges deterministically: a lane exactly on the first byte of the next chunk (both directions, widths 1 to 8, strides of 1 to 1000 elements), a last lane ending exactly at the end of the allocation (taken) and one byte past it (declined), the first lane at the base or one byte below it.
+* `test_sass_generic_mem`: mode 4 (`global_accesses_on_a_descending_stride`: lane l at base + (31 - l) * S, strides 4 to 200: a stride taken as unsigned or lanes counted from the wrong end read the wrong words) and mode 5 (`global_accesses_off_a_stride_over_a_full_warp`: the stride doubles at lane 16, a full warp in global memory that is not on one stride: it must go to the batch), tier against the interpreter and the written-out rule: bytes, registers, every counter. Both also under `VGPU_SIMD=base` (no row kernel: the paths are off).
+* Mutations, each rebuilt and run, each fails a test: store last-lane bound `>=` to `>` (the edges test); store segment ends one lane late `io <= kChunkSize` (edges); the broadcast of a uniform chunk gives 0; the store always materializes; the broadcast's alignment test removed; the tier broadcasts for every progression (generic_mem: stride tests); the store's base moved by one element; the store takes any full warp, not only progressions (mode 5); the store's stride negated (descending).
+* Also run, all pass: `test_gather_sp10`, `test_memhot_sp8`, `test_memfast`, `test_sass_mem_rows`, `test_tier`, `test_memcopy_direct`, `test_sass_atomics`, `test_sass_access_count`, `test_memrmw`, `test_memalloc`, `test_sass_block_reuse`, `test_sass_ldgsts`, `test_sass_dispatch`, `test_hostmap_cache`. Not run (no nvcc on server3, CI): `e2e_sass_tier`, `e2e_sass_archs`, the AMD guards, ASan/UBSan/TSan builds (the change adds no atomics beyond `load_at`/`store_at`, which are the manager's own).
+
+### Not kept, with numbers
+* **A strided gather load** (`load_strided`: the chunk looked up once for the lanes that share it, the lanes in it plain loads). Instructions down 17 to 24% in every gather row; cycles ATAX 0.89, MVT 0.90 (better than the broadcast alone by 2 points), but **SYRK 1.07 to 1.09 (stride 4096 bytes, 16 lanes to a chunk)** with 24% fewer instructions: `ex_no_retire.load_not_complete` 8.7 G to 14.6 G cycles, the hardware prefetcher's allocations halved (0.42 G to 0.22 G), L1 misses down (1.40 G to 1.21 G). The cost is in waiting for the loads, not in work. Not the loop exit (branch-misses 5.9 M both), not store forwarding (writing the words straight into the register row: same), not the stores' 4 KB aliasing, not a software prefetch of the next line (worse), not the length of a run of tight loads (a break every 4 lanes: same), not a dependency every 8 lanes (same or worse). Dropped: the broadcast (stride 0) alone is a win on every row it touches, SYRK 0.887.
+* **Transparent huge pages for the chunks** (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, an experiment, not a change): dTLB load misses 3.8 M to 11 K in ATAX, cycles 0.975; SYR2K cycles 1.00. The gathers are L1-miss bound, not TLB bound.
+* **Colouring the chunks** (each chunk's base offset by a different multiple of 64 bytes, so that the lanes of a stride-4096 gather spread over the L1's sets; experiment with leaked chunks): ATAX L1 misses 190 M to 68 M (-64%), cycles 0.967; MVT 0.97; GESUMMV 0.98. A real gain of 2 to 3% for a change in how every chunk is allocated and freed (the pointer's low bit is a tag, the delete[] needs the original): not worth it alone.
+
+### Not done
+* `init_block` is 12% of gaussian and 17% of blockAccess (small blocks, many of them): two `rep stos` of about 3 KB each per warp (`new (&w) Warp()` and `w.r.assign(nregs * 32, 0)`; `ur[256]`, `pc[32]`, `cga_target[32]`, `rpc[32]` are most of it). A reset of only what a run can have changed needs a test that a reset warp equals a fresh one.
+* `warp_rows_k` spills six ymm registers to the stack in the unrolled loop (the precomputed expected-address chain) and is 5 to 15% of the gather rows; a version with `expect` advanced in the loop and no spills was not tried.
+* `count_global_progression` is 70 instructions with a six-register prologue and epilogue (13% of SYR2K's instructions); inlining it into `h_global` changes the placement of `h_global`.

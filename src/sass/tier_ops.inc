@@ -1052,9 +1052,12 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
       bool done;
       if (Store) {
         exec::sassmem::full_warp_store_values(dreg, bytes, fv);   // (the registers' rows widened four lanes to a vector)
-        done = mem.store_batch(addrs, 32, bytes, fv);
+        done = (rows && ri.progression && mem.store_strided(ri.a0, static_cast<int64_t>(ri.stride), 32, bytes, fv)) ||
+               mem.store_batch(addrs, 32, bytes, fv);
       } else {
-        done = mem.load_batch(addrs, 32, bytes, fv);
+        // (every lane the same address: one load)
+        done = (rows && ri.progression && ri.stride == 0 && mem.load_broadcast(ri.a0, 32, bytes, fv)) ||
+               mem.load_batch(addrs, 32, bytes, fv);
         if (done && dreg) {
           uint32_t* d = c.R + op.dst * 32u;
           if (bytes == 4) {

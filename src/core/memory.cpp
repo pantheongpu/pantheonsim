@@ -710,6 +710,66 @@ bool MemoryManager::load_batch(const uint64_t* addrs, size_t count, uint32_t siz
   return true;
 }
 
+// The same address for `count` lanes (a warp's load of one word, as a kernel's uniform index or loop-invariant makes): one lookup, one load, the word
+// copied to every lane. The word is a legal outcome of the lanes' loads one by one (a store from another thread between them could show different
+// words to different lanes; the lanes of one warp are one instruction).
+bool MemoryManager::load_broadcast(uint64_t addr, size_t count, uint32_t size, uint64_t* out) const {
+  if (count == 0 || count > 32 || (size != 1 && size != 2 && size != 4 && size != 8) || (addr & (size - 1))) return false;
+  if (!batch_faults_clear(/*store=*/false)) return false;
+  uint64_t base = 0;
+  const Allocation* a = find_ordinary(addr, size, &base);
+  if (!a || !host_map_free_span(base, a->size)) return false;
+  const uint64_t off = addr - base;   // (the access is inside: find_ordinary asked for `size` bytes)
+  const uint8_t* chunk = a->chunks[off / kChunkSize].load(std::memory_order_acquire);
+  uint64_t v;
+  if (!chunk) v = 0;
+  else if (is_uniform(chunk)) v = repeated(uniform_byte(chunk), size);
+  else v = load_at(chunk + off % kChunkSize, size);
+  for (size_t i = 0; i < count; ++i) out[i] = v;
+  return true;
+}
+
+bool MemoryManager::store_strided(uint64_t a0, int64_t stride, size_t count, uint32_t size, const uint64_t* vals, size_t* failed_at) {
+  constexpr int64_t kHalf = static_cast<int64_t>(kChunkSize / 2);
+  if (count < 2 || count > 32 || (size != 1 && size != 2 && size != 4 && size != 8) || stride > kHalf || stride < -kHalf) return false;
+  if ((a0 | static_cast<uint64_t>(stride)) & (size - 1)) return false;
+  if (!batch_faults_clear(/*store=*/true)) return false;
+  uint64_t base = 0;
+  const Allocation* ca = find_ordinary(a0, size, &base);
+  if (!ca || !host_map_free_span(base, ca->size)) return false;
+  const uint64_t limit = ca->size - size + 1;
+  const uint64_t off0 = a0 - base;
+  if (off0 + static_cast<uint64_t>(stride) * (count - 1) >= limit) return false;   // (the ends are in, so the lanes between are: the stride is small, so the offset arithmetic does not wrap)
+  Allocation& a = const_cast<Allocation&>(*ca);
+  size_t l = 0;
+  uint64_t off = off0;
+  while (l < count) {
+    uint8_t* chunk = a.chunks[off / kChunkSize].load(std::memory_order_acquire);
+    uint64_t io = off % kChunkSize;
+    if (__builtin_expect(chunk != nullptr && !is_uniform(chunk), 1)) {
+      do {
+        store_at(chunk + io, size, vals[l++]);
+        io += static_cast<uint64_t>(stride);
+      } while (l < count && io < kChunkSize);
+    } else {
+      // An untouched or uniform chunk: this lane as store_batch_in does it, and the chunk is asked again for the next (it is real now,
+      // unless the store left it as it was).
+      if (!(is_uniform(chunk) && vals[l] == repeated(uniform_byte(chunk), size))) {
+        try {
+          chunk = materialize(a, off / kChunkSize);
+        } catch (...) {
+          if (failed_at) *failed_at = l;
+          throw;
+        }
+        store_at(chunk + io, size, vals[l]);
+      }
+      ++l;
+    }
+    off = off0 + static_cast<uint64_t>(stride) * l;
+  }
+  return true;
+}
+
 void MemoryManager::store_batch_in(Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size,
                                    const uint64_t* vals, size_t* failed_at) {
   for (size_t i = 0; i < count; ++i) {
