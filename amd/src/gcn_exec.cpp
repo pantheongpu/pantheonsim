@@ -31,6 +31,7 @@
 #include "vgpu/amd_gcn.hpp"
 #include "vgpu/amd_hostcall.hpp"
 #include "gcn_divide.hpp"
+#include "vgpu/exec/amd_run_scan.hpp"
 #include "vgpu/exec/lockstep.hpp"
 #include "vgpu/error.hpp"
 #include "vgpu/host_cpus.hpp"
@@ -10062,14 +10063,13 @@ struct Machine {
     const uint32_t reach = std::min<uint32_t>(off_mask ? static_cast<uint32_t>(__builtin_ctzll(off_mask)) : kLanes, kLanes - lane);
     if (direct && !in.scale_offset) {
       // The address registers as rows, and each lane's address compared with the one the run would give it.
-      const uint32_t* const lo = w.vgpr[a0.index].data();
+      // (exec::amdrun::run_scan: the same lanes compared with the same sums, four to a vector where the low words cannot wrap round.)
+      const uint32_t* const lo = w.vgpr[a0.index].data() + lane;
       if (in.has_saddr) {
-        for (; count < reach && sbase + lo[lane + count] + imm == (next += stride); ++count) {
-        }
+        count = exec::amdrun::run_scan(lo, nullptr, reach, lo[0], stride);
       } else {
-        const uint32_t* const hi = w.vgpr[a0.index + 1].data();
-        for (; count < reach && ((static_cast<uint64_t>(hi[lane + count]) << 32 | lo[lane + count]) + imm) == (next += stride); ++count) {
-        }
+        const uint32_t* const hi = w.vgpr[a0.index + 1].data() + lane;
+        count = exec::amdrun::run_scan(lo, hi, reach, addr - imm, stride);
       }
     } else {
       const auto address = [&](uint32_t l) -> uint64_t {
