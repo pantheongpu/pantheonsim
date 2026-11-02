@@ -98,6 +98,37 @@ __attribute__((target("popcnt"))) bool sector_window_k(const uint64_t* addrs, ui
   return true;
 }
 
+// sassmem::full_warp_rows, four lanes to a step: lane l's address is (lo[l] | hi[l] << 32) + add (`hi` null: lo[l] + add; `lo` null: add), stored to addrs[l];
+// whether some lane's address is in [window, window + 2^32), judged as the high half of (address - window) being zero; and whether every lane is on the
+// stride of the first two (addrs[l] == a0 + l * stride, modulo 2^64), found in the same pass by the difference from the expected address.
+void warp_rows_k(const uint32_t* lo, const uint32_t* hi, uint64_t add, uint64_t window, uint64_t* addrs, WarpRowsInfo& info) {
+  const auto lane = [&](unsigned l) { return lo ? ((hi ? static_cast<uint64_t>(hi[l]) << 32 : 0) | lo[l]) + add : add; };
+  const uint64_t a0 = lane(0), stride = lane(1) - a0;
+  const __m256i vadd = _mm256_set1_epi64x(static_cast<long long>(add));
+  const __m256i vwin = _mm256_set1_epi64x(static_cast<long long>(window));
+  const __m256i zero = _mm256_setzero_si256();
+  __m256i expect = _mm256_set_epi64x(static_cast<long long>(a0 + 3 * stride), static_cast<long long>(a0 + 2 * stride),
+                                     static_cast<long long>(a0 + stride), static_cast<long long>(a0));
+  const __m256i step = _mm256_set1_epi64x(static_cast<long long>(4 * stride));
+  __m256i in = zero, differ = zero;
+  for (unsigned i = 0; i < 32; i += 4) {
+    __m256i a = vadd;
+    if (lo) {
+      a = _mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(lo + i)));
+      if (hi) a = _mm256_or_si256(a, _mm256_slli_epi64(_mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(hi + i))), 32));
+      a = _mm256_add_epi64(a, vadd);
+    }
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(addrs + i), a);
+    in = _mm256_or_si256(in, _mm256_cmpeq_epi64(_mm256_srli_epi64(_mm256_sub_epi64(a, vwin), 32), zero));
+    differ = _mm256_or_si256(differ, _mm256_xor_si256(a, expect));
+    expect = _mm256_add_epi64(expect, step);
+  }
+  info.a0 = a0;
+  info.stride = stride;
+  info.in_window = !_mm256_testz_si256(in, in);
+  info.progression = _mm256_testz_si256(differ, differ);
+}
+
 // The same four lanes at a time (a 32-lane warp: eight steps), on a host with AVX2 at the level in use (VGPU_SIMD=base
 // and off keep the loop above): the fused multiply-add is correctly rounded, so a vector fma gives each lane's bits. A
 // group with a NaN result -- whose operands may be NaNs, which the rule above picks from -- is run lane by lane, and
@@ -428,6 +459,7 @@ namespace detail {
 std::atomic<const Kernels*> g_kernels __attribute__((visibility("hidden"))){&kBase};
 bool g_enabled __attribute__((visibility("hidden"))) = true;
 SectorWindowFn g_sector_window __attribute__((visibility("hidden"))) = nullptr;
+WarpRowsFn g_warp_rows __attribute__((visibility("hidden"))) = nullptr;
 }  // namespace detail
 
 bool avx2_f64_available() {
@@ -453,6 +485,7 @@ namespace testing {
 void use_sector_window_kernel(bool on) {
 #ifdef VGPU_SIMD_X86
   detail::g_sector_window = on && level() == Level::Avx2 ? avx2_impl::sector_window_k : nullptr;
+  detail::g_warp_rows = on && level() == Level::Avx2 ? avx2_impl::warp_rows_k : nullptr;
 #else
   (void)on;
 #endif

@@ -183,6 +183,8 @@ struct MOp {
   bool unguarded = true;
   bool never = false;            // @!PT: the guard is false for every lane, so it does nothing but count
   bool straight = false;         // Instr::straight
+  bool store = false;            // an STG or an ST: the op the store gate (Runner::step_warp, tier_run_t) looks for
+  bool cont = false;             // has a handler but is not straight, and does nothing but write registers: the run loop may go on past it (set with `fn`, Code::tier_program)
   uint8_t aux = 0;               // form-specific flags
   // How many instructions from this one on (at most 255) the run loop can issue back to back for a whole group (Runner::tier_run_t): straight,
   // unguarded, with a handler, and a pure register form (no memory, no scheduler, nothing that can fault), none of them the section's last. Set
