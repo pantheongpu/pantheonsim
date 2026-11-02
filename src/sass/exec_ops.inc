@@ -3041,6 +3041,17 @@ inline void count_shared(exec::LaunchStats& st, bool store, uint64_t n, uint32_t
   (store ? st.shared_bank_conflicts_st : st.shared_bank_conflicts_ld) += passes - 1;
 }
 
+// A warp's global access of `n` lanes of `bytes` bytes touching `distinct` sectors.
+inline void count_global(exec::LaunchStats& st, bool store, uint64_t n, uint32_t bytes, uint64_t distinct) {
+  (store ? st.global_stores : st.global_loads) += n;
+  (store ? st.global_bytes_written : st.global_bytes_read) += n * bytes;
+  st.global_sectors += distinct;
+  ++st.global_requests;
+  (store ? st.global_sectors_st : st.global_sectors_ld) += distinct;
+  ++(store ? st.global_requests_st : st.global_requests_ld);
+  (store ? st.global_bytes_st : st.global_bytes_ld) += n * bytes;
+}
+
 // Counts one warp-level access: per-lane operations and bytes, the 32-byte
 // sectors the lanes' addresses touch, and shared-memory bank conflicts.
 void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 local */, bool store,
@@ -3049,14 +3060,7 @@ void count_access(exec::LaunchStats& st, int space /* 0 global, 1 shared, 2 loca
   if (!n) return;
   switch (space) {
     case 0: {
-      const uint64_t distinct = exec::memcount::distinct_sectors_uncapped(addr, lanes, 32, bytes);
-      (store ? st.global_stores : st.global_loads) += n;
-      (store ? st.global_bytes_written : st.global_bytes_read) += n * bytes;
-      st.global_sectors += distinct;
-      ++st.global_requests;
-      (store ? st.global_sectors_st : st.global_sectors_ld) += distinct;
-      ++(store ? st.global_requests_st : st.global_requests_ld);
-      (store ? st.global_bytes_st : st.global_bytes_ld) += n * bytes;
+      count_global(st, store, n, bytes, exec::memcount::distinct_sectors_uncapped(addr, lanes, 32, bytes));
       break;
     }
     case 1: {
@@ -3112,14 +3116,17 @@ void count_run(exec::LaunchStats& st, bool store, uint64_t g0, unsigned first, u
     count_access(st, 0, store, addrs, ex, bytes);
     return;
   }
-  const uint64_t n = count;
-  (store ? st.global_stores : st.global_loads) += n;
-  (store ? st.global_bytes_written : st.global_bytes_read) += n * bytes;
-  st.global_sectors += distinct;
-  ++st.global_requests;
-  (store ? st.global_sectors_st : st.global_sectors_ld) += distinct;
-  ++(store ? st.global_requests_st : st.global_requests_ld);
-  (store ? st.global_bytes_st : st.global_bytes_ld) += n * bytes;
+  count_global(st, store, count, bytes, distinct);
+}
+
+// count_access of a full warp's global access whose 32 addresses are known to be a0 + l * stride (modulo 2^64): counted by the closed forms of a
+// progression without a pass over the addresses (memcount::full_warp_progression_sectors). False, with nothing counted, when they do not apply (the
+// caller then counts the addresses as count_access does).
+bool count_global_progression(exec::LaunchStats& st, bool store, uint64_t a0, uint64_t stride, uint32_t bytes) {
+  uint64_t distinct;
+  if (!exec::memcount::fast() || !exec::memcount::detail::full_warp_progression_sectors(a0, stride, bytes, distinct)) return false;
+  count_global(st, store, 32, bytes, distinct);
+  return true;
 }
 
 // One lane's access to shared or local memory moves `B` bytes (1, 2, 4, 8 or 16) between the register file and an array.

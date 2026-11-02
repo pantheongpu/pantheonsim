@@ -1370,6 +1370,8 @@ vgpu_unit_test(test_sass_lanes)
 target_include_directories(test_sass_lanes PRIVATE src)
 # The address-row questions of the tier's global and shared memory handlers (vgpu/exec/sass_mem_rows.hpp), against the address array they replaced.
 vgpu_unit_test(test_sass_mem_rows)
+add_test(NAME test_sass_mem_rows_simd_base COMMAND test_sass_mem_rows)
+set_tests_properties(test_sass_mem_rows_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base")
 # The SASS executor's memory-access counting, against the straightforward version it replaced
 # (vgpu/exec/mem_counters.hpp, which both engines count with).
 vgpu_unit_test(test_sass_access_count)
@@ -1415,6 +1417,12 @@ add_test(NAME test_sass_alu_runs_tier0 COMMAND test_sass_alu_runs)
 set_tests_properties(test_sass_alu_runs_tier0 PROPERTIES ENVIRONMENT "VGPU_TIER=0")
 add_test(NAME test_sass_alu_runs_simd_base COMMAND test_sass_alu_runs)
 set_tests_properties(test_sass_alu_runs_simd_base PROPERTIES ENVIRONMENT "VGPU_SIMD=base")
+# The store gate: every warp of a block loads before the first store lands, in the tier's run loop and in the interpreter's.
+vgpu_unit_test(test_sass_store_gate)
+add_test(NAME test_sass_store_gate_tier0 COMMAND test_sass_store_gate)
+set_tests_properties(test_sass_store_gate_tier0 PROPERTIES ENVIRONMENT "VGPU_TIER=0")
+# The run loop going on past S2R, ULDC, UMOV, USEL, PLOP3 and SEL where the chain would have started the next call there: same words, counters and clocks as the interpreter.
+vgpu_unit_test(test_sass_chain_cont)
 vgpu_unit_test(test_sass_s2r_fill)
 # LDGSTS (cp.async): the tier's own handler against the rule and the interpreter, registers, shared memory and counters.
 vgpu_unit_test(test_sass_ldgsts)
