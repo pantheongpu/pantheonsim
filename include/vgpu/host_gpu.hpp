@@ -75,6 +75,108 @@ inline bool exact_opcode_allowed(const std::string& mnemonic, const std::vector<
   return exact_mnemonic_allowed(mnemonic) && exact_mods_allowed(mnemonic, mods);
 }
 
+// ---- the IEEE division idiom (MUFU.RCP + FCHK + a call to the slow path) --------------------------------------------------------------
+// MUFU.RCP alone is NOT in the exact set: the card's reciprocal differs from the simulator's correctly rounded one by one ulp on about 13% of the mantissas
+// (tools/probes/mufu_rcp_probe.cu, round 5), and 09 doc section 2 saw 1 to 171 ulp results downstream of an SFU instruction. But ptxas builds the IEEE
+// quotient a / b (div.rn.f32, also `/` in CUDA C++) from MUFU.RCP, a few FFMAs that refine it, an FCHK that sends the rare operands to a slow path
+// (CALL.REL.NOINC to a subroutine that also uses MUFU.RCP, ending in RET), and the result is the correctly rounded quotient whatever the last bit of the
+// approximation: the PTX ISA requires div.rn.f32 to be IEEE-compliant, so the card and the simulator both give the one correctly rounded answer.
+// Tested here without a card: the refinement over every mantissa of the divisor with the simulator's reciprocal and with it one ulp off either way
+// (tests/unit/test_host_gpu_ref.cpp); on a card, by tools/probes/hostgpu_sfu_exhaustive.cu div (all 2^32 divisors), which is PENDING. Until that run is
+// clean the recognizer is behind VGPU_HOST_GPU_DIV=1 and the default exact set is unchanged.
+//
+// What the recognizer accepts (division_idiom_only): every MUFU is a plain RCP; each one outside a subroutine has an FCHK of the same divisor register within
+// kIdiomMufuToFchk instructions after it; every CALL goes to a subroutine (from its target to the first RET at or after it) and has an FCHK within
+// kIdiomFchkToCall instructions before it; a subroutine holds arithmetic only (no memory, barrier or warp operation, no call); every RET is in a subroutine.
+// The slow path makes the NaN of 0/0 and inf/inf with `MUFU.RSQ R, -QNAN` (the reciprocal square root of an immediate NaN: the canonical NaN 0x7fffffff, which
+// the simulator gives and the card run checks with dividends 0, inf and NaN): that one form (NanGen) is accepted inside a subroutine and nowhere else.
+// A kernel with a bare rcp.approx (no FCHK), a device function that is not the slow path, or any other MUFU fails the check and stays refused.
+struct CodeInsn {
+  enum class Kind : uint8_t { Other, MufuRcp, MufuOther, Fchk, Call, Ret, Memory, NanGen };
+  Kind kind = Kind::Other;
+  uint64_t pc = 0;
+  int64_t target = -1;    // CALL: the address of the subroutine
+  int src0 = -1;          // MUFU: the register read; FCHK: the dividend's
+  int src1 = -1;          // FCHK: the divisor's register
+};
+inline constexpr unsigned kIdiomMufuToFchk = 32;   // (the scheduler interleaves other work: 9 instructions apart in a kernel that also has an expf)
+inline constexpr unsigned kIdiomFchkToCall = 12;
+
+inline bool division_idiom_only(const std::vector<CodeInsn>& code, const char** why = nullptr) {
+  const char* sink = "";
+  if (!why) why = &sink;
+  using K = CodeInsn::Kind;
+  struct Region { uint64_t lo, hi; };
+  std::vector<Region> regions;
+  bool any = false;
+  for (size_t i = 0; i < code.size(); ++i) {
+    if (code[i].kind != K::Call) continue;
+    any = true;
+    // the subroutine: from the target to the first RET at or after it
+    size_t t = code.size();
+    for (size_t j = 0; j < code.size(); ++j)
+      if (static_cast<int64_t>(code[j].pc) == code[i].target) { t = j; break; }
+    if (t == code.size() || t <= i) { *why = "a call to an address that is not later in the code"; return false; }   // no such address, or a call backwards (a loop of calls is not the idiom)
+    size_t r = t;
+    while (r < code.size() && code[r].kind != K::Ret) {
+      if (code[r].kind == K::Call || code[r].kind == K::Memory) { *why = "the subroutine calls or touches memory or other threads"; return false; }
+      ++r;
+    }
+    if (r == code.size()) { *why = "a subroutine with no RET"; return false; }
+    bool fchk_before = false;
+    for (size_t j = i > kIdiomFchkToCall ? i - kIdiomFchkToCall : 0; j < i; ++j) fchk_before = fchk_before || code[j].kind == K::Fchk;
+    if (!fchk_before) { *why = "a CALL with no FCHK before it"; return false; }
+    regions.push_back({code[t].pc, code[r].pc});
+  }
+  const auto in_region = [&](uint64_t pc) {
+    for (const Region& g : regions)
+      if (pc >= g.lo && pc <= g.hi) return true;
+    return false;
+  };
+  for (size_t i = 0; i < code.size(); ++i) {
+    switch (code[i].kind) {
+      case K::MufuOther: *why = "an SFU instruction other than RCP"; return false;
+      case K::NanGen:
+        if (!in_region(code[i].pc)) { *why = "a NaN generator outside a division subroutine"; return false; }
+        break;
+      case K::Ret:
+        if (!in_region(code[i].pc)) { *why = "a RET outside a division subroutine"; return false; }
+        break;
+      case K::MufuRcp: {
+        if (in_region(code[i].pc)) break;
+        bool checked = false;
+        for (size_t j = i + 1; j < code.size() && j <= i + kIdiomMufuToFchk && !checked; ++j)
+          checked = code[j].kind == K::Fchk && code[j].src1 >= 0 && code[j].src1 == code[i].src0;
+        if (!checked) { *why = "a MUFU.RCP with no FCHK of its divisor right after"; return false; }
+        break;
+      }
+      default: break;
+    }
+  }
+  (void)any;
+  return true;
+}
+
+// The kind of an instruction for the check above, from its mnemonic and modifiers. Anything that touches memory, a barrier or other threads is Memory
+// (not allowed inside the slow path); an instruction that is not in the exact set at all is Memory too, so a subroutine holding one fails.
+inline CodeInsn::Kind classify_for_idiom(const std::string& mnemonic, const std::vector<std::string>& mods, bool source_is_nan_constant = false) {
+  using K = CodeInsn::Kind;
+  if (mnemonic == "MUFU") {
+    bool rcp = false, rsq = false, other = false;
+    for (const std::string& m : mods) (m == "RCP" ? rcp : m == "RSQ" ? rsq : other) = true;
+    if (rsq && !rcp && !other && source_is_nan_constant) return K::NanGen;
+    return rcp && !rsq && !other ? K::MufuRcp : K::MufuOther;
+  }
+  if (mnemonic == "FCHK") return K::Fchk;
+  if (mnemonic == "CALL") return K::Call;
+  if (mnemonic == "RET") return K::Ret;
+  static const char* const kTouchesOthers[] = {"LDG", "STG", "LDS", "STS", "LDL", "STL", "LD", "ST", "BAR", "MEMBAR", "ERRBAR", "DEPBAR", "CCTL", "SHFL",
+                                               "VOTE", "MATCH", "RED", "WARPSYNC", "VOTEU"};
+  for (const char* t : kTouchesOthers)
+    if (mnemonic == t) return K::Memory;
+  return exact_mnemonic_allowed(mnemonic) ? K::Other : K::Memory;
+}
+
 // ---- residency (the design for a card copy that outlives a launch) ---------------------------------------------------------
 
 enum class Where : uint8_t {
@@ -218,6 +320,16 @@ inline bool should_offload(const Estimate& e, const Costs& c) {
   return e.sim_s >= c.min_sim_s && e.sim_s > c.margin * card_path_seconds(e, c);
 }
 
+// ---- start-up of the real driver ---------------------------------------------------------------------------------------------------
+// Loading the driver and making its context costs 0.15 to 0.35 s (09 doc, section 5). It starts, on a thread, at the first launch of a kernel in the exact set
+// that is big enough to be a candidate; a program with no such launch never loads the driver. A launch of fewer than kStartMinWarps warps in all runs in well
+// under a millisecond in the simulator and cannot repay a start by itself; a kernel whose small grid runs long gets its start when the card path is first needed.
+inline constexpr uint64_t kStartMinWarps = 32;
+inline bool start_worthwhile(uint64_t blocks, uint32_t threads_per_block) {
+  const uint64_t warps_per_block = (static_cast<uint64_t>(threads_per_block) + 31) / 32;
+  return blocks * warps_per_block >= kStartMinWarps;
+}
+
 // An estimate for a launch the simulator has not run yet: every warp of the grid executes the kernel's static instruction count, at the
 // simulator's rate. It is NOT a lower bound: a thread that leaves at a bounds check runs a few instructions (PolyBench 3DCONV, a stencil
 // whose grid covers the array and whose threads mostly exit, simulated in 3 ms and estimated at 60 ms), and a loop adds to the count.
@@ -227,35 +339,124 @@ inline double static_sim_seconds(uint64_t blocks, uint32_t threads_per_block, ui
   return static_cast<double>(blocks * warps_per_block * static_instrs) / c.sim_warp_instr_per_s;
 }
 
-// What the simulator took for a kernel before, by kernel, per block of the grid. The first two launches of a kernel always run in the
-// simulator: the first one pays decoding and set-up that the later ones do not (PolyBench 3DCONV's first launch took far longer than the
-// 252 after it, and an estimate from it sent 253 launches of 3 ms to a card path of 100 ms: 38x slower), so the estimate is the
-// smallest per-block time seen, which errs towards the simulator, as the rule should. It is available after two samples.
+// What the simulator took for a kernel before, by kernel, per block of the grid. The first two launches of a kernel run in the simulator: the first one
+// pays decoding and set-up that the later ones do not (PolyBench 3DCONV's first launch took far longer than the 252 after it, and an estimate from it sent
+// 253 launches of 3 ms to a card path of 100 ms: 38x slower), so the estimate is the smallest per-block time seen, which errs towards the simulator, as the
+// rule should. It is available after two samples.
+//
+// One exception, for the launches that cost the most (sp15): a first sample that took kOneSampleMinSeconds or more is a launch whose simulator time is far above any
+// decode or set-up cost, and running the kernel a second time in the simulator just to learn what it already showed would cost as much again. Such a kernel
+// has an estimate after ONE sample, for at most kOneSampleOffloads offloaded launches (the estimate may still hold set-up time, which would blind the
+// offload_paid_off check below): after that it needs a second, simulated sample like any other kernel, and the ban rules judge the card path against that.
+inline constexpr double kOneSampleMinSeconds = 0.25;
+inline constexpr unsigned kOneSampleOffloads = 2;
+
 class SimTimeTable {
  public:
   void record(const std::string& kernel, uint64_t blocks, double seconds) {
     Entry& e = table_[kernel];
     const double per_block = blocks ? seconds / static_cast<double>(blocks) : seconds;
+    if (!e.samples) e.first_total_s = seconds;
     e.per_block_s = e.samples ? std::min(e.per_block_s, per_block) : per_block;
     ++e.samples;
   }
   std::optional<double> predict(const std::string& kernel, uint64_t blocks) const {
     const auto it = table_.find(kernel);
-    if (it == table_.end() || it->second.samples < kSamplesNeeded) return std::nullopt;
-    return it->second.per_block_s * static_cast<double>(std::max<uint64_t>(blocks, 1));
+    if (it == table_.end()) return std::nullopt;
+    const Entry& e = it->second;
+    const bool one_sample_ok = e.samples == 1 && e.first_total_s >= kOneSampleMinSeconds && e.one_sample_offloads < kOneSampleOffloads;
+    if (e.samples < kSamplesNeeded && !one_sample_ok) return std::nullopt;
+    return e.per_block_s * static_cast<double>(std::max<uint64_t>(blocks, 1));
+  }
+  // An offloaded launch used an estimate from `kernel`'s samples: counts against the one-sample allowance.
+  void note_offload(const std::string& kernel) {
+    const auto it = table_.find(kernel);
+    if (it != table_.end() && it->second.samples < kSamplesNeeded) ++it->second.one_sample_offloads;
+  }
+  unsigned samples(const std::string& kernel) const {
+    const auto it = table_.find(kernel);
+    return it == table_.end() ? 0 : it->second.samples;
   }
   static constexpr unsigned kSamplesNeeded = 2;
 
  private:
   struct Entry {
     double per_block_s = 0;
+    double first_total_s = 0;
     unsigned samples = 0;
+    unsigned one_sample_offloads = 0;
   };
   std::map<std::string, Entry> table_;
 };
 
+// ---- the first launch of a kernel (docs/perf-design/09-host-gpu-spike.md 6, step 2) --------------------------------------------------
+// The history rule needs two simulator launches of a kernel, so a program that launches each kernel once (PolyBench GEMM, SYRK, SYR2K, 3MM) was never
+// offloaded. A static count of the code cannot say how long threads run (3DCONV, a stencil with no loop whose threads mostly leave at a bounds check, was
+// 38x slower with VGPU_HOST_GPU_STATIC=1), so the first launch of a kernel goes to the card only when ALL of these hold:
+//  * the kernel has a loop (a branch back to an earlier instruction): threads cannot all leave at a bounds check, they have work that grows with the code's loop;
+//  * the grid covers at least kFirstLaunchBlocksPerSm blocks per multiprocessor: a grid that does not fill the machine is small however long a thread runs;
+//  * the live bytes (the most the launch can move each way) are at most kFirstLaunchMaxBytes: a mistaken first launch is bounded;
+//  * the static estimate beats the card path by the usual margin, with the pushes and pulls of the whole live memory.
+// Only the kernel's first launch is decided this way: the next ones are the simulator's until its history exists, as before.
+inline constexpr uint64_t kFirstLaunchBlocksPerSm = 8;
+inline constexpr uint64_t kFirstLaunchMaxBytes = 256ull << 20;
+
+// Whether a branch goes back to its own instruction or an earlier one. `branches` holds (pc, target) of every branch of the kernel's code.
+inline bool has_back_edge(const std::vector<std::pair<uint64_t, uint64_t>>& branches) {
+  for (const auto& [pc, target] : branches)
+    if (target <= pc) return true;
+  return false;
+}
+
+struct FirstLaunch {
+  uint64_t blocks = 0;
+  uint32_t threads_per_block = 0;
+  uint64_t static_instrs = 0;
+  bool back_edge = false;
+  uint32_t multiprocessors = 0;
+  uint64_t live_bytes = 0;
+};
+
+inline bool first_launch_offload(const FirstLaunch& f, const Costs& c) {
+  if (!f.back_edge || f.multiprocessors == 0 || f.blocks < kFirstLaunchBlocksPerSm * f.multiprocessors || f.live_bytes > kFirstLaunchMaxBytes) return false;
+  Estimate e;
+  e.sim_s = static_sim_seconds(f.blocks, f.threads_per_block, f.static_instrs, c);
+  e.push_bytes = f.live_bytes;
+  e.pull_bytes = f.live_bytes;
+  return should_offload(e, c);
+}
+
 // A safety net for any estimate that turns out wrong: an offloaded launch that took longer on the card path (copies, launch, copy back)
 // than the simulator was expected to need ends the offloading of that kernel. One bad launch is the most it can cost.
 inline bool offload_paid_off(double card_total_s, double sim_estimate_s) { return card_total_s <= sim_estimate_s; }
+
+// A second safety net, by traffic (docs/perf-design/09-host-gpu-spike.md 7.3; docs/performance.md "Round sp14"). With a persistent card copy, a kernel that
+// alternates with simulator launches on the same buffers gives the copy up and gets it pushed again every time. A kernel is banned when kTrafficLaunches
+// offloaded launches IN A ROW each pushed more than kTrafficSharePercent percent of the live bytes AND more than kTrafficMinBytes, and each one's card path
+// took more than kTrafficSlowShare of the simulator's estimate. All three conditions are needed: replayed over the 64 saved traces (residency_model.py), the share
+// and the size alone also catch GRAMSCHM, whose offloaded launches are worth 3x their traffic (banning it loses 29%), and the share keeps base64e (8.4% of live bytes
+// per push, 8.06 MiB) out. The kernel stays in the simulator for the rest of the process; a ban only moves a launch back, so results do not change.
+// Measured on the traces the ban fires on LU only, and late: it is a net, not the fix for LU's 18% against write-through.
+inline constexpr unsigned kTrafficLaunches = 2;
+inline constexpr unsigned kTrafficSharePercent = 25;
+inline constexpr uint64_t kTrafficMinBytes = 12ull << 20;
+inline constexpr double kTrafficSlowShare = 0.5;
+
+class TrafficTable {
+ public:
+  // One offloaded launch of `kernel`: it pushed `push_bytes` of `live_bytes`, its card path took `card_total_s`, the simulator was expected to need
+  // `sim_estimate_s`. `timing_valid` is false for a kernel's first card launch, whose path includes the module load: then only the traffic counts.
+  // Returns true when the kernel must go back to the simulator for good.
+  bool record(const std::string& kernel, uint64_t push_bytes, uint64_t live_bytes, double card_total_s, double sim_estimate_s, bool timing_valid = true) {
+    unsigned& heavy = heavy_[kernel];
+    const bool big = push_bytes > kTrafficMinBytes && live_bytes > 0 && push_bytes * 100 > live_bytes * kTrafficSharePercent;
+    const bool slow = !timing_valid || card_total_s > kTrafficSlowShare * sim_estimate_s;
+    heavy = (big && slow) ? heavy + 1 : 0;
+    return heavy >= kTrafficLaunches;
+  }
+
+ private:
+  std::map<std::string, unsigned> heavy_;   // per kernel: offloaded launches in a row that were heavy
+};
 
 }  // namespace vgpu::hostgpu

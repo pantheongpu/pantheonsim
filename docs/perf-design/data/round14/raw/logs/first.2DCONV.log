@@ -1,0 +1,5 @@
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+host_gpu: _Z20convolution2D_kerneliiPfS_: first launch decided by the static rule (loop, 65536 blocks)
+host_gpu: _Z20convolution2D_kerneliiPfS_ on the card (resident): kernel 0.357 ms, total 37.408 ms (sim estimate 293.601 ms), 128.00 MiB pushed
+host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 128.0 MiB went to the card, 64.0 MiB came back

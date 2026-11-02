@@ -1,0 +1,76 @@
+program                          off        wt   persist       ban | banned ban/pers | banned kernels (launch of the ban)
+hec_adam-cuda                  0.025     0.025     0.025     0.025 | -        1.000x | 
+hec_aidw-cuda                  0.000     0.000     0.000     0.000 | -        0.000x | 
+hec_aligned-types-cuda        64.030     8.912     1.513     1.513 | -        1.000x | 
+hec_aobench-cuda               0.527     0.527     0.527     0.527 | -        1.000x | 
+hec_aop-cuda                   1.969     1.969     1.969     1.969 | -        1.000x | 
+hec_asmooth-cuda               0.221     0.221     0.221     0.221 | -        1.000x | 
+hec_asyncAllocation-cuda       3.503     3.503     3.503     3.503 | -        1.000x | 
+hec_atan2-cuda                 0.018     0.018     0.018     0.018 | -        1.000x | 
+hec_atomicAggregate-cuda       4.746     4.746     4.746     4.746 | -        1.000x | 
+hec_atomicCost-cuda            0.000     0.000     0.000     0.000 | -        0.000x | 
+hec_atomicIntrinsics-cuda      0.727     0.727     0.727     0.727 | -        1.000x | 
+hec_atomicPerf-cuda            1.497     1.497     1.497     1.497 | -        1.000x | 
+hec_atomicReduction-cuda      97.944    97.944    97.944    97.944 | -        1.000x | 
+hec_attention-cuda             0.025     0.025     0.025     0.025 | -        1.000x | 
+hec_axpby-cuda                 0.386     0.375     0.051     0.051 | -        1.000x | 
+hec_babelstream-cuda          31.334    25.978     5.645     5.645 | -        1.000x | 
+hec_background-subtract-cuda     0.000     0.000     0.000     0.000 | -        0.000x | 
+hec_backprop-cuda              0.008     0.008     0.008     0.008 | -        1.000x | 
+hec_base64e-cuda              57.989    11.741     2.043     2.043 | -        1.000x | 
+hec_bgmv-cuda                  0.010     0.010     0.010     0.010 | -        1.000x | 
+hec_bh-cuda                    0.010     0.010     0.010     0.010 | -        1.000x | 
+hec_bilateral-cuda             1.303     1.303     1.303     1.303 | -        1.000x | 
+hec_binomial-cuda              0.000     0.000     0.000     0.000 | -        0.000x | 
+hec_bitonic-sort-cuda          0.332     0.332     0.332     0.332 | -        1.000x | 
+hec_black-scholes-cuda        19.443    19.443    19.443    19.443 | -        1.000x | 
+hec_blockAccess-cuda           0.019     0.019     0.019     0.019 | -        1.000x | 
+hec_perplexity-cuda            0.378     0.378     0.378     0.378 | -        1.000x | 
+hec_radixsort2-cuda            6.436     6.436     6.436     6.436 | -        1.000x | 
+hec_s3d-cuda                   0.304     0.304     0.304     0.304 | -        1.000x | 
+hec_shmembench-cuda            8.899     8.899     8.899     8.899 | -        1.000x | 
+hec_silu-cuda                  0.559     0.559     0.559     0.559 | -        1.000x | 
+hec_sortKV-cuda                0.413     0.413     0.413     0.413 | -        1.000x | 
+hec_zerocopy-cuda             44.611    44.611    44.611    44.611 | -        1.000x | 
+poly_2DCONV                    0.582     0.582     0.582     0.582 | -        1.000x | 
+poly_2MM                       0.000     0.000     0.000     0.000 | -        0.000x | 
+poly_3DCONV                    0.738     0.738     0.738     0.738 | -        1.000x | 
+poly_3MM                       2.635     2.635     2.635     2.635 | -        1.000x | 
+poly_ADI                       0.407     0.407     0.407     0.407 | -        1.000x | 
+poly_ATAX                      2.034     2.034     2.034     2.034 | -        1.000x | 
+poly_BICG                      0.260     0.260     0.260     0.260 | -        1.000x | 
+poly_CORR                     36.251    36.251    36.251    36.251 | -        1.000x | 
+poly_COVAR                    36.445    36.445    36.445    36.445 | -        1.000x | 
+poly_FDTD-2D                  57.779    24.213     0.759     0.759 | -        1.000x | 
+poly_GEMM                      0.921     0.921     0.921     0.921 | -        1.000x | 
+poly_GEMVER                    0.782     0.782     0.782     0.782 | -        1.000x | 
+poly_GESUMMV                   0.354     0.354     0.354     0.354 | -        1.000x | 
+poly_GRAMSCHM                 52.355    39.432    37.117    37.117 | -        1.000x | 
+poly_JACOBI1D                  2.966     2.902     2.922     2.922 | -        1.000x | 
+poly_JACOBI2D                  0.936     0.283     0.105     0.105 | -        1.000x | 
+poly_LU                       55.663    16.208    20.084    19.290 | YES      1.041x | _Z10lu_kernel2iPfi@1145
+poly_MVT                       2.029     2.029     2.029     2.029 | -        1.000x | 
+poly_SYR2K                    17.895    17.895    17.895    17.895 | -        1.000x | 
+poly_SYRK                      9.374     9.374     9.374     9.374 | -        1.000x | 
+rod_backprop                   0.041     0.041     0.041     0.041 | -        1.000x | 
+rod_bfs                        0.007     0.004     0.005     0.005 | -        1.000x | 
+rod_gaussian                   0.017     0.008     0.010     0.010 | -        1.000x | 
+rod_hotspot                    0.022     0.022     0.022     0.022 | -        1.000x | 
+rod_lavaMD                     0.385     0.385     0.385     0.385 | -        1.000x | 
+rod_lud                        0.050     0.029     0.030     0.030 | -        1.000x | 
+rod_needle                     0.008     0.008     0.005     0.005 | -        1.000x | 
+rod_pathfinder                 0.002     0.002     0.002     0.002 | -        1.000x | 
+rod_pf                         0.131     0.131     0.131     0.131 | -        1.000x | 
+rod_sc                         0.402     0.158     0.175     0.175 | -        1.000x | 
+rod_srad_v2                    0.000     0.000     0.000     0.000 | -        0.000x | 
+
+# slow-share sweep (pct=25, mib=12, n=2): programs banned and persist/ban gain
+slow 0.10: poly_GRAMSCHM 0.710x@4, poly_LU 0.698x@417
+slow 0.25: poly_GRAMSCHM 0.710x@4, poly_LU 1.014x@825
+slow 0.30: poly_GRAMSCHM 0.878x@451, poly_LU 1.037x@897
+slow 0.40: poly_LU 1.051x@1025
+slow 0.50: poly_LU 1.041x@1145
+slow 0.70: poly_LU 1.010x@1281
+slow 0.75: none banned
+slow 0.80: none banned
+slow 1.00: none banned

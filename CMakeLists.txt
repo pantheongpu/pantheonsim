@@ -1325,6 +1325,7 @@ endfunction()
 vgpu_unit_test(test_yamlish)
 vgpu_unit_test(test_check_compare)
 vgpu_unit_test(test_host_gpu_logic)
+vgpu_unit_test(test_host_gpu_ref)
 vgpu_unit_test(test_card_gate)
 target_include_directories(test_check_compare PRIVATE src/cli)
 vgpu_unit_test(test_profile)
@@ -1393,6 +1394,8 @@ vgpu_unit_test(test_memrmw)
 vgpu_unit_test(test_memhot_sp8)
 # A warp's gather load (load_batch's fused tests and two-pass loads) against load_scalar, over every kind of chunk and every way to decline.
 vgpu_unit_test(test_gather_sp10)
+# A warp's load of one address (load_broadcast) and store on a stride (store_strided) against load_scalar / store_scalar, over every kind of chunk, the edges of chunks and of the allocation, and every decline.
+vgpu_unit_test(test_warp_stride_access)
 # A device-to-device copy made chunk to chunk (MemoryManager::copy_to) against the read-into-a-buffer-then-write pair it replaces: bytes, chunk state, declines.
 vgpu_unit_test(test_memcopy_direct)
 # The warp's local memory, interleaved by words, against the per-lane layout it replaced.
@@ -3669,6 +3672,15 @@ set_tests_properties(e2e_host_gpu PROPERTIES
   ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
   SKIP_REGULAR_EXPRESSION "^SKIP:"
   TIMEOUT 900)
+
+# The same mode's start-up on any machine, with a stand-in driver (nvidia/tests/e2e/host_gpu_stub_driver.c): lazy, off the launch path, failing cleanly.
+add_test(NAME e2e_host_gpu_stub
+         COMMAND ${CMAKE_SOURCE_DIR}/nvidia/tests/e2e/run_host_gpu_stub.sh)
+set_tests_properties(e2e_host_gpu_stub PROPERTIES
+  DEPENDS vgpucudart
+  ENVIRONMENT "VGPU_BUILD_DIR=${CMAKE_BINARY_DIR}"
+  SKIP_REGULAR_EXPRESSION "^SKIP:"
+  TIMEOUT 600)
 
 # Tier 2 (src/sass/jit.hpp, VGPU_JIT=1) against the tier, on the same programs: results and every counter, with the JIT forced on at once, one
 # and four host threads, a warm cache, the faults of sass_tier_steps, and every way the JIT can fail (the output must not change).

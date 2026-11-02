@@ -118,7 +118,7 @@ Insn stg_e(unsigned size, unsigned a, unsigned data, uint32_t off, unsigned guar
 constexpr uint32_t kK[4] = {0x9e3779b1u, 0x85ebca6bu, 0xc2b2ae35u, 0x27d4eb2fu}, kC = 0x01234567u;
 
 // Registers: R1 tid, R3 tid * 4, R4:R5 the address, R6:R7 the buffer, R8:R9 the output, R10 a word read back, R11 a constant, R12..R15 the data.
-// mode 0: every lane's address is in the shared window (tid * D), 1: global (base + tid * S), 2: shared for tid < 16 and global for the rest, 3: as 1 with LDG and STG.
+// mode 0: every lane's address is in the shared window (tid * D), 1: global (base + tid * S), 2: shared for tid < 16 and global for the rest, 3: as 1 with LDG and STG, 4: as 3 with the lanes in reverse order (lane l at base + (31 - l) * S: a warp that goes DOWN memory), 5: as 3 with the stride doubling from lane 16 (a full warp in global memory that is NOT on a stride).
 std::vector<Insn> kernel(unsigned mode, uint32_t S, uint32_t D, unsigned st_size, unsigned ld_size, uint32_t soff, uint32_t loff, unsigned st_guard, unsigned ld_guard) {
   std::vector<Insn> code;
   code.push_back(s2r(1, 0x21));
@@ -128,15 +128,20 @@ std::vector<Insn> kernel(unsigned mode, uint32_t S, uint32_t D, unsigned st_size
   code.push_back(movi(11, kC));
   for (unsigned i = 0; i < 4; ++i) code.push_back(imadi(12 + i, 1, kK[i], 11));
   code.push_back(imadi(3, 1, 4, kRZ));
-  if (mode == 1 || mode == 3) {
+  if (mode == 4) {
+    code.push_back(movi(11, 31));
+    code.push_back(imadi(2, 1, 0xffffffffu, 11));   // R2 = 31 - tid
+    code.push_back(imad_wide_i(4, 2, S, 6));
+  } else if (mode == 1 || mode == 3 || mode == 5) {
     code.push_back(imad_wide_i(4, 1, S, 6));
+    if (mode == 5) code.push_back(imad_wide_g(4, 1, 2 * S, 6, 0));   // (@P0, lanes 16 and up: twice the stride)
   } else {
     code.push_back(imadi(4, 1, D, kRZ));
     code.push_back(movi(5, 0x6ffe));
     if (mode == 2) code.push_back(imad_wide_g(4, 1, S, 6, 0));
   }
-  code.push_back((mode == 3 ? stg_e : st_e)(st_size, 4, 12, soff, st_guard));
-  code.push_back((mode == 3 ? ldg_e : ld_e)(ld_size, 12, 4, loff, ld_guard));
+  code.push_back((mode >= 3 ? stg_e : st_e)(st_size, 4, 12, soff, st_guard));
+  code.push_back((mode >= 3 ? ldg_e : ld_e)(ld_size, 12, 4, loff, ld_guard));
   code.push_back(imad_wide_i(8, 1, 32, 6));
   for (unsigned i = 0; i < 4; ++i) code.push_back(stg(8, 12 + i, kIn + 4 * i));
   for (unsigned j = 0; j < 4; ++j) {
@@ -186,9 +191,9 @@ Result run(Env& e, const Case& k, const std::vector<uint8_t>& input, bool interp
   unsigned lds = 0, sts = 0;
   for (size_t i = 0; i < code.size(); ++i) {
     const sass::Instr ins = sass::decode(code[i].w, 16 * i, 86);
-    lds += ins.op == (k.mode == 3 ? sass::Op::LDG : sass::Op::LD), sts += ins.op == (k.mode == 3 ? sass::Op::STG : sass::Op::ST);
+    lds += ins.op == (k.mode >= 3 ? sass::Op::LDG : sass::Op::LD), sts += ins.op == (k.mode >= 3 ? sass::Op::STG : sass::Op::ST);
   }
-  if (lds != 1 || sts != (k.mode == 3 ? 9u : 1u)) throw vtest::Failure("the kernel does not hold the one load and the one store under test");
+  if (lds != 1 || sts != (k.mode >= 3 ? 9u : 1u)) throw vtest::Failure("the kernel does not hold the one load and the one store under test");
   const std::string c = make_cubin(code);
   const auto m = sass::load(reinterpret_cast<const uint8_t*>(c.data()), c.size(), e.mem, e.prof);
   if (interp) ::setenv("VGPU_FASTPATH", "0", 1);
@@ -219,7 +224,9 @@ Result expected(const Case& k, const std::vector<uint8_t>& in) {
   const auto where = [&](uint32_t t, uint32_t off, std::vector<uint8_t>*& mem) -> uint64_t {
     const bool shared = k.mode == 0 || (k.mode == 2 && t < 16);
     mem = shared ? &sh : &gl;
-    return shared ? uint64_t{k.D} * t + off : uint64_t{k.S} * t + off;
+    const uint32_t lane = k.mode == 4 ? 31 - t : t;   // (mode 4: the lanes go down memory)
+    const uint64_t s = k.mode == 5 && t >= 16 ? 2 * uint64_t{k.S} : k.S;   // (mode 5: the stride doubles from lane 16)
+    return shared ? uint64_t{k.D} * t + off : s * lane + off;
   };
   std::vector<std::array<uint32_t, 4>> reg(k.threads);
   for (uint32_t t = 0; t < k.threads; ++t)
@@ -325,6 +332,17 @@ VTEST(generic_accesses_in_both_windows_are_the_interpreters) { sweep({2}, {{16, 
 // leaves (the low half, the high half); bytes, registers and every counter against the rule and against the interpreter.
 VTEST(global_accesses_on_a_stride_or_not) {
   sweep({3}, {{0, 0}, {1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {12, 0}, {32, 0}, {36, 0}, {128, 0}, {200, 0}}, {32, 20});
+}
+
+// Warps whose lanes go DOWN memory (mode 4: lane l at base + (31 - l) * S, strides of 4 to 200 bytes): a strided load or store that took the stride
+// as unsigned, or counted the lanes from the wrong end, would read and write the wrong words.
+VTEST(global_accesses_on_a_descending_stride) {
+  sweep({4}, {{4, 0}, {8, 0}, {16, 0}, {12, 0}, {32, 0}, {36, 0}, {200, 0}}, {32});
+}
+
+// A full warp whose lanes are in global memory but NOT on one stride (the stride doubles at lane 16): the strided load and store must leave it to the batch.
+VTEST(global_accesses_off_a_stride_over_a_full_warp) {
+  sweep({5}, {{4, 0}, {8, 0}, {16, 0}, {12, 0}, {36, 0}, {100, 0}}, {32, 20});
 }
 
 VTEST_MAIN

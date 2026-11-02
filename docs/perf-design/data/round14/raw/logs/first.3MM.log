@@ -1,0 +1,9 @@
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+host_gpu: _Z11mm3_kernel1iiiiiPfS_S_: first launch decided by the static rule (loop, 1024 blocks)
+host_gpu: _Z11mm3_kernel1iiiiiPfS_S_ on the card (resident): kernel 0.461 ms, total 2.298 ms (sim estimate 19.005 ms), 7.00 MiB pushed
+host_gpu: _Z11mm3_kernel2iiiiiPfS_S_: first launch decided by the static rule (loop, 1024 blocks)
+host_gpu: _Z11mm3_kernel2iiiiiPfS_S_ on the card (resident): kernel 0.408 ms, total 0.433 ms (sim estimate 19.005 ms), 0.00 MiB pushed
+host_gpu: _Z11mm3_kernel3iiiiiPfS_S_: first launch decided by the static rule (loop, 1024 blocks)
+host_gpu: _Z11mm3_kernel3iiiiiPfS_S_ on the card (resident): kernel 0.346 ms, total 0.364 ms (sim estimate 19.005 ms), 0.00 MiB pushed
+host_gpu: 3 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 7.0 MiB went to the card, 1.0 MiB came back

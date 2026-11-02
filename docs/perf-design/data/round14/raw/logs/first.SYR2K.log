@@ -1,0 +1,5 @@
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+host_gpu: _Z12syr2k_kerneliiffPfS_S_: first launch decided by the static rule (loop, 4096 blocks)
+host_gpu: _Z12syr2k_kerneliiffPfS_S_ on the card (resident): kernel 17.457 ms, total 21.441 ms (sim estimate 44.564 ms), 12.00 MiB pushed
+host_gpu: 1 launches ran on the card, 0 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 12.0 MiB went to the card, 4.0 MiB came back

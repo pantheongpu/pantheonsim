@@ -225,6 +225,13 @@ class MemoryManager {
   // case the caller makes them one at a time and meets any error where it
   // would have. One lookup serves the lot.
   bool load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const;
+  // load_batch for `count` lanes that all load the same address: one lookup and one load, the word in every out[i]. False (out may be written) for
+  // anything load_batch would decline (a fault armed, a host mapping, a misaligned or no-allocation address).
+  bool load_broadcast(uint64_t addr, size_t count, uint32_t size, uint64_t* out) const;
+  // store_batch for the accesses a0 + i * stride (i < count <= 32; a stride up to half a chunk, a0 and the stride multiples of `size`): where a chunk is real the
+  // lanes in it are plain stores after one lookup, where it is untouched or uniform each lane is store_batch's (a uniform chunk left
+  // alone by a store of its own byte, any other materialized, a failure to do so reported through `*failed_at` and thrown as there).
+  bool store_strided(uint64_t a0, int64_t stride, size_t count, uint32_t size, const uint64_t* vals, size_t* failed_at = nullptr);
   // A store that cannot get host memory for a chunk throws what store_scalar
   // would, with `*failed_at` the index of the access that did.
   bool store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,

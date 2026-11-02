@@ -1,0 +1,2 @@
+poly/GRAMSCHM          off    0.00 | wt    0.00 | base  277.60 (2046 launches ran on the card, 4098 in the simulator; 98208.0 MiB went to the card, 98176.0 MiB came back) same | ban  278.33 (2046 launches ran on the card, 4098 in the simulator; 98208.0 MiB went to the card, 98176.0 MiB came back) same traffic-bans=0
+FINISHED

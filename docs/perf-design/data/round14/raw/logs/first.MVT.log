@@ -1,0 +1,3 @@
+[vgpu] virtual GPU platform initialized: 1 x nvidia/a10g (NVIDIA A10G)
+host_gpu: 0 launches ran on the card, 2 in the simulator (0 kernels not in the exact set, 0 too small, 0 unsupported launch shapes, 0 failed on the card)
+host_gpu: 0.0 MiB went to the card, 0.0 MiB came back
