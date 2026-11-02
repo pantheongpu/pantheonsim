@@ -26,6 +26,8 @@ nvcc_bin="$(pick_nvcc_for_shim "$shim")"
 [[ -n "$nvcc_bin" ]] || { echo "SKIP: no nvcc matching this shim's toolkit"; exit 0; }
 cc_bin="$(command -v cc || command -v gcc)"
 [[ -n "$cc_bin" ]] || { echo "SKIP: no C compiler"; exit 0; }
+# The simulator loads the card driver with RTLD_DEEPBIND, which the sanitizer runtimes refuse to dlopen.
+[[ -z "$(shim_sanitizer "$shim")" ]] || { echo "SKIP: the sanitizer runtimes refuse a RTLD_DEEPBIND dlopen"; exit 0; }
 nvcc_host_compiler_fix
 work="$(mktemp -d "${TMPDIR:-/tmp}/vgpu-host-gpu-stub.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
