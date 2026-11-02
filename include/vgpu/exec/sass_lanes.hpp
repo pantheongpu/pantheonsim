@@ -150,6 +150,28 @@ inline void wake(W& w, Mask m) {
 }
 
 
+// `v` into the words of the lanes of `ex` (a row of 32), the others left alone: the whole warp is a broadcast and eight stores in place of a
+// lane search and a store a lane (S2R of a value the same for every lane: a block index, the block's size).
+inline void fill_lanes(uint32_t* d, Mask ex, uint32_t v) {
+  if (ex == kAll) {
+    for (unsigned l = 0; l < 32; ++l) d[l] = v;
+    return;
+  }
+  for (Mask m = ex; m; m &= m - 1) d[static_cast<unsigned>(std::countr_zero(m))] = v;
+}
+
+// The lane numbers into the words of the lanes of `ex` (S2R SR_LANEID): the whole warp is a constant row.
+inline void lane_ids(uint32_t* d, Mask ex) {
+  if (ex == kAll) {
+    for (unsigned l = 0; l < 32; ++l) d[l] = l;
+    return;
+  }
+  for (Mask m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(std::countr_zero(m));
+    d[l] = l;
+  }
+}
+
 // Whether all 32 words of a row are the same, and then that word.
 inline bool row_uniform(const uint32_t* r, uint32_t& v) {
 #if defined(__SSE2__)

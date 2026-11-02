@@ -103,6 +103,81 @@ VTEST(full_warp_addresses_are_the_lane_loops_and_find_a_lane_in_the_window) {
   VCHECK(inside > 5000 && outside > 10000 && edges > 1000);
 }
 
+VTEST(a_window_that_is_not_on_a_4_gib_boundary_takes_the_scalar_distance) {
+  // The vector pass compares high words and so needs a window on a multiple of 4 GiB; any other window is the scalar loop, whose answer is
+  // the smallest distance above the window (below 2^32 when a lane is in it).
+  std::mt19937_64 rng(23);
+  unsigned inside = 0, outside = 0;
+  for (int round = 0; round < 50000; ++round) {
+    const uint64_t window = (rng() % 8 + 1) * (uint64_t{1} << 32) + (rng() % 2 ? rng() % (uint64_t{1} << 32) : 0x1000);
+    uint32_t lo[32], hi[32];
+    const unsigned near_lane = rng() % 2 ? rng() % 32 : 32;   // half the warps have one lane within 2 GiB of the window's ends
+    for (unsigned l = 0; l < 32; ++l) {
+      uint64_t a = l != near_lane ? rng() : window + rng() % (uint64_t{1} << 33) - (uint64_t{1} << 31);
+      lo[l] = static_cast<uint32_t>(a);
+      hi[l] = static_cast<uint32_t>(a >> 32);
+    }
+    uint64_t got[32];
+    const uint64_t nearest = sm::full_warp_addresses(lo, hi, 0, window, got);
+    bool any_in = false;
+    for (unsigned l = 0; l < 32; ++l) {
+      VCHECK_EQ(got[l], lane_address(lo, hi, 0, l));
+      any_in |= got[l] - window < (uint64_t{1} << 32);
+    }
+    VCHECK_EQ(nearest < (uint64_t{1} << 32), any_in);
+    (any_in ? inside : outside) += 1;
+  }
+  VCHECK(inside > 5000 && outside > 5000);
+}
+
+VTEST(a_lane_in_the_window_is_found_in_every_position_and_by_its_high_word_alone) {
+  // One lane in the constant window, at each lane number, with the low word anything (the vector compare looks at the high word only), and
+  // every other lane a word away from it in the high half; and none.
+  constexpr uint64_t kWindow = 0x6ff9'0000'0000ull;
+  std::mt19937_64 rng(31);
+  for (unsigned at = 0; at < 32; ++at)
+    for (int round = 0; round < 200; ++round) {
+      uint32_t lo[32], hi[32];
+      for (unsigned l = 0; l < 32; ++l) {
+        lo[l] = static_cast<uint32_t>(rng());
+        hi[l] = static_cast<uint32_t>(kWindow >> 32) + 1 + static_cast<uint32_t>(rng() % 3);   // just above the window
+        if (rng() % 3 == 0) hi[l] = static_cast<uint32_t>(kWindow >> 32) - 1 - static_cast<uint32_t>(rng() % 3);   // or just below
+      }
+      uint64_t got[32];
+      VCHECK(sm::full_warp_addresses(lo, hi, 0, kWindow, got) >= (uint64_t{1} << 32));
+      hi[at] = static_cast<uint32_t>(kWindow >> 32);
+      VCHECK(sm::full_warp_addresses(lo, hi, 0, kWindow, got) < (uint64_t{1} << 32));
+      // the same lane found through the added offset's carry: the pair is just below the window and `add` lifts it in
+      for (unsigned l = 0; l < 32; ++l) lo[l] = 0;   // (no other lane carries into the window)
+      hi[at] = static_cast<uint32_t>(kWindow >> 32) - 1;
+      lo[at] = 0xfffffff0u;
+      VCHECK(sm::full_warp_addresses(lo, hi, 0x20, kWindow, got) < (uint64_t{1} << 32));
+      VCHECK(sm::full_warp_addresses(lo, hi, 0x10, kWindow, got) < (uint64_t{1} << 32));   // (to the window's first byte exactly)
+      VCHECK(sm::full_warp_addresses(lo, hi, 0xf, kWindow, got) >= (uint64_t{1} << 32));   // (one byte short)
+    }
+}
+
+VTEST(full_warp_store_values_are_the_lane_loop) {
+  std::mt19937_64 rng(41);
+  const unsigned sizes[] = {1, 2, 4, 8};
+  for (int round = 0; round < 20000; ++round) {
+    uint32_t rows[64];
+    for (uint32_t& w : rows) w = static_cast<uint32_t>(rng());
+    for (unsigned bytes : sizes) {
+      uint64_t got[32], want[32];
+      std::fill(got, got + 32, 0x5a5a5a5a5a5a5a5aull);
+      sm::full_warp_store_values(rows, bytes, got);
+      for (unsigned l = 0; l < 32; ++l) {
+        const uint32_t v0 = rows[l], v1 = bytes == 8 ? rows[32 + l] : 0u;
+        want[l] = bytes == 8 ? (static_cast<uint64_t>(v1) << 32 | v0) : bytes == 4 ? v0 : (v0 & ((1u << (8 * bytes)) - 1));
+        VCHECK_EQ(got[l], want[l]);
+      }
+    }
+  }
+  uint64_t z[32];
+  std::fill(z, z + 32, 7);
+  sm::full_warp_store_values(nullptr, 4, z);   // RZ stores zeros
+  for (unsigned l = 0; l < 32; ++l) VCHECK_EQ(z[l], 0u);
 // The AVX2 kernel behind the tier's full-warp global access (simd::warp_rows_kernel; null on a host or at a VGPU_SIMD level without AVX2, where the scalar
 // full_warp_addresses is all there is and the VGPU_SIMD=base twin of this test runs only the checks that do not need it): the addresses, the first
 // lane's, the stride of the first two, whether a lane is in the window and whether all lanes are on the stride, against the lane definitions, over the

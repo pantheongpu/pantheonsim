@@ -30,6 +30,9 @@ inline void cpu_relax() { std::this_thread::yield(); }
 
 using Clock = std::chrono::steady_clock;
 
+// What the bodies of the calls this thread made have run for since a LaunchWidth cleared it.
+thread_local uint64_t t_busy_ns = 0;
+
 // How long a parked worker, and a caller waiting for its workers, poll before
 // they sleep on a condition variable. A sleeping thread costs a futex wake and
 // a trip through the scheduler to start again -- tens of microseconds, more on
@@ -70,6 +73,7 @@ struct Worker {
   std::atomic<uint64_t> done{0};
   std::atomic<bool> quit{false};
   std::exception_ptr error;   // written by the worker before `done`, read by the caller after it
+  uint64_t busy_ns = 0;       // how long the last body ran; written before `done`, read after it
 
   // The sleeping sides. A flag is raised under the mutex before sleeping and
   // the waker takes and drops the mutex before notifying, so a wake cannot fall
@@ -143,12 +147,14 @@ void worker_main(Worker* w) {
       pthread_sigmask(SIG_SETMASK, &job->mask, nullptr);
       current = job->mask;
     }
+    const Clock::time_point began = Clock::now();
     try {
       job->fn(job->ctx, index);
     } catch (...) {
       w->error = std::current_exception();
     }
     finished = Clock::now();
+    w->busy_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - began).count());
     // The last thing done with the job; from here the caller may return.
     w->done.store(w->posted.load());
     if (w->caller_asleep.load()) {
@@ -271,12 +277,15 @@ void run_parallel_raw(unsigned n, void (*fn)(void*, unsigned), void* ctx) {
   // engines' bodies take their work from a shared counter, so the first of
   // them finishes the grid and the others find nothing left.
   std::exception_ptr first_error;
+  uint64_t busy = 0;
   for (unsigned i = started; i < n; ++i) {
+    const Clock::time_point began = Clock::now();
     try {
       fn(ctx, i);
     } catch (...) {
       if (!first_error) first_error = std::current_exception();
     }
+    busy += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count());
   }
   for (Worker* w : ws) {
     if (!w->has_work()) continue;
@@ -296,8 +305,11 @@ void run_parallel_raw(unsigned n, void (*fn)(void*, unsigned), void* ctx) {
     }
   }
   // Every body has returned; the workers are the pool's again.
-  for (Worker* w : ws)
+  for (Worker* w : ws) {
     if (w->error && !first_error) first_error = w->error;
+    busy += w->busy_ns;
+  }
+  t_busy_ns += busy;
   p.give_back(ws);
   if (first_error) std::rethrow_exception(first_error);
 }
@@ -318,6 +330,14 @@ uint64_t blend_unit_cost(uint64_t old_ns_per_unit, uint64_t units, unsigned thre
   if (threads <= 1 || old_ns_per_unit == 0) return sample;
   return (old_ns_per_unit + sample) / 2;
 }
+
+uint64_t unit_cost_from_busy(uint64_t units, uint64_t busy_ns) {
+  if (units == 0) return 0;
+  const uint64_t cost = busy_ns / units;
+  return cost ? cost : 1;
+}
+
+void note_busy_ns(uint64_t ns) { t_busy_ns += ns; }
 
 namespace {
 
@@ -360,6 +380,7 @@ LaunchWidth::LaunchWidth(const void* key, uint64_t units, unsigned& threads)
                              ? s.ns_per_unit.load(std::memory_order_relaxed) : 0;
   threads = cap_threads(threads, units, known, min_work_ns());
   used_ = threads;
+  t_busy_ns = 0;
   begin_ns_ = now_ns();
 }
 
@@ -368,7 +389,11 @@ LaunchWidth::~LaunchWidth() {
   CostSlot& s = cost_slot(key_);
   const uintptr_t k = reinterpret_cast<uintptr_t>(key_);
   const uint64_t old = s.key.load(std::memory_order_relaxed) == k ? s.ns_per_unit.load(std::memory_order_relaxed) : 0;
-  s.ns_per_unit.store(blend_unit_cost(old, units_, used_, now_ns() - begin_ns_), std::memory_order_relaxed);
+  const uint64_t busy = t_busy_ns;
+  t_busy_ns = 0;
+  s.ns_per_unit.store(used_ > 1 && busy > 0 ? unit_cost_from_busy(units_, busy)
+                                            : blend_unit_cost(old, units_, used_, now_ns() - begin_ns_),
+                      std::memory_order_relaxed);
   s.key.store(k, std::memory_order_relaxed);
 }
 

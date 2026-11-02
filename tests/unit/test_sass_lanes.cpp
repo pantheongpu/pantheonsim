@@ -226,4 +226,22 @@ VTEST(shuffle_shapes_move_the_words_the_per_lane_rule_moves) {
   VCHECK(moved > 1000);
 }
 
+VTEST(fill_lanes_and_lane_ids_write_the_lanes_of_the_mask_only) {
+  // S2R's one-value-to-the-warp fill and SR_LANEID: the lanes of the mask get the value (their own number), the rest of the row is untouched; a whole warp
+  // is a different (vector) path, so it is run on its own as well as among the random masks.
+  std::mt19937 rng(77);
+  for (int round = 0; round < 20000; ++round) {
+    const Mask ex = round % 5 == 0 ? sl::kAll : (round % 5 == 1 ? 0 : static_cast<Mask>(rng()));
+    const uint32_t v = static_cast<uint32_t>(rng());
+    uint32_t a[32], b[32], keep[32];
+    for (unsigned l = 0; l < 32; ++l) keep[l] = a[l] = b[l] = static_cast<uint32_t>(rng());
+    sl::fill_lanes(a, ex, v);
+    sl::lane_ids(b, ex);
+    for (unsigned l = 0; l < 32; ++l) {
+      VCHECK_EQ(a[l], ((ex >> l) & 1) ? v : keep[l]);
+      VCHECK_EQ(b[l], ((ex >> l) & 1) ? l : keep[l]);
+    }
+  }
+}
+
 VTEST_MAIN

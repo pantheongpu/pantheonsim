@@ -1,3 +1,4 @@
+asm(".pushsection .text,\"ax\",@progbits\n.p2align 12\n.skip 1536\n.popsection");
 // The AMD interpreter's pre-decoded tier (vgpu/amd_gcn_tier.hpp). gcn::finalize calls tier_classify when an
 // instruction is decoded; the interpreter's step() calls Inst::fast.run, if there is one, before it does anything else.
 //
