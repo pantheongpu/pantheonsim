@@ -6316,3 +6316,63 @@ bench.py canaries (13 workloads x SASS and PTX, 15 alternating runs, cpu 10, cou
 | rodinia hotspot | 0.941 | 0.959 | <0.001 |
 | rodinia gaussian | 0.880 | 0.898 | <0.001 |
 The gains add: the gather-bound rows keep part 1's gain (ATAX 0.797 alone), the short-kernel rows keep part 2's (gaussian 0.917 alone, hotspot 0.967 alone). Part 2 moves six bench.py canary rows more than 2% the wrong way (`wmma` PTX 0.978, `shared` PTX 0.975, `atomics` SASS 0.981, `atomics` PTX 0.975, `api` SASS 0.971, `api` PTX 0.973; 25 runs beside an A/A of 1.000-1.003) on workloads whose executed code it does not touch; read as code placement in the single LTO unit, not fixed (see the layout notes of rounds sp4 to sp10).
+
+## Round sp16: byte and short global accesses of the AMD engine, as runs (branch `sp16-amd`, base 705ed36f)
+
+Profiled first (server3, Zen 4, `perf record -e cycles:u`, one host thread, `bench_amd <workload> full` on the MI300X profile, base 705ed36f). Shares of the cycles, outside the
+pre-decoded tier's arithmetic kernels:
+
+| workload | top symbols (share of cycles) |
+| --- | --- |
+| `narrow` | `wave_scalars` 31.8, `tier_global` 16.5, `MemoryManager::load_batch_in` 7.8, `store_batch_in` 7.5, `batch_addresses_ok` 6.7 |
+| `atomics` | `wave_atomics` 30.4, `global_access` 12.9, `rmw_batch_fn` 12.1, `atomic_result` 8.2 |
+| `buf` | `buffer_words` 26.0, `batch_addresses_ok` 13.9, `load_batch_in` 13.2, `buffer_access` 10.1 |
+| `flat` | `global_access` 18.7, `memory_run` 16.3, `flat_access` 15.6 |
+| `mem` | `memory_run` 13.7, `h_l64_avx2` 13.2, `run_groups` 10.6, `wave_scalars` 8.9, `tier_global` 8.0 |
+| `lds`, `ldsx`, `wave` | `h_ds_avx2` 20 to 27, `run_groups` 17 to 25, `memory_run` 12 to 18 |
+| `divergent`, `smem` | `run_groups` 25 and 27, `h_mad_u64_avx2` 12 (divergent) |
+| `valu_*` | the host program's own check (`main`, libm) is 43 to 69%; the engine is 22 to 31% |
+
+`wave_scalars` is the path for a byte or a short a lane: the addresses of the active lanes are collected, `load_batch` / `store_batch` make the accesses together, and the values go back
+lane by lane. A word or more a lane with consecutive addresses already went to memory as one call (`memory_run`: `load_run` / `store_run`); a byte or a short never did, though a
+`char` or `half` array read a lane at a time (images, strings, quantized weights, fp16 loads) is exactly consecutive addresses.
+
+### What changed
+
+`Machine::narrow_run` (`amd/src/gcn_exec.cpp`, out of line as `memory_run` is): the lanes from the current one that are active and take addresses a byte (or a short) apart go to memory as one
+`load_run` / `store_run` with the element as the unit, and a load widens each element into its lane (zero- or sign-extended). It declines, having done nothing, where `memory_run` does (fewer than two
+lanes, a fault armed, a host mapping, a run not inside one allocation, a misaligned run), and the lanes then go to `wave_scalars` and one at a time as before. The interpreter's `global_access` calls it
+for the plain-register forms; the tier's byte and short accesses moved out of `tier_global` into `tier_narrow` (`amd/src/gcn_tier_machine.inc`), so the word loop of `tier_global` has only lost its sub-dword
+branches. The load memo's rule (a lane that reads the address the lane before it read takes that value) is kept: a run does not start on such a lane, and the last element of a run is the next lane's memo.
+Same bits: results, error text and counters do not change.
+
+### Results (server3, `perf stat` user cycles and instructions, cpu 3, 15 alternating runs, A = 705ed36f built from this tree before the change, B = branch; `VGPU_THREADS=1`, `full` size)
+
+| workload / target | instructions B/A | cycles B/A | p |
+| --- | ---: | ---: | ---: |
+| `narrow` MI300X | 0.498 | **0.505** | <0.001 |
+| `narrow` RX 6800 | 0.713 | **0.774** | <0.001 |
+| `mem`, `flat`, `buf`, `atomics`, `lds`, `ldsx`, `divergent`, `wave`, `valu_int`, `valu_f32`, `smem` (MI300X) | 0.998 to 1.001 | 0.970 to 1.012 | `atomics` 0.970 and `ldsx` 1.012 (p < 0.01), the rest p > 0.01 |
+| the same eleven on the RX 6800 | 1.000 to 1.007 | 0.934 to 1.031 | see below |
+
+Rows that run no narrow instruction and still moved on the RX 6800: `mem` 1.031 and `lds` 1.026 (equal instructions to within 0.5% and 0.7%), `flat` 0.957 and `atomics` 0.934. Four code
+placement results of the library in both directions, as the sp13 and sp14 rounds saw for other changes (the A/A of the same binary against itself reads 0.992 to 1.004 on the rows tried), so they are not a claim either way.
+`bench.py --ab`'s counters-identical check says `yes` on the 24 rows of the first A/B (`/tmp` run of 12 workloads, both targets).
+
+### Tests (CMake-wired)
+
+* `test_amd_gcn_narrowruns` (new; kernels `amd/tests/data/narrowruns.c`, built for gfx942, 1030, 1100, 1201 and 1250 and run on all five, and once more with `VGPU_AMD_TIER=0` for the interpreter's own path): ten copy
+  and widening-load kernels (byte and short, signed and not, 64-bit and 32-bit offsets) over 18 address patterns (consecutive, reversed, strided, repeated, overlapping stores, misaligned, over chunk and allocation edges, off the end,
+  wild, random) and 7 lane masks, 3 draws each; the run path on and off against twin memories: memory images, resident bytes, error text, wave / instruction / VMEM / flat counts. And a pair of directed cases: sixteen lanes
+  storing a byte to one address (the last lane stays), and a signed load of bytes with the top bit set. The five code objects are in `codeobject_digests.txt` (`test_amd_codeobject_same_bits`).
+* Mutations of `narrow_run` (rebuilt and run on server3; each fails the test): sign extension ignored (both targets, 0 of 2 pass); a short stored as one byte (1 of 2 pass); the run not stopping at an inactive lane
+  (fails on gfx1030, passes on gfx942: the wave32 masks catch it); the next lane's memo taking the first element (1 of 2).
+* Also run and passing: `test_amd_gcn_memruns`, `test_amd_gcn_memory_same_bits` (tier on and off), `test_amd_gcn_same_bits`, `test_amd_gcn_tier_same_bits`, `test_amd_gcn_narrow`, `test_amd_gcn_memory`,
+  `test_amd_codeobject_same_bits`.
+
+### Not done
+
+* `wave_atomics` + `rmw_batch_fn` + `atomic_result` are 51% of `atomics`: the per-lane callback does a switch on the operation each lane; a batch specialised by operation (add, min, max, and, or, xor) would drop it. Not tried.
+* `buffer_words` (26% of `buf`) reads each lane's offset and bounds through generic code; raw buffer accesses with a plain-register offset have no run path. Not tried.
+* `run_groups` (the wave stepping loop, 10 to 27% of the memory and control rows) is where the per-instruction overhead of the interpreter sits, as `step_warp` is for SASS; the sp14 round's work on the SASS run loop has no AMD twin yet.
+* ASan, UBSan and TSan were not run on this change; it touches no threaded or atomic code, and the buffers are fixed-size stack arrays of twice the wave size.

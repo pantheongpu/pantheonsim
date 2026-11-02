@@ -152,6 +152,11 @@ data/narrow.gfx1100.o	6d213698e7e419af
 data/narrow.gfx1201.o	f9dfe9c1a6b463a4
 data/narrow.gfx1250.o	de846afef11c5d57
 data/narrow.gfx942.o	d82124f45f001201
+data/narrowruns.gfx1030.o	c348ad083122e6de
+data/narrowruns.gfx1100.o	1f7612c8222254b4
+data/narrowruns.gfx1201.o	b0231dfabb5dca9a
+data/narrowruns.gfx1250.o	50bdcb77c78c4457
+data/narrowruns.gfx942.o	30e92a625c873f0f
 data/ops.gfx1030.o	7c1ad00c387b369
 data/ops.gfx1100.o	c1034e3117c9ab0f
 data/ops.gfx1201.o	74e0673bec99f588

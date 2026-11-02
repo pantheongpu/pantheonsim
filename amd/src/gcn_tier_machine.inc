@@ -4,6 +4,56 @@
 // (memory_run), the load memo and every memory call are the interpreter's own, in the same order, so a fault in lane 17 happens
 // after lane 16's store as before.
 //
+// The lanes of a byte or short global access (tier_global counted it): a run of consecutive addresses goes to memory as one call (narrow_run),
+// the lanes that make no run together (wave_scalars), and what neither takes one at a time, in lane order. Out of line, so the word accesses'
+// lane loop in tier_global stays as it was.
+[[gnu::noinline]] int tier_narrow(Wave& w, const Inst& in, bool is_store) {
+  const uint32_t bytes = in.fast.words;   // (1 or 2)
+  const bool sign = in.fast.sub != 0;
+  const uint64_t saddr_base = in.has_saddr ? scalar_field(w, in.saddr, true) : 0;
+  const uint64_t offset = static_cast<uint64_t>(static_cast<int64_t>(in.offset));
+  const uint32_t* const lo = w.vgpr[in.src[0].index].data();
+  const uint32_t* const hi = in.has_saddr ? nullptr : w.vgpr[in.src[0].index + 1].data();
+  uint32_t* const row = w.vgpr[is_store ? in.src[1].index : in.dst[0].index].data();
+  bool try_runs = d.peers.empty() && runs_on, try_batch = try_runs;
+  uint64_t memo_addr = 0, memo_value = 0;
+  bool memo = false;
+  for (uint32_t lane = 0; lane < kLanes; ++lane) {
+    if (!(w.exec >> lane & 1)) continue;
+    const uint64_t addr = (in.has_saddr ? saddr_base + lo[lane] : static_cast<uint64_t>(hi ? hi[lane] : 0) << 32 | lo[lane]) + offset;
+    if (try_runs) {
+      uint64_t raw = 0;
+      // (A load whose first address the lane before it just read takes the value that read had: not a run.)
+      const uint32_t made = !is_store && memo && memo_addr == addr
+                                ? 0
+                                : narrow_run(w, !is_store, lane, addr, bytes, sign, lo, hi, (in.has_saddr ? saddr_base : 0) + offset, row, &raw);
+      if (made) {
+        if (!is_store) memo_value = raw, memo_addr = addr + uint64_t{bytes} * (made - 1), memo = true;
+        lane += made - 1;
+        continue;
+      }
+      try_runs = false;
+    }
+    if (try_batch && (is_store || !memo)) {
+      try_batch = false;
+      uint64_t lane_addr[kLanes];
+      for (uint64_t m = w.exec >> lane << lane; m; m &= m - 1) {
+        const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
+        lane_addr[l] = (in.has_saddr ? saddr_base + lo[l] : static_cast<uint64_t>(hi[l]) << 32 | lo[l]) + offset;
+      }
+      const Narrow nr{bytes, sign};
+      if (wave_scalars(w, is_store, lane, lane_addr, is_store ? in.src[1] : in.dst[0], 1, &nr)) return 1;
+    }
+    if (is_store) {
+      store(addr, bytes, row[lane]);
+    } else {
+      if (!memo || memo_addr != addr) memo_value = load(addr, bytes), memo_addr = addr, memo = true;
+      row[lane] = widen(memo_value, Narrow{bytes, sign});
+    }
+  }
+  return 1;
+}
+
 // Everything step() counts for such an instruction is counted here, before the lanes run (an access that faults has been counted).
 int tier_global(Wave& w, Group& g, const Inst& in) {
   const bool is_store = in.fast.mach == 2 || in.fast.mach == 5;
@@ -24,20 +74,20 @@ int tier_global(Wave& w, Group& g, const Inst& in) {
   if (is_store) ++n.flat_write, ++n.vmem_wr;
   else ++n.flat_read, ++n.vmem_rd, issued_load(w);
   if (!w.exec) return 1;
+  if (sub_dword) return tier_narrow(w, in, is_store);
   const uint32_t words = in.fast.words;
-  const uint32_t access_bytes = sub_dword ? words : 4 * words;
+  const uint32_t access_bytes = 4 * words;
   const uint64_t saddr_base = in.has_saddr ? scalar_field(w, in.saddr, true) : 0;
   const uint64_t offset = static_cast<uint64_t>(static_cast<int64_t>(in.offset));
   const uint32_t* const lo = w.vgpr[in.src[0].index].data();
   const uint32_t* const hi = in.has_saddr ? lo : w.vgpr[in.src[0].index + 1].data();
-  bool try_runs = !sub_dword && (words == 1 || words == 2 || words == 4) && d.peers.empty() && runs_on;
-  // Lanes whose addresses make no run go to memory together (wave_scalars), once: a byte, a short, a word or a pair a lane.
-  bool try_batch = (sub_dword || words <= 2) && d.peers.empty() && runs_on;
+  bool try_runs = (words == 1 || words == 2 || words == 4) && d.peers.empty() && runs_on;
+  // Lanes whose addresses make no run go to memory together (wave_scalars), once: a word or a pair a lane.
+  bool try_batch = words <= 2 && d.peers.empty() && runs_on;
   uint64_t memo_addr = 0;
   bool memo = false;
   uint32_t memo_words[kMaxWords];
   uint32_t buf[4];
-  uint64_t memo_value = 0;
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
     if (!(w.exec >> lane & 1)) continue;
     const uint64_t addr = (in.has_saddr ? saddr_base + lo[lane] : static_cast<uint64_t>(hi[lane]) << 32 | lo[lane]) + offset;
@@ -57,18 +107,9 @@ int tier_global(Wave& w, Group& g, const Inst& in) {
         const uint32_t l = static_cast<uint32_t>(__builtin_ctzll(m));
         lane_addr[l] = (in.has_saddr ? saddr_base + lo[l] : static_cast<uint64_t>(hi[l]) << 32 | lo[l]) + offset;
       }
-      const Narrow nr{words, in.fast.sub != 0};
-      if (wave_scalars(w, is_store, lane, lane_addr, is_store ? in.src[1] : in.dst[0], sub_dword ? 1 : words, sub_dword ? &nr : nullptr))
-        return 1;
+      if (wave_scalars(w, is_store, lane, lane_addr, is_store ? in.src[1] : in.dst[0], words, nullptr)) return 1;
     }
-    if (sub_dword) {
-      if (is_store) {
-        store(addr, words, w.vgpr[in.src[1].index][lane]);
-      } else {
-        if (!memo || memo_addr != addr) memo_value = load(addr, words), memo_addr = addr, memo = true;
-        w.vgpr[in.dst[0].index][lane] = widen(memo_value, Narrow{words, in.fast.sub != 0});
-      }
-    } else if (is_store) {
+    if (is_store) {
       for (uint32_t k = 0; k < words; ++k) buf[k] = w.vgpr[in.src[1].index + k][lane];
       store_words(addr, words, buf);
     } else {

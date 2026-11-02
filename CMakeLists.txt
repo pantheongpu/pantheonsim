@@ -1768,6 +1768,17 @@ foreach(_t gfx1100 gfx1201 gfx1030 gfx1250)
   set_tests_properties(test_amd_gcn_memruns_${_t} PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=${_t}")
 endforeach()
 
+# A byte or a short a lane over consecutive addresses as one call to the memory manager, against lane by lane (narrowruns.c).
+vgpu_unit_test(test_amd_gcn_narrowruns amd/tests/unit/test_gcn_narrowruns.cpp)
+target_compile_definitions(test_amd_gcn_narrowruns PRIVATE VGPU_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+foreach(_t gfx1100 gfx1201 gfx1030 gfx1250)
+  add_test(NAME test_amd_gcn_narrowruns_${_t} COMMAND test_amd_gcn_narrowruns)
+  set_tests_properties(test_amd_gcn_narrowruns_${_t} PROPERTIES ENVIRONMENT "VGPU_TEST_TARGET=${_t}")
+endforeach()
+# (The interpreter's own path, with the pre-decoded tier off.)
+add_test(NAME test_amd_gcn_narrowruns_notier COMMAND test_amd_gcn_narrowruns)
+set_tests_properties(test_amd_gcn_narrowruns_notier PROPERTIES ENVIRONMENT "VGPU_AMD_TIER=0")
+
 # A dispatch spread over host threads (amd/src/gcn_pool.hpp): the pool's tasks once each and all at once, forks, the caller's
 # floating-point environment; memory and counts the same on any thread count, over many dispatches and from several callers,
 # and a failing dispatch.
