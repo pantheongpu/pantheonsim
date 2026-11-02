@@ -1,3 +1,5 @@
+// (Mode 3, below, is LDG and STG on the same address rows: the tier's h_global, whose full-warp path reads a warp's address rows once for the
+// addresses, a lane in the constant window, a run of consecutive elements and a stride, and counts a stride's sectors from its ends.)
 // LD and ST with generic 64-bit addresses (the tier's h_generic): a warp whose lanes all name the shared window moves like LDS/STS and is counted as a
 // shared access of the offsets; a warp with no lane in any window is plain global memory (LDG/STG's batches); a warp with lanes in both is exec_mem's,
 // which moves each lane by its window and counts the whole warp by the LAST lane's. Bytes, registers, the shared array, the global buffer and every
@@ -103,10 +105,20 @@ Insn st_e(unsigned size, unsigned a, unsigned data, uint32_t off, unsigned guard
   return make(hi, 0x0985ull | uint64_t{guard} << 12 | uint64_t{a} << 24 | uint64_t{data} << 32 | uint64_t{off & 0xffffff} << 40);
 }
 
+// LDG and STG: the same operands as LD and ST (opcodes 0x981 and 0x986 with the guard in bits 12..15, as the sm_86 corpus has them).
+Insn ldg_e(unsigned size, unsigned d, unsigned a, uint32_t off, unsigned guard) {
+  const uint64_t hi = (0x000ea8000c1e1900ull & ~(uint64_t{7} << 9)) | uint64_t{size} << 9;
+  return make(hi, 0x0981ull | uint64_t{guard} << 12 | uint64_t{d} << 16 | uint64_t{a} << 24 | uint64_t{4} << 32 | uint64_t{off & 0xffffff} << 40);
+}
+Insn stg_e(unsigned size, unsigned a, unsigned data, uint32_t off, unsigned guard) {
+  const uint64_t hi = (0x0001e2000c101904ull & ~(uint64_t{7} << 9)) | uint64_t{size} << 9;
+  return make(hi, 0x0986ull | uint64_t{guard} << 12 | uint64_t{a} << 24 | uint64_t{data} << 32 | uint64_t{off & 0xffffff} << 40);
+}
+
 constexpr uint32_t kK[4] = {0x9e3779b1u, 0x85ebca6bu, 0xc2b2ae35u, 0x27d4eb2fu}, kC = 0x01234567u;
 
 // Registers: R1 tid, R3 tid * 4, R4:R5 the address, R6:R7 the buffer, R8:R9 the output, R10 a word read back, R11 a constant, R12..R15 the data.
-// mode 0: every lane's address is in the shared window (tid * D), 1: global (base + tid * S), 2: shared for tid < 16 and global for the rest.
+// mode 0: every lane's address is in the shared window (tid * D), 1: global (base + tid * S), 2: shared for tid < 16 and global for the rest, 3: as 1 with LDG and STG.
 std::vector<Insn> kernel(unsigned mode, uint32_t S, uint32_t D, unsigned st_size, unsigned ld_size, uint32_t soff, uint32_t loff, unsigned st_guard, unsigned ld_guard) {
   std::vector<Insn> code;
   code.push_back(s2r(1, 0x21));
@@ -116,15 +128,15 @@ std::vector<Insn> kernel(unsigned mode, uint32_t S, uint32_t D, unsigned st_size
   code.push_back(movi(11, kC));
   for (unsigned i = 0; i < 4; ++i) code.push_back(imadi(12 + i, 1, kK[i], 11));
   code.push_back(imadi(3, 1, 4, kRZ));
-  if (mode == 1) {
+  if (mode == 1 || mode == 3) {
     code.push_back(imad_wide_i(4, 1, S, 6));
   } else {
     code.push_back(imadi(4, 1, D, kRZ));
     code.push_back(movi(5, 0x6ffe));
     if (mode == 2) code.push_back(imad_wide_g(4, 1, S, 6, 0));
   }
-  code.push_back(st_e(st_size, 4, 12, soff, st_guard));
-  code.push_back(ld_e(ld_size, 12, 4, loff, ld_guard));
+  code.push_back((mode == 3 ? stg_e : st_e)(st_size, 4, 12, soff, st_guard));
+  code.push_back((mode == 3 ? ldg_e : ld_e)(ld_size, 12, 4, loff, ld_guard));
   code.push_back(imad_wide_i(8, 1, 32, 6));
   for (unsigned i = 0; i < 4; ++i) code.push_back(stg(8, 12 + i, kIn + 4 * i));
   for (unsigned j = 0; j < 4; ++j) {
@@ -174,9 +186,9 @@ Result run(Env& e, const Case& k, const std::vector<uint8_t>& input, bool interp
   unsigned lds = 0, sts = 0;
   for (size_t i = 0; i < code.size(); ++i) {
     const sass::Instr ins = sass::decode(code[i].w, 16 * i, 86);
-    lds += ins.op == sass::Op::LD, sts += ins.op == sass::Op::ST;
+    lds += ins.op == (k.mode == 3 ? sass::Op::LDG : sass::Op::LD), sts += ins.op == (k.mode == 3 ? sass::Op::STG : sass::Op::ST);
   }
-  if (lds != 1 || sts != 1) throw vtest::Failure("the kernel does not hold one LD and one ST");
+  if (lds != 1 || sts != (k.mode == 3 ? 9u : 1u)) throw vtest::Failure("the kernel does not hold the one load and the one store under test");
   const std::string c = make_cubin(code);
   const auto m = sass::load(reinterpret_cast<const uint8_t*>(c.data()), c.size(), e.mem, e.prof);
   if (interp) ::setenv("VGPU_FASTPATH", "0", 1);
@@ -307,5 +319,12 @@ VTEST(generic_accesses_all_in_the_shared_window) { sweep({0}, {{16, 16}, {4, 4},
 VTEST(generic_accesses_all_in_global_memory) { sweep({1}, {{16, 16}, {4, 4}, {0, 16}, {32, 24}}, {32, 20}); }
 
 VTEST(generic_accesses_in_both_windows_are_the_interpreters) { sweep({2}, {{16, 16}, {4, 4}, {32, 24}}, {32, 20}); }
+
+// LDG and STG over the shapes of a warp's addresses: every lane the same (0), consecutive elements (the access size, 1 to 16 bytes), a stride a sector
+// or more wide (32, 128, 200), strides between (12, 36, misaligned ones among them) -- for a full warp, for 20 lanes, and for the lanes a guard
+// leaves (the low half, the high half); bytes, registers and every counter against the rule and against the interpreter.
+VTEST(global_accesses_on_a_stride_or_not) {
+  sweep({3}, {{0, 0}, {1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {12, 0}, {32, 0}, {36, 0}, {128, 0}, {200, 0}}, {32, 20});
+}
 
 VTEST_MAIN

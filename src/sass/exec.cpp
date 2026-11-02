@@ -1945,6 +1945,9 @@ const tier::Program* Code::tier_program() const {
         ++prog->native;
         prog->max_reg = std::max(prog->max_reg, op.maxreg);
       }
+      op.cont = op.fn && !op.straight &&
+                (op.form == tier::Form::S2r || op.form == tier::Form::Uldc || op.form == tier::Form::Umov || op.form == tier::Form::Usel ||
+                 op.form == tier::Form::Plop3 || op.form == tier::Form::Sel);
     }
     prog->const_index.clear();
     for (size_t i = count; i-- > 0;) {   // (the last instruction never starts a run: the loop does not take it as a straight one)

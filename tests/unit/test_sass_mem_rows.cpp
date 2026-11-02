@@ -7,10 +7,13 @@
 #include <cstdint>
 #include <random>
 
+#include "vgpu/exec/mem_counters.hpp"
 #include "vgpu/exec/sass_mem_rows.hpp"
+#include "vgpu/simd/simd.hpp"
 #include "vtest.hpp"
 
 namespace sm = vgpu::exec::sassmem;
+namespace simd = vgpu::simd;
 
 namespace {
 
@@ -175,6 +178,70 @@ VTEST(full_warp_store_values_are_the_lane_loop) {
   std::fill(z, z + 32, 7);
   sm::full_warp_store_values(nullptr, 4, z);   // RZ stores zeros
   for (unsigned l = 0; l < 32; ++l) VCHECK_EQ(z[l], 0u);
+// The AVX2 kernel behind the tier's full-warp global access (simd::warp_rows_kernel; null on a host or at a VGPU_SIMD level without AVX2, where the scalar
+// full_warp_addresses is all there is and the VGPU_SIMD=base twin of this test runs only the checks that do not need it): the addresses, the first
+// lane's, the stride of the first two, whether a lane is in the window and whether all lanes are on the stride, against the lane definitions, over the
+// shapes a warp's addresses come in -- every lane the same, a stride, a carry out of the low half, a wrap of the 64-bit sum -- and a lane moved off the
+// stride by one bit or into the window alone. And the sectors of such a warp from (a0, stride) against the lane-walking count of its addresses.
+VTEST(warp_rows_kernel_shapes) {
+  constexpr uint64_t kWindow = 0x6ff9'0000'0000ull, kSpan = uint64_t{1} << 32;
+  const uint64_t adds[] = {0, 1, 0xffff'ffffull, 0x1'0000'0000ull, ~uint64_t{0}, ~uint64_t{0} - 7, 0x8000'0000'0000'0000ull, kWindow};
+  const uint64_t bases[] = {0, 0xffff'ffe0ull, 0xffff'ffffull, 0x7f00'0000'0000ull, kWindow - 4, kWindow - 1, kWindow, kWindow + kSpan - 1,
+                            kWindow + kSpan, ~uint64_t{0} - 100, 0xffff'ffff'ffff'ff00ull, 0x7fff'ffff'fff0ull};
+  const int64_t strides[] = {0, 1, 4, 8, 16, 32, 33, 128, 1000, 0x1000'0000, -4, -32, -1000, int64_t{1} << 32, -(int64_t{1} << 32), (int64_t{1} << 32) + 32};
+  const simd::WarpRowsFn kernel = simd::warp_rows_kernel();
+  unsigned prog = 0, off = 0, inw = 0, counted = 0, declined = 0;
+  for (uint64_t add : adds)
+    for (uint64_t base : bases)
+      for (int64_t stride : strides)
+        for (unsigned kind = 0; kind < 3; ++kind)
+          for (unsigned lone = 0; lone < 34; ++lone) {   // lone: 32 none, 33 a bit flipped in a lane, else a lane moved into the window alone
+            uint32_t lo[32], hi[32];
+            for (unsigned l = 0; l < 32; ++l) {
+              uint64_t a = base + uint64_t{l} * static_cast<uint64_t>(stride) - add;
+              if (lone < 32 && l == lone) a = kWindow + 5 - add;
+              if (lone == 33 && l == 19) a ^= uint64_t{1} << (l % 40);
+              if (kind == 1) a = static_cast<uint32_t>(a);
+              lo[l] = static_cast<uint32_t>(a);
+              hi[l] = static_cast<uint32_t>(a >> 32);
+            }
+            const uint32_t* plo = kind == 2 ? nullptr : lo;
+            const uint32_t* phi = kind == 0 ? hi : nullptr;
+            uint64_t ref[32];
+            bool want_in = false, want_prog = true;
+            for (unsigned l = 0; l < 32; ++l) {
+              ref[l] = lane_address(plo, phi, add, l);
+              want_in |= ref[l] - kWindow < kSpan;
+            }
+            const uint64_t want_stride = ref[1] - ref[0];
+            for (unsigned l = 0; l < 32; ++l) want_prog &= ref[l] == ref[0] + uint64_t{l} * want_stride;
+            if (kernel) {
+              uint64_t got[32];
+              simd::WarpRowsInfo ri{};
+              kernel(plo, phi, add, kWindow, got, ri);
+              for (unsigned l = 0; l < 32; ++l) VCHECK_EQ(got[l], ref[l]);
+              VCHECK_EQ(ri.a0, ref[0]);
+              VCHECK_EQ(ri.stride, want_stride);
+              VCHECK_EQ(ri.in_window, want_in);
+              VCHECK_EQ(ri.progression, want_prog);
+              (want_prog ? prog : off) += 1;
+              inw += want_in;
+            }
+            if (want_prog) {   // the closed form of the progression against the count of its addresses, whenever it answers
+              for (unsigned bytes : {1u, 2u, 4u, 8u}) {
+                uint64_t d;
+                if (vgpu::exec::memcount::detail::full_warp_progression_sectors(ref[0], want_stride, bytes, d)) {
+                  VCHECK_EQ(d, vgpu::exec::memcount::distinct_sectors_uncapped(ref, 0xffffffffu, 32, bytes));
+                  ++counted;
+                } else {
+                  ++declined;
+                }
+              }
+            }
+          }
+  if (simd::level() == simd::Level::Avx2) VCHECK(kernel != nullptr);   // (the kernel is there wherever the host and VGPU_SIMD have AVX2)
+  if (kernel) VCHECK(prog > 1000 && off > 1000 && inw > 500);
+  VCHECK(counted > 1000 && declined > 100);
 }
 
 VTEST_MAIN

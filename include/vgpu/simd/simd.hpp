@@ -269,6 +269,19 @@ extern SectorWindowFn g_sector_window __attribute__((visibility("hidden")));
 }
 inline SectorWindowFn sector_window_kernel() { return detail::g_sector_window; }
 
+// The addresses of a full warp's global access (sassmem::full_warp_rows): addrs[l] = (lo[l] | hi[l] << 32) + add for the 32 lanes (`hi` null: lo[l] + add;
+// `lo` null: add), and in `info` the first lane's address, the stride of the first two lanes, whether some lane's address is in [window, window + 2^32),
+// and whether all the lanes are on that stride (addrs[l] == a0 + l * stride, modulo 2^64). Null below AVX2 (the scalar loop is then the caller's).
+struct WarpRowsInfo {
+  uint64_t a0, stride;
+  bool in_window, progression;
+};
+using WarpRowsFn = void (*)(const uint32_t* lo, const uint32_t* hi, uint64_t add, uint64_t window, uint64_t* addrs, WarpRowsInfo& info);
+namespace detail {
+extern WarpRowsFn g_warp_rows __attribute__((visibility("hidden")));
+}
+inline WarpRowsFn warp_rows_kernel() { return detail::g_warp_rows; }
+
 // The AVX2 forms of the PTX engine's f64 lane loops (32 lanes; `m` the active ones; null/absent below AVX2, see
 // avx2_f64_available): fma d = a * b + c with the contracted-subtract negations in `sub` (bit 0 the product, bit 1 the
 // addend), and add (op 0), sub (1), mul (2) or div (3) into a row of 32 results, returning whether any is a NaN.
@@ -278,7 +291,7 @@ bool f64_bin_lanes_avx2(unsigned op, uint64_t* r, const uint64_t* a, const uint6
 
 namespace testing {
 // Switches the kernel above between the level's own (true) and none (false), for the tests that compare the two.
-void use_sector_window_kernel(bool on);
+void use_sector_window_kernel(bool on);   // (and the warp-addresses kernel with it)
 }
 
 }  // namespace vgpu::simd
