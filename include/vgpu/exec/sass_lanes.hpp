@@ -93,6 +93,27 @@ inline void wait(W& w, Mask ex, K kind, unsigned arg) {
     w.waiting |= ex;
     return;
   }
+  // Some of the lanes: the arrays blended in place, a vector at a time, with the bytes and words of `ex` replaced. A store a lane is a
+  // loop whose length no predictor learns in a diverged warp, and the vector loads that read the arrays back (waiting_on) overlap them.
+  {
+    const __m128i bit8 = _mm_set1_epi64x(static_cast<long long>(0x8040201008040201ull));
+    const __m128i k = _mm_set1_epi8(static_cast<char>(kind));
+    for (unsigned h = 0; h < 2; ++h) {
+      const uint64_t lo = (ex >> (16 * h)) & 0xffu, hi = (ex >> (16 * h + 8)) & 0xffu;
+      const __m128i v = _mm_set_epi64x(static_cast<long long>(hi * 0x0101010101010101ull), static_cast<long long>(lo * 0x0101010101010101ull));
+      const __m128i sel = _mm_cmpeq_epi8(_mm_and_si128(v, bit8), bit8);
+      __m128i* p = reinterpret_cast<__m128i*>(&w.wait_kind[16 * h]);
+      _mm_storeu_si128(p, _mm_or_si128(_mm_and_si128(sel, k), _mm_andnot_si128(sel, _mm_loadu_si128(p))));
+    }
+    const __m128i bit4 = _mm_set_epi32(8, 4, 2, 1), a = _mm_set1_epi32(static_cast<int>(arg));
+    for (unsigned i = 0; i < 8; ++i) {
+      const __m128i sel = _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(static_cast<int>(ex >> (4 * i))), bit4), bit4);
+      __m128i* p = reinterpret_cast<__m128i*>(&w.wait_arg[4 * i]);
+      _mm_storeu_si128(p, _mm_or_si128(_mm_and_si128(sel, a), _mm_andnot_si128(sel, _mm_loadu_si128(p))));
+    }
+    w.waiting |= ex;
+    return;
+  }
 #endif
   for (Mask m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(std::countr_zero(m));
@@ -125,6 +146,25 @@ inline Mask waiting_on(const W& w, K kind, unsigned arg) {
   }
   return match;
 #endif
+}
+
+// A BSYNC on barrier `arg` for the lanes of `ex` (kind `kind`): they start to wait, and the lanes to release are returned: all the lanes
+// that wait at it (limited to `members`, the barrier's lanes still alive, when there are any) when every one of `members` has arrived,
+// else none. It is `wait` followed by `waiting_on` and the completeness test, without reading back the arrays `wait` has just written
+// (a load that spans stores still in the buffer waits for them to retire; before `wait` blended the arrays this was a byte and a word store
+// a lane and 12 to 15 % of the cycles of a divergent kernel sat on the loads that followed). When some member is neither waiting nor in
+// `ex` the barrier cannot be complete and nothing is read; otherwise the lanes that already waited are read before the new ones are entered
+// and `ex` is added (it was running, so not waiting).
+template <class W, class K>
+inline Mask bsync_arrive(W& w, Mask ex, K kind, unsigned arg, Mask members) {
+  if (members & ~(ex | w.waiting)) {
+    wait(w, ex, kind, arg);
+    return 0;
+  }
+  Mask arrived = waiting_on(w, kind, arg) | ex;
+  wait(w, ex, kind, arg);
+  if (members) arrived &= members;
+  return ((members & ~arrived) == 0) ? arrived : 0;
 }
 
 // The lanes of `m` (waiting) stop waiting and go on past the instruction they wait at.
