@@ -1466,6 +1466,20 @@ class Parser {
       fail_unsupported(ins.line, reconstruct_from(start_tok), fn.name, hint);
     };
 
+    // ldu{.vec}.type d, [a] (PTX ISA, ".global" only): a load from an address the
+    // program promises is the same for every thread of the warp. The promise lets
+    // hardware use a uniform datapath; the value read is the one ld.global reads,
+    // so it is parsed, counted and executed as that load.
+    if (parts[0] == "ldu") {
+      for (size_t i = 1; i < parts.size(); ++i)
+        if (parts[i] == "shared" || parts[i] == "local" || parts[i] == "param" || parts[i] == "const" ||
+            parts[i] == "shared::cluster")
+          return unsupported("ldu is a .global load (ldu." + parts[i] + ")");
+      if (std::find(parts.begin() + 1, parts.end(), "global") == parts.end())
+        return unsupported("ldu needs the .global state space");
+      parts[0] = "ld";
+    }
+
     // Interned here rather than at each instruction's own construction site:
     // there are dozens of those and the first attempt reached two of them, so
     // the histogram counted almost nothing. This is the one point every

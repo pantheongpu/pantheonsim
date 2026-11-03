@@ -1924,6 +1924,7 @@ table says. `pantheonworkloads #10` lives in another repository and was not chec
 | pantheonsim #310 | Driver stream-ordered memory pools (`cuMemPool*`, `cuMemAllocAsync` through the current pool) |
 | pantheonsim #311 | Driver `cuPointerGetAttributes`, `cuPointerSetAttribute` and the missing `cuPointerGetAttribute` answers |
 | pantheonsim #290 | The memory-pattern e2e test and the `cuda_memtest` and `gpu-burn` external suites |
+| pantheonsim #472 | PTX `ldu.global` (uniform load), read as the `ld.global` it is; other spaces are refused by name |
 | pantheonworkloads #10 | `arch-*` and `lib-*` workload runs on `sim:nvidia`, and `unsupported_ok` for ops real GPUs lack |
 
 ## Profile inventory (rev 6)
@@ -2288,7 +2289,7 @@ with what `nvidia/src` defines):
   and vGPU management, GPM and units are absent, and `nvidia-smi` has no `-pm`, `-pl` or `-c`. Deliberately
   not done: an in-process-only setter would make `nvidia-smi -pm 1` look successful while the next process
   shows no change, so persistence across processes needs a design decision first.
-- **PTX**: `multimem` (needs the multicast fabric, which the driver refuses), `sured`, `ldu`, and the `txq` queries other than width, height and depth (a kernel using one for a texture object does not launch on an RTX 3060).
+- **PTX**: `multimem` (needs the multicast fabric, which the driver refuses), `sured`, and the `txq` queries other than width, height and depth (a kernel using one for a texture object does not launch on an RTX 3060).
 
 AMD:
 
