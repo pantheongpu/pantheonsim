@@ -563,16 +563,24 @@ VTEST(warps_that_differ_in_the_mask_alone_do_not_all_share_one_slot) {
 }
 
 VTEST(every_nibble_of_a_partial_mask_selects_its_own_lanes_in_the_key) {
-  // Lanes on words of bank 0, a lane or two to a word: the passes are the distinct words of the lanes that run, so a key that took a lane of a group of four for another (the
-  // rows that select a nibble's lanes) answers one mask with the passes of its neighbour.
+  // Two masks that differ in one group of four lanes only, over lanes on a few words of bank 0 (chosen at random, six assignments for each
+  // pair): the passes are the distinct words of the lanes that run, so a key that took a lane of a group for another (the rows that select a
+  // nibble's lanes) gives one mask the table entry of its neighbour, and the neighbour's passes. Random masks never differ in one group
+  // only, which is why every pair is made.
+  Rng r(31337);
   mc::BankMemo memo;
   uint32_t o[32];
-  for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 128 * ((l * l * 5 + l / 3) % 11);   // (some lanes on one word, so a mask's passes are its distinct ones)
-  Rng r(31337);
-  for (int i = 0; i < 6000; ++i) {
-    uint32_t mask = static_cast<uint32_t>(r.next()) | 1u;
-    if (i % 3 == 0) mask &= static_cast<uint32_t>(r.next());   // (sparser ones: a group of four with one lane set)
-    mask |= 1u;
-    VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, mask, 4), offsets_def(o, mask, 4));
-  }
+  for (unsigned nib = 0; nib < 8; ++nib)
+    for (uint32_t p = 0; p < 16; ++p)
+      for (uint32_t q = 0; q < 16; ++q) {
+        if (p == q) continue;
+        for (int trial = 0; trial < 6; ++trial) {
+          for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 128 * static_cast<uint32_t>(r.below(6));
+          const uint32_t rest = 0x00010001u;   // (lane 0 runs, so the key is made from its word; lane 16 too)
+          const uint32_t m1 = (rest & ~(15u << (4 * nib))) | (p << (4 * nib)), m2 = (rest & ~(15u << (4 * nib))) | (q << (4 * nib));
+          VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, m1, 4), offsets_def(o, m1, 4));
+          VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, m2, 4), offsets_def(o, m2, 4));
+          VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, m1, 4), offsets_def(o, m1, 4));
+        }
+      }
 }
