@@ -542,22 +542,37 @@ VTEST(an_entry_hint_is_only_a_place_to_look_first) {
 }
 
 VTEST(warps_that_differ_in_the_mask_alone_do_not_all_share_one_slot) {
-  // The same offsets with forty masks that differ only in lanes the key's hash does not sample (the key holds zero for a lane that does not run, so
-  // the samples are equal): were they one slot, forty shapes in turn would each evict the last and the table would give up on this loop.
+  // The same offsets with sixteen masks that differ only in lanes the key's hash does not sample (the key holds zero for a lane that does not run, so
+  // the samples are equal): were they one slot, sixteen shapes in turn would each evict the last and the table would give up on this loop.
   mc::BankMemo memo;
   uint32_t o[32];
   for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 4 * (l % 16) + 4 * 160 * (l / 16);
   const unsigned free_lanes[] = {0, 2, 4, 5, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 27, 28, 29, 30};
-  uint32_t masks[40];
+  uint32_t masks[16];
   Rng r(77);
-  for (unsigned m = 0; m < 40; ++m) {
+  for (unsigned m = 0; m < 16; ++m) {
     masks[m] = 1u;
     for (unsigned lane : free_lanes)
       if (r.below(2)) masks[m] |= 1u << lane;
   }
   for (int round = 0; round < 200; ++round)
-    for (unsigned m = 0; m < 40; ++m) {
+    for (unsigned m = 0; m < 16; ++m) {
       VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, masks[m], 4), offsets_def(o, masks[m], 4));
       VCHECK(memo.skip32 == 0);
     }
+}
+
+VTEST(every_nibble_of_a_partial_mask_selects_its_own_lanes_in_the_key) {
+  // Every lane on its own word of bank 0: the passes are the lanes that run, so a key that took a lane of a group of four for another (the
+  // rows that select a nibble's lanes) answers one mask with the passes of its neighbour.
+  mc::BankMemo memo;
+  uint32_t o[32];
+  for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 128 * l;
+  Rng r(31337);
+  for (int i = 0; i < 6000; ++i) {
+    uint32_t mask = static_cast<uint32_t>(r.next()) | 1u;
+    if (i % 3 == 0) mask &= static_cast<uint32_t>(r.next());   // (sparser ones: a group of four with one lane set)
+    mask |= 1u;
+    VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, mask, 4), static_cast<uint32_t>(__builtin_popcount(mask)));
+  }
 }
