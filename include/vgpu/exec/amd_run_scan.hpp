@@ -58,4 +58,54 @@ inline uint32_t run_scan(const uint32_t* lo, const uint32_t* hi, uint32_t reach,
   return run_scan_reference(lo, hi, reach, first, stride);
 }
 
+// Whether two neighbouring entries of a list of 64-bit addresses are equal (a load's lane that follows a lane with the same address takes
+// that lane's value, Machine::wave_scalars: the usual wave has no such pair, and the pass that copies the values then need not run).
+// `any_adjacent_equal_reference` is the definition; the vector form compares two entries to their predecessors at a time (SSE2).
+inline bool any_adjacent_equal_reference(const uint64_t* a, uint32_t n) {
+  for (uint32_t i = 1; i < n; ++i)
+    if (a[i] == a[i - 1]) return true;
+  return false;
+}
+
+inline bool any_adjacent_equal(const uint64_t* a, uint32_t n) {
+#if defined(__SSE2__) && defined(__x86_64__)
+  __m128i acc = _mm_setzero_si128();
+  uint32_t i = 1;
+  for (; i + 2 <= n; i += 2) {
+    const __m128i eq = _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)),
+                                       _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i - 1)));
+    acc = _mm_or_si128(acc, _mm_and_si128(eq, _mm_shuffle_epi32(eq, _MM_SHUFFLE(2, 3, 0, 1))));  // (both halves of a 64-bit entry equal)
+  }
+  bool any = _mm_movemask_epi8(acc) != 0;
+  for (; i < n; ++i) any |= a[i] == a[i - 1];
+  return any;
+#else
+  return any_adjacent_equal_reference(a, n);
+#endif
+}
+
+// Whether every entry equals the first (a wave's lanes all loading one address: a uniform value read through vector registers). The
+// definition is `all_equal_reference`; the vector form compares two entries to the first at a time (SSE2).
+inline bool all_equal_reference(const uint64_t* a, uint32_t n) {
+  for (uint32_t i = 1; i < n; ++i)
+    if (a[i] != a[0]) return false;
+  return true;
+}
+
+inline bool all_equal(const uint64_t* a, uint32_t n) {
+#if defined(__SSE2__) && defined(__x86_64__)
+  if (n < 2) return true;
+  const __m128i first = _mm_set1_epi64x(static_cast<long long>(a[0]));
+  __m128i acc = _mm_set1_epi32(-1);
+  uint32_t i = 0;
+  for (; i + 2 <= n; i += 2)
+    acc = _mm_and_si128(acc, _mm_cmpeq_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)), first));
+  bool same = _mm_movemask_epi8(acc) == 0xFFFF;
+  for (; i < n; ++i) same &= a[i] == a[0];
+  return same;
+#else
+  return all_equal_reference(a, n);
+#endif
+}
+
 }  // namespace vgpu::exec::amdrun

@@ -10291,9 +10291,17 @@ struct Machine {
         }
         return mem.store_batch(addrs, count, bytes, vals);
       }
-      if (!load_wave(addrs, count, bytes, vals)) return false;
-      for (uint32_t i = 1; i < count; ++i)
-        if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
+      if (count > 1 && exec::amdrun::all_equal(addrs, count)) {
+        // One address in every lane: every lane takes the value the first got (the rule below), so it is read once.
+        if (!load_wave(addrs, 1, bytes, vals)) return false;
+        for (uint32_t i = 1; i < count; ++i) vals[i] = vals[0];
+      } else {
+        if (!load_wave(addrs, count, bytes, vals)) return false;
+        // (On one host thread nothing writes between two lanes' reads of an address, so they already agree: the copy is for threads.)
+        if (conc() && exec::amdrun::any_adjacent_equal(addrs, count))
+          for (uint32_t i = 1; i < count; ++i)
+            if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
+      }
       if (narrow_by) {
         const Narrow nb = *narrow_by;
         for (uint32_t i = 0; i < count; ++i) row0[i] = widen(vals[i], nb);
@@ -10320,8 +10328,9 @@ struct Machine {
       return mem.store_batch(addrs, n, bytes, vals);
     }
     if (!load_wave(addrs, n, bytes, vals)) return false;
-    for (uint32_t i = 1; i < n; ++i)
-      if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
+    if (conc() && exec::amdrun::any_adjacent_equal(addrs, n))
+      for (uint32_t i = 1; i < n; ++i)
+        if (addrs[i] == addrs[i - 1]) vals[i] = vals[i - 1];
     if (narrow_by) {
       const Narrow nb = *narrow_by;
       for (uint32_t i = 0; i < n; ++i) row0[lanes[i]] = widen(vals[i], nb);
@@ -13885,6 +13894,19 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
       }
     }
     if (flavour == 24) w.exec &= ~(uint64_t{1} << (r.next() % w.lanes));
+  }
+  if (flavour == 25 && in.enc == gcn::Enc::Flat && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+    // Flavour 25: a global access whose every lane is at one address (a uniform value read through vector registers), on any word.
+    if (in.has_saddr && in.saddr + 1 < kSgprs) w.sgpr[in.saddr] = static_cast<uint32_t>(region), w.sgpr[in.saddr + 1] = static_cast<uint32_t>(region >> 32);
+    const uint64_t off = 4 * (r.next() % 256);
+    for (uint32_t lane = 0; lane < kLanes; ++lane) {
+      if (in.has_saddr) {
+        w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(off);
+      } else {
+        w.vgpr[in.src[0].index][lane] = static_cast<uint32_t>(region + off);
+        w.vgpr[in.src[0].index + 1][lane] = static_cast<uint32_t>((region + off) >> 32);
+      }
+    }
   }
   if ((flavour == 18 || flavour == 19) && in.enc == gcn::Enc::Ds && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
     // Flavours 18 and 19: an LDS access whose lanes' addresses are consecutive words (or, for the wide forms, consecutive groups of words)

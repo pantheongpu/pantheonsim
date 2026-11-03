@@ -69,4 +69,65 @@ VTEST(the_vector_run_length_is_the_loops_for_every_kind_of_row) {
   VCHECK(pair_form > 100000 && base_form > 40000);
 }
 
+// Whether any two neighbouring addresses of a list are equal (Machine::wave_scalars decides from it whether the pass that copies a repeated
+// address's value runs) against the definition: lists of every length, with one pair equal at every position (the two halves of an
+// address separately equal too: a pair that differs in the low or the high word only is not equal), and with none.
+VTEST(a_pair_of_equal_neighbours_is_found_wherever_it_is) {
+  using namespace vgpu::exec::amdrun;
+  Rng rng{0xfeedbeef1234ULL};
+  unsigned found = 0, none = 0;
+  for (int it = 0; it < 200000; ++it) {
+    const uint32_t n = static_cast<uint32_t>(rng.below(66));
+    std::vector<uint64_t> a(n + 4);
+    for (auto& v : a) v = rng.next();
+    // Neighbours that agree in one word but not the other, and a few repeats.
+    for (uint32_t k = 1; k < n; ++k) {
+      const unsigned how = static_cast<unsigned>(rng.below(24));
+      if (how == 0) a[k] = a[k - 1];
+      else if (how == 1) a[k] = (a[k - 1] & 0xFFFFFFFFull) | (a[k] & ~0xFFFFFFFFull);
+      else if (how == 2) a[k] = (a[k - 1] & ~0xFFFFFFFFull) | (a[k] & 0xFFFFFFFFull);
+    }
+    // (Entries past n are never looked at: make them equal to the last one.)
+    for (uint32_t k = n; k < n + 4; ++k) a[k] = n ? a[n - 1] : 0;
+    const bool want = any_adjacent_equal_reference(a.data(), n), got = any_adjacent_equal(a.data(), n);
+    if (got != want)
+      throw vtest::Failure(std::string("any_adjacent_equal says ") + (got ? "yes" : "no") + ", the loop says " + (want ? "yes" : "no") + " (n " +
+                           std::to_string(n) + ")");
+    found += want, none += !want;
+  }
+  VCHECK(found > 20000 && none > 5000);
+  // Exactly one equal pair, at every position and every length.
+  for (uint32_t n = 0; n <= 65; ++n)
+    for (uint32_t at = 1; at < n; ++at) {
+      std::vector<uint64_t> a(n);
+      for (uint32_t k = 0; k < n; ++k) a[k] = 0x1000000001ull * (k + 1);
+      VCHECK(!any_adjacent_equal(a.data(), n));
+      a[at] = a[at - 1];
+      VCHECK(any_adjacent_equal(a.data(), n));
+    }
+}
+
+// Whether every address equals the first (Machine::wave_scalars reads such a load once) against the definition: every length, a list that
+// differs from the first at one position only (in the low word, in the high word), and lists that are all one value.
+VTEST(a_list_of_one_address_is_told_from_one_that_differs_anywhere) {
+  using namespace vgpu::exec::amdrun;
+  Rng rng{0x1234abcd5678ULL};
+  for (uint32_t n = 0; n <= 66; ++n) {
+    for (uint32_t at = 0; at <= n; ++at) {
+      for (unsigned how = 0; how < 3; ++how) {
+        std::vector<uint64_t> a(n, 0x00007F1200345670ull);
+        if (at < n) a[at] ^= how == 0 ? 4 : how == 1 ? (uint64_t{1} << 40) : (uint64_t{1} << 63);
+        VCHECK(all_equal(a.data(), n) == all_equal_reference(a.data(), n));
+        VCHECK(all_equal(a.data(), n) == (at >= n || n == 1));   // (the list is one value, or one entry was changed: that is a difference unless it is the only one)
+      }
+    }
+  }
+  for (int it = 0; it < 100000; ++it) {
+    const uint32_t n = static_cast<uint32_t>(rng.below(66));
+    std::vector<uint64_t> a(n, rng.next());
+    if (rng.below(2) && n) a[rng.below(n)] = rng.next();
+    VCHECK(all_equal(a.data(), n) == all_equal_reference(a.data(), n));
+  }
+}
+
 VTEST_MAIN
