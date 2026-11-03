@@ -1249,6 +1249,20 @@ TIER_DUAL(h_carry)
   const uint32_t* a = load32(o.src[0], R, t0, n);
   const uint32_t* b = load32(o.src[1], R, t1, n);
   const MaskTable& tab = mask_table();
+  uint32_t* d = R.vgpr[o.dst.index];
+  if (full(ex, n)) {
+    // Every lane: the select goes straight into the destination row, eight lanes at a time (each chunk is read before it is written, so a
+    // source that is the destination register is fine).
+    for (unsigned i = 0; i < n; i += 8) {
+      V8u m, x, y;
+      std::memcpy(&m, tab.m[(cond >> i) & 0xFF], 32);
+      std::memcpy(&x, a + i, 32);
+      std::memcpy(&y, b + i, 32);
+      x = (y & m) | (x & ~m);
+      std::memcpy(d + i, &x, 32);
+    }
+    return true;
+  }
   for (unsigned i = 0; i < n; i += 8) {
     V8u m, x, y;
     std::memcpy(&m, tab.m[(cond >> i) & 0xFF], 32);
@@ -1259,9 +1273,7 @@ TIER_DUAL(h_carry)
     // __memcpy_chk even at 32 bytes; this was 7% of the flat workload)
     __builtin_memcpy(r + i, &x, 32);
   }
-  uint32_t* d = R.vgpr[o.dst.index];
-  if (full(ex, n)) copy_row(d, r, n);
-  else merge(d, r, ex, n);
+  merge(d, r, ex, n);
   return true;
 }
 TIER_DUAL(h_cndmask)
