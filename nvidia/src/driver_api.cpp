@@ -2455,6 +2455,55 @@ const vgpu::exec::devrt::Services& driver_devrt_services() {
   return services;
 }
 
+// The `extra` form of a launch: a list of key/value pairs ending in CU_LAUNCH_PARAM_END that names one buffer
+// holding every kernel parameter laid out as the kernel's parameter block is (each at the next offset its
+// alignment allows, as cuFuncGetParamInfo reports) and that buffer's size. The parameters are copied out of the
+// buffer, one vector each, as the kernelParams form copies them. A malformed list is CUDA_ERROR_INVALID_VALUE:
+// an unknown key, a key given twice, no END, no buffer or size, or a size short of the parameters' end.
+// NVIDIA's values (cuda.h: CU_LAUNCH_PARAM_END 0x00, _BUFFER_POINTER 0x01, _BUFFER_SIZE 0x02); not in the clean-room header.
+void* const CU_LAUNCH_PARAM_END = reinterpret_cast<void*>(0x00);
+void* const CU_LAUNCH_PARAM_BUFFER_POINTER = reinterpret_cast<void*>(0x01);
+void* const CU_LAUNCH_PARAM_BUFFER_SIZE = reinterpret_cast<void*>(0x02);
+CUresult unpack_extra(const std::vector<vgpu::ptx::ParamDecl>& params, void** extra,
+                      std::vector<std::vector<uint8_t>>* out) {
+  const void* buffer = nullptr;
+  size_t buffer_size = 0;
+  bool have_buffer = false, have_size = false, ended = false;
+  // Three keys at most (pointer, size, END): a list that goes on longer than the keys can account for has no END.
+  for (int i = 0; i < 6; i += 2) {
+    void* key = extra[i];
+    if (key == CU_LAUNCH_PARAM_END) {
+      ended = true;
+      break;
+    }
+    if (key == CU_LAUNCH_PARAM_BUFFER_POINTER) {
+      if (have_buffer) return CUDA_ERROR_INVALID_VALUE;
+      buffer = extra[i + 1];
+      have_buffer = true;
+    } else if (key == CU_LAUNCH_PARAM_BUFFER_SIZE) {
+      if (have_size || !extra[i + 1]) return CUDA_ERROR_INVALID_VALUE;
+      buffer_size = *static_cast<const size_t*>(extra[i + 1]);
+      have_size = true;
+    } else {
+      return CUDA_ERROR_INVALID_VALUE;
+    }
+  }
+  // A kernel with no parameters needs neither the buffer nor its size.
+  if (!ended || (!params.empty() && (!have_buffer || !have_size))) return CUDA_ERROR_INVALID_VALUE;
+  out->assign(params.size(), {});
+  uint64_t end = 0;
+  for (size_t i = 0; i < params.size(); ++i) {
+    const uint64_t size = params[i].size;
+    const uint64_t align = params[i].align ? params[i].align : (size < 8 ? size : 8);
+    const uint64_t offset = align ? (end + align - 1) / align * align : end;
+    end = offset + size;
+    if (end > buffer_size || (!buffer && size)) return CUDA_ERROR_INVALID_VALUE;
+    (*out)[i].resize(size);
+    if (size) std::memcpy((*out)[i].data(), static_cast<const uint8_t*>(buffer) + offset, size);
+  }
+  return CUDA_SUCCESS;
+}
+
 CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int gridDimX,
                               unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX,
                               unsigned int blockDimY, unsigned int blockDimZ,
@@ -2483,22 +2532,24 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
     // Every stream is the synchronous default stream in this engine: legacy
     // (0/1), per-thread (2), and created stream handles all execute in order.
     (void)hStream;
-    if (extra != nullptr)
-      throw vgpu::Error::make(vgpu::Err::Unsupported,
-                              "the `extra` parameter-packing path of cuLaunchKernel is not "
-                              "implemented; use kernelParams");
     const auto& params = rec.fn->params;
-    if (!kernelParams && !params.empty()) return CUDA_ERROR_INVALID_VALUE;
     std::vector<std::vector<uint8_t>> args(params.size());
-    for (size_t i = 0; i < params.size(); ++i) {
-      if (!kernelParams[i])
-        throw vgpu::Error::make(vgpu::Err::InvalidValue, "kernelParams[", i, "] is NULL (kernel '",
-                                rec.fn->name, "' takes ", params.size(), " parameters)");
-      // The whole parameter: a struct passed by value is a .b8 array in PTX,
-      // whose element is one byte and whose size is the struct's.
-      uint32_t size = params[i].size;
-      args[i].resize(size);
-      std::memcpy(args[i].data(), kernelParams[i], size);
+    if (extra != nullptr) {
+      // kernelParams and extra are alternatives: giving both is an error, not a choice of one.
+      if (kernelParams != nullptr) return CUDA_ERROR_INVALID_VALUE;
+      if (const CUresult e = unpack_extra(params, extra, &args); e != CUDA_SUCCESS) return e;
+    } else {
+      if (!kernelParams && !params.empty()) return CUDA_ERROR_INVALID_VALUE;
+      for (size_t i = 0; i < params.size(); ++i) {
+        if (!kernelParams[i])
+          throw vgpu::Error::make(vgpu::Err::InvalidValue, "kernelParams[", i, "] is NULL (kernel '",
+                                  rec.fn->name, "' takes ", params.size(), " parameters)");
+        // The whole parameter: a struct passed by value is a .b8 array in PTX,
+        // whose element is one byte and whose size is the struct's.
+        uint32_t size = params[i].size;
+        args[i].resize(size);
+        std::memcpy(args[i].data(), kernelParams[i], size);
+      }
     }
     vgpu::exec::LaunchConfig cfg;
     cfg.grid = {gridDimX, gridDimY, gridDimZ};
@@ -2599,7 +2650,6 @@ CUresult launch_kernel_common(const char* api_name, CUfunction f, unsigned int g
 
 // For the driver's graphs (driver_graph.hpp): a kernel node keeps a copy of its parameters.
 int vgpu_driver::copy_kernel_args(void* func, void** kernel_params, void** extra, std::vector<std::vector<uint8_t>>* out) {
-  if (extra) return CUDA_ERROR_NOT_SUPPORTED;   // as cuLaunchKernel: only kernelParams are packed here
   return api("cuGraphAddKernelNode", true, false, [&](ShimState& s) {
     uintptr_t fh = reinterpret_cast<uintptr_t>(func);
     if ((fh & 7) == kTagKernel) fh = kernel_to_function(s, fh);
@@ -2607,6 +2657,7 @@ int vgpu_driver::copy_kernel_args(void* func, void** kernel_params, void** extra
     auto it = s.functions.find(fh);
     if (it == s.functions.end()) return CUDA_ERROR_NOT_FOUND;
     const auto& params = it->second.fn->params;
+    if (extra) return kernel_params ? CUDA_ERROR_INVALID_VALUE : unpack_extra(params, extra, out);
     if (!kernel_params && !params.empty()) return CUDA_ERROR_INVALID_VALUE;
     out->assign(params.size(), {});
     for (size_t i = 0; i < params.size(); ++i) {
@@ -6940,7 +6991,7 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuSurfRefSetArray), VGPU_PROC(cuSurfRefGetArray),
     VGPU_PROC(cuProfilerStart), VGPU_PROC(cuProfilerStop),
     VGPU_PROC(cuGraphicsUnregisterResource), VGPU_PROC(cuGraphicsMapResources),
-    VGPU_PROC(cuGraphicsUnmapResources), VGPU_PROC(cuGraphicsResourceSetMapFlags_v2),
+VGPU_PROC(cuGraphicsUnmapResources), VGPU_PROC(cuGraphicsResourceSetMapFlags_v2),
     VGPU_PROC(cuGraphicsResourceGetMappedPointer_v2), VGPU_PROC(cuGraphicsSubResourceGetMappedArray),
     VGPU_PROC(cuTexObjectCreate), VGPU_PROC(cuTexObjectDestroy), VGPU_PROC(cuSurfObjectCreate),
     VGPU_PROC(cuSurfObjectDestroy),
