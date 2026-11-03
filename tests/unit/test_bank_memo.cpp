@@ -502,3 +502,62 @@ VTEST(offsets_across_bit_31_are_not_taken_for_the_same_shape_in_low_memory) {
   VCHECK_EQ(offsets_def(o, 0x81u, 4), 2u);
   VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, 0x81u, 4), 2u);
 }
+
+// ---- the entry an instruction looks in first, and the mask in the hash (Round sp21)
+
+VTEST(an_entry_hint_is_only_a_place_to_look_first) {
+  // Eight "instructions", each with its own hint byte, run in turn over a few shapes with different answers; a hint is also given any byte
+  // at all (past the table's 128 entries too), another instruction's, and none. The passes are the definition's every time, and the
+  // table does not go into its back-off (a loop that alternates shapes is the use the hint is for).
+  Rng r(20261103);
+  mc::BankMemo memo;
+  uint8_t hints[8] = {};
+  uint32_t shapes[4][32];
+  for (unsigned s = 0; s < 4; ++s)   // 1 pass, 2 passes (two rows), 32 passes (one bank), and a pair of words every four
+    for (unsigned l = 0; l < 32; ++l)
+      shapes[s][l] = s == 0 ? 4096 + 4 * l : s == 1 ? 4096 + 4 * (l % 16) + 4 * 160 * (l / 16) : s == 2 ? 4096 + 128 * l : 4096 + 8 * (l % 8) + 512 * (l / 8);
+  uint64_t calls = 0;
+  for (int i = 0; i < 40000; ++i) {
+    const unsigned op = static_cast<unsigned>(r.below(8)), sh = (op + static_cast<unsigned>(i / 8)) % 4;
+    uint32_t o[32];
+    const uint32_t shift = 4 * static_cast<uint32_t>(r.below(1 << 10));
+    for (unsigned l = 0; l < 32; ++l) o[l] = shapes[sh][l] + shift;
+    static const uint32_t kMasks[4] = {0xFFFFFFFFu, 0x0000FFFFu, 0xA5A5A5A5u, 0x80000001u};
+    const uint32_t mask = kMasks[(op / 2) % 4];
+    uint8_t* hint = nullptr;
+    uint8_t wild = static_cast<uint8_t>(r.next());
+    switch (r.below(4)) {
+      case 0: hint = &hints[op]; break;
+      case 1: hint = &hints[r.below(8)]; break;
+      case 2: hint = &wild; break;
+      default: break;
+    }
+    VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, mask, 4, hint), offsets_def(o, mask, 4));
+    VCHECK(memo.skip32 == 0);
+    ++calls;
+  }
+  VCHECK(calls == 40000);
+  // The hint of an instruction that has run is an entry of the table.
+  for (uint8_t h : hints) VCHECK(h < mc::BankMemo::kEntries32);
+}
+
+VTEST(warps_that_differ_in_the_mask_alone_do_not_all_share_one_slot) {
+  // The same offsets with forty masks that differ only in lanes the key's hash does not sample (the key holds zero for a lane that does not run, so
+  // the samples are equal): were they one slot, forty shapes in turn would each evict the last and the table would give up on this loop.
+  mc::BankMemo memo;
+  uint32_t o[32];
+  for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 4 * (l % 16) + 4 * 160 * (l / 16);
+  const unsigned free_lanes[] = {0, 2, 4, 5, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 20, 22, 23, 24, 25, 27, 28, 29, 30};
+  uint32_t masks[40];
+  Rng r(77);
+  for (unsigned m = 0; m < 40; ++m) {
+    masks[m] = 1u;
+    for (unsigned lane : free_lanes)
+      if (r.below(2)) masks[m] |= 1u << lane;
+  }
+  for (int round = 0; round < 200; ++round)
+    for (unsigned m = 0; m < 40; ++m) {
+      VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, masks[m], 4), offsets_def(o, masks[m], 4));
+      VCHECK(memo.skip32 == 0);
+    }
+}
