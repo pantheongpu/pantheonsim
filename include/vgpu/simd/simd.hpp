@@ -210,6 +210,13 @@ struct Kernels {
   void (*f2f_widen)(const uint32_t* a, unsigned mods, uint32_t* lo, uint32_t* hi);
   void (*f2f_narrow)(const uint32_t* alo, const uint32_t* ahi, unsigned mods, uint32_t* r);
   void (*i2d)(bool sgn, const uint32_t* a, uint32_t* lo, uint32_t* hi);
+
+  // The SASS tier's operands that are worked out when the instruction runs (tier_dyn in src/sass/tier_ops.inc), 32 lanes each.
+  //  row_mod: r[l] = ((a[l] & and_m) ^ xor_m) + add, wrapping (|x| and -x on float bits is and_m = 0x7fffffff and xor_m = 0x80000000; an integer's
+  //    -x is xor_m = ~0 and add = 1, its ~x xor_m = ~0, both -x then ~x is add = ~0). r may be a.
+  //  row_splat: r[l] = v.
+  void (*row_mod)(uint32_t* r, const uint32_t* a, uint32_t and_m, uint32_t xor_m, uint32_t add);
+  void (*row_splat)(uint32_t* r, uint32_t v);
 };
 
 // The kernels at the level in use, and at a given one (for tests; a level the

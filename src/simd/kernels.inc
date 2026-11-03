@@ -1635,5 +1635,30 @@ void i2d_k(bool sgn, const uint32_t* a, uint32_t* lo, uint32_t* hi) {
 #endif
 }
 
+// ---- the SASS tier's operands that are worked out when the instruction runs (tier_dyn, src/sass/tier_ops.inc) --------------------------------
+// row_mod: r[l] = ((a[l] & and_m) ^ xor_m) + add for the 32 lanes, wrapping: pure bit and wrapping-add operations, so the result is the same at every
+// level. r and a may be one row. row_splat: r[l] = v.
+void row_mod_k(uint32_t* r, const uint32_t* a, uint32_t and_m, uint32_t xor_m, uint32_t add) {
+#if VGPU_SIMD_AVX2
+  const __m256i va = _mm256_set1_epi32(static_cast<int>(and_m)), vx = _mm256_set1_epi32(static_cast<int>(xor_m)),
+                vd = _mm256_set1_epi32(static_cast<int>(add));
+  __m256i v[4];
+  for (unsigned i = 0; i < 4; ++i) v[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a) + i);
+  for (unsigned i = 0; i < 4; ++i)
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(r) + i, _mm256_add_epi32(_mm256_xor_si256(_mm256_and_si256(v[i], va), vx), vd));
+#else
+  for (unsigned l = 0; l < 32; ++l) r[l] = ((a[l] & and_m) ^ xor_m) + add;
+#endif
+}
+
+void row_splat_k(uint32_t* r, uint32_t v) {
+#if VGPU_SIMD_AVX2
+  const __m256i x = _mm256_set1_epi32(static_cast<int>(v));
+  for (unsigned i = 0; i < 4; ++i) _mm256_storeu_si256(reinterpret_cast<__m256i*>(r) + i, x);
+#else
+  for (unsigned l = 0; l < 32; ++l) r[l] = v;
+#endif
+}
+
 #endif  // !VGPU_LANES_ONLY
 }  // namespace VGPU_SIMD_NS

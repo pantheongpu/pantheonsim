@@ -1420,6 +1420,72 @@ VTEST(prmt0_at_every_level) {
   }
 }
 
+// row_mod and row_splat (the SASS tier's operands worked out at run time): against the scalar modifier rule the tier used before, |x| then -x on float
+// bits and -x (0 - x) then ~x on integers, for every modifier combination, written out here with the (and, xor, add) the tier passes; and against the
+// bare formula for random parameters. Special words in every lane position, the destination also one of the sources, neighbours of the row untouched.
+VTEST(row_mod_and_row_splat_at_every_level) {
+  std::mt19937 rng(8213);
+  const auto old_mod = [](bool flt, unsigned mod, uint32_t v) {   // the rule of tier_mod before the kernels (kNeg = 1, kNot = 2, kAbs = 4)
+    if (flt) {
+      if (mod & 4) v &= 0x7fffffffu;
+      if (mod & 1) v ^= 0x80000000u;
+    } else {
+      if (mod & 1) v = 0u - v;
+      if (mod & 2) v = ~v;
+    }
+    return v;
+  };
+  for (simd::Level l : levels()) {
+    const auto& k = simd::kernels_for(l);
+    const std::string lv = simd::level_name(l);
+    for (int round = 0; round < 20000; ++round) {
+      uint32_t a[32];
+      for (int i = 0; i < 32; ++i) a[i] = round % 3 == 0 ? static_cast<uint32_t>(rng()) : kWords[rng() % kNW];
+      // 1. The tier's parameters for each domain and modifier against the old scalar rule.
+      for (int flt = 0; flt < 2; ++flt)
+        for (unsigned mod = 0; mod < 8; ++mod) {
+          uint32_t am, xm, ad;
+          if (flt) am = (mod & 4) ? 0x7fffffffu : ~0u, xm = (mod & 1) ? 0x80000000u : 0u, ad = 0u;
+          else {
+            const bool neg = mod & 1, not_ = mod & 2;
+            am = ~0u, xm = (neg != not_) ? ~0u : 0u, ad = neg ? (not_ ? ~0u : 1u) : 0u;
+          }
+          uint32_t guard[34], *r = guard + 1;
+          guard[0] = guard[33] = 0xa5a5a5a5u;
+          k.row_mod(r, a, am, xm, ad);
+          for (int i = 0; i < 32; ++i)
+            if (r[i] != old_mod(flt, mod, a[i]))
+              throw vtest::Failure(lv + " row_mod flt=" + std::to_string(flt) + " mod=" + std::to_string(mod) + " lane " + std::to_string(i) + ": a=0x" +
+                                   hex(a[i]) + " got 0x" + hex(r[i]) + " want 0x" + hex(old_mod(flt, mod, a[i])));
+          VCHECK_EQ(guard[0], 0xa5a5a5a5u);
+          VCHECK_EQ(guard[33], 0xa5a5a5a5u);
+        }
+      // 2. Random parameters, the destination the source itself.
+      const uint32_t am = static_cast<uint32_t>(rng()), xm = static_cast<uint32_t>(rng()), ad = round % 4 == 0 ? 0u : static_cast<uint32_t>(rng());
+      uint32_t b[32], c[32];
+      std::memcpy(b, a, sizeof a);
+      k.row_mod(c, a, am, xm, ad);
+      k.row_mod(b, b, am, xm, ad);
+      for (int i = 0; i < 32; ++i) {
+        const uint32_t want = ((a[i] & am) ^ xm) + ad;
+        if (c[i] != want || b[i] != want)
+          throw vtest::Failure(lv + " row_mod lane " + std::to_string(i) + ": a=0x" + hex(a[i]) + " got 0x" + hex(c[i]) + " in place 0x" + hex(b[i]) +
+                               " want 0x" + hex(want));
+      }
+      // 3. The splat.
+      uint32_t guard[34], *r = guard + 1;
+      const uint32_t v = round % 2 ? static_cast<uint32_t>(rng()) : kWords[rng() % kNW];
+      guard[0] = guard[33] = 0x5a5a5a5au;
+      for (int i = 0; i < 32; ++i) r[i] = static_cast<uint32_t>(rng());
+      k.row_splat(r, v);
+      for (int i = 0; i < 32; ++i)
+        if (r[i] != v) throw vtest::Failure(lv + " row_splat lane " + std::to_string(i) + ": v=0x" + hex(v) + " got 0x" + hex(r[i]));
+      VCHECK_EQ(guard[0], 0x5a5a5a5au);
+      VCHECK_EQ(guard[33], 0x5a5a5a5au);
+    }
+  }
+}
+
 // dcmp: DSETP's compares and its MIN/MAX against the executor's rule on doubles, over special values and random bit patterns,
 // with |x| and -x on either source.
 VTEST(dcmp_at_every_level) {

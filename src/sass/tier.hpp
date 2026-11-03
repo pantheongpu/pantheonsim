@@ -54,6 +54,18 @@ enum class Dyn : uint8_t {
 // The modifiers a Dyn source carries, applied to its value as the form's domain says (apply()).
 enum Mod : uint8_t { kNeg = 1, kNot = 2, kAbs = 4 };
 
+// A modifier as the lane kernel simd::Kernels::row_mod takes it, r = ((a & and_m) ^ xor_m) + add: the float |x| and -x are a mask and a sign flip; the
+// integer -x is ~x + 1, ~x is the flip alone, and -x then ~x is x - 1 (a flip of the flip, and the add of all ones). The rule it stands for is
+// tier_mod's (tier_ops.inc); test_sass_lanes checks every modifier value of both domains against it.
+struct ModParams {
+  uint32_t and_m, xor_m, add;
+};
+inline ModParams mod_params(bool flt, uint8_t mod) {
+  if (flt) return {(mod & kAbs) ? 0x7fffffffu : ~0u, (mod & kNeg) ? 0x80000000u : 0u, 0u};
+  const bool neg = (mod & kNeg) != 0, flip = neg != ((mod & kNot) != 0);
+  return {~0u, flip ? ~0u : 0u, neg ? ((mod & kNot) ? ~0u : 1u) : 0u};
+}
+
 struct Src {
   SrcKind kind = SrcKind::Pool;
   Dyn dyn = Dyn::Reg;

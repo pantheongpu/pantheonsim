@@ -8,6 +8,8 @@
 // instructions the run loop takes at a time -- of integer, float and conversion instructions on registers that are also their own sources,
 // with a guarded one now and then (a stretch ends at it) and a compare that sets the predicate it uses; every thread stores its registers.
 // Block sizes of whole warps, of a warp and one lane, and of less than a warp make the full-warp and the partial-warp paths both run.
+// The operands the tier works out when an instruction runs (tier_dyn, tier_dyn64: a register with |x|, -x or ~x, a word of constant bank 0 or of another
+// bank, a uniform register, each possibly negated or absolute, as 32-bit and as 64-bit operands) are in the last test, in float, integer and double forms.
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -279,7 +281,35 @@ void compare(const std::vector<Insn>& code, std::initializer_list<uint32_t> size
     ::setenv("VGPU_FASTPATH", "0", 1);
     const Result ref = e.run(*m, 3, threads);
     ::unsetenv("VGPU_FASTPATH");
-    expect_same(tier, ref, name + ", " + std::to_string(threads) + " threads");
+    try {
+      expect_same(tier, ref, name + ", " + std::to_string(threads) + " threads");
+    } catch (const vtest::Failure& f) {
+      // The first instruction after which the two differ: the kernel cut short there, then the stores of its registers.
+      const size_t tail = kRegs - 1 + 2;   // the stores and the exit
+      std::string where;
+      std::vector<uint32_t> before;
+      for (size_t k = 4; k + tail < code.size(); ++k) {
+        std::vector<Insn> cut(code.begin(), code.begin() + static_cast<long>(k));
+        cut.insert(cut.end(), code.end() - static_cast<long>(tail), code.end());
+        Env e2;
+        const auto m2 = e2.load(cut);
+        ::unsetenv("VGPU_FASTPATH");
+        const Result t2 = e2.run(*m2, 3, threads);
+        ::setenv("VGPU_FASTPATH", "0", 1);
+        const Result r2 = e2.run(*m2, 3, threads);
+        ::unsetenv("VGPU_FASTPATH");
+        if (t2.out != r2.out) {
+          size_t i = 0;
+          while (t2.out[i] == r2.out[i]) ++i;
+          where = " [first differs after instruction " + std::to_string(k - 1) + ": " + (code[k - 1].text.empty() ? "(no text)" : code[k - 1].text) +
+                  "; word " + std::to_string(i) + " is " + hex(t2.out[i]) + " with the tier, " + hex(r2.out[i]) + " without, " + hex(before.empty() ? 0 : before[i]) +
+                  " before]";
+          break;
+        }
+        before = t2.out;
+      }
+      throw vtest::Failure(std::string(f.what()) + where);
+    }
   }
 }
 
@@ -433,6 +463,157 @@ std::vector<Insn> cvt_kernel(uint64_t seed, unsigned part) {
   return c;
 }
 
+
+// ---- operands that are worked out when the instruction runs: a register with a modifier, a constant-bank word, a uniform register -------------------
+// Each form below is written with the field layout of the sm_86 corpus (nvidia/tests/data/sass/sm_86.txt); the decoder's text for each word is checked
+// against the text written here, so a form that does not decode as meant fails the test instead of leaving an operand kind untested. Modifier fields:
+// hi bits 8 and 9 are -Ra and |Ra|; for the forms with a register b, lo bits 63 and 62 are -Rb and |Rb|; hi bit 11 is -Rc (DADD: hi bits 11 and 10 are
+// -Rb and |Rb|, b in the low byte of hi). A constant operand is offset << 38 | bank << 54 in lo; a uniform register is the low byte of lo's b field.
+std::string mod_text(const std::string& body, bool ng, bool ab) { return std::string(ng ? "-" : "") + (ab ? "|" : "") + body + (ab ? "|" : ""); }
+std::string cb_text(unsigned bank, unsigned off) {
+  char b[40];
+  std::snprintf(b, sizeof b, "c[0x%x][0x%x]", bank, off);
+  return b;
+}
+constexpr uint64_t kLoNeg = 1ull << 63, kLoAbs = 1ull << 62;
+uint64_t cb_bits(unsigned bank, unsigned off) { return uint64_t{off} << 38 | uint64_t{bank} << 54; }
+// Ra and its modifiers: hi bits 8, 9.
+uint64_t amods(bool ng, bool ab) { return (ng ? 0x100ull : 0) | (ab ? 0x200ull : 0); }
+
+Insn iadd3_m(unsigned d, unsigned a, bool na, unsigned b, bool nb, unsigned c, bool nc) {
+  return make(0x000fc80007ffe000ull | c | amods(na, false) | (nc ? 0x800ull : 0), lo_of(0x7210, d, a, b) | (nb ? kLoNeg : 0),
+              "IADD3 " + reg(d) + ", " + mod_text(reg(a), na, false) + ", " + mod_text(reg(b), nb, false) + ", " + mod_text(reg(c), nc, false));
+}
+Insn iadd3_cb(unsigned d, unsigned a, bool na, unsigned bank, unsigned off, bool nb, unsigned c) {
+  return make(0x000fc80007ffe000ull | c | amods(na, false), lo_of(0x7a10, d, a, 0) | cb_bits(bank, off) | (nb ? kLoNeg : 0),
+              "IADD3 " + reg(d) + ", " + mod_text(reg(a), na, false) + ", " + mod_text(cb_text(bank, off), nb, false) + ", " + reg(c));
+}
+Insn iadd3_ur(unsigned d, unsigned a, bool na, unsigned u, bool nb, unsigned c) {
+  return make(0x000fc8000fffe000ull | c | amods(na, false), lo_of(0x7c10, d, a, u) | (nb ? kLoNeg : 0),
+              "IADD3 " + reg(d) + ", " + mod_text(reg(a), na, false) + ", " + mod_text("UR" + std::to_string(u), nb, false) + ", " + reg(c));
+}
+// IADD3.X Rd, Ra, Rb, Rc, P3, !PT: the carry-in forms read their operands with ~ (a modifier of the same bits).
+Insn iadd3x_m(unsigned d, unsigned a, bool na, unsigned b, bool nb, unsigned c, bool nc) {
+  return make(0x000fc40001ffe400ull | c | amods(na, false) | (nc ? 0x800ull : 0), lo_of(0x7210, d, a, b) | (nb ? kLoNeg : 0), "");
+}
+Insn imad_cb(unsigned d, unsigned a, unsigned bank, unsigned off, unsigned c) {
+  return make(0x000fc400078e0200ull | c, lo_of(0x7a24, d, a, 0) | cb_bits(bank, off),
+              "IMAD " + reg(d) + ", " + reg(a) + ", " + cb_text(bank, off) + ", " + reg(c));
+}
+Insn lop3_cb(unsigned d, unsigned a, unsigned bank, unsigned off, unsigned c, unsigned lut) {
+  return make(0x000fe200078e0000ull | lut << 8 | c, lo_of(0x7a12, d, a, 0) | cb_bits(bank, off),
+              "LOP3.LUT " + reg(d) + ", " + reg(a) + ", " + cb_text(bank, off) + ", " + reg(c) + ", " + hex(lut) + ", !PT");
+}
+// FADD / FMUL (op 0x7221 / 0x7220), the b operand a register (opcode 0x7_), a constant (0x76_) or a uniform register (0x7e_).
+Insn fbin_rr(bool mul, unsigned d, unsigned a, bool na, bool aa, unsigned b, bool nb, bool ab) {
+  return make((mul ? 0x000fc80000400000ull : 0x000fc80000000000ull) | amods(na, aa), lo_of(mul ? 0x7220 : 0x7221, d, a, b) | (nb ? kLoNeg : 0) | (ab ? kLoAbs : 0),
+              std::string(mul ? "FMUL " : "FADD ") + reg(d) + ", " + mod_text(reg(a), na, aa) + ", " + mod_text(reg(b), nb, ab));
+}
+Insn fbin_cb(bool mul, unsigned d, unsigned a, bool na, bool aa, unsigned bank, unsigned off, bool nb, bool ab) {
+  return make((mul ? 0x000fc80000400000ull : 0x000fc80000000000ull) | amods(na, aa), lo_of(mul ? 0x7620 : 0x7621, d, a, 0) | cb_bits(bank, off) | (nb ? kLoNeg : 0) | (ab ? kLoAbs : 0),
+              std::string(mul ? "FMUL " : "FADD ") + reg(d) + ", " + mod_text(reg(a), na, aa) + ", " + mod_text(cb_text(bank, off), nb, ab));
+}
+Insn fbin_ur(bool mul, unsigned d, unsigned a, bool na, bool aa, unsigned u, bool nb, bool ab) {
+  return make((mul ? 0x000fc80008400000ull : 0x000fc80008000000ull) | amods(na, aa), lo_of(mul ? 0x7e20 : 0x7e21, d, a, u) | (nb ? kLoNeg : 0) | (ab ? kLoAbs : 0),
+              std::string(mul ? "FMUL " : "FADD ") + reg(d) + ", " + mod_text(reg(a), na, aa) + ", " + mod_text("UR" + std::to_string(u), nb, ab));
+}
+// FFMA Rd, [-|]Ra, [-|]Rb, [-]Rc and FFMA Rd, Ra, [-|]c[bank][off], [-]Rc.
+Insn ffma_m(unsigned d, unsigned a, bool na, bool aa, unsigned b, bool nb, bool ab, unsigned c, bool nc) {
+  return make(0x000fc60000000000ull | c | amods(na, aa) | (nc ? 0x800ull : 0), lo_of(0x7223, d, a, b) | (nb ? kLoNeg : 0) | (ab ? kLoAbs : 0),
+              "FFMA " + reg(d) + ", " + mod_text(reg(a), na, aa) + ", " + mod_text(reg(b), nb, ab) + ", " + mod_text(reg(c), nc, false));
+}
+Insn ffma_cb(unsigned d, unsigned a, bool na, bool aa, unsigned bank, unsigned off, bool nb, bool ab, unsigned c, bool nc) {
+  return make(0x000fc60000000000ull | c | amods(na, aa) | (nc ? 0x800ull : 0), lo_of(0x7a23, d, a, 0) | cb_bits(bank, off) | (nb ? kLoNeg : 0) | (ab ? kLoAbs : 0),
+              "FFMA " + reg(d) + ", " + mod_text(reg(a), na, aa) + ", " + mod_text(cb_text(bank, off), nb, ab) + ", " + mod_text(reg(c), nc, false));
+}
+// DADD Rd, [-|]Ra, [-|]Rb ; DADD Rd, [-|]Ra, [-|]c[bank][off] ; DADD Rd, [-|]Ra, [-|]URu (register pairs: even numbers).
+Insn dadd_rr(unsigned d, unsigned a, bool na, bool aa, unsigned b, bool nb, bool ab) {
+  return make(0x000fc80000000000ull | b | amods(na, aa) | (nb ? 0x800ull : 0) | (ab ? 0x400ull : 0), lo_of(0x7229, d, a, 0),
+              "DADD " + reg(d) + ", " + mod_text(reg(a), na, aa) + ", " + mod_text(reg(b), nb, ab));
+}
+Insn dadd_cb(unsigned d, unsigned a, bool na, bool aa, unsigned bank, unsigned off, bool nb, bool ab) {
+  return make(0x000fc80000000000ull | amods(na, aa), lo_of(0x7629, d, a, 0) | cb_bits(bank, off) | (nb ? kLoNeg : 0) | (ab ? kLoAbs : 0),
+              "DADD " + reg(d) + ", " + mod_text(reg(a), na, aa) + ", " + mod_text(cb_text(bank, off), nb, ab));
+}
+Insn dadd_ur(unsigned d, unsigned a, bool na, bool aa, unsigned u, bool nb, bool ab) {
+  return make(0x000fc80008000000ull | amods(na, aa), lo_of(0x7e29, d, a, u) | (nb ? kLoNeg : 0) | (ab ? kLoAbs : 0),
+              "DADD " + reg(d) + ", " + mod_text(reg(a), na, aa) + ", " + mod_text("UR" + std::to_string(u), nb, ab));
+}
+// DFMA Rd, [-|]Ra, [-|]c[bank][off], [-]Rc (Rc the low register of a pair).
+Insn dfma_cb(unsigned d, unsigned a, bool na, bool aa, unsigned bank, unsigned off, bool nb, bool ab, unsigned c, bool nc) {
+  return make(0x000fc80000000000ull | c | amods(na, aa) | (nc ? 0x800ull : 0), lo_of(0x7a2b, d, a, 0) | cb_bits(bank, off) | (nb ? kLoNeg : 0) | (ab ? kLoAbs : 0),
+              "DFMA " + reg(d) + ", " + mod_text(reg(a), na, aa) + ", " + mod_text(cb_text(bank, off), nb, ab) + ", " + mod_text(reg(c), nc, false));
+}
+// UIADD3 URd, URZ, imm, URZ: a uniform register set to a constant.
+Insn uset(unsigned u, uint32_t imm) {
+  return make(0x000fc8000fffe03full, lo_of(0x7890, u, 63, imm), "UIADD3 UR" + std::to_string(u) + ", URZ, " + (static_cast<int32_t>(imm) < 0 ? "-" + hex(0u - imm) : hex(imm)) + ", URZ");
+}
+
+// The seeds of the registers, as kernel(): R1 .. R9, then a few that are zero, a power of two, a NaN, an infinity (floats and doubles) by lane.
+std::vector<Insn> dyn_kernel(uint64_t seed, unsigned length) {
+  Rng rng;
+  rng.s ^= seed * 0xff51afd7ed558ccdull;
+  std::vector<Insn> code;
+  code.push_back(s2r_tid(0));
+  code.push_back(make(0x000fc60000000f00ull, 0x0000580000007a02ull | uint64_t{12} << 16, "MOV R12, c[0x0][0x160]"));
+  code.push_back(make(0x000fc60000000f00ull, 0x0000590000007a02ull | uint64_t{13} << 16, "MOV R13, c[0x0][0x164]"));
+  code.push_back(imad_wide_i(14, 0, kStride, 12));
+  for (unsigned r = 1; r < kRegs; ++r) scramble(code, r, static_cast<uint32_t>(seed) * 16 + r);
+  // R1, R2:R3, R4:R5 shaped to float, double and double: zeros, infinities, NaNs and ordinary numbers by lane, so |x| and -x meet the edge values too.
+  shape(code, 1, 0x807fffffu, (0x78u + rng.next(8)) << 23, 23);
+  shape(code, 3, 0x800fffffu, rng.next(2) ? 0x7ff00000u : (0x3f0u + rng.next(32)) << 20, 20);
+  shape(code, 5, 0x800fffffu, (0x3f0u + rng.next(32)) << 20, 20);
+  static const uint32_t ur_words[] = {0x00000000u, 0x80000000u, 0x7fffffffu, 0xffffffffu, 0x7f800000u, 0xff800000u, 0x7fc00001u, 0x3ff00000u, 0xbff00000u, 0x80000001u};
+  for (unsigned u = 4; u < 8; ++u) code.push_back(uset(u, ur_words[rng.next(10)] ^ (rng.next(3) == 0 ? rng.next(1u << 20) : 0)));
+  const auto reg_any = [&]() { return 1 + rng.next(kRegs - 1); };
+  const auto even = [&]() { return 2 * (1 + rng.next(4)); };   // R2, R4, R6, R8: the pairs (the high register is the next)
+  const auto flag = [&]() { return rng.next(2) != 0; };
+  const auto bank_off = [&](unsigned& bank, unsigned& off) {
+    // bank 0: the launch shape, the high word of the pointer argument (0x164; not 0x160, the low word, which is the address the launch happened to get)
+    // and the words past the end of the arguments (zero); the other banks.
+    static const unsigned offs[] = {0x0, 0x4, 0x8, 0xc, 0x10, 0x14, 0x118, 0x164, 0x168, 0x170, 0x370, 0x174};
+    bank = rng.next(4) == 0 ? 1 + rng.next(3) : 0;
+    off = offs[rng.next(12)] + (rng.next(5) == 0 ? 4 : 0);
+  };
+  const auto pair_off = [](unsigned off) { return (off & ~7u) == 0x160 ? 0x168u : (off & ~7u); };   // (a pair never takes the pointer's low word)
+  for (unsigned i = 0; i < length; ++i) {
+    const unsigned d = reg_any(), a = reg_any(), b = reg_any(), c = reg_any();
+    unsigned bank, off;
+    bank_off(bank, off);
+    const unsigned u = 4 + rng.next(4);
+    switch (rng.next(24)) {
+      case 0: code.push_back(iadd3_m(d, a, flag(), b, flag(), c, flag())); break;
+      case 1: code.push_back(iadd3_m(d, a, true, b, true, c, true)); break;
+      case 2: code.push_back(iadd3_cb(d, a, flag(), bank, off, flag(), c)); break;
+      case 3: code.push_back(iadd3_ur(d, a, flag(), u, flag(), c)); break;
+      case 4: code.push_back(iadd3x_m(d, a, flag(), b, flag(), c, flag())); break;
+      case 5: code.push_back(imad_cb(d, a, bank, off, c)); break;
+      case 6: code.push_back(lop3_cb(d, a, bank, off, c, rng.next(2) ? 0x96 : 0xe8)); break;
+      case 7: code.push_back(fbin_rr(false, d, a, flag(), flag(), b, flag(), flag())); break;
+      case 8: code.push_back(fbin_rr(true, d, a, flag(), flag(), b, flag(), flag())); break;
+      case 9: code.push_back(fbin_cb(false, d, a, flag(), flag(), bank, off, flag(), flag())); break;
+      case 10: code.push_back(fbin_cb(true, d, a, flag(), flag(), bank, off, flag(), flag())); break;
+      case 11: code.push_back(fbin_ur(false, d, a, flag(), flag(), u, flag(), flag())); break;
+      case 12: code.push_back(fbin_ur(true, d, a, flag(), flag(), u, flag(), flag())); break;
+      case 13: code.push_back(ffma_m(d, a, flag(), flag(), b, flag(), flag(), c, flag())); break;
+      case 14: code.push_back(ffma_cb(d, a, flag(), flag(), bank, off, flag(), flag(), c, flag())); break;
+      case 15: code.push_back(dadd_rr(even(), even(), flag(), flag(), even(), flag(), flag())); break;
+      case 16: code.push_back(dadd_cb(even(), even(), flag(), flag(), bank, pair_off(off), flag(), flag())); break;
+      case 17: code.push_back(dadd_ur(even(), even(), flag(), flag(), 4 + 2 * rng.next(2), flag(), flag())); break;
+      case 18: code.push_back(dfma_cb(even(), even(), flag(), flag(), bank, pair_off(off), flag(), flag(), even(), flag())); break;
+      case 19: code.push_back(fbin_rr(false, d, a, true, true, a, true, true)); break;   // a source that is also another source, every modifier
+      case 20: code.push_back(iadd3_m(d, d, true, d, flag(), d, flag())); break;        // the destination is every source
+      case 21: code.push_back(fbin_cb(false, d, d, flag(), flag(), 0, rng.next(2) ? 0x164 : 0x0, true, true)); break;
+      case 22: code.push_back(uset(u, ur_words[rng.next(10)])); break;                  // a uniform register that changes under the instructions
+      default: code.push_back(ffma_m(d, d, true, false, d, true, false, d, true)); break;
+    }
+  }
+  for (unsigned r = 1; r < kRegs; ++r) code.push_back(stg(14, r, 4 * r));
+  code.push_back(stg(14, 0, 0));
+  code.push_back(exit_());
+  return code;
+}
+
 }  // namespace
 
 VTEST(a_stretch_of_register_instructions_gives_the_interpreters_registers_and_counters) {
@@ -497,6 +678,11 @@ std::vector<Insn> imad_hi_kernel(unsigned body, uint64_t seed) {
 
 VTEST(imad_hi_gives_the_interpreters_registers_and_counters_signed_unsigned_and_negated) {
   for (uint64_t seed = 1; seed <= 12; ++seed) compare(imad_hi_kernel(60, seed), {32, 33, 100}, "IMAD.HI, seed " + std::to_string(seed));
+}
+
+VTEST(operands_worked_out_at_run_time_give_the_general_rules_registers_and_counters) {
+  // Whole warps, a warp and a lane, and part of a warp, over many mixes of the forms; the same kernels again with the lane kernels at the baseline.
+  for (uint64_t seed = 1; seed <= 60; ++seed) compare(dyn_kernel(seed, 120), {32, 100, 33, 5}, "dyn operands, seed " + std::to_string(seed));
 }
 
 VTEST_MAIN

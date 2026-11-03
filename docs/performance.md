@@ -6919,3 +6919,47 @@ The stencil rows have no shared memory and no IMAD.HI: their instructions are ex
 * `test_sass_alu_runs`: `imad_hi_gives_the_interpreters_registers_and_counters_signed_unsigned_and_negated` (IMAD.HI and IMAD.HI.U32 with a pair addend R0:R1 .. R8:R9 or RZ, negated or not, 12 seeds, 32/33/100 threads, tier against `VGPU_FASTPATH=0`; also under `VGPU_TIER=0`). The 32-bit addend form (`!(aux & 4)`) is not reachable from an encoding this assembler makes and is not covered by a test; it is the `h_imad_wide` extension rule written the same way.
 * Mutants built and run on server3 (each killed): hash without the mask (hash-collision test); partial-mask rows 5, 6 and 15 wrong, row 8 zeroed (nibble tests; rows 5/6/15 survived the first two versions of the test, which is why the pairs test exists); hint hit answering with the wrong entry's passes; a hint miss that skips the key compare; IMAD.HI: negation ignored, low word stored, sign ignored, negated high word shifted by 33. Survived, equivalent in results: the hint ignored in favour of the last entry (a performance change only; checked by the instruction counts above).
 * Also run, all pass: `test_tier`, `test_sass_mem_rows` (and `VGPU_SIMD=base`), `test_memfast`, `test_sass_dispatch`, `test_sass_block_reuse`, `test_memalloc`, `test_exec`, `test_memhot_sp8`, `test_gather_sp10`, `test_sass_generic_mem` (and `VGPU_SIMD=base`), `test_warp_stride_access`, `test_sass_access_count`, `test_memrmw`, `test_memcopy_direct`, `test_fastpath`, `test_memcpy_chk`, `test_jit_resid`, `test_sass_atomics`, `test_sass_ldgsts`, `test_sched`, `lint_hot_unit_layout`. Not run: sanitizer builds, the AMD guards, the canary harness (CI).
+
+## Round sp21 (tier_dyn): a vector kernel for the run-time operands, measured and NOT a win (branch `sp21-tierdyn`, base 85ec63a5)
+
+Result first: **the change is correct (unit tests, 14 mutants killed) and does not make any program faster. It adds 0.1% to 0.8% instructions (p < 1e-4 in every row) and its cycles are inside the noise. It should not be merged as a speed-up; the tests (and `tier::mod_params`) are the part worth keeping.**
+
+### How much of the real programs is `tier_dyn`?
+Server3 (Zen 4 laptop part, one thread, `perf record -e cycles:u -F 1999`, first 40 s of each program, base build 85ec63a5, load 8 to 12 from other sessions), all 66 corpus programs (PolyBench, Rodinia, HeCBench). Share of cycles in `tier_dyn<false/true>` + `tier_dyn64`, including programs' own host time in the denominator:
+* mean 2.5%; 45 of 66 programs above 1%, 9 above 5%, 1 above 10%.
+* top: HeCBench atomicReduction 20.1% (16.9% `tier_dyn<false>`, 3.2% `<true>`; the survey brief's 32% was a different window), Rodinia bfs 7.9%, PolyBench FDTD-2D 7.4%, Rodinia sc_gpu 6.9%, PolyBench LU 6.7%, HeCBench s3d 5.5%, aligned-types 5.2%, JACOBI1D/2D 5.1%, bitonic-sort 4.9%, Rodinia gaussian 4.9%, GEMVER 4.5%, lavaMD 4.5%.
+So the share is real and wider than the 0.7% of instructions the sp15 note gave (a share of cycles, not of instructions: the call is cheap in instructions and dear in cycles), but only atomicReduction is above 10%.
+
+### Why vector kernels do not help
+`perf annotate` of `tier_dyn<false>` on atomicReduction (base build): the cost is in the call, not in the 32-lane loop. The hot case is the bank-0 splat, already eight 16-byte stores after a `pshufd`; the samples sit on the first load of `s.mod` after the call (17%), the `pshufd` (15%) and the first stores. The baseline compiler had already vectorized the loops. Replacing them with an indirect call to a 4 x 256-bit kernel (`simd::Kernels::row_mod` / `row_splat`) removes no work and adds the indirect call and the parameter set-up, hence slightly more instructions. Inlining the bank-0 case into the handlers (the other half of the idea) was not tried: the call overhead it would save is the only thing left, and the sp15 note's code-size objection stands.
+
+### What the branch contains
+* `simd::Kernels::row_mod(r, a, and_m, xor_m, add)` (r[l] = ((a[l] & and_m) ^ xor_m) + add) and `row_splat(r, v)`, baseline loops and AVX2 intrinsics, in all four tables. No AVX-512 form (the row is 4 vectors of 256 bits; unmeasured and pointless given the result).
+* `tier::mod_params(flt, mod)` (src/sass/tier.hpp): the old `tier_mod` rule as an (and, xor, add) triple: float |x| and -x a mask and a sign flip; integer -x is ~x + 1, ~x the flip, -x then ~x is x - 1.
+* `tier_dyn` / `tier_dyn64` call the kernels.
+
+### Results (B = branch, A = base, alternating A B, 15 pairs, `perf stat` instructions:u / cycles:u, cpu 8 or 9, `VGPU_THREADS=1`, 3 fresh copies of each shim dir rotated by pair, ratios of medians B/A, Mann-Whitney p; output hashes and exit codes identical where the output is deterministic)
+| program | ins B/A | p | cycles B/A | p | A spread (cycles) |
+|---|---:|---:|---:|---:|---:|
+| atomicReduction (args `52428800 3`, 3 repeats instead of 100) | 1.0032 | 3e-6 | 1.0028 | 0.044 | 0.30 |
+| rodinia sc_gpu | 1.0081 | 3e-6 | 1.0076 | 0.10 | 0.10 |
+| hecbench s3d | 1.0055 | 3e-6 | 0.9989 | 0.79 | 0.08 |
+| hecbench bitonic-sort | 1.0063 | 3e-6 | 0.9674 | 0.006 | 0.36 |
+| polybench FDTD-2D | 1.0065 | 3e-6 | 0.9657 | 0.29 | 0.85 |
+| rodinia lavaMD | 1.0041 | 3e-6 | 0.9926 | 0.31 | 0.48 |
+| rodinia bfs | 1.0012 | 3e-6 | 0.9962 | 0.60 | 0.10 |
+| polybench GEMM | 1.0016 | 3e-6 | 0.9958 | 0.059 | 0.03 |
+| polybench BICG (no `tier_dyn` in its profile) | 1.0000 | 5e-5 | 0.9947 | 0.24 | 0.23 |
+
+A/A (base against a second set of 3 fresh copies of the base): atomicReduction ins 1.0000 (p 0.37), cycles 1.0019 (p 0.059); s3d ins 1.0000, cycles 1.0015 (p 0.69); BICG ins 1.0000, cycles 1.0039 (p 0.11). Load during the timed windows was 8 to 13 (other sessions), so no cycle ratio is claimed: the two rows below 0.97 (bitonic-sort, FDTD-2D) have A spreads of 36% and 85% and no A/A control, and are noise until shown otherwise. PolyBench LU, Rodinia gaussian and JACOBI1D were planned and not run (FDTD-2D alone took 90 minutes).
+
+### Tests (CMake-wired, no GPU) and mutations
+* `test_simd`: `row_mod_and_row_splat_at_every_level` (every level against the old scalar rule for all 8 modifier values in both domains, random parameters, in place, guard words round the destination).
+* `test_sass_lanes`: `a_modifiers_kernel_parameters_give_the_scalar_rule_for_every_modifier` (`tier::mod_params` against the old rule for all 8 values in both domains).
+* `test_sass_alu_runs` (it already runs under `VGPU_TIER=0` and `VGPU_SIMD=base`): `operands_worked_out_at_run_time_give_the_general_rules_registers_and_counters`: 60 seeds of IADD3 (+IADD3.X), IMAD, LOP3, FADD, FMUL, FFMA, DADD, DFMA with registers carrying -, |.|, constant-bank words (bank 0 and banks 1 to 3) and uniform registers as sources, 32- and 64-bit, against `VGPU_FASTPATH=0`: registers and every counter; on a mismatch it names the first instruction after which the two differ. (c[0x0][0x160] is the launch's output address, which differs between two runs; the generator never reads it.)
+* Mutants, each built and run, all killed: float |x| mask dropped; float sign flip dropped; integer ~x flips nothing; integer -x without its add; integer -x then ~x with add 1 instead of all ones (survived the first version of the tests, killed by the `mod_params` test); both-modifier flip kept; Bank0 / UReg / BankN modifier not applied; `tier_dyn64` high word taken from the low one; register row read one register off; AVX2 splat one vector short; AVX2 add dropped; baseline xor dropped; baseline splat one lane short.
+* Not run: the e2e programs and sanitizers (no nvcc on server3; CI), the whole ctest suite.
+
+### Not done
+* Inlining the bank-0 / uniform splat into `tier_src` (saves the call, costs code size at about 100 handler sites); the survey says only atomicReduction (20%) would show it.
+* An AVX-512 form of the kernels.

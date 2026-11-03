@@ -44,25 +44,19 @@ template <bool Flt>
 [[gnu::noinline]] const uint32_t* tier_dyn(const TCtx& c, const tier::Src& s, uint32_t* tmp) {
   switch (s.dyn) {
     case tier::Dyn::Reg: {
-      const uint32_t* r = c.R + s.off * 32u;
-      for (unsigned l = 0; l < 32; ++l) tmp[l] = tier_mod(Flt, s.mod, r[l]);
+      const tier::ModParams k = tier::mod_params(Flt, s.mod);
+      c.sk->row_mod(tmp, c.R + s.off * 32u, k.and_m, k.xor_m, k.add);
       return tmp;
     }
-    case tier::Dyn::Bank0: {
-      const uint32_t v = tier_mod(Flt, s.mod, tier_b0(c, s.off));
-      for (unsigned l = 0; l < 32; ++l) tmp[l] = v;
+    case tier::Dyn::Bank0:
+      c.sk->row_splat(tmp, tier_mod(Flt, s.mod, tier_b0(c, s.off)));
       return tmp;
-    }
-    case tier::Dyn::UReg: {
-      const uint32_t v = tier_mod(Flt, s.mod, c.w->ur[s.off]);
-      for (unsigned l = 0; l < 32; ++l) tmp[l] = v;
+    case tier::Dyn::UReg:
+      c.sk->row_splat(tmp, tier_mod(Flt, s.mod, c.w->ur[s.off]));
       return tmp;
-    }
-    case tier::Dyn::BankN: {
-      const uint32_t v = tier_mod(Flt, s.mod, c.r->tier_cbank32(s.pad, s.off));
-      for (unsigned l = 0; l < 32; ++l) tmp[l] = v;
+    case tier::Dyn::BankN:
+      c.sk->row_splat(tmp, tier_mod(Flt, s.mod, c.r->tier_cbank32(s.pad, s.off)));
       return tmp;
-    }
   }
   return tmp;
 }
@@ -88,10 +82,8 @@ inline const uint32_t* tier_src(const TCtx& c, const tier::Src& s, uint32_t* tmp
     if (s.mod & tier::kAbs) bits &= 0x7fffffffffffffffull;
     if (s.mod & tier::kNeg) bits ^= 0x8000000000000000ull;
   }
-  for (unsigned l = 0; l < 32; ++l) {
-    lo[l] = static_cast<uint32_t>(bits);
-    hi[l] = static_cast<uint32_t>(bits >> 32);
-  }
+  c.sk->row_splat(lo, static_cast<uint32_t>(bits));
+  c.sk->row_splat(hi, static_cast<uint32_t>(bits >> 32));
 }
 
 // A predicate source as the lane mask fast_alu's pmask gives.

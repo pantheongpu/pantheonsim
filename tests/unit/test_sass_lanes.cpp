@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <string>
 
 #include "sass/tier.hpp"
 #include "vgpu/exec/sass_lanes.hpp"
@@ -289,6 +290,34 @@ VTEST(fill_lanes_and_lane_ids_write_the_lanes_of_the_mask_only) {
       VCHECK_EQ(b[l], ((ex >> l) & 1) ? l : keep[l]);
     }
   }
+}
+
+// tier::mod_params (the (and, xor, add) the tier hands the row_mod kernel for a source's modifier) against the scalar rule it replaced, |x| then -x on float
+// bits and -x (0 - x) then ~x on integers, for every modifier value (kNeg, kNot, kAbs in every combination) in both domains, on special words and random ones.
+VTEST(a_modifiers_kernel_parameters_give_the_scalar_rule_for_every_modifier) {
+  std::mt19937_64 rng(11);
+  const auto old_mod = [](bool flt, unsigned mod, uint32_t v) {
+    if (flt) {
+      if (mod & vgpu::sass::tier::kAbs) v &= 0x7fffffffu;
+      if (mod & vgpu::sass::tier::kNeg) v ^= 0x80000000u;
+    } else {
+      if (mod & vgpu::sass::tier::kNeg) v = 0u - v;
+      if (mod & vgpu::sass::tier::kNot) v = ~v;
+    }
+    return v;
+  };
+  const uint32_t special[] = {0u, 1u, 2u, 0x7fffffffu, 0x80000000u, 0x80000001u, 0xffffffffu, 0xfffffffeu, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x00400000u};
+  for (int flt = 0; flt < 2; ++flt)
+    for (unsigned mod = 0; mod < 8; ++mod) {
+      const auto k = vgpu::sass::tier::mod_params(flt != 0, static_cast<uint8_t>(mod));
+      for (int i = 0; i < 4000; ++i) {
+        const uint32_t v = i < 12 ? special[i] : static_cast<uint32_t>(rng());
+        const uint32_t got = ((v & k.and_m) ^ k.xor_m) + k.add;
+        if (got != old_mod(flt != 0, mod, v))
+          throw vtest::Failure(std::string(flt ? "float" : "integer") + " modifier " + std::to_string(mod) + ", value " + std::to_string(v) + ": got " +
+                               std::to_string(got) + ", want " + std::to_string(old_mod(flt != 0, mod, v)));
+      }
+    }
 }
 
 VTEST_MAIN
