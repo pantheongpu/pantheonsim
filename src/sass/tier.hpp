@@ -192,6 +192,7 @@ struct MOp {
   uint8_t run = 0;
   // A global access: the way of the thread's lookup memory this instruction's allocation was last found in (MemoryManager::find_ordinary's `hint`; only ever
   // a place to look first, and read and written relaxed by whichever thread runs the op).
+  // A shared-memory access: the entry of the thread's table of bank passes this instruction's last warp was found in (sass_bank_passes_offsets's `hint`).
   mutable uint8_t way = 0;
 };
 static_assert(sizeof(MOp) == 96, "an op is 96 bytes: a cache line and a half, which the run loop reads one after the other");

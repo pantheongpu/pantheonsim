@@ -629,7 +629,10 @@ struct BankMemo {
     uint32_t passes = 0;
     uint32_t rel[32] = {};
   };
-  Entry32 e32[kEntries];
+  // (More entries than the table of 64-bit keys: a wavefront kernel (Needleman-Wunsch) asks for one mask a step, a hundred and more
+  // shapes in all, and a table of 32 gave a quarter of its calls the full count.)
+  static constexpr unsigned kEntries32 = 128;
+  Entry32 e32[kEntries32];
   uint32_t last32 = 0;              // the entry that answered last (a loop asks for one shape a few times running)
   uint32_t lookups32 = 0, hits32 = 0, skip32 = 0;
 };
@@ -699,7 +702,10 @@ inline uint32_t sass_bank_passes_memo(BankMemo& memo, const uint64_t* addrs, uin
 // offset has bit 31 set the true differences are under 2^31 either way, so keys that are equal are shapes that differ by a move
 // of whole words (the argument of the 64-bit key, which sass_bank_passes_memo has). Every shape goes through the table, the
 // ones on a stride too (a hit costs less than finding the stride); a warp that is not remembered is counted by sass_bank_passes.
-// The entry that answered last is asked first, without the hash.
+// The entry asked first, without the hash, is the caller's `hint` (the entry this instruction's last warp was found in: a loop that
+// alternates two shapes finds each at the entry it left it, where the entry that answered last is always the other one), else the
+// one that answered last. The hint is only a place to look first: any byte, another thread's table's, stale after the entry was
+// reused -- the key is compared in full either way. It is read and written relaxed, by whichever thread runs the instruction.
 namespace detail {
 typedef uint32_t V4 __attribute__((vector_size(16)));
 typedef uint32_t V4u __attribute__((vector_size(16), aligned(4), may_alias));
@@ -714,7 +720,8 @@ inline void store_v4(uint32_t* p, V4 v) { *reinterpret_cast<V4u*>(p) = v; }
   return sass_bank_passes(a, mask, 32, bytes);
 }
 
-[[gnu::noinline]] inline uint32_t sass_bank_passes_offsets(BankMemo& memo, const uint32_t* offs, uint64_t lanes, uint32_t bytes) {
+[[gnu::noinline]] inline uint32_t sass_bank_passes_offsets(BankMemo& memo, const uint32_t* offs, uint64_t lanes, uint32_t bytes,
+                                                           uint8_t* hint = nullptr) {
   const uint32_t m = static_cast<uint32_t>(lanes);
   if (!fast() || bytes == 0 || bytes > 64 || !m) return sass_bank_passes_widened(offs, m, bytes);
   if (memo.skip32) {
@@ -732,10 +739,14 @@ inline void store_v4(uint32_t* p, V4 v) { *reinterpret_cast<V4u*>(p) = v; }
       detail::store_v4(key + 4 * i, v - bv);
     }
   } else {
-    const detail::V4 bit = {1, 2, 4, 8};
+    // (all ones in the lanes of a group of four that run: sixteen rows, one a nibble of the mask)
+    static const detail::V4 kSel[16] = {
+        {0, 0, 0, 0},       {~0u, 0, 0, 0},       {0, ~0u, 0, 0},       {~0u, ~0u, 0, 0},
+        {0, 0, ~0u, 0},     {~0u, 0, ~0u, 0},     {0, ~0u, ~0u, 0},     {~0u, ~0u, ~0u, 0},
+        {0, 0, 0, ~0u},     {~0u, 0, 0, ~0u},     {0, ~0u, 0, ~0u},     {~0u, ~0u, 0, ~0u},
+        {0, 0, ~0u, ~0u},   {~0u, 0, ~0u, ~0u},   {0, ~0u, ~0u, ~0u},   {~0u, ~0u, ~0u, ~0u}};
     for (unsigned i = 0; i < 8; ++i) {
-      const uint32_t nib = (m >> (4 * i)) & 15u;
-      const detail::V4 sel = (detail::V4{nib, nib, nib, nib} & bit) == bit;   // (all ones where the lane runs)
+      const detail::V4 sel = kSel[(m >> (4 * i)) & 15u];
       const detail::V4 v = (detail::load_v4(offs + 4 * i) & sel) | (bv & ~sel);
       high |= v;
       detail::store_v4(key + 4 * i, v - bv);
@@ -748,18 +759,23 @@ inline void store_v4(uint32_t* p, V4 v) { *reinterpret_cast<V4u*>(p) = v; }
     return (diff[0] | diff[1] | diff[2] | diff[3]) == 0;
   };
   uint32_t passes;
-  bool hit = same(memo.e32[memo.last32]);
+  const uint32_t first = (hint ? __atomic_load_n(hint, __ATOMIC_RELAXED) : memo.last32) & (BankMemo::kEntries32 - 1);
+  bool hit = same(memo.e32[first]);
   if (hit) {
-    passes = memo.e32[memo.last32].passes;
+    passes = memo.e32[first].passes;
+    memo.last32 = first;
   } else {
-    uint32_t h = bytes * 0x01000193u;
+    // (The mask is in the hash: a partial warp (a wavefront's diagonal) has only some of its lanes in the eight sampled, the others
+    // are zero in the key, and shapes that differ in the mask alone are the same sample.)
+    uint32_t h = bytes * 0x01000193u ^ m * 0x2545F491u;
     h ^= key[1] * 0x9E3779B1u ^ key[3] * 0x85EBCA77u ^ key[6] * 0xC2B2AE3Du ^ key[10] * 0x27D4EB2Fu ^ key[15] * 0x165667B1u ^
          key[21] * 0x9E3779B1u ^ key[26] * 0x85EBCA77u ^ key[31] * 0xC2B2AE3Du;
     h ^= h >> 15;
-    const uint32_t idx = h % BankMemo::kEntries;
+    const uint32_t idx = h % BankMemo::kEntries32;
     BankMemo::Entry32& e = memo.e32[idx];
-    hit = idx != memo.last32 && same(e);
+    hit = idx != first && same(e);
     memo.last32 = idx;
+    if (hint) __atomic_store_n(hint, static_cast<uint8_t>(idx), __ATOMIC_RELAXED);
     if (hit) {
       passes = e.passes;
     } else {

@@ -3097,11 +3097,12 @@ void count_shared_access(exec::LaunchStats& st, bool store, const uint64_t* addr
 }
 
 // count_shared_access for a warp given as 32-bit offsets (the tier's shared-memory handler): the same counts, without widening them.
-void count_shared_offsets(exec::LaunchStats& st, bool store, const uint32_t* offs, Mask lanes, uint32_t bytes) {
+// (`hint`: the instruction's own place to look first in the table, MOp::way.)
+void count_shared_offsets(exec::LaunchStats& st, bool store, const uint32_t* offs, Mask lanes, uint32_t bytes, uint8_t* hint) {
   const uint64_t n = popc(lanes);
   if (!n) return;
   exec::memcount::BankMemo* const memo = &thread_bank_memo();
-  count_shared(st, store, n, bytes, exec::memcount::sass_bank_passes_offsets(*memo, offs, lanes, bytes));
+  count_shared(st, store, n, bytes, exec::memcount::sass_bank_passes_offsets(*memo, offs, lanes, bytes, hint));
 }
 
 // count_access for a coalesced run: the lanes of `ex`, which are the `count` consecutive ones from `first`, made their
