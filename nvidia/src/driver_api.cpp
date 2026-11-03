@@ -6892,6 +6892,8 @@ static CUresult cuGetExportTable_impl(const void** table, const void* uuid) {
   return t ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
 }
 
+#include "driver_gl.inc"
+
 /* ---- cuGetProcAddress: how modern cudart resolves everything ---- */
 
 namespace {
@@ -6991,7 +6993,20 @@ const ProcEntry kProcTable[] = {
     VGPU_PROC(cuSurfRefSetArray), VGPU_PROC(cuSurfRefGetArray),
     VGPU_PROC(cuProfilerStart), VGPU_PROC(cuProfilerStop),
     VGPU_PROC(cuGraphicsUnregisterResource), VGPU_PROC(cuGraphicsMapResources),
-VGPU_PROC(cuGraphicsUnmapResources), VGPU_PROC(cuGraphicsResourceSetMapFlags_v2),
+    // OpenGL, EGL and VDPAU interop: exported, and refused (driver_gl.inc).
+    VGPU_PROC(cuGraphicsGLRegisterBuffer), VGPU_PROC(cuGraphicsGLRegisterImage), VGPU_PROC(cuGLGetDevices_v2),
+    VGPU_PROC(cuGLCtxCreate_v2), VGPU_PROC(cuGLInit), VGPU_PROC(cuGLRegisterBufferObject),
+    VGPU_PROC(cuGLMapBufferObject_v2), VGPU_PROC(cuGLUnmapBufferObject), VGPU_PROC(cuGLUnregisterBufferObject),
+    VGPU_PROC(cuGLSetBufferObjectMapFlags), VGPU_PROC(cuGLMapBufferObjectAsync_v2),
+    VGPU_PROC(cuGLUnmapBufferObjectAsync), VGPU_PROC(cuGraphicsEGLRegisterImage),
+    VGPU_PROC(cuEGLStreamConsumerConnect), VGPU_PROC(cuEGLStreamConsumerConnectWithFlags),
+    VGPU_PROC(cuEGLStreamConsumerDisconnect), VGPU_PROC(cuEGLStreamConsumerAcquireFrame),
+    VGPU_PROC(cuEGLStreamConsumerReleaseFrame), VGPU_PROC(cuEGLStreamProducerConnect),
+    VGPU_PROC(cuEGLStreamProducerDisconnect), VGPU_PROC(cuEGLStreamProducerPresentFrame),
+    VGPU_PROC(cuEGLStreamProducerReturnFrame), VGPU_PROC(cuGraphicsResourceGetMappedEglFrame),
+    VGPU_PROC(cuEventCreateFromEGLSync), VGPU_PROC(cuVDPAUGetDevice), VGPU_PROC(cuVDPAUCtxCreate_v2),
+    VGPU_PROC(cuGraphicsVDPAURegisterVideoSurface), VGPU_PROC(cuGraphicsVDPAURegisterOutputSurface),
+    VGPU_PROC(cuGraphicsUnmapResources), VGPU_PROC(cuGraphicsResourceSetMapFlags_v2),
     VGPU_PROC(cuGraphicsResourceGetMappedPointer_v2), VGPU_PROC(cuGraphicsSubResourceGetMappedArray),
     VGPU_PROC(cuTexObjectCreate), VGPU_PROC(cuTexObjectDestroy), VGPU_PROC(cuSurfObjectCreate),
     VGPU_PROC(cuSurfObjectDestroy),
@@ -7101,6 +7116,8 @@ static CUresult cuGetProcAddress_impl(const char* symbol, void** pfn, int cudaVe
 VGPU_PT_ALIAS(cuEventRecordWithFlags_ptsz, cuEventRecordWithFlags)
 VGPU_PT_ALIAS(cuEventRecord_ptsz, cuEventRecord)
 VGPU_PT_ALIAS(cuGraphicsMapResources_ptsz, cuGraphicsMapResources)
+VGPU_PT_ALIAS(cuGLMapBufferObject_v2_ptds, cuGLMapBufferObject_v2)
+VGPU_PT_ALIAS(cuGLMapBufferObjectAsync_v2_ptsz, cuGLMapBufferObjectAsync_v2)
 VGPU_PT_ALIAS(cuGraphicsUnmapResources_ptsz, cuGraphicsUnmapResources)
 VGPU_PT_ALIAS(cuLaunchCooperativeKernel_ptsz, cuLaunchCooperativeKernel)
 VGPU_PT_ALIAS(cuLaunchHostFunc_ptsz, cuLaunchHostFunc)
