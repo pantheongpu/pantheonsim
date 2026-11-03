@@ -563,16 +563,16 @@ VTEST(warps_that_differ_in_the_mask_alone_do_not_all_share_one_slot) {
 }
 
 VTEST(every_nibble_of_a_partial_mask_selects_its_own_lanes_in_the_key) {
-  // Every lane on its own word of bank 0: the passes are the lanes that run, so a key that took a lane of a group of four for another (the
+  // Lanes on words of bank 0, a lane or two to a word: the passes are the distinct words of the lanes that run, so a key that took a lane of a group of four for another (the
   // rows that select a nibble's lanes) answers one mask with the passes of its neighbour.
   mc::BankMemo memo;
   uint32_t o[32];
-  for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 128 * l;
+  for (unsigned l = 0; l < 32; ++l) o[l] = 4096 + 128 * ((l * l * 5 + l / 3) % 11);   // (some lanes on one word, so a mask's passes are its distinct ones)
   Rng r(31337);
   for (int i = 0; i < 6000; ++i) {
     uint32_t mask = static_cast<uint32_t>(r.next()) | 1u;
     if (i % 3 == 0) mask &= static_cast<uint32_t>(r.next());   // (sparser ones: a group of four with one lane set)
     mask |= 1u;
-    VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, mask, 4), static_cast<uint32_t>(__builtin_popcount(mask)));
+    VCHECK_EQ(mc::sass_bank_passes_offsets(memo, o, mask, 4), offsets_def(o, mask, 4));
   }
 }
