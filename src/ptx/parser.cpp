@@ -611,16 +611,45 @@ class Parser {
   // call_slots_ before the body is parsed is what makes "ld.param [x_param_0]"
   // inside the function compile to a slot read rather than a kernel-parameter
   // read.
+  // A .reg parameter or result of a .func: a register of the function's own. Only the scalar integer and float
+  // types can be passed this way; a register is 32 or 64 bits here, and the slot that carries it is the same.
+  Reg declare_param_reg(EntryFn& fn, const std::string& name, Type ty, size_t line) {
+    if (ty.kind == Type::Kind::Pred)
+      fail_unsupported(line, ".reg .pred " + name, fn.name, "a .pred register parameter of a .func");
+    declare_reg(fn, name, ty, line);
+    return intern(name);
+  }
+  // The slot a .reg result leaves the function by, and the register it is read from.
+  static constexpr const char* reg_result_slot = ".reg.result";
+  Reg ret_reg_;
+  // Instructions a call or a ret needs around itself when registers are passed (stores of the arguments before
+  // the call, the load of a register result after it, the store of the result before a ret). parse_body places
+  // them next to the instruction, under its guard.
+  std::vector<Instr> pre_instrs_, post_instrs_;
+  size_t reg_call_seq_ = 0;
   bool parse_device_func(EntryFn* out) {
     EntryFn& fn = *out;
     cur_fn_ = &fn;
     fn.is_device_func = true;
     call_slots_.clear();
     declared_regs_.clear();
+    reg_scopes_.clear();
+    ret_reg_ = Reg{};
     if (peek_punct("(")) {
       next();
       const std::string kw = expect_word("'.param'");
-      if (kw != ".param") fail(peek().line, "expected .param in a .func return value");
+      if (kw == ".reg") {
+        // ".func (.reg .b32 r) name(...)": the result is the register r, which the body sets. It leaves the
+        // function by the same slot a .param result does, filled from r at every ret and read back into the
+        // caller's register after the call (see reg_result_slot).
+        const Type rty = expect_type("return value declaration");
+        const std::string rname = expect_word("return value name");
+        ret_reg_ = declare_param_reg(fn, rname, rty, peek().line);
+        fn.retval_slot_name = reg_result_slot;
+        fn.retval_bytes = ret_reg_.wide ? 8 : 4;
+        expect_punct(")");
+      } else {
+      if (kw != ".param") fail(peek().line, "expected .param or .reg in a .func return value");
       if (peek().kind == Token::Kind::Word && peek().text == ".align") {
         next();
         expect_int("alignment");
@@ -638,6 +667,7 @@ class Parser {
       }
       call_slots_.insert(fn.retval_slot_name);
       expect_punct(")");
+      }
     }
     fn.name = expect_word("device function name");
     current_kernel_ = fn.name;
@@ -645,7 +675,29 @@ class Parser {
       next();
       while (!peek_punct(")")) {
         const std::string kw = expect_word("'.param'");
-        if (kw != ".param") fail(peek().line, "expected .param in a .func signature");
+        if (kw == ".reg") {
+          // ".reg .u64 data": a register of the callee's own, named data, that the caller's argument is copied
+          // into at the call. It travels in a slot like a .param does (each lane passes its own value), and
+          // the first instructions of the body load it into the register, so the body sees an ordinary
+          // register and the caller sees an ordinary call.
+          const Type rty = expect_type("parameter declaration");
+          while (peek().kind == Token::Kind::Word && peek().text[0] == '.') next();  // ptr annotations
+          const size_t pline = peek().line;
+          const std::string pname = expect_word("parameter name");
+          const Reg r = declare_param_reg(fn, pname, rty, pline);
+          const std::string slot = ".reg." + pname;
+          Instr load;
+          load.line = pline;
+          load.op = OpLdSlot{slot, 0, Type{Type::Kind::B, r.wide ? 64u : 32u}, {r}};
+          load.text = "ld.param " + pname;
+          load.opcode_id = intern_opcode("ld");
+          fn.body.push_back(std::move(load));
+          fn.param_slot_bytes.push_back(r.wide ? 8 : 4);
+          fn.param_slot_names.push_back(slot);
+          if (peek_punct(",")) next();
+          continue;
+        }
+        if (kw != ".param") fail(peek().line, "expected .param or .reg in a .func signature");
         if (peek().kind == Token::Kind::Word && peek().text == ".align") {
           next();
           expect_int("alignment");
@@ -703,6 +755,7 @@ class Parser {
     cur_fn_ = &fn;
     fn.name = expect_word("kernel name");
     current_kernel_ = fn.name;
+    ret_reg_ = Reg{};
     call_slots_.clear();
     declared_regs_.clear();
     if (peek_punct("(")) {
@@ -960,7 +1013,32 @@ class Parser {
         pending_pos = pos_;
         continue;
       }
-      fn.body.push_back(parse_instruction(fn, bra_fixups));
+      {
+        pre_instrs_.clear();
+        post_instrs_.clear();
+        Instr ins = parse_instruction(fn, bra_fixups);
+        // A function that returns a register copies it into the result slot before it leaves.
+        if (ret_reg_.id != kNoReg && std::holds_alternative<OpRet>(ins.op)) {
+          Instr store;
+          store.line = ins.line;
+          store.op = OpStSlot{reg_result_slot, 0, Type{Type::Kind::B, ret_reg_.wide ? 64u : 32u}, {RegOperand{ret_reg_}}};
+          store.text = "st.param " + ret_reg_.name;
+          store.opcode_id = intern_opcode("st");
+          pre_instrs_.push_back(std::move(store));
+        }
+        const auto guard = [&](Instr& i) {
+          i.has_pred = ins.has_pred;
+          i.pred_negated = ins.pred_negated;
+          i.pred = ins.pred;
+        };
+        for (Instr& extra : pre_instrs_) {
+          guard(extra);
+          fn.body.push_back(std::move(extra));
+        }
+        for (Instr& extra : post_instrs_) guard(extra);
+        fn.body.push_back(std::move(ins));
+        for (Instr& extra : post_instrs_) fn.body.push_back(std::move(extra));
+      }
       while (fixup_scopes.size() < bra_fixups.size()) fixup_scopes.push_back(scopes);
     }
 
@@ -1326,6 +1404,13 @@ class Parser {
       ++cur_fn_->num_regs;
     }
     return Reg{name, it->second, wide};
+  }
+
+  // A register named in a call, which has to be declared (a %-name that is not is a special register).
+  Reg expect_defined_reg(const std::string& w, size_t line) {
+    if (!declared_regs_.count(w))
+      fail_unsupported(line, w, cur_fn_ ? cur_fn_->name : std::string(), "a call argument that is not a declared register");
+    return intern(w);
   }
 
   // Register operand. Inline asm may declare locals without the '%' sigil
@@ -4675,9 +4760,30 @@ class Parser {
     } else if (op0 == "call") {
       // call.uni (retval0), vprintf, (param0, param1);
       OpCall op;
+      // Arguments and results may be registers (".callprototype _(.reg .u64 data)", ".func f(.reg .u64 data)"):
+      // a register is stored to a slot of its own before the call, the callee loads that slot into its
+      // parameter register, and a register result is loaded from the callee's result slot after the call. All
+      // of it is guarded as the call is, so a divergent call moves only the lanes that make it.
+      const size_t seq = reg_call_seq_++;
+      const auto is_reg = [&](const std::string& w) {
+        return !call_slots_.count(w) && (w[0] == '%' || declared_regs_.count(w));
+      };
+      const auto slot_type = [](const Reg& r) { return Type{Type::Kind::B, r.wide ? 64u : 32u}; };
       if (peek_punct("(")) {
         next();
-        op.retval_slot = expect_word("return value slot");
+        const std::string w = expect_word("return value slot");
+        if (is_reg(w)) {
+          const Reg r = expect_defined_reg(w, ins.line);
+          op.retval_slot = ".reg.rv" + std::to_string(seq);
+          Instr load;
+          load.line = ins.line;
+          load.op = OpLdSlot{op.retval_slot, 0, slot_type(r), {r}};
+          load.text = "ld.param " + w;
+          load.opcode_id = intern_opcode("ld");
+          post_instrs_.push_back(std::move(load));
+        } else {
+          op.retval_slot = w;
+        }
         expect_punct(")");
         expect_punct(",");
       }
@@ -4691,7 +4797,27 @@ class Parser {
       expect_punct(",");
       expect_punct("(");
       while (!peek_punct(")")) {
-        op.param_slots.push_back(expect_word("call argument slot"));
+        if (peek_punct("-") || (peek().kind == Token::Kind::Word && isdigit(static_cast<unsigned char>(peek().text[0]))))
+          return unsupported("a constant as a call argument (pass it in a register or a .param)");
+        const std::string w = expect_word("call argument slot");
+        if (is_reg(w)) {
+          const Reg r = expect_defined_reg(w, ins.line);
+          const std::string slot = ".reg.a" + std::to_string(seq) + "_" + std::to_string(op.param_slots.size());
+          Instr decl;
+          decl.line = ins.line;
+          decl.op = OpDeclSlot{slot, r.wide ? 8u : 4u};
+          decl.text = ".param " + slot;
+          pre_instrs_.push_back(std::move(decl));
+          Instr store;
+          store.line = ins.line;
+          store.op = OpStSlot{slot, 0, slot_type(r), {RegOperand{r}}};
+          store.text = "st.param " + w;
+          store.opcode_id = intern_opcode("st");
+          pre_instrs_.push_back(std::move(store));
+          op.param_slots.push_back(slot);
+        } else {
+          op.param_slots.push_back(w);
+        }
         if (peek_punct(",")) next();
       }
       next();

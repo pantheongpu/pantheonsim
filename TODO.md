@@ -1924,6 +1924,7 @@ table says. `pantheonworkloads #10` lives in another repository and was not chec
 | pantheonsim #310 | Driver stream-ordered memory pools (`cuMemPool*`, `cuMemAllocAsync` through the current pool) |
 | pantheonsim #311 | Driver `cuPointerGetAttributes`, `cuPointerSetAttribute` and the missing `cuPointerGetAttribute` answers |
 | pantheonsim #290 | The memory-pattern e2e test and the `cuda_memtest` and `gpu-burn` external suites |
+| pantheonsim #475 | PTX `.func` with `.reg` parameters and a `.reg` result, and `.callprototype` with `.reg`; a constant call argument is refused by name (a register has a width, a literal does not) |
 | pantheonworkloads #10 | `arch-*` and `lib-*` workload runs on `sim:nvidia`, and `unsupported_ok` for ops real GPUs lack |
 
 ## Profile inventory (rev 6)

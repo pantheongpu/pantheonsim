@@ -7,6 +7,11 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- PTX `.func` accepts `.reg` parameters and a `.reg` result (`.visible .func f(.reg .u64 data)`), and calls pass
+  and receive registers (`call %rd1, (%rd0), proto;` with `proto: .callprototype _(.reg .u64 data);`), which is how
+  Dr.Jit compiles virtual calls; it was refused as `expected .param in a .func signature` (pantheonsim #475). The
+  argument register is copied into the callee's register of the parameter's name at the call, per lane; a
+  constant as a call argument is refused by name.
 - A kernel run from PTX no longer fails to launch when its register estimate is up to twice the block's register
   file. The estimate is the peak of live virtual registers and ptxas needs fewer, so ggml's `rms_norm_f32`
   (88 estimated, 64 allowed at 1,024 threads) stopped Ollama running Gemma 3 on the RTX PRO 6000 profile, the one
