@@ -237,4 +237,50 @@ VTEST(div_scale_and_div_fixup_follow_the_guides_pseudocode) {
   VCHECK_EQ(div_fixup(3.5f, -2.0f, 1.0f), -3.5f);
 }
 
+// div_scale takes bit-arithmetic paths where its operands are normal numbers (gcn_divide.hpp); it must give the reference's value (the
+// bits) and condition for every operand, for S0 each of the denominator, the numerator and something else.
+template <typename T>
+void check_div_scale_against_reference(int scale) {
+  std::vector<T> a, b;
+  operands<T>(a, b, scale);
+  const std::vector<T> e = edges<T>();
+  int bad = 0;
+  std::string first;
+  for (size_t i = 0; i < a.size(); ++i) {
+    const T n = a[i], d = b[i];
+    const T other = (i & 1) ? e[next() % e.size()] : make<T>(next() % (dv::Fp<T>::kMaxExp + 1), rmant(), next() & 1);
+    for (T s0 : {d, n, other}) {
+      const auto got = dv::div_scale(s0, d, n), want = dv::div_scale_reference(s0, d, n);
+      if (dv::bits_of(got.value) != dv::bits_of(want.value) || got.vcc != want.vcc) {
+        if (++bad == 1) {
+          char buf[200];
+          std::snprintf(buf, sizeof buf, "div_scale(%a, %a, %a): got %llx vcc %d, want %llx vcc %d", static_cast<double>(s0),
+                        static_cast<double>(d), static_cast<double>(n), static_cast<unsigned long long>(dv::bits_of(got.value)), got.vcc,
+                        static_cast<unsigned long long>(dv::bits_of(want.value)), want.vcc);
+          first = buf;
+        }
+      }
+    }
+  }
+  if (bad) throw vtest::Failure(std::to_string(bad) + " div_scale results differ from the reference; first: " + first);
+}
+
+template <typename T>
+void check_scale_by_pow2() {
+  int bad = 0;
+  std::vector<T> v = edges<T>();
+  for (int i = 0; i < 20000; ++i) v.push_back(make<T>(next() % (dv::Fp<T>::kMaxExp + 1), rmant(), next() & 1));
+  for (T x : v)
+    for (int k = -300; k <= 300; k += (k > -140 && k < 140) ? 1 : 7)
+      if (dv::bits_of(dv::scale_by_pow2(x, k)) != dv::bits_of(std::ldexp(x, k))) ++bad;
+  VCHECK_EQ(bad, 0);
+}
+
+VTEST(a_float_div_scale_is_the_reference_for_every_operand) { check_div_scale_against_reference<float>(1); }
+VTEST(a_double_div_scale_is_the_reference_for_every_operand) { check_div_scale_against_reference<double>(1); }
+VTEST(scaling_by_a_power_of_two_is_ldexp) {
+  check_scale_by_pow2<float>();
+  check_scale_by_pow2<double>();
+}
+
 VTEST_MAIN

@@ -6540,6 +6540,47 @@ Step by step (single runs, instructions B/A on ATAX / GEMM / SYR2K): the new `wa
 * `load_batch` (13 to 26% of the gather rows) is 14 instructions a lane and bound by the L1 misses; `load_broadcast` is still about 110 instructions a call (the fault checks, the lookup, the chunk test, the fill).
 * `POPC` calls libgcc's `__popcountdi2` per lane (3% of `int_alu`): the AVX2 unit is compiled with `target("avx2")` and no `popcnt`.
 
+## Round sp21 (AMD): float division on real HIP programs (branch `sp21-amd`, base `origin/main` 179c886f)
+
+Question: where does the AMD tier spend its time on real HIP programs, beyond PolyBench? Built for gfx942 with `hipcc -O2` after `hipify-perl`: 18 of 22 HeCBench programs (the reduced set's `-cuda` sources; `attention` needs `cooperative_groups/reduce.h`, `bh` a 64-bit `__shfl_sync` mask, `black-scholes` and `s3d` do not hipify cleanly) and 8 Rodinia apps (hotspot, gaussian, needle, pathfinder, bfs, lud, nn, srad; backprop's C files do not compile as hip). Profiled with the `LD_PRELOAD` `SIGPROF` sampler (`tools/bench-amd/profile`, `SIGPROF_STACK=1` for callers), one thread, `amd/mi300x`. Most of them finish in under a second at their reduced sizes; the ones with seconds in them:
+
+| program | top of the profile (self time) |
+|---|---|
+| bilateral | `h_div` 28 %, libm `ldexpf` 19 %, `modf` 14 %, `ilogb` 4 % (the libm entries are called from `h_div`: 265 of 342 `ldexpf` samples, all of the `ilogb`) |
+| aobench | `h_div` 19 %, `h_f32_avx2` 17 %, `ldexpf` 10 %, `run_groups` 12 % |
+| aidw | `h_div` 14 %, `h_f32_avx2` 13 %, `h_pk` 12 %, `ldexpf` 10 %, `modf` 6 % |
+| radixsort2 | `vector_alu` lambda 17 %, `run_groups` 15 %, `wave_scalars` 14 %, `h_cndmask_avx2` 8 %, `load_batch` 7 % |
+| shmembench | `h_ds_avx2` 38 %, `ds_run_read` 20 %, `run_groups` 19 %, `ds_run_write` 19 % (already SIMD; a bandwidth test) |
+
+### What changed
+`v_div_scale_f32/f64` (`div_scale` in `amd/src/gcn_divide.hpp`, run per lane by the tier's `h_div`) classified its operands with `fpclassify`, `isfinite`, `ilogb` and `scalbn` and scaled with `ldexp`, all libm calls: every float division is two `v_div_scale`. When S1 and S2 are normal numbers (the usual case) every test is now a test of the exponent and mantissa fields (`div_scale`), and the scaling by 2^+-64 / 2^+-128 moves the exponent field of a normal number (`scale_by_pow2`; zero, denormals, infinities, NaNs, or a result out of the normal range go to `ldexp`). Any other operand takes the old code, kept as `div_scale_reference`. The interpreter (`gcn_exec.cpp`) calls `div_scale_reference`: it stays the independent oracle for the tier's same-bits tests, and its machine code is what it was (editing the inlined code of `gcn_exec.cpp` re-rolled the layout of the whole AMD canary: first attempt with the interpreter on the new code lost 3 to 6 % on `valu_int`, `smem`, `mfma_i8`, `p_smem_wide`, `launch_*`).
+
+### Results (Zen 5, server2 cpu 13, `VGPU_THREADS=1`, user-time median of 9 alternating runs, A = origin/main, W = this branch, counters equal, program output (stdout without timing lines, and files) equal in every run)
+| program | A (s) | W (s) | W/A |
+|---|---:|---:|---:|
+| silu | 0.78 | 0.38 | **0.487** |
+| bilateral | 2.00 | 0.96 | **0.480** |
+| aobench | 0.90 | 0.61 | **0.678** |
+| aidw (10 0 1) | 41.7 | 32.0 | **0.767** |
+| hotspot (512) | 0.15 | 0.11 | 0.733 |
+| lud (1024) | 0.76 | 0.74 | 0.974 |
+| gaussian, needle, srad | 0.43, 0.24, 0.08 | same | 1.000 |
+| radixsort2 | 5.36 | 5.48 | 1.022 |
+| shmembench | 3.12 | 3.11 | 0.997 |
+Rows under 0.3 s time start-up as much as the tier; hotspot's 0.15 s is within a couple of timer ticks of 0.11 s, not a claim. radixsort2 and shmembench use no division and are the controls (no A/A copy was timed for the programs).
+
+`bench-amd` canary (mi300x, 44 rows, one thread, 15 runs, cpu 13; `--check-counters`: 66 workload/target pairs match): no division in the canary, so it only measures layout. W/A: `mfma` 1.012, `mfma_i8` 0.978 (A against a copy of A: 0.987), `smfmac` 1.006, `narrow` 0.970 (A/A 1.007), `p_smem_wide` 0.943 (A/A 0.989; stable in a re-run, 0.944), `mem` 0.992, `smem` 1.008, `flat` 1.003, `atomics` 0.984 (re-run 1.008), `divergent` 0.996, `valu_int` 0.992, `p_sbuf` 1.040 (A/A 0.960..1.012), `p_lane` 0.996; the other rows within 0.99..1.03. Two rows lose at equal counters and are not recovered: `p_smem_wide` -5.6 % and `narrow` -2 %, which moved with a no-op change to which unit holds the division code (a `noinline` wrapper of `div_scale` in the tier changed neither) and are the placement lottery of Round sp14 again. `lint_hot_unit_layout` passes.
+
+### Tried and dropped
+`v_ldexp_f32` (`k_fldexp`, `__builtin_ldexpf` per lane; 3 % of bilateral): the same bit trick (no libm call for a normal number that stays normal) made it 2 to 3 % faster there and `p_lane` 4.5 % slower at equal counters, from the placement of the handlers behind it in `gcn_tier.cpp`; not kept. Tier-mutants of that version (bound `<= 255`, shift 22) were killed by `test_amd_gcn_tier_same_bits`.
+
+### Tests and mutants
+`test_amd_gcn_divide` (existing, in CI): `a_float_div_scale_is_the_reference_for_every_operand`, `a_double_...` (the edge values squared, random operands of every exponent, exponent differences at the quotient's two ends, denormals; S0 each of the denominator, the numerator and a third value; the value's bits and the condition equal to `div_scale_reference`) and `scaling_by_a_power_of_two_is_ldexp` (every edge value and random ones, k from -300 to 300). The reference is the old code, so no golden value is recorded. The tier's `test_amd_gcn_tier_same_bits` (interpreter on the reference, tier on the new code, every `v_div_scale` of the corpora) passes. Mutants of the fast path, each built and run against the test: `d1 > -kMinExp` to `>=`: killed (2 tests fail); `e2 - e1 >= kFar` to `>`: killed; `diff < kMinExp` to `<=`: killed; mantissa test `<` to `<=`: killed; `e2 <= kTiny` to `<`: killed; the exponent range test of `scale_by_pow2` `< kMaxExp` to `<=`: killed (3 fail); `>= 1` to `>= 0`: killed (3 fail).
+
+### Not done
+* `radixsort2`'s `vector_alu` lambda / `wave_scalars` / `run_groups` share (the next biggest real-program cost seen) and the other division instructions (`v_div_fmas`/`v_div_fixup` are cheap, `scaled_fma` only runs with VCC set).
+* RX 6800 (gfx1030) builds of the programs were not timed; `div_scale` is shared, so the effect is the same code.
+
 ## Round sp19 (AMD): the LDS-load double free, and gathered dwordx3/dwordx4 stores on AMD (branch `sp19-amd`, base `sp18-amd` bf4e7622)
 
 ### A correctness bug first
