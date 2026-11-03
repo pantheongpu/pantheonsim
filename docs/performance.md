@@ -6836,3 +6836,45 @@ Three copies of A's bytes give 14.8 / 14.7 / 15.7 / 15.7, so `p_lane` moves by 6
 * The A/A control is one copy; the p_lane table shows that several copies are needed for a 15 ms row. Rows under 20 ms (`p_lane`, `p_dpp*`, `startup`) are not claimed either way.
 * The PolyBench programs here are the MINI datasets scaled by the corpus (0.1 s to 120 s); GEMM-class programs measure at 0.5 s and mostly time the host reference check as well.
 * Zen 4 was not part of this round. Timed windows were at load 4 to 7 from other sessions.
+
+## Round sp21 (rodinia-profile): shared-memory bank counting and IMAD.HI (branch `sp21-rodinia`, base `origin/main` 179c886f)
+
+The question: where do the Rodinia rows and the stencil PolyBench rows (hotspot, needle, pathfinder, gaussian, lud, backprop, 2DCONV, 3DCONV, JACOBI2D, FDTD-2D) spend their instructions, and which handlers have avoidable work? Measured on server3 (Zen 4), one thread, SASS, `nvidia/rtx3060`, `perf record -e instructions:u -c 1000000` and `-e cycles:u -c 400000`, corpora of `tools/bench/real`.
+
+### What the profile said (base build, share of instructions retired)
+* needle: `step_warp` 23%, **`sass_bank_passes_offsets` 17%**, `h_shared<false>` 10%, `sass_bank_passes_widened` 4.5%. lud: `h_shared<false>` 18%, **`sass_bank_passes_offsets` 13%** (and 60% of its cycles are the program's own `lud_verify`). hotspot: `step_warp` 18%, bank passes 7%, `h_shared<false>` 7%. backprop: `step_warp` 17%, **`h_imad_hi` 9.3%**, `load_batch` 7%. gaussian: `step_warp` 14%, `sectors_hash` 8%, `init_block` 14% of the cycles (38% of it two `rep stos`: the register file and the shared array of every block). pathfinder and lud are mostly the program's own host code and libc `random`. 2DCONV, 3DCONV, JACOBI2D: `step_warp` 14 to 26%, `load_run` 6 to 12%, `warp_rows_k` 5 to 9%, `run_allocation` 4%, `count_run` 3 to 7%.
+* `sass_bank_passes_offsets` counted, per call, from the entry that answered last, with a 32-entry table. Counting its calls (a temporary counter, not kept): needle 3.1 M calls, **21% of them misses** (each takes `sass_bank_passes_widened`, about 400 instructions) although the kernel has only some hundred shapes; lud 15.5 M calls, 88% full warps, the entry that answered last answered only 58% (a loop that alternates two shapes asks for the other one every time, and then pays the hash and a second compare); hotspot 85% last-entry hits. The misses of needle were not a capacity matter (a table of 128 changed nothing): the hash samples eight lanes of the key (1, 3, 6, 10, 15, 21, 26, 31), and a partial warp has most of those lanes at zero in the key (a lane that does not run is taken at the first lane's word), so the forty masks of a wavefront's diagonals were all one slot and evicted each other.
+* `h_imad_hi` made a 128-bit sum for each lane (about 25 instructions a lane, scalar), for the high word of a * b + c: the wide multiply-add kernel (`imad_wide`) already computes that sum modulo 2^64 with the carry out.
+
+### What changed
+1. **Bank passes**: (a) the hash takes the lane mask, so shapes that differ in the mask alone no longer share a slot; (b) 128 entries for the 32-bit table (`BankMemo::kEntries32`; the 64-bit table keeps 32); (c) `MOp::way` (unused by a shared access until now) is the instruction's own entry, asked first instead of the one that answered last (`sass_bank_passes_offsets(..., hint)`; only ever a place to look first, read and written relaxed, masked to the table); (d) the partial-mask rows come from a 16-row table instead of being built from the nibble with five vector operations a group.
+2. **IMAD.HI** through `c.sk->imad_wide` (low word thrown away, `rhi` stored, the carry out as before): the 32-bit addend extended by the sign of the product's kind, the negated 64-bit addend made in rows as `h_imad_wide` does.
+
+### Results (counters and outputs identical in every row: `VGPU_COUNTERS=1` stdout/stderr hashed with the timing lines dropped)
+Zen 4 (server3), one thread, cpu 4, `perf stat -e instructions:u,cycles:u`, alternating A B, 9 runs (FDTD-2D 3), medians, Mann-Whitney p on cycles; A = origin/main 179c886f, B = this branch, each built here and frozen. Load 1 to 9 from other sessions. A/A (A against itself, 9 runs): cycles 0.999 to 1.020 (backprop 1.020 p 0.10, JACOBI2D 1.010, the others 1.000 +- 0.002), instructions exactly 1.0000.
+| program | instructions B/A | cycles B/A | p |
+|---|---:|---:|---:|
+| rodinia needle | 0.9436 | 0.9287 | <0.001 |
+| rodinia backprop | 0.9267 | 0.9065 | <0.001 |
+| rodinia lud | 0.9889 | 0.9866 | <0.001 |
+| rodinia hotspot | 0.9992 | 0.9919 | 0.45 |
+| rodinia gaussian | 1.0000 | 1.0044 | 0.06 |
+| rodinia pathfinder | 1.0010 | 1.0061 | 0.20 |
+| polybench 2DCONV | 1.0000 | 1.0155 | 0.10 |
+| polybench 3DCONV | 1.0000 | 1.0134 | 0.007 |
+| polybench JACOBI2D | 1.0000 | 0.9932 | 0.35 |
+| polybench FDTD-2D (480 G cycles a run, 3 runs) | 1.0000 | 1.0203 | 0.05 |
+| polybench ATAX | 1.0000 | 0.9995 | 0.57 |
+| polybench GEMM | 1.0000 | 0.9916 | 0.12 |
+The stencil rows have no shared memory and no IMAD.HI: their instructions are exactly equal and the +1 to +2% of cycles on 2DCONV, 3DCONV and FDTD-2D is where the linker put the code (the hot units moved with the edits to `tier_ops.inc` / `exec_ops.inc`; a first build that also had the change below read gaussian +3.1% and FDTD-2D +1.5%, the same lottery with another roll). Not fixed, as in the rounds before (see sp4 to sp10). `lint_hot_unit_layout` passes. The bench.py canary could not be run: server3 has no nvcc for its program (the key of the cached program includes the nvcc path).
+
+### Tried and not kept
+* `MemoryManager::run_out` / `run_in` (the 128-byte runs of the stencil loads and stores) four words to a step instead of one: 6 instructions per 8 bytes become about 2.75; instructions -2.2% on 2DCONV, 3DCONV, JACOBI2D and -2.2% on FDTD-2D, cycles -0.3% to -2.8% (3DCONV 0.975, p 0.002), but gaussian +3.1% in the same build with equal instructions (layout). With the change taken out gaussian reads +0.4% (p 0.06). Reverted (commit kept in the history, then its revert): a win in instructions that the cycles do not show on three of four rows and that costs a layout roll.
+* A table of 128 entries alone (without the mask in the hash): needle's misses stay at 21%.
+* Left alone: `init_block`'s two `rep stos` (gaussian; the register file and shared array of every block must be zero, so it is the memory traffic), `sectors_hash` (gaussian), `step_warp` (flat, see sp18).
+
+### Tests (CMake-wired, no GPU) and mutations
+* `test_bank_memo`: `an_entry_hint_is_only_a_place_to_look_first` (hints: per instruction, another instruction's, any byte, none; four shapes with different answers, masks drawn from four; the table must not enter its back-off), `warps_that_differ_in_the_mask_alone_do_not_all_share_one_slot` (sixteen masks over lanes the hash does not sample), `every_nibble_of_a_partial_mask_selects_its_own_lanes_in_the_key` (two masks that differ in one group of four lanes, every pair of 16 patterns, 8 groups, six random word assignments each: random masks never differ in one group alone).
+* `test_sass_alu_runs`: `imad_hi_gives_the_interpreters_registers_and_counters_signed_unsigned_and_negated` (IMAD.HI and IMAD.HI.U32 with a pair addend R0:R1 .. R8:R9 or RZ, negated or not, 12 seeds, 32/33/100 threads, tier against `VGPU_FASTPATH=0`; also under `VGPU_TIER=0`). The 32-bit addend form (`!(aux & 4)`) is not reachable from an encoding this assembler makes and is not covered by a test; it is the `h_imad_wide` extension rule written the same way.
+* Mutants built and run on server3 (each killed): hash without the mask (hash-collision test); partial-mask rows 5, 6 and 15 wrong, row 8 zeroed (nibble tests; rows 5/6/15 survived the first two versions of the test, which is why the pairs test exists); hint hit answering with the wrong entry's passes; a hint miss that skips the key compare; IMAD.HI: negation ignored, low word stored, sign ignored, negated high word shifted by 33. Survived, equivalent in results: the hint ignored in favour of the last entry (a performance change only; checked by the instruction counts above).
+* Also run, all pass: `test_tier`, `test_sass_mem_rows` (and `VGPU_SIMD=base`), `test_memfast`, `test_sass_dispatch`, `test_sass_block_reuse`, `test_memalloc`, `test_exec`, `test_memhot_sp8`, `test_gather_sp10`, `test_sass_generic_mem` (and `VGPU_SIMD=base`), `test_warp_stride_access`, `test_sass_access_count`, `test_memrmw`, `test_memcopy_direct`, `test_fastpath`, `test_memcpy_chk`, `test_jit_resid`, `test_sass_atomics`, `test_sass_ldgsts`, `test_sched`, `lint_hot_unit_layout`. Not run: sanitizer builds, the AMD guards, the canary harness (CI).
