@@ -462,4 +462,41 @@ VTEST(the_conversions_between_f32_and_f64_give_the_general_rules_registers_and_c
       compare(cvt_kernel(seed, part), {32, 100, 33, 5}, "conversions, seed " + std::to_string(seed) + ", part " + std::to_string(part));
 }
 
+// ---- IMAD.HI (the wide multiply-add's high word: the tier's h_imad_hi) -------------------------------------------------------------------------------------
+// IMAD.HI[.U32] Rd, Ra, Rb, Rc with the addend Rc a register pair (R0:R1 ... R8:R9, or RZ), negated or not.
+Insn imad_hi(unsigned d, unsigned a, unsigned b, unsigned c, bool sgn, bool neg) {
+  return make(0x000fc800078e0000ull | (sgn ? 0x200ull : 0) | (neg ? 0x800ull : 0) | c, lo_of(0x7227, d, a, b), "");
+}
+
+// Registers spread over the whole word (top bits set, products that carry out of 64 bits as a signed and as an unsigned pair), then `body` of them in forms drawn by the seed.
+std::vector<Insn> imad_hi_kernel(unsigned body, uint64_t seed) {
+  Rng rng;
+  rng.s ^= seed * 0xff51afd7ed558ccdull;
+  std::vector<Insn> code;
+  code.push_back(s2r_tid(0));
+  code.push_back(make(0x000fc60000000f00ull, 0x0000580000007a02ull | uint64_t{12} << 16, "MOV R12, c[0x0][0x160]"));
+  code.push_back(make(0x000fc60000000f00ull, 0x0000590000007a02ull | uint64_t{13} << 16, "MOV R13, c[0x0][0x164]"));
+  code.push_back(imad_wide_i(14, 0, kStride, 12));
+  for (unsigned r = 1; r < kRegs; ++r) {
+    code.push_back(imadi(r, 0, ((0x9e3779b1u * r) | 1u) & 0x7fffffffu, kRZ));
+    code.push_back(iadd3i(r, r, (0x85ebca6bu * r) & 0x7fffffffu, 0));
+    code.push_back(imad(r, r, r, 0));
+    code.push_back(imad(r, r, r, 0));
+  }
+  static const unsigned addends[] = {kRZ, 0, 2, 4, 6, 8};
+  for (unsigned i = 0; i < body; ++i) {
+    const unsigned d = 1 + rng.next(kRegs - 1), a = rng.next(kRegs), b = rng.next(kRegs);
+    code.push_back(imad_hi(d, a, b, addends[rng.next(6)], rng.next(2) != 0, rng.next(3) == 0));
+    if (rng.next(4) == 0) code.push_back(imad(d, d, b, a));   // (keeps the registers from settling)
+  }
+  for (unsigned r = 1; r < kRegs; ++r) code.push_back(stg(14, r, 4 * r));
+  code.push_back(stg(14, 0, 0));
+  code.push_back(exit_());
+  return code;
+}
+
+VTEST(imad_hi_gives_the_interpreters_registers_and_counters_signed_unsigned_and_negated) {
+  for (uint64_t seed = 1; seed <= 12; ++seed) compare(imad_hi_kernel(60, seed), {32, 33, 100}, "IMAD.HI, seed " + std::to_string(seed));
+}
+
 VTEST_MAIN
