@@ -29,6 +29,14 @@ using K3 = void (*)(uint32_t* d, const uint32_t* a, const uint32_t* b, const uin
 // ---- integer
 TIER_K(k_mov, d[i] = a[i])
 TIER_K(k_not, d[i] = ~a[i])
+// v_bfrev_b32: the bits in reverse order (swap neighbours, pairs, nibbles, then the bytes).
+TIER_K(k_bfrev, {
+  uint32_t v = a[i];
+  v = ((v >> 1) & 0x55555555u) | ((v & 0x55555555u) << 1);
+  v = ((v >> 2) & 0x33333333u) | ((v & 0x33333333u) << 2);
+  v = ((v >> 4) & 0x0F0F0F0Fu) | ((v & 0x0F0F0F0Fu) << 4);
+  d[i] = __builtin_bswap32(v);
+})
 TIER_K(k_add, d[i] = a[i] + b[i])
 TIER_K(k_sub, d[i] = a[i] - b[i])
 TIER_K(k_subrev, d[i] = b[i] - a[i])

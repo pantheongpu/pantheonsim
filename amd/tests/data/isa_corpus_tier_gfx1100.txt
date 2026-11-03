@@ -117,6 +117,28 @@
 7E026EE9 1F58D102	v_not_b32_dpp v1, v2 dpp8:[1,2,3,4,5,6,7,0]
 7E026EEA 1F58D102	v_not_b32_dpp v1, v2 dpp8:[1,2,3,4,5,6,7,0] fi:1
 7F906EFA FF001BFF	v_not_b32_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+7E0270FA FF00B102	v_bfrev_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+7E0270FA A500B102	v_bfrev_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5
+7E0270FA FF04B102	v_bfrev_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf fi:1
+7E0270FA FF011302	v_bfrev_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0xf
+7E0270FA A5011302	v_bfrev_b32_dpp v1, v2 row_shr:3 row_mask:0xa bank_mask:0x5
+7E0270FA FF051302	v_bfrev_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0xf fi:1
+7E0270FA FF012702	v_bfrev_b32_dpp v1, v2 row_ror:7 row_mask:0xf bank_mask:0xf
+7E0270FA A5012702	v_bfrev_b32_dpp v1, v2 row_ror:7 row_mask:0xa bank_mask:0x5
+7E0270FA FF052702	v_bfrev_b32_dpp v1, v2 row_ror:7 row_mask:0xf bank_mask:0xf fi:1
+7E0270FA FF014002	v_bfrev_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf
+7E0270FA A5014002	v_bfrev_b32_dpp v1, v2 row_mirror row_mask:0xa bank_mask:0x5
+7E0270FA FF054002	v_bfrev_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf fi:1
+7E0270FA FF016902	v_bfrev_b32_dpp v1, v2 row_xmask:9 row_mask:0xf bank_mask:0xf
+7E0270FA A5016902	v_bfrev_b32_dpp v1, v2 row_xmask:9 row_mask:0xa bank_mask:0x5
+7E0270FA FF056902	v_bfrev_b32_dpp v1, v2 row_xmask:9 row_mask:0xf bank_mask:0xf fi:1
+7E0270E9 05397702	v_bfrev_b32_dpp v1, v2 dpp8:[7,6,5,4,3,2,1,0]
+7E0270EA 05397702	v_bfrev_b32_dpp v1, v2 dpp8:[7,6,5,4,3,2,1,0] fi:1
+7E0270E9 00000002	v_bfrev_b32_dpp v1, v2 dpp8:[0,0,0,0,0,0,0,0]
+7E0270EA 00000002	v_bfrev_b32_dpp v1, v2 dpp8:[0,0,0,0,0,0,0,0] fi:1
+7E0270E9 1F58D102	v_bfrev_b32_dpp v1, v2 dpp8:[1,2,3,4,5,6,7,0]
+7E0270EA 1F58D102	v_bfrev_b32_dpp v1, v2 dpp8:[1,2,3,4,5,6,7,0] fi:1
+7F9070FA FF001BFF	v_bfrev_b32_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
 4A0206FA FF00B102	v_add_nc_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 4A0206FA A500B102	v_add_nc_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5
 4A0206FA 3F00B102	v_add_nc_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0x3 bank_mask:0xf
@@ -1472,6 +1494,16 @@ D5BB0001 00000085	v_cls_i32_e64 v1, 5
 D5BB0001 00000102	v_cls_i32_e64 v1, v2
 D5BB0001 00000002	v_cls_i32_e64 v1, s2
 D5BB0001 00000085	v_cls_i32_e64 v1, 5
+7E027102	v_bfrev_b32_e32 v1, v2
+7F9071FF	v_bfrev_b32_e32 v200, v255
+7E027003	v_bfrev_b32_e32 v1, s3
+7E027080	v_bfrev_b32_e32 v1, 0
+7E0270C1	v_bfrev_b32_e32 v1, -1
+7E0270FF 80000000	v_bfrev_b32_e32 v1, 0x80000000
+7E027087	v_bfrev_b32_e32 v1, 7
+D5B80001 00000102	v_bfrev_b32_e64 v1, v2
+D5B80001 00000002	v_bfrev_b32_e64 v1, s2
+D5B80001 00000085	v_bfrev_b32_e64 v1, 5
 D65B0001 00100702	v_permlane16_b32 v1, v2, s3, s4
 D65B0801 00100702	v_permlane16_b32 v1, v2, s3, s4 op_sel:[1,0]
 D65B1001 00100702	v_permlane16_b32 v1, v2, s3, s4 op_sel:[0,1]

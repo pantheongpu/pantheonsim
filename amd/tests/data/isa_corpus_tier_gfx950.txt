@@ -1487,6 +1487,37 @@ D2A00001 00020602	v_pack_b32_f16 v1, s2, v3
 7E0256F9 00031102	v_not_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_3
 7E0256F9 00040D02	v_not_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_SEXT src0_sel:WORD_0
 7E0256F9 00090902	v_not_b32_sdwa v1, sext(v2) dst_sel:BYTE_1 dst_unused:UNUSED_SEXT src0_sel:BYTE_1
+7E0258F9 00060002	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020002	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050802	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011002	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060102	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020102	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050902	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011102	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060202	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_2 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020202	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_2 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050A02	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_2 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011202	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_2 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060302	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020302	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_3 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050B02	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_3 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011302	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_3 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060402	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020402	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050C02	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011402	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060502	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020502	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050D02	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011502	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00060602	v_bfrev_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD
+7E0258F9 00020602	v_bfrev_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2
+7E0258F9 00050E02	v_bfrev_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_SEXT src0_sel:WORD_1
+7E0258F9 00011602	v_bfrev_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PRESERVE src0_sel:BYTE_1
+7E0258F9 00031102	v_bfrev_b32_sdwa v1, v2 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE src0_sel:BYTE_3
+7E0258F9 00040D02	v_bfrev_b32_sdwa v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_SEXT src0_sel:WORD_0
+7E0258F9 00090902	v_bfrev_b32_sdwa v1, sext(v2) dst_sel:BYTE_1 dst_unused:UNUSED_SEXT src0_sel:BYTE_1
 7E0222F9 00060002	v_cvt_f32_ubyte0_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:DWORD
 7E0222F9 00020002	v_cvt_f32_ubyte0_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PAD src0_sel:BYTE_2
 7E0222F9 00050802	v_cvt_f32_ubyte0_sdwa v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_SEXT src0_sel:WORD_1
@@ -2739,6 +2770,19 @@ D3D94001 1800007E	v_accvgpr_write_b32 a1, exec_lo
 7E0256FA FF014202	v_not_b32_dpp v1, v2 row_bcast:15 row_mask:0xf bank_mask:0xf
 7E0256FA A5094202	v_not_b32_dpp v1, v2 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
 7F9056FA FF001BFF	v_not_b32_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
+7E0258FA FF00B102	v_bfrev_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+7E0258FA A508B102	v_bfrev_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0258FA FF011302	v_bfrev_b32_dpp v1, v2 row_shr:3 row_mask:0xf bank_mask:0xf
+7E0258FA A5091302	v_bfrev_b32_dpp v1, v2 row_shr:3 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0258FA FF012702	v_bfrev_b32_dpp v1, v2 row_ror:7 row_mask:0xf bank_mask:0xf
+7E0258FA A5092702	v_bfrev_b32_dpp v1, v2 row_ror:7 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0258FA FF014002	v_bfrev_b32_dpp v1, v2 row_mirror row_mask:0xf bank_mask:0xf
+7E0258FA A5094002	v_bfrev_b32_dpp v1, v2 row_mirror row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0258FA FF013002	v_bfrev_b32_dpp v1, v2 wave_shl:1 row_mask:0xf bank_mask:0xf
+7E0258FA A5093002	v_bfrev_b32_dpp v1, v2 wave_shl:1 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7E0258FA FF014202	v_bfrev_b32_dpp v1, v2 row_bcast:15 row_mask:0xf bank_mask:0xf
+7E0258FA A5094202	v_bfrev_b32_dpp v1, v2 row_bcast:15 row_mask:0xa bank_mask:0x5 bound_ctrl:1
+7F9058FA FF001BFF	v_bfrev_b32_dpp v200, v255 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf
 680206FA FF00B102	v_add_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 680206FA A500B102	v_add_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0xa bank_mask:0x5
 680206FA 3F08B102	v_add_u32_dpp v1, v2, v3 quad_perm:[1,0,3,2] row_mask:0x3 bank_mask:0xf bound_ctrl:1
@@ -3712,6 +3756,16 @@ D16E0001 00000085	v_ffbl_b32_e64 v1, 5
 D16F0001 00000102	v_ffbh_i32_e64 v1, v2
 D16F0001 00000002	v_ffbh_i32_e64 v1, s2
 D16F0001 00000085	v_ffbh_i32_e64 v1, 5
+7E025902	v_bfrev_b32_e32 v1, v2
+7F9059FF	v_bfrev_b32_e32 v200, v255
+7E025803	v_bfrev_b32_e32 v1, s3
+7E025880	v_bfrev_b32_e32 v1, 0
+7E0258C1	v_bfrev_b32_e32 v1, -1
+7E0258FF 80000000	v_bfrev_b32_e32 v1, 0x80000000
+7E025887	v_bfrev_b32_e32 v1, 7
+D16C0001 00000102	v_bfrev_b32_e64 v1, v2
+D16C0001 00000002	v_bfrev_b32_e64 v1, s2
+D16C0001 00000085	v_bfrev_b32_e64 v1, 5
 7E006302	v_frexp_mant_f64_e32 v[0:1], v[2:3]
 7E006202	v_frexp_mant_f64_e32 v[0:1], s[2:3]
 7E0062FF 3FF80000	v_frexp_mant_f64_e32 v[0:1], 0x3ff80000
