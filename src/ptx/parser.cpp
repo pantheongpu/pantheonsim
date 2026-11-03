@@ -539,6 +539,7 @@ class Parser {
     g.size = checked_size(elems, storage_bytes(ty, line, "global '" + g.name + "'"), uint64_t{1} << 40, line,
                           "global '" + g.name + "'");
     if (g.size == 0) fail(line, "zero-sized global '" + g.name + "'");
+    note_array_elem(g.name, storage_bytes(ty, line, "global '" + g.name + "'"));
     if (peek_punct("=")) {
       next();
       if (peek_punct("{")) {
@@ -615,6 +616,7 @@ class Parser {
     EntryFn& fn = *out;
     cur_fn_ = &fn;
     fn.is_device_func = true;
+    fn_elem_bytes_.clear();
     call_slots_.clear();
     declared_regs_.clear();
     if (peek_punct("(")) {
@@ -703,6 +705,7 @@ class Parser {
     cur_fn_ = &fn;
     fn.name = expect_word("kernel name");
     current_kernel_ = fn.name;
+    fn_elem_bytes_.clear();
     call_slots_.clear();
     declared_regs_.clear();
     if (peek_punct("(")) {
@@ -1152,6 +1155,7 @@ class Parser {
     }
     d.size = static_cast<uint32_t>(checked_size(elems, storage_bytes(ty, line, ".shared '" + d.name + "'"),
                                                 UINT32_MAX, line, ".shared '" + d.name + "'"));
+    note_array_elem(d.name, storage_bytes(ty, line, ".shared '" + d.name + "'"));
     if (!sized) {
       if (!allow_unsized) fail(line, "unsized .shared array '" + d.name + "'");
       d.dynamic = true;
@@ -1193,6 +1197,7 @@ class Parser {
     }
     d.size = static_cast<uint32_t>(checked_size(elems, storage_bytes(ty, line, ".local '" + d.name + "'"),
                                                 UINT32_MAX, line, ".local '" + d.name + "'"));
+    note_array_elem(d.name, storage_bytes(ty, line, ".local '" + d.name + "'"));
     if (d.align == 0) d.align = 8;
     const uint64_t off = (uint64_t{fn.local_frame_size} + d.align - 1) / d.align * d.align;
     if (off + d.size > UINT32_MAX) fail(line, ".local frame of this kernel is too large");
@@ -1392,9 +1397,25 @@ class Parser {
   }
 
   Addr parse_addr(const EntryFn& fn) {
-    expect_punct("[");
     Addr a;
-    std::string base = expect_word("address base");
+    // `var[imm]`, with no brackets round the whole operand: element imm of an array, at var + imm * the
+    // element's size (PTX ISA, "Array indexing"; ptxas lays a .b32 array's [5] 20 bytes in). The size
+    // comes from the declaration, which has to precede the use.
+    bool indexed = false;
+    int64_t array_index = 0;
+    size_t index_line = 0;
+    std::string base;
+    if (peek().kind == Token::Kind::Word) {
+      index_line = peek().line;
+      base = next().text;
+      expect_punct("[");
+      array_index = expect_int("array index");
+      expect_punct("]");
+      indexed = true;
+    } else {
+      expect_punct("[");
+      base = expect_word("address base");
+    }
     if (base[0] == '%' || declared_regs_.count(base)) {
       a.base_kind = Addr::Base::Reg;
       Reg r = intern(base);
@@ -1425,6 +1446,14 @@ class Parser {
         a.base = base;
         a.base_kind = Addr::Base::Symbol;
       }
+    }
+    if (indexed) {
+      const uint32_t* elem = a.base_kind == Addr::Base::Symbol ? array_elem_bytes(base) : nullptr;
+      if (!elem)
+        fail(index_line, "'" + base + "[" + std::to_string(array_index) +
+                             "]' indexes a name that is not an array declared earlier in the module");
+      a.offset = array_index * static_cast<int64_t>(*elem);
+      return a;
     }
     if (peek_punct("+")) {
       next();
@@ -5475,6 +5504,18 @@ class Parser {
   std::vector<Token> toks_;
   size_t pos_ = 0;
   std::string current_kernel_;
+  // The element size, in bytes, of each array declared so far, for the `var[imm]` operand (the address is
+  // var + imm * element size). Function-level declarations (.local, .shared) are forgotten with the function;
+  // module-level ones (.global, .const, .shared) stay.
+  std::unordered_map<std::string, uint32_t> fn_elem_bytes_, module_elem_bytes_;
+  void note_array_elem(const std::string& name, uint32_t bytes) {
+    (cur_fn_ ? fn_elem_bytes_ : module_elem_bytes_)[name] = bytes;
+  }
+  const uint32_t* array_elem_bytes(const std::string& name) const {
+    if (auto it = fn_elem_bytes_.find(name); it != fn_elem_bytes_.end()) return &it->second;
+    if (auto it = module_elem_bytes_.find(name); it != module_elem_bytes_.end()) return &it->second;
+    return nullptr;
+  }
   std::set<std::string> call_slots_;
   std::set<std::string> declared_regs_;  // every .reg name in the current kernel
   // Registers declared inside a nested { } block that shadow an outer

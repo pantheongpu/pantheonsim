@@ -1924,6 +1924,7 @@ table says. `pantheonworkloads #10` lives in another repository and was not chec
 | pantheonsim #310 | Driver stream-ordered memory pools (`cuMemPool*`, `cuMemAllocAsync` through the current pool) |
 | pantheonsim #311 | Driver `cuPointerGetAttributes`, `cuPointerSetAttribute` and the missing `cuPointerGetAttribute` answers |
 | pantheonsim #290 | The memory-pattern e2e test and the `cuda_memtest` and `gpu-burn` external suites |
+| pantheonsim #476 | PTX array-element operand `var[imm]` (`st.local.b32 arr[0], %f0;`) for `.local`, `.shared` and `.global` arrays: var + imm * element size, as ptxas lays it out |
 | pantheonworkloads #10 | `arch-*` and `lib-*` workload runs on `sim:nvidia`, and `unsupported_ok` for ops real GPUs lack |
 
 ## Profile inventory (rev 6)

@@ -7,6 +7,10 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- PTX accepts the array-element operand `var[imm]` on `.local`, `.shared` and `.global` arrays
+  (`st.local.b32 arr[1], %f0;`), the form Dr.Jit's CUDA backend writes for its per-thread arrays. The index is scaled
+  by the element size, as ptxas does (`arr[1]` of a `.b32` array is `[arr+4]`); it was refused as `expected '[', got
+  'arr'` (pantheonsim #476). A name that is not an array declared earlier is refused by name.
 - A kernel run from PTX no longer fails to launch when its register estimate is up to twice the block's register
   file. The estimate is the peak of live virtual registers and ptxas needs fewer, so ggml's `rms_norm_f32`
   (88 estimated, 64 allowed at 1,024 threads) stopped Ollama running Gemma 3 on the RTX PRO 6000 profile, the one
