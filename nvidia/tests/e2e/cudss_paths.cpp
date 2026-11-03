@@ -24,6 +24,7 @@
 #include <type_traits>
 #include <vector>
 
+#define VGPU_CUDSS_API_0_8 /* these programs pin the 0.8 behaviour (libcudss.so.0) */
 #include "../../include/vgpu_cudss.h"
 
 using cd = std::complex<double>;

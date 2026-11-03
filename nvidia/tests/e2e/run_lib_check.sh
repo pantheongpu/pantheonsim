@@ -32,6 +32,13 @@ links=()
 cudart=shared
 for lib in "$@"; do
   [[ "$lib" == cuda ]] && cudart=none
+  # cudss1: the cuDSS 1.0 shim (libcudss.so.1), beside the 0.8 one that "cudss" names. nvcc links
+  # the way SCS's run_tests_cudss does against NVIDIA's 1.0 and the binary needs libcudss.so.1.
+  if [[ "$lib" == cudss1 ]]; then
+    [[ -e "$shim/libcudss.so.1" ]] || { echo "SKIP: the cuDSS 1.0 shim is not built (CUDA ABI headers absent at build time)"; exit 0; }
+    links+=("-L$shim" "-l:libcudss.so.1")
+    continue
+  fi
   shopt -s nullglob
   have=("$shim"/lib"$lib".so.[0-9]*)
   shopt -u nullglob

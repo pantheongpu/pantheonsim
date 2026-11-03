@@ -15,7 +15,7 @@ The status snapshot, the inventories and the gap register at the end are new in 
 | NVIDIA execution | PTX interpreter and a SASS executor (the default; sm_75 to sm_120a); both run unmodified nvcc programs through `libvgpucudart` / `libvgpucuda` | nvidia/docs/sass.md, "Coverage" |
 | AMD execution | GCN/CDNA and RDNA executors (64- and 32-lane); unmodified hipcc programs from ROCm 6.4 to 7.2 on MI250X, MI300X, MI325X, MI350X, RX 6900 XT, RX 6800, RX 6700 XT, RX 7900 XTX, RX 9070 XT | amd/README.md |
 | Device profiles | 38 NVIDIA (14 read from hardware) and 10 AMD (3 read from hardware) | "Profile inventory" |
-| NVIDIA libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP, nvJPEG, cuDSS, cuSPARSELt, cuTENSOR, cuTensorNet, cuStateVec, cuFile, nvCOMP, NVSHMEM, nvJitLink, nvFatbin, NVENC | nvidia/docs/libraries.md |
+| NVIDIA libraries | cuBLAS, cuBLASLt, cuDNN, cuFFT, cuRAND, cuSPARSE, cuSOLVER, NCCL, NVRTC, NPP, nvJPEG, cuDSS (0.8 and 1.0), cuSPARSELt, cuTENSOR, cuTensorNet, cuStateVec, cuFile, nvCOMP, NVSHMEM, nvJitLink, nvFatbin, NVENC | nvidia/docs/libraries.md |
 | AMD libraries | rocBLAS, hipBLASLt, hipSPARSELt, MIOpen, rocPRIM/hipCUB, rocRAND, rocFFT, rocSPARSE, rocSOLVER, Composable Kernel, RCCL; ROCm SMI, AMD SMI, rocprofv3/rocprofiler-sdk shims | amd/README.md |
 | Frameworks | PyTorch (CUDA on 12 whole-model checks; ROCm on six AMD GPUs), vLLM (ROCm), llama.cpp and Ollama (every NVIDIA and AMD profile), Triton, Numba, `torch.compile` | nvidia/docs/pytorch.md, "CI inventory" |
 | Health, diagnostics, RAS | NVML (incl. the reads DCGM makes), nvidia-smi, rocm-smi, amd-smi, RVS's sensors, `vgpu fault`, BAR0/MMIO register model, memory-pattern tests | docs/telemetry.md, docs/registers.md |
