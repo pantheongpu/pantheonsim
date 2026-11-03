@@ -100,33 +100,46 @@ __attribute__((target("popcnt"))) bool sector_window_k(const uint64_t* addrs, ui
 
 // sassmem::full_warp_rows, four lanes to a step: lane l's address is (lo[l] | hi[l] << 32) + add (`hi` null: lo[l] + add; `lo` null: add), stored to addrs[l];
 // whether some lane's address is in [window, window + 2^32), judged as the high half of (address - window) being zero; and whether every lane is on the
-// stride of the first two (addrs[l] == a0 + l * stride, modulo 2^64), found in the same pass by the difference from the expected address.
-void warp_rows_k(const uint32_t* lo, const uint32_t* hi, uint64_t add, uint64_t window, uint64_t* addrs, WarpRowsInfo& info) {
-  const auto lane = [&](unsigned l) { return lo ? ((hi ? static_cast<uint64_t>(hi[l]) << 32 : 0) | lo[l]) + add : add; };
+// stride of the first two (addrs[l] == a0 + l * stride, modulo 2^64), found in the same pass by the difference of each group of four from the one before it.
+template <bool Lo, bool Hi>
+[[gnu::always_inline]] static inline void warp_rows_body(const uint32_t* lo, const uint32_t* hi, uint64_t add, uint64_t window, uint64_t* addrs, WarpRowsInfo& info) {
+  const auto lane = [&](unsigned l) { return Lo ? ((Hi ? static_cast<uint64_t>(hi[l]) << 32 : 0) | lo[l]) + add : add; };
   const uint64_t a0 = lane(0), stride = lane(1) - a0;
   const __m256i vadd = _mm256_set1_epi64x(static_cast<long long>(add));
   const __m256i vwin = _mm256_set1_epi64x(static_cast<long long>(window));
-  const __m256i zero = _mm256_setzero_si256();
-  __m256i expect = _mm256_set_epi64x(static_cast<long long>(a0 + 3 * stride), static_cast<long long>(a0 + 2 * stride),
-                                     static_cast<long long>(a0 + stride), static_cast<long long>(a0));
   const __m256i step = _mm256_set1_epi64x(static_cast<long long>(4 * stride));
-  __m256i in = zero, differ = zero;
+  // The lanes are on the stride when every group of four is the group before it plus 4 * stride, and the first group is the first lane's address plus 0, 1,
+  // 2 and 3 strides (`prev` starts one step before it): the difference of two groups is the same test as the distance from the expected address, without
+  // the chain of expected addresses (which the compiler kept in eight registers, and spilled six of them).
+  __m256i prev = _mm256_sub_epi64(_mm256_set_epi64x(static_cast<long long>(a0 + 3 * stride), static_cast<long long>(a0 + 2 * stride),
+                                                    static_cast<long long>(a0 + stride), static_cast<long long>(a0)), step);
+  __m256i differ = _mm256_setzero_si256();
+  // A lane is in the window when the high half of (address - window) is zero: the unsigned minimum of the high halves over the groups, taken on the
+  // whole 64-bit lanes' 32-bit halves (the low halves it also takes are not looked at), is zero in some lane.
+  __m256i least = _mm256_set1_epi32(-1);
+#pragma GCC unroll 8
   for (unsigned i = 0; i < 32; i += 4) {
     __m256i a = vadd;
-    if (lo) {
+    if constexpr (Lo) {
       a = _mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(lo + i)));
-      if (hi) a = _mm256_or_si256(a, _mm256_slli_epi64(_mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(hi + i))), 32));
+      if constexpr (Hi) a = _mm256_or_si256(a, _mm256_slli_epi64(_mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(hi + i))), 32));
       a = _mm256_add_epi64(a, vadd);
     }
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(addrs + i), a);
-    in = _mm256_or_si256(in, _mm256_cmpeq_epi64(_mm256_srli_epi64(_mm256_sub_epi64(a, vwin), 32), zero));
-    differ = _mm256_or_si256(differ, _mm256_xor_si256(a, expect));
-    expect = _mm256_add_epi64(expect, step);
+    least = _mm256_min_epu32(least, _mm256_sub_epi64(a, vwin));
+    differ = _mm256_or_si256(differ, _mm256_xor_si256(_mm256_sub_epi64(a, prev), step));
+    prev = a;
   }
   info.a0 = a0;
   info.stride = stride;
-  info.in_window = !_mm256_testz_si256(in, in);
+  info.in_window = _mm256_movemask_epi8(_mm256_cmpeq_epi64(_mm256_srli_epi64(least, 32), _mm256_setzero_si256())) != 0;
   info.progression = _mm256_testz_si256(differ, differ);
+}
+
+void warp_rows_k(const uint32_t* lo, const uint32_t* hi, uint64_t add, uint64_t window, uint64_t* addrs, WarpRowsInfo& info) {
+  if (!lo) warp_rows_body<false, false>(lo, hi, add, window, addrs, info);
+  else if (!hi) warp_rows_body<true, false>(lo, hi, add, window, addrs, info);
+  else warp_rows_body<true, true>(lo, hi, add, window, addrs, info);
 }
 
 // The same four lanes at a time (a 32-lane warp: eight steps), on a host with AVX2 at the level in use (VGPU_SIMD=base

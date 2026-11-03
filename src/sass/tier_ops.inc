@@ -912,9 +912,9 @@ static void tier_global16(void* vc, const tier::MOp& op, Mask ex) {
       if (Store) {
         for (unsigned i = 0; i < count; ++i)
           for (unsigned k = 0; k < 4; ++k) buf[4 * i + k] = d ? d[32 * k + first + i] : 0u;
-        done = mem.store_run(g0, buf, uint64_t{count} * 16, 8);
+        done = mem.store_run(g0, buf, uint64_t{count} * 16, 8, &op.way);
       } else {
-        done = mem.load_run(g0, buf, uint64_t{count} * 16, 8);
+        done = mem.load_run(g0, buf, uint64_t{count} * 16, 8, &op.way);
         if (done && d)
           for (unsigned i = 0; i < count; ++i)
             for (unsigned k = 0; k < 4; ++k) d[32 * k + first + i] = buf[4 * i + k];
@@ -1011,16 +1011,16 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
         // Words of consecutive lanes are consecutive words of the register's row: moved straight between it and memory (a load that
         // declines has written nothing; the lanes' addresses were read before).
         uint32_t* row = c.R + op.dst * 32u + first;
-        done = Store ? mem.store_run(g0, row, uint64_t{count} * 4, 4) : mem.load_run(g0, row, uint64_t{count} * 4, 4);
+        done = Store ? mem.store_run(g0, row, uint64_t{count} * 4, 4, &op.way) : mem.load_run(g0, row, uint64_t{count} * 4, 4, &op.way);
       } else if (Store) {
         for (unsigned i = 0; i < count; ++i) {
           uint32_t v[4] = {};
           data(first + i, v);
           tier_put(buf + i * bytes, v, bytes);
         }
-        done = mem.store_run(g0, buf, uint64_t{count} * bytes, bytes);
+        done = mem.store_run(g0, buf, uint64_t{count} * bytes, bytes, &op.way);
       } else {
-        done = mem.load_run(g0, buf, uint64_t{count} * bytes, bytes);
+        done = mem.load_run(g0, buf, uint64_t{count} * bytes, bytes, &op.way);
         if (done && dreg) {
           uint32_t* d = c.R + op.dst * 32u;
           for (unsigned i = 0; i < count; ++i) {
@@ -1052,12 +1052,12 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
       bool done;
       if (Store) {
         exec::sassmem::full_warp_store_values(dreg, bytes, fv);   // (the registers' rows widened four lanes to a vector)
-        done = (rows && ri.progression && mem.store_strided(ri.a0, static_cast<int64_t>(ri.stride), 32, bytes, fv)) ||
-               mem.store_batch(addrs, 32, bytes, fv);
+        done = (rows && ri.progression && mem.store_strided(ri.a0, static_cast<int64_t>(ri.stride), 32, bytes, fv, nullptr, &op.way)) ||
+               mem.store_batch(addrs, 32, bytes, fv, nullptr, &op.way);
       } else {
         // (every lane the same address: one load)
-        done = (rows && ri.progression && ri.stride == 0 && mem.load_broadcast(ri.a0, 32, bytes, fv)) ||
-               mem.load_batch(addrs, 32, bytes, fv);
+        done = (rows && ri.progression && ri.stride == 0 && mem.load_broadcast(ri.a0, 32, bytes, fv, &op.way)) ||
+               mem.load_batch(addrs, 32, bytes, fv, &op.way);
         if (done && dreg) {
           uint32_t* d = c.R + op.dst * 32u;
           if (bytes == 4) {
@@ -1073,7 +1073,7 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
         }
       }
       if (done) {
-        if (!(rows && ri.progression && count_global_progression(blk.st, Store, ri.a0, ri.stride, bytes)))
+        if (!(rows && ri.progression && count_global_progression(blk.st, Store, ri.a0, ri.stride, bytes, c.r->fastcount())))
           count_access(blk.st, 0, Store, addrs, ex, bytes);
         return;
       }
@@ -1100,9 +1100,9 @@ static void h_global(void* vc, const tier::MOp& op, Mask ex) {
         data(lane_of[i], v);
         fv[i] = bytes == 8 ? (static_cast<uint64_t>(v[1]) << 32 | v[0]) : bytes == 4 ? v[0] : (v[0] & ((1u << (8 * bytes)) - 1));
       }
-      done = mem.store_batch(fa, cnt, bytes, fv);
+      done = mem.store_batch(fa, cnt, bytes, fv, nullptr, &op.way);
     } else {
-      done = mem.load_batch(fa, cnt, bytes, fv);
+      done = mem.load_batch(fa, cnt, bytes, fv, &op.way);
       if (done && dreg) {
         uint32_t* d = c.R + op.dst * 32u;
         for (unsigned i = 0; i < cnt; ++i) {

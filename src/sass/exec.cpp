@@ -545,6 +545,7 @@ class Runner {
   // For the tier's handlers (tier_ops.inc): the memory the launch runs on, and the interpreter's memory
   // instructions for the cases a handler leaves to it.
   MemoryManager& memory() { return mem_; }
+  bool fastcount() const { return fastcount_; }
   uint32_t tier_sreg(const Block& blk, const Warp& w, unsigned idx, unsigned lane) const { return sreg(blk, w, idx, lane); }
   // The special registers a handler fills a warp's lanes with in one pass (S2R of TID.X/Y/Z, LANEID, CTAID, NTID): the lanes of
   // `ex` of d, exactly the values sreg() gives them one by one; false for any other register.
@@ -702,6 +703,7 @@ class Runner {
   const uint64_t max_steps_;   // the step budget of a warp (cfg_.max_steps, or VGPU_MAX_STEPS)
   exec::LaunchEnv env_;   // the launch's environment variables, read once at its start
   bool fast_ = true;   // VGPU_FASTPATH, sampled at launch
+  bool fastcount_ = exec::memcount::fast();   // VGPU_FASTCOUNT, sampled at launch (the tier asks it for every global access: the function-static answer is two loads through the GOT)
   // The pre-decoded tier (src/sass/tier.hpp): on unless VGPU_TIER=0, with the fast paths and the SIMD kernels it is held to on and
   // no per-instruction trace. tier_stats_: VGPU_TIER_STATS=1 counts what ran where.
   bool tier_ = false;

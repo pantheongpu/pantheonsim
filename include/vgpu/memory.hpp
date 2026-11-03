@@ -213,8 +213,11 @@ class MemoryManager {
   // mapping possibly in range, a run not inside one allocation, or one not
   // aligned to `unit` -- and the caller then goes element by element, errors
   // and all.
-  bool load_run(uint64_t addr, void* dst, uint64_t len, uint32_t unit) const;
-  bool store_run(uint64_t addr, const void* src, uint64_t len, uint32_t unit);
+  // `hint`, here and in the batch calls below: the way of the lookup memory to ask first (find_ordinary), kept by the caller for one instruction -- an
+  // instruction reads the same allocation every time, where the thread's last lookup is the allocation of whatever instruction came before it. A hint
+  // is only where to look first: the answer is the same with any value, with none, or with another thread's (it is read and written relaxed).
+  bool load_run(uint64_t addr, void* dst, uint64_t len, uint32_t unit, uint8_t* hint = nullptr) const;
+  bool store_run(uint64_t addr, const void* src, uint64_t len, uint32_t unit, uint8_t* hint = nullptr);
 
   // The accesses of one warp-wide load or store, made together, for the ordinary
   // case: `count` accesses of `size` bytes, in order. They return true having
@@ -224,18 +227,18 @@ class MemoryManager {
   // allocation the first is in, an address that is no allocation's), in which
   // case the caller makes them one at a time and meets any error where it
   // would have. One lookup serves the lot.
-  bool load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const;
+  bool load_batch(const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out, uint8_t* hint = nullptr) const;
   // load_batch for `count` lanes that all load the same address: one lookup and one load, the word in every out[i]. False (out may be written) for
   // anything load_batch would decline (a fault armed, a host mapping, a misaligned or no-allocation address).
-  bool load_broadcast(uint64_t addr, size_t count, uint32_t size, uint64_t* out) const;
+  bool load_broadcast(uint64_t addr, size_t count, uint32_t size, uint64_t* out, uint8_t* hint = nullptr) const;
   // store_batch for the accesses a0 + i * stride (i < count <= 32; a stride up to half a chunk, a0 and the stride multiples of `size`): where a chunk is real the
   // lanes in it are plain stores after one lookup, where it is untouched or uniform each lane is store_batch's (a uniform chunk left
   // alone by a store of its own byte, any other materialized, a failure to do so reported through `*failed_at` and thrown as there).
-  bool store_strided(uint64_t a0, int64_t stride, size_t count, uint32_t size, const uint64_t* vals, size_t* failed_at = nullptr);
+  bool store_strided(uint64_t a0, int64_t stride, size_t count, uint32_t size, const uint64_t* vals, size_t* failed_at = nullptr, uint8_t* hint = nullptr);
   // A store that cannot get host memory for a chunk throws what store_scalar
   // would, with `*failed_at` the index of the access that did.
   bool store_batch(const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
-                   size_t* failed_at = nullptr);
+                   size_t* failed_at = nullptr, uint8_t* hint = nullptr);
 
   // The same for accesses that all lie in ONE host-mapped buffer (cudaHostAlloc mapped memory, managed memory, IPC): each is the
   // relaxed atomic access of its width that load_scalar / store_scalar make there (no device fault applies to host memory), one lookup
@@ -718,7 +721,7 @@ class MemoryManager {
   // and returns the chunk that won the race; safe to call from several block
   // threads at once.
   static uint8_t* materialize(Allocation& a, uint64_t chunk_idx);
-  const Allocation* run_allocation(uint64_t addr, uint64_t len, uint32_t unit, uint64_t* base) const;
+  const Allocation* run_allocation(uint64_t addr, uint64_t len, uint32_t unit, uint64_t* base, uint8_t* hint = nullptr) const;
   // rmw_scalar's parts. The slot holds where the access is; a chunk that is real stays the same pointer.
   struct RmwSlot {
     Allocation* a;
@@ -753,7 +756,7 @@ class MemoryManager {
   // takes resolve(), so every diagnostic is the one resolve() makes.
   // The ordinary allocation holding [addr, addr + len), from the memory of
   // recent lookups or the table; null if there is none or the memory is off.
-  const Allocation* find_ordinary(uint64_t addr, uint64_t len, uint64_t* base_out) const;
+  const Allocation* find_ordinary(uint64_t addr, uint64_t len, uint64_t* base_out, uint8_t* hint = nullptr) const;
   uint8_t* hot_location(uint64_t addr, uint32_t size) const;
   // True when no address in [base, base + size) can be in a host mapping, by the one range test that covers them all: the span is
   // wholly in the device windows and no host buffer has ever been mapped inside one. (False says nothing: ask each address.)
@@ -769,10 +772,10 @@ class MemoryManager {
   // `memory` is the calling thread's lookup memory (found by the caller, which has just looked in it).
   Found find_ordinary_miss(uint64_t addr, uint64_t len, void* memory) const;
   bool batch_ok(const uint64_t* addrs, size_t count, uint32_t size, bool store, const Allocation** alloc,
-                uint64_t* base) const;
+                uint64_t* base, uint8_t* hint = nullptr) const;
   // The part of batch_ok that is about armed faults, for a load or for a store, and the part that is about the addresses.
   bool batch_faults_clear(bool store) const;
-  bool batch_addresses_ok(const uint64_t* addrs, size_t count, uint32_t size, const Allocation** alloc, uint64_t* base) const;
+  bool batch_addresses_ok(const uint64_t* addrs, size_t count, uint32_t size, const Allocation** alloc, uint64_t* base, uint8_t* hint = nullptr) const;
   void load_batch_in(const Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size, uint64_t* out) const;
   void store_batch_in(Allocation& a, uint64_t base, const uint64_t* addrs, size_t count, uint32_t size, const uint64_t* vals,
                       size_t* failed_at);

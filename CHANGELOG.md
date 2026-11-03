@@ -7,6 +7,10 @@ release says what runs and what it produces, never how fast a real GPU would run
 
 ## Unreleased
 
+- A kernel run from PTX no longer fails to launch when its register estimate is up to twice the block's register
+  file. The estimate is the peak of live virtual registers and ptxas needs fewer, so ggml's `rms_norm_f32`
+  (88 estimated, 64 allowed at 1,024 threads) stopped Ollama running Gemma 3 on the RTX PRO 6000 profile, the one
+  profile whose Ollama build has no cubin. The excess is charged as spill; a launch several times over still fails.
 - The GitHub Action has a `source-dir` output, the simulator's source tree. A project that has the pantheon
   workloads can run `tests/workloads/run_pantheon_workloads.sh` from its own CI with one `uses:` and no second
   checkout (`docs/pantheon-workloads.md`).

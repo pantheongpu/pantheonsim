@@ -340,6 +340,114 @@ VTEST(concurrent_access_beside_allocation_churn_adds_up) {
   }
 }
 
+VTEST(more_threads_than_lookup_slots_all_read_the_right_words) {
+  // A thread's cache of recent lookups is found through a table of 1024 slots by the thread pointer: its first probe is the usual hit, the
+  // later probes and the shared "ended" memory (for a thread that finds no room) are the rest. With more threads alive together than there
+  // are slots, some find their memory on a later probe and some find none, and every one of them must still read what was stored, through
+  // the scalar, the batch and the broadcast paths.
+  MemoryManager mm(1ull << 30);
+  mm.set_lookup_cache(true);
+  constexpr int kThreads = 1300, kWords = 256;
+  const uint64_t base = mm.alloc(kWords * 8);
+  for (int i = 0; i < kWords; ++i) mm.store_scalar(base + 8 * i, 8, uint64_t(i) * 0x9E3779B97F4A7C15ull + 7);
+  std::atomic<int> arrived{0}, failures{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t)
+    threads.emplace_back([&, t] {
+      try {
+        arrived.fetch_add(1);
+        while (arrived.load() < kThreads) std::this_thread::yield();   // (all the threads alive together)
+        for (int round = 0; round < 8; ++round) {
+          const int i = (t * 7 + round * 13) % (kWords - 32);
+          uint64_t addrs[32], out[32], b[32];
+          for (int l = 0; l < 32; ++l) addrs[l] = base + 8 * (i + (l * 5) % 32);
+          if (mm.load_scalar(base + 8 * i, 8) != uint64_t(i) * 0x9E3779B97F4A7C15ull + 7) ++failures;
+          if (!mm.load_batch(addrs, 32, 8, out)) ++failures;
+          else
+            for (int l = 0; l < 32; ++l)
+              if (out[l] != uint64_t(i + (l * 5) % 32) * 0x9E3779B97F4A7C15ull + 7) ++failures;
+          if (!mm.load_broadcast(base + 8 * i, 32, 8, b)) ++failures;
+          else
+            for (int l = 0; l < 32; ++l)
+              if (b[l] != uint64_t(i) * 0x9E3779B97F4A7C15ull + 7) ++failures;
+        }
+      } catch (...) {
+        ++failures;
+      }
+    });
+  for (auto& th : threads) th.join();
+  VCHECK_EQ(failures.load(), 0);
+}
+
+VTEST(a_lookup_hint_is_only_a_place_to_look_first) {
+  // The batch and run calls take the way of the lookup memory to ask first (an instruction's last allocation). Any byte is a legal hint -- stale,
+  // from another allocation, past the number of ways, none -- and the answer is the one without it: the words of the allocation the addresses are
+  // in, or a decline where none is (a freed one, whose cached way must not answer: the epoch).
+  MemoryManager mm(1ull << 30);
+  mm.set_lookup_cache(true);
+  constexpr int kSlots = 12, kWords = 32768;   // (more allocations than the 8 ways, 256 KiB each)
+  uint64_t base[kSlots], id[kSlots];
+  uint64_t next_id = 1;
+  const auto word = [](uint64_t i, uint64_t w) { return (i * 0x9E3779B97F4A7C15ull + w) * 0x2545F4914F6CDD1Dull; };
+  const auto fresh = [&](int k) {
+    id[k] = next_id++;
+    base[k] = mm.alloc(kWords * 8);
+    for (int w = 0; w < kWords; ++w) mm.store_scalar(base[k] + 8 * w, 8, word(id[k], w));
+  };
+  for (int k = 0; k < kSlots; ++k) fresh(k);
+  uint8_t hints[16];
+  Rng rng{0x417};
+  for (uint8_t& h : hints) h = static_cast<uint8_t>(rng.below(256));
+  unsigned batch = 0, bcast = 0, runs = 0, declined = 0;
+  for (int it = 0; it < 30000; ++it) {
+    const int k = static_cast<int>(rng.below(kSlots));
+    uint8_t* hint = rng.below(5) == 0 ? nullptr : &hints[rng.below(16)];
+    switch (rng.below(3)) {
+      case 0: {
+        const uint32_t size = rng.below(2) ? 8 : 4;
+        uint64_t addrs[32], out[32];
+        for (int l = 0; l < 32; ++l) addrs[l] = base[k] + 8 * rng.below(kWords) + (size == 4 ? 4 * rng.below(2) : 0);
+        VCHECK(mm.load_batch(addrs, 32, size, out, hint));
+        for (int l = 0; l < 32; ++l) {
+          const uint64_t off = addrs[l] - base[k], w = off / 8;
+          const uint64_t full = word(id[k], w), want = size == 8 ? full : (off % 8 ? full >> 32 : full & 0xffffffffull);
+          VCHECK_EQ(out[l], want);
+        }
+        ++batch;
+        break;
+      }
+      case 1: {
+        uint64_t out[32];
+        const uint64_t w = rng.below(kWords);
+        VCHECK(mm.load_broadcast(base[k] + 8 * w, 32, 8, out, hint));
+        for (int l = 0; l < 32; ++l) VCHECK_EQ(out[l], word(id[k], w));
+        ++bcast;
+        break;
+      }
+      default: {
+        uint64_t out[32];
+        const uint64_t w = rng.below(kWords - 32);
+        VCHECK(mm.load_run(base[k] + 8 * w, out, 32 * 8, 8, hint));
+        for (int l = 0; l < 32; ++l) VCHECK_EQ(out[l], word(id[k], w + l));
+        ++runs;
+      }
+    }
+    if (it % 700 == 699) {   // an allocation goes: its cached way, still named by a hint, must not answer
+      const int g = static_cast<int>(rng.below(kSlots));
+      const uint64_t old = base[g];
+      mm.free(old);
+      uint64_t addrs[32], out[32];
+      for (int l = 0; l < 32; ++l) addrs[l] = old + 8 * l;
+      for (uint8_t& h : hints) VCHECK(!mm.load_batch(addrs, 32, 8, out, &h));
+      VCHECK(!mm.load_broadcast(old, 32, 8, out, &hints[0]));
+      VCHECK(!mm.load_run(old, out, 32 * 8, 8, &hints[1]));
+      ++declined;
+      fresh(g);
+    }
+  }
+  VCHECK(batch > 8000 && bcast > 8000 && runs > 8000 && declined > 30);
+}
+
 // ---- the counters of a warp's memory access ----------------------------------
 //
 // The two functions below are the engines' counting as it was before

@@ -17271,8 +17271,11 @@ std::optional<Type> tensor_reduce_type(exec::TmapType t, AtomOp op) {
   return ty;
 }
 
+// How far over a block's register file a PTX-only estimate may be and still launch (see kernel_resources).
+constexpr uint64_t kPtxEstimateSlack = 2;
+
 KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile,
-                                 uint32_t block_threads, uint32_t dynamic_shared) {
+                                 uint32_t block_threads, uint32_t dynamic_shared, bool for_launch) {
   // The register analysis depends only on the kernel, so memoize it on the
   // kernel itself. Occupancy also depends on the launch shape and is cheap.
   ptx::RegisterUsage usage;
@@ -17327,6 +17330,22 @@ KernelResources kernel_resources(const EntryFn& fn, const DeviceProfile& profile
     usage.spilled_regs = spilled;
     usage.regs_per_thread = arch_max;
     usage.local_bytes += spilled * 4u;  // a spilled 32-bit register
+  }
+  // A figure estimated from PTX is not ptxas's. The estimate counts the peak of live virtual registers in the order
+  // the PTX writes them; ptxas schedules the loads and arithmetic closer to their uses and so needs fewer. ggml's
+  // rms_norm_f32<1024> measures 88 here and launches on hardware with 1024 threads, which allows 64. Refusing a
+  // launch on an overshoot of that size turns a program that runs on the card into a failure, and it is the only way
+  // to reach this path: a fatbin with a cubin for the device carries ptxas's own count (the branch above is skipped
+  // for it), so what is left is a device the fatbin has no machine code for, an sm_120 part under a build that stops
+  // at sm_100 say. Within the slack, the excess is charged as spill, as for a kernel past the ISA's registers.
+  // Past it the refusal stands: a launch several times over the file is not an estimate's error.
+  if (for_launch && profile.vendor == "nvidia" && !fn.sass && block_threads && profile.limits.registers_per_block) {
+    const uint64_t cap = uint64_t{profile.limits.registers_per_block} / block_threads / 8 * 8;
+    if (cap && usage.regs_per_thread > cap && usage.regs_per_thread <= cap * kPtxEstimateSlack) {
+      usage.spilled_regs += usage.regs_per_thread - static_cast<uint32_t>(cap);
+      usage.local_bytes += (usage.regs_per_thread - static_cast<uint32_t>(cap)) * 4u;
+      usage.regs_per_thread = static_cast<uint32_t>(cap);
+    }
   }
   KernelResources r;
   r.usage = usage;
@@ -17483,7 +17502,7 @@ void validate(const EntryFn& fn, const LaunchConfig& cfg, const DeviceProfile& p
   // than the device provides cannot be launched -- the same
   // "too many resources requested for launch" a real driver reports.
   KernelResources res = kernel_resources(fn, p, static_cast<uint32_t>(threads),
-                                         cfg.shared_bytes);
+                                         cfg.shared_bytes, true);
   uint64_t block_regs = uint64_t{res.usage.regs_per_thread} * threads;
   if (block_regs > p.limits.registers_per_block)
     throw Error::make(Err::LaunchResources, "too many resources requested for launch: kernel '",

@@ -324,6 +324,40 @@ VTEST(register_budget_refuses_an_impossible_launch) {
   VCHECK_CONTAINS(err.what(), "too many resources requested for launch");
 }
 
+VTEST(a_ptx_estimate_a_little_over_the_block_file_launches_with_spill) {
+  // The register count of a kernel run from PTX is an estimate (peak live virtual registers), and ptxas needs fewer
+  // than it: ggml's rms_norm_f32<1024> measured 88 and launches on an RTX PRO 6000 with 1024 threads, which allows 64.
+  // An estimate that overshoots the block's file by less than the slack launches, the excess charged as spill; one
+  // several times over still does not (register_budget_refuses_an_impossible_launch).
+  std::string body = ".reg .b64 %rd<100>;\n";
+  for (int i = 1; i <= 46; ++i)
+    body += "mov.u64 %rd" + std::to_string(i) + ", " + std::to_string(i) + ";\n";
+  for (int i = 2; i <= 46; ++i)
+    body += "add.s64 %rd1, %rd1, %rd" + std::to_string(i) + ";\n";
+  body += "ret;\n";
+  auto m = ptx::parse(std::string(kHeader) + ".visible .entry k()\n{\n" + body + "}\n");
+  auto raw = ptx::analyze_registers(m.entries[0]);
+  VCHECK(raw.regs_per_thread > 64 && raw.regs_per_thread <= 128);  // over a 1024-thread block's file, inside the slack
+
+  MemoryManager mem(1 << 20);
+  DeviceProfile prof = load_gpu("nvidia/rtx-pro-6000");
+  LaunchConfig cfg;
+  cfg.block = {1024, 1, 1};
+  exec::launch(m.entries[0], cfg, {}, mem, prof);
+
+  auto res = exec::kernel_resources(m.entries[0], prof, 1024, 0, true);
+  VCHECK_EQ(res.usage.regs_per_thread, 64u);
+  VCHECK_EQ(res.usage.spilled_regs, raw.regs_per_thread - 64u);
+  // A query (cudaFuncGetAttributes, occupancy) is not a launch: it reports the estimate as it is.
+  auto query = exec::kernel_resources(m.entries[0], prof, 1024, 0);
+  VCHECK_EQ(query.usage.regs_per_thread, raw.regs_per_thread);
+  VCHECK_EQ(query.usage.spilled_regs, 0u);
+  // At a block size the estimate fits, nothing is clamped.
+  auto small = exec::kernel_resources(m.entries[0], prof, 256, 0);
+  VCHECK_EQ(small.usage.regs_per_thread, raw.regs_per_thread);
+  VCHECK_EQ(small.usage.spilled_regs, 0u);
+}
+
 VTEST(simple_kernel_matches_hardware_register_count) {
   // A one-store kernel measured 8 registers on a physical RTX 3060; the
   // estimate agrees after rounding to the allocation granularity.

@@ -411,14 +411,70 @@ inline T nan_rule(uint8_t rule, T x, T y, T z) {
   }
 }
 // The lanes of a binary32 result that are NaNs (among EXEC's), done again by the interpreter's rule from the operands the kernel had.
-[[gnu::noinline]] void fix_nan32(uint8_t rule, uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex) {
+// A lane with a NaN operand takes the first NaN operand in the rule's order, quieted (the nan_order.hpp helpers' rule: a NaN operand makes
+// the operation's result a NaN, so the operation need not be made to find out); only a lane whose NaN is made by the operation itself
+// (inf - inf, 0 * inf) is computed again. The rule is a template argument so the lane loop has no switch in it.
+template <uint8_t Rule>
+struct NanOrder32 {
+  // The operands the helper the rule names looks at, in the order it looks (indexes into a, b, c).
+  static constexpr bool kYFirst = Rule == kNanAdd || Rule == kNanMul || Rule == kNanSubRev || Rule == kNanFma;
+  static constexpr int kFirst = kYFirst ? 1 : 0, kSecond = kYFirst ? 0 : 1;
+  static constexpr bool kThree = Rule == kNanFma || Rule == kNanPkFma;
+};
+// Every lane of the row (N of them, a constant so the loop is vectors): where the result is a NaN and an operand is one, the first NaN operand
+// in the rule's order, quieted. Returns whether some lane's result is a NaN with no NaN operand (the operation made it: inf - inf, 0 * inf),
+// which only the scalar rule below can say. Lanes off in EXEC are computed too, and are not used.
+template <uint8_t Rule, unsigned N>
+[[gnu::always_inline]] inline bool fix_nan32_lanes(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c) {
+  using O = NanOrder32<Rule>;
+  const uint32_t* const ops[3] = {a, b, c};
+  const uint32_t* const p0 = ops[O::kFirst];
+  const uint32_t* const p1 = ops[O::kSecond];
+  uint32_t need = 0;
+  for (unsigned l = 0; l < N; ++l) {
+    const uint32_t rv = r[l], v0 = p0[l], v1 = p1[l], v2 = c[l];
+    const bool made = (rv & 0x7FFFFFFFu) > 0x7F800000u;
+    const bool n0 = (v0 & 0x7FFFFFFFu) > 0x7F800000u, n1 = (v1 & 0x7FFFFFFFu) > 0x7F800000u;
+    const bool n2 = O::kThree && (v2 & 0x7FFFFFFFu) > 0x7F800000u;
+    const uint32_t pick = n0 ? v0 : n1 ? v1 : v2;
+    const bool has = n0 | n1 | n2;
+    r[l] = made && has ? pick | 0x400000u : rv;
+    need |= made && !has;
+  }
+  return need != 0;
+}
+template <uint8_t Rule>
+void fix_nan32_rule(uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex) {
+  using O = NanOrder32<Rule>;
+  if (!(lanes_of(ex) == 64 ? fix_nan32_lanes<Rule, 64>(r, a, b, c) : fix_nan32_lanes<Rule, 32>(r, a, b, c))) return;
   for (uint64_t m = ex; m; m &= m - 1) {
     const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
     if ((r[l] & 0x7FFFFFFFu) <= 0x7F800000u) continue;
-    float x, y, z, v;
-    std::memcpy(&x, &a[l], 4), std::memcpy(&y, &b[l], 4), std::memcpy(&z, &c[l], 4);
-    v = nan_rule<float>(rule, x, y, z);
-    std::memcpy(&r[l], &v, 4);
+    const uint32_t v[3] = {a[l], b[l], c[l]};
+    bool found = false;
+    for (int k = 0; k < (O::kThree ? 3 : 2); ++k) {
+      const uint32_t w = v[k == 0 ? O::kFirst : k == 1 ? O::kSecond : 2];
+      if ((w & 0x7FFFFFFFu) > 0x7F800000u) {
+        r[l] = w | 0x400000u;
+        found = true;
+        break;
+      }
+    }
+    if (found) continue;
+    float x, y, z, o;
+    std::memcpy(&x, &v[0], 4), std::memcpy(&y, &v[1], 4), std::memcpy(&z, &v[2], 4);
+    o = nan_rule<float>(Rule, x, y, z);
+    std::memcpy(&r[l], &o, 4);
+  }
+}
+[[gnu::noinline]] void fix_nan32(uint8_t rule, uint32_t* r, const uint32_t* a, const uint32_t* b, const uint32_t* c, uint64_t ex) {
+  switch (rule) {
+    case kNanAdd: return fix_nan32_rule<kNanAdd>(r, a, b, c, ex);
+    case kNanSub: return fix_nan32_rule<kNanSub>(r, a, b, c, ex);
+    case kNanSubRev: return fix_nan32_rule<kNanSubRev>(r, a, b, c, ex);
+    case kNanMul: return fix_nan32_rule<kNanMul>(r, a, b, c, ex);
+    case kNanFma: return fix_nan32_rule<kNanFma>(r, a, b, c, ex);
+    default: return fix_nan32_rule<kNanPkFma>(r, a, b, c, ex);
   }
 }
 [[gnu::noinline]] void fix_nan64(uint8_t rule, uint64_t* r, const uint64_t* a, const uint64_t* b, const uint64_t* c, uint64_t ex) {

@@ -6479,6 +6479,123 @@ placement results of the library in both directions, as the sp13 and sp14 rounds
 * `run_groups` (the wave stepping loop, 10 to 27% of the memory and control rows) is where the per-instruction overhead of the interpreter sits, as `step_warp` is for SASS; the sp14 round's work on the SASS run loop has no AMD twin yet.
 * ASan, UBSan and TSan were not run on this change; it touches no threaded or atomic code, and the buffers are fixed-size stack arrays of twice the wave size.
 
+## Round sp18 (SASS): the global-memory path (branch `sp18-sass`, base `sp17-speed` dd3adb43)
+
+The question: what does the SASS tier spend its instructions on in the gather-bound real programs, and in the issue loop? Measured first, on server3 (Zen 4), with `perf record -e instructions:u -c 1000000` on one thread (`VGPU_THREADS=1`, SASS, `nvidia/rtx3060`), PolyBench/GPU and Rodinia from the Round sp8 corpus, and the canary workloads with `-c 2000000`.
+
+### What the profile said (base build, share of instructions retired)
+* ATAX: `warp_rows_k` 24%, `load_batch` 14%, `h_global<false>` 9%, `load_broadcast` 8%, `store_run` 6%, `load_run` 6%, **`find_ordinary_miss` 5%**, `count_global_progression` 5%, `step_warp` 3%. SYR2K: `load_batch` 26%, `warp_rows_k` 17%, `h_global<false>` 8%, `count_global_progression` 8%, `load_broadcast` 7%, `find_ordinary_miss` 2.5%.
+* `warp_rows_k` (the full warp's addresses, window and stride tests) was 166 instructions with six 32-byte spills to the stack (the chain of eight expected-address vectors the compiler hoisted).
+* `count_global_progression` was a function of its own: six pushes and pops around a dozen operations, and `memcount::fast()` read through the GOT (two loads of a guard and a flag) on every counted access.
+* `find_ordinary_miss`: a kernel that reads A, then x, then writes y asks the thread's lookup memory for three allocations in turn, and the lookup tries the way that answered *last* first, which is the allocation of the instruction before. So most accesses of such a kernel took the miss path (a call, a loop over the ways, the epoch tests). Each global instruction reads the same allocation every time.
+* The issue loop (`step_warp`, which holds `tier_run_t`): 9% of `int_alu`, 27% of `warp`, 36% of `divergent`, 45% of `shared` (barrier turns), 3 to 6% of the real programs, and **flat**: in a 100,000-instruction sample of `shared` no instruction of `step_warp` has more than 5.6% of the function's samples (the top one is the epilogue's `pop`s: a call per warp turn), the rest is a few percent each. The per-instruction `++st.instructions; st.thread_instructions += lanes; st.inst_by_class[cls] += lanes` and the `w.steps` update are memory read-modify-writes, but `w.steps` is read by S2R CLOCK in `exec.cpp` and the counters by the fallback handlers, so keeping them in registers needs a flush before every call out of the loop. Not attempted (see Not done).
+
+### What changed
+1. **A hint for the allocation lookup** (`MemoryManager::find_ordinary(addr, len, base, hint)`; `MOp::way`). Each global op keeps the way of the lookup memory its allocation was last found in and passes it (`&op.way`) to `load_batch`, `store_batch`, `load_broadcast`, `store_strided`, `load_run`, `store_run`; the lookup asks that way first instead of `mem.last`. The hint is only where to look first: any byte (masked to the ways), none, another thread's (read and written with relaxed atomics), stale after a free (the epoch test still decides). The thread's `last` and `prev` ways are not touched by a hit.
+2. **`warp_rows_k` without the spills**: each group of four addresses is compared with the one before it plus `4 * stride` (the first with `a0 + 0..3 * stride`, by starting `prev` one step back) instead of with a chain of expected addresses; the constant-window test takes the unsigned minimum (`vpminud`) of `(a - window)` over the groups and looks at the high halves once at the end instead of compare-and-or per group; the three shapes (`lo` and `hi` rows, `lo` only, neither) are three instantiations, not tests in the loop. About 165 to about 115 instructions, no spill.
+3. **`count_global_progression` inlined** into the handler, with `fast` the launch's own copy of `VGPU_FASTCOUNT` (`Runner::fastcount_`, sampled at launch).
+4. `lookups()` (the thread's lookup memory, found by the thread pointer in a table of slots): the first probe inline, the rest in a function of its own (it was a call and a loop set-up on every lookup). `load_broadcast` fills its 32 entries with a counted loop of fixed length (sixteen stores).
+
+### Results (counters and outputs identical in every run)
+Zen 4 (server3), one thread, `perf stat -e instructions:u,cycles:u`, alternating A B, medians, Mann-Whitney p on cycles; A = base build (dd3adb43), B = this branch, each built here and frozen. CPU 13 for the first table (its SMT sibling was used by another session during parts of the run: the A/A of that window drifted to 1.04 on ATAX, so the rows were repeated on CPU 4 with an idle sibling: ATAX 0.866, GEMM 0.916, BICG 0.926, MVT 0.901, the same as below).
+| program | runs | instructions B/A | cycles B/A | p |
+|---|---:|---:|---:|---:|
+| polybench ATAX | 9 | 0.819 | 0.864 | <0.001 |
+| polybench BICG | 9 | 0.850 | 0.930 | 0.019 |
+| polybench GESUMMV | 9 | 0.877 | 0.924 | 0.031 |
+| polybench MVT | 9 | 0.834 | 0.894 | 0.005 |
+| polybench GEMM | 9 | 0.833 | 0.913 | <0.001 |
+| polybench SYR2K | 5 | 0.887 | 0.914 | 0.009 |
+| polybench SYRK | 5 | 0.920 | 0.924 | 0.009 |
+| polybench 3MM | 5 | 0.844 | 0.919 | 0.009 |
+| polybench CORR | 5 | 0.956 | 0.937 | 0.60 |
+| polybench 2DCONV (no change expected) | 9 | 0.987 | 0.991 | 0.07 |
+| polybench JACOBI2D | 9 | 0.988 | 0.975 | <0.001 |
+| rodinia needle | 9 | 1.000 | 0.981 | 0.004 |
+| rodinia hotspot | 9 | 0.997 | 1.007 | 0.002 |
+| rodinia gaussian | 9 | 0.994 | 0.982 | <0.001 |
+| rodinia pathfinder | 9 | 0.999 | 0.988 | 0.97 |
+| rodinia backprop | 9 | 0.977 | 1.000 | 0.97 |
+| rodinia lud | 9 | 0.998 | 0.996 | 0.024 |
+| polybench GRAMSCHM (702 G cycles a run) | 3 | 0.861 | 0.969 | 0.05 |
+| polybench FDTD-2D (494 G cycles a run) | 3 | 0.972 | 0.977 | 0.13 |
+A/A (A against itself): ATAX 0.999, GEMM 0.999 (CPU 4, 9 runs); on CPU 13 (sibling busy) needle 1.000, hotspot 1.001, 2DCONV 1.004, GEMM 1.001, ATAX 1.041.
+
+`bench.py --ab` canary (13 workloads x SASS and PTX, 9 runs, CPU 4, load 8 to 11 from other sessions): counters `identical` in all 28 rows; the only row the script calls different is `mem` SASS 1.052x (p 0.024; its A/A is 1.007x); every other row is inside its own A/A spread (0.97 to 1.03): `divergent` SASS 1.019x (A/A 0.989x), `shared` SASS 1.016x, `local` 1.010x, `int_alu` 1.010x, `api` SASS 1.017x (A/A 0.987x), `launch` SASS 1.002x. The PTX rows (1.00 +- 0.02) run the same memory manager with no hint.
+
+Step by step (single runs, instructions B/A on ATAX / GEMM / SYR2K): the new `warp_rows_k` alone 0.978 / 0.978; plus the inlined counting, the inline first probe and the broadcast fill 0.939 / 0.948 / 0.942; plus the hint 0.819 / 0.833 / 0.887.
+
+### Tried and not kept
+* `-fno-semantic-interposition` on the hot units (the memory manager's functions are called through the PLT inside the library, and GCC will not inline an exported function): instructions -0.4% on top of the above, cycles +4.4% (ATAX), -1.4% (GEMM), +4.5% (SYR2K): a layout re-roll, not a gain. Dropped.
+
+### Tests (CMake-wired, no GPU) and mutations
+* `test_memfast`: `a_lookup_hint_is_only_a_place_to_look_first` (random, stale, out-of-range and no hints for `load_batch`, `load_broadcast` and `load_run` over twelve allocations (more than the eight ways) against the words stored; every 700 iterations an allocation is freed and the calls with every hint must decline its addresses, then a new one is made) and `more_threads_than_lookup_slots_all_read_the_right_words` (1,300 threads alive at once, over the 1,024 slots, each reading through the scalar, batch and broadcast paths).
+* `test_sass_mem_rows` (existing, holds the AVX2 kernel to the lane definitions over 3 kinds of rows x 34 positions of a lane in the window or off the stride x 8 adds x 12 bases x 16 strides) also with `VGPU_SIMD=base`; `test_warp_stride_access` (broadcast counts 1 to 32).
+* Mutants built and run on server3 (each killed unless noted): window minimum taken as a maximum; `prev` not advanced; `prev` not started a step back; step doubled; window test without the shift (and with the wrong shift); high half shifted by 31; broadcast fill one lane short; first probe inverted; hint hit skipping the epoch test; hint hit returning a wrong base. Survived, equivalent: the group difference written as a subtraction instead of an xor (same zero test); the probe loop returning the slot of the first probe instead of the probed one (another thread's lookup memory: the answers are the same and only a data race, which TSan, not run here, would flag); the hint not masked to the ways (reads past the entries: caught only by ASan, not run here).
+* Also run, all pass: `test_tier`, `test_sass_alu_runs`, `test_sass_atomics`, `test_sass_block_reuse`, `test_sass_dispatch`, `test_sass_generic_mem` (and with `VGPU_SIMD=base`), `test_gather_sp10`, `test_memhot_sp8`, `test_memcopy_direct`, `test_sass_access_count`, `test_memrmw`, `test_memalloc`, `test_sass_ldgsts`, `test_hostmap_cache`, `test_exec`, `test_exec2`, `test_fastpath`, `test_sched`, `test_sass_lockfree`, `lint_hot_unit_layout`. Sources compile with g++-12 (`-fsyntax-only`). Not run: the sanitizer builds and the AMD guards (CI).
+
+### Not done
+* The issue loop: its profile is flat and the per-instruction counters need a flush protocol around every call out of the loop (S2R CLOCK reads `w.steps`; the fallback handlers read the counters). Hoisting `tier_stats_` and `max_steps_` into locals was not tried: the loop has no spare register (its comment says so).
+* Calls inside the library go through the PLT (`batch_faults_clear`, `find_ordinary_miss`, `host_map_free_span`'s callees): `-Wl,-Bsymbolic-functions` would remove it but changes which copy of a function the shim libraries that each carry the core bind to; not looked at beyond the flag above.
+* `load_batch` (13 to 26% of the gather rows) is 14 instructions a lane and bound by the L1 misses; `load_broadcast` is still about 110 instructions a call (the fault checks, the lookup, the chunk test, the fill).
+* `POPC` calls libgcc's `__popcountdi2` per lane (3% of `int_alu`): the AVX2 unit is compiled with `target("avx2")` and no `popcnt`.
+
+## Round sp19 (AMD): the LDS-load double free, and gathered dwordx3/dwordx4 stores on AMD (branch `sp19-amd`, base `sp18-amd` bf4e7622)
+
+### A correctness bug first
+`VGPU_GATHER_ONLY=dwordx4 test_amd_gcn_gather_same_bits` aborted with "double free or corruption". Root cause: `global_load_lds` (gfx950's `global_load_lds_dwordx4` and its siblings) checked `at + bytes > lds.size()` with `at = M0 + offset + lane * bytes` in 64 bits. The corpus line `global_load_lds_dwordx4 v[2:3], off offset:-16` with M0 = 0 gives `at = 2^64 - 16` on lane 0, the sum wraps to 0, the check passes, and the `memcpy` wrote 16 bytes in front of the LDS vector's storage: heap metadata, found by the next `free`. The filter only exposed it because the instructions before it in the corpus left the heap in a state where the damage was caught. It is now `at > size || bytes > size - at` (same in `scratch_load_lds`, where the same offset also feeds `scratch_at` first, so the wrap is not reachable there by a negative offset; changed for the same reason, not separately tested). Test: `a_load_into_lds_below_address_zero_is_refused` in `test_amd_gcn_gather_same_bits` (flavour 16, every register zero) reads the refusal from the error text, because the corruption itself is silent. Mutant (check put back to `at + bytes > size`): killed (the instruction is then not refused). The whole unfiltered test and `VGPU_GATHER_ONLY=dwordx4` pass.
+
+### Gathered dwordx3 / dwordx4 stores
+`Machine::wave_store_words` (defined after the class, as `wave_load4` is): a store of three or four words a lane whose lanes make no run went lane by lane through `store_words`. Now one `MemoryManager::store_batch` of 4-byte stores in lane order (lane 0's words, lane 1's, ...), single host thread only (`conc()` false). Lane order is kept, so lanes whose quads overlap leave the same bytes whatever the access sizes were; a declined batch (fault armed, host mapping, address off a word or outside the first allocation) has changed nothing and the lanes go one at a time as before.
+
+Results (counters identical, Zen 5, server2 cpu 13, one thread, A = `sp18-amd` + the fix, W = this branch; load 4 to 5). Microbenchmark `x4s` (16K threads x 2048 scattered `float4` stores, 16-byte slots for variant 0, 4-byte-aligned addresses for variant 1; the final memory hash is equal on A and W): gfx942 variant 0 0.52 s -> 0.27 s (0.52x), variant 1 0.56-0.64 s -> 0.31 s (0.52-0.55x); gfx1030 (`amd/rx6800`) 0.57 -> 0.32 s and 0.60 -> 0.36 s. No real program of the PolyBench set stores quads that make no run, so none moves; the claim is for kernels that scatter `float4` or `float3` results (the loads of the same shapes were Round sp18).
+
+`bench-amd` canary (mi300x, 44 rows, one thread, 15 runs, cpu 13): counters identical in all rows (`--check-counters`: 66 pairs match). W/A, with an A/A of a copy in brackets: `mfma` 1.031 (1.003), `smfmac` 1.042 (1.031), `mfma_fp8` 1.063 (1.001), `mfma_bf16` 1.030 (1.002), `flat` 1.028 (0.984), `valu_int` 1.023 (1.011), `mem` 1.002 (0.984), `divergent` 1.003 (0.943), `atomics` 0.976 (1.008, p 0.005), `smem` 0.983 (0.997), `p_smem_wide` 0.966 (0.963), `p_sbuf` 0.995 (1.000); the launch rows swing 0.94 to 1.08 between two copies of A and are not claimed. The only W-specific loss is `atomics` at -2.4 %. This is the layout lottery again (`gcn_exec.cpp` is edited): the rows that Round sp17 lost on Zen 5 (`mfma`, `smfmac`, `divergent`) are at or above 1.00 against `sp18-amd`; `lint_hot_unit_layout` passes.
+
+### Tests and mutants
+`test_amd_gcn_gather_same_bits` (flavours 21 to 24 run every `global_store_dwordx3/x4` and `flat_store_dwordx3/x4` of the five corpora, lane by lane against the tier with batches on) passes, as do `test_amd_gcn_tier_same_bits`, `test_amd_gcn_same_bits`, `test_amd_gcn_memory_same_bits`. Mutants of `wave_store_words`, each run against the test: lanes in reverse order: killed (2288 runs differ); the last word of each lane dropped: killed (2978); starting from lane 0 instead of `from`: survived, equivalent (lanes before `from` are stored again with the same data before any later lane, so the final bytes are the same); not testing `conc()`: survived (the test runs one thread).
+
+### Not done
+Item 3 (the AMD rows lost to layout on Zen 5) was not attempted: with A/A swings of 2 to 6 % on `divergent`, `launch_*` and `p_lane` between copies of the same library, nothing cheap can be told from noise on this box.
+
+## Round sp18 (AMD): NaN lanes and gathered quad loads (branch `sp18-amd`, base `sp17-speed` dd3adb43)
+
+Two of the three items Round sp17 left (`run_groups` was looked at again and left alone: about 45 instructions of bookkeeping around each handler call, spread over four read-modify-write counters, the state checks of `tier_step` and the `Inst::next` chain, nothing small and bit-safe; the `divergent` row says what an edit near it costs in layout). Measured with a sampling profiler (an `LD_PRELOAD` `SIGPROF` sampler resolved against `nm`; `perf` is not allowed on server2) on the 19 PolyBench/GPU programs hipified and built for gfx942 (`hipcc -O2`, dimensions capped at 512 / 160 / 1536, one thread, `amd/mi300x`).
+
+### What changed
+1. `fix_nan32` (`amd/src/gcn_tier.cpp`; 13.5 % of GRAMSCHM, 9.4 % of LU): a lane whose result is a NaN was recomputed by the interpreter's rule, a switch on the rule per lane and a `std::fma` call even where an operand is a NaN, which already says the answer (the first NaN operand in the rule's order, quieted). Now one template per rule, a row pass (32 or 64 lanes, a constant, so GCC makes vectors of it) that does the lanes with a NaN operand without computing anything, and the old per-lane rule only for a lane whose NaN the operation itself made (`inf - inf`, `0 * inf`), and only if there is one.
+2. `Machine::wave_load4` (`amd/src/gcn_exec.cpp`, defined after the class so no member of the machine moves; hooked in `tier_global`): `global_load_dwordx4` / `flat_load_dwordx4` whose lanes make no run (a gather of float4s, or quads on a 4-byte boundary) went lane by lane through `load_words` and `load_quad`. Now two batches, as `load_wave` and `wave_load3` do: a lane on an 8-byte boundary is two 8-byte loads (what a quad on a 16-byte boundary and the two pairs of a 8-byte one give), any other lane an 8-byte load in the middle and a word at each end. The quad's 16-byte access becomes two 8-byte ones, which only a thread writing the quad at that moment could tell, so the batch is made only when `conc()` is false. Stores of the same shapes are unchanged (they must keep lane order across mixed sizes).
+
+### Results (counters identical; Zen 5, server2, cpu 13, `VGPU_THREADS=1`, user-time median of 9 runs, A = `sp17-speed`, W = this branch, A2 = a copy of A in the same window; load 4 to 5)
+| program | W/A | A2/A | | program | W/A | A2/A |
+|---|---:|---:|---|---|---:|---:|
+| GRAMSCHM | **0.858** | 0.997 | | GEMM | 0.997 | 0.994 |
+| LU | **0.913** | 0.990 | | 3MM | 0.975 | 1.000 |
+| X4 (float4 gathers, below) | **0.410** | 1.023 | | 2MM | 0.981 | 0.995 |
+| SYR2K | 0.995 | 1.003 | | SYRK | 0.997 | 1.000 |
+| CORR | 0.994 | 0.994 | | COVAR | 0.989 | 1.004 |
+| FDTD-2D | 0.994 | 0.986 | | JACOBI2D | 1.001 | 1.001 |
+| 2DCONV | 1.027 | 0.994 | | 3DCONV | 0.989 | 0.994 |
+| ATAX | 0.982 | 0.984 | | BICG | 0.955 | 0.988 |
+| GEMVER | 0.978 | 0.998 | | GESUMMV | 1.025 | 0.961 |
+| MVT | 1.017 | 1.011 | | | | |
+The programs under 0.1 s (2DCONV, ATAX, BICG, GEMVER, GESUMMV, MVT) time start-up and swing as far between copies of A as W does; none of them is claimed. `X4` is a kernel of 16 K threads that load a `float4` from 64 random 16-byte slots each (variant 0) and from random 4-byte-aligned addresses (variant 1): the sim's output hash is the same on A and W for gfx942 and gfx1030, and equals the real RX 6800's (`amd/rx6800` and the card: `d5a8901c3ed4a983` / `8813586ecd033783`).
+
+`bench-amd` canary (mi300x, 44 rows, one thread, 15 runs, cpu 13): counters identical in all 44 rows (and `--check-counters`: 66 workload/target pairs match). W/A, with the A/A of a copy in brackets: `mfma` 1.016 (1.004), `smfmac` 1.012 (1.001), `divergent` 1.018 (1.021), `mem` 0.999 (1.000), `flat` 1.048 (0.989), `smem` 1.030 (0.947), `narrow` 1.019 (1.008), `mfma_fp8` 1.044 (1.000), `p_i64` 1.037 (1.004), `valu_int` 0.988 (0.984), `atomics` 0.989 (0.993); no row below 0.98. The -3 % of `mfma` / `smfmac` and the -2 to -4 % of `divergent` that Round sp17 measured against the round before are not in these numbers against `sp17-speed`, and rows that swing between two copies of the same library (`smem`, `p_sbuf` 1.070, `p_smem_wide` 1.044, `launch`) are not claimed either way. Not recovered by design: that loss is the placement of `gcn_exec.cpp`, which a change anywhere in that unit re-rolls.
+
+### The layout lottery, again
+The first version of `wave_load4` was a member defined in the middle of the memory path: CORR 1.04 to 1.06, COVAR 1.03 at equal counters (other rows 2 to 3 % faster). Defining it after the class (the `noinline` stays on the declaration) took CORR and COVAR back to 0.998 / 0.984 and moved the rest within the A/A. The `fix_nan32` change is in `gcn_tier.cpp`, a unit outside link-time optimization, and moved no other row (checked alone: CORR 0.994, GEMM 1.000). `lint_hot_unit_layout` passes.
+
+### Tests (CMake-wired, existing) and mutations
+No new test file: the existing same-bits tests already drive both paths, so the evidence is the mutants they kill (each mutant built and run alone against the whole unit).
+* `test_amd_gcn_tier_same_bits` (flavour 2: floats with the specials and NaNs, every `v_*_f32` shape of the five corpora, tier on against tier off). Killed: the add, mul, subrev and fma operand order flipped, the packed fma order flipped, the NaN not quieted, the second operand taken after the third, only the first operand looked at, a 32-lane pass over a 64-lane wave. Survived, equivalent: the third operand ignored (the lane then takes the scalar rule, which gives the same bits) and the scalar fallback never run (the vector result of `inf - inf` is the scalar rule's, the default NaN).
+* `test_amd_gcn_gather_same_bits` (flavours 21 to 24 hold `global_load_dwordx4` / `flat_load_dwordx4` lanes on every boundary, with lanes on one address and one lane off). Killed: the last word at +8, the pair halves swapped, the word and the last word swapped, a batch of 4-byte loads one short. Survived, equivalent: the high pair at +4 and the middle pair at +8 (the batch declines on the misaligned 8-byte load and the lanes go one at a time, correctly), the same-address rule dropped (loads, single thread), `conc()` not tested (the test runs one thread), the alignment test of the addresses dropped (the batch declines itself). Also: `test_amd_gcn_same_bits`, `test_amd_gcn_memory_same_bits`, `lint_hot_unit_layout` and `bench-amd --check-counters` pass.
+* The substring filter `VGPU_GATHER_ONLY=dwordx4` aborts with a double free on `sp17-speed` too (`load_dwordx4` and the other filters pass); not looked into.
+
+### Not done
+* `run_groups` (above), and a gfx1030/gfx942 real-card A/B of quad stores. `dwordx4` stores that are not runs still go lane by lane.
+* The AMD rows are measured on Zen 5 only; Zen 4 was not part of this round.
+
 ## Round sp17: the AMD memory path on real programs (branch `sp17-amd`, base `sp15-speed-pr` 4a5185a3)
 
 The question: the sp16 profile of the real programs put a quarter of the AMD cycles in the memory path (`wave_scalars`, `tier_global`, `memory_run`, `load_batch_in`, `batch_addresses_ok`; 78 % of SYR2K) and 12 % in the `run_groups` loop. Measured first, with `perf record -e cycles:u` on the 20 PolyBench/GPU programs hipified and built for gfx942 (`hipcc -O2`, one thread, `amd/mi300x`), then changed in the order the profile gave.
@@ -6668,3 +6785,54 @@ The SASS engine and programs with no module do not change (the `mem` row is 1%, 
 * Mutations, each rebuilt and run on server3, each fails a test: threshold back to 2 MiB (the first), threshold 0 (the second and `unsupported_ptx_error_names_profile`), no name tie-break (the third), eleven opcodes shown instead of ten (the fourth).
 
 Not run: the e2e suite (no nvcc on server3); the nightly lazy-modules workflow and the regular CI cover it, and ASan, UBSan and TSan (the change adds no shared state).
+
+## Round sp20 (zen5-check): `sp18-speed` against `sp17-speed` on Zen 5 (docs only, no code changed)
+
+The question: does the combined branch (`sp18-speed` db576493 = SASS global-memory path + sp18-amd + sp19-amd) lose anywhere against `sp17-speed` dd3adb43 on Zen 5? Host server2 (Ryzen 9 9950X), Release, GCC 13.3, `VGPU_THREADS=1`, every run pinned to cpu 13, load 4 to 7 (timed runs wait for load < 8), `nice -n 19`. A and W were built from `git archive` trees in separate directories, then the build directories were copied at the same moment to equal-length paths (`runA`, `runW`) with an A/A copy (`runB`, a third copy of A's bytes). Counters identical in every row of the SASS/PTX canary and the 44-row mi300x canary; outputs identical in every PolyBench and Rodinia program except `particlefilter_float` (DIFFER in A/A as well: the known nondeterministic program).
+
+### SASS and PTX canary (`bench.py --ab`, 13 workloads x 2 engines, 15 runs; W/A median ratio, > 1 means W is faster; A/A in brackets)
+| row | SASS | PTX |
+|---|---:|---:|
+| int_alu | 0.993 (1.001) | 0.997 (0.998) |
+| f32_fma | 1.010 (1.012) | 0.999 (1.001) |
+| f64_fma | 0.995 (0.990) | 1.002 (0.995) |
+| wmma | 1.000 (0.999) | 0.991 (1.002) |
+| mma_ptx | 0.997 (0.999) | **1.042** (1.005) |
+| mem | **1.043** (1.007) | 1.000 (0.992) |
+| shared | **1.035** (1.004) | 1.000 (0.957) |
+| atomics | 0.980 (1.013) | 0.995 (1.002) |
+| local | 1.003 (0.999) | 0.983 (0.996) |
+| divergent | 1.014 (0.997) | 0.996 (0.998) |
+| warp | 1.002 (1.011) | 1.002 (1.000) |
+| launch | 1.013 (0.999) | 0.997 (0.970) |
+| api | 1.007 (1.010) | 1.007 (1.004) |
+
+No row loses 3 %. The two rows under 0.985 (SASS `atomics` 0.980, PTX `local` 0.983) are inside the A/A swing of the window's other rows (PTX `shared` 0.957 and PTX `launch` 0.970 in the A/A; SASS `atomics` read 1.013 in it).
+
+### Real programs (`real.py`, cpu 13, 7 runs, 3 for programs over 30 s; W over A of the median wall time; A/A of the same window: 0.98 to 1.02 in every row)
+PolyBench (gather rows first): ATAX 1.16, GEMM 1.13, 3MM 1.12, MVT 1.12, SYR2K 1.09, SYRK 1.09, GESUMMV 1.09, JACOBI1D 1.09, BICG 1.05, 2MM 1.05, CORR 1.03, COVAR 1.04, FDTD-2D 1.04, GRAMSCHM 1.04, LU 1.02, GEMVER 1.04, 3DCONV 1.02, 2DCONV 1.02, JACOBI2D 1.03, ADI 1.03 (geometric mean 1.064x, no program under 1.00). Rodinia: sc_gpu 1.06, particlefilter_float 1.04 (outputs differ in the A/A too), backprop 1.03, needle 1.02, lud 1.01, hotspot / gaussian / lavaMD / srad_v2 1.00, nn 1.01, bfs 1.04 (10 ms, start-up), pathfinder 0.99 (geometric mean 1.013x). The programs under 0.3 s time start-up as much as simulation.
+
+### mi300x AMD canary (`bench-amd`, 44 rows, 15 runs; W/A, A/A in brackets; the rows that moved)
+Faster: `mfma_fp8` 1.053 (0.976), `p_smem_wide` 1.048 (0.991), `mfma_bf16` 1.041 (0.990), `mfma` 1.037 (0.989), `flat` 1.033 (0.992), `p_perm` 1.028 (1.023), `divergent` 1.025 (1.009). Four rows read 0.95 to 0.97: `p_lane` **0.946** (A/A 1.004), `p_sdwa` 0.968 (1.007), `smem` 0.963 (0.979), `p_sbuf` 0.970 (0.971); `atomics` 0.975 (0.997). Everything else 0.98 to 1.02. The `mfma` / `smfmac` / `divergent` losses that Round sp17 measured are not present against `sp17-speed`.
+
+A repeat of those rows (21 runs, three windows) gave the same: `p_lane` 0.944 / 0.949 (A/A 1.005), `p_sdwa` 0.969 / 0.971 (0.998), `smem` 0.966 / 0.973 (0.980), `p_sbuf` 0.968 / 0.967 (0.970), `atomics` 0.988 / 0.983 (1.013).
+
+### The cause of `p_lane` and `p_sdwa`: the copy of the library, not the code
+`p_lane` is a 15 ms device phase and the 0.9 ms gap is the whole-process gap (user time +0.7 ms, page faults equal at 803 / 804). The profile (SIGPROF sampler, 15 samples) puts the time in the same handlers in A and W, and none of them is touched by `sp18-speed` (`h_int_avx2`, `run_lane`, `h_readlane`; the AMD changes are `fix_nan32` and the dwordx3/x4 memory path). `libamdhip64.so.6.4` of the two differ, but the hot handlers sit at the same 64-byte offsets in both. What decides it is the file copy. Median device CPU time of `p_lane`, 31 interleaved runs, byte-identical copies of A's build and of W's build, all copied at the same moment:
+
+| build directory | bytes of | p_lane device ms | p_sdwa device ms |
+|---|---|---:|---:|
+| runA | A | 14.8 | 74.0 |
+| runB (the A/A) | A | 14.7 | 73.4 |
+| runA3 | A | 15.7 | 73.7 |
+| runA4 | A | 15.7 | 73.8 |
+| runW | W | 15.7 | 76.0 |
+| runW3 | W | 15.6 | 74.2 |
+| runW4 | W | 15.6 | 74.5 |
+
+Three copies of A's bytes give 14.8 / 14.7 / 15.7 / 15.7, so `p_lane` moves by 6 % between copies of one library; W's copies are all on the slow side. An earlier pair did the same (an unrelated one-function edit to `src/core/error.cpp`, which leaves `libamdhip64` byte-identical in A and in W: the edited A copy read 15.4 ms, the edited W copy 14.7 ms, the reverse of the unedited pair). Page-cache placement of the mapped file (physical addresses of the text pages) is the only thing that differs, so this is Round sp16's "copies of one library differ", and an A/A made with one copy cannot see it: here the A/A copy happened to land with A. `p_sdwa` is the same effect at 1 to 3 % (W copies 74.2 to 76.0 against A copies 73.4 to 74.0). `smem` and `p_sbuf` have the same sign in the A/A (0.979 / 0.971). No code was changed; a fix by layout is not possible for page placement.
+
+### Caveats
+* The A/A control is one copy; the p_lane table shows that several copies are needed for a 15 ms row. Rows under 20 ms (`p_lane`, `p_dpp*`, `startup`) are not claimed either way.
+* The PolyBench programs here are the MINI datasets scaled by the corpus (0.1 s to 120 s); GEMM-class programs measure at 0.5 s and mostly time the host reference check as well.
+* Zen 4 was not part of this round. Timed windows were at load 4 to 7 from other sessions.

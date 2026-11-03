@@ -1260,7 +1260,7 @@ void Device::run_kernel(const ptx::EntryFn& fn, const exec::LaunchConfig& in_cfg
     const uint64_t threads = uint64_t{cfg.block[0]} * cfg.block[1] * cfg.block[2];
     if (threads && threads <= profile_.limits.max_threads_per_block) {
       try {
-        const exec::KernelResources res = exec::kernel_resources(fn, profile_, static_cast<uint32_t>(threads), cfg.shared_bytes);
+        const exec::KernelResources res = exec::kernel_resources(fn, profile_, static_cast<uint32_t>(threads), cfg.shared_bytes, true);
         cfg.resident_blocks = uint64_t{res.occupancy.blocks_per_sm} * profile_.limits.multiprocessors;
       } catch (const Error&) {
         // The launch's own checks report what is wrong with the kernel; the blocks just run as before.

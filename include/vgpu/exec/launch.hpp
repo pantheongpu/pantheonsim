@@ -162,9 +162,11 @@ struct KernelResources {
 };
 
 // Computes a kernel's register footprint and its occupancy at `block_threads`
-// on `profile`. Cached per kernel; deterministic.
+// on `profile`. Cached per kernel; deterministic. `for_launch` is set by the launch itself: a PTX-only estimate
+// slightly over the block's register file is then clamped to it (the excess is charged as spill) so the launch goes
+// ahead; a query for attributes or occupancy reports the estimate as it is.
 KernelResources kernel_resources(const ptx::EntryFn& fn, const DeviceProfile& profile,
-                                 uint32_t block_threads, uint32_t dynamic_shared = 0);
+                                 uint32_t block_threads, uint32_t dynamic_shared = 0, bool for_launch = false);
 
 // Counters for a launch. Everything here is counted exactly as it happens
 // rather than sampled, which is the one thing a simulator can offer that

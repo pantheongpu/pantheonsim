@@ -3122,9 +3122,11 @@ void count_run(exec::LaunchStats& st, bool store, uint64_t g0, unsigned first, u
 // count_access of a full warp's global access whose 32 addresses are known to be a0 + l * stride (modulo 2^64): counted by the closed forms of a
 // progression without a pass over the addresses (memcount::full_warp_progression_sectors). False, with nothing counted, when they do not apply (the
 // caller then counts the addresses as count_access does).
-bool count_global_progression(exec::LaunchStats& st, bool store, uint64_t a0, uint64_t stride, uint32_t bytes) {
+// (Inlined into the tier's global-access handler: as a function of its own it saved and restored six registers for a dozen operations, and asked
+// VGPU_FASTCOUNT through the GOT; the caller asks `fast` of the launch's own copy.)
+[[gnu::always_inline]] inline bool count_global_progression(exec::LaunchStats& st, bool store, uint64_t a0, uint64_t stride, uint32_t bytes, bool fast) {
   uint64_t distinct;
-  if (!exec::memcount::fast() || !exec::memcount::detail::full_warp_progression_sectors(a0, stride, bytes, distinct)) return false;
+  if (!fast || !exec::memcount::detail::full_warp_progression_sectors(a0, stride, bytes, distinct)) return false;
   count_global(st, store, 32, bytes, distinct);
   return true;
 }

@@ -110,6 +110,7 @@ VTEST(exporting_an_allocation_brings_the_card_copy_back_first) {
   mm.share(a, path);   // the exported file is the allocation from here on (cudaIpcGetMemHandle)
   VCHECK(!gate.accesses.empty());
   VCHECK(gate.accesses[0].addr == a && !gate.accesses[0].write);
+  VCHECK(!gate.frees.empty() && gate.frees[0] == a);   // the allocation leaves the table for a file: the gate drops what it tracks of it
   mm.free(a);
   ::unlink(path.c_str());
 }
@@ -123,8 +124,30 @@ VTEST(nothing_is_asked_while_no_allocation_has_a_card_copy) {
   mm.write(a, buf.data(), 100);
   mm.read(a, buf.data(), 100);
   mm.store_scalar(a, 4, 1);
+  VCHECK(gate.accesses.empty());
   mm.free(a);
-  VCHECK(gate.accesses.empty() && gate.frees.empty());
+  VCHECK(gate.accesses.empty());   // (a free is not an access)
+}
+
+// The gate tracks allocations that hold no card copy too (a launch the size rule refused registers every live allocation), so it is told of every free:
+// an entry that outlives its allocation points into a freed record, and the next launch that goes to the card reads the freed range (HeCBench hadamard-cuda,
+// "illegal memory access" in most runs). Before, a free asked the gate only while some allocation held a card copy.
+VTEST(a_free_tells_the_gate_while_no_allocation_has_a_card_copy) {
+  MemoryManager mm(64 << 20);
+  FakeGate gate;
+  mm.set_card_gate(&gate);
+  const uint64_t a = mm.alloc(1 << 20), b = mm.alloc(1 << 20);
+  VCHECK_EQ(mm.card_resident_count().load(), 0);
+  mm.free(a);
+  VCHECK_EQ(gate.frees.size(), size_t{1});
+  VCHECK_EQ(gate.frees[0], a);
+  mm.free_all();   // the reset, and the sweep of what is left (b)
+  bool all = false, second = false;
+  for (uint64_t f : gate.frees) {
+    all = all || f == UINT64_MAX;
+    second = second || f == b;
+  }
+  VCHECK(all && second);
 }
 
 VTEST(a_zero_count_makes_the_allocation_ordinary_again) {

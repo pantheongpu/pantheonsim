@@ -93,4 +93,38 @@ VTEST(a_gather_or_a_run_then_a_gather_gives_the_bits_lane_by_lane_gives) {
   VCHECK(only || nonzero > 1000);
 }
 
+// A load into LDS whose LDS address is below zero (M0 0, offset -16, lane 0: 2^64 - 16) must be refused, not written. The bound was
+// `at + bytes > size`, which wraps to 0 here, so the 16 bytes went in front of the LDS buffer and the heap's next free() aborted
+// ("double free or corruption", seen as VGPU_GATHER_ONLY=dwordx4 aborting the test above). Every register is zero (flavour 16), so
+// M0 is 0 and lane 0 is the lane that wraps. The refusal is read from the error itself: the corruption is silent until a free().
+VTEST(a_load_into_lds_below_address_zero_is_refused) {
+  size_t seen = 0;
+  for (const Corpus& c : kCorpora) {
+    for (const std::string& line : lines_of(std::string(VGPU_SOURCE_DIR) + "/amd/tests/data/" + c.file)) {
+      if (line[0] == '#') continue;
+      const size_t tab = line.find('\t');
+      const std::string text = line.substr(tab + 1);
+      if (text.find("load_lds") == std::string::npos || text.find("offset:-") == std::string::npos) continue;
+      std::vector<uint8_t> code;
+      std::istringstream words(line.substr(0, tab));
+      for (std::string w; words >> w;) {
+        const uint32_t v = static_cast<uint32_t>(std::stoul(w, nullptr, 16));
+        for (int b = 0; b < 4; ++b) code.push_back(static_cast<uint8_t>(v >> (8 * b)));
+      }
+      amd::gcn::Inst in;
+      try {
+        in = amd::gcn::decode(code, 0, 0, c.target);
+      } catch (const std::exception&) {
+        continue;
+      }
+      std::string error;
+      amd::digest_instruction(in, c.target, 1, 16, &error);
+      ++seen;
+      if (error.find("writes LDS") == std::string::npos)
+        throw vtest::Failure(std::string(c.file) + ": " + text + " was not refused (error: '" + error + "')");
+    }
+  }
+  VCHECK(seen >= 1);
+}
+
 VTEST_MAIN

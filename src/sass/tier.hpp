@@ -190,6 +190,9 @@ struct MOp {
   // unguarded, with a handler, and a pure register form (no memory, no scheduler, nothing that can fault), none of them the section's last. Set
   // when the section's program is built (the analysis does not know the next instruction); 0 for an instruction that is not in such a stretch.
   uint8_t run = 0;
+  // A global access: the way of the thread's lookup memory this instruction's allocation was last found in (MemoryManager::find_ordinary's `hint`; only ever
+  // a place to look first, and read and written relaxed by whichever thread runs the op).
+  mutable uint8_t way = 0;
 };
 static_assert(sizeof(MOp) == 96, "an op is 96 bytes: a cache line and a half, which the run loop reads one after the other");
 inline constexpr uint16_t kNoReg = 0xffff;

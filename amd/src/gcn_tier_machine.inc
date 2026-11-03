@@ -83,7 +83,7 @@ int tier_global(Wave& w, Group& g, const Inst& in) {
   const uint32_t* const hi = in.has_saddr ? lo : w.vgpr[in.src[0].index + 1].data();
   bool try_runs = !sub_dword && (words == 1 || words == 2 || words == 4) && d.peers.empty() && runs_on;
   // Lanes whose addresses make no run go to memory together (wave_scalars), once: a byte, a short, a word or a pair a lane.
-  bool try_batch = (sub_dword || words <= 2 || (words == 3 && !is_store)) && d.peers.empty() && runs_on;
+  bool try_batch = (sub_dword || words <= 4) && d.peers.empty() && runs_on;
   uint64_t memo_addr = 0;
   bool memo = false;
   uint32_t memo_words[kMaxWords];
@@ -123,7 +123,9 @@ int tier_global(Wave& w, Group& g, const Inst& in) {
         }
       }
       const Narrow nr{words, in.fast.sub != 0};
-      if (words == 3 && !sub_dword ? wave_load3(w, lane, lane_addr, in.dst[0])
+      if (is_store && words >= 3 && !sub_dword ? wave_store_words(w, lane, lane_addr, in.src[1], words)
+          : words == 4 && !sub_dword && !is_store ? wave_load4(w, lane, lane_addr, in.dst[0])
+          : words == 3 && !sub_dword && !is_store ? wave_load3(w, lane, lane_addr, in.dst[0])
                                    : wave_scalars(w, is_store, lane, lane_addr, is_store ? in.src[1] : in.dst[0], sub_dword ? 1 : words, sub_dword ? &nr : nullptr))
         return 1;
     }

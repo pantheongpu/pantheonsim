@@ -23,6 +23,7 @@
 #include <thread>
 
 #include "vgpu/error.hpp"
+#include "vgpu/host_gpu_track.hpp"
 #include "vgpu/sass/exec.hpp"
 
 namespace vgpu::hostgpu {
@@ -161,12 +162,8 @@ struct Runtime::Impl : CardGate {
   // The card copy outlives a launch (docs/perf-design/09-host-gpu-spike.md section 4) unless VGPU_HOST_GPU_WRITE_THROUGH=1.
   bool resident = true;
   MemoryManager* gate_mem = nullptr;
-  struct Res {
-    uint64_t base = 0, size = 0;
-    Residency r;
-    std::atomic<uint32_t>* slot = nullptr;
-  };
-  std::map<uint64_t, Res> res;
+  using Res = Tracked;   // (vgpu/host_gpu_track.hpp)
+  TrackedMap res;
   // Scratch for the copies between the card and the simulator, kept across launches: a fresh 16 to 32 MiB vector per launch is an mmap, a zero fill and a
   // page fault per page each time (4.7 s of system time in 1,400 launches of PolyBench LU, against 0.6 s with the write-through path).
   std::vector<uint8_t> pull_buf, push_buf, sim_buf;
@@ -265,23 +262,13 @@ struct Runtime::Impl : CardGate {
     }
   }
 
-  // The tracked allocations are the live ones: new ones start Host (nothing of them is on the card).
+  // The tracked allocations are the live ones: new ones start Host (nothing of them is on the card), the ones that went are dropped (sync_tracked).
   void sync_tracking(MemoryManager& mem, const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
     if (gate_mem != &mem) {
       gate_mem = &mem;
       mem.set_card_gate(this);
     }
-    for (const auto& [b, s] : ranges) {
-      const auto it = res.find(b);
-      if (it != res.end() && it->second.size == s) continue;
-      Res a;
-      a.base = b;
-      a.size = s;
-      a.r = Residency((s + kChunkSize - 1) / kChunkSize);
-      a.slot = mem.card_slot(b);
-      if (!a.slot) continue;
-      res[b] = std::move(a);
-    }
+    sync_tracked(res, mem, ranges);
   }
 
   // ---- start-up of the real driver: lazy, and off the launch path ----
