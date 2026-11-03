@@ -1234,8 +1234,31 @@ class Parser {
     return ImmFloatBits{b, 32};
   }
 
+  // The operand of a unary '~' in an integer constant: a literal, another unary
+  // '-' or '~', or any of those in parentheses ("~0x2", "~~5", "~-1", "~(0x2)").
+  // Evaluated on the 64-bit value, as ptxas does; the instruction's type then
+  // keeps the low bits it needs, so ~0x2 is 0xfffffffd for .b32 and
+  // 0xfffffffffffffffd for .b64.
+  int64_t parse_unary_int_constant(size_t line) {
+    const Token& t = next();
+    if (t.kind == Token::Kind::Punct && t.text == "~") return ~parse_unary_int_constant(t.line);
+    if (t.kind == Token::Kind::Punct && t.text == "-") return negate(parse_unary_int_constant(t.line));
+    if (t.kind == Token::Kind::Punct && t.text == "(") {
+      const int64_t v = parse_unary_int_constant(t.line);
+      if (!peek_punct(")")) fail(t.line, "expected ')' to close the constant after '('");
+      next();
+      return v;
+    }
+    if (t.kind != Token::Kind::Word || !isdigit(static_cast<unsigned char>(t.text[0])) || decimal_float(t.text) ||
+        (t.text.size() == 10 && t.text[0] == '0' && (t.text[1] == 'f' || t.text[1] == 'F')) ||
+        (t.text.size() == 18 && t.text[0] == '0' && (t.text[1] == 'd' || t.text[1] == 'D')))
+      fail(t.kind == Token::Kind::End ? line : t.line, "'~' needs an integer constant, got '" + t.text + "'");
+    return parse_int_literal(t.text, t.line);
+  }
+
   Operand parse_operand() {
     const Token& t = next();
+    if (t.kind == Token::Kind::Punct && t.text == "~") return ImmInt{~parse_unary_int_constant(t.line)};
     if (t.kind == Token::Kind::Punct && t.text == "-") {
       std::string w = expect_word("number after '-'");
       if (decimal_float(w)) return decimal_float_operand(w, true, t.line);
