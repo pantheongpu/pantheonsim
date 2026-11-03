@@ -431,32 +431,34 @@ TIER_HANDLER(h_imad_wide) {
   if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
 }
 
+// IMAD.HI: bits 32..63 of a * b + c + the carry-in bit (c a 64-bit pair, or a 32-bit register extended by the sign of the product's kind), and
+// bit 64 of the sum as the carry out. That is the wide multiply-add's high word and carry (the same kernel as h_imad_wide, with the low word
+// thrown away), not a 128-bit sum for each lane.
 TIER_HANDLER(h_imad_hi) {
   TIER_PRELUDE
-  alignas(32) uint32_t t[3][32], tlo[32], thi[32], r[32];
+  alignas(32) uint32_t t[3][32], tlo[32], thi[32], rlo[32], rhi[32], mlo[32], mhi[32];
   const uint32_t *a = tier_src<false>(c, op.s[0], t[0]), *b = tier_src<false>(c, op.s[1], t[1]);
   const bool sgn = op.aux & 2, pair = op.aux & 4;
-  const uint32_t *clo, *chi = nullptr;
-  if (pair) tier_src64(c, op.s[2], tlo, thi, clo, chi);
-  else clo = tier_src<false>(c, op.s[2], t[2]);
-  const bool neg = op.s[2].mod & tier::kNeg;
-  const Mask cin = (op.aux & 1) ? tier_pmask(c, op.p) : 0;
-  Mask carry = 0;
-  for (unsigned l = 0; l < 32; ++l) {
-    const uint64_t prod = sgn ? static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(a[l])) * static_cast<int32_t>(b[l]))
-                              : static_cast<uint64_t>(a[l]) * b[l];
-    uint64_t cc;
-    if (pair) {
-      cc = clo[l] | (static_cast<uint64_t>(chi[l]) << 32);
-      if (neg) cc = 0 - cc;
-    } else {
-      cc = static_cast<uint64_t>(sgn ? static_cast<int64_t>(static_cast<int32_t>(clo[l])) : clo[l]);
+  const uint32_t *clo, *chi;
+  if (pair) {
+    tier_src64(c, op.s[2], tlo, thi, clo, chi);
+    if (op.s[2].mod & tier::kNeg) {   // the 64-bit addend negated, lane by lane, into rows of their own
+      for (unsigned l = 0; l < 32; ++l) {
+        const uint64_t cc = 0 - (clo[l] | (static_cast<uint64_t>(chi[l]) << 32));
+        mlo[l] = static_cast<uint32_t>(cc);
+        mhi[l] = static_cast<uint32_t>(cc >> 32);
+      }
+      clo = mlo;
+      chi = mhi;
     }
-    const unsigned __int128 sum = static_cast<unsigned __int128>(prod) + cc + ((cin >> l) & 1);
-    r[l] = static_cast<uint32_t>(sum >> 32);
-    carry |= static_cast<Mask>((sum >> 64) != 0) << l;
+  } else {   // a 32-bit addend, extended to 64 bits as the product is
+    clo = tier_src<false>(c, op.s[2], t[2]);
+    for (unsigned l = 0; l < 32; ++l) mhi[l] = sgn ? static_cast<uint32_t>(static_cast<int32_t>(clo[l]) >> 31) : 0u;
+    chi = mhi;
   }
-  tier_store(c, op.dst, ex, r);
+  uint32_t carry;
+  c.sk->imad_wide(rlo, rhi, a, b, clo, chi, sgn, (op.aux & 1) ? static_cast<uint32_t>(tier_pmask(c, op.p)) : 0u, &carry);
+  tier_store(c, op.dst, ex, rhi);
   if (op.dst2 != tier::kNoReg) tier_setp(c, op.dst2, ex, carry);
 }
 
@@ -1348,7 +1350,7 @@ static void h_shared(void* vc, const tier::MOp& op, Mask ex) {
       }
     }
   }
-  count_shared_offsets(blk.st, Store, offs, ex, bytes);
+  count_shared_offsets(blk.st, Store, offs, ex, bytes, &op.way);
 }
 
 // Local memory: each lane's window of the warp's array, when every active lane's access is inside the thread's frame.

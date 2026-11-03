@@ -127,9 +127,11 @@ struct Scaled {
   bool vcc;
 };
 
-// v_div_scale(S0, S1 = denominator, S2 = numerator).
+// v_div_scale(S0, S1 = denominator, S2 = numerator), the reference: written with the library's classification and scaling calls. The tier
+// and the interpreter run div_scale below, which gives these results (bits and condition) for every operand, with bit arithmetic
+// where all three of the numbers involved are normal; test_gcn_divide holds the two against each other.
 template <typename T>
-inline Scaled<T> div_scale(T s0, T s1, T s2) {
+inline Scaled<T> div_scale_reference(T s0, T s1, T s2) {
   using F = Fp<T>;
   Scaled<T> r{s0, false};
   if (s2 == 0 || s1 == 0) {
@@ -155,6 +157,55 @@ inline Scaled<T> div_scale(T s0, T s1, T s2) {
     } else if (e2 <= F::kTiny) {   // a tiny numerator
       r.value = std::ldexp(s0, F::kScale);
     }
+  }
+  return r;
+}
+
+// x * 2^k for a normal x and a result that is normal too: the exponent field moves, the rest is untouched (exactly what ldexp gives).
+// Anything else -- zero, a denormal, an infinity or a NaN, an exponent that leaves the normal range -- is the library's call.
+template <typename T>
+inline T scale_by_pow2(T x, int k) {
+  using F = Fp<T>;
+  using B = typename F::Bits;
+  const int ef = exponent_field(x);
+  if (ef >= 1 && ef < F::kMaxExp && ef + k >= 1 && ef + k < F::kMaxExp)
+    return from_bits<T>(bits_of(x) + static_cast<B>(static_cast<int64_t>(k) * (int64_t{1} << F::kMantissa)));
+  return std::ldexp(x, k);
+}
+
+// v_div_scale(S0, S1 = denominator, S2 = numerator). The same as div_scale_reference. When both S1 and S2 are normal numbers (the
+// usual case, and the only one where the reference needed no special handling) every test on them is a test of the exponent and
+// mantissa fields: the reference's classification, ilogb and scalbn calls were most of a division's time in the real programs.
+template <typename T>
+inline Scaled<T> div_scale(T s0, T s1, T s2) {
+  using F = Fp<T>;
+  using B = typename F::Bits;
+  const int e2 = exponent_field(s2), e1 = exponent_field(s1);
+  if (e1 < 1 || e1 >= F::kMaxExp || e2 < 1 || e2 >= F::kMaxExp) return div_scale_reference(s0, s1, s2);
+  Scaled<T> r{s0, false};
+  const B mant_mask = (B{1} << F::kMantissa) - 1;
+  if (e2 - e1 >= F::kFar) {
+    r.vcc = true;
+    if (s0 == s1) r.value = scale_by_pow2(s0, F::kScale);
+    return r;
+  }
+  // (S1 is not a denormal.) Its reciprocal is: exponent above 2^-kMinExp, or equal to it with a mantissa above 1.
+  const int d1 = e1 - F::kBias;
+  const bool rcp_denormal = d1 > -F::kMinExp || (d1 == -F::kMinExp && (bits_of(s1) & mant_mask) != 0);
+  // The quotient is below the smallest normal: the exponents differ by less than kMinExp, or by that and the numerator's mantissa
+  // is below the denominator's.
+  const int diff = e2 - e1;
+  const bool quotient_denormal = diff < F::kMinExp || (diff == F::kMinExp && (bits_of(s2) & mant_mask) < (bits_of(s1) & mant_mask));
+  if (rcp_denormal && quotient_denormal) {
+    r.vcc = true;
+    if (s0 == s1) r.value = scale_by_pow2(s0, -F::kScale);
+  } else if (rcp_denormal) {
+    r.value = scale_by_pow2(s0, -F::kScale);
+  } else if (quotient_denormal) {
+    r.vcc = true;
+    if (s0 == s2) r.value = scale_by_pow2(s0, F::kScale);
+  } else if (e2 <= F::kTiny) {
+    r.value = scale_by_pow2(s0, F::kScale);
   }
   return r;
 }

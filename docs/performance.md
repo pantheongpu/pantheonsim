@@ -6540,6 +6540,47 @@ Step by step (single runs, instructions B/A on ATAX / GEMM / SYR2K): the new `wa
 * `load_batch` (13 to 26% of the gather rows) is 14 instructions a lane and bound by the L1 misses; `load_broadcast` is still about 110 instructions a call (the fault checks, the lookup, the chunk test, the fill).
 * `POPC` calls libgcc's `__popcountdi2` per lane (3% of `int_alu`): the AVX2 unit is compiled with `target("avx2")` and no `popcnt`.
 
+## Round sp21 (AMD): float division on real HIP programs (branch `sp21-amd`, base `origin/main` 179c886f)
+
+Question: where does the AMD tier spend its time on real HIP programs, beyond PolyBench? Built for gfx942 with `hipcc -O2` after `hipify-perl`: 18 of 22 HeCBench programs (the reduced set's `-cuda` sources; `attention` needs `cooperative_groups/reduce.h`, `bh` a 64-bit `__shfl_sync` mask, `black-scholes` and `s3d` do not hipify cleanly) and 8 Rodinia apps (hotspot, gaussian, needle, pathfinder, bfs, lud, nn, srad; backprop's C files do not compile as hip). Profiled with the `LD_PRELOAD` `SIGPROF` sampler (`tools/bench-amd/profile`, `SIGPROF_STACK=1` for callers), one thread, `amd/mi300x`. Most of them finish in under a second at their reduced sizes; the ones with seconds in them:
+
+| program | top of the profile (self time) |
+|---|---|
+| bilateral | `h_div` 28 %, libm `ldexpf` 19 %, `modf` 14 %, `ilogb` 4 % (the libm entries are called from `h_div`: 265 of 342 `ldexpf` samples, all of the `ilogb`) |
+| aobench | `h_div` 19 %, `h_f32_avx2` 17 %, `ldexpf` 10 %, `run_groups` 12 % |
+| aidw | `h_div` 14 %, `h_f32_avx2` 13 %, `h_pk` 12 %, `ldexpf` 10 %, `modf` 6 % |
+| radixsort2 | `vector_alu` lambda 17 %, `run_groups` 15 %, `wave_scalars` 14 %, `h_cndmask_avx2` 8 %, `load_batch` 7 % |
+| shmembench | `h_ds_avx2` 38 %, `ds_run_read` 20 %, `run_groups` 19 %, `ds_run_write` 19 % (already SIMD; a bandwidth test) |
+
+### What changed
+`v_div_scale_f32/f64` (`div_scale` in `amd/src/gcn_divide.hpp`, run per lane by the tier's `h_div`) classified its operands with `fpclassify`, `isfinite`, `ilogb` and `scalbn` and scaled with `ldexp`, all libm calls: every float division is two `v_div_scale`. When S1 and S2 are normal numbers (the usual case) every test is now a test of the exponent and mantissa fields (`div_scale`), and the scaling by 2^+-64 / 2^+-128 moves the exponent field of a normal number (`scale_by_pow2`; zero, denormals, infinities, NaNs, or a result out of the normal range go to `ldexp`). Any other operand takes the old code, kept as `div_scale_reference`. The interpreter (`gcn_exec.cpp`) calls `div_scale_reference`: it stays the independent oracle for the tier's same-bits tests, and its machine code is what it was (editing the inlined code of `gcn_exec.cpp` re-rolled the layout of the whole AMD canary: first attempt with the interpreter on the new code lost 3 to 6 % on `valu_int`, `smem`, `mfma_i8`, `p_smem_wide`, `launch_*`).
+
+### Results (Zen 5, server2 cpu 13, `VGPU_THREADS=1`, user-time median of 9 alternating runs, A = origin/main, W = this branch, counters equal, program output (stdout without timing lines, and files) equal in every run)
+| program | A (s) | W (s) | W/A |
+|---|---:|---:|---:|
+| silu | 0.78 | 0.38 | **0.487** |
+| bilateral | 2.00 | 0.96 | **0.480** |
+| aobench | 0.90 | 0.61 | **0.678** |
+| aidw (10 0 1) | 41.7 | 32.0 | **0.767** |
+| hotspot (512) | 0.15 | 0.11 | 0.733 |
+| lud (1024) | 0.76 | 0.74 | 0.974 |
+| gaussian, needle, srad | 0.43, 0.24, 0.08 | same | 1.000 |
+| radixsort2 | 5.36 | 5.48 | 1.022 |
+| shmembench | 3.12 | 3.11 | 0.997 |
+Rows under 0.3 s time start-up as much as the tier; hotspot's 0.15 s is within a couple of timer ticks of 0.11 s, not a claim. radixsort2 and shmembench use no division and are the controls (no A/A copy was timed for the programs).
+
+`bench-amd` canary (mi300x, 44 rows, one thread, 15 runs, cpu 13; `--check-counters`: 66 workload/target pairs match): no division in the canary, so it only measures layout. W/A: `mfma` 1.012, `mfma_i8` 0.978 (A against a copy of A: 0.987), `smfmac` 1.006, `narrow` 0.970 (A/A 1.007), `p_smem_wide` 0.943 (A/A 0.989; stable in a re-run, 0.944), `mem` 0.992, `smem` 1.008, `flat` 1.003, `atomics` 0.984 (re-run 1.008), `divergent` 0.996, `valu_int` 0.992, `p_sbuf` 1.040 (A/A 0.960..1.012), `p_lane` 0.996; the other rows within 0.99..1.03. Two rows lose at equal counters and are not recovered: `p_smem_wide` -5.6 % and `narrow` -2 %, which moved with a no-op change to which unit holds the division code (a `noinline` wrapper of `div_scale` in the tier changed neither) and are the placement lottery of Round sp14 again. `lint_hot_unit_layout` passes.
+
+### Tried and dropped
+`v_ldexp_f32` (`k_fldexp`, `__builtin_ldexpf` per lane; 3 % of bilateral): the same bit trick (no libm call for a normal number that stays normal) made it 2 to 3 % faster there and `p_lane` 4.5 % slower at equal counters, from the placement of the handlers behind it in `gcn_tier.cpp`; not kept. Tier-mutants of that version (bound `<= 255`, shift 22) were killed by `test_amd_gcn_tier_same_bits`.
+
+### Tests and mutants
+`test_amd_gcn_divide` (existing, in CI): `a_float_div_scale_is_the_reference_for_every_operand`, `a_double_...` (the edge values squared, random operands of every exponent, exponent differences at the quotient's two ends, denormals; S0 each of the denominator, the numerator and a third value; the value's bits and the condition equal to `div_scale_reference`) and `scaling_by_a_power_of_two_is_ldexp` (every edge value and random ones, k from -300 to 300). The reference is the old code, so no golden value is recorded. The tier's `test_amd_gcn_tier_same_bits` (interpreter on the reference, tier on the new code, every `v_div_scale` of the corpora) passes. Mutants of the fast path, each built and run against the test: `d1 > -kMinExp` to `>=`: killed (2 tests fail); `e2 - e1 >= kFar` to `>`: killed; `diff < kMinExp` to `<=`: killed; mantissa test `<` to `<=`: killed; `e2 <= kTiny` to `<`: killed; the exponent range test of `scale_by_pow2` `< kMaxExp` to `<=`: killed (3 fail); `>= 1` to `>= 0`: killed (3 fail).
+
+### Not done
+* `radixsort2`'s `vector_alu` lambda / `wave_scalars` / `run_groups` share (the next biggest real-program cost seen) and the other division instructions (`v_div_fmas`/`v_div_fixup` are cheap, `scaled_fma` only runs with VCC set).
+* RX 6800 (gfx1030) builds of the programs were not timed; `div_scale` is shared, so the effect is the same code.
+
 ## Round sp19 (AMD): the LDS-load double free, and gathered dwordx3/dwordx4 stores on AMD (branch `sp19-amd`, base `sp18-amd` bf4e7622)
 
 ### A correctness bug first
@@ -6836,6 +6877,48 @@ Three copies of A's bytes give 14.8 / 14.7 / 15.7 / 15.7, so `p_lane` moves by 6
 * The A/A control is one copy; the p_lane table shows that several copies are needed for a 15 ms row. Rows under 20 ms (`p_lane`, `p_dpp*`, `startup`) are not claimed either way.
 * The PolyBench programs here are the MINI datasets scaled by the corpus (0.1 s to 120 s); GEMM-class programs measure at 0.5 s and mostly time the host reference check as well.
 * Zen 4 was not part of this round. Timed windows were at load 4 to 7 from other sessions.
+
+## Round sp21 (rodinia-profile): shared-memory bank counting and IMAD.HI (branch `sp21-rodinia`, base `origin/main` 179c886f)
+
+The question: where do the Rodinia rows and the stencil PolyBench rows (hotspot, needle, pathfinder, gaussian, lud, backprop, 2DCONV, 3DCONV, JACOBI2D, FDTD-2D) spend their instructions, and which handlers have avoidable work? Measured on server3 (Zen 4), one thread, SASS, `nvidia/rtx3060`, `perf record -e instructions:u -c 1000000` and `-e cycles:u -c 400000`, corpora of `tools/bench/real`.
+
+### What the profile said (base build, share of instructions retired)
+* needle: `step_warp` 23%, **`sass_bank_passes_offsets` 17%**, `h_shared<false>` 10%, `sass_bank_passes_widened` 4.5%. lud: `h_shared<false>` 18%, **`sass_bank_passes_offsets` 13%** (and 60% of its cycles are the program's own `lud_verify`). hotspot: `step_warp` 18%, bank passes 7%, `h_shared<false>` 7%. backprop: `step_warp` 17%, **`h_imad_hi` 9.3%**, `load_batch` 7%. gaussian: `step_warp` 14%, `sectors_hash` 8%, `init_block` 14% of the cycles (38% of it two `rep stos`: the register file and the shared array of every block). pathfinder and lud are mostly the program's own host code and libc `random`. 2DCONV, 3DCONV, JACOBI2D: `step_warp` 14 to 26%, `load_run` 6 to 12%, `warp_rows_k` 5 to 9%, `run_allocation` 4%, `count_run` 3 to 7%.
+* `sass_bank_passes_offsets` counted, per call, from the entry that answered last, with a 32-entry table. Counting its calls (a temporary counter, not kept): needle 3.1 M calls, **21% of them misses** (each takes `sass_bank_passes_widened`, about 400 instructions) although the kernel has only some hundred shapes; lud 15.5 M calls, 88% full warps, the entry that answered last answered only 58% (a loop that alternates two shapes asks for the other one every time, and then pays the hash and a second compare); hotspot 85% last-entry hits. The misses of needle were not a capacity matter (a table of 128 changed nothing): the hash samples eight lanes of the key (1, 3, 6, 10, 15, 21, 26, 31), and a partial warp has most of those lanes at zero in the key (a lane that does not run is taken at the first lane's word), so the forty masks of a wavefront's diagonals were all one slot and evicted each other.
+* `h_imad_hi` made a 128-bit sum for each lane (about 25 instructions a lane, scalar), for the high word of a * b + c: the wide multiply-add kernel (`imad_wide`) already computes that sum modulo 2^64 with the carry out.
+
+### What changed
+1. **Bank passes**: (a) the hash takes the lane mask, so shapes that differ in the mask alone no longer share a slot; (b) 128 entries for the 32-bit table (`BankMemo::kEntries32`; the 64-bit table keeps 32); (c) `MOp::way` (unused by a shared access until now) is the instruction's own entry, asked first instead of the one that answered last (`sass_bank_passes_offsets(..., hint)`; only ever a place to look first, read and written relaxed, masked to the table); (d) the partial-mask rows come from a 16-row table instead of being built from the nibble with five vector operations a group.
+2. **IMAD.HI** through `c.sk->imad_wide` (low word thrown away, `rhi` stored, the carry out as before): the 32-bit addend extended by the sign of the product's kind, the negated 64-bit addend made in rows as `h_imad_wide` does.
+
+### Results (counters and outputs identical in every row: `VGPU_COUNTERS=1` stdout/stderr hashed with the timing lines dropped)
+Zen 4 (server3), one thread, cpu 4, `perf stat -e instructions:u,cycles:u`, alternating A B, 9 runs (FDTD-2D 3), medians, Mann-Whitney p on cycles; A = origin/main 179c886f, B = this branch, each built here and frozen. Load 1 to 9 from other sessions. A/A (A against itself, 9 runs): cycles 0.999 to 1.020 (backprop 1.020 p 0.10, JACOBI2D 1.010, the others 1.000 +- 0.002), instructions exactly 1.0000.
+| program | instructions B/A | cycles B/A | p |
+|---|---:|---:|---:|
+| rodinia needle | 0.9436 | 0.9287 | <0.001 |
+| rodinia backprop | 0.9267 | 0.9065 | <0.001 |
+| rodinia lud | 0.9889 | 0.9866 | <0.001 |
+| rodinia hotspot | 0.9992 | 0.9919 | 0.45 |
+| rodinia gaussian | 1.0000 | 1.0044 | 0.06 |
+| rodinia pathfinder | 1.0010 | 1.0061 | 0.20 |
+| polybench 2DCONV | 1.0000 | 1.0155 | 0.10 |
+| polybench 3DCONV | 1.0000 | 1.0134 | 0.007 |
+| polybench JACOBI2D | 1.0000 | 0.9932 | 0.35 |
+| polybench FDTD-2D (480 G cycles a run, 3 runs) | 1.0000 | 1.0203 | 0.05 |
+| polybench ATAX | 1.0000 | 0.9995 | 0.57 |
+| polybench GEMM | 1.0000 | 0.9916 | 0.12 |
+The stencil rows have no shared memory and no IMAD.HI: their instructions are exactly equal and the +1 to +2% of cycles on 2DCONV, 3DCONV and FDTD-2D is where the linker put the code (the hot units moved with the edits to `tier_ops.inc` / `exec_ops.inc`; a first build that also had the change below read gaussian +3.1% and FDTD-2D +1.5%, the same lottery with another roll). Not fixed, as in the rounds before (see sp4 to sp10). `lint_hot_unit_layout` passes. The bench.py canary could not be run: server3 has no nvcc for its program (the key of the cached program includes the nvcc path).
+
+### Tried and not kept
+* `MemoryManager::run_out` / `run_in` (the 128-byte runs of the stencil loads and stores) four words to a step instead of one: 6 instructions per 8 bytes become about 2.75; instructions -2.2% on 2DCONV, 3DCONV, JACOBI2D and -2.2% on FDTD-2D, cycles -0.3% to -2.8% (3DCONV 0.975, p 0.002), but gaussian +3.1% in the same build with equal instructions (layout). With the change taken out gaussian reads +0.4% (p 0.06). Reverted (commit kept in the history, then its revert): a win in instructions that the cycles do not show on three of four rows and that costs a layout roll.
+* A table of 128 entries alone (without the mask in the hash): needle's misses stay at 21%.
+* Left alone: `init_block`'s two `rep stos` (gaussian; the register file and shared array of every block must be zero, so it is the memory traffic), `sectors_hash` (gaussian), `step_warp` (flat, see sp18).
+
+### Tests (CMake-wired, no GPU) and mutations
+* `test_bank_memo`: `an_entry_hint_is_only_a_place_to_look_first` (hints: per instruction, another instruction's, any byte, none; four shapes with different answers, masks drawn from four; the table must not enter its back-off), `warps_that_differ_in_the_mask_alone_do_not_all_share_one_slot` (sixteen masks over lanes the hash does not sample), `every_nibble_of_a_partial_mask_selects_its_own_lanes_in_the_key` (two masks that differ in one group of four lanes, every pair of 16 patterns, 8 groups, six random word assignments each: random masks never differ in one group alone).
+* `test_sass_alu_runs`: `imad_hi_gives_the_interpreters_registers_and_counters_signed_unsigned_and_negated` (IMAD.HI and IMAD.HI.U32 with a pair addend R0:R1 .. R8:R9 or RZ, negated or not, 12 seeds, 32/33/100 threads, tier against `VGPU_FASTPATH=0`; also under `VGPU_TIER=0`). The 32-bit addend form (`!(aux & 4)`) is not reachable from an encoding this assembler makes and is not covered by a test; it is the `h_imad_wide` extension rule written the same way.
+* Mutants built and run on server3 (each killed): hash without the mask (hash-collision test); partial-mask rows 5, 6 and 15 wrong, row 8 zeroed (nibble tests; rows 5/6/15 survived the first two versions of the test, which is why the pairs test exists); hint hit answering with the wrong entry's passes; a hint miss that skips the key compare; IMAD.HI: negation ignored, low word stored, sign ignored, negated high word shifted by 33. Survived, equivalent in results: the hint ignored in favour of the last entry (a performance change only; checked by the instruction counts above).
+* Also run, all pass: `test_tier`, `test_sass_mem_rows` (and `VGPU_SIMD=base`), `test_memfast`, `test_sass_dispatch`, `test_sass_block_reuse`, `test_memalloc`, `test_exec`, `test_memhot_sp8`, `test_gather_sp10`, `test_sass_generic_mem` (and `VGPU_SIMD=base`), `test_warp_stride_access`, `test_sass_access_count`, `test_memrmw`, `test_memcopy_direct`, `test_fastpath`, `test_memcpy_chk`, `test_jit_resid`, `test_sass_atomics`, `test_sass_ldgsts`, `test_sched`, `lint_hot_unit_layout`. Not run: sanitizer builds, the AMD guards, the canary harness (CI).
 
 ## Round sp21 (address rows) (branch `sp21-addr`, base `main` 85ec63a5)
 

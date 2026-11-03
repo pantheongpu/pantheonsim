@@ -2929,7 +2929,7 @@ struct Machine {
     if (op.size() > 4 && op.compare(op.size() - 4, 4, "_f64") == 0) {
       const double s0 = lane_double(w, in.src[0], lane), s1 = lane_double(w, in.src[1], lane), s2 = lane_double(w, in.src[2], lane);
       if (op == "v_div_scale_f64"_op) {
-        const auto r = gcn::divide::div_scale(s0, s1, s2);
+        const auto r = gcn::divide::div_scale_reference(s0, s1, s2);
         write_lane64(w, in.dst[0], lane, as_bits(r.value));
         if (r.vcc) sdst_bits |= uint64_t{1} << lane;
       } else if (op == "v_div_fmas_f64"_op) {
@@ -2941,7 +2941,7 @@ struct Machine {
     }
     const float s0 = lane_float(w, in.src[0], lane), s1 = lane_float(w, in.src[1], lane), s2 = lane_float(w, in.src[2], lane);
     if (op == "v_div_scale_f32"_op) {
-      const auto r = gcn::divide::div_scale(s0, s1, s2);
+      const auto r = gcn::divide::div_scale_reference(s0, s1, s2);
       write_lane(w, in.dst[0], lane, as_bits(r.value));
       if (r.vcc) sdst_bits |= uint64_t{1} << lane;
     } else if (op == "v_div_fmas_f32"_op) {
