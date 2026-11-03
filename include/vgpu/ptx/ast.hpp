@@ -953,7 +953,9 @@ struct OpSet {
 struct OpSelp { Type ty; Reg dst; Operand a, b; Reg pred; };
 // and/or/xor.pred. Either source may be an immediate, which nvcc emits for
 // a negation (`xor.pred %p2, %p1, -1`): non-zero is true in every lane.
-struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; int8_t a_imm = -1, b_imm = -1; };
+// A source written `!%p` is complemented before the operation (neg_a, neg_b); on an immediate the complement
+// applies to its truth value.
+struct OpPredBin { PredBinOp op = PredBinOp::And; Reg dst; Reg a, b; int8_t a_imm = -1, b_imm = -1; bool neg_a = false, neg_b = false; };
 struct OpNotPred { Reg dst; Reg src; };
 // atom and red are the same instruction; red is the form that discards the
 // old value. nvcc emits it whenever the result of an atomicAdd() is unused,
@@ -1328,10 +1330,12 @@ struct MicroOp {
                         Float64, Fma64, MovImm64, CvtF2I, CvtF2F, Unpack64, Pack64 };
   enum Flags : uint8_t { kSigned = 1, kFloat = 2, kHasPred = 4, kPredNeg = 8, kLeft = 16, kWrap = 32,
                          kDstWide = 64, kFtz = 128 };
+  static constexpr uint8_t kPredOpMask = 0x0F, kPredNegA = 0x10, kPredNegB = 0x20;
   Kind kind = None;
   uint8_t sub = 0;        // IntBinOp, FloatBinOp or CmpOp, by kind; Cvt, CvtI2F: the source's width in bits;
                           // Sign32: 1 for neg, 0 for abs; Fma32: bit 0 negates the product, bit 1 the addend;
-                          // MovSreg: the Sreg (255: the warp size); LdParam: the bytes read; PredBin: PredBinOp;
+                          // MovSreg: the Sreg (255: the warp size); LdParam: the bytes read; PredBin: PredBinOp (kPredOpMask), plus
+                          // kPredNegA / kPredNegB for a source written !%p;
                           // PopcClz32: 1 for popc, 0 for clz; Shfl32: ShflMode, plus 4 when it writes a predicate
                           // (its id in `pred`; such a shfl has no guard); Vote: VoteMode, plus 4 for a negated
                           // source and 8 for ballot; CarryAddSub32, CarryMadLo32: IntBinOp (add, sub) or 0, plus 64 for

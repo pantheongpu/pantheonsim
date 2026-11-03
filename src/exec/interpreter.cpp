@@ -4832,7 +4832,9 @@ class Interpreter {
   [[gnu::noinline]] bool micro_pred_bin(Warp& w, const MicroOp& u, Mask fm) {
     Mask a, b;
     if (!micro_pred(w, u, 0, a) || !micro_pred(w, u, 1, b)) return false;
-    const PredBinOp o = static_cast<PredBinOp>(u.sub);
+    if (u.sub & MicroOp::kPredNegA) a = ~a;
+    if (u.sub & MicroOp::kPredNegB) b = ~b;
+    const PredBinOp o = static_cast<PredBinOp>(u.sub & MicroOp::kPredOpMask);
     const Mask r = o == PredBinOp::And ? (a & b) : o == PredBinOp::Or ? (a | b) : (a ^ b);
     w.written32[u.dst] = 1;
     Mask& p = w.preds[u.dst];
@@ -9029,8 +9031,10 @@ class Interpreter {
       return;
     }
     if (const auto* op = std::get_if<OpPredBin>(&ins.op)) {
-      const Mask a = op->a_imm >= 0 ? (op->a_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->a);
-      const Mask b = op->b_imm >= 0 ? (op->b_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->b);
+      Mask a = op->a_imm >= 0 ? (op->a_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->a);
+      Mask b = op->b_imm >= 0 ? (op->b_imm ? ~Mask{0} : 0) : read_pred(w, ins, op->b);
+      if (op->neg_a) a = ~a;
+      if (op->neg_b) b = ~b;
       Mask r = op->op == PredBinOp::And ? (a & b) : op->op == PredBinOp::Or ? (a | b) : (a ^ b);
       Mask& p = pred_slot(w, op->dst);
       p = (p & ~m) | (r & m);

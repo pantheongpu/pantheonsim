@@ -389,7 +389,7 @@ void build_micro(EntryFn& fn) {
       ok = a_ok && b_ok && narrow_dst(op->dst);
       if (ok) {
         u.kind = MicroOp::PredBin;
-        u.sub = static_cast<uint8_t>(op->op);
+        u.sub = static_cast<uint8_t>(op->op) | (op->neg_a ? MicroOp::kPredNegA : 0) | (op->neg_b ? MicroOp::kPredNegB : 0);
         if (op->a_imm >= 0) { u.src_imm |= 1; u.src[0] = op->a_imm ? 1 : 0; } else { u.src[0] = op->a.id; }
         if (op->b_imm >= 0) { u.src_imm |= 2; u.src[1] = op->b_imm ? 1 : 0; } else { u.src[1] = op->b.id; }
       }
