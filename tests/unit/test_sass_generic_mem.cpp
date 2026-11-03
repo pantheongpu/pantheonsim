@@ -93,6 +93,8 @@ constexpr uint32_t kIn = 8192, kShared = 4096;
 
 Insn movi(unsigned d, uint32_t imm) { return make(0x000fe20000000f00ull, lo_of(0x7802, d, 0, imm)); }
 Insn imad_wide_g(unsigned d, unsigned a, uint32_t imm, unsigned c, unsigned guard) { return make(0x000fe200078e0000ull | c, lo_of(0x0825 | guard << 12, d, a, imm)); }
+// IMAD.WIDE.U32 Rd, P0, Ra, imm, Rc: the carry out of the 64-bit sum goes to P0 (bits 81..83 of the word, PT in the others)
+Insn imad_wide_p0(unsigned d, unsigned a, uint32_t imm, unsigned c) { return make(0x000fe20007800000ull | c, lo_of(0x7825, d, a, imm)); }
 Insn lds(unsigned d, unsigned a, uint32_t imm) { return make(0x000e220000000800ull, 0x7984ull | uint64_t{d} << 16 | uint64_t{a} << 24 | uint64_t{imm} << 40); }
 
 // size codes of the instruction: 0 U8, 1 S8, 2 U16, 3 S16, 4 32 bits, 5 64, 6 128. guard: 7 none, 0 @P0, 8 @!P0.
@@ -118,13 +120,13 @@ Insn stg_e(unsigned size, unsigned a, unsigned data, uint32_t off, unsigned guar
 constexpr uint32_t kK[4] = {0x9e3779b1u, 0x85ebca6bu, 0xc2b2ae35u, 0x27d4eb2fu}, kC = 0x01234567u;
 
 // Registers: R1 tid, R3 tid * 4, R4:R5 the address, R6:R7 the buffer, R8:R9 the output, R10 a word read back, R11 a constant, R12..R15 the data.
-// mode 0: every lane's address is in the shared window (tid * D), 1: global (base + tid * S), 2: shared for tid < 16 and global for the rest, 3: as 1 with LDG and STG, 4: as 3 with the lanes in reverse order (lane l at base + (31 - l) * S: a warp that goes DOWN memory), 5: as 3 with the stride doubling from lane 16 (a full warp in global memory that is NOT on a stride).
+// mode 0: every lane's address is in the shared window (tid * D), 1: global (base + tid * S), 2: shared for tid < 16 and global for the rest, 3: as 1 with LDG and STG, 4: as 3 with the lanes in reverse order (lane l at base + (31 - l) * S: a warp that goes DOWN memory), 5: as 3 with the stride doubling from lane 16 (a full warp in global memory that is NOT on a stride), 6: as 3 with every lane of the first warp at the one address (P0 is tid >= 32 here) and the lanes of the others at base + tid * S (the shape of a full warp changes from one warp of the block to the next).
 std::vector<Insn> kernel(unsigned mode, uint32_t S, uint32_t D, unsigned st_size, unsigned ld_size, uint32_t soff, uint32_t loff, unsigned st_guard, unsigned ld_guard) {
   std::vector<Insn> code;
   code.push_back(s2r(1, 0x21));
   code.push_back(mov_param(6, 0x58));
   code.push_back(mov_param(7, 0x59));
-  code.push_back(isetp_ge(1, 16));              // P0 = (tid >= 16)
+  code.push_back(isetp_ge(1, mode == 6 ? 32 : 16));   // P0 = (tid >= 16), (tid >= 32) for mode 6
   code.push_back(movi(11, kC));
   for (unsigned i = 0; i < 4; ++i) code.push_back(imadi(12 + i, 1, kK[i], 11));
   code.push_back(imadi(3, 1, 4, kRZ));
@@ -132,6 +134,9 @@ std::vector<Insn> kernel(unsigned mode, uint32_t S, uint32_t D, unsigned st_size
     code.push_back(movi(11, 31));
     code.push_back(imadi(2, 1, 0xffffffffu, 11));   // R2 = 31 - tid
     code.push_back(imad_wide_i(4, 2, S, 6));
+  } else if (mode == 6) {
+    code.push_back(imad_wide_i(4, 1, 0, 6));   // (every lane at the base)
+    code.push_back(imad_wide_g(4, 1, S, 6, 0));   // (@P0, the lanes of the later warps: base + tid * S)
   } else if (mode == 1 || mode == 3 || mode == 5) {
     code.push_back(imad_wide_i(4, 1, S, 6));
     if (mode == 5) code.push_back(imad_wide_g(4, 1, 2 * S, 6, 0));   // (@P0, lanes 16 and up: twice the stride)
@@ -220,12 +225,13 @@ Result run(Env& e, const Case& k, const std::vector<uint8_t>& input, bool interp
 // The rule: the lanes in order store, then load; a lane that does not run keeps the data it holds. Memory is a shared array (zeros) and the global buffer.
 Result expected(const Case& k, const std::vector<uint8_t>& in) {
   std::vector<uint8_t> sh(kShared, 0), gl = in;
-  const auto active = [&](unsigned guard, uint32_t t) { return guard == 7 || (guard == 0 ? t >= 16 : t < 16); };
+  const uint32_t half = k.mode == 6 ? 32 : 16;   // (where P0 turns on)
+  const auto active = [&](unsigned guard, uint32_t t) { return guard == 7 || (guard == 0 ? t >= half : t < half); };
   const auto where = [&](uint32_t t, uint32_t off, std::vector<uint8_t>*& mem) -> uint64_t {
     const bool shared = k.mode == 0 || (k.mode == 2 && t < 16);
     mem = shared ? &sh : &gl;
     const uint32_t lane = k.mode == 4 ? 31 - t : t;   // (mode 4: the lanes go down memory)
-    const uint64_t s = k.mode == 5 && t >= 16 ? 2 * uint64_t{k.S} : k.S;   // (mode 5: the stride doubles from lane 16)
+    const uint64_t s = k.mode == 5 && t >= 16 ? 2 * uint64_t{k.S} : k.mode == 6 && t < 32 ? 0 : k.S;   // (mode 5: the stride doubles from lane 16; mode 6: the first warp's lanes all at the base)
     return shared ? uint64_t{k.D} * t + off : s * lane + off;
   };
   std::vector<std::array<uint32_t, 4>> reg(k.threads);
@@ -277,6 +283,15 @@ void check(Env& e, const Case& k, const std::vector<uint8_t>& input) {
   }
 }
 
+// The tier against the interpreter alone (words, bytes, counters): for the cases whose rule `expected` does not model (an access that reaches past the buffer
+// under test into the output area).
+void check_against_interpreter(Env& e, const Case& k, const std::vector<uint8_t>& input) {
+  const Result tier = run(e, k, input, false), ref = run(e, k, input, true);
+  if (tier.out != ref.out) throw vtest::Failure(k.name() + ": the registers differ from the interpreter's");
+  if (tier.global != ref.global) throw vtest::Failure(k.name() + ": the global buffer differs from the interpreter's");
+  if (std::memcmp(&tier.stats, &ref.stats, exec::kCounterWords * sizeof(uint64_t)) != 0) throw vtest::Failure(k.name() + ": the counters differ from the interpreter's");
+}
+
 std::vector<uint8_t> random_input() {
   std::mt19937 rng(11);
   std::vector<uint8_t> v(kIn);
@@ -295,6 +310,23 @@ void sweep(std::initializer_list<unsigned> modes, std::initializer_list<std::arr
         for (unsigned lg : {7u, 8u})
           for (const auto& p : sd)
             for (uint32_t t : threads) check(e, Case{mode, p[0], p[1], z[0], z[1], 0x20, z[0] == 6 && z[1] == 4 ? 0x24u : 0x20u, sg, lg, t}, input);
+}
+
+// As `sweep`, for blocks of several warps, against the interpreter alone: the rule written out (`expected`) takes the lanes of the whole block as one
+// warp's, and warps of one block run one after the other, so what a warp reads of another's stores would differ. The stores go to a region of their own
+// (at 4 KiB), the loads read the input (at 32 bytes), so what each lane reads does not depend on the order of the warps; the words the lanes store and
+// the counters are still the interpreter's.
+void sweep_against_interpreter(std::initializer_list<unsigned> modes, std::initializer_list<std::array<uint32_t, 2>> sd, std::initializer_list<uint32_t> threads) {
+  Scoped scoped;
+  Env e;
+  const std::vector<uint8_t> input = random_input();
+  const unsigned sizes[][2] = {{0, 0}, {0, 1}, {2, 2}, {2, 3}, {4, 4}, {5, 5}, {6, 6}, {6, 4}, {4, 0}};
+  for (unsigned mode : modes)
+    for (const auto& z : sizes)
+      for (unsigned sg : {7u, 0u})
+        for (unsigned lg : {7u, 8u})
+          for (const auto& p : sd)
+            for (uint32_t t : threads) check_against_interpreter(e, Case{mode, p[0], p[1], z[0], z[1], 0x1000, 0x20, sg, lg, t}, input);
 }
 
 // A launch's error text, or "" when it ran.
@@ -343,6 +375,106 @@ VTEST(global_accesses_on_a_descending_stride) {
 // A full warp whose lanes are in global memory but NOT on one stride (the stride doubles at lane 16): the strided load and store must leave it to the batch.
 VTEST(global_accesses_off_a_stride_over_a_full_warp) {
   sweep({5}, {{4, 0}, {8, 0}, {16, 0}, {12, 0}, {36, 0}, {100, 0}}, {32, 20});
+}
+
+// A full warp's run (lane l at base + l * bytes) that ends at the end of the allocation, a byte short of it, and one byte and one element past it (mode 3
+// at S = the access size, the offset chosen so that lane 31's last byte lands there). The tier takes the run from the registers' rows alone; where the
+// memory manager declines it (past the end) the addresses are made and the access goes the way any full warp's does, to the interpreter's fault. Whatever
+// the tier does must be the interpreter's: the same words, bytes and counters when the access ran, the same error text when it did not.
+VTEST(full_warp_runs_at_the_end_of_the_allocation) {
+  Scoped scoped;
+  const std::vector<uint8_t> input = random_input();
+  const unsigned sizes[][2] = {{0, 0}, {2, 2}, {2, 3}, {4, 4}, {5, 5}, {6, 6}, {4, 0}, {0, 4}};
+  unsigned ran = 0, faulted = 0;
+  for (const auto& z : sizes)
+    for (int d : {-32, -8, -4, -1, 0, 1, 4, 32}) {
+      const unsigned sb = bytes_of(z[0]), lb = bytes_of(z[1]);
+      const unsigned elem = std::max(sb, lb);
+      const uint32_t total = kIn + 32 * 32;
+      const uint32_t off = total - 32 * elem + static_cast<uint32_t>(d);
+      for (unsigned guard : {7u, 8u}) {
+        const Case k{3, elem, 0, z[0], z[1], off, off, 7, guard, 32};
+        // (a world of its own for each run: the error text names the address, and the buffer is allocated at the same place in both)
+        Env et, er;
+        const std::string tier = fault_of(et, k, input, false), ref = fault_of(er, k, input, true);
+        if (tier != ref) throw vtest::Failure(k.name() + ": the tier's error is \"" + tier + "\", the interpreter's \"" + ref + "\"");
+        if (ref.empty()) {
+          Env e;
+          check_against_interpreter(e, k, input);
+          ++ran;
+        } else {
+          ++faulted;
+        }
+      }
+    }
+  VCHECK(ran > 10 && faulted > 10);
+}
+
+// A block of several warps over the same load and store: the shape of the lanes' addresses decides which test the tier makes first, from the warp before
+// (a run, one address, neither), so the warps after the first take the path the first one chose; the strides here include the access size (a run) and 0
+// (one address), with guards that leave half warps (the later warps of a block of 64 or 128 are full).
+VTEST(global_accesses_over_several_warps) {
+  sweep_against_interpreter({3}, {{0, 0}, {1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {12, 0}}, {64, 128});
+}
+
+// The first warp's lanes all at one address and the later warps' lanes on a stride (mode 6), and blocks of 64, 96 and 128 threads: the hint set by the first warp
+// is wrong for the second, whose lanes are a run or a stride, and right again for the third.
+VTEST(global_accesses_whose_shape_changes_from_warp_to_warp) {
+  sweep_against_interpreter({6}, {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {12, 0}, {20, 0}}, {64, 96, 128});
+}
+
+// IMAD.WIDE.U32 with a carry-out predicate: the tier finds the carry only when an instruction names a predicate for it. Lane t adds 4 * t to
+// 0xfffffffffffffff0, so the sum wraps past 2^64 (the carry is set) for t >= 4; a store guarded by that predicate is made by those lanes only,
+// and the two words of the sum are stored by all. One warp, two warps and a part of one, the tier against the interpreter and the sums written out.
+VTEST(imad_wide_carry_out_predicate_guards_a_store) {
+  Scoped scoped;
+  Env e;
+  std::vector<Insn> code;
+  code.push_back(s2r(1, 0x21));
+  code.push_back(mov_param(6, 0x58));
+  code.push_back(mov_param(7, 0x59));
+  code.push_back(movi(2, 0xfffffff0u));
+  code.push_back(movi(3, 0xffffffffu));
+  code.push_back(movi(11, kC));
+  code.push_back(imadi(12, 1, kK[0], 11));
+  code.push_back(imad_wide_p0(10, 1, 4, 2));
+  code.push_back(imad_wide_i(8, 1, 32, 6));
+  code.push_back(stg_e(4, 8, 12, 0, 0));   // @P0 STG.E [R8.64], R12
+  code.push_back(stg(8, 10, 4));
+  code.push_back(stg(8, 11, 8));
+  code.push_back(exit_());
+  const std::string cubin = make_cubin(code);
+  const auto m = sass::load(reinterpret_cast<const uint8_t*>(cubin.data()), cubin.size(), e.mem, e.prof);
+  for (uint32_t threads : {32u, 20u, 64u, 96u}) {
+    std::vector<uint32_t> results[2];
+    exec::LaunchStats stats[2];
+    for (int interp = 0; interp < 2; ++interp) {
+      if (interp) ::setenv("VGPU_FASTPATH", "0", 1);
+      const uint32_t bytes = threads * 32;
+      const uint64_t base = e.mem.alloc(bytes);
+      const std::vector<uint8_t> zeros(bytes, 0);
+      e.mem.write(base, zeros.data(), bytes);
+      exec::LaunchConfig cfg;
+      cfg.grid = {1, 1, 1};
+      cfg.block = {threads, 1, 1};
+      std::vector<uint8_t> arg(8);
+      std::memcpy(arg.data(), &base, 8);
+      stats[interp] = sass::launch(*m, "k", cfg, {arg}, e.mem, e.prof);
+      ::unsetenv("VGPU_FASTPATH");
+      results[interp].resize(bytes / 4);
+      e.mem.read(base, results[interp].data(), bytes);
+      e.mem.free(base);
+    }
+    for (int interp = 0; interp < 2; ++interp)
+      for (uint32_t t = 0; t < threads; ++t) {
+        const uint64_t sum = 0xfffffffffffffff0ull + 4ull * t;   // (modulo 2^64)
+        const uint32_t* w = &results[interp][t * 8];
+        if (w[0] != (t >= 4 ? t * kK[0] + kC : 0u) || w[1] != static_cast<uint32_t>(sum) || w[2] != static_cast<uint32_t>(sum >> 32))
+          throw vtest::Failure("threads=" + std::to_string(threads) + (interp ? " (interpreter)" : " (tier)") + ": thread " + std::to_string(t) + " stored " + std::to_string(w[0]) + ", " +
+                               std::to_string(w[1]) + ", " + std::to_string(w[2]));
+      }
+    if (std::memcmp(&stats[0], &stats[1], exec::kCounterWords * sizeof(uint64_t)) != 0) throw vtest::Failure("the counters differ from the interpreter's");
+  }
 }
 
 VTEST_MAIN

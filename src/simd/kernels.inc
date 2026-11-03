@@ -706,7 +706,9 @@ VGPU_KN void iadd3x_k(uint32_t* r, const uint32_t* a, const uint32_t* b, const u
 }
 
 #if VGPU_SIMD_AVX2
-template <bool Sgn>
+// `Carry`: whether bit l of *carry_out is wanted (IMAD.WIDE with a carry-out predicate; most are not -- an address computation -- and the two compares per
+// half that find the carry are then not made); `Cin`: whether the carry-in mask is not zero (the product plus 64-bit addend is then the whole sum).
+template <bool Sgn, bool Carry, bool Cin>
 VGPU_KA inline void imad_wide_avx2(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const uint32_t* b, const uint32_t* clo,
                            const uint32_t* chi, uint32_t cin, uint32_t* carry_out) {
   const __m256i zero = _mm256_setzero_si256();
@@ -717,37 +719,57 @@ VGPU_KA inline void imad_wide_avx2(uint32_t* rlo, uint32_t* rhi, const uint32_t*
     const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
     const __m256i cl = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(clo + i));
     const __m256i ch = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(chi + i));
-    const __m256i cm = lane_mask_dwords(cin >> i);
+    const __m256i cm = Cin ? lane_mask_dwords(cin >> i) : zero;
     const auto half = [&](bool high, __m256i& res, __m256i& carry) {
       const __m256i xa = high ? _mm256_unpackhi_epi32(x, zero) : _mm256_unpacklo_epi32(x, zero);
       const __m256i ya = high ? _mm256_unpackhi_epi32(y, zero) : _mm256_unpacklo_epi32(y, zero);
       const __m256i prod = Sgn ? _mm256_mul_epi32(xa, ya) : _mm256_mul_epu32(xa, ya);
       const __m256i cc = high ? _mm256_unpackhi_epi32(cl, ch) : _mm256_unpacklo_epi32(cl, ch);
-      const __m256i ci = _mm256_srli_epi64(high ? _mm256_unpackhi_epi32(cm, cm) : _mm256_unpacklo_epi32(cm, cm), 63);
       const __m256i s1 = _mm256_add_epi64(prod, cc);
-      const __m256i s2 = _mm256_add_epi64(s1, ci);
-      // Unsigned: a sum below an addend wrapped. (cmpgt is signed; the sign bit flipped on both makes it unsigned.)
-      const __m256i c1 = _mm256_cmpgt_epi64(_mm256_xor_si256(prod, sign), _mm256_xor_si256(s1, sign));
-      const __m256i c2 = _mm256_cmpgt_epi64(_mm256_xor_si256(s1, sign), _mm256_xor_si256(s2, sign));
+      __m256i s2 = s1;
+      if constexpr (Cin) s2 = _mm256_add_epi64(s1, _mm256_srli_epi64(high ? _mm256_unpackhi_epi32(cm, cm) : _mm256_unpacklo_epi32(cm, cm), 63));
       res = s2;
-      carry = _mm256_or_si256(c1, c2);
+      if constexpr (Carry) {
+        // Unsigned: a sum below an addend wrapped. (cmpgt is signed; the sign bit flipped on both makes it unsigned.)
+        const __m256i c1 = _mm256_cmpgt_epi64(_mm256_xor_si256(prod, sign), _mm256_xor_si256(s1, sign));
+        const __m256i c2 = _mm256_cmpgt_epi64(_mm256_xor_si256(s1, sign), _mm256_xor_si256(s2, sign));
+        carry = _mm256_or_si256(c1, c2);
+      } else {
+        carry = zero;
+      }
     };
     __m256i p, q, cp, cq;
     half(false, p, cp);
     half(true, q, cq);
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(rlo + i), pair_pack_lo(p, q));
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(rhi + i), pair_pack_hi(p, q));
-    out |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(pair_pack_lo(cp, cq)))) << i;
+    if constexpr (Carry) out |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(pair_pack_lo(cp, cq)))) << i;
   }
-  *carry_out = out;
+  if constexpr (Carry) *carry_out = out;
 }
 #endif
 
 VGPU_KN void imad_wide_k(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const uint32_t* b, const uint32_t* clo,
                  const uint32_t* chi, bool sgn, uint32_t cin, uint32_t* carry_out) {
 #if VGPU_SIMD_AVX2
-  if (sgn) imad_wide_avx2<true>(rlo, rhi, a, b, clo, chi, cin, carry_out);
-  else imad_wide_avx2<false>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+  // (`carry_out` null: the carry is not wanted and is not found.)
+  if (sgn) {
+    if (carry_out) {
+      if (cin) imad_wide_avx2<true, true, true>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+      else imad_wide_avx2<true, true, false>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+    } else {
+      if (cin) imad_wide_avx2<true, false, true>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+      else imad_wide_avx2<true, false, false>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+    }
+  } else {
+    if (carry_out) {
+      if (cin) imad_wide_avx2<false, true, true>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+      else imad_wide_avx2<false, true, false>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+    } else {
+      if (cin) imad_wide_avx2<false, false, true>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+      else imad_wide_avx2<false, false, false>(rlo, rhi, a, b, clo, chi, cin, carry_out);
+    }
+  }
 #else
   uint32_t out = 0;
   for (unsigned i = 0; i < 32; ++i) {
@@ -759,7 +781,7 @@ VGPU_KN void imad_wide_k(uint32_t* rlo, uint32_t* rhi, const uint32_t* a, const 
     rhi[i] = static_cast<uint32_t>(static_cast<uint64_t>(full) >> 32);
     out |= static_cast<uint32_t>((full >> 64) != 0) << i;
   }
-  *carry_out = out;
+  if (carry_out) *carry_out = out;
 #endif
 }
 

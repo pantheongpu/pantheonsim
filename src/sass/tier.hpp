@@ -193,6 +193,10 @@ struct MOp {
   // A global access: the way of the thread's lookup memory this instruction's allocation was last found in (MemoryManager::find_ordinary's `hint`; only ever
   // a place to look first, and read and written relaxed by whichever thread runs the op).
   mutable uint8_t way = 0;
+  // A global access of a full warp: the shape the last such warp's lanes had (h_global tries the cheap test for this one first; only ever a place to
+  // start, read and written relaxed by whichever thread runs the op).
+  static constexpr uint8_t kShapeRun = 0, kShapeOne = 1, kShapeOther = 2;
+  mutable uint8_t shape = kShapeRun;
 };
 static_assert(sizeof(MOp) == 96, "an op is 96 bytes: a cache line and a half, which the run loop reads one after the other");
 inline constexpr uint16_t kNoReg = 0xffff;

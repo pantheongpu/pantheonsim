@@ -136,6 +136,39 @@ template <bool Lo, bool Hi>
   info.progression = _mm256_testz_si256(differ, differ);
 }
 
+// sassmem::full_warp_run: whether the 32 lanes' base registers are on consecutive elements of `bytes` bytes (1, 2, 4 or 8; 0 is every lane the same),
+// eight lanes to a step, and nothing stored. Lane l's pair (lo[l] | hi[l] << 32; `hi` null: lo[l]) must be the first lane's plus l * bytes modulo 2^64; the added offset
+// is the same for every lane and cancels. As l * bytes is below 2^32 the high word is the first lane's plus the carry out of the low sum, and the
+// carry is the low sum being below the first lane's low word (unsigned, found with the sign bits flipped). With no high row the high word of the
+// pair is zero, so the carry must be zero in every lane too.
+template <bool Hi>
+[[gnu::always_inline]] static inline bool warp_run_body(const uint32_t* lo, const uint32_t* hi, unsigned bytes) {
+  const uint32_t lo0 = lo[0];
+  const __m256i vlo0 = _mm256_set1_epi32(static_cast<int>(lo0));
+  const __m256i sign = _mm256_set1_epi32(static_cast<int>(0x8000'0000u));
+  const __m256i vlo0b = _mm256_xor_si256(vlo0, sign);
+  const __m256i vhi0 = Hi ? _mm256_set1_epi32(static_cast<int>(hi[0])) : _mm256_setzero_si256();
+  const __m256i step = _mm256_set1_epi32(static_cast<int>(8 * bytes));
+  const __m256i iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+  __m256i e = _mm256_add_epi32(vlo0, _mm256_mullo_epi32(iota, _mm256_set1_epi32(static_cast<int>(bytes))));
+  __m256i differ = _mm256_setzero_si256();
+#pragma GCC unroll 4
+  for (unsigned i = 0; i < 32; i += 8) {
+    differ = _mm256_or_si256(differ, _mm256_xor_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(lo + i)), e));
+    const __m256i wrapped = _mm256_cmpgt_epi32(vlo0b, _mm256_xor_si256(e, sign));   // all ones in a lane whose low sum wrapped
+    if constexpr (Hi)
+      differ = _mm256_or_si256(differ, _mm256_xor_si256(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(hi + i)), _mm256_sub_epi32(vhi0, wrapped)));
+    else
+      differ = _mm256_or_si256(differ, wrapped);
+    e = _mm256_add_epi32(e, step);
+  }
+  return _mm256_testz_si256(differ, differ);
+}
+
+bool warp_run_k(const uint32_t* lo, const uint32_t* hi, unsigned bytes) {
+  return hi ? warp_run_body<true>(lo, hi, bytes) : warp_run_body<false>(lo, hi, bytes);
+}
+
 void warp_rows_k(const uint32_t* lo, const uint32_t* hi, uint64_t add, uint64_t window, uint64_t* addrs, WarpRowsInfo& info) {
   if (!lo) warp_rows_body<false, false>(lo, hi, add, window, addrs, info);
   else if (!hi) warp_rows_body<true, false>(lo, hi, add, window, addrs, info);
@@ -473,6 +506,7 @@ std::atomic<const Kernels*> g_kernels __attribute__((visibility("hidden"))){&kBa
 bool g_enabled __attribute__((visibility("hidden"))) = true;
 SectorWindowFn g_sector_window __attribute__((visibility("hidden"))) = nullptr;
 WarpRowsFn g_warp_rows __attribute__((visibility("hidden"))) = nullptr;
+WarpRunFn g_warp_run __attribute__((visibility("hidden"))) = nullptr;
 }  // namespace detail
 
 bool avx2_f64_available() {
@@ -499,6 +533,7 @@ void use_sector_window_kernel(bool on) {
 #ifdef VGPU_SIMD_X86
   detail::g_sector_window = on && level() == Level::Avx2 ? avx2_impl::sector_window_k : nullptr;
   detail::g_warp_rows = on && level() == Level::Avx2 ? avx2_impl::warp_rows_k : nullptr;
+  detail::g_warp_run = on && level() == Level::Avx2 ? avx2_impl::warp_run_k : nullptr;
 #else
   (void)on;
 #endif
