@@ -13950,6 +13950,27 @@ uint64_t digest_instruction(const gcn::Inst& in, gcn::Target target, uint64_t se
       if (seed & 1) w.vgpr[in.src[0].index][r.next() % w.lanes] = 0xFFFFFFFEu;
     }
   }
+  if ((flavour == 32 || flavour == 33) && in.enc == gcn::Enc::Ds && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+    // Flavours 32 and 33: an LDS access inside the LDS whose lanes' addresses are not a run of consecutive words. 32: scattered words, a few lanes sharing
+    // an address (writes that overlap end as the lanes' order says), half the lanes off. 33: lanes 8 bytes apart from a random 8-aligned start (the two
+    // 32-bit values of a ds_read2_b32 or the one value of a ds_read2_b64 a lane, with the second offset right after the first or far off), every lane on
+    // or a run of them.
+    if (flavour == 32) {
+      w.exec = r.next() & all;
+      for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[in.src[0].index][lane] = (static_cast<uint32_t>(r.next()) & 0x1FFC);
+      for (uint32_t lane = 4; lane < kLanes; lane += 9) w.vgpr[in.src[0].index][lane] = w.vgpr[in.src[0].index][lane - 3];
+      if (r.next() & 1) {   // (one lane at the end of the LDS: its access, the second one if there are two, ends at or just past the last byte)
+        const uint32_t k = 4 * (1 + static_cast<uint32_t>(r.next() % 4)), lane = static_cast<uint32_t>(r.next() % w.lanes);
+        w.vgpr[in.src[0].index][lane] = 0x10000u - k - static_cast<uint32_t>(r.next() & 1 ? in.fast.off1 : in.fast.off0);
+        w.exec |= uint64_t{1} << lane;
+      }
+    } else {
+      const unsigned first = static_cast<unsigned>(r.next() % w.lanes), cnt = 1 + static_cast<unsigned>(r.next() % (w.lanes - first));
+      if (r.next() & 1) w.exec = ((cnt == 64 ? ~uint64_t{0} : (uint64_t{1} << cnt) - 1) << first) & all;
+      const uint32_t start = static_cast<uint32_t>(r.next() & 0x7FF8);
+      for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[in.src[0].index][lane] = start + 8u * lane;
+    }
+  }
   if (flavour == 12 || flavour == 13) w.loads_in_flight = 3 + static_cast<uint32_t>(r.next() & 7);   // (loads to wait for)
   w.pc = 0;
   Mix64 h;
@@ -14029,6 +14050,11 @@ double time_instruction(const gcn::Inst& in, gcn::Target target, uint64_t seed, 
   for (auto& row : w.agpr)
     for (uint32_t& v : row) v = draw(r, flavour);
   w.exec = w.lanes == 64 ? ~uint64_t{0} : (uint64_t{1} << w.lanes) - 1;
+  if ((flavour == 18 || flavour == 27) && in.enc == gcn::Enc::Ds && !in.src.empty() && in.src[0].kind == OperandKind::Vgpr) {
+    // (An LDS access inside the LDS, as the digest's flavours 18 and 27 aim it: the lanes' words consecutive, or 8 bytes apart.)
+    const uint32_t stride = flavour == 27 ? 8u : in.fast.sub <= 1 ? 4u * std::max<uint32_t>(in.fast.words, 1) : 4u;
+    for (uint32_t lane = 0; lane < kLanes; ++lane) w.vgpr[in.src[0].index][lane] = 256 + stride * lane;
+  }
   w.pc = 0;
   m.step(w, g);   // (throws what the instruction throws)
   const auto t0 = std::chrono::steady_clock::now();

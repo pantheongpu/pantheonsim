@@ -246,6 +246,27 @@ for off in ['', ' offset:4', ' offset:128', ' offset:65532']:
 add('ds_permute_b32 v200, v255, v201')
 add('ds_swizzle_b32 v200, v255 offset:4122')
 
+# ---- ds_read2 / ds_write2 (and the st64 forms), 32- and 64-bit: every offset pair, the data registers apart or overlapping the address, a high register
+# (gfx11 and gfx12 spell them ds_load_2addr / ds_store_2addr)
+def ds2_name(op):
+    if mcpu.startswith('gfx11') or mcpu.startswith('gfx12'):
+        return op.replace('ds_read2st64_', 'ds_load_2addr_stride64_').replace('ds_read2_', 'ds_load_2addr_').replace(
+            'ds_write2st64_', 'ds_store_2addr_stride64_').replace('ds_write2_', 'ds_store_2addr_')
+    return op
+for op in ['ds_read2_b32', 'ds_read2st64_b32', 'ds_read2_b64', 'ds_read2st64_b64']:
+    w = 4 if op.endswith('b64') else 2
+    for offs in ['', ' offset1:1', ' offset0:1 offset1:2', ' offset0:2 offset1:3', ' offset0:8 offset1:9', ' offset0:63 offset1:64', ' offset0:255 offset1:0',
+                 ' offset0:7 offset1:7', ' offset0:200 offset1:255', ' offset1:128']:
+        for dst, addr in [('v[4:%d]' % (3 + w), 'v1'), ('v[1:%d]' % w, 'v1'), ('v[0:%d]' % (w - 1), 'v%d' % (w - 1)), ('v[200:%d]' % (199 + w), 'v255')]:
+            add('%s %s, %s%s' % (ds2_name(op), dst, addr, offs))
+for op in ['ds_write2_b32', 'ds_write2st64_b32', 'ds_write2_b64', 'ds_write2st64_b64']:
+    b64 = op.endswith('b64')
+    for offs in ['', ' offset1:1', ' offset0:1 offset1:2', ' offset0:2 offset1:3', ' offset0:8 offset1:9', ' offset0:63 offset1:64', ' offset0:255 offset1:0',
+                 ' offset0:7 offset1:7', ' offset0:200 offset1:255', ' offset1:128']:
+        for a, d0, d1 in ([('v1', 'v[4:5]', 'v[6:7]'), ('v1', 'v[1:2]', 'v[3:4]'), ('v1', 'v[4:5]', 'v[4:5]'), ('v255', 'v[200:201]', 'v[254:255]')] if b64 else
+                          [('v1', 'v4', 'v5'), ('v1', 'v1', 'v2'), ('v1', 'v4', 'v4'), ('v255', 'v200', 'v254')]):
+            add('%s %s, %s, %s%s' % (ds2_name(op), a, d0, d1, offs))
+
 # ---- packed 16-bit integers, and the leading/trailing zero counts
 PK2 = ['v_pk_mul_lo_u16', 'v_pk_add_u16', 'v_pk_add_i16', 'v_pk_sub_u16', 'v_pk_sub_i16', 'v_pk_lshlrev_b16', 'v_pk_lshrrev_b16', 'v_pk_ashrrev_i16',
        'v_pk_max_i16', 'v_pk_min_i16', 'v_pk_max_u16', 'v_pk_min_u16']

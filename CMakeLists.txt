@@ -396,6 +396,10 @@ target_include_directories(amd_exec_bench PRIVATE amd/include)
 add_executable(amd_matrix_bench amd/tools/matrix-bench.cpp)
 target_link_libraries(amd_matrix_bench PRIVATE vgpu)
 target_include_directories(amd_matrix_bench PRIVATE amd/include)
+# What the tier saves on the LDS instructions with two offsets (amd/tools/lds-bench.cpp).
+add_executable(amd_lds_bench amd/tools/lds-bench.cpp)
+target_link_libraries(amd_lds_bench PRIVATE vgpu)
+target_include_directories(amd_lds_bench PRIVATE amd/include)
 # What one tensor-core instruction costs the simulator, PTX and SASS (nvidia/tools/tensor-bench.cpp).
 add_executable(nvidia_tensor_bench nvidia/tools/tensor-bench.cpp)
 target_link_libraries(nvidia_tensor_bench PRIVATE vgpu)

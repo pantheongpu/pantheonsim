@@ -120,4 +120,71 @@ void ds_lanes_write(uint32_t* const* rows, uint8_t* lds, const uint32_t* addr, u
   else ds_write_lanes_w<4>(rows, lds, addr, x0, ex);
 }
 
+// ds_read2_b64 / ds_read2st64_b64 and the write forms: each lane moves two 64-bit values, at addr[l] + x0 and addr[l] + x1 (the offsets already in
+// bytes), to or from four rows (value 0 is rows[0] low and rows[1] high, value 1 rows[2] and rows[3]). Nothing is touched and 0 is returned when a lane's
+// access is not inside the LDS (the interpreter then raises or handles it). A write goes lane by lane, the first value then the second, so lanes whose
+// values overlap end as they do one instruction at a time.
+// (A read's destination may include the address register: every lane's address is read before anything is stored, a group of four lanes at a time.)
+int ds_two_read(uint32_t* const* rows, const uint32_t* addr_row, uint32_t x0, uint32_t x1, uint64_t ex, uint8_t* lds, uint64_t size, unsigned n) {
+  const uint32_t* const a = addr_row;
+  unsigned past = 0;
+  const bool all_on = n == 32 ? (ex & 0xFFFFFFFFull) == 0xFFFFFFFFull : ex == ~0ull;
+  if (all_on) {
+    for (unsigned l = 0; l < n; ++l)
+      past |= (static_cast<uint64_t>(static_cast<uint32_t>(a[l] + x0)) + 8 > size) | (static_cast<uint64_t>(static_cast<uint32_t>(a[l] + x1)) + 8 > size);
+  } else {
+    for (uint64_t m = ex; m; m &= m - 1) {
+      const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+      past |= (static_cast<uint64_t>(static_cast<uint32_t>(a[l] + x0)) + 8 > size) | (static_cast<uint64_t>(static_cast<uint32_t>(a[l] + x1)) + 8 > size);
+    }
+  }
+  if (past) return 0;
+  if (all_on) {
+    uint32_t* const lo[2] = {rows[0], rows[1]};
+    uint32_t* const hi[2] = {rows[2], rows[3]};
+    for (unsigned l = 0; l < n; l += 4) {
+      const uint8_t* f0[4] = {lds + static_cast<uint32_t>(a[l] + x0), lds + static_cast<uint32_t>(a[l + 1] + x0), lds + static_cast<uint32_t>(a[l + 2] + x0),
+                              lds + static_cast<uint32_t>(a[l + 3] + x0)};
+      const uint8_t* f1[4] = {lds + static_cast<uint32_t>(a[l] + x1), lds + static_cast<uint32_t>(a[l + 1] + x1), lds + static_cast<uint32_t>(a[l + 2] + x1),
+                              lds + static_cast<uint32_t>(a[l + 3] + x1)};
+      lds_to_rows<2>(lo, f0, l);
+      lds_to_rows<2>(hi, f1, l);
+    }
+    return 1;
+  }
+  uint32_t* const r0 = rows[0];
+  uint32_t* const r1 = rows[1];
+  uint32_t* const r2 = rows[2];
+  uint32_t* const r3 = rows[3];
+  for (uint64_t m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+    uint32_t v[4];
+    std::memcpy(&v[0], lds + static_cast<uint32_t>(a[l] + x0), 8);
+    std::memcpy(&v[2], lds + static_cast<uint32_t>(a[l] + x1), 8);
+    r0[l] = v[0], r1[l] = v[1], r2[l] = v[2], r3[l] = v[3];
+  }
+  return 1;
+}
+int ds_two_write(const uint32_t* const* rows, const uint32_t* addr_row, uint32_t x0, uint32_t x1, uint64_t ex, uint8_t* lds, uint64_t size, unsigned n) {
+  const uint32_t* const a = addr_row;
+  unsigned past = 0;
+  for (uint64_t m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+    past |= (static_cast<uint64_t>(static_cast<uint32_t>(a[l] + x0)) + 8 > size) | (static_cast<uint64_t>(static_cast<uint32_t>(a[l] + x1)) + 8 > size);
+  }
+  if (past) return 0;
+  (void)n;
+  const uint32_t* const r0 = rows[0];
+  const uint32_t* const r1 = rows[1];
+  const uint32_t* const r2 = rows[2];
+  const uint32_t* const r3 = rows[3];
+  for (uint64_t m = ex; m; m &= m - 1) {
+    const unsigned l = static_cast<unsigned>(__builtin_ctzll(m));
+    const uint32_t v0[2] = {r0[l], r1[l]}, v1[2] = {r2[l], r3[l]};
+    std::memcpy(lds + static_cast<uint32_t>(a[l] + x0), v0, 8);
+    std::memcpy(lds + static_cast<uint32_t>(a[l] + x1), v1, 8);
+  }
+  return 1;
+}
+
 }  // namespace vgpu::amd::gcn::tier_ds
