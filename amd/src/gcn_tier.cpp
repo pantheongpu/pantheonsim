@@ -1295,7 +1295,7 @@ TIER_DUAL(h_cmp)
 int h_never(const Op&, Regs&) { return 0; }
 
 // ---- LDS
-enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAdd, kDsSwizzle, kDsPerm };
+enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAdd, kDsSwizzle, kDsPerm, kDsRead2W, kDsWrite2W };
 // (Out of line: their 256-byte rows in h_ds's frame cost the LDS handlers' common paths a larger prologue.)
 [[gnu::noinline]] int ds_swizzle_run(const Op& o, Regs& R, uint64_t ex) {
     // ds_swizzle_b32: a lane reads another lane of its group of 32 as the offset's pattern says (a lane that is off gives zero); the data is read
@@ -1560,6 +1560,26 @@ enum DsKind : uint32_t { kDsRead, kDsWrite, kDsRead2, kDsWrite2, kDsBperm, kDsAd
   }
 }
 TIER_DUAL(h_ds)
+
+// ds_read2_b64 / ds_write2_b64 and their st64 forms: two 64-bit values a lane at two offsets (gcn_tier_ds.cpp).
+[[gnu::always_inline]] inline int h_ds2w_body(const Op& o, Regs& R) {
+  const uint64_t ex = *R.exec;
+  if (o.store && *R.store_gate && ex && R.nwaves > 1) {
+    *R.store_gate = false;
+    *R.soft_yield = true;
+    return 3;
+  }
+  if (!ex) return 1;
+  const uint32_t* const addr = R.vgpr[o.src[0].index];
+  const uint32_t x0 = static_cast<uint32_t>(o.off0), x1 = static_cast<uint32_t>(o.off1);
+  if (o.sub == kDsRead2W) {
+    uint32_t* const rows[4] = {R.vgpr[o.dst.index], R.vgpr[o.dst.index + 1], R.vgpr[o.dst.index + 2], R.vgpr[o.dst.index + 3]};
+    return tier_ds::ds_two_read(rows, addr, x0, x1, ex, R.lds, R.lds_size, R.lanes);
+  }
+  const uint32_t* const rows[4] = {R.vgpr[o.src[1].index], R.vgpr[o.src[1].index + 1], R.vgpr[o.src[2].index], R.vgpr[o.src[2].index + 1]};
+  return tier_ds::ds_two_write(rows, addr, x0, x1, ex, R.lds, R.lds_size, R.lanes);
+}
+TIER_DUAL(h_ds2w)
 
 // A 64-bit comparison (integers, or binary64 with the source modifiers): `kern` is the test for the first n lanes.
 [[gnu::always_inline]] inline int h_cmp64_body(const Op& o, Regs& R) {
@@ -2146,6 +2166,10 @@ const std::unordered_map<std::string_view, Entry>& table() {
     m["ds_write2st64_b32"] = {Cat::Ds, kDsWrite2, 1, 1, nullptr, 2};
     m["ds_read2_b32"] = {Cat::Ds, kDsRead2, 1, 0, nullptr, 2};
     m["ds_write2_b32"] = {Cat::Ds, kDsWrite2, 1, 0, nullptr, 2};
+    m["ds_read2_b64"] = {Cat::Ds, kDsRead2W, 1, 0, nullptr, 4};
+    m["ds_read2st64_b64"] = {Cat::Ds, kDsRead2W, 1, 1, nullptr, 4};
+    m["ds_write2_b64"] = {Cat::Ds, kDsWrite2W, 1, 0, nullptr, 2};
+    m["ds_write2st64_b64"] = {Cat::Ds, kDsWrite2W, 1, 1, nullptr, 2};
     m["v_pk_add_f32"] = {Cat::Pk, FADD, 2};
     m["v_permlane16_b32"] = {Cat::Permlane, 0, 3};
     m["v_permlanex16_b32"] = {Cat::Permlane, 1, 3};
@@ -2837,13 +2861,13 @@ void tier_classify(Inst& in) {
         f.unit = kUnitLds;
         return;
       }
-      const bool read = e.k == kDsRead || e.k == kDsRead2;
+      const bool read = e.k == kDsRead || e.k == kDsRead2 || e.k == kDsRead2W;
       if (read) {
         if (in.dst.size() != 1 || in.dst[0].kind != OperandKind::Vgpr || in.dst[0].index + e.sub > kVgprs) return;
         if (in.dst[0].width != e.sub) return;
         f.dst.kind = kVgpr, f.dst.index = in.dst[0].index;
       } else {
-        const size_t need = e.k == kDsWrite2 ? 3 : 2;
+        const size_t need = e.k == kDsWrite2 || e.k == kDsWrite2W ? 3 : 2;
         if (in.src.size() < need) return;
         for (size_t k = 1; k < need; ++k) {
           const uint32_t width = e.k == kDsWrite2 ? 1 : e.sub;   // (write2's two data operands are a register each; read2's destination is the pair)
@@ -2852,13 +2876,13 @@ void tier_classify(Inst& in) {
         }
         f.store = e.k != kDsAdd;   // (ds_add_u32 is not one of the stores that wait for the group's other waves)
       }
-      if (e.k == kDsRead2 || e.k == kDsWrite2) {
-        // (Offsets in words: the instruction's two 8-bit counts.)
-        const uint32_t unit = e.flags & 1 ? 4 * 64 : 4;   // (the st64 forms count in 64s of words)
+      if (e.k == kDsRead2 || e.k == kDsWrite2 || e.k == kDsRead2W || e.k == kDsWrite2W) {
+        // (Offsets in words, or in 64-bit values for the _b64 forms: the instruction's two 8-bit counts.)
+        const uint32_t unit = (e.k == kDsRead2W || e.k == kDsWrite2W ? 8 : 4) * (e.flags & 1 ? 64 : 1);   // (the st64 forms count in 64s)
         f.off0 = static_cast<int32_t>(static_cast<uint32_t>(in.offset) * unit);
         f.off1 = static_cast<int32_t>(static_cast<uint32_t>(in.offset1) * unit);
       }
-      f.run = TIER_RUN(h_ds);
+      f.run = e.k == kDsRead2W || e.k == kDsWrite2W ? TIER_RUN(h_ds2w) : TIER_RUN(h_ds);
       f.unit = kUnitLds;
       return;
     }
