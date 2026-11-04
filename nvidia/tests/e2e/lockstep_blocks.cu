@@ -197,6 +197,43 @@ __global__ void forward_chain(volatile unsigned* flag, unsigned* out, unsigned* 
   flag[b] = 1;
 }
 
+// ---- 6. a wait that works only on some turns: the shape of Barnes-Hut's SortKernel -----------------
+
+// Cell k waits for the cell above it (k + 1), which another thread handles, often in a block that has not
+// started: `start[k] < 0` means "not yet", and the turns that find nothing write nothing. The loop
+// also stores and changes the address it polls (k), on the turns that find work, so it is not a poll the
+// kernel_polls test of "the same address, no store" can see; the turns that find nothing are one. Each
+// pass ends in a __syncthreads, as the original's does.
+constexpr unsigned kSortLimit = 1u << 16;
+
+__global__ void sort_wait(volatile int* start, int* out, int ncells, unsigned* timeouts) {
+  const int dec = blockDim.x * gridDim.x;
+  int k = ncells - dec + threadIdx.x + blockIdx.x * blockDim.x;
+  unsigned polls = 0;
+  while (k >= 0) {
+    const int s = start[k];
+    if (s >= 0) {
+      out[k] = s;
+      if (k >= 1) start[k - 1] = s + 1;   // the cell below it can go on
+      k -= dec;
+      polls = 0;
+    } else if (++polls >= kSortLimit) {
+      atomicAdd(timeouts, 1u);
+      break;
+    }
+    __syncthreads();
+  }
+}
+
+// A decoy that must not be taken for a poller: it reads a volatile word in a loop and stores on some turns,
+// but the address moves on every turn, so nothing in it waits for another block.
+__global__ void volatile_scan(volatile int* in, int* out, int n) {
+  for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < n; i += blockDim.x * gridDim.x) {
+    const int v = in[i];
+    if (v > 0) out[i] = v;
+  }
+}
+
 #define CHECK(x)                                                                     \
   do {                                                                               \
     cudaError_t e_ = (x);                                                            \
@@ -223,8 +260,11 @@ static void expect(bool ok, const char* what) {
 }
 
 int main(int argc, char** argv) {
-  // `lockstep_blocks <name>` runs one of barrier, chain, queue, locks, forward; none runs them all.
-  const auto want = [&](const char* name) { return argc < 2 || !std::strcmp(argv[1], name); };
+  // `lockstep_blocks <name>` runs one of barrier, chain, queue, locks, forward, sortwait; none runs all but sortwait.
+  // (sortwait is SASS-only -- the PTX engine does not search for this shape -- so it runs only when named)
+  const auto want = [&](const char* name) {
+    return argc < 2 ? std::strcmp(name, "sortwait") != 0 : !std::strcmp(argv[1], name);
+  };
   int dev_count = 0;
   CHECK(cudaGetDeviceCount(&dev_count));
   cudaDeviceProp prop;
@@ -362,6 +402,37 @@ int main(int argc, char** argv) {
     std::printf("forward chain over %u blocks (%d per SM): %s, %u timed-out waits\n", n, per_sm, ok ? "right" : "wrong", t);
     expect(ok && t == 0, "a chain across a grid larger than the device holds");
     cudaFree(flag), cudaFree(out), cudaFree(timeouts);
+  }
+
+  // 6. cells that wait for the cell above, in a grid that fits the device; the loop stores and moves its address
+  // when it finds work (Barnes-Hut's SortKernel).
+  if (want("sortwait")) {
+    const unsigned blocks = 8, threads = 64, rounds = 2;
+    const int ncells = static_cast<int>(blocks * threads * rounds);
+    int* start = dev<int>(ncells);
+    int* out = dev<int>(ncells);
+    unsigned* timeouts = dev<unsigned>(1);
+    std::vector<int> init(ncells, -1);
+    init[ncells - 1] = 0;
+    CHECK(cudaMemcpy(start, init.data(), init.size() * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK(cudaMemset(out, 0xff, ncells * sizeof(int)));
+    sort_wait<<<blocks, threads>>>(start, out, ncells, timeouts);
+    CHECK(cudaGetLastError());
+    CHECK(cudaDeviceSynchronize());
+    std::vector<int> h(ncells);
+    unsigned t = 0;
+    CHECK(cudaMemcpy(h.data(), out, h.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(&t, timeouts, sizeof t, cudaMemcpyDeviceToHost));
+    bool ok = true;
+    for (int c = 0; c < ncells; ++c) ok = ok && h[c] == ncells - 1 - c;
+    std::printf("cells waiting for the cell above (%d cells): %s, %u timed-out waits\n", ncells, ok ? "right" : "wrong", t);
+    expect(ok && t == 0, "a wait that stores and moves its address when it finds work");
+    // the decoy runs beside it, and the script checks that only sort_wait went the lockstep way
+    int* in = dev<int>(ncells);
+    volatile_scan<<<blocks, threads>>>(in, out, ncells);
+    CHECK(cudaGetLastError());
+    CHECK(cudaDeviceSynchronize());
+    cudaFree(start), cudaFree(out), cudaFree(timeouts), cudaFree(in);
   }
 
   std::printf(fails ? "FAIL\n" : "PASS\n");

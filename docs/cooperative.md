@@ -131,6 +131,15 @@ flight together; run one after another every block wins them all).
   (`src/exec/interpreter.cpp`) and `amd_kernel_polls` (`amd/src/gcn_exec.cpp`); for
   AMD it assumes, and the ISA guides do not say, that a compiler marks the loads of a
   polling loop with cache-control bits.
+  A SASS loop that stores and moves its address when it finds work (Barnes-Hut's
+  `SortKernel`: `while (k >= bottom) { s = volatile start[k]; if (s >= 0) { ...stores...;
+  k -= dec; } __syncthreads(); }`) is a poll on the turns that find nothing, and is
+  taken too: `kernel_polls_conditional` follows the paths through the loop body,
+  leaving out what a guard on the polled value skips and trying first the side of a
+  branch on the polled value that skips the work, and asks the test above of the first
+  path that goes round. A call is allowed when it goes to straight code with no store
+  that ends in EXIT or RET (ptxas's shared exit stub). The PTX and AMD searches do not
+  have this form yet.
 - **How many are resident.** The runtime works out how many blocks of the kernel the
   device holds at once, as `cudaOccupancyMaxActiveBlocksPerMultiprocessor` does,
   times the multiprocessors (`LaunchConfig::resident_blocks`, `Dispatch::resident_groups`).

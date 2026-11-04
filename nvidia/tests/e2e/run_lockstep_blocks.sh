@@ -7,7 +7,9 @@
 # blocks. The SASS run is repeated on one host thread (the order is then fixed) and with every launch in
 # lockstep (VGPU_LOCKSTEP=all), where a kernel whose blocks do not wait on each other must give the same
 # answers. Last, with the old behaviour (VGPU_LOCKSTEP=0, one thread) the patch locks must fail: the test
-# would otherwise pass whatever this does.
+# would otherwise pass whatever this does. Then the sort-shaped wait (a loop that stores and moves the address it
+# polls on the turns that find work, as Barnes-Hut's SortKernel does) in the same four ways, and a check of which
+# kernels took the lockstep path: the sort-shaped one must, a volatile loop that only walks an array must not.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$root/tests/shim_guard.sh"
@@ -23,7 +25,7 @@ shopt -u nullglob
 if (( ${#cudart_libs[@]} == 0 )); then
   echo "SKIP: libvgpucudart not built (CUDA ABI headers absent at build time)"; exit 0
 fi
-trap 'rm -f "$out".sass "$out".ptx' EXIT
+trap 'rm -f "$out".sass "$out".ptx "$out".log' EXIT
 
 nvcc -std=c++17 -cudart shared -gencode arch=compute_75,code=sm_75 \
      -Wno-deprecated-gpu-targets $(shim_sanitizer_nvcc_flags "$shim") "$src" -o "$out.sass"
@@ -54,4 +56,13 @@ run "PTX, all lockstep"    "$out.ptx"  PASS VGPU_LOCKSTEP=all
 ARGS=locks
 run "old behaviour: the patch locks fail (SASS)" "$out.sass" FAIL VGPU_LOCKSTEP=0 VGPU_THREADS=1
 run "old behaviour: the patch locks fail (PTX)"  "$out.ptx"  FAIL VGPU_LOCKSTEP=0 VGPU_THREADS=1
+ARGS=sortwait
+run "SASS, sort-shaped wait"               "$out.sass" PASS
+run "SASS, sort-shaped wait, one thread"   "$out.sass" PASS VGPU_THREADS=1
+run "SASS, sort-shaped wait, three threads" "$out.sass" PASS VGPU_THREADS=3
+run "old behaviour: the sort-shaped wait times out (SASS)" "$out.sass" FAIL VGPU_LOCKSTEP=0 VGPU_THREADS=1
+rm -f "$out.log"
+run "SASS, sort-shaped wait, logging the lockstep launches" "$out.sass" PASS VGPU_LOCKSTEP_LOG="$out.log"
+if grep -q 'kernel _Z9sort_wait' "$out.log" 2>/dev/null; then echo "ok: sort_wait runs in lockstep"; else echo "FAIL: sort_wait did not run in lockstep"; fails=1; fi
+if grep -q 'volatile_scan' "$out.log" 2>/dev/null; then echo "FAIL: volatile_scan was taken for a poller"; fails=1; else echo "ok: volatile_scan is not taken for a poller"; fi
 exit "$fails"

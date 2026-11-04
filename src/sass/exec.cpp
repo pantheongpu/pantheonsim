@@ -405,6 +405,135 @@ bool kernel_polls_loop(const std::vector<const Instr*>& body) {
   return polls;
 }
 
+// A loop that polls only on some turns: the load whose value decides whether the thread has work to do. Barnes-Hut's SortKernel
+// (`while (k >= bottom) { start = volatile startd[k]; if (start >= 0) { ...stores...; k -= dec; } __syncthreads(); }`) waits like
+// this for the thread that handles its cell's parent, which may be in a block that has not started. The whole loop writes global
+// memory and changes its load's address, so kernel_polls_loop turns it down; but the turns that find nothing to do (the value
+// is not there yet) write nothing and change nothing the next turn reads. Those turns are the path through the loop's body that
+// the branches on the polled value skip the work on. This follows the paths of the body in address order (forward branches only,
+// the loop's own closing branch ends a path), takes the side of a branch (or guard) on the polled value that skips the work first,
+// leaves out what a guard on the polled value skips, and asks kernel_polls_loop of the first path that reaches the end. A call
+// is allowed when the code it goes to is straight code with no store, ending in EXIT or RET (ptxas's shared exit stub). Budgeted:
+// a body with more branches than the budget is not searched. Like the test above it errs towards "no".
+bool call_target_is_inert(const Code& code, size_t first_index_of_target) {
+  for (size_t j = first_index_of_target; j < code.count && j < first_index_of_target + 32; ++j) {
+    const Instr& t = code.instr(j);
+    switch (t.op) {
+      case Op::EXIT: case Op::RET: return true;
+      case Op::STG: case Op::ST: case Op::RED: case Op::ATOM: case Op::ATOMG: case Op::CALL: case Op::BRA: case Op::BRX: case Op::JMP:
+      case Op::UTMASTG: case Op::UTMAREDG: case Op::UBLKRED: case Op::REDAS: case Op::Unknown:
+        return false;
+      default: break;
+    }
+  }
+  return false;
+}
+
+bool kernel_polls_conditional(const Code& code, size_t first, size_t last) {
+  const size_t n = last - first + 1;   // the closing branch is the last of them
+  if (n > 400) return false;
+  // What depends on a strong load's value: registers (R0..R254) and predicates (P0..P6), going through the body once.
+  std::bitset<256> treg;
+  std::bitset<8> tpred;
+  bool any_load = false;
+  const auto is_poll_load = [](const Instr& ins) {
+    if (ins.op != Op::LDG && ins.op != Op::LD) return false;
+    bool strong = false, cta = false;
+    for (const std::string& m : ins.mods) {
+      strong = strong || m == "STRONG";
+      cta = cta || m == "CTA";
+    }
+    return strong && !cta;
+  };
+  const auto reads_taint = [&](const Instr& ins) {
+    if (ins.guard != kPT && !ins.guard_uniform && tpred.test(ins.guard)) return true;
+    for (const Operand& o : ins.src) {
+      if (o.kind == Kind::Reg && o.reg != kRZ) {
+        for (unsigned w = 0; w < std::max<unsigned>(1, o.width) && o.reg + w < 255; ++w)
+          if (treg.test(o.reg + w)) return true;
+      } else if (o.kind == Kind::Pred && o.reg != kPT && o.reg < 8 && tpred.test(o.reg)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  for (size_t j = first; j <= last; ++j) {
+    const Instr& ins = code.instr(j);
+    bool t = reads_taint(ins);
+    if (is_poll_load(ins)) {
+      any_load = true;
+      t = true;
+    }
+    if (!t) continue;
+    for (const Operand& d : ins.dst) {
+      if (d.kind == Kind::Reg && d.reg != kRZ) {
+        for (unsigned w = 0; w < std::max<unsigned>(1, d.width) && d.reg + w < 255; ++w) treg.set(d.reg + w);
+      } else if (d.kind == Kind::Pred && d.reg != kPT && d.reg < 8) {
+        tpred.set(d.reg);
+      }
+    }
+  }
+  if (!any_load) return false;
+  // Depth-first over the paths; a path is the instructions it runs (those a tainted guard skips are left out).
+  std::vector<const Instr*> path;
+  size_t budget = 20000;
+  std::function<bool(size_t)> walk = [&](size_t j) -> bool {
+    while (true) {
+      if (j > last || j < first || budget == 0) return false;   // out of the loop, or out of budget
+      --budget;
+      const Instr& ins = code.instr(j);
+      if (j == last) return kernel_polls_loop(path);   // the closing branch: the path has gone round
+      const bool skipped = ins.guard != kPT && !ins.guard_uniform && tpred.test(ins.guard);
+      switch (ins.op) {
+        case Op::BRA: {
+          const int64_t target = ins.src.empty() ? -1 : ins.src.back().imm;
+          if (target < 0 || static_cast<uint64_t>(target) <= ins.pc) return false;   // another loop inside this one
+          const size_t to = static_cast<size_t>(target) / 16;
+          bool conditional = ins.guard != kPT, on_value = skipped;   // (a branch guarded by the polled value is not "skipped": it chooses)
+          for (const Operand& o : ins.src)
+            if (o.kind == Kind::Pred && o.reg != kPT) {
+              conditional = true;
+              on_value = on_value || (o.reg < 8 && tpred.test(o.reg));
+            }
+          if (!conditional) {
+            j = to;
+            continue;
+          }
+          const size_t fall = j + 1;
+          const size_t mark = path.size();
+          if (on_value) {   // the side that skips the work first: the branch taken
+            if (walk(to)) return true;
+            path.resize(mark);
+            j = fall;
+          } else {          // not on the polled value: either side may be the path; the fall-through first, then the target
+            if (walk(fall)) return true;
+            path.resize(mark);
+            j = to;
+          }
+          continue;
+        }
+        case Op::EXIT: case Op::RET: case Op::BRX: case Op::JMP:
+          if (ins.guard == kPT) return false;   // the path leaves the kernel or the loop
+          j += 1;
+          continue;
+        case Op::CALL: {
+          const int64_t target = ins.src.empty() ? -1 : ins.src.back().imm;
+          if (target < 0 || ins.mnemonic != "CALL" || ins.mods.empty() || ins.mods[0] != "REL") return false;
+          const size_t to = static_cast<size_t>(target) / 16;
+          if (to >= code.count || !call_target_is_inert(code, to)) return false;
+          j += 1;
+          continue;
+        }
+        default:
+          break;
+      }
+      if (!skipped) path.push_back(&ins);
+      j += 1;
+    }
+  };
+  return walk(first);
+}
+
 bool kernel_polls(const Module& m, const CubinKernel& k) {
   {
     std::lock_guard<std::mutex> g(m.polling_mu);
@@ -426,7 +555,7 @@ bool kernel_polls(const Module& m, const CubinKernel& k) {
       if (i - first > 400) continue;
       std::vector<const Instr*> body;
       for (size_t j = first; j <= i; ++j) body.push_back(&code.instr(j));
-      found = kernel_polls_loop(body);
+      found = kernel_polls_loop(body) || kernel_polls_conditional(code, first, i);
     }
     if (found) break;
   }
